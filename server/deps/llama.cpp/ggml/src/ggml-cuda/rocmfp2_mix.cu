@@ -39,9 +39,30 @@ void mix_free_entry_device(MixEntry & e) {
     e.owns_device = false;
 }
 
+// Enforce the wide-load invariant for EVERY registration path. mix_block_accum reads the
+// two 8-aligned u64 bracketing each 10-byte block -- a 16 B window from (addr & ~7). For
+// the last block of a row that window ends (6 - (10*(nb-1) & 7)) B past the row end, which
+// is 0 only when nb % 4 == 0, i.e. in % 128 == 0. Any other `in` reads up to 6 B past the
+// tensor allocation, and for the last tensor in a buffer that is a fault.
+//
+// This lives in mix_register_impl (the single chokepoint both public entrypoints funnel
+// through) rather than in one of them: the non-owning ggml_cuda_rocmfp2_mix_register()
+// accepts caller-managed device side-data and would otherwise still be able to register an
+// unsafe shape. Checking here makes it structurally impossible for a registration path to
+// skip the guard, including any added later.
+void mix_validate_shape(int in) {
+    if (in % 128 != 0) {
+        GGML_ABORT("rocmfp2_mix: in=%d must be a multiple of 128 (block count nb=%d must be "
+                   "a multiple of 4) so the 16 B wide-load window stays in bounds on the "
+                   "final block; got in %% 128 = %d",
+                   in, in / 32, in % 128);
+    }
+}
+
 void mix_register_impl(const void * base, size_t nb02, int n_experts, int out, int in,
                        const nv_bfloat16 * codebooks, const uint8_t * modes,
                        const uint8_t * rotations, bool owns_device) {
+    mix_validate_shape(in);
     std::lock_guard<std::mutex> lk(g_mix_mtx);
     MixEntry ne{base, nb02, n_experts, out, in, codebooks, modes, rotations, owns_device};
     for (auto & e : g_mix_registry) {
@@ -75,6 +96,10 @@ extern "C" void ggml_cuda_rocmfp2_mix_register_host(
         const void * base, size_t nb02, int n_experts, int out, int in,
         const void * codebooks_bf16_host, const uint8_t * modes_host,
         const uint8_t * rotations_host) {
+    // Validate up front, before any cudaMalloc: mix_register_impl checks this too (it is
+    // the chokepoint), but reaching it would mean having already allocated three device
+    // buffers for a shape we are about to reject.
+    mix_validate_shape(in);
     const size_t cb_bytes = (size_t) n_experts * 2 * 4 * sizeof(nv_bfloat16);
     void * cb_dev = nullptr; void * modes_dev = nullptr; void * rots_dev = nullptr;
     cudaError_t err = cudaMalloc(&cb_dev, cb_bytes);
@@ -91,22 +116,6 @@ extern "C" void ggml_cuda_rocmfp2_mix_register_host(
         if (rots_dev)  cudaFree(rots_dev);
         CUDA_CHECK(err);  // report/abort exactly as before, but only after cleanup
         return;
-    }
-    // GUARD the wide load-from-floor staging in mix_block_accum. It reads the two
-    // 8-aligned u64 bracketing each 10-byte block, i.e. a 16 B window from
-    // (addr & ~7). For the LAST block of a row that window ends
-    // (6 - (10*(nb-1) & 7)) B past the row end, which is 0 only when nb % 4 == 0,
-    // i.e. in % 128 == 0. Every shipped shape satisfies this (in = 256..32768, all
-    // multiples of 128), but the loader otherwise accepts any in % 32 == 0, so a
-    // future shape would read up to 6 B past the tensor allocation -- and for the
-    // last tensor in a buffer that is a real fault, not a benign over-read.
-    // Rejecting at registration is preferred over a tail branch in the hot loop:
-    // this matvec is latency-bound on exactly those block loads.
-    if (in % 128 != 0) {
-        GGML_ABORT("rocmfp2_mix: in=%d must be a multiple of 128 (block count nb=%d "
-                   "must be a multiple of 4) for the 16 B wide-load window to stay "
-                   "in bounds on the final block; got in %% 128 = %d",
-                   in, in / 32, in % 128);
     }
     mix_register_impl(base, nb02, n_experts, out, in, (const nv_bfloat16 *) cb_dev,
                       (const uint8_t *) modes_dev, (const uint8_t *) rots_dev,
