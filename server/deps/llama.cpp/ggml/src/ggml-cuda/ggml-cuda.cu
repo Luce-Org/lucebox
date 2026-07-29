@@ -2830,19 +2830,21 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             && src1->ne[2] > 1 && src0->ne[2] == src1->ne[2]) {
         const int    nslices = (int) src0->ne[2];
         const int    ntokens = (int) src1->ne[1];
-        const int64_t s1_s1  = (int64_t) (src1->nb[1] / sizeof(float));
-        const int64_t s1_s2  = (int64_t) (src1->nb[2] / sizeof(float));
-        const int64_t d_s1   = (int64_t) (dst->nb[1]  / sizeof(float));
-        const int64_t d_s2   = (int64_t) (dst->nb[2]  / sizeof(float));
+        // ne[1] is the token dim and ne[2] the slice dim, so nb[1]/nb[2] are the TOKEN
+        // and SLICE strides. The callee names its parameters accordingly; do not reorder.
+        const int64_t s1_tok = (int64_t) (src1->nb[1] / sizeof(float));
+        const int64_t s1_sl  = (int64_t) (src1->nb[2] / sizeof(float));
+        const int64_t d_tok  = (int64_t) (dst->nb[1]  / sizeof(float));
+        const int64_t d_sl   = (int64_t) (dst->nb[2]  / sizeof(float));
         const bool handled = is_rocmfp3_mix
             ? ggml_cuda_rocmfp3_mix_mul_mat_vec_3d(
                   src0->data, (const float *) src1->data, (float *) dst->data,
                   (int) src0->ne[0], (int) src0->ne[1], nslices, ntokens,
-                  s1_s1, s1_s2, d_s1, d_s2, ctx.stream())
+                  s1_tok, s1_sl, d_tok, d_sl, ctx.stream())
             : ggml_cuda_rocmfp2_mix_mul_mat_vec_3d(
                   src0->data, (const float *) src1->data, (float *) dst->data,
                   (int) src0->ne[0], (int) src0->ne[1], nslices, ntokens,
-                  s1_s1, s1_s2, d_s1, d_s2, ctx.stream());
+                  s1_tok, s1_sl, d_tok, d_sl, ctx.stream());
         if (handled) {
             return;
         }

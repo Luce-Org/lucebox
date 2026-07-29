@@ -367,14 +367,18 @@ __global__ void mix_matvec_rocmfp3_slice_kernel(
     const int warp  = blockIdx.x * warps_per_block + (threadIdx.x / MIX_WARP);
     const int row0  = warp * 2;                 // two output rows per warp
     const int lane  = threadIdx.x % MIX_WARP;
-    const int slot  = 0;                        // dense: one logical slot
+    const int slot  = blockIdx.y;               // DENSE: the slice index. It indexes
+                                                // src1 AND dst as well as the weights --
+                                                // zeroing it made every slice read slice-0
+                                                // activations and overwrite slice-0 output.
     const int token = blockIdx.z;
     const bool two  = (row0 + 1) < out;         // false only for an odd-out tail warp
     // slot = blockIdx.y, token = blockIdx.z, so `expert` -- and hence the codebook,
     // mode and expert base -- is WORKGROUP-UNIFORM, which is what makes one LDS table
     // per block legal. Staged before the row0 early return so all threads sync.
-    const int expert = blockIdx.y;              // DENSE: slice index is the grid dim,
-                                                // not a routing lookup
+    const int expert = slot;                    // DENSE: the weight slice is the grid slice,
+                                                // not a routing lookup. This is the ONLY
+                                                // change from the MoE kernel.
     __shared__ float s_lut[2 * MIX_K];
     if ((int) threadIdx.x < 2 * MIX_K) {
         s_lut[threadIdx.x] =
@@ -512,7 +516,8 @@ __global__ void mix_matvec_rocmfp3_moe_kernel(
 bool ggml_cuda_rocmfp3_mix_mul_mat_vec_3d(
         const void * vx, const float * src1, float * dst,
         int in, int out, int nslices, int ntokens,
-        int64_t src1_s1, int64_t src1_s2, int64_t dst_s1, int64_t dst_s2,
+        int64_t src1_token_stride, int64_t src1_slice_stride,
+        int64_t dst_token_stride,  int64_t dst_slice_stride,
         cudaStream_t stream) {
     MixEntry e;
     int slice0;
@@ -529,10 +534,19 @@ bool ggml_cuda_rocmfp3_mix_mul_mat_vec_3d(
     const int threads = warps_per_block * MIX_WARP;
     const int rows_per_block = 2 * warps_per_block;
     dim3 grid((out + rows_per_block - 1) / rows_per_block, nslices, ntokens);
+    // Stride mapping, and the reason this wrapper names its arguments by MEANING.
+    // The kernel inherits the MoE indexing `src1 + token*src1_s2 + (slot%ne11)*src1_s1`
+    // and `dst[token*dst_s2 + slot*dst_s1]`, i.e. **_s1 is the SLOT stride and _s2 the
+    // TOKEN stride** -- the opposite of the ne[1]/ne[2] reading the names suggest. Passing
+    // ggml's nb[1]/nb[2] straight through (and ne11=1) silently dropped the slice offset
+    // entirely, because `slot % 1 == 0`, and produced completely wrong values that the
+    // per-slice comparison test caught. ne11 must be >= nslices for `slot % ne11` to be
+    // the identity on the slice index.
     mix_matvec_rocmfp3_slice_kernel<<<grid, dim3(threads), 0, stream>>>(
         (const uint8_t *) e.base, e.nb02, e.codebooks, e.modes,
-        src1, dst, in, out, /*ne11=*/1,
-        src1_s1, src1_s2, dst_s1, dst_s2);
+        src1, dst, in, out, /*ne11=*/nslices,
+        /*src1_s1=slot  */ src1_slice_stride, /*src1_s2=token*/ src1_token_stride,
+        /*dst_s1 =slot  */ dst_slice_stride,  /*dst_s2 =token*/ dst_token_stride);
     return true;
 }
 

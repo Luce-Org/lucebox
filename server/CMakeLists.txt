@@ -896,6 +896,18 @@ if(DFLASH27B_TESTS)
             ${DFLASH27B_GGML_BACKEND_TARGET}
             hip::host)
         list(APPEND _raw_unit_test_targets test_rocmfp3_mix_registry)
+
+        add_executable(test_rocmfp_mix_slice_matvec test/test_rocmfp_mix_slice_matvec.cpp)
+        set_source_files_properties(test/test_rocmfp_mix_slice_matvec.cpp PROPERTIES LANGUAGE HIP)
+        set_target_properties(test_rocmfp_mix_slice_matvec PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
+        target_include_directories(test_rocmfp_mix_slice_matvec PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
+        target_link_libraries(test_rocmfp_mix_slice_matvec PRIVATE
+            ggml
+            ggml-base
+            ${DFLASH27B_GGML_BACKEND_TARGET}
+            hip::host)
+        list(APPEND _raw_unit_test_targets test_rocmfp_mix_slice_matvec)
     endif()
     add_executable(test_qwen35_tensor_parallel test/test_qwen35_tensor_parallel.cpp)
     target_include_directories(test_qwen35_tensor_parallel PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})

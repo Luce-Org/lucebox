@@ -56,10 +56,13 @@ bool ggml_cuda_rocmfp2_mix_mul_mat_vec(
 // hook rejects, and the dequant->cuBLAS fallback reads more bytes than the f16 it
 // replaces. Requires the tensor registered with n_experts >= nslices; returns false
 // otherwise (rather than reading another tensor's codebook).
+// Strides are named by MEANING deliberately: the underlying kernel's _s1/_s2 are the
+// SLOT and TOKEN strides respectively, which is the reverse of what ne[1]/ne[2] suggests.
 bool ggml_cuda_rocmfp2_mix_mul_mat_vec_3d(
         const void * vx, const float * src1, float * dst,
         int in, int out, int nslices, int ntokens,
-        int64_t src1_s1, int64_t src1_s2, int64_t dst_s1, int64_t dst_s2,
+        int64_t src1_token_stride, int64_t src1_slice_stride,
+        int64_t dst_token_stride,  int64_t dst_slice_stride,
         cudaStream_t stream);
 
 // Stream-sync-free fused MoE matvec for a qtype-106 mul_mat_id (decode). Reads
