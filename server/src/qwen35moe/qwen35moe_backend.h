@@ -44,6 +44,9 @@ protected:
     bool spark_wants_bootstrap() const override;
     bool spark_bootstrap_finalize(const std::string & profile_path) override;
     void after_target_compute(StepGraph & sg, int kv_start, int n_tokens) override;
+    // MoE AR is untested under graph-reuse (expert swaps + per-step host-sync);
+    // fall back to per-step rebuild instead of inheriting the dense fast path.
+    bool supports_ar_graph_reuse() const override { return false; }
 
 private:
     // All-hot placement signal for post_kvflash_init_gate(): set when

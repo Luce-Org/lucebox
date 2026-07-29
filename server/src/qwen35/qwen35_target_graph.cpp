@@ -33,6 +33,7 @@
 #include "internal.h"
 #include "delta_net_chunked.h"
 #include "kv_quant.h"
+#include "qwen35/qwen35_graph_options.h"
 #include "qwen35_ops.h"
 #include "qwen35moe_ffn.h"
 #include "common/chain_rollback_policy.h"
@@ -129,10 +130,10 @@ bool create_target_cache_partial(const TargetWeights & w,
     out.kv_k_type = kv_k_type;
     out.kv_v_type = kv_v_type;
 
-    // Graph-level FWHT K-rotation (TurboQuant-style outlier spreading with
-    // standard quant types that keep fast FA kernel paths on all arches).
-    // Skip for TQ3_0 K cache — that type already applies WHT during quantization.
-    out.kv_k_rotated = (kv_k_type != GGML_TYPE_TQ3_0);
+    // Graph-level FWHT K-rotation (TurboQuant-style outlier spreading).
+    // q4_0 on Ampere skips it by default for parity with llama.cpp's leaner
+    // q4_0 path; DFLASH_FORCE_WHT=1 restores the old graph-level rotation.
+    out.kv_k_rotated = qwen35_should_use_graph_wht_k_rotation(kv_k_type);
 
     const bool needs_256_stride =
         kv_k_type == GGML_TYPE_TQ3_0 || kv_v_type == GGML_TYPE_TQ3_0;
@@ -808,7 +809,10 @@ static ggml_tensor * build_delta_net_block(
 
     // qkv_mixed currently is [conv_channels, n_tokens, n_seqs]; we need
     // [n_tokens, conv_channels, n_seqs] to concat on dim 0.
-    ggml_tensor * qkv_T = ggml_transpose(ctx, qkv_mixed);
+    // Materialize the transpose once so both concat inputs are contiguous
+    // → concat_cont fast path fires (saves 1 ggml_cont per layer vs wrapping
+    // both inputs individually).
+    ggml_tensor * qkv_T = ggml_cont(ctx, ggml_transpose(ctx, qkv_mixed));
 
     ggml_tensor * conv_input = ggml_concat(ctx, conv_states_r, qkv_T, 0);
     // I0 domain: [0,K_conv-2] are prefix-history rows; tree token flat slot t
@@ -886,9 +890,14 @@ static ggml_tensor * build_delta_net_block(
     q_c = ggml_l2_norm(ctx, q_c, w.rms_eps);
     k_c = ggml_l2_norm(ctx, k_c, w.rms_eps);
 
-    // Repeat Q and K from num_k_heads to num_v_heads so they match V's layout
-    // (only needed if not using the fused op's broadcast support).
-    if (num_k_heads != num_v_heads) {
+    // Repeat Q and K from num_k_heads to num_v_heads so they match V's layout.
+    // In pure AR (cap==nullptr, parent_ids==nullptr) the kernel's fastmodulo
+    // broadcast handles the head mismatch natively — skip the repeat to save
+    // one tensor allocation and a memory-bandwidth copy per SSM layer per step.
+    // In tree/capture mode keep the repeat: the DFS parent-reload in the kernel
+    // indexes intermediate states by h_idx (v-head), so Q/K must already be
+    // in the expanded [num_v_heads] layout before the kernel runs.
+    if (num_k_heads != num_v_heads && (cap != nullptr || parent_ids != nullptr)) {
         q_c = ggml_repeat_4d(ctx, q_c, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
         k_c = ggml_repeat_4d(ctx, k_c, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
     }
@@ -940,6 +949,7 @@ static ggml_tensor * build_delta_net_block(
 
     ggml_tensor * output = nullptr;
     ggml_tensor * new_state = nullptr;
+    const bool pure_ar = !use_chunked && parent_ids == nullptr && cap == nullptr && persist_inter == nullptr;
 
     if (use_chunked) {
         auto r = build_delta_net_chunked(ctx, q_c, k_c, v_c, g_tensor, beta, s);
@@ -955,12 +965,12 @@ static ggml_tensor * build_delta_net_block(
             ? ggml_gated_delta_net_tree_persist(ctx, q_c, k_c, v_c, g_tensor, beta, s, parent_ids, persist_inter)
             : ggml_gated_delta_net_tree(ctx, q_c, k_c, v_c, g_tensor, beta, s, parent_ids);
     } else {
-        // Non-tree (chain/prefill). When capture is requested, set src[7] so
-        // the kernel writes per-token intermediates directly to the persistent
-        // cache buffer — same mechanism as _tree_persist, but without tree
-        // parent_ids. Avoids the legacy result-region cpy (and the OOB it
-        // could cause if the result tensor has no embedded intermediate region).
-        result = ggml_gated_delta_net(ctx, q_c, k_c, v_c, g_tensor, beta, s);
+        // Non-tree (chain/prefill). Pure AR writes the final recurrent state
+        // in-place; capture paths keep the regular op and attach src[7] so the
+        // kernel writes per-token intermediates directly to persistent cache.
+        result = pure_ar
+            ? ggml_gated_delta_net_inplace(ctx, q_c, k_c, v_c, g_tensor, beta, s)
+            : ggml_gated_delta_net(ctx, q_c, k_c, v_c, g_tensor, beta, s);
         if (persist_inter) {
             result->src[7] = persist_inter;
         }
@@ -987,8 +997,11 @@ static ggml_tensor * build_delta_net_block(
         S_v * S_v * H_v * r_elt,
         S_v * H_v * n_seq_tokens * n_seqs * r_elt);
 
-    // Persist new_state back to cache
-    ggml_build_forward_expand(gf, ggml_cpy(ctx, new_state, ssm_state));
+    // In pure AR, ggml_gated_delta_net_inplace writes the final recurrent state
+    // directly into ssm_state, so the explicit copy is redundant.
+    if (!pure_ar) {
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, new_state, ssm_state));
+    }
 
     // Expose per-step intermediate states for spec-decode rollback. The patched
     // ggml_gated_delta_net kernel appends an intermediate-states region to the
@@ -1027,12 +1040,12 @@ after_delta_net:
         ggml_build_forward_expand(gf, ggml_cpy(ctx, new_state, s));
     }
 
-    // ── Gated output norm: rms_norm(output) * silu(z_4d)
+    // ── Gated output norm: rms_norm(output) * weight * silu(z_4d)
+    // fused: swiglu_split(z_4d, normed) = silu(z_4d) * normed  (1 GLU kernel vs 2)
     ggml_tensor * z_4d = ggml_reshape_4d(ctx, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
     ggml_tensor * output_n = ggml_rms_norm(ctx, rms_norm_input_f32(ctx, output), w.rms_eps);
     output_n = ggml_mul(ctx, output_n, L.ssm_norm);
-    ggml_tensor * z_silu  = ggml_silu(ctx, z_4d);
-    output_n = ggml_mul(ctx, output_n, z_silu);
+    output_n = ggml_swiglu_split(ctx, z_4d, output_n);
 
     // Reshape to [d_inner, n_tokens]
     ggml_tensor * flat = ggml_reshape_3d(ctx, output_n,
