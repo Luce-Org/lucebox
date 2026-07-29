@@ -289,6 +289,232 @@ else
 fi
 rm -rf "$native_tmp"
 
+# Engine client connectors: use already-installed binaries, preserve every
+# normal client config, and point a Lucebox-owned profile at the local API.
+# Fake binaries make this an execution-path test without installing or
+# launching any real client.
+test_engine_client_connectors() {
+    local label="engine client connectors are isolated and executable"
+    local sandbox bin_dir state_dir home_dir log out rc client command_name
+    sandbox=$(mktemp -d "${TMPDIR:-/tmp}/lucebox-connectors.XXXXXX")
+    bin_dir="$sandbox/bin"
+    state_dir="$sandbox/lucebox-home"
+    home_dir="$sandbox/home"
+    log="$sandbox/client.log"
+    mkdir -p "$bin_dir" "$state_dir" "$home_dir/.codex" "$home_dir/.config/opencode"
+    cat > "$state_dir/config.toml" <<'TOML'
+[runtime]
+port = 18080
+
+[model]
+preset = "qwen3.6-27b"
+
+[dflash]
+max_ctx = 98304
+TOML
+    printf 'personal-codex-config\n' > "$home_dir/.codex/config.toml"
+    printf 'personal-opencode-config\n' > "$home_dir/.config/opencode/opencode.json"
+
+    cat > "$bin_dir/curl" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' '{"object":"list","data":[{"id":"qwen3.6-27b"}]}'
+exit 0
+STUB
+    chmod +x "$bin_dir/curl"
+    for command_name in claude codex opencode hermes pi openclaw open-webui; do
+        cat > "$bin_dir/$command_name" <<'STUB'
+#!/usr/bin/env bash
+connector_context="${ANTHROPIC_BASE_URL:-}"
+[ -n "$connector_context" ] || connector_context="${OPENCODE_CONFIG:-}"
+[ -n "$connector_context" ] || connector_context="${HERMES_HOME:-}"
+[ -n "$connector_context" ] || connector_context="${PI_CODING_AGENT_DIR:-}"
+[ -n "$connector_context" ] || connector_context="${OPENCLAW_STATE_DIR:-}"
+[ -n "$connector_context" ] || connector_context="${OPENAI_API_BASE_URL:-}"
+printf '%s|%s|%s|%s|%s|%s\n' \
+  "$(basename "$0")" "$*" "$connector_context" \
+  "${OPENAI_BASE_URL:-}" "${OPENCLAW_WORKSPACE_DIR:-}" "${WEBUI_AUTH:-}" \
+  >> "${LUCEBOX_TEST_CONNECTOR_LOG:?}"
+if [ "$(basename "$0")" = "claude" ] \
+   && { [ -n "${ANTHROPIC_API_KEY:-}" ] || [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; }; then
+  exit 42
+fi
+if [ "$(basename "$0")" = "opencode" ] && [ "${1:-}" = "--version" ]; then
+  printf '2.0.0\n'
+fi
+if [ "$(basename "$0")" = "openclaw" ] \
+   && [ "${1:-}" = "config" ] && [ "${2:-}" = "patch" ]; then
+  mkdir -p "$(dirname "${OPENCLAW_CONFIG_PATH:?}")"
+  cp "${4:?}" "$OPENCLAW_CONFIG_PATH"
+fi
+exit 0
+STUB
+        chmod +x "$bin_dir/$command_name"
+    done
+
+    rc=0
+    for client in claude codex opencode hermes pi openclaw openwebui; do
+        if ! out=$(HOME="$home_dir" XDG_CONFIG_HOME="$home_dir/.config" \
+            PATH="$bin_dir:$PATH" LUCEBOX_HOME="$state_dir" \
+            LUCEBOX_TEST_CONNECTOR_LOG="$log" NO_COLOR=1 \
+            ANTHROPIC_API_KEY=personal-key CLAUDE_CODE_OAUTH_TOKEN=personal-oauth \
+            bash "$SCRIPT" connect "$client" 2>&1); then
+            rc=1
+            break
+        fi
+        if [[ "$out" != *"is linked to Lucebox"* ]]; then
+            rc=1
+            break
+        fi
+    done
+
+    local missing=""
+    [ "$rc" -eq 0 ] || missing+=" launch-$client"
+    grep -qF 'personal-codex-config' "$home_dir/.codex/config.toml" \
+        || missing+=" codex-default-overwritten"
+    grep -qF 'personal-opencode-config' "$home_dir/.config/opencode/opencode.json" \
+        || missing+=" opencode-default-overwritten"
+    grep -qF 'base_url = "http://127.0.0.1:18080/v1"' \
+        "$home_dir/.codex/lucebox-local.config.toml" \
+        || missing+=" codex-profile"
+    grep -qF '"providers"' "$state_dir/connectors/opencode/opencode.json" \
+        || missing+=" opencode-v2-profile"
+    grep -qF 'http://127.0.0.1:18080/v1' "$state_dir/connectors/hermes/config.yaml" \
+        || missing+=" hermes-profile"
+    grep -qF 'provider: "custom"' "$state_dir/connectors/hermes/config.yaml" \
+        || missing+=" hermes-custom-provider"
+    grep -qF '"baseUrl": "http://127.0.0.1:18080/v1"' \
+        "$state_dir/connectors/pi/models.json" \
+        || missing+=" pi-profile"
+    grep -qF '"api": "openai-completions"' "$state_dir/connectors/pi/models.json" \
+        || missing+=" pi-chat-completions"
+    grep -qF '"primary": "lucebox/qwen3.6-27b"' \
+        "$state_dir/connectors/openclaw/lucebox.patch.json" \
+        || missing+=" openclaw-profile"
+    cmp -s "$state_dir/connectors/openclaw/lucebox.patch.json" \
+        "$state_dir/connectors/openclaw/state/openclaw.json" \
+        || missing+=" openclaw-isolation"
+    python3 -m json.tool "$state_dir/connectors/opencode/opencode.json" >/dev/null \
+        || missing+=" opencode-invalid-json"
+    python3 -m json.tool "$state_dir/connectors/pi/models.json" >/dev/null \
+        || missing+=" pi-invalid-json"
+    python3 -m json.tool "$state_dir/connectors/openclaw/lucebox.patch.json" >/dev/null \
+        || missing+=" openclaw-invalid-json"
+    python3 -c 'import sys, tomllib; tomllib.load(open(sys.argv[1], "rb"))' \
+        "$home_dir/.codex/lucebox-local.config.toml" \
+        || missing+=" codex-invalid-toml"
+    grep -qF 'open-webui|serve --host 127.0.0.1 --port 3000' "$log" \
+        || missing+=" openwebui-launch"
+    grep -qF 'open-webui|serve --host 127.0.0.1 --port 3000|http://127.0.0.1:18080/v1|||True' "$log" \
+        || missing+=" openwebui-auth"
+    grep -qF 'claude|--model qwen3.6-27b|http://127.0.0.1:18080' "$log" \
+        || missing+=" claude-endpoint"
+    grep -qF 'codex|--profile lucebox-local --model qwen3.6-27b' "$log" \
+        || missing+=" codex-launch"
+    [ "$(cat "$state_dir/connectors/selected")" = "openwebui" ] \
+        || missing+=" remembered-selection"
+    [ -z "$(find "$state_dir/connectors" -type f ! -perm 600 -print -quit)" ] \
+        || missing+=" connector-file-mode"
+    [ -z "$(find "$state_dir/connectors" -type d ! -perm 700 -print -quit)" ] \
+        || missing+=" connector-directory-mode"
+    [ "$(find "$home_dir/.codex/lucebox-local.config.toml" -perm 600 -print)" ] \
+        || missing+=" codex-profile-mode"
+
+    if [ -n "$missing" ]; then
+        report fail "$label" "missing:$missing; output=${out:-}; log=$(tail -10 "$log" 2>/dev/null)"
+    else
+        report ok "$label"
+    fi
+
+    out=$(HOME="$home_dir" PATH="$bin_dir:$PATH" LUCEBOX_HOME="$state_dir" \
+        LUCEBOX_CODEX_BIN="$sandbox/does-not-exist/codex" NO_COLOR=1 \
+        bash "$SCRIPT" connect codex --no-launch 2>&1 || true)
+    if [[ "$out" == *"does not install harnesses"* ]]; then
+        report ok "missing harness is reported without installing it"
+    else
+        report fail "missing harness is reported without installing it" "output: $out"
+    fi
+
+    local unowned_home="$sandbox/unowned-home"
+    mkdir -p "$unowned_home/.codex"
+    printf 'user-owned-lucebox-profile\n' > "$unowned_home/.codex/lucebox-local.config.toml"
+    out=$(HOME="$unowned_home" PATH="$bin_dir:$PATH" LUCEBOX_HOME="$state_dir" \
+        LUCEBOX_TEST_CONNECTOR_LOG="$log" NO_COLOR=1 \
+        bash "$SCRIPT" connect codex --no-launch 2>&1 || true)
+    if [[ "$out" == *"refusing to replace an unowned Codex profile"* ]] \
+       && grep -qF 'user-owned-lucebox-profile' \
+           "$unowned_home/.codex/lucebox-local.config.toml"; then
+        report ok "Codex connector refuses to overwrite an unowned profile"
+    else
+        report fail "Codex connector refuses to overwrite an unowned profile" "output: $out"
+    fi
+
+    local offline_bin="$sandbox/offline-bin" before_lines after_lines
+    mkdir -p "$offline_bin"
+    cp "$bin_dir/codex" "$offline_bin/codex"
+    cat > "$offline_bin/curl" <<'STUB'
+#!/usr/bin/env bash
+exit 1
+STUB
+    chmod +x "$offline_bin/curl"
+    before_lines=$(wc -l < "$log" | tr -d ' ')
+    out=$(HOME="$home_dir" PATH="$offline_bin:$PATH" LUCEBOX_HOME="$state_dir" \
+        LUCEBOX_TEST_CONNECTOR_LOG="$log" NO_COLOR=1 \
+        bash "$SCRIPT" connect codex 2>&1 || true)
+    after_lines=$(wc -l < "$log" | tr -d ' ')
+    if [[ "$out" == *"Lucebox API is not reachable"* ]] \
+       && [ "$before_lines" = "$after_lines" ]; then
+        report ok "connector does not launch a client when the API is unavailable"
+    else
+        report fail "connector does not launch a client when the API is unavailable" \
+            "before=$before_lines after=$after_lines output=$out"
+    fi
+
+    local small_state="$sandbox/small-state"
+    mkdir -p "$small_state"
+    cat > "$small_state/config.toml" <<'TOML'
+[runtime]
+port = 18080
+
+[model]
+preset = "qwen3.6-27b"
+
+[dflash]
+max_ctx = 4096
+TOML
+    out=$(HOME="$home_dir" PATH="$bin_dir:$PATH" LUCEBOX_HOME="$small_state" \
+        LUCEBOX_TEST_CONNECTOR_LOG="$log" NO_COLOR=1 \
+        bash "$SCRIPT" connect pi --no-launch 2>&1 || true)
+    if grep -qF '"contextWindow": 4096' "$small_state/connectors/pi/models.json" \
+       && grep -qF '"maxTokens": 2048' "$small_state/connectors/pi/models.json"; then
+        report ok "connector output allowance fits a small context profile"
+    else
+        report fail "connector output allowance fits a small context profile" "output: $out"
+    fi
+
+    out=$(HOME="$home_dir" PATH="$bin_dir:$PATH" LUCEBOX_HOME="$small_state" \
+        LUCEBOX_TEST_CONNECTOR_LOG="$log" NO_COLOR=1 \
+        bash "$SCRIPT" connect hermes --no-launch 2>&1 || true)
+    if [[ "$out" == *"Hermes requires at least a 65536-token context"* ]]; then
+        report ok "Hermes connector rejects an unsupported small context"
+    else
+        report fail "Hermes connector rejects an unsupported small context" "output: $out"
+    fi
+
+    out=$(HOME="$home_dir" XDG_CONFIG_HOME="$home_dir/.config" \
+        PATH="$bin_dir:$PATH" LUCEBOX_HOME="$state_dir" \
+        LUCEBOX_TEST_CONNECTOR_LOG="$log" LUCEBOX_NO_CLEAR=1 NO_COLOR=1 \
+        bash -c "printf 'q\\n' | bash '$SCRIPT' menu" 2>&1 || true)
+    if [[ "$out" == *"Harness:      Codex"* ]] \
+       && [[ "$out" == *"Connect or open your harness"* ]]; then
+        report ok "main menu shows the selected engine harness"
+    else
+        report fail "main menu shows the selected engine harness" "output: $(tail -20 <<<"$out")"
+    fi
+
+    rm -rf "$sandbox"
+}
+test_engine_client_connectors
+
 # ── 7. Unknown subcommand → cmd_in_container fallback path. Same rule:
 # clean error, no raw bash leak.
 assert_no_set_u_leak "unknown subcommand dispatch" "$SCRIPT" no-such-subcommand

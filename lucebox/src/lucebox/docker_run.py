@@ -274,6 +274,11 @@ def server_run_spec(cfg: Config) -> DockerRunSpec:
         ("DFLASH_THINK_MAX", str(cfg.dflash.think_max)),
         ("DFLASH_PORT", "8080"),
     ]
+    # Keep the API model catalog aligned with the preset selected by the host
+    # CLI. Client connectors use this id for explicit model selection and
+    # clients such as Codex also discover it through ``/v1/models``.
+    if cfg.model.preset:
+        env.append(("DFLASH_MODEL_NAME", cfg.model.preset))
     # Resolve target/draft GGUFs in priority order:
     #   1. cfg.model.target_file / draft_file (explicit override in config.toml)
     #   2. PRESETS[cfg.model.preset].target_file / draft_file / speculator_dir (registry)
