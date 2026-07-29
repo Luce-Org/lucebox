@@ -618,6 +618,30 @@ FILE * ggml_fopen(const char * fname, const char * mode) {
 
 }
 
+// qtype 105/106 carry a per-expert LEARNED CODEBOOK out of band -- GGUF KV for 105, the
+// loader sidecar for 106 -- which the generic type_traits signature cannot reach. The
+// uniform fixed-level decoders used to be wired in here as a "fallback". That was wrong:
+// for a mode-0 (uniform) expert the fixed decoder coincidentally agrees, but for a mode-1
+// (adaptive) expert it SILENTLY PRODUCES WRONG VALUES, so any generic CPU op, offload or
+// tool path quietly corrupted adaptive experts instead of refusing an operation it cannot
+// perform. Aborting is the only correct generic behaviour; the real decoders are the
+// dedicated CUDA/HIP mul_mat_id kernels and the registry-aware to_fp16 shim.
+static void rocmfpx_mix_to_float_unsupported(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    GGML_UNUSED(x); GGML_UNUSED(y); GGML_UNUSED(k);
+    GGML_ABORT("rocmfpx_mix: generic CPU dequantization is unsupported -- the per-expert "
+               "codebook is out-of-band. Use the CUDA/HIP mix path (mul_mat_id or the "
+               "registry-aware to_fp16 shim).");
+}
+// Symmetric hole: producing one of these types needs a FITTED per-expert codebook plus the
+// sidecar/KV that carries it. from_float_ref could previously mint a qtype-105/106 tensor
+// with no codebook at all -- a tensor nothing can decode correctly.
+static void rocmfpx_mix_from_float_unsupported(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    GGML_UNUSED(x); GGML_UNUSED(y); GGML_UNUSED(k);
+    GGML_ABORT("rocmfpx_mix: quantization requires a fitted per-expert codebook and its "
+               "sidecar/KV. Produce these tensors with the geo-quant exporter.");
+}
+
+
 static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
     [GGML_TYPE_I8] = {
         .type_name                = "i8",
@@ -758,27 +782,29 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
     [GGML_TYPE_Q3_1_ROCMFP3_MIX] = {
         // Per-expert mixed absmax/adaptive ROCmFP3 (P4). Same 14B block wire as
         // q3_0; the per-expert codebook lives in GGUF KV and decode happens in the
-        // dedicated CUDA/HIP mul_mat_id path. to_float here is the legacy fixed-level
-        // fallback (used only by generic CPU paths, not the HIP serving path).
+        // dedicated CUDA/HIP mul_mat_id path. The generic to_float/from_float_ref ABORT:
+        // see rocmfpx_mix_to_float_unsupported above for why a fixed-level fallback here
+        // is not merely approximate but silently wrong for adaptive experts.
         .type_name                = "q3_1_rocmfp3_mix",
         .blck_size                = QK_ROCMFP3,
         .type_size                = sizeof(block_rocmfp3),
         .is_quantized             = true,
-        .to_float                 = (ggml_to_float_t) rocmfpx_dequantize_row_fp3,
-        .from_float_ref           = (ggml_from_float_t) rocmfpx_quantize_row_fp3_ref,
+        .to_float                 = (ggml_to_float_t) rocmfpx_mix_to_float_unsupported,
+        .from_float_ref           = (ggml_from_float_t) rocmfpx_mix_from_float_unsupported,
     },
     [GGML_TYPE_Q2_1_ROCMFP2_MIX] = {
         // Per-expert mixed absmax/adaptive ROCmFP2 (gate/up). Same 10B block wire as
         // q2_0, so a GGUF splice from 107 is offset-preserving; the per-expert
         // codebook travels in the loader sidecar and decode happens in the dedicated
-        // CUDA/HIP mul_mat_id path. to_float here is the legacy fixed-level fallback
-        // (generic CPU paths only, not the HIP serving path).
+        // CUDA/HIP mul_mat_id path. The generic to_float/from_float_ref ABORT: see
+        // rocmfpx_mix_to_float_unsupported above for why a fixed-level fallback here is
+        // not merely approximate but silently wrong for adaptive experts.
         .type_name                = "q2_1_rocmfp2_mix",
         .blck_size                = QK_ROCMFP2,
         .type_size                = sizeof(block_rocmfp2),
         .is_quantized             = true,
-        .to_float                 = (ggml_to_float_t) rocmfpx_dequantize_row_fp2,
-        .from_float_ref           = (ggml_from_float_t) rocmfpx_quantize_row_fp2_ref,
+        .to_float                 = (ggml_to_float_t) rocmfpx_mix_to_float_unsupported,
+        .from_float_ref           = (ggml_from_float_t) rocmfpx_mix_from_float_unsupported,
     },
     [GGML_TYPE_Q2_0_ROCMFP2] = {
         .type_name                = "q2_0_rocmfp2",

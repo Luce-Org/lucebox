@@ -92,6 +92,22 @@ extern "C" void ggml_cuda_rocmfp2_mix_register_host(
         CUDA_CHECK(err);  // report/abort exactly as before, but only after cleanup
         return;
     }
+    // GUARD the wide load-from-floor staging in mix_block_accum. It reads the two
+    // 8-aligned u64 bracketing each 10-byte block, i.e. a 16 B window from
+    // (addr & ~7). For the LAST block of a row that window ends
+    // (6 - (10*(nb-1) & 7)) B past the row end, which is 0 only when nb % 4 == 0,
+    // i.e. in % 128 == 0. Every shipped shape satisfies this (in = 256..32768, all
+    // multiples of 128), but the loader otherwise accepts any in % 32 == 0, so a
+    // future shape would read up to 6 B past the tensor allocation -- and for the
+    // last tensor in a buffer that is a real fault, not a benign over-read.
+    // Rejecting at registration is preferred over a tail branch in the hot loop:
+    // this matvec is latency-bound on exactly those block loads.
+    if (in % 128 != 0) {
+        GGML_ABORT("rocmfp2_mix: in=%d must be a multiple of 128 (block count nb=%d "
+                   "must be a multiple of 4) for the 16 B wide-load window to stay "
+                   "in bounds on the final block; got in %% 128 = %d",
+                   in, in / 32, in % 128);
+    }
     mix_register_impl(base, nb02, n_experts, out, in, (const nv_bfloat16 *) cb_dev,
                       (const uint8_t *) modes_dev, (const uint8_t *) rots_dev,
                       /*owns_device=*/true);
@@ -275,7 +291,9 @@ __device__ __forceinline__ void mix_block_accum(
     // (6 - (10*(nb-1) & 7)) B, which is 0 exactly when nb % 4 == 0 (in % 128 == 0).
     // in=4096 -> nb=128 -> overrun 0 (last block reads [rowbase+1272, rowbase+1280),
     // exactly to the 8-aligned row end). If a future shape has nb % 4 != 0, the last
-    // block reads up to 6 B past the tensor end -- add a floor-clamp guard there.
+    // block reads up to 6 B past the tensor end. That is now REJECTED AT REGISTRATION
+    // (see the in % 128 guard in ggml_cuda_rocmfp2_mix_register_host) rather than
+    // left to chance, so this loop can stay branch-free.
     const uintptr_t addr  = (uintptr_t) b;
     const uint8_t * base8 = (const uint8_t *) __builtin_assume_aligned(
             (const void *) (addr & ~(uintptr_t) 7), 8);
