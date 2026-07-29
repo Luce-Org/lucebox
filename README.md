@@ -113,9 +113,20 @@ lucebox
 ```
 
 `lucebox` opens the branded menu. **Quick setup** detects NVIDIA CUDA or AMD
-ROCm, lets you choose and download a model, applies safe hardware-aware
-optimizations, and starts the inference service. Wi-Fi and device provisioning
+ROCm, lets you choose and download a model, applies a model- and hardware-aware
+**Automatic** profile, and starts the inference service. Automatic explains its
+DFlash, PFlash, KVFlash, and Spark choices and prefers exact, all-GPU execution
+when it fits. It enables paging or expert offload only when the selected model
+and primary GPU need them; Spark also requires enough host RAM for its cold
+experts. **Review optimizations** offers an Advanced mode for users who want to
+override those four choices. Wi-Fi and device provisioning
 are intentionally outside this inference-only CLI.
+
+On heterogeneous builds the CLI selects one primary accelerator: CUDA on an
+RTX 3090 + Strix machine, and the largest-VRAM AMD device on an R9700 + Strix
+machine. Automatic tuning never adds VRAM across devices. The engine's advanced
+layer-split paths remain contributor workflows; transparent multi-GPU sharding
+is not part of this CLI release.
 
 Contributors can open the same menu from a repository checkout with
 `./lucebox.sh`. Its **Developer tools** can build and run the native C++ engine
@@ -125,6 +136,7 @@ harnesses. Every menu action also has a scriptable command, for example:
 ```bash
 lucebox models select
 lucebox optimize --yes
+lucebox optimize --advanced
 lucebox start
 ./lucebox.sh build cuda
 ./lucebox.sh native cuda

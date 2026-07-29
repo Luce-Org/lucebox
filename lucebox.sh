@@ -237,6 +237,7 @@ CONFIG_HOME="${LUCEBOX_HOME:-$HOME/.lucebox}"
 : "${LUCEBOX_HOST_GPU_LIST_CSV:=}"
 : "${LUCEBOX_HOST_CUDA_VISIBLE_DEVICES:=}"
 : "${LUCEBOX_HOST_HIP_VISIBLE_DEVICES:=}"
+: "${LUCEBOX_HOST_ROCR_VISIBLE_DEVICES:=}"
 # Tracks whether probe_host has actually run; pieces of the code that need
 # fresh host facts (e.g. cmd_check, cmd_serve) gate on this. Default 0.
 : "${_LUCEBOX_HOST_PROBED:=0}"
@@ -444,7 +445,7 @@ probe_host() {
     # NVIDIA GPU remains the default backend (RTX 3090 + Strix → cuda12), but
     # recording the AMD companion prevents the APU from confusing readiness
     # reporting and lets an explicit rocm variant remain possible.
-    local amd_csv="" amd_rows=""
+    local amd_csv="" amd_rows="" amd_primary_idx=""
     if command -v amd-smi &>/dev/null; then
         amd_csv=$(amd-smi static --asic --vram --csv 2>/dev/null || echo "")
         if [ -n "$amd_csv" ]; then
@@ -480,6 +481,7 @@ probe_host() {
         amd_primary=$(printf '%s\n' "$amd_rows" | sort -t'|' -k4,4nr | head -1)
         local amd_idx amd_name amd_arch amd_mem_mib
         IFS='|' read -r amd_idx amd_name amd_arch amd_mem_mib <<<"$amd_primary"
+        amd_primary_idx="$amd_idx"
         LUCEBOX_HOST_AMD_GPU_NAME="$amd_name"
         LUCEBOX_HOST_AMD_GPU_ARCH="$amd_arch"
         LUCEBOX_HOST_AMD_VRAM_GB=$((amd_mem_mib / 1024))
@@ -528,7 +530,20 @@ probe_host() {
     done
     # CUDA_VISIBLE_DEVICES from the caller's env (empty default = "all GPUs").
     LUCEBOX_HOST_CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-}"
+    # The native server currently uses one primary device unless an advanced
+    # user explicitly supplies a visibility list. On R9700 + Strix systems,
+    # pinning the largest-VRAM card keeps the runtime aligned with the GPU that
+    # the readiness screen and optimizer selected, even when ROCm enumerates
+    # the integrated GPU first.
     LUCEBOX_HOST_HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-}"
+    LUCEBOX_HOST_ROCR_VISIBLE_DEVICES="${ROCR_VISIBLE_DEVICES:-}"
+    if [ -z "$LUCEBOX_HOST_HIP_VISIBLE_DEVICES" ] \
+       && [ -z "$LUCEBOX_HOST_ROCR_VISIBLE_DEVICES" ]; then
+        # AMD recommends ROCR_VISIBLE_DEVICES for Linux. Use one isolation
+        # layer, not both, so a physical device index is never filtered and
+        # then interpreted again in a renumbered HIP-visible set.
+        LUCEBOX_HOST_ROCR_VISIBLE_DEVICES="$amd_primary_idx"
+    fi
 
     # OS / kernel identity. /etc/os-release is the freedesktop spec for
     # "what distro is this?" and we keep PRETTY_NAME verbatim (it already
@@ -614,7 +629,7 @@ probe_host() {
     export LUCEBOX_HOST_OS_PRETTY LUCEBOX_HOST_KERNEL LUCEBOX_HOST_WSL_VERSION
     export LUCEBOX_HOST_NVIDIA_CTK_VERSION LUCEBOX_HOST_CPU_MODEL
     export LUCEBOX_HOST_GPU_LIST_CSV LUCEBOX_HOST_CUDA_VISIBLE_DEVICES
-    export LUCEBOX_HOST_HIP_VISIBLE_DEVICES
+    export LUCEBOX_HOST_HIP_VISIBLE_DEVICES LUCEBOX_HOST_ROCR_VISIBLE_DEVICES
     _LUCEBOX_HOST_PROBED=1
 }
 
@@ -768,6 +783,26 @@ _append_host_env() {
     done
 }
 
+# Override the generic primary-GPU facts when the user deliberately selects
+# the AMD backend on a mixed NVIDIA + AMD machine. probe_host keeps NVIDIA as
+# the mixed-build default, but Automatic must tune the accelerator that will
+# actually run the model.
+_append_selected_backend_facts() {  # usage: arrayname variant
+    # shellcheck disable=SC2178
+    local -n _facts_arr="$1"
+    local variant="$2"
+    if _variant_is_rocm "$variant" && [ "$LUCEBOX_HOST_HAS_AMD_GPU" = "1" ]; then
+        _facts_arr+=(
+            -e "LUCEBOX_HOST_GPU_VENDOR=amd"
+            -e "LUCEBOX_HOST_GPU_NAME=$LUCEBOX_HOST_AMD_GPU_NAME"
+            -e "LUCEBOX_HOST_GPU_COUNT=$LUCEBOX_HOST_AMD_GPU_COUNT"
+            -e "LUCEBOX_HOST_VRAM_GB=$LUCEBOX_HOST_AMD_VRAM_GB"
+            -e "LUCEBOX_HOST_GPU_SM=$LUCEBOX_HOST_AMD_GPU_ARCH"
+            -e "LUCEBOX_HOST_GPU_LIST_CSV=$LUCEBOX_HOST_AMD_GPU_LIST_CSV"
+        )
+    fi
+}
+
 # Append the LUCEBOX_* scalar overrides (image/variant/port/container/models)
 # plus the optional HF_TOKEN guard onto the named docker-argv array. Shared
 # by the docker-run (build_orchestrator_argv) and docker-exec
@@ -802,8 +837,18 @@ _append_gpu_args() {  # usage: _append_gpu_args arrayname variant
             --group-add render
             --security-opt seccomp=unconfined
         )
+        if [ -n "${LUCEBOX_HOST_ROCR_VISIBLE_DEVICES:-}" ]; then
+            _gpu_arr+=(-e "ROCR_VISIBLE_DEVICES=$LUCEBOX_HOST_ROCR_VISIBLE_DEVICES")
+        elif [ -n "${LUCEBOX_HOST_HIP_VISIBLE_DEVICES:-}" ]; then
+            _gpu_arr+=(
+                -e "HIP_VISIBLE_DEVICES=$LUCEBOX_HOST_HIP_VISIBLE_DEVICES"
+            )
+        fi
     else
         _gpu_arr+=(--gpus all)
+        if [ -n "${LUCEBOX_HOST_CUDA_VISIBLE_DEVICES:-}" ]; then
+            _gpu_arr+=(-e "CUDA_VISIBLE_DEVICES=$LUCEBOX_HOST_CUDA_VISIBLE_DEVICES")
+        fi
     fi
 }
 
@@ -863,6 +908,7 @@ build_orchestrator_argv() {
     argv+=(-e "HOME=$CONFIG_HOME")
     # Host facts — Python side reads these instead of reprobing.
     _append_host_env argv
+    _append_selected_backend_facts argv "$variant"
     # User overrides for image/port/container/models scalars + HF_TOKEN.
     # Always exports the resolved models dir so the in-container CLI sees
     # the same path the wrapper mounts (the XDG default flows through too).
@@ -990,6 +1036,7 @@ cmd_serve() {
         -e "HOME=$CONFIG_HOME")
     _append_gpu_args fallback_argv "$variant"
     _append_host_env fallback_argv
+    _append_selected_backend_facts fallback_argv "$variant"
     _append_scalar_env fallback_argv "$variant"
     fallback_argv+=("${IMAGE_BASE}:${variant}")
     _serve_and_track "${fallback_argv[@]}"
@@ -1292,11 +1339,26 @@ _safe_model_relative_path() {
     return 0
 }
 
+_model_artifact_ready() {
+    local path="$1"
+    if [ -f "$path" ]; then
+        [ -s "$path" ]
+        return
+    fi
+    if [ -d "$path" ]; then
+        [ -n "$(find -L "$path" -maxdepth 4 -type f \
+            \( -name '*.gguf' -o -name '*.safetensors' \) \
+            -size +0c -print -quit 2>/dev/null)" ]
+        return
+    fi
+    return 1
+}
+
 _selected_model_paths() {
     # Emit target path, draft path (or "none"), and model id on separate lines.
     # `models select` persists the filenames, so preset mapping is only a
     # compatibility fallback for hand-written config files.
-    local preset target_file draft_file target_path draft_path="none"
+    local preset target_file draft_file target_path draft_path="none" speculative_decode
     preset=$(_lucebox_config_get model.preset)
     target_file=$(_lucebox_config_get model.target_file)
     draft_file=$(_lucebox_config_get model.draft_file)
@@ -1316,6 +1378,10 @@ _selected_model_paths() {
             gemma-4-31b) draft_file="gemma-4-31B-it-DFlash-q8_0.gguf" ;;
         esac
     fi
+    speculative_decode=$(_lucebox_config_get dflash.speculative_decode)
+    case "$speculative_decode" in
+        false|0|no|off) draft_file="" ;;
+    esac
     _safe_model_relative_path "$target_file" \
         || die "no valid model is selected — run '$SCRIPT_NAME models select' first"
     target_path="$DEFAULT_MODELS_DIR/$target_file"
@@ -1324,6 +1390,10 @@ _selected_model_paths() {
             || die "invalid model.draft_file in $(_lucebox_config_path)"
         draft_path="$DEFAULT_MODELS_DIR/draft/$draft_file"
     elif [ "$preset" = "laguna-xs.2" ] \
+         && [ "$speculative_decode" != "false" ] \
+         && [ "$speculative_decode" != "0" ] \
+         && [ "$speculative_decode" != "no" ] \
+         && [ "$speculative_decode" != "off" ] \
          && [ -d "$DEFAULT_MODELS_DIR/draft/laguna-xs2-speculator" ]; then
         draft_path="$DEFAULT_MODELS_DIR/draft/laguna-xs2-speculator"
     fi
@@ -1332,15 +1402,32 @@ _selected_model_paths() {
 
 _export_native_config() {
     local key env_name value
+    if [ -n "${LUCEBOX_HOST_ROCR_VISIBLE_DEVICES:-}" ]; then
+        export ROCR_VISIBLE_DEVICES="$LUCEBOX_HOST_ROCR_VISIBLE_DEVICES"
+        unset HIP_VISIBLE_DEVICES
+    elif [ -n "${LUCEBOX_HOST_HIP_VISIBLE_DEVICES:-}" ]; then
+        export HIP_VISIBLE_DEVICES="$LUCEBOX_HOST_HIP_VISIBLE_DEVICES"
+        unset ROCR_VISIBLE_DEVICES
+    fi
+    if [ -n "${LUCEBOX_HOST_CUDA_VISIBLE_DEVICES:-}" ]; then
+        export CUDA_VISIBLE_DEVICES="$LUCEBOX_HOST_CUDA_VISIBLE_DEVICES"
+    fi
     while IFS='|' read -r key env_name; do
         [ -n "$key" ] || continue
         value=$(_lucebox_config_get "$key")
         [ -n "$value" ] || continue
         case "$key" in
-            dflash.lazy|dflash.debug_thinking_logits)
+            dflash.speculative_decode|dflash.lazy|dflash.spark|dflash.debug_thinking_logits)
                 case "$value" in
                     true|1|yes|on) value=1 ;;
                     *)             value=0 ;;
+                esac
+                ;;
+            dflash.prefill_drafter)
+                case "$value" in
+                    /opt/lucebox-hub/server/models/*)
+                        value="$DEFAULT_MODELS_DIR/${value#/opt/lucebox-hub/server/models/}"
+                        ;;
                 esac
                 ;;
         esac
@@ -1348,6 +1435,7 @@ _export_native_config() {
     done <<'EOF'
 dflash.budget|DFLASH_BUDGET
 dflash.max_ctx|DFLASH_MAX_CTX
+dflash.speculative_decode|DFLASH_SPECULATIVE_DECODE
 dflash.lazy|DFLASH_LAZY
 dflash.prefix_cache_slots|DFLASH_PREFIX_CACHE_SLOTS
 dflash.prefill_cache_slots|DFLASH_PREFILL_CACHE_SLOTS
@@ -1357,6 +1445,11 @@ dflash.prefill_mode|DFLASH_PREFILL_MODE
 dflash.prefill_keep_ratio|DFLASH_PREFILL_KEEP
 dflash.prefill_threshold|DFLASH_PREFILL_THRESHOLD
 dflash.prefill_drafter|DFLASH_PREFILL_DRAFTER
+dflash.kvflash|DFLASH_KVFLASH
+dflash.kvflash_policy|DFLASH_KVFLASH_POLICY
+dflash.kvflash_tau|DFLASH_KVFLASH_TAU
+dflash.spark|DFLASH_SPARK
+dflash.spark_vram_gb|DFLASH_SPARK_VRAM_GB
 dflash.think_max|DFLASH_THINK_MAX
 dflash.fa_window|DFLASH_FA_WINDOW
 dflash.think_soft_close_min_ratio|DFLASH_THINK_SOFT_CLOSE_MIN_RATIO
@@ -1419,9 +1512,9 @@ cmd_native_serve() {
     target="${selected[0]:-}"
     draft="${selected[1]:-none}"
     model_id="${selected[2]:-lucebox}"
-    [ -f "$target" ] \
+    _model_artifact_ready "$target" \
         || die "selected target is not installed: $target — run '$SCRIPT_NAME models select'"
-    if [ "$draft" != "none" ] && [ ! -e "$draft" ]; then
+    if [ "$draft" != "none" ] && ! _model_artifact_ready "$draft"; then
         die "selected draft is not installed: $draft — run '$SCRIPT_NAME models select'"
     fi
 
@@ -1481,15 +1574,19 @@ EOF
     mapfile -t selected < <(_selected_model_paths)
     target="${selected[0]:-}"
     draft="${selected[1]:-none}"
-    [ -f "$target" ] \
+    _model_artifact_ready "$target" \
         || die "selected target is not installed: $target — run '$SCRIPT_NAME models select'"
 
+    _export_native_config
     export REPO_DIR="$repo"
     export DFLASH_SERVER_BIN="$binary"
     export DFLASH_TARGET="$target"
     export TARGET="$target"
     export DFLASH_DRAFT="$draft"
     export DRAFT="$draft"
+    if [ "$draft" != "none" ]; then
+        export VERIFY_MODE="${VERIFY_MODE:-ddtree}"
+    fi
     local max_ctx budget
     max_ctx=$(_lucebox_config_get dflash.max_ctx)
     budget=$(_lucebox_config_get dflash.budget)
@@ -1726,6 +1823,11 @@ cmd_check() {
             _row warn "rocm" "GPU detected, userspace version unavailable"
         fi
         _row 1 "amd gpu" "${LUCEBOX_HOST_AMD_GPU_COUNT} device(s); primary ${LUCEBOX_HOST_AMD_GPU_NAME} (${LUCEBOX_HOST_AMD_GPU_ARCH}, ${LUCEBOX_HOST_AMD_VRAM_GB} GB effective)"
+        if [ "$LUCEBOX_HOST_AMD_GPU_COUNT" -gt 1 ]; then
+            local selected_device
+            selected_device="${LUCEBOX_HOST_ROCR_VISIBLE_DEVICES:-${LUCEBOX_HOST_HIP_VISIBLE_DEVICES:-0}}"
+            _row warn "gpu placement" "primary device ${selected_device}; multi-GPU sharding is not automatic"
+        fi
         local amd_line amd_device_idx amd_device_name amd_device_arch amd_device_mem
         while IFS= read -r amd_line; do
             [ -n "$amd_line" ] || continue
@@ -1848,6 +1950,7 @@ cmd_exec_in_container() {
     argv+=(-w /opt/lucebox-hub)
     argv+=(-e "HOME=$CONFIG_HOME")
     _append_host_env argv
+    _append_selected_backend_facts argv "$variant"
     _append_scalar_env argv "$variant"
     # The image has no top-level `lucebox` binary on PATH — that name only
     # works as the first arg to /opt/lucebox-hub/server/scripts/entrypoint.sh,
@@ -2020,8 +2123,10 @@ cmd_setup() {
     fi
 
     printf '\n'
-    if _confirm "Use automatic GPU optimization?" 1; then
+    if _confirm "Enable recommended optimizations (may add a ~1.2 GB shared scorer)?" 1; then
         bash "$SCRIPT_PATH" optimize --yes || return $?
+    else
+        hint "The safe base profile is active; optional scorer-based features remain off."
     fi
 
     if [ "$LUCEBOX_HOST_HAS_SYSTEMD" = "1" ]; then
@@ -2075,14 +2180,73 @@ cmd_developer_menu() {
     done
 }
 
+_optimization_summary() {
+    local mode model decode prefill kvflash spark draft_file active=""
+    mode=$(_lucebox_config_get autotune.mode)
+    model=$(_lucebox_config_get model.preset)
+    decode=$(_lucebox_config_get dflash.speculative_decode)
+    prefill=$(_lucebox_config_get dflash.prefill_mode)
+    kvflash=$(_lucebox_config_get dflash.kvflash)
+    spark=$(_lucebox_config_get dflash.spark)
+
+    if [ -z "$mode" ]; then
+        if [ -n "$(_lucebox_config_get dflash.max_ctx)" ]; then
+            mode="custom"
+        else
+            mode="not configured"
+        fi
+    fi
+    case "$decode" in false|0|no|off) ;; *)
+        case "$model" in
+            qwen3.6-27b|gemma-4-26b|gemma-4-31b)
+                draft_file=$(_lucebox_config_get model.draft_file)
+                if [ -z "$draft_file" ]; then
+                    case "$model" in
+                        qwen3.6-27b) draft_file="dflash-draft-3.6-q4_k_m.gguf" ;;
+                        gemma-4-26b) draft_file="gemma-4-26B-A4B-it-DFlash-q8_0.gguf" ;;
+                        gemma-4-31b) draft_file="gemma-4-31B-it-DFlash-q8_0.gguf" ;;
+                    esac
+                fi
+                [ -s "$DEFAULT_MODELS_DIR/draft/$draft_file" ] && active="DFlash"
+                ;;
+            laguna-xs.2)
+                _model_artifact_ready "$DEFAULT_MODELS_DIR/draft/laguna-xs2-speculator" \
+                    && active="DFlash"
+                ;;
+        esac
+        ;;
+    esac
+    if [ -n "$prefill" ] && [ "$prefill" != "off" ]; then
+        active="${active:+$active, }PFlash"
+    fi
+    if [ -n "$kvflash" ] && [ "$kvflash" != "off" ]; then
+        active="${active:+$active, }KVFlash"
+    fi
+    case "$spark" in true|1|yes|on) active="${active:+$active, }Spark" ;; esac
+    printf '%s (%s)' "$mode" "${active:-standard engine}"
+}
+
 cmd_menu() {
-    local choice model variant state repo_hint
+    local choice model variant state repo_hint optimization gpu_name gpu_count other_gpu
     while true; do
         ensure_probed
         model=$(_lucebox_config_get model.preset)
         model="${model:-not selected}"
         variant=$(pick_variant)
         state=$(_engine_state)
+        optimization=$(_optimization_summary)
+        gpu_name="${LUCEBOX_HOST_GPU_NAME:-not detected}"
+        gpu_count="$LUCEBOX_HOST_GPU_COUNT"
+        other_gpu=""
+        if _variant_is_rocm "$variant" && [ "$LUCEBOX_HOST_HAS_AMD_GPU" = "1" ]; then
+            gpu_name="${LUCEBOX_HOST_AMD_GPU_NAME:-AMD GPU}"
+            gpu_count="$LUCEBOX_HOST_AMD_GPU_COUNT"
+            [ "$LUCEBOX_HOST_HAS_NVIDIA_GPU" = "1" ] \
+                && other_gpu="${LUCEBOX_HOST_GPU_NAME:-NVIDIA GPU}"
+        elif [ "$LUCEBOX_HOST_HAS_NVIDIA_GPU" = "1" ] \
+             && [ "$LUCEBOX_HOST_HAS_AMD_GPU" = "1" ]; then
+            other_gpu="${LUCEBOX_HOST_AMD_GPU_NAME:-AMD GPU}"
+        fi
         if _find_repo_root >/dev/null 2>&1; then
             repo_hint="available"
         else
@@ -2091,19 +2255,23 @@ cmd_menu() {
 
         _menu_clear
         print_logo
-        printf '  GPU:          %s\n' "${LUCEBOX_HOST_GPU_NAME:-${LUCEBOX_HOST_AMD_GPU_NAME:-not detected}}"
-        if [ "$LUCEBOX_HOST_HAS_NVIDIA_GPU" = "1" ] \
-           && [ "$LUCEBOX_HOST_HAS_AMD_GPU" = "1" ]; then
-            printf '  Other GPU:    %s\n' "${LUCEBOX_HOST_AMD_GPU_NAME:-AMD GPU}"
+        if [ "$gpu_count" -gt 1 ]; then
+            printf '  GPU:          %s (primary of %s)\n' \
+                "$gpu_name" "$gpu_count"
+        else
+            printf '  GPU:          %s\n' "$gpu_name"
+        fi
+        if [ -n "$other_gpu" ]; then
+            printf '  Other GPU:    %s\n' "$other_gpu"
         fi
         printf '  Backend:      %s\n' "$variant"
         printf '  Model:        %s\n' "$model"
-        printf '  Optimization: automatic\n'
+        printf '  Optimization: %s\n' "$optimization"
         printf '  Engine:       %s\n\n' "$state"
 
         printf '  1  Quick setup\n'
         printf '  2  Choose or download a model\n'
-        printf '  3  Apply automatic optimization\n'
+        printf '  3  Review optimizations\n'
         printf '  4  Start the inference engine\n'
         printf '  5  Stop the inference engine\n'
         printf '  6  Status\n'
@@ -2173,7 +2341,7 @@ Provisioning + workloads (delegated to the in-container Python CLI):
   completion <shell>    print shell completion script (bash / zsh / fish)
   models select         numbered model picker; download + activate in one step
   models                list / download / activate model presets
-  optimize              apply safe hardware-aware inference defaults
+  optimize              automatic or guided DFlash/PFlash/KVFlash/Spark setup
   config                read / write keys in .lucebox/config.toml
   print-run             print the docker-run command for the server
 

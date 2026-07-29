@@ -21,8 +21,9 @@ def _set_config_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 def _stub_host(monkeypatch: pytest.MonkeyPatch, vram_gb: int) -> None:
-    monkeypatch.setattr("lucebox.host_facts.from_env", lambda: HostFacts(vram_gb=vram_gb))
-    monkeypatch.setattr("lucebox.cli.from_env", lambda: HostFacts(vram_gb=vram_gb))
+    host = HostFacts(vram_gb=vram_gb, ram_gb=64)
+    monkeypatch.setattr("lucebox.host_facts.from_env", lambda: host)
+    monkeypatch.setattr("lucebox.cli.from_env", lambda: host)
 
 
 def test_models_list_shows_every_registered_preset(
@@ -131,10 +132,10 @@ def test_models_select_activates_preloaded_model_offline(
     preset = PRESETS["qwen3.6-27b"]
     models = tmp_path / "models"
     (models / preset.target_file).parent.mkdir(parents=True, exist_ok=True)
-    (models / preset.target_file).touch()
+    (models / preset.target_file).write_bytes(b"preloaded-target")
     assert preset.draft_file is not None
     (models / "draft").mkdir()
-    (models / "draft" / preset.draft_file).touch()
+    (models / "draft" / preset.draft_file).write_bytes(b"preloaded-draft")
 
     def fail_network(*args: object, **kwargs: object) -> object:
         raise AssertionError("preloaded selection must not contact Hugging Face")
@@ -182,7 +183,100 @@ def test_optimize_resets_to_hardware_profile(
     assert "Automatic optimization applied" in result.output
     entries = config_mod.config_get(path=cfg_path)
     assert entries["dflash.max_ctx"] == (98304, "file")
-    assert entries["dflash.cache_type_k"] == ("tq3_0", "file")
+    assert entries["dflash.cache_type_k"] == ("", "file")
+
+
+def test_optimize_applies_model_aware_qwen_stack(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg_path = _set_config_path(tmp_path, monkeypatch)
+    _stub_host(monkeypatch, vram_gb=24)
+    config_mod.config_set("model.preset", "qwen3.6-27b", path=cfg_path)
+    cfg = config_mod.load(cfg_path)
+    assert cfg is not None
+    cfg = config_mod.overlay_env(cfg)
+    scorer = download_mod.optimizer_drafter_path(cfg)
+    scorer.parent.mkdir(parents=True, exist_ok=True)
+    scorer.write_bytes(b"preloaded")
+    preset = PRESETS["qwen3.6-27b"]
+    assert preset.draft_file is not None
+    draft = cfg.models_dir / "draft" / preset.draft_file
+    draft.parent.mkdir(parents=True, exist_ok=True)
+    draft.write_bytes(b"preloaded-draft")
+
+    result = CliRunner().invoke(app, ["optimize", "--yes"])
+
+    assert result.exit_code == 0
+    assert "DFlash" in result.output
+    assert "PFlash" in result.output
+    loaded = config_mod.load(cfg_path)
+    assert loaded is not None
+    assert loaded.dflash.speculative_decode is True
+    assert loaded.dflash.prefill_mode == "auto"
+    assert loaded.dflash.kvflash == "off"
+    assert config_mod.optimization_mode(path=cfg_path) == "automatic"
+
+
+def test_optimize_installs_shared_scorer_for_constrained_moe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg_path = _set_config_path(tmp_path, monkeypatch)
+    _stub_host(monkeypatch, vram_gb=24)
+    config_mod.config_set("model.preset", "qwen3.6-moe", path=cfg_path)
+
+    def fake_download(cfg: object) -> int:
+        assert isinstance(cfg, config_mod.Config)
+        path = download_mod.optimizer_drafter_path(cfg)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"downloaded")
+        return 0
+
+    monkeypatch.setattr(download_mod, "download_optimizer_drafter", fake_download)
+
+    result = CliRunner().invoke(app, ["optimize", "--yes"])
+
+    assert result.exit_code == 0
+    assert "Shared optimizer installed" in result.output
+    loaded = config_mod.load(cfg_path)
+    assert loaded is not None
+    assert loaded.dflash.kvflash == "auto"
+    assert loaded.dflash.kvflash_policy == "drafter"
+    assert loaded.dflash.spark is True
+
+
+def test_optimize_advanced_writes_a_custom_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg_path = _set_config_path(tmp_path, monkeypatch)
+    _stub_host(monkeypatch, vram_gb=24)
+    config_mod.config_set("model.preset", "qwen3.6-27b", path=cfg_path)
+    cfg = config_mod.load(cfg_path)
+    assert cfg is not None
+    cfg = config_mod.overlay_env(cfg)
+    scorer = download_mod.optimizer_drafter_path(cfg)
+    scorer.parent.mkdir(parents=True, exist_ok=True)
+    scorer.write_bytes(b"preloaded")
+    preset = PRESETS["qwen3.6-27b"]
+    assert preset.draft_file is not None
+    draft = cfg.models_dir / "draft" / preset.draft_file
+    draft.parent.mkdir(parents=True, exist_ok=True)
+    draft.write_bytes(b"preloaded-draft")
+
+    # DFlash yes, PFlash no, KVFlash yes, qk policy, apply yes.
+    result = CliRunner().invoke(
+        app,
+        ["optimize", "--advanced"],
+        input="y\nn\ny\nqk\ny\n",
+    )
+
+    assert result.exit_code == 0
+    loaded = config_mod.load(cfg_path)
+    assert loaded is not None
+    assert loaded.dflash.speculative_decode is True
+    assert loaded.dflash.prefill_mode == "off"
+    assert loaded.dflash.kvflash == "auto"
+    assert loaded.dflash.kvflash_policy == "qk"
+    assert config_mod.optimization_mode(path=cfg_path) == "custom"
 
 
 def test_installed_helpers_track_presence(
@@ -200,6 +294,8 @@ def test_installed_helpers_track_presence(
 
     target = cfg.models_dir / laguna.target_file
     target.parent.mkdir(parents=True, exist_ok=True)
+    target.touch()
+    assert download_mod.installed_status(cfg, laguna) == "absent"
     # Apparent size is what the CLI reports; a sparse file exercises the same
     # stat path without allocating and writing a 5 GB Python byte string.
     with target.open("wb") as sparse:

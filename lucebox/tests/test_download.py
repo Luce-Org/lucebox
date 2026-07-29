@@ -327,15 +327,15 @@ def test_status_target_only_preset_reports_draft_as_present(tmp_path, monkeypatc
 
 
 def test_recommend_preset_tiers() -> None:
-    """First-run preset recommendation is a pure VRAM-tier function.
+    """First-run recommendations account for GPU and host-memory capacity.
 
-    22 GB+ → the Lucebox default (qwen3.6-27b); 16-21 GB → laguna-xs.2;
-    below 16 GB → None (the registered presets need ≥16 GB, so we punt to
-    an explicit choice rather than recommend something that can't run).
+    22 GB+ → the Lucebox default (qwen3.6-27b); 16-21 GB plus enough host
+    RAM for Spark offload → laguna-xs.2; otherwise ask explicitly.
     """
     assert recommend_preset(HostFacts(vram_gb=24)) == "qwen3.6-27b"
     assert recommend_preset(HostFacts(vram_gb=22)) == "qwen3.6-27b"
-    assert recommend_preset(HostFacts(vram_gb=20)) == "laguna-xs.2"
-    assert recommend_preset(HostFacts(vram_gb=16)) == "laguna-xs.2"
+    assert recommend_preset(HostFacts(vram_gb=20, ram_gb=64)) == "laguna-xs.2"
+    assert recommend_preset(HostFacts(vram_gb=16, ram_gb=32)) == "laguna-xs.2"
+    assert recommend_preset(HostFacts(vram_gb=20, ram_gb=16)) is None
     assert recommend_preset(HostFacts(vram_gb=12)) is None
     assert recommend_preset(HostFacts(vram_gb=0)) is None

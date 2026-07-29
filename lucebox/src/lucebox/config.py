@@ -55,11 +55,48 @@ def default_config_path() -> Path:
 
 # ── dotted-key registry ────────────────────────────────────────────────────
 
+
 def _cast_prefill_mode(v: Any) -> Literal["off", "auto", "always"]:
     s = str(v)
     if s not in {"off", "auto", "always"}:
         raise ValueError(f"prefill_mode must be off/auto/always, got {s!r}")
     return cast(Literal["off", "auto", "always"], s)
+
+
+def _cast_kvflash(v: Any) -> str:
+    value = str(v).strip().lower()
+    if value in {"off", "auto"}:
+        return value
+    try:
+        pool_tokens = int(value)
+    except ValueError as exc:
+        raise ValueError(
+            f"kvflash must be off, auto, or a positive token count, got {value!r}"
+        ) from exc
+    if pool_tokens <= 0:
+        raise ValueError(f"kvflash token count must be positive, got {value!r}")
+    return str(pool_tokens)
+
+
+def _cast_kvflash_policy(v: Any) -> Literal["drafter", "lru", "qk"]:
+    value = str(v).strip().lower()
+    if value not in {"drafter", "lru", "qk"}:
+        raise ValueError(f"kvflash_policy must be drafter/lru/qk, got {value!r}")
+    return cast(Literal["drafter", "lru", "qk"], value)
+
+
+def _cast_positive_int(v: Any) -> int:
+    value = int(v)
+    if value <= 0:
+        raise ValueError(f"value must be positive, got {value!r}")
+    return value
+
+
+def _cast_nonnegative_float(v: Any) -> float:
+    value = float(v)
+    if value < 0.0:
+        raise ValueError(f"value must be zero or positive, got {value!r}")
+    return value
 
 
 def _cast_bool(v: Any) -> bool:
@@ -112,10 +149,7 @@ def _cast_model_relative_path(v: Any) -> str:
 def _cast_prefill_keep_ratio(v: Any) -> float:
     value = float(v)
     if not 0.0 < value <= 1.0:
-        raise ValueError(
-            "prefill_keep_ratio must be in the interval (0.0, 1.0], "
-            f"got {value!r}"
-        )
+        raise ValueError(f"prefill_keep_ratio must be in the interval (0.0, 1.0], got {value!r}")
     return value
 
 
@@ -123,8 +157,7 @@ def _cast_think_soft_close_min_ratio(v: Any) -> float:
     value = float(v)
     if not 0.0 <= value <= 1.0:
         raise ValueError(
-            "think_soft_close_min_ratio must be in the interval [0.0, 1.0], "
-            f"got {value!r}"
+            f"think_soft_close_min_ratio must be in the interval [0.0, 1.0], got {value!r}"
         )
     return value
 
@@ -142,6 +175,7 @@ KEY_REGISTRY: dict[str, tuple[tuple[str, str], Callable[[Any], Any]]] = {
     "model.preset": (("model", "preset"), str),
     "model.target_file": (("model", "target_file"), _cast_model_relative_path),
     "model.draft_file": (("model", "draft_file"), _cast_model_relative_path),
+    "dflash.speculative_decode": (("dflash", "speculative_decode"), _cast_bool),
     "dflash.budget": (("dflash", "budget"), int),
     "dflash.max_ctx": (("dflash", "max_ctx"), int),
     "dflash.lazy": (("dflash", "lazy"), _cast_bool),
@@ -156,6 +190,11 @@ KEY_REGISTRY: dict[str, tuple[tuple[str, str], Callable[[Any], Any]]] = {
     ),
     "dflash.prefill_threshold": (("dflash", "prefill_threshold"), int),
     "dflash.prefill_drafter": (("dflash", "prefill_drafter"), str),
+    "dflash.kvflash": (("dflash", "kvflash"), _cast_kvflash),
+    "dflash.kvflash_policy": (("dflash", "kvflash_policy"), _cast_kvflash_policy),
+    "dflash.kvflash_tau": (("dflash", "kvflash_tau"), _cast_positive_int),
+    "dflash.spark": (("dflash", "spark"), _cast_bool),
+    "dflash.spark_vram_gb": (("dflash", "spark_vram_gb"), _cast_nonnegative_float),
     "dflash.think_max": (("dflash", "think_max"), int),
     "dflash.fa_window": (("dflash", "fa_window"), int),
     "dflash.think_soft_close_min_ratio": (
@@ -239,9 +278,14 @@ def load_doc(path: Path | None = None) -> dict[str, Any]:
 _LEGACY_KEY_MAP: dict[str, tuple[str, str, Callable[[str], Any]]] = {
     "DFLASH_BUDGET": ("dflash", "budget", int),
     "DFLASH_MAX_CTX": ("dflash", "max_ctx", int),
-    "DFLASH_LAZY": ("dflash", "lazy",
-                    lambda v: str(v).strip().lower() in ("1", "true", "yes", "on")),
+    "DFLASH_LAZY": (
+        "dflash",
+        "lazy",
+        lambda v: str(v).strip().lower() in ("1", "true", "yes", "on"),
+    ),
     "DFLASH_PREFIX_CACHE_SLOTS": ("dflash", "prefix_cache_slots", int),
+    "DFLASH_KVFLASH": ("dflash", "kvflash", _cast_kvflash),
+    "DFLASH_SPARK": ("dflash", "spark", _cast_bool),
     "DFLASH_PORT": ("runtime", "port", int),
     "LUCEBOX_VARIANT": ("image", "variant", str),
     "LUCEBOX_IMAGE": ("image", "registry", str),
@@ -285,6 +329,7 @@ def _from_dict(raw: dict[str, Any]) -> Config:
 
     df = raw.get("dflash", {})
     dflash = DflashRuntime(
+        speculative_decode=_cast_bool(df.get("speculative_decode", True)),
         budget=int(df.get("budget", 22)),
         max_ctx=int(df.get("max_ctx", 16384)),
         lazy=_cast_bool(df.get("lazy", False)),
@@ -293,11 +338,14 @@ def _from_dict(raw: dict[str, Any]) -> Config:
         cache_type_k=str(df.get("cache_type_k", "")),
         cache_type_v=str(df.get("cache_type_v", "")),
         prefill_mode=_cast_prefill_mode(df.get("prefill_mode", "off")),
-        prefill_keep_ratio=_cast_prefill_keep_ratio(
-            df.get("prefill_keep_ratio", 0.05)
-        ),
+        prefill_keep_ratio=_cast_prefill_keep_ratio(df.get("prefill_keep_ratio", 0.05)),
         prefill_threshold=int(df.get("prefill_threshold", 32000)),
         prefill_drafter=str(df.get("prefill_drafter", "")),
+        kvflash=_cast_kvflash(df.get("kvflash", "off")),
+        kvflash_policy=_cast_kvflash_policy(df.get("kvflash_policy", "drafter")),
+        kvflash_tau=_cast_positive_int(df.get("kvflash_tau", 64)),
+        spark=_cast_bool(df.get("spark", False)),
+        spark_vram_gb=_cast_nonnegative_float(df.get("spark_vram_gb", 0.0)),
         think_max=int(df.get("think_max", 15488)),
         fa_window=int(df.get("fa_window", 0)),
         think_soft_close_min_ratio=_cast_think_soft_close_min_ratio(
@@ -413,8 +461,6 @@ def seed_dflash_from_host(
     when there is no config.toml at all, which stops being true the moment a
     model is activated — so the heuristic is persisted here instead.
     """
-    from datetime import datetime
-
     import lucebox.autotune as autotune_mod
 
     path = path or default_config_path()
@@ -432,15 +478,79 @@ def seed_dflash_from_host(
         # reset to the current hardware-derived defaults.
         doc.pop("dflash", None)
     runtime = autotune_mod.runtime_from_host(host)
-    for field, value in asdict(runtime).items():
-        _doc_set(doc, "dflash", field, _value_to_toml(value))
-    _doc_set(doc, "autotune", "source", "heuristic")
-    _doc_set(
-        doc, "autotune", "timestamp",
-        datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
-    )
+    _write_runtime_doc(doc, runtime, mode="automatic", source="heuristic")
     path.parent.mkdir(parents=True, exist_ok=True)
     _atomic_write_doc(path, doc)
+    return True
+
+
+def _write_runtime_doc(
+    doc: dict[str, Any],
+    runtime: DflashRuntime,
+    *,
+    mode: str,
+    source: str,
+) -> None:
+    """Replace ``[dflash]`` with one coherent resolved profile."""
+    from datetime import datetime
+
+    doc.pop("dflash", None)
+    for field, value in asdict(runtime).items():
+        _doc_set(doc, "dflash", field, _value_to_toml(value))
+    _doc_set(doc, "autotune", "mode", mode)
+    _doc_set(doc, "autotune", "source", source)
+    _doc_set(
+        doc,
+        "autotune",
+        "timestamp",
+        datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    )
+
+
+def write_optimization_runtime(
+    runtime: DflashRuntime,
+    *,
+    path: Path | None = None,
+    mode: str = "automatic",
+    source: str = "model+hardware",
+) -> None:
+    """Atomically persist a complete automatic or custom optimization profile."""
+    if mode not in {"automatic", "custom"}:
+        raise ValueError(f"optimization mode must be automatic or custom, got {mode!r}")
+    path = path or default_config_path()
+    doc = load_doc(path)
+    _write_runtime_doc(doc, runtime, mode=mode, source=source)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write_doc(path, doc)
+
+
+def optimization_mode(*, path: Path | None = None) -> str:
+    """Return automatic/custom/unconfigured for menu and model-switch behavior."""
+    doc = load_doc(path)
+    auto = doc.get("autotune", {})
+    if isinstance(auto, dict) and auto.get("mode") in {"automatic", "custom"}:
+        return str(auto["mode"])
+    if "dflash" not in doc:
+        return "unconfigured"
+    # Existing profiles predate mode metadata and may contain hand tuning.
+    return "custom"
+
+
+def seed_optimization_from_config(
+    cfg: Config,
+    *,
+    path: Path | None = None,
+    force: bool = False,
+) -> bool:
+    """Apply a model+hardware plan unless the user owns a custom profile."""
+    import lucebox.autotune as autotune_mod
+
+    path = path or default_config_path()
+    mode = optimization_mode(path=path)
+    if not force and mode == "custom":
+        return False
+    plan = autotune_mod.automatic_plan(cfg)
+    write_optimization_runtime(plan.runtime, path=path)
     return True
 
 
@@ -485,6 +595,20 @@ def config_set(key: str, value: Any, *, path: Path | None = None) -> None:
     path = path or default_config_path()
     doc = load_doc(path) if path.exists() else {}
     _doc_set(doc, section, field, _value_to_toml(cast_value))
+    if section == "dflash":
+        # Validate the complete profile before replacing the file. Individual
+        # fields can be valid while their combination is not (for example,
+        # KVFlash and a finite FA window are mutually exclusive).
+        try:
+            _from_dict({"dflash": doc.get("dflash", {})})
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid dflash profile after setting {key}: {exc}") from exc
+        # A direct low-level edit transfers ownership from the automatic
+        # planner to the user. Model changes will preserve it until they pick
+        # Automatic again in ``lucebox optimize``.
+        _doc_set(doc, "autotune", "mode", "custom")
+        _doc_set(doc, "autotune", "source", "manual")
+        _doc_unset(doc, "autotune", "timestamp")
     path.parent.mkdir(parents=True, exist_ok=True)
     _atomic_write_doc(path, doc)
 
@@ -501,6 +625,13 @@ def config_unset(key: str, *, path: Path | None = None) -> bool:
     doc = load_doc(path)
     changed = _doc_unset(doc, section, field)
     if changed:
+        if section == "dflash":
+            if "dflash" in doc:
+                _doc_set(doc, "autotune", "mode", "custom")
+                _doc_set(doc, "autotune", "source", "manual")
+                _doc_unset(doc, "autotune", "timestamp")
+            else:
+                doc.pop("autotune", None)
         # Leave the file in place even when empty — `config set` will
         # repopulate; deleting would surprise users who expect their
         # config dir to exist.
@@ -544,9 +675,7 @@ def overlay_env(cfg: Config) -> Config:
         image=os.environ.get("LUCEBOX_IMAGE", cfg.image),
         container_name=os.environ.get("LUCEBOX_CONTAINER", cfg.container_name),
         port=_cast_port(os.environ.get("LUCEBOX_PORT", str(cfg.port))),
-        models_dir=Path(
-            _cast_models_dir(os.environ.get("LUCEBOX_MODELS", str(cfg.models_dir)))
-        ),
+        models_dir=Path(_cast_models_dir(os.environ.get("LUCEBOX_MODELS", str(cfg.models_dir)))),
     )
 
 

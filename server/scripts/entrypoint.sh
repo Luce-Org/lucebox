@@ -324,24 +324,21 @@ if [ "$GPU_VRAM_GB" -gt 0 ]; then
         IS_WSL=1
     fi
     if [ "$GPU_VRAM_GB" -lt 12 ]; then
-        : "${DFLASH_LAZY:=1}"
         : "${DFLASH_MAX_CTX:=4096}"
         warn "VRAM ${GPU_VRAM_GB} GB < 12 GB — 27B target unlikely to fit"
     elif [ "$GPU_VRAM_GB" -lt 22 ]; then
-        : "${DFLASH_LAZY:=1}"
         : "${DFLASH_MAX_CTX:=32768}"
     elif [ "$GPU_VRAM_GB" -lt 32 ]; then
-        : "${DFLASH_LAZY:=1}"
         if [ "$IS_WSL" = "1" ]; then
             : "${DFLASH_BUDGET:=16}"
-            : "${DFLASH_MAX_CTX:=65536}"
-        else
-            : "${DFLASH_MAX_CTX:=98304}"
         fi
+        : "${DFLASH_MAX_CTX:=98304}"
     else
         : "${DFLASH_MAX_CTX:=131072}"
     fi
 fi
+
+[ "${GPU_ARCH:-}" = "gfx1100" ] && : "${DFLASH_BUDGET:=8}"
 
 : "${DFLASH_BIN:=$DFLASH_DIR/build/test_dflash}"
 : "${DFLASH_SERVER_BIN:=$DFLASH_DIR/build/dflash_server}"
@@ -359,6 +356,11 @@ fi
 : "${DFLASH_PREFILL_KEEP:=0.05}"
 : "${DFLASH_PREFILL_THRESHOLD:=32000}"
 : "${DFLASH_PREFILL_DRAFTER:=}"
+: "${DFLASH_KVFLASH:=off}"
+: "${DFLASH_KVFLASH_POLICY:=drafter}"
+: "${DFLASH_KVFLASH_TAU:=64}"
+: "${DFLASH_SPARK:=0}"
+: "${DFLASH_SPARK_VRAM_GB:=0}"
 # Optional server default for requests that omit max_tokens. When unset,
 # the C++ server uses the model-card default.
 : "${DFLASH_DEFAULT_MAX_TOKENS:=}"
@@ -404,7 +406,10 @@ fi
 if [ -z "$DFLASH_TARGET" ] && [ -d "$DFLASH_DIR/models" ]; then
     # Collect candidates: .gguf files ≥5 GB (target-sized), excluding
     # anything under models/draft/. Sort alphabetically for determinism.
-    mapfile -t TARGET_CANDIDATES < <(
+    TARGET_CANDIDATES=()
+    while IFS= read -r candidate; do
+        [ -n "$candidate" ] && TARGET_CANDIDATES+=("$candidate")
+    done < <(
         find -L "$DFLASH_DIR/models" -maxdepth 4 -type f -name '*.gguf' \
             -size +5G \
             -not -path '*/draft/*' \
@@ -489,6 +494,10 @@ if [ -d "$DFLASH_DRAFT" ]; then
     # then generic dflash-draft-*.gguf legacy, then last-resort *.gguf.
     # The 31B match in the Lucebox repo uses capital B in the filename —
     # -iname handles that without needing to enumerate every case form.
+    # Bash 3.2 + `set -u` treats an expansion of an empty array as an
+    # unbound variable. Keep a non-empty sentinel for an unknown family and
+    # build the combined search list explicitly below. The production image
+    # uses a newer Bash, but this also keeps host-side smoke tests portable.
     case "$(echo "$TARGET_BASENAME" | tr 'A-Z' 'a-z')" in
         *gemma-4-26b*|*gemma4-26b*)
             FAMILY_GLOBS=('*gemma*4*26b*dflash*.gguf' '*dflash*gemma*4*26b*.gguf') ;;
@@ -499,7 +508,7 @@ if [ -d "$DFLASH_DRAFT" ]; then
         *qwen3.6*|*qwen36*)
             FAMILY_GLOBS=('dflash-draft-3.6-*.gguf' '*qwen*3.6*dflash*.gguf') ;;
         *)
-            FAMILY_GLOBS=() ;;
+            FAMILY_GLOBS=('') ;;
     esac
 
     DRAFT_FILE=""
@@ -514,8 +523,14 @@ if [ -d "$DFLASH_DRAFT" ]; then
     # `*.gguf` / safetensors fallbacks.
     GENERIC_GLOBS=('dflash-draft-*.gguf' '*dflash*.gguf' '*.gguf' 'model.safetensors' '*.safetensors')
     family_count="${#FAMILY_GLOBS[@]}"
+    if [ -z "${FAMILY_GLOBS[0]}" ]; then
+        family_count=0
+        ALL_DRAFT_GLOBS=("${GENERIC_GLOBS[@]}")
+    else
+        ALL_DRAFT_GLOBS=("${FAMILY_GLOBS[@]}" "${GENERIC_GLOBS[@]}")
+    fi
     i=0
-    for pattern in "${FAMILY_GLOBS[@]}" "${GENERIC_GLOBS[@]}"; do
+    for pattern in "${ALL_DRAFT_GLOBS[@]}"; do
         # Sort matches lexicographically so the pick is deterministic across
         # filesystems (find's traversal order is filesystem-dependent without
         # an explicit sort). First lexicographic match wins.
@@ -575,6 +590,7 @@ CMD=("$DFLASH_SERVER_BIN" "$DFLASH_TARGET"
 [ -n "$DRAFT_ARG" ]                && CMD+=(--ddtree --ddtree-budget "$DFLASH_BUDGET")
 [ -n "$DFLASH_DEFAULT_MAX_TOKENS" ] && CMD+=(--default-max-tokens "$DFLASH_DEFAULT_MAX_TOKENS")
 [ -n "$DFLASH_MODEL_NAME" ]         && CMD+=(--model-name "$DFLASH_MODEL_NAME")
+[ -n "$DFLASH_PREFILL_DRAFTER" ]    && CMD+=(--prefill-drafter "$DFLASH_PREFILL_DRAFTER")
 # `--lazy-draft` is silently dropped by the C++ server unless both
 # `--prefill-drafter` and `--draft` are present (look for the runtime
 # warning `--lazy-draft ignored: requires both --prefill-drafter and
@@ -591,6 +607,18 @@ fi
 [ -n "$DFLASH_CACHE_TYPE_K" ]      && CMD+=(--cache-type-k "$DFLASH_CACHE_TYPE_K")
 [ -n "$DFLASH_CACHE_TYPE_V" ]      && CMD+=(--cache-type-v "$DFLASH_CACHE_TYPE_V")
 [ "$DFLASH_FA_WINDOW" -gt 0 ] 2>/dev/null && CMD+=(--fa-window "$DFLASH_FA_WINDOW")
+if [ "$DFLASH_KVFLASH" != "off" ] && [ -n "$DFLASH_KVFLASH" ]; then
+    CMD+=(--kvflash "$DFLASH_KVFLASH"
+          --kvflash-policy "$DFLASH_KVFLASH_POLICY"
+          --kvflash-tau "$DFLASH_KVFLASH_TAU")
+fi
+if [ "$DFLASH_SPARK" = "1" ]; then
+    CMD+=(--spark)
+    case "$DFLASH_SPARK_VRAM_GB" in
+        0|0.0|0.00|"") ;;
+        *) CMD+=(--spark-vram "$DFLASH_SPARK_VRAM_GB") ;;
+    esac
+fi
 # Soft-close ratio: emit only when nonzero. The default-string compare
 # guards against the floating-point quirks of `[` numeric tests for
 # values like 0.0/0/0.00 — anything non-"0.0" passes through to the
@@ -606,8 +634,7 @@ if [ "$DFLASH_PREFILL_MODE" != "off" ]; then
     [ -f "$DFLASH_PREFILL_DRAFTER" ] || die "Prefill drafter not found at $DFLASH_PREFILL_DRAFTER"
     CMD+=(--prefill-compression "$DFLASH_PREFILL_MODE"
           --prefill-keep-ratio "$DFLASH_PREFILL_KEEP"
-          --prefill-threshold "$DFLASH_PREFILL_THRESHOLD"
-          --prefill-drafter "$DFLASH_PREFILL_DRAFTER")
+          --prefill-threshold "$DFLASH_PREFILL_THRESHOLD")
 fi
 
 if [ "${LUCEBOX_NATIVE:-0}" = "1" ]; then

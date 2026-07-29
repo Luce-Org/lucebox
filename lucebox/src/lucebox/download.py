@@ -87,6 +87,8 @@ class ModelPreset:
     draft_repo: str | None
     draft_file: str | None
     approx_total_gb: int
+    architecture: str
+    native_context: int
     description: str = ""
     speculator_dir: str | None = None
 
@@ -107,6 +109,8 @@ PRESETS: dict[str, ModelPreset] = {
         draft_repo="spiritbuun/Qwen3.6-27B-DFlash-GGUF",
         draft_file="dflash-draft-3.6-q4_k_m.gguf",
         approx_total_gb=17,
+        architecture="qwen35",
+        native_context=262144,
         description="Qwen3.6 27B dense (Q4_K_M) + Qwen3.6 DFlash draft. Lucebox default.",
     ),
     "gemma-4-26b": ModelPreset(
@@ -116,6 +120,8 @@ PRESETS: dict[str, ModelPreset] = {
         draft_repo="Lucebox/gemma-4-26B-A4B-it-DFlash-GGUF",
         draft_file="gemma-4-26B-A4B-it-DFlash-q8_0.gguf",
         approx_total_gb=18,
+        architecture="gemma4",
+        native_context=262144,
         description="Gemma 4 26B-A4B IT MoE (Q4_K_M) + Lucebox DFlash q8_0 draft.",
     ),
     "gemma-4-31b": ModelPreset(
@@ -125,6 +131,8 @@ PRESETS: dict[str, ModelPreset] = {
         draft_repo="Lucebox/gemma-4-31B-it-DFlash-GGUF",
         draft_file="gemma-4-31B-it-DFlash-q8_0.gguf",
         approx_total_gb=21,
+        architecture="gemma4",
+        native_context=262144,
         description="Gemma 4 31B IT dense (Q4_K_M) + Lucebox DFlash q8_0 draft.",
     ),
     "laguna-xs.2": ModelPreset(
@@ -140,6 +148,8 @@ PRESETS: dict[str, ModelPreset] = {
         draft_file=None,
         speculator_dir="laguna-xs2-speculator",
         approx_total_gb=20,
+        architecture="laguna",
+        native_context=4096,
         description=(
             "Laguna-XS.2 MoE code model (Q4_K_M). "
             "DFlash safetensors speculator in draft/laguna-xs2-speculator/ "
@@ -162,6 +172,8 @@ PRESETS: dict[str, ModelPreset] = {
         draft_repo=None,
         draft_file=None,
         approx_total_gb=22,
+        architecture="qwen35moe",
+        native_context=262144,
         description=(
             "Qwen3.6 35B-A3B MoE (3B active per token), Q4_K_M unsloth "
             "dynamic quant. Target-only — no DFlash MoE draft published "
@@ -171,6 +183,13 @@ PRESETS: dict[str, ModelPreset] = {
 }
 
 DEFAULT_PRESET = PRESETS["qwen3.6-27b"]
+
+# Shared scorer used by PFlash and by KVFlash's drafter residency policy.
+# It is deliberately separate from each target preset: one ~1.2 GB file is
+# reused by every installed model and can be factory-preloaded on a Lucebox.
+OPTIMIZER_DRAFTER_REPO = "unsloth/Qwen3-0.6B-GGUF"
+OPTIMIZER_DRAFTER_FILE = "Qwen3-0.6B-BF16.gguf"
+OPTIMIZER_DRAFTER_APPROX_GB = 1.2
 
 
 def resolve_preset(name: str | None) -> ModelPreset:
@@ -184,7 +203,7 @@ def resolve_preset(name: str | None) -> ModelPreset:
     if name in PRESETS:
         return PRESETS[name]
     # Build a suggestion list — show every known preset; the user's
-    # search space is small (4 entries today) so listing them all is
+    # search space is small, so listing them all is
     # cheaper and clearer than a fuzzy-match heuristic.
     known = ", ".join(sorted(PRESETS.keys()))
     raise KeyError(f"unknown preset {name!r}. Known presets: {known}")
@@ -425,6 +444,47 @@ def download_preset(cfg: Config, preset: ModelPreset | None = None) -> int:
     return 0
 
 
+def optimizer_drafter_path(cfg: Config) -> Path:
+    """Host path of the scorer shared by PFlash and KVFlash."""
+    return cfg.models_dir / "drafter" / OPTIMIZER_DRAFTER_FILE
+
+
+def optimizer_drafter_container_path() -> str:
+    """Path seen by the native server inside the runtime image."""
+    return f"/opt/lucebox-hub/server/models/drafter/{OPTIMIZER_DRAFTER_FILE}"
+
+
+def optimizer_drafter_installed(cfg: Config) -> bool:
+    """Presence-only check suitable for an offline, factory-preloaded box."""
+    return local_artifact_present(optimizer_drafter_path(cfg))
+
+
+def local_artifact_present(path: Path) -> bool:
+    """Reject directories, placeholders, and interrupted zero-byte copies."""
+    try:
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def download_optimizer_drafter(cfg: Config) -> int:
+    """Download and verify the shared PFlash/KVFlash scorer."""
+    console = Console()
+    api = _new_hf_api()
+    try:
+        _fetch(
+            api,
+            OPTIMIZER_DRAFTER_REPO,
+            OPTIMIZER_DRAFTER_FILE,
+            cfg.models_dir / "drafter",
+            console,
+        )
+    except Exception as exc:
+        console.print(f"[red]optimizer download failed:[/red] {exc}")
+        return 1
+    return 0
+
+
 def _local_target_path(cfg: Config, preset: ModelPreset) -> Path:
     return cfg.models_dir / preset.target_file
 
@@ -438,15 +498,16 @@ def _local_draft_path(cfg: Config, preset: ModelPreset) -> Path | None:
 def installed_status(cfg: Config, preset: ModelPreset) -> str:
     """Return ``"installed"`` / ``"partial"`` / ``"absent"`` for a preset.
 
-    Size-only — doesn't hash. ``"installed"`` requires the target (and
-    draft when one is published) to exist on disk; ``"partial"`` means
-    at least one of the two is present but the set is incomplete.
+    Presence-only — doesn't query the network or hash. ``"installed"``
+    requires a non-empty target (and draft when one is published);
+    ``"partial"`` means at least one of the two is present but the set is
+    incomplete.
     """
-    target_exists = _local_target_path(cfg, preset).exists()
+    target_exists = local_artifact_present(_local_target_path(cfg, preset))
     draft_path = _local_draft_path(cfg, preset)
     if draft_path is None:
         return "installed" if target_exists else "absent"
-    draft_exists = draft_path.exists()
+    draft_exists = local_artifact_present(draft_path)
     if target_exists and draft_exists:
         return "installed"
     if target_exists or draft_exists:
@@ -522,12 +583,12 @@ def recommend_preset(host: HostFacts) -> str | None:
     """Pick a default preset for first-run install. None = ask the user.
 
     Tiers follow the model size catalog: 22 GB+ → Qwen3.6-27B (the
-    Lucebox default), 16-21 GB → Laguna-XS.2 (small target-only). Below
-    16 GB we punt and let the user pick explicitly — the registered
-    presets all need at least 16 GB to run usefully.
+    Lucebox default); 16-21 GB plus at least 32 GB host RAM → Laguna-XS.2
+    with Spark expert offload. Otherwise ask explicitly instead of proposing
+    a model that may not have enough GPU/host memory to start safely.
     """
     if host.vram_gb >= 22:
         return "qwen3.6-27b"
-    if host.vram_gb >= 16:
+    if host.vram_gb >= 16 and host.ram_gb >= 32:
         return "laguna-xs.2"
     return None

@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import sys
 from dataclasses import replace
-from typing import Annotated
+from typing import Annotated, Literal
 
 import typer
 from rich.console import Console
@@ -33,7 +33,7 @@ import lucebox.host_check as host_check
 from lucebox import __version__
 from lucebox.config import config_get, config_set, config_unset, live_config
 from lucebox.host_facts import from_env
-from lucebox.types import Config
+from lucebox.types import Config, DflashRuntime, ModelMeta
 
 app = typer.Typer(
     name="lucebox",
@@ -115,6 +115,36 @@ def _server_spec() -> docker_run.DockerRunSpec:
         raise typer.Exit(code=2) from exc
 
 
+def _active_optimization_names(cfg: Config) -> list[str]:
+    """Return the product-level features represented by the loaded config."""
+    active: list[str] = []
+    preset = download_mod.PRESETS.get(cfg.model.preset)
+    if (
+        cfg.dflash.speculative_decode
+        and preset is not None
+        and autotune_mod.draft_available(cfg, preset)
+    ):
+        active.append("DFlash")
+    if cfg.dflash.prefill_mode != "off":
+        active.append("PFlash")
+    if cfg.dflash.kvflash != "off":
+        active.append("KVFlash")
+    if cfg.dflash.spark:
+        active.append("Spark")
+    return active
+
+
+def _optimization_label(cfg: Config) -> str:
+    mode = config_mod.optimization_mode()
+    mode_label = {
+        "automatic": "Automatic",
+        "custom": "Custom",
+        "unconfigured": "Not configured",
+    }[mode]
+    active = _active_optimization_names(cfg)
+    return f"{mode_label} ({', '.join(active) if active else 'standard engine'})"
+
+
 def _package_menu() -> None:
     """Small in-package menu for direct installs and contributor workflows.
 
@@ -127,9 +157,9 @@ def _package_menu() -> None:
         cfg = _load_or_build()
         active = cfg.model.preset or "not selected"
         console.print(f"Model:        [bold]{escape(active)}[/bold]")
-        console.print("Optimization: [bold]Automatic[/bold] (safe defaults for this GPU)\n")
+        console.print(f"Optimization: [bold]{escape(_optimization_label(cfg))}[/bold]\n")
         console.print("  [bold cyan]1[/bold cyan]  Choose or download a model")
-        console.print("  [bold cyan]2[/bold cyan]  Apply automatic optimization")
+        console.print("  [bold cyan]2[/bold cyan]  Review optimizations")
         console.print("  [bold cyan]3[/bold cyan]  Show configuration")
         console.print("  [bold cyan]4[/bold cyan]  Show Docker launch command")
         console.print("  [bold cyan]q[/bold cyan]  Quit")
@@ -296,13 +326,28 @@ def _activate_preset(cfg: Config, preset: download_mod.ModelPreset) -> None:
         # preset is explicitly target-only.
         config_unset("model.draft_file")
     console.print(f"[green]Activated:[/green] model.preset = {preset.name}")
-    # Never clobber a user-edited [dflash] section. Explicit profile resets
-    # go through `lucebox optimize` instead.
-    if config_mod.seed_dflash_from_host(cfg.host):
+    selected_cfg = replace(
+        cfg,
+        model=ModelMeta(
+            preset=preset.name,
+            target_file=preset.target_file,
+            draft_file=preset.draft_file or "",
+        ),
+    )
+    # Automatic profiles follow the selected model. A user-owned custom
+    # profile is preserved and called out instead of being silently reset.
+    if config_mod.seed_optimization_from_config(selected_cfg):
         max_ctx = config_get("dflash.max_ctx")["dflash.max_ctx"][0]
+        plan = autotune_mod.automatic_plan(selected_cfg)
+        active = ", ".join(plan.active_names) or "standard engine"
         console.print(
-            f"[green]Auto-tuned:[/green] VRAM-tier DFLASH_* defaults "
-            f"(max_ctx={max_ctx}) written to config.toml"
+            f"[green]Optimized:[/green] Automatic profile for {preset.name} "
+            f"({active}; max_ctx={max_ctx})"
+        )
+    else:
+        console.print(
+            "[yellow]Custom optimization profile kept.[/yellow] "
+            "Run `lucebox optimize` to review it for this model."
         )
 
 
@@ -479,34 +524,215 @@ def models_download(
         _activate_preset(cfg, pres)
 
 
+def _render_optimization_plan(
+    plan: autotune_mod.OptimizationPlan,
+    *,
+    title: str = "Automatic optimization (recommended)",
+) -> None:
+    console.print(f"[bold]{title}[/bold]")
+    console.print(f"Model: {escape(plan.model_name)}")
+    table = Table(show_header=True, box=None, pad_edge=False)
+    table.add_column("Optimization", style="bold")
+    table.add_column("State")
+    table.add_column("Why")
+    for decision in plan.decisions:
+        if decision.enabled:
+            state = "[green]ON[/green]"
+        elif decision.available:
+            state = "[dim]off[/dim]"
+        else:
+            state = "[dim]not available[/dim]"
+        table.add_row(decision.name, state, escape(decision.reason))
+    console.print(table)
+    cache = plan.runtime.cache_type_k or "model default"
+    console.print(
+        f"Context: [bold]{plan.runtime.max_ctx:,}[/bold] tokens  ·  "
+        f"KV format: [bold]{cache}[/bold]  ·  "
+        f"DFlash budget: [bold]{plan.runtime.budget}[/bold]"
+    )
+
+
+def _ensure_optimizer_drafter(cfg: Config, *, assume_yes: bool = False) -> bool:
+    """Offer the one shared scorer asset and degrade cleanly when offline."""
+    if download_mod.optimizer_drafter_installed(cfg):
+        return True
+    question = (
+        f"Install the shared PFlash/KVFlash scorer "
+        f"(~{download_mod.OPTIMIZER_DRAFTER_APPROX_GB:g} GB)?"
+    )
+    if not assume_yes and not typer.confirm(question, default=True):
+        return False
+    console.print("[bold]Installing the shared long-context scorer…[/bold]")
+    if download_mod.download_optimizer_drafter(cfg) != 0:
+        console.print(
+            "[yellow]Continuing without the scorer; the rest of the automatic "
+            "profile is still safe.[/yellow]"
+        )
+        return False
+    if not download_mod.optimizer_drafter_installed(cfg):
+        console.print("[yellow]The scorer download completed but its file is missing.[/yellow]")
+        return False
+    console.print("[green]Shared optimizer installed.[/green]")
+    return True
+
+
+def _customize_runtime(
+    cfg: Config,
+    plan: autotune_mod.OptimizationPlan,
+) -> DflashRuntime:
+    """Prompt only for product-level choices; keep low-level knobs automatic."""
+    preset = download_mod.PRESETS.get(cfg.model.preset)
+    runtime = plan.runtime
+    console.print("\n[bold]Customize optimizations[/bold]")
+    console.print("[dim]Context, cache format, and budgets remain hardware-tuned.[/dim]\n")
+
+    if plan.dflash.available:
+        speculative_decode = typer.confirm(
+            "Enable DFlash speculative decode?", default=plan.dflash.enabled
+        )
+    else:
+        speculative_decode = False
+        console.print(f"DFlash: [dim]unavailable — {escape(plan.dflash.reason)}[/dim]")
+
+    pflash = False
+    if plan.pflash.available:
+        pflash = typer.confirm(
+            "Enable PFlash automatically for long prompts?", default=plan.pflash.enabled
+        )
+        if pflash and not _ensure_optimizer_drafter(cfg):
+            pflash = False
+            console.print("[yellow]PFlash left off because its scorer is unavailable.[/yellow]")
+    else:
+        console.print(f"PFlash: [dim]unavailable — {escape(plan.pflash.reason)}[/dim]")
+
+    kvflash = False
+    kvflash_policy: Literal["drafter", "lru", "qk"] = "drafter"
+    if preset is not None and plan.kvflash.available:
+        kvflash = typer.confirm(
+            "Enable KVFlash bounded long-context memory?", default=plan.kvflash.enabled
+        )
+    else:
+        console.print(f"KVFlash: [dim]unavailable — {escape(plan.kvflash.reason)}[/dim]")
+    if kvflash:
+        has_scorer = download_mod.optimizer_drafter_installed(cfg)
+        if has_scorer:
+            policy_choices = "drafter"
+            if preset is not None and preset.architecture == "qwen35":
+                policy_choices += "/qk/lru"
+            else:
+                policy_choices += "/lru"
+            answer = typer.prompt("KVFlash policy", default="drafter").strip().lower()
+            if answer not in policy_choices.split("/"):
+                fallback_policy = policy_choices.split("/")[0]
+                console.print(f"[yellow]Unknown policy; using {fallback_policy}.[/yellow]")
+                answer = fallback_policy
+            if answer == "qk":
+                kvflash_policy = "qk"
+            elif answer == "lru":
+                kvflash_policy = "lru"
+            else:
+                kvflash_policy = "drafter"
+        elif preset is not None and preset.architecture == "qwen35":
+            kvflash_policy = "qk"
+            console.print("KVFlash policy: [bold]qk[/bold] (no extra scorer required)")
+        else:
+            console.print(
+                "[yellow]KVFlash would use recency-only LRU without the shared scorer; "
+                "older context can be evicted.[/yellow]"
+            )
+            if typer.confirm("Install the scorer instead?", default=True):
+                if _ensure_optimizer_drafter(cfg):
+                    kvflash_policy = "drafter"
+                else:
+                    kvflash_policy = "lru"
+            else:
+                kvflash_policy = "lru"
+
+    spark = False
+    if plan.spark.available:
+        spark = typer.confirm(
+            "Enable Spark self-tuning MoE expert offload?", default=plan.spark.enabled
+        )
+    else:
+        console.print(f"Spark: [dim]unavailable — {escape(plan.spark.reason)}[/dim]")
+
+    uses_scorer = pflash or (kvflash and kvflash_policy == "drafter")
+    prefill_drafter = download_mod.optimizer_drafter_container_path() if uses_scorer else ""
+    if kvflash and runtime.fa_window > 0:
+        console.print("[dim]KVFlash selected: disabling the incompatible FA window.[/dim]")
+
+    return replace(
+        runtime,
+        speculative_decode=speculative_decode,
+        lazy=False if not speculative_decode else runtime.lazy,
+        prefill_mode="auto" if pflash else "off",
+        prefill_keep_ratio=0.10 if pflash else runtime.prefill_keep_ratio,
+        prefill_threshold=32768,
+        prefill_drafter=prefill_drafter,
+        kvflash="auto" if kvflash else "off",
+        kvflash_policy=kvflash_policy,
+        spark=spark,
+        spark_vram_gb=0.0,
+        fa_window=0 if kvflash else runtime.fa_window,
+    )
+
+
 @app.command()
 def optimize(
     yes: Annotated[
         bool,
-        typer.Option("--yes", "-y", help="Apply without confirmation."),
+        typer.Option("--yes", "-y", help="Apply Automatic without prompts."),
+    ] = False,
+    advanced: Annotated[
+        bool,
+        typer.Option("--advanced", help="Review DFlash/PFlash/KVFlash/Spark choices."),
     ] = False,
 ) -> None:
-    """Apply the recommended hardware-aware inference profile.
+    """Choose and apply a model-aware, hardware-aware optimization profile."""
+    if yes and advanced:
+        error_console.print(
+            "[red]--advanced is interactive and cannot be combined with --yes[/red]"
+        )
+        raise typer.Exit(code=2)
 
-    Stable CUDA/ROCm fast paths remain enabled by the engine itself. This
-    profile selects a safe context size, cache format, and DFlash budget from
-    detected VRAM while leaving experimental features off.
-    """
     cfg = _load_or_build()
-    recommended = autotune_mod.runtime_from_host(cfg.host)
-    console.print("[bold]Automatic optimization (recommended)[/bold]")
-    console.print("  DFlash decode       automatic when the model has a matching draft")
-    console.print("  GPU fast paths      enabled by the engine on CUDA and ROCm")
-    console.print(f"  Maximum context     {recommended.max_ctx:,} tokens")
-    cache = recommended.cache_type_k or "model default"
-    console.print(f"  KV cache            {cache}")
-    console.print("  Experimental paths  off")
-    if not yes and not typer.confirm("Apply this profile?", default=True):
+    plan = autotune_mod.automatic_plan(cfg)
+    _render_optimization_plan(plan)
+
+    custom = advanced
+    if not yes and not advanced:
+        console.print("\n  [bold cyan]1[/bold cyan]  Apply Automatic (recommended)")
+        console.print("  [bold cyan]2[/bold cyan]  Customize")
+        console.print("  [bold cyan]q[/bold cyan]  Cancel")
+        choice = typer.prompt("\nChoose", default="1").strip().lower()
+        if choice in {"q", "quit", "cancel"}:
+            console.print("[dim]Optimization unchanged.[/dim]")
+            return
+        if choice not in {"1", "2"}:
+            error_console.print("[red]Choose 1, 2, or q.[/red]")
+            raise typer.Exit(code=2)
+        custom = choice == "2"
+
+    if custom:
+        runtime = _customize_runtime(cfg, plan)
+        if not typer.confirm("Apply this custom profile?", default=True):
+            console.print("[dim]Optimization unchanged.[/dim]")
+            return
+        config_mod.write_optimization_runtime(runtime, mode="custom", source="guided")
+        console.print("[green]Custom optimization profile applied.[/green]")
+        return
+
+    if plan.needs_optimizer_drafter and _ensure_optimizer_drafter(cfg, assume_yes=yes):
+        plan = autotune_mod.automatic_plan(cfg)
+        _render_optimization_plan(plan, title="Updated automatic plan")
+    if not yes and not typer.confirm("Apply this automatic profile?", default=True):
         console.print("[dim]Optimization unchanged.[/dim]")
         return
-    config_mod.seed_dflash_from_host(cfg.host, force=True)
+    config_mod.write_optimization_runtime(plan.runtime)
     console.print("[green]Automatic optimization applied.[/green]")
-    console.print("[dim]Advanced users can still use `lucebox config set dflash.KEY=VALUE`.[/dim]")
+    console.print(
+        "[dim]Run `lucebox optimize --advanced` anytime to review individual features.[/dim]"
+    )
 
 
 @app.command()

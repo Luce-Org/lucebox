@@ -112,9 +112,7 @@ def _resolve_model_files(cfg: Config) -> tuple[str, str, str]:
 def _runtime_volumes(cfg: Config) -> tuple[BindMount, ...]:
     """Mount only the writable application data needed by the server."""
     models = str(cfg.models_dir.absolute())
-    config_home = Path(
-        os.environ.get("LUCEBOX_HOME") or Path.home() / ".lucebox"
-    ).absolute()
+    config_home = Path(os.environ.get("LUCEBOX_HOME") or Path.home() / ".lucebox").absolute()
     return (
         BindMount(models, _CONTAINER_MODELS),
         BindMount(str(config_home), str(config_home)),
@@ -266,9 +264,7 @@ def server_run_spec(cfg: Config) -> DockerRunSpec:
     # LUCEBOX_HOST_* first so they ride out front in the rendered argv,
     # making it obvious in `print-run` output what host facts get forwarded.
     env: list[tuple[str, str]] = list(_host_facts_env())
-    config_home = str(
-        Path(os.environ.get("LUCEBOX_HOME") or Path.home() / ".lucebox").absolute()
-    )
+    config_home = str(Path(os.environ.get("LUCEBOX_HOME") or Path.home() / ".lucebox").absolute())
     env += [
         ("LUCEBOX_HOME", config_home),
         ("DFLASH_BUDGET", str(cfg.dflash.budget)),
@@ -299,7 +295,9 @@ def server_run_spec(cfg: Config) -> DockerRunSpec:
             mounts=volumes,
         )
         env.append(("DFLASH_TARGET", target_path))
-    if draft_file:
+    if not cfg.dflash.speculative_decode:
+        env.append(("DFLASH_DRAFT", "/opt/lucebox-hub/server/models/.lucebox-no-draft"))
+    elif draft_file:
         draft_path = _selected_model_path(
             cfg,
             draft_file,
@@ -333,14 +331,24 @@ def server_run_spec(cfg: Config) -> DockerRunSpec:
         env.append(("DFLASH_CACHE_TYPE_K", cfg.dflash.cache_type_k))
     if cfg.dflash.cache_type_v:
         env.append(("DFLASH_CACHE_TYPE_V", cfg.dflash.cache_type_v))
+    if cfg.dflash.prefill_drafter:
+        env.append(("DFLASH_PREFILL_DRAFTER", cfg.dflash.prefill_drafter))
     if cfg.dflash.prefill_mode != "off":
         env += [
             ("DFLASH_PREFILL_MODE", cfg.dflash.prefill_mode),
             ("DFLASH_PREFILL_KEEP", str(cfg.dflash.prefill_keep_ratio)),
             ("DFLASH_PREFILL_THRESHOLD", str(cfg.dflash.prefill_threshold)),
         ]
-        if cfg.dflash.prefill_drafter:
-            env.append(("DFLASH_PREFILL_DRAFTER", cfg.dflash.prefill_drafter))
+    if cfg.dflash.kvflash != "off":
+        env += [
+            ("DFLASH_KVFLASH", cfg.dflash.kvflash),
+            ("DFLASH_KVFLASH_POLICY", cfg.dflash.kvflash_policy),
+            ("DFLASH_KVFLASH_TAU", str(cfg.dflash.kvflash_tau)),
+        ]
+    if cfg.dflash.spark:
+        env.append(("DFLASH_SPARK", "1"))
+        if cfg.dflash.spark_vram_gb > 0.0:
+            env.append(("DFLASH_SPARK_VRAM_GB", f"{cfg.dflash.spark_vram_gb:g}"))
     # fa_window=0 is the server's own default (full attention); only emit
     # the env when the operator has selected a sparse decode window. The
     # entrypoint mirrors this guard so an unset env reproduces the
@@ -351,10 +359,12 @@ def server_run_spec(cfg: Config) -> DockerRunSpec:
     # to pre-PR-#326 behavior). Emit only when nonzero to keep the
     # docker env minimal and mirror the entrypoint's `case` guard.
     if cfg.dflash.think_soft_close_min_ratio > 0.0:
-        env.append((
-            "DFLASH_THINK_SOFT_CLOSE_MIN_RATIO",
-            f"{cfg.dflash.think_soft_close_min_ratio:g}",
-        ))
+        env.append(
+            (
+                "DFLASH_THINK_SOFT_CLOSE_MIN_RATIO",
+                f"{cfg.dflash.think_soft_close_min_ratio:g}",
+            )
+        )
     if cfg.dflash.debug_thinking_logits:
         env.append(("DFLASH_DEBUG_THINKING_LOGITS", "1"))
 
@@ -369,6 +379,22 @@ def server_run_spec(cfg: Config) -> DockerRunSpec:
         gpu_vendor = "nvidia"
     else:
         gpu_vendor = cfg.host.gpu_vendor if cfg.host.gpu_vendor != "none" else "nvidia"
+
+    # Keep execution on the same primary device used by host detection and
+    # automatic tuning. This matters on an R9700 + Strix build where ROCm may
+    # enumerate the integrated GPU before the larger discrete card. Explicit
+    # CUDA/ROCR/HIP visibility supplied by an advanced user remains authoritative.
+    if gpu_vendor == "amd":
+        rocr_visible = os.environ.get("LUCEBOX_HOST_ROCR_VISIBLE_DEVICES", "").strip()
+        hip_visible = os.environ.get("LUCEBOX_HOST_HIP_VISIBLE_DEVICES", "").strip()
+        if rocr_visible:
+            env.append(("ROCR_VISIBLE_DEVICES", rocr_visible))
+        elif hip_visible:
+            env.append(("HIP_VISIBLE_DEVICES", hip_visible))
+    elif gpu_vendor == "nvidia":
+        visible = os.environ.get("LUCEBOX_HOST_CUDA_VISIBLE_DEVICES", "").strip()
+        if visible:
+            env.append(("CUDA_VISIBLE_DEVICES", visible))
 
     return DockerRunSpec(
         image=f"{cfg.image}:{cfg.variant}",
