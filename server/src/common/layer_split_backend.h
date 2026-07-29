@@ -65,6 +65,12 @@ public:
     virtual void snapshot_free(int slot) { (void)slot; }
     virtual bool snapshot_used(int slot) const { (void)slot; return false; }
     virtual int snapshot_cur_pos(int slot) const { (void)slot; return 0; }
+    virtual bool snapshot_compatible(int slot,
+                                     const GenerateRequest & req) const {
+        (void)slot;
+        (void)req;
+        return true;
+    }
     virtual bool snapshot_restore(int slot) { (void)slot; return false; }
     virtual ModelBackend::SnapshotRef snapshot_ref(int slot) const {
         (void)slot;

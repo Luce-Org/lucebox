@@ -8,13 +8,13 @@
 static __global__ void argmax_f32(const float * __restrict__ x, int32_t * __restrict__ dst, const int64_t ncols) {
     const int64_t row = blockIdx.x;
 
-    float maxval = -FLT_MAX;
+    float maxval = -INFINITY;
     int   argmax = -1;
     const float * rowx = x + row * ncols;
 
     for (int32_t col = threadIdx.x; col < ncols; col += blockDim.x) {
         const float val = rowx[col];
-        if (val > maxval) {
+        if (val > maxval || (val == maxval && (argmax < 0 || col < argmax))) {
             maxval = val;
             argmax = col;
         }
@@ -24,7 +24,8 @@ static __global__ void argmax_f32(const float * __restrict__ x, int32_t * __rest
     for (int offset = WARP_SIZE/2; offset > 0; offset >>= 1) {
         const float val = __shfl_xor_sync(0xFFFFFFFF, maxval, offset, WARP_SIZE);
         const int   col = __shfl_xor_sync(0xFFFFFFFF, argmax, offset, WARP_SIZE);
-        if (val > maxval) {
+        if (col >= 0 &&
+            (val > maxval || (val == maxval && (argmax < 0 || col < argmax)))) {
             maxval = val;
             argmax = col;
         }
@@ -53,7 +54,8 @@ static __global__ void argmax_f32(const float * __restrict__ x, int32_t * __rest
             for (int offset = WARP_SIZE/2; offset > 0; offset >>= 1) {
                 const float val = __shfl_xor_sync(0xFFFFFFFF, maxval, offset, WARP_SIZE);
                 const int   col = __shfl_xor_sync(0xFFFFFFFF, argmax, offset, WARP_SIZE);
-                if (val > maxval) {
+                if (col >= 0 &&
+                    (val > maxval || (val == maxval && (argmax < 0 || col < argmax)))) {
                     maxval = val;
                     argmax = col;
                 }

@@ -1584,8 +1584,10 @@ inline static void ggml_vec_argmax_f32(const int n, int * s, const float * x) {
     float max = -INFINITY;
     int idx = 0;
     for (int i = 0; i < n; ++i) {
-        max = MAX(max, x[i]);
-        if (max == x[i]) { idx = i; }
+        if (x[i] > max) {
+            max = x[i];
+            idx = i;
+        }
     }
     *s = idx;
 }

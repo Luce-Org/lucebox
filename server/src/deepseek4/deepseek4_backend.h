@@ -76,6 +76,7 @@ private:
     static constexpr int PREFIX_SLOTS = 64;
     DeepSeek4Snapshot      snapshots_[PREFIX_SLOTS];
     std::vector<float>     last_logits_;
+    int32_t                last_argmax_ = -1;
 
     // DSpark speculative decode (opt-in: DFLASH_DS4_SPEC=1 + DFLASH_DS4_DRAFT=<gguf>).
     bool                           spec_enabled_ = false;
