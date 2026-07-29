@@ -1,0 +1,9 @@
+{
+  "changed_paths": [
+    "server/src/server/sse_emitter.cpp"
+  ],
+  "expected_coverage_gaps": [
+    "streaming-lifecycle"
+  ],
+  "expected_target_ids": []
+}

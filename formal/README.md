@@ -8,25 +8,31 @@ companion runner.
 
 The `Formal Verification / verify` check is deterministic:
 
+- its workflow, registry, templates, bounds, and verifier arguments come from
+  the exact target-branch base commit, not from the PR being judged;
+- it checks out the exact PR head separately and refuses a SHA mismatch;
 - its verifier image and ESBMC release are pinned by SHA-256 digest;
 - the Lucebox checkout is mounted read-only;
-- the results directory is the only writable bind mount;
+- only the generated-plan and results directories are writable;
 - the container has no network, Linux capabilities, or writable root;
 - no model SDK or repository secret is present.
 
 The `Formal AI Candidate` workflow is separate and advisory:
 
-- it ignores fork failures and infrastructure failures;
-- a secretless job first confirms that the deterministic report contains a
-  real counterexample;
+- automatic model access is limited to same-repository revisions; a maintainer
+  may explicitly dispatch a reviewed fork run;
+- a secretless job authenticates the deterministic run, source SHA, evidence,
+  and either a real counterexample or a critical coverage gap;
 - the `formal-ai` environment requires approval before model access;
 - archive paths, sizes, immutable contract hashes, and mutable patch paths are
   validated;
 - the credential-bearing proposer never executes generated code;
 - generated code is applied, compiled, run, and reverified only in a second
   networkless container after the proposer has exited;
-- the lane can upload only a diagnosis and candidate patch. It cannot commit,
-  comment, push, or open a pull request.
+- a missing-contract proposal is compiled and checked by ESBMC without
+  credentials, but remains advisory until reviewed and merged into base policy;
+- the lane can only upload artifacts. It cannot commit, comment, push, or open
+  a pull request.
 
 Every C/C++ capsule requests ESBMC's native self-contained HTML report. A
 counterexample publishes it below `counterexamples/<capsule>/` in the formal
@@ -54,27 +60,61 @@ capsule contract is described as model checked.
 
 ## Local use
 
-Docker will pull the immutable verifier declared in `manifest.toml`.
+Docker will pull the immutable verifier declared in
+`contracts/registry.toml`. Local planning requires a committed checkout.
 
 ```bash
 ./scripts/formal.sh --all
 ./scripts/formal.sh --nightly
 ./scripts/formal.sh --base-sha origin/main
+./scripts/formal.sh --all --legacy
 ```
 
 Set `LUCEBOX_FORMAL_IMAGE` only when deliberately testing a new companion image.
 Results are written to `.formal-results/`.
 
-## Adding a capsule
+## Adding an approved contract
 
 1. Extract a dependency-light production transition boundary; do not verify a
    toy reimplementation.
-2. Write the bounded harness and a property document that distinguishes checked
-   properties from exclusions.
+2. Write a deterministic template and property document that distinguish
+   checked properties from exclusions.
 3. Add a deterministic native regression test.
-4. Declare trigger, mutable, and immutable contract paths in `manifest.toml`.
+4. Declare the exact symbol/signature, triggers, PR/nightly bounds, mutable
+   paths, and immutable contract paths in `contracts/registry.toml`.
 5. Run both pull-request and nightly bounds locally.
-6. Treat timeout and tool errors as failures, never as passes.
+6. Demonstrate mutation sensitivity before marking the entry `required`.
+7. Treat invalid contracts, exhausted bounds, timeout, and tool errors as
+   failures, never as passes.
+
+## Per-PR contract registry migration
+
+The current capsules have also been recorded in
+[`contracts/registry.toml`](contracts/registry.toml) with deterministic source
+templates. This is a dual-run migration: the registry drives the base-locked
+plan while `manifest.toml` remains an advisory comparison interface. See
+[`contracts/README.md`](contracts/README.md) for the base-branch trust rule,
+coverage-gap policy, and local registry validation commands.
+
+The first registry PR cannot use itself as required base policy. Validate that
+bootstrap revision with an `all` workflow dispatch; base-locked PR planning
+starts after the registry exists on the protected target branch.
+
+## AI environment
+
+Create an approval-protected GitHub environment named `formal-ai`:
+
+```text
+Secret:
+  ZAI_API_KEY=<key>
+
+Variables:
+  FORMAL_AI_MODEL=openai:glm-5
+  FORMAL_AI_BASE_URL=https://api.z.ai/api/paas/v4/
+```
+
+`OPENAI_API_KEY` may be used instead when the base URL and model are configured
+for OpenAI. Model credentials are passed only to proposal containers.
 
 ## Promotion after the proving period
 

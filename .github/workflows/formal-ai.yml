@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       run_id:
-        description: Failed Formal Verification workflow run ID
+        description: Formal Verification workflow run ID
         required: true
         type: string
 
@@ -22,25 +22,26 @@ concurrency:
 jobs:
   inspect:
     name: inspect-deterministic-result
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (
-        github.event.workflow_run.conclusion == 'failure' &&
-        github.event.workflow_run.head_repository.full_name == github.repository
-      )
     runs-on: ubuntu-latest
     outputs:
       run_id: ${{ steps.source.outputs.run_id }}
+      authorized: ${{ steps.report.outputs.authorized }}
       has_counterexample: ${{ steps.report.outputs.has_counterexample }}
+      has_coverage_gap: ${{ steps.report.outputs.has_coverage_gap }}
+      head_repository: ${{ steps.report.outputs.head_repository }}
+      head_sha: ${{ steps.report.outputs.head_sha }}
     steps:
       - id: source
-        name: Resolve failed run
+        name: Resolve deterministic run
         shell: bash
         run: |
           if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
-            echo 'run_id=${{ inputs.run_id }}' >> "$GITHUB_OUTPUT"
+            echo "run_id=${{ inputs.run_id }}" >> "$GITHUB_OUTPUT"
+            echo "manual=true" >> "$GITHUB_OUTPUT"
           else
-            echo 'run_id=${{ github.event.workflow_run.id }}' >> "$GITHUB_OUTPUT"
+            echo "run_id=${{ github.event.workflow_run.id }}" \
+              >> "$GITHUB_OUTPUT"
+            echo "manual=false" >> "$GITHUB_OUTPUT"
           fi
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -51,30 +52,84 @@ jobs:
           run-id: ${{ steps.source.outputs.run_id }}
 
       - id: report
-        name: Require a real counterexample
+        name: Authenticate source and classify evidence
+        env:
+          MANUAL_DISPATCH: ${{ steps.source.outputs.manual }}
+          EXPECTED_REPOSITORY: ${{ github.repository }}
         shell: bash
         run: |
-          python3 - <<'PY'
+          python3 -c '
           import json
           import os
+          import re
           from pathlib import Path
 
-          reports = list(Path("incoming").rglob("report.json"))
-          if len(reports) != 1:
-              raise SystemExit(f"expected one report.json, found {len(reports)}")
-          report = json.loads(reports[0].read_text(encoding="utf-8"))
+          def exactly_one(name):
+              matches = list(Path("incoming").rglob(name))
+              if len(matches) != 1:
+                  raise SystemExit(
+                      f"expected one {name}, found {len(matches)}"
+                  )
+              return matches[0]
+
+          source = json.loads(
+              exactly_one("source.json").read_text(encoding="utf-8")
+          )
+          report = json.loads(
+              exactly_one("report.json").read_text(encoding="utf-8")
+          )
+          expected = os.environ["EXPECTED_REPOSITORY"]
+          sha = re.compile(r"^[0-9a-f]{40}$")
+          if source.get("repository") != expected:
+              raise SystemExit("formal source repository mismatch")
+          if not sha.fullmatch(source.get("base_sha", "")):
+              raise SystemExit("formal source has invalid base SHA")
+          if not sha.fullmatch(source.get("head_sha", "")):
+              raise SystemExit("formal source has invalid head SHA")
+          if report.get("base_sha") != source["base_sha"]:
+              raise SystemExit("formal report base SHA mismatch")
+          if report.get("head_sha") != source["head_sha"]:
+              raise SystemExit("formal report head SHA mismatch")
+          head_repository = source.get("head_repository")
+          if not isinstance(head_repository, str):
+              raise SystemExit("formal source has invalid head repository")
+
           statuses = {
               item.get("status") for item in report.get("results", [])
           }
-          value = "true" if "counterexample" in statuses else "false"
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-              output.write(f"has_counterexample={value}\n")
-          PY
+          failures = list(
+              Path("incoming").rglob("failure-bundle-*.tar.gz")
+          )
+          gaps = list(
+              Path("incoming").rglob("coverage-gap-bundle-*.tar.gz")
+          )
+          has_counterexample = (
+              "counterexample" in statuses and bool(failures)
+          )
+          has_coverage_gap = "coverage_gap" in statuses and bool(gaps)
+          manual = os.environ["MANUAL_DISPATCH"] == "true"
+          authorized = manual or head_repository == expected
 
-  candidate:
-    name: approval-only-candidate
+          values = {
+              "authorized": str(authorized).lower(),
+              "has_counterexample": str(has_counterexample).lower(),
+              "has_coverage_gap": str(has_coverage_gap).lower(),
+              "head_repository": head_repository,
+              "head_sha": source["head_sha"],
+          }
+          with open(
+              os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8"
+          ) as output:
+              for key, value in values.items():
+                  output.write(f"{key}={value}\n")
+          '
+
+  repair-candidate:
+    name: approval-only-repair
     needs: inspect
-    if: needs.inspect.outputs.has_counterexample == 'true'
+    if: >-
+      needs.inspect.outputs.authorized == 'true' &&
+      needs.inspect.outputs.has_counterexample == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: formal-ai
@@ -87,16 +142,20 @@ jobs:
           run-id: ${{ needs.inspect.outputs.run_id }}
 
       - id: propose
-        name: Generate bounded proposal without executing it
+        name: Generate bounded repair without executing it
         continue-on-error: true
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          FORMAL_AI_MODEL: ${{ vars.FORMAL_AI_MODEL || 'openai:gpt-5.6-sol' }}
-          REPAIR_IMAGE: ghcr.io/dusterbloom/lucebox-esbmc-ai-repair@sha256:16916da7102b7d02a45707d15f0bea2e40c186943f77f5d05babb5b48db57297
+          OPENAI_API_KEY: ${{ secrets.ZAI_API_KEY || secrets.OPENAI_API_KEY }}
+          OPENAI_API_BASE: ${{ vars.FORMAL_AI_BASE_URL || 'https://api.z.ai/api/paas/v4/' }}
+          FORMAL_AI_MODEL: ${{ vars.FORMAL_AI_MODEL || 'openai:glm-5' }}
+          REPAIR_IMAGE: ghcr.io/dusterbloom/lucebox-esbmc-ai-repair@sha256:ab36822157cc26ec59e160b96f2a38f63cfcafee895eb2d7d7fc3077f309d36b
         run: |
-          bundle="$(find incoming -type f -name 'failure-bundle-*.tar.gz' -print -quit)"
+          bundle="$(
+            find incoming -type f -name "failure-bundle-*.tar.gz" \
+              -print -quit
+          )"
           if [[ -z "$bundle" ]]; then
-            echo 'No failure bundle was present in the deterministic artifact.' >&2
+            echo "No failure bundle was present." >&2
             exit 21
           fi
           mkdir -p proposed
@@ -111,6 +170,7 @@ jobs:
             --user "$(id -u):$(id -g)" \
             --tmpfs /tmp:rw,nosuid,nodev,size=1g \
             --env OPENAI_API_KEY \
+            --env OPENAI_API_BASE \
             --env XDG_CACHE_HOME=/tmp/cache \
             --env XDG_CONFIG_HOME=/tmp/config \
             --volume "$GITHUB_WORKSPACE/incoming:/input:ro" \
@@ -121,20 +181,21 @@ jobs:
             --out /output
 
       - id: validate
-        name: Reverify proposal without network or credentials
+        name: Reverify repair without network or credentials
         if: steps.propose.outcome == 'success'
         continue-on-error: true
         env:
-          REPAIR_IMAGE: ghcr.io/dusterbloom/lucebox-esbmc-ai-repair@sha256:16916da7102b7d02a45707d15f0bea2e40c186943f77f5d05babb5b48db57297
+          REPAIR_IMAGE: ghcr.io/dusterbloom/lucebox-esbmc-ai-repair@sha256:ab36822157cc26ec59e160b96f2a38f63cfcafee895eb2d7d7fc3077f309d36b
         run: |
-          bundle="$(find incoming -type f -name 'failure-bundle-*.tar.gz' -print -quit)"
+          bundle="$(
+            find incoming -type f -name "failure-bundle-*.tar.gz" \
+              -print -quit
+          )"
           bundle_relative="${bundle#incoming/}"
           mkdir -p candidate
           if [[ -f proposed/diagnosis.md ]]; then
             cp proposed/diagnosis.md candidate/diagnosis.md
           fi
-          # Native revalidation compiles and executes inside this isolated,
-          # credential-free, networkless container.
           docker run --rm \
             --network none \
             --read-only \
@@ -153,26 +214,157 @@ jobs:
             --patch /proposal/candidate.patch \
             --out /output
 
-      - name: Publish advisory summary
+      - name: Publish advisory repair summary
         if: always()
         run: |
           {
-            echo '# Formal AI candidate'
+            echo "# Formal AI repair candidate"
             echo
-            echo 'This lane is advisory and cannot write to the repository.'
-            echo
-            echo "Proposal step outcome: \`${{ steps.propose.outcome }}\`"
-            echo "Secretless validation outcome: \`${{ steps.validate.outcome }}\`"
-            if [[ -f candidate/diagnosis.md ]]; then
-              echo
-              cat candidate/diagnosis.md
-            fi
+            echo "This lane is advisory and cannot write to the repository."
+            echo "Proposal: \`${{ steps.propose.outcome }}\`"
+            echo "Secretless validation: \`${{ steps.validate.outcome }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
-          name: formal-ai-candidate-${{ needs.inspect.outputs.run_id }}
+          name: formal-ai-repair-${{ needs.inspect.outputs.run_id }}
+          path: candidate/
+          if-no-files-found: warn
+          retention-days: 14
+
+  contract-candidate:
+    name: approval-only-contract
+    needs: inspect
+    if: >-
+      needs.inspect.outputs.authorized == 'true' &&
+      needs.inspect.outputs.has_coverage_gap == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: formal-ai
+    steps:
+      - name: Checkout exact head without credentials
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: ${{ needs.inspect.outputs.head_repository }}
+          ref: ${{ needs.inspect.outputs.head_sha }}
+          path: head
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: formal-results
+          path: incoming
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ needs.inspect.outputs.run_id }}
+
+      - id: propose
+        name: Draft bounded contracts without executing them
+        continue-on-error: true
+        env:
+          OPENAI_API_KEY: ${{ secrets.ZAI_API_KEY || secrets.OPENAI_API_KEY }}
+          OPENAI_API_BASE: ${{ vars.FORMAL_AI_BASE_URL || 'https://api.z.ai/api/paas/v4/' }}
+          FORMAL_AI_MODEL: ${{ vars.FORMAL_AI_MODEL || 'openai:glm-5' }}
+          REPAIR_IMAGE: ghcr.io/dusterbloom/lucebox-esbmc-ai-repair@sha256:ab36822157cc26ec59e160b96f2a38f63cfcafee895eb2d7d7fc3077f309d36b
+        run: |
+          mkdir -p proposed
+          successes=0
+          while IFS= read -r bundle; do
+            key="$(basename "$bundle" .tar.gz)"
+            bundle_relative="${bundle#incoming/}"
+            mkdir -p "proposed/$key"
+            if docker run --rm \
+              --read-only \
+              --cap-drop ALL \
+              --security-opt no-new-privileges \
+              --pids-limit 512 \
+              --memory 6g \
+              --cpus 2 \
+              --user "$(id -u):$(id -g)" \
+              --tmpfs /tmp:rw,nosuid,nodev,size=1g \
+              --env OPENAI_API_KEY \
+              --env OPENAI_API_BASE \
+              --env XDG_CACHE_HOME=/tmp/cache \
+              --env XDG_CONFIG_HOME=/tmp/config \
+              --volume "$GITHUB_WORKSPACE/incoming:/input:ro" \
+              --volume "$GITHUB_WORKSPACE/proposed/$key:/output:rw" \
+              "$REPAIR_IMAGE" propose-contract \
+              --bundle "/input/$bundle_relative" \
+              --model "$FORMAL_AI_MODEL" \
+              --out /output;
+            then
+              successes=$((successes + 1))
+            fi
+          done < <(
+            find incoming -type f \
+              -name "coverage-gap-bundle-*.tar.gz" |
+              sort |
+              head -4
+          )
+          [[ "$successes" -gt 0 ]]
+
+      - id: validate
+        name: Validate draft contracts without network or credentials
+        if: steps.propose.outcome == 'success'
+        continue-on-error: true
+        env:
+          REPAIR_IMAGE: ghcr.io/dusterbloom/lucebox-esbmc-ai-repair@sha256:ab36822157cc26ec59e160b96f2a38f63cfcafee895eb2d7d7fc3077f309d36b
+        run: |
+          mkdir -p candidate
+          ready=0
+          while IFS= read -r bundle; do
+            key="$(basename "$bundle" .tar.gz)"
+            bundle_relative="${bundle#incoming/}"
+            [[ -d "proposed/$key" ]] || continue
+            mkdir -p "candidate/$key"
+            if docker run --rm \
+              --network none \
+              --read-only \
+              --cap-drop ALL \
+              --security-opt no-new-privileges \
+              --pids-limit 512 \
+              --memory 6g \
+              --cpus 2 \
+              --user "$(id -u):$(id -g)" \
+              --tmpfs /tmp:rw,exec,nosuid,nodev,size=1g \
+              --volume "$GITHUB_WORKSPACE/incoming:/input:ro" \
+              --volume "$GITHUB_WORKSPACE/proposed/$key:/proposal:ro" \
+              --volume "$GITHUB_WORKSPACE/head:/workspace:ro" \
+              --volume "$GITHUB_WORKSPACE/candidate/$key:/output:rw" \
+              "$REPAIR_IMAGE" validate-contract \
+              --bundle "/input/$bundle_relative" \
+              --proposal-dir /proposal \
+              --workspace /workspace \
+              --out /output;
+            then
+              cp "proposed/$key/proposal.json" "candidate/$key/"
+              cp "proposed/$key/contract.cpp" "candidate/$key/"
+              ready=$((ready + 1))
+            fi
+          done < <(
+            find incoming -type f \
+              -name "coverage-gap-bundle-*.tar.gz" |
+              sort |
+              head -4
+          )
+          [[ "$ready" -gt 0 ]]
+
+      - name: Publish advisory contract summary
+        if: always()
+        run: |
+          {
+            echo "# Formal AI contract proposals"
+            echo
+            echo "AI proposals are advisory and never satisfy the gate."
+            echo "Proposal: \`${{ steps.propose.outcome }}\`"
+            echo "Secretless validation: \`${{ steps.validate.outcome }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: formal-ai-contract-${{ needs.inspect.outputs.run_id }}
           path: candidate/
           if-no-files-found: warn
           retention-days: 14

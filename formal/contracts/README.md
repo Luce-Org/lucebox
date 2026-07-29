@@ -1,0 +1,50 @@
+# Approved per-PR formal contracts
+
+`registry.toml` is the source of truth for the minimal formal boundaries that
+may be selected automatically for a pull request.  It is intentionally not a
+replacement for `../manifest.toml` yet: the manifest continues to drive the
+existing deterministic capsule workflow during the dual-run migration.
+
+Each target records the exact production symbol and signature, approved
+template, execution bounds, mutable implementation paths, immutable contract
+paths, and paired native regression.  Templates use only literal
+`{{ID}}`, `{{SYMBOL}}`, `{{SIGNATURE}}`, and optional declared variables.  The
+planner substitutes those tokens deterministically; it never asks a model to
+write a required contract.
+
+## Trust and migration rules
+
+For a PR, the planner must read this registry and the selected template blobs
+from the merge base (or a protected artifact identified by that base), then
+record their hashes in its plan.  It must not trust a registry or template that
+the PR itself changed.  A contract-change PR therefore runs the old approved
+contract as the gate and reports its proposed new contract separately until
+formal CODEOWNERS approve promotion.
+
+The current entries are a lossless migration of the two prefix-cache capsules:
+
+- `prefix-cache-inline` maps to the existing prepare/confirm/lookup harness.
+- `prefix-cache-abort-hole` maps to the existing native ESBMC function
+  contract around `select_inline_free_slot`.
+
+The templates intentionally call production code; they are not duplicate
+implementations.  The legacy harnesses and `formal/manifest.toml` remain
+unchanged until the planner and verifier dual-run has established equivalence.
+
+`[[critical_paths]]` lists the cache, snapshot, streaming, and tool-hint state
+machines.  A changed path in one of those areas that matches no approved target
+is an **advisory coverage gap**, never a pass.  Paths outside the list are
+reported as not applicable by the CI planner.
+
+## Local validation
+
+```bash
+python3 scripts/formal_plan.py validate
+python3 scripts/formal_plan.py plan \
+  --changed-path server/src/server/prefix_cache_state.h
+python3 -m unittest formal/contracts/tests/test_formal_plan.py -v
+```
+
+`emit` is a local fixture aid: it renders selected protected templates into an
+output directory and records their hashes.  It does not invoke ESBMC or modify
+the existing manifest lane.

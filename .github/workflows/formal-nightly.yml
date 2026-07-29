@@ -16,15 +16,60 @@ jobs:
   verify-nightly:
     name: verify-nightly
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
-      - id: formal
-        name: Run extended ESBMC capsules
+      - id: plan
+        name: Generate extended base-approved plan
         continue-on-error: true
         env:
-          VERIFIER_IMAGE: ghcr.io/dusterbloom/lucebox-esbmc-ai-verifier@sha256:d6f6d45ee3ff9531ba8255e98d2c9c235d3ce489d9ecad0df9f107406c218abf
+          VERIFIER_IMAGE: ghcr.io/dusterbloom/lucebox-esbmc-ai-verifier@sha256:dc25f2eea3fda4ea18b94a5539430d4598f6c833417186b536b7cab036c820ab
+          REVISION: ${{ github.sha }}
+        run: |
+          policy_image="$(
+            git show "$REVISION:formal/contracts/registry.toml" |
+              python3 -c '
+          import sys
+          import tomllib
+          print(tomllib.loads(sys.stdin.read())["toolchain"]["verifier_image"])
+          '
+          )"
+          if [[ "$policy_image" != "$VERIFIER_IMAGE" ]]; then
+            echo "Nightly image does not match trusted policy." >&2
+            exit 13
+          fi
+          mkdir -p .formal-plan
+          docker run --rm \
+            --network none \
+            --read-only \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --pids-limit 256 \
+            --memory 2g \
+            --cpus 1 \
+            --user "$(id -u):$(id -g)" \
+            --tmpfs /tmp:rw,nosuid,nodev,size=128m \
+            --volume "$GITHUB_WORKSPACE:/workspace:ro" \
+            --volume "$GITHUB_WORKSPACE/.formal-plan:/plan:rw" \
+            --workdir /workspace \
+            "$VERIFIER_IMAGE" plan \
+            --workspace /workspace \
+            --base-policy formal/contracts/registry.toml \
+            --base-sha "$REVISION" \
+            --head-sha "$REVISION" \
+            --mode nightly \
+            --out /plan
+
+      - id: formal
+        name: Run extended generated contracts
+        if: steps.plan.outcome == 'success'
+        continue-on-error: true
+        env:
+          VERIFIER_IMAGE: ghcr.io/dusterbloom/lucebox-esbmc-ai-verifier@sha256:dc25f2eea3fda4ea18b94a5539430d4598f6c833417186b536b7cab036c820ab
         run: |
           mkdir -p .formal-results
           docker run --rm \
@@ -38,7 +83,34 @@ jobs:
             --user "$(id -u):$(id -g)" \
             --tmpfs /tmp:rw,nosuid,nodev,size=512m \
             --volume "$GITHUB_WORKSPACE:/workspace:ro" \
+            --volume "$GITHUB_WORKSPACE/.formal-plan:/plan:ro" \
             --volume "$GITHUB_WORKSPACE/.formal-results:/results:rw" \
+            --workdir /workspace \
+            "$VERIFIER_IMAGE" verify \
+            --plan /plan/plan.json \
+            --workspace /workspace \
+            --generated-root /plan \
+            --out /results
+
+      - id: legacy
+        name: Run legacy nightly capsules for comparison
+        continue-on-error: true
+        env:
+          VERIFIER_IMAGE: ghcr.io/dusterbloom/lucebox-esbmc-ai-verifier@sha256:dc25f2eea3fda4ea18b94a5539430d4598f6c833417186b536b7cab036c820ab
+        run: |
+          mkdir -p .formal-legacy-results
+          docker run --rm \
+            --network none \
+            --read-only \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --pids-limit 512 \
+            --memory 6g \
+            --cpus 2 \
+            --user "$(id -u):$(id -g)" \
+            --tmpfs /tmp:rw,nosuid,nodev,size=512m \
+            --volume "$GITHUB_WORKSPACE:/workspace:ro" \
+            --volume "$GITHUB_WORKSPACE/.formal-legacy-results:/results:rw" \
             --workdir /workspace \
             "$VERIFIER_IMAGE" verify \
             --manifest /workspace/formal/manifest.toml \
@@ -51,18 +123,26 @@ jobs:
           if [[ -f .formal-results/summary.md ]]; then
             cat .formal-results/summary.md >> "$GITHUB_STEP_SUMMARY"
           else
-            echo 'Formal verifier did not produce a summary.' >> "$GITHUB_STEP_SUMMARY"
+            echo "Nightly plan did not produce a summary." \
+              >> "$GITHUB_STEP_SUMMARY"
           fi
+          echo "Legacy comparison: \`${{ steps.legacy.outcome }}\`" \
+            >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
           name: formal-nightly-results
-          path: .formal-results/
+          path: |
+            .formal-plan/
+            .formal-results/
+            .formal-legacy-results/
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 30
 
       - name: Enforce extended result
-        if: steps.formal.outcome != 'success'
+        if: >-
+          steps.plan.outcome != 'success' ||
+          steps.formal.outcome != 'success'
         run: exit 1

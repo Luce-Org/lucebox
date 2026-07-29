@@ -1,49 +1,178 @@
 name: Formal Verification
 
 on:
-  pull_request:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
   merge_group:
+    types: [checks_requested]
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      base_sha:
+        description: Trusted policy/base commit (defaults to head)
+        required: false
+        type: string
+      head_sha:
+        description: Production commit to verify (defaults to dispatched ref)
+        required: false
+        type: string
+      mode:
+        description: Verification scope
+        required: true
+        default: all
+        type: choice
+        options: [pr, all, nightly]
 
 permissions:
   contents: read
 
 concurrency:
-  group: formal-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: formal-${{ github.workflow }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}
   cancel-in-progress: true
 
 jobs:
   verify:
     name: verify
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
+    outputs:
+      base_sha: ${{ steps.scope.outputs.base_sha }}
+      head_sha: ${{ steps.scope.outputs.head_sha }}
+      head_repository: ${{ steps.scope.outputs.head_repository }}
+      mode: ${{ steps.scope.outputs.mode }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          fetch-depth: 0
-
       - id: scope
-        name: Select verification scope
+        name: Resolve trusted policy and production revisions
         shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          GROUP_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+          INPUT_BASE_SHA: ${{ inputs.base_sha }}
+          INPUT_HEAD_SHA: ${{ inputs.head_sha }}
+          INPUT_MODE: ${{ inputs.mode }}
+          EVENT_SHA: ${{ github.sha }}
+          CURRENT_REPOSITORY: ${{ github.repository }}
         run: |
-          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
-            echo 'mode=pr' >> "$GITHUB_OUTPUT"
-            echo 'base_sha=${{ github.event.pull_request.base.sha }}' >> "$GITHUB_OUTPUT"
-          elif [[ "$GITHUB_EVENT_NAME" == "merge_group" ]]; then
-            echo 'mode=pr' >> "$GITHUB_OUTPUT"
-            echo 'base_sha=${{ github.event.merge_group.base_sha }}' >> "$GITHUB_OUTPUT"
-          else
-            echo 'mode=all' >> "$GITHUB_OUTPUT"
-            echo 'base_sha=' >> "$GITHUB_OUTPUT"
+          case "$EVENT_NAME" in
+            pull_request_target)
+              base_sha="$PR_BASE_SHA"
+              head_sha="$PR_HEAD_SHA"
+              head_repository="$PR_HEAD_REPOSITORY"
+              mode=pr
+              ;;
+            merge_group)
+              base_sha="$GROUP_BASE_SHA"
+              head_sha="$GROUP_HEAD_SHA"
+              head_repository="$CURRENT_REPOSITORY"
+              mode=pr
+              ;;
+            workflow_dispatch)
+              head_sha="${INPUT_HEAD_SHA:-$EVENT_SHA}"
+              base_sha="${INPUT_BASE_SHA:-$head_sha}"
+              head_repository="$CURRENT_REPOSITORY"
+              mode="$INPUT_MODE"
+              ;;
+            *)
+              base_sha="$EVENT_SHA"
+              head_sha="$EVENT_SHA"
+              head_repository="$CURRENT_REPOSITORY"
+              mode=all
+              ;;
+          esac
+          if [[ ! "$base_sha" =~ ^[0-9a-f]{40}$ ]] ||
+             [[ ! "$head_sha" =~ ^[0-9a-f]{40}$ ]] ||
+             [[ ! "$head_repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]];
+          then
+            echo "Refusing malformed formal-verification scope." >&2
+            exit 13
           fi
+          {
+            echo "base_sha=$base_sha"
+            echo "head_sha=$head_sha"
+            echo "head_repository=$head_repository"
+            echo "mode=$mode"
+          } >> "$GITHUB_OUTPUT"
 
-      - id: formal
-        name: Run deterministic ESBMC capsules
+      - name: Checkout exact production revision without credentials
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: ${{ steps.scope.outputs.head_repository }}
+          ref: ${{ steps.scope.outputs.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Materialize exact trusted base commit
+        shell: bash
+        env:
+          BASE_SHA: ${{ steps.scope.outputs.base_sha }}
+          HEAD_SHA: ${{ steps.scope.outputs.head_sha }}
+          BASE_REPOSITORY: ${{ github.repository }}
+        run: |
+          actual_head="$(git rev-parse HEAD)"
+          if [[ "$actual_head" != "$HEAD_SHA" ]]; then
+            echo "Checkout does not match the requested head SHA." >&2
+            exit 13
+          fi
+          if ! git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
+            git fetch --no-tags --depth=1 \
+              "https://github.com/$BASE_REPOSITORY.git" "$BASE_SHA"
+          fi
+          git cat-file -e "$BASE_SHA^{commit}"
+
+      - id: plan
+        name: Generate base-approved verification plan
         continue-on-error: true
         env:
-          VERIFIER_IMAGE: ghcr.io/dusterbloom/lucebox-esbmc-ai-verifier@sha256:d6f6d45ee3ff9531ba8255e98d2c9c235d3ce489d9ecad0df9f107406c218abf
+          VERIFIER_IMAGE: ghcr.io/dusterbloom/lucebox-esbmc-ai-verifier@sha256:dc25f2eea3fda4ea18b94a5539430d4598f6c833417186b536b7cab036c820ab
+          BASE_SHA: ${{ steps.scope.outputs.base_sha }}
+          HEAD_SHA: ${{ steps.scope.outputs.head_sha }}
+          MODE: ${{ steps.scope.outputs.mode }}
+        run: |
+          policy_image="$(
+            git show "$BASE_SHA:formal/contracts/registry.toml" |
+              python3 -c '
+          import sys
+          import tomllib
+          print(tomllib.loads(sys.stdin.read())["toolchain"]["verifier_image"])
+          '
+          )"
+          if [[ "$policy_image" != "$VERIFIER_IMAGE" ]]; then
+            echo "Workflow image does not match trusted base policy." >&2
+            exit 13
+          fi
+          mkdir -p .formal-plan
+          docker run --rm \
+            --network none \
+            --read-only \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --pids-limit 256 \
+            --memory 2g \
+            --cpus 1 \
+            --user "$(id -u):$(id -g)" \
+            --tmpfs /tmp:rw,nosuid,nodev,size=128m \
+            --volume "$GITHUB_WORKSPACE:/workspace:ro" \
+            --volume "$GITHUB_WORKSPACE/.formal-plan:/plan:rw" \
+            --workdir /workspace \
+            "$VERIFIER_IMAGE" plan \
+            --workspace /workspace \
+            --base-policy formal/contracts/registry.toml \
+            --base-sha "$BASE_SHA" \
+            --head-sha "$HEAD_SHA" \
+            --mode "$MODE" \
+            --out /plan
+
+      - id: formal
+        name: Verify exact generated plan
+        if: steps.plan.outcome == 'success'
+        continue-on-error: true
+        env:
+          VERIFIER_IMAGE: ghcr.io/dusterbloom/lucebox-esbmc-ai-verifier@sha256:dc25f2eea3fda4ea18b94a5539430d4598f6c833417186b536b7cab036c820ab
         run: |
           mkdir -p .formal-results
           docker run --rm \
@@ -57,12 +186,13 @@ jobs:
             --user "$(id -u):$(id -g)" \
             --tmpfs /tmp:rw,nosuid,nodev,size=512m \
             --volume "$GITHUB_WORKSPACE:/workspace:ro" \
+            --volume "$GITHUB_WORKSPACE/.formal-plan:/plan:ro" \
             --volume "$GITHUB_WORKSPACE/.formal-results:/results:rw" \
             --workdir /workspace \
             "$VERIFIER_IMAGE" verify \
-            --manifest /workspace/formal/manifest.toml \
-            --base-sha '${{ steps.scope.outputs.base_sha }}' \
-            --mode '${{ steps.scope.outputs.mode }}' \
+            --plan /plan/plan.json \
+            --workspace /workspace \
+            --generated-root /plan \
             --out /results
 
       - name: Publish formal summary
@@ -70,21 +200,128 @@ jobs:
         run: |
           if [[ -f .formal-results/summary.md ]]; then
             cat .formal-results/summary.md >> "$GITHUB_STEP_SUMMARY"
+          elif [[ "${{ steps.plan.outcome }}" != "success" ]]; then
+            echo "Formal planning failed; inspect the plan artifact." \
+              >> "$GITHUB_STEP_SUMMARY"
           else
-            echo 'Formal verifier did not produce a summary.' >> "$GITHUB_STEP_SUMMARY"
+            echo "Formal verifier did not produce a summary." \
+              >> "$GITHUB_STEP_SUMMARY"
           fi
+
+      - name: Record trusted workflow source
+        if: always()
+        env:
+          BASE_REPOSITORY: ${{ github.repository }}
+          HEAD_REPOSITORY: ${{ steps.scope.outputs.head_repository }}
+          BASE_SHA: ${{ steps.scope.outputs.base_sha }}
+          HEAD_SHA: ${{ steps.scope.outputs.head_sha }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          mkdir -p .formal-results
+          python3 -c '
+          import json
+          import os
+          from pathlib import Path
+          fields = {
+              "repository": os.environ["BASE_REPOSITORY"],
+              "head_repository": os.environ["HEAD_REPOSITORY"],
+              "base_sha": os.environ["BASE_SHA"],
+              "head_sha": os.environ["HEAD_SHA"],
+              "event": os.environ["EVENT_NAME"],
+          }
+          Path(".formal-results/source.json").write_text(
+              json.dumps(fields, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          '
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
           name: formal-results
-          path: .formal-results/
+          path: |
+            .formal-plan/
+            .formal-results/
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 14
 
       - name: Enforce deterministic result
-        if: steps.formal.outcome != 'success'
+        if: >-
+          steps.plan.outcome != 'success' ||
+          steps.formal.outcome != 'success'
         run: |
-          echo 'The deterministic formal-verification lane did not pass.' >&2
+          echo "The deterministic formal-verification lane did not pass." >&2
           exit 1
+
+  legacy-shadow:
+    name: legacy-shadow
+    needs: verify
+    if: always() && needs.verify.outputs.head_sha != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout exact production revision without credentials
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: ${{ needs.verify.outputs.head_repository }}
+          ref: ${{ needs.verify.outputs.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Materialize comparison base
+        env:
+          BASE_SHA: ${{ needs.verify.outputs.base_sha }}
+          BASE_REPOSITORY: ${{ github.repository }}
+        run: |
+          if ! git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
+            git fetch --no-tags --depth=1 \
+              "https://github.com/$BASE_REPOSITORY.git" "$BASE_SHA"
+          fi
+
+      - id: legacy
+        name: Run legacy manifest for dual-run comparison
+        continue-on-error: true
+        env:
+          VERIFIER_IMAGE: ghcr.io/dusterbloom/lucebox-esbmc-ai-verifier@sha256:dc25f2eea3fda4ea18b94a5539430d4598f6c833417186b536b7cab036c820ab
+          BASE_SHA: ${{ needs.verify.outputs.base_sha }}
+          MODE: ${{ needs.verify.outputs.mode }}
+        run: |
+          mkdir -p .formal-legacy-results
+          docker run --rm \
+            --network none \
+            --read-only \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --pids-limit 512 \
+            --memory 6g \
+            --cpus 2 \
+            --user "$(id -u):$(id -g)" \
+            --tmpfs /tmp:rw,nosuid,nodev,size=512m \
+            --volume "$GITHUB_WORKSPACE:/workspace:ro" \
+            --volume "$GITHUB_WORKSPACE/.formal-legacy-results:/results:rw" \
+            --workdir /workspace \
+            "$VERIFIER_IMAGE" verify \
+            --manifest /workspace/formal/manifest.toml \
+            --base-sha "$BASE_SHA" \
+            --mode "$MODE" \
+            --out /results
+
+      - name: Record advisory comparison
+        if: always()
+        run: |
+          {
+            echo "# Legacy formal comparison"
+            echo
+            echo "This shadow result is advisory during plan migration."
+            echo "Outcome: \`${{ steps.legacy.outcome }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: formal-legacy-results
+          path: .formal-legacy-results/
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 14
