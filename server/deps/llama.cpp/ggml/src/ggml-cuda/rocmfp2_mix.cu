@@ -427,6 +427,91 @@ __global__ void mix_matvec_rocmfp2_kernel(
 #if defined(__HIP_PLATFORM_AMD__)
 __attribute__((amdgpu_waves_per_eu(12, 12)))
 #endif
+
+// ---- fused DENSE 3-D-slice matvec (batched mul_mat over src0->ne[2]) ----
+// The target's attention output projection reshapes attn_output_a to
+// [group_dim, n_lora_o, n_out_group] and mul_mats it against a matching 3-D src1
+// (deepseek4_graph.cpp:2122), so src1->ne[2] > 1 and the 2-D fused hook's
+// `src1->ne[2] == 1` gate rejects it -- sending ~31% of the attention weight read to
+// dequantize->cuBLAS, which reads MORE bytes than the f16 it replaces.
+//
+// This is the MoE kernel with one change: the slice index comes from blockIdx.y
+// instead of a routing `ids[]` lookup. Everything else -- the data + slice*nb02
+// stride, codebooks + slice*2*K, modes[slice], the two-rows-per-warp register
+// blocking, the fixed ascending-j fold -- is unchanged, so each output element is
+// bit-identical to the MoE path for the same weights.
+__global__ void mix_matvec_rocmfp2_slice_kernel(
+        const uint8_t * __restrict__ data, size_t nb02,
+        const nv_bfloat16 * __restrict__ codebooks, const uint8_t * __restrict__ modes,
+        const float * __restrict__ src1,
+        float * __restrict__ dst, int in, int out, int ne11,
+        int64_t src1_s1, int64_t src1_s2,     // element strides (float) over ne11, token
+        int64_t dst_s1, int64_t dst_s2) {     // element strides (float) over slot, token
+    const int warps_per_block = blockDim.x / MIX_WARP;
+    const int warp  = blockIdx.x * warps_per_block + (threadIdx.x / MIX_WARP);
+    const int row0  = warp * 2;                 // two output rows per warp
+    const int lane  = threadIdx.x % MIX_WARP;
+    const int slot  = 0;                        // dense: one logical slot
+    const int token = blockIdx.z;
+    // slot = blockIdx.y and token = blockIdx.z, so `expert` -- and hence the codebook,
+    // mode and expert data base -- is WORKGROUP-UNIFORM. That is what makes staging the
+    // table in LDS legal: one table serves every warp in the block. Read the expert and
+    // stage BEFORE the row0 early-return so all threads reach the __syncthreads()
+    // (`row0 >= out` retires whole warps in the tail block).
+    const int expert = blockIdx.y;              // DENSE: slice index is the grid dim,
+                                                // not a routing lookup
+    __shared__ float s_lut[2 * MIX_K];
+    if ((int) threadIdx.x < 2 * MIX_K) {
+        s_lut[threadIdx.x] =
+            __bfloat162float(codebooks[(int64_t) expert * 2 * MIX_K + threadIdx.x]);
+    }
+    __syncthreads();
+    if (row0 >= out) return;
+    const bool two  = (row0 + 1) < out;         // false only for an odd-out tail warp
+    const uint8_t     * edata   = data + (int64_t) expert * nb02;
+    const int           mode    = (int) modes[expert];
+    const int           nb      = in / MIX_QK;
+    const uint8_t     * rowbase0 = edata + (int64_t) row0 * nb * MIX_BLOCK_BYTES;
+    // For an odd tail warp (no row1) reuse row0's base so the loads stay in-bounds;
+    // acc1 is simply never written. out=hidden is even here so `two` is uniformly
+    // true across the whole warp (no divergence in the hot loop).
+    const uint8_t     * rowbase1 = two ? edata + (int64_t) (row0 + 1) * nb * MIX_BLOCK_BYTES
+                                       : rowbase0;
+    // src1 is [in, ne11, ntok]; the get_rows-equivalent row for (slot, token)
+    // is token*ne11 + slot%ne11 — i.e. token column + the slot%ne11 broadcast.
+    const float * xcol = src1 + (int64_t) token * src1_s2 + (int64_t) (slot % ne11) * src1_s1;
+    // Two output rows in one warp. Each row is folded by the SAME mix_block_accum
+    // that the single-row path uses (byte-identical inlined body, same fixed j
+    // order, same acc-add chain) so acc0/acc1 are bit-for-bit identical to the
+    // single-row kernel's output for those rows. The two calls per block share the
+    // same __restrict__ xcol + col0, so the compiler CSEs the strided activation
+    // loads to one issue per element — halving activation LSU issue on this partly
+    // load-instruction-bound matvec — WITHOUT reordering either row's summation.
+    float acc0 = 0.0f, acc1 = 0.0f;
+    int blk = lane;
+    for (; blk + (MIX_UNROLL - 1) * MIX_WARP < nb; blk += MIX_UNROLL * MIX_WARP) {
+        #pragma unroll
+        for (int u = 0; u < MIX_UNROLL; ++u) {
+            const int b = blk + u * MIX_WARP;
+            mix_block_accum(rowbase0 + (int64_t) b * MIX_BLOCK_BYTES, xcol, b * MIX_QK, mode, s_lut, acc0);
+            mix_block_accum(rowbase1 + (int64_t) b * MIX_BLOCK_BYTES, xcol, b * MIX_QK, mode, s_lut, acc1);
+        }
+    }
+    for (; blk < nb; blk += MIX_WARP) {
+        mix_block_accum(rowbase0 + (int64_t) blk * MIX_BLOCK_BYTES, xcol, blk * MIX_QK, mode, s_lut, acc0);
+        mix_block_accum(rowbase1 + (int64_t) blk * MIX_BLOCK_BYTES, xcol, blk * MIX_QK, mode, s_lut, acc1);
+    }
+    #pragma unroll
+    for (int off = MIX_WARP/2; off > 0; off >>= 1) {
+        acc0 += mix_warp_shfl_down(acc0, off);
+        acc1 += mix_warp_shfl_down(acc1, off);
+    }
+    if (lane == 0) {
+        dst[(int64_t) token * dst_s2 + (int64_t) slot * dst_s1 + row0] = acc0;
+        if (two) dst[(int64_t) token * dst_s2 + (int64_t) slot * dst_s1 + row0 + 1] = acc1;
+    }
+}
+
 __global__ void mix_matvec_rocmfp2_moe_kernel(
         const uint8_t * __restrict__ data, size_t nb02,
         const nv_bfloat16 * __restrict__ codebooks, const uint8_t * __restrict__ modes,
@@ -504,6 +589,33 @@ __global__ void mix_matvec_rocmfp2_moe_kernel(
 // the per-expert index is read on device. Returns false if the tensor is not
 // registered (caller keeps the generic fallback). ne11 is the src1 broadcast
 // dim (1 for decode). All *_s* are element strides (see kernel).
+bool ggml_cuda_rocmfp2_mix_mul_mat_vec_3d(
+        const void * vx, const float * src1, float * dst,
+        int in, int out, int nslices, int ntokens,
+        int64_t src1_s1, int64_t src1_s2, int64_t dst_s1, int64_t dst_s2,
+        cudaStream_t stream) {
+    MixEntry e;
+    int slice0;
+    if (!mix_lookup(vx, e, slice0)) {
+        return false;  // not registered -> caller keeps the dequant fallback
+    }
+    // The registry must cover every slice this launch will index via blockIdx.y.
+    // Registering a 3-D dense tensor with n_experts < ne02 would silently read a
+    // codebook belonging to another tensor, so refuse rather than corrupt.
+    if (slice0 != 0 || e.n_experts < nslices) {
+        return false;
+    }
+    const int warps_per_block = 2;
+    const int threads = warps_per_block * MIX_WARP;
+    const int rows_per_block = 2 * warps_per_block;
+    dim3 grid((out + rows_per_block - 1) / rows_per_block, nslices, ntokens);
+    mix_matvec_rocmfp2_slice_kernel<<<grid, dim3(threads), 0, stream>>>(
+        (const uint8_t *) e.base, e.nb02, e.codebooks, e.modes,
+        src1, dst, in, out, /*ne11=*/1,
+        src1_s1, src1_s2, dst_s1, dst_s2);
+    return true;
+}
+
 bool ggml_cuda_rocmfp2_mix_mul_mat_id(
         const void * vx, const float * src1, const int32_t * ids, float * dst,
         int in, int out, int n_expert_used, int n_tokens, int ne11,

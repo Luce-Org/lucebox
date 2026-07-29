@@ -42,6 +42,19 @@ bool ggml_cuda_rocmfp3_mix_mul_mat_vec(
         int in, int out, int ncols,
         int64_t x_col_stride, int64_t y_col_stride, cudaStream_t stream);
 
+
+// Fused DENSE 3-D-slice matvec: dst[out, ntokens, nslices] = W[out, in, nslices] .
+// x[in, ntokens, nslices], one slice per blockIdx.y. Exists because the target's
+// attn_output_a is mul_mat'd as a 3-D batched slice (src1->ne[2] > 1), which the 2-D
+// hook rejects, and the dequant->cuBLAS fallback reads more bytes than the f16 it
+// replaces. Requires the tensor registered with n_experts >= nslices; returns false
+// otherwise (rather than reading another tensor's codebook).
+bool ggml_cuda_rocmfp3_mix_mul_mat_vec_3d(
+        const void * vx, const float * src1, float * dst,
+        int in, int out, int nslices, int ntokens,
+        int64_t src1_s1, int64_t src1_s2, int64_t dst_s1, int64_t dst_s2,
+        cudaStream_t stream);
+
 // Stream-sync-free fused MoE matvec for a qtype-105 mul_mat_id (decode). Reads
 // the routing `ids` on device so the whole op runs with no host id-sort +
 // cudaStreamSynchronize (the generic ggml_cuda_mul_mat_id fallback needs both),

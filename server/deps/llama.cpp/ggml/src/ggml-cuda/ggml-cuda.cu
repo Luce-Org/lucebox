@@ -2811,6 +2811,43 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         }
     }
 
+    // 3-D batched slice: the target's attn_output_a is reshaped to
+    // [group_dim, n_lora_o, n_out_group] and mul_mat'd against a matching 3-D src1
+    // (deepseek4_graph.cpp:2122), so src1->ne[2] > 1 and the two 2-D hooks above
+    // reject it on `src1->ne[2] == 1`. Falling through is not neutral: for a mix
+    // qtype the generic chain ends at dequant->cuBLAS, which reads the blocks, writes
+    // a full f16 copy, then reads that back -- MORE bytes than the f16 weight it
+    // replaced. This is ~31% of the attention weight read, so it has to be handled
+    // rather than merely allowed.
+    //
+    // ne[1] is the token count here (not a column batch), so no ncols cap applies:
+    // the kernel gives each (row, token, slice) its own warp exactly as the MoE path
+    // does. src0->ne[2] must equal src1->ne[2]; anything else is not this pattern.
+    if (mix_fused_on && is_mix_qtype && !split
+            && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+            && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)
+            && src1->ne[3] == 1 && src0->ne[3] == 1
+            && src1->ne[2] > 1 && src0->ne[2] == src1->ne[2]) {
+        const int    nslices = (int) src0->ne[2];
+        const int    ntokens = (int) src1->ne[1];
+        const int64_t s1_s1  = (int64_t) (src1->nb[1] / sizeof(float));
+        const int64_t s1_s2  = (int64_t) (src1->nb[2] / sizeof(float));
+        const int64_t d_s1   = (int64_t) (dst->nb[1]  / sizeof(float));
+        const int64_t d_s2   = (int64_t) (dst->nb[2]  / sizeof(float));
+        const bool handled = is_rocmfp3_mix
+            ? ggml_cuda_rocmfp3_mix_mul_mat_vec_3d(
+                  src0->data, (const float *) src1->data, (float *) dst->data,
+                  (int) src0->ne[0], (int) src0->ne[1], nslices, ntokens,
+                  s1_s1, s1_s2, d_s1, d_s2, ctx.stream())
+            : ggml_cuda_rocmfp2_mix_mul_mat_vec_3d(
+                  src0->data, (const float *) src1->data, (float *) dst->data,
+                  (int) src0->ne[0], (int) src0->ne[1], nslices, ntokens,
+                  s1_s1, s1_s2, d_s1, d_s2, ctx.stream());
+        if (handled) {
+            return;
+        }
+    }
+
     if (grouped_src) {
         // Only MMQ's grouped activation quantizer understands the physical
         // [K/group,N,group] source layout.
