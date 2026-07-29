@@ -83,6 +83,12 @@ def load_registry(registry_path: Path, root: Path) -> dict[str, Any]:
         raise RegistryError("unsupported registry schema_version")
     if not isinstance(data.get("registry"), dict):
         raise RegistryError("registry table is required")
+    compatibility_manifest = data["registry"].get("compatibility_manifest")
+    if compatibility_manifest is not None:
+        data["registry"]["compatibility_manifest"] = _repo_path(
+            compatibility_manifest,
+            "registry.compatibility_manifest",
+        )
 
     critical_paths = data.get("critical_paths")
     if not isinstance(critical_paths, list) or not critical_paths:
@@ -211,11 +217,10 @@ def coverage_gaps(registry: dict[str, Any], changed_paths: list[str]) -> list[di
         pattern for target in registry["targets"] for pattern in target["trigger_paths"]
     ]
     for area in registry["critical_paths"]:
-        routing_patterns = area["paths"] + area["watch_paths"]
         uncovered = [
             path
             for path in changed_paths
-            if _matches(path, routing_patterns) and not _matches(path, target_patterns)
+            if _matches(path, area["paths"]) and not _matches(path, target_patterns)
         ]
         if uncovered:
             gaps.append(

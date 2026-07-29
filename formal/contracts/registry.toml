@@ -13,6 +13,7 @@ schema_version = 1
 # advisory until reviewed and promoted through the protected-contract path.
 [registry]
 description = "Approved Lucebox minimal-core contracts for per-PR ESBMC planning"
+compatibility_manifest = "formal/manifest.toml"
 
 [toolchain]
 esbmc_version = "8.4"
@@ -34,9 +35,12 @@ paths = [
 # These are advisory routing hints, not claims of formal coverage.  Exact
 # boundaries above and approved target triggers remain authoritative.
 watch_paths = [
-  "server/src/server/prefix_cache*",
-  "server/src/server/*snapshot*",
-  "server/src/server/*eviction*",
+  "server/src/server/prefix_cache*.h",
+  "server/src/server/prefix_cache*.cpp",
+  "server/src/server/*snapshot*.h",
+  "server/src/server/*snapshot*.cpp",
+  "server/src/server/*eviction*.h",
+  "server/src/server/*eviction*.cpp",
 ]
 include_roots = ["server/src"]
 policy = "advisory"

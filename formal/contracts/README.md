@@ -38,10 +38,11 @@ is an **advisory coverage gap**, never a pass.  Paths outside the list are
 reported as not applicable by the CI planner.
 
 An area may also declare advisory `watch_paths` and bounded `include_roots`.
-Watch matches route suspicious new files for review but never mean that a file
-is formally covered.  The companion planner records exact boundary, trigger,
-include-adjacency, and unmodeled relationships separately; only a verifier
-result for a declared target may use the word `verified`.
+In CI, the companion planner uses watch matches to route suspicious new files
+for review, but a match never means that a file is formally covered.  The
+companion records exact boundary, trigger, include-adjacency, and unmodeled
+relationships separately; only a verifier result for a declared target may
+use the word `verified`.
 
 ## Local validation
 
