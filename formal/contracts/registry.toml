@@ -31,6 +31,15 @@ paths = [
   "server/src/server/prefix_cache.h",
   "server/src/server/prefix_cache.cpp",
 ]
+# These are advisory routing hints, not claims of formal coverage.  Exact
+# boundaries above and approved target triggers remain authoritative.
+watch_paths = [
+  "server/src/server/prefix_cache*",
+  "server/src/server/*snapshot*",
+  "server/src/server/*eviction*",
+]
+include_roots = ["server/src"]
+policy = "advisory"
 
 [[critical_paths]]
 id = "disk-prefix-cache"

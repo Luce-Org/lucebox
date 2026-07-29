@@ -1,0 +1,5 @@
+# Formal policy and its execution boundary require explicit pilot ownership.
+/formal/ @dusterbloom
+/scripts/formal*.py @dusterbloom
+/scripts/formal*.sh @dusterbloom
+/.github/workflows/formal*.yml @dusterbloom

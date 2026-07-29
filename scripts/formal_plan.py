@@ -100,6 +100,20 @@ def load_registry(registry_path: Path, root: Path) -> dict[str, Any]:
         if not isinstance(area.get("description"), str):
             raise RegistryError(f"{area_id}: critical-path description is required")
         area["paths"] = _repo_paths(area.get("paths"), f"{area_id}.paths")
+        area["watch_paths"] = _repo_paths(
+            area.get("watch_paths", []),
+            f"{area_id}.watch_paths",
+        )
+        area["include_roots"] = _repo_paths(
+            area.get("include_roots", []),
+            f"{area_id}.include_roots",
+        )
+        area_policy = area.get("policy", "advisory")
+        if area_policy not in POLICIES:
+            raise RegistryError(
+                f"{area_id}: unsupported critical-path policy {area_policy!r}"
+            )
+        area["policy"] = area_policy
     if not isinstance(data.get("toolchain"), dict):
         raise RegistryError("toolchain table is required")
     if not isinstance(data["toolchain"].get("esbmc_version"), str):
@@ -197,17 +211,18 @@ def coverage_gaps(registry: dict[str, Any], changed_paths: list[str]) -> list[di
         pattern for target in registry["targets"] for pattern in target["trigger_paths"]
     ]
     for area in registry["critical_paths"]:
+        routing_patterns = area["paths"] + area["watch_paths"]
         uncovered = [
             path
             for path in changed_paths
-            if _matches(path, area["paths"]) and not _matches(path, target_patterns)
+            if _matches(path, routing_patterns) and not _matches(path, target_patterns)
         ]
         if uncovered:
             gaps.append(
                 {
                     "id": area["id"],
                     "description": area["description"],
-                    "policy": "advisory",
+                    "policy": area["policy"],
                     "changed_paths": uncovered,
                 }
             )

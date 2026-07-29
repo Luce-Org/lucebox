@@ -32,6 +32,22 @@ class FormalPlanTest(unittest.TestCase):
             [target["id"] for target in registry["targets"]],
             ["prefix-cache-inline", "prefix-cache-abort-hole"],
         )
+        prefix_area = next(
+            area
+            for area in registry["critical_paths"]
+            if area["id"] == "prefix-cache"
+        )
+        self.assertEqual(prefix_area["policy"], "advisory")
+        self.assertEqual(prefix_area["include_roots"], ["server/src"])
+        self.assertIn(
+            "server/src/server/*eviction*",
+            prefix_area["watch_paths"],
+        )
+
+    def test_registry_and_legacy_manifest_pin_the_same_toolchain(self) -> None:
+        registry = formal_plan.load_registry(REGISTRY, ROOT)
+        manifest = tomllib.loads((ROOT / "formal" / "manifest.toml").read_text())
+        self.assertEqual(registry["toolchain"], manifest["toolchain"])
 
     def test_prefix_cache_fixture_selects_approved_targets(self) -> None:
         plan = self.plan_fixture("prefix-cache-change.json")
@@ -66,6 +82,16 @@ class FormalPlanTest(unittest.TestCase):
         plan = self.plan_fixture("uncovered-streaming-change.json")
         self.assertEqual(plan["targets"], [])
         self.assertEqual(plan["coverage_gaps"][0]["id"], "streaming-lifecycle")
+        self.assertEqual(plan["coverage_gaps"][0]["policy"], "advisory")
+
+    def test_watch_pattern_routes_new_eviction_file_without_claiming_coverage(self) -> None:
+        plan = formal_plan.make_plan(
+            REGISTRY,
+            ROOT,
+            ["server/src/server/cache_eviction_policy.h"],
+        )
+        self.assertEqual(plan["targets"], [])
+        self.assertEqual(plan["coverage_gaps"][0]["id"], "prefix-cache")
         self.assertEqual(plan["coverage_gaps"][0]["policy"], "advisory")
 
     def test_emit_copies_approved_template_and_records_hash(self) -> None:
