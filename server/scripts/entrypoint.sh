@@ -331,12 +331,18 @@ if [ "$GPU_VRAM_GB" -gt 0 ]; then
     elif [ "$GPU_VRAM_GB" -lt 32 ]; then
         if [ "$IS_WSL" = "1" ]; then
             : "${DFLASH_BUDGET:=16}"
+            : "${DFLASH_MAX_CTX:=65536}"
+        else
+            : "${DFLASH_MAX_CTX:=98304}"
         fi
-        : "${DFLASH_MAX_CTX:=98304}"
     else
         : "${DFLASH_MAX_CTX:=131072}"
     fi
 fi
+
+# Do not synthesize DFLASH_LAZY here. dflash_server ignores --lazy-draft
+# unless both a decode draft and a prefill scorer are configured, so setting
+# it from VRAM alone would claim an optimization the runtime cannot apply.
 
 [ "${GPU_ARCH:-}" = "gfx1100" ] && : "${DFLASH_BUDGET:=8}"
 

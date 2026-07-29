@@ -329,8 +329,10 @@ sha256_file() {
 # — it can't see the host's /proc anyway, only the container's.
 
 # Normalize ``amd-smi static --asic --vram --csv`` into the compact internal
-# form ``index|name|gfx_arch|vram_mib``. Header lookup keeps this resilient to
-# columns being added or reordered by future amd-smi releases.
+# form ``index|name|gfx_arch|vram_mib|rocr_selector``. Discrete cards use
+# their stable GPU UUID instead of assuming amd-smi and ROCr enumerate devices
+# in the same order; devices without a usable ASIC serial fall back to index.
+# Header lookup keeps this resilient to columns being added or reordered.
 _parse_amd_smi_csv() {
     awk -F',' '
         NR == 1 {
@@ -346,12 +348,19 @@ _parse_amd_smi_csv() {
             name = $(col["market_name"])
             arch = $(col["target_graphics_version"])
             mem = $(col["size"])
+            serial = $(col["asic_serial"])
             gsub(/^[[:space:]]+|[[:space:]\r]+$/, "", idx)
             gsub(/^[[:space:]]+|[[:space:]\r]+$/, "", name)
             gsub(/^[[:space:]]+|[[:space:]\r]+$/, "", arch)
             gsub(/^[[:space:]]+|[[:space:]\r]+$/, "", mem)
+            gsub(/^[[:space:]]+|[[:space:]\r]+$/, "", serial)
+            selector = idx
+            serial = tolower(serial)
+            sub(/^0x/, "", serial)
+            if (serial ~ /^[0-9a-f]+$/ && serial !~ /^0+$/)
+                selector = "GPU-" serial
             if (idx ~ /^[0-9]+$/ && arch ~ /^gfx[0-9a-z]+$/ && mem ~ /^[0-9]+([.][0-9]+)?$/)
-                printf "%s|%s|%s|%d\n", idx, name, arch, mem
+                printf "%s|%s|%s|%d|%s\n", idx, name, arch, mem, selector
         }
     '
 }
@@ -380,7 +389,7 @@ _parse_rocm_smi_csv() {
             idx = dev
             sub(/^card/, "", idx)
             if (idx ~ /^[0-9]+$/ && arch ~ /^gfx[0-9a-z]+$/ && bytes ~ /^[0-9]+$/)
-                printf "%s|%s|%s|%d\n", idx, name, arch, bytes / 1048576
+                printf "%s|%s|%s|%d|%s\n", idx, name, arch, bytes / 1048576, idx
         }
     '
 }
@@ -445,7 +454,7 @@ probe_host() {
     # NVIDIA GPU remains the default backend (RTX 3090 + Strix → cuda12), but
     # recording the AMD companion prevents the APU from confusing readiness
     # reporting and lets an explicit rocm variant remain possible.
-    local amd_csv="" amd_rows="" amd_primary_idx=""
+    local amd_csv="" amd_rows="" amd_primary_selector=""
     if command -v amd-smi &>/dev/null; then
         amd_csv=$(amd-smi static --asic --vram --csv 2>/dev/null || echo "")
         if [ -n "$amd_csv" ]; then
@@ -467,7 +476,7 @@ probe_host() {
         if [ -n "$roc_arches" ]; then
             local amd_idx=0 arch
             while IFS= read -r arch; do
-                amd_rows+="${amd_idx}|AMD GPU|${arch}|0"$'\n'
+                amd_rows+="${amd_idx}|AMD GPU|${arch}|0|${amd_idx}"$'\n'
                 amd_idx=$((amd_idx + 1))
             done <<<"$roc_arches"
             amd_rows=${amd_rows%$'\n'}
@@ -479,9 +488,9 @@ probe_host() {
         LUCEBOX_HOST_AMD_GPU_COUNT=$(printf '%s\n' "$amd_rows" | awk 'NF{n++} END{print n+0}')
         local amd_primary
         amd_primary=$(printf '%s\n' "$amd_rows" | sort -t'|' -k4,4nr | head -1)
-        local amd_idx amd_name amd_arch amd_mem_mib
-        IFS='|' read -r amd_idx amd_name amd_arch amd_mem_mib <<<"$amd_primary"
-        amd_primary_idx="$amd_idx"
+        local amd_idx amd_name amd_arch amd_mem_mib amd_selector
+        IFS='|' read -r amd_idx amd_name amd_arch amd_mem_mib amd_selector <<<"$amd_primary"
+        amd_primary_selector="${amd_selector:-$amd_idx}"
         LUCEBOX_HOST_AMD_GPU_NAME="$amd_name"
         LUCEBOX_HOST_AMD_GPU_ARCH="$amd_arch"
         LUCEBOX_HOST_AMD_VRAM_GB=$((amd_mem_mib / 1024))
@@ -539,10 +548,11 @@ probe_host() {
     LUCEBOX_HOST_ROCR_VISIBLE_DEVICES="${ROCR_VISIBLE_DEVICES:-}"
     if [ -z "$LUCEBOX_HOST_HIP_VISIBLE_DEVICES" ] \
        && [ -z "$LUCEBOX_HOST_ROCR_VISIBLE_DEVICES" ]; then
-        # AMD recommends ROCR_VISIBLE_DEVICES for Linux. Use one isolation
-        # layer, not both, so a physical device index is never filtered and
-        # then interpreted again in a renumbered HIP-visible set.
-        LUCEBOX_HOST_ROCR_VISIBLE_DEVICES="$amd_primary_idx"
+        # AMD recommends ROCR_VISIBLE_DEVICES for Linux. Prefer the physical
+        # GPU UUID derived from amd-smi's ASIC serial; it remains stable even
+        # if SMI and ROCr enumeration orders differ. Use one isolation layer,
+        # not both, so an index fallback is never interpreted twice.
+        LUCEBOX_HOST_ROCR_VISIBLE_DEVICES="$amd_primary_selector"
     fi
 
     # OS / kernel identity. /etc/os-release is the freedesktop spec for
@@ -1585,6 +1595,9 @@ EOF
     export DFLASH_DRAFT="$draft"
     export DRAFT="$draft"
     if [ "$draft" != "none" ]; then
+        # Match `lucebox native` and the container entrypoint: a selected
+        # DFlash draft uses DDTree by default. An explicit contributor
+        # VERIFY_MODE remains authoritative for comparison experiments.
         export VERIFY_MODE="${VERIFY_MODE:-ddtree}"
     fi
     local max_ctx budget

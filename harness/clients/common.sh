@@ -132,22 +132,30 @@ start_dflash_native_server() {
     echo "  cmake --build $REPO_DIR/server/build --target dflash_server -j\$(nproc)" >&2
     return 1
   fi
-  if [[ ! -s "$TARGET" ]]; then
+  if [[ ! -f "$TARGET" || ! -s "$TARGET" ]]; then
     echo "target GGUF not found: $TARGET" >&2
     echo "Set TARGET=/path/to/model.gguf or DFLASH_TARGET=/path/to/model.gguf, or download the default:" >&2
     echo "  hf download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf --local-dir $REPO_DIR/server/models/" >&2
     return 1
   fi
   if draft_enabled && [[ -d "$DRAFT" ]]; then
-    local resolved_draft=""
-    resolved_draft=$(find -L "$DRAFT" -maxdepth 4 -type f \
-      \( -name 'model.safetensors' -o -name '*.safetensors' -o -name '*.gguf' \) \
-      -print 2>/dev/null | sort | head -n 1)
-    if [[ -n "$resolved_draft" ]]; then
-      DRAFT="$resolved_draft"
-    fi
+    local draft_candidates=() candidate
+    while IFS= read -r candidate; do
+      [[ -n "$candidate" ]] && draft_candidates+=("$candidate")
+    done < <(find -L "$DRAFT" -maxdepth 4 -type f \
+      \( -name '*.safetensors' -o -name '*.gguf' \) \
+      -size +0c -print 2>/dev/null | sort)
+    case "${#draft_candidates[@]}" in
+      0) ;;
+      1) DRAFT="${draft_candidates[0]}" ;;
+      *)
+        echo "multiple DFlash draft candidates in $DRAFT; choose one file explicitly:" >&2
+        printf '  %s\n' "${draft_candidates[@]}" >&2
+        return 1
+        ;;
+    esac
   fi
-  if draft_enabled && [[ ! -s "$DRAFT" ]]; then
+  if draft_enabled && [[ ! -f "$DRAFT" || ! -s "$DRAFT" ]]; then
     echo "DFlash draft not found: $DRAFT" >&2
     echo "Set DRAFT=/path/to/dflash-draft.gguf or DFLASH_DRAFT=/path/to/dflash-draft.gguf, or download the default:" >&2
     echo "  hf download Lucebox/Qwen3.6-27B-DFlash-GGUF dflash-draft-3.6-q4_k_m.gguf --local-dir $REPO_DIR/server/models/draft/" >&2
@@ -171,7 +179,7 @@ start_dflash_native_server() {
   fi
   local optimization_args=()
   if [[ -n "${DFLASH_PREFILL_DRAFTER:-}" ]]; then
-    if [[ ! -s "$DFLASH_PREFILL_DRAFTER" ]]; then
+    if [[ ! -f "$DFLASH_PREFILL_DRAFTER" || ! -s "$DFLASH_PREFILL_DRAFTER" ]]; then
       echo "PFlash/KVFlash scorer not found: $DFLASH_PREFILL_DRAFTER" >&2
       return 1
     fi

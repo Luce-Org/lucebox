@@ -75,7 +75,11 @@ def runtime_from_host(host: HostFacts) -> DflashRuntime:
         # Cache types stay model-owned. In particular, tq3_0 is unsafe for
         # Laguna and was removed from the engine's automatic defaults in
         # July 2026. The CLI must not silently reintroduce it here.
-        return DflashRuntime(budget=budget, max_ctx=98304)
+        # The earlier 98K WSL result depended on a blanket tq3_0 cache.
+        # Automatic now preserves model-family cache types, so keep extra
+        # headroom for WSL's virtualization overhead instead.
+        max_ctx = 65536 if host.is_wsl else 98304
+        return DflashRuntime(budget=budget, max_ctx=max_ctx)
     return DflashRuntime(budget=budget, max_ctx=131072)
 
 
