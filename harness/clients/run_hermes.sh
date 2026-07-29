@@ -18,7 +18,7 @@ mkdir -p "$HOME_DIR"
 cat > "$HOME_DIR/config.yaml" <<YAML
 model:
   default: "$MODEL_ID"
-  provider: "lucebox"
+  provider: "custom"
   base_url: "$BASE_URL/v1"
   api_key: "$API_KEY"
   api_mode: "chat_completions"
@@ -45,7 +45,7 @@ YAML
 cat > "$HOME_DIR/.env" <<ENV
 OPENAI_API_KEY=$API_KEY
 OPENAI_BASE_URL=$BASE_URL/v1
-HERMES_INFERENCE_PROVIDER=lucebox
+HERMES_INFERENCE_PROVIDER=custom
 HERMES_INFERENCE_MODEL=$MODEL_ID
 HERMES_ACCEPT_HOOKS=1
 HERMES_API_TIMEOUT=600
@@ -62,13 +62,12 @@ HOME="$HOME_DIR" \
 HERMES_HOME="$HOME_DIR" \
 OPENAI_API_KEY="$API_KEY" \
 OPENAI_BASE_URL="$BASE_URL/v1" \
-HERMES_INFERENCE_PROVIDER=lucebox \
+HERMES_INFERENCE_PROVIDER=custom \
 HERMES_INFERENCE_MODEL="$MODEL_ID" \
 HERMES_ACCEPT_HOOKS=1 \
 NO_COLOR=1 \
 timeout 420s "$HERMES_BIN" chat \
   --quiet \
-  --provider lucebox \
   --model "$MODEL_ID" \
   --accept-hooks \
   --yolo \

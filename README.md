@@ -128,10 +128,28 @@ machine. Automatic tuning never adds VRAM across devices. The engine's advanced
 layer-split paths remain contributor workflows; transparent multi-GPU sharding
 is not part of this CLI release.
 
+**Connect or open your harness** links the running local API to a client the
+engine user already installed: Claude Code, Codex, OpenCode, Hermes, Pi,
+OpenClaw, or Open WebUI. It is available from the same main menu in an installed
+Lucebox and a source checkout. Lucebox does not install the client and does not
+replace its normal cloud configuration. It launches the installed binary with
+an invocation-only override or an additive, Lucebox-owned profile, remembers
+the selection, and shows it on the main menu. For example:
+
+```bash
+lucebox connect codex             # link and open Codex
+lucebox connect opencode --no-launch
+```
+
+The connector verifies the local server before opening the client. Starting
+the same client normally, without `lucebox connect`, continues to use the
+user's existing provider and account.
+
 Contributors can open the same menu from a repository checkout with
 `./lucebox.sh`. Its **Developer tools** can build and run the native C++ engine
-or launch Claude Code, Codex, OpenCode, Hermes, Pi, OpenClaw, and Open WebUI
-harnesses. Every menu action also has a scriptable command, for example:
+or run isolated compatibility harnesses for Claude Code, Codex, OpenCode,
+Hermes, Pi, OpenClaw, and Open WebUI. Every menu action also has a scriptable
+command, for example:
 
 ```bash
 lucebox models select

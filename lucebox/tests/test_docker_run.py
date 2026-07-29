@@ -390,6 +390,7 @@ def test_server_run_spec_target_only_preset_disables_stale_draft(tmp_path: Path)
 
     assert env["DFLASH_TARGET"].endswith("Qwen3.6-35B-A3B-UD-Q4_K_M.gguf")
     assert env["DFLASH_DRAFT"].endswith("/.lucebox-no-draft")
+    assert env["DFLASH_MODEL_NAME"] == "qwen3.6-moe"
 
 
 def test_server_run_spec_optional_env_off_by_default(tmp_path: Path) -> None:
@@ -410,6 +411,7 @@ def test_server_run_spec_optional_env_off_by_default(tmp_path: Path) -> None:
         "DFLASH_DEBUG_THINKING_LOGITS",
         "DFLASH_TARGET",
         "DFLASH_DRAFT",
+        "DFLASH_MODEL_NAME",
     ):
         assert absent not in env
 

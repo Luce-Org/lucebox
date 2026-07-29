@@ -191,6 +191,8 @@ DEFAULT_PORT=$(_lucebox_resolve "${LUCEBOX_PORT:-}" runtime.port "8080")
 DEFAULT_MODELS_DIR=$(_lucebox_resolve "${LUCEBOX_MODELS:-}" paths.models "${XDG_DATA_HOME:-$HOME/.local/share}/lucebox/models")
 IMAGE_BASE=$(_lucebox_resolve "${LUCEBOX_IMAGE:-}" image.registry "$(_lucebox_derive_image "$LUCEBOX_INSTALLED_FROM")")
 CONFIG_HOME="${LUCEBOX_HOME:-$HOME/.lucebox}"
+CONNECTOR_STATE_DIR="$CONFIG_HOME/connectors"
+CONNECTOR_SELECTION_FILE="$CONNECTOR_STATE_DIR/selected"
 
 # ── LUCEBOX_HOST_* safe defaults (belt-and-suspenders) ────────────────────
 # `set -u` makes any unbound LUCEBOX_HOST_* read fatal. Historically this has
@@ -1410,6 +1412,555 @@ _selected_model_paths() {
     printf '%s\n%s\n%s\n' "$target_path" "$draft_path" "${preset:-lucebox}"
 }
 
+# ── engine client connectors ─────────────────────────────────────────────
+#
+# A connector uses a client the user already installed and points only that
+# invocation (or a dedicated Lucebox profile) at the local inference API. It
+# never installs a client and never replaces the client's normal cloud config.
+
+_connector_normalize() {
+    case "${1:-}" in
+        1|claude|claude-code|claude_code) printf 'claude_code' ;;
+        2|codex)                          printf 'codex' ;;
+        3|opencode|open-code)             printf 'opencode' ;;
+        4|hermes)                         printf 'hermes' ;;
+        5|pi)                             printf 'pi' ;;
+        6|openclaw|open-claw)             printf 'openclaw' ;;
+        7|openwebui|open-webui|webui)     printf 'openwebui' ;;
+        *) return 1 ;;
+    esac
+}
+
+_connector_label() {
+    case "$1" in
+        claude_code) printf 'Claude Code' ;;
+        codex)       printf 'Codex' ;;
+        opencode)    printf 'OpenCode' ;;
+        hermes)      printf 'Hermes' ;;
+        pi)          printf 'Pi' ;;
+        openclaw)    printf 'OpenClaw' ;;
+        openwebui)   printf 'Open WebUI' ;;
+        *)           printf '%s' "$1" ;;
+    esac
+}
+
+_connector_binary() {
+    local client="$1" override="" command_name=""
+    case "$client" in
+        claude_code) override="${LUCEBOX_CLAUDE_BIN:-}";  command_name=claude ;;
+        codex)       override="${LUCEBOX_CODEX_BIN:-}";   command_name=codex ;;
+        opencode)    override="${LUCEBOX_OPENCODE_BIN:-}"; command_name=opencode ;;
+        hermes)      override="${LUCEBOX_HERMES_BIN:-}";  command_name=hermes ;;
+        pi)          override="${LUCEBOX_PI_BIN:-}";      command_name=pi ;;
+        openclaw)    override="${LUCEBOX_OPENCLAW_BIN:-}"; command_name=openclaw ;;
+        openwebui)   override="${LUCEBOX_OPENWEBUI_BIN:-}"; command_name=open-webui ;;
+        *) return 1 ;;
+    esac
+    if [ -n "$override" ]; then
+        if [[ "$override" == */* ]]; then
+            [ -f "$override" ] && [ -x "$override" ] || return 1
+            printf '%s' "$override"
+            return 0
+        fi
+        command -v "$override" 2>/dev/null
+        return
+    fi
+    command -v "$command_name" 2>/dev/null
+}
+
+_connector_selected() {
+    local selected
+    [ -f "$CONNECTOR_SELECTION_FILE" ] || return 0
+    IFS= read -r selected < "$CONNECTOR_SELECTION_FILE" || return 0
+    _connector_normalize "$selected" 2>/dev/null || true
+}
+
+_connector_write_file() {
+    # Atomically replace a Lucebox-owned connector file with private mode.
+    # Content is read from stdin so callers can use a quoted or expanded
+    # heredoc without lossy shell escaping.
+    local target="$1" mode="${2:-600}" parent tmp
+    parent=$(dirname "$target")
+    mkdir -p "$parent"
+    tmp=$(mktemp "${target}.tmp.XXXXXX") \
+        || die "couldn't create a temporary connector file next to $target"
+    if ! cat > "$tmp"; then
+        rm -f "$tmp"
+        die "couldn't write connector file: $target"
+    fi
+    chmod "$mode" "$tmp"
+    mv "$tmp" "$target"
+}
+
+_connector_private_dir() {
+    local path="$1"
+    mkdir -p "$path"
+    chmod 700 "$path"
+}
+
+_connector_remember() {
+    local client="$1"
+    _connector_private_dir "$CONNECTOR_STATE_DIR"
+    _connector_write_file "$CONNECTOR_SELECTION_FILE" 600 <<EOF
+$client
+EOF
+}
+
+_connector_model_id() {
+    local model
+    model=$(_lucebox_config_get model.preset)
+    [ -n "$model" ] \
+        || die "no model is selected — run '$SCRIPT_NAME models select' first"
+    # The value is embedded in small TOML/JSON/YAML connector profiles. Keep
+    # hand-edited config from turning that serialization into code or syntax.
+    [[ "$model" =~ ^[A-Za-z0-9._:/-]+$ ]] \
+        || die "model.preset contains unsupported characters: $model"
+    printf '%s' "$model"
+}
+
+_connector_context_size() {
+    local value
+    value=$(_lucebox_config_get dflash.max_ctx)
+    [ -n "$value" ] || value=65536
+    [[ "$value" =~ ^[0-9]+$ ]] && [ "$value" -gt 0 ] \
+        || die "dflash.max_ctx must be a positive integer before connecting a harness"
+    printf '%s' "$value"
+}
+
+_connector_output_size() {
+    # Never advertise an output allowance larger than the active context.
+    # Small-memory automatic profiles can use a 4K context, while the server
+    # and larger profiles support up to a 32K response budget.
+    local max_ctx="$1" value=32768
+    if [ "$max_ctx" -lt 65536 ]; then
+        value=$((max_ctx / 2))
+        [ "$value" -gt 0 ] || value=1
+    fi
+    printf '%s' "$value"
+}
+
+_connector_api_root() {
+    [[ "$DEFAULT_PORT" =~ ^[0-9]+$ ]] \
+        && [ "$DEFAULT_PORT" -ge 1 ] && [ "$DEFAULT_PORT" -le 65535 ] \
+        || die "runtime.port must be an integer between 1 and 65535"
+    printf 'http://127.0.0.1:%s' "$DEFAULT_PORT"
+}
+
+_connector_api_ready() {
+    local api_root="$1" response
+    command -v curl >/dev/null 2>&1 || return 1
+    response=$(curl -fsS --connect-timeout 2 --max-time 4 \
+        "$api_root/v1/models" 2>/dev/null) || return 1
+    # A generic 200 response from another process on the configured port is
+    # not sufficient. Require an OpenAI-compatible model catalog shape.
+    [[ "$response" == *'"data"'* || "$response" == *'"models"'* ]]
+}
+
+_connector_ensure_api() {
+    local api_root="$1" i state
+    if ! command -v curl >/dev/null 2>&1; then
+        err "curl is required to verify the local Lucebox API"
+        return 1
+    fi
+    if _connector_api_ready "$api_root"; then
+        return 0
+    fi
+    ensure_probed
+    state=$(_engine_state)
+    if [ "$state" = "stopped" ] && [ -t 0 ] \
+       && [ "$LUCEBOX_HOST_HAS_SYSTEMD" = "1" ] \
+       && [ -f "$UNIT_PATH" ] \
+       && _confirm "The inference engine is stopped. Start it now?" 1; then
+        bash "$SCRIPT_PATH" start || return $?
+        state=running
+        for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+            _connector_api_ready "$api_root" && return 0
+            sleep 1
+        done
+    fi
+    if [ "$state" = "running" ]; then
+        err "the inference engine is running, but its API is not ready at $api_root"
+        hint "Wait for model loading to finish, or inspect: $SCRIPT_NAME logs"
+    else
+        err "the Lucebox API is not reachable at $api_root"
+        hint "Start it from the menu or run: $SCRIPT_NAME start"
+    fi
+    return 1
+}
+
+_connector_print_argv() {
+    local arg
+    printf '  '
+    for arg in "$@"; do
+        printf '%q ' "$arg"
+    done
+    printf '\n'
+}
+
+_connector_choose() {
+    local client label selected status number selected_number=""
+    selected=$(_connector_selected)
+    printf 'Choose an installed harness to connect:\n'
+    number=0
+    for client in claude_code codex opencode hermes pi openclaw openwebui; do
+        number=$((number + 1))
+        label=$(_connector_label "$client")
+        if _connector_binary "$client" >/dev/null 2>&1; then
+            status="installed"
+            [ "$client" = "$selected" ] && selected_number="$number"
+        else
+            status="not found"
+        fi
+        [ "$client" = "$selected" ] && status="$status, selected"
+        printf '  %s  %-12s %b(%s)%b\n' "$number" "$label" "$C_DIM" "$status" "$C_RST"
+    done
+    printf '  b  Back\n\n'
+    if [ -n "$selected_number" ]; then
+        printf 'Harness number [%s]: ' "$selected_number"
+    else
+        printf 'Harness number: '
+    fi
+    IFS= read -r client || return 1
+    case "$client" in b|B|q|Q) return 1 ;; esac
+    [ -n "$client" ] || client="$selected_number"
+    [ -n "$client" ] || return 1
+    CONNECTOR_CHOICE=$(_connector_normalize "$client") \
+        || { warn "Choose 1–7 or b"; return 1; }
+}
+
+# The prepare helpers generate only Lucebox-owned files or additive named
+# profiles. They populate CONNECTOR_SETUP_ARGV (optional) and
+# CONNECTOR_LAUNCH_ARGV; the caller applies setup before remembering the choice.
+_connector_prepare_claude() {
+    local binary="$1" api_root="$2" model="$3"
+    CONNECTOR_LAUNCH_ARGV=(
+        env
+        -u CLAUDE_CODE_USE_BEDROCK
+        -u CLAUDE_CODE_USE_VERTEX
+        -u CLAUDE_CODE_USE_FOUNDRY
+        -u ANTHROPIC_API_KEY
+        -u CLAUDE_CODE_OAUTH_TOKEN
+        "ANTHROPIC_BASE_URL=$api_root"
+        "ANTHROPIC_AUTH_TOKEN=lucebox-local"
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1"
+        "$binary" --model "$model"
+    )
+    CONNECTOR_NOTE="Only this Claude Code session uses Lucebox; your normal Claude configuration is unchanged."
+}
+
+_connector_prepare_codex() {
+    local binary="$1" api_root="$2" model="$3" codex_home profile
+    codex_home="${CODEX_HOME:-$HOME/.codex}"
+    profile="$codex_home/lucebox-local.config.toml"
+    mkdir -p "$codex_home"
+    if [ -e "$profile" ] \
+       && ! grep -Fqx '# Generated by Lucebox. Normal Codex configuration is not modified.' "$profile"; then
+        die "refusing to replace an unowned Codex profile: $profile"
+    fi
+    _connector_write_file "$profile" 600 <<EOF
+# Generated by Lucebox. Normal Codex configuration is not modified.
+model = "$model"
+model_provider = "lucebox"
+
+[model_providers.lucebox]
+name = "Lucebox"
+base_url = "$api_root/v1"
+wire_api = "responses"
+EOF
+    CONNECTOR_LAUNCH_ARGV=("$binary" --profile lucebox-local --model "$model")
+    CONNECTOR_NOTE="Codex uses the additive 'lucebox-local' profile; your default profile and login are unchanged."
+}
+
+_connector_prepare_opencode() {
+    local binary="$1" api_root="$2" model="$3" max_ctx="$4" output_tokens="$5"
+    local state config version major=2
+    state="$CONNECTOR_STATE_DIR/opencode"
+    config="$state/opencode.json"
+    _connector_private_dir "$state"
+    version=$("$binary" --version 2>/dev/null | head -n 1 || true)
+    if [[ "$version" =~ (^|[^0-9])([0-9]+)\.[0-9]+ ]]; then
+        major="${BASH_REMATCH[2]}"
+    fi
+    if [ "$major" -ge 2 ]; then
+        _connector_write_file "$config" 600 <<EOF
+{
+  "\$schema": "https://opencode.ai/config.json",
+  "model": "lucebox-local/$model",
+  "providers": {
+    "lucebox-local": {
+      "name": "Lucebox",
+      "package": "@opencode-ai/ai/providers/openai-compatible",
+      "settings": {"baseURL": "$api_root/v1"},
+      "models": {
+        "$model": {
+          "name": "Lucebox local model",
+          "capabilities": {"tools": true, "input": ["text"], "output": ["text"]},
+          "limit": {"context": $max_ctx, "output": $output_tokens}
+        }
+      }
+    }
+  }
+}
+EOF
+    else
+        _connector_write_file "$config" 600 <<EOF
+{
+  "\$schema": "https://opencode.ai/config.json",
+  "model": "lucebox-local/$model",
+  "small_model": "lucebox-local/$model",
+  "provider": {
+    "lucebox-local": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Lucebox",
+      "options": {"baseURL": "$api_root/v1", "apiKey": "lucebox-local"},
+      "models": {
+        "$model": {
+          "name": "Lucebox local model",
+          "limit": {"context": $max_ctx, "output": $output_tokens}
+        }
+      }
+    }
+  }
+}
+EOF
+    fi
+    CONNECTOR_LAUNCH_ARGV=(
+        env "OPENCODE_CONFIG=$config" "OPENAI_API_KEY=lucebox-local"
+        "$binary" --model "lucebox-local/$model"
+    )
+    CONNECTOR_NOTE="OpenCode receives a Lucebox config overlay; its global and project files are not replaced."
+}
+
+_connector_prepare_hermes() {
+    local binary="$1" api_root="$2" model="$3" max_ctx="$4" output_tokens="$5" state
+    state="$CONNECTOR_STATE_DIR/hermes"
+    _connector_private_dir "$state"
+    _connector_write_file "$state/config.yaml" 600 <<EOF
+model:
+  default: "$model"
+  provider: "custom"
+  base_url: "$api_root/v1"
+  api_key: "lucebox-local"
+  api_mode: "chat_completions"
+  context_length: $max_ctx
+  max_tokens: $output_tokens
+EOF
+    _connector_write_file "$state/.env" 600 <<EOF
+OPENAI_API_KEY=lucebox-local
+OPENAI_BASE_URL=$api_root/v1
+HERMES_INFERENCE_PROVIDER=custom
+HERMES_INFERENCE_MODEL=$model
+EOF
+    CONNECTOR_LAUNCH_ARGV=(
+        env "HERMES_HOME=$state" "OPENAI_API_KEY=lucebox-local"
+        "OPENAI_BASE_URL=$api_root/v1" "HERMES_INFERENCE_PROVIDER=custom"
+        "HERMES_INFERENCE_MODEL=$model" "$binary" chat --model "$model"
+    )
+    CONNECTOR_NOTE="Hermes uses a Lucebox-only provider profile; your normal Hermes home is unchanged."
+}
+
+_connector_prepare_pi() {
+    local binary="$1" api_root="$2" model="$3" max_ctx="$4" output_tokens="$5" state
+    state="$CONNECTOR_STATE_DIR/pi"
+    _connector_private_dir "$state"
+    _connector_private_dir "$state/sessions"
+    _connector_write_file "$state/models.json" 600 <<EOF
+{
+  "providers": {
+    "lucebox": {
+      "baseUrl": "$api_root/v1",
+      "api": "openai-completions",
+      "apiKey": "lucebox-local",
+      "compat": {
+        "supportsDeveloperRole": false,
+        "supportsReasoningEffort": false,
+        "supportsUsageInStreaming": true,
+        "maxTokensField": "max_tokens"
+      },
+      "models": [
+        {
+          "id": "$model",
+          "name": "Lucebox local model",
+          "reasoning": false,
+          "input": ["text"],
+          "contextWindow": $max_ctx,
+          "maxTokens": $output_tokens,
+          "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}
+        }
+      ]
+    }
+  }
+}
+EOF
+    CONNECTOR_LAUNCH_ARGV=(
+        env "PI_CODING_AGENT_DIR=$state" "PI_CODING_AGENT_SESSION_DIR=$state/sessions"
+        "PI_OFFLINE=1" "$binary" --provider lucebox --model "$model"
+        --api-key lucebox-local
+    )
+    CONNECTOR_NOTE="Pi uses a Lucebox-only model directory; your normal Pi models and sessions are unchanged."
+}
+
+_connector_prepare_openclaw() {
+    local binary="$1" api_root="$2" model="$3" max_ctx="$4" output_tokens="$5"
+    local state runtime config patch
+    state="$CONNECTOR_STATE_DIR/openclaw"
+    runtime="$state/state"
+    config="$runtime/openclaw.json"
+    patch="$state/lucebox.patch.json"
+    _connector_private_dir "$state"
+    _connector_private_dir "$runtime"
+    _connector_write_file "$patch" 600 <<EOF
+{
+  "models": {
+    "mode": "merge",
+    "providers": {
+      "lucebox": {
+        "baseUrl": "$api_root/v1",
+        "apiKey": "\${OPENAI_API_KEY}",
+        "auth": "api-key",
+        "api": "openai-completions",
+        "models": [
+          {
+            "id": "$model",
+            "name": "Lucebox local model",
+            "api": "openai-completions",
+            "contextWindow": $max_ctx,
+            "maxTokens": $output_tokens,
+            "input": ["text"],
+            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}
+          }
+        ]
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": {"primary": "lucebox/$model"},
+      "models": {"lucebox/$model": {"alias": "Lucebox local model"}},
+      "skipBootstrap": true
+    }
+  }
+}
+EOF
+    CONNECTOR_SETUP_ARGV=(
+        env "OPENCLAW_STATE_DIR=$runtime" "OPENCLAW_CONFIG_PATH=$config"
+        "OPENAI_API_KEY=lucebox-local"
+        "$binary" config patch --file "$patch"
+    )
+    CONNECTOR_LAUNCH_ARGV=(
+        env "OPENCLAW_STATE_DIR=$runtime" "OPENCLAW_CONFIG_PATH=$config"
+        "OPENCLAW_WORKSPACE_DIR=$PWD"
+        "OPENAI_API_KEY=lucebox-local" "$binary" chat
+    )
+    CONNECTOR_NOTE="OpenClaw uses Lucebox-only state; your default OpenClaw profile is unchanged."
+}
+
+_connector_prepare_openwebui() {
+    local binary="$1" api_root="$2" model="$3" state webui_port
+    state="$CONNECTOR_STATE_DIR/openwebui"
+    webui_port="${LUCEBOX_WEBUI_PORT:-3000}"
+    [[ "$webui_port" =~ ^[0-9]+$ ]] \
+        && [ "$webui_port" -ge 1 ] && [ "$webui_port" -le 65535 ] \
+        || die "LUCEBOX_WEBUI_PORT must be an integer between 1 and 65535"
+    [ "$webui_port" != "$DEFAULT_PORT" ] \
+        || die "Open WebUI and the Lucebox API cannot use the same port ($webui_port)"
+    _connector_private_dir "$state"
+    _connector_private_dir "$state/data"
+    CONNECTOR_LAUNCH_ARGV=(
+        env "DATA_DIR=$state/data" "WEBUI_AUTH=True"
+        "DEFAULT_MODELS=$model" "OPENAI_API_BASE_URL=$api_root/v1"
+        "OPENAI_API_KEY=lucebox-local" "$binary" serve
+        --host 127.0.0.1 --port "$webui_port"
+    )
+    CONNECTOR_NOTE="Open WebUI will use a Lucebox-only data directory at http://127.0.0.1:$webui_port."
+}
+
+cmd_connect() {
+    local requested="" launch=1 client label binary api_root model max_ctx output_tokens
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --no-launch) launch=0 ;;
+            --help|-h)
+                cat <<EOF
+$SCRIPT_NAME connect [harness] [--no-launch]
+
+Connect an already-installed Claude Code, Codex, OpenCode, Hermes, Pi,
+OpenClaw, or Open WebUI client to the local Lucebox API. Lucebox never
+installs the client and never replaces its normal cloud configuration.
+
+  --no-launch  create/update the Lucebox profile but do not open the client
+EOF
+                return 0
+                ;;
+            -*) die "unknown connect option: $1" ;;
+            *)
+                [ -z "$requested" ] || die "connect accepts one harness name"
+                requested="$1"
+                ;;
+        esac
+        shift
+    done
+
+    if [ -z "$requested" ]; then
+        [ -t 0 ] && [ -t 1 ] \
+            || die "choose a harness name in non-interactive mode (for example: $SCRIPT_NAME connect codex)"
+        CONNECTOR_CHOICE=""
+        _connector_choose || return 0
+        client="$CONNECTOR_CHOICE"
+    else
+        client=$(_connector_normalize "$requested") \
+            || die "unknown harness '$requested' — choose claude, codex, opencode, hermes, pi, openclaw, or openwebui"
+    fi
+
+    label=$(_connector_label "$client")
+    binary=$(_connector_binary "$client") || {
+        err "$label is not installed or not on PATH"
+        hint "Lucebox does not install harnesses. Install $label yourself, then run this command again."
+        return 1
+    }
+    api_root=$(_connector_api_root)
+    model=$(_connector_model_id)
+    max_ctx=$(_connector_context_size)
+    output_tokens=$(_connector_output_size "$max_ctx")
+    if [ "$client" = "hermes" ] && [ "$max_ctx" -lt 65536 ]; then
+        die "Hermes requires at least a 65536-token context; choose a larger optimization profile first"
+    fi
+
+    CONNECTOR_SETUP_ARGV=()
+    CONNECTOR_LAUNCH_ARGV=()
+    CONNECTOR_NOTE=""
+    case "$client" in
+        claude_code) _connector_prepare_claude "$binary" "$api_root" "$model" ;;
+        codex)       _connector_prepare_codex "$binary" "$api_root" "$model" ;;
+        opencode)    _connector_prepare_opencode "$binary" "$api_root" "$model" "$max_ctx" "$output_tokens" ;;
+        hermes)      _connector_prepare_hermes "$binary" "$api_root" "$model" "$max_ctx" "$output_tokens" ;;
+        pi)          _connector_prepare_pi "$binary" "$api_root" "$model" "$max_ctx" "$output_tokens" ;;
+        openclaw)    _connector_prepare_openclaw "$binary" "$api_root" "$model" "$max_ctx" "$output_tokens" ;;
+        openwebui)   _connector_prepare_openwebui "$binary" "$api_root" "$model" ;;
+    esac
+
+    if [ "${#CONNECTOR_SETUP_ARGV[@]}" -gt 0 ]; then
+        "${CONNECTOR_SETUP_ARGV[@]}" \
+            || die "$label rejected the generated Lucebox profile"
+    fi
+    _connector_remember "$client"
+
+    ok "$label is linked to Lucebox"
+    hint "Endpoint: $api_root/v1"
+    hint "Model:    $model"
+    [ -z "$CONNECTOR_NOTE" ] || hint "$CONNECTOR_NOTE"
+
+    if [ "$launch" = "0" ]; then
+        printf '\nLaunch command:\n'
+        _connector_print_argv "${CONNECTOR_LAUNCH_ARGV[@]}"
+        return 0
+    fi
+
+    _connector_ensure_api "$api_root" || return $?
+    info "Opening $label with the Lucebox model"
+    exec "${CONNECTOR_LAUNCH_ARGV[@]}"
+}
+
 _export_native_config() {
     local key env_name value
     if [ -n "${LUCEBOX_HOST_ROCR_VISIBLE_DEVICES:-}" ]; then
@@ -1696,21 +2247,23 @@ cmd_completion() {
 # lucebox bash completion. Source from ~/.bashrc:
 #   source <(lucebox completion bash)
 _lucebox_complete() {
-    local cur prev cmds config_verbs models_verbs completion_shells
+    local cur prev cmds config_verbs models_verbs connector_names completion_shells
     COMPREPLY=()
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    cmds="menu setup install uninstall start stop restart enable disable status logs \
+    cmds="menu setup connect install uninstall start stop restart enable disable status logs \
           serve build native harness pull update check completion config models \
           optimize print-run help version"
     config_verbs="get set unset"
     models_verbs="list download select"
+    connector_names="claude codex opencode hermes pi openclaw openwebui"
     completion_shells="bash zsh fish"
 
     # Sub-app verbs / shell args.
     case "$prev" in
         config)     COMPREPLY=( $(compgen -W "$config_verbs"     -- "$cur") ); return ;;
         models)     COMPREPLY=( $(compgen -W "$models_verbs"     -- "$cur") ); return ;;
+        connect)    COMPREPLY=( $(compgen -W "$connector_names"  -- "$cur") ); return ;;
         completion) COMPREPLY=( $(compgen -W "$completion_shells" -- "$cur") ); return ;;
     esac
 
@@ -1742,7 +2295,7 @@ ZSH
 # lucebox fish completion. Source from ~/.config/fish/config.fish:
 #   lucebox completion fish | source
 complete -c lucebox -f
-set -l __lucebox_cmds menu setup install uninstall start stop restart enable disable \
+set -l __lucebox_cmds menu setup connect install uninstall start stop restart enable disable \
     status logs serve build native harness pull update check completion config models \
     optimize print-run help version
 for cmd in $__lucebox_cmds
@@ -1750,6 +2303,7 @@ for cmd in $__lucebox_cmds
 end
 complete -c lucebox -n "__fish_seen_subcommand_from config" -a "get set unset"
 complete -c lucebox -n "__fish_seen_subcommand_from models" -a "list download select"
+complete -c lucebox -n "__fish_seen_subcommand_from connect" -a "claude codex opencode hermes pi openclaw openwebui"
 complete -c lucebox -n "__fish_seen_subcommand_from completion" -a "bash zsh fish"
 FISH
             ;;
@@ -2166,6 +2720,12 @@ cmd_setup() {
     hint "API:    http://127.0.0.1:$DEFAULT_PORT/v1"
     hint "Menu:   $SCRIPT_NAME"
     hint "Status: $SCRIPT_NAME status"
+
+    printf '\n'
+    if _confirm "Link an installed AI harness now (without opening it)?" 1; then
+        bash "$SCRIPT_PATH" connect --no-launch \
+            || warn "The engine is ready; harness linking was not completed."
+    fi
 }
 
 cmd_developer_menu() {
@@ -2241,6 +2801,7 @@ _optimization_summary() {
 
 cmd_menu() {
     local choice model variant state repo_hint optimization gpu_name gpu_count other_gpu
+    local connector connector_label
     while true; do
         ensure_probed
         model=$(_lucebox_config_get model.preset)
@@ -2265,6 +2826,14 @@ cmd_menu() {
         else
             repo_hint="not a source checkout"
         fi
+        connector=$(_connector_selected)
+        if [ -n "$connector" ]; then
+            connector_label=$(_connector_label "$connector")
+            _connector_binary "$connector" >/dev/null 2>&1 \
+                || connector_label="$connector_label (not found)"
+        else
+            connector_label="not selected"
+        fi
 
         _menu_clear
         print_logo
@@ -2280,7 +2849,8 @@ cmd_menu() {
         printf '  Backend:      %s\n' "$variant"
         printf '  Model:        %s\n' "$model"
         printf '  Optimization: %s\n' "$optimization"
-        printf '  Engine:       %s\n\n' "$state"
+        printf '  Engine:       %s\n' "$state"
+        printf '  Harness:      %s\n\n' "$connector_label"
 
         printf '  1  Quick setup\n'
         printf '  2  Choose or download a model\n'
@@ -2289,6 +2859,7 @@ cmd_menu() {
         printf '  5  Stop the inference engine\n'
         printf '  6  Status\n'
         printf '  7  Recent logs\n'
+        printf '  8  Connect or open your harness\n'
         printf '  d  Developer tools  %b(%s)%b\n' "$C_DIM" "$repo_hint" "$C_RST"
         printf '  q  Quit\n\n'
         printf 'Choose: '
@@ -2314,9 +2885,10 @@ cmd_menu() {
                 fi
                 _menu_pause
                 ;;
+            8) _menu_run connect; _menu_pause ;;
             d|D) cmd_developer_menu ;;
             q|Q|quit|exit) return 0 ;;
-            *) warn "Choose 1–7, d, or q"; _menu_pause ;;
+            *) warn "Choose 1–8, d, or q"; _menu_pause ;;
         esac
     done
 }
@@ -2329,6 +2901,7 @@ Interactive:
   $SCRIPT_NAME            open the branded menu (when run in a terminal)
   menu                    open the menu explicitly
   setup                   guided backend, model, optimization, and service setup
+  connect [harness]       link an installed AI client to the local Lucebox API
 
 Service management (via user systemd):
   install               install user systemd unit
@@ -2417,6 +2990,7 @@ main() {
         # Branded interactive surface / guided first run.
         menu)             cmd_menu "$@" ;;
         setup)            cmd_setup "$@" ;;
+        connect)          cmd_connect "$@" ;;
 
         # Systemd surface
         install)          cmd_systemd_install "$@" ;;
