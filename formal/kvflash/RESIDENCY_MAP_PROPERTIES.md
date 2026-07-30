@@ -2,10 +2,17 @@
 
 `kvflash-residency-map` checks the dependency-free production
 `dflash::common::KvFlashResidencyMap` used by `KvFlashPager`. Pull-request
-proofs use four one-token physical blocks; nightly proofs use six. ESBMC checks
-the named identity-fill, failed-eviction, protected-LRU-eviction, mask, and
-logical-bound sequences. The exact-head native regression covers the broader
-chunk offsets, recall, explicit page-out, block order, reset, and scored paths.
+proofs use four one-token physical blocks; nightly proofs use five, adding a
+non-power-of-two pool. ESBMC checks the named identity-fill, failed-eviction,
+protected-LRU-eviction, mask, and logical-bound sequences. The exact-head
+native regression covers the broader chunk offsets, recall, explicit page-out,
+block order, reset, and scored paths.
+
+The initial six-block nightly bound reached the declared 180-second timeout in
+both generated and legacy lanes on GitHub-hosted runners. Five blocks retains a
+strict nightly expansion without weakening the shared PR timeout. Six blocks
+remains a future harness/solver optimization target rather than claimed proof
+coverage.
 
 ## Model-checked guarantees for the named sequences
 

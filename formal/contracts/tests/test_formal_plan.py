@@ -50,6 +50,21 @@ class FormalPlanTest(unittest.TestCase):
             "server/src/server/*eviction*.h",
             prefix_area["watch_paths"],
         )
+        kvflash_target = next(
+            target
+            for target in registry["targets"]
+            if target["id"] == "kvflash-residency-map"
+        )
+        self.assertEqual(kvflash_target["policy"], "advisory")
+        self.assertEqual(
+            kvflash_target["pr_defines"],
+            ["LUCEBOX_FORMAL_BLOCKS=4"],
+        )
+        self.assertEqual(
+            kvflash_target["nightly_defines"],
+            ["LUCEBOX_FORMAL_BLOCKS=5"],
+        )
+        self.assertEqual(kvflash_target["timeout_seconds"], 180)
 
     def test_registry_and_legacy_manifest_pin_the_same_toolchain(self) -> None:
         registry = formal_plan.load_registry(REGISTRY, ROOT)

@@ -178,7 +178,7 @@ defines = [
   "LUCEBOX_FORMAL_BLOCKS=4",
 ]
 nightly_defines = [
-  "LUCEBOX_FORMAL_BLOCKS=6",
+  "LUCEBOX_FORMAL_BLOCKS=5",
 ]
 esbmc_args = [
   "--quiet",

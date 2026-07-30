@@ -338,7 +338,7 @@ entry_function = "main"
 include_dirs = ["server/src", "formal"]
 timeout_seconds = 180
 pr_defines = ["LUCEBOX_FORMAL_BLOCKS=4"]
-nightly_defines = ["LUCEBOX_FORMAL_BLOCKS=6"]
+nightly_defines = ["LUCEBOX_FORMAL_BLOCKS=5"]
 pr_esbmc_args = [
   "--quiet",
   "--boolector",

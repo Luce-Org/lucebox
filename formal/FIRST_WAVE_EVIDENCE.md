@@ -104,6 +104,26 @@ includes an adversarial regression checking that a head-edited transitive
 contract body cannot shadow the authenticated base snapshot while production
 headers still resolve from the exact head.
 
+## 2026-07-30 nightly-bound calibration
+
+The first hosted nightly-mode bootstrap at exact base=head
+`a88ba49251fa657efe1d13938c9280a211d380e6` was intentionally treated as a
+calibration run:
+[run 30543897953](https://github.com/dusterbloom/lucebox-hub/actions/runs/30543897953).
+Both the generated-plan and legacy lanes verified the two inline prefix-cache
+targets, four-slot full prefix-cache lifecycle, and width-eight speculative
+commit target. The six-block KVFlash target reached its exact 180-second
+timeout in both lanes and was reported as inconclusive, not as a
+counterexample.
+
+The generated KVFlash run spent 145.39 seconds in symbolic execution and
+produced 83,245 verification conditions before timing out in Boolector. Because
+the four-block PR bound already verifies well within the shared timeout, the
+advisory nightly bound is calibrated to five blocks rather than loosening the
+PR timeout. Five remains a strict coverage expansion and adds a
+non-power-of-two pool. It must pass generated, legacy, native, and mutation
+checks before it counts as clean soak evidence.
+
 ## Promotion blockers
 
 The three new targets remain advisory until all of the following are complete:
