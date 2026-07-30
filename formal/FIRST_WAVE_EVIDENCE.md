@@ -28,16 +28,31 @@ The broader exact-head native regressions remain part of each deterministic
 plan. They cover integration behavior that is intentionally not described as
 model checked.
 
+## 2026-07-30 mutation campaign
+
+The complete checked-in mutation suite passed against exact source commit
+`a0e476bd`. Each case ran in an isolated clone and required the protected
+target to conclude with a counterexample:
+
+| Mutation | Target result | Intended evidence |
+|---|---:|---|
+| inline free-slot selector bypass | counterexample | exact-head native regression; inline formal control verified |
+| full-cache free-slot selector bypass | counterexample | exact-head lifecycle regression; inline and abort-hole controls verified |
+| speculative prefix comparison inversion | counterexample in 2.26 s | ESBMC and native regression |
+| KVFlash capacity-boundary off-by-one | counterexample in 0.93 s | ESBMC and native regression |
+
+This establishes sensitivity for the checked-in representative defects. It
+does not imply sensitivity to every possible defect in the same production
+areas.
+
 ## Promotion blockers
 
 The three new targets remain advisory until all of the following are complete:
 
-1. The checked-in mutations reliably produce target counterexamples while an
-   unrelated control remains green where one is declared.
-2. The companion verifier's authenticated transitive-contract snapshot fix is
+1. The companion verifier's authenticated transitive-contract snapshot fix is
    reviewed, merged, and published in a new immutable verifier image.
-3. Lucebox pins that reviewed image digest in the registry and workflows.
-4. Maintainers approve each target's protected contract, bounds, latency, and
+2. Lucebox pins that reviewed image digest in the registry and workflows.
+3. Maintainers approve each target's protected contract, bounds, latency, and
    ownership.
 
 The current pinned image is sufficient for the legacy replay above. It does
