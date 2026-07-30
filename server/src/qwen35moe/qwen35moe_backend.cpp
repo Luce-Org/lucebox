@@ -170,13 +170,10 @@ bool Qwen35MoeBackend::load_target_model(ggml_backend_t backend, TargetWeights &
         const size_t file_size = _mf.size();
         // Transfer mmap ownership out of the RAII wrapper: the hybrid storage
         // keeps the mapping alive for streaming prefill and unmaps it in
-        // ~MoeHybridStorage. On POSIX the fd can be closed now (the mapping
-        // stays valid); on Windows release() already closed the mapping handle.
+        // ~MoeHybridStorage. Keep the POSIX fd through storage construction so
+        // it can retain a duplicate for io_uring/pread, then close our copy.
         GgufMmap::OwnedRegion _region = _mf.release();
         const void * mmap_addr = _region.data;
-#if !defined(_WIN32)
-        if (_region.fd >= 0) ::close(_region.fd);
-#endif
 
         const size_t data_start = gguf_get_data_offset(gctx);
         const auto * file_bytes = (const uint8_t *)mmap_addr;
@@ -214,7 +211,13 @@ bool Qwen35MoeBackend::load_target_model(ggml_backend_t backend, TargetWeights &
         int cache_slots = 0;
     if (const char * cs = std::getenv("DFLASH_QWEN35MOE_CACHE_SLOTS")) cache_slots = std::max(0, std::atoi(cs));
     else if (cache_slots_ >= 0) cache_slots = cache_slots_;
-    if (!build_moe_hybrid_storage_from_file_with_mmap(hybrid_cfg, backend, placement, layer_descs, layer_file_data, mmap_addr, file_size, *hybrid, &err, cache_slots)) {
+    const bool hybrid_ok = build_moe_hybrid_storage_from_file_with_mmap(
+        hybrid_cfg, backend, placement, layer_descs, layer_file_data,
+        mmap_addr, file_size, *hybrid, &err, cache_slots, nullptr, _region.fd);
+#if !defined(_WIN32)
+    if (_region.fd >= 0) ::close(_region.fd);
+#endif
+    if (!hybrid_ok) {
 #if defined(_WIN32)
             UnmapViewOfFile(const_cast<void *>(mmap_addr));
 #else
@@ -244,8 +247,9 @@ bool Qwen35MoeBackend::load_target_model(ggml_backend_t backend, TargetWeights &
         }
         if (max_expert_bytes > 0) {
             std::string stream_err;
-            if (stream_engine_.init(backend, max_expert_bytes, &stream_err)) {
-                std::printf("[qwen35moe] streaming prefill engine ready (pinned=%.1f MiB, scratch=%.1f MiB)\n",
+            if (stream_engine_.init(backend, max_expert_bytes, *out.moe_hybrid, &stream_err)) {
+                std::printf("[qwen35moe] SSD stream engine ready (io=%s pinned=%.1f MiB, scratch=%.1f MiB)\n",
+                            stream_engine_.io_backend_name(),
                             stream_engine_.pinned_bytes() / 1024.0 / 1024.0,
                             stream_engine_.scratch_bytes() / 1024.0 / 1024.0);
             } else {

@@ -306,6 +306,7 @@ add_library(dflash_common STATIC
     src/common/moe_hybrid_storage.cpp
     src/common/spark_corpus.cpp
     src/common/moe_hybrid_ffn_eval.cpp
+    src/common/moe_nvme_scheduler.cpp
     src/common/moe_hybrid_stream.cpp
     src/common/moe_expert_compute.cpp
     src/common/moe_expert_compute_cpu.cpp
@@ -620,6 +621,10 @@ target_link_libraries(dflash_common
         ggml-base
         nlohmann_json::nlohmann_json
 )
+# The NVMe scheduler uses a bounded worker pool on platforms where io_uring is
+# unavailable (and as its portable fallback).
+find_package(Threads REQUIRED)
+target_link_libraries(dflash_common PUBLIC Threads::Threads)
 # OpenMP for parallel MoE expert compute kernel (saturate memory bandwidth).
 find_package(OpenMP)
 if(OpenMP_CXX_FOUND)
@@ -667,6 +672,70 @@ if(DFLASH27B_TESTS)
             target_link_libraries(test_platform_compat PRIVATE ws2_32)
         endif()
         add_test(NAME platform_compat COMMAND test_platform_compat)
+    endif()
+
+    # SSD scheduling is deliberately independent of ggml and the GPU runtime.
+    # Keep its correctness tests lightweight so queueing/cache invariants are
+    # exercised even on CPU-only CI workers.
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_moe_nvme_scheduler.cpp")
+        add_executable(test_moe_nvme_scheduler
+            test/test_unit_main.cpp
+            test/test_moe_nvme_scheduler.cpp
+            src/common/moe_nvme_scheduler.cpp)
+        target_include_directories(test_moe_nvme_scheduler PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/common
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
+        target_link_libraries(test_moe_nvme_scheduler PRIVATE Threads::Threads)
+        list(APPEND _raw_unit_test_targets test_moe_nvme_scheduler)
+    endif()
+
+    # Read-only microbenchmark for tuning the exact expert I/O path on the
+    # deployment SSD. It accepts any sufficiently large file; no model parser
+    # or generated benchmark data is required.
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/bench_moe_nvme_io.cpp")
+        add_executable(bench_moe_nvme_io
+            test/bench_moe_nvme_io.cpp
+            src/common/moe_nvme_scheduler.cpp)
+        target_include_directories(bench_moe_nvme_io PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/common
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
+        target_link_libraries(bench_moe_nvme_io PRIVATE Threads::Threads)
+    endif()
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/bench_moe_nvme_pipeline.cpp")
+        add_executable(bench_moe_nvme_pipeline test/bench_moe_nvme_pipeline.cpp)
+        target_include_directories(bench_moe_nvme_pipeline PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/common
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
+        target_link_libraries(bench_moe_nvme_pipeline PRIVATE
+            dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            target_link_libraries(bench_moe_nvme_pipeline PRIVATE CUDA::cudart)
+        else()
+            target_link_libraries(bench_moe_nvme_pipeline PRIVATE hip::host)
+        endif()
+    endif()
+
+    # Kimi-K3 routed-core qualification. This replays the exact latent-expert
+    # geometry (IQ1_S, 3584 -> 3072 -> 3584, SiTU) through the common NVMe
+    # stream engine. It is deliberately independent of a Kimi model loader so
+    # the hardware path can be qualified before downloading the 594 GB model.
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/bench_kimi_k3_hetero.cpp")
+        add_executable(bench_kimi_k3_hetero test/bench_kimi_k3_hetero.cpp)
+        target_include_directories(bench_kimi_k3_hetero PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/common
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
+        target_link_libraries(bench_kimi_k3_hetero PRIVATE
+            dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            target_link_libraries(bench_kimi_k3_hetero PRIVATE CUDA::cudart)
+        else()
+            target_link_libraries(bench_kimi_k3_hetero PRIVATE hip::host)
+        endif()
     endif()
 
     if(DFLASH27B_GPU_BACKEND STREQUAL "hip"

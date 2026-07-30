@@ -728,16 +728,21 @@ bool DeepSeek4Backend::init_moe_tensor_parallel() {
     }
 
     if (ds4_inprocess_moe_tp_enabled()) {
-        if (!expert_backend_ || !moe_hybrid_->materialized_cold_experts ||
-            moe_hybrid_->cold_backend != expert_backend_) {
+        const bool resident_ready = moe_hybrid_->materialized_cold_experts &&
+                                    moe_hybrid_->cold_backend == expert_backend_;
+        const bool streamed_ready = !moe_hybrid_->materialized_cold_experts &&
+                                    stream_engine_.is_bound() &&
+                                    stream_engine_.compute_backend() == expert_backend_;
+        if (!expert_backend_ || (!resident_ready && !streamed_ready)) {
             std::fprintf(stderr,
                          "[deepseek4-moe-tp] in-process expert backend is not ready\n");
             return false;
         }
         expert_runtime_.reset();
         std::fprintf(stderr,
-                     "[deepseek4-moe-tp] enabled mode=in-process local_gpu=%d "
+                     "[deepseek4-moe-tp] enabled mode=%s local_gpu=%d "
                      "expert_gpu=%d local_experts=%d remote_experts=%d\n",
+                     streamed_ready ? "in-process+ssd" : "in-process",
                      cfg_.device.gpu, ds4_moe_tp_gpu(cfg_.device.gpu),
                      moe_placement_.total_hot,
                      w_.n_layer * w_.n_expert - moe_placement_.total_hot);
@@ -853,6 +858,7 @@ bool DeepSeek4Backend::init_hybrid_model() {
 
     auto hybrid = std::make_shared<MoeHybridStorage>();
     MoeHybridConfig hybrid_cfg = make_ds4_parent_worker_cfg(w_);
+    size_t nvme_device_cache_bytes = 0;
     const bool inprocess_tp =
         env_flag_enabled("DFLASH_DS4_MOE_TP") && ds4_inprocess_moe_tp_enabled();
     if (inprocess_tp) {
@@ -875,8 +881,47 @@ bool DeepSeek4Backend::init_hybrid_model() {
                          expert_gpu);
             return false;
         }
-        hybrid_cfg.materialize_cold_experts = true;
         hybrid_cfg.cold_expert_backend = MoeHybridColdBackend::Gpu;
+
+        // Third tier: R9700 static-hot -> Strix adaptive-warm -> SSD misses.
+        // Keep the established fully-resident path whenever it fits. In auto
+        // mode, switch only when the cold stack plus a safety reserve exceeds
+        // currently available Strix memory. An explicit override is useful
+        // for qualification on models that already fit.
+        bool stream_cold = false;
+        const char * nvme_mode = std::getenv("DFLASH_MOE_NVME_COLD_TIER");
+        if (nvme_mode && (std::strcmp(nvme_mode, "1") == 0 ||
+                          std::strcmp(nvme_mode, "on") == 0 ||
+                          std::strcmp(nvme_mode, "true") == 0)) {
+            stream_cold = true;
+        } else if (!nvme_mode || std::strcmp(nvme_mode, "auto") == 0) {
+            Ds4ExpertMemoryInfo info;
+            std::string memory_error;
+            size_t expert_free = 0;
+            size_t expert_total = 0;
+            ggml_backend_cuda_get_device_memory(expert_gpu, &expert_free, &expert_total);
+            if (compute_ds4_expert_memory_info(w_, &moe_placement_, info, &memory_error)) {
+                const uint64_t reserve = std::max<uint64_t>(
+                    2ULL * 1024 * 1024 * 1024, (uint64_t) expert_total / 20);
+                const uint64_t usable = expert_free > reserve
+                    ? (uint64_t) expert_free - reserve : 0;
+                stream_cold = info.cold_bytes > usable;
+                if (stream_cold) nvme_device_cache_bytes = (size_t) usable;
+                std::fprintf(stderr,
+                    "[deepseek4] Strix cold tier: cold=%.2f GiB free=%.2f GiB "
+                    "reserve=%.2f GiB warm-cache=%.2f GiB mode=%s\n",
+                    gib(info.cold_bytes), gib(expert_free), gib(reserve),
+                    gib(nvme_device_cache_bytes),
+                    stream_cold ? "ssd-stream" : "resident");
+            }
+        } else if (std::strcmp(nvme_mode, "0") != 0 &&
+                   std::strcmp(nvme_mode, "off") != 0 &&
+                   std::strcmp(nvme_mode, "false") != 0) {
+            std::fprintf(stderr,
+                "[deepseek4] ignoring invalid DFLASH_MOE_NVME_COLD_TIER=%s\n",
+                nvme_mode);
+        }
+        hybrid_cfg.materialize_cold_experts = !stream_cold;
     }
     if (!build_deepseek4_moe_hybrid_storage_from_file_with_mmap(
             cfg_.model_path, backend_, w_, moe_placement_, &hybrid_cfg,
@@ -901,15 +946,25 @@ bool DeepSeek4Backend::init_hybrid_model() {
             std::fprintf(stderr, "[deepseek4] failed to compute streaming expert size\n");
             return false;
         }
-        if (!stream_engine_.init(backend_, max_expert_bytes, &err)) {
+        ggml_backend_t stream_backend = expert_backend_ ? expert_backend_ : backend_;
+        MoeStreamConfig stream_config = MoeStreamConfig::from_env();
+        if (!std::getenv("DFLASH_MOE_NVME_DEVICE_CACHE_MB") &&
+            nvme_device_cache_bytes > 0) {
+            stream_config.device_cache_bytes = nvme_device_cache_bytes;
+        }
+        if (!stream_engine_.init(
+                stream_backend, max_expert_bytes, *hybrid, stream_config, &err)) {
             std::fprintf(stderr, "[deepseek4] failed to init cold-expert stream engine: %s\n",
                          err.c_str());
             return false;
         }
         std::fprintf(stderr,
-                     "[deepseek4] cold-expert stream engine ready: pinned=%.1f MiB scratch=%.1f MiB\n",
+                     "[deepseek4] cold-expert SSD engine ready: io=%s pinned=%.1f MiB "
+                     "strix_cache=%.1f MiB slots=%d\n",
+                     stream_engine_.io_backend_name(),
                      stream_engine_.pinned_bytes() / 1024.0 / 1024.0,
-                     stream_engine_.scratch_bytes() / 1024.0 / 1024.0);
+                     stream_engine_.device_cache_bytes() / 1024.0 / 1024.0,
+                     stream_engine_.device_slot_count());
     }
 
     moe_hybrid_ = std::move(hybrid);
@@ -1131,7 +1186,8 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
             spec_hooks.capture_out = &spec_cap;
             hp = &spec_hooks;
         }
-        if (moe_hybrid_ && (expert_runtime_.compute || expert_backend_)) {
+        if (moe_hybrid_ && !stream_engine_.is_bound() &&
+            (expert_runtime_.compute || expert_backend_)) {
             ok = deepseek4_step_layer_range(
                 backend_, cfg_.device.gpu, w_, cache_, hc_state,
                 embed.data(), n_tok, pos,
@@ -1234,7 +1290,8 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
 
             const int pos = std::max(0, committed + generated - 1);
             bool ok = false;
-            if (moe_hybrid_ && (expert_runtime_.compute || expert_backend_)) {
+            if (moe_hybrid_ && !stream_engine_.is_bound() &&
+                (expert_runtime_.compute || expert_backend_)) {
                 std::vector<float> hc_state;
                 ok = deepseek4_step_layer_range(
                     backend_, cfg_.device.gpu, w_, cache_, hc_state,

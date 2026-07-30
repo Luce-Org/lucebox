@@ -16,6 +16,7 @@
 
 #if !defined(_WIN32)
 #include <sys/mman.h>
+#include <unistd.h>
 #else
 #if !defined(NOMINMAX)
 #define NOMINMAX
@@ -212,6 +213,12 @@ MoeHybridStorage::~MoeHybridStorage() {
         mmap_data = nullptr;
         mmap_size = 0;
     }
+#if !defined(_WIN32)
+    if (mmap_fd >= 0) {
+        ::close(mmap_fd);
+        mmap_fd = -1;
+    }
+#endif
 }
 
 bool MoeHybridStorage::matches(const MoeHybridConfig & cfg) const {
@@ -745,7 +752,8 @@ bool build_moe_hybrid_storage_from_file_with_mmap(
     MoeHybridStorage & out,
     std::string * err,
     int cache_slots,
-    ggml_backend_t cold_gpu_backend) {
+    ggml_backend_t cold_gpu_backend,
+    int mmap_fd) {
 
     // First build storage normally (hot GPU + cold CPU buffers).
     if (!build_moe_hybrid_storage_from_file(
@@ -757,6 +765,13 @@ bool build_moe_hybrid_storage_from_file_with_mmap(
     // Store mmap metadata for streaming prefill.
     out.mmap_data = mmap_base;
     out.mmap_size = mmap_total_size;
+#if !defined(_WIN32)
+    // Keep a separate open-file description for true asynchronous reads. A
+    // failure is non-fatal: mmap workers remain a correct portable fallback.
+    if (mmap_fd >= 0) out.mmap_fd = ::dup(mmap_fd);
+#else
+    (void) mmap_fd;
+#endif
 
     // Compute per-layer expert file regions (offsets relative to mmap base).
     const auto * base = static_cast<const uint8_t *>(mmap_base);

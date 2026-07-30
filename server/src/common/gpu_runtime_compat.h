@@ -44,6 +44,8 @@
 #define cudaDeviceReset hipDeviceReset
 #define cudaEvent_t hipEvent_t
 #define cudaEventCreate hipEventCreate
+#define cudaEventCreateWithFlags hipEventCreateWithFlags
+#define cudaEventDisableTiming hipEventDisableTiming
 #define cudaEventDestroy hipEventDestroy
 #define cudaEventElapsedTime hipEventElapsedTime
 #define cudaEventRecord hipEventRecord

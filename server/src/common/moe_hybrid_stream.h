@@ -1,34 +1,42 @@
-// MoE hybrid prefill streaming engine — DMA pipeline for cold expert offload.
+// Heterogeneous MoE SSD execution tier.
 //
-// Streams cold expert weight slices from mmap (page cache) through a pinned
-// host staging buffer to GPU scratch memory, pipelined with GPU compute on
-// previously-transferred experts. Used during prefill when T >= threshold.
+// Exact routed experts move through a bounded NVMe -> page-locked host -> GPU
+// pipeline. The model storage format remains separate: this runtime only
+// consumes model-neutral LayerExpertRegions produced by a loader.
 
 #pragma once
 
 #include "moe_hybrid_types.h"
 #include "moe_hybrid_storage.h"
+#include "moe_nvme_scheduler.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
 namespace dflash::common {
 
-// Configuration for the stream engine.
 struct MoeStreamConfig {
-    int  prefill_threshold = 8;    // min n_tokens to activate streaming
-    int  prefetch_layers   = 2;    // how many layers ahead to madvise
+    int prefill_threshold = 8;
+    int prefetch_layers = 2;
+    int device_slots = 2; // double buffering is the minimum useful pipeline
+    // Optional adaptive GPU expert-cache budget. Zero keeps only the pipeline
+    // slots. The hardware planner can safely assign otherwise-unused Strix
+    // memory here while retaining its KV/graph reserve.
+    size_t device_cache_bytes = 0;
+    MoeNvmeConfig nvme{};
+
+    static MoeStreamConfig from_env();
 };
 
-// Streaming engine: manages pinned staging buffer, GPU scratch, and DMA pipeline.
 class MoeHybridStreamEngine {
 public:
-    MoeHybridStreamEngine() = default;
+    MoeHybridStreamEngine();
     ~MoeHybridStreamEngine();
 
     MoeHybridStreamEngine(const MoeHybridStreamEngine &) = delete;
@@ -36,63 +44,85 @@ public:
     MoeHybridStreamEngine(MoeHybridStreamEngine &&) noexcept;
     MoeHybridStreamEngine & operator=(MoeHybridStreamEngine &&) noexcept;
 
-    // Initialize the engine with a maximum expert size (bytes for one expert's
-    // gate+up+down tensors). Allocates pinned host buffer and GPU scratch.
-    bool init(ggml_backend_t gpu_backend, size_t max_expert_bytes, std::string * err = nullptr);
+    // Compatibility initialization for synthetic callers. Production callers
+    // should use the storage overload so actual file reads (and io_uring) are
+    // available instead of relying only on mmap page faults.
+    bool init(ggml_backend_t gpu_backend, size_t max_expert_bytes,
+              std::string * err = nullptr);
+    bool init(ggml_backend_t gpu_backend, size_t max_expert_bytes,
+              const MoeHybridStorage & storage,
+              std::string * err = nullptr);
+    bool init(ggml_backend_t gpu_backend, size_t max_expert_bytes,
+              const MoeHybridStorage & storage,
+              const MoeStreamConfig & config,
+              std::string * err = nullptr);
+
+    bool bind_storage(const MoeHybridStorage & storage, std::string * err = nullptr);
+    bool bind_sources(const std::vector<MoeNvmeSource> & sources,
+                      const std::vector<LayerExpertRegions> & layer_regions,
+                      std::string * err = nullptr);
     bool is_ready() const;
+    bool is_bound() const;
     void destroy();
 
-    // Issue madvise(WILLNEED) for the specified cold experts in the given layer.
-    // Call this as early as possible (e.g. at start of layer or N layers ahead).
+    // Queue exact experts without waiting. Demand requests always outrank
+    // speculative prefetches and can cancel queued speculation.
+    void request_experts(int layer, const int32_t * expert_ids, int count,
+                         MoeNvmePriority priority = MoeNvmePriority::Prefetch);
+
+    // Compatibility page-cache hint. New code should call request_experts(),
+    // which performs real asynchronous reads into the bounded host cache.
     void prefetch_cold_experts(const void * mmap_data, size_t mmap_size,
                                const LayerExpertRegions & regions,
                                const int32_t * cold_expert_ids,
                                int n_cold);
 
-    // Stream a single cold expert from mmap to GPU scratch and return a ggml
-    // tensor view over the scratch memory for each weight matrix.
-    // This is a BLOCKING operation (synchronous DMA). For pipelined usage,
-    // use the async variants below.
+    // Queue one H2D transfer into a device slot, then activate it after its
+    // completion event. Different slots allow transfer N+1 to overlap compute N.
+    bool stage_expert_async(int layer, int expert_id, int device_slot,
+                            std::string * err = nullptr);
+
+    // Cache-aware form used by production inference. On a hit it returns the
+    // existing Strix slot without host or SSD traffic. On a miss it selects an
+    // unpinned LFRU victim and starts the same asynchronous upload pipeline.
+    bool stage_expert_cached_async(int layer, int expert_id, int * device_slot,
+                                   std::string * err = nullptr);
+    bool activate_device_slot(int device_slot, std::string * err = nullptr);
+    void release_device_slot(int device_slot);
+    int device_slot_count() const;
+    size_t device_cache_bytes() const;
+    ggml_backend_t compute_backend() const;
+
+    bool stream_expert_sync(int layer, int expert_id,
+                            std::string * err = nullptr);
+
+    // Legacy form: lazily binds a single synthetic layer.
     bool stream_expert_sync(const void * mmap_data, size_t mmap_size,
                             const LayerExpertRegions & regions,
                             int expert_id,
                             ggml_backend_t gpu_backend,
                             std::string * err = nullptr);
 
-    // Get tensor pointers into the GPU scratch buffer after a successful stream.
-    // Valid until next stream call. Tensors are transient (not owned by any context).
-    const void * scratch_gate_data() const { return scratch_gate_; }
-    const void * scratch_up_data()   const { return scratch_up_; }
-    const void * scratch_down_data() const { return scratch_down_; }
-    size_t scratch_gate_bytes() const { return last_gate_bytes_; }
-    size_t scratch_up_bytes()   const { return last_up_bytes_; }
-    size_t scratch_down_bytes() const { return last_down_bytes_; }
+    const void * scratch_gate_data() const;
+    const void * scratch_up_data() const;
+    const void * scratch_down_data() const;
+    size_t scratch_gate_bytes() const;
+    size_t scratch_up_bytes() const;
+    size_t scratch_down_bytes() const;
 
-    // Total pinned buffer size.
-    size_t pinned_bytes() const { return pinned_size_; }
-    // Total GPU scratch size.
-    size_t scratch_bytes() const { return scratch_size_; }
+    size_t pinned_bytes() const;
+    size_t scratch_bytes() const;
+    const char * io_backend_name() const;
+    MoeNvmeStats io_stats() const;
 
 private:
-    void * pinned_buf_  = nullptr;  // cudaMallocHost'd staging buffer
-    size_t pinned_size_ = 0;
-
-    void * gpu_scratch_     = nullptr;  // GPU device memory for one expert
-    size_t scratch_size_    = 0;
-    ggml_backend_t backend_ = nullptr;
-
-    // Offsets into scratch for last-streamed expert
-    void * scratch_gate_ = nullptr;
-    void * scratch_up_   = nullptr;
-    void * scratch_down_ = nullptr;
-    size_t last_gate_bytes_ = 0;
-    size_t last_up_bytes_   = 0;
-    size_t last_down_bytes_ = 0;
+    struct Runtime;
+    std::unique_ptr<Runtime> runtime_;
 };
 
-// Evaluate cold experts by streaming from mmap to GPU, pipelined.
-// Hot experts are already computed (result in hot_partial).
-// Returns combined cold expert contribution in out (sized n_embd * n_tokens).
+// Evaluate the cold contribution for one layer. All routed SSD requests are
+// admitted before compute starts, then double-buffered H2D runs concurrently
+// with the preceding expert graph.
 bool eval_moe_cold_experts_streaming(
     MoeHybridStreamEngine &         engine,
     ggml_backend_t                  gpu_backend,
@@ -107,6 +137,7 @@ bool eval_moe_cold_experts_streaming(
     const float *                   selected_weights,
     int                             n_tokens,
     std::vector<float> &            out,
-    std::string *                   err = nullptr);
+    std::string *                   err = nullptr,
+    int                             layer = 0);
 
-}  // namespace dflash::common
+} // namespace dflash::common
