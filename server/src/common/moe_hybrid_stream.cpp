@@ -291,6 +291,9 @@ public:
                const void * gate_data,
                const void * up_data,
                const void * down_data,
+               size_t gate_alloc_bytes,
+               size_t up_alloc_bytes,
+               size_t down_alloc_bytes,
                std::string * err) {
         destroy();
         if (!backend || !expert_buffer || batch <= 0 || !gate_data || !down_data ||
@@ -336,22 +339,19 @@ public:
 
         auto bind_external = [&](ggml_tensor * tensor,
                                  const void * data,
+                                 size_t available_bytes,
                                  const char * label) -> bool {
             if (!tensor || !data) {
                 if (err) *err = std::string("invalid streamed ") +
                                 label + " tensor binding";
                 return false;
             }
-            // Some GPU quant kernels require row-tail padding beyond
-            // ggml_nbytes(). The ordinary allocator supplies that padding,
-            // but a compact streamed record does not. Refuse such an adapter
-            // until it provides a padded device layout; otherwise a kernel
-            // could zero or read into the following component.
-            if (ggml_backend_buffer_get_alloc_size(expert_buffer, tensor) !=
-                ggml_nbytes(tensor)) {
+            const size_t required_bytes =
+                ggml_backend_buffer_get_alloc_size(expert_buffer, tensor);
+            if (available_bytes < required_bytes) {
                 if (err) *err = std::string("streamed ") + label +
-                    " tensor requires backend row padding; use a padded "
-                    "device layout";
+                    " device allocation is smaller than the backend's "
+                    "padded tensor requirement";
                 return false;
             }
             const size_t alignment =
@@ -372,13 +372,14 @@ public:
             return true;
         };
         if (spec.fused_gate_up) {
-            if (!bind_external(gate_up_, gate_data, "gate_up") ||
-                !bind_external(down_, down_data, "down")) {
+            if (!bind_external(gate_up_, gate_data, gate_alloc_bytes,
+                               "gate_up") ||
+                !bind_external(down_, down_data, down_alloc_bytes, "down")) {
                 return false;
             }
-        } else if (!bind_external(gate_, gate_data, "gate") ||
-                   !bind_external(up_, up_data, "up") ||
-                   !bind_external(down_, down_data, "down")) {
+        } else if (!bind_external(gate_, gate_data, gate_alloc_bytes, "gate") ||
+                   !bind_external(up_, up_data, up_alloc_bytes, "up") ||
+                   !bind_external(down_, down_data, down_alloc_bytes, "down")) {
             return false;
         }
 
@@ -524,6 +525,29 @@ private:
 } // namespace
 
 struct MoeHybridStreamEngine::Runtime {
+    struct DeviceComponentLayout {
+        MoeExpertComponentKind kind = MoeExpertComponentKind::Gate;
+        size_t offset = 0;
+        size_t logical_bytes = 0;
+        size_t alloc_bytes = 0;
+    };
+
+    struct DeviceExpertLayout {
+        MoeStreamExpertSpec spec{};
+        DeviceComponentLayout components[3]{};
+        int component_count = 0;
+        size_t bytes = 0;
+        bool configured = false;
+
+        const DeviceComponentLayout * component(
+                MoeExpertComponentKind kind) const {
+            for (int i = 0; i < component_count; ++i) {
+                if (components[i].kind == kind) return &components[i];
+            }
+            return nullptr;
+        }
+    };
+
     struct DeviceSlot {
         void * data = nullptr;
         cudaEvent_t ready = nullptr;
@@ -536,6 +560,7 @@ struct MoeHybridStreamEngine::Runtime {
         uint64_t last_touch = 0;
         MoeNvmeLease host_lease;
         MoeExpertIoLayout layout{};
+        DeviceExpertLayout device_layout{};
     };
 
     ggml_backend_t backend = nullptr;
@@ -550,6 +575,7 @@ struct MoeHybridStreamEngine::Runtime {
     size_t device_pool_bytes = 0;
     std::vector<DeviceSlot> device_slots;
     std::unordered_map<uint64_t, int> device_index;
+    std::unordered_map<int, DeviceExpertLayout> layer_device_layouts;
     uint64_t device_clock = 0;
     uint64_t device_cache_hits = 0;
     uint64_t device_cache_misses = 0;
@@ -562,8 +588,37 @@ struct MoeHybridStreamEngine::Runtime {
 };
 
 template <typename RuntimeT>
-bool allocate_device_cache(RuntimeT & runtime, std::string * err) {
-    runtime.device_stride = align_up(runtime.max_expert_bytes, 256);
+void release_device_cache(RuntimeT & runtime) {
+    if (runtime.backend) ggml_backend_synchronize(runtime.backend);
+    if (runtime.transfer_stream) {
+        (void) cudaStreamSynchronize(runtime.transfer_stream);
+    }
+    runtime.graph_cache.clear();
+    for (auto & slot : runtime.device_slots) {
+        slot.host_lease.reset();
+        if (slot.ready) (void) cudaEventDestroy(slot.ready);
+        slot.ready = nullptr;
+        slot.data = nullptr;
+        slot.pending = false;
+    }
+    runtime.device_slots.clear();
+    runtime.device_index.clear();
+    runtime.active_slot = -1;
+    if (runtime.device_pool_buffer) {
+        ggml_backend_buffer_free(runtime.device_pool_buffer);
+    }
+    runtime.device_pool_buffer = nullptr;
+    runtime.device_pool = nullptr;
+    runtime.device_stride = 0;
+    runtime.device_pool_bytes = 0;
+}
+
+template <typename RuntimeT>
+bool allocate_device_cache(RuntimeT & runtime, std::string * err,
+                           size_t minimum_stride = 0) {
+    const size_t logical_stride =
+        std::max(runtime.max_expert_bytes, minimum_stride);
+    runtime.device_stride = align_up(logical_stride, 256);
     if (runtime.device_stride == 0) {
         if (err) *err = "SSD device-cache stride overflow";
         return false;
@@ -619,7 +674,130 @@ bool allocate_device_cache(RuntimeT & runtime, std::string * err) {
     for (size_t i = 0; i < runtime.device_slots.size(); ++i) {
         runtime.device_slots[i].data = base + i * runtime.device_stride;
     }
-    runtime.config.device_slots = (int) attempt_slots;
+    return true;
+}
+
+template <typename RuntimeT>
+bool build_device_expert_layout(
+        RuntimeT & runtime,
+        const MoeStreamExpertSpec & spec,
+        typename RuntimeT::DeviceExpertLayout & out,
+        std::string * err) {
+    out = typename RuntimeT::DeviceExpertLayout{};
+    if (spec.input_dim <= 0 || spec.intermediate_dim <= 0 ||
+        spec.output_dim <= 0 || !valid_ggml_type(spec.down_type) ||
+        (spec.fused_gate_up
+            ? !valid_ggml_type(spec.gate_up_type)
+            : (!valid_ggml_type(spec.gate_type) ||
+               !valid_ggml_type(spec.up_type)))) {
+        if (err) *err = "invalid streamed expert shape or tensor type";
+        return false;
+    }
+
+    ggml_backend_buffer_type_t buft =
+        ggml_backend_get_default_buffer_type(runtime.backend);
+    const size_t alignment = ggml_backend_buft_get_alignment(buft);
+    if (alignment == 0 || (alignment & (alignment - 1)) != 0) {
+        if (err) *err = "streamed expert backend alignment is invalid";
+        return false;
+    }
+
+    ggml_init_params params{};
+    params.mem_size = 128 * 1024;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        if (err) *err = "ggml_init failed for streamed device layout";
+        return false;
+    }
+
+    size_t cursor = 0;
+    auto add = [&](MoeExpertComponentKind kind, ggml_type type,
+                   int64_t columns, int64_t rows, const char * label) -> bool {
+        if (out.component_count >= 3 || columns <= 0 || rows <= 0 ||
+            columns % ggml_blck_size(type) != 0) {
+            if (err) *err = std::string("invalid streamed ") + label +
+                            " tensor dimensions";
+            return false;
+        }
+        ggml_tensor * tensor =
+            ggml_new_tensor_2d(ctx, type, columns, rows);
+        const size_t logical_bytes = ggml_nbytes(tensor);
+        const size_t alloc_bytes =
+            ggml_backend_buft_get_alloc_size(buft, tensor);
+        const size_t offset = align_up(cursor, alignment);
+        if (offset == 0 && cursor != 0) {
+            if (err) *err = "streamed device component alignment overflow";
+            return false;
+        }
+        if (alloc_bytes < logical_bytes ||
+            offset > std::numeric_limits<size_t>::max() - alloc_bytes) {
+            if (err) *err = "streamed device component size overflow";
+            return false;
+        }
+        out.components[out.component_count++] = {
+            kind, offset, logical_bytes, alloc_bytes};
+        cursor = offset + alloc_bytes;
+        return true;
+    };
+
+    bool ok = true;
+    if (spec.fused_gate_up) {
+        ok = spec.intermediate_dim <= std::numeric_limits<int>::max() / 2 &&
+             add(MoeExpertComponentKind::FusedGateUp, spec.gate_up_type,
+                 spec.input_dim, 2LL * spec.intermediate_dim, "gate_up") &&
+             add(MoeExpertComponentKind::Down, spec.down_type,
+                 spec.intermediate_dim, spec.output_dim, "down");
+    } else {
+        ok = add(MoeExpertComponentKind::Gate, spec.gate_type,
+                 spec.input_dim, spec.intermediate_dim, "gate") &&
+             add(MoeExpertComponentKind::Up, spec.up_type,
+                 spec.input_dim, spec.intermediate_dim, "up") &&
+             add(MoeExpertComponentKind::Down, spec.down_type,
+                 spec.intermediate_dim, spec.output_dim, "down");
+    }
+    if (ok) {
+        out.bytes = align_up(cursor, std::max<size_t>(256, alignment));
+        if (out.bytes == 0) {
+            if (err) *err = "streamed device expert stride overflow";
+            ok = false;
+        }
+    }
+    ggml_free(ctx);
+    if (!ok) return false;
+    out.spec = spec;
+    out.configured = true;
+    return true;
+}
+
+template <typename RuntimeT>
+bool prepare_device_expert_layout(RuntimeT & runtime, int layer,
+                                  const MoeStreamExpertSpec & spec,
+                                  std::string * err) {
+    auto existing = runtime.layer_device_layouts.find(layer);
+    if (existing != runtime.layer_device_layouts.end()) {
+        if (!same_stream_spec(existing->second.spec, spec)) {
+            if (err) *err = "streamed expert specification changed within one layer";
+            return false;
+        }
+        return true;
+    }
+
+    typename RuntimeT::DeviceExpertLayout layout;
+    if (!build_device_expert_layout(runtime, spec, layout, err)) return false;
+    const bool has_compact_cached_slot = std::any_of(
+        runtime.device_slots.begin(), runtime.device_slots.end(),
+        [&](const auto & slot) {
+            return slot.valid && slot.key.layer == layer &&
+                   !slot.device_layout.configured;
+        });
+    if (layout.bytes > runtime.device_stride || has_compact_cached_slot) {
+        const size_t required_stride =
+            std::max(layout.bytes, runtime.device_stride);
+        release_device_cache(runtime);
+        if (!allocate_device_cache(runtime, err, required_stride)) return false;
+    }
+    runtime.layer_device_layouts.emplace(layer, layout);
     return true;
 }
 
@@ -932,6 +1110,8 @@ bool MoeHybridStreamEngine::stage_expert_async(int layer, int expert_id,
     dst.valid = false;
     dst.cache_managed = false;
     dst.key = {};
+    dst.layout = MoeExpertIoLayout{};
+    dst.device_layout = Runtime::DeviceExpertLayout{};
 
     if (!dst.ready) {
         const cudaError_t event_create_err =
@@ -949,17 +1129,91 @@ bool MoeHybridStreamEngine::stage_expert_async(int layer, int expert_id,
         if (err) *err = "streamed expert exceeds GPU device slot";
         return false;
     }
-    for (int i = 0; i < lease.layout().span_count; ++i) {
-        const MoeExpertIoSpan & span = lease.layout().spans[i];
-        cudaError_t gpu_err = cudaMemcpyAsync(
-            static_cast<uint8_t *>(dst.data) + span.device_offset,
-            lease.data() + span.buffer_offset,
-            span.bytes, cudaMemcpyHostToDevice, runtime_->transfer_stream);
-        if (gpu_err != cudaSuccess) {
-            (void) cudaStreamSynchronize(runtime_->transfer_stream);
-            if (err) *err = std::string("asynchronous expert H2D failed: ") +
-                            cudaGetErrorString(gpu_err);
+    const auto prepared = runtime_->layer_device_layouts.find(layer);
+    if (prepared != runtime_->layer_device_layouts.end()) {
+        const Runtime::DeviceExpertLayout & device_layout = prepared->second;
+        if (!device_layout.configured ||
+            device_layout.bytes > runtime_->device_stride) {
+            if (err) *err = "prepared streamed expert exceeds GPU device stride";
             return false;
+        }
+        for (int i = 0; i < device_layout.component_count; ++i) {
+            const Runtime::DeviceComponentLayout & device_component =
+                device_layout.components[i];
+            const MoeExpertComponentLayout * io_component =
+                lease.layout().component(device_component.kind);
+            if (!io_component ||
+                io_component->bytes != device_component.logical_bytes) {
+                if (err) *err = "streamed device and storage components disagree";
+                return false;
+            }
+
+            const uint8_t * source = nullptr;
+            for (int span_index = 0;
+                 span_index < lease.layout().span_count; ++span_index) {
+                const MoeExpertIoSpan & span =
+                    lease.layout().spans[span_index];
+                if (io_component->device_offset < span.device_offset) continue;
+                const size_t delta =
+                    io_component->device_offset - span.device_offset;
+                if (delta <= span.bytes &&
+                    io_component->bytes <= span.bytes - delta) {
+                    source = lease.data() + span.buffer_offset + delta;
+                    break;
+                }
+            }
+            if (!source) {
+                if (err) *err = "streamed component is not contained in its I/O span";
+                return false;
+            }
+
+            cudaError_t gpu_err = cudaMemcpyAsync(
+                static_cast<uint8_t *>(dst.data) + device_component.offset,
+                source, device_component.logical_bytes,
+                cudaMemcpyHostToDevice, runtime_->transfer_stream);
+            if (gpu_err == cudaSuccess &&
+                device_component.alloc_bytes > device_component.logical_bytes) {
+                gpu_err = cudaMemsetAsync(
+                    static_cast<uint8_t *>(dst.data) + device_component.offset +
+                        device_component.logical_bytes,
+                    0,
+                    device_component.alloc_bytes -
+                        device_component.logical_bytes,
+                    runtime_->transfer_stream);
+            }
+            if (gpu_err != cudaSuccess) {
+                (void) cudaStreamSynchronize(runtime_->transfer_stream);
+                if (err) *err = std::string("asynchronous expert H2D failed: ") +
+                                cudaGetErrorString(gpu_err);
+                return false;
+            }
+        }
+        dst.device_layout = device_layout;
+    } else {
+        // Storage-only callers do not supply a compute specification. Preserve
+        // their compact byte-for-byte staging contract; numerical evaluation
+        // always registers an exact backend-padded layout before reaching here.
+        for (int i = 0; i < lease.layout().span_count; ++i) {
+            const MoeExpertIoSpan & span = lease.layout().spans[i];
+            cudaError_t gpu_err = cudaMemcpyAsync(
+                static_cast<uint8_t *>(dst.data) + span.device_offset,
+                lease.data() + span.buffer_offset,
+                span.bytes, cudaMemcpyHostToDevice, runtime_->transfer_stream);
+            if (gpu_err != cudaSuccess) {
+                (void) cudaStreamSynchronize(runtime_->transfer_stream);
+                if (err) *err = std::string("asynchronous expert H2D failed: ") +
+                                cudaGetErrorString(gpu_err);
+                return false;
+            }
+        }
+        dst.device_layout.component_count = lease.layout().component_count;
+        dst.device_layout.bytes = lease.layout().payload_bytes;
+        for (int i = 0; i < lease.layout().component_count; ++i) {
+            const MoeExpertComponentLayout & component =
+                lease.layout().components[i];
+            dst.device_layout.components[i] = {
+                component.kind, component.device_offset,
+                component.bytes, component.bytes};
         }
     }
     const cudaError_t event_err = cudaEventRecord(dst.ready, runtime_->transfer_stream);
@@ -1137,9 +1391,10 @@ const void * MoeHybridStreamEngine::scratch_gate_data() const {
     const Runtime::DeviceSlot & slot = runtime_->device_slots[(size_t) runtime_->active_slot];
     const MoeExpertComponentKind kind = slot.layout.fused_gate_up
         ? MoeExpertComponentKind::FusedGateUp : MoeExpertComponentKind::Gate;
-    const MoeExpertComponentLayout * component = slot.layout.component(kind);
+    const Runtime::DeviceComponentLayout * component =
+        slot.device_layout.component(kind);
     return component
-        ? static_cast<const uint8_t *>(slot.data) + component->device_offset
+        ? static_cast<const uint8_t *>(slot.data) + component->offset
         : nullptr;
 }
 
@@ -1147,50 +1402,51 @@ const void * MoeHybridStreamEngine::scratch_up_data() const {
     if (!runtime_ || runtime_->active_slot < 0) return nullptr;
     const Runtime::DeviceSlot & slot = runtime_->device_slots[(size_t) runtime_->active_slot];
     if (slot.layout.fused_gate_up) return nullptr;
-    const MoeExpertComponentLayout * component =
-        slot.layout.component(MoeExpertComponentKind::Up);
+    const Runtime::DeviceComponentLayout * component =
+        slot.device_layout.component(MoeExpertComponentKind::Up);
     return component
-        ? static_cast<const uint8_t *>(slot.data) + component->device_offset
+        ? static_cast<const uint8_t *>(slot.data) + component->offset
         : nullptr;
 }
 
 const void * MoeHybridStreamEngine::scratch_down_data() const {
     if (!runtime_ || runtime_->active_slot < 0) return nullptr;
     const Runtime::DeviceSlot & slot = runtime_->device_slots[(size_t) runtime_->active_slot];
-    const MoeExpertComponentLayout * component =
-        slot.layout.component(MoeExpertComponentKind::Down);
+    const Runtime::DeviceComponentLayout * component =
+        slot.device_layout.component(MoeExpertComponentKind::Down);
     return component
-        ? static_cast<const uint8_t *>(slot.data) + component->device_offset
+        ? static_cast<const uint8_t *>(slot.data) + component->offset
         : nullptr;
 }
 
 size_t MoeHybridStreamEngine::scratch_gate_bytes() const {
     if (!runtime_ || runtime_->active_slot < 0) return 0;
-    const MoeExpertIoLayout & layout =
-        runtime_->device_slots[(size_t) runtime_->active_slot].layout;
-    const MoeExpertComponentKind kind = layout.fused_gate_up
+    const Runtime::DeviceSlot & slot =
+        runtime_->device_slots[(size_t) runtime_->active_slot];
+    const MoeExpertComponentKind kind = slot.layout.fused_gate_up
         ? MoeExpertComponentKind::FusedGateUp : MoeExpertComponentKind::Gate;
-    const MoeExpertComponentLayout * component = layout.component(kind);
-    return component ? component->bytes : 0;
+    const Runtime::DeviceComponentLayout * component =
+        slot.device_layout.component(kind);
+    return component ? component->logical_bytes : 0;
 }
 
 size_t MoeHybridStreamEngine::scratch_up_bytes() const {
     if (!runtime_ || runtime_->active_slot < 0) return 0;
-    const MoeExpertIoLayout & layout =
-        runtime_->device_slots[(size_t) runtime_->active_slot].layout;
-    if (layout.fused_gate_up) return 0;
-    const MoeExpertComponentLayout * component =
-        layout.component(MoeExpertComponentKind::Up);
-    return component ? component->bytes : 0;
+    const Runtime::DeviceSlot & slot =
+        runtime_->device_slots[(size_t) runtime_->active_slot];
+    if (slot.layout.fused_gate_up) return 0;
+    const Runtime::DeviceComponentLayout * component =
+        slot.device_layout.component(MoeExpertComponentKind::Up);
+    return component ? component->logical_bytes : 0;
 }
 
 size_t MoeHybridStreamEngine::scratch_down_bytes() const {
     if (!runtime_ || runtime_->active_slot < 0) return 0;
-    const MoeExpertIoLayout & layout =
-        runtime_->device_slots[(size_t) runtime_->active_slot].layout;
-    const MoeExpertComponentLayout * component =
-        layout.component(MoeExpertComponentKind::Down);
-    return component ? component->bytes : 0;
+    const Runtime::DeviceSlot & slot =
+        runtime_->device_slots[(size_t) runtime_->active_slot];
+    const Runtime::DeviceComponentLayout * component =
+        slot.device_layout.component(MoeExpertComponentKind::Down);
+    return component ? component->logical_bytes : 0;
 }
 
 size_t MoeHybridStreamEngine::pinned_bytes() const {
@@ -1509,6 +1765,10 @@ bool eval_moe_streamed_experts(
 
     auto & runtime = *engine.runtime_;
     std::lock_guard<std::mutex> compute_guard(runtime.compute_mutex);
+    if (!prepare_device_expert_layout(
+            runtime, batch.layer, spec, err)) {
+        return false;
+    }
 
     size_t route_slots = 0;
     if (!checked_mul_size((size_t) batch.top_k,
@@ -1575,6 +1835,24 @@ bool eval_moe_streamed_experts(
         const MoeExpertIoLayout & layout =
             runtime.device_slots[(size_t) active].layout;
         if (!validate_moe_stream_expert_layout(spec, layout, err)) return false;
+        const auto & device_layout =
+            runtime.device_slots[(size_t) active].device_layout;
+        const MoeExpertComponentKind gate_kind = spec.fused_gate_up
+            ? MoeExpertComponentKind::FusedGateUp
+            : MoeExpertComponentKind::Gate;
+        const auto * gate_component =
+            device_layout.component(gate_kind);
+        const auto * up_component =
+            spec.fused_gate_up
+                ? nullptr
+                : device_layout.component(MoeExpertComponentKind::Up);
+        const auto * down_component =
+            device_layout.component(MoeExpertComponentKind::Down);
+        if (!gate_component || !down_component ||
+            (!spec.fused_gate_up && !up_component)) {
+            if (err) *err = "streamed device layout is missing an expert component";
+            return false;
+        }
 
         std::unique_ptr<PersistentStreamExpertGraph> built(
             new (std::nothrow) PersistentStreamExpertGraph);
@@ -1586,7 +1864,11 @@ bool eval_moe_streamed_experts(
                           spec, graph_batch,
                           engine.scratch_gate_data(),
                           engine.scratch_up_data(),
-                          engine.scratch_down_data(), err)) {
+                          engine.scratch_down_data(),
+                          gate_component->alloc_bytes,
+                          up_component ? up_component->alloc_bytes : 0,
+                          down_component->alloc_bytes,
+                          err)) {
             return false;
         }
         built->last_touch = touch;
