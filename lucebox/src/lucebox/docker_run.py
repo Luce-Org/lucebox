@@ -119,6 +119,33 @@ def _runtime_volumes(cfg: Config) -> tuple[BindMount, ...]:
     )
 
 
+def _placement_env(cfg: Config) -> list[tuple[str, str]]:
+    """Translate the portable placement profile to the entrypoint contract."""
+    placement = cfg.placement
+    env: list[tuple[str, str]] = [("DFLASH_PLACEMENT_MODE", placement.mode)]
+    if placement.target_device:
+        env.append(("DFLASH_TARGET_DEVICE", placement.target_device))
+    if placement.target_devices:
+        env.append(("DFLASH_TARGET_DEVICES", ",".join(placement.target_devices)))
+        env.append(
+            (
+                "DFLASH_TARGET_LAYER_SPLIT",
+                ",".join(f"{weight:g}" for weight in placement.target_layer_split),
+            )
+        )
+    if placement.draft_device:
+        env.append(("DFLASH_DRAFT_DEVICE", placement.draft_device))
+    if placement.remote_draft:
+        env.append(("DFLASH_REMOTE_DRAFT", "1"))
+    if placement.remote_target_shard:
+        env.append(("DFLASH_REMOTE_TARGET_SHARD", "1"))
+    if placement.peer_access:
+        env.append(("DFLASH_PEER_ACCESS", "1"))
+    if placement.remote_expert_device:
+        env.append(("DFLASH_REMOTE_EXPERT_DEVICE", placement.remote_expert_device))
+    return env
+
+
 def _validate_model_relative_path(value: str, field: str) -> PurePosixPath:
     """Validate a config-provided path intended to live below models_dir."""
     relative = PurePosixPath(value)
@@ -261,6 +288,12 @@ def server_run_spec(cfg: Config) -> DockerRunSpec:
     """Long-running OpenAI-compatible server. Foreground (systemd manages
     lifecycle), vendor-specific GPU devices, models bind-mounted, DFLASH_* propagated.
     """
+    if cfg.placement.requires_hybrid_runtime:
+        raise ValueError(
+            "cross-vendor placement requires the paired native Lucebox runtime; "
+            "a single-backend Docker image cannot launch it"
+        )
+
     # LUCEBOX_HOST_* first so they ride out front in the rendered argv,
     # making it obvious in `print-run` output what host facts get forwarded.
     env: list[tuple[str, str]] = list(_host_facts_env())
@@ -274,6 +307,7 @@ def server_run_spec(cfg: Config) -> DockerRunSpec:
         ("DFLASH_THINK_MAX", str(cfg.dflash.think_max)),
         ("DFLASH_PORT", "8080"),
     ]
+    env += _placement_env(cfg)
     # Keep the API model catalog aligned with the preset selected by the host
     # CLI. Client connectors use this id for explicit model selection and
     # clients such as Codex also discover it through ``/v1/models``.
@@ -389,14 +423,15 @@ def server_run_spec(cfg: Config) -> DockerRunSpec:
     # automatic tuning. This matters on an R9700 + Strix build where ROCm may
     # enumerate the integrated GPU before the larger discrete card. Explicit
     # CUDA/ROCR/HIP visibility supplied by an advanced user remains authoritative.
-    if gpu_vendor == "amd":
+    placement_is_explicit = bool(cfg.placement.target_device or cfg.placement.target_devices)
+    if gpu_vendor == "amd" and not placement_is_explicit:
         rocr_visible = os.environ.get("LUCEBOX_HOST_ROCR_VISIBLE_DEVICES", "").strip()
         hip_visible = os.environ.get("LUCEBOX_HOST_HIP_VISIBLE_DEVICES", "").strip()
         if rocr_visible:
             env.append(("ROCR_VISIBLE_DEVICES", rocr_visible))
         elif hip_visible:
             env.append(("HIP_VISIBLE_DEVICES", hip_visible))
-    elif gpu_vendor == "nvidia":
+    elif gpu_vendor == "nvidia" and not placement_is_explicit:
         visible = os.environ.get("LUCEBOX_HOST_CUDA_VISIBLE_DEVICES", "").strip()
         if visible:
             env.append(("CUDA_VISIBLE_DEVICES", visible))

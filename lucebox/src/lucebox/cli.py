@@ -33,6 +33,7 @@ import lucebox.host_check as host_check
 from lucebox import __version__
 from lucebox.config import config_get, config_set, config_unset, live_config
 from lucebox.host_facts import from_env
+from lucebox.placement import PlacementPlan
 from lucebox.types import Config, DflashRuntime, ModelMeta
 
 app = typer.Typer(
@@ -87,8 +88,9 @@ def _print_logo() -> None:
 def _load_or_build() -> Config:
     """env > config.toml > dataclass defaults — the canonical precedence.
 
-    Only the five documented top-level scalars have environment overrides;
-    dflash, host, and model settings intentionally remain config-driven.
+    Only the five documented top-level scalars have environment overrides.
+    Optimization, placement, and model settings remain config-driven, while
+    fresh host facts replace an absent or stale persisted snapshot.
     """
     try:
         cfg = config_mod.load()
@@ -145,6 +147,18 @@ def _optimization_label(cfg: Config) -> str:
     return f"{mode_label} ({', '.join(active) if active else 'standard engine'})"
 
 
+def _placement_label(cfg: Config) -> str:
+    placement = cfg.placement
+    target = placement.target_device or ", ".join(placement.target_devices)
+    if placement.remote_expert_device:
+        return f"{target} target + {placement.remote_expert_device} Spark experts"
+    if placement.draft_device:
+        return f"{target} target + {placement.draft_device} draft/scorer"
+    if placement.target_devices:
+        return f"{target} target split"
+    return target or "server default"
+
+
 def _package_menu() -> None:
     """Small in-package menu for direct installs and contributor workflows.
 
@@ -157,7 +171,8 @@ def _package_menu() -> None:
         cfg = _load_or_build()
         active = cfg.model.preset or "not selected"
         console.print(f"Model:        [bold]{escape(active)}[/bold]")
-        console.print(f"Optimization: [bold]{escape(_optimization_label(cfg))}[/bold]\n")
+        console.print(f"Optimization: [bold]{escape(_optimization_label(cfg))}[/bold]")
+        console.print(f"Execution:    [bold]{escape(_placement_label(cfg))}[/bold]\n")
         console.print("  [bold cyan]1[/bold cyan]  Choose or download a model")
         console.print("  [bold cyan]2[/bold cyan]  Review optimizations")
         console.print("  [bold cyan]3[/bold cyan]  Show configuration")
@@ -316,39 +331,66 @@ def _print_installed_presets() -> None:
 
 
 def _activate_preset(cfg: Config, preset: download_mod.ModelPreset) -> None:
-    """Persist one selected preset and seed first-run tuning."""
-    config_set("model.preset", preset.name)
-    config_set("model.target_file", preset.target_file)
-    if preset.has_draft and preset.draft_file:
-        config_set("model.draft_file", preset.draft_file)
-    else:
-        # Drop any stale draft_file from a previous activation; the selected
-        # preset is explicitly target-only.
-        config_unset("model.draft_file")
-    console.print(f"[green]Activated:[/green] model.preset = {preset.name}")
+    """Activate one preset together with a runnable execution profile."""
+    selected_model = ModelMeta(
+        preset=preset.name,
+        target_file=preset.target_file,
+        draft_file=preset.draft_file if preset.has_draft and preset.draft_file else "",
+    )
     selected_cfg = replace(
         cfg,
-        model=ModelMeta(
-            preset=preset.name,
-            target_file=preset.target_file,
-            draft_file=preset.draft_file or "",
-        ),
+        model=selected_model,
     )
-    # Automatic profiles follow the selected model. A user-owned custom
-    # profile is preserved and called out instead of being silently reset.
-    if config_mod.seed_optimization_from_config(selected_cfg):
-        max_ctx = config_get("dflash.max_ctx")["dflash.max_ctx"][0]
-        plan = autotune_mod.automatic_plan(selected_cfg)
-        active = ", ".join(plan.active_names) or "standard engine"
-        console.print(
-            f"[green]Optimized:[/green] Automatic profile for {preset.name} "
-            f"({active}; max_ctx={max_ctx})"
+
+    mode = config_mod.optimization_mode()
+    if mode == "custom":
+        placement = autotune_mod.placement_for_runtime(selected_cfg, cfg.dflash)
+        if not placement.runnable:
+            error_console.print(
+                "[red]Model not activated: the custom profile has no runnable "
+                f"placement on this machine.[/red]\n[dim]{escape(placement.reason)}[/dim]"
+            )
+            raise typer.Exit(code=2)
+        runtime = placement.optimization_runtime
+        config_mod.write_model_profile(
+            selected_model,
+            runtime,
+            placement.runtime,
+            mode="custom",
+            source="model-switch",
         )
-    else:
-        console.print(
-            "[yellow]Custom optimization profile kept.[/yellow] "
-            "Run `lucebox optimize` to review it for this model."
+        console.print(f"[green]Activated:[/green] model.preset = {preset.name}")
+        if runtime != cfg.dflash:
+            console.print(
+                "[yellow]Custom profile adjusted.[/yellow] Features incompatible "
+                "with the new placement were disabled; run `lucebox optimize "
+                "--advanced` to review it."
+            )
+        else:
+            console.print(
+                "[yellow]Custom optimization profile kept.[/yellow] "
+                "Execution placement was recalculated for this model."
+            )
+        return
+
+    plan = autotune_mod.automatic_plan(selected_cfg)
+    if not plan.placement.runnable:
+        error_console.print(
+            "[red]Model not activated: Automatic found no runnable placement "
+            f"on this machine.[/red]\n[dim]{escape(plan.placement.reason)}[/dim]"
         )
+        raise typer.Exit(code=2)
+    config_mod.write_model_profile(
+        selected_model,
+        plan.runtime,
+        plan.placement.runtime,
+    )
+    console.print(f"[green]Activated:[/green] model.preset = {preset.name}")
+    active = ", ".join(plan.active_names) or "standard engine"
+    console.print(
+        f"[green]Optimized:[/green] Automatic profile for {preset.name} "
+        f"({active}; max_ctx={plan.runtime.max_ctx})"
+    )
 
 
 @models_app.callback(invoke_without_command=True)
@@ -531,6 +573,9 @@ def _render_optimization_plan(
 ) -> None:
     console.print(f"[bold]{title}[/bold]")
     console.print(f"Model: {escape(plan.model_name)}")
+    placement_state = "[green]ready[/green]" if plan.placement.runnable else "[red]blocked[/red]"
+    console.print(f"Execution: [bold]{escape(plan.placement.summary)}[/bold] ({placement_state})")
+    console.print(f"[dim]{escape(plan.placement.reason)}[/dim]")
     table = Table(show_header=True, box=None, pad_edge=False)
     table.add_column("Optimization", style="bold")
     table.add_column("State")
@@ -552,7 +597,10 @@ def _render_optimization_plan(
     )
 
 
-def _render_custom_runtime(runtime: DflashRuntime) -> None:
+def _render_custom_runtime(
+    runtime: DflashRuntime,
+    placement: PlacementPlan | None = None,
+) -> None:
     """Show the exact product choices before a custom profile is committed."""
     console.print("\n[bold]Your custom profile[/bold]")
     table = Table(show_header=True, box=None, pad_edge=False)
@@ -576,6 +624,10 @@ def _render_custom_runtime(runtime: DflashRuntime) -> None:
         f"KV format: [bold]{cache}[/bold]  ·  "
         f"DFlash budget: [bold]{runtime.budget}[/bold]"
     )
+    if placement is not None:
+        console.print(
+            f"Execution: [bold]{escape(placement.summary)}[/bold]  ·  {escape(placement.reason)}"
+        )
 
 
 def _ensure_optimizer_drafter(cfg: Config, *, assume_yes: bool = False) -> bool:
@@ -745,11 +797,23 @@ def optimize(
 
     if custom:
         runtime = _customize_runtime(cfg, plan)
-        _render_custom_runtime(runtime)
+        placement = autotune_mod.placement_for_runtime(cfg, runtime)
+        runtime = placement.optimization_runtime
+        _render_custom_runtime(runtime, placement)
+        if not placement.runnable:
+            error_console.print(
+                "[red]This profile has no runnable placement on the detected hardware.[/red]"
+            )
+            raise typer.Exit(code=2)
         if not typer.confirm("Apply this custom profile?", default=True):
             console.print("[dim]Optimization unchanged.[/dim]")
             return
-        config_mod.write_optimization_runtime(runtime, mode="custom", source="guided")
+        config_mod.write_optimization_runtime(
+            runtime,
+            placement=placement.runtime,
+            mode="custom",
+            source="guided",
+        )
         console.print("[green]Custom optimization profile applied.[/green]")
         return
 
@@ -759,7 +823,15 @@ def optimize(
     if not yes and not typer.confirm("Apply this automatic profile?", default=True):
         console.print("[dim]Optimization unchanged.[/dim]")
         return
-    config_mod.write_optimization_runtime(plan.runtime)
+    if not plan.placement.runnable:
+        error_console.print(
+            "[red]Automatic cannot produce a runnable placement for this model and machine.[/red]"
+        )
+        raise typer.Exit(code=2)
+    config_mod.write_optimization_runtime(
+        plan.runtime,
+        placement=plan.placement.runtime,
+    )
     console.print("[green]Automatic optimization applied.[/green]")
     console.print(
         "[dim]Run `lucebox optimize --advanced` anytime to review individual features.[/dim]"

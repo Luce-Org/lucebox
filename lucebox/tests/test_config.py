@@ -435,3 +435,100 @@ def test_model_switch_preserves_custom_profile(tmp_path: Path) -> None:
     loaded = config.load(path)
     assert loaded is not None
     assert loaded.dflash.max_ctx == 8192
+
+
+def test_optimization_and_placement_are_persisted_atomically(tmp_path: Path) -> None:
+    from lucebox.types import DflashRuntime, PlacementRuntime
+
+    path = tmp_path / "config.toml"
+    placement = PlacementRuntime(
+        mode="layer-split",
+        target_devices=("hip:0", "hip:1"),
+        target_layer_split=(0.7, 0.3),
+        peer_access=True,
+    )
+
+    config.write_optimization_runtime(
+        DflashRuntime(max_ctx=32768),
+        placement=placement,
+        path=path,
+    )
+    loaded = config.load(path)
+
+    assert loaded is not None
+    assert loaded.dflash.max_ctx == 32768
+    assert loaded.placement == placement
+    assert config.optimization_mode(path=path) == "automatic"
+
+
+def test_runtime_reset_clears_stale_placement(tmp_path: Path) -> None:
+    from lucebox.types import DflashRuntime, PlacementRuntime
+
+    path = tmp_path / "config.toml"
+    config.write_optimization_runtime(
+        DflashRuntime(),
+        placement=PlacementRuntime(
+            mode="layer-split",
+            target_devices=("hip:0", "hip:1"),
+            target_layer_split=(0.7, 0.3),
+        ),
+        path=path,
+    )
+
+    config.write_optimization_runtime(DflashRuntime(max_ctx=4096), path=path)
+
+    assert "placement" not in config.load_doc(path)
+
+
+def test_model_and_execution_profile_switch_atomically(tmp_path: Path) -> None:
+    from lucebox.types import DflashRuntime, ModelMeta, PlacementRuntime
+
+    path = tmp_path / "config.toml"
+    path.write_text(
+        '[model]\npreset = "old"\ntarget_file = "old.gguf"\ndraft_file = "old-draft.gguf"\n'
+    )
+    placement = PlacementRuntime(mode="single", target_device="cuda:0")
+
+    config.write_model_profile(
+        ModelMeta(preset="new", target_file="new.gguf"),
+        DflashRuntime(max_ctx=32768),
+        placement,
+        path=path,
+    )
+
+    loaded = config.load(path)
+    assert loaded is not None
+    assert loaded.model == ModelMeta(preset="new", target_file="new.gguf")
+    assert loaded.dflash.max_ctx == 32768
+    assert loaded.placement == placement
+    assert "draft_file" not in config.load_doc(path)["model"]
+
+
+def test_automatic_seed_refuses_unrunnable_placement(tmp_path: Path) -> None:
+    from lucebox.types import Config, HostFacts, ModelMeta
+
+    path = tmp_path / "config.toml"
+    cfg = Config(
+        models_dir=tmp_path / "models",
+        host=HostFacts(),
+        model=ModelMeta(preset="qwen3.6-27b"),
+    )
+
+    with pytest.raises(ValueError, match="no runnable placement"):
+        config.seed_optimization_from_config(cfg, path=path)
+
+    assert not path.exists()
+
+
+def test_config_rejects_unpaired_mixed_backend_placement(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "[placement]\n"
+        'mode = "heterogeneous"\n'
+        'target_device = "cuda:0"\n'
+        'draft_device = "hip:0"\n'
+        "remote_draft = false\n"
+    )
+
+    with pytest.raises(ValueError, match="requires remote_draft"):
+        config.load(path)

@@ -14,9 +14,7 @@ def _set_config_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return tmp_path / "config.toml"
 
 
-def test_config_set_then_get_round_trip(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_config_set_then_get_round_trip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     cfg_path = _set_config_path(tmp_path, monkeypatch)
     set_result = CliRunner().invoke(app, ["config", "set", "dflash.budget=12"])
     assert set_result.exit_code == 0
@@ -38,9 +36,7 @@ def test_config_get_with_no_key_lists_every_registered_key(
         assert key in result.stdout
 
 
-def test_config_unset_drops_key(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_config_unset_drops_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     cfg_path = _set_config_path(tmp_path, monkeypatch)
     CliRunner().invoke(app, ["config", "set", "dflash.budget=9"])
     assert "budget = 9" in cfg_path.read_text()
@@ -50,17 +46,13 @@ def test_config_unset_drops_key(
     assert "budget" not in body
 
 
-def test_config_set_unknown_key_errors(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_config_set_unknown_key_errors(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _set_config_path(tmp_path, monkeypatch)
     result = CliRunner().invoke(app, ["config", "set", "totally.unknown=1"])
     assert result.exit_code == 2
 
 
-def test_config_set_rejects_missing_equals(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_config_set_rejects_missing_equals(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _set_config_path(tmp_path, monkeypatch)
     result = CliRunner().invoke(app, ["config", "set", "dflash.budget"])
     assert result.exit_code == 2
@@ -108,8 +100,7 @@ def test_load_or_build_env_overrides_persisted_config(
     # Write a config.toml WITHOUT an image.registry line — the
     # bug-trigger shape on sindri.
     cfg_path.write_text(
-        '[image]\nvariant = "cuda12"\n[runtime]\nport = 9090\n'
-        '[dflash]\nbudget = 22\n'
+        '[image]\nvariant = "cuda12"\n[runtime]\nport = 9090\n[dflash]\nbudget = 22\n'
     )
     # Env should override what config.toml says (and what dataclass
     # defaults fill in for missing keys).
@@ -118,8 +109,8 @@ def test_load_or_build_env_overrides_persisted_config(
     monkeypatch.setenv("LUCEBOX_CONTAINER", "lucebox-test")
     cfg = _load_or_build()
     assert cfg.image == "ghcr.io/myfork/lucebox-hub"  # env beats dataclass default
-    assert cfg.port == 7777                            # env beats config.toml
-    assert cfg.container_name == "lucebox-test"        # env applied
+    assert cfg.port == 7777  # env beats config.toml
+    assert cfg.container_name == "lucebox-test"  # env applied
     # variant is in config.toml — config.toml value (no env override).
     assert cfg.variant == "cuda12"
     # dflash IS persisted in config.toml — env doesn't touch it (no DFLASH_*

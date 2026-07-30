@@ -12,7 +12,9 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "peer_access.h"
 
+#include <cstdint>
 #include <vector>
 
 namespace dflash::common {
@@ -46,6 +48,34 @@ struct ActivationBuffer {
     int n_tokens = 0;
     ggml_type type = GGML_TYPE_F32;
 };
+
+inline void copy_layer_split_tensor(const ggml_tensor * src,
+                                    int src_device,
+                                    ggml_tensor * dst,
+                                    int dst_device) {
+    GGML_ASSERT(src && dst);
+    GGML_ASSERT(src->type == dst->type);
+    GGML_ASSERT(ggml_are_same_shape(src, dst));
+    GGML_ASSERT(ggml_are_same_stride(src, dst));
+    if (src_device == dst_device) {
+        ggml_backend_tensor_copy(src, dst);
+        return;
+    }
+
+    // Route every cross-device transfer through the shared transport policy.
+    // It uses reusable pinned host staging by default and P2P only after an
+    // explicit --peer-access opt-in plus a successful capability check.
+    if (copy_peer_async(dst->data, dst_device, src->data, src_device,
+                        ggml_nbytes(src))) {
+        return;
+    }
+    // Preserve a backend-generic last resort if the runtime-level transfer
+    // fails (for example, pinned allocation pressure).
+    thread_local std::vector<std::uint8_t> staging;
+    staging.resize(ggml_nbytes(src));
+    ggml_backend_tensor_get(src, staging.data(), 0, staging.size());
+    ggml_backend_tensor_set(dst, staging.data(), 0, staging.size());
+}
 
 inline bool set_activation_tensor_from_f32(ggml_tensor * dst,
                                            const float * src,

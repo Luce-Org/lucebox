@@ -258,7 +258,8 @@ bool run_qwen35_layer_split_forward(
                 return false;
             }
             ggml_backend_synchronize(current_shard->backend);
-            ggml_backend_tensor_copy(act_in, next_acts.a);
+            copy_layer_split_tensor(
+                act_in, current_shard->gpu, next_acts.a, shard->gpu);
             ggml_backend_synchronize(shard->backend);
             activation_pair_free(acts);
             acts = next_acts;
@@ -455,7 +456,8 @@ bool run_qwen35_layer_split_layers_from_activation(
                 return false;
             }
             ggml_backend_synchronize(current_shard->backend);
-            ggml_backend_tensor_copy(act_in, next_acts.a);
+            copy_layer_split_tensor(
+                act_in, current_shard->gpu, next_acts.a, shard->gpu);
             ggml_backend_synchronize(shard->backend);
             activation_pair_free(acts);
             acts = next_acts;

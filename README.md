@@ -122,11 +122,22 @@ experts. **Review optimizations** offers an Advanced mode for users who want to
 override those four choices. Wi-Fi and device provisioning
 are intentionally outside this inference-only CLI.
 
-On heterogeneous builds the CLI selects one primary accelerator: CUDA on an
-RTX 3090 + Strix machine, and the largest-VRAM AMD device on an R9700 + Strix
-machine. Automatic tuning never adds VRAM across devices. The engine's advanced
-layer-split paths remain contributor workflows; transparent multi-GPU sharding
-is not part of this CLI release.
+Automatic inventories every NVIDIA and AMD accelerator, then writes one
+validated execution plan together with the optimization profile. A model that
+fits stays on the faster primary GPU. When capacity requires it, supported
+architectures are split across same-backend GPUs; DFlash or PFlash work can be
+placed on a companion GPU when the target fits but the complete stack does not.
+Spark-compatible MoE models can place cold experts on a companion accelerator.
+Cross-GPU copies use the correctness-first staged path unless an operator
+explicitly opts into topology-specific peer access.
+
+RTX 3090 + Strix builds use CUDA for the main server and can use the Strix HIP
+companion through the paired native runtime. R9700 + Strix builds use ROCm and
+prefer the discrete R9700, while retaining Strix as a capacity/optimizer
+device. Factory Lucebox systems can ship that runtime preinstalled; a source
+checkout can create the same layout with `./lucebox.sh build hybrid` followed
+by `./lucebox.sh package-runtime`. A normal single-GPU NVIDIA or AMD machine
+keeps using its prebuilt Docker image and requires no native compilation.
 
 **Connect or open your harness** links the running local API to a client the
 engine user already installed: Claude Code, Codex, OpenCode, Hermes, Pi,
@@ -158,6 +169,8 @@ lucebox optimize --advanced
 lucebox start
 ./lucebox.sh build cuda
 ./lucebox.sh native cuda
+./lucebox.sh build hybrid            # CUDA + HIP contributor build
+./lucebox.sh package-runtime         # factory-installable paired runtime
 ```
 
 ## Quick Start On Harnesses

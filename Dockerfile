@@ -100,16 +100,18 @@ RUN cmake -S /src/server -B /src/server/build \
         -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
         -DDFLASH27B_USER_CUDA_ARCHITECTURES="${DFLASH_CUDA_ARCHES}" \
         -DCMAKE_CUDA_ARCHITECTURES="${DFLASH_CUDA_ARCHES}" \
-    && cmake --build /src/server/build --target test_dflash dflash_server test_server_unit --parallel
+    && cmake --build /src/server/build \
+        --target test_dflash dflash_server backend_ipc_daemon test_server_unit --parallel
 
 # Prune the build tree to only what the runtime stage needs: the native server,
-# test_dflash, test_server_unit, and the ggml shared libs their embedded rpath
+# backend IPC companion, tests, and the ggml shared libs their embedded rpath
 # ($ORIGIN/deps/...) looks up. Drops ~1 GB per image of CMakeFiles/,
 # libdflash27b.a (statically linked into the binaries), ninja state,
 # compile_commands.json, and the template-instance .o tree from ggml-cuda.
 RUN cd /src/server/build \
     && find . -mindepth 1 -maxdepth 1 \
-            ! -name test_dflash ! -name dflash_server ! -name test_server_unit ! -name deps -exec rm -rf {} + \
+            ! -name test_dflash ! -name dflash_server ! -name backend_ipc_daemon \
+            ! -name test_server_unit ! -name deps -exec rm -rf {} + \
     && find deps -mindepth 1 -type f ! -name 'lib*.so*' -delete \
     && find deps -depth -type d -empty -delete
 
@@ -218,6 +220,7 @@ RUN mkdir -p /opt/lucebox-hub/server/share \
 
 RUN test -x /opt/lucebox-hub/server/build/test_dflash \
     && test -x /opt/lucebox-hub/server/build/dflash_server \
+    && test -x /opt/lucebox-hub/server/build/backend_ipc_daemon \
     && test -x /opt/lucebox-hub/server/build/test_server_unit \
     && test -f /opt/lucebox-hub/server/share/model_cards/qwen3.6-27b.json \
     && chmod +x /opt/lucebox-hub/server/scripts/entrypoint.sh

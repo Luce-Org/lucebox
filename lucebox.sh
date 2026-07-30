@@ -79,8 +79,12 @@ _lucebox_config_path() {
 #   key = "string"      # surrounding double-quotes are stripped
 #   key = 8080          # bare scalars passed through verbatim
 #   key = true          # same
-# Inline `# comment` is honored. Arrays / inline tables / multi-line
-# strings aren't written by the Python persister, so we don't parse them.
+#   key = [             # simple multi-line arrays written by tomli_w
+#       "hip:0",
+#       "hip:1",
+#   ]
+# Inline `# comment` is honored. Inline tables and multi-line strings are not
+# part of the host wrapper's config contract.
 _lucebox_config_get() {
     local dotted="$1" cfg
     cfg="$(_lucebox_config_path)"
@@ -89,24 +93,11 @@ _lucebox_config_get() {
     local key="${dotted##*.}"
     [ "$section" = "$dotted" ] && section=""
     awk -v want_section="$section" -v want_key="$key" '
-        BEGIN { current = "" }
-        /^[[:space:]]*\[/ {
-            t = $0
-            sub(/^[[:space:]]*\[[[:space:]]*/, "", t)
-            sub(/[[:space:]]*\][[:space:]]*$/, "", t)
-            current = t
-            next
-        }
-        /^[[:space:]]*#/ { next }
-        /=/ {
-            if (current != want_section) next
-            line = $0
-            # Strip a TOML comment only when # is outside a quoted string.
-            # Paths and image tags may legitimately contain #.
+        function strip_comment(text,    i, ch, in_quote, escaped) {
             in_quote = 0
             escaped = 0
-            for (i = 1; i <= length(line); i++) {
-                ch = substr(line, i, 1)
+            for (i = 1; i <= length(text); i++) {
+                ch = substr(text, i, 1)
                 if (escaped) {
                     escaped = 0
                     continue
@@ -119,11 +110,23 @@ _lucebox_config_get() {
                     in_quote = !in_quote
                     continue
                 }
-                if (ch == "#" && !in_quote) {
-                    line = substr(line, 1, i - 1)
-                    break
-                }
+                if (ch == "#" && !in_quote)
+                    return substr(text, 1, i - 1)
             }
+            return text
+        }
+        BEGIN { current = "" }
+        /^[[:space:]]*\[/ {
+            t = $0
+            sub(/^[[:space:]]*\[[[:space:]]*/, "", t)
+            sub(/[[:space:]]*\][[:space:]]*$/, "", t)
+            current = t
+            next
+        }
+        /^[[:space:]]*#/ { next }
+        /=/ {
+            if (current != want_section) next
+            line = strip_comment($0)
             eq = index(line, "=")
             if (eq == 0) next
             k = substr(line, 1, eq - 1)
@@ -131,6 +134,14 @@ _lucebox_config_get() {
             gsub(/^[[:space:]]+|[[:space:]]+$/, "", k)
             gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
             if (k != want_key) next
+            if (substr(v, 1, 1) == "[" && index(v, "]") == 0) {
+                while ((getline continuation) > 0) {
+                    continuation = strip_comment(continuation)
+                    gsub(/^[[:space:]]+|[[:space:]]+$/, "", continuation)
+                    v = v continuation
+                    if (index(continuation, "]") > 0) break
+                }
+            }
             if (length(v) >= 2 && substr(v, 1, 1) == "\"" && substr(v, length(v), 1) == "\"")
                 v = substr(v, 2, length(v) - 2)
             print v
@@ -214,6 +225,11 @@ CONNECTOR_SELECTION_FILE="$CONNECTOR_STATE_DIR/selected"
 : "${LUCEBOX_HOST_GPU_SM:=}"
 : "${LUCEBOX_HOST_DRIVER_VERSION:=}"
 : "${LUCEBOX_HOST_DRIVER_MAJOR:=0}"
+: "${LUCEBOX_HOST_NVIDIA_GPU_NAME:=}"
+: "${LUCEBOX_HOST_NVIDIA_GPU_COUNT:=0}"
+: "${LUCEBOX_HOST_NVIDIA_VRAM_GB:=0}"
+: "${LUCEBOX_HOST_NVIDIA_GPU_ARCH:=}"
+: "${LUCEBOX_HOST_NVIDIA_GPU_LIST_CSV:=}"
 : "${LUCEBOX_HOST_ROCM_VERSION:=}"
 : "${LUCEBOX_HOST_HAS_KFD:=0}"
 : "${LUCEBOX_HOST_HAS_DRI:=0}"
@@ -240,6 +256,11 @@ CONNECTOR_SELECTION_FILE="$CONNECTOR_STATE_DIR/selected"
 : "${LUCEBOX_HOST_CUDA_VISIBLE_DEVICES:=}"
 : "${LUCEBOX_HOST_HIP_VISIBLE_DEVICES:=}"
 : "${LUCEBOX_HOST_ROCR_VISIBLE_DEVICES:=}"
+: "${LUCEBOX_HOST_HAS_HYBRID_RUNTIME:=0}"
+: "${LUCEBOX_HOST_HYBRID_SERVER_BIN:=}"
+: "${LUCEBOX_HOST_HYBRID_IPC_BIN:=}"
+: "${LUCEBOX_HOST_HYBRID_DFLASH_DIR:=}"
+: "${LUCEBOX_HOST_HYBRID_ENTRYPOINT:=}"
 # Tracks whether probe_host has actually run; pieces of the code that need
 # fresh host facts (e.g. cmd_check, cmd_serve) gate on this. Default 0.
 : "${_LUCEBOX_HOST_PROBED:=0}"
@@ -296,6 +317,14 @@ _find_repo_root() {
         done
     done
     return 1
+}
+
+_native_binary_ready() {
+    local binary="$1" dependencies
+    [ -x "$binary" ] || return 1
+    command -v ldd >/dev/null 2>&1 || return 0
+    dependencies=$(ldd "$binary" 2>&1 || true)
+    [[ "$dependencies" != *"not found"* ]]
 }
 
 _confirm() {
@@ -416,6 +445,11 @@ probe_host() {
     LUCEBOX_HOST_DRIVER_VERSION=""
     LUCEBOX_HOST_DRIVER_MAJOR=0
     LUCEBOX_HOST_GPU_LIST_CSV=""
+    LUCEBOX_HOST_NVIDIA_GPU_NAME=""
+    LUCEBOX_HOST_NVIDIA_GPU_COUNT=0
+    LUCEBOX_HOST_NVIDIA_VRAM_GB=0
+    LUCEBOX_HOST_NVIDIA_GPU_ARCH=""
+    LUCEBOX_HOST_NVIDIA_GPU_LIST_CSV=""
     LUCEBOX_HOST_ROCM_VERSION=""
     LUCEBOX_HOST_HAS_KFD=0
     LUCEBOX_HOST_HAS_DRI=0
@@ -424,6 +458,11 @@ probe_host() {
     LUCEBOX_HOST_AMD_VRAM_GB=0
     LUCEBOX_HOST_AMD_GPU_ARCH=""
     LUCEBOX_HOST_AMD_GPU_LIST_CSV=""
+    LUCEBOX_HOST_HAS_HYBRID_RUNTIME=0
+    LUCEBOX_HOST_HYBRID_SERVER_BIN=""
+    LUCEBOX_HOST_HYBRID_IPC_BIN=""
+    LUCEBOX_HOST_HYBRID_DFLASH_DIR=""
+    LUCEBOX_HOST_HYBRID_ENTRYPOINT=""
 
     if command -v nvidia-smi &>/dev/null; then
         local q
@@ -441,6 +480,10 @@ probe_host() {
             cc=$(printf '%s\n' "$q" | head -1 | awk -F', ' '{print $4}')
             LUCEBOX_HOST_GPU_SM="${cc//./}"
             LUCEBOX_HOST_GPU_COUNT=$(printf '%s\n' "$q" | wc -l)
+            LUCEBOX_HOST_NVIDIA_GPU_NAME="$LUCEBOX_HOST_GPU_NAME"
+            LUCEBOX_HOST_NVIDIA_GPU_COUNT="$LUCEBOX_HOST_GPU_COUNT"
+            LUCEBOX_HOST_NVIDIA_VRAM_GB="$LUCEBOX_HOST_VRAM_GB"
+            LUCEBOX_HOST_NVIDIA_GPU_ARCH="$LUCEBOX_HOST_GPU_SM"
         fi
         # Multi-GPU enumeration for /props.host. The single-GPU vars
         # above (GPU_NAME / GPU_SM / VRAM_GB / DRIVER_VERSION) keep
@@ -450,6 +493,7 @@ probe_host() {
         LUCEBOX_HOST_GPU_LIST_CSV=$(nvidia-smi \
             --query-gpu=index,uuid,pci.bus_id,name,compute_cap,memory.total,power.limit \
             --format=csv,noheader 2>/dev/null || echo "")
+        LUCEBOX_HOST_NVIDIA_GPU_LIST_CSV="$LUCEBOX_HOST_GPU_LIST_CSV"
     fi
 
     # Probe AMD independently even on mixed NVIDIA + Strix systems. A working
@@ -489,7 +533,20 @@ probe_host() {
         LUCEBOX_HOST_HAS_AMD_GPU=1
         LUCEBOX_HOST_AMD_GPU_COUNT=$(printf '%s\n' "$amd_rows" | awk 'NF{n++} END{print n+0}')
         local amd_primary
-        amd_primary=$(printf '%s\n' "$amd_rows" | sort -t'|' -k4,4nr | head -1)
+        # Prefer a discrete accelerator over Strix Halo UMA even when a newer
+        # firmware reports the APU's large shared-memory aperture as VRAM.
+        # Within the same memory class, use the device with most physical
+        # memory. This keeps R9700 + Strix builds on the faster R9700 while a
+        # Strix-only machine still selects its integrated GPU.
+        amd_primary=$(printf '%s\n' "$amd_rows" \
+            | awk -F'|' '$3 != "gfx1151"' \
+            | sort -t'|' -k4,4nr \
+            | head -1)
+        if [ -z "$amd_primary" ]; then
+            amd_primary=$(printf '%s\n' "$amd_rows" \
+                | sort -t'|' -k4,4nr \
+                | head -1)
+        fi
         local amd_idx amd_name amd_arch amd_mem_mib amd_selector
         IFS='|' read -r amd_idx amd_name amd_arch amd_mem_mib amd_selector <<<"$amd_primary"
         amd_primary_selector="${amd_selector:-$amd_idx}"
@@ -501,7 +558,7 @@ probe_host() {
         # Strix Halo exposes most memory as unified system RAM, while SMI may
         # report only a 512 MiB carve-out. Use host RAM as the effective model
         # capacity on a Strix-only build; a discrete R9700 remains primary on
-        # the R9700 + Strix build because it has the largest physical VRAM.
+        # the R9700 + Strix build by the policy above.
         if [ "$amd_arch" = "gfx1151" ] \
            && [ "$LUCEBOX_HOST_AMD_VRAM_GB" -lt 12 ] \
            && [ "$LUCEBOX_HOST_RAM_GB" -ge 32 ]; then
@@ -541,11 +598,10 @@ probe_host() {
     done
     # CUDA_VISIBLE_DEVICES from the caller's env (empty default = "all GPUs").
     LUCEBOX_HOST_CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-}"
-    # The native server currently uses one primary device unless an advanced
-    # user explicitly supplies a visibility list. On R9700 + Strix systems,
-    # pinning the largest-VRAM card keeps the runtime aligned with the GPU that
-    # the readiness screen and optimizer selected, even when ROCm enumerates
-    # the integrated GPU first.
+    # Legacy profiles use one isolated primary device. A resolved placement
+    # later clears this mask so the engine can address every named device. On
+    # R9700 + Strix systems, the legacy pin remains aligned with the discrete
+    # primary even when ROCm enumerates the integrated GPU first.
     LUCEBOX_HOST_HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-}"
     LUCEBOX_HOST_ROCR_VISIBLE_DEVICES="${ROCR_VISIBLE_DEVICES:-}"
     if [ -z "$LUCEBOX_HOST_HIP_VISIBLE_DEVICES" ] \
@@ -555,6 +611,52 @@ probe_host() {
         # if SMI and ROCr enumeration orders differ. Use one isolation layer,
         # not both, so an index fallback is never interpreted twice.
         LUCEBOX_HOST_ROCR_VISIBLE_DEVICES="$amd_primary_selector"
+    fi
+
+    # A mixed CUDA/HIP process cannot be assembled from a single-backend
+    # Docker image. Buyers may receive the paired native runtime under
+    # /opt/lucebox/runtime; contributors get the same contract after building
+    # both backends in their checkout. Record it only when both executables
+    # exist so Automatic never emits an unlaunchable cross-vendor plan.
+    if [ "$LUCEBOX_HOST_HAS_NVIDIA_GPU" = "1" ] \
+       && [ "$LUCEBOX_HOST_HAS_AMD_GPU" = "1" ]; then
+        local hybrid_repo="" hybrid_server="" hybrid_ipc=""
+        local hybrid_dir="" hybrid_entrypoint=""
+        hybrid_server="${LUCEBOX_HYBRID_SERVER_BIN:-}"
+        hybrid_ipc="${LUCEBOX_HYBRID_IPC_BIN:-}"
+        hybrid_dir="${LUCEBOX_HYBRID_DFLASH_DIR:-}"
+        hybrid_entrypoint="${LUCEBOX_HYBRID_ENTRYPOINT:-}"
+        if [ -z "$hybrid_entrypoint" ] && [ -n "$hybrid_dir" ]; then
+            hybrid_entrypoint="$hybrid_dir/scripts/entrypoint.sh"
+        fi
+        if ! _native_binary_ready "$hybrid_server" \
+           || ! _native_binary_ready "$hybrid_ipc" \
+           || [ ! -f "$hybrid_entrypoint" ]; then
+            hybrid_repo=$(_find_repo_root 2>/dev/null || true)
+            if [ -n "$hybrid_repo" ]; then
+                hybrid_server="$hybrid_repo/server/build-cuda/dflash_server"
+                hybrid_ipc="$hybrid_repo/server/build-hip/backend_ipc_daemon"
+                hybrid_dir="$hybrid_repo/server"
+                hybrid_entrypoint="$hybrid_dir/scripts/entrypoint.sh"
+            fi
+        fi
+        if ! _native_binary_ready "$hybrid_server" \
+           || ! _native_binary_ready "$hybrid_ipc" \
+           || [ ! -f "$hybrid_entrypoint" ]; then
+            hybrid_server="/opt/lucebox/runtime/cuda/dflash_server"
+            hybrid_ipc="/opt/lucebox/runtime/hip/backend_ipc_daemon"
+            hybrid_dir="/opt/lucebox/runtime/server"
+            hybrid_entrypoint="$hybrid_dir/scripts/entrypoint.sh"
+        fi
+        if _native_binary_ready "$hybrid_server" \
+           && _native_binary_ready "$hybrid_ipc" \
+           && [ -f "$hybrid_entrypoint" ]; then
+            LUCEBOX_HOST_HAS_HYBRID_RUNTIME=1
+            LUCEBOX_HOST_HYBRID_SERVER_BIN="$hybrid_server"
+            LUCEBOX_HOST_HYBRID_IPC_BIN="$hybrid_ipc"
+            LUCEBOX_HOST_HYBRID_DFLASH_DIR="$hybrid_dir"
+            LUCEBOX_HOST_HYBRID_ENTRYPOINT="$hybrid_entrypoint"
+        fi
     fi
 
     # OS / kernel identity. /etc/os-release is the freedesktop spec for
@@ -642,6 +744,12 @@ probe_host() {
     export LUCEBOX_HOST_NVIDIA_CTK_VERSION LUCEBOX_HOST_CPU_MODEL
     export LUCEBOX_HOST_GPU_LIST_CSV LUCEBOX_HOST_CUDA_VISIBLE_DEVICES
     export LUCEBOX_HOST_HIP_VISIBLE_DEVICES LUCEBOX_HOST_ROCR_VISIBLE_DEVICES
+    export LUCEBOX_HOST_NVIDIA_GPU_NAME LUCEBOX_HOST_NVIDIA_GPU_COUNT
+    export LUCEBOX_HOST_NVIDIA_VRAM_GB LUCEBOX_HOST_NVIDIA_GPU_ARCH
+    export LUCEBOX_HOST_NVIDIA_GPU_LIST_CSV
+    export LUCEBOX_HOST_HAS_HYBRID_RUNTIME
+    export LUCEBOX_HOST_HYBRID_SERVER_BIN LUCEBOX_HOST_HYBRID_IPC_BIN
+    export LUCEBOX_HOST_HYBRID_DFLASH_DIR LUCEBOX_HOST_HYBRID_ENTRYPOINT
     _LUCEBOX_HOST_PROBED=1
 }
 
@@ -935,6 +1043,127 @@ build_orchestrator_argv() {
 
 # ── subcommand implementations ────────────────────────────────────────────
 
+_config_requires_hybrid_runtime() {
+    local value target target_devices remote target_backend remote_backend
+    for value in \
+        "$(_lucebox_config_get placement.remote_draft)" \
+        "$(_lucebox_config_get placement.remote_target_shard)"; do
+        case "$value" in true|1|yes|on) return 0 ;; esac
+    done
+
+    remote=$(_lucebox_config_get placement.remote_expert_device)
+    [ -n "$remote" ] || return 1
+    target=$(_lucebox_config_get placement.target_device)
+    if [ -z "$target" ]; then
+        target_devices=$(_toml_array_to_csv \
+            "$(_lucebox_config_get placement.target_devices)")
+        target="${target_devices%%,*}"
+    fi
+    [ -n "$target" ] || return 1
+    target_backend="${target%%:*}"
+    remote_backend="${remote%%:*}"
+    [ "$target_backend" != "$remote_backend" ]
+}
+
+_validate_hybrid_profile() {
+    local target target_devices draft remote_expert value device
+    local remote_draft=0 remote_target=0 seen_remote=0
+    local hybrid_targets=()
+    target=$(_lucebox_config_get placement.target_device)
+    target_devices=$(_toml_array_to_csv \
+        "$(_lucebox_config_get placement.target_devices)")
+    if [ -z "$target" ]; then
+        target="${target_devices%%,*}"
+    fi
+    [[ "$target" =~ ^cuda:[0-9]+$ ]] \
+        || die "the installed hybrid runtime requires a CUDA target server (got '${target:-none}')"
+
+    value=$(_lucebox_config_get placement.remote_draft)
+    case "$value" in true|1|yes|on) remote_draft=1 ;; esac
+    value=$(_lucebox_config_get placement.remote_target_shard)
+    case "$value" in true|1|yes|on) remote_target=1 ;; esac
+
+    if [ "$remote_draft" = "1" ]; then
+        draft=$(_lucebox_config_get placement.draft_device)
+        [[ "$draft" =~ ^hip:[0-9]+$ ]] \
+            || die "the installed hybrid runtime requires the remote draft on HIP (got '${draft:-none}')"
+    fi
+
+    if [ "$remote_target" = "1" ]; then
+        [ -n "$target_devices" ] \
+            || die "remote target sharding requires placement.target_devices"
+        IFS=',' read -r -a hybrid_targets <<<"$target_devices"
+        for device in "${hybrid_targets[@]}"; do
+            if [[ "$device" =~ ^cuda:[0-9]+$ ]]; then
+                [ "$seen_remote" = "0" ] \
+                    || die "hybrid target devices must list CUDA shards before HIP shards"
+            elif [[ "$device" =~ ^hip:[0-9]+$ ]]; then
+                seen_remote=1
+            else
+                die "bad hybrid target device '$device'"
+            fi
+        done
+        [ "$seen_remote" = "1" ] \
+            || die "remote target sharding requires at least one HIP shard"
+    fi
+
+    remote_expert=$(_lucebox_config_get placement.remote_expert_device)
+    if [ -n "$remote_expert" ] \
+       && [ "${remote_expert%%:*}" != "${target%%:*}" ]; then
+        [[ "$remote_expert" =~ ^hip:[0-9]+$ ]] \
+            || die "the installed hybrid runtime requires remote Spark experts on HIP (got '$remote_expert')"
+    fi
+}
+
+cmd_hybrid_serve() {
+    ensure_probed
+    [ "$LUCEBOX_HOST_HAS_HYBRID_RUNTIME" = "1" ] \
+        || die "this profile needs the paired CUDA + HIP runtime, but it is not installed"
+    [ -x "$LUCEBOX_HOST_HYBRID_SERVER_BIN" ] \
+        || die "hybrid server is missing: $LUCEBOX_HOST_HYBRID_SERVER_BIN"
+    [ -x "$LUCEBOX_HOST_HYBRID_IPC_BIN" ] \
+        || die "hybrid backend daemon is missing: $LUCEBOX_HOST_HYBRID_IPC_BIN"
+    [ -f "$LUCEBOX_HOST_HYBRID_ENTRYPOINT" ] \
+        || die "hybrid runtime entrypoint is missing: $LUCEBOX_HOST_HYBRID_ENTRYPOINT"
+    _validate_hybrid_profile
+
+    if [ -z "${INVOCATION_ID:-}" ] \
+       && systemctl --user is-active --quiet "$UNIT_NAME" 2>/dev/null; then
+        die "$UNIT_NAME is already running; use '$SCRIPT_NAME restart' or '$SCRIPT_NAME logs'"
+    fi
+    if _lucebox_container_running; then
+        die "container '$CONTAINER_NAME' is already running; stop it before starting the hybrid runtime"
+    fi
+
+    local selected=() target draft model_id
+    mapfile -t selected < <(_selected_model_paths)
+    target="${selected[0]:-}"
+    draft="${selected[1]:-none}"
+    model_id="${selected[2]:-lucebox}"
+    _model_artifact_ready "$target" \
+        || die "selected target is not installed: $target — run '$SCRIPT_NAME models select'"
+    if [ "$draft" != "none" ] && ! _model_artifact_ready "$draft"; then
+        die "selected draft is not installed: $draft — run '$SCRIPT_NAME models select'"
+    fi
+
+    _export_native_config
+    export DFLASH_DIR="$LUCEBOX_HOST_HYBRID_DFLASH_DIR"
+    export DFLASH_SERVER_BIN="$LUCEBOX_HOST_HYBRID_SERVER_BIN"
+    export DFLASH_BACKEND_IPC_BIN="$LUCEBOX_HOST_HYBRID_IPC_BIN"
+    export DFLASH_TARGET="$target"
+    if [ "$draft" = "none" ]; then
+        export DFLASH_DRAFT="$DEFAULT_MODELS_DIR/.lucebox-no-draft"
+    else
+        export DFLASH_DRAFT="$draft"
+    fi
+    export DFLASH_HOST="${LUCEBOX_NATIVE_HOST:-127.0.0.1}"
+    export DFLASH_PORT="$DEFAULT_PORT"
+    export DFLASH_MODEL_NAME="$model_id"
+    export LUCEBOX_NATIVE=1
+    info "Starting topology-aware CUDA + HIP engine at http://$DFLASH_HOST:$DFLASH_PORT"
+    exec bash "$LUCEBOX_HOST_HYBRID_ENTRYPOINT" serve
+}
+
 cmd_serve() {
     # Long-running foreground server. Also what systemd's ExecStart= calls.
     #
@@ -950,6 +1179,10 @@ cmd_serve() {
     ensure_probed
     local variant
     variant=$(pick_variant)
+    if _config_requires_hybrid_runtime; then
+        cmd_hybrid_serve
+        return $?
+    fi
     require_host_prereqs "$variant"
     require_ctk "$variant"
 
@@ -1091,12 +1324,33 @@ _serve_and_track() {
 
 cmd_systemd_install() {
     ensure_probed
-    local variant
+    local variant unit_after unit_wants unit_pre="" unit_stop="" unit_hybrid_env=""
     variant=$(pick_variant)
-    require_host_prereqs "$variant"
     require_systemd "service install"
-    local docker_bin
-    docker_bin=$(command -v docker)
+    unit_after="network-online.target"
+    unit_wants="network-online.target"
+    if _config_requires_hybrid_runtime; then
+        [ "$LUCEBOX_HOST_HAS_HYBRID_RUNTIME" = "1" ] \
+            || die "install the paired CUDA + HIP runtime before enabling this profile"
+        _validate_hybrid_profile
+        # A contributor build may live in a checkout that systemd cannot
+        # rediscover from its working directory. Persist the already-validated
+        # executable contract in the unit; factory installs use the same lines
+        # with their stable /opt/lucebox/runtime paths.
+        unit_hybrid_env=$(printf '%s\n%s\n%s\n%s' \
+            "Environment=LUCEBOX_HYBRID_SERVER_BIN=$LUCEBOX_HOST_HYBRID_SERVER_BIN" \
+            "Environment=LUCEBOX_HYBRID_IPC_BIN=$LUCEBOX_HOST_HYBRID_IPC_BIN" \
+            "Environment=LUCEBOX_HYBRID_DFLASH_DIR=$LUCEBOX_HOST_HYBRID_DFLASH_DIR" \
+            "Environment=LUCEBOX_HYBRID_ENTRYPOINT=$LUCEBOX_HOST_HYBRID_ENTRYPOINT")
+    else
+        require_host_prereqs "$variant"
+        local docker_bin
+        docker_bin=$(command -v docker)
+        unit_after+=" docker.service"
+        unit_wants+=" docker.service"
+        unit_pre="ExecStartPre=-$docker_bin rm -f $CONTAINER_NAME"
+        unit_stop="ExecStop=$docker_bin stop -t 30 $CONTAINER_NAME"
+    fi
 
     mkdir -p "$(dirname "$UNIT_PATH")"
     # Capture the user's resolved env at install time so the unit launches
@@ -1106,25 +1360,22 @@ cmd_systemd_install() {
     # in-script defaults and silently pick a different image or models
     # directory than the user's interactive session uses.
     #
-    # ExecStartPre cleans up any orphaned container with the target name
-    # left behind by a previous crash (docker's `--rm` only fires on clean
-    # exit — a SIGKILL or daemon restart leaves the name claimed, and the
-    # next ExecStart would die with "name already in use" while systemd
-    # reports a useless "exit code 125").
+    # Docker profiles add an ExecStartPre cleanup for an orphaned container
+    # name. Native hybrid profiles intentionally leave both Docker directives
+    # empty because their server process is owned directly by systemd.
     cat > "$UNIT_PATH" <<EOF
 [Unit]
 Description=Lucebox hub LLM inference server
 Documentation=https://github.com/Luce-Org/lucebox-hub
-After=network-online.target docker.service
-Wants=network-online.target docker.service
+After=$unit_after
+Wants=$unit_wants
 
 [Service]
 Type=exec
 Restart=on-failure
 RestartSec=10
-# \`serve\` traps SIGTERM, stops the container, and exits 143 (128+SIGTERM).
-# Without this, a normal \`systemctl stop\` leaves the unit "failed" instead of
-# "inactive". Genuine crashes exit with other codes and still trip Restart.
+# A normal SIGTERM may surface as 143 after transport-specific cleanup. Treat
+# that as a clean stop; genuine crashes still use other codes and trip Restart.
 SuccessExitStatus=143 SIGTERM
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=LUCEBOX_IMAGE=$IMAGE_BASE
@@ -1133,9 +1384,10 @@ Environment=LUCEBOX_PORT=$DEFAULT_PORT
 Environment=LUCEBOX_CONTAINER=$CONTAINER_NAME
 Environment=LUCEBOX_MODELS=$DEFAULT_MODELS_DIR
 Environment=LUCEBOX_HOME=$CONFIG_HOME
-ExecStartPre=-$docker_bin rm -f $CONTAINER_NAME
+$unit_hybrid_env
+$unit_pre
 ExecStart=$SCRIPT_PATH serve
-ExecStop=$docker_bin stop -t 30 $CONTAINER_NAME
+$unit_stop
 TimeoutStopSec=45
 
 [Install]
@@ -1338,6 +1590,33 @@ _native_build_dir() {
     else
         printf '%s/server/build-cuda' "$repo"
     fi
+}
+
+_nvidia_build_arches() {
+    printf '%s\n' "${LUCEBOX_HOST_NVIDIA_GPU_LIST_CSV:-}" | awk -F',' '
+        {
+            arch = $5
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", arch)
+            gsub(/[.]/, "", arch)
+            if (arch ~ /^[0-9]+$/ && !seen[arch]++) {
+                out = out (out ? ";" : "") arch
+            }
+        }
+        END { print out }
+    '
+}
+
+_amd_build_arches() {
+    printf '%s\n' "${LUCEBOX_HOST_AMD_GPU_LIST_CSV:-}" | awk -F',' '
+        {
+            arch = $5
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", arch)
+            if (arch ~ /^gfx[0-9a-z]+$/ && !seen[arch]++) {
+                out = out (out ? ";" : "") arch
+            }
+        }
+        END { print out }
+    '
 }
 
 _safe_model_relative_path() {
@@ -1961,28 +2240,49 @@ EOF
     exec "${CONNECTOR_LAUNCH_ARGV[@]}"
 }
 
+_toml_array_to_csv() {
+    # Config arrays written by tomli_w contain only validated device names or
+    # finite positive numbers. Strip TOML punctuation for the engine's comma-
+    # separated CLI flags without evaluating the value as shell code.
+    printf '%s' "$1" | tr -d '[]"[:space:]' | sed 's/,$//'
+}
+
 _export_native_config() {
-    local key env_name value
-    if [ -n "${LUCEBOX_HOST_ROCR_VISIBLE_DEVICES:-}" ]; then
-        export ROCR_VISIBLE_DEVICES="$LUCEBOX_HOST_ROCR_VISIBLE_DEVICES"
-        unset HIP_VISIBLE_DEVICES
-    elif [ -n "${LUCEBOX_HOST_HIP_VISIBLE_DEVICES:-}" ]; then
-        export HIP_VISIBLE_DEVICES="$LUCEBOX_HOST_HIP_VISIBLE_DEVICES"
-        unset ROCR_VISIBLE_DEVICES
-    fi
-    if [ -n "${LUCEBOX_HOST_CUDA_VISIBLE_DEVICES:-}" ]; then
-        export CUDA_VISIBLE_DEVICES="$LUCEBOX_HOST_CUDA_VISIBLE_DEVICES"
+    local key env_name value target_device target_devices
+    target_device=$(_lucebox_config_get placement.target_device)
+    target_devices=$(_lucebox_config_get placement.target_devices)
+    # A resolved placement uses physical device indexes and therefore needs the
+    # complete backend inventory. Legacy configs without [placement] retain the
+    # wrapper's historical primary-device isolation.
+    if [ -n "$target_device" ] || [ -n "$target_devices" ]; then
+        unset ROCR_VISIBLE_DEVICES HIP_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES
+    else
+        if [ -n "${LUCEBOX_HOST_ROCR_VISIBLE_DEVICES:-}" ]; then
+            export ROCR_VISIBLE_DEVICES="$LUCEBOX_HOST_ROCR_VISIBLE_DEVICES"
+            unset HIP_VISIBLE_DEVICES
+        elif [ -n "${LUCEBOX_HOST_HIP_VISIBLE_DEVICES:-}" ]; then
+            export HIP_VISIBLE_DEVICES="$LUCEBOX_HOST_HIP_VISIBLE_DEVICES"
+            unset ROCR_VISIBLE_DEVICES
+        fi
+        if [ -n "${LUCEBOX_HOST_CUDA_VISIBLE_DEVICES:-}" ]; then
+            export CUDA_VISIBLE_DEVICES="$LUCEBOX_HOST_CUDA_VISIBLE_DEVICES"
+        fi
     fi
     while IFS='|' read -r key env_name; do
         [ -n "$key" ] || continue
         value=$(_lucebox_config_get "$key")
         [ -n "$value" ] || continue
         case "$key" in
-            dflash.speculative_decode|dflash.lazy|dflash.spark|dflash.debug_thinking_logits)
+            dflash.speculative_decode|dflash.lazy|dflash.spark|\
+            dflash.debug_thinking_logits|placement.remote_draft|\
+            placement.remote_target_shard|placement.peer_access)
                 case "$value" in
                     true|1|yes|on) value=1 ;;
                     *)             value=0 ;;
                 esac
+                ;;
+            placement.target_devices|placement.target_layer_split)
+                value=$(_toml_array_to_csv "$value")
                 ;;
             dflash.prefill_drafter)
                 case "$value" in
@@ -2015,21 +2315,50 @@ dflash.think_max|DFLASH_THINK_MAX
 dflash.fa_window|DFLASH_FA_WINDOW
 dflash.think_soft_close_min_ratio|DFLASH_THINK_SOFT_CLOSE_MIN_RATIO
 dflash.debug_thinking_logits|DFLASH_DEBUG_THINKING_LOGITS
+placement.mode|DFLASH_PLACEMENT_MODE
+placement.target_device|DFLASH_TARGET_DEVICE
+placement.target_devices|DFLASH_TARGET_DEVICES
+placement.target_layer_split|DFLASH_TARGET_LAYER_SPLIT
+placement.draft_device|DFLASH_DRAFT_DEVICE
+placement.remote_draft|DFLASH_REMOTE_DRAFT
+placement.remote_target_shard|DFLASH_REMOTE_TARGET_SHARD
+placement.peer_access|DFLASH_PEER_ACCESS
+placement.remote_expert_device|DFLASH_REMOTE_EXPERT_DEVICE
 EOF
 }
 
 cmd_native_build() {
-    local repo backend build_dir jobs hip_wmma=OFF
+    local requested="${1:-}" repo backend build_dir jobs hip_wmma=OFF build_arches
+    if [ "$requested" = "hybrid" ]; then
+        [ -z "${LUCEBOX_BUILD_DIR:-}" ] \
+            || die "LUCEBOX_BUILD_DIR cannot be shared by a hybrid build"
+        ensure_probed
+        [ "$LUCEBOX_HOST_HAS_NVIDIA_GPU" = "1" ] \
+            && [ "$LUCEBOX_HOST_HAS_AMD_GPU" = "1" ] \
+            || die "hybrid build requires both NVIDIA and AMD GPUs"
+        cmd_native_build cuda
+        cmd_native_build rocm
+        _LUCEBOX_HOST_PROBED=0
+        ensure_probed
+        [ "$LUCEBOX_HOST_HAS_HYBRID_RUNTIME" = "1" ] \
+            || die "both builds completed, but the paired runtime contract is incomplete"
+        ok "Hybrid CUDA + HIP runtime ready"
+        return 0
+    fi
     repo=$(_find_repo_root) \
         || die "native build requires a lucebox repository checkout (cd into it or set LUCEBOX_REPO)"
     ensure_probed
-    backend=$(_native_backend "${1:-}")
+    backend=$(_native_backend "$requested")
     build_dir=$(_native_build_dir "$repo" "$backend")
     command -v cmake >/dev/null 2>&1 || die "cmake is required to build the inference engine"
     [ -f "$repo/server/deps/llama.cpp/ggml/CMakeLists.txt" ] \
         || die "git submodules are missing — run: git -C '$repo' submodule update --init --recursive"
 
-    local configure=(cmake -S "$repo/server" -B "$build_dir" -DCMAKE_BUILD_TYPE=Release)
+    local configure=(
+        cmake -S "$repo/server" -B "$build_dir"
+        -DCMAKE_BUILD_TYPE=Release
+        -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON
+    )
     if [ "$backend" = "rocm" ]; then
         [ "$LUCEBOX_HOST_HAS_AMD_GPU" = "1" ] \
             || die "ROCm native build selected but no AMD GPU was detected"
@@ -2037,33 +2366,99 @@ cmd_native_build() {
            || [ -f /usr/include/rocwmma/rocwmma.hpp ]; then
             hip_wmma=ON
         fi
+        build_arches=$(_amd_build_arches)
+        build_arches="${build_arches:-${LUCEBOX_HOST_AMD_GPU_ARCH:-gfx1151}}"
         configure+=(
             -DDFLASH27B_GPU_BACKEND=hip
-            "-DDFLASH27B_HIP_ARCHITECTURES=${LUCEBOX_HOST_AMD_GPU_ARCH:-gfx1151}"
+            "-DDFLASH27B_HIP_ARCHITECTURES=$build_arches"
             "-DDFLASH27B_HIP_SM80_EQUIV=$hip_wmma"
         )
     else
         [ "$LUCEBOX_HOST_HAS_NVIDIA_GPU" = "1" ] \
             || die "CUDA native build selected but no NVIDIA GPU was detected"
         configure+=(-DDFLASH27B_GPU_BACKEND=cuda)
-        if [[ "$LUCEBOX_HOST_GPU_SM" =~ ^[0-9]+$ ]]; then
-            configure+=("-DCMAKE_CUDA_ARCHITECTURES=$LUCEBOX_HOST_GPU_SM")
+        build_arches=$(_nvidia_build_arches)
+        build_arches="${build_arches:-${LUCEBOX_HOST_NVIDIA_GPU_ARCH:-$LUCEBOX_HOST_GPU_SM}}"
+        if [[ "$build_arches" =~ ^[0-9]+([;][0-9]+)*$ ]]; then
+            configure+=("-DCMAKE_CUDA_ARCHITECTURES=$build_arches")
         fi
     fi
     info "Configuring native $backend build in $build_dir"
     "${configure[@]}"
     jobs="${LUCEBOX_HOST_NPROC:-1}"
     [ "$jobs" -gt 0 ] 2>/dev/null || jobs=1
-    info "Building dflash_server ($jobs jobs)"
-    cmake --build "$build_dir" --target dflash_server -j "$jobs"
+    info "Building dflash_server + backend_ipc_daemon ($jobs jobs)"
+    cmake --build "$build_dir" \
+        --target dflash_server backend_ipc_daemon -j "$jobs"
     ok "Native engine ready: $build_dir/dflash_server"
+    ok "Backend companion ready: $build_dir/backend_ipc_daemon"
+}
+
+cmd_package_runtime() {
+    local repo destination stage runtime_dir backend build_dir package_backend
+    repo=$(_find_repo_root) \
+        || die "runtime packaging requires a lucebox repository checkout"
+    destination="${1:-$repo/dist/lucebox-runtime}"
+    case "$destination" in
+        ""|/|"$repo") die "refusing unsafe runtime package destination: $destination" ;;
+    esac
+    [ ! -e "$destination" ] \
+        || die "runtime package destination already exists: $destination"
+
+    for backend in cuda rocm; do
+        build_dir=$(_native_build_dir "$repo" "$backend")
+        [ -x "$build_dir/dflash_server" ] \
+            || die "missing $backend server — run '$SCRIPT_NAME build hybrid' first"
+        [ -x "$build_dir/backend_ipc_daemon" ] \
+            || die "missing $backend companion — run '$SCRIPT_NAME build hybrid' first"
+    done
+
+    stage=$(mktemp -d -t lucebox-runtime.XXXXXX) \
+        || die "could not create runtime staging directory"
+    trap 'if [ -n "${stage:-}" ] && [ -d "$stage" ]; then rm -rf -- "$stage"; fi' EXIT
+    runtime_dir="$stage/lucebox-runtime"
+    mkdir -p "$runtime_dir/cuda" "$runtime_dir/hip" \
+        "$runtime_dir/server/scripts" "$runtime_dir/server/share"
+
+    for backend in cuda rocm; do
+        build_dir=$(_native_build_dir "$repo" "$backend")
+        package_backend="$backend"
+        [ "$backend" = "rocm" ] && package_backend=hip
+        cp "$build_dir/dflash_server" "$runtime_dir/$package_backend/"
+        cp "$build_dir/backend_ipc_daemon" "$runtime_dir/$package_backend/"
+        if [ -d "$build_dir/deps" ]; then
+            cp -R "$build_dir/deps" "$runtime_dir/$package_backend/deps"
+            find "$runtime_dir/$package_backend/deps" -type f \
+                ! -name 'lib*.so*' -delete
+            find "$runtime_dir/$package_backend/deps" -depth -type d \
+                -empty -delete
+        fi
+    done
+    cp "$repo/server/scripts/entrypoint.sh" "$runtime_dir/server/scripts/"
+    cp -R "$repo/server/share/." "$runtime_dir/server/share/"
+    printf 'source_commit=%s\ncreated_at=%s\n' \
+        "$(git -C "$repo" rev-parse HEAD 2>/dev/null || printf unknown)" \
+        "$(date -u +%FT%TZ 2>/dev/null || printf unknown)" \
+        > "$runtime_dir/MANIFEST"
+
+    mkdir -p "$(dirname "$destination")"
+    mv "$runtime_dir" "$destination"
+    rmdir "$stage" 2>/dev/null || true
+    stage=""
+    trap - EXIT
+    ok "Paired native runtime packaged: $destination"
+    hint "Factory install location: /opt/lucebox/runtime"
 }
 
 cmd_native_serve() {
     local repo backend build_dir binary selected=() target draft model_id
+    ensure_probed
+    if _config_requires_hybrid_runtime; then
+        cmd_hybrid_serve
+        return $?
+    fi
     repo=$(_find_repo_root) \
         || die "native run requires a lucebox repository checkout (cd into it or set LUCEBOX_REPO)"
-    ensure_probed
     backend=$(_native_backend "${1:-}")
     build_dir=$(_native_build_dir "$repo" "$backend")
     binary="$build_dir/dflash_server"
@@ -2082,6 +2477,7 @@ cmd_native_serve() {
     _export_native_config
     export DFLASH_DIR="$repo/server"
     export DFLASH_SERVER_BIN="$binary"
+    export DFLASH_BACKEND_IPC_BIN="$build_dir/backend_ipc_daemon"
     export DFLASH_TARGET="$target"
     if [ "$draft" = "none" ]; then
         export DFLASH_DRAFT="$DEFAULT_MODELS_DIR/.lucebox-no-draft"
@@ -2127,6 +2523,9 @@ EOF
     script="$repo/harness/clients/run_${name}.sh"
     [ -x "$script" ] || die "harness launcher is missing: $script"
     ensure_probed
+    if _config_requires_hybrid_runtime; then
+        die "this profile uses the paired CUDA + HIP runtime; start it with '$SCRIPT_NAME native', then connect the harness with '$SCRIPT_NAME connect $name'"
+    fi
     backend=$(_native_backend "${LUCEBOX_HARNESS_BACKEND:-}")
     build_dir=$(_native_build_dir "$repo" "$backend")
     binary="$build_dir/dflash_server"
@@ -2252,7 +2651,7 @@ _lucebox_complete() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
     cmds="menu setup connect install uninstall start stop restart enable disable status logs \
-          serve build native harness pull update check completion config models \
+          serve build package-runtime native harness pull update check completion config models \
           optimize print-run help version"
     config_verbs="get set unset"
     models_verbs="list download select"
@@ -2296,7 +2695,7 @@ ZSH
 #   lucebox completion fish | source
 complete -c lucebox -f
 set -l __lucebox_cmds menu setup connect install uninstall start stop restart enable disable \
-    status logs serve build native harness pull update check completion config models \
+    status logs serve build package-runtime native harness pull update check completion config models \
     optimize print-run help version
 for cmd in $__lucebox_cmds
     complete -c lucebox -n "not __fish_seen_subcommand_from $__lucebox_cmds" -a $cmd
@@ -2393,7 +2792,7 @@ cmd_check() {
         if [ "$LUCEBOX_HOST_AMD_GPU_COUNT" -gt 1 ]; then
             local selected_device
             selected_device="${LUCEBOX_HOST_ROCR_VISIBLE_DEVICES:-${LUCEBOX_HOST_HIP_VISIBLE_DEVICES:-0}}"
-            _row warn "gpu placement" "primary device ${selected_device}; multi-GPU sharding is not automatic"
+            _row 1 "gpu placement" "Automatic resolves single- or multi-GPU execution after model selection (primary ${selected_device})"
         fi
         local amd_line amd_device_idx amd_device_name amd_device_arch amd_device_mem
         while IFS= read -r amd_line; do
@@ -2740,6 +3139,7 @@ cmd_developer_menu() {
         printf '  1  Build the native inference engine\n'
         printf '  2  Run the native inference engine\n'
         printf '  3  Choose and run a client harness\n'
+        printf '  4  Package the CUDA + HIP buyer runtime\n'
         printf '  b  Back\n\n'
         printf 'Choose: '
         IFS= read -r choice || return 0
@@ -2747,8 +3147,9 @@ cmd_developer_menu() {
             1) _menu_run build; _menu_pause ;;
             2) _menu_run native; _menu_pause ;;
             3) _menu_run harness; _menu_pause ;;
+            4) _menu_run package-runtime; _menu_pause ;;
             b|B|q|Q) return 0 ;;
-            *) warn "Choose 1–3 or b"; _menu_pause ;;
+            *) warn "Choose 1–4 or b"; _menu_pause ;;
         esac
     done
 }
@@ -2799,8 +3200,29 @@ _optimization_summary() {
     printf '%s (%s)' "$mode" "${active:-standard engine}"
 }
 
+_placement_summary() {
+    local mode target targets draft remote_expert
+    mode=$(_lucebox_config_get placement.mode)
+    target=$(_lucebox_config_get placement.target_device)
+    targets=$(_toml_array_to_csv \
+        "$(_lucebox_config_get placement.target_devices)")
+    draft=$(_lucebox_config_get placement.draft_device)
+    remote_expert=$(_lucebox_config_get placement.remote_expert_device)
+    if [ -n "$remote_expert" ]; then
+        printf '%s + %s Spark experts' "${target:-$targets}" "$remote_expert"
+    elif [ -n "$draft" ]; then
+        printf '%s + %s draft/scorer' "${target:-$targets}" "$draft"
+    elif [ -n "$targets" ]; then
+        printf '%s target split' "$targets"
+    elif [ -n "$target" ]; then
+        printf '%s' "$target"
+    else
+        printf '%s' "${mode:-server default}"
+    fi
+}
+
 cmd_menu() {
-    local choice model variant state repo_hint optimization gpu_name gpu_count other_gpu
+    local choice model variant state repo_hint optimization placement gpu_name gpu_count other_gpu
     local connector connector_label
     while true; do
         ensure_probed
@@ -2809,6 +3231,7 @@ cmd_menu() {
         variant=$(pick_variant)
         state=$(_engine_state)
         optimization=$(_optimization_summary)
+        placement=$(_placement_summary)
         gpu_name="${LUCEBOX_HOST_GPU_NAME:-not detected}"
         gpu_count="$LUCEBOX_HOST_GPU_COUNT"
         other_gpu=""
@@ -2849,6 +3272,7 @@ cmd_menu() {
         printf '  Backend:      %s\n' "$variant"
         printf '  Model:        %s\n' "$model"
         printf '  Optimization: %s\n' "$optimization"
+        printf '  Execution:    %s\n' "$placement"
         printf '  Engine:       %s\n' "$state"
         printf '  Harness:      %s\n\n' "$connector_label"
 
@@ -2915,7 +3339,10 @@ Direct server invocation (foreground, no systemd):
   serve                 docker run the server in the foreground
 
 Contributor workflow (inside a repository checkout):
-  build [cuda|rocm]     build the native dflash_server
+  build [cuda|rocm]     build one native backend and its IPC companion
+  build hybrid         build the paired CUDA + HIP runtime
+  package-runtime [dir]
+                        stage a relocatable factory runtime (default: dist/)
   native [cuda|rocm]    run the selected model with the native engine
   harness [name]        run Claude, Codex, OpenCode, Hermes, Pi, OpenClaw,
                         or Open WebUI against the native engine
@@ -3007,6 +3434,7 @@ main() {
 
         # Native source-repository workflow.
         build)            cmd_native_build "$@" ;;
+        package-runtime)  cmd_package_runtime "$@" ;;
         native)           cmd_native_serve "$@" ;;
         harness)          cmd_harness "$@" ;;
 
