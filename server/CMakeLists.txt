@@ -237,6 +237,7 @@ set(DFLASH27B_SRC_INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen3
     ${CMAKE_CURRENT_SOURCE_DIR}/src/gemma4
     ${CMAKE_CURRENT_SOURCE_DIR}/src/deepseek4
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/kimi_k3
     ${CMAKE_CURRENT_SOURCE_DIR}/src/server
 )
 
@@ -269,6 +270,10 @@ add_library(dflash_common STATIC
     src/deepseek4/deepseek4_target_shard_ipc_daemon.cpp
     src/deepseek4/deepseek4_dspark.cpp
     src/deepseek4/deepseek4_dspark_spec.cpp
+    # Kimi-K3 hybrid KDA/MLA + latent-MoE target arch
+    src/kimi_k3/kimi_k3_loader.cpp
+    src/kimi_k3/kimi_k3_graph.cpp
+    src/kimi_k3/kimi_k3_backend.cpp
     src/flashprefill_q8.cpp
     src/kv_cache.cpp
     src/kv_quant.cpp
@@ -987,6 +992,17 @@ if(DFLASH27B_TESTS)
         add_executable(smoke_qwen3_forward test/smoke_qwen3_forward.cpp)
         target_include_directories(smoke_qwen3_forward PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         target_link_libraries(smoke_qwen3_forward PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_kimi_k3_forward.cpp")
+        add_executable(smoke_kimi_k3_forward test/smoke_kimi_k3_forward.cpp)
+        target_include_directories(smoke_kimi_k3_forward PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        target_link_libraries(smoke_kimi_k3_forward PRIVATE
+            dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            target_link_libraries(smoke_kimi_k3_forward PRIVATE CUDA::cudart)
+        else()
+            target_link_libraries(smoke_kimi_k3_forward PRIVATE hip::host)
+        endif()
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_vs_oracle.cpp")
         add_executable(test_vs_oracle test/test_vs_oracle.cpp)

@@ -13,6 +13,7 @@
 #include "gemma4_layer_split_adapter.h"
 #include "deepseek4_backend.h"
 #include "deepseek4_layer_split_adapter.h"
+#include "kimi_k3_backend.h"
 #include "layer_split_backend.h"
 #include "qwen35_layer_split_adapter.h"
 
@@ -94,6 +95,7 @@ DFLASH_CHECK_ARCH("laguna",    LagunaBackendArgs,     LagunaLayerSplitAdapterCon
 DFLASH_CHECK_ARCH("qwen3",     Qwen3BackendConfig,    NoLayerSplitConfig);
 DFLASH_CHECK_ARCH("gemma4",    Gemma4BackendConfig,   Gemma4LayerSplitAdapterConfig);
 DFLASH_CHECK_ARCH("deepseek4", DeepSeek4BackendConfig, DeepSeek4LayerSplitAdapterConfig);
+DFLASH_CHECK_ARCH("kimi-k3",   KimiK3BackendConfig,    NoLayerSplitConfig);
 
 #undef DFLASH_CHECK_ARCH
 #undef DFLASH_CHECK_ARCH_OPTION
@@ -432,6 +434,19 @@ std::unique_ptr<ModelBackend> create_backend(
         auto backend = std::make_unique<LayerSplitBackend>(std::move(adapter));
         if (!backend->init()) {
             std::fprintf(stderr, "[backend_factory] LayerSplitBackend(deepseek4) init failed\n");
+            return nullptr;
+        }
+        return backend;
+
+    } else if (arch == "kimi-k3") {
+        KimiK3BackendConfig cfg;
+        cfg.model_path = args.model_path;
+        cfg.device = args.device;
+        cfg.stream_fd = args.stream_fd;
+
+        auto backend = std::make_unique<KimiK3Backend>(cfg);
+        if (!backend->init()) {
+            std::fprintf(stderr, "[backend_factory] KimiK3Backend init failed\n");
             return nullptr;
         }
         return backend;

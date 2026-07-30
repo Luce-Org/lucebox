@@ -265,9 +265,9 @@ static void test_feature_gate_layer_split_requires_supported_arch() {
     for (const char * arch : {"qwen35", "laguna", "gemma4", "deepseek4"}) {
         TEST_ASSERT(gate_result(args, arch, PlacementBackend::Cuda).empty());
     }
-    // These two do not: the factory would hand the split placement to a
+    // These do not: the factory would hand the split placement to a
     // monolithic backend, which reads only the primary GPU.
-    for (const char * arch : {"qwen35moe", "qwen3"}) {
+    for (const char * arch : {"qwen35moe", "qwen3", "kimi-k3"}) {
         TEST_ASSERT(!gate_result(args, arch, PlacementBackend::Cuda).empty());
     }
 
@@ -276,6 +276,7 @@ static void test_feature_gate_layer_split_requires_supported_arch() {
     single.model_path = "/nonexistent/model.gguf";
     TEST_ASSERT(gate_result(single, "qwen35moe", PlacementBackend::Cuda).empty());
     TEST_ASSERT(gate_result(single, "qwen3", PlacementBackend::Cuda).empty());
+    TEST_ASSERT(gate_result(single, "kimi-k3", PlacementBackend::Cuda).empty());
 }
 
 // ── Inert-flag warnings ─────────────────────────────────────────────────
@@ -316,9 +317,10 @@ static void test_feature_warnings_report_inert_draft() {
     args.model_path = "/nonexistent/model.gguf";
     args.draft_path = "/nonexistent/draft.gguf";
 
-    // qwen3 and deepseek4 never forward a draft model.
+    // These native AR backends never forward a draft model.
     TEST_ASSERT(warns_about(warn_result(args, "qwen3"), "--draft"));
     TEST_ASSERT(warns_about(warn_result(args, "deepseek4"), "--draft"));
+    TEST_ASSERT(warns_about(warn_result(args, "kimi-k3"), "--draft"));
     // laguna and gemma4 forward it only when monolithic.
     TEST_ASSERT(!warns_about(warn_result(args, "laguna"), "--draft"));
     TEST_ASSERT(!warns_about(warn_result(args, "gemma4"), "--draft"));
@@ -380,7 +382,7 @@ static void test_model_capability_tables() {
 
     // arch_is_supported() must match create_backend()'s dispatch chain.
     for (const char * arch : {"qwen35", "qwen35moe", "laguna",
-                              "qwen3", "gemma4", "deepseek4"}) {
+                              "qwen3", "gemma4", "deepseek4", "kimi-k3"}) {
         TEST_ASSERT(arch_is_supported(arch));
     }
     TEST_ASSERT(!arch_is_supported(""));
@@ -392,6 +394,7 @@ static void test_model_capability_tables() {
     TEST_ASSERT(!arch_has_expert_offload("qwen35"));
     // deepseek4 is mixture-of-experts but has no hot/cold offload path.
     TEST_ASSERT(!arch_has_expert_offload("deepseek4"));
+    TEST_ASSERT(!arch_has_expert_offload("kimi-k3"));
 
     // Every capability predicate must be false for an architecture the
     // factory cannot build, so no rule can admit an unbuildable model.
