@@ -18,13 +18,16 @@ missing without making the scheduler Kimi-specific:
 - The common streamed graph supports SiTU as well as SwiGLU and DS4's clamped
   SwiGLU.
 - `bench_kimi_k3_hetero` runs Kimi's exact IQ1_S routed-expert geometry through
-  a reusable graph: 896 experts, top-16, 92 MoE layers,
+  the same model-neutral persistent evaluator used by production adapters:
+  896 experts, top-16, 92 MoE layers,
   `3584 -> 3072 -> 3584`, and SiTU (`beta=4`, `linear_beta=25`). It overlaps
   SSD/H2D for expert N+1 with compute for expert N.
 
-Six scheduler tests pass on the AMD Lucebox, including mmap and real-file
-multi-shard reads. Existing single-file DS4 descriptors remain source index
-zero and need no model-specific change.
+Seven scheduler tests pass on the AMD Lucebox, including expert-major one-read
+records, mmap, and real-file multi-shard reads. A separate numerical test
+matches both tensor-major and expert-major streamed GPU execution against a
+CPU oracle on gfx1151 and gfx1201. Existing single-file DS4 descriptors remain
+source index zero and need no model-specific change.
 
 This is not yet a complete Kimi K3 backend. KDA/MLA, Attention Residuals, the
 vision encoder, the latent projections around the routed core, tokenizer, and
@@ -67,16 +70,17 @@ the byte values do not affect transfer volume or kernel shape.
 
 | Owner of streamed experts | Scenario | Pipeline | Routed-core rate |
 |---|---|---:|---:|
-| Strix Halo | 3 tokens, balanced cold routes, compute on | **3.716 GiB/s** | **0.420 token/s** |
+| Strix Halo | 3 tokens, balanced cold routes, common evaluator | **3.804 GiB/s** | **0.430 token/s** |
 | R9700 | 1 token, balanced cold routes, compute on | 2.091 GiB/s | 0.236 token/s |
 | Strix Halo | 2 tokens, 10 GiB cache, unrelated routes | 3.638 GiB/s, 0.82% hits | 0.415 token/s |
 | Strix Halo | 2 tokens, 10 GiB cache, identical routes | 3.557 GiB/s, 50% aggregate hits | 0.804 token/s |
 
-The sustained Strix run moved 26.531982 GiB in 7.139575 seconds, evaluated
-4,416 routed experts, and reported zero I/O errors. Adding the exact expert
-math did not reduce the cold result materially: compute is hidden behind the
-8.84 GiB/token storage path. The R9700 is the wrong cold owner because the
-extra discrete-GPU upload path cuts end-to-end throughput.
+The sustained Strix run moved 26.531982 GiB in 6.974184 seconds, evaluated
+4,416 routed experts with one graph build and 4,415 graph-cache hits, and
+reported zero I/O errors. Adding the exact expert math did not reduce the cold
+result materially: compute is hidden behind the 8.84 GiB/token storage path.
+The R9700 is the wrong cold owner because the extra discrete-GPU upload path
+cuts end-to-end throughput.
 
 The repeated-route result is deliberately a best case, not a prediction.
 Kimi K3 was designed for balanced expert use. With unrelated balanced routes,
@@ -97,8 +101,8 @@ reserves. A simple placement is:
 After approximately 57.94 GiB of non-routed weights plus OS, workspace, and a
 moderate context reserve, roughly 70-85 GiB may remain for routed experts.
 Under a uniform balanced-routing assumption this covers about 14-17% of the
-routed pool. At the measured 3.716 GiB/s, the storage-only ceiling is then
-approximately 0.49-0.50 token/s. Full inference will be lower unless dense
+routed pool. At the measured 3.804 GiB/s, the storage-only ceiling is then
+approximately 0.50-0.51 token/s. Full inference will be lower unless dense
 R9700 work overlaps almost completely with Strix expert service.
 
 So the honest expectation for this quant is **roughly one token every two to

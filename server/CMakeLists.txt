@@ -719,6 +719,28 @@ if(DFLASH27B_TESTS)
         endif()
     endif()
 
+    # End-to-end numerical check for the reusable streamed-expert graph. It
+    # uses tiny generated F32 experts and defaults to GPU 0, so a Strix-only
+    # machine can run it without any model download. DFLASH_TEST_GPU selects a
+    # different device on multi-GPU qualification hosts.
+    if(UNIX AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_moe_stream_compute.cpp")
+        add_executable(test_moe_stream_compute
+            test/test_unit_main.cpp
+            test/test_moe_stream_compute.cpp)
+        target_include_directories(test_moe_stream_compute PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/common
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
+        target_link_libraries(test_moe_stream_compute PRIVATE
+            dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            target_link_libraries(test_moe_stream_compute PRIVATE CUDA::cudart)
+        else()
+            target_link_libraries(test_moe_stream_compute PRIVATE hip::host)
+        endif()
+        list(APPEND _raw_unit_test_targets test_moe_stream_compute)
+    endif()
+
     # Kimi-K3 routed-core qualification. This replays the exact latent-expert
     # geometry (IQ1_S, 3584 -> 3072 -> 3584, SiTU) through the common NVMe
     # stream engine. It is deliberately independent of a Kimi model loader so

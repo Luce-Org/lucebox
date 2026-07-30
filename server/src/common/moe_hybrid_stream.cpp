@@ -6,10 +6,12 @@
 #include "ggml-cuda.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <new>
 #include <unordered_map>
 #include <utility>
@@ -59,6 +61,36 @@ size_t align_up(size_t value, size_t alignment) {
     return (value + alignment - 1) & ~(alignment - 1);
 }
 
+bool checked_mul_size(size_t a, size_t b, size_t & out) {
+    if (a != 0 && b > std::numeric_limits<size_t>::max() / a) return false;
+    out = a * b;
+    return true;
+}
+
+bool valid_ggml_type(ggml_type type) {
+    return type >= 0 && type < GGML_TYPE_COUNT;
+}
+
+bool same_stream_spec(const MoeStreamExpertSpec & a,
+                      const MoeStreamExpertSpec & b) {
+    return a.input_dim == b.input_dim &&
+           a.intermediate_dim == b.intermediate_dim &&
+           a.output_dim == b.output_dim &&
+           a.gate_type == b.gate_type &&
+           a.up_type == b.up_type &&
+           a.down_type == b.down_type &&
+           a.gate_up_type == b.gate_up_type &&
+           a.fused_gate_up == b.fused_gate_up &&
+           a.gated_activation == b.gated_activation &&
+           a.swiglu_clamp == b.swiglu_clamp &&
+           a.situ_beta == b.situ_beta &&
+           a.situ_linear_beta == b.situ_linear_beta &&
+           a.gate_scale == b.gate_scale &&
+           a.up_scale == b.up_scale &&
+           a.down_scale == b.down_scale &&
+           a.gate_up_scale == b.gate_up_scale;
+}
+
 uint64_t device_key(int layer, int expert) {
     return ((uint64_t) (uint32_t) layer << 32) | (uint32_t) expert;
 }
@@ -105,12 +137,391 @@ MoeStreamConfig MoeStreamConfig::from_env() {
     config.nvme = MoeNvmeConfig::from_env(config.nvme);
     config.device_slots = env_bounded_int(
         "DFLASH_MOE_NVME_DEVICE_SLOTS", config.device_slots, 2, 8);
+    config.graph_cache_entries = env_bounded_int(
+        "DFLASH_MOE_NVME_GRAPH_CACHE", config.graph_cache_entries, 0, 64);
     config.device_cache_bytes = env_mib(
         "DFLASH_MOE_NVME_DEVICE_CACHE_MB", config.device_cache_bytes);
     config.prefill_threshold = env_bounded_int(
         "DFLASH_MOE_NVME_PREFILL_THRESHOLD", config.prefill_threshold, 1, 4096);
     return config;
 }
+
+bool make_moe_stream_expert_spec(
+        const MoeHybridConfig & cfg,
+        const MoeLayerDesc & desc,
+        const LayerExpertRegions & regions,
+        MoeStreamExpertSpec & out,
+        std::string * err) {
+    out = {};
+    const int expert_dim = cfg.expert_embd();
+    if (expert_dim <= 0 || cfg.n_ff_exp <= 0) {
+        if (err) *err = "streamed expert dimensions must be positive";
+        return false;
+    }
+    out.input_dim = expert_dim;
+    out.intermediate_dim = cfg.n_ff_exp;
+    out.output_dim = expert_dim;
+    out.fused_gate_up = regions.fused_gate_up;
+    out.gated_activation = cfg.gated_activation;
+    out.swiglu_clamp = cfg.swiglu_clamp;
+    out.situ_beta = cfg.situ_beta;
+    out.situ_linear_beta = cfg.situ_linear_beta;
+    out.gate_scale = desc.ffn_gate_exps_s;
+    out.up_scale = desc.ffn_up_exps_s;
+    out.down_scale = desc.ffn_down_exps_s;
+    out.gate_up_scale = desc.ffn_gate_up_exps_s;
+
+    if (out.fused_gate_up) {
+        if (!desc.ffn_gate_up_exps || !desc.ffn_down_exps) {
+            if (err) *err = "fused streamed expert is missing gate_up or down metadata";
+            return false;
+        }
+        out.gate_up_type = desc.ffn_gate_up_exps->type;
+        out.down_type = desc.ffn_down_exps->type;
+    } else {
+        if (!desc.ffn_gate_exps || !desc.ffn_up_exps || !desc.ffn_down_exps) {
+            if (err) *err = "streamed expert is missing gate, up, or down metadata";
+            return false;
+        }
+        out.gate_type = desc.ffn_gate_exps->type;
+        out.up_type = desc.ffn_up_exps->type;
+        out.down_type = desc.ffn_down_exps->type;
+    }
+    return true;
+}
+
+bool validate_moe_stream_expert_layout(
+        const MoeStreamExpertSpec & spec,
+        const MoeExpertIoLayout & layout,
+        std::string * err) {
+    if (spec.input_dim <= 0 || spec.intermediate_dim <= 0 ||
+        spec.output_dim <= 0 || !valid_ggml_type(spec.down_type) ||
+        (spec.fused_gate_up
+            ? !valid_ggml_type(spec.gate_up_type)
+            : (!valid_ggml_type(spec.gate_type) || !valid_ggml_type(spec.up_type)))) {
+        if (err) *err = "invalid streamed expert shape or tensor type";
+        return false;
+    }
+    if (spec.swiglu_clamp < 0.0f ||
+        !std::isfinite(spec.swiglu_clamp) ||
+        !std::isfinite(spec.gate_scale) ||
+        !std::isfinite(spec.up_scale) ||
+        !std::isfinite(spec.down_scale) ||
+        !std::isfinite(spec.gate_up_scale) ||
+        (spec.gated_activation != MoeGatedActivation::SwiGlu &&
+         spec.gated_activation != MoeGatedActivation::Situ) ||
+        (spec.gated_activation == MoeGatedActivation::Situ &&
+         (spec.situ_beta <= 0.0f || spec.situ_linear_beta <= 0.0f ||
+          !std::isfinite(spec.situ_beta) ||
+          !std::isfinite(spec.situ_linear_beta)))) {
+        if (err) *err = "invalid streamed expert activation parameters";
+        return false;
+    }
+    if (layout.fused_gate_up != spec.fused_gate_up) {
+        if (err) *err = "streamed storage and compute disagree about fused gate/up";
+        return false;
+    }
+
+    auto expected_bytes = [&](ggml_type type, int64_t columns,
+                              int64_t rows, size_t & bytes) -> bool {
+        if (!valid_ggml_type(type) || columns <= 0 || rows <= 0) return false;
+        const size_t row = ggml_row_size(type, columns);
+        return checked_mul_size(row, (size_t) rows, bytes);
+    };
+    auto require_component = [&](MoeExpertComponentKind kind, size_t expected,
+                                 const char * label) -> bool {
+        const MoeExpertComponentLayout * component = layout.component(kind);
+        if (!component || component->bytes != expected) {
+            if (err) {
+                *err = std::string("streamed ") + label +
+                    " bytes do not match tensor type/shape";
+            }
+            return false;
+        }
+        return true;
+    };
+
+    size_t down_bytes = 0;
+    if (!expected_bytes(spec.down_type, spec.intermediate_dim,
+                        spec.output_dim, down_bytes)) {
+        if (err) *err = "streamed down tensor size overflow";
+        return false;
+    }
+    if (spec.fused_gate_up) {
+        if (spec.intermediate_dim > std::numeric_limits<int>::max() / 2) {
+            if (err) *err = "streamed fused intermediate dimension overflow";
+            return false;
+        }
+        size_t gate_up_bytes = 0;
+        if (!expected_bytes(spec.gate_up_type, spec.input_dim,
+                            2LL * spec.intermediate_dim, gate_up_bytes) ||
+            !require_component(MoeExpertComponentKind::FusedGateUp,
+                               gate_up_bytes, "gate_up")) {
+            return false;
+        }
+    } else {
+        size_t gate_bytes = 0;
+        size_t up_bytes = 0;
+        if (!expected_bytes(spec.gate_type, spec.input_dim,
+                            spec.intermediate_dim, gate_bytes) ||
+            !expected_bytes(spec.up_type, spec.input_dim,
+                            spec.intermediate_dim, up_bytes) ||
+            !require_component(MoeExpertComponentKind::Gate, gate_bytes, "gate") ||
+            !require_component(MoeExpertComponentKind::Up, up_bytes, "up")) {
+            return false;
+        }
+    }
+    return require_component(MoeExpertComponentKind::Down, down_bytes, "down");
+}
+
+namespace {
+
+class PersistentStreamExpertGraph {
+public:
+    ~PersistentStreamExpertGraph() { destroy(); }
+
+    bool matches(const MoeStreamExpertSpec & spec, int batch) const {
+        return batch_ == batch && same_stream_spec(spec_, spec);
+    }
+
+    bool build(ggml_backend_t backend,
+               ggml_backend_buffer_t expert_buffer,
+               const MoeStreamExpertSpec & spec,
+               int batch,
+               const void * gate_data,
+               const void * up_data,
+               const void * down_data,
+               std::string * err) {
+        destroy();
+        if (!backend || !expert_buffer || batch <= 0 || !gate_data || !down_data ||
+            (!spec.fused_gate_up && !up_data)) {
+            if (err) *err = "invalid persistent streamed-expert graph arguments";
+            return false;
+        }
+        backend_ = backend;
+        spec_ = spec;
+        batch_ = batch;
+
+        ggml_init_params params{};
+        params.mem_size = 4 * 1024 * 1024;
+        params.no_alloc = true;
+        ctx_ = ggml_init(params);
+        if (!ctx_) {
+            if (err) *err = "ggml_init failed for persistent streamed expert";
+            return false;
+        }
+
+        input_ = ggml_new_tensor_2d(
+            ctx_, GGML_TYPE_F32, spec.input_dim, batch);
+        ggml_set_input(input_);
+        if (spec.fused_gate_up) {
+            gate_up_ = ggml_new_tensor_2d(
+                ctx_, spec.gate_up_type, spec.input_dim,
+                2LL * spec.intermediate_dim);
+            down_ = ggml_new_tensor_2d(
+                ctx_, spec.down_type, spec.intermediate_dim, spec.output_dim);
+            ggml_set_input(gate_up_);
+            ggml_set_input(down_);
+        } else {
+            gate_ = ggml_new_tensor_2d(
+                ctx_, spec.gate_type, spec.input_dim, spec.intermediate_dim);
+            up_ = ggml_new_tensor_2d(
+                ctx_, spec.up_type, spec.input_dim, spec.intermediate_dim);
+            down_ = ggml_new_tensor_2d(
+                ctx_, spec.down_type, spec.intermediate_dim, spec.output_dim);
+            ggml_set_input(gate_);
+            ggml_set_input(up_);
+            ggml_set_input(down_);
+        }
+
+        auto bind_external = [&](ggml_tensor * tensor,
+                                 const void * data,
+                                 const char * label) -> bool {
+            if (!tensor || !data) {
+                if (err) *err = std::string("invalid streamed ") +
+                                label + " tensor binding";
+                return false;
+            }
+            // Some GPU quant kernels require row-tail padding beyond
+            // ggml_nbytes(). The ordinary allocator supplies that padding,
+            // but a compact streamed record does not. Refuse such an adapter
+            // until it provides a padded device layout; otherwise a kernel
+            // could zero or read into the following component.
+            if (ggml_backend_buffer_get_alloc_size(expert_buffer, tensor) !=
+                ggml_nbytes(tensor)) {
+                if (err) *err = std::string("streamed ") + label +
+                    " tensor requires backend row padding; use a padded "
+                    "device layout";
+                return false;
+            }
+            const size_t alignment =
+                ggml_backend_buffer_get_alignment(expert_buffer);
+            if (alignment != 0 &&
+                (uintptr_t) data % alignment != 0) {
+                if (err) *err = std::string("streamed ") + label +
+                    " tensor is not aligned for the compute backend";
+                return false;
+            }
+            if (ggml_backend_tensor_alloc(
+                    expert_buffer, tensor, const_cast<void *>(data)) !=
+                    GGML_STATUS_SUCCESS) {
+                if (err) *err = std::string("failed to bind streamed ") +
+                                label + " tensor to expert cache";
+                return false;
+            }
+            return true;
+        };
+        if (spec.fused_gate_up) {
+            if (!bind_external(gate_up_, gate_data, "gate_up") ||
+                !bind_external(down_, down_data, "down")) {
+                return false;
+            }
+        } else if (!bind_external(gate_, gate_data, "gate") ||
+                   !bind_external(up_, up_data, "up") ||
+                   !bind_external(down_, down_data, "down")) {
+            return false;
+        }
+
+        auto scale_if_needed = [&](ggml_tensor * value, float scale) {
+            return scale == 1.0f ? value : ggml_scale(ctx_, value, scale);
+        };
+        auto gated_activation = [&](ggml_tensor * gate,
+                                    ggml_tensor * up) -> ggml_tensor * {
+            if (spec.gated_activation == MoeGatedActivation::Situ) {
+                ggml_tensor * nonlinear = ggml_scale(
+                    ctx_, gate, 1.0f / spec.situ_beta);
+                nonlinear = ggml_tanh(ctx_, nonlinear);
+                nonlinear = ggml_scale(ctx_, nonlinear, spec.situ_beta);
+                nonlinear = ggml_mul(
+                    ctx_, nonlinear, ggml_sigmoid(ctx_, gate));
+                ggml_tensor * linear = ggml_scale(
+                    ctx_, up, 1.0f / spec.situ_linear_beta);
+                linear = ggml_tanh(ctx_, linear);
+                linear = ggml_scale(ctx_, linear, spec.situ_linear_beta);
+                return ggml_mul(ctx_, nonlinear, linear);
+            }
+            if (spec.swiglu_clamp > 0.0f) {
+                return ggml_swiglu_ds4_split(
+                    ctx_, gate, up, spec.swiglu_clamp);
+            }
+            return ggml_swiglu_split(ctx_, gate, up);
+        };
+
+        ggml_tensor * activated = nullptr;
+        if (gate_up_) {
+            ggml_tensor * combined = scale_if_needed(
+                ggml_mul_mat(ctx_, gate_up_, input_), spec.gate_up_scale);
+            ggml_tensor * gate_part = ggml_view_2d(
+                ctx_, combined, spec.intermediate_dim, batch,
+                combined->nb[1], 0);
+            ggml_tensor * up_part = ggml_view_2d(
+                ctx_, combined, spec.intermediate_dim, batch,
+                combined->nb[1],
+                (size_t) spec.intermediate_dim * sizeof(float));
+            activated = gated_activation(
+                ggml_cont(ctx_, gate_part), ggml_cont(ctx_, up_part));
+        } else {
+            ggml_tensor * gate_value = scale_if_needed(
+                ggml_mul_mat(ctx_, gate_, input_), spec.gate_scale);
+            ggml_tensor * up_value = scale_if_needed(
+                ggml_mul_mat(ctx_, up_, input_), spec.up_scale);
+            activated = gated_activation(gate_value, up_value);
+        }
+        output_ = scale_if_needed(
+            ggml_mul_mat(ctx_, down_, activated), spec.down_scale);
+        ggml_set_output(output_);
+        graph_ = ggml_new_graph_custom(ctx_, 512, false);
+        ggml_build_forward_expand(graph_, output_);
+        alloc_ = ggml_gallocr_new(
+            ggml_backend_get_default_buffer_type(backend_));
+        if (!alloc_ || !ggml_gallocr_alloc_graph(alloc_, graph_)) {
+            if (err) *err = "persistent streamed-expert graph allocation failed";
+            return false;
+        }
+        return true;
+    }
+
+    bool launch(const void * gate_data,
+                const void * up_data,
+                const void * down_data,
+                const float * input,
+                std::string * err) {
+        if (!valid() || !gate_data || !down_data || !input ||
+            (!spec_.fused_gate_up && !up_data)) {
+            if (err) *err = "persistent streamed-expert graph is not ready";
+            return false;
+        }
+        if (gate_up_) gate_up_->data = const_cast<void *>(gate_data);
+        else gate_->data = const_cast<void *>(gate_data);
+        if (up_) up_->data = const_cast<void *>(up_data);
+        down_->data = const_cast<void *>(down_data);
+        size_t input_values = 0;
+        if (!checked_mul_size((size_t) spec_.input_dim,
+                              (size_t) batch_, input_values)) {
+            if (err) *err = "streamed expert input size overflow";
+            return false;
+        }
+        ggml_backend_tensor_set(
+            input_, input, 0, input_values * sizeof(float));
+        if (ggml_backend_graph_compute_async(backend_, graph_) !=
+            GGML_STATUS_SUCCESS) {
+            if (err) *err = "persistent streamed-expert graph launch failed";
+            return false;
+        }
+        return true;
+    }
+
+    bool finish(std::vector<float> & output, std::string * err) {
+        if (!valid()) {
+            if (err) *err = "persistent streamed-expert graph is not ready";
+            return false;
+        }
+        ggml_backend_synchronize(backend_);
+        size_t output_values = 0;
+        if (!checked_mul_size((size_t) spec_.output_dim,
+                              (size_t) batch_, output_values)) {
+            if (err) *err = "streamed expert output size overflow";
+            return false;
+        }
+        output.resize(output_values);
+        ggml_backend_tensor_get(
+            output_, output.data(), 0, output_values * sizeof(float));
+        return true;
+    }
+
+    void destroy() {
+        if (alloc_) ggml_gallocr_free(alloc_);
+        alloc_ = nullptr;
+        if (ctx_) ggml_free(ctx_);
+        ctx_ = nullptr;
+        graph_ = nullptr;
+        input_ = gate_ = up_ = down_ = gate_up_ = output_ = nullptr;
+        backend_ = nullptr;
+        batch_ = 0;
+    }
+
+    bool valid() const {
+        return backend_ && ctx_ && graph_ && alloc_ && input_ && output_;
+    }
+
+    uint64_t last_touch = 0;
+
+private:
+    ggml_backend_t backend_ = nullptr;
+    MoeStreamExpertSpec spec_{};
+    int batch_ = 0;
+    ggml_context * ctx_ = nullptr;
+    ggml_cgraph * graph_ = nullptr;
+    ggml_gallocr_t alloc_ = nullptr;
+    ggml_tensor * input_ = nullptr;
+    ggml_tensor * gate_ = nullptr;
+    ggml_tensor * up_ = nullptr;
+    ggml_tensor * down_ = nullptr;
+    ggml_tensor * gate_up_ = nullptr;
+    ggml_tensor * output_ = nullptr;
+};
+
+} // namespace
 
 struct MoeHybridStreamEngine::Runtime {
     struct DeviceSlot {
@@ -133,6 +544,7 @@ struct MoeHybridStreamEngine::Runtime {
     MoeStreamConfig config{};
     std::unique_ptr<MoeNvmeScheduler> io;
     cudaStream_t transfer_stream = nullptr;
+    ggml_backend_buffer_t device_pool_buffer = nullptr;
     void * device_pool = nullptr;
     size_t device_stride = 0;
     size_t device_pool_bytes = 0;
@@ -143,6 +555,10 @@ struct MoeHybridStreamEngine::Runtime {
     uint64_t device_cache_misses = 0;
     uint64_t device_cache_evictions = 0;
     int active_slot = -1;
+    std::vector<std::unique_ptr<PersistentStreamExpertGraph>> graph_cache;
+    uint64_t graph_clock = 0;
+    MoeStreamComputeStats compute_stats{};
+    std::mutex compute_mutex;
 };
 
 template <typename RuntimeT>
@@ -168,11 +584,16 @@ bool allocate_device_cache(RuntimeT & runtime, std::string * err) {
     // raced another allocation, converge to a smaller usable cache instead of
     // failing model startup.
     size_t attempt_slots = desired_slots;
-    cudaError_t gpu_err = cudaSuccess;
+    ggml_backend_buffer_type_t buft =
+        ggml_backend_get_default_buffer_type(runtime.backend);
     while (attempt_slots >= 2) {
         const size_t bytes = attempt_slots * runtime.device_stride;
-        gpu_err = cudaMalloc(&runtime.device_pool, bytes);
-        if (gpu_err == cudaSuccess) {
+        runtime.device_pool_buffer = ggml_backend_buft_alloc_buffer(buft, bytes);
+        if (runtime.device_pool_buffer) {
+            ggml_backend_buffer_set_usage(
+                runtime.device_pool_buffer, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+            runtime.device_pool =
+                ggml_backend_buffer_get_base(runtime.device_pool_buffer);
             runtime.device_pool_bytes = bytes;
             break;
         }
@@ -180,17 +601,15 @@ bool allocate_device_cache(RuntimeT & runtime, std::string * err) {
         attempt_slots = std::max<size_t>(2, attempt_slots * 3 / 4);
     }
     if (!runtime.device_pool) {
-        if (err) {
-            *err = std::string("failed to allocate SSD GPU expert cache: ") +
-                   cudaGetErrorString(gpu_err);
-        }
+        if (err) *err = "failed to allocate SSD GPU expert cache";
         return false;
     }
 
     try {
         runtime.device_slots.resize(attempt_slots);
     } catch (const std::bad_alloc &) {
-        (void) cudaFree(runtime.device_pool);
+        ggml_backend_buffer_free(runtime.device_pool_buffer);
+        runtime.device_pool_buffer = nullptr;
         runtime.device_pool = nullptr;
         runtime.device_pool_bytes = 0;
         if (err) *err = "failed to allocate SSD GPU cache metadata";
@@ -351,9 +770,11 @@ void MoeHybridStreamEngine::destroy() {
     const size_t device_cache_slot_count = runtime_->device_slots.size();
     const size_t device_cache_byte_count = runtime_->device_pool_bytes;
     ScopedGpuDevice device_scope(runtime_->device);
+    if (runtime_->backend) ggml_backend_synchronize(runtime_->backend);
     if (runtime_->transfer_stream) {
         (void) cudaStreamSynchronize(runtime_->transfer_stream);
     }
+    runtime_->graph_cache.clear();
     for (Runtime::DeviceSlot & slot : runtime_->device_slots) {
         slot.host_lease.reset();
         if (slot.ready) (void) cudaEventDestroy(slot.ready);
@@ -363,7 +784,10 @@ void MoeHybridStreamEngine::destroy() {
     }
     runtime_->device_slots.clear();
     runtime_->device_index.clear();
-    if (runtime_->device_pool) (void) cudaFree(runtime_->device_pool);
+    if (runtime_->device_pool_buffer) {
+        ggml_backend_buffer_free(runtime_->device_pool_buffer);
+    }
+    runtime_->device_pool_buffer = nullptr;
     runtime_->device_pool = nullptr;
     if (runtime_->transfer_stream) (void) cudaStreamDestroy(runtime_->transfer_stream);
     runtime_->transfer_stream = nullptr;
@@ -387,7 +811,8 @@ void MoeHybridStreamEngine::destroy() {
                 "payload=%.3f GiB physical=%.3f GiB active-io-rate=%.3f GiB/s "
                 "cache-hit=%.1f%% mean-demand-wait=%.3f ms "
                 "dedupe=%llu upgrades=%llu dropped-prefetch=%llu errors=%llu "
-                "strix-cache=%.1f MiB slots=%zu hits=%llu misses=%llu evictions=%llu\n",
+                "device-cache=%.1f MiB slots=%zu hits=%llu misses=%llu evictions=%llu "
+                "graphs=%llu graph-hits=%llu graph-evictions=%llu launches=%llu\n",
                 runtime_->io->effective_backend_name(),
                 (unsigned long long) stats.requests,
                 (unsigned long long) stats.read_ops,
@@ -400,7 +825,11 @@ void MoeHybridStreamEngine::destroy() {
                 device_cache_slot_count,
                 (unsigned long long) runtime_->device_cache_hits,
                 (unsigned long long) runtime_->device_cache_misses,
-                (unsigned long long) runtime_->device_cache_evictions);
+                (unsigned long long) runtime_->device_cache_evictions,
+                (unsigned long long) runtime_->compute_stats.graph_builds,
+                (unsigned long long) runtime_->compute_stats.graph_cache_hits,
+                (unsigned long long) runtime_->compute_stats.graph_evictions,
+                (unsigned long long) runtime_->compute_stats.graph_launches);
         }
         runtime_->io->destroy();
     }
@@ -642,7 +1071,7 @@ bool MoeHybridStreamEngine::activate_device_slot(int device_slot,
         slot.pending = false;
         slot.host_lease.reset();
     }
-    if (slot.layout.span_count < 2) {
+    if (slot.layout.component_count < 2) {
         if (err) *err = "SSD device slot has no complete expert";
         return false;
     }
@@ -706,40 +1135,62 @@ bool MoeHybridStreamEngine::stream_expert_sync(
 const void * MoeHybridStreamEngine::scratch_gate_data() const {
     if (!runtime_ || runtime_->active_slot < 0) return nullptr;
     const Runtime::DeviceSlot & slot = runtime_->device_slots[(size_t) runtime_->active_slot];
-    return static_cast<const uint8_t *>(slot.data) + slot.layout.spans[0].device_offset;
+    const MoeExpertComponentKind kind = slot.layout.fused_gate_up
+        ? MoeExpertComponentKind::FusedGateUp : MoeExpertComponentKind::Gate;
+    const MoeExpertComponentLayout * component = slot.layout.component(kind);
+    return component
+        ? static_cast<const uint8_t *>(slot.data) + component->device_offset
+        : nullptr;
 }
 
 const void * MoeHybridStreamEngine::scratch_up_data() const {
     if (!runtime_ || runtime_->active_slot < 0) return nullptr;
     const Runtime::DeviceSlot & slot = runtime_->device_slots[(size_t) runtime_->active_slot];
     if (slot.layout.fused_gate_up) return nullptr;
-    return static_cast<const uint8_t *>(slot.data) + slot.layout.spans[1].device_offset;
+    const MoeExpertComponentLayout * component =
+        slot.layout.component(MoeExpertComponentKind::Up);
+    return component
+        ? static_cast<const uint8_t *>(slot.data) + component->device_offset
+        : nullptr;
 }
 
 const void * MoeHybridStreamEngine::scratch_down_data() const {
     if (!runtime_ || runtime_->active_slot < 0) return nullptr;
     const Runtime::DeviceSlot & slot = runtime_->device_slots[(size_t) runtime_->active_slot];
-    const int index = slot.layout.fused_gate_up ? 1 : 2;
-    return static_cast<const uint8_t *>(slot.data) + slot.layout.spans[index].device_offset;
+    const MoeExpertComponentLayout * component =
+        slot.layout.component(MoeExpertComponentKind::Down);
+    return component
+        ? static_cast<const uint8_t *>(slot.data) + component->device_offset
+        : nullptr;
 }
 
 size_t MoeHybridStreamEngine::scratch_gate_bytes() const {
     if (!runtime_ || runtime_->active_slot < 0) return 0;
-    return runtime_->device_slots[(size_t) runtime_->active_slot].layout.spans[0].bytes;
+    const MoeExpertIoLayout & layout =
+        runtime_->device_slots[(size_t) runtime_->active_slot].layout;
+    const MoeExpertComponentKind kind = layout.fused_gate_up
+        ? MoeExpertComponentKind::FusedGateUp : MoeExpertComponentKind::Gate;
+    const MoeExpertComponentLayout * component = layout.component(kind);
+    return component ? component->bytes : 0;
 }
 
 size_t MoeHybridStreamEngine::scratch_up_bytes() const {
     if (!runtime_ || runtime_->active_slot < 0) return 0;
     const MoeExpertIoLayout & layout =
         runtime_->device_slots[(size_t) runtime_->active_slot].layout;
-    return layout.fused_gate_up ? 0 : layout.spans[1].bytes;
+    if (layout.fused_gate_up) return 0;
+    const MoeExpertComponentLayout * component =
+        layout.component(MoeExpertComponentKind::Up);
+    return component ? component->bytes : 0;
 }
 
 size_t MoeHybridStreamEngine::scratch_down_bytes() const {
     if (!runtime_ || runtime_->active_slot < 0) return 0;
     const MoeExpertIoLayout & layout =
         runtime_->device_slots[(size_t) runtime_->active_slot].layout;
-    return layout.spans[layout.fused_gate_up ? 1 : 2].bytes;
+    const MoeExpertComponentLayout * component =
+        layout.component(MoeExpertComponentKind::Down);
+    return component ? component->bytes : 0;
 }
 
 size_t MoeHybridStreamEngine::pinned_bytes() const {
@@ -758,7 +1209,11 @@ MoeNvmeStats MoeHybridStreamEngine::io_stats() const {
     return runtime_ && runtime_->io ? runtime_->io->stats() : MoeNvmeStats{};
 }
 
-bool eval_moe_cold_experts_streaming(
+MoeStreamComputeStats MoeHybridStreamEngine::compute_stats() const {
+    return runtime_ ? runtime_->compute_stats : MoeStreamComputeStats{};
+}
+
+static bool eval_moe_cold_experts_streaming_reference(
     MoeHybridStreamEngine &         engine,
     ggml_backend_t                  gpu_backend,
     const void *                    mmap_data,
@@ -1019,6 +1474,297 @@ bool eval_moe_cold_experts_streaming(
         }
     }
     return true;
+}
+
+bool eval_moe_streamed_experts(
+        MoeHybridStreamEngine & engine,
+        const MoeStreamExpertSpec & spec,
+        const MoeStreamRouteBatch & batch,
+        std::vector<float> & out,
+        std::string * err) {
+    if (!engine.runtime_ || !engine.is_bound()) {
+        if (err) *err = "streamed expert evaluation requires a bound model source";
+        return false;
+    }
+    if (batch.layer < 0 || batch.n_expert <= 0 || batch.top_k <= 0 ||
+        batch.top_k > batch.n_expert ||
+        batch.n_tokens <= 0 || !batch.inputs || !batch.selected_ids ||
+        !batch.selected_weights || spec.input_dim <= 0 ||
+        spec.output_dim <= 0) {
+        if (err) *err = "invalid model-neutral streamed route batch";
+        return false;
+    }
+    if (batch.resident_local_by_global &&
+        batch.resident_map_size < (size_t) batch.n_expert) {
+        if (err) *err = "streamed route residency map is smaller than n_expert";
+        return false;
+    }
+    size_t output_values = 0;
+    if (!checked_mul_size((size_t) spec.output_dim,
+                          (size_t) batch.n_tokens, output_values)) {
+        if (err) *err = "streamed route output size overflow";
+        return false;
+    }
+    out.assign(output_values, 0.0f);
+
+    auto & runtime = *engine.runtime_;
+    std::lock_guard<std::mutex> compute_guard(runtime.compute_mutex);
+
+    size_t route_slots = 0;
+    if (!checked_mul_size((size_t) batch.top_k,
+                          (size_t) batch.n_tokens, route_slots)) {
+        if (err) *err = "streamed route slot count overflow";
+        return false;
+    }
+    std::vector<bool> needed((size_t) batch.n_expert, false);
+    for (size_t i = 0; i < route_slots; ++i) {
+        const int32_t expert = batch.selected_ids[i];
+        if (expert < 0) continue;
+        if (expert >= batch.n_expert) {
+            if (err) *err = "native router selected an out-of-range expert";
+            return false;
+        }
+        if (!std::isfinite(batch.selected_weights[i])) {
+            if (err) *err = "native router produced a non-finite expert weight";
+            return false;
+        }
+        if (batch.selected_weights[i] == 0.0f) continue;
+        if (batch.resident_local_by_global &&
+            batch.resident_local_by_global[(size_t) expert] >= 0) {
+            continue;
+        }
+        needed[(size_t) expert] = true;
+    }
+
+    std::vector<int32_t> unique_experts;
+    for (int expert = 0; expert < batch.n_expert; ++expert) {
+        if (needed[(size_t) expert]) unique_experts.push_back((int32_t) expert);
+    }
+    if (unique_experts.empty()) return true;
+
+    engine.request_experts(batch.layer, unique_experts.data(),
+                           (int) unique_experts.size(),
+                           MoeNvmePriority::Demand);
+    int staged_slot = -1;
+    if (!engine.stage_expert_cached_async(
+            batch.layer, unique_experts[0], &staged_slot, err)) {
+        return false;
+    }
+
+    auto acquire_graph = [&](int graph_batch,
+                             std::unique_ptr<PersistentStreamExpertGraph> & ephemeral,
+                             PersistentStreamExpertGraph ** graph_out) -> bool {
+        *graph_out = nullptr;
+        const uint64_t touch = ++runtime.graph_clock;
+        if (runtime.config.graph_cache_entries > 0) {
+            for (auto & candidate : runtime.graph_cache) {
+                if (candidate && candidate->matches(spec, graph_batch)) {
+                    candidate->last_touch = touch;
+                    ++runtime.compute_stats.graph_cache_hits;
+                    *graph_out = candidate.get();
+                    return true;
+                }
+            }
+        }
+
+        const int active = runtime.active_slot;
+        if (active < 0 || active >= (int) runtime.device_slots.size()) {
+            if (err) *err = "no active streamed expert slot for graph build";
+            return false;
+        }
+        const MoeExpertIoLayout & layout =
+            runtime.device_slots[(size_t) active].layout;
+        if (!validate_moe_stream_expert_layout(spec, layout, err)) return false;
+
+        std::unique_ptr<PersistentStreamExpertGraph> built(
+            new (std::nothrow) PersistentStreamExpertGraph);
+        if (!built) {
+            if (err) *err = "failed to allocate persistent streamed-expert graph";
+            return false;
+        }
+        if (!built->build(runtime.backend, runtime.device_pool_buffer,
+                          spec, graph_batch,
+                          engine.scratch_gate_data(),
+                          engine.scratch_up_data(),
+                          engine.scratch_down_data(), err)) {
+            return false;
+        }
+        built->last_touch = touch;
+        ++runtime.compute_stats.graph_builds;
+
+        if (runtime.config.graph_cache_entries <= 0) {
+            *graph_out = built.get();
+            ephemeral = std::move(built);
+            return true;
+        }
+        if ((int) runtime.graph_cache.size() >=
+            runtime.config.graph_cache_entries) {
+            auto victim = std::min_element(
+                runtime.graph_cache.begin(), runtime.graph_cache.end(),
+                [](const auto & a, const auto & b) {
+                    return a->last_touch < b->last_touch;
+                });
+            if (victim != runtime.graph_cache.end()) {
+                runtime.graph_cache.erase(victim);
+                ++runtime.compute_stats.graph_evictions;
+            }
+        }
+        *graph_out = built.get();
+        runtime.graph_cache.push_back(std::move(built));
+        return true;
+    };
+
+    for (size_t expert_index = 0;
+         expert_index < unique_experts.size(); ++expert_index) {
+        const int current_slot = staged_slot;
+        if (!engine.activate_device_slot(current_slot, err)) return false;
+        auto release_current = [&]() {
+            engine.release_device_slot(current_slot);
+        };
+
+        struct TokenHit { int token; float weight; };
+        std::vector<TokenHit> hits;
+        hits.reserve((size_t) batch.n_tokens);
+        const int32_t expert = unique_experts[expert_index];
+        for (int token = 0; token < batch.n_tokens; ++token) {
+            float combined_weight = 0.0f;
+            for (int rank = 0; rank < batch.top_k; ++rank) {
+                const size_t route =
+                    (size_t) token * (size_t) batch.top_k + (size_t) rank;
+                if (batch.selected_ids[route] != expert) continue;
+                combined_weight += batch.selected_weights[route];
+            }
+            if (!std::isfinite(combined_weight)) {
+                if (err) *err = "combined expert route weight overflowed";
+                release_current();
+                return false;
+            }
+            if (combined_weight != 0.0f) {
+                hits.push_back({token, combined_weight});
+            }
+        }
+        if (hits.empty()) {
+            release_current();
+            continue;
+        }
+
+        size_t input_values = 0;
+        if (!checked_mul_size((size_t) spec.input_dim, hits.size(),
+                              input_values)) {
+            if (err) *err = "streamed compact input size overflow";
+            release_current();
+            return false;
+        }
+        std::vector<float> compact_input(input_values);
+        for (size_t i = 0; i < hits.size(); ++i) {
+            const float * src = batch.inputs +
+                (size_t) hits[i].token * (size_t) spec.input_dim;
+            std::memcpy(compact_input.data() + i * (size_t) spec.input_dim,
+                        src, sizeof(float) * (size_t) spec.input_dim);
+        }
+
+        std::unique_ptr<PersistentStreamExpertGraph> ephemeral;
+        PersistentStreamExpertGraph * graph = nullptr;
+        if (!acquire_graph((int) hits.size(), ephemeral, &graph)) {
+            release_current();
+            return false;
+        }
+        if (!validate_moe_stream_expert_layout(
+                spec, runtime.device_slots[(size_t) current_slot].layout, err) ||
+            !graph->launch(engine.scratch_gate_data(),
+                           engine.scratch_up_data(),
+                           engine.scratch_down_data(),
+                           compact_input.data(), err)) {
+            release_current();
+            return false;
+        }
+        ++runtime.compute_stats.graph_launches;
+
+        // Compute N is running while the already-admitted read for N+1 is
+        // acquired and uploaded into a different, eviction-protected slot.
+        if (expert_index + 1 < unique_experts.size()) {
+            int next_slot = -1;
+            if (!engine.stage_expert_cached_async(
+                    batch.layer, unique_experts[expert_index + 1],
+                    &next_slot, err)) {
+                ggml_backend_synchronize(runtime.backend);
+                release_current();
+                return false;
+            }
+            staged_slot = next_slot;
+        }
+
+        std::vector<float> result;
+        if (!graph->finish(result, err)) {
+            release_current();
+            return false;
+        }
+        for (size_t i = 0; i < hits.size(); ++i) {
+            float * dst = out.data() +
+                (size_t) hits[i].token * (size_t) spec.output_dim;
+            const float * src = result.data() +
+                i * (size_t) spec.output_dim;
+            const float weight = hits[i].weight;
+            for (int j = 0; j < spec.output_dim; ++j) {
+                dst[j] += weight * src[(size_t) j];
+            }
+        }
+        release_current();
+    }
+    return true;
+}
+
+bool eval_moe_cold_experts_streaming(
+        MoeHybridStreamEngine & engine,
+        ggml_backend_t gpu_backend,
+        const void * mmap_data,
+        size_t mmap_size,
+        const MoeHybridConfig & cfg,
+        const MoeLayerDesc & desc,
+        const LayerExpertRegions & regions,
+        const MoeHybridLayerStorage & storage,
+        const float * cur_host,
+        const int32_t * selected_ids,
+        const float * selected_weights,
+        int n_tokens,
+        std::vector<float> & out,
+        std::string * err,
+        int layer) {
+    const char * reference = std::getenv("DFLASH_MOE_NVME_REFERENCE_EVAL");
+    if (reference && (std::strcmp(reference, "1") == 0 ||
+                      std::strcmp(reference, "on") == 0 ||
+                      std::strcmp(reference, "true") == 0)) {
+        return eval_moe_cold_experts_streaming_reference(
+            engine, gpu_backend, mmap_data, mmap_size, cfg, desc, regions,
+            storage, cur_host, selected_ids, selected_weights, n_tokens,
+            out, err, layer);
+    }
+
+    int bound_layer = layer;
+    if (!engine.is_bound()) {
+        if (!mmap_data || mmap_size == 0 ||
+            !engine.bind_sources({{mmap_data, mmap_size, -1}}, {regions}, err)) {
+            if (err && err->empty()) *err = "stream engine has no model source";
+            return false;
+        }
+        bound_layer = 0;
+    }
+
+    MoeStreamExpertSpec spec;
+    if (!make_moe_stream_expert_spec(cfg, desc, regions, spec, err)) return false;
+    MoeStreamRouteBatch route_batch;
+    route_batch.layer = bound_layer;
+    route_batch.n_expert = cfg.n_expert;
+    route_batch.top_k = cfg.n_expert_used;
+    route_batch.n_tokens = n_tokens;
+    route_batch.inputs = cur_host;
+    route_batch.selected_ids = selected_ids;
+    route_batch.selected_weights = selected_weights;
+    route_batch.resident_local_by_global =
+        storage.hot_local_by_global.empty()
+            ? nullptr : storage.hot_local_by_global.data();
+    route_batch.resident_map_size = storage.hot_local_by_global.size();
+    return eval_moe_streamed_experts(engine, spec, route_batch, out, err);
 }
 
 } // namespace dflash::common

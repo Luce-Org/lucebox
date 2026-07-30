@@ -89,13 +89,39 @@ struct MoeExpertIoSpan {
     size_t io_bytes = 0;          // aligned direct-I/O length
 };
 
+enum class MoeExpertComponentKind : uint8_t {
+    Gate,
+    Up,
+    Down,
+    FusedGateUp,
+};
+
+// Compute-facing view of one tensor inside the packed device slot. Keeping
+// components separate from I/O spans lets tensor-major storage use three reads
+// while an expert-major representation uses one read with identical compute
+// pointers and numerical behavior.
+struct MoeExpertComponentLayout {
+    MoeExpertComponentKind kind = MoeExpertComponentKind::Gate;
+    size_t device_offset = 0;
+    size_t bytes = 0;
+};
+
 struct MoeExpertIoLayout {
     MoeExpertKey key;
     MoeExpertIoSpan spans[3]{};
     int span_count = 0;
+    MoeExpertComponentLayout components[3]{};
+    int component_count = 0;
     size_t payload_bytes = 0;
     size_t host_bytes = 0;
     bool fused_gate_up = false;
+
+    const MoeExpertComponentLayout * component(MoeExpertComponentKind kind) const {
+        for (int i = 0; i < component_count; ++i) {
+            if (components[i].kind == kind) return &components[i];
+        }
+        return nullptr;
+    }
 };
 
 // Convert the common LayerExpertRegions descriptor into an exact read plan.

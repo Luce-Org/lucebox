@@ -431,7 +431,7 @@ bool make_moe_expert_io_layout(
     MoeExpertIoLayout & out,
     std::string * err) {
 
-    out = {};
+    out = MoeExpertIoLayout{};
     out.key = { (int32_t) layer, (int32_t) expert };
     out.fused_gate_up = regions.fused_gate_up;
     if (layer < 0 || expert < 0) {
@@ -501,13 +501,85 @@ bool make_moe_expert_io_layout(
         return true;
     };
 
-    if (regions.fused_gate_up) {
-        if (!add_span(regions.gate_up_exps, regions.expert_bytes_gate_up, "gate_up")) return false;
+    auto add_component = [&](MoeExpertComponentKind kind, size_t offset,
+                             size_t bytes, size_t record_bytes,
+                             const char * label) -> bool {
+        if (out.component_count >= 3 || bytes == 0 ||
+            !range_in_bounds(offset, bytes, record_bytes)) {
+            if (err) *err = std::string("invalid ") + label +
+                            " component in expert record";
+            return false;
+        }
+        for (int i = 0; i < out.component_count; ++i) {
+            const MoeExpertComponentLayout & prior = out.components[i];
+            const size_t prior_end = prior.device_offset + prior.bytes;
+            const size_t end = offset + bytes;
+            if (offset < prior_end && prior.device_offset < end) {
+                if (err) *err = std::string(label) +
+                                " overlaps another expert component";
+                return false;
+            }
+        }
+        out.components[out.component_count++] = {kind, offset, bytes};
+        return true;
+    };
+
+    if (regions.expert_major.enabled) {
+        const ExpertMajorFileLayout & packed = regions.expert_major;
+        if (!add_span(packed.experts, packed.expert_stride, "expert-major")) {
+            return false;
+        }
+        if (regions.fused_gate_up) {
+            if (!add_component(MoeExpertComponentKind::FusedGateUp,
+                               packed.gate_up_offset,
+                               regions.expert_bytes_gate_up,
+                               packed.expert_stride, "gate_up")) {
+                return false;
+            }
+        } else {
+            if (!add_component(MoeExpertComponentKind::Gate,
+                               packed.gate_offset, regions.expert_bytes_gate,
+                               packed.expert_stride, "gate") ||
+                !add_component(MoeExpertComponentKind::Up,
+                               packed.up_offset, regions.expert_bytes_up,
+                               packed.expert_stride, "up")) {
+                return false;
+            }
+        }
+        if (!add_component(MoeExpertComponentKind::Down,
+                           packed.down_offset, regions.expert_bytes_down,
+                           packed.expert_stride, "down")) {
+            return false;
+        }
+    } else if (regions.fused_gate_up) {
+        if (!add_span(regions.gate_up_exps, regions.expert_bytes_gate_up, "gate_up") ||
+            !add_component(MoeExpertComponentKind::FusedGateUp,
+                           out.spans[out.span_count - 1].device_offset,
+                           regions.expert_bytes_gate_up, device_cursor,
+                           "gate_up")) {
+            return false;
+        }
     } else {
-        if (!add_span(regions.gate_exps, regions.expert_bytes_gate, "gate")) return false;
-        if (!add_span(regions.up_exps, regions.expert_bytes_up, "up")) return false;
+        if (!add_span(regions.gate_exps, regions.expert_bytes_gate, "gate") ||
+            !add_component(MoeExpertComponentKind::Gate,
+                           out.spans[out.span_count - 1].device_offset,
+                           regions.expert_bytes_gate, device_cursor, "gate") ||
+            !add_span(regions.up_exps, regions.expert_bytes_up, "up") ||
+            !add_component(MoeExpertComponentKind::Up,
+                           out.spans[out.span_count - 1].device_offset,
+                           regions.expert_bytes_up, device_cursor, "up")) {
+            return false;
+        }
     }
-    if (!add_span(regions.down_exps, regions.expert_bytes_down, "down")) return false;
+
+    if (!regions.expert_major.enabled) {
+        if (!add_span(regions.down_exps, regions.expert_bytes_down, "down") ||
+            !add_component(MoeExpertComponentKind::Down,
+                           out.spans[out.span_count - 1].device_offset,
+                           regions.expert_bytes_down, device_cursor, "down")) {
+            return false;
+        }
+    }
 
     out.payload_bytes = device_cursor;
     out.host_bytes = host_cursor;
@@ -1093,7 +1165,7 @@ void MoeNvmeLease::reset() {
     data_ = nullptr;
     slot_ = -1;
     generation_ = 0;
-    layout_ = {};
+    layout_ = MoeExpertIoLayout{};
 }
 
 MoeNvmeScheduler::MoeNvmeScheduler() : impl_(new Impl) {}

@@ -28,7 +28,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `DFLASH_MMID_GROUPED_DEVICE` | -1 | Optional zero-based device restriction; unset/-1 applies to every eligible device. |
 | `DFLASH_DS4_MOE_TP` / `DFLASH_DS4_MOE_TP_INPROC` | unset | BURN-IN: enable DeepSeek4 route-owner expert parallelism in one process. |
 | `DFLASH_DS4_MOE_TP_GPU` | auto | HIP device for the cold DeepSeek4 expert owner. |
-| `DFLASH_MOE_NVME_COLD_TIER` | auto | BURN-IN: DeepSeek4 cold-capacity policy (`auto`, `on`, `off`). Auto streams only when the cold stack does not fit on Strix with reserve. |
+| `DFLASH_MOE_NVME_COLD_TIER` | auto | BURN-IN: DeepSeek4 cold-capacity policy (`auto`, `on`, `off`) for dual-device and Strix-only execution. |
 | `DFLASH_MOE_NVME_*` | tuned defaults | BURN-IN: bounded MoE SSD scheduler/backend controls; see `MOE_NVME_STREAMING.md`. |
 | `GGML_CUDA_BATCH_PEER_COPIES` | unset | BURN-IN: publish ordered HIP peer copies with one cross-device dependency per source/destination pair. |
 | `DFLASH_MOE_PREFILL_PERSISTENT_OWNER_ALLOC` | 1 for qualified long heterogeneous prefill | KILL SWITCH: =0 restores per-layer route/owner scratch allocation. |

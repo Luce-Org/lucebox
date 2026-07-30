@@ -25,6 +25,10 @@ struct MoeStreamConfig {
     int prefill_threshold = 8;
     int prefetch_layers = 2;
     int device_slots = 2; // double buffering is the minimum useful pipeline
+    // Persistent compute graphs are keyed by tensor types, dimensions,
+    // activation, scales, and batch width. A small bounded cache removes graph
+    // construction from decode without assuming every layer uses one format.
+    int graph_cache_entries = 8;
     // Optional adaptive GPU expert-cache budget. Zero keeps only the pipeline
     // slots. The hardware planner can safely assign otherwise-unused Strix
     // memory here while retaining its KV/graph reserve.
@@ -32,6 +36,70 @@ struct MoeStreamConfig {
     MoeNvmeConfig nvme{};
 
     static MoeStreamConfig from_env();
+};
+
+// Complete numerical contract for one streamed gated expert. This is the
+// model-adapter boundary: storage scheduling consumes byte ranges, while the
+// reusable compute path consumes this shape/type/activation description.
+// input_dim and output_dim may differ, although common routed FFNs use the
+// same value for both.
+struct MoeStreamExpertSpec {
+    int input_dim = 0;
+    int intermediate_dim = 0;
+    int output_dim = 0;
+    ggml_type gate_type = GGML_TYPE_COUNT;
+    ggml_type up_type = GGML_TYPE_COUNT;
+    ggml_type down_type = GGML_TYPE_COUNT;
+    ggml_type gate_up_type = GGML_TYPE_COUNT;
+    bool fused_gate_up = false;
+    MoeGatedActivation gated_activation = MoeGatedActivation::SwiGlu;
+    float swiglu_clamp = 0.0f;
+    float situ_beta = 4.0f;
+    float situ_linear_beta = 25.0f;
+    float gate_scale = 1.0f;
+    float up_scale = 1.0f;
+    float down_scale = 1.0f;
+    float gate_up_scale = 1.0f;
+};
+
+// Build the common contract from an existing model's ordinary MoE metadata.
+// New adapters may either use this helper or populate MoeStreamExpertSpec
+// directly when their latent input/output dimensions differ.
+bool make_moe_stream_expert_spec(
+    const MoeHybridConfig & cfg,
+    const MoeLayerDesc & desc,
+    const LayerExpertRegions & regions,
+    MoeStreamExpertSpec & out,
+    std::string * err = nullptr);
+
+// Reject a shape/type/layout mismatch before launching a kernel. This makes a
+// bad adapter fail deterministically instead of silently interpreting the
+// wrong number of weight bytes.
+bool validate_moe_stream_expert_layout(
+    const MoeStreamExpertSpec & spec,
+    const MoeExpertIoLayout & layout,
+    std::string * err = nullptr);
+
+// Model-neutral routed batch. Inputs and outputs are token-major contiguous
+// F32 matrices. resident_local_by_global is optional; when supplied, IDs with
+// a non-negative entry are already owned by another tier and are skipped.
+struct MoeStreamRouteBatch {
+    int layer = 0;
+    int n_expert = 0;
+    int top_k = 0;
+    int n_tokens = 0;
+    const float * inputs = nullptr;
+    const int32_t * selected_ids = nullptr;
+    const float * selected_weights = nullptr;
+    const int32_t * resident_local_by_global = nullptr;
+    size_t resident_map_size = 0;
+};
+
+struct MoeStreamComputeStats {
+    uint64_t graph_builds = 0;
+    uint64_t graph_cache_hits = 0;
+    uint64_t graph_evictions = 0;
+    uint64_t graph_launches = 0;
 };
 
 class MoeHybridStreamEngine {
@@ -114,11 +182,28 @@ public:
     size_t scratch_bytes() const;
     const char * io_backend_name() const;
     MoeNvmeStats io_stats() const;
+    MoeStreamComputeStats compute_stats() const;
 
 private:
+    friend bool eval_moe_streamed_experts(
+        MoeHybridStreamEngine &,
+        const MoeStreamExpertSpec &,
+        const MoeStreamRouteBatch &,
+        std::vector<float> &,
+        std::string *);
     struct Runtime;
     std::unique_ptr<Runtime> runtime_;
 };
+
+// Evaluate exactly the experts selected by the native router. Placement only
+// decides which selected IDs arrive here; no prediction or cache policy can
+// change the returned mathematical function.
+bool eval_moe_streamed_experts(
+    MoeHybridStreamEngine & engine,
+    const MoeStreamExpertSpec & spec,
+    const MoeStreamRouteBatch & batch,
+    std::vector<float> & out,
+    std::string * err = nullptr);
 
 // Evaluate the cold contribution for one layer. All routed SSD requests are
 // admitted before compute starts, then double-buffered H2D runs concurrently

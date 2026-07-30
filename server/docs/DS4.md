@@ -177,12 +177,13 @@ The runtime logs the chosen split with a `[deepseek4-split] auto-split:` banner.
 
 ### NVMe cold-capacity tier
 
-When the cold expert stack cannot fit on Strix, the inference engine turns the
-safe remaining Strix memory into an adaptive warm-expert cache and streams only
-exact routed misses from NVMe.
-`DFLASH_MOE_NVME_COLD_TIER=auto` selects this only when required by measured
-free memory; `on` forces qualification and `off` requires resident experts.
-The R9700 continues to own dense layers and hot experts. See
+When the cold expert stack cannot fit on its compute device, the inference
+engine turns safe remaining memory into an adaptive warm-expert cache and
+streams only exact routed misses from NVMe. This supports both R9700+Strix
+expert parallelism and a single Strix Halo. `DFLASH_MOE_NVME_COLD_TIER=auto`
+selects streaming when capacity requires it; `on` forces at least one cold
+expert per layer for qualification and `off` requires resident experts. On a
+full Lucebox the R9700 continues to own dense layers and hot experts. See
 [`MOE_NVME_STREAMING.md`](MOE_NVME_STREAMING.md) for the data path, tuning,
 and benchmark methodology.
 
@@ -197,8 +198,8 @@ and benchmark methodology.
 | `DFLASH_DS4_MOE_TP` | Enable routed-expert partitioning. |
 | `DFLASH_DS4_MOE_TP_INPROC` | Use two local HIP backends instead of an expert IPC worker. |
 | `DFLASH_DS4_MOE_TP_GPU` | HIP device that owns the cold expert stack. |
-| `DFLASH_MOE_NVME_COLD_TIER` | `auto`, `on`, or `off` for the Strix-backed SSD cold-capacity tier. |
-| `DFLASH_MOE_NVME_DEVICE_CACHE_MB` | Optional explicit Strix adaptive expert-cache budget; auto mode otherwise uses safe free memory. |
+| `DFLASH_MOE_NVME_COLD_TIER` | `auto`, `on`, or `off` for the SSD cold-capacity tier on dual-device or Strix-only deployments. |
+| `DFLASH_MOE_NVME_DEVICE_CACHE_MB` | Optional explicit adaptive device expert-cache budget; auto mode otherwise uses safe free memory. |
 | `DFLASH_EXPERT_BUDGET_MB` | Main-GPU memory budget for hot experts. |
 | `DFLASH_DS4_HOTNESS_CSV` | Optional per-layer routing profile for hot placement. |
 | `GGML_CUDA_BATCH_PEER_COPIES` | Batch ordered peer copies behind one dependency. |

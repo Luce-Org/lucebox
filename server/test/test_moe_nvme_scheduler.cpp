@@ -96,6 +96,7 @@ void verify_lease(const MoeNvmeLease & lease, int layer, int expert) {
     NVME_REQUIRE(layout.key.expert == expert);
     const int expected_spans = layer == 0 ? 3 : 2;
     NVME_REQUIRE(layout.span_count == expected_spans);
+    NVME_REQUIRE(layout.component_count == expected_spans);
     for (int tensor = 0; tensor < layout.span_count; ++tensor) {
         const MoeExpertIoSpan & span = layout.spans[tensor];
         const uint8_t * payload = lease.data() + span.buffer_offset;
@@ -124,6 +125,7 @@ TEST_CASE(MoeNvmeSchedulerFixture, exact_layout_bounds_and_alignment) {
     NVME_REQUIRE(make_moe_expert_io_layout(
         0, 3, model.regions[0], model.file.size(), 4096, layout, &err));
     NVME_REQUIRE(layout.span_count == 3);
+    NVME_REQUIRE(layout.component_count == 3);
     NVME_REQUIRE(layout.payload_bytes ==
                  model.regions[0].expert_bytes_gate +
                  model.regions[0].expert_bytes_up +
@@ -133,6 +135,75 @@ TEST_CASE(MoeNvmeSchedulerFixture, exact_layout_bounds_and_alignment) {
         0, SyntheticModel::kExperts, model.regions[0], model.file.size(),
         4096, layout, &err));
     NVME_REQUIRE(!err.empty());
+}
+
+TEST_CASE(MoeNvmeSchedulerFixture, expert_major_layout_uses_one_read_without_changing_components) {
+    constexpr int experts = SyntheticModel::kExperts;
+    constexpr size_t gate_bytes = 4093;
+    constexpr size_t up_bytes = 6141;
+    constexpr size_t down_bytes = 8189;
+    constexpr size_t gate_offset = 0;
+    constexpr size_t up_offset = 4352;
+    constexpr size_t down_offset = 10752;
+    constexpr size_t stride = 19456;
+    constexpr size_t file_offset = 4096;
+
+    std::vector<uint8_t> file(file_offset + stride * experts + 4096, 0xa5);
+    LayerExpertRegions layer;
+    layer.expert_bytes_gate = gate_bytes;
+    layer.expert_bytes_up = up_bytes;
+    layer.expert_bytes_down = down_bytes;
+    layer.expert_major.enabled = true;
+    layer.expert_major.expert_stride = stride;
+    layer.expert_major.gate_offset = gate_offset;
+    layer.expert_major.up_offset = up_offset;
+    layer.expert_major.down_offset = down_offset;
+    layer.expert_major.experts = {file_offset, stride * experts, 0};
+    for (int expert = 0; expert < experts; ++expert) {
+        const size_t base = file_offset + (size_t) expert * stride;
+        for (size_t i = 0; i < gate_bytes; ++i) {
+            file[base + gate_offset + i] = expected_byte(0, 0, expert, i);
+        }
+        for (size_t i = 0; i < up_bytes; ++i) {
+            file[base + up_offset + i] = expected_byte(0, 1, expert, i);
+        }
+        for (size_t i = 0; i < down_bytes; ++i) {
+            file[base + down_offset + i] = expected_byte(0, 2, expert, i);
+        }
+    }
+
+    MoeExpertIoLayout layout;
+    std::string err;
+    NVME_REQUIRE(make_moe_expert_io_layout(
+        0, 5, layer, file.size(), 4096, layout, &err));
+    NVME_REQUIRE(layout.span_count == 1);
+    NVME_REQUIRE(layout.component_count == 3);
+    NVME_REQUIRE(layout.payload_bytes == stride);
+    NVME_REQUIRE(layout.component(MoeExpertComponentKind::Gate)->device_offset == gate_offset);
+    NVME_REQUIRE(layout.component(MoeExpertComponentKind::Up)->device_offset == up_offset);
+    NVME_REQUIRE(layout.component(MoeExpertComponentKind::Down)->device_offset == down_offset);
+
+    MoeNvmeConfig config;
+    config.backend = MoeNvmeBackend::Mmap;
+    config.direct_io = MoeNvmeDirectMode::Disabled;
+    config.host_slots = 4;
+    MoeNvmeScheduler scheduler;
+    NVME_REQUIRE(scheduler.init(config, stride, aligned_allocate,
+                                aligned_free, nullptr, &err));
+    NVME_REQUIRE(scheduler.bind_source(
+        {file.data(), file.size(), -1}, {layer}, &err));
+    MoeNvmeLease lease;
+    NVME_REQUIRE(scheduler.acquire(0, 5, lease, &err));
+    const MoeExpertIoSpan & record = lease.layout().spans[0];
+    const uint8_t * payload = lease.data() + record.buffer_offset;
+    NVME_REQUIRE(payload[gate_offset] == expected_byte(0, 0, 5, 0));
+    NVME_REQUIRE(payload[up_offset + up_bytes / 2] ==
+                 expected_byte(0, 1, 5, up_bytes / 2));
+    NVME_REQUIRE(payload[down_offset + down_bytes - 1] ==
+                 expected_byte(0, 2, 5, down_bytes - 1));
+    lease.reset();
+    NVME_REQUIRE(scheduler.stats().read_ops == 1);
+    NVME_REQUIRE(scheduler.stats().errors == 0);
 }
 
 TEST_CASE(MoeNvmeSchedulerFixture, async_exact_reads_dedupe_and_cache) {

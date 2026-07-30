@@ -40,6 +40,29 @@ static bool env_flag_enabled(const char * name) {
     return value && value[0] && std::strcmp(value, "0") != 0;
 }
 
+enum class MoeNvmeColdTierMode {
+    Auto,
+    Enabled,
+    Disabled,
+    Invalid,
+};
+
+static MoeNvmeColdTierMode moe_nvme_cold_tier_mode() {
+    const char * value = std::getenv("DFLASH_MOE_NVME_COLD_TIER");
+    if (!value || !value[0] || std::strcmp(value, "auto") == 0) {
+        return MoeNvmeColdTierMode::Auto;
+    }
+    if (std::strcmp(value, "1") == 0 || std::strcmp(value, "on") == 0 ||
+        std::strcmp(value, "true") == 0) {
+        return MoeNvmeColdTierMode::Enabled;
+    }
+    if (std::strcmp(value, "0") == 0 || std::strcmp(value, "off") == 0 ||
+        std::strcmp(value, "false") == 0) {
+        return MoeNvmeColdTierMode::Disabled;
+    }
+    return MoeNvmeColdTierMode::Invalid;
+}
+
 static void configure_gfx1151_dspark_mmvq_default(int gpu) {
 #if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
     if (!env_flag_enabled("DFLASH_DS4_SPEC") ||
@@ -394,6 +417,42 @@ static bool compute_ds4_hybrid_budget_info(const DeepSeek4Weights & w,
     return true;
 }
 
+// Safe adaptive cache budget after dense and statically-hot weights have been
+// allocated on the same device. This is the Strix-only counterpart of the
+// separate expert-GPU budget: reserve the not-yet-created KV cache and runtime
+// headroom, then expose only genuine leftover memory to the common SSD tier.
+static size_t compute_single_device_stream_cache_budget(
+        const DeepSeek4Weights & w,
+        const Ds4ExpertMemoryInfo & placed,
+        int gpu,
+        int max_ctx) {
+    size_t gpu_free = 0;
+    size_t gpu_total = 0;
+    ggml_backend_cuda_get_device_memory(gpu, &gpu_free, &gpu_total);
+    if (gpu_total == 0) return 0;
+
+    const uint64_t kv_bytes = estimate_ds4_cache_bytes(w, max_ctx);
+    const uint64_t runtime_reserve =
+        256ULL * 1024 * 1024 + 512ULL * 1024 * 1024;
+    uint64_t available = (uint64_t) gpu_free > kv_bytes + runtime_reserve
+        ? (uint64_t) gpu_free - kv_bytes - runtime_reserve : 0;
+
+    // On a single device, DFLASH_EXPERT_BUDGET_MB is a cap for all routed
+    // residency, not a second cache allowance on top of the static hot set.
+    if (const char * cap_env = std::getenv("DFLASH_EXPERT_BUDGET_MB")) {
+        const uint64_t cap =
+            (uint64_t) std::max(0, std::atoi(cap_env)) * 1024ULL * 1024ULL;
+        if (cap > 0) {
+            const uint64_t cap_remaining = cap > placed.hot_bytes
+                ? cap - placed.hot_bytes : 0;
+            available = std::min(available, cap_remaining);
+        }
+    }
+    available = std::min(available, placed.cold_bytes);
+    return available > (uint64_t) std::numeric_limits<size_t>::max()
+        ? std::numeric_limits<size_t>::max() : (size_t) available;
+}
+
 static MoeHybridConfig make_ds4_parent_worker_cfg(const DeepSeek4Weights & w) {
     MoeHybridConfig cfg;
     cfg.n_embd = w.n_embd;
@@ -476,8 +535,10 @@ bool DeepSeek4Backend::load_model() {
     // disable the requested split before the TP runtime can initialize.
     const bool force_full = env_flag_enabled("DFLASH_DS4_FORCE_FULL_LOAD");
     const bool heterogeneous_tp = env_flag_enabled("DFLASH_DS4_MOE_TP");
+    const bool explicit_ssd_capacity =
+        moe_nvme_cold_tier_mode() == MoeNvmeColdTierMode::Enabled;
     const bool need_monolithic =
-        requires_monolithic_model() && !heterogeneous_tp;
+        requires_monolithic_model() && !heterogeneous_tp && !explicit_ssd_capacity;
     if (target_backend == PlacementBackend::Hip &&
         (force_full || need_monolithic)) {
         std::fprintf(stderr,
@@ -791,6 +852,18 @@ bool DeepSeek4Backend::compute_uniform_hybrid_placement(const DeepSeek4Weights &
 
     const bool all_cold = env_flag_enabled("DFLASH_DS4_MOE_TP_ALL_COLD");
     int hot_per_layer = all_cold ? 0 : budget.max_hot_per_layer;
+    if (!all_cold &&
+        moe_nvme_cold_tier_mode() == MoeNvmeColdTierMode::Enabled &&
+        hot_per_layer >= w.n_expert) {
+        // `on` is also a qualification switch. Keep one exact expert per
+        // layer in the SSD tier when the whole model would otherwise fit, so
+        // a single-Strix user can exercise the real path without inventing a
+        // fragile machine-specific memory cap. `auto` still prefers full
+        // residency whenever it fits.
+        hot_per_layer = std::max(0, w.n_expert - 1);
+        std::fprintf(stderr,
+            "[deepseek4] forced SSD tier: reserving one cold expert per layer\n");
+    }
     if (all_cold) {
         std::fprintf(stderr,
                      "[deepseek4-moe-tp] all routed experts assigned to the cold backend\n");
@@ -859,8 +932,23 @@ bool DeepSeek4Backend::init_hybrid_model() {
     auto hybrid = std::make_shared<MoeHybridStorage>();
     MoeHybridConfig hybrid_cfg = make_ds4_parent_worker_cfg(w_);
     size_t nvme_device_cache_bytes = 0;
+    const bool tp_requested = env_flag_enabled("DFLASH_DS4_MOE_TP");
     const bool inprocess_tp =
-        env_flag_enabled("DFLASH_DS4_MOE_TP") && ds4_inprocess_moe_tp_enabled();
+        tp_requested && ds4_inprocess_moe_tp_enabled();
+    const bool external_tp = tp_requested && !inprocess_tp;
+    MoeNvmeColdTierMode nvme_mode = moe_nvme_cold_tier_mode();
+    if (nvme_mode == MoeNvmeColdTierMode::Invalid) {
+        std::fprintf(stderr,
+            "[deepseek4] ignoring invalid DFLASH_MOE_NVME_COLD_TIER; using auto\n");
+        nvme_mode = MoeNvmeColdTierMode::Auto;
+    }
+
+    // A partially resident single-GPU model streams its non-resident experts
+    // on the same device. In-process TP instead streams them on the expert GPU;
+    // external TP leaves them to the remote worker and does not start a local
+    // SSD service. `off` explicitly selects the older materialized CPU tail.
+    bool stream_cold = !external_tp &&
+        nvme_mode != MoeNvmeColdTierMode::Disabled;
     if (inprocess_tp) {
         const int expert_gpu = ds4_moe_tp_gpu(cfg_.device.gpu);
         if (expert_gpu == cfg_.device.gpu) {
@@ -883,18 +971,10 @@ bool DeepSeek4Backend::init_hybrid_model() {
         }
         hybrid_cfg.cold_expert_backend = MoeHybridColdBackend::Gpu;
 
-        // Third tier: R9700 static-hot -> Strix adaptive-warm -> SSD misses.
-        // Keep the established fully-resident path whenever it fits. In auto
-        // mode, switch only when the cold stack plus a safety reserve exceeds
-        // currently available Strix memory. An explicit override is useful
-        // for qualification on models that already fit.
-        bool stream_cold = false;
-        const char * nvme_mode = std::getenv("DFLASH_MOE_NVME_COLD_TIER");
-        if (nvme_mode && (std::strcmp(nvme_mode, "1") == 0 ||
-                          std::strcmp(nvme_mode, "on") == 0 ||
-                          std::strcmp(nvme_mode, "true") == 0)) {
-            stream_cold = true;
-        } else if (!nvme_mode || std::strcmp(nvme_mode, "auto") == 0) {
+        // On a separate expert GPU, auto mode retains the established fully
+        // resident path whenever the cold stack fits after a conservative
+        // reserve. Explicit on/off remain authoritative.
+        if (nvme_mode == MoeNvmeColdTierMode::Auto) {
             Ds4ExpertMemoryInfo info;
             std::string memory_error;
             size_t expert_free = 0;
@@ -914,15 +994,9 @@ bool DeepSeek4Backend::init_hybrid_model() {
                     gib(nvme_device_cache_bytes),
                     stream_cold ? "ssd-stream" : "resident");
             }
-        } else if (std::strcmp(nvme_mode, "0") != 0 &&
-                   std::strcmp(nvme_mode, "off") != 0 &&
-                   std::strcmp(nvme_mode, "false") != 0) {
-            std::fprintf(stderr,
-                "[deepseek4] ignoring invalid DFLASH_MOE_NVME_COLD_TIER=%s\n",
-                nvme_mode);
         }
-        hybrid_cfg.materialize_cold_experts = !stream_cold;
     }
+    hybrid_cfg.materialize_cold_experts = !stream_cold && !external_tp;
     if (!build_deepseek4_moe_hybrid_storage_from_file_with_mmap(
             cfg_.model_path, backend_, w_, moe_placement_, &hybrid_cfg,
             *hybrid, &err, expert_backend_)) {
@@ -934,12 +1008,39 @@ bool DeepSeek4Backend::init_hybrid_model() {
         return false;
     }
 
-    if (hybrid->has_mmap() && !hybrid->materialized_cold_experts) {
+    if (stream_cold && !inprocess_tp &&
+        !std::getenv("DFLASH_MOE_NVME_DEVICE_CACHE_MB")) {
+        Ds4ExpertMemoryInfo placed;
+        std::string memory_error;
+        if (compute_ds4_expert_memory_info(w_, &moe_placement_,
+                                           placed, &memory_error)) {
+            nvme_device_cache_bytes = compute_single_device_stream_cache_budget(
+                w_, placed, cfg_.device.gpu, max_ctx);
+            size_t device_free = 0;
+            size_t device_total = 0;
+            ggml_backend_cuda_get_device_memory(
+                cfg_.device.gpu, &device_free, &device_total);
+            std::fprintf(stderr,
+                "[deepseek4] single-device SSD tier: device=%d free=%.2f GiB "
+                "cold=%.2f GiB adaptive-cache=%.2f GiB\n",
+                cfg_.device.gpu, gib(device_free), gib(placed.cold_bytes),
+                gib(nvme_device_cache_bytes));
+        }
+    }
+
+    if (!external_tp && hybrid->has_mmap() &&
+        !hybrid->materialized_cold_experts) {
         size_t max_expert_bytes = 0;
-        for (const auto & layer : hybrid->layers) {
-            const size_t per_expert_bytes = layer.fused_gate_up
+        for (size_t il = 0; il < hybrid->layers.size(); ++il) {
+            const auto & layer = hybrid->layers[il];
+            size_t per_expert_bytes = layer.fused_gate_up
                 ? layer.gate_up_expert_bytes + layer.down_expert_bytes
                 : layer.gate_expert_bytes + layer.up_expert_bytes + layer.down_expert_bytes;
+            if (il < hybrid->layer_regions.size() &&
+                hybrid->layer_regions[il].expert_major.enabled) {
+                per_expert_bytes =
+                    hybrid->layer_regions[il].expert_major.expert_stride;
+            }
             max_expert_bytes = std::max(max_expert_bytes, per_expert_bytes);
         }
         if (max_expert_bytes == 0) {
@@ -960,9 +1061,10 @@ bool DeepSeek4Backend::init_hybrid_model() {
         }
         std::fprintf(stderr,
                      "[deepseek4] cold-expert SSD engine ready: io=%s pinned=%.1f MiB "
-                     "strix_cache=%.1f MiB slots=%d\n",
+                     "device=%d device_cache=%.1f MiB slots=%d\n",
                      stream_engine_.io_backend_name(),
                      stream_engine_.pinned_bytes() / 1024.0 / 1024.0,
+                     inprocess_tp ? ds4_moe_tp_gpu(cfg_.device.gpu) : cfg_.device.gpu,
                      stream_engine_.device_cache_bytes() / 1024.0 / 1024.0,
                      stream_engine_.device_slot_count());
     }
@@ -970,8 +1072,10 @@ bool DeepSeek4Backend::init_hybrid_model() {
     moe_hybrid_ = std::move(hybrid);
     w_.moe_hybrid = true;
     const int total_cold = w_.n_layer * w_.n_expert - moe_placement_.total_hot;
-    const char * cold_backend =
-        moe_hybrid_->cold_backend_kind == MoeHybridColdBackend::Gpu ? "gpu" : "cpu";
+    const char * cold_backend = stream_engine_.is_bound()
+        ? "ssd" : (external_tp ? "remote" :
+            (moe_hybrid_->cold_backend_kind == MoeHybridColdBackend::Gpu
+                ? "gpu" : "cpu"));
     std::fprintf(stderr, "[deepseek4] hybrid experts ready: hot=%d cold=%d cold_backend=%s%s\n",
                  moe_placement_.total_hot, total_cold, cold_backend, "");
     return true;

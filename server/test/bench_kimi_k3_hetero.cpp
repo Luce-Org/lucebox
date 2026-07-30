@@ -61,115 +61,6 @@ double gib(uint64_t bytes) {
     return (double) bytes / (1024.0 * 1024.0 * 1024.0);
 }
 
-class PersistentKimiExpertGraph {
-public:
-    ~PersistentKimiExpertGraph() { destroy(); }
-
-    bool init(ggml_backend_t backend, std::string & error) {
-        backend_ = backend;
-        ggml_init_params params{};
-        params.mem_size = 16 * 1024 * 1024;
-        params.no_alloc = true;
-        ctx_ = ggml_init(params);
-        if (!ctx_) {
-            error = "ggml_init failed for Kimi expert graph";
-            return false;
-        }
-
-        gate_ = ggml_new_tensor_2d(
-            ctx_, GGML_TYPE_IQ1_S, kKimiLatent, kKimiExpertFf);
-        up_ = ggml_new_tensor_2d(
-            ctx_, GGML_TYPE_IQ1_S, kKimiLatent, kKimiExpertFf);
-        down_ = ggml_new_tensor_2d(
-            ctx_, GGML_TYPE_IQ1_S, kKimiExpertFf, kKimiLatent);
-        input_ = ggml_new_tensor_2d(ctx_, GGML_TYPE_F32, kKimiLatent, 1);
-        ggml_set_input(gate_);
-        ggml_set_input(up_);
-        ggml_set_input(down_);
-        ggml_set_input(input_);
-
-        ggml_tensor * gate_value = ggml_mul_mat(ctx_, gate_, input_);
-        ggml_tensor * up_value = ggml_mul_mat(ctx_, up_, input_);
-
-        // SiTU(g, u) = beta*tanh(g/beta)*sigmoid(g)
-        //              * linear_beta*tanh(u/linear_beta).
-        ggml_tensor * activated = ggml_scale(ctx_, gate_value, 1.0f / kSituBeta);
-        activated = ggml_tanh(ctx_, activated);
-        activated = ggml_scale(ctx_, activated, kSituBeta);
-        activated = ggml_mul(ctx_, activated, ggml_sigmoid(ctx_, gate_value));
-        up_value = ggml_scale(ctx_, up_value, 1.0f / kSituLinearBeta);
-        up_value = ggml_tanh(ctx_, up_value);
-        up_value = ggml_scale(ctx_, up_value, kSituLinearBeta);
-        activated = ggml_mul(ctx_, activated, up_value);
-        output_ = ggml_mul_mat(ctx_, down_, activated);
-        ggml_set_output(output_);
-
-        graph_ = ggml_new_graph_custom(ctx_, 256, false);
-        ggml_build_forward_expand(graph_, output_);
-        buffer_ = ggml_backend_alloc_ctx_tensors(ctx_, backend_);
-        if (!buffer_) {
-            error = "device allocation failed for Kimi expert graph";
-            return false;
-        }
-
-        std::vector<float> input((size_t) kKimiLatent);
-        for (size_t i = 0; i < input.size(); ++i) {
-            input[i] = 0.01f * std::sin((float) i * 0.013f);
-        }
-        ggml_backend_tensor_set(
-            input_, input.data(), 0, input.size() * sizeof(float));
-        return true;
-    }
-
-    bool launch(const MoeHybridStreamEngine & engine, std::string & error) {
-        if (!ctx_ || !graph_ || !backend_) {
-            error = "Kimi expert graph is not initialized";
-            return false;
-        }
-        if (engine.scratch_gate_bytes() != ggml_nbytes(gate_) ||
-            engine.scratch_up_bytes() != ggml_nbytes(up_) ||
-            engine.scratch_down_bytes() != ggml_nbytes(down_)) {
-            error = "streamed Kimi expert byte layout does not match IQ1_S graph";
-            return false;
-        }
-        gate_->data = const_cast<void *>(engine.scratch_gate_data());
-        up_->data = const_cast<void *>(engine.scratch_up_data());
-        down_->data = const_cast<void *>(engine.scratch_down_data());
-        if (ggml_backend_graph_compute_async(backend_, graph_) !=
-            GGML_STATUS_SUCCESS) {
-            error = "Kimi expert graph launch failed";
-            return false;
-        }
-        return true;
-    }
-
-    void destroy() {
-        if (backend_) ggml_backend_synchronize(backend_);
-        if (buffer_) {
-            ggml_backend_buffer_free(buffer_);
-            buffer_ = nullptr;
-        }
-        if (ctx_) {
-            ggml_free(ctx_);
-            ctx_ = nullptr;
-        }
-        graph_ = nullptr;
-        backend_ = nullptr;
-        gate_ = up_ = down_ = input_ = output_ = nullptr;
-    }
-
-private:
-    ggml_backend_t backend_ = nullptr;
-    ggml_context * ctx_ = nullptr;
-    ggml_cgraph * graph_ = nullptr;
-    ggml_backend_buffer_t buffer_ = nullptr;
-    ggml_tensor * gate_ = nullptr;
-    ggml_tensor * up_ = nullptr;
-    ggml_tensor * down_ = nullptr;
-    ggml_tensor * input_ = nullptr;
-    ggml_tensor * output_ = nullptr;
-};
-
 std::vector<int32_t> route_for(int token, int layer, int top_k, bool repeat) {
     std::vector<int32_t> population((size_t) kKimiExperts);
     std::iota(population.begin(), population.end(), 0);
@@ -289,13 +180,24 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    PersistentKimiExpertGraph expert_graph;
-    if (compute_arg && !expert_graph.init(backend, error)) {
-        std::fprintf(stderr, "Kimi graph initialization failed: %s\n", error.c_str());
-        engine.destroy();
-        ggml_backend_free(backend);
-        return 1;
+    MoeStreamExpertSpec expert_spec;
+    expert_spec.input_dim = (int) kKimiLatent;
+    expert_spec.intermediate_dim = (int) kKimiExpertFf;
+    expert_spec.output_dim = (int) kKimiLatent;
+    expert_spec.gate_type = GGML_TYPE_IQ1_S;
+    expert_spec.up_type = GGML_TYPE_IQ1_S;
+    expert_spec.down_type = GGML_TYPE_IQ1_S;
+    expert_spec.gated_activation = MoeGatedActivation::Situ;
+    expert_spec.situ_beta = kSituBeta;
+    expert_spec.situ_linear_beta = kSituLinearBeta;
+
+    std::vector<float> model_input((size_t) kKimiLatent);
+    for (size_t i = 0; i < model_input.size(); ++i) {
+        model_input[i] = 0.01f * std::sin((float) i * 0.013f);
     }
+    std::vector<float> route_weights(
+        (size_t) top_k_arg, 1.0f / (float) top_k_arg);
+    std::vector<float> routed_output;
 
     const uint64_t accesses =
         tokens_arg * layers_arg * top_k_arg;
@@ -304,6 +206,25 @@ int main(int argc, char ** argv) {
         for (int layer = 0; layer < (int) layers_arg; ++layer) {
             const std::vector<int32_t> experts = route_for(
                 token, layer, (int) top_k_arg, repeat_arg != 0);
+            if (compute_arg) {
+                MoeStreamRouteBatch batch;
+                batch.layer = layer;
+                batch.n_expert = kKimiExperts;
+                batch.top_k = (int) top_k_arg;
+                batch.n_tokens = 1;
+                batch.inputs = model_input.data();
+                batch.selected_ids = experts.data();
+                batch.selected_weights = route_weights.data();
+                if (!eval_moe_streamed_experts(
+                        engine, expert_spec, batch, routed_output, &error)) {
+                    std::fprintf(stderr,
+                        "common streamed-expert evaluation failed: %s\n",
+                        error.c_str());
+                    return 1;
+                }
+                continue;
+            }
+
             engine.request_experts(
                 layer, experts.data(), (int) experts.size(), MoeNvmePriority::Demand);
 
@@ -319,12 +240,7 @@ int main(int argc, char ** argv) {
                     std::fprintf(stderr, "expert activation failed: %s\n", error.c_str());
                     return 1;
                 }
-                if (compute_arg && !expert_graph.launch(engine, error)) {
-                    std::fprintf(stderr, "expert compute failed: %s\n", error.c_str());
-                    return 1;
-                }
-
-                // Disk/H2D for expert N+1 overlaps expert N's persistent graph.
+                // Disk/H2D for expert N+1 overlaps bookkeeping for expert N.
                 if (i + 1 < experts.size()) {
                     int next_slot = -1;
                     if (!engine.stage_expert_cached_async(
@@ -335,7 +251,6 @@ int main(int argc, char ** argv) {
                     }
                     staged_slot = next_slot;
                 }
-                if (compute_arg) ggml_backend_synchronize(backend);
                 engine.release_device_slot(current_slot);
             }
         }
@@ -345,6 +260,7 @@ int main(int argc, char ** argv) {
     const double seconds =
         std::chrono::duration<double>(end - begin).count();
     const MoeNvmeStats stats = engine.io_stats();
+    const MoeStreamComputeStats compute_stats = engine.compute_stats();
     const double misses = expert_bytes > 0
         ? (double) stats.payload_bytes / (double) expert_bytes : 0.0;
     const double hit_rate = accesses > 0
@@ -369,12 +285,15 @@ int main(int argc, char ** argv) {
         seconds > 0 ? (double) accesses / seconds : 0.0);
     std::printf(
         "ssd_payload_gib=%.6f physical_gib=%.6f pipeline_gib_s=%.6f "
-        "estimated_device_cache_hit=%.4f cache_gib=%.3f io_errors=%" PRIu64 "\n",
+        "estimated_device_cache_hit=%.4f cache_gib=%.3f io_errors=%" PRIu64
+        " graph_builds=%" PRIu64 " graph_hits=%" PRIu64
+        " graph_launches=%" PRIu64 "\n",
         gib(stats.payload_bytes), gib(stats.physical_bytes),
         seconds > 0 ? gib(stats.payload_bytes) / seconds : 0.0,
-        hit_rate, gib(engine.device_cache_bytes()), stats.errors);
+        hit_rate, gib(engine.device_cache_bytes()), stats.errors,
+        compute_stats.graph_builds, compute_stats.graph_cache_hits,
+        compute_stats.graph_launches);
 
-    expert_graph.destroy();
     engine.destroy();
     ggml_backend_free(backend);
 #if defined(_WIN32)

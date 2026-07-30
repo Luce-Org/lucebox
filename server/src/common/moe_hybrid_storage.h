@@ -24,6 +24,21 @@ struct ExpertFileRegion {
     uint32_t source_index = 0;
 };
 
+// Optional expert-major representation. All components of one expert occupy
+// one contiguous record, allowing one storage request instead of two or three
+// tensor-major requests. The numerical tensor types and values are unchanged;
+// only their physical ordering differs. Model adapters can leave this disabled
+// for ordinary GGUF tensor-major files.
+struct ExpertMajorFileLayout {
+    ExpertFileRegion experts;
+    size_t expert_stride = 0;
+    size_t gate_offset = 0;
+    size_t up_offset = 0;
+    size_t down_offset = 0;
+    size_t gate_up_offset = 0;
+    bool enabled = false;
+};
+
 // Per-layer file regions for all expert tensors (used by streaming prefill).
 struct LayerExpertRegions {
     ExpertFileRegion gate_exps;
@@ -35,6 +50,7 @@ struct LayerExpertRegions {
     size_t expert_bytes_down    = 0;
     size_t expert_bytes_gate_up = 0;
     bool   fused_gate_up        = false;
+    ExpertMajorFileLayout expert_major;
 };
 
 // Cached FFN graph for a fixed number of selected experts.

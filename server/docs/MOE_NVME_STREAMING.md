@@ -3,9 +3,9 @@
 This is an inference-engine feature. It streams existing expert-weight bytes
 from SSD without changing their format or numerical representation.
 
-## Lucebox data path
+## Deployment shapes
 
-The three owners have distinct jobs:
+On a full Lucebox, the three owners have distinct jobs:
 
 1. **R9700** owns dense layers and the statically hot routed experts.
 2. **Strix Halo** owns an adaptive warm-expert cache, the bounded SSD staging
@@ -15,12 +15,33 @@ The three owners have distinct jobs:
 3. **NVMe** is the capacity tier for true cache misses that do not fit in the
    Strix safe-memory budget.
 
-`LayerExpertRegions` is the model-adapter contract. It describes the exact
-GGUF byte ranges for each layer's gate/up/down tensors (or fused gate+up).
-The scheduler therefore has no model names, tensor names, expert dimensions,
-or quantization-format assumptions. Each tensor range can also select a model
-shard; single-file models use shard zero. See [KIMI_K3_HETERO.md](KIMI_K3_HETERO.md)
-for the 14-shard Kimi K3 qualification.
+On a Strix Halo-only machine, the same device owns dense/static-hot weights,
+the warm cache, and streamed-expert execution. The planner reserves KV and
+runtime headroom before assigning otherwise-unused UMA to the cache. Nothing
+in the scheduler assumes an R9700 or peer access.
+
+## Model integration contract
+
+A model adapter supplies three independent descriptions:
+
+1. `LayerExpertRegions` describes physical bytes and model shards. Ordinary
+   GGUF uses tensor-major gate/up/down regions. An optional expert-major record
+   stores all components of one expert contiguously, reducing three reads to
+   one without changing weight values. Component offsets must respect the
+   target backend's tensor alignment.
+2. `MoeStreamExpertSpec` describes dimensions, tensor types, scales, and the
+   gated activation. It supports separate or fused gate/up, different routed
+   input/output widths, SwiGLU, clamped SwiGLU, and SiTU.
+3. `MoeStreamRouteBatch` carries the native router IDs, weights, and F32 input
+   activations. It contains no architecture-specific tensor names.
+
+`eval_moe_streamed_experts` validates the byte layout against the numerical
+specification before compute. It then uses a bounded cache of persistent graphs
+keyed by the full specification and active token width. New MoE families only
+need an adapter that fills these descriptors; the storage scheduler, cache,
+and compute pipeline remain unchanged. Each file range can select a different
+shard, while single-file models use shard zero. See
+[KIMI_K3_HETERO.md](KIMI_K3_HETERO.md) for the 14-shard Kimi K3 qualification.
 
 ## Scheduler
 
@@ -45,10 +66,13 @@ for the 14-shard Kimi K3 qualification.
   upload and execution of expert N.
 - Two or more rotating GPU slots separate the expert being computed from the
   expert being uploaded.
-- Otherwise-unused Strix memory becomes a contiguous model-neutral expert
+- Otherwise-unused device memory becomes a contiguous model-neutral expert
   cache indexed by `(layer, expert)`. Cache hits issue neither SSD reads nor
   host-to-device copies. LFRU replacement cannot evict a pending upload or an
   expert currently executing.
+- Persistent compute graphs remove graph construction and activation-buffer
+  allocation from the steady-state expert loop. A bounded LRU supports models
+  whose layers use more than one expert shape or quantization format.
 
 The native model router remains authoritative. Prediction may only issue a
 bounded prefetch; a wrong prediction cannot change model output.
@@ -75,6 +99,25 @@ export DFLASH_MOE_NVME_COLD_TIER=auto
 Strix receives all currently usable memory (after reserve) as its adaptive
 expert-cache budget, and only the remainder spills to SSD.
 
+### Strix Halo only
+
+Do not enable the MoE-TP variables. A single-device Strix machine normally
+exposes its GPU as `hip:0`:
+
+```bash
+unset DFLASH_DS4_MOE_TP DFLASH_DS4_MOE_TP_INPROC DFLASH_DS4_MOE_TP_GPU
+export DFLASH_MOE_NVME_COLD_TIER=on
+
+./build-hip/dflash_server /path/to/model.gguf \
+  --target-device hip:0 --max-ctx 8192
+```
+
+`on` keeps at least one expert per layer in the SSD tier even if the model
+would otherwise be fully resident, making the path directly testable. For a
+model that genuinely exceeds UMA, `auto` chooses the partial placement itself.
+`DFLASH_EXPERT_BUDGET_MB` can additionally cap static routed-weight residency;
+`DFLASH_MOE_NVME_DEVICE_CACHE_MB` can override the adaptive cache budget.
+
 ## Tuning and diagnostics
 
 Defaults are intentionally small: eight pinned host slots, four fallback I/O
@@ -90,13 +133,19 @@ not improve the qualified P310 drive and consumes extra pinned/system memory.
 | `DFLASH_MOE_NVME_DEMAND_RESERVE` | `2` | Slots unavailable to speculation |
 | `DFLASH_MOE_NVME_PREFETCH_BATCH` | `2` | Maximum speculative jobs per ring submission |
 | `DFLASH_MOE_NVME_DEVICE_SLOTS` | `2` | Minimum rotating GPU expert buffers |
-| `DFLASH_MOE_NVME_DEVICE_CACHE_MB` | automatic/`0` | Override adaptive Strix expert-cache memory; `0` leaves only pipeline slots |
+| `DFLASH_MOE_NVME_DEVICE_CACHE_MB` | automatic/`0` | Override adaptive device expert-cache memory; `0` leaves only pipeline slots |
+| `DFLASH_MOE_NVME_GRAPH_CACHE` | `8` | Persistent expert-graph variants retained per stream engine; `0` is a diagnostic no-cache mode |
+| `DFLASH_MOE_NVME_REFERENCE_EVAL` | unset | Diagnostic only: `1` restores the allocation-heavy reference evaluator for numerical/performance A/B |
 
 Shutdown telemetry reports logical and physical bytes, measured read service
-rate, cache hits, demand wait, de-duplication, dropped speculation, and errors.
-The standalone targets `test_moe_nvme_scheduler`, `bench_moe_nvme_io`, and
-`bench_moe_nvme_pipeline` test correctness, raw storage, and the complete
-SSD-to-GPU path respectively. Benchmarks are read-only.
+rate, cache hits, demand wait, de-duplication, dropped speculation, errors, and
+persistent-graph builds/hits/evictions. `test_moe_stream_compute` generates
+tiny experts and checks both tensor-major and expert-major GPU results against
+a CPU oracle. It defaults to GPU 0, so it runs directly on Strix-only systems;
+`DFLASH_TEST_GPU` selects another device on multi-GPU hosts. The standalone
+targets `test_moe_nvme_scheduler`, `bench_moe_nvme_io`, and
+`bench_moe_nvme_pipeline` test scheduling, raw storage, and the complete
+SSD-to-GPU path. Benchmarks are read-only.
 
 ## Qualification result (2026-07-30)
 
@@ -127,6 +176,16 @@ prompt issued no additional SSD reads and completed in 0.842 seconds: a 2.86x
 warm-request improvement with identical output. Final counters were 731 cache
 misses, 1,463 Strix hits, and zero I/O errors.
 
+The single-Strix production path was also qualified with no MoE-TP variables,
+a 12 GiB static-expert cap, a 255 MiB device cache, and 79.95 GiB left in the
+SSD tier. Two identical seven-token prompts returned identical output in 3.762
+and 3.503 seconds of prefill. Across both requests the engine moved 25.367 GiB
+at 4.350 GiB/s active I/O, reported zero errors, and used one graph build for
+3,056 launches (3,055 graph-cache hits). The allocation-heavy reference path
+took 3.816 and 3.599 seconds on the same run shape, so persistence improved
+this deliberately cold, storage-bound case by 1.4-2.7%; its larger value is
+removing thousands of allocations when more of the route set is warm.
+
 ## Research lineage and next optimization
 
 The bounded priority/cache design follows the lessons of MoE-Infinity and
@@ -136,9 +195,9 @@ that leaves the native router untouched. MoE-SpAc motivates compile-time
 expert layout and I/O coalescing. Tutti's slack-aware `io_uring` scheduling is
 relevant when persistent KV traffic shares the device.
 
-The Kimi qualification now has a persistent reusable expert graph and proves
-that its small expert math can hide under SSD service. The production DS4 path
-still constructs a graph per streamed expert. Its next implementation step is
-to move that qualification design into the common evaluator, then overlap
-hot-owner work with cold-owner streaming. Any learned predictor comes after
-that deterministic path is qualified.
+The persistent graph and model-neutral evaluator are now shared by Kimi
+qualification and production DS4 streaming. The next high-value work is a
+repacked expert-major artifact, followed by overlap of hot-owner work with
+cold-owner streaming. Any learned predictor comes after that deterministic
+path is qualified, and may only prefetch routes selected later by the native
+router.
