@@ -174,6 +174,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release
           cmake --build build \
             --target test_flash_attn_sparse test_deepseek4_mmid_grouped_cuda \
+              test_moe_stream_compute \
             -j"$(nproc)"
 
       - name: Run flash-attn sparse kernel test on the 3090
@@ -183,6 +184,9 @@ jobs:
 
       - name: Run grouped MMID dispatch and parity test on the 3090
         run: ./server/build/test_deepseek4_mmid_grouped_cuda
+
+      - name: Run compact-to-padded MXFP4 expert streaming test on the 3090
+        run: ./server/build/test_moe_stream_compute
 
       # Optional model-backed end-to-end smoke (real spec-decode on the 3090),
       # disabled by default because it builds dflash_server and lazy-loads the
@@ -290,11 +294,12 @@ jobs:
             -DCMAKE_HIP_FLAGS=-DDFLASH_WAVE_SIZE=32
           cmake --build "$RUNNER_TEMP/rocmfp-build" \
             --target test_rocmfp4 test_rocmfpx test_rocmfp4_hip_tail test_rocmfpx_mmq \
-              test_deepseek4_mmid_grouped_cuda test_recurrent_snapshot test_server_unit \
+              test_deepseek4_mmid_grouped_cuda test_moe_stream_compute \
+              test_recurrent_snapshot test_server_unit \
             --parallel 8
           ctest --test-dir "$RUNNER_TEMP/rocmfp-build" \
             --output-on-failure \
-            -R 'rocmfp4_reference|rocmfpx_reference|rocmfp4_hip_tail|rocmfpx_mmq|deepseek4_mmid_grouped_cuda|recurrent_snapshot|ChainRollbackPolicy'
+            -R 'rocmfp4_reference|rocmfpx_reference|rocmfp4_hip_tail|rocmfpx_mmq|deepseek4_mmid_grouped_cuda|test_moe_stream_compute|recurrent_snapshot|ChainRollbackPolicy'
 
   build-windows:
     name: Build Windows (MSVC + CUDA, library + server targets)
