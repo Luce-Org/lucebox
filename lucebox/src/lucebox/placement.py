@@ -134,7 +134,7 @@ def _split_devices(
 ) -> tuple[tuple[GpuDevice, ...], tuple[float, ...]]:
     """Choose the smallest ordered device set that makes the target fit."""
     primary = topology.primary
-    if primary is None:
+    if primary is None or primary_capacity <= 0.0:
         return (), ()
 
     local = sorted(
@@ -172,7 +172,10 @@ def _split_devices(
     allocations: list[float] = []
     for capacity in capacities:
         allocation = min(capacity, remaining)
-        allocations.append(max(allocation, target_gb * 0.05))
+        # Keep a non-trivial shard when capacity allows it, without ever
+        # assigning a device more target weight than its safe byte budget.
+        allocation = min(capacity, max(allocation, target_gb * 0.05))
+        allocations.append(allocation)
         remaining -= allocation
     total_allocation = sum(allocations)
     weights = tuple(round(value / total_allocation, 4) for value in allocations)
@@ -181,17 +184,26 @@ def _split_devices(
     return tuple(selected), weights
 
 
-def _single_option(primary: GpuDevice, fits: bool) -> PlacementOption:
+def _single_option(
+    primary: GpuDevice,
+    *,
+    target_fits: bool,
+    stack_fits: bool,
+) -> PlacementOption:
+    if stack_fits:
+        reason = f"the selected stack fits {primary.name}; avoiding a layer/IPC boundary is faster"
+    elif target_fits:
+        reason = (
+            f"the target fits {primary.name}, but its optional workloads exceed the safe budget"
+        )
+    else:
+        reason = f"the target does not fit the safe memory budget on {primary.name}"
     return PlacementOption(
         key="single",
         label="Primary GPU",
-        available=fits,
-        recommended=fits,
-        reason=(
-            f"the selected stack fits {primary.name}; avoiding a layer/IPC boundary is faster"
-            if fits
-            else f"the target does not fit the safe memory budget on {primary.name}"
-        ),
+        available=stack_fits,
+        recommended=stack_fits,
+        reason=reason,
     )
 
 
@@ -241,7 +253,9 @@ def automatic_placement(
     # of truth for the exact byte budget.
     stack_fits = stack_gb <= primary_capacity or (runtime.spark and capabilities.expert_offload)
 
-    options: list[PlacementOption] = [_single_option(primary, stack_fits)]
+    options: list[PlacementOption] = [
+        _single_option(primary, target_fits=target_fits, stack_fits=stack_fits)
+    ]
     base = PlacementRuntime(mode="single", target_device=primary.placement_name)
     if secondary is None:
         if stack_fits:
@@ -258,7 +272,12 @@ def automatic_placement(
             runtime=base,
             optimization_runtime=runtime,
             summary=primary.name,
-            reason="the selected target exceeds this GPU's safe memory budget",
+            reason=(
+                "the target fits, but its selected optional workloads exceed this GPU's "
+                "safe memory budget"
+                if target_fits
+                else "the selected target exceeds this GPU's safe memory budget"
+            ),
             runnable=False,
             topology=topology,
             options=tuple(options),
@@ -266,27 +285,38 @@ def automatic_placement(
 
     same_backend = primary.backend == secondary.backend
     cross_backend_ready = _cross_backend_ready(cfg, primary, secondary)
-    draft_work_available = (has_draft and runtime.speculative_decode) or (
-        optimizer_drafter_available and runtime.prefill_mode != "off"
+    decode_draft_work = has_draft and runtime.speculative_decode
+    pflash_scorer_work = optimizer_drafter_available and runtime.prefill_mode != "off"
+    draft_work_available = decode_draft_work or pflash_scorer_work
+    draft_work_gb = (draft_gb if decode_draft_work else 0.0) + (
+        scorer_gb if pflash_scorer_work else 0.0
     )
-    draft_offload_available = draft_work_available and (
-        same_backend or (cross_backend_ready and capabilities.remote_draft)
+    secondary_capacity = _primary_capacity(secondary)
+    draft_offload_fits = draft_work_gb <= secondary_capacity
+    draft_offload_compatible = same_backend or (cross_backend_ready and capabilities.remote_draft)
+    draft_offload_available = (
+        draft_work_available and draft_offload_fits and draft_offload_compatible
     )
+    if draft_offload_available:
+        draft_offload_reason = "moves the independent draft/scorer workload off the primary GPU"
+    elif not draft_work_available:
+        draft_offload_reason = "the selected model has no installed draft/scorer workload"
+    elif not draft_offload_fits:
+        draft_offload_reason = (
+            f"the optional workload needs {draft_work_gb:g} GB, but "
+            f"{secondary.name} has {secondary_capacity:g} GB of safe capacity"
+        )
+    else:
+        draft_offload_reason = (
+            "the engine/runtime cannot execute this draft across the backend boundary"
+        )
     options.append(
         PlacementOption(
             key="draft-offload",
             label="Secondary draft/scorer",
             available=draft_offload_available,
             recommended=draft_offload_available and not stack_fits and target_fits,
-            reason=(
-                "moves the independent draft/scorer workload off the primary GPU"
-                if draft_offload_available
-                else (
-                    "the selected model has no installed draft/scorer workload"
-                    if not draft_work_available
-                    else "the engine/runtime cannot execute this draft across the backend boundary"
-                )
-            ),
+            reason=draft_offload_reason,
         )
     )
 
@@ -425,7 +455,10 @@ def automatic_placement(
         optimization_runtime=runtime,
         summary=primary.name,
         reason=(
-            "the target does not fit the primary and no validated secondary-device "
+            "the target fits the primary, but its optional workloads do not and no validated "
+            "secondary-device placement is available"
+            if target_fits
+            else "the target does not fit the primary and no validated secondary-device "
             "placement is available"
         ),
         runnable=False,

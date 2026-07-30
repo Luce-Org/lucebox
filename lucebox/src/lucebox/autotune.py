@@ -151,6 +151,70 @@ def _cap_exact_context(
     return runtime
 
 
+CapacityAdjustment = Literal["pflash", "kvflash-qk", "kvflash-off", "dflash"]
+
+
+def _uses_optimizer_scorer(runtime: DflashRuntime) -> bool:
+    return runtime.prefill_mode != "off" or (
+        runtime.kvflash != "off" and runtime.kvflash_policy == "drafter"
+    )
+
+
+def _without_unused_scorer(runtime: DflashRuntime) -> DflashRuntime:
+    """Clear the scorer path once no enabled feature consumes it."""
+    return runtime if _uses_optimizer_scorer(runtime) else replace(runtime, prefill_drafter="")
+
+
+def _capacity_fallbacks(
+    runtime: DflashRuntime,
+    *,
+    architecture: str,
+) -> tuple[tuple[DflashRuntime, CapacityAdjustment], ...]:
+    """Return progressively smaller optional stacks, in performance order.
+
+    Installed optional assets must never make a fitting target unrunnable.
+    Placement gets the full recommended stack first; only when that has no
+    valid device plan do we remove independent optional workloads. Qwen dense
+    can retain bounded KV residency without the 1.2 GB scorer by switching to
+    its validated QK policy.
+    """
+    candidates: list[tuple[DflashRuntime, CapacityAdjustment]] = []
+    current = runtime
+
+    if current.prefill_mode != "off":
+        defaults = DflashRuntime()
+        current = _without_unused_scorer(
+            replace(
+                current,
+                prefill_mode="off",
+                prefill_keep_ratio=defaults.prefill_keep_ratio,
+                prefill_threshold=defaults.prefill_threshold,
+                prefill_drafter=(
+                    current.prefill_drafter
+                    if current.kvflash != "off" and current.kvflash_policy == "drafter"
+                    else ""
+                ),
+            )
+        )
+        candidates.append((current, "pflash"))
+
+    if current.kvflash != "off" and current.kvflash_policy == "drafter":
+        if architecture == "qwen35":
+            current = replace(current, kvflash_policy="qk")
+            action: CapacityAdjustment = "kvflash-qk"
+        else:
+            current = replace(current, kvflash="off")
+            action = "kvflash-off"
+        current = _without_unused_scorer(current)
+        candidates.append((current, action))
+
+    if current.speculative_decode:
+        current = replace(current, speculative_decode=False, lazy=False)
+        candidates.append((current, "dflash"))
+
+    return tuple(candidates)
+
+
 def automatic_plan(
     cfg: Config,
     *,
@@ -322,20 +386,67 @@ def automatic_plan(
         has_draft=has_draft,
         optimizer_drafter_available=optimizer_drafter_available,
     )
+    capacity_adjustments: set[CapacityAdjustment] = set()
+    if not placement.runnable:
+        for fallback_runtime, adjustment in _capacity_fallbacks(
+            runtime,
+            architecture=preset.architecture,
+        ):
+            capacity_adjustments.add(adjustment)
+            placement = automatic_placement(
+                cfg,
+                fallback_runtime,
+                preset,
+                has_draft=has_draft and fallback_runtime.speculative_decode,
+                optimizer_drafter_available=optimizer_drafter_available,
+            )
+            runtime = fallback_runtime
+            if placement.runnable:
+                break
+
     adjusted = placement.optimization_runtime
     if dflash.enabled and not adjusted.speculative_decode:
+        reason = (
+            "disabled because the draft would exceed the safe GPU memory budget"
+            if "dflash" in capacity_adjustments
+            else "disabled because the selected target placement has no compatible draft path"
+        )
         dflash = OptimizationDecision(
             "DFlash",
             False,
             dflash.available,
-            "disabled because the selected target placement has no compatible draft path",
+            reason,
         )
     if pflash.enabled and adjusted.prefill_mode == "off":
+        reason = (
+            "disabled because the scorer would exceed the safe GPU memory budget"
+            if "pflash" in capacity_adjustments
+            else "disabled because the selected target placement has no compatible compression path"
+        )
         pflash = OptimizationDecision(
             "PFlash",
             False,
             pflash.available,
-            "disabled because the selected target placement has no compatible compression path",
+            reason,
+        )
+    if kvflash.enabled and adjusted.kvflash == "off":
+        reason = (
+            "disabled because its scorer would exceed the safe GPU memory budget"
+            if "kvflash-off" in capacity_adjustments
+            else "disabled because the selected target placement has no compatible KV path"
+        )
+        kvflash = OptimizationDecision(
+            "KVFlash",
+            False,
+            kvflash.available,
+            reason,
+        )
+    elif "kvflash-qk" in capacity_adjustments:
+        kvflash = OptimizationDecision(
+            "KVFlash",
+            True,
+            kvflash.available,
+            "memory is tight; QK policy avoids a separate scorer allocation",
         )
     if spark.enabled and not adjusted.spark:
         spark = OptimizationDecision(
@@ -343,6 +454,14 @@ def automatic_plan(
             False,
             spark.available,
             "disabled because Automatic does not compose Spark with target layer splitting",
+        )
+    if needs_optimizer_drafter:
+        # Do not ask a first-time user to download 1.2 GB only to discard the
+        # scorer during capacity fallback. The scorer-present branch cannot
+        # recurse again because its availability makes ``needs_*`` false.
+        scorer_plan = automatic_plan(cfg, optimizer_drafter_available=True)
+        needs_optimizer_drafter = scorer_plan.placement.runnable and _uses_optimizer_scorer(
+            scorer_plan.runtime
         )
     return OptimizationPlan(
         runtime=adjusted,

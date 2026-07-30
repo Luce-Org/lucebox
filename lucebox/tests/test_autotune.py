@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pytest
 from lucebox.autotune import automatic_plan, runtime_from_host
 from lucebox.types import Config, HostFacts, ModelMeta
 
@@ -247,3 +248,126 @@ def test_known_gpu_specific_ddtree_budgets() -> None:
     assert runtime_from_host(HostFacts(vram_gb=24, gpu_sm="gfx1100")).budget == 8
     assert runtime_from_host(HostFacts(vram_gb=32, gpu_sm="120")).budget == 40
     assert runtime_from_host(HostFacts(vram_gb=31, gpu_sm="gfx1201")).budget == 22
+
+
+@pytest.mark.parametrize(
+    ("vendor", "variant", "architecture"),
+    [
+        ("nvidia", "cuda12", "86"),
+        ("amd", "rocm", "gfx1201"),
+    ],
+)
+def test_20gb_automatic_drops_scorer_before_blocking_a_fitting_target(
+    tmp_path: Path,
+    vendor: str,
+    variant: str,
+    architecture: str,
+) -> None:
+    cfg = Config(
+        variant=variant,
+        models_dir=tmp_path / vendor,
+        host=HostFacts(gpu_vendor=vendor, vram_gb=20, ram_gb=64, gpu_sm=architecture),
+        model=ModelMeta(preset="qwen3.6-27b"),
+    )
+    _install_decode_draft(cfg)
+    _install_optimizer_drafter(cfg)
+
+    plan = automatic_plan(cfg)
+
+    assert plan.placement.runnable is True
+    assert plan.dflash.enabled is True
+    assert plan.pflash.enabled is False
+    assert plan.kvflash.enabled is True
+    assert plan.runtime.speculative_decode is True
+    assert plan.runtime.prefill_mode == "off"
+    assert plan.runtime.prefill_keep_ratio == 0.05
+    assert plan.runtime.prefill_threshold == 32000
+    assert plan.runtime.kvflash_policy == "qk"
+    assert plan.runtime.prefill_drafter == ""
+    assert "scorer" in plan.pflash.reason
+
+
+def test_18gb_automatic_drops_draft_instead_of_blocking_qwen(tmp_path: Path) -> None:
+    cfg = _cfg(
+        tmp_path,
+        "qwen3.6-27b",
+        HostFacts(gpu_vendor="nvidia", vram_gb=18, ram_gb=64, gpu_sm="86"),
+    )
+    _install_decode_draft(cfg)
+    _install_optimizer_drafter(cfg)
+
+    plan = automatic_plan(cfg)
+
+    assert plan.placement.runnable is True
+    assert plan.dflash.enabled is False
+    assert plan.pflash.enabled is False
+    assert plan.kvflash.enabled is True
+    assert plan.runtime.speculative_decode is False
+    assert plan.runtime.kvflash_policy == "qk"
+    assert "memory budget" in plan.dflash.reason
+
+
+def test_18gb_automatic_does_not_offer_a_scorer_it_cannot_keep(tmp_path: Path) -> None:
+    cfg = _cfg(
+        tmp_path,
+        "qwen3.6-27b",
+        HostFacts(gpu_vendor="nvidia", vram_gb=18, ram_gb=64, gpu_sm="86"),
+    )
+
+    plan = automatic_plan(cfg, optimizer_drafter_available=False)
+
+    assert plan.placement.runnable is True
+    assert plan.runtime.kvflash_policy == "qk"
+    assert plan.needs_optimizer_drafter is False
+
+
+def test_18gb_automatic_drops_gemma_draft_when_target_alone_fits(tmp_path: Path) -> None:
+    cfg = Config(
+        variant="rocm",
+        models_dir=tmp_path / "models",
+        host=HostFacts(gpu_vendor="amd", vram_gb=18, ram_gb=64, gpu_sm="gfx1201"),
+        model=ModelMeta(preset="gemma-4-26b"),
+    )
+    _install_decode_draft(cfg)
+
+    plan = automatic_plan(cfg, optimizer_drafter_available=False)
+
+    assert plan.placement.runnable is True
+    assert plan.dflash.enabled is False
+    assert plan.runtime.speculative_decode is False
+    assert "memory budget" in plan.dflash.reason
+
+
+def test_24gb_moe_drops_scored_kvflash_when_host_cannot_run_spark(
+    tmp_path: Path,
+) -> None:
+    cfg = _cfg(
+        tmp_path,
+        "qwen3.6-moe",
+        HostFacts(gpu_vendor="nvidia", vram_gb=24, ram_gb=16, gpu_sm="86"),
+    )
+    _install_optimizer_drafter(cfg)
+
+    plan = automatic_plan(cfg)
+
+    assert plan.placement.runnable is True
+    assert plan.kvflash.enabled is False
+    assert plan.runtime.kvflash == "off"
+    assert plan.runtime.prefill_drafter == ""
+    assert "memory budget" in plan.kvflash.reason
+
+
+def test_24gb_moe_does_not_offer_an_unusable_scorer_without_spark_ram(
+    tmp_path: Path,
+) -> None:
+    cfg = _cfg(
+        tmp_path,
+        "qwen3.6-moe",
+        HostFacts(gpu_vendor="nvidia", vram_gb=24, ram_gb=16, gpu_sm="86"),
+    )
+
+    plan = automatic_plan(cfg, optimizer_drafter_available=False)
+
+    assert plan.placement.runnable is True
+    assert plan.runtime.kvflash == "off"
+    assert plan.needs_optimizer_drafter is False
