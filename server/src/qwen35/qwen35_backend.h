@@ -152,6 +152,11 @@ public:
     bool supports_dflash_spec_decode() const override { return !cfg_.paged_attention; }
     DFlashTarget * dflash_target() override;
     bool supports_remote_draft() const override { return true; }
+#ifdef DFLASH_HAVE_MMPROJ
+    bool supports_multimodal() const override { return vision_ != nullptr; }
+#else
+    bool supports_multimodal() const override { return false; }
+#endif
 
     // ── Concurrent slot serving (paged AR decode over N sequences) ────
     // Non-null once init() has built the engine (--max-concurrency N with paged
