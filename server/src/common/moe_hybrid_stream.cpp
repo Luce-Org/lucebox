@@ -1614,6 +1614,12 @@ bool eval_moe_streamed_experts(
         return true;
     };
 
+    struct TokenHit { int token; float weight; };
+    std::vector<TokenHit> hits;
+    hits.reserve((size_t) batch.n_tokens);
+    std::vector<float> compact_input;
+    std::vector<float> result;
+
     for (size_t expert_index = 0;
          expert_index < unique_experts.size(); ++expert_index) {
         const int current_slot = staged_slot;
@@ -1622,9 +1628,7 @@ bool eval_moe_streamed_experts(
             engine.release_device_slot(current_slot);
         };
 
-        struct TokenHit { int token; float weight; };
-        std::vector<TokenHit> hits;
-        hits.reserve((size_t) batch.n_tokens);
+        hits.clear();
         const int32_t expert = unique_experts[expert_index];
         for (int token = 0; token < batch.n_tokens; ++token) {
             float combined_weight = 0.0f;
@@ -1655,7 +1659,7 @@ bool eval_moe_streamed_experts(
             release_current();
             return false;
         }
-        std::vector<float> compact_input(input_values);
+        compact_input.resize(input_values);
         for (size_t i = 0; i < hits.size(); ++i) {
             const float * src = batch.inputs +
                 (size_t) hits[i].token * (size_t) spec.input_dim;
@@ -1694,7 +1698,6 @@ bool eval_moe_streamed_experts(
             staged_slot = next_slot;
         }
 
-        std::vector<float> result;
         if (!graph->finish(result, err)) {
             release_current();
             return false;
