@@ -13,33 +13,41 @@ which invokes the package in the appropriate container:
     lucebox optimize --advanced     # override individual optimizations
     lucebox start
 
-The wrapper detects the host and selects CUDA for NVIDIA builds (including RTX
-3090 + Strix) or ROCm for AMD builds (including R9700 + Strix). The package then
-handles readiness checks, TOML configuration, model selection and download,
-optimization settings, and construction of the final server command. Host
-facts are passed through `LUCEBOX_HOST_*` environment variables so the
-container never has to guess the host configuration.
+The wrapper inventories the host and selects CUDA for NVIDIA builds (including
+RTX 3090 + Strix) or ROCm for AMD builds (including R9700 + Strix). The package
+then handles readiness checks, TOML configuration, model selection and
+download, optimization and placement settings, and construction of the final
+server command. Host facts are passed through `LUCEBOX_HOST_*` environment
+variables so the package never has to guess the host configuration.
 
-Automatic mode considers the selected model and the primary GPU. It shows a
-plain-language decision for DFlash, PFlash, KVFlash, and Spark, prefers exact
-all-GPU execution when it fits, and enables memory-saving paths only under
-pressure. Advanced mode lets experienced users override those four product
-choices while the CLI retains safe context, cache, and DDTree defaults. A
-factory-preloaded Lucebox can ship the models and shared optimizer scorer, so a
-buyer does not need to download anything during first setup.
+Automatic mode considers the selected model and the complete accelerator
+topology. It shows plain-language decisions for DFlash, PFlash, KVFlash, Spark,
+and execution placement. It keeps fitting targets on the faster primary GPU,
+uses supported secondary-device workloads under memory pressure, and enables
+memory-saving paths only when needed. Advanced mode lets experienced users
+override the four optimization choices while placement invariants, context,
+cache, and DDTree defaults remain guarded. A factory-preloaded Lucebox can ship
+the models, shared optimizer scorer, and paired runtime, so a buyer does not
+need to download or compile anything during first setup.
 
 Spark is enabled automatically only when an MoE model is under GPU-memory
 pressure and the machine reports at least 32 GB of host RAM; its cold experts
 live in system memory. Lower-memory or unknown hosts keep Spark off unless an
 advanced user explicitly opts in.
 
-Heterogeneous machines use one detected primary accelerator by default. The
-CLI pins ROCm to the largest-VRAM AMD device and never sums memory across GPUs;
-automatic multi-GPU layer sharding is deliberately not claimed by this release.
+On a same-backend multi-GPU host, supported models can use a layer split when
+the target does not fit one device. On R9700 + Strix, ROCm prefers the discrete
+R9700 and can use Strix as a companion. RTX + Strix cross-vendor execution uses
+a validated CUDA-main/HIP-companion native package; it is selected only when
+that paired runtime is actually installed. Cross-GPU transfers default to safe
+host staging, with peer access left as an explicit expert opt-in.
 
 Inside a source checkout, the same wrapper also exposes `lucebox build`,
-`lucebox native`, and `lucebox harness` for contributors. Buyer installations
-keep using the prebuilt container, so no compiler or source checkout is needed.
+`lucebox native`, and `lucebox harness` for contributors. `lucebox build hybrid`
+builds both native backends and `lucebox package-runtime` stages the factory
+layout. Single-backend buyer installations keep using the prebuilt container;
+heterogeneous buyers can receive the paired runtime preinstalled. Neither path
+requires a source checkout during normal use.
 
 See the [project README](https://github.com/Luce-Org/lucebox#readme) for the
 installation and user flow. Contributors can find the CLI implementation in

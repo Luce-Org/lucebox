@@ -199,6 +199,15 @@ for dockerfile in Dockerfile Dockerfile.rocm; do
         report fail "$dockerfile includes CMake discovery helpers" \
             "server/cmake/DiscoverCppUnitTests.cmake would be missing from the image build context"
     fi
+    if grep -qF -- "--target test_dflash dflash_server backend_ipc_daemon" \
+            "$ROOT/$dockerfile" \
+       && grep -qF -- "test -x /opt/lucebox-hub/server/build/backend_ipc_daemon" \
+            "$ROOT/$dockerfile"; then
+        report ok "$dockerfile packages the backend IPC companion"
+    else
+        report fail "$dockerfile packages the backend IPC companion" \
+            "multi-device Spark/draft placement would be saved but could not launch"
+    fi
 done
 
 # ── 3. Trivial subcommands (zero-exit expected) ───────────────────────────
@@ -272,7 +281,7 @@ if [ "$native_rc" -ne 0 ]; then
     report fail "native CUDA build dispatch" "exit=$native_rc output=$(head -3 <<<"$native_out")"
 elif ! grep -qF -- "-DDFLASH27B_GPU_BACKEND=cuda" "$native_log" \
      || ! grep -qF -- "-DCMAKE_CUDA_ARCHITECTURES=86" "$native_log" \
-     || ! grep -qF -- "--target dflash_server -j 2" "$native_log"; then
+     || ! grep -qF -- "--target dflash_server backend_ipc_daemon -j 2" "$native_log"; then
     report fail "native CUDA build dispatch" "unexpected cmake argv: $(tr '\n' ' ' < "$native_log")"
 else
     report ok "native CUDA build dispatch"
@@ -302,6 +311,72 @@ else
     report ok "native ROCm build dispatch"
 fi
 rm -rf "$native_tmp"
+
+test_paired_runtime_packaging() {
+    local label="paired runtime packaging creates a relocatable factory layout"
+    local sandbox repo destination out rc package_backend
+    sandbox=$(mktemp -d "${TMPDIR:-/tmp}/lucebox-runtime-package.XXXXXX")
+    repo="$sandbox/repo"
+    destination="$sandbox/output/lucebox-runtime"
+    mkdir -p "$repo/harness" "$repo/server/scripts" \
+        "$repo/server/share/model_cards"
+    : > "$repo/server/CMakeLists.txt"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$repo/server/scripts/entrypoint.sh"
+    printf '{}\n' > "$repo/server/share/model_cards/test.json"
+    chmod +x "$repo/server/scripts/entrypoint.sh"
+
+    for package_backend in cuda hip; do
+        mkdir -p "$repo/server/build-$package_backend/deps/runtime"
+        printf '#!/usr/bin/env bash\nexit 0\n' \
+            > "$repo/server/build-$package_backend/dflash_server"
+        printf '#!/usr/bin/env bash\nexit 0\n' \
+            > "$repo/server/build-$package_backend/backend_ipc_daemon"
+        chmod +x "$repo/server/build-$package_backend/dflash_server" \
+            "$repo/server/build-$package_backend/backend_ipc_daemon"
+        printf 'shared library\n' \
+            > "$repo/server/build-$package_backend/deps/runtime/libtest.so.1"
+        printf 'delete me\n' \
+            > "$repo/server/build-$package_backend/deps/runtime/build.txt"
+    done
+
+    rc=0
+    out=$(LUCEBOX_REPO="$repo" LUCEBOX_BUILD_DIR= NO_COLOR=1 \
+        bash "$SCRIPT" package-runtime "$destination" 2>&1) || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        report fail "$label" "exit=$rc output=$(head -3 <<<"$out")"
+        rm -rf "$sandbox"
+        return
+    fi
+    for expected in \
+        cuda/dflash_server cuda/backend_ipc_daemon \
+        hip/dflash_server hip/backend_ipc_daemon \
+        server/scripts/entrypoint.sh server/share/model_cards/test.json \
+        cuda/deps/runtime/libtest.so.1 hip/deps/runtime/libtest.so.1 \
+        MANIFEST; do
+        if [ ! -f "$destination/$expected" ]; then
+            report fail "$label" "missing packaged file: $expected"
+            rm -rf "$sandbox"
+            return
+        fi
+    done
+    if [ -e "$destination/cuda/deps/runtime/build.txt" ] \
+       || [ -e "$destination/hip/deps/runtime/build.txt" ]; then
+        report fail "$label" "non-runtime build artifacts were retained"
+        rm -rf "$sandbox"
+        return
+    fi
+    rc=0
+    LUCEBOX_REPO="$repo" LUCEBOX_BUILD_DIR= NO_COLOR=1 \
+        bash "$SCRIPT" package-runtime "$destination" >/dev/null 2>&1 || rc=$?
+    if [ "$rc" -eq 0 ]; then
+        report fail "$label" "existing destination was overwritten"
+        rm -rf "$sandbox"
+        return
+    fi
+    report ok "$label"
+    rm -rf "$sandbox"
+}
+test_paired_runtime_packaging
 
 # Engine client connectors: use already-installed binaries, preserve every
 # normal client config, and point a Lucebox-owned profile at the local API.
@@ -736,10 +811,20 @@ _make_entrypoint_sandbox() {
 #!/usr/bin/env bash
 printf '[shim] dflash_server'
 for a in "$@"; do printf ' %q' "$a"; done
+if [ -n "${DFLASH_MOE_EXPERT_COMPUTE_IPC_BIN:-}" ]; then
+    printf ' MOE_IPC=%q' "$DFLASH_MOE_EXPERT_COMPUTE_IPC_BIN"
+    printf ' MOE_GPU=%q' "${DFLASH_MOE_EXPERT_COMPUTE_IPC_GPU:-}"
+    printf ' MOE_REQUIRED=%q' "${DFLASH_MOE_EXPERT_COMPUTE_IPC_REQUIRED:-}"
+fi
 printf '\n'
 exit 0
 STUB
     chmod +x "$bin_dir/dflash_server"
+    cat > "$bin_dir/backend_ipc_daemon" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+    chmod +x "$bin_dir/backend_ipc_daemon"
     # `nvidia-smi` shim — pretend we have a 24 GB GPU so the autotune
     # block runs but doesn't pick the under-12-GB warn tier.
     cat > "$shim_dir/nvidia-smi" <<'STUB'
@@ -835,6 +920,97 @@ test_entrypoint_optimization_flags() {
 }
 test_entrypoint_optimization_flags \
     "entrypoint forwards PFlash, KVFlash, and Spark exactly once"
+
+test_entrypoint_placement_flags() {
+    local label="$1" sandbox draft_dir models_dir bin_dir shim_dir out
+    _make_entrypoint_sandbox
+    touch "$models_dir/Qwen3.6-27B-Q4_K_M.gguf"
+    out=$(PATH="$shim_dir:$PATH" \
+        DFLASH_DIR="$sandbox" \
+        DFLASH_SERVER_BIN="$bin_dir/dflash_server" \
+        DFLASH_BACKEND_IPC_BIN="$bin_dir/backend_ipc_daemon" \
+        DFLASH_TARGET="$models_dir/Qwen3.6-27B-Q4_K_M.gguf" \
+        DFLASH_DRAFT="$models_dir/.no-draft" \
+        DFLASH_TARGET_DEVICES="cuda:0,hip:0" \
+        DFLASH_TARGET_LAYER_SPLIT="0.8,0.2" \
+        DFLASH_REMOTE_TARGET_SHARD=1 \
+        timeout 10 bash "$ENTRYPOINT" serve 2>&1 || true)
+    rm -rf "$sandbox"
+    local required missing=""
+    for required in \
+        "--target-devices cuda:0\\,hip:0" \
+        "--target-layer-split 0.8\\,0.2" \
+        "--target-shard-ipc-bin $bin_dir/backend_ipc_daemon"; do
+        [[ "$out" == *"$required"* ]] || missing+=" $required"
+    done
+    if [ -n "$missing" ]; then
+        report fail "$label" "missing argv/env:$missing; output: $(tail -3 <<<"$out")"
+    else
+        report ok "$label"
+    fi
+}
+test_entrypoint_placement_flags \
+    "entrypoint forwards mixed target layer placement"
+
+test_entrypoint_remote_spark_flags() {
+    local label="$1" sandbox draft_dir models_dir bin_dir shim_dir out
+    _make_entrypoint_sandbox
+    touch "$models_dir/Qwen3.6-MoE-Q4_K_M.gguf"
+    out=$(PATH="$shim_dir:$PATH" \
+        DFLASH_DIR="$sandbox" \
+        DFLASH_SERVER_BIN="$bin_dir/dflash_server" \
+        DFLASH_BACKEND_IPC_BIN="$bin_dir/backend_ipc_daemon" \
+        DFLASH_TARGET="$models_dir/Qwen3.6-MoE-Q4_K_M.gguf" \
+        DFLASH_DRAFT="$models_dir/.no-draft" \
+        DFLASH_TARGET_DEVICE="cuda:0" \
+        DFLASH_REMOTE_EXPERT_DEVICE="hip:0" \
+        DFLASH_SPARK=1 \
+        timeout 10 bash "$ENTRYPOINT" serve 2>&1 || true)
+    rm -rf "$sandbox"
+    local required missing=""
+    for required in \
+        "--target-device cuda:0" \
+        "--spark" \
+        "MOE_IPC=$bin_dir/backend_ipc_daemon" \
+        "MOE_GPU=0" \
+        "MOE_REQUIRED=1"; do
+        [[ "$out" == *"$required"* ]] || missing+=" $required"
+    done
+    if [ -n "$missing" ]; then
+        report fail "$label" "missing argv/env:$missing; output: $(tail -3 <<<"$out")"
+    else
+        report ok "$label"
+    fi
+}
+test_entrypoint_remote_spark_flags \
+    "entrypoint forwards remote Spark expert placement"
+
+test_entrypoint_remote_draft_flags() {
+    local label="$1" sandbox draft_dir models_dir bin_dir shim_dir out
+    _make_entrypoint_sandbox
+    touch "$models_dir/Qwen3.6-27B-Q4_K_M.gguf"
+    touch "$draft_dir/dflash-draft-3.6-test.gguf"
+    out=$(PATH="$shim_dir:$PATH" \
+        DFLASH_DIR="$sandbox" \
+        DFLASH_SERVER_BIN="$bin_dir/dflash_server" \
+        DFLASH_BACKEND_IPC_BIN="$bin_dir/backend_ipc_daemon" \
+        DFLASH_TARGET="$models_dir/Qwen3.6-27B-Q4_K_M.gguf" \
+        DFLASH_DRAFT="$draft_dir/dflash-draft-3.6-test.gguf" \
+        DFLASH_TARGET_DEVICE="cuda:0" \
+        DFLASH_DRAFT_DEVICE="hip:0" \
+        DFLASH_REMOTE_DRAFT=1 \
+        timeout 10 bash "$ENTRYPOINT" serve 2>&1 || true)
+    rm -rf "$sandbox"
+    if [[ "$out" != *"--target-device cuda:0"* ]] \
+       || [[ "$out" != *"--draft-device hip:0"* ]] \
+       || [[ "$out" != *"--draft-ipc-bin $bin_dir/backend_ipc_daemon"* ]]; then
+        report fail "$label" "placement flags missing: $(tail -3 <<<"$out")"
+    else
+        report ok "$label"
+    fi
+}
+test_entrypoint_remote_draft_flags \
+    "entrypoint forwards cross-backend draft placement"
 
 test_harness_draft_directory_validation() {
     local label="$1" sandbox target server ambiguous empty out rc out_empty rc_empty
@@ -1251,6 +1427,16 @@ models = "/srv/models#fast" # an actual TOML comment
 [dflash]
 budget = 22
 lazy = false
+
+[placement]
+target_devices = [
+    "hip:0",
+    "hip:1", # generated arrays may retain a trailing comma
+]
+target_layer_split = [
+    0.7,
+    0.3,
+]
 TOML
 
     # Exercise both helpers + the resolver via a subshell that sources
@@ -1284,6 +1470,42 @@ TOML
     report ok "$label"
 }
 test_config_toml_reader_and_resolve "config.toml reader + env > toml > default resolution (7 cases)"
+
+test_multiline_placement_arrays_to_csv() {
+    local label="$1" tmp devices split
+    tmp=$(mktemp -d -t lucebox-placement-cfg.XXXXXX)
+    cat > "$tmp/config.toml" <<'TOML'
+[placement]
+target_devices = [
+    "hip:0",
+    "hip:1",
+]
+target_layer_split = [
+    0.7,
+    0.3,
+]
+TOML
+    devices=$(LUCEBOX_HOME="$tmp" bash -c '
+        '"$(sed -n "/^_lucebox_config_path()/,/^}/p" "$SCRIPT")"'
+        '"$(sed -n "/^_lucebox_config_get()/,/^}/p" "$SCRIPT")"'
+        '"$(sed -n "/^_toml_array_to_csv()/,/^}/p" "$SCRIPT")"'
+        _toml_array_to_csv "$(_lucebox_config_get placement.target_devices)"
+    ')
+    split=$(LUCEBOX_HOME="$tmp" bash -c '
+        '"$(sed -n "/^_lucebox_config_path()/,/^}/p" "$SCRIPT")"'
+        '"$(sed -n "/^_lucebox_config_get()/,/^}/p" "$SCRIPT")"'
+        '"$(sed -n "/^_toml_array_to_csv()/,/^}/p" "$SCRIPT")"'
+        _toml_array_to_csv "$(_lucebox_config_get placement.target_layer_split)"
+    ')
+    rm -rf "$tmp"
+    if [ "$devices" != "hip:0,hip:1" ] || [ "$split" != "0.7,0.3" ]; then
+        report fail "$label" "devices=$devices split=$split"
+        return
+    fi
+    report ok "$label"
+}
+test_multiline_placement_arrays_to_csv \
+    "tomli_w multi-line placement arrays reach native runtime as CSV"
 
 # ── cmd_serve under systemd: INVOCATION_ID short-circuits is-active ──────
 # When systemd invokes the wrapper as a unit's ExecStart, it sets
@@ -1842,6 +2064,48 @@ STUB
 }
 test_mixed_rtx_strix_probe_prefers_cuda "mixed RTX 3090 + Strix probe selects CUDA"
 
+test_r9700_strix_probe_prefers_discrete_gpu() {
+    local label="$1" sandbox shim_dir out
+    sandbox=$(mktemp -d -t lucebox-amd-primary.XXXXXX)
+    shim_dir="$sandbox/bin"
+    mkdir -p "$shim_dir"
+    cat > "$shim_dir/nvidia-smi" <<'STUB'
+#!/usr/bin/env bash
+exit 1
+STUB
+    cat > "$shim_dir/amd-smi" <<'STUB'
+#!/usr/bin/env bash
+if [ "${1:-}" = "version" ]; then
+    echo "AMDSMI Tool: test | ROCm version: 7.2.4 | Platform: Linux Baremetal"
+    exit 0
+fi
+cat <<'CSV'
+gpu,market_name,vendor_id,vendor_name,subvendor_id,device_id,subsystem_id,rev_id,asic_serial,oam_id,num_compute_units,target_graphics_version,type,vendor,size,bit_width,max_bandwidth
+0,AMD Radeon AI PRO R9700,0x1002,AMD,0xf111,0x7551,0x000a,0xc0,0xE099917E6553AFAA,N/A,64,gfx1201,GDDR6,SAMSUNG,32624,256,N/A
+1,AMD Radeon Graphics,0x1002,AMD,0xf111,0x1586,0x000a,0xc1,0x0000000000000000,N/A,40,gfx1151,GDDR7,UNKNOWN,98304,256,N/A
+CSV
+STUB
+    cat > "$shim_dir/docker" <<'STUB'
+#!/usr/bin/env bash
+case "${1:-}" in
+  ps) exit 0 ;;
+  version) echo "29.1.3" ;;
+esac
+exit 0
+STUB
+    chmod +x "$shim_dir"/*
+    out=$(HOME="$sandbox" LUCEBOX_HOME="$sandbox/.lucebox" \
+        PATH="$shim_dir:$PATH" NO_COLOR=1 bash "$SCRIPT" check 2>&1)
+    rm -rf "$sandbox"
+    if ! grep -qF "primary AMD Radeon AI PRO R9700 (gfx1201" <<<"$out"; then
+        report fail "$label" "large Strix aperture displaced the R9700: $(printf '%s' "$out" | head -20)"
+        return
+    fi
+    report ok "$label"
+}
+test_r9700_strix_probe_prefers_discrete_gpu \
+    "R9700 remains primary when Strix reports a large UMA aperture"
+
 test_cross_vendor_docker_args() {
     local label="$1" helpers cuda_args rocm_args pinned_rocm_args selected_rocm_args
     helpers=$(awk '/^_variant_is_rocm\(\) \{/,/^\}/' "$SCRIPT")$'\n'
@@ -1902,6 +2166,84 @@ test_selected_backend_facts() {
     report ok "$label"
 }
 test_selected_backend_facts "mixed-build autotune facts follow the selected ROCm backend"
+
+test_native_placement_visibility() {
+    local label="$1" helpers explicit legacy
+    helpers=$(awk '/^_toml_array_to_csv\(\) \{/,/^\}/' "$SCRIPT")$'\n'
+    helpers+=$(awk '/^_export_native_config\(\) \{/,/^\}/' "$SCRIPT")
+    explicit=$(bash -c "$helpers"$'\n''
+        _lucebox_config_get() {
+            [ "$1" = "placement.target_device" ] && printf "cuda:0"
+        }
+        CUDA_VISIBLE_DEVICES=7
+        HIP_VISIBLE_DEVICES=6
+        ROCR_VISIBLE_DEVICES=5
+        LUCEBOX_HOST_CUDA_VISIBLE_DEVICES=7
+        LUCEBOX_HOST_HIP_VISIBLE_DEVICES=6
+        LUCEBOX_HOST_ROCR_VISIBLE_DEVICES=5
+        _export_native_config
+        printf "%s|%s|%s" "${CUDA_VISIBLE_DEVICES-unset}" \
+            "${HIP_VISIBLE_DEVICES-unset}" "${ROCR_VISIBLE_DEVICES-unset}"
+    ')
+    legacy=$(bash -c "$helpers"$'\n''
+        _lucebox_config_get() { :; }
+        LUCEBOX_HOST_CUDA_VISIBLE_DEVICES=7
+        LUCEBOX_HOST_ROCR_VISIBLE_DEVICES=GPU-primary
+        _export_native_config
+        printf "%s|%s|%s" "${CUDA_VISIBLE_DEVICES-unset}" \
+            "${HIP_VISIBLE_DEVICES-unset}" "${ROCR_VISIBLE_DEVICES-unset}"
+    ')
+    if [ "$explicit" != "unset|unset|unset" ]; then
+        report fail "$label" "explicit physical placement retained a visibility mask: $explicit"
+        return
+    fi
+    if [ "$legacy" != "7|unset|GPU-primary" ]; then
+        report fail "$label" "legacy primary isolation changed: $legacy"
+        return
+    fi
+    report ok "$label"
+}
+test_native_placement_visibility "native placement owns the full physical GPU inventory"
+
+test_hybrid_profile_direction() {
+    local label="$1" helpers out rc
+    helpers=$(awk '/^_toml_array_to_csv\(\) \{/,/^\}/' "$SCRIPT")$'\n'
+    helpers+=$(awk '/^_validate_hybrid_profile\(\) \{/,/^\}/' "$SCRIPT")
+    out=$(bash -c "$helpers"$'\n''
+        die() { printf "%s" "$1" >&2; exit 9; }
+        _lucebox_config_get() {
+            case "$1" in
+                placement.target_devices) printf '\''["cuda:0", "hip:0"]'\'' ;;
+                placement.remote_target_shard) printf true ;;
+            esac
+        }
+        _validate_hybrid_profile
+    ' 2>&1) || rc=$?
+    rc="${rc:-0}"
+    if [ "$rc" -ne 0 ]; then
+        report fail "$label" "valid CUDA→HIP target split failed: $out"
+        return
+    fi
+
+    rc=0
+    out=$(bash -c "$helpers"$'\n''
+        die() { printf "%s" "$1" >&2; exit 9; }
+        _lucebox_config_get() {
+            case "$1" in
+                placement.target_device) printf hip:0 ;;
+                placement.draft_device) printf cuda:0 ;;
+                placement.remote_draft) printf true ;;
+            esac
+        }
+        _validate_hybrid_profile
+    ' 2>&1) || rc=$?
+    if [ "$rc" -ne 9 ] || ! grep -qF "requires a CUDA target server" <<<"$out"; then
+        report fail "$label" "unsupported HIP→CUDA direction was not rejected: rc=$rc out=$out"
+        return
+    fi
+    report ok "$label"
+}
+test_hybrid_profile_direction "hybrid runtime accepts CUDA→HIP and rejects HIP→CUDA"
 
 # ── TTY flag selection. Regression guard for the process-substitution bug:
 # _set_tty_flags must run in the CALLER's scope so `[ -t 1 ]` inspects the

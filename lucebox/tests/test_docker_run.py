@@ -12,7 +12,13 @@ from pathlib import Path
 
 import pytest
 from lucebox.download import PRESETS
-from lucebox.types import Config, DflashRuntime, HostFacts, ModelMeta
+from lucebox.types import (
+    Config,
+    DflashRuntime,
+    HostFacts,
+    ModelMeta,
+    PlacementRuntime,
+)
 
 from lucebox import docker_run
 
@@ -44,9 +50,7 @@ def test_argv_flags_and_ordering() -> None:
         detach=True,
         remove=False,
         port_publish=(8080, 8080),
-        volumes=(
-            docker_run.BindMount("/host/models", "/opt/lucebox-hub/server/models"),
-        ),
+        volumes=(docker_run.BindMount("/host/models", "/opt/lucebox-hub/server/models"),),
         env=(("DFLASH_BUDGET", "22"),),
         entrypoint_args=("serve",),
         extra=("--shm-size", "1g"),
@@ -57,9 +61,7 @@ def test_argv_flags_and_ordering() -> None:
     assert "--gpus" not in argv  # gpus=False
     assert ["-p", "8080:8080"] == argv[argv.index("-p") : argv.index("-p") + 2]
     mount_arg = "type=bind,source=/host/models,target=/opt/lucebox-hub/server/models"
-    assert ["--mount", mount_arg] == argv[
-        argv.index("--mount") : argv.index("--mount") + 2
-    ]
+    assert ["--mount", mount_arg] == argv[argv.index("--mount") : argv.index("--mount") + 2]
     assert ["-e", "DFLASH_BUDGET=22"] == argv[argv.index("-e") : argv.index("-e") + 2]
     # extra flags precede the image; entrypoint_args follow it.
     assert argv[-1] == "serve"
@@ -85,9 +87,7 @@ def test_argv_amd_uses_rocm_device_contract() -> None:
     spec = docker_run.DockerRunSpec(image="img:rocm", name="box", gpu_vendor="amd")
     argv = spec.argv()
     assert "--gpus" not in argv
-    assert ["--device", "/dev/kfd"] == argv[
-        argv.index("--device") : argv.index("--device") + 2
-    ]
+    assert ["--device", "/dev/kfd"] == argv[argv.index("--device") : argv.index("--device") + 2]
     assert "/dev/dri" in argv
     assert ["--group-add", "video"] == argv[
         argv.index("--group-add") : argv.index("--group-add") + 2
@@ -126,12 +126,8 @@ def test_runtime_volumes_mounts_only_models_and_config(
     monkeypatch.delenv("LUCEBOX_HOME", raising=False)
     cfg = Config(models_dir=tmp_path / "models")
     vols = docker_run._runtime_volumes(cfg)
-    assert docker_run.BindMount(
-        str(tmp_path / "models"), "/opt/lucebox-hub/server/models"
-    ) in vols
-    assert docker_run.BindMount(
-        str(home / ".lucebox"), str(home / ".lucebox")
-    ) in vols
+    assert docker_run.BindMount(str(tmp_path / "models"), "/opt/lucebox-hub/server/models") in vols
+    assert docker_run.BindMount(str(home / ".lucebox"), str(home / ".lucebox")) in vols
     assert all(mount.source != str(home) for mount in vols)
 
 
@@ -143,18 +139,11 @@ def test_runtime_volumes_dedupes_when_models_is_home(monkeypatch, tmp_path: Path
     # models_dir is mounted at the image's canonical path, while config keeps
     # its same-path mount. The parent home directory itself is never exposed.
     assert len(vols) == 2
-    assert docker_run.BindMount(
-        str(tmp_path / ".lucebox"), str(tmp_path / ".lucebox")
-    ) in vols
-    assert all(
-        mount.source != str(tmp_path) or mount.target != str(tmp_path)
-        for mount in vols
-    )
+    assert docker_run.BindMount(str(tmp_path / ".lucebox"), str(tmp_path / ".lucebox")) in vols
+    assert all(mount.source != str(tmp_path) or mount.target != str(tmp_path) for mount in vols)
 
 
-def test_runtime_volumes_mounts_custom_config_home(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_runtime_volumes_mounts_custom_config_home(monkeypatch, tmp_path: Path) -> None:
     home = tmp_path / "home"
     config_home = tmp_path / "config-outside-home"
     monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
@@ -242,9 +231,7 @@ def test_server_run_spec_top_level_shape(tmp_path: Path) -> None:
     assert spec.remove is True
     assert spec.detach is False
     assert spec.port_publish == (9000, 8080)
-    assert docker_run.BindMount(
-        str(tmp_path), "/opt/lucebox-hub/server/models"
-    ) in spec.volumes
+    assert docker_run.BindMount(str(tmp_path), "/opt/lucebox-hub/server/models") in spec.volumes
 
 
 def test_server_run_spec_mounts_selected_symlink_target_narrowly_read_only(
@@ -264,11 +251,14 @@ def test_server_run_spec_mounts_selected_symlink_target_narrowly_read_only(
         Config(models_dir=models, model=ModelMeta(target_file="selected.gguf"))
     )
 
-    assert docker_run.BindMount(
-        str(target),
-        "/opt/lucebox-resolved/target/target.gguf",
-        read_only=True,
-    ) in spec.volumes
+    assert (
+        docker_run.BindMount(
+            str(target),
+            "/opt/lucebox-resolved/target/target.gguf",
+            read_only=True,
+        )
+        in spec.volumes
+    )
     assert _env(spec)["DFLASH_TARGET"] == "/opt/lucebox-resolved/target/target.gguf"
     assert all(mount.source != str(home) for mount in spec.volumes)
     argv = spec.argv()
@@ -292,11 +282,14 @@ def test_server_run_spec_resolves_symlinked_model_parent(tmp_path: Path) -> None
         Config(models_dir=models, model=ModelMeta(target_file="selected/nested.gguf"))
     )
 
-    assert docker_run.BindMount(
-        str(target),
-        "/opt/lucebox-resolved/target/nested.gguf",
-        read_only=True,
-    ) in spec.volumes
+    assert (
+        docker_run.BindMount(
+            str(target),
+            "/opt/lucebox-resolved/target/nested.gguf",
+            read_only=True,
+        )
+        in spec.volumes
+    )
     assert _env(spec)["DFLASH_TARGET"] == "/opt/lucebox-resolved/target/nested.gguf"
 
 
@@ -314,10 +307,7 @@ def test_server_run_spec_does_not_remount_file_for_symlinked_models_dir(
     )
 
     assert _env(spec)["DFLASH_TARGET"] == "/opt/lucebox-hub/server/models/target.gguf"
-    assert all(
-        mount.target != "/opt/lucebox-resolved/target/target.gguf"
-        for mount in spec.volumes
-    )
+    assert all(mount.target != "/opt/lucebox-resolved/target/target.gguf" for mount in spec.volumes)
 
 
 def test_server_run_spec_mounts_symlinked_speculator_directory_read_only(
@@ -329,19 +319,20 @@ def test_server_run_spec_mounts_symlinked_speculator_directory_read_only(
     draft_root.mkdir(parents=True)
     external.mkdir()
     (external / "model.safetensors").write_bytes(b"speculator")
-    (draft_root / "laguna-xs2-speculator").symlink_to(
-        external, target_is_directory=True
-    )
+    (draft_root / "laguna-xs2-speculator").symlink_to(external, target_is_directory=True)
 
     spec = docker_run.server_run_spec(
         Config(models_dir=models, model=ModelMeta(preset="laguna-xs.2"))
     )
 
-    assert docker_run.BindMount(
-        str(external),
-        "/opt/lucebox-resolved/draft-dir",
-        read_only=True,
-    ) in spec.volumes
+    assert (
+        docker_run.BindMount(
+            str(external),
+            "/opt/lucebox-resolved/draft-dir",
+            read_only=True,
+        )
+        in spec.volumes
+    )
     assert _env(spec)["DFLASH_DRAFT"] == "/opt/lucebox-resolved/draft-dir"
 
 
@@ -472,15 +463,90 @@ def test_server_run_spec_forwards_primary_rocm_device(
     assert "HIP_VISIBLE_DEVICES" not in env
 
 
+def test_server_run_spec_forwards_explicit_single_gpu_placement(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("LUCEBOX_HOST_ROCR_VISIBLE_DEVICES", "GPU-primary")
+    cfg = Config(
+        variant="rocm",
+        models_dir=tmp_path,
+        placement=PlacementRuntime(target_device="hip:1"),
+    )
+
+    env = _env(docker_run.server_run_spec(cfg))
+
+    assert env["DFLASH_TARGET_DEVICE"] == "hip:1"
+    # Explicit engine placement uses the physical inventory. A visibility pin
+    # would renumber the selected device to hip:0 and invalidate the plan.
+    assert "ROCR_VISIBLE_DEVICES" not in env
+    assert "HIP_VISIBLE_DEVICES" not in env
+
+
+def test_server_run_spec_forwards_same_backend_layer_split(tmp_path: Path) -> None:
+    cfg = Config(
+        variant="rocm",
+        models_dir=tmp_path,
+        placement=PlacementRuntime(
+            mode="layer-split",
+            target_devices=("hip:0", "hip:1"),
+            target_layer_split=(0.75, 0.25),
+            peer_access=True,
+        ),
+    )
+
+    env = _env(docker_run.server_run_spec(cfg))
+
+    assert env["DFLASH_TARGET_DEVICES"] == "hip:0,hip:1"
+    assert env["DFLASH_TARGET_LAYER_SPLIT"] == "0.75,0.25"
+    assert env["DFLASH_PEER_ACCESS"] == "1"
+
+
+def test_server_run_spec_forwards_same_backend_spark_companion(
+    tmp_path: Path,
+) -> None:
+    cfg = Config(
+        variant="rocm",
+        models_dir=tmp_path,
+        dflash=DflashRuntime(spark=True),
+        placement=PlacementRuntime(
+            mode="heterogeneous",
+            target_device="hip:0",
+            remote_expert_device="hip:1",
+        ),
+    )
+
+    env = _env(docker_run.server_run_spec(cfg))
+
+    assert env["DFLASH_SPARK"] == "1"
+    assert env["DFLASH_REMOTE_EXPERT_DEVICE"] == "hip:1"
+
+
+def test_server_run_spec_rejects_cross_backend_docker_placement(
+    tmp_path: Path,
+) -> None:
+    cfg = Config(
+        variant="cuda12",
+        models_dir=tmp_path,
+        dflash=DflashRuntime(spark=True),
+        placement=PlacementRuntime(
+            mode="heterogeneous",
+            target_device="cuda:0",
+            remote_expert_device="hip:0",
+        ),
+    )
+
+    with pytest.raises(ValueError, match="paired native Lucebox runtime"):
+        docker_run.server_run_spec(cfg)
+
+
 def test_server_run_spec_resolves_target_and_draft_paths(tmp_path: Path) -> None:
     pres = PRESETS["qwen3.6-27b"]
     cfg = Config(models_dir=tmp_path, model=ModelMeta(preset="qwen3.6-27b"))
     env = _env(docker_run.server_run_spec(cfg))
     assert env["DFLASH_TARGET"] == f"/opt/lucebox-hub/server/models/{pres.target_file}"
     if pres.draft_file:
-        assert env["DFLASH_DRAFT"] == (
-            f"/opt/lucebox-hub/server/models/draft/{pres.draft_file}"
-        )
+        assert env["DFLASH_DRAFT"] == (f"/opt/lucebox-hub/server/models/draft/{pres.draft_file}")
 
 
 def test_server_run_spec_can_disable_preset_dflash_draft(tmp_path: Path) -> None:

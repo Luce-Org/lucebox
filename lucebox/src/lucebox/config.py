@@ -6,10 +6,15 @@ their behalf) and serialize ONLY those keys back to disk — defaults
 stay implicit, so `config.toml` reads like a diff against live defaults
 and upgrades that add new fields don't gratuitously rewrite every file.
 
-The dotted-key surface area is small and flat:
+The user-editable dotted-key surface area is small and flat:
   model.preset, model.target_file, model.draft_file
   port, models_dir, variant, image, container_name
   dflash.<field>  for every registered DflashRuntime knob
+
+The resolved ``[placement]`` section is deliberately written only as part of
+an atomic optimization plan. Its fields have cross-field invariants, so
+exposing them through one-at-a-time ``config set`` operations would make it
+easy to persist an intermediate profile that cannot be loaded.
 
 Load resolves the TOML file → ``Config`` object, with anything absent
 filled from ``Config()`` defaults. Save writes back only the keys that
@@ -36,6 +41,8 @@ from lucebox.types import (
     DflashRuntime,
     HostFacts,
     ModelMeta,
+    PlacementMode,
+    PlacementRuntime,
     Variant,
     default_models_dir,
 )
@@ -161,6 +168,24 @@ def _cast_think_soft_close_min_ratio(v: Any) -> float:
             f"think_soft_close_min_ratio must be in the interval [0.0, 1.0], got {value!r}"
         )
     return value
+
+
+def _cast_placement_mode(v: Any) -> PlacementMode:
+    value = str(v).strip().lower()
+    allowed = {"single", "draft-offload", "layer-split", "heterogeneous"}
+    if value not in allowed:
+        raise ValueError(f"placement mode must be one of {sorted(allowed)}, got {value!r}")
+    return cast(PlacementMode, value)
+
+
+def _cast_string_tuple(v: Any) -> tuple[str, ...]:
+    values = v if isinstance(v, (list, tuple)) else str(v).split(",")
+    return tuple(str(value).strip() for value in values if str(value).strip())
+
+
+def _cast_float_tuple(v: Any) -> tuple[float, ...]:
+    values = v if isinstance(v, (list, tuple)) else str(v).split(",")
+    return tuple(float(value) for value in values if str(value).strip())
 
 
 # Each entry: dotted-key → (toml_path, type_caster, default_getter).
@@ -355,13 +380,26 @@ def _from_dict(raw: dict[str, Any]) -> Config:
         debug_thinking_logits=_cast_bool(df.get("debug_thinking_logits", False)),
     )
 
+    placement_raw = raw.get("placement", {})
+    placement = PlacementRuntime(
+        mode=_cast_placement_mode(placement_raw.get("mode", "single")),
+        target_device=str(placement_raw.get("target_device", "")),
+        target_devices=_cast_string_tuple(placement_raw.get("target_devices", ())),
+        target_layer_split=_cast_float_tuple(placement_raw.get("target_layer_split", ())),
+        draft_device=str(placement_raw.get("draft_device", "")),
+        remote_draft=_cast_bool(placement_raw.get("remote_draft", False)),
+        remote_target_shard=_cast_bool(placement_raw.get("remote_target_shard", False)),
+        peer_access=_cast_bool(placement_raw.get("peer_access", False)),
+        remote_expert_device=str(placement_raw.get("remote_expert_device", "")),
+    )
+
     host_raw = raw.get("host", {})
     host = HostFacts(
         nproc=int(host_raw.get("nproc", 0)),
         ram_gb=int(host_raw.get("ram_gb", 0)),
         gpu_vendor=host_raw.get("gpu_vendor", "none"),
-        has_nvidia_gpu=bool(host_raw.get("has_nvidia_gpu", False)),
-        has_amd_gpu=bool(host_raw.get("has_amd_gpu", False)),
+        has_nvidia_gpu=_cast_bool(host_raw.get("has_nvidia_gpu", False)),
+        has_amd_gpu=_cast_bool(host_raw.get("has_amd_gpu", False)),
         gpu_name=str(host_raw.get("gpu_name", "")),
         gpu_count=int(host_raw.get("gpu_count", 0)),
         vram_gb=int(host_raw.get("vram_gb", 0)),
@@ -369,13 +407,24 @@ def _from_dict(raw: dict[str, Any]) -> Config:
         driver_version=str(host_raw.get("driver_version", "")),
         driver_major=int(host_raw.get("driver_major", 0)),
         rocm_version=str(host_raw.get("rocm_version", "")),
-        has_kfd=bool(host_raw.get("has_kfd", False)),
-        has_dri=bool(host_raw.get("has_dri", False)),
-        has_systemd=bool(host_raw.get("has_systemd", False)),
-        is_wsl=bool(host_raw.get("is_wsl", False)),
-        has_docker=bool(host_raw.get("has_docker", False)),
+        has_kfd=_cast_bool(host_raw.get("has_kfd", False)),
+        has_dri=_cast_bool(host_raw.get("has_dri", False)),
+        has_systemd=_cast_bool(host_raw.get("has_systemd", False)),
+        is_wsl=_cast_bool(host_raw.get("is_wsl", False)),
+        has_docker=_cast_bool(host_raw.get("has_docker", False)),
         docker_version=str(host_raw.get("docker_version", "")),
         ctk=host_raw.get("ctk", "none"),
+        nvidia_gpu_name=str(host_raw.get("nvidia_gpu_name", "")),
+        nvidia_gpu_count=int(host_raw.get("nvidia_gpu_count", 0)),
+        nvidia_vram_gb=int(host_raw.get("nvidia_vram_gb", 0)),
+        nvidia_gpu_arch=str(host_raw.get("nvidia_gpu_arch", "")),
+        nvidia_gpu_list_csv=str(host_raw.get("nvidia_gpu_list_csv", "")),
+        amd_gpu_name=str(host_raw.get("amd_gpu_name", "")),
+        amd_gpu_count=int(host_raw.get("amd_gpu_count", 0)),
+        amd_vram_gb=int(host_raw.get("amd_vram_gb", 0)),
+        amd_gpu_arch=str(host_raw.get("amd_gpu_arch", "")),
+        amd_gpu_list_csv=str(host_raw.get("amd_gpu_list_csv", "")),
+        hybrid_runtime=_cast_bool(host_raw.get("hybrid_runtime", False)),
     )
 
     # `[model]` is optional — legacy configs (pre-multi-model) carry no
@@ -404,6 +453,7 @@ def _from_dict(raw: dict[str, Any]) -> Config:
         port=port,
         models_dir=models_dir,
         dflash=dflash,
+        placement=placement,
         host=host,
         model=model,
     )
@@ -491,13 +541,21 @@ def _write_runtime_doc(
     *,
     mode: str,
     source: str,
+    placement: PlacementRuntime | None = None,
 ) -> None:
-    """Replace ``[dflash]`` with one coherent resolved profile."""
+    """Replace optimization/placement with one coherent resolved profile."""
     from datetime import datetime
 
     doc.pop("dflash", None)
     for field, value in asdict(runtime).items():
         _doc_set(doc, "dflash", field, _value_to_toml(value))
+    # Placement belongs to the resolved runtime as one atomic unit. Clearing
+    # it even when an older caller supplies no replacement prevents a stale
+    # multi-GPU profile from surviving a heuristic/runtime reset.
+    doc.pop("placement", None)
+    if placement is not None:
+        for field, value in asdict(placement).items():
+            _doc_set(doc, "placement", field, _value_to_toml(value))
     _doc_set(doc, "autotune", "mode", mode)
     _doc_set(doc, "autotune", "source", source)
     _doc_set(
@@ -511,6 +569,7 @@ def _write_runtime_doc(
 def write_optimization_runtime(
     runtime: DflashRuntime,
     *,
+    placement: PlacementRuntime | None = None,
     path: Path | None = None,
     mode: str = "automatic",
     source: str = "model+hardware",
@@ -520,7 +579,52 @@ def write_optimization_runtime(
         raise ValueError(f"optimization mode must be automatic or custom, got {mode!r}")
     path = path or default_config_path()
     doc = load_doc(path)
-    _write_runtime_doc(doc, runtime, mode=mode, source=source)
+    _write_runtime_doc(
+        doc,
+        runtime,
+        mode=mode,
+        source=source,
+        placement=placement,
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write_doc(path, doc)
+
+
+def write_model_profile(
+    model: ModelMeta,
+    runtime: DflashRuntime,
+    placement: PlacementRuntime,
+    *,
+    path: Path | None = None,
+    mode: str = "automatic",
+    source: str = "model+hardware",
+) -> None:
+    """Atomically activate a model and its validated execution profile."""
+    if mode not in {"automatic", "custom"}:
+        raise ValueError(f"optimization mode must be automatic or custom, got {mode!r}")
+    preset = str(model.preset).strip()
+    if not preset:
+        raise ValueError("model preset must not be empty")
+    target_file = _cast_model_relative_path(model.target_file)
+    if not target_file:
+        raise ValueError("model target_file must not be empty")
+    draft_file = _cast_model_relative_path(model.draft_file)
+
+    path = path or default_config_path()
+    doc = load_doc(path)
+    _doc_set(doc, "model", "preset", preset)
+    _doc_set(doc, "model", "target_file", target_file)
+    if draft_file:
+        _doc_set(doc, "model", "draft_file", draft_file)
+    else:
+        _doc_unset(doc, "model", "draft_file")
+    _write_runtime_doc(
+        doc,
+        runtime,
+        mode=mode,
+        source=source,
+        placement=placement,
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     _atomic_write_doc(path, doc)
 
@@ -551,7 +655,15 @@ def seed_optimization_from_config(
     if not force and mode == "custom":
         return False
     plan = autotune_mod.automatic_plan(cfg)
-    write_optimization_runtime(plan.runtime, path=path)
+    if not plan.placement.runnable:
+        raise ValueError(
+            f"automatic optimization has no runnable placement: {plan.placement.reason}"
+        )
+    write_optimization_runtime(
+        plan.runtime,
+        placement=plan.placement.runtime,
+        path=path,
+    )
     return True
 
 
@@ -562,6 +674,8 @@ def _value_to_toml(value: Any) -> Any:
     """Make a Python value safe for tomli_w (no None, Path→str)."""
     if isinstance(value, Path):
         return str(value)
+    if isinstance(value, tuple):
+        return list(value)
     return value
 
 
@@ -603,7 +717,8 @@ def config_set(key: str, value: Any, *, path: Path | None = None) -> None:
         try:
             _from_dict({"dflash": doc.get("dflash", {})})
         except (TypeError, ValueError) as exc:
-            raise ValueError(f"invalid dflash profile after setting {key}: {exc}") from exc
+            raise ValueError(f"invalid runtime profile after setting {key}: {exc}") from exc
+    if section == "dflash":
         # A direct low-level edit transfers ownership from the automatic
         # planner to the user. Model changes will preserve it until they pick
         # Automatic again in ``lucebox optimize``.

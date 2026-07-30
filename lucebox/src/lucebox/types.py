@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -31,6 +32,12 @@ def default_models_dir() -> Path:
 
 
 GpuVendor = Literal["nvidia", "amd", "none"]
+PlacementMode = Literal[
+    "single",
+    "draft-offload",
+    "layer-split",
+    "heterogeneous",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +67,25 @@ class HostFacts:
     has_docker: bool = False
     docker_version: str = ""
     ctk: CtkStatus = "none"
+    # Per-vendor inventory is kept in addition to the selected accelerator.
+    # On an RTX + Strix host the generic ``gpu_*`` fields describe the RTX,
+    # while these fields retain the AMD companion for placement planning. On
+    # an R9700 + Strix host the AMD CSV contains both devices.
+    nvidia_gpu_name: str = ""
+    nvidia_gpu_count: int = 0
+    nvidia_vram_gb: int = 0
+    nvidia_gpu_arch: str = ""
+    nvidia_gpu_list_csv: str = ""
+    amd_gpu_name: str = ""
+    amd_gpu_count: int = 0
+    amd_vram_gb: int = 0
+    amd_gpu_arch: str = ""
+    amd_gpu_list_csv: str = ""
+    # The first packaged cross-vendor runtime is a CUDA server paired with a
+    # HIP companion daemon. The host wrapper proves that contract before
+    # setting this fact; the planner never assumes a CUDA image can execute a
+    # HIP child process.
+    hybrid_runtime: bool = False
 
     def __post_init__(self) -> None:
         """Reject malformed persisted host snapshots.
@@ -74,6 +100,124 @@ class HostFacts:
             raise ValueError(
                 f"ctk must be runtime, cdi, installed-unwired, or none; got {self.ctk!r}"
             )
+
+
+_PLACEMENT_DEVICE_RE = re.compile(r"^(cuda|hip):([0-9]+)$")
+
+
+def _placement_backend(device: str) -> str:
+    match = _PLACEMENT_DEVICE_RE.fullmatch(device)
+    if not match:
+        raise ValueError(f"placement device must use cuda:N or hip:N syntax; got {device!r}")
+    return match.group(1)
+
+
+@dataclass(frozen=True, slots=True)
+class PlacementRuntime:
+    """Validated accelerator placement passed atomically to the engine.
+
+    Paths to backend IPC binaries deliberately do not live in user config.
+    They are installation details resolved by the host wrapper after it has
+    verified the executable and its backend runtime. These fields describe
+    only the portable execution intent.
+    """
+
+    mode: PlacementMode = "single"
+    target_device: str = ""
+    target_devices: tuple[str, ...] = ()
+    target_layer_split: tuple[float, ...] = ()
+    draft_device: str = ""
+    remote_draft: bool = False
+    remote_target_shard: bool = False
+    peer_access: bool = False
+    remote_expert_device: str = ""
+
+    def __post_init__(self) -> None:
+        if self.mode not in {
+            "single",
+            "draft-offload",
+            "layer-split",
+            "heterogeneous",
+        }:
+            raise ValueError(f"unknown placement mode {self.mode!r}")
+        if self.target_device and self.target_devices:
+            raise ValueError("target_device and target_devices are mutually exclusive")
+
+        devices = self.target_devices or ((self.target_device,) if self.target_device else ())
+        if not devices and self.mode != "single":
+            raise ValueError("non-single placement requires a target device")
+        if len(set(devices)) != len(devices):
+            raise ValueError("target devices must be unique")
+        backends = tuple(_placement_backend(device) for device in devices)
+        if self.draft_device:
+            draft_backend = _placement_backend(self.draft_device)
+        else:
+            draft_backend = backends[0] if backends else ""
+        if self.remote_expert_device:
+            _placement_backend(self.remote_expert_device)
+
+        if self.target_layer_split:
+            if len(self.target_layer_split) != len(self.target_devices):
+                raise ValueError("target_layer_split must contain one weight per target device")
+            if len(self.target_layer_split) < 2:
+                raise ValueError("target layer split requires at least two devices")
+            if any(
+                not math.isfinite(weight) or weight <= 0.0 for weight in self.target_layer_split
+            ):
+                raise ValueError("target layer split weights must be finite and positive")
+        elif len(self.target_devices) > 1:
+            raise ValueError("multiple target devices require target_layer_split")
+
+        mixed_target = len(set(backends)) > 1
+        if mixed_target and not self.remote_target_shard:
+            raise ValueError("mixed-backend target placement requires remote_target_shard")
+        if self.remote_target_shard and not mixed_target:
+            raise ValueError("remote_target_shard requires mixed-backend target placement")
+        mixed_draft = bool(draft_backend and backends and draft_backend != backends[0])
+        if mixed_draft and not self.remote_draft:
+            raise ValueError("mixed-backend draft placement requires remote_draft")
+        if self.remote_draft and not mixed_draft:
+            raise ValueError("remote_draft requires mixed-backend draft placement")
+        if self.draft_device and self.draft_device in devices:
+            raise ValueError("draft_device must differ from the target device")
+        if self.remote_expert_device and self.remote_expert_device in devices:
+            raise ValueError("remote_expert_device must differ from target devices")
+        if self.peer_access and (len(backends) < 2 or len(set(backends)) != 1):
+            raise ValueError("peer_access requires a same-backend target layer split")
+        if self.mode == "single" and (
+            len(devices) > 1
+            or self.draft_device
+            or self.remote_expert_device
+            or self.remote_draft
+            or self.remote_target_shard
+        ):
+            raise ValueError("single placement cannot contain secondary-device settings")
+        if self.mode == "draft-offload" and not self.draft_device:
+            raise ValueError("draft-offload placement requires draft_device")
+        if self.mode == "layer-split" and not self.target_layer_split:
+            raise ValueError("layer-split placement requires target_layer_split")
+        if self.mode == "heterogeneous" and not (
+            self.remote_draft or self.remote_target_shard or self.remote_expert_device
+        ):
+            raise ValueError("heterogeneous placement requires a cross-device workload")
+
+    @property
+    def uses_multiple_devices(self) -> bool:
+        return bool(len(self.target_devices) > 1 or self.draft_device or self.remote_expert_device)
+
+    @property
+    def target_backend(self) -> str:
+        devices = self.target_devices or ((self.target_device,) if self.target_device else ())
+        return _placement_backend(devices[0]) if devices else ""
+
+    @property
+    def requires_hybrid_runtime(self) -> bool:
+        """Whether one process must launch a daemon from another backend."""
+        if self.remote_draft or self.remote_target_shard:
+            return True
+        if not self.remote_expert_device or not self.target_backend:
+            return False
+        return _placement_backend(self.remote_expert_device) != self.target_backend
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,5 +361,6 @@ class Config:
     port: int = 8080
     models_dir: Path = field(default_factory=default_models_dir)
     dflash: DflashRuntime = field(default_factory=DflashRuntime)
+    placement: PlacementRuntime = field(default_factory=PlacementRuntime)
     host: HostFacts = field(default_factory=HostFacts)
     model: ModelMeta = field(default_factory=ModelMeta)

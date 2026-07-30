@@ -397,6 +397,18 @@ fi
 # the KV footprint. Only emitted to the server CLI when nonzero so
 # unset reproduces the server's own default unchanged.
 : "${DFLASH_FA_WINDOW:=0}"
+# Accelerator placement is resolved by the host CLI. Empty values preserve the
+# server's historical auto:0 defaults for direct Docker users.
+: "${DFLASH_PLACEMENT_MODE:=single}"
+: "${DFLASH_TARGET_DEVICE:=}"
+: "${DFLASH_TARGET_DEVICES:=}"
+: "${DFLASH_TARGET_LAYER_SPLIT:=}"
+: "${DFLASH_DRAFT_DEVICE:=}"
+: "${DFLASH_REMOTE_DRAFT:=0}"
+: "${DFLASH_REMOTE_TARGET_SHARD:=0}"
+: "${DFLASH_PEER_ACCESS:=0}"
+: "${DFLASH_REMOTE_EXPERT_DEVICE:=}"
+: "${DFLASH_BACKEND_IPC_BIN:=$DFLASH_DIR/build/backend_ipc_daemon}"
 
 # ── auto-detect target ─────────────────────────────────────────────────────
 # Target .gguf is typically 10-30 GB (Q4_K_M). Drafts are 1-2 GB (Q8_0 / Q4)
@@ -576,7 +588,11 @@ elif [ -n "$DFLASH_DRAFT" ] && [ ! -f "$DFLASH_DRAFT" ]; then
     DRAFT_ARG=""
 fi
 
-[ "$GPU_COUNT" -gt 1 ] && warn "${GPU_COUNT} GPUs detected — native server layer sharding is not auto-enabled"
+if [ "$GPU_COUNT" -gt 1 ] \
+   && [ -z "$DFLASH_TARGET_DEVICE" ] \
+   && [ -z "$DFLASH_TARGET_DEVICES" ]; then
+    warn "${GPU_COUNT} GPUs detected but no placement profile was supplied; using the server default"
+fi
 
 # ── build + exec native server ────────────────────────────────────────────
 CMD=("$DFLASH_SERVER_BIN" "$DFLASH_TARGET"
@@ -584,6 +600,45 @@ CMD=("$DFLASH_SERVER_BIN" "$DFLASH_TARGET"
      --port "$DFLASH_PORT"
      --max-ctx "$DFLASH_MAX_CTX"
      --think-max-tokens "$DFLASH_THINK_MAX")
+
+if [ -n "$DFLASH_TARGET_DEVICES" ]; then
+    [ -z "$DFLASH_TARGET_DEVICE" ] \
+        || die "DFLASH_TARGET_DEVICE conflicts with DFLASH_TARGET_DEVICES"
+    [ -n "$DFLASH_TARGET_LAYER_SPLIT" ] \
+        || die "DFLASH_TARGET_DEVICES requires DFLASH_TARGET_LAYER_SPLIT"
+    CMD+=(--target-devices "$DFLASH_TARGET_DEVICES"
+          --target-layer-split "$DFLASH_TARGET_LAYER_SPLIT")
+elif [ -n "$DFLASH_TARGET_DEVICE" ]; then
+    CMD+=(--target-device "$DFLASH_TARGET_DEVICE")
+fi
+[ -n "$DFLASH_DRAFT_DEVICE" ] && CMD+=(--draft-device "$DFLASH_DRAFT_DEVICE")
+
+if [ "$DFLASH_REMOTE_DRAFT" = "1" ] \
+   || [ "$DFLASH_REMOTE_TARGET_SHARD" = "1" ] \
+   || [ -n "$DFLASH_REMOTE_EXPERT_DEVICE" ]; then
+    [ -x "$DFLASH_BACKEND_IPC_BIN" ] \
+        || die "backend IPC daemon missing or not executable at $DFLASH_BACKEND_IPC_BIN"
+fi
+[ "$DFLASH_REMOTE_DRAFT" = "1" ] \
+    && CMD+=(--draft-ipc-bin "$DFLASH_BACKEND_IPC_BIN")
+[ "$DFLASH_REMOTE_TARGET_SHARD" = "1" ] \
+    && CMD+=(--target-shard-ipc-bin "$DFLASH_BACKEND_IPC_BIN")
+[ "$DFLASH_PEER_ACCESS" = "1" ] && CMD+=(--peer-access)
+
+if [ -n "$DFLASH_REMOTE_EXPERT_DEVICE" ]; then
+    [ "$DFLASH_SPARK" = "1" ] \
+        || die "DFLASH_REMOTE_EXPERT_DEVICE requires DFLASH_SPARK=1"
+    case "$DFLASH_REMOTE_EXPERT_DEVICE" in
+        cuda:[0-9]*|hip:[0-9]*) ;;
+        *) die "bad DFLASH_REMOTE_EXPERT_DEVICE (expected cuda:N or hip:N)" ;;
+    esac
+    remote_expert_gpu="${DFLASH_REMOTE_EXPERT_DEVICE##*:}"
+    [[ "$remote_expert_gpu" =~ ^[0-9]+$ ]] \
+        || die "bad DFLASH_REMOTE_EXPERT_DEVICE GPU index"
+    export DFLASH_MOE_EXPERT_COMPUTE_IPC_BIN="$DFLASH_BACKEND_IPC_BIN"
+    export DFLASH_MOE_EXPERT_COMPUTE_IPC_GPU="$remote_expert_gpu"
+    export DFLASH_MOE_EXPERT_COMPUTE_IPC_REQUIRED=1
+fi
 
 # Keep cache defaults owned by dflash_server. In particular, omitting
 # DFLASH_PREFIX_CACHE_SLOTS preserves the native nonzero default instead of

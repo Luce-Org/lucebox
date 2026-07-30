@@ -50,8 +50,7 @@ def test_deferred_verbs_are_not_registered(verb: str) -> None:
 def test_core_verbs_present_in_app() -> None:
     """The core launch/serve surface stays wired into the Typer command table."""
     registered = {
-        c.name or (c.callback.__name__ if c.callback else "")
-        for c in app.registered_commands
+        c.name or (c.callback.__name__ if c.callback else "") for c in app.registered_commands
     }
     for verb in ("check", "pull", "optimize", "print-run", "print-serve-argv", "version"):
         assert verb in registered

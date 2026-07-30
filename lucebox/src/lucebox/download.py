@@ -86,7 +86,9 @@ class ModelPreset:
     target_file: str
     draft_repo: str | None
     draft_file: str | None
-    approx_total_gb: int
+    approx_total_gb: float
+    approx_target_gb: float
+    approx_draft_gb: float
     architecture: str
     native_context: int
     description: str = ""
@@ -109,6 +111,8 @@ PRESETS: dict[str, ModelPreset] = {
         draft_repo="spiritbuun/Qwen3.6-27B-DFlash-GGUF",
         draft_file="dflash-draft-3.6-q4_k_m.gguf",
         approx_total_gb=17,
+        approx_target_gb=15.7,
+        approx_draft_gb=1.3,
         architecture="qwen35",
         native_context=262144,
         description="Qwen3.6 27B dense (Q4_K_M) + Qwen3.6 DFlash draft. Lucebox default.",
@@ -120,6 +124,8 @@ PRESETS: dict[str, ModelPreset] = {
         draft_repo="Lucebox/gemma-4-26B-A4B-it-DFlash-GGUF",
         draft_file="gemma-4-26B-A4B-it-DFlash-q8_0.gguf",
         approx_total_gb=18,
+        approx_target_gb=16.0,
+        approx_draft_gb=2.0,
         architecture="gemma4",
         native_context=262144,
         description="Gemma 4 26B-A4B IT MoE (Q4_K_M) + Lucebox DFlash q8_0 draft.",
@@ -131,6 +137,8 @@ PRESETS: dict[str, ModelPreset] = {
         draft_repo="Lucebox/gemma-4-31B-it-DFlash-GGUF",
         draft_file="gemma-4-31B-it-DFlash-q8_0.gguf",
         approx_total_gb=21,
+        approx_target_gb=19.0,
+        approx_draft_gb=2.0,
         architecture="gemma4",
         native_context=262144,
         description="Gemma 4 31B IT dense (Q4_K_M) + Lucebox DFlash q8_0 draft.",
@@ -148,6 +156,8 @@ PRESETS: dict[str, ModelPreset] = {
         draft_file=None,
         speculator_dir="laguna-xs2-speculator",
         approx_total_gb=20,
+        approx_target_gb=18.9,
+        approx_draft_gb=1.1,
         architecture="laguna",
         native_context=4096,
         description=(
@@ -172,6 +182,8 @@ PRESETS: dict[str, ModelPreset] = {
         draft_repo=None,
         draft_file=None,
         approx_total_gb=22,
+        approx_target_gb=22.0,
+        approx_draft_gb=0.0,
         architecture="qwen35moe",
         native_context=262144,
         description=(

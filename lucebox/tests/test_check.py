@@ -33,6 +33,7 @@ def test_check_prints_host_facts_section(monkeypatch: pytest.MonkeyPatch) -> Non
         "LUCEBOX_HOST_GPU_LIST_CSV",
         "0, GPU-abc, 00000000:01:00.0, NVIDIA RTX 5090, 12.0, 24576 MiB, 175.00 W",
     )
+
     # Stub HostFacts so the pass/fail checks succeed at least minimally.
     # `cli.check` imports `from_env` into its module namespace, so patch
     # both names.
@@ -53,6 +54,7 @@ def test_check_prints_host_facts_section(monkeypatch: pytest.MonkeyPatch) -> Non
             docker_version="29.1.3",
             ctk="runtime",
         )
+
     monkeypatch.setattr("lucebox.host_facts.from_env", stub)
     monkeypatch.setattr("lucebox.cli.from_env", stub)
     result = CliRunner().invoke(app, ["check"])
@@ -93,6 +95,7 @@ def test_check_exit_code_independent_of_host_facts(
     facts block prints.
     """
     monkeypatch.setenv("LUCEBOX_HOST_OS_PRETTY", "Bare Linux")
+
     def stub() -> HostFacts:
         return HostFacts(
             nproc=8,
@@ -110,6 +113,7 @@ def test_check_exit_code_independent_of_host_facts(
             docker_version="",
             ctk="none",  # also fail
         )
+
     monkeypatch.setattr("lucebox.host_facts.from_env", stub)
     monkeypatch.setattr("lucebox.cli.from_env", stub)
     result = CliRunner().invoke(app, ["check"])

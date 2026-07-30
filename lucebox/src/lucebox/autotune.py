@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Literal
 
+from lucebox.placement import PlacementPlan, automatic_placement
 from lucebox.types import Config, DflashRuntime, HostFacts
 
 
@@ -26,10 +27,11 @@ class OptimizationDecision:
 
 @dataclass(frozen=True, slots=True)
 class OptimizationPlan:
-    """Resolved runtime plus the four product-level optimization decisions."""
+    """Resolved optimization and accelerator-placement decisions."""
 
     runtime: DflashRuntime
     model_name: str
+    placement: PlacementPlan
     dflash: OptimizationDecision
     pflash: OptimizationDecision
     kvflash: OptimizationDecision
@@ -106,7 +108,34 @@ def draft_available(cfg: Config, preset: object) -> bool:
         return False
 
 
-def _cap_exact_context(runtime: DflashRuntime, *, headroom_gb: int, arch: str) -> DflashRuntime:
+def placement_for_runtime(cfg: Config, runtime: DflashRuntime) -> PlacementPlan:
+    """Resolve placement after an Advanced-mode optimization edit."""
+    from lucebox import download as download_mod
+
+    preset = download_mod.PRESETS.get(cfg.model.preset)
+    if preset is None:
+        return automatic_placement(
+            cfg,
+            runtime,
+            object(),
+            has_draft=False,
+            optimizer_drafter_available=False,
+        )
+    return automatic_placement(
+        cfg,
+        runtime,
+        preset,
+        has_draft=runtime.speculative_decode and draft_available(cfg, preset),
+        optimizer_drafter_available=download_mod.optimizer_drafter_installed(cfg),
+    )
+
+
+def _cap_exact_context(
+    runtime: DflashRuntime,
+    *,
+    headroom_gb: float,
+    arch: str,
+) -> DflashRuntime:
     """Keep exact-cache families inside conservative primary-GPU headroom.
 
     Qwen families have an automatic bounded-residency path below; other
@@ -150,9 +179,17 @@ def automatic_plan(
             "choose a model first; it activates when that model has a matching draft",
         )
         unavailable = "choose a model first"
+        placement = automatic_placement(
+            cfg,
+            runtime,
+            object(),
+            has_draft=False,
+            optimizer_drafter_available=optimizer_drafter_available,
+        )
         return OptimizationPlan(
             runtime=runtime,
             model_name=cfg.model.preset or "not selected",
+            placement=placement,
             dflash=dflash,
             pflash=OptimizationDecision("PFlash", False, False, unavailable),
             kvflash=OptimizationDecision("KVFlash", False, False, unavailable),
@@ -278,9 +315,39 @@ def automatic_plan(
     needs_optimizer_drafter = not optimizer_drafter_available and (
         pflash_profile or (kvflash_profile and preset.architecture == "qwen35moe")
     )
+    placement = automatic_placement(
+        cfg,
+        runtime,
+        preset,
+        has_draft=has_draft,
+        optimizer_drafter_available=optimizer_drafter_available,
+    )
+    adjusted = placement.optimization_runtime
+    if dflash.enabled and not adjusted.speculative_decode:
+        dflash = OptimizationDecision(
+            "DFlash",
+            False,
+            dflash.available,
+            "disabled because the selected target placement has no compatible draft path",
+        )
+    if pflash.enabled and adjusted.prefill_mode == "off":
+        pflash = OptimizationDecision(
+            "PFlash",
+            False,
+            pflash.available,
+            "disabled because the selected target placement has no compatible compression path",
+        )
+    if spark.enabled and not adjusted.spark:
+        spark = OptimizationDecision(
+            "Spark",
+            False,
+            spark.available,
+            "disabled because Automatic does not compose Spark with target layer splitting",
+        )
     return OptimizationPlan(
-        runtime=runtime,
+        runtime=adjusted,
         model_name=preset.name,
+        placement=placement,
         dflash=dflash,
         pflash=pflash,
         kvflash=kvflash,
