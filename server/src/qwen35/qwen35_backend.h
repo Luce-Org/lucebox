@@ -131,6 +131,11 @@ public:
     bool supports_dflash_spec_decode() const override { return true; }
     DFlashTarget * dflash_target() override;
     bool supports_remote_draft() const override { return true; }
+#ifdef DFLASH_HAVE_MMPROJ
+    bool supports_multimodal() const override { return vision_ != nullptr; }
+#else
+    bool supports_multimodal() const override { return false; }
+#endif
 
     void shutdown() override;
 
