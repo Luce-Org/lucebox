@@ -89,6 +89,17 @@ smoke-tested in [run 30560639772](https://github.com/dusterbloom/lucebox-esbmc-a
 This timeout change provides operational headroom for the nightly proof; it
 does not promote KVFlash or relax the per-PR bound.
 
+The exact-head nightly replay at Lucebox commit `2fe23811868701ec430325817972b1efd0872fbc`
+passed both generated and legacy lanes in
+[run 30561396096](https://github.com/dusterbloom/lucebox-hub/actions/runs/30561396096).
+The generated KVFlash proof took 167.92 seconds and the legacy proof took
+181.48 seconds against the 240-second nightly timeout, leaving approximately
+58.5 seconds of margin in the slower lane. The artifact hashes are:
+
+- plan: `d50d74575fae0871a6ac0eb94b2a36946edd4dcf4e6f7ca3f919ded5f5fec6f9`;
+- generated report: `f045a24c6c8619091d375c488ae9b7295f5cc1ed197f795c23723fcc606b302e`;
+- legacy report: `23a526ceb8f28279be848ef3548919d9247d9e185f715d9b10f515b22e7f1744`.
+
 | Capsule | Result | Time |
 |---|---:|---:|
 | `prefix-cache-inline` | verified | 7.27 s |
