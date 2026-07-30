@@ -81,6 +81,23 @@ The generated plan directory was ephemeral and was not retained.
 | `spec-commit-exactness` | verified | 1.19 s |
 | `kvflash-residency-map` | verified | 87.89 s |
 
+At proposed-pin commit `b37dae25ea3f4104785ee2163174390fbbb9e0be`,
+the normal pinned-image invocation also verified all five capsules with
+base=head and mode `all`:
+
+```text
+LUCEBOX_FORMAL_RESULTS=/tmp/lucebox-formal-pin-head \
+./scripts/formal.sh --all
+```
+
+The resulting `report.json` SHA-256 was
+`eb2d633fa0108a94aa82364091714da2f8bbe842c1ff72c588079172512f8052`.
+Capsule times were 7.02 s, 0.98 s, 45.21 s, 1.15 s, and 87.34 s in registry
+order. The complete `./scripts/formal_mutation_test.sh` campaign then passed
+at the same commit: each of the four checked-in defects produced its required
+counterexample, while the applicable prefix-cache control capsules remained
+verified.
+
 The companion's
 [49-test CI run](https://github.com/dusterbloom/lucebox-esbmc-ai/actions/runs/30538756694)
 includes an adversarial regression checking that a head-edited transitive
