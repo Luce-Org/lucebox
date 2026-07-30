@@ -71,10 +71,12 @@ The first-wave advisory capsules add:
   exact-head native regression.
 
 Their exact checked properties and exclusions live beside their harnesses.
-They remain `advisory` while the checked-in mutations, proof latency, and
-companion-image trust changes are reviewed in CI. Local ESBMC evidence is
-recorded in [`FIRST_WAVE_EVIDENCE.md`](FIRST_WAVE_EVIDENCE.md). Only behavior
-explicitly named by a capsule contract is described as model checked.
+They remain `advisory` while maintainers review their protected contracts,
+bounds, latency, and ownership. The candidate companion image proposed by this
+transition contains the authenticated transitive-contract snapshot
+implementation. Local candidate and hosted baseline ESBMC evidence is recorded in
+[`FIRST_WAVE_EVIDENCE.md`](FIRST_WAVE_EVIDENCE.md). Only behavior explicitly
+named by a capsule contract is described as model checked.
 
 ## Local use
 

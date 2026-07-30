@@ -148,7 +148,7 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.ZAI_API_KEY || secrets.OPENAI_API_KEY }}
           OPENAI_API_BASE: ${{ vars.FORMAL_AI_BASE_URL || 'https://api.z.ai/api/paas/v4/' }}
           FORMAL_AI_MODEL: ${{ vars.FORMAL_AI_MODEL || 'openai:glm-5' }}
-          REPAIR_IMAGE: ghcr.io/dusterbloom/lucebox-esbmc-ai-repair@sha256:8abd1ce59aea9df95bcb2d73ce77238ed009ceaddf7f69dac68b9937e37e50ce
+          REPAIR_IMAGE: ghcr.io/dusterbloom/lucebox-esbmc-ai-repair@sha256:2d77a93c2467641696b1080e00866b22d5f7ab6f4456eeceec35862aa01bdd46
         run: |
           bundle="$(
             find incoming -type f -name "failure-bundle-*.tar.gz" \
@@ -185,7 +185,7 @@ jobs:
         if: steps.propose.outcome == 'success'
         continue-on-error: true
         env:
-          REPAIR_IMAGE: ghcr.io/dusterbloom/lucebox-esbmc-ai-repair@sha256:8abd1ce59aea9df95bcb2d73ce77238ed009ceaddf7f69dac68b9937e37e50ce
+          REPAIR_IMAGE: ghcr.io/dusterbloom/lucebox-esbmc-ai-repair@sha256:2d77a93c2467641696b1080e00866b22d5f7ab6f4456eeceec35862aa01bdd46
         run: |
           bundle="$(
             find incoming -type f -name "failure-bundle-*.tar.gz" \
@@ -266,7 +266,7 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.ZAI_API_KEY || secrets.OPENAI_API_KEY }}
           OPENAI_API_BASE: ${{ vars.FORMAL_AI_BASE_URL || 'https://api.z.ai/api/paas/v4/' }}
           FORMAL_AI_MODEL: ${{ vars.FORMAL_AI_MODEL || 'openai:glm-5' }}
-          REPAIR_IMAGE: ghcr.io/dusterbloom/lucebox-esbmc-ai-repair@sha256:8abd1ce59aea9df95bcb2d73ce77238ed009ceaddf7f69dac68b9937e37e50ce
+          REPAIR_IMAGE: ghcr.io/dusterbloom/lucebox-esbmc-ai-repair@sha256:2d77a93c2467641696b1080e00866b22d5f7ab6f4456eeceec35862aa01bdd46
         run: |
           mkdir -p proposed
           successes=0
@@ -309,7 +309,7 @@ jobs:
         if: steps.propose.outcome == 'success'
         continue-on-error: true
         env:
-          REPAIR_IMAGE: ghcr.io/dusterbloom/lucebox-esbmc-ai-repair@sha256:8abd1ce59aea9df95bcb2d73ce77238ed009ceaddf7f69dac68b9937e37e50ce
+          REPAIR_IMAGE: ghcr.io/dusterbloom/lucebox-esbmc-ai-repair@sha256:2d77a93c2467641696b1080e00866b22d5f7ab6f4456eeceec35862aa01bdd46
         run: |
           mkdir -p candidate
           ready=0

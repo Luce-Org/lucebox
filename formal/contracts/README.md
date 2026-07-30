@@ -36,12 +36,11 @@ mutation sensitivity are established:
 - `kvflash-residency-map`
 
 Their generated wrappers may include shared harness bodies. Every such body is
-declared in `contract_paths`. The accepted companion image must materialize
-those authenticated base-revision blobs into an isolated include tree before
-the PR/head production include paths. A PR then cannot weaken a transitive
-harness include while retaining a green result. The source implementation of
-this rule is pending publication and acceptance as a new immutable companion
-image before these targets can be promoted.
+declared in `contract_paths`. Once accepted into protected base policy, the
+candidate companion image materializes those authenticated base-revision blobs
+into an isolated include tree before the PR/head production include paths. A
+PR therefore cannot weaken a transitive harness include while retaining a
+green result.
 
 The templates intentionally call production code; they are not duplicate
 implementations.  The legacy harness runs the same transition during the

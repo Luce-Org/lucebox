@@ -45,16 +45,55 @@ This establishes sensitivity for the checked-in representative defects. It
 does not imply sensitivity to every possible defect in the same production
 areas.
 
+## 2026-07-30 companion 0.3.0 candidate validation and proposed pin
+
+Companion commit `971fda75b4b6f2da9ff26d1c06bf248472bf96b6` was published
+and smoke-tested in
+[run 30541259801](https://github.com/dusterbloom/lucebox-esbmc-ai/actions/runs/30541259801).
+This branch proposes pinning the resulting post-smoke OCI digests:
+
+- verifier:
+  `ghcr.io/dusterbloom/lucebox-esbmc-ai-verifier@sha256:fd1a08aec947df86f3a441504f65d44ebb3fc05c299e98cdf3249a724446f62e`;
+- repair:
+  `ghcr.io/dusterbloom/lucebox-esbmc-ai-repair@sha256:2d77a93c2467641696b1080e00866b22d5f7ab6f4456eeceec35862aa01bdd46`.
+
+Before the proposed pin transition, the new verifier was run locally as an
+explicit candidate override against exact Lucebox head
+`84ad08b22e34814f116628a3ea396b7c4efa6bf0`. The authenticated generated plan
+and all declared native regressions verified:
+
+```text
+LUCEBOX_FORMAL_IMAGE=ghcr.io/dusterbloom/lucebox-esbmc-ai-verifier@sha256:fd1a08aec947df86f3a441504f65d44ebb3fc05c299e98cdf3249a724446f62e \
+LUCEBOX_FORMAL_RESULTS=/tmp/lucebox-formal-new-image-candidate \
+./scripts/formal.sh --all
+```
+
+Mode `all` used base=head=`84ad08b22e34814f116628a3ea396b7c4efa6bf0`.
+The resulting `report.json` SHA-256 was
+`8613f96727f73739e1072242f4a7e0ea6f98b92172d83061b3eb370268e69ea7`.
+The generated plan directory was ephemeral and was not retained.
+
+| Capsule | Result | Time |
+|---|---:|---:|
+| `prefix-cache-inline` | verified | 7.27 s |
+| `prefix-cache-abort-hole` | verified | 0.96 s |
+| `prefix-cache-full-lifecycle` | verified | 45.34 s |
+| `spec-commit-exactness` | verified | 1.19 s |
+| `kvflash-residency-map` | verified | 87.89 s |
+
+The companion's
+[49-test CI run](https://github.com/dusterbloom/lucebox-esbmc-ai/actions/runs/30538756694)
+includes an adversarial regression checking that a head-edited transitive
+contract body cannot shadow the authenticated base snapshot while production
+headers still resolve from the exact head.
+
 ## Promotion blockers
 
 The three new targets remain advisory until all of the following are complete:
 
-1. The companion verifier's authenticated transitive-contract snapshot fix is
-   reviewed, merged, and published in a new immutable verifier image.
-2. Lucebox pins that reviewed image digest in the registry and workflows.
+1. The companion and Lucebox pin transitions are reviewed and merged into
+   their protected base branches.
+2. The accepted base policy completes a clean PR/nightly soak on the new
+   digests.
 3. Maintainers approve each target's protected contract, bounds, latency, and
-   ownership.
-
-The current pinned image is sufficient for the legacy replay above. It does
-not contain the pending transitive-contract snapshot fix and therefore is not
-the image to use when promoting the generated per-PR plan lane.
+   ownership in a separate promotion change.

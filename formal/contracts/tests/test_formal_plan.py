@@ -57,6 +57,41 @@ class FormalPlanTest(unittest.TestCase):
         manifest = tomllib.loads((ROOT / manifest_path).read_text())
         self.assertEqual(registry["toolchain"], manifest["toolchain"])
 
+    def test_workflow_image_pins_match_registry_toolchain(self) -> None:
+        toolchain = formal_plan.load_registry(REGISTRY, ROOT)["toolchain"]
+        workflows = {
+            ".github/workflows/formal.yml": {
+                "VERIFIER_IMAGE": (toolchain["verifier_image"], 3),
+                "REPAIR_IMAGE": (toolchain["repair_image"], 1),
+            },
+            ".github/workflows/formal-nightly.yml": {
+                "VERIFIER_IMAGE": (toolchain["verifier_image"], 3),
+                "REPAIR_IMAGE": (toolchain["repair_image"], 1),
+            },
+            ".github/workflows/formal-ai.yml": {
+                "REPAIR_IMAGE": (toolchain["repair_image"], 4),
+            },
+        }
+        assignment_pattern = re.compile(
+            r"^\s*(VERIFIER_IMAGE|REPAIR_IMAGE):\s*(\S+)\s*$",
+            re.MULTILINE,
+        )
+        for relative, expected in workflows.items():
+            assignments = assignment_pattern.findall((ROOT / relative).read_text())
+            self.assertEqual(
+                {name for name, _ in assignments},
+                set(expected),
+                relative,
+            )
+            for name, (expected_value, expected_count) in expected.items():
+                values = [value for actual_name, value in assignments if actual_name == name]
+                self.assertEqual(len(values), expected_count, f"{relative}: {name}")
+                self.assertEqual(
+                    values,
+                    [expected_value] * expected_count,
+                    f"{relative}: {name}",
+                )
+
     def test_prefix_cache_fixture_selects_approved_targets(self) -> None:
         plan = self.plan_fixture("prefix-cache-change.json")
         self.assertEqual(
@@ -108,16 +143,51 @@ class FormalPlanTest(unittest.TestCase):
 
     def test_transitive_formal_template_includes_are_protected(self) -> None:
         registry = formal_plan.load_registry(REGISTRY, ROOT)
+        expected_bodies = {
+            "prefix-cache-full-lifecycle": (
+                "formal/prefix_cache/full_lifecycle_harness_body.h"
+            ),
+            "spec-commit-exactness": (
+                "formal/spec_commit/spec_commit_harness_body.h"
+            ),
+            "kvflash-residency-map": (
+                "formal/kvflash/residency_map_harness_body.h"
+            ),
+        }
         for target in registry["targets"]:
             template = (ROOT / target["template"]).read_text(encoding="utf-8")
-            repository_includes = [
-                path
-                for path in re.findall(r'#include\s+"([^"]+)"', template)
-                if path.startswith("formal/")
-            ]
-            for included in repository_includes:
-                self.assertIn(included, target["contract_paths"], target["id"])
-                self.assertIn(included, target["trigger_paths"], target["id"])
+            resolved_formal_paths = set()
+            for included in re.findall(r'#include\s+"([^"]+)"', template):
+                candidates = [included]
+                candidates.extend(
+                    str(Path(include_dir) / included)
+                    for include_dir in target["include_dirs"]
+                )
+                resolved_formal_paths.update(
+                    path
+                    for path in candidates
+                    if path.startswith("formal/") and (ROOT / path).is_file()
+                )
+
+            if "formal" in target["include_dirs"]:
+                self.assertTrue(resolved_formal_paths, target["id"])
+            if target["id"] in expected_bodies:
+                self.assertIn(
+                    expected_bodies[target["id"]],
+                    resolved_formal_paths,
+                    target["id"],
+                )
+            for formal_path in resolved_formal_paths:
+                self.assertIn(
+                    formal_path,
+                    target["contract_paths"],
+                    target["id"],
+                )
+                self.assertIn(
+                    formal_path,
+                    target["trigger_paths"],
+                    target["id"],
+                )
 
     def test_uncovered_critical_path_is_advisory_gap(self) -> None:
         plan = self.plan_fixture("uncovered-streaming-change.json")
