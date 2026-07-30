@@ -27,8 +27,8 @@ jobs:
         name: Generate extended base-approved plan
         continue-on-error: true
         env:
-          VERIFIER_IMAGE: ghcr.io/dusterbloom/lucebox-esbmc-ai-verifier@sha256:fd1a08aec947df86f3a441504f65d44ebb3fc05c299e98cdf3249a724446f62e
-          REPAIR_IMAGE: ghcr.io/dusterbloom/lucebox-esbmc-ai-repair@sha256:2d77a93c2467641696b1080e00866b22d5f7ab6f4456eeceec35862aa01bdd46
+          VERIFIER_IMAGE: ghcr.io/dusterbloom/lucebox-esbmc-ai-verifier@sha256:9321a4aa371efec1b55e33dff0c1cefbc10778aa7f38b07cb2b84cff1c9ed39e
+          REPAIR_IMAGE: ghcr.io/dusterbloom/lucebox-esbmc-ai-repair@sha256:e33712eac4207a74562fe9d9fda9a9456ce41c175456dda3dd54e7ba7286c597
           REVISION: ${{ github.sha }}
         run: |
           readarray -t policy_images < <(
@@ -75,7 +75,7 @@ jobs:
         if: steps.plan.outcome == 'success'
         continue-on-error: true
         env:
-          VERIFIER_IMAGE: ghcr.io/dusterbloom/lucebox-esbmc-ai-verifier@sha256:fd1a08aec947df86f3a441504f65d44ebb3fc05c299e98cdf3249a724446f62e
+          VERIFIER_IMAGE: ghcr.io/dusterbloom/lucebox-esbmc-ai-verifier@sha256:9321a4aa371efec1b55e33dff0c1cefbc10778aa7f38b07cb2b84cff1c9ed39e
         run: |
           mkdir -p .formal-results
           docker run --rm \
@@ -102,7 +102,7 @@ jobs:
         name: Run legacy nightly capsules for comparison
         continue-on-error: true
         env:
-          VERIFIER_IMAGE: ghcr.io/dusterbloom/lucebox-esbmc-ai-verifier@sha256:fd1a08aec947df86f3a441504f65d44ebb3fc05c299e98cdf3249a724446f62e
+          VERIFIER_IMAGE: ghcr.io/dusterbloom/lucebox-esbmc-ai-verifier@sha256:9321a4aa371efec1b55e33dff0c1cefbc10778aa7f38b07cb2b84cff1c9ed39e
         run: |
           mkdir -p .formal-legacy-results
           docker run --rm \

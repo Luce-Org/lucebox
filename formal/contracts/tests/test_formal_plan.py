@@ -145,6 +145,10 @@ class FormalPlanTest(unittest.TestCase):
             self.assertEqual(target["entry_function"], capsule["entry_function"])
             self.assertEqual(target["include_dirs"], capsule["include_dirs"])
             self.assertEqual(target["timeout_seconds"], capsule["timeout_seconds"])
+            self.assertEqual(
+                target["nightly_timeout_seconds"],
+                capsule.get("nightly_timeout_seconds", capsule["timeout_seconds"]),
+            )
             self.assertEqual(target["pr_defines"], capsule["defines"])
             self.assertEqual(target["nightly_defines"], capsule["nightly_defines"])
             self.assertEqual(target["pr_esbmc_args"], capsule["esbmc_args"])

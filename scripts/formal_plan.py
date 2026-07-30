@@ -149,6 +149,17 @@ def load_registry(registry_path: Path, root: Path) -> dict[str, Any]:
                 raise RegistryError(f"{target_id}: {field} must be a non-empty string")
         if not isinstance(target["timeout_seconds"], int) or not 0 < target["timeout_seconds"] <= 3600:
             raise RegistryError(f"{target_id}: timeout_seconds must be between 1 and 3600")
+        nightly_timeout = target.setdefault(
+            "nightly_timeout_seconds", target["timeout_seconds"]
+        )
+        if (
+            not isinstance(nightly_timeout, int)
+            or nightly_timeout < target["timeout_seconds"]
+            or nightly_timeout > 3600
+        ):
+            raise RegistryError(
+                f"{target_id}: nightly_timeout_seconds must be between timeout_seconds and 3600"
+            )
         for field in (
             "source_paths",
             "trigger_paths",
@@ -257,6 +268,7 @@ def make_plan(registry_path: Path, root: Path, changed_paths: list[str]) -> dict
                     "entry_function",
                     "include_dirs",
                     "timeout_seconds",
+                    "nightly_timeout_seconds",
                     "pr_defines",
                     "nightly_defines",
                     "pr_esbmc_args",

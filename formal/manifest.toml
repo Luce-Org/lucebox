@@ -3,8 +3,8 @@ schema_version = 1
 [toolchain]
 esbmc_version = "8.4"
 esbmc_linux_sha256 = "68bb71128e0c3c2db090955e7a302533a8a11a9d898df7f169c22311a0ec5078"
-verifier_image = "ghcr.io/dusterbloom/lucebox-esbmc-ai-verifier@sha256:fd1a08aec947df86f3a441504f65d44ebb3fc05c299e98cdf3249a724446f62e"
-repair_image = "ghcr.io/dusterbloom/lucebox-esbmc-ai-repair@sha256:2d77a93c2467641696b1080e00866b22d5f7ab6f4456eeceec35862aa01bdd46"
+verifier_image = "ghcr.io/dusterbloom/lucebox-esbmc-ai-verifier@sha256:9321a4aa371efec1b55e33dff0c1cefbc10778aa7f38b07cb2b84cff1c9ed39e"
+repair_image = "ghcr.io/dusterbloom/lucebox-esbmc-ai-repair@sha256:e33712eac4207a74562fe9d9fda9a9456ce41c175456dda3dd54e7ba7286c597"
 
 [[capsules]]
 id = "prefix-cache-inline"
@@ -174,6 +174,7 @@ harness = "formal/kvflash/residency_map_harness.cpp"
 entry_function = "main"
 include_dirs = ["server/src", "formal"]
 timeout_seconds = 180
+nightly_timeout_seconds = 240
 defines = [
   "LUCEBOX_FORMAL_BLOCKS=4",
 ]

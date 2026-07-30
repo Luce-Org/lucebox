@@ -78,6 +78,10 @@ implementation. Local candidate and hosted baseline ESBMC evidence is recorded i
 [`FIRST_WAVE_EVIDENCE.md`](FIRST_WAVE_EVIDENCE.md). Only behavior explicitly
 named by a capsule contract is described as model checked.
 
+The KVFlash target keeps its four-block PR timeout at 180 seconds while using a
+separate 240-second authenticated nightly timeout for the wider five-block
+soak. This extra nightly margin does not weaken the per-PR gate.
+
 ## Local use
 
 Docker will pull the immutable verifier declared in

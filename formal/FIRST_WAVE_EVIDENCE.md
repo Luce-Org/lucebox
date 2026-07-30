@@ -73,6 +73,22 @@ The resulting `report.json` SHA-256 was
 `8613f96727f73739e1072242f4a7e0ea6f98b92172d83061b3eb370268e69ea7`.
 The generated plan directory was ephemeral and was not retained.
 
+## 2026-07-30 separate KVFlash nightly timeout
+
+Companion commit `8a7e1aae040a9f17a7e7513e7bb29c9495afcedb` adds an authenticated
+`nightly_timeout_seconds` target setting. The PR timeout remains 180 seconds;
+the KVFlash five-block nightly expansion is set to 240 seconds. The companion
+CI suite passed all 49 tests, and the updated images were published and
+smoke-tested in [run 30560639772](https://github.com/dusterbloom/lucebox-esbmc-ai/actions/runs/30560639772):
+
+- verifier:
+  `ghcr.io/dusterbloom/lucebox-esbmc-ai-verifier@sha256:9321a4aa371efec1b55e33dff0c1cefbc10778aa7f38b07cb2b84cff1c9ed39e`;
+- repair:
+  `ghcr.io/dusterbloom/lucebox-esbmc-ai-repair@sha256:e33712eac4207a74562fe9d9fda9a9456ce41c175456dda3dd54e7ba7286c597`.
+
+This timeout change provides operational headroom for the nightly proof; it
+does not promote KVFlash or relax the per-PR bound.
+
 | Capsule | Result | Time |
 |---|---:|---:|
 | `prefix-cache-inline` | verified | 7.27 s |
