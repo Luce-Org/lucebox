@@ -1,0 +1,3 @@
+// Generated protected wrapper for {{ID}}: {{SIGNATURE}}
+#define LUCEBOX_FORMAL_CONTRACT_SYMBOL {{SYMBOL}}
+#include "spec_commit/spec_commit_harness_body.h"

@@ -1,0 +1,14 @@
+diff --git a/server/src/server/prefix_cache_state.h b/server/src/server/prefix_cache_state.h
+--- a/server/src/server/prefix_cache_state.h
++++ b/server/src/server/prefix_cache_state.h
+@@ -405,9 +405,7 @@ public:
+                     }
+                 }
+             }
+-            const int relative = select_inline_free_slot(
+-                next_relative_slot_, capacity_, occupied);
+-            if (relative < 0) return result;
++            const int relative = next_relative_slot_;
+             abs_slot = slot_base_ + relative;
+             next_relative_slot_ = (relative + 1) % capacity_;
+         } else {

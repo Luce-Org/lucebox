@@ -2916,10 +2916,11 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
         cache.snap_cut = prepared_snapshot.second;
     };
     auto prepare_full = [&]() {
+        cache.full_snap_pos = (int) effective_prompt.size();
         cache.full_snap_slot =
-            prefix_cache_.prepare_full_snap(req.prompt_tokens);
+            prefix_cache_.prepare_full_snap(
+                req.prompt_tokens, cache.full_snap_pos);
         if (cache.full_snap_slot >= 0) {
-            cache.full_snap_pos = (int) effective_prompt.size();
             generate_request.snap_slot = cache.full_snap_slot;
             generate_request.snap_pos = cache.full_snap_pos;
             cache.full_snap_prepared = true;
@@ -2994,8 +2995,13 @@ void HttpServer::finalize_generation_cache(
                 backend_.snapshot_cur_pos(cache.full_snap_slot);
             if (saved_position > 0 &&
                 saved_position <= cache.full_snap_pos) {
-                prefix_cache_.confirm_full_snap(
-                    cache.full_snap_slot, req.prompt_tokens, saved_position);
+                if (!prefix_cache_.confirm_full_snap(
+                        cache.full_snap_slot,
+                        req.prompt_tokens,
+                        saved_position)) {
+                    backend_.snapshot_free(cache.full_snap_slot);
+                    prefix_cache_.abort_full_snap(cache.full_snap_slot);
+                }
             } else {
                 backend_.snapshot_free(cache.full_snap_slot);
                 prefix_cache_.abort_full_snap(cache.full_snap_slot);

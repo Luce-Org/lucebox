@@ -5,6 +5,7 @@
 // KV cache with layer sharing, snapshot/restore.
 
 #include "gemma4_backend.h"
+#include "common/spec_commit.h"
 #include "dflash27b.h"
 #include "../qwen3/qwen3_kvflash_scorer.h"
 #include "common/sampler.h"
@@ -637,16 +638,24 @@ bool Gemma4Backend::do_spec_decode(int committed, int n_gen,
         }
 
         // 5. Acceptance: longest matching prefix
-        int accept_n = 1;
-        for (int i = 0; i < q_len - 1; i++) {
-            if (draft_tok[i + 1] == target_tok[i]) accept_n++;
-            else break;
+        const auto commit_decision = dflash::common::SpecCommitDecision::greedy(
+            draft_tok, target_tok, q_len, need_commit_budget);
+        if (!commit_decision.valid()) {
+            std::fprintf(stderr, "[gemma4-spec] invalid commit decision\n");
+            cache_.cur_pos = committed;
+            step_graph_destroy(draft_sg);
+            return false;
         }
-        int bonus_tok = (accept_n < q_len) ? target_tok[accept_n - 1] : -1;
-        int commit_n  = accept_n + (bonus_tok >= 0 ? 1 : 0);
-        if (commit_n > need_commit_budget) {
-            commit_n = need_commit_budget;
-            if (commit_n <= accept_n) bonus_tok = -1;
+        const int accept_n = commit_decision.accepted_count();
+        const int bonus_tok = commit_decision.commits_bonus()
+            ? commit_decision.bonus_token() : -1;
+        const int commit_n = commit_decision.commit_count();
+        std::vector<int32_t> commit_tokens;
+        if (!commit_decision.materialize(draft_tok, commit_tokens)) {
+            std::fprintf(stderr, "[gemma4-spec] commit materialization failed\n");
+            cache_.cur_pos = committed;
+            step_graph_destroy(draft_sg);
+            return false;
         }
 
         // 6. KV truncation: discard rejected positions, keep accepted.
@@ -678,7 +687,7 @@ bool Gemma4Backend::do_spec_decode(int committed, int n_gen,
         bool hit_eos = false;
         int emitted = 0;
         for (int i = 0; i < commit_n; i++) {
-            int tok = (i < accept_n) ? draft_tok[i] : bonus_tok;
+            const int tok = commit_tokens[(size_t)i];
             out_tokens.push_back(tok);
             io.emit(tok);
             emitted++;

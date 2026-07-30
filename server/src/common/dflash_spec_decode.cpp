@@ -1,6 +1,7 @@
 // dflash_spec_decode.cpp — Generic DFlash speculative-decode loop.
 
 #include "dflash_spec_decode.h"
+#include "spec_commit.h"
 
 #include "internal.h"        // DraftWeights
 #include "io_utils.h"
@@ -198,22 +199,20 @@ bool run_dflash_spec_decode(
         }
 
         // Acceptance: longest matching prefix between draft and target argmax.
-        int accept_n = 1;
-        for (int i = 0; i < q_len - 1; i++) {
-            if (draft_tok[i + 1] == target_tok[i]) accept_n++;
-            else break;
+        const auto commit_decision = dflash::common::SpecCommitDecision::greedy(
+            draft_tok, target_tok, q_len, need_commit_budget);
+        if (!commit_decision.valid()) {
+            std::fprintf(stderr, "dflash-spec invalid commit decision\n");
+            target.restore_kv();
+            return false;
         }
+        const int accept_n = commit_decision.accepted_count();
         // Track hint acceptance telemetry.
         if (hint_filled > 0) {
             n_hint_proposed += hint_filled;
             n_hint_accepted += std::min(hint_filled, accept_n - 1);
         }
-        int bonus_tok = (accept_n < q_len) ? target_tok[accept_n - 1] : -1;
-        int commit_n  = accept_n + (bonus_tok >= 0 ? 1 : 0);
-        if (commit_n > need_commit_budget) {
-            commit_n = need_commit_budget;
-            if (commit_n <= accept_n) bonus_tok = -1;
-        }
+        int commit_n = commit_decision.commit_count();
 
         // ── Commit accepted tokens to KV state ──────────────────────────
         // Adaptive: use fast-rollback when acceptance is high enough to benefit.
@@ -222,9 +221,11 @@ bool run_dflash_spec_decode(
             target.supports_fast_rollback() &&
             (accept_n >= rollback_policy.fast_rollback_threshold);
 
-        std::vector<int32_t> replay_tok((size_t)commit_n);
-        for (int i = 0; i < commit_n; i++) {
-            replay_tok[i] = (i < accept_n) ? draft_tok[i] : bonus_tok;
+        std::vector<int32_t> replay_tok;
+        if (!commit_decision.materialize(draft_tok, replay_tok)) {
+            std::fprintf(stderr, "dflash-spec commit materialization failed\n");
+            target.restore_kv();
+            return false;
         }
 
         bool fast_rolled_back = false;
@@ -235,7 +236,6 @@ bool run_dflash_spec_decode(
             // budget (need_commit_budget). Committing accept_n would both
             // overrun the budget and grow replay_tok with zero-initialised
             // tokens (it was sized to the clamped commit_n above).
-            bonus_tok = -1;
             commit_n = std::min(accept_n, need_commit_budget);
             replay_tok.resize(commit_n);
             if (target.rollback_to(committed, commit_n)) {
@@ -254,8 +254,8 @@ bool run_dflash_spec_decode(
         if (!fast_rolled_back) {
             rollback_diag.record_legacy_replay();
             // Legacy path: restore SSM snapshot and replay accepted + bonus tokens.
-            // (When falling back from fast-rollback, bonus_tok is already -1 and
-            //  replay_tok/commit_n reflect the budget-clamped accepted set.)
+            // When falling back from fast rollback, replay_tok/commit_n already
+            // reflect the budget-clamped accepted set, with the bonus deferred.
             if (!target.restore_kv()) {
                 std::fprintf(stderr, "dflash-spec restore_kv failed\n");
                 return false;

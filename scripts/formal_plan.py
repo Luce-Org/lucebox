@@ -55,7 +55,7 @@ def _repo_path(value: object, field: str) -> str:
     if not isinstance(value, str) or not value:
         raise RegistryError(f"{field} must be a non-empty repository path")
     path = PurePosixPath(value)
-    if path.is_absolute() or ".." in path.parts:
+    if path.is_absolute() or ".." in path.parts or str(path) == ".":
         raise RegistryError(f"{field} must remain inside the repository: {value}")
     return value
 

@@ -1,0 +1,8 @@
+diff --git a/server/src/common/kvflash_residency_map.h b/server/src/common/kvflash_residency_map.h
+--- a/server/src/common/kvflash_residency_map.h
++++ b/server/src/common/kvflash_residency_map.h
+@@ -80,3 +80,3 @@ public:
+         const int64_t min_chunks =
+-            (int64_t)cfg.sink_chunks + cfg.tail_window_chunks + 2;
++            (int64_t)cfg.sink_chunks + cfg.tail_window_chunks + 3;
+         const int64_t min_tokens = min_chunks * cfg.chunk_tokens;

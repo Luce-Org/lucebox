@@ -1,4 +1,5 @@
 #include "qwen35moe_backend.h"
+#include "common/spec_commit.h"
 
 #include "../common/moe_hybrid_placement.h"
 #include "../common/moe_hybrid_stream.h"
@@ -2098,18 +2099,20 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
         }
 
         // 5. Acceptance: longest matching prefix
-        int accept_n = 1;
-        for (int i = 0; i < verify_width - 1; i++) {
-            if (draft_tok[i + 1] == target_tok[i]) accept_n++;
-            else break;
+        const auto commit_decision = dflash::common::SpecCommitDecision::greedy(
+            draft_tok, target_tok, verify_width, need_commit_budget);
+        if (!commit_decision.valid()) {
+            std::fprintf(stderr, "[hybrid-spec] invalid commit decision\n");
+            if (!restore_ssm_state(target_cache(), target_backend())) {
+                std::fprintf(stderr,
+                    "[hybrid-spec] recurrent-state restore failed\n");
+            }
+            step_graph_destroy(draft_sg);
+            return false;
         }
-        int bonus_tok = (accept_n < verify_width) ? target_tok[accept_n - 1] : -1;
+        const int accept_n = commit_decision.accepted_count();
         observed_max_accept = std::max(observed_max_accept, accept_n);
-        int commit_n = accept_n + (bonus_tok >= 0 ? 1 : 0);
-        if (commit_n > need_commit_budget) {
-            commit_n = need_commit_budget;
-            if (commit_n <= accept_n) bonus_tok = -1;
-        }
+        const int commit_n = commit_decision.commit_count();
 
         // 6. Restore and replay accepted tokens
         if (!restore_ssm_state(target_cache(), target_backend())) {
@@ -2118,9 +2121,11 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
             return false;
         }
 
-        std::vector<int32_t> replay_tok((size_t)commit_n);
-        for (int i = 0; i < commit_n; i++) {
-            replay_tok[i] = (i < accept_n) ? draft_tok[i] : bonus_tok;
+        std::vector<int32_t> replay_tok;
+        if (!commit_decision.materialize(draft_tok, replay_tok)) {
+            std::fprintf(stderr, "[hybrid-spec] commit materialization failed\n");
+            step_graph_destroy(draft_sg);
+            return false;
         }
 
         // Replay tokens through batched hybrid forward (captures features for next draft step)

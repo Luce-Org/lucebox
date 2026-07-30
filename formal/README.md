@@ -11,7 +11,9 @@ The `Formal Verification / verify` check is deterministic:
 - its workflow, registry, templates, bounds, and verifier arguments come from
   the exact target-branch base commit, not from the PR being judged;
 - it checks out the exact PR head separately and refuses a SHA mismatch;
-- its verifier image and ESBMC release are pinned by SHA-256 digest;
+- its verifier image is pinned by an OCI SHA-256 digest; the registry records
+  the ESBMC release checksum and the current verifier checks its version
+  string;
 - the Lucebox checkout is mounted read-only;
 - only the generated-plan and results directories are writable;
 - the container has no network, Linux capabilities, or writable root;
@@ -53,10 +55,26 @@ sequence. This catches both a broken selector and a `prepare` call site that
 bypasses a correct selector. The formal and native guarantees are separated in
 [`prefix_cache/ABORT_HOLE_PROPERTIES.md`](prefix_cache/ABORT_HOLE_PROPERTIES.md).
 
-The dependency-free native test covers the wider transition matrix:
-abort, cancellation, stale lookup, invalid confirmation, clear, full-capacity
-slot reuse, and prefix-aware eviction. Only behavior explicitly named by a
-capsule contract is described as model checked.
+The first-wave advisory capsules add:
+
+- `prefix-cache-full-lifecycle`, which extracts the full snapshot
+  key/slot/boundary/victim reservation, model-checks its fresh
+  prepare/invalid-confirm/confirm/lookup/clear trace, and exercises the wider
+  abort/hole/LRU lifecycle in the exact-head native regression;
+- `spec-commit-exactness`, which centralizes the linear speculative-decode
+  acceptance, optional bonus, budget, and token-selection decision used by
+  five model families;
+- `kvflash-residency-map`, which makes the CPU ownership map authoritative and
+  model-checks named identity-fill, rejected-eviction rollback,
+  protected-LRU-eviction, mask, and logical-bound sequences independently of
+  GPU DMA; recall, explicit page-out, reset, and scored paths remain in the
+  exact-head native regression.
+
+Their exact checked properties and exclusions live beside their harnesses.
+They remain `advisory` while the checked-in mutations, proof latency, and
+companion-image trust changes are reviewed in CI. Local ESBMC evidence is
+recorded in [`FIRST_WAVE_EVIDENCE.md`](FIRST_WAVE_EVIDENCE.md). Only behavior
+explicitly named by a capsule contract is described as model checked.
 
 ## Local use
 
@@ -73,9 +91,11 @@ Docker will pull the immutable verifier declared in
 
 Set `LUCEBOX_FORMAL_IMAGE` only when deliberately testing a new companion image.
 Results are written to `.formal-results/`.
-The mutation test recreates the historical `prepare` call-site bypass in a
-temporary standalone clone and requires the base-approved regression to reject
-it while the scalar selector contract remains green.
+The mutation suite runs four isolated clones. It recreates the historical
+inline `prepare` bypass and injects one focused defect into each first-wave
+core. Every immutable native regression must fail, every selected formal lane
+must conclude with a counterexample, and declared unrelated control targets
+must remain verified.
 
 ## Adding an approved contract
 

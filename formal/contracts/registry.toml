@@ -77,6 +77,41 @@ paths = [
   "server/src/server/tool_hint.cpp",
 ]
 
+[[critical_paths]]
+id = "spec-commit"
+description = "Linear speculative verification and bounded token commit decisions"
+paths = [
+  "server/src/common/spec_commit.h",
+  "server/src/common/dflash_spec_decode.cpp",
+  "server/src/qwen35/qwen35_backend.cpp",
+  "server/src/qwen35moe/qwen35moe_backend.cpp",
+  "server/src/laguna/laguna_backend.cpp",
+  "server/src/gemma4/gemma4_backend.cpp",
+]
+watch_paths = [
+  "server/src/**/*spec*decode*.h",
+  "server/src/**/*spec*decode*.cpp",
+  "server/src/**/*backend.cpp",
+]
+include_roots = ["server/src"]
+policy = "advisory"
+
+[[critical_paths]]
+id = "kvflash-residency"
+description = "KVFlash logical-chunk ownership, eviction, and slot mapping"
+paths = [
+  "server/src/common/kvflash_residency_map.h",
+  "server/src/common/kvflash_pager.h",
+]
+watch_paths = [
+  "server/src/common/*kvflash*.h",
+  "server/src/common/*kvflash*.cpp",
+  "server/src/**/*kvflash*.h",
+  "server/src/**/*kvflash*.cpp",
+]
+include_roots = ["server/src"]
+policy = "advisory"
+
 [[targets]]
 id = "prefix-cache-inline"
 policy = "required"
@@ -133,6 +168,7 @@ source_paths = [
 trigger_paths = [
   "formal/contracts/registry.toml",
   "formal/contracts/templates/prefix-cache-abort-hole.cpp.in",
+  "formal/contracts/mutations/prefix-cache-bypass-selector.patch",
   "formal/prefix_cache/ABORT_HOLE_PROPERTIES.md",
   "server/src/server/prefix_cache_state.h",
   "server/src/server/prefix_cache.h",
@@ -165,8 +201,164 @@ mutable_paths = ["server/src/server/prefix_cache_state.h"]
 contract_paths = [
   "formal/contracts/registry.toml",
   "formal/contracts/templates/prefix-cache-abort-hole.cpp.in",
+  "formal/contracts/mutations/prefix-cache-bypass-selector.patch",
   "formal/prefix_cache/ABORT_HOLE_PROPERTIES.md",
   "server/test/test_prefix_cache_state.cpp",
 ]
 native_test = "test_prefix_cache_state"
 native_test_source = "server/test/test_prefix_cache_state.cpp"
+
+[[targets]]
+id = "prefix-cache-full-lifecycle"
+policy = "advisory"
+description = "Full prefix-cache fresh boundary/confirm proof with exact-head lifecycle regression"
+source_paths = [
+  "server/src/server/prefix_cache_state.h",
+]
+trigger_paths = [
+  "formal/contracts/registry.toml",
+  "formal/contracts/templates/prefix-cache-full-lifecycle.cpp.in",
+  "formal/contracts/mutations/prefix-cache-full-bypass-free-slot.patch",
+  "formal/prefix_cache/full_lifecycle_harness_body.h",
+  "formal/prefix_cache/FULL_LIFECYCLE_PROPERTIES.md",
+  "server/src/server/prefix_cache_state.h",
+  "server/src/server/prefix_cache.h",
+  "server/src/server/prefix_cache.cpp",
+  "server/test/test_full_prefix_cache_state.cpp",
+]
+symbol = "dflash::common::FullPrefixCacheState"
+signature = "class dflash::common::FullPrefixCacheState"
+template = "formal/contracts/templates/prefix-cache-full-lifecycle.cpp.in"
+entry_function = "main"
+include_dirs = ["server/src", "formal"]
+timeout_seconds = 120
+pr_defines = ["LUCEBOX_FORMAL_CAP=2"]
+nightly_defines = ["LUCEBOX_FORMAL_CAP=4"]
+pr_esbmc_args = [
+  "--quiet",
+  "--boolector",
+  "--unwind", "5",
+  "--overflow-check",
+]
+nightly_esbmc_args = [
+  "--quiet",
+  "--boolector",
+  "--unwind", "5",
+  "--overflow-check",
+]
+mutable_paths = ["server/src/server/prefix_cache_state.h"]
+contract_paths = [
+  "formal/contracts/registry.toml",
+  "formal/contracts/templates/prefix-cache-full-lifecycle.cpp.in",
+  "formal/contracts/mutations/prefix-cache-full-bypass-free-slot.patch",
+  "formal/prefix_cache/full_lifecycle_harness_body.h",
+  "formal/prefix_cache/FULL_LIFECYCLE_PROPERTIES.md",
+  "server/test/test_full_prefix_cache_state.cpp",
+]
+native_test = "test_full_prefix_cache_state"
+native_test_source = "server/test/test_full_prefix_cache_state.cpp"
+
+[[targets]]
+id = "spec-commit-exactness"
+policy = "advisory"
+description = "Linear speculative acceptance, bonus availability, budget clipping, and safe token selection"
+source_paths = [
+  "server/src/common/spec_commit.h",
+]
+trigger_paths = [
+  "formal/contracts/registry.toml",
+  "formal/contracts/templates/spec-commit-exactness.cpp.in",
+  "formal/contracts/mutations/spec-commit-invert-prefix-match.patch",
+  "formal/spec_commit/spec_commit_harness_body.h",
+  "formal/spec_commit/PROPERTIES.md",
+  "server/src/common/spec_commit.h",
+  "server/src/common/dflash_spec_decode.cpp",
+  "server/src/qwen35/qwen35_backend.cpp",
+  "server/src/qwen35moe/qwen35moe_backend.cpp",
+  "server/src/laguna/laguna_backend.cpp",
+  "server/src/gemma4/gemma4_backend.cpp",
+  "server/test/test_spec_commit.cpp",
+]
+symbol = "dflash::common::SpecCommitDecision"
+signature = "class dflash::common::SpecCommitDecision"
+template = "formal/contracts/templates/spec-commit-exactness.cpp.in"
+entry_function = "main"
+include_dirs = ["server/src", "formal"]
+timeout_seconds = 120
+pr_defines = ["LUCEBOX_FORMAL_MAX_WIDTH=4"]
+nightly_defines = ["LUCEBOX_FORMAL_MAX_WIDTH=8"]
+pr_esbmc_args = [
+  "--quiet",
+  "--z3",
+  "--unwind", "17",
+  "--memory-leak-check",
+  "--overflow-check",
+]
+nightly_esbmc_args = [
+  "--quiet",
+  "--z3",
+  "--unwind", "17",
+  "--memory-leak-check",
+  "--overflow-check",
+]
+mutable_paths = ["server/src/common/spec_commit.h"]
+contract_paths = [
+  "formal/contracts/registry.toml",
+  "formal/contracts/templates/spec-commit-exactness.cpp.in",
+  "formal/contracts/mutations/spec-commit-invert-prefix-match.patch",
+  "formal/spec_commit/spec_commit_harness_body.h",
+  "formal/spec_commit/PROPERTIES.md",
+  "server/test/test_spec_commit.cpp",
+]
+native_test = "test_spec_commit"
+native_test_source = "server/test/test_spec_commit.cpp"
+
+[[targets]]
+id = "kvflash-residency-map"
+policy = "advisory"
+description = "KVFlash identity map, callback rollback, protected LRU eviction, logical bounds, and slot masks"
+source_paths = [
+  "server/src/common/kvflash_residency_map.h",
+]
+trigger_paths = [
+  "formal/contracts/registry.toml",
+  "formal/contracts/templates/kvflash-residency-map.cpp.in",
+  "formal/contracts/mutations/kvflash-capacity-off-by-one.patch",
+  "formal/kvflash/residency_map_harness_body.h",
+  "formal/kvflash/RESIDENCY_MAP_PROPERTIES.md",
+  "server/src/common/kvflash_residency_map.h",
+  "server/src/common/kvflash_pager.h",
+  "server/test/test_kvflash_residency_map.cpp",
+  "server/test/test_kvflash.cpp",
+]
+symbol = "dflash::common::KvFlashResidencyMap"
+signature = "class dflash::common::KvFlashResidencyMap"
+template = "formal/contracts/templates/kvflash-residency-map.cpp.in"
+entry_function = "main"
+include_dirs = ["server/src", "formal"]
+timeout_seconds = 180
+pr_defines = ["LUCEBOX_FORMAL_BLOCKS=4"]
+nightly_defines = ["LUCEBOX_FORMAL_BLOCKS=6"]
+pr_esbmc_args = [
+  "--quiet",
+  "--boolector",
+  "--unwind", "14",
+  "--overflow-check",
+]
+nightly_esbmc_args = [
+  "--quiet",
+  "--boolector",
+  "--unwind", "14",
+  "--overflow-check",
+]
+mutable_paths = ["server/src/common/kvflash_residency_map.h"]
+contract_paths = [
+  "formal/contracts/registry.toml",
+  "formal/contracts/templates/kvflash-residency-map.cpp.in",
+  "formal/contracts/mutations/kvflash-capacity-off-by-one.patch",
+  "formal/kvflash/residency_map_harness_body.h",
+  "formal/kvflash/RESIDENCY_MAP_PROPERTIES.md",
+  "server/test/test_kvflash_residency_map.cpp",
+]
+native_test = "test_kvflash_residency_map"
+native_test_source = "server/test/test_kvflash_residency_map.cpp"

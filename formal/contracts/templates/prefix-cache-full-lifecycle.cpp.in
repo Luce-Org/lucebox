@@ -1,0 +1,3 @@
+// Generated protected wrapper for {{ID}}: {{SIGNATURE}}
+#define LUCEBOX_FORMAL_CONTRACT_SYMBOL {{SYMBOL}}
+#include "prefix_cache/full_lifecycle_harness_body.h"

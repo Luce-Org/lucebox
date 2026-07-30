@@ -46,6 +46,8 @@
 
 #pragma once
 
+#include "kvflash_residency_map.h"
+
 #include "ggml.h"
 #include "ggml-backend.h"
 
@@ -56,6 +58,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -68,13 +71,6 @@
 #endif
 
 namespace dflash::common {
-
-struct KvFlashConfig {
-    int chunk_tokens       = 64;  // logical tokens per page
-    int pool_tokens        = 0;   // resident pool capacity (multiple of chunk_tokens)
-    int sink_chunks        = 1;   // leading chunks never evicted (attention sinks)
-    int tail_window_chunks = 4;   // trailing chunks never evicted (local window)
-};
 
 struct KvFlashStats {
     int64_t page_outs  = 0;
@@ -93,7 +89,7 @@ public:
     // victim + the partially filled append head) or eviction deadlocks and
     // slot_for() starts failing once the pool fills.
     static int min_pool_tokens(const KvFlashConfig & cfg) {
-        return (cfg.sink_chunks + cfg.tail_window_chunks + 2) * cfg.chunk_tokens;
+        return KvFlashResidencyMap::min_pool_tokens(cfg);
     }
 
     ~KvFlashPager() { cleanup_(); }
@@ -101,26 +97,45 @@ public:
     bool attach(const KvFlashConfig & cfg,
                 const std::vector<ggml_tensor *> & attn_k,
                 const std::vector<ggml_tensor *> & attn_v) {
-        if (cfg.pool_tokens <= 0 || cfg.pool_tokens % cfg.chunk_tokens != 0) return false;
-        if (cfg.pool_tokens < min_pool_tokens(cfg)) {
+        const int minimum = min_pool_tokens(cfg);
+        if (!KvFlashResidencyMap::valid_config(cfg)) {
             std::fprintf(stderr,
-                "kvflash: pool %d < minimum %d (%d sink + %d tail chunks must "
-                "leave an evictable block)\n",
-                cfg.pool_tokens, min_pool_tokens(cfg),
-                cfg.sink_chunks, cfg.tail_window_chunks);
+                "kvflash: invalid config (pool=%d chunk=%d sink=%d tail=%d, "
+                "minimum=%d)\n",
+                cfg.pool_tokens, cfg.chunk_tokens, cfg.sink_chunks,
+                cfg.tail_window_chunks, minimum);
             return false;
         }
         if (attn_k.size() != attn_v.size()) return false;
+
+        if (!attn_k.empty()) {
+            const ggml_tensor * K0 = attn_k[0];
+            const ggml_tensor * V0 = attn_v[0];
+            if (!K0 || !V0 || K0->ne[1] < cfg.pool_tokens ||
+                V0->ne[1] < cfg.pool_tokens || K0->ne[2] <= 0 ||
+                V0->ne[2] != K0->ne[2]) {
+                return false;
+            }
+            for (size_t i = 0; i < attn_k.size(); ++i) {
+                const ggml_tensor * K = attn_k[i];
+                const ggml_tensor * V = attn_v[i];
+                if (!K || !V || K->ne[1] < cfg.pool_tokens ||
+                    V->ne[1] < cfg.pool_tokens || K->ne[2] != K0->ne[2] ||
+                    V->ne[2] != K0->ne[2] || K->nb[1] != K0->nb[1] ||
+                    V->nb[1] != V0->nb[1]) {
+                    return false;
+                }
+            }
+        }
 
         cleanup_();   // release pinned buffers + stream from any prior attach
 
         cfg_ = cfg;
         attn_k_ = attn_k;
         attn_v_ = attn_v;
-        n_blocks_ = cfg.pool_tokens / cfg.chunk_tokens;
+        if (!residency_.configure(cfg)) return false; // validated above
         if (!attn_k.empty()) {
             const ggml_tensor * K0 = attn_k[0];
-            if ((int)K0->ne[1] < cfg.pool_tokens) return false;
             n_head_kv_ = (int)K0->ne[2];
 
             // Per-(tensor, head) contiguous segment of chunk_tokens rows.
@@ -136,11 +151,8 @@ public:
             zero_buf_.clear();
         }
 
-        free_blocks_.clear();
-        for (int b = n_blocks_ - 1; b >= 0; b--) free_blocks_.push_back(b);
-        chunks_.clear();
+        backing_.clear();
         stats_ = {};
-        clock_ = 0;
         has_pending_page_in_ = false;
 
 #ifdef KVFLASH_HAS_ASYNC_DMA
@@ -156,7 +168,9 @@ public:
     // Optional: custom block hand-out order (e.g. shuffled placement in
     // relocation tests). `order[i]` = i-th block to hand out.
     void set_block_order(const std::vector<int> & order) {
-        free_blocks_.assign(order.rbegin(), order.rend());
+        if (!residency_.set_block_order(order)) {
+            std::fprintf(stderr, "[kvflash] invalid block order ignored\n");
+        }
     }
 
     // Drop all mappings and host backing (new request / cache reset).
@@ -166,23 +180,20 @@ public:
         if (page_stream_) {
             cudaStreamSynchronize(page_stream_);
         }
-        for (auto & st : chunks_) {
-            if (st.host_data) {
-                cudaError_t err = cudaFreeHost(st.host_data);
+        for (auto & backing : backing_) {
+            if (backing.host_data) {
+                cudaError_t err = cudaFreeHost(backing.host_data);
                 if (err != cudaSuccess) {
                     std::fprintf(stderr, "[kvflash] cudaFreeHost failed: %s\n",
                                  cudaGetErrorString(err));
                 }
-                st.host_data = nullptr;
+                backing.host_data = nullptr;
             }
         }
 #endif
-        chunks_.clear();
-        free_blocks_.clear();
-        for (int b = n_blocks_ - 1; b >= 0; b--) free_blocks_.push_back(b);
+        backing_.clear();
+        residency_.reset();
         stats_.host_bytes = 0;
-        cur_chunk_ = 0;
-        epoch_++;
         has_pending_page_in_ = false;
     }
 
@@ -192,7 +203,7 @@ public:
     // need stale rows to dequantise to ~zero contribution. Masked consumers
     // don't need this but it is cheap (pool-sized memset, sub-ms).
     void zero_free_blocks() {
-        for (int b : free_blocks_) zero_block(b);
+        for (int b : residency_.free_blocks()) zero_block(b);
 #ifdef KVFLASH_HAS_ASYNC_DMA
         if (page_stream_) {
             cudaStreamSynchronize(page_stream_);
@@ -200,9 +211,9 @@ public:
 #endif
     }
 
-    bool attached() const { return n_blocks_ > 0; }
-    int pool_tokens() const { return cfg_.pool_tokens; }
-    int chunk_tokens() const { return cfg_.chunk_tokens; }
+    bool attached() const { return residency_.attached(); }
+    int pool_tokens() const { return residency_.pool_tokens(); }
+    int chunk_tokens() const { return residency_.chunk_tokens(); }
 
     // Optional external relevance score; higher = keep. Falls back to LRU.
     std::function<float(int /*chunk*/)> score_hook;
@@ -216,11 +227,19 @@ public:
     // issued, page_stream_ is synchronised here so that recalled KV data is
     // resident before the next attention forward.
     bool alloc_span(int kv_start, int n_tok) {
+        if (kv_start < 0 || n_tok < 0 ||
+            (int64_t)kv_start + n_tok > std::numeric_limits<int>::max()) {
+            std::fprintf(stderr,
+                "[kvflash] invalid allocation span start=%d count=%d\n",
+                kv_start, n_tok);
+            return false;
+        }
         for (int i = 0; i < n_tok; ++i) {
-            if (slot_for(kv_start + i) < 0) {
+            const int64_t pos = (int64_t)kv_start + i;
+            if (slot_for(pos) < 0) {
                 std::fprintf(stderr, "[kvflash] no pool slot at pos %d "
                                      "(pool %d exhausted)\n",
-                             kv_start + i, cfg_.pool_tokens);
+                             (int)pos, cfg_.pool_tokens);
                 return false;
             }
         }
@@ -232,68 +251,37 @@ public:
     // the pool is full, evicts) at chunk granularity. Call once per
     // appended token, in logical order.
     int slot_for(int64_t pos) {
-        const int c = (int)(pos / cfg_.chunk_tokens);
-        // cur_chunk_ tracks the append head only; a page_in of an older
-        // chunk must not shrink the protected tail window. It must advance
-        // BEFORE eviction (so the victim search protects the new tail), but
-        // a failed allocation must roll it back or the next eviction's tail
-        // window is computed from a chunk that never materialized.
-        const int prev_cur_chunk = cur_chunk_;
-        if (c > cur_chunk_) cur_chunk_ = c;
-        if ((int)chunks_.size() <= c) chunks_.resize(c + 1);
-        ChunkState & st = chunks_[c];
-        if (st.block < 0) {
-            if (!ensure_free_block()) {
-                cur_chunk_ = prev_cur_chunk;
-                return -1;
-            }
-            st.block = free_blocks_.back();
-            free_blocks_.pop_back();
-            epoch_++;
-            if (st.on_host) {              // recall: restore paged-out bytes
-                copy_chunk(c, st.block, /*to_host=*/false);
-                stats_.page_ins++;
-                stats_.moved_bytes += chunk_bytes_;
+        const KvFlashResidencyMap::Score score = score_hook
+            ? KvFlashResidencyMap::Score{&score_hook, &evaluate_score_}
+            : KvFlashResidencyMap::Score{};
+        const KvFlashResidencyMap::PreparePageOut page_out{
+            this, &prepare_page_out_thunk_};
+        const KvFlashResidencyMap::AcquireResult acquired =
+            residency_.acquire(pos, score, page_out);
+        if (!acquired) return -1;
+        if (acquired.recalled) {
+            copy_chunk(acquired.chunk, acquired.block, /*to_host=*/false);
+            stats_.page_ins++;
+            stats_.moved_bytes += chunk_bytes_;
 #ifdef KVFLASH_HAS_ASYNC_DMA
-                has_pending_page_in_ = true;
+            has_pending_page_in_ = true;
 #endif
-            }
         }
-        st.last_use = ++clock_;
-        return st.block * cfg_.chunk_tokens + (int)(pos % cfg_.chunk_tokens);
+        return acquired.slot;
     }
 
     // Force a chunk out of the pool (host backing + zeroed slots).
     bool page_out(int c) {
-        if (c >= (int)chunks_.size() || chunks_[c].block < 0) return false;
-        ChunkState & st = chunks_[c];
-        if (has_tensor_storage() && !st.on_host) {
-#ifdef KVFLASH_HAS_ASYNC_DMA
-            cudaError_t err = cudaMallocHost(&st.host_data, chunk_bytes_);
-            if (err != cudaSuccess) {
-                std::fprintf(stderr, "[kvflash] cudaMallocHost failed: %s\n",
-                             cudaGetErrorString(err));
-                return false;
-            }
-#else
-            st.host_data.resize(chunk_bytes_);
-#endif
-            stats_.host_bytes += (int64_t)chunk_bytes_;
-        }
-        copy_chunk(c, st.block, /*to_host=*/true);
-        zero_block(st.block);
-        st.on_host = true;
-        free_blocks_.push_back(st.block);
-        st.block = -1;
-        epoch_++;
-        stats_.page_outs++;
-        stats_.moved_bytes += chunk_bytes_;
-        return true;
+        const KvFlashResidencyMap::PreparePageOut page_out{
+            this, &prepare_page_out_thunk_};
+        return residency_.page_out(c, page_out);
     }
 
     // Recall a chunk into the pool (used by reselect / tests).
     bool page_in(int c) {
-        if (c >= (int)chunks_.size() || !chunks_[c].on_host || chunks_[c].block >= 0) return false;
+        if (c < 0 || !residency_.is_host_backed(c) || residency_.is_resident(c)) {
+            return false;
+        }
         return slot_for((int64_t)c * cfg_.chunk_tokens) >= 0;
     }
 
@@ -309,7 +297,7 @@ public:
     }
 
     bool is_resident(int c) const {
-        return c < (int)chunks_.size() && chunks_[c].block >= 0;
+        return residency_.is_resident(c);
     }
 
     // True while every materialized chunk still sits in its identity block
@@ -317,11 +305,7 @@ public:
     // identity-copy snapshots rely on; it holds from reset() until the
     // first eviction of the CURRENT request (cumulative stats do not).
     bool is_identity() const {
-        for (int c = 0; c < (int)chunks_.size(); c++) {
-            if (chunks_[c].block >= 0 && chunks_[c].block != c) return false;
-            if (chunks_[c].block < 0 && chunks_[c].on_host) return false;
-        }
-        return true;
+        return residency_.is_identity();
     }
 
     // True iff every chunk intersecting [0, n_tok) is resident in its identity
@@ -330,24 +314,17 @@ public:
     // the non-paged tree-verify graph relies on. Stronger than is_identity(),
     // which is also true for an empty / not-yet-materialized pager.
     bool identity_prefix_covers(int n_tok) const {
-        if (n_tok <= 0) return true;
-        const int nc = (n_tok + cfg_.chunk_tokens - 1) / cfg_.chunk_tokens;
-        if (nc > (int)chunks_.size()) return false;
-        for (int c = 0; c < nc; c++)
-            if (chunks_[c].block != c) return false;
-        return true;
+        return residency_.identity_prefix_covers(n_tok);
     }
     int block_of(int c) const {
-        return c < (int)chunks_.size() ? chunks_[c].block : -1;
+        return residency_.block_of(c);
     }
 
     // Const lookup (no alloc / LRU touch): physical slot currently holding
     // logical `pos`, or -1 if its chunk is not resident. Callers that may
     // need an allocation must use slot_for() beforehand.
     int slot_of(int64_t pos) const {
-        const int c = (int)(pos / cfg_.chunk_tokens);
-        if (c >= (int)chunks_.size() || chunks_[c].block < 0) return -1;
-        return chunks_[c].block * cfg_.chunk_tokens + (int)(pos % cfg_.chunk_tokens);
+        return residency_.slot_of(pos);
     }
 
     // Logical position held by each pool slot, -1 for free blocks. `dst`
@@ -355,34 +332,22 @@ public:
     // POSITION semantics in slot space (causal / sliding-window): the
     // mask condition is evaluated on dst[slot] instead of the column index.
     void fill_slot_pos(int32_t * dst) const {
-        for (int i = 0; i < cfg_.pool_tokens; i++) dst[i] = -1;
-        for (int c = 0; c < (int)chunks_.size(); c++) {
-            if (chunks_[c].block < 0) continue;
-            int32_t * p = dst + (size_t)chunks_[c].block * cfg_.chunk_tokens;
-            for (int i = 0; i < cfg_.chunk_tokens; i++)
-                p[i] = (int32_t)c * cfg_.chunk_tokens + i;
-        }
+        residency_.fill_slot_pos(dst);
     }
     const KvFlashStats & stats() const { return stats_; }
-    int resident_blocks() const { return n_blocks_ - (int)free_blocks_.size(); }
-    int n_chunks() const { return (int)chunks_.size(); }
+    int resident_blocks() const { return residency_.resident_blocks(); }
+    int n_chunks() const { return residency_.n_chunks(); }
 
     // Bumped on every residency change (alloc / page_out / page_in).
     // Callers cache the slot mask and refill only when the epoch moves.
-    uint64_t epoch() const { return epoch_; }
+    uint64_t epoch() const { return residency_.epoch(); }
 
     // F16 slot-validity mask for one query row: 0 for slots belonging to a
     // resident chunk, -inf for free / paged-out blocks. `dst` must hold
     // pool_tokens entries. Used as the FA mask so non-resident slots are
     // excluded exactly instead of via the zero-row ~exp(-max) approximation.
     void fill_slot_mask(uint16_t * dst) const {
-        constexpr uint16_t F16_ZERO = 0x0000, F16_NEG_INF = 0xFC00;
-        for (int i = 0; i < cfg_.pool_tokens; i++) dst[i] = F16_NEG_INF;
-        for (int c = 0; c < (int)chunks_.size(); c++) {
-            if (chunks_[c].block < 0) continue;
-            uint16_t * p = dst + (size_t)chunks_[c].block * cfg_.chunk_tokens;
-            for (int i = 0; i < cfg_.chunk_tokens; i++) p[i] = F16_ZERO;
-        }
+        residency_.fill_slot_mask(dst);
     }
 
     // Lookahead reselect (FlashMemory τ-step): rebuild the resident set as
@@ -391,26 +356,19 @@ public:
     // the number of page events. Call between decode steps.
     int reselect() {
         if (!score_hook) return 0;
-        struct Cand { int c; float s; };
-        std::vector<Cand> cands;
-        for (int c = 0; c < (int)chunks_.size(); c++) {
-            const ChunkState & st = chunks_[c];
-            if (st.block < 0 && !st.on_host) continue;     // never materialized
-            const bool prot = c < cfg_.sink_chunks ||
-                              c > cur_chunk_ - 1 - cfg_.tail_window_chunks;
-            cands.push_back({c, prot ? 3.4e38f : score_hook(c)});
-        }
-        std::sort(cands.begin(), cands.end(),
-                  [](const Cand & a, const Cand & b) { return a.s > b.s; });
-        std::vector<uint8_t> want(chunks_.size(), 0);
-        for (int i = 0; i < (int)cands.size() && i < n_blocks_; i++) want[cands[i].c] = 1;
+        const KvFlashResidencyMap::Score score{&score_hook, &evaluate_score_};
+        const std::vector<uint8_t> want =
+            residency_.desired_residency(score);
 
         int events = 0;
-        for (int c = 0; c < (int)chunks_.size(); c++) {       // out first: frees blocks
-            if (!want[c] && chunks_[c].block >= 0) { page_out(c); events++; }
+        for (int c = 0; c < residency_.n_chunks(); c++) { // out first: frees blocks
+            if (!want[(size_t)c] && residency_.is_resident(c) && page_out(c)) {
+                events++;
+            }
         }
-        for (int c = 0; c < (int)chunks_.size(); c++) {
-            if (want[c] && chunks_[c].block < 0 && chunks_[c].on_host) {
+        for (int c = 0; c < residency_.n_chunks(); c++) {
+            if (want[(size_t)c] && !residency_.is_resident(c) &&
+                residency_.is_host_backed(c)) {
                 if (page_in(c)) events++;
             }
         }
@@ -419,10 +377,7 @@ public:
     }
 
 private:
-    struct ChunkState {
-        int      block    = -1;       // pool block index, -1 = not resident
-        bool     on_host  = false;    // backing store holds valid bytes
-        uint64_t last_use = 0;
+    struct ChunkBacking {
 #ifdef KVFLASH_HAS_ASYNC_DMA
         void *   host_data = nullptr; // cudaMallocHost-pinned; allocated on first page_out
 #else
@@ -430,25 +385,50 @@ private:
 #endif
     };
 
-    bool ensure_free_block() {
-        if (!free_blocks_.empty()) return true;
-        // Victim: unprotected resident chunk with the lowest score
-        // (score_hook) or the oldest use (LRU fallback).
-        int victim = -1;
-        float v_score = 0.f;
-        uint64_t v_use = 0;
-        for (int c = 0; c < (int)chunks_.size(); c++) {
-            if (chunks_[c].block < 0) continue;
-            if (c < cfg_.sink_chunks) continue;
-            if (c > cur_chunk_ - 1 - cfg_.tail_window_chunks) continue;
-            if (score_hook) {
-                const float s = score_hook(c);
-                if (victim < 0 || s < v_score) { victim = c; v_score = s; }
-            } else {
-                if (victim < 0 || chunks_[c].last_use < v_use) { victim = c; v_use = chunks_[c].last_use; }
+    static float evaluate_score_(const void * context, int chunk) {
+        const auto * score =
+            static_cast<const std::function<float(int)> *>(context);
+        return (*score)(chunk);
+    }
+
+    static bool prepare_page_out_thunk_(
+            void * context, int chunk, int block) {
+        return static_cast<KvFlashPager *>(context)
+            ->prepare_page_out_(chunk, block);
+    }
+
+    bool prepare_page_out_(int chunk, int block) {
+        if (chunk < 0 || block < 0) return false;
+        if ((size_t)chunk >= backing_.size()) {
+            try {
+                backing_.resize((size_t)chunk + 1);
+            } catch (...) {
+                return false;
             }
         }
-        return victim >= 0 && page_out(victim);
+        ChunkBacking & backing = backing_[(size_t)chunk];
+        if (has_tensor_storage() && !residency_.is_host_backed(chunk)) {
+#ifdef KVFLASH_HAS_ASYNC_DMA
+            cudaError_t err = cudaMallocHost(&backing.host_data, chunk_bytes_);
+            if (err != cudaSuccess) {
+                std::fprintf(stderr, "[kvflash] cudaMallocHost failed: %s\n",
+                             cudaGetErrorString(err));
+                return false;
+            }
+#else
+            try {
+                backing.host_data.resize(chunk_bytes_);
+            } catch (...) {
+                return false;
+            }
+#endif
+            stats_.host_bytes += (int64_t)chunk_bytes_;
+        }
+        copy_chunk(chunk, block, /*to_host=*/true);
+        zero_block(block);
+        stats_.page_outs++;
+        stats_.moved_bytes += chunk_bytes_;
+        return true;
     }
 
     // Move one chunk between pool slots and host backing.
@@ -459,7 +439,7 @@ private:
     // alloc_span(), so host_data is coherent before any H2D read starts.
     void copy_chunk(int c, int block, bool to_host) {
         if (!has_tensor_storage()) return;
-        ChunkState & st = chunks_[c];
+        ChunkBacking & backing = backing_[(size_t)c];
 #ifdef KVFLASH_HAS_ASYNC_DMA
         size_t host_off = 0;
         for (size_t l = 0; l < attn_k_.size(); l++) {
@@ -470,7 +450,7 @@ private:
                     const size_t dev_off =
                         (size_t)block * cfg_.chunk_tokens * t->nb[1] +
                         (size_t)h * t->nb[2];
-                    void * host_ptr = (uint8_t *)st.host_data + host_off;
+                    void * host_ptr = (uint8_t *)backing.host_data + host_off;
                     void * dev_ptr  = (uint8_t *)t->data + dev_off;
                     cudaError_t err;
                     if (to_host)
@@ -488,7 +468,7 @@ private:
             }
         }
 #else
-        uint8_t * p = (uint8_t *)st.host_data.data();
+        uint8_t * p = (uint8_t *)backing.host_data.data();
         for (size_t l = 0; l < attn_k_.size(); l++) {
             for (int kv = 0; kv < 2; kv++) {
                 ggml_tensor * t = kv == 0 ? attn_k_[l] : attn_v_[l];
@@ -532,8 +512,7 @@ private:
 
     // Release page_stream_ and all pinned host_data buffers.
     // Safe to call on a never-attached or already-cleaned-up instance.
-    // Does NOT touch pool state (chunks_, free_blocks_) — that is the
-    // caller's responsibility (reset() or destructor via caller).
+    // Does NOT touch residency state; reset()/attach() own that transition.
     void cleanup_() {
 #ifdef KVFLASH_HAS_ASYNC_DMA
         cudaStreamSynchronize(page_stream_);  // real stream, or default stream if create failed
@@ -543,17 +522,18 @@ private:
         }
         // Free pinned host buffers unconditionally: page_out() may have
         // allocated them even when stream creation failed (default-stream path).
-        for (auto & st : chunks_) {
-            if (st.host_data) {
-                cudaError_t err = cudaFreeHost(st.host_data);
+        for (auto & backing : backing_) {
+            if (backing.host_data) {
+                cudaError_t err = cudaFreeHost(backing.host_data);
                 if (err != cudaSuccess) {
                     std::fprintf(stderr, "[kvflash] cudaFreeHost failed: %s\n",
                                  cudaGetErrorString(err));
                 }
-                st.host_data = nullptr;
+                backing.host_data = nullptr;
             }
         }
 #endif
+        backing_.clear();
         has_pending_page_in_ = false;
     }
 
@@ -562,15 +542,13 @@ private:
     }
 
     KvFlashConfig cfg_;
+    KvFlashResidencyMap residency_;
     std::vector<ggml_tensor *> attn_k_, attn_v_;
-    std::vector<ChunkState> chunks_;
-    std::vector<int> free_blocks_;
+    std::vector<ChunkBacking> backing_;
     std::vector<uint8_t> zero_buf_;   // used by zero_block() in non-CUDA builds
     KvFlashStats stats_;
     size_t k_seg_bytes_ = 0, v_seg_bytes_ = 0, chunk_bytes_ = 0;
-    int n_blocks_ = 0, n_head_kv_ = 0, cur_chunk_ = 0;
-    uint64_t clock_ = 0;
-    uint64_t epoch_ = 0;
+    int n_head_kv_ = 0;
 
 #ifdef KVFLASH_HAS_ASYNC_DMA
     cudaStream_t page_stream_ = nullptr;

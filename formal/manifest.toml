@@ -76,8 +76,133 @@ mutable_paths = [
 contract_paths = [
   "formal/manifest.toml",
   "formal/prefix_cache/abort_hole_harness.cpp",
+  "formal/contracts/mutations/prefix-cache-bypass-selector.patch",
   "formal/prefix_cache/ABORT_HOLE_PROPERTIES.md",
   "server/test/test_prefix_cache_state.cpp",
 ]
 native_test = "test_prefix_cache_state"
 native_test_source = "server/test/test_prefix_cache_state.cpp"
+
+[[capsules]]
+id = "prefix-cache-full-lifecycle"
+description = "Full prefix-cache fresh boundary/confirm proof with exact-head lifecycle regression"
+harness = "formal/prefix_cache/full_lifecycle_harness.cpp"
+entry_function = "main"
+include_dirs = ["server/src", "formal"]
+timeout_seconds = 120
+defines = [
+  "LUCEBOX_FORMAL_CAP=2",
+]
+nightly_defines = [
+  "LUCEBOX_FORMAL_CAP=4",
+]
+esbmc_args = [
+  "--quiet",
+  "--boolector",
+  "--unwind", "5",
+  "--overflow-check",
+]
+trigger_paths = [
+  "formal/**",
+  "server/src/server/prefix_cache_state.h",
+  "server/src/server/prefix_cache.h",
+  "server/src/server/prefix_cache.cpp",
+  "server/test/test_full_prefix_cache_state.cpp",
+]
+mutable_paths = [
+  "server/src/server/prefix_cache_state.h",
+]
+contract_paths = [
+  "formal/manifest.toml",
+  "formal/prefix_cache/full_lifecycle_harness.cpp",
+  "formal/prefix_cache/full_lifecycle_harness_body.h",
+  "formal/contracts/mutations/prefix-cache-full-bypass-free-slot.patch",
+  "formal/prefix_cache/FULL_LIFECYCLE_PROPERTIES.md",
+  "server/test/test_full_prefix_cache_state.cpp",
+]
+native_test = "test_full_prefix_cache_state"
+native_test_source = "server/test/test_full_prefix_cache_state.cpp"
+
+[[capsules]]
+id = "spec-commit-exactness"
+description = "Linear speculative acceptance, bonus availability, budget clipping, and safe token selection"
+harness = "formal/spec_commit/spec_commit_harness.cpp"
+entry_function = "main"
+include_dirs = ["server/src", "formal"]
+timeout_seconds = 120
+defines = [
+  "LUCEBOX_FORMAL_MAX_WIDTH=4",
+]
+nightly_defines = [
+  "LUCEBOX_FORMAL_MAX_WIDTH=8",
+]
+esbmc_args = [
+  "--quiet",
+  "--z3",
+  "--unwind", "17",
+  "--memory-leak-check",
+  "--overflow-check",
+]
+trigger_paths = [
+  "formal/**",
+  "server/src/common/spec_commit.h",
+  "server/src/common/dflash_spec_decode.cpp",
+  "server/src/qwen35/qwen35_backend.cpp",
+  "server/src/qwen35moe/qwen35moe_backend.cpp",
+  "server/src/laguna/laguna_backend.cpp",
+  "server/src/gemma4/gemma4_backend.cpp",
+  "server/test/test_spec_commit.cpp",
+]
+mutable_paths = [
+  "server/src/common/spec_commit.h",
+]
+contract_paths = [
+  "formal/manifest.toml",
+  "formal/spec_commit/spec_commit_harness.cpp",
+  "formal/spec_commit/spec_commit_harness_body.h",
+  "formal/contracts/mutations/spec-commit-invert-prefix-match.patch",
+  "formal/spec_commit/PROPERTIES.md",
+  "server/test/test_spec_commit.cpp",
+]
+native_test = "test_spec_commit"
+native_test_source = "server/test/test_spec_commit.cpp"
+
+[[capsules]]
+id = "kvflash-residency-map"
+description = "KVFlash identity map, callback rollback, protected LRU eviction, logical bounds, and slot masks"
+harness = "formal/kvflash/residency_map_harness.cpp"
+entry_function = "main"
+include_dirs = ["server/src", "formal"]
+timeout_seconds = 180
+defines = [
+  "LUCEBOX_FORMAL_BLOCKS=4",
+]
+nightly_defines = [
+  "LUCEBOX_FORMAL_BLOCKS=6",
+]
+esbmc_args = [
+  "--quiet",
+  "--boolector",
+  "--unwind", "14",
+  "--overflow-check",
+]
+trigger_paths = [
+  "formal/**",
+  "server/src/common/kvflash_residency_map.h",
+  "server/src/common/kvflash_pager.h",
+  "server/test/test_kvflash_residency_map.cpp",
+  "server/test/test_kvflash.cpp",
+]
+mutable_paths = [
+  "server/src/common/kvflash_residency_map.h",
+]
+contract_paths = [
+  "formal/manifest.toml",
+  "formal/kvflash/residency_map_harness.cpp",
+  "formal/kvflash/residency_map_harness_body.h",
+  "formal/contracts/mutations/kvflash-capacity-off-by-one.patch",
+  "formal/kvflash/RESIDENCY_MAP_PROPERTIES.md",
+  "server/test/test_kvflash_residency_map.cpp",
+]
+native_test = "test_kvflash_residency_map"
+native_test_source = "server/test/test_kvflash_residency_map.cpp"

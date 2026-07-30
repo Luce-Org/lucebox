@@ -1,5 +1,6 @@
 #include "qwen35_backend.h"
 #include "common/chain_rollback_policy.h"
+#include "common/spec_commit.h"
 #include "placement/skip_park_guard.h"
 #include "qwen35_dflash_target.h"
 #include "graph_builders.h"
@@ -2410,6 +2411,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         // token (it is already a valid target sample at that position).
         int accept_n = 1;
         int bonus_tok = -1;
+        dflash::common::SpecCommitDecision commit_decision;
         if (sampled_verify) {
             if (!target->read_verify_logits(q_len, verify_logits)) {
                 std::fprintf(stderr, "spec-decode: verify logits read failed\n");
@@ -2471,23 +2473,27 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 }
             }
             (void)mismatched;
+            commit_decision = dflash::common::SpecCommitDecision::precomputed(
+                accept_n, q_len, bonus_tok >= 0, bonus_tok, need_commit_budget);
         } else {
-            for (int i = 0; i < q_len - 1; i++) {
-                if (draft_tok[i + 1] == target_tok[i]) accept_n++;
-                else break;
-            }
-            bonus_tok = (accept_n < q_len) ? target_tok[accept_n - 1] : -1;
+            commit_decision = dflash::common::SpecCommitDecision::greedy(
+                draft_tok, target_tok, q_len, need_commit_budget);
         }
+        if (!commit_decision.valid()) {
+            std::fprintf(stderr, "spec-decode: invalid commit decision\n");
+            target->restore_kv();
+            step_graph_destroy(draft_sg);
+            return false;
+        }
+        accept_n = commit_decision.accepted_count();
+        bonus_tok = commit_decision.commits_bonus()
+            ? commit_decision.bonus_token() : -1;
         // Track hint acceptance telemetry.
         if (hint_fill > 0) {
             n_hint_proposed += hint_fill;
             n_hint_accepted += std::min(hint_fill, accept_n - 1);
         }
-        int commit_n  = accept_n + (bonus_tok >= 0 ? 1 : 0);
-        if (commit_n > need_commit_budget) {
-            commit_n = need_commit_budget;
-            if (commit_n <= accept_n) bonus_tok = -1;
-        }
+        int commit_n = commit_decision.commit_count();
 
         // 6. Fix state: adaptive fast-rollback vs legacy replay.
         //    Fast-rollback (implicit bonus, skip replay) is profitable when
@@ -2532,10 +2538,13 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 step_graph_destroy(draft_sg);
                 return false;
             }
-            std::vector<int32_t> replay_batch((size_t)commit_n);
-            for (int i = 0; i < commit_n; i++) {
-                replay_batch[i] = (i < accept_n) ? draft_tok[i] : bonus_tok;
+            std::vector<int32_t> replay_batch;
+            if (!commit_decision.materialize(draft_tok, replay_batch)) {
+                std::fprintf(stderr, "spec-decode: commit materialization failed\n");
+                step_graph_destroy(draft_sg);
+                return false;
             }
+            replay_batch.resize((size_t)commit_n);
             if (!target->verify_batch(replay_batch, committed, replay_last_tok, nullptr)) {
                 std::fprintf(stderr, "spec-decode: replay failed\n");
                 step_graph_destroy(draft_sg);
@@ -2545,10 +2554,13 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         }
 
         // Build replay_tok for emitting committed tokens.
-        std::vector<int32_t> replay_tok((size_t)commit_n);
-        for (int i = 0; i < commit_n; i++) {
-            replay_tok[i] = (i < accept_n) ? draft_tok[i] : bonus_tok;
+        std::vector<int32_t> replay_tok;
+        if (!commit_decision.materialize(draft_tok, replay_tok)) {
+            std::fprintf(stderr, "spec-decode: commit materialization failed\n");
+            step_graph_destroy(draft_sg);
+            return false;
         }
+        replay_tok.resize((size_t)commit_n);
 
         // 7. Sync features for replayed range to mirror (needed for next draft step)
         if (use_remote_draft && cache_.target_feat) {

@@ -7,6 +7,7 @@
 // snapshots, and pflash compress lifecycle.
 
 #include "laguna_backend.h"
+#include "common/spec_commit.h"
 #include "laguna_internal.h"
 #include "qwen3/qwen3_kvflash_scorer.h"
 #include "dflash27b.h"
@@ -1106,6 +1107,7 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
         int accept_n = 1;
         int bonus_tok = -1;
         int verify_vocab = 0;
+        dflash::common::SpecCommitDecision commit_decision;
         if (sampled_verify) {
             if (!target->read_verify_logits(q_len, verify_logits)) {
                 std::fprintf(stderr, "[laguna-spec] verify logits read failed\n");
@@ -1127,22 +1129,29 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
                     break;
                 }
             }
+            commit_decision = dflash::common::SpecCommitDecision::precomputed(
+                accept_n, q_len, bonus_tok >= 0, bonus_tok, need_commit_budget);
         } else {
-            for (int i = 0; i < q_len - 1; i++) {
-                if (draft_tok[(size_t)i + 1] == target_tok[(size_t)i]) accept_n++;
-                else break;
-            }
-            bonus_tok = (accept_n < q_len) ? target_tok[(size_t)accept_n - 1] : -1;
+            commit_decision = dflash::common::SpecCommitDecision::greedy(
+                draft_tok, target_tok, q_len, need_commit_budget);
         }
-        int commit_n = accept_n + (bonus_tok >= 0 ? 1 : 0);
-        if (commit_n > need_commit_budget) {
-            commit_n = need_commit_budget;
-            if (commit_n <= accept_n) bonus_tok = -1;
+        if (!commit_decision.valid()) {
+            std::fprintf(stderr, "[laguna-spec] invalid commit decision\n");
+            cache_.cur_pos = committed;
+            step_graph_destroy(draft_sg);
+            return false;
         }
+        accept_n = commit_decision.accepted_count();
+        bonus_tok = commit_decision.commits_bonus()
+            ? commit_decision.bonus_token() : -1;
+        int commit_n = commit_decision.commit_count();
 
-        std::vector<int32_t> replay_tok((size_t)commit_n);
-        for (int i = 0; i < commit_n; ++i) {
-            replay_tok[(size_t)i] = (i < accept_n) ? draft_tok[(size_t)i] : bonus_tok;
+        std::vector<int32_t> replay_tok;
+        if (!commit_decision.materialize(draft_tok, replay_tok)) {
+            std::fprintf(stderr, "[laguna-spec] commit materialization failed\n");
+            cache_.cur_pos = committed;
+            step_graph_destroy(draft_sg);
+            return false;
         }
         std::vector<int32_t> history_after_commit = sample_history;
         for (int32_t tok : replay_tok) {

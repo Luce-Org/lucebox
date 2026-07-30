@@ -21,12 +21,27 @@ the PR itself changed.  A contract-change PR therefore runs the old approved
 contract as the gate and reports its proposed new contract separately until
 formal CODEOWNERS approve promotion.
 
-The current entries cover two complementary prefix-cache capsules:
+The promoted entries cover two complementary inline prefix-cache capsules:
 
 - `prefix-cache-inline` maps to the existing prepare/confirm/lookup harness.
 - `prefix-cache-abort-hole` exhaustively checks the bounded scalar free-slot
   selector, then runs the immutable base regression against the exact head to
   guard the real `prepare`/`abort`/`prepare` integration point.
+
+Three first-wave entries are registered as advisory while proof latency and
+mutation sensitivity are established:
+
+- `prefix-cache-full-lifecycle`
+- `spec-commit-exactness`
+- `kvflash-residency-map`
+
+Their generated wrappers may include shared harness bodies. Every such body is
+declared in `contract_paths`. The accepted companion image must materialize
+those authenticated base-revision blobs into an isolated include tree before
+the PR/head production include paths. A PR then cannot weaken a transitive
+harness include while retaining a green result. The source implementation of
+this rule is pending publication and acceptance as a new immutable companion
+image before these targets can be promoted.
 
 The templates intentionally call production code; they are not duplicate
 implementations.  The legacy harness runs the same transition during the

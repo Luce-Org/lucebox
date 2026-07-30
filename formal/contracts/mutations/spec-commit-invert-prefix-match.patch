@@ -1,0 +1,10 @@
+diff --git a/server/src/common/spec_commit.h b/server/src/common/spec_commit.h
+--- a/server/src/common/spec_commit.h
++++ b/server/src/common/spec_commit.h
+@@ -34,5 +34,5 @@ public:
+         int accepted = 1; // seed
+         while (accepted < verify_count &&
+-               draft_tokens[accepted] == target_tokens[accepted - 1]) {
++               draft_tokens[accepted] != target_tokens[accepted - 1]) {
+             ++accepted;
+         }

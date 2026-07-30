@@ -1160,6 +1160,37 @@ if(DFLASH27B_TESTS)
         add_test(NAME prefix_cache_state COMMAND test_prefix_cache_state)
     endif()
 
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_full_prefix_cache_state.cpp")
+        add_executable(
+            test_full_prefix_cache_state
+            test/test_full_prefix_cache_state.cpp)
+        target_include_directories(test_full_prefix_cache_state PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        add_test(
+            NAME full_prefix_cache_state
+            COMMAND test_full_prefix_cache_state)
+    endif()
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_spec_commit.cpp")
+        add_executable(
+            test_spec_commit
+            test/test_spec_commit.cpp)
+        target_include_directories(test_spec_commit PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        add_test(NAME spec_commit COMMAND test_spec_commit)
+    endif()
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_kvflash_residency_map.cpp")
+        add_executable(
+            test_kvflash_residency_map
+            test/test_kvflash_residency_map.cpp)
+        target_include_directories(test_kvflash_residency_map PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        add_test(
+            NAME kvflash_residency_map
+            COMMAND test_kvflash_residency_map)
+    endif()
+
     # Feature/architecture gate tests. check_feature_compatibility(),
     # collect_feature_warnings() and the capability table are pure functions,
     # so this target deliberately compiles only feature_gate.cpp and
@@ -1235,6 +1266,15 @@ if(DFLASH27B_TESTS)
     endif()
     if(TARGET test_prefix_cache_state)
         list(APPEND _check_deps test_prefix_cache_state)
+    endif()
+    if(TARGET test_full_prefix_cache_state)
+        list(APPEND _check_deps test_full_prefix_cache_state)
+    endif()
+    if(TARGET test_spec_commit)
+        list(APPEND _check_deps test_spec_commit)
+    endif()
+    if(TARGET test_kvflash_residency_map)
+        list(APPEND _check_deps test_kvflash_residency_map)
     endif()
     if(_check_deps)
         add_custom_target(check
