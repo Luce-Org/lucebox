@@ -2,6 +2,7 @@
 #include "common/moe_hybrid_stream.h"
 
 #include "ggml-cuda.h"
+#include "ggml-quants.h"
 
 #include <algorithm>
 #include <cmath>
@@ -27,9 +28,12 @@ namespace {
 struct MoeStreamComputeFixture {};
 
 constexpr int kExperts = 3;
-constexpr int kInput = 16;
-constexpr int kFf = 24;
-constexpr int kOutput = 12;
+// 256 deliberately does not satisfy CUDA/HIP's 512-element quantized matrix
+// row padding. The MXFP4 case below therefore exercises the padded GPU-slot
+// path that real Kimi-K3 exposed.
+constexpr int kInput = 256;
+constexpr int kFf = 64;
+constexpr int kOutput = 128;
 constexpr int kTokens = 2;
 constexpr int kTopK = 2;
 
@@ -162,6 +166,73 @@ ModelBytes make_model_bytes(bool expert_major,
     return model;
 }
 
+std::vector<uint8_t> quantize_mxfp4(const std::vector<float> & values,
+                                    int columns, int rows) {
+    const size_t bytes = ggml_row_size(GGML_TYPE_MXFP4, columns) *
+                         static_cast<size_t>(rows);
+    std::vector<uint8_t> quantized(bytes);
+    const size_t written = ggml_quantize_chunk(
+        GGML_TYPE_MXFP4, values.data(), quantized.data(), 0,
+        rows, columns, nullptr);
+    STREAM_REQUIRE(written == bytes);
+    return quantized;
+}
+
+std::vector<float> dequantize_mxfp4(const std::vector<uint8_t> & values,
+                                    int columns, int rows) {
+    const size_t row_bytes = ggml_row_size(GGML_TYPE_MXFP4, columns);
+    STREAM_REQUIRE(values.size() == row_bytes * static_cast<size_t>(rows));
+    std::vector<float> dequantized(
+        static_cast<size_t>(columns) * static_cast<size_t>(rows));
+    for (int row = 0; row < rows; ++row) {
+        dequantize_row_mxfp4(
+            reinterpret_cast<const block_mxfp4 *>(
+                values.data() + static_cast<size_t>(row) * row_bytes),
+            dequantized.data() + static_cast<size_t>(row) * columns,
+            columns);
+    }
+    return dequantized;
+}
+
+ModelBytes make_mxfp4_model_bytes(const std::vector<float> & gate,
+                                  const std::vector<float> & up,
+                                  const std::vector<float> & down,
+                                  std::vector<float> & gate_dequantized,
+                                  std::vector<float> & up_dequantized,
+                                  std::vector<float> & down_dequantized) {
+    const std::vector<uint8_t> gate_q = quantize_mxfp4(
+        gate, kInput, kExperts * kFf);
+    const std::vector<uint8_t> up_q = quantize_mxfp4(
+        up, kInput, kExperts * kFf);
+    const std::vector<uint8_t> down_q = quantize_mxfp4(
+        down, kFf, kExperts * kOutput);
+    gate_dequantized = dequantize_mxfp4(
+        gate_q, kInput, kExperts * kFf);
+    up_dequantized = dequantize_mxfp4(
+        up_q, kInput, kExperts * kFf);
+    down_dequantized = dequantize_mxfp4(
+        down_q, kFf, kExperts * kOutput);
+
+    ModelBytes model;
+    model.regions.expert_bytes_gate =
+        ggml_row_size(GGML_TYPE_MXFP4, kInput) * kFf;
+    model.regions.expert_bytes_up = model.regions.expert_bytes_gate;
+    model.regions.expert_bytes_down =
+        ggml_row_size(GGML_TYPE_MXFP4, kFf) * kOutput;
+    model.regions.gate_exps = {0, gate_q.size()};
+    model.regions.up_exps = {gate_q.size(), up_q.size()};
+    model.regions.down_exps = {
+        gate_q.size() + up_q.size(), down_q.size()};
+    model.file.reserve(gate_q.size() + up_q.size() + down_q.size());
+    model.file.insert(model.file.end(), gate_q.begin(), gate_q.end());
+    model.file.insert(model.file.end(), up_q.begin(), up_q.end());
+    model.file.insert(model.file.end(), down_q.begin(), down_q.end());
+    model.slot_bytes = model.regions.expert_bytes_gate +
+                       model.regions.expert_bytes_up +
+                       model.regions.expert_bytes_down;
+    return model;
+}
+
 std::vector<float> cpu_reference(
         const std::vector<float> & gate,
         const std::vector<float> & up,
@@ -289,9 +360,85 @@ void run_layout_case(ggml_backend_t backend, bool expert_major) {
     engine.destroy();
 }
 
+void run_mxfp4_padding_case(ggml_backend_t backend) {
+    std::vector<float> gate;
+    std::vector<float> up;
+    std::vector<float> down;
+    fill_weights(gate, up, down);
+    std::vector<float> gate_dequantized;
+    std::vector<float> up_dequantized;
+    std::vector<float> down_dequantized;
+    ModelBytes model = make_mxfp4_model_bytes(
+        gate, up, down, gate_dequantized, up_dequantized,
+        down_dequantized);
+    TempFile file(model.file);
+
+    MoeHybridStorage storage;
+    storage.mmap_size = model.file.size();
+    storage.mmap_fd = ::dup(file.fd);
+    STREAM_REQUIRE(storage.mmap_fd >= 0);
+    storage.layer_regions.push_back(model.regions);
+
+    MoeStreamConfig config;
+    config.device_slots = 2;
+    config.graph_cache_entries = 4;
+    config.nvme.backend = MoeNvmeBackend::ThreadPool;
+    config.nvme.direct_io = MoeNvmeDirectMode::Disabled;
+    config.nvme.host_slots = 6;
+
+    MoeHybridStreamEngine engine;
+    std::string error;
+    STREAM_REQUIRE(engine.init(
+        backend, model.slot_bytes, storage, config, &error));
+
+    MoeStreamExpertSpec spec;
+    spec.input_dim = kInput;
+    spec.intermediate_dim = kFf;
+    spec.output_dim = kOutput;
+    spec.gate_type = GGML_TYPE_MXFP4;
+    spec.up_type = GGML_TYPE_MXFP4;
+    spec.down_type = GGML_TYPE_MXFP4;
+    spec.gated_activation = MoeGatedActivation::Situ;
+    spec.gate_scale = 0.8f;
+    spec.up_scale = 1.1f;
+    spec.down_scale = 0.9f;
+
+    std::vector<float> input(static_cast<size_t>(kTokens) * kInput);
+    for (size_t i = 0; i < input.size(); ++i) {
+        input[i] = 0.12f * std::sin(0.07f * static_cast<float>(i + 1));
+    }
+    const int32_t ids[kTokens * kTopK] = {2, 0, 1, 2};
+    const float weights[kTokens * kTopK] = {0.65f, 0.35f, 0.55f, 0.45f};
+    MoeStreamRouteBatch batch;
+    batch.layer = 0;
+    batch.n_expert = kExperts;
+    batch.top_k = kTopK;
+    batch.n_tokens = kTokens;
+    batch.inputs = input.data();
+    batch.selected_ids = ids;
+    batch.selected_weights = weights;
+
+    const std::vector<float> expected = cpu_reference(
+        gate_dequantized, up_dequantized, down_dequantized,
+        input, ids, weights);
+    std::vector<float> actual;
+    STREAM_REQUIRE(eval_moe_streamed_experts(
+        engine, spec, batch, actual, &error));
+    STREAM_REQUIRE(actual.size() == expected.size());
+    for (size_t i = 0; i < actual.size(); ++i) {
+        const float tolerance =
+            2.0e-4f + 2.0e-3f * std::fabs(expected[i]);
+        STREAM_REQUIRE(std::fabs(actual[i] - expected[i]) <= tolerance);
+    }
+    const MoeStreamComputeStats stats = engine.compute_stats();
+    STREAM_REQUIRE(stats.graph_builds == 2);
+    STREAM_REQUIRE(stats.graph_launches == 3);
+    engine.destroy();
+}
+
 } // namespace
 
-TEST_CASE(MoeStreamComputeFixture, persistent_graph_matches_cpu_for_both_layouts) {
+TEST_CASE(MoeStreamComputeFixture, persistent_graph_matches_cpu_and_padded_mxfp4) {
     int device = 0;
     if (const char * value = std::getenv("DFLASH_TEST_GPU")) {
         device = std::max(0, std::atoi(value));
@@ -307,5 +454,6 @@ TEST_CASE(MoeStreamComputeFixture, persistent_graph_matches_cpu_for_both_layouts
     }
     run_layout_case(backend, false);
     run_layout_case(backend, true);
+    run_mxfp4_padding_case(backend);
     ggml_backend_free(backend);
 }

@@ -735,7 +735,8 @@ if(DFLASH27B_TESTS)
         target_include_directories(test_moe_stream_compute PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src
             ${CMAKE_CURRENT_SOURCE_DIR}/src/common
-            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src)
         target_link_libraries(test_moe_stream_compute PRIVATE
             dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
         if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
