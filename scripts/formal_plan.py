@@ -23,7 +23,6 @@ import tomllib
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-
 SCHEMA_VERSION = 1
 POLICIES = {"required", "advisory"}
 TARGET_REQUIRED_FIELDS = {
@@ -280,8 +279,7 @@ def _changed_paths_from_git(root: Path, base_sha: str) -> list[str]:
         cwd=root,
         check=False,
         text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
     )
     if process.returncode:
         raise RegistryError(

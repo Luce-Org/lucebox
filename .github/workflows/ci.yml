@@ -79,14 +79,15 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release
           cmake --build build --target \
             test_dflash test_generate test_flash_attn_sparse test_server_unit \
-            test_prefix_cache_state \
+            test_prefix_cache_state test_full_prefix_cache_state test_spec_commit \
+            test_kvflash_residency_map \
             test_deepseek4_unit -j$(nproc)
 
       - name: Run C++ server unit tests
         run: |
           cd server/build
           ctest --output-on-failure \
-            -R "server_unit|prefix_cache_state|deepseek4_unit" \
+            -R "server_unit|prefix_cache_state|spec_commit|kvflash_residency_map|deepseek4_unit" \
             --no-tests=error
 
       - name: Populate venv with cu128 torch + setuptools
