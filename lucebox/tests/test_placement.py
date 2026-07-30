@@ -1,9 +1,12 @@
+import os
 import re
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from lucebox.autotune import automatic_plan
+from lucebox.docker_run import server_run_spec
+from lucebox.host_facts import from_env
 from lucebox.placement import ARCHITECTURE_CAPABILITIES, automatic_placement
 from lucebox.topology import from_config
 from lucebox.types import Config, DflashRuntime, HostFacts, ModelMeta
@@ -29,6 +32,14 @@ def _amd_csv(*rows: tuple[str, str, int]) -> str:
         f"{index}, , , {name}, {architecture}, {memory_mib} MiB,"
         for index, (name, architecture, memory_mib) in enumerate(rows)
     )
+
+
+def _set_host_env(monkeypatch: pytest.MonkeyPatch, values: dict[str, str | int]) -> None:
+    for key in tuple(os.environ):
+        if key.startswith("LUCEBOX_HOST_"):
+            monkeypatch.delenv(key, raising=False)
+    for key, value in values.items():
+        monkeypatch.setenv(key, str(value))
 
 
 def test_r9700_strix_keeps_fitting_qwen_target_on_r9700(tmp_path: Path) -> None:
@@ -105,6 +116,79 @@ def test_three_same_backend_gpus_are_used_only_when_capacity_requires_them(
     assert plan.runtime.target_devices == ("cuda:0", "cuda:1", "cuda:2")
     assert sum(plan.runtime.target_layer_split) == pytest.approx(1.0)
     assert plan.runtime.peer_access is False
+
+
+def test_undersized_secondary_does_not_claim_draft_offload(tmp_path: Path) -> None:
+    host = HostFacts(
+        gpu_vendor="nvidia",
+        has_nvidia_gpu=True,
+        gpu_name="RTX 0",
+        gpu_count=2,
+        vram_gb=18,
+        gpu_sm="86",
+        nvidia_gpu_name="RTX 0",
+        nvidia_gpu_count=2,
+        nvidia_vram_gb=18,
+        nvidia_gpu_arch="86",
+        nvidia_gpu_list_csv=_nvidia_csv(18432, 1024),
+    )
+    cfg = Config(
+        variant="cuda12",
+        models_dir=tmp_path,
+        host=host,
+        model=ModelMeta(preset="qwen3.6-27b"),
+    )
+    preset = download.PRESETS["qwen3.6-27b"]
+
+    placement = automatic_placement(
+        cfg,
+        DflashRuntime(speculative_decode=True),
+        preset,
+        has_draft=True,
+        optimizer_drafter_available=False,
+    )
+
+    draft_option = next(option for option in placement.options if option.key == "draft-offload")
+    assert placement.runnable is False
+    assert draft_option.available is False
+    assert "0 GB of safe capacity" in draft_option.reason
+
+
+def test_layer_split_never_assigns_target_to_a_zero_capacity_primary(
+    tmp_path: Path,
+) -> None:
+    host = HostFacts(
+        gpu_vendor="nvidia",
+        has_nvidia_gpu=True,
+        gpu_name="RTX 0",
+        gpu_count=2,
+        vram_gb=4,
+        gpu_sm="86",
+        nvidia_gpu_name="RTX 0",
+        nvidia_gpu_count=2,
+        nvidia_vram_gb=4,
+        nvidia_gpu_arch="86",
+        nvidia_gpu_list_csv=_nvidia_csv(4096, 24576),
+    )
+    cfg = Config(variant="cuda12", models_dir=tmp_path, host=host)
+    preset = SimpleNamespace(
+        architecture="qwen35",
+        target_file="large.gguf",
+        approx_target_gb=20.0,
+        approx_draft_gb=3.0,
+    )
+
+    placement = automatic_placement(
+        cfg,
+        DflashRuntime(speculative_decode=True),
+        preset,
+        has_draft=True,
+        optimizer_drafter_available=False,
+    )
+
+    split_option = next(option for option in placement.options if option.key == "layer-split")
+    assert placement.runnable is False
+    assert split_option.available is False
 
 
 def test_rtx_strix_moe_uses_paired_runtime_for_remote_spark_experts(
@@ -290,3 +374,100 @@ def test_python_architecture_capabilities_match_engine_table() -> None:
         assert capability.draft_on_layer_split is (row["draft"] == "kBoth")
         assert capability.pflash_on_layer_split is (split and row["pflash"] == "true")
         assert capability.expert_offload is (row["offload"] == "true")
+
+
+def test_env_driven_dual_nvidia_plan_reaches_server_launch_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _set_host_env(
+        monkeypatch,
+        {
+            "LUCEBOX_HOST_NPROC": 16,
+            "LUCEBOX_HOST_RAM_GB": 64,
+            "LUCEBOX_HOST_GPU_VENDOR": "nvidia",
+            "LUCEBOX_HOST_HAS_NVIDIA_GPU": 1,
+            "LUCEBOX_HOST_GPU_NAME": "RTX 0",
+            "LUCEBOX_HOST_GPU_COUNT": 2,
+            "LUCEBOX_HOST_VRAM_GB": 12,
+            "LUCEBOX_HOST_GPU_SM": "86",
+            "LUCEBOX_HOST_NVIDIA_GPU_LIST_CSV": _nvidia_csv(12288, 12288),
+        },
+    )
+    cfg = Config(
+        variant="cuda12",
+        models_dir=tmp_path,
+        host=from_env(),
+        model=ModelMeta(preset="qwen3.6-27b"),
+    )
+
+    plan = automatic_plan(cfg, optimizer_drafter_available=False)
+    launch = server_run_spec(
+        Config(
+            variant=cfg.variant,
+            models_dir=cfg.models_dir,
+            host=cfg.host,
+            model=cfg.model,
+            dflash=plan.runtime,
+            placement=plan.placement.runtime,
+        )
+    )
+    launch_env = dict(launch.env)
+
+    assert plan.placement.runnable is True
+    assert plan.placement.runtime.mode == "layer-split"
+    assert plan.placement.runtime.target_devices == ("cuda:0", "cuda:1")
+    assert launch_env["DFLASH_TARGET_DEVICES"] == "cuda:0,cuda:1"
+    assert launch_env["DFLASH_TARGET_LAYER_SPLIT"]
+    assert launch_env["DFLASH_KVFLASH"] == "auto"
+
+
+def test_env_driven_lucebox_plan_uses_r9700_without_unnecessary_split(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _set_host_env(
+        monkeypatch,
+        {
+            "LUCEBOX_HOST_NPROC": 32,
+            "LUCEBOX_HOST_RAM_GB": 125,
+            "LUCEBOX_HOST_GPU_VENDOR": "amd",
+            "LUCEBOX_HOST_HAS_AMD_GPU": 1,
+            "LUCEBOX_HOST_GPU_NAME": "AMD Radeon AI PRO R9700",
+            "LUCEBOX_HOST_GPU_COUNT": 2,
+            "LUCEBOX_HOST_VRAM_GB": 31,
+            "LUCEBOX_HOST_GPU_SM": "gfx1201",
+            "LUCEBOX_HOST_AMD_GPU_LIST_CSV": _amd_csv(
+                ("AMD Radeon AI PRO R9700", "gfx1201", 32624),
+                ("AMD Radeon Graphics", "gfx1151", 512),
+            ),
+        },
+    )
+    cfg = Config(
+        variant="rocm",
+        models_dir=tmp_path,
+        host=from_env(),
+        model=ModelMeta(preset="qwen3.6-27b"),
+    )
+
+    plan = automatic_plan(cfg, optimizer_drafter_available=False)
+    launch = server_run_spec(
+        Config(
+            variant=cfg.variant,
+            models_dir=cfg.models_dir,
+            host=cfg.host,
+            model=cfg.model,
+            dflash=plan.runtime,
+            placement=plan.placement.runtime,
+        )
+    )
+    launch_env = dict(launch.env)
+
+    assert plan.placement.runnable is True
+    assert plan.placement.runtime.mode == "single"
+    assert plan.placement.runtime.target_device == "hip:0"
+    assert plan.placement.runtime.uses_multiple_devices is False
+    assert plan.placement.topology.companions[0].unified_memory is True
+    assert launch.gpu_vendor == "amd"
+    assert launch_env["DFLASH_TARGET_DEVICE"] == "hip:0"
+    assert "DFLASH_TARGET_DEVICES" not in launch_env
