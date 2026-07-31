@@ -1,0 +1,109 @@
+import tempfile
+import unittest
+from pathlib import Path
+
+from benchmark_kimi_k3_deployments import (
+    Deployment,
+    build_deployments,
+    deployment_environment,
+    discover_model_files,
+    extract_nvme_telemetry,
+    server_command,
+)
+
+
+class KimiDeploymentBenchmarkTests(unittest.TestCase):
+    def test_builds_capacity_safe_default_profiles(self):
+        profiles = build_deployments(["strix-only", "heterogeneous"], 1, 0, "strix")
+        self.assertEqual(
+            profiles,
+            [
+                Deployment("strix-only-ssd", 1, None),
+                Deployment("heterogeneous-ssd", 1, 0),
+            ],
+        )
+
+    def test_r9700_primary_is_explicit(self):
+        profiles = build_deployments(["heterogeneous"], 1, 0, "r9700")
+        self.assertEqual(profiles, [Deployment("heterogeneous-ssd", 0, 1)])
+        with self.assertRaisesRegex(ValueError, "distinct"):
+            build_deployments(["heterogeneous"], 0, 0, "strix")
+
+    def test_environment_removes_stale_tuning(self):
+        base = {
+            "PATH": "/bin",
+            "DFLASH_MOE_STORAGE": "resident",
+            "DFLASH_MOE_NVME_SLOTS": "64",
+            "DFLASH_MOE_TP_GPU": "9",
+            "DFLASH_MOE_PLACEMENT": "/stale.json",
+        }
+        env = deployment_environment(
+            base,
+            Deployment("heterogeneous-ssd", 1, 0),
+            "uring",
+            600,
+            Path("/new.json"),
+            4096,
+            True,
+        )
+        self.assertEqual(env["PATH"], "/bin")
+        self.assertNotIn("DFLASH_MOE_STORAGE", env)
+        self.assertNotIn("DFLASH_MOE_NVME_SLOTS", env)
+        self.assertEqual(env["DFLASH_MOE_NVME_BACKEND"], "uring")
+        self.assertEqual(env["DFLASH_MOE_NVME_DEVICE_CACHE_MB"], "4096")
+        self.assertEqual(env["DFLASH_MOE_TP_GPU"], "0")
+        self.assertEqual(env["DFLASH_MOE_PRIMARY_SHARE_PER_MILLE"], "600")
+        self.assertEqual(env["DFLASH_MOE_PLACEMENT"], "/new.json")
+        self.assertEqual(env["DFLASH_MOE_DUAL_STREAM_TRACE"], "1")
+
+    def test_strix_only_has_no_secondary_owner(self):
+        env = deployment_environment(
+            {"DFLASH_MOE_TP_GPU": "0"},
+            Deployment("strix-only-ssd", 1, None),
+            "auto",
+            500,
+            None,
+            None,
+            False,
+        )
+        self.assertNotIn("DFLASH_MOE_TP_GPU", env)
+        command = server_command(
+            Path("server"), Path("model.gguf"), Deployment("strix", 1, None), 8080, 8192, []
+        )
+        self.assertIn("hip:1", command)
+        self.assertEqual(command[command.index("--moe-storage") + 1], "ssd")
+        self.assertEqual(command[command.index("--prefix-cache-slots") + 1], "0")
+
+    def test_discovers_complete_split_model(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = [root / f"model-{index:05d}-of-00003.gguf" for index in range(1, 4)]
+            for index, path in enumerate(paths, 1):
+                path.write_bytes(bytes(index))
+            self.assertEqual(discover_model_files(paths[0]), paths)
+            with self.assertRaisesRegex(ValueError, "first"):
+                discover_model_files(paths[1])
+            paths[-1].unlink()
+            with self.assertRaisesRegex(FileNotFoundError, "incomplete"):
+                discover_model_files(paths[0])
+
+    def test_extracts_each_owner_telemetry_line(self):
+        line = (
+            "[moe-nvme] io=io_uring requests=10 reads=9 payload=1.250 GiB "
+            "physical=1.500 GiB active-io-rate=3.750 GiB/s cache-hit=10.0% "
+            "mean-demand-wait=2.500 ms dedupe=0 upgrades=0 dropped-prefetch=0 "
+            "timeouts=0 errors=0 device-cache=1024.0 MiB slots=2 hits=1 misses=9 "
+            "evictions=3 graphs=1 graph-hits=8 graph-evictions=0 launches=9\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "server.log"
+            log.write_text(line + line)
+            rows = extract_nvme_telemetry(log)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["io"], "io_uring")
+        self.assertEqual(rows[0]["active_io_gib_s"], 3.75)
+        self.assertEqual(rows[0]["errors"], 0)
+
+
+if __name__ == "__main__":
+    unittest.main()

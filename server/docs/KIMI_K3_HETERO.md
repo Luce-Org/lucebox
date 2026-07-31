@@ -176,7 +176,32 @@ router, or per-layer worker creation. Full-scale qualification requires:
 4. Replace the correctness-first host partial join with a device-resident peer
    join, then tune the placement until the two owner branches balance.
 
-The full 594 GB model cannot currently be staged on the qualification box,
-which currently has about 513 GB free. It needs at least about 650 GB of safe
-free space for all shards plus logging/headroom; existing user models should
-not be deleted implicitly.
+Staging the released quant requires 594 GB for the shards plus operational
+headroom. The benchmark validates that every shard is present before starting;
+it never downloads models or deletes existing data implicitly.
+
+## Reproducible full-model comparison
+
+Once all 14 shards are present, one harness runs the two relevant deployments
+serially so they cannot contend for the SSD or GPUs:
+
+```bash
+python3 server/scripts/benchmark_kimi_k3_deployments.py \
+  /models/Kimi-K3-UD-IQ1_S/Kimi-K3-UD-IQ1_S-00001-of-00014.gguf \
+  --server-bin server/build-hip-dual/dflash_server \
+  --r9700-device 0 --strix-device 1 \
+  --output-dir bench-out/kimi-k3-lucebox
+```
+
+The profiles are Strix-only+SSD and heterogeneous Strix+R9700+SSD. For the
+published IQ1_S checkpoint, Strix is the capacity-safe primary because the
+non-routed tensors alone exceed the R9700's memory; R9700 concurrently owns a
+partition of routed experts. `--hetero-primary r9700` is available for a later
+checkpoint whose non-routed plan fits the discrete GPU.
+
+Each profile starts from a fresh server, forces `--moe-storage ssd`, clears
+inherited MoE tuning, disables HTTP/prefix caches, and issues one cold followed
+by two warm deterministic requests. The output directory contains the command,
+effective MoE environment, client first-event time, server prefill/decode rate,
+complete server log, and parsed per-owner NVMe/cache/graph telemetry. A
+deterministic output mismatch between profiles fails the benchmark.
