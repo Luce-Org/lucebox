@@ -93,28 +93,42 @@ class ModelPreset:
     native_context: int
     description: str = ""
     speculator_dir: str | None = None
+    display_name: str = ""
+    featured_rank: int | None = None
 
     @property
     def has_draft(self) -> bool:
         return bool(self.draft_repo and self.draft_file)
 
+    @property
+    def label(self) -> str:
+        """Human-readable catalog label; ``name`` remains the stable CLI id."""
+        return self.display_name or self.name
+
+    @property
+    def featured(self) -> bool:
+        """Whether this preset belongs in the focused first-run picker."""
+        return self.featured_rank is not None
+
 
 # Registry of supported models. Keyed by preset name; the CLI surface
 # exposes these via `lucebox models download <name>` and the
 # `lucebox models list` table. The values come straight from the model
-# cards under share/model_cards/ — keep them in sync.
+# cards and published Lucebox artifacts — keep them in sync.
 PRESETS: dict[str, ModelPreset] = {
     "qwen3.6-27b": ModelPreset(
         name="qwen3.6-27b",
         target_repo="unsloth/Qwen3.6-27B-GGUF",
         target_file="Qwen3.6-27B-Q4_K_M.gguf",
-        draft_repo="spiritbuun/Qwen3.6-27B-DFlash-GGUF",
+        draft_repo="Lucebox/Qwen3.6-27B-DFlash-GGUF",
         draft_file="dflash-draft-3.6-q4_k_m.gguf",
         approx_total_gb=17,
         approx_target_gb=15.7,
         approx_draft_gb=1.3,
         architecture="qwen35",
         native_context=262144,
+        display_name="Qwen3.6 27B",
+        featured_rank=1,
         description="Qwen3.6 27B dense (Q4_K_M) + Qwen3.6 DFlash draft. Lucebox default.",
     ),
     "gemma-4-26b": ModelPreset(
@@ -160,6 +174,8 @@ PRESETS: dict[str, ModelPreset] = {
         approx_draft_gb=1.1,
         architecture="laguna",
         native_context=4096,
+        display_name="Laguna XS.2",
+        featured_rank=3,
         description=(
             "Laguna-XS.2 MoE code model (Q4_K_M). "
             "DFlash safetensors speculator in draft/laguna-xs2-speculator/ "
@@ -186,15 +202,57 @@ PRESETS: dict[str, ModelPreset] = {
         approx_draft_gb=0.0,
         architecture="qwen35moe",
         native_context=262144,
+        display_name="Qwen3.6 35B-A3B",
+        featured_rank=2,
         description=(
             "Qwen3.6 35B-A3B MoE (3B active per token), Q4_K_M unsloth "
             "dynamic quant. Target-only — no DFlash MoE draft published "
             "yet. Uses lucebox's qwen35moe arch backend."
         ),
     ),
+    "deepseek-v4-flash": ModelPreset(
+        name="deepseek-v4-flash",
+        target_repo="Lucebox/DeepSeek-V4-Flash-ROCMFPX",
+        target_file="DeepSeek-V4-Flash-ROCMFP2-STRIX.gguf",
+        draft_repo="Lucebox/DeepSeek-V4-Flash-DSpark-Drafter-GGUF",
+        draft_file="DeepSeek-V4-Flash-DSpark-draft-Q4RMFP4-denseF16.gguf",
+        approx_total_gb=114,
+        approx_target_gb=102.4,
+        approx_draft_gb=11.3,
+        architecture="deepseek4",
+        native_context=1048576,
+        display_name="DeepSeek V4 Flash",
+        featured_rank=4,
+        description=(
+            "DeepSeek V4 Flash ROCmFPX target + Lucebox DSpark draft. "
+            "Large-system profile: about 103 GB for the target and 114 GB "
+            "with speculative decoding."
+        ),
+    ),
 }
 
 DEFAULT_PRESET = PRESETS["qwen3.6-27b"]
+
+
+def catalog_presets(*, featured_only: bool = False) -> tuple[ModelPreset, ...]:
+    """Return presets in stable product order.
+
+    The guided picker stays deliberately focused on the models Lucebox tunes
+    and qualifies most heavily. Older supported presets remain addressable by
+    their stable names and visible through ``lucebox models list``.
+    """
+    candidates = (preset for preset in PRESETS.values() if preset.featured or not featured_only)
+    return tuple(
+        sorted(
+            candidates,
+            key=lambda preset: (
+                preset.featured_rank is None,
+                preset.featured_rank if preset.featured_rank is not None else 0,
+                preset.name,
+            ),
+        )
+    )
+
 
 # Shared scorer used by PFlash and by KVFlash's drafter residency policy.
 # It is deliberately separate from each target preset: one ~1.2 GB file is
@@ -214,10 +272,14 @@ def resolve_preset(name: str | None) -> ModelPreset:
         return DEFAULT_PRESET
     if name in PRESETS:
         return PRESETS[name]
+    normalized = name.strip().casefold()
+    for preset in PRESETS.values():
+        if normalized == preset.label.casefold():
+            return preset
     # Build a suggestion list — show every known preset; the user's
     # search space is small, so listing them all is
     # cheaper and clearer than a fuzzy-match heuristic.
-    known = ", ".join(sorted(PRESETS.keys()))
+    known = ", ".join(preset.name for preset in catalog_presets())
     raise KeyError(f"unknown preset {name!r}. Known presets: {known}")
 
 
@@ -553,8 +615,7 @@ def installed_presets(cfg: Config) -> list[ModelPreset]:
     default ``lucebox models`` view stays uncluttered.
     """
     out: list[ModelPreset] = []
-    for name in sorted(PRESETS):
-        pres = PRESETS[name]
+    for pres in catalog_presets():
         if installed_status(cfg, pres) == "installed":
             out.append(pres)
     return out

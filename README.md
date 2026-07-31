@@ -173,6 +173,12 @@ lucebox start
 ./lucebox.sh package-runtime         # factory-installable paired runtime
 ```
 
+The first-run picker focuses on the model families Lucebox qualifies most
+heavily: Qwen3.6 27B, Qwen3.6 35B-A3B, Laguna XS.2, and DeepSeek V4 Flash.
+Before any download, it checks whether the detected single-GPU, multi-GPU, or
+Lucebox heterogeneous placement can actually run the selected model. Gemma
+presets remain available from `lucebox models list` for existing users.
+
 ## Quick Start On Harnesses
 
 [`harness/`](harness/) contains RTX 3090 client launchers and regression tests
