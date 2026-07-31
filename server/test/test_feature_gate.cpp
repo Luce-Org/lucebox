@@ -43,6 +43,43 @@ static int test_count = 0;
 // One case per rule cluster in check_feature_compatibility(). All resolved
 // facts are parameters, so none of this needs a model file or GPU.
 
+static void test_moe_storage_policy_resolution() {
+    MoeStoragePolicy parsed = MoeStoragePolicy::Auto;
+    TEST_ASSERT(parse_moe_storage_policy("auto", parsed));
+    TEST_ASSERT(parsed == MoeStoragePolicy::Auto);
+    TEST_ASSERT(parse_moe_storage_policy("resident", parsed));
+    TEST_ASSERT(parsed == MoeStoragePolicy::Resident);
+    TEST_ASSERT(parse_moe_storage_policy("ssd", parsed));
+    TEST_ASSERT(parsed == MoeStoragePolicy::Ssd);
+    TEST_ASSERT(!parse_moe_storage_policy("disk", parsed));
+
+    MoeStoragePolicyResolution resolved =
+        resolve_moe_storage_policy({}, nullptr, nullptr);
+    TEST_ASSERT(resolved.ok());
+    TEST_ASSERT(resolved.policy == MoeStoragePolicy::Auto);
+    TEST_ASSERT(resolved.source == MoeStoragePolicySource::Default);
+
+    resolved = resolve_moe_storage_policy({}, "resident", "on");
+    TEST_ASSERT(resolved.ok());
+    TEST_ASSERT(resolved.policy == MoeStoragePolicy::Resident);
+    TEST_ASSERT(resolved.source == MoeStoragePolicySource::Environment);
+
+    resolved = resolve_moe_storage_policy(
+        MoeStoragePolicy::Ssd, "invalid", "off");
+    TEST_ASSERT(resolved.ok());
+    TEST_ASSERT(resolved.policy == MoeStoragePolicy::Ssd);
+    TEST_ASSERT(resolved.source == MoeStoragePolicySource::Cli);
+
+    resolved = resolve_moe_storage_policy({}, nullptr, "on");
+    TEST_ASSERT(resolved.ok());
+    TEST_ASSERT(resolved.policy == MoeStoragePolicy::Ssd);
+    TEST_ASSERT(resolved.source == MoeStoragePolicySource::LegacyEnvironment);
+    TEST_ASSERT(!resolved.warning.empty());
+
+    TEST_ASSERT(!resolve_moe_storage_policy({}, "invalid", nullptr).ok());
+    TEST_ASSERT(!resolve_moe_storage_policy({}, nullptr, "invalid").ok());
+}
+
 static BackendArgs gate_args_hip_deepseek4() {
     BackendArgs args;
     args.model_path = "/nonexistent/model.gguf";
@@ -279,6 +316,38 @@ static void test_feature_gate_layer_split_requires_supported_arch() {
     TEST_ASSERT(gate_result(single, "kimi-k3", PlacementBackend::Cuda).empty());
 }
 
+static void test_feature_gate_moe_ssd_requires_complete_adapter() {
+    BackendArgs args;
+    args.model_path = "/nonexistent/model.gguf";
+    args.moe_storage = MoeStoragePolicy::Ssd;
+
+    TEST_ASSERT(gate_result(
+        args, "deepseek4", PlacementBackend::Hip).empty());
+    TEST_ASSERT(gate_result(
+        args, "kimi-k3", PlacementBackend::Hip).empty());
+    for (const char * arch : {"qwen35", "qwen35moe", "laguna",
+                              "qwen3", "gemma4"}) {
+        TEST_ASSERT(!gate_result(args, arch, PlacementBackend::Hip).empty());
+    }
+
+    BackendArgs split = args;
+    TEST_ASSERT(parse_placement_device_list("hip:0,hip:1", split.device));
+    TEST_ASSERT(!gate_result(
+        split, "deepseek4", PlacementBackend::Hip).empty());
+
+    BackendArgs remote = args;
+    remote.remote_target_shard.ipc_bin = "/usr/bin/target-shard";
+    TEST_ASSERT(!gate_result(
+        remote, "deepseek4", PlacementBackend::Hip).empty());
+
+    // Resident prohibits SSD streaming and is therefore safe everywhere.
+    args.moe_storage = MoeStoragePolicy::Resident;
+    TEST_ASSERT(gate_result(
+        args, "qwen35", PlacementBackend::Hip).empty());
+    TEST_ASSERT(gate_result(
+        args, "laguna", PlacementBackend::Hip).empty());
+}
+
 // ── Inert-flag warnings ─────────────────────────────────────────────────
 // Warnings must never gate admission, so each case also asserts the same
 // configuration passes check_feature_compatibility().
@@ -406,10 +475,17 @@ static void test_model_capability_tables() {
     TEST_ASSERT(!arch_supports_verify_width("qwen36", false));
     TEST_ASSERT(!arch_supports_fa_window("qwen36", false));
     TEST_ASSERT(!arch_supports_draft_swa("qwen36", false));
+    TEST_ASSERT(!arch_supports_moe_ssd_storage("qwen36", false));
+
+    TEST_ASSERT(arch_supports_moe_ssd_storage("deepseek4", false));
+    TEST_ASSERT(!arch_supports_moe_ssd_storage("deepseek4", true));
+    TEST_ASSERT(arch_supports_moe_ssd_storage("kimi-k3", false));
+    TEST_ASSERT(!arch_supports_moe_ssd_storage("qwen35moe", false));
 }
 
 int main() {
     std::fprintf(stderr, "\n\u2500\u2500 Backend feature/architecture gate \u2500\u2500\n");
+    RUN_TEST(test_moe_storage_policy_resolution);
     RUN_TEST(test_feature_gate_accepts_plain_launch);
     RUN_TEST(test_feature_gate_rejects_undetected_arch);
     RUN_TEST(test_feature_gate_requires_compiled_target_backend);
@@ -422,6 +498,7 @@ int main() {
     RUN_TEST(test_feature_gate_ds4_decode_options_require_monolithic_hip);
     RUN_TEST(test_feature_gate_remote_draft_requires_supported_arch);
     RUN_TEST(test_feature_gate_layer_split_requires_supported_arch);
+    RUN_TEST(test_feature_gate_moe_ssd_requires_complete_adapter);
     RUN_TEST(test_feature_warnings_silent_when_supported);
     RUN_TEST(test_feature_warnings_report_inert_draft);
     RUN_TEST(test_feature_warnings_report_inert_decode_tunables);

@@ -304,9 +304,11 @@ bool KimiK3Backend::init() {
                      cfg_.device.primary_gpu());
         return false;
     }
+    const bool stream_routed_experts =
+        cfg_.moe_storage != MoeStoragePolicy::Resident;
     if (!load_kimi_k3_gguf(
             cfg_.model_path, backend_, weights_,
-            cfg_.stream_routed_experts)) {
+            stream_routed_experts)) {
         std::fprintf(stderr, "[kimi-k3] model load failed: %s\n",
                      dflash27b_last_error());
         return false;
@@ -354,7 +356,7 @@ bool KimiK3Backend::unpark(ParkTarget target) {
     if (parked_) {
         if (!load_kimi_k3_gguf(
                 cfg_.model_path, backend_, weights_,
-                cfg_.stream_routed_experts) ||
+                cfg_.moe_storage != MoeStoragePolicy::Resident) ||
             (weights_.routed_experts_streamed && !init_streaming())) {
             return false;
         }

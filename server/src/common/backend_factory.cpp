@@ -18,6 +18,7 @@
 #include "qwen35_layer_split_adapter.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <algorithm>
 #include <type_traits>
 
@@ -49,6 +50,7 @@ DFLASH_ARCH_FIELD_TRAIT(has_verify_width,      verify_width);
 DFLASH_ARCH_FIELD_TRAIT(has_draft_swa,         draft_swa_window);
 DFLASH_ARCH_FIELD_TRAIT(has_ddtree_mode,       ddtree_mode);
 DFLASH_ARCH_FIELD_TRAIT(has_max_verify_tokens, max_verify_tokens);
+DFLASH_ARCH_FIELD_TRAIT(has_moe_storage,       moe_storage);
 
 #undef DFLASH_ARCH_FIELD_TRAIT
 
@@ -87,7 +89,8 @@ constexpr bool layer_split_carries(FeatureSupport support) {
     DFLASH_CHECK_ARCH_OPTION(arch_name, Mono, Split, has_ddtree,       ddtree);       \
     DFLASH_CHECK_ARCH_OPTION(arch_name, Mono, Split, has_verify_width, verify_width); \
     DFLASH_CHECK_ARCH_OPTION(arch_name, Mono, Split, has_fa_window,    fa_window);    \
-    DFLASH_CHECK_ARCH_OPTION(arch_name, Mono, Split, has_draft_swa,    draft_swa)
+    DFLASH_CHECK_ARCH_OPTION(arch_name, Mono, Split, has_draft_swa,    draft_swa);    \
+    DFLASH_CHECK_ARCH_OPTION(arch_name, Mono, Split, has_moe_storage,  moe_ssd_storage)
 
 DFLASH_CHECK_ARCH("qwen35",    Qwen35Config,          Qwen35LayerSplitAdapterConfig);
 DFLASH_CHECK_ARCH("qwen35moe", Qwen35Config,          NoLayerSplitConfig);
@@ -106,6 +109,14 @@ PlacementBackend resolve_target_backend(
     return args.device.backend == PlacementBackend::Auto
         ? compiled_backend
         : args.device.backend;
+}
+
+MoeStoragePolicyResolution resolve_requested_moe_storage(
+    const BackendArgs & args) {
+    return resolve_moe_storage_policy(
+        args.moe_storage,
+        std::getenv(kMoeStorageEnvironment),
+        std::getenv(kLegacyMoeStorageEnvironment));
 }
 
 }  // namespace
@@ -131,6 +142,12 @@ BackendPreparation prepare_backend(
     preparation.plan.target_backend_ = resolve_target_backend(
         args, preparation.plan.compiled_backend_);
     preparation.plan.model_ = inspect_gguf_model_info(args.model_path);
+    preparation.plan.moe_storage_ = resolve_requested_moe_storage(args);
+    if (!preparation.plan.moe_storage_.ok()) {
+        preparation.error = BackendPreparationError::InvalidRequest;
+        preparation.message = preparation.plan.moe_storage_.error;
+        return preparation;
+    }
 
     if (preparation.plan.arch().empty()) {
         preparation.error = BackendPreparationError::ModelInspection;
@@ -152,8 +169,10 @@ BackendPreparation prepare_backend(
         return preparation;
     }
 
+    BackendArgs effective_args = args;
+    effective_args.moe_storage = preparation.plan.moe_storage_policy();
     preparation.message = check_feature_compatibility(
-        args,
+        effective_args,
         preparation.plan.features(),
         preparation.plan.arch(),
         preparation.plan.target_backend(),
@@ -164,7 +183,12 @@ BackendPreparation prepare_backend(
     }
 
     preparation.warnings = collect_feature_warnings(
-        args, preparation.plan.features(), preparation.plan.arch());
+        effective_args, preparation.plan.features(), preparation.plan.arch());
+    if (!preparation.plan.moe_storage_.warning.empty()) {
+        preparation.warnings.insert(
+            preparation.warnings.begin(),
+            preparation.plan.moe_storage_.warning);
+    }
     return preparation;
 }
 
@@ -202,6 +226,14 @@ std::unique_ptr<ModelBackend> create_backend(
             "[backend_factory] resolved plan does not match target placement\n");
         return nullptr;
     }
+    const MoeStoragePolicyResolution current_storage =
+        resolve_requested_moe_storage(args);
+    if (!current_storage.ok() ||
+        current_storage.policy != plan.moe_storage_policy()) {
+        std::fprintf(stderr,
+            "[backend_factory] resolved plan does not match MoE storage policy\n");
+        return nullptr;
+    }
 
     const std::string & arch = plan.arch();
     if (arch.empty()) {
@@ -215,8 +247,10 @@ std::unique_ptr<ModelBackend> create_backend(
 
     // Recheck at the construction boundary in case raw arguments changed
     // after preparation. No entry point can dispatch an incoherent request.
+    BackendArgs effective_args = args;
+    effective_args.moe_storage = plan.moe_storage_policy();
     const std::string incompatible = check_feature_compatibility(
-        args,
+        effective_args,
         plan.features(),
         arch,
         plan.target_backend(),
@@ -414,6 +448,7 @@ std::unique_ptr<ModelBackend> create_backend(
             cfg.expert_top_k = args.ds4_expert_top_k;
             cfg.fused_decode = args.ds4_fused_decode;
             cfg.prefill_mode = args.ds4_prefill_mode;
+            cfg.moe_storage = plan.moe_storage_policy();
 
             auto backend = std::make_unique<DeepSeek4Backend>(cfg);
             if (!backend->init()) {
@@ -443,6 +478,7 @@ std::unique_ptr<ModelBackend> create_backend(
         cfg.model_path = args.model_path;
         cfg.device = args.device;
         cfg.stream_fd = args.stream_fd;
+        cfg.moe_storage = plan.moe_storage_policy();
 
         auto backend = std::make_unique<KimiK3Backend>(cfg);
         if (!backend->init()) {

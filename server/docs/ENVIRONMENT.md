@@ -32,7 +32,8 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `DFLASH_MOE_PLACEMENT` | unset | BURN-IN: offline placement JSON; listed experts belong to the primary owner. |
 | `DFLASH_MOE_PRIMARY_SHARE_PER_MILLE` | 500 | BURN-IN: deterministic primary route share when no explicit placement is supplied. |
 | `DFLASH_MOE_DUAL_STREAM_TRACE` | unset | DEBUG: per-layer dual-owner route counts and branch/wall timings. |
-| `DFLASH_MOE_NVME_COLD_TIER` | auto | BURN-IN: DeepSeek4 cold-capacity policy (`auto`, `on`, `off`) for dual-device and Strix-only execution. |
+| `DFLASH_MOE_STORAGE` | auto | Routed-MoE storage policy (`auto`, `resident`, `ssd`); prefer `--moe-storage`, which takes precedence. |
+| `DFLASH_MOE_NVME_COLD_TIER` | unset | DEPRECATED: DeepSeek compatibility alias (`auto`, `on`, `off`). |
 | `DFLASH_MOE_NVME_*` | tuned defaults | BURN-IN: bounded MoE SSD scheduler/backend controls; see `MOE_NVME_STREAMING.md`. |
 | `GGML_CUDA_BATCH_PEER_COPIES` | unset | BURN-IN: publish ordered HIP peer copies with one cross-device dependency per source/destination pair. |
 | `DFLASH_MOE_PREFILL_PERSISTENT_OWNER_ALLOC` | 1 for qualified long heterogeneous prefill | KILL SWITCH: =0 restores per-layer route/owner scratch allocation. |

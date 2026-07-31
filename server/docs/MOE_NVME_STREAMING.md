@@ -91,6 +91,25 @@ weight masks reconstruct the original route batch exactly.
 The native model router remains authoritative. Prediction may only issue a
 bounded prefetch; a wrong prediction cannot change model output.
 
+## Storage policy
+
+The native server exposes one model-neutral operator policy:
+
+```bash
+--moe-storage auto|resident|ssd
+```
+
+- `auto` preserves the model adapter's capacity-safe default and uses SSD when
+  the qualified adapter determines it is required.
+- `resident` prohibits SSD expert execution and may fail allocation when the
+  routed weights do not fit available GPU/host memory.
+- `ssd` forces the complete SSD-to-GPU capacity path. Startup fails before
+  model allocation when the architecture or placement lacks that path.
+
+CLI wins over `DFLASH_MOE_STORAGE`, which wins over the deprecated
+`DFLASH_MOE_NVME_COLD_TIER` compatibility variable. Invalid values fail fast;
+the resolved value and source are printed in the server configuration banner.
+
 ## DeepSeek V4 Flash activation
 
 The existing heterogeneous mode is required. In `auto` mode, SSD streaming is
@@ -102,14 +121,13 @@ export DFLASH_DS4_MOE_TP=1
 export DFLASH_DS4_MOE_TP_INPROC=1
 export DFLASH_DS4_MOE_TP_GPU=1
 export DFLASH_EXPERT_BUDGET_MB=11700
-export DFLASH_MOE_NVME_COLD_TIER=auto
 
 ./build-hip-dual/dflash_server /path/to/model.gguf \
-  --target-device hip:0 --peer-access
+  --target-device hip:0 --peer-access --moe-storage auto
 ```
 
-`DFLASH_MOE_NVME_COLD_TIER=on` forces the capacity tier for qualification;
-`off` requires the old resident-cold path. In `auto`, a model that exceeds
+`--moe-storage ssd` forces the capacity tier for qualification;
+`resident` requires the old resident-cold path. In `auto`, a model that exceeds
 Strix receives all currently usable memory (after reserve) as its adaptive
 expert-cache budget, and only the remainder spills to SSD.
 
@@ -120,13 +138,12 @@ exposes its GPU as `hip:0`:
 
 ```bash
 unset DFLASH_DS4_MOE_TP DFLASH_DS4_MOE_TP_INPROC DFLASH_DS4_MOE_TP_GPU
-export DFLASH_MOE_NVME_COLD_TIER=on
 
 ./build-hip/dflash_server /path/to/model.gguf \
-  --target-device hip:0 --max-ctx 8192
+  --target-device hip:0 --max-ctx 8192 --moe-storage ssd
 ```
 
-`on` keeps at least one expert per layer in the SSD tier even if the model
+`ssd` keeps at least one expert per layer in the SSD tier even if the model
 would otherwise be fully resident, making the path directly testable. For a
 model that genuinely exceeds UMA, `auto` chooses the partial placement itself.
 `DFLASH_EXPERT_BUDGET_MB` can additionally cap static routed-weight residency;
@@ -143,7 +160,7 @@ export DFLASH_MOE_NVME_BACKEND=auto
 
 ./build-hip/dflash_server \
   /path/to/Kimi-K3-UD-IQ1_S-00001-of-00014.gguf \
-  --target-device hip:0 --max-ctx 8192
+  --target-device hip:0 --max-ctx 8192 --moe-storage auto
 ```
 
 No DeepSeek MoE-TP variables are required. Cache memory is chosen only after
@@ -186,6 +203,8 @@ not improve the qualified P310 drive and consumes extra pinned/system memory.
 
 | Variable | Default | Meaning |
 |---|---:|---|
+| `DFLASH_MOE_STORAGE` | `auto` | Environment equivalent of `--moe-storage`; CLI takes precedence |
+| `DFLASH_MOE_NVME_COLD_TIER` | unset | Deprecated DeepSeek compatibility alias (`auto`, `on`, `off`) |
 | `DFLASH_MOE_NVME_BACKEND` | `auto` | `auto`, `uring`, `pread`, or `mmap` |
 | `DFLASH_MOE_NVME_DIRECT` | `auto` | `auto`, `on`, or `off` |
 | `DFLASH_MOE_NVME_SLOTS` | `8` | Fixed pinned host slots |

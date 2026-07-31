@@ -2,6 +2,7 @@
 
 #include "common/model_backend.h"
 #include "common/moe_hybrid_stream.h"
+#include "common/moe_storage_policy.h"
 #include "kimi_k3_internal.h"
 #include "placement/placement_config.h"
 
@@ -19,9 +20,9 @@ struct KimiK3BackendConfig {
     // routed work is partitioned between both GPUs while dense KDA/MLA,
     // recurrent state, and sampling remain primary-owned.
     int expert_gpu = -1;
-    // Production Kimi uses file-backed routed experts. The resident mode is
+    // Auto uses Kimi's capacity-safe file-backed routed experts. Resident is
     // retained as a deterministic oracle for small architecture fixtures.
-    bool stream_routed_experts = true;
+    MoeStoragePolicy moe_storage = MoeStoragePolicy::Auto;
 };
 
 class KimiK3Backend final : public ModelBackend {

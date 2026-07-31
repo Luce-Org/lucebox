@@ -24,6 +24,7 @@
 
 #include "internal.h"
 #include "common/layer_split_utils.h"
+#include "common/moe_storage_policy.h"
 #include "common/prefill_attention_mode.h"
 
 namespace dflash::common {
@@ -309,6 +310,7 @@ struct DeepSeek4BackendConfig {
     int          max_ctx      = 0;     // 0 = auto from SWA + compression capacity
     int          expert_top_k = 0;     // 0 = use all model-routed experts
     bool         fused_decode = false; // single-graph GPU decode
+    MoeStoragePolicy moe_storage = MoeStoragePolicy::Auto;
 };
 
 // ─── Function declarations ──────────────────────────────────────────────

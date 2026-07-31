@@ -55,6 +55,7 @@ struct ArchCapabilities {
     FeatureSupport verify_width;  // --verify-width
     FeatureSupport fa_window;     // --fa-window
     FeatureSupport draft_swa;     // --draft-swa
+    FeatureSupport moe_ssd_storage; // --moe-storage ssd
 };
 
 inline constexpr FeatureSupport kNever = FeatureSupport::Never;
@@ -62,14 +63,14 @@ inline constexpr FeatureSupport kMono  = FeatureSupport::Monolithic;
 inline constexpr FeatureSupport kBoth  = FeatureSupport::Both;
 
 inline constexpr ArchCapabilities kArchCapabilities[] = {
-//   arch          split  rdraft pflash offload  draft  ddtree vwidth fa_win dswa
-    {"qwen35",     true,  true,  true,  false,   kBoth, kBoth, kNever, kBoth, kBoth},
-    {"qwen35moe",  false, false, false, true,    kMono, kMono, kNever, kMono, kMono},
-    {"laguna",     true,  false, false, true,    kMono, kMono, kMono,  kNever, kNever},
-    {"qwen3",      false, false, true,  false,   kNever, kNever, kNever, kNever, kNever},
-    {"gemma4",     true,  false, false, false,   kMono, kNever, kNever, kBoth, kNever},
-    {"deepseek4",  true,  false, false, false,   kNever, kNever, kNever, kNever, kNever},
-    {"kimi-k3",    false, false, false, false,   kNever, kNever, kNever, kNever, kNever},
+//   arch          split  rdraft pflash offload  draft  ddtree vwidth fa_win dswa   moe-ssd
+    {"qwen35",     true,  true,  true,  false,   kBoth, kBoth, kNever, kBoth, kBoth, kNever},
+    {"qwen35moe",  false, false, false, true,    kMono, kMono, kNever, kMono, kMono, kNever},
+    {"laguna",     true,  false, false, true,    kMono, kMono, kMono,  kNever, kNever, kNever},
+    {"qwen3",      false, false, true,  false,   kNever, kNever, kNever, kNever, kNever, kNever},
+    {"gemma4",     true,  false, false, false,   kMono, kNever, kNever, kBoth, kNever, kNever},
+    {"deepseek4",  true,  false, false, false,   kNever, kNever, kNever, kNever, kNever, kMono},
+    {"kimi-k3",    false, false, false, false,   kNever, kNever, kNever, kNever, kNever, kMono},
 };
 
 inline constexpr std::size_t kArchCount =
@@ -107,7 +108,8 @@ constexpr bool row_has_both(const ArchCapabilities & c) {
            c.ddtree       == FeatureSupport::Both ||
            c.verify_width == FeatureSupport::Both ||
            c.fa_window    == FeatureSupport::Both ||
-           c.draft_swa    == FeatureSupport::Both;
+           c.draft_swa    == FeatureSupport::Both ||
+           c.moe_ssd_storage == FeatureSupport::Both;
 }
 
 constexpr bool table_rows_named() {
@@ -234,6 +236,12 @@ inline bool arch_supports_fa_window(const std::string & arch,
 inline bool arch_supports_draft_swa(const std::string & arch,
                                     bool is_layer_split) {
     return detail::arch_has(arch, &ArchCapabilities::draft_swa, is_layer_split);
+}
+
+inline bool arch_supports_moe_ssd_storage(const std::string & arch,
+                                          bool split_dispatch) {
+    return detail::arch_has(
+        arch, &ArchCapabilities::moe_ssd_storage, split_dispatch);
 }
 
 }  // namespace dflash::common

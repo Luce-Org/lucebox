@@ -40,29 +40,6 @@ static bool env_flag_enabled(const char * name) {
     return value && value[0] && std::strcmp(value, "0") != 0;
 }
 
-enum class MoeNvmeColdTierMode {
-    Auto,
-    Enabled,
-    Disabled,
-    Invalid,
-};
-
-static MoeNvmeColdTierMode moe_nvme_cold_tier_mode() {
-    const char * value = std::getenv("DFLASH_MOE_NVME_COLD_TIER");
-    if (!value || !value[0] || std::strcmp(value, "auto") == 0) {
-        return MoeNvmeColdTierMode::Auto;
-    }
-    if (std::strcmp(value, "1") == 0 || std::strcmp(value, "on") == 0 ||
-        std::strcmp(value, "true") == 0) {
-        return MoeNvmeColdTierMode::Enabled;
-    }
-    if (std::strcmp(value, "0") == 0 || std::strcmp(value, "off") == 0 ||
-        std::strcmp(value, "false") == 0) {
-        return MoeNvmeColdTierMode::Disabled;
-    }
-    return MoeNvmeColdTierMode::Invalid;
-}
-
 static void configure_gfx1151_dspark_mmvq_default(int gpu) {
 #if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
     if (!env_flag_enabled("DFLASH_DS4_SPEC") ||
@@ -549,7 +526,7 @@ bool DeepSeek4Backend::load_model() {
     const bool force_full = env_flag_enabled("DFLASH_DS4_FORCE_FULL_LOAD");
     const bool heterogeneous_tp = env_flag_enabled("DFLASH_DS4_MOE_TP");
     const bool explicit_ssd_capacity =
-        moe_nvme_cold_tier_mode() == MoeNvmeColdTierMode::Enabled;
+        cfg_.moe_storage == MoeStoragePolicy::Ssd;
     const bool need_monolithic =
         requires_monolithic_model() && !heterogeneous_tp && !explicit_ssd_capacity;
     if (target_backend == PlacementBackend::Hip &&
@@ -868,9 +845,9 @@ bool DeepSeek4Backend::compute_uniform_hybrid_placement(const DeepSeek4Weights &
     const bool all_cold = env_flag_enabled("DFLASH_DS4_MOE_TP_ALL_COLD");
     int hot_per_layer = all_cold ? 0 : budget.max_hot_per_layer;
     if (!all_cold &&
-        moe_nvme_cold_tier_mode() == MoeNvmeColdTierMode::Enabled &&
+        cfg_.moe_storage == MoeStoragePolicy::Ssd &&
         hot_per_layer >= w.n_expert) {
-        // `on` is also a qualification switch. Keep one exact expert per
+        // `ssd` is also a qualification switch. Keep one exact expert per
         // layer in the SSD tier when the whole model would otherwise fit, so
         // a single-Strix user can exercise the real path without inventing a
         // fragile machine-specific memory cap. `auto` still prefers full
@@ -951,19 +928,13 @@ bool DeepSeek4Backend::init_hybrid_model() {
     const bool inprocess_tp =
         tp_requested && ds4_inprocess_moe_tp_enabled();
     const bool external_tp = tp_requested && !inprocess_tp;
-    MoeNvmeColdTierMode nvme_mode = moe_nvme_cold_tier_mode();
-    if (nvme_mode == MoeNvmeColdTierMode::Invalid) {
-        std::fprintf(stderr,
-            "[deepseek4] ignoring invalid DFLASH_MOE_NVME_COLD_TIER; using auto\n");
-        nvme_mode = MoeNvmeColdTierMode::Auto;
-    }
-
     // A partially resident single-GPU model streams its non-resident experts
     // on the same device. In-process TP instead streams them on the expert GPU;
     // external TP leaves them to the remote worker and does not start a local
-    // SSD service. `off` explicitly selects the older materialized CPU tail.
+    // SSD service. `resident` explicitly selects the older materialized CPU
+    // tail.
     bool stream_cold = !external_tp &&
-        nvme_mode != MoeNvmeColdTierMode::Disabled;
+        cfg_.moe_storage != MoeStoragePolicy::Resident;
     if (inprocess_tp) {
         const int expert_gpu = ds4_moe_tp_gpu(cfg_.device.gpu);
         if (expert_gpu < 0) return false;
@@ -989,8 +960,8 @@ bool DeepSeek4Backend::init_hybrid_model() {
 
         // On a separate expert GPU, auto mode retains the established fully
         // resident path whenever the cold stack fits after a conservative
-        // reserve. Explicit on/off remain authoritative.
-        if (nvme_mode == MoeNvmeColdTierMode::Auto) {
+        // reserve. Explicit ssd/resident modes remain authoritative.
+        if (cfg_.moe_storage == MoeStoragePolicy::Auto) {
             Ds4ExpertMemoryInfo info;
             std::string memory_error;
             size_t expert_free = 0;

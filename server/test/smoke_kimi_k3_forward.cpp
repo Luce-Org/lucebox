@@ -37,8 +37,9 @@ int main(int argc, char ** argv) {
     config.model_path = model;
     config.device.gpu = gpu;
     config.device.max_ctx = 4096;
-    config.stream_routed_experts =
-        argc <= 5 || std::atoi(argv[5]) != 0;
+    config.moe_storage = argc <= 5 || std::atoi(argv[5]) != 0
+        ? MoeStoragePolicy::Ssd
+        : MoeStoragePolicy::Resident;
     config.expert_gpu = argc > 6 ? std::atoi(argv[6]) : -1;
     KimiK3Backend backend(config);
     if (!backend.init()) return 1;
