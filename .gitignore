@@ -78,6 +78,7 @@ fix-plan.md
 
 # Harness test artifacts
 .harness-work/
+.formal-results/
 health
 
 # lucebox host-side generated config + benchmark output
