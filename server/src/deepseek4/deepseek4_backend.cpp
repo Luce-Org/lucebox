@@ -117,12 +117,25 @@ static bool ds4_inprocess_moe_tp_enabled() {
 }
 
 static int ds4_moe_tp_gpu(int local_gpu) {
-    const char * raw = std::getenv("DFLASH_DS4_MOE_TP_GPU");
-    if (!raw || !*raw) {
-        raw = std::getenv("DFLASH_MOE_EXPERT_COMPUTE_IPC_GPU");
+    const char * generic = std::getenv("DFLASH_MOE_TP_GPU");
+    const char * legacy_ds4 = std::getenv("DFLASH_DS4_MOE_TP_GPU");
+    const char * legacy_ipc =
+        std::getenv("DFLASH_MOE_EXPERT_COMPUTE_IPC_GPU");
+    const bool configured =
+        (generic && *generic) || (legacy_ds4 && *legacy_ds4) ||
+        (legacy_ipc && *legacy_ipc);
+    const int default_peer = local_gpu == 0 ? 1 : 0;
+    MoeExpertOwnerPlacement owner;
+    std::string error;
+    if (!resolve_moe_expert_owner_placement(
+            local_gpu, configured ? -1 : default_peer,
+            owner, &error)) {
+        std::fprintf(stderr,
+                     "[deepseek4-moe-tp] invalid expert owner: %s\n",
+                     error.c_str());
+        return -1;
     }
-    if (raw && *raw) return std::max(0, std::atoi(raw));
-    return local_gpu == 0 ? 1 : 0;
+    return owner.expert_gpu;
 }
 
 static double gib(uint64_t bytes) {
@@ -789,6 +802,8 @@ bool DeepSeek4Backend::init_moe_tensor_parallel() {
     }
 
     if (ds4_inprocess_moe_tp_enabled()) {
+        const int expert_gpu = ds4_moe_tp_gpu(cfg_.device.gpu);
+        if (expert_gpu < 0) return false;
         const bool resident_ready = moe_hybrid_->materialized_cold_experts &&
                                     moe_hybrid_->cold_backend == expert_backend_;
         const bool streamed_ready = !moe_hybrid_->materialized_cold_experts &&
@@ -804,7 +819,7 @@ bool DeepSeek4Backend::init_moe_tensor_parallel() {
                      "[deepseek4-moe-tp] enabled mode=%s local_gpu=%d "
                      "expert_gpu=%d local_experts=%d remote_experts=%d\n",
                      streamed_ready ? "in-process+ssd" : "in-process",
-                     cfg_.device.gpu, ds4_moe_tp_gpu(cfg_.device.gpu),
+                     cfg_.device.gpu, expert_gpu,
                      moe_placement_.total_hot,
                      w_.n_layer * w_.n_expert - moe_placement_.total_hot);
         return true;
@@ -951,6 +966,7 @@ bool DeepSeek4Backend::init_hybrid_model() {
         nvme_mode != MoeNvmeColdTierMode::Disabled;
     if (inprocess_tp) {
         const int expert_gpu = ds4_moe_tp_gpu(cfg_.device.gpu);
+        if (expert_gpu < 0) return false;
         if (expert_gpu == cfg_.device.gpu) {
             std::fprintf(stderr,
                          "[deepseek4-moe-tp] in-process expert GPU must differ from local GPU\n");

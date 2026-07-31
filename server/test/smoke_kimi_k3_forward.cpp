@@ -11,7 +11,7 @@ int main(int argc, char ** argv) {
     if (argc < 2) {
         std::fprintf(stderr,
             "usage: %s <kimi-k3.gguf> [gpu=0] [n_gen=16] [prompt] "
-            "[stream_experts=1]\n",
+            "[stream_experts=1] [expert_gpu=-1]\n",
             argv[0]);
         return 2;
     }
@@ -39,6 +39,7 @@ int main(int argc, char ** argv) {
     config.device.max_ctx = 4096;
     config.stream_routed_experts =
         argc <= 5 || std::atoi(argv[5]) != 0;
+    config.expert_gpu = argc > 6 ? std::atoi(argv[6]) : -1;
     KimiK3Backend backend(config);
     if (!backend.init()) return 1;
 

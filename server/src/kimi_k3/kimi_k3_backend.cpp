@@ -1,5 +1,6 @@
 #include "kimi_k3_backend.h"
 
+#include "common/moe_hybrid_placement.h"
 #include "common/sampler.h"
 #include "dflash27b.h"
 
@@ -33,6 +34,14 @@ KimiK3Backend::~KimiK3Backend() {
     shutdown();
 }
 
+void KimiK3Backend::release_expert_backend() {
+    if (expert_backend_) {
+        ggml_backend_free(expert_backend_);
+        expert_backend_ = nullptr;
+    }
+    expert_gpu_ = -1;
+}
+
 bool KimiK3Backend::init_streaming() {
     if (!weights_.routed_experts_streamed ||
         weights_.streamed_layer_regions.empty() ||
@@ -41,6 +50,35 @@ bool KimiK3Backend::init_streaming() {
                      "[kimi-k3] routed expert streaming metadata is incomplete\n");
         return false;
     }
+
+    MoeExpertOwnerPlacement owner;
+    std::string error;
+    if (!resolve_moe_expert_owner_placement(
+            cfg_.device.primary_gpu(), cfg_.expert_gpu,
+            owner, &error)) {
+        std::fprintf(stderr,
+                     "[kimi-k3] invalid expert-owner placement: %s\n",
+                     error.c_str());
+        return false;
+    }
+    expert_gpu_ = owner.expert_gpu;
+    if (owner.heterogeneous()) {
+        expert_backend_ = ggml_backend_cuda_init(expert_gpu_);
+        if (!expert_backend_) {
+            std::fprintf(stderr,
+                         "[kimi-k3] expert backend init failed for device %d\n",
+                         expert_gpu_);
+            expert_gpu_ = -1;
+            return false;
+        }
+    }
+    ggml_backend_t stream_backend =
+        expert_backend_ ? expert_backend_ : backend_;
+    auto fail_streaming = [&]() {
+        stream_engine_.destroy();
+        release_expert_backend();
+        return false;
+    };
 
     MoeStreamConfig stream_config = MoeStreamConfig::from_env();
     size_t routed_pool_bytes = 0;
@@ -75,7 +113,7 @@ bool KimiK3Backend::init_streaming() {
         size_t free_bytes = 0;
         size_t total_bytes = 0;
         ggml_backend_cuda_get_device_memory(
-            cfg_.device.primary_gpu(), &free_bytes, &total_bytes);
+            expert_gpu_, &free_bytes, &total_bytes);
         const size_t gib = 1024ULL * 1024ULL * 1024ULL;
         const size_t reserve = std::max<size_t>(2 * gib, total_bytes / 20);
         stream_config.device_cache_bytes =
@@ -93,14 +131,13 @@ bool KimiK3Backend::init_streaming() {
         stream_config.device_cache_bytes =
             std::min(stream_config.device_cache_bytes, routed_pool_bytes);
     }
-    std::string error;
     if (!stream_engine_.init(
-            backend_, weights_.max_streamed_expert_bytes,
+            stream_backend, weights_.max_streamed_expert_bytes,
             stream_config, &error)) {
         std::fprintf(stderr,
                      "[kimi-k3] stream engine initialization failed: %s\n",
                      error.c_str());
-        return false;
+        return fail_streaming();
     }
 
     std::vector<int> descriptors;
@@ -124,8 +161,7 @@ bool KimiK3Backend::init_streaming() {
                 ::close(opened);
 #endif
             }
-            stream_engine_.destroy();
-            return false;
+            return fail_streaming();
         }
         uint64_t shard_bytes = 0;
 #if defined(_WIN32)
@@ -156,8 +192,7 @@ bool KimiK3Backend::init_streaming() {
                 ::close(opened);
 #endif
             }
-            stream_engine_.destroy();
-            return false;
+            return fail_streaming();
         }
         descriptors.push_back(fd);
         sources.push_back({
@@ -176,15 +211,15 @@ bool KimiK3Backend::init_streaming() {
         std::fprintf(stderr,
                      "[kimi-k3] stream source binding failed: %s\n",
                      error.c_str());
-        stream_engine_.destroy();
-        return false;
+        return fail_streaming();
     }
     std::fprintf(stderr,
         "[kimi-k3] routed experts file-backed: shards=%zu layers=%zu "
-        "io=%s cache=%.2f GiB\n",
+        "io=%s primary_gpu=%d expert_gpu=%d cache=%.2f GiB\n",
         weights_.shard_paths.size(),
         weights_.streamed_layer_regions.size(),
         stream_engine_.io_backend_name(),
+        cfg_.device.primary_gpu(), expert_gpu_,
         static_cast<double>(stream_engine_.device_cache_bytes()) /
             (1024.0 * 1024.0 * 1024.0));
     return true;
@@ -217,9 +252,11 @@ bool KimiK3Backend::init() {
     if (weights_.routed_experts_streamed && !init_streaming()) return false;
     std::fprintf(stderr,
         "[kimi-k3] native backend ready on device %d (max_ctx=%d, "
-        "experts=%s, correctness-first sequential prefill)\n",
+        "experts=%s:%d, correctness-first sequential prefill)\n",
         cfg_.device.primary_gpu(), max_ctx,
-        weights_.routed_experts_streamed ? "nvme" : "resident");
+        weights_.routed_experts_streamed ? "nvme" : "resident",
+        weights_.routed_experts_streamed ? expert_gpu_
+                                          : cfg_.device.primary_gpu());
     std::fflush(stderr);
     return true;
 }
@@ -236,6 +273,7 @@ bool KimiK3Backend::park(ParkTarget target) {
     if (!park_target_includes_target_model(target)) return false;
     if (!parked_) {
         stream_engine_.destroy();
+        release_expert_backend();
         free_kimi_k3_weights(weights_);
         parked_ = true;
     }
@@ -391,6 +429,7 @@ bool KimiK3Backend::handle_compress(const std::string & line,
 
 void KimiK3Backend::shutdown() {
     stream_engine_.destroy();
+    release_expert_backend();
     free_kimi_k3_cache(cache_);
     free_kimi_k3_weights(weights_);
     if (backend_) {

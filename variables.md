@@ -217,6 +217,7 @@ Untagged variables are operational tuning knobs.
 
 | Variable | Purpose |
 |---|---|
+| `DFLASH_MOE_TP_GPU` | Model-neutral HIP device that owns routed-expert cache and compute; Kimi uses the primary device when unset. |
 | `DFLASH_MOE_HYBRID_PREFILL_EAGER` / `DFLASH_MOE_PREFILL_TRACE` | Model-neutral heterogeneous prefill policy and tracing. The legacy `DFLASH_DS4_*` spellings remain aliases. |
 | `DFLASH_MOE_TP_GROUPED_MMVQ` / `DFLASH_MOE_TP_FUSED_GATE_UP` | Model-neutral grouped and fused routed-FFN kernel qualification switches. The legacy `DFLASH_DS4_*` spellings remain aliases. |
 | `DFLASH_MOE_TP_COARSE_OWNER` / `DFLASH_MOE_TP_COARSE_OWNER_SPLIT` | Model-neutral owner-op lowering switches. The legacy `DFLASH_DS4_*` spellings remain aliases. |

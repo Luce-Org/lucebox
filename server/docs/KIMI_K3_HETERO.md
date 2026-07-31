@@ -29,6 +29,10 @@ small architecture adapter around it:
   are allocated. It reserves the larger of 2 GiB or 5% of device memory and is
   capped by the actual routed pool, so a tiny model cannot accidentally request
   a model-sized cache.
+- Routed-expert ownership is independent of contiguous layer splitting.
+  `DFLASH_MOE_TP_GPU` can place the SSD slots, adaptive cache, and selected
+  expert graphs on a second HIP device while KDA/MLA, recurrent/KV state,
+  shared experts, and sampling remain on the primary device.
 - `bench_kimi_k3_hetero` runs Kimi's exact IQ1_S routed-expert geometry through
   the same model-neutral persistent evaluator used by production adapters:
   896 experts, top-16, 92 MoE layers,
@@ -45,10 +49,9 @@ The SSD text path is implemented, but two qualification boundaries remain:
 
 - The backend is correctness-first and token-sequential. Its per-layer graph
   boundaries are not yet fused/captured for full-model speed.
-- Kimi currently places resident text tensors and streamed expert compute on
-  one selected GPU. Strix-only is supported directly. Splitting Kimi's dense
-  tensors onto R9700 while Strix owns streamed experts is a later performance
-  adapter, not a requirement for SSD capacity correctness.
+- The heterogeneous path currently crosses a host-visible, activation-sized
+  boundary at every routed layer. It is correct on two devices but does not
+  yet use PR-505's device-resident owner fork/join and overlap.
 
 The vision encoder is out of scope for this text-only path.
 
@@ -126,18 +129,19 @@ a cache only helps in proportion to its share of the 495 GiB routed pool.
 
 The machine has about 125.08 GiB of system/UMA memory plus 31.86 GiB on the
 R9700, or 156.94 GiB of unique physical weight capacity before runtime
-reserves. The implemented capacity-safe starting point is:
+reserves. The implemented capacity-safe Strix-only starting point is:
 
 1. Strix/system memory: all non-routed text weights, shared experts, latent
    projections, recurrent/KV state, workspace, and the routed-expert cache.
 2. NVMe: all routed expert stacks, with actual route misses read directly into
    pinned slots and evaluated on Strix.
 
-This works unchanged on a Strix-only machine. On a full Lucebox the R9700 is
-currently unused by the Kimi adapter; moving dense KDA/MLA work there is the
-next throughput optimization. The common SSD runtime already supports a
-different compute owner, but Kimi still needs device-aware resident allocation
-and cache ownership before that placement is correct end to end.
+This works unchanged on a Strix-only machine. A full Lucebox can additionally
+assign the R9700 as the routed-expert owner with `DFLASH_MOE_TP_GPU`, moving
+the adaptive expert cache and selected expert compute off Strix. That uses the
+second device's memory, but the measured R9700 cold-storage path is slower, so
+it is a capacity option rather than the default speed profile. The inverse
+placement is also supported when a model's non-routed tensors fit on R9700.
 
 After approximately 57.94 GiB of non-routed weights plus OS, workspace, and a
 moderate context reserve, roughly 70-85 GiB may remain for routed experts.
@@ -164,9 +168,8 @@ router. Full-scale qualification requires:
    chosen context budget.
 3. Compare end-to-end output and token rate against ordinary llama.cpp
    CPU/GPU offload.
-4. Only after that baseline, place dense attention on R9700 and the
-   latent/shared/routed MoE path on Strix, retaining activation-sized transfers
-   at the boundary.
+4. Only after that baseline, replace the correctness-first host boundary with
+   a device-resident owner fork/join and overlap dense work with expert service.
 
 The full 594 GB model cannot currently be staged on the qualification box,
 which currently has about 513 GB free. It needs at least about 650 GB of safe

@@ -14,6 +14,10 @@ struct KimiK3BackendConfig {
     const char * model_path = nullptr;
     DevicePlacement device;
     int stream_fd = -1;
+    // -1 resolves DFLASH_MOE_TP_GPU and otherwise keeps experts on the
+    // primary GPU. A different GPU owns streamed weights/cache/compute while
+    // dense KDA/MLA, recurrent state, and sampling remain primary-owned.
+    int expert_gpu = -1;
     // Production Kimi uses file-backed routed experts. The resident mode is
     // retained as a deterministic oracle for small architecture fixtures.
     bool stream_routed_experts = true;
@@ -49,6 +53,7 @@ public:
 
 private:
     bool init_streaming();
+    void release_expert_backend();
 
     int32_t choose_token(const std::vector<float> & logits,
                          const SamplerCfg & sampler,
@@ -56,6 +61,8 @@ private:
 
     KimiK3BackendConfig cfg_;
     ggml_backend_t backend_ = nullptr;
+    ggml_backend_t expert_backend_ = nullptr;
+    int expert_gpu_ = -1;
     KimiK3Weights weights_;
     KimiK3Cache cache_;
     MoeHybridStreamEngine stream_engine_;

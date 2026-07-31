@@ -139,8 +139,25 @@ the complete routed pool. `DFLASH_MOE_NVME_DEVICE_CACHE_MB` remains an explicit
 override, also capped by the routed pool.
 
 Kimi's native router remains authoritative. The current text backend is
-correctness-first and sequential; multi-device dense placement, captured
-per-layer graphs, and the vision tower are separate optimizations.
+correctness-first and sequential; captured per-layer graphs and the vision
+tower are separate optimizations.
+
+On a two-GPU Lucebox, the primary device still owns KDA/MLA and model state;
+the optional expert device owns the SSD slots, adaptive cache, and selected
+expert graphs:
+
+```bash
+export DFLASH_MOE_TP_GPU=<expert-gpu>
+
+./build-hip-dual/dflash_server \
+  /path/to/Kimi-K3-UD-IQ1_S-00001-of-00014.gguf \
+  --target-device hip:<primary-gpu> --max-ctx 8192
+```
+
+This is functional expert ownership, not a contiguous layer split, so do not
+use `--target-devices`. Leaving `DFLASH_MOE_TP_GPU` unset preserves the
+Strix-only path. The current Kimi boundary uses activation-sized host staging;
+device-resident peer fork/join is a later throughput optimization.
 
 ## Tuning and diagnostics
 
@@ -160,6 +177,7 @@ not improve the qualified P310 drive and consumes extra pinned/system memory.
 | `DFLASH_MOE_NVME_DEVICE_CACHE_MB` | automatic/`0` | Override adaptive device expert-cache memory; `0` leaves only pipeline slots |
 | `DFLASH_MOE_NVME_GRAPH_CACHE` | `8` | Persistent expert-graph variants retained per stream engine; `0` is a diagnostic no-cache mode |
 | `DFLASH_MOE_NVME_REFERENCE_EVAL` | unset | Diagnostic only: `1` restores the allocation-heavy reference evaluator for numerical/performance A/B |
+| `DFLASH_MOE_TP_GPU` | primary GPU | Optional second GPU that owns streamed expert cache and compute |
 
 Shutdown telemetry reports logical and physical bytes, measured read service
 rate, cache hits, demand wait, de-duplication, dropped speculation, errors, and
@@ -172,8 +190,9 @@ targets `test_moe_nvme_scheduler`, `bench_moe_nvme_io`, and
 SSD-to-GPU path. Benchmarks are read-only.
 
 The external `smoke_kimi_k3_forward` target accepts
-`[stream_experts=0|1]`. This is an A/B oracle for small Kimi fixtures; production
-Kimi uses `1`.
+`[stream_experts=0|1] [expert_gpu=-1]`. This is an A/B and placement oracle for
+small Kimi fixtures; production Kimi uses streaming and `-1` resolves the
+environment/default owner.
 
 ## Qualification result (2026-07-30)
 
