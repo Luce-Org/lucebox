@@ -192,6 +192,7 @@ not improve the qualified P310 drive and consumes extra pinned/system memory.
 | `DFLASH_MOE_NVME_IO_THREADS` | `4` | Portable pread workers |
 | `DFLASH_MOE_NVME_DEMAND_RESERVE` | `2` | Slots unavailable to speculation |
 | `DFLASH_MOE_NVME_PREFETCH_BATCH` | `2` | Maximum speculative jobs per ring submission |
+| `DFLASH_MOE_NVME_DEMAND_TIMEOUT_MS` | `30000` | Maximum wait for a demanded expert; `0` disables the guard |
 | `DFLASH_MOE_NVME_DEVICE_SLOTS` | `2` | Minimum rotating GPU expert buffers |
 | `DFLASH_MOE_NVME_DEVICE_CACHE_MB` | automatic/`0` | Override adaptive device expert-cache memory; `0` leaves only pipeline slots |
 | `DFLASH_MOE_NVME_GRAPH_CACHE` | `8` | Persistent expert-graph variants retained per stream engine; `0` is a diagnostic no-cache mode |
@@ -202,8 +203,11 @@ not improve the qualified P310 drive and consumes extra pinned/system memory.
 | `DFLASH_MOE_DUAL_STREAM_TRACE` | unset | Debug per-layer owner counts and branch/wall timing |
 
 Shutdown telemetry reports logical and physical bytes, measured read service
-rate, cache hits, demand wait, de-duplication, dropped speculation, errors, and
-persistent-graph builds/hits/evictions. `test_moe_stream_compute` generates
+rate, cache hits, demand wait/timeouts, de-duplication, dropped speculation,
+errors, and persistent-graph builds/hits/evictions. The scheduler rejects
+truncated shards at bind time and accepts a valid short direct-I/O completion
+only when it covers the complete logical payload at an unaligned file tail.
+`test_moe_stream_compute` generates
 tiny experts and checks both tensor-major and expert-major GPU results against
 a CPU oracle. It defaults to GPU 0, so it runs directly on Strix-only systems;
 `DFLASH_TEST_GPU` selects another device on multi-GPU hosts. The standalone

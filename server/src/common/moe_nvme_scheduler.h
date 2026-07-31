@@ -53,6 +53,10 @@ struct MoeNvmeConfig {
     // latency of a demand arriving immediately after speculation was issued.
     int max_prefetch_batch = 2;
 
+    // Bound a demand wait so a failed drive cannot hang an inference worker
+    // forever. Zero disables the timeout for diagnostic use.
+    int demand_timeout_ms = 30000;
+
     size_t direct_alignment = 4096;
 
     // Environment overrides use the DFLASH_MOE_NVME_* prefix. Invalid values
@@ -87,6 +91,9 @@ struct MoeExpertIoSpan {
     size_t io_file_offset = 0;    // aligned direct-I/O start
     size_t io_buffer_offset = 0;  // aligned direct-I/O destination
     size_t io_bytes = 0;          // aligned direct-I/O length
+    // Bytes that must be returned to cover the logical payload. This may be
+    // smaller than io_bytes for the final unaligned page of a model shard.
+    size_t io_required_bytes = 0;
 };
 
 enum class MoeExpertComponentKind : uint8_t {
@@ -163,6 +170,7 @@ struct MoeNvmeStats {
     uint64_t active_io_ns = 0;
     uint64_t read_ns = 0;
     uint64_t wait_ns = 0;
+    uint64_t demand_timeouts = 0;
     uint64_t errors = 0;
 };
 

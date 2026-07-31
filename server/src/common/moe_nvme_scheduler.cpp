@@ -20,6 +20,7 @@
 
 #if defined(_WIN32)
 #include <io.h>
+#include <sys/stat.h>
 #else
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -126,10 +127,17 @@ uint64_t physical_memory_bytes() {
 }
 
 #if !defined(_WIN32)
-bool pread_full(int fd, uint8_t * dst, size_t bytes, size_t offset, std::string & err) {
+bool pread_at_least(int fd, uint8_t * dst, size_t request_bytes,
+                    size_t required_bytes, size_t offset,
+                    size_t & bytes_read, std::string & err) {
+    bytes_read = 0;
+    if (required_bytes > request_bytes) {
+        err = "invalid minimum read length";
+        return false;
+    }
     size_t done = 0;
-    while (done < bytes) {
-        const size_t remaining = bytes - done;
+    while (done < required_bytes) {
+        const size_t remaining = request_bytes - done;
         const size_t chunk = std::min(remaining, (size_t) std::numeric_limits<ssize_t>::max());
         const ssize_t got = ::pread(fd, dst + done, chunk, (off_t) (offset + done));
         if (got < 0) {
@@ -143,6 +151,7 @@ bool pread_full(int fd, uint8_t * dst, size_t bytes, size_t offset, std::string 
         }
         done += (size_t) got;
     }
+    bytes_read = done;
     return true;
 }
 #endif
@@ -380,6 +389,8 @@ MoeNvmeConfig MoeNvmeConfig::from_env(MoeNvmeConfig base) {
         "DFLASH_MOE_NVME_DEMAND_RESERVE", base.demand_reserve, 1, base.host_slots - 1);
     base.max_prefetch_batch = parse_bounded_int(
         "DFLASH_MOE_NVME_PREFETCH_BATCH", base.max_prefetch_batch, 1, base.host_slots);
+    base.demand_timeout_ms = parse_bounded_int(
+        "DFLASH_MOE_NVME_DEMAND_TIMEOUT_MS", base.demand_timeout_ms, 0, 600000);
 
     if (const char * value = std::getenv("DFLASH_MOE_NVME_BACKEND")) {
         const std::string mode = lowercase(value);
@@ -498,6 +509,7 @@ bool make_moe_expert_io_layout(
         span.io_file_offset = aligned_file;
         span.io_buffer_offset = aligned_buffer;
         span.io_bytes = aligned_io_bytes;
+        span.io_required_bytes = raw_io_bytes;
         return true;
     };
 
@@ -668,6 +680,7 @@ struct MoeNvmeScheduler::Impl {
     uint64_t active_io_ns = 0;
     std::atomic<uint64_t> read_ns{0};
     std::atomic<uint64_t> wait_ns{0};
+    std::atomic<uint64_t> demand_timeouts{0};
     std::atomic<uint64_t> errors{0};
 
     void begin_io_activity() {
@@ -791,6 +804,10 @@ struct MoeNvmeScheduler::Impl {
     Admission admit_locked(int layer, int expert, MoeNvmePriority priority,
                            int & slot_out, std::string * err) {
         slot_out = -1;
+        if (stopping) {
+            if (err) *err = "SSD scheduler is stopping";
+            return Admission::Invalid;
+        }
         if (!bound) {
             if (err) *err = "SSD scheduler has no bound model source";
             return Admission::Invalid;
@@ -905,9 +922,16 @@ struct MoeNvmeScheduler::Impl {
 #else
                 const size_t read_offset = direct_active ? span.io_file_offset : span.file_offset;
                 const size_t read_bytes = direct_active ? span.io_bytes : span.bytes;
+                const size_t required_bytes = direct_active
+                    ? span.io_required_bytes : span.bytes;
                 const size_t buffer_offset = direct_active ? span.io_buffer_offset : span.buffer_offset;
-                if (!pread_full(active_fd, base + buffer_offset, read_bytes, read_offset, err)) return false;
-                physical += read_bytes;
+                size_t actual_bytes = 0;
+                if (!pread_at_least(active_fd, base + buffer_offset,
+                                    read_bytes, required_bytes, read_offset,
+                                    actual_bytes, err)) {
+                    return false;
+                }
+                physical += actual_bytes;
 #endif
             }
         }
@@ -969,6 +993,7 @@ struct MoeNvmeScheduler::Impl {
         struct Op {
             size_t job = 0;
             uint32_t expected = 0;
+            uint32_t required = 0;
         };
         struct Progress {
             int pending = 0;
@@ -1018,11 +1043,14 @@ struct MoeNvmeScheduler::Impl {
                     const MoeExpertIoSpan & span = slot.layout.spans[s];
                     const size_t read_offset = direct_active ? span.io_file_offset : span.file_offset;
                     const size_t read_bytes = direct_active ? span.io_bytes : span.bytes;
+                    const size_t required_bytes = direct_active
+                        ? span.io_required_bytes : span.bytes;
                     const size_t buffer_offset = direct_active ? span.io_buffer_offset : span.buffer_offset;
-                    if (read_bytes > std::numeric_limits<uint32_t>::max()) {
+                    if (read_bytes > (size_t) std::numeric_limits<int32_t>::max() ||
+                        required_bytes > read_bytes) {
                         progress[j].ok = false;
                         progress[j].error =
-                            "one expert tensor read exceeds io_uring's 32-bit length";
+                            "one expert tensor read exceeds io_uring's supported length";
                         continue;
                     }
                     io_uring_sqe * sqe = ring->get_sqe();
@@ -1032,14 +1060,14 @@ struct MoeNvmeScheduler::Impl {
                         continue;
                     }
                     const uint64_t op_index = operations.size();
-                    operations.push_back({j, (uint32_t) read_bytes});
+                    operations.push_back({j, (uint32_t) read_bytes,
+                                          (uint32_t) required_bytes});
                     ring->prepare_read(sqe, active_fds, span.source_index,
                                        jobs[j].slot,
                                        base + buffer_offset, (uint32_t) read_bytes,
                                        read_offset, op_index, !direct_active);
                     ++progress[j].pending;
                     ++progress[j].ops;
-                    progress[j].physical += read_bytes;
                 }
             }
 
@@ -1097,13 +1125,16 @@ struct MoeNvmeScheduler::Impl {
                     }
                     const Op & op = operations[(size_t) cqe.user_data];
                     Progress & item = progress[op.job];
-                    if (cqe.res != (int32_t) op.expected) {
+                    if (cqe.res < 0) {
                         item.ok = false;
-                        if (cqe.res < 0) {
-                            item.error = std::string("io_uring read failed: ") +
-                                         std::strerror(-cqe.res);
-                        } else {
-                            item.error = "io_uring returned a short model read";
+                        item.error = std::string("io_uring read failed: ") +
+                                     std::strerror(-cqe.res);
+                    } else {
+                        item.physical += (uint32_t) cqe.res;
+                        if ((uint32_t) cqe.res < op.required ||
+                            (uint32_t) cqe.res > op.expected) {
+                            item.ok = false;
+                            item.error = "io_uring returned an incomplete model read";
                         }
                     }
                     if (item.pending > 0 && --item.pending == 0) finish_job(op.job);
@@ -1191,6 +1222,7 @@ bool MoeNvmeScheduler::init(const MoeNvmeConfig & requested,
                                                    p.config.host_slots - 1));
     p.config.max_prefetch_batch = std::max(1, std::min(p.config.max_prefetch_batch,
                                                        p.config.host_slots));
+    p.config.demand_timeout_ms = std::max(0, p.config.demand_timeout_ms);
     if (!is_power_of_two(p.config.direct_alignment) || p.config.direct_alignment < 512 ||
         max_expert_payload_bytes == 0 || !allocate || !free_fn) {
         if (err) *err = "invalid SSD scheduler initialization arguments";
@@ -1263,6 +1295,25 @@ bool MoeNvmeScheduler::bind_sources(
         }
         all_mapped = all_mapped && source.mmap_data != nullptr;
         all_have_fds = all_have_fds && source.fd >= 0;
+#if defined(_WIN32)
+        if (source.fd >= 0) {
+            struct _stat64 file_stat{};
+            if (::_fstat64(source.fd, &file_stat) != 0 || file_stat.st_size < 0 ||
+                (uint64_t) file_stat.st_size < (uint64_t) source.mmap_size) {
+                if (err) *err = "model shard fd is unreadable or shorter than its declared size";
+                return false;
+            }
+        }
+#else
+        if (source.fd >= 0) {
+            struct stat file_stat{};
+            if (::fstat(source.fd, &file_stat) != 0 || file_stat.st_size < 0 ||
+                (uint64_t) file_stat.st_size < (uint64_t) source.mmap_size) {
+                if (err) *err = "model shard fd is unreadable or shorter than its declared size";
+                return false;
+            }
+        }
+#endif
         if ((uint64_t) source.mmap_size >
             std::numeric_limits<uint64_t>::max() - total_source_bytes) {
             if (err) *err = "SSD model shard sizes overflow";
@@ -1545,11 +1596,32 @@ bool MoeNvmeScheduler::acquire(int layer, int expert, MoeNvmeLease & out,
     }
     Impl & p = *impl_;
     const auto begin = Clock::now();
+    const bool timeout_enabled = p.config.demand_timeout_ms > 0;
+    const auto deadline = timeout_enabled
+        ? begin + std::chrono::milliseconds(p.config.demand_timeout_ms)
+        : Clock::time_point::max();
     p.requests.fetch_add(1, std::memory_order_relaxed);
     p.demand_requests.fetch_add(1, std::memory_order_relaxed);
     const MoeExpertKey key{(int32_t) layer, (int32_t) expert};
 
     std::unique_lock<std::mutex> lock(p.mutex);
+    auto wait_for_state = [&]() -> bool {
+        if (!timeout_enabled) {
+            p.state_cv.wait(lock);
+            return true;
+        }
+        if (p.state_cv.wait_until(lock, deadline) != std::cv_status::timeout) {
+            return true;
+        }
+        p.demand_timeouts.fetch_add(1, std::memory_order_relaxed);
+        p.wait_ns.fetch_add(elapsed_ns(begin, Clock::now()),
+                            std::memory_order_relaxed);
+        if (err) {
+            *err = "timed out waiting for an SSD expert after " +
+                   std::to_string(p.config.demand_timeout_ms) + " ms";
+        }
+        return false;
+    };
     bool admitted = false;
     for (;;) {
         if (p.stopping) {
@@ -1563,7 +1635,7 @@ bool MoeNvmeScheduler::acquire(int layer, int expert, MoeNvmeLease & out,
                 layer, expert, MoeNvmePriority::Demand, slot, err);
             if (result == Impl::Admission::Invalid) return false;
             if (result == Impl::Admission::NoSlot) {
-                p.state_cv.wait(lock);
+                if (!wait_for_state()) return false;
                 continue;
             }
             admitted = true;
@@ -1607,7 +1679,7 @@ bool MoeNvmeScheduler::acquire(int layer, int expert, MoeNvmeLease & out,
             return false;
         }
         if (slot.state != Impl::SlotState::Ready) {
-            p.state_cv.wait(lock);
+            if (!wait_for_state()) return false;
             continue;
         }
 
@@ -1654,6 +1726,7 @@ MoeNvmeStats MoeNvmeScheduler::stats() const {
     out.active_io_ns = p.active_io_time();
     out.read_ns = p.read_ns.load(std::memory_order_relaxed);
     out.wait_ns = p.wait_ns.load(std::memory_order_relaxed);
+    out.demand_timeouts = p.demand_timeouts.load(std::memory_order_relaxed);
     out.errors = p.errors.load(std::memory_order_relaxed);
     return out;
 }
@@ -1675,6 +1748,7 @@ void MoeNvmeScheduler::reset_stats() {
     p.reset_io_time();
     p.read_ns.store(0, std::memory_order_relaxed);
     p.wait_ns.store(0, std::memory_order_relaxed);
+    p.demand_timeouts.store(0, std::memory_order_relaxed);
     p.errors.store(0, std::memory_order_relaxed);
 }
 

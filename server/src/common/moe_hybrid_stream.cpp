@@ -969,7 +969,8 @@ void MoeHybridStreamEngine::destroy() {
                 "[moe-nvme] io=%s requests=%llu reads=%llu "
                 "payload=%.3f GiB physical=%.3f GiB active-io-rate=%.3f GiB/s "
                 "cache-hit=%.1f%% mean-demand-wait=%.3f ms "
-                "dedupe=%llu upgrades=%llu dropped-prefetch=%llu errors=%llu "
+                "dedupe=%llu upgrades=%llu dropped-prefetch=%llu "
+                "timeouts=%llu errors=%llu "
                 "device-cache=%.1f MiB slots=%zu hits=%llu misses=%llu evictions=%llu "
                 "graphs=%llu graph-hits=%llu graph-evictions=%llu launches=%llu\n",
                 runtime_->io->effective_backend_name(),
@@ -979,6 +980,7 @@ void MoeHybridStreamEngine::destroy() {
                 (unsigned long long) stats.inflight_deduplications,
                 (unsigned long long) stats.demand_upgrades,
                 (unsigned long long) stats.prefetch_drops,
+                (unsigned long long) stats.demand_timeouts,
                 (unsigned long long) stats.errors,
                 device_cache_byte_count / 1024.0 / 1024.0,
                 device_cache_slot_count,

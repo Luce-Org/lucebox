@@ -282,6 +282,34 @@ TEST_CASE(MoeNvmeSchedulerFixture, speculation_cannot_consume_demand_reserve) {
     NVME_REQUIRE(stats.errors == 0);
 }
 
+TEST_CASE(MoeNvmeSchedulerFixture, demand_timeout_prevents_busy_cache_deadlock) {
+    SyntheticModel model;
+    MoeNvmeConfig config;
+    config.backend = MoeNvmeBackend::Mmap;
+    config.direct_io = MoeNvmeDirectMode::Disabled;
+    config.host_slots = 2;
+    config.io_threads = 1;
+    config.demand_timeout_ms = 25;
+
+    MoeNvmeScheduler scheduler;
+    std::string err;
+    NVME_REQUIRE(scheduler.init(config, 32 * 1024, aligned_allocate,
+                                aligned_free, nullptr, &err));
+    NVME_REQUIRE(scheduler.bind_source(
+        {model.file.data(), model.file.size(), -1}, model.regions, &err));
+
+    MoeNvmeLease first;
+    MoeNvmeLease second;
+    MoeNvmeLease blocked;
+    NVME_REQUIRE(scheduler.acquire(0, 0, first, &err));
+    NVME_REQUIRE(scheduler.acquire(0, 1, second, &err));
+    NVME_REQUIRE(!scheduler.acquire(0, 2, blocked, &err));
+    NVME_REQUIRE(err.find("timed out") != std::string::npos);
+    NVME_REQUIRE(scheduler.stats().demand_timeouts == 1);
+    first.reset();
+    second.reset();
+}
+
 TEST_CASE(MoeNvmeSchedulerFixture, split_model_reads_tensor_spans_from_multiple_shards) {
     constexpr int experts = SyntheticModel::kExperts;
     std::vector<uint8_t> shard_a(512 * 1024, 0xa5);
@@ -334,6 +362,81 @@ TEST_CASE(MoeNvmeSchedulerFixture, split_model_reads_tensor_spans_from_multiple_
 }
 
 #if !defined(_WIN32)
+TEST_CASE(MoeNvmeSchedulerFixture, declared_shard_size_cannot_exceed_real_file) {
+    SyntheticModel model;
+    char path[] = "/tmp/moe_nvme_truncated_XXXXXX";
+    const int fd = ::mkstemp(path);
+    NVME_REQUIRE(fd >= 0);
+    ::unlink(path);
+    std::vector<uint8_t> bytes(4096, 0xa5);
+    NVME_REQUIRE(::write(fd, bytes.data(), bytes.size()) == (ssize_t) bytes.size());
+
+    MoeNvmeConfig config;
+    config.backend = MoeNvmeBackend::ThreadPool;
+    config.direct_io = MoeNvmeDirectMode::Disabled;
+    config.host_slots = 2;
+    MoeNvmeScheduler scheduler;
+    std::string err;
+    NVME_REQUIRE(scheduler.init(config, 32 * 1024, aligned_allocate,
+                                aligned_free, nullptr, &err));
+    NVME_REQUIRE(!scheduler.bind_source(
+        {nullptr, bytes.size() * 2, fd}, model.regions, &err));
+    NVME_REQUIRE(err.find("shorter") != std::string::npos);
+    ::close(fd);
+}
+
+#if defined(__linux__) && defined(O_DIRECT)
+TEST_CASE(MoeNvmeSchedulerFixture, direct_io_accepts_valid_unaligned_shard_tail) {
+    constexpr size_t gate_bytes = 1000;
+    constexpr size_t up_bytes = 1000;
+    constexpr size_t down_bytes = 1300;
+    LayerExpertRegions layer;
+    layer.expert_bytes_gate = gate_bytes;
+    layer.expert_bytes_up = up_bytes;
+    layer.expert_bytes_down = down_bytes;
+    layer.gate_exps = {123, gate_bytes};
+    layer.up_exps = {2125, up_bytes};
+    layer.down_exps = {8192 + 37, down_bytes};
+    std::vector<uint8_t> file(layer.down_exps.offset + down_bytes, 0xa5);
+    fill_tensor(file, layer.gate_exps, gate_bytes, 0, 0, 1);
+    fill_tensor(file, layer.up_exps, up_bytes, 0, 1, 1);
+    fill_tensor(file, layer.down_exps, down_bytes, 0, 2, 1);
+
+    char path[] = "/tmp/moe_nvme_direct_tail_XXXXXX";
+    const int fd = ::mkstemp(path);
+    NVME_REQUIRE(fd >= 0);
+    ::unlink(path);
+    size_t written = 0;
+    while (written < file.size()) {
+        const ssize_t result = ::write(
+            fd, file.data() + written, file.size() - written);
+        NVME_REQUIRE(result > 0);
+        written += (size_t) result;
+    }
+
+    MoeNvmeConfig config;
+    config.backend = MoeNvmeBackend::ThreadPool;
+    config.direct_io = MoeNvmeDirectMode::Enabled;
+    config.host_slots = 2;
+    config.io_threads = 1;
+    MoeNvmeScheduler scheduler;
+    std::string err;
+    NVME_REQUIRE(scheduler.init(config, gate_bytes + up_bytes + down_bytes,
+                                aligned_allocate, aligned_free, nullptr, &err));
+    NVME_REQUIRE(scheduler.bind_source(
+        {file.data(), file.size(), fd}, {layer}, &err));
+    NVME_REQUIRE(scheduler.direct_io_active());
+    MoeNvmeLease lease;
+    NVME_REQUIRE(scheduler.acquire(0, 0, lease, &err));
+    verify_lease(lease, 0, 0);
+    lease.reset();
+    NVME_REQUIRE(scheduler.stats().physical_bytes < 3 * 4096);
+    NVME_REQUIRE(scheduler.stats().errors == 0);
+    scheduler.destroy();
+    ::close(fd);
+}
+#endif
+
 TEST_CASE(MoeNvmeSchedulerFixture, split_real_files_use_the_fd_backend) {
     constexpr int experts = SyntheticModel::kExperts;
     std::vector<uint8_t> shard_a(512 * 1024, 0xa5);
@@ -374,7 +477,11 @@ TEST_CASE(MoeNvmeSchedulerFixture, split_real_files_use_the_fd_backend) {
     write_all(fd_b, shard_b);
 
     MoeNvmeConfig config;
+#if defined(__linux__)
+    config.backend = MoeNvmeBackend::IoUring;
+#else
     config.backend = MoeNvmeBackend::Auto;
+#endif
     config.direct_io = MoeNvmeDirectMode::Disabled;
     config.host_slots = 4;
     config.io_threads = 2;
@@ -423,6 +530,9 @@ TEST_CASE(MoeNvmeSchedulerFixture, real_file_backend_reads_exact_bytes) {
                                 aligned_free, nullptr, &err));
     NVME_REQUIRE(scheduler.bind_source(
         {model.file.data(), model.file.size(), fd}, model.regions, &err));
+#if defined(__linux__)
+    NVME_REQUIRE(std::string(scheduler.effective_backend_name()) == "io_uring");
+#endif
     MoeNvmeLease lease;
     NVME_REQUIRE(scheduler.acquire(1, 7, lease, &err));
     verify_lease(lease, 1, 7);
