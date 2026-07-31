@@ -284,12 +284,14 @@ die()   { err "$*"; exit 1; }
 print_logo() {
     printf '%b' "$C_BRAND"
     cat <<'EOF'
-     · ╱
-  ·──✦──·  █    █ █ ▄▀▀ █▀▀  █▀▀▄ ▄▀▀▄ █ █
-    ╱ ·    █  █ █ █   █▀▀   █▀▀▄ █  █  █
-   ·        ▀▀  ▀▀  ▀▀ ▀▀▀  ▀▀▀  ▀▀  ▀ ▀
+ ░██                                          ░██
+ ░██         ░██    ░██  ░███████   ░███████  ░████████   ░███████  ░██    ░██
+ ░██         ░██    ░██ ░██    ░██ ░██    ░██ ░██    ░██ ░██    ░██  ░██  ░██
+ ░██         ░██    ░██ ░██        ░█████████ ░██    ░██ ░██    ░██   ░█████
+ ░██         ░██   ░███ ░██    ░██ ░██        ░███   ░██ ░██    ░██  ░██  ░██
+ ░██████████  ░█████░██  ░███████   ░███████  ░██░█████   ░███████  ░██    ░██
 EOF
-    printf '%b             local inference, made simple%b\n\n' "$C_DIM" "$C_RST"
+    printf '%b   computers for agents%b\n\n' "$C_DIM" "$C_RST"
 }
 
 # Find a source checkout for contributor-only actions. An explicit path wins;
@@ -3172,13 +3174,16 @@ _optimization_summary() {
     fi
     case "$decode" in false|0|no|off) ;; *)
         case "$model" in
-            qwen3.6-27b|gemma-4-26b|gemma-4-31b)
+            qwen3.6-27b|gemma-4-26b|gemma-4-31b|deepseek-v4-flash)
                 draft_file=$(_lucebox_config_get model.draft_file)
                 if [ -z "$draft_file" ]; then
                     case "$model" in
                         qwen3.6-27b) draft_file="dflash-draft-3.6-q4_k_m.gguf" ;;
                         gemma-4-26b) draft_file="gemma-4-26B-A4B-it-DFlash-q8_0.gguf" ;;
                         gemma-4-31b) draft_file="gemma-4-31B-it-DFlash-q8_0.gguf" ;;
+                        deepseek-v4-flash)
+                            draft_file="DeepSeek-V4-Flash-DSpark-draft-Q4RMFP4-denseF16.gguf"
+                            ;;
                     esac
                 fi
                 [ -s "$DEFAULT_MODELS_DIR/draft/$draft_file" ] && active="DFlash"

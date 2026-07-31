@@ -16,6 +16,7 @@ import pytest
 from lucebox.download import (
     DEFAULT_PRESET,
     PRESETS,
+    catalog_presets,
     recommend_preset,
     resolve_preset,
     status,
@@ -42,7 +43,7 @@ def test_import_does_not_mutate_huggingface_environment() -> None:
 
 
 def test_default_preset_uses_quantized_gguf_draft():
-    assert DEFAULT_PRESET.draft_repo == "spiritbuun/Qwen3.6-27B-DFlash-GGUF"
+    assert DEFAULT_PRESET.draft_repo == "Lucebox/Qwen3.6-27B-DFlash-GGUF"
     assert DEFAULT_PRESET.draft_file == "dflash-draft-3.6-q4_k_m.gguf"
 
 
@@ -89,6 +90,29 @@ def test_resolve_preset_picks_qwen36_moe_target_only():
     assert pres.draft_repo is None
     assert pres.draft_file is None
     assert not pres.has_draft
+
+
+def test_featured_catalog_has_stable_product_order():
+    assert [preset.name for preset in catalog_presets(featured_only=True)] == [
+        "qwen3.6-27b",
+        "qwen3.6-moe",
+        "laguna-xs.2",
+        "deepseek-v4-flash",
+    ]
+
+
+def test_resolve_preset_accepts_display_name():
+    assert resolve_preset("Qwen3.6 35B-A3B") is PRESETS["qwen3.6-moe"]
+
+
+def test_resolve_preset_picks_deepseek_target_and_dspark_draft():
+    pres = resolve_preset("deepseek-v4-flash")
+    assert pres.target_repo == "Lucebox/DeepSeek-V4-Flash-ROCMFPX"
+    assert pres.target_file == "DeepSeek-V4-Flash-ROCMFP2-STRIX.gguf"
+    assert pres.draft_repo == "Lucebox/DeepSeek-V4-Flash-DSpark-Drafter-GGUF"
+    assert pres.draft_file == "DeepSeek-V4-Flash-DSpark-draft-Q4RMFP4-denseF16.gguf"
+    assert pres.has_draft
+    assert pres.approx_target_gb == pytest.approx(102.4)
 
 
 def test_download_preset_target_only_qwen36_moe_skips_draft(tmp_path, monkeypatch):

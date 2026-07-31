@@ -163,12 +163,36 @@ def test_models_select_numbered_picker_downloads_and_activates(
         "status",
         lambda cfg, pres: {"target_present": False, "draft_present": False},
     )
-    # qwen3.6-27b is the fourth entry in the stable alphabetical menu.
-    result = CliRunner().invoke(app, ["models", "select"], input="4\ny\n")
+    # Qwen3.6 27B leads the stable, product-focused menu.
+    result = CliRunner().invoke(app, ["models", "select"], input="1\ny\n")
     assert result.exit_code == 0
     assert "Choose a model" in result.output
     entries = config_mod.config_get(path=cfg_path)
     assert entries["model.preset"] == ("qwen3.6-27b", "file")
+
+
+def test_models_select_blocks_incompatible_model_before_download(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _set_config_path(tmp_path, monkeypatch)
+    _stub_host(monkeypatch, vram_gb=24)
+    attempted = False
+
+    def _unexpected_download(cfg, preset):  # noqa: ARG001
+        nonlocal attempted
+        attempted = True
+        return 0
+
+    monkeypatch.setattr(download_mod, "download_preset", _unexpected_download)
+    result = CliRunner().invoke(
+        app,
+        ["models", "select", "deepseek-v4-flash", "--yes"],
+    )
+
+    assert result.exit_code == 2
+    assert "cannot run on the detected hardware" in result.output
+    assert "No model files were downloaded" in result.output
+    assert attempted is False
 
 
 def test_optimize_resets_to_hardware_profile(

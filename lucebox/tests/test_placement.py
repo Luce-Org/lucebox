@@ -355,6 +355,65 @@ def test_rtx_strix_uses_remote_target_shard_when_capacity_requires_it(
     assert plan.runtime.peer_access is False
 
 
+def test_deepseek_uses_r9700_and_strix_capacity_automatically(tmp_path: Path) -> None:
+    host = HostFacts(
+        gpu_vendor="amd",
+        has_amd_gpu=True,
+        gpu_name="AMD Radeon AI PRO R9700",
+        gpu_count=2,
+        vram_gb=31,
+        gpu_sm="gfx1201",
+        ram_gb=125,
+        amd_gpu_list_csv=_amd_csv(
+            ("AMD Radeon AI PRO R9700", "gfx1201", 32624),
+            ("AMD Radeon Graphics", "gfx1151", 512),
+        ),
+    )
+    cfg = Config(
+        variant="rocm",
+        models_dir=tmp_path,
+        host=host,
+        model=ModelMeta(preset="deepseek-v4-flash"),
+    )
+
+    plan = automatic_plan(cfg, optimizer_drafter_available=False)
+
+    assert plan.placement.runnable is True
+    assert plan.placement.runtime.mode == "layer-split"
+    assert plan.placement.runtime.target_devices == ("hip:0", "hip:1")
+    assert sum(plan.placement.runtime.target_layer_split) == pytest.approx(1.0)
+    assert plan.runtime.speculative_decode is False
+
+
+def test_deepseek_uses_rtx_strix_paired_runtime_automatically(tmp_path: Path) -> None:
+    host = HostFacts(
+        gpu_vendor="nvidia",
+        has_nvidia_gpu=True,
+        has_amd_gpu=True,
+        gpu_name="RTX 3090",
+        vram_gb=24,
+        gpu_sm="86",
+        ram_gb=128,
+        nvidia_gpu_list_csv=("0, GPU-0, 0000:01:00.0, RTX 3090, 8.6, 24576 MiB, 350 W"),
+        amd_gpu_list_csv=_amd_csv(("AMD Radeon Graphics", "gfx1151", 512)),
+        hybrid_runtime=True,
+    )
+    cfg = Config(
+        variant="cuda12",
+        models_dir=tmp_path,
+        host=host,
+        model=ModelMeta(preset="deepseek-v4-flash"),
+    )
+
+    plan = automatic_plan(cfg, optimizer_drafter_available=False)
+
+    assert plan.placement.runnable is True
+    assert plan.placement.runtime.mode == "heterogeneous"
+    assert plan.placement.runtime.target_devices == ("cuda:0", "hip:0")
+    assert plan.placement.runtime.remote_target_shard is True
+    assert plan.placement.runtime.requires_hybrid_runtime is True
+
+
 def test_python_architecture_capabilities_match_engine_table() -> None:
     header = (Path(__file__).parents[2] / "server/src/common/model_capabilities.h").read_text()
     row_pattern = re.compile(

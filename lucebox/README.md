@@ -20,6 +20,13 @@ download, optimization and placement settings, and construction of the final
 server command. Host facts are passed through `LUCEBOX_HOST_*` environment
 variables so the package never has to guess the host configuration.
 
+The guided picker leads with Lucebox's four featured model paths: Qwen3.6
+27B, Qwen3.6 35B-A3B, Laguna XS.2, and DeepSeek V4 Flash. It checks the
+resolved placement before downloading, so a machine without enough compatible
+accelerator memory cannot accidentally begin DeepSeek's roughly 114 GB
+target-plus-draft download. Older supported Gemma presets remain available by
+name and through `lucebox models list`.
+
 Automatic mode considers the selected model and the complete accelerator
 topology. It shows plain-language decisions for DFlash, PFlash, KVFlash, Spark,
 and execution placement. It keeps fitting targets on the faster primary GPU,

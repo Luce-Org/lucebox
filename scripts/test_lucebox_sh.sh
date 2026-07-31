@@ -218,7 +218,7 @@ assert_runs "no args (non-interactive help)" \
     "bash '$SCRIPT' </dev/null" "simple CLI for the Lucebox inference engine"
 assert_runs "interactive menu renders and quits" \
     "printf 'q\\n' | LUCEBOX_NO_CLEAR=1 bash '$SCRIPT' menu" \
-    "local inference, made simple"
+    "computers for agents"
 assert_runs "version"  "bash '$SCRIPT' version"  ""
 assert_runs "--version" "bash '$SCRIPT' --version" ""
 

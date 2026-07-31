@@ -330,13 +330,40 @@ def _print_installed_presets() -> None:
     console.print(f"[dim]Total disk usage: {total:.1f} GB[/dim]")
 
 
-def _activate_preset(cfg: Config, preset: download_mod.ModelPreset) -> None:
-    """Activate one preset together with a runnable execution profile."""
-    selected_model = ModelMeta(
+def _model_meta(preset: download_mod.ModelPreset) -> ModelMeta:
+    """Build the persisted model selection for one catalog preset."""
+    return ModelMeta(
         preset=preset.name,
         target_file=preset.target_file,
         draft_file=preset.draft_file if preset.has_draft and preset.draft_file else "",
     )
+
+
+def _preset_placement(cfg: Config, preset: download_mod.ModelPreset) -> PlacementPlan:
+    """Plan the placement that activating ``preset`` would persist."""
+    selected_cfg = replace(cfg, model=_model_meta(preset))
+    if config_mod.optimization_mode() == "custom":
+        return autotune_mod.placement_for_runtime(selected_cfg, cfg.dflash)
+    return autotune_mod.automatic_plan(selected_cfg).placement
+
+
+def _require_runnable_preset(cfg: Config, preset: download_mod.ModelPreset) -> None:
+    """Stop before a large download when this machine cannot run the model."""
+    placement = _preset_placement(cfg, preset)
+    if placement.runnable:
+        return
+    error_console.print(
+        f"[red]{escape(preset.label)} cannot run on the detected hardware.[/red]\n"
+        f"[dim]{escape(placement.reason)}[/dim]\n"
+        "[dim]No model files were downloaded. Run `lucebox check` to review "
+        "the detected accelerators.[/dim]"
+    )
+    raise typer.Exit(code=2)
+
+
+def _activate_preset(cfg: Config, preset: download_mod.ModelPreset) -> None:
+    """Activate one preset together with a runnable execution profile."""
+    selected_model = _model_meta(preset)
     selected_cfg = replace(
         cfg,
         model=selected_model,
@@ -406,17 +433,23 @@ def models_list() -> None:
     cfg = _load_or_build()
     active = cfg.model.preset
     table = Table()
+    table.add_column("model")
     table.add_column("preset")
     table.add_column("status")
     table.add_column("size (GB)")
     table.add_column("description")
-    for name in sorted(download_mod.PRESETS):
-        pres = download_mod.PRESETS[name]
-        marker = "* " if name == active else "  "
+    for pres in download_mod.catalog_presets():
+        marker = "* " if pres.name == active else "  "
         status = download_mod.installed_status(cfg, pres)
         size = download_mod.installed_size_gb(cfg, pres)
         size_text = f"{size:.1f}" if size > 0 else f"~{pres.approx_total_gb}*"
-        table.add_row(f"{marker}{name}", status, size_text, pres.description or "")
+        table.add_row(
+            f"{marker}{pres.label}",
+            pres.name,
+            status,
+            size_text,
+            pres.description or "",
+        )
     console.print(table)
 
 
@@ -434,7 +467,8 @@ def models_select(
     """Choose, download, and activate a model in one guided step."""
     cfg = _load_or_build()
     if not preset:
-        names = sorted(download_mod.PRESETS)
+        candidates = download_mod.catalog_presets(featured_only=True)
+        names = [candidate.name for candidate in candidates]
         recommended = download_mod.recommend_preset(cfg.host)
         default_name = cfg.model.preset or recommended or names[0]
         default_index = names.index(default_name) + 1 if default_name in names else 1
@@ -444,22 +478,29 @@ def models_select(
         table.add_column("model")
         table.add_column("download")
         table.add_column("status")
-        table.add_column("notes")
-        for index, name in enumerate(names, start=1):
-            candidate = download_mod.PRESETS[name]
+        table.add_column("this machine")
+        for index, candidate in enumerate(candidates, start=1):
             labels: list[str] = []
-            if name == cfg.model.preset:
+            if candidate.name == cfg.model.preset:
                 labels.append("active")
-            if name == recommended:
+            if candidate.name == recommended:
                 labels.append("recommended")
+            placement = _preset_placement(cfg, candidate)
+            fit = "ready" if placement.runnable else "not enough compatible memory"
             table.add_row(
                 str(index),
-                name,
+                candidate.label,
                 f"~{candidate.approx_total_gb} GB",
                 download_mod.installed_status(cfg, candidate),
-                ", ".join(labels) or candidate.description,
+                ", ".join((*labels, fit)) if labels else fit,
             )
         console.print(table)
+        extra = [item.name for item in download_mod.catalog_presets() if not item.featured]
+        if extra:
+            console.print(
+                "[dim]More supported presets: "
+                f"{escape(', '.join(extra))}. See `lucebox models list`.[/dim]"
+            )
         try:
             answer = typer.prompt(
                 "Model number or name",
@@ -486,9 +527,10 @@ def models_select(
         # already present locally.
         _activate_preset(cfg, selected)
         return
+    _require_runnable_preset(cfg, selected)
     if state != "installed" and not yes:
         if not typer.confirm(
-            f"Download about {selected.approx_total_gb} GB and activate {selected.name}?",
+            f"Download about {selected.approx_total_gb} GB and activate {selected.label}?",
             default=True,
         ):
             console.print("[dim]No model changed.[/dim]")
@@ -537,6 +579,9 @@ def models_download(
     except KeyError as exc:
         console.print(f"[red]{escape(str(exc))}[/red]")
         raise typer.Exit(code=2) from exc
+
+    if activate:
+        _require_runnable_preset(cfg, pres)
 
     current = download_mod.status(cfg, pres)
     console.print(f"Models dir: [bold]{cfg.models_dir}[/bold]")
