@@ -65,6 +65,18 @@ bool ggml_cuda_rocmfp3_mix_mul_mat_vec_3d(
 // per output element to the fallback's per-expert-slice path. vx is the whole
 // MoE tensor base (registry resolves per-expert codebook/mode on device). All
 // *_s* args are element strides. Returns false if vx is not registered.
+// Fused gate/up + SwiGLU_DS4 in ONE launch -- collapses the second mul_mat_id and the separate
+// swiglu pass that the mix qtypes were paying and qtype 107 was not. False unless both halves
+// are registered and shape-matched.
+bool ggml_cuda_rocmfp3_mix_mul_mat_id_glu(
+        const void * vx_up, const void * vx_gate,
+        const float * src1, const int32_t * ids, float * dst,
+        int in, int out, int n_expert_used, int n_tokens, int ne11,
+        int64_t ids_s0, int64_t ids_s1,
+        int64_t src1_s1, int64_t src1_s2,
+        int64_t dst_s1, int64_t dst_s2,
+        float glu_limit, cudaStream_t stream);
+
 bool ggml_cuda_rocmfp3_mix_mul_mat_id(
         const void * vx, const float * src1, const int32_t * ids, float * dst,
         int in, int out, int n_expert_used, int n_tokens, int ne11,

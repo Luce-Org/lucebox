@@ -2625,6 +2625,55 @@ static bool ggml_cuda_try_fuse_mul_mat_glu(
     const ggml_tensor * src1 = up->src[1];
     const ggml_tensor * ids  = up->src[2];
 
+    // ---- DeepSeek4 mix qtypes (105/106) --------------------------------------------------
+    // These cannot go through mul_mat_vec_q at all: get_mmvq_mmid_max_batch returns 0 for them
+    // because their learned per-expert codebooks live in a side registry that the mmvq kernels
+    // know nothing about. So they were the only expert types paying the UNFUSED shape -- two
+    // mul_mat_id launches plus a separate swiglu_ds4 pass -- which the profile measured as
+    // 30100 launches against qtype 107's 15050, and ~102% of the observed 4.6% decode gap.
+    //
+    // Handled before the generic checks because those would reject these types and fall through
+    // to the two-launch path. Each launcher returns false unless BOTH halves are registered and
+    // shape-matched, so a partial registration keeps the correct unfused path rather than fusing
+    // a decoded tensor with an undecoded one.
+    if (ids && up->op == GGML_OP_MUL_MAT_ID
+            && ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU_DS4
+            && src1->type == GGML_TYPE_F32 && glu->type == GGML_TYPE_F32
+            && gate->src[0]->type == src0->type
+            && ids->type == GGML_TYPE_I32) {
+        const float limit = ggml_get_op_params_f32(glu, 2);
+        // dst is the GLU tensor: the fused kernel writes the SwiGLU result straight there and
+        // the two intermediates are never materialised.
+        const int64_t ids_s0  = (int64_t) (ids->nb[0] / sizeof(int32_t));
+        const int64_t ids_s1  = (int64_t) (ids->nb[1] / sizeof(int32_t));
+        const int64_t src1_s1 = (int64_t) (src1->nb[1] / sizeof(float));
+        const int64_t src1_s2 = (int64_t) (src1->nb[2] / sizeof(float));
+        const int64_t dst_s1  = (int64_t) (glu->nb[1] / sizeof(float));
+        const int64_t dst_s2  = (int64_t) (glu->nb[2] / sizeof(float));
+        const int in  = (int) src0->ne[0];
+        const int out = (int) src0->ne[1];
+        const int n_expert_used = (int) ids->ne[0];
+        const int n_tokens = (int) src1->ne[2];
+        const int ne11     = (int) src1->ne[1];
+
+        if (src0->type == GGML_TYPE_Q2_1_ROCMFP2_MIX
+                && ggml_cuda_rocmfp2_mix_mul_mat_id_glu(
+                    src0->data, gate->src[0]->data,
+                    (const float *) src1->data, (const int32_t *) ids->data,
+                    (float *) glu->data, in, out, n_expert_used, n_tokens, ne11,
+                    ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2, limit, ctx.stream())) {
+            return true;
+        }
+        if (src0->type == GGML_TYPE_Q3_1_ROCMFP3_MIX
+                && ggml_cuda_rocmfp3_mix_mul_mat_id_glu(
+                    src0->data, gate->src[0]->data,
+                    (const float *) src1->data, (const int32_t *) ids->data,
+                    (float *) glu->data, in, out, n_expert_used, n_tokens, ne11,
+                    ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2, limit, ctx.stream())) {
+            return true;
+        }
+    }
+
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     if (ids && ggml_cuda_mmvq_mmid_grouped_enabled(
             src0->type, cc, up->ne[2], up->ne[1]*up->ne[2])) {

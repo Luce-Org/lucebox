@@ -3,6 +3,9 @@
 // to_fp16 converter signature cannot carry; the deepseek4 loader registers each
 // fused down-expert tensor after staging its sidecar side-data to device memory.
 #include "rocmfp3_mix.cuh"
+// For ggml_cuda_op_swiglu_ds4_single -- the fused path applies the EXACT function the
+// standalone swiglu_ds4 kernel applies, not a re-derivation.
+#include "unary.cuh"
 #include "convert.cuh"
 #include <mutex>
 #include <vector>
@@ -434,6 +437,10 @@ __global__ void mix_matvec_rocmfp3_slice_kernel(
     }
 }
 
+// FUSE_GLU: see the twin in rocmfp2_mix.cu. Templated so both instantiations share ONE
+// accumulation over ONE fixed block order -- each dot stays bit-identical to the unfused
+// launch, so the fused result equals swiglu_ds4(unfused_gate, unfused_up) exactly.
+template <bool FUSE_GLU>
 __global__ void mix_matvec_rocmfp3_moe_kernel(
         const uint8_t * __restrict__ data, size_t nb02,
         const nv_bfloat16 * __restrict__ codebooks, const uint8_t * __restrict__ modes,
@@ -441,7 +448,11 @@ __global__ void mix_matvec_rocmfp3_moe_kernel(
         float * __restrict__ dst, int in, int out, int ne11,
         int64_t ids_s0, int64_t ids_s1,       // element strides (int32) over slot, token
         int64_t src1_s1, int64_t src1_s2,     // element strides (float) over ne11, token
-        int64_t dst_s1, int64_t dst_s2) {     // element strides (float) over slot, token
+        int64_t dst_s1, int64_t dst_s2,
+        // FUSE_GLU only: the gate tensor's own registry entry. Not assumed equal to up's.
+        const uint8_t * __restrict__ gdata, size_t gnb02,
+        const nv_bfloat16 * __restrict__ gcodebooks, const uint8_t * __restrict__ gmodes,
+        float glu_limit) {     // element strides (float) over slot, token
     const int warps_per_block = blockDim.x / MIX_WARP;
     const int warp  = blockIdx.x * warps_per_block + (threadIdx.x / MIX_WARP);
     const int row0  = warp * 2;                 // two output rows per warp
@@ -453,10 +464,17 @@ __global__ void mix_matvec_rocmfp3_moe_kernel(
     // mode and expert base -- is WORKGROUP-UNIFORM, which is what makes one LDS table
     // per block legal. Staged before the row0 early return so all threads sync.
     const int expert = ids[(int64_t) token * ids_s1 + (int64_t) slot * ids_s0];
-    __shared__ float s_lut[2 * MIX_K];
+    __shared__ float s_lut[FUSE_GLU ? 4 * MIX_K : 2 * MIX_K];
     if ((int) threadIdx.x < 2 * MIX_K) {
         s_lut[threadIdx.x] =
             __bfloat162float(codebooks[(int64_t) expert * 2 * MIX_K + threadIdx.x]);
+    }
+    if (FUSE_GLU) {
+        const int gt = (int) threadIdx.x - 2 * MIX_K;
+        if (gt >= 0 && gt < 2 * MIX_K) {
+            s_lut[2 * MIX_K + gt] =
+                __bfloat162float(gcodebooks[(int64_t) expert * 2 * MIX_K + gt]);
+        }
     }
     __syncthreads();
     if (row0 >= out) return;
@@ -469,6 +487,11 @@ __global__ void mix_matvec_rocmfp3_moe_kernel(
     // true across the whole warp (no divergence in the hot loop).
     const uint8_t     * rowbase1 = two ? edata + (int64_t) (row0 + 1) * nb * MIX_BLOCK_BYTES
                                        : rowbase0;
+    const uint8_t * gedata    = FUSE_GLU ? gdata + (int64_t) expert * gnb02 : nullptr;
+    const int       gmode     = FUSE_GLU ? (int) gmodes[expert] : 0;
+    const uint8_t * growbase0 = FUSE_GLU ? gedata + (int64_t) row0 * nb * MIX_BLOCK_BYTES : nullptr;
+    const uint8_t * growbase1 = FUSE_GLU ? (two ? gedata + (int64_t) (row0 + 1) * nb * MIX_BLOCK_BYTES
+                                                : growbase0) : nullptr;
     // src1 is [in, ne11, ntok]; the get_rows-equivalent row for (slot, token)
     // is token*ne11 + slot%ne11 — i.e. token column + the slot%ne11 broadcast.
     const float * xcol = src1 + (int64_t) token * src1_s2 + (int64_t) (slot % ne11) * src1_s1;
@@ -480,31 +503,62 @@ __global__ void mix_matvec_rocmfp3_moe_kernel(
     // loads to one issue per element — halving activation LSU issue on this partly
     // load-instruction-bound matvec — WITHOUT reordering either row's summation.
     float acc0 = 0.0f, acc1 = 0.0f;
+    float gacc0 = 0.0f, gacc1 = 0.0f;   // same block order as acc*, so bit-identical per row
     int blk = lane;
     for (; blk + 3 * MIX_WARP < nb; blk += MIX_UNROLL * MIX_WARP) {
         const int b0 = blk, b1 = blk + MIX_WARP;
         const int b2 = blk + 2 * MIX_WARP, b3 = blk + 3 * MIX_WARP;
         mix_block_accum(rowbase0 + (int64_t) b0 * MIX_BLOCK_BYTES, xcol, b0 * MIX_QK, mode, s_lut, acc0);
         mix_block_accum(rowbase1 + (int64_t) b0 * MIX_BLOCK_BYTES, xcol, b0 * MIX_QK, mode, s_lut, acc1);
+        if (FUSE_GLU) {
+            mix_block_accum(growbase0 + (int64_t) b0 * MIX_BLOCK_BYTES, xcol, b0 * MIX_QK, gmode, s_lut + 2 * MIX_K, gacc0);
+            mix_block_accum(growbase1 + (int64_t) b0 * MIX_BLOCK_BYTES, xcol, b0 * MIX_QK, gmode, s_lut + 2 * MIX_K, gacc1);
+        }
         mix_block_accum(rowbase0 + (int64_t) b1 * MIX_BLOCK_BYTES, xcol, b1 * MIX_QK, mode, s_lut, acc0);
         mix_block_accum(rowbase1 + (int64_t) b1 * MIX_BLOCK_BYTES, xcol, b1 * MIX_QK, mode, s_lut, acc1);
+        if (FUSE_GLU) {
+            mix_block_accum(growbase0 + (int64_t) b1 * MIX_BLOCK_BYTES, xcol, b1 * MIX_QK, gmode, s_lut + 2 * MIX_K, gacc0);
+            mix_block_accum(growbase1 + (int64_t) b1 * MIX_BLOCK_BYTES, xcol, b1 * MIX_QK, gmode, s_lut + 2 * MIX_K, gacc1);
+        }
         mix_block_accum(rowbase0 + (int64_t) b2 * MIX_BLOCK_BYTES, xcol, b2 * MIX_QK, mode, s_lut, acc0);
         mix_block_accum(rowbase1 + (int64_t) b2 * MIX_BLOCK_BYTES, xcol, b2 * MIX_QK, mode, s_lut, acc1);
+        if (FUSE_GLU) {
+            mix_block_accum(growbase0 + (int64_t) b2 * MIX_BLOCK_BYTES, xcol, b2 * MIX_QK, gmode, s_lut + 2 * MIX_K, gacc0);
+            mix_block_accum(growbase1 + (int64_t) b2 * MIX_BLOCK_BYTES, xcol, b2 * MIX_QK, gmode, s_lut + 2 * MIX_K, gacc1);
+        }
         mix_block_accum(rowbase0 + (int64_t) b3 * MIX_BLOCK_BYTES, xcol, b3 * MIX_QK, mode, s_lut, acc0);
         mix_block_accum(rowbase1 + (int64_t) b3 * MIX_BLOCK_BYTES, xcol, b3 * MIX_QK, mode, s_lut, acc1);
+        if (FUSE_GLU) {
+            mix_block_accum(growbase0 + (int64_t) b3 * MIX_BLOCK_BYTES, xcol, b3 * MIX_QK, gmode, s_lut + 2 * MIX_K, gacc0);
+            mix_block_accum(growbase1 + (int64_t) b3 * MIX_BLOCK_BYTES, xcol, b3 * MIX_QK, gmode, s_lut + 2 * MIX_K, gacc1);
+        }
     }
     for (; blk < nb; blk += MIX_WARP) {
         mix_block_accum(rowbase0 + (int64_t) blk * MIX_BLOCK_BYTES, xcol, blk * MIX_QK, mode, s_lut, acc0);
         mix_block_accum(rowbase1 + (int64_t) blk * MIX_BLOCK_BYTES, xcol, blk * MIX_QK, mode, s_lut, acc1);
+        if (FUSE_GLU) {
+            mix_block_accum(growbase0 + (int64_t) blk * MIX_BLOCK_BYTES, xcol, blk * MIX_QK, gmode, s_lut + 2 * MIX_K, gacc0);
+            mix_block_accum(growbase1 + (int64_t) blk * MIX_BLOCK_BYTES, xcol, blk * MIX_QK, gmode, s_lut + 2 * MIX_K, gacc1);
+        }
     }
     #pragma unroll
     for (int off = MIX_WARP/2; off > 0; off >>= 1) {
         acc0 += mix_warp_shfl_down(acc0, off);
         acc1 += mix_warp_shfl_down(acc1, off);
+        if (FUSE_GLU) {
+            gacc0 += mix_warp_shfl_down(gacc0, off);
+            gacc1 += mix_warp_shfl_down(gacc1, off);
+        }
     }
     if (lane == 0) {
-        dst[(int64_t) token * dst_s2 + (int64_t) slot * dst_s1 + row0] = acc0;
-        if (two) dst[(int64_t) token * dst_s2 + (int64_t) slot * dst_s1 + row0 + 1] = acc1;
+        const int64_t o = (int64_t) token * dst_s2 + (int64_t) slot * dst_s1 + row0;
+        if (FUSE_GLU) {
+            dst[o]              = ggml_cuda_op_swiglu_ds4_single(gacc0, acc0, glu_limit);
+            if (two) dst[o + 1] = ggml_cuda_op_swiglu_ds4_single(gacc1, acc1, glu_limit);
+        } else {
+            dst[o]              = acc0;
+            if (two) dst[o + 1] = acc1;
+        }
     }
 }
 
@@ -567,10 +621,44 @@ bool ggml_cuda_rocmfp3_mix_mul_mat_id(
     // of `warps_per_block` warps covers 2*warps_per_block rows.
     const int rows_per_block = 2 * warps_per_block;
     dim3 grid((out + rows_per_block - 1) / rows_per_block, n_expert_used, n_tokens);
-    mix_matvec_rocmfp3_moe_kernel<<<grid, dim3(threads), 0, stream>>>(
+    mix_matvec_rocmfp3_moe_kernel<false><<<grid, dim3(threads), 0, stream>>>(
         (const uint8_t *) e.base, e.nb02, e.codebooks, e.modes,
         src1, ids, dst, in, out, ne11,
-        ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2);
+        ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2,
+        nullptr, 0, nullptr, nullptr, 0.0f);
+    return true;
+}
+
+// Fused gate/up + SwiGLU for a qtype-105 expert pair. See the rocmfp2 twin: `vx_up` is the
+// surviving mul_mat_id's src0 and `vx_gate` the collapsed one, because swiglu_ds4 applies silu
+// to GATE and the operands are not interchangeable. Refuses unless BOTH halves are registered
+// and shape-matched, so a half-registered pair keeps the correct unfused path instead of fusing
+// a decoded tensor with an undecoded one -- which would load and emit fluent garbage.
+bool ggml_cuda_rocmfp3_mix_mul_mat_id_glu(
+        const void * vx_up, const void * vx_gate,
+        const float * src1, const int32_t * ids, float * dst,
+        int in, int out, int n_expert_used, int n_tokens, int ne11,
+        int64_t ids_s0, int64_t ids_s1,
+        int64_t src1_s1, int64_t src1_s2,
+        int64_t dst_s1, int64_t dst_s2,
+        float glu_limit, cudaStream_t stream) {
+    MixEntry eu, eg;
+    int expert0_u, expert0_g;
+    if (!mix_lookup(vx_up, eu, expert0_u) || !mix_lookup(vx_gate, eg, expert0_g)) {
+        return false;
+    }
+    if (eu.in != eg.in || eu.out != eg.out || eu.n_experts != eg.n_experts) {
+        return false;
+    }
+    const int warps_per_block = 2;
+    const int threads = warps_per_block * MIX_WARP;
+    const int rows_per_block = 2 * warps_per_block;
+    dim3 grid((out + rows_per_block - 1) / rows_per_block, n_expert_used, n_tokens);
+    mix_matvec_rocmfp3_moe_kernel<true><<<grid, dim3(threads), 0, stream>>>(
+        (const uint8_t *) eu.base, eu.nb02, eu.codebooks, eu.modes,
+        src1, ids, dst, in, out, ne11,
+        ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2,
+        (const uint8_t *) eg.base, eg.nb02, eg.codebooks, eg.modes, glu_limit);
     return true;
 }
 

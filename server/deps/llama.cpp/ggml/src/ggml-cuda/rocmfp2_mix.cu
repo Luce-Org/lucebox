@@ -4,6 +4,9 @@
 // fused down-expert tensor after staging its sidecar side-data to device memory.
 #include "rocmfp2_mix.cuh"
 #include "convert.cuh"
+// For ggml_cuda_op_swiglu_ds4_single: the fused path must apply the EXACT function the
+// standalone swiglu_ds4 kernel applies, not a re-derivation of the formula.
+#include "unary.cuh"
 #include <mutex>
 #include <vector>
 
@@ -516,6 +519,21 @@ __global__ void mix_matvec_rocmfp2_slice_kernel(
     }
 }
 
+// FUSE_GLU folds the SECOND mul_mat_id of a DeepSeek4 gate/up pair plus the SwiGLU into this
+// launch. The unfused shape is two matvec launches writing two [n_ff_exp, n_used, ntok]
+// intermediates, then a third kernel reading both back to apply the GLU. qtype 107 never paid
+// that: ggml_cuda_try_fuse_mul_mat_glu collapses the trio into one mul_mat_vec_q, which is why
+// the profile showed 107 at 15050 launches against 106's 30100 plus a 28 ms swiglu_ds4 pass.
+//
+// TEMPLATED rather than a second kernel on purpose: both instantiations run the SAME
+// accumulation over the SAME fixed block order, so each dot product is bit-identical to what
+// the unfused path computes, and the fused result is bit-identical to
+// swiglu_ds4(unfused_gate, unfused_up). A copy-pasted kernel would only *probably* stay that way.
+//
+// Naming follows the mmvq fusion convention: the PRIMARY tensor is `up` (src0 of the surviving
+// mul_mat_id) and `gate` arrives as the extra operand, because
+// ggml_cuda_op_swiglu_ds4_single(gate, up, limit) is not symmetric -- silu() is applied to gate.
+template <bool FUSE_GLU>
 __global__ void mix_matvec_rocmfp2_moe_kernel(
         const uint8_t * __restrict__ data, size_t nb02,
         const nv_bfloat16 * __restrict__ codebooks, const uint8_t * __restrict__ modes,
@@ -523,7 +541,13 @@ __global__ void mix_matvec_rocmfp2_moe_kernel(
         float * __restrict__ dst, int in, int out, int ne11,
         int64_t ids_s0, int64_t ids_s1,       // element strides (int32) over slot, token
         int64_t src1_s1, int64_t src1_s2,     // element strides (float) over ne11, token
-        int64_t dst_s1, int64_t dst_s2) {     // element strides (float) over slot, token
+        int64_t dst_s1, int64_t dst_s2,       // element strides (float) over slot, token
+        // FUSE_GLU only. The gate tensor's own registry entry -- separate codebooks and modes,
+        // NOT assumed equal to up's. The geo-quant splitter asserts they match today, but the
+        // kernel does not need that to be true and staging both costs 32 bytes of LDS.
+        const uint8_t * __restrict__ gdata, size_t gnb02,
+        const nv_bfloat16 * __restrict__ gcodebooks, const uint8_t * __restrict__ gmodes,
+        float glu_limit) {
     const int warps_per_block = blockDim.x / MIX_WARP;
     const int warp  = blockIdx.x * warps_per_block + (threadIdx.x / MIX_WARP);
     const int row0  = warp * 2;                 // two output rows per warp
@@ -536,10 +560,19 @@ __global__ void mix_matvec_rocmfp2_moe_kernel(
     // stage BEFORE the row0 early-return so all threads reach the __syncthreads()
     // (`row0 >= out` retires whole warps in the tail block).
     const int expert = ids[(int64_t) token * ids_s1 + (int64_t) slot * ids_s0];
-    __shared__ float s_lut[2 * MIX_K];
+    // Both tables in one array so the staging stays a single guarded write per thread and one
+    // barrier. Gate's table occupies [2*MIX_K, 4*MIX_K).
+    __shared__ float s_lut[FUSE_GLU ? 4 * MIX_K : 2 * MIX_K];
     if ((int) threadIdx.x < 2 * MIX_K) {
         s_lut[threadIdx.x] =
             __bfloat162float(codebooks[(int64_t) expert * 2 * MIX_K + threadIdx.x]);
+    }
+    if (FUSE_GLU) {
+        const int gt = (int) threadIdx.x - 2 * MIX_K;
+        if (gt >= 0 && gt < 2 * MIX_K) {
+            s_lut[2 * MIX_K + gt] =
+                __bfloat162float(gcodebooks[(int64_t) expert * 2 * MIX_K + gt]);
+        }
     }
     __syncthreads();
     if (row0 >= out) return;
@@ -553,6 +586,15 @@ __global__ void mix_matvec_rocmfp2_moe_kernel(
     // true across the whole warp (no divergence in the hot loop).
     const uint8_t     * rowbase1 = two ? edata + (int64_t) (row0 + 1) * nb * MIX_BLOCK_BYTES
                                        : rowbase0;
+    // Gate shares the shape, the expert and the row indices -- only the bytes and the table
+    // differ -- so it reuses `nb`, `two`, `row0` and the same activation column below.
+    const uint8_t * gedata    = FUSE_GLU ? gdata + (int64_t) expert * gnb02 : nullptr;
+    const int       gmode     = FUSE_GLU ? (int) gmodes[expert] : 0;
+    const uint8_t * growbase0 = FUSE_GLU ? gedata + (int64_t) row0 * nb * MIX_BLOCK_BYTES
+                                         : nullptr;
+    const uint8_t * growbase1 = FUSE_GLU ? (two ? gedata + (int64_t) (row0 + 1) * nb * MIX_BLOCK_BYTES
+                                                : growbase0)
+                                         : nullptr;
     // src1 is [in, ne11, ntok]; the get_rows-equivalent row for (slot, token)
     // is token*ne11 + slot%ne11 — i.e. token column + the slot%ne11 broadcast.
     const float * xcol = src1 + (int64_t) token * src1_s2 + (int64_t) (slot % ne11) * src1_s1;
@@ -564,6 +606,11 @@ __global__ void mix_matvec_rocmfp2_moe_kernel(
     // loads to one issue per element — halving activation LSU issue on this partly
     // load-instruction-bound matvec — WITHOUT reordering either row's summation.
     float acc0 = 0.0f, acc1 = 0.0f;
+    // Gate accumulates in its own registers over the SAME block order, so gacc is bit-identical
+    // to what the separate gate launch produced. All four folds share one `xcol`, so the fused
+    // form reads the activation column once for four rows instead of once for two -- on a launch
+    // that is partly load-issue bound, that is the second saving after the launch itself.
+    float gacc0 = 0.0f, gacc1 = 0.0f;
     int blk = lane;
     for (; blk + (MIX_UNROLL - 1) * MIX_WARP < nb; blk += MIX_UNROLL * MIX_WARP) {
         #pragma unroll
@@ -571,20 +618,40 @@ __global__ void mix_matvec_rocmfp2_moe_kernel(
             const int b = blk + u * MIX_WARP;
             mix_block_accum(rowbase0 + (int64_t) b * MIX_BLOCK_BYTES, xcol, b * MIX_QK, mode, s_lut, acc0);
             mix_block_accum(rowbase1 + (int64_t) b * MIX_BLOCK_BYTES, xcol, b * MIX_QK, mode, s_lut, acc1);
+            if (FUSE_GLU) {
+                mix_block_accum(growbase0 + (int64_t) b * MIX_BLOCK_BYTES, xcol, b * MIX_QK, gmode, s_lut + 2 * MIX_K, gacc0);
+                mix_block_accum(growbase1 + (int64_t) b * MIX_BLOCK_BYTES, xcol, b * MIX_QK, gmode, s_lut + 2 * MIX_K, gacc1);
+            }
         }
     }
     for (; blk < nb; blk += MIX_WARP) {
         mix_block_accum(rowbase0 + (int64_t) blk * MIX_BLOCK_BYTES, xcol, blk * MIX_QK, mode, s_lut, acc0);
         mix_block_accum(rowbase1 + (int64_t) blk * MIX_BLOCK_BYTES, xcol, blk * MIX_QK, mode, s_lut, acc1);
+        if (FUSE_GLU) {
+            mix_block_accum(growbase0 + (int64_t) blk * MIX_BLOCK_BYTES, xcol, blk * MIX_QK, gmode, s_lut + 2 * MIX_K, gacc0);
+            mix_block_accum(growbase1 + (int64_t) blk * MIX_BLOCK_BYTES, xcol, blk * MIX_QK, gmode, s_lut + 2 * MIX_K, gacc1);
+        }
     }
     #pragma unroll
     for (int off = MIX_WARP/2; off > 0; off >>= 1) {
         acc0 += mix_warp_shfl_down(acc0, off);
         acc1 += mix_warp_shfl_down(acc1, off);
+        if (FUSE_GLU) {
+            gacc0 += mix_warp_shfl_down(gacc0, off);
+            gacc1 += mix_warp_shfl_down(gacc1, off);
+        }
     }
     if (lane == 0) {
-        dst[(int64_t) token * dst_s2 + (int64_t) slot * dst_s1 + row0] = acc0;
-        if (two) dst[(int64_t) token * dst_s2 + (int64_t) slot * dst_s1 + row0 + 1] = acc1;
+        const int64_t o = (int64_t) token * dst_s2 + (int64_t) slot * dst_s1 + row0;
+        if (FUSE_GLU) {
+            // The SAME function the standalone swiglu_ds4 kernel applies, on inputs bit-identical
+            // to the ones it would have read back from the two intermediates.
+            dst[o]                = ggml_cuda_op_swiglu_ds4_single(gacc0, acc0, glu_limit);
+            if (two) dst[o + 1]   = ggml_cuda_op_swiglu_ds4_single(gacc1, acc1, glu_limit);
+        } else {
+            dst[o]                = acc0;
+            if (two) dst[o + 1]   = acc1;
+        }
     }
 }
 
@@ -647,10 +714,47 @@ bool ggml_cuda_rocmfp2_mix_mul_mat_id(
     // of `warps_per_block` warps covers 2*warps_per_block rows.
     const int rows_per_block = 2 * warps_per_block;
     dim3 grid((out + rows_per_block - 1) / rows_per_block, n_expert_used, n_tokens);
-    mix_matvec_rocmfp2_moe_kernel<<<grid, dim3(threads), 0, stream>>>(
+    mix_matvec_rocmfp2_moe_kernel<false><<<grid, dim3(threads), 0, stream>>>(
         (const uint8_t *) e.base, e.nb02, e.codebooks, e.modes,
         src1, ids, dst, in, out, ne11,
-        ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2);
+        ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2,
+        nullptr, 0, nullptr, nullptr, 0.0f);
+    return true;
+}
+
+// Fused gate/up + SwiGLU for a DeepSeek4 qtype-106 expert pair. `vx_up` is the surviving
+// mul_mat_id's src0 and `vx_gate` the collapsed one, matching the mmvq fusion convention
+// (swiglu_ds4 applies silu to GATE, so the two are not interchangeable).
+//
+// Refuses -- leaving the caller's unfused path intact -- unless BOTH tensors are registered and
+// agree on shape. A registry miss on one half would otherwise fuse a decoded tensor with a
+// garbage one, and the artifact loads either way, so this is the "fluent garbage" failure mode
+// rather than a crash.
+bool ggml_cuda_rocmfp2_mix_mul_mat_id_glu(
+        const void * vx_up, const void * vx_gate,
+        const float * src1, const int32_t * ids, float * dst,
+        int in, int out, int n_expert_used, int n_tokens, int ne11,
+        int64_t ids_s0, int64_t ids_s1,
+        int64_t src1_s1, int64_t src1_s2,
+        int64_t dst_s1, int64_t dst_s2,
+        float glu_limit, cudaStream_t stream) {
+    MixEntry eu, eg;
+    int expert0_u, expert0_g;
+    if (!mix_lookup(vx_up, eu, expert0_u) || !mix_lookup(vx_gate, eg, expert0_g)) {
+        return false;
+    }
+    if (eu.in != eg.in || eu.out != eg.out || eu.n_experts != eg.n_experts) {
+        return false;   // not a matched pair; the caller's two-launch path is still correct
+    }
+    const int warps_per_block = 2;
+    const int threads = warps_per_block * MIX_WARP;
+    const int rows_per_block = 2 * warps_per_block;
+    dim3 grid((out + rows_per_block - 1) / rows_per_block, n_expert_used, n_tokens);
+    mix_matvec_rocmfp2_moe_kernel<true><<<grid, dim3(threads), 0, stream>>>(
+        (const uint8_t *) eu.base, eu.nb02, eu.codebooks, eu.modes,
+        src1, ids, dst, in, out, ne11,
+        ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2,
+        (const uint8_t *) eg.base, eg.nb02, eg.codebooks, eg.modes, glu_limit);
     return true;
 }
 
