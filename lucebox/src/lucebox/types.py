@@ -248,6 +248,10 @@ class DflashRuntime:
     kvflash_tau: int = 64
     spark: bool = False
     spark_vram_gb: float = 0.0
+    # DeepSeek4's architecture-specific prefill implementation. ``exact`` is
+    # the quality-safe default. ``dense`` and ``sparse`` are approximate,
+    # monolithic-HIP preview paths and are never selected silently.
+    ds4_prefill: Literal["exact", "dense", "sparse"] = "exact"
     # Phase-1 (thinking) cap when a request opts into thinking. Default mirrors
     # antirez/ds4 ds4_eval.c: think_max_tokens = max_tokens - hard_limit_reply
     # budget = 16000 - 512 = 15488. The server's own hardcoded default is 10000.
@@ -319,6 +323,11 @@ class DflashRuntime:
             raise ValueError(
                 "spark_vram_gb must be finite and zero (automatic) or positive; "
                 f"got {self.spark_vram_gb!r}"
+            )
+        if self.ds4_prefill not in {"exact", "dense", "sparse"}:
+            raise ValueError(
+                "ds4_prefill must be exact, dense, or sparse; "
+                f"got {self.ds4_prefill!r}"
             )
         if self.prefill_threshold <= 0:
             raise ValueError(f"prefill_threshold must be positive; got {self.prefill_threshold!r}")

@@ -13,30 +13,9 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from lucebox.capabilities import architecture_capabilities
 from lucebox.topology import GpuDevice, HardwareTopology, from_config
 from lucebox.types import Config, DflashRuntime, PlacementRuntime
-
-
-@dataclass(frozen=True, slots=True)
-class ArchitecturePlacementCapabilities:
-    layer_split: bool
-    remote_draft: bool
-    draft_on_layer_split: bool
-    pflash_on_layer_split: bool
-    expert_offload: bool
-
-
-# Mirrors server/src/common/model_capabilities.h for the product-level paths
-# the packaged planner can actually launch. A parity test keeps this table
-# explicit and reviewable when an engine architecture changes.
-ARCHITECTURE_CAPABILITIES: dict[str, ArchitecturePlacementCapabilities] = {
-    "qwen35": ArchitecturePlacementCapabilities(True, True, True, True, False),
-    "qwen35moe": ArchitecturePlacementCapabilities(False, False, False, False, True),
-    "laguna": ArchitecturePlacementCapabilities(True, False, False, False, True),
-    "gemma4": ArchitecturePlacementCapabilities(True, False, False, False, False),
-    "deepseek4": ArchitecturePlacementCapabilities(True, False, False, False, False),
-    "qwen3": ArchitecturePlacementCapabilities(False, False, False, False, False),
-}
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,9 +65,12 @@ def _model_sizes(cfg: Config, preset: object, has_draft: bool) -> tuple[float, f
 
 
 def _primary_capacity(device: GpuDevice) -> float:
-    # Discrete GPUs need less host-side reserve; UMA devices share their pool
-    # with the OS and CPU engine buffers and therefore keep a wider margin.
-    reserve = 8.0 if device.unified_memory else 2.0
+    # ``topology`` already removes 16 GB from a UMA device's shared system
+    # memory for the OS and CPU-side engine buffers. Subtracting another UMA
+    # reserve here would double-count that margin and incorrectly reject the
+    # Strix-specific 102.4 GB DeepSeek target on a 128 GB machine. Discrete
+    # devices still retain a small allocator/working-buffer reserve.
+    reserve = 0.0 if device.unified_memory else 2.0
     return max(0.0, float(device.effective_memory_gb) - reserve)
 
 
@@ -230,10 +212,28 @@ def automatic_placement(
         )
 
     architecture = str(getattr(preset, "architecture", ""))
-    capabilities = ARCHITECTURE_CAPABILITIES.get(
-        architecture,
-        ArchitecturePlacementCapabilities(False, False, False, False, False),
-    )
+    capabilities = architecture_capabilities(architecture)
+    base = PlacementRuntime(mode="single", target_device=primary.placement_name)
+    if runtime.ds4_prefill != "exact":
+        if architecture != "deepseek4":
+            reason = "DeepSeek prefill modes can only be applied to a DeepSeek4 target"
+        elif primary.backend != "hip":
+            reason = (
+                f"DeepSeek {runtime.ds4_prefill} prefill is a HIP-only preview; "
+                f"the selected primary uses {primary.backend}"
+            )
+        else:
+            reason = ""
+        if reason:
+            return PlacementPlan(
+                runtime=base,
+                optimization_runtime=runtime,
+                summary=primary.name,
+                reason=reason,
+                runnable=False,
+                topology=topology,
+                options=(),
+            )
     secondary = _best_secondary(topology)
     target_gb, draft_gb = _model_sizes(cfg, preset, has_draft)
     scorer_gb = (
@@ -256,7 +256,6 @@ def automatic_placement(
     options: list[PlacementOption] = [
         _single_option(primary, target_fits=target_fits, stack_fits=stack_fits)
     ]
-    base = PlacementRuntime(mode="single", target_device=primary.placement_name)
     if secondary is None:
         if stack_fits:
             return PlacementPlan(
@@ -273,10 +272,15 @@ def automatic_placement(
             optimization_runtime=runtime,
             summary=primary.name,
             reason=(
-                "the target fits, but its selected optional workloads exceed this GPU's "
-                "safe memory budget"
-                if target_fits
-                else "the selected target exceeds this GPU's safe memory budget"
+                "approximate DeepSeek prefill requires the target to fit one HIP device; "
+                "choose exact prefill to enable layer splitting"
+                if runtime.ds4_prefill != "exact" and not target_fits
+                else (
+                    "the target fits, but its selected optional workloads exceed this GPU's "
+                    "safe memory budget"
+                    if target_fits
+                    else "the selected target exceeds this GPU's safe memory budget"
+                )
             ),
             runnable=False,
             topology=topology,
@@ -331,7 +335,11 @@ def automatic_placement(
         target_gb,
         max(0.0, split_primary_capacity),
     )
-    split_available = capabilities.layer_split and bool(split_devices)
+    split_available = (
+        capabilities.layer_split
+        and bool(split_devices)
+        and runtime.ds4_prefill == "exact"
+    )
     options.append(
         PlacementOption(
             key="layer-split",
@@ -342,9 +350,14 @@ def automatic_placement(
                 "capacity mode for a target that does not fit the primary GPU"
                 if split_available
                 else (
-                    f"{architecture or 'this model'} has no engine layer-split path"
-                    if not capabilities.layer_split
-                    else "a compatible runtime or enough combined safe memory is unavailable"
+                    "approximate DeepSeek prefill is monolithic-only; choose exact prefill "
+                    "to use a target layer split"
+                    if runtime.ds4_prefill != "exact" and bool(split_devices)
+                    else (
+                        f"{architecture or 'this model'} has no engine layer-split path"
+                        if not capabilities.layer_split
+                        else "a compatible runtime or enough combined safe memory is unavailable"
+                    )
                 )
             ),
         )
@@ -455,11 +468,16 @@ def automatic_placement(
         optimization_runtime=runtime,
         summary=primary.name,
         reason=(
-            "the target fits the primary, but its optional workloads do not and no validated "
-            "secondary-device placement is available"
-            if target_fits
-            else "the target does not fit the primary and no validated secondary-device "
-            "placement is available"
+            "approximate DeepSeek prefill requires the target to fit one HIP device; "
+            "choose exact prefill to enable layer splitting"
+            if runtime.ds4_prefill != "exact" and not target_fits
+            else (
+                "the target fits the primary, but its optional workloads do not and no validated "
+                "secondary-device placement is available"
+                if target_fits
+                else "the target does not fit the primary and no validated secondary-device "
+                "placement is available"
+            )
         ),
         runnable=False,
         topology=topology,

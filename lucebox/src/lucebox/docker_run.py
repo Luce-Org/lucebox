@@ -388,6 +388,8 @@ def server_run_spec(cfg: Config) -> DockerRunSpec:
         env.append(("DFLASH_SPARK", "1"))
         if cfg.dflash.spark_vram_gb > 0.0:
             env.append(("DFLASH_SPARK_VRAM_GB", f"{cfg.dflash.spark_vram_gb:g}"))
+    if cfg.dflash.ds4_prefill != "exact":
+        env.append(("DFLASH_DS4_PREFILL", cfg.dflash.ds4_prefill))
     # fa_window=0 is the server's own default (full attention); only emit
     # the env when the operator has selected a sparse decode window. The
     # entrypoint mirrors this guard so an unset env reproduces the

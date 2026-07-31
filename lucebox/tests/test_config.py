@@ -334,6 +334,7 @@ def test_optimization_fields_round_trip_and_validate(tmp_path: Path) -> None:
         "kvflash_tau = 96\n"
         "spark = true\n"
         "spark_vram_gb = 14.5\n"
+        'ds4_prefill = "sparse"\n'
     )
 
     loaded = config.load(path)
@@ -344,6 +345,7 @@ def test_optimization_fields_round_trip_and_validate(tmp_path: Path) -> None:
     assert loaded.dflash.kvflash_tau == 96
     assert loaded.dflash.spark is True
     assert loaded.dflash.spark_vram_gb == 14.5
+    assert loaded.dflash.ds4_prefill == "sparse"
 
 
 @pytest.mark.parametrize(
@@ -356,6 +358,7 @@ def test_optimization_fields_round_trip_and_validate(tmp_path: Path) -> None:
         ("dflash.spark_vram_gb", "-1"),
         ("dflash.spark_vram_gb", "nan"),
         ("dflash.spark_vram_gb", "inf"),
+        ("dflash.ds4_prefill", "fast"),
     ],
 )
 def test_config_rejects_invalid_optimization_values(tmp_path: Path, key: str, value: str) -> None:

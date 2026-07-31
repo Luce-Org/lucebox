@@ -93,6 +93,13 @@ def _cast_kvflash_policy(v: Any) -> Literal["drafter", "lru", "qk"]:
     return cast(Literal["drafter", "lru", "qk"], value)
 
 
+def _cast_ds4_prefill(v: Any) -> Literal["exact", "dense", "sparse"]:
+    value = str(v).strip().lower()
+    if value not in {"exact", "dense", "sparse"}:
+        raise ValueError(f"ds4_prefill must be exact/dense/sparse, got {value!r}")
+    return cast(Literal["exact", "dense", "sparse"], value)
+
+
 def _cast_positive_int(v: Any) -> int:
     value = int(v)
     if value <= 0:
@@ -221,6 +228,7 @@ KEY_REGISTRY: dict[str, tuple[tuple[str, str], Callable[[Any], Any]]] = {
     "dflash.kvflash_tau": (("dflash", "kvflash_tau"), _cast_positive_int),
     "dflash.spark": (("dflash", "spark"), _cast_bool),
     "dflash.spark_vram_gb": (("dflash", "spark_vram_gb"), _cast_nonnegative_float),
+    "dflash.ds4_prefill": (("dflash", "ds4_prefill"), _cast_ds4_prefill),
     "dflash.think_max": (("dflash", "think_max"), int),
     "dflash.fa_window": (("dflash", "fa_window"), int),
     "dflash.think_soft_close_min_ratio": (
@@ -372,6 +380,7 @@ def _from_dict(raw: dict[str, Any]) -> Config:
         kvflash_tau=_cast_positive_int(df.get("kvflash_tau", 64)),
         spark=_cast_bool(df.get("spark", False)),
         spark_vram_gb=_cast_nonnegative_float(df.get("spark_vram_gb", 0.0)),
+        ds4_prefill=_cast_ds4_prefill(df.get("ds4_prefill", "exact")),
         think_max=int(df.get("think_max", 15488)),
         fa_window=int(df.get("fa_window", 0)),
         think_soft_close_min_ratio=_cast_think_soft_close_min_ratio(

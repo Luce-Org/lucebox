@@ -26,6 +26,7 @@ from rich.markup import escape
 from rich.table import Table
 
 import lucebox.autotune as autotune_mod
+import lucebox.capabilities as capabilities_mod
 import lucebox.config as config_mod
 import lucebox.docker_run as docker_run
 import lucebox.download as download_mod
@@ -621,6 +622,11 @@ def _render_optimization_plan(
     placement_state = "[green]ready[/green]" if plan.placement.runnable else "[red]blocked[/red]"
     console.print(f"Execution: [bold]{escape(plan.placement.summary)}[/bold] ({placement_state})")
     console.print(f"[dim]{escape(plan.placement.reason)}[/dim]")
+    strategies = "  ·  ".join(
+        f"{phase}: [bold]{escape(strategy)}[/bold]"
+        for phase, strategy in plan.phase_strategies
+    )
+    console.print(strategies)
     table = Table(show_header=True, box=None, pad_edge=False)
     table.add_column("Optimization", style="bold")
     table.add_column("State")
@@ -628,6 +634,11 @@ def _render_optimization_plan(
     for decision in plan.decisions:
         if decision.enabled:
             state = "[green]ON[/green]"
+        elif (
+            decision.available
+            and decision.qualification is capabilities_mod.Qualification.PREVIEW
+        ):
+            state = "[yellow]preview[/yellow]"
         elif decision.available:
             state = "[dim]off[/dim]"
         else:
@@ -651,12 +662,14 @@ def _render_custom_runtime(
     table = Table(show_header=True, box=None, pad_edge=False)
     table.add_column("Optimization", style="bold")
     table.add_column("Selected")
-    selections = (
+    selections = [
         ("DFlash", runtime.speculative_decode),
         ("PFlash", runtime.prefill_mode != "off"),
         ("KVFlash", runtime.kvflash != "off"),
         ("Spark", runtime.spark),
-    )
+    ]
+    if runtime.ds4_prefill != "exact":
+        selections.append((f"DeepSeek {runtime.ds4_prefill} prefill", True))
     for name, enabled in selections:
         table.add_row(name, "[green]ON[/green]" if enabled else "[dim]off[/dim]")
     console.print(table)
@@ -705,6 +718,8 @@ def _customize_runtime(
 ) -> DflashRuntime:
     """Prompt only for product-level choices; keep low-level knobs automatic."""
     preset = download_mod.PRESETS.get(cfg.model.preset)
+    profile = capabilities_mod.model_profile(preset.name) if preset is not None else None
+    kvflash_capability = profile.kvflash if profile is not None else None
     runtime = plan.runtime
     console.print("\n[bold]Customize optimizations[/bold]")
     console.print("[dim]Context, cache format, and budgets remain hardware-tuned.[/dim]\n")
@@ -728,8 +743,21 @@ def _customize_runtime(
     else:
         console.print(f"PFlash: [dim]unavailable — {escape(plan.pflash.reason)}[/dim]")
 
+    ds4_prefill: Literal["exact", "dense", "sparse"] = "exact"
+    if plan.prefill_alternative is not None and plan.prefill_alternative.available:
+        console.print(
+            "[yellow]DeepSeek sparse prefill is approximate and currently a HIP preview.[/yellow]"
+        )
+        if typer.confirm("Enable DeepSeek sparse prefill?", default=False):
+            assert profile is not None and profile.deepseek_prefill is not None
+            ds4_prefill = profile.deepseek_prefill.mode
+
     kvflash = False
-    kvflash_policy: Literal["drafter", "lru", "qk"] = "drafter"
+    kvflash_policy: Literal["drafter", "lru", "qk"] = (
+        kvflash_capability.preferred_policy
+        if kvflash_capability is not None
+        else "drafter"
+    )
     if preset is not None and plan.kvflash.available:
         kvflash = typer.confirm(
             "Enable KVFlash bounded long-context memory?", default=plan.kvflash.enabled
@@ -738,14 +766,14 @@ def _customize_runtime(
         console.print(f"KVFlash: [dim]unavailable — {escape(plan.kvflash.reason)}[/dim]")
     if kvflash:
         has_scorer = download_mod.optimizer_drafter_installed(cfg)
-        if has_scorer:
-            policy_choices = "drafter"
-            if preset is not None and preset.architecture == "qwen35":
-                policy_choices += "/qk/lru"
-            else:
-                policy_choices += "/lru"
+        policies = kvflash_capability.policies if kvflash_capability is not None else ()
+        if has_scorer and policies and kvflash_capability is not None:
+            policy_choices = "/".join(policies)
             answer = (
-                typer.prompt(f"KVFlash policy ({policy_choices})", default="drafter")
+                typer.prompt(
+                    f"KVFlash policy ({policy_choices})",
+                    default=kvflash_capability.preferred_policy,
+                )
                 .strip()
                 .lower()
             )
@@ -759,21 +787,35 @@ def _customize_runtime(
                 kvflash_policy = "lru"
             else:
                 kvflash_policy = "drafter"
-        elif preset is not None and preset.architecture == "qwen35":
-            kvflash_policy = "qk"
-            console.print("KVFlash policy: [bold]qk[/bold] (no extra scorer required)")
         else:
-            console.print(
-                "[yellow]KVFlash would use recency-only LRU without the shared scorer; "
-                "older context can be evicted.[/yellow]"
+            scorerless_policy = (
+                kvflash_capability.scorerless_policy
+                if kvflash_capability is not None
+                else None
             )
-            if typer.confirm("Install the scorer instead?", default=True):
-                if _ensure_optimizer_drafter(cfg):
-                    kvflash_policy = "drafter"
-                else:
-                    kvflash_policy = "lru"
+            if scorerless_policy == "qk":
+                kvflash_policy = "qk"
+                console.print("KVFlash policy: [bold]qk[/bold] (no extra scorer required)")
             else:
-                kvflash_policy = "lru"
+                if scorerless_policy == "lru":
+                    console.print(
+                        "[yellow]Without the shared scorer, KVFlash uses recency-only LRU; "
+                        "older context can be evicted.[/yellow]"
+                    )
+                if typer.confirm("Install the scorer instead?", default=True):
+                    if _ensure_optimizer_drafter(cfg):
+                        kvflash_policy = "drafter"
+                    elif scorerless_policy is not None:
+                        kvflash_policy = scorerless_policy
+                    else:
+                        kvflash = False
+                elif scorerless_policy is not None:
+                    kvflash_policy = scorerless_policy
+                else:
+                    kvflash = False
+                    console.print(
+                        "[yellow]KVFlash left off because this model requires its scorer.[/yellow]"
+                    )
 
     spark = False
     if plan.spark.available:
@@ -793,13 +835,22 @@ def _customize_runtime(
         speculative_decode=speculative_decode,
         lazy=False if not speculative_decode else runtime.lazy,
         prefill_mode="auto" if pflash else "off",
-        prefill_keep_ratio=0.10 if pflash else runtime.prefill_keep_ratio,
-        prefill_threshold=32768,
+        prefill_keep_ratio=(
+            profile.pflash.keep_ratio
+            if pflash and profile is not None and profile.pflash is not None
+            else runtime.prefill_keep_ratio
+        ),
+        prefill_threshold=(
+            profile.pflash.minimum_context
+            if profile is not None and profile.pflash is not None
+            else runtime.prefill_threshold
+        ),
         prefill_drafter=prefill_drafter,
         kvflash="auto" if kvflash else "off",
         kvflash_policy=kvflash_policy,
         spark=spark,
         spark_vram_gb=0.0,
+        ds4_prefill=ds4_prefill,
         fa_window=0 if kvflash else runtime.fa_window,
     )
 

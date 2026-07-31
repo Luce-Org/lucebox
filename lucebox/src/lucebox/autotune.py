@@ -11,7 +11,15 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Literal
 
+from lucebox.capabilities import (
+    FeatureCapability,
+    KvFlashCapability,
+    ModelOptimizationProfile,
+    Qualification,
+    model_profile,
+)
 from lucebox.placement import PlacementPlan, automatic_placement
+from lucebox.topology import from_config
 from lucebox.types import Config, DflashRuntime, HostFacts
 
 
@@ -23,6 +31,7 @@ class OptimizationDecision:
     enabled: bool
     available: bool
     reason: str
+    qualification: Qualification = Qualification.QUALIFIED
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,15 +45,31 @@ class OptimizationPlan:
     pflash: OptimizationDecision
     kvflash: OptimizationDecision
     spark: OptimizationDecision
+    prefill_alternative: OptimizationDecision | None = None
+    prefill_strategy: str = "not selected"
+    decode_strategy: str = "not selected"
+    kv_strategy: str = "not selected"
     needs_optimizer_drafter: bool = False
 
     @property
     def decisions(self) -> tuple[OptimizationDecision, ...]:
-        return (self.dflash, self.pflash, self.kvflash, self.spark)
+        core = (self.dflash, self.pflash, self.kvflash, self.spark)
+        if self.prefill_alternative is None:
+            return core
+        return (*core, self.prefill_alternative)
 
     @property
     def active_names(self) -> tuple[str, ...]:
         return tuple(item.name for item in self.decisions if item.enabled)
+
+    @property
+    def phase_strategies(self) -> tuple[tuple[str, str], ...]:
+        """Resolved implementation for each performance-critical phase."""
+        return (
+            ("Prefill", self.prefill_strategy),
+            ("Decode", self.decode_strategy),
+            ("KV cache", self.kv_strategy),
+        )
 
 
 def _budget_for_host(host: HostFacts) -> int:
@@ -134,15 +159,17 @@ def _cap_exact_context(
     runtime: DflashRuntime,
     *,
     headroom_gb: float,
-    arch: str,
+    profile: ModelOptimizationProfile,
+    backend: str,
 ) -> DflashRuntime:
     """Keep exact-cache families inside conservative primary-GPU headroom.
 
-    Qwen families have an automatic bounded-residency path below; other
-    families currently keep their exact cache in Automatic mode. Those models
-    get a smaller context when their weights/draft leave little working room.
+    Models with a qualified automatic bounded-residency path are handled by
+    the planner below. Other models keep exact cache semantics in Automatic
+    mode and receive a smaller context when weights leave little working room.
     """
-    if arch in {"qwen35", "qwen35moe"}:
+    kvflash = profile.kvflash
+    if kvflash is not None and kvflash.feature.automatic_on(backend):
         return runtime
     if headroom_gb < 4:
         return replace(runtime, max_ctx=min(runtime.max_ctx, 8192))
@@ -151,7 +178,12 @@ def _cap_exact_context(
     return runtime
 
 
-CapacityAdjustment = Literal["pflash", "kvflash-qk", "kvflash-off", "dflash"]
+CapacityAdjustment = Literal[
+    "pflash",
+    "kvflash-scorerless",
+    "kvflash-off",
+    "dflash",
+]
 
 
 def _uses_optimizer_scorer(runtime: DflashRuntime) -> bool:
@@ -168,7 +200,7 @@ def _without_unused_scorer(runtime: DflashRuntime) -> DflashRuntime:
 def _capacity_fallbacks(
     runtime: DflashRuntime,
     *,
-    architecture: str,
+    kvflash: KvFlashCapability | None,
 ) -> tuple[tuple[DflashRuntime, CapacityAdjustment], ...]:
     """Return progressively smaller optional stacks, in performance order.
 
@@ -199,9 +231,10 @@ def _capacity_fallbacks(
         candidates.append((current, "pflash"))
 
     if current.kvflash != "off" and current.kvflash_policy == "drafter":
-        if architecture == "qwen35":
-            current = replace(current, kvflash_policy="qk")
-            action: CapacityAdjustment = "kvflash-qk"
+        scorerless_policy = kvflash.scorerless_policy if kvflash is not None else None
+        if scorerless_policy is not None:
+            current = replace(current, kvflash_policy=scorerless_policy)
+            action: CapacityAdjustment = "kvflash-scorerless"
         else:
             current = replace(current, kvflash="off")
             action = "kvflash-off"
@@ -215,6 +248,36 @@ def _capacity_fallbacks(
     return tuple(candidates)
 
 
+def _selected_backend(cfg: Config) -> str:
+    """Return the backend of the runtime's primary device."""
+    primary = from_config(cfg).primary
+    if primary is not None:
+        return primary.backend
+    # Config snapshots predating the inventory fields can still carry the
+    # selected generic vendor. Placement remains blocked when the configured
+    # image and inventory disagree; this fallback is only for feature support
+    # reporting and migration of those snapshots.
+    if cfg.host.gpu_vendor == "nvidia":
+        return "cuda"
+    if cfg.host.gpu_vendor == "amd":
+        return "hip"
+    return ""
+
+
+def _qualification(feature: FeatureCapability | None, backend: str) -> Qualification:
+    if feature is None:
+        return Qualification.UNAVAILABLE
+    return feature.qualification_on(backend)
+
+
+def _preview_reason(feature: FeatureCapability, backend: str) -> str:
+    backend_label = "CUDA" if backend == "cuda" else "HIP"
+    return (
+        f"{feature.label} is available as a {backend_label} preview; "
+        "Automatic keeps the qualified baseline"
+    )
+
+
 def automatic_plan(
     cfg: Config,
     *,
@@ -222,11 +285,10 @@ def automatic_plan(
 ) -> OptimizationPlan:
     """Resolve the recommended profile for the selected model and primary GPU.
 
-    Automatic mode favors exact/full-cache execution whenever it fits. PFlash
-    is enabled only for its validated Qwen3.6 dense profile. KVFlash is enabled
-    only under real memory pressure and only on qwen-family paths with a tuned
-    scorer. Spark is enabled only for supported MoE models that would otherwise
-    leave too little VRAM headroom. Advanced mode can override these choices.
+    Automatic mode favors exact/full-cache execution whenever it fits. The
+    model contract limits each feature to legal, qualified backends; measured
+    memory pressure decides whether a qualified feature is useful. Device
+    placement is then resolved independently from the detected topology.
     """
     from lucebox import download as download_mod
 
@@ -241,6 +303,7 @@ def automatic_plan(
             False,
             False,
             "choose a model first; it activates when that model has a matching draft",
+            Qualification.UNAVAILABLE,
         )
         unavailable = "choose a model first"
         placement = automatic_placement(
@@ -255,11 +318,24 @@ def automatic_plan(
             model_name=cfg.model.preset or "not selected",
             placement=placement,
             dflash=dflash,
-            pflash=OptimizationDecision("PFlash", False, False, unavailable),
-            kvflash=OptimizationDecision("KVFlash", False, False, unavailable),
-            spark=OptimizationDecision("Spark", False, False, unavailable),
+            pflash=OptimizationDecision(
+                "PFlash", False, False, unavailable, Qualification.UNAVAILABLE
+            ),
+            kvflash=OptimizationDecision(
+                "KVFlash", False, False, unavailable, Qualification.UNAVAILABLE
+            ),
+            spark=OptimizationDecision(
+                "Spark", False, False, unavailable, Qualification.UNAVAILABLE
+            ),
         )
 
+    profile = model_profile(preset.name)
+    if profile.architecture != preset.architecture:
+        raise ValueError(
+            f"optimization profile for {preset.name!r} targets {profile.architecture!r}, "
+            f"but the model catalog declares {preset.architecture!r}"
+        )
+    backend = _selected_backend(cfg)
     runtime = replace(runtime, max_ctx=min(runtime.max_ctx, preset.native_context))
     vram_known = cfg.host.vram_gb > 0
     headroom = cfg.host.vram_gb - preset.approx_total_gb if vram_known else 0
@@ -267,43 +343,100 @@ def automatic_plan(
         runtime = _cap_exact_context(
             runtime,
             headroom_gb=headroom,
-            arch=preset.architecture,
+            profile=profile,
+            backend=backend,
         )
 
     has_draft = draft_available(cfg, preset)
-    runtime = replace(runtime, speculative_decode=has_draft)
-    if has_draft:
+    decode_feature = profile.speculative_decode
+    decode_qualification = _qualification(decode_feature, backend)
+    decode_supported = decode_feature is not None and decode_feature.available_on(backend)
+    dflash_available = has_draft and decode_supported
+    dflash_enabled = (
+        dflash_available
+        and decode_feature is not None
+        and decode_feature.automatic_on(backend)
+    )
+    runtime = replace(runtime, speculative_decode=dflash_enabled)
+    if dflash_available and not dflash_enabled and decode_feature is not None:
+        dflash_reason = _preview_reason(decode_feature, backend)
+    elif dflash_enabled:
         dflash_reason = "matching speculative draft is available for this model"
+    elif has_draft and not decode_supported:
+        dflash_reason = "the installed draft is not supported by the selected backend"
     elif preset.speculator_dir:
         dflash_reason = "optional model speculator is not installed"
     elif preset.has_draft:
         dflash_reason = "matching speculative draft is not installed"
     else:
         dflash_reason = "no compatible speculative draft is published for this model"
-    dflash = OptimizationDecision("DFlash", has_draft, has_draft, dflash_reason)
+    dflash = OptimizationDecision(
+        decode_feature.label if decode_feature is not None else "DFlash",
+        dflash_enabled,
+        dflash_available,
+        dflash_reason,
+        decode_qualification,
+    )
+
+    alternative_capability = profile.deepseek_prefill
+    if alternative_capability is None:
+        prefill_alternative = None
+    else:
+        alternative_feature = alternative_capability.feature
+        alternative_qualification = alternative_feature.qualification_on(backend)
+        alternative_available = alternative_feature.available_on(backend)
+        if alternative_available:
+            alternative_reason = _preview_reason(alternative_feature, backend)
+        else:
+            alternative_reason = (
+                "this approximate prefill path is unavailable on the selected backend"
+            )
+        prefill_alternative = OptimizationDecision(
+            alternative_feature.label,
+            False,
+            alternative_available,
+            alternative_reason,
+            alternative_qualification,
+        )
 
     long_context = runtime.max_ctx >= 32768
 
-    # PFlash automatic mode is deliberately narrow: this is the profile with
-    # end-to-end long-context quality validation. Other architectures remain
-    # unavailable until the engine exposes a compatible compression path.
-    pflash_supported = preset.architecture == "qwen35"
-    pflash_available = pflash_supported and long_context
-    pflash_profile = pflash_available and vram_known
+    pflash_capability = profile.pflash
+    pflash_feature = pflash_capability.feature if pflash_capability is not None else None
+    pflash_qualification = _qualification(pflash_feature, backend)
+    pflash_supported = (
+        pflash_feature is not None and pflash_feature.available_on(backend)
+    )
+    pflash_available = (
+        pflash_supported
+        and pflash_capability is not None
+        and runtime.max_ctx >= pflash_capability.minimum_context
+    )
+    pflash_profile = (
+        pflash_available
+        and vram_known
+        and pflash_feature is not None
+        and pflash_feature.automatic_on(backend)
+    )
     pflash_enabled = pflash_profile and optimizer_drafter_available
     if pflash_enabled:
         pflash_reason = "long prompts use the installed scorer above 32K tokens"
+        assert pflash_capability is not None
         runtime = replace(
             runtime,
             prefill_mode="auto",
-            prefill_keep_ratio=0.10,
-            prefill_threshold=32768,
+            prefill_keep_ratio=pflash_capability.keep_ratio,
+            prefill_threshold=pflash_capability.minimum_context,
             prefill_drafter=download_mod.optimizer_drafter_container_path(),
         )
     elif pflash_profile:
         pflash_reason = "shared 1.2 GB scorer is not installed"
+    elif pflash_available and pflash_feature is not None:
+        pflash_reason = _preview_reason(pflash_feature, backend)
     elif not pflash_supported:
-        pflash_reason = "this model architecture has no PFlash compression path"
+        pflash_reason = (
+            f"this model has no PFlash production path; {profile.prefill_baseline} remains active"
+        )
     elif not long_context:
         pflash_reason = "the safe context for this GPU is below PFlash's long-prompt threshold"
     else:
@@ -313,60 +446,106 @@ def automatic_plan(
         pflash_enabled,
         pflash_available,
         pflash_reason,
+        pflash_qualification,
     )
 
-    # Bounded KV residency changes long-context retrieval semantics, so it is
-    # not a blanket speed toggle. Use it only when the selected stack leaves
-    # less than 5 GB for KV/compute and a tuned qwen-family policy is available.
+    # Bounded residency affects long-context retrieval semantics, so it is
+    # activated only by a model contract and only under real memory pressure.
+    kvflash_capability = profile.kvflash
+    kvflash_feature = (
+        kvflash_capability.feature if kvflash_capability is not None else None
+    )
+    kvflash_qualification = _qualification(kvflash_feature, backend)
+    kvflash_supported = (
+        kvflash_feature is not None and kvflash_feature.available_on(backend)
+    )
+    kvflash_available = (
+        kvflash_supported
+        and kvflash_capability is not None
+        and runtime.max_ctx >= kvflash_capability.minimum_context
+    )
     kvflash_profile = (
         vram_known
-        and long_context
-        and headroom < 5
-        and preset.architecture in {"qwen35", "qwen35moe"}
+        and kvflash_available
+        and kvflash_capability is not None
+        and kvflash_feature is not None
+        and kvflash_feature.automatic_on(backend)
+        and headroom < kvflash_capability.pressure_headroom_gb
     )
-    kvflash_enabled = kvflash_profile and (
-        optimizer_drafter_available or preset.architecture == "qwen35"
-    )
+    kvflash_policy = None
+    if kvflash_profile and kvflash_capability is not None:
+        kvflash_policy = (
+            kvflash_capability.preferred_policy
+            if optimizer_drafter_available
+            else kvflash_capability.scorerless_policy
+        )
+    kvflash_enabled = kvflash_policy is not None
     if kvflash_enabled:
-        policy: Literal["drafter", "qk"] = "drafter" if optimizer_drafter_available else "qk"
-        runtime = replace(runtime, kvflash="auto", kvflash_policy=policy)
-        if optimizer_drafter_available and not runtime.prefill_drafter:
+        assert kvflash_policy is not None
+        runtime = replace(runtime, kvflash="auto", kvflash_policy=kvflash_policy)
+        if kvflash_policy == "drafter" and not runtime.prefill_drafter:
             runtime = replace(
                 runtime,
                 prefill_drafter=download_mod.optimizer_drafter_container_path(),
             )
-        kvflash_reason = f"only {headroom} GB VRAM headroom; {policy} policy bounds KV residency"
+        kvflash_reason = (
+            f"only {headroom} GB VRAM headroom; {kvflash_policy} policy bounds KV residency"
+        )
     elif kvflash_profile:
         kvflash_reason = "memory pressure detected, but no quality-safe scorer is installed"
-    elif not long_context:
+    elif kvflash_available and kvflash_feature is not None:
+        if kvflash_feature.qualification_on(backend) is Qualification.PREVIEW:
+            kvflash_reason = _preview_reason(kvflash_feature, backend)
+        else:
+            kvflash_reason = "full KV cache fits; exact full-cache execution is preferred"
+    elif kvflash_capability is not None and runtime.max_ctx < kvflash_capability.minimum_context:
         kvflash_reason = "the selected context does not need bounded KV residency"
-    elif preset.architecture not in {"qwen35", "qwen35moe"}:
-        kvflash_reason = "cross-tokenizer residency remains an Advanced choice"
     else:
-        kvflash_reason = "full KV cache fits; exact full-cache execution is preferred"
+        kvflash_reason = (
+            f"this model uses {profile.kv_baseline} instead of generic KVFlash"
+        )
     kvflash = OptimizationDecision(
         "KVFlash",
         kvflash_enabled,
-        long_context,
+        kvflash_available,
         kvflash_reason,
+        kvflash_qualification,
     )
 
-    spark_available = preset.architecture in {"laguna", "qwen35moe"}
-    spark_pressure = spark_available and vram_known and headroom < 6
+    spark_capability = profile.spark
+    spark_feature = spark_capability.feature if spark_capability is not None else None
+    spark_qualification = _qualification(spark_feature, backend)
+    spark_available = spark_feature is not None and spark_feature.available_on(backend)
+    spark_pressure = (
+        spark_available
+        and vram_known
+        and spark_capability is not None
+        and headroom < spark_capability.pressure_headroom_gb
+    )
     # Cold experts live in host RAM. A 20–22 GB preset plus the OS, runtime,
     # KV spill, and working buffers is not a safe automatic fit below 32 GB.
     # Advanced mode can still let an informed operator opt in.
-    spark_host_ready = cfg.host.ram_gb >= 32
-    spark_enabled = spark_pressure and spark_host_ready
+    minimum_host_ram = (
+        spark_capability.minimum_host_ram_gb if spark_capability is not None else 0
+    )
+    spark_host_ready = cfg.host.ram_gb >= minimum_host_ram
+    spark_enabled = (
+        spark_pressure
+        and spark_host_ready
+        and spark_feature is not None
+        and spark_feature.automatic_on(backend)
+    )
     runtime = replace(runtime, spark=spark_enabled)
     if spark_enabled:
         spark_reason = f"MoE weights leave {headroom} GB headroom; expert residency self-tunes"
+    elif spark_pressure and spark_feature is not None and not spark_feature.automatic_on(backend):
+        spark_reason = _preview_reason(spark_feature, backend)
     elif spark_pressure and cfg.host.ram_gb <= 0:
         spark_reason = "GPU memory is tight, but host RAM is unknown; automatic offload stays off"
     elif spark_pressure:
         spark_reason = (
             f"GPU memory is tight, but {cfg.host.ram_gb} GB host RAM is below "
-            "the 32 GB automatic offload floor"
+            f"the {minimum_host_ram} GB automatic offload floor"
         )
     elif spark_available and vram_known:
         spark_reason = "the model fits the primary GPU; all-GPU execution is faster and simpler"
@@ -374,30 +553,41 @@ def automatic_plan(
         spark_reason = "GPU memory is unknown; automatic mode will not assume offload"
     else:
         spark_reason = "this is not a Spark-compatible MoE architecture"
-    spark = OptimizationDecision("Spark", spark_enabled, spark_available, spark_reason)
+    spark = OptimizationDecision(
+        "Spark",
+        spark_enabled,
+        spark_available,
+        spark_reason,
+        spark_qualification,
+    )
 
     needs_optimizer_drafter = not optimizer_drafter_available and (
-        pflash_profile or (kvflash_profile and preset.architecture == "qwen35moe")
+        pflash_profile
+        or (
+            kvflash_profile
+            and kvflash_capability is not None
+            and kvflash_capability.scorerless_policy is None
+        )
     )
     placement = automatic_placement(
         cfg,
         runtime,
         preset,
-        has_draft=has_draft,
+        has_draft=dflash_enabled,
         optimizer_drafter_available=optimizer_drafter_available,
     )
     capacity_adjustments: set[CapacityAdjustment] = set()
     if not placement.runnable:
         for fallback_runtime, adjustment in _capacity_fallbacks(
             runtime,
-            architecture=preset.architecture,
+            kvflash=kvflash_capability,
         ):
             capacity_adjustments.add(adjustment)
             placement = automatic_placement(
                 cfg,
                 fallback_runtime,
                 preset,
-                has_draft=has_draft and fallback_runtime.speculative_decode,
+                has_draft=dflash_enabled and fallback_runtime.speculative_decode,
                 optimizer_drafter_available=optimizer_drafter_available,
             )
             runtime = fallback_runtime
@@ -412,10 +602,11 @@ def automatic_plan(
             else "disabled because the selected target placement has no compatible draft path"
         )
         dflash = OptimizationDecision(
-            "DFlash",
+            dflash.name,
             False,
             dflash.available,
             reason,
+            dflash.qualification,
         )
     if pflash.enabled and adjusted.prefill_mode == "off":
         reason = (
@@ -428,6 +619,7 @@ def automatic_plan(
             False,
             pflash.available,
             reason,
+            pflash.qualification,
         )
     if kvflash.enabled and adjusted.kvflash == "off":
         reason = (
@@ -440,13 +632,15 @@ def automatic_plan(
             False,
             kvflash.available,
             reason,
+            kvflash.qualification,
         )
-    elif "kvflash-qk" in capacity_adjustments:
+    elif "kvflash-scorerless" in capacity_adjustments:
         kvflash = OptimizationDecision(
             "KVFlash",
             True,
             kvflash.available,
-            "memory is tight; QK policy avoids a separate scorer allocation",
+            f"memory is tight; {adjusted.kvflash_policy} policy avoids a separate scorer allocation",
+            kvflash.qualification,
         )
     if spark.enabled and not adjusted.spark:
         spark = OptimizationDecision(
@@ -454,7 +648,28 @@ def automatic_plan(
             False,
             spark.available,
             "disabled because Automatic does not compose Spark with target layer splitting",
+            spark.qualification,
         )
+    if (
+        prefill_alternative is not None
+        and prefill_alternative.available
+        and alternative_capability is not None
+    ):
+        alternative_placement = automatic_placement(
+            cfg,
+            replace(adjusted, ds4_prefill=alternative_capability.mode),
+            preset,
+            has_draft=adjusted.speculative_decode,
+            optimizer_drafter_available=optimizer_drafter_available,
+        )
+        if not alternative_placement.runnable:
+            prefill_alternative = OptimizationDecision(
+                prefill_alternative.name,
+                False,
+                False,
+                alternative_placement.reason,
+                prefill_alternative.qualification,
+            )
     if needs_optimizer_drafter:
         # Do not ask a first-time user to download 1.2 GB only to discard the
         # scorer during capacity fallback. The scorer-present branch cannot
@@ -471,5 +686,13 @@ def automatic_plan(
         pflash=pflash,
         kvflash=kvflash,
         spark=spark,
+        prefill_alternative=prefill_alternative,
+        prefill_strategy=(pflash.name if pflash.enabled else profile.prefill_baseline),
+        decode_strategy=(dflash.name if dflash.enabled else profile.decode_baseline),
+        kv_strategy=(
+            f"{kvflash.name} ({adjusted.kvflash_policy})"
+            if kvflash.enabled
+            else profile.kv_baseline
+        ),
         needs_optimizer_drafter=needs_optimizer_drafter,
     )

@@ -33,6 +33,17 @@
 
 set -euo pipefail
 
+# ROCm packages on minimal Ubuntu images install their tools under
+# /opt/rocm/bin without necessarily adding that directory to a login shell's
+# PATH. Keep probing and native builds self-contained; this changes PATH only
+# for the wrapper process and its children.
+if [ -d /opt/rocm/bin ]; then
+    case ":${PATH:-}:" in
+        *:/opt/rocm/bin:*) ;;
+        *) export PATH="/opt/rocm/bin:${PATH:-/usr/bin:/bin}" ;;
+    esac
+fi
+
 VERSION="0.2.0"
 SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
 SCRIPT_NAME="$(basename "$SCRIPT_PATH")"
@@ -2313,6 +2324,7 @@ dflash.kvflash_policy|DFLASH_KVFLASH_POLICY
 dflash.kvflash_tau|DFLASH_KVFLASH_TAU
 dflash.spark|DFLASH_SPARK
 dflash.spark_vram_gb|DFLASH_SPARK_VRAM_GB
+dflash.ds4_prefill|DFLASH_DS4_PREFILL
 dflash.think_max|DFLASH_THINK_MAX
 dflash.fa_window|DFLASH_FA_WINDOW
 dflash.think_soft_close_min_ratio|DFLASH_THINK_SOFT_CLOSE_MIN_RATIO
@@ -2356,8 +2368,16 @@ cmd_native_build() {
     [ -f "$repo/server/deps/llama.cpp/ggml/CMakeLists.txt" ] \
         || die "git submodules are missing — run: git -C '$repo' submodule update --init --recursive"
 
-    local configure=(
-        cmake -S "$repo/server" -B "$build_dir"
+    local configure=(cmake)
+    # Prefer Ninja for a fresh build when it is available. Minimal buyer
+    # images often ship Ninja with the ROCm SDK but omit GNU make; relying on
+    # CMake's Unix Makefiles default makes an otherwise complete toolchain
+    # fail before compiler detection. Preserve an existing build's generator.
+    if [ ! -f "$build_dir/CMakeCache.txt" ] && command -v ninja >/dev/null 2>&1; then
+        configure+=(-G Ninja)
+    fi
+    configure+=(
+        -S "$repo/server" -B "$build_dir"
         -DCMAKE_BUILD_TYPE=Release
         -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON
     )

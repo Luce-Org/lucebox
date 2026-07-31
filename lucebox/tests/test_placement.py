@@ -5,9 +5,10 @@ from types import SimpleNamespace
 
 import pytest
 from lucebox.autotune import automatic_plan
+from lucebox.capabilities import ARCHITECTURE_CAPABILITIES
 from lucebox.docker_run import server_run_spec
 from lucebox.host_facts import from_env
-from lucebox.placement import ARCHITECTURE_CAPABILITIES, automatic_placement
+from lucebox.placement import automatic_placement
 from lucebox.topology import from_config
 from lucebox.types import Config, DflashRuntime, HostFacts, ModelMeta
 
@@ -77,6 +78,39 @@ def test_r9700_strix_keeps_fitting_qwen_target_on_r9700(tmp_path: Path) -> None:
     assert plan.placement.runtime.target_device == "hip:0"
     assert plan.placement.runtime.uses_multiple_devices is False
     assert "full stack fits" in plan.placement.reason
+
+
+def test_strix_128gb_does_not_double_reserve_memory_for_deepseek(
+    tmp_path: Path,
+) -> None:
+    host = HostFacts(
+        gpu_vendor="amd",
+        has_amd_gpu=True,
+        gpu_name="Radeon 8060S",
+        gpu_count=1,
+        vram_gb=125,
+        gpu_sm="gfx1151",
+        ram_gb=125,
+        amd_gpu_name="Radeon 8060S",
+        amd_gpu_count=1,
+        amd_vram_gb=125,
+        amd_gpu_arch="gfx1151",
+        amd_gpu_list_csv=_amd_csv(("Radeon 8060S", "gfx1151", 0)),
+    )
+    cfg = Config(
+        variant="rocm",
+        models_dir=tmp_path,
+        host=host,
+        model=ModelMeta(preset="deepseek-v4-flash"),
+    )
+
+    plan = automatic_plan(cfg, optimizer_drafter_available=False)
+
+    assert plan.placement.runnable is True
+    assert plan.placement.runtime.mode == "single"
+    assert plan.placement.runtime.target_device == "hip:0"
+    assert plan.prefill_alternative is not None
+    assert plan.prefill_alternative.available is True
 
 
 def test_three_same_backend_gpus_are_used_only_when_capacity_requires_them(
@@ -383,6 +417,69 @@ def test_deepseek_uses_r9700_and_strix_capacity_automatically(tmp_path: Path) ->
     assert plan.placement.runtime.target_devices == ("hip:0", "hip:1")
     assert sum(plan.placement.runtime.target_layer_split) == pytest.approx(1.0)
     assert plan.runtime.speculative_decode is False
+    assert plan.prefill_alternative is not None
+    assert plan.prefill_alternative.available is False
+    assert "requires the target to fit one HIP device" in plan.prefill_alternative.reason
+
+
+def test_deepseek_sparse_prefill_runs_only_when_target_fits_one_hip_gpu(
+    tmp_path: Path,
+) -> None:
+    host = HostFacts(
+        gpu_vendor="amd",
+        has_amd_gpu=True,
+        gpu_name="Large HIP GPU",
+        vram_gb=128,
+        gpu_sm="gfx1201",
+        ram_gb=256,
+        amd_gpu_list_csv=_amd_csv(("Large HIP GPU", "gfx1201", 131072)),
+    )
+    cfg = Config(
+        variant="rocm",
+        models_dir=tmp_path,
+        host=host,
+        model=ModelMeta(preset="deepseek-v4-flash"),
+    )
+
+    placement = automatic_placement(
+        cfg,
+        DflashRuntime(speculative_decode=False, ds4_prefill="sparse"),
+        download.PRESETS["deepseek-v4-flash"],
+        has_draft=False,
+        optimizer_drafter_available=False,
+    )
+
+    assert placement.runnable is True
+    assert placement.runtime.mode == "single"
+    assert placement.runtime.target_device == "hip:0"
+
+
+def test_deepseek_sparse_prefill_rejects_required_layer_split(tmp_path: Path) -> None:
+    host = HostFacts(
+        gpu_vendor="amd",
+        has_amd_gpu=True,
+        gpu_name="AMD Radeon AI PRO R9700",
+        gpu_count=2,
+        vram_gb=31,
+        gpu_sm="gfx1201",
+        ram_gb=125,
+        amd_gpu_list_csv=_amd_csv(
+            ("AMD Radeon AI PRO R9700", "gfx1201", 32624),
+            ("AMD Radeon Graphics", "gfx1151", 512),
+        ),
+    )
+    cfg = Config(variant="rocm", models_dir=tmp_path, host=host)
+
+    placement = automatic_placement(
+        cfg,
+        DflashRuntime(speculative_decode=False, ds4_prefill="sparse"),
+        download.PRESETS["deepseek-v4-flash"],
+        has_draft=False,
+        optimizer_drafter_available=False,
+    )
+
+    assert placement.runnable is False
+    assert "requires the target to fit one HIP device" in placement.reason
 
 
 def test_deepseek_uses_rtx_strix_paired_runtime_automatically(tmp_path: Path) -> None:

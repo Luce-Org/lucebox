@@ -397,6 +397,7 @@ def test_server_run_spec_optional_env_off_by_default(tmp_path: Path) -> None:
         "DFLASH_KVFLASH_TAU",
         "DFLASH_SPARK",
         "DFLASH_SPARK_VRAM_GB",
+        "DFLASH_DS4_PREFILL",
         "DFLASH_FA_WINDOW",
         "DFLASH_THINK_SOFT_CLOSE_MIN_RATIO",
         "DFLASH_DEBUG_THINKING_LOGITS",
@@ -423,6 +424,7 @@ def test_server_run_spec_optional_env_emitted_when_set(tmp_path: Path) -> None:
             kvflash_tau=96,
             spark=True,
             spark_vram_gb=14.5,
+            ds4_prefill="sparse",
             think_soft_close_min_ratio=0.5,
             debug_thinking_logits=True,
         ),
@@ -440,6 +442,7 @@ def test_server_run_spec_optional_env_emitted_when_set(tmp_path: Path) -> None:
     assert env["DFLASH_KVFLASH_TAU"] == "96"
     assert env["DFLASH_SPARK"] == "1"
     assert env["DFLASH_SPARK_VRAM_GB"] == "14.5"
+    assert env["DFLASH_DS4_PREFILL"] == "sparse"
     assert env["DFLASH_THINK_SOFT_CLOSE_MIN_RATIO"] == "0.5"
     assert env["DFLASH_DEBUG_THINKING_LOGITS"] == "1"
 

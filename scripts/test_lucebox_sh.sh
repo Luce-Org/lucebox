@@ -261,7 +261,11 @@ cat > "$native_tmp/bin/cmake" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "${LUCEBOX_TEST_CMAKE_LOG:?}"
 STUB
-chmod +x "$native_tmp/bin/cmake"
+cat > "$native_tmp/bin/ninja" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+chmod +x "$native_tmp/bin/cmake" "$native_tmp/bin/ninja"
 native_log="$native_tmp/cmake.log"
 native_out=""
 native_rc=0
@@ -281,6 +285,7 @@ if [ "$native_rc" -ne 0 ]; then
     report fail "native CUDA build dispatch" "exit=$native_rc output=$(head -3 <<<"$native_out")"
 elif ! grep -qF -- "-DDFLASH27B_GPU_BACKEND=cuda" "$native_log" \
      || ! grep -qF -- "-DCMAKE_CUDA_ARCHITECTURES=86" "$native_log" \
+     || ! grep -qF -- "-G Ninja" "$native_log" \
      || ! grep -qF -- "--target dflash_server backend_ipc_daemon -j 2" "$native_log"; then
     report fail "native CUDA build dispatch" "unexpected cmake argv: $(tr '\n' ' ' < "$native_log")"
 else
@@ -305,7 +310,8 @@ native_out=$(
 if [ "$native_rc" -ne 0 ]; then
     report fail "native ROCm build dispatch" "exit=$native_rc output=$(head -3 <<<"$native_out")"
 elif ! grep -qF -- "-DDFLASH27B_GPU_BACKEND=hip" "$native_log" \
-     || ! grep -qF -- "-DDFLASH27B_HIP_ARCHITECTURES=gfx1201" "$native_log"; then
+     || ! grep -qF -- "-DDFLASH27B_HIP_ARCHITECTURES=gfx1201" "$native_log" \
+     || ! grep -qF -- "-G Ninja" "$native_log"; then
     report fail "native ROCm build dispatch" "unexpected cmake argv: $(tr '\n' ' ' < "$native_log")"
 else
     report ok "native ROCm build dispatch"
@@ -901,13 +907,14 @@ test_entrypoint_optimization_flags() {
         DFLASH_KVFLASH_TAU=96 \
         DFLASH_SPARK=1 \
         DFLASH_SPARK_VRAM_GB=14 \
+        DFLASH_DS4_PREFILL=sparse \
         timeout 10 bash "$ENTRYPOINT" serve 2>&1 || true)
     rm -rf "$sandbox"
     local required missing=""
     for required in \
         "--prefill-drafter" "--prefill-compression auto" \
         "--kvflash auto" "--kvflash-policy qk" "--kvflash-tau 96" \
-        "--spark" "--spark-vram 14"; do
+        "--spark" "--spark-vram 14" "--ds4-prefill sparse"; do
         [[ "$out" == *"$required"* ]] || missing+=" $required"
     done
     if [ -n "$missing" ]; then
@@ -919,7 +926,7 @@ test_entrypoint_optimization_flags() {
     fi
 }
 test_entrypoint_optimization_flags \
-    "entrypoint forwards PFlash, KVFlash, and Spark exactly once"
+    "entrypoint forwards optimization modes exactly once"
 
 test_entrypoint_placement_flags() {
     local label="$1" sandbox draft_dir models_dir bin_dir shim_dir out

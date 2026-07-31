@@ -137,6 +137,7 @@ Untagged variables are operational tuning knobs.
 
 | Variable | Purpose |
 |---|---|
+| `DFLASH_DS4_PREFILL` | DeepSeek4 prefill mode: `exact` (default), `dense`, or `sparse`. Approximate modes require a monolithic HIP placement. |
 | `DFLASH_FP_USE_BSA` | Use block-sparse attention in flash prefill. |
 | `DFLASH_FP_ALPHA` | FlashPrefill alpha parameter. |
 | `DFLASH_FP_CHUNK_S` | FlashPrefill chunk size. |

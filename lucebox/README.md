@@ -27,15 +27,17 @@ accelerator memory cannot accidentally begin DeepSeek's roughly 114 GB
 target-plus-draft download. Older supported Gemma presets remain available by
 name and through `lucebox models list`.
 
-Automatic mode considers the selected model and the complete accelerator
-topology. It shows plain-language decisions for DFlash, PFlash, KVFlash, Spark,
-and execution placement. It keeps fitting targets on the faster primary GPU,
-uses supported secondary-device workloads under memory pressure, and enables
-memory-saving paths only when needed. Advanced mode lets experienced users
-override the four optimization choices while placement invariants, context,
-cache, and DDTree defaults remain guarded. A factory-preloaded Lucebox can ship
-the models, shared optimizer scorer, and paired runtime, so a buyer does not
-need to download or compile anything during first setup.
+Automatic mode combines a typed model capability contract with the complete
+accelerator topology. It prints the selected prefill, decode, and KV-cache
+strategies, then explains each DFlash, PFlash, KVFlash, Spark, and placement
+decision. A fitting target stays on the faster primary GPU; qualified
+secondary-device and memory-saving paths activate only when needed. Advanced
+mode exposes only policies that are legal for that model and backend while
+placement, context, cache, and DDTree invariants remain guarded. Preview paths
+are labeled and never enabled silently. In particular, DeepSeek sparse prefill
+is an explicit approximate HIP preview and exact MLA prefill remains Automatic.
+A factory-preloaded Lucebox can ship the models, shared optimizer scorer, and
+paired runtime, so a buyer does not download or compile during first setup.
 
 Spark is enabled automatically only when an MoE model is under GPU-memory
 pressure and the machine reports at least 32 GB of host RAM; its cold experts

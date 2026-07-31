@@ -173,7 +173,10 @@ PRESETS: dict[str, ModelPreset] = {
         approx_target_gb=18.9,
         approx_draft_gb=1.1,
         architecture="laguna",
-        native_context=4096,
+        # Poolside's model contract is 262K. Hardware-aware planning may pick
+        # a smaller exact-cache context, but the catalog must not erase the
+        # model's native capability (the previous 4K value did exactly that).
+        native_context=262144,
         display_name="Laguna XS.2",
         featured_rank=3,
         description=(

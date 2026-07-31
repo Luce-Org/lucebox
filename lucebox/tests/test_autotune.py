@@ -103,6 +103,11 @@ def test_qwen_24gb_enables_dflash_and_pflash_but_prefers_full_kv(
     assert plan.runtime.prefill_keep_ratio == 0.10
     assert plan.runtime.max_ctx == 98304
     assert plan.active_names == ("DFlash", "PFlash")
+    assert dict(plan.phase_strategies) == {
+        "Prefill": "PFlash",
+        "Decode": "DFlash",
+        "KV cache": "Full KV cache",
+    }
 
 
 def test_published_draft_is_not_claimed_until_it_is_installed(tmp_path: Path) -> None:
@@ -181,11 +186,52 @@ def test_laguna_uses_native_context_and_spark_under_24gb_pressure(
 
     plan = automatic_plan(cfg, optimizer_drafter_available=False)
 
-    assert plan.runtime.max_ctx == 4096
+    # Laguna advertises 262K native context. The planner keeps an exact-cache
+    # 32K cap on this tight 24 GB profile rather than the old, incorrect 4K
+    # catalog limit.
+    assert plan.runtime.max_ctx == 32768
     assert plan.dflash.enabled is False
     assert plan.pflash.available is False
     assert plan.kvflash.enabled is False
+    assert plan.kvflash.available is True
+    assert plan.kvflash.qualification.value == "preview"
     assert plan.spark.enabled is True
+    assert dict(plan.phase_strategies) == {
+        "Prefill": "Exact sparse-attention prefill",
+        "Decode": "Autoregressive decode",
+        "KV cache": "Full hybrid-attention KV cache",
+    }
+
+
+def test_deepseek_reports_native_mla_instead_of_generic_flash_features(
+    tmp_path: Path,
+) -> None:
+    cfg = Config(
+        variant="rocm",
+        models_dir=tmp_path / "models",
+        host=HostFacts(
+            gpu_vendor="amd",
+            vram_gb=128,
+            ram_gb=256,
+            gpu_sm="gfx1201",
+        ),
+        model=ModelMeta(preset="deepseek-v4-flash"),
+    )
+
+    plan = automatic_plan(cfg, optimizer_drafter_available=False)
+
+    assert plan.pflash.available is False
+    assert plan.kvflash.available is False
+    assert plan.prefill_alternative is not None
+    assert plan.prefill_alternative.available is True
+    assert plan.prefill_alternative.enabled is False
+    assert plan.runtime.ds4_prefill == "exact"
+    assert "Native MLA-compressed KV cache" in plan.kvflash.reason
+    assert dict(plan.phase_strategies) == {
+        "Prefill": "Exact MLA prefill",
+        "Decode": "Autoregressive decode",
+        "KV cache": "Native MLA-compressed KV cache",
+    }
 
 
 def test_spark_stays_off_when_host_ram_cannot_hold_cold_experts(

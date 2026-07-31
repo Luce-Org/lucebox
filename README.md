@@ -115,12 +115,16 @@ lucebox
 `lucebox` opens the branded menu. **Quick setup** detects NVIDIA CUDA or AMD
 ROCm, lets you choose and download a model, applies a model- and hardware-aware
 **Automatic** profile, and starts the inference service. Automatic explains its
-DFlash, PFlash, KVFlash, and Spark choices and prefers exact, all-GPU execution
-when it fits. It enables paging or expert offload only when the selected model
-and primary GPU need them; Spark also requires enough host RAM for its cold
-experts. **Review optimizations** offers an Advanced mode for users who want to
-override those four choices. Wi-Fi and device provisioning
-are intentionally outside this inference-only CLI.
+DFlash, PFlash, KVFlash, and Spark choices, and also prints the resolved
+prefill, decode, and KV-cache strategy. A typed capability contract prevents
+unsupported model/backend combinations; preview paths are labeled and stay off
+in Automatic. Exact, all-GPU execution remains preferred when it fits. Paging
+or expert offload activates only when the selected model and primary GPU need
+it; Spark also requires enough host RAM for its cold experts. **Review
+optimizations** exposes only model-compatible overrides. DeepSeek sparse
+prefill is available there as an approximate, monolithic-HIP preview; exact MLA
+prefill remains the default. Wi-Fi and device provisioning are intentionally
+outside this inference-only CLI.
 
 Automatic inventories every NVIDIA and AMD accelerator, then writes one
 validated execution plan together with the optimization profile. A model that

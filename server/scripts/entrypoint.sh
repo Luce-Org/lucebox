@@ -367,6 +367,7 @@ fi
 : "${DFLASH_KVFLASH_TAU:=64}"
 : "${DFLASH_SPARK:=0}"
 : "${DFLASH_SPARK_VRAM_GB:=0}"
+: "${DFLASH_DS4_PREFILL:=exact}"
 # Optional server default for requests that omit max_tokens. When unset,
 # the C++ server uses the model-card default.
 : "${DFLASH_DEFAULT_MAX_TOKENS:=}"
@@ -680,6 +681,11 @@ if [ "$DFLASH_SPARK" = "1" ]; then
         *) CMD+=(--spark-vram "$DFLASH_SPARK_VRAM_GB") ;;
     esac
 fi
+case "$DFLASH_DS4_PREFILL" in
+    exact) ;;
+    dense|sparse) CMD+=(--ds4-prefill "$DFLASH_DS4_PREFILL") ;;
+    *) die "DFLASH_DS4_PREFILL must be exact, dense, or sparse" ;;
+esac
 # Soft-close ratio: emit only when nonzero. The default-string compare
 # guards against the floating-point quirks of `[` numeric tests for
 # values like 0.0/0/0.00 — anything non-"0.0" passes through to the
