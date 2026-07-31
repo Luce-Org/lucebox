@@ -118,6 +118,9 @@ public:
     bool init(ggml_backend_t gpu_backend, size_t max_expert_bytes,
               std::string * err = nullptr);
     bool init(ggml_backend_t gpu_backend, size_t max_expert_bytes,
+              const MoeStreamConfig & config,
+              std::string * err = nullptr);
+    bool init(ggml_backend_t gpu_backend, size_t max_expert_bytes,
               const MoeHybridStorage & storage,
               std::string * err = nullptr);
     bool init(ggml_backend_t gpu_backend, size_t max_expert_bytes,

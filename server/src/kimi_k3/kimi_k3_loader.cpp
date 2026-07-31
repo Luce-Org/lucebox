@@ -8,7 +8,11 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <iomanip>
+#include <limits>
+#include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace dflash::common {
@@ -26,7 +30,16 @@ uint32_t get_u32_or(const gguf_context * g, const char * key, uint32_t fallback)
         return fallback;
     }
     const gguf_type type = gguf_get_kv_type(g, id);
+    if (type == GGUF_TYPE_UINT8)  return gguf_get_val_u8(g, id);
+    if (type == GGUF_TYPE_UINT16) return gguf_get_val_u16(g, id);
     if (type == GGUF_TYPE_UINT32) return gguf_get_val_u32(g, id);
+    if (type == GGUF_TYPE_UINT64) {
+        const uint64_t value = gguf_get_val_u64(g, id);
+        return value <= std::numeric_limits<uint32_t>::max()
+            ? static_cast<uint32_t>(value) : fallback;
+    }
+    if (type == GGUF_TYPE_INT8)   return static_cast<uint32_t>(gguf_get_val_i8(g, id));
+    if (type == GGUF_TYPE_INT16)  return static_cast<uint32_t>(gguf_get_val_i16(g, id));
     if (type == GGUF_TYPE_INT32)  return static_cast<uint32_t>(gguf_get_val_i32(g, id));
     return fallback;
 }
@@ -68,42 +81,195 @@ bool tensor_shape_is(const ggml_tensor * t,
     return t && t->ne[0] == ne0 && t->ne[1] == ne1 && t->ne[2] == ne2;
 }
 
+bool is_routed_expert_tensor(const std::string & name) {
+    return name.find(".ffn_gate_exps.weight") != std::string::npos ||
+           name.find(".ffn_up_exps.weight") != std::string::npos ||
+           name.find(".ffn_down_exps.weight") != std::string::npos ||
+           name.find(".ffn_gate_up_exps.weight") != std::string::npos;
+}
+
+size_t align_up(size_t value, size_t alignment) {
+    if (alignment == 0) return value;
+    const size_t remainder = value % alignment;
+    return remainder == 0 ? value : value + (alignment - remainder);
+}
+
+bool discover_split_paths(const std::string & supplied,
+                          uint32_t split_count,
+                          std::vector<std::string> & out,
+                          std::string & error) {
+    out.clear();
+    const size_t of = supplied.rfind("-of-");
+    if (split_count <= 1 && of == std::string::npos) {
+        out.push_back(supplied);
+        return true;
+    }
+
+    if (of == std::string::npos) {
+        error = "split.count is greater than one but the GGUF filename has no -NNNNN-of-NNNNN suffix";
+        return false;
+    }
+    const size_t index_dash = supplied.rfind('-', of - 1);
+    if (index_dash == std::string::npos || index_dash + 1 >= of) {
+        error = "cannot locate the split index in the GGUF filename";
+        return false;
+    }
+    size_t total_end = of + 4;
+    while (total_end < supplied.size() &&
+           supplied[total_end] >= '0' && supplied[total_end] <= '9') {
+        ++total_end;
+    }
+    const std::string index_text =
+        supplied.substr(index_dash + 1, of - index_dash - 1);
+    const std::string total_text =
+        supplied.substr(of + 4, total_end - (of + 4));
+    if (index_text.empty() || total_text.empty() ||
+        index_text.find_first_not_of("0123456789") != std::string::npos ||
+        total_text.find_first_not_of("0123456789") != std::string::npos) {
+        error = "invalid split index/count in the GGUF filename";
+        return false;
+    }
+    uint64_t filename_total = 0;
+    try {
+        filename_total = std::stoull(total_text);
+    } catch (...) {
+        error = "GGUF filename split count is not an integer";
+        return false;
+    }
+    if (split_count != 0 && filename_total != split_count) {
+        error = "GGUF split.count disagrees with the filename";
+        return false;
+    }
+    if (filename_total == 0 ||
+        filename_total > std::numeric_limits<uint32_t>::max()) {
+        error = "GGUF filename has an invalid split count";
+        return false;
+    }
+    split_count = static_cast<uint32_t>(filename_total);
+
+    const std::string prefix = supplied.substr(0, index_dash + 1);
+    const std::string suffix = supplied.substr(total_end);
+    out.reserve(split_count);
+    for (uint32_t split = 1; split <= split_count; ++split) {
+        std::ostringstream path;
+        path << prefix << std::setw(static_cast<int>(index_text.size()))
+             << std::setfill('0') << split
+             << "-of-" << total_text << suffix;
+        out.push_back(path.str());
+    }
+    return true;
+}
+
+struct TensorSource {
+    ggml_tensor * tensor = nullptr;
+    uint32_t shard = 0;
+    size_t file_offset = 0;
+    size_t file_size = 0;
+};
+
 } // namespace
 
 bool load_kimi_k3_gguf(const std::string & path,
                        ggml_backend_t backend,
-                       KimiK3Weights & out) {
+                       KimiK3Weights & out,
+                       bool stream_routed_experts) {
     free_kimi_k3_weights(out);
 
-    ggml_context * meta_ctx = nullptr;
-    gguf_init_params params{};
-    params.no_alloc = true;
-    params.ctx = &meta_ctx;
-    gguf_context * gctx = gguf_init_from_file(path.c_str(), params);
-    if (!gctx || !meta_ctx) {
+    ggml_context * first_meta = nullptr;
+    gguf_init_params first_params{};
+    first_params.no_alloc = true;
+    first_params.ctx = &first_meta;
+    gguf_context * first_gguf =
+        gguf_init_from_file(path.c_str(), first_params);
+    if (!first_gguf || !first_meta) {
         set_last_error("Kimi-K3: failed to parse GGUF: " + path);
-        if (gctx) gguf_free(gctx);
-        if (meta_ctx) ggml_free(meta_ctx);
+        if (first_gguf) gguf_free(first_gguf);
+        if (first_meta) ggml_free(first_meta);
         return false;
+    }
+
+    // Only the first file of a standard split GGUF is required to carry
+    // global metadata. If the caller supplied another shard, infer the count
+    // from its canonical filename and reopen the set in numerical order.
+    const uint32_t split_count =
+        get_u32_or(first_gguf, "split.count", 0);
+    std::vector<std::string> shard_paths;
+    std::string discovery_error;
+    if (!discover_split_paths(path, split_count, shard_paths,
+                              discovery_error)) {
+        gguf_free(first_gguf);
+        ggml_free(first_meta);
+        set_last_error("Kimi-K3: " + discovery_error);
+        return false;
+    }
+
+    std::vector<gguf_context *> shard_ggufs;
+    shard_ggufs.reserve(shard_paths.size());
+    out.contexts.reserve(shard_paths.size());
+    bool used_supplied = false;
+    for (size_t shard = 0; shard < shard_paths.size(); ++shard) {
+        if (shard_paths[shard] == path) {
+            shard_ggufs.push_back(first_gguf);
+            out.contexts.push_back(first_meta);
+            used_supplied = true;
+            continue;
+        }
+        ggml_context * meta = nullptr;
+        gguf_init_params params{};
+        params.no_alloc = true;
+        params.ctx = &meta;
+        gguf_context * gguf =
+            gguf_init_from_file(shard_paths[shard].c_str(), params);
+        if (!gguf || !meta) {
+            if (gguf) gguf_free(gguf);
+            if (meta) ggml_free(meta);
+            for (gguf_context * opened : shard_ggufs) gguf_free(opened);
+            if (!used_supplied) {
+                gguf_free(first_gguf);
+                ggml_free(first_meta);
+            }
+            free_kimi_k3_weights(out);
+            set_last_error("Kimi-K3: failed to parse GGUF shard: " +
+                           shard_paths[shard]);
+            return false;
+        }
+        shard_ggufs.push_back(gguf);
+        out.contexts.push_back(meta);
+    }
+    if (!used_supplied) {
+        gguf_free(first_gguf);
+        ggml_free(first_meta);
     }
 
     auto fail = [&](const std::string & message) {
         set_last_error("Kimi-K3: " + message);
-        if (out.buf) {
-            ggml_backend_buffer_free(out.buf);
-            out.buf = nullptr;
-        }
-        gguf_free(gctx);
-        ggml_free(meta_ctx);
-        out = KimiK3Weights{};
+        for (gguf_context * gguf : shard_ggufs) gguf_free(gguf);
+        shard_ggufs.clear();
+        free_kimi_k3_weights(out);
         return false;
     };
 
-    const int64_t arch_id = gguf_find_key(gctx, "general.architecture");
-    if (arch_id < 0 || std::strcmp(gguf_get_val_str(gctx, arch_id), "kimi-k3") != 0) {
-        return fail("general.architecture must be kimi-k3");
+    gguf_context * gctx = nullptr;
+    for (size_t shard = 0; shard < shard_ggufs.size(); ++shard) {
+        const int64_t arch_id =
+            gguf_find_key(shard_ggufs[shard], "general.architecture");
+        if (arch_id >= 0) {
+            if (std::strcmp(
+                    gguf_get_val_str(shard_ggufs[shard], arch_id),
+                    "kimi-k3") != 0) {
+                return fail("general.architecture must be kimi-k3");
+            }
+            if (!gctx) gctx = shard_ggufs[shard];
+        }
+        const uint32_t count =
+            get_u32_or(shard_ggufs[shard], "split.count", 0);
+        if (count != 0 && count != shard_paths.size()) {
+            return fail("split.count is inconsistent across GGUF shards");
+        }
     }
-
+    if (!gctx) {
+        return fail("no shard contains general.architecture metadata");
+    }
     constexpr const char * A = "kimi-k3.";
     auto key = [&](const char * suffix) { return std::string(A) + suffix; };
     auto u32 = [&](const char * suffix, uint32_t fallback = 0) {
@@ -119,8 +285,10 @@ bool load_kimi_k3_gguf(const std::string & path,
         return get_bool_or(gctx, k.c_str(), fallback);
     };
 
-    out.ctx       = meta_ctx;
+    out.ctx       = out.contexts.front();
     out.backend   = backend;
+    out.shard_paths = shard_paths;
+    out.routed_experts_streamed = stream_routed_experts;
     out.n_layer   = static_cast<int>(u32("block_count"));
     out.n_embd    = static_cast<int>(u32("embedding_length"));
     out.n_ff      = static_cast<int>(u32("feed_forward_length"));
@@ -150,7 +318,31 @@ bool load_kimi_k3_gguf(const std::string & path,
     out.situ_linear_beta = f32("activation.situ_linear_beta", 25.0f);
     out.eos_token_id = static_cast<int32_t>(get_u32_or(gctx, "tokenizer.ggml.eos_token_id", 2));
 
-    auto get = [&](const char * name) { return ggml_get_tensor(meta_ctx, name); };
+    std::unordered_map<std::string, TensorSource> tensors;
+    for (size_t shard = 0; shard < shard_ggufs.size(); ++shard) {
+        gguf_context * gguf = shard_ggufs[shard];
+        ggml_context * meta = out.contexts[shard];
+        const size_t data_start = gguf_get_data_offset(gguf);
+        const int64_t count = gguf_get_n_tensors(gguf);
+        for (int64_t tid = 0; tid < count; ++tid) {
+            const char * name = gguf_get_tensor_name(gguf, tid);
+            if (!name || tensors.find(name) != tensors.end()) {
+                return fail(std::string("duplicate or unnamed tensor across shards: ") +
+                            (name ? name : "<null>"));
+            }
+            TensorSource source;
+            source.tensor = ggml_get_tensor(meta, name);
+            source.shard = static_cast<uint32_t>(shard);
+            source.file_offset =
+                data_start + gguf_get_tensor_offset(gguf, tid);
+            source.file_size = gguf_get_tensor_size(gguf, tid);
+            tensors.emplace(name, source);
+        }
+    }
+    auto get = [&](const char * name) -> ggml_tensor * {
+        const auto found = tensors.find(name);
+        return found == tensors.end() ? nullptr : found->second.tensor;
+    };
     out.tok_embd = get("token_embd.weight");
     out.output_norm = get("output_norm.weight");
     out.output = get("output.weight");
@@ -276,36 +468,136 @@ bool load_kimi_k3_gguf(const std::string & path,
         }
     }
 
-    out.buf = ggml_backend_alloc_ctx_tensors(meta_ctx, backend);
-    if (!out.buf) return fail("unable to allocate resident tensor buffer");
-
-    GgufMmap mmap;
-    std::string mmap_error;
-    if (!mmap.open(path, mmap_error)) return fail(mmap_error);
-    const auto * base = static_cast<const uint8_t *>(mmap.data());
-    const size_t file_size = mmap.size();
-    const size_t data_start = gguf_get_data_offset(gctx);
-    size_t copied = 0;
-    for (int64_t tid = 0; tid < gguf_get_n_tensors(gctx); ++tid) {
-        const char * tensor_name = gguf_get_tensor_name(gctx, tid);
-        ggml_tensor * tensor = ggml_get_tensor(meta_ctx, tensor_name);
-        if (!tensor) continue;
-        const size_t offset = gguf_get_tensor_offset(gctx, tid);
-        const size_t bytes = gguf_get_tensor_size(gctx, tid);
-        if (!gguf_tensor_in_file(data_start, offset, bytes, file_size)) {
-            return fail(gguf_bounds_error("Kimi-K3 GGUF", tensor_name,
-                ggml_type_name(gguf_get_tensor_type(gctx, tid)), data_start,
-                offset, bytes, file_size));
+    out.streamed_layer_regions.clear();
+    out.max_streamed_expert_bytes = 0;
+    for (int il = out.n_dense_lead; il < out.n_layer; ++il) {
+        char gate_name[160], up_name[160], down_name[160];
+        std::snprintf(gate_name, sizeof(gate_name),
+                      "blk.%d.ffn_gate_exps.weight", il);
+        std::snprintf(up_name, sizeof(up_name),
+                      "blk.%d.ffn_up_exps.weight", il);
+        std::snprintf(down_name, sizeof(down_name),
+                      "blk.%d.ffn_down_exps.weight", il);
+        const TensorSource & gate = tensors.at(gate_name);
+        const TensorSource & up = tensors.at(up_name);
+        const TensorSource & down = tensors.at(down_name);
+        if (gate.file_size % static_cast<size_t>(out.n_expert) != 0 ||
+            up.file_size % static_cast<size_t>(out.n_expert) != 0 ||
+            down.file_size % static_cast<size_t>(out.n_expert) != 0) {
+            return fail("routed expert tensor size is not divisible by expert_count");
         }
-        ggml_backend_tensor_set(tensor, base + data_start + offset, 0, bytes);
-        copied += bytes;
+        LayerExpertRegions regions;
+        regions.expert_bytes_gate =
+            gate.file_size / static_cast<size_t>(out.n_expert);
+        regions.expert_bytes_up =
+            up.file_size / static_cast<size_t>(out.n_expert);
+        regions.expert_bytes_down =
+            down.file_size / static_cast<size_t>(out.n_expert);
+        regions.gate_exps = {
+            gate.file_offset, gate.file_size, gate.shard};
+        regions.up_exps = {
+            up.file_offset, up.file_size, up.shard};
+        regions.down_exps = {
+            down.file_offset, down.file_size, down.shard};
+        const size_t expert_bytes =
+            regions.expert_bytes_gate + regions.expert_bytes_up +
+            regions.expert_bytes_down;
+        out.max_streamed_expert_bytes =
+            std::max(out.max_streamed_expert_bytes, expert_bytes);
+        out.streamed_layer_regions.push_back(regions);
     }
 
-    gguf_free(gctx);
+    struct ResidentAlloc {
+        ggml_tensor * tensor = nullptr;
+        size_t file_offset = 0;
+        size_t file_size = 0;
+        size_t buffer_offset = 0;
+    };
+    ggml_backend_buffer_type_t buft =
+        ggml_backend_get_default_buffer_type(backend);
+    const size_t alignment = ggml_backend_buft_get_alignment(buft);
+    size_t copied = 0;
+    size_t skipped = 0;
+    for (size_t shard = 0; shard < shard_ggufs.size(); ++shard) {
+        gguf_context * gguf = shard_ggufs[shard];
+        ggml_context * meta = out.contexts[shard];
+        const size_t data_start = gguf_get_data_offset(gguf);
+        std::vector<ResidentAlloc> allocs;
+        size_t allocation_bytes = 0;
+        for (int64_t tid = 0; tid < gguf_get_n_tensors(gguf); ++tid) {
+            const char * tensor_name = gguf_get_tensor_name(gguf, tid);
+            ggml_tensor * tensor = ggml_get_tensor(meta, tensor_name);
+            const size_t bytes = gguf_get_tensor_size(gguf, tid);
+            if (!tensor) continue;
+            if (stream_routed_experts &&
+                is_routed_expert_tensor(tensor_name)) {
+                skipped += bytes;
+                continue;
+            }
+            allocation_bytes = align_up(allocation_bytes, alignment);
+            ResidentAlloc allocation;
+            allocation.tensor = tensor;
+            allocation.file_offset =
+                data_start + gguf_get_tensor_offset(gguf, tid);
+            allocation.file_size = bytes;
+            allocation.buffer_offset = allocation_bytes;
+            allocation_bytes +=
+                ggml_backend_buft_get_alloc_size(buft, tensor);
+            allocs.push_back(allocation);
+        }
+        if (allocs.empty()) continue;
+
+        ggml_backend_buffer_t buffer =
+            ggml_backend_alloc_buffer(backend, allocation_bytes);
+        if (!buffer) {
+            return fail("unable to allocate resident tensor buffer for shard " +
+                        std::to_string(shard + 1));
+        }
+        ggml_backend_buffer_set_usage(
+            buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        out.buffers.push_back(buffer);
+        char * buffer_base =
+            static_cast<char *>(ggml_backend_buffer_get_base(buffer));
+        for (const ResidentAlloc & allocation : allocs) {
+            if (ggml_backend_tensor_alloc(
+                    buffer, allocation.tensor,
+                    buffer_base + allocation.buffer_offset) !=
+                GGML_STATUS_SUCCESS) {
+                return fail("unable to bind a resident tensor allocation");
+            }
+        }
+
+        GgufMmap mmap;
+        std::string mmap_error;
+        if (!mmap.open(shard_paths[shard], mmap_error)) {
+            return fail(mmap_error);
+        }
+        const auto * base =
+            static_cast<const uint8_t *>(mmap.data());
+        for (const ResidentAlloc & allocation : allocs) {
+            if (allocation.file_offset > mmap.size() ||
+                allocation.file_size >
+                    mmap.size() - allocation.file_offset) {
+                return fail("resident tensor range is outside GGUF shard " +
+                            std::to_string(shard + 1));
+            }
+            ggml_backend_tensor_set(
+                allocation.tensor, base + allocation.file_offset,
+                0, allocation.file_size);
+            copied += allocation.file_size;
+        }
+    }
+    out.buf = out.buffers.empty() ? nullptr : out.buffers.front();
+
+    for (gguf_context * gguf : shard_ggufs) gguf_free(gguf);
+    shard_ggufs.clear();
     std::fprintf(stderr,
-        "[kimi-k3] loaded %.2f GiB: layers=%d (KDA=%zu MLA=%zu) hidden=%d "
+        "[kimi-k3] loaded resident=%.2f GiB file-backed-experts=%.2f GiB "
+        "shards=%zu layers=%d (KDA=%zu MLA=%zu) hidden=%d "
         "experts=%d top=%d latent=%d vocab=%d\n",
         static_cast<double>(copied) / (1024.0 * 1024.0 * 1024.0),
+        static_cast<double>(skipped) / (1024.0 * 1024.0 * 1024.0),
+        out.shard_paths.size(),
         out.n_layer,
         static_cast<size_t>(std::count_if(out.layers.begin(), out.layers.end(),
                                           [](const KimiK3Layer & l) { return l.recurrent; })),
@@ -318,8 +610,12 @@ bool load_kimi_k3_gguf(const std::string & path,
 }
 
 void free_kimi_k3_weights(KimiK3Weights & w) {
-    if (w.buf) ggml_backend_buffer_free(w.buf);
-    if (w.ctx) ggml_free(w.ctx);
+    for (ggml_backend_buffer_t buffer : w.buffers) {
+        if (buffer) ggml_backend_buffer_free(buffer);
+    }
+    for (ggml_context * context : w.contexts) {
+        if (context) ggml_free(context);
+    }
     w = KimiK3Weights{};
 }
 

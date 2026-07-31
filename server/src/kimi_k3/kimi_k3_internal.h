@@ -11,6 +11,8 @@
 
 #pragma once
 
+#include "common/moe_hybrid_storage.h"
+
 #include "ggml.h"
 #include "ggml-backend.h"
 
@@ -20,6 +22,8 @@
 #include <vector>
 
 namespace dflash::common {
+
+class MoeHybridStreamEngine;
 
 struct KimiK3Layer {
     bool recurrent = false;
@@ -77,9 +81,21 @@ struct KimiK3Layer {
 };
 
 struct KimiK3Weights {
+    // ctx/buf alias the first entries for compatibility with the original
+    // single-file loader. Split GGUFs retain one metadata context and optional
+    // resident backend buffer per shard.
     ggml_context *        ctx     = nullptr;
     ggml_backend_t        backend = nullptr;
     ggml_backend_buffer_t buf     = nullptr;
+    std::vector<ggml_context *> contexts;
+    std::vector<ggml_backend_buffer_t> buffers;
+    std::vector<std::string> shard_paths;
+
+    // The routed stacks may remain file-backed. Regions use MoE-layer-local
+    // indices [0, n_layer-n_dense_lead), independent of model layer numbers.
+    std::vector<LayerExpertRegions> streamed_layer_regions;
+    size_t max_streamed_expert_bytes = 0;
+    bool routed_experts_streamed = false;
 
     ggml_tensor * tok_embd         = nullptr;
     ggml_tensor * output_norm      = nullptr;
@@ -135,7 +151,8 @@ struct KimiK3Cache {
 
 bool load_kimi_k3_gguf(const std::string & path,
                        ggml_backend_t backend,
-                       KimiK3Weights & out);
+                       KimiK3Weights & out,
+                       bool stream_routed_experts = false);
 void free_kimi_k3_weights(KimiK3Weights & w);
 
 bool create_kimi_k3_cache(ggml_backend_t backend,
@@ -154,6 +171,7 @@ bool kimi_k3_step(ggml_backend_t backend,
                   KimiK3Cache & cache,
                   int32_t token,
                   int position,
-                  std::vector<float> & logits);
+                  std::vector<float> & logits,
+                  MoeHybridStreamEngine * stream_engine = nullptr);
 
 } // namespace dflash::common

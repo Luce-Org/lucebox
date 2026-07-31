@@ -118,6 +118,30 @@ model that genuinely exceeds UMA, `auto` chooses the partial placement itself.
 `DFLASH_EXPERT_BUDGET_MB` can additionally cap static routed-weight residency;
 `DFLASH_MOE_NVME_DEVICE_CACHE_MB` can override the adaptive cache budget.
 
+## Kimi K3 activation
+
+Pass the first file of a standard split GGUF and select the Strix device.
+Kimi's routed gate/up/down stacks remain file-backed by default; the loader
+allocates only dense, shared, routing, latent-projection, and cache tensors.
+
+```bash
+export DFLASH_MOE_NVME_BACKEND=auto
+
+./build-hip/dflash_server \
+  /path/to/Kimi-K3-UD-IQ1_S-00001-of-00014.gguf \
+  --target-device hip:0 --max-ctx 8192
+```
+
+No DeepSeek MoE-TP variables are required. Cache memory is chosen only after
+the resident model and recurrent/KV state have been allocated. The automatic
+budget reserves the larger of 2 GiB or 5% of device memory and never exceeds
+the complete routed pool. `DFLASH_MOE_NVME_DEVICE_CACHE_MB` remains an explicit
+override, also capped by the routed pool.
+
+Kimi's native router remains authoritative. The current text backend is
+correctness-first and sequential; multi-device dense placement, captured
+per-layer graphs, and the vision tower are separate optimizations.
+
 ## Tuning and diagnostics
 
 Defaults are intentionally small: eight pinned host slots, four fallback I/O
@@ -146,6 +170,10 @@ a CPU oracle. It defaults to GPU 0, so it runs directly on Strix-only systems;
 targets `test_moe_nvme_scheduler`, `bench_moe_nvme_io`, and
 `bench_moe_nvme_pipeline` test scheduling, raw storage, and the complete
 SSD-to-GPU path. Benchmarks are read-only.
+
+The external `smoke_kimi_k3_forward` target accepts
+`[stream_experts=0|1]`. This is an A/B oracle for small Kimi fixtures; production
+Kimi uses `1`.
 
 ## Qualification result (2026-07-30)
 
@@ -185,6 +213,13 @@ at 4.350 GiB/s active I/O, reported zero errors, and used one graph build for
 took 3.816 and 3.599 seconds on the same run shape, so persistence improved
 this deliberately cold, storage-bound case by 1.4-2.7%; its larger value is
 removing thousands of allocations when more of the route set is warm.
+
+The native Kimi path was qualified with a real two-shard 0.40B MXFP4
+architecture fixture. Resident and streamed execution produced the same eight
+greedy output tokens. The `io_uring` run completed 168 selected-expert
+launches with one graph build, 167 graph-cache hits, and zero I/O errors. A
+1 MiB device cache forced 163 evictions, demonstrating that the result came
+through the split-GGUF SSD path rather than accidental full residency.
 
 ## Research lineage and next optimization
 

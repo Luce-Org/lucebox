@@ -10,7 +10,8 @@ using namespace dflash::common;
 int main(int argc, char ** argv) {
     if (argc < 2) {
         std::fprintf(stderr,
-            "usage: %s <kimi-k3.gguf> [gpu=0] [n_gen=16] [prompt]\n",
+            "usage: %s <kimi-k3.gguf> [gpu=0] [n_gen=16] [prompt] "
+            "[stream_experts=1]\n",
             argv[0]);
         return 2;
     }
@@ -36,6 +37,8 @@ int main(int argc, char ** argv) {
     config.model_path = model;
     config.device.gpu = gpu;
     config.device.max_ctx = 4096;
+    config.stream_routed_experts =
+        argc <= 5 || std::atoi(argv[5]) != 0;
     KimiK3Backend backend(config);
     if (!backend.init()) return 1;
 

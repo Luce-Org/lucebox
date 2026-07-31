@@ -808,6 +808,13 @@ MoeHybridStreamEngine & MoeHybridStreamEngine::operator=(MoeHybridStreamEngine &
 
 bool MoeHybridStreamEngine::init(ggml_backend_t gpu_backend, size_t max_expert_bytes,
                                  std::string * err) {
+    return init(gpu_backend, max_expert_bytes, MoeStreamConfig::from_env(), err);
+}
+
+bool MoeHybridStreamEngine::init(ggml_backend_t gpu_backend,
+                                 size_t max_expert_bytes,
+                                 const MoeStreamConfig & config,
+                                 std::string * err) {
     destroy();
     if (!gpu_backend || max_expert_bytes == 0) {
         if (err) *err = "invalid arguments to stream engine init";
@@ -827,7 +834,8 @@ bool MoeHybridStreamEngine::init(ggml_backend_t gpu_backend, size_t max_expert_b
         return false;
     }
     runtime->max_expert_bytes = max_expert_bytes;
-    runtime->config = MoeStreamConfig::from_env();
+    runtime->config = config;
+    runtime->config.device_slots = std::max(2, runtime->config.device_slots);
     runtime->io.reset(new (std::nothrow) MoeNvmeScheduler);
     if (!runtime->io) {
         if (err) *err = "failed to allocate SSD scheduler";
@@ -864,46 +872,7 @@ bool MoeHybridStreamEngine::init(ggml_backend_t gpu_backend, size_t max_expert_b
                                  const MoeHybridStorage & storage,
                                  const MoeStreamConfig & config,
                                  std::string * err) {
-    destroy();
-    if (!gpu_backend || max_expert_bytes == 0) {
-        if (err) *err = "invalid arguments to stream engine init";
-        return false;
-    }
-
-    std::unique_ptr<Runtime> runtime(new (std::nothrow) Runtime);
-    if (!runtime) {
-        if (err) *err = "failed to allocate stream runtime";
-        return false;
-    }
-    runtime->backend = gpu_backend;
-    runtime->device = backend_device_index(gpu_backend);
-    ScopedGpuDevice device_scope(runtime->device);
-    if (!device_scope.ready()) {
-        if (err) *err = "failed to resolve/select SSD stream GPU";
-        return false;
-    }
-    runtime->max_expert_bytes = max_expert_bytes;
-    runtime->config = config;
-    runtime->config.device_slots = std::max(2, runtime->config.device_slots);
-    runtime->io.reset(new (std::nothrow) MoeNvmeScheduler);
-    if (!runtime->io ||
-        !runtime->io->init(runtime->config.nvme, max_expert_bytes,
-                           pinned_allocate, pinned_free, nullptr, err)) {
-        return false;
-    }
-
-    cudaError_t gpu_err = cudaStreamCreate(&runtime->transfer_stream);
-    if (gpu_err != cudaSuccess) {
-        if (err) *err = std::string("failed to create SSD transfer stream: ") +
-                        cudaGetErrorString(gpu_err);
-        return false;
-    }
-    if (!allocate_device_cache(*runtime, err)) {
-        runtime_ = std::move(runtime);
-        destroy();
-        return false;
-    }
-    runtime_ = std::move(runtime);
+    if (!init(gpu_backend, max_expert_bytes, config, err)) return false;
     if (!bind_storage(storage, err)) {
         destroy();
         return false;
