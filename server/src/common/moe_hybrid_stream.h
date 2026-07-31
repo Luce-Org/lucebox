@@ -102,6 +102,27 @@ struct MoeStreamComputeStats {
     uint64_t graph_launches = 0;
 };
 
+// Route ownership for two concurrent SSD-backed GPU owners. An explicit
+// placement takes precedence and identifies the primary GPU's hot experts.
+// Without one, a stable layer/expert hash supplies a deterministic capacity
+// split that preserves cache locality across tokens.
+struct MoeStreamDualOwnerPolicy {
+    const MoeHybridPlacement * primary_placement = nullptr;
+    int primary_share_per_mille = 500;
+
+    static MoeStreamDualOwnerPolicy from_env();
+};
+
+struct MoeStreamDualOwnerStats {
+    uint64_t wall_us = 0;
+    uint64_t primary_us = 0;
+    uint64_t secondary_us = 0;
+    int primary_routes = 0;
+    int secondary_routes = 0;
+    int primary_experts = 0;
+    int secondary_experts = 0;
+};
+
 class MoeHybridStreamEngine {
 public:
     MoeHybridStreamEngine();
@@ -198,6 +219,37 @@ private:
     std::unique_ptr<Runtime> runtime_;
 };
 
+// Persistent two-owner coordinator. The secondary compute worker is created
+// once at model initialization, so decode does not pay a thread create/join at
+// every routed layer. Calls are deliberately serialized; each call still
+// launches the primary and secondary GPU pipelines concurrently.
+class MoeStreamDualOwnerExecutor {
+public:
+    MoeStreamDualOwnerExecutor();
+    ~MoeStreamDualOwnerExecutor();
+
+    MoeStreamDualOwnerExecutor(const MoeStreamDualOwnerExecutor &) = delete;
+    MoeStreamDualOwnerExecutor & operator=(
+        const MoeStreamDualOwnerExecutor &) = delete;
+
+    bool init(MoeHybridStreamEngine & primary,
+              MoeHybridStreamEngine & secondary,
+              std::string * err = nullptr);
+    bool is_ready() const;
+    void destroy();
+
+    bool eval(const MoeStreamExpertSpec & spec,
+              const MoeStreamRouteBatch & batch,
+              const MoeStreamDualOwnerPolicy & policy,
+              std::vector<float> & out,
+              MoeStreamDualOwnerStats * stats = nullptr,
+              std::string * err = nullptr);
+
+private:
+    struct Runtime;
+    std::unique_ptr<Runtime> runtime_;
+};
+
 // Evaluate exactly the experts selected by the native router. Placement only
 // decides which selected IDs arrive here; no prediction or cache policy can
 // change the returned mathematical function.
@@ -206,6 +258,27 @@ bool eval_moe_streamed_experts(
     const MoeStreamExpertSpec & spec,
     const MoeStreamRouteBatch & batch,
     std::vector<float> & out,
+    std::string * err = nullptr);
+
+// One-shot compatibility wrapper. Long-lived model adapters should initialize
+// MoeStreamDualOwnerExecutor once to avoid per-layer thread startup overhead.
+bool eval_moe_streamed_experts_dual_owner(
+    MoeHybridStreamEngine & primary,
+    MoeHybridStreamEngine & secondary,
+    const MoeStreamExpertSpec & spec,
+    const MoeStreamRouteBatch & batch,
+    const MoeStreamDualOwnerPolicy & policy,
+    std::vector<float> & out,
+    MoeStreamDualOwnerStats * stats = nullptr,
+    std::string * err = nullptr);
+
+// Exposed for deterministic, GPU-free policy tests and offline plan tooling.
+bool partition_moe_stream_routes(
+    const MoeStreamRouteBatch & batch,
+    const MoeStreamDualOwnerPolicy & policy,
+    std::vector<float> & primary_weights,
+    std::vector<float> & secondary_weights,
+    MoeStreamDualOwnerStats * stats = nullptr,
     std::string * err = nullptr);
 
 // Evaluate the cold contribution for one layer. All routed SSD requests are

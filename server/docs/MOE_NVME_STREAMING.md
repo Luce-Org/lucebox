@@ -7,13 +7,21 @@ from SSD without changing their format or numerical representation.
 
 On a full Lucebox, the three owners have distinct jobs:
 
-1. **R9700** owns dense layers and the statically hot routed experts.
-2. **Strix Halo** owns an adaptive warm-expert cache, the bounded SSD staging
-   buffers, and execution of streamed cold experts. Its direct path to system
-   memory is faster than staging those experts into the discrete GPU on the
-   qualified machine.
+1. **R9700** is the primary compute owner. It runs dense layers and the
+   profile-selected hot routed branch from its own SSD-backed expert cache.
+2. **Strix Halo** is the capacity owner. It runs the remaining routed branch
+   from a separate adaptive cache and bounded SSD staging pipeline. Its direct
+   path to system memory is faster than staging every cold expert into the
+   discrete GPU on the qualified machine.
 3. **NVMe** is the capacity tier for true cache misses that do not fit in the
-   Strix safe-memory budget.
+   two safe-memory budgets.
+
+The two routed branches launch concurrently. Each native route has exactly one
+owner, and their activation-sized partials are added after both complete, so
+the routed-layer target is `max(R9700 branch, Strix branch)` rather than their
+sum. A persistent secondary worker avoids thread creation in the layer loop.
+This route-owner split does not itself solve placement of a non-routed core
+larger than R9700 VRAM; that remains an independent layer/tensor-plan decision.
 
 On a Strix Halo-only machine, the same device owns dense/static-hot weights,
 the warm cache, and streamed-expert execution. The planner reserves KV and
@@ -42,6 +50,12 @@ need an adapter that fills these descriptors; the storage scheduler, cache,
 and compute pipeline remain unchanged. Each file range can select a different
 shard, while single-file models use shard zero. See
 [KIMI_K3_HETERO.md](KIMI_K3_HETERO.md) for the 14-shard Kimi K3 qualification.
+
+`MoeStreamDualOwnerExecutor` composes two such engines without adding a model
+router. `MoeHybridPlacement` can select the primary owner's experts per layer;
+otherwise a deterministic hash is only a bring-up fallback. Duplicate routes
+to one expert retain one owner, and a partition test verifies that the two
+weight masks reconstruct the original route batch exactly.
 
 ## Scheduler
 
@@ -142,22 +156,27 @@ Kimi's native router remains authoritative. The current text backend is
 correctness-first and sequential; captured per-layer graphs and the vision
 tower are separate optimizations.
 
-On a two-GPU Lucebox, the primary device still owns KDA/MLA and model state;
-the optional expert device owns the SSD slots, adaptive cache, and selected
-expert graphs:
+On a two-GPU Lucebox, put the compute-intensive primary path on the R9700 and
+use Strix as the secondary capacity owner. Both devices receive independent
+SSD slots/caches and execute their selected routed experts concurrently:
 
 ```bash
-export DFLASH_MOE_TP_GPU=<expert-gpu>
+export DFLASH_MOE_TP_GPU=<strix-gpu>
 
 ./build-hip-dual/dflash_server \
   /path/to/Kimi-K3-UD-IQ1_S-00001-of-00014.gguf \
-  --target-device hip:<primary-gpu> --max-ctx 8192
+  --target-device hip:<r9700-gpu> --max-ctx 8192
 ```
 
 This is functional expert ownership, not a contiguous layer split, so do not
-use `--target-devices`. Leaving `DFLASH_MOE_TP_GPU` unset preserves the
-Strix-only path. The current Kimi boundary uses activation-sized host staging;
-device-resident peer fork/join is a later throughput optimization.
+use `--target-devices`. `DFLASH_MOE_PLACEMENT` may point at an offline
+`MoeHybridPlacement` JSON; its hot expert IDs become R9700-owned and
+all other selected routes become Strix-owned. Without a plan,
+`DFLASH_MOE_PRIMARY_SHARE_PER_MILLE` controls a deterministic bring-up split
+(default 500). Leaving `DFLASH_MOE_TP_GPU` unset preserves the single-device
+path, including Strix-only systems. The current Kimi join still uses
+activation-sized host staging; a device-resident peer join remains the next
+throughput optimization.
 
 ## Tuning and diagnostics
 
@@ -177,7 +196,10 @@ not improve the qualified P310 drive and consumes extra pinned/system memory.
 | `DFLASH_MOE_NVME_DEVICE_CACHE_MB` | automatic/`0` | Override adaptive device expert-cache memory; `0` leaves only pipeline slots |
 | `DFLASH_MOE_NVME_GRAPH_CACHE` | `8` | Persistent expert-graph variants retained per stream engine; `0` is a diagnostic no-cache mode |
 | `DFLASH_MOE_NVME_REFERENCE_EVAL` | unset | Diagnostic only: `1` restores the allocation-heavy reference evaluator for numerical/performance A/B |
-| `DFLASH_MOE_TP_GPU` | primary GPU | Optional second GPU that owns streamed expert cache and compute |
+| `DFLASH_MOE_TP_GPU` | primary GPU | Optional secondary GPU; enables concurrent route ownership when different from the primary |
+| `DFLASH_MOE_PLACEMENT` | unset | Offline placement JSON; listed experts belong to the primary GPU |
+| `DFLASH_MOE_PRIMARY_SHARE_PER_MILLE` | `500` | Bring-up hash split used only when no placement is supplied |
+| `DFLASH_MOE_DUAL_STREAM_TRACE` | unset | Debug per-layer owner counts and branch/wall timing |
 
 Shutdown telemetry reports logical and physical bytes, measured read service
 rate, cache hits, demand wait, de-duplication, dropped speculation, errors, and
@@ -240,6 +262,15 @@ launches with one graph build, 167 graph-cache hits, and zero I/O errors. A
 1 MiB device cache forced 163 evictions, demonstrating that the result came
 through the split-GGUF SSD path rather than accidental full residency.
 
+The dual-owner extension was then qualified on the same fixture with the
+R9700 primary and Strix secondary. Stable route ownership exercised both
+engines and both issued real `io_uring` traffic; some top-2 layers naturally
+landed on only one owner and bypassed the rendezvous. The eight greedy token
+IDs matched the single-R9700 oracle exactly. After warm-up, dual-branch
+routed-layer wall time matched the slower branch to within a few microseconds.
+The tiny experts do not provide a meaningful end-to-end speed claim; full-size
+expert geometry and a quiescent machine are required for that comparison.
+
 ## Research lineage and next optimization
 
 The bounded priority/cache design follows the lessons of MoE-Infinity and
@@ -249,9 +280,8 @@ that leaves the native router untouched. MoE-SpAc motivates compile-time
 expert layout and I/O coalescing. Tutti's slack-aware `io_uring` scheduling is
 relevant when persistent KV traffic shares the device.
 
-The persistent graph and model-neutral evaluator are now shared by Kimi
-qualification and production DS4 streaming. The next high-value work is a
-repacked expert-major artifact, followed by overlap of hot-owner work with
-cold-owner streaming. Any learned predictor comes after that deterministic
-path is qualified, and may only prefetch routes selected later by the native
-router.
+The persistent graph, model-neutral evaluator, and exact concurrent owner
+split are now shared infrastructure. The next high-value work is a repacked
+expert-major artifact and a device-resident fork/join that removes Kimi's host
+activation boundary. Any learned predictor comes after that deterministic path
+is qualified, and may only prefetch routes selected later by the native router.

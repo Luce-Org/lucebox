@@ -15,8 +15,9 @@ struct KimiK3BackendConfig {
     DevicePlacement device;
     int stream_fd = -1;
     // -1 resolves DFLASH_MOE_TP_GPU and otherwise keeps experts on the
-    // primary GPU. A different GPU owns streamed weights/cache/compute while
-    // dense KDA/MLA, recurrent state, and sampling remain primary-owned.
+    // primary GPU. A different GPU becomes the secondary capacity owner;
+    // routed work is partitioned between both GPUs while dense KDA/MLA,
+    // recurrent state, and sampling remain primary-owned.
     int expert_gpu = -1;
     // Production Kimi uses file-backed routed experts. The resident mode is
     // retained as a deterministic oracle for small architecture fixtures.
@@ -66,6 +67,10 @@ private:
     KimiK3Weights weights_;
     KimiK3Cache cache_;
     MoeHybridStreamEngine stream_engine_;
+    MoeHybridStreamEngine secondary_stream_engine_;
+    MoeStreamDualOwnerExecutor dual_stream_executor_;
+    MoeHybridPlacement stream_placement_;
+    MoeStreamDualOwnerPolicy stream_owner_policy_;
     bool parked_ = false;
     std::mt19937_64 rng_{std::random_device{}()};
 };

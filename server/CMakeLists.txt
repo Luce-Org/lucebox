@@ -1184,6 +1184,7 @@ if(DFLASH27B_TESTS)
             test/test_kvflash_pool_sizing.cpp
             test/test_kvflash_qk.cpp
             test/test_moe_expert_owner_placement.cpp
+            test/test_moe_stream_owner_partition.cpp
             test/test_qwen35moe_routing_stats.cpp
             test/test_qwen35moe_expert_placement.cpp
             test/test_qwen35moe_swap_manager.cpp

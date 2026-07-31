@@ -28,7 +28,10 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `DFLASH_MMID_GROUPED_DEVICE` | -1 | Optional zero-based device restriction; unset/-1 applies to every eligible device. |
 | `DFLASH_DS4_MOE_TP` / `DFLASH_DS4_MOE_TP_INPROC` | unset | BURN-IN: enable DeepSeek4 route-owner expert parallelism in one process. |
 | `DFLASH_DS4_MOE_TP_GPU` | auto | HIP device for the cold DeepSeek4 expert owner. |
-| `DFLASH_MOE_TP_GPU` | primary device | Model-neutral routed-expert owner GPU; used by Kimi streaming and preferred over legacy DS4/IPC GPU variables. |
+| `DFLASH_MOE_TP_GPU` | primary device | BURN-IN: optional secondary routed-expert GPU; Kimi executes exact route partitions concurrently when it differs from the primary. |
+| `DFLASH_MOE_PLACEMENT` | unset | BURN-IN: offline placement JSON; listed experts belong to the primary owner. |
+| `DFLASH_MOE_PRIMARY_SHARE_PER_MILLE` | 500 | BURN-IN: deterministic primary route share when no explicit placement is supplied. |
+| `DFLASH_MOE_DUAL_STREAM_TRACE` | unset | DEBUG: per-layer dual-owner route counts and branch/wall timings. |
 | `DFLASH_MOE_NVME_COLD_TIER` | auto | BURN-IN: DeepSeek4 cold-capacity policy (`auto`, `on`, `off`) for dual-device and Strix-only execution. |
 | `DFLASH_MOE_NVME_*` | tuned defaults | BURN-IN: bounded MoE SSD scheduler/backend controls; see `MOE_NVME_STREAMING.md`. |
 | `GGML_CUDA_BATCH_PEER_COPIES` | unset | BURN-IN: publish ordered HIP peer copies with one cross-device dependency per source/destination pair. |
@@ -160,6 +163,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_MODEL_CARDS_DIR` - model_card.cpp
 - `DFLASH_MOE_COLD_BACKEND` - deepseek4_loader.cpp
 - `DFLASH_MOE_COMPACT_MATERIALIZED` - moe_hybrid_ffn_eval.cpp
+- `DFLASH_MOE_DUAL_STREAM_TRACE` - kimi_k3_graph.cpp
 - `DFLASH_MOE_DUPLICATE_HOT_ON_COLD` - moe_hybrid_storage.cpp
 - `DFLASH_MOE_EXPERT_COMPUTE_DAEMON_TOKEN_LOOP` - moe_expert_compute_ipc.cpp
 - `DFLASH_MOE_EXPERT_COMPUTE_IPC_BATCH_CAPACITY` - moe_expert_compute_ipc.cpp
@@ -176,10 +180,12 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_MOE_FIXED_SLOT_MAX` - moe_hybrid_ffn_eval.cpp
 - `DFLASH_MOE_FULL_COLD_PARALLEL` - moe_hybrid_ffn_eval.cpp
 - `DFLASH_MOE_FUSED_COMBINE` - moe_hybrid_ffn_eval.cpp
+- `DFLASH_MOE_PLACEMENT` - kimi_k3_backend.cpp
 - `DFLASH_MOE_PREFILL_DEVICE_INPUT` - deepseek4_graph.cpp
 - `DFLASH_MOE_PREFILL_HOT_SUB_BATCH` - moe_hybrid_ffn_eval.cpp
 - `DFLASH_MOE_PREFILL_MASKED_COLD` - moe_hybrid_ffn_eval.cpp
 - `DFLASH_MOE_PREFILL_PERSISTENT_OWNER_ALLOC` - deepseek4_graph.cpp
+- `DFLASH_MOE_PRIMARY_SHARE_PER_MILLE` - moe_hybrid_stream.cpp
 - `DFLASH_NO_MASK` - laguna_backend.cpp
 - `DFLASH_NO_MOE_ROUTER_FUSE` - qwen35moe_ffn.cpp
 - `DFLASH_NO_MOE_SWIGLU_FUSE` - qwen35moe_ffn.cpp

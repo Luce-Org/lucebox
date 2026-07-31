@@ -30,9 +30,13 @@ small architecture adapter around it:
   capped by the actual routed pool, so a tiny model cannot accidentally request
   a model-sized cache.
 - Routed-expert ownership is independent of contiguous layer splitting.
-  `DFLASH_MOE_TP_GPU` can place the SSD slots, adaptive cache, and selected
-  expert graphs on a second HIP device while KDA/MLA, recurrent/KV state,
-  shared experts, and sampling remain on the primary device.
+  With a second HIP device, two common stream engines partition the exact
+  native routes and run concurrently. The primary owns profile-selected hot
+  experts; the secondary owns the remaining capacity routes. Each engine has
+  independent SSD slots, adaptive cache, and persistent expert graphs.
+- `MoeStreamDualOwnerExecutor` keeps one secondary worker alive for the model
+  lifetime. This removes thread create/join from every MoE layer and makes
+  routed wall time track the slower branch instead of their sum.
 - `bench_kimi_k3_hetero` runs Kimi's exact IQ1_S routed-expert geometry through
   the same model-neutral persistent evaluator used by production adapters:
   896 experts, top-16, 92 MoE layers,
@@ -49,9 +53,9 @@ The SSD text path is implemented, but two qualification boundaries remain:
 
 - The backend is correctness-first and token-sequential. Its per-layer graph
   boundaries are not yet fused/captured for full-model speed.
-- The heterogeneous path currently crosses a host-visible, activation-sized
-  boundary at every routed layer. It is correct on two devices but does not
-  yet use PR-505's device-resident owner fork/join and overlap.
+- The heterogeneous routed branches overlap, but their partial outputs still
+  cross a host-visible, activation-sized boundary at every routed layer. It
+  does not yet use PR-505's device-resident peer join.
 
 The vision encoder is out of scope for this text-only path.
 
@@ -136,12 +140,13 @@ reserves. The implemented capacity-safe Strix-only starting point is:
 2. NVMe: all routed expert stacks, with actual route misses read directly into
    pinned slots and evaluated on Strix.
 
-This works unchanged on a Strix-only machine. A full Lucebox can additionally
-assign the R9700 as the routed-expert owner with `DFLASH_MOE_TP_GPU`, moving
-the adaptive expert cache and selected expert compute off Strix. That uses the
-second device's memory, but the measured R9700 cold-storage path is slower, so
-it is a capacity option rather than the default speed profile. The inverse
-placement is also supported when a model's non-routed tensors fit on R9700.
+This works unchanged on a Strix-only machine. When the non-routed execution
+plan fits the R9700 budget, the full-Lucebox speed topology instead makes R9700
+the primary and sets `DFLASH_MOE_TP_GPU` to Strix. An offline placement
+file assigns hot routes to R9700 while Strix executes the remaining routes and
+serves the larger capacity cache. Both branches run concurrently; blindly
+sending every streamed expert to R9700 remains slower because its cold SSD
+upload path measured below Strix.
 
 After approximately 57.94 GiB of non-routed weights plus OS, workspace, and a
 moderate context reserve, roughly 70-85 GiB may remain for routed experts.
@@ -158,8 +163,8 @@ can establish it.
 
 ## Next full-model milestone
 
-The implementation no longer needs another generic cache or a second Kimi
-router. Full-scale qualification requires:
+The implementation no longer needs another generic cache, a second Kimi
+router, or per-layer worker creation. Full-scale qualification requires:
 
 1. Stage all 14 IQ1_S shards and run a short token-for-token comparison against
    the upstream Kimi implementation.
@@ -168,8 +173,8 @@ router. Full-scale qualification requires:
    chosen context budget.
 3. Compare end-to-end output and token rate against ordinary llama.cpp
    CPU/GPU offload.
-4. Only after that baseline, replace the correctness-first host boundary with
-   a device-resident owner fork/join and overlap dense work with expert service.
+4. Replace the correctness-first host partial join with a device-resident peer
+   join, then tune the placement until the two owner branches balance.
 
 The full 594 GB model cannot currently be staged on the qualification box,
 which currently has about 513 GB free. It needs at least about 650 GB of safe

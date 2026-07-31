@@ -9,6 +9,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -446,7 +448,9 @@ bool streamed_kimi_k3_step(
         int32_t token,
         int position,
         std::vector<float> & logits,
-        MoeHybridStreamEngine & stream_engine) {
+        MoeHybridStreamEngine & stream_engine,
+        MoeStreamDualOwnerExecutor * dual_stream_executor,
+        const MoeStreamDualOwnerPolicy * stream_owner_policy) {
     std::vector<float> hidden(static_cast<size_t>(w.n_embd));
 
     {
@@ -637,15 +641,34 @@ bool streamed_kimi_k3_step(
         route_batch.selected_weights = route_weights.data();
         std::vector<float> routed_output;
         std::string stream_error;
-        if (!eval_moe_streamed_experts(
+        MoeStreamDualOwnerStats owner_stats;
+        const bool dual_owner = dual_stream_executor != nullptr;
+        const bool route_ok = dual_owner
+            ? dual_stream_executor->eval(
+                spec, route_batch, *stream_owner_policy,
+                routed_output, &owner_stats, &stream_error)
+            : eval_moe_streamed_experts(
                 stream_engine, spec, route_batch,
-                routed_output, &stream_error)) {
+                routed_output, &stream_error);
+        if (!route_ok) {
             set_last_error(
                 "Kimi-K3 routed layer " +
                 std::to_string(il) +
                 ": streamed expert evaluation failed: " +
                 stream_error);
             return false;
+        }
+        const char * trace = std::getenv("DFLASH_MOE_DUAL_STREAM_TRACE");
+        if (dual_owner && trace && *trace && std::strcmp(trace, "0") != 0) {
+            std::fprintf(stderr,
+                "[kimi-k3] dual-owner layer=%d routes=%d/%d experts=%d/%d "
+                "primary=%.3fms secondary=%.3fms wall=%.3fms\n",
+                route_batch.layer,
+                owner_stats.primary_routes, owner_stats.secondary_routes,
+                owner_stats.primary_experts, owner_stats.secondary_experts,
+                owner_stats.primary_us / 1000.0,
+                owner_stats.secondary_us / 1000.0,
+                owner_stats.wall_us / 1000.0);
         }
 
         ctx = new_kimi_step_context();
@@ -797,7 +820,9 @@ bool kimi_k3_step(ggml_backend_t backend,
                   int32_t token,
                   int position,
                   std::vector<float> & logits,
-                  MoeHybridStreamEngine * stream_engine) {
+                  MoeHybridStreamEngine * stream_engine,
+                  MoeStreamDualOwnerExecutor * dual_stream_executor,
+                  const MoeStreamDualOwnerPolicy * stream_owner_policy) {
     if (!backend || !w.ctx || !cache.ctx || position < 0 ||
         position >= cache.max_ctx || position != cache.cur_pos ||
         token < 0 || token >= w.n_vocab) {
@@ -810,9 +835,17 @@ bool kimi_k3_step(ggml_backend_t backend,
                 "Kimi-K3 step: file-backed experts require a bound stream engine");
             return false;
         }
+        if (dual_stream_executor &&
+            (!dual_stream_executor->is_ready() || !stream_owner_policy)) {
+            set_last_error(
+                "Kimi-K3 step: dual-owner streaming requires a ready "
+                "executor and an ownership policy");
+            return false;
+        }
         return streamed_kimi_k3_step(
             backend, w, cache, token, position,
-            logits, *stream_engine);
+            logits, *stream_engine, dual_stream_executor,
+            stream_owner_policy);
     }
 
     ggml_init_params params{};

@@ -6,13 +6,17 @@
 #include "ggml-cuda.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <limits>
 #include <mutex>
 #include <new>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 
@@ -144,6 +148,14 @@ MoeStreamConfig MoeStreamConfig::from_env() {
     config.prefill_threshold = env_bounded_int(
         "DFLASH_MOE_NVME_PREFILL_THRESHOLD", config.prefill_threshold, 1, 4096);
     return config;
+}
+
+MoeStreamDualOwnerPolicy MoeStreamDualOwnerPolicy::from_env() {
+    MoeStreamDualOwnerPolicy policy;
+    policy.primary_share_per_mille = env_bounded_int(
+        "DFLASH_MOE_PRIMARY_SHARE_PER_MILLE",
+        policy.primary_share_per_mille, 0, 1000);
+    return policy;
 }
 
 bool make_moe_stream_expert_spec(
@@ -1734,6 +1746,11 @@ bool eval_moe_streamed_experts(
 
     auto & runtime = *engine.runtime_;
     std::lock_guard<std::mutex> compute_guard(runtime.compute_mutex);
+    ScopedGpuDevice device_scope(runtime.device);
+    if (!device_scope.ready()) {
+        if (err) *err = "failed to select streamed expert compute GPU";
+        return false;
+    }
     if (!prepare_device_expert_layout(
             runtime, batch.layer, spec, err)) {
         return false;
@@ -1966,6 +1983,367 @@ bool eval_moe_streamed_experts(
         release_current();
     }
     return true;
+}
+
+namespace {
+
+uint32_t stream_owner_hash(int layer, int expert) {
+    uint32_t value = (uint32_t) expert + 0x9e3779b9U;
+    value ^= (uint32_t) layer * 0x85ebca6bU;
+    value ^= value >> 16;
+    value *= 0x7feb352dU;
+    value ^= value >> 15;
+    value *= 0x846ca68bU;
+    value ^= value >> 16;
+    return value;
+}
+
+} // namespace
+
+bool partition_moe_stream_routes(
+        const MoeStreamRouteBatch & batch,
+        const MoeStreamDualOwnerPolicy & policy,
+        std::vector<float> & primary_weights,
+        std::vector<float> & secondary_weights,
+        MoeStreamDualOwnerStats * stats,
+        std::string * err) {
+    if (batch.layer < 0 || batch.n_expert <= 0 || batch.top_k <= 0 ||
+        batch.top_k > batch.n_expert || batch.n_tokens <= 0 ||
+        !batch.selected_ids || !batch.selected_weights ||
+        policy.primary_share_per_mille < 0 ||
+        policy.primary_share_per_mille > 1000) {
+        if (err) *err = "invalid dual-owner route batch or policy";
+        return false;
+    }
+    if (policy.primary_placement &&
+        (policy.primary_placement->n_layer <= batch.layer ||
+         policy.primary_placement->n_expert != batch.n_expert)) {
+        if (err) *err = "dual-owner placement does not match routed batch";
+        return false;
+    }
+
+    size_t route_slots = 0;
+    if (!checked_mul_size((size_t) batch.top_k,
+                          (size_t) batch.n_tokens, route_slots)) {
+        if (err) *err = "dual-owner route slot count overflow";
+        return false;
+    }
+    primary_weights.assign(route_slots, 0.0f);
+    secondary_weights.assign(route_slots, 0.0f);
+
+    // -1 means unseen, 0 secondary, 1 primary. Duplicate appearances of one
+    // expert in a batch must retain one owner so its cache remains coherent.
+    std::vector<int8_t> owner((size_t) batch.n_expert, -1);
+    std::vector<int32_t> unique_experts;
+    unique_experts.reserve(std::min(route_slots, (size_t) batch.n_expert));
+    int primary_experts = 0;
+    int secondary_experts = 0;
+    for (size_t route = 0; route < route_slots; ++route) {
+        const int32_t expert = batch.selected_ids[route];
+        const float weight = batch.selected_weights[route];
+        if (expert < 0 || weight == 0.0f) continue;
+        if (expert >= batch.n_expert || !std::isfinite(weight)) {
+            if (err) *err = "native router produced an invalid dual-owner route";
+            return false;
+        }
+        if (owner[(size_t) expert] >= 0) continue;
+        bool primary_owner = false;
+        if (policy.primary_placement) {
+            primary_owner = policy.primary_placement->is_hot(
+                batch.layer, expert);
+        } else {
+            primary_owner =
+                stream_owner_hash(batch.layer, expert) % 1000U <
+                (uint32_t) policy.primary_share_per_mille;
+        }
+        owner[(size_t) expert] = primary_owner ? 1 : 0;
+        unique_experts.push_back(expert);
+        if (primary_owner) ++primary_experts;
+        else ++secondary_experts;
+    }
+
+    int primary_routes = 0;
+    int secondary_routes = 0;
+    for (size_t route = 0; route < route_slots; ++route) {
+        const int32_t expert = batch.selected_ids[route];
+        const float weight = batch.selected_weights[route];
+        if (expert < 0 || weight == 0.0f) continue;
+        if (owner[(size_t) expert] == 1) {
+            primary_weights[route] = weight;
+            ++primary_routes;
+        } else {
+            secondary_weights[route] = weight;
+            ++secondary_routes;
+        }
+    }
+    if (stats) {
+        stats->primary_routes = primary_routes;
+        stats->secondary_routes = secondary_routes;
+        stats->primary_experts = primary_experts;
+        stats->secondary_experts = secondary_experts;
+    }
+    return true;
+}
+
+struct MoeStreamDualOwnerExecutor::Runtime {
+    MoeHybridStreamEngine * primary = nullptr;
+    MoeHybridStreamEngine * secondary = nullptr;
+    std::mutex call_mutex;
+    std::mutex work_mutex;
+    std::condition_variable work_cv;
+    std::condition_variable done_cv;
+    std::thread worker;
+    bool stop = false;
+    bool pending = false;
+    bool done = false;
+
+    const MoeStreamExpertSpec * job_spec = nullptr;
+    MoeStreamRouteBatch job_batch;
+    std::vector<float> * job_out = nullptr;
+    std::string * job_error = nullptr;
+    bool job_ok = false;
+    uint64_t job_us = 0;
+
+    void worker_loop() {
+        using Clock = std::chrono::steady_clock;
+        for (;;) {
+            const MoeStreamExpertSpec * spec = nullptr;
+            MoeStreamRouteBatch batch;
+            std::vector<float> * out = nullptr;
+            std::string * error = nullptr;
+            {
+                std::unique_lock<std::mutex> lock(work_mutex);
+                work_cv.wait(lock, [&]() { return stop || pending; });
+                if (stop) return;
+                spec = job_spec;
+                batch = job_batch;
+                out = job_out;
+                error = job_error;
+                pending = false;
+            }
+
+            const auto start = Clock::now();
+            bool ok = false;
+            try {
+                ok = eval_moe_streamed_experts(
+                    *secondary, *spec, batch, *out, error);
+            } catch (const std::exception & ex) {
+                *error = ex.what();
+            } catch (...) {
+                *error = "unknown secondary-owner exception";
+            }
+            const uint64_t elapsed_us = (uint64_t)
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    Clock::now() - start).count();
+            {
+                std::lock_guard<std::mutex> lock(work_mutex);
+                job_ok = ok;
+                job_us = elapsed_us;
+                done = true;
+            }
+            done_cv.notify_one();
+        }
+    }
+};
+
+MoeStreamDualOwnerExecutor::MoeStreamDualOwnerExecutor() = default;
+
+MoeStreamDualOwnerExecutor::~MoeStreamDualOwnerExecutor() {
+    destroy();
+}
+
+bool MoeStreamDualOwnerExecutor::init(
+        MoeHybridStreamEngine & primary,
+        MoeHybridStreamEngine & secondary,
+        std::string * err) {
+    destroy();
+    if (!primary.is_bound() || !secondary.is_bound() ||
+        !primary.compute_backend() || !secondary.compute_backend() ||
+        primary.compute_backend() == secondary.compute_backend()) {
+        if (err) *err = "dual-owner streaming requires two bound GPU backends";
+        return false;
+    }
+
+    auto runtime = std::make_unique<Runtime>();
+    runtime->primary = &primary;
+    runtime->secondary = &secondary;
+    try {
+        Runtime * worker_runtime = runtime.get();
+        runtime->worker = std::thread(
+            [worker_runtime]() { worker_runtime->worker_loop(); });
+    } catch (const std::exception & ex) {
+        if (err) {
+            *err = std::string("failed to start secondary owner worker: ") +
+                ex.what();
+        }
+        return false;
+    }
+    runtime_ = std::move(runtime);
+    return true;
+}
+
+bool MoeStreamDualOwnerExecutor::is_ready() const {
+    return runtime_ != nullptr;
+}
+
+void MoeStreamDualOwnerExecutor::destroy() {
+    if (!runtime_) return;
+    auto runtime = std::move(runtime_);
+    std::lock_guard<std::mutex> call_guard(runtime->call_mutex);
+    {
+        std::lock_guard<std::mutex> lock(runtime->work_mutex);
+        runtime->stop = true;
+    }
+    runtime->work_cv.notify_one();
+    if (runtime->worker.joinable()) runtime->worker.join();
+}
+
+bool MoeStreamDualOwnerExecutor::eval(
+        const MoeStreamExpertSpec & spec,
+        const MoeStreamRouteBatch & batch,
+        const MoeStreamDualOwnerPolicy & policy,
+        std::vector<float> & out,
+        MoeStreamDualOwnerStats * stats,
+        std::string * err) {
+    if (!runtime_) {
+        if (err) *err = "dual-owner executor is not initialized";
+        return false;
+    }
+    Runtime & runtime = *runtime_;
+    std::lock_guard<std::mutex> call_guard(runtime.call_mutex);
+    if (!runtime.primary->is_bound() || !runtime.secondary->is_bound()) {
+        if (err) *err = "dual-owner stream engine was destroyed";
+        return false;
+    }
+
+    MoeStreamDualOwnerStats local_stats;
+    std::vector<float> primary_weights;
+    std::vector<float> secondary_weights;
+    if (!partition_moe_stream_routes(
+            batch, policy, primary_weights, secondary_weights,
+            &local_stats, err)) {
+        return false;
+    }
+
+    // A stable placement may legitimately route this token to only one GPU.
+    // Bypass the worker rendezvous in that case; forcing synthetic work onto
+    // both owners would hurt cache locality and small-top-k decode latency.
+    if (local_stats.primary_routes == 0 ||
+        local_stats.secondary_routes == 0) {
+        const bool use_primary = local_stats.primary_routes != 0;
+        MoeHybridStreamEngine & owner = use_primary
+            ? *runtime.primary : *runtime.secondary;
+        MoeStreamRouteBatch owner_batch = batch;
+        owner_batch.selected_weights = use_primary
+            ? primary_weights.data() : secondary_weights.data();
+        using Clock = std::chrono::steady_clock;
+        const auto start = Clock::now();
+        std::string owner_error;
+        bool ok = false;
+        try {
+            ok = eval_moe_streamed_experts(
+                owner, spec, owner_batch, out, &owner_error);
+        } catch (const std::exception & ex) {
+            owner_error = ex.what();
+        } catch (...) {
+            owner_error = "unknown single-owner exception";
+        }
+        const uint64_t elapsed_us = (uint64_t)
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                Clock::now() - start).count();
+        local_stats.wall_us = elapsed_us;
+        if (use_primary) local_stats.primary_us = elapsed_us;
+        else local_stats.secondary_us = elapsed_us;
+        if (stats) *stats = local_stats;
+        if (!ok && err) {
+            *err = std::string(use_primary ? "primary" : "secondary") +
+                " owner failed: " + owner_error;
+        }
+        return ok;
+    }
+
+    MoeStreamRouteBatch primary_batch = batch;
+    MoeStreamRouteBatch secondary_batch = batch;
+    primary_batch.selected_weights = primary_weights.data();
+    secondary_batch.selected_weights = secondary_weights.data();
+    std::vector<float> primary_out;
+    std::vector<float> secondary_out;
+    std::string primary_error;
+    std::string secondary_error;
+    using Clock = std::chrono::steady_clock;
+    const auto wall_start = Clock::now();
+
+    {
+        std::lock_guard<std::mutex> lock(runtime.work_mutex);
+        runtime.job_spec = &spec;
+        runtime.job_batch = secondary_batch;
+        runtime.job_out = &secondary_out;
+        runtime.job_error = &secondary_error;
+        runtime.job_ok = false;
+        runtime.job_us = 0;
+        runtime.done = false;
+        runtime.pending = true;
+    }
+    runtime.work_cv.notify_one();
+
+    bool primary_ok = false;
+    const auto primary_start = Clock::now();
+    try {
+        primary_ok = eval_moe_streamed_experts(
+            *runtime.primary, spec, primary_batch,
+            primary_out, &primary_error);
+    } catch (const std::exception & ex) {
+        primary_error = ex.what();
+    } catch (...) {
+        primary_error = "unknown primary-owner exception";
+    }
+    local_stats.primary_us = (uint64_t)
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            Clock::now() - primary_start).count();
+
+    bool secondary_ok = false;
+    {
+        std::unique_lock<std::mutex> lock(runtime.work_mutex);
+        runtime.done_cv.wait(lock, [&]() { return runtime.done; });
+        secondary_ok = runtime.job_ok;
+        local_stats.secondary_us = runtime.job_us;
+    }
+    local_stats.wall_us = (uint64_t)
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            Clock::now() - wall_start).count();
+
+    if (!primary_ok || !secondary_ok) {
+        if (err) {
+            *err = !primary_ok
+                ? std::string("primary owner failed: ") + primary_error
+                : std::string("secondary owner failed: ") + secondary_error;
+        }
+        return false;
+    }
+    if (primary_out.size() != secondary_out.size()) {
+        if (err) *err = "dual-owner partial sizes do not match";
+        return false;
+    }
+    out.resize(primary_out.size());
+    for (size_t i = 0; i < out.size(); ++i) {
+        out[i] = primary_out[i] + secondary_out[i];
+    }
+    if (stats) *stats = local_stats;
+    return true;
+}
+
+bool eval_moe_streamed_experts_dual_owner(
+        MoeHybridStreamEngine & primary,
+        MoeHybridStreamEngine & secondary,
+        const MoeStreamExpertSpec & spec,
+        const MoeStreamRouteBatch & batch,
+        const MoeStreamDualOwnerPolicy & policy,
+        std::vector<float> & out,
+        MoeStreamDualOwnerStats * stats,
+        std::string * err) {
+    MoeStreamDualOwnerExecutor executor;
+    if (!executor.init(primary, secondary, err)) return false;
+    return executor.eval(spec, batch, policy, out, stats, err);
 }
 
 bool eval_moe_cold_experts_streaming(

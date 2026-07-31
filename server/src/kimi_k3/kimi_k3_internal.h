@@ -24,6 +24,8 @@
 namespace dflash::common {
 
 class MoeHybridStreamEngine;
+class MoeStreamDualOwnerExecutor;
+struct MoeStreamDualOwnerPolicy;
 
 struct KimiK3Layer {
     bool recurrent = false;
@@ -172,6 +174,8 @@ bool kimi_k3_step(ggml_backend_t backend,
                   int32_t token,
                   int position,
                   std::vector<float> & logits,
-                  MoeHybridStreamEngine * stream_engine = nullptr);
+                  MoeHybridStreamEngine * stream_engine = nullptr,
+                  MoeStreamDualOwnerExecutor * dual_stream_executor = nullptr,
+                  const MoeStreamDualOwnerPolicy * stream_owner_policy = nullptr);
 
 } // namespace dflash::common
