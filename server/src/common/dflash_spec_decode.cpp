@@ -66,9 +66,11 @@ bool run_dflash_spec_decode(
     const bool use_remote_draft = remote_draft && remote_draft->active();
     if (!use_remote_draft && !feature_ring.target_feat) return false;
 
-    const int hidden    = draft_weights.n_embd;
-    const int max_q_len = draft_weights.block_size;
-    if (hidden <= 0 || max_q_len <= 0) return false;
+    const int hidden = draft_weights.n_embd;
+    const int draft_block_size = draft_weights.block_size;
+    const bool dspark_block = draft_weights.dspark.enabled;
+    const int max_verify_width = draft_weights.max_chain_verify_tokens();
+    if (hidden <= 0 || draft_block_size <= 0 || max_verify_width <= 0) return false;
     const float width_theta = adaptive_verify_width_theta();
     const int target_width_min = target.default_adaptive_verify_min_rows();
     const int width_min = adaptive_verify_width_min(target_width_min);
@@ -76,11 +78,11 @@ bool run_dflash_spec_decode(
     StepGraph draft_sg;
     StepGraphGuard draft_sg_guard{draft_sg};
 
-    std::vector<float>   noise_embed((size_t)hidden * max_q_len);
-    std::vector<int32_t> noise_ids(max_q_len);
-    std::vector<int32_t> draft_tok(max_q_len);
-    std::vector<int32_t> target_tok(max_q_len);
-    std::vector<int32_t> pos_q(max_q_len);
+    std::vector<float>   noise_embed((size_t)hidden * draft_block_size);
+    std::vector<int32_t> noise_ids(draft_block_size);
+    std::vector<int32_t> draft_tok(max_verify_width);
+    std::vector<int32_t> target_tok(max_verify_width);
+    std::vector<int32_t> pos_q(draft_block_size);
     std::vector<int32_t> pos_k;
     std::vector<float>   local_hidden;       // host buffer for local draft hidden states
     std::vector<float>   remote_hidden;      // host buffer for remote-draft hidden states
@@ -99,15 +101,15 @@ bool run_dflash_spec_decode(
     auto t_dec0 = std::chrono::steady_clock::now();
     while (n_generated < n_gen) {
         const int need_commit_budget = n_gen - n_generated;
-        int q_len = max_q_len;
+        int q_len = max_verify_width;
 
         // ── Build noise input for draft ────────────────────────────────────
         noise_ids[0] = last_tok;
-        for (int i = 1; i < max_q_len; i++) {
+        for (int i = 1; i < draft_block_size; i++) {
             noise_ids[i] = target.mask_token_id();
         }
         if (!target.embed_tokens(
-                noise_ids.data(), max_q_len, noise_embed.data())) {
+                noise_ids.data(), draft_block_size, noise_embed.data())) {
             std::fprintf(stderr, "dflash-spec noise embed failed\n");
             return false;
         }
@@ -146,9 +148,9 @@ bool run_dflash_spec_decode(
             }
             ggml_backend_tensor_set(draft_sg.inp_embed, noise_embed.data(), 0,
                                     sizeof(float) * noise_embed.size());
-            pos_k.resize((size_t)draft_ctx + max_q_len);
-            for (int i = 0; i < max_q_len; i++) pos_q[i] = draft_ctx + i;
-            for (int i = 0; i < draft_ctx + max_q_len; i++) pos_k[i] = i;
+            pos_k.resize((size_t)draft_ctx + draft_block_size);
+            for (int i = 0; i < draft_block_size; i++) pos_q[i] = draft_ctx + i;
+            for (int i = 0; i < draft_ctx + draft_block_size; i++) pos_k[i] = i;
             ggml_backend_tensor_set(draft_sg.positions, pos_q.data(), 0,
                                     sizeof(int32_t) * pos_q.size());
             ggml_backend_tensor_set(draft_sg.positions_k, pos_k.data(), 0,
@@ -160,7 +162,7 @@ bool run_dflash_spec_decode(
             }
             // Read draft hidden states out to host so the target adapter can
             // project them through its own LM head (target-internal layout).
-            local_hidden.resize((size_t)hidden * max_q_len);
+            local_hidden.resize((size_t)hidden * draft_block_size);
             ggml_backend_tensor_get(draft_sg.hidden_states, local_hidden.data(), 0,
                                     sizeof(float) * local_hidden.size());
             draft_hidden_host = local_hidden.data();
@@ -174,46 +176,70 @@ bool run_dflash_spec_decode(
         std::vector<float> confidence;
         std::vector<float> candidate_probs;
         std::vector<int32_t> candidate_ids;
+        std::vector<int32_t> proposals;
         bool projected = false;
-        if (draft_backend && draft_weights.dspark.enabled && max_q_len > 1) {
+        if (draft_backend && dspark_block) {
             ggml_backend_t head_backend = target.fused_head_backend();
             const bool same_device_head =
                 head_backend && target.lm_head_tensor() &&
                 ggml_backend_get_device(head_backend) ==
                     ggml_backend_get_device(draft_backend);
             if (same_device_head) {
-                projected = dspark_markov_correct_greedy_chain_fused(
+                projected = dspark_markov_propose_greedy_block_fused(
                     draft_weights, draft_backend, target.lm_head_tensor(),
-                    draft_hidden_host, max_q_len, last_tok, draft_tok,
+                    draft_hidden_host, draft_block_size, last_tok, proposals,
                     &confidence);
             }
             if (!projected) {
-                projected = dspark_markov_correct_greedy_chain(
+                projected = dspark_markov_propose_greedy_block(
                     draft_weights, draft_backend, target,
-                    draft_hidden_host, max_q_len, last_tok,
-                    /*confidence_threshold=*/0.0f, draft_tok);
+                    draft_hidden_host, draft_block_size, last_tok, proposals);
             }
         }
-        if (!projected) {
-            const int candidate_k = width_theta > 0.0f && max_q_len > 2 ? 2 : 0;
+        if (dspark_block && !projected) {
+            // Preserve the DSpark block contract even if the auxiliary head
+            // cannot execute: every hidden row still predicts a proposal.
+            projected = target.project_hidden_to_tokens(
+                draft_hidden_host, draft_block_size, proposals);
+        }
+        if (dspark_block && projected) {
+            if (proposals.size() < static_cast<size_t>(draft_block_size)) {
+                projected = false;
+            } else {
+                draft_tok.clear();
+                draft_tok.reserve(static_cast<size_t>(max_verify_width));
+                draft_tok.push_back(last_tok);
+                draft_tok.insert(
+                    draft_tok.end(), proposals.begin(),
+                    proposals.begin() + draft_block_size);
+            }
+        } else if (!dspark_block) {
+            const int candidate_k =
+                width_theta > 0.0f && draft_block_size > 2 ? 2 : 0;
             projected = target.project_hidden_to_tokens_topk(
-                draft_hidden_host, max_q_len, draft_tok, candidate_k,
+                draft_hidden_host, draft_block_size, draft_tok, candidate_k,
                 candidate_k > 0 ? &candidate_probs : nullptr,
                 candidate_k > 0 ? &candidate_ids : nullptr);
+            if (projected &&
+                draft_tok.size() >= static_cast<size_t>(draft_block_size)) {
+                draft_tok[0] = last_tok;
+            }
         }
-        if (!projected || draft_tok.size() < (size_t)max_q_len) {
+        if (!projected ||
+            draft_tok.size() < static_cast<size_t>(max_verify_width)) {
             std::fprintf(stderr, "dflash-spec projection failed\n");
             return false;
         }
-        draft_tok[0] = last_tok;
 
-        if (confidence.size() >= (size_t)(max_q_len - 1)) {
+        if (dspark_block &&
+            confidence.size() >= static_cast<size_t>(draft_block_size)) {
             q_len = adaptive_verify_width(
-                confidence.data(), 1, max_q_len, width_theta, width_min);
+                confidence.data(), 1, max_verify_width,
+                width_theta, width_min);
         } else if (candidate_probs.size() >=
-                   static_cast<size_t>((max_q_len - 1) * 2)) {
+                   static_cast<size_t>((max_verify_width - 1) * 2)) {
             q_len = adaptive_verify_width(
-                candidate_probs.data(), 2, max_q_len,
+                candidate_probs.data(), 2, max_verify_width,
                 width_theta, width_min);
         }
 
@@ -223,8 +249,8 @@ bool run_dflash_spec_decode(
         int hint_filled = 0;
         if (hint_tokens && n_generated < (int)hint_tokens->size()) {
             const int hint_avail = (int)hint_tokens->size() - n_generated;
-            q_len = max_q_len;
-            hint_filled = std::min(hint_avail, max_q_len - 1);
+            q_len = max_verify_width;
+            hint_filled = std::min(hint_avail, max_verify_width - 1);
             for (int i = 0; i < hint_filled; i++) {
                 draft_tok[1 + i] = (*hint_tokens)[n_generated + i];
             }

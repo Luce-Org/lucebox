@@ -799,7 +799,7 @@ bool KimiK3Backend::init() {
     if (!init_draft()) return false;
     const int max_ctx = std::max(1, cfg_.device.max_ctx);
     const int max_verify_tokens = draft_weights_.ctx
-        ? draft_weights_.block_size : 0;
+        ? draft_weights_.max_chain_verify_tokens() : 0;
     if (!create_kimi_k3_cache(
             backend_, weights_, max_ctx, cache_, max_verify_tokens)) {
         std::fprintf(stderr, "[kimi-k3] cache allocation failed (max_ctx=%d)\n",
