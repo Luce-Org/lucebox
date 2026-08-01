@@ -487,6 +487,9 @@ struct ModelBackend {
     // the server before startup.
     virtual bool supports_remote_draft() const { return false; }
 
+    // Native mmproj vision. LayerSplitBackend overrides to proxy the adapter.
+    virtual bool supports_multimodal() const { return false; }
+
     // Layer-split capability introspection. Non layer-split backends keep the
     // default false; LayerSplitBackend proxies model-adapter support.
     virtual bool supports_kvflash() const { return false; }
