@@ -8,7 +8,7 @@
 #      dispatch into the in-container Python CLI via `docker run`. The
 #      Python CLI lives at /opt/lucebox-hub/lucebox/ inside the image and is
 #      the single source of truth for orchestration logic — TOML config,
-#      autotune rules + sweep, server bring-up, smoke tests, model downloads.
+#      optimization planning, calibration probes, and model downloads.
 #
 #   2) Manage a user-level systemd unit (~/.config/systemd/user/lucebox.service)
 #      so the server can run as a long-lived service without keeping a shell
@@ -1072,12 +1072,19 @@ _set_tty_flags() {  # usage: _set_tty_flags arrayname
 
 build_orchestrator_argv() {
     local variant="$1" caller_has_tty="$2"; shift 2
+    local cli_group="${1:-}" cli_action="${2:-}"
     local tty=(-i)
     [ "$caller_has_tty" = "1" ] && tty=(-it)
     local argv=(docker run --rm "${tty[@]}")
     _append_gpu_args argv "$variant"
     argv+=(--name "${CONTAINER_NAME}-cli-$$")
     argv+=(--user "$(id -u):$(id -g)")
+    # Native/hybrid servers listen on the host loopback rather than in a
+    # Lucebox container. The internal calibration probe needs that namespace
+    # when it cannot use docker exec against a running inference container.
+    if [ "$cli_group" = "_calibration" ] && [ "$cli_action" = "probe" ]; then
+        argv+=(--network host)
+    fi
     # Only bind-mount the docker socket when DOCKER_HOST actually points
     # at a unix socket on this host. With DOCKER_HOST=tcp://… or ssh://…
     # the path we'd construct is `tcp` or empty, and `docker run -v` would
@@ -1586,6 +1593,161 @@ cmd_systemctl_passthrough() {
         *)
             die "unknown systemctl passthrough: $action" ;;
     esac
+}
+
+# One-time machine calibration. The Python package owns candidate generation,
+# workload measurement, quality-equivalence checks, winner selection, and the
+# result cache. This host layer owns only the lifecycle it alone can control:
+# restart the user service for each startup-scoped DDTree budget and restore
+# both config and service state on every failure or interrupt.
+_calibration_remove_run_dir() {
+    if [ -n "${LUCEBOX_CALIBRATION_RUN_DIR:-}" ] \
+       && [[ "$LUCEBOX_CALIBRATION_RUN_DIR" == "$CONFIG_HOME"/.calibration-run.* ]]; then
+        rm -rf -- "$LUCEBOX_CALIBRATION_RUN_DIR"
+    fi
+}
+
+_calibration_on_exit() {
+    local rc=$?
+    trap - EXIT HUP INT TERM
+    if [ "${LUCEBOX_CALIBRATION_COMMITTED:-0}" != "1" ] \
+       && [ -f "${LUCEBOX_CALIBRATION_BACKUP:-}" ]; then
+        cp "$LUCEBOX_CALIBRATION_BACKUP" "$(_lucebox_config_path)" || true
+        if [ "${LUCEBOX_CALIBRATION_HAD_RECORD:-0}" = "1" ] \
+           && [ -f "${LUCEBOX_CALIBRATION_RECORD_BACKUP:-}" ]; then
+            cp "$LUCEBOX_CALIBRATION_RECORD_BACKUP" \
+                "$CONFIG_HOME/calibration.json" || true
+        else
+            rm -f "$CONFIG_HOME/calibration.json"
+        fi
+        if [ "${LUCEBOX_CALIBRATION_WAS_ACTIVE:-0}" = "1" ]; then
+            systemctl --user restart "$UNIT_NAME" >/dev/null 2>&1 || true
+        else
+            systemctl --user stop "$UNIT_NAME" >/dev/null 2>&1 || true
+        fi
+        warn "Calibration did not complete; the original profile and service state were restored."
+    fi
+    _calibration_remove_run_dir
+    exit "$rc"
+}
+
+cmd_calibrate() {
+    local force=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --force) force=1 ;;
+            --help|-h)
+                cat <<EOF
+Usage: $SCRIPT_NAME calibrate [--force]
+
+Measure prefill, decode, and warm-prefix performance on the selected model.
+For DDTree-capable models, test at most three budgets and keep a new value only
+when its output/cache behavior matches and it is at least 5% faster. Results
+are cached for the exact model, runtime profile, driver, and GPU.
+EOF
+                return 0
+                ;;
+            *) die "unknown calibrate option: $1" ;;
+        esac
+        shift
+    done
+
+    ensure_probed
+    local config_path model
+    config_path=$(_lucebox_config_path)
+    [ -f "$config_path" ] || die "no config.toml — run '$SCRIPT_NAME setup' first"
+    model=$(_lucebox_config_get model.preset)
+    [ -n "$model" ] || die "no model selected — run '$SCRIPT_NAME models select' first"
+    _ensure_configured_image || return $?
+    if [ "$force" = "0" ] \
+       && bash "$SCRIPT_PATH" _calibration status; then
+        hint "Use '$SCRIPT_NAME calibrate --force' to measure again."
+        return 0
+    fi
+
+    require_systemd "safe calibration restarts"
+    [ -f "$UNIT_PATH" ] \
+        || die "$UNIT_NAME is not installed — run '$SCRIPT_NAME install' first"
+    command -v flock >/dev/null 2>&1 \
+        || die "calibration requires flock (provided by util-linux)"
+
+    mkdir -p "$CONFIG_HOME"
+    exec 9>"$CONFIG_HOME/calibration.lock"
+    flock -n 9 || die "another Lucebox calibration is already running"
+
+    LUCEBOX_CALIBRATION_RUN_DIR=$(mktemp -d "$CONFIG_HOME/.calibration-run.XXXXXX") \
+        || die "could not create calibration workspace"
+    LUCEBOX_CALIBRATION_BACKUP="$LUCEBOX_CALIBRATION_RUN_DIR/config.toml.backup"
+    cp "$config_path" "$LUCEBOX_CALIBRATION_BACKUP"
+    LUCEBOX_CALIBRATION_RECORD_BACKUP="$LUCEBOX_CALIBRATION_RUN_DIR/calibration.json.backup"
+    LUCEBOX_CALIBRATION_HAD_RECORD=0
+    if [ -f "$CONFIG_HOME/calibration.json" ]; then
+        cp "$CONFIG_HOME/calibration.json" "$LUCEBOX_CALIBRATION_RECORD_BACKUP"
+        LUCEBOX_CALIBRATION_HAD_RECORD=1
+    fi
+    LUCEBOX_CALIBRATION_WAS_ACTIVE=0
+    systemctl --user is-active --quiet "$UNIT_NAME" 2>/dev/null \
+        && LUCEBOX_CALIBRATION_WAS_ACTIVE=1
+    LUCEBOX_CALIBRATION_COMMITTED=0
+    export LUCEBOX_CALIBRATION_RUN_DIR LUCEBOX_CALIBRATION_BACKUP
+    export LUCEBOX_CALIBRATION_RECORD_BACKUP LUCEBOX_CALIBRATION_HAD_RECORD
+    export LUCEBOX_CALIBRATION_WAS_ACTIVE LUCEBOX_CALIBRATION_COMMITTED
+    trap _calibration_on_exit EXIT
+    trap 'exit 130' HUP INT TERM
+
+    local budgets=() baseline budget result_path successful=0
+    mapfile -t budgets < <(bash "$SCRIPT_PATH" _calibration budgets)
+    [ "${#budgets[@]}" -gt 0 ] || die "calibration planner returned no budget"
+    [ "${#budgets[@]}" -le 3 ] || die "calibration planner exceeded its three-cell bound"
+    baseline="${budgets[0]}"
+    info "Calibrating $model on this machine (${#budgets[@]} server start(s))."
+    hint "The engine may take several minutes to load each cell. Ctrl-C safely restores the original profile."
+
+    for budget in "${budgets[@]}"; do
+        [[ "$budget" =~ ^[0-9]+$ ]] || die "invalid calibration budget: $budget"
+        info "Calibration cell: DDTree budget $budget"
+        bash "$SCRIPT_PATH" _calibration apply "$budget" \
+            || die "could not apply calibration budget $budget"
+        if ! systemctl --user restart "$UNIT_NAME"; then
+            if [ "$budget" = "$baseline" ]; then
+                die "the baseline server failed to start"
+            fi
+            warn "Skipping budget $budget because the server failed to start."
+            continue
+        fi
+        result_path="$LUCEBOX_CALIBRATION_RUN_DIR/budget-$budget.json"
+        if bash "$SCRIPT_PATH" _calibration probe "$budget" "$result_path"; then
+            successful=$((successful + 1))
+        elif [ "$budget" = "$baseline" ]; then
+            die "the baseline performance probe failed"
+        else
+            warn "Skipping budget $budget because its performance probe failed."
+        fi
+    done
+    [ "$successful" -gt 0 ] || die "calibration produced no measurements"
+
+    bash "$SCRIPT_PATH" _calibration finish \
+        "$LUCEBOX_CALIBRATION_RUN_DIR" --baseline "$baseline" \
+        || die "calibration could not select a safe result"
+    local winner
+    winner=$(<"$LUCEBOX_CALIBRATION_RUN_DIR/winner")
+    [[ "$winner" =~ ^[0-9]+$ ]] || die "calibration returned an invalid winner"
+
+    if [ "$LUCEBOX_CALIBRATION_WAS_ACTIVE" = "1" ]; then
+        systemctl --user restart "$UNIT_NAME" \
+            || die "the calibrated server failed to restart"
+        ok "Calibrated profile is active (DDTree budget $winner)."
+    else
+        systemctl --user stop "$UNIT_NAME" \
+            || die "could not restore the engine's stopped state"
+        ok "Calibrated profile saved (DDTree budget $winner); engine remains stopped."
+    fi
+
+    LUCEBOX_CALIBRATION_COMMITTED=1
+    export LUCEBOX_CALIBRATION_COMMITTED
+    trap - EXIT HUP INT TERM
+    _calibration_remove_run_dir
+    flock -u 9
 }
 
 cmd_logs() {
@@ -2795,7 +2957,7 @@ _lucebox_complete() {
     COMPREPLY=()
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    cmds="menu setup connect install uninstall start stop restart enable disable status logs \
+    cmds="menu setup calibrate connect install uninstall start stop restart enable disable status logs \
           serve build package-runtime native harness pull update check completion config models \
           optimize print-run help version"
     config_verbs="get set unset"
@@ -2839,7 +3001,7 @@ ZSH
 # lucebox fish completion. Source from ~/.config/fish/config.fish:
 #   lucebox completion fish | source
 complete -c lucebox -f
-set -l __lucebox_cmds menu setup connect install uninstall start stop restart enable disable \
+set -l __lucebox_cmds menu setup calibrate connect install uninstall start stop restart enable disable \
     status logs serve build package-runtime native harness pull update check completion config models \
     optimize print-run help version
 for cmd in $__lucebox_cmds
@@ -3070,7 +3232,7 @@ _lucebox_container_running() {
 #     server), filesystem, and mounts — no bind mounts needed.
 #   - skips the ~1-3s cold-start cost of a fresh `docker run --rm`.
 #   - only safe for steady-state / read-only / config-only subcommands. Any
-#     command that restarts the lucebox service (autotune --sweep, serve)
+#     command that restarts the lucebox service (calibrate, serve)
 #     would kill the very container the exec is in — caller must route those
 #     to cmd_in_container instead.
 #
@@ -3116,6 +3278,12 @@ _lucebox_prefer_exec() {
         config|models|optimize|check|print-run|print-serve-argv)
             return 0
             ;;
+        _calibration)
+            case "${1:-}" in
+                apply|budgets|finish|probe|status) return 0 ;;
+            esac
+            return 1
+            ;;
         *)
             return 1
             ;;
@@ -3129,7 +3297,7 @@ _lucebox_prefer_exec() {
 #   1. LUCEBOX_NO_EXEC=1 / --no-exec was set → always run, never exec.
 #      Useful for debugging the wrapper or when the in-container Python is
 #      stale relative to the image.
-#   2. cmd is not in the prefer-exec list → run (sweep, service mutators).
+#   2. cmd is not in the prefer-exec list → run (service mutators).
 #   3. container is running → exec (the fast path, hits the live server).
 #   4. container is not running → run (fall back so first-run / pre-install
 #      flows still work without a live service).
@@ -3210,7 +3378,7 @@ _menu_restart_if_running() {
         _menu_run restart
     else
         _menu_run stop
-        warn "The foreground engine was stopped. Start it again from menu option 4."
+        warn "The foreground engine was stopped. Start it again from menu option 5."
     fi
 }
 
@@ -3281,8 +3449,10 @@ cmd_setup() {
     _ensure_configured_image || return $?
 
     printf '\n'
+    local optimized=0
     if _confirm "Enable recommended optimizations (may add a ~1.2 GB shared scorer)?" 1; then
         bash "$SCRIPT_PATH" optimize --yes || return $?
+        optimized=1
     else
         hint "The safe base profile is active; optional scorer-based features remain off."
     fi
@@ -3293,6 +3463,11 @@ cmd_setup() {
             if _confirm "Install Lucebox as a background service?" 1; then
                 bash "$SCRIPT_PATH" install || return $?
             fi
+        fi
+        if [ "$optimized" = "1" ] && [ -f "$UNIT_PATH" ] \
+           && _confirm "Measure and calibrate this model on this GPU? (one-time; several minutes)" 1; then
+            bash "$SCRIPT_PATH" calibrate \
+                || warn "Calibration was skipped; the Automatic profile is unchanged."
         fi
         if [ -f "$UNIT_PATH" ] && _confirm "Start the inference engine now?" 1; then
             if [ "$(_engine_state)" = "running" ]; then
@@ -3474,11 +3649,12 @@ cmd_menu() {
         printf '  1  Quick setup\n'
         printf '  2  Choose or download a model\n'
         printf '  3  Review optimizations\n'
-        printf '  4  Start the inference engine\n'
-        printf '  5  Stop the inference engine\n'
-        printf '  6  Status\n'
-        printf '  7  Recent logs\n'
-        printf '  8  Connect or open your harness\n'
+        printf '  4  Calibrate and measure performance\n'
+        printf '  5  Start the inference engine\n'
+        printf '  6  Stop the inference engine\n'
+        printf '  7  Status\n'
+        printf '  8  Recent logs\n'
+        printf '  9  Connect or open your harness\n'
         printf '  d  Developer tools  %b(%s)%b\n' "$C_DIM" "$repo_hint" "$C_RST"
         printf '  q  Quit\n\n'
         printf 'Choose: '
@@ -3496,10 +3672,11 @@ cmd_menu() {
                 if _menu_run optimize; then _menu_restart_if_running; fi
                 _menu_pause
                 ;;
-            4) _menu_start; _menu_pause ;;
-            5) _menu_run stop; _menu_pause ;;
-            6) _menu_run status; _menu_pause ;;
-            7)
+            4) _menu_run calibrate; _menu_pause ;;
+            5) _menu_start; _menu_pause ;;
+            6) _menu_run stop; _menu_pause ;;
+            7) _menu_run status; _menu_pause ;;
+            8)
                 if [ "$LUCEBOX_HOST_HAS_SYSTEMD" = "1" ] && [ -f "$UNIT_PATH" ]; then
                     _menu_run logs -n 80 --no-pager
                 else
@@ -3507,10 +3684,10 @@ cmd_menu() {
                 fi
                 _menu_pause
                 ;;
-            8) _menu_run connect; _menu_pause ;;
+            9) _menu_run connect; _menu_pause ;;
             d|D) cmd_developer_menu ;;
             q|Q|quit|exit) return 0 ;;
-            *) warn "Choose 1–8, d, or q"; _menu_pause ;;
+            *) warn "Choose 1–9, d, or q"; _menu_pause ;;
         esac
     done
 }
@@ -3523,6 +3700,7 @@ Interactive:
   $SCRIPT_NAME            open the branded menu (when run in a terminal)
   menu                    open the menu explicitly
   setup                   guided backend, model, optimization, and service setup
+  calibrate [--force]     measure this model/GPU and tune safe startup knobs
   connect [harness]       link an installed AI client to the local Lucebox API
 
 Service management (via user systemd):
@@ -3615,6 +3793,7 @@ main() {
         # Branded interactive surface / guided first run.
         menu)             cmd_menu "$@" ;;
         setup)            cmd_setup "$@" ;;
+        calibrate)        cmd_calibrate "$@" ;;
         connect)          cmd_connect "$@" ;;
 
         # Systemd surface

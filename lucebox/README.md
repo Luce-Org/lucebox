@@ -11,6 +11,7 @@ which invokes the package in the appropriate container:
     lucebox models select           # numbered picker + download + activate
     lucebox optimize                # review/apply the Automatic profile
     lucebox optimize --advanced     # override individual optimizations
+    lucebox calibrate               # measure + tune this model/GPU safely
     lucebox start
 
 The wrapper inventories the host and selects the compatible CUDA image for
@@ -20,6 +21,15 @@ then handles readiness checks, TOML configuration, model selection and
 download, optimization and placement settings, and construction of the final
 server command. Host facts are passed through `LUCEBOX_HOST_*` environment
 variables so the package never has to guess the host configuration.
+
+Calibration measures a real three-turn request and reports prefill, decode, and
+warm-prefix performance from the server's own timing data. It brackets only the
+DDTree budget, only on architectures where that startup value is consumed, and
+requires matching normalized output/cache behavior plus a 5% decode gain before
+changing the planner default. The cached record is invalidated by model,
+runtime, driver, or GPU changes. Spark, KVFlash, PFlash, GPU split, and DSpark
+continue to self-tune inside the engine; the CLI does not duplicate those
+policies.
 
 The guided picker leads with Lucebox's four featured model paths: Qwen3.6
 27B, Qwen3.6 35B-A3B, Laguna XS.2, and DeepSeek V4 Flash. It checks the

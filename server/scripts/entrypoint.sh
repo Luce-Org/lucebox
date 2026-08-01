@@ -2,13 +2,13 @@
 # In-container ENTRYPOINT for lucebox-hub.
 #
 # Normal path: the host-side `lucebox` CLI has already populated every
-# DFLASH_* env var from its detection / autotune sweep, so this script
-# just resolves paths and execs the native dflash_server binary.
+# DFLASH_* env var from its model/hardware plan (and optional calibration),
+# so this script just resolves paths and execs the native dflash_server binary.
 #
 # Fallback path: a user runs the image directly (`docker run --gpus all
 # ghcr.io/luce-org/lucebox-hub:cuda12`) with no env-var prep. We then do a
-# minimal VRAM-tiered autotune — same tiers as `lucebox autotune`, kept in
-# sync by hand. NVIDIA and AMD are both supported; elaborate driver/version
+# minimal VRAM-tiered fallback — same conservative tiers as the host planner,
+# kept in sync by hand. NVIDIA and AMD are both supported; elaborate driver/version
 # diagnostics and heterogeneous-backend selection stay in the host CLI.
 
 set -euo pipefail
@@ -27,7 +27,7 @@ die()   { printf '\033[1;31m[ERROR]\033[0m %s\n' "$*" >&2; exit 1; }
 # `shell`            — drop into bash inside the container (debug).
 # `lucebox`          — dispatch to the Python CLI. Any subcommand
 #                      `lucebox.sh` doesn't handle on the host arrives here
-#                      (check, config, pull, print-run, smoke, …).
+#                      (check, config, pull, print-run, calibration probes, …).
 # `python` or anything else
 #                    — pass through to exec, so `docker run … python -m foo`
 #                      still works for dev.
@@ -469,7 +469,7 @@ fi
 
 # Qwen3.6 DFlash drafters use sliding-window attention in the draft. Some GGUFs
 # carry this metadata directly; keep the documented env override as the startup
-# default so older drafts behave like the autotune-sweep path.
+# default so older drafts retain the documented startup behavior.
 case "$(basename "$DFLASH_TARGET")" in
     *Qwen3.6*|*qwen3.6*)
         if [ -z "${DFLASH27B_DRAFT_SWA:-}" ]; then
@@ -573,10 +573,8 @@ if [ -d "$DFLASH_DRAFT" ]; then
     # even if the init on line ~257 was somehow skipped (e.g. a future refactor
     # that moves the init out of this block, or a partial-rewrite during a
     # rebase that drops it). Coalesce-to-empty inline so a regression can't
-    # re-trip the unbound-variable crash that fired on the sindri sweep with
-    # multiple target GGUFs in models/ (commit a87bb93 was a partial fix —
-    # the recurrence proved that "initialize once at the top of the block"
-    # is too easy to undo). Cost: zero bytes at runtime.
+    # re-trip the unbound-variable crash seen with multiple target GGUFs in
+    # models/. Coalescing at the read site keeps a future refactor safe.
     DRAFT_FAMILY_GLOB="${DRAFT_FAMILY_GLOB:-}"
     if [ -n "$DRAFT_FILE" ] && [ -f "$DRAFT_FILE" ]; then
         DRAFT_ARG="$DRAFT_FILE"
@@ -663,8 +661,8 @@ fi
 # `--prefill-drafter` and `--draft` are present (look for the runtime
 # warning `--lazy-draft ignored: requires both --prefill-drafter and
 # --draft`). Warn loudly here when the operator's config asked for lazy
-# but we're about to drop it — sweeping past the silent no-op was the
-# fingerprint left in every sindri decode-tuning docker.stderr.
+# but we're about to drop it; otherwise performance measurements silently run
+# a different profile from the one the operator selected.
 if [ "$DFLASH_LAZY" = "1" ]; then
     if [ -z "$DRAFT_ARG" ] || [ -z "$DFLASH_PREFILL_DRAFTER" ]; then
         warn "DFLASH_LAZY=1 ignored: requires both DFLASH_DRAFT and DFLASH_PREFILL_DRAFTER (see entrypoint.sh comment). Continuing without --lazy-draft."

@@ -221,6 +221,7 @@ assert_runs "interactive menu renders and quits" \
     "computers for agents"
 assert_runs "version"  "bash '$SCRIPT' version"  ""
 assert_runs "--version" "bash '$SCRIPT' --version" ""
+assert_runs "calibrate --help" "bash '$SCRIPT' calibrate --help" "at most three"
 
 # ── 4. check — host-only, must run to completion even without docker/nvidia.
 #    This is the path that broke last time (multi-byte glyph + set -u).
@@ -235,7 +236,7 @@ assert_runs "check"    "bash '$SCRIPT' check"    "host readiness report"
 # On the bare runner there is no user systemd, no installed unit, and no
 # docker — so every command is expected to exit non-zero with a CLEAN error
 # message. What we forbid is a raw bash "unbound variable" leak.
-for sub in start stop restart enable disable status install uninstall; do
+for sub in start stop restart enable disable status install uninstall calibrate; do
     assert_no_set_u_leak "$sub dispatch (no set -u leak)" "$SCRIPT" "$sub"
 done
 # `logs` is special: it execs `journalctl -f` which streams every historical
@@ -761,6 +762,119 @@ STUB
     rm -rf "$sandbox"
 }
 test_install_writes_robust_unit
+
+# Calibration owns temporary service restarts, so its rollback contract is a
+# production invariant rather than a cosmetic CLI detail. Exercise both the
+# successful three-cell path and a failed baseline probe with isolated shims.
+test_calibration_lifecycle_and_rollback() {
+    local label="calibration lifecycle commits success and rolls back failure"
+    local sandbox state shim_dir out rc restart_count apply_count
+    sandbox=$(mktemp -d)
+    state="$sandbox/state"
+    shim_dir="$sandbox/bin"
+    mkdir -p "$state" "$shim_dir"
+    printf 'original\n' > "$state/config.toml"
+    : > "$sandbox/unit"
+    sed '$d' "$SCRIPT" > "$sandbox/library.sh"
+
+    cat > "$sandbox/cli-shim" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "${LUCEBOX_TEST_CLI_LOG:?}"
+case "${1:-}:${2:-}" in
+    _calibration:status) exit 1 ;;
+    _calibration:budgets) printf '22\n16\n32\n' ;;
+    _calibration:apply) printf 'budget=%s\n' "$3" > "$LUCEBOX_HOME/config.toml" ;;
+    _calibration:probe)
+        if [ "${LUCEBOX_TEST_FAIL_BASELINE:-0}" = "1" ] && [ "$3" = "22" ]; then
+            exit 2
+        fi
+        printf '{}\n' > "$4"
+        ;;
+    _calibration:finish)
+        printf 'calibrated=22\n' > "$LUCEBOX_HOME/config.toml"
+        printf '22\n' > "$3/winner"
+        ;;
+    *) exit 2 ;;
+esac
+STUB
+    cat > "$shim_dir/systemctl" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${LUCEBOX_TEST_SYSTEMCTL_LOG:?}"
+exit 0
+STUB
+    cat > "$shim_dir/flock" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+    chmod +x "$sandbox/cli-shim" "$shim_dir/systemctl" "$shim_dir/flock"
+
+    run_calibration_case() {
+        local fail_baseline="$1"
+        HOME="$sandbox/home" \
+        XDG_CONFIG_HOME="$sandbox/xdg" \
+        LUCEBOX_HOME="$state" \
+        LUCEBOX_TEST_CLI_LOG="$sandbox/cli.log" \
+        LUCEBOX_TEST_SYSTEMCTL_LOG="$sandbox/systemctl.log" \
+        LUCEBOX_TEST_FAIL_BASELINE="$fail_baseline" \
+        PATH="$shim_dir:$PATH" \
+        NO_COLOR=1 \
+        bash -c '
+            source "$1/library.sh"
+            SCRIPT_PATH="$1/cli-shim"
+            SCRIPT_NAME=lucebox
+            CONFIG_HOME="$LUCEBOX_HOME"
+            UNIT_NAME=lucebox.service
+            UNIT_PATH="$1/unit"
+            ensure_probed() { :; }
+            _ensure_configured_image() { :; }
+            require_systemd() { :; }
+            _lucebox_config_path() { printf "%s/config.toml" "$CONFIG_HOME"; }
+            _lucebox_config_get() { printf "qwen3.6-27b"; }
+            info() { :; }
+            hint() { :; }
+            ok() { :; }
+            warn() { printf "WARN %s\n" "$*" >&2; }
+            die() { printf "ERROR %s\n" "$*" >&2; exit 1; }
+            cmd_calibrate
+        ' bash "$sandbox"
+    }
+
+    : > "$sandbox/cli.log"
+    : > "$sandbox/systemctl.log"
+    rc=0
+    out=$(run_calibration_case 0 2>&1) || rc=$?
+    restart_count=$(grep -cF -- '--user restart lucebox.service' "$sandbox/systemctl.log" || true)
+    apply_count=$(grep -cF -- '_calibration apply' "$sandbox/cli.log" || true)
+    if [ "$rc" -ne 0 ] || [ "$(<"$state/config.toml")" != "calibrated=22" ] \
+       || [ "$restart_count" -ne 4 ] || [ "$apply_count" -ne 3 ] \
+       || compgen -G "$state/.calibration-run.*" >/dev/null; then
+        report fail "$label" \
+            "success case rc=$rc restarts=$restart_count applies=$apply_count output=$(head -5 <<<"$out")"
+        rm -rf "$sandbox"
+        return
+    fi
+
+    printf 'original\n' > "$state/config.toml"
+    : > "$sandbox/cli.log"
+    : > "$sandbox/systemctl.log"
+    rc=0
+    out=$(run_calibration_case 1 2>&1) || rc=$?
+    restart_count=$(grep -cF -- '--user restart lucebox.service' "$sandbox/systemctl.log" || true)
+    if [ "$rc" -eq 0 ] || [ "$(<"$state/config.toml")" != "original" ] \
+       || [ "$restart_count" -ne 2 ] \
+       || ! grep -qF 'original profile and service state were restored' <<<"$out" \
+       || compgen -G "$state/.calibration-run.*" >/dev/null; then
+        report fail "$label" \
+            "rollback case rc=$rc restarts=$restart_count config=$(<"$state/config.toml") output=$(head -5 <<<"$out")"
+        rm -rf "$sandbox"
+        return
+    fi
+
+    report ok "$label"
+    rm -rf "$sandbox"
+}
+test_calibration_lifecycle_and_rollback
 
 # ── 9. entrypoint.sh dispatch — confirm the in-container dispatch routes
 # trivial subcommands (shell, an unknown passthrough) without firing

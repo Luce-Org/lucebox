@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import sys
 from dataclasses import replace
+from pathlib import Path
 from typing import Annotated, Literal
 
 import typer
@@ -26,6 +27,7 @@ from rich.markup import escape
 from rich.table import Table
 
 import lucebox.autotune as autotune_mod
+import lucebox.calibration as calibration_mod
 import lucebox.capabilities as capabilities_mod
 import lucebox.config as config_mod
 import lucebox.docker_run as docker_run
@@ -246,6 +248,146 @@ def print_serve_argv() -> None:
     """
     for tok in _server_spec().argv():
         print(tok)
+
+
+# ── host-wrapper calibration protocol ─────────────────────────────────────
+
+
+calibration_app = typer.Typer(
+    no_args_is_help=True,
+    help="Internal host-wrapper calibration protocol.",
+)
+app.add_typer(calibration_app, name="_calibration", hidden=True)
+
+
+def _render_measurement(label: str, result: calibration_mod.ProbeResult) -> None:
+    cold_prefill = result.cold.prefill_tokens_per_sec
+    prefill = f"{cold_prefill:,.0f} prefill tok/s" if cold_prefill else "prefill n/a"
+    cache = (
+        f"warm cache hit ({result.warm.cached_prefix_tokens:,} tokens)"
+        if result.warm.cache_hit
+        else "warm cache not observed"
+    )
+    console.print(
+        f"{label}: budget [bold]{result.budget}[/bold] · {prefill} · "
+        f"[bold]{result.cold.decode_tokens_per_sec:.1f}[/bold] cold / "
+        f"[bold]{result.warm.decode_tokens_per_sec:.1f}[/bold] warm decode tok/s · {cache}"
+    )
+
+
+@calibration_app.command("budgets")
+def calibration_budgets() -> None:
+    """Emit the bounded candidate set, baseline first."""
+    cfg = _load_or_build()
+    if config_mod.optimization_mode() not in {"automatic", "custom"}:
+        error_console.print(
+            "[red]Calibration needs an optimization profile; run `lucebox optimize` first.[/red]"
+        )
+        raise typer.Exit(code=2)
+    for budget in calibration_mod.candidate_budgets(cfg):
+        print(budget)
+
+
+@calibration_app.command("status")
+def calibration_status() -> None:
+    """Show a matching cached result; exit 1 when calibration is stale."""
+    cfg = _load_or_build()
+    record = calibration_mod.current_record(cfg)
+    if record is None:
+        raise typer.Exit(code=1)
+    try:
+        winner_budget = int(record["winner_budget"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise typer.Exit(code=1) from exc
+    raw_results = record.get("results")
+    if not isinstance(raw_results, list):
+        raise typer.Exit(code=1)
+    try:
+        results = tuple(
+            calibration_mod.ProbeResult.from_dict(raw)
+            for raw in raw_results
+            if isinstance(raw, dict)
+        )
+    except ValueError as exc:
+        raise typer.Exit(code=1) from exc
+    winner = next((item for item in results if item.budget == winner_budget), None)
+    if winner is None:
+        raise typer.Exit(code=1)
+    console.print("[green]Calibration is current for this model and machine.[/green]")
+    _render_measurement("Measured", winner)
+
+
+@calibration_app.command("apply")
+def calibration_apply(
+    budget: Annotated[int, typer.Argument(help="DDTree budget for this cell.")],
+    final: Annotated[
+        bool,
+        typer.Option("--final", help="Mark this budget as the selected result."),
+    ] = False,
+) -> None:
+    """Apply one calibration cell while preserving Automatic/Custom ownership."""
+    try:
+        calibration_mod.apply_budget(budget, final=final)
+    except (OSError, ValueError) as exc:
+        error_console.print(f"[red]Cannot apply calibration cell:[/red] {escape(str(exc))}")
+        raise typer.Exit(code=2) from exc
+
+
+@calibration_app.command("probe")
+def calibration_probe(
+    budget: Annotated[int, typer.Argument(help="Expected active DDTree budget.")],
+    output: Annotated[Path, typer.Argument(help="Result JSON path.")],
+    ready_timeout: Annotated[
+        float,
+        typer.Option("--ready-timeout", min=1.0, help="Model startup timeout in seconds."),
+    ] = 600.0,
+) -> None:
+    """Measure one live server cell and atomically write its result."""
+    cfg = _load_or_build()
+    try:
+        result = calibration_mod.probe(
+            cfg,
+            budget,
+            ready_timeout_s=ready_timeout,
+        )
+        calibration_mod.write_probe(output, result)
+    except (OSError, TimeoutError, ValueError) as exc:
+        error_console.print(f"[red]Calibration probe failed:[/red] {escape(str(exc))}")
+        raise typer.Exit(code=2) from exc
+    _render_measurement("Measured", result)
+
+
+@calibration_app.command("finish")
+def calibration_finish(
+    result_dir: Annotated[Path, typer.Argument(help="Directory containing cell JSON files.")],
+    baseline: Annotated[int, typer.Option("--baseline", help="Original DDTree budget.")],
+) -> None:
+    """Select and persist the fastest quality-equivalent result."""
+    cfg = _load_or_build()
+    try:
+        summary = calibration_mod.finish(result_dir, baseline, cfg=cfg)
+    except (OSError, ValueError) as exc:
+        error_console.print(f"[red]Cannot finish calibration:[/red] {escape(str(exc))}")
+        raise typer.Exit(code=2) from exc
+    for result in summary.results:
+        label = "Selected" if result.budget == summary.winner.budget else "Candidate"
+        _render_measurement(label, result)
+    if summary.rejected_budgets:
+        rejected = ", ".join(str(value) for value in summary.rejected_budgets)
+        console.print(
+            f"[yellow]Rejected budgets {rejected} because output/cache behavior changed "
+            "or metrics were invalid.[/yellow]"
+        )
+    if summary.winner.budget == summary.baseline_budget:
+        console.print(
+            "[green]Kept the planner budget; no quality-equivalent candidate was "
+            "at least 5% faster.[/green]"
+        )
+    else:
+        console.print(
+            f"[green]Calibrated DDTree budget: {summary.baseline_budget} → "
+            f"{summary.winner.budget}.[/green]"
+        )
 
 
 # ── config sub-app ─────────────────────────────────────────────────────────

@@ -12,7 +12,7 @@ authors = [{ name = "Lucebox" }]
 license = { text = "Apache-2.0" }
 
 # Kept intentionally narrow. typer pulls click+rich; tomli-w gives us TOML
-# writes (stdlib tomllib only reads). httpx for the smoke + readiness probes.
+# writes (stdlib tomllib only reads). httpx for calibration + readiness probes.
 # huggingface_hub for download-models — used directly (not via subprocess)
 # so we can drive a Rich progress bar + verify sha256 against the repo
 # metadata before re-fetching multi-GB GGUFs.
@@ -22,12 +22,6 @@ dependencies = [
     "httpx>=0.27",
     "tomli-w>=1.0",
     "huggingface_hub>=0.27",
-    # luce-bench is consumed lazily by the autotune sweep scorer
-    # (agent_replay_pass_rate in sweep.py does a function-local
-    # `from lucebench.areas.agent_recorded import ...` wrapped in try/except).
-    # It's deliberately NOT a hard dep here because the workspace can't lock
-    # against it until #337 (luce-bench in-tree) lands. Install with
-    # `uv pip install luce-bench` on the host running the scorer.
 ]
 
 [project.urls]

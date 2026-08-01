@@ -114,7 +114,8 @@ lucebox
 
 `lucebox` opens the branded menu. **Quick setup** detects NVIDIA CUDA or AMD
 ROCm, lets you choose and download a model, applies a model- and hardware-aware
-**Automatic** profile, and starts the inference service. Automatic explains its
+**Automatic** profile, offers a one-time on-machine calibration, and starts the
+inference service. Automatic explains its
 DFlash, PFlash, KVFlash, and Spark choices, and also prints the resolved
 prefill, decode, and KV-cache strategy. A typed capability contract prevents
 unsupported model/backend combinations; preview paths are labeled and stay off
@@ -125,6 +126,17 @@ optimizations** exposes only model-compatible overrides. DeepSeek sparse
 prefill is available there as an approximate, monolithic-HIP preview; exact MLA
 prefill remains the default. Wi-Fi and device provisioning are intentionally
 outside this inference-only CLI.
+
+**Calibrate and measure performance** runs a fixed three-turn coding workload on
+the selected model and reports measured prefill tok/s, decode tok/s, and warm
+prefix-cache reuse. On DDTree backends it tests at most the planner budget and
+its two nearest safe neighbours. A candidate is accepted only when its
+normalized greedy output and cache behavior are identical and its decode score
+is at least 5% faster; failures restore the original config and engine state.
+Results are cached against the model files, runtime profile, driver, and GPU.
+Spark placement, KVFlash sizing, PFlash request policy, GPU top-K split, and
+DSpark width remain engine-owned adaptive policies rather than a second set of
+CLI heuristics.
 
 Automatic inventories every NVIDIA and AMD accelerator, then writes one
 validated execution plan together with the optimization profile. A model that
@@ -170,6 +182,7 @@ command, for example:
 lucebox models select
 lucebox optimize --yes
 lucebox optimize --advanced
+lucebox calibrate                    # cached; --force measures again
 lucebox start
 ./lucebox.sh build cuda
 ./lucebox.sh native cuda
@@ -358,7 +371,7 @@ Requests that omit `temperature` use the model card's sampling (Qwen3.6: `temper
 | Flag | Default | Effect |
 |---|---|---|
 | `--ddtree` | off (chain) | Enable tree verify |
-| `--ddtree-budget N` | `22` | Tree size. 22 on 3090 (default), 40 on 5090, re-sweep on GB10 |
+| `--ddtree-budget N` | `22` | Tree size. The planner picks a hardware baseline; `lucebox calibrate` verifies it on the actual machine. |
 | `--fa-window N` | `0` / `2048` (full attention) | Sliding FA window. Leave at 0: a finite window breaks tool calls (the full-attention layers lose the system prompt/tools). |
 | `--draft-residency {auto,persistent,request-scoped}` | `auto` | When draft weights are evicted from VRAM. `request-scoped` parks/frees them after each request's draft work (frees VRAM for the target on tight GPUs); `persistent` keeps them resident across requests; `auto` preserves current behavior while honoring the low-VRAM / `--lazy-draft` hint. Reported at `/props.runtime.draft_residency`. |
 | `--lazy-draft` | off | Legacy alias for `--draft-residency=request-scoped` (defer draft load until first request, release after) |
