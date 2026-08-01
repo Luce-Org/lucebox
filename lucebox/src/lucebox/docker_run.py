@@ -91,7 +91,7 @@ def _resolve_model_files(cfg: Config) -> tuple[str, str, str]:
     draft = cfg.model.draft_file
     draft_dir = ""
     if (not target or not draft) and cfg.model.preset:
-        from lucebox.download import PRESETS
+        from lucebox.download import PRESETS, local_artifact_present
 
         pres = PRESETS.get(cfg.model.preset)
         if pres is not None:
@@ -104,9 +104,22 @@ def _resolve_model_files(cfg: Config) -> tuple[str, str, str]:
                 # is_dir() follows valid directory symlinks. It also rejects
                 # dangling links and links to files, which cannot satisfy the
                 # speculator-directory contract.
-                if spec_path.is_dir():
+                required = tuple(spec_path / filename for filename in pres.speculator_files)
+                if spec_path.is_dir() and required and all(
+                    local_artifact_present(path) for path in required
+                ):
                     draft_dir = pres.speculator_dir
     return target, draft, draft_dir
+
+
+def _selected_model_architecture(cfg: Config) -> str:
+    """Return the engine architecture declared by the active preset."""
+    if not cfg.model.preset:
+        return ""
+    from lucebox.download import PRESETS
+
+    preset = PRESETS.get(cfg.model.preset)
+    return preset.architecture if preset is not None else ""
 
 
 def _runtime_volumes(cfg: Config) -> tuple[BindMount, ...]:
@@ -304,9 +317,10 @@ def server_run_spec(cfg: Config) -> DockerRunSpec:
         ("DFLASH_MAX_CTX", str(cfg.dflash.max_ctx)),
         ("DFLASH_PREFIX_CACHE_SLOTS", str(cfg.dflash.prefix_cache_slots)),
         ("DFLASH_PREFILL_CACHE_SLOTS", str(cfg.dflash.prefill_cache_slots)),
-        ("DFLASH_THINK_MAX", str(cfg.dflash.think_max)),
         ("DFLASH_PORT", "8080"),
     ]
+    if cfg.dflash.think_max is not None:
+        env.append(("DFLASH_THINK_MAX", str(cfg.dflash.think_max)))
     env += _placement_env(cfg)
     # Keep the API model catalog aligned with the preset selected by the host
     # CLI. Client connectors use this id for explicit model selection and
@@ -322,6 +336,7 @@ def server_run_spec(cfg: Config) -> DockerRunSpec:
     # draft_dir is a subdirectory of models/draft/ holding a safetensors speculator;
     # it takes effect only when draft_file is empty and the directory exists on disk.
     target_file, draft_file, draft_dir = _resolve_model_files(cfg)
+    model_architecture = _selected_model_architecture(cfg)
     volumes = list(_runtime_volumes(cfg))
     if target_file:
         target_path = _selected_model_path(
@@ -334,7 +349,27 @@ def server_run_spec(cfg: Config) -> DockerRunSpec:
             mounts=volumes,
         )
         env.append(("DFLASH_TARGET", target_path))
-    if not cfg.dflash.speculative_decode:
+    if model_architecture == "deepseek4":
+        # DeepSeek's DSpark path is architecture-specific. Passing its GGUF as
+        # generic --draft is explicitly inert for deepseek4; the backend reads
+        # these two variables instead. Keep generic draft discovery disabled
+        # so a stale Qwen/Gemma draft cannot be attached by the entrypoint.
+        env.append(("DFLASH_DRAFT", "/opt/lucebox-hub/server/models/.lucebox-no-draft"))
+        if cfg.dflash.speculative_decode and draft_file:
+            draft_path = _selected_model_path(
+                cfg,
+                draft_file,
+                field="model.draft_file",
+                role="ds4-draft",
+                under_draft=True,
+                directory=False,
+                mounts=volumes,
+            )
+            env += [
+                ("DFLASH_DS4_SPEC", "1"),
+                ("DFLASH_DS4_DRAFT", draft_path),
+            ]
+    elif not cfg.dflash.speculative_decode:
         env.append(("DFLASH_DRAFT", "/opt/lucebox-hub/server/models/.lucebox-no-draft"))
     elif draft_file:
         draft_path = _selected_model_path(

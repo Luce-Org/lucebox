@@ -73,12 +73,10 @@ class ModelPreset:
     speculator). In that case the entrypoint runs target-only — DFlash
     speculative decoding is disabled but the server still works.
 
-    ``speculator_dir`` names a directory under ``models/draft/`` that holds
-    a safetensors-format speculator (e.g. ``model.safetensors``). When
-    present on disk the server launch sets ``DFLASH_DRAFT`` to that
-    directory; absent, the server runs target-only. Unlike ``draft_file``
-    (which marks the preset as incomplete when missing), ``speculator_dir``
-    is optional supplementary hardware and doesn't affect installed_status.
+    ``speculator_repo`` / ``speculator_files`` describe a safetensors-format
+    decode companion stored under ``models/draft/<speculator_dir>``. Some
+    loaders also require metadata next to ``model.safetensors``; listing every
+    required file here makes download, status, and activation one contract.
     """
 
     name: str
@@ -93,12 +91,33 @@ class ModelPreset:
     native_context: int
     description: str = ""
     speculator_dir: str | None = None
+    speculator_repo: str | None = None
+    speculator_files: tuple[str, ...] = ()
     display_name: str = ""
     featured_rank: int | None = None
+
+    def __post_init__(self) -> None:
+        speculator_fields = (
+            self.speculator_dir is not None,
+            self.speculator_repo is not None,
+            bool(self.speculator_files),
+        )
+        if any(speculator_fields) and not all(speculator_fields):
+            raise ValueError(
+                "speculator_dir, speculator_repo, and speculator_files must be set together"
+            )
 
     @property
     def has_draft(self) -> bool:
         return bool(self.draft_repo and self.draft_file)
+
+    @property
+    def has_speculator(self) -> bool:
+        return bool(self.speculator_dir and self.speculator_repo and self.speculator_files)
+
+    @property
+    def has_decode_companion(self) -> bool:
+        return self.has_draft or self.has_speculator
 
     @property
     def label(self) -> str:
@@ -161,14 +180,14 @@ PRESETS: dict[str, ModelPreset] = {
         name="laguna-xs.2",
         target_repo="Lucebox/Laguna-XS.2-GGUF",
         target_file="laguna-xs2-Q4_K_M.gguf",
-        # Laguna's DFlash speculator is safetensors-format
-        # (poolside/Laguna-XS.2-speculator.dflash), downloaded manually
-        # into models/draft/laguna-xs2-speculator/. The download command
-        # doesn't fetch it automatically — it's opt-in. When present,
-        # speculator_dir wires it into DFLASH_DRAFT at server launch.
+        # Laguna's DFlash companion is safetensors-format. config.json is a
+        # runtime requirement: the native loader reads rope_theta beside the
+        # weights and rejects a lone model.safetensors.
         draft_repo=None,
         draft_file=None,
         speculator_dir="laguna-xs2-speculator",
+        speculator_repo="poolside/Laguna-XS.2-speculator.dflash",
+        speculator_files=("model.safetensors", "config.json"),
         approx_total_gb=20,
         approx_target_gb=18.9,
         approx_draft_gb=1.1,
@@ -180,9 +199,8 @@ PRESETS: dict[str, ModelPreset] = {
         display_name="Laguna XS.2",
         featured_rank=3,
         description=(
-            "Laguna-XS.2 MoE code model (Q4_K_M). "
-            "DFlash safetensors speculator in draft/laguna-xs2-speculator/ "
-            "is used automatically when present."
+            "Laguna-XS.2 MoE code model (Q4_K_M) + published DFlash "
+            "safetensors speculator."
         ),
     ),
     "qwen3.6-moe": ModelPreset(
@@ -486,15 +504,15 @@ def _fetch(
 
 
 def download_preset(cfg: Config, preset: ModelPreset | None = None) -> int:
-    """Fetch the target GGUF + (optional) DFlash draft into cfg.models_dir.
+    """Fetch the target and its published decode companion into cfg.models_dir.
 
     Returns 0 on success, non-zero on failure. Verifies each file's size
     and (LFS) sha256 against the repo metadata before downloading, so a
     repeat run with the files already on disk is a no-op + sha256 walk.
 
     ``preset=None`` resolves to :data:`DEFAULT_PRESET` for back-compat;
-    presets with ``has_draft=False`` (e.g. Laguna) skip the draft fetch
-    entirely and let the server run target-only.
+    GGUF drafts live directly under ``models/draft``; safetensors speculators
+    retain their required sidecar metadata in a dedicated subdirectory.
     """
     preset = preset or DEFAULT_PRESET
     console = Console()
@@ -511,9 +529,16 @@ def download_preset(cfg: Config, preset: ModelPreset | None = None) -> int:
             # exactly the predicate that proves these aren't None.
             assert preset.draft_repo is not None and preset.draft_file is not None
             _fetch(api, preset.draft_repo, preset.draft_file, draft, console)
+        elif preset.has_speculator:
+            assert preset.speculator_repo is not None
+            assert preset.speculator_dir is not None
+            speculator_dir = draft / preset.speculator_dir
+            for filename in preset.speculator_files:
+                _fetch(api, preset.speculator_repo, filename, speculator_dir, console)
         else:
             console.print(
-                f"  [dim]no DFlash draft published for {preset.name} — running target-only[/dim]"
+                f"  [dim]no decode companion published for {preset.name} — "
+                "running target-only[/dim]"
             )
     except Exception as exc:
         console.print(f"[red]download failed:[/red] {exc}")
@@ -566,28 +591,30 @@ def _local_target_path(cfg: Config, preset: ModelPreset) -> Path:
     return cfg.models_dir / preset.target_file
 
 
-def _local_draft_path(cfg: Config, preset: ModelPreset) -> Path | None:
-    if not (preset.has_draft and preset.draft_file):
-        return None
-    return cfg.models_dir / "draft" / preset.draft_file
+def _local_decode_companion_paths(cfg: Config, preset: ModelPreset) -> tuple[Path, ...]:
+    if preset.has_draft and preset.draft_file:
+        return (cfg.models_dir / "draft" / preset.draft_file,)
+    if preset.has_speculator and preset.speculator_dir:
+        root = cfg.models_dir / "draft" / preset.speculator_dir
+        return tuple(root / filename for filename in preset.speculator_files)
+    return ()
 
 
 def installed_status(cfg: Config, preset: ModelPreset) -> str:
     """Return ``"installed"`` / ``"partial"`` / ``"absent"`` for a preset.
 
     Presence-only — doesn't query the network or hash. ``"installed"``
-    requires a non-empty target (and draft when one is published);
+    requires a non-empty target (and every decode-companion file when one is
+    published);
     ``"partial"`` means at least one of the two is present but the set is
     incomplete.
     """
     target_exists = local_artifact_present(_local_target_path(cfg, preset))
-    draft_path = _local_draft_path(cfg, preset)
-    if draft_path is None:
-        return "installed" if target_exists else "absent"
-    draft_exists = local_artifact_present(draft_path)
-    if target_exists and draft_exists:
+    companion_paths = _local_decode_companion_paths(cfg, preset)
+    companion_states = tuple(local_artifact_present(path) for path in companion_paths)
+    if target_exists and all(companion_states):
         return "installed"
-    if target_exists or draft_exists:
+    if target_exists or any(companion_states):
         return "partial"
     return "absent"
 
@@ -601,10 +628,9 @@ def installed_size_gb(cfg: Config, preset: ModelPreset) -> float:
             total += target.stat().st_size
         except OSError:
             pass
-    draft = _local_draft_path(cfg, preset)
-    if draft is not None and draft.exists():
+    for companion in _local_decode_companion_paths(cfg, preset):
         try:
-            total += draft.stat().st_size
+            total += companion.stat().st_size
         except OSError:
             pass
     return total / 1e9
@@ -627,10 +653,9 @@ def installed_presets(cfg: Config) -> list[ModelPreset]:
 def status(cfg: Config, preset: ModelPreset | None = None) -> dict[str, bool]:
     """Quick presence check — what's already on disk? Size-only, no sha256.
 
-    For presets without a published DFlash draft, ``draft_present`` is
-    reported as ``True`` (nothing to fetch → nothing missing). That
-    keeps the "all present, nothing to do" UX path uniform whether or
-    not a draft exists.
+    ``draft_present`` covers either a GGUF draft or every required file in a
+    safetensors speculator. For target-only presets it remains ``True`` because
+    there is no companion to fetch.
     """
     preset = preset or DEFAULT_PRESET
     api = _new_hf_api()
@@ -650,6 +675,19 @@ def status(cfg: Config, preset: ModelPreset | None = None) -> dict[str, bool]:
             out["draft_present"] = local.exists() and local.stat().st_size == size
         except Exception:
             out["draft_present"] = False
+    elif preset.has_speculator:
+        assert preset.speculator_repo is not None
+        assert preset.speculator_dir is not None
+        root = cfg.models_dir / "draft" / preset.speculator_dir
+        present = True
+        for filename in preset.speculator_files:
+            try:
+                size, _ = _file_meta(api, preset.speculator_repo, filename)
+                local = root / filename
+                present = present and local.exists() and local.stat().st_size == size
+            except Exception:
+                present = False
+        out["draft_present"] = present
     else:
         out["draft_present"] = True
     return out

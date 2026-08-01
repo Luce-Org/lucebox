@@ -213,6 +213,18 @@ def test_resolve_model_files_ignores_invalid_speculator_symlink(
     assert draft_dir == ""
 
 
+def test_resolve_model_files_rejects_incomplete_speculator(tmp_path: Path) -> None:
+    speculator = tmp_path / "draft" / "laguna-xs2-speculator"
+    speculator.mkdir(parents=True)
+    (speculator / "model.safetensors").write_bytes(b"partial")
+    cfg = Config(models_dir=tmp_path, model=ModelMeta(preset="laguna-xs.2"))
+
+    assert docker_run._resolve_model_files(cfg)[2] == ""
+
+    (speculator / "config.json").write_text("{}")
+    assert docker_run._resolve_model_files(cfg)[2] == "laguna-xs2-speculator"
+
+
 # ── server_run_spec ──────────────────────────────────────────────────────────
 
 
@@ -319,6 +331,7 @@ def test_server_run_spec_mounts_symlinked_speculator_directory_read_only(
     draft_root.mkdir(parents=True)
     external.mkdir()
     (external / "model.safetensors").write_bytes(b"speculator")
+    (external / "config.json").write_text("{}")
     (draft_root / "laguna-xs2-speculator").symlink_to(external, target_is_directory=True)
 
     spec = docker_run.server_run_spec(
@@ -364,9 +377,9 @@ def test_server_run_spec_always_emits_core_dflash_env(tmp_path: Path) -> None:
     env = _env(docker_run.server_run_spec(cfg))
     assert env["DFLASH_BUDGET"] == "22"
     assert env["DFLASH_MAX_CTX"] == "32768"
-    assert env["DFLASH_PREFIX_CACHE_SLOTS"] == "0"
+    assert env["DFLASH_PREFIX_CACHE_SLOTS"] == "32"
     assert env["DFLASH_PREFILL_CACHE_SLOTS"] == "0"
-    assert env["DFLASH_THINK_MAX"] == "15488"
+    assert "DFLASH_THINK_MAX" not in env
     assert env["DFLASH_PORT"] == "8080"
     assert env["LUCEBOX_HOME"]
 
@@ -423,6 +436,7 @@ def test_server_run_spec_optional_env_emitted_when_set(tmp_path: Path) -> None:
             kvflash_policy="qk",
             kvflash_tau=96,
             spark=True,
+            think_max=15488,
             spark_vram_gb=14.5,
             ds4_prefill="sparse",
             think_soft_close_min_ratio=0.5,
@@ -443,6 +457,7 @@ def test_server_run_spec_optional_env_emitted_when_set(tmp_path: Path) -> None:
     assert env["DFLASH_SPARK"] == "1"
     assert env["DFLASH_SPARK_VRAM_GB"] == "14.5"
     assert env["DFLASH_DS4_PREFILL"] == "sparse"
+    assert env["DFLASH_THINK_MAX"] == "15488"
     assert env["DFLASH_THINK_SOFT_CLOSE_MIN_RATIO"] == "0.5"
     assert env["DFLASH_DEBUG_THINKING_LOGITS"] == "1"
 
@@ -561,6 +576,40 @@ def test_server_run_spec_can_disable_preset_dflash_draft(tmp_path: Path) -> None
 
     env = _env(docker_run.server_run_spec(cfg))
 
+    assert env["DFLASH_DRAFT"].endswith("/.lucebox-no-draft")
+
+
+def test_server_run_spec_uses_deepseek_dspark_contract(tmp_path: Path) -> None:
+    preset = PRESETS["deepseek-v4-flash"]
+    assert preset.draft_file is not None
+    cfg = Config(
+        models_dir=tmp_path,
+        model=ModelMeta(preset=preset.name),
+        dflash=DflashRuntime(speculative_decode=True),
+    )
+
+    env = _env(docker_run.server_run_spec(cfg))
+
+    assert env["DFLASH_DS4_SPEC"] == "1"
+    assert env["DFLASH_DS4_DRAFT"] == (
+        f"/opt/lucebox-hub/server/models/draft/{preset.draft_file}"
+    )
+    # --draft is not DeepSeek's DSpark switch and the server warns that it is
+    # inert. Pin generic discovery off instead.
+    assert env["DFLASH_DRAFT"].endswith("/.lucebox-no-draft")
+
+
+def test_server_run_spec_disables_deepseek_dspark_cleanly(tmp_path: Path) -> None:
+    cfg = Config(
+        models_dir=tmp_path,
+        model=ModelMeta(preset="deepseek-v4-flash"),
+        dflash=DflashRuntime(speculative_decode=False),
+    )
+
+    env = _env(docker_run.server_run_spec(cfg))
+
+    assert "DFLASH_DS4_SPEC" not in env
+    assert "DFLASH_DS4_DRAFT" not in env
     assert env["DFLASH_DRAFT"].endswith("/.lucebox-no-draft")
 
 

@@ -33,6 +33,9 @@ elif [[ "$TARGET_WAS_EXPLICIT" == "1" ]]; then
 else
   DRAFT="$DEFAULT_DRAFT"
 fi
+# ``external`` is the production CLI contract: the canonical Lucebox launch
+# path owns the engine and this harness only exercises the client protocol.
+# ``lucebox`` and ``llamacpp`` remain explicit standalone comparison modes.
 MODEL_SERVER="${MODEL_SERVER:-lucebox}"
 DFLASH_SERVER_BIN="${DFLASH_SERVER_BIN:-$REPO_DIR/server/build/dflash_server}"
 LLAMA_BUILD_DIR="${LLAMA_BUILD_DIR:-$CLIENT_WORK_DIR/llama-cpp-server-build}"
@@ -77,7 +80,7 @@ fi
 STAMP="${STAMP:-$(date +%Y%m%d-%H%M%S)}"
 BASE_URL="http://$HOST:$PORT"
 LOG_DIR="$RUN_DIR/$STAMP"
-SERVER_LOG="$LOG_DIR/server.log"
+SERVER_LOG="${SERVER_LOG:-$LOG_DIR/server.log}"
 
 mkdir -p "$LOG_DIR"
 
@@ -113,12 +116,15 @@ draft_enabled() {
 }
 
 start_lucebox_server() {
+  if [[ "$MODEL_SERVER" == "external" ]]; then
+    return 0
+  fi
   if [[ "$MODEL_SERVER" == "llamacpp" ]]; then
     start_llamacpp_server
     return
   fi
   if [[ "$MODEL_SERVER" != "lucebox" ]]; then
-    echo "unknown MODEL_SERVER=$MODEL_SERVER; expected lucebox or llamacpp" >&2
+    echo "unknown MODEL_SERVER=$MODEL_SERVER; expected external, lucebox, or llamacpp" >&2
     return 1
   fi
   start_dflash_native_server
@@ -298,7 +304,8 @@ wait_lucebox_server() {
       return 0
     fi
     sleep 1
-    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+    if [[ "$MODEL_SERVER" != "external" ]] \
+       && ! kill -0 "$SERVER_PID" 2>/dev/null; then
       echo "server exited early; log: $SERVER_LOG" >&2
       tail -n 160 "$SERVER_LOG" >&2 || true
       return 1
@@ -310,6 +317,9 @@ wait_lucebox_server() {
 }
 
 stop_lucebox_server() {
+  if [[ "$MODEL_SERVER" == "external" ]]; then
+    return 0
+  fi
   if [[ -n "${SERVER_PID:-}" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
     kill "$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true

@@ -1060,6 +1060,76 @@ test_harness_draft_directory_validation() {
 test_harness_draft_directory_validation \
     "native harness rejects empty or ambiguous draft directories"
 
+test_harness_external_mode_reuses_canonical_engine() {
+    local label="$1" sandbox server_log out rc=0
+    sandbox=$(mktemp -d -t lucebox-harness-external.XXXXXX)
+    server_log="$sandbox/canonical-engine.log"
+    out=$(REPO_DIR="$ROOT" CLIENT_WORK_DIR="$sandbox/work" \
+        MODEL_SERVER=external SERVER_LOG="$server_log" \
+        bash -c '
+            curl() { return 0; }
+            source "$1"
+            start_lucebox_server
+            wait_lucebox_server
+            stop_lucebox_server
+            printf "server_log=%s\n" "$SERVER_LOG"
+        ' _ "$HARNESS_COMMON" 2>&1) || rc=$?
+    rm -rf "$sandbox"
+    if [ "$rc" -ne 0 ] || [[ "$out" != *"server_log=$server_log"* ]]; then
+        report fail "$label" "external mode tried to own the server: $out"
+    else
+        report ok "$label"
+    fi
+}
+test_harness_external_mode_reuses_canonical_engine \
+    "CLI harness mode reuses the canonical optimized engine"
+
+test_connector_api_checks_selected_model() {
+    local label="$1" fn runner rc=0
+    fn=$(awk '/^_connector_api_ready\(\) \{/,/^\}/' "$SCRIPT")
+    runner=$'\ncurl(){ printf "%s" "$API_RESPONSE"; }\n_connector_api_ready http://127.0.0.1:8080 qwen3.6-27b'
+    API_RESPONSE='{"object":"list","data":[{"id":"qwen3.6-27b"}]}' \
+        bash -c "$fn$runner" \
+        || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        report fail "$label" "selected model was rejected"
+        return
+    fi
+    rc=0
+    API_RESPONSE='{"object":"list","data":[{"id":"laguna-xs.2"}]}' \
+        bash -c "$fn$runner" \
+        || rc=$?
+    if [ "$rc" -eq 0 ]; then
+        report fail "$label" "a different model was accepted"
+    else
+        report ok "$label"
+    fi
+}
+test_connector_api_checks_selected_model \
+    "harness connector rejects an API serving the wrong model"
+
+test_native_decode_companion_contract() {
+    local label="$1" fn out runner
+    fn=$(awk '/^_export_selected_decode_companion\(\) \{/,/^\}/' "$SCRIPT")
+
+    runner=$'\n_export_selected_decode_companion deepseek-v4-flash /models/draft/dspark.gguf\nprintf "%s|%s|%s" "$DFLASH_DRAFT" "$DFLASH_DS4_SPEC" "$DFLASH_DS4_DRAFT"'
+    out=$(DEFAULT_MODELS_DIR=/models bash -c "$fn$runner" 2>&1)
+    if [ "$out" != "/models/.lucebox-no-draft|1|/models/draft/dspark.gguf" ]; then
+        report fail "$label" "DeepSeek native contract was $out"
+        return
+    fi
+
+    runner=$'\n_export_selected_decode_companion qwen3.6-27b /models/draft/qwen.gguf\nprintf "%s|%s|%s" "$DFLASH_DRAFT" "${DFLASH_DS4_SPEC:-}" "${DFLASH_DS4_DRAFT:-}"'
+    out=$(DEFAULT_MODELS_DIR=/models bash -c "$fn$runner" 2>&1)
+    if [ "$out" != "/models/draft/qwen.gguf||" ]; then
+        report fail "$label" "generic native contract was $out"
+        return
+    fi
+    report ok "$label"
+}
+test_native_decode_companion_contract \
+    "native CLI maps DeepSeek to DSpark and other drafts to generic DFlash"
+
 test_entrypoint_keeps_family_kv_default() {
     local label="$1" sandbox draft_dir models_dir bin_dir shim_dir out
     _make_entrypoint_sandbox
@@ -1194,19 +1264,15 @@ test_entrypoint_draft_is_file "entrypoint serve: DFLASH_DRAFT is a file (no DRAF
 # test 10/11 already; this test pins the JSON shape independently.
 test_entrypoint_host_info_json() {
     local label="$1"
-    # Source the helper functions from the real entrypoint.sh.
-    # shellcheck disable=SC1090
-    source <(awk '/^_json_escape\(\) \{/,/^\}/' "$ENTRYPOINT")
-    # shellcheck disable=SC1090
-    source <(awk '/^_json_str_or_null\(\) \{/,/^\}/' "$ENTRYPOINT")
-    # shellcheck disable=SC1090
-    source <(awk '/^_json_int_or_null\(\) \{/,/^\}/' "$ENTRYPOINT")
-    # shellcheck disable=SC1090
-    source <(awk '/^_trim\(\) \{/,/^\}/' "$ENTRYPOINT")
-    # shellcheck disable=SC1090
-    source <(awk '/^_emit_gpu_array\(\) \{/,/^\}/' "$ENTRYPOINT")
-    # shellcheck disable=SC1090
-    source <(awk '/^_build_host_info_json\(\) \{/,/^\}/' "$ENTRYPOINT")
+    # Load the helper functions from the real entrypoint. Bash 3.2 on macOS
+    # can report success for `source <(...)` while reading an empty /dev/fd;
+    # command substitution keeps this contributor test portable.
+    eval "$(awk '/^_json_escape/,/^}/' "$ENTRYPOINT")"
+    eval "$(awk '/^_json_str_or_null/,/^}/' "$ENTRYPOINT")"
+    eval "$(awk '/^_json_int_or_null/,/^}/' "$ENTRYPOINT")"
+    eval "$(awk '/^_trim/,/^}/' "$ENTRYPOINT")"
+    eval "$(awk '/^_emit_gpu_array/,/^}/' "$ENTRYPOINT")"
+    eval "$(awk '/^_build_host_info_json/,/^}/' "$ENTRYPOINT")"
 
     local out
     LUCEBOX_HOST_OS_PRETTY="Ubuntu 22.04.3 LTS" \
@@ -2003,11 +2069,21 @@ test_amd_smi_parser "amd-smi parser recognizes R9700 + Strix"
 
 test_variant_autoselection() {
     local label="$1" fn common got
-    fn=$(awk '/^pick_variant\(\) \{/,/^\}/' "$SCRIPT")
+    fn=$(awk '/^pick_variant\(\) \{/,/^\}/' "$SCRIPT")$'\n'
+    fn+=$(awk '/^_default_cuda_variant\(\) \{/,/^\}/' "$SCRIPT")
     common=$'_lucebox_config_get(){ :; }\nensure_probed(){ :; }\nLUCEBOX_VARIANT=""\n'
 
-    got=$(bash -c "$fn"$'\n'"$common"$'LUCEBOX_HOST_HAS_NVIDIA_GPU=1\nLUCEBOX_HOST_HAS_AMD_GPU=1\npick_variant')
+    got=$(bash -c "$fn"$'\n'"$common"$'LUCEBOX_HOST_HAS_NVIDIA_GPU=1\nLUCEBOX_HOST_HAS_AMD_GPU=1\nLUCEBOX_HOST_GPU_SM=86\npick_variant')
     [ "$got" = "cuda12" ] || { report fail "$label" "mixed RTX + Strix chose $got"; return; }
+
+    got=$(bash -c "$fn"$'\n'"$common"$'uname(){ echo aarch64; }\nLUCEBOX_HOST_HAS_NVIDIA_GPU=1\nLUCEBOX_HOST_HAS_AMD_GPU=0\nLUCEBOX_HOST_GPU_SM=121\npick_variant')
+    [ "$got" = "cuda13" ] || { report fail "$label" "GB10 chose $got"; return; }
+
+    got=$(bash -c "$fn"$'\n'"$common"$'LUCEBOX_HOST_HAS_NVIDIA_GPU=1\nLUCEBOX_HOST_HAS_AMD_GPU=0\nLUCEBOX_HOST_GPU_SM=120\npick_variant')
+    [ "$got" = "cuda128" ] || { report fail "$label" "RTX 5090 chose $got"; return; }
+
+    got=$(bash -c "$fn"$'\n_lucebox_config_get(){ echo cuda12; }\nensure_probed(){ :; }\nLUCEBOX_VARIANT=""\nLUCEBOX_HOST_GPU_SM=120\npick_variant')
+    [ "$got" = "cuda128" ] || { report fail "$label" "configured RTX 5090 migration chose $got"; return; }
 
     got=$(bash -c "$fn"$'\n'"$common"$'LUCEBOX_HOST_HAS_NVIDIA_GPU=0\nLUCEBOX_HOST_HAS_AMD_GPU=1\npick_variant')
     [ "$got" = "rocm" ] || { report fail "$label" "R9700 + Strix chose $got"; return; }
@@ -2016,7 +2092,54 @@ test_variant_autoselection() {
     [ "$got" = "rocm" ] || { report fail "$label" "explicit override chose $got"; return; }
     report ok "$label"
 }
-test_variant_autoselection "variant selection: RTX+Strix=cuda12, R9700+Strix=rocm"
+test_variant_autoselection "variant selection: RTX=cuda12, RTX5090=cuda128, GB10=cuda13, R9700=rocm"
+
+test_gb10_na_memory_probe() {
+    local label="$1" sandbox shim_dir out
+    sandbox=$(mktemp -d -t lucebox-gb10.XXXXXX)
+    shim_dir="$sandbox/bin"
+    mkdir -p "$shim_dir"
+    cat > "$shim_dir/nvidia-smi" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in
+  *"name,memory.total,driver_version,compute_cap"*)
+    echo "NVIDIA GB10, [N/A], 580.159.03, 12.1" ;;
+  *"index,uuid,pci.bus_id,name,compute_cap,memory.total,power.limit"*)
+    echo "0, GPU-test, 00000000:01:00.0, NVIDIA GB10, 12.1, [N/A], [N/A]" ;;
+  *"--query-gpu=name"*) echo "NVIDIA GB10" ;;
+  "-L") echo "GPU 0: NVIDIA GB10" ;;
+esac
+exit 0
+STUB
+    cat > "$shim_dir/docker" <<'STUB'
+#!/usr/bin/env bash
+case "${1:-}" in
+  ps) exit 0 ;;
+  version) echo "29.1.3" ;;
+esac
+exit 0
+STUB
+    cat > "$shim_dir/uname" <<'STUB'
+#!/usr/bin/env bash
+case "${1:-}" in
+  -m) echo "aarch64" ;;
+  *) /usr/bin/uname "$@" ;;
+esac
+STUB
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$shim_dir/nvidia-container-runtime"
+    chmod +x "$shim_dir"/*
+    out=$(HOME="$sandbox" LUCEBOX_HOME="$sandbox/.lucebox" \
+        PATH="$shim_dir:$PATH" NO_COLOR=1 bash "$SCRIPT" check 2>&1)
+    rm -rf "$sandbox"
+    if ! grep -qF "NVIDIA GB10" <<<"$out" \
+       || ! grep -qF ":cuda13 (NVIDIA selected)" <<<"$out" \
+       || ! grep -qF "sm_121 covered" <<<"$out"; then
+        report fail "$label" "GB10 probe output: $(printf '%s' "$out" | head -20)"
+        return
+    fi
+    report ok "$label"
+}
+test_gb10_na_memory_probe "GB10 [N/A] NVML memory selects CUDA 13 without crashing"
 
 test_mixed_rtx_strix_probe_prefers_cuda() {
     local label="$1" sandbox shim_dir out

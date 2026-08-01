@@ -367,7 +367,7 @@ def _from_dict(raw: dict[str, Any]) -> Config:
         budget=int(df.get("budget", 22)),
         max_ctx=int(df.get("max_ctx", 16384)),
         lazy=_cast_bool(df.get("lazy", False)),
-        prefix_cache_slots=int(df.get("prefix_cache_slots", 0)),
+        prefix_cache_slots=int(df.get("prefix_cache_slots", 32)),
         prefill_cache_slots=int(df.get("prefill_cache_slots", 0)),
         cache_type_k=str(df.get("cache_type_k", "")),
         cache_type_v=str(df.get("cache_type_v", "")),
@@ -381,7 +381,7 @@ def _from_dict(raw: dict[str, Any]) -> Config:
         spark=_cast_bool(df.get("spark", False)),
         spark_vram_gb=_cast_nonnegative_float(df.get("spark_vram_gb", 0.0)),
         ds4_prefill=_cast_ds4_prefill(df.get("ds4_prefill", "exact")),
-        think_max=int(df.get("think_max", 15488)),
+        think_max=int(df["think_max"]) if "think_max" in df else None,
         fa_window=int(df.get("fa_window", 0)),
         think_soft_close_min_ratio=_cast_think_soft_close_min_ratio(
             df.get("think_soft_close_min_ratio", 0.0)
@@ -428,6 +428,7 @@ def _from_dict(raw: dict[str, Any]) -> Config:
         nvidia_vram_gb=int(host_raw.get("nvidia_vram_gb", 0)),
         nvidia_gpu_arch=str(host_raw.get("nvidia_gpu_arch", "")),
         nvidia_gpu_list_csv=str(host_raw.get("nvidia_gpu_list_csv", "")),
+        nvidia_unified_memory=_cast_bool(host_raw.get("nvidia_unified_memory", False)),
         amd_gpu_name=str(host_raw.get("amd_gpu_name", "")),
         amd_gpu_count=int(host_raw.get("amd_gpu_count", 0)),
         amd_vram_gb=int(host_raw.get("amd_vram_gb", 0)),
@@ -557,6 +558,10 @@ def _write_runtime_doc(
 
     doc.pop("dflash", None)
     for field, value in asdict(runtime).items():
+        # Optional fields represent "let the model/server decide" and TOML
+        # has no null value. Omitting the key preserves that ownership.
+        if value is None:
+            continue
         _doc_set(doc, "dflash", field, _value_to_toml(value))
     # Placement belongs to the resolved runtime as one atomic unit. Clearing
     # it even when an older caller supplies no replacement prevents a stale
@@ -604,6 +609,7 @@ def write_model_profile(
     runtime: DflashRuntime,
     placement: PlacementRuntime,
     *,
+    variant: str | None = None,
     path: Path | None = None,
     mode: str = "automatic",
     source: str = "model+hardware",
@@ -621,6 +627,11 @@ def write_model_profile(
 
     path = path or default_config_path()
     doc = load_doc(path)
+    if variant is not None:
+        normalized_variant = variant.strip()
+        if not normalized_variant:
+            raise ValueError("image variant must not be empty")
+        _doc_set(doc, "image", "variant", normalized_variant)
     _doc_set(doc, "model", "preset", preset)
     _doc_set(doc, "model", "target_file", target_file)
     if draft_file:

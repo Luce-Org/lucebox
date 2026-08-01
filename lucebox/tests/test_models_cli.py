@@ -26,6 +26,33 @@ def _stub_host(monkeypatch: pytest.MonkeyPatch, vram_gb: int) -> None:
     monkeypatch.setattr("lucebox.cli.from_env", lambda: host)
 
 
+def _stub_rtx_strix_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    host = HostFacts(
+        gpu_vendor="nvidia",
+        has_nvidia_gpu=True,
+        has_amd_gpu=True,
+        gpu_name="NVIDIA GeForce RTX 3090",
+        gpu_count=1,
+        vram_gb=24,
+        gpu_sm="86",
+        ram_gb=125,
+        nvidia_gpu_name="NVIDIA GeForce RTX 3090",
+        nvidia_gpu_count=1,
+        nvidia_vram_gb=24,
+        nvidia_gpu_arch="86",
+        nvidia_gpu_list_csv=(
+            "0, GPU-test, 0000:01:00.0, NVIDIA GeForce RTX 3090, 8.6, 24576 MiB,"
+        ),
+        amd_gpu_name="AMD Radeon Graphics",
+        amd_gpu_count=1,
+        amd_vram_gb=125,
+        amd_gpu_arch="gfx1151",
+        amd_gpu_list_csv="0, , , AMD Radeon Graphics, gfx1151, 512 MiB,",
+    )
+    monkeypatch.setattr("lucebox.host_facts.from_env", lambda: host)
+    monkeypatch.setattr("lucebox.cli.from_env", lambda: host)
+
+
 def test_models_list_shows_every_registered_preset(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -195,6 +222,62 @@ def test_models_select_blocks_incompatible_model_before_download(
     assert attempted is False
 
 
+def test_models_select_switches_to_detected_backend_only_when_required(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg_path = _set_config_path(tmp_path, monkeypatch)
+    _stub_rtx_strix_host(monkeypatch)
+    monkeypatch.setattr(download_mod, "download_preset", lambda cfg, pres: 0)
+    monkeypatch.setattr(
+        download_mod,
+        "status",
+        lambda cfg, pres: {"target_present": False, "draft_present": False},
+    )
+
+    result = CliRunner().invoke(
+        app,
+        ["models", "select", "deepseek-v4-flash", "--yes"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "switched to rocm" in result.output
+    entries = config_mod.config_get(path=cfg_path)
+    assert entries["variant"] == ("rocm", "file")
+    assert entries["model.preset"] == ("deepseek-v4-flash", "file")
+    assert entries["dflash.max_ctx"] == (131072, "file")
+
+
+def test_models_download_blocks_incompatible_model_unless_staging_is_explicit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _set_config_path(tmp_path, monkeypatch)
+    _stub_host(monkeypatch, vram_gb=24)
+    attempted = False
+
+    def _download(cfg, preset):  # noqa: ARG001
+        nonlocal attempted
+        attempted = True
+        return 0
+
+    monkeypatch.setattr(download_mod, "download_preset", _download)
+    monkeypatch.setattr(
+        download_mod,
+        "status",
+        lambda cfg, pres: {"target_present": False, "draft_present": False},
+    )
+
+    blocked = CliRunner().invoke(app, ["models", "download", "deepseek-v4-flash"])
+    assert blocked.exit_code == 2
+    assert attempted is False
+
+    staged = CliRunner().invoke(
+        app,
+        ["models", "download", "deepseek-v4-flash", "--force"],
+    )
+    assert staged.exit_code == 0
+    assert attempted is True
+
+
 def test_optimize_resets_to_hardware_profile(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -324,5 +407,11 @@ def test_installed_helpers_track_presence(tmp_path: Path, monkeypatch: pytest.Mo
     # stat path without allocating and writing a 5 GB Python byte string.
     with target.open("wb") as sparse:
         sparse.truncate(5 * 10**9)
+    assert download_mod.installed_status(cfg, laguna) == "partial"
+    assert laguna.speculator_dir is not None
+    speculator_root = cfg.models_dir / "draft" / laguna.speculator_dir
+    speculator_root.mkdir(parents=True)
+    for filename in laguna.speculator_files:
+        (speculator_root / filename).write_bytes(b"installed")
     assert download_mod.installed_status(cfg, laguna) == "installed"
     assert download_mod.installed_size_gb(cfg, laguna) == pytest.approx(5.0, rel=0.01)

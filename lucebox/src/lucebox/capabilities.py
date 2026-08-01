@@ -84,12 +84,18 @@ class PFlashCapability:
     feature: FeatureCapability
     minimum_context: int = 32_768
     keep_ratio: float = 0.10
+    # Exact raw-prompt matches can skip both the scorer and target prefill.
+    # Keep this pool deliberately small: unlike turn-boundary snapshots, a
+    # full PFlash snapshot is useful only when the complete request repeats.
+    exact_cache_slots: int = 4
 
     def __post_init__(self) -> None:
         if self.minimum_context <= 0:
             raise ValueError("PFlash minimum context must be positive")
         if not 0.0 < self.keep_ratio <= 1.0:
             raise ValueError("PFlash keep ratio must be in (0.0, 1.0]")
+        if self.exact_cache_slots <= 0:
+            raise ValueError("PFlash exact-cache slots must be positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,6 +155,10 @@ class ModelOptimizationProfile:
     prefill_baseline: str
     decode_baseline: str
     kv_baseline: str
+    # The architecture stores an exact but substantially compressed native KV
+    # representation. It still grows with context, but does not need the blunt
+    # full-KV headroom cap used for ordinary attention caches.
+    compact_native_kv: bool = False
     speculative_decode: FeatureCapability | None = None
     pflash: PFlashCapability | None = None
     kvflash: KvFlashCapability | None = None
@@ -282,6 +292,7 @@ MODEL_OPTIMIZATION_PROFILES: Mapping[str, ModelOptimizationProfile] = MappingPro
             prefill_baseline="Exact MLA prefill",
             decode_baseline="Autoregressive decode",
             kv_baseline="Native MLA-compressed KV cache",
+            compact_native_kv=True,
             speculative_decode=_DSPARK,
             # Sparse DeepSeek prefill is engine-backed but approximate and
             # currently restricted to the monolithic HIP path. It is recorded

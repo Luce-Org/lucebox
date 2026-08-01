@@ -83,14 +83,21 @@ def _nvidia_devices(host: HostFacts) -> list[GpuDevice]:
             continue
         architecture = row[4].replace(".", "")
         memory_gb = _int_from_cell(row[5]) // 1024
+        unified = (
+            memory_gb == 0
+            and architecture == "121"
+            and "GB10" in row[3].upper()
+        ) or (index == 0 and host.nvidia_unified_memory)
+        effective_gb = max(0, host.ram_gb - 16) if unified else memory_gb
         devices.append(
             GpuDevice(
                 vendor="nvidia",
                 index=index,
                 name=row[3],
                 architecture=architecture,
-                physical_vram_gb=memory_gb,
-                effective_memory_gb=memory_gb,
+                physical_vram_gb=0 if unified else memory_gb,
+                effective_memory_gb=effective_gb,
+                unified_memory=unified,
             )
         )
     if not devices and (host.has_nvidia_gpu or host.gpu_vendor == "nvidia"):
@@ -101,14 +108,19 @@ def _nvidia_devices(host: HostFacts) -> list[GpuDevice]:
             name = name or host.gpu_name
             architecture = architecture or host.gpu_sm
             memory_gb = memory_gb or host.vram_gb
+        unified = host.nvidia_unified_memory or (
+            architecture == "121" and "GB10" in (name or "").upper()
+        )
+        effective_gb = max(0, host.ram_gb - 16) if unified else memory_gb
         devices.append(
             GpuDevice(
                 vendor="nvidia",
                 index=0,
                 name=name or "NVIDIA GPU",
                 architecture=architecture,
-                physical_vram_gb=memory_gb,
-                effective_memory_gb=memory_gb,
+                physical_vram_gb=0 if unified else memory_gb,
+                effective_memory_gb=effective_gb,
+                unified_memory=unified,
             )
         )
     return devices

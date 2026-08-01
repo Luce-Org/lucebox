@@ -33,7 +33,7 @@ import lucebox.download as download_mod
 import lucebox.host_check as host_check
 from lucebox import __version__
 from lucebox.config import config_get, config_set, config_unset, live_config
-from lucebox.host_facts import from_env
+from lucebox.host_facts import compatible_variant, for_variant, from_env, nvidia_variant
 from lucebox.placement import PlacementPlan
 from lucebox.types import Config, DflashRuntime, ModelMeta
 
@@ -96,13 +96,21 @@ def _load_or_build() -> Config:
     try:
         cfg = config_mod.load()
         if cfg is None:
-            return live_config()
+            cfg = live_config()
+            variant = compatible_variant(cfg.host, cfg.variant)
+            return replace(cfg, variant=variant, host=for_variant(cfg.host, variant))
         # Host facts exported by the wrapper take precedence over an absent or
         # stale persisted snapshot. A zero-filled environment means the CLI was
         # invoked directly, so retain any snapshot already in the config.
         live_host = from_env()
         host = live_host if live_host.vram_gb > 0 or live_host.nproc > 0 else cfg.host
-        return config_mod.overlay_env(replace(cfg, host=host))
+        overlaid = config_mod.overlay_env(replace(cfg, host=host))
+        variant = compatible_variant(overlaid.host, overlaid.variant)
+        return replace(
+            overlaid,
+            variant=variant,
+            host=for_variant(overlaid.host, variant),
+        )
     except (OSError, ValueError) as exc:
         error_console.print(f"[red]Invalid configuration:[/red] {escape(str(exc))}")
         raise typer.Exit(code=2) from exc
@@ -340,12 +348,47 @@ def _model_meta(preset: download_mod.ModelPreset) -> ModelMeta:
     )
 
 
+def _alternative_variants(cfg: Config) -> tuple[str, ...]:
+    """Return detected backend variants other than the currently selected one."""
+    current = cfg.variant.casefold()
+    variants: list[str] = []
+    if cfg.host.has_nvidia_gpu and "cuda" not in current:
+        variants.append(nvidia_variant(cfg.host))
+    if cfg.host.has_amd_gpu and "rocm" not in current and "hip" not in current:
+        variants.append("rocm")
+    return tuple(variants)
+
+
+def _automatic_preset_plan(
+    cfg: Config,
+    preset: download_mod.ModelPreset,
+) -> tuple[Config, autotune_mod.OptimizationPlan]:
+    """Keep the active backend when possible, otherwise try detected peers."""
+    model = _model_meta(preset)
+    selected = replace(cfg, model=model)
+    plan = autotune_mod.automatic_plan(selected)
+    if plan.placement.runnable:
+        return selected, plan
+
+    for variant in _alternative_variants(cfg):
+        candidate = replace(
+            cfg,
+            variant=variant,
+            host=for_variant(cfg.host, variant),
+            model=model,
+        )
+        candidate_plan = autotune_mod.automatic_plan(candidate)
+        if candidate_plan.placement.runnable:
+            return candidate, candidate_plan
+    return selected, plan
+
+
 def _preset_placement(cfg: Config, preset: download_mod.ModelPreset) -> PlacementPlan:
     """Plan the placement that activating ``preset`` would persist."""
     selected_cfg = replace(cfg, model=_model_meta(preset))
     if config_mod.optimization_mode() == "custom":
         return autotune_mod.placement_for_runtime(selected_cfg, cfg.dflash)
-    return autotune_mod.automatic_plan(selected_cfg).placement
+    return _automatic_preset_plan(cfg, preset)[1].placement
 
 
 def _require_runnable_preset(cfg: Config, preset: download_mod.ModelPreset) -> None:
@@ -401,7 +444,7 @@ def _activate_preset(cfg: Config, preset: download_mod.ModelPreset) -> None:
             )
         return
 
-    plan = autotune_mod.automatic_plan(selected_cfg)
+    selected_cfg, plan = _automatic_preset_plan(cfg, preset)
     if not plan.placement.runnable:
         error_console.print(
             "[red]Model not activated: Automatic found no runnable placement "
@@ -412,7 +455,17 @@ def _activate_preset(cfg: Config, preset: download_mod.ModelPreset) -> None:
         selected_model,
         plan.runtime,
         plan.placement.runtime,
+        variant=selected_cfg.variant if selected_cfg.variant != cfg.variant else None,
     )
+    if selected_cfg.variant != cfg.variant:
+        console.print(
+            f"[green]Backend:[/green] switched to {selected_cfg.variant} because "
+            f"{cfg.variant} cannot place this model on the detected hardware"
+        )
+        console.print(
+            "[dim]If this runtime image is not installed yet, run `lucebox pull` "
+            "before starting the engine.[/dim]"
+        )
     console.print(f"[green]Activated:[/green] model.preset = {preset.name}")
     active = ", ".join(plan.active_names) or "standard engine"
     console.print(
@@ -487,7 +540,15 @@ def models_select(
             if candidate.name == recommended:
                 labels.append("recommended")
             placement = _preset_placement(cfg, candidate)
-            fit = "ready" if placement.runnable else "not enough compatible memory"
+            primary = placement.topology.primary
+            backend = (
+                "CUDA" if primary is not None and primary.backend == "cuda" else "ROCm"
+            )
+            fit = (
+                f"ready on {backend}"
+                if placement.runnable
+                else "not enough compatible memory"
+            )
             table.add_row(
                 str(index),
                 candidate.label,
@@ -545,8 +606,15 @@ def models_download(
     activate: Annotated[
         bool, typer.Option("--activate", help="Also set as active preset (model.preset).")
     ] = False,
+    force: Annotated[
+        bool,
+        typer.Option(
+            "--force",
+            help="Download for another machine even when this host cannot run the preset.",
+        ),
+    ] = False,
 ) -> None:
-    """Fetch a preset's GGUFs into the models dir.
+    """Fetch a preset's target and decode companion into the models dir.
 
     With no argument and no preset configured, recommends one for this
     host's VRAM tier and auto-activates it (the first-install path).
@@ -581,7 +649,10 @@ def models_download(
         console.print(f"[red]{escape(str(exc))}[/red]")
         raise typer.Exit(code=2) from exc
 
-    if activate:
+    # A 100+ GB model is an expensive mistake on an incompatible host. Keep
+    # staging for another machine possible, but make that intent explicit.
+    # --force never bypasses the activation gate.
+    if activate or not force:
         _require_runnable_preset(cfg, pres)
 
     current = download_mod.status(cfg, pres)
@@ -594,6 +665,12 @@ def models_download(
     if pres.has_draft:
         console.print(
             f"  draft  ({pres.draft_repo}/{pres.draft_file}):"
+            f"  {'present' if current['draft_present'] else 'will download'}"
+        )
+    elif pres.has_speculator:
+        files = ", ".join(pres.speculator_files)
+        console.print(
+            f"  draft  ({pres.speculator_repo}: {files}):"
             f"  {'present' if current['draft_present'] else 'will download'}"
         )
     else:
@@ -650,6 +727,10 @@ def _render_optimization_plan(
         f"Context: [bold]{plan.runtime.max_ctx:,}[/bold] tokens  ·  "
         f"KV format: [bold]{cache}[/bold]  ·  "
         f"DFlash budget: [bold]{plan.runtime.budget}[/bold]"
+    )
+    console.print(
+        f"Cache: [bold]{plan.runtime.prefix_cache_slots}[/bold] turn-prefix slots  ·  "
+        f"[bold]{plan.runtime.prefill_cache_slots}[/bold] exact-prompt slots"
     )
 
 
@@ -844,6 +925,11 @@ def _customize_runtime(
             profile.pflash.minimum_context
             if profile is not None and profile.pflash is not None
             else runtime.prefill_threshold
+        ),
+        prefill_cache_slots=(
+            profile.pflash.exact_cache_slots
+            if pflash and profile is not None and profile.pflash is not None
+            else 0
         ),
         prefill_drafter=prefill_drafter,
         kvflash="auto" if kvflash else "off",

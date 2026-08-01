@@ -76,6 +76,7 @@ class HostFacts:
     nvidia_vram_gb: int = 0
     nvidia_gpu_arch: str = ""
     nvidia_gpu_list_csv: str = ""
+    nvidia_unified_memory: bool = False
     amd_gpu_name: str = ""
     amd_gpu_count: int = 0
     amd_vram_gb: int = 0
@@ -235,7 +236,11 @@ class DflashRuntime:
     budget: int = 22
     max_ctx: int = 16384
     lazy: bool = False
-    prefix_cache_slots: int = 0
+    # Exact turn-boundary snapshots. This is safe for every model/backend and
+    # is the server's production default; 0 remains an explicit opt-out.
+    prefix_cache_slots: int = 32
+    # Exact full-prompt snapshots, keyed by the raw prompt. PFlash can use
+    # these to skip both rescoring and target prefill when a request repeats.
     prefill_cache_slots: int = 0
     cache_type_k: str = ""
     cache_type_v: str = ""
@@ -252,10 +257,10 @@ class DflashRuntime:
     # the quality-safe default. ``dense`` and ``sparse`` are approximate,
     # monolithic-HIP preview paths and are never selected silently.
     ds4_prefill: Literal["exact", "dense", "sparse"] = "exact"
-    # Phase-1 (thinking) cap when a request opts into thinking. Default mirrors
-    # antirez/ds4 ds4_eval.c: think_max_tokens = max_tokens - hard_limit_reply
-    # budget = 16000 - 512 = 15488. The server's own hardcoded default is 10000.
-    think_max: int = 15488
+    # Optional operator override for the phase-1 reasoning cap. ``None`` lets
+    # the selected model card choose its own safe value; one global DeepSeek
+    # default would silently truncate Qwen/Gemma reasoning workloads.
+    think_max: int | None = None
     # Flash-attention sliding-window on full-attention layers. 0 = full
     # attention (server default). On gemma4's hybrid iSWA the full-attn
     # layers grow KV linearly with max_ctx; a sparse fa_window keeps
@@ -294,6 +299,13 @@ class DflashRuntime:
             raise ValueError(
                 f"prefill_cache_slots must be zero or positive; got {self.prefill_cache_slots!r}"
             )
+        if self.prefill_cache_slots > 0 and (
+            self.prefix_cache_slots + self.prefill_cache_slots > 63
+        ):
+            raise ValueError(
+                "prefix_cache_slots + prefill_cache_slots must not exceed 63 "
+                "when the exact prefill cache is enabled"
+            )
         if not 0.0 < self.prefill_keep_ratio <= 1.0:
             raise ValueError(
                 "prefill_keep_ratio must be in the interval (0.0, 1.0]; "
@@ -331,7 +343,7 @@ class DflashRuntime:
             )
         if self.prefill_threshold <= 0:
             raise ValueError(f"prefill_threshold must be positive; got {self.prefill_threshold!r}")
-        if self.think_max < 0:
+        if self.think_max is not None and self.think_max < 0:
             raise ValueError(f"think_max must be zero or positive; got {self.think_max!r}")
         if self.fa_window < 0:
             raise ValueError(f"fa_window must be zero or positive; got {self.fa_window!r}")

@@ -67,11 +67,15 @@ def test_resolve_preset_picks_gemma_target_and_draft():
     assert pres.has_draft
 
 
-def test_resolve_preset_supports_target_only_laguna():
+def test_resolve_preset_includes_laguna_speculator_contract():
     pres = resolve_preset("laguna-xs.2")
     assert pres.target_repo == "Lucebox/Laguna-XS.2-GGUF"
     assert pres.draft_repo is None
     assert not pres.has_draft
+    assert pres.has_speculator
+    assert pres.has_decode_companion
+    assert pres.speculator_repo == "poolside/Laguna-XS.2-speculator.dflash"
+    assert pres.speculator_files == ("model.safetensors", "config.json")
 
 
 def test_resolve_preset_picks_qwen36_moe_target_only():
@@ -116,7 +120,7 @@ def test_resolve_preset_picks_deepseek_target_and_dspark_draft():
 
 
 def test_download_preset_target_only_qwen36_moe_skips_draft(tmp_path, monkeypatch):
-    """qwen3.6-moe behaves identically to laguna-xs.2: target only, no draft fetch."""
+    """Qwen3.6 MoE has no published decode companion."""
     cfg = SimpleNamespace(models_dir=tmp_path)
     pres = resolve_preset("qwen3.6-moe")
     assert not pres.has_draft
@@ -313,17 +317,20 @@ def test_download_preset_routes_gemma_preset_to_correct_repos(tmp_path, monkeypa
     assert (pres.draft_repo, pres.draft_file, str(tmp_path / "draft")) in fetches
 
 
-def test_download_preset_target_only_skips_draft_fetch(tmp_path, monkeypatch):
+def test_download_preset_fetches_laguna_speculator_and_required_config(
+    tmp_path, monkeypatch
+):
     cfg = SimpleNamespace(models_dir=tmp_path)
     pres = resolve_preset("laguna-xs.2")
     assert not pres.has_draft
-    fetches: list[tuple[str, str]] = []
+    assert pres.has_speculator
+    fetches: list[tuple[str, str, str]] = []
 
     def _meta(_api, repo_id: str, filename: str) -> tuple[int, None]:
         return 10, None
 
     def _stub_fetch(api, repo_id, filename, local_dir, console):  # noqa: ARG001
-        fetches.append((repo_id, filename))
+        fetches.append((repo_id, filename, str(local_dir)))
         out = local_dir / filename
         out.parent.mkdir(parents=True, exist_ok=True)
         with out.open("wb") as f:
@@ -334,11 +341,15 @@ def test_download_preset_target_only_skips_draft_fetch(tmp_path, monkeypatch):
     monkeypatch.setattr(download, "_fetch", _stub_fetch)
 
     assert download.download_preset(cfg, pres) == 0
-    # Target fetched, no draft fetch attempted at all.
-    assert fetches == [(pres.target_repo, pres.target_file)]
+    speculator_dir = str(tmp_path / "draft" / "laguna-xs2-speculator")
+    assert fetches == [
+        (pres.target_repo, pres.target_file, str(tmp_path)),
+        (pres.speculator_repo, "model.safetensors", speculator_dir),
+        (pres.speculator_repo, "config.json", speculator_dir),
+    ]
 
 
-def test_status_target_only_preset_reports_draft_as_present(tmp_path, monkeypatch):
+def test_status_requires_every_laguna_speculator_file(tmp_path, monkeypatch):
     cfg = SimpleNamespace(models_dir=tmp_path)
     pres = resolve_preset("laguna-xs.2")
 
@@ -346,8 +357,14 @@ def test_status_target_only_preset_reports_draft_as_present(tmp_path, monkeypatc
         return 1024, None
 
     monkeypatch.setattr(download, "_file_meta", _meta)
-    # Target absent → target_present False, draft_present True (nothing to download).
-    assert status(cfg, pres) == {"target_present": False, "draft_present": True}
+    assert status(cfg, pres) == {"target_present": False, "draft_present": False}
+
+    root = tmp_path / "draft" / "laguna-xs2-speculator"
+    root.mkdir(parents=True)
+    (root / "model.safetensors").write_bytes(b"x" * 1024)
+    assert status(cfg, pres)["draft_present"] is False
+    (root / "config.json").write_bytes(b"x" * 1024)
+    assert status(cfg, pres)["draft_present"] is True
 
 
 def test_recommend_preset_tiers() -> None:

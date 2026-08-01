@@ -33,16 +33,19 @@
 
 set -euo pipefail
 
-# ROCm packages on minimal Ubuntu images install their tools under
-# /opt/rocm/bin without necessarily adding that directory to a login shell's
-# PATH. Keep probing and native builds self-contained; this changes PATH only
-# for the wrapper process and its children.
-if [ -d /opt/rocm/bin ]; then
+# GPU SDK packages on minimal Ubuntu images do not always update a login
+# shell's PATH.  Keep probing and native builds self-contained; this changes
+# PATH only for the wrapper process and its children.
+for lucebox_toolchain_bin in /opt/rocm/bin /usr/local/cuda/bin; do
+    [ -d "$lucebox_toolchain_bin" ] || continue
     case ":${PATH:-}:" in
-        *:/opt/rocm/bin:*) ;;
-        *) export PATH="/opt/rocm/bin:${PATH:-/usr/bin:/bin}" ;;
+        *:"$lucebox_toolchain_bin":*) ;;
+        # Respect explicit caller paths (including test shims and operator
+        # toolchain pins); SDK defaults are fallbacks, not overrides.
+        *) export PATH="${PATH:-/usr/bin:/bin}:$lucebox_toolchain_bin" ;;
     esac
-fi
+done
+unset lucebox_toolchain_bin
 
 VERSION="0.2.0"
 SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
@@ -63,6 +66,8 @@ UNIT_PATH="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$UNIT_NAME"
 # CUDA driver floor for the prebuilt CUDA 12 image.
 # shellcheck disable=SC2034
 MIN_DRIVER_CUDA12=525
+MIN_DRIVER_CUDA128=570
+MIN_DRIVER_CUDA13=580
 
 # Canonical source of `lucebox.sh`. The bootstrap installer (`install.sh`)
 # rewrites this line at install time to record which URL the user actually
@@ -241,6 +246,7 @@ CONNECTOR_SELECTION_FILE="$CONNECTOR_STATE_DIR/selected"
 : "${LUCEBOX_HOST_NVIDIA_VRAM_GB:=0}"
 : "${LUCEBOX_HOST_NVIDIA_GPU_ARCH:=}"
 : "${LUCEBOX_HOST_NVIDIA_GPU_LIST_CSV:=}"
+: "${LUCEBOX_HOST_NVIDIA_UNIFIED_MEMORY:=0}"
 : "${LUCEBOX_HOST_ROCM_VERSION:=}"
 : "${LUCEBOX_HOST_HAS_KFD:=0}"
 : "${LUCEBOX_HOST_HAS_DRI:=0}"
@@ -463,6 +469,7 @@ probe_host() {
     LUCEBOX_HOST_NVIDIA_VRAM_GB=0
     LUCEBOX_HOST_NVIDIA_GPU_ARCH=""
     LUCEBOX_HOST_NVIDIA_GPU_LIST_CSV=""
+    LUCEBOX_HOST_NVIDIA_UNIFIED_MEMORY=0
     LUCEBOX_HOST_ROCM_VERSION=""
     LUCEBOX_HOST_HAS_KFD=0
     LUCEBOX_HOST_HAS_DRI=0
@@ -484,14 +491,28 @@ probe_host() {
             LUCEBOX_HOST_GPU_VENDOR="nvidia"
             LUCEBOX_HOST_HAS_NVIDIA_GPU=1
             LUCEBOX_HOST_GPU_NAME=$(printf '%s\n' "$q" | head -1 | awk -F', ' '{print $1}')
-            local mem_mib
-            mem_mib=$(printf '%s\n' "$q" | head -1 | awk -F', ' '{print $2}')
-            LUCEBOX_HOST_VRAM_GB=$((mem_mib / 1024))
             LUCEBOX_HOST_DRIVER_VERSION=$(printf '%s\n' "$q" | head -1 | awk -F', ' '{print $3}')
             LUCEBOX_HOST_DRIVER_MAJOR=${LUCEBOX_HOST_DRIVER_VERSION%%.*}
-            local cc
+            local cc mem_mib
             cc=$(printf '%s\n' "$q" | head -1 | awk -F', ' '{print $4}')
             LUCEBOX_HOST_GPU_SM="${cc//./}"
+            mem_mib=$(printf '%s\n' "$q" | head -1 | awk -F', ' '{print $2}')
+            if [[ "$mem_mib" =~ ^[0-9]+$ ]]; then
+                LUCEBOX_HOST_VRAM_GB=$((mem_mib / 1024))
+            elif [ "$LUCEBOX_HOST_GPU_SM" = "121" ] \
+                 && [[ "$LUCEBOX_HOST_GPU_NAME" == *GB10* ]] \
+                 && [ "$LUCEBOX_HOST_RAM_GB" -gt 16 ]; then
+                # GB10 exposes one coherent CPU/GPU memory pool. NVML reports
+                # memory.total as [N/A], while the CUDA runtime sees nearly all
+                # system RAM. Reserve 16 GB for the OS and CPU-side buffers,
+                # matching the Strix UMA planner policy.
+                LUCEBOX_HOST_VRAM_GB=$((LUCEBOX_HOST_RAM_GB - 16))
+                LUCEBOX_HOST_NVIDIA_UNIFIED_MEMORY=1
+            else
+                # Unknown/non-numeric NVML memory must never enter arithmetic
+                # or be guessed as system RAM on a discrete card.
+                LUCEBOX_HOST_VRAM_GB=0
+            fi
             LUCEBOX_HOST_GPU_COUNT=$(printf '%s\n' "$q" | wc -l)
             LUCEBOX_HOST_NVIDIA_GPU_NAME="$LUCEBOX_HOST_GPU_NAME"
             LUCEBOX_HOST_NVIDIA_GPU_COUNT="$LUCEBOX_HOST_GPU_COUNT"
@@ -760,6 +781,7 @@ probe_host() {
     export LUCEBOX_HOST_NVIDIA_GPU_NAME LUCEBOX_HOST_NVIDIA_GPU_COUNT
     export LUCEBOX_HOST_NVIDIA_VRAM_GB LUCEBOX_HOST_NVIDIA_GPU_ARCH
     export LUCEBOX_HOST_NVIDIA_GPU_LIST_CSV
+    export LUCEBOX_HOST_NVIDIA_UNIFIED_MEMORY
     export LUCEBOX_HOST_HAS_HYBRID_RUNTIME
     export LUCEBOX_HOST_HYBRID_SERVER_BIN LUCEBOX_HOST_HYBRID_IPC_BIN
     export LUCEBOX_HOST_HYBRID_DFLASH_DIR LUCEBOX_HOST_HYBRID_ENTRYPOINT
@@ -784,12 +806,27 @@ pick_variant() {
     fi
     configured=$(_lucebox_config_get image.variant)
     if [ -n "$configured" ]; then
+        # cuda12 used to contain sm_120. New releases keep that newer toolkit
+        # in cuda128 so RTX 20/30/40 users retain the r525 driver floor. Migrate
+        # the old moving tag in memory; explicit LUCEBOX_VARIANT still wins.
+        if [ "$configured" = "cuda12" ]; then
+            ensure_probed
+            if [ "$LUCEBOX_HOST_GPU_SM" = "120" ]; then
+                printf 'cuda128'
+                return
+            fi
+            if [ "$LUCEBOX_HOST_GPU_SM" = "121" ]; then
+                case "$(uname -m 2>/dev/null || echo unknown)" in
+                    aarch64|arm64) printf 'cuda13'; return ;;
+                esac
+            fi
+        fi
         printf '%s' "$configured"
         return
     fi
     ensure_probed
     if [ "$LUCEBOX_HOST_HAS_NVIDIA_GPU" = "1" ]; then
-        printf 'cuda12'
+        _default_cuda_variant
     elif [ "$LUCEBOX_HOST_HAS_AMD_GPU" = "1" ]; then
         printf 'rocm'
     else
@@ -797,6 +834,24 @@ pick_variant() {
         # GPU-less host what image it would otherwise use.
         printf 'cuda12'
     fi
+}
+
+_default_cuda_variant() {
+    # Each Blackwell target needs a newer compiler/runtime than the broad
+    # CUDA-12 image. Keep that newer driver floor isolated from Turing through
+    # Hopper hosts, which remain on cuda12.
+    local machine
+    machine=$(uname -m 2>/dev/null || echo unknown)
+    if [ "$LUCEBOX_HOST_GPU_SM" = "121" ]; then
+        case "$machine" in
+            aarch64|arm64) printf 'cuda13'; return ;;
+        esac
+    fi
+    if [ "$LUCEBOX_HOST_GPU_SM" = "120" ]; then
+        printf 'cuda128'
+        return
+    fi
+    printf 'cuda12'
 }
 
 _variant_is_rocm() {
@@ -808,6 +863,20 @@ _variant_is_rocm() {
     case "$1" in
         *[Rr][Oo][Cc][Mm]*) return 0 ;;
         *)                  return 1 ;;
+    esac
+}
+
+_variant_is_cuda13() {
+    case "$1" in
+        *[Cc][Uu][Dd][Aa]13*) return 0 ;;
+        *)                    return 1 ;;
+    esac
+}
+
+_variant_is_cuda128() {
+    case "$1" in
+        *[Cc][Uu][Dd][Aa]128*) return 0 ;;
+        *)                     return 1 ;;
     esac
 }
 
@@ -1164,11 +1233,7 @@ cmd_hybrid_serve() {
     export DFLASH_SERVER_BIN="$LUCEBOX_HOST_HYBRID_SERVER_BIN"
     export DFLASH_BACKEND_IPC_BIN="$LUCEBOX_HOST_HYBRID_IPC_BIN"
     export DFLASH_TARGET="$target"
-    if [ "$draft" = "none" ]; then
-        export DFLASH_DRAFT="$DEFAULT_MODELS_DIR/.lucebox-no-draft"
-    else
-        export DFLASH_DRAFT="$draft"
-    fi
+    _export_selected_decode_companion "$model_id" "$draft"
     export DFLASH_HOST="${LUCEBOX_NATIVE_HOST:-127.0.0.1}"
     export DFLASH_PORT="$DEFAULT_PORT"
     export DFLASH_MODEL_NAME="$model_id"
@@ -1583,7 +1648,7 @@ cmd_pull() {
 _native_backend() {
     local requested="${1:-}" variant
     case "$requested" in
-        cuda|cuda12|nvidia) printf 'cuda'; return ;;
+        cuda|cuda12|cuda128|cuda13|nvidia) printf 'cuda'; return ;;
         rocm|hip|amd)       printf 'rocm'; return ;;
         "")
             variant=$(pick_variant)
@@ -1673,6 +1738,7 @@ _selected_model_paths() {
             gemma-4-31b)  target_file="google_gemma-4-31B-it-Q4_K_M.gguf" ;;
             laguna-xs.2)  target_file="laguna-xs2-Q4_K_M.gguf" ;;
             qwen3.6-moe)  target_file="Qwen3.6-35B-A3B-UD-Q4_K_M.gguf" ;;
+            deepseek-v4-flash) target_file="DeepSeek-V4-Flash-ROCMFP2-STRIX.gguf" ;;
         esac
     fi
     if [ -z "$draft_file" ]; then
@@ -1680,6 +1746,7 @@ _selected_model_paths() {
             qwen3.6-27b) draft_file="dflash-draft-3.6-q4_k_m.gguf" ;;
             gemma-4-26b) draft_file="gemma-4-26B-A4B-it-DFlash-q8_0.gguf" ;;
             gemma-4-31b) draft_file="gemma-4-31B-it-DFlash-q8_0.gguf" ;;
+            deepseek-v4-flash) draft_file="DeepSeek-V4-Flash-DSpark-draft-Q4RMFP4-denseF16.gguf" ;;
         esac
     fi
     speculative_decode=$(_lucebox_config_get dflash.speculative_decode)
@@ -1698,10 +1765,31 @@ _selected_model_paths() {
          && [ "$speculative_decode" != "0" ] \
          && [ "$speculative_decode" != "no" ] \
          && [ "$speculative_decode" != "off" ] \
-         && [ -d "$DEFAULT_MODELS_DIR/draft/laguna-xs2-speculator" ]; then
+         && [ -s "$DEFAULT_MODELS_DIR/draft/laguna-xs2-speculator/model.safetensors" ] \
+         && [ -s "$DEFAULT_MODELS_DIR/draft/laguna-xs2-speculator/config.json" ]; then
         draft_path="$DEFAULT_MODELS_DIR/draft/laguna-xs2-speculator"
     fi
     printf '%s\n%s\n%s\n' "$target_path" "$draft_path" "${preset:-lucebox}"
+}
+
+_export_selected_decode_companion() {
+    # Generic DFlash consumes --draft. DeepSeek's architecture-specific
+    # DSpark backend consumes a separate switch/path and deliberately ignores
+    # --draft, so native and packaged-hybrid launches must mirror the Python
+    # container planner instead of relying on generic draft discovery.
+    local model_id="$1" draft="$2"
+    unset DFLASH_DS4_SPEC DFLASH_DS4_DRAFT
+    if [ "$model_id" = "deepseek-v4-flash" ]; then
+        export DFLASH_DRAFT="$DEFAULT_MODELS_DIR/.lucebox-no-draft"
+        if [ "$draft" != "none" ]; then
+            export DFLASH_DS4_SPEC=1
+            export DFLASH_DS4_DRAFT="$draft"
+        fi
+    elif [ "$draft" = "none" ]; then
+        export DFLASH_DRAFT="$DEFAULT_MODELS_DIR/.lucebox-no-draft"
+    else
+        export DFLASH_DRAFT="$draft"
+    fi
 }
 
 # ── engine client connectors ─────────────────────────────────────────────
@@ -1839,22 +1927,25 @@ _connector_api_root() {
 }
 
 _connector_api_ready() {
-    local api_root="$1" response
+    local api_root="$1" expected_model="${2:-}" response compact
     command -v curl >/dev/null 2>&1 || return 1
     response=$(curl -fsS --connect-timeout 2 --max-time 4 \
         "$api_root/v1/models" 2>/dev/null) || return 1
     # A generic 200 response from another process on the configured port is
     # not sufficient. Require an OpenAI-compatible model catalog shape.
-    [[ "$response" == *'"data"'* || "$response" == *'"models"'* ]]
+    [[ "$response" == *'"data"'* || "$response" == *'"models"'* ]] || return 1
+    [ -n "$expected_model" ] || return 0
+    compact=$(printf '%s' "$response" | tr -d '[:space:]')
+    [[ "$compact" == *"\"id\":\"$expected_model\""* ]]
 }
 
 _connector_ensure_api() {
-    local api_root="$1" i state
+    local api_root="$1" expected_model="${2:-}" i state
     if ! command -v curl >/dev/null 2>&1; then
         err "curl is required to verify the local Lucebox API"
         return 1
     fi
-    if _connector_api_ready "$api_root"; then
+    if _connector_api_ready "$api_root" "$expected_model"; then
         return 0
     fi
     ensure_probed
@@ -1866,7 +1957,7 @@ _connector_ensure_api() {
         bash "$SCRIPT_PATH" start || return $?
         state=running
         for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
-            _connector_api_ready "$api_root" && return 0
+            _connector_api_ready "$api_root" "$expected_model" && return 0
             sleep 1
         done
     fi
@@ -2248,7 +2339,7 @@ EOF
         return 0
     fi
 
-    _connector_ensure_api "$api_root" || return $?
+    _connector_ensure_api "$api_root" "$model" || return $?
     info "Opening $label with the Lucebox model"
     exec "${CONNECTOR_LAUNCH_ARGV[@]}"
 }
@@ -2501,11 +2592,7 @@ cmd_native_serve() {
     export DFLASH_SERVER_BIN="$binary"
     export DFLASH_BACKEND_IPC_BIN="$build_dir/backend_ipc_daemon"
     export DFLASH_TARGET="$target"
-    if [ "$draft" = "none" ]; then
-        export DFLASH_DRAFT="$DEFAULT_MODELS_DIR/.lucebox-no-draft"
-    else
-        export DFLASH_DRAFT="$draft"
-    fi
+    _export_selected_decode_companion "$model_id" "$draft"
     export DFLASH_HOST="${LUCEBOX_NATIVE_HOST:-127.0.0.1}"
     export DFLASH_PORT="$DEFAULT_PORT"
     export DFLASH_MODEL_NAME="$model_id"
@@ -2514,8 +2601,39 @@ cmd_native_serve() {
     exec "$repo/server/scripts/entrypoint.sh" serve
 }
 
+HARNESS_ENGINE_PID=""
+HARNESS_ENGINE_LOG=""
+
+_stop_harness_engine() {
+    if [ -n "$HARNESS_ENGINE_PID" ] \
+       && kill -0 "$HARNESS_ENGINE_PID" 2>/dev/null; then
+        kill "$HARNESS_ENGINE_PID" 2>/dev/null || true
+        wait "$HARNESS_ENGINE_PID" 2>/dev/null || true
+    fi
+    HARNESS_ENGINE_PID=""
+}
+
+_wait_for_harness_engine() {
+    local api_root="$1" model="$2" attempts=0
+    while [ "$attempts" -lt 300 ]; do
+        attempts=$((attempts + 1))
+        _connector_api_ready "$api_root" "$model" && return 0
+        if [ -n "$HARNESS_ENGINE_PID" ] \
+           && ! kill -0 "$HARNESS_ENGINE_PID" 2>/dev/null; then
+            err "the inference engine exited while loading"
+            [ ! -f "$HARNESS_ENGINE_LOG" ] \
+                || tail -n 120 "$HARNESS_ENGINE_LOG" >&2
+            return 1
+        fi
+        sleep 1
+    done
+    err "the inference engine did not become ready within 5 minutes"
+    [ ! -f "$HARNESS_ENGINE_LOG" ] || tail -n 120 "$HARNESS_ENGINE_LOG" >&2
+    return 1
+}
+
 cmd_harness() {
-    local repo name="${1:-}" backend build_dir binary script selected=() target draft
+    local repo name="${1:-}" backend script api_root model max_ctx log_dir rc=0
     repo=$(_find_repo_root) \
         || die "harness launchers are contributor tools; run this command inside the lucebox repository"
     if [ -z "$name" ]; then
@@ -2545,40 +2663,45 @@ EOF
     script="$repo/harness/clients/run_${name}.sh"
     [ -x "$script" ] || die "harness launcher is missing: $script"
     ensure_probed
-    if _config_requires_hybrid_runtime; then
-        die "this profile uses the paired CUDA + HIP runtime; start it with '$SCRIPT_NAME native', then connect the harness with '$SCRIPT_NAME connect $name'"
-    fi
     backend=$(_native_backend "${LUCEBOX_HARNESS_BACKEND:-}")
-    build_dir=$(_native_build_dir "$repo" "$backend")
-    binary="$build_dir/dflash_server"
-    [ -x "$binary" ] \
-        || die "native engine is not built — run '$SCRIPT_NAME build $backend' first"
-    mapfile -t selected < <(_selected_model_paths)
-    target="${selected[0]:-}"
-    draft="${selected[1]:-none}"
-    _model_artifact_ready "$target" \
-        || die "selected target is not installed: $target — run '$SCRIPT_NAME models select'"
+    api_root=$(_connector_api_root)
+    model=$(_connector_model_id)
+    max_ctx=$(_connector_context_size)
+    log_dir="$CONFIG_HOME/logs"
+    _connector_private_dir "$log_dir"
+    HARNESS_ENGINE_LOG="$log_dir/harness-engine.log"
 
-    _export_native_config
-    export REPO_DIR="$repo"
-    export DFLASH_SERVER_BIN="$binary"
-    export DFLASH_TARGET="$target"
-    export TARGET="$target"
-    export DFLASH_DRAFT="$draft"
-    export DRAFT="$draft"
-    if [ "$draft" != "none" ]; then
-        # Match `lucebox native` and the container entrypoint: a selected
-        # DFlash draft uses DDTree by default. An explicit contributor
-        # VERIFY_MODE remains authoritative for comparison experiments.
-        export VERIFY_MODE="${VERIFY_MODE:-ddtree}"
+    if _connector_api_ready "$api_root"; then
+        _connector_api_ready "$api_root" "$model" \
+            || die "the API at $api_root is running a different model; stop it or select its advertised model"
+        # We do not own the reused process and therefore cannot promise a log
+        # path to the harness.  Avoid exposing a stale log from an earlier
+        # CLI-owned launch if the client later reports an API error.
+        HARNESS_ENGINE_LOG=/dev/null
+        info "Reusing the running Lucebox API at $api_root"
+    else
+        # The canonical native path owns model resolution, placement, and all
+        # optimization flags. Harness scripts are protocol/client adapters;
+        # they must not reconstruct a second, divergent engine command line.
+        info "Starting the optimized Lucebox engine for $name"
+        bash "$SCRIPT_PATH" native "$backend" >"$HARNESS_ENGINE_LOG" 2>&1 &
+        HARNESS_ENGINE_PID=$!
+        trap _stop_harness_engine EXIT
+        _wait_for_harness_engine "$api_root" "$model" || return $?
     fi
-    local max_ctx budget
-    max_ctx=$(_lucebox_config_get dflash.max_ctx)
-    budget=$(_lucebox_config_get dflash.budget)
-    [ -z "$max_ctx" ] || export MAX_CTX="$max_ctx"
-    [ -z "$budget" ] || export BUDGET="$budget"
-    info "Launching $name with the selected Lucebox model"
-    exec "$script"
+
+    export REPO_DIR="$repo"
+    export MODEL_SERVER=external
+    export HOST=127.0.0.1
+    export PORT="$DEFAULT_PORT"
+    export MODEL_ID="$model"
+    export MAX_CTX="$max_ctx"
+    export SERVER_LOG="$HARNESS_ENGINE_LOG"
+    info "Launching $name against the selected Lucebox model"
+    "$script" || rc=$?
+    _stop_harness_engine
+    trap - EXIT
+    return "$rc"
 }
 
 cmd_update() {
@@ -2788,18 +2911,46 @@ cmd_check() {
             none|*)             _row 0    "nvidia ctk" "not installed — https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html" ;;
         esac
 
-        if [ "$LUCEBOX_HOST_DRIVER_MAJOR" -ge "$MIN_DRIVER_CUDA12" ]; then
-            _row 1 "nvidia driver" "$LUCEBOX_HOST_DRIVER_VERSION (≥ $MIN_DRIVER_CUDA12 required for cuda12)"
+        local required_driver cuda_label memory_label
+        if _variant_is_cuda13 "$variant"; then
+            required_driver=$MIN_DRIVER_CUDA13
+            cuda_label=cuda13
+        elif _variant_is_cuda128 "$variant"; then
+            required_driver=$MIN_DRIVER_CUDA128
+            cuda_label=cuda128
         else
-            _row 0 "nvidia driver" "$LUCEBOX_HOST_DRIVER_VERSION (< $MIN_DRIVER_CUDA12 — cuda12 image will fail)"
+            required_driver=$MIN_DRIVER_CUDA12
+            cuda_label=cuda12
         fi
-        _row 1 "nvidia gpu" "$LUCEBOX_HOST_GPU_NAME × $LUCEBOX_HOST_GPU_COUNT (sm_$LUCEBOX_HOST_GPU_SM, ${LUCEBOX_HOST_VRAM_GB} GB VRAM)"
-        # cuda12 image arch coverage: sm_75;80;86;89;90;120 (see docker-bake.hcl)
-        case "$LUCEBOX_HOST_GPU_SM" in
-            75|80|86|89|90|120) _row 1    "cuda12 arch" "sm_$LUCEBOX_HOST_GPU_SM covered by image" ;;
-            "")                 _row warn "cuda12 arch" "compute capability not detected" ;;
-            *)                  _row warn "cuda12 arch" "sm_$LUCEBOX_HOST_GPU_SM not in image arch list (75;80;86;89;90;120)" ;;
-        esac
+        if [ "$LUCEBOX_HOST_DRIVER_MAJOR" -ge "$required_driver" ]; then
+            _row 1 "nvidia driver" "$LUCEBOX_HOST_DRIVER_VERSION (≥ $required_driver required for $cuda_label)"
+        else
+            _row 0 "nvidia driver" "$LUCEBOX_HOST_DRIVER_VERSION (< $required_driver — $cuda_label image will fail)"
+        fi
+        memory_label="${LUCEBOX_HOST_VRAM_GB} GB VRAM"
+        if [ "$LUCEBOX_HOST_NVIDIA_UNIFIED_MEMORY" = "1" ]; then
+            memory_label="${LUCEBOX_HOST_VRAM_GB} GB usable shared memory"
+        fi
+        _row 1 "nvidia gpu" "$LUCEBOX_HOST_GPU_NAME × $LUCEBOX_HOST_GPU_COUNT (sm_$LUCEBOX_HOST_GPU_SM, $memory_label)"
+        if _variant_is_cuda13 "$variant"; then
+            case "$LUCEBOX_HOST_GPU_SM" in
+                121) _row 1    "cuda13 arch" "sm_121 covered by the arm64 image" ;;
+                "")  _row warn "cuda13 arch" "compute capability not detected" ;;
+                *)   _row warn "cuda13 arch" "sm_$LUCEBOX_HOST_GPU_SM is not covered by the arm64 image (121)" ;;
+            esac
+        elif _variant_is_cuda128 "$variant"; then
+            case "$LUCEBOX_HOST_GPU_SM" in
+                120) _row 1    "cuda128 arch" "sm_120 covered by the CUDA 12.8 image" ;;
+                "")  _row warn "cuda128 arch" "compute capability not detected" ;;
+                *)   _row warn "cuda128 arch" "sm_$LUCEBOX_HOST_GPU_SM is not covered by the CUDA 12.8 image (120)" ;;
+            esac
+        else
+            case "$LUCEBOX_HOST_GPU_SM" in
+                75|80|86|89|90) _row 1    "cuda12 arch" "sm_$LUCEBOX_HOST_GPU_SM covered by image" ;;
+                "")             _row warn "cuda12 arch" "compute capability not detected" ;;
+                *)              _row warn "cuda12 arch" "sm_$LUCEBOX_HOST_GPU_SM not in image arch list (75;80;86;89;90)" ;;
+            esac
+        fi
     elif command -v nvidia-smi &>/dev/null; then
         _row 0 "nvidia driver" "nvidia-smi present but NVML calls fail — driver/library mismatch, try reboot"
     fi
@@ -3063,6 +3214,24 @@ _menu_restart_if_running() {
     fi
 }
 
+_ensure_configured_image() {
+    # Model activation may switch backends on a mixed machine when the current
+    # backend cannot place the selected model. Keep guided setup/menu one-step:
+    # install the newly selected runtime before optimize/start tries to use it.
+    local selected
+    selected=$(_lucebox_config_get image.variant)
+    [ -n "$selected" ] || selected=$(pick_variant)
+    if docker image inspect "${IMAGE_BASE}:${selected}" >/dev/null 2>&1; then
+        return 0
+    fi
+    if ! _confirm "Download the ${selected} inference image required by this model?" 1; then
+        warn "The model is configured, but ${IMAGE_BASE}:${selected} is not installed."
+        hint "Run '$SCRIPT_NAME pull' before starting the engine."
+        return 1
+    fi
+    LUCEBOX_VARIANT="$selected" bash "$SCRIPT_PATH" pull
+}
+
 cmd_setup() {
     [ -t 0 ] && [ -t 1 ] \
         || die "guided setup needs a terminal — use '$SCRIPT_NAME --help' for non-interactive commands"
@@ -3085,7 +3254,7 @@ cmd_setup() {
         IFS= read -r backend_choice || return 1
         case "$backend_choice" in
             2) variant=rocm ;;
-            *) variant=cuda12 ;;
+            *) variant=$(_default_cuda_variant) ;;
         esac
     fi
     info "Selected backend: $variant"
@@ -3109,6 +3278,7 @@ cmd_setup() {
         warn "No model was selected; setup stopped without starting the engine."
         return 1
     fi
+    _ensure_configured_image || return $?
 
     printf '\n'
     if _confirm "Enable recommended optimizations (may add a ~1.2 GB shared scorer)?" 1; then
@@ -3316,7 +3486,10 @@ cmd_menu() {
         case "$choice" in
             1) cmd_setup; _menu_pause ;;
             2)
-                if _menu_run models select; then _menu_restart_if_running; fi
+                if _menu_run models select \
+                   && _ensure_configured_image; then
+                    _menu_restart_if_running
+                fi
                 _menu_pause
                 ;;
             3)
@@ -3389,7 +3562,7 @@ Misc:
 
 Environment overrides:
   LUCEBOX_IMAGE         image name without tag (default: ghcr.io/luce-org/lucebox-hub)
-  LUCEBOX_VARIANT       image tag override (default: cuda12 on NVIDIA, rocm on AMD)
+  LUCEBOX_VARIANT       image tag override (default: cuda13 on GB10, cuda128 on RTX 5090, cuda12 on other NVIDIA, rocm on AMD)
   LUCEBOX_PORT          host port for the server (default: 8080)
   LUCEBOX_CONTAINER     server container name (default: lucebox)
   LUCEBOX_MODELS        host model directory (default: \$XDG_DATA_HOME/lucebox/models)

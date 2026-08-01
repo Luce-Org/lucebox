@@ -380,6 +380,14 @@ def test_cache_slot_validation_names_the_invalid_field(field: str, message: str)
         DflashRuntime(**{field: -1})
 
 
+def test_exact_prefill_cache_reserves_the_internal_staging_slot() -> None:
+    from lucebox.types import DflashRuntime
+
+    assert DflashRuntime(prefix_cache_slots=32, prefill_cache_slots=4)
+    with pytest.raises(ValueError, match="must not exceed 63"):
+        DflashRuntime(prefix_cache_slots=60, prefill_cache_slots=4)
+
+
 def test_direct_optimization_edit_marks_profile_custom(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
 
@@ -464,6 +472,31 @@ def test_optimization_and_placement_are_persisted_atomically(tmp_path: Path) -> 
     assert config.optimization_mode(path=path) == "automatic"
 
 
+def test_automatic_runtime_preserves_model_card_thinking_budget(tmp_path: Path) -> None:
+    """An absent override must survive TOML persistence as ``None``."""
+    from lucebox.types import DflashRuntime
+
+    path = tmp_path / "config.toml"
+    config.write_optimization_runtime(DflashRuntime(), path=path)
+
+    assert "think_max" not in config.load_doc(path)["dflash"]
+    loaded = config.load(path)
+    assert loaded is not None
+    assert loaded.dflash.think_max is None
+    assert loaded.dflash.prefix_cache_slots == 32
+
+
+def test_explicit_thinking_budget_round_trips(tmp_path: Path) -> None:
+    from lucebox.types import DflashRuntime
+
+    path = tmp_path / "config.toml"
+    config.write_optimization_runtime(DflashRuntime(think_max=15488), path=path)
+
+    loaded = config.load(path)
+    assert loaded is not None
+    assert loaded.dflash.think_max == 15488
+
+
 def test_runtime_reset_clears_stale_placement(tmp_path: Path) -> None:
     from lucebox.types import DflashRuntime, PlacementRuntime
 
@@ -496,12 +529,14 @@ def test_model_and_execution_profile_switch_atomically(tmp_path: Path) -> None:
         ModelMeta(preset="new", target_file="new.gguf"),
         DflashRuntime(max_ctx=32768),
         placement,
+        variant="rocm",
         path=path,
     )
 
     loaded = config.load(path)
     assert loaded is not None
     assert loaded.model == ModelMeta(preset="new", target_file="new.gguf")
+    assert loaded.variant == "rocm"
     assert loaded.dflash.max_ctx == 32768
     assert loaded.placement == placement
     assert "draft_file" not in config.load_doc(path)["model"]

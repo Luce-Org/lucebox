@@ -13,8 +13,9 @@ which invokes the package in the appropriate container:
     lucebox optimize --advanced     # override individual optimizations
     lucebox start
 
-The wrapper inventories the host and selects CUDA for NVIDIA builds (including
-RTX 3090 + Strix) or ROCm for AMD builds (including R9700 + Strix). The package
+The wrapper inventories the host and selects the compatible CUDA image for
+NVIDIA builds (`cuda12` through Hopper, `cuda128` for RTX 5090, `cuda13` for
+GB10), or ROCm for AMD builds (including R9700 + Strix). The package
 then handles readiness checks, TOML configuration, model selection and
 download, optimization and placement settings, and construction of the final
 server command. Host facts are passed through `LUCEBOX_HOST_*` environment
@@ -38,6 +39,9 @@ are labeled and never enabled silently. In particular, DeepSeek sparse prefill
 is an explicit approximate HIP preview and exact MLA prefill remains Automatic.
 A factory-preloaded Lucebox can ship the models, shared optimizer scorer, and
 paired runtime, so a buyer does not download or compile during first setup.
+If model placement must switch backend on a mixed machine, activation persists
+that backend atomically with its optimization plan and guided setup installs
+the corresponding image before continuing.
 
 Spark is enabled automatically only when an MoE model is under GPU-memory
 pressure and the machine reports at least 32 GB of host RAM; its cold experts

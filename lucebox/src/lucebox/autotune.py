@@ -123,6 +123,12 @@ def draft_available(cfg: Config, preset: object) -> bool:
     root = cfg.models_dir / "draft" / str(speculator_dir)
     if not root.is_dir():
         return False
+    required_files = tuple(getattr(preset, "speculator_files", ()))
+    if required_files:
+        return all(
+            local_artifact_present(root / str(filename))
+            for filename in required_files
+        )
     try:
         return any(
             local_artifact_present(candidate)
@@ -168,6 +174,8 @@ def _cap_exact_context(
     the planner below. Other models keep exact cache semantics in Automatic
     mode and receive a smaller context when weights leave little working room.
     """
+    if profile.compact_native_kv:
+        return runtime
     kvflash = profile.kvflash
     if kvflash is not None and kvflash.feature.automatic_on(backend):
         return runtime
@@ -221,6 +229,7 @@ def _capacity_fallbacks(
                 prefill_mode="off",
                 prefill_keep_ratio=defaults.prefill_keep_ratio,
                 prefill_threshold=defaults.prefill_threshold,
+                prefill_cache_slots=defaults.prefill_cache_slots,
                 prefill_drafter=(
                     current.prefill_drafter
                     if current.kvflash != "off" and current.kvflash_policy == "drafter"
@@ -427,6 +436,7 @@ def automatic_plan(
             prefill_mode="auto",
             prefill_keep_ratio=pflash_capability.keep_ratio,
             prefill_threshold=pflash_capability.minimum_context,
+            prefill_cache_slots=pflash_capability.exact_cache_slots,
             prefill_drafter=download_mod.optimizer_drafter_container_path(),
         )
     elif pflash_profile:

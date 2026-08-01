@@ -7,7 +7,7 @@ import pytest
 from lucebox.autotune import automatic_plan
 from lucebox.capabilities import ARCHITECTURE_CAPABILITIES
 from lucebox.docker_run import server_run_spec
-from lucebox.host_facts import from_env
+from lucebox.host_facts import compatible_variant, for_variant, from_env, nvidia_variant
 from lucebox.placement import automatic_placement
 from lucebox.topology import from_config
 from lucebox.types import Config, DflashRuntime, HostFacts, ModelMeta
@@ -349,6 +349,106 @@ def test_strix_is_uma_even_when_driver_reports_large_aperture(tmp_path: Path) ->
     assert topology.primary.unified_memory is True
     assert topology.primary.physical_vram_gb == 16
     assert topology.primary.effective_memory_gb == 112
+
+
+def test_gb10_nvml_na_memory_is_normalized_as_shared_memory(tmp_path: Path) -> None:
+    """DGX Spark reports ``[N/A]`` for NVML memory despite CUDA UMA."""
+    host = HostFacts(
+        gpu_vendor="nvidia",
+        has_nvidia_gpu=True,
+        gpu_name="NVIDIA GB10",
+        gpu_count=1,
+        vram_gb=105,
+        gpu_sm="121",
+        ram_gb=121,
+        nvidia_gpu_name="NVIDIA GB10",
+        nvidia_gpu_count=1,
+        nvidia_vram_gb=105,
+        nvidia_gpu_arch="121",
+        nvidia_gpu_list_csv=(
+            "0, GPU-test, 00000000:01:00.0, NVIDIA GB10, 12.1, [N/A], [N/A]"
+        ),
+        nvidia_unified_memory=True,
+    )
+
+    topology = from_config(Config(variant="cuda13", models_dir=tmp_path, host=host))
+
+    assert topology.primary is not None
+    assert topology.primary.backend == "cuda"
+    assert topology.primary.architecture == "121"
+    assert topology.primary.unified_memory is True
+    assert topology.primary.physical_vram_gb == 0
+    assert topology.primary.effective_memory_gb == 105
+    assert "105 GB shared" in topology.primary.label
+
+
+def test_gb10_unified_memory_flag_is_read_from_host_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_host_env(
+        monkeypatch,
+        {
+            "LUCEBOX_HOST_GPU_VENDOR": "nvidia",
+            "LUCEBOX_HOST_NVIDIA_UNIFIED_MEMORY": 1,
+        },
+    )
+
+    assert from_env().nvidia_unified_memory is True
+
+
+def test_backend_projection_uses_the_selected_vendor_inventory() -> None:
+    host = HostFacts(
+        gpu_vendor="nvidia",
+        has_nvidia_gpu=True,
+        has_amd_gpu=True,
+        gpu_name="RTX 3090",
+        gpu_count=1,
+        vram_gb=24,
+        gpu_sm="86",
+        nvidia_gpu_name="RTX 3090",
+        nvidia_gpu_count=1,
+        nvidia_vram_gb=24,
+        nvidia_gpu_arch="86",
+        amd_gpu_name="AMD Radeon Graphics",
+        amd_gpu_count=1,
+        amd_vram_gb=125,
+        amd_gpu_arch="gfx1151",
+    )
+
+    selected = for_variant(host, "rocm")
+
+    assert selected.gpu_vendor == "amd"
+    assert selected.gpu_name == "AMD Radeon Graphics"
+    assert selected.gpu_count == 1
+    assert selected.vram_gb == 125
+    assert selected.gpu_sm == "gfx1151"
+
+
+@pytest.mark.parametrize(
+    ("architecture", "name", "expected"),
+    [
+        ("86", "NVIDIA GeForce RTX 3090", "cuda12"),
+        ("90", "NVIDIA H100", "cuda12"),
+        ("120", "NVIDIA GeForce RTX 5090", "cuda128"),
+        ("121", "NVIDIA GB10", "cuda13"),
+    ],
+)
+def test_nvidia_image_variant_tracks_the_toolkit_required_by_the_architecture(
+    architecture: str,
+    name: str,
+    expected: str,
+) -> None:
+    host = HostFacts(
+        gpu_vendor="nvidia",
+        has_nvidia_gpu=True,
+        gpu_name=name,
+        gpu_sm=architecture,
+        nvidia_gpu_name=name,
+        nvidia_gpu_arch=architecture,
+    )
+
+    assert nvidia_variant(host) == expected
+    assert compatible_variant(host, "cuda12") == expected
 
 
 def test_rtx_strix_uses_remote_target_shard_when_capacity_requires_it(
