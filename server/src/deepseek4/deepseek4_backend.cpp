@@ -49,6 +49,19 @@ static void configure_gfx1151_dspark_mmvq_default(int gpu) {
         return;
     }
 
+    // q=5 is an explicit AMD-only experiment and needs the plain quantized
+    // verifier matmuls to stay on MMVQ. The process-wide crossover applies to
+    // both owners in the heterogeneous graph, so set it before inspecting the
+    // target device (which is gfx1201 in the R9700 + gfx1151 launch).
+    if (env_flag_enabled("DFLASH_DS4_Q5_VERIFY")) {
+        if (::setenv("LUCE_MMVQ_MAX_NCOLS", "5", 0) == 0) {
+            std::fprintf(stderr,
+                         "[deepseek4] AMD DSpark q5: defaulting "
+                         "LUCE_MMVQ_MAX_NCOLS=5\n");
+        }
+        return;
+    }
+
     cudaDeviceProp prop{};
     if (cudaGetDeviceProperties(&prop, gpu) != cudaSuccess ||
         std::strncmp(prop.gcnArchName, "gfx1151", 7) != 0) {

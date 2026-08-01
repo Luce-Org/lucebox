@@ -287,7 +287,15 @@ static void ds4_fused_consume_route_diagnostics(
 static size_t ds4_fused_verify_hybrid_slot_limit() {
     static const size_t limit = []() {
         const char * raw = std::getenv("DFLASH_DS4_TP_FUSED_CACHE_SLOTS");
-        const long requested = raw ? std::strtol(raw, nullptr, 10) : 2;
+        // q=5 advances through four ratio-4 phases and crosses a ratio-128
+        // boundary in the 128-token qualification request. With two slots the
+        // nine recurring shapes rebuild on every step. Nine slots were
+        // model-qualified at 28.5 GiB peak on the 31.9 GiB R9700. q<=4 keeps
+        // the conservative two-slot default.
+        const long default_slots =
+            ds4_env_flag("DFLASH_DS4_Q5_VERIFY") ? 9 : 2;
+        const long requested = raw ? std::strtol(raw, nullptr, 10)
+                                   : default_slots;
         return (size_t) std::max<long>(
             1, std::min<long>(requested,
                               (long) Ds4FusedVerifyCache::kSlotCount));
