@@ -95,7 +95,7 @@ def test_strix_128gb_does_not_double_reserve_memory_for_deepseek(
         amd_gpu_count=1,
         amd_vram_gb=125,
         amd_gpu_arch="gfx1151",
-        amd_gpu_list_csv=_amd_csv(("Radeon 8060S", "gfx1151", 0)),
+        amd_gpu_list_csv=_amd_csv(("Radeon 8060S", "gfx1151", 512)),
     )
     cfg = Config(
         variant="rocm",
@@ -104,8 +104,13 @@ def test_strix_128gb_does_not_double_reserve_memory_for_deepseek(
         model=ModelMeta(preset="deepseek-v4-flash"),
     )
 
+    topology = from_config(cfg)
     plan = automatic_plan(cfg, optimizer_drafter_available=False)
 
+    assert topology.primary is not None
+    assert topology.primary.unified_memory is True
+    assert topology.primary.physical_vram_gb == 0
+    assert topology.primary.effective_memory_gb == 109
     assert plan.placement.runnable is True
     assert plan.placement.runtime.mode == "single"
     assert plan.placement.runtime.target_device == "hip:0"
