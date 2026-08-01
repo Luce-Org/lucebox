@@ -2420,6 +2420,15 @@ extern "C" {
             int                  keep_rows,
             int                  block_size);
 
+    // Attach the exact DS4 compressed-row selection directly to flash
+    // attention. selected is I32 [keep_rows,n_batch] and indexes the
+    // compressed span (that is, rows after raw_rows). The DS4 HIP kernel sorts
+    // these score-ordered indices into physical-row order before reduction so
+    // the numerical topology stays identical to the mask-derived path.
+    GGML_API void ggml_flash_attn_ext_set_ds4_indexer_topk(
+            struct ggml_tensor * a,
+            struct ggml_tensor * selected);
+
     // Fuse DS4's inverse 64-d tail RoPE into the D=512 flash-attention
     // writeback. q_unrotated additionally asks the kernel to apply the forward
     // tail RoPE to Q from shared F32. This is exact-only plumbing: both paths

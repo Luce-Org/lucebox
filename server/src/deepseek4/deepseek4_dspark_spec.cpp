@@ -256,7 +256,7 @@ constexpr float kConfidenceQ3Threshold = 0.40f;
 constexpr float kConfidenceQ4Threshold = 0.30f;
 
 // ── Light rollback state ────────────────────────────────────────────────
-// Save the ratio-4 rolling state, HC state, and the raw SWA rows that a q<=4
+// Save the ratio-4 rolling state, HC state, and the raw SWA rows that a q<=5
 // verify may overwrite. Pinned host storage lets the GPU copy this compact
 // rollback state on its stream before the verifier without a host fence.
 // prev-half = first 4 rows of a [comp_width, 8] ratio-4 rolling state.
@@ -300,7 +300,7 @@ bool init_pinned_rollback(const DeepSeek4Cache & cache, DeepSeek4SpecRollback & 
             s.pinned_idx_sc, prev_half_bytes(lc.indexer_compressor.state_score), total);
         s.raw_row_bytes = lc.raw_kv
             ? ggml_row_size(lc.raw_kv->type, lc.raw_kv->ne[0]) : 0;
-        assign_pinned_span(s.pinned_raw_rows, s.raw_row_bytes * 4, total);
+        assign_pinned_span(s.pinned_raw_rows, s.raw_row_bytes * 5, total);
     }
     assign_pinned_span(
         rb.pinned_hc, cache.hc_state ? ggml_nbytes(cache.hc_state) : 0, total);
@@ -367,7 +367,7 @@ void spec_rollback_save(const DeepSeek4Cache & cache, DeepSeek4SpecRollback & rb
                         ggml_backend_t backend, bool async_copy,
                         bool pinned_copy, int raw_pos, int raw_count) {
     rb.raw_pos = raw_pos;
-    rb.raw_count = std::clamp(raw_count, 0, 4);
+    rb.raw_count = std::clamp(raw_count, 0, 5);
     rb.layers.resize(cache.layers.size());
     if (async_copy || pinned_copy) {
         rb.async_backend = backend;
@@ -675,6 +675,7 @@ bool run_deepseek4_dspark_spec_decode(
         {roctx_phase, n_gen, 0, target_w.n_layer, device});
     const bool async_rollback = spec_env_flag("DFLASH_DS4_ASYNC_ROLLBACK");
     const bool pinned_rollback = spec_env_flag("DFLASH_DS4_PINNED_ROLLBACK");
+    const bool q5_verify = spec_env_flag("DFLASH_DS4_Q5_VERIFY") && block >= 4;
     const bool draft_overlap_probe =
         spec_env_flag("DFLASH_DS4_DRAFT_OVERLAP_PROBE");
     const bool draft_overlap_reuse_context =
@@ -717,18 +718,17 @@ bool run_deepseek4_dspark_spec_decode(
     }
     double ewma_accept = 1.5;
 
-    // Fast path caps the verify at the compression ratio (4): one boundary max,
-    // no rolling-state row aliasing -> snapshot-free rollback stays exact.
-    // Full snapshots change rollback strategy but not the compressor-window
-    // limit below. The legacy sequential measurement path is validated only
-    // through q=4.
-    int q_cap = full_snap ? block + 1
-                          : GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS;
+    // The conservative fast path remains capped at the compression ratio.
+    // The explicit q5 path handles the second ratio-4 boundary in-graph and
+    // restores/replays only a rejected q5 prefix, avoiding full snapshots on
+    // the overwhelmingly common all-accepted path.
+    const int fast_cap = q5_verify
+        ? block + 1 : GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS;
+    int q_cap = full_snap ? block + 1 : fast_cap;
     if (const char * qs = std::getenv("DFLASH_DS4_SPEC_Q")) {
         const int v = std::atoi(qs);
         if (v >= 2 && v <= block + 1) {
-            q_cap = full_snap
-                ? v : std::min(v, GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS);
+            q_cap = full_snap ? v : std::min(v, fast_cap);
         }
     }
     if (std::FILE * qf = std::fopen("/tmp/ds4_spec_q", "r")) {
@@ -737,8 +737,7 @@ bool run_deepseek4_dspark_spec_decode(
         // (diagnoses batched-vs-sequential target divergence).
         int v = 0;
         if (std::fscanf(qf, "%d", &v) == 1 && v >= 1 && v <= block + 1) {
-            q_cap = full_snap
-                ? v : std::min(v, GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS);
+            q_cap = full_snap ? v : std::min(v, fast_cap);
         }
         std::fclose(qf);
     }
@@ -843,6 +842,10 @@ bool run_deepseek4_dspark_spec_decode(
             }
         }
         tm_draft += spec_ms_since(t0);
+        if (q5_verify && steps == 0) {
+            std::fprintf(stderr, "[ds4-q5] draft-ready block=%d hidden=%zu\n",
+                         block, local_hidden.size());
+        }
 
         if (debug) {
             size_t lh_nan = 0; double lh_ss = 0;
@@ -873,7 +876,7 @@ bool run_deepseek4_dspark_spec_decode(
             return v && *v && *v != '0';
         }();
         int q_step_cap = (seq_verify_mode || fused_verify_mode)
-                       ? std::min(q_cap, 4)
+                       ? std::min(q_cap, q5_verify ? 5 : 4)
                        : std::min(q_cap, 4 - (pos & 3));
         if (adaptive_width && !use_confidence_width && !seq_verify_mode) {
             const int w_cap = (int) ewma_accept + 2;
@@ -938,6 +941,9 @@ bool run_deepseek4_dspark_spec_decode(
         if ((int) draft_tok.size() > q_step_cap) draft_tok.resize(q_step_cap);
         const int q = (int) draft_tok.size();   // seed + candidates
         tm_head += spec_ms_since(t0);
+        if (q5_verify && steps == 0) {
+            std::fprintf(stderr, "[ds4-q5] head-ready q=%d\n", q);
+        }
 
         if (debug) {
             std::fprintf(stderr, "[ds4-spec] dbg ds_ok=%d q=%d lt=%d draft=[%d %d %d %d]\n",
@@ -979,6 +985,10 @@ bool run_deepseek4_dspark_spec_decode(
                 pos, q);
         }
         tm_save += spec_ms_since(t0);
+        if (q5_verify && steps == 0) {
+            std::fprintf(stderr, "[ds4-q5] rollback-ready rows=%d\n",
+                         rollback.raw_count);
+        }
 
         // First ratio-4 boundary position touched by this verify (p % 4 == 3).
         const int first_boundary = pos + (3 - (pos & 3));
@@ -987,6 +997,9 @@ bool run_deepseek4_dspark_spec_decode(
         // ── ONE batched verify (writes cache + captures features for all q) ──
         t0 = SpecClock::now();
         int verify_last = -1;
+        if (q5_verify && steps == 0) {
+            std::fprintf(stderr, "[ds4-q5] verify-begin q=%d pos=%d\n", q, pos);
+        }
         const bool verify_ok =
             target.verify_batch(draft_tok, pos, verify_last, &tgt_am);
         tm_verify += spec_ms_since(t0);
@@ -1051,6 +1064,25 @@ bool run_deepseek4_dspark_spec_decode(
             std::vector<int32_t> replay_am;
             if (!target.verify_batch(kv_toks, pos, replay_last, &replay_am)) {
                 std::fprintf(stderr, "[ds4-spec] replay verify failed\n");
+                ok = false;
+                break;
+            }
+        } else if (!full_snap && accept < q && q > 4) {
+            // A rejected q5 may have crossed two ratio-4 boundaries. Restore
+            // the compact pre-verify state and replay only the accepted prefix
+            // (at most q4), which is exact and rare at high acceptance.
+            spec_rollback_apply(
+                rollback, target_w, target_cache, pos, true,
+                backend, async_rollback || pinned_rollback,
+                pinned_rollback);
+            std::vector<int32_t> kv_toks;
+            kv_toks.reserve((size_t) accept);
+            kv_toks.push_back(lt);
+            for (int i = 1; i < accept; ++i) kv_toks.push_back(draft_tok[i]);
+            int replay_last = -1;
+            std::vector<int32_t> replay_am;
+            if (!target.verify_batch(kv_toks, pos, replay_last, &replay_am)) {
+                std::fprintf(stderr, "[ds4-spec] q5 rollback replay failed\n");
                 ok = false;
                 break;
             }

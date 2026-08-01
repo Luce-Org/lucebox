@@ -473,6 +473,106 @@ __global__ static void ds4_fa_indexed_rows_parallel_kernel(
     }
 }
 
+// The indexer already returns the exact compressed-row set, ordered by score.
+// Convert it directly into the lookup tables consumed by compact attention.
+// A shared-memory bitonic sort restores ascending physical-row order, matching
+// the old top-k -> mask -> physical scan path and therefore preserving each
+// reduction lane's accumulation order exactly.
+template <typename Mask>
+__global__ static void ds4_fa_indexed_rows_topk_kernel(
+        const Mask    * mask,
+        const int32_t * topk,
+        int           * selected_rows,
+        int           * selected_counts,
+        int           * owner_offsets,
+        int           * owner_ranks,
+        int             n_tokens,
+        int             n_kv,
+        int             raw_rows,
+        int             capacity) {
+    const int t = (int) blockIdx.x;
+    const int tid = (int) threadIdx.x;
+    if (t >= n_tokens) return;
+
+    constexpr int SORT_WIDTH = 512;
+    constexpr int N_OWNERS = 256;
+    constexpr int INVALID_ROW = 0x7fffffff;
+    __shared__ int sorted_rows[SORT_WIDTH];
+    __shared__ int owner_counts[N_OWNERS];
+    __shared__ int count;
+
+    const int n_comp_rows = n_kv - raw_rows;
+    const Mask * token_mask = mask + (size_t) t * n_kv;
+    const int32_t * token_topk = topk + (size_t) t * capacity;
+    int * token_rows = selected_rows + (size_t) t * capacity;
+    int * token_owner_offsets = owner_offsets + (size_t) t * (N_OWNERS + 1);
+    int * token_owner_ranks = owner_ranks + (size_t) t * capacity;
+
+    int row = INVALID_ROW;
+    if (tid < capacity) {
+        const int comp = token_topk[tid];
+        const int physical = raw_rows + comp;
+        if (comp >= 0 && comp < n_comp_rows &&
+            ds4_fa_load<Mask, Mask>(token_mask + physical) > -1.0e20f) {
+            row = physical;
+        }
+    }
+    sorted_rows[tid] = row;
+    if (tid < N_OWNERS) owner_counts[tid] = 0;
+    __syncthreads();
+
+    for (int width = 2; width <= SORT_WIDTH; width <<= 1) {
+        for (int stride = width >> 1; stride > 0; stride >>= 1) {
+            const int peer = tid ^ stride;
+            if (peer > tid) {
+                const int lhs = sorted_rows[tid];
+                const int rhs = sorted_rows[peer];
+                const bool ascending = (tid & width) == 0;
+                if ((lhs > rhs) == ascending) {
+                    sorted_rows[tid] = rhs;
+                    sorted_rows[peer] = lhs;
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    if (tid == 0) {
+        int valid = 0;
+        while (valid < capacity && sorted_rows[valid] != INVALID_ROW) {
+            ++valid;
+        }
+        count = valid;
+        selected_counts[t] = valid;
+    }
+    __syncthreads();
+
+    if (tid < count) {
+        token_rows[tid] = sorted_rows[tid];
+        atomicAdd(owner_counts + (sorted_rows[tid] & (N_OWNERS - 1)), 1);
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        int prefix = 0;
+        for (int owner = 0; owner < N_OWNERS; ++owner) {
+            token_owner_offsets[owner] = prefix;
+            prefix += owner_counts[owner];
+        }
+        token_owner_offsets[N_OWNERS] = prefix;
+    }
+    __syncthreads();
+
+    if (tid < N_OWNERS) {
+        int write = token_owner_offsets[tid];
+        for (int rank = 0; rank < count; ++rank) {
+            if ((token_rows[rank] & (N_OWNERS - 1)) == tid) {
+                token_owner_ranks[write++] = rank;
+            }
+        }
+    }
+}
+
 template <typename KV, typename Mask>
 __global__ static void ds4_flash_attn_d512_shared_kv_kernel(
         float       * dst,
@@ -1618,6 +1718,7 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32_supported(const ggml_tensor * dst)
     const ggml_tensor * V = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
+    const ggml_tensor * indexer_topk = dst->src[5];
     const bool kv_f32 = K && V && K->type == GGML_TYPE_F32 &&
                         V->type == GGML_TYPE_F32;
     const bool kv_f16 = K && V && K->type == GGML_TYPE_F16 &&
@@ -1676,6 +1777,15 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32_supported(const ggml_tensor * dst)
     const int raw_window = (int) (ds4_layout >> 16);
     const int sparse_block_size = (int) (ds4_layout & 0xffffu);
     const int rope_flags = ggml_get_op_params_i32(dst, 7);
+    if (indexer_topk &&
+        (sparse_keep_rows >= 0 || -sparse_keep_rows > 512 ||
+         indexer_topk->type != GGML_TYPE_I32 ||
+         indexer_topk->ne[0] != -sparse_keep_rows ||
+         indexer_topk->ne[1] != Q->ne[1] ||
+         indexer_topk->ne[2] != 1 || indexer_topk->ne[3] != 1 ||
+         !ggml_is_contiguous(indexer_topk))) {
+        return false;
+    }
     if (raw_rows < 0 || raw_rows > n_kv ||
         (ds4_layout != 0 && (raw_window <= 0 || sparse_block_size <= 0)) ||
         sparse_keep_rows == INT_MIN ||
@@ -1699,6 +1809,7 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
     const ggml_tensor * V = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
+    const ggml_tensor * indexer_topk = dst->src[5];
     const bool kv_f32 = K->type == GGML_TYPE_F32;
     const bool kv_f16 = K->type == GGML_TYPE_F16;
     const int n_tokens = (int) Q->ne[1];
@@ -1857,7 +1968,14 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
             const bool parallel_index_scan = n_comp_rows > 512 &&
                 getenv("GGML_DS4_FA_SERIAL_INDEX_SCAN") == nullptr;
             if (mask->type == GGML_TYPE_F16) {
-                if (parallel_index_scan) {
+                if (indexer_topk) {
+                    ds4_fa_indexed_rows_topk_kernel<half><<<n_tokens, 512, 0, stream>>>(
+                        (const half *) mask->data,
+                        (const int32_t *) indexer_topk->data,
+                        indexed_rows, indexed_counts,
+                        indexed_owner_offsets, indexed_owner_ranks,
+                        n_tokens, n_kv, raw_rows, indexed_capacity);
+                } else if (parallel_index_scan) {
                     ds4_fa_indexed_rows_parallel_kernel<half><<<n_tokens, 256, 0, stream>>>(
                         (const half *) mask->data, indexed_rows, indexed_counts,
                         indexed_owner_offsets, indexed_owner_ranks,
@@ -1871,7 +1989,14 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
                         indexed_capacity);
                 }
             } else {
-                if (parallel_index_scan) {
+                if (indexer_topk) {
+                    ds4_fa_indexed_rows_topk_kernel<float><<<n_tokens, 512, 0, stream>>>(
+                        (const float *) mask->data,
+                        (const int32_t *) indexer_topk->data,
+                        indexed_rows, indexed_counts,
+                        indexed_owner_offsets, indexed_owner_ranks,
+                        n_tokens, n_kv, raw_rows, indexed_capacity);
+                } else if (parallel_index_scan) {
                     ds4_fa_indexed_rows_parallel_kernel<float><<<n_tokens, 256, 0, stream>>>(
                         (const float *) mask->data, indexed_rows, indexed_counts,
                         indexed_owner_offsets, indexed_owner_ranks,

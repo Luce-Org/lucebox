@@ -1186,6 +1186,9 @@ static void build_compressor_step(
     pooled = ggml_reshape_2d(ctx, pooled, head_dim, 1);
 
     ggml_tensor * comp_pos = comp_pos_inp;
+    if (comp_pos && ggml_nelements(comp_pos) > 1) {
+        comp_pos = ggml_view_1d(ctx, comp_pos, 1, 0);
+    }
     if (!comp_pos) {
         comp_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
         ggml_set_input(comp_pos);
@@ -1210,7 +1213,11 @@ static void build_compressor_step(
     }
 
     if (comp_rows_inp) {
-        comp_cache_source = ggml_set_rows(ctx, comp_cache, pooled, comp_rows_inp);
+        ggml_tensor * first_comp_row = comp_rows_inp;
+        if (ggml_nelements(first_comp_row) > 1) {
+            first_comp_row = ggml_view_1d(ctx, first_comp_row, 1, 0);
+        }
+        comp_cache_source = ggml_set_rows(ctx, comp_cache, pooled, first_comp_row);
         ggml_build_forward_expand(gf, comp_cache_source);
     } else {
         ggml_tensor * comp_slot = ggml_view_2d(
@@ -1249,6 +1256,8 @@ static void build_compressor_step(
                 ggml_build_forward_expand(gf, ggml_cpy(ctx, src_sc, dst_sc));
             }
         }
+        ggml_tensor * tail_kv_source = nullptr;
+        ggml_tensor * tail_score_source = nullptr;
         if (batched_nB > 0) {
             ggml_tensor * kv_v = ggml_cont(ctx, ggml_view_2d(
                 ctx, batched_kv_all, comp_width, batched_nB,
@@ -1261,10 +1270,99 @@ static void build_compressor_step(
             ggml_tensor * rows_v = ggml_view_1d(
                 ctx, state_rows_inp, batched_nB,
                 (size_t) batched_span_off * state_rows_inp->nb[0]);
-            ggml_build_forward_expand(
-                gf, ggml_set_rows(ctx, state.state_kv, kv_v, rows_v));
-            ggml_build_forward_expand(
-                gf, ggml_set_rows(ctx, state.state_score, sc_v, rows_v));
+            tail_kv_source = ggml_set_rows(ctx, state.state_kv, kv_v, rows_v);
+            tail_score_source = ggml_set_rows(ctx, state.state_score, sc_v, rows_v);
+            ggml_build_forward_expand(gf, tail_kv_source);
+            ggml_build_forward_expand(gf, tail_score_source);
+        }
+
+        // q=5 can start on the last position of a ratio-4 window. In that
+        // shape the first token flushes one row and the four-token tail fills
+        // and flushes the next window. Pool the second window in the same
+        // graph, then rotate it into the persistent previous half.
+        const bool second_boundary =
+            ratio == 4 && batched_nB == ratio && tail_kv_source &&
+            tail_score_source && comp_pos_inp && comp_rows_inp &&
+            ggml_nelements(comp_pos_inp) >= 2 &&
+            ggml_nelements(comp_rows_inp) >= 2;
+        if (second_boundary) {
+            const size_t hi_off_kv =
+                (size_t) ratio * tail_kv_source->nb[1] +
+                (size_t) head_dim * tail_kv_source->nb[0];
+            const size_t hi_off_sc =
+                (size_t) ratio * tail_score_source->nb[1] +
+                (size_t) head_dim * tail_score_source->nb[0];
+            ggml_tensor * prev_kv = ggml_view_2d(
+                ctx, tail_kv_source, head_dim, ratio,
+                tail_kv_source->nb[1], 0);
+            ggml_tensor * cur_kv_hi = ggml_view_2d(
+                ctx, tail_kv_source, head_dim, ratio,
+                tail_kv_source->nb[1], hi_off_kv);
+            ggml_tensor * prev_sc = ggml_view_2d(
+                ctx, tail_score_source, head_dim, ratio,
+                tail_score_source->nb[1], 0);
+            ggml_tensor * cur_sc_hi = ggml_view_2d(
+                ctx, tail_score_source, head_dim, ratio,
+                tail_score_source->nb[1], hi_off_sc);
+            ggml_tensor * second_kv = ggml_concat(
+                ctx, prev_kv, cur_kv_hi, 1);
+            ggml_tensor * second_sc = ggml_concat(
+                ctx, prev_sc, cur_sc_hi, 1);
+            ggml_tensor * second_sc_t = ggml_cont(
+                ctx, ggml_transpose(ctx, second_sc));
+            ggml_tensor * second_kv_t = ggml_cont(
+                ctx, ggml_transpose(ctx, second_kv));
+            ggml_tensor * second_probs = ggml_soft_max(ctx, second_sc_t);
+            ggml_tensor * second_weighted = ggml_mul(
+                ctx, second_probs, second_kv_t);
+            ggml_tensor * second_pooled = ggml_reshape_1d(
+                ctx, ggml_sum_rows(ctx, second_weighted), head_dim);
+            second_pooled = ggml_cont(ctx, second_pooled);
+            second_pooled = build_rms_norm(
+                ctx, second_pooled, norm_weight, rms_eps);
+            second_pooled = ggml_reshape_2d(
+                ctx, second_pooled, head_dim, 1);
+            ggml_tensor * second_comp_pos = ggml_view_1d(
+                ctx, comp_pos_inp, 1, comp_pos_inp->nb[0]);
+            second_pooled = build_tail_rope_2d(
+                ctx, second_pooled, second_comp_pos, n_rot, head_dim, 1,
+                compress_rope_freq_base, rope_scale, 1.0f, rope_attn,
+                rope_yarn_beta_fast, rope_yarn_beta_slow, rope_orig_ctx);
+            if (indexer_qat) {
+                second_pooled = ggml_ds4_indexer_qat(
+                    ctx, ggml_cont(ctx, second_pooled));
+            }
+            ggml_tensor * second_comp_row = ggml_view_1d(
+                ctx, comp_rows_inp, 1, comp_rows_inp->nb[0]);
+            comp_cache_source = ggml_set_rows(
+                ctx, comp_cache_source, second_pooled, second_comp_row);
+            ggml_build_forward_expand(gf, comp_cache_source);
+
+            for (int r = 0; r < ratio; ++r) {
+                ggml_tensor * src_kv = ggml_view_2d(
+                    ctx, tail_kv_source, comp_width, 1,
+                    tail_kv_source->nb[1],
+                    (size_t) (ratio + r) * tail_kv_source->nb[1]);
+                ggml_tensor * dst_kv = ggml_view_2d(
+                    ctx, state.state_kv, comp_width, 1,
+                    state.state_kv->nb[1],
+                    (size_t) r * state.state_kv->nb[1]);
+                ggml_build_forward_expand(
+                    gf, ggml_cpy(ctx, src_kv, dst_kv));
+                ggml_tensor * src_sc = ggml_view_2d(
+                    ctx, tail_score_source, comp_width, 1,
+                    tail_score_source->nb[1],
+                    (size_t) (ratio + r) * tail_score_source->nb[1]);
+                ggml_tensor * dst_sc = ggml_view_2d(
+                    ctx, state.state_score, comp_width, 1,
+                    state.state_score->nb[1],
+                    (size_t) r * state.state_score->nb[1]);
+                ggml_build_forward_expand(
+                    gf, ggml_cpy(ctx, src_sc, dst_sc));
+            }
+            if (comp_cache_source_out) {
+                *comp_cache_source_out = comp_cache_source;
+            }
         }
         return;
     }
@@ -1939,6 +2037,8 @@ static ggml_tensor * build_mla_attention(
             score_mask = ggml_reshape_2d(ctx, cmask, n_attn, n_tokens);
         }
     }
+    const bool direct_indexer_topk = indexer_topk &&
+        ds4_env_flag("DFLASH_DS4_DIRECT_INDEXER_TOPK");
     if (indexer_topk) {
         if (!score_mask) {
             score_mask = ggml_new_tensor_2d(
@@ -1949,8 +2049,10 @@ static ggml_tensor * build_mla_attention(
                 std::vector<float>((size_t) n_attn * n_tokens, 0.0f),
             });
         }
-        score_mask = ggml_ds4_indexer_mask(
-            ctx, ggml_cont(ctx, score_mask), indexer_topk, n_raw);
+        if (!direct_indexer_topk) {
+            score_mask = ggml_ds4_indexer_mask(
+                ctx, ggml_cont(ctx, score_mask), indexer_topk, n_raw);
+        }
     }
     ggml_tensor * context = nullptr;
     bool inverse_rope_fused = false;
@@ -2115,6 +2217,10 @@ static ggml_tensor * build_mla_attention(
                     : attention_impl == DeepSeek4AttentionImpl::SparseFlash
                         ? w.n_indexer_top_k : 0,
                 32);
+            if (direct_indexer_topk) {
+                ggml_flash_attn_ext_set_ds4_indexer_topk(
+                    context, indexer_topk);
+            }
             if (attention_impl != DeepSeek4AttentionImpl::Explicit &&
                 head_dim == 512 && n_rot == 64) {
                 ggml_flash_attn_ext_set_ds4_inverse_rope(
@@ -6663,14 +6769,18 @@ bool deepseek4_step_layer_range(
         moe_hybrid->materialized_cold_experts &&
         moe_hybrid->cold_backend_kind == MoeHybridColdBackend::Gpu &&
         moe_hybrid->cold_backend && moe_hybrid->cold_backend != backend;
+    const bool q5_verify_candidate =
+        n_tokens == 5 && ds4_env_flag("DFLASH_DS4_Q5_VERIFY");
     const bool fused_verify_candidate =
         (!moe_hybrid || fused_hybrid_ready) &&
         n_tokens >= 2 &&
-        n_tokens <= GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS && verify_hooks &&
+        (n_tokens <= GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS ||
+         q5_verify_candidate) && verify_hooks &&
         layer_begin == 0 && is_last_shard && out_logits &&
         ds4_backend_is_gpu(backend) && ds4_fused_verify_enabled();
     const bool heterogeneous_sparse_prefill =
-        moe_hybrid && cache.prefill_mode == PrefillAttentionMode::Sparse &&
+        !fused_verify_candidate && moe_hybrid &&
+        cache.prefill_mode == PrefillAttentionMode::Sparse &&
         n_tokens > 4 && n_tokens <= DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS &&
         layer_begin == 0 && is_last_shard && out_logits &&
         ds4_backend_is_gpu(backend);
@@ -6912,7 +7022,8 @@ bool deepseek4_step_layer_range(
             ? &fused_hybrid_decode_hooks : verify_hooks;
     if ((!moe_hybrid || fused_hybrid_ready) &&
         ((n_tokens >= 2 &&
-          n_tokens <= GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS && verify_hooks) ||
+          (n_tokens <= GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS ||
+           q5_verify_candidate) && verify_hooks) ||
          fused_hybrid_decode) &&
         layer_begin == 0 && is_last_shard &&
         out_logits && ds4_backend_is_gpu(backend) && ds4_fused_verify_enabled()) {

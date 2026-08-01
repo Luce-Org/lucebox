@@ -5586,6 +5586,18 @@ void ggml_flash_attn_ext_set_ds4_sparse(
     ggml_set_op_params_i32(a, 6, (int32_t) packed_layout);
 }
 
+void ggml_flash_attn_ext_set_ds4_indexer_topk(
+        struct ggml_tensor * a,
+        struct ggml_tensor * selected) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->src[5] == NULL);
+    GGML_ASSERT(selected && selected->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(selected));
+    GGML_ASSERT(selected->ne[1] == a->src[0]->ne[1]);
+    GGML_ASSERT(selected->ne[2] == 1 && selected->ne[3] == 1);
+    a->src[5] = selected;
+}
+
 void ggml_flash_attn_ext_set_ds4_inverse_rope(
         struct ggml_tensor * a,
         int                  kv_start,
