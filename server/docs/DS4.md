@@ -283,6 +283,7 @@ The runtime logs the chosen split with a `[deepseek4-split] auto-split:` banner.
 | `DFLASH_DS4_HOTNESS_CSV` | Optional per-layer routing profile for hot placement. |
 | `GGML_BATCH_PEER_COPIES` | Batch peer-runtime copies and unlike-runtime pinned-host staging with one source wait per split. The old `GGML_CUDA_BATCH_PEER_COPIES` spelling remains an alias. |
 | `DFLASH_DS4_Q5_VERIFY` | Opt in to the AMD q=5 fused verifier. This also selects the qualified MMVQ width and verifier-cache defaults when they are not explicitly overridden. |
+| `DFLASH_CUDA_MMVQ_FP4_Q5_X4_PLUS1` | Select the q=5 ROCmFP4 dense verifier kernel that reuses the existing x4 dot product for columns 0-3 and the exact scalar path for column 4. Defaults to `1` for q=5 on `gfx1201`; set `0` to force the generic five-column kernel. |
 | `DFLASH_DS4_TP_FUSED_CACHE_SLOTS` | Number of heterogeneous verifier graph slots. Defaults to `2` for q<=4 and `9` for the opt-in q=5 verifier; each slot retains scheduler scratch on both GPUs. |
 | `DFLASH_DS4_VERIFY_FORCE_GRAPH_REPLAY` | Skip the expensive property scan only for a warmed verifier graph. Rebuilt scheduler generations are always validated. Leave unset for the conservative production profile. |
 | `GGML_DS4_FA_SERIAL_INDEX_SCAN` | Restore the serial compressed-row mask scan for an indexed-attention A/B. By default, HIP scans contexts above 512 compressed rows in parallel. |
@@ -397,12 +398,16 @@ the shape that crosses two ratio-4 compressor boundaries, preserves five raw
 SWA rows for rollback, and restores plus replays only the accepted prefix after
 a partial rejection. q<=4 behavior is unchanged when the flag is absent.
 
-On the qualified R9700 + Strix Halo profile, leaving the two related controls
-unset selects `LUCE_MMVQ_MAX_NCOLS=5` and nine heterogeneous verifier slots.
+On the qualified R9700 + Strix Halo profile, leaving the related controls
+unset selects `LUCE_MMVQ_MAX_NCOLS=5`, nine heterogeneous verifier slots, and
+the ROCmFP4 x4+1 dense kernel on `gfx1201`.
 The wider MMVQ ceiling avoids the slow small-matrix crossover, while nine slots
-hold the recurring compressor phases without steady graph rebuilds. Explicit
-environment values still take priority. The nine-slot profile peaked at 28.481
-GiB on the reported 31.86 GiB R9700 and must be requalified on smaller devices.
+hold the recurring compressor phases without steady graph rebuilds. The x4+1
+kernel decodes shared weights through the existing four-column vector path and
+retains the original scalar accumulation for the fifth verifier column.
+Explicit environment values still take priority. The nine-slot profile peaked
+at 28.481 GiB on the reported 31.86 GiB R9700 and must be requalified on
+smaller devices.
 
 The exact qualification launch used:
 
