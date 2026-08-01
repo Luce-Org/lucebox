@@ -102,6 +102,20 @@ struct MoeStreamComputeStats {
     uint64_t graph_launches = 0;
 };
 
+struct MoeStreamCacheWarmEntry {
+    int32_t layer = -1;
+    int32_t expert = -1;
+    uint64_t frequency = 0;
+    uint64_t bytes = 0;
+};
+
+struct MoeStreamCacheWarmStats {
+    size_t requested = 0;
+    size_t admitted = 0;
+    size_t already_resident = 0;
+    size_t capacity_drops = 0;
+};
+
 // Route ownership for two concurrent SSD-backed GPU owners. An explicit
 // placement takes precedence and identifies the primary GPU's hot experts.
 // Without one, a stable layer/expert hash supplies a deterministic capacity
@@ -183,7 +197,18 @@ public:
     void release_device_slot(int device_slot);
     int device_slot_count() const;
     size_t device_cache_bytes() const;
+    size_t pinned_expert_count() const;
     ggml_backend_t compute_backend() const;
+
+    // Populate and protect the highest-value profile entries. Numerical specs
+    // are supplied per layer so mixed-format models remain valid. At least
+    // reserve_slots stay evictable for the ordinary miss pipeline.
+    bool warm_and_pin_device_cache(
+        const std::vector<MoeStreamExpertSpec> & layer_specs,
+        const std::vector<MoeStreamCacheWarmEntry> & entries,
+        int reserve_slots,
+        MoeStreamCacheWarmStats * stats = nullptr,
+        std::string * err = nullptr);
 
     bool stream_expert_sync(int layer, int expert_id,
                             std::string * err = nullptr);
@@ -280,6 +305,12 @@ bool partition_moe_stream_routes(
     std::vector<float> & secondary_weights,
     MoeStreamDualOwnerStats * stats = nullptr,
     std::string * err = nullptr);
+
+// Stable owner decision shared by route partitioning and offline cache plans.
+bool moe_stream_primary_owns_expert(
+    const MoeStreamDualOwnerPolicy & policy,
+    int layer,
+    int expert);
 
 // Evaluate the cold contribution for one layer. All routed SSD requests are
 // admitted before compute starts, then double-buffered H2D runs concurrently

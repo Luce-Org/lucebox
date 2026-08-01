@@ -1,5 +1,6 @@
 #include "kimi_k3_internal.h"
 
+#include "common/moe_hybrid_routing_stats.h"
 #include "common/moe_hybrid_stream.h"
 #include "common/moe_router_graph.h"
 #include "internal.h"
@@ -450,7 +451,8 @@ bool streamed_kimi_k3_step(
         std::vector<float> & logits,
         MoeHybridStreamEngine & stream_engine,
         MoeStreamDualOwnerExecutor * dual_stream_executor,
-        const MoeStreamDualOwnerPolicy * stream_owner_policy) {
+        const MoeStreamDualOwnerPolicy * stream_owner_policy,
+        MoeHybridRoutingStats * routing_stats) {
     std::vector<float> hidden(static_cast<size_t>(w.n_embd));
 
     {
@@ -639,6 +641,14 @@ bool streamed_kimi_k3_step(
         route_batch.inputs = routed_input_host.data();
         route_batch.selected_ids = selected.data();
         route_batch.selected_weights = route_weights.data();
+        if (routing_stats && !routing_stats->observe(
+                route_batch.layer, selected.data(),
+                static_cast<int>(selected.size()))) {
+            set_last_error(
+                "Kimi-K3 routed layer " + std::to_string(il) +
+                ": failed to record native route statistics");
+            return false;
+        }
         std::vector<float> routed_output;
         std::string stream_error;
         MoeStreamDualOwnerStats owner_stats;
@@ -822,7 +832,8 @@ bool kimi_k3_step(ggml_backend_t backend,
                   std::vector<float> & logits,
                   MoeHybridStreamEngine * stream_engine,
                   MoeStreamDualOwnerExecutor * dual_stream_executor,
-                  const MoeStreamDualOwnerPolicy * stream_owner_policy) {
+                  const MoeStreamDualOwnerPolicy * stream_owner_policy,
+                  MoeHybridRoutingStats * routing_stats) {
     if (!backend || !w.ctx || !cache.ctx || position < 0 ||
         position >= cache.max_ctx || position != cache.cur_pos ||
         token < 0 || token >= w.n_vocab) {
@@ -845,7 +856,7 @@ bool kimi_k3_step(ggml_backend_t backend,
         return streamed_kimi_k3_step(
             backend, w, cache, token, position,
             logits, *stream_engine, dual_stream_executor,
-            stream_owner_policy);
+            stream_owner_policy, routing_stats);
     }
 
     ggml_init_params params{};

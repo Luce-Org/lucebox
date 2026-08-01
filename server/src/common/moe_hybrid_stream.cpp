@@ -18,6 +18,7 @@
 #include <new>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 #if !defined(_WIN32)
@@ -566,6 +567,7 @@ struct MoeHybridStreamEngine::Runtime {
         bool pending = false;
         bool valid = false;
         bool cache_managed = false;
+        bool pinned = false;
         int compute_users = 0;
         MoeExpertKey key{};
         uint64_t frequency = 0;
@@ -592,6 +594,7 @@ struct MoeHybridStreamEngine::Runtime {
     uint64_t device_cache_hits = 0;
     uint64_t device_cache_misses = 0;
     uint64_t device_cache_evictions = 0;
+    size_t pinned_experts = 0;
     int active_slot = -1;
     std::vector<std::unique_ptr<PersistentStreamExpertGraph>> graph_cache;
     uint64_t graph_clock = 0;
@@ -615,6 +618,7 @@ void release_device_cache(RuntimeT & runtime) {
     }
     runtime.device_slots.clear();
     runtime.device_index.clear();
+    runtime.pinned_experts = 0;
     runtime.active_slot = -1;
     if (runtime.device_pool_buffer) {
         ggml_backend_buffer_free(runtime.device_pool_buffer);
@@ -971,7 +975,8 @@ void MoeHybridStreamEngine::destroy() {
                 "cache-hit=%.1f%% mean-demand-wait=%.3f ms "
                 "dedupe=%llu upgrades=%llu dropped-prefetch=%llu "
                 "timeouts=%llu errors=%llu "
-                "device-cache=%.1f MiB slots=%zu hits=%llu misses=%llu evictions=%llu "
+                "device-cache=%.1f MiB slots=%zu pinned=%zu "
+                "hits=%llu misses=%llu evictions=%llu "
                 "graphs=%llu graph-hits=%llu graph-evictions=%llu launches=%llu\n",
                 runtime_->io->effective_backend_name(),
                 (unsigned long long) stats.requests,
@@ -984,6 +989,7 @@ void MoeHybridStreamEngine::destroy() {
                 (unsigned long long) stats.errors,
                 device_cache_byte_count / 1024.0 / 1024.0,
                 device_cache_slot_count,
+                runtime_->pinned_experts,
                 (unsigned long long) runtime_->device_cache_hits,
                 (unsigned long long) runtime_->device_cache_misses,
                 (unsigned long long) runtime_->device_cache_evictions,
@@ -1073,6 +1079,10 @@ bool MoeHybridStreamEngine::stage_expert_async(int layer, int expert_id,
         return false;
     }
     Runtime::DeviceSlot & dst = runtime_->device_slots[(size_t) device_slot];
+    if (dst.pinned) {
+        if (err) *err = "SSD device slot is pinned by the warm expert set";
+        return false;
+    }
     if (dst.compute_users != 0) {
         if (err) *err = "SSD device slot is still in use by expert compute";
         return false;
@@ -1092,6 +1102,7 @@ bool MoeHybridStreamEngine::stage_expert_async(int layer, int expert_id,
     }
     dst.valid = false;
     dst.cache_managed = false;
+    dst.pinned = false;
     dst.key = {};
     dst.layout = MoeExpertIoLayout{};
     dst.device_layout = Runtime::DeviceExpertLayout{};
@@ -1255,7 +1266,8 @@ bool MoeHybridStreamEngine::stage_expert_cached_async(
         uint64_t best_score = std::numeric_limits<uint64_t>::max();
         for (size_t i = 0; i < runtime_->device_slots.size(); ++i) {
             const Runtime::DeviceSlot & slot = runtime_->device_slots[i];
-            if (!slot.valid || slot.pending || slot.compute_users != 0) continue;
+            if (!slot.valid || slot.pending || slot.pinned ||
+                slot.compute_users != 0) continue;
             const uint64_t age = runtime_->device_clock >= slot.last_touch
                 ? runtime_->device_clock - slot.last_touch : 0;
             const uint64_t recency = age < 65535 ? 65535 - age : 0;
@@ -1341,6 +1353,109 @@ int MoeHybridStreamEngine::device_slot_count() const {
 
 size_t MoeHybridStreamEngine::device_cache_bytes() const {
     return runtime_ ? runtime_->device_pool_bytes : 0;
+}
+
+size_t MoeHybridStreamEngine::pinned_expert_count() const {
+    return runtime_ ? runtime_->pinned_experts : 0;
+}
+
+bool MoeHybridStreamEngine::warm_and_pin_device_cache(
+        const std::vector<MoeStreamExpertSpec> & layer_specs,
+        const std::vector<MoeStreamCacheWarmEntry> & entries,
+        int reserve_slots,
+        MoeStreamCacheWarmStats * stats,
+        std::string * err) {
+    MoeStreamCacheWarmStats local;
+    local.requested = entries.size();
+    if (stats) *stats = local;
+    if (!is_bound()) {
+        if (err) *err = "cannot warm an unbound streamed expert cache";
+        return false;
+    }
+    reserve_slots = std::max(2, reserve_slots);
+
+    std::lock_guard<std::mutex> compute_guard(runtime_->compute_mutex);
+    ScopedGpuDevice device_scope(runtime_->device);
+    if (!device_scope.ready()) {
+        if (err) *err = "failed to select streamed cache GPU for warmup";
+        return false;
+    }
+
+    std::vector<MoeStreamCacheWarmEntry> candidates = entries;
+    std::stable_sort(candidates.begin(), candidates.end(),
+        [](const MoeStreamCacheWarmEntry & a,
+           const MoeStreamCacheWarmEntry & b) {
+            if (a.frequency != b.frequency) return a.frequency > b.frequency;
+            if (a.layer != b.layer) return a.layer < b.layer;
+            return a.expert < b.expert;
+        });
+    std::unordered_set<uint64_t> seen;
+    std::vector<MoeStreamCacheWarmEntry> unique;
+    unique.reserve(candidates.size());
+    for (const MoeStreamCacheWarmEntry & candidate : candidates) {
+        if (candidate.layer < 0 || candidate.expert < 0 ||
+            (size_t) candidate.layer >= layer_specs.size()) {
+            if (err) *err = "streamed cache warm entry is out of range";
+            return false;
+        }
+        const uint64_t key = device_key(candidate.layer, candidate.expert);
+        if (seen.insert(key).second) unique.push_back(candidate);
+    }
+
+    // Establish every backend-padded layer layout before loading data. If one
+    // format needs a larger device stride, the cache is resized once while it
+    // is still empty instead of invalidating an already-warmed prefix.
+    std::unordered_set<int32_t> prepared_layers;
+    for (const MoeStreamCacheWarmEntry & candidate : unique) {
+        if (!prepared_layers.insert(candidate.layer).second) continue;
+        if (!prepare_device_expert_layout(
+                *runtime_, candidate.layer,
+                layer_specs[(size_t) candidate.layer], err)) {
+            return false;
+        }
+    }
+
+    const size_t slot_count = runtime_->device_slots.size();
+    const size_t pin_capacity = slot_count > (size_t) reserve_slots
+        ? slot_count - (size_t) reserve_slots : 0;
+    for (const MoeStreamCacheWarmEntry & candidate : unique) {
+        const uint64_t key = device_key(candidate.layer, candidate.expert);
+        auto found = runtime_->device_index.find(key);
+        if (found != runtime_->device_index.end()) {
+            const int slot_index = found->second;
+            if (slot_index >= 0 && slot_index < (int) slot_count) {
+                Runtime::DeviceSlot & resident =
+                    runtime_->device_slots[(size_t) slot_index];
+                if (resident.valid && resident.pinned) {
+                    ++local.already_resident;
+                    continue;
+                }
+            }
+        }
+        if (runtime_->pinned_experts >= pin_capacity) {
+            ++local.capacity_drops;
+            continue;
+        }
+
+        const bool was_resident = found != runtime_->device_index.end();
+        int device_slot = -1;
+        if (!stage_expert_cached_async(
+                candidate.layer, candidate.expert, &device_slot, err) ||
+            !activate_device_slot(device_slot, err)) {
+            if (stats) *stats = local;
+            return false;
+        }
+        release_device_slot(device_slot);
+        Runtime::DeviceSlot & slot =
+            runtime_->device_slots[(size_t) device_slot];
+        slot.pinned = true;
+        slot.frequency = std::max<uint64_t>(slot.frequency, 2);
+        ++runtime_->pinned_experts;
+        ++local.admitted;
+        if (was_resident) ++local.already_resident;
+    }
+    if (stats) *stats = local;
+    return true;
 }
 
 ggml_backend_t MoeHybridStreamEngine::compute_backend() const {
@@ -2002,6 +2117,22 @@ uint32_t stream_owner_hash(int layer, int expert) {
 
 } // namespace
 
+bool moe_stream_primary_owns_expert(
+        const MoeStreamDualOwnerPolicy & policy,
+        int layer,
+        int expert) {
+    if (layer < 0 || expert < 0 ||
+        policy.primary_share_per_mille < 0 ||
+        policy.primary_share_per_mille > 1000) {
+        return false;
+    }
+    if (policy.primary_placement) {
+        return policy.primary_placement->is_hot(layer, expert);
+    }
+    return stream_owner_hash(layer, expert) % 1000U <
+           (uint32_t) policy.primary_share_per_mille;
+}
+
 bool partition_moe_stream_routes(
         const MoeStreamRouteBatch & batch,
         const MoeStreamDualOwnerPolicy & policy,
@@ -2049,15 +2180,8 @@ bool partition_moe_stream_routes(
             return false;
         }
         if (owner[(size_t) expert] >= 0) continue;
-        bool primary_owner = false;
-        if (policy.primary_placement) {
-            primary_owner = policy.primary_placement->is_hot(
-                batch.layer, expert);
-        } else {
-            primary_owner =
-                stream_owner_hash(batch.layer, expert) % 1000U <
-                (uint32_t) policy.primary_share_per_mille;
-        }
+        const bool primary_owner = moe_stream_primary_owns_expert(
+            policy, batch.layer, expert);
         owner[(size_t) expert] = primary_owner ? 1 : 0;
         unique_experts.push_back(expert);
         if (primary_owner) ++primary_experts;

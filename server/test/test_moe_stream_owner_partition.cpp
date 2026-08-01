@@ -1,5 +1,6 @@
 #include "CppUnitTestFramework.hpp"
 #include "../src/common/moe_hybrid_stream.h"
+#include "../src/common/moe_stream_cache_policy.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -135,4 +136,54 @@ TEST_CASE(MoeStreamOwnerPartitionFixture,
     policy.primary_placement = &mismatch;
     REQUIRE(!partition_moe_stream_routes(
         batch, policy, primary, secondary, nullptr, &error));
+}
+
+TEST_CASE(MoeStreamOwnerPartitionFixture,
+          warm_cache_plan_is_value_ranked_and_owner_disjoint) {
+    MoeHybridRoutingStats routing;
+    REQUIRE(routing.init(2, 4, 2));
+    routing.counts = {
+        100, 40, 20, 10,
+         80, 70, 60, 50,
+    };
+    routing.layer_totals = {170, 260};
+
+    MoeHybridPlacement placement;
+    placement.n_layer = 2;
+    placement.n_expert = 4;
+    placement.n_expert_used = 2;
+    placement.total_hot = 4;
+    placement.hot_counts = {2, 2};
+    placement.hot_expert_ids = {{0, 2}, {1, 3}};
+    MoeStreamDualOwnerPolicy owner_policy;
+    owner_policy.primary_placement = &placement;
+
+    MoeStreamCachePlanConfig config;
+    config.max_entries = 3;
+    config.max_bytes = 400;
+    config.owner = MoeStreamCacheOwner::Primary;
+    std::vector<MoeStreamCacheWarmEntry> primary;
+    std::string error;
+    REQUIRE(build_moe_stream_cache_plan(
+        routing, {100, 200}, config, &owner_policy,
+        primary, &error));
+    REQUIRE(primary.size() == 3);
+    REQUIRE(primary[0].layer == 0 && primary[0].expert == 0);
+    REQUIRE(primary[1].layer == 1 && primary[1].expert == 1);
+    REQUIRE(primary[2].layer == 0 && primary[2].expert == 2);
+
+    config.owner = MoeStreamCacheOwner::Secondary;
+    std::vector<MoeStreamCacheWarmEntry> secondary;
+    REQUIRE(build_moe_stream_cache_plan(
+        routing, {100, 200}, config, &owner_policy,
+        secondary, &error));
+    REQUIRE(!secondary.empty());
+    for (const MoeStreamCacheWarmEntry & entry : primary) {
+        REQUIRE(moe_stream_primary_owns_expert(
+            owner_policy, entry.layer, entry.expert));
+    }
+    for (const MoeStreamCacheWarmEntry & entry : secondary) {
+        REQUIRE(!moe_stream_primary_owns_expert(
+            owner_policy, entry.layer, entry.expert));
+    }
 }

@@ -436,6 +436,76 @@ void run_mxfp4_padding_case(ggml_backend_t backend) {
     engine.destroy();
 }
 
+void run_pinned_cache_case(ggml_backend_t backend) {
+    std::vector<float> gate;
+    std::vector<float> up;
+    std::vector<float> down;
+    fill_weights(gate, up, down);
+    ModelBytes model = make_model_bytes(false, gate, up, down);
+    TempFile file(model.file);
+
+    MoeHybridStorage storage;
+    storage.mmap_size = model.file.size();
+    storage.mmap_fd = ::dup(file.fd);
+    STREAM_REQUIRE(storage.mmap_fd >= 0);
+    // A second logical layer gives the eviction test more unique cache keys
+    // without making the synthetic weight file larger.
+    storage.layer_regions = {model.regions, model.regions};
+
+    MoeStreamConfig config;
+    config.device_slots = 3;
+    config.device_cache_bytes = 0;
+    config.graph_cache_entries = 0;
+    config.nvme.backend = MoeNvmeBackend::ThreadPool;
+    config.nvme.direct_io = MoeNvmeDirectMode::Disabled;
+    config.nvme.host_slots = 6;
+    config.nvme.io_threads = 2;
+
+    MoeHybridStreamEngine engine;
+    std::string error;
+    STREAM_REQUIRE(engine.init(
+        backend, model.slot_bytes, storage, config, &error));
+    STREAM_REQUIRE(engine.device_slot_count() == 3);
+
+    MoeStreamExpertSpec spec;
+    spec.input_dim = kInput;
+    spec.intermediate_dim = kFf;
+    spec.output_dim = kOutput;
+    spec.gate_type = GGML_TYPE_F32;
+    spec.up_type = GGML_TYPE_F32;
+    spec.down_type = GGML_TYPE_F32;
+    spec.gated_activation = MoeGatedActivation::Situ;
+
+    const std::vector<MoeStreamExpertSpec> layer_specs = {spec, spec};
+    const std::vector<MoeStreamCacheWarmEntry> warm = {
+        {0, 0, 100, model.slot_bytes},
+    };
+    MoeStreamCacheWarmStats warm_stats;
+    STREAM_REQUIRE(engine.warm_and_pin_device_cache(
+        layer_specs, warm, 2, &warm_stats, &error));
+    STREAM_REQUIRE(warm_stats.admitted == 1);
+    STREAM_REQUIRE(engine.pinned_expert_count() == 1);
+
+    auto touch = [&](int layer, int expert) {
+        int slot = -1;
+        STREAM_REQUIRE(engine.stage_expert_cached_async(
+            layer, expert, &slot, &error));
+        STREAM_REQUIRE(engine.activate_device_slot(slot, &error));
+        engine.release_device_slot(slot);
+    };
+    // Only two slots are evictable. Four distinct cold keys force churn.
+    touch(0, 1);
+    touch(0, 2);
+    touch(1, 0);
+    touch(1, 1);
+
+    const uint64_t requests_before_hot_reuse = engine.io_stats().requests;
+    touch(0, 0);
+    STREAM_REQUIRE(engine.io_stats().requests == requests_before_hot_reuse);
+    STREAM_REQUIRE(engine.pinned_expert_count() == 1);
+    engine.destroy();
+}
+
 } // namespace
 
 TEST_CASE(MoeStreamComputeFixture, persistent_graph_matches_cpu_and_padded_mxfp4) {
@@ -455,5 +525,6 @@ TEST_CASE(MoeStreamComputeFixture, persistent_graph_matches_cpu_and_padded_mxfp4
     run_layout_case(backend, false);
     run_layout_case(backend, true);
     run_mxfp4_padding_case(backend);
+    run_pinned_cache_case(backend);
     ggml_backend_free(backend);
 }

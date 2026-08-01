@@ -173,6 +173,50 @@ Kimi's native router remains authoritative. The current text backend is
 correctness-first and sequential; captured per-layer graphs and the vision
 tower are separate optimizations.
 
+### Expert-major package and profile-guided cache
+
+Standard split GGUF stores gate/up/down expert tensors in separate ranges, so
+one cache miss normally needs three SSD reads. Kimi can compile the routed
+bytes once into a self-describing expert-major package. This is a byte-exact
+layout transform: it changes neither quantization nor model output, and one
+aligned expert record replaces the three reads.
+
+```bash
+export DFLASH_MOE_EXPERT_PACKAGE=/fast-nvme/Kimi-K3.lbmoe
+export DFLASH_MOE_EXPERT_PACKAGE_BUILD=1
+
+./build-hip/dflash_server \
+  /models/Kimi-K3-UD-IQ1_S-00001-of-00014.gguf \
+  --target-device hip:0 --max-ctx 8192
+```
+
+The one-time build streams source shards and reports completed layers. It
+needs free disk roughly equal to the routed expert weights. A process-unique
+temporary file is synced and atomically published only after its package magic
+is valid, so an interrupted build never replaces a working artifact. On later
+starts, unset `DFLASH_MOE_EXPERT_PACKAGE_BUILD`; `force` explicitly rebuilds
+an existing artifact. The loader validates model shape and source-layout
+fingerprint plus deterministic weight samples before using it, so a same-shape
+package from another checkpoint also fails closed.
+
+For stable workloads, a short representative run can record native-router
+counts, and the next run can pin the highest observed value-per-byte experts:
+
+```bash
+# Profiling run: ordinary adaptive cache, native routes unchanged.
+export DFLASH_MOE_ROUTE_STATS_OUT=/models/kimi-routes.csv
+
+# Deployment run: warm and pin the profile-selected experts.
+unset DFLASH_MOE_ROUTE_STATS_OUT
+export DFLASH_MOE_HOTNESS_CSV=/models/kimi-routes.csv
+```
+
+At least one quarter of each device cache (and never fewer than two slots)
+remains adaptive for profile drift and misses. With two GPUs, the same runtime
+ownership rule filters both warm plans, so an expert is never pinned on both
+R9700 and Strix. A missing profile simply retains the adaptive LFRU cache;
+prediction is not required for correctness.
+
 On a two-GPU Lucebox, put the compute-intensive primary path on the R9700 and
 use Strix as the secondary capacity owner. Both devices receive independent
 SSD slots/caches and execute their selected routed experts concurrently:
@@ -216,6 +260,10 @@ not improve the qualified P310 drive and consumes extra pinned/system memory.
 | `DFLASH_MOE_NVME_DEVICE_CACHE_MB` | automatic/`0` | Override adaptive device expert-cache memory; `0` leaves only pipeline slots |
 | `DFLASH_MOE_NVME_GRAPH_CACHE` | `8` | Persistent expert-graph variants retained per stream engine; `0` is a diagnostic no-cache mode |
 | `DFLASH_MOE_NVME_REFERENCE_EVAL` | unset | Diagnostic only: `1` restores the allocation-heavy reference evaluator for numerical/performance A/B |
+| `DFLASH_MOE_EXPERT_PACKAGE` | unset | Optional validated expert-major package used in place of tensor-major GGUF expert regions |
+| `DFLASH_MOE_EXPERT_PACKAGE_BUILD` | unset | One-time Kimi package creation: `1` builds when absent; `force` rebuilds |
+| `DFLASH_MOE_ROUTE_STATS_OUT` | unset | Record Kimi native-router counts as a reusable model-neutral CSV profile |
+| `DFLASH_MOE_HOTNESS_CSV` | unset | Warm and pin the highest-value experts from a compatible routing profile |
 | `DFLASH_MOE_TP_GPU` | primary GPU | Optional secondary GPU; enables concurrent route ownership when different from the primary |
 | `DFLASH_MOE_PLACEMENT` | unset | Offline placement JSON; listed experts belong to the primary GPU |
 | `DFLASH_MOE_PRIMARY_SHARE_PER_MILLE` | `500` | Bring-up hash split used only when no placement is supplied |
@@ -230,7 +278,8 @@ only when it covers the complete logical payload at an unaligned file tail.
 tiny experts and checks both tensor-major and expert-major GPU results against
 a CPU oracle. It defaults to GPU 0, so it runs directly on Strix-only systems;
 `DFLASH_TEST_GPU` selects another device on multi-GPU hosts. The standalone
-targets `test_moe_nvme_scheduler`, `bench_moe_nvme_io`, and
+targets `test_moe_nvme_scheduler`, `test_moe_expert_package`,
+`bench_moe_nvme_io`, and
 `bench_moe_nvme_pipeline` test scheduling, raw storage, and the complete
 SSD-to-GPU path. Benchmarks are read-only.
 
@@ -303,8 +352,9 @@ that leaves the native router untouched. MoE-SpAc motivates compile-time
 expert layout and I/O coalescing. Tutti's slack-aware `io_uring` scheduling is
 relevant when persistent KV traffic shares the device.
 
-The persistent graph, model-neutral evaluator, and exact concurrent owner
-split are now shared infrastructure. The next high-value work is a repacked
-expert-major artifact and a device-resident fork/join that removes Kimi's host
-activation boundary. Any learned predictor comes after that deterministic path
-is qualified, and may only prefetch routes selected later by the native router.
+The persistent graph, model-neutral evaluator, exact concurrent owner split,
+expert-major package, and profile-guided pinned cache are now shared
+infrastructure. The next high-value work is a device-resident fork/join that
+removes Kimi's host activation boundary. Any learned predictor comes after
+that deterministic path is qualified, and may only prefetch routes selected
+later by the native router.

@@ -312,6 +312,8 @@ add_library(dflash_common STATIC
     src/common/spark_corpus.cpp
     src/common/moe_hybrid_ffn_eval.cpp
     src/common/moe_nvme_scheduler.cpp
+    src/common/moe_expert_package.cpp
+    src/common/moe_stream_cache_policy.cpp
     src/common/moe_hybrid_stream.cpp
     src/common/moe_expert_compute.cpp
     src/common/moe_expert_compute_cpu.cpp
@@ -693,6 +695,20 @@ if(DFLASH27B_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
         target_link_libraries(test_moe_nvme_scheduler PRIVATE Threads::Threads)
         list(APPEND _raw_unit_test_targets test_moe_nvme_scheduler)
+    endif()
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_moe_expert_package.cpp")
+        add_executable(test_moe_expert_package
+            test/test_unit_main.cpp
+            test/test_moe_expert_package.cpp
+            src/common/moe_expert_package.cpp
+            src/common/moe_nvme_scheduler.cpp)
+        target_include_directories(test_moe_expert_package PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/common
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
+        target_link_libraries(test_moe_expert_package PRIVATE Threads::Threads)
+        list(APPEND _raw_unit_test_targets test_moe_expert_package)
     endif()
 
     # Read-only microbenchmark for tuning the exact expert I/O path on the

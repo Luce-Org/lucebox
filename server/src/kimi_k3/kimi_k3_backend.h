@@ -1,12 +1,14 @@
 #pragma once
 
 #include "common/model_backend.h"
+#include "common/moe_hybrid_routing_stats.h"
 #include "common/moe_hybrid_stream.h"
 #include "common/moe_storage_policy.h"
 #include "kimi_k3_internal.h"
 #include "placement/placement_config.h"
 
 #include <random>
+#include <memory>
 #include <string>
 
 namespace dflash::common {
@@ -56,6 +58,7 @@ public:
 private:
     bool init_streaming();
     void release_expert_backend();
+    void maybe_save_routing_stats();
 
     int32_t choose_token(const std::vector<float> & logits,
                          const SamplerCfg & sampler,
@@ -72,6 +75,8 @@ private:
     MoeStreamDualOwnerExecutor dual_stream_executor_;
     MoeHybridPlacement stream_placement_;
     MoeStreamDualOwnerPolicy stream_owner_policy_;
+    std::shared_ptr<MoeHybridRoutingStats> routing_stats_;
+    std::string routing_stats_out_path_;
     bool parked_ = false;
     std::mt19937_64 rng_{std::random_device{}()};
 };

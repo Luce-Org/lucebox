@@ -35,6 +35,8 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `DFLASH_MOE_STORAGE` | auto | Routed-MoE storage policy (`auto`, `resident`, `ssd`); prefer `--moe-storage`, which takes precedence. |
 | `DFLASH_MOE_NVME_COLD_TIER` | unset | DEPRECATED: DeepSeek compatibility alias (`auto`, `on`, `off`). |
 | `DFLASH_MOE_NVME_*` | tuned defaults | BURN-IN: bounded MoE SSD scheduler/backend controls; see `MOE_NVME_STREAMING.md`. |
+| `DFLASH_MOE_EXPERT_PACKAGE` / `DFLASH_MOE_EXPERT_PACKAGE_BUILD` | unset | BURN-IN: use or explicitly build a validated, byte-exact expert-major SSD package. |
+| `DFLASH_MOE_ROUTE_STATS_OUT` / `DFLASH_MOE_HOTNESS_CSV` | unset | BURN-IN: capture native route counts, then profile-warm and pin valuable streamed experts. |
 | `GGML_CUDA_BATCH_PEER_COPIES` | unset | BURN-IN: publish ordered HIP peer copies with one cross-device dependency per source/destination pair. |
 | `DFLASH_MOE_PREFILL_PERSISTENT_OWNER_ALLOC` | 1 for qualified long heterogeneous prefill | KILL SWITCH: =0 restores per-layer route/owner scratch allocation. |
 | `DFLASH_MOE_TP_*` / `DFLASH_MOE_HYBRID_PREFILL_EAGER` | unset | BURN-IN: model-neutral names for common heterogeneous-MoE scheduling and kernel policy. Existing `DFLASH_DS4_*` names remain compatibility aliases. |
@@ -175,18 +177,22 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_MOE_EXPERT_COMPUTE_IPC_SHARED_BYTES` - moe_expert_compute_ipc.cpp
 - `DFLASH_MOE_EXPERT_COMPUTE_IPC_TRANSPORT` - moe_expert_compute_ipc.cpp
 - `DFLASH_MOE_EXPERT_COMPUTE_THREADS` - moe_expert_compute_cpu.cpp
+- `DFLASH_MOE_EXPERT_PACKAGE` - kimi_k3_backend.cpp
+- `DFLASH_MOE_EXPERT_PACKAGE_BUILD` - kimi_k3_backend.cpp
 - `DFLASH_MOE_EXPERT_MAJOR_GPU_REDUCE` - moe_hybrid_ffn_eval.cpp
 - `DFLASH_MOE_EXPERT_MAJOR_PREFILL` - moe_hybrid_ffn_eval.cpp
 - `DFLASH_MOE_FIXED_SLOT_GRAPHS` - moe_hybrid_ffn_eval.cpp
 - `DFLASH_MOE_FIXED_SLOT_MAX` - moe_hybrid_ffn_eval.cpp
 - `DFLASH_MOE_FULL_COLD_PARALLEL` - moe_hybrid_ffn_eval.cpp
 - `DFLASH_MOE_FUSED_COMBINE` - moe_hybrid_ffn_eval.cpp
+- `DFLASH_MOE_HOTNESS_CSV` - kimi_k3_backend.cpp
 - `DFLASH_MOE_PLACEMENT` - kimi_k3_backend.cpp
 - `DFLASH_MOE_PREFILL_DEVICE_INPUT` - deepseek4_graph.cpp
 - `DFLASH_MOE_PREFILL_HOT_SUB_BATCH` - moe_hybrid_ffn_eval.cpp
 - `DFLASH_MOE_PREFILL_MASKED_COLD` - moe_hybrid_ffn_eval.cpp
 - `DFLASH_MOE_PREFILL_PERSISTENT_OWNER_ALLOC` - deepseek4_graph.cpp
 - `DFLASH_MOE_PRIMARY_SHARE_PER_MILLE` - moe_hybrid_stream.cpp
+- `DFLASH_MOE_ROUTE_STATS_OUT` - kimi_k3_backend.cpp
 - `DFLASH_NO_MASK` - laguna_backend.cpp
 - `DFLASH_NO_MOE_ROUTER_FUSE` - qwen35moe_ffn.cpp
 - `DFLASH_NO_MOE_SWIGLU_FUSE` - qwen35moe_ffn.cpp

@@ -79,13 +79,14 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release
           cmake --build build --target \
             test_dflash test_generate test_flash_attn_sparse test_server_unit \
-            test_deepseek4_unit test_moe_nvme_scheduler -j$(nproc)
+            test_deepseek4_unit test_moe_nvme_scheduler \
+            test_moe_expert_package -j$(nproc)
 
       - name: Run C++ server unit tests
         run: |
           cd server/build
           ctest --output-on-failure \
-            -R "server_unit|deepseek4_unit|test_moe_nvme_scheduler" \
+            -R "server_unit|deepseek4_unit|test_moe_nvme_scheduler|test_moe_expert_package" \
             --no-tests=error
 
       - name: Populate venv with cu128 torch + setuptools
@@ -177,6 +178,7 @@ jobs:
           cmake --build build \
             --target test_flash_attn_sparse test_deepseek4_mmid_grouped_cuda \
               test_moe_stream_compute test_moe_nvme_scheduler \
+              test_moe_expert_package \
             -j"$(nproc)"
 
       - name: Run flash-attn sparse kernel test on the 3090
@@ -191,7 +193,9 @@ jobs:
         run: ./server/build/test_moe_stream_compute
 
       - name: Run NVMe scheduler production tests
-        run: ./server/build/test_moe_nvme_scheduler
+        run: |
+          ./server/build/test_moe_nvme_scheduler
+          ./server/build/test_moe_expert_package
 
       # Optional model-backed end-to-end smoke (real spec-decode on the 3090),
       # disabled by default because it builds dflash_server and lazy-loads the
@@ -300,11 +304,12 @@ jobs:
           cmake --build "$RUNNER_TEMP/rocmfp-build" \
             --target test_rocmfp4 test_rocmfpx test_rocmfp4_hip_tail test_rocmfpx_mmq \
               test_deepseek4_mmid_grouped_cuda test_moe_stream_compute \
-              test_moe_nvme_scheduler test_recurrent_snapshot test_server_unit \
+              test_moe_nvme_scheduler test_moe_expert_package \
+              test_recurrent_snapshot test_server_unit \
             --parallel 8
           ctest --test-dir "$RUNNER_TEMP/rocmfp-build" \
             --output-on-failure \
-            -R 'rocmfp4_reference|rocmfpx_reference|rocmfp4_hip_tail|rocmfpx_mmq|deepseek4_mmid_grouped_cuda|test_moe_stream_compute|test_moe_nvme_scheduler|recurrent_snapshot|ChainRollbackPolicy'
+            -R 'rocmfp4_reference|rocmfpx_reference|rocmfp4_hip_tail|rocmfpx_mmq|deepseek4_mmid_grouped_cuda|test_moe_stream_compute|test_moe_nvme_scheduler|test_moe_expert_package|recurrent_snapshot|ChainRollbackPolicy'
 
   build-windows:
     name: Build Windows (MSVC + CUDA, library + server targets)
