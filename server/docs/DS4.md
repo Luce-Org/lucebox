@@ -405,8 +405,8 @@ The wider MMVQ ceiling avoids the slow small-matrix crossover, while nine slots
 hold the recurring compressor phases without steady graph rebuilds. The x4+1
 kernel decodes shared weights through the existing four-column vector path and
 retains the original scalar accumulation for the fifth verifier column.
-Explicit environment values still take priority. The nine-slot profile peaked
-at 28.481 GiB on the reported 31.86 GiB R9700 and must be requalified on
+Explicit environment values still take priority. The hot-36 full sweep peaked
+at 30.561 GiB on the reported 31.86 GiB R9700 and must be requalified on
 smaller devices.
 
 The exact qualification launch used:
@@ -418,12 +418,28 @@ export DFLASH_EXPERT_BUDGET_MB=13200 # 36 hot experts/layer on this profile
 export DFLASH_DS4_HOTNESS_CSV=/path/to/ds4_moe_tp_hotness.csv
 ```
 
+The checked-in wrapper reproduces the full exact-context protocol and records
+the manifest, response hashes, server log, ROCm state, and a two-second VRAM
+trace:
+
+```bash
+TARGET_MODEL=/path/to/target.gguf \
+DRAFT_MODEL=/path/to/dspark-draft.gguf \
+HOTNESS_CSV=/path/to/ds4_moe_tp_hotness.csv \
+server/scripts/qualify_ds4_q5_amd.sh
+```
+
+Its q=5 MMVQ width, verifier slots, and x4+1 controls default to `auto`, so the
+run also verifies the platform defaults. `EXPECTED_SHA256` can override the
+qualified deterministic-workload hash when intentionally testing another
+compatible artifact.
+
 At temperature zero, all 25 requests in the 2K -> 4K -> 8K -> 16K -> 2K
-burn-in produced the same expected response hash. Measured medians were 64.212,
-62.428, 59.267, and 53.750 tok/s before the expert-budget follow-up. Two 2K
-runs with 36 hot experts/layer measured 64.846 and 64.775 tok/s, with a 29.905
-GiB observed peak. Treat these as workload-specific burn-in measurements, not
-as a portable default for unrelated AMD memory layouts.
+burn-in produced the same expected response hash. With the automatic q=5
+MMVQ/cache/kernel defaults and the explicit hot-36 hardware profile, measured
+medians were 67.957, 65.927, 62.544, 56.335, and 67.458 tok/s. Treat these as
+workload-specific burn-in measurements, not as a portable default for unrelated
+AMD memory layouts.
 
 On HIP `gfx1151`, enabling DSpark defaults `LUCE_MMVQ_MAX_NCOLS` to `4` when
 the variable is unset. This keeps the four-row verifier on MMVQ. On a 128 GiB
