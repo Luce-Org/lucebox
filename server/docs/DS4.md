@@ -282,7 +282,8 @@ The runtime logs the chosen split with a `[deepseek4-split] auto-split:` banner.
 | `DFLASH_EXPERT_BUDGET_MB` | Main-GPU memory budget for hot experts. |
 | `DFLASH_DS4_HOTNESS_CSV` | Optional per-layer routing profile for hot placement. |
 | `GGML_BATCH_PEER_COPIES` | Batch peer-runtime copies and unlike-runtime pinned-host staging with one source wait per split. The old `GGML_CUDA_BATCH_PEER_COPIES` spelling remains an alias. |
-| `DFLASH_DS4_TP_FUSED_CACHE_SLOTS` | Number of heterogeneous verifier graph slots. Defaults to `2`; each slot retains scheduler scratch on both GPUs. |
+| `DFLASH_DS4_Q5_VERIFY` | Opt in to the AMD q=5 fused verifier. This also selects the qualified MMVQ width and verifier-cache defaults when they are not explicitly overridden. |
+| `DFLASH_DS4_TP_FUSED_CACHE_SLOTS` | Number of heterogeneous verifier graph slots. Defaults to `2` for q<=4 and `9` for the opt-in q=5 verifier; each slot retains scheduler scratch on both GPUs. |
 | `DFLASH_DS4_VERIFY_FORCE_GRAPH_REPLAY` | Skip the expensive property scan only for a warmed verifier graph. Rebuilt scheduler generations are always validated. Leave unset for the conservative production profile. |
 | `GGML_DS4_FA_SERIAL_INDEX_SCAN` | Restore the serial compressed-row mask scan for an indexed-attention A/B. By default, HIP scans contexts above 512 compressed rows in parallel. |
 | `DFLASH_MOE_PREFILL_PERSISTENT_OWNER_ALLOC` | Long-prefill arena kill switch; set `0` to restore per-layer owner allocation. |
@@ -388,6 +389,36 @@ The required burn-in sequence is repeated requests at 2K, 4K, 8K, and 16K in
 one process, followed by another 2K request to force additional eviction. Run
 with `DFLASH_DS4_TP_FUSED_CACHE_SLOTS=2`; first qualify with forced replay
 unset, then repeat with it enabled as a separate performance A/B.
+
+### Experimental AMD q=5 verifier
+
+`DFLASH_DS4_Q5_VERIFY=1` enables a five-row fused verifier on HIP. It handles
+the shape that crosses two ratio-4 compressor boundaries, preserves five raw
+SWA rows for rollback, and restores plus replays only the accepted prefix after
+a partial rejection. q<=4 behavior is unchanged when the flag is absent.
+
+On the qualified R9700 + Strix Halo profile, leaving the two related controls
+unset selects `LUCE_MMVQ_MAX_NCOLS=5` and nine heterogeneous verifier slots.
+The wider MMVQ ceiling avoids the slow small-matrix crossover, while nine slots
+hold the recurring compressor phases without steady graph rebuilds. Explicit
+environment values still take priority. The nine-slot profile peaked at 28.481
+GiB on the reported 31.86 GiB R9700 and must be requalified on smaller devices.
+
+The exact qualification launch used:
+
+```bash
+export DFLASH_DS4_Q5_VERIFY=1
+export DFLASH_DS4_SPEC_Q=5
+export DFLASH_EXPERT_BUDGET_MB=13200 # 36 hot experts/layer on this profile
+export DFLASH_DS4_HOTNESS_CSV=/path/to/ds4_moe_tp_hotness.csv
+```
+
+At temperature zero, all 25 requests in the 2K -> 4K -> 8K -> 16K -> 2K
+burn-in produced the same expected response hash. Measured medians were 64.212,
+62.428, 59.267, and 53.750 tok/s before the expert-budget follow-up. Two 2K
+runs with 36 hot experts/layer measured 64.846 and 64.775 tok/s, with a 29.905
+GiB observed peak. Treat these as workload-specific burn-in measurements, not
+as a portable default for unrelated AMD memory layouts.
 
 On HIP `gfx1151`, enabling DSpark defaults `LUCE_MMVQ_MAX_NCOLS` to `4` when
 the variable is unset. This keeps the four-row verifier on MMVQ. On a 128 GiB
