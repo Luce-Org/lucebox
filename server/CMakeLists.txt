@@ -400,6 +400,7 @@ add_library(dflash_common STATIC
     # Kimi-K3 hybrid KDA/MLA + latent-MoE target arch
     src/kimi_k3/kimi_k3_loader.cpp
     src/kimi_k3/kimi_k3_graph.cpp
+    src/kimi_k3/kimi_k3_dflash_target.cpp
     src/kimi_k3/kimi_k3_backend.cpp
     src/flashprefill_q8.cpp
     src/kv_cache.cpp

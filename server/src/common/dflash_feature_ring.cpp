@@ -520,14 +520,29 @@ bool copy_host_capture_slice_to_draft_ring(
     const size_t expected = (size_t)n_tokens * (size_t)hidden;
     if (host_elems != expected) return false;
     const size_t dst_stride = feature_ring.target_feat->nb[1];
-    const size_t row_bytes = (size_t)hidden * sizeof(float);
+    const size_t row_bytes =
+        ggml_row_size(feature_ring.storage_type, hidden);
+    std::vector<uint8_t> converted;
+    if (feature_ring.storage_type != GGML_TYPE_F32) {
+        converted.resize(row_bytes);
+    }
     for (int i = 0; i < n_tokens; ++i) {
         const int slot = (start_pos + i) % feature_ring.cap;
         const float * src = host + (size_t)i * (size_t)hidden;
+        const void * row = src;
+        if (!converted.empty()) {
+            if (!host_f32_to_feature_row(
+                    feature_ring.storage_type, src,
+                    converted.data(), static_cast<size_t>(hidden))) {
+                return false;
+            }
+            row = converted.data();
+        }
         const size_t dst_offset =
             (size_t)slot * dst_stride +
-            (size_t)capture_idx * (size_t)hidden * sizeof(float);
-        ggml_backend_tensor_set(feature_ring.target_feat, src, dst_offset, row_bytes);
+            (size_t)capture_idx * row_bytes;
+        ggml_backend_tensor_set(
+            feature_ring.target_feat, row, dst_offset, row_bytes);
     }
     return true;
 }

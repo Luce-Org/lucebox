@@ -62,6 +62,11 @@ struct DFlashTarget {
     // When true, verify_batch captures intermediates and rollback_to() works.
     virtual bool supports_fast_rollback() const { return false; }
 
+    // Cost hint for targets where applying captured recurrent transitions is
+    // always cheaper than restoring and replaying the accepted tokens.  The
+    // default preserves the shared acceptance-threshold policy.
+    virtual bool prefer_fast_rollback_over_replay() const { return false; }
+
     // Roll back recurrent state to position `commit_n` within the last
     // verify batch (0-indexed). Uses SSM intermediate states captured during
     // verify. Also truncates KV to `base_pos + commit_n`. No replay needed.
@@ -184,6 +189,13 @@ struct DFlashTarget {
     // Which target layers to capture intermediate activations from.
     // The draft model's fc layer expects exactly this many feature slices.
     virtual const std::vector<int> & capture_layer_ids() const = 0;
+
+    // Optional cost hint for adaptive speculative verification.  Zero keeps
+    // the shared runtime default.  Targets whose extra verify rows trigger
+    // expensive external-memory traffic can return a smaller floor without
+    // putting model- or storage-specific policy in the common decode loop.
+    // DFLASH_ADAPTIVE_WIDTH_MIN remains an explicit runtime override.
+    virtual int default_adaptive_verify_min_rows() const { return 0; }
 };
 
 } // namespace dflash::common

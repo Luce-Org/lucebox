@@ -3,8 +3,10 @@
 #endif
 
 #include "kimi_k3_backend.h"
+#include "kimi_k3_dflash_target.h"
 
 #include "common/dynamic_backend.h"
+#include "common/dflash_spec_decode.h"
 #include "common/moe_expert_package.h"
 #include "common/moe_hybrid_placement.h"
 #include "common/moe_stream_cache_policy.h"
@@ -38,6 +40,8 @@
 
 namespace dflash::common {
 namespace {
+
+constexpr int kMaxDsparkBlockSize = 16;
 
 void close_file_descriptor(int fd) {
 #if defined(_WIN32)
@@ -701,6 +705,77 @@ bool KimiK3Backend::init_streaming() {
     return true;
 }
 
+bool KimiK3Backend::init_draft() {
+    if (!cfg_.draft_path || !*cfg_.draft_path) return true;
+    if (draft_backend_ || draft_weights_.ctx) return true;
+
+    draft_backend_ = ggml_backend_cuda_init(std::max(0, cfg_.draft_gpu));
+    if (!draft_backend_) {
+        std::fprintf(stderr,
+                     "[kimi-k3-dspark] draft backend init failed for device %d\n",
+                     cfg_.draft_gpu);
+        return false;
+    }
+    if (!load_draft_gguf(cfg_.draft_path, draft_backend_, draft_weights_)) {
+        std::fprintf(stderr,
+                     "[kimi-k3-dspark] draft load failed: %s\n",
+                     dflash27b_last_error());
+        free_drafter();
+        return false;
+    }
+
+    bool compatible =
+        draft_weights_.n_embd == weights_.n_embd &&
+        draft_weights_.block_size > 1 &&
+        draft_weights_.block_size <= kMaxDsparkBlockSize &&
+        draft_weights_.n_target_layers > 0 &&
+        draft_weights_.n_target_layers ==
+            static_cast<int>(draft_weights_.capture_layer_ids.size()) &&
+        draft_weights_.mask_token_id >= 0 &&
+        draft_weights_.mask_token_id < weights_.n_vocab;
+    for (int layer : draft_weights_.capture_layer_ids) {
+        compatible = compatible && layer >= 0 && layer < weights_.n_layer;
+    }
+    if (draft_weights_.dspark.enabled) {
+        compatible = compatible &&
+            draft_weights_.dspark.vocab_size == weights_.n_vocab;
+    }
+    if (!compatible) {
+        std::fprintf(stderr,
+            "[kimi-k3-dspark] incompatible checkpoint: target "
+            "hidden/vocab/layers=%d/%d/%d, draft hidden/block/captures/"
+            "mask/vocab=%d/%d/%zu/%d/%d\n",
+            weights_.n_embd, weights_.n_vocab, weights_.n_layer,
+            draft_weights_.n_embd, draft_weights_.block_size,
+            draft_weights_.capture_layer_ids.size(),
+            draft_weights_.mask_token_id,
+            draft_weights_.dspark.vocab_size);
+        free_drafter();
+        return false;
+    }
+
+    const int ring_cap = std::min(
+        std::max(1, cfg_.device.max_ctx),
+        std::max(2048, cfg_.draft_ctx_max));
+    if (!draft_feature_mirror_init(
+            feature_ring_, draft_backend_, std::max(0, cfg_.draft_gpu),
+            cfg_.device.primary_gpu(), ring_cap,
+            draft_weights_.n_target_layers, weights_.n_embd)) {
+        std::fprintf(stderr,
+                     "[kimi-k3-dspark] feature-ring allocation failed\n");
+        free_drafter();
+        return false;
+    }
+    std::fprintf(stderr,
+        "[kimi-k3-dspark] shared DFlash runtime enabled: block=%d "
+        "captures=%zu ring=%d draft_gpu=%d target_gpu=%d dspark=%d\n",
+        draft_weights_.block_size,
+        draft_weights_.capture_layer_ids.size(), ring_cap,
+        cfg_.draft_gpu, cfg_.device.primary_gpu(),
+        draft_weights_.dspark.enabled ? 1 : 0);
+    return true;
+}
+
 bool KimiK3Backend::init() {
     if (!cfg_.model_path) {
         std::fprintf(stderr, "[kimi-k3] model path is null\n");
@@ -721,8 +796,12 @@ bool KimiK3Backend::init() {
                      dflash27b_last_error());
         return false;
     }
+    if (!init_draft()) return false;
     const int max_ctx = std::max(1, cfg_.device.max_ctx);
-    if (!create_kimi_k3_cache(backend_, weights_, max_ctx, cache_)) {
+    const int max_verify_tokens = draft_weights_.ctx
+        ? draft_weights_.block_size : 0;
+    if (!create_kimi_k3_cache(
+            backend_, weights_, max_ctx, cache_, max_verify_tokens)) {
         std::fprintf(stderr, "[kimi-k3] cache allocation failed (max_ctx=%d)\n",
                      max_ctx);
         return false;
@@ -747,8 +826,13 @@ void KimiK3Backend::print_ready_banner() const {
 }
 
 bool KimiK3Backend::park(ParkTarget target) {
-    if (!park_target_includes_target_model(target)) return false;
-    if (!parked_) {
+    bool handled = false;
+    if (park_target_includes_draft_model(target) && draft_backend_) {
+        free_drafter();
+        handled = true;
+    }
+    if (park_target_includes_target_model(target) && !parked_) {
+        dflash_target_.reset();
         maybe_save_routing_stats();
         dual_stream_executor_.destroy();
         stream_engine_.destroy();
@@ -756,13 +840,14 @@ bool KimiK3Backend::park(ParkTarget target) {
         release_expert_backend();
         free_kimi_k3_weights(weights_);
         parked_ = true;
+        handled = true;
     }
-    return true;
+    return handled;
 }
 
 bool KimiK3Backend::unpark(ParkTarget target) {
-    if (!park_target_includes_target_model(target)) return false;
-    if (parked_) {
+    bool handled = false;
+    if (park_target_includes_target_model(target) && parked_) {
         if (!load_kimi_k3_gguf(
                 cfg_.model_path, backend_, weights_,
                 cfg_.moe_storage != MoeStoragePolicy::Resident) ||
@@ -770,8 +855,14 @@ bool KimiK3Backend::unpark(ParkTarget target) {
             return false;
         }
         parked_ = false;
+        handled = true;
     }
-    return true;
+    if (park_target_includes_draft_model(target) &&
+        cfg_.draft_path && *cfg_.draft_path && !draft_backend_) {
+        if (!init_draft()) return false;
+        handled = true;
+    }
+    return handled;
 }
 
 int32_t KimiK3Backend::choose_token(const std::vector<float> & logits,
@@ -783,6 +874,35 @@ int32_t KimiK3Backend::choose_token(const std::vector<float> & logits,
     }
     return static_cast<int32_t>(std::distance(logits.begin(),
         std::max_element(logits.begin(), logits.end())));
+}
+
+bool KimiK3Backend::supports_dflash_spec_decode() const {
+    return draft_backend_ && draft_weights_.ctx && feature_ring_.target_feat;
+}
+
+DFlashTarget * KimiK3Backend::dflash_target() {
+    if (!supports_dflash_spec_decode()) return nullptr;
+    if (!dflash_target_) {
+        dflash_target_ = std::make_unique<KimiK3DFlashTarget>(
+            weights_, cache_, backend_, feature_ring_,
+            draft_weights_.capture_layer_ids,
+            draft_weights_.mask_token_id, cfg_.fast_rollback,
+            weights_.routed_experts_streamed ? &stream_engine_ : nullptr,
+            dual_stream_executor_.is_ready()
+                ? &dual_stream_executor_ : nullptr,
+            &stream_owner_policy_, routing_stats_.get());
+    }
+    return dflash_target_.get();
+}
+
+void KimiK3Backend::free_drafter() {
+    dflash_target_.reset();
+    draft_feature_mirror_free(feature_ring_);
+    if (draft_weights_.ctx) free_draft_weights(draft_weights_);
+    if (draft_backend_) {
+        ggml_backend_free(draft_backend_);
+        draft_backend_ = nullptr;
+    }
 }
 
 GenerateResult KimiK3Backend::generate_impl(const GenerateRequest & req,
@@ -810,14 +930,19 @@ GenerateResult KimiK3Backend::generate_impl(const GenerateRequest & req,
 
     reset_kimi_k3_cache(cache_);
     std::vector<float> logits;
+    auto * spec_target = static_cast<KimiK3DFlashTarget *>(dflash_target());
     const auto prefill_begin = std::chrono::steady_clock::now();
     for (size_t i = 0; i < req.prompt.size(); ++i) {
-        if (!kimi_k3_step(
+        const bool ok = spec_target
+            ? spec_target->forward_token(
+                req.prompt[i], static_cast<int>(i), logits)
+            : kimi_k3_step(
                 backend_, weights_, cache_, req.prompt[i],
                 static_cast<int>(i), logits, &stream_engine_,
                 dual_stream_executor_.is_ready()
                     ? &dual_stream_executor_ : nullptr,
-                &stream_owner_policy_, routing_stats_.get())) {
+                &stream_owner_policy_, routing_stats_.get());
+        if (!ok) {
             result.fail(GenerateErrorCode::PrefillFailed,
                         dflash27b_last_error());
             out_io.emit(-1);
@@ -827,7 +952,45 @@ GenerateResult KimiK3Backend::generate_impl(const GenerateRequest & req,
     const auto prefill_end = std::chrono::steady_clock::now();
     result.prefill_s = std::chrono::duration<double>(prefill_end - prefill_begin).count();
 
+    if (req.n_gen <= 0 || out_io.cancelled) {
+        maybe_save_routing_stats();
+        out_io.emit(-1);
+        result.succeed();
+        return result;
+    }
+
     const auto decode_begin = std::chrono::steady_clock::now();
+    const bool can_spec = spec_target && !req.force_ar_decode &&
+        req.budget_hook.close_token_ids.empty() &&
+        !req.sampler.needs_logit_processing();
+    if (can_spec) {
+        const int32_t seed = choose_token(logits, req.sampler, result.tokens);
+        DaemonIO spec_io = out_io.with_token_callback(
+            [&](int32_t token) -> bool {
+                result.tokens.push_back(token);
+                return true;
+            });
+        double accept_rate = 0.0;
+        const bool ok = run_dflash_spec_decode(
+            *spec_target, draft_weights_, draft_backend_, feature_ring_,
+            req.prompt, req.n_gen, seed, /*out_path=*/nullptr,
+            cfg_.draft_ctx_max, spec_io, /*remote_draft=*/nullptr,
+            req.hint_tokens, /*base_pos=*/0, &accept_rate);
+        result.decode_s = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - decode_begin).count();
+        result.accept_rate = static_cast<float>(accept_rate);
+        result.spec_decode_ran = true;
+        maybe_save_routing_stats();
+        spec_io.emit(-1);
+        if (!ok) {
+            result.fail(GenerateErrorCode::DecodeFailed,
+                        dflash27b_last_error());
+            return result;
+        }
+        result.succeed();
+        return result;
+    }
+
     bool budget_close_started = false;
     size_t close_inject_pos = 0;
     for (int i = 0; i < req.n_gen; ++i) {
@@ -917,6 +1080,7 @@ bool KimiK3Backend::handle_compress(const std::string & line,
 }
 
 void KimiK3Backend::shutdown() {
+    free_drafter();
     maybe_save_routing_stats();
     dual_stream_executor_.destroy();
     stream_engine_.destroy();

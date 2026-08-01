@@ -36,7 +36,7 @@ struct BackendArgs {
     // Required
     const char *    model_path   = nullptr;   // target .gguf
 
-    // Optional: speculative decode draft model (qwen35 only)
+    // Optional: architecture-compatible speculative decode draft model.
     const char *    draft_path   = nullptr;
 
     // Device placement

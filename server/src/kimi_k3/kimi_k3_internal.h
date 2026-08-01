@@ -3,7 +3,7 @@
 // This is intentionally split into three model-neutral boundaries:
 //   * GGUF loading owns tensor metadata/storage only;
 //   * KimiK3Cache owns recurrent/attention state only; and
-//   * kimi_k3_step owns the architecture graph only.
+//   * kimi_k3_forward owns the architecture graph only.
 //
 // Routed-expert placement can therefore replace the resident expert tensors
 // with the common MoE stream engine without changing KDA, MLA, AttnRes, or the
@@ -143,6 +143,15 @@ struct KimiK3LayerCache {
     ggml_tensor * conv_state = nullptr; // [d_conv-1, 3*d_inner], F32
     ggml_tensor * ssm_state  = nullptr; // [head_dim, head_dim, n_head], F32
     ggml_tensor * mla_k      = nullptr; // [kv_rank+rope_dim, 1, max_ctx], F16
+
+    // Speculative-decode state.  ReplaySSM captures the much smaller
+    // pre-KDA activation for every verify row, then re-runs only the accepted
+    // recurrent transitions at commit time.  The snapshots are a failure-safe
+    // for the commit graph; ordinary rejected verification leaves the live
+    // recurrent tensors untouched and therefore needs no restore copy.
+    ggml_tensor * conv_state_snap = nullptr;
+    ggml_tensor * ssm_state_snap  = nullptr;
+    ggml_tensor * replay_input    = nullptr; // [hidden, max_verify_tokens], F32
 };
 
 struct KimiK3Cache {
@@ -151,6 +160,29 @@ struct KimiK3Cache {
     std::vector<KimiK3LayerCache> layers;
     int max_ctx = 0;
     int cur_pos = 0;
+    int max_verify_tokens = 0;
+    int snapshot_pos = -1;
+    int replay_base_pos = -1;
+    int replay_n_tokens = 0;
+    bool snapshot_valid = false;
+    bool replay_valid = false;
+    bool recurrent_state_pristine = false;
+};
+
+// Model-neutral forward result shape used by the Kimi DFlash adapter.  Capture
+// rows are capture-major, then token-major:
+//   [capture_layer][token][hidden].
+struct KimiK3ForwardOptions {
+    const std::vector<int> * capture_layer_ids = nullptr;
+    bool capture_replay = false;
+    bool read_logits = false;
+    bool read_argmax = true;
+};
+
+struct KimiK3ForwardResult {
+    std::vector<float> logits;
+    std::vector<int32_t> argmax;
+    std::vector<float> captured_hidden;
 };
 
 bool load_kimi_k3_gguf(const std::string & path,
@@ -162,14 +194,37 @@ void free_kimi_k3_weights(KimiK3Weights & w);
 bool create_kimi_k3_cache(ggml_backend_t backend,
                           const KimiK3Weights & w,
                           int max_ctx,
-                          KimiK3Cache & out);
+                          KimiK3Cache & out,
+                          int max_verify_tokens = 0);
 void reset_kimi_k3_cache(KimiK3Cache & cache);
 void free_kimi_k3_cache(KimiK3Cache & cache);
 
-// Executes exactly one token. Token-at-a-time is deliberate for the first
-// correctness path: it makes the recurrent state transition explicit and is
-// numerically equivalent to chunked prefill. Persistent/captured decode graphs
-// and chunked KDA are performance layers added above this contract.
+// Batch forward used for target verification.  With capture_replay=true the
+// recurrent state is read-only: KDA inputs are persisted for a later
+// kimi_k3_replay_commit(), while MLA writes remain position-indexed and become
+// invisible simply by restoring cur_pos.
+bool kimi_k3_forward(ggml_backend_t backend,
+                     const KimiK3Weights & w,
+                     KimiK3Cache & cache,
+                     const std::vector<int32_t> & tokens,
+                     int base_pos,
+                     const KimiK3ForwardOptions & options,
+                     KimiK3ForwardResult & result,
+                     MoeHybridStreamEngine * stream_engine = nullptr,
+                     MoeStreamDualOwnerExecutor * dual_stream_executor = nullptr,
+                     const MoeStreamDualOwnerPolicy * stream_owner_policy = nullptr,
+                     MoeHybridRoutingStats * routing_stats = nullptr);
+
+bool kimi_k3_replay_snapshot(ggml_backend_t backend, KimiK3Cache & cache);
+bool kimi_k3_replay_restore(ggml_backend_t backend, KimiK3Cache & cache);
+bool kimi_k3_replay_commit(ggml_backend_t backend,
+                           const KimiK3Weights & w,
+                           KimiK3Cache & cache,
+                           int base_pos,
+                           int commit_n);
+
+// Compatibility wrapper for the ordinary one-token AR path. Speculative
+// verification calls kimi_k3_forward directly with a bounded token batch.
 bool kimi_k3_step(ggml_backend_t backend,
                   const KimiK3Weights & w,
                   KimiK3Cache & cache,

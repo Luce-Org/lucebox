@@ -32,6 +32,7 @@ struct StepGraph {
     int alloc_reserved_ctx = 0;
 
     // Named inputs
+    ggml_tensor *   token_ids = nullptr;     // embedding-only utility graphs
     ggml_tensor *   inp_embed = nullptr;
     ggml_tensor *   positions = nullptr;
     ggml_tensor *   attn_mask = nullptr;     // may be null
@@ -71,6 +72,7 @@ struct StepGraph {
 inline void step_graph_free(StepGraph & sg) {
     if (sg.ctx)   { ggml_free(sg.ctx); sg.ctx = nullptr; }
     sg.gf = nullptr;
+    sg.token_ids = nullptr;
     sg.inp_embed = sg.positions = sg.attn_mask = nullptr;
     sg.target_hidden_cat = sg.positions_k = nullptr;
     sg.pad_mask_full = nullptr;

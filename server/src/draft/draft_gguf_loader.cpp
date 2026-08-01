@@ -204,6 +204,8 @@ bool load_draft_gguf(const std::string & path,
     // Store GGUF-declared config into DraftWeights (replaces hardcoded defaults).
     out.block_size = (int)block_sz;
     out.n_target_layers = (int)n_tgt_lay;
+    out.mask_token_id = (int32_t)read_u32(
+        "dflash.mask_token_id", (uint32_t)out.mask_token_id);
 
     // Propagate target model properties if available.
     if (target) {

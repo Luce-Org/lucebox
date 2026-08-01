@@ -5,6 +5,8 @@
 #include "internal.h"        // DraftWeights
 #include "io_utils.h"
 #include "dflash_draft_graph.h"  // build_draft_step
+#include "dspark_head.h"
+#include "adaptive_verify_width.h"
 #include "step_graph.h"
 
 #include <algorithm>
@@ -64,17 +66,21 @@ bool run_dflash_spec_decode(
     const bool use_remote_draft = remote_draft && remote_draft->active();
     if (!use_remote_draft && !feature_ring.target_feat) return false;
 
-    const int hidden = draft_weights.n_embd;
-    const int q_len  = draft_weights.block_size;
+    const int hidden    = draft_weights.n_embd;
+    const int max_q_len = draft_weights.block_size;
+    if (hidden <= 0 || max_q_len <= 0) return false;
+    const float width_theta = adaptive_verify_width_theta();
+    const int target_width_min = target.default_adaptive_verify_min_rows();
+    const int width_min = adaptive_verify_width_min(target_width_min);
 
     StepGraph draft_sg;
     StepGraphGuard draft_sg_guard{draft_sg};
 
-    std::vector<float>   noise_embed((size_t)hidden * q_len);
-    std::vector<int32_t> noise_ids(q_len);
-    std::vector<int32_t> draft_tok(q_len);
-    std::vector<int32_t> target_tok(q_len);
-    std::vector<int32_t> pos_q(q_len);
+    std::vector<float>   noise_embed((size_t)hidden * max_q_len);
+    std::vector<int32_t> noise_ids(max_q_len);
+    std::vector<int32_t> draft_tok(max_q_len);
+    std::vector<int32_t> target_tok(max_q_len);
+    std::vector<int32_t> pos_q(max_q_len);
     std::vector<int32_t> pos_k;
     std::vector<float>   local_hidden;       // host buffer for local draft hidden states
     std::vector<float>   remote_hidden;      // host buffer for remote-draft hidden states
@@ -84,6 +90,7 @@ bool run_dflash_spec_decode(
     int n_generated     = 0;
     int n_draft_steps   = 0;
     int n_accept_sum    = 0;
+    int n_verify_rows   = 0;
     int n_hint_proposed = 0;
     int n_hint_accepted = 0;
     const ChainRollbackPolicy rollback_policy = resolve_chain_rollback_policy();
@@ -92,11 +99,15 @@ bool run_dflash_spec_decode(
     auto t_dec0 = std::chrono::steady_clock::now();
     while (n_generated < n_gen) {
         const int need_commit_budget = n_gen - n_generated;
+        int q_len = max_q_len;
 
         // ── Build noise input for draft ────────────────────────────────────
         noise_ids[0] = last_tok;
-        for (int i = 1; i < q_len; i++) noise_ids[i] = target.mask_token_id();
-        if (!target.embed_tokens(noise_ids.data(), q_len, noise_embed.data())) {
+        for (int i = 1; i < max_q_len; i++) {
+            noise_ids[i] = target.mask_token_id();
+        }
+        if (!target.embed_tokens(
+                noise_ids.data(), max_q_len, noise_embed.data())) {
             std::fprintf(stderr, "dflash-spec noise embed failed\n");
             return false;
         }
@@ -135,9 +146,9 @@ bool run_dflash_spec_decode(
             }
             ggml_backend_tensor_set(draft_sg.inp_embed, noise_embed.data(), 0,
                                     sizeof(float) * noise_embed.size());
-            pos_k.resize((size_t)draft_ctx + q_len);
-            for (int i = 0; i < q_len; i++) pos_q[i] = draft_ctx + i;
-            for (int i = 0; i < draft_ctx + q_len; i++) pos_k[i] = i;
+            pos_k.resize((size_t)draft_ctx + max_q_len);
+            for (int i = 0; i < max_q_len; i++) pos_q[i] = draft_ctx + i;
+            for (int i = 0; i < draft_ctx + max_q_len; i++) pos_k[i] = i;
             ggml_backend_tensor_set(draft_sg.positions, pos_q.data(), 0,
                                     sizeof(int32_t) * pos_q.size());
             ggml_backend_tensor_set(draft_sg.positions_k, pos_k.data(), 0,
@@ -149,18 +160,62 @@ bool run_dflash_spec_decode(
             }
             // Read draft hidden states out to host so the target adapter can
             // project them through its own LM head (target-internal layout).
-            local_hidden.resize((size_t)hidden * q_len);
+            local_hidden.resize((size_t)hidden * max_q_len);
             ggml_backend_tensor_get(draft_sg.hidden_states, local_hidden.data(), 0,
                                     sizeof(float) * local_hidden.size());
             draft_hidden_host = local_hidden.data();
         }
 
-        // ── Project draft hidden → token IDs via target's LM head ─────────
-        if (!target.project_hidden_to_tokens(draft_hidden_host, q_len, draft_tok)) {
+        // ── Project draft hidden → token IDs via the shared draft head ────
+        // DSpark is an auxiliary head on the universal DFlash checkpoint, not
+        // a target-model implementation.  Keep its Markov correction and
+        // confidence policy here so Kimi, Qwen, Laguna, and future adapters
+        // share exactly one implementation.
+        std::vector<float> confidence;
+        std::vector<float> candidate_probs;
+        std::vector<int32_t> candidate_ids;
+        bool projected = false;
+        if (draft_backend && draft_weights.dspark.enabled && max_q_len > 1) {
+            ggml_backend_t head_backend = target.fused_head_backend();
+            const bool same_device_head =
+                head_backend && target.lm_head_tensor() &&
+                ggml_backend_get_device(head_backend) ==
+                    ggml_backend_get_device(draft_backend);
+            if (same_device_head) {
+                projected = dspark_markov_correct_greedy_chain_fused(
+                    draft_weights, draft_backend, target.lm_head_tensor(),
+                    draft_hidden_host, max_q_len, last_tok, draft_tok,
+                    &confidence);
+            }
+            if (!projected) {
+                projected = dspark_markov_correct_greedy_chain(
+                    draft_weights, draft_backend, target,
+                    draft_hidden_host, max_q_len, last_tok,
+                    /*confidence_threshold=*/0.0f, draft_tok);
+            }
+        }
+        if (!projected) {
+            const int candidate_k = width_theta > 0.0f && max_q_len > 2 ? 2 : 0;
+            projected = target.project_hidden_to_tokens_topk(
+                draft_hidden_host, max_q_len, draft_tok, candidate_k,
+                candidate_k > 0 ? &candidate_probs : nullptr,
+                candidate_k > 0 ? &candidate_ids : nullptr);
+        }
+        if (!projected || draft_tok.size() < (size_t)max_q_len) {
             std::fprintf(stderr, "dflash-spec projection failed\n");
             return false;
         }
         draft_tok[0] = last_tok;
+
+        if (confidence.size() >= (size_t)(max_q_len - 1)) {
+            q_len = adaptive_verify_width(
+                confidence.data(), 1, max_q_len, width_theta, width_min);
+        } else if (candidate_probs.size() >=
+                   static_cast<size_t>((max_q_len - 1) * 2)) {
+            q_len = adaptive_verify_width(
+                candidate_probs.data(), 2, max_q_len,
+                width_theta, width_min);
+        }
 
         // ── Tool call hint injection ──────────────────────────────────────
         // Override draft tokens with pre-known hint tokens for near-100%
@@ -168,11 +223,19 @@ bool run_dflash_spec_decode(
         int hint_filled = 0;
         if (hint_tokens && n_generated < (int)hint_tokens->size()) {
             const int hint_avail = (int)hint_tokens->size() - n_generated;
-            hint_filled = std::min(hint_avail, q_len - 1);
+            q_len = max_q_len;
+            hint_filled = std::min(hint_avail, max_q_len - 1);
             for (int i = 0; i < hint_filled; i++) {
                 draft_tok[1 + i] = (*hint_tokens)[n_generated + i];
             }
         }
+
+        // Never verify rows that cannot fit in the remaining generation
+        // budget.  The draft graph remains fixed-width for graph reuse; this
+        // only trims expensive target/MoE work.
+        q_len = std::max(1, std::min(q_len, need_commit_budget));
+        draft_tok.resize(static_cast<size_t>(q_len));
+        target_tok.resize(static_cast<size_t>(q_len));
 
         // Notify observer with draft tokens for this step.
         if (io.observer) {
@@ -220,11 +283,23 @@ bool run_dflash_spec_decode(
         rollback_diag.record_accept(accept_n);
         const bool use_fast_rollback =
             target.supports_fast_rollback() &&
-            (accept_n >= rollback_policy.fast_rollback_threshold);
+            (target.prefer_fast_rollback_over_replay() ||
+             accept_n >= rollback_policy.fast_rollback_threshold);
 
         std::vector<int32_t> replay_tok((size_t)commit_n);
         for (int i = 0; i < commit_n; i++) {
             replay_tok[i] = (i < accept_n) ? draft_tok[i] : bonus_tok;
+        }
+        // Never commit hidden state past EOS when a verify batch happens to
+        // accept additional candidates after it.
+        for (int i = 0; i < commit_n; ++i) {
+            if (target.is_eos(replay_tok[(size_t)i])) {
+                commit_n = i + 1;
+                accept_n = std::min(accept_n, commit_n);
+                bonus_tok = -1;
+                replay_tok.resize((size_t)commit_n);
+                break;
+            }
         }
 
         bool fast_rolled_back = false;
@@ -275,11 +350,15 @@ bool run_dflash_spec_decode(
             io.emit(replay_tok[i]);
             if (io.cancelled) break;
             ++emitted;
-            if (target.is_eos(replay_tok[i])) hit_eos = true;
+            if (target.is_eos(replay_tok[i])) {
+                hit_eos = true;
+                break;
+            }
         }
         committed   += emitted;
         n_generated += emitted;
         n_accept_sum += std::min(accept_n, emitted);
+        n_verify_rows += q_len;
         n_draft_steps++;
 
         // Notify observer with accepted tokens for this step.
@@ -293,7 +372,7 @@ bool run_dflash_spec_decode(
     if (!use_remote_draft && draft_backend) ggml_backend_synchronize(draft_backend);
     auto t_dec1 = std::chrono::steady_clock::now();
     const double decode_s = std::chrono::duration<double>(t_dec1 - t_dec0).count();
-    const int total_draft_pos = std::max(1, n_draft_steps * q_len);
+    const int total_draft_pos = std::max(1, n_verify_rows);
     const double accept_pct = 100.0 * (double)n_accept_sum / (double)total_draft_pos;
     if (accept_rate_out) {
         *accept_rate_out = total_draft_pos > 0

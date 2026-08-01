@@ -11,7 +11,8 @@ int main(int argc, char ** argv) {
     if (argc < 2) {
         std::fprintf(stderr,
             "usage: %s <kimi-k3.gguf> [gpu=0] [n_gen=16] [prompt] "
-            "[stream_experts=1] [expert_gpu=-1]\n",
+            "[stream_experts=1] [expert_gpu=-1] [draft.gguf] "
+            "[draft_gpu=0]\n",
             argv[0]);
         return 2;
     }
@@ -41,6 +42,8 @@ int main(int argc, char ** argv) {
         ? MoeStoragePolicy::Ssd
         : MoeStoragePolicy::Resident;
     config.expert_gpu = argc > 6 ? std::atoi(argv[6]) : -1;
+    config.draft_path = argc > 7 && argv[7][0] != '\0' ? argv[7] : nullptr;
+    config.draft_gpu = argc > 8 ? std::atoi(argv[8]) : gpu;
     KimiK3Backend backend(config);
     if (!backend.init()) return 1;
 
