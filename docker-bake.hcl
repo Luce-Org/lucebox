@@ -1,12 +1,13 @@
 # docker-bake.hcl — Lucebox hub prebuild matrix.
 #
-# Single CUDA 12 image from one Dockerfile. Additional CUDA stacks are
-# intentionally omitted.
+# CUDA 12 covers Turing through Hopper on the broad CUDA-12 driver floor.
+# CUDA 12.8 covers x86 Blackwell sm_120, while CUDA 13 provides the native
+# arm64/sm_121 image required by GB10/DGX Spark.
 #
 #   scripts/build_image.sh            # version-derived local build (preferred)
 #   docker buildx bake cuda12-local   # raw local build; tagged lucebox-hub:cuda12
 #   docker buildx bake cuda12         # CI target; tags come from metadata-action
-#                                 # Arches: sm_75;80;86;89;90;120
+#                                 # Arches: sm_75;80;86;89;90
 #
 # Pre-Turing arches (Pascal sm_60/61, Volta sm_70) are intentionally
 # excluded — dflash's kernels assume sm_75+ with no fallback below
@@ -32,17 +33,24 @@ variable "VERSION"  { default = "" }
 # but new callers should use `VERSION`.
 variable "TAG"      { default = "" }
 
-# Fat-binary CUDA arch list. Defaults to all supported arches so the
-# released image runs on every consumer/datacenter GPU we target. Local
+# Fat-binary CUDA arch list for the broad-driver image. Local
 # dev builds can narrow this to the host's compute capability to skip the
 # 5-6× CUDA template recompile cost:
 #
-#   DFLASH_CUDA_ARCHES=120 docker buildx bake cuda12-local --load
+#   DFLASH_CUDA_ARCHES=86 docker buildx bake cuda12-local --load
 #
-# (RTX 5090 / 5090 Laptop = 120, RTX 4090 = 89, RTX 3090 = 86, H100 = 90,
-# A100 = 80, RTX 2080 Ti = 75.) Use a semicolon-separated list to include
-# multiple arches.
-variable "DFLASH_CUDA_ARCHES" { default = "75;80;86;89;90;120" }
+# (RTX 4090 = 89, RTX 3090 = 86, H100 = 90, A100 = 80, RTX 2080 Ti = 75.)
+# Use a semicolon-separated list to include multiple arches.
+variable "DFLASH_CUDA_ARCHES" { default = "75;80;86;89;90" }
+
+# RTX 5090 is the only currently qualified x86 sm_120 target. Keeping it in a
+# narrow CUDA 12.8 image avoids raising the driver floor for every older GPU.
+variable "DFLASH_CUDA128_ARCHES" { default = "120" }
+
+# GB10 is an arm64 Blackwell part with compute capability 12.1. nvcc gained
+# sm_121 support after CUDA 12.8, so it intentionally lives in a separate
+# CUDA 13 image instead of raising the driver floor for existing x86 users.
+variable "DFLASH_CUDA13_ARCHES" { default = "121" }
 
 # Fat-binary HIP/gfx arch list for the rocm variant (semicolon-separated).
 # Default is gfx1151 (Strix Halo, the lucebox appliance iGPU) only, to keep the
@@ -90,10 +98,10 @@ group "default" {
     targets = ["cuda12-local"]
 }
 
-# Build every published variant locally (cuda + rocm). CI builds these as a
-# matrix; this group is the local equivalent for a full two-image build.
+# Build every published variant locally (CUDA 12, CUDA 12.8, CUDA 13, and
+# ROCm). CI builds these as a matrix; this group is the local equivalent.
 group "all" {
-    targets = ["cuda12-local", "rocm-local"]
+    targets = ["cuda12-local", "cuda128-local", "cuda13-local", "rocm-local"]
 }
 
 # CI integration. docker/metadata-action in .github/workflows/docker.yml
@@ -103,15 +111,15 @@ group "all" {
 # file, so this empty target keeps inheritance valid.
 target "docker-metadata-action" {}
 
-# ── CUDA 12.8 ───────────────────────────────────────────────────────────────
-# CUDA 12.8 matches the uv-managed PyTorch cu128 stack and carries current-gen
-# consumer Blackwell sm_120 coverage. Thor/GB10 variants stay out of this
-# build matrix.
+# ── CUDA 12 (broad driver compatibility) ───────────────────────────────────
+# CUDA 12.0 is the oldest toolkit that builds every qualified pre-Blackwell
+# architecture and runs on the CUDA-12 minor-compatibility driver floor
+# (r525+). This is the default for RTX 20/30/40, A-series, A100, and H100.
 target "_cuda12-base" {
     context    = "."
     dockerfile = "Dockerfile"
     args = {
-        CUDA_VERSION        = "12.8.1"
+        CUDA_VERSION        = "12.0.1"
         UBUNTU_VERSION      = "22.04"
         DFLASH_CUDA_ARCHES  = DFLASH_CUDA_ARCHES
         # /props.build identity. CI passes these as env vars from the
@@ -130,6 +138,55 @@ target "cuda12" {
 target "cuda12-local" {
     inherits = ["_cuda12-base"]
     tags = image_tags("cuda12")
+}
+
+# ── CUDA 12.8 / x86 Blackwell ──────────────────────────────────────────────
+# sm_120 first appeared in CUDA 12.8. It has a newer driver floor, so it must
+# not share the image selected for older NVIDIA cards.
+target "_cuda128-base" {
+    context    = "."
+    dockerfile = "Dockerfile"
+    args = {
+        CUDA_VERSION        = "12.8.1"
+        UBUNTU_VERSION      = "22.04"
+        DFLASH_CUDA_ARCHES  = DFLASH_CUDA128_ARCHES
+        GIT_SHA             = GIT_SHA
+        IMAGE_TAG           = IMAGE_TAG
+        BUILD_TIME          = BUILD_TIME
+    }
+}
+
+target "cuda128" {
+    inherits = ["_cuda128-base", "docker-metadata-action"]
+}
+
+target "cuda128-local" {
+    inherits = ["_cuda128-base"]
+    tags = image_tags("cuda128")
+}
+
+# ── CUDA 13 / GB10 arm64 ──────────────────────────────────────────────────
+target "_cuda13-base" {
+    context    = "."
+    dockerfile = "Dockerfile"
+    platforms  = ["linux/arm64"]
+    args = {
+        CUDA_VERSION        = "13.0.1"
+        UBUNTU_VERSION      = "24.04"
+        DFLASH_CUDA_ARCHES  = DFLASH_CUDA13_ARCHES
+        GIT_SHA             = GIT_SHA
+        IMAGE_TAG           = IMAGE_TAG
+        BUILD_TIME          = BUILD_TIME
+    }
+}
+
+target "cuda13" {
+    inherits = ["_cuda13-base", "docker-metadata-action"]
+}
+
+target "cuda13-local" {
+    inherits = ["_cuda13-base"]
+    tags = image_tags("cuda13")
 }
 
 # ── ROCm / HIP ───────────────────────────────────────────────────────────────

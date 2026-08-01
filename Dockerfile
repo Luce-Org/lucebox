@@ -2,30 +2,31 @@
 
 # ─── Stage 1: builder ───────────────────────────────────────────────────────
 # CUDA_VERSION / UBUNTU_VERSION / DFLASH_CUDA_ARCHES are build args so the
-# same Dockerfile can be repinned later. The prebuilt image is the
-# CUDA 12.8 path:
-#   • lucebox-hub:cuda12  — CUDA 12.8.1, sm_75;80;86;89;90;120
+# same Dockerfile serves all published CUDA variants:
+#   • lucebox-hub:cuda12   — CUDA 12.0.1, x86_64, sm_75;80;86;89;90
+#   • lucebox-hub:cuda128  — CUDA 12.8.1, x86_64, sm_120 (RTX 5090)
+#   • lucebox-hub:cuda13   — CUDA 13.0.1, arm64, sm_121 (GB10/DGX Spark)
 # See docker-bake.hcl for the canonical invocation.
-ARG CUDA_VERSION=12.8.1
+ARG CUDA_VERSION=12.0.1
 ARG UBUNTU_VERSION=22.04
 FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION} AS builder
 
 ARG DEBIAN_FRONTEND=noninteractive
 
-# Fat-binary CUDA arch list, semicolon-separated. Defaults cover the CUDA 12.8
-# image. dflash-supported arches in this image:
+# Fat-binary CUDA arch list, semicolon-separated. Defaults cover the broadly
+# compatible CUDA 12 image. dflash-supported arches in this image:
 #   75  Turing      RTX 2080 Ti
 #   80  Ampere      A100
 #   86  Ampere      RTX 3090, A40, A10
 #   89  Ada         RTX 4090, L40
 #   90  Hopper      H100
-#   120 Blackwell   RTX 5090, RTX 5090 Laptop
-# Thor and GB10 prebuilt-image coverage is intentionally omitted.
+# RTX 5090 (sm_120) and GB10 (sm_121) are built by docker-bake.hcl's
+# CUDA 12.8 and CUDA 13 targets, respectively.
 # Pre-Turing arches (sm_60/61/70/72) are intentionally excluded — dflash's
 # BF16/WMMA paths have no fallback below sm_75. Each arch adds ~50-200 MB
 # of fat-binary kernel code and ~3-5 min of nvcc time per .cu translation
 # unit.
-ARG DFLASH_CUDA_ARCHES="75;80;86;89;90;120"
+ARG DFLASH_CUDA_ARCHES="75;80;86;89;90"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \

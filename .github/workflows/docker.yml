@@ -1,7 +1,7 @@
 name: Docker prebuilds
 
-# Builds the cuda12 lucebox-hub Docker image defined in docker-bake.hcl
-# and pushes it to GHCR. The bake file is the source of
+# Builds the cuda12, cuda128/RTX5090, cuda13/GB10, and ROCm images defined in
+# docker-bake.hcl and pushes them to GHCR. The bake file is the source of
 # truth for arch matrices and CUDA pinning; this workflow only handles
 # fetching submodules, freeing runner disk, signing in to the registry, and
 # wiring the cache.
@@ -12,7 +12,7 @@ on:
   # event=tag` + `type=semver` rules below.
   release:
     types: [published]
-  # Build + push the rolling `:cuda12` / `:rocm` tags when an image-affecting
+  # Build + push the rolling CUDA / ROCm tags when an image-affecting
   # file changes on main, so the public images track main without a ~2h
   # rebuild on every unrelated commit (docs, harness, server tweaks that
   # don't reach the image). Same paths as the PR guard below. The
@@ -90,14 +90,23 @@ jobs:
     #     halve wall time.
     #   • A self-hosted runner with the host's nvcc avoids the
     #     containerised CUDA toolkit pull entirely.
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       packages: write
     strategy:
       fail-fast: false
       matrix:
-        variant: [cuda12, rocm]
+        include:
+          - variant: cuda12
+            runner: ubuntu-latest
+          - variant: cuda128
+            runner: ubuntu-latest
+          - variant: cuda13
+            # Native arm64 compilation avoids hours of QEMU-emulated nvcc.
+            runner: ubuntu-24.04-arm
+          - variant: rocm
+            runner: ubuntu-latest
     steps:
       - name: Free runner disk space
         # The default ubuntu-latest image keeps ~25 GB of preinstalled
@@ -190,7 +199,7 @@ jobs:
           # under the concurrency group's pre-emption window. Release / main /
           # dispatch builds keep the full consumer-GPU list so the published
           # image runs on every supported card.
-          DFLASH_CUDA_ARCHES: ${{ github.event_name == 'pull_request' && '86' || '75;80;86;89;90;120' }}
+          DFLASH_CUDA_ARCHES: ${{ github.event_name == 'pull_request' && '86' || '75;80;86;89;90' }}
           # Same split for HIP: PR builds compile gfx1151 only (the verified
           # reference, Strix Halo); main / release builds widen to consumer
           # RDNA so the published :rocm runs on RX 7900 (gfx1100) and both RDNA4
