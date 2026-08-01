@@ -50,6 +50,7 @@ using __nv_bfloat16 = __hip_bfloat16;
 #define cudaEventDestroy hipEventDestroy
 #define cudaStreamSynchronize hipStreamSynchronize
 #define cudaGetLastError hipGetLastError
+#define cudaPeekAtLastError hipPeekAtLastError
 #define cudaGetErrorString hipGetErrorString
 #define cudaDeviceSynchronize hipDeviceSynchronize
 #define cudaSetDevice hipSetDevice

@@ -5,6 +5,7 @@
 //   4. sparse_flash_forward_bf16   (kernel)
 
 #include "flashprefill.h"
+#include "flashprefill_launchers.h"
 
 #include <cstdio>
 #include <cstdint>
@@ -23,24 +24,6 @@ namespace flashprefill {
 
 #if defined(DFLASH27B_HAVE_FLASHPREFILL) || defined(DFLASH27B_HAVE_SM80_FLASHPREFILL)
 extern "C" {
-int launch_compute_mean_vector_bf16(
-    const void * K, void * mean_K,
-    int batch, int seq_len, int n_kv_heads, int head_dim, int block_size,
-    int s_K_b, int s_K_n, int s_K_h, int s_K_d,
-    int s_mK_b, int s_mK_m, int s_mK_h, int s_mK_d,
-    cudaStream_t stream);
-
-int launch_compute_block_score_bf16(
-    const void * Q, const void * mean_K, float sm_scale,
-    void * score, void * score_max,
-    int batch, int n_q_heads, int n_k_heads,
-    int seq_len, int head_dim, int block_size,
-    int s_Q_b, int s_Q_n, int s_Q_h, int s_Q_d,
-    int s_mK_b, int s_mK_m, int s_mK_h, int s_mK_d,
-    int s_S_b, int s_S_m, int s_S_n, int s_S_h,
-    int s_M_b, int s_M_m, int s_M_n, int s_M_h,
-    cudaStream_t stream);
-
 #ifdef DFLASH27B_BACKEND_HIP
 // Phase 4 (HIP): mean_Q + tiled rocWMMA GEMM replaces the O(M²) scalar
 // block-score kernel. ~5-10× faster on the score step at 8K-32K context.
@@ -270,6 +253,7 @@ int flash_prefill_forward_bf16(
     float * dS = nullptr, * dM = nullptr;
     int32_t * dIdx = nullptr, * dCnt = nullptr;
     cudaError_t e;
+    const char * failure_context = "scratch allocation";
 #ifdef DFLASH27B_BACKEND_HIP
     if ((e = cudaMalloc(&dmK,  (size_t)B * M_gemm * Hk * D * 2)) != cudaSuccess) goto err;  // bf16, padded
 #else
@@ -289,6 +273,7 @@ int flash_prefill_forward_bf16(
     if (prof) for (int i=0;i<5;i++) cudaEventCreate(&pE[i]);
     if (prof) cudaEventRecord(pE[0]);
     // 1. mean_K
+    failure_context = "mean-vector launch";
     if (launch_compute_mean_vector_bf16(
             K, dmK, B, S, Hk, D, BLOCK,
             s_K_b, s_K_n, s_K_h, s_K_d,
@@ -298,10 +283,12 @@ int flash_prefill_forward_bf16(
     // 2. block scores
 #ifdef DFLASH27B_BACKEND_HIP
     // Phase 4: mean_Q + rocWMMA GEMM replaces the O(M²) scalar kernel.
+    failure_context = "mean-query launch";
     if (launch_compute_mean_vector_bf16(
             Q, dmQ, B, S, H, D, BLOCK,
             s_Q_b, s_Q_n, s_Q_h, s_Q_d,
             s_mQ_b, s_mQ_m, s_mQ_h, 1, 0) != 0) goto err;
+    failure_context = "block-score GEMM launch";
     if (launch_compute_block_score_gemm_bf16(
             dmQ, dmK, scale, dS,
             B, H, Hk, M, D,
@@ -309,6 +296,7 @@ int flash_prefill_forward_bf16(
             s_mK_b, s_mK_m, s_mK_h,
             s_S_b,  s_S_m,  s_S_n, s_S_h, 0) != 0) goto err;
 #else
+    failure_context = "block-score launch";
     if (launch_compute_block_score_bf16(
             Q, dmK, scale, dS, dM,
             B, H, Hk, S, D, BLOCK,
@@ -387,7 +375,14 @@ err:
     if (dM)   cudaFree(dM);
     if (dIdx) cudaFree(dIdx);
     if (dCnt) cudaFree(dCnt);
-    std::fprintf(stderr, "[flashprefill] cudaMalloc failed: %s\n", cudaGetErrorString(e));
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "[flashprefill] %s failed: %s\n",
+                     failure_context, cudaGetErrorString(e));
+    } else {
+        // Shape/dispatch failures are reported by the launcher itself and do
+        // not necessarily set a CUDA/HIP runtime error.
+        std::fprintf(stderr, "[flashprefill] %s failed\n", failure_context);
+    }
     return -1;
 }
 

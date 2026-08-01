@@ -189,6 +189,25 @@ struct ServerConfig {
     std::string collect_routing_path;
 };
 
+// Request-level composition of long-prompt compression and reusable KV
+// prefixes. Exposed as a pure policy function so the cache-sensitive cases
+// stay model-free and unit-testable.
+enum class PflashRequestStrategy {
+    Off,
+    WholePrompt,
+    FlowKv,
+    PreservePrefix,
+};
+
+PflashRequestStrategy select_pflash_request_strategy(
+    ServerConfig::PflashMode mode,
+    int prompt_tokens,
+    int threshold,
+    bool continuation,
+    bool has_tools,
+    bool has_reusable_prefix,
+    bool flowkv_enabled);
+
 // ─── Parsed request ─────────────────────────────────────────────────────
 
 struct ParsedRequest {

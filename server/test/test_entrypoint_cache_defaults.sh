@@ -45,7 +45,7 @@ default_output="$(
     unset DFLASH_PREFIX_CACHE_SLOTS DFLASH_PREFILL_CACHE_SLOTS
     run_entrypoint
 )"
-for flag in --prefix-cache-slots --prefill-cache-slots; do
+for flag in --prefix-cache-slots --prefill-cache-slots --think-max-tokens; do
     if grep -Fq "SERVER_ARG=$flag" <<<"$default_output"; then
         echo "entrypoint overrides the native cache default with $flag" >&2
         exit 1
@@ -58,9 +58,11 @@ assert_arg_pair "$disabled_output" --prefix-cache-slots 0
 configured_output="$(
     run_entrypoint \
         DFLASH_PREFIX_CACHE_SLOTS=4 \
-        DFLASH_PREFILL_CACHE_SLOTS=2
+        DFLASH_PREFILL_CACHE_SLOTS=2 \
+        DFLASH_THINK_MAX=15488
 )"
 assert_arg_pair "$configured_output" --prefix-cache-slots 4
 assert_arg_pair "$configured_output" --prefill-cache-slots 2
+assert_arg_pair "$configured_output" --think-max-tokens 15488
 
 echo "entrypoint cache defaults: PASS"

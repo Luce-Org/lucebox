@@ -375,11 +375,10 @@ fi
 # share/model_cards/<name>.json). When unset, the C++ server uses its default
 # ("dflash"). Lets an operator surface the real model id without a wrapper.
 : "${DFLASH_MODEL_NAME:=}"
-# Phase-1 (thinking) cap when a request opts into thinking. Default mirrors
-# antirez/ds4 ds4_eval.c: think_max_tokens = max_tokens(16000) - hard_limit
-# reply budget(512) = 15488. The server's own hardcoded default is 10000;
-# overriding here aligns ds4-eval and similar reasoning benches with upstream.
-: "${DFLASH_THINK_MAX:=15488}"
+# Optional phase-1 (thinking) cap. When unset, the native server resolves it
+# from the selected model card, then its per-family and hard fallbacks. A
+# global DeepSeek-derived cap is unsafe for models with larger card budgets.
+: "${DFLASH_THINK_MAX:=}"
 # Soft-close thinking termination dial (PR #326). Lets the AR loop force
 # </think> early when the close-token logit comes within this probability
 # ratio of the chosen-token logit. Range [0.0, 1.0]; 0.0 = disabled (server
@@ -427,12 +426,18 @@ if [ -z "$DFLASH_TARGET" ] && [ -d "$DFLASH_DIR/models" ]; then
     # anything under models/draft/. Sort alphabetically for determinism.
     TARGET_CANDIDATES=()
     while IFS= read -r candidate; do
-        [ -n "$candidate" ] && TARGET_CANDIDATES+=("$candidate")
+        [ -n "$candidate" ] || continue
+        # Avoid GNU-only find predicates (`-printf`, `-size +5G`). The native
+        # entrypoint is also exercised from macOS contributor checkouts, and
+        # `wc -c` obtains a regular file's logical size without reading a
+        # sparse multi-gigabyte fixture into memory.
+        candidate_bytes=$(wc -c <"$candidate" 2>/dev/null || echo 0)
+        [ "$candidate_bytes" -gt 5368709120 ] 2>/dev/null \
+            && TARGET_CANDIDATES+=("$candidate")
     done < <(
         find -L "$DFLASH_DIR/models" -maxdepth 4 -type f -name '*.gguf' \
-            -size +5G \
-            -not -path '*/draft/*' \
-            -printf '%p\n' 2>/dev/null \
+            ! -path '*/draft/*' \
+            -print 2>/dev/null \
           | sort
     )
     case "${#TARGET_CANDIDATES[@]}" in
@@ -599,8 +604,9 @@ fi
 CMD=("$DFLASH_SERVER_BIN" "$DFLASH_TARGET"
      --host "$DFLASH_HOST"
      --port "$DFLASH_PORT"
-     --max-ctx "$DFLASH_MAX_CTX"
-     --think-max-tokens "$DFLASH_THINK_MAX")
+     --max-ctx "$DFLASH_MAX_CTX")
+
+[ -n "$DFLASH_THINK_MAX" ] && CMD+=(--think-max-tokens "$DFLASH_THINK_MAX")
 
 if [ -n "$DFLASH_TARGET_DEVICES" ]; then
     [ -z "$DFLASH_TARGET_DEVICE" ] \

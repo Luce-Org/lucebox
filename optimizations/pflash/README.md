@@ -114,7 +114,7 @@ When `--prefill-compression != off`, the server auto-sets `DFLASH27B_LM_HEAD_FIX
   --prefill-drafter server/models/Qwen3-0.6B-BF16.gguf
 ```
 
-Below the threshold the server runs the standard target generate (no compression). Above it, the server transparently runs `compress` on the daemon, swaps the prompt for the compressed text, and continues the normal `/v1/chat/completions` flow. Tool-calling requests (`req.tools` non-empty) skip compression so JSON tool definitions stay intact.
+Below the threshold the server runs standard target prefill. Above it, a true long one-shot request transparently runs `compress`, swaps in the selected token stream, and continues the normal `/v1/chat/completions` flow. Structured system/tool chats stay verbatim so their target prefix remains reusable. Continuations also preserve that prefix unless the request explicitly enables FlowKV, which compresses only aged messages. Exact repeated prompts can restore a completed target snapshot and skip both scorer and target prefill.
 
 Validated end-to-end at 64K and 128K source on RTX 3090 (Qwen3.6-27B Q4_K_M target + Qwen3.5-DFlash draft + Qwen3-0.6B BF16 drafter).
 

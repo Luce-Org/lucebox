@@ -253,7 +253,9 @@ Prebuilt images on GHCR track `main`. No CUDA toolkit or build needed. Pull the 
 
 | GPU | Image tag |
 |-----|-----------|
-| NVIDIA (CUDA 12+) | `:cuda12` |
+| NVIDIA Turing–Hopper (sm_75–sm_90) | `:cuda12` |
+| NVIDIA RTX 5090 (sm_120) | `:cuda128` |
+| NVIDIA GB10 / DGX Spark (sm_121) | `:cuda13` |
 | AMD (ROCm 6+) | `:rocm` |
 
 Drop a GGUF model target into `server/models/` first, then
@@ -274,6 +276,8 @@ Drop a GGUF model target into `server/models/` first, then
 ```bash
 # 1. Pull the image for your GPU
 docker pull ghcr.io/luce-org/lucebox-hub:cuda12   # NVIDIA
+docker pull ghcr.io/luce-org/lucebox-hub:cuda128  # RTX 5090
+docker pull ghcr.io/luce-org/lucebox-hub:cuda13   # GB10 / DGX Spark
 docker pull ghcr.io/luce-org/lucebox-hub:rocm     # AMD
 
 # 2. Download a target model into server/models/ and the DFlash draft
@@ -418,7 +422,7 @@ End-to-end repro: `DFLASH_SAMP=0.8,1.0,0,1.1,42 python server/scripts/bench_llm.
 | `DFLASH_FP_ALPHA=0.85` | `0.12` | Block-selection threshold; higher = stricter = fewer K-blocks |
 | `DFLASH_FP_PROFILE=1` | `0` | Per-stage timing log |
 
-When compression is on, the request path picks one of three modes automatically, so they never stack: the first turn is sent verbatim (the system prompt stays as a stable cache anchor), multi-turn continuations use **FlowKV** (only the aged history is compressed, recent turns kept verbatim, so the disk prefix cache from `--prefix-cache-slots` keeps hitting), and a single oversized prompt with no prior turns uses whole-prompt PFlash. With `--prefill-compression off` the request path is identical to a build without compression.
+When compression is on, the request policy keeps reusable state reusable. Structured system+user chats and tool requests preserve the target prefix so the live prefix cache can hit on later turns. A continuation also preserves that prefix unless the request explicitly enables FlowKV; in that mode only aged messages are compressed and recent turns remain verbatim. A true long one-shot prompt uses whole-prompt PFlash. Exact repeats can restore a completed PFlash/target snapshot from `--prefill-cache-slots`, skipping both scorer and target prefill. These paths are mutually exclusive; with compression off the request path is unchanged.
 
 **KV cache**
 
@@ -429,13 +433,13 @@ When compression is on, the request path picks one of three modes automatically,
 | `DFLASH27B_KV_Q4=1` | off | Q4_0 K+V (4.5 bpv, legacy, ~128K ceiling) |
 | `--prefix-cache-slots N` | — | Live prefix-cache slot count |
 | `DFLASH_PREFIX_CACHE_SLOTS=N` | `32` | Container-entrypoint equivalent of `--prefix-cache-slots`; the native binary itself uses the CLI flag. |
-| `DFLASH_PREFILL_CACHE_SLOTS=N` | `0` | Container-entrypoint equivalent of `--prefill-cache-slots`; the native binary itself uses the CLI flag. |
+| `--prefill-cache-slots N` / `DFLASH_PREFILL_CACHE_SLOTS=N` | `0` | Exact full-prompt snapshot slots. Automatic assigns four for qualified PFlash models; exact repeats skip scorer and target prefill. |
 | `--kv-cache-dir <path>` | — | Persist prefix cache to disk |
 | `--kv-cache-budget N` | — | On-disk cache size cap |
 
 **Bounded KV residency (KVFlash)**
 
-Pages the attention KV cache through a fixed pool of GPU slots; cold 64-token chunks live in host RAM, bit-exact and recallable. Decode speed stops depending on context length and resident KV stays pool-sized at any context. Off by default; works on every model family. Drafter-scored residency is the default on every family: the server finds the Qwen3-0.6B drafter next to the model (or via `--prefill-drafter`) and lazy-loads it as the relevance scorer that decides which chunks stay resident — non-qwen targets (laguna, gemma4) bridge the tokenizer gap by re-tokenizing the context text for the drafter. LRU is the fallback when no drafter is present, or the explicit choice via `--kvflash-policy lru`. Per-model numbers in [Luce KVFlash →](optimizations/kvflash/README.md).
+Pages a conventional attention KV cache through a fixed pool of GPU slots; cold 64-token chunks live in host RAM, bit-exact and recallable. Decode speed stops depending on context length and resident KV stays pool-sized at any context. Automatic enables only qualified model/backend combinations when full KV no longer fits; Laguna's CUDA path remains preview, and DeepSeek uses its native MLA-compressed cache instead of generic KVFlash. Drafter-scored residency uses the shared Qwen3-0.6B scorer; LRU is the fallback when no scorer is present, while qwen35 can use target-native QK scoring. Per-model numbers in [Luce KVFlash →](optimizations/kvflash/README.md).
 
 | Flag / env | Default | Effect |
 |---|---|---|
