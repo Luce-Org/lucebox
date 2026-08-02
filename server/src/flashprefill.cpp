@@ -377,9 +377,8 @@ int flash_prefill_forward_bf16(
     }
     // 4. sparse flash forward (BSA-or-WMMA)
 #ifdef DFLASH27B_HAVE_BSA
-    const bool bsa_requested =
+    static const bool use_bsa =
         environment_variable_enabled("DFLASH_FP_USE_BSA");
-    const bool use_bsa = bsa_requested;
     if (use_bsa && D == 128 && BLOCK == 128) {
         launch_bsa_sparse_flash_forward_bf16(
             Q, K, V, O, dIdx, dCnt, scale,
