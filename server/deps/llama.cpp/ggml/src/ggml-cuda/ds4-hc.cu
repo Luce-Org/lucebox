@@ -397,7 +397,19 @@ static __global__ void ds4_hc_post_split_kernel(
         const float * __restrict__ split,
         float       * __restrict__ dst,
         int n_embd,
-        int n_hc) {
+        int n_hc,
+        size_t residual_stride,
+        size_t main_block_stride,
+        size_t peer_block_stride,
+        size_t split_stride,
+        size_t dst_stride) {
+    const int token = (int) blockIdx.y;
+    residual += (size_t) token * residual_stride;
+    main_block += (size_t) token * main_block_stride;
+    peer_block += (size_t) token * peer_block_stride;
+    split += (size_t) token * split_stride;
+    dst += (size_t) token * dst_stride;
+
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     const int total = n_embd * n_hc;
     if (i >= total) {
@@ -530,10 +542,14 @@ void ggml_cuda_op_ds4_hc(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             GGML_ASSERT(src3 && src3->type == GGML_TYPE_F32);
             const int total = n_embd * n_hc;
             const int blocks = (total + 255) / 256;
-            ds4_hc_post_split_kernel<<<blocks, 256, 0, stream>>>(
+            const dim3 grid(blocks, n_tokens, 1);
+            ds4_hc_post_split_kernel<<<grid, 256, 0, stream>>>(
                 (const float *) src0->data, (const float *) src1->data,
                 (const float *) src3->data, (const float *) src2->data,
-                (float *) dst->data, n_embd, n_hc);
+                (float *) dst->data, n_embd, n_hc,
+                src0->nb[1] / sizeof(float), src1->nb[1] / sizeof(float),
+                src3->nb[1] / sizeof(float), src2->nb[1] / sizeof(float),
+                dst->nb[1] / sizeof(float));
         } break;
         default:
             GGML_ABORT("ds4_hc: unknown mode");

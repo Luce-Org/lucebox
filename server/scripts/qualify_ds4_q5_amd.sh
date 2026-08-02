@@ -26,6 +26,9 @@ BLOCK_RADIX_TOPK="${BLOCK_RADIX_TOPK:-1}"
 PACK_Q4_INDEXER="${PACK_Q4_INDEXER:-0}"
 Q5_VERIFY="${Q5_VERIFY:-1}"
 FP4_Q5_X4_PLUS1="${FP4_Q5_X4_PLUS1:-auto}"
+CRITICAL_PATH_PLACEMENT="${CRITICAL_PATH_PLACEMENT:-0}"
+MAIN_TO_PEER_RATE="${MAIN_TO_PEER_RATE:-3.4}"
+BALANCE_MIN_HOT="${BALANCE_MIN_HOT:-0}"
 EXPERT_BUDGET_MB="${EXPERT_BUDGET_MB:-13200}"
 WARMUP="${WARMUP:-2}"
 RUNS="${RUNS:-3}"
@@ -33,7 +36,9 @@ MAX_TOKENS="${MAX_TOKENS:-128}"
 TARGETS="${TARGETS:-2048 4096 8192 16384 2048}"
 VRAM_MONITOR_SECONDS="${VRAM_MONITOR_SECONDS:-2}"
 HASH_MODELS="${HASH_MODELS:-0}"
-RUN_ID="${RUN_ID:-ds4-q5-fr${FORCE_GRAPH_REPLAY}-direct${DIRECT_INDEXER_TOPK}-radix${BLOCK_RADIX_TOPK}-x4p1${FP4_Q5_X4_PLUS1}-$(date -u +%Y%m%dT%H%M%SZ)}"
+CUDA_GRAPH_STATS_EVERY="${CUDA_GRAPH_STATS_EVERY:-200}"
+CUDA_DISABLE_GRAPHS_DEVICES="${CUDA_DISABLE_GRAPHS_DEVICES:-}"
+RUN_ID="${RUN_ID:-ds4-q5-fr${FORCE_GRAPH_REPLAY}-direct${DIRECT_INDEXER_TOPK}-radix${BLOCK_RADIX_TOPK}-x4p1${FP4_Q5_X4_PLUS1}-cp${CRITICAL_PATH_PLACEMENT}-r${MAIN_TO_PEER_RATE}-$(date -u +%Y%m%dT%H%M%SZ)}"
 OUT_ROOT="${OUT_ROOT:-$CHECKOUT/results/ds4_q5_context_qualification}"
 OUT_DIR="$OUT_ROOT/$RUN_ID"
 SERVER_LOG="$OUT_DIR/server.log"
@@ -70,6 +75,19 @@ case "$FP4_Q5_X4_PLUS1" in
     auto|0|1) ;;
     *) echo "FP4_Q5_X4_PLUS1 must be auto, 0, or 1" >&2; exit 2 ;;
 esac
+case "$CRITICAL_PATH_PLACEMENT" in
+    0|1) ;;
+    *) echo "CRITICAL_PATH_PLACEMENT must be 0 or 1" >&2; exit 2 ;;
+esac
+if [[ ! "$MAIN_TO_PEER_RATE" =~ ^[0-9]+([.][0-9]+)?$ ]] ||
+   ! awk -v value="$MAIN_TO_PEER_RATE" 'BEGIN { exit !(value > 0) }'; then
+    echo "MAIN_TO_PEER_RATE must be greater than zero" >&2
+    exit 2
+fi
+if [[ ! "$BALANCE_MIN_HOT" =~ ^[0-9]+$ ]]; then
+    echo "BALANCE_MIN_HOT must be a non-negative integer" >&2
+    exit 2
+fi
 if [[ "$MMVQ_MAX_NCOLS" != auto && ! "$MMVQ_MAX_NCOLS" =~ ^[1-8]$ ]]; then
     echo "MMVQ_MAX_NCOLS must be auto or an integer from 1 through 8" >&2
     exit 2
@@ -116,6 +134,7 @@ server_env=(
     "PATH=$PATH"
     "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}"
     "GGML_CUDA_GRAPH_STATS=1"
+    "GGML_CUDA_GRAPH_STATS_EVERY=$CUDA_GRAPH_STATS_EVERY"
     "LUCE_CUDA_I32_REPEAT=1"
     "DFLASH_DS4_TOPK=4"
     "DFLASH_DS4_FUSED_VERIFY=1"
@@ -166,6 +185,21 @@ server_env=(
     "DFLASH_MOE_FUSED_COMBINE=0"
 )
 
+if [[ -n "$CUDA_DISABLE_GRAPHS_DEVICES" ]]; then
+    server_env+=(
+        "GGML_CUDA_DISABLE_GRAPHS_DEVICES=$CUDA_DISABLE_GRAPHS_DEVICES"
+    )
+fi
+
+# Preserve only the explicit profiler-wrapper controls across env -i. Ordinary
+# qualification runs leave these unset and retain the exact established env.
+for profiler_var in PROFILED_SERVER_BIN ROCPROF_OUTPUT_DIR \
+    ROCPROF_START_SECONDS ROCPROF_DURATION_SECONDS; do
+    if [[ -n "${!profiler_var:-}" ]]; then
+        server_env+=("$profiler_var=${!profiler_var}")
+    fi
+done
+
 if [[ "$MMVQ_MAX_NCOLS" != auto ]]; then
     server_env+=("LUCE_MMVQ_MAX_NCOLS=$MMVQ_MAX_NCOLS")
 fi
@@ -194,7 +228,13 @@ fi
 if [[ "$FP4_Q5_X4_PLUS1" != auto ]]; then
     server_env+=("DFLASH_CUDA_MMVQ_FP4_Q5_X4_PLUS1=$FP4_Q5_X4_PLUS1")
 fi
-
+if [[ "$CRITICAL_PATH_PLACEMENT" == 1 ]]; then
+    server_env+=(
+        "DFLASH_DS4_TP_CRITICAL_PATH_PLACEMENT=1"
+        "DFLASH_DS4_TP_MAIN_TO_PEER_RATE=$MAIN_TO_PEER_RATE"
+        "DFLASH_DS4_TP_BALANCE_MIN_HOT=$BALANCE_MIN_HOT"
+    )
+fi
 server_args=(
     "$SERVER_BIN" "$TARGET_MODEL"
     --host 127.0.0.1 --port "$PORT"
@@ -221,6 +261,9 @@ server_args=(
     echo "pack_q4_indexer=$PACK_Q4_INDEXER"
     echo "q5_verify=$Q5_VERIFY"
     echo "fp4_q5_x4_plus1=$FP4_Q5_X4_PLUS1"
+    echo "critical_path_placement=$CRITICAL_PATH_PLACEMENT"
+    echo "main_to_peer_rate=$MAIN_TO_PEER_RATE"
+    echo "balance_min_hot=$BALANCE_MIN_HOT"
     echo "cache_slots=$CACHE_SLOTS"
     echo "mmvq_max_ncols=$MMVQ_MAX_NCOLS"
     echo "targets=$TARGETS"
@@ -228,6 +271,8 @@ server_args=(
     echo "runs=$RUNS"
     echo "max_tokens=$MAX_TOKENS"
     echo "max_ctx=$MAX_CTX"
+    echo "cuda_graph_stats_every=$CUDA_GRAPH_STATS_EVERY"
+    echo "cuda_disable_graphs_devices=$CUDA_DISABLE_GRAPHS_DEVICES"
     sha256sum "$SERVER_BIN"
     stat -c 'target_model=%n bytes=%s mtime=%y' "$TARGET_MODEL"
     stat -c 'draft_model=%n bytes=%s mtime=%y' "$DRAFT_MODEL"

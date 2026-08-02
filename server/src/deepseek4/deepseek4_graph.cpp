@@ -4677,8 +4677,15 @@ struct DeepSeek4FusedDecodeCache {
     std::vector<ggml_tensor *> fn_ffn_f16;
     ggml_tensor * fn_out_f16 = nullptr;
 
+    void evict_graphs() {
+        for (auto & slot : slots) {
+            slot.destroy(backend);
+        }
+        counter = 0;
+    }
+
     void destroy() {
-        for (auto & s : slots) s.destroy(backend);
+        evict_graphs();
         if (fn_buf) { ggml_backend_buffer_free(fn_buf); fn_buf = nullptr; }
         if (fn_ctx) { ggml_free(fn_ctx); fn_ctx = nullptr; }
         fn_attn_f16.clear();
@@ -4712,7 +4719,7 @@ struct Ds4FusedVerifyCache {
         ggml_tensor * ape128 = nullptr;   // i32 [q]
         ggml_tensor * st4 = nullptr;      // i64 [1,q]
         ggml_tensor * st128 = nullptr;    // i64 [1,q]
-        ggml_tensor * capture = nullptr;  // f32 [n_embd*ncap*q], order [ci][t]
+        ggml_tensor * capture = nullptr;  // f32 [n_embd*ncap,q], token-major
         ggml_tensor * argmax = nullptr;   // i32 [q], optional greedy output
         // Reused host staging for the context-sized additive attention mask.
         // Keeping it per slot removes one allocation from every verify step.
@@ -4844,22 +4851,32 @@ static ggml_tensor * ds4_fused_hc_base_f32(ggml_context * ctx, ggml_tensor * bas
 static ggml_tensor * ds4_build_fused_hc_pre(
         ggml_context * ctx,
         const DeepSeek4Weights & w,
-        ggml_tensor * hc_flat,          // [n_embd*n_hc] contiguous f32
+        ggml_tensor * hc_flat,          // [n_embd*n_hc,n_tokens] contiguous f32
         ggml_tensor * fn,
         ggml_tensor * base,
         const HcWeightsCpu & cw,
         ggml_tensor ** out_split) {
     if (!fn || !base || !cw.loaded || cw.scale_data.size() < 3) return nullptr;
     const int mix_dim = 2 * w.n_hc + w.n_hc * w.n_hc;
+    const int64_t n_tokens = hc_flat->ne[1];
     ggml_tensor * normed = ggml_rms_norm(ctx, hc_flat, w.hc_eps);
     ggml_tensor * mix = ggml_mul_mat(ctx, fn, normed);
-    mix = ggml_reshape_1d(ctx, mix, mix_dim);
+    mix = n_tokens == 1
+        ? ggml_reshape_1d(ctx, mix, mix_dim)
+        : ggml_reshape_2d(ctx, mix, mix_dim, n_tokens);
     ggml_tensor * base_f32 = ds4_fused_hc_base_f32(ctx, base);
     ggml_tensor * pre = ggml_ds4_hc_pre(ctx, mix, base_f32, hc_flat,
                                         w.n_hc, w.n_hc_sinkhorn_iter,
                                         cw.scale_data[0], cw.scale_data[1], cw.scale_data[2]);
-    *out_split = ggml_view_1d(ctx, pre, mix_dim, (size_t) w.n_embd * sizeof(float));
-    return ggml_view_1d(ctx, pre, w.n_embd, 0);
+    if (n_tokens == 1) {
+        *out_split = ggml_view_1d(
+            ctx, pre, mix_dim, (size_t) w.n_embd * sizeof(float));
+        return ggml_view_1d(ctx, pre, w.n_embd, 0);
+    }
+    *out_split = ggml_view_2d(
+        ctx, pre, mix_dim, n_tokens, pre->nb[1],
+        (size_t) w.n_embd * sizeof(float));
+    return ggml_view_2d(ctx, pre, w.n_embd, n_tokens, pre->nb[1], 0);
 }
 
 static ggml_tensor * ds4_build_hash_routed_ffn(
@@ -7401,16 +7418,96 @@ bool deepseek4_step_layer_range(
                 auto & attn_alloc = heterogeneous_sparse_prefill
                     ? shared_prefill_attn_alloc
                     : cached_attn_allocs[(size_t)il];
+                constexpr size_t shared_prefill_max_chunk =
+                    128u * 1024u * 1024u;
                 if (!attn_alloc.valid() || attn_alloc.owner_ctx != w.ctx || attn_alloc.backend != backend) {
                     attn_alloc.free();
-                    attn_alloc.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+                    attn_alloc.alloc = heterogeneous_sparse_prefill
+                        ? ggml_gallocr_new_with_max_chunk_size(
+                              ggml_backend_get_default_buffer_type(backend),
+                              shared_prefill_max_chunk)
+                        : ggml_gallocr_new(
+                              ggml_backend_get_default_buffer_type(backend));
                     attn_alloc.owner_ctx = w.ctx;
                     attn_alloc.backend = backend;
                 }
-                if (!attn_alloc.alloc || !ggml_gallocr_alloc_graph(attn_alloc.alloc, gf)) {
+                const size_t attn_bytes_before =
+                    heterogeneous_sparse_prefill && attn_alloc.alloc
+                        ? ggml_gallocr_get_buffer_size(attn_alloc.alloc, 0)
+                        : 0;
+                if (heterogeneous_sparse_prefill && attn_alloc.alloc) {
+                    ggml_gallocr_t sizing =
+                        ggml_gallocr_new_with_max_chunk_size(
+                            ggml_backend_get_default_buffer_type(backend),
+                            shared_prefill_max_chunk);
+                    size_t required_bytes = 0;
+                    ggml_gallocr_reserve_n_size(
+                        sizing, gf, nullptr, nullptr, &required_bytes);
+                    ggml_gallocr_free(sizing);
+
+                    if (required_bytes > attn_bytes_before) {
+                        size_t free_bytes = 0;
+                        size_t total_bytes = 0;
+                        ggml_backend_cuda_get_device_memory(
+                            device, &free_bytes, &total_bytes);
+                        (void) total_bytes;
+                        constexpr size_t growth_margin =
+                            128u * 1024u * 1024u;
+                        const size_t replaceable_bytes =
+                            free_bytes + attn_bytes_before;
+                        if (replaceable_bytes < required_bytes + growth_margin) {
+                            // The shared arena is about to grow after decode
+                            // graphs have occupied the remaining VRAM. Retire
+                            // those reproducible caches before cudaMalloc: a
+                            // failed allocator resize cannot safely be retried
+                            // in place on every HIP runtime.
+                            ggml_backend_synchronize(backend);
+                            if (moe_hybrid && moe_hybrid->cold_backend &&
+                                moe_hybrid->cold_backend != backend) {
+                                ggml_backend_synchronize(
+                                    moe_hybrid->cold_backend);
+                            }
+                            layer_range_cache.fused_verify_graph_cache.destroy();
+                            layer_range_cache.fused_capture_graph_cache.destroy();
+                            // q=1 decode slots are also reproducible, while
+                            // their F16 HC mirrors are required by the active
+                            // prefill and must remain resident.
+                            layer_range_cache.fused_decode_graph_cache.evict_graphs();
+                            size_t free_after_evict = 0;
+                            ggml_backend_cuda_get_device_memory(
+                                device, &free_after_evict, &total_bytes);
+                            std::fprintf(stderr,
+                                "[deepseek4] evicted fused decode graphs "
+                                "before prefill scratch growth at pos=%d "
+                                "layer=%d required=%.1f MiB current=%.1f MiB "
+                                "free=%.1f->%.1f MiB\n",
+                                kv_start, il,
+                                required_bytes / (1024.0 * 1024.0),
+                                attn_bytes_before / (1024.0 * 1024.0),
+                                free_bytes / (1024.0 * 1024.0),
+                                free_after_evict / (1024.0 * 1024.0));
+                        }
+                    }
+                }
+                const bool attn_allocated = attn_alloc.alloc &&
+                    ggml_gallocr_alloc_graph(attn_alloc.alloc, gf);
+                if (!attn_allocated) {
                     std::fprintf(stderr, "[deepseek4] attn graph alloc failed layer %d\n", il);
                     ggml_free(ctx);
                     return false;
+                }
+                if (heterogeneous_sparse_prefill) {
+                    const size_t attn_bytes_after =
+                        ggml_gallocr_get_buffer_size(attn_alloc.alloc, 0);
+                    if (attn_bytes_after > attn_bytes_before) {
+                        std::fprintf(stderr,
+                            "[deepseek4] shared prefill scratch grew "
+                            "%.1f->%.1f MiB across %d chunk(s)\n",
+                            attn_bytes_before / (1024.0 * 1024.0),
+                            attn_bytes_after / (1024.0 * 1024.0),
+                            ggml_gallocr_get_buffer_n_chunks(
+                                attn_alloc.alloc, 0));
+                    }
                 }
                 if (telemetry) telemetry->attn_build_us += ds4_elapsed_us(attn_build_t0, Ds4TimingClock::now());
                 if (attn_in_backend) {

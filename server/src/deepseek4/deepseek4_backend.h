@@ -26,6 +26,13 @@
 
 namespace dflash::common {
 
+// Bounds the sparse heterogeneous prefill arena once accumulated attention
+// context dominates its memory footprint. Decode batching is unaffected.
+int deepseek4_hybrid_prefill_chunk_tokens(
+    int requested_chunk,
+    int context_end,
+    int current_cap = 0);
+
 class DeepSeek4Backend : public ModelBackend {
 public:
     explicit DeepSeek4Backend(const DeepSeek4BackendConfig & cfg);
@@ -99,6 +106,9 @@ private:
     ggml_backend_t                 spec_backend_ = nullptr;
     std::unique_ptr<DSparkDrafter> spec_drafter_;
     std::vector<float>             spec_feat_window_;
+    // Once a long prompt selects the fragmentation-safe prefill shape, retain
+    // it for later requests so the HIP arenas never switch back under load.
+    int                            hybrid_prefill_chunk_cap_ = 0;
 
     bool load_spec_drafter();
     void release_spec_drafter(bool mark_parked);
