@@ -12,7 +12,27 @@ namespace dflash::common {
 
 // ─── Chat marker resolution ────────────────────────────────────────────
 
-bool resolve_chat_markers(const Tokenizer & tok, ChatMarkers & out) {
+bool resolve_chat_markers(const Tokenizer & tok, const std::string & arch,
+                          ChatMarkers & out) {
+    // DeepSeek V4 uses DSML. Unlike ChatML, messages are separated by role
+    // starts rather than paired start/end delimiters:
+    //   <BOS>{system}<User>{user}<Assistant>...<EOS><User>...
+    // Resolve this before tokenizer-based probes so the architecture cannot
+    // be mistaken for another family whose marker strings are tokenizable.
+    if (arch == "deepseek4") {
+        auto bos = tok.encode("<｜begin▁of▁sentence｜>");
+        auto user = tok.encode("<｜User｜>");
+        auto assistant = tok.encode("<｜Assistant｜>");
+        if (!bos.empty() && !user.empty() && !assistant.empty()) {
+            out.family = "deepseek4";
+            out.sys_role_prefix = bos;
+            out.next_role_starts = {user, assistant};
+            out.boundary_on_role_start = true;
+            return true;
+        }
+        return false;
+    }
+
     // Try Qwen family: <|im_end|> and <|im_start|> should be single tokens.
     auto im_end = tok.encode("<|im_end|>");
     auto im_start = tok.encode("<|im_start|>");
@@ -37,20 +57,23 @@ bool resolve_chat_markers(const Tokenizer & tok, ChatMarkers & out) {
         return true;
     }
 
-    // Try Laguna family: XML-style markers.
-    auto start_sys = tok.encode("<system>");
-    auto end_sys   = tok.encode("</system>");
-    auto start_usr = tok.encode("<user>");
-    auto end_usr   = tok.encode("</user>");
-    auto start_ast = tok.encode("<assistant>");
-    auto end_ast   = tok.encode("</assistant>");
-    if (!start_sys.empty() && !end_sys.empty() && !start_usr.empty() &&
-        !end_usr.empty() && !start_ast.empty() && !end_ast.empty()) {
-        out.family = "laguna";
-        out.sys_role_prefix = start_sys;
-        out.end_msg_seqs = {end_sys, end_usr, end_ast};
-        out.next_role_starts = {start_usr, start_ast, start_sys};
-        return true;
+    // Laguna uses XML strings that every BPE tokenizer can encode, so only
+    // select this template when the loader identified the architecture.
+    if (arch == "laguna") {
+        auto start_sys = tok.encode("<system>");
+        auto end_sys   = tok.encode("</system>");
+        auto start_usr = tok.encode("<user>");
+        auto end_usr   = tok.encode("</user>");
+        auto start_ast = tok.encode("<assistant>");
+        auto end_ast   = tok.encode("</assistant>");
+        if (!start_sys.empty() && !end_sys.empty() && !start_usr.empty() &&
+            !end_usr.empty() && !start_ast.empty() && !end_ast.empty()) {
+            out.family = "laguna";
+            out.sys_role_prefix = start_sys;
+            out.end_msg_seqs = {end_sys, end_usr, end_ast};
+            out.next_role_starts = {start_usr, start_ast, start_sys};
+            return true;
+        }
     }
 
     return false;
@@ -98,6 +121,17 @@ std::vector<int> find_all_boundaries(const std::vector<int32_t> & ids,
     if (sys_idx < 0) return out;
 
     int cursor = sys_idx + (int)markers.sys_role_prefix.size();
+    if (markers.boundary_on_role_start) {
+        while (true) {
+            auto [role_idx, role_len] =
+                find_first_seq_any(ids, markers.next_role_starts, cursor);
+            if (role_idx < 0) break;
+            cursor = role_idx + role_len;
+            out.push_back(cursor);
+        }
+        return out;
+    }
+
     while (true) {
         auto [end_idx, end_len] = find_first_seq_any(ids, markers.end_msg_seqs, cursor);
         if (end_idx < 0) break;
@@ -183,7 +217,8 @@ int select_inline_snapshot_boundary(const std::vector<int> & boundaries,
 
 // ─── PrefixCache ────────────────────────────────────────────────────────
 
-PrefixCache::PrefixCache(int cap, const Tokenizer & tokenizer)
+PrefixCache::PrefixCache(int cap, const Tokenizer & tokenizer,
+                         const std::string & arch)
     : cap_(std::min(cap, MAX_SLOTS))
 {
     if (cap_ <= 0) {
@@ -191,7 +226,7 @@ PrefixCache::PrefixCache(int cap, const Tokenizer & tokenizer)
         cap_ = 0;
         return;
     }
-    if (!resolve_chat_markers(tokenizer, markers_)) {
+    if (!resolve_chat_markers(tokenizer, arch, markers_)) {
         std::fprintf(stderr, "[pc] could not resolve chat markers; prefix cache disabled\n");
         disabled_ = true;
         cap_ = 0;

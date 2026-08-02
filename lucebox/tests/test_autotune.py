@@ -22,7 +22,7 @@ def test_wsl_24gb_defaults_leave_cuda_headroom() -> None:
     # to False makes the host config match runtime behaviour. See the
     # `entrypoint.sh` warning emitted when the two are out-of-sync.
     assert runtime.lazy is False
-    assert runtime.prefix_cache_slots == 32
+    assert runtime.prefix_cache_slots == 8
 
 
 def test_native_24gb_caps_context_below_vmm_failure_boundary() -> None:
@@ -31,7 +31,7 @@ def test_native_24gb_caps_context_below_vmm_failure_boundary() -> None:
     assert runtime.budget == 22
     assert runtime.max_ctx == 98304
     assert runtime.lazy is False  # see WSL test above
-    assert runtime.prefix_cache_slots == 32
+    assert runtime.prefix_cache_slots == 8
 
 
 def test_no_heuristic_tier_sets_lazy_without_prefill_drafter() -> None:
@@ -125,6 +125,40 @@ def test_qwen_24gb_enables_dflash_and_pflash_but_prefers_full_kv(
     assert env["DFLASH_PREFILL_CACHE_SLOTS"] == "4"
     assert "DFLASH_KVFLASH" not in env
     assert "DFLASH_SPARK" not in env
+
+
+def test_gb10_hides_unqualified_pflash_and_keeps_exact_prefill(
+    tmp_path: Path,
+) -> None:
+    cfg = _cfg(
+        tmp_path,
+        "qwen3.6-27b",
+        HostFacts(
+            gpu_vendor="nvidia",
+            has_nvidia_gpu=True,
+            gpu_name="NVIDIA GB10",
+            gpu_count=1,
+            vram_gb=105,
+            gpu_sm="121",
+            ram_gb=121,
+            nvidia_gpu_name="NVIDIA GB10",
+            nvidia_gpu_count=1,
+            nvidia_gpu_arch="121",
+            nvidia_unified_memory=True,
+        ),
+    )
+    _install_optimizer_drafter(cfg)
+    _install_decode_draft(cfg)
+
+    plan = automatic_plan(cfg)
+
+    assert plan.dflash.enabled is True
+    assert plan.pflash.available is False
+    assert plan.pflash.enabled is False
+    assert plan.runtime.prefill_mode == "off"
+    assert "GB10" in plan.pflash.reason
+    assert "prefix reuse" in plan.pflash.reason
+    assert "DFLASH_PREFILL_MODE" not in _server_env_for_plan(cfg, plan)
 
 
 def test_published_draft_is_not_claimed_until_it_is_installed(tmp_path: Path) -> None:
@@ -311,6 +345,35 @@ def test_deepseek_compact_mla_cache_avoids_the_generic_full_kv_context_cap(
     assert plan.placement.runnable is True
     assert plan.runtime.max_ctx == 131072
     assert plan.runtime.ds4_prefill == "exact"
+
+
+def test_deepseek_disables_unqualified_dspark_on_gb10(tmp_path: Path) -> None:
+    cfg = _cfg(
+        tmp_path,
+        "deepseek-v4-flash",
+        HostFacts(
+            gpu_vendor="nvidia",
+            has_nvidia_gpu=True,
+            gpu_name="NVIDIA GB10",
+            vram_gb=128,
+            ram_gb=256,
+            gpu_sm="121",
+            nvidia_gpu_name="NVIDIA GB10",
+            nvidia_gpu_count=1,
+            nvidia_vram_gb=128,
+            nvidia_gpu_arch="121",
+        ),
+    )
+    _install_decode_draft(cfg)
+
+    plan = automatic_plan(cfg)
+
+    assert plan.dflash.name == "DSpark"
+    assert plan.dflash.available is False
+    assert plan.dflash.enabled is False
+    assert plan.runtime.speculative_decode is False
+    assert plan.decode_strategy == "Autoregressive decode"
+    assert "GB10" in plan.dflash.reason
 
 
 def test_spark_stays_off_when_host_ram_cannot_hold_cold_experts(
@@ -568,14 +631,15 @@ def test_featured_model_strix_only_contract_reaches_exact_server_environment(
     assert plan.placement.runtime.target_device == "hip:0"
     assert plan.placement.runtime.uses_multiple_devices is False
     assert plan.runtime.max_ctx == 131072
-    assert plan.runtime.prefix_cache_slots == 32
+    expected_prefix_slots = 4 if preset_name == "deepseek-v4-flash" else 8
+    assert plan.runtime.prefix_cache_slots == expected_prefix_slots
     assert plan.runtime.prefill_cache_slots == (4 if pflash_enabled else 0)
     assert plan.dflash.enabled is decode_enabled
     assert plan.pflash.enabled is pflash_enabled
     assert plan.kvflash.enabled is False
     assert plan.spark.enabled is False
     assert env["DFLASH_TARGET_DEVICE"] == "hip:0"
-    assert env["DFLASH_PREFIX_CACHE_SLOTS"] == "32"
+    assert env["DFLASH_PREFIX_CACHE_SLOTS"] == str(expected_prefix_slots)
     assert env["DFLASH_PREFILL_CACHE_SLOTS"] == ("4" if pflash_enabled else "0")
     assert "DFLASH_TARGET_DEVICES" not in env
     assert ("DFLASH_PREFILL_MODE" in env) is pflash_enabled
@@ -638,7 +702,8 @@ def test_featured_model_roomy_gpu_contract_reaches_exact_server_environment(
     env = dict(server_run_spec(launch_cfg).env)
 
     assert plan.placement.runnable is True
-    assert plan.runtime.prefix_cache_slots == 32
+    expected_prefix_slots = 4 if preset_name == "deepseek-v4-flash" else 8
+    assert plan.runtime.prefix_cache_slots == expected_prefix_slots
     assert plan.runtime.prefill_cache_slots == (4 if pflash_enabled else 0)
     assert plan.dflash.enabled is bool(decode_name)
     assert plan.dflash.name == (decode_name or "DFlash")
@@ -647,7 +712,7 @@ def test_featured_model_roomy_gpu_contract_reaches_exact_server_environment(
     assert plan.spark.enabled is False
     assert env["DFLASH_MODEL_NAME"] == preset_name
     assert env["DFLASH_TARGET_DEVICE"] == ("cuda:0" if vendor == "nvidia" else "hip:0")
-    assert env["DFLASH_PREFIX_CACHE_SLOTS"] == "32"
+    assert env["DFLASH_PREFIX_CACHE_SLOTS"] == str(expected_prefix_slots)
     assert env["DFLASH_PREFILL_CACHE_SLOTS"] == ("4" if pflash_enabled else "0")
     assert ("DFLASH_PREFILL_MODE" in env) is pflash_enabled
     assert "DFLASH_KVFLASH" not in env

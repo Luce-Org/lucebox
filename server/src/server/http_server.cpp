@@ -23,6 +23,7 @@
 #include "tool_hint.h"
 #include "common/sha1.h"
 #include "freeze_history.h"
+#include "flashprefill.h"
 
 #ifdef DFLASH_HAS_CURL
 #include <curl/curl.h>
@@ -1072,7 +1073,7 @@ HttpServer::HttpServer(ModelBackend & backend,
     , tokenizer_(tokenizer)
     , config_(config)
     , chat_format_(ChatFormat::QWEN3)  // default, overridden by arch
-    , prefix_cache_(config.prefix_cache_cap, tokenizer)
+    , prefix_cache_(config.prefix_cache_cap, tokenizer, config.arch)
     , disk_cache_({config.disk_cache_dir,
                    config.disk_cache_budget_mb * (size_t)(1024 * 1024),
                    config.disk_cache_min_tokens,
@@ -2711,6 +2712,18 @@ HttpServer::PreparedPrompt HttpServer::prepare_prompt(
 
     if (config_.pflash_mode != ServerConfig::PflashMode::OFF &&
         drafter_tokenizer_ != nullptr) {
+        // GB10's local custom sparse scorer kernels are not qualified. Check
+        // before loading or running the drafter so a stale/manual PFlash
+        // profile degrades to exact prefill instead of touching that path.
+        // A remote drafter runs on its own backend and remains independent.
+#if defined(DFLASH27B_BACKEND_CUDA)
+        if (!config_.pflash_remote_drafter &&
+            !flashprefill::local_pflash_supported_on_current_device()) {
+            std::fprintf(stderr,
+                "[pflash] local scorer unavailable on this GPU; using exact prefill\n");
+            return prepared;
+        }
+#endif
         const int prompt_tokens = (int) req.prompt_tokens.size();
         const bool continuation = is_continuation_request(req.messages);
         const bool has_tools = req.tools.is_array() && !req.tools.empty();
@@ -2754,8 +2767,15 @@ HttpServer::PreparedPrompt HttpServer::prepare_prompt(
         } else if (strategy == PflashRequestStrategy::WholePrompt) {
             prepared.error = apply_pflash_compression(req, prepared);
             if (!prepared.error.empty()) {
-                prepared.error_status = 500;
-                return prepared;
+                // PFlash is optional acceleration. The backend restores its
+                // target residency before returning a compression failure,
+                // so an otherwise valid request can safely continue verbatim.
+                std::fprintf(stderr,
+                    "[pflash] %s; falling back to exact prefill\n",
+                    prepared.error.c_str());
+                prepared.error.clear();
+                prepared.tokens = req.prompt_tokens;
+                prepared.compressed = false;
             }
         }
     }

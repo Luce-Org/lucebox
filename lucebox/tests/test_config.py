@@ -483,7 +483,7 @@ def test_automatic_runtime_preserves_model_card_thinking_budget(tmp_path: Path) 
     loaded = config.load(path)
     assert loaded is not None
     assert loaded.dflash.think_max is None
-    assert loaded.dflash.prefix_cache_slots == 32
+    assert loaded.dflash.prefix_cache_slots == 8
 
 
 def test_explicit_thinking_budget_round_trips(tmp_path: Path) -> None:

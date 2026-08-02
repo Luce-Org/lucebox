@@ -21,7 +21,9 @@
 #include "common/sampler.h"
 #include "common/backend_precision.h"
 #include "common/backend_ipc.h"
+#include "common/platform_env.h"
 #include "common/moe_hybrid_ffn_eval.h"
+#include "flashprefill.h"
 #include "placement/pflash_placement.h"
 #include "common/io_utils.h"
 #include "placement/placement_config.h"
@@ -34,6 +36,7 @@
 #include "ggml-cpu.h"
 #include "server/prompt_normalize.h"
 #include "qwen3_drafter_model.h"
+#include "deepseek4/deepseek4_backend.h"
 #include "dflash27b.h"
 #include "gguf.h"
 #include <nlohmann/json.hpp>
@@ -89,6 +92,30 @@ struct ServerUnitFixture {};
             std::to_string(__LINE__) + ": " + #expr + " — " + std::string(msg)); \
     } \
 } while (0)
+
+TEST_CASE(ServerUnitFixture, test_feature_flag_and_sparse_hardware_policy) {
+    constexpr const char * flag = "DFLASH_TEST_FEATURE_FLAG";
+    dflash_unsetenv(flag);
+    TEST_ASSERT(!environment_variable_enabled(flag));
+    dflash_setenv(flag, "0");
+    TEST_ASSERT(!environment_variable_enabled(flag));
+    dflash_setenv(flag, "1");
+    TEST_ASSERT(environment_variable_enabled(flag));
+    dflash_unsetenv(flag);
+
+    TEST_ASSERT(!flashprefill::custom_bf16_sparse_supports_cuda_sm(75));
+    TEST_ASSERT(flashprefill::custom_bf16_sparse_supports_cuda_sm(80));
+    TEST_ASSERT(flashprefill::custom_bf16_sparse_supports_cuda_sm(86));
+    TEST_ASSERT(flashprefill::custom_bf16_sparse_supports_cuda_sm(120));
+    TEST_ASSERT(!flashprefill::custom_bf16_sparse_supports_cuda_sm(121));
+    TEST_ASSERT(flashprefill::local_pflash_supports_cuda_sm(75));
+    TEST_ASSERT(flashprefill::local_pflash_supports_cuda_sm(120));
+    TEST_ASSERT(!flashprefill::local_pflash_supports_cuda_sm(121));
+
+    TEST_ASSERT(deepseek4_dspark_supports_cuda_sm(90));
+    TEST_ASSERT(deepseek4_dspark_supports_cuda_sm(120));
+    TEST_ASSERT(!deepseek4_dspark_supports_cuda_sm(121));
+}
 
 // ─── Helper: create an SseEmitter with minimal config ──────────────────
 
@@ -1785,6 +1812,31 @@ TEST_CASE(ServerUnitFixture, test_tool_schema_is_part_of_stable_system_boundary)
                 hash_prefix(prompt_new_user.data(), system_end));
     TEST_ASSERT(hash_prefix(prompt_a.data(), system_end) !=
                 hash_prefix(prompt_new_tools.data(), system_end));
+}
+
+TEST_CASE(ServerUnitFixture, test_deepseek_role_starts_are_safe_boundaries) {
+    // Synthetic DSML-shaped prompt:
+    //   <BOS> system <User> u1 <Assistant> a1 <EOS> <User> u2 <Assistant>
+    // DeepSeek has no explicit system/user end delimiter. The role marker
+    // itself is the safe cut after all preceding content has been consumed.
+    ChatMarkers markers;
+    markers.family = "deepseek4";
+    markers.sys_role_prefix = {10};
+    markers.next_role_starts = {{20}, {30}};
+    markers.boundary_on_role_start = true;
+
+    const std::vector<int32_t> prompt = {
+        10, 100, 20, 200, 30, 300, 40, 20, 400, 30,
+    };
+    const auto bounds = find_all_boundaries(prompt, markers);
+    TEST_ASSERT(bounds == std::vector<int>({3, 5, 8, 10}));
+
+    // The snapshot excludes the current user text while preserving the full
+    // stable conversation prefix, matching the existing ChatML policy.
+    TEST_ASSERT(select_inline_snapshot_boundary(bounds) == 8);
+
+    const std::vector<int32_t> missing_bos = {100, 20, 200, 30};
+    TEST_ASSERT(find_all_boundaries(missing_bos, markers).empty());
 }
 
 TEST_CASE(ServerUnitFixture, test_inline_snapshot_boundary_advances_past_restore) {
@@ -4118,7 +4170,7 @@ TEST_CASE(ServerUnitFixture, test_sampler_needs_logit_processing) {
 
 TEST_CASE(ServerUnitFixture, test_server_config_cache_defaults) {
     ServerConfig cfg;
-    TEST_ASSERT(cfg.prefix_cache_cap == 32);
+    TEST_ASSERT(cfg.prefix_cache_cap == 8);
     TEST_ASSERT(cfg.prefill_cache_cap == 0);
 }
 
@@ -4172,7 +4224,7 @@ TEST_CASE(ServerUnitFixture, test_props_model_card_wholesale_sidecar) {
     };
     ServerConfig cfg = make_props_config_with_sidecar(sidecar);
     Tokenizer    tok;
-    PrefixCache  pc(0, tok);
+    PrefixCache  pc(0, tok, cfg.arch);
     ToolMemory   tm;
     json body = build_props_body(cfg, pc, tm);
 
@@ -4205,7 +4257,7 @@ TEST_CASE(ServerUnitFixture, test_props_model_card_null_on_family_fallback) {
     cfg.hard_limit_reply_budget = 512;
     cfg.think_max_tokens        = 32256;
     Tokenizer    tok;
-    PrefixCache  pc(0, tok);
+    PrefixCache  pc(0, tok, cfg.arch);
     ToolMemory   tm;
     json body = build_props_body(cfg, pc, tm);
 
@@ -4241,7 +4293,7 @@ TEST_CASE(ServerUnitFixture, test_props_budget_envelope_shape) {
     cfg.effort_tiers.max    = 500;
 
     Tokenizer    tok;
-    PrefixCache  pc(0, tok);
+    PrefixCache  pc(0, tok, cfg.arch);
     ToolMemory   tm;
     json body = build_props_body(cfg, pc, tm);
 
@@ -4290,7 +4342,7 @@ TEST_CASE(ServerUnitFixture, test_props_runtime_shape) {
     cfg.draft_device    = "auto:0";
 
     Tokenizer    tok;
-    PrefixCache  pc(0, tok);
+    PrefixCache  pc(0, tok, cfg.arch);
     ToolMemory   tm;
     json body = build_props_body(cfg, pc, tm);
 

@@ -24,6 +24,10 @@
 
 namespace dflash::common {
 
+bool deepseek4_dspark_supports_cuda_sm(int sm) {
+    return sm != 121;
+}
+
 namespace {
 using Clock = std::chrono::steady_clock;
 
@@ -38,6 +42,19 @@ static uint64_t elapsed_us(Clock::time_point start, Clock::time_point end) {
 static bool env_flag_enabled(const char * name) {
     const char * value = std::getenv(name);
     return value && value[0] && std::strcmp(value, "0") != 0;
+}
+
+static bool dspark_supported_on_current_device(int gpu, int & cuda_sm) {
+    cuda_sm = 0;
+#if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
+    (void) gpu;
+    return true;
+#else
+    cudaDeviceProp prop{};
+    if (cudaGetDeviceProperties(&prop, gpu) != cudaSuccess) return false;
+    cuda_sm = prop.major * 10 + prop.minor;
+    return deepseek4_dspark_supports_cuda_sm(cuda_sm);
+#endif
 }
 
 static void configure_gfx1151_dspark_mmvq_default(int gpu) {
@@ -627,7 +644,7 @@ void DeepSeek4Backend::release_spec_drafter(bool mark_parked) {
         spec_backend_ = nullptr;
     }
     spec_enabled_ = false;
-    spec_feat_window_.clear();
+    std::vector<float>().swap(spec_feat_window_);
     spec_drafter_parked_ = mark_parked && !spec_draft_path_.empty();
 }
 
@@ -704,7 +721,20 @@ bool DeepSeek4Backend::init() {
                  prefill_attention_mode_name(cfg_.prefill_mode),
                  moe_hybrid_ ? " [hybrid]" : "");
 
-    if (env_flag_enabled("DFLASH_DS4_SPEC")) {
+    const bool dspark_requested = env_flag_enabled("DFLASH_DS4_SPEC");
+    int dspark_cuda_sm = 0;
+    if (dspark_requested &&
+        !dspark_supported_on_current_device(cfg_.device.gpu, dspark_cuda_sm)) {
+        if (dspark_cuda_sm == 121) {
+            std::fprintf(stderr,
+                "[deepseek4] DSpark disabled: CUDA sm_121 is not qualified; "
+                "continuing with autoregressive decode\n");
+        } else {
+            std::fprintf(stderr,
+                "[deepseek4] DSpark disabled: selected CUDA device could not "
+                "be qualified; continuing with autoregressive decode\n");
+        }
+    } else if (dspark_requested) {
         const char * dp = std::getenv("DFLASH_DS4_DRAFT");
         if (dp && *dp) {
             spec_draft_path_ = dp;
@@ -941,9 +971,10 @@ bool DeepSeek4Backend::park(ParkTarget target) {
 
     maybe_save_routing_stats();
     for (int i = 0; i < PREFIX_SLOTS; ++i) {
-        free_deepseek4_snapshot(snapshots_[i]);
+        snapshot_free(i);
     }
-    last_logits_.clear();
+    std::vector<float>().swap(last_logits_);
+    std::vector<float>().swap(spec_feat_window_);
     free_deepseek4_cache(cache_);
     expert_runtime_.reset();
     stream_engine_.destroy();
@@ -1044,7 +1075,9 @@ bool DeepSeek4Backend::unpark(ParkTarget target) {
 
 int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                                   const DaemonIO & io,
-                                  int kv_offset) {
+                                  int kv_offset,
+                                  int snap_pos,
+                                  int snap_slot) {
     // The all-hot layer-range path supports causal chunked prefill. The
     // optimized graph snapshots the previous raw SWA window, attends over
     // that snapshot plus the current ubatch, and commits only the final SWA
@@ -1108,10 +1141,17 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
     DeepSeek4StepTelemetry tel_acc;
     int steps = 0;
 
-    for (int i = 0; i < n_total; i += chunk) {
+    for (int i = 0; i < n_total;) {
         if (io.cancelled) return pos;
 
-        const int n_tok = std::min(chunk, n_total - i);
+        int n_tok = std::min(chunk, n_total - i);
+        // The cache key names an exact token prefix. Split only the chunk
+        // that crosses that prefix so the saved recurrent/compressor state
+        // cannot include tokens beyond the key. Exact prefill is already
+        // tokenwise; preview batched modes keep normal chunking elsewhere.
+        if (snap_slot >= 0 && snap_pos > pos && snap_pos < pos + n_tok) {
+            n_tok = snap_pos - pos;
+        }
 
         // Embed tokens
         std::vector<float> embed(w_.n_embd * n_tok);
@@ -1177,6 +1217,19 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         }
         last_logits_ = std::move(logits);
         pos += n_tok;
+        i += n_tok;
+
+        if (snap_slot >= 0 && snap_pos > 0 && pos == snap_pos) {
+            if (snapshot_save(snap_slot)) {
+                std::fprintf(stderr,
+                    "[deepseek4] inline-snap slot=%d cur_pos=%d\n",
+                    snap_slot, snapshot_cur_pos(snap_slot));
+            } else {
+                std::fprintf(stderr,
+                    "[deepseek4] inline-snap failed slot=%d requested=%d\n",
+                    snap_slot, snap_pos);
+            }
+        }
     }
     if (timing) {
         log_step_tel("prefill", n_total, steps, elapsed_s(phase_t0), tel_acc);
@@ -1317,12 +1370,23 @@ GenerateResult DeepSeek4Backend::generate_impl(const GenerateRequest & req,
     }
 
     // Prefill
-    int committed = do_prefill(req.prompt, out_io);
+    int committed = do_prefill(
+        req.prompt, out_io, /*kv_offset=*/0, req.snap_pos, req.snap_slot);
     if (committed < 0) {
         result.fail(GenerateErrorCode::PrefillFailed);
         return result;
     }
-    result.prefill_s = elapsed_s(t0);
+    return finish_generation(req, out_io, committed, elapsed_s(t0), req.prompt);
+}
+
+GenerateResult DeepSeek4Backend::finish_generation(
+        const GenerateRequest & req,
+        const DaemonIO & out_io,
+        int committed,
+        double prefill_s,
+        const std::vector<int32_t> & history_prefix) {
+    GenerateResult result;
+    result.prefill_s = prefill_s;
 
     if (out_io.cancelled) {
         result.succeed();
@@ -1396,7 +1460,7 @@ GenerateResult DeepSeek4Backend::generate_impl(const GenerateRequest & req,
     gen_tokens.reserve(req.n_gen);
 
     bool forced_close = false;
-    if (!do_decode(committed, req.n_gen, req.prompt, gen_tokens, out_io,
+    if (!do_decode(committed, req.n_gen, history_prefix, gen_tokens, out_io,
                    req.budget_hook, &forced_close)) {
         result.fail(GenerateErrorCode::DecodeFailed);
         return result;
@@ -1414,30 +1478,88 @@ GenerateResult DeepSeek4Backend::generate_impl(const GenerateRequest & req,
 
 bool DeepSeek4Backend::snapshot_save(int slot) {
     if (slot < 0 || slot >= PREFIX_SLOTS) return false;
-    // TODO: Implement snapshot save (copy KV cache + HC state to CPU)
-    return false;
+    auto & snap = snapshots_[slot];
+    snapshot_free(slot);
+    if (!deepseek4_snapshot_save(cache_, snap_backend_, snap.cache)) {
+        snapshot_free(slot);
+        return false;
+    }
+    snap.last_logits = last_logits_;
+    snap.spec_feat_window = spec_feat_window_;
+    return true;
 }
 
 void DeepSeek4Backend::snapshot_free(int slot) {
     if (slot < 0 || slot >= PREFIX_SLOTS) return;
-    free_deepseek4_snapshot(snapshots_[slot]);
+    auto & snap = snapshots_[slot];
+    free_deepseek4_snapshot(snap.cache);
+    std::vector<float>().swap(snap.last_logits);
+    std::vector<float>().swap(snap.spec_feat_window);
 }
 
 bool DeepSeek4Backend::snapshot_used(int slot) const {
     if (slot < 0 || slot >= PREFIX_SLOTS) return false;
-    return snapshots_[slot].ctx != nullptr;
+    return snapshots_[slot].cache.ctx != nullptr;
 }
 
 int DeepSeek4Backend::snapshot_cur_pos(int slot) const {
     if (slot < 0 || slot >= PREFIX_SLOTS) return 0;
-    return snapshots_[slot].cur_pos;
+    return snapshots_[slot].cache.cur_pos;
 }
 
 GenerateResult DeepSeek4Backend::restore_and_generate_impl(
         int slot, const GenerateRequest & req, const DaemonIO & io) {
-    // TODO: Implement snapshot restore + generate
-    (void)slot;
-    return generate_impl(req, io);
+    GenerateResult result;
+    DaemonIO out_io = io.with_token_callback(req.on_token);
+    if (!snapshot_used(slot)) {
+        result.fail(GenerateErrorCode::InvalidSnapshotSlot);
+        out_io.emit(-1);
+        return result;
+    }
+
+    auto & snap = snapshots_[slot];
+    if (!deepseek4_snapshot_restore(snap.cache, cache_)) {
+        result.fail(GenerateErrorCode::InvalidSnapshotSlot,
+                    "DeepSeek cache restore failed");
+        out_io.emit(-1);
+        return result;
+    }
+    last_logits_ = snap.last_logits;
+    spec_feat_window_ = snap.spec_feat_window;
+
+    sampler_ = req.sampler;
+    if (req.do_sample && sampler_.seed != 0) {
+        sampler_rng_.seed(sampler_.seed);
+    }
+
+    const int snap_pos = snap.cache.cur_pos;
+    const int prompt_len = (int) req.prompt.size();
+    if (prompt_len < snap_pos) {
+        std::fprintf(stderr,
+            "[pc] snapshot longer than prompt (snap=%d > prompt=%d) — "
+            "fresh prefill fallback\n", snap_pos, prompt_len);
+        return generate_impl(req, io);
+    }
+
+    auto t0 = Clock::now();
+    int committed = snap_pos;
+    if (prompt_len > snap_pos) {
+        std::vector<int32_t> delta(
+            req.prompt.begin() + snap_pos, req.prompt.end());
+        committed = do_prefill(
+            delta, out_io, snap_pos, req.snap_pos, req.snap_slot);
+        if (committed < 0) {
+            result.fail(GenerateErrorCode::PrefillFailed);
+            return result;
+        }
+    } else if (last_logits_.empty() && req.n_gen > 0) {
+        result.fail(GenerateErrorCode::DecodeSeedMissing,
+                    "DeepSeek snapshot has no prefill logits");
+        return result;
+    }
+
+    return finish_generation(
+        req, out_io, committed, elapsed_s(t0), req.prompt);
 }
 
 bool DeepSeek4Backend::handle_compress(const std::string & line,
@@ -1466,7 +1588,7 @@ void DeepSeek4Backend::shutdown() {
     maybe_save_routing_stats();
     free_drafter();
     for (int i = 0; i < PREFIX_SLOTS; i++) {
-        free_deepseek4_snapshot(snapshots_[i]);
+        snapshot_free(i);
     }
     free_deepseek4_cache(cache_);
     expert_runtime_.reset();

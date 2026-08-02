@@ -236,9 +236,10 @@ class DflashRuntime:
     budget: int = 22
     max_ctx: int = 16384
     lazy: bool = False
-    # Exact turn-boundary snapshots. This is safe for every model/backend and
-    # is the server's production default; 0 remains an explicit opt-out.
-    prefix_cache_slots: int = 32
+    # Exact turn-boundary snapshots. Eight slots bound memory at long context
+    # while covering the common harness/session set; 0 remains an explicit
+    # opt-out and Advanced mode can raise the cap deliberately.
+    prefix_cache_slots: int = 8
     # Exact full-prompt snapshots, keyed by the raw prompt. PFlash can use
     # these to skip both rescoring and target prefill when a request repeats.
     prefill_cache_slots: int = 0

@@ -11,9 +11,11 @@
 //   O[B, S, n_q_heads, D]
 //
 // Backends:
-//   - Default: WMMA m16n16k16 sparse forward (sm_70+). Functional everywhere.
+//   - Default: WMMA m16n16k16 sparse forward (qualified CUDA sm_80+ and HIP).
 //   - Set env DFLASH_FP_USE_BSA=1 to dispatch to the Block-Sparse-Attention
-//     kernel (FA-2 derived, m16n8k16 PTX, sm_80+ via cuBLAS BF16 GEMM).
+//     kernel (FA-2 derived, m16n8k16 PTX, qualified CUDA sm_80+ except GB10
+//     sm_121). PFlash stays on exact prefill there because neither bundled
+//     custom BF16 sparse kernel is qualified.
 //     Requires building with -DDFLASH27B_ENABLE_BSA=ON. ~3x faster than WMMA
 //     on RTX 3090 at S=128K.
 //
@@ -34,6 +36,23 @@
 
 namespace dflash::common {
 namespace flashprefill {
+
+// Keep the low-level BF16-kernel policy separate from the product-level local
+// PFlash policy. Legacy CUDA architectures have other compiled fallbacks, but
+// GB10's sm_121 is the one device on which the complete local scorer path is
+// currently unsafe.
+inline constexpr bool custom_bf16_sparse_supports_cuda_sm(int sm) {
+    return sm >= 80 && sm != 121;
+}
+inline constexpr bool local_pflash_supports_cuda_sm(int sm) {
+    return sm != 121;
+}
+
+// Runtime helpers are implemented in flashprefill.cpp, which is present in
+// CUDA and custom-kernel HIP builds. Call the PFlash helper only from CUDA
+// code; ordinary HIP builds use their independent scorer implementation.
+bool custom_bf16_sparse_supported_on_current_device();
+bool local_pflash_supported_on_current_device();
 
 // Algorithmic parameters for the FlashPrefill selection + sparse forward.
 struct FlashPrefillConfig {
@@ -92,7 +111,8 @@ int flash_prefill_forward_q8(
 
 // ── Unified dispatch ──────────────────────────────────────────────────────────
 // Picks the best available kernel at compile time + runtime buffer type:
-//   BF16 buffers + sm_80 build → flash_prefill_forward_bf16
+//   BF16 buffers + qualified sm_80 build → flash_prefill_forward_bf16
+//   BF16 buffers + unqualified device   → -2 (caller chooses exact fallback)
 //   F16 buffers  + Volta build → flash_prefill_forward_f16
 //   otherwise                  → flash_prefill_forward_q8 (ggml FA fallback)
 //
@@ -107,6 +127,7 @@ inline int flash_prefill_forward(
 {
 #if defined(DFLASH27B_HAVE_FLASHPREFILL) || defined(DFLASH27B_HAVE_SM80_FLASHPREFILL)
     if (qkv_type == GGML_TYPE_BF16) {
+        if (!custom_bf16_sparse_supported_on_current_device()) return -2;
         return flash_prefill_forward_bf16(Q, K, V, O,
             batch, seq_len, n_q_heads, n_k_heads, head_dim, scale, cfg);
     }

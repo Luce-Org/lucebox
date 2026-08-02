@@ -155,6 +155,11 @@ class ModelOptimizationProfile:
     prefill_baseline: str
     decode_baseline: str
     kv_baseline: str
+    # Turn-prefix snapshots grow with the cached context. Eight slots cover
+    # the common harness/session set without letting 100K+ contexts reserve an
+    # unbounded amount of host or unified memory. DeepSeek's allocated MLA
+    # state has a smaller architecture-specific production default.
+    prefix_cache_slots: int = 8
     # The architecture stores an exact but substantially compressed native KV
     # representation. It still grows with context, but does not need the blunt
     # full-KV headroom cap used for ordinary attention caches.
@@ -170,6 +175,8 @@ class ModelOptimizationProfile:
             raise ValueError("model profile preset and architecture must not be empty")
         if not all(label.strip() for label in self.phase_baselines):
             raise ValueError("every model profile must name all three baseline strategies")
+        if self.prefix_cache_slots < 0:
+            raise ValueError("model prefix-cache slots must not be negative")
 
     @property
     def phase_baselines(self) -> tuple[str, str, str]:
@@ -292,6 +299,7 @@ MODEL_OPTIMIZATION_PROFILES: Mapping[str, ModelOptimizationProfile] = MappingPro
             prefill_baseline="Exact MLA prefill",
             decode_baseline="Autoregressive decode",
             kv_baseline="Native MLA-compressed KV cache",
+            prefix_cache_slots=4,
             compact_native_kv=True,
             speculative_decode=_DSPARK,
             # Sparse DeepSeek prefill is engine-backed but approximate and

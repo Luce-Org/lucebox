@@ -367,7 +367,7 @@ def _from_dict(raw: dict[str, Any]) -> Config:
         budget=int(df.get("budget", 22)),
         max_ctx=int(df.get("max_ctx", 16384)),
         lazy=_cast_bool(df.get("lazy", False)),
-        prefix_cache_slots=int(df.get("prefix_cache_slots", 32)),
+        prefix_cache_slots=int(df.get("prefix_cache_slots", 8)),
         prefill_cache_slots=int(df.get("prefill_cache_slots", 0)),
         cache_type_k=str(df.get("cache_type_k", "")),
         cache_type_v=str(df.get("cache_type_v", "")),

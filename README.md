@@ -431,7 +431,7 @@ End-to-end repro: `DFLASH_SAMP=0.8,1.0,0,1.1,42 python server/scripts/bench_llm.
 | `--prefill-drafter <gguf>` | required if on | Drafter weights (Qwen3-0.6B BF16 GGUF) |
 | `--prefill-skip-park` | off | Keep drafter resident across requests (more VRAM, faster) |
 | `PFLASH_FREEZE_HOT_WINDOW=N` | `2` | FlowKV: how many of the most recent messages stay verbatim. Everything older than this window (but after the system prompt) is compressed once and cached. Larger = more recent context kept uncompressed. |
-| `DFLASH_FP_USE_BSA=1` | `0` | Dispatch sparse FA through BSA (sm_80+); required for headline 10.4× |
+| `DFLASH_FP_USE_BSA=1` | `0` | Dispatch sparse FA through BSA (qualified sm_80+ except GB10 sm_121, where PFlash safely stays on exact prefill); required for headline 10.4× |
 | `DFLASH_FP_ALPHA=0.85` | `0.12` | Block-selection threshold; higher = stricter = fewer K-blocks |
 | `DFLASH_FP_PROFILE=1` | `0` | Per-stage timing log |
 
@@ -445,7 +445,7 @@ When compression is on, the request policy keeps reusable state reusable. Struct
 | `DFLASH27B_KV_TQ3=1` | (default) | Preset TQ3_0 K+V (3.5 bpv, fits 256K @ 24 GB) |
 | `DFLASH27B_KV_Q4=1` | off | Q4_0 K+V (4.5 bpv, legacy, ~128K ceiling) |
 | `--prefix-cache-slots N` | — | Live prefix-cache slot count |
-| `DFLASH_PREFIX_CACHE_SLOTS=N` | `32` | Container-entrypoint equivalent of `--prefix-cache-slots`; the native binary itself uses the CLI flag. |
+| `DFLASH_PREFIX_CACHE_SLOTS=N` | architecture default (`8`; DeepSeek `4`) | Container-entrypoint equivalent of `--prefix-cache-slots`; the native binary itself uses the CLI flag. |
 | `--prefill-cache-slots N` / `DFLASH_PREFILL_CACHE_SLOTS=N` | `0` | Exact full-prompt snapshot slots. Automatic assigns four for qualified PFlash models; exact repeats skip scorer and target prefill. |
 | `--kv-cache-dir <path>` | — | Persist prefix cache to disk |
 | `--kv-cache-budget N` | — | On-disk cache size cap |

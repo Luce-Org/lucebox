@@ -6,7 +6,9 @@
 
 #include "flashprefill.h"
 #include "flashprefill_launchers.h"
+#include "common/platform_env.h"
 
+#include <atomic>
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
@@ -209,6 +211,47 @@ namespace {
 inline int cdiv(int a, int b) { return (a + b - 1) / b; }
 }
 
+bool custom_bf16_sparse_supported_on_current_device() {
+#ifdef DFLASH27B_BACKEND_HIP
+    // HIP uses Lucebox's rocWMMA implementation; the GB10 restriction is
+    // specific to the CUDA sm_121 kernels.
+    return true;
+#else
+    int device = 0;
+    cudaDeviceProp properties{};
+    if (cudaGetDevice(&device) != cudaSuccess ||
+        cudaGetDeviceProperties(&properties, device) != cudaSuccess) {
+        return false;
+    }
+    const int sm = properties.major * 10 + properties.minor;
+    const bool supported = custom_bf16_sparse_supports_cuda_sm(sm);
+    if (!supported) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true)) {
+            std::fprintf(stderr,
+                "[flashprefill] custom BF16 sparse kernels unavailable on "
+                "CUDA sm_%d; caller must use a safe fallback\n", sm);
+        }
+    }
+    return supported;
+#endif
+}
+
+bool local_pflash_supported_on_current_device() {
+#ifdef DFLASH27B_BACKEND_HIP
+    return true;
+#else
+    int device = 0;
+    cudaDeviceProp properties{};
+    if (cudaGetDevice(&device) != cudaSuccess ||
+        cudaGetDeviceProperties(&properties, device) != cudaSuccess) {
+        return false;
+    }
+    return local_pflash_supports_cuda_sm(
+        properties.major * 10 + properties.minor);
+#endif
+}
+
 #if defined(DFLASH27B_HAVE_FLASHPREFILL) || defined(DFLASH27B_HAVE_SM80_FLASHPREFILL)
 // ── BF16 (sm_80+) dispatch: native BF16 WMMA kernels ──
 
@@ -218,6 +261,12 @@ int flash_prefill_forward_bf16(
     float scale,
     const FlashPrefillConfig & cfg)
 {
+    // Direct users such as the registered ggml sparse-attention callback do
+    // not pass a backend and therefore cannot use flash_prefill_forward_q8.
+    // Reject the unqualified kernel before any launch so the owning request
+    // path can keep the original prompt and choose exact prefill instead.
+    if (!custom_bf16_sparse_supported_on_current_device()) return -2;
+
     const int B = batch;
     const int S = seq_len;
     const int H = n_q_heads;
@@ -328,7 +377,9 @@ int flash_prefill_forward_bf16(
     }
     // 4. sparse flash forward (BSA-or-WMMA)
 #ifdef DFLASH27B_HAVE_BSA
-    static const bool use_bsa = (std::getenv("DFLASH_FP_USE_BSA") != nullptr);
+    const bool bsa_requested =
+        environment_variable_enabled("DFLASH_FP_USE_BSA");
+    const bool use_bsa = bsa_requested;
     if (use_bsa && D == 128 && BLOCK == 128) {
         launch_bsa_sparse_flash_forward_bf16(
             Q, K, V, O, dIdx, dCnt, scale,

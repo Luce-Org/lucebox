@@ -26,7 +26,8 @@ cmake --build . --target test_dflash test_flashprefill_kernels -- -j8
 ```
 
 Required:
-- CUDA Toolkit 12.0+ (sm_80+ for BSA path; sm_86 RTX 3090 is the
+- CUDA Toolkit 12.0+ (custom BF16 sparse kernels are qualified on sm_80+
+  except GB10 sm_121, where PFlash stays on exact prefill; sm_86 RTX 3090 is the
   reference target).
 - `git submodule update --init --recursive` to pull
   `deps/Block-Sparse-Attention` (with cutlass). `deps/llama.cpp` is vendored

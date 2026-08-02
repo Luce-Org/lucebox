@@ -83,6 +83,31 @@ def _budget_for_host(host: HostFacts) -> int:
     return 22
 
 
+def _pflash_qualified_on_host(host: HostFacts, backend: str) -> bool:
+    """Whether this host has a qualified local PFlash scorer path."""
+    if backend != "cuda":
+        return True
+    cuda_sm = host.nvidia_gpu_arch or host.gpu_sm
+    # The custom CUDA sparse forwards fault on GB10 at long context. The
+    # server safely retains exact prefill, but must not expose the unavailable
+    # scorer as an Advanced-mode optimization.
+    return cuda_sm != "121"
+
+
+def _decode_qualified_on_host(
+    profile: ModelOptimizationProfile,
+    host: HostFacts,
+    backend: str,
+) -> bool:
+    """Apply known device-level exclusions to speculative decode."""
+    if profile.architecture != "deepseek4" or backend != "cuda":
+        return True
+    cuda_sm = host.nvidia_gpu_arch or host.gpu_sm
+    # DSpark currently reaches an out-of-bounds tensor read on GB10 even at
+    # 32K context. Keep exact AR until that CUDA path is requalified.
+    return cuda_sm != "121"
+
+
 def runtime_from_host(host: HostFacts) -> DflashRuntime:
     """Pick conservative context/cache defaults from the selected GPU.
 
@@ -345,7 +370,11 @@ def automatic_plan(
             f"but the model catalog declares {preset.architecture!r}"
         )
     backend = _selected_backend(cfg)
-    runtime = replace(runtime, max_ctx=min(runtime.max_ctx, preset.native_context))
+    runtime = replace(
+        runtime,
+        max_ctx=min(runtime.max_ctx, preset.native_context),
+        prefix_cache_slots=profile.prefix_cache_slots,
+    )
     vram_known = cfg.host.vram_gb > 0
     headroom = cfg.host.vram_gb - preset.approx_total_gb if vram_known else 0
     if vram_known:
@@ -360,7 +389,8 @@ def automatic_plan(
     decode_feature = profile.speculative_decode
     decode_qualification = _qualification(decode_feature, backend)
     decode_supported = decode_feature is not None and decode_feature.available_on(backend)
-    dflash_available = has_draft and decode_supported
+    decode_hardware_qualified = _decode_qualified_on_host(profile, cfg.host, backend)
+    dflash_available = has_draft and decode_supported and decode_hardware_qualified
     dflash_enabled = (
         dflash_available
         and decode_feature is not None
@@ -371,6 +401,11 @@ def automatic_plan(
         dflash_reason = _preview_reason(decode_feature, backend)
     elif dflash_enabled:
         dflash_reason = "matching speculative draft is available for this model"
+    elif has_draft and decode_supported and not decode_hardware_qualified:
+        dflash_reason = (
+            "DSpark is not yet qualified on GB10 CUDA; "
+            "autoregressive decode stays active"
+        )
     elif has_draft and not decode_supported:
         dflash_reason = "the installed draft is not supported by the selected backend"
     elif preset.speculator_dir:
@@ -416,11 +451,13 @@ def automatic_plan(
     pflash_supported = (
         pflash_feature is not None and pflash_feature.available_on(backend)
     )
-    pflash_available = (
+    pflash_model_available = (
         pflash_supported
         and pflash_capability is not None
         and runtime.max_ctx >= pflash_capability.minimum_context
     )
+    pflash_hardware_qualified = _pflash_qualified_on_host(cfg.host, backend)
+    pflash_available = pflash_model_available and pflash_hardware_qualified
     pflash_profile = (
         pflash_available
         and vram_known
@@ -441,6 +478,11 @@ def automatic_plan(
         )
     elif pflash_profile:
         pflash_reason = "shared 1.2 GB scorer is not installed"
+    elif pflash_model_available and not pflash_hardware_qualified:
+        pflash_reason = (
+            "GB10's local sparse scorer kernels are not yet qualified; "
+            "exact prefill and prefix reuse stay active"
+        )
     elif pflash_available and pflash_feature is not None:
         pflash_reason = _preview_reason(pflash_feature, backend)
     elif not pflash_supported:

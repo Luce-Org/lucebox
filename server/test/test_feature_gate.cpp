@@ -447,6 +447,10 @@ static void test_model_capability_tables() {
     // deepseek4 is mixture-of-experts but has no hot/cold offload path.
     TEST_ASSERT(!arch_has_expert_offload("deepseek4"));
 
+    TEST_ASSERT(arch_default_prefix_cache_slots("qwen35") == 8);
+    TEST_ASSERT(arch_default_prefix_cache_slots("deepseek4") == 4);
+    TEST_ASSERT(arch_default_prefix_cache_slots("unknown") == 8);
+
     // Every capability predicate must be false for an architecture the
     // factory cannot build, so no rule can admit an unbuildable model.
     TEST_ASSERT(!arch_supports_layer_split("qwen36"));

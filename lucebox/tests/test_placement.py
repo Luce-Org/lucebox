@@ -622,6 +622,7 @@ def test_python_architecture_capabilities_match_engine_table() -> None:
         r'\{"(?P<arch>[^\"]+)",\s*'
         r"(?P<split>true|false),\s*(?P<remote>true|false),\s*"
         r"(?P<pflash>true|false),\s*(?P<offload>true|false),\s*"
+        r"(?P<prefix_slots>[0-9]+),\s*"
         r"(?P<draft>kNever|kMono|kBoth),"
     )
     engine_rows = {match["arch"]: match.groupdict() for match in row_pattern.finditer(header)}

@@ -377,7 +377,7 @@ def test_server_run_spec_always_emits_core_dflash_env(tmp_path: Path) -> None:
     env = _env(docker_run.server_run_spec(cfg))
     assert env["DFLASH_BUDGET"] == "22"
     assert env["DFLASH_MAX_CTX"] == "32768"
-    assert env["DFLASH_PREFIX_CACHE_SLOTS"] == "32"
+    assert env["DFLASH_PREFIX_CACHE_SLOTS"] == "8"
     assert env["DFLASH_PREFILL_CACHE_SLOTS"] == "0"
     assert "DFLASH_THINK_MAX" not in env
     assert env["DFLASH_PORT"] == "8080"

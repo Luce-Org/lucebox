@@ -253,7 +253,10 @@ GPU_COUNT=0
 if command -v nvidia-smi &>/dev/null; then
     if mem_mib=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null \
                   | head -1) && [ -n "$mem_mib" ]; then
-        GPU_VRAM_GB=$((mem_mib / 1024))
+        mem_mib=$(_trim "$mem_mib")
+        if [[ "$mem_mib" =~ ^[0-9]+$ ]]; then
+            GPU_VRAM_GB=$((mem_mib / 1024))
+        fi
     fi
     GPU_COUNT=$(nvidia-smi -L 2>/dev/null | awk '/^GPU /{n++} END{print n+0}') || GPU_COUNT=0
 elif command -v amd-smi &>/dev/null; then

@@ -32,6 +32,7 @@ def test_deepseek_uses_native_mla_instead_of_claiming_generic_flash_paths() -> N
 
     assert profile.pflash is None
     assert profile.kvflash is None
+    assert profile.prefix_cache_slots == 4
     assert "MLA" in profile.prefill_baseline
     assert "MLA" in profile.kv_baseline
     assert profile.deepseek_prefill is not None

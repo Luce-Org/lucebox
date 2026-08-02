@@ -10,7 +10,7 @@
 | VRAM | 22 GB | 24 GB |
 | OS | Ubuntu 22.04 (jammy) | Ubuntu 24.04 (noble) |
 
-> **Note:** FlashPrefill and BSA (Block-Sparse Attention) require **sm_80+** (Ampere or newer).
+> **Note:** FlashPrefill and BSA (Block-Sparse Attention) require **sm_80+** (Ampere or newer). GB10's sm_121 custom sparse kernels are not yet qualified, so PFlash safely stays on exact prefill.
 > On Turing (sm_75) the drafter falls back to ggml's `flash_attn_ext`.
 
 ### System packages

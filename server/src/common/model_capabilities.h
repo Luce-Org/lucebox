@@ -48,6 +48,7 @@ struct ArchCapabilities {
                               // --collect-routing, --adaptive-experts). Note
                               // deepseek4 is mixture-of-experts but has no such
                               // path, so this is narrower than "is MoE".
+    int default_prefix_cache_slots;  // bounded by architecture snapshot cost
 
     // Placement-dependent.
     FeatureSupport decode_draft;  // --draft
@@ -62,13 +63,15 @@ inline constexpr FeatureSupport kMono  = FeatureSupport::Monolithic;
 inline constexpr FeatureSupport kBoth  = FeatureSupport::Both;
 
 inline constexpr ArchCapabilities kArchCapabilities[] = {
-//   arch          split  rdraft pflash offload  draft  ddtree vwidth fa_win dswa
-    {"qwen35",     true,  true,  true,  false,   kBoth, kBoth, kNever, kBoth, kBoth},
-    {"qwen35moe",  false, false, false, true,    kMono, kMono, kNever, kMono, kMono},
-    {"laguna",     true,  false, false, true,    kMono, kMono, kMono,  kNever, kNever},
-    {"qwen3",      false, false, true,  false,   kNever, kNever, kNever, kNever, kNever},
-    {"gemma4",     true,  false, false, false,   kMono, kNever, kNever, kBoth, kNever},
-    {"deepseek4",  true,  false, false, false,   kNever, kNever, kNever, kNever, kNever},
+//   arch          split rdraft pflash offload pc draft  ddtree vwidth fa_win dswa
+    {"qwen35",     true,  true,  true,  false, 8, kBoth, kBoth, kNever, kBoth, kBoth},
+    {"qwen35moe",  false, false, false, true,  8, kMono, kMono, kNever, kMono, kMono},
+    {"laguna",     true,  false, false, true,  8, kMono, kMono, kMono,  kNever, kNever},
+    {"qwen3",      false, false, true,  false, 8, kNever, kNever, kNever, kNever, kNever},
+    {"gemma4",     true,  false, false, false, 8, kMono, kNever, kNever, kBoth, kNever},
+    // DeepSeek snapshots copy its allocated MLA state. At 131K, one slot is
+    // roughly 0.9 GiB, so the generic 32-slot default could consume ~30 GiB.
+    {"deepseek4",  true,  false, false, false,  4, kNever, kNever, kNever, kNever, kNever},
 };
 
 inline constexpr std::size_t kArchCount =
@@ -116,6 +119,13 @@ constexpr bool table_rows_named() {
     return true;
 }
 
+constexpr bool table_cache_defaults_valid() {
+    for (const ArchCapabilities & c : kArchCapabilities) {
+        if (c.default_prefix_cache_slots < 0) return false;
+    }
+    return true;
+}
+
 constexpr bool table_rows_unique() {
     for (std::size_t i = 0; i < kArchCount; ++i) {
         for (std::size_t j = i + 1; j < kArchCount; ++j) {
@@ -155,6 +165,8 @@ static_assert(detail::table_rows_named(),
               "every capability row needs a non-empty architecture name");
 static_assert(detail::table_rows_unique(),
               "duplicate architecture row in kArchCapabilities");
+static_assert(detail::table_cache_defaults_valid(),
+              "architecture prefix-cache defaults must not be negative");
 static_assert(detail::table_split_coherent(),
               "an architecture with no layer-split adapter cannot support an "
               "option on 'Both' placements; use Monolithic");
@@ -208,6 +220,11 @@ inline bool arch_supports_pflash_compression(const std::string & arch) {
 
 inline bool arch_has_expert_offload(const std::string & arch) {
     return detail::arch_has(arch, &ArchCapabilities::expert_offload);
+}
+
+inline int arch_default_prefix_cache_slots(const std::string & arch) {
+    const ArchCapabilities * caps = find_arch_capabilities(arch);
+    return caps ? caps->default_prefix_cache_slots : 8;
 }
 
 inline bool arch_supports_decode_draft(const std::string & arch,

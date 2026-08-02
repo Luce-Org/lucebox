@@ -207,6 +207,10 @@ GGUF carries its auxiliary projections under the existing `dflash.dspark.*`
 tensor contract. DeepSeek4/MTP checkpoints store compatible heads under the
 `mtp.2.*` namespace, which the converter maps as follows.
 
+CUDA sm_121 (GB10) currently stays on autoregressive decode: the DSpark path is
+disabled in both the automatic planner and server until its tensor-read failure
+is requalified. HIP and other qualified CUDA architectures are unchanged.
+
 Supported DeepSeek4/MTP input tensors:
 
 | DeepSeek4/MTP tensor | GGUF tensor |

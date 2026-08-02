@@ -3,8 +3,18 @@
 #pragma once
 
 #include <cstdlib>
+#include <cstring>
 
 namespace dflash::common {
+
+// Treat an unset, empty, or explicit "0" value as disabled. This lets a
+// caller override a default with FOO=0 instead of mere variable presence
+// accidentally enabling the feature.
+inline bool environment_variable_enabled(const char * name) {
+    const char * value = std::getenv(name);
+    return value != nullptr && value[0] != '\0' &&
+           std::strcmp(value, "0") != 0;
+}
 
 // Match POSIX setenv() semantics on every platform. In particular,
 // overwrite=false must preserve an existing value; _putenv_s() does not

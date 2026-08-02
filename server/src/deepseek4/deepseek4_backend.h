@@ -26,6 +26,10 @@
 
 namespace dflash::common {
 
+// DSpark's CUDA path is qualified broadly except for the known GB10 sm_121
+// tensor-read failure. Kept pure so the runtime policy has a unit test.
+bool deepseek4_dspark_supports_cuda_sm(int sm);
+
 class DeepSeek4Backend : public ModelBackend {
 public:
     explicit DeepSeek4Backend(const DeepSeek4BackendConfig & cfg);
@@ -80,7 +84,12 @@ private:
 
     // Snapshots
     static constexpr int PREFIX_SLOTS = 64;
-    DeepSeek4Snapshot      snapshots_[PREFIX_SLOTS];
+    struct PrefixSnapshot {
+        DeepSeek4Snapshot cache;
+        std::vector<float> last_logits;
+        std::vector<float> spec_feat_window;
+    };
+    PrefixSnapshot         snapshots_[PREFIX_SLOTS];
     std::vector<float>     last_logits_;
 
     // DSpark speculative decode (opt-in: DFLASH_DS4_SPEC=1 + DFLASH_DS4_DRAFT=<gguf>).
@@ -96,7 +105,12 @@ private:
 
     // Prefill prompt tokens in chunks, return absolute committed position.
     int do_prefill(const std::vector<int32_t> & tokens, const DaemonIO & io,
-                   int kv_offset = 0);
+                   int kv_offset = 0, int snap_pos = -1, int snap_slot = -1);
+
+    GenerateResult finish_generation(
+        const GenerateRequest & req, const DaemonIO & io,
+        int committed, double prefill_s,
+        const std::vector<int32_t> & history_prefix);
 
     // Autoregressive decode loop.
     bool do_decode(int committed, int n_gen,

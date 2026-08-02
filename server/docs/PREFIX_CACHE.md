@@ -194,21 +194,22 @@ free_snapshot_backend(snap_backend_, compute_backend_);  // then backend
 
 | Server flag | Default | Description |
 |-------------|---------|-------------|
-| `--prefix-cache-slots N` | 32 | Max turn-boundary prefix cache slots |
+| `--prefix-cache-slots N` | 8 (DeepSeek: 4) | Max turn-boundary prefix cache slots |
 | `--prefill-cache-slots N` | 0 | Max exact full-prompt prefill cache slots |
 | `--skip-park` | false | Skip parking draft model during compress |
 
 ### Choosing `--prefix-cache-slots`
 
-With right-sized, CPU-resident snapshots the limiting resource is **system RAM**,
-not VRAM. Each slot costs approximately `cur_pos × 5 KB` (for Qwen3.5-27B Q8_0 KV),
-so 32 slots with an average prefix of 2000 tokens ≈ 320 MB of system RAM — negligible
-on most workstations.
+With right-sized snapshots the limiting resource is **system or unified RAM**,
+not only VRAM. Cost grows linearly with the cached prefix and varies by model.
+Short chat prefixes are inexpensive, but 100K+ agent/tool prefixes can make one
+slot several GiB. The production defaults therefore favor a bounded working
+set; raise the cap only after accounting for the selected model and context.
 
 | Scenario | Typical prefix length | Recommended cap |
 |----------|----------------------|-----------------|
-| Single-user chat | 200–2000 tokens | 16–32 |
-| Multi-session agent | 500–5000 tokens | 32–64 |
+| Single-user chat | 200–2000 tokens | 8 |
+| Multi-session agent | 500–5000 tokens | 8–16 |
 | Batch / benchmark | N/A (cold starts) | 4 |
 
 The hard limit is `MAX_SLOTS = 64`. Beyond that, increase the constant in
