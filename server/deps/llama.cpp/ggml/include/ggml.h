@@ -2485,6 +2485,7 @@ extern "C" {
         GGML_MOE_FUSED_DEFERRED_PEER_COPY = -3,
         GGML_MOE_FUSED_OWNER_SPLIT        = -4,
         GGML_MOE_FUSED_ALIGN_IDS          = -5,
+        GGML_MOE_FUSED_BALANCED_OWNER_IDS = -6,
     };
 
     // Word offsets in ggml_tensor::op_params for the deferred peer-copy op.
@@ -2553,6 +2554,20 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_ds4_moe_align_ids(
             struct ggml_context * ctx,
             struct ggml_tensor  * expert_ids);
+
+    // Map global route IDs directly to one owner's compact expert stack while
+    // assigning a batch-wide main-resident quota encoded as four times the
+    // desired routes per token. The peer owner receives the exact complement.
+    // This fuses the former repeated-LUT lookup and route masking chain into
+    // one small device-local operation.
+    GGML_API struct ggml_tensor * ggml_ds4_moe_balanced_owner_ids(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * global_ids,
+            struct ggml_tensor  * router_weights,
+            struct ggml_tensor  * local_id_lut,
+            struct ggml_tensor  * main_candidate_lut,
+            int                   main_slots_x4,
+            bool                  main_owner);
 
     // Copy an F32 peer-GPU tensor only after a scheduler-provided device event
     // has completed. The scheduler writes the native event handle into the op

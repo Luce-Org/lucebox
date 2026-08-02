@@ -74,6 +74,18 @@ struct MoeHybridPlacement {
         MoeHybridPlacement & out,
         std::string * err = nullptr);
 
+    // Preserve an existing placement and spend any remaining byte budget on
+    // experts ranked by a second routing profile. This is useful when the
+    // experts needed to balance a latency-sensitive phase (for example,
+    // decode) must remain resident while spare capacity is filled for a
+    // different phase (for example, prefill).
+    static bool expand_from_stats_with_layer_bytes(
+        const MoeHybridRoutingStats & stats,
+        const std::vector<uint64_t> & layer_expert_bytes,
+        uint64_t total_hot_budget_bytes,
+        MoeHybridPlacement & in_out,
+        std::string * err = nullptr);
+
     // Distribute main-owner experts to minimize the sum of predicted per-layer
     // fork times, max(main, peer), rather than merely maximizing aggregate hit
     // rate. layer_main_fixed_bytes accounts for owner-local work such as the

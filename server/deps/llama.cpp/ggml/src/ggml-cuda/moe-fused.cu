@@ -435,6 +435,49 @@ static __global__ void ds4_align_moe_ids_kernel(
     }
 }
 
+static __global__ void ds4_balanced_owner_ids_kernel(
+        const int32_t * __restrict__ global_ids,
+        const float * __restrict__ router_weights,
+        const int32_t * __restrict__ local_id_lut,
+        const float * __restrict__ main_candidate_lut,
+        int32_t * __restrict__ owner_ids,
+        int n_routes,
+        int n_tokens,
+        int n_expert,
+        int main_slots_x4,
+        bool main_owner) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) {
+        return;
+    }
+
+    // Assign one shared quota over the complete verification batch. Quarter-
+    // route units expose the otherwise unreachable 16/30 split at q=5 while
+    // keeping the decision device-local and identical on both owners.
+    const int main_quota = (main_slots_x4 * n_tokens) / 4;
+    int assigned_main = 0;
+    for (int token = 0; token < n_tokens; ++token) {
+        const int row = token * n_routes;
+        for (int route = 0; route < n_routes; ++route) {
+            const int index = row + route;
+            const int32_t global_id = global_ids[index];
+            const bool active = router_weights[index] != 0.0f;
+            const bool valid_global = global_id >= 0 && global_id < n_expert;
+            const bool main_candidate = active && valid_global &&
+                main_candidate_lut[global_id] != 0.0f;
+            const bool route_on_main =
+                main_candidate && assigned_main < main_quota;
+            if (route_on_main) {
+                ++assigned_main;
+            }
+
+            const bool keep = active && valid_global &&
+                (main_owner ? route_on_main : !route_on_main);
+            const int32_t local_id = keep ? local_id_lut[global_id] : -1;
+            owner_ids[index] = local_id >= 0 ? local_id : -1;
+        }
+    }
+}
+
 static ggml_tensor make_contiguous_f32_tensor(
         float * data,
         int64_t ne0,
@@ -607,6 +650,36 @@ static void ggml_cuda_op_ds4_moe_owner_split(
 
 void ggml_cuda_op_moe_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int mode = ggml_get_op_params_i32(dst, 0);
+    if (mode == GGML_MOE_FUSED_BALANCED_OWNER_IDS) {
+        const ggml_tensor * global_ids = dst->src[0];
+        const ggml_tensor * weights = dst->src[1];
+        const ggml_tensor * local_lut = dst->src[2];
+        const ggml_tensor * candidate_lut = dst->src[3];
+        GGML_ASSERT(global_ids && global_ids->type == GGML_TYPE_I32);
+        GGML_ASSERT(weights && weights->type == GGML_TYPE_F32);
+        GGML_ASSERT(local_lut && local_lut->type == GGML_TYPE_I32);
+        GGML_ASSERT(candidate_lut && candidate_lut->type == GGML_TYPE_F32);
+        GGML_ASSERT(dst->type == GGML_TYPE_I32);
+        GGML_ASSERT(ggml_is_contiguous(global_ids));
+        GGML_ASSERT(ggml_is_contiguous(weights));
+        GGML_ASSERT(ggml_is_contiguous(local_lut));
+        GGML_ASSERT(ggml_is_contiguous(candidate_lut));
+        GGML_ASSERT(ggml_is_contiguous(dst));
+
+        const int n_routes = (int) global_ids->ne[0];
+        const int n_tokens = (int) global_ids->ne[1];
+        const int n_expert = (int) ggml_nelements(local_lut);
+        const int main_slots_x4 = ggml_get_op_params_i32(dst, 1);
+        const bool main_owner = ggml_get_op_params_i32(dst, 2) != 0;
+        ds4_balanced_owner_ids_kernel<<<1, 1, 0, ctx.stream()>>>(
+            (const int32_t *) global_ids->data,
+            (const float *) weights->data,
+            (const int32_t *) local_lut->data,
+            (const float *) candidate_lut->data,
+            (int32_t *) dst->data,
+            n_routes, n_tokens, n_expert, main_slots_x4, main_owner);
+        return;
+    }
     if (mode == GGML_MOE_FUSED_ALIGN_IDS) {
         const ggml_tensor * ids = dst->src[0];
         GGML_ASSERT(ids && ids->type == GGML_TYPE_I32);

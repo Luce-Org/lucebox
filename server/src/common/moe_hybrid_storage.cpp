@@ -294,6 +294,7 @@ bool build_moe_hybrid_storage(const MoeHybridConfig & cfg,
             dst.hot_local_by_global[(size_t)expert] = (int32_t)i;
             is_hot[(size_t)expert] = 1;
         }
+        dst.decode_hot_local_by_global = dst.hot_local_by_global;
         for (int expert = 0; expert < cfg.n_expert; ++expert) {
             if (duplicate_hot_on_cold || !is_hot[(size_t)expert]) {
                 dst.cold_local_by_global[(size_t)expert] = (int32_t)dst.cold_expert_ids.size();
@@ -507,6 +508,7 @@ bool build_moe_hybrid_storage_from_file(
             dst.hot_local_by_global[(size_t)expert] = (int32_t)i;
             is_hot[(size_t)expert] = 1;
         }
+        dst.decode_hot_local_by_global = dst.hot_local_by_global;
         if (allocate_cold) {
             for (int expert = 0; expert < cfg.n_expert; ++expert) {
                 if (duplicate_hot_on_cold || !is_hot[(size_t)expert]) {

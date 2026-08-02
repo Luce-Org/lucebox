@@ -66,16 +66,18 @@ static void configure_dspark_mmvq_defaults(int gpu) {
         return;
     }
 
-    // q=5 is an explicit AMD-only experiment and needs the plain quantized
+    // Wide verification is an explicit AMD-only experiment and needs the plain quantized
     // verifier matmuls to stay on MMVQ. The process-wide crossover applies to
     // both owners in the heterogeneous graph, so set it before inspecting the
     // target device (which is gfx1201 in the R9700 + gfx1151 launch).
-    if (env_flag_enabled("DFLASH_DS4_Q5_VERIFY")) {
+    const bool q6_verify = env_flag_enabled("DFLASH_DS4_Q6_VERIFY");
+    if (env_flag_enabled("DFLASH_DS4_Q5_VERIFY") || q6_verify) {
         if (std::getenv("LUCE_MMVQ_MAX_NCOLS") == nullptr &&
-            ::setenv("LUCE_MMVQ_MAX_NCOLS", "5", 0) == 0) {
+            ::setenv("LUCE_MMVQ_MAX_NCOLS", q6_verify ? "6" : "5", 0) == 0) {
             std::fprintf(stderr,
-                         "[deepseek4] AMD DSpark q5: defaulting "
-                         "LUCE_MMVQ_MAX_NCOLS=5\n");
+                         "[deepseek4] AMD DSpark wide verify: defaulting "
+                         "LUCE_MMVQ_MAX_NCOLS=%d\n",
+                         q6_verify ? 6 : 5);
         }
 
         cudaDeviceProp prop{};
@@ -1030,7 +1032,9 @@ bool DeepSeek4Backend::init_moe_tensor_parallel() {
 bool DeepSeek4Backend::compute_uniform_hybrid_placement(const DeepSeek4Weights & w,
                                                        int max_ctx,
                                                        MoeHybridPlacement & out,
+                                                       MoeHybridPlacement * decode_out,
                                                        std::string * err) const {
+    if (decode_out) *decode_out = {};
     Ds4HybridBudgetInfo budget;
     if (!compute_ds4_hybrid_budget_info(w, backend_, max_ctx, budget, err)) {
         return false;
@@ -1047,6 +1051,10 @@ bool DeepSeek4Backend::compute_uniform_hybrid_placement(const DeepSeek4Weights &
     bool concentrated = false;
     int retained_local = 0;
     const char * profile_path = std::getenv("DFLASH_DS4_HOTNESS_CSV");
+    const char * decode_profile_path =
+        std::getenv("DFLASH_DS4_DECODE_HOTNESS_CSV");
+    const bool phase_aware_placement = decode_profile_path &&
+        *decode_profile_path;
     const bool critical_path_placement =
         !tp.all_on_secondary && !concentrate_requested &&
         env_flag_enabled("DFLASH_DS4_TP_CRITICAL_PATH_PLACEMENT");
@@ -1068,8 +1076,11 @@ bool DeepSeek4Backend::compute_uniform_hybrid_placement(const DeepSeek4Weights &
             }
             return false;
         }
+        const char * balance_profile_path = phase_aware_placement
+            ? decode_profile_path : profile_path;
         MoeHybridRoutingStats stats;
-        if (!MoeHybridRoutingStats::load_csv(profile_path, stats, err)) {
+        if (!MoeHybridRoutingStats::load_csv(
+                balance_profile_path, stats, err)) {
             return false;
         }
         if (stats.n_layer != w.n_layer || stats.n_expert != w.n_expert) {
@@ -1115,6 +1126,39 @@ bool DeepSeek4Backend::compute_uniform_hybrid_placement(const DeepSeek4Weights &
             return false;
         }
 
+        if (phase_aware_placement) {
+            if (!decode_out) {
+                if (err) *err = "phase-aware placement requires decode output";
+                return false;
+            }
+            *decode_out = out;
+            MoeHybridRoutingStats residency_stats;
+            if (!MoeHybridRoutingStats::load_csv(
+                    profile_path, residency_stats, err)) {
+                return false;
+            }
+            if (residency_stats.n_layer != w.n_layer ||
+                residency_stats.n_expert != w.n_expert ||
+                residency_stats.n_expert_used != w.n_expert_used) {
+                if (err) {
+                    *err = "residency routing profile shape does not match "
+                           "DeepSeek V4 target";
+                }
+                return false;
+            }
+            if (!MoeHybridPlacement::expand_from_stats_with_layer_bytes(
+                    residency_stats, budget.mem.layer_expert_bytes,
+                    budget.expert_budget, out, err)) {
+                return false;
+            }
+            std::fprintf(stderr,
+                         "[deepseek4] hybrid phase-aware placement: "
+                         "decode_profile=%s resident_profile=%s "
+                         "decode=%d resident=%d\n",
+                         decode_profile_path, profile_path,
+                         decode_out->total_hot, out.total_hot);
+        }
+
         const auto [min_hot, max_hot] = std::minmax_element(
             out.hot_counts.begin(), out.hot_counts.end());
         const double mean_hot = out.hot_counts.empty() ? 0.0
@@ -1123,7 +1167,7 @@ bool DeepSeek4Backend::compute_uniform_hybrid_placement(const DeepSeek4Weights &
                      "[deepseek4] hybrid critical-path placement: "
                      "profile=%s active=%d main/peer=%.3f "
                      "hot/layer=%.1f [%d,%d]\n",
-                     profile_path, active_experts, main_to_peer_rate,
+                     balance_profile_path, active_experts, main_to_peer_rate,
                      mean_hot,
                      min_hot != out.hot_counts.end() ? *min_hot : 0,
                      max_hot != out.hot_counts.end() ? *max_hot : 0);
@@ -1209,7 +1253,8 @@ bool DeepSeek4Backend::init_hybrid_model() {
 
     std::string err;
     const int max_ctx = cfg_.max_ctx > 0 ? cfg_.max_ctx : 8192;
-    if (!compute_uniform_hybrid_placement(w_, max_ctx, moe_placement_, &err)) {
+    if (!compute_uniform_hybrid_placement(
+            w_, max_ctx, moe_placement_, &moe_decode_placement_, &err)) {
         std::fprintf(stderr, "[deepseek4] failed to compute hybrid placement: %s\n", err.c_str());
         return false;
     }
@@ -1283,6 +1328,36 @@ bool DeepSeek4Backend::init_hybrid_model() {
         return false;
     }
 
+    // The physical placement is shared by both phases. Decode may own only a
+    // subset so its fast main branch does not outrun and then wait on the peer;
+    // prefill continues to consume every resident expert.
+    if (!moe_decode_placement_.empty()) {
+        if (!moe_decode_placement_.matches(
+                w_.n_layer, w_.n_expert, w_.n_expert_used)) {
+            std::fprintf(stderr,
+                         "[deepseek4] decode placement dimensions are invalid\n");
+            return false;
+        }
+        for (int il = 0; il < w_.n_layer; ++il) {
+            MoeHybridLayerStorage & layer = hybrid->layers[(size_t) il];
+            layer.decode_hot_local_by_global.assign(
+                (size_t) w_.n_expert, -1);
+            for (int32_t expert :
+                    moe_decode_placement_.hot_expert_ids[(size_t) il]) {
+                if (expert < 0 || expert >= w_.n_expert ||
+                    layer.hot_local_by_global[(size_t) expert] < 0) {
+                    std::fprintf(stderr,
+                                 "[deepseek4] decode owner expert %d in layer "
+                                 "%d is not resident\n",
+                                 (int) expert, il);
+                    return false;
+                }
+                layer.decode_hot_local_by_global[(size_t) expert] =
+                    layer.hot_local_by_global[(size_t) expert];
+            }
+        }
+    }
+
     if (hybrid->has_mmap() && !hybrid->materialized_cold_experts) {
         size_t max_expert_bytes = 0;
         for (const auto & layer : hybrid->layers) {
@@ -1348,6 +1423,7 @@ bool DeepSeek4Backend::park(ParkTarget target) {
         expert_backend_ = nullptr;
     }
     moe_placement_ = {};
+    moe_decode_placement_ = {};
     free_deepseek4_weights(w_);
     parked_ = true;
     if (spec_drafter_) {
@@ -1375,6 +1451,7 @@ bool DeepSeek4Backend::unpark(ParkTarget target) {
                 expert_backend_ = nullptr;
             }
             moe_placement_ = {};
+            moe_decode_placement_ = {};
             return false;
         }
 
@@ -1392,6 +1469,7 @@ bool DeepSeek4Backend::unpark(ParkTarget target) {
                 expert_backend_ = nullptr;
             }
             moe_placement_ = {};
+            moe_decode_placement_ = {};
             return false;
         }
 
@@ -1407,6 +1485,7 @@ bool DeepSeek4Backend::unpark(ParkTarget target) {
                 expert_backend_ = nullptr;
             }
             moe_placement_ = {};
+            moe_decode_placement_ = {};
             return false;
         }
 
@@ -1419,6 +1498,7 @@ bool DeepSeek4Backend::unpark(ParkTarget target) {
         stream_engine_.destroy();
         moe_hybrid_.reset();
         moe_placement_ = {};
+        moe_decode_placement_ = {};
         return false;
     }
 
@@ -2103,6 +2183,7 @@ void DeepSeek4Backend::shutdown() {
     routing_stats_.reset();
     routing_stats_out_path_.clear();
     moe_placement_ = {};
+    moe_decode_placement_ = {};
     free_deepseek4_weights(w_);
     if (snap_backend_) { ggml_backend_free(snap_backend_); snap_backend_ = nullptr; }
     if (backend_) { ggml_backend_free(backend_); backend_ = nullptr; }

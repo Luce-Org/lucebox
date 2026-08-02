@@ -6747,11 +6747,15 @@ bool deepseek4_step_layer_range(
         moe_hybrid->materialized_cold_experts &&
         moe_hybrid->cold_backend_kind == MoeHybridColdBackend::Gpu &&
         moe_hybrid->cold_backend && moe_hybrid->cold_backend != backend;
-    const bool q5_verify_candidate =
-        n_tokens == 5 && ds4_env_flag("DFLASH_DS4_Q5_VERIFY");
+    const bool q6_verify_enabled =
+        ds4_env_flag("DFLASH_DS4_Q6_VERIFY");
+    const bool wide_verify_candidate =
+        (n_tokens == 5 &&
+         (ds4_env_flag("DFLASH_DS4_Q5_VERIFY") || q6_verify_enabled)) ||
+        (n_tokens == 6 && q6_verify_enabled);
     const bool fused_verify_candidate =
         (!moe_hybrid || fused_hybrid_ready) &&
-        n_tokens >= 2 && (n_tokens <= 4 || q5_verify_candidate) && verify_hooks &&
+        n_tokens >= 2 && (n_tokens <= 4 || wide_verify_candidate) && verify_hooks &&
         layer_begin == 0 && is_last_shard && out_logits &&
         ds4_backend_is_gpu(backend) && ds4_fused_verify_enabled();
     const bool heterogeneous_sparse_prefill =
@@ -6987,7 +6991,7 @@ bool deepseek4_step_layer_range(
             ? &fused_hybrid_decode_hooks : verify_hooks;
     if ((!moe_hybrid || fused_hybrid_ready) &&
         ((n_tokens >= 2 &&
-          (n_tokens <= 4 || q5_verify_candidate) && verify_hooks) ||
+          (n_tokens <= 4 || wide_verify_candidate) && verify_hooks) ||
          fused_hybrid_decode) &&
         layer_begin == 0 && is_last_shard &&
         out_logits && ds4_backend_is_gpu(backend) && ds4_fused_verify_enabled()) {
