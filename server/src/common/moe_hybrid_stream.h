@@ -29,6 +29,11 @@ struct MoeStreamConfig {
     // activation, scales, and batch width. A small bounded cache removes graph
     // construction from decode without assuming every layer uses one format.
     int graph_cache_entries = 8;
+    // Decode normally routes one token to several experts. When that complete
+    // route set is device-resident, submit its independent branches as one
+    // backend graph and reduce on the GPU, avoiding one synchronization and
+    // D2H copy per expert. Misses and multi-token prefill retain the pipeline.
+    bool fused_decode = true;
     // Optional adaptive GPU expert-cache budget. Zero keeps only the pipeline
     // slots. The hardware planner can safely assign otherwise-unused Strix
     // memory here while retaining its KV/graph reserve.
@@ -100,6 +105,8 @@ struct MoeStreamComputeStats {
     uint64_t graph_cache_hits = 0;
     uint64_t graph_evictions = 0;
     uint64_t graph_launches = 0;
+    uint64_t fused_decode_launches = 0;
+    uint64_t fused_decode_experts = 0;
 };
 
 struct MoeStreamCacheWarmEntry {

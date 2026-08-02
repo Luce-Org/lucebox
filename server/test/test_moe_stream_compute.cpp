@@ -27,7 +27,7 @@ namespace {
 
 struct MoeStreamComputeFixture {};
 
-constexpr int kExperts = 3;
+constexpr int kExperts = 4;
 // 256 deliberately does not satisfy CUDA/HIP's 512-element quantized matrix
 // row padding. The MXFP4 case below therefore exercises the padded GPU-slot
 // path that real Kimi-K3 exposed.
@@ -239,17 +239,19 @@ std::vector<float> cpu_reference(
         const std::vector<float> & down,
         const std::vector<float> & input,
         const int32_t * ids,
-        const float * weights) {
+        const float * weights,
+        int n_tokens = kTokens,
+        int top_k = kTopK) {
     constexpr float gate_scale = 0.8f;
     constexpr float up_scale = 1.1f;
     constexpr float down_scale = 0.9f;
     constexpr float beta = 4.0f;
     constexpr float linear_beta = 25.0f;
-    std::vector<float> output((size_t) kTokens * kOutput, 0.0f);
+    std::vector<float> output((size_t) n_tokens * kOutput, 0.0f);
     std::vector<float> activated(kFf);
-    for (int token = 0; token < kTokens; ++token) {
-        for (int rank = 0; rank < kTopK; ++rank) {
-            const int expert = ids[token * kTopK + rank];
+    for (int token = 0; token < n_tokens; ++token) {
+        for (int rank = 0; rank < top_k; ++rank) {
+            const int expert = ids[token * top_k + rank];
             for (int row = 0; row < kFf; ++row) {
                 float g = 0.0f;
                 float u = 0.0f;
@@ -275,11 +277,144 @@ std::vector<float> cpu_reference(
                     value += down[wi] * activated[(size_t) column];
                 }
                 output[(size_t) token * kOutput + row] +=
-                    weights[token * kTopK + rank] * down_scale * value;
+                    weights[token * top_k + rank] * down_scale * value;
             }
         }
     }
     return output;
+}
+
+void run_fused_decode_case(ggml_backend_t backend, bool mxfp4) {
+    std::vector<float> gate;
+    std::vector<float> up;
+    std::vector<float> down;
+    fill_weights(gate, up, down);
+    std::vector<float> gate_reference = gate;
+    std::vector<float> up_reference = up;
+    std::vector<float> down_reference = down;
+    ModelBytes model = mxfp4
+        ? make_mxfp4_model_bytes(
+              gate, up, down, gate_reference, up_reference, down_reference)
+        : make_model_bytes(true, gate, up, down);
+    TempFile file(model.file);
+
+    MoeHybridStorage storage;
+    storage.mmap_size = model.file.size();
+    storage.mmap_fd = ::dup(file.fd);
+    STREAM_REQUIRE(storage.mmap_fd >= 0);
+    storage.layer_regions.push_back(model.regions);
+
+    MoeStreamConfig config;
+    config.device_slots = kExperts;
+    config.device_cache_bytes = 0;
+    config.graph_cache_entries = 4;
+    config.fused_decode = true;
+    config.nvme.backend = MoeNvmeBackend::ThreadPool;
+    config.nvme.direct_io = MoeNvmeDirectMode::Disabled;
+    config.nvme.host_slots = 6;
+    config.nvme.io_threads = 2;
+
+    MoeHybridStreamEngine engine;
+    std::string error;
+    STREAM_REQUIRE(engine.init(
+        backend, model.slot_bytes, storage, config, &error));
+
+    MoeStreamExpertSpec spec;
+    spec.input_dim = kInput;
+    spec.intermediate_dim = kFf;
+    spec.output_dim = kOutput;
+    spec.gate_type = mxfp4 ? GGML_TYPE_MXFP4 : GGML_TYPE_F32;
+    spec.up_type = mxfp4 ? GGML_TYPE_MXFP4 : GGML_TYPE_F32;
+    spec.down_type = mxfp4 ? GGML_TYPE_MXFP4 : GGML_TYPE_F32;
+    spec.gated_activation = MoeGatedActivation::Situ;
+    spec.gate_scale = 0.8f;
+    spec.up_scale = 1.1f;
+    spec.down_scale = 0.9f;
+
+    std::vector<float> input((size_t) kInput);
+    for (size_t i = 0; i < input.size(); ++i) {
+        input[i] = 0.12f * std::sin(0.07f * (float) (i + 1));
+    }
+    constexpr int kDecodeTopK = 3;
+    int32_t ids[kDecodeTopK] = {2, 0, 1};
+    float weights[kDecodeTopK] = {0.50f, 0.30f, 0.20f};
+    MoeStreamRouteBatch batch;
+    batch.layer = 0;
+    batch.n_expert = kExperts;
+    batch.top_k = kDecodeTopK;
+    batch.n_tokens = 1;
+    batch.inputs = input.data();
+    batch.selected_ids = ids;
+    batch.selected_weights = weights;
+
+    // Prepare the padded numerical layout without admitting a pinned entry.
+    MoeStreamCacheWarmStats prepare_stats;
+    STREAM_REQUIRE(engine.warm_and_pin_device_cache(
+        {spec}, {{0, 0, 1, model.slot_bytes}}, kExperts,
+        &prepare_stats, &error));
+    STREAM_REQUIRE(prepare_stats.capacity_drops == 1);
+
+    const std::vector<float> expected = cpu_reference(
+        gate_reference, up_reference, down_reference,
+        input, ids, weights, 1, kDecodeTopK);
+    std::vector<float> actual;
+    auto require_close = [&](const std::vector<float> & reference) {
+        STREAM_REQUIRE(actual.size() == reference.size());
+        for (size_t i = 0; i < actual.size(); ++i) {
+            const float tolerance = mxfp4
+                ? 2.0e-4f + 2.0e-3f * std::fabs(reference[i])
+                : 2.0e-5f + 2.0e-4f * std::fabs(reference[i]);
+            STREAM_REQUIRE(std::fabs(actual[i] - reference[i]) <= tolerance);
+        }
+    };
+
+    // A cold route must preserve the transfer/compute overlap pipeline.
+    STREAM_REQUIRE(eval_moe_streamed_experts(
+        engine, spec, batch, actual, &error));
+    require_close(expected);
+    const MoeStreamComputeStats cold = engine.compute_stats();
+    STREAM_REQUIRE(cold.graph_launches == kDecodeTopK);
+    STREAM_REQUIRE(cold.fused_decode_launches == 0);
+
+    // Populate every slot, then verify the all-resident fused path.
+    for (int expert = 0; expert < kExperts; ++expert) {
+        int slot = -1;
+        STREAM_REQUIRE(engine.stage_expert_cached_async(
+            0, expert, &slot, &error));
+        STREAM_REQUIRE(engine.activate_device_slot(slot, &error));
+        engine.release_device_slot(slot);
+    }
+    STREAM_REQUIRE(eval_moe_streamed_experts(
+        engine, spec, batch, actual, &error));
+    require_close(expected);
+
+    const MoeStreamComputeStats first = engine.compute_stats();
+    STREAM_REQUIRE(first.graph_builds == cold.graph_builds + 1);
+    STREAM_REQUIRE(first.graph_launches == cold.graph_launches + 1);
+    STREAM_REQUIRE(first.fused_decode_launches == 1);
+    STREAM_REQUIRE(first.fused_decode_experts == kDecodeTopK);
+
+    // Reuse the same graph shape with a different expert set and ordering.
+    // This catches stale captured device pointers in CUDA/HIP graph mode.
+    ids[0] = 3;
+    ids[1] = 2;
+    ids[2] = 0;
+    weights[0] = 0.25f;
+    weights[1] = 0.60f;
+    weights[2] = 0.15f;
+    const std::vector<float> expected_rebound = cpu_reference(
+        gate_reference, up_reference, down_reference,
+        input, ids, weights, 1, kDecodeTopK);
+    STREAM_REQUIRE(eval_moe_streamed_experts(
+        engine, spec, batch, actual, &error));
+    require_close(expected_rebound);
+    const MoeStreamComputeStats second = engine.compute_stats();
+    STREAM_REQUIRE(second.graph_builds == first.graph_builds);
+    STREAM_REQUIRE(second.graph_cache_hits > first.graph_cache_hits);
+    STREAM_REQUIRE(second.graph_launches == cold.graph_launches + 2);
+    STREAM_REQUIRE(second.fused_decode_launches == 2);
+    STREAM_REQUIRE(second.fused_decode_experts == 2 * kDecodeTopK);
+    engine.destroy();
 }
 
 void run_layout_case(ggml_backend_t backend, bool expert_major) {
@@ -524,6 +659,8 @@ TEST_CASE(MoeStreamComputeFixture, persistent_graph_matches_cpu_and_padded_mxfp4
     }
     run_layout_case(backend, false);
     run_layout_case(backend, true);
+    run_fused_decode_case(backend, false);
+    run_fused_decode_case(backend, true);
     run_mxfp4_padding_case(backend);
     run_pinned_cache_case(backend);
     ggml_backend_free(backend);

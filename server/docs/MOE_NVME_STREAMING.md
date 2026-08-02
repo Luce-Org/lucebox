@@ -87,6 +87,11 @@ weight masks reconstruct the original route batch exactly.
 - Persistent compute graphs remove graph construction and activation-buffer
   allocation from the steady-state expert loop. A bounded LRU supports models
   whose layers use more than one expert shape or quantization format.
+- When every route selected for a decode token is already device-resident, one
+  persistent fork/join graph evaluates all selected experts and performs the
+  weighted reduction on the GPU. A cache miss automatically retains the
+  transfer/compute pipeline, so this optimization cannot remove cold-path
+  overlap.
 
 The native model router remains authoritative. Prediction may only issue a
 bounded prefetch; a wrong prediction cannot change model output.
@@ -169,9 +174,10 @@ budget reserves the larger of 2 GiB or 5% of device memory and never exceeds
 the complete routed pool. `DFLASH_MOE_NVME_DEVICE_CACHE_MB` remains an explicit
 override, also capped by the routed pool.
 
-Kimi's native router remains authoritative. The current text backend is
-correctness-first and sequential; captured per-layer graphs and the vision
-tower are separate optimizations.
+Kimi's native router remains authoritative. Routed decode uses one GPU graph
+per layer when every selected expert is resident; otherwise it uses the
+pipelined per-expert graph. The complete text backend remains layer-sequential,
+and the vision tower is a separate optimization.
 
 ### Expert-major package and profile-guided cache
 
@@ -259,6 +265,7 @@ not improve the qualified P310 drive and consumes extra pinned/system memory.
 | `DFLASH_MOE_NVME_DEVICE_SLOTS` | `2` | Minimum rotating GPU expert buffers |
 | `DFLASH_MOE_NVME_DEVICE_CACHE_MB` | automatic/`0` | Override adaptive device expert-cache memory; `0` leaves only pipeline slots |
 | `DFLASH_MOE_NVME_GRAPH_CACHE` | `8` | Persistent expert-graph variants retained per stream engine; `0` is a diagnostic no-cache mode |
+| `DFLASH_MOE_NVME_FUSED_DECODE` | `1` | Fuse an all-resident single-token route set and its weighted reduction into one GPU graph; `0` is an A/B fallback |
 | `DFLASH_MOE_NVME_REFERENCE_EVAL` | unset | Diagnostic only: `1` restores the allocation-heavy reference evaluator for numerical/performance A/B |
 | `DFLASH_MOE_EXPERT_PACKAGE` | unset | Optional validated expert-major package used in place of tensor-major GGUF expert regions |
 | `DFLASH_MOE_EXPERT_PACKAGE_BUILD` | unset | One-time Kimi package creation: `1` builds when absent; `force` rebuilds |
@@ -271,7 +278,8 @@ not improve the qualified P310 drive and consumes extra pinned/system memory.
 
 Shutdown telemetry reports logical and physical bytes, measured read service
 rate, cache hits, demand wait/timeouts, de-duplication, dropped speculation,
-errors, and persistent-graph builds/hits/evictions. The scheduler rejects
+errors, persistent-graph builds/hits/evictions, and fused decode
+launches/experts. The scheduler rejects
 truncated shards at bind time and accepts a valid short direct-I/O completion
 only when it covers the complete logical payload at an unaligned file tail.
 `test_moe_stream_compute` generates
@@ -282,6 +290,23 @@ targets `test_moe_nvme_scheduler`, `test_moe_expert_package`,
 `bench_moe_nvme_io`, and
 `bench_moe_nvme_pipeline` test scheduling, raw storage, and the complete
 SSD-to-GPU path. Benchmarks are read-only.
+
+### Warm decode qualification (2026-08-02)
+
+The model-neutral Kimi geometry benchmark was run on Lucebox3 with 896 IQ1_S
+experts, top-16 routing, 92 MoE layers, and a 9.763 GiB device cache. The first
+token loaded 8.843994 GiB; the following 49 tokens reused identical routes, for
+a 98% aggregate cache-hit rate. Three alternating A/B runs on Strix Halo
+measured 5.770 routed-core token/s with per-expert submission and 6.913 token/s
+with fused decode: **+19.8%**. Each fused run reduced 73,600 expert graph
+submissions to 1,472 cold submissions plus 4,508 fused layer submissions.
+
+The same numerical test passed on ROCm/gfx1151 and CUDA/sm_86, including graph
+reuse with changed expert pointers and route weights. RTX 3090 throughput on
+the same three-run A/B improved from 6.327 to 7.364 token/s (**+16.4%**). With a
+128 MiB cache and unrelated routes, the resident guard selected the existing
+cold pipeline (zero fused launches), preserving its storage throughput. These
+are routed-core microbenchmarks rather than complete Kimi generation rates.
 
 The external `smoke_kimi_k3_forward` target accepts
 `[stream_experts=0|1] [expert_gpu=-1]`. This is an A/B and placement oracle for

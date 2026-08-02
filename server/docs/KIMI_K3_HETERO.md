@@ -42,6 +42,11 @@ small architecture adapter around it:
   896 experts, top-16, 92 MoE layers,
   `3584 -> 3072 -> 3584`, and SiTU (`beta=4`, `linear_beta=25`). It overlaps
   SSD/H2D for expert N+1 with compute for expert N.
+- All-resident single-token route sets use one persistent GPU fork/join graph
+  per MoE layer. The graph evaluates every selected expert, applies dynamic
+  native-router weights, and reduces on-device, replacing up to 16 graph
+  submissions, synchronizations, and output copies. Any cache miss retains the
+  original overlap pipeline automatically.
 
 Seven scheduler tests pass on the AMD Lucebox, including expert-major one-read
 records, mmap, and real-file multi-shard reads. A separate numerical test
@@ -51,8 +56,8 @@ source index zero and need no model-specific change.
 
 The SSD text path is implemented, but two qualification boundaries remain:
 
-- The backend is correctness-first and token-sequential. Its per-layer graph
-  boundaries are not yet fused/captured for full-model speed.
+- The backend is correctness-first and token-sequential. Routed expert
+  fork/join is fused on cache hits, but full-model layer boundaries are not.
 - The heterogeneous routed branches overlap, but their partial outputs still
   cross a host-visible, activation-sized boundary at every routed layer. It
   does not yet use PR-505's device-resident peer join.
@@ -128,6 +133,26 @@ cuts end-to-end throughput.
 The repeated-route result is deliberately a best case, not a prediction.
 Kimi K3 was designed for balanced expert use. With unrelated balanced routes,
 a cache only helps in proportion to its share of the 495 GiB routed pool.
+
+## Warm routed-core optimization, 2026-08-02
+
+Lucebox3 supplied independent Strix Halo and RTX 3090 qualification. The
+benchmark used the complete Kimi geometry above, 50 tokens with identical
+routes, and a 9.763 GiB device cache. The first token was cold and moved the
+exact 8.843994 GiB; the remaining tokens were device-cache hits.
+
+| Backend | Per-expert graphs | Fused resident decode | Gain |
+|---|---:|---:|---:|
+| Strix Halo ROCm/gfx1151 (three-run mean) | 5.770 token/s | **6.913 token/s** | **+19.8%** |
+| RTX 3090 CUDA/sm_86 (three-run mean) | 6.327 token/s | **7.364 token/s** | **+16.4%** |
+
+On Strix, graph submissions fell from 73,600 to 5,980: 1,472 submissions for
+the first cold token plus one fused submission for each of the remaining
+4,508 layer calls. A separate 0%-hit, 128 MiB-cache run selected the original
+cold pipeline and issued zero fused launches. Numerical tests match a CPU
+oracle on both backends and also change expert addresses and route weights
+between cached graph launches. These numbers isolate the routed core and do
+not claim complete-model token speed.
 
 ## Practical Lucebox placement
 

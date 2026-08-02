@@ -144,6 +144,8 @@ MoeStreamConfig MoeStreamConfig::from_env() {
         "DFLASH_MOE_NVME_DEVICE_SLOTS", config.device_slots, 2, 8);
     config.graph_cache_entries = env_bounded_int(
         "DFLASH_MOE_NVME_GRAPH_CACHE", config.graph_cache_entries, 0, 64);
+    config.fused_decode = env_bounded_int(
+        "DFLASH_MOE_NVME_FUSED_DECODE", config.fused_decode ? 1 : 0, 0, 1) != 0;
     config.device_cache_bytes = env_mib(
         "DFLASH_MOE_NVME_DEVICE_CACHE_MB", config.device_cache_bytes);
     config.prefill_threshold = env_bounded_int(
@@ -289,6 +291,111 @@ bool validate_moe_stream_expert_layout(
 
 namespace {
 
+struct StreamExpertDeviceBinding {
+    const void * gate = nullptr;
+    const void * up = nullptr;
+    const void * down = nullptr;
+    size_t gate_alloc_bytes = 0;
+    size_t up_alloc_bytes = 0;
+    size_t down_alloc_bytes = 0;
+};
+
+bool bind_stream_tensor(ggml_backend_buffer_t buffer,
+                        ggml_tensor * tensor,
+                        const void * data,
+                        size_t available_bytes,
+                        const char * label,
+                        std::string * err) {
+    if (!buffer || !tensor || !data) {
+        if (err) *err = std::string("invalid streamed ") +
+                        label + " tensor binding";
+        return false;
+    }
+    const size_t required_bytes =
+        ggml_backend_buffer_get_alloc_size(buffer, tensor);
+    if (available_bytes < required_bytes) {
+        if (err) *err = std::string("streamed ") + label +
+            " device allocation is smaller than the backend's padded "
+            "tensor requirement";
+        return false;
+    }
+    const size_t alignment = ggml_backend_buffer_get_alignment(buffer);
+    if (alignment != 0 && (uintptr_t) data % alignment != 0) {
+        if (err) *err = std::string("streamed ") + label +
+                        " tensor is not aligned for the compute backend";
+        return false;
+    }
+    if (ggml_backend_tensor_alloc(
+            buffer, tensor, const_cast<void *>(data)) != GGML_STATUS_SUCCESS) {
+        if (err) *err = std::string("failed to bind streamed ") + label +
+                        " tensor to expert cache";
+        return false;
+    }
+    return true;
+}
+
+ggml_tensor * scale_stream_tensor(ggml_context * ctx,
+                                  ggml_tensor * value,
+                                  float scale) {
+    return scale == 1.0f ? value : ggml_scale(ctx, value, scale);
+}
+
+ggml_tensor * apply_stream_gated_activation(
+        ggml_context * ctx,
+        const MoeStreamExpertSpec & spec,
+        ggml_tensor * gate,
+        ggml_tensor * up) {
+    if (spec.gated_activation == MoeGatedActivation::Situ) {
+        ggml_tensor * nonlinear = ggml_scale(ctx, gate, 1.0f / spec.situ_beta);
+        nonlinear = ggml_tanh(ctx, nonlinear);
+        nonlinear = ggml_scale(ctx, nonlinear, spec.situ_beta);
+        nonlinear = ggml_mul(ctx, nonlinear, ggml_sigmoid(ctx, gate));
+        ggml_tensor * linear = ggml_scale(
+            ctx, up, 1.0f / spec.situ_linear_beta);
+        linear = ggml_tanh(ctx, linear);
+        linear = ggml_scale(ctx, linear, spec.situ_linear_beta);
+        return ggml_mul(ctx, nonlinear, linear);
+    }
+    if (spec.swiglu_clamp > 0.0f) {
+        return ggml_swiglu_ds4_split(ctx, gate, up, spec.swiglu_clamp);
+    }
+    return ggml_swiglu_split(ctx, gate, up);
+}
+
+ggml_tensor * build_stream_expert_branch(
+        ggml_context * ctx,
+        const MoeStreamExpertSpec & spec,
+        int batch,
+        ggml_tensor * input,
+        ggml_tensor * gate,
+        ggml_tensor * up,
+        ggml_tensor * down,
+        ggml_tensor * gate_up) {
+    ggml_tensor * activated = nullptr;
+    if (gate_up) {
+        ggml_tensor * combined = scale_stream_tensor(
+            ctx, ggml_mul_mat(ctx, gate_up, input), spec.gate_up_scale);
+        ggml_tensor * gate_part = ggml_view_2d(
+            ctx, combined, spec.intermediate_dim, batch,
+            combined->nb[1], 0);
+        ggml_tensor * up_part = ggml_view_2d(
+            ctx, combined, spec.intermediate_dim, batch,
+            combined->nb[1],
+            (size_t) spec.intermediate_dim * sizeof(float));
+        activated = apply_stream_gated_activation(
+            ctx, spec, ggml_cont(ctx, gate_part), ggml_cont(ctx, up_part));
+    } else {
+        ggml_tensor * gate_value = scale_stream_tensor(
+            ctx, ggml_mul_mat(ctx, gate, input), spec.gate_scale);
+        ggml_tensor * up_value = scale_stream_tensor(
+            ctx, ggml_mul_mat(ctx, up, input), spec.up_scale);
+        activated = apply_stream_gated_activation(
+            ctx, spec, gate_value, up_value);
+    }
+    return scale_stream_tensor(
+        ctx, ggml_mul_mat(ctx, down, activated), spec.down_scale);
+}
+
 class PersistentStreamExpertGraph {
 public:
     ~PersistentStreamExpertGraph() { destroy(); }
@@ -350,99 +457,24 @@ public:
             ggml_set_input(down_);
         }
 
-        auto bind_external = [&](ggml_tensor * tensor,
-                                 const void * data,
-                                 size_t available_bytes,
-                                 const char * label) -> bool {
-            if (!tensor || !data) {
-                if (err) *err = std::string("invalid streamed ") +
-                                label + " tensor binding";
-                return false;
-            }
-            const size_t required_bytes =
-                ggml_backend_buffer_get_alloc_size(expert_buffer, tensor);
-            if (available_bytes < required_bytes) {
-                if (err) *err = std::string("streamed ") + label +
-                    " device allocation is smaller than the backend's "
-                    "padded tensor requirement";
-                return false;
-            }
-            const size_t alignment =
-                ggml_backend_buffer_get_alignment(expert_buffer);
-            if (alignment != 0 &&
-                (uintptr_t) data % alignment != 0) {
-                if (err) *err = std::string("streamed ") + label +
-                    " tensor is not aligned for the compute backend";
-                return false;
-            }
-            if (ggml_backend_tensor_alloc(
-                    expert_buffer, tensor, const_cast<void *>(data)) !=
-                    GGML_STATUS_SUCCESS) {
-                if (err) *err = std::string("failed to bind streamed ") +
-                                label + " tensor to expert cache";
-                return false;
-            }
-            return true;
-        };
         if (spec.fused_gate_up) {
-            if (!bind_external(gate_up_, gate_data, gate_alloc_bytes,
-                               "gate_up") ||
-                !bind_external(down_, down_data, down_alloc_bytes, "down")) {
+            if (!bind_stream_tensor(expert_buffer, gate_up_, gate_data,
+                                    gate_alloc_bytes, "gate_up", err) ||
+                !bind_stream_tensor(expert_buffer, down_, down_data,
+                                    down_alloc_bytes, "down", err)) {
                 return false;
             }
-        } else if (!bind_external(gate_, gate_data, gate_alloc_bytes, "gate") ||
-                   !bind_external(up_, up_data, up_alloc_bytes, "up") ||
-                   !bind_external(down_, down_data, down_alloc_bytes, "down")) {
+        } else if (!bind_stream_tensor(expert_buffer, gate_, gate_data,
+                                       gate_alloc_bytes, "gate", err) ||
+                   !bind_stream_tensor(expert_buffer, up_, up_data,
+                                       up_alloc_bytes, "up", err) ||
+                   !bind_stream_tensor(expert_buffer, down_, down_data,
+                                       down_alloc_bytes, "down", err)) {
             return false;
         }
 
-        auto scale_if_needed = [&](ggml_tensor * value, float scale) {
-            return scale == 1.0f ? value : ggml_scale(ctx_, value, scale);
-        };
-        auto gated_activation = [&](ggml_tensor * gate,
-                                    ggml_tensor * up) -> ggml_tensor * {
-            if (spec.gated_activation == MoeGatedActivation::Situ) {
-                ggml_tensor * nonlinear = ggml_scale(
-                    ctx_, gate, 1.0f / spec.situ_beta);
-                nonlinear = ggml_tanh(ctx_, nonlinear);
-                nonlinear = ggml_scale(ctx_, nonlinear, spec.situ_beta);
-                nonlinear = ggml_mul(
-                    ctx_, nonlinear, ggml_sigmoid(ctx_, gate));
-                ggml_tensor * linear = ggml_scale(
-                    ctx_, up, 1.0f / spec.situ_linear_beta);
-                linear = ggml_tanh(ctx_, linear);
-                linear = ggml_scale(ctx_, linear, spec.situ_linear_beta);
-                return ggml_mul(ctx_, nonlinear, linear);
-            }
-            if (spec.swiglu_clamp > 0.0f) {
-                return ggml_swiglu_ds4_split(
-                    ctx_, gate, up, spec.swiglu_clamp);
-            }
-            return ggml_swiglu_split(ctx_, gate, up);
-        };
-
-        ggml_tensor * activated = nullptr;
-        if (gate_up_) {
-            ggml_tensor * combined = scale_if_needed(
-                ggml_mul_mat(ctx_, gate_up_, input_), spec.gate_up_scale);
-            ggml_tensor * gate_part = ggml_view_2d(
-                ctx_, combined, spec.intermediate_dim, batch,
-                combined->nb[1], 0);
-            ggml_tensor * up_part = ggml_view_2d(
-                ctx_, combined, spec.intermediate_dim, batch,
-                combined->nb[1],
-                (size_t) spec.intermediate_dim * sizeof(float));
-            activated = gated_activation(
-                ggml_cont(ctx_, gate_part), ggml_cont(ctx_, up_part));
-        } else {
-            ggml_tensor * gate_value = scale_if_needed(
-                ggml_mul_mat(ctx_, gate_, input_), spec.gate_scale);
-            ggml_tensor * up_value = scale_if_needed(
-                ggml_mul_mat(ctx_, up_, input_), spec.up_scale);
-            activated = gated_activation(gate_value, up_value);
-        }
-        output_ = scale_if_needed(
-            ggml_mul_mat(ctx_, down_, activated), spec.down_scale);
+        output_ = build_stream_expert_branch(
+            ctx_, spec, batch, input_, gate_, up_, down_, gate_up_);
         ggml_set_output(output_);
         graph_ = ggml_new_graph_custom(ctx_, 512, false);
         ggml_build_forward_expand(graph_, output_);
@@ -535,6 +567,212 @@ private:
     ggml_tensor * output_ = nullptr;
 };
 
+// Single-token decode selects several independent experts and then computes a
+// weighted sum. Keeping those branches in one persistent graph removes the
+// host boundary between experts: one graph submission, one synchronization,
+// and one output copy per routed MoE layer.
+class PersistentStreamMoEDecodeGraph {
+public:
+    ~PersistentStreamMoEDecodeGraph() { destroy(); }
+
+    bool matches(const MoeStreamExpertSpec & spec, int expert_count) const {
+        return expert_count_ == expert_count && same_stream_spec(spec_, spec);
+    }
+
+    bool build(ggml_backend_t backend,
+               ggml_backend_buffer_t expert_buffer,
+               const MoeStreamExpertSpec & spec,
+               const std::vector<StreamExpertDeviceBinding> & bindings,
+               std::string * err) {
+        destroy();
+        if (!backend || !expert_buffer || bindings.size() < 2) {
+            if (err) *err = "invalid fused streamed-MoE graph arguments";
+            return false;
+        }
+        backend_ = backend;
+        spec_ = spec;
+        expert_count_ = (int) bindings.size();
+
+        ggml_init_params params{};
+        params.mem_size = 8 * 1024 * 1024;
+        params.no_alloc = true;
+        ctx_ = ggml_init(params);
+        if (!ctx_) {
+            if (err) *err = "ggml_init failed for fused streamed-MoE decode";
+            return false;
+        }
+
+        input_ = ggml_new_tensor_2d(ctx_, GGML_TYPE_F32, spec.input_dim, 1);
+        route_weights_ = ggml_new_tensor_1d(
+            ctx_, GGML_TYPE_F32, expert_count_);
+        ggml_set_input(input_);
+        ggml_set_input(route_weights_);
+
+        tensors_.resize(bindings.size());
+        expert_outputs_ = ggml_new_tensor_3d(
+            ctx_, GGML_TYPE_F32, spec.output_dim, expert_count_, 1);
+        copy_nodes_.reserve(bindings.size());
+        for (size_t i = 0; i < bindings.size(); ++i) {
+            ExpertTensors & tensors = tensors_[i];
+            if (spec.fused_gate_up) {
+                tensors.gate_up = ggml_new_tensor_2d(
+                    ctx_, spec.gate_up_type, spec.input_dim,
+                    2LL * spec.intermediate_dim);
+                tensors.down = ggml_new_tensor_2d(
+                    ctx_, spec.down_type, spec.intermediate_dim,
+                    spec.output_dim);
+                ggml_set_input(tensors.gate_up);
+                ggml_set_input(tensors.down);
+                if (!bind_stream_tensor(
+                        expert_buffer, tensors.gate_up, bindings[i].gate,
+                        bindings[i].gate_alloc_bytes, "gate_up", err) ||
+                    !bind_stream_tensor(
+                        expert_buffer, tensors.down, bindings[i].down,
+                        bindings[i].down_alloc_bytes, "down", err)) {
+                    return false;
+                }
+            } else {
+                tensors.gate = ggml_new_tensor_2d(
+                    ctx_, spec.gate_type, spec.input_dim,
+                    spec.intermediate_dim);
+                tensors.up = ggml_new_tensor_2d(
+                    ctx_, spec.up_type, spec.input_dim,
+                    spec.intermediate_dim);
+                tensors.down = ggml_new_tensor_2d(
+                    ctx_, spec.down_type, spec.intermediate_dim,
+                    spec.output_dim);
+                ggml_set_input(tensors.gate);
+                ggml_set_input(tensors.up);
+                ggml_set_input(tensors.down);
+                if (!bind_stream_tensor(
+                        expert_buffer, tensors.gate, bindings[i].gate,
+                        bindings[i].gate_alloc_bytes, "gate", err) ||
+                    !bind_stream_tensor(
+                        expert_buffer, tensors.up, bindings[i].up,
+                        bindings[i].up_alloc_bytes, "up", err) ||
+                    !bind_stream_tensor(
+                        expert_buffer, tensors.down, bindings[i].down,
+                        bindings[i].down_alloc_bytes, "down", err)) {
+                    return false;
+                }
+            }
+
+            ggml_tensor * branch = build_stream_expert_branch(
+                ctx_, spec, 1, input_, tensors.gate, tensors.up,
+                tensors.down, tensors.gate_up);
+            ggml_tensor * destination = ggml_view_2d(
+                ctx_, expert_outputs_, spec.output_dim, 1,
+                expert_outputs_->nb[1], i * expert_outputs_->nb[1]);
+            ggml_tensor * copy = ggml_cpy(ctx_, branch, destination);
+            ggml_set_output(copy);
+            copy_nodes_.push_back(copy);
+        }
+
+        output_ = ggml_laguna_moe_combine(
+            ctx_, expert_outputs_, route_weights_);
+        ggml_set_output(output_);
+        graph_ = ggml_new_graph_custom(
+            ctx_, std::max<size_t>(512, bindings.size() * 256), false);
+        for (ggml_tensor * copy : copy_nodes_) {
+            ggml_build_forward_expand(graph_, copy);
+        }
+        ggml_build_forward_expand(graph_, output_);
+        alloc_ = ggml_gallocr_new(
+            ggml_backend_get_default_buffer_type(backend_));
+        if (!alloc_ || !ggml_gallocr_alloc_graph(alloc_, graph_)) {
+            if (err) *err = "fused streamed-MoE graph allocation failed";
+            return false;
+        }
+        return true;
+    }
+
+    bool launch(const std::vector<StreamExpertDeviceBinding> & bindings,
+                const float * input,
+                const float * route_weights,
+                std::string * err) {
+        if (!valid() || !input || !route_weights ||
+            bindings.size() != tensors_.size()) {
+            if (err) *err = "fused streamed-MoE graph is not ready";
+            return false;
+        }
+        for (size_t i = 0; i < bindings.size(); ++i) {
+            ExpertTensors & tensors = tensors_[i];
+            if (tensors.gate_up) {
+                tensors.gate_up->data = const_cast<void *>(bindings[i].gate);
+            } else {
+                tensors.gate->data = const_cast<void *>(bindings[i].gate);
+                tensors.up->data = const_cast<void *>(bindings[i].up);
+            }
+            tensors.down->data = const_cast<void *>(bindings[i].down);
+        }
+        ggml_backend_tensor_set(
+            input_, input, 0, (size_t) spec_.input_dim * sizeof(float));
+        ggml_backend_tensor_set(
+            route_weights_, route_weights, 0,
+            bindings.size() * sizeof(float));
+        if (ggml_backend_graph_compute_async(backend_, graph_) !=
+            GGML_STATUS_SUCCESS) {
+            if (err) *err = "fused streamed-MoE graph launch failed";
+            return false;
+        }
+        return true;
+    }
+
+    bool finish(std::vector<float> & output, std::string * err) {
+        if (!valid()) {
+            if (err) *err = "fused streamed-MoE graph is not ready";
+            return false;
+        }
+        ggml_backend_synchronize(backend_);
+        output.resize((size_t) spec_.output_dim);
+        ggml_backend_tensor_get(
+            output_, output.data(), 0,
+            output.size() * sizeof(float));
+        return true;
+    }
+
+    void destroy() {
+        if (alloc_) ggml_gallocr_free(alloc_);
+        alloc_ = nullptr;
+        if (ctx_) ggml_free(ctx_);
+        ctx_ = nullptr;
+        graph_ = nullptr;
+        input_ = route_weights_ = expert_outputs_ = output_ = nullptr;
+        tensors_.clear();
+        copy_nodes_.clear();
+        backend_ = nullptr;
+        expert_count_ = 0;
+    }
+
+    bool valid() const {
+        return backend_ && ctx_ && graph_ && alloc_ && input_ &&
+               route_weights_ && expert_outputs_ && output_;
+    }
+
+    uint64_t last_touch = 0;
+
+private:
+    struct ExpertTensors {
+        ggml_tensor * gate = nullptr;
+        ggml_tensor * up = nullptr;
+        ggml_tensor * down = nullptr;
+        ggml_tensor * gate_up = nullptr;
+    };
+
+    ggml_backend_t backend_ = nullptr;
+    MoeStreamExpertSpec spec_{};
+    int expert_count_ = 0;
+    ggml_context * ctx_ = nullptr;
+    ggml_cgraph * graph_ = nullptr;
+    ggml_gallocr_t alloc_ = nullptr;
+    ggml_tensor * input_ = nullptr;
+    ggml_tensor * route_weights_ = nullptr;
+    ggml_tensor * expert_outputs_ = nullptr;
+    ggml_tensor * output_ = nullptr;
+    std::vector<ExpertTensors> tensors_;
+    std::vector<ggml_tensor *> copy_nodes_;
+};
+
 } // namespace
 
 struct MoeHybridStreamEngine::Runtime {
@@ -597,6 +835,8 @@ struct MoeHybridStreamEngine::Runtime {
     size_t pinned_experts = 0;
     int active_slot = -1;
     std::vector<std::unique_ptr<PersistentStreamExpertGraph>> graph_cache;
+    std::vector<std::unique_ptr<PersistentStreamMoEDecodeGraph>>
+        fused_decode_graph_cache;
     uint64_t graph_clock = 0;
     MoeStreamComputeStats compute_stats{};
     std::mutex compute_mutex;
@@ -609,6 +849,7 @@ void release_device_cache(RuntimeT & runtime) {
         (void) cudaStreamSynchronize(runtime.transfer_stream);
     }
     runtime.graph_cache.clear();
+    runtime.fused_decode_graph_cache.clear();
     for (auto & slot : runtime.device_slots) {
         slot.host_lease.reset();
         if (slot.ready) (void) cudaEventDestroy(slot.ready);
@@ -938,6 +1179,7 @@ void MoeHybridStreamEngine::destroy() {
         (void) cudaStreamSynchronize(runtime_->transfer_stream);
     }
     runtime_->graph_cache.clear();
+    runtime_->fused_decode_graph_cache.clear();
     for (Runtime::DeviceSlot & slot : runtime_->device_slots) {
         slot.host_lease.reset();
         if (slot.ready) (void) cudaEventDestroy(slot.ready);
@@ -977,7 +1219,8 @@ void MoeHybridStreamEngine::destroy() {
                 "timeouts=%llu errors=%llu "
                 "device-cache=%.1f MiB slots=%zu pinned=%zu "
                 "hits=%llu misses=%llu evictions=%llu "
-                "graphs=%llu graph-hits=%llu graph-evictions=%llu launches=%llu\n",
+                "graphs=%llu graph-hits=%llu graph-evictions=%llu launches=%llu "
+                "fused-decode-launches=%llu fused-decode-experts=%llu\n",
                 runtime_->io->effective_backend_name(),
                 (unsigned long long) stats.requests,
                 (unsigned long long) stats.read_ops,
@@ -996,7 +1239,9 @@ void MoeHybridStreamEngine::destroy() {
                 (unsigned long long) runtime_->compute_stats.graph_builds,
                 (unsigned long long) runtime_->compute_stats.graph_cache_hits,
                 (unsigned long long) runtime_->compute_stats.graph_evictions,
-                (unsigned long long) runtime_->compute_stats.graph_launches);
+                (unsigned long long) runtime_->compute_stats.graph_launches,
+                (unsigned long long) runtime_->compute_stats.fused_decode_launches,
+                (unsigned long long) runtime_->compute_stats.fused_decode_experts);
         }
         runtime_->io->destroy();
     }
@@ -1908,6 +2153,160 @@ bool eval_moe_streamed_experts(
     engine.request_experts(batch.layer, unique_experts.data(),
                            (int) unique_experts.size(),
                            MoeNvmePriority::Demand);
+
+    // Decode is latency-sensitive and normally selects several experts for a
+    // single token. If every selected expert is already device-resident, keep
+    // the complete fork/join on the GPU. A miss retains the pipelined path so
+    // expert N compute can overlap the upload of N+1. This removes the hot-path
+    // host boundary without changing routing, formats, or prefill behavior.
+    bool all_selected_resident = runtime.config.fused_decode &&
+        batch.n_tokens == 1 && unique_experts.size() > 1;
+    if (all_selected_resident) {
+        for (const int32_t expert : unique_experts) {
+            const auto found = runtime.device_index.find(
+                device_key(batch.layer, expert));
+            if (found == runtime.device_index.end() || found->second < 0 ||
+                found->second >= (int) runtime.device_slots.size()) {
+                all_selected_resident = false;
+                break;
+            }
+            const auto & slot =
+                runtime.device_slots[(size_t) found->second];
+            if (!slot.valid || !slot.cache_managed ||
+                slot.compute_users != 0 || slot.key.layer != batch.layer ||
+                slot.key.expert != expert) {
+                all_selected_resident = false;
+                break;
+            }
+        }
+    }
+    if (all_selected_resident) {
+        struct ActiveSlotSet {
+            MoeHybridStreamEngine & engine;
+            std::vector<int> slots;
+            ~ActiveSlotSet() {
+                for (auto it = slots.rbegin(); it != slots.rend(); ++it) {
+                    engine.release_device_slot(*it);
+                }
+            }
+        } active{engine, {}};
+        active.slots.reserve(unique_experts.size());
+
+        std::vector<StreamExpertDeviceBinding> bindings;
+        std::vector<float> route_weights;
+        bindings.reserve(unique_experts.size());
+        route_weights.reserve(unique_experts.size());
+        for (const int32_t expert : unique_experts) {
+            float combined_weight = 0.0f;
+            for (int rank = 0; rank < batch.top_k; ++rank) {
+                if (batch.selected_ids[(size_t) rank] == expert) {
+                    combined_weight += batch.selected_weights[(size_t) rank];
+                }
+            }
+            if (!std::isfinite(combined_weight)) {
+                if (err) *err = "combined expert route weight overflowed";
+                return false;
+            }
+
+            int slot_index = -1;
+            if (!engine.stage_expert_cached_async(
+                    batch.layer, expert, &slot_index, err) ||
+                !engine.activate_device_slot(slot_index, err)) {
+                return false;
+            }
+            active.slots.push_back(slot_index);
+            const auto & slot = runtime.device_slots[(size_t) slot_index];
+            if (!validate_moe_stream_expert_layout(spec, slot.layout, err)) {
+                return false;
+            }
+            const MoeExpertComponentKind gate_kind = spec.fused_gate_up
+                ? MoeExpertComponentKind::FusedGateUp
+                : MoeExpertComponentKind::Gate;
+            const auto * gate_component =
+                slot.device_layout.component(gate_kind);
+            const auto * up_component = spec.fused_gate_up
+                ? nullptr
+                : slot.device_layout.component(MoeExpertComponentKind::Up);
+            const auto * down_component =
+                slot.device_layout.component(MoeExpertComponentKind::Down);
+            if (!gate_component || !down_component ||
+                (!spec.fused_gate_up && !up_component)) {
+                if (err) *err =
+                    "streamed device layout is missing an expert component";
+                return false;
+            }
+            const auto * base = static_cast<const uint8_t *>(slot.data);
+            bindings.push_back({
+                base + gate_component->offset,
+                up_component ? base + up_component->offset : nullptr,
+                base + down_component->offset,
+                gate_component->alloc_bytes,
+                up_component ? up_component->alloc_bytes : 0,
+                down_component->alloc_bytes,
+            });
+            route_weights.push_back(combined_weight);
+        }
+
+        std::unique_ptr<PersistentStreamMoEDecodeGraph> ephemeral;
+        PersistentStreamMoEDecodeGraph * graph = nullptr;
+        const uint64_t touch = ++runtime.graph_clock;
+        if (runtime.config.graph_cache_entries > 0) {
+            for (auto & candidate : runtime.fused_decode_graph_cache) {
+                if (candidate && candidate->matches(
+                        spec, (int) bindings.size())) {
+                    candidate->last_touch = touch;
+                    ++runtime.compute_stats.graph_cache_hits;
+                    graph = candidate.get();
+                    break;
+                }
+            }
+        }
+        if (!graph) {
+            std::unique_ptr<PersistentStreamMoEDecodeGraph> built(
+                new (std::nothrow) PersistentStreamMoEDecodeGraph);
+            if (!built) {
+                if (err) *err =
+                    "failed to allocate fused streamed-MoE graph";
+                return false;
+            }
+            if (!built->build(runtime.backend, runtime.device_pool_buffer,
+                              spec, bindings, err)) {
+                return false;
+            }
+            built->last_touch = touch;
+            ++runtime.compute_stats.graph_builds;
+            if (runtime.config.graph_cache_entries <= 0) {
+                graph = built.get();
+                ephemeral = std::move(built);
+            } else {
+                if ((int) runtime.fused_decode_graph_cache.size() >=
+                    runtime.config.graph_cache_entries) {
+                    auto victim = std::min_element(
+                        runtime.fused_decode_graph_cache.begin(),
+                        runtime.fused_decode_graph_cache.end(),
+                        [](const auto & a, const auto & b) {
+                            return a->last_touch < b->last_touch;
+                        });
+                    if (victim != runtime.fused_decode_graph_cache.end()) {
+                        runtime.fused_decode_graph_cache.erase(victim);
+                        ++runtime.compute_stats.graph_evictions;
+                    }
+                }
+                graph = built.get();
+                runtime.fused_decode_graph_cache.push_back(std::move(built));
+            }
+        }
+        if (!graph->launch(
+                bindings, batch.inputs, route_weights.data(), err) ||
+            !graph->finish(out, err)) {
+            return false;
+        }
+        ++runtime.compute_stats.graph_launches;
+        ++runtime.compute_stats.fused_decode_launches;
+        runtime.compute_stats.fused_decode_experts += bindings.size();
+        return true;
+    }
+
     int staged_slot = -1;
     if (!engine.stage_expert_cached_async(
             batch.layer, unique_experts[0], &staged_slot, err)) {

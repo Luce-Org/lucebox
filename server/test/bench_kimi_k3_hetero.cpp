@@ -478,12 +478,15 @@ int main(int argc, char ** argv) {
         "ssd_payload_gib=%.6f physical_gib=%.6f pipeline_gib_s=%.6f "
         "estimated_device_cache_hit=%.4f cache_gib=%.3f io_errors=%" PRIu64
         " graph_builds=%" PRIu64 " graph_hits=%" PRIu64
-        " graph_launches=%" PRIu64 "\n",
+        " graph_launches=%" PRIu64 " fused_decode_launches=%" PRIu64
+        " fused_decode_experts=%" PRIu64 "\n",
         gib(stats.payload_bytes), gib(stats.physical_bytes),
         seconds > 0 ? gib(stats.payload_bytes) / seconds : 0.0,
         hit_rate, gib(engine.device_cache_bytes()), stats.errors,
         compute_stats.graph_builds, compute_stats.graph_cache_hits,
-        compute_stats.graph_launches);
+        compute_stats.graph_launches,
+        compute_stats.fused_decode_launches,
+        compute_stats.fused_decode_experts);
 
     engine.destroy();
     ggml_backend_free(backend);
