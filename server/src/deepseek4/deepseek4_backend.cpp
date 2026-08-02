@@ -44,6 +44,24 @@ static bool env_flag_enabled(const char * name) {
     return value && value[0] && std::strcmp(value, "0") != 0;
 }
 
+static bool positive_env_double(const char * name, double fallback,
+                                double & out, std::string * err) {
+    out = fallback;
+    const char * raw = std::getenv(name);
+    if (!raw || !*raw) return true;
+    char * end = nullptr;
+    const double parsed = std::strtod(raw, &end);
+    if (end == raw || *end != '\0' || !std::isfinite(parsed) ||
+        parsed <= 0.0) {
+        if (err) {
+            *err = std::string(name) + " must be a finite value greater than zero";
+        }
+        return false;
+    }
+    out = parsed;
+    return true;
+}
+
 static bool configure_dspark_mmvq_defaults(int gpu) {
 #if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
     if (!env_flag_enabled("DFLASH_DS4_SPEC")) {
@@ -300,6 +318,14 @@ static uint64_t layer_expert_bytes(const DeepSeek4Layer & layer, int n_expert) {
     if (layer.ffn_gate_exps) bytes += ggml_nbytes(layer.ffn_gate_exps) / (uint64_t) n_expert;
     if (layer.ffn_up_exps) bytes += ggml_nbytes(layer.ffn_up_exps) / (uint64_t) n_expert;
     if (layer.ffn_down_exps) bytes += ggml_nbytes(layer.ffn_down_exps) / (uint64_t) n_expert;
+    return bytes;
+}
+
+static uint64_t layer_shared_expert_bytes(const DeepSeek4Layer & layer) {
+    uint64_t bytes = 0;
+    if (layer.ffn_gate_shexp) bytes += ggml_nbytes(layer.ffn_gate_shexp);
+    if (layer.ffn_up_shexp) bytes += ggml_nbytes(layer.ffn_up_shexp);
+    if (layer.ffn_down_shexp) bytes += ggml_nbytes(layer.ffn_down_shexp);
     return bytes;
 }
 
@@ -1047,6 +1073,10 @@ bool DeepSeek4Backend::compute_uniform_hybrid_placement(const DeepSeek4Weights &
     const bool concentrate_requested = tp.concentrate_secondary;
     bool concentrated = false;
     int retained_local = 0;
+    const char * profile_path = std::getenv("DFLASH_DS4_HOTNESS_CSV");
+    const bool critical_path_placement =
+        !tp.all_on_secondary && !concentrate_requested &&
+        env_flag_enabled("DFLASH_DS4_TP_CRITICAL_PATH_PLACEMENT");
     const int requested_cold =
         w.n_layer * std::max(0, w.n_expert - hot_per_layer);
     if (concentrate_requested && requested_cold >= w.n_expert) {
@@ -1058,7 +1088,79 @@ bool DeepSeek4Backend::compute_uniform_hybrid_placement(const DeepSeek4Weights &
                      "[deepseek4] concentrated secondary placement needs at least "
                      "one complete layer; using uniform placement\n");
         fill_prefix_hot_placement(w, hot_per_layer, out);
-    } else if (const char * profile_path = std::getenv("DFLASH_DS4_HOTNESS_CSV")) {
+    } else if (critical_path_placement) {
+        if (!profile_path || !*profile_path) {
+            if (err) {
+                *err = "critical-path placement requires DFLASH_DS4_HOTNESS_CSV";
+            }
+            return false;
+        }
+        MoeHybridRoutingStats stats;
+        if (!MoeHybridRoutingStats::load_csv(profile_path, stats, err)) {
+            return false;
+        }
+        if (stats.n_layer != w.n_layer || stats.n_expert != w.n_expert) {
+            if (err) {
+                *err = "routing profile shape does not match DeepSeek V4 target";
+            }
+            return false;
+        }
+
+        int active_experts = cfg_.expert_top_k > 0
+            ? cfg_.expert_top_k : w.n_expert_used;
+        if (const char * raw_top_k = std::getenv("DFLASH_DS4_TOPK")) {
+            const int env_top_k = std::atoi(raw_top_k);
+            if (env_top_k > 0) active_experts = env_top_k;
+        }
+        if (active_experts <= 0 || active_experts > w.n_expert_used) {
+            if (err) *err = "critical-path placement active expert count is invalid";
+            return false;
+        }
+
+        double main_to_peer_rate = 3.4;
+        if (!positive_env_double(
+                "DFLASH_DS4_TP_MAIN_TO_PEER_RATE", 3.4,
+                main_to_peer_rate, err)) {
+            return false;
+        }
+        MoeHybridCriticalPathConfig balance_cfg;
+        balance_cfg.active_experts = active_experts;
+        balance_cfg.main_to_peer_rate = main_to_peer_rate;
+        if (const char * raw_floor =
+                std::getenv("DFLASH_DS4_TP_BALANCE_MIN_HOT")) {
+            balance_cfg.min_hot_per_layer = std::max(0, std::atoi(raw_floor));
+        }
+
+        std::vector<uint64_t> main_fixed_bytes((size_t) w.n_layer, 0);
+        for (int il = 0; il < w.n_layer; ++il) {
+            main_fixed_bytes[(size_t) il] =
+                layer_shared_expert_bytes(w.layers[(size_t) il]);
+        }
+        if (!MoeHybridPlacement::build_critical_path_balanced_from_stats(
+                stats, budget.mem.layer_expert_bytes, main_fixed_bytes,
+                budget.expert_budget, balance_cfg, out, err)) {
+            return false;
+        }
+
+        const auto [min_hot, max_hot] = std::minmax_element(
+            out.hot_counts.begin(), out.hot_counts.end());
+        const double mean_hot = out.hot_counts.empty() ? 0.0
+            : (double) out.total_hot / (double) out.hot_counts.size();
+        std::fprintf(stderr,
+                     "[deepseek4] hybrid critical-path placement: "
+                     "profile=%s active=%d main/peer=%.3f "
+                     "hot/layer=%.1f [%d,%d]\n",
+                     profile_path, active_experts, main_to_peer_rate,
+                     mean_hot,
+                     min_hot != out.hot_counts.end() ? *min_hot : 0,
+                     max_hot != out.hot_counts.end() ? *max_hot : 0);
+        std::fprintf(stderr,
+                     "[deepseek4] hybrid critical-path hot counts:");
+        for (int count : out.hot_counts) {
+            std::fprintf(stderr, " %d", count);
+        }
+        std::fprintf(stderr, "\n");
+    } else if (profile_path) {
         if (*profile_path) {
             const bool profile_hot_on_secondary =
                 tp.in_process && tp.profile_hot_on_secondary;
@@ -1107,8 +1209,10 @@ bool DeepSeek4Backend::compute_uniform_hybrid_placement(const DeepSeek4Weights &
                      retained_local);
     }
 
+    const std::string hot_label = critical_path_placement
+        ? "balanced" : std::to_string(hot_per_layer);
     std::fprintf(stderr,
-                 "[deepseek4] hybrid placement: gpu_total=%.2f GiB gpu_free=%.2f GiB core=%.2f GiB kv=%.2f GiB warm=%.2f GiB safety=%.2f GiB expert_budget=%.2f GiB hot/layer=%d\n",
+                 "[deepseek4] hybrid placement: gpu_total=%.2f GiB gpu_free=%.2f GiB core=%.2f GiB kv=%.2f GiB warm=%.2f GiB safety=%.2f GiB expert_budget=%.2f GiB hot/layer=%s\n",
                  gib((uint64_t) budget.gpu_total),
                  gib((uint64_t) budget.gpu_free),
                  gib(budget.core_bytes),
@@ -1116,7 +1220,7 @@ bool DeepSeek4Backend::compute_uniform_hybrid_placement(const DeepSeek4Weights &
                  gib(budget.warm_bytes),
                  gib(budget.safety_bytes),
                  gib(budget.expert_budget),
-                 hot_per_layer);
+                 hot_label.c_str());
     log_ds4_expert_memory_info("placement", placed_mem, w.n_layer);
     return true;
 }
@@ -1407,6 +1511,21 @@ bool DeepSeek4Backend::unpark(ParkTarget target) {
     return true;
 }
 
+int deepseek4_hybrid_prefill_chunk_tokens(
+        int requested_chunk,
+        int context_end,
+        int current_cap) {
+    constexpr int long_context_begin = 4096;
+    constexpr int long_context_chunk = 1024;
+    int bounded = std::max(1, requested_chunk);
+    if (current_cap > 0) {
+        bounded = std::min(bounded, current_cap);
+    }
+    return context_end > long_context_begin
+        ? std::min(bounded, long_context_chunk)
+        : bounded;
+}
+
 int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                                   const DaemonIO & io,
                                   int kv_offset,
@@ -1436,12 +1555,34 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
     // post-mixing and corrupt the hidden state.
     const bool hybrid_batch_supported =
         !moe_hybrid_ || cfg_.prefill_mode == PrefillAttentionMode::Sparse;
-    const int chunk =
+    const int base_chunk =
         !prefill_attention_mode_is_approximate(cfg_.prefill_mode) ||
         !hybrid_batch_supported
         ? 1
         : std::max(1, std::min(requested_chunk,
                                layer_major_cap));
+    const bool bound_hybrid_scratch =
+        moe_hybrid_ &&
+        cfg_.prefill_mode == PrefillAttentionMode::Sparse;
+    const int safe_chunk = bound_hybrid_scratch
+        ? deepseek4_hybrid_prefill_chunk_tokens(
+              base_chunk, kv_offset + n_total,
+              hybrid_prefill_chunk_cap_)
+        : base_chunk;
+    if (safe_chunk < base_chunk) {
+        hybrid_prefill_chunk_cap_ = hybrid_prefill_chunk_cap_ > 0
+            ? std::min(hybrid_prefill_chunk_cap_, safe_chunk)
+            : safe_chunk;
+    }
+    const int chunk = bound_hybrid_scratch && hybrid_prefill_chunk_cap_ > 0
+        ? std::min(base_chunk, hybrid_prefill_chunk_cap_)
+        : base_chunk;
+    if (chunk < base_chunk) {
+        std::fprintf(stderr,
+                     "[deepseek4] hybrid prefill scratch bound: "
+                     "chunk %d->%d for context_end=%d (sticky)\n",
+                     base_chunk, chunk, kv_offset + n_total);
+    }
     int pos = kv_offset;
     const bool save_snapshot =
         snap_slot >= 0 && snap_slot < PREFIX_SLOTS &&

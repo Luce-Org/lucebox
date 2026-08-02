@@ -321,6 +321,40 @@ static ggml_context * make_test_context(size_t mem_size = 1u << 20) {
     return ggml_init(params);
 }
 
+static void test_chunked_graph_allocator(ggml_backend_t backend) {
+    std::fprintf(stderr, "  test_chunked_graph_allocator ...");
+    ggml_context * ctx = make_test_context();
+    TEST_ASSERT_MSG(ctx != nullptr, "ggml_init failed");
+    if (!ctx) {
+        std::fprintf(stderr, " FAIL\n");
+        return;
+    }
+
+    // The input and output must coexist. Each fits under the cap, while their
+    // combined live range does not, so the allocator must create two chunks.
+    constexpr int64_t n_elements = 96 * 1024; // 384 KiB of F32
+    ggml_tensor * input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_elements);
+    ggml_set_input(input);
+    ggml_tensor * output = ggml_dup(ctx, input);
+    ggml_set_output(output);
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 16, false);
+    ggml_build_forward_expand(graph, output);
+
+    constexpr size_t max_chunk_size = 512u * 1024u;
+    ggml_gallocr_t alloc = ggml_gallocr_new_with_max_chunk_size(
+        ggml_backend_get_default_buffer_type(backend), max_chunk_size);
+    TEST_ASSERT_MSG(alloc != nullptr, "chunked graph allocator creation failed");
+    if (alloc) {
+        TEST_ASSERT_MSG(ggml_gallocr_alloc_graph(alloc, graph),
+                        "chunked graph allocation failed");
+        TEST_ASSERT_MSG(ggml_gallocr_get_buffer_n_chunks(alloc, 0) == 2,
+                        "graph allocator did not split the backing buffer");
+        ggml_gallocr_free(alloc);
+    }
+    ggml_free(ctx);
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
 static void test_dspark_confidence_uses_separate_hidden(ggml_backend_t backend) {
     std::fprintf(stderr, "  test_dspark_confidence_uses_separate_hidden ...");
 
@@ -1645,6 +1679,19 @@ static void test_safe_compressor_batch_tokens() {
     w.compress_ratios.clear();
     TEST_ASSERT(deepseek4_safe_compressor_batch_tokens(w, 17, 9) == 9);
     TEST_ASSERT(deepseek4_safe_compressor_batch_tokens(w, 17, 0) == 0);
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+static void test_hybrid_prefill_chunk_tokens() {
+    std::fprintf(stderr, "  test_hybrid_prefill_chunk_tokens ...");
+    TEST_ASSERT(deepseek4_hybrid_prefill_chunk_tokens(2048, 0) == 2048);
+    TEST_ASSERT(deepseek4_hybrid_prefill_chunk_tokens(2048, 4096) == 2048);
+    TEST_ASSERT(deepseek4_hybrid_prefill_chunk_tokens(2048, 4097) == 1024);
+    TEST_ASSERT(deepseek4_hybrid_prefill_chunk_tokens(1024, 8192) == 1024);
+    TEST_ASSERT(deepseek4_hybrid_prefill_chunk_tokens(512, 8192) == 512);
+    TEST_ASSERT(deepseek4_hybrid_prefill_chunk_tokens(0, 8192) == 1);
+    TEST_ASSERT(deepseek4_hybrid_prefill_chunk_tokens(
+                    2048, 2048, 1024) == 1024);
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
@@ -3184,12 +3231,16 @@ static void test_hc_post_strided_split_gpu() {
 
     std::vector<float> residual((size_t) hc_dim * n_tokens);
     std::vector<float> block_out((size_t) n_embd * n_tokens);
+    std::vector<float> main_block((size_t) n_embd * n_tokens);
+    std::vector<float> peer_block((size_t) n_embd * n_tokens);
     std::vector<float> split_storage((size_t) split_stride * n_tokens, -99.0f);
     for (size_t i = 0; i < residual.size(); ++i) {
         residual[i] = ((int) (i % 17) - 8) * 0.03125f;
     }
     for (size_t i = 0; i < block_out.size(); ++i) {
         block_out[i] = ((int) (i % 11) - 5) * 0.0625f;
+        main_block[i] = block_out[i] * 0.25f;
+        peer_block[i] = block_out[i] - main_block[i];
     }
     for (int token = 0; token < n_tokens; ++token) {
         float * split = split_storage.data() + (size_t) token * split_stride;
@@ -3230,6 +3281,10 @@ static void test_hc_post_strided_split_gpu() {
         ctx, GGML_TYPE_F32, hc_dim, n_tokens);
     ggml_tensor * block_t = ggml_new_tensor_2d(
         ctx, GGML_TYPE_F32, n_embd, n_tokens);
+    ggml_tensor * main_t = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F32, n_embd, n_tokens);
+    ggml_tensor * peer_t = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F32, n_embd, n_tokens);
     ggml_tensor * split_storage_t = ggml_new_tensor_2d(
         ctx, GGML_TYPE_F32, split_stride, n_tokens);
     ggml_tensor * split_t = ggml_view_2d(
@@ -3238,10 +3293,14 @@ static void test_hc_post_strided_split_gpu() {
     TEST_ASSERT(!ggml_is_contiguous(split_t));
     ggml_tensor * output_t = ggml_ds4_hc_post(
         ctx, residual_t, block_t, split_t, n_hc);
+    ggml_tensor * split_output_t = ggml_ds4_hc_post_split(
+        ctx, residual_t, main_t, peer_t, split_t, n_hc);
     ggml_set_output(output_t);
+    ggml_set_output(split_output_t);
 
     ggml_cgraph * graph = ggml_new_graph_custom(ctx, 64, false);
     ggml_build_forward_expand(graph, output_t);
+    ggml_build_forward_expand(graph, split_output_t);
     ggml_gallocr_t alloc = ggml_gallocr_new(
         ggml_backend_get_default_buffer_type(backend));
     const bool allocated = ggml_gallocr_alloc_graph(alloc, graph);
@@ -3251,6 +3310,10 @@ static void test_hc_post_strided_split_gpu() {
                                 residual.size() * sizeof(float));
         ggml_backend_tensor_set(block_t, block_out.data(), 0,
                                 block_out.size() * sizeof(float));
+        ggml_backend_tensor_set(main_t, main_block.data(), 0,
+                                main_block.size() * sizeof(float));
+        ggml_backend_tensor_set(peer_t, peer_block.data(), 0,
+                                peer_block.size() * sizeof(float));
         ggml_backend_tensor_set(split_storage_t, split_storage.data(), 0,
                                 split_storage.size() * sizeof(float));
         const bool computed =
@@ -3258,12 +3321,18 @@ static void test_hc_post_strided_split_gpu() {
         TEST_ASSERT_MSG(computed, "strided HC-post graph compute failed");
         if (computed) {
             std::vector<float> actual(expected.size());
+            std::vector<float> split_actual(expected.size());
             ggml_backend_tensor_get(output_t, actual.data(), 0,
                                     actual.size() * sizeof(float));
+            ggml_backend_tensor_get(split_output_t, split_actual.data(), 0,
+                                    split_actual.size() * sizeof(float));
             for (size_t i = 0; i < actual.size(); ++i) {
                 TEST_ASSERT_MSG(nearly_equal(actual[i], expected[i],
                                              1.0e-6f, 1.0e-6f),
                                 "strided HC-post output mismatch");
+                TEST_ASSERT_MSG(nearly_equal(split_actual[i], expected[i],
+                                             1.0e-6f, 1.0e-6f),
+                                "batched split HC-post output mismatch");
             }
         }
     }
@@ -4015,6 +4084,7 @@ int main() {
     }
 
     test_compressor_pooling_correctness(backend);
+    test_chunked_graph_allocator(backend);
     test_swiglu_ds4_cpu_correctness(backend);
     test_moe_routing_correctness(backend);
     test_rmsnorm_correctness(backend);
@@ -4042,6 +4112,7 @@ int main() {
     test_dspark_loader_contract_and_bounds(backend);
     test_dspark_confidence_uses_separate_hidden(backend);
     test_safe_compressor_batch_tokens();
+    test_hybrid_prefill_chunk_tokens();
     test_dspark_park_all_releases_drafter();
     test_dspark_raw_ring_rollback_after_wrap(backend);
     test_snapshot_save_restore();

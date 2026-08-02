@@ -4,7 +4,9 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <fstream>
+#include <limits>
 #include <numeric>
 
 namespace dflash::common {
@@ -254,6 +256,142 @@ bool MoeHybridPlacement::build_from_stats_with_layer_bytes(
         hot.reserve((size_t)hot_n);
         for (int i = 0; i < hot_n; ++i) {
             hot.push_back((int32_t)ranked[(size_t)il][(size_t)i]);
+        }
+    }
+
+    out = std::move(tmp);
+    return true;
+}
+
+bool MoeHybridPlacement::build_critical_path_balanced_from_stats(
+    const MoeHybridRoutingStats & stats,
+    const std::vector<uint64_t> & layer_expert_bytes,
+    const std::vector<uint64_t> & layer_main_fixed_bytes,
+    uint64_t total_hot_budget_bytes,
+    const MoeHybridCriticalPathConfig & config,
+    MoeHybridPlacement & out,
+    std::string * err) {
+    if (stats.empty() || stats.n_layer <= 0 || stats.n_expert <= 0) {
+        if (err) *err = "stats not initialized";
+        return false;
+    }
+    if ((int) layer_expert_bytes.size() != stats.n_layer ||
+        (int) layer_main_fixed_bytes.size() != stats.n_layer) {
+        if (err) *err = "critical-path layer byte vector size mismatch";
+        return false;
+    }
+    if (total_hot_budget_bytes == 0) {
+        if (err) *err = "total_hot_budget_bytes must be > 0";
+        return false;
+    }
+    if (config.active_experts <= 0 ||
+        config.active_experts > stats.n_expert_used) {
+        if (err) *err = "active_experts must be within the routing profile width";
+        return false;
+    }
+    if (!std::isfinite(config.main_to_peer_rate) ||
+        config.main_to_peer_rate <= 0.0) {
+        if (err) *err = "main_to_peer_rate must be finite and > 0";
+        return false;
+    }
+
+    const int floor = std::clamp(
+        config.min_hot_per_layer, 0, stats.n_expert);
+    uint64_t used_bytes = 0;
+    for (int il = 0; il < stats.n_layer; ++il) {
+        const uint64_t expert_bytes = layer_expert_bytes[(size_t) il];
+        if (expert_bytes == 0) continue;
+        if ((uint64_t) floor >
+            (std::numeric_limits<uint64_t>::max() - used_bytes) /
+                expert_bytes) {
+            if (err) *err = "minimum hot placement byte count overflow";
+            return false;
+        }
+        used_bytes += (uint64_t) floor * expert_bytes;
+    }
+    if (used_bytes > total_hot_budget_bytes) {
+        if (err) *err = "min_hot_per_layer exceeds byte budget";
+        return false;
+    }
+
+    MoeHybridPlacement tmp;
+    tmp.n_layer = stats.n_layer;
+    tmp.n_expert = stats.n_expert;
+    tmp.n_expert_used = stats.n_expert_used;
+    tmp.hot_counts.assign((size_t) tmp.n_layer, 0);
+
+    std::vector<std::vector<int>> ranked((size_t) tmp.n_layer);
+    std::vector<std::vector<uint64_t>> prefix_counts((size_t) tmp.n_layer);
+    for (int il = 0; il < tmp.n_layer; ++il) {
+        ranked[(size_t) il] = stats.ranked_experts(il);
+        auto & prefix = prefix_counts[(size_t) il];
+        prefix.assign((size_t) tmp.n_expert + 1, 0);
+        for (int n = 0; n < tmp.n_expert; ++n) {
+            prefix[(size_t) n + 1] = prefix[(size_t) n] +
+                stats.count(il, ranked[(size_t) il][(size_t) n]);
+        }
+        if (layer_expert_bytes[(size_t) il] > 0) {
+            tmp.hot_counts[(size_t) il] = floor;
+        }
+    }
+
+    auto layer_cost = [&](int il, int hot_count) {
+        const uint64_t expert_bytes = layer_expert_bytes[(size_t) il];
+        if (expert_bytes == 0) return 0.0;
+        const auto & prefix = prefix_counts[(size_t) il];
+        const uint64_t total = prefix.back();
+        const double hot_probability = total > 0
+            ? (double) prefix[(size_t) hot_count] / (double) total
+            : (double) hot_count / (double) tmp.n_expert;
+        const double routed_bytes =
+            (double) config.active_experts * (double) expert_bytes;
+        const double main_work =
+            (double) layer_main_fixed_bytes[(size_t) il] +
+            routed_bytes * hot_probability;
+        const double peer_work = routed_bytes * (1.0 - hot_probability);
+        return std::max(
+            main_work / config.main_to_peer_rate,
+            peer_work);
+    };
+
+    uint64_t remaining = total_hot_budget_bytes - used_bytes;
+    while (true) {
+        int best_layer = -1;
+        double best_value = 0.0;
+        double best_gain = 0.0;
+        for (int il = 0; il < tmp.n_layer; ++il) {
+            const int current = tmp.hot_counts[(size_t) il];
+            const uint64_t bytes = layer_expert_bytes[(size_t) il];
+            if (current >= tmp.n_expert || bytes == 0 || bytes > remaining) {
+                continue;
+            }
+            const double gain =
+                layer_cost(il, current) - layer_cost(il, current + 1);
+            if (!(gain > 0.0)) continue;
+            const double value = gain / (double) bytes;
+            if (best_layer < 0 || value > best_value ||
+                (value == best_value && gain > best_gain)) {
+                best_layer = il;
+                best_value = value;
+                best_gain = gain;
+            }
+        }
+        if (best_layer < 0) break;
+        const uint64_t bytes = layer_expert_bytes[(size_t) best_layer];
+        tmp.hot_counts[(size_t) best_layer]++;
+        remaining -= bytes;
+    }
+
+    tmp.total_hot =
+        std::accumulate(tmp.hot_counts.begin(), tmp.hot_counts.end(), 0);
+    tmp.hot_expert_ids.resize((size_t) tmp.n_layer);
+    for (int il = 0; il < tmp.n_layer; ++il) {
+        const int hot_count = tmp.hot_counts[(size_t) il];
+        auto & hot = tmp.hot_expert_ids[(size_t) il];
+        hot.reserve((size_t) hot_count);
+        for (int n = 0; n < hot_count; ++n) {
+            hot.push_back(
+                (int32_t) ranked[(size_t) il][(size_t) n]);
         }
     }
 

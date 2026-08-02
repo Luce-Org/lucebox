@@ -14,6 +14,15 @@ namespace dflash::common {
 
 struct MoeHybridRoutingStats;  // forward decl
 
+// Cost model for balancing two concurrently executed MoE owners. Rates are
+// relative, so peer_rate is normalized to one and main_to_peer_rate expresses
+// how many equivalent expert bytes the main owner consumes in the same time.
+struct MoeHybridCriticalPathConfig {
+    int active_experts = 0;
+    int min_hot_per_layer = 0;
+    double main_to_peer_rate = 1.0;
+};
+
 inline uint64_t moe_hybrid_core_bytes_from_memory(const char * log_prefix,
                                                   size_t gpu_free,
                                                   size_t gpu_total) {
@@ -62,6 +71,21 @@ struct MoeHybridPlacement {
         const std::vector<uint64_t> & layer_expert_bytes,
         uint64_t total_hot_budget_bytes,
         int min_hot_per_layer,
+        MoeHybridPlacement & out,
+        std::string * err = nullptr);
+
+    // Distribute main-owner experts to minimize the sum of predicted per-layer
+    // fork times, max(main, peer), rather than merely maximizing aggregate hit
+    // rate. layer_main_fixed_bytes accounts for owner-local work such as the
+    // shared expert that runs on every route. The byte budget is an upper
+    // bound; allocation stops when another hot expert would lengthen the
+    // critical path.
+    static bool build_critical_path_balanced_from_stats(
+        const MoeHybridRoutingStats & stats,
+        const std::vector<uint64_t> & layer_expert_bytes,
+        const std::vector<uint64_t> & layer_main_fixed_bytes,
+        uint64_t total_hot_budget_bytes,
+        const MoeHybridCriticalPathConfig & config,
         MoeHybridPlacement & out,
         std::string * err = nullptr);
 };

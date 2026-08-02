@@ -50,5 +50,40 @@ TEST_CASE(Qwen35MoeExpertPlacementFixture, moe_expert_placement_suite) {
     REQUIRE(loaded.hot_expert_ids == placement.hot_expert_ids);
     std::filesystem::remove(tmp);
 
+    // Aggregate hit-rate placement can overfeed a highly skewed layer while a
+    // flat layer remains peer-bound. The critical-path model stops at each
+    // layer's branch crossover and may deliberately leave spare memory unused.
+    MoeHybridRoutingStats balance_stats;
+    balance_stats.n_layer = 2;
+    balance_stats.n_expert = 4;
+    balance_stats.n_expert_used = 2;
+    balance_stats.counts = {
+        100, 100, 100, 100,  // flat: needs three hot experts
+        400,   1,   1,   1,  // skewed: one hot expert is sufficient
+    };
+    balance_stats.layer_totals = {400, 403};
+
+    MoeHybridCriticalPathConfig balance_cfg;
+    balance_cfg.active_experts = 2;
+    balance_cfg.main_to_peer_rate = 3.0;
+    MoeHybridPlacement balanced;
+    REQUIRE(MoeHybridPlacement::build_critical_path_balanced_from_stats(
+        balance_stats,
+        /*layer_expert_bytes=*/{100, 100},
+        /*layer_main_fixed_bytes=*/{100, 100},
+        /*total_hot_budget_bytes=*/600,
+        balance_cfg, balanced, &err));
+    REQUIRE(balanced.hot_counts == std::vector<int>({3, 1}));
+    REQUIRE(balanced.total_hot == 4);
+    REQUIRE(balanced.is_hot(0, 0));
+    REQUIRE(balanced.is_hot(0, 1));
+    REQUIRE(balanced.is_hot(0, 2));
+    REQUIRE(balanced.is_hot(1, 0));
+
+    balance_cfg.main_to_peer_rate = 0.0;
+    REQUIRE(!MoeHybridPlacement::build_critical_path_balanced_from_stats(
+        balance_stats, {100, 100}, {100, 100}, 600,
+        balance_cfg, balanced, &err));
+
     std::printf("OK\n");
 }

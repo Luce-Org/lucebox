@@ -2617,7 +2617,8 @@ extern "C" {
 
     // Exact mode-1 variant for heterogeneous MoE verification. It computes
     // block_out[d] = peer_block[d] + main_block[d] inside the HC-post kernel,
-    // eliminating the standalone reduction and tokenwise CONT copies.
+    // eliminating the standalone reduction and tokenwise CONT copies. All
+    // non-base tensors may carry the same n_tokens second dimension.
     GGML_API struct ggml_tensor * ggml_ds4_hc_post_split(
             struct ggml_context * ctx,
             struct ggml_tensor  * residual_hc,

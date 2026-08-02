@@ -8531,17 +8531,26 @@ struct ggml_tensor * ggml_ds4_hc_post_split(
     GGML_ASSERT(ggml_is_contiguous(residual_hc));
     GGML_ASSERT(ggml_is_contiguous(main_block));
     GGML_ASSERT(ggml_is_contiguous(peer_block));
-    GGML_ASSERT(ggml_is_contiguous(split));
+    GGML_ASSERT(split->nb[0] == sizeof(float));
+    GGML_ASSERT(split->nb[1] >= split->ne[0] * split->nb[0]);
+    GGML_ASSERT(split->ne[2] == 1 && split->ne[3] == 1);
     GGML_ASSERT(n_hc > 0 && n_hc <= 8);
+    GGML_ASSERT(residual_hc->ne[2] == 1 && residual_hc->ne[3] == 1);
+    GGML_ASSERT(main_block->ne[2] == 1 && main_block->ne[3] == 1);
+    GGML_ASSERT(peer_block->ne[2] == 1 && peer_block->ne[3] == 1);
     const int64_t mix_dim = 2*(int64_t)n_hc + (int64_t)n_hc*n_hc;
-    GGML_ASSERT(ggml_nelements(split) == mix_dim);
-    GGML_ASSERT(ggml_nelements(residual_hc) % n_hc == 0);
-    const int64_t n_embd = ggml_nelements(residual_hc) / n_hc;
-    GGML_ASSERT(ggml_nelements(main_block) == n_embd);
-    GGML_ASSERT(ggml_nelements(peer_block) == n_embd);
+    const int64_t n_tokens = residual_hc->ne[1];
+    GGML_ASSERT(n_tokens > 0);
+    GGML_ASSERT(split->ne[0] == mix_dim && split->ne[1] == n_tokens);
+    GGML_ASSERT(residual_hc->ne[0] % n_hc == 0);
+    const int64_t n_embd = residual_hc->ne[0] / n_hc;
+    GGML_ASSERT(main_block->ne[0] == n_embd && main_block->ne[1] == n_tokens);
+    GGML_ASSERT(peer_block->ne[0] == n_embd && peer_block->ne[1] == n_tokens);
 
-    struct ggml_tensor * result = ggml_new_tensor_1d(
-        ctx, GGML_TYPE_F32, (int64_t) n_embd * n_hc);
+    struct ggml_tensor * result = n_tokens == 1
+        ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (int64_t) n_embd * n_hc)
+        : ggml_new_tensor_2d(
+            ctx, GGML_TYPE_F32, (int64_t) n_embd * n_hc, n_tokens);
     result->op = GGML_OP_DS4_HC;
     result->src[0] = residual_hc;
     result->src[1] = main_block;

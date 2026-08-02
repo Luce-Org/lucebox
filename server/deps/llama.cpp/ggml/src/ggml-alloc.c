@@ -494,7 +494,10 @@ struct ggml_gallocr {
     int n_leafs;
 };
 
-ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
+static ggml_gallocr_t ggml_gallocr_new_n_impl(
+        ggml_backend_buffer_type_t * bufts,
+        int n_bufs,
+        size_t max_chunk_size) {
     ggml_gallocr_t galloc = (ggml_gallocr_t)calloc(1, sizeof(struct ggml_gallocr));
     GGML_ASSERT(galloc != NULL);
 
@@ -522,6 +525,9 @@ ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs
         if (galloc->buf_tallocs[i] == NULL) {
             size_t alignment = ggml_backend_buft_get_alignment(bufts[i]);
             size_t max_size = ggml_backend_buft_get_max_size(bufts[i]);
+            if (max_chunk_size > 0) {
+                max_size = MIN(max_size, max_chunk_size);
+            }
             galloc->buf_tallocs[i] = ggml_dyn_tallocr_new(alignment, max_size);
         }
     }
@@ -530,8 +536,19 @@ ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs
     return galloc;
 }
 
+ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
+    return ggml_gallocr_new_n_impl(bufts, n_bufs, 0);
+}
+
 ggml_gallocr_t ggml_gallocr_new(ggml_backend_buffer_type_t buft) {
     return ggml_gallocr_new_n(&buft, 1);
+}
+
+ggml_gallocr_t ggml_gallocr_new_with_max_chunk_size(
+        ggml_backend_buffer_type_t buft,
+        size_t max_chunk_size) {
+    GGML_ASSERT(max_chunk_size > 0);
+    return ggml_gallocr_new_n_impl(&buft, 1, max_chunk_size);
 }
 
 void ggml_gallocr_free(ggml_gallocr_t galloc) {
@@ -1112,6 +1129,21 @@ size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id) {
     }
 
     return ggml_vbuffer_size(galloc->buffers[buffer_id]);
+}
+
+int ggml_gallocr_get_buffer_n_chunks(ggml_gallocr_t galloc, int buffer_id) {
+    GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
+
+    if (galloc->buffers[buffer_id] == NULL) {
+        return 0;
+    }
+
+    int n_chunks = 0;
+    while (n_chunks < GGML_VBUFFER_MAX_CHUNKS &&
+           galloc->buffers[buffer_id]->chunks[n_chunks] != NULL) {
+        ++n_chunks;
+    }
+    return n_chunks;
 }
 
 // utils

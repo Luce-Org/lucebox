@@ -424,16 +424,18 @@ static bool ds4_build_fused_verify_graph(
     ggml_set_input(fg.mask_bundle);
     int64_t mask_off = 0;
 
-    // per-token HC streams
-    std::vector<ggml_tensor *> hc_cur(q);
-    for (int t = 0; t < q; ++t) {
-        ggml_tensor * col = ggml_view_2d(ctx, fg.inp_embed, n_embd, 1,
-                                         fg.inp_embed->nb[1], (size_t) t * fg.inp_embed->nb[1]);
-        hc_cur[(size_t) t] = ggml_repeat_4d(ctx, col, n_embd, n_hc, 1, 1);
-    }
+    // Keep every speculative lane in one HC tensor. The previous graph built
+    // five independent HC ops and progressively concatenated their outputs at
+    // every pre/post boundary. HC kernels already support a token dimension,
+    // so preserve it throughout the verifier and issue one batched op instead.
+    ggml_tensor * embed_3d = ggml_reshape_3d(
+        ctx, fg.inp_embed, n_embd, 1, q);
+    ggml_tensor * hc_repeated = ggml_repeat_4d(
+        ctx, embed_3d, n_embd, n_hc, q, 1);
+    ggml_tensor * hc_cur = ggml_reshape_2d(
+        ctx, hc_repeated, (int64_t) n_embd * n_hc, q);
 
-    std::vector<ggml_tensor *> capture_pieces(
-        capture_ids.size() * (size_t) q, nullptr);   // order [ci][t]
+    std::vector<ggml_tensor *> capture_layers(capture_ids.size(), nullptr);
 
     for (int il = 0; il < w.n_layer; ++il) {
         const DeepSeek4Layer & L = w.layers[(size_t) il];
@@ -447,20 +449,16 @@ static bool ds4_build_fused_verify_graph(
         const int lane_token_pos = lane_kv_start + lane_q - 1;
         const size_t hybrid_idx = (size_t) il;
 
-        // ── HC pre (attention), per token ──
-        std::vector<ggml_tensor *> hc_flat(lane_q), split_attn(lane_q);
-        ggml_tensor * attn_in = nullptr;
-        for (int t = 0; t < lane_q; ++t) {
-            const size_t token_idx = (size_t) lane_start + (size_t) t;
-            hc_flat[(size_t) t] = ggml_reshape_1d(
-                ctx, hc_cur[token_idx], (int64_t) n_embd * n_hc);
-            ggml_tensor * working = ds4_build_fused_hc_pre(ctx, w, hc_flat[(size_t) t],
-                                                           mc.fn_attn_f16[(size_t) il], L.hc_attn_base,
-                                                           hlw.attn, &split_attn[(size_t) t]);
-            if (!working) return false;
-            ggml_tensor * w2 = ggml_reshape_2d(ctx, working, n_embd, 1);
-            attn_in = attn_in ? ggml_concat(ctx, attn_in, w2, 1) : w2;
-        }
+        // ── Batched HC pre (attention) ──
+        ggml_tensor * hc_flat = hc_cur;
+        ggml_tensor * split_attn = nullptr;
+        ggml_tensor * attn_working = ds4_build_fused_hc_pre(
+            ctx, w, hc_flat, mc.fn_attn_f16[(size_t) il], L.hc_attn_base,
+            hlw.attn, &split_attn);
+        if (!attn_working) return false;
+        // HC-pre stores working and split values together per token. Materialize
+        // the strided working view once, replacing q kernels and q-1 concats.
+        ggml_tensor * attn_in = ggml_cont(ctx, attn_working);
 
         // ── Batched attention ──
         DeepSeek4AttentionGraphInputs ain{};
@@ -525,27 +523,18 @@ static bool ds4_build_fused_verify_graph(
             return false;
         }
 
-        // ── HC post (attention) + HC pre (FFN), per token ──
-        ggml_tensor * ffn_in = nullptr;
-        std::vector<ggml_tensor *> split_ffn(lane_q);
-        for (int t = 0; t < lane_q; ++t) {
-            const size_t token_idx = (size_t) lane_start + (size_t) t;
-            ggml_tensor * ao = ggml_view_2d(ctx, attn_out, n_embd, 1,
-                                            attn_out->nb[1], (size_t) t * attn_out->nb[1]);
-            ggml_tensor * ao_flat = ggml_reshape_1d(ctx, ggml_cont(ctx, ao), n_embd);
-            ggml_tensor * hc_next = ggml_ds4_hc_post(ctx, hc_flat[(size_t) t], ao_flat,
-                                                     split_attn[(size_t) t], n_hc);
-            hc_cur[token_idx] = ggml_reshape_2d(
-                ctx, hc_next, n_embd, n_hc);
-            hc_flat[(size_t) t] = ggml_reshape_1d(
-                ctx, hc_cur[token_idx], (int64_t) n_embd * n_hc);
-            ggml_tensor * fworking = ds4_build_fused_hc_pre(ctx, w, hc_flat[(size_t) t],
-                                                            mc.fn_ffn_f16[(size_t) il], L.hc_ffn_base,
-                                                            hlw.ffn, &split_ffn[(size_t) t]);
-            if (!fworking) return false;
-            ggml_tensor * f2 = ggml_reshape_2d(ctx, fworking, n_embd, 1);
-            ffn_in = ffn_in ? ggml_concat(ctx, ffn_in, f2, 1) : f2;
-        }
+        // ── Batched HC post (attention) + HC pre (FFN) ──
+        ggml_tensor * attn_batch = ggml_is_contiguous(attn_out)
+            ? attn_out : ggml_cont(ctx, attn_out);
+        hc_cur = ggml_ds4_hc_post(
+            ctx, hc_flat, attn_batch, split_attn, n_hc);
+        hc_flat = hc_cur;
+        ggml_tensor * split_ffn = nullptr;
+        ggml_tensor * ffn_working = ds4_build_fused_hc_pre(
+            ctx, w, hc_flat, mc.fn_ffn_f16[(size_t) il], L.hc_ffn_base,
+            hlw.ffn, &split_ffn);
+        if (!ffn_working) return false;
+        ggml_tensor * ffn_in = ggml_cont(ctx, ffn_working);
 
         // ── Batched FFN ──
         ggml_tensor * ffn_normed = build_rms_norm(ctx, ffn_in, L.ffn_norm, w.rms_eps);
@@ -739,64 +728,39 @@ static bool ds4_build_fused_verify_graph(
         }
         if (!ffn_out) return false;
 
-        // ── HC post (FFN), per token; capture at drafter layers ──
-        for (int t = 0; t < lane_q; ++t) {
-            const size_t token_idx = (size_t) lane_start + (size_t) t;
-            ggml_tensor * hc_next = nullptr;
-            if (fused_hc_join_inputs) {
-                ggml_tensor * main_part = ggml_view_2d(
-                    ctx, fused_hc_join_inputs->main_output, n_embd, 1,
-                    fused_hc_join_inputs->main_output->nb[1],
-                    (size_t) t * fused_hc_join_inputs->main_output->nb[1]);
-                ggml_tensor * peer_part = ggml_view_2d(
-                    ctx, fused_hc_join_inputs->peer_output, n_embd, 1,
-                    fused_hc_join_inputs->peer_output->nb[1],
-                    (size_t) t * fused_hc_join_inputs->peer_output->nb[1]);
-                hc_next = ggml_ds4_hc_post_split(
-                    ctx, hc_flat[(size_t) t], main_part, peer_part,
-                    split_ffn[(size_t) t], n_hc);
-            } else {
-                ggml_tensor * fo = ggml_view_2d(
-                    ctx, ffn_out, n_embd, 1, ffn_out->nb[1],
-                    (size_t) t * ffn_out->nb[1]);
-                ggml_tensor * fo_flat = ggml_reshape_1d(
-                    ctx, ggml_cont(ctx, fo), n_embd);
-                hc_next = ggml_ds4_hc_post(
-                    ctx, hc_flat[(size_t) t], fo_flat,
-                    split_ffn[(size_t) t], n_hc);
-            }
-            hc_cur[token_idx] = ggml_reshape_2d(
-                ctx, hc_next, n_embd, n_hc);
+        // ── Batched HC post (FFN); capture at drafter layers ──
+        if (fused_hc_join_inputs) {
+            hc_cur = ggml_ds4_hc_post_split(
+                ctx, hc_flat, fused_hc_join_inputs->main_output,
+                fused_hc_join_inputs->peer_output, split_ffn, n_hc);
+        } else {
+            ggml_tensor * ffn_batch = ggml_is_contiguous(ffn_out)
+                ? ffn_out : ggml_cont(ctx, ffn_out);
+            hc_cur = ggml_ds4_hc_post(
+                ctx, hc_flat, ffn_batch, split_ffn, n_hc);
         }
         for (size_t ci = 0; ci < capture_ids.size(); ++ci) {
             if (capture_ids[ci] != il) continue;
-            for (int t = 0; t < lane_q; ++t) {
-                const size_t token_idx =
-                    (size_t) lane_start + (size_t) t;
-                ggml_tensor * hs = hc_cur[token_idx];             // [n_embd, n_hc]
-                ggml_tensor * hsT = ggml_cont(ctx, ggml_transpose(ctx, hs)); // [n_hc, n_embd]
-                ggml_tensor * summed = ggml_sum_rows(ctx, hsT);   // [1, n_embd]
-                ggml_tensor * mean = ggml_scale(ctx, summed, 1.0f / (float) n_hc);
-                capture_pieces[ci * (size_t) q + (size_t) t] =
-                    ggml_reshape_1d(ctx, ggml_cont(ctx, mean), n_embd);
-            }
+            ggml_tensor * hs = ggml_reshape_3d(
+                ctx, hc_cur, n_embd, n_hc, lane_q);
+            ggml_tensor * hs_t = ggml_cont(
+                ctx, ggml_transpose(ctx, hs));                    // [n_hc,n_embd,q]
+            ggml_tensor * summed = ggml_sum_rows(ctx, hs_t);      // [1,n_embd,q]
+            ggml_tensor * mean = ggml_scale(
+                ctx, summed, 1.0f / (float) n_hc);
+            capture_layers[ci] = ggml_reshape_2d(
+                ctx, mean, n_embd, lane_q);                       // [n_embd,q]
         }
     }
 
-    // ── Output: per-token HC merge → batched out_norm + lm_head ──
-    ggml_tensor * final_all = nullptr;
-    for (int t = 0; t < q; ++t) {
-        ggml_tensor * hc_flat = ggml_reshape_1d(ctx, hc_cur[(size_t) t], (int64_t) n_embd * n_hc);
-        ggml_tensor * onorm = ggml_rms_norm(ctx, hc_flat, w.hc_eps);
-        ggml_tensor * omix = ggml_mul_mat(ctx, mc.fn_out_f16, onorm);
-        omix = ggml_reshape_1d(ctx, omix, ggml_nelements(omix));
-        ggml_tensor * obase = ds4_fused_hc_base_f32(ctx, w.output_hc_base);
-        if (!obase || hc_out_weights.scale_data.empty()) return false;
-        ggml_tensor * fe = ggml_ds4_hc_out(ctx, omix, obase, hc_flat, n_hc,
-                                           hc_out_weights.scale_data[0]);
-        ggml_tensor * fe2 = ggml_reshape_2d(ctx, fe, n_embd, 1);
-        final_all = final_all ? ggml_concat(ctx, final_all, fe2, 1) : fe2;
-    }
+    // ── Batched output HC merge → out_norm + lm_head ──
+    ggml_tensor * onorm = ggml_rms_norm(ctx, hc_cur, w.hc_eps);
+    ggml_tensor * omix = ggml_mul_mat(ctx, mc.fn_out_f16, onorm);
+    omix = ggml_reshape_2d(ctx, omix, ggml_nelements(omix) / q, q);
+    ggml_tensor * obase = ds4_fused_hc_base_f32(ctx, w.output_hc_base);
+    if (!obase || hc_out_weights.scale_data.empty()) return false;
+    ggml_tensor * final_all = ggml_ds4_hc_out(
+        ctx, omix, obase, hc_cur, n_hc, hc_out_weights.scale_data[0]);
     ggml_tensor * out_normed = build_rms_norm(ctx, final_all, w.out_norm, w.rms_eps);
     fg.logits = ggml_mul_mat(ctx, w.output, out_normed);   // [n_vocab, q]
     ggml_set_output(fg.logits);
@@ -807,16 +771,18 @@ static bool ds4_build_fused_verify_graph(
         ggml_build_forward_expand(gf, ex.argmax);
     }
 
-    if (!capture_pieces.empty()) {
-        for (ggml_tensor * piece : capture_pieces) {
-            if (!piece) {
+    if (!capture_layers.empty()) {
+        for (ggml_tensor * layer : capture_layers) {
+            if (!layer) {
                 std::fprintf(stderr, "[ds4-fused-verify] capture layer id is invalid\n");
                 return false;
             }
         }
-        ggml_tensor * cap = capture_pieces[0];
-        for (size_t i = 1; i < capture_pieces.size(); ++i) {
-            cap = ggml_concat(ctx, cap, capture_pieces[i], 0);
+        // Concatenating layer matrices on dim 0 produces the token-major
+        // [n_capture*n_embd,q] layout consumed by the drafter directly.
+        ggml_tensor * cap = capture_layers[0];
+        for (size_t i = 1; i < capture_layers.size(); ++i) {
+            cap = ggml_concat(ctx, cap, capture_layers[i], 0);
         }
         ex.capture = cap;
         ggml_set_output(ex.capture);
@@ -1361,17 +1327,10 @@ static int ds4_try_fused_verify_step(
         out_logits.clear();
     }
     if (hooks->capture_out && ex->capture && ncap > 0) {
-        std::vector<float> flat((size_t) w.n_embd * ncap * q);
-        ggml_backend_tensor_get(ex->capture, flat.data(), 0, sizeof(float) * flat.size());
-        hooks->capture_out->assign((size_t) ncap * w.n_embd * q, 0.0f);
-        for (int ci = 0; ci < ncap; ++ci) {
-            for (int t = 0; t < q; ++t) {
-                const float * src = flat.data() + ((size_t) ci * q + t) * w.n_embd;
-                float * dst = hooks->capture_out->data() +
-                              (size_t) t * ncap * w.n_embd + (size_t) ci * w.n_embd;
-                std::memcpy(dst, src, sizeof(float) * (size_t) w.n_embd);
-            }
-        }
+        hooks->capture_out->resize((size_t) ncap * w.n_embd * q);
+        ggml_backend_tensor_get(
+            ex->capture, hooks->capture_out->data(), 0,
+            sizeof(float) * hooks->capture_out->size());
     }
     if (telemetry) {
         telemetry->full_graph_read_us += ds4_elapsed_us(read_t0, Ds4TimingClock::now());
