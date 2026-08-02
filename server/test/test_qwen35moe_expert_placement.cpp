@@ -80,6 +80,34 @@ TEST_CASE(Qwen35MoeExpertPlacementFixture, moe_expert_placement_suite) {
     REQUIRE(balanced.is_hot(0, 2));
     REQUIRE(balanced.is_hot(1, 0));
 
+    // A phase-specific decode placement remains intact while a second profile
+    // spends otherwise-unused bytes on prefill residency.
+    MoeHybridRoutingStats residency_stats;
+    residency_stats.n_layer = 2;
+    residency_stats.n_expert = 4;
+    residency_stats.n_expert_used = 2;
+    residency_stats.counts = {
+        1, 2, 3, 500,
+        1, 300, 400, 1000,
+    };
+    residency_stats.layer_totals = {506, 1701};
+    MoeHybridPlacement expanded = balanced;
+    REQUIRE(MoeHybridPlacement::expand_from_stats_with_layer_bytes(
+        residency_stats, {100, 100}, 600, expanded, &err));
+    REQUIRE(expanded.total_hot == 6);
+    REQUIRE(expanded.hot_counts == std::vector<int>({4, 2}));
+    REQUIRE(expanded.is_hot(0, 0));
+    REQUIRE(expanded.is_hot(0, 1));
+    REQUIRE(expanded.is_hot(0, 2));
+    REQUIRE(expanded.is_hot(0, 3));
+    REQUIRE(expanded.is_hot(1, 0));
+    REQUIRE(expanded.is_hot(1, 3));
+    REQUIRE(!expanded.is_hot(1, 2));
+
+    MoeHybridPlacement over_budget = balanced;
+    REQUIRE(!MoeHybridPlacement::expand_from_stats_with_layer_bytes(
+        residency_stats, {100, 100}, 300, over_budget, &err));
+
     balance_cfg.main_to_peer_rate = 0.0;
     REQUIRE(!MoeHybridPlacement::build_critical_path_balanced_from_stats(
         balance_stats, {100, 100}, {100, 100}, 600,

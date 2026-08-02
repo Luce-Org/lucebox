@@ -263,6 +263,111 @@ bool MoeHybridPlacement::build_from_stats_with_layer_bytes(
     return true;
 }
 
+bool MoeHybridPlacement::expand_from_stats_with_layer_bytes(
+    const MoeHybridRoutingStats & stats,
+    const std::vector<uint64_t> & layer_expert_bytes,
+    uint64_t total_hot_budget_bytes,
+    MoeHybridPlacement & in_out,
+    std::string * err) {
+    if (stats.empty() || stats.n_layer <= 0 || stats.n_expert <= 0) {
+        if (err) *err = "stats not initialized";
+        return false;
+    }
+    if ((int) layer_expert_bytes.size() != stats.n_layer) {
+        if (err) *err = "layer_expert_bytes size mismatch";
+        return false;
+    }
+    if (!in_out.matches(
+            stats.n_layer, stats.n_expert, stats.n_expert_used)) {
+        if (err) *err = "existing placement shape does not match stats";
+        return false;
+    }
+    if (total_hot_budget_bytes == 0) {
+        if (err) *err = "total_hot_budget_bytes must be > 0";
+        return false;
+    }
+
+    MoeHybridPlacement tmp = in_out;
+    std::vector<std::vector<uint8_t>> resident(
+        (size_t) stats.n_layer,
+        std::vector<uint8_t>((size_t) stats.n_expert, 0));
+    uint64_t used_bytes = 0;
+    for (int il = 0; il < stats.n_layer; ++il) {
+        const auto & ids = tmp.hot_expert_ids[(size_t) il];
+        if ((int) ids.size() != tmp.hot_counts[(size_t) il]) {
+            if (err) *err = "existing placement count does not match ids";
+            return false;
+        }
+        const uint64_t expert_bytes = layer_expert_bytes[(size_t) il];
+        if (expert_bytes > 0 && ids.size() >
+                (std::numeric_limits<uint64_t>::max() - used_bytes) /
+                    expert_bytes) {
+            if (err) *err = "existing placement byte count overflow";
+            return false;
+        }
+        used_bytes += (uint64_t) ids.size() * expert_bytes;
+        for (int32_t id : ids) {
+            if (id < 0 || id >= stats.n_expert ||
+                resident[(size_t) il][(size_t) id]) {
+                if (err) *err = "existing placement contains an invalid expert";
+                return false;
+            }
+            resident[(size_t) il][(size_t) id] = 1;
+        }
+    }
+    if (used_bytes > total_hot_budget_bytes) {
+        if (err) *err = "existing placement exceeds byte budget";
+        return false;
+    }
+
+    std::vector<std::vector<int>> ranked((size_t) stats.n_layer);
+    std::vector<size_t> next((size_t) stats.n_layer, 0);
+    for (int il = 0; il < stats.n_layer; ++il) {
+        ranked[(size_t) il] = stats.ranked_experts(il);
+    }
+
+    uint64_t remaining = total_hot_budget_bytes - used_bytes;
+    while (true) {
+        int best_layer = -1;
+        int best_expert = -1;
+        double best_value = -1.0;
+        uint64_t best_gain = 0;
+        for (int il = 0; il < stats.n_layer; ++il) {
+            const uint64_t bytes = layer_expert_bytes[(size_t) il];
+            if (bytes == 0 || bytes > remaining) continue;
+            auto & cursor = next[(size_t) il];
+            const auto & layer_ranked = ranked[(size_t) il];
+            while (cursor < layer_ranked.size() &&
+                   resident[(size_t) il]
+                           [(size_t) layer_ranked[cursor]]) {
+                ++cursor;
+            }
+            if (cursor == layer_ranked.size()) continue;
+            const int expert = layer_ranked[cursor];
+            const uint64_t gain = stats.count(il, expert);
+            const double value = (double) gain / (double) bytes;
+            if (best_layer < 0 || value > best_value ||
+                (value == best_value && gain > best_gain)) {
+                best_layer = il;
+                best_expert = expert;
+                best_value = value;
+                best_gain = gain;
+            }
+        }
+        if (best_layer < 0) break;
+        tmp.hot_expert_ids[(size_t) best_layer].push_back(
+            (int32_t) best_expert);
+        tmp.hot_counts[(size_t) best_layer]++;
+        tmp.total_hot++;
+        resident[(size_t) best_layer][(size_t) best_expert] = 1;
+        remaining -= layer_expert_bytes[(size_t) best_layer];
+        ++next[(size_t) best_layer];
+    }
+
+    in_out = std::move(tmp);
+    return true;
+}
+
 bool MoeHybridPlacement::build_critical_path_balanced_from_stats(
     const MoeHybridRoutingStats & stats,
     const std::vector<uint64_t> & layer_expert_bytes,

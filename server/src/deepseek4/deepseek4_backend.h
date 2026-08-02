@@ -153,11 +153,13 @@ private:
     bool compute_uniform_hybrid_placement(const DeepSeek4Weights & w,
                                           int max_ctx,
                                           MoeHybridPlacement & out,
+                                          MoeHybridPlacement * decode_out,
                                           std::string * err) const;
     void maybe_save_routing_stats();
 
     std::shared_ptr<MoeHybridStorage> moe_hybrid_;
     MoeHybridPlacement                moe_placement_;
+    MoeHybridPlacement                moe_decode_placement_;
     MoeHybridStreamEngine             stream_engine_;
     MoeExpertComputeRuntime            expert_runtime_;
     std::shared_ptr<MoeHybridRoutingStats> routing_stats_;

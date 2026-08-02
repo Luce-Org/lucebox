@@ -8412,6 +8412,40 @@ struct ggml_tensor * ggml_ds4_moe_align_ids(
     return result;
 }
 
+struct ggml_tensor * ggml_ds4_moe_balanced_owner_ids(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * global_ids,
+        struct ggml_tensor  * router_weights,
+        struct ggml_tensor  * local_id_lut,
+        struct ggml_tensor  * main_candidate_lut,
+        int                   main_slots_x4,
+        bool                  main_owner) {
+    GGML_ASSERT(global_ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(router_weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(local_id_lut->type == GGML_TYPE_I32);
+    GGML_ASSERT(main_candidate_lut->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(global_ids, router_weights));
+    GGML_ASSERT(ggml_nelements(local_id_lut) ==
+                ggml_nelements(main_candidate_lut));
+    GGML_ASSERT(ggml_is_contiguous(global_ids));
+    GGML_ASSERT(ggml_is_contiguous(router_weights));
+    GGML_ASSERT(ggml_is_contiguous(local_id_lut));
+    GGML_ASSERT(ggml_is_contiguous(main_candidate_lut));
+    GGML_ASSERT(main_slots_x4 > 0 &&
+                main_slots_x4 <= 4 * global_ids->ne[0]);
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, global_ids);
+    result->op = GGML_OP_MOE_FUSED;
+    result->src[0] = global_ids;
+    result->src[1] = router_weights;
+    result->src[2] = local_id_lut;
+    result->src[3] = main_candidate_lut;
+    ggml_set_op_params_i32(result, 0, GGML_MOE_FUSED_BALANCED_OWNER_IDS);
+    ggml_set_op_params_i32(result, 1, main_slots_x4);
+    ggml_set_op_params_i32(result, 2, main_owner ? 1 : 0);
+    return result;
+}
+
 struct ggml_tensor * ggml_ds4_deferred_peer_copy(
         struct ggml_context * ctx,
         struct ggml_tensor  * src) {

@@ -1748,8 +1748,8 @@ static void test_dspark_raw_ring_rollback_after_wrap(ggml_backend_t backend) {
     layer.n_comp = 2;
     layer.n_index_comp = 2;
     DeepSeek4SpecRollback rollback;
-    deepseek4_spec_rollback_save(cache, rollback, 10, 5);
-    TEST_ASSERT(rollback.raw_count == 5);
+    deepseek4_spec_rollback_save(cache, rollback, 10, 6);
+    TEST_ASSERT(rollback.raw_count == 6);
 
     auto overwrite_row = [&](int absolute_pos, uint8_t value) {
         const int row = absolute_pos % weights.n_swa;
@@ -1763,7 +1763,7 @@ static void test_dspark_raw_ring_rollback_after_wrap(ggml_backend_t backend) {
                   expected.begin() + (size_t) row * layer.raw_kv->nb[1] + row_bytes,
                   value);
     };
-    for (int t = 0; t < 5; ++t) {
+    for (int t = 0; t < 6; ++t) {
         overwrite_row(10 + t, (uint8_t) (0xa0 + t));
     }
 

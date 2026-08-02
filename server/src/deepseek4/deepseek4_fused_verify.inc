@@ -160,26 +160,40 @@ static void ds4_fused_verify_refresh_hybrid_luts(
         MoeHybridStorage * hybrid,
         DeepSeek4FusedDecodeGraph & fg) {
     if (!hybrid) return;
+    const bool dynamic_route_balance =
+        ds4_env_flag("DFLASH_DS4_TP_DYNAMIC_ROUTE_BALANCE") ||
+        ds4_env_flag("DFLASH_MOE_TP_DYNAMIC_ROUTE_BALANCE");
     const int32_t invalid_route =
         ds4_env_flag("DFLASH_DS4_TP_MASKED_ROUTES") ? -1 : 0;
     for (size_t hi = 0; hi < fg.hybrid_inputs.size(); ++hi) {
         const int il = (int) hi;
         const MoeHybridLayerStorage & layer = hybrid->layers[(size_t) il];
         const MoeHybridGraphInputs & inputs = fg.hybrid_inputs[hi];
+        const std::vector<int32_t> & decode_hot =
+            dynamic_route_balance ||
+                    layer.decode_hot_local_by_global.empty()
+                ? layer.hot_local_by_global
+                : layer.decode_hot_local_by_global;
         std::vector<int32_t> hot_lut((size_t) w.n_expert, invalid_route);
         std::vector<int32_t> cold_lut((size_t) w.n_expert, invalid_route);
         std::vector<float> hot_valid((size_t) w.n_expert, 0.0f);
         std::vector<float> cold_valid((size_t) w.n_expert, 0.0f);
         for (int ie = 0; ie < w.n_expert; ++ie) {
-            const int32_t hot = layer.hot_local_by_global[(size_t) ie];
+            const int32_t hot = decode_hot[(size_t) ie];
             const int32_t cold = layer.cold_local_by_global[(size_t) ie];
             if (hot >= 0) {
                 hot_lut[(size_t) ie] = hot;
                 hot_valid[(size_t) ie] = 1.0f;
             }
-            if (cold >= 0 && hot < 0) {
+            if (cold >= 0) {
                 cold_lut[(size_t) ie] = cold;
-                cold_valid[(size_t) ie] = 1.0f;
+                // In dynamic mode this LUT is the main-residency candidate
+                // set, copied independently to peer. The peer selector keeps
+                // its exact complement after the per-token main cap. Static
+                // placement retains the ordinary cold-validity mask.
+                cold_valid[(size_t) ie] = dynamic_route_balance
+                    ? (hot >= 0 ? 1.0f : 0.0f)
+                    : (hot < 0 ? 1.0f : 0.0f);
             }
         }
         ds4_fv_set_repeated_rows(inputs.hot_local_lut, hot_lut);
@@ -253,14 +267,18 @@ static void ds4_fused_consume_route_diagnostics(
                 route.layer < (int) hybrid->layers.size()) {
                 const MoeHybridLayerStorage & layer =
                     hybrid->layers[(size_t) route.layer];
+                const std::vector<int32_t> & decode_hot =
+                    layer.decode_hot_local_by_global.empty()
+                        ? layer.hot_local_by_global
+                        : layer.decode_hot_local_by_global;
                 for (int i = 0; i < route.width; ++i) {
                     const int32_t id = token_ids[i];
                     if (token_weights[i] == 0.0f || id < 0 ||
-                        id >= (int32_t) layer.hot_local_by_global.size()) {
+                        id >= (int32_t) decode_hot.size()) {
                         continue;
                     }
                     ++cache_total;
-                    if (layer.hot_local_by_global[(size_t) id] >= 0) {
+                    if (decode_hot[(size_t) id] >= 0) {
                         ++cache_hot;
                     }
                 }
