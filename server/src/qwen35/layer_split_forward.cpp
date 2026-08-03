@@ -425,7 +425,8 @@ bool run_qwen35_layer_split_layers_from_activation(
         bool capture_ssm_intermediates,
         Qwen35SplitCaptureStats * capture_stats,
         bool kvflash_preallocated = false,
-        const Qwen35SplitTreeInputs * tree_inputs = nullptr) {
+        const Qwen35SplitTreeInputs * tree_inputs = nullptr,
+        const LayerSplitAttnPrefillOpts * attn_opts = nullptr) {
     if (shards.empty() || !acts.a || !acts.b || n_tokens_total <= 0) return false;
     if (kvflash && fa_window > 0) {
         std::fprintf(stderr,
@@ -509,16 +510,23 @@ bool run_qwen35_layer_split_layers_from_activation(
                 return false;
             }
             if (is_attn && shard->layer_graph.positions) {
-                pos_buf.assign((size_t)4 * n, 0);
-                for (int i = 0; i < n; i++) {
-                    const int p = kv_start + i;
-                    pos_buf[0 * n + i] = p;
-                    pos_buf[1 * n + i] = p;
-                    pos_buf[2 * n + i] = p;
-                    pos_buf[3 * n + i] = 0;
+                if (attn_opts && attn_opts->positions) {
+                    const int32_t * src = attn_opts->positions + (size_t)4 * (size_t)start;
+                    pos_buf.assign(src, src + (size_t)4 * (size_t)n);
+                    ggml_backend_tensor_set(shard->layer_graph.positions, pos_buf.data(), 0,
+                                            sizeof(int32_t) * pos_buf.size());
+                } else {
+                    pos_buf.assign((size_t)4 * n, 0);
+                    for (int i = 0; i < n; i++) {
+                        const int p = kv_start + i;
+                        pos_buf[0 * n + i] = p;
+                        pos_buf[1 * n + i] = p;
+                        pos_buf[2 * n + i] = p;
+                        pos_buf[3 * n + i] = 0;
+                    }
+                    ggml_backend_tensor_set(shard->layer_graph.positions, pos_buf.data(), 0,
+                                            sizeof(int32_t) * pos_buf.size());
                 }
-                ggml_backend_tensor_set(shard->layer_graph.positions, pos_buf.data(), 0,
-                                        sizeof(int32_t) * pos_buf.size());
             }
             if (is_attn && kvflash) {
                 if (!fill_qwen35_kvflash_inputs(
@@ -527,12 +535,17 @@ bool run_qwen35_layer_split_layers_from_activation(
                     return false;
                 }
             } else if (is_attn && with_mask && shard->layer_graph.attn_mask) {
-                const int win_start_l = (fa_window > 0 && kv_start > fa_window)
-                                            ? (kv_start - fa_window) : 0;
-                const int win_len_l = kv_len - win_start_l;
                 const int kv_pad_override = (int)shard->layer_graph.attn_mask->ne[0];
-                build_causal_mask(mask_buf, win_len_l, n, kv_start, kq_stride_pad,
-                                  win_start_l, kv_pad_override);
+                if (attn_opts && attn_opts->bidirectional) {
+                    build_bidirectional_mask(mask_buf, kv_len, n, kv_start,
+                                             kq_stride_pad, kv_pad_override);
+                } else {
+                    const int win_start_l = (fa_window > 0 && kv_start > fa_window)
+                                                ? (kv_start - fa_window) : 0;
+                    const int win_len_l = kv_len - win_start_l;
+                    build_causal_mask(mask_buf, win_len_l, n, kv_start, kq_stride_pad,
+                                      win_start_l, kv_pad_override);
+                }
                 ggml_backend_tensor_set(shard->layer_graph.attn_mask, mask_buf.data(), 0,
                                         sizeof(uint16_t) * mask_buf.size());
             }
@@ -627,12 +640,14 @@ bool run_qwen35_layer_split_forward_from_activation(
         KvFlashPager * kvflash,
         bool kvflash_preallocated,
         const Qwen35SplitTreeInputs * tree_inputs,
-        bool capture_ssm_intermediates) {
+        bool capture_ssm_intermediates,
+        const LayerSplitAttnPrefillOpts * attn_opts) {
     if (!run_qwen35_layer_split_layers_from_activation(
             shards, acts, base_pos, n_tokens_total, ubatch, kq_stride_pad,
             fa_window, captures_out, nullptr, nullptr, kvflash,
             capture_ssm_intermediates,
-            /*capture_stats=*/nullptr, kvflash_preallocated, tree_inputs)) {
+            /*capture_stats=*/nullptr, kvflash_preallocated, tree_inputs,
+            attn_opts)) {
         return false;
     }
 

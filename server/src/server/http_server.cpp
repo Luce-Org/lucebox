@@ -23,6 +23,11 @@
 #include "tool_hint.h"
 #include "common/sha1.h"
 #include "freeze_history.h"
+#include "vision/vision_input.h"
+
+#ifdef DFLASH_HAVE_MMPROJ
+#include "mtmd.h"
+#endif
 
 #ifdef DFLASH_HAS_CURL
 #include <curl/curl.h>
@@ -737,6 +742,7 @@ json build_props_body(const ServerConfig & config,
             {"reasoning_supported",   reasoning_supported},
             {"speculative_supported", speculative_supported},
             {"tools_supported",       tools_supported},
+            {"vision_supported",      config.vision_supported},
         }},
     };
     return body;
@@ -850,10 +856,18 @@ std::vector<ChatMessage> normalize_chat_messages(
                     cm.content = m["content"].get<std::string>();
                 } else if (m.contains("content") && m["content"].is_array()) {
                     for (const auto & part : m["content"]) {
+                        if (!part.is_object()) continue;
                         std::string ptype = part.value("type", "");
                         if (ptype == "text" || ptype == "input_text" ||
                             ptype == "output_text") {
                             cm.content += part.value("text", "");
+                        } else if (ptype == "image_url" || ptype == "input_image" ||
+                                   ptype == "image") {
+#ifdef DFLASH_HAVE_MMPROJ
+                            cm.content += mtmd_default_marker();
+#else
+                            cm.content += "<__media__>";
+#endif
                         }
                     }
                 }
@@ -1764,6 +1778,22 @@ bool HttpServer::render_and_tokenize_request(
     }
 
     req.started_in_thinking = prompt_ends_in_open_think(rendered);
+    if (messages_contain_images(req.messages)) {
+        if (config_.mmproj_path.empty()) {
+            send_error(fd, 400,
+                "vision input requires --mmproj (no mmproj model loaded)");
+            return false;
+        }
+        MultimodalPrompt extracted = extract_multimodal_from_messages(req.messages);
+        if (extracted.images.empty()) {
+            send_error(fd, 400, "failed to decode vision input");
+            return false;
+        }
+        auto mm = std::make_unique<MultimodalPrompt>();
+        mm->marked_text = rendered;
+        mm->images = std::move(extracted.images);
+        req.multimodal = std::move(mm);
+    }
     req.prompt_tokens = tokenizer_.encode(rendered);
     return true;
 }
@@ -3095,6 +3125,11 @@ void HttpServer::prepare_generation_inputs(
         : req.max_output;
 
     inputs.request.prompt = prepared.tokens;
+    if (req.multimodal) {
+        inputs.request.multimodal =
+            std::make_unique<MultimodalPrompt>(*req.multimodal);
+        inputs.request.force_ar_decode = true;
+    }
     inputs.request.n_gen = inputs.generation_cap;
     inputs.request.sampler = req.sampler;
     inputs.request.do_sample = req.sampler.needs_logit_processing();

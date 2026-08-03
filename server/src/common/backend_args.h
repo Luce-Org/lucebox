@@ -36,6 +36,10 @@ struct BackendArgs {
     // Optional: speculative decode draft model (qwen35 only)
     const char *    draft_path   = nullptr;
 
+    // Native mmproj vision (qwen35)
+    const char *    mmproj_path     = nullptr;
+    bool            mmproj_use_gpu  = true;
+
     // Device placement
     DevicePlacement device;
     DevicePlacement draft_device;

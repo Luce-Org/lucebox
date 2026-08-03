@@ -242,6 +242,11 @@ std::unique_ptr<ModelBackend> create_backend(
                 ? std::max<int>(DFLASH27B_DRAFT_BLOCK_SIZE, args.ddtree_budget + 1)
                 : DFLASH27B_DRAFT_BLOCK_SIZE;
             cfg.run_dflash         = args.draft_path != nullptr;
+            cfg.mmproj_path        = args.mmproj_path;
+            cfg.mmproj_use_gpu     = args.mmproj_use_gpu;
+            if (const char * mt = std::getenv("DFLASH_MMPROJ_THREADS")) {
+                cfg.mmproj_threads = std::max(1, std::atoi(mt));
+            }
 
             auto adapter = std::make_unique<Qwen35LayerSplitAdapter>(cfg);
             auto backend = std::make_unique<LayerSplitBackend>(std::move(adapter));
@@ -270,6 +275,8 @@ std::unique_ptr<ModelBackend> create_backend(
         cfg.ddtree_temp        = args.ddtree_temp;
         cfg.ddtree_chain_seed  = args.ddtree_chain_seed;
         cfg.use_feature_mirror = args.use_feature_mirror;
+        cfg.mmproj_path        = args.mmproj_path;
+        cfg.mmproj_use_gpu     = args.mmproj_use_gpu;
 
         auto backend = std::make_unique<Qwen35Backend>(cfg);
         if (!backend->init()) {

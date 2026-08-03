@@ -14,6 +14,7 @@
 #include "placement/remote_target_shard_config.h"
 #include "qwen3/qwen3_drafter.h"
 #include "qwen35_target_shard_ipc.h"
+#include "qwen35/layer_split_forward.h"
 #include "step_graph.h"
 #include "internal.h"
 
@@ -23,6 +24,10 @@
 #include <random>
 #include <string>
 #include <vector>
+
+namespace dflash::common {
+class VisionEncoder;
+}
 
 namespace dflash::common {
 
@@ -41,6 +46,9 @@ struct Qwen35LayerSplitAdapterConfig {
     int max_verify_tokens = DFLASH27B_DRAFT_BLOCK_SIZE;
     bool run_dflash = false;
     int draft_swa_window = 0;
+    const char * mmproj_path = nullptr;
+    bool mmproj_use_gpu = true;
+    int mmproj_threads = 4;
 };
 
 class Qwen35LayerSplitAdapter : public LayerSplitAdapter {
@@ -60,6 +68,8 @@ public:
     int prefill_chunk_tokens() const override;
     bool prefill(const std::vector<int32_t> & prompt,
                  int base_pos, int & last_tok) override;
+    bool supports_multimodal() const override;
+    int prefill_multimodal(MultimodalPrompt & mm, int & last_tok) override;
     bool decode_ar(int last_tok, int committed, int n_gen,
                    const std::vector<int32_t> & history_prefix,
                    std::vector<int32_t> & out_tokens,
@@ -86,6 +96,7 @@ public:
                         ggml_backend_buffer_t buf, int cur_pos,
                         int32_t last_tok) override;
     int current_last_token() const override;
+    int current_cur_pos() const override;
 
     bool supports_dflash_spec_decode() const override { return true; }
     DFlashTarget * dflash_target() override;
@@ -114,6 +125,10 @@ private:
     bool snapshot_draft_features(int slot);
     void free_draft_feature_snapshot(int slot);
     bool restore_draft_features(int slot);
+    bool prefill_activation_chunk(int kv_pos, int n_tokens, const float * embeds,
+                                  int hidden, const LayerSplitAttnPrefillOpts * attn_opts,
+                                  bool want_logits);
+    void sync_draft_features_range(int kv_pos, int n_tokens);
 
     Qwen35LayerSplitAdapterConfig cfg_;
     std::vector<Qwen35LayerSplitShard> shards_;
@@ -162,6 +177,7 @@ private:
     std::mt19937_64 sampler_rng_{std::random_device{}()};
     std::unique_ptr<DFlashTarget> dflash_target_;
     std::vector<float> prefill_last_logits_;
+    std::unique_ptr<VisionEncoder> vision_;
 };
 
 }  // namespace dflash::common
