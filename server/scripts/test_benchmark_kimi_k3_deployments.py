@@ -3,31 +3,41 @@ import unittest
 from pathlib import Path
 
 from benchmark_kimi_k3_deployments import (
+    DeviceEndpoint,
     Deployment,
     build_deployments,
     deployment_environment,
     discover_model_files,
     extract_nvme_telemetry,
+    parse_device_endpoint,
     server_command,
 )
 
 
 class KimiDeploymentBenchmarkTests(unittest.TestCase):
     def test_builds_capacity_safe_default_profiles(self):
-        profiles = build_deployments(["strix-only", "heterogeneous"], 1, 0, "strix")
+        strix = DeviceEndpoint("hip", 0)
+        rtx = DeviceEndpoint("cuda", 0)
+        profiles = build_deployments(["primary-only", "heterogeneous"], strix, rtx)
         self.assertEqual(
             profiles,
             [
-                Deployment("strix-only-ssd", 1, None),
-                Deployment("heterogeneous-ssd", 1, 0),
+                Deployment("primary-only-ssd", strix, None),
+                Deployment("heterogeneous-ssd", strix, rtx),
             ],
         )
 
-    def test_r9700_primary_is_explicit(self):
-        profiles = build_deployments(["heterogeneous"], 1, 0, "r9700")
-        self.assertEqual(profiles, [Deployment("heterogeneous-ssd", 0, 1)])
+    def test_backend_qualified_endpoints_allow_matching_indices(self):
+        strix = parse_device_endpoint("hip:0")
+        rtx = parse_device_endpoint("CUDA:0")
+        profiles = build_deployments(["heterogeneous"], strix, rtx)
+        self.assertEqual(
+            profiles, [Deployment("heterogeneous-ssd", strix, rtx)]
+        )
         with self.assertRaisesRegex(ValueError, "distinct"):
-            build_deployments(["heterogeneous"], 0, 0, "strix")
+            build_deployments(["heterogeneous"], strix, strix)
+        with self.assertRaisesRegex(ValueError, "secondary-device"):
+            build_deployments(["heterogeneous"], strix, None)
 
     def test_environment_removes_stale_tuning(self):
         base = {
@@ -35,11 +45,16 @@ class KimiDeploymentBenchmarkTests(unittest.TestCase):
             "DFLASH_MOE_STORAGE": "resident",
             "DFLASH_MOE_NVME_SLOTS": "64",
             "DFLASH_MOE_TP_GPU": "9",
+            "DFLASH_MOE_TP_BACKEND": "hip",
             "DFLASH_MOE_PLACEMENT": "/stale.json",
         }
         env = deployment_environment(
             base,
-            Deployment("heterogeneous-ssd", 1, 0),
+            Deployment(
+                "heterogeneous-ssd",
+                DeviceEndpoint("hip", 0),
+                DeviceEndpoint("cuda", 0),
+            ),
             "uring",
             600,
             Path("/new.json"),
@@ -51,6 +66,7 @@ class KimiDeploymentBenchmarkTests(unittest.TestCase):
         self.assertNotIn("DFLASH_MOE_NVME_SLOTS", env)
         self.assertEqual(env["DFLASH_MOE_NVME_BACKEND"], "uring")
         self.assertEqual(env["DFLASH_MOE_NVME_DEVICE_CACHE_MB"], "4096")
+        self.assertEqual(env["DFLASH_MOE_TP_BACKEND"], "cuda")
         self.assertEqual(env["DFLASH_MOE_TP_GPU"], "0")
         self.assertEqual(env["DFLASH_MOE_PRIMARY_SHARE_PER_MILLE"], "600")
         self.assertEqual(env["DFLASH_MOE_PLACEMENT"], "/new.json")
@@ -58,8 +74,8 @@ class KimiDeploymentBenchmarkTests(unittest.TestCase):
 
     def test_strix_only_has_no_secondary_owner(self):
         env = deployment_environment(
-            {"DFLASH_MOE_TP_GPU": "0"},
-            Deployment("strix-only-ssd", 1, None),
+            {"DFLASH_MOE_TP_GPU": "0", "DFLASH_MOE_TP_BACKEND": "cuda"},
+            Deployment("primary-only-ssd", DeviceEndpoint("hip", 0), None),
             "auto",
             500,
             None,
@@ -67,10 +83,16 @@ class KimiDeploymentBenchmarkTests(unittest.TestCase):
             False,
         )
         self.assertNotIn("DFLASH_MOE_TP_GPU", env)
+        self.assertNotIn("DFLASH_MOE_TP_BACKEND", env)
         command = server_command(
-            Path("server"), Path("model.gguf"), Deployment("strix", 1, None), 8080, 8192, []
+            Path("server"),
+            Path("model.gguf"),
+            Deployment("strix", DeviceEndpoint("hip", 0), None),
+            8080,
+            8192,
+            [],
         )
-        self.assertIn("hip:1", command)
+        self.assertIn("hip:0", command)
         self.assertEqual(command[command.index("--moe-storage") + 1], "ssd")
         self.assertEqual(command[command.index("--prefix-cache-slots") + 1], "0")
 

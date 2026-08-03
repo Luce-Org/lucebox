@@ -238,16 +238,16 @@ serially so they cannot contend for the SSD or GPUs:
 ```bash
 python3 server/scripts/benchmark_kimi_k3_deployments.py \
   /models/Kimi-K3-UD-IQ1_S/Kimi-K3-UD-IQ1_S-00001-of-00014.gguf \
-  --server-bin server/build-hip-dual/dflash_server \
-  --r9700-device 0 --strix-device 1 \
+  --server-bin server/build-hip-mixed/dflash_server \
+  --primary-device hip:0 --secondary-device cuda:0 \
   --output-dir bench-out/kimi-k3-lucebox
 ```
 
-The profiles are Strix-only+SSD and heterogeneous Strix+R9700+SSD. For the
+The profiles are primary-only+SSD and heterogeneous primary+peer+SSD. For the
 published IQ1_S checkpoint, Strix is the capacity-safe primary because the
-non-routed tensors alone exceed the R9700's memory; R9700 concurrently owns a
-partition of routed experts. `--hetero-primary r9700` is available for a later
-checkpoint whose non-routed plan fits the discrete GPU.
+non-routed tensors exceed a 24/32 GiB discrete GPU; the RTX 3090 or R9700 can
+concurrently own a partition of routed experts. Backend-qualified endpoints
+also distinguish `hip:0` from `cuda:0` in the same process.
 
 Each profile starts from a fresh server, forces `--moe-storage ssd`, clears
 inherited MoE tuning, disables HTTP/prefix caches, and issues one cold followed

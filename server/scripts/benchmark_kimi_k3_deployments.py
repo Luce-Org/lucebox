@@ -28,6 +28,7 @@ from typing import Any
 
 
 _SPLIT_GGUF = re.compile(r"^(?P<prefix>.+)-(?P<index>\d+)-of-(?P<total>\d+)(?P<suffix>\.gguf)$")
+_DEVICE_ENDPOINT = re.compile(r"^(?P<backend>hip|cuda):(?P<index>\d+)$")
 _NVME_KEY_VALUE = re.compile(
     r"(?<!\S)(?P<key>[a-z][a-z0-9-]*)=(?P<value>\S+)"
 )
@@ -45,36 +46,53 @@ _NVME_RESULT_NAMES = {
 
 
 @dataclass(frozen=True)
+class DeviceEndpoint:
+    backend: str
+    index: int
+
+    def __post_init__(self) -> None:
+        if self.backend not in {"hip", "cuda"}:
+            raise ValueError(f"unsupported GPU backend: {self.backend}")
+        if self.index < 0:
+            raise ValueError("GPU device index must be non-negative")
+
+    def __str__(self) -> str:
+        return f"{self.backend}:{self.index}"
+
+
+@dataclass(frozen=True)
 class Deployment:
     name: str
-    primary_device: int
-    secondary_device: int | None
+    primary: DeviceEndpoint
+    secondary: DeviceEndpoint | None
+
+
+def parse_device_endpoint(value: str) -> DeviceEndpoint:
+    match = _DEVICE_ENDPOINT.fullmatch(value.strip().lower())
+    if match is None:
+        raise argparse.ArgumentTypeError(
+            f"invalid GPU endpoint {value!r}; expected hip:N or cuda:N"
+        )
+    return DeviceEndpoint(match.group("backend"), int(match.group("index")))
 
 
 def build_deployments(
     profiles: list[str],
-    strix_device: int,
-    r9700_device: int,
-    hetero_primary: str,
+    primary: DeviceEndpoint,
+    secondary: DeviceEndpoint | None,
 ) -> list[Deployment]:
-    if strix_device < 0 or r9700_device < 0:
-        raise ValueError("GPU device indices must be non-negative")
-    if strix_device == r9700_device and "heterogeneous" in profiles:
-        raise ValueError("heterogeneous mode requires distinct R9700 and Strix devices")
+    if "heterogeneous" in profiles and secondary is None:
+        raise ValueError("heterogeneous mode requires --secondary-device")
+    if primary == secondary and "heterogeneous" in profiles:
+        raise ValueError("heterogeneous mode requires distinct GPU endpoints")
 
     deployments: list[Deployment] = []
     for profile in profiles:
-        if profile == "strix-only":
-            deployments.append(Deployment("strix-only-ssd", strix_device, None))
+        if profile in {"primary-only", "strix-only"}:
+            deployments.append(Deployment("primary-only-ssd", primary, None))
         elif profile == "heterogeneous":
-            if hetero_primary == "strix":
-                deployments.append(
-                    Deployment("heterogeneous-ssd", strix_device, r9700_device)
-                )
-            else:
-                deployments.append(
-                    Deployment("heterogeneous-ssd", r9700_device, strix_device)
-                )
+            assert secondary is not None
+            deployments.append(Deployment("heterogeneous-ssd", primary, secondary))
         else:
             raise ValueError(f"unknown deployment profile: {profile}")
     return deployments
@@ -95,6 +113,7 @@ def deployment_environment(
         if key.startswith("DFLASH_MOE_NVME_") or key in {
             "DFLASH_MOE_STORAGE",
             "DFLASH_MOE_TP_GPU",
+            "DFLASH_MOE_TP_BACKEND",
             "DFLASH_MOE_PLACEMENT",
             "DFLASH_MOE_PRIMARY_SHARE_PER_MILLE",
             "DFLASH_MOE_DUAL_STREAM_TRACE",
@@ -104,8 +123,9 @@ def deployment_environment(
     env["DFLASH_MOE_NVME_BACKEND"] = nvme_backend
     if device_cache_mb is not None:
         env["DFLASH_MOE_NVME_DEVICE_CACHE_MB"] = str(device_cache_mb)
-    if deployment.secondary_device is not None:
-        env["DFLASH_MOE_TP_GPU"] = str(deployment.secondary_device)
+    if deployment.secondary is not None:
+        env["DFLASH_MOE_TP_BACKEND"] = deployment.secondary.backend
+        env["DFLASH_MOE_TP_GPU"] = str(deployment.secondary.index)
         env["DFLASH_MOE_PRIMARY_SHARE_PER_MILLE"] = str(primary_share_per_mille)
         if placement is not None:
             env["DFLASH_MOE_PLACEMENT"] = str(placement)
@@ -130,7 +150,7 @@ def server_command(
         "--port",
         str(port),
         "--target-device",
-        f"hip:{deployment.primary_device}",
+        str(deployment.primary),
         "--max-ctx",
         str(max_ctx),
         "--moe-storage",
@@ -387,8 +407,8 @@ def run_deployment(
         "requests": [],
     }
     print(
-        f"\n[{deployment.name}] primary=hip:{deployment.primary_device} "
-        f"secondary={deployment.secondary_device}",
+        f"\n[{deployment.name}] primary={deployment.primary} "
+        f"secondary={deployment.secondary}",
         flush=True,
     )
     process: subprocess.Popen[bytes] | None = None
@@ -439,27 +459,33 @@ def run_deployment(
 
 def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Compare Kimi K3 Strix-only and heterogeneous SSD deployments"
+        description="Compare Kimi K3 primary-only and heterogeneous SSD deployments"
     )
     parser.add_argument("model", type=Path, help="first shard of the split Kimi K3 GGUF")
     parser.add_argument(
-        "--server-bin", type=Path, default=Path("server/build-hip-dual/dflash_server")
+        "--server-bin", type=Path, default=Path("server/build-hip-mixed/dflash_server")
     )
     parser.add_argument(
         "--profiles",
         nargs="+",
-        choices=("strix-only", "heterogeneous"),
-        default=("strix-only", "heterogeneous"),
+        choices=("primary-only", "heterogeneous", "strix-only"),
+        default=("primary-only", "heterogeneous"),
     )
-    parser.add_argument("--strix-device", type=int, default=1)
-    parser.add_argument("--r9700-device", type=int, default=0)
     parser.add_argument(
-        "--hetero-primary",
-        choices=("strix", "r9700"),
-        default="strix",
+        "--primary-device",
+        type=parse_device_endpoint,
+        required=True,
         help=(
-            "primary device for the heterogeneous run; current IQ1_S defaults to Strix "
-            "because its non-routed tensors exceed R9700 VRAM"
+            "backend-qualified device for dense/non-routed execution and the "
+            "primary expert partition"
+        ),
+    )
+    parser.add_argument(
+        "--secondary-device",
+        type=parse_device_endpoint,
+        help=(
+            "backend-qualified routed-expert capacity owner; mixed builds accept "
+            "a different runtime such as cuda:0"
         ),
     )
     parser.add_argument("--primary-share-per-mille", type=int, default=500)
@@ -509,9 +535,8 @@ def main() -> int:
         validate_args(args)
         deployments = build_deployments(
             list(args.profiles),
-            args.strix_device,
-            args.r9700_device,
-            args.hetero_primary,
+            args.primary_device,
+            args.secondary_device,
         )
         if args.dry_run:
             resolved = []
