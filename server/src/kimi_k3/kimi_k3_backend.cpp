@@ -1,5 +1,6 @@
 #include "kimi_k3_backend.h"
 
+#include "common/dynamic_backend.h"
 #include "common/moe_expert_package.h"
 #include "common/moe_hybrid_placement.h"
 #include "common/moe_stream_cache_policy.h"
@@ -168,6 +169,7 @@ void KimiK3Backend::release_expert_backend() {
         expert_backend_ = nullptr;
     }
     expert_gpu_ = -1;
+    expert_backend_kind_ = PlacementBackend::Auto;
 }
 
 bool KimiK3Backend::init_streaming() {
@@ -192,15 +194,39 @@ bool KimiK3Backend::init_streaming() {
         return false;
     }
     expert_gpu_ = owner.expert_gpu;
-    if (owner.heterogeneous()) {
-        expert_backend_ = ggml_backend_cuda_init(expert_gpu_);
+    const PlacementBackend primary_kind =
+        cfg_.device.backend == PlacementBackend::Auto
+            ? compiled_placement_backend() : cfg_.device.backend;
+    PlacementBackend expert_kind = primary_kind;
+    if (const char * raw = std::getenv("DFLASH_MOE_TP_BACKEND")) {
+        if (*raw && (!parse_placement_backend(raw, expert_kind) ||
+                     expert_kind == PlacementBackend::Auto)) {
+            std::fprintf(stderr,
+                         "[kimi-k3] invalid DFLASH_MOE_TP_BACKEND=%s; "
+                         "expected cuda or hip\n", raw);
+            return false;
+        }
+    }
+    const bool heterogeneous =
+        expert_kind != primary_kind || owner.heterogeneous();
+    if (heterogeneous) {
+        expert_backend_ = init_placement_backend(
+            expert_kind, expert_gpu_, &error);
         if (!expert_backend_) {
             std::fprintf(stderr,
-                         "[kimi-k3] expert backend init failed for device %d\n",
-                         expert_gpu_);
+                         "[kimi-k3] expert backend init failed for %s:%d: %s\n",
+                         placement_backend_name(expert_kind), expert_gpu_,
+                         error.c_str());
             expert_gpu_ = -1;
             return false;
         }
+        expert_backend_kind_ = expert_kind;
+        std::fprintf(stderr,
+                     "[kimi-k3] in-process routed owners primary=%s:%d "
+                     "secondary=%s:%d transfer=backend-staged\n",
+                     placement_backend_name(primary_kind),
+                     cfg_.device.primary_gpu(),
+                     placement_backend_name(expert_kind), expert_gpu_);
     }
     auto fail_streaming = [&]() {
         dual_stream_executor_.destroy();
@@ -240,7 +266,9 @@ bool KimiK3Backend::init_streaming() {
         routed_pool_bytes +=
             bytes_per_expert * static_cast<size_t>(weights_.n_expert);
     }
-    auto stream_config_for = [&](int gpu, const char * owner_name) {
+    auto stream_config_for = [&](ggml_backend_t owner_backend, int gpu,
+                                 PlacementBackend backend_kind,
+                                 const char * owner_name) {
         MoeStreamConfig stream_config = MoeStreamConfig::from_env();
         if (std::getenv("DFLASH_MOE_NVME_DEVICE_CACHE_MB")) {
             stream_config.device_cache_bytes =
@@ -249,7 +277,10 @@ bool KimiK3Backend::init_streaming() {
         }
         size_t free_bytes = 0;
         size_t total_bytes = 0;
-        ggml_backend_cuda_get_device_memory(gpu, &free_bytes, &total_bytes);
+        if (ggml_backend_dev_t device =
+                ggml_backend_get_device(owner_backend)) {
+            ggml_backend_dev_memory(device, &free_bytes, &total_bytes);
+        }
         const size_t gib = 1024ULL * 1024ULL * 1024ULL;
         const size_t reserve = std::max<size_t>(2 * gib, total_bytes / 20);
         stream_config.device_cache_bytes =
@@ -257,9 +288,9 @@ bool KimiK3Backend::init_streaming() {
                 ? std::min(free_bytes - reserve, routed_pool_bytes)
                 : 0;
         std::fprintf(stderr,
-            "[kimi-k3] %s streamed cache: gpu=%d free=%.2f GiB "
+            "[kimi-k3] %s streamed cache: device=%s:%d free=%.2f GiB "
             "reserve=%.2f GiB pool=%.2f GiB cache=%.2f GiB\n",
-            owner_name, gpu,
+            owner_name, placement_backend_name(backend_kind), gpu,
             static_cast<double>(free_bytes) / gib,
             static_cast<double>(reserve) / gib,
             static_cast<double>(routed_pool_bytes) / gib,
@@ -432,7 +463,7 @@ bool KimiK3Backend::init_streaming() {
     }
 
     const MoeStreamConfig primary_config = stream_config_for(
-        cfg_.device.primary_gpu(), "primary");
+        backend_, cfg_.device.primary_gpu(), primary_kind, "primary");
     if (!stream_engine_.init(
             backend_, max_streamed_expert_bytes,
             primary_config, &error)) {
@@ -443,7 +474,7 @@ bool KimiK3Backend::init_streaming() {
     }
     if (expert_backend_) {
         const MoeStreamConfig secondary_config = stream_config_for(
-            expert_gpu_, "secondary");
+            expert_backend_, expert_gpu_, expert_backend_kind_, "secondary");
         if (!secondary_stream_engine_.init(
                 expert_backend_, max_streamed_expert_bytes,
                 secondary_config, &error)) {
@@ -622,14 +653,16 @@ bool KimiK3Backend::init_streaming() {
     if (expert_backend_) {
         std::fprintf(stderr,
             "[kimi-k3] routed experts dual-owner: shards=%zu layers=%zu "
-            "primary=%d/%s/%.2fGiB secondary=%d/%s/%.2fGiB "
+            "primary=%s:%d/%s/%.2fGiB secondary=%s:%d/%s/%.2fGiB "
             "primary_share=%d/1000 placement=%s\n",
             weights_.shard_paths.size(),
             weights_.streamed_layer_regions.size(),
-            cfg_.device.primary_gpu(), stream_engine_.io_backend_name(),
+            placement_backend_name(primary_kind), cfg_.device.primary_gpu(),
+            stream_engine_.io_backend_name(),
             static_cast<double>(stream_engine_.device_cache_bytes()) /
                 (1024.0 * 1024.0 * 1024.0),
-            expert_gpu_, secondary_stream_engine_.io_backend_name(),
+            placement_backend_name(expert_backend_kind_), expert_gpu_,
+            secondary_stream_engine_.io_backend_name(),
             static_cast<double>(secondary_stream_engine_.device_cache_bytes()) /
                 (1024.0 * 1024.0 * 1024.0),
             stream_owner_policy_.primary_share_per_mille,

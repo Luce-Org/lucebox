@@ -1,7 +1,7 @@
 #include "CppUnitTestFramework.hpp"
+#include "common/dynamic_backend.h"
 #include "common/moe_hybrid_stream.h"
 
-#include "ggml-cuda.h"
 #include "ggml-quants.h"
 
 #include <algorithm>
@@ -648,13 +648,22 @@ TEST_CASE(MoeStreamComputeFixture, persistent_graph_matches_cpu_and_padded_mxfp4
     if (const char * value = std::getenv("DFLASH_TEST_GPU")) {
         device = std::max(0, std::atoi(value));
     }
-    if (device >= ggml_backend_cuda_get_device_count()) {
-        std::fprintf(stderr, "skip: requested CUDA/HIP device is unavailable\n");
-        return;
+    PlacementBackend backend_kind = compiled_placement_backend();
+    const char * backend_value = std::getenv("DFLASH_TEST_BACKEND");
+    if (backend_value && *backend_value) {
+        STREAM_REQUIRE(parse_placement_backend(backend_value, backend_kind));
+        STREAM_REQUIRE(backend_kind != PlacementBackend::Auto);
     }
-    ggml_backend_t backend = ggml_backend_cuda_init(device);
+    std::string init_error;
+    ggml_backend_t backend = init_placement_backend(
+        backend_kind, device, &init_error);
     if (!backend) {
-        std::fprintf(stderr, "skip: no CUDA/HIP backend available\n");
+        if (backend_value && *backend_value) {
+            throw std::runtime_error(
+                "explicit stream test backend failed: " + init_error);
+        }
+        std::fprintf(stderr, "skip: no CUDA/HIP backend available: %s\n",
+                     init_error.c_str());
         return;
     }
     run_layout_case(backend, false);

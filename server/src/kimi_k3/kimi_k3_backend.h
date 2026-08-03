@@ -17,10 +17,11 @@ struct KimiK3BackendConfig {
     const char * model_path = nullptr;
     DevicePlacement device;
     int stream_fd = -1;
-    // -1 resolves DFLASH_MOE_TP_GPU and otherwise keeps experts on the
-    // primary GPU. A different GPU becomes the secondary capacity owner;
-    // routed work is partitioned between both GPUs while dense KDA/MLA,
-    // recurrent state, and sampling remain primary-owned.
+    // -1 resolves DFLASH_MOE_TP_GPU and otherwise keeps the primary device
+    // index. DFLASH_MOE_TP_BACKEND may select a different in-process runtime
+    // (for example CUDA beside a HIP primary). A different backend or device
+    // becomes the secondary capacity owner; routed work is partitioned while
+    // dense KDA/MLA, recurrent state, and sampling remain primary-owned.
     int expert_gpu = -1;
     // Auto uses Kimi's capacity-safe file-backed routed experts. Resident is
     // retained as a deterministic oracle for small architecture fixtures.
@@ -67,6 +68,7 @@ private:
     KimiK3BackendConfig cfg_;
     ggml_backend_t backend_ = nullptr;
     ggml_backend_t expert_backend_ = nullptr;
+    PlacementBackend expert_backend_kind_ = PlacementBackend::Auto;
     int expert_gpu_ = -1;
     KimiK3Weights weights_;
     KimiK3Cache cache_;

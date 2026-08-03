@@ -1,9 +1,7 @@
 #include "moe_hybrid_stream.h"
-#include "gpu_runtime_compat.h"
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
-#include "ggml-cuda.h"
 
 #include <algorithm>
 #include <chrono>
@@ -29,13 +27,93 @@
 namespace dflash::common {
 namespace {
 
-bool pinned_allocate(void ** ptr, size_t bytes, void *) {
-    return cudaMallocHost(ptr, bytes) == cudaSuccess;
-}
+// Allocate host staging through the selected ggml backend module. This is
+// essential in a mixed HIP+CUDA process: memory pinned by the linked HIP
+// runtime is not CUDA-pinned memory for a dynamically loaded CUDA backend.
+// Keeping allocation behind the backend device also makes the SSD scheduler
+// independent of which GPU vendor owns a route partition.
+class BackendHostAllocator {
+public:
+    bool init(ggml_backend_t backend, std::string * err) {
+        const ggml_backend_dev_t device = backend
+            ? ggml_backend_get_device(backend) : nullptr;
+        buffer_type_ = device
+            ? ggml_backend_dev_host_buffer_type(device) : nullptr;
+        if (!buffer_type_) buffer_type_ = ggml_backend_cpu_buffer_type();
+        if (!buffer_type_) {
+            if (err) *err = "stream backend has no host staging buffer type";
+            return false;
+        }
+        return true;
+    }
 
-void pinned_free(void * ptr, void *) {
-    if (ptr) (void) cudaFreeHost(ptr);
-}
+    bool allocate(void ** ptr, size_t bytes) {
+        if (!ptr || bytes == 0 || !buffer_type_) return false;
+        *ptr = nullptr;
+        ggml_backend_buffer_t buffer =
+            ggml_backend_buft_alloc_buffer(buffer_type_, bytes);
+        if (!buffer) return false;
+        void * base = ggml_backend_buffer_get_base(buffer);
+        if (!base) {
+            ggml_backend_buffer_free(buffer);
+            return false;
+        }
+        try {
+            std::lock_guard<std::mutex> lock(mutex_);
+            const auto [_, inserted] = buffers_.emplace(base, buffer);
+            if (!inserted) {
+                ggml_backend_buffer_free(buffer);
+                return false;
+            }
+        } catch (const std::bad_alloc &) {
+            ggml_backend_buffer_free(buffer);
+            return false;
+        }
+        *ptr = base;
+        return true;
+    }
+
+    void release(void * ptr) {
+        if (!ptr) return;
+        ggml_backend_buffer_t buffer = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            const auto found = buffers_.find(ptr);
+            if (found == buffers_.end()) return;
+            buffer = found->second;
+            buffers_.erase(found);
+        }
+        ggml_backend_buffer_free(buffer);
+    }
+
+    static bool allocate_callback(void ** ptr, size_t bytes, void * opaque) {
+        return opaque && static_cast<BackendHostAllocator *>(opaque)->allocate(
+            ptr, bytes);
+    }
+
+    static void free_callback(void * ptr, void * opaque) {
+        if (opaque) static_cast<BackendHostAllocator *>(opaque)->release(ptr);
+    }
+
+    ~BackendHostAllocator() {
+        for (;;) {
+            ggml_backend_buffer_t buffer = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (buffers_.empty()) break;
+                const auto found = buffers_.begin();
+                buffer = found->second;
+                buffers_.erase(found);
+            }
+            ggml_backend_buffer_free(buffer);
+        }
+    }
+
+private:
+    ggml_backend_buffer_type_t buffer_type_ = nullptr;
+    std::mutex mutex_;
+    std::unordered_map<void *, ggml_backend_buffer_t> buffers_;
+};
 
 int env_bounded_int(const char * name, int fallback, int lo, int hi) {
     const char * value = std::getenv(name);
@@ -99,41 +177,6 @@ bool same_stream_spec(const MoeStreamExpertSpec & a,
 uint64_t device_key(int layer, int expert) {
     return ((uint64_t) (uint32_t) layer << 32) | (uint32_t) expert;
 }
-
-int backend_device_index(ggml_backend_t backend) {
-    if (!backend || !ggml_backend_is_cuda(backend)) return -1;
-    ggml_backend_dev_t wanted = ggml_backend_get_device(backend);
-    ggml_backend_reg_t reg = ggml_backend_cuda_reg();
-    const int count = ggml_backend_cuda_get_device_count();
-    for (int device = 0; device < count; ++device) {
-        if (ggml_backend_reg_dev_get(reg, (size_t) device) == wanted) return device;
-    }
-    return -1;
-}
-
-// HIP/CUDA streams, events, and allocations belong to the current device.
-// The heterogeneous engine alternates R9700 and Strix backends on one host
-// thread, so relying on whichever backend ran last is a cross-device bug.
-class ScopedGpuDevice {
-public:
-    explicit ScopedGpuDevice(int target) : target_(target) {
-        if (target_ < 0 || cudaGetDevice(&previous_) != cudaSuccess) return;
-        valid_ = true;
-        if (previous_ != target_) switched_ = cudaSetDevice(target_) == cudaSuccess;
-    }
-
-    ~ScopedGpuDevice() {
-        if (valid_ && switched_) (void) cudaSetDevice(previous_);
-    }
-
-    bool ready() const { return valid_ && (previous_ == target_ || switched_); }
-
-private:
-    int target_ = -1;
-    int previous_ = -1;
-    bool valid_ = false;
-    bool switched_ = false;
-};
 
 } // namespace
 
@@ -801,7 +844,8 @@ struct MoeHybridStreamEngine::Runtime {
 
     struct DeviceSlot {
         void * data = nullptr;
-        cudaEvent_t ready = nullptr;
+        ggml_tensor * transfer_tensor = nullptr;
+        ggml_backend_event_t ready = nullptr;
         bool pending = false;
         bool valid = false;
         bool cache_managed = false;
@@ -816,13 +860,17 @@ struct MoeHybridStreamEngine::Runtime {
     };
 
     ggml_backend_t backend = nullptr;
-    int device = -1;
+    // A second backend instance on the same device owns the upload stream.
+    // Its interface comes from the same module as `backend`, so this works for
+    // both the linked runtime and an isolated CUDA/HIP peer module.
+    ggml_backend_t transfer_backend = nullptr;
     size_t max_expert_bytes = 0;
     MoeStreamConfig config{};
+    BackendHostAllocator host_allocator;
     std::unique_ptr<MoeNvmeScheduler> io;
-    cudaStream_t transfer_stream = nullptr;
     ggml_backend_buffer_t device_pool_buffer = nullptr;
     void * device_pool = nullptr;
+    ggml_context * device_slot_ctx = nullptr;
     size_t device_stride = 0;
     size_t device_pool_bytes = 0;
     std::vector<DeviceSlot> device_slots;
@@ -845,16 +893,17 @@ struct MoeHybridStreamEngine::Runtime {
 template <typename RuntimeT>
 void release_device_cache(RuntimeT & runtime) {
     if (runtime.backend) ggml_backend_synchronize(runtime.backend);
-    if (runtime.transfer_stream) {
-        (void) cudaStreamSynchronize(runtime.transfer_stream);
+    if (runtime.transfer_backend) {
+        ggml_backend_synchronize(runtime.transfer_backend);
     }
     runtime.graph_cache.clear();
     runtime.fused_decode_graph_cache.clear();
     for (auto & slot : runtime.device_slots) {
         slot.host_lease.reset();
-        if (slot.ready) (void) cudaEventDestroy(slot.ready);
+        if (slot.ready) ggml_backend_event_free(slot.ready);
         slot.ready = nullptr;
         slot.data = nullptr;
+        slot.transfer_tensor = nullptr;
         slot.pending = false;
     }
     runtime.device_slots.clear();
@@ -866,6 +915,8 @@ void release_device_cache(RuntimeT & runtime) {
     }
     runtime.device_pool_buffer = nullptr;
     runtime.device_pool = nullptr;
+    if (runtime.device_slot_ctx) ggml_free(runtime.device_slot_ctx);
+    runtime.device_slot_ctx = nullptr;
     runtime.device_stride = 0;
     runtime.device_pool_bytes = 0;
 }
@@ -928,8 +979,46 @@ bool allocate_device_cache(RuntimeT & runtime, std::string * err,
         return false;
     }
     auto * base = static_cast<uint8_t *>(runtime.device_pool);
+    if (runtime.device_stride >
+            static_cast<size_t>(std::numeric_limits<int64_t>::max()) ||
+        attempt_slots >
+        (std::numeric_limits<size_t>::max() - 1024) /
+            ggml_tensor_overhead()) {
+        if (err) *err = "SSD GPU cache tensor size overflow";
+        release_device_cache(runtime);
+        return false;
+    }
+    ggml_init_params params{};
+    params.mem_size = attempt_slots * ggml_tensor_overhead() + 1024;
+    params.no_alloc = true;
+    runtime.device_slot_ctx = ggml_init(params);
+    if (!runtime.device_slot_ctx) {
+        if (err) *err = "failed to allocate SSD GPU cache tensor metadata";
+        release_device_cache(runtime);
+        return false;
+    }
+    ggml_backend_buffer_clear(runtime.device_pool_buffer, 0);
+    // The pool is shared by the compute and upload backend instances. Finish
+    // initialization on the compute stream before the upload stream can reuse
+    // any slot, otherwise zero-filled quantization padding could race H2D.
+    ggml_backend_synchronize(runtime.backend);
     for (size_t i = 0; i < runtime.device_slots.size(); ++i) {
-        runtime.device_slots[i].data = base + i * runtime.device_stride;
+        auto & slot = runtime.device_slots[i];
+        slot.data = base + i * runtime.device_stride;
+        slot.transfer_tensor = ggml_new_tensor_1d(
+            runtime.device_slot_ctx, GGML_TYPE_I8,
+            (int64_t) runtime.device_stride);
+        if (!slot.transfer_tensor ||
+            ggml_backend_buffer_get_alloc_size(
+                runtime.device_pool_buffer, slot.transfer_tensor) >
+                runtime.device_stride ||
+            ggml_backend_tensor_alloc(
+                runtime.device_pool_buffer, slot.transfer_tensor,
+                slot.data) != GGML_STATUS_SUCCESS) {
+            if (err) *err = "failed to bind SSD GPU cache transfer tensor";
+            release_device_cache(runtime);
+            return false;
+        }
     }
     return true;
 }
@@ -1084,10 +1173,19 @@ bool MoeHybridStreamEngine::init(ggml_backend_t gpu_backend,
         return false;
     }
     runtime->backend = gpu_backend;
-    runtime->device = backend_device_index(gpu_backend);
-    ScopedGpuDevice device_scope(runtime->device);
-    if (!device_scope.ready()) {
-        if (err) *err = "failed to resolve/select SSD stream GPU";
+    ggml_backend_dev_t device = ggml_backend_get_device(gpu_backend);
+    if (!device) {
+        if (err) *err = "failed to resolve SSD stream backend device";
+        return false;
+    }
+    runtime->transfer_backend = ggml_backend_dev_init(device, nullptr);
+    if (!runtime->transfer_backend) {
+        if (err) *err = "failed to create SSD upload backend stream";
+        return false;
+    }
+    if (!runtime->host_allocator.init(runtime->transfer_backend, err)) {
+        ggml_backend_free(runtime->transfer_backend);
+        runtime->transfer_backend = nullptr;
         return false;
     }
     runtime->max_expert_bytes = max_expert_bytes;
@@ -1096,17 +1194,17 @@ bool MoeHybridStreamEngine::init(ggml_backend_t gpu_backend,
     runtime->io.reset(new (std::nothrow) MoeNvmeScheduler);
     if (!runtime->io) {
         if (err) *err = "failed to allocate SSD scheduler";
+        ggml_backend_free(runtime->transfer_backend);
+        runtime->transfer_backend = nullptr;
         return false;
     }
     if (!runtime->io->init(runtime->config.nvme, max_expert_bytes,
-                           pinned_allocate, pinned_free, nullptr, err)) {
-        return false;
-    }
-
-    cudaError_t gpu_err = cudaStreamCreate(&runtime->transfer_stream);
-    if (gpu_err != cudaSuccess) {
-        if (err) *err = std::string("failed to create SSD transfer stream: ") +
-                        cudaGetErrorString(gpu_err);
+                           BackendHostAllocator::allocate_callback,
+                           BackendHostAllocator::free_callback,
+                           &runtime->host_allocator, err)) {
+        runtime->io.reset();
+        ggml_backend_free(runtime->transfer_backend);
+        runtime->transfer_backend = nullptr;
         return false;
     }
     if (!allocate_device_cache(*runtime, err)) {
@@ -1161,7 +1259,7 @@ bool MoeHybridStreamEngine::bind_sources(
 
 bool MoeHybridStreamEngine::is_ready() const {
     return runtime_ && runtime_->backend && runtime_->io &&
-           runtime_->io->is_initialized() && runtime_->transfer_stream &&
+           runtime_->io->is_initialized() && runtime_->transfer_backend &&
            !runtime_->device_slots.empty();
 }
 
@@ -1173,18 +1271,18 @@ void MoeHybridStreamEngine::destroy() {
     if (!runtime_) return;
     const size_t device_cache_slot_count = runtime_->device_slots.size();
     const size_t device_cache_byte_count = runtime_->device_pool_bytes;
-    ScopedGpuDevice device_scope(runtime_->device);
     if (runtime_->backend) ggml_backend_synchronize(runtime_->backend);
-    if (runtime_->transfer_stream) {
-        (void) cudaStreamSynchronize(runtime_->transfer_stream);
+    if (runtime_->transfer_backend) {
+        ggml_backend_synchronize(runtime_->transfer_backend);
     }
     runtime_->graph_cache.clear();
     runtime_->fused_decode_graph_cache.clear();
     for (Runtime::DeviceSlot & slot : runtime_->device_slots) {
         slot.host_lease.reset();
-        if (slot.ready) (void) cudaEventDestroy(slot.ready);
+        if (slot.ready) ggml_backend_event_free(slot.ready);
         slot.ready = nullptr;
         slot.data = nullptr;
+        slot.transfer_tensor = nullptr;
         slot.pending = false;
     }
     runtime_->device_slots.clear();
@@ -1194,8 +1292,8 @@ void MoeHybridStreamEngine::destroy() {
     }
     runtime_->device_pool_buffer = nullptr;
     runtime_->device_pool = nullptr;
-    if (runtime_->transfer_stream) (void) cudaStreamDestroy(runtime_->transfer_stream);
-    runtime_->transfer_stream = nullptr;
+    if (runtime_->device_slot_ctx) ggml_free(runtime_->device_slot_ctx);
+    runtime_->device_slot_ctx = nullptr;
     if (runtime_->io) {
         const MoeNvmeStats stats = runtime_->io->stats();
         if (stats.requests != 0 || stats.read_ops != 0 || stats.errors != 0) {
@@ -1244,6 +1342,11 @@ void MoeHybridStreamEngine::destroy() {
                 (unsigned long long) runtime_->compute_stats.fused_decode_experts);
         }
         runtime_->io->destroy();
+    }
+    runtime_->io.reset();
+    if (runtime_->transfer_backend) {
+        ggml_backend_free(runtime_->transfer_backend);
+        runtime_->transfer_backend = nullptr;
     }
     runtime_.reset();
 }
@@ -1314,11 +1417,6 @@ bool MoeHybridStreamEngine::stage_expert_async(int layer, int expert_id,
         if (err) *err = "stream engine has no bound SSD model source";
         return false;
     }
-    ScopedGpuDevice device_scope(runtime_->device);
-    if (!device_scope.ready()) {
-        if (err) *err = "failed to select SSD stream GPU";
-        return false;
-    }
     if (device_slot < 0 || device_slot >= (int) runtime_->device_slots.size()) {
         if (err) *err = "SSD device slot is out of range";
         return false;
@@ -1333,12 +1431,7 @@ bool MoeHybridStreamEngine::stage_expert_async(int layer, int expert_id,
         return false;
     }
     if (dst.pending) {
-        const cudaError_t wait_err = cudaEventSynchronize(dst.ready);
-        if (wait_err != cudaSuccess) {
-            if (err) *err = std::string("failed waiting for prior SSD upload: ") +
-                            cudaGetErrorString(wait_err);
-            return false;
-        }
+        ggml_backend_event_synchronize(dst.ready);
         dst.pending = false;
         dst.host_lease.reset();
     }
@@ -1353,13 +1446,16 @@ bool MoeHybridStreamEngine::stage_expert_async(int layer, int expert_id,
     dst.device_layout = Runtime::DeviceExpertLayout{};
 
     if (!dst.ready) {
-        const cudaError_t event_create_err =
-            cudaEventCreateWithFlags(&dst.ready, cudaEventDisableTiming);
-        if (event_create_err != cudaSuccess) {
-            if (err) *err = std::string("failed to create expert upload event: ") +
-                            cudaGetErrorString(event_create_err);
+        dst.ready = ggml_backend_event_new(
+            ggml_backend_get_device(runtime_->transfer_backend));
+        if (!dst.ready) {
+            if (err) *err = "stream backend does not support upload events";
             return false;
         }
+    }
+    if (!dst.transfer_tensor) {
+        if (err) *err = "SSD device slot has no transfer tensor";
+        return false;
     }
 
     MoeNvmeLease lease;
@@ -1406,26 +1502,10 @@ bool MoeHybridStreamEngine::stage_expert_async(int layer, int expert_id,
                 return false;
             }
 
-            cudaError_t gpu_err = cudaMemcpyAsync(
-                static_cast<uint8_t *>(dst.data) + device_component.offset,
-                source, device_component.logical_bytes,
-                cudaMemcpyHostToDevice, runtime_->transfer_stream);
-            if (gpu_err == cudaSuccess &&
-                device_component.alloc_bytes > device_component.logical_bytes) {
-                gpu_err = cudaMemsetAsync(
-                    static_cast<uint8_t *>(dst.data) + device_component.offset +
-                        device_component.logical_bytes,
-                    0,
-                    device_component.alloc_bytes -
-                        device_component.logical_bytes,
-                    runtime_->transfer_stream);
-            }
-            if (gpu_err != cudaSuccess) {
-                (void) cudaStreamSynchronize(runtime_->transfer_stream);
-                if (err) *err = std::string("asynchronous expert H2D failed: ") +
-                                cudaGetErrorString(gpu_err);
-                return false;
-            }
+            ggml_backend_tensor_set_async(
+                runtime_->transfer_backend, dst.transfer_tensor,
+                source, device_component.offset,
+                device_component.logical_bytes);
         }
         dst.device_layout = device_layout;
     } else {
@@ -1434,16 +1514,10 @@ bool MoeHybridStreamEngine::stage_expert_async(int layer, int expert_id,
         // always registers an exact backend-padded layout before reaching here.
         for (int i = 0; i < lease.layout().span_count; ++i) {
             const MoeExpertIoSpan & span = lease.layout().spans[i];
-            cudaError_t gpu_err = cudaMemcpyAsync(
-                static_cast<uint8_t *>(dst.data) + span.device_offset,
+            ggml_backend_tensor_set_async(
+                runtime_->transfer_backend, dst.transfer_tensor,
                 lease.data() + span.buffer_offset,
-                span.bytes, cudaMemcpyHostToDevice, runtime_->transfer_stream);
-            if (gpu_err != cudaSuccess) {
-                (void) cudaStreamSynchronize(runtime_->transfer_stream);
-                if (err) *err = std::string("asynchronous expert H2D failed: ") +
-                                cudaGetErrorString(gpu_err);
-                return false;
-            }
+                span.device_offset, span.bytes);
         }
         dst.device_layout.component_count = lease.layout().component_count;
         dst.device_layout.bytes = lease.layout().payload_bytes;
@@ -1455,13 +1529,7 @@ bool MoeHybridStreamEngine::stage_expert_async(int layer, int expert_id,
                 component.bytes, component.bytes};
         }
     }
-    const cudaError_t event_err = cudaEventRecord(dst.ready, runtime_->transfer_stream);
-    if (event_err != cudaSuccess) {
-        (void) cudaStreamSynchronize(runtime_->transfer_stream);
-        if (err) *err = std::string("failed to record expert upload event: ") +
-                        cudaGetErrorString(event_err);
-        return false;
-    }
+    ggml_backend_event_record(dst.ready, runtime_->transfer_backend);
     dst.layout = lease.layout();
     dst.host_lease = std::move(lease);
     dst.pending = true;
@@ -1549,19 +1617,9 @@ bool MoeHybridStreamEngine::activate_device_slot(int device_slot,
         if (err) *err = "SSD device slot is out of range";
         return false;
     }
-    ScopedGpuDevice device_scope(runtime_->device);
-    if (!device_scope.ready()) {
-        if (err) *err = "failed to select SSD stream GPU";
-        return false;
-    }
     Runtime::DeviceSlot & slot = runtime_->device_slots[(size_t) device_slot];
     if (slot.pending) {
-        const cudaError_t gpu_err = cudaEventSynchronize(slot.ready);
-        if (gpu_err != cudaSuccess) {
-            if (err) *err = std::string("expert H2D synchronization failed: ") +
-                            cudaGetErrorString(gpu_err);
-            return false;
-        }
+        ggml_backend_event_synchronize(slot.ready);
         slot.pending = false;
         slot.host_lease.reset();
     }
@@ -1620,11 +1678,6 @@ bool MoeHybridStreamEngine::warm_and_pin_device_cache(
     reserve_slots = std::max(2, reserve_slots);
 
     std::lock_guard<std::mutex> compute_guard(runtime_->compute_mutex);
-    ScopedGpuDevice device_scope(runtime_->device);
-    if (!device_scope.ready()) {
-        if (err) *err = "failed to select streamed cache GPU for warmup";
-        return false;
-    }
 
     std::vector<MoeStreamCacheWarmEntry> candidates = entries;
     std::stable_sort(candidates.begin(), candidates.end(),
@@ -2108,11 +2161,6 @@ bool eval_moe_streamed_experts(
 
     auto & runtime = *engine.runtime_;
     std::lock_guard<std::mutex> compute_guard(runtime.compute_mutex);
-    ScopedGpuDevice device_scope(runtime.device);
-    if (!device_scope.ready()) {
-        if (err) *err = "failed to select streamed expert compute GPU";
-        return false;
-    }
     if (!prepare_device_expert_layout(
             runtime, batch.layer, spec, err)) {
         return false;

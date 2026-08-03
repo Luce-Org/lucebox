@@ -218,10 +218,10 @@ export DFLASH_MOE_HOTNESS_CSV=/models/kimi-routes.csv
 ```
 
 At least one quarter of each device cache (and never fewer than two slots)
-remains adaptive for profile drift and misses. With two GPUs, the same runtime
-ownership rule filters both warm plans, so an expert is never pinned on both
-R9700 and Strix. A missing profile simply retains the adaptive LFRU cache;
-prediction is not required for correctness.
+remains adaptive for profile drift and misses. With two GPU owners, the same
+deterministic ownership rule filters both warm plans, so an expert is never
+pinned on both devices. A missing profile simply retains the adaptive LFRU
+cache; prediction is not required for correctness.
 
 On a two-GPU Lucebox, put the compute-intensive primary path on the R9700 and
 use Strix as the secondary capacity owner. Both devices receive independent
@@ -237,13 +237,26 @@ export DFLASH_MOE_TP_GPU=<strix-gpu>
 
 This is functional expert ownership, not a contiguous layer split, so do not
 use `--target-devices`. `DFLASH_MOE_PLACEMENT` may point at an offline
-`MoeHybridPlacement` JSON; its hot expert IDs become R9700-owned and
-all other selected routes become Strix-owned. Without a plan,
+`MoeHybridPlacement` JSON; its hot expert IDs become R9700-owned and all other
+selected routes become Strix-owned. Without a plan,
 `DFLASH_MOE_PRIMARY_SHARE_PER_MILLE` controls a deterministic bring-up split
-(default 500). Leaving `DFLASH_MOE_TP_GPU` unset preserves the single-device
-path, including Strix-only systems. The current Kimi join still uses
-activation-sized host staging; a device-resident peer join remains the next
-throughput optimization.
+(default 500). Leaving both secondary-owner variables unset preserves the
+single-device path, including Strix-only systems.
+
+Mixed-vendor builds use the same path. For example, a HIP primary with an RTX
+secondary selects the isolated CUDA module in the existing process:
+
+```bash
+export DFLASH_MOE_TP_BACKEND=cuda
+export DFLASH_MOE_TP_GPU=0
+
+./build-hip-mixed/dflash_server \
+  /path/to/Kimi-K3-UD-IQ1_S-00001-of-00014.gguf \
+  --target-device hip:0 --max-ctx 8192
+```
+
+The current Kimi join still uses activation-sized host staging; a
+device-resident peer join remains the next throughput optimization.
 
 ## Tuning and diagnostics
 
@@ -272,6 +285,7 @@ not improve the qualified P310 drive and consumes extra pinned/system memory.
 | `DFLASH_MOE_ROUTE_STATS_OUT` | unset | Record Kimi native-router counts as a reusable model-neutral CSV profile |
 | `DFLASH_MOE_HOTNESS_CSV` | unset | Warm and pin the highest-value experts from a compatible routing profile |
 | `DFLASH_MOE_TP_GPU` | primary GPU | Optional secondary GPU; enables concurrent route ownership when different from the primary |
+| `DFLASH_MOE_TP_BACKEND` | primary backend | Optional secondary runtime (`cuda` or `hip`); a different runtime enables mixed-vendor route ownership even when both use device index `0` |
 | `DFLASH_MOE_PLACEMENT` | unset | Offline placement JSON; listed experts belong to the primary GPU |
 | `DFLASH_MOE_PRIMARY_SHARE_PER_MILLE` | `500` | Bring-up hash split used only when no placement is supplied |
 | `DFLASH_MOE_DUAL_STREAM_TRACE` | unset | Debug per-layer owner counts and branch/wall timing |
@@ -285,7 +299,8 @@ only when it covers the complete logical payload at an unaligned file tail.
 `test_moe_stream_compute` generates
 tiny experts and checks both tensor-major and expert-major GPU results against
 a CPU oracle. It defaults to GPU 0, so it runs directly on Strix-only systems;
-`DFLASH_TEST_GPU` selects another device on multi-GPU hosts. The standalone
+`DFLASH_TEST_GPU` selects another device and `DFLASH_TEST_BACKEND` selects the
+linked or dynamically loaded runtime on mixed builds. The standalone
 targets `test_moe_nvme_scheduler`, `test_moe_expert_package`,
 `bench_moe_nvme_io`, and
 `bench_moe_nvme_pipeline` test scheduling, raw storage, and the complete

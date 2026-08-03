@@ -1196,7 +1196,7 @@ bool DeepSeek4Backend::init_hybrid_model() {
                 stream_cold = info.cold_bytes > usable;
                 if (stream_cold) nvme_device_cache_bytes = (size_t) usable;
                 std::fprintf(stderr,
-                    "[deepseek4] Strix cold tier: cold=%.2f GiB free=%.2f GiB "
+                    "[deepseek4] secondary cold tier: cold=%.2f GiB free=%.2f GiB "
                     "reserve=%.2f GiB warm-cache=%.2f GiB mode=%s\n",
                     gib(info.cold_bytes), gib(expert_free), gib(reserve),
                     gib(nvme_device_cache_bytes),
