@@ -17,6 +17,7 @@
 #include "server/utf8_utils.h"
 #include "server/api_types.h"
 #include "server/http_server.h"
+#include "server/finish_reason.h"
 #include "server/chat_template.h"
 #include "common/sampler.h"
 #include "common/backend_precision.h"
@@ -333,13 +334,189 @@ TEST_CASE(ServerUnitFixture, test_utf8_sanitize_replaces_invalid) {
     // Truncated 4-byte sequence
     std::string s2 = "X\xF0\x9F";
     std::string out2 = utf8_sanitize(s2);
-    // Each invalid byte becomes U+FFFD
-    TEST_ASSERT(out2.find("X") == 0);
-    TEST_ASSERT(out2.size() > 1);  // has replacement(s)
+    // A valid but truncated prefix collapses to one U+FFFD.
+    TEST_ASSERT(out2 == "X\xEF\xBF\xBD");
 }
 
 TEST_CASE(ServerUnitFixture, test_utf8_sanitize_empty) {
     TEST_ASSERT(utf8_sanitize("") == "");
+}
+
+TEST_CASE(ServerUnitFixture, test_finish_reason_resolution_table) {
+    struct Case {
+        const char * emitter;
+        int tokens;
+        int cap;
+        bool degenerate;
+        bool ok;
+        bool disconnected;
+        const char * expected;
+    };
+    const std::vector<Case> cases = {
+        {"stop",       3,  8, false, true,  false, "stop"},
+        {"stop",       8,  8, false, true,  false, "length"},
+        {"stop",       9,  8, false, true,  false, "length"},
+        {"stop",       3,  8, true,  true,  false, "length"},
+        {"tool_calls", 8,  8, false, true,  false, "tool_calls"},
+        {"tool_calls", 8,  8, true,  true,  false, "tool_calls"},
+        {"stop",       3,  8, false, true,  true,  "client_disconnect"},
+        {"stop",       3,  8, false, false, false, "error"},
+    };
+    for (const auto & c : cases) {
+        TEST_ASSERT(resolve_client_finish_reason(
+            c.emitter, c.tokens, c.cap, c.degenerate,
+            c.ok, c.disconnected) == c.expected);
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_streaming_finish_reason_uses_shared_length_policy) {
+    auto openai = make_emitter(ApiFormat::OPENAI_CHAT);
+    openai.emit_start();
+    openai.emit_token("x");
+    const std::string openai_wire = concat(openai.emit_finish(1, nullptr, 1));
+    TEST_ASSERT(openai_wire.find("\"finish_reason\":\"length\"") !=
+                std::string::npos);
+
+    auto anthropic = make_emitter(ApiFormat::ANTHROPIC);
+    anthropic.emit_start();
+    anthropic.emit_token("x");
+    const std::string anthropic_wire = concat(anthropic.emit_finish(1, nullptr, 1));
+    TEST_ASSERT(anthropic_wire.find("\"stop_reason\":\"max_tokens\"") !=
+                std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_utf8_sanitize_invalid_sequences_are_deterministic) {
+    const std::string replacement = "\xEF\xBF\xBD";
+
+    // Overlong U+002F: C0 AF. Each invalid byte remains visible as a
+    // replacement; the sanitizer is not allowed to pass malformed UTF-8.
+    TEST_ASSERT(utf8_sanitize("A\xC0\xAFZ") == "A" + replacement + replacement + "Z");
+
+    // UTF-8 encoding of a surrogate code point: ED A0 80.
+    TEST_ASSERT(utf8_sanitize("A\xED\xA0\x80Z") ==
+                "A" + replacement + replacement + replacement + "Z");
+
+    // A lone continuation byte is invalid immediately.
+    TEST_ASSERT(utf8_sanitize("A\x80Z") == "A" + replacement + "Z");
+
+    // These incomplete prefixes are already impossible once their first
+    // continuation byte arrives and must not be retained for another call.
+    TEST_ASSERT(utf8_stream_safe_len("\xE0\x80") == 2);
+    TEST_ASSERT(utf8_stream_safe_len("\xED\xA0") == 2);
+    TEST_ASSERT(utf8_stream_safe_len("\xF0\x80") == 2);
+    TEST_ASSERT(utf8_stream_safe_len("\xF4\x90") == 2);
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_replaces_invalid_utf8_without_holding_valid_suffix) {
+    const std::string replacement = "\xEF\xBF\xBD";
+
+    auto invalid_continuation = make_emitter(ApiFormat::OPENAI_CHAT);
+    invalid_continuation.emit_start();
+    invalid_continuation.emit_token("A\xE2(Z");
+    invalid_continuation.emit_finish(1);
+    TEST_ASSERT(invalid_continuation.accumulated_text() ==
+                "A" + replacement + "(Z");
+
+    auto impossible_lead = make_emitter(ApiFormat::OPENAI_CHAT);
+    impossible_lead.emit_start();
+    impossible_lead.emit_token("A\xF5Z");
+    impossible_lead.emit_finish(1);
+    TEST_ASSERT(impossible_lead.accumulated_text() ==
+                "A" + replacement + "Z");
+}
+
+// Feed one string in two pieces at every byte boundary. This deliberately
+// models byte-fallback tokens: a valid code point may be split across calls.
+static void assert_emitter_reassembles_at_split(ApiFormat format,
+                                                bool reasoning,
+                                                const std::string & expected) {
+    TEST_ASSERT(expected.size() > 1);
+    for (size_t split = 1; split < expected.size(); ++split) {
+        auto em = make_emitter(format, json::array(), reasoning);
+        std::vector<std::string> chunks = em.emit_start();
+        auto append = [&](std::vector<std::string> more) {
+            chunks.insert(chunks.end(), more.begin(), more.end());
+        };
+        append(em.emit_token(expected.substr(0, split)));
+        append(em.emit_token(expected.substr(split)));
+        append(em.emit_finish(2));
+
+        std::string streamed;
+        for (const auto & chunk : chunks) {
+            if (chunk.rfind("data: ", 0) != 0) continue;
+            const size_t end = chunk.find('\n');
+            const std::string payload = chunk.substr(6, end - 6);
+            if (payload == "[DONE]") continue;
+            const json event = json::parse(payload);
+            if (!event.contains("choices") || event["choices"].empty()) continue;
+            const json & delta = event["choices"][0]["delta"];
+            const char * field = reasoning ? "reasoning_content" : "content";
+            if (delta.contains(field) && delta[field].is_string()) {
+                streamed += delta[field].get<std::string>();
+            }
+        }
+
+        const std::string & accumulated = reasoning
+            ? em.reasoning_text() : em.accumulated_text();
+        TEST_ASSERT_MSG(accumulated == expected,
+                        "split UTF-8 text changed before accumulation");
+        TEST_ASSERT_MSG(streamed.find("\xEF\xBF\xBD") == std::string::npos,
+                        "valid split UTF-8 emitted U+FFFD");
+        TEST_ASSERT_MSG(streamed == expected,
+                        "wire output lost valid split UTF-8");
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_reassembles_utf8_content_at_every_boundary) {
+    // 2-, 3-, and 4-byte code points, the exact candidate failure, set
+    // notation, CJK, emoji, and combining accents.
+    const std::vector<std::string> samples = {
+        "e\xCC\x81",                         // e + combining acute accent
+        "caf\xC3\xA9 — \xCF\x80 \xE2\x88\x88 \xE2\x88\x85 \xE2\x8A\x86",
+        "\xE2\x88\x80\xE2\x88\x83\xE2\x88\x88\xE2\x88\x85\xE2\x8A\x86\xE2\x8A\x87\xE2\x88\xA9\xE2\x89\xA0\xE2\x86\x92",
+        "\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E \xF0\x9F\x9A\xA9",
+        "Return exactly this text and nothing else: caf\xC3\xA9 — \xCF\x80 \xE2\x88\x88 \xE2\x88\x85 \xE2\x8A\x86",
+    };
+    for (const auto & sample : samples) {
+        assert_emitter_reassembles_at_split(ApiFormat::OPENAI_CHAT, false, sample);
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_reassembles_utf8_reasoning_at_every_boundary) {
+    const std::vector<std::string> samples = {
+        "caf\xC3\xA9 — \xCF\x80 \xE2\x88\x88 \xE2\x88\x85 \xE2\x8A\x86",
+        "\xE2\x88\x80\xE2\x88\x83\xE2\x88\x88\xE2\x88\x85\xE2\x8A\x86\xE2\x8A\x87\xE2\x88\xA9\xE2\x89\xA0\xE2\x86\x92",
+        "\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E \xF0\x9F\x98\x80 e\xCC\x81",
+    };
+    for (const auto & sample : samples) {
+        assert_emitter_reassembles_at_split(ApiFormat::OPENAI_CHAT, true, sample);
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_final_flush_replaces_truncated_utf8_once) {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT);
+    em.emit_start();
+    em.emit_token("\xF0");
+    em.emit_token("\x9F");
+    em.emit_token("\x92");
+    em.emit_finish(3);
+    TEST_ASSERT(em.accumulated_text() == "\xEF\xBF\xBD");
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_stop_discards_trailing_incomplete_utf8) {
+    SseEmitter em(ApiFormat::OPENAI_CHAT, "test_id_001", "test-model", 10,
+                  json::array(), nullptr, {"STOP"}, false);
+    std::vector<std::string> chunks = em.emit_start();
+    auto append = [&](std::vector<std::string> more) {
+        chunks.insert(chunks.end(), more.begin(), more.end());
+    };
+    append(em.emit_token("beforeSTOP\xF0\x9F\x92"));
+    append(em.emit_finish(1));
+
+    const std::string wire = concat(chunks);
+    TEST_ASSERT(em.accumulated_text() == "before");
+    TEST_ASSERT(wire.find("\xEF\xBF\xBD") == std::string::npos);
+    TEST_ASSERT(wire.find("before") != std::string::npos);
 }
 
 // ═══════════════════════════════════════════════════════════════════════

@@ -19,6 +19,7 @@
 #include "http_server.h"
 #include "admission.h"
 #include "sse_emitter.h"
+#include "finish_reason.h"
 #include "prompt_normalize.h"
 #include "tool_hint.h"
 #include "common/sha1.h"
@@ -2091,18 +2092,11 @@ json build_openai_completion_response(
         message["tool_calls"] = tool_calls;
     }
 
-    // The emitter only knows "stop" / "tool_calls"; it cannot see that the
-    // daemon hit the n_gen cap. Derive "length" from the committed-token
-    // count — OpenAI-compatible clients (open-webui, Cline) gate retry
-    // logic on finish_reason == "length".
-    std::string finish_reason = emitter.finish_reason();
-    if (finish_reason == "stop" && counts.total >= generation_cap) {
-        finish_reason = "length";
-    }
-    // Degenerate decode (post-close repetition-loop watchdog) also reports
-    // "length": OpenAI/Anthropic/Gemini all collapse budget-class events
-    // into one closed enum, with richer signal in sidecar fields below.
-    if (result.degenerate_decode_close) finish_reason = "length";
+    // Resolve the same client-facing policy used by the streaming terminal
+    // event and the chat DONE log.
+    const std::string finish_reason = resolve_client_finish_reason(
+        emitter.finish_reason(), counts.total, generation_cap,
+        result.degenerate_decode_close);
 
     json choice = {
         {"index", 0},
@@ -2193,12 +2187,14 @@ json build_anthropic_response(
     }
 
     // stop_reason is Anthropic's analog of finish_reason, with the same
-    // length-vs-EOS distinction — Cline / Anthropic SDK clients gate
-    // retry logic on stop_reason == "max_tokens".
+    // shared length-vs-EOS policy as OpenAI and the streaming terminal event.
+    const std::string finish_reason = resolve_client_finish_reason(
+        emitter.finish_reason(), counts.total, generation_cap,
+        result.degenerate_decode_close);
     std::string stop_reason;
-    if (emitter.finish_reason() == "tool_calls") {
+    if (finish_reason == "tool_calls") {
         stop_reason = "tool_use";
-    } else if (counts.total >= generation_cap) {
+    } else if (finish_reason == "length") {
         stop_reason = "max_tokens";
     } else {
         stop_reason = "end_turn";
@@ -3568,7 +3564,9 @@ void HttpServer::process_job(ServerJob * job) {
         client_disconnected = true;
     }
     if (req.stream && !client_disconnected) {
-        auto final_chunks = emitter.emit_finish(completion_tokens, &gen_timings);
+        auto final_chunks = emitter.emit_finish(
+            completion_tokens, &gen_timings, n_gen_cap,
+            result.degenerate_decode_close);
         for (const auto & chunk : final_chunks) {
             if (!send_job_bytes(job, chunk.data(), chunk.size())) {
                 client_disconnected = true;
@@ -3600,9 +3598,13 @@ void HttpServer::process_job(ServerJob * job) {
     const double tok_s = elapsed_s > 0.0 ? out_tokens / elapsed_s : 0.0;
     const double decode_tok_s =
         result.decode_s > 0.0 ? out_tokens / result.decode_s : 0.0;
-    const std::string finish = client_disconnected
-        ? "client_disconnect"
-        : (result.ok() ? emitter.finish_reason() : "error");
+    // Match the counter used by the client-facing path: streaming reports
+    // completion_tokens, while non-streaming builders use result.tokens.
+    const int finish_tokens = req.stream ? completion_tokens : result_tokens;
+    const std::string finish = resolve_client_finish_reason(
+        result.ok() ? emitter.finish_reason() : "stop",
+        finish_tokens, n_gen_cap, result.degenerate_decode_close,
+        result.ok(), client_disconnected);
 
     std::fprintf(stderr,
         "[server] chat DONE %s ok=%s in=%zu effective_in=%zu out=%d "

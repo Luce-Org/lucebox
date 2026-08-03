@@ -1,6 +1,7 @@
 // SSE emitter implementation — streaming state machine for all 3 API formats.
 
 #include "sse_emitter.h"
+#include "finish_reason.h"
 #include "utf8_utils.h"
 
 #include <algorithm>
@@ -22,6 +23,26 @@ static bool has_request_tools(const json & tools) {
 
 static bool has_single_request_tool(const json & tools) {
     return tools.is_array() && tools.size() == 1 && tools[0].is_object();
+}
+
+static std::string sanitize_stream_piece(const std::string & raw_piece,
+                                         std::string & pending_bytes) {
+    if (pending_bytes.empty()) {
+        bool ascii = true;
+        for (unsigned char c : raw_piece) {
+            if (c >= 0x80) {
+                ascii = false;
+                break;
+            }
+        }
+        if (ascii) return raw_piece;
+    }
+
+    pending_bytes += raw_piece;
+    const size_t safe_len = utf8_stream_safe_len(pending_bytes);
+    std::string complete = pending_bytes.substr(0, safe_len);
+    pending_bytes.erase(0, safe_len);
+    return utf8_sanitize(complete);
 }
 
 static bool starts_with_potential_bare_json_tool(const std::string & text,
@@ -238,8 +259,10 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
     }
     emit_token_count_++;
 
-    // Sanitize input to prevent json::dump() from throwing on invalid UTF-8.
-    std::string piece = utf8_sanitize(raw_piece);
+    // Sanitize only complete UTF-8 sequences. Byte-fallback token pieces can
+    // split one code point across calls, so retain only a valid incomplete
+    // trailing prefix and let invalid bytes reach the sanitizer promptly.
+    std::string piece = sanitize_stream_piece(raw_piece, pending_bytes_);
     std::vector<std::string> out;
     accumulated_raw_ += piece;
     window_ += piece;
@@ -276,6 +299,10 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
                 }
             }
             window_.clear();
+            // Bytes held past the matched stop sequence are not part of the
+            // response. In particular, do not turn a trailing incomplete
+            // UTF-8 prefix into U+FFFD during emit_finish().
+            pending_bytes_.clear();
             stop_hit_ = true;
             return out;
         }
@@ -500,8 +527,20 @@ void SseEmitter::emit_content_delta(std::vector<std::string> & out,
 // ─── emit_finish ────────────────────────────────────────────────────────
 
 std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
-                                                 const GenTimings * timings) {
+                                                 const GenTimings * timings,
+                                                 int generation_cap,
+                                                 bool degenerate_decode_close) {
     std::vector<std::string> out;
+
+    // A valid but incomplete trailing sequence is only safe to retain until
+    // the generation is over. At finalization it is genuinely truncated and
+    // utf8_sanitize() emits one deterministic replacement character.
+    if (!pending_bytes_.empty()) {
+        const std::string tail = utf8_sanitize(pending_bytes_);
+        pending_bytes_.clear();
+        accumulated_raw_ += tail;
+        window_ += tail;
+    }
 
     // Flush remaining window
     if (mode_ == StreamMode::REASONING && !window_.empty()) {
@@ -673,6 +712,9 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
         }
     }
 
+    fr = resolve_client_finish_reason(
+        fr, completion_tokens, generation_cap, degenerate_decode_close);
+
     // Format-specific final events
     switch (format_) {
     case ApiFormat::OPENAI_CHAT: {
@@ -711,11 +753,12 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
                 json({{"type", "content_block_stop"}, {"index", block_index_}}).dump()));
             active_kind_.clear();
         }
-        // stop_reason reflects the model's actual finish: "tool_use" when
-        // any tool calls were emitted (downstream SDKs pivot on this to feed
-        // tool_result back), else "end_turn". Stop-sequence hits also report
-        // "end_turn" (Anthropic has no dedicated reason for that case).
-        const char * stop_reason = tool_calls_.empty() ? "end_turn" : "tool_use";
+        // stop_reason follows the same shared policy as the OpenAI terminal
+        // event: tool calls stay tool_use, budget closure is max_tokens, and
+        // ordinary completion is end_turn.
+        const char * stop_reason =
+            fr == "tool_calls" ? "tool_use" :
+            fr == "length" ? "max_tokens" : "end_turn";
         json anth_usage = {{"output_tokens", completion_tokens}};
         if (timings) {
             anth_usage["timings"] = build_timings_json(*timings, completion_tokens);

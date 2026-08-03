@@ -87,7 +87,9 @@ public:
     // the pre-timings API for unit tests that don't exercise that
     // shape.
     std::vector<std::string> emit_finish(int completion_tokens,
-                                         const GenTimings * timings = nullptr);
+                                         const GenTimings * timings = nullptr,
+                                         int generation_cap = -1,
+                                         bool degenerate_decode_close = false);
 
     // Get the finish_reason for non-streaming responses.
     std::string finish_reason() const;
@@ -153,6 +155,7 @@ private:
     ToolMemory * tool_memory_;
 
     StreamMode   mode_;
+    std::string  pending_bytes_;     // bounded incomplete UTF-8 tail (max 3 bytes)
     std::string  window_;           // holdback buffer
     std::string  tool_buffer_;      // accumulated tool text
     bool         tool_buffer_fallback_to_content_ = false;
