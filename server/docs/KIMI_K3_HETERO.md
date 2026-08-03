@@ -154,6 +154,34 @@ oracle on both backends and also change expert addresses and route weights
 between cached graph launches. These numbers isolate the routed core and do
 not claim complete-model token speed.
 
+## Full 2.8T model qualification, 2026-08-03
+
+The complete 14-shard Unsloth IQ1_S checkpoint was run through the native text
+backend on Lucebox4's Strix Halo. This was an end-to-end greedy generation,
+not synthetic byte ranges or a routed-core microbenchmark. The run used commit
+`3450da3f`, `--moe-storage ssd`, automatic cache sizing, direct `io_uring`, a
+512-token context allocation, and disabled HTTP/prefix caches.
+
+| Result | Cold request | Warm request |
+|---|---:|---:|
+| Startup | 46.0 s | same server |
+| 34-token prefill | 129.2 s | 103.6 s |
+| Four-token decode | 16.0 s | 16.3 s |
+| Decode rate | **0.200 token/s** | **0.200 token/s** |
+
+Both requests returned the identical greedy prefix `Hello! Nice to`. The
+loader placed 57.93 GiB of non-routed weights on Strix and assigned 32.66 GiB
+of the 495.26 GiB routed pool to its adaptive cache. Across both requests the
+engine read 262.31 GiB at 1.158 GiB/s, obtained a 7.5% aggregate cache-hit
+rate, issued 86 fused resident-decode launches, and reported zero I/O errors
+or timeouts.
+
+This establishes that the released 2.8T checkpoint fits and generates on a
+128 GiB Strix-only system. It also establishes the current bottleneck: real
+token-sequential prefill plus the small cache yields about one decoded token
+every five seconds. Fused warm graphs cannot materially change that result
+while more than 92% of routed expert accesses miss the device cache.
+
 ## Practical Lucebox placement
 
 The machine has about 125.08 GiB of system/UMA memory plus 31.86 GiB on the
@@ -176,23 +204,20 @@ upload path measured below Strix.
 After approximately 57.94 GiB of non-routed weights plus OS, workspace, and a
 moderate context reserve, roughly 70-85 GiB may remain for routed experts.
 Under a uniform balanced-routing assumption this covers about 14-17% of the
-routed pool. At the measured 3.804 GiB/s, the storage-only ceiling is then
-approximately 0.50-0.51 token/s. Full Strix-only inference will be lower
-because dense/recurrent work shares the same device; a later R9700 split may
-recover part of that gap through overlap.
+routed pool. The earlier routed-core storage ceiling was 0.50-0.51 token/s,
+but full Strix-only inference shares the device with dense and recurrent work.
+The full checkpoint measured **0.200 token/s**, or roughly one decoded token
+every five seconds. Real route traces and heterogeneous overlap are required
+to determine how much of that gap is recoverable.
 
-So the honest expectation for this quant is **roughly one token every two to
-three seconds**, not interactive multi-token-per-second generation. Real
-router locality can move that estimate; only a route trace from the real model
-can establish it.
-
-## Next full-model milestone
+## Next optimization milestone
 
 The implementation no longer needs another generic cache, a second Kimi
-router, or per-layer worker creation. Full-scale qualification requires:
+router, per-layer worker creation, or a first full-scale smoke test. The next
+work is:
 
-1. Stage all 14 IQ1_S shards and run a short token-for-token comparison against
-   the upstream Kimi implementation.
+1. Compare a longer deterministic sample token-for-token against the upstream
+   Kimi implementation.
 2. Record real `(layer, expert)` routes on a calibration prompt suite and let
    the existing placement planner allocate the measured best cache under the
    chosen context budget.

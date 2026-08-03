@@ -104,6 +104,23 @@ class KimiDeploymentBenchmarkTests(unittest.TestCase):
         self.assertEqual(rows[0]["active_io_gib_s"], 3.75)
         self.assertEqual(rows[0]["errors"], 0)
 
+    def test_telemetry_parser_tolerates_new_and_reordered_fields(self):
+        line = (
+            "[moe-nvme] io=io_uring+direct launches=107638 requests=87143 "
+            "payload=261.811 GiB cache-hit=7.5% device-cache=33444.1 MiB "
+            "slots=5436 pinned=0 hits=65354 misses=43574 evictions=38138 "
+            "fused-decode-launches=86 fused-decode-experts=1376 future-counter=7\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "server.log"
+            log.write_text(line)
+            rows = extract_nvme_telemetry(log)
+        self.assertEqual(rows[0]["io"], "io_uring+direct")
+        self.assertEqual(rows[0]["device_hits"], 65354)
+        self.assertEqual(rows[0]["pinned"], 0)
+        self.assertEqual(rows[0]["fused_decode_launches"], 86)
+        self.assertEqual(rows[0]["future_counter"], 7)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -28,17 +28,20 @@ from typing import Any
 
 
 _SPLIT_GGUF = re.compile(r"^(?P<prefix>.+)-(?P<index>\d+)-of-(?P<total>\d+)(?P<suffix>\.gguf)$")
-_NVME_TELEMETRY = re.compile(
-    r"\[moe-nvme\] io=(?P<io>\S+) requests=(?P<requests>\d+) reads=(?P<reads>\d+) "
-    r"payload=(?P<payload_gib>[\d.]+) GiB physical=(?P<physical_gib>[\d.]+) GiB "
-    r"active-io-rate=(?P<active_io_gib_s>[\d.]+) GiB/s cache-hit=(?P<cache_hit_pct>[\d.]+)% "
-    r"mean-demand-wait=(?P<mean_demand_wait_ms>[\d.]+) ms .*?timeouts=(?P<timeouts>\d+) "
-    r"errors=(?P<errors>\d+) device-cache=(?P<device_cache_mib>[\d.]+) MiB "
-    r"slots=(?P<slots>\d+) hits=(?P<device_hits>\d+) misses=(?P<device_misses>\d+) "
-    r"evictions=(?P<device_evictions>\d+) graphs=(?P<graphs>\d+) "
-    r"graph-hits=(?P<graph_hits>\d+) graph-evictions=(?P<graph_evictions>\d+) "
-    r"launches=(?P<launches>\d+)"
+_NVME_KEY_VALUE = re.compile(
+    r"(?<!\S)(?P<key>[a-z][a-z0-9-]*)=(?P<value>\S+)"
 )
+_NVME_RESULT_NAMES = {
+    "payload": "payload_gib",
+    "physical": "physical_gib",
+    "active-io-rate": "active_io_gib_s",
+    "cache-hit": "cache_hit_pct",
+    "mean-demand-wait": "mean_demand_wait_ms",
+    "device-cache": "device_cache_mib",
+    "hits": "device_hits",
+    "misses": "device_misses",
+    "evictions": "device_evictions",
+}
 
 
 @dataclass(frozen=True)
@@ -175,13 +178,26 @@ def extract_nvme_telemetry(log_path: Path) -> list[dict[str, Any]]:
     telemetry: list[dict[str, Any]] = []
     if not log_path.exists():
         return telemetry
-    for match in _NVME_TELEMETRY.finditer(log_path.read_text(errors="replace")):
-        row: dict[str, Any] = {"io": match.group("io")}
-        for key, value in match.groupdict().items():
-            if key == "io":
-                continue
-            row[key] = float(value) if "." in value else int(value)
-        telemetry.append(row)
+    for line in log_path.read_text(errors="replace").splitlines():
+        if not line.startswith("[moe-nvme] "):
+            continue
+        row: dict[str, Any] = {}
+        for match in _NVME_KEY_VALUE.finditer(line):
+            raw_key = match.group("key")
+            key = _NVME_RESULT_NAMES.get(raw_key, raw_key.replace("-", "_"))
+            raw_value = match.group("value")
+            numeric_value = raw_value.removesuffix("%")
+            try:
+                value: Any = (
+                    float(numeric_value)
+                    if "." in numeric_value
+                    else int(numeric_value)
+                )
+            except ValueError:
+                value = raw_value
+            row[key] = value
+        if "io" in row:
+            telemetry.append(row)
     return telemetry
 
 
