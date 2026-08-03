@@ -8206,6 +8206,7 @@ struct ggml_tensor * ggml_ds4_moe_owner(
         struct ggml_tensor  * down_w,
         struct ggml_tensor  * expert_ids,
         struct ggml_tensor  * expert_weights,
+        struct ggml_tensor  * owner_residual,
         int64_t               ff_dim,
         float                 swiglu_clamp,
         float                 down_scale) {
@@ -8220,6 +8221,10 @@ struct ggml_tensor * ggml_ds4_moe_owner(
     GGML_ASSERT(down_w->ne[0] == ff_dim);
     GGML_ASSERT(down_w->ne[1] == input->ne[0]);
     GGML_ASSERT(gate_up_w->ne[2] == down_w->ne[2]);
+    GGML_ASSERT(!owner_residual ||
+        (owner_residual->type == GGML_TYPE_F32 &&
+         owner_residual->ne[0] == input->ne[0] &&
+         owner_residual->ne[1] == input->ne[1]));
 
     const int64_t ne[4] = { input->ne[0], input->ne[1], 1, 1 };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 2, ne);
@@ -8230,6 +8235,7 @@ struct ggml_tensor * ggml_ds4_moe_owner(
     result->src[2] = down_w;
     result->src[3] = expert_ids;
     result->src[4] = expert_weights;
+    result->src[5] = owner_residual;
 
     ggml_set_op_params_i32(result, 0, GGML_MOE_FUSED_OWNER);
     ggml_set_op_params_i32(result, 1, (int32_t) ff_dim);
@@ -8247,6 +8253,7 @@ struct ggml_tensor * ggml_ds4_moe_owner_split(
         struct ggml_tensor  * down_w,
         struct ggml_tensor  * expert_ids,
         struct ggml_tensor  * expert_weights,
+        struct ggml_tensor  * owner_residual,
         int64_t               ff_dim,
         float                 swiglu_clamp,
         float                 gate_scale,
@@ -8265,6 +8272,10 @@ struct ggml_tensor * ggml_ds4_moe_owner_split(
     GGML_ASSERT(down_w->ne[1] == input->ne[0]);
     GGML_ASSERT(gate_w->ne[2] == up_w->ne[2]);
     GGML_ASSERT(gate_w->ne[2] == down_w->ne[2]);
+    GGML_ASSERT(!owner_residual ||
+        (owner_residual->type == GGML_TYPE_F32 &&
+         owner_residual->ne[0] == input->ne[0] &&
+         owner_residual->ne[1] == input->ne[1]));
 
     const int64_t ne[4] = { input->ne[0], input->ne[1], 1, 1 };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 2, ne);
@@ -8276,6 +8287,7 @@ struct ggml_tensor * ggml_ds4_moe_owner_split(
     result->src[3] = down_w;
     result->src[4] = expert_ids;
     result->src[5] = expert_weights;
+    result->src[6] = owner_residual;
 
     ggml_set_op_params_i32(result, 0, GGML_MOE_FUSED_OWNER_SPLIT);
     ggml_set_op_params_i32(result, 1, (int32_t) ff_dim);

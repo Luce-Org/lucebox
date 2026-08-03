@@ -45,6 +45,10 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `GGML_DS4_FA_SERIAL_INDEX_SCAN` | unset | DEBUG/A-B: restore the serial indexed-attention mask scan instead of the long-context HIP parallel scan. |
 | `DFLASH_MOE_PREFILL_PERSISTENT_OWNER_ALLOC` | 1 for qualified long heterogeneous prefill | KILL SWITCH: =0 restores per-layer route/owner scratch allocation. |
 | `DFLASH_MOE_TP_*` / `DFLASH_MOE_HYBRID_PREFILL_EAGER` | unset | BURN-IN: model-neutral names for common heterogeneous-MoE scheduling and kernel policy. Existing `DFLASH_DS4_*` names remain compatibility aliases. |
+| `DFLASH_MOE_TP_SHARED_FFN_PEER_FRACTION` | 0 | OPT-IN: aligned shared/dense FFN stage partition (`0`, `(0,1]`, or `auto`). Keep disabled unless exact model-backed qualification wins; see `HETEROGENEOUS_STAGE_PLANNER.md`. |
+| `DFLASH_MOE_TP_MAIN_RATE` / `DFLASH_MOE_TP_PEER_RATE` | 1 / 1 | Calibrated owner rates used by automatic stage partitioning. |
+| `DFLASH_MOE_TP_MAIN_FIXED_WORK` / `DFLASH_MOE_TP_PEER_FIXED_WORK` | 0 / 0 | Concurrent work already assigned to each owner, in the planner's stage-work units. |
+| `DFLASH_MOE_TP_FUSED_OWNER_RESIDUAL` | unset | OPT-IN: merge an owner-local shared/dense contribution into a supported routed-owner reduction without another cross-device value. |
 | `DFLASH_MMID_TELEMETRY` | unset | DEBUG: report MUL_MAT_ID dispatch, MMVQ variant, and per-node graph compatibility. |
 | `DFLASH_KVFLASH` | unset | Prefer the CLI: `--kvflash` (token count or `auto`). |
 | `DFLASH_PREFIX_CACHE_SLOTS` | 32 | Container-entrypoint equivalent of `--prefix-cache-slots`; not read directly by the native binary. |

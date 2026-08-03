@@ -90,6 +90,26 @@ struct MoeHybridLayerStorage {
     ggml_backend_t cold_backend = nullptr; // Alias: either CPU backend or caller-owned GPU/HIP backend.
     MoeHybridColdBackend cold_backend_kind = MoeHybridColdBackend::Cpu;
 
+    // Peer-owned partition of a shared gate/up/down FFN. For a tensor split,
+    // main uses zero-copy prefix views and peer stores a compact tail. For a
+    // whole-stage assignment, main_width is zero and peer stores the complete
+    // tensors. Both lowerings retain one value per routed owner at the join.
+    ggml_tensor * gate_shexp_peer = nullptr;
+    ggml_tensor * up_shexp_peer = nullptr;
+    ggml_tensor * down_shexp_peer = nullptr;
+    int shared_ffn_main_width = 0;
+    int shared_ffn_peer_width = 0;
+
+    bool has_shared_ffn_peer_partition() const {
+        return gate_shexp_peer && up_shexp_peer && down_shexp_peer &&
+               shared_ffn_main_width >= 0 && shared_ffn_peer_width > 0;
+    }
+
+    bool has_shared_ffn_peer_shard() const {
+        return has_shared_ffn_peer_partition() &&
+               shared_ffn_main_width > 0;
+    }
+
     std::vector<int32_t> hot_expert_ids;
     std::vector<int32_t> cold_expert_ids;
     std::vector<int32_t> hot_local_by_global;
@@ -199,6 +219,7 @@ struct MoeHybridStorage {
     MoeHybridColdBackend cold_backend_kind = MoeHybridColdBackend::Cpu;
     bool materialized_hot_experts = true;
     bool materialized_cold_experts = true;
+    float shared_ffn_peer_fraction = 0.0f;
     MoeHybridPlacement placement;
     std::vector<MoeHybridLayerStorage> layers;
 

@@ -429,6 +429,7 @@ add_library(dflash_common STATIC
     src/qwen35moe/qwen35moe_daemon.cpp
     src/qwen35moe/qwen35moe_pipelined_decode.cpp
     # ── Common MoE hybrid infrastructure ──
+    src/common/heterogeneous_stage_planner.cpp
     src/common/moe_hybrid_placement.cpp
     src/common/moe_hybrid_routing_stats.cpp
     src/common/moe_hybrid_storage.cpp

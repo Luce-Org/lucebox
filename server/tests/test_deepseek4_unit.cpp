@@ -3279,6 +3279,88 @@ static void test_hc_post_strided_split_gpu() {
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
+static void test_moe_id_alignment_q5_gpu() {
+    std::fprintf(stderr, "  test_moe_id_alignment_q5_gpu ...");
+    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    if (!backend) {
+        std::fprintf(stderr, " skipped (no GPU backend)\n");
+        return;
+    }
+
+    constexpr int n_routes = 4;
+    constexpr int n_tokens = 5;
+    const std::vector<int32_t> ids = {
+        10, 20, 30, 40,
+        20, 30, 40, 10,
+        30, 40, 10, 20,
+        40, 10, 20, 30,
+        10, 30, 20, 40,
+    };
+
+    ggml_context * ctx = make_test_context(1u << 20);
+    TEST_ASSERT_MSG(ctx != nullptr, "ggml_init failed");
+    if (!ctx) {
+        ggml_backend_free(backend);
+        std::fprintf(stderr, " FAIL\n");
+        return;
+    }
+
+    ggml_tensor * input = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_I32, n_routes, n_tokens);
+    ggml_tensor * aligned = ggml_ds4_moe_align_ids(ctx, input);
+    ggml_set_output(aligned);
+    TEST_ASSERT_MSG(ggml_backend_supports_op(backend, aligned),
+                    "GPU rejected MoE ID alignment");
+
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 16, false);
+    ggml_build_forward_expand(graph, aligned);
+    ggml_gallocr_t alloc = ggml_gallocr_new(
+        ggml_backend_get_default_buffer_type(backend));
+    const bool allocated = ggml_gallocr_alloc_graph(alloc, graph);
+    TEST_ASSERT_MSG(allocated, "MoE ID alignment graph allocation failed");
+    if (allocated) {
+        ggml_backend_tensor_set(
+            input, ids.data(), 0, ids.size() * sizeof(int32_t));
+        const bool computed =
+            ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
+        TEST_ASSERT_MSG(computed, "MoE ID alignment graph compute failed");
+        if (computed) {
+            std::vector<int32_t> actual(ids.size());
+            ggml_backend_tensor_get(
+                aligned, actual.data(), 0, actual.size() * sizeof(int32_t));
+            for (int token = 0; token < n_tokens; ++token) {
+                bool seen_route[n_routes] = {};
+                for (int slot = 0; slot < n_routes; ++slot) {
+                    const uint32_t encoded = (uint32_t)
+                        actual[(size_t) token * n_routes + slot];
+                    const int original_route = (int) ((encoded >> 16) & 0xffu);
+                    const int expert = (int) (encoded & 0xffffu);
+                    TEST_ASSERT_MSG((encoded & 0xff000000u) == 0x5a000000u,
+                                    "aligned expert metadata magic mismatch");
+                    TEST_ASSERT_MSG(original_route >= 0 &&
+                                    original_route < n_routes,
+                                    "aligned original route is out of range");
+                    if (original_route >= 0 && original_route < n_routes) {
+                        TEST_ASSERT_MSG(!seen_route[original_route],
+                                        "alignment did not preserve a route permutation");
+                        seen_route[original_route] = true;
+                        TEST_ASSERT_MSG(
+                            expert == ids[(size_t) token * n_routes + original_route],
+                            "alignment metadata changed the selected expert");
+                    }
+                    TEST_ASSERT_MSG(expert == ids[(size_t) slot],
+                                    "q=5 repeated experts were not slot-aligned");
+                }
+            }
+        }
+    }
+
+    ggml_gallocr_free(alloc);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
 static void test_cpu_hc_sinkhorn_ref(float * out, const float * mix, const float * scale,
                                      const float * base, int n_hc, int iters, float eps) {
     const float pre_scale = scale[0];
@@ -4069,6 +4151,7 @@ int main() {
     test_ds4_topk_block_radix_gpu();
     test_ds4_flash_attention_inverse_rope_fallback_gpu();
     test_hc_post_strided_split_gpu();
+    test_moe_id_alignment_q5_gpu();
     test_hc_pre_kernel_gpu();
     test_layer_range_rejects_stale_hc_boundary();
     test_hc_scratch_per_device();

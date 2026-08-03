@@ -24,6 +24,7 @@ The same mechanism supports GPU+CPU offload on a memory-constrained card and GPU
 | `moe_hybrid_swap_manager.{h,cpp}` | Runtime expert promotion/demotion between requests |
 | `moe_hybrid_storage.{h,cpp}` | Compact owner-local buffers for split expert tensors |
 | `moe_hybrid_ffn_eval.{h,cpp}` | Concurrent owner execution and partial-result joining |
+| `heterogeneous_stage_planner.{h,cpp}` | Model/vendor-neutral aligned stage partitioning and rate balancing |
 | `moe_expert_compute.{h,cpp}` | Backend-neutral selected-expert compute interface |
 | `moe_expert_compute_ipc.cpp` | Second-GPU process transport and architecture adapter registry |
 
@@ -166,6 +167,10 @@ Adding a compatible MoE architecture requires a thin adapter, not another schedu
 5. Let the model backend retain its own attention, KV-cache, and speculative-decoding state. It calls the common owner evaluator only at the routed-FFN boundary.
 
 Hardware policy remains outside this contract: placement budgets, which GPU is primary, peer-copy mode, verification width, and kernel qualification are Lucebox profile choices. A model adapter must not duplicate owner scheduling, storage, peer transport, or join logic.
+
+The common shared/dense-stage partition, its safety constraints, and measured
+qualification history are documented in
+[`HETEROGENEOUS_STAGE_PLANNER.md`](HETEROGENEOUS_STAGE_PLANNER.md).
 
 Common execution switches use the `DFLASH_MOE_*` namespace. The corresponding `DFLASH_DS4_*` names remain accepted as compatibility aliases for existing DeepSeek V4 profiles.
 

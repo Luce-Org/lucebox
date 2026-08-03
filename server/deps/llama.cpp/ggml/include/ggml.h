@@ -2519,7 +2519,8 @@ extern "C" {
 
     // Coarse DeepSeek-V4 routed-owner op. gate_up contains concatenated gate
     // and up output rows; the backend performs fused gate/up MMVQ + clamped
-    // SwiGLU, down MMVQ, route weighting, and local reduction.
+    // SwiGLU, down MMVQ, route weighting, and local reduction. An optional
+    // owner_residual is added in that final reduction without another launch.
     GGML_API struct ggml_tensor * ggml_ds4_moe_owner(
             struct ggml_context * ctx,
             struct ggml_tensor  * input,
@@ -2527,13 +2528,15 @@ extern "C" {
             struct ggml_tensor  * down_w,
             struct ggml_tensor  * expert_ids,
             struct ggml_tensor  * expert_weights,
+            struct ggml_tensor  * owner_residual,
             int64_t               ff_dim,
             float                 swiglu_clamp,
             float                 down_scale);
 
     // Coarse owner variant for checkpoints that store gate and up tensors
     // separately. The backend fuses their MMVQ traversal and SwiGLU while
-    // preserving the checkpoint's three external value scales.
+    // preserving the checkpoint's three external value scales. The optional
+    // owner_residual has the same semantics as in ggml_ds4_moe_owner.
     GGML_API struct ggml_tensor * ggml_ds4_moe_owner_split(
             struct ggml_context * ctx,
             struct ggml_tensor  * input,
@@ -2542,6 +2545,7 @@ extern "C" {
             struct ggml_tensor  * down_w,
             struct ggml_tensor  * expert_ids,
             struct ggml_tensor  * expert_weights,
+            struct ggml_tensor  * owner_residual,
             int64_t               ff_dim,
             float                 swiglu_clamp,
             float                 gate_scale,

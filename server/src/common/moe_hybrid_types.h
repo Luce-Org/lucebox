@@ -38,6 +38,22 @@ struct MoeHybridConfig {
     bool materialize_hot_experts = true;
     bool materialize_cold_experts = true;
 
+    // Optional tensor-parallel shard of the shared FFN intermediate width.
+    // 0 disables it; values in (0,1) request an explicit tensor partition;
+    // 1 assigns the complete stage to peer; a negative value asks the generic
+    // planner to balance from owner rates.
+    // The storage builder also accepts DFLASH_MOE_TP_SHARED_FFN_PEER_FRACTION
+    // (and the legacy DS4 alias), allowing every model adapter that uses the
+    // common hybrid path to opt in without architecture-specific graph code.
+    float shared_ffn_peer_fraction = 0.0f;
+    float heterogeneous_main_rate = 1.0f;
+    float heterogeneous_peer_rate = 1.0f;
+    // Work already assigned to each owner when the splittable stage begins.
+    // Values use the same arbitrary work unit as the stage width; adapters can
+    // therefore account for routed experts or other concurrent dense stages.
+    float heterogeneous_main_fixed_work = 0.0f;
+    float heterogeneous_peer_fixed_work = 0.0f;
+
     // When true, MMQ mul_mat_id works correctly with reduced hot stacks
     // (n_hot < n_expert). Safe on sm_80+ (Ampere/Ada/Hopper/Blackwell).
     // On sm_75 (Turing) and gfx1151, the kernel has illegal memory accesses

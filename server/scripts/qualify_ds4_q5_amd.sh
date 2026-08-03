@@ -37,6 +37,7 @@ RUNS="${RUNS:-3}"
 MAX_TOKENS="${MAX_TOKENS:-128}"
 TARGETS="${TARGETS:-2048 4096 8192 16384 2048}"
 VRAM_MONITOR_SECONDS="${VRAM_MONITOR_SECONDS:-2}"
+SET_PERF_LEVEL="${SET_PERF_LEVEL:-1}"
 HASH_MODELS="${HASH_MODELS:-0}"
 CUDA_GRAPH_STATS_EVERY="${CUDA_GRAPH_STATS_EVERY:-200}"
 CUDA_DISABLE_GRAPHS_DEVICES="${CUDA_DISABLE_GRAPHS_DEVICES:-}"
@@ -44,8 +45,12 @@ DYNAMIC_ROUTE_BALANCE="${DYNAMIC_ROUTE_BALANCE:-0}"
 DYNAMIC_MAIN_SLOTS="${DYNAMIC_MAIN_SLOTS:-3}"
 DYNAMIC_MAIN_SLOTS_X2="${DYNAMIC_MAIN_SLOTS_X2:-}"
 DYNAMIC_MAIN_SLOTS_X4="${DYNAMIC_MAIN_SLOTS_X4:-}"
+SHARED_FFN_PEER_FRACTION="${SHARED_FFN_PEER_FRACTION:-0}"
+FUSED_OWNER_RESIDUAL="${FUSED_OWNER_RESIDUAL:-0}"
+ALIGN_SHARED_IDS="${ALIGN_SHARED_IDS:-0}"
+EXPERT_TOP_K="${EXPERT_TOP_K:-4}"
 VERIFY_WIDTH=$((4 + Q5_VERIFY + 2 * Q6_VERIFY))
-RUN_ID="${RUN_ID:-ds4-q${VERIFY_WIDTH}-fr${FORCE_GRAPH_REPLAY}-direct${DIRECT_INDEXER_TOPK}-radix${BLOCK_RADIX_TOPK}-x4p1${FP4_Q5_X4_PLUS1}-cp${CRITICAL_PATH_PLACEMENT}-r${MAIN_TO_PEER_RATE}-$(date -u +%Y%m%dT%H%M%SZ)}"
+RUN_ID="${RUN_ID:-ds4-q${VERIFY_WIDTH}-fr${FORCE_GRAPH_REPLAY}-direct${DIRECT_INDEXER_TOPK}-radix${BLOCK_RADIX_TOPK}-x4p1${FP4_Q5_X4_PLUS1}-cp${CRITICAL_PATH_PLACEMENT}-r${MAIN_TO_PEER_RATE}-sf${SHARED_FFN_PEER_FRACTION}-or${FUSED_OWNER_RESIDUAL}-ai${ALIGN_SHARED_IDS}-$(date -u +%Y%m%dT%H%M%SZ)}"
 OUT_ROOT="${OUT_ROOT:-$CHECKOUT/results/ds4_q5_context_qualification}"
 OUT_DIR="$OUT_ROOT/$RUN_ID"
 SERVER_LOG="$OUT_DIR/server.log"
@@ -94,18 +99,43 @@ case "$DYNAMIC_ROUTE_BALANCE" in
     0|1) ;;
     *) echo "DYNAMIC_ROUTE_BALANCE must be 0 or 1" >&2; exit 2 ;;
 esac
-case "$DYNAMIC_MAIN_SLOTS" in
-    1|2|3|4|5|6) ;;
-    *) echo "DYNAMIC_MAIN_SLOTS must be an integer from 1 through 6" >&2; exit 2 ;;
+case "$FUSED_OWNER_RESIDUAL" in
+    0|1) ;;
+    *) echo "FUSED_OWNER_RESIDUAL must be 0 or 1" >&2; exit 2 ;;
 esac
-case "$DYNAMIC_MAIN_SLOTS_X2" in
-    ""|2|3|4|5|6|7|8|9|10|11|12) ;;
-    *) echo "DYNAMIC_MAIN_SLOTS_X2 must be empty or an integer from 2 through 12" >&2; exit 2 ;;
+case "$ALIGN_SHARED_IDS" in
+    0|1) ;;
+    *) echo "ALIGN_SHARED_IDS must be 0 or 1" >&2; exit 2 ;;
 esac
-case "$DYNAMIC_MAIN_SLOTS_X4" in
-    ""|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18|19|20|21|22|23|24) ;;
-    *) echo "DYNAMIC_MAIN_SLOTS_X4 must be empty or an integer from 4 through 24" >&2; exit 2 ;;
-esac
+if [[ ! "$EXPERT_TOP_K" =~ ^[1-9][0-9]*$ ]] || ((EXPERT_TOP_K > 16)); then
+    echo "EXPERT_TOP_K must be an integer from 1 through 16" >&2
+    exit 2
+fi
+if [[ ! "$DYNAMIC_MAIN_SLOTS" =~ ^[1-9][0-9]*$ ]] ||
+   ((DYNAMIC_MAIN_SLOTS > EXPERT_TOP_K)); then
+    echo "DYNAMIC_MAIN_SLOTS must be an integer from 1 through EXPERT_TOP_K ($EXPERT_TOP_K)" >&2
+    exit 2
+fi
+if [[ -n "$DYNAMIC_MAIN_SLOTS_X2" ]] &&
+   { [[ ! "$DYNAMIC_MAIN_SLOTS_X2" =~ ^[1-9][0-9]*$ ]] ||
+     ((DYNAMIC_MAIN_SLOTS_X2 < 2 || DYNAMIC_MAIN_SLOTS_X2 > 2 * EXPERT_TOP_K)); }; then
+    echo "DYNAMIC_MAIN_SLOTS_X2 must be empty or an integer from 2 through $((2 * EXPERT_TOP_K))" >&2
+    exit 2
+fi
+if [[ -n "$DYNAMIC_MAIN_SLOTS_X4" ]] &&
+   { [[ ! "$DYNAMIC_MAIN_SLOTS_X4" =~ ^[1-9][0-9]*$ ]] ||
+     ((DYNAMIC_MAIN_SLOTS_X4 < 4 || DYNAMIC_MAIN_SLOTS_X4 > 4 * EXPERT_TOP_K)); }; then
+    echo "DYNAMIC_MAIN_SLOTS_X4 must be empty or an integer from 4 through $((4 * EXPERT_TOP_K))" >&2
+    exit 2
+fi
+if [[ "$SHARED_FFN_PEER_FRACTION" != 0 &&
+      "$SHARED_FFN_PEER_FRACTION" != auto ]] &&
+   { [[ ! "$SHARED_FFN_PEER_FRACTION" =~ ^(0[.][0-9]+|1([.]0+)?)$ ]] ||
+     ! awk -v value="$SHARED_FFN_PEER_FRACTION" \
+         'BEGIN { exit !(value > 0 && value <= 1) }'; }; then
+    echo "SHARED_FFN_PEER_FRACTION must be 0, auto, or a value in (0,1]" >&2
+    exit 2
+fi
 case "$FP4_Q5_X4_PLUS1" in
     auto|0|1) ;;
     *) echo "FP4_Q5_X4_PLUS1 must be auto, 0, or 1" >&2; exit 2 ;;
@@ -135,6 +165,10 @@ case "$HASH_MODELS" in
     0|1) ;;
     *) echo "HASH_MODELS must be 0 or 1" >&2; exit 2 ;;
 esac
+case "$SET_PERF_LEVEL" in
+    0|1) ;;
+    *) echo "SET_PERF_LEVEL must be 0 or 1" >&2; exit 2 ;;
+esac
 
 if pgrep -f "dflash_server .*--port ${PORT}([[:space:]]|$)" >/dev/null; then
     echo "benchmark port $PORT is already owned by another dflash_server" >&2
@@ -157,8 +191,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-rocm-smi -d 0 --setperflevel auto >/dev/null 2>&1 || true
-rocm-smi -d 1 --setperflevel high >/dev/null 2>&1 || true
+if [[ "$SET_PERF_LEVEL" == 1 ]]; then
+    rocm-smi -d 0 --setperflevel auto >/dev/null 2>&1 || true
+    rocm-smi -d 1 --setperflevel high >/dev/null 2>&1 || true
+fi
 printf '0\n' >/tmp/ds4_awidth
 rm -f /tmp/ds4_spec_q
 
@@ -227,19 +263,31 @@ if [[ -n "$DECODE_HOTNESS_CSV" ]]; then
 fi
 if [[ "$DYNAMIC_ROUTE_BALANCE" == 1 ]]; then
     server_env+=(
-        "DFLASH_DS4_TP_DYNAMIC_ROUTE_BALANCE=1"
-        "DFLASH_DS4_TP_DYNAMIC_MAIN_SLOTS=$DYNAMIC_MAIN_SLOTS"
+        "DFLASH_MOE_TP_DYNAMIC_ROUTE_BALANCE=1"
+        "DFLASH_MOE_TP_DYNAMIC_MAIN_SLOTS=$DYNAMIC_MAIN_SLOTS"
     )
     if [[ -n "$DYNAMIC_MAIN_SLOTS_X2" ]]; then
         server_env+=(
-            "DFLASH_DS4_TP_DYNAMIC_MAIN_SLOTS_X2=$DYNAMIC_MAIN_SLOTS_X2"
+            "DFLASH_MOE_TP_DYNAMIC_MAIN_SLOTS_X2=$DYNAMIC_MAIN_SLOTS_X2"
         )
     fi
     if [[ -n "$DYNAMIC_MAIN_SLOTS_X4" ]]; then
         server_env+=(
-            "DFLASH_DS4_TP_DYNAMIC_MAIN_SLOTS_X4=$DYNAMIC_MAIN_SLOTS_X4"
+            "DFLASH_MOE_TP_DYNAMIC_MAIN_SLOTS_X4=$DYNAMIC_MAIN_SLOTS_X4"
         )
     fi
+fi
+if [[ "$SHARED_FFN_PEER_FRACTION" != 0 ]]; then
+    server_env+=(
+        "DFLASH_MOE_TP_SHARED_FFN_PEER_FRACTION=$SHARED_FFN_PEER_FRACTION"
+        "DFLASH_MOE_TP_MAIN_TO_PEER_RATE=$MAIN_TO_PEER_RATE"
+    )
+fi
+if [[ "$FUSED_OWNER_RESIDUAL" == 1 ]]; then
+    server_env+=("DFLASH_MOE_TP_FUSED_OWNER_RESIDUAL=1")
+fi
+if [[ "$ALIGN_SHARED_IDS" == 1 ]]; then
+    server_env+=("DFLASH_CUDA_MMVQ_MOE_ALIGN_SHARED_IDS=1")
 fi
 if [[ -n "$CUDA_DISABLE_GRAPHS_DEVICES" ]]; then
     server_env+=(
@@ -304,7 +352,7 @@ server_args=(
     --hard-limit-reply-budget 0
     --chunk 2048
     --ds4-fused-decode
-    --ds4-expert-top-k 4
+    --ds4-expert-top-k "$EXPERT_TOP_K"
     --ds4-prefill sparse
     --peer-access
 )
@@ -330,6 +378,10 @@ server_args=(
     echo "dynamic_main_slots=$DYNAMIC_MAIN_SLOTS"
     echo "dynamic_main_slots_x2=$DYNAMIC_MAIN_SLOTS_X2"
     echo "dynamic_main_slots_x4=$DYNAMIC_MAIN_SLOTS_X4"
+    echo "shared_ffn_peer_fraction=$SHARED_FFN_PEER_FRACTION"
+    echo "fused_owner_residual=$FUSED_OWNER_RESIDUAL"
+    echo "align_shared_ids=$ALIGN_SHARED_IDS"
+    echo "expert_top_k=$EXPERT_TOP_K"
     echo "cache_slots=$CACHE_SLOTS"
     echo "mmvq_max_ncols=$MMVQ_MAX_NCOLS"
     echo "targets=$TARGETS"

@@ -1,11 +1,13 @@
 #include "moe_hybrid_storage.h"
 #include "moe_hybrid_types.h"
+#include "heterogeneous_stage_planner.h"
 
 #include "ggml-cpu.h"
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -146,6 +148,223 @@ static ggml_tensor * new_like_with_expert_count(ggml_context * ctx, ggml_tensor 
     return ggml_new_tensor(ctx, src->type, 4, ne);
 }
 
+struct SharedFfnSplitPolicy {
+    double peer_fraction = 0.0;
+    double main_rate = 1.0;
+    double peer_rate = 1.0;
+    double main_fixed_work = 0.0;
+    double peer_fixed_work = 0.0;
+};
+
+static const char * first_nonempty_env(
+        const char * primary, const char * legacy = nullptr) {
+    const char * raw = std::getenv(primary);
+    if (raw && *raw) return raw;
+    raw = legacy ? std::getenv(legacy) : nullptr;
+    return raw && *raw ? raw : nullptr;
+}
+
+static bool parse_positive_double(const char * raw, double & value) {
+    if (!raw || !*raw) return false;
+    char * end = nullptr;
+    const double parsed = std::strtod(raw, &end);
+    if (end == raw || *end != '\0' || !std::isfinite(parsed) || parsed <= 0.0) {
+        return false;
+    }
+    value = parsed;
+    return true;
+}
+
+static bool parse_nonnegative_double(const char * raw, double & value) {
+    if (!raw || !*raw) return false;
+    char * end = nullptr;
+    const double parsed = std::strtod(raw, &end);
+    if (end == raw || *end != '\0' || !std::isfinite(parsed) || parsed < 0.0) {
+        return false;
+    }
+    value = parsed;
+    return true;
+}
+
+static SharedFfnSplitPolicy resolve_shared_ffn_split_policy(
+        const MoeHybridConfig & cfg) {
+    SharedFfnSplitPolicy policy;
+    policy.peer_fraction = cfg.shared_ffn_peer_fraction;
+    policy.main_rate = cfg.heterogeneous_main_rate > 0.0f
+        ? cfg.heterogeneous_main_rate : 1.0;
+    policy.peer_rate = cfg.heterogeneous_peer_rate > 0.0f
+        ? cfg.heterogeneous_peer_rate : 1.0;
+    policy.main_fixed_work = std::max(
+        0.0, (double) cfg.heterogeneous_main_fixed_work);
+    policy.peer_fixed_work = std::max(
+        0.0, (double) cfg.heterogeneous_peer_fixed_work);
+
+    if (const char * raw = first_nonempty_env(
+            "DFLASH_MOE_TP_SHARED_FFN_PEER_FRACTION",
+            "DFLASH_DS4_TP_SHARED_FFN_PEER_FRACTION")) {
+        if (std::strcmp(raw, "auto") == 0 ||
+            std::strcmp(raw, "AUTO") == 0) {
+            policy.peer_fraction = -1.0;
+        } else {
+            char * end = nullptr;
+            const double parsed = std::strtod(raw, &end);
+            if (end == raw || *end != '\0' || !std::isfinite(parsed) ||
+                parsed <= 0.0 || parsed > 1.0) {
+                std::fprintf(stderr,
+                    "[hybrid-storage] ignoring invalid shared-FFN peer "
+                    "fraction '%s' (expected auto or a value in (0,1])\n",
+                    raw);
+                policy.peer_fraction = 0.0;
+            } else {
+                policy.peer_fraction = parsed;
+            }
+        }
+    }
+
+    double rate = 0.0;
+    if (parse_positive_double(first_nonempty_env(
+            "DFLASH_MOE_TP_MAIN_RATE", "DFLASH_DS4_TP_MAIN_RATE"), rate)) {
+        policy.main_rate = rate;
+    } else if (parse_positive_double(first_nonempty_env(
+            "DFLASH_MOE_TP_MAIN_TO_PEER_RATE",
+            "DFLASH_DS4_TP_MAIN_TO_PEER_RATE"), rate)) {
+        policy.main_rate = rate;
+        policy.peer_rate = 1.0;
+    }
+    if (parse_positive_double(first_nonempty_env(
+            "DFLASH_MOE_TP_PEER_RATE", "DFLASH_DS4_TP_PEER_RATE"), rate)) {
+        policy.peer_rate = rate;
+    }
+    double fixed_work = 0.0;
+    if (parse_nonnegative_double(first_nonempty_env(
+            "DFLASH_MOE_TP_MAIN_FIXED_WORK",
+            "DFLASH_DS4_TP_MAIN_FIXED_WORK"), fixed_work)) {
+        policy.main_fixed_work = fixed_work;
+    }
+    if (parse_nonnegative_double(first_nonempty_env(
+            "DFLASH_MOE_TP_PEER_FIXED_WORK",
+            "DFLASH_DS4_TP_PEER_FIXED_WORK"), fixed_work)) {
+        policy.peer_fixed_work = fixed_work;
+    }
+    return policy;
+}
+
+static HeterogeneousStagePlan plan_shared_ffn_peer_shard(
+        const MoeHybridConfig & cfg,
+        const MoeLayerDesc & desc,
+        const SharedFfnSplitPolicy & policy,
+        bool distinct_gpu_peer) {
+    if (!distinct_gpu_peer || policy.peer_fraction == 0.0 ||
+        !cfg.materialize_cold_experts || desc.ffn_gate_inp_shexp ||
+        !desc.ffn_gate_shexp || !desc.ffn_up_shexp ||
+        !desc.ffn_down_shexp) {
+        return {};
+    }
+
+    const ggml_tensor * gate = desc.ffn_gate_shexp;
+    const ggml_tensor * up = desc.ffn_up_shexp;
+    const ggml_tensor * down = desc.ffn_down_shexp;
+    const int64_t width = gate->ne[1];
+    if (width <= 1 || width > std::numeric_limits<int>::max() ||
+        gate->ne[0] != cfg.n_embd || up->ne[0] != cfg.n_embd ||
+        up->ne[1] != width || down->ne[0] != width ||
+        down->ne[1] != cfg.n_embd ||
+        gate->ne[2] != 1 || gate->ne[3] != 1 ||
+        up->ne[2] != 1 || up->ne[3] != 1 ||
+        down->ne[2] != 1 || down->ne[3] != 1 ||
+        !ggml_is_contiguous(gate) || !ggml_is_contiguous(up) ||
+        !ggml_is_contiguous(down)) {
+        return {};
+    }
+
+    const int alignment = std::max(1, (int) ggml_blck_size(down->type));
+    HeterogeneousStagePlan plan = policy.peer_fraction < 0.0
+        ? plan_balanced_heterogeneous_stage_width(
+            (int) width, alignment, policy.main_rate, policy.peer_rate,
+            policy.main_fixed_work, policy.peer_fixed_work)
+        : plan_heterogeneous_stage_width(
+            (int) width, alignment, policy.peer_fraction);
+    if (!plan.uses_peer() ||
+        gate->nb[1] != ggml_row_size(gate->type, gate->ne[0]) ||
+        up->nb[1] != ggml_row_size(up->type, up->ne[0]) ||
+        down->nb[1] != ggml_row_size(down->type, down->ne[0])) {
+        return {};
+    }
+    return plan;
+}
+
+static void create_shared_ffn_peer_shard(
+        ggml_context * ctx,
+        const MoeLayerDesc & desc,
+        const HeterogeneousStagePlan & plan,
+        MoeHybridLayerStorage & dst,
+        int layer) {
+    if (!ctx || !plan.uses_peer()) return;
+    dst.gate_shexp_peer = ggml_new_tensor_2d(
+        ctx, desc.ffn_gate_shexp->type,
+        desc.ffn_gate_shexp->ne[0], plan.peer_width);
+    dst.up_shexp_peer = ggml_new_tensor_2d(
+        ctx, desc.ffn_up_shexp->type,
+        desc.ffn_up_shexp->ne[0], plan.peer_width);
+    dst.down_shexp_peer = ggml_new_tensor_2d(
+        ctx, desc.ffn_down_shexp->type,
+        plan.peer_width, desc.ffn_down_shexp->ne[1]);
+    dst.shared_ffn_main_width = plan.main_width;
+    dst.shared_ffn_peer_width = plan.peer_width;
+    ggml_format_name(dst.gate_shexp_peer, "blk.%d.ffn_gate_shexp.peer", layer);
+    ggml_format_name(dst.up_shexp_peer, "blk.%d.ffn_up_shexp.peer", layer);
+    ggml_format_name(dst.down_shexp_peer, "blk.%d.ffn_down_shexp.peer", layer);
+}
+
+static bool copy_shared_ffn_peer_shard(
+        const MoeLayerDesc & desc,
+        MoeHybridLayerStorage & dst,
+        std::vector<uint8_t> & staging,
+        std::string * err) {
+    if (!dst.has_shared_ffn_peer_partition()) return true;
+
+    auto copy_tail_rows = [&](ggml_tensor * source, ggml_tensor * destination,
+                              const char * label) {
+        const size_t offset =
+            (size_t) dst.shared_ffn_main_width * source->nb[1];
+        const size_t bytes = ggml_nbytes(destination);
+        if (offset > ggml_nbytes(source) || bytes > ggml_nbytes(source) - offset) {
+            if (err) *err = std::string("shared-FFN ") + label +
+                " tail is outside the source tensor";
+            return false;
+        }
+        staging.resize(bytes);
+        ggml_backend_tensor_get(source, staging.data(), offset, bytes);
+        ggml_backend_tensor_set(destination, staging.data(), 0, bytes);
+        return true;
+    };
+    if (!copy_tail_rows(
+            desc.ffn_gate_shexp, dst.gate_shexp_peer, "gate") ||
+        !copy_tail_rows(
+            desc.ffn_up_shexp, dst.up_shexp_peer, "up")) {
+        return false;
+    }
+
+    const size_t main_row_bytes = ggml_row_size(
+        desc.ffn_down_shexp->type, dst.shared_ffn_main_width);
+    const size_t peer_row_bytes = ggml_row_size(
+        desc.ffn_down_shexp->type, dst.shared_ffn_peer_width);
+    const size_t destination_bytes = ggml_nbytes(dst.down_shexp_peer);
+    if (main_row_bytes + peer_row_bytes != desc.ffn_down_shexp->nb[1] ||
+        peer_row_bytes != dst.down_shexp_peer->nb[1]) {
+        if (err) *err = "shared-FFN down-projection row packing mismatch";
+        return false;
+    }
+    staging.resize(destination_bytes);
+    ggml_backend_tensor_get_2d(
+        desc.ffn_down_shexp, staging.data(), main_row_bytes,
+        peer_row_bytes, (size_t) desc.ffn_down_shexp->ne[1],
+        desc.ffn_down_shexp->nb[1], dst.down_shexp_peer->nb[1]);
+    ggml_backend_tensor_set(
+        dst.down_shexp_peer, staging.data(), 0, destination_bytes);
+    return true;
+}
+
 } // namespace
 
 MoeHybridStorage::~MoeHybridStorage() {
@@ -196,6 +415,11 @@ MoeHybridStorage::~MoeHybridStorage() {
         layer.up_cold = nullptr;
         layer.down_cold = nullptr;
         layer.gate_up_cold = nullptr;
+        layer.gate_shexp_peer = nullptr;
+        layer.up_shexp_peer = nullptr;
+        layer.down_shexp_peer = nullptr;
+        layer.shared_ffn_main_width = 0;
+        layer.shared_ffn_peer_width = 0;
     }
     if (cpu_backend) {
         ggml_backend_free(cpu_backend);
@@ -260,6 +484,11 @@ bool build_moe_hybrid_storage(const MoeHybridConfig & cfg,
         if (err) *err = "failed to select cold expert backend";
         return false;
     }
+    const SharedFfnSplitPolicy shared_policy =
+        resolve_shared_ffn_split_policy(cfg);
+    out.shared_ffn_peer_fraction = (float) shared_policy.peer_fraction;
+    int shared_split_layers = 0;
+    size_t shared_split_bytes = 0;
     const bool duplicate_hot_on_cold =
         out.cold_backend_kind == MoeHybridColdBackend::Gpu &&
         duplicate_hot_experts_on_cold_gpu();
@@ -318,6 +547,11 @@ bool build_moe_hybrid_storage(const MoeHybridConfig & cfg,
 
         const int cold_count = (int)dst.cold_expert_ids.size();
         const int hot_count = (int)dst.hot_expert_ids.size();
+        const HeterogeneousStagePlan shared_plan =
+            plan_shared_ffn_peer_shard(
+                cfg, desc, shared_policy,
+                out.cold_backend_kind == MoeHybridColdBackend::Gpu &&
+                out.cold_backend != gpu_backend);
 
         // Allocate hot expert tensors on GPU
         if (hot_count > 0 && cfg.materialize_hot_experts) {
@@ -371,9 +605,10 @@ bool build_moe_hybrid_storage(const MoeHybridConfig & cfg,
         }
 
         // Allocate cold expert tensors on the selected cold backend.
-        if (cold_count > 0 && cfg.materialize_cold_experts) {
+        if ((cold_count > 0 || shared_plan.uses_peer()) &&
+            cfg.materialize_cold_experts) {
             ggml_init_params ip{};
-            ip.mem_size   = 16 * ggml_tensor_overhead();
+            ip.mem_size   = 24 * ggml_tensor_overhead();
             ip.mem_buffer = nullptr;
             ip.no_alloc   = true;
             dst.cold_ctx = ggml_init(ip);
@@ -389,12 +624,9 @@ bool build_moe_hybrid_storage(const MoeHybridConfig & cfg,
                 dst.up_cold   = new_like_with_expert_count(dst.cold_ctx, desc.ffn_up_exps, cold_count);
                 dst.down_cold = new_like_with_expert_count(dst.cold_ctx, desc.ffn_down_exps, cold_count);
             }
+            create_shared_ffn_peer_shard(
+                dst.cold_ctx, desc, shared_plan, dst, il);
             dst.cold_buf = ggml_backend_alloc_ctx_tensors(dst.cold_ctx, out.cold_backend);
-
-
-
-
-
             if (!dst.cold_buf) {
                 if (err) {
                     *err = (out.cold_backend_kind == MoeHybridColdBackend::Gpu)
@@ -403,9 +635,11 @@ bool build_moe_hybrid_storage(const MoeHybridConfig & cfg,
                 }
                 return false;
             }
+            ggml_backend_buffer_set_usage(
+                dst.cold_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
             std::vector<uint8_t> cold_bytes;
-            if (dst.fused_gate_up) {
+            if (cold_count > 0 && dst.fused_gate_up) {
                 if (!read_expert_slices(gpu_backend, desc.ffn_gate_up_exps, dst.cold_expert_ids,
                                         dst.gate_up_expert_bytes, cold_bytes, err))
                     return false;
@@ -414,7 +648,7 @@ bool build_moe_hybrid_storage(const MoeHybridConfig & cfg,
                                         dst.down_expert_bytes, cold_bytes, err))
                     return false;
                 ggml_backend_tensor_set(dst.down_cold, cold_bytes.data(), 0, cold_bytes.size());
-            } else {
+            } else if (cold_count > 0) {
                 if (!read_expert_slices(gpu_backend, desc.ffn_gate_exps, dst.cold_expert_ids,
                                         dst.gate_expert_bytes, cold_bytes, err))
                     return false;
@@ -428,7 +662,31 @@ bool build_moe_hybrid_storage(const MoeHybridConfig & cfg,
                     return false;
                 ggml_backend_tensor_set(dst.down_cold, cold_bytes.data(), 0, cold_bytes.size());
             }
+            if (!copy_shared_ffn_peer_shard(desc, dst, cold_bytes, err)) {
+                return false;
+            }
+            if (dst.has_shared_ffn_peer_partition()) {
+                ++shared_split_layers;
+                shared_split_bytes += ggml_nbytes(dst.gate_shexp_peer) +
+                    ggml_nbytes(dst.up_shexp_peer) +
+                    ggml_nbytes(dst.down_shexp_peer);
+            }
         }
+    }
+
+    if (shared_split_layers > 0) {
+        const auto split_it = std::find_if(
+            out.layers.begin(), out.layers.end(),
+            [](const MoeHybridLayerStorage & layer) {
+                return layer.has_shared_ffn_peer_partition();
+            });
+        std::fprintf(stderr,
+            "[hybrid-storage] shared-FFN partition: layers=%d "
+            "main=%d peer=%d peer_weights=%.1f MiB\n",
+            shared_split_layers,
+            split_it != out.layers.end() ? split_it->shared_ffn_main_width : 0,
+            split_it != out.layers.end() ? split_it->shared_ffn_peer_width : 0,
+            (double) shared_split_bytes / (1024.0 * 1024.0));
     }
 
     return true;
@@ -473,6 +731,11 @@ bool build_moe_hybrid_storage_from_file(
         if (err) *err = "failed to select cold expert backend";
         return false;
     }
+    const SharedFfnSplitPolicy shared_policy =
+        resolve_shared_ffn_split_policy(cfg);
+    out.shared_ffn_peer_fraction = (float) shared_policy.peer_fraction;
+    int shared_split_layers = 0;
+    size_t shared_split_bytes = 0;
     const bool duplicate_hot_on_cold =
         out.cold_backend_kind == MoeHybridColdBackend::Gpu && allocate_cold &&
         duplicate_hot_experts_on_cold_gpu();
@@ -534,6 +797,12 @@ bool build_moe_hybrid_storage_from_file(
 
         const int hot_count = (int)dst.hot_expert_ids.size();
         const int cold_count = (int)dst.cold_expert_ids.size();
+        const HeterogeneousStagePlan shared_plan =
+            plan_shared_ffn_peer_shard(
+                cfg, desc, shared_policy,
+                allocate_cold &&
+                out.cold_backend_kind == MoeHybridColdBackend::Gpu &&
+                out.cold_backend != gpu_backend);
         const int spare = (cold_count > 0 && cache_slots > 0)
                           ? std::min(cache_slots, cold_count) : 0;
         const int hot_alloc = hot_count + spare;
@@ -597,9 +866,10 @@ bool build_moe_hybrid_storage_from_file(
         }
 
         // Allocate cold expert tensors on the selected cold backend.
-        if (allocate_cold && cold_count > 0 && cfg.materialize_cold_experts) {
+        if (allocate_cold && (cold_count > 0 || shared_plan.uses_peer()) &&
+            cfg.materialize_cold_experts) {
             ggml_init_params ip{};
-            ip.mem_size   = 16 * ggml_tensor_overhead();
+            ip.mem_size   = 24 * ggml_tensor_overhead();
             ip.mem_buffer = nullptr;
             ip.no_alloc   = true;
             dst.cold_ctx = ggml_init(ip);
@@ -615,6 +885,8 @@ bool build_moe_hybrid_storage_from_file(
                 dst.up_cold   = new_like_with_expert_count(dst.cold_ctx, desc.ffn_up_exps, cold_count);
                 dst.down_cold = new_like_with_expert_count(dst.cold_ctx, desc.ffn_down_exps, cold_count);
             }
+            create_shared_ffn_peer_shard(
+                dst.cold_ctx, desc, shared_plan, dst, il);
             dst.cold_buf = ggml_backend_alloc_ctx_tensors(dst.cold_ctx, out.cold_backend);
             if (!dst.cold_buf) {
                 if (err) {
@@ -624,9 +896,11 @@ bool build_moe_hybrid_storage_from_file(
                 }
                 return false;
             }
+            ggml_backend_buffer_set_usage(
+                dst.cold_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
             std::vector<uint8_t> slice_buf;
-            if (dst.fused_gate_up) {
+            if (cold_count > 0 && dst.fused_gate_up) {
                 if (!read_expert_slices_from_mem(fd.gate_up_exps.data, fd.gate_up_exps.size,
                                                  dst.cold_expert_ids, dst.gate_up_expert_bytes, slice_buf, err))
                     return false;
@@ -635,7 +909,7 @@ bool build_moe_hybrid_storage_from_file(
                                                  dst.cold_expert_ids, dst.down_expert_bytes, slice_buf, err))
                     return false;
                 ggml_backend_tensor_set(dst.down_cold, slice_buf.data(), 0, slice_buf.size());
-            } else {
+            } else if (cold_count > 0) {
                 if (!read_expert_slices_from_mem(fd.gate_exps.data, fd.gate_exps.size,
                                                  dst.cold_expert_ids, dst.gate_expert_bytes, slice_buf, err))
                     return false;
@@ -649,7 +923,31 @@ bool build_moe_hybrid_storage_from_file(
                     return false;
                 ggml_backend_tensor_set(dst.down_cold, slice_buf.data(), 0, slice_buf.size());
             }
+            if (!copy_shared_ffn_peer_shard(desc, dst, slice_buf, err)) {
+                return false;
+            }
+            if (dst.has_shared_ffn_peer_partition()) {
+                ++shared_split_layers;
+                shared_split_bytes += ggml_nbytes(dst.gate_shexp_peer) +
+                    ggml_nbytes(dst.up_shexp_peer) +
+                    ggml_nbytes(dst.down_shexp_peer);
+            }
         }
+    }
+
+    if (shared_split_layers > 0) {
+        const auto split_it = std::find_if(
+            out.layers.begin(), out.layers.end(),
+            [](const MoeHybridLayerStorage & layer) {
+                return layer.has_shared_ffn_peer_partition();
+            });
+        std::fprintf(stderr,
+            "[hybrid-storage] shared-FFN partition: layers=%d "
+            "main=%d peer=%d peer_weights=%.1f MiB\n",
+            shared_split_layers,
+            split_it != out.layers.end() ? split_it->shared_ffn_main_width : 0,
+            split_it != out.layers.end() ? split_it->shared_ffn_peer_width : 0,
+            (double) shared_split_bytes / (1024.0 * 1024.0));
     }
 
     return true;

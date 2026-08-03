@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <future>
+#include <mutex>
 
 namespace dflash::common {
 
@@ -129,13 +130,21 @@ const MoeHybridGraphPolicy & moe_hybrid_graph_policy() {
     return policy;
 }
 
-static int dynamic_route_balance_main_slots_x4() {
-    static const int slots_x4 = [] {
+// Merge an owner-local dense/shared contribution in the routed owner's
+// existing final reduction. Unsupported kernels retain an ordinary local add.
+static bool fused_owner_residual_enabled() {
+    return moe_policy_flag(
+        "DFLASH_MOE_TP_FUSED_OWNER_RESIDUAL",
+        "DFLASH_DS4_TP_FUSED_OWNER_RESIDUAL");
+}
+
+static int dynamic_route_balance_main_slots_x4(int n_used) {
+    static const long requested_x4 = [] {
         const char * enabled = moe_policy_env(
             "DFLASH_MOE_TP_DYNAMIC_ROUTE_BALANCE",
             "DFLASH_DS4_TP_DYNAMIC_ROUTE_BALANCE");
         if (!enabled || !*enabled || std::strcmp(enabled, "0") == 0) {
-            return 0;
+            return 0L;
         }
         const char * raw_slots_x4 = moe_policy_env(
             "DFLASH_MOE_TP_DYNAMIC_MAIN_SLOTS_X4",
@@ -146,24 +155,39 @@ static int dynamic_route_balance_main_slots_x4() {
         const char * raw_slots = moe_policy_env(
             "DFLASH_MOE_TP_DYNAMIC_MAIN_SLOTS",
             "DFLASH_DS4_TP_DYNAMIC_MAIN_SLOTS");
-        const long requested_x4 = raw_slots_x4 && *raw_slots_x4
-            ? std::strtol(raw_slots_x4, nullptr, 10)
-            : 2 * (raw_slots_x2 && *raw_slots_x2
-                ? std::strtol(raw_slots_x2, nullptr, 10)
-                : 2 * (raw_slots && *raw_slots
-                    ? std::strtol(raw_slots, nullptr, 10) : 3));
-        if (requested_x4 < 4 || requested_x4 > 24) {
-            std::fprintf(stderr,
-                "[moe-hybrid] dynamic route balance disabled: "
-                "four times the main slot quota must be in [4,24]\n");
-            return 0;
+        const char * raw = raw_slots;
+        long scale = 4L;
+        if (raw_slots_x4 && *raw_slots_x4) {
+            raw = raw_slots_x4;
+            scale = 1L;
+        } else if (raw_slots_x2 && *raw_slots_x2) {
+            raw = raw_slots_x2;
+            scale = 2L;
         }
+        if (!raw || !*raw) return 12L;
+        char * end = nullptr;
+        const long value = std::strtol(raw, &end, 10);
+        return end && end != raw && *end == '\0' && value > 0
+            ? scale * value : -1L;
+    }();
+    if (requested_x4 == 0) return 0;
+    if (n_used <= 0 || requested_x4 < 4 || requested_x4 > 4L * n_used) {
+        static std::once_flag invalid_log;
+        std::call_once(invalid_log, [n_used] {
+            std::fprintf(stderr,
+                "[moe-hybrid] invalid dynamic route balance: four times the "
+                "main slot quota must be in [4,%d] for top-k=%d\n",
+                4 * std::max(0, n_used), n_used);
+        });
+        return -1;
+    }
+    static std::once_flag active_log;
+    std::call_once(active_log, [] {
         std::fprintf(stderr,
             "[moe-hybrid] dynamic route balance active: main_slots=%.2f\n",
             0.25 * (double) requested_x4);
-        return (int) requested_x4;
-    }();
-    return slots_x4;
+    });
+    return (int) requested_x4;
 }
 
 static void add_hybrid_telemetry(MoeHybridFfnTelemetry & dst,
@@ -237,16 +261,28 @@ static MoeExpertComputeIpcMode parse_moe_expert_compute_ipc_mode() {
 // Returns the output tensor (or nullptr if no shared expert is present).
 static ggml_tensor * build_shared_expert_subgraph(
         ggml_context * ctx, const MoeLayerDesc & desc, ggml_tensor * inp,
-        float swiglu_clamp = 0.0f) {
+        float swiglu_clamp = 0.0f,
+        std::vector<ggml_tensor *> * backend_nodes = nullptr) {
     if (!desc.ffn_up_shexp || !desc.ffn_gate_shexp || !desc.ffn_down_shexp)
         return nullptr;
-    ggml_tensor * sh_gate = apply_scale2(ctx,
-        ggml_mul_mat(ctx, desc.ffn_gate_shexp, inp), desc.ffn_gate_shexp_s);
-    ggml_tensor * sh_up = apply_scale2(ctx,
-        ggml_mul_mat(ctx, desc.ffn_up_shexp, inp), desc.ffn_up_shexp_s);
-    ggml_tensor * sh_gu = swiglu_maybe_clamped(ctx, sh_gate, sh_up, swiglu_clamp);
-    ggml_tensor * shared = apply_scale2(ctx,
-        ggml_mul_mat(ctx, desc.ffn_down_shexp, sh_gu), desc.ffn_down_shexp_s);
+    const auto track = [backend_nodes](ggml_tensor * tensor) {
+        if (tensor && backend_nodes) backend_nodes->push_back(tensor);
+        return tensor;
+    };
+    ggml_tensor * sh_gate = track(ggml_mul_mat(
+        ctx, desc.ffn_gate_shexp, inp));
+    sh_gate = track(apply_scale2(
+        ctx, sh_gate, desc.ffn_gate_shexp_s));
+    ggml_tensor * sh_up = track(ggml_mul_mat(
+        ctx, desc.ffn_up_shexp, inp));
+    sh_up = track(apply_scale2(
+        ctx, sh_up, desc.ffn_up_shexp_s));
+    ggml_tensor * sh_gu = track(
+        swiglu_maybe_clamped(ctx, sh_gate, sh_up, swiglu_clamp));
+    ggml_tensor * shared = track(ggml_mul_mat(
+        ctx, desc.ffn_down_shexp, sh_gu));
+    shared = track(apply_scale2(
+        ctx, shared, desc.ffn_down_shexp_s));
     if (desc.ffn_gate_inp_shexp) {
         // The shared-expert gate is a single-row weight (M=1): out[0,n] = sum_k W[k]*inp[k,n].
         // Computing it as ggml_mul_mat routes to cublas, and on the shipped CUDA 12.0
@@ -256,13 +292,52 @@ static ggml_tensor * build_shared_expert_subgraph(
         // the stream and surfaces as an illegal access in the next op. Compute the gate as
         // broadcast elementwise-mul + sum_rows instead: identical math, ggml kernels only,
         // no cublas. This is what unblocks single-pass full-batch verify.
-        ggml_tensor * gate_prod = ggml_mul(ctx, inp, desc.ffn_gate_inp_shexp);
-        ggml_tensor * shared_gate = apply_scale2(ctx,
-            ggml_sum_rows(ctx, gate_prod), desc.ffn_gate_inp_shexp_s);
-        shared_gate = ggml_sigmoid(ctx, shared_gate);
-        shared = ggml_mul(ctx, shared, shared_gate);
+        ggml_tensor * gate_prod = track(
+            ggml_mul(ctx, inp, desc.ffn_gate_inp_shexp));
+        ggml_tensor * shared_gate = track(ggml_sum_rows(ctx, gate_prod));
+        shared_gate = track(apply_scale2(
+            ctx, shared_gate, desc.ffn_gate_inp_shexp_s));
+        shared_gate = track(ggml_sigmoid(ctx, shared_gate));
+        shared = track(ggml_mul(ctx, shared, shared_gate));
     }
     return shared;
+}
+
+static MoeLayerDesc make_shared_ffn_main_shard(
+        ggml_context * ctx,
+        const MoeLayerDesc & desc,
+        const MoeHybridLayerStorage & storage) {
+    MoeLayerDesc shard;
+    const int64_t width = storage.shared_ffn_main_width;
+    shard.ffn_gate_shexp = ggml_view_2d(
+        ctx, desc.ffn_gate_shexp,
+        desc.ffn_gate_shexp->ne[0], width,
+        desc.ffn_gate_shexp->nb[1], 0);
+    shard.ffn_up_shexp = ggml_view_2d(
+        ctx, desc.ffn_up_shexp,
+        desc.ffn_up_shexp->ne[0], width,
+        desc.ffn_up_shexp->nb[1], 0);
+    shard.ffn_down_shexp = ggml_view_2d(
+        ctx, desc.ffn_down_shexp,
+        width, desc.ffn_down_shexp->ne[1],
+        desc.ffn_down_shexp->nb[1], 0);
+    shard.ffn_gate_shexp_s = desc.ffn_gate_shexp_s;
+    shard.ffn_up_shexp_s = desc.ffn_up_shexp_s;
+    shard.ffn_down_shexp_s = desc.ffn_down_shexp_s;
+    return shard;
+}
+
+static MoeLayerDesc make_shared_ffn_peer_shard(
+        const MoeLayerDesc & desc,
+        const MoeHybridLayerStorage & storage) {
+    MoeLayerDesc shard;
+    shard.ffn_gate_shexp = storage.gate_shexp_peer;
+    shard.ffn_up_shexp = storage.up_shexp_peer;
+    shard.ffn_down_shexp = storage.down_shexp_peer;
+    shard.ffn_gate_shexp_s = desc.ffn_gate_shexp_s;
+    shard.ffn_up_shexp_s = desc.ffn_up_shexp_s;
+    shard.ffn_down_shexp_s = desc.ffn_down_shexp_s;
+    return shard;
 }
 
 static int fixed_slot_graphs_mode() {
@@ -614,7 +689,8 @@ static bool build_batched_routed_graph(
     std::vector<ggml_tensor *> * backend_nodes = nullptr,
     bool allow_fused_combine = false,
     bool force_fused_combine = false,
-    bool defer_route_reduction = false)
+    bool defer_route_reduction = false,
+    ggml_tensor * owner_residual = nullptr)
 {
     const auto track = [&](ggml_tensor * t) -> ggml_tensor * {
         if (backend_nodes && t) backend_nodes->push_back(t);
@@ -629,6 +705,12 @@ static bool build_batched_routed_graph(
                 ctx, sel, n_used, 1, sel->nb[1], (size_t) t * sel->nb[1]));
             ggml_tensor * wts_col = ggml_cont(ctx, ggml_view_2d(
                 ctx, wts, n_used, 1, wts->nb[1], (size_t) t * wts->nb[1]));
+            ggml_tensor * residual_col = owner_residual
+                ? track(ggml_cont(ctx, ggml_view_2d(
+                    ctx, owner_residual, n_embd, 1,
+                    owner_residual->nb[1],
+                    (size_t) t * owner_residual->nb[1])))
+                : nullptr;
             ggml_tensor * routed_col = nullptr;
             if (!build_batched_routed_graph(
                     ctx, gate_tensor, up_tensor, down_tensor, gate_up_tensor,
@@ -637,7 +719,7 @@ static bool build_batched_routed_graph(
                     n_embd, n_ff_exp, n_used, 1, swiglu_clamp,
                     &routed_col, false, backend_nodes,
                     allow_fused_combine, force_fused_combine,
-                    defer_route_reduction)) {
+                    defer_route_reduction, residual_col)) {
                 return false;
             }
             // Reduced owner outputs concatenate by token columns. Canonical
@@ -682,6 +764,7 @@ static bool build_batched_routed_graph(
     if (coarse_split_requested && coarse_split_eligible) {
         *out_routed = track(ggml_ds4_moe_owner_split(
             ctx, inp, gate_tensor, up_tensor, down_tensor, sel, wts,
+            owner_residual,
             n_ff_exp, swiglu_clamp,
             gate_scale, up_scale, down_scale));
         return *out_routed != nullptr;
@@ -693,6 +776,7 @@ static bool build_batched_routed_graph(
         down_tensor->type == GGML_TYPE_Q3_0_ROCMFPX) {
         *out_routed = track(ggml_ds4_moe_owner(
             ctx, inp, gate_up_tensor, down_tensor, sel, wts,
+            owner_residual,
             n_ff_exp, swiglu_clamp, down_scale));
         return *out_routed != nullptr;
     } else if (gate_up_tensor &&
@@ -743,6 +827,9 @@ static bool build_batched_routed_graph(
     if (!defer_route_reduction && allow_fused_combine &&
         (force_fused_combine || moe_hybrid_graph_policy().fused_combine)) {
         *out_routed = track(ggml_laguna_moe_combine(ctx, experts, wts));
+        if (owner_residual) {
+            *out_routed = track(ggml_add(ctx, *out_routed, owner_residual));
+        }
         return *out_routed != nullptr;
     }
 
@@ -761,6 +848,9 @@ static bool build_batched_routed_graph(
         ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 1, n_tokens));
     ggml_tensor * moe_sum = track(ggml_repeat_back(ctx, experts, sum_shape));
     *out_routed = track(ggml_reshape_2d(ctx, moe_sum, n_embd, n_tokens));
+    if (owner_residual) {
+        *out_routed = track(ggml_add(ctx, *out_routed, owner_residual));
+    }
     return true;
 }
 
@@ -892,6 +982,7 @@ static bool build_moe_owner_branch(
         int n_tokens,
         bool canonical_route_join,
         bool allow_fused_combine,
+        ggml_tensor * owner_residual,
         MoeOwnerGraphSpec & owner) {
     if (!owner.available()) {
         return true;
@@ -910,7 +1001,8 @@ static bool build_moe_owner_branch(
         cfg.n_embd, cfg.n_ff_exp, cfg.n_expert_used, n_tokens,
         cfg.swiglu_clamp, &owner.output, tokenwise,
         owner.branch_nodes, allow_fused_combine,
-        /*force_fused_combine=*/false, canonical_route_join);
+        /*force_fused_combine=*/false, canonical_route_join,
+        owner_residual);
 }
 
 static ggml_tensor * build_moe_owner_join(
@@ -1056,10 +1148,9 @@ bool build_moe_hybrid_ffn_graph(
     const bool canonical_route_join =
         join_mode == MoeHybridJoinMode::CanonicalRouteOrder;
     const int n_used = cfg.n_expert_used;
-    const int dynamic_main_slots_x4 = dynamic_route_balance_main_slots_x4();
-    if (dynamic_main_slots_x4 > 4 * n_used) {
-        return false;
-    }
+    const int dynamic_main_slots_x4 =
+        dynamic_route_balance_main_slots_x4(n_used);
+    if (dynamic_main_slots_x4 < 0) return false;
     // Both owner remaps consume the same normalized top-k route weights.
     // Expose the canonical tensor so the scheduler can keep it on the primary
     // backend rather than discovering it late through the secondary branch.
@@ -1089,18 +1180,70 @@ bool build_moe_hybrid_ffn_graph(
     }
     align_moe_owner_routes(ctx, n_tokens, primary_owner);
     align_moe_owner_routes(ctx, n_tokens, secondary_owner);
+
+    // Shared/dense FFNs can be width-partitioned only when each owner reduces
+    // its routes locally. Canonical cross-runtime joins retain the established
+    // full shared stage on the primary backend to preserve route-order math.
+    ggml_tensor * shared_main = nullptr;
+    ggml_tensor * shared_peer = nullptr;
+    if (!canonical_route_join && include_shared &&
+        storage.has_shared_ffn_peer_partition()) {
+        const MoeLayerDesc peer_shard =
+            make_shared_ffn_peer_shard(desc, storage);
+        if (storage.shared_ffn_main_width > 0) {
+            const MoeLayerDesc main_shard =
+                make_shared_ffn_main_shard(ctx, desc, storage);
+            shared_main = build_shared_expert_subgraph(
+                ctx, main_shard, inp, cfg.swiglu_clamp, &out.hot_nodes);
+        }
+        shared_peer = build_shared_expert_subgraph(
+            ctx, peer_shard, inp, cfg.swiglu_clamp, &out.cold_nodes);
+        if ((storage.shared_ffn_main_width > 0 && !shared_main) ||
+            !shared_peer) {
+            return false;
+        }
+    } else if (!canonical_route_join && include_shared) {
+        shared_main = build_shared_expert_subgraph(
+            ctx, desc, inp, cfg.swiglu_clamp, &out.hot_nodes);
+        if (!shared_main) return false;
+    }
+
+    const bool fuse_owner_residual =
+        !canonical_route_join && fused_owner_residual_enabled();
+    const bool main_shared_consumed =
+        fuse_owner_residual && shared_main && primary_owner.available();
+    const bool peer_shared_consumed =
+        fuse_owner_residual && shared_peer && secondary_owner.available();
     if (!build_moe_owner_branch(
             ctx, cfg, desc, inp, n_tokens, canonical_route_join,
-            allow_fused_combine, primary_owner) ||
+            allow_fused_combine,
+            main_shared_consumed ? shared_main : nullptr,
+            primary_owner) ||
         !build_moe_owner_branch(
             ctx, cfg, desc, inp, n_tokens, canonical_route_join,
-            allow_fused_combine, secondary_owner)) {
+            allow_fused_combine,
+            peer_shared_consumed ? shared_peer : nullptr,
+            secondary_owner)) {
         return false;
+    }
+
+    if (!main_shared_consumed && shared_main) {
+        primary_owner.output = primary_owner.output
+            ? ggml_add(ctx, primary_owner.output, shared_main)
+            : shared_main;
+        out.hot_nodes.push_back(primary_owner.output);
+    }
+    if (!peer_shared_consumed && shared_peer) {
+        secondary_owner.output = secondary_owner.output
+            ? ggml_add(ctx, secondary_owner.output, shared_peer)
+            : shared_peer;
+        out.cold_nodes.push_back(secondary_owner.output);
     }
 
     ggml_tensor * combined = build_moe_owner_join(
         ctx, schedule_graph, cfg, desc, inp, global_ids, router_weights,
-        n_tokens, include_shared, canonical_route_join,
+        n_tokens, canonical_route_join && include_shared,
+        canonical_route_join,
         primary_owner.output, secondary_owner.output, out);
     if (!combined) return false;
 

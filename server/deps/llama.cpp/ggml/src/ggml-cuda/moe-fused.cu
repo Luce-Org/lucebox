@@ -265,6 +265,7 @@ static __global__ void moe_fused_kernel(
 static __global__ void laguna_moe_combine_kernel(
     const char * __restrict__ experts,
     const char * __restrict__ weights,
+    const char * __restrict__ owner_residual,
     char * __restrict__ output,
     const int n_embd,
     const int n_used,
@@ -274,6 +275,8 @@ static __global__ void laguna_moe_combine_kernel(
     const size_t experts_nb2,
     const size_t weights_nb0,
     const size_t weights_nb1,
+    const size_t residual_nb0,
+    const size_t residual_nb1,
     const size_t output_nb0,
     const size_t output_nb1,
     const float value_scale) {
@@ -304,6 +307,12 @@ static __global__ void laguna_moe_combine_kernel(
         const float prod = __fmul_rn(scaled, w);
         sum = (e == 0) ? prod : __fadd_rn(sum, prod);
     }
+    if (owner_residual != nullptr) {
+        const float residual = *(const float *)(owner_residual +
+            (size_t)h * residual_nb0 +
+            (size_t)t * residual_nb1);
+        sum = __fadd_rn(sum, residual);
+    }
     *(float *)(output +
         (size_t)h * output_nb0 +
         (size_t)t * output_nb1) = sum;
@@ -323,8 +332,10 @@ static __global__ void ds4_peer_copy_f32_kernel(
 // of every valid output encode the original route slot; invalid entries use
 // the sign bit plus the original slot.  The dedicated MoE MMVQ kernel decodes
 // this metadata and scatters its result back to the original route layout.
-// A single thread is deliberate: this is at most a 4 x 6 assignment problem
-// and runs once per owner/layer, outside the weight-streaming kernels.
+// A single thread is deliberate: practical speculative MoE batches are tiny,
+// and this runs once per owner/layer outside the weight-streaming kernels. The
+// bounded fast path covers common top-k and speculative widths; larger shapes
+// retain the original route order and exact scatter metadata.
 static __global__ void ds4_align_moe_ids_kernel(
         const int32_t * __restrict__ ids,
         int32_t * __restrict__ aligned,
@@ -336,8 +347,8 @@ static __global__ void ds4_align_moe_ids_kernel(
         return;
     }
 
-    constexpr int max_routes = 6;
-    constexpr int max_tokens = 4;
+    constexpr int max_routes = 16;
+    constexpr int max_tokens = 16;
     if (n_routes > max_routes || n_tokens > max_tokens) {
         for (int t = 0; t < n_tokens; ++t) {
             for (int r = 0; r < n_routes; ++r) {
@@ -505,6 +516,7 @@ static void ggml_cuda_op_ds4_moe_owner(
     const ggml_tensor * down_w     = dst->src[2];  // [n_ff, n_embd, n_expert]
     const ggml_tensor * expert_ids = dst->src[3];  // [n_used, n_tokens]
     const ggml_tensor * weights    = dst->src[4];  // [n_used, n_tokens]
+    const ggml_tensor * residual   = dst->src[5];  // optional [n_embd, n_tokens]
 
     const int n_embd   = (int) input->ne[0];
     const int n_tokens = (int) input->ne[1];
@@ -520,6 +532,9 @@ static void ggml_cuda_op_ds4_moe_owner(
     GGML_ASSERT(expert_ids->ne[1] == n_tokens);
     GGML_ASSERT(weights->ne[0] == n_used && weights->ne[1] == n_tokens);
     GGML_ASSERT(dst->ne[0] == n_embd && dst->ne[1] == n_tokens);
+    GGML_ASSERT(!residual ||
+        (residual->type == GGML_TYPE_F32 &&
+         residual->ne[0] == n_embd && residual->ne[1] == n_tokens));
 
     // The checkpoint concatenates gate rows followed by up rows inside each
     // expert. Keep the original expert stride while viewing each half.
@@ -567,10 +582,13 @@ static void ggml_cuda_op_ds4_moe_owner(
     laguna_moe_combine_kernel<<<grid, block, 0, ctx.stream()>>>(
         (const char *) experts.data,
         (const char *) weights->data,
+        residual ? (const char *) residual->data : nullptr,
         (char *) dst->data,
         n_embd, n_used, n_tokens,
         experts.nb[0], experts.nb[1], experts.nb[2],
         weights->nb[0], weights->nb[1],
+        residual ? residual->nb[0] : 0,
+        residual ? residual->nb[1] : 0,
         dst->nb[0], dst->nb[1],
         down_scale);
 }
@@ -584,6 +602,7 @@ static void ggml_cuda_op_ds4_moe_owner_split(
     const ggml_tensor * down_w     = dst->src[3];  // [n_ff, n_embd, n_expert]
     const ggml_tensor * expert_ids = dst->src[4];  // [n_used, n_tokens]
     const ggml_tensor * weights    = dst->src[5];  // [n_used, n_tokens]
+    const ggml_tensor * residual   = dst->src[6];  // optional [n_embd, n_tokens]
 
     const int n_embd   = (int) input->ne[0];
     const int n_tokens = (int) input->ne[1];
@@ -600,6 +619,9 @@ static void ggml_cuda_op_ds4_moe_owner_split(
     GGML_ASSERT(expert_ids->ne[1] == n_tokens);
     GGML_ASSERT(weights->ne[0] == n_used && weights->ne[1] == n_tokens);
     GGML_ASSERT(dst->ne[0] == n_embd && dst->ne[1] == n_tokens);
+    GGML_ASSERT(!residual ||
+        (residual->type == GGML_TYPE_F32 &&
+         residual->ne[0] == n_embd && residual->ne[1] == n_tokens));
 
     // MUL_MAT_ID consumes token columns in dimension 2. This descriptor is
     // stack-local, so it deliberately does not participate in q8 memoization.
@@ -640,10 +662,13 @@ static void ggml_cuda_op_ds4_moe_owner_split(
     laguna_moe_combine_kernel<<<grid, block, 0, ctx.stream()>>>(
         (const char *) experts.data,
         (const char *) weights->data,
+        residual ? (const char *) residual->data : nullptr,
         (char *) dst->data,
         n_embd, n_used, n_tokens,
         experts.nb[0], experts.nb[1], experts.nb[2],
         weights->nb[0], weights->nb[1],
+        residual ? residual->nb[0] : 0,
+        residual ? residual->nb[1] : 0,
         dst->nb[0], dst->nb[1],
         down_scale);
 }
@@ -751,10 +776,12 @@ void ggml_cuda_op_moe_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         laguna_moe_combine_kernel<<<grid, block, 0, ctx.stream()>>>(
             (const char *) experts->data,
             (const char *) weights->data,
+            nullptr,
             (char *) dst->data,
             n_embd, n_used, n_tokens,
             experts->nb[0], experts->nb[1], experts->nb[2],
             weights->nb[0], weights->nb[1],
+            0, 0,
             dst->nb[0], dst->nb[1],
             1.0f);
         return;
