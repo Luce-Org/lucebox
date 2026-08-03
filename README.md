@@ -92,7 +92,7 @@ Reference target: **RTX 3090 (Ampere sm_86)** — all headline numbers. Other NV
 | <img src="assets/gpus/5090.png" width="750" /> | Blackwell `sm_120` | RTX 5090 | CUDA 12.8 | ✅ 205 tok/s, 4.84× | [↗](server/RESULTS.md#rtx-5090-blackwell-sm_120sm_120a-32-gb) |
 | <img src="assets/gpus/gb10.png" width="750" /> | Blackwell `sm_121` | DGX Spark / GB10 | CUDA 12.9 | ✅ megakernel NVFP4 | [↗](optimizations/megakernel/RESULTS.md#nvidia-dgx-spark-gb10-sm_121a) |
 | <img src="assets/gpus/2080ti.png" width="750" /> | Turing `sm_75` | RTX 2080 Ti | CUDA 12.0 | ✅ 53 tok/s DFlash | [↗](server/RESULTS.md#rtx-2080-ti-turing-sm_75-22-gb) |
-| <img src="assets/gpus/4090.png" width="750" /> | Ada `sm_89` | RTX 40xx | CUDA 12.0 | 🟡 community WSL2 bench | [↗](server/RESULTS.md#rtx-4090-ada-sm_89-24-gb--wsl2-community) |
+| <img src="assets/gpus/4090.png" width="750" /> | Ada `sm_89` | RTX 40xx | CUDA 12.0 | 🟡 community Linux + WSL2 benches | [Linux](server/RESULTS.md#rtx-4090-ada-sm_89-24-gb--cachyos-bare-metal-community) · [WSL2](server/RESULTS.md#rtx-4090-ada-sm_89-24-gb--wsl2-community) |
 | — | Blackwell `sm_110` | Jetson AGX Thor | CUDA 13.0 | 🟡 builds, unbenched | — |
 | <img src="assets/gpus/v100.png" width="750" /> | Volta `sm_70` / Pascal `sm_61` | V100, P40 | CUDA 12.0 | 🟡 fallback paths, unbenched | — |
 | <img src="assets/gpus/ryze395.png" width="750" /> | RDNA3.5 `gfx1151` | Ryzen AI MAX+ 395 / Strix Halo | ROCm 6+ | ✅ 37 tok/s HIP | [↗](server/README.md#amd-hip-backend-strix-halo-rx-7900-xtx) |
@@ -380,7 +380,8 @@ Pages the attention KV cache through a fixed pool of GPU slots; cold 64-token ch
 | `--draft-device <dev>` | same as target | Draft backend; mixed backend needs `--draft-ipc-bin` |
 | `--target-gpu N` | `0` | Target GPU index |
 | `--draft-gpu N` | same as target | Draft GPU index; offload draft to a second GPU |
-| `--target-devices <list>` / `--target-layer-split` | single GPU | Layer-split target across GPUs |
+| `--target-devices <list>` / `--target-layer-split` | single GPU | Select target GPUs and optional layer-split weights |
+| `--target-split-mode {layer,tensor}` | `layer` | Multi-GPU strategy; tensor mode currently supports dense Qwen3.5/3.6 on local CUDA GPUs |
 | `--target-split-fast-rollback` | off | Qwen35 local layer-split only: enable exact F32 per-token checkpoints and skip accepted-token replay. Adds checkpoint VRAM (~1.65 GiB for the measured Qwen3.6-27B q=16 split). |
 | `DFLASH_SPLIT_FAST_ROLLBACK=1` | off | Environment equivalent of `--target-split-fast-rollback`. |
 | `--draft-ipc-bin <path>` | — | Out-of-process draft binary (mixed CUDA/HIP) |
@@ -390,6 +391,22 @@ Pages the attention KV cache through a fixed pool of GPU slots; cold 64-token ch
 | `DFLASH_TARGET_GPU=N` | `0` | Env var equivalent of `--target-gpu` |
 | `DFLASH_DRAFT_GPU=N` | same as target | Env var equivalent of `--draft-gpu` |
 | `DFLASH_MODEL_NAME=<name>` | `dflash` | Env var equivalent of `--model-name`; sets the `/v1/models` id and selects the matching `share/model_cards/<name>.json` |
+
+Tensor parallelism uses NCCL collectives between the selected devices and does
+not include other visible GPUs in its communicator. For example, this runs the
+Qwen3.6 target on GPU 1 and GPU 2 while leaving GPU 0 available:
+
+```bash
+dflash_server model.gguf \
+  --target-devices cuda:1,cuda:2 \
+  --target-split-mode tensor
+```
+
+Tensor mode requires at least two homogeneous local CUDA devices. It currently
+rejects weighted layer placement, target-shard IPC, and prefill compression.
+The token embedding stays on the host and the LM head is mirrored because the
+server performs argmax inside the target graph; transformer attention, FFN,
+DeltaNet weights, and runtime state are split across the selected GPUs.
 
 **MoE expert offload (Spark)**
 

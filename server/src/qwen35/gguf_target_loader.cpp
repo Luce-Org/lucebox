@@ -627,6 +627,72 @@ bool load_target_gguf_partial(const std::string & path,
         alloc_total += ggml_backend_buft_get_alloc_size(buft, t);
         allocs.push_back(a);
     }
+
+    // The generic meta buffer allocator must see all tensors together so it
+    // can allocate each device from its actual slices. The legacy loader's
+    // monolithic backing buffer would reserve alloc_total on every rank.
+    if (!plan.metadata_only && ggml_backend_buft_is_meta(buft)) {
+        ggml_init_params tip{};
+        tip.mem_size = (allocs.size() + 32) * ggml_tensor_overhead();
+        tip.mem_buffer = nullptr;
+        tip.no_alloc = true;
+        ggml_context * tp_ctx = ggml_init(tip);
+        if (!tp_ctx) {
+            set_last_error("target TP allocation context init failed");
+            gguf_free(gctx);
+            return false;
+        }
+
+        for (TargetTensorAlloc & a : allocs) {
+            ggml_tensor * clone = ggml_dup_tensor(tp_ctx, a.tensor);
+            ggml_set_name(clone, a.tensor->name);
+            a.tensor = clone;
+        }
+
+        auto remap = [&](ggml_tensor *& tensor) {
+            if (tensor) tensor = ggml_get_tensor(tp_ctx, tensor->name);
+        };
+        remap(out.out_norm);
+        remap(out.output);
+        for (TargetLayer & layer : out.layers) {
+            remap(layer.attn_norm);
+            remap(layer.attn_post_norm);
+            remap(layer.ffn_norm);
+            remap(layer.w_gate);
+            remap(layer.w_up);
+            remap(layer.w_down);
+            remap(layer.wq);
+            remap(layer.wk);
+            remap(layer.wv);
+            remap(layer.wo);
+            remap(layer.q_norm);
+            remap(layer.k_norm);
+            remap(layer.wqkv);
+            remap(layer.wqkv_gate);
+            remap(layer.ssm_conv1d);
+            remap(layer.ssm_beta);
+            remap(layer.ssm_alpha);
+            remap(layer.ssm_a);
+            remap(layer.ssm_dt_bias);
+            remap(layer.ssm_norm);
+            remap(layer.ssm_out);
+            remap(layer.ffn_gate_inp);
+            remap(layer.ffn_gate_exps);
+            remap(layer.ffn_up_exps);
+            remap(layer.ffn_down_exps);
+            remap(layer.ffn_gate_up_exps);
+            remap(layer.ffn_gate_inp_shexp);
+            remap(layer.ffn_gate_shexp);
+            remap(layer.ffn_up_shexp);
+            remap(layer.ffn_down_shexp);
+        }
+
+        ggml_free(meta_ctx);
+        meta_ctx = tp_ctx;
+        out.ctx = tp_ctx;
+        out.tok_embd = nullptr;
+    }
+
     auto release_out_buffer = [&]() {
         if (out.buf) {
             ggml_backend_buffer_free(out.buf);
@@ -639,6 +705,14 @@ bool load_target_gguf_partial(const std::string & path,
         set_last_error("target load plan selected no GPU tensors");
         gguf_free(gctx);
         return false;
+    } else if (ggml_backend_buft_is_meta(buft)) {
+        out.buf = ggml_backend_alloc_ctx_tensors(out.ctx, backend);
+        if (!out.buf) {
+            set_last_error("ggml_backend_alloc_ctx_tensors failed (target TP)");
+            gguf_free(gctx);
+            return false;
+        }
+        ggml_backend_buffer_set_usage(out.buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     } else {
         out.buf = ggml_backend_alloc_buffer(backend, alloc_total);
         if (!out.buf) {
@@ -730,8 +804,6 @@ bool load_target_gguf_partial(const std::string & path,
     ggml_type tok_embd_type = GGML_TYPE_COUNT;
     for (int64_t tid = 0; tid < n_tensors; tid++) {
         const char * tname = gguf_get_tensor_name(gctx, tid);
-        ggml_tensor * t = ggml_get_tensor(meta_ctx, tname);
-        if (!t) continue;
         const size_t rel_off = gguf_get_tensor_offset(gctx, tid);
         const size_t off = data_start + rel_off;
         const size_t sz  = gguf_get_tensor_size(gctx, tid);
@@ -750,6 +822,8 @@ bool load_target_gguf_partial(const std::string & path,
             tok_embd_type = gguf_get_tensor_type(gctx, tid);
             continue;
         }
+        ggml_tensor * t = ggml_get_tensor(meta_ctx, tname);
+        if (!t) continue;
         if (!should_load_target_tensor(tname, plan.layer_begin, plan.layer_end, plan.load_output, plan.skip_expert_tensors)) {
             continue;
         }

@@ -537,7 +537,7 @@ cmake --build build --target test_dflash -j
 
 > **Multi-GPU / distro note.** On a host with more than one AMD GPU, pin the bench to the target with `HIP_VISIBLE_DEVICES`. On distros that link PIE executables by default (e.g. Fedora's system ROCm under `/usr`), add `-DCMAKE_EXE_LINKER_FLAGS=-no-pie` to the `cmake` configure line, and point at the toolchain with `-DCMAKE_HIP_COMPILER_ROCM_ROOT=/usr -DROCM_PATH=/usr` if ROCm lives under `/usr` rather than `/opt/rocm`.
 
-**Drafter recipe for max decode:** target = Qwen3.5-27B Q4_K_M, drafter = same gen quantized to Q8_0 via `server/scripts/quantize_draft_q8.py`. Matching Q8_0 GGUF on the unsloth Qwen3.6 target needs `DFLASH27B_DRAFT_SWA=2048` for sliding-window correctness.
+**Drafter recipe for max decode:** target = Qwen3.5-27B Q4_K_M, drafter = same gen quantized to Q8_0 via `server/scripts/quantize_draft_q8.py`. For the unsloth Qwen3.6 target, pass `--qwen36-swa` when creating the Q8_0 draft so its GGUF embeds the required 2048-token, 4-of-5-layer sliding-window configuration. Older Qwen3.6 drafts without that metadata still need `DFLASH27B_DRAFT_SWA=2048` at runtime.
 
 See also: [`docs/HIP_PERF_PLAN.md`](docs/HIP_PERF_PLAN.md) (perf sweeps), [`docs/MIXED_BACKEND.md`](docs/MIXED_BACKEND.md) (mixed CUDA+HIP runs).
 

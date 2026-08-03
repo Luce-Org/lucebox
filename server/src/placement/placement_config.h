@@ -15,9 +15,32 @@
 
 namespace dflash::common {
 
+enum class TargetSplitMode {
+    Layer,
+    Tensor,
+};
+
+inline const char * target_split_mode_name(TargetSplitMode mode) {
+    return mode == TargetSplitMode::Tensor ? "tensor" : "layer";
+}
+
+inline bool parse_target_split_mode(const std::string & value,
+                                    TargetSplitMode & out) {
+    if (value == "layer") {
+        out = TargetSplitMode::Layer;
+        return true;
+    }
+    if (value == "tensor") {
+        out = TargetSplitMode::Tensor;
+        return true;
+    }
+    return false;
+}
+
 struct DevicePlacement {
     PlacementBackend backend = PlacementBackend::Auto;
     int gpu = 0;                              // primary GPU (single-GPU mode)
+    TargetSplitMode split_mode = TargetSplitMode::Layer;
 
     // Multi-GPU layer-split. Empty = single GPU mode.
     std::vector<PlacementBackend> layer_split_backends; // backend for each shard
@@ -27,7 +50,13 @@ struct DevicePlacement {
     bool peer_access = false;                 // enable CUDA/HIP peer access between GPUs
     int  max_ctx     = 8192;                  // max KV cache context length
 
-    bool is_layer_split() const { return layer_split_gpus.size() > 1; }
+    bool is_multi_device() const { return layer_split_gpus.size() > 1; }
+    bool is_layer_split() const {
+        return is_multi_device() && split_mode == TargetSplitMode::Layer;
+    }
+    bool is_tensor_parallel() const {
+        return is_multi_device() && split_mode == TargetSplitMode::Tensor;
+    }
     bool is_mixed_layer_split() const {
         if (layer_split_backends.size() <= 1) return false;
         const PlacementBackend first = layer_split_backends[0];

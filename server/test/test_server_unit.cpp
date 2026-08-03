@@ -22,6 +22,7 @@
 #include "common/backend_precision.h"
 #include "common/backend_ipc.h"
 #include "common/moe_hybrid_ffn_eval.h"
+#include "common/moe_hybrid_placement.h"
 #include "placement/pflash_placement.h"
 #include "common/io_utils.h"
 #include "placement/placement_config.h"
@@ -1712,6 +1713,57 @@ TEST_CASE(ServerUnitFixture, test_stop_sequence_holdback_extends) {
 // Prefix cache hash tests (model-free)
 // ═══════════════════════════════════════════════════════════════════════
 
+static std::string write_deepseek_marker_tokenizer_fixture() {
+    gguf_context * g = gguf_init_empty();
+    const char * tokens[] = {
+        "x",
+        "<｜begin▁of▁sentence｜>",
+        "<｜end▁of▁sentence｜>",
+        "<｜User｜>",
+        "<｜Assistant｜>",
+    };
+    const uint32_t token_types[] = {1, 3, 3, 3, 3};
+    gguf_set_arr_str(g, "tokenizer.ggml.tokens", tokens,
+                     sizeof(tokens) / sizeof(tokens[0]));
+    gguf_set_arr_data(g, "tokenizer.ggml.token_type", GGUF_TYPE_UINT32,
+                      token_types,
+                      sizeof(token_types) / sizeof(token_types[0]));
+    gguf_set_val_str(g, "tokenizer.ggml.model", "gpt2");
+    gguf_set_val_str(g, "tokenizer.ggml.pre", "qwen35");
+    gguf_set_val_u32(g, "tokenizer.ggml.bos_token_id", 1);
+    gguf_set_val_u32(g, "tokenizer.ggml.eos_token_id", 2);
+
+    const std::string path = "/tmp/dflash_test_deepseek_markers.gguf";
+    gguf_write_to_file(g, path.c_str(), /*only_meta=*/false);
+    gguf_free(g);
+    return path;
+}
+
+TEST_CASE(ServerUnitFixture, test_resolve_deepseek_chat_markers) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    ChatMarkers markers;
+    TEST_ASSERT(resolve_chat_markers(tokenizer, markers));
+    TEST_ASSERT(markers.family == "deepseek");
+    TEST_ASSERT(markers.sys_role_prefix == std::vector<int32_t>({1}));
+    TEST_ASSERT(markers.end_msg_seqs ==
+                std::vector<std::vector<int32_t>>({{2}}));
+    TEST_ASSERT(markers.next_role_starts ==
+                std::vector<std::vector<int32_t>>({{3}, {4}}));
+
+    // Completed assistant turn followed by the next user marker. The reusable
+    // boundary includes that role marker, matching the server's other chat
+    // families and leaving only the new user content for suffix prefill.
+    const std::vector<int32_t> prompt = {
+        1, 100, 3, 101, 4, 102, 2, 3, 103, 4,
+    };
+    TEST_ASSERT(find_all_boundaries(prompt, markers) ==
+                std::vector<int>({8}));
+    unlink(path.c_str());
+}
+
 TEST_CASE(ServerUnitFixture, test_hash_prefix_deterministic) {
     std::vector<int32_t> ids = {100, 200, 300, 400, 500};
     auto h1 = hash_prefix(ids.data(), (int)ids.size());
@@ -2861,6 +2913,10 @@ struct MockBackend : ModelBackend {
     void shutdown() override {}
 };
 
+struct MockMemoryOnlySnapshotBackend : MockBackend {
+    bool snapshot_used(int slot) const override { return slot == 0; }
+};
+
 // ─── MockBackendWithLayout ──────────────────────────────────────────────
 // Extends MockBackend with a real ggml_context so DiskPrefixCache can
 // iterate tensors in compute_layout_id and write a real .dkv file.
@@ -3066,6 +3122,19 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_disabled_when_no_dir) {
     std::vector<int32_t> ids = {1, 2, 3, 4, 5};
     TEST_ASSERT(!cache.lookup(ids, 0));
     TEST_ASSERT(!cache.save(0, ids));
+}
+
+TEST_CASE(ServerUnitFixture, test_disk_cache_disables_memory_only_backend) {
+    MockMemoryOnlySnapshotBackend backend;
+    DiskCacheConfig cfg;
+    cfg.cache_dir = "/tmp/dflash_test_disk_cache_memory_only";
+    DiskPrefixCache cache(cfg, backend);
+    TEST_ASSERT(!cache.disabled());
+
+    // A live in-memory snapshot with no SnapshotRef means this backend cannot
+    // serialize or adopt disk entries. Detect it once and skip later disk work.
+    cache.learn_layout(0);
+    TEST_ASSERT(cache.disabled());
 }
 
 TEST_CASE(ServerUnitFixture, test_disk_cache_init_creates_directory) {
@@ -3653,6 +3722,86 @@ TEST_CASE(ServerUnitFixture, test_moe_hybrid_prefill_hot_sub_batch_limit) {
     TEST_ASSERT(moe_hybrid_prefill_hot_sub_batch_limit() == 4);
 
     dflash_unsetenv("DFLASH_MOE_PREFILL_HOT_SUB_BATCH");
+}
+
+TEST_CASE(ServerUnitFixture, test_moe_hybrid_uma_core_memory_is_saturating) {
+    constexpr size_t gib = (size_t) 1024 * 1024 * 1024;
+    TEST_ASSERT(moe_hybrid_core_bytes_from_memory(
+        "test", 6 * gib, 8 * gib) == 2 * gib);
+    TEST_ASSERT(moe_hybrid_core_bytes_from_memory(
+        "test", 10 * gib, 8 * gib) == 0);
+}
+
+TEST_CASE(ServerUnitFixture, test_moe_hybrid_canonical_rocmfp2_q2_is_tokenwise) {
+    // ROCmFP2's safe q>1 fallback builds one owner graph per token. Canonical
+    // route-order joins must preserve [hidden, route, token] while appending
+    // those token slices; concatenating the route dimension makes the final
+    // owner reduction invalid.
+    dflash_unsetenv("DFLASH_MOE_TP_GROUPED_MMVQ");
+    dflash_unsetenv("DFLASH_DS4_TP_GROUPED_MMVQ");
+
+    ggml_init_params params{};
+    params.mem_size = 16 * 1024 * 1024;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    TEST_ASSERT(ctx != nullptr);
+
+    constexpr int n_embd = 32;
+    constexpr int n_ff = 32;
+    constexpr int n_expert = 4;
+    constexpr int n_used = 2;
+    constexpr int n_tokens = 2;
+
+    MoeHybridConfig cfg;
+    cfg.n_embd = n_embd;
+    cfg.n_ff_exp = n_ff;
+    cfg.n_expert = n_expert;
+    cfg.n_expert_used = n_used;
+
+    MoeHybridLayerStorage storage;
+    storage.gate_hot = ggml_new_tensor_3d(
+        ctx, GGML_TYPE_Q2_0_ROCMFP2, n_embd, n_ff, 2);
+    storage.up_hot = ggml_new_tensor_3d(
+        ctx, GGML_TYPE_Q2_0_ROCMFP2, n_embd, n_ff, 2);
+    storage.down_hot = ggml_new_tensor_3d(
+        ctx, GGML_TYPE_Q3_0_ROCMFPX, n_ff, n_embd, 2);
+    storage.gate_cold = ggml_new_tensor_3d(
+        ctx, GGML_TYPE_Q2_0_ROCMFP2, n_embd, n_ff, 2);
+    storage.up_cold = ggml_new_tensor_3d(
+        ctx, GGML_TYPE_Q2_0_ROCMFP2, n_embd, n_ff, 2);
+    storage.down_cold = ggml_new_tensor_3d(
+        ctx, GGML_TYPE_Q3_0_ROCMFPX, n_ff, n_embd, 2);
+    storage.hot_local_by_global = {0, 1, -1, -1};
+    storage.cold_local_by_global = {-1, -1, 0, 1};
+
+    MoeLayerDesc desc;
+    ggml_tensor * input = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F32, n_embd, n_tokens);
+    ggml_tensor * ids = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_I32, n_used, n_tokens);
+    ggml_tensor * weights = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F32, n_used, n_tokens);
+    MoeHybridGraphInputs out;
+    const bool built = build_moe_hybrid_ffn_graph(
+        ctx, nullptr, cfg, desc, storage, input, ids, weights, n_tokens,
+        out, /*include_shared=*/false, /*allow_fused_combine=*/false,
+        MoeHybridJoinMode::CanonicalRouteOrder);
+    TEST_ASSERT(built);
+    TEST_ASSERT(out.output != nullptr);
+    TEST_ASSERT(out.output->ne[0] == n_embd);
+    TEST_ASSERT(out.output->ne[1] == n_tokens);
+
+    const auto count_mul_mat_id = [](const std::vector<ggml_tensor *> & nodes) {
+        int count = 0;
+        for (const ggml_tensor * node : nodes) {
+            if (node && node->op == GGML_OP_MUL_MAT_ID) ++count;
+        }
+        return count;
+    };
+    TEST_ASSERT(count_mul_mat_id(out.hot_nodes) == 3 * n_tokens);
+    TEST_ASSERT(count_mul_mat_id(out.cold_nodes) == 3 * n_tokens);
+
+    ggml_free(ctx);
 }
 
 // ═══════════════════════════════════════════════════════════════════════

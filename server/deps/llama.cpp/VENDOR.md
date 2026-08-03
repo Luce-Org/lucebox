@@ -8,10 +8,11 @@ This directory contains the ggml-only subset used by Lucebox Hub.
 - Included merged PR: `#35` (`0fe65d9354b7c5da52a7741d2e37ba85f0d0c925`)
 - Included test PR: `#37` (`0699be81480428f01b9b7ac49a09a2d51c77f8df`)
 - Included upstream backport: `llama.cpp #22298` (`9725a313be0528214c4a02fed906ddaf7b3f712e`)
-- Reconstruction: `luce-dflash@6fbe72d67069136bbd370be703e1d4f441b5e942` plus cherry-picked PRs `#35`, `#37`, and upstream `llama.cpp #22298`
+- Included tensor-parallel source PR: `Luce-Org/lucebox-ggml#39` (`a6eb14b8d678c23f111b7acfcfe6b51b2ea95c46`)
+- Reconstruction: `luce-dflash@6fbe72d67069136bbd370be703e1d4f441b5e942` plus cherry-picked PRs `#35`, `#37`, upstream `llama.cpp #22298`, and the GGML delta from `Luce-Org/lucebox-ggml#39`
 - Vendored paths: `LICENSE`, `common/jinja`, `common/log.h`, `common/unicode.*`, `ggml`, `gguf-py`
 
-Open ggml feature PRs are intentionally not included until they are merged, except for explicitly listed hub test PRs.
+Open ggml feature PRs are not included unless they are explicitly listed above as a vendored source.
 
 ## Hub-local heterogeneous execution patches
 

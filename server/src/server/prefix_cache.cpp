@@ -13,6 +13,27 @@ namespace dflash::common {
 // ─── Chat marker resolution ────────────────────────────────────────────
 
 bool resolve_chat_markers(const Tokenizer & tok, ChatMarkers & out) {
+    // DeepSeek V4 uses full-width punctuation in its control tokens. Require
+    // each marker to encode as its exact vocabulary token so an unrelated BPE
+    // tokenizer cannot be misclassified merely because it can spell the text.
+    const auto exact_control_token = [&tok](const char * marker) -> int32_t {
+        const int32_t id = tok.token_to_id(marker);
+        if (id < 0) return -1;
+        const auto encoded = tok.encode(marker);
+        return encoded.size() == 1 && encoded[0] == id ? id : -1;
+    };
+    const int32_t ds_bos = exact_control_token("<｜begin▁of▁sentence｜>");
+    const int32_t ds_eos = exact_control_token("<｜end▁of▁sentence｜>");
+    const int32_t ds_user = exact_control_token("<｜User｜>");
+    const int32_t ds_assistant = exact_control_token("<｜Assistant｜>");
+    if (ds_bos >= 0 && ds_eos >= 0 && ds_user >= 0 && ds_assistant >= 0) {
+        out.family = "deepseek";
+        out.sys_role_prefix = {ds_bos};
+        out.end_msg_seqs = {{ds_eos}};
+        out.next_role_starts = {{ds_user}, {ds_assistant}};
+        return true;
+    }
+
     // Try Qwen family: <|im_end|> and <|im_start|> should be single tokens.
     auto im_end = tok.encode("<|im_end|>");
     auto im_start = tok.encode("<|im_start|>");

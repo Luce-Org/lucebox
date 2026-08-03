@@ -3,7 +3,6 @@
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
-#include "ggml-cuda.h"
 
 #include <algorithm>
 #include <chrono>
@@ -71,6 +70,15 @@ static uint64_t elapsed_us(HybridClock::time_point start, HybridClock::time_poin
     return (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
 }
 
+static bool backend_is_gpu(ggml_backend_t backend) {
+    if (!backend) return false;
+    ggml_backend_dev_t device = ggml_backend_get_device(backend);
+    if (!device) return false;
+    const enum ggml_backend_dev_type type = ggml_backend_dev_type(device);
+    return type == GGML_BACKEND_DEVICE_TYPE_GPU ||
+           type == GGML_BACKEND_DEVICE_TYPE_IGPU;
+}
+
 static bool compact_materialized_experts_enabled() {
     static const bool enabled = [] {
         const char * raw = std::getenv("DFLASH_MOE_COMPACT_MATERIALIZED");
@@ -79,109 +87,46 @@ static bool compact_materialized_experts_enabled() {
     return enabled;
 }
 
-// The legacy ROCmFP2 verifier graph expands a q-token routed FFN into q
-// independent single-token subgraphs.  That was required before the CUDA/HIP
-// backend gained its grouped MUL_MAT_ID MMVQ kernel, but it multiplies graph
-// nodes, scheduler copies, and launches by the verify width.  Keep the old
-// lowering as the default while the grouped path is qualified on each ROCm
-// architecture; opt in with DFLASH_MOE_TP_GROUPED_MMVQ=1. The original DS4
-// variable remains a compatibility alias.
-static bool grouped_mmvq_moe_enabled() {
-    static const bool enabled = [] {
-        const char * raw = moe_policy_env(
+static bool moe_policy_flag(const char * name, const char * legacy_name = nullptr) {
+    const char * raw = moe_policy_env(name, legacy_name);
+    return raw && *raw && std::strcmp(raw, "0") != 0;
+}
+
+const MoeHybridGraphPolicy & moe_hybrid_graph_policy() {
+    static const MoeHybridGraphPolicy policy = [] {
+        MoeHybridGraphPolicy result;
+        result.grouped_mmvq = moe_policy_flag(
             "DFLASH_MOE_TP_GROUPED_MMVQ", "DFLASH_DS4_TP_GROUPED_MMVQ");
-        return raw && *raw && std::strcmp(raw, "0") != 0;
-    }();
-    return enabled;
-}
-
-static bool gpu_i32_repeat_enabled() {
-    static const bool enabled = [] {
-        const char * raw = std::getenv("LUCE_CUDA_I32_REPEAT");
-        return raw && *raw && std::strcmp(raw, "0") != 0;
-    }();
-    return enabled;
-}
-
-// The regular DeepSeek graph already uses ggml_laguna_moe_combine for the
-// route-weighted expert reduction.  Keep the heterogeneous graph A/B-able
-// while replacing its MUL + shape-only REPEAT_BACK sequence with the same
-// exact owner-local kernel.
-static bool fused_moe_combine_enabled() {
-    static const bool enabled = [] {
-        const char * raw = std::getenv("DFLASH_MOE_FUSED_COMBINE");
-        return raw && *raw && std::strcmp(raw, "0") != 0;
-    }();
-    return enabled;
-}
-
-// DeepSeek V4 stores routed gate and up projections as one tensor with the
-// output rows concatenated.  The generic graph computes that full tensor,
-// materializes two contiguous views, clamps both, and only then runs SwiGLU.
-// Present the two weight halves as views instead: the CUDA/HIP graph optimizer
-// can fuse both MUL_MAT_ID operations and DS4 SwiGLU into one MMVQ launch.
-// This is exact when the external gate/up scale is one (the ROCmFP checkpoint
-// used by the heterogeneous path); other scale values retain the old graph.
-static bool fused_gate_up_mmvq_enabled() {
-    static const bool enabled = [] {
-        const char * raw = moe_policy_env(
+        result.fused_combine = moe_policy_flag("DFLASH_MOE_FUSED_COMBINE");
+        result.fused_gate_up = moe_policy_flag(
             "DFLASH_MOE_TP_FUSED_GATE_UP", "DFLASH_DS4_TP_FUSED_GATE_UP");
-        return raw && *raw && std::strcmp(raw, "0") != 0;
-    }();
-    return enabled;
-}
-
-static bool coarse_owner_op_enabled() {
-    static const bool enabled = [] {
-        const char * raw = moe_policy_env(
+        result.coarse_owner = moe_policy_flag(
             "DFLASH_MOE_TP_COARSE_OWNER", "DFLASH_DS4_TP_COARSE_OWNER");
-        return raw && *raw && std::strcmp(raw, "0") != 0;
-    }();
-    return enabled;
-}
+        result.coarse_owner_split = moe_policy_flag(
+            "DFLASH_MOE_TP_COARSE_OWNER_SPLIT",
+            "DFLASH_DS4_TP_COARSE_OWNER_SPLIT");
+        result.device_join = moe_policy_flag(
+            "DFLASH_MOE_TP_DEVICE_JOIN", "DFLASH_DS4_TP_DEVICE_JOIN");
+        result.route_prefork = moe_policy_flag(
+            "DFLASH_MOE_TP_ROUTE_PREFORK", "DFLASH_DS4_TP_ROUTE_PREFORK");
+        result.targeted_join_split = moe_policy_flag(
+            "DFLASH_MOE_TP_TARGETED_JOIN_SPLIT",
+            "DFLASH_DS4_TP_TARGETED_JOIN_SPLIT");
 
-static bool coarse_owner_split_op_enabled() {
-    static const bool enabled = [] {
-        const char * raw = moe_policy_env(
-            "DFLASH_MOE_TP_COARSE_OWNER_SPLIT", "DFLASH_DS4_TP_COARSE_OWNER_SPLIT");
-        return raw && *raw && std::strcmp(raw, "0") != 0;
-    }();
-    return enabled;
-}
-
-static bool align_shared_moe_ids_enabled() {
-    static const bool enabled = [] {
-        const char * raw = std::getenv("DFLASH_CUDA_MMVQ_MOE_ALIGN_SHARED_IDS");
-        const bool requested = raw && *raw && std::strcmp(raw, "0") != 0;
+        const bool align_requested = moe_policy_flag(
+            "DFLASH_CUDA_MMVQ_MOE_ALIGN_SHARED_IDS");
         const char * kernel = std::getenv("DFLASH_CUDA_MMVQ_MOE_KERNEL");
         const bool dedicated_kernel = !kernel || !*kernel ||
             std::strcmp(kernel, "0") != 0;
-        if (requested && !dedicated_kernel) {
+        result.align_shared_ids = align_requested && dedicated_kernel;
+        if (align_requested && !dedicated_kernel) {
             std::fprintf(stderr,
                 "[moe-hybrid] shared-ID alignment disabled because the dedicated "
                 "MMVQ MoE kernel is disabled\n");
         }
-        return requested && dedicated_kernel;
+        return result;
     }();
-    return enabled;
-}
-
-static bool device_join_enabled() {
-    static const bool enabled = [] {
-        const char * raw = moe_policy_env(
-            "DFLASH_MOE_TP_DEVICE_JOIN", "DFLASH_DS4_TP_DEVICE_JOIN");
-        return raw && *raw && std::strcmp(raw, "0") != 0;
-    }();
-    return enabled;
-}
-
-static bool route_prefork_enabled() {
-    static const bool enabled = [] {
-        const char * raw = moe_policy_env(
-            "DFLASH_MOE_TP_ROUTE_PREFORK", "DFLASH_DS4_TP_ROUTE_PREFORK");
-        return raw && *raw && std::strcmp(raw, "0") != 0;
-    }();
-    return enabled;
+    return policy;
 }
 
 static void add_hybrid_telemetry(MoeHybridFfnTelemetry & dst,
@@ -631,7 +576,8 @@ static bool build_batched_routed_graph(
     bool tokenwise = false,
     std::vector<ggml_tensor *> * backend_nodes = nullptr,
     bool allow_fused_combine = false,
-    bool force_fused_combine = false)
+    bool force_fused_combine = false,
+    bool defer_route_reduction = false)
 {
     const auto track = [&](ggml_tensor * t) -> ggml_tensor * {
         if (backend_nodes && t) backend_nodes->push_back(t);
@@ -653,10 +599,16 @@ static bool build_batched_routed_graph(
                     inp_col, sel_col, wts_col,
                     n_embd, n_ff_exp, n_used, 1, swiglu_clamp,
                     &routed_col, false, backend_nodes,
-                    allow_fused_combine, force_fused_combine)) {
+                    allow_fused_combine, force_fused_combine,
+                    defer_route_reduction)) {
                 return false;
             }
-            joined = joined ? track(ggml_concat(ctx, joined, routed_col, 1))
+            // Reduced owner outputs concatenate by token columns. Canonical
+            // joins retain the per-route dimension until both owners have
+            // been combined, so append those token slices along dimension 2.
+            const int concat_dim = defer_route_reduction ? 2 : 1;
+            joined = joined ? track(ggml_concat(
+                                  ctx, joined, routed_col, concat_dim))
                             : routed_col;
         }
         *out_routed = joined;
@@ -666,7 +618,9 @@ static bool build_batched_routed_graph(
     ggml_tensor * cur_3d = ggml_reshape_3d(ctx, inp, n_embd, 1, n_tokens);
     ggml_tensor * gu = nullptr;
     const bool coarse_split_requested =
-        coarse_owner_op_enabled() && coarse_owner_split_op_enabled();
+        !defer_route_reduction &&
+        moe_hybrid_graph_policy().coarse_owner &&
+        moe_hybrid_graph_policy().coarse_owner_split;
     const bool coarse_split_eligible =
         gate_tensor && up_tensor &&
         gate_tensor->type == GGML_TYPE_Q2_0_ROCMFP2 &&
@@ -694,7 +648,8 @@ static bool build_batched_routed_graph(
             n_ff_exp, swiglu_clamp,
             gate_scale, up_scale, down_scale));
         return *out_routed != nullptr;
-    } else if (coarse_owner_op_enabled() &&
+    } else if (!defer_route_reduction &&
+        moe_hybrid_graph_policy().coarse_owner &&
         gate_up_tensor &&
         gate_up_scale == 1.0f &&
         gate_up_tensor->type == GGML_TYPE_Q2_0_ROCMFP2 &&
@@ -704,7 +659,7 @@ static bool build_batched_routed_graph(
             n_ff_exp, swiglu_clamp, down_scale));
         return *out_routed != nullptr;
     } else if (gate_up_tensor &&
-        fused_gate_up_mmvq_enabled() &&
+        moe_hybrid_graph_policy().fused_gate_up &&
         gate_up_scale == 1.0f) {
         GGML_ASSERT(gate_up_tensor->ne[1] == 2 * n_ff_exp);
         ggml_tensor * gate_w = ggml_view_3d(
@@ -748,14 +703,19 @@ static bool build_batched_routed_graph(
         ggml_mul_mat_id(ctx, down_tensor, gu, sel), down_scale));
 
     // Weight and sum over experts: [n_embd, n_used, n_tokens] * [1, n_used, n_tokens]
-    if (allow_fused_combine &&
-        (force_fused_combine || fused_moe_combine_enabled())) {
+    if (!defer_route_reduction && allow_fused_combine &&
+        (force_fused_combine || moe_hybrid_graph_policy().fused_combine)) {
         *out_routed = track(ggml_laguna_moe_combine(ctx, experts, wts));
         return *out_routed != nullptr;
     }
 
     ggml_tensor * w_view = ggml_reshape_3d(ctx, wts, 1, n_used, n_tokens);
     experts = track(ggml_mul(ctx, experts, w_view));
+
+    if (defer_route_reduction) {
+        *out_routed = experts;
+        return true;
+    }
 
     // repeat_back uses this tensor for shape only, but the scheduler still
     // treats it as a leaf. Keep it on the branch backend; otherwise every MoE
@@ -765,6 +725,248 @@ static bool build_batched_routed_graph(
     ggml_tensor * moe_sum = track(ggml_repeat_back(ctx, experts, sum_shape));
     *out_routed = track(ggml_reshape_2d(ctx, moe_sum, n_embd, n_tokens));
     return true;
+}
+
+// One routed-expert owner. The established hot/cold storage names describe
+// primary and secondary ownership respectively; this view keeps the graph
+// construction logic independent of whether the secondary owner is a CPU,
+// another same-runtime GPU, or a dynamically loaded peer runtime.
+struct MoeOwnerGraphSpec {
+    const std::vector<int32_t> * local_by_global = nullptr;
+    ggml_tensor * gate = nullptr;
+    ggml_tensor * up = nullptr;
+    ggml_tensor * down = nullptr;
+    ggml_tensor * gate_up = nullptr;
+    ggml_tensor ** local_lut = nullptr;
+    ggml_tensor ** valid_lut = nullptr;
+    std::vector<ggml_tensor *> * remap_nodes = nullptr;
+    std::vector<ggml_tensor *> * branch_nodes = nullptr;
+    ggml_tensor * local_ids = nullptr;
+    ggml_tensor * masked_weights = nullptr;
+    ggml_tensor * output = nullptr;
+
+    bool available() const {
+        return (gate_up || (gate && up)) && down;
+    }
+};
+
+static bool build_moe_owner_remap(
+        ggml_context * ctx,
+        const MoeHybridConfig & cfg,
+        ggml_tensor * global_ids,
+        ggml_tensor * router_weights,
+        int n_tokens,
+        MoeOwnerGraphSpec & owner) {
+    if (!owner.local_by_global ||
+        (int) owner.local_by_global->size() != cfg.n_expert ||
+        !owner.local_lut || !owner.valid_lut) {
+        return false;
+    }
+    const auto track = [&owner](ggml_tensor * tensor) {
+        if (tensor && owner.remap_nodes) {
+            owner.remap_nodes->push_back(tensor);
+        }
+        return tensor;
+    };
+    if (!*owner.local_lut) {
+        *owner.local_lut = ggml_new_tensor_4d(
+            ctx, GGML_TYPE_I32, 1, cfg.n_expert, n_tokens, 1);
+        ggml_set_input(*owner.local_lut);
+        // These inputs are consumed late in a whole-model graph. Preserve
+        // their allocation from graph start so activation scratch cannot
+        // reuse the small buffer before its layer executes.
+        ggml_set_output(*owner.local_lut);
+    }
+    if (!*owner.valid_lut) {
+        *owner.valid_lut = ggml_new_tensor_4d(
+            ctx, GGML_TYPE_F32, 1, cfg.n_expert, n_tokens, 1);
+        ggml_set_input(*owner.valid_lut);
+        ggml_set_output(*owner.valid_lut);
+    }
+
+    // Store immutable q-replicated lookup rows as graph inputs instead of
+    // running owner-local REPEAT kernels in every layer and verifier step.
+    ggml_tensor * mapped = track(ggml_get_rows(
+        ctx, *owner.local_lut, global_ids));
+    mapped = track(ggml_reshape_2d(
+        ctx, mapped, cfg.n_expert_used, n_tokens));
+    owner.local_ids = track(ggml_cont(ctx, mapped));
+    ggml_tensor * valid = track(ggml_get_rows(
+        ctx, *owner.valid_lut, global_ids));
+    valid = track(ggml_reshape_2d(
+        ctx, valid, cfg.n_expert_used, n_tokens));
+    owner.masked_weights = track(ggml_mul(ctx, router_weights, valid));
+    return true;
+}
+
+static bool prepare_moe_owner_branch(
+        ggml_context * ctx,
+        const MoeHybridConfig & cfg,
+        ggml_tensor * global_ids,
+        ggml_tensor * router_weights,
+        int n_tokens,
+        MoeOwnerGraphSpec & owner) {
+    return !owner.available() || build_moe_owner_remap(
+        ctx, cfg, global_ids, router_weights, n_tokens, owner);
+}
+
+static void align_moe_owner_routes(
+        ggml_context * ctx,
+        int n_tokens,
+        MoeOwnerGraphSpec & owner) {
+    if (!owner.available() || !owner.local_ids || n_tokens <= 1 ||
+        !moe_hybrid_graph_policy().align_shared_ids) {
+        return;
+    }
+    owner.local_ids = ggml_ds4_moe_align_ids(ctx, owner.local_ids);
+    if (owner.local_ids && owner.remap_nodes) {
+        owner.remap_nodes->push_back(owner.local_ids);
+    }
+}
+
+static bool build_moe_owner_branch(
+        ggml_context * ctx,
+        const MoeHybridConfig & cfg,
+        const MoeLayerDesc & desc,
+        ggml_tensor * inp,
+        int n_tokens,
+        bool canonical_route_join,
+        bool allow_fused_combine,
+        MoeOwnerGraphSpec & owner) {
+    if (!owner.available()) {
+        return true;
+    }
+    const MoeHybridGraphPolicy & policy = moe_hybrid_graph_policy();
+    const ggml_tensor * dispatch_weights = owner.gate_up
+        ? owner.gate_up : owner.gate;
+    const bool tokenwise =
+        dispatch_weights->type == GGML_TYPE_Q2_0_ROCMFP2 &&
+        !(n_tokens > 1 && policy.grouped_mmvq);
+    return build_batched_routed_graph(
+        ctx, owner.gate, owner.up, owner.down, owner.gate_up,
+        desc.ffn_gate_exps_s, desc.ffn_up_exps_s,
+        desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
+        inp, owner.local_ids, owner.masked_weights,
+        cfg.n_embd, cfg.n_ff_exp, cfg.n_expert_used, n_tokens,
+        cfg.swiglu_clamp, &owner.output, tokenwise,
+        owner.branch_nodes, allow_fused_combine,
+        /*force_fused_combine=*/false, canonical_route_join);
+}
+
+static ggml_tensor * build_moe_owner_join(
+        ggml_context * ctx,
+        ggml_cgraph * schedule_graph,
+        const MoeHybridConfig & cfg,
+        const MoeLayerDesc & desc,
+        ggml_tensor * inp,
+        ggml_tensor * global_ids,
+        ggml_tensor * router_weights,
+        int n_tokens,
+        bool include_shared,
+        bool canonical_route_join,
+        ggml_tensor * primary,
+        ggml_tensor * secondary,
+        MoeHybridGraphInputs & out) {
+    // Canonical reduction consumes the secondary tensor below, but branch
+    // scheduling still needs the original producer as an independent graph
+    // root. Keep that dependency separate from the owner-level add state.
+    ggml_tensor * secondary_branch = secondary;
+    if (canonical_route_join) {
+        ggml_tensor * routes = nullptr;
+        if (primary && secondary) {
+            routes = ggml_add(ctx, primary, secondary);
+            out.join_nodes.push_back(routes);
+        } else {
+            routes = primary ? primary : secondary;
+        }
+        if (!routes) return nullptr;
+
+        ggml_tensor * sum_shape = ggml_new_tensor_3d(
+            ctx, GGML_TYPE_F32, cfg.n_embd, 1, n_tokens);
+        ggml_tensor * route_sum = ggml_repeat_back(ctx, routes, sum_shape);
+        primary = ggml_reshape_2d(ctx, route_sum, cfg.n_embd, n_tokens);
+        out.join_nodes.push_back(sum_shape);
+        out.join_nodes.push_back(route_sum);
+        out.join_nodes.push_back(primary);
+        // The secondary contribution is consumed by the canonical route
+        // reduction and must not be added again as an owner-level partial.
+        secondary = nullptr;
+    }
+
+    ggml_tensor * shared = include_shared
+        ? build_shared_expert_subgraph(ctx, desc, inp, cfg.swiglu_clamp)
+        : nullptr;
+    if (shared) {
+        primary = primary ? ggml_add(ctx, primary, shared) : shared;
+    }
+
+    const MoeHybridGraphPolicy & policy = moe_hybrid_graph_policy();
+    if (schedule_graph && secondary_branch && policy.route_prefork) {
+        // Materialize shared route IDs and weights before either owner branch.
+        // This prevents a late cross-runtime dependency from synchronizing the
+        // secondary stream before independent primary work can be submitted.
+        out.route_prefork_nodes.push_back(global_ids);
+        out.route_prefork_nodes.push_back(router_weights);
+        ggml_build_forward_expand(schedule_graph, global_ids);
+        ggml_build_forward_expand(schedule_graph, router_weights);
+    }
+
+    if (canonical_route_join) {
+        if (schedule_graph && secondary_branch) {
+            // Queue secondary expert work before the final graph traversal
+            // reaches the primary branch and canonical route-order join.
+            ggml_build_forward_expand(schedule_graph, secondary_branch);
+        }
+        return primary;
+    }
+
+    if (schedule_graph && secondary && policy.device_join) {
+        // Submit secondary and primary work independently, then perform the
+        // peer wait/copy at its exact position in the primary consumer graph.
+        ggml_set_output(secondary);
+        ggml_build_forward_expand(schedule_graph, secondary);
+        if (primary) {
+            ggml_build_forward_expand(schedule_graph, primary);
+        }
+        ggml_tensor * secondary_ready =
+            ggml_ds4_deferred_peer_copy(ctx, secondary);
+        // Diagnostic host-copy paths may prefill this tensor before its split
+        // launches, so reserve a stable allocation for the full graph.
+        ggml_set_input(secondary_ready);
+        ggml_set_output(secondary_ready);
+        out.deferred_peer_copy_nodes.push_back(secondary_ready);
+        out.main_output = primary;
+        out.peer_output = secondary_ready;
+        return primary ? ggml_add(ctx, secondary_ready, primary)
+                       : secondary_ready;
+    }
+
+    if (schedule_graph && secondary && policy.targeted_join_split) {
+        // The scheduler starts a new primary split at this join, allowing both
+        // owner branches to be enqueued before unlike-runtime host staging.
+        ggml_build_forward_expand(schedule_graph, secondary);
+        ggml_tensor * combined = primary
+            ? ggml_add(ctx, secondary, primary) : secondary;
+        if (primary) {
+            out.join_nodes.push_back(combined);
+        }
+        return combined;
+    }
+
+    if (schedule_graph && secondary) {
+        ggml_build_forward_expand(schedule_graph, secondary);
+        ggml_tensor * secondary_fence = ggml_cont(ctx, secondary);
+        out.cold_nodes.push_back(secondary_fence);
+        return primary ? ggml_add(ctx, primary, secondary_fence)
+                       : secondary_fence;
+    }
+
+    if (secondary && primary) {
+        ggml_tensor * combined = ggml_add(ctx, secondary, primary);
+        out.join_nodes.push_back(combined);
+        return combined;
+    }
+    return secondary ? secondary : primary;
 }
 
 bool build_moe_hybrid_ffn_graph(
@@ -779,7 +981,8 @@ bool build_moe_hybrid_ffn_graph(
     int                            n_tokens,
     MoeHybridGraphInputs &         out,
     bool                           include_shared,
-    bool                           allow_fused_combine) {
+    bool                           allow_fused_combine,
+    MoeHybridJoinMode              join_mode) {
 
     out.output = nullptr;
     out.main_output = nullptr;
@@ -790,211 +993,48 @@ bool build_moe_hybrid_ffn_graph(
         return false;
     }
 
-    const int n_used = cfg.n_expert_used;
+    const bool canonical_route_join =
+        join_mode == MoeHybridJoinMode::CanonicalRouteOrder;
     // Both owner remaps consume the same normalized top-k route weights.
-    // Expose the canonical tensor so the heterogeneous scheduler can keep it
-    // on the main GPU. Otherwise expanding the cold branch first lets backend
-    // assignment migrate this shared dependency to Strix, forcing the hot
-    // R9700 branch to wait for a reverse peer copy before it can launch.
+    // Expose the canonical tensor so the scheduler can keep it on the primary
+    // backend rather than discovering it late through the secondary branch.
     out.router_weights = router_weights;
-    auto build_remap = [&](const std::vector<int32_t> & local_by_global,
-                           ggml_tensor ** local_lut,
-                           ggml_tensor ** valid_lut,
-                           ggml_tensor ** local_ids,
-                           ggml_tensor ** masked_weights,
-                           std::vector<ggml_tensor *> * backend_nodes) {
-        auto track = [backend_nodes](ggml_tensor * tensor) {
-            if (tensor && backend_nodes) backend_nodes->push_back(tensor);
-            return tensor;
-        };
-        if (!*local_lut) {
-            *local_lut = ggml_new_tensor_2d(
-                ctx, GGML_TYPE_I32, 1, cfg.n_expert);
-            ggml_set_input(*local_lut);
-            // These inputs are consumed late in a whole-model graph. Preserve
-            // their allocation from graph start; otherwise gallocr may reuse
-            // the tiny buffer as activation scratch before its layer executes.
-            ggml_set_output(*local_lut);
-        }
-        if (!*valid_lut) {
-            *valid_lut = ggml_new_tensor_2d(
-                ctx, GGML_TYPE_F32, 1, cfg.n_expert);
-            ggml_set_input(*valid_lut);
-            ggml_set_output(*valid_lut);
-        }
+    MoeOwnerGraphSpec primary_owner{
+        &storage.hot_local_by_global,
+        storage.gate_hot, storage.up_hot, storage.down_hot,
+        storage.gate_up_hot,
+        &out.hot_local_lut, &out.hot_valid_lut,
+        &out.hot_remap_nodes, &out.hot_nodes};
+    MoeOwnerGraphSpec secondary_owner{
+        &storage.cold_local_by_global,
+        storage.gate_cold, storage.up_cold, storage.down_cold,
+        storage.gate_up_cold,
+        &out.cold_local_lut, &out.cold_valid_lut,
+        &out.cold_remap_nodes, &out.cold_nodes};
 
-        // q1 can address the 2-D LUT directly.  Historically q>1 left its tiny
-        // I32 repeat unpinned for CPU fallback.  With the exact GPU I32 repeat
-        // enabled, track it with the rest of the owner-local remap nodes.
-        ggml_tensor * local_lut_batched = *local_lut;
-        if (n_tokens > 1) {
-            ggml_tensor * repeated = ggml_repeat_4d(
-                ctx, *local_lut, 1, cfg.n_expert, n_tokens, 1);
-            local_lut_batched =
-                gpu_i32_repeat_enabled() ? track(repeated) : repeated;
-        }
-        ggml_tensor * mapped = track(ggml_get_rows(
-            ctx, local_lut_batched, global_ids));
-        mapped = track(ggml_reshape_2d(ctx, mapped, n_used, n_tokens));
-        *local_ids = track(ggml_cont(ctx, mapped));
-        ggml_tensor * valid_lut_batched = *valid_lut;
-        if (n_tokens > 1) {
-            valid_lut_batched = track(ggml_repeat_4d(
-                ctx, *valid_lut, 1, cfg.n_expert, n_tokens, 1));
-        }
-        ggml_tensor * valid = track(ggml_get_rows(
-            ctx, valid_lut_batched, global_ids));
-        valid = track(ggml_reshape_2d(ctx, valid, n_used, n_tokens));
-        *masked_weights = track(ggml_mul(ctx, router_weights, valid));
-        return (int)local_by_global.size() == cfg.n_expert;
-    };
-
-    ggml_tensor * hot_ids = nullptr;
-    ggml_tensor * hot_weights = nullptr;
-    if (!build_remap(storage.hot_local_by_global,
-                     &out.hot_local_lut, &out.hot_valid_lut,
-                     &hot_ids, &hot_weights, &out.hot_remap_nodes)) {
+    // Keep graph construction order stable: both remaps, then both optional ID
+    // alignments, then both expert branches.
+    if (!prepare_moe_owner_branch(
+            ctx, cfg, global_ids, router_weights, n_tokens, primary_owner) ||
+        !prepare_moe_owner_branch(
+            ctx, cfg, global_ids, router_weights, n_tokens, secondary_owner)) {
+        return false;
+    }
+    align_moe_owner_routes(ctx, n_tokens, primary_owner);
+    align_moe_owner_routes(ctx, n_tokens, secondary_owner);
+    if (!build_moe_owner_branch(
+            ctx, cfg, desc, inp, n_tokens, canonical_route_join,
+            allow_fused_combine, primary_owner) ||
+        !build_moe_owner_branch(
+            ctx, cfg, desc, inp, n_tokens, canonical_route_join,
+            allow_fused_combine, secondary_owner)) {
         return false;
     }
 
-    ggml_tensor * cold_ids = nullptr;
-    ggml_tensor * cold_weights = nullptr;
-    if (!build_remap(storage.cold_local_by_global,
-                     &out.cold_local_lut, &out.cold_valid_lut,
-                     &cold_ids, &cold_weights, &out.cold_remap_nodes)) {
-        return false;
-    }
-
-    // q-token verification often routes adjacent tokens to the same expert
-    // at different top-k ranks.  Align those owner-local IDs before MMVQ so
-    // equal weights are consumed by warps in one block.  The encoded original
-    // route slot is decoded by the dedicated MoE kernel, which scatters every
-    // result back before the unchanged weighted reduction.
-    if (n_tokens > 1 && align_shared_moe_ids_enabled()) {
-        hot_ids = ggml_ds4_moe_align_ids(ctx, hot_ids);
-        cold_ids = ggml_ds4_moe_align_ids(ctx, cold_ids);
-        out.hot_remap_nodes.push_back(hot_ids);
-        out.cold_remap_nodes.push_back(cold_ids);
-    }
-
-    ggml_tensor * hot = nullptr;
-    if ((storage.gate_up_hot || (storage.gate_hot && storage.up_hot)) &&
-        storage.down_hot) {
-        const ggml_tensor * hot_gate = storage.gate_up_hot
-            ? storage.gate_up_hot : storage.gate_hot;
-        const bool tokenwise =
-            hot_gate->type == GGML_TYPE_Q2_0_ROCMFP2 &&
-            !(n_tokens > 1 && grouped_mmvq_moe_enabled());
-        if (!build_batched_routed_graph(
-                ctx,
-                storage.gate_hot, storage.up_hot, storage.down_hot,
-                storage.gate_up_hot,
-                desc.ffn_gate_exps_s, desc.ffn_up_exps_s,
-                desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
-                inp, hot_ids, hot_weights,
-                cfg.n_embd, cfg.n_ff_exp, n_used, n_tokens,
-                cfg.swiglu_clamp, &hot, tokenwise,
-                &out.hot_nodes, allow_fused_combine)) {
-            return false;
-        }
-    }
-
-    ggml_tensor * cold = nullptr;
-    if ((storage.gate_up_cold || (storage.gate_cold && storage.up_cold)) &&
-        storage.down_cold) {
-        const ggml_tensor * cold_gate = storage.gate_up_cold
-            ? storage.gate_up_cold : storage.gate_cold;
-        const bool tokenwise =
-            cold_gate->type == GGML_TYPE_Q2_0_ROCMFP2 &&
-            !(n_tokens > 1 && grouped_mmvq_moe_enabled());
-        if (!build_batched_routed_graph(
-                ctx,
-                storage.gate_cold, storage.up_cold, storage.down_cold,
-                storage.gate_up_cold,
-                desc.ffn_gate_exps_s, desc.ffn_up_exps_s,
-                desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
-                inp, cold_ids, cold_weights,
-                cfg.n_embd, cfg.n_ff_exp,
-                n_used, n_tokens,
-                cfg.swiglu_clamp, &cold, tokenwise,
-                &out.cold_nodes, allow_fused_combine)) {
-            return false;
-        }
-    }
-
-    ggml_tensor * main_branch = hot;
-    ggml_tensor * shared = include_shared
-        ? build_shared_expert_subgraph(ctx, desc, inp, cfg.swiglu_clamp)
-        : nullptr;
-    if (shared) main_branch = main_branch ? ggml_add(ctx, main_branch, shared) : shared;
-
-    // The generic scheduler copies every cross-backend input before launching
-    // any node in a split. If hot/shared and the final add are one contiguous
-    // main-backend split, the add's cold input makes that whole split wait for
-    // the peer, serializing the nominally parallel branches.
-    //
-    // Expand cold now, then visit hot/shared, then a new peer-owned CONT fence,
-    // and finally the main-backend add. This yields:
-    //   peer cold compute -> main hot/shared compute -> peer fence -> main join
-    // The scheduler can enqueue cold first and hot/shared second; the fence
-    // separates the final join so its event wait is inserted after hot/shared.
-    ggml_tensor * combined = nullptr;
-    if (schedule_graph && cold && device_join_enabled()) {
-        // Materialize both route IDs and normalized route weights before the
-        // cold split is expanded.  Cross-device copies are not guaranteed to
-        // remain asynchronous on this heterogeneous ROCm pair.  If the tiny
-        // weight copy is discovered after cold expert execution, the fallback
-        // copy synchronizes the Strix stream and prevents the host from
-        // enqueueing independent R9700 hot work until cold has completed.
-        //
-        // q4 verification calls this builder twice (4 routes + padded 2), so
-        // retain every derived route tensor rather than only the canonical
-        // six-wide routing output.
-        if (route_prefork_enabled()) {
-            out.route_prefork_nodes.push_back(global_ids);
-            out.route_prefork_nodes.push_back(router_weights);
-            ggml_build_forward_expand(schedule_graph, global_ids);
-            ggml_build_forward_expand(schedule_graph, router_weights);
-        }
-        // Enforce fork order without adding another backend graph:
-        //   cold owner -> hot/shared -> in-graph event wait/copy -> add.
-        // The deferred copy remains in the same main-backend split as the
-        // hot branch, so its wait is reached only after useful main work.
-        // Keep the peer result live explicitly. The generic allocator normally
-        // derives lifetime from children on the same execution backend; this
-        // custom foreign-buffer edge intentionally bypasses that copy path.
-        ggml_set_output(cold);
-        ggml_build_forward_expand(schedule_graph, cold);
-        if (main_branch) {
-            ggml_build_forward_expand(schedule_graph, main_branch);
-        }
-        ggml_tensor * cold_ready =
-            ggml_ds4_deferred_peer_copy(ctx, cold);
-        // The scheduler may prefill this tensor in the host-copy diagnostic
-        // before its containing main split launches. Reserve a stable buffer
-        // from graph start so earlier hot-branch scratch cannot alias it.
-        ggml_set_input(cold_ready);
-        ggml_set_output(cold_ready);
-        out.deferred_peer_copy_nodes.push_back(cold_ready);
-        out.main_output = main_branch;
-        out.peer_output = cold_ready;
-        combined = main_branch ? ggml_add(ctx, cold_ready, main_branch)
-                               : cold_ready;
-    } else if (schedule_graph && cold) {
-        ggml_build_forward_expand(schedule_graph, cold);
-        ggml_tensor * cold_fence = ggml_cont(ctx, cold);
-        out.cold_nodes.push_back(cold_fence);
-        combined = main_branch ? ggml_add(ctx, main_branch, cold_fence)
-                               : cold_fence;
-    } else {
-        // Preserve the established default dependency order exactly.
-        if (cold && main_branch) {
-            combined = ggml_add(ctx, cold, main_branch);
-            out.join_nodes.push_back(combined);
-        } else {
-            combined = cold ? cold : main_branch;
-        }
-    }
+    ggml_tensor * combined = build_moe_owner_join(
+        ctx, schedule_graph, cfg, desc, inp, global_ids, router_weights,
+        n_tokens, include_shared, canonical_route_join,
+        primary_owner.output, secondary_owner.output, out);
     if (!combined) return false;
 
     out.output = ggml_cont(ctx, combined);
@@ -1238,7 +1278,7 @@ bool build_cached_hot_batched_graph(
             desc.ffn_gate_exps_s, desc.ffn_up_exps_s, desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
             out.inp, out.sel, out.wts, n_embd, n_ff_exp, n_used, n_tokens,
             cfg.swiglu_clamp, &routed, false, nullptr,
-            ggml_backend_is_cuda(gpu_backend));
+            backend_is_gpu(gpu_backend));
     }
 
     // Shared expert (always on GPU)
@@ -1300,7 +1340,7 @@ static bool build_cached_cold_batched_graph(
         desc.ffn_gate_exps_s, desc.ffn_up_exps_s, desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
         out.inp, out.sel, out.wts, n_embd, n_ff_exp, n_used, n_tokens,
         cfg.swiglu_clamp, &routed, false, nullptr,
-        ggml_backend_is_cuda(cpu_backend));
+        backend_is_gpu(cpu_backend));
     if (!routed) { out.free(); return false; }
     out.output = routed;
 
@@ -1820,11 +1860,11 @@ static bool eval_moe_hybrid_ffn_batched_core(
     auto set_cur_input = [&](ggml_tensor * dst,
                              ggml_backend_t dst_backend) {
         if (cur_backend) {
-            // Use the backend-aware copy path. On heterogeneous HIP this
+            // Use the backend-aware copy path. On heterogeneous runtimes this
             // submits on the producer stream and publishes an event to the
             // consumer stream; the generic buffer copy uses a per-thread
-            // stream with no cross-device dependency and can leave the Strix
-            // destination containing zeros.
+            // stream with no cross-device dependency and can leave the
+            // secondary destination containing zeros.
             ggml_backend_tensor_copy_async(
                 gpu_backend, dst_backend, cur_backend, dst);
         } else {
@@ -2002,7 +2042,7 @@ static bool eval_moe_hybrid_ffn_batched_core(
         if (!logged) {
             std::fprintf(stderr,
                          "[hybrid-ffn] masked cold prefill routes active; "
-                         "Strix skips R9700-owned expert GEMMs "
+                         "secondary owner skips primary-owned expert GEMMs "
                          "max_expert_rows=%d\n",
                          (int)max_cold_expert_rows);
             logged = true;
@@ -2050,7 +2090,7 @@ static bool eval_moe_hybrid_ffn_batched_core(
                 desc.ffn_gate_exps_s, desc.ffn_up_exps_s, desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
                 inp, sel, wts, n_embd, n_ff_exp, n_used, n_tokens,
                 cfg.swiglu_clamp, &routed, false, nullptr,
-                ggml_backend_is_cuda(gpu_backend));
+                backend_is_gpu(gpu_backend));
         }
 
         // Shared expert (always on GPU)
@@ -2163,7 +2203,7 @@ static bool eval_moe_hybrid_ffn_batched_core(
             desc.ffn_gate_exps_s, desc.ffn_up_exps_s, desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
             inp, sel, wts, n_embd, n_ff_exp, n_used, n_tokens,
             cfg.swiglu_clamp, &cold_routed, false, nullptr,
-            ggml_backend_is_cuda(cold_backend),
+            backend_is_gpu(cold_backend),
             /*force_fused_combine=*/mask_skipped_cold);
 
         ggml_cgraph * cold_gf = ggml_new_graph_custom(cold_ctx, 4096, false);
@@ -2458,8 +2498,8 @@ static bool eval_moe_owner_expert_major_batched(
                                   (size_t)counts[(size_t)e];
     }
     std::vector<size_t> cursor(offsets.begin(), offsets.end() - 1);
-    // Device input keeps the normalized activation on the R9700 and gathers
-    // the owner rows on-device. The host fallback remains for decode and A/B.
+    // Device input keeps the normalized activation on the primary owner and
+    // gathers rows on-device. The host fallback remains for decode and A/B.
     std::vector<float> packed_input;
     if (!cur_backend) {
         packed_input.resize(n_pairs * (size_t)n_embd);
@@ -2871,7 +2911,7 @@ bool eval_moe_hot_only_batched(
         desc.ffn_gate_exps_s, desc.ffn_up_exps_s, desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
         inp, sel, wts, n_embd, n_ff_exp, n_used, n_tokens,
         cfg.swiglu_clamp, &routed, false, nullptr,
-        ggml_backend_is_cuda(gpu_backend));
+        backend_is_gpu(gpu_backend));
 
     // Shared expert (always on GPU)
     ggml_tensor * combined = routed;
@@ -3047,11 +3087,11 @@ bool eval_moe_hybrid_ffn_batched(
         return true;
     }
 
-    // A prefill-only full cold stack keeps Strix on its proven full-stack
-    // MUL_MAT_ID path.  Do not pair it with hundreds of q<=4 hot sub-batches:
-    // pack the R9700 routes by expert and launch one owner graph instead.  The
-    // hot-local map takes priority in eval_moe_hybrid_ffn_batched_core(), so
-    // skip_hot makes the duplicated Strix stack evaluate cold routes only.
+    // A prefill-only full secondary stack keeps that owner on its qualified
+    // full-stack MUL_MAT_ID path. Do not pair it with hundreds of q<=4 primary
+    // sub-batches: pack the primary routes by expert and launch one owner graph
+    // instead. The primary-local map takes priority in the core evaluator, so
+    // skip_hot makes the duplicated secondary stack evaluate its routes only.
     const bool inprocess_full_cold_hot_expert_major =
         !expert_compute && expert_major_prefill_enabled(n_tokens) &&
         cold_on_gpu && storage.cold_backend &&
@@ -3063,8 +3103,9 @@ bool eval_moe_hybrid_ffn_batched(
         static bool logged = false;
         if (!logged) {
             std::fprintf(stderr,
-                         "[hybrid-ffn] full-cold Strix MMID batch + expert-major "
-                         "R9700 prefill active tokens=%d hot_stack=%d\n",
+                         "[hybrid-ffn] full-secondary MMID batch + "
+                         "expert-major primary prefill active tokens=%d "
+                         "primary_stack=%d\n",
                          n_tokens, n_hot_stack);
             logged = true;
         }
@@ -3178,12 +3219,12 @@ bool eval_moe_hybrid_ffn_batched(
         const bool remote_cold_full_batch =
             expert_compute && expert_layer &&
             parse_moe_expert_compute_ipc_mode() == MoeExpertComputeIpcMode::Batched;
-        // The in-process heterogeneous path owns a nearly-full cold stack on
-        // Strix and a small hot stack on the R9700.  A full reduced-stack MMQ
-        // is pathological for the 24-expert hot side, but is stable once the
-        // cold stack covers most experts and the prompt supplies enough rows.
-        // Run that one cold batch on Strix while retaining the proven q<=4
-        // MMVQ slices for R9700 hot/shared work.
+        // The in-process heterogeneous path may own a nearly full secondary
+        // stack and a small primary stack. A full reduced-stack MMQ is
+        // pathological for the small side, but stable once the secondary
+        // covers most experts and the prompt supplies enough rows. Run that
+        // secondary batch while retaining q<=4 MMVQ slices for primary/shared
+        // work.
         const bool inprocess_cold_full_batch =
             !expert_compute && cold_on_gpu &&
             storage.cold_backend && storage.cold_backend != gpu_backend &&

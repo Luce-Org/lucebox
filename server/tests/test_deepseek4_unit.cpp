@@ -1172,6 +1172,15 @@ static std::vector<uint8_t> read_tensor_bytes(const ggml_tensor * tensor) {
     return data;
 }
 
+static std::vector<uint8_t> read_tensor_rows(const ggml_tensor * tensor,
+                                             int rows) {
+    const size_t bytes = rows > 0
+        ? ggml_row_size(tensor->type, tensor->ne[0]) * (size_t) rows : 0;
+    std::vector<uint8_t> data(bytes);
+    if (bytes > 0) ggml_backend_tensor_get(tensor, data.data(), 0, bytes);
+    return data;
+}
+
 static bool init_snapshot_test_shard(DeepSeek4LayerSplitAdapter & adapter) {
     adapter.shards_.resize(1);
     auto & shard = adapter.shards_[0];
@@ -1733,8 +1742,8 @@ static void test_snapshot_save_restore() {
     write_tensor_pattern(layer.indexer_compressor.state_score, 79);
 
     const std::vector<uint8_t> raw_before = read_tensor_bytes(layer.raw_kv);
-    const std::vector<uint8_t> comp_before = read_tensor_bytes(layer.comp_kv);
-    const std::vector<uint8_t> index_before = read_tensor_bytes(layer.index_comp_kv);
+    const std::vector<uint8_t> comp_before = read_tensor_rows(layer.comp_kv, 5);
+    const std::vector<uint8_t> index_before = read_tensor_rows(layer.index_comp_kv, 3);
     const std::vector<uint8_t> attn_kv_before =
         read_tensor_bytes(layer.attn_compressor.state_kv);
     const std::vector<uint8_t> attn_score_before =
@@ -1755,6 +1764,8 @@ static void test_snapshot_save_restore() {
     TEST_ASSERT(adapter.snapshot_save(0));
     TEST_ASSERT(adapter.snapshot_used(0));
     TEST_ASSERT(adapter.snapshot_cur_pos(0) == 7);
+    TEST_ASSERT(adapter.snapshots_[0].shards[0].layers[0].comp_kv->ne[1] == 5);
+    TEST_ASSERT(adapter.snapshots_[0].shards[0].layers[0].index_comp_kv->ne[1] == 3);
 
     adapter.cur_pos_ = 0;
     adapter.last_tok_ = -1;
@@ -1782,12 +1793,30 @@ static void test_snapshot_save_restore() {
     TEST_ASSERT(layer.n_comp == 5);
     TEST_ASSERT(layer.n_index_comp == 3);
     TEST_ASSERT(read_tensor_bytes(layer.raw_kv) == raw_before);
-    TEST_ASSERT(read_tensor_bytes(layer.comp_kv) == comp_before);
-    TEST_ASSERT(read_tensor_bytes(layer.index_comp_kv) == index_before);
+    TEST_ASSERT(read_tensor_rows(layer.comp_kv, 5) == comp_before);
+    TEST_ASSERT(read_tensor_rows(layer.index_comp_kv, 3) == index_before);
     TEST_ASSERT(read_tensor_bytes(layer.attn_compressor.state_kv) == attn_kv_before);
     TEST_ASSERT(read_tensor_bytes(layer.attn_compressor.state_score) == attn_score_before);
     TEST_ASSERT(read_tensor_bytes(layer.indexer_compressor.state_kv) == index_kv_before);
     TEST_ASSERT(read_tensor_bytes(layer.indexer_compressor.state_score) == index_score_before);
+
+    // A zero-row compressed prefix is represented by one physical GGML row.
+    // ggml_n_dims() reports that tensor as 1D, so restore must validate its
+    // row layout rather than reject it against the full 2D cache capacity.
+    adapter.snapshot_free(0);
+    layer.n_comp = 0;
+    layer.n_index_comp = 0;
+    cache.cur_pos = 1;
+    adapter.cur_pos_ = 1;
+    adapter.last_tok_ = 7;
+    TEST_ASSERT(adapter.snapshot_save(0));
+    TEST_ASSERT(adapter.snapshots_[0].shards[0].layers[0].comp_kv->ne[1] == 1);
+    TEST_ASSERT(adapter.snapshots_[0].shards[0].layers[0].index_comp_kv->ne[1] == 1);
+    cache.cur_pos = 0;
+    TEST_ASSERT(adapter.snapshot_restore(0));
+    TEST_ASSERT(cache.cur_pos == 1);
+    TEST_ASSERT(layer.n_comp == 0);
+    TEST_ASSERT(layer.n_index_comp == 0);
 
     adapter.snapshot_free(0);
     TEST_ASSERT(!adapter.snapshot_used(0));
@@ -1798,6 +1827,141 @@ static void test_snapshot_save_restore() {
     TEST_ASSERT(!adapter.snapshot_restore(0));
     TEST_ASSERT(!adapter.snapshot_save(-1));
     TEST_ASSERT(!adapter.snapshot_save(ModelBackend::kMaxSlots));
+
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+static bool init_monolithic_snapshot_test_backend(DeepSeek4Backend & backend) {
+    backend.backend_ = ggml_backend_cpu_init();
+    backend.snap_backend_ = ggml_backend_cpu_init();
+    if (!backend.backend_ || !backend.snap_backend_) return false;
+    backend.w_.n_layer = 1;
+    backend.w_.n_embd = 4;
+    backend.w_.n_hc = 1;
+    backend.w_.n_vocab = 3;
+    backend.w_.head_dim = 4;
+    backend.w_.n_swa = 8;
+    backend.w_.n_indexer_head_dim = 2;
+    backend.w_.compress_ratios = {4};
+    return create_deepseek4_cache(backend.backend_, backend.w_, 16,
+                                  backend.cache_);
+}
+
+static void test_monolithic_snapshot_preserves_decode_state() {
+    std::fprintf(stderr,
+                 "  test_monolithic_snapshot_preserves_decode_state ...");
+
+    DeepSeek4BackendConfig cfg;
+    DeepSeek4Backend backend(cfg);
+    TEST_ASSERT(init_monolithic_snapshot_test_backend(backend));
+    if (!backend.cache_.buf || backend.cache_.layers.empty()) {
+        std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+        return;
+    }
+
+    auto & layer = backend.cache_.layers[0];
+    write_tensor_pattern(layer.raw_kv, 13);
+    write_tensor_pattern(layer.comp_kv, 31);
+    write_tensor_pattern(layer.index_comp_kv, 47);
+    write_tensor_pattern(layer.attn_compressor.state_kv, 59);
+    write_tensor_pattern(layer.attn_compressor.state_score, 71);
+    write_tensor_pattern(layer.indexer_compressor.state_kv, 83);
+    write_tensor_pattern(layer.indexer_compressor.state_score, 97);
+    write_tensor_pattern(backend.cache_.hc_state, 109);
+
+    layer.n_comp = 5;
+    layer.n_index_comp = 3;
+    backend.cache_.cur_pos = 7;
+    backend.last_logits_ = {1.0f, 4.0f, 2.0f};
+    backend.last_logits_pos_ = 7;
+    backend.spec_feat_window_ = {9.0f, 8.0f, 7.0f, 6.0f};
+
+    const auto raw_before = read_tensor_bytes(layer.raw_kv);
+    const auto comp_before = read_tensor_rows(layer.comp_kv, layer.n_comp);
+    const auto index_before =
+        read_tensor_rows(layer.index_comp_kv, layer.n_index_comp);
+    const auto hc_before = read_tensor_bytes(backend.cache_.hc_state);
+
+    TEST_ASSERT(backend.snapshot_save(0));
+    TEST_ASSERT(backend.snapshot_used(0));
+    TEST_ASSERT(backend.snapshot_cur_pos(0) == 7);
+    TEST_ASSERT(backend.snapshots_[0].layers[0].comp_kv->ne[1] == 5);
+    TEST_ASSERT(backend.snapshots_[0].layers[0].index_comp_kv->ne[1] == 3);
+
+    ggml_backend_buffer_clear(backend.cache_.buf, 0);
+    backend.cache_.cur_pos = 0;
+    layer.n_comp = 0;
+    layer.n_index_comp = 0;
+    backend.last_logits_ = {-1.0f};
+    backend.last_logits_pos_ = -1;
+    backend.spec_feat_window_.clear();
+
+    TEST_ASSERT(backend.snapshot_restore(0));
+    TEST_ASSERT(backend.cache_.cur_pos == 7);
+    TEST_ASSERT(layer.n_comp == 5);
+    TEST_ASSERT(layer.n_index_comp == 3);
+    TEST_ASSERT(read_tensor_bytes(layer.raw_kv) == raw_before);
+    TEST_ASSERT(read_tensor_rows(layer.comp_kv, 5) == comp_before);
+    TEST_ASSERT(read_tensor_rows(layer.index_comp_kv, 3) == index_before);
+    TEST_ASSERT(read_tensor_bytes(backend.cache_.hc_state) == hc_before);
+    TEST_ASSERT(backend.last_logits_ == std::vector<float>({1.0f, 4.0f, 2.0f}));
+    TEST_ASSERT(backend.spec_feat_window_ ==
+                std::vector<float>({9.0f, 8.0f, 7.0f, 6.0f}));
+    TEST_ASSERT(backend.last_logits_pos_ == 7);
+
+    GenerateRequest exact;
+    exact.prompt.assign(7, 0);
+    exact.n_gen = 1;
+    const GenerateResult exact_result =
+        backend.restore_and_generate_impl(0, exact, DaemonIO{});
+    TEST_ASSERT(exact_result.ok());
+    TEST_ASSERT(exact_result.tokens == std::vector<int32_t>({1}));
+    TEST_ASSERT(backend.cache_.cur_pos == 7);
+    TEST_ASSERT(backend.last_logits_ == std::vector<float>({1.0f, 4.0f, 2.0f}));
+
+    // A cache state that advanced without corresponding logits (for example,
+    // after DSpark) must not be persisted with stale decode state.
+    backend.cache_.cur_pos = 8;
+    TEST_ASSERT(!backend.snapshot_save(1));
+    backend.cache_.cur_pos = 7;
+    TEST_ASSERT(!backend.snapshot_save(-1));
+    TEST_ASSERT(!backend.snapshot_save(ModelBackend::kMaxSlots));
+
+    // Parking the target releases both the core tensors and the potentially
+    // large host-side logits/feature vectors for every populated slot.
+    TEST_ASSERT(backend.park(ParkTarget::TargetModel));
+    TEST_ASSERT(!backend.snapshot_used(0));
+    TEST_ASSERT(backend.snapshot_aux_[0].last_logits.empty());
+    TEST_ASSERT(backend.snapshot_aux_[0].spec_feat_window.empty());
+    TEST_ASSERT(!backend.snapshot_restore(0));
+
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+static void test_spec_feature_tail_is_bounded() {
+    std::fprintf(stderr, "  test_spec_feature_tail_is_bounded ...");
+
+    DeepSeek4BackendConfig cfg;
+    DeepSeek4Backend backend(cfg);
+    backend.w_.n_embd = 2;
+    backend.w_.n_swa = 3;
+    backend.spec_drafter_ = std::make_unique<DSparkDrafter>();
+    backend.spec_drafter_->n_target_layers = 1;
+
+    std::vector<float> features = {
+        0.0f, 1.0f,
+        2.0f, 3.0f,
+        4.0f, 5.0f,
+        6.0f, 7.0f,
+        8.0f, 9.0f,
+    };
+    backend.keep_spec_feature_tail(features, 3);
+    TEST_ASSERT(features ==
+                std::vector<float>({4.0f, 5.0f, 6.0f, 7.0f, 8.0f, 9.0f}));
+
+    features.push_back(10.0f);  // malformed partial feature row
+    backend.keep_spec_feature_tail(features, 3);
+    TEST_ASSERT(features.empty());
 
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
@@ -3252,6 +3416,8 @@ int main() {
     test_dspark_park_all_releases_drafter();
     test_dspark_raw_ring_rollback_after_wrap(backend);
     test_snapshot_save_restore();
+    test_monolithic_snapshot_preserves_decode_state();
+    test_spec_feature_tail_is_bounded();
     test_reset_request_state();
     test_reset_deepseek4_cache(backend);
     test_adapter_guard_paths();

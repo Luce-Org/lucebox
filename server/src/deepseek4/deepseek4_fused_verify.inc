@@ -13,6 +13,71 @@
 static void ds4_fv_set(ggml_tensor * t, const void * data, size_t nbytes) {
     if (t && t->buffer) ggml_backend_tensor_set(t, data, 0, nbytes);
 }
+
+struct Ds4MixedMoePolicy {
+    bool owner_local_reduction = false;
+    bool direct_device_join = false;
+    bool schedule_branches = false;
+    bool native_route_width = false;
+    bool fused_hc_join = false;
+    bool late_join_split = false;
+    bool deferred_join_split = false;
+    bool batch_peer_copies = false;
+    bool report_split_count = false;
+    bool scheduler_trace = false;
+    bool pin_route_weights = false;
+    bool preserve_routes_for_diagnostics = false;
+};
+
+static const Ds4MixedMoePolicy & ds4_mixed_moe_policy() {
+    static const Ds4MixedMoePolicy policy = [] {
+        Ds4MixedMoePolicy result;
+        result.owner_local_reduction =
+            ds4_env_flag("DFLASH_DS4_CROSS_VENDOR_OWNER_SUMS");
+        result.direct_device_join =
+            ds4_env_flag("DFLASH_DS4_TP_PEER_FENCE") ||
+            moe_hybrid_graph_policy().device_join;
+        result.schedule_branches =
+            ds4_env_flag("DFLASH_DS4_TP_SCHEDULE_BRANCHES");
+        result.native_route_width =
+            ds4_env_flag("DFLASH_DS4_TP_NATIVE_ROUTE_WIDTH");
+        result.fused_hc_join =
+            ds4_env_flag("DFLASH_DS4_TP_FUSED_HC_JOIN");
+        result.late_join_split =
+            ds4_env_flag("DFLASH_DS4_TP_LATE_JOIN_SPLIT");
+        result.deferred_join_split =
+            ds4_env_flag("DFLASH_DS4_TP_DEVICE_JOIN_SPLIT");
+        result.batch_peer_copies =
+            ds4_env_flag("GGML_BATCH_PEER_COPIES") ||
+            ds4_env_flag("GGML_CUDA_BATCH_PEER_COPIES");
+        result.report_split_count =
+            ds4_env_flag("DFLASH_DS4_TP_SPLIT_COUNT");
+        result.scheduler_trace =
+            ds4_env_flag("DFLASH_DS4_TP_SCHED_TRACE");
+        result.pin_route_weights =
+            ds4_env_flag("DFLASH_DS4_TP_MAIN_ROUTE_WEIGHTS");
+        result.preserve_routes_for_diagnostics =
+            ds4_env_flag("DFLASH_DS4_TP_ROUTE_STATS") ||
+            ds4_env_flag("DFLASH_DS4_ROUTING_STATS_OUT") ||
+            ds4_env_flag("DFLASH_DS4_TP_CACHE_AUDIT");
+        return result;
+    }();
+    return policy;
+}
+
+template <typename T>
+static void ds4_fv_set_repeated_rows(
+        ggml_tensor * tensor,
+        const std::vector<T> & row) {
+    if (!tensor || row.empty()) return;
+    const size_t elements = (size_t) ggml_nelements(tensor);
+    GGML_ASSERT(elements % row.size() == 0);
+    std::vector<T> repeated(elements);
+    for (size_t offset = 0; offset < elements; offset += row.size()) {
+        std::copy(row.begin(), row.end(), repeated.begin() + offset);
+    }
+    ds4_fv_set(tensor, repeated.data(), repeated.size() * sizeof(T));
+}
 static bool ds4_fused_verify_enabled() {
     static int enabled = -1;
     if (enabled < 0) {
@@ -117,14 +182,10 @@ static void ds4_fused_verify_refresh_hybrid_luts(
                 cold_valid[(size_t) ie] = 1.0f;
             }
         }
-        ds4_fv_set(inputs.hot_local_lut, hot_lut.data(),
-                   sizeof(int32_t) * hot_lut.size());
-        ds4_fv_set(inputs.hot_valid_lut, hot_valid.data(),
-                   sizeof(float) * hot_valid.size());
-        ds4_fv_set(inputs.cold_local_lut, cold_lut.data(),
-                   sizeof(int32_t) * cold_lut.size());
-        ds4_fv_set(inputs.cold_valid_lut, cold_valid.data(),
-                   sizeof(float) * cold_valid.size());
+        ds4_fv_set_repeated_rows(inputs.hot_local_lut, hot_lut);
+        ds4_fv_set_repeated_rows(inputs.hot_valid_lut, hot_valid);
+        ds4_fv_set_repeated_rows(inputs.cold_local_lut, cold_lut);
+        ds4_fv_set_repeated_rows(inputs.cold_valid_lut, cold_valid);
     }
 }
 
@@ -297,6 +358,10 @@ static bool ds4_build_fused_verify_graph(
     }
     const int n_embd = w.n_embd;
     const int n_hc = w.n_hc;
+    const BackendPairCapabilities pair_capabilities = hybrid
+        ? backend_pair_capabilities(backend, hybrid->cold_backend)
+        : BackendPairCapabilities{true, true};
+    const bool same_gpu_runtime = pair_capabilities.same_runtime;
 
     const size_t arena_size = 256u * 1024 * 1024;
     if (fg.sg.meta_arena.size() < arena_size) fg.sg.meta_arena.resize(arena_size);
@@ -517,9 +582,34 @@ static bool ds4_build_fused_verify_graph(
         }
 
         if (hybrid) {
+            const Ds4MixedMoePolicy & mixed_policy =
+                ds4_mixed_moe_policy();
+            const bool cross_vendor_owner_sums =
+                !same_gpu_runtime &&
+                mixed_policy.owner_local_reduction;
             const bool allow_fused_combine =
-                ggml_backend_is_cuda(backend) &&
-                ggml_backend_is_cuda(hybrid->cold_backend);
+                same_gpu_runtime || cross_vendor_owner_sums;
+            const bool allow_direct_device_join =
+                pair_capabilities.native_gpu_handoff &&
+                mixed_policy.direct_device_join;
+            const bool schedule_host_staged_branches =
+                !same_gpu_runtime &&
+                mixed_policy.schedule_branches;
+            ggml_cgraph * hybrid_schedule_graph =
+                (allow_direct_device_join || schedule_host_staged_branches)
+                    ? gf : nullptr;
+            // Cross-vendor staging normally preserves canonical route order
+            // so it matches the single-owner reduction as closely as
+            // possible.  For performance qualification, allow each owner to
+            // reduce its routed experts locally and stage one [n_embd, q]
+            // partial instead of the full [n_embd, n_used, q] route tensor.
+            // This is the same join shape used by the qualified same-runtime
+            // heterogeneous path, but remains opt-in until exact-output and
+            // mixed-vendor burn-in have passed.
+            const MoeHybridJoinMode join_mode =
+                same_gpu_runtime || cross_vendor_owner_sums
+                    ? MoeHybridJoinMode::OwnerPartialSums
+                    : MoeHybridJoinMode::CanonicalRouteOrder;
             MoeHybridConfig hybrid_cfg = make_ds4_moe_hybrid_config(w);
             hybrid_cfg.n_expert_used = (int) selected->ne[0];
             MoeLayerDesc desc = make_ds4_moe_layer_desc(L);
@@ -540,7 +630,8 @@ static bool ds4_build_fused_verify_graph(
             // six routes in one owner graph: the legacy 4 + padded-2 split
             // computes two duplicate expert paths whose weights are zero.
             const bool native_route_width =
-                ds4_env_flag("DFLASH_DS4_TP_NATIVE_ROUTE_WIDTH");
+                !same_gpu_runtime ||
+                mixed_policy.native_route_width;
             if (lane_q > 1 && hybrid_cfg.n_expert_used > 4 && has_hot_routed &&
                 !native_route_width) {
                 const int route_width = hybrid_cfg.n_expert_used;
@@ -584,41 +675,39 @@ static bool ds4_build_fused_verify_graph(
                 }
                 if (!build_moe_hybrid_ffn_graph(
                         ctx,
-                        (ds4_env_flag("DFLASH_DS4_TP_PEER_FENCE") ||
-                         ds4_env_flag("DFLASH_DS4_TP_DEVICE_JOIN")) ? gf : nullptr,
+                        hybrid_schedule_graph,
                         hybrid_cfg, desc,
                         hybrid->layers[(size_t) il], ffn_normed,
                         first_ids, first_weights, lane_q, inputs, true,
-                        allow_fused_combine)) {
+                        allow_fused_combine, join_mode)) {
                     return false;
                 }
                 ffn_out = inputs.output;
 
                 if (!build_moe_hybrid_ffn_graph(
                         ctx,
-                        (ds4_env_flag("DFLASH_DS4_TP_PEER_FENCE") ||
-                         ds4_env_flag("DFLASH_DS4_TP_DEVICE_JOIN")) ? gf : nullptr,
+                        hybrid_schedule_graph,
                         hybrid_cfg, desc,
                         hybrid->layers[(size_t) il], ffn_normed,
                         padded_ids, padded_weights, lane_q, inputs, false,
-                        allow_fused_combine)) {
+                        allow_fused_combine, join_mode)) {
                     return false;
                 }
                 ffn_out = ggml_add(ctx, ffn_out, inputs.output);
             } else {
                 if (!build_moe_hybrid_ffn_graph(
                         ctx,
-                        (ds4_env_flag("DFLASH_DS4_TP_PEER_FENCE") ||
-                         ds4_env_flag("DFLASH_DS4_TP_DEVICE_JOIN")) ? gf : nullptr,
+                        hybrid_schedule_graph,
                         hybrid_cfg, desc,
                         hybrid->layers[(size_t) il],
                         ffn_normed, selected, router_weights,
-                        lane_q, inputs, true, allow_fused_combine)) {
+                        lane_q, inputs, true, allow_fused_combine,
+                        join_mode)) {
                     return false;
                 }
                 ffn_out = inputs.output;
                 if (lane_q > 1 && native_route_width &&
-                    ds4_env_flag("DFLASH_DS4_TP_FUSED_HC_JOIN") &&
+                    mixed_policy.fused_hc_join &&
                     inputs.main_output && inputs.peer_output) {
                     fused_hc_join_inputs = &inputs;
                 }
@@ -753,6 +842,17 @@ static bool ds4_build_fused_verify_graph(
                          "[ds4-fused-verify] scheduler CPU fallback unavailable\n");
             return false;
         }
+        const Ds4MixedMoePolicy & mixed_policy =
+            ds4_mixed_moe_policy();
+        if (!same_gpu_runtime && mixed_policy.direct_device_join) {
+            static bool warned_cross_vendor_join = false;
+            if (!warned_cross_vendor_join) {
+                std::fprintf(stderr,
+                    "[ds4-fused-verify] direct peer join disabled across GPU "
+                    "vendors; using scheduler host staging\n");
+                warned_cross_vendor_join = true;
+            }
+        }
         ggml_backend_t backends[3] = {
             backend, peer, hybrid->cpu_backend};
         fg.sched = ggml_backend_sched_new(
@@ -762,25 +862,21 @@ static bool ds4_build_fused_verify_graph(
                          "[ds4-fused-verify] scheduler creation failed\n");
             return false;
         }
-        const bool late_join_split =
-            ds4_env_flag("DFLASH_DS4_TP_LATE_JOIN_SPLIT");
+        const bool late_join_split = mixed_policy.late_join_split;
+        const MoeHybridGraphPolicy & moe_policy =
+            moe_hybrid_graph_policy();
         const bool targeted_join_split =
-            ds4_env_flag("DFLASH_DS4_TP_TARGETED_JOIN_SPLIT");
-        const bool device_join_split =
-            ds4_env_flag("DFLASH_DS4_TP_DEVICE_JOIN_SPLIT");
-        const bool batch_split_copies =
-            ds4_env_flag("GGML_CUDA_BATCH_PEER_COPIES");
-        const bool gpu_i32_repeat =
-            ds4_env_flag("LUCE_CUDA_I32_REPEAT");
-        const bool report_split_count =
-            ds4_env_flag("DFLASH_DS4_TP_SPLIT_COUNT");
+            moe_policy.targeted_join_split;
+        const bool device_join_split = mixed_policy.deferred_join_split;
+        const bool batch_split_copies = mixed_policy.batch_peer_copies;
+        const bool report_split_count = mixed_policy.report_split_count;
         ggml_backend_sched_set_late_cross_input_split(
             fg.sched, late_join_split);
         ggml_backend_sched_set_deferred_peer_copy_split(
             fg.sched, device_join_split);
         ggml_backend_sched_set_batch_split_copies(
             fg.sched, batch_split_copies);
-        if (ds4_env_flag("DFLASH_DS4_TP_SCHED_TRACE")) {
+        if (mixed_policy.scheduler_trace) {
             ggml_backend_sched_set_eval_callback(
                 fg.sched, ds4_fused_verify_trace_node, nullptr);
         }
@@ -807,26 +903,22 @@ static bool ds4_build_fused_verify_graph(
         pin_main(fg.mask_bundle);
         for (ggml_tensor * hids : fg.hash_ids) pin_main(hids);
         for (const MoeHybridGraphInputs & inputs : fg.hybrid_inputs) {
-            if (ds4_env_flag("DFLASH_DS4_TP_MAIN_ROUTE_WEIGHTS")) {
+            if (mixed_policy.pin_route_weights) {
                 for (ggml_tensor * node : inputs.router_nodes) {
                     pin_main(node);
                 }
                 pin_main(inputs.router_weights);
             }
-            if (ds4_env_flag("DFLASH_DS4_TP_ROUTE_PREFORK")) {
+            if (moe_policy.route_prefork) {
                 for (ggml_tensor * node : inputs.route_prefork_nodes) {
                     pin_main(node);
                 }
             }
             pin_main(inputs.hot_local_lut);
             pin_main(inputs.hot_valid_lut);
-            // q1 has no repeat.  The opt-in exact I32 GPU repeat lets q>1 keep
-            // both the LUT and its repeated output on the cold owner as well.
-            if (q == 1 || gpu_i32_repeat) {
-                pin_peer(inputs.cold_local_lut);
-            } else {
-                pin_main(inputs.cold_local_lut);
-            }
+            // The LUT is already q-batched and consumed only by the cold
+            // remap, so keep it with that owner for every verifier width.
+            pin_peer(inputs.cold_local_lut);
             pin_peer(inputs.cold_valid_lut);
             for (ggml_tensor * node : inputs.hot_remap_nodes) {
                 pin_main(node);
@@ -860,9 +952,7 @@ static bool ds4_build_fused_verify_graph(
             pin_main(route.selected);
             pin_main(route.weights);
         }
-        if (ds4_env_flag("DFLASH_DS4_TP_ROUTE_STATS") ||
-            ds4_env_flag("DFLASH_DS4_ROUTING_STATS_OUT") ||
-            ds4_env_flag("DFLASH_DS4_TP_CACHE_AUDIT")) {
+        if (mixed_policy.preserve_routes_for_diagnostics) {
             // Preserve the unsplit authoritative route and weight matrices.
             // Reading the pre-fork list is insufficient in the legacy 4+2
             // lowering because its second build overwrites the per-layer

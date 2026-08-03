@@ -173,13 +173,32 @@ static void ggml_cuda_mul_mat_q_impl(
     const bool use_native_mxfp4 = blackwell_mma_available(cc) && src0->type == GGML_TYPE_MXFP4;
     const bool grouped_src = !ids && ggml_mul_mat_is_grouped_src(dst);
     const ggml_tensor * grouped_physical = grouped_src ? src1->view_src : nullptr;
+    int64_t grouped_width = 0;
+    int64_t grouped_row_stride = 0;
+    int64_t grouped_plane_stride = 0;
     if (grouped_src) {
-        GGML_ASSERT(grouped_physical && grouped_physical->type == GGML_TYPE_F32);
-        GGML_ASSERT(grouped_physical->ne[2] ==
-                    ggml_mul_mat_grouped_src_groups(dst));
-        GGML_ASSERT(grouped_physical->ne[0] * grouped_physical->ne[2] == ne10);
-        GGML_ASSERT(grouped_physical->ne[1] == ne11);
-        GGML_ASSERT(grouped_physical->ne[3] == 1);
+        const int64_t groups = ggml_mul_mat_grouped_src_groups(dst);
+        GGML_ASSERT(groups > 1 && ne10 % groups == 0);
+        grouped_width = ne10 / groups;
+
+        if (grouped_physical) {
+            GGML_ASSERT(grouped_physical->type == GGML_TYPE_F32);
+            GGML_ASSERT(grouped_physical->ne[0] == grouped_width);
+            GGML_ASSERT(grouped_physical->ne[1] == ne11);
+            GGML_ASSERT(grouped_physical->ne[2] == groups);
+            GGML_ASSERT(grouped_physical->ne[3] == 1);
+            grouped_row_stride = grouped_physical->nb[1] / ts_src1;
+            grouped_plane_stride = grouped_physical->nb[2] / ts_src1;
+        } else {
+            // A scheduler copy between unlike backends materializes the raw
+            // bytes of the logical 2-D view as a standalone tensor. The bytes
+            // retain the grouped physical ordering, while view_src metadata
+            // cannot cross the allocation boundary. ggml_mul_mat_grouped_src
+            // guarantees a contiguous [width, rows, groups] physical source,
+            // so reconstruct those two strides from the op's group count.
+            grouped_row_stride = grouped_width;
+            grouped_plane_stride = grouped_width * ne11;
+        }
         GGML_ASSERT(!use_native_mxfp4);
     }
 
@@ -195,9 +214,8 @@ static void ggml_cuda_mul_mat_q_impl(
             if (grouped_src) {
                 quantize_mmq_q8_1_grouped_cuda(
                     src1_d, src1_q8_1.get(), src0->type,
-                    ne10, grouped_physical->ne[0],
-                    grouped_physical->nb[1] / ts_src1,
-                    grouped_physical->nb[2] / ts_src1,
+                    ne10, grouped_width,
+                    grouped_row_stride, grouped_plane_stride,
                     ne10_padded, ne11, stream);
             } else if (use_native_mxfp4) {
                 static_assert(sizeof(block_fp4_mmq) == 4 * sizeof(block_q8_1));

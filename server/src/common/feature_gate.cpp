@@ -62,16 +62,41 @@ std::string check_feature_compatibility(
                std::string(placement_backend_name(target_backend)) +
                " draft=" + placement_backend_name(draft_backend) + ")";
     }
-    // ── target layer split structure and remote backend topology
+    // ── target split structure and remote backend topology
+    const bool tensor_mode =
+        args.device.split_mode == TargetSplitMode::Tensor;
     if (!args.device.is_layer_split() &&
         !args.device.layer_split_weights.empty()) {
-        return "--target-layer-split requires --target-devices";
+        return tensor_mode
+            ? "--target-layer-split is incompatible with tensor parallelism"
+            : "--target-layer-split requires --target-devices";
     }
-    if (args.device.is_layer_split()) {
+    if (args.device.is_multi_device() || tensor_mode) {
         const std::string placement_error =
             validate_device_placement(args.device, /*device_count=*/-1);
         if (!placement_error.empty()) {
-            return "bad target layer split: " + placement_error;
+            return "bad target placement: " + placement_error;
+        }
+    }
+
+    // The target-only implementation is deliberately narrow: every rank must
+    // be a local CUDA device and target-replacing features are unsupported.
+    if (tensor_mode) {
+        if (arch != "qwen35") {
+            return "tensor parallelism is currently supported only for dense qwen35";
+        }
+        if (target_backend != PlacementBackend::Cuda ||
+            compiled_backend != PlacementBackend::Cuda) {
+            return "tensor parallelism currently requires local CUDA devices";
+        }
+        if (args.device.is_mixed_layer_split()) {
+            return "tensor parallelism requires homogeneous local devices";
+        }
+        if (args.remote_target_shard.enabled()) {
+            return "tensor parallelism is incompatible with --target-shard-ipc-bin";
+        }
+        if (features.pflash_enabled) {
+            return "tensor parallelism does not yet support prefill compression";
         }
     }
 
@@ -158,12 +183,17 @@ std::string check_feature_compatibility(
                arch + "')";
     }
 
-    // Approximate prefill and the fused decode options are implemented only
-    // in the monolithic HIP DeepSeek4 backend; the layer-split adapter and
-    // the CUDA path have no equivalent.
+    // Approximate prefill and fused decode are implemented only in the
+    // monolithic HIP DeepSeek4 backend. Expert top-k is model policy handled
+    // by either monolithic backend, but the layer-split adapter does not yet
+    // propagate it.
     const bool monolithic_ds4 =
         arch == "deepseek4" &&
         target_backend == PlacementBackend::Hip &&
+        !args.device.is_layer_split() &&
+        !args.remote_target_shard.enabled();
+    const bool local_ds4 =
+        arch == "deepseek4" &&
         !args.device.is_layer_split() &&
         !args.remote_target_shard.enabled();
 
@@ -177,11 +207,16 @@ std::string check_feature_compatibility(
                "--ds4-prefill exact for split, remote, or CUDA placement";
     }
 
-    // ── --ds4-fused-decode / --ds4-expert-top-k × placement
-    if ((args.ds4_fused_decode || args.ds4_expert_top_k != 0) &&
-        !monolithic_ds4) {
-        return "--ds4-fused-decode and --ds4-expert-top-k currently require "
-               "single-device HIP DeepSeek4";
+    // ── --ds4-fused-decode × placement
+    if (args.ds4_fused_decode && !monolithic_ds4) {
+        return "--ds4-fused-decode currently requires single-device HIP "
+               "DeepSeek4";
+    }
+
+    // ── --ds4-expert-top-k × architecture/adapter
+    if (args.ds4_expert_top_k != 0 && !local_ds4) {
+        return "--ds4-expert-top-k currently requires a single local "
+               "DeepSeek4 backend";
     }
 
     return {};
