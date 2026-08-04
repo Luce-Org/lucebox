@@ -1185,6 +1185,16 @@ if(DFLASH27B_TESTS)
     endif()
 
     # ─── Unit tests (no GPU, no model files) ────────────────────────────
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_test(
+            NAME ds4_exact_verify_parser
+            COMMAND "${Python3_EXECUTABLE}" -m unittest discover
+                -s "${CMAKE_CURRENT_SOURCE_DIR}/tests"
+                -p test_ds4_exact_verify_parity.py
+                -v)
+    endif()
+
     # The production CUDA and ROCm images share this entrypoint. Keep native
     # server defaults intact unless an operator explicitly supplies an env
     # override; otherwise container launches can silently disable features
