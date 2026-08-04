@@ -146,6 +146,23 @@ std::string check_feature_compatibility(
                placement_device_name(args.device) + " alone";
     }
 
+    // ── SSD-backed routed experts × architecture/dispatch path
+    // Auto and resident are safe everywhere. Forcing SSD must reach a complete
+    // storage+compute adapter; a prefetch-only integration is not sufficient.
+    const MoeStoragePolicy storage =
+        args.moe_storage.value_or(MoeStoragePolicy::Auto);
+    const bool split_dispatch =
+        args.device.is_layer_split() || args.remote_target_shard.enabled();
+    if (storage == MoeStoragePolicy::Ssd &&
+        !arch_supports_moe_ssd_storage(arch, split_dispatch)) {
+        if (split_dispatch && arch_supports_moe_ssd_storage(arch, false)) {
+            return "--moe-storage ssd is supported for architecture '" + arch +
+                   "' only on monolithic placement";
+        }
+        return "model architecture '" + arch +
+               "' does not support --moe-storage ssd";
+    }
+
     // ── remote draft execution × architecture
     if (args.remote_draft.enabled() && args.draft_path &&
         !arch_supports_remote_draft(arch)) {

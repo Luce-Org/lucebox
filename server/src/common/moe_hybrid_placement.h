@@ -14,6 +14,25 @@ namespace dflash::common {
 
 struct MoeHybridRoutingStats;  // forward decl
 
+// Functional MoE placement: the model's dense/recurrent graph remains on the
+// primary owner while selected routed experts may execute on a second GPU.
+// This is deliberately separate from contiguous layer splitting.
+struct MoeExpertOwnerPlacement {
+    int primary_gpu = 0;
+    int expert_gpu = 0;
+
+    bool heterogeneous() const { return primary_gpu != expert_gpu; }
+};
+
+// Resolve a reusable routed-expert owner. requested_expert_gpu >= 0 is an
+// explicit programmatic choice. -1 reads DFLASH_MOE_TP_GPU and then legacy
+// DeepSeek/IPC spellings; if none is set, experts stay on primary_gpu.
+bool resolve_moe_expert_owner_placement(
+    int primary_gpu,
+    int requested_expert_gpu,
+    MoeExpertOwnerPlacement & out,
+    std::string * err = nullptr);
+
 inline uint64_t moe_hybrid_core_bytes_from_memory(const char * log_prefix,
                                                   size_t gpu_free,
                                                   size_t gpu_total) {

@@ -225,6 +225,18 @@ If DeepSeek4 is started without an explicit target layer split, `DeepSeek4LayerS
 
 The runtime logs the chosen split with a `[deepseek4-split] auto-split:` banner.
 
+### NVMe cold-capacity tier
+
+When the cold expert stack cannot fit on its compute device, the inference
+engine turns safe remaining memory into an adaptive warm-expert cache and
+streams only exact routed misses from NVMe. This supports both R9700+Strix
+expert parallelism and a single Strix Halo. `--moe-storage auto` selects
+streaming when capacity requires it; `ssd` forces at least one cold expert per
+layer for qualification and `resident` prohibits SSD execution. On a
+full Lucebox the R9700 continues to own dense layers and hot experts. See
+[`MOE_NVME_STREAMING.md`](MOE_NVME_STREAMING.md) for the data path, tuning,
+and benchmark methodology.
+
 ## Environment Variables
 
 | Variable | Purpose |
@@ -245,6 +257,9 @@ The runtime logs the chosen split with a `[deepseek4-split] auto-split:` banner.
 | `DFLASH_DS4_COMP_PAD_STRIDE` | Exact compressed-KV padding bucket; wider buckets trade small masked work for fewer verifier graph captures. |
 | `DFLASH_DS4_DISABLE_GROUPED_OUTPUT_PROJECTION` | Diagnostic fallback for runtimes that cannot preserve grouped projection metadata across a scheduler copy. |
 | `DFLASH_CUDA_BACKEND_PATH` / `DFLASH_HIP_BACKEND_PATH` | Optional explicit peer backend module path. |
+| `DFLASH_MOE_STORAGE` | Environment equivalent of `--moe-storage auto|resident|ssd`; CLI takes precedence. |
+| `DFLASH_MOE_NVME_COLD_TIER` | Deprecated compatibility alias (`auto`, `on`, `off`). |
+| `DFLASH_MOE_NVME_DEVICE_CACHE_MB` | Optional explicit adaptive device expert-cache budget; auto mode otherwise uses safe free memory. |
 | `DFLASH_EXPERT_BUDGET_MB` | Main-GPU memory budget for hot experts. |
 | `DFLASH_DS4_HOTNESS_CSV` | Optional per-layer routing profile for hot placement. |
 | `GGML_BATCH_PEER_COPIES` | Batch peer-runtime copies and unlike-runtime pinned-host staging with one source wait per split. The old `GGML_CUDA_BATCH_PEER_COPIES` spelling remains an alias. |

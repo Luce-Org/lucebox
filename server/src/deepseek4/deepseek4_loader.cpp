@@ -992,8 +992,6 @@ bool build_deepseek4_moe_hybrid_storage_from_file_with_mmap(
         if (err) *err = mmap_err;
         return false;
     }
-    mmap.close_fd();
-
     const size_t data_start = gguf_get_data_offset(gctx);
     const auto * file_bytes = static_cast<const uint8_t *>(mmap.addr);
     std::vector<LayerExpertFileData> layer_file_data((size_t)w.n_layer);
@@ -1039,7 +1037,14 @@ bool build_deepseek4_moe_hybrid_storage_from_file_with_mmap(
     const MoeHybridConfig cfg = cfg_override ? *cfg_override : make_ds4_moe_hybrid_config(w);
     const bool ok = build_moe_hybrid_storage_from_file_with_mmap(
         cfg, backend, placement, layer_descs, layer_file_data,
-        mmap.addr, mmap.len, out, err, 0, cold_gpu_backend);
+        mmap.addr, mmap.len, out, err, 0, cold_gpu_backend,
+#if defined(_WIN32)
+        -1
+#else
+        mmap.fd
+#endif
+    );
+    mmap.close_fd();
 
     if (!ok) {
         mmap.close_map();

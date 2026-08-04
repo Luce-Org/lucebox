@@ -2071,8 +2071,9 @@ bool LagunaBackend::init_hybrid_mode() {
                 if (eb > max_expert_bytes) max_expert_bytes = eb;
             }
             std::string stream_err;
-            if (stream_engine_.init(backend_, max_expert_bytes, &stream_err)) {
-                std::printf("[laguna-hybrid] stream engine ready: pinned=%.1f MiB scratch=%.1f MiB\n",
+            if (stream_engine_.init(backend_, max_expert_bytes, *moe_hybrid_, &stream_err)) {
+                std::printf("[laguna-hybrid] SSD stream engine ready: io=%s pinned=%.1f MiB scratch=%.1f MiB\n",
+                            stream_engine_.io_backend_name(),
                             stream_engine_.pinned_bytes() / 1024.0 / 1024.0,
                             stream_engine_.scratch_bytes() / 1024.0 / 1024.0);
             } else {
@@ -3129,14 +3130,10 @@ bool LagunaBackend::build_hybrid_storage_from_file(
     }
     const size_t file_size = _mf.size();
     // Transfer mmap ownership out of the RAII wrapper: the hybrid storage keeps
-    // the mapping alive and unmaps it in ~MoeHybridStorage. On POSIX the fd can
-    // be closed now (the mapping stays valid); on Windows release() already
-    // closed the mapping handle.
+    // the mapping alive and unmaps it in ~MoeHybridStorage. Keep the POSIX fd
+    // through storage construction so it can retain an async-I/O duplicate.
     GgufMmap::OwnedRegion _region = _mf.release();
     const void * mmap_addr = _region.data;
-#if !defined(_WIN32)
-    if (_region.fd >= 0) ::close(_region.fd);
-#endif
 
     const size_t data_start = gguf_get_data_offset(gctx);
     const auto * file_bytes = (const uint8_t *)mmap_addr;
@@ -3168,9 +3165,12 @@ bool LagunaBackend::build_hybrid_storage_from_file(
     int cache_slots = 0;
     if (const char * cs = std::getenv("DFLASH_LAGUNA_CACHE_SLOTS")) cache_slots = std::max(0, std::atoi(cs));
     else if (cache_slots_ >= 0) cache_slots = cache_slots_;
-    bool ok = build_moe_hybrid_storage_from_file_with_mmap(hybrid_cfg, backend_, placement,
-                                                            layer_descs, layer_file_data,
-                                                            mmap_addr, file_size, *hybrid, &err, cache_slots);
+    bool ok = build_moe_hybrid_storage_from_file_with_mmap(
+        hybrid_cfg, backend_, placement, layer_descs, layer_file_data,
+        mmap_addr, file_size, *hybrid, &err, cache_slots, nullptr, _region.fd);
+#if !defined(_WIN32)
+    if (_region.fd >= 0) ::close(_region.fd);
+#endif
     gguf_free(gctx);
     if (!ok) {
 #if defined(_WIN32)

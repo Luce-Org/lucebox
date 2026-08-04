@@ -23,6 +23,8 @@ The same mechanism supports GPU+CPU offload on a memory-constrained card and GPU
 | `moe_hybrid_placement.{h,cpp}` | Hot/cold assignment: greedy budget allocation from stats |
 | `moe_hybrid_swap_manager.{h,cpp}` | Runtime expert promotion/demotion between requests |
 | `moe_hybrid_storage.{h,cpp}` | Compact owner-local buffers for split expert tensors |
+| `moe_nvme_scheduler.{h,cpp}` | Bounded priority SSD I/O, exact expert cache, and leases |
+| `moe_hybrid_stream.{h,cpp}` | Pipelined pinned-host to GPU staging and streamed expert evaluation |
 | `moe_hybrid_ffn_eval.{h,cpp}` | Concurrent owner execution and partial-result joining |
 | `moe_expert_compute.{h,cpp}` | Backend-neutral selected-expert compute interface |
 | `moe_expert_compute_ipc.cpp` | Second-GPU process transport and architecture adapter registry |
@@ -36,12 +38,14 @@ Model-agnostic architecture descriptor:
 ```cpp
 struct MoeHybridConfig {
     int n_embd;           // hidden dimension
+    int n_expert_embd;    // routed latent dim; 0 means n_embd
     int n_expert;         // total experts per layer
     int n_expert_used;    // top-k selected per token
     int n_ff_exp;         // routed expert intermediate dim
     int n_ff_shexp;       // shared expert intermediate dim (0 = none)
     int n_layer;          // number of MoE layers
     int first_moe_layer;  // first MoE layer index
+    MoeGatedActivation gated_activation; // SwiGLU or SiTU
 };
 ```
 
@@ -152,6 +156,11 @@ Two loading paths:
 1. **From backend tensors** (`build_moe_hybrid_storage`): Reads expert slices from already-loaded full stacks and compacts them into owner-local buffers.
 
 2. **From file** (`build_moe_hybrid_storage_from_file`): Reads expert slices directly from mmap'd GGUF data into the selected owners, avoiding a temporary full expert stack on either GPU.
+
+3. **NVMe capacity tier**: Leaves non-resident cold tensors in the model file,
+   retains exact per-layer byte descriptors, and loads only routed misses into
+   a bounded pinned-host pipeline plus an adaptive complementary-GPU cache. See
+   [`MOE_NVME_STREAMING.md`](MOE_NVME_STREAMING.md).
 
 Both paths produce the same `MoeHybridStorage` containing per-layer split buffers ready for evaluation.
 

@@ -364,6 +364,7 @@ set(DFLASH27B_SRC_INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen3
     ${CMAKE_CURRENT_SOURCE_DIR}/src/gemma4
     ${CMAKE_CURRENT_SOURCE_DIR}/src/deepseek4
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/kimi_k3
     ${CMAKE_CURRENT_SOURCE_DIR}/src/server
 )
 
@@ -396,6 +397,10 @@ add_library(dflash_common STATIC
     src/deepseek4/deepseek4_target_shard_ipc_daemon.cpp
     src/deepseek4/deepseek4_dspark.cpp
     src/deepseek4/deepseek4_dspark_spec.cpp
+    # Kimi-K3 hybrid KDA/MLA + latent-MoE target arch
+    src/kimi_k3/kimi_k3_loader.cpp
+    src/kimi_k3/kimi_k3_graph.cpp
+    src/kimi_k3/kimi_k3_backend.cpp
     src/flashprefill_q8.cpp
     src/kv_cache.cpp
     src/kv_quant.cpp
@@ -434,6 +439,9 @@ add_library(dflash_common STATIC
     src/common/moe_hybrid_storage.cpp
     src/common/spark_corpus.cpp
     src/common/moe_hybrid_ffn_eval.cpp
+    src/common/moe_nvme_scheduler.cpp
+    src/common/moe_expert_package.cpp
+    src/common/moe_stream_cache_policy.cpp
     src/common/moe_hybrid_stream.cpp
     src/common/moe_expert_compute.cpp
     src/common/moe_expert_compute_cpu.cpp
@@ -757,6 +765,10 @@ target_link_libraries(dflash_common
         ggml-base
         nlohmann_json::nlohmann_json
 )
+# The NVMe scheduler uses a bounded worker pool on platforms where io_uring is
+# unavailable (and as its portable fallback).
+find_package(Threads REQUIRED)
+target_link_libraries(dflash_common PUBLIC Threads::Threads)
 # OpenMP for parallel MoE expert compute kernel (saturate memory bandwidth).
 find_package(OpenMP)
 if(OpenMP_CXX_FOUND)
@@ -804,6 +816,107 @@ if(DFLASH27B_TESTS)
             target_link_libraries(test_platform_compat PRIVATE ws2_32)
         endif()
         add_test(NAME platform_compat COMMAND test_platform_compat)
+    endif()
+
+    # SSD scheduling is deliberately independent of ggml and the GPU runtime.
+    # Keep its correctness tests lightweight so queueing/cache invariants are
+    # exercised even on CPU-only CI workers.
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_moe_nvme_scheduler.cpp")
+        add_executable(test_moe_nvme_scheduler
+            test/test_unit_main.cpp
+            test/test_moe_nvme_scheduler.cpp
+            src/common/moe_nvme_scheduler.cpp)
+        target_include_directories(test_moe_nvme_scheduler PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/common
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
+        target_link_libraries(test_moe_nvme_scheduler PRIVATE Threads::Threads)
+        list(APPEND _raw_unit_test_targets test_moe_nvme_scheduler)
+    endif()
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_moe_expert_package.cpp")
+        add_executable(test_moe_expert_package
+            test/test_unit_main.cpp
+            test/test_moe_expert_package.cpp
+            src/common/moe_expert_package.cpp
+            src/common/moe_nvme_scheduler.cpp)
+        target_include_directories(test_moe_expert_package PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/common
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
+        target_link_libraries(test_moe_expert_package PRIVATE Threads::Threads)
+        list(APPEND _raw_unit_test_targets test_moe_expert_package)
+    endif()
+
+    # Read-only microbenchmark for tuning the exact expert I/O path on the
+    # deployment SSD. It accepts any sufficiently large file; no model parser
+    # or generated benchmark data is required.
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/bench_moe_nvme_io.cpp")
+        add_executable(bench_moe_nvme_io
+            test/bench_moe_nvme_io.cpp
+            src/common/moe_nvme_scheduler.cpp)
+        target_include_directories(bench_moe_nvme_io PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/common
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
+        target_link_libraries(bench_moe_nvme_io PRIVATE Threads::Threads)
+    endif()
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/bench_moe_nvme_pipeline.cpp")
+        add_executable(bench_moe_nvme_pipeline test/bench_moe_nvme_pipeline.cpp)
+        target_include_directories(bench_moe_nvme_pipeline PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/common
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
+        target_link_libraries(bench_moe_nvme_pipeline PRIVATE
+            dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            target_link_libraries(bench_moe_nvme_pipeline PRIVATE CUDA::cudart)
+        else()
+            target_link_libraries(bench_moe_nvme_pipeline PRIVATE hip::host)
+        endif()
+    endif()
+
+    # End-to-end numerical check for the reusable streamed-expert graph. It
+    # uses tiny generated F32 experts and defaults to GPU 0, so a Strix-only
+    # machine can run it without any model download. DFLASH_TEST_GPU selects a
+    # different device on multi-GPU qualification hosts.
+    if(UNIX AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_moe_stream_compute.cpp")
+        add_executable(test_moe_stream_compute
+            test/test_unit_main.cpp
+            test/test_moe_stream_compute.cpp)
+        target_include_directories(test_moe_stream_compute PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/common
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src)
+        target_link_libraries(test_moe_stream_compute PRIVATE
+            dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            target_link_libraries(test_moe_stream_compute PRIVATE CUDA::cudart)
+        else()
+            target_link_libraries(test_moe_stream_compute PRIVATE hip::host)
+        endif()
+        list(APPEND _raw_unit_test_targets test_moe_stream_compute)
+    endif()
+
+    # Kimi-K3 routed-core qualification. This replays the exact latent-expert
+    # geometry (IQ1_S, 3584 -> 3072 -> 3584, SiTU) through the common NVMe
+    # stream engine. It is deliberately independent of a Kimi model loader so
+    # the hardware path can be qualified before downloading the 594 GB model.
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/bench_kimi_k3_hetero.cpp")
+        add_executable(bench_kimi_k3_hetero test/bench_kimi_k3_hetero.cpp)
+        target_include_directories(bench_kimi_k3_hetero PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/common
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
+        target_link_libraries(bench_kimi_k3_hetero PRIVATE
+            dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            target_link_libraries(bench_kimi_k3_hetero PRIVATE CUDA::cudart)
+        else()
+            target_link_libraries(bench_kimi_k3_hetero PRIVATE hip::host)
+        endif()
     endif()
 
     if(DFLASH27B_GPU_BACKEND STREQUAL "hip"
@@ -1056,6 +1169,17 @@ if(DFLASH27B_TESTS)
         target_include_directories(smoke_qwen3_forward PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         target_link_libraries(smoke_qwen3_forward PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
     endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_kimi_k3_forward.cpp")
+        add_executable(smoke_kimi_k3_forward test/smoke_kimi_k3_forward.cpp)
+        target_include_directories(smoke_kimi_k3_forward PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        target_link_libraries(smoke_kimi_k3_forward PRIVATE
+            dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            target_link_libraries(smoke_kimi_k3_forward PRIVATE CUDA::cudart)
+        else()
+            target_link_libraries(smoke_kimi_k3_forward PRIVATE hip::host)
+        endif()
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_vs_oracle.cpp")
         add_executable(test_vs_oracle test/test_vs_oracle.cpp)
         target_include_directories(test_vs_oracle PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
@@ -1235,6 +1359,8 @@ if(DFLASH27B_TESTS)
             test/test_kvflash_placement.cpp
             test/test_kvflash_pool_sizing.cpp
             test/test_kvflash_qk.cpp
+            test/test_moe_expert_owner_placement.cpp
+            test/test_moe_stream_owner_partition.cpp
             test/test_qwen35moe_routing_stats.cpp
             test/test_qwen35moe_expert_placement.cpp
             test/test_qwen35moe_swap_manager.cpp

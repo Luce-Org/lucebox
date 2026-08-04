@@ -9,6 +9,9 @@
 #include "placement/remote_draft_config.h"
 #include "placement/remote_target_shard_config.h"
 #include "prefill_attention_mode.h"
+#include "moe_storage_policy.h"
+
+#include <optional>
 
 namespace dflash::common {
 
@@ -54,6 +57,11 @@ struct BackendArgs {
     // deepseek4-specific decode options
     int             ds4_expert_top_k = 0;  // 0 = model default
     bool            ds4_fused_decode = false;
+
+    // Routed-MoE capacity policy. An unset value allows the factory to apply
+    // environment compatibility and the default; an explicit Auto must remain
+    // distinguishable because CLI always wins over environment configuration.
+    std::optional<MoeStoragePolicy> moe_storage;
 
     // Attention and speculative-decode options. Individual backends consume
     // only the fields they support.

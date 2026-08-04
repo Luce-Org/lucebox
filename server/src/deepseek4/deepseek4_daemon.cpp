@@ -5,6 +5,7 @@
 #include "common/daemon_loop.h"
 
 #include <cstdio>
+#include <cstdlib>
 
 namespace dflash::common {
 
@@ -19,6 +20,18 @@ int run_deepseek4_daemon(const char * model_path,
     cfg.stream_fd  = stream_fd;
     cfg.max_ctx    = max_ctx;
     cfg.chunk      = chunk > 0 ? chunk : 512;
+    const MoeStoragePolicyResolution storage = resolve_moe_storage_policy(
+        {}, std::getenv(kMoeStorageEnvironment),
+        std::getenv(kLegacyMoeStorageEnvironment));
+    if (!storage.ok()) {
+        std::fprintf(stderr, "[deepseek4-daemon] %s\n", storage.error.c_str());
+        return 2;
+    }
+    if (!storage.warning.empty()) {
+        std::fprintf(stderr, "[deepseek4-daemon] warning: %s\n",
+                     storage.warning.c_str());
+    }
+    cfg.moe_storage = storage.policy;
 
     auto backend = std::make_unique<DeepSeek4Backend>(cfg);
     if (!backend->init()) {

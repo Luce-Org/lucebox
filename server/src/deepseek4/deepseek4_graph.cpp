@@ -2981,7 +2981,7 @@ static bool eval_ds4_hybrid(
                         hybrid_owner->mmap_data, hybrid_owner->mmap_size,
                         hybrid_cfg, desc, regions, storage,
                         token_inp, token_selected, token_weights, 1,
-                        cold_out, &err)) {
+                        cold_out, &err, layer)) {
                     std::fprintf(stderr,
                                  "[deepseek4] layer %d cold streaming eval failed: %s\n",
                                  layer, err.c_str());

@@ -34,11 +34,14 @@ public:
     PlacementBackend target_backend() const { return target_backend_; }
     PlacementBackend compiled_backend() const { return compiled_backend_; }
     const BackendFeatureConfig & features() const { return features_; }
+    MoeStoragePolicy moe_storage_policy() const { return moe_storage_.policy; }
+    MoeStoragePolicySource moe_storage_source() const { return moe_storage_.source; }
 
 private:
     std::string          model_path_;
     GgufModelInfo        model_;
     BackendFeatureConfig features_;
+    MoeStoragePolicyResolution moe_storage_;
     PlacementBackend    target_backend_ = PlacementBackend::Auto;
     PlacementBackend    compiled_backend_ = PlacementBackend::Auto;
 

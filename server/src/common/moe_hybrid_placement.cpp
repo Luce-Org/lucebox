@@ -4,10 +4,52 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cerrno>
+#include <cstdlib>
 #include <fstream>
+#include <limits>
 #include <numeric>
 
 namespace dflash::common {
+
+bool resolve_moe_expert_owner_placement(
+        int primary_gpu,
+        int requested_expert_gpu,
+        MoeExpertOwnerPlacement & out,
+        std::string * err) {
+    if (primary_gpu < 0 || requested_expert_gpu < -1) {
+        if (err) *err = "MoE owner GPU indices must be non-negative";
+        return false;
+    }
+
+    int expert_gpu = requested_expert_gpu;
+    if (expert_gpu < 0) {
+        const char * raw = std::getenv("DFLASH_MOE_TP_GPU");
+        if (!raw || !*raw) raw = std::getenv("DFLASH_DS4_MOE_TP_GPU");
+        if (!raw || !*raw) {
+            raw = std::getenv("DFLASH_MOE_EXPERT_COMPUTE_IPC_GPU");
+        }
+        if (!raw || !*raw) {
+            expert_gpu = primary_gpu;
+        } else {
+            errno = 0;
+            char * end = nullptr;
+            const long parsed = std::strtol(raw, &end, 10);
+            if (errno != 0 || end == raw || *end != '\0' || parsed < 0 ||
+                parsed > std::numeric_limits<int>::max()) {
+                if (err) {
+                    *err = std::string("invalid routed-expert GPU: ") + raw;
+                }
+                return false;
+            }
+            expert_gpu = static_cast<int>(parsed);
+        }
+    }
+
+    out.primary_gpu = primary_gpu;
+    out.expert_gpu = expert_gpu;
+    return true;
+}
 
 bool MoeHybridPlacement::matches(int n_layer_, int n_expert_, int n_expert_used_) const {
     return n_layer == n_layer_ &&

@@ -101,6 +101,8 @@ static void print_usage(const char * prog) {
         "  --ds4-prefill <mode> DeepSeek4 prefill: exact, dense, or sparse\n"
         "                       (default: exact; dense/sparse are experimental\n"
         "                       and may change generated tokens)\n"
+        "  --moe-storage <mode> Routed-MoE storage: auto, resident, or ssd\n"
+        "                       (default: auto; env: DFLASH_MOE_STORAGE)\n"
         "  --fa-window <N>     Flash-attention sliding window (default: 0=full).\n"
         "                       WARNING: >0 drops system prompt / tool definitions\n"
         "                       from attention at long contexts. Use 0 for tools.\n"
@@ -325,6 +327,24 @@ int main(int argc, char ** argv) {
             bargs.device.peer_access = true;
         } else if (std::strcmp(argv[i], "--chunk") == 0 && i + 1 < argc) {
             bargs.chunk = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--moe-storage") == 0) {
+            MoeStoragePolicy policy;
+            if (i + 1 >= argc ||
+                !parse_moe_storage_policy(argv[i + 1], policy)) {
+                std::fprintf(stderr,
+                    "[server] --moe-storage expects auto, resident, or ssd\n");
+                return 2;
+            }
+            ++i;
+            bargs.moe_storage = policy;
+        } else if (std::strncmp(argv[i], "--moe-storage=", 14) == 0) {
+            MoeStoragePolicy policy;
+            if (!parse_moe_storage_policy(argv[i] + 14, policy)) {
+                std::fprintf(stderr,
+                    "[server] --moe-storage expects auto, resident, or ssd\n");
+                return 2;
+            }
+            bargs.moe_storage = policy;
         } else if (std::strcmp(argv[i], "--ds4-fused-decode") == 0) {
             bargs.ds4_fused_decode = true;
         } else if (std::strcmp(argv[i], "--ds4-expert-top-k") == 0 && i + 1 < argc) {
@@ -975,6 +995,10 @@ int main(int argc, char ** argv) {
                  sconfig.effort_tiers.max, src_of(cli_set.effort_max));
     std::fprintf(stderr, "[server] │  target_device   = %s\n",
                  placement_device_name(bargs.device).c_str());
+    std::fprintf(stderr, "[server] │  moe_storage     = %s (%s)\n",
+                 moe_storage_policy_name(backend_plan.moe_storage_policy()),
+                 moe_storage_policy_source_name(
+                     backend_plan.moe_storage_source()));
     std::fprintf(stderr, "[server] │  target_split    = %s\n",
                  target_split_mode_name(bargs.device.split_mode));
     if (bargs.device.is_multi_device()) {

@@ -23,10 +23,18 @@ enum class MoeHybridColdBackend {
     Gpu,
 };
 
+enum class MoeGatedActivation {
+    SwiGlu,
+    Situ,
+};
+
 // ─── MoE architecture config (model-agnostic) ──────────────────────────
 
 struct MoeHybridConfig {
     int n_embd        = 0;   // hidden dimension
+    // Some MoEs project hidden states into a smaller routed-expert latent
+    // space (Kimi K3: 7168 -> 3584). Zero means use n_embd.
+    int n_expert_embd = 0;
     int n_expert      = 0;   // total experts per layer
     int n_expert_used = 0;   // top-k selected per token
     int n_ff_exp      = 0;   // routed expert intermediate dimension
@@ -34,6 +42,9 @@ struct MoeHybridConfig {
     int n_layer       = 0;   // number of MoE layers
     int first_moe_layer = 0; // index of first MoE layer (e.g., 0 for qwen35moe, 1 for laguna)
     float swiglu_clamp = 0.0f; // 0 = regular SwiGLU; >0 clamps gate upper/up symmetric (DS4)
+    MoeGatedActivation gated_activation = MoeGatedActivation::SwiGlu;
+    float situ_beta = 4.0f;
+    float situ_linear_beta = 25.0f;
     MoeHybridColdBackend cold_expert_backend = MoeHybridColdBackend::Cpu;
     bool materialize_hot_experts = true;
     bool materialize_cold_experts = true;
@@ -43,6 +54,8 @@ struct MoeHybridConfig {
     // On sm_75 (Turing) and gfx1151, the kernel has illegal memory accesses
     // with reduced stacks, requiring the <=4-token sub-batch workaround.
     bool mmq_safe_full_batch = false;
+
+    int expert_embd() const { return n_expert_embd > 0 ? n_expert_embd : n_embd; }
 };
 
 // ─── Per-layer expert tensor descriptor ─────────────────────────────────

@@ -16,10 +16,27 @@ namespace dflash::common {
 
 struct MoeHybridRoutingStats;
 
-// File region for one expert tensor (offset into mmap).
+// File region for one expert tensor. source_index is zero for ordinary
+// single-file models and selects a shard for split GGUF models.
 struct ExpertFileRegion {
     size_t offset = 0;
     size_t size   = 0;
+    uint32_t source_index = 0;
+};
+
+// Optional expert-major representation. All components of one expert occupy
+// one contiguous record, allowing one storage request instead of two or three
+// tensor-major requests. The numerical tensor types and values are unchanged;
+// only their physical ordering differs. Model adapters can leave this disabled
+// for ordinary GGUF tensor-major files.
+struct ExpertMajorFileLayout {
+    ExpertFileRegion experts;
+    size_t expert_stride = 0;
+    size_t gate_offset = 0;
+    size_t up_offset = 0;
+    size_t down_offset = 0;
+    size_t gate_up_offset = 0;
+    bool enabled = false;
 };
 
 // Per-layer file regions for all expert tensors (used by streaming prefill).
@@ -33,6 +50,7 @@ struct LayerExpertRegions {
     size_t expert_bytes_down    = 0;
     size_t expert_bytes_gate_up = 0;
     bool   fused_gate_up        = false;
+    ExpertMajorFileLayout expert_major;
 };
 
 // Cached FFN graph for a fixed number of selected experts.
@@ -211,7 +229,9 @@ struct MoeHybridStorage {
     // When set, the streaming engine can DMA cold experts directly from here.
     const void * mmap_data = nullptr;
     size_t mmap_size = 0;
-    int mmap_fd = -1;  // POSIX fd for madvise; -1 on Windows or if not available
+    // Owned duplicate of the model fd. The SSD scheduler duplicates it again,
+    // allowing io_uring/pread/O_DIRECT without coupling its lifetime to mmap.
+    int mmap_fd = -1;
 
     // Per-layer file region metadata for streaming (populated when mmap is active).
     std::vector<LayerExpertRegions> layer_regions;
@@ -287,6 +307,7 @@ bool build_moe_hybrid_storage_from_file_with_mmap(
     MoeHybridStorage & out,
     std::string * err = nullptr,
     int cache_slots = 0,
-    ggml_backend_t cold_gpu_backend = nullptr);
+    ggml_backend_t cold_gpu_backend = nullptr,
+    int mmap_fd = -1);
 
 }  // namespace dflash::common
