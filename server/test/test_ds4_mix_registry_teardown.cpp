@@ -57,9 +57,13 @@ const void * fake_base(int i) {
     return (const void *) (uintptr_t) (0x100000000ull + (uintptr_t) i * 0x1000000ull);
 }
 
+// IN must be a multiple of 128: qtype-106 validates that at the registration chokepoint so
+// its 16 B wide-load window stays in bounds on the final block, and registering with a
+// smaller row aborts. That check is doing its job -- the fixture has to satisfy the real
+// invariant rather than the check be relaxed for a test's convenience.
 constexpr int    E    = 4;
 constexpr int    OUT  = 32;
-constexpr int    IN   = 32;
+constexpr int    IN   = 128;
 constexpr size_t NB02 = 4096;
 
 void register_as(bool is105, const void * base) {
