@@ -21,6 +21,11 @@
 #include <cstdlib>
 #include <string>
 #include <unistd.h>
+#include <vector>
+
+// C++ linkage, matching the definitions in rocmfp{2,3}_mix.cu. Pure pointer-range lookups.
+bool ggml_cuda_rocmfp3_mix_registered(const void * vx);
+bool ggml_cuda_rocmfp2_mix_registered(const void * vx);
 
 using dflash::common::DeepSeek4Weights;
 using dflash::common::load_deepseek4_gguf;
@@ -75,8 +80,45 @@ int main() {
         bool ok2 = load_deepseek4_gguf(tmp_model, backend, w);
         CHECK(ok2, "retry with a valid sidecar succeeds on the reused object");
         CHECK(w.ctx != nullptr && w.buf != nullptr, "reused load holds fresh handles");
+
+        // 3. Registry teardown must cover EVERY mix tensor class, not just the experts.
+        //    free_deepseek4_weights originally walked only ffn_down/gate/up, so the dense
+        //    attention classes registered by the dmix sidecar were left behind: their device
+        //    codebooks leaked and their ranges kept resolving against released buffers, so a
+        //    later allocation at the same address answered with stale side data.
+        //
+        //    Bases are captured BEFORE the free and queried after. registered() is pure
+        //    pointer-range arithmetic and never dereferences the key, so this is safe on a
+        //    freed address -- and it is precisely the stale-range question being asked.
+        std::vector<const void *> mix105, mix106;
+        for (const auto & L : w.layers) {
+            ggml_tensor * const dense[] = {
+                L.attn_q_a, L.attn_q_b, L.attn_kv, L.attn_output_a, L.attn_output_b,
+                L.ffn_down_exps, L.ffn_gate_exps, L.ffn_up_exps,
+            };
+            for (ggml_tensor * t : dense) {
+                if (!t || !t->data) continue;
+                if (t->type == GGML_TYPE_Q3_1_ROCMFP3_MIX) mix105.push_back(t->data);
+                else if (t->type == GGML_TYPE_Q2_1_ROCMFP2_MIX) mix106.push_back(t->data);
+            }
+        }
+        std::fprintf(stderr, "note: %zu qtype-105 and %zu qtype-106 mix tensors registered\n",
+                     mix105.size(), mix106.size());
+
         free_deepseek4_weights(w);
         CHECK(w.ctx == nullptr && w.buf == nullptr, "clean release after success");
+
+        size_t stale = 0;
+        for (const void * b : mix105) if (ggml_cuda_rocmfp3_mix_registered(b)) ++stale;
+        for (const void * b : mix106) if (ggml_cuda_rocmfp2_mix_registered(b)) ++stale;
+        CHECK(stale == 0, "no mix registry entry survives free (dense classes included)");
+
+        // 4. And it must be reloadable afterwards: a surviving range would either be hit by
+        //    the new allocation or trip the registry's own duplicate handling.
+        bool ok3 = load_deepseek4_gguf(tmp_model, backend, w);
+        CHECK(ok3, "reload succeeds after a clean free");
+        free_deepseek4_weights(w);
+        CHECK(w.ctx == nullptr && w.buf == nullptr, "clean release after reload");
     } else {
         std::fprintf(stderr, "note: no real sidecar at %s; skipped success-retry leg\n",
                      real_side.c_str());

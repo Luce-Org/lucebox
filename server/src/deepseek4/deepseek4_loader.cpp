@@ -630,6 +630,44 @@ static const char * ds4_dmix_class_name(uint32_t cls) {
     }
 }
 
+// Header validation for one dmix sidecar entry, factored out so the malformed cases are
+// reachable from a unit test: the parser that calls it is static and reads from a FILE*, so
+// covering "rejects mode 2" or "rejects a duplicate" through it would need a fixture model
+// and a hand-forged sidecar on disk for every case.
+//
+// `already_covered` is the caller's covered[layer][cls]; passing it in keeps the duplicate
+// rule here with the rest of the entry rules rather than split across two places.
+// Returns nullptr when the entry is acceptable, else a short reason for the caller to log.
+const char * ds4_dmix_entry_reject_reason(
+        uint32_t layer, uint32_t cls, uint32_t qtype, uint32_t nslices,
+        uint32_t C, uint32_t K, uint8_t mode,
+        uint32_t n_layers, bool already_covered) {
+    if (layer >= n_layers || cls >= DS4_DMIX_CLASSES) {
+        return "out of range";
+    }
+    const uint32_t want_K = (qtype == (uint32_t) DS4_QTYPE_ROCMFP3_MIX) ? 8u : 4u;
+    if (C != 2 || K != want_K ||
+        (qtype != (uint32_t) DS4_QTYPE_ROCMFP3_MIX &&
+         qtype != (uint32_t) DS4_QTYPE_ROCMFP2_MIX)) {
+        return "unexpected qtype/C/K";
+    }
+    if (nslices == 0 || nslices > 4096) {
+        return "bad nslices";
+    }
+    // The kernels branch on mode != 0, so an unrecognised future mode would be silently
+    // decoded as adaptive against a codebook that means something else.
+    if (mode > DS4_P4MIX_MAX_MODE) {
+        return "unsupported mode";
+    }
+    // Exact coverage once per tensor is the loader's contract; the caller enforces the
+    // "at least once" half. Without this a second entry silently replaces the first
+    // registration -- later codebook wins, earlier one leaks, nothing reported.
+    if (already_covered) {
+        return "duplicate (layer, class)";
+    }
+    return nullptr;
+}
+
 static ggml_tensor * ds4_dmix_class_tensor(const DeepSeek4Layer & L, uint32_t cls) {
     switch (cls) {
         case 0: return L.attn_q_a;
@@ -692,42 +730,17 @@ static bool ds4_register_dmix_sidecar(const std::string & gguf_path,
             std::fprintf(stderr, "[deepseek4] truncated dmix sidecar (entry %u header)\n", i);
             ok = false; break;
         }
-        // Bound everything BEFORE it is used to size a read or an allocation.
-        if (layer >= n_layers_out || cls >= DS4_DMIX_CLASSES) {
-            std::fprintf(stderr, "[deepseek4] dmix entry %u out of range: layer=%u cls=%u\n",
-                         i, layer, cls);
-            ok = false; break;
-        }
-        const uint32_t want_K = (qtype == (uint32_t) DS4_QTYPE_ROCMFP3_MIX) ? 8u : 4u;
-        if (C != 2 || K != want_K ||
-            (qtype != (uint32_t) DS4_QTYPE_ROCMFP3_MIX &&
-             qtype != (uint32_t) DS4_QTYPE_ROCMFP2_MIX)) {
-            std::fprintf(stderr, "[deepseek4] dmix entry %u (L%u %s) unexpected "
-                         "qtype=%u C=%u K=%u\n", i, layer, ds4_dmix_class_name(cls),
-                         qtype, C, K);
-            ok = false; break;
-        }
-        if (nslices == 0 || nslices > 4096) {
-            std::fprintf(stderr, "[deepseek4] dmix entry %u (L%u %s) bad nslices=%u\n",
-                         i, layer, ds4_dmix_class_name(cls), nslices);
-            ok = false; break;
-        }
-        // The kernels branch on mode != 0, so an unrecognised future mode would be silently
-        // decoded as adaptive with a codebook that means something else. The p4mix and gumix
-        // parsers bound this; dmix did not.
-        if (mode > DS4_P4MIX_MAX_MODE) {
-            std::fprintf(stderr, "[deepseek4] dmix entry %u (L%u %s) unsupported mode=%u "
-                         "(max %u)\n", i, layer, ds4_dmix_class_name(cls),
-                         (unsigned) mode, (unsigned) DS4_P4MIX_MAX_MODE);
-            ok = false; break;
-        }
-        // Exact coverage once per tensor is the loader's stated contract, and the check
-        // below enforces the "at least once" half. Without this, a second entry for the
-        // same (layer, class) silently replaces the first registration -- the later
-        // codebook wins and the earlier one leaks, with nothing reported.
-        if (covered[layer][cls]) {
-            std::fprintf(stderr, "[deepseek4] dmix entry %u: duplicate (L%u %s)\n",
-                         i, layer, ds4_dmix_class_name(cls));
+        // Bound everything BEFORE it is used to size a read or an allocation. Shared with
+        // the unit test so the rules cannot drift from what is covered.
+        const bool dup = layer < n_layers_out && cls < DS4_DMIX_CLASSES
+                         && covered[layer][cls];
+        if (const char * why = ds4_dmix_entry_reject_reason(
+                layer, cls, qtype, nslices, C, K, mode, n_layers_out, dup)) {
+            std::fprintf(stderr, "[deepseek4] dmix entry %u (L%u %s) rejected: %s "
+                         "(qtype=%u C=%u K=%u nslices=%u mode=%u)\n",
+                         i, layer,
+                         cls < DS4_DMIX_CLASSES ? ds4_dmix_class_name(cls) : "?",
+                         why, qtype, C, K, nslices, (unsigned) mode);
             ok = false; break;
         }
         std::vector<uint16_t> book_one((size_t) C * K);

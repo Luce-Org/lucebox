@@ -2616,6 +2616,50 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 // output tensors. Vector kernels write the GLU directly. Large routed-expert
 // MMQ keeps both ordinary matmul writes (and therefore numerical behavior),
 // but shares the identical ids sort and F32->Q8 activation quantization.
+// Whether the DeepSeek4 mix-qtype (105/106) fused gate/up+SwiGLU path may run for this
+// triple. Deliberately NOT static: the dispatcher below is, and a graph-level test cannot
+// tell "correctly refused to fuse" from "fused and happened to be right", so the negative
+// cases are only testable if the predicate itself is reachable. One definition, two callers.
+//
+// direct_layout is passed in rather than recomputed so this cannot drift from the value the
+// sibling vector-fusion paths are gated on.
+bool ggml_cuda_ds4_mix_glu_fusable(
+        const ggml_tensor * gate,
+        const ggml_tensor * up,
+        const ggml_tensor * glu,
+        bool direct_layout) {
+    if (!direct_layout || !gate || !up || !glu) {
+        return false;
+    }
+    const ggml_tensor * src0 = up->src[0];
+    const ggml_tensor * src1 = up->src[1];
+    const ggml_tensor * ids  = up->src[2];
+    if (!src0 || !src1 || !ids || !gate->src[0]) {
+        return false;
+    }
+    // Both halves must be the SAME mul_mat_id shape over the same activations and the same
+    // routing ids. Matching weight types alone would let two unrelated mul_mat_ids fuse,
+    // reading one expert's rows under the other's routing.
+    if (up->op != GGML_OP_MUL_MAT_ID || gate->op != GGML_OP_MUL_MAT_ID) {
+        return false;
+    }
+    if (gate->src[1] != src1 || gate->src[2] != ids) {
+        return false;
+    }
+    if (gate->src[0]->type != src0->type) {
+        return false;
+    }
+    if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU_DS4) {
+        return false;
+    }
+    if (src1->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32 ||
+        ids->type != GGML_TYPE_I32) {
+        return false;
+    }
+    return src0->type == GGML_TYPE_Q2_1_ROCMFP2_MIX ||
+           src0->type == GGML_TYPE_Q3_1_ROCMFP3_MIX;
+}
+
 static bool ggml_cuda_try_fuse_mul_mat_glu(
         ggml_backend_cuda_context & ctx,
         ggml_tensor * gate,
@@ -2660,13 +2704,7 @@ static bool ggml_cuda_try_fuse_mul_mat_glu(
     // fusing across two different mul_mat_ids would read one expert's rows with the other's
     // routing. Each launcher additionally returns false unless BOTH halves are registered,
     // so a partial registration keeps the correct unfused path.
-    if (direct_vector_layout && ids && up->op == GGML_OP_MUL_MAT_ID
-            && gate->op == GGML_OP_MUL_MAT_ID
-            && gate->src[1] == src1 && gate->src[2] == ids
-            && ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU_DS4
-            && src1->type == GGML_TYPE_F32 && glu->type == GGML_TYPE_F32
-            && gate->src[0]->type == src0->type
-            && ids->type == GGML_TYPE_I32) {
+    if (ggml_cuda_ds4_mix_glu_fusable(gate, up, glu, direct_vector_layout)) {
         const float limit = ggml_get_op_params_f32(glu, 2);
         // dst is the GLU tensor: the fused kernel writes the SwiGLU result straight there and
         // the two intermediates are never materialised.
