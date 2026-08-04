@@ -18,7 +18,7 @@
 namespace dflash::common {
 namespace {
 
-thread_local const char * current_phase_mode = nullptr;
+thread_local InferencePhase current_phase = InferencePhase::Unspecified;
 
 bool equals_ignore_case(const char * lhs, const char * rhs) {
     if (!lhs || !rhs) return false;
@@ -149,20 +149,46 @@ DeepSeek4RoctxCallbacks deepseek4_roctx_load_callbacks(
     return {push, pop};
 }
 
-DeepSeek4RoctxPhaseScope::DeepSeek4RoctxPhaseScope(const char * mode)
-    : previous_(current_phase_mode) {
-    current_phase_mode = mode;
+DeepSeek4RoctxPhaseScope::DeepSeek4RoctxPhaseScope(InferencePhase phase)
+    : previous_(current_phase) {
+    current_phase = phase;
 }
 
 DeepSeek4RoctxPhaseScope::~DeepSeek4RoctxPhaseScope() {
-    current_phase_mode = previous_;
+    current_phase = previous_;
 }
 
-const char * deepseek4_roctx_layer_mode(
-        bool verify, int n_tokens, const char * prefill_mode) {
-    if (current_phase_mode && current_phase_mode[0]) return current_phase_mode;
-    if (verify) return "verify";
-    return n_tokens == 1 ? "unspecified" : prefill_mode;
+InferencePhase deepseek4_roctx_prefill_phase(const char * mode) {
+    if (mode && std::strcmp(mode, "exact") == 0) return InferencePhase::Exact;
+    if (mode && std::strcmp(mode, "dense") == 0) return InferencePhase::Dense;
+    if (mode && std::strcmp(mode, "sparse") == 0) return InferencePhase::Sparse;
+    return InferencePhase::Unspecified;
+}
+
+InferencePhase deepseek4_roctx_current_phase() {
+    return current_phase;
+}
+
+InferencePhase deepseek4_roctx_layer_phase(
+        bool verify, int n_tokens, InferencePhase prefill_phase) {
+    if (current_phase != InferencePhase::Unspecified) return current_phase;
+    if (verify) return InferencePhase::Verify;
+    return n_tokens == 1 ? InferencePhase::Unspecified : prefill_phase;
+}
+
+const char * deepseek4_roctx_phase_name(InferencePhase phase) {
+    switch (phase) {
+        case InferencePhase::Exact: return "exact";
+        case InferencePhase::Dense: return "dense";
+        case InferencePhase::Sparse: return "sparse";
+        case InferencePhase::Decode: return "decode";
+        case InferencePhase::Verify: return "verify";
+        case InferencePhase::ReferenceExact: return "reference_exact";
+        case InferencePhase::Sequential: return "sequential";
+        case InferencePhase::Batched: return "batched";
+        case InferencePhase::Unspecified: return "unspecified";
+    }
+    return "unspecified";
 }
 
 DeepSeek4RoctxRange::DeepSeek4RoctxRange(
@@ -181,7 +207,8 @@ DeepSeek4RoctxRange::DeepSeek4RoctxRange(
     size_t used = initial > 0
         ? std::min(static_cast<size_t>(initial), sizeof(message) - 1)
         : 0;
-    append_field(message, sizeof(message), used, " mode=%s", metadata.mode);
+    append_field(message, sizeof(message), used, " mode=%s",
+                 deepseek4_roctx_phase_name(metadata.phase));
     append_field(message, sizeof(message), used, " tokens=%d", metadata.tokens);
     append_field(message, sizeof(message), used, " layer_begin=%d", metadata.layer_begin);
     append_field(message, sizeof(message), used, " layer_end=%d", metadata.layer_end);

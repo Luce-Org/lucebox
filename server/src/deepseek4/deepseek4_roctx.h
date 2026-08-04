@@ -4,10 +4,12 @@
 
 #pragma once
 
+#include "common/inference_phase.h"
+
 namespace dflash::common {
 
 struct DeepSeek4RoctxMetadata {
-    const char * mode = nullptr;
+    InferencePhase phase = InferencePhase::Unspecified;
     int tokens = -1;
     int layer_begin = -1;
     int layer_end = -1;
@@ -41,18 +43,21 @@ DeepSeek4RoctxCallbacks deepseek4_roctx_load_callbacks(
 // where n_tokens == 1 alone cannot distinguish prefill from decode.
 class DeepSeek4RoctxPhaseScope {
 public:
-    explicit DeepSeek4RoctxPhaseScope(const char * mode);
+    explicit DeepSeek4RoctxPhaseScope(InferencePhase phase);
     ~DeepSeek4RoctxPhaseScope();
 
     DeepSeek4RoctxPhaseScope(const DeepSeek4RoctxPhaseScope &) = delete;
     DeepSeek4RoctxPhaseScope & operator=(const DeepSeek4RoctxPhaseScope &) = delete;
 
 private:
-    const char * previous_ = nullptr;
+    InferencePhase previous_ = InferencePhase::Unspecified;
 };
 
-const char * deepseek4_roctx_layer_mode(
-    bool verify, int n_tokens, const char * prefill_mode);
+InferencePhase deepseek4_roctx_prefill_phase(const char * mode);
+InferencePhase deepseek4_roctx_current_phase();
+InferencePhase deepseek4_roctx_layer_phase(
+    bool verify, int n_tokens, InferencePhase prefill_phase);
+const char * deepseek4_roctx_phase_name(InferencePhase phase);
 
 class DeepSeek4RoctxRange {
 public:

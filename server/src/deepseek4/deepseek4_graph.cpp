@@ -6741,12 +6741,13 @@ bool deepseek4_step_layer_range(
     // Emit only executable leaf ranges. The compressor-boundary wrapper above
     // recursively invokes this function, and marking both parent and children
     // would double-count the phase in external trace summaries.
-    const char * roctx_mode = deepseek4_roctx_layer_mode(
+    const InferencePhase roctx_phase = deepseek4_roctx_layer_phase(
         verify_hooks != nullptr, n_tokens,
-        prefill_attention_mode_name(cache.prefill_mode));
+        deepseek4_roctx_prefill_phase(
+            prefill_attention_mode_name(cache.prefill_mode)));
     const DeepSeek4RoctxRange roctx_range(
         "ds4.layer_range",
-        {roctx_mode, n_tokens, layer_begin, layer_end, device});
+        {roctx_phase, n_tokens, layer_begin, layer_end, device});
 
     // Initialize HC state.
     // First shard (layer_begin=0): embed is token embeddings [n_embd × n_tokens],

@@ -1,10 +1,24 @@
 #include "deepseek4/deepseek4_roctx.h"
+#include "common/io_utils.h"
+#include "common/target_shard_ipc_daemon.h"
 
+#include <cstdint>
 #include <cstdio>
+#include <iostream>
+#include <sstream>
 #include <string>
+#include <type_traits>
 #include <vector>
 
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
+
 using namespace dflash::common;
+
+static_assert(std::is_same_v<std::underlying_type_t<InferencePhase>, int32_t>);
+static_assert(std::is_same_v<
+    decltype(TargetShardDaemonForwardRequest{}.semantic_phase), InferencePhase>);
 
 namespace {
 
@@ -73,7 +87,7 @@ void reset_loader_state() {
 
 bool return_failure_with_range() {
     const DeepSeek4RoctxRange range(
-        "ds4.layer_range", {"verify", 4, 0, 43, 0}, true,
+        "ds4.layer_range", {InferencePhase::Verify, 4, 0, 43, 0}, true,
         {record_push, record_pop});
     return false;
 }
@@ -90,18 +104,128 @@ void test_env_policy() {
 }
 
 void test_exact_prefill_phase_label() {
-    CHECK(std::string(deepseek4_roctx_layer_mode(false, 1, "exact")) ==
-          "unspecified");
+    CHECK(deepseek4_roctx_layer_phase(
+              false, 1, InferencePhase::Exact) == InferencePhase::Unspecified);
     {
-        const DeepSeek4RoctxPhaseScope prefill("exact");
-        CHECK(std::string(deepseek4_roctx_layer_mode(false, 1, "exact")) ==
-              "exact");
-        CHECK(std::string(deepseek4_roctx_layer_mode(true, 1, "exact")) ==
-              "exact");
+        const DeepSeek4RoctxPhaseScope prefill(InferencePhase::Exact);
+        CHECK(deepseek4_roctx_layer_phase(
+                  false, 1, InferencePhase::Exact) == InferencePhase::Exact);
+        {
+            const DeepSeek4RoctxPhaseScope decode(InferencePhase::Decode);
+            CHECK(deepseek4_roctx_current_phase() == InferencePhase::Decode);
+        }
+        CHECK(deepseek4_roctx_current_phase() == InferencePhase::Exact);
+        CHECK(deepseek4_roctx_layer_phase(
+                  true, 1, InferencePhase::Exact) == InferencePhase::Exact);
     }
-    CHECK(std::string(deepseek4_roctx_layer_mode(false, 1, "exact")) ==
-          "unspecified");
+    CHECK(deepseek4_roctx_current_phase() == InferencePhase::Unspecified);
 }
+
+void test_phase_mapping_and_wire_roundtrip() {
+    const InferencePhase phases[] = {
+        InferencePhase::Unspecified,
+        InferencePhase::Exact,
+        InferencePhase::Dense,
+        InferencePhase::Sparse,
+        InferencePhase::Decode,
+        InferencePhase::Verify,
+        InferencePhase::ReferenceExact,
+        InferencePhase::Sequential,
+        InferencePhase::Batched,
+    };
+    const char * names[] = {
+        "unspecified", "exact", "dense", "sparse", "decode", "verify",
+        "reference_exact", "sequential", "batched",
+    };
+    for (size_t i = 0; i < sizeof(phases) / sizeof(phases[0]); ++i) {
+        InferencePhase decoded = InferencePhase::Unspecified;
+        CHECK(inference_phase_from_wire_value(
+            inference_phase_wire_value(phases[i]), decoded));
+        CHECK(decoded == phases[i]);
+        CHECK(std::string(deepseek4_roctx_phase_name(decoded)) == names[i]);
+    }
+    InferencePhase decoded = InferencePhase::Exact;
+    CHECK(!inference_phase_from_wire_value(-1, decoded));
+    CHECK(!inference_phase_from_wire_value(9, decoded));
+
+    TargetShardDaemonForwardRequest remote_request;
+    remote_request.semantic_phase = InferencePhase::Decode;
+    {
+        const DeepSeek4RoctxPhaseScope remote_phase(remote_request.semantic_phase);
+        CHECK(deepseek4_roctx_current_phase() == InferencePhase::Decode);
+    }
+    CHECK(deepseek4_roctx_current_phase() == InferencePhase::Unspecified);
+}
+
+#if !defined(_WIN32)
+void test_malformed_phase_does_not_desynchronize_pipe(const char * malformed_phase) {
+    int payload_fds[2] = {-1, -1};
+    int response_fds[2] = {-1, -1};
+    CHECK(pipe(payload_fds) == 0);
+    CHECK(pipe(response_fds) == 0);
+    if (payload_fds[0] < 0 || response_fds[0] < 0) return;
+
+    const float malformed_activation[] = {1.0f, 2.0f};
+    const int32_t malformed_token = 11;
+    const float valid_activation[] = {3.0f, 4.0f};
+    const int32_t valid_token = 22;
+    CHECK(write_exact_fd(payload_fds[1], malformed_activation,
+                         sizeof(malformed_activation)));
+    CHECK(write_exact_fd(payload_fds[1], &malformed_token,
+                         sizeof(malformed_token)));
+    CHECK(write_exact_fd(payload_fds[1], valid_activation,
+                         sizeof(valid_activation)));
+    CHECK(write_exact_fd(payload_fds[1], &valid_token, sizeof(valid_token)));
+    close(payload_fds[1]);
+
+    std::ostringstream command_text;
+    command_text << "forward_pipe 0 1 0 0 8 1 1 1" << malformed_phase << '\n';
+    command_text << "forward_pipe 1 1 0 0 8 1 1 1 "
+                 << inference_phase_wire_value(InferencePhase::Decode) << '\n';
+    command_text << "quit\n";
+    std::istringstream commands(command_text.str());
+
+    int callback_calls = 0;
+    TargetShardDaemonCallbacks callbacks;
+    callbacks.forward = [&](const TargetShardDaemonForwardRequest & request,
+                            TargetShardDaemonForwardResponse & response) {
+        ++callback_calls;
+        CHECK(request.semantic_phase == InferencePhase::Decode);
+        CHECK(request.base_pos == 1);
+        CHECK(request.boundary_activation &&
+              *request.boundary_activation == std::vector<float>({3.0f, 4.0f}));
+        CHECK(request.token_ids &&
+              *request.token_ids == std::vector<int32_t>({22}));
+        response.last_tok = 77;
+        return true;
+    };
+
+    std::streambuf * previous_input = std::cin.rdbuf(commands.rdbuf());
+    std::cin.clear();
+    const int rc = run_target_shard_ipc_daemon_loop(
+        2, 8, response_fds[1], payload_fds[0], -1, 0, std::move(callbacks));
+    std::cin.rdbuf(previous_input);
+    std::cin.clear();
+    close(payload_fds[0]);
+    close(response_fds[1]);
+
+    int32_t responses[4] = {};
+    CHECK(read_exact_fd(response_fds[0], responses, sizeof(responses)));
+    close(response_fds[0]);
+    CHECK(rc == 0);
+    CHECK(callback_calls == 1);
+    CHECK(responses[0] == 0);
+    CHECK(responses[1] == -1);
+    CHECK(responses[2] == 0);
+    CHECK(responses[3] == 77);
+}
+
+void test_malformed_phases_do_not_desynchronize_pipe() {
+    test_malformed_phase_does_not_desynchronize_pipe("");
+    test_malformed_phase_does_not_desynchronize_pipe(" 4 extra");
+    test_malformed_phase_does_not_desynchronize_pipe(" 99");
+}
+#endif
 
 void test_disabled_loader_is_silent_and_unopened() {
     reset_loader_state();
@@ -144,7 +268,7 @@ void test_disabled_is_silent() {
     events.clear();
     {
         const DeepSeek4RoctxRange range(
-            "ds4.prefill", {"exact", 8, 0, 43, 0}, false,
+            "ds4.prefill", {InferencePhase::Exact, 8, 0, 43, 0}, false,
             {record_push, record_pop});
     }
     CHECK(events.empty());
@@ -155,7 +279,7 @@ void test_metadata_and_balance() {
     push_result = 0;
     {
         const DeepSeek4RoctxRange range(
-            "ds4.layer_range", {"exact", 4, 2, 17, 1}, true,
+            "ds4.layer_range", {InferencePhase::Exact, 4, 2, 17, 1}, true,
             {record_push, record_pop});
         CHECK(events.size() == 1);
         CHECK(events[0] ==
@@ -170,7 +294,7 @@ void test_failed_push_is_not_popped() {
     push_result = -1;
     {
         const DeepSeek4RoctxRange range(
-            "ds4.spec_decode", {"reference_exact", 32, -1, -1, 0}, true,
+            "ds4.spec_decode", {InferencePhase::ReferenceExact, 32, -1, -1, 0}, true,
             {record_push, record_pop});
     }
     CHECK(events.size() == 1);
@@ -204,6 +328,10 @@ void test_missing_callback_is_silent() {
 int main() {
     test_env_policy();
     test_exact_prefill_phase_label();
+    test_phase_mapping_and_wire_roundtrip();
+#if !defined(_WIN32)
+    test_malformed_phases_do_not_desynchronize_pipe();
+#endif
     test_disabled_loader_is_silent_and_unopened();
     test_missing_library_is_diagnosed();
     test_missing_symbol_closes_and_is_diagnosed();

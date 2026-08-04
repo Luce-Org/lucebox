@@ -3,6 +3,7 @@
 #pragma once
 
 #include "backend_ipc.h"
+#include "inference_phase.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -39,6 +40,7 @@ struct TargetShardForwardRequest {
     int ubatch = 0;
     bool want_argmax = false;
     bool want_logits = false;
+    InferencePhase semantic_phase = InferencePhase::Unspecified;
 };
 
 struct TargetShardForwardResponse {

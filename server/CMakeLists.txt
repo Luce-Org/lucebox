@@ -1012,7 +1012,8 @@ if(DFLASH27B_TESTS)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_deepseek4_roctx.cpp")
         add_executable(test_deepseek4_roctx
             test/test_deepseek4_roctx.cpp
-            src/deepseek4/deepseek4_roctx.cpp)
+            src/deepseek4/deepseek4_roctx.cpp
+            src/common/target_shard_ipc_daemon.cpp)
         target_include_directories(test_deepseek4_roctx PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src)
         if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
