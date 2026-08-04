@@ -1213,6 +1213,13 @@ if(DFLASH27B_TESTS)
         endif()
         add_test(NAME ds4_mix_registry_teardown COMMAND test_ds4_mix_registry_teardown)
     endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ds4_budget_hook.cpp")
+        # Thinking-budget force-close rule. Header-only logic, so unlike the other ds4 tests
+        # this needs no backend, no ggml and no CUDA/HIP link at all.
+        add_executable(test_ds4_budget_hook test/test_ds4_budget_hook.cpp test/test_unit_main.cpp)
+        target_include_directories(test_ds4_budget_hook PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        add_test(NAME ds4_budget_hook COMMAND test_ds4_budget_hook)
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ds4_dmix_entry_validation.cpp")
         # Pure validation logic against the loader's shared rule function: no model, no GPU.
         add_executable(test_ds4_dmix_entry_validation test/test_ds4_dmix_entry_validation.cpp)

@@ -2,6 +2,7 @@
 #include "deepseek4_roctx.h"
 
 #include "deepseek4_backend.h"
+#include "deepseek4_budget_hook.h"
 #include "deepseek4_internal.h"
 #include "common/dynamic_backend.h"
 #include "common/peer_access.h"
@@ -1600,21 +1601,19 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
         }
     }
 
+    // Budget-hook state. The close sequence is injected one token per step, then decoding
+    // CONTINUES so the model can spend the reserved reply budget on a visible answer. The
+    // previous implementation pushed the whole close sequence and broke out of the loop, which
+    // (a) never ran a forward over the injected tokens, so KV state did not reflect them, and
+    // (b) ended generation, so the reply budget was reserved and never usable. Measured on
+    // DeepSeek-V4-Flash: total tokens came to exactly thinking_ceiling + len(close_sequence)
+    // for close sequences of 1, 3 and 23 tokens -- zero tokens of answer in every case, while
+    // finish_reason still reported "stop". This mirrors qwen35_backend's override-and-continue.
+    bool budget_close_started = false;
+    size_t close_inject_pos = 0;
+
     for (int generated = 0; generated < n_gen; generated++) {
         if (io.is_cancelled()) break;
-
-        // Budget hook: force-close if remaining budget hits threshold
-        if (!budget_hook.close_token_ids.empty() &&
-            (n_gen - generated) <= budget_hook.hard_limit_remaining) {
-            // Inject close-tag tokens
-            for (int32_t close_tok : budget_hook.close_token_ids) {
-                out_tokens.push_back(close_tok);
-                io.emit(close_tok);
-                if (io.is_cancelled()) break;
-            }
-            if (forced_close_out) *forced_close_out = true;
-            break;
-        }
 
         // Get last logits and sample
         std::vector<float> logits;
@@ -1684,6 +1683,20 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
             }
         }
         if (timing) tel_acc.sample_us += elapsed_us(sample_t0, Clock::now());
+
+        // Budget hook: steer the tail of the window into the close sequence, then let the model
+        // keep going. Runs before history.push_back so penalty history records what was
+        // actually emitted. The rule lives in a header-only helper so it is testable without a
+        // model; see deepseek4_budget_hook.h for why this overrides rather than appends.
+        {
+            bool hook_forced = false;
+            next_token = dflash::deepseek4::budget_hook_apply(
+                budget_hook.close_token_ids, n_gen - generated,
+                budget_hook.hard_limit_remaining, next_token,
+                budget_close_started, close_inject_pos, hook_forced);
+            if (hook_forced && forced_close_out) *forced_close_out = true;
+        }
+
         if (process_logits) {
             history.push_back(next_token);
         }
