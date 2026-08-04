@@ -2625,6 +2625,23 @@ static bool ggml_cuda_try_fuse_mul_mat_glu(
     const ggml_tensor * src1 = up->src[1];
     const ggml_tensor * ids  = up->src[2];
 
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (ids && ggml_cuda_mmvq_mmid_grouped_enabled(
+            src0->type, cc, up->ne[2], up->ne[1]*up->ne[2])) {
+        return false;
+    }
+
+    // Vector fusion writes the final GLU tensor directly and indexes routing
+    // ids from the matmul layout. A reshape that changes token/expert axes is
+    // therefore not a shape-only detail for this kernel. MMQ below remains
+    // safe because it materializes both matmul outputs and lets GLU consume
+    // the original reshape nodes.
+    const bool direct_vector_layout =
+        ggml_are_same_shape(gate, glu->src[0]) &&
+        ggml_are_same_stride(gate, glu->src[0]) &&
+        ggml_are_same_shape(up, glu->src[1]) &&
+        ggml_are_same_stride(up, glu->src[1]);
+
     // ---- DeepSeek4 mix qtypes (105/106) --------------------------------------------------
     // These cannot go through mul_mat_vec_q at all: get_mmvq_mmid_max_batch returns 0 for them
     // because their learned per-expert codebooks live in a side registry that the mmvq kernels
@@ -2632,11 +2649,20 @@ static bool ggml_cuda_try_fuse_mul_mat_glu(
     // mul_mat_id launches plus a separate swiglu_ds4 pass -- which the profile measured as
     // 30100 launches against qtype 107's 15050, and ~102% of the observed 4.6% decode gap.
     //
-    // Handled before the generic checks because those would reject these types and fall through
-    // to the two-launch path. Each launcher returns false unless BOTH halves are registered and
-    // shape-matched, so a partial registration keeps the correct unfused path rather than fusing
-    // a decoded tensor with an undecoded one.
-    if (ids && up->op == GGML_OP_MUL_MAT_ID
+    // Placed after direct_vector_layout and gated on it: this path writes straight into
+    // glu->data and derives its strides from glu->nb, which is exactly the aliasing the
+    // other direct vector fusions guard against. The guard postdates this kernel upstream,
+    // and carrying the kernel forward without it would silently fuse a reshaped graph with
+    // the wrong token/expert mapping.
+    //
+    // gate is validated as an operand, not just by weight type: a matching src0 type says
+    // nothing about whether gate consumes the same activations and routing ids as up, and
+    // fusing across two different mul_mat_ids would read one expert's rows with the other's
+    // routing. Each launcher additionally returns false unless BOTH halves are registered,
+    // so a partial registration keeps the correct unfused path.
+    if (direct_vector_layout && ids && up->op == GGML_OP_MUL_MAT_ID
+            && gate->op == GGML_OP_MUL_MAT_ID
+            && gate->src[1] == src1 && gate->src[2] == ids
             && ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU_DS4
             && src1->type == GGML_TYPE_F32 && glu->type == GGML_TYPE_F32
             && gate->src[0]->type == src0->type
@@ -2673,23 +2699,6 @@ static bool ggml_cuda_try_fuse_mul_mat_glu(
             return true;
         }
     }
-
-    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    if (ids && ggml_cuda_mmvq_mmid_grouped_enabled(
-            src0->type, cc, up->ne[2], up->ne[1]*up->ne[2])) {
-        return false;
-    }
-
-    // Vector fusion writes the final GLU tensor directly and indexes routing
-    // ids from the matmul layout. A reshape that changes token/expert axes is
-    // therefore not a shape-only detail for this kernel. MMQ below remains
-    // safe because it materializes both matmul outputs and lets GLU consume
-    // the original reshape nodes.
-    const bool direct_vector_layout =
-        ggml_are_same_shape(gate, glu->src[0]) &&
-        ggml_are_same_stride(gate, glu->src[0]) &&
-        ggml_are_same_shape(up, glu->src[1]) &&
-        ggml_are_same_stride(up, glu->src[1]);
 
     if (direct_vector_layout && ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
         ggml_cuda_mm_fusion_args_host fusion_data{};

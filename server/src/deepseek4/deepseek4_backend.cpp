@@ -1103,14 +1103,27 @@ bool DeepSeek4Backend::init_hybrid_model() {
     // Fail at load with a clear message instead of starting a server that
     // crashes or emits garbage at first decode. (The all-hot case above reloads
     // the full monolithic model and never reaches here.)
+    // The same reasoning applies verbatim to qtype-106 (Q2_1_ROCMFP2_MIX) gate/up: hybrid
+    // slicing drops their registry metadata too, and there is no CPU vec_dot for 106 either.
+    // Only the down projection was checked, so a model with adaptive gate/up over uniform
+    // down experts passed this gate and went on to materialise unregistered hot/cold tensors
+    // -- aborting at first decode, or worse, decoding with whatever the registry lookup
+    // returned. Check every expert tensor that can carry a mix qtype.
     for (const auto & L : w_.layers) {
-        if (L.ffn_down_exps &&
-            L.ffn_down_exps->type == GGML_TYPE_Q3_1_ROCMFP3_MIX) {
+        const struct { ggml_tensor * t; int qtype; const char * what; } mix_experts[] = {
+            { L.ffn_down_exps, GGML_TYPE_Q3_1_ROCMFP3_MIX, "qtype-105 (mixed ROCmFP3) down" },
+            { L.ffn_gate_exps, GGML_TYPE_Q2_1_ROCMFP2_MIX, "qtype-106 (mixed ROCmFP2) gate" },
+            { L.ffn_up_exps,   GGML_TYPE_Q2_1_ROCMFP2_MIX, "qtype-106 (mixed ROCmFP2) up"   },
+        };
+        for (const auto & m : mix_experts) {
+            if (!m.t || m.t->type != m.qtype) {
+                continue;
+            }
             std::fprintf(stderr,
-                "[deepseek4] qtype-105 (mixed ROCmFP3) experts require monolithic "
+                "[deepseek4] %s experts require monolithic "
                 "residency — hybrid/cold expert placement cannot decode them. "
                 "Enable fused decode or provide enough VRAM to keep all experts "
-                "resident.\n");
+                "resident.\n", m.what);
             // Release the weights this hybrid attempt already loaded before
             // bailing, so w_ is left empty rather than holding a live context +
             // GPU buffer on the failure path.

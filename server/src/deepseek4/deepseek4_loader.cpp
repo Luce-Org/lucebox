@@ -712,6 +712,24 @@ static bool ds4_register_dmix_sidecar(const std::string & gguf_path,
                          i, layer, ds4_dmix_class_name(cls), nslices);
             ok = false; break;
         }
+        // The kernels branch on mode != 0, so an unrecognised future mode would be silently
+        // decoded as adaptive with a codebook that means something else. The p4mix and gumix
+        // parsers bound this; dmix did not.
+        if (mode > DS4_P4MIX_MAX_MODE) {
+            std::fprintf(stderr, "[deepseek4] dmix entry %u (L%u %s) unsupported mode=%u "
+                         "(max %u)\n", i, layer, ds4_dmix_class_name(cls),
+                         (unsigned) mode, (unsigned) DS4_P4MIX_MAX_MODE);
+            ok = false; break;
+        }
+        // Exact coverage once per tensor is the loader's stated contract, and the check
+        // below enforces the "at least once" half. Without this, a second entry for the
+        // same (layer, class) silently replaces the first registration -- the later
+        // codebook wins and the earlier one leaks, with nothing reported.
+        if (covered[layer][cls]) {
+            std::fprintf(stderr, "[deepseek4] dmix entry %u: duplicate (L%u %s)\n",
+                         i, layer, ds4_dmix_class_name(cls));
+            ok = false; break;
+        }
         std::vector<uint16_t> book_one((size_t) C * K);
         if (std::fread(book_one.data(), 2, book_one.size(), f) != book_one.size()) {
             std::fprintf(stderr, "[deepseek4] truncated dmix sidecar (entry %u payload)\n", i);
@@ -1800,6 +1818,27 @@ void free_deepseek4_weights(DeepSeek4Weights & w) {
         ggml_tensor * const gu[2] = { L.ffn_gate_exps, L.ffn_up_exps };
         for (ggml_tensor * t : gu) {
             if (t && t->type == GGML_TYPE_Q2_1_ROCMFP2_MIX && t->data) {
+                ggml_cuda_rocmfp2_mix_unregister(t->data);
+            }
+        }
+    }
+    // And the DENSE mix tensors. ds4_register_dmix_sidecar registers up to five attention
+    // classes per layer through the same two registries, but they were never torn down: the
+    // expert loops above key off the ffn_* members and cannot reach attn_q_a/q_b/kv/
+    // output_a/output_b. Every load/free cycle therefore leaked their device-side codebooks
+    // and left registry ranges pointing at released buffers -- and a later allocation landing
+    // on one of those addresses resolves to the stale side data rather than failing. The
+    // dispatch is by TENSOR TYPE, not by class, because a dense artifact may mix 105 and 106
+    // across classes; the sidecar records a qtype per entry precisely so it can.
+    for (auto & L : w.layers) {
+        for (uint32_t c = 0; c < DS4_DMIX_CLASSES; ++c) {
+            ggml_tensor * t = ds4_dmix_class_tensor(L, c);
+            if (!t || !t->data) {
+                continue;
+            }
+            if (t->type == GGML_TYPE_Q3_1_ROCMFP3_MIX) {
+                ggml_cuda_rocmfp3_mix_unregister(t->data);
+            } else if (t->type == GGML_TYPE_Q2_1_ROCMFP2_MIX) {
                 ggml_cuda_rocmfp2_mix_unregister(t->data);
             }
         }
