@@ -106,6 +106,9 @@ def deployment_environment(
     placement: Path | None,
     device_cache_mb: int | None,
     dual_trace: bool,
+    nvme_direct: str = "auto",
+    nvme_slots: int | None = None,
+    nvme_cache_first: str = "on",
 ) -> dict[str, str]:
     """Return a clean MoE environment without inherited benchmark tuning."""
     env = dict(base)
@@ -121,6 +124,12 @@ def deployment_environment(
             env.pop(key)
 
     env["DFLASH_MOE_NVME_BACKEND"] = nvme_backend
+    env["DFLASH_MOE_NVME_DIRECT"] = nvme_direct
+    env["DFLASH_MOE_NVME_CACHE_FIRST"] = (
+        "1" if nvme_cache_first == "on" else "0"
+    )
+    if nvme_slots is not None:
+        env["DFLASH_MOE_NVME_SLOTS"] = str(nvme_slots)
     if device_cache_mb is not None:
         env["DFLASH_MOE_NVME_DEVICE_CACHE_MB"] = str(device_cache_mb)
     if deployment.secondary is not None:
@@ -389,6 +398,9 @@ def run_deployment(
         args.placement,
         args.device_cache_mb,
         args.dual_trace,
+        args.nvme_direct,
+        args.nvme_slots,
+        args.nvme_cache_first,
     )
     command = server_command(
         args.server_bin,
@@ -494,6 +506,17 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--nvme-backend", choices=("auto", "uring", "pread", "mmap"), default="auto"
     )
+    parser.add_argument(
+        "--nvme-direct", choices=("auto", "on", "off"), default="auto"
+    )
+    parser.add_argument(
+        "--nvme-slots",
+        type=int,
+        help="page-locked host slots per SSD expert owner (engine default: 8)",
+    )
+    parser.add_argument(
+        "--nvme-cache-first", choices=("on", "off"), default="on"
+    )
     parser.add_argument("--port", type=int, default=18080)
     parser.add_argument("--max-ctx", type=int, default=8192)
     parser.add_argument("--max-tokens", type=int, default=8)
@@ -522,6 +545,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("primary-share-per-mille must be in [0, 1000]")
     if args.device_cache_mb is not None and args.device_cache_mb < 0:
         raise ValueError("device-cache-mb must be non-negative")
+    if args.nvme_slots is not None and not 2 <= args.nvme_slots <= 64:
+        raise ValueError("nvme-slots must be in [2, 64]")
     if len(set(args.profiles)) != len(args.profiles):
         raise ValueError("deployment profiles must not be repeated")
     if args.placement is not None and not args.dry_run and not args.placement.is_file():
@@ -549,6 +574,9 @@ def main() -> int:
                     args.placement,
                     args.device_cache_mb,
                     args.dual_trace,
+                    args.nvme_direct,
+                    args.nvme_slots,
+                    args.nvme_cache_first,
                 )
                 resolved.append(
                     {

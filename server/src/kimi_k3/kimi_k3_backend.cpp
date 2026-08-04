@@ -281,18 +281,34 @@ bool KimiK3Backend::init_streaming() {
                 ggml_backend_get_device(owner_backend)) {
             ggml_backend_dev_memory(device, &free_bytes, &total_bytes);
         }
+        // ggml's generic UMA query intentionally reports available system RAM
+        // so model loaders can use managed memory. The streamed cache needs one
+        // contiguous native allocation, so cap it using the runtime's native
+        // pool even when the owner is provided by a dynamically loaded peer.
+        size_t allocation_free = free_bytes;
+        size_t allocation_total = total_bytes;
+        backend_native_memory(
+            owner_backend, &allocation_free, &allocation_total);
         const size_t gib = 1024ULL * 1024ULL * 1024ULL;
-        const size_t reserve = std::max<size_t>(2 * gib, total_bytes / 20);
-        stream_config.device_cache_bytes =
-            free_bytes > reserve
-                ? std::min(free_bytes - reserve, routed_pool_bytes)
-                : 0;
+        const size_t system_reserve =
+            std::max<size_t>(2 * gib, total_bytes / 20);
+        const size_t allocation_reserve =
+            std::max<size_t>(2 * gib, allocation_total / 20);
+        const size_t system_budget = free_bytes > system_reserve
+            ? free_bytes - system_reserve : 0;
+        const size_t allocation_budget = allocation_free > allocation_reserve
+            ? allocation_free - allocation_reserve : 0;
+        stream_config.device_cache_bytes = std::min(
+            {system_budget, allocation_budget, routed_pool_bytes});
         std::fprintf(stderr,
             "[kimi-k3] %s streamed cache: device=%s:%d free=%.2f GiB "
-            "reserve=%.2f GiB pool=%.2f GiB cache=%.2f GiB\n",
+            "alloc-free=%.2f GiB reserve=%.2f/%.2f GiB pool=%.2f GiB "
+            "cache=%.2f GiB\n",
             owner_name, placement_backend_name(backend_kind), gpu,
             static_cast<double>(free_bytes) / gib,
-            static_cast<double>(reserve) / gib,
+            static_cast<double>(allocation_free) / gib,
+            static_cast<double>(system_reserve) / gib,
+            static_cast<double>(allocation_reserve) / gib,
             static_cast<double>(routed_pool_bytes) / gib,
             static_cast<double>(stream_config.device_cache_bytes) / gib);
         return stream_config;

@@ -60,11 +60,16 @@ class KimiDeploymentBenchmarkTests(unittest.TestCase):
             Path("/new.json"),
             4096,
             True,
+            "off",
+            16,
+            "off",
         )
         self.assertEqual(env["PATH"], "/bin")
         self.assertNotIn("DFLASH_MOE_STORAGE", env)
-        self.assertNotIn("DFLASH_MOE_NVME_SLOTS", env)
+        self.assertEqual(env["DFLASH_MOE_NVME_SLOTS"], "16")
         self.assertEqual(env["DFLASH_MOE_NVME_BACKEND"], "uring")
+        self.assertEqual(env["DFLASH_MOE_NVME_DIRECT"], "off")
+        self.assertEqual(env["DFLASH_MOE_NVME_CACHE_FIRST"], "0")
         self.assertEqual(env["DFLASH_MOE_NVME_DEVICE_CACHE_MB"], "4096")
         self.assertEqual(env["DFLASH_MOE_TP_BACKEND"], "cuda")
         self.assertEqual(env["DFLASH_MOE_TP_GPU"], "0")
@@ -84,6 +89,8 @@ class KimiDeploymentBenchmarkTests(unittest.TestCase):
         )
         self.assertNotIn("DFLASH_MOE_TP_GPU", env)
         self.assertNotIn("DFLASH_MOE_TP_BACKEND", env)
+        self.assertEqual(env["DFLASH_MOE_NVME_DIRECT"], "auto")
+        self.assertEqual(env["DFLASH_MOE_NVME_CACHE_FIRST"], "1")
         command = server_command(
             Path("server"),
             Path("model.gguf"),

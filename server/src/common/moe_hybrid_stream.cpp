@@ -189,6 +189,9 @@ MoeStreamConfig MoeStreamConfig::from_env() {
         "DFLASH_MOE_NVME_GRAPH_CACHE", config.graph_cache_entries, 0, 64);
     config.fused_decode = env_bounded_int(
         "DFLASH_MOE_NVME_FUSED_DECODE", config.fused_decode ? 1 : 0, 0, 1) != 0;
+    config.cache_first_decode = env_bounded_int(
+        "DFLASH_MOE_NVME_CACHE_FIRST",
+        config.cache_first_decode ? 1 : 0, 0, 1) != 0;
     config.device_cache_bytes = env_mib(
         "DFLASH_MOE_NVME_DEVICE_CACHE_MB", config.device_cache_bytes);
     config.prefill_threshold = env_bounded_int(
@@ -867,6 +870,12 @@ struct MoeHybridStreamEngine::Runtime {
     size_t max_expert_bytes = 0;
     MoeStreamConfig config{};
     BackendHostAllocator host_allocator;
+    // Quantized CUDA/HIP kernels may read backend-added row padding. Keep one
+    // immutable backend-pinned zero source and upload only those padding bytes
+    // with each expert. Clearing a capacity-sized cache eagerly can fault tens
+    // of GiB of APU managed memory before the first request.
+    void * zero_padding = nullptr;
+    size_t zero_padding_bytes = 0;
     std::unique_ptr<MoeNvmeScheduler> io;
     ggml_backend_buffer_t device_pool_buffer = nullptr;
     void * device_pool = nullptr;
@@ -919,6 +928,37 @@ void release_device_cache(RuntimeT & runtime) {
     runtime.device_slot_ctx = nullptr;
     runtime.device_stride = 0;
     runtime.device_pool_bytes = 0;
+}
+
+template <typename RuntimeT>
+bool ensure_zero_padding(RuntimeT & runtime, size_t required_bytes,
+                         std::string * err) {
+    if (required_bytes == 0 || required_bytes <= runtime.zero_padding_bytes) {
+        return true;
+    }
+    const size_t allocation_bytes = align_up(required_bytes, 256);
+    if (allocation_bytes == 0) {
+        if (err) *err = "SSD quantization padding size overflow";
+        return false;
+    }
+
+    void * replacement = nullptr;
+    if (!runtime.host_allocator.allocate(&replacement, allocation_bytes)) {
+        if (err) *err = "failed to allocate SSD quantization padding staging";
+        return false;
+    }
+    std::memset(replacement, 0, allocation_bytes);
+
+    // The previous immutable source may still be referenced by queued H2D
+    // copies. Growth normally happens once, on the first numerical layout, so
+    // synchronize only before replacement and never on the steady-state path.
+    if (runtime.zero_padding) {
+        ggml_backend_synchronize(runtime.transfer_backend);
+        runtime.host_allocator.release(runtime.zero_padding);
+    }
+    runtime.zero_padding = replacement;
+    runtime.zero_padding_bytes = allocation_bytes;
+    return true;
 }
 
 template <typename RuntimeT>
@@ -997,11 +1037,6 @@ bool allocate_device_cache(RuntimeT & runtime, std::string * err,
         release_device_cache(runtime);
         return false;
     }
-    ggml_backend_buffer_clear(runtime.device_pool_buffer, 0);
-    // The pool is shared by the compute and upload backend instances. Finish
-    // initialization on the compute stream before the upload stream can reuse
-    // any slot, otherwise zero-filled quantization padding could race H2D.
-    ggml_backend_synchronize(runtime.backend);
     for (size_t i = 0; i < runtime.device_slots.size(); ++i) {
         auto & slot = runtime.device_slots[i];
         slot.data = base + i * runtime.device_stride;
@@ -1318,7 +1353,8 @@ void MoeHybridStreamEngine::destroy() {
                 "device-cache=%.1f MiB slots=%zu pinned=%zu "
                 "hits=%llu misses=%llu evictions=%llu "
                 "graphs=%llu graph-hits=%llu graph-evictions=%llu launches=%llu "
-                "fused-decode-launches=%llu fused-decode-experts=%llu\n",
+                "fused-decode-launches=%llu fused-decode-experts=%llu "
+                "cache-first-reorders=%llu cache-first-experts=%llu\n",
                 runtime_->io->effective_backend_name(),
                 (unsigned long long) stats.requests,
                 (unsigned long long) stats.read_ops,
@@ -1339,11 +1375,18 @@ void MoeHybridStreamEngine::destroy() {
                 (unsigned long long) runtime_->compute_stats.graph_evictions,
                 (unsigned long long) runtime_->compute_stats.graph_launches,
                 (unsigned long long) runtime_->compute_stats.fused_decode_launches,
-                (unsigned long long) runtime_->compute_stats.fused_decode_experts);
+                (unsigned long long) runtime_->compute_stats.fused_decode_experts,
+                (unsigned long long) runtime_->compute_stats.cache_first_reorders,
+                (unsigned long long) runtime_->compute_stats.cache_first_experts);
         }
         runtime_->io->destroy();
     }
     runtime_->io.reset();
+    if (runtime_->zero_padding) {
+        runtime_->host_allocator.release(runtime_->zero_padding);
+        runtime_->zero_padding = nullptr;
+        runtime_->zero_padding_bytes = 0;
+    }
     if (runtime_->transfer_backend) {
         ggml_backend_free(runtime_->transfer_backend);
         runtime_->transfer_backend = nullptr;
@@ -1472,6 +1515,16 @@ bool MoeHybridStreamEngine::stage_expert_async(int layer, int expert_id,
             if (err) *err = "prepared streamed expert exceeds GPU device stride";
             return false;
         }
+        size_t maximum_padding = 0;
+        for (int i = 0; i < device_layout.component_count; ++i) {
+            const Runtime::DeviceComponentLayout & component =
+                device_layout.components[i];
+            maximum_padding = std::max(
+                maximum_padding,
+                component.alloc_bytes - component.logical_bytes);
+        }
+        if (!ensure_zero_padding(*runtime_, maximum_padding, err)) return false;
+
         for (int i = 0; i < device_layout.component_count; ++i) {
             const Runtime::DeviceComponentLayout & device_component =
                 device_layout.components[i];
@@ -1506,6 +1559,15 @@ bool MoeHybridStreamEngine::stage_expert_async(int layer, int expert_id,
                 runtime_->transfer_backend, dst.transfer_tensor,
                 source, device_component.offset,
                 device_component.logical_bytes);
+            const size_t padding_bytes =
+                device_component.alloc_bytes - device_component.logical_bytes;
+            if (padding_bytes > 0) {
+                ggml_backend_tensor_set_async(
+                    runtime_->transfer_backend, dst.transfer_tensor,
+                    runtime_->zero_padding,
+                    device_component.offset + device_component.logical_bytes,
+                    padding_bytes);
+            }
         }
         dst.device_layout = device_layout;
     } else {
@@ -2355,9 +2417,54 @@ bool eval_moe_streamed_experts(
         return true;
     }
 
+    // The weighted expert sum is order-independent mathematically. Execute
+    // device-resident experts first so their compute overlaps every admitted
+    // SSD miss instead of blocking on the first cold expert encountered by ID.
+    // Contributions are accumulated later in the original deterministic order
+    // to preserve the previous floating-point result.
+    std::vector<int32_t> execution_experts = unique_experts;
+    bool cache_first_reordered = false;
+    if (runtime.config.cache_first_decode && batch.n_tokens == 1 &&
+        execution_experts.size() > 1) {
+        const auto is_device_resident = [&](int32_t expert) {
+            const auto found = runtime.device_index.find(
+                device_key(batch.layer, expert));
+            if (found == runtime.device_index.end() || found->second < 0 ||
+                found->second >= (int) runtime.device_slots.size()) {
+                return false;
+            }
+            const auto & slot =
+                runtime.device_slots[(size_t) found->second];
+            return slot.valid && slot.cache_managed &&
+                slot.compute_users == 0 && slot.key.layer == batch.layer &&
+                slot.key.expert == expert;
+        };
+        const auto cold_begin = std::stable_partition(
+            execution_experts.begin(), execution_experts.end(),
+            is_device_resident);
+        const size_t resident_count = (size_t) std::distance(
+            execution_experts.begin(), cold_begin);
+        cache_first_reordered = execution_experts != unique_experts;
+        if (cache_first_reordered) {
+            ++runtime.compute_stats.cache_first_reorders;
+            runtime.compute_stats.cache_first_experts += resident_count;
+        }
+    }
+
+    std::vector<float> ordered_contributions;
+    if (cache_first_reordered) {
+        size_t contribution_values = 0;
+        if (!checked_mul_size(output_values, unique_experts.size(),
+                              contribution_values)) {
+            if (err) *err = "streamed expert contribution size overflow";
+            return false;
+        }
+        ordered_contributions.assign(contribution_values, 0.0f);
+    }
+
     int staged_slot = -1;
     if (!engine.stage_expert_cached_async(
-            batch.layer, unique_experts[0], &staged_slot, err)) {
+            batch.layer, execution_experts[0], &staged_slot, err)) {
         return false;
     }
 
@@ -2453,7 +2560,7 @@ bool eval_moe_streamed_experts(
     std::vector<float> result;
 
     for (size_t expert_index = 0;
-         expert_index < unique_experts.size(); ++expert_index) {
+         expert_index < execution_experts.size(); ++expert_index) {
         const int current_slot = staged_slot;
         if (!engine.activate_device_slot(current_slot, err)) return false;
         auto release_current = [&]() {
@@ -2461,7 +2568,7 @@ bool eval_moe_streamed_experts(
         };
 
         hits.clear();
-        const int32_t expert = unique_experts[expert_index];
+        const int32_t expert = execution_experts[expert_index];
         for (int token = 0; token < batch.n_tokens; ++token) {
             float combined_weight = 0.0f;
             for (int rank = 0; rank < batch.top_k; ++rank) {
@@ -2518,10 +2625,10 @@ bool eval_moe_streamed_experts(
 
         // Compute N is running while the already-admitted read for N+1 is
         // acquired and uploaded into a different, eviction-protected slot.
-        if (expert_index + 1 < unique_experts.size()) {
+        if (expert_index + 1 < execution_experts.size()) {
             int next_slot = -1;
             if (!engine.stage_expert_cached_async(
-                    batch.layer, unique_experts[expert_index + 1],
+                    batch.layer, execution_experts[expert_index + 1],
                     &next_slot, err)) {
                 ggml_backend_synchronize(runtime.backend);
                 release_current();
@@ -2534,9 +2641,19 @@ bool eval_moe_streamed_experts(
             release_current();
             return false;
         }
+        const size_t original_expert_index = cache_first_reordered
+            ? (size_t) std::distance(
+                unique_experts.begin(),
+                std::lower_bound(
+                    unique_experts.begin(), unique_experts.end(), expert))
+            : 0;
         for (size_t i = 0; i < hits.size(); ++i) {
-            float * dst = out.data() +
-                (size_t) hits[i].token * (size_t) spec.output_dim;
+            float * dst = cache_first_reordered
+                ? ordered_contributions.data() +
+                    original_expert_index * output_values +
+                    (size_t) hits[i].token * (size_t) spec.output_dim
+                : out.data() +
+                    (size_t) hits[i].token * (size_t) spec.output_dim;
             const float * src = result.data() +
                 i * (size_t) spec.output_dim;
             const float weight = hits[i].weight;
@@ -2545,6 +2662,16 @@ bool eval_moe_streamed_experts(
             }
         }
         release_current();
+    }
+    if (cache_first_reordered) {
+        for (size_t expert_index = 0;
+             expert_index < unique_experts.size(); ++expert_index) {
+            const float * contribution = ordered_contributions.data() +
+                expert_index * output_values;
+            for (size_t value = 0; value < output_values; ++value) {
+                out[value] += contribution[value];
+            }
+        }
     }
     return true;
 }

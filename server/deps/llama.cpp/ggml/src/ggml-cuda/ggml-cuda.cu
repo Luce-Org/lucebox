@@ -5382,10 +5382,14 @@ static bool ggml_backend_cuda_get_available_uma_memory(long * available_memory_k
 }
 #endif // defined(__linux__)
 
+static void ggml_backend_cuda_device_get_native_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
+    ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *)dev->context;
+    ggml_backend_cuda_get_device_memory(ctx->device, free, total);
+}
+
 static void ggml_backend_cuda_device_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
     ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *)dev->context;
-    ggml_cuda_set_device(ctx->device);
-    CUDA_CHECK(cudaMemGetInfo(free, total));
+    ggml_backend_cuda_device_get_native_memory(dev, free, total);
 
 // ref: https://github.com/ggml-org/llama.cpp/pull/17368
 #if defined(__linux__)
@@ -6122,6 +6126,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_dev_get_native_memory") == 0) {
+        return (void *)ggml_backend_cuda_device_get_native_memory;
     }
     return nullptr;
 }

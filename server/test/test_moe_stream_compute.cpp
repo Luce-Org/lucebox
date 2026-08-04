@@ -354,6 +354,14 @@ void run_fused_decode_case(ggml_backend_t backend, bool mxfp4) {
         &prepare_stats, &error));
     STREAM_REQUIRE(prepare_stats.capacity_drops == 1);
 
+    // Make the largest selected ID resident. The cold fallback must execute it
+    // before lower-ID misses while preserving the original accumulation order.
+    int resident_slot = -1;
+    STREAM_REQUIRE(engine.stage_expert_cached_async(
+        0, 2, &resident_slot, &error));
+    STREAM_REQUIRE(engine.activate_device_slot(resident_slot, &error));
+    engine.release_device_slot(resident_slot);
+
     const std::vector<float> expected = cpu_reference(
         gate_reference, up_reference, down_reference,
         input, ids, weights, 1, kDecodeTopK);
@@ -375,6 +383,8 @@ void run_fused_decode_case(ggml_backend_t backend, bool mxfp4) {
     const MoeStreamComputeStats cold = engine.compute_stats();
     STREAM_REQUIRE(cold.graph_launches == kDecodeTopK);
     STREAM_REQUIRE(cold.fused_decode_launches == 0);
+    STREAM_REQUIRE(cold.cache_first_reorders == 1);
+    STREAM_REQUIRE(cold.cache_first_experts == 1);
 
     // Populate every slot, then verify the all-resident fused path.
     for (int expert = 0; expert < kExperts; ++expert) {

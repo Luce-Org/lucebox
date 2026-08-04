@@ -12,11 +12,25 @@
 #include <vector>
 
 using dflash::common::PlacementBackend;
+using dflash::common::backend_native_memory;
 using dflash::common::backend_pair_capabilities;
 using dflash::common::init_placement_backend;
 using dflash::common::placement_backend_of;
 
 namespace {
+
+bool run_native_memory_query(ggml_backend_t backend, const char * label) {
+    size_t free_bytes = 0;
+    size_t total_bytes = 0;
+    const bool ok = backend_native_memory(
+        backend, &free_bytes, &total_bytes) &&
+        free_bytes > 0 && total_bytes >= free_bytes;
+    std::printf("mixed-backend %s native memory: %s (%.2f/%.2f GiB)\n",
+                label, ok ? "ok" : "FAILED",
+                (double) free_bytes / (1024.0 * 1024.0 * 1024.0),
+                (double) total_bytes / (1024.0 * 1024.0 * 1024.0));
+    return ok;
+}
 
 bool run_scale(ggml_backend_t backend, const char * label) {
     constexpr int64_t n = 4096;
@@ -491,6 +505,8 @@ int main() {
     ok = placement_backend_of(cuda) == PlacementBackend::Cuda &&
          placement_backend_of(hip) == PlacementBackend::Hip &&
          !pair.same_runtime && !pair.native_gpu_handoff && ok;
+    ok = run_native_memory_query(cuda, "CUDA") && ok;
+    ok = run_native_memory_query(hip, "HIP") && ok;
     ok = run_scale(cuda, "CUDA") && ok;
     ok = run_scale(hip, "HIP") && ok;
     ok = run_cross_copy(cuda, hip, "CUDA->HIP") && ok;

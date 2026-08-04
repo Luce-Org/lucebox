@@ -175,6 +175,31 @@ PlacementBackend placement_backend_of(ggml_backend_t backend) {
     return PlacementBackend::Auto;
 }
 
+bool backend_native_memory(ggml_backend_t backend,
+                           size_t * free_bytes,
+                           size_t * total_bytes) {
+    if (!backend || !free_bytes || !total_bytes) return false;
+    ggml_backend_dev_t device = ggml_backend_get_device(backend);
+    if (!device) return false;
+    ggml_backend_reg_t registry = ggml_backend_dev_backend_reg(device);
+    if (!registry) return false;
+
+    using query_fn = void (*)(ggml_backend_dev_t, size_t *, size_t *);
+    auto query = reinterpret_cast<query_fn>(ggml_backend_reg_get_proc_address(
+        registry, "ggml_backend_dev_get_native_memory"));
+    if (!query) return false;
+
+    size_t native_free = 0;
+    size_t native_total = 0;
+    query(device, &native_free, &native_total);
+    if (native_free == 0 || native_total == 0 || native_free > native_total) {
+        return false;
+    }
+    *free_bytes = native_free;
+    *total_bytes = native_total;
+    return true;
+}
+
 BackendPairCapabilities backend_pair_capabilities(ggml_backend_t first,
                                                   ggml_backend_t second) {
     BackendPairCapabilities result;
