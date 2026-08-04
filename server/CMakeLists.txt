@@ -885,41 +885,8 @@ if(DFLASH27B_TESTS)
             hip::host)
         list(APPEND _raw_unit_test_targets test_rocmfpx_mmq)
 
-        add_executable(test_rocmfp3_mix_registry test/test_rocmfp3_mix_registry.cpp)
-        set_source_files_properties(test/test_rocmfp3_mix_registry.cpp PROPERTIES LANGUAGE HIP)
-        set_target_properties(test_rocmfp3_mix_registry PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
-        target_include_directories(test_rocmfp3_mix_registry PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
-        target_link_libraries(test_rocmfp3_mix_registry PRIVATE
-            ggml
-            ggml-base
-            ${DFLASH27B_GGML_BACKEND_TARGET}
-            hip::host)
-        list(APPEND _raw_unit_test_targets test_rocmfp3_mix_registry)
 
-        add_executable(test_rocmfp_mix_slice_matvec test/test_rocmfp_mix_slice_matvec.cpp)
-        set_source_files_properties(test/test_rocmfp_mix_slice_matvec.cpp PROPERTIES LANGUAGE HIP)
-        set_target_properties(test_rocmfp_mix_slice_matvec PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
-        target_include_directories(test_rocmfp_mix_slice_matvec PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
-        target_link_libraries(test_rocmfp_mix_slice_matvec PRIVATE
-            ggml
-            ggml-base
-            ${DFLASH27B_GGML_BACKEND_TARGET}
-            hip::host)
-        list(APPEND _raw_unit_test_targets test_rocmfp_mix_slice_matvec)
 
-        add_executable(test_rocmfp_mix_gateup_glu test/test_rocmfp_mix_gateup_glu.cpp)
-        set_source_files_properties(test/test_rocmfp_mix_gateup_glu.cpp PROPERTIES LANGUAGE HIP)
-        set_target_properties(test_rocmfp_mix_gateup_glu PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
-        target_include_directories(test_rocmfp_mix_gateup_glu PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
-        target_link_libraries(test_rocmfp_mix_gateup_glu PRIVATE
-            ggml
-            ggml-base
-            ${DFLASH27B_GGML_BACKEND_TARGET}
-            hip::host)
-        list(APPEND _raw_unit_test_targets test_rocmfp_mix_gateup_glu)
 
         # Benchmark, not a test: built with the tests but deliberately NOT added to
         # _raw_unit_test_targets, so ctest stays deterministic. Measures the launch-count
@@ -1123,6 +1090,84 @@ if(DFLASH27B_TESTS)
         endif()
         # Self-skips (returns 0) unless DS4_TEST_MODEL points at a qtype-105 model.
         add_test(NAME ds4_load_transactional COMMAND test_ds4_load_transactional)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_rocmfp3_mix_registry.cpp")
+        # Backend-general: the kernels declare cudaStream_t and ggml's vendors/hip.h maps the
+        # cuda* spellings onto hip*, so the same source builds for both. These were hip-only,
+        # which left the qtype-105/106 numerics verified on gfx1151 alone.
+        add_executable(test_rocmfp3_mix_registry test/test_rocmfp3_mix_registry.cpp)
+        if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+            set_source_files_properties(test/test_rocmfp3_mix_registry.cpp PROPERTIES LANGUAGE HIP)
+            set_target_properties(test_rocmfp3_mix_registry PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
+            target_compile_definitions(test_rocmfp3_mix_registry PRIVATE GGML_USE_HIP)
+        else()
+            set_source_files_properties(test/test_rocmfp3_mix_registry.cpp PROPERTIES LANGUAGE CUDA)
+            set_target_properties(test_rocmfp3_mix_registry PROPERTIES CUDA_ARCHITECTURES "${_dflash_archs}")
+        endif()
+        target_include_directories(test_rocmfp3_mix_registry PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src/ggml-cuda)
+        target_link_libraries(test_rocmfp3_mix_registry PRIVATE
+            ggml ggml-base ${DFLASH27B_GGML_BACKEND_TARGET})
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            find_package(CUDAToolkit REQUIRED)
+            target_link_libraries(test_rocmfp3_mix_registry PRIVATE CUDA::cudart)
+        else()
+            target_link_libraries(test_rocmfp3_mix_registry PRIVATE hip::host)
+        endif()
+        list(APPEND _raw_unit_test_targets test_rocmfp3_mix_registry)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_rocmfp_mix_slice_matvec.cpp")
+        # Backend-general: the kernels declare cudaStream_t and ggml's vendors/hip.h maps the
+        # cuda* spellings onto hip*, so the same source builds for both. These were hip-only,
+        # which left the qtype-105/106 numerics verified on gfx1151 alone.
+        add_executable(test_rocmfp_mix_slice_matvec test/test_rocmfp_mix_slice_matvec.cpp)
+        if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+            set_source_files_properties(test/test_rocmfp_mix_slice_matvec.cpp PROPERTIES LANGUAGE HIP)
+            set_target_properties(test_rocmfp_mix_slice_matvec PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
+            target_compile_definitions(test_rocmfp_mix_slice_matvec PRIVATE GGML_USE_HIP)
+        else()
+            set_source_files_properties(test/test_rocmfp_mix_slice_matvec.cpp PROPERTIES LANGUAGE CUDA)
+            set_target_properties(test_rocmfp_mix_slice_matvec PROPERTIES CUDA_ARCHITECTURES "${_dflash_archs}")
+        endif()
+        target_include_directories(test_rocmfp_mix_slice_matvec PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src/ggml-cuda)
+        target_link_libraries(test_rocmfp_mix_slice_matvec PRIVATE
+            ggml ggml-base ${DFLASH27B_GGML_BACKEND_TARGET})
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            find_package(CUDAToolkit REQUIRED)
+            target_link_libraries(test_rocmfp_mix_slice_matvec PRIVATE CUDA::cudart)
+        else()
+            target_link_libraries(test_rocmfp_mix_slice_matvec PRIVATE hip::host)
+        endif()
+        list(APPEND _raw_unit_test_targets test_rocmfp_mix_slice_matvec)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_rocmfp_mix_gateup_glu.cpp")
+        # Backend-general: the kernels declare cudaStream_t and ggml's vendors/hip.h maps the
+        # cuda* spellings onto hip*, so the same source builds for both. These were hip-only,
+        # which left the qtype-105/106 numerics verified on gfx1151 alone.
+        add_executable(test_rocmfp_mix_gateup_glu test/test_rocmfp_mix_gateup_glu.cpp)
+        if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+            set_source_files_properties(test/test_rocmfp_mix_gateup_glu.cpp PROPERTIES LANGUAGE HIP)
+            set_target_properties(test_rocmfp_mix_gateup_glu PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
+            target_compile_definitions(test_rocmfp_mix_gateup_glu PRIVATE GGML_USE_HIP)
+        else()
+            set_source_files_properties(test/test_rocmfp_mix_gateup_glu.cpp PROPERTIES LANGUAGE CUDA)
+            set_target_properties(test_rocmfp_mix_gateup_glu PROPERTIES CUDA_ARCHITECTURES "${_dflash_archs}")
+        endif()
+        target_include_directories(test_rocmfp_mix_gateup_glu PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src/ggml-cuda)
+        target_link_libraries(test_rocmfp_mix_gateup_glu PRIVATE
+            ggml ggml-base ${DFLASH27B_GGML_BACKEND_TARGET})
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            find_package(CUDAToolkit REQUIRED)
+            target_link_libraries(test_rocmfp_mix_gateup_glu PRIVATE CUDA::cudart)
+        else()
+            target_link_libraries(test_rocmfp_mix_gateup_glu PRIVATE hip::host)
+        endif()
+        list(APPEND _raw_unit_test_targets test_rocmfp_mix_gateup_glu)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_rocmfp_mix_glu_fusable.cpp")
         # Pure admission logic on tensor metadata -- no device work, no kernels. Deliberately

@@ -32,7 +32,7 @@
 //    halves disagree on shape, must fall back to the two-launch path rather than fuse a decoded
 //    tensor with an undecoded one.
 
-#include <hip/hip_runtime.h>
+#include "ds4_test_gpu_runtime.h"
 
 #include <cmath>
 #include <cstdint>
@@ -51,7 +51,7 @@ bool ggml_cuda_rocmfp2_mix_mul_mat_id(
     int in, int out, int n_expert_used, int n_tokens, int ne11,
     int64_t ids_s0, int64_t ids_s1,
     int64_t src1_s1, int64_t src1_s2,
-    int64_t dst_s1, int64_t dst_s2, hipStream_t stream);
+    int64_t dst_s1, int64_t dst_s2, cudaStream_t stream);
 
 bool ggml_cuda_rocmfp2_mix_mul_mat_id_glu(
     const void * vx_up, const void * vx_gate,
@@ -60,7 +60,7 @@ bool ggml_cuda_rocmfp2_mix_mul_mat_id_glu(
     int64_t ids_s0, int64_t ids_s1,
     int64_t src1_s1, int64_t src1_s2,
     int64_t dst_s1, int64_t dst_s2,
-    float glu_limit, hipStream_t stream);
+    float glu_limit, cudaStream_t stream);
 
 static int g_fails = 0;
 
@@ -74,10 +74,10 @@ static int g_fails = 0;
 
 #define HIP_OK(expr)                                                           \
     do {                                                                       \
-        hipError_t _e = (expr);                                                \
-        if (_e != hipSuccess) {                                                \
+        cudaError_t _e = (expr);                                                \
+        if (_e != cudaSuccess) {                                                \
             std::fprintf(stderr, "FAIL: %s -> %s\n", #expr,                    \
-                         hipGetErrorString(_e));                               \
+                         cudaGetErrorString(_e));                               \
             ++g_fails;                                                         \
         }                                                                      \
     } while (0)
@@ -112,7 +112,7 @@ static float host_swiglu_ds4(float gate, float up, float limit) {
 
 int main() {
     int ndev = 0;
-    if (hipGetDeviceCount(&ndev) != hipSuccess || ndev == 0) {
+    if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev == 0) {
         std::fprintf(stderr, "SKIP: no HIP device\n");
         return 0;
     }
@@ -149,26 +149,26 @@ int main() {
     void * d_up = nullptr, * d_gate = nullptr;
     float * d_x = nullptr, * d_up_out = nullptr, * d_gate_out = nullptr, * d_fused = nullptr;
     int32_t * d_ids = nullptr;
-    HIP_OK(hipMalloc(&d_up, wup.size()));
-    HIP_OK(hipMalloc(&d_gate, wgate.size()));
-    HIP_OK(hipMemcpy(d_up, wup.data(), wup.size(), hipMemcpyHostToDevice));
-    HIP_OK(hipMemcpy(d_gate, wgate.data(), wgate.size(), hipMemcpyHostToDevice));
+    HIP_OK(cudaMalloc(&d_up, wup.size()));
+    HIP_OK(cudaMalloc(&d_gate, wgate.size()));
+    HIP_OK(cudaMemcpy(d_up, wup.data(), wup.size(), cudaMemcpyHostToDevice));
+    HIP_OK(cudaMemcpy(d_gate, wgate.data(), wgate.size(), cudaMemcpyHostToDevice));
 
     const size_t xn = (size_t) in * ntok;
     const size_t yn = (size_t) out * n_used * ntok;
-    HIP_OK(hipMalloc(&d_x, sizeof(float) * xn));
-    HIP_OK(hipMalloc(&d_up_out, sizeof(float) * yn));
-    HIP_OK(hipMalloc(&d_gate_out, sizeof(float) * yn));
-    HIP_OK(hipMalloc(&d_fused, sizeof(float) * yn));
-    HIP_OK(hipMalloc(&d_ids, sizeof(int32_t) * n_used * ntok));
+    HIP_OK(cudaMalloc(&d_x, sizeof(float) * xn));
+    HIP_OK(cudaMalloc(&d_up_out, sizeof(float) * yn));
+    HIP_OK(cudaMalloc(&d_gate_out, sizeof(float) * yn));
+    HIP_OK(cudaMalloc(&d_fused, sizeof(float) * yn));
+    HIP_OK(cudaMalloc(&d_ids, sizeof(int32_t) * n_used * ntok));
 
     std::vector<float> xh(xn);
     for (size_t i = 0; i < xn; ++i) xh[i] = -0.75f + 0.03f * (float) (i % 51);
-    HIP_OK(hipMemcpy(d_x, xh.data(), sizeof(float) * xn, hipMemcpyHostToDevice));
+    HIP_OK(cudaMemcpy(d_x, xh.data(), sizeof(float) * xn, cudaMemcpyHostToDevice));
 
     std::vector<int32_t> idsh((size_t) n_used * ntok);
     for (size_t i = 0; i < idsh.size(); ++i) idsh[i] = (int32_t) ((i * 2 + 1) % n_experts);
-    HIP_OK(hipMemcpy(d_ids, idsh.data(), sizeof(int32_t) * idsh.size(), hipMemcpyHostToDevice));
+    HIP_OK(cudaMemcpy(d_ids, idsh.data(), sizeof(int32_t) * idsh.size(), cudaMemcpyHostToDevice));
 
     ggml_cuda_rocmfp2_mix_register_host(d_up, rows_bytes, n_experts, out, in,
                                         books_up.data(), modes_up.data(), rots.data());
@@ -189,12 +189,12 @@ int main() {
                                                in, out, n_used, ntok, 1,
                                                ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2,
                                                limit, nullptr));
-    HIP_OK(hipDeviceSynchronize());
+    HIP_OK(cudaDeviceSynchronize());
 
     std::vector<float> hu(yn), hg(yn), hf(yn);
-    HIP_OK(hipMemcpy(hu.data(), d_up_out,   sizeof(float) * yn, hipMemcpyDeviceToHost));
-    HIP_OK(hipMemcpy(hg.data(), d_gate_out, sizeof(float) * yn, hipMemcpyDeviceToHost));
-    HIP_OK(hipMemcpy(hf.data(), d_fused,    sizeof(float) * yn, hipMemcpyDeviceToHost));
+    HIP_OK(cudaMemcpy(hu.data(), d_up_out,   sizeof(float) * yn, cudaMemcpyDeviceToHost));
+    HIP_OK(cudaMemcpy(hg.data(), d_gate_out, sizeof(float) * yn, cudaMemcpyDeviceToHost));
+    HIP_OK(cudaMemcpy(hf.data(), d_fused,    sizeof(float) * yn, cudaMemcpyDeviceToHost));
 
     // The dots must be finite and non-trivial, or every assertion below passes vacuously.
     double mag = 0.0;
@@ -219,28 +219,28 @@ int main() {
 
     // ---- operand ORDER: swiglu_ds4 applies silu to GATE, so the two are not symmetric ----
     float * d_swapped = nullptr;
-    HIP_OK(hipMalloc(&d_swapped, sizeof(float) * yn));
+    HIP_OK(cudaMalloc(&d_swapped, sizeof(float) * yn));
     CHECK(ggml_cuda_rocmfp2_mix_mul_mat_id_glu(d_gate, d_up, d_x, d_ids, d_swapped,
                                                in, out, n_used, ntok, 1,
                                                ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2,
                                                limit, nullptr));
-    HIP_OK(hipDeviceSynchronize());
+    HIP_OK(cudaDeviceSynchronize());
     std::vector<float> hs(yn);
-    HIP_OK(hipMemcpy(hs.data(), d_swapped, sizeof(float) * yn, hipMemcpyDeviceToHost));
+    HIP_OK(cudaMemcpy(hs.data(), d_swapped, sizeof(float) * yn, cudaMemcpyDeviceToHost));
     int differing = 0;
     for (size_t i = 0; i < yn; ++i) if (hs[i] != hf[i]) ++differing;
     // If these matched, the kernel would be applying silu to the wrong operand (or ignoring one).
     CHECK(differing > (int) yn / 2);
 
     // ---- determinism: same inputs, same bytes ------------------------------------------
-    HIP_OK(hipMemset(d_fused, 0, sizeof(float) * yn));
+    HIP_OK(cudaMemset(d_fused, 0, sizeof(float) * yn));
     CHECK(ggml_cuda_rocmfp2_mix_mul_mat_id_glu(d_up, d_gate, d_x, d_ids, d_fused,
                                                in, out, n_used, ntok, 1,
                                                ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2,
                                                limit, nullptr));
-    HIP_OK(hipDeviceSynchronize());
+    HIP_OK(cudaDeviceSynchronize());
     std::vector<float> hf2(yn);
-    HIP_OK(hipMemcpy(hf2.data(), d_fused, sizeof(float) * yn, hipMemcpyDeviceToHost));
+    HIP_OK(cudaMemcpy(hf2.data(), d_fused, sizeof(float) * yn, cudaMemcpyDeviceToHost));
     for (size_t i = 0; i < yn; ++i) CHECK(std::memcmp(&hf[i], &hf2[i], 4) == 0);
 
     // ---- REFUSALS: a half-registered or mismatched pair must NOT fuse ------------------
@@ -260,10 +260,10 @@ int main() {
 
     ggml_cuda_rocmfp2_mix_unregister(d_gate);
     ggml_cuda_rocmfp2_mix_unregister(d_up);
-    HIP_OK(hipFree(d_up));  HIP_OK(hipFree(d_gate));
-    HIP_OK(hipFree(d_x));   HIP_OK(hipFree(d_ids));
-    HIP_OK(hipFree(d_up_out)); HIP_OK(hipFree(d_gate_out));
-    HIP_OK(hipFree(d_fused));  HIP_OK(hipFree(d_swapped));
+    HIP_OK(cudaFree(d_up));  HIP_OK(cudaFree(d_gate));
+    HIP_OK(cudaFree(d_x));   HIP_OK(cudaFree(d_ids));
+    HIP_OK(cudaFree(d_up_out)); HIP_OK(cudaFree(d_gate_out));
+    HIP_OK(cudaFree(d_fused));  HIP_OK(cudaFree(d_swapped));
 
     if (g_fails) { std::fprintf(stderr, "%d FAILURE(S)\n", g_fails); return 1; }
     std::fprintf(stderr, "OK: fused gate/up GLU matches the unfused pair, order is respected, "

@@ -8,7 +8,7 @@
 // The pre-fix code (unregister only erased the vector entry, never cudaFree'd
 // the register_host allocations) fails the leak assertion below.
 
-#include <hip/hip_runtime.h>
+#include "ds4_test_gpu_runtime.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -67,7 +67,7 @@ int main() {
     // 4. no device-memory leak across many register/unregister cycles. A missing
     //    cudaFree in unregister (or on update) leaks ~E*(2*8*2 + 1 + 1) bytes per
     //    cycle; 4000 cycles would drop free VRAM by tens of MB.
-    hipDeviceSynchronize();
+    cudaDeviceSynchronize();
     size_t free_warm = 0, total = 0;
     // warm the allocator first so pool growth isn't counted as a leak
     for (int i = 0; i < 64; ++i) {
@@ -75,16 +75,16 @@ int main() {
                                             books.data(), modes.data(), rots.data());
         ggml_cuda_rocmfp3_mix_unregister(b0);
     }
-    hipDeviceSynchronize();
-    (void) hipMemGetInfo(&free_warm, &total);
+    cudaDeviceSynchronize();
+    (void) cudaMemGetInfo(&free_warm, &total);
     for (int i = 0; i < 4000; ++i) {
         ggml_cuda_rocmfp3_mix_register_host(b0, nb02, E, out, in,
                                             books.data(), modes.data(), rots.data());
         ggml_cuda_rocmfp3_mix_unregister(b0);
     }
-    hipDeviceSynchronize();
+    cudaDeviceSynchronize();
     size_t free_end = 0;
-    (void) hipMemGetInfo(&free_end, &total);
+    (void) cudaMemGetInfo(&free_end, &total);
     const long long delta = (long long) free_warm - (long long) free_end;
     std::fprintf(stderr, "[registry] free VRAM delta over 4000 cycles: %lld bytes\n", delta);
     CHECK(delta < 8 * 1024 * 1024, "no device leak across register/unregister cycles");

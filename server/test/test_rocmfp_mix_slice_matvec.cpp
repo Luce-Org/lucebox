@@ -20,7 +20,7 @@
 // slices than the grid will index must be REFUSED, not silently decoded against a
 // neighbouring tensor's codebook. That failure mode is wrong numbers, not a crash.
 
-#include <hip/hip_runtime.h>
+#include "ds4_test_gpu_runtime.h"
 
 #include <cmath>
 #include <cstdint>
@@ -37,14 +37,14 @@ extern "C" void ggml_cuda_rocmfp3_mix_unregister(const void * base);
 bool ggml_cuda_rocmfp3_mix_mul_mat_vec(
     const void * vx, const float * x, float * y,
     int in, int out, int ncols,
-    int64_t x_col_stride, int64_t y_col_stride, hipStream_t stream);
+    int64_t x_col_stride, int64_t y_col_stride, cudaStream_t stream);
 
 bool ggml_cuda_rocmfp3_mix_mul_mat_vec_3d(
     const void * vx, const float * src1, float * dst,
     int in, int out, int nslices, int ntokens,
     int64_t src1_token_stride, int64_t src1_slice_stride,
     int64_t dst_token_stride,  int64_t dst_slice_stride,
-    hipStream_t stream);
+    cudaStream_t stream);
 
 static int g_fails = 0;
 #define CHECK(cond, msg)                                                       \
@@ -54,10 +54,10 @@ static int g_fails = 0;
 
 #define HIP_OK(expr)                                                           \
     do {                                                                       \
-        hipError_t _e = (expr);                                                \
-        if (_e != hipSuccess) {                                                \
+        cudaError_t _e = (expr);                                                \
+        if (_e != cudaSuccess) {                                                \
             std::fprintf(stderr, "FAIL: %s -> %s\n", #expr,                    \
-                         hipGetErrorString(_e));                               \
+                         cudaGetErrorString(_e));                               \
             ++g_fails;                                                         \
         }                                                                      \
     } while (0)
@@ -75,7 +75,7 @@ static uint32_t rnd() { xs ^= xs << 13; xs ^= xs >> 17; xs ^= xs << 5; return xs
 
 int main() {
     int ndev = 0;
-    if (hipGetDeviceCount(&ndev) != hipSuccess || ndev == 0) {
+    if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev == 0) {
         std::fprintf(stderr, "SKIP: no HIP device\n");
         return 0;
     }
@@ -120,19 +120,19 @@ int main() {
     float   * d_x = nullptr;
     float   * d_y3 = nullptr;
     float   * d_y2 = nullptr;
-    HIP_OK(hipMalloc(&d_w, blocks.size()));
-    HIP_OK(hipMemcpy(d_w, blocks.data(), blocks.size(), hipMemcpyHostToDevice));
-    HIP_OK(hipMalloc(&d_x, sizeof(float) * (size_t) in * ntokens * nslices));
-    HIP_OK(hipMalloc(&d_y3, sizeof(float) * (size_t) out * ntokens * nslices));
-    HIP_OK(hipMalloc(&d_y2, sizeof(float) * (size_t) out * ntokens * nslices));
+    HIP_OK(cudaMalloc(&d_w, blocks.size()));
+    HIP_OK(cudaMemcpy(d_w, blocks.data(), blocks.size(), cudaMemcpyHostToDevice));
+    HIP_OK(cudaMalloc(&d_x, sizeof(float) * (size_t) in * ntokens * nslices));
+    HIP_OK(cudaMalloc(&d_y3, sizeof(float) * (size_t) out * ntokens * nslices));
+    HIP_OK(cudaMalloc(&d_y2, sizeof(float) * (size_t) out * ntokens * nslices));
 
     std::vector<float> xh((size_t) in * ntokens * nslices);
     for (size_t i = 0; i < xh.size(); ++i) {
         xh[i] = 0.5f - (float) (rnd() % 1000) / 1000.0f;
     }
-    HIP_OK(hipMemcpy(d_x, xh.data(), sizeof(float) * xh.size(), hipMemcpyHostToDevice));
-    HIP_OK(hipMemset(d_y3, 0, sizeof(float) * (size_t) out * ntokens * nslices));
-    HIP_OK(hipMemset(d_y2, 0, sizeof(float) * (size_t) out * ntokens * nslices));
+    HIP_OK(cudaMemcpy(d_x, xh.data(), sizeof(float) * xh.size(), cudaMemcpyHostToDevice));
+    HIP_OK(cudaMemset(d_y3, 0, sizeof(float) * (size_t) out * ntokens * nslices));
+    HIP_OK(cudaMemset(d_y2, 0, sizeof(float) * (size_t) out * ntokens * nslices));
 
     // Contiguous [in, ntokens, nslices] src1 and [out, ntokens, nslices] dst.
     const int64_t s1_tok = in,  s1_sl = (int64_t) in  * ntokens;
@@ -155,7 +155,7 @@ int main() {
               d_w, d_x, d_y3, in, out, nslices, ntokens,
               s1_tok, s1_sl, d_tok, d_sl, nullptr),
           "3d matvec handles a fully registered tensor");
-    HIP_OK(hipDeviceSynchronize());
+    HIP_OK(cudaDeviceSynchronize());
 
     // Reference: call the 2-D path once per slice. Its base pointer lands inside the
     // registered range, so mix_lookup resolves that slice's own codebook/mode -- the
@@ -167,12 +167,12 @@ int main() {
             in, out, ntokens, s1_tok, d_tok, nullptr);
         CHECK(ok, "2d reference path handles each slice");
     }
-    HIP_OK(hipDeviceSynchronize());
+    HIP_OK(cudaDeviceSynchronize());
 
     std::vector<float> y3((size_t) out * ntokens * nslices);
     std::vector<float> y2(y3.size());
-    HIP_OK(hipMemcpy(y3.data(), d_y3, sizeof(float) * y3.size(), hipMemcpyDeviceToHost));
-    HIP_OK(hipMemcpy(y2.data(), d_y2, sizeof(float) * y2.size(), hipMemcpyDeviceToHost));
+    HIP_OK(cudaMemcpy(y3.data(), d_y3, sizeof(float) * y3.size(), cudaMemcpyDeviceToHost));
+    HIP_OK(cudaMemcpy(y2.data(), d_y2, sizeof(float) * y2.size(), cudaMemcpyDeviceToHost));
 
     // BIT-identical, not close: same decode, same ascending-j fold, same acc chain.
     size_t mismatches = 0, first = 0;
@@ -194,10 +194,10 @@ int main() {
     }
 
     ggml_cuda_rocmfp3_mix_unregister(d_w);
-    HIP_OK(hipFree(d_w));
-    HIP_OK(hipFree(d_x));
-    HIP_OK(hipFree(d_y3));
-    HIP_OK(hipFree(d_y2));
+    HIP_OK(cudaFree(d_w));
+    HIP_OK(cudaFree(d_x));
+    HIP_OK(cudaFree(d_y3));
+    HIP_OK(cudaFree(d_y2));
 
     if (g_fails == 0) {
         std::printf("PASS: dense 3-D-slice matvec is bit-identical to the per-slice path "
