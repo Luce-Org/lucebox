@@ -394,10 +394,9 @@ def main() -> int:
         print(f"FAIL: {error}; diagnostics retained in {failed_dir}", file=sys.stderr)
         return 1
     try:
-try:
-    attempt_dir.rmdir()
-except OSError as error:
-    print(f"warning: could not remove staging dir {attempt_dir}: {error}", file=sys.stderr)
+        attempt_dir.rmdir()
+    except OSError as error:
+        print(f"warning: could not remove staging dir {attempt_dir}: {error}", file=sys.stderr)
     print(
         f"PASS: {len(ar.tokens)} generated token IDs are identical; "
         "reference-exact speculation executed at least one step"
