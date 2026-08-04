@@ -644,7 +644,7 @@ constexpr int DS4_QTYPE_ROCMFP2_MIX = 106;  // GGML_TYPE_Q2_1_ROCMFP2_MIX
 // Registers dense (non-MoE) qtype-105/106 tensors -- the attention stack -- with the
 // device decoder. Motivated by measurement rather than symmetry: on attention the learned
 // codebook is worth -25%/-40% ppl damage at byte-identical size, and attention is 46.2% of
-// per-token read bytes (geo-quant log 2026-07-29). Without registration the fused kernels
+// per-token read bytes, both measured. Without registration the fused kernels
 // return false and every dense mix tensor falls to dequantize->cuBLAS, which reads MORE
 // bytes than the f16 it replaced.
 //

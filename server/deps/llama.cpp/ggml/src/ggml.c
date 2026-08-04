@@ -638,7 +638,8 @@ static void rocmfpx_mix_to_float_unsupported(const void * GGML_RESTRICT x, float
 static void rocmfpx_mix_from_float_unsupported(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     GGML_UNUSED(x); GGML_UNUSED(y); GGML_UNUSED(k);
     GGML_ABORT("rocmfpx_mix: quantization requires a fitted per-expert codebook and its "
-               "sidecar/KV. Produce these tensors with the geo-quant exporter.");
+               "sidecar/KV. These tensors must come from an exporter that fits "
+               "per-expert codebooks and emits them alongside the weights.");
 }
 
 

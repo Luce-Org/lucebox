@@ -135,7 +135,7 @@ int main() {
         wgate[blk * BLOCK_BYTES + 9] = (uint8_t) (0x30 | (wgate[blk * BLOCK_BYTES + 9] & 0x80));
     }
 
-    // DIFFERENT codebooks for gate and up on purpose. The geo-quant splitter asserts they match
+    // DIFFERENT codebooks for gate and up on purpose. Producers may emit matching ones,
     // in the shipped artifact, but the kernel must not depend on that -- if it silently used
     // up's table for gate, this test would catch it.
     std::vector<uint16_t> books_up((size_t) n_experts * 2 * K), books_gate((size_t) n_experts * 2 * K);

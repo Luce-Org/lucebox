@@ -543,8 +543,8 @@ __global__ void mix_matvec_rocmfp2_moe_kernel(
         int64_t src1_s1, int64_t src1_s2,     // element strides (float) over ne11, token
         int64_t dst_s1, int64_t dst_s2,       // element strides (float) over slot, token
         // FUSE_GLU only. The gate tensor's own registry entry -- separate codebooks and modes,
-        // NOT assumed equal to up's. The geo-quant splitter asserts they match today, but the
-        // kernel does not need that to be true and staging both costs 32 bytes of LDS.
+        // NOT assumed equal to up's. Producers may emit identical codebooks for the two
+        // halves, but the kernel does not rely on that and staging both costs 32 B of LDS.
         const uint8_t * __restrict__ gdata, size_t gnb02,
         const nv_bfloat16 * __restrict__ gcodebooks, const uint8_t * __restrict__ gmodes,
         float glu_limit) {
