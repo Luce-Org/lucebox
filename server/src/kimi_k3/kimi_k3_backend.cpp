@@ -1,3 +1,7 @@
+#if defined(_WIN32) && !defined(NOMINMAX)
+#define NOMINMAX
+#endif
+
 #include "kimi_k3_backend.h"
 
 #include "common/dynamic_backend.h"
