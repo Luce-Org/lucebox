@@ -529,8 +529,14 @@ void SseEmitter::emit_content_delta(std::vector<std::string> & out,
 std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
                                                  const GenTimings * timings,
                                                  int generation_cap,
-                                                 bool degenerate_decode_close) {
+                                                 bool degenerate_decode_close,
+                                                 bool result_ok) {
     std::vector<std::string> out;
+
+    // Failed generations use HttpServer::fail_request() instead of a
+    // format-specific terminal success event. Keep this guard here as a
+    // second line of defense for callers that use the emitter directly.
+    if (!result_ok) return out;
 
     // A valid but incomplete trailing sequence is only safe to retain until
     // the generation is over. At finalization it is genuinely truncated and
@@ -713,7 +719,8 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
     }
 
     fr = resolve_client_finish_reason(
-        fr, completion_tokens, generation_cap, degenerate_decode_close);
+        fr, completion_tokens, generation_cap, degenerate_decode_close,
+        result_ok);
 
     // Format-specific final events
     switch (format_) {

@@ -361,11 +361,30 @@ TEST_CASE(ServerUnitFixture, test_finish_reason_resolution_table) {
         {"tool_calls", 8,  8, true,  true,  false, "tool_calls"},
         {"stop",       3,  8, false, true,  true,  "client_disconnect"},
         {"stop",       3,  8, false, false, false, "error"},
+        {"length",     8,  8, false, false, false, "error"},
+        {"tool_calls", 8,  8, true,  false, false, "error"},
     };
     for (const auto & c : cases) {
         TEST_ASSERT(resolve_client_finish_reason(
             c.emitter, c.tokens, c.cap, c.degenerate,
             c.ok, c.disconnected) == c.expected);
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_failed_stream_finish_emits_no_success_terminal_event) {
+    for (const auto format : {ApiFormat::OPENAI_CHAT,
+                              ApiFormat::ANTHROPIC,
+                              ApiFormat::RESPONSES}) {
+        auto em = make_emitter(format);
+        em.emit_start();
+        em.emit_token("partial");
+        const std::string wire = concat(
+            em.emit_finish(1, nullptr, 8, false, false));
+        TEST_ASSERT(wire.find("finish_reason") == std::string::npos);
+        TEST_ASSERT(wire.find("stop_reason") == std::string::npos);
+        TEST_ASSERT(wire.find("response.completed") == std::string::npos);
+        TEST_ASSERT(wire.find("\"status\":\"completed\"") ==
+                    std::string::npos);
     }
 }
 

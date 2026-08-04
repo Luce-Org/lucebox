@@ -89,7 +89,8 @@ public:
     std::vector<std::string> emit_finish(int completion_tokens,
                                          const GenTimings * timings = nullptr,
                                          int generation_cap = -1,
-                                         bool degenerate_decode_close = false);
+                                         bool degenerate_decode_close = false,
+                                         bool result_ok = true);
 
     // Get the finish_reason for non-streaming responses.
     std::string finish_reason() const;

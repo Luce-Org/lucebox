@@ -2096,7 +2096,7 @@ json build_openai_completion_response(
     // event and the chat DONE log.
     const std::string finish_reason = resolve_client_finish_reason(
         emitter.finish_reason(), counts.total, generation_cap,
-        result.degenerate_decode_close);
+        result.degenerate_decode_close, result.ok());
 
     json choice = {
         {"index", 0},
@@ -2190,7 +2190,7 @@ json build_anthropic_response(
     // shared length-vs-EOS policy as OpenAI and the streaming terminal event.
     const std::string finish_reason = resolve_client_finish_reason(
         emitter.finish_reason(), counts.total, generation_cap,
-        result.degenerate_decode_close);
+        result.degenerate_decode_close, result.ok());
     std::string stop_reason;
     if (finish_reason == "tool_calls") {
         stop_reason = "tool_use";
@@ -3366,7 +3366,8 @@ void HttpServer::process_job(ServerJob * job) {
         job->done = true;
         job->cv.notify_one();
     };
-    auto fail_request = [&](int status, const std::string & message) {
+    auto fail_request = [&](int status, const std::string & message,
+                            bool finish = true) {
         std::fprintf(stderr, "[server] request failed: %s\n", message.c_str());
         if (req.stream) {
             stop_job_stream(job);
@@ -3378,7 +3379,7 @@ void HttpServer::process_job(ServerJob * job) {
         } else {
             send_error(fd, status, message);
         }
-        finish_job();
+        if (finish) finish_job();
     };
 
     std::fprintf(stderr,
@@ -3515,6 +3516,26 @@ void HttpServer::process_job(ServerJob * job) {
         req, prepared, cache, result, completion_tokens,
         visible_output_seen, client_disconnected);
 
+    // GenerateResult is authoritative. Do not finalize a failed generation
+    // as a normal stop/length/end_turn/completed response. A stream has
+    // already committed HTTP 200 headers, so fail_request() sends the
+    // existing SSE error envelope; non-streaming requests get HTTP 500.
+    // A disconnected client cannot receive either form and must retain the
+    // existing disconnect-only cleanup/logging path.
+    if (!result.ok() && !client_disconnected) {
+        std::string message = "generation failed";
+        if (!result.error_detail().empty()) {
+            message += ": ";
+            message += result.error_detail();
+        } else if (!result.error_code().empty()) {
+            message += ": ";
+            message += result.error_code();
+        }
+        // Preserve the authoritative `chat DONE ... finish=error` log below,
+        // then signal completion once after the common logging path.
+        fail_request(500, message, false);
+    }
+
     // Finalize.
     // Per-request wall-clock timings forwarded to the response's
     // `usage.timings` (OpenAI Chat usage chunk, Anthropic
@@ -3563,17 +3584,17 @@ void HttpServer::process_job(ServerJob * job) {
     if (job->client_disconnected.load(std::memory_order_acquire)) {
         client_disconnected = true;
     }
-    if (req.stream && !client_disconnected) {
+    if (result.ok() && req.stream && !client_disconnected) {
         auto final_chunks = emitter.emit_finish(
             completion_tokens, &gen_timings, n_gen_cap,
-            result.degenerate_decode_close);
+            result.degenerate_decode_close, result.ok());
         for (const auto & chunk : final_chunks) {
             if (!send_job_bytes(job, chunk.data(), chunk.size())) {
                 client_disconnected = true;
                 break;
             }
         }
-    } else if (!req.stream && !client_disconnected) {
+    } else if (result.ok() && !req.stream && !client_disconnected) {
         const json response = build_non_streaming_response(
             req, result, n_gen_cap, gen_timings, tokenizer_, emitter);
         // Streaming uses non-blocking sends; restore blocking mode before
