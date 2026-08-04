@@ -1,4 +1,5 @@
 // DeepSeek4Backend implementation — AR-only decode, chunked prefill.
+#include "deepseek4_roctx.h"
 
 #include "deepseek4_backend.h"
 #include "deepseek4_internal.h"
@@ -1311,6 +1312,12 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                                   int kv_offset,
                                   int snap_slot,
                                   int snap_pos) {
+    const DeepSeek4RoctxPhaseScope roctx_phase(
+        prefill_attention_mode_name(cfg_.prefill_mode));
+    const DeepSeek4RoctxRange roctx_range(
+        "ds4.prefill",
+        {prefill_attention_mode_name(cfg_.prefill_mode),
+         static_cast<int>(tokens.size()), 0, w_.n_layer, cfg_.device.gpu});
     // The all-hot layer-range path supports causal chunked prefill. The
     // optimized graph snapshots the previous raw SWA window, attends over
     // that snapshot plus the current ubatch, and commits only the final SWA
@@ -1540,6 +1547,7 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
                                   const DaemonIO & io,
                                   const BudgetHook & budget_hook,
                                   bool * forced_close_out) {
+    const DeepSeek4RoctxPhaseScope roctx_phase("decode");
     if (forced_close_out) *forced_close_out = false;
     const bool timing = env_flag_enabled("DFLASH_DS4_TIMING");
     const auto phase_t0 = Clock::now();

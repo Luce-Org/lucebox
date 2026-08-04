@@ -231,6 +231,7 @@ The runtime logs the chosen split with a `[deepseek4-split] auto-split:` banner.
 |----------|---------|
 | `DFLASH_DS4_CUDA_LAYERS` | Override the auto-split heuristic and pin the first `N` DeepSeek4 layers to CUDA. The remaining `43 - N` layers run on the Halo shard. |
 | `DFLASH_DS4_TIMING` | Enable DS4 timing logs for the layer-split parent and target-shard daemon. Useful for profiling prefill/decode breakdowns; leave unset for normal runs. |
+| `DFLASH_DS4_ROCTX` | HIP-only, default-off semantic ROCTX ranges for an external rocprof trace. The library is loaded dynamically only when set to `1`, `true`, `yes`, or `on`. |
 | `DFLASH_DS4_SPEC` / `DFLASH_DS4_DRAFT` | Enable DSpark and select its GGUF. |
 | `DFLASH_DS4_DRAFT_BACKEND` / `DFLASH_DS4_DRAFT_GPU` | Backend and device for the in-process drafter. |
 | `DFLASH_DS4_MOE_TP` | Enable routed-expert partitioning. |
@@ -260,6 +261,21 @@ The runtime logs the chosen split with a `[deepseek4-split] auto-split:` banner.
 
 The old per-expert IPC worker is retired. The `DFLASH_DS4_MOE_TP*` variables
 above configure the in-process route-owner implementation.
+
+### External ROCm traces
+
+Set `DFLASH_DS4_ROCTX=1` when collecting an external rocprof marker trace.
+The runtime emits balanced `ds4.prefill`, `ds4.spec_decode`, and
+`ds4.layer_range` ranges with the applicable mode, token count, layer bounds,
+and device. The marker layer does not use HIP events, synchronize a stream, or
+calculate timings; rocprof remains the timing authority. Non-HIP builds emit
+no markers or ROCTX library calls, and an unset or false value does not load
+ROCTX.
+
+Use the marker-trace option supported by the installed rocprof version (for
+example, `rocprofv3 --marker-trace -- <lucebox command>`), then correlate these
+host scopes with the kernel and memory-copy tracks. A target-machine trace is
+still required to assess instrumentation perturbation.
 
 ## DSpark Speculative Decode
 

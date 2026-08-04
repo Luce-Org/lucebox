@@ -5,6 +5,7 @@
 // HC state is transferred between shards at the boundary.
 
 #include "deepseek4_layer_split_adapter.h"
+#include "deepseek4_roctx.h"
 #include "deepseek4_internal.h"
 #include "common/layer_split_runtime.h"
 #include "common/gguf_inspect.h"
@@ -575,6 +576,15 @@ bool DeepSeek4LayerSplitAdapter::prefill(
         const std::vector<int32_t> & prompt,
         int base_pos,
         int & last_tok) {
+    const char * roctx_mode = shards_.empty()
+        ? "exact"
+        : prefill_attention_mode_name(shards_.front().cache.prefill_mode);
+    const DeepSeek4RoctxPhaseScope roctx_phase(roctx_mode);
+    const int n_layers = shards_.empty() ? -1 : shards_.front().weights.n_layer;
+    const DeepSeek4RoctxRange roctx_range(
+        "ds4.prefill",
+        {roctx_mode, static_cast<int>(prompt.size()), 0, n_layers,
+         cfg_.device.gpu});
     const int chunk_size = cfg_.chunk > 0 ? cfg_.chunk : 512;
     const int n_prompt = (int)prompt.size();
 
@@ -600,6 +610,7 @@ bool DeepSeek4LayerSplitAdapter::decode_ar(
         const std::vector<int32_t> & history_prefix,
         std::vector<int32_t> & out_tokens,
         const DaemonIO & io) {
+    const DeepSeek4RoctxPhaseScope roctx_phase("decode");
     if (shards_.empty()) return false;
 
     const DeepSeek4Weights & w = shards_[0].weights;

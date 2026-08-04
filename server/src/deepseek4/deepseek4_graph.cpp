@@ -10,6 +10,7 @@
 
 #include "deepseek4_internal.h"
 #include "deepseek4_hc_cuda.h"
+#include "deepseek4_roctx.h"
 #include "internal.h"
 #include "../common/step_graph.h"
 #include "../common/cuda_graph_overrides.h"
@@ -6618,7 +6619,6 @@ bool deepseek4_step_layer_range(
     const int n_hc = w.n_hc;
     const int hc_dim = n_hc * n_embd;
     const bool is_last_shard = (layer_end >= w.n_layer);
-
     const bool fused_hybrid_ready =
         moe_hybrid && !expert_runtime &&
         moe_hybrid->materialized_cold_experts &&
@@ -6737,6 +6737,16 @@ bool deepseek4_step_layer_range(
         }
         return true;
     }
+
+    // Emit only executable leaf ranges. The compressor-boundary wrapper above
+    // recursively invokes this function, and marking both parent and children
+    // would double-count the phase in external trace summaries.
+    const char * roctx_mode = deepseek4_roctx_layer_mode(
+        verify_hooks != nullptr, n_tokens,
+        prefill_attention_mode_name(cache.prefill_mode));
+    const DeepSeek4RoctxRange roctx_range(
+        "ds4.layer_range",
+        {roctx_mode, n_tokens, layer_begin, layer_end, device});
 
     // Initialize HC state.
     // First shard (layer_begin=0): embed is token embeddings [n_embd × n_tokens],

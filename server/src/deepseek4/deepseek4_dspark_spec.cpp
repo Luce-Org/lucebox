@@ -23,6 +23,7 @@
 
 #include "deepseek4_dspark.h"
 #include "deepseek4_internal.h"
+#include "deepseek4_roctx.h"
 #include "internal.h"
 #include "common/dspark_head.h"
 
@@ -585,6 +586,7 @@ bool deepseek4_dspark_verify_forward(ggml_backend_t backend,
                                      MoeHybridStorage * moe_hybrid,
                                      MoeExpertComputeRuntime * expert_runtime,
                                      MoeHybridRoutingStats * routing_stats) {
+    const DeepSeek4RoctxPhaseScope roctx_phase("verify");
     std::vector<float> hc_state;
     std::vector<float> all_logits;
     std::vector<float> last_logits;
@@ -664,6 +666,11 @@ bool run_deepseek4_dspark_spec_decode(
         spec_env_flag("DFLASH_DS4_FULL_SNAP");
     const bool seq_verify_mode = reference_exact ||
         spec_env_flag("DFLASH_DS4_SEQ_VERIFY");
+    const char * roctx_mode = reference_exact ? "reference_exact"
+        : (seq_verify_mode ? "sequential" : "batched");
+    const DeepSeek4RoctxRange roctx_range(
+        "ds4.spec_decode",
+        {roctx_mode, n_gen, 0, target_w.n_layer, device});
     const bool async_rollback = spec_env_flag("DFLASH_DS4_ASYNC_ROLLBACK");
     const bool pinned_rollback = spec_env_flag("DFLASH_DS4_PINNED_ROLLBACK");
     const bool draft_overlap_probe =
