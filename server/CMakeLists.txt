@@ -921,16 +921,6 @@ if(DFLASH27B_TESTS)
             hip::host)
         list(APPEND _raw_unit_test_targets test_rocmfp_mix_gateup_glu)
 
-        # Admission-logic only (no device work), but it links ggml for the tensor types.
-        add_executable(test_rocmfp_mix_glu_fusable test/test_rocmfp_mix_glu_fusable.cpp)
-        set_source_files_properties(test/test_rocmfp_mix_glu_fusable.cpp PROPERTIES LANGUAGE HIP)
-        set_target_properties(test_rocmfp_mix_glu_fusable PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
-        target_include_directories(test_rocmfp_mix_glu_fusable PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
-        target_link_libraries(test_rocmfp_mix_glu_fusable PRIVATE
-            ggml ggml-base ${DFLASH27B_GGML_BACKEND_TARGET} hip::host)
-        list(APPEND _raw_unit_test_targets test_rocmfp_mix_glu_fusable)
-
         # Benchmark, not a test: built with the tests but deliberately NOT added to
         # _raw_unit_test_targets, so ctest stays deterministic. Measures the launch-count
         # claim the fusion rests on.
@@ -1110,7 +1100,13 @@ if(DFLASH27B_TESTS)
         endif()
         add_test(NAME ggml_rmsnorm_batch COMMAND test_ggml_rmsnorm_batch)
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ds4_load_transactional.cpp")
+    # POSIX-only fixture: it builds its temp model/sidecar stand-ins with symlink()/getpid()
+    # under /tmp and probes them with access(R_OK). Porting that to Win32 would mean
+    # CreateSymbolicLinkW (which needs privilege or developer mode) for a test that is already
+    # gated on DS4_TEST_MODEL and skips without it -- disproportionate. Excluded on Windows so
+    # a tests-enabled MSVC build compiles; the portable coverage lives in
+    # test_ds4_mix_registry_teardown and test_ds4_dmix_entry_validation, which need no model.
+    if(NOT WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ds4_load_transactional.cpp")
         add_executable(test_ds4_load_transactional test/test_ds4_load_transactional.cpp)
         target_include_directories(test_ds4_load_transactional PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/include)
         if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
@@ -1127,6 +1123,31 @@ if(DFLASH27B_TESTS)
         endif()
         # Self-skips (returns 0) unless DS4_TEST_MODEL points at a qtype-105 model.
         add_test(NAME ds4_load_transactional COMMAND test_ds4_load_transactional)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_rocmfp_mix_glu_fusable.cpp")
+        # Pure admission logic on tensor metadata -- no device work, no kernels. Deliberately
+        # OUTSIDE the hip-only block: the predicate it checks lives in ggml-cuda.cu and is
+        # compiled for both backends, so the negative cases are worth exercising under CUDA
+        # too. Source language follows the backend.
+        add_executable(test_rocmfp_mix_glu_fusable test/test_rocmfp_mix_glu_fusable.cpp)
+        if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+            set_source_files_properties(test/test_rocmfp_mix_glu_fusable.cpp PROPERTIES LANGUAGE HIP)
+            set_target_properties(test_rocmfp_mix_glu_fusable PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
+        else()
+            set_source_files_properties(test/test_rocmfp_mix_glu_fusable.cpp PROPERTIES LANGUAGE CUDA)
+            set_target_properties(test_rocmfp_mix_glu_fusable PROPERTIES CUDA_ARCHITECTURES "${_dflash_archs}")
+        endif()
+        target_include_directories(test_rocmfp_mix_glu_fusable PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
+        target_link_libraries(test_rocmfp_mix_glu_fusable PRIVATE
+            ggml ggml-base ${DFLASH27B_GGML_BACKEND_TARGET})
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            find_package(CUDAToolkit REQUIRED)
+            target_link_libraries(test_rocmfp_mix_glu_fusable PRIVATE CUDA::cudart)
+        else()
+            target_link_libraries(test_rocmfp_mix_glu_fusable PRIVATE hip::host)
+        endif()
+        list(APPEND _raw_unit_test_targets test_rocmfp_mix_glu_fusable)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ds4_mix_registry_teardown.cpp")
         # Synthetic fixture: exercises free_deepseek4_weights' registry teardown with a
