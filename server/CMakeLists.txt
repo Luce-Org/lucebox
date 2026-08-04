@@ -1608,6 +1608,16 @@ if(DFLASH27B_TESTS)
                 if(_unit_target STREQUAL "test_deepseek4_mmid_grouped_cuda")
                     set_tests_properties("${_unit_ctest_name}" PROPERTIES SKIP_RETURN_CODE 77)
                 endif()
+                if(_unit_target STREQUAL "test_rocmfp3_mix_registry")
+                    # Its leak assertion reads GLOBAL free VRAM (cudaMemGetInfo) before and
+                    # after 4000 register/unregister cycles, so any other test allocating on
+                    # the device concurrently is charged to it as a leak. Observed exactly
+                    # that: passes alone, and under `ctest -j 3` reported a 591 MB "leak" that
+                    # belonged to a neighbour. Serialise it rather than loosen the threshold --
+                    # a tolerance wide enough to absorb another test's allocation would be wide
+                    # enough to hide the leak this test exists to catch.
+                    set_tests_properties("${_unit_ctest_name}" PROPERTIES RUN_SERIAL TRUE)
+                endif()
             endif()
         endforeach()
         unset(_unit_ctest_name)
