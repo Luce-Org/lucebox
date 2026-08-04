@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <cinttypes>
 #include <cmath>
+#include <cstdint>   // SIZE_MAX, used by the portable checked-size helpers below
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -369,6 +370,59 @@ constexpr uint8_t  DS4_P4MIX_MAX_MODE    = 1;          // 0 = fixed, 1 = adaptiv
 //
 // fmemopen is what keeps this small: the callers' existing FILE* parsers read the
 // embedded bytes with no change, so the sidecar layout still has exactly one parser.
+// A read-only FILE* over a memory buffer, portably.
+//
+// fmemopen is POSIX and absent from the MSVC CRT, and this file carries real Windows support
+// (several _WIN32 branches above), so calling it unconditionally would break that build. The
+// fallback writes the blob to a tmpfile and rewinds: one extra copy of ~375 KB, once per
+// load, against keeping a single FILE*-based parser for the layout. Duplicating the parsers
+// to take byte buffers instead would trade a trivial cost for exactly the drift risk the
+// single-parser design exists to avoid.
+static FILE * ds4_fopen_memory(std::vector<uint8_t> & backing) {
+#if defined(_WIN32)
+    FILE * f = std::tmpfile();
+    if (!f) {
+        return nullptr;
+    }
+    if (!backing.empty() &&
+        std::fwrite(backing.data(), 1, backing.size(), f) != backing.size()) {
+        std::fclose(f);
+        return nullptr;
+    }
+    std::rewind(f);
+    return f;
+#else
+    return fmemopen(backing.data(), backing.size(), "rb");
+#endif
+}
+
+// Checked size arithmetic, portably. The __builtin_*_overflow forms these replace are
+// GCC/Clang-only; MSVC has neither, and the sidecar parsers use them on every header field
+// that sizes a read or an allocation, so they cannot simply be dropped on that compiler.
+static inline bool ds4_size_mul_overflow(size_t a, size_t b, size_t * out) {
+#if defined(__GNUC__) || defined(__clang__)
+    return __builtin_mul_overflow(a, b, out);
+#else
+    if (a != 0 && b > (SIZE_MAX / a)) {
+        return true;
+    }
+    *out = a * b;
+    return false;
+#endif
+}
+
+static inline bool ds4_size_add_overflow(size_t a, size_t b, size_t * out) {
+#if defined(__GNUC__) || defined(__clang__)
+    return __builtin_add_overflow(a, b, out);
+#else
+    if (b > (SIZE_MAX - a)) {
+        return true;
+    }
+    *out = a + b;
+    return false;
+#endif
+}
+
 static FILE * ds4_open_sidecar(const std::string & gguf_path,
                                const char * kv_key,
                                const char * suffix,
@@ -385,7 +439,7 @@ static FILE * ds4_open_sidecar(const std::string & gguf_path,
             gguf_free(g);
             std::fprintf(stderr, "[deepseek4] %s: using codebooks embedded in the GGUF "
                          "(%zu bytes, no sidecar file needed)\n", kv_key, backing.size());
-            return fmemopen(backing.data(), backing.size(), "rb");
+            return ds4_fopen_memory(backing);
         }
         gguf_free(g);
     }
@@ -465,9 +519,9 @@ static bool ds4_register_p4mix_sidecar(const std::string & gguf_path,
         }
         // Checked payload size = modes(E) + rots(E) + books(E*C*K * 2 bytes).
         size_t book_elems = 0, book_bytes = 0, payload = 0;
-        if (__builtin_mul_overflow((size_t) E, (size_t) (C * K), &book_elems) ||
-            __builtin_mul_overflow(book_elems, (size_t) sizeof(uint16_t), &book_bytes) ||
-            __builtin_add_overflow((size_t) E + (size_t) E, book_bytes, &payload)) {
+        if (ds4_size_mul_overflow((size_t) E, (size_t) (C * K), &book_elems) ||
+            ds4_size_mul_overflow(book_elems, (size_t) sizeof(uint16_t), &book_bytes) ||
+            ds4_size_add_overflow((size_t) E + (size_t) E, book_bytes, &payload)) {
             std::fprintf(stderr, "[deepseek4] p4mix layer %u payload size overflow\n", layer);
             ok = false; break;
         }
@@ -928,9 +982,9 @@ static bool ds4_register_gumix_sidecar(const std::string & gguf_path,
         }
         // Checked payload = modes(E) + books(E*C*K * 2 bytes). No rotation field.
         size_t book_elems = 0, book_bytes = 0, payload = 0;
-        if (__builtin_mul_overflow((size_t) E, (size_t) (C * K), &book_elems) ||
-            __builtin_mul_overflow(book_elems, (size_t) sizeof(uint16_t), &book_bytes) ||
-            __builtin_add_overflow((size_t) E, book_bytes, &payload)) {
+        if (ds4_size_mul_overflow((size_t) E, (size_t) (C * K), &book_elems) ||
+            ds4_size_mul_overflow(book_elems, (size_t) sizeof(uint16_t), &book_bytes) ||
+            ds4_size_add_overflow((size_t) E, book_bytes, &payload)) {
             std::fprintf(stderr, "[deepseek4] gumix layer %u payload size overflow\n", layer);
             ok = false; break;
         }

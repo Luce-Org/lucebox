@@ -10,9 +10,15 @@
 // has a valid <model>.p4mix.bin sidecar next to it. Without it the test skips
 // (returns 0) so it is CI-safe on hosts without the fixture model.
 //
-// It never touches the real model or sidecar: a temp symlink stands in for the
-// model, and the presence of the temp sidecar symlink is toggled to exercise the
-// failure and success paths against the same weights object.
+// It never touches the real model or sidecar: temp symlinks stand in for both, and the
+// presence of the sidecar links is toggled to exercise the failure and success paths against
+// the same weights object.
+//
+// The missing-sidecar leg is skipped for an artifact whose codebooks are EMBEDDED in the
+// GGUF: the loader prefers the embedded copy, so removing the loose file cannot make such a
+// load fail, and asserting that it does would be asserting the packaging rather than the
+// transactional contract. The registry-teardown contract lives in
+// test_ds4_mix_registry_teardown, which needs no model at all.
 
 #include "deepseek4_internal.h"
 #include "ggml-cuda.h"
@@ -22,10 +28,6 @@
 #include <string>
 #include <unistd.h>
 #include <vector>
-
-// C++ linkage, matching the definitions in rocmfp{2,3}_mix.cu. Pure pointer-range lookups.
-bool ggml_cuda_rocmfp3_mix_registered(const void * vx);
-bool ggml_cuda_rocmfp2_mix_registered(const void * vx);
 
 using dflash::common::DeepSeek4Weights;
 using dflash::common::load_deepseek4_gguf;
@@ -67,54 +69,62 @@ int main() {
     DeepSeek4Weights w;  // the SAME object is reused across both loads
 
     // 1. Missing sidecar => load must fail and release everything.
+    //
+    // This leg only means anything for a LEGACY two-file artifact. Codebooks may now be
+    // embedded in the GGUF's KV block, and the loader prefers the embedded copy, so deleting
+    // the loose file next to such a model changes nothing and this leg would assert a failure
+    // that correctly does not happen. Detect the packaging and skip rather than fail.
     ::unlink(tmp_side.c_str());  // ensure no sidecar
-    bool ok1 = load_deepseek4_gguf(tmp_model, backend, w);
-    CHECK(!ok1, "load fails when the qtype-105 sidecar is missing");
-    CHECK(w.ctx == nullptr, "ctx released after failed load");
-    CHECK(w.buf == nullptr, "GPU buffer released after failed load");
-    CHECK(w.layers.empty(), "layers cleared after failed load");
+    bool embedded = false;
+    {
+        struct gguf_init_params gip = { /*no_alloc=*/ true, /*ctx=*/ nullptr };
+        if (gguf_context * g = gguf_init_from_file(model, gip)) {
+            embedded = gguf_find_key(g, "deepseek4.p4mix.sidecar") >= 0;
+            gguf_free(g);
+        }
+    }
+    if (embedded) {
+        std::fprintf(stderr, "note: %s carries embedded codebooks; skipping the "
+                             "missing-loose-sidecar leg (it cannot fail for such a model)\n",
+                     model);
+    } else {
+        bool ok1 = load_deepseek4_gguf(tmp_model, backend, w);
+        CHECK(!ok1, "load fails when the qtype-105 sidecar is missing");
+        CHECK(w.ctx == nullptr, "ctx released after failed load");
+        CHECK(w.buf == nullptr, "GPU buffer released after failed load");
+        CHECK(w.layers.empty(), "layers cleared after failed load");
+    }
 
     // 2. Retry with a valid sidecar into the SAME weights object. This must
     //    succeed — proving the failed load left no live handles to overwrite.
-    if (symlink(real_side.c_str(), tmp_side.c_str()) == 0) {
+    // Every sidecar kind the real model actually has must be present under the temp name.
+    // Linking only .p4mix.bin makes an artifact with loose gumix/dmix data fail to load, so
+    // the success leg below would never run and the reload coverage would silently vanish.
+    std::vector<std::string> linked;
+    for (const char * suffix : { ".p4mix.bin", ".gumix.bin", ".dmix.bin" }) {
+        const std::string src = real_model + suffix;
+        const std::string dst = tmp_model + suffix;
+        ::unlink(dst.c_str());
+        if (::access(src.c_str(), R_OK) != 0) {
+            continue;                      // that kind simply is not part of this artifact
+        }
+        if (symlink(src.c_str(), dst.c_str()) == 0) {
+            linked.push_back(dst);
+        }
+    }
+    if (!linked.empty() || embedded) {
         bool ok2 = load_deepseek4_gguf(tmp_model, backend, w);
         CHECK(ok2, "retry with a valid sidecar succeeds on the reused object");
         CHECK(w.ctx != nullptr && w.buf != nullptr, "reused load holds fresh handles");
 
-        // 3. Registry teardown must cover EVERY mix tensor class, not just the experts.
-        //    free_deepseek4_weights originally walked only ffn_down/gate/up, so the dense
-        //    attention classes registered by the dmix sidecar were left behind: their device
-        //    codebooks leaked and their ranges kept resolving against released buffers, so a
-        //    later allocation at the same address answered with stale side data.
-        //
-        //    Bases are captured BEFORE the free and queried after. registered() is pure
-        //    pointer-range arithmetic and never dereferences the key, so this is safe on a
-        //    freed address -- and it is precisely the stale-range question being asked.
-        std::vector<const void *> mix105, mix106;
-        for (const auto & L : w.layers) {
-            ggml_tensor * const dense[] = {
-                L.attn_q_a, L.attn_q_b, L.attn_kv, L.attn_output_a, L.attn_output_b,
-                L.ffn_down_exps, L.ffn_gate_exps, L.ffn_up_exps,
-            };
-            for (ggml_tensor * t : dense) {
-                if (!t || !t->data) continue;
-                if (t->type == GGML_TYPE_Q3_1_ROCMFP3_MIX) mix105.push_back(t->data);
-                else if (t->type == GGML_TYPE_Q2_1_ROCMFP2_MIX) mix106.push_back(t->data);
-            }
-        }
-        std::fprintf(stderr, "note: %zu qtype-105 and %zu qtype-106 mix tensors registered\n",
-                     mix105.size(), mix106.size());
-
         free_deepseek4_weights(w);
         CHECK(w.ctx == nullptr && w.buf == nullptr, "clean release after success");
 
-        size_t stale = 0;
-        for (const void * b : mix105) if (ggml_cuda_rocmfp3_mix_registered(b)) ++stale;
-        for (const void * b : mix106) if (ggml_cuda_rocmfp2_mix_registered(b)) ++stale;
-        CHECK(stale == 0, "no mix registry entry survives free (dense classes included)");
-
-        // 4. And it must be reloadable afterwards: a surviving range would either be hit by
-        //    the new allocation or trip the registry's own duplicate handling.
+        // Reload on the same object, which a surviving registry range would disturb. The
+        // registry/teardown contract itself is covered by test_ds4_mix_registry_teardown:
+        // asserting it here would depend on how this fixture happens to be packaged (a
+        // p4-only model has no dense mix tensors, so a "dense included" claim would pass
+        // vacuously), which is exactly the kind of test that cannot fail.
         bool ok3 = load_deepseek4_gguf(tmp_model, backend, w);
         CHECK(ok3, "reload succeeds after a clean free");
         free_deepseek4_weights(w);
@@ -125,7 +135,9 @@ int main() {
     }
 
     ggml_backend_free(backend);
-    ::unlink(tmp_side.c_str());
+    for (const std::string & l : linked) {
+        ::unlink(l.c_str());
+    }
     ::unlink(tmp_model.c_str());
 
     std::fprintf(stderr, g_fails ? "TRANSACTIONAL LOAD TEST FAILED (%d)\n"
