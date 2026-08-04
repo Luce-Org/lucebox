@@ -41,6 +41,7 @@
 #include "gguf.h"
 #include <nlohmann/json.hpp>
 
+#include <filesystem>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -4440,6 +4441,40 @@ static ServerConfig make_props_config_with_sidecar(const json & sidecar) {
     cfg.effort_tiers.x_high = 56832;
     cfg.effort_tiers.max    = 81408;
     return cfg;
+}
+
+TEST_CASE(ServerUnitFixture, test_model_card_env_override_beats_cwd) {
+    // DFLASH_MODEL_CARDS_DIR used to be the LAST candidate, tried after the cwd-relative
+    // "share/model_cards". Running from a directory that happened to contain one silently
+    // ignored the operator's explicit override. An explicit setting must win.
+    namespace fs = std::filesystem;
+    const auto root = fs::temp_directory_path() / "dflash-mc-env-test";
+    const auto envdir = root / "explicit";
+    fs::remove_all(root);
+    fs::create_directories(envdir);
+
+    // A card the resolver can only have found via the env var.
+    {
+        FILE * f = std::fopen((envdir / "env-probe-model.json").string().c_str(), "w");
+        TEST_ASSERT(f != nullptr);
+        std::fprintf(f, "{\"name\":\"env-probe-model\",\"source\":\"test\","
+                        "\"verified_at\":\"2026-08-04\",\"max_tokens\":4321}");
+        std::fclose(f);
+    }
+
+    const char * prev = std::getenv("DFLASH_MODEL_CARDS_DIR");
+    const std::string saved = prev ? prev : "";
+    setenv("DFLASH_MODEL_CARDS_DIR", envdir.string().c_str(), 1);
+
+    auto card = dflash::common::resolve_model_card("", "env-probe-model", "deepseek4", "");
+
+    if (saved.empty()) unsetenv("DFLASH_MODEL_CARDS_DIR");
+    else setenv("DFLASH_MODEL_CARDS_DIR", saved.c_str(), 1);
+    fs::remove_all(root);
+
+    // Resolved from the env dir, not the deepseek4 family fallback (which gives 32768).
+    TEST_ASSERT(card.max_tokens == 4321);
+    TEST_ASSERT(card.source_label != "family:deepseek4");
 }
 
 TEST_CASE(ServerUnitFixture, test_model_card_family_fallback_deepseek4) {

@@ -91,15 +91,24 @@ static std::string find_model_cards_dir(const std::string & repo_root_hint) {
     if (!repo_root_hint.empty()) {
         candidates.push_back(repo_root_hint + "/share/model_cards");
     }
+    // An explicit override has to beat implicit discovery. This used to be tried LAST,
+    // after the cwd-relative path, so running from any directory that happened to contain
+    // share/model_cards silently ignored the operator's DFLASH_MODEL_CARDS_DIR.
+    if (const char * envp = std::getenv("DFLASH_MODEL_CARDS_DIR")) {
+        candidates.push_back(envp);
+    }
     std::string bd = self_bin_dir();
     if (!bd.empty()) {
         candidates.push_back(bd + "/../share/model_cards");
         candidates.push_back(bd + "/share/model_cards");
+        // CMake build tree: the binary is at <repo>/server/build-*/dflash_server while
+        // share/ sits at the repo root, two levels up. That is the layout every developer
+        // run and both eval boxes use, and without this the shipped cards resolve to
+        // nothing -- observed on the H200 as "no share/model_cards/ directory found;
+        // tried 3 candidate(s)" with the cards sitting right there in the checkout.
+        candidates.push_back(bd + "/../../share/model_cards");
     }
     candidates.push_back("share/model_cards");
-    if (const char * envp = std::getenv("DFLASH_MODEL_CARDS_DIR")) {
-        candidates.push_back(envp);
-    }
 
     for (const auto & c : candidates) {
         std::error_code ec;
