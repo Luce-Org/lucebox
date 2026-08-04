@@ -1,0 +1,20 @@
+{
+  "name": "DeepSeek-V4-Flash-0731 (ROCmFPX)",
+  "source": "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731",
+  "verified_at": "2026-08-04",
+  "max_tokens": 393216,
+  "complex_problem_max_tokens": 393216,
+  "hard_limit_reply_budget": 4096,
+  "sampling": {
+    "temperature": 1.0,
+    "top_p": 1.0
+  },
+  "reasoning_effort_tiers": {
+    "low": 49152,
+    "medium": 196608,
+    "high": 393216,
+    "x-high": 393216,
+    "max": 393216
+  },
+  "notes": "Transcribed from the upstream card's deployment section: 'we recommend setting the sampling parameters to temperature = 1.0, with top_p = 0.95 for agentic scenarios and top_p = 1.0 otherwise. For the high and max reasoning effort levels, we recommend a maximum output length of 384K tokens.' 384K is taken as 393216. top_p is the non-agentic 1.0; a deployment doing tool calling should override to 0.95 per that same sentence, which is why the agentic value is not baked in here. top_k / min_p / penalties are deliberately ABSENT: the upstream card does not state them and generation_config.json carries only temperature and top_p, so inventing values would misattribute them to DeepSeek. Upstream exposes three reasoning_effort levels (low, high, max) against this server's five, so medium is interpolated at 50% and x-high pinned to max rather than fabricating intermediate recommendations. These are model-capability figures; the server still clamps every tier to max_ctx minus hard_limit_reply_budget, so an 8192-context deployment sees 4096 rather than 384K. Without this file the arch falls to the hard fallback, whose 16000-token ceiling is a generic placeholder rather than anything measured about this model, and /props.model_card reports null so a client cannot discover the real budgets at all."
+}

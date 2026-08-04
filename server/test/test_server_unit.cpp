@@ -10,6 +10,7 @@
 
 #include "server/sse_emitter.h"
 #include "server/tool_parser.h"
+#include "server/model_card.h"
 #include "server/reasoning.h"
 #include "server/prefix_cache.h"
 #include "server/pin_friendly_prompt.h"
@@ -4439,6 +4440,27 @@ static ServerConfig make_props_config_with_sidecar(const json & sidecar) {
     cfg.effort_tiers.x_high = 56832;
     cfg.effort_tiers.max    = 81408;
     return cfg;
+}
+
+TEST_CASE(ServerUnitFixture, test_model_card_family_fallback_deepseek4) {
+    // deepseek4 had NO family entry, so every DeepSeek4 artifact -- including the
+    // published ROCmFPX GGUFs -- fell through to the hard fallback, taking a generic
+    // 16000-token ceiling that is a placeholder rather than a measured property of the
+    // model, and reporting model_card = null on /props.
+    //
+    // Pins the branch rather than the exact ceiling: an operator is expected to ship a
+    // sidecar for the real figures, and the fallback is deliberately conservative.
+    // What must not regress is that deepseek4 resolves to a FAMILY card at all, and
+    // carries the wider reply budget rather than the terse 512 default.
+    auto card = dflash::common::resolve_model_card("", "", "deepseek4", "");
+    TEST_ASSERT(card.source_label == "family:deepseek4");
+    TEST_ASSERT(card.max_tokens == 32768);
+    TEST_ASSERT(card.hard_limit_reply_budget == 4096);
+
+    // An unknown architecture must still fall through, or the safety net would mask
+    // genuinely unsupported models.
+    auto unknown = dflash::common::resolve_model_card("", "", "not-a-real-arch", "");
+    TEST_ASSERT(unknown.source_label != "family:not-a-real-arch");
 }
 
 TEST_CASE(ServerUnitFixture, test_props_model_card_wholesale_sidecar) {

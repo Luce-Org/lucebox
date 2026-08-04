@@ -285,6 +285,28 @@ static bool family_fallback(const std::string & arch, ModelCard & out) {
         out.source_label = "family:laguna";
         return true;
     }
+    if (arch == "deepseek4") {
+        // There was no entry here, so every DeepSeek4 artifact — including the
+        // published ROCmFPX GGUFs — fell through to the §3.4 hard fallback. That
+        // clamped replies hard enough to truncate ~35% of HumanEval completions
+        // mid-code on a 27B-class model, which reads as a quality problem and is
+        // not one.
+        //
+        // 32768 matches the conservative ceiling used for the other families. The
+        // upstream card recommends up to 384K output for the high/max reasoning
+        // levels, but this is the no-sidecar safety net and the comment above is
+        // explicit that these values are deliberately not aspirational; ship
+        // share/model_cards/<general.name>.json to get the real figures.
+        out.max_tokens                 = 32768;
+        out.complex_problem_max_tokens = 0;
+        // DeepSeek's visible answer after `</think>` is terse, so the 512 default
+        // from ds4_eval.c fits the style — but chat-formatted code answers wrap the
+        // function in prose, and 512 clips those. 4096 matches Qwen's reasoning for
+        // the same failure mode.
+        out.hard_limit_reply_budget    = 4096;
+        out.source_label = "family:deepseek4";
+        return true;
+    }
     return false;
 }
 
