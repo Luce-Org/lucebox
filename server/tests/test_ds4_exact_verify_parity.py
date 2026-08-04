@@ -3,6 +3,7 @@
 
 import importlib.util
 import os
+import tempfile
 import unittest
 from argparse import Namespace
 from pathlib import Path
@@ -94,6 +95,81 @@ class TokenTraceParserTest(unittest.TestCase):
                 "[ds4-spec] gen=9 steps=4 matched=5 offered=12 "
                 "mean_accept=1.25/3.00 q_cap=4 full_snap=0\n"
             )
+
+    def test_reports_positional_token_mismatch(self):
+        self.assertEqual(
+            MODULE.token_mismatch_message((3, 5, 8), (3, 7, 8)),
+            "first token mismatch at 1: ar=(5, 8) exact=(7, 8)",
+        )
+
+    def test_reports_length_mismatch_after_common_prefix(self):
+        self.assertEqual(
+            MODULE.token_mismatch_message((3, 5), (3, 5, 8)),
+            "token trace length mismatch after common prefix of 2: ar=2 exact=3",
+        )
+
+
+class EvidenceLifecycleTest(unittest.TestCase):
+    def test_failed_attempt_does_not_occupy_final_evidence_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log_dir = Path(directory)
+            attempt_dir = log_dir / "attempt-test"
+            attempt_dir.mkdir()
+            (attempt_dir / "ar.log").write_text("diagnostic", encoding="utf-8")
+
+            failed_dir = MODULE.retain_failed_attempt(attempt_dir)
+
+            self.assertEqual(failed_dir.name, "failed-test")
+            self.assertEqual((failed_dir / "ar.log").read_text(encoding="utf-8"), "diagnostic")
+            self.assertFalse((log_dir / "ar.log").exists())
+
+    def test_promotes_complete_evidence_set(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log_dir = Path(directory)
+            attempt_dir = log_dir / "attempt-test"
+            attempt_dir.mkdir()
+            staged = [attempt_dir / name for name in ("ar.log", "exact.log", "manifest.json")]
+            final = [log_dir / path.name for path in staged]
+            for index, path in enumerate(staged):
+                path.write_text(str(index), encoding="utf-8")
+
+            MODULE.promote_evidence(staged, final)
+
+            self.assertEqual([path.read_text(encoding="utf-8") for path in final], ["0", "1", "2"])
+
+    def test_preexisting_final_rolls_back_only_new_links(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log_dir = Path(directory)
+            attempt_dir = log_dir / "attempt-test"
+            attempt_dir.mkdir()
+            staged = [attempt_dir / name for name in ("ar.log", "exact.log")]
+            final = [log_dir / path.name for path in staged]
+            for path in staged:
+                path.write_text("diagnostic", encoding="utf-8")
+            final[1].write_text("existing evidence", encoding="utf-8")
+
+            with self.assertRaises(FileExistsError):
+                MODULE.promote_evidence(staged, final)
+
+            self.assertTrue(all(path.exists() for path in staged))
+            self.assertFalse(final[0].exists())
+            self.assertEqual(final[1].read_text(encoding="utf-8"), "existing evidence")
+
+    def test_denied_staged_cleanup_does_not_fail_completed_promotion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log_dir = Path(directory)
+            attempt_dir = log_dir / "attempt-test"
+            attempt_dir.mkdir()
+            staged = [attempt_dir / name for name in ("ar.log", "exact.log")]
+            final = [log_dir / path.name for path in staged]
+            for path in staged:
+                path.write_text("evidence", encoding="utf-8")
+
+            with mock.patch.object(MODULE.Path, "unlink", side_effect=PermissionError):
+                MODULE.promote_evidence(staged, final)
+
+            self.assertTrue(all(path.exists() for path in final))
+            self.assertTrue(all(path.exists() for path in staged))
 
 
 class CaseEnvironmentTest(unittest.TestCase):

@@ -9,6 +9,8 @@ import json
 import os
 import re
 import subprocess
+import sys
+import tempfile
 import time
 import urllib.request
 from pathlib import Path
@@ -129,6 +131,49 @@ def require_speculation_work(log: str) -> SpeculationSummary:
     if "[ds4-spec] reference-exact verifier:" not in log:
         raise RuntimeError("reference-exact verifier activation banner is missing")
     return summary
+
+
+def token_mismatch_message(ar_tokens: tuple[int, ...], exact_tokens: tuple[int, ...]) -> str | None:
+    common_length = min(len(ar_tokens), len(exact_tokens))
+    first_mismatch = next(
+        (index for index in range(common_length) if ar_tokens[index] != exact_tokens[index]),
+        None,
+    )
+    if first_mismatch is not None:
+        return (
+            f"first token mismatch at {first_mismatch}: "
+            f"ar={ar_tokens[first_mismatch : first_mismatch + 4]} "
+            f"exact={exact_tokens[first_mismatch : first_mismatch + 4]}"
+        )
+    if len(ar_tokens) != len(exact_tokens):
+        return (
+            f"token trace length mismatch after common prefix of {common_length}: "
+            f"ar={len(ar_tokens)} exact={len(exact_tokens)}"
+        )
+    return None
+
+
+def retain_failed_attempt(attempt_dir: Path) -> Path:
+    failed_dir = attempt_dir.with_name(attempt_dir.name.replace("attempt-", "failed-", 1))
+    attempt_dir.replace(failed_dir)
+    return failed_dir
+
+
+def promote_evidence(staged_paths: list[Path], final_paths: list[Path]) -> None:
+    promoted: list[Path] = []
+    try:
+        for staged, final in zip(staged_paths, final_paths, strict=True):
+            os.link(staged, final)
+            promoted.append(final)
+    except Exception:
+        for final in reversed(promoted):
+            final.unlink(missing_ok=True)
+        raise
+    for staged in staged_paths:
+        try:
+            staged.unlink()
+        except OSError:
+            pass
 
 
 def wait_ready(port: int, proc: subprocess.Popen[bytes], timeout: float) -> None:
@@ -306,46 +351,52 @@ def main() -> int:
     existing = [str(path) for path in evidence_paths if path.exists()]
     if existing:
         parser.error(f"refusing to overwrite evidence files: {', '.join(existing)}")
-    ar = run_case(
-        args,
-        reference_exact=False,
-        prompt=prompt,
-        log_path=evidence_paths[0],
-    )
-    exact = run_case(
-        args,
-        reference_exact=True,
-        prompt=prompt,
-        log_path=evidence_paths[1],
-    )
-    manifest = {
-        "server": {"path": str(args.server_bin), "sha256": args.server_sha256.lower()},
-        "target": {"path": str(args.target), "sha256": args.target_sha256.lower()},
-        "draft": {"path": str(args.draft), "sha256": args.draft_sha256.lower()},
-        "prompt": {"path": str(args.prompt_file), "sha256": args.prompt_sha256.lower()},
-        "target_device": args.target_device,
-        "max_ctx": args.max_ctx,
-        "prefill_chunk": args.prefill_chunk,
-        "max_tokens": args.max_tokens,
-        "seed": args.seed,
-        "spec_q": args.spec_q,
-        "mmvq_max_ncols": args.mmvq_max_ncols,
-        "ar_tokens": list(ar.tokens),
-        "reference_exact_tokens": list(exact.tokens),
-    }
-    evidence_paths[2].write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    attempt_dir = Path(tempfile.mkdtemp(prefix="attempt-", dir=args.log_dir))
+    staged_paths = [attempt_dir / path.name for path in evidence_paths]
+    try:
+        ar = run_case(
+            args,
+            reference_exact=False,
+            prompt=prompt,
+            log_path=staged_paths[0],
+        )
+        exact = run_case(
+            args,
+            reference_exact=True,
+            prompt=prompt,
+            log_path=staged_paths[1],
+        )
+        manifest = {
+            "server": {"path": str(args.server_bin), "sha256": args.server_sha256.lower()},
+            "target": {"path": str(args.target), "sha256": args.target_sha256.lower()},
+            "draft": {"path": str(args.draft), "sha256": args.draft_sha256.lower()},
+            "prompt": {"path": str(args.prompt_file), "sha256": args.prompt_sha256.lower()},
+            "target_device": args.target_device,
+            "max_ctx": args.max_ctx,
+            "prefill_chunk": args.prefill_chunk,
+            "max_tokens": args.max_tokens,
+            "seed": args.seed,
+            "spec_q": args.spec_q,
+            "mmvq_max_ncols": args.mmvq_max_ncols,
+            "ar_tokens": list(ar.tokens),
+            "reference_exact_tokens": list(exact.tokens),
+        }
+        staged_paths[2].write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 
-    if ar.tokens != exact.tokens:
-        limit = min(len(ar.tokens), len(exact.tokens))
-        first = next(
-            (index for index in range(limit) if ar.tokens[index] != exact.tokens[index]),
-            limit,
-        )
-        print(
-            f"FAIL: first token mismatch at {first}: "
-            f"ar={ar.tokens[first : first + 4]} exact={exact.tokens[first : first + 4]}"
-        )
+        mismatch = token_mismatch_message(ar.tokens, exact.tokens)
+        if mismatch is not None:
+            failed_dir = retain_failed_attempt(attempt_dir)
+            print(f"FAIL: {mismatch}; diagnostics retained in {failed_dir}")
+            return 1
+        promote_evidence(staged_paths, evidence_paths)
+    except Exception as error:
+        failed_dir = retain_failed_attempt(attempt_dir)
+        print(f"FAIL: {error}; diagnostics retained in {failed_dir}", file=sys.stderr)
         return 1
+    try:
+        attempt_dir.rmdir()
+    except OSError:
+        pass
     print(
         f"PASS: {len(ar.tokens)} generated token IDs are identical; "
         "reference-exact speculation executed at least one step"

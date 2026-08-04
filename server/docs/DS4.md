@@ -323,8 +323,10 @@ the reference run did not execute speculative work with at least one rejected
 draft prefix and full-snapshot rollback. The gate requires SHA-256 identities
 for the server binary, target GGUF, DSpark GGUF, and prompt file.
 Use the same `hip:0` device, exact prefill, q=4, prompt, context, seed, and token
-limit for both arms. Pass a new `--log-dir` for each run; the gate retains both
-server logs and a JSON manifest and refuses to overwrite existing evidence.
+limit for both arms. A passing run retains both server logs and a JSON manifest
+and refuses to overwrite that final evidence. Failed attempts keep their logs
+under a unique `failed-*` subdirectory without occupying the final filenames,
+so the same `--log-dir` can be rerun after correcting the failure.
 `DFLASH_DS4_EXACT_VERIFY_TRACE` is a default-off diagnostic used by that gate
 to emit the complete generated-token trace; it does not make the fused
 throughput profile exact. The two arms share a sanitized DS4 execution-policy
