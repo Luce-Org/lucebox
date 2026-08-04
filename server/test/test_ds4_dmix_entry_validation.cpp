@@ -18,7 +18,10 @@
 #include <cstdio>
 #include <cstring>
 
-const char * ds4_dmix_entry_reject_reason(
+// C linkage: the rules themselves sit in the loader's anonymous namespace (internal linkage,
+// correct for the parser); a thin extern "C" wrapper there is what makes them reachable here
+// without a second copy of the rules that could drift.
+extern "C" const char * ds4_dmix_entry_reject_reason(
     uint32_t layer, uint32_t cls, uint32_t qtype, uint32_t nslices,
     uint32_t C, uint32_t K, uint8_t mode,
     uint32_t n_layers, bool already_covered);

@@ -638,7 +638,7 @@ static const char * ds4_dmix_class_name(uint32_t cls) {
 // `already_covered` is the caller's covered[layer][cls]; passing it in keeps the duplicate
 // rule here with the rest of the entry rules rather than split across two places.
 // Returns nullptr when the entry is acceptable, else a short reason for the caller to log.
-const char * ds4_dmix_entry_reject_reason(
+const char * ds4_dmix_entry_reject_reason_impl(
         uint32_t layer, uint32_t cls, uint32_t qtype, uint32_t nslices,
         uint32_t C, uint32_t K, uint8_t mode,
         uint32_t n_layers, bool already_covered) {
@@ -734,7 +734,7 @@ static bool ds4_register_dmix_sidecar(const std::string & gguf_path,
         // the unit test so the rules cannot drift from what is covered.
         const bool dup = layer < n_layers_out && cls < DS4_DMIX_CLASSES
                          && covered[layer][cls];
-        if (const char * why = ds4_dmix_entry_reject_reason(
+        if (const char * why = ds4_dmix_entry_reject_reason_impl(
                 layer, cls, qtype, nslices, C, K, mode, n_layers_out, dup)) {
             std::fprintf(stderr, "[deepseek4] dmix entry %u (L%u %s) rejected: %s "
                          "(qtype=%u C=%u K=%u nslices=%u mode=%u)\n",
@@ -1027,6 +1027,18 @@ static bool ds4_register_gumix_sidecar(const std::string & gguf_path,
 }
 
 }  // namespace
+
+// Exported with C linkage purely so the unit test can reach the dmix entry rules: they live
+// in the anonymous namespace above (internal linkage), which is right for the parser but
+// makes them unlinkable from outside the TU. A thin forwarding wrapper keeps one definition
+// of the rules rather than a second copy that could drift from what the loader enforces.
+extern "C" const char * ds4_dmix_entry_reject_reason(
+        uint32_t layer, uint32_t cls, uint32_t qtype, uint32_t nslices,
+        uint32_t C, uint32_t K, uint8_t mode, uint32_t n_layers, bool already_covered) {
+    return ds4_dmix_entry_reject_reason_impl(layer, cls, qtype, nslices, C, K, mode,
+                                             n_layers, already_covered);
+}
+
 
 bool load_deepseek4_gguf(const std::string & path,
                           ggml_backend_t backend,
