@@ -8,6 +8,29 @@
 
 namespace dflash::common {
 
+// Reference DSpark contract: each of the `proposal_len` draft hidden rows
+// predicts one proposal. The known target token is only the Markov-chain
+// anchor; it is not part of proposals_out. This differs from the historical
+// Luce DFlash chain helper below, whose output starts with that anchor.
+bool dspark_markov_propose_greedy_block(const DraftWeights & dw,
+                                        ggml_backend_t backend,
+                                        DFlashTarget & target,
+                                        const float * draft_hidden,
+                                        int proposal_len,
+                                        int32_t anchor_token,
+                                        std::vector<int32_t> & proposals_out);
+
+bool dspark_markov_propose_greedy_block_fused(
+    const DraftWeights & dw,
+    ggml_backend_t backend,
+    ggml_tensor * lm_head,
+    const float * draft_hidden,
+    int proposal_len,
+    int32_t anchor_token,
+    std::vector<int32_t> & proposals_out,
+    std::vector<float> * confidence_out = nullptr,
+    const float * confidence_hidden = nullptr);
+
 bool dspark_markov_correct_greedy_chain(const DraftWeights & dw,
                                         ggml_backend_t backend,
                                         DFlashTarget & target,

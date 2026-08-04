@@ -299,6 +299,7 @@ struct DraftWeights {
     int n_embd    = DFLASH27B_TARGET_HIDDEN;           // 5120
     int n_ff      = DFLASH27B_TARGET_INTERMEDIATE;     // 17408
     int swa_window = 0;  // sliding window size (0 = disabled)
+    float rms_eps = DFLASH27B_RMS_EPS;
     float rope_theta = 0.0f;  // RoPE frequency base (must come from GGUF)
 
     // YaRN rope scaling (populated by loader; 0 = disabled / plain RoPE).
@@ -323,6 +324,14 @@ struct DraftWeights {
     // Optional DSpark/DeepSpec-style Markov correction head. When present,
     // greedy chain decode adds a low-rank previous-token bias before argmax.
     DraftDSparkWeights dspark;
+
+    // DFlash's historical chain contract replaces draft row 0 with the known
+    // target seed, so block_size rows are verified.  DSpark instead predicts
+    // one token from every draft row: block_size proposals are verified after
+    // the seed, matching SGLang's gamma+1 target window.
+    int max_chain_verify_tokens() const {
+        return block_size + (dspark.enabled ? 1 : 0);
+    }
 };
 
 bool load_draft_safetensors(const std::string & path,

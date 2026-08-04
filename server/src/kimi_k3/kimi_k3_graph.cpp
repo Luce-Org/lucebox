@@ -46,52 +46,61 @@ struct AttnResBank {
     ggml_context * ctx = nullptr;
     float eps = 1.0e-5f;
     int64_t n_embd = 0;
+    int64_t n_tokens = 1;
     std::vector<ggml_tensor *> checkpoints;
-    ggml_tensor * stack = nullptr;
-    size_t stack_size = 0;
 
     void push(ggml_tensor * cur) {
-        checkpoints.push_back(ggml_reshape_3d(ctx, cur, n_embd, 1, 1));
-    }
-
-    ggml_tensor * get_stack() {
-        if (stack && stack_size == checkpoints.size()) return stack;
-        stack = checkpoints.front();
-        for (size_t i = 1; i < checkpoints.size(); ++i) {
-            stack = ggml_concat(ctx, stack, checkpoints[i], 1);
-        }
-        stack_size = checkpoints.size();
-        return stack;
+        checkpoints.push_back(
+            ggml_reshape_3d(ctx, cur, n_embd, n_tokens, 1));
     }
 
     ggml_tensor * mix(ggml_tensor * cur, ggml_tensor * score_weight) {
         if (checkpoints.empty()) return cur;
         const int64_t n = static_cast<int64_t>(checkpoints.size());
-        ggml_tensor * src = get_stack(); // [hidden, n_checkpoint, 1]
+        ggml_tensor * mixed = nullptr;
 
-        ggml_tensor * score_src = rms_norm(ctx, src, score_weight, eps);
-        score_src = ggml_sum_rows(ctx, score_src);
-        score_src = ggml_reshape_2d(ctx, score_src, n, 1);
+        // AttnRes chooses a different checkpoint mixture for every token.
+        // Express the small contraction as independent token slices.  This is
+        // the exact one-token algebra used by the original Kimi path, avoids
+        // relying on fragile rank-3 broadcast rules, and is cheap at the
+        // bounded speculative widths (currently <= 16).
+        for (int64_t token = 0; token < n_tokens; ++token) {
+            ggml_tensor * src = nullptr; // [hidden, checkpoint]
+            for (ggml_tensor * checkpoint : checkpoints) {
+                ggml_tensor * checkpoint_token = ggml_view_2d(
+                    ctx, checkpoint, n_embd, 1, checkpoint->nb[1],
+                    static_cast<size_t>(token) * checkpoint->nb[1]);
+                src = src
+                    ? ggml_concat(ctx, src, checkpoint_token, 1)
+                    : checkpoint_token;
+            }
+            ggml_tensor * cur_token = ggml_view_2d(
+                ctx, cur, n_embd, 1, cur->nb[1],
+                static_cast<size_t>(token) * cur->nb[1]);
 
-        ggml_tensor * score_cur = rms_norm(ctx, cur, score_weight, eps);
-        score_cur = ggml_sum_rows(ctx, score_cur);
+            ggml_tensor * score_src = rms_norm(ctx, src, score_weight, eps);
+            score_src = ggml_reshape_2d(
+                ctx, ggml_sum_rows(ctx, score_src), n, 1);
+            ggml_tensor * score_cur = ggml_sum_rows(
+                ctx, rms_norm(ctx, cur_token, score_weight, eps));
+            ggml_tensor * probs = ggml_soft_max(
+                ctx, ggml_concat(ctx, score_src, score_cur, 0));
+            ggml_tensor * p_src = ggml_cont(ctx,
+                ggml_view_2d(ctx, probs, n, 1, probs->nb[1], 0));
+            ggml_tensor * p_cur = ggml_cont(ctx,
+                ggml_view_2d(ctx, probs, 1, 1, probs->nb[1],
+                             probs->nb[0] * static_cast<size_t>(n)));
 
-        ggml_tensor * probs = ggml_soft_max(ctx,
-            ggml_concat(ctx, score_src, score_cur, 0));
-        ggml_tensor * p_src = ggml_cont(ctx,
-            ggml_view_2d(ctx, probs, n, 1, probs->nb[1], 0));
-        ggml_tensor * p_cur = ggml_cont(ctx,
-            ggml_view_2d(ctx, probs, 1, 1, probs->nb[1],
-                         probs->nb[0] * static_cast<size_t>(n)));
-
-        // Reduce checkpoint dimension with an ordinary matrix product. The
-        // newer upstream ggml has a dedicated dsv4_hc_pre op for this exact
-        // contraction; the Lucebox ggml snapshot predates that API, and this
-        // algebra is identical: [checkpoint, hidden] x [checkpoint, 1].
-        ggml_tensor * src_t = ggml_cont(ctx,
-            ggml_permute(ctx, src, 1, 0, 2, 3));
-        ggml_tensor * out = ggml_mul_mat(ctx, src_t, p_src);
-        return ggml_add(ctx, out, ggml_mul(ctx, cur, p_cur));
+            ggml_tensor * src_t = ggml_cont(
+                ctx, ggml_permute(ctx, src, 1, 0, 2, 3));
+            ggml_tensor * out_token = ggml_add(
+                ctx, ggml_mul_mat(ctx, src_t, p_src),
+                ggml_mul(ctx, cur_token, p_cur));
+            mixed = mixed
+                ? ggml_concat(ctx, mixed, out_token, 1)
+                : out_token;
+        }
+        return mixed;
     }
 };
 
@@ -104,28 +113,32 @@ ggml_tensor * kda_conv1d(ggml_context * ctx,
                          ggml_tensor * conv_weight,
                          int d_conv,
                          int head_dim,
-                         int n_head) {
+                         int n_head,
+                         bool commit_state) {
     const int64_t d_inner = static_cast<int64_t>(head_dim) * n_head;
     const int64_t state_rows = d_conv - 1;
+    const int64_t n_tokens = x->ne[1];
     const size_t block_offset = static_cast<size_t>(qkv) * d_inner * all_state->nb[1];
     ggml_tensor * state = ggml_view_3d(ctx, all_state,
         state_rows, d_inner, 1, all_state->nb[1], all_state->nb[2],
         block_offset);
 
     ggml_tensor * projected = ggml_mul_mat(ctx, projection, x);
-    projected = ggml_reshape_3d(ctx, projected, d_inner, 1, 1);
+    projected = ggml_reshape_3d(ctx, projected, d_inner, n_tokens, 1);
     ggml_tensor * conv_input = ggml_concat(ctx, state,
                                            ggml_transpose(ctx, projected), 0);
 
     // Drop the oldest row and persist the newest d_conv-1 values.
-    ggml_tensor * newest = ggml_view_3d(ctx, conv_input,
-        state_rows, d_inner, 1, conv_input->nb[1], conv_input->nb[2],
-        conv_input->nb[0]);
-    ggml_build_forward_expand(graph, ggml_cpy(ctx, newest, state));
+    if (commit_state) {
+        ggml_tensor * newest = ggml_view_3d(ctx, conv_input,
+            state_rows, d_inner, 1, conv_input->nb[1], conv_input->nb[2],
+            static_cast<size_t>(n_tokens) * conv_input->nb[0]);
+        ggml_build_forward_expand(graph, ggml_cpy(ctx, newest, state));
+    }
 
     ggml_tensor * cw = ggml_reshape_2d(ctx, conv_weight, d_conv, d_inner);
     ggml_tensor * out = ggml_silu(ctx, ggml_ssm_conv(ctx, conv_input, cw));
-    out = ggml_reshape_4d(ctx, out, head_dim, n_head, 1, 1);
+    out = ggml_reshape_4d(ctx, out, head_dim, n_head, n_tokens, 1);
     return out;
 }
 
@@ -134,36 +147,52 @@ ggml_tensor * build_kda(ggml_context * ctx,
                         const KimiK3Weights & w,
                         const KimiK3Layer & layer,
                         KimiK3LayerCache & cache,
-                        ggml_tensor * cur) {
+                        ggml_tensor * cur,
+                        bool commit_state,
+                        bool capture_replay) {
     const int head_dim = w.kda_head_dim;
     const int n_head = w.n_head;
+    const int n_tokens = static_cast<int>(cur->ne[1]);
     const int64_t d_inner = static_cast<int64_t>(head_dim) * n_head;
 
+    if (capture_replay) {
+        GGML_ASSERT(cache.replay_input != nullptr);
+        GGML_ASSERT(n_tokens <= cache.replay_input->ne[1]);
+        ggml_tensor * replay_dst = ggml_view_2d(
+            ctx, cache.replay_input, w.n_embd, n_tokens,
+            cache.replay_input->nb[1], 0);
+        ggml_build_forward_expand(graph, ggml_cpy(ctx, cur, replay_dst));
+    }
+
     ggml_tensor * q = kda_conv1d(ctx, graph, cache.conv_state, 0, cur,
-        layer.wq, layer.ssm_q_conv, w.ssm_d_conv, head_dim, n_head);
+        layer.wq, layer.ssm_q_conv, w.ssm_d_conv, head_dim, n_head,
+        commit_state);
     ggml_tensor * k = kda_conv1d(ctx, graph, cache.conv_state, 1, cur,
-        layer.wk, layer.ssm_k_conv, w.ssm_d_conv, head_dim, n_head);
+        layer.wk, layer.ssm_k_conv, w.ssm_d_conv, head_dim, n_head,
+        commit_state);
     ggml_tensor * v = kda_conv1d(ctx, graph, cache.conv_state, 2, cur,
-        layer.wv, layer.ssm_v_conv, w.ssm_d_conv, head_dim, n_head);
+        layer.wv, layer.ssm_v_conv, w.ssm_d_conv, head_dim, n_head,
+        commit_state);
 
     ggml_tensor * decay = ggml_mul_mat(ctx, layer.ssm_f_a, cur);
     decay = ggml_mul_mat(ctx, layer.ssm_f_b, decay);
     decay = ggml_add(ctx, decay, layer.ssm_dt_b);
     ggml_tensor * A = ggml_reshape_3d(ctx, layer.ssm_a, 1, n_head, 1);
     if (std::isfinite(w.kda_gate_lower_bound)) {
-        decay = ggml_reshape_3d(ctx, decay, head_dim, n_head, 1);
+        decay = ggml_reshape_3d(ctx, decay, head_dim, n_head, n_tokens);
         decay = ggml_mul(ctx, decay, A);
         decay = ggml_sigmoid(ctx, ggml_scale(ctx, decay, -1.0f));
         decay = ggml_scale(ctx, decay, w.kda_gate_lower_bound);
     } else {
         decay = ggml_softplus(ctx, decay);
-        decay = ggml_reshape_3d(ctx, decay, head_dim, n_head, 1);
+        decay = ggml_reshape_3d(ctx, decay, head_dim, n_head, n_tokens);
         decay = ggml_mul(ctx, decay, A);
     }
-    decay = ggml_reshape_4d(ctx, decay, head_dim, n_head, 1, 1);
+    decay = ggml_reshape_4d(ctx, decay, head_dim, n_head, n_tokens, 1);
 
     ggml_tensor * beta = ggml_mul_mat(ctx, layer.ssm_beta, cur);
-    beta = ggml_sigmoid(ctx, ggml_reshape_4d(ctx, beta, 1, n_head, 1, 1));
+    beta = ggml_sigmoid(ctx,
+        ggml_reshape_4d(ctx, beta, 1, n_head, n_tokens, 1));
 
     q = ggml_l2_norm(ctx, q, w.rms_eps);
     k = ggml_l2_norm(ctx, k, w.rms_eps);
@@ -174,25 +203,27 @@ ggml_tensor * build_kda(ggml_context * ctx,
 
     const size_t elt = ggml_element_size(packed);
     ggml_tensor * output = ggml_view_4d(ctx, packed,
-        head_dim, n_head, 1, 1,
+        head_dim, n_head, n_tokens, 1,
         static_cast<size_t>(head_dim) * elt,
         static_cast<size_t>(head_dim) * n_head * elt,
-        static_cast<size_t>(head_dim) * n_head * elt, 0);
+        static_cast<size_t>(head_dim) * n_head * n_tokens * elt, 0);
     ggml_tensor * new_state = ggml_view_4d(ctx, packed,
         head_dim, head_dim, n_head, 1,
         static_cast<size_t>(head_dim) * elt,
         static_cast<size_t>(head_dim) * head_dim * elt,
         static_cast<size_t>(head_dim) * head_dim * n_head * elt,
-        static_cast<size_t>(head_dim) * n_head * elt);
-    ggml_build_forward_expand(graph,
-        ggml_cpy(ctx, new_state, cache.ssm_state));
+        static_cast<size_t>(head_dim) * n_head * n_tokens * elt);
+    if (commit_state) {
+        ggml_build_forward_expand(graph,
+            ggml_cpy(ctx, new_state, cache.ssm_state));
+    }
 
     ggml_tensor * gate = ggml_mul_mat(ctx, layer.ssm_g, cur);
-    gate = ggml_reshape_3d(ctx, gate, head_dim, n_head, 1);
-    output = ggml_reshape_3d(ctx, output, head_dim, n_head, 1);
+    gate = ggml_reshape_3d(ctx, gate, head_dim, n_head, n_tokens);
+    output = ggml_reshape_3d(ctx, output, head_dim, n_head, n_tokens);
     output = rms_norm(ctx, output, layer.ssm_o_norm, w.rms_eps);
     output = ggml_mul(ctx, output, ggml_sigmoid(ctx, gate));
-    output = ggml_cont_2d(ctx, output, d_inner, 1);
+    output = ggml_cont_2d(ctx, output, d_inner, n_tokens);
     return ggml_mul_mat(ctx, layer.wo, output);
 }
 
@@ -202,7 +233,8 @@ ggml_tensor * build_mla(ggml_context * ctx,
                         const KimiK3Layer & layer,
                         KimiK3LayerCache & cache,
                         ggml_tensor * cur,
-                        int position) {
+                        int position,
+                        ggml_tensor * attn_mask) {
     const int n_head = w.n_head;
     const int kv_rank = w.kv_lora_rank;
     const int key_dim = w.mla_k_head_dim;
@@ -210,7 +242,8 @@ ggml_tensor * build_mla(ggml_context * ctx,
     const int rope_dim = w.rope_dim;
     const int nope_dim = key_dim - rope_dim;
     const int compact_dim = kv_rank + rope_dim;
-    const int kv_len = position + 1;
+    const int n_tokens = static_cast<int>(cur->ne[1]);
+    const int kv_len = position + n_tokens;
 
     ggml_tensor * gate_input = cur;
     ggml_tensor * q_cur = nullptr;
@@ -223,18 +256,18 @@ ggml_tensor * build_mla(ggml_context * ctx,
     }
 
     ggml_tensor * compact_pe = ggml_mul_mat(ctx, layer.wkv_a_mqa, cur);
-    ggml_tensor * compact = ggml_view_2d(ctx, compact_pe, kv_rank, 1,
+    ggml_tensor * compact = ggml_view_2d(ctx, compact_pe, kv_rank, n_tokens,
         ggml_row_size(compact_pe->type, compact_dim), 0);
-    ggml_tensor * k_pe = ggml_view_3d(ctx, compact_pe, rope_dim, 1, 1,
+    ggml_tensor * k_pe = ggml_view_3d(ctx, compact_pe, rope_dim, n_tokens, 1,
         ggml_row_size(compact_pe->type, compact_dim),
-        ggml_row_size(compact_pe->type, compact_dim),
+        ggml_row_size(compact_pe->type, compact_dim) * n_tokens,
         ggml_row_size(compact_pe->type, kv_rank));
     compact = rms_norm(ctx, compact, layer.wkv_a_norm, w.rms_eps);
 
-    ggml_tensor * q_nope = ggml_view_3d(ctx, q_cur, nope_dim, n_head, 1,
+    ggml_tensor * q_nope = ggml_view_3d(ctx, q_cur, nope_dim, n_head, n_tokens,
         ggml_row_size(q_cur->type, key_dim),
         ggml_row_size(q_cur->type, key_dim) * n_head, 0);
-    ggml_tensor * q_pe = ggml_view_3d(ctx, q_cur, rope_dim, n_head, 1,
+    ggml_tensor * q_pe = ggml_view_3d(ctx, q_cur, rope_dim, n_head, n_tokens,
         ggml_row_size(q_cur->type, key_dim),
         ggml_row_size(q_cur->type, key_dim) * n_head,
         ggml_row_size(q_cur->type, nope_dim));
@@ -243,11 +276,12 @@ ggml_tensor * build_mla(ggml_context * ctx,
     q_nope = ggml_permute(ctx, q_nope, 0, 2, 1, 3);
     ggml_tensor * q = ggml_concat(ctx, q_nope, q_pe, 0);
 
-    ggml_tensor * compact_3d = ggml_reshape_3d(ctx, compact, kv_rank, 1, 1);
+    ggml_tensor * compact_3d =
+        ggml_reshape_3d(ctx, compact, kv_rank, n_tokens, 1);
     ggml_tensor * current_k = ggml_concat(ctx, compact_3d, k_pe, 0);
 
-    ggml_tensor * dst = ggml_view_3d(ctx, cache.mla_k,
-        compact_dim, 1, 1, cache.mla_k->nb[1], cache.mla_k->nb[2],
+    ggml_tensor * dst = ggml_view_2d(ctx, cache.mla_k,
+        compact_dim, n_tokens, cache.mla_k->nb[2],
         static_cast<size_t>(position) * cache.mla_k->nb[2]);
     ggml_build_forward_expand(graph, ggml_cpy(ctx, current_k, dst));
 
@@ -265,7 +299,7 @@ ggml_tensor * build_mla(ggml_context * ctx,
     v = ggml_permute(ctx, v, 0, 2, 1, 3);
     ggml_tensor * scores = ggml_mul_mat(ctx, k, q);
     ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
-    scores = ggml_soft_max_ext(ctx, scores, nullptr,
+    scores = ggml_soft_max_ext(ctx, scores, attn_mask,
                                1.0f / std::sqrt(static_cast<float>(key_dim)),
                                0.0f);
     if (!v_trans) v = ggml_cont(ctx, ggml_transpose(ctx, v));
@@ -273,7 +307,7 @@ ggml_tensor * build_mla(ggml_context * ctx,
     out = ggml_mul_mat(ctx, layer.wv_b, out);
     out = ggml_permute(ctx, out, 0, 2, 1, 3);
     out = ggml_cont_2d(ctx, out,
-                       static_cast<int64_t>(value_dim) * n_head, 1);
+                       static_cast<int64_t>(value_dim) * n_head, n_tokens);
 
     if (layer.wqkv_gate) {
         ggml_tensor * output_gate = ggml_sigmoid(ctx,
@@ -288,18 +322,21 @@ TopKMoeRouterResult build_kimi_router(ggml_context * ctx,
                                       const KimiK3Weights & w,
                                       const KimiK3Layer & layer,
                                       ggml_tensor * cur) {
+    const int n_tokens = static_cast<int>(cur->ne[1]);
     ggml_tensor * logits = ggml_mul_mat(ctx, layer.ffn_gate_inp, cur);
     TopKMoeRouterResult router;
     if (w.expert_gating_func == 2) {
         router = build_sigmoid_topk_moe_router(ctx, graph, logits,
-            layer.ffn_exp_probs_b, w.n_expert, w.n_expert_used, 1,
+            layer.ffn_exp_probs_b, w.n_expert, w.n_expert_used, n_tokens,
             w.expert_weights_norm, w.expert_weights_scale, false);
     } else {
         ggml_tensor * probs = ggml_soft_max(ctx, logits);
         ggml_tensor * selected = ggml_argsort_top_k(ctx, probs, w.n_expert_used);
-        ggml_tensor * probs_3d = ggml_reshape_3d(ctx, probs, 1, w.n_expert, 1);
+        ggml_tensor * probs_3d =
+            ggml_reshape_3d(ctx, probs, 1, w.n_expert, n_tokens);
         ggml_tensor * weights = ggml_get_rows(ctx, probs_3d, selected);
-        weights = ggml_reshape_2d(ctx, weights, w.n_expert_used, 1);
+        weights = ggml_reshape_2d(
+            ctx, weights, w.n_expert_used, n_tokens);
         if (w.expert_weights_norm) {
             ggml_tensor * sum = ggml_clamp(ctx, ggml_sum_rows(ctx, weights),
                                            6.103515625e-5f, INFINITY);
@@ -310,7 +347,8 @@ TopKMoeRouterResult build_kimi_router(ggml_context * ctx,
         }
         router.selected = selected;
         router.weights_2d = weights;
-        router.weights_3d = ggml_reshape_3d(ctx, weights, 1, w.n_expert_used, 1);
+        router.weights_3d = ggml_reshape_3d(
+            ctx, weights, 1, w.n_expert_used, n_tokens);
     }
     return router;
 }
@@ -326,7 +364,8 @@ ggml_tensor * build_latent_moe(ggml_context * ctx,
         build_kimi_router(ctx, graph, w, layer, identity);
 
     ggml_tensor * routed_3d = ggml_reshape_3d(ctx, routed_in,
-                                               w.n_expert_latent, 1, 1);
+                                               w.n_expert_latent,
+                                               1, cur->ne[1]);
     ggml_tensor * gate = ggml_mul_mat_id(ctx, layer.ffn_gate_exps,
                                          routed_3d, router.selected);
     ggml_tensor * up = ggml_mul_mat_id(ctx, layer.ffn_up_exps,
@@ -337,9 +376,10 @@ ggml_tensor * build_latent_moe(ggml_context * ctx,
                                             activated, router.selected);
     experts = ggml_mul(ctx, experts, router.weights_3d);
     ggml_tensor * sum_shape = ggml_new_tensor_3d(ctx, GGML_TYPE_F32,
-                                                 w.n_expert_latent, 1, 1);
+                                                 w.n_expert_latent,
+                                                 1, cur->ne[1]);
     ggml_tensor * moe = ggml_repeat_back(ctx, experts, sum_shape);
-    moe = ggml_reshape_2d(ctx, moe, w.n_expert_latent, 1);
+    moe = ggml_reshape_2d(ctx, moe, w.n_expert_latent, cur->ne[1]);
     if (layer.ffn_routed_norm) {
         moe = rms_norm(ctx, moe, layer.ffn_routed_norm, w.rms_eps);
     }
@@ -418,15 +458,17 @@ bool run_host_boundary_graph(ggml_backend_t backend,
 void populate_attn_res_bank(
         ggml_context * ctx,
         const KimiK3Weights & w,
+        int n_tokens,
         const std::vector<std::vector<float>> & host_checkpoints,
         AttnResBank & bank,
         std::vector<GraphInput> & inputs) {
     bank.ctx = ctx;
     bank.eps = w.rms_eps;
     bank.n_embd = w.n_embd;
+    bank.n_tokens = n_tokens;
     for (const std::vector<float> & checkpoint : host_checkpoints) {
         ggml_tensor * tensor = ggml_new_tensor_2d(
-            ctx, GGML_TYPE_F32, w.n_embd, 1);
+            ctx, GGML_TYPE_F32, w.n_embd, n_tokens);
         ggml_set_input(tensor);
         inputs.push_back({
             tensor, checkpoint.data(),
@@ -442,18 +484,40 @@ ggml_context * new_kimi_step_context() {
     return ggml_init(params);
 }
 
-bool streamed_kimi_k3_step(
+bool streamed_kimi_k3_forward(
         ggml_backend_t backend,
         const KimiK3Weights & w,
         KimiK3Cache & cache,
-        int32_t token,
-        int position,
-        std::vector<float> & logits,
+        const std::vector<int32_t> & tokens,
+        int base_pos,
+        const KimiK3ForwardOptions & options,
+        KimiK3ForwardResult & result,
         MoeHybridStreamEngine & stream_engine,
         MoeStreamDualOwnerExecutor * dual_stream_executor,
         const MoeStreamDualOwnerPolicy * stream_owner_policy,
         MoeHybridRoutingStats * routing_stats) {
-    std::vector<float> hidden(static_cast<size_t>(w.n_embd));
+    const int n_tokens = static_cast<int>(tokens.size());
+    const size_t hidden_values =
+        static_cast<size_t>(w.n_embd) * static_cast<size_t>(n_tokens);
+    std::vector<float> hidden(hidden_values);
+
+    std::vector<int> capture_at_layer(static_cast<size_t>(w.n_layer), -1);
+    const int n_capture = options.capture_layer_ids
+        ? static_cast<int>(options.capture_layer_ids->size()) : 0;
+    for (int i = 0; i < n_capture; ++i) {
+        capture_at_layer[static_cast<size_t>((*options.capture_layer_ids)[i])] = i;
+    }
+    result.captured_hidden.assign(
+        static_cast<size_t>(n_capture) * hidden_values, 0.0f);
+
+    const int kv_len = base_pos + n_tokens;
+    std::vector<float> mla_mask(
+        static_cast<size_t>(kv_len) * n_tokens, -INFINITY);
+    for (int q = 0; q < n_tokens; ++q) {
+        for (int k = 0; k <= base_pos + q; ++k) {
+            mla_mask[static_cast<size_t>(q) * kv_len + k] = 0.0f;
+        }
+    }
 
     {
         ggml_context * ctx = new_kimi_step_context();
@@ -464,13 +528,13 @@ bool streamed_kimi_k3_step(
         ggml_cgraph * graph =
             ggml_new_graph_custom(ctx, 1024, false);
         ggml_tensor * ids =
-            ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+            ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
         ggml_set_input(ids);
         ggml_tensor * embedding =
             ggml_get_rows(ctx, w.tok_embd, ids);
         const bool ok = run_host_boundary_graph(
             backend, ctx, graph,
-            {{ids, &token, sizeof(token)}},
+            {{ids, tokens.data(), sizeof(int32_t) * tokens.size()}},
             {{embedding, hidden.data(),
               hidden.size() * sizeof(float)}},
             "embedding");
@@ -502,7 +566,7 @@ bool streamed_kimi_k3_step(
             ggml_new_graph_custom(ctx, 32768, false);
         std::vector<GraphInput> inputs;
         ggml_tensor * hidden_in = ggml_new_tensor_2d(
-            ctx, GGML_TYPE_F32, w.n_embd, 1);
+            ctx, GGML_TYPE_F32, w.n_embd, n_tokens);
         ggml_set_input(hidden_in);
         inputs.push_back({
             hidden_in, hidden.data(),
@@ -510,7 +574,7 @@ bool streamed_kimi_k3_step(
 
         AttnResBank residuals;
         populate_attn_res_bank(
-            ctx, w, checkpoints, residuals, inputs);
+            ctx, w, n_tokens, checkpoints, residuals, inputs);
         ggml_tensor * prefix = hidden_in;
         ggml_tensor * cur =
             residuals.mix(prefix, layer.attn_res_score);
@@ -518,12 +582,21 @@ bool streamed_kimi_k3_step(
 
         cur = rms_norm(
             ctx, cur, layer.attn_norm, w.rms_eps);
-        cur = layer.recurrent
-            ? build_kda(
-                ctx, graph, w, layer, layer_cache, cur)
-            : build_mla(
+        if (layer.recurrent) {
+            cur = build_kda(
+                ctx, graph, w, layer, layer_cache, cur,
+                /*commit_state=*/!options.capture_replay,
+                options.capture_replay);
+        } else {
+            ggml_tensor * mask = ggml_new_tensor_2d(
+                ctx, GGML_TYPE_F32, kv_len, n_tokens);
+            ggml_set_input(mask);
+            inputs.push_back({
+                mask, mla_mask.data(), mla_mask.size() * sizeof(float)});
+            cur = build_mla(
                 ctx, graph, w, layer, layer_cache,
-                cur, position);
+                cur, base_pos, mask);
+        }
         prefix = banked
             ? cur : ggml_add(ctx, prefix, cur);
         cur = residuals.mix(prefix, layer.ffn_res_score);
@@ -542,8 +615,7 @@ bool streamed_kimi_k3_step(
                 ctx, layer.ffn_down, dense);
             ggml_tensor * hidden_out =
                 ggml_add(ctx, prefix, dense);
-            std::vector<float> next_hidden(
-                static_cast<size_t>(w.n_embd));
+            std::vector<float> next_hidden(hidden_values);
             const bool ok = run_host_boundary_graph(
                 backend, ctx, graph, inputs,
                 {{hidden_out, next_hidden.data(),
@@ -553,6 +625,13 @@ bool streamed_kimi_k3_step(
             if (!ok) return false;
             if (banked) checkpoints.push_back(checkpoint_value);
             hidden.swap(next_hidden);
+            const int capture_idx = capture_at_layer[static_cast<size_t>(il)];
+            if (capture_idx >= 0) {
+                std::memcpy(
+                    result.captured_hidden.data() +
+                        static_cast<size_t>(capture_idx) * hidden_values,
+                    hidden.data(), hidden_values * sizeof(float));
+            }
             continue;
         }
 
@@ -577,16 +656,14 @@ bool streamed_kimi_k3_step(
         shared = ggml_mul_mat(
             ctx, layer.ffn_down_shexp, shared);
 
-        std::vector<float> prefix_host(
-            static_cast<size_t>(w.n_embd));
+        std::vector<float> prefix_host(hidden_values);
         std::vector<float> routed_input_host(
-            static_cast<size_t>(w.n_expert_latent));
+            static_cast<size_t>(w.n_expert_latent) * n_tokens);
         std::vector<int32_t> selected(
-            static_cast<size_t>(w.n_expert_used));
+            static_cast<size_t>(w.n_expert_used) * n_tokens);
         std::vector<float> route_weights(
-            static_cast<size_t>(w.n_expert_used));
-        std::vector<float> shared_host(
-            static_cast<size_t>(w.n_embd));
+            static_cast<size_t>(w.n_expert_used) * n_tokens);
+        std::vector<float> shared_host(hidden_values);
         const bool prep_ok = run_host_boundary_graph(
             backend, ctx, graph, inputs,
             {
@@ -637,7 +714,7 @@ bool streamed_kimi_k3_step(
         route_batch.layer = il - w.n_dense_lead;
         route_batch.n_expert = w.n_expert;
         route_batch.top_k = w.n_expert_used;
-        route_batch.n_tokens = 1;
+        route_batch.n_tokens = n_tokens;
         route_batch.inputs = routed_input_host.data();
         route_batch.selected_ids = selected.data();
         route_batch.selected_weights = route_weights.data();
@@ -689,11 +766,11 @@ bool streamed_kimi_k3_step(
         }
         graph = ggml_new_graph_custom(ctx, 4096, false);
         ggml_tensor * prefix_in = ggml_new_tensor_2d(
-            ctx, GGML_TYPE_F32, w.n_embd, 1);
+            ctx, GGML_TYPE_F32, w.n_embd, n_tokens);
         ggml_tensor * routed_out_in = ggml_new_tensor_2d(
-            ctx, GGML_TYPE_F32, w.n_expert_latent, 1);
+            ctx, GGML_TYPE_F32, w.n_expert_latent, n_tokens);
         ggml_tensor * shared_in = ggml_new_tensor_2d(
-            ctx, GGML_TYPE_F32, w.n_embd, 1);
+            ctx, GGML_TYPE_F32, w.n_embd, n_tokens);
         ggml_set_input(prefix_in);
         ggml_set_input(routed_out_in);
         ggml_set_input(shared_in);
@@ -708,8 +785,7 @@ bool streamed_kimi_k3_step(
             ggml_add(ctx, routed, shared_in);
         ggml_tensor * hidden_out =
             ggml_add(ctx, prefix_in, moe_shared);
-        std::vector<float> next_hidden(
-            static_cast<size_t>(w.n_embd));
+        std::vector<float> next_hidden(hidden_values);
         const bool join_ok = run_host_boundary_graph(
             backend, ctx, graph,
             {
@@ -726,6 +802,13 @@ bool streamed_kimi_k3_step(
         ggml_free(ctx);
         if (!join_ok) return false;
         hidden.swap(next_hidden);
+        const int capture_idx = capture_at_layer[static_cast<size_t>(il)];
+        if (capture_idx >= 0) {
+            std::memcpy(
+                result.captured_hidden.data() +
+                    static_cast<size_t>(capture_idx) * hidden_values,
+                hidden.data(), hidden_values * sizeof(float));
+        }
     }
 
     ggml_context * ctx = new_kimi_step_context();
@@ -737,30 +820,40 @@ bool streamed_kimi_k3_step(
         ggml_new_graph_custom(ctx, 8192, false);
     std::vector<GraphInput> inputs;
     ggml_tensor * hidden_in = ggml_new_tensor_2d(
-        ctx, GGML_TYPE_F32, w.n_embd, 1);
+        ctx, GGML_TYPE_F32, w.n_embd, n_tokens);
     ggml_set_input(hidden_in);
     inputs.push_back({
         hidden_in, hidden.data(),
         hidden.size() * sizeof(float)});
     AttnResBank residuals;
     populate_attn_res_bank(
-        ctx, w, checkpoints, residuals, inputs);
+        ctx, w, n_tokens, checkpoints, residuals, inputs);
     ggml_tensor * output_hidden =
         residuals.mix(hidden_in, w.output_res_score);
     output_hidden = rms_norm(
         ctx, output_hidden, w.output_norm, w.rms_eps);
     ggml_tensor * output =
         ggml_mul_mat(ctx, w.output, output_hidden);
-    logits.resize(static_cast<size_t>(w.n_vocab));
+    ggml_tensor * argmax = ggml_argmax(ctx, output);
+    std::vector<GraphOutput> outputs;
+    if (options.read_logits) {
+        result.logits.resize(static_cast<size_t>(w.n_vocab) * n_tokens);
+        outputs.push_back({
+            output, result.logits.data(), result.logits.size() * sizeof(float)});
+    }
+    if (options.read_argmax) {
+        result.argmax.resize(static_cast<size_t>(n_tokens));
+        outputs.push_back({
+            argmax, result.argmax.data(), result.argmax.size() * sizeof(int32_t)});
+    }
     const bool output_ok = run_host_boundary_graph(
         backend, ctx, graph, inputs,
-        {{output, logits.data(),
-          logits.size() * sizeof(float)}},
+        outputs,
         "output");
     ggml_free(ctx);
     if (!output_ok) return false;
 
-    cache.cur_pos = position + 1;
+    cache.cur_pos = base_pos + n_tokens;
     return true;
 }
 
@@ -769,13 +862,14 @@ bool streamed_kimi_k3_step(
 bool create_kimi_k3_cache(ggml_backend_t backend,
                           const KimiK3Weights & w,
                           int max_ctx,
-                          KimiK3Cache & out) {
+                          KimiK3Cache & out,
+                          int max_verify_tokens) {
     free_kimi_k3_cache(out);
     if (!backend || max_ctx <= 0) return false;
 
     ggml_init_params params{};
     params.mem_size = ggml_tensor_overhead() *
-        static_cast<size_t>(w.n_layer * 3 + 16) + 16384;
+        static_cast<size_t>(w.n_layer * 6 + 16) + 16384;
     params.no_alloc = true;
     out.ctx = ggml_init(params);
     if (!out.ctx) return false;
@@ -795,6 +889,23 @@ bool create_kimi_k3_cache(ggml_backend_t backend,
             ggml_set_name(layer_cache.conv_state, name);
             std::snprintf(name, sizeof(name), "kimi_k3_ssm_state_%d", il);
             ggml_set_name(layer_cache.ssm_state, name);
+            if (max_verify_tokens > 0) {
+                layer_cache.conv_state_snap = ggml_dup_tensor(
+                    out.ctx, layer_cache.conv_state);
+                layer_cache.ssm_state_snap = ggml_dup_tensor(
+                    out.ctx, layer_cache.ssm_state);
+                layer_cache.replay_input = ggml_new_tensor_2d(
+                    out.ctx, GGML_TYPE_F32, w.n_embd, max_verify_tokens);
+                std::snprintf(
+                    name, sizeof(name), "kimi_k3_conv_state_snap_%d", il);
+                ggml_set_name(layer_cache.conv_state_snap, name);
+                std::snprintf(
+                    name, sizeof(name), "kimi_k3_ssm_state_snap_%d", il);
+                ggml_set_name(layer_cache.ssm_state_snap, name);
+                std::snprintf(
+                    name, sizeof(name), "kimi_k3_replay_input_%d", il);
+                ggml_set_name(layer_cache.replay_input, name);
+            }
         } else {
             layer_cache.mla_k = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F16,
                 compact_dim, 1, max_ctx);
@@ -809,6 +920,7 @@ bool create_kimi_k3_cache(ggml_backend_t backend,
         return false;
     }
     out.max_ctx = max_ctx;
+    out.max_verify_tokens = std::max(0, max_verify_tokens);
     reset_kimi_k3_cache(out);
     return true;
 }
@@ -816,6 +928,12 @@ bool create_kimi_k3_cache(ggml_backend_t backend,
 void reset_kimi_k3_cache(KimiK3Cache & cache) {
     if (cache.buf) ggml_backend_buffer_clear(cache.buf, 0);
     cache.cur_pos = 0;
+    cache.snapshot_pos = -1;
+    cache.replay_base_pos = -1;
+    cache.replay_n_tokens = 0;
+    cache.snapshot_valid = false;
+    cache.replay_valid = false;
+    cache.recurrent_state_pristine = false;
 }
 
 void free_kimi_k3_cache(KimiK3Cache & cache) {
@@ -824,39 +942,89 @@ void free_kimi_k3_cache(KimiK3Cache & cache) {
     cache = KimiK3Cache{};
 }
 
-bool kimi_k3_step(ggml_backend_t backend,
-                  const KimiK3Weights & w,
-                  KimiK3Cache & cache,
-                  int32_t token,
-                  int position,
-                  std::vector<float> & logits,
-                  MoeHybridStreamEngine * stream_engine,
-                  MoeStreamDualOwnerExecutor * dual_stream_executor,
-                  const MoeStreamDualOwnerPolicy * stream_owner_policy,
-                  MoeHybridRoutingStats * routing_stats) {
-    if (!backend || !w.ctx || !cache.ctx || position < 0 ||
-        position >= cache.max_ctx || position != cache.cur_pos ||
-        token < 0 || token >= w.n_vocab) {
-        set_last_error("Kimi-K3 step: invalid backend, cache position, or token");
+bool kimi_k3_forward(ggml_backend_t backend,
+                     const KimiK3Weights & w,
+                     KimiK3Cache & cache,
+                     const std::vector<int32_t> & tokens,
+                     int base_pos,
+                     const KimiK3ForwardOptions & options,
+                     KimiK3ForwardResult & result,
+                     MoeHybridStreamEngine * stream_engine,
+                     MoeStreamDualOwnerExecutor * dual_stream_executor,
+                     const MoeStreamDualOwnerPolicy * stream_owner_policy,
+                     MoeHybridRoutingStats * routing_stats) {
+    result = KimiK3ForwardResult{};
+    const int n_tokens = static_cast<int>(tokens.size());
+    if (!backend || !w.ctx || !cache.ctx || n_tokens <= 0 || base_pos < 0 ||
+        base_pos != cache.cur_pos || base_pos + n_tokens > cache.max_ctx ||
+        (!options.read_logits && !options.read_argmax)) {
+        set_last_error("Kimi-K3 forward: invalid backend, output, or cache span");
         return false;
     }
+    for (int32_t token : tokens) {
+        if (token < 0 || token >= w.n_vocab) {
+            set_last_error("Kimi-K3 forward: token is outside the vocabulary");
+            return false;
+        }
+    }
+
+    std::vector<int> capture_at_layer(static_cast<size_t>(w.n_layer), -1);
+    const int n_capture = options.capture_layer_ids
+        ? static_cast<int>(options.capture_layer_ids->size()) : 0;
+    for (int i = 0; i < n_capture; ++i) {
+        const int layer = (*options.capture_layer_ids)[static_cast<size_t>(i)];
+        if (layer < 0 || layer >= w.n_layer ||
+            capture_at_layer[static_cast<size_t>(layer)] >= 0) {
+            set_last_error("Kimi-K3 forward: invalid or duplicate capture layer");
+            return false;
+        }
+        capture_at_layer[static_cast<size_t>(layer)] = i;
+    }
+    if (options.capture_replay &&
+        (n_tokens > cache.max_verify_tokens || !cache.snapshot_valid ||
+         cache.snapshot_pos != base_pos)) {
+        set_last_error("Kimi-K3 forward: ReplaySSM capture has no matching snapshot");
+        return false;
+    }
+
     if (w.routed_experts_streamed) {
         if (!stream_engine || !stream_engine->is_bound()) {
             set_last_error(
-                "Kimi-K3 step: file-backed experts require a bound stream engine");
+                "Kimi-K3 forward: file-backed experts require a bound stream engine");
             return false;
         }
         if (dual_stream_executor &&
             (!dual_stream_executor->is_ready() || !stream_owner_policy)) {
             set_last_error(
-                "Kimi-K3 step: dual-owner streaming requires a ready "
+                "Kimi-K3 forward: dual-owner streaming requires a ready "
                 "executor and an ownership policy");
             return false;
         }
-        return streamed_kimi_k3_step(
-            backend, w, cache, token, position,
-            logits, *stream_engine, dual_stream_executor,
-            stream_owner_policy, routing_stats);
+        if (!streamed_kimi_k3_forward(
+                backend, w, cache, tokens, base_pos, options, result,
+                *stream_engine, dual_stream_executor,
+                stream_owner_policy, routing_stats)) {
+            return false;
+        }
+        if (options.capture_replay) {
+            cache.replay_base_pos = base_pos;
+            cache.replay_n_tokens = n_tokens;
+            cache.replay_valid = true;
+            cache.recurrent_state_pristine = true;
+        } else {
+            cache.replay_valid = false;
+            cache.recurrent_state_pristine = false;
+        }
+        return true;
+    }
+
+    const int kv_len = base_pos + n_tokens;
+    std::vector<float> mla_mask(
+        static_cast<size_t>(kv_len) * n_tokens, -INFINITY);
+    for (int q = 0; q < n_tokens; ++q) {
+        for (int k = 0; k <= base_pos + q; ++k) {
+            mla_mask[static_cast<size_t>(q) * kv_len + k] = 0.0f;
+        }
     }
 
     ggml_init_params params{};
@@ -864,20 +1032,27 @@ bool kimi_k3_step(ggml_backend_t backend,
     params.no_alloc = true;
     ggml_context * ctx = ggml_init(params);
     if (!ctx) {
-        set_last_error("Kimi-K3 step: graph context allocation failed");
+        set_last_error("Kimi-K3 forward: graph context allocation failed");
         return false;
     }
     ggml_cgraph * graph = ggml_new_graph_custom(ctx, 32768, false);
 
-    ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
-    ggml_set_name(ids, "token_id");
+    ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+    ggml_set_name(ids, "token_ids");
     ggml_set_input(ids);
     ggml_tensor * hidden = ggml_get_rows(ctx, w.tok_embd, ids);
+    ggml_tensor * mask = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F32, kv_len, n_tokens);
+    ggml_set_name(mask, "kimi_k3_mla_causal_mask");
+    ggml_set_input(mask);
 
+    std::vector<ggml_tensor *> capture_tensors(
+        static_cast<size_t>(n_capture), nullptr);
     AttnResBank residuals;
     residuals.ctx = ctx;
     residuals.eps = w.rms_eps;
     residuals.n_embd = w.n_embd;
+    residuals.n_tokens = n_tokens;
     for (int il = 0; il < w.n_layer; ++il) {
         const KimiK3Layer & layer = w.layers[static_cast<size_t>(il)];
         KimiK3LayerCache & layer_cache = cache.layers[static_cast<size_t>(il)];
@@ -888,8 +1063,10 @@ bool kimi_k3_step(ggml_backend_t backend,
 
         cur = rms_norm(ctx, cur, layer.attn_norm, w.rms_eps);
         cur = layer.recurrent
-            ? build_kda(ctx, graph, w, layer, layer_cache, cur)
-            : build_mla(ctx, graph, w, layer, layer_cache, cur, position);
+            ? build_kda(ctx, graph, w, layer, layer_cache, cur,
+                        /*commit_state=*/!options.capture_replay,
+                        options.capture_replay)
+            : build_mla(ctx, graph, w, layer, layer_cache, cur, base_pos, mask);
         prefix = banked ? cur : ggml_add(ctx, prefix, cur);
 
         cur = residuals.mix(prefix, layer.ffn_res_score);
@@ -903,39 +1080,201 @@ bool kimi_k3_step(ggml_backend_t backend,
             cur = build_latent_moe(ctx, graph, w, layer, cur);
         }
         hidden = ggml_add(ctx, prefix, cur);
+        const int capture_idx = capture_at_layer[static_cast<size_t>(il)];
+        if (capture_idx >= 0) {
+            capture_tensors[static_cast<size_t>(capture_idx)] = hidden;
+            ggml_set_output(hidden);
+            ggml_build_forward_expand(graph, hidden);
+        }
     }
 
     hidden = residuals.mix(hidden, w.output_res_score);
     hidden = rms_norm(ctx, hidden, w.output_norm, w.rms_eps);
     ggml_tensor * output = ggml_mul_mat(ctx, w.output, hidden);
     ggml_set_name(output, "logits");
-    ggml_set_output(output);
-    ggml_build_forward_expand(graph, output);
+    ggml_tensor * argmax = ggml_argmax(ctx, output);
+    if (options.read_logits) {
+        ggml_set_output(output);
+        ggml_build_forward_expand(graph, output);
+    }
+    if (options.read_argmax) {
+        ggml_set_output(argmax);
+        ggml_build_forward_expand(graph, argmax);
+    }
 
     ggml_gallocr_t allocator = ggml_gallocr_new(
         ggml_backend_get_default_buffer_type(backend));
     if (!allocator || !ggml_gallocr_alloc_graph(allocator, graph)) {
-        set_last_error("Kimi-K3 step: graph allocation failed");
+        set_last_error("Kimi-K3 forward: graph allocation failed");
         if (allocator) ggml_gallocr_free(allocator);
         ggml_free(ctx);
         return false;
     }
-    ggml_backend_tensor_set(ids, &token, 0, sizeof(token));
+    ggml_backend_tensor_set(
+        ids, tokens.data(), 0, sizeof(int32_t) * tokens.size());
+    ggml_backend_tensor_set(
+        mask, mla_mask.data(), 0, sizeof(float) * mla_mask.size());
     const ggml_status status = ggml_backend_graph_compute(backend, graph);
     if (status != GGML_STATUS_SUCCESS) {
-        set_last_error("Kimi-K3 step: graph compute failed with status " +
+        set_last_error("Kimi-K3 forward: graph compute failed with status " +
                        std::to_string(static_cast<int>(status)));
         ggml_gallocr_free(allocator);
         ggml_free(ctx);
         return false;
     }
 
-    logits.resize(static_cast<size_t>(w.n_vocab));
-    ggml_backend_tensor_get(output, logits.data(), 0,
-                            logits.size() * sizeof(float));
-    cache.cur_pos = position + 1;
+    if (options.read_logits) {
+        result.logits.resize(static_cast<size_t>(w.n_vocab) * n_tokens);
+        ggml_backend_tensor_get(output, result.logits.data(), 0,
+                                result.logits.size() * sizeof(float));
+    }
+    if (options.read_argmax) {
+        result.argmax.resize(static_cast<size_t>(n_tokens));
+        ggml_backend_tensor_get(argmax, result.argmax.data(), 0,
+                                result.argmax.size() * sizeof(int32_t));
+    }
+    const size_t hidden_values =
+        static_cast<size_t>(w.n_embd) * static_cast<size_t>(n_tokens);
+    result.captured_hidden.resize(
+        static_cast<size_t>(n_capture) * hidden_values);
+    for (int i = 0; i < n_capture; ++i) {
+        ggml_backend_tensor_get(
+            capture_tensors[static_cast<size_t>(i)],
+            result.captured_hidden.data() + static_cast<size_t>(i) * hidden_values,
+            0, hidden_values * sizeof(float));
+    }
+
+    cache.cur_pos = base_pos + n_tokens;
+    if (options.capture_replay) {
+        cache.replay_base_pos = base_pos;
+        cache.replay_n_tokens = n_tokens;
+        cache.replay_valid = true;
+        cache.recurrent_state_pristine = true;
+    } else {
+        cache.replay_valid = false;
+        cache.recurrent_state_pristine = false;
+    }
     ggml_gallocr_free(allocator);
     ggml_free(ctx);
+    return true;
+}
+
+bool kimi_k3_replay_snapshot(ggml_backend_t backend, KimiK3Cache & cache) {
+    if (!backend || cache.max_verify_tokens <= 0) return false;
+    for (KimiK3LayerCache & layer : cache.layers) {
+        if (!layer.ssm_state) continue;
+        if (!layer.ssm_state_snap || !layer.conv_state_snap ||
+            !layer.replay_input) {
+            return false;
+        }
+        ggml_backend_tensor_copy_async(
+            backend, backend, layer.ssm_state, layer.ssm_state_snap);
+        ggml_backend_tensor_copy_async(
+            backend, backend, layer.conv_state, layer.conv_state_snap);
+    }
+    ggml_backend_synchronize(backend);
+    cache.snapshot_pos = cache.cur_pos;
+    cache.snapshot_valid = true;
+    cache.replay_valid = false;
+    cache.recurrent_state_pristine = true;
+    return true;
+}
+
+bool kimi_k3_replay_restore(ggml_backend_t backend, KimiK3Cache & cache) {
+    if (!backend || !cache.snapshot_valid || cache.snapshot_pos < 0) return false;
+    if (!cache.recurrent_state_pristine) {
+        for (KimiK3LayerCache & layer : cache.layers) {
+            if (!layer.ssm_state) continue;
+            if (!layer.ssm_state_snap || !layer.conv_state_snap) return false;
+            ggml_backend_tensor_copy_async(
+                backend, backend, layer.ssm_state_snap, layer.ssm_state);
+            ggml_backend_tensor_copy_async(
+                backend, backend, layer.conv_state_snap, layer.conv_state);
+        }
+        ggml_backend_synchronize(backend);
+    }
+    cache.cur_pos = cache.snapshot_pos;
+    cache.replay_valid = false;
+    cache.recurrent_state_pristine = true;
+    return true;
+}
+
+bool kimi_k3_replay_commit(ggml_backend_t backend,
+                           const KimiK3Weights & w,
+                           KimiK3Cache & cache,
+                           int base_pos,
+                           int commit_n) {
+    if (!backend || !cache.snapshot_valid || !cache.replay_valid ||
+        !cache.recurrent_state_pristine || cache.snapshot_pos != base_pos ||
+        cache.replay_base_pos != base_pos || commit_n <= 0 ||
+        commit_n > cache.replay_n_tokens) {
+        return false;
+    }
+
+    ggml_init_params params{};
+    params.mem_size = 64ull * 1024ull * 1024ull;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) return false;
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 32768, false);
+    for (int il = 0; il < w.n_layer; ++il) {
+        const KimiK3Layer & layer = w.layers[static_cast<size_t>(il)];
+        if (!layer.recurrent) continue;
+        KimiK3LayerCache & layer_cache = cache.layers[static_cast<size_t>(il)];
+        if (!layer_cache.replay_input) {
+            ggml_free(ctx);
+            return false;
+        }
+        ggml_tensor * replay = ggml_view_2d(
+            ctx, layer_cache.replay_input, w.n_embd, commit_n,
+            layer_cache.replay_input->nb[1], 0);
+        (void)build_kda(ctx, graph, w, layer, layer_cache, replay,
+                        /*commit_state=*/true,
+                        /*capture_replay=*/false);
+    }
+
+    ggml_gallocr_t allocator = ggml_gallocr_new(
+        ggml_backend_get_default_buffer_type(backend));
+    if (!allocator || !ggml_gallocr_alloc_graph(allocator, graph)) {
+        if (allocator) ggml_gallocr_free(allocator);
+        ggml_free(ctx);
+        return false;
+    }
+    cache.recurrent_state_pristine = false;
+    const ggml_status status = ggml_backend_graph_compute(backend, graph);
+    ggml_gallocr_free(allocator);
+    ggml_free(ctx);
+    if (status != GGML_STATUS_SUCCESS) {
+        (void)kimi_k3_replay_restore(backend, cache);
+        return false;
+    }
+    cache.cur_pos = base_pos + commit_n;
+    cache.snapshot_valid = false;
+    cache.replay_valid = false;
+    return true;
+}
+
+bool kimi_k3_step(ggml_backend_t backend,
+                  const KimiK3Weights & w,
+                  KimiK3Cache & cache,
+                  int32_t token,
+                  int position,
+                  std::vector<float> & logits,
+                  MoeHybridStreamEngine * stream_engine,
+                  MoeStreamDualOwnerExecutor * dual_stream_executor,
+                  const MoeStreamDualOwnerPolicy * stream_owner_policy,
+                  MoeHybridRoutingStats * routing_stats) {
+    KimiK3ForwardOptions options;
+    options.read_logits = true;
+    options.read_argmax = false;
+    KimiK3ForwardResult result;
+    if (!kimi_k3_forward(
+            backend, w, cache, std::vector<int32_t>{token}, position,
+            options, result, stream_engine, dual_stream_executor,
+            stream_owner_policy, routing_stats)) {
+        return false;
+    }
+    logits = std::move(result.logits);
     return true;
 }
 

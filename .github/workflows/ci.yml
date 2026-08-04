@@ -34,6 +34,9 @@ jobs:
       - name: Lint Python surfaces touched by lucebox tooling
         run: uv run --frozen --extra dev ruff check .
 
+      - name: Test DSpark GGUF converter
+        run: uv run --frozen --no-sync python -m unittest server/scripts/test_convert_dspark_to_gguf.py
+
   build:
     name: Build (cmake + uv sync --extra megakernel)
     runs-on: ubuntu-latest

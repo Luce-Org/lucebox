@@ -456,7 +456,8 @@ static void test_feature_warnings_report_inert_draft() {
     // These native AR backends never forward a draft model.
     TEST_ASSERT(warns_about(warn_result(args, "qwen3"), "--draft"));
     TEST_ASSERT(warns_about(warn_result(args, "deepseek4"), "--draft"));
-    TEST_ASSERT(warns_about(warn_result(args, "kimi-k3"), "--draft"));
+    // Kimi-K3 uses the generic DFlash/DSpark runtime on monolithic placement.
+    TEST_ASSERT(!warns_about(warn_result(args, "kimi-k3"), "--draft"));
     // laguna and gemma4 forward it only when monolithic.
     TEST_ASSERT(!warns_about(warn_result(args, "laguna"), "--draft"));
     TEST_ASSERT(!warns_about(warn_result(args, "gemma4"), "--draft"));
@@ -547,6 +548,8 @@ static void test_model_capability_tables() {
     TEST_ASSERT(arch_supports_moe_ssd_storage("deepseek4", false));
     TEST_ASSERT(!arch_supports_moe_ssd_storage("deepseek4", true));
     TEST_ASSERT(arch_supports_moe_ssd_storage("kimi-k3", false));
+    TEST_ASSERT(arch_supports_decode_draft("kimi-k3", false));
+    TEST_ASSERT(!arch_supports_decode_draft("kimi-k3", true));
     TEST_ASSERT(!arch_supports_moe_ssd_storage("qwen35moe", false));
 }
 

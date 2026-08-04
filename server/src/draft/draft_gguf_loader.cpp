@@ -31,6 +31,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -149,6 +150,11 @@ bool load_draft_gguf(const std::string & path,
         if (id < 0) return fallback;
         return gguf_get_val_f32(gctx, id);
     };
+    auto read_string = [&](const char * suffix) -> std::string {
+        std::snprintf(key, sizeof(key), "%s.%s", A, suffix);
+        const int64_t id = gguf_find_key(gctx, key);
+        return id >= 0 ? std::string(gguf_get_val_str(gctx, id)) : std::string();
+    };
 
     const uint32_t n_embd    = read_u32("embedding_length",        0);
     const uint32_t n_layer   = read_u32("block_count",             0);
@@ -204,6 +210,8 @@ bool load_draft_gguf(const std::string & path,
     // Store GGUF-declared config into DraftWeights (replaces hardcoded defaults).
     out.block_size = (int)block_sz;
     out.n_target_layers = (int)n_tgt_lay;
+    out.mask_token_id = (int32_t)read_u32(
+        "dflash.mask_token_id", (uint32_t)out.mask_token_id);
 
     // Propagate target model properties if available.
     if (target) {
@@ -241,9 +249,51 @@ bool load_draft_gguf(const std::string & path,
     out.head_dim  = (int)head_dim;
     out.n_embd    = (int)n_embd;
     out.n_ff      = (int)n_ff;
+    out.rms_eps = read_f32(
+        "attention.layer_norm_rms_epsilon", DFLASH27B_RMS_EPS);
+    if (!std::isfinite(out.rms_eps) || out.rms_eps <= 0.0f) {
+        set_last_error("draft GGUF: invalid attention.layer_norm_rms_epsilon");
+        ggml_free(meta_ctx);
+        out.ctx = nullptr;
+        gguf_free(gctx);
+        return false;
+    }
     out.rope_theta = read_f32("rope.freq_base", 0.0f);
     if (out.rope_theta == 0.0f) {
         fprintf(stderr, "[draft-gguf] WARNING: rope.freq_base not found in GGUF, draft RoPE will be wrong\n");
+    }
+    const std::string rope_scaling_type = read_string("rope.scaling.type");
+    if (!rope_scaling_type.empty() && rope_scaling_type != "none") {
+        if (rope_scaling_type != "yarn") {
+            set_last_error("draft GGUF: unsupported rope.scaling.type=" +
+                           rope_scaling_type);
+            ggml_free(meta_ctx);
+            out.ctx = nullptr;
+            gguf_free(gctx);
+            return false;
+        }
+        const float factor = read_f32("rope.scaling.factor", 0.0f);
+        const uint32_t original_context =
+            read_u32("rope.scaling.original_context_length", 0);
+        if (!std::isfinite(factor) || factor <= 0.0f || original_context == 0) {
+            set_last_error("draft GGUF: incomplete or invalid YaRN metadata");
+            ggml_free(meta_ctx);
+            out.ctx = nullptr;
+            gguf_free(gctx);
+            return false;
+        }
+        // Match Transformers' YaRN defaults when the checkpoint does not
+        // provide explicit attention/beta overrides.
+        out.rope_freq_scale = 1.0f / factor;
+        out.rope_ext_factor = 1.0f;
+        out.rope_attn_factor = 0.1f * std::log(factor) + 1.0f;
+        out.rope_beta_fast = 32.0f;
+        out.rope_beta_slow = 1.0f;
+        out.rope_n_ctx_orig = static_cast<int>(original_context);
+        std::fprintf(stderr,
+            "[draft-gguf] YaRN enabled: factor=%.3f original_ctx=%u "
+            "attn_factor=%.6f\n",
+            factor, original_context, out.rope_attn_factor);
     }
     out.layers.assign((size_t)n_layer, DraftLayer{});
 

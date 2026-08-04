@@ -3,9 +3,11 @@
 #include "ggml-alloc.h"
 #include "ddtree.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <utility>
 #include <vector>
 
 namespace dflash::common {
@@ -106,7 +108,76 @@ bool dspark_step(const DraftWeights & dw,
     return true;
 }
 
+bool dspark_markov_candidates(const DraftWeights & dw,
+                              ggml_backend_t backend,
+                              DFlashTarget & target,
+                              const float * candidate_hidden,
+                              int n_candidates,
+                              int32_t anchor_token,
+                              float confidence_threshold,
+                              std::vector<int32_t> & candidates_out) {
+    if (!dw.dspark.enabled || !candidate_hidden || n_candidates <= 0) return false;
+    const int hidden = dw.n_embd;
+    if (hidden <= 0) return false;
+    confidence_threshold = std::clamp(confidence_threshold, 0.0f, 1.0f);
+    const bool use_confidence_gate =
+        confidence_threshold > 0.0f &&
+        dw.dspark.confidence_w != nullptr &&
+        dw.dspark.confidence_b != nullptr &&
+        dw.dspark.confidence_dim > 0;
+
+    std::vector<float> base_logits;
+    if (!target.project_hidden_to_logits(
+            candidate_hidden, n_candidates, base_logits)) {
+        return false;
+    }
+    if (base_logits.size() % static_cast<size_t>(n_candidates) != 0) return false;
+    const int vocab = static_cast<int>(
+        base_logits.size() / static_cast<size_t>(n_candidates));
+    if (dw.dspark.vocab_size > 0 && vocab != dw.dspark.vocab_size) {
+        std::fprintf(stderr,
+            "dspark_markov_candidates: vocab mismatch target=%d dspark=%d\n",
+            vocab, dw.dspark.vocab_size);
+        return false;
+    }
+
+    candidates_out.clear();
+    candidates_out.reserve(static_cast<size_t>(n_candidates));
+    int32_t previous = anchor_token;
+    for (int i = 0; i < n_candidates; ++i) {
+        int32_t token = -1;
+        float confidence = 0.0f;
+        if (!dspark_step(
+                dw, backend, previous,
+                candidate_hidden + static_cast<size_t>(i) * hidden,
+                base_logits.data() + static_cast<size_t>(i) * vocab,
+                vocab, token,
+                use_confidence_gate ? &confidence : nullptr)) {
+            return false;
+        }
+        if (use_confidence_gate && confidence < confidence_threshold) break;
+        candidates_out.push_back(token);
+        previous = token;
+    }
+    // An empty proposal list is a valid confidence-gated result.  Legacy
+    // callers still return the anchor token, while block callers can fall
+    // back to the non-speculative path when the full block is unavailable.
+    return true;
+}
+
 }  // namespace
+
+bool dspark_markov_propose_greedy_block(const DraftWeights & dw,
+                                        ggml_backend_t backend,
+                                        DFlashTarget & target,
+                                        const float * draft_hidden,
+                                        int proposal_len,
+                                        int32_t anchor_token,
+                                        std::vector<int32_t> & proposals_out) {
+    return dspark_markov_candidates(
+        dw, backend, target, draft_hidden, proposal_len, anchor_token,
+        /*confidence_threshold=*/0.0f, proposals_out);
+}
 
 bool dspark_markov_correct_greedy_chain(const DraftWeights & dw,
                                         ggml_backend_t backend,
@@ -122,53 +193,17 @@ bool dspark_markov_correct_greedy_chain(const DraftWeights & dw,
     if (hidden <= 0 || n_candidates <= 0) return false;
     if (confidence_threshold < 0.0f) confidence_threshold = 0.0f;
     if (confidence_threshold > 1.0f) confidence_threshold = 1.0f;
-    const bool use_confidence_gate =
-        confidence_threshold > 0.0f &&
-        dw.dspark.confidence_w != nullptr &&
-        dw.dspark.confidence_b != nullptr &&
-        dw.dspark.confidence_dim > 0;
-
-    std::vector<float> candidate_hidden((size_t)n_candidates * (size_t)hidden);
-    for (int i = 0; i < n_candidates; ++i) {
-        const float * src = local_hidden + (size_t)(i + 1) * (size_t)hidden;
-        std::memcpy(candidate_hidden.data() + (size_t)i * (size_t)hidden,
-                    src, sizeof(float) * (size_t)hidden);
-    }
-
-    std::vector<float> base_logits;
-    if (!target.project_hidden_to_logits(candidate_hidden.data(), n_candidates, base_logits)) {
+    std::vector<int32_t> candidates;
+    if (!dspark_markov_candidates(
+            dw, backend, target,
+            local_hidden + static_cast<size_t>(hidden), n_candidates,
+            last_tok, confidence_threshold, candidates)) {
         return false;
     }
-    if (base_logits.size() % (size_t)n_candidates != 0) return false;
-    const int vocab = (int)(base_logits.size() / (size_t)n_candidates);
-    if (dw.dspark.vocab_size > 0 && vocab != dw.dspark.vocab_size) {
-        std::fprintf(stderr, "dspark_markov_correct_greedy_chain: vocab mismatch target=%d dspark=%d\n",
-                     vocab, dw.dspark.vocab_size);
-        return false;
-    }
-
     draft_tok.clear();
-    draft_tok.reserve((size_t)q_len);
+    draft_tok.reserve(candidates.size() + 1);
     draft_tok.push_back(last_tok);
-    int32_t prefix_tok = last_tok;
-    for (int i = 0; i < n_candidates; ++i) {
-        int32_t tok = -1;
-        float confidence = 0.0f;
-        float * confidence_ptr = use_confidence_gate ? &confidence : nullptr;
-        if (!dspark_step(dw, backend, prefix_tok,
-                         candidate_hidden.data() + (size_t)i * (size_t)hidden,
-                         base_logits.data() + (size_t)i * (size_t)vocab,
-                         vocab,
-                         tok,
-                         confidence_ptr)) {
-            return false;
-        }
-        if (use_confidence_gate && confidence < confidence_threshold) {
-            break;
-        }
-        draft_tok.push_back(tok);
-        prefix_tok = tok;
-    }
+    draft_tok.insert(draft_tok.end(), candidates.begin(), candidates.end());
     return true;
 }
 
@@ -305,7 +340,101 @@ bool build_markov_chain_graph(const DraftWeights & dw,
     return true;
 }
 
+bool dspark_markov_propose_fused_impl(
+        const DraftWeights & dw,
+        ggml_backend_t backend,
+        ggml_tensor * lm_head,
+        const float * proposal_hidden,
+        int proposal_len,
+        int32_t anchor_token,
+        std::vector<int32_t> & proposals_out,
+        std::vector<float> * confidence_out,
+        const float * confidence_hidden) {
+    if (proposal_len <= 0 ||
+        !dspark_fused_usable(
+            dw, backend, lm_head, proposal_hidden, "dspark_fused")) {
+        return false;
+    }
+    const int hidden = dw.n_embd;
+
+    static thread_local std::vector<uint8_t> g_arena_chain;
+    MarkovChainGraph graph;
+    const bool want_confidence = confidence_out != nullptr;
+    if (confidence_out) confidence_out->clear();
+    if (!build_markov_chain_graph(
+            dw, lm_head, proposal_len, /*first_corrected=*/0,
+            /*corrected_are_outputs=*/false,
+            /*confidence_are_outputs=*/want_confidence,
+            g_arena_chain, graph)) {
+        return false;
+    }
+
+    static thread_local ggml_gallocr_t galloc_chain = nullptr;
+    if (!galloc_chain) {
+        galloc_chain = ggml_gallocr_new(
+            ggml_backend_get_default_buffer_type(backend));
+    }
+    if (!ggml_gallocr_alloc_graph(galloc_chain, graph.gf)) {
+        std::fprintf(stderr, "dspark_fused: gallocr_alloc_graph failed\n");
+        ggml_free(graph.ctx);
+        return false;
+    }
+
+    ggml_backend_tensor_set(
+        graph.inp_hidden, proposal_hidden, 0,
+        sizeof(float) * static_cast<size_t>(hidden) * proposal_len);
+    if (want_confidence && graph.inp_confidence_hidden) {
+        const float * source = confidence_hidden
+            ? confidence_hidden : proposal_hidden;
+        ggml_backend_tensor_set(
+            graph.inp_confidence_hidden, source, 0,
+            sizeof(float) * static_cast<size_t>(hidden) * proposal_len);
+    }
+    ggml_backend_tensor_set(
+        graph.inp_seed, &anchor_token, 0, sizeof(anchor_token));
+
+    if (ggml_backend_graph_compute(backend, graph.gf) != GGML_STATUS_SUCCESS) {
+        std::fprintf(stderr, "dspark_fused: graph_compute failed\n");
+        ggml_free(graph.ctx);
+        return false;
+    }
+
+    proposals_out.resize(static_cast<size_t>(proposal_len));
+    std::vector<float> confidence(static_cast<size_t>(proposal_len), 0.0f);
+    for (int i = 0; i < proposal_len; ++i) {
+        ggml_backend_tensor_get_async(
+            backend, graph.toks[static_cast<size_t>(i)],
+            &proposals_out[static_cast<size_t>(i)], 0, sizeof(int32_t));
+        if (want_confidence && graph.confidence[static_cast<size_t>(i)]) {
+            ggml_backend_tensor_get_async(
+                backend, graph.confidence[static_cast<size_t>(i)],
+                &confidence[static_cast<size_t>(i)], 0, sizeof(float));
+        }
+    }
+    ggml_backend_synchronize(backend);
+    if (want_confidence && !graph.confidence.empty() && graph.confidence[0]) {
+        *confidence_out = std::move(confidence);
+    }
+    ggml_free(graph.ctx);
+    return true;
+}
+
 }  // namespace
+
+bool dspark_markov_propose_greedy_block_fused(
+        const DraftWeights & dw,
+        ggml_backend_t backend,
+        ggml_tensor * lm_head,
+        const float * draft_hidden,
+        int proposal_len,
+        int32_t anchor_token,
+        std::vector<int32_t> & proposals_out,
+        std::vector<float> * confidence_out,
+        const float * confidence_hidden) {
+    return dspark_markov_propose_fused_impl(
+        dw, backend, lm_head, draft_hidden, proposal_len, anchor_token,
+        proposals_out, confidence_out, confidence_hidden);
+}
 
 bool dspark_markov_correct_greedy_chain_fused(const DraftWeights & dw,
                                               ggml_backend_t backend,
@@ -317,68 +446,21 @@ bool dspark_markov_correct_greedy_chain_fused(const DraftWeights & dw,
                                               std::vector<float> * confidence_out,
                                               const float * confidence_hidden) {
     if (q_len <= 1) return false;
-    if (!dspark_fused_usable(dw, backend, lm_head, local_hidden, "dspark_fused")) return false;
-    const int hdim   = dw.n_embd;
+    const int hidden = dw.n_embd;
     const int n_cand = q_len - 1;
-
-    static thread_local std::vector<uint8_t> g_arena_chain;
-    MarkovChainGraph g;
-    const bool want_confidence = confidence_out != nullptr;
-    if (confidence_out) confidence_out->clear();
-    if (!build_markov_chain_graph(dw, lm_head, n_cand, /*first_corrected=*/0,
-                                  /*corrected_are_outputs=*/false,
-                                  /*confidence_are_outputs=*/want_confidence,
-                                  g_arena_chain, g)) {
+    std::vector<int32_t> candidates;
+    const float * candidate_confidence_hidden = confidence_hidden
+        ? confidence_hidden + static_cast<size_t>(hidden) : nullptr;
+    if (!dspark_markov_propose_fused_impl(
+            dw, backend, lm_head,
+            local_hidden + static_cast<size_t>(hidden), n_cand, last_tok,
+            candidates, confidence_out, candidate_confidence_hidden)) {
         return false;
     }
-
-    static thread_local ggml_gallocr_t galloc_chain = nullptr;
-    if (!galloc_chain) {
-        galloc_chain = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-    }
-    if (!ggml_gallocr_alloc_graph(galloc_chain, g.gf)) {
-        std::fprintf(stderr, "dspark_fused: gallocr_alloc_graph failed\n");
-        ggml_free(g.ctx);
-        return false;
-    }
-
-    // Candidate hidden states start at position 1 (position 0 is the seed).
-    ggml_backend_tensor_set(g.inp_hidden, local_hidden + (size_t)hdim, 0,
-                            sizeof(float) * (size_t)hdim * (size_t)n_cand);
-    if (want_confidence && g.inp_confidence_hidden) {
-        const float * conf_src = confidence_hidden ? confidence_hidden : local_hidden;
-        ggml_backend_tensor_set(g.inp_confidence_hidden, conf_src + (size_t)hdim, 0,
-                                sizeof(float) * (size_t)hdim * (size_t)n_cand);
-    }
-    ggml_backend_tensor_set(g.inp_seed, &last_tok, 0, sizeof(int32_t));
-
-    if (ggml_backend_graph_compute(backend, g.gf) != GGML_STATUS_SUCCESS) {
-        std::fprintf(stderr, "dspark_fused: graph_compute failed\n");
-        ggml_free(g.ctx);
-        return false;
-    }
-
-    draft_tok.assign((size_t)q_len, 0);
-    draft_tok[0] = last_tok;
-    // One synchronize instead of n_cand blocking readbacks.
-    int32_t t_out[16];
-    float c_out[16] = {};
-    const int n_get = n_cand < 16 ? n_cand : 16;
-    for (int i = 0; i < n_get; ++i) {
-        ggml_backend_tensor_get_async(backend, g.toks[(size_t)i], &t_out[i], 0, sizeof(int32_t));
-        if (want_confidence && g.confidence[(size_t)i]) {
-            ggml_backend_tensor_get_async(
-                backend, g.confidence[(size_t)i], &c_out[i], 0, sizeof(float));
-        }
-    }
-    ggml_backend_synchronize(backend);
-    for (int i = 0; i < n_get; ++i) {
-        draft_tok[(size_t)i + 1] = t_out[i];
-    }
-    if (want_confidence && !g.confidence.empty() && g.confidence[0]) {
-        confidence_out->assign(c_out, c_out + n_get);
-    }
-    ggml_free(g.ctx);
+    draft_tok.clear();
+    draft_tok.reserve(candidates.size() + 1);
+    draft_tok.push_back(last_tok);
+    draft_tok.insert(draft_tok.end(), candidates.begin(), candidates.end());
     return true;
 }
 
