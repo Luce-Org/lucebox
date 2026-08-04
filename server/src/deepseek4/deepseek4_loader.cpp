@@ -360,6 +360,39 @@ constexpr uint32_t DS4_P4MIX_K           = 8;          // levels per codebook
 constexpr uint32_t DS4_P4MIX_QK          = 32;         // MIX_QK block width (rocmfp3_mix.cu)
 constexpr uint8_t  DS4_P4MIX_MAX_MODE    = 1;          // 0 = fixed, 1 = adaptive
 
+// ---- learned-codebook sidecars: embedded in the GGUF, or a loose file beside it ----
+// The adaptive mix qtypes keep per-expert codebooks out of band because a ggml block has
+// nowhere to put a learned table. Shipping that as a second file makes the model a
+// two-part download whose halves can be separated -- and it is REQUIRED, so a model
+// without it is undecodable. Prefer a copy embedded in the GGUF KV block; fall back to
+// the loose file so already-published two-file artifacts keep loading unchanged.
+//
+// fmemopen is what keeps this small: the callers' existing FILE* parsers read the
+// embedded bytes with no change, so the sidecar layout still has exactly one parser.
+static FILE * ds4_open_sidecar(const std::string & gguf_path,
+                               const char * kv_key,
+                               const char * suffix,
+                               std::vector<uint8_t> & backing) {
+    struct gguf_init_params gip = { /*no_alloc=*/ true, /*ctx=*/ nullptr };
+    struct gguf_context * g = gguf_init_from_file(gguf_path.c_str(), gip);
+    if (g) {
+        const int64_t id = gguf_find_key(g, kv_key);
+        if (id >= 0 && gguf_get_kv_type(g, id) == GGUF_TYPE_ARRAY &&
+            gguf_get_arr_type(g, id) == GGUF_TYPE_UINT8) {
+            const size_t n = gguf_get_arr_n(g, id);
+            const uint8_t * d = (const uint8_t *) gguf_get_arr_data(g, id);
+            backing.assign(d, d + n);
+            gguf_free(g);
+            std::fprintf(stderr, "[deepseek4] %s: using codebooks embedded in the GGUF "
+                         "(%zu bytes, no sidecar file needed)\n", kv_key, backing.size());
+            return fmemopen(backing.data(), backing.size(), "rb");
+        }
+        gguf_free(g);
+    }
+    const std::string p = gguf_path + suffix;
+    return std::fopen(p.c_str(), "rb");
+}
+
 static bool ds4_register_p4mix_sidecar(const std::string & gguf_path,
                                        const TargetLoadPlan & plan,
                                        DeepSeek4Weights & out) {
@@ -385,7 +418,8 @@ static bool ds4_register_p4mix_sidecar(const std::string & gguf_path,
     }
 
     const std::string sc_path = gguf_path + ".p4mix.bin";
-    FILE * f = std::fopen(sc_path.c_str(), "rb");
+    std::vector<uint8_t> sc_embedded;  // outlives f when the blob came from GGUF KV
+    FILE * f = ds4_open_sidecar(gguf_path, "deepseek4.p4mix.sidecar", ".p4mix.bin", sc_embedded);
     if (!f) {
         std::fprintf(stderr, "[deepseek4] qtype-105 down-experts require sidecar but it "
                      "is missing: %s\n", sc_path.c_str());
@@ -628,7 +662,8 @@ static bool ds4_register_dmix_sidecar(const std::string & gguf_path,
     if (n_dense_mix == 0) return true;  // uniform dense (101/104/107) -- nothing to do
 
     const std::string sc_path = gguf_path + ".dmix.bin";
-    FILE * f = std::fopen(sc_path.c_str(), "rb");
+    std::vector<uint8_t> sc_embedded;  // outlives f when the blob came from GGUF KV
+    FILE * f = ds4_open_sidecar(gguf_path, "deepseek4.dmix.sidecar", ".dmix.bin", sc_embedded);
     if (!f) {
         std::fprintf(stderr, "[deepseek4] %d dense mix-qtype attention tensors require "
                      "sidecar but it is missing: %s\n", n_dense_mix, sc_path.c_str());
@@ -806,7 +841,8 @@ static bool ds4_register_gumix_sidecar(const std::string & gguf_path,
     }
 
     const std::string sc_path = gguf_path + ".gumix.bin";
-    FILE * f = std::fopen(sc_path.c_str(), "rb");
+    std::vector<uint8_t> sc_embedded;  // outlives f when the blob came from GGUF KV
+    FILE * f = ds4_open_sidecar(gguf_path, "deepseek4.gumix.sidecar", ".gumix.bin", sc_embedded);
     if (!f) {
         std::fprintf(stderr, "[deepseek4] qtype-106 gate/up experts require sidecar but it "
                      "is missing: %s\n", sc_path.c_str());
