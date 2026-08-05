@@ -3417,7 +3417,12 @@ static thread_local ggml_cuda_pending_peer_copy_batch
 
 static bool ggml_cuda_batch_peer_copies_enabled() {
     static const bool enabled = [] {
-        const char * value = getenv("GGML_CUDA_BATCH_PEER_COPIES");
+        const char * value = getenv("GGML_BATCH_PEER_COPIES");
+        if (!value || !*value) {
+            // Compatibility with profiles created before the policy became
+            // runtime-neutral.
+            value = getenv("GGML_CUDA_BATCH_PEER_COPIES");
+        }
         return value && *value && strcmp(value, "0") != 0;
     }();
     return enabled;
@@ -4779,6 +4784,47 @@ extern "C" bool ggml_backend_cuda_set_skip_props_check(bool skip) {
     return previous;
 }
 
+extern "C" size_t ggml_backend_cuda_graph_invalidate_range(
+        ggml_backend_t backend,
+        const void * begin,
+        size_t size) {
+#ifdef USE_CUDA_GRAPH
+    if (backend == nullptr || begin == nullptr || size == 0 ||
+        !ggml_backend_is_cuda(backend)) {
+        return 0;
+    }
+
+    // Graph instances may still be queued even when their owning ggml graph
+    // is no longer reachable. Retiring one is only safe after all work on the
+    // backend has completed.
+    ggml_backend_synchronize(backend);
+    auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+    ggml_cuda_set_device(cuda_ctx->device);
+
+    const uintptr_t first = reinterpret_cast<uintptr_t>(begin);
+    const uintptr_t last = size > std::numeric_limits<uintptr_t>::max() - first
+        ? std::numeric_limits<uintptr_t>::max()
+        : first + size;
+    size_t erased = 0;
+    for (auto it = cuda_ctx->cuda_graphs.begin();
+         it != cuda_ctx->cuda_graphs.end();) {
+        const uintptr_t key = reinterpret_cast<uintptr_t>(it->first);
+        if (key >= first && key < last) {
+            it = cuda_ctx->cuda_graphs.erase(it);
+            ++erased;
+        } else {
+            ++it;
+        }
+    }
+    return erased;
+#else
+    GGML_UNUSED(backend);
+    GGML_UNUSED(begin);
+    GGML_UNUSED(size);
+    return 0;
+#endif
+}
+
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
@@ -4812,9 +4858,20 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             getenv("GGML_CUDA_GRAPH_WARMUP_LOG") != nullptr;
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
+            // A metadata arena can be rebuilt at the same address, producing
+            // the same pointer-derived graph key for a different graph. The
+            // scheduler assigns every split a new uid when that happens. A
+            // forced property-scan bypass is therefore valid only for the
+            // exact generation that populated this cache entry.
+            // Scheduler graphs carry a non-zero generation uid. Direct graphs
+            // retain uid=0 and therefore keep the existing caller-guaranteed
+            // immutable-topology fast path.
+            const bool same_graph_generation = cgraph->uid == 0 ||
+                                               cgraph->uid == graph->uid;
             const bool can_skip_props_check = ggml_cuda_skip_props_check
                                            && graph->warmup_complete
-                                           && graph->instance != nullptr;
+                                           && graph->instance != nullptr
+                                           && same_graph_generation;
             const bool properties_changed = can_skip_props_check
                                           ? false
                                           : ggml_cuda_graph_update_required(cuda_ctx, cgraph);
@@ -5178,7 +5235,14 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
 };
 
 static ggml_guid_t ggml_backend_cuda_guid() {
+#if defined(GGML_USE_HIP)
+    // CUDA and HIP may coexist in one process as separate backend modules.
+    // A distinct GUID prevents either implementation from casting the other
+    // vendor's backend context and attempting an invalid peer copy.
+    static ggml_guid guid = { 0x87, 0x4b, 0x09, 0xd6, 0x72, 0x3f, 0x4e, 0x91, 0xa4, 0x66, 0x2d, 0x6e, 0x0a, 0x7f, 0x31, 0xbc };
+#else
     static ggml_guid guid = { 0x2c, 0xdd, 0xe8, 0x1c, 0x65, 0xb3, 0x65, 0x73, 0x6a, 0x12, 0x88, 0x61, 0x1c, 0xc9, 0xdc, 0x25 };
+#endif
     return &guid;
 }
 

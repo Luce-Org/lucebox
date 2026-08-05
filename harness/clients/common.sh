@@ -111,6 +111,23 @@ require_client_binary() {
   return 1
 }
 
+# Run a real client with a bounded wall-clock deadline. Each launcher exposes
+# its own variable for backward compatibility, but shares validation and the
+# `0 = unlimited` contract here.
+run_with_timeout() {
+  local timeout_seconds="$1"
+  shift
+  if [[ ! "$timeout_seconds" =~ ^[0-9]+$ ]]; then
+    echo "client timeout must be a non-negative integer (seconds; 0 disables it)" >&2
+    return 2
+  fi
+  if [[ "$timeout_seconds" == "0" ]]; then
+    "$@"
+  else
+    timeout "${timeout_seconds}s" "$@"
+  fi
+}
+
 draft_enabled() {
   [[ -n "${DRAFT:-}" && "$DRAFT" != "none" && "$DRAFT" != "off" && "$DRAFT" != "0" ]]
 }

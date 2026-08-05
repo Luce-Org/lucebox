@@ -13,6 +13,9 @@ Usage:
     python3 scripts/quantize_draft_q8.py \
         models/draft/model.safetensors \
         models/draft/draft-q8_0.gguf
+
+For a Qwen3.6 target, add ``--qwen36-swa`` so the output carries the
+draft sliding-window architecture metadata required by the server.
 """
 
 import argparse
@@ -47,6 +50,20 @@ BLOCK_SIZE          = 16
 CTX_LEN             = 32768
 
 Q8_0_BLOCK_SIZE     = 32   # elements per Q8_0 block
+
+QWEN36_SWA_WINDOW   = 2048
+QWEN36_SWA_PATTERN  = (True, True, True, True, False)
+
+
+def add_qwen36_swa_metadata(writer, enabled: bool) -> None:
+    """Embed Qwen3.6 draft SWA metadata without changing Qwen3.5 defaults."""
+    if not enabled:
+        return
+    writer.add_uint32(f"{ARCH}.attention.sliding_window", QWEN36_SWA_WINDOW)
+    writer.add_array(
+        f"{ARCH}.attention.sliding_window_pattern",
+        list(QWEN36_SWA_PATTERN),
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -116,14 +133,24 @@ def bf16_bytes_to_f32(raw: bytes, shape: list[int]) -> np.ndarray:
 # Main
 # ──────────────────────────────────────────────────────────────────────
 
-def main():
+def build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         description="Quantize DFlash draft BF16 safetensors to Q8_0 GGUF")
     ap.add_argument("safetensors", type=Path,
                     help="Input BF16 safetensors (e.g. models/draft/model.safetensors)")
     ap.add_argument("out_gguf", type=Path,
                     help="Output Q8_0 GGUF (e.g. models/draft/draft-q8_0.gguf)")
-    args = ap.parse_args()
+    ap.add_argument(
+        "--qwen36-swa",
+        action="store_true",
+        help=("embed Qwen3.6 draft SWA metadata (window 2048; layers "
+              "0-3 sliding, layer 4 full attention)"),
+    )
+    return ap
+
+
+def main():
+    args = build_arg_parser().parse_args()
 
     if not args.safetensors.exists():
         print(f"[error] safetensors not found: {args.safetensors}", file=sys.stderr)
@@ -150,6 +177,9 @@ def main():
     writer.add_uint32(f"{ARCH}.vocab_size",              VOCAB)
     writer.add_float32(f"{ARCH}.attention.layer_norm_rms_epsilon", RMS_EPS)
     writer.add_float32(f"{ARCH}.rope.freq_base",         ROPE_THETA)
+    add_qwen36_swa_metadata(writer, args.qwen36_swa)
+    if args.qwen36_swa:
+        print("[info] Qwen3.6 draft SWA: layers 0-3 window=2048; layer 4 full attention")
 
     # DFlash-specific hyperparameters
     writer.add_uint32(f"{ARCH}.dflash.n_target_layers", N_TARGET_LAYERS)

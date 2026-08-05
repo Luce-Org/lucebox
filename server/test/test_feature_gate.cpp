@@ -226,7 +226,7 @@ static void test_feature_gate_tensor_parallel_requirements() {
 
     BackendArgs draft = valid;
     draft.draft_path = "/nonexistent/draft.gguf";
-    TEST_ASSERT(!gate_result(
+    TEST_ASSERT(gate_result(
         draft, "qwen35", PlacementBackend::Cuda).empty());
 }
 
@@ -288,6 +288,19 @@ static void test_feature_gate_ds4_decode_options_require_monolithic_hip() {
         topk, "qwen35", PlacementBackend::Hip).empty());
     TEST_ASSERT(gate_result(
         topk, "deepseek4", PlacementBackend::Hip).empty());
+
+    // Top-k is a model policy in the monolithic backend and is independent of
+    // the GPU vendor. Unlike fused decode, mixed CUDA-primary expert
+    // placement can therefore use it.
+    BackendArgs cuda_topk = topk;
+    cuda_topk.device.backend = PlacementBackend::Cuda;
+    TEST_ASSERT(gate_result(
+        cuda_topk, "deepseek4", PlacementBackend::Cuda).empty());
+
+    BackendArgs split_topk = topk;
+    split_topk.device.layer_split_gpus = {0, 1};
+    TEST_ASSERT(!gate_result(
+        split_topk, "deepseek4", PlacementBackend::Hip).empty());
 }
 
 static void test_feature_gate_remote_draft_requires_supported_arch() {

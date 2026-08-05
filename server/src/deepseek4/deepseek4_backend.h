@@ -84,13 +84,17 @@ private:
 
     // Snapshots
     static constexpr int PREFIX_SLOTS = 64;
-    struct PrefixSnapshot {
-        DeepSeek4Snapshot cache;
+    struct SnapshotAux {
         std::vector<float> last_logits;
         std::vector<float> spec_feat_window;
+        bool used = false;
     };
-    PrefixSnapshot         snapshots_[PREFIX_SLOTS];
+    DeepSeek4Snapshot      snapshots_[PREFIX_SLOTS];
+    SnapshotAux            snapshot_aux_[PREFIX_SLOTS];
     std::vector<float>     last_logits_;
+    // Absolute cache position represented by last_logits_. A snapshot is
+    // safe only when this matches cache_.cur_pos.
+    int                    last_logits_pos_ = -1;
 
     // DSpark speculative decode (opt-in: DFLASH_DS4_SPEC=1 + DFLASH_DS4_DRAFT=<gguf>).
     bool                           spec_enabled_ = false;
@@ -102,15 +106,30 @@ private:
 
     bool load_spec_drafter();
     void release_spec_drafter(bool mark_parked);
+    void keep_spec_feature_tail(std::vector<float> & features,
+                                size_t max_rows) const;
+    // Limit a prefill batch to a region with a uniform DSpark capture policy.
+    // Layer-major prefill can capture a subrange without splitting the final
+    // feature window; other paths still stop exactly at capture boundaries.
+    static int capture_safe_prefill_tokens(int token_offset,
+                                           int requested_tokens,
+                                           int final_capture_from,
+                                           bool batch_final_capture,
+                                           bool snapshot_pending,
+                                           int snapshot_capture_from,
+                                           int snapshot_capture_to);
 
     // Prefill prompt tokens in chunks, return absolute committed position.
     int do_prefill(const std::vector<int32_t> & tokens, const DaemonIO & io,
-                   int kv_offset = 0, int snap_pos = -1, int snap_slot = -1);
+                   int kv_offset = 0, int snap_slot = -1, int snap_pos = -1);
 
-    GenerateResult finish_generation(
-        const GenerateRequest & req, const DaemonIO & io,
-        int committed, double prefill_s,
-        const std::vector<int32_t> & history_prefix);
+    // Generate after either a fresh prefill or a restored prefix. kv_offset is
+    // the number of prompt tokens already represented by cache_ and the
+    // auxiliary logits/speculative state.
+    GenerateResult generate_from_state(const GenerateRequest & req,
+                                       const DaemonIO & io,
+                                       int kv_offset);
+    bool snapshot_restore(int slot);
 
     // Autoregressive decode loop.
     bool do_decode(int committed, int n_gen,

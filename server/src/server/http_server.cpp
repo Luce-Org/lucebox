@@ -95,6 +95,69 @@ static inline bool sock_is_eagain(int e) { return e == EAGAIN || e == EWOULDBLOC
 
 namespace dflash::common {
 
+namespace {
+constexpr auto kClientMonitorInterval = std::chrono::milliseconds(250);
+constexpr auto kSseHeartbeatInterval = std::chrono::seconds(15);
+constexpr char kSseHeartbeat[] = ": keep-alive\n\n";
+}
+
+namespace http_detail {
+
+PeerSocketState inspect_peer_socket(SocketHandle fd) {
+    struct pollfd pfd = {fd, POLLIN, 0};
+#if defined(POLLRDHUP)
+    pfd.events |= POLLRDHUP;
+#endif
+
+    int ret;
+    do {
+        ret = poll(&pfd, 1, 0);
+    } while (ret < 0 && sock_is_eintr(sock_errno()));
+    if (ret == 0) return PeerSocketState::Connected;
+    if (ret < 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+        return PeerSocketState::Disconnected;
+    }
+    bool read_closed = false;
+#if defined(POLLRDHUP)
+    read_closed = (pfd.revents & POLLRDHUP) != 0;
+#endif
+    if (!(pfd.revents & POLLIN)) {
+        return read_closed ? PeerSocketState::ReadClosed
+                           : PeerSocketState::Connected;
+    }
+
+    char byte = 0;
+    const ssize_t n = recv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+    if (n == 0) return PeerSocketState::ReadClosed;
+    if (n > 0) return PeerSocketState::Connected;
+    const int error = sock_errno();
+    return (sock_is_eintr(error) || sock_is_eagain(error))
+        ? PeerSocketState::Connected
+        : PeerSocketState::Disconnected;
+}
+
+bool sse_chunk_has_done(
+        std::string & partial_line, const char * data, size_t size) {
+    static constexpr char kDoneLine[] = "data: [DONE]";
+    static constexpr size_t kDoneLineSize = sizeof(kDoneLine) - 1;
+
+    bool found = false;
+    for (size_t i = 0; i < size; ++i) {
+        const char ch = data[i];
+        if (ch == '\r' || ch == '\n') {
+            found = found || partial_line == kDoneLine;
+            partial_line.clear();
+        } else if (partial_line.size() <= kDoneLineSize) {
+            // One byte beyond the marker length is an overflow sentinel. It
+            // prevents a non-terminal SSE line from growing without bound.
+            partial_line.push_back(ch);
+        }
+    }
+    return found;
+}
+
+}  // namespace http_detail
+
 static std::string context_overflow_message(int max_ctx, int prompt_tokens, int max_output) {
     const int requested_tokens = prompt_tokens + max_output;
     return "This model's maximum context length is " + std::to_string(max_ctx) +
@@ -138,20 +201,27 @@ static float pflash_keep_ratio(const ServerConfig & cfg, int n_tokens) {
 #ifdef DFLASH_HAS_CURL
 
 struct CurlWriteCtx {
-    SocketHandle client_fd;
     bool streaming;
     bool first_chunk;
     bool chat_rewrite;   // rewrite completions → chat format
     std::string buffer;  // accumulates non-streaming response
+    std::string sse_partial_line;
     std::string response_id;
     std::string model;
+    std::function<bool(const void *, size_t)> send_bytes;
+    std::function<void()> stop_stream;
+    std::function<bool()> cancelled;
 };
 
 static size_t curl_write_passthrough(char * ptr, size_t size, size_t nmemb, void * userdata) {
     size_t total = size * nmemb;
     auto * ctx = static_cast<CurlWriteCtx *>(userdata);
     if (ctx->streaming) {
-        ::send(ctx->client_fd, ptr, total, MSG_NOSIGNAL);
+        if (http_detail::sse_chunk_has_done(
+                ctx->sse_partial_line, ptr, total)) {
+            ctx->stop_stream();
+        }
+        if (!ctx->send_bytes(ptr, total)) return 0;
     } else {
         ctx->buffer.append(ptr, total);
     }
@@ -178,19 +248,20 @@ static size_t curl_write_rewrite(char * ptr, size_t size, size_t nmemb, void * u
         pos = nl + 1;
         if (line.empty() || line == "\r") {
             std::string out = "\n";
-            ::send(ctx->client_fd, out.data(), out.size(), MSG_NOSIGNAL);
+            if (!ctx->send_bytes(out.data(), out.size())) return 0;
             continue;
         }
         if (line.size() > 0 && line.back() == '\r') line.pop_back();
         if (line.rfind("data: ", 0) != 0) {
             line += "\n";
-            ::send(ctx->client_fd, line.data(), line.size(), MSG_NOSIGNAL);
+            if (!ctx->send_bytes(line.data(), line.size())) return 0;
             continue;
         }
         std::string payload = line.substr(6);
         if (payload == "[DONE]") {
             std::string out = "data: [DONE]\n\n";
-            ::send(ctx->client_fd, out.data(), out.size(), MSG_NOSIGNAL);
+            ctx->stop_stream();
+            if (!ctx->send_bytes(out.data(), out.size())) return 0;
             continue;
         }
         try {
@@ -213,10 +284,10 @@ static size_t curl_write_rewrite(char * ptr, size_t size, size_t nmemb, void * u
                 }
             }
             std::string out = "data: " + j.dump() + "\n\n";
-            ::send(ctx->client_fd, out.data(), out.size(), MSG_NOSIGNAL);
+            if (!ctx->send_bytes(out.data(), out.size())) return 0;
         } catch (...) {
             std::string out = line + "\n";
-            ::send(ctx->client_fd, out.data(), out.size(), MSG_NOSIGNAL);
+            if (!ctx->send_bytes(out.data(), out.size())) return 0;
         }
     }
     buf.erase(0, pos);
@@ -245,11 +316,20 @@ static json rewrite_completions_to_chat(const json & comp_resp) {
     return chat_resp;
 }
 
-static bool curl_forward(SocketHandle client_fd, const std::string & url,
+static int curl_progress_cancelled(
+        void * userdata, curl_off_t, curl_off_t, curl_off_t, curl_off_t) {
+    auto * ctx = static_cast<CurlWriteCtx *>(userdata);
+    return ctx->cancelled && ctx->cancelled() ? 1 : 0;
+}
+
+static bool curl_forward(const std::string & url,
                          const std::string & api_key, const json & body,
                          bool streaming, bool rewrite_to_chat,
                          const std::string & response_id,
-                         const std::string & model) {
+                         const std::string & model,
+                         std::function<bool(const void *, size_t)> send_bytes,
+                         std::function<void()> stop_stream,
+                         std::function<bool()> cancelled) {
     CURL * curl = curl_easy_init();
     if (!curl) return false;
 
@@ -263,19 +343,25 @@ static bool curl_forward(SocketHandle client_fd, const std::string & url,
     }
 
     CurlWriteCtx ctx;
-    ctx.client_fd = client_fd;
     ctx.streaming = streaming;
     ctx.first_chunk = true;
     ctx.chat_rewrite = rewrite_to_chat;
     ctx.response_id = response_id;
     ctx.model = model;
+    ctx.send_bytes = std::move(send_bytes);
+    ctx.stop_stream = std::move(stop_stream);
+    ctx.cancelled = std::move(cancelled);
 
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body_str.c_str());
     curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)body_str.size());
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 600L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 3600L);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &ctx);
+    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, curl_progress_cancelled);
+    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &ctx);
 
     if (rewrite_to_chat) {
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_rewrite);
@@ -283,18 +369,10 @@ static bool curl_forward(SocketHandle client_fd, const std::string & url,
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_passthrough);
     }
 
-    if (streaming) {
-        std::string sse_header =
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: text/event-stream\r\n"
-            "Cache-Control: no-cache\r\n"
-            "Connection: keep-alive\r\n"
-            "\r\n";
-        ::send(client_fd, sse_header.data(), sse_header.size(), MSG_NOSIGNAL);
-    }
-
     CURLcode res = curl_easy_perform(curl);
+    if (streaming) ctx.stop_stream();
 
+    bool response_sent = true;
     if (!streaming && res == CURLE_OK) {
         // Non-streaming: send accumulated response.
         if (rewrite_to_chat) {
@@ -307,13 +385,13 @@ static bool curl_forward(SocketHandle client_fd, const std::string & url,
                     "Content-Type: application/json\r\n"
                     "Content-Length: " + std::to_string(out.size()) + "\r\n"
                     "\r\n" + out;
-                ::send(client_fd, http.data(), http.size(), MSG_NOSIGNAL);
+                response_sent = ctx.send_bytes(http.data(), http.size());
             } catch (...) {
                 std::string http =
                     "HTTP/1.1 502 Bad Gateway\r\n"
                     "Content-Type: application/json\r\n"
                     "\r\n{\"error\":\"upstream response parse failed\"}";
-                ::send(client_fd, http.data(), http.size(), MSG_NOSIGNAL);
+                response_sent = ctx.send_bytes(http.data(), http.size());
             }
         } else {
             std::string http =
@@ -321,13 +399,13 @@ static bool curl_forward(SocketHandle client_fd, const std::string & url,
                 "Content-Type: application/json\r\n"
                 "Content-Length: " + std::to_string(ctx.buffer.size()) + "\r\n"
                 "\r\n" + ctx.buffer;
-            ::send(client_fd, http.data(), http.size(), MSG_NOSIGNAL);
+            response_sent = ctx.send_bytes(http.data(), http.size());
         }
     }
 
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
-    return res == CURLE_OK;
+    return res == CURLE_OK && response_sent;
 }
 #endif // DFLASH_HAS_CURL
 
@@ -1951,8 +2029,27 @@ void HttpServer::enqueue_request_and_wait(SocketHandle fd, ParsedRequest req) {
     job.req = std::move(req);
     enqueue(&job);
 
+    // The worker can spend minutes in prefill before its first token. Keep the
+    // SSE response active and watch the read side independently so an orderly
+    // client close is observed before the kernel send buffer eventually fills.
     std::unique_lock<std::mutex> lock(job.mu);
-    job.cv.wait(lock, [&]() { return job.done; });
+    while (!job.done) {
+        if (job.cv.wait_for(lock, kClientMonitorInterval,
+                            [&]() { return job.done; })) {
+            break;
+        }
+
+        lock.unlock();
+        const auto peer_state = http_detail::inspect_peer_socket(fd);
+        if (peer_state == http_detail::PeerSocketState::Disconnected) {
+            job.client_disconnected.store(true, std::memory_order_release);
+        } else {
+            maybe_send_job_heartbeat(
+                &job,
+                peer_state == http_detail::PeerSocketState::ReadClosed);
+        }
+        lock.lock();
+    }
 }
 
 bool HttpServer::route_request(SocketHandle fd, const HttpRequest & hr) {
@@ -2794,7 +2891,7 @@ HttpServer::PreparedPrompt HttpServer::prepare_prompt(
 }
 
 bool HttpServer::forward_upstream(
-        SocketHandle fd, const ParsedRequest & req,
+        ServerJob * job, const ParsedRequest & req,
         const PreparedPrompt & prepared) {
 #ifdef DFLASH_HAS_CURL
     if (config_.pflash_upstream_base.empty()) return false;
@@ -2827,9 +2924,17 @@ bool HttpServer::forward_upstream(
             "[pflash-proxy] compressed forward → %s/completions  "
             "prompt=%zu tokens  model=%s\n",
             upstream.c_str(), prepared.tokens.size(), upstream_model.c_str());
-        curl_forward(fd, upstream + "/completions", upstream_key, body,
-                     req.stream, /*rewrite_to_chat=*/true,
-                     req.response_id, upstream_model);
+        curl_forward(
+            upstream + "/completions", upstream_key, body,
+            req.stream, /*rewrite_to_chat=*/true,
+            req.response_id, upstream_model,
+            [this, job](const void * data, size_t size) {
+                return send_job_bytes(job, data, size);
+            },
+            [this, job]() { stop_job_stream(job); },
+            [job]() {
+                return job->client_disconnected.load(std::memory_order_acquire);
+            });
     } else {
         json body = req.raw_body;
         body["model"] = upstream_model;
@@ -2837,13 +2942,21 @@ bool HttpServer::forward_upstream(
         std::fprintf(stderr,
             "[pflash-proxy] passthrough → %s/chat/completions  model=%s\n",
             upstream.c_str(), upstream_model.c_str());
-        curl_forward(fd, upstream + "/chat/completions", upstream_key, body,
-                     req.stream, /*rewrite_to_chat=*/false,
-                     req.response_id, upstream_model);
+        curl_forward(
+            upstream + "/chat/completions", upstream_key, body,
+            req.stream, /*rewrite_to_chat=*/false,
+            req.response_id, upstream_model,
+            [this, job](const void * data, size_t size) {
+                return send_job_bytes(job, data, size);
+            },
+            [this, job]() { stop_job_stream(job); },
+            [job]() {
+                return job->client_disconnected.load(std::memory_order_acquire);
+            });
     }
     return true;
 #else
-    (void) fd;
+    (void) job;
     (void) req;
     (void) prepared;
     return false;
@@ -3350,9 +3463,12 @@ void HttpServer::prepare_generation_inputs(
 }
 
 void HttpServer::configure_generation_io(
-        SocketHandle fd, const ParsedRequest & req, SseEmitter & emitter,
+        ServerJob * job, const ParsedRequest & req, SseEmitter & emitter,
         GenerationOutputState & output, DaemonIO & io) {
     io.stream_fd = -1;
+    io.should_cancel = [job]() {
+        return job->client_disconnected.load(std::memory_order_acquire);
+    };
     io.observer = [this](const char *, const std::vector<int32_t> & tokens) {
         std::vector<std::string> token_strings;
         token_strings.reserve(tokens.size());
@@ -3363,9 +3479,13 @@ void HttpServer::configure_generation_io(
         broadcast_status();
     };
 
-    io.on_token = [this, fd, &req, &emitter, &output](
+    io.on_token = [this, job, &req, &emitter, &output](
             int32_t token) -> bool {
-        if (output.client_disconnected) return false;
+        if (output.client_disconnected ||
+            job->client_disconnected.load(std::memory_order_acquire)) {
+            output.client_disconnected = true;
+            return false;
+        }
         ++output.completion_tokens;
 
         if (output.completion_tokens % 10 == 0) {
@@ -3385,7 +3505,7 @@ void HttpServer::configure_generation_io(
         if (!req.stream || text.empty()) return true;
 
         for (const auto & chunk : emitter.emit_token(text)) {
-            if (!send_all(fd, chunk.data(), chunk.size())) {
+            if (!send_job_bytes(job, chunk.data(), chunk.size())) {
                 output.client_disconnected = true;
                 return false;
             }
@@ -3442,6 +3562,7 @@ void HttpServer::process_job(ServerJob * job) {
     StatusGuard status_guard{status_};
 
     auto finish_job = [&]() {
+        stop_job_stream(job);
         std::lock_guard<std::mutex> lk(job->mu);
         job->done = true;
         job->cv.notify_one();
@@ -3449,11 +3570,12 @@ void HttpServer::process_job(ServerJob * job) {
     auto fail_request = [&](int status, const std::string & message) {
         std::fprintf(stderr, "[server] request failed: %s\n", message.c_str());
         if (req.stream) {
+            stop_job_stream(job);
             json err = {{"error", {{"message", message}, {"type", "server_error"}}}};
             const std::string chunk = "data: " + err.dump() + "\n\n";
-            send_all(fd, chunk.data(), chunk.size());
+            send_job_bytes(job, chunk.data(), chunk.size());
             const char done[] = "data: [DONE]\n\n";
-            send_all(fd, done, sizeof(done) - 1);
+            send_job_bytes(job, done, sizeof(done) - 1);
         } else {
             send_error(fd, status, message);
         }
@@ -3470,9 +3592,10 @@ void HttpServer::process_job(ServerJob * job) {
         req.max_output,
         json_array_size(req.tools));
 
-    // Send SSE headers (skip when proxying — curl_forward handles its own headers).
-    if (req.stream && config_.pflash_upstream_base.empty()) {
-        if (!send_sse_headers(fd)) {
+    // The server owns the downstream SSE transport for local and proxied
+    // generation so both paths share heartbeat and disconnect handling.
+    if (req.stream) {
+        if (!send_sse_headers(job)) {
             finish_job();
             return;
         }
@@ -3485,11 +3608,12 @@ void HttpServer::process_job(ServerJob * job) {
                        req.stop_sequences,
                        req.started_in_thinking);
 
-    // Emit initial SSE events (skip when proxying).
+    // Emit initial SSE events only for local generation. The upstream owns
+    // the proxied event sequence.
     if (req.stream && config_.pflash_upstream_base.empty()) {
         bool start_ok = true;
         for (const auto & chunk : emitter.emit_start()) {
-            if (!send_all(fd, chunk.data(), chunk.size())) {
+            if (!send_job_bytes(job, chunk.data(), chunk.size())) {
                 start_ok = false;
                 break;
             }
@@ -3499,13 +3623,14 @@ void HttpServer::process_job(ServerJob * job) {
             return;
         }
     }
+    if (req.stream) start_job_stream(job);
 
     PreparedPrompt prepared = prepare_prompt(req);
     if (prepared.error_status != 0) {
         fail_request(prepared.error_status, prepared.error);
         return;
     }
-    if (forward_upstream(fd, req, prepared)) {
+    if (forward_upstream(job, req, prepared)) {
         finish_job();
         return;
     }
@@ -3526,7 +3651,7 @@ void HttpServer::process_job(ServerJob * job) {
 
     DaemonIO io;
     GenerationOutputState output;
-    configure_generation_io(fd, req, emitter, output, io);
+    configure_generation_io(job, req, emitter, output, io);
     int & completion_tokens = output.completion_tokens;
     bool & visible_output_seen = output.visible_output_seen;
     bool & client_disconnected = output.client_disconnected;
@@ -3563,6 +3688,10 @@ void HttpServer::process_job(ServerJob * job) {
     if (dflash_residency == DraftResidencyAction::ReleaseAfterUse &&
         !config_.draft_path.empty()) {
         backend_.park(ParkTarget::DraftModel);
+    }
+
+    if (job->client_disconnected.load(std::memory_order_acquire)) {
+        client_disconnected = true;
     }
 
     // Release oversized scratch buffers (gallocr, BSA cache) so VRAM
@@ -3629,10 +3758,16 @@ void HttpServer::process_job(ServerJob * job) {
         status_.update_completion_tokens(completion_tokens);
         broadcast_status();
     }
+    // Serialize final frames after disabling heartbeat comments so no comment
+    // can appear after the protocol's [DONE] marker.
+    stop_job_stream(job);
+    if (job->client_disconnected.load(std::memory_order_acquire)) {
+        client_disconnected = true;
+    }
     if (req.stream && !client_disconnected) {
         auto final_chunks = emitter.emit_finish(completion_tokens, &gen_timings);
         for (const auto & chunk : final_chunks) {
-            if (!send_all(fd, chunk.data(), chunk.size())) {
+            if (!send_job_bytes(job, chunk.data(), chunk.size())) {
                 client_disconnected = true;
                 break;
             }
@@ -3864,6 +3999,56 @@ bool HttpServer::send_all(SocketHandle fd, const void * data, size_t len) {
     return true;
 }
 
+bool HttpServer::send_job_bytes(
+        ServerJob * job, const void * data, size_t len) {
+    std::lock_guard<std::mutex> lock(job->write_mu);
+    if (job->client_disconnected.load(std::memory_order_acquire)) {
+        return false;
+    }
+    if (!send_all(job->fd, data, len)) {
+        job->client_disconnected.store(true, std::memory_order_release);
+        return false;
+    }
+    job->last_stream_write = std::chrono::steady_clock::now();
+    return true;
+}
+
+void HttpServer::start_job_stream(ServerJob * job) {
+    std::lock_guard<std::mutex> lock(job->write_mu);
+    if (job->client_disconnected.load(std::memory_order_acquire)) return;
+    job->stream_ready = true;
+    job->read_close_probe_sent = false;
+    job->last_stream_write = std::chrono::steady_clock::now();
+}
+
+void HttpServer::stop_job_stream(ServerJob * job) {
+    std::lock_guard<std::mutex> lock(job->write_mu);
+    job->stream_ready = false;
+}
+
+void HttpServer::maybe_send_job_heartbeat(
+        ServerJob * job, bool peer_read_closed) {
+    std::lock_guard<std::mutex> lock(job->write_mu);
+    if (!job->stream_ready ||
+        job->client_disconnected.load(std::memory_order_acquire)) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    const bool probe_read_close =
+        peer_read_closed && !job->read_close_probe_sent;
+    if (!probe_read_close &&
+        now - job->last_stream_write < kSseHeartbeatInterval) {
+        return;
+    }
+
+    if (!send_all(job->fd, kSseHeartbeat, sizeof(kSseHeartbeat) - 1)) {
+        job->client_disconnected.store(true, std::memory_order_release);
+        return;
+    }
+    if (probe_read_close) job->read_close_probe_sent = true;
+    job->last_stream_write = now;
+}
+
 bool HttpServer::send_response(
         SocketHandle fd, int status, const std::string & content_type,
                                const std::string & body) {
@@ -3899,7 +4084,7 @@ bool HttpServer::send_error(
     return send_response(fd, status, "application/json", err.dump() + "\n");
 }
 
-bool HttpServer::send_sse_headers(SocketHandle fd) {
+bool HttpServer::send_sse_headers(ServerJob * job) {
     std::string header = "HTTP/1.1 200 OK\r\n";
     if (config_.enable_cors) {
         header += "Access-Control-Allow-Origin: *\r\n";
@@ -3907,7 +4092,7 @@ bool HttpServer::send_sse_headers(SocketHandle fd) {
     header += "Content-Type: text/event-stream\r\n"
               "Cache-Control: no-cache\r\n"
               "Connection: keep-alive\r\n\r\n";
-    return send_all(fd, header.data(), header.size());
+    return send_job_bytes(job, header.data(), header.size());
 }
 
 }  // namespace dflash::common

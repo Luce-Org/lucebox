@@ -677,7 +677,7 @@ bool Qwen35MoeBackend::run_pipelined_decode_path(int committed, int n_gen,
             kvflash_history_.push_back(next_tok);
             kvflash_maybe_reselect((int)out_tokens.size());
         }
-        if (io.cancelled) break;
+        if (io.is_cancelled()) break;
         if (is_eos_tok(next_tok, target_weights())) break;
     }
 
@@ -871,6 +871,11 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
     const int n_expert_used = target_weights().n_expert_used;
     std::vector<float> embed_all((size_t)prompt_len * (size_t)hidden);
     for (int i = 0; i < prompt_len; ++i) {
+        if ((i % 256) == 0 && out_io.is_cancelled()) {
+            result.succeed();
+            cleanup_graphs();
+            return result;
+        }
         int32_t tok = req.prompt[(size_t)i];
         if (!target_weights().embedder.embed(&tok, 1, embed_all.data() + (size_t)i * (size_t)hidden)) {
             result.fail(GenerateErrorCode::BackendSpecific, "prefill_embed");
@@ -883,6 +888,21 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
     StepGraph prefill_sg;  // persistent across layers to reuse GPU buffer
     ggml_gallocr_t ffn_hot_alloc = nullptr;
     ggml_gallocr_t ffn_cold_alloc = nullptr;
+    auto cleanup_prefill_graphs = [&]() {
+        step_graph_destroy(prefill_sg);
+        if (ffn_hot_alloc) {
+            ggml_gallocr_free(ffn_hot_alloc);
+            ffn_hot_alloc = nullptr;
+        }
+        if (ffn_cold_alloc) {
+            ggml_gallocr_free(ffn_cold_alloc);
+            ffn_cold_alloc = nullptr;
+        }
+        for (auto & layer : target_weights().moe_hybrid->layers) {
+            layer.hot_batched_graph.free();
+            layer.shared_batched_graph.free();
+        }
+    };
 
     for (int il = 0; il < n_layer; ++il) {
         auto & storage = target_weights().moe_hybrid->layers[(size_t)il];
@@ -894,6 +914,12 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
             pipe_state_ ? pipe_state_->expert_runtime.layer_ptr((size_t)il) : nullptr;
 
         for (int chunk_start = 0; chunk_start < prompt_len; chunk_start += prefill_chunk) {
+            if (out_io.is_cancelled()) {
+                cleanup_prefill_graphs();
+                cleanup_graphs();
+                result.succeed();
+                return result;
+            }
             const int chunk_len = std::min(prefill_chunk, prompt_len - chunk_start);
             const auto t0 = HybridClock::now();
 
@@ -1107,12 +1133,11 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
         storage.hot_batched_graph.free();
         storage.shared_batched_graph.free();
     }
-    step_graph_destroy(prefill_sg);
-    if (ffn_hot_alloc) ggml_gallocr_free(ffn_hot_alloc);
-    if (ffn_cold_alloc) ggml_gallocr_free(ffn_cold_alloc);
-    for (auto & layer : target_weights().moe_hybrid->layers) {
-        layer.hot_batched_graph.free();
-        layer.shared_batched_graph.free();
+    cleanup_prefill_graphs();
+    if (out_io.is_cancelled()) {
+        cleanup_graphs();
+        result.succeed();
+        return result;
     }
 
     // Copy last token's output to act_cur for decode
@@ -1325,7 +1350,7 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
                         kvflash_history_.push_back(next_tok);
                         kvflash_maybe_reselect((int)result.tokens.size());
                     }
-                    if (out_io.cancelled) break;
+                    if (out_io.is_cancelled()) break;
                     if (is_eos_tok(next_tok, target_weights())) break;
                 }
                 if (hybrid_telemetry_) {
@@ -1523,6 +1548,10 @@ GenerateResult Qwen35MoeBackend::restore_and_generate_impl(int slot,
     if (prompt_len > snap_pos) {
         auto t_prefill_start = std::chrono::steady_clock::now();
         for (int i = snap_pos; i < prompt_len; ++i) {
+            if (out_io.is_cancelled()) {
+                result.succeed();
+                return result;
+            }
             int32_t argmax = -1;
             if (!hybrid_forward_one_token(req.prompt[(size_t)i], committed,
                                           act_cur, argmax)) {
@@ -1535,6 +1564,10 @@ GenerateResult Qwen35MoeBackend::restore_and_generate_impl(int slot,
         }
         result.prefill_s = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t_prefill_start).count();
+    }
+    if (out_io.is_cancelled()) {
+        result.succeed();
+        return result;
     }
 
     if (kvflash_active()) {
@@ -2147,7 +2180,7 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
             out_tokens.push_back(replay_tok[i]);
             io.emit(replay_tok[i]);
             emitted++;
-            if (io.cancelled) break;
+            if (io.is_cancelled()) break;
             if (is_eos_tok(replay_tok[i], target_weights())) { hit_eos = true; break; }
         }
         committed += emitted;
@@ -2163,7 +2196,7 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
         n_accept_sum += std::min(accept_n, emitted);
         n_draft_steps++;
         const int fallback_steps = hybrid_spec_min_steps_before_ar();
-        if (!io.cancelled && !hit_eos && fallback_steps > 0 &&
+        if (!io.is_cancelled() && !hit_eos && fallback_steps > 0 &&
             n_draft_steps >= fallback_steps && n_generated < n_gen) {
             const int total_draft_pos_so_far = std::max(1, n_draft_steps * q_len);
             const float accept_rate_value =
@@ -2183,7 +2216,7 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
                 return ok;
             }
         }
-        if (io.cancelled) break;
+        if (io.is_cancelled()) break;
         if (hit_eos) break;
     }
 

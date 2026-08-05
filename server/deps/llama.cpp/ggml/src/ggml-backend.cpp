@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <chrono>
 #include <vector>
 
 #ifdef __APPLE__
@@ -819,6 +820,11 @@ struct ggml_backend_sched_deferred_peer_copy {
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
+    // True only after every backend stream has been synchronized and before
+    // another graph is submitted. In that state scheduler copy destinations
+    // are already reusable, so queueing the same generation event before
+    // every split is redundant (and particularly expensive across HIP/CUDA).
+    bool backends_synchronized;
 
     int n_backends;
 
@@ -876,6 +882,27 @@ struct ggml_backend_sched {
     int deferred_peer_copies_capacity;
     bool split_deferred_peer_copies;
     bool batch_split_copies;
+    ggml_backend_buffer_t batch_staging_buffers[GGML_SCHED_MAX_BACKENDS];
+    uint8_t * batch_staging_bases[GGML_SCHED_MAX_BACKENDS];
+    size_t batch_staging_sizes[GGML_SCHED_MAX_BACKENDS];
+    bool profile_requested;
+    int profile_min_splits;
+
+    struct {
+        bool active;
+        uint64_t loop_us;
+        uint64_t destination_wait_us;
+        uint64_t d2h_submit_us;
+        uint64_t host_relay_us;
+        uint64_t h2d_submit_us;
+        uint64_t compute_submit_us;
+        uint64_t staged_bytes;
+        int staged_copies;
+        uint64_t source_wait_us[GGML_SCHED_MAX_BACKENDS];
+        uint64_t final_wait_us[GGML_SCHED_MAX_BACKENDS];
+        int source_waits[GGML_SCHED_MAX_BACKENDS];
+        int split_counts[GGML_SCHED_MAX_BACKENDS];
+    } profile;
 
     int debug;
 
@@ -1748,13 +1775,557 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+struct ggml_backend_sched_tensor_payload_layout {
+    bool contiguous;
+    size_t run_bytes;
+    size_t runs_dim0;
+    size_t ne1;
+    size_t ne2;
+    size_t ne3;
+    size_t bytes;
+};
+
+static bool ggml_backend_sched_checked_mul(
+        size_t first, size_t second, size_t & result) {
+    if (first != 0 && second > SIZE_MAX / first) {
+        return false;
+    }
+    result = first * second;
+    return true;
+}
+
+// Describe the logical payload independently of any padding or stride gaps.
+// Contiguous tensors retain the one-copy fast path. Strided and permuted
+// tensors are transferred as packed runs and restored at the same logical
+// coordinates in the destination tensor.
+static bool ggml_backend_sched_make_tensor_payload_layout(
+        const struct ggml_tensor * tensor,
+        ggml_backend_sched_tensor_payload_layout & layout) {
+    layout = {};
+    if (!tensor) {
+        return false;
+    }
+    const size_t bytes = ggml_nbytes(tensor);
+    if (bytes == 0) {
+        layout.contiguous = true;
+        return true;
+    }
+    if (ggml_is_contiguous(tensor)) {
+        layout.contiguous = true;
+        layout.run_bytes = bytes;
+        layout.runs_dim0 = 1;
+        layout.ne1 = layout.ne2 = layout.ne3 = 1;
+        layout.bytes = bytes;
+        return true;
+    }
+
+    const size_t type_size = ggml_type_size(tensor->type);
+    const int64_t block_size = ggml_blck_size(tensor->type);
+    if (type_size == 0 || block_size <= 0 || tensor->ne[0] <= 0 ||
+        tensor->ne[0] % block_size != 0) {
+        return false;
+    }
+    layout.contiguous = false;
+    if (tensor->nb[0] == type_size) {
+        layout.run_bytes = ggml_row_size(tensor->type, tensor->ne[0]);
+        layout.runs_dim0 = 1;
+    } else {
+        // A permuted tensor is not contiguous even within dimension zero.
+        // Copy one storage block at a time while retaining its logical order.
+        layout.run_bytes = type_size;
+        layout.runs_dim0 = (size_t) (tensor->ne[0] / block_size);
+    }
+    layout.ne1 = (size_t) tensor->ne[1];
+    layout.ne2 = (size_t) tensor->ne[2];
+    layout.ne3 = (size_t) tensor->ne[3];
+
+    size_t runs = layout.runs_dim0;
+    if (!ggml_backend_sched_checked_mul(runs, layout.ne1, runs) ||
+        !ggml_backend_sched_checked_mul(runs, layout.ne2, runs) ||
+        !ggml_backend_sched_checked_mul(runs, layout.ne3, runs) ||
+        !ggml_backend_sched_checked_mul(runs, layout.run_bytes, layout.bytes)) {
+        return false;
+    }
+    return true;
+}
+
+static bool ggml_backend_sched_reserve_staging(
+        size_t & cursor, size_t bytes, size_t * offset = nullptr) {
+    constexpr size_t staging_alignment = 64;
+    if (cursor > SIZE_MAX - (staging_alignment - 1)) {
+        return false;
+    }
+    cursor = (cursor + staging_alignment - 1) &
+             ~(staging_alignment - 1);
+    if (bytes > SIZE_MAX - cursor) {
+        return false;
+    }
+    if (offset) {
+        *offset = cursor;
+    }
+    cursor += bytes;
+    return true;
+}
+
+// The fast staging path is reserved for unlike non-host runtimes. Native
+// peers retain their backend copy implementation, while host-backed tensors
+// use the established direct fallback without allocating redundant arenas.
+static bool ggml_backend_sched_batch_staging_candidate(
+        ggml_backend_sched_t sched,
+        int source_backend_id,
+        int destination_backend_id,
+        const struct ggml_tensor * source) {
+    if (!sched || !source || source_backend_id < 0 ||
+        destination_backend_id < 0 ||
+        source_backend_id >= sched->n_backends ||
+        destination_backend_id >= sched->n_backends ||
+        source_backend_id == destination_backend_id) {
+        return false;
+    }
+    ggml_backend_t source_backend = sched->backends[source_backend_id];
+    ggml_backend_t destination_backend =
+        sched->backends[destination_backend_id];
+    if (!source_backend->iface.get_tensor_async ||
+        !destination_backend->iface.set_tensor_async ||
+        ggml_guid_matches(ggml_backend_guid(source_backend),
+                          ggml_backend_guid(destination_backend))) {
+        return false;
+    }
+    ggml_backend_buffer_t source_buffer = source->view_src
+        ? source->view_src->buffer : source->buffer;
+    const bool source_is_host = source_buffer
+        ? ggml_backend_buffer_is_host(source_buffer)
+        : ggml_backend_buft_is_host(sched->bufts[source_backend_id]);
+    if (source_is_host) {
+        return false;
+    }
+    ggml_backend_dev_t destination_device =
+        ggml_backend_get_device(destination_backend);
+    return destination_device &&
+        ggml_backend_dev_type(destination_device) !=
+            GGML_BACKEND_DEVICE_TYPE_CPU;
+}
+
+static bool ggml_backend_sched_prepare_batch_staging(
+        ggml_backend_sched_t sched) {
+    if (!sched->batch_split_copies) {
+        return true;
+    }
+
+    size_t required[GGML_SCHED_MAX_BACKENDS] = {};
+    for (int split_id = 0; split_id < sched->n_splits; ++split_id) {
+        const struct ggml_backend_sched_split & split =
+            sched->splits[split_id];
+        for (int input_id = 0; input_id < split.n_inputs; ++input_id) {
+            struct ggml_tensor * input = split.inputs[input_id];
+            if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+                continue;
+            }
+            ggml_backend_t source_backend =
+                ggml_backend_sched_get_tensor_backend(sched, input);
+            const int source_backend_id =
+                ggml_backend_sched_backend_id(sched, source_backend);
+            if (!ggml_backend_sched_batch_staging_candidate(
+                    sched, source_backend_id, split.backend_id, input)) {
+                continue;
+            }
+            ggml_backend_sched_tensor_payload_layout layout;
+            if (!ggml_backend_sched_make_tensor_payload_layout(input, layout)) {
+                // Unsupported exotic layouts retain the established blocking
+                // tensor-copy fallback instead of making graph allocation fail.
+                continue;
+            }
+            if (!ggml_backend_sched_reserve_staging(
+                    required[source_backend_id], layout.bytes) ||
+                !ggml_backend_sched_reserve_staging(
+                    required[split.backend_id], layout.bytes)) {
+                return false;
+            }
+        }
+    }
+
+    ggml_backend_buffer_t new_buffers[GGML_SCHED_MAX_BACKENDS] = {};
+    uint8_t * new_bases[GGML_SCHED_MAX_BACKENDS] = {};
+    bool replace_any = false;
+    for (int i = 0; i < sched->n_backends; ++i) {
+        if (required[i] == 0 ||
+            (sched->batch_staging_bases[i] &&
+             required[i] <= sched->batch_staging_sizes[i])) {
+            continue;
+        }
+        replace_any = true;
+        ggml_backend_dev_t device = ggml_backend_get_device(sched->backends[i]);
+        ggml_backend_buffer_type_t host_buft = device
+            ? ggml_backend_dev_host_buffer_type(device) : nullptr;
+        if (host_buft) {
+            new_buffers[i] = ggml_backend_buft_alloc_buffer(
+                host_buft, required[i]);
+            if (new_buffers[i]) {
+                new_bases[i] = static_cast<uint8_t *>(
+                    ggml_backend_buffer_get_base(new_buffers[i]));
+            }
+        }
+        if (!new_bases[i]) {
+            if (new_buffers[i]) {
+                ggml_backend_buffer_free(new_buffers[i]);
+                new_buffers[i] = nullptr;
+            }
+            new_bases[i] = static_cast<uint8_t *>(malloc(required[i]));
+        }
+        if (!new_bases[i]) {
+            for (int j = 0; j < sched->n_backends; ++j) {
+                if (new_buffers[j]) {
+                    ggml_backend_buffer_free(new_buffers[j]);
+                } else {
+                    free(new_bases[j]);
+                }
+            }
+            return false;
+        }
+    }
+    if (!replace_any) {
+        return true;
+    }
+
+    // A graph may be reallocated after an earlier execution. Quiesce every
+    // runtime before releasing host pages that an asynchronous H2D transfer
+    // could still reference.
+    for (int i = 0; i < sched->n_backends; ++i) {
+        ggml_backend_synchronize(sched->backends[i]);
+    }
+    sched->backends_synchronized = true;
+    for (int i = 0; i < sched->n_backends; ++i) {
+        if (!new_bases[i]) {
+            continue;
+        }
+        if (sched->batch_staging_buffers[i]) {
+            ggml_backend_buffer_free(sched->batch_staging_buffers[i]);
+        } else {
+            free(sched->batch_staging_bases[i]);
+        }
+        sched->batch_staging_buffers[i] = new_buffers[i];
+        sched->batch_staging_bases[i] = new_bases[i];
+        sched->batch_staging_sizes[i] = required[i];
+        GGML_LOG_DEBUG(
+            "%s: backend=%s size=%zu memory=%s\n", __func__,
+            ggml_backend_name(sched->backends[i]), required[i],
+            sched->batch_staging_buffers[i] ? "pinned" : "pageable");
+    }
+    return true;
+}
+
+static void ggml_backend_sched_free_batch_staging(
+        ggml_backend_sched_t sched) {
+    if (!sched) {
+        return;
+    }
+    for (int i = 0; i < sched->n_backends; ++i) {
+        if (sched->batch_staging_buffers[i]) {
+            ggml_backend_buffer_free(sched->batch_staging_buffers[i]);
+        } else {
+            free(sched->batch_staging_bases[i]);
+        }
+        sched->batch_staging_buffers[i] = nullptr;
+        sched->batch_staging_bases[i] = nullptr;
+        sched->batch_staging_sizes[i] = 0;
+    }
+}
+
+using ggml_backend_sched_profile_clock = std::chrono::steady_clock;
+
+static uint64_t ggml_backend_sched_elapsed_us(
+        ggml_backend_sched_profile_clock::time_point start,
+        ggml_backend_sched_profile_clock::time_point end) {
+    return (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+        end - start).count();
+}
+
+struct ggml_backend_sched_staged_copy {
+    ggml_backend_t source_backend;
+    int source_backend_id;
+    struct ggml_tensor * destination;
+    ggml_backend_sched_tensor_payload_layout layout;
+    size_t source_offset;
+    size_t destination_offset;
+};
+
+template <typename CopyRun>
+static void ggml_backend_sched_for_each_payload_run(
+        const struct ggml_tensor * tensor,
+        const ggml_backend_sched_tensor_payload_layout & layout,
+        CopyRun && copy_run) {
+    if (layout.bytes == 0) {
+        return;
+    }
+    if (layout.contiguous) {
+        copy_run(/*tensor_offset=*/0, /*packed_offset=*/0, layout.bytes);
+        return;
+    }
+
+    const size_t tensor_span = ggml_nbytes(tensor);
+    size_t packed_offset = 0;
+    for (size_t i3 = 0; i3 < layout.ne3; ++i3) {
+        for (size_t i2 = 0; i2 < layout.ne2; ++i2) {
+            for (size_t i1 = 0; i1 < layout.ne1; ++i1) {
+                for (size_t i0 = 0; i0 < layout.runs_dim0; ++i0) {
+                    const size_t tensor_offset =
+                        i0 * tensor->nb[0] + i1 * tensor->nb[1] +
+                        i2 * tensor->nb[2] + i3 * tensor->nb[3];
+                    GGML_ASSERT(tensor_offset <= tensor_span &&
+                                layout.run_bytes <= tensor_span - tensor_offset);
+                    copy_run(tensor_offset, packed_offset, layout.run_bytes);
+                    packed_offset += layout.run_bytes;
+                }
+            }
+        }
+    }
+    GGML_ASSERT(packed_offset == layout.bytes);
+}
+
+static void ggml_backend_sched_get_payload_async(
+        ggml_backend_t backend,
+        const struct ggml_tensor * tensor,
+        uint8_t * packed,
+        const ggml_backend_sched_tensor_payload_layout & layout) {
+    GGML_ASSERT(backend && backend->iface.get_tensor_async &&
+                tensor && tensor->data && packed);
+    ggml_backend_sched_for_each_payload_run(
+        tensor, layout,
+        [&](size_t tensor_offset, size_t packed_offset, size_t bytes) {
+            backend->iface.get_tensor_async(
+                backend, tensor, packed + packed_offset,
+                tensor_offset, bytes);
+        });
+}
+
+static void ggml_backend_sched_set_payload_async(
+        ggml_backend_t backend,
+        struct ggml_tensor * tensor,
+        const uint8_t * packed,
+        const ggml_backend_sched_tensor_payload_layout & layout) {
+    GGML_ASSERT(backend && backend->iface.set_tensor_async &&
+                tensor && tensor->data && packed);
+    ggml_backend_sched_for_each_payload_run(
+        tensor, layout,
+        [&](size_t tensor_offset, size_t packed_offset, size_t bytes) {
+            backend->iface.set_tensor_async(
+                backend, tensor, packed + packed_offset,
+                tensor_offset, bytes);
+        });
+}
+
+// Owns copy synchronization and host-staging state for one scheduler split.
+// Keeping this policy separate from graph submission makes the execution loop
+// readable and gives every early/fallback path one synchronization contract.
+struct ggml_backend_sched_split_copy_state {
+    ggml_backend_sched_t sched;
+    int destination_backend_id;
+    ggml_backend_t destination_backend;
+    bool staging_arena_reusable;
+    bool destination_generation_ready;
+    size_t * staging_cursors;
+    bool destination_host_ready = false;
+    ggml_backend_t synchronized_sources[GGML_SCHED_MAX_BACKENDS] = {};
+    int n_synchronized_sources = 0;
+    ggml_backend_sched_staged_copy staged[GGML_SCHED_MAX_SPLIT_INPUTS] = {};
+    int n_staged = 0;
+
+    bool profiling() const {
+        return sched->profile.active;
+    }
+
+    void mark_destination_ready() {
+        destination_generation_ready = true;
+        destination_host_ready = true;
+    }
+
+    void wait_for_destination_generation() {
+        if (sched->batch_split_copies && destination_generation_ready) {
+            return;
+        }
+        const auto start = profiling()
+            ? ggml_backend_sched_profile_clock::now()
+            : ggml_backend_sched_profile_clock::time_point{};
+        if (sched->events[destination_backend_id][sched->cur_copy]) {
+            ggml_backend_event_wait(
+                destination_backend,
+                sched->events[destination_backend_id][sched->cur_copy]);
+        } else {
+            ggml_backend_synchronize(destination_backend);
+            destination_host_ready = true;
+        }
+        if (profiling()) {
+            sched->profile.destination_wait_us +=
+                ggml_backend_sched_elapsed_us(
+                    start, ggml_backend_sched_profile_clock::now());
+        }
+        destination_generation_ready = true;
+    }
+
+    void synchronize_source(ggml_backend_t source_backend) {
+        const auto end = synchronized_sources + n_synchronized_sources;
+        if (sched->batch_split_copies &&
+            std::find(synchronized_sources, end, source_backend) != end) {
+            return;
+        }
+        const auto start = profiling()
+            ? ggml_backend_sched_profile_clock::now()
+            : ggml_backend_sched_profile_clock::time_point{};
+        ggml_backend_synchronize(source_backend);
+        if (profiling()) {
+            for (int backend_id = 0; backend_id < sched->n_backends;
+                 ++backend_id) {
+                if (sched->backends[backend_id] == source_backend) {
+                    sched->profile.source_wait_us[backend_id] +=
+                        ggml_backend_sched_elapsed_us(
+                            start, ggml_backend_sched_profile_clock::now());
+                    sched->profile.source_waits[backend_id]++;
+                    break;
+                }
+            }
+        }
+        if (sched->batch_split_copies) {
+            GGML_ASSERT(n_synchronized_sources < GGML_SCHED_MAX_BACKENDS);
+            synchronized_sources[n_synchronized_sources++] = source_backend;
+        }
+    }
+
+    bool can_stage(int source_backend_id,
+                   const struct ggml_tensor * source) const {
+        ggml_backend_sched_tensor_payload_layout layout;
+        return sched->batch_split_copies &&
+               staging_arena_reusable &&
+               ggml_backend_sched_batch_staging_candidate(
+                   sched, source_backend_id,
+                   destination_backend_id, source) &&
+               ggml_backend_sched_make_tensor_payload_layout(source, layout) &&
+               layout.bytes > 0 &&
+               sched->batch_staging_bases[source_backend_id] &&
+               sched->batch_staging_bases[destination_backend_id];
+    }
+
+    void stage(ggml_backend_t source_backend,
+               int source_backend_id,
+               const struct ggml_tensor * source,
+               struct ggml_tensor * destination) {
+        GGML_ASSERT(ggml_are_same_layout(source, destination));
+        ggml_backend_sched_tensor_payload_layout layout;
+        GGML_ASSERT(ggml_backend_sched_make_tensor_payload_layout(
+            source, layout));
+        size_t source_offset = 0;
+        size_t destination_offset = 0;
+        GGML_ASSERT(ggml_backend_sched_reserve_staging(
+            staging_cursors[source_backend_id],
+            layout.bytes, &source_offset));
+        GGML_ASSERT(ggml_backend_sched_reserve_staging(
+            staging_cursors[destination_backend_id],
+            layout.bytes, &destination_offset));
+        GGML_ASSERT(staging_cursors[source_backend_id] <=
+                    sched->batch_staging_sizes[source_backend_id]);
+        GGML_ASSERT(staging_cursors[destination_backend_id] <=
+                    sched->batch_staging_sizes[destination_backend_id]);
+
+        const auto start = profiling()
+            ? ggml_backend_sched_profile_clock::now()
+            : ggml_backend_sched_profile_clock::time_point{};
+        ggml_backend_sched_get_payload_async(
+            source_backend, source,
+            sched->batch_staging_bases[source_backend_id] + source_offset,
+            layout);
+        if (profiling()) {
+            sched->profile.d2h_submit_us += ggml_backend_sched_elapsed_us(
+                start, ggml_backend_sched_profile_clock::now());
+            sched->profile.staged_bytes += layout.bytes;
+            sched->profile.staged_copies++;
+        }
+
+        GGML_ASSERT(n_staged < GGML_SCHED_MAX_SPLIT_INPUTS);
+        staged[n_staged++] = {
+            source_backend, source_backend_id, destination,
+            layout, source_offset, destination_offset};
+    }
+
+    void prepare_blocking_copy() {
+        if (sched->events[destination_backend_id][sched->cur_copy]) {
+            ggml_backend_event_synchronize(
+                sched->events[destination_backend_id][sched->cur_copy]);
+            destination_host_ready = true;
+        } else if (!destination_host_ready) {
+            ggml_backend_synchronize(destination_backend);
+            destination_host_ready = true;
+        }
+    }
+
+    void flush_staged() {
+        for (int copy_id = 0; copy_id < n_staged; ++copy_id) {
+            synchronize_source(staged[copy_id].source_backend);
+        }
+        for (int copy_id = 0; copy_id < n_staged; ++copy_id) {
+            const ggml_backend_sched_staged_copy & copy = staged[copy_id];
+            auto start = profiling()
+                ? ggml_backend_sched_profile_clock::now()
+                : ggml_backend_sched_profile_clock::time_point{};
+            memcpy(
+                sched->batch_staging_bases[destination_backend_id] +
+                    copy.destination_offset,
+                sched->batch_staging_bases[copy.source_backend_id] +
+                    copy.source_offset,
+                copy.layout.bytes);
+            if (profiling()) {
+                sched->profile.host_relay_us +=
+                    ggml_backend_sched_elapsed_us(
+                        start, ggml_backend_sched_profile_clock::now());
+            }
+
+            start = profiling()
+                ? ggml_backend_sched_profile_clock::now()
+                : ggml_backend_sched_profile_clock::time_point{};
+            ggml_backend_sched_set_payload_async(
+                destination_backend, copy.destination,
+                sched->batch_staging_bases[destination_backend_id] +
+                    copy.destination_offset,
+                copy.layout);
+            if (profiling()) {
+                sched->profile.h2d_submit_us +=
+                    ggml_backend_sched_elapsed_us(
+                        start, ggml_backend_sched_profile_clock::now());
+            }
+        }
+    }
+};
+
+static ggml_backend_sched_profile_clock::time_point
+ggml_backend_sched_begin_profile(ggml_backend_sched_t sched) {
+    const bool enabled = sched->profile_requested &&
+        sched->n_splits >= sched->profile_min_splits;
+    sched->profile = {};
+    sched->profile.active = enabled;
+    if (!enabled) {
+        return {};
+    }
+    for (int split_id = 0; split_id < sched->n_splits; ++split_id) {
+        const int backend_id = sched->splits[split_id].backend_id;
+        if (backend_id >= 0 && backend_id < sched->n_backends) {
+            sched->profile.split_counts[backend_id]++;
+        }
+    }
+    return ggml_backend_sched_profile_clock::now();
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
+    const auto profile_loop_start = ggml_backend_sched_begin_profile(sched);
+
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
+    size_t batch_staging_cursors[GGML_SCHED_MAX_BACKENDS] = {};
+    const bool copy_destinations_ready = sched->backends_synchronized;
+    // From this point onward an early return must remain conservative: a
+    // backend may have accepted work even if a later split fails.
+    sched->backends_synchronized = false;
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
@@ -1771,26 +2342,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
-        // All copied inputs for this split use the same destination backend
-        // and scheduler copy generation. Waiting for that generation once is
-        // sufficient before overwriting any of its input buffers. The legacy
-        // loop waited again before every tensor; without scheduler events each
-        // wait synchronizes the whole destination stream and serializes a
-        // multi-input peer handoff.
-        bool split_copy_generation_ready = false;
-        auto wait_for_split_copy_generation = [&]() {
-            if (sched->batch_split_copies && split_copy_generation_ready) {
-                return;
-            }
-            if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                ggml_backend_event_wait(
-                    split_backend,
-                    sched->events[split_backend_id][sched->cur_copy]);
-            } else {
-                ggml_backend_synchronize(split_backend);
-            }
-            split_copy_generation_ready = true;
-        };
+        ggml_backend_sched_split_copy_state copy_state{
+            sched, split_backend_id, split_backend,
+            copy_destinations_ready, copy_destinations_ready,
+            batch_staging_cursors};
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -1806,11 +2361,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 } else {
                     ggml_backend_synchronize(split_backend);
                 }
-                split_copy_generation_ready = true;
+                copy_state.mark_destination_ready();
                 ggml_backend_tensor_copy(input, input_cpy);
             } else {
                 // wait for the split backend to finish using the input before overwriting it
-                wait_for_split_copy_generation();
+                copy_state.wait_for_destination_generation();
 
                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
                 ggml_tensor * node = split->graph.nodes[0];
@@ -1901,20 +2456,51 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
                     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
-                        ggml_backend_synchronize(input_backend);
-                        if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                            ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
-                        } else {
-                            ggml_backend_synchronize(split_backend);
+                        const int input_backend_id =
+                            ggml_backend_sched_backend_id(sched, input_backend);
+                        if (copy_state.can_stage(input_backend_id, input)) {
+                            copy_state.stage(
+                                input_backend, input_backend_id,
+                                input, input_cpy);
+                            continue;
                         }
+
+                        // All non-input copies are gathered before this split
+                        // launches. Once a source backend is synchronized, its
+                        // other inputs for the same split are ready as well.
+                        // Cross-runtime MoE joins commonly carry activation,
+                        // route-ID, and route-weight tensors together; waiting
+                        // on the same source for each tensor serialized dozens
+                        // of redundant stream round trips per verifier step.
+                        copy_state.synchronize_source(input_backend);
+
+                        // With one scheduler copy there is no event object and
+                        // wait_for_destination_generation() already established
+                        // host-visible destination quiescence. Parallel-copy
+                        // schedulers retain the explicit event synchronization
+                        // before a blocking host-staged overwrite.
+                        copy_state.prepare_blocking_copy();
                         ggml_backend_tensor_copy(input, input_cpy);
                     }
                 }
             }
         }
 
+        // Queue D2H for every source, wait once per source, then relay and
+        // enqueue all H2D transfers immediately before the consumer graph.
+        copy_state.flush_staged();
+
         if (!sched->callback_eval) {
+            const auto submit_start = sched->profile.active
+                ? ggml_backend_sched_profile_clock::now()
+                : ggml_backend_sched_profile_clock::time_point{};
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            if (sched->profile.active) {
+                sched->profile.compute_submit_us +=
+                    ggml_backend_sched_elapsed_us(
+                        submit_start,
+                        ggml_backend_sched_profile_clock::now());
+            }
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }
@@ -1952,7 +2538,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
-        // Publish cold-owner completion before a later main-backend graph
+        // Publish producer completion before a later consumer-backend graph
         // reaches its in-graph event wait. Recording is asynchronous and does
         // not block the host from immediately enqueueing independent work.
         for (int i = 0; i < sched->n_deferred_peer_copies; ++i) {
@@ -1970,6 +2556,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
             }
         }
+    }
+
+    if (sched->profile.active) {
+        sched->profile.loop_us = ggml_backend_sched_elapsed_us(
+            profile_loop_start,
+            ggml_backend_sched_profile_clock::now());
     }
 
     return GGML_STATUS_SUCCESS;
@@ -1997,6 +2589,13 @@ ggml_backend_sched_t ggml_backend_sched_new(
 #endif
     const char * GGML_SCHED_DEBUG_REALLOC = getenv("GGML_SCHED_DEBUG_REALLOC");
     sched->debug_realloc = GGML_SCHED_DEBUG_REALLOC ? atoi(GGML_SCHED_DEBUG_REALLOC) : sched->debug_realloc;
+
+    const char * profile_raw = getenv("GGML_SCHED_PROFILE");
+    const char * profile_min_raw = getenv("GGML_SCHED_PROFILE_MIN_SPLITS");
+    sched->profile_requested =
+        profile_raw && profile_raw[0] && strcmp(profile_raw, "0") != 0;
+    sched->profile_min_splits = profile_min_raw
+        ? std::max(1, atoi(profile_min_raw)) : 1;
 
     sched->n_backends = n_backends;
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
@@ -2048,6 +2647,13 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
     }
+    // graph_compute_async callers may tear down without an explicit wait.
+    // Quiesce every backend before releasing graph allocations, native events,
+    // or pinned staging pages still referenced by queued transfers.
+    for (int b = 0; b < sched->n_backends; ++b) {
+        ggml_backend_synchronize(sched->backends[b]);
+    }
+    ggml_backend_sched_free_batch_staging(sched);
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
@@ -2080,12 +2686,14 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     // reset explicitly discards that graph, so carrying either list into the
     // next allocation would dereference stale metadata (and leak the events).
     sched->n_late_cross_input_split_nodes = 0;
-    if (sched->n_deferred_peer_copies > 0) {
-        // A caller may reset after an asynchronous submission. Do not destroy
-        // producer events while either backend can still reference them.
+    if (!sched->backends_synchronized) {
+        // A caller may reset after an asynchronous submission. Graph
+        // allocations, deferred events, and host-staging pages all remain
+        // reachable by queued work until every scheduler backend is idle.
         for (int backend_id = 0; backend_id < sched->n_backends; ++backend_id) {
             ggml_backend_synchronize(sched->backends[backend_id]);
         }
+        sched->backends_synchronized = true;
     }
     for (int i = 0; i < sched->n_deferred_peer_copies; ++i) {
         ggml_backend_event_free(sched->deferred_peer_copies[i].event);
@@ -2143,6 +2751,10 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
     ggml_backend_sched_split_graph(sched, graph);
 
+    if (!ggml_backend_sched_prepare_batch_staging(sched)) {
+        return false;
+    }
+
     if (!ggml_backend_sched_alloc_splits(sched)) {
         return false;
     }
@@ -2170,12 +2782,6 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     return true;
 }
 
-enum ggml_status ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
-    enum ggml_status err = ggml_backend_sched_graph_compute_async(sched, graph);
-    ggml_backend_sched_synchronize(sched);
-    return err;
-}
-
 enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     GGML_ASSERT(sched);
     if (!sched->is_reset && !sched->is_alloc) {
@@ -2191,10 +2797,52 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
     return ggml_backend_sched_compute_splits(sched);
 }
 
+enum ggml_status ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    enum ggml_status err = ggml_backend_sched_graph_compute_async(sched, graph);
+    ggml_backend_sched_synchronize(sched);
+    return err;
+}
+
 void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
+    using profile_clock = std::chrono::steady_clock;
     for (int i = 0; i < sched->n_backends; i++) {
+        const profile_clock::time_point wait_start = sched->profile.active
+            ? profile_clock::now() : profile_clock::time_point{};
         ggml_backend_synchronize(sched->backends[i]);
+        if (sched->profile.active) {
+            sched->profile.final_wait_us[i] =
+                (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+                    profile_clock::now() - wait_start).count();
+        }
+    }
+    sched->backends_synchronized = true;
+    if (sched->profile.active) {
+        GGML_LOG_INFO(
+            "[ggml-sched-profile] splits=%d loop=%lluus dst_wait=%lluus "
+            "d2h_submit=%lluus host_relay=%lluus h2d_submit=%lluus "
+            "compute_submit=%lluus "
+            "staged_copies=%d staged_bytes=%llu\n",
+            sched->n_splits,
+            (unsigned long long) sched->profile.loop_us,
+            (unsigned long long) sched->profile.destination_wait_us,
+            (unsigned long long) sched->profile.d2h_submit_us,
+            (unsigned long long) sched->profile.host_relay_us,
+            (unsigned long long) sched->profile.h2d_submit_us,
+            (unsigned long long) sched->profile.compute_submit_us,
+            sched->profile.staged_copies,
+            (unsigned long long) sched->profile.staged_bytes);
+        for (int i = 0; i < sched->n_backends; ++i) {
+            GGML_LOG_INFO(
+                "[ggml-sched-profile] backend=%s splits=%d "
+                "source_waits=%d source_wait=%lluus final_wait=%lluus\n",
+                ggml_backend_name(sched->backends[i]),
+                sched->profile.split_counts[i],
+                sched->profile.source_waits[i],
+                (unsigned long long) sched->profile.source_wait_us[i],
+                (unsigned long long) sched->profile.final_wait_us[i]);
+        }
+        sched->profile.active = false;
     }
     if (!sched->is_alloc) {
         // if the graph is not already allocated, always use copy 0 after a synchronization

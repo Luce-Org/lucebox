@@ -25,14 +25,16 @@
 //
 // Memory at S=140K, B=1, H=16, Hk=8, D=128, hidden=1024, ff=3072:
 //   weights                                            ~1.5 GB
-//   28 × K_curr [D, Hk, S] bf16 + 28 × V_curr same   ~15.7 GB
-//   28 × Q_last [D, H, N] bf16                        ~1 KB
+//   reusable K_curr + V_curr [D, Hk, S] bf16          ~0.57 GB
+//   28 × K_norope [D, Hk, S] bf16 (score-all default) ~8.0 GB
+//   Q_buf + attn_out [D, H, S] bf16                   ~1.15 GB
 //   hidden_buf [hidden, S] f32                         0.57 GB
 //   pos / mask_tail                                    1 MB
 //   per-ubatch graph transients (chunk_s sized)        ~2-3 GB
-//   total                                              ~20 GB  (fits 24 GB)
+//   total including weights                           ~14-15 GB
 
 #include "qwen3_drafter_model.h"
+#include "qwen3_buffer_plan.h"
 #include "internal.h"
 #include "flashprefill.h"
 #include "../common/score_range.h"
@@ -228,6 +230,10 @@ bool forward_qwen3_drafter_model(
         set_last_error("forward_qwen3_drafter_model: weights not loaded");
         return false;
     }
+    if (w.n_layer <= 0) {
+        set_last_error("forward_qwen3_drafter_model: model has no layers");
+        return false;
+    }
     const int S        = (int)ids.size();
     const int H        = w.n_head;
     const int Hk       = w.n_head_kv;
@@ -268,9 +274,16 @@ bool forward_qwen3_drafter_model(
     const int n_score_layers = pre_range.count(); // K_norope/Q_norope sized to this, not n_layer
 
     PersBuf hidden_buf, pos_buf, mask_tail_buf, Q_buf, attn_out_buf;
-    std::vector<PersBuf> K_curr_v((size_t)w.n_layer);
-    std::vector<PersBuf> V_curr_v((size_t)w.n_layer);
-    std::vector<PersBuf> Q_last_v((size_t)w.n_layer);
+    // With NoPE tail scoring, only the current layer's RoPE K/V survive until
+    // FlashPrefill returns.  Reuse those large buffers instead of reserving a
+    // full-sequence K/V pair for every layer.  The legacy RoPE scoring path
+    // still retains per-layer K/Q-tail state because it consumes it after the
+    // forward loop.
+    const Qwen3DrafterBufferPlan buffer_plan =
+        qwen3_drafter_buffer_plan(nope_tail, w.n_layer);
+    std::vector<PersBuf> K_curr_v(buffer_plan.rope_k_buffers);
+    std::vector<PersBuf> V_curr_v(buffer_plan.value_buffers);
+    std::vector<PersBuf> Q_last_v(buffer_plan.rope_q_tail_buffers);
     // NoPE: allocate only for scored layers (avoids ~5.6 GB waste at 128K).
     std::vector<PersBuf> K_norope_v(nope_tail ? (size_t)n_score_layers : 0);
     std::vector<PersBuf> Q_norope_v(nope_tail ? (size_t)n_score_layers : 0);
@@ -304,11 +317,18 @@ bool forward_qwen3_drafter_model(
             cleanup_all();
             return false;
         }
+        if (!make_pers(w.backend, half_type, 3, d_kv, V_curr_v[0])) {
+            set_last_error("forward_qwen3: reusable V_curr alloc failed");
+            cleanup_all();
+            return false;
+        }
         for (int il = 0; il < w.n_layer; ++il) {
-            if (!make_pers(w.backend, half_type, 3, d_kv, K_curr_v[il]) ||
-                !make_pers(w.backend, half_type, 3, d_kv, V_curr_v[il]) ||
-                !make_pers(w.backend, GGML_TYPE_F32, 3, d_ql, Q_last_v[il])) {
-                set_last_error("forward_qwen3: K_curr/V_curr/Q_last alloc failed at layer " + std::to_string(il));
+            const size_t li = buffer_plan.layer_cache_index(il);
+            const bool need_layer_buffers = !nope_tail || il == 0;
+            if (need_layer_buffers &&
+                (!make_pers(w.backend, half_type, 3, d_kv, K_curr_v[li]) ||
+                 (!nope_tail && !make_pers(w.backend, GGML_TYPE_F32, 3, d_ql, Q_last_v[li])))) {
+                set_last_error("forward_qwen3: K_curr/Q_last alloc failed at layer " + std::to_string(il));
                 cleanup_all();
                 return false;
             }
@@ -398,6 +418,7 @@ bool forward_qwen3_drafter_model(
 
     for (int il = 0; il < fwd_layer_limit; ++il) {
         const auto & L = w.layers[il];
+        const size_t layer_cache_idx = buffer_plan.layer_cache_index(il);
         const bool debug_first_layer = (il == 0 && std::getenv("DFLASH_FP_DEBUG_LAYER0") != nullptr);
 
         // ── Graph A (chunked): norm + Q/K/V proj + RoPE + copy to persistent K_curr/V_curr/Q_buf ──
@@ -480,14 +501,14 @@ bool forward_qwen3_drafter_model(
             V = ggml_reshape_3d(gA, V, D, Hk, cl);
 
             const size_t q_esz  = ggml_element_size(Q_buf.t);
-            const size_t kv_esz = ggml_element_size(K_curr_v[il].t);
+            const size_t kv_esz = ggml_element_size(K_curr_v[layer_cache_idx].t);
             ggml_tensor * Q_dst = ggml_view_3d(gA, Q_buf.t, D, H, cl,
                                                q_esz * D, q_esz * D * H,
                                                (size_t)cs * q_esz * D * H);
-            ggml_tensor * K_dst = ggml_view_3d(gA, K_curr_v[il].t, D, Hk, cl,
+            ggml_tensor * K_dst = ggml_view_3d(gA, K_curr_v[layer_cache_idx].t, D, Hk, cl,
                                                kv_esz * D, kv_esz * D * Hk,
                                                (size_t)cs * kv_esz * D * Hk);
-            ggml_tensor * V_dst = ggml_view_3d(gA, V_curr_v[il].t, D, Hk, cl,
+            ggml_tensor * V_dst = ggml_view_3d(gA, V_curr_v[0].t, D, Hk, cl,
                                                kv_esz * D, kv_esz * D * Hk,
                                                (size_t)cs * kv_esz * D * Hk);
             ggml_build_forward_expand(gfA, ggml_cpy(gA, Q, Q_dst));
@@ -496,14 +517,14 @@ bool forward_qwen3_drafter_model(
 
             // Copy Q tail to Q_last_v[il] in the chunk that contains the tail.
             const int tail_lo = S - n_lookahead;
-            if (tail_lo >= cs && tail_lo + n_lookahead <= cs + cl) {
+            if (!nope_tail && tail_lo >= cs && tail_lo + n_lookahead <= cs + cl) {
                 int local_lo = tail_lo - cs;
                 ggml_tensor * Q_tail_local = ggml_view_3d(
                     gA, Q, D, H, n_lookahead,
                     Q->nb[1], Q->nb[2],
                     (size_t)local_lo * Q->nb[2]);
                 ggml_build_forward_expand(gfA,
-                    ggml_cpy(gA, Q_tail_local, Q_last_v[il].t));
+                    ggml_cpy(gA, Q_tail_local, Q_last_v[layer_cache_idx].t));
             }
 
             auto tA_setup1 = std::chrono::steady_clock::now();
@@ -537,8 +558,8 @@ bool forward_qwen3_drafter_model(
         int rc = flashprefill::flash_prefill_forward(
             w.backend,
             Q_buf.t->data,
-            K_curr_v[il].t->data,
-            V_curr_v[il].t->data,
+            K_curr_v[layer_cache_idx].t->data,
+            V_curr_v[0].t->data,
             attn_out_buf.t->data,
             1, S, H, Hk, D, scale,
             Q_buf.t->type,
@@ -762,6 +783,7 @@ bool forward_qwen3_drafter_model(
     auto t_score_start = std::chrono::steady_clock::now();
 
     for (int il = score_layer_start; il < score_layer_end; ++il) {
+        const size_t layer_cache_idx = buffer_plan.layer_cache_index(il);
         ggml_init_params ip{};
         ip.mem_size = ggml_tensor_overhead() * 32 + ggml_graph_overhead() + 16 * 1024;
         ip.no_alloc = true;
@@ -771,7 +793,7 @@ bool forward_qwen3_drafter_model(
         const int si = il - score_layer_start_pre;
         ggml_tensor * K_f32 = ggml_new_tensor_3d(gctx, GGML_TYPE_F32, D, Hk, S);
         ggml_tensor * K_cast = ggml_cpy(gctx,
-            nope_tail ? K_norope_v[si].t : K_curr_v[il].t, K_f32);
+            nope_tail ? K_norope_v[si].t : K_curr_v[layer_cache_idx].t, K_f32);
         ggml_tensor * K_perm = ggml_cont(gctx,
             ggml_permute(gctx, K_cast, 0, 2, 1, 3));
         ggml_tensor * K_score = K_perm;
@@ -784,7 +806,7 @@ bool forward_qwen3_drafter_model(
         }
         ggml_tensor * Q_tail_perm = ggml_cont(gctx,
             ggml_permute(gctx,
-                nope_tail ? Q_norope_v[si].t : Q_last_v[il].t,
+                nope_tail ? Q_norope_v[si].t : Q_last_v[layer_cache_idx].t,
                 0, 2, 1, 3));
         ggml_tensor * attn_score = ggml_mul_mat(gctx, K_score, Q_tail_perm);
         ggml_tensor * probs = ggml_soft_max_ext(gctx, attn_score, mask_tail_buf.t,

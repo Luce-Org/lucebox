@@ -14,23 +14,28 @@ namespace dflash::common {
 
 bool resolve_chat_markers(const Tokenizer & tok, const std::string & arch,
                           ChatMarkers & out) {
-    // DeepSeek V4 uses DSML. Unlike ChatML, messages are separated by role
-    // starts rather than paired start/end delimiters:
-    //   <BOS>{system}<User>{user}<Assistant>...<EOS><User>...
-    // Resolve this before tokenizer-based probes so the architecture cannot
-    // be mistaken for another family whose marker strings are tokenizable.
-    if (arch == "deepseek4") {
-        auto bos = tok.encode("<｜begin▁of▁sentence｜>");
-        auto user = tok.encode("<｜User｜>");
-        auto assistant = tok.encode("<｜Assistant｜>");
-        if (!bos.empty() && !user.empty() && !assistant.empty()) {
-            out.family = "deepseek4";
-            out.sys_role_prefix = bos;
-            out.next_role_starts = {user, assistant};
-            out.boundary_on_role_start = true;
-            return true;
-        }
-        return false;
+    // DeepSeek V4 uses DSML with full-width punctuation in its control
+    // tokens:
+    //   <BOS>{system}<User>{user}<Assistant>{reply}<EOS><User>...
+    // Require each marker to encode as its exact vocabulary token so an
+    // unrelated BPE tokenizer cannot be misclassified merely because it can
+    // spell the marker text.
+    const auto exact_control_token = [&tok](const char * marker) -> int32_t {
+        const int32_t id = tok.token_to_id(marker);
+        if (id < 0) return -1;
+        const auto encoded = tok.encode(marker);
+        return encoded.size() == 1 && encoded[0] == id ? id : -1;
+    };
+    const int32_t ds_bos = exact_control_token("<｜begin▁of▁sentence｜>");
+    const int32_t ds_eos = exact_control_token("<｜end▁of▁sentence｜>");
+    const int32_t ds_user = exact_control_token("<｜User｜>");
+    const int32_t ds_assistant = exact_control_token("<｜Assistant｜>");
+    if (ds_bos >= 0 && ds_eos >= 0 && ds_user >= 0 && ds_assistant >= 0) {
+        out.family = "deepseek";
+        out.sys_role_prefix = {ds_bos};
+        out.end_msg_seqs = {{ds_eos}};
+        out.next_role_starts = {{ds_user}, {ds_assistant}};
+        return true;
     }
 
     // Try Qwen family: <|im_end|> and <|im_start|> should be single tokens.

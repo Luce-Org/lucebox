@@ -20,7 +20,7 @@ AUTH_JSON="$LOG_DIR/openwebui-auth.json"
 AUTH_OUT="$LOG_DIR/openwebui-auth.out"
 WEBUI_ADMIN_EMAIL_VALUE="${WEBUI_ADMIN_EMAIL_VALUE:-admin@localhost}"
 WEBUI_ADMIN_PASSWORD_VALUE="${WEBUI_ADMIN_PASSWORD_VALUE:-admin}"
-CURL_MAX_TIME="${CURL_MAX_TIME:-300}"
+CURL_MAX_TIME="${CURL_MAX_TIME:-3600}"
 mkdir -p "$DATA_DIR"
 
 start_lucebox_server

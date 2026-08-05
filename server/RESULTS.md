@@ -662,6 +662,140 @@ usage at 117K, that trade isn't worth taking. Users on 4090 or 3090
 further than Q8_0 in either direction set the K/V types explicitly via
 `DFLASH27B_KV_K=<type> DFLASH27B_KV_V=<type>`.
 
+## RTX 4090 (Ada, sm_89, 24 GB) — CachyOS bare metal (community)
+
+Single NVIDIA GeForce RTX 4090 24 GB on bare-metal CachyOS Linux, measured
+2026-08-02. CPU: Intel Core i9-9900KF (8 cores / 16 threads); RAM: 64 GiB.
+NVIDIA driver 610.43.03, CUDA 13.3, 360 W GPU power limit. KDE Plasma/Wayland
+remained active; the pre-run environment capture showed 753 MiB VRAM in use and
+1% GPU utilization.
+
+Repository and build:
+
+- Lucebox commit: `bc881af248de9c03336bb9afa54735d1af5f273f`
+- Block-Sparse-Attention commit: `49d6c39e4dc0303442cda3bb758b3925d4399c49`
+- CMake 4.4.2, NVCC 13.3.73
+- CUDA host compiler: GCC 15.3.0 (system GCC 16.1.1 at environment capture)
+- Build: `cmake -S server -B server/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=89 -DDFLASH27B_ENABLE_BSA=ON -DGGML_CUDA_CUB_3DOT2=ON`
+- CCCL 3.2.0 compatibility path enabled
+
+Models:
+
+- Target: `unsloth/Qwen3.6-27B-GGUF` — `Qwen3.6-27B-Q4_K_M.gguf`
+  - SHA-256: `5ed60d0af4650a854b1755bd392f9aef4872643dc25a254bc68043fa638392a0`
+- Draft: `Lucebox/Qwen3.6-27B-DFlash-GGUF` — `dflash-draft-3.6-q4_k_m.gguf`
+  - SHA-256: `e2500e90165a0f8e7b52c9882c29ed1fa391c60b300ff11b817bf10e31fa092e`
+- Tokenizer: `Qwen/Qwen3.6-27B`
+
+Protocol:
+
+- Concurrency = 1, greedy decoding
+- Qwen chat template with thinking disabled (`--no-thinking`)
+- 10 prompts per dataset, shuffled with seed 42
+- `n_gen=256` for HumanEval, `1024` for GSM8K, `2048` for Math500
+- DDTree budget 22, fast rollback
+- `DFLASH_GPU_DRAFT_TOPK=1`
+- `DFLASH_GPU_VERIFY_ARGMAX=1`
+- Command: `DFLASH_N_SAMPLE=10 uv run python -m server.scripts.bench_llm --no-thinking --budget 22`
+
+### RTX 4090 CachyOS headline
+
+Run 1 is the canonical result; run 2 below repeats the identical command.
+
+| Task      | AR tok/s | DFlash tok/s | AL   | Speedup | Score |
+|-----------|:--------:|:------------:|:----:|:-------:|:-----:|
+| HumanEval | 40.49 | **235.01** | 9.66 | **5.80×** | — |
+| GSM8K     | 40.37 | **169.72** | 6.92 | **4.20×** | 5/10 |
+| Math500   | 40.11 | **195.37** | 8.17 | **4.87×** | 9/10 |
+
+The GSM8K and Math500 scores are for the fixed 10-prompt samples used by the
+throughput harness, not full-dataset accuracy results.
+
+### Repeatability
+
+| Task      | Run 1 AR | Run 1 DFlash | Run 2 AR | Run 2 DFlash | DFlash delta |
+|-----------|:--------:|:------------:|:--------:|:------------:|:------------:|
+| HumanEval | 40.49 | 235.01 | 40.50 | 235.12 | +0.05% |
+| GSM8K     | 40.37 | 169.72 | 40.35 | 169.70 | -0.01% |
+| Math500   | 40.11 | 195.37 | 40.06 | 195.62 | +0.13% |
+
+DFlash throughput varied by at most 0.13% between the two complete runs.
+
+### DDTree budget sweep
+
+HumanEval, five prompts per budget, `n_gen=256`, same target and Q4_K_M draft.
+The final 10-prompt headline is not numerically comparable to these five-prompt
+means because it contains five additional shuffled prompts.
+
+| Budget | AR tok/s | DFlash tok/s | Mean AL | Speedup |
+|:------:|:--------:|:------------:|:-------:|:-------:|
+| **22** | 40.44 | **253.32** | **10.43** | **6.26×** |
+| 26 | 40.56 | 236.03 | 9.97 | 5.82× |
+| 28 | 40.50 | 235.16 | 9.99 | 5.81× |
+| 30 | 40.48 | 234.32 | 9.99 | 5.79× |
+| 32 | 40.51 | 227.60 | 9.92 | 5.62× |
+| 34 | 40.54 | 229.74 | 10.10 | 5.67× |
+| 36 | 40.51 | 229.88 | 10.20 | 5.68× |
+| 38 | 40.47 | 228.04 | 10.20 | 5.63× |
+| 40 | 40.55 | 228.49 | 10.28 | 5.63× |
+
+Budget 22 was the fastest setting in the tested range, delivering 253.32 tok/s
+on the five-prompt sweep, 7.3% above the next-fastest tested budget (26).
+
+### Per-prompt results — final run 1
+
+#### HumanEval
+
+| # | n_tok | AR tok/s | DFlash tok/s | AL |
+|:-:|:-----:|:--------:|:------------:|:--:|
+| 01 | 94 | 40.61 | 304.70 | 12.62 |
+| 02 | 148 | 40.48 | 189.64 | 7.76 |
+| 03 | 144 | 40.49 | 314.22 | 12.85 |
+| 04 | 130 | 40.50 | 245.35 | 10.07 |
+| 05 | 182 | 40.54 | 214.30 | 8.83 |
+| 06 | 128 | 40.54 | 221.08 | 9.06 |
+| 07 | 61 | 40.42 | 224.07 | 9.20 |
+| 08 | 151 | 40.45 | 208.08 | 8.53 |
+| 09 | 135 | 40.49 | 188.64 | 7.72 |
+| 10 | 105 | 40.39 | 240.04 | 10.00 |
+| **mean** |  | **40.49** | **235.01** | **9.66** |
+
+#### GSM8K
+
+| # | n_tok | AR tok/s | DFlash tok/s | AL | Result |
+|:-:|:-----:|:--------:|:------------:|:--:|:------:|
+| 01 | 56 | 40.40 | 184.35 | 7.47 | ✓ |
+| 02 | 122 | 40.34 | 163.61 | 6.73 | ✓ |
+| 03 | 60 | 40.42 | 172.40 | 6.97 | ✓ |
+| 04 | 81 | 40.42 | 189.59 | 7.71 | ✗ |
+| 05 | 113 | 40.30 | 141.24 | 5.76 | ✗ |
+| 06 | 129 | 40.32 | 128.10 | 5.36 | ✗ |
+| 07 | 124 | 40.38 | 189.77 | 7.73 | ✗ |
+| 08 | 61 | 40.39 | 160.45 | 6.50 | ✗ |
+| 09 | 54 | 40.41 | 186.20 | 7.53 | ✓ |
+| 10 | 107 | 40.31 | 181.53 | 7.42 | ✓ |
+| **mean** |  | **40.37** | **169.72** | **6.92** | **5/10** |
+
+#### Math500
+
+| # | n_tok | AR tok/s | DFlash tok/s | AL | Result |
+|:-:|:-----:|:--------:|:------------:|:--:|:------:|
+| 01 | 276 | 40.11 | 181.42 | 7.74 | ✓ |
+| 02 | 72 | 40.13 | 190.61 | 7.80 | ✓ |
+| 03 | 59 | 40.20 | 227.51 | 9.29 | ✓ |
+| 04 | 69 | 40.07 | 202.61 | 8.71 | ✓ |
+| 05 | 136 | 40.04 | 204.96 | 8.37 | ✓ |
+| 06 | 95 | 40.04 | 145.82 | 6.50 | ✗ |
+| 07 | 62 | 40.14 | 173.48 | 7.06 | ✓ |
+| 08 | 98 | 40.04 | 195.92 | 8.32 | ✓ |
+| 09 | 71 | 40.14 | 212.16 | 8.97 | ✓ |
+| 10 | 76 | 40.16 | 219.18 | 8.94 | ✓ |
+| **mean** |  | **40.11** | **195.37** | **8.17** | **9/10** |
+
+This result is not an apples-to-apples comparison with the WSL2 Qwen3.6 result
+below: that run used the Q8_0 draft and `bench_he.py`, while this run uses the
+Q4_K_M draft and the chat-template-aware `bench_llm.py --no-thinking` protocol.
+
 ## RTX 4090 (Ada, sm_89, 24 GB) — WSL2 (community)
 
 Single RTX 4090 24 GB, CUDA 13.2, driver 596.21, WSL2 (Ubuntu) on Windows 11.

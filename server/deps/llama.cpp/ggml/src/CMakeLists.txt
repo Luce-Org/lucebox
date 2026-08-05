@@ -250,7 +250,9 @@ if (CMAKE_SYSTEM_NAME MATCHES "Linux")
 endif()
 
 function(ggml_add_backend_library backend)
-    if (GGML_BACKEND_DL)
+    if (GGML_BACKEND_DL OR
+        (GGML_HIP_MODULE AND backend STREQUAL "ggml-hip") OR
+        (GGML_CUDA_MODULE AND backend STREQUAL "ggml-cuda"))
         add_library(${backend} MODULE ${ARGN})
         # write the shared library to the output directory
         set_target_properties(${backend} PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
@@ -302,7 +304,9 @@ function(ggml_add_backend backend)
         string(TOLOWER "ggml-${backend}" backend_target)
         add_subdirectory(${backend_target})
         message(STATUS "Including ${backend} backend")
-        if (NOT GGML_BACKEND_DL)
+        if (NOT GGML_BACKEND_DL AND
+            NOT (GGML_HIP_MODULE AND backend STREQUAL "HIP") AND
+            NOT (GGML_CUDA_MODULE AND backend STREQUAL "CUDA"))
             string(TOUPPER "GGML_USE_${backend}" backend_use)
             target_compile_definitions(ggml PUBLIC ${backend_use})
         endif()

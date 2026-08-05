@@ -36,6 +36,15 @@ GGML_BACKEND_API bool ggml_backend_cuda_set_low_priority_stream(
 // not change; input contents may still be updated in place.
 GGML_BACKEND_API bool ggml_backend_cuda_set_skip_props_check(bool skip);
 
+// Retire CUDA/HIP graph-cache entries whose graph key points into a metadata
+// arena that is about to be rebuilt or released. The backend is synchronized
+// before native graph executables are destroyed. Returns the number of erased
+// entries. Non-CUDA/HIP backends and empty ranges return zero.
+GGML_BACKEND_API size_t ggml_backend_cuda_graph_invalidate_range(
+        ggml_backend_t backend,
+        const void *   begin,
+        size_t         size);
+
 // Disable CUDA/HIP graph capture and replay on the calling thread. Returns the
 // previous value so scoped callers can restore nested overrides correctly.
 GGML_BACKEND_API bool ggml_backend_cuda_set_graphs_disabled_override(bool disabled);

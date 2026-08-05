@@ -92,7 +92,13 @@ if (NOT GGML_BACKEND_DL)
     target_compile_definitions(ggml PUBLIC GGML_USE_CUDA)
 endif()
 
-add_compile_definitions(GGML_USE_HIP)
+if (GGML_HIP_MODULE)
+    # Do not leak HIP runtime spellings into the linked CUDA application in a
+    # mixed-vendor build. The module is the only target that needs this flag.
+    target_compile_definitions(ggml-hip PRIVATE GGML_USE_HIP)
+else()
+    add_compile_definitions(GGML_USE_HIP)
+endif()
 
 if (GGML_CUDA_FORCE_MMQ)
     add_compile_definitions(GGML_CUDA_FORCE_MMQ)

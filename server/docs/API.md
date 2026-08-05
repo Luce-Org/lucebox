@@ -159,6 +159,11 @@ When `temperature = 0`:
 - **OpenAI format**: `text/event-stream` with `data: {...}\n\n` chunks, terminated by `data: [DONE]\n\n`
 - **Anthropic format**: SSE with `event: message_start`, `content_block_start`, `content_block_delta`, `message_stop`
 - **Responses format**: SSE with `response.created`, `response.output_item.*`, `response.completed`
+- During long prefill or cleanup phases with no token data, the server emits a
+  valid SSE comment (`: keep-alive`) every 15 seconds. Clients ignore the
+  comment as payload while HTTP body-idle timers remain active. If the peer
+  closes, the server propagates cancellation into the backend at its next safe
+  prefill or decode boundary.
 
 ---
 

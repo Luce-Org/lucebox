@@ -80,6 +80,11 @@ constexpr bool park_target_includes_draft_model(ParkTarget target) {
 // Return true to continue generation, false to abort.
 using TokenCallback = std::function<bool(int32_t token)>;
 
+// Return true when an in-flight request should stop. Backends poll this at
+// their existing prefill/decode cancellation boundaries so cancellation does
+// not depend on filling the socket's send buffer first.
+using CancellationProbe = std::function<bool()>;
+
 // Inference observer callback for live status updates. Called by backends
 // at each spec-decode step to report phase/detail. When empty, backends
 // skip the call (zero overhead).
@@ -98,6 +103,11 @@ struct DaemonIO {
     TokenCallback on_token;
     mutable bool cancelled = false;
 
+    // Optional request-liveness probe. The native HTTP server uses this to
+    // propagate a peer disconnect detected by the client thread into backend
+    // prefill and decode loops.
+    CancellationProbe should_cancel;
+
     // Optional inference observer for /status page. When set, backends call
     // this at each spec-decode step with draft tokens and phase info.
     InferenceObserver observer;
@@ -106,6 +116,15 @@ struct DaemonIO {
     // Also invokes on_token if set. Sets cancelled=true if on_token
     // returns false (client disconnected).
     void emit(int32_t v) const;
+
+    // Poll external cancellation and latch the result locally. `cancelled`
+    // remains worker-thread-owned; the probe itself may read atomic state.
+    bool is_cancelled() const {
+        if (!cancelled && should_cancel && should_cancel()) {
+            cancelled = true;
+        }
+        return cancelled;
+    }
 
     // Return an IO handle that also invokes `cb` for emitted tokens.
     DaemonIO with_token_callback(const TokenCallback & cb) const;

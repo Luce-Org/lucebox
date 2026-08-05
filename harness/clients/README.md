@@ -66,7 +66,7 @@ The defaults below are the current RTX 3090 starting points for
 | Codex | `run_codex.sh` | `MAX_CTX=32768 BUDGET=22 VERIFY_MODE=ddtree EXTRA_SERVER_ARGS=--lazy-draft` |
 | OpenCode | `run_opencode.sh` | `MAX_CTX=86016 BUDGET=22 VERIFY_MODE=ddtree EXTRA_SERVER_ARGS=--lazy-draft` |
 | Hermes Agent | `run_hermes.sh` | `MAX_CTX=98304 BUDGET=22 VERIFY_MODE=ddtree EXTRA_SERVER_ARGS=--lazy-draft` |
-| Pi | `run_pi.sh` | `MAX_CTX=65536 BUDGET=22 VERIFY_MODE=ddtree EXTRA_SERVER_ARGS=--lazy-draft` |
+| Pi | `run_pi.sh` | `MAX_CTX=65536 BUDGET=22 VERIFY_MODE=ddtree EXTRA_SERVER_ARGS=--lazy-draft PI_TIMEOUT=3600` |
 | OpenClaw | `run_openclaw.sh` | `MAX_CTX=204800 BUDGET=22 VERIFY_MODE=ddtree EXTRA_SERVER_ARGS=--lazy-draft` |
 | Open WebUI chat | `run_openwebui.sh` | `MAX_CTX=262144 BUDGET=22 VERIFY_MODE=ddtree EXTRA_SERVER_ARGS=--lazy-draft` |
 | Open WebUI tools | `run_openwebui_tools.sh` | `MAX_CTX=65536 BUDGET=22 VERIFY_MODE=ddtree EXTRA_SERVER_ARGS=--lazy-draft` |
@@ -78,6 +78,27 @@ MAX_CTX=32768 harness/clients/run_claude_code.sh
 PROMPT='Explain the repo and end with lucebox-client-ok' harness/clients/run_opencode.sh
 PROMPT_FILE=harness/clients/prompts/repo_inspection.txt harness/clients/run_hermes.sh
 ```
+
+`PI_TIMEOUT` is Pi's total wall-clock limit in seconds. Its one-hour default
+allows long-context prefill and long generations to finish; set
+`PI_TIMEOUT=0` to run without a launcher deadline. The launcher also disables
+Pi's separate five-minute HTTP idle timeout, which can otherwise terminate an
+SSE connection during a long prefill. For a manually configured Pi install,
+put the same setting in `~/.pi/agent/settings.json`:
+
+```json
+{"httpIdleTimeoutMs": 0}
+```
+
+The other real-client launchers also allow one hour by default. Override their
+deadlines with `CLAUDE_TIMEOUT`, `CODEX_TIMEOUT`, `OPENCODE_TIMEOUT`,
+`HERMES_TIMEOUT`, `OPENCLAW_TIMEOUT`, or (for Open WebUI's curl probe)
+`CURL_MAX_TIME`. The CLI launcher timeouts accept `0` to disable the outer
+deadline. OpenCode's provider-level request and chunk deadlines default to one
+hour too and can be changed with `OPENCODE_REQUEST_TIMEOUT_MS` and
+`OPENCODE_CHUNK_TIMEOUT_MS`. The server independently sends SSE heartbeat
+comments during silent prefill and cancels backend work when a client
+disconnects.
 
 Claude Code uses the real Anthropic Messages client path. Lucebox trims
 Claude-specific prompt boilerplate by default for local-model reliability. To

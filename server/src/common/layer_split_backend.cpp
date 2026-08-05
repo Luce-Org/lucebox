@@ -77,6 +77,7 @@ GenerateResult LayerSplitBackend::run_from_state(const GenerateRequest & req,
     int consumed = 0;
     auto t_prefill_start = std::chrono::steady_clock::now();
     while (consumed < prompt_len) {
+        if (out_io.is_cancelled()) break;
         int n_tokens = prompt_len - consumed;
         if (adapter_chunk > 0 && n_tokens > adapter_chunk) {
             n_tokens = adapter_chunk;
@@ -104,6 +105,10 @@ GenerateResult LayerSplitBackend::run_from_state(const GenerateRequest & req,
     }
     result.prefill_s = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - t_prefill_start).count();
+    if (out_io.is_cancelled()) {
+        result.succeed();
+        return result;
+    }
 
     if (req.n_gen > 0) {
         if (last_tok < 0) {

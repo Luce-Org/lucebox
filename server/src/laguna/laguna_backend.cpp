@@ -633,7 +633,7 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
             out_tokens.push_back(tok);
             sample_history.push_back(tok);
             io.emit(tok);
-            if (io.cancelled) break;
+            if (io.is_cancelled()) break;
 
             if (!target->embed_tokens(&tok, 1, embed_step.data())) return false;
             if (!kvflash_alloc_span(committed, 1) ||
@@ -1040,13 +1040,13 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
                 sample_history.push_back(tok);
                 io.emit(tok);
                 emitted++;
-                if (io.cancelled) break;
+                if (io.is_cancelled()) break;
             }
 
             n_accept_sum += std::max(0, emitted - 1);
             n_draft_steps++;
             n_draft_pos_sum += q_len;
-            if (io.cancelled || hit_eos || emitted <= 0 || next_token < 0 ||
+            if (io.is_cancelled() || hit_eos || emitted <= 0 || next_token < 0 ||
                 (!ignore_eos && target->is_eos(next_token))) {
                 committed += emitted;
                 cache_.cur_pos = committed;
@@ -1220,7 +1220,7 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
             sample_history.push_back(tok);
             io.emit(tok);
             emitted++;
-            if (io.cancelled) break;
+            if (io.is_cancelled()) break;
         }
 
         committed += emitted;
@@ -1229,7 +1229,7 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
         n_accept_sum += std::min(accept_n, emitted);
         n_draft_steps++;
         n_draft_pos_sum += q_len;
-        if (io.cancelled) break;
+        if (io.is_cancelled()) break;
         if (hit_eos) break;
     }
 
@@ -1281,9 +1281,14 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
 
 GenerateResult LagunaBackend::generate_impl(const GenerateRequest & req,
                                         const DaemonIO & io) {
+    if (io.is_cancelled()) {
+        GenerateResult result;
+        result.succeed();
+        return result;
+    }
     if (hybrid_mode_ && moe_hybrid_) {
         auto result = generate_hybrid(req, io);
-        if (result.ok()) {
+        if (result.ok() && !io.is_cancelled()) {
             // Flush routing-frequency profile if requested (independent of swap).
             if (!routing_stats_out_path_.empty() && routing_stats_) {
                 std::string serr;
@@ -1348,6 +1353,7 @@ GenerateResult LagunaBackend::generate_impl(const GenerateRequest & req,
     const int pf_chunk = kvf_paged ? pf_pool_batch : args_.chunk;
     const int n_chunks = (N + pf_chunk - 1) / pf_chunk;
     for (int c = 0; c < n_chunks && ok; ++c) {
+        if (out_io.is_cancelled()) break;
         const int kv_start = c * pf_chunk;
         const int n_tok    = std::min(pf_chunk, N - c * pf_chunk);
         if (kvf_paged) {
@@ -1370,6 +1376,10 @@ GenerateResult LagunaBackend::generate_impl(const GenerateRequest & req,
                           embed_pf.data() + (size_t)kv_start * w_.n_embd,
                           n_tok, kv_start, no_mask, last_logits, kvf,
                           /*capture=*/true);
+    }
+    if (out_io.is_cancelled()) {
+        result.succeed();
+        return result;
     }
     if (!ok) { result.fail(GenerateErrorCode::PrefillFailed); return result; }
     auto t_pf1 = std::chrono::steady_clock::now();
@@ -1509,7 +1519,7 @@ GenerateResult LagunaBackend::generate_impl(const GenerateRequest & req,
         history.push_back(next_tok);
         if (should_emit) {
             out_io.emit(next_tok);
-            if (out_io.cancelled) break;
+            if (out_io.is_cancelled()) break;
         }
         if (!w_.embedder.embed(&next_tok, 1, embed_step.data())) { ok = false; break; }
         std::vector<float> step_logits;
@@ -1542,6 +1552,10 @@ GenerateResult LagunaBackend::restore_and_generate_impl(int slot,
     const bool no_mask = (std::getenv("DFLASH_NO_MASK") != nullptr);
     GenerateResult result;
     DaemonIO out_io = io.with_token_callback(req.on_token);
+    if (out_io.is_cancelled()) {
+        result.succeed();
+        return result;
+    }
     sampler_ = req.sampler;
     if (req.do_sample && sampler_.seed != 0) {
         sampler_rng_.seed(sampler_.seed);
@@ -1616,6 +1630,7 @@ GenerateResult LagunaBackend::restore_and_generate_impl(int slot,
     bool ok = true;
     const int n_chunks = (diff_n + args_.chunk - 1) / args_.chunk;
     for (int c = 0; c < n_chunks && ok; ++c) {
+        if (out_io.is_cancelled()) break;
         const int off   = c * args_.chunk;
         const int n_tok = std::min(args_.chunk, diff_n - off);
         const int starts = kv_start + off;
@@ -1624,6 +1639,10 @@ GenerateResult LagunaBackend::restore_and_generate_impl(int slot,
                           embed_diff.data() + (size_t)off * w_.n_embd,
                           n_tok, starts, no_mask, last_logits, kvf,
                           /*capture=*/true);
+    }
+    if (out_io.is_cancelled()) {
+        result.succeed();
+        return result;
     }
     if (!ok) { result.fail(GenerateErrorCode::PrefillFailed); return result; }
 
@@ -1732,7 +1751,7 @@ GenerateResult LagunaBackend::restore_and_generate_impl(int slot,
         history.push_back(next_tok);
         result.tokens.push_back(next_tok);
         out_io.emit(next_tok);
-        if (out_io.cancelled) break;
+        if (out_io.is_cancelled()) break;
         if (!w_.embedder.embed(&next_tok, 1, embed_step.data())) { ok = false; break; }
         std::vector<float> step_logits;
         int32_t step_argmax = -1;
@@ -2763,6 +2782,13 @@ GenerateResult LagunaBackend::generate_hybrid(const GenerateRequest & req,
         const bool is_full = laguna_is_full_attn_layer(w_, il);
 
         for (int chunk_start = 0; chunk_start < N; chunk_start += prefill_chunk) {
+            if (out_io.is_cancelled()) {
+                step_graph_destroy(prefill_sg);
+                if (ffn_hot_alloc) ggml_gallocr_free(ffn_hot_alloc);
+                if (ffn_cold_alloc) ggml_gallocr_free(ffn_cold_alloc);
+                result.succeed();
+                return result;
+            }
             const int chunk_len = std::min(prefill_chunk, N - chunk_start);
 
             step_graph_free(prefill_sg);  // reset ctx/graph but keep gallocr buffer
@@ -2950,6 +2976,10 @@ GenerateResult LagunaBackend::generate_hybrid(const GenerateRequest & req,
     step_graph_destroy(prefill_sg);
     if (ffn_hot_alloc) ggml_gallocr_free(ffn_hot_alloc);
     if (ffn_cold_alloc) ggml_gallocr_free(ffn_cold_alloc);
+    if (out_io.is_cancelled()) {
+        result.succeed();
+        return result;
+    }
 
     // Project logits from last token's hidden state
     cache_.cur_pos = N;
@@ -3056,7 +3086,7 @@ GenerateResult LagunaBackend::generate_hybrid(const GenerateRequest & req,
         history.push_back(next_tok);
         if (should_emit) {
             out_io.emit(next_tok);
-            if (out_io.cancelled) break;
+            if (out_io.is_cancelled()) break;
         }
 
         // Hybrid forward: one token through all layers

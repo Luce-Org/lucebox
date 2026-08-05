@@ -813,6 +813,10 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
     }
     auto t_prefill_end = std::chrono::steady_clock::now();
     result.prefill_s = std::chrono::duration<double>(t_prefill_end - t_prefill_start).count();
+    if (out_io.is_cancelled()) {
+        result.succeed();
+        return result;
+    }
 
     // Decode (speculative)
     if (req.n_gen > 0) {
@@ -898,11 +902,17 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
         if (n > 0) {
             const int start = cache_.cur_pos - n;
             if (remote_draft_.active()) {
-                sync_remote_draft_features(start, n);
+                if (!sync_remote_draft_features(start, n)) {
+                    result.fail(GenerateErrorCode::BackendSpecific,
+                                "prefix remote feature sync");
+                    return result;
+                }
             } else if (feature_mirror_.target_feat && cache_.target_feat) {
-                draft_feature_mirror_sync_range(cache_.target_feat,
-                                                cache_.target_feat_cap,
-                                                feature_mirror_, start, n);
+                if (!sync_local_draft_features(start, n)) {
+                    result.fail(GenerateErrorCode::BackendSpecific,
+                                "prefix feature mirror sync");
+                    return result;
+                }
             }
         }
     }
@@ -962,6 +972,10 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
             return result;
         }
     }
+    if (out_io.is_cancelled()) {
+        result.succeed();
+        return result;
+    }
 
     // Decode
     if (req.n_gen > 0) {
@@ -1016,8 +1030,6 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
                                const DaemonIO & io,
                                int snap_pos, int snap_slot,
                                int kv_offset) {
-    (void)io;
-
     const int hidden = w_.n_embd;
     const int vocab  = w_.n_vocab;
     int prefill_ubatch = 512;
@@ -1077,6 +1089,7 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
     std::vector<float> embed_buf((size_t)hidden * prefill_ubatch);
     int committed = kv_offset;
     for (int start = 0; start < prompt_len;) {
+        if (io.is_cancelled()) break;
         const int kv_pos = kv_offset + start;
 
         int n_tokens = std::min(prefill_ubatch, prompt_len - start);
@@ -1246,8 +1259,7 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         if (remote_draft_.active() && !draft_parked_) {
             if (!sync_remote_draft_features(kv_pos, n_tokens)) return -1;
         } else if (feature_mirror_.target_feat && !draft_parked_) {
-            draft_feature_mirror_sync_range(cache_.target_feat, cache_.target_feat_cap,
-                                            feature_mirror_, kv_pos, n_tokens);
+            if (!sync_local_draft_features(kv_pos, n_tokens)) return -1;
         }
 
         start += n_tokens;
@@ -1692,7 +1704,7 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
             if (kvflash_qk_policy_) kvflash_qk_pool_to(committed);
             kvflash_maybe_reselect((int)(out_tokens.size() - out_tokens_at_entry));
         }
-        if (io.cancelled) break;
+        if (io.is_cancelled()) break;
 
         if (IS_EOS_TOK(next_tok, w_)) break;
 
@@ -1792,6 +1804,22 @@ bool Qwen35Backend::sync_remote_draft_features(int start_pos, int n_tokens) {
         }
     }
     return true;
+}
+
+bool Qwen35Backend::sync_local_draft_features(int start_pos, int n_tokens) {
+    if (n_tokens <= 0 || draft_parked_ || !feature_mirror_.target_feat ||
+        !cache_.target_feat) {
+        return true;
+    }
+    if (draft_feature_mirror_sync_range(
+            cache_.target_feat, cache_.target_feat_cap,
+            feature_mirror_, start_pos, n_tokens)) {
+        return true;
+    }
+    std::fprintf(stderr,
+        "spec-decode: local feature sync failed start=%d n=%d\n",
+        start_pos, n_tokens);
+    return false;
 }
 
 // ── DFlash speculative decode loop ─────────────────────────────────────
@@ -1939,8 +1967,33 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     int n_hint_proposed = 0;
     int n_hint_accepted = 0;
     int target_forwards = 0;
-    const ChainRollbackPolicy rollback_policy = resolve_chain_rollback_policy();
+    const ChainRollbackPolicy rollback_policy =
+        resolve_chain_rollback_policy(cfg_.device.is_tensor_parallel());
+    const int fast_rollback_threshold =
+        rollback_policy.fast_rollback_threshold;
     RollbackDiag rollback_diag;
+
+    const char * tp_profile_env = std::getenv("DFLASH_TP_PROFILE");
+    const bool tp_profile = tp_profile_env && std::strcmp(tp_profile_env, "0") != 0;
+    double profile_draft_s = 0.0;
+    double profile_project_s = 0.0;
+    double profile_snapshot_s = 0.0;
+    double profile_verify_s = 0.0;
+    double profile_rollback_s = 0.0;
+    double profile_replay_s = 0.0;
+    double profile_feature_s = 0.0;
+    auto profile_start = [&]() {
+        return tp_profile
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
+    };
+    auto profile_add = [&](double & total,
+                           std::chrono::steady_clock::time_point start) {
+        if (tp_profile) {
+            total += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - start).count();
+        }
+    };
 
     auto log_target_forward_stats = [&]() {
         std::fprintf(stderr, "[spec-decode] target_forwards=%d forwards_per_token=%.6f forwards_per_step=%.3f\n",
@@ -2012,6 +2065,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             !use_remote_draft &&
             draft_feature_mirror_can_view(feature_mirror_, committed, draft_ctx, mirror_slot0);
 
+        const auto profile_draft_start = profile_start();
         if (use_remote_draft) {
             local_hidden.clear();
             if (!remote_draft_.propose(committed, draft_ctx, noise_embed, local_hidden)) {
@@ -2098,14 +2152,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                                         sizeof(float) * local_hidden.size());
             }
         }
-
-        // 3. Project draft hidden → token IDs via target LM head
-        if (!target->project_hidden_to_tokens(local_hidden.data(), q_len, draft_tok)) {
-            std::fprintf(stderr, "spec-decode: projection failed\n");
-            step_graph_destroy(draft_sg);
-            return false;
-        }
-        draft_tok[0] = last_tok;
+        profile_add(profile_draft_s, profile_draft_start);
 
         // ── DDTree tree-structured verify ────────────────────────────────
         // When --ddtree is on and the target supports tree verify, build a
@@ -2135,18 +2182,34 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             (cfg_.fa_window == 0 &&
              committed + cfg_.ddtree_budget + 1 + cfg_.kq_stride_pad <= kvflash_tokens_ &&
              kvflash_pager_.identity_prefix_covers(committed));
-        if (cfg_.ddtree_mode && target->supports_tree_verify() && kvflash_tree_ok &&
-            !use_remote_draft && q_len > 1 && tree_special_inactive) {
+        const bool use_tree_verify =
+            cfg_.ddtree_mode && target->supports_tree_verify() && kvflash_tree_ok &&
+            !use_remote_draft && q_len > 1 && tree_special_inactive;
+
+        // DDTree consumes top-K rows directly. Avoid projecting the same
+        // hidden block once for argmax and again for top-K on every step.
+        if (!use_tree_verify) {
+            if (!target->project_hidden_to_tokens(local_hidden.data(), q_len, draft_tok)) {
+                std::fprintf(stderr, "spec-decode: projection failed\n");
+                step_graph_destroy(draft_sg);
+                return false;
+            }
+            draft_tok[0] = last_tok;
+        }
+
+        if (use_tree_verify) {
             const int L = q_len - 1;
             const int K = (cfg_.ddtree_budget > L) ? 8 : 1;
             std::vector<float>   top_lp;
             std::vector<int32_t> top_ids;
+            const auto profile_project_start = profile_start();
             if (!target->project_hidden_to_topk(local_hidden.data(), q_len, K,
                                                 cfg_.ddtree_temp, top_lp, top_ids)) {
                 std::fprintf(stderr, "spec-decode: ddtree topk projection failed\n");
                 step_graph_destroy(draft_sg);
                 return false;
             }
+            profile_add(profile_project_s, profile_project_start);
             // Tree depth L draws from draft rows 1..q_len-1 (row 0 = the seed).
             // Known limitation: branch descendants beyond depth 1 still come
             // from one spine-conditioned block-draft forward, so a confident
@@ -2159,19 +2222,25 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             flat_tokens[0] = last_tok;
             for (int i = 0; i < tree.n_nodes; i++) flat_tokens[1 + i] = tree.token_ids[i];
 
-            if (!sampled_verify && !target->snapshot_kv()) {
-                step_graph_destroy(draft_sg);
-                return false;
+            if (!sampled_verify) {
+                const auto profile_snapshot_start = profile_start();
+                if (!target->snapshot_kv()) {
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
+                profile_add(profile_snapshot_s, profile_snapshot_start);
             }
 
             std::vector<int32_t> posterior;
             std::vector<float>   node_logits;
+            const auto profile_verify_start = profile_start();
             if (!target->verify_tree(committed, tree, flat_tokens, N, posterior,
                                      sampled_verify ? &node_logits : nullptr)) {
                 std::fprintf(stderr, "spec-decode: verify_tree failed\n");
                 step_graph_destroy(draft_sg);
                 return false;
             }
+            profile_add(profile_verify_s, profile_verify_start);
             target_forwards++;
 
             int next_token = -1, bonus_node = 0;
@@ -2214,7 +2283,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 out_tokens.push_back(tok);
                 io.emit(tok);
                 accepted_emitted++;
-                if (io.cancelled) { hit_eos = true; break; }
+                if (io.is_cancelled()) { hit_eos = true; break; }
                 if (target->is_eos(tok)) { hit_eos = true; break; }
             }
 
@@ -2225,33 +2294,38 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
             if (!sampled_verify) {
                 const int root_last_tok = last_tok;
-                constexpr int kFastRollbackThreshold = 5;
                 const bool use_tree_fast_rollback =
                     target->supports_fast_rollback() &&
-                    accepted_emitted >= kFastRollbackThreshold;
+                    accepted_emitted >= fast_rollback_threshold;
 
                 if (use_tree_fast_rollback) {
                     // Fast greedy production path: restore to the accepted path
                     // from tree captures and defer the bonus as next step's root.
                     std::vector<int> accepted_committed(accepted.begin(),
                                                         accepted.begin() + accepted_emitted);
+                    const auto profile_rollback_start = profile_start();
                     if (!target->rollback_to_tree(committed, tree, accepted_committed)) {
                         std::fprintf(stderr, "spec-decode: rollback_to_tree failed\n");
                         step_graph_destroy(draft_sg);
                         return false;
                     }
+                    profile_add(profile_rollback_s, profile_rollback_start);
                     last_tok = next_token;
 
                     if (feature_mirror_.target_feat && !draft_parked_) {
-                        draft_feature_mirror_sync_range(cache_.target_feat, cache_.target_feat_cap,
-                                                        feature_mirror_, committed, accepted_emitted);
+                        const auto profile_feature_start = profile_start();
+                        if (!sync_local_draft_features(committed, accepted_emitted)) {
+                            step_graph_destroy(draft_sg);
+                            return false;
+                        }
+                        profile_add(profile_feature_s, profile_feature_start);
                     }
 
                     committed   += accepted_emitted;
                     cache_.cur_pos = committed;
                     n_generated += accepted_emitted;
                     n_draft_steps++;
-                    if (hit_eos || io.cancelled || n_generated >= n_gen ||
+                    if (hit_eos || io.is_cancelled() || n_generated >= n_gen ||
                         last_tok < 0 || target->is_eos(last_tok)) {
                         break;
                     }
@@ -2263,7 +2337,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 // path has already been emitted above; only emit the bonus here.
                 int total_emitted = accepted_emitted;
                 const bool can_commit_bonus =
-                    !hit_eos && !io.cancelled && next_token >= 0 &&
+                    !hit_eos && !io.is_cancelled() && next_token >= 0 &&
                     total_emitted < need_commit_budget;
 
                 std::vector<int32_t> replay_batch;
@@ -2274,6 +2348,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 }
                 if (can_commit_bonus) replay_batch.push_back(next_token);
 
+                const auto profile_replay_start = profile_start();
                 if (!target->restore_kv()) {
                     step_graph_destroy(draft_sg);
                     return false;
@@ -2284,13 +2359,14 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                     step_graph_destroy(draft_sg);
                     return false;
                 }
+                profile_add(profile_replay_s, profile_replay_start);
                 target_forwards++;
 
                 if (can_commit_bonus) {
                     out_tokens.push_back(next_token);
                     io.emit(next_token);
                     total_emitted++;
-                    if (io.cancelled) {
+                    if (io.is_cancelled()) {
                         hit_eos = true;
                     } else if (target->is_eos(next_token)) {
                         hit_eos = true;
@@ -2299,15 +2375,17 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
                 last_tok = replay_last_tok;
                 if (feature_mirror_.target_feat && !draft_parked_) {
-                    draft_feature_mirror_sync_range(cache_.target_feat, cache_.target_feat_cap,
-                                                    feature_mirror_, committed, total_emitted);
+                    if (!sync_local_draft_features(committed, total_emitted)) {
+                        step_graph_destroy(draft_sg);
+                        return false;
+                    }
                 }
 
                 committed   += total_emitted;
                 cache_.cur_pos = committed;
                 n_generated += total_emitted;
                 n_draft_steps++;
-                if (hit_eos || io.cancelled || n_generated >= n_gen ||
+                if (hit_eos || io.is_cancelled() || n_generated >= n_gen ||
                     last_tok < 0 || target->is_eos(last_tok)) {
                     break;
                 }
@@ -2328,7 +2406,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             int bonus_last_tok = -1;
             std::vector<float> bonus_logits;
             const bool can_commit_bonus =
-                !hit_eos && !io.cancelled && next_token >= 0 &&
+                !hit_eos && !io.is_cancelled() && next_token >= 0 &&
                 total_emitted < need_commit_budget;
             if (can_commit_bonus) {
                 const int bonus_pos = committed + total_emitted;
@@ -2353,7 +2431,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 out_tokens.push_back(next_token);
                 io.emit(next_token);
                 total_emitted++;
-                if (io.cancelled) {
+                if (io.is_cancelled()) {
                     hit_eos = true;
                 } else if (target->is_eos(next_token)) {
                     hit_eos = true;
@@ -2368,15 +2446,17 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
             // Sampled path commits the bonus in-step, so sync accepted+bonus.
             if (feature_mirror_.target_feat && !draft_parked_) {
-                draft_feature_mirror_sync_range(cache_.target_feat, cache_.target_feat_cap,
-                                                feature_mirror_, committed, total_emitted);
+                if (!sync_local_draft_features(committed, total_emitted)) {
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
             }
 
             committed   += total_emitted;
             cache_.cur_pos = committed;
             n_generated += total_emitted;
             n_draft_steps++;
-            if (hit_eos || io.cancelled || n_generated >= n_gen || last_tok < 0) {
+            if (hit_eos || io.is_cancelled() || n_generated >= n_gen || last_tok < 0) {
                 break;
             }
             continue;
@@ -2503,8 +2583,8 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         // 6. Fix state: adaptive fast-rollback vs legacy replay.
         //    Fast-rollback (implicit bonus, skip replay) is profitable when
         //    accept_n is large enough that skipping the replay saves more compute
-        //    than the cost of deferring the bonus to the next step. The default
-        //    threshold is 5; exact F32 checkpoints may opt in to a lower value.
+        //    than the cost of deferring the bonus to the next step. TP uses
+        //    device-local rollback; other paths use the configurable policy.
         rollback_diag.record_accept(accept_n);
         const bool use_fast_rollback =
             target->supports_fast_rollback() &&
@@ -2568,8 +2648,10 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 return false;
             }
         } else if (feature_mirror_.target_feat && cache_.target_feat) {
-            draft_feature_mirror_sync_range(cache_.target_feat, cache_.target_feat_cap,
-                                            feature_mirror_, committed, commit_n);
+            if (!sync_local_draft_features(committed, commit_n)) {
+                step_graph_destroy(draft_sg);
+                return false;
+            }
         }
 
         // 8. Emit committed tokens (stop at EOS)
@@ -2642,7 +2724,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             out_tokens.push_back(replay_tok[i]);
             io.emit(replay_tok[i]);
             emitted++;
-            if (io.cancelled) break;
+            if (io.is_cancelled()) break;
             if (budget_close_fired) break;
             if (IS_EOS_TOK(replay_tok[i], w_)) { hit_eos = true; break; }
         }
@@ -2718,7 +2800,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             io.observer("verify", replay_tok);
         }
 
-        if (io.cancelled) break;
+        if (io.is_cancelled()) break;
         if (floor_to_ar) {
             step_graph_destroy(draft_sg);
             cache_.last_tok = out_tokens.empty() ? last_tok : out_tokens.back();
@@ -2799,6 +2881,15 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                  n_generated > 0 ? n_generated / decode_s : 0.0,
                  n_draft_steps, n_accept_sum, total_draft_pos, accept_pct,
                  n_draft_steps > 0 ? (double)n_generated / (double)n_draft_steps : 0.0);
+    if (tp_profile) {
+        std::fprintf(stderr,
+            "[spec-profile] draft=%.3fs project=%.3fs snapshot=%.3fs "
+            "verify=%.3fs rollback=%.3fs replay=%.3fs feature=%.3fs accounted=%.3fs\n",
+            profile_draft_s, profile_project_s, profile_snapshot_s,
+            profile_verify_s, profile_rollback_s, profile_replay_s, profile_feature_s,
+            profile_draft_s + profile_project_s + profile_snapshot_s +
+            profile_verify_s + profile_rollback_s + profile_replay_s + profile_feature_s);
+    }
     log_target_forward_stats();
     if (n_hint_proposed > 0) {
         std::fprintf(stderr, "[spec-decode] hint tokens: %d/%d accepted (%.1f%%)\n",

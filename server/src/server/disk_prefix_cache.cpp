@@ -252,7 +252,15 @@ void DiskPrefixCache::learn_layout(int slot) {
     if (layout_known_ && !layout_from_disk_) return;  // already verified from live model
 
     auto ref = backend_.snapshot_ref(slot);
-    if (!ref.ctx) return;
+    if (!ref.ctx) {
+        if (backend_.snapshot_used(slot)) {
+            backend_snapshot_unsupported_ = true;
+            std::fprintf(stderr,
+                         "[disk-cache] disabled: backend snapshots are "
+                         "memory-only\n");
+        }
+        return;
+    }
 
     std::array<uint8_t, 16> prev_id = layout_id_;
     bool had_disk_layout = layout_from_disk_;

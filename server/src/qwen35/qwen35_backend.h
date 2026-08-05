@@ -319,6 +319,7 @@ private:
                       bool * degenerate_close_out = nullptr);
 
     bool sync_remote_draft_features(int start_pos, int n_tokens);
+    bool sync_local_draft_features(int start_pos, int n_tokens);
 
     // Chain-mode verify (single batch of q_len tokens).
     int verify_chain(int committed, const int32_t * draft_tok, int q_len);

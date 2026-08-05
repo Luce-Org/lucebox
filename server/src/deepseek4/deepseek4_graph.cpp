@@ -13,6 +13,7 @@
 #include "internal.h"
 #include "../common/step_graph.h"
 #include "../common/cuda_graph_overrides.h"
+#include "../common/dynamic_backend.h"
 #include "../common/moe_expert_compute.h"
 #include "../common/moe_hybrid_ffn_eval.h"
 #include "../common/moe_hybrid_routing_stats.h"
@@ -1375,10 +1376,33 @@ static int ds4_comp_rows_used(const ggml_tensor * comp_cache, int n_cached, int 
 // rows in [n_comp, padded) are masked to -1e30 in the score matrix, which
 // underflows to exactly 0 in softmax, so a padded read is bit-identical to an
 // unpadded read of the first n_comp rows.
-static constexpr int DS4_COMP_PAD_STRIDE = 16;
+static int ds4_comp_pad_stride() {
+    static const int stride = [] {
+        constexpr int default_stride = 16;
+        const char * raw = std::getenv("DFLASH_DS4_COMP_PAD_STRIDE");
+        if (!raw || !*raw) return default_stride;
+        const int requested = std::atoi(raw);
+        switch (requested) {
+            case 16:
+            case 32:
+            case 64:
+            case 128:
+                return requested;
+            default:
+                std::fprintf(stderr,
+                    "[deepseek4] invalid DFLASH_DS4_COMP_PAD_STRIDE=%s; "
+                    "using %d\n",
+                    raw, default_stride);
+                return default_stride;
+        }
+    }();
+    return stride;
+}
+
 static int ds4_padded_comp_rows(int n_comp, int cap) {
     if (n_comp <= 0) return 0;
-    const int padded = ((n_comp + DS4_COMP_PAD_STRIDE - 1) / DS4_COMP_PAD_STRIDE) * DS4_COMP_PAD_STRIDE;
+    const int stride = ds4_comp_pad_stride();
+    const int padded = ((n_comp + stride - 1) / stride) * stride;
     return padded < cap ? padded : cap;
 }
 
@@ -2153,13 +2177,19 @@ static ggml_tensor * build_mla_attention(
     ggml_tensor * attn_low = ggml_mul_mat(ctx, out_a_3d, attn_out);
     // attn_low: [n_lora_o, n_tokens, n_out_group]
     ggml_tensor * out = nullptr;
-    if (n_tokens > 1) {
+    const bool grouped_output_projection =
+        n_tokens > 1 &&
+        !ds4_env_flag("DFLASH_DS4_DISABLE_GROUPED_OUTPUT_PROJECTION");
+    if (grouped_output_projection) {
         // Batched ROCmFPX MMQ consumes src1's channel stride directly. This
         // avoids materializing both permutations (~256 MiB/layer at 2K).
         out = ggml_mul_mat_grouped_src(ctx, L.attn_output_b, attn_low);
     } else {
-        // Preserve the established single-token graph and its numerical
-        // behavior. Decode is intentionally outside the prefill fast path.
+        // Preserve the established single-token graph and provide an exact
+        // fallback for heterogeneous runtimes that cannot retain grouped-view
+        // metadata across a scheduler copy. At verifier widths (q <= 4), this
+        // materializes at most 128 KiB per layer rather than the long-prefill
+        // volume avoided by the grouped path.
         attn_low = ggml_cont(ctx, ggml_permute(ctx, attn_low, 0, 2, 1, 3));
         attn_low = ggml_reshape_2d(
             ctx, attn_low, n_lora_o * n_out_group, n_tokens);
@@ -2885,7 +2915,8 @@ static bool eval_ds4_hybrid(
         ggml_tensor * ffn_normed_backend = nullptr,
         const MoeHybridDeviceOutputs * device_outputs = nullptr) {
     const auto ffn_t0 = Ds4TimingClock::now();
-    if (!storage.down_cold && !storage.gate_up_cold &&
+    if (!storage.cold_expert_ids.empty() &&
+        !storage.down_cold && !storage.gate_up_cold &&
         !(expert_compute && expert_layer)) {
         if (!hybrid_owner || !stream_engine || !stream_engine->is_ready() ||
             !hybrid_owner->has_mmap() ||
@@ -4444,10 +4475,13 @@ bool deepseek4_step(
 // while a variant recurs, which is what the ggml-cuda/HIP graph cache keys
 // on, enabling graph replay for the bulk of decode steps.
 
-static bool ds4_fused_decode_enabled() {
-    static const bool enabled =
+static bool ds4_fused_decode_enabled(const DeepSeek4Weights & w) {
+    // The supported control is --ds4-fused-decode, propagated through the
+    // loaded weights. Keep the old environment spelling as a compatibility
+    // fallback for existing launch scripts.
+    static const bool legacy_env_enabled =
         ds4_env_flag("DFLASH_DS4_FUSED_DECODE");
-    return enabled;
+    return w.fused_decode || legacy_env_enabled;
 }
 
 struct DeepSeek4FusedDecodeGraph {
@@ -4489,7 +4523,29 @@ struct DeepSeek4FusedDecodeGraph {
         return sg.ctx && sg.gf && logits;
     }
 
-    void destroy() {
+    void invalidate_native_graphs(ggml_backend_t main_backend,
+                                  ggml_backend_t peer_backend = nullptr) const {
+        if (sg.meta_arena.empty()) {
+            return;
+        }
+        auto invalidate = [&](ggml_backend_t candidate) {
+            if (candidate && ggml_backend_is_cuda(candidate)) {
+                ggml_backend_cuda_graph_invalidate_range(
+                    candidate, sg.meta_arena.data(), sg.meta_arena.size());
+            }
+        };
+        invalidate(main_backend);
+        if (peer_backend != main_backend) {
+            invalidate(peer_backend);
+        }
+    }
+
+    void destroy(ggml_backend_t main_backend,
+                 ggml_backend_t peer_backend = nullptr) {
+        // Native graph executables outlive ggml graph metadata in the backend
+        // cache. Retire them before either the scheduler or metadata arena is
+        // released, otherwise a rebuilt slot can inherit the same pointer key.
+        invalidate_native_graphs(main_backend, peer_backend);
         if (sched) {
             ggml_backend_sched_free(sched);
             sched = nullptr;
@@ -4516,7 +4572,7 @@ struct DeepSeek4FusedDecodeCache {
     ggml_tensor * fn_out_f16 = nullptr;
 
     void destroy() {
-        for (auto & s : slots) s.destroy();
+        for (auto & s : slots) s.destroy(backend);
         if (fn_buf) { ggml_backend_buffer_free(fn_buf); fn_buf = nullptr; }
         if (fn_ctx) { ggml_free(fn_ctx); fn_ctx = nullptr; }
         fn_attn_f16.clear();
@@ -4552,6 +4608,9 @@ struct Ds4FusedVerifyCache {
         ggml_tensor * st128 = nullptr;    // i64 [1,q]
         ggml_tensor * capture = nullptr;  // f32 [n_embd*ncap*q], order [ci][t]
         ggml_tensor * argmax = nullptr;   // i32 [q], optional greedy output
+        // Reused host staging for the context-sized additive attention mask.
+        // Keeping it per slot removes one allocation from every verify step.
+        std::vector<float> mask_values;
         int q = 0;
 
         void reset() { *this = Extra{}; }
@@ -4559,7 +4618,7 @@ struct Ds4FusedVerifyCache {
     std::array<Extra, kSlotCount> extra;
 
     void destroy() {
-        for (auto & slot : slots) slot.destroy();
+        for (auto & slot : slots) slot.destroy(backend, peer_backend);
         for (auto & value : extra) value.reset();
         owner_ctx = nullptr;
         backend = nullptr;
@@ -5216,6 +5275,11 @@ static int ds4_try_fused_decode_step(
                 if (s.last_use < fg->last_use) fg = &s;
             }
         }
+        // The backend's native graph cache is keyed by tensor metadata
+        // addresses. Retire the previous generation before rebuilding this
+        // slot over the same persistent arena; keep the gallocr itself so its
+        // device scratch can still be reused.
+        fg->invalidate_native_graphs(backend);
         const auto build_t0 = Ds4TimingClock::now();
         if (!ds4_build_fused_decode_graph(fc, *fg, backend, w, cache,
                                           hc_weights, hc_out_weights, hash_tables,
@@ -5888,6 +5952,7 @@ static int ds4_try_layer_major_prefill(
         int kv_start,
         std::vector<float> & out_logits,
         const int32_t * token_ids,
+        Ds4VerifyHooks * verify_hooks,
         DeepSeek4StepTelemetry * telemetry) {
     if (!backend || !embed || n_tokens <= 4 ||
         n_tokens > DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS ||
@@ -5895,6 +5960,14 @@ static int ds4_try_layer_major_prefill(
         return 0;
     }
     if (cache.prefill_mode == PrefillAttentionMode::Exact) return 0;
+    // Layer-major prefill returns only the final-position logits. DSpark's
+    // per-layer feature capture is supported below, but verifier requests for
+    // every position's logits/argmax must retain the generic path.
+    if (verify_hooks &&
+        (verify_hooks->all_logits_out || verify_hooks->argmax_out ||
+         verify_hooks->prefer_argmax_only)) {
+        return 0;
+    }
     if (!ds4_backend_is_gpu(backend) || !hc_out_weights.loaded ||
         hc_out_weights.scale_data.empty() || !w.output_hc_fn ||
         !w.output_hc_base) {
@@ -5927,6 +6000,64 @@ static int ds4_try_layer_major_prefill(
     const int64_t hc_dim = (int64_t) n_embd * n_hc;
     const int64_t mix_dim = 2 * (int64_t) n_hc + (int64_t) n_hc * n_hc;
     const int next_pos = kv_start + n_tokens;
+
+    const std::vector<int> * capture_layer_ids =
+        verify_hooks ? verify_hooks->capture_layer_ids : nullptr;
+    std::vector<float> * capture_out =
+        verify_hooks ? verify_hooks->capture_out : nullptr;
+    const bool capture_enabled = capture_layer_ids && capture_out &&
+                                 !capture_layer_ids->empty();
+    const int capture_begin = verify_hooks
+        ? std::clamp(verify_hooks->capture_token_begin, 0, n_tokens) : 0;
+    const int requested_capture_end =
+        verify_hooks && verify_hooks->capture_token_end >= 0
+            ? verify_hooks->capture_token_end : n_tokens;
+    const int capture_end = std::clamp(
+        requested_capture_end, capture_begin, n_tokens);
+    const int capture_tokens = capture_end - capture_begin;
+    std::vector<float> capture_hc_state;
+    if (capture_out) {
+        capture_out->clear();
+    }
+    if (capture_enabled) {
+        capture_out->assign(
+            (size_t) n_tokens * capture_layer_ids->size() * n_embd, 0.0f);
+        capture_hc_state.resize((size_t) hc_dim * capture_tokens);
+    }
+    const auto capture_layer = [&](int layer, ggml_tensor * state) {
+        if (!capture_enabled || capture_tokens <= 0 || !state) return;
+        const auto first = std::find(capture_layer_ids->begin(),
+                                     capture_layer_ids->end(), layer);
+        if (first == capture_layer_ids->end()) return;
+
+        const auto read_t0 = Ds4TimingClock::now();
+        const size_t capture_offset =
+            (size_t) capture_begin * hc_dim * sizeof(float);
+        ggml_backend_tensor_get(state, capture_hc_state.data(), capture_offset,
+                                sizeof(float) * capture_hc_state.size());
+        if (telemetry) {
+            telemetry->full_graph_read_us += ds4_elapsed_us(
+                read_t0, Ds4TimingClock::now());
+        }
+
+        const size_t n_capture = capture_layer_ids->size();
+        for (size_t ci = 0; ci < n_capture; ++ci) {
+            if ((*capture_layer_ids)[ci] != layer) continue;
+            for (int t = capture_begin; t < capture_end; ++t) {
+                float * dst = capture_out->data() +
+                    ((size_t) t * n_capture + ci) * n_embd;
+                const float * src = capture_hc_state.data() +
+                    (size_t) (t - capture_begin) * hc_dim;
+                for (int d = 0; d < n_embd; ++d) {
+                    float sum = 0.0f;
+                    for (int h = 0; h < n_hc; ++h) {
+                        sum += src[(size_t) h * n_embd + d];
+                    }
+                    dst[d] = sum / (float) n_hc;
+                }
+            }
+        }
+    };
 
     Ds4LayerMajorGraphCache * graph_cache = nullptr;
     bool cache_hit = false;
@@ -6097,6 +6228,7 @@ static int ds4_try_layer_major_prefill(
                 telemetry->full_graph_compute_us += ds4_elapsed_us(
                     compute_t0, Ds4TimingClock::now());
             }
+            capture_layer(il, (il & 1) == 0 ? state_b : state_a);
             if (layer.logits) {
                 out_logits.resize((size_t) w.n_vocab);
                 ggml_backend_tensor_get(
@@ -6323,6 +6455,8 @@ static int ds4_try_layer_major_prefill(
                 compute_t0, Ds4TimingClock::now());
         }
 
+        capture_layer(il, state_out);
+
         if (logits) {
             out_logits.resize((size_t) w.n_vocab);
             ggml_backend_tensor_get(logits, out_logits.data(), 0,
@@ -6500,6 +6634,19 @@ bool deepseek4_step_layer_range(
         n_tokens > 4 && n_tokens <= DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS &&
         layer_begin == 0 && is_last_shard && out_logits &&
         ds4_backend_is_gpu(backend);
+    const bool layer_major_hooks_supported =
+        !verify_hooks ||
+        (!verify_hooks->all_logits_out && !verify_hooks->argmax_out &&
+         !verify_hooks->prefer_argmax_only);
+    // The standard layer-major pipeline owns an exact batched compressor.
+    // Let it see the wide prompt before the generic boundary splitter turns
+    // the request into ratio-sized (typically four-token) forwards. It also
+    // owns DSpark feature capture, so the final capture window stays batched.
+    const bool standard_layer_major_prefill =
+        !w.moe_hybrid && cache.prefill_mode != PrefillAttentionMode::Exact &&
+        n_tokens > 4 && n_tokens <= DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS &&
+        layer_begin == 0 && is_last_shard && out_logits &&
+        ds4_backend_is_gpu(backend) && layer_major_hooks_supported;
     // These graphs are rebuilt around an owner join on every layer, so tensor
     // metadata addresses can be recycled for different topologies.  Until
     // the full heterogeneous layer is captured as one stable scheduler graph,
@@ -6517,7 +6664,8 @@ bool deepseek4_step_layer_range(
     // as sequential execution while retaining safe batched prefixes.
     const int first_chunk = deepseek4_safe_compressor_batch_tokens(w, kv_start, n_tokens);
     if (first_chunk > 0 && first_chunk < n_tokens &&
-        !fused_verify_candidate && !heterogeneous_sparse_prefill) {
+        !fused_verify_candidate && !heterogeneous_sparse_prefill &&
+        !standard_layer_major_prefill) {
         const int input_width = layer_begin == 0 ? n_embd : hc_dim;
         std::vector<float> hc_all;
         std::vector<float> shard_out_all;
@@ -6675,14 +6823,13 @@ bool deepseek4_step_layer_range(
 
     // Large full-model prefill batches use the device-resident layer-major
     // pipeline. DSpark verification remains on its exact q=2..4 path below.
-    if (n_tokens > 4 &&
-        n_tokens <= DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS && layer_begin == 0 &&
-        is_last_shard && out_logits && ds4_backend_is_gpu(backend)) {
+    if (standard_layer_major_prefill) {
         const int prc = ds4_try_layer_major_prefill(
             fused_decode_graph_cache, backend, w, cache,
             hc_layer_weights_range, hc_output_weights_range,
             hash_routing_tables_range, scratch.hash_expert_ids, embed,
-            n_tokens, kv_start, *out_logits, token_ids, telemetry);
+            n_tokens, kv_start, *out_logits, token_ids, verify_hooks,
+            telemetry);
         if (prc < 0) return false;
         if (prc > 0) {
             if (telemetry) {
@@ -6760,7 +6907,8 @@ bool deepseek4_step_layer_range(
     if (!moe_hybrid && n_tokens == 1 && allow_decode_graph_reuse && layer_begin == 0 && is_last_shard &&
         !(verify_hooks && verify_hooks->capture_layer_ids &&
           verify_hooks->capture_out) &&
-        out_logits && ds4_backend_is_gpu(backend) && ds4_fused_decode_enabled()) {
+        out_logits && ds4_backend_is_gpu(backend) &&
+        ds4_fused_decode_enabled(w)) {
         const int rc = ds4_try_fused_decode_step(
             fused_decode_graph_cache, backend, w, cache, hc_layer_weights_range,
             hc_output_weights_range, hash_routing_tables_range, scratch.hash_expert_ids,
@@ -6848,6 +6996,38 @@ bool deepseek4_step_layer_range(
                                 hc_state.data(), 0, sizeof(float) * hc_state.size());
         hc_state_backend = cached_decode_hc_post_graph.residual_hc;
     }
+    const auto capture_requested = [&](int layer) {
+        if (!verify_hooks || !verify_hooks->capture_layer_ids ||
+            !verify_hooks->capture_out) {
+            return false;
+        }
+        const std::vector<int> & ids = *verify_hooks->capture_layer_ids;
+        return std::find(ids.begin(), ids.end(), layer) != ids.end();
+    };
+    const auto capture_hc_layer = [&](int layer, const float * state) {
+        if (!state || !capture_requested(layer)) return;
+        const std::vector<int> & ids = *verify_hooks->capture_layer_ids;
+        std::vector<float> & capture = *verify_hooks->capture_out;
+        if ((int) capture.size() != (int) ids.size() * n_embd * n_tokens) {
+            capture.assign(
+                (size_t) ids.size() * n_embd * n_tokens, 0.0f);
+        }
+        for (size_t ci = 0; ci < ids.size(); ++ci) {
+            if (ids[ci] != layer) continue;
+            for (int t = 0; t < n_tokens; ++t) {
+                float * dst = capture.data() +
+                    (size_t) t * ids.size() * n_embd + ci * n_embd;
+                const float * hs = state + (size_t) t * hc_dim;
+                for (int d = 0; d < n_embd; ++d) {
+                    float sum = 0.0f;
+                    for (int h = 0; h < n_hc; ++h) {
+                        sum += hs[(size_t) h * n_embd + d];
+                    }
+                    dst[d] = sum / (float) n_hc;
+                }
+            }
+        }
+    };
     for (int il = layer_begin; il < layer_end; ++il) {
         const DeepSeek4Layer & L = w.layers[(size_t)il];
         DeepSeek4LayerCache & lc = cache.layers[(size_t)il];
@@ -7518,25 +7698,15 @@ bool deepseek4_step_layer_range(
                               n_hc);
                 std::memcpy(hc_state.data(), next_hc.data(), next_hc.size() * sizeof(float));
                 if (telemetry) telemetry->hc_post_ffn_us += ds4_elapsed_us(hc_post_ffn_t0, Ds4TimingClock::now());
-                if (verify_hooks && verify_hooks->capture_layer_ids && verify_hooks->capture_out) {
-                    const std::vector<int> & _ids = *verify_hooks->capture_layer_ids;
-                    for (size_t _ci = 0; _ci < _ids.size(); ++_ci) {
-                        if (_ids[_ci] != il) continue;
-                        const int _ncap = (int) _ids.size();
-                        std::vector<float> & _cap = *verify_hooks->capture_out;
-                        if ((int) _cap.size() != _ncap * n_embd * n_tokens)
-                            _cap.assign((size_t) _ncap * n_embd * n_tokens, 0.0f);
-                        for (int _t = 0; _t < n_tokens; ++_t) {
-                            float * _dst = _cap.data() + (size_t) _t * _ncap * n_embd + (size_t) _ci * n_embd;
-                            const float * _hs = hc_state.data() + (size_t) _t * hc_dim;
-                            for (int _d = 0; _d < n_embd; ++_d) {
-                                float _acc = 0.0f;
-                                for (int _h = 0; _h < n_hc; ++_h) _acc += _hs[(size_t) _h * n_embd + _d];
-                                _dst[_d] = _acc / (float) n_hc;
-                            }
-                        }
-                    }
-                }
+                capture_hc_layer(il, hc_state.data());
+            }
+            if ((use_backend_prefill_hc || use_backend_decode_hc_graph ||
+                 use_backend_decode_hc_direct) &&
+                hc_state_backend && capture_requested(il)) {
+                ggml_backend_tensor_get(
+                    hc_state_backend, hc_state.data(), 0,
+                    sizeof(float) * hc_state.size());
+                capture_hc_layer(il, hc_state.data());
             }
         }
     }
@@ -7585,7 +7755,9 @@ bool deepseek4_step_layer_range(
             ggml_context * ctx = ggml_init(params);
             if (!ctx) return false;
 
-            const bool last_only = n_tokens > 1;
+            const bool need_all_logits =
+                verify_hooks && verify_hooks->all_logits_out;
+            const bool last_only = n_tokens > 1 && !need_all_logits;
             const int output_tokens = last_only ? 1 : n_tokens;
             ggml_tensor * inp = ggml_new_tensor_2d(
                 ctx, GGML_TYPE_F32, n_embd, output_tokens);
@@ -7776,6 +7948,49 @@ ggml_tensor * clone_snapshot_tensor(ggml_context * ctx,
     return dst;
 }
 
+ggml_tensor * clone_snapshot_rows(ggml_context * ctx,
+                                  const ggml_tensor * src,
+                                  int live_rows,
+                                  const char * name) {
+    if (!ctx || !src || ggml_n_dims(src) != 2 || live_rows < 0 ||
+        live_rows > src->ne[1]) {
+        return nullptr;
+    }
+    // GGML tensors cannot have an empty physical dimension. Keep one
+    // allocated row for an empty logical prefix, but copy zero bytes below.
+    const int64_t allocated_rows = std::max(1, live_rows);
+    ggml_tensor * dst = ggml_new_tensor_2d(
+        ctx, src->type, src->ne[0], allocated_rows);
+    if (!dst) return nullptr;
+    if (name && *name) ggml_set_name(dst, name);
+    return dst;
+}
+
+size_t tensor_prefix_bytes(const ggml_tensor * tensor, int rows) {
+    if (!tensor || rows <= 0) return 0;
+    return ggml_row_size(tensor->type, tensor->ne[0]) * (size_t) rows;
+}
+
+bool copy_tensor_prefix_from_backend(const ggml_tensor * src,
+                                     ggml_tensor * dst,
+                                     int rows) {
+    if (!src || !dst || rows < 0) return false;
+    const size_t bytes = tensor_prefix_bytes(src, rows);
+    if (bytes > ggml_nbytes(src) || bytes > ggml_nbytes(dst)) return false;
+    if (bytes > 0) ggml_backend_tensor_get(src, dst->data, 0, bytes);
+    return true;
+}
+
+bool copy_tensor_prefix_to_backend(const ggml_tensor * src,
+                                   ggml_tensor * dst,
+                                   int rows) {
+    if (!src || !dst || rows < 0) return false;
+    const size_t bytes = tensor_prefix_bytes(src, rows);
+    if (bytes > ggml_nbytes(src) || bytes > ggml_nbytes(dst)) return false;
+    if (bytes > 0) ggml_backend_tensor_set(dst, src->data, 0, bytes);
+    return true;
+}
+
 bool copy_tensor_from_backend(const ggml_tensor * src, ggml_tensor * dst) {
     if (!src || !dst) return false;
     const size_t bytes = ggml_nbytes(src);
@@ -7802,14 +8017,44 @@ bool tensors_compatible(const ggml_tensor * a, const ggml_tensor * b) {
     return true;
 }
 
+bool prefix_tensors_compatible(const ggml_tensor * snap,
+                               const ggml_tensor * cache,
+                               int live_rows) {
+    if (!!snap != !!cache) return false;
+    if (!snap) return live_rows == 0;
+    // A right-sized zero/one-row tensor reports one logical GGML dimension,
+    // while its full-capacity cache tensor reports two. Compare the physical
+    // row layout instead of ggml_n_dims() so those valid snapshots restore.
+    if (live_rows < 0 || cache->ne[1] <= 0 ||
+        snap->type != cache->type ||
+        snap->ne[0] != cache->ne[0] || live_rows > cache->ne[1]) {
+        return false;
+    }
+    for (int i = 2; i < GGML_MAX_DIMS; ++i) {
+        if (snap->ne[i] != cache->ne[i]) return false;
+    }
+    return snap->ne[1] == std::max(1, live_rows);
+}
+
 }  // namespace
 
 bool deepseek4_snapshot_save(const DeepSeek4Cache & cache,
                              ggml_backend_t snapshot_backend,
                              DeepSeek4Snapshot & out) {
     if (!snapshot_backend || !cache.ctx || !cache.buf || !cache.hc_state ||
-        cache.layers.size() != (size_t)cache.n_layer) {
+        cache.layers.size() != (size_t)cache.n_layer || cache.cur_pos < 0 ||
+        cache.cur_pos > cache.max_ctx) {
         return false;
+    }
+    for (const auto & layer : cache.layers) {
+        if (layer.n_comp < 0 || layer.n_index_comp < 0 ||
+            (layer.comp_kv && layer.n_comp > layer.comp_kv->ne[1]) ||
+            (!layer.comp_kv && layer.n_comp != 0) ||
+            (layer.index_comp_kv &&
+             layer.n_index_comp > layer.index_comp_kv->ne[1]) ||
+            (!layer.index_comp_kv && layer.n_index_comp != 0)) {
+            return false;
+        }
     }
 
     free_deepseek4_snapshot(out);
@@ -7833,8 +8078,13 @@ bool deepseek4_snapshot_save(const DeepSeek4Cache & cache,
         const auto & src = cache.layers[(size_t)il];
         auto & dst = out.layers[(size_t)il];
         dst.raw_kv = clone_snapshot_tensor(out.ctx, src.raw_kv, nullptr);
-        dst.comp_kv = clone_snapshot_tensor(out.ctx, src.comp_kv, nullptr);
-        dst.index_comp_kv = clone_snapshot_tensor(out.ctx, src.index_comp_kv, nullptr);
+        dst.comp_kv = src.comp_kv
+            ? clone_snapshot_rows(out.ctx, src.comp_kv, src.n_comp, nullptr)
+            : nullptr;
+        dst.index_comp_kv = src.index_comp_kv
+            ? clone_snapshot_rows(out.ctx, src.index_comp_kv,
+                                  src.n_index_comp, nullptr)
+            : nullptr;
         dst.attn_compressor.state_kv =
             clone_snapshot_tensor(out.ctx, src.attn_compressor.state_kv, nullptr);
         dst.attn_compressor.state_score =
@@ -7871,9 +8121,13 @@ bool deepseek4_snapshot_save(const DeepSeek4Cache & cache,
         dst.n_comp = src.n_comp;
         dst.n_index_comp = src.n_index_comp;
         if (!copy_tensor_from_backend(src.raw_kv, dst.raw_kv) ||
-            (src.comp_kv && !copy_tensor_from_backend(src.comp_kv, dst.comp_kv)) ||
+            (src.comp_kv &&
+             !copy_tensor_prefix_from_backend(src.comp_kv, dst.comp_kv,
+                                              src.n_comp)) ||
             (src.index_comp_kv &&
-             !copy_tensor_from_backend(src.index_comp_kv, dst.index_comp_kv)) ||
+             !copy_tensor_prefix_from_backend(src.index_comp_kv,
+                                              dst.index_comp_kv,
+                                              src.n_index_comp)) ||
             (src.attn_compressor.state_kv &&
              !copy_tensor_from_backend(src.attn_compressor.state_kv,
                                        dst.attn_compressor.state_kv)) ||
@@ -7898,30 +8152,79 @@ bool deepseek4_snapshot_save(const DeepSeek4Cache & cache,
 bool deepseek4_snapshot_restore(const DeepSeek4Snapshot & snap,
                                 DeepSeek4Cache & cache) {
     if (!snap.ctx || !cache.ctx || !cache.buf || !snap.hc_state_snap ||
-        snap.layers.size() != cache.layers.size()) {
+        snap.layers.size() != cache.layers.size() || snap.cur_pos < 0 ||
+        snap.cur_pos > cache.max_ctx) {
+        std::fprintf(stderr,
+                     "[deepseek4] snapshot restore: invalid header "
+                     "(snap_ctx=%d cache_ctx=%d snap_layers=%zu "
+                     "cache_layers=%zu pos=%d max_ctx=%d)\n",
+                     snap.ctx != nullptr, cache.ctx != nullptr,
+                     snap.layers.size(), cache.layers.size(),
+                     snap.cur_pos, cache.max_ctx);
         return false;
     }
-    if (!tensors_compatible(snap.hc_state_snap, cache.hc_state) ||
-        !copy_tensor_to_backend(snap.hc_state_snap, cache.hc_state)) {
+    if (!tensors_compatible(snap.hc_state_snap, cache.hc_state)) {
+        std::fprintf(stderr,
+                     "[deepseek4] snapshot restore: incompatible HC state\n");
         return false;
     }
 
+    // Validate the complete layout before changing the live cache. Compressed
+    // tensors are deliberately right-sized to their logical row counts;
+    // inactive capacity rows are not part of the snapshot contract.
+    for (size_t il = 0; il < cache.layers.size(); ++il) {
+        const auto & src = snap.layers[il];
+        const auto & dst = cache.layers[il];
+        const bool raw_ok = tensors_compatible(src.raw_kv, dst.raw_kv);
+        const bool comp_ok = prefix_tensors_compatible(
+            src.comp_kv, dst.comp_kv, src.n_comp);
+        const bool index_ok = prefix_tensors_compatible(
+            src.index_comp_kv, dst.index_comp_kv, src.n_index_comp);
+        const bool attn_kv_ok = tensors_compatible(
+            src.attn_compressor.state_kv, dst.attn_compressor.state_kv);
+        const bool attn_score_ok = tensors_compatible(
+            src.attn_compressor.state_score, dst.attn_compressor.state_score);
+        const bool index_kv_ok = tensors_compatible(
+            src.indexer_compressor.state_kv, dst.indexer_compressor.state_kv);
+        const bool index_score_ok = tensors_compatible(
+            src.indexer_compressor.state_score,
+            dst.indexer_compressor.state_score);
+        if (!raw_ok || !comp_ok || !index_ok || !attn_kv_ok ||
+            !attn_score_ok || !index_kv_ok || !index_score_ok) {
+            std::fprintf(stderr,
+                         "[deepseek4] snapshot restore: incompatible layer %zu "
+                         "(raw=%d comp=%d[%d/%lld/%lld] "
+                         "index=%d[%d/%lld/%lld] states=%d/%d/%d/%d)\n",
+                         il, raw_ok, comp_ok, src.n_comp,
+                         (long long) (src.comp_kv ? src.comp_kv->ne[1] : 0),
+                         (long long) (dst.comp_kv ? dst.comp_kv->ne[1] : 0),
+                         index_ok, src.n_index_comp,
+                         (long long) (src.index_comp_kv
+                             ? src.index_comp_kv->ne[1] : 0),
+                         (long long) (dst.index_comp_kv
+                             ? dst.index_comp_kv->ne[1] : 0),
+                         attn_kv_ok, attn_score_ok,
+                         index_kv_ok, index_score_ok);
+            return false;
+        }
+    }
+
+    if (!copy_tensor_to_backend(snap.hc_state_snap, cache.hc_state)) {
+        std::fprintf(stderr,
+                     "[deepseek4] snapshot restore: HC copy failed\n");
+        return false;
+    }
     for (size_t il = 0; il < cache.layers.size(); ++il) {
         const auto & src = snap.layers[il];
         auto & dst = cache.layers[il];
-        if (!tensors_compatible(src.raw_kv, dst.raw_kv) ||
-            !tensors_compatible(src.comp_kv, dst.comp_kv) ||
-            !tensors_compatible(src.index_comp_kv, dst.index_comp_kv) ||
-            !tensors_compatible(src.attn_compressor.state_kv, dst.attn_compressor.state_kv) ||
-            !tensors_compatible(src.attn_compressor.state_score, dst.attn_compressor.state_score) ||
-            !tensors_compatible(src.indexer_compressor.state_kv, dst.indexer_compressor.state_kv) ||
-            !tensors_compatible(src.indexer_compressor.state_score, dst.indexer_compressor.state_score)) {
-            return false;
-        }
         if (!copy_tensor_to_backend(src.raw_kv, dst.raw_kv) ||
-            (src.comp_kv && !copy_tensor_to_backend(src.comp_kv, dst.comp_kv)) ||
+            (src.comp_kv &&
+             !copy_tensor_prefix_to_backend(src.comp_kv, dst.comp_kv,
+                                            src.n_comp)) ||
             (src.index_comp_kv &&
-             !copy_tensor_to_backend(src.index_comp_kv, dst.index_comp_kv)) ||
+             !copy_tensor_prefix_to_backend(src.index_comp_kv,
+                                            dst.index_comp_kv,
+                                            src.n_index_comp)) ||
             (src.attn_compressor.state_kv &&
              !copy_tensor_to_backend(src.attn_compressor.state_kv,
                                      dst.attn_compressor.state_kv)) ||
@@ -7933,7 +8236,10 @@ bool deepseek4_snapshot_restore(const DeepSeek4Snapshot & snap,
                                      dst.indexer_compressor.state_kv)) ||
             (src.indexer_compressor.state_score &&
              !copy_tensor_to_backend(src.indexer_compressor.state_score,
-                                     dst.indexer_compressor.state_score))) {
+                                       dst.indexer_compressor.state_score))) {
+            std::fprintf(stderr,
+                         "[deepseek4] snapshot restore: layer %zu copy failed\n",
+                         il);
             return false;
         }
         dst.n_comp = src.n_comp;

@@ -273,7 +273,7 @@ bool run_dflash_spec_decode(
         for (int i = 0; i < commit_n; i++) {
             out_all.push_back(replay_tok[i]);
             io.emit(replay_tok[i]);
-            if (io.cancelled) break;
+            if (io.is_cancelled()) break;
             ++emitted;
             if (target.is_eos(replay_tok[i])) hit_eos = true;
         }
@@ -287,7 +287,7 @@ bool run_dflash_spec_decode(
             io.observer("verify", replay_tok);
         }
 
-        if (io.cancelled) break;
+        if (io.is_cancelled()) break;
         if (hit_eos) break;
     }
     if (!use_remote_draft && draft_backend) ggml_backend_synchronize(draft_backend);

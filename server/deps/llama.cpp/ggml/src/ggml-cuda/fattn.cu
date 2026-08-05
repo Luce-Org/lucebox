@@ -368,6 +368,111 @@ __global__ static void ds4_fa_indexed_rows_kernel(
     }
 }
 
+// Long contexts used to compact the exact indexer mask on thread 0, scanning
+// every compressed row serially for every token and layer. Compact chunks in
+// physical-row order with warp ballots instead. The generated selected_rows
+// and per-owner rank lists are deliberately identical to the serial kernel so
+// the attention accumulation order and logits remain unchanged.
+template <typename Mask>
+__global__ static void ds4_fa_indexed_rows_parallel_kernel(
+        const Mask * mask,
+        int        * selected_rows,
+        int        * selected_counts,
+        int        * owner_offsets,
+        int        * owner_ranks,
+        int          n_tokens,
+        int          n_kv,
+        int          raw_rows,
+        int          capacity) {
+    const int t = (int) blockIdx.x;
+    const int tid = (int) threadIdx.x;
+    if (t >= n_tokens) return;
+
+    constexpr int N_THREADS = 256;
+    constexpr int MAX_WARPS = N_THREADS / 32;
+    __shared__ int warp_offsets[MAX_WARPS];
+    __shared__ int owner_counts[N_THREADS];
+    __shared__ int chunk_base;
+    __shared__ int total_selected;
+
+    const int n_comp_rows = n_kv - raw_rows;
+    const Mask * token_mask = mask + (size_t) t * n_kv;
+    int * token_rows = selected_rows + (size_t) t * capacity;
+    int * token_owner_offsets = owner_offsets + (size_t) t * (N_THREADS + 1);
+    int * token_owner_ranks = owner_ranks + (size_t) t * capacity;
+
+    owner_counts[tid] = 0;
+    if (tid == 0) total_selected = 0;
+    __syncthreads();
+
+    const int lane = tid % warpSize;
+    const int warp = tid / warpSize;
+    const int n_warps = N_THREADS / warpSize;
+    for (int base = 0; base < n_comp_rows; base += N_THREADS) {
+        const int c = base + tid;
+        const bool selected = c < n_comp_rows &&
+            ds4_fa_load<Mask, Mask>(token_mask + raw_rows + c) > -1.0e20f;
+        const unsigned long long selected_bits = __ballot(selected);
+        if (lane == 0) {
+            warp_offsets[warp] = __popcll(selected_bits);
+        }
+        __syncthreads();
+
+        if (tid == 0) {
+            int prefix = 0;
+            for (int w = 0; w < n_warps; ++w) {
+                const int count = warp_offsets[w];
+                warp_offsets[w] = prefix;
+                prefix += count;
+            }
+            chunk_base = total_selected;
+            total_selected += prefix;
+        }
+        __syncthreads();
+
+        const unsigned long long lower_lanes = lane == 0
+            ? 0ULL
+            : ((1ULL << lane) - 1ULL);
+        const int rank = chunk_base + warp_offsets[warp] +
+            __popcll(selected_bits & lower_lanes);
+        if (selected && rank < capacity) {
+            token_rows[rank] = raw_rows + c;
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        selected_counts[t] = min(total_selected, capacity);
+    }
+    __syncthreads();
+
+    const int count = selected_counts[t];
+    for (int rank = tid; rank < count; rank += N_THREADS) {
+        const int owner = token_rows[rank] & (N_THREADS - 1);
+        atomicAdd(owner_counts + owner, 1);
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        int prefix = 0;
+        for (int owner = 0; owner < N_THREADS; ++owner) {
+            token_owner_offsets[owner] = prefix;
+            prefix += owner_counts[owner];
+        }
+        token_owner_offsets[N_THREADS] = prefix;
+    }
+    __syncthreads();
+
+    // One thread owns each original attention reduction lane. Walking the
+    // already sorted rows preserves the serial kernel's rank order per owner.
+    int write = token_owner_offsets[tid];
+    for (int rank = 0; rank < count; ++rank) {
+        if ((token_rows[rank] & (N_THREADS - 1)) == tid) {
+            token_owner_ranks[write++] = rank;
+        }
+    }
+}
+
 template <typename KV, typename Mask>
 __global__ static void ds4_flash_attn_d512_shared_kv_kernel(
         float       * dst,
@@ -1748,18 +1853,36 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
                 (size_t) n_tokens * 257);
             indexed_owner_ranks = indexed_owner_ranks_alloc.alloc(
                 (size_t) n_tokens * indexed_capacity);
+            const bool parallel_index_scan = n_comp_rows > 512 &&
+                getenv("GGML_DS4_FA_SERIAL_INDEX_SCAN") == nullptr;
             if (mask->type == GGML_TYPE_F16) {
-                ds4_fa_indexed_rows_kernel<half><<<n_tokens, 256, 0, stream>>>(
-                    (const half *) mask->data, indexed_rows, indexed_counts,
-                    indexed_owner_offsets, indexed_owner_ranks,
-                    n_tokens, n_kv, raw_rows,
-                    indexed_capacity);
+                if (parallel_index_scan) {
+                    ds4_fa_indexed_rows_parallel_kernel<half><<<n_tokens, 256, 0, stream>>>(
+                        (const half *) mask->data, indexed_rows, indexed_counts,
+                        indexed_owner_offsets, indexed_owner_ranks,
+                        n_tokens, n_kv, raw_rows,
+                        indexed_capacity);
+                } else {
+                    ds4_fa_indexed_rows_kernel<half><<<n_tokens, 256, 0, stream>>>(
+                        (const half *) mask->data, indexed_rows, indexed_counts,
+                        indexed_owner_offsets, indexed_owner_ranks,
+                        n_tokens, n_kv, raw_rows,
+                        indexed_capacity);
+                }
             } else {
-                ds4_fa_indexed_rows_kernel<float><<<n_tokens, 256, 0, stream>>>(
-                    (const float *) mask->data, indexed_rows, indexed_counts,
-                    indexed_owner_offsets, indexed_owner_ranks,
-                    n_tokens, n_kv, raw_rows,
-                    indexed_capacity);
+                if (parallel_index_scan) {
+                    ds4_fa_indexed_rows_parallel_kernel<float><<<n_tokens, 256, 0, stream>>>(
+                        (const float *) mask->data, indexed_rows, indexed_counts,
+                        indexed_owner_offsets, indexed_owner_ranks,
+                        n_tokens, n_kv, raw_rows,
+                        indexed_capacity);
+                } else {
+                    ds4_fa_indexed_rows_kernel<float><<<n_tokens, 256, 0, stream>>>(
+                        (const float *) mask->data, indexed_rows, indexed_counts,
+                        indexed_owner_offsets, indexed_owner_ranks,
+                        n_tokens, n_kv, raw_rows,
+                        indexed_capacity);
+                }
             }
             CUDA_CHECK(cudaGetLastError());
         }

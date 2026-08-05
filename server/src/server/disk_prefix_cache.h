@@ -113,7 +113,9 @@ public:
     DiskPrefixCache(const DiskPrefixCache &) = delete;
     DiskPrefixCache & operator=(const DiskPrefixCache &) = delete;
 
-    bool disabled() const { return config_.cache_dir.empty(); }
+    bool disabled() const {
+        return config_.cache_dir.empty() || backend_snapshot_unsupported_;
+    }
 
     // Initialize: create directory, scan existing files, learn layout from
     // first available snapshot. Returns false on fatal error.
@@ -170,6 +172,10 @@ public:
 private:
     DiskCacheConfig config_;
     ModelBackend &  backend_;
+    // Some backends support in-memory snapshots but deliberately do not
+    // implement SnapshotRef/adoption. Detect that once from a live slot and
+    // stop scheduling disk work for the rest of the process.
+    bool backend_snapshot_unsupported_ = false;
 
     // Continued checkpoint tracking (per-session).
     int continued_last_store_pos_ = 0;

@@ -384,6 +384,7 @@ int Qwen3Backend::do_prefill(const std::vector<int32_t> & tokens,
     std::vector<float> embed_buf((size_t)chunk * hidden);
 
     for (int start = 0; start < total; start += chunk) {
+        if (io.is_cancelled()) break;
         const int n = std::min(chunk, total - start);
 
         // CPU embedding: read rows from tok_embd (which is on GPU)
@@ -464,7 +465,7 @@ bool Qwen3Backend::do_decode(int committed, int n_gen,
         io.emit(next);
         committed++;
         cache_.cur_pos = committed;
-        if (io.cancelled) break;
+        if (io.is_cancelled()) break;
 
         // Check EOS
         if (next == 151643 || next == 151645) break;
@@ -526,6 +527,10 @@ GenerateResult Qwen3Backend::generate_impl(const GenerateRequest & req,
     const int committed = do_prefill(req.prompt, out_io);
     if (committed < 0) {
         result.fail(GenerateErrorCode::PrefillFailed);
+        return result;
+    }
+    if (out_io.is_cancelled()) {
+        result.succeed();
         return result;
     }
 
@@ -596,7 +601,7 @@ GenerateResult Qwen3Backend::generate_impl(const GenerateRequest & req,
         }
         result.tokens.push_back(first);
         out_io.emit(first);
-        if (out_io.cancelled) {
+        if (out_io.is_cancelled()) {
             out_io.emit(-1);
             result.succeed();
             return result;
@@ -695,6 +700,10 @@ GenerateResult Qwen3Backend::restore_and_generate_impl(int slot,
             return result;
         }
     }
+    if (out_io.is_cancelled()) {
+        result.succeed();
+        return result;
+    }
 
     // Now generate (decode) from here
     const int total_committed = (int)req.prompt.size();
@@ -763,7 +772,7 @@ GenerateResult Qwen3Backend::restore_and_generate_impl(int slot,
         }
         result.tokens.push_back(first);
         out_io.emit(first);
-        if (out_io.cancelled) {
+        if (out_io.is_cancelled()) {
             out_io.emit(-1);
             result.succeed();
             return result;

@@ -382,6 +382,10 @@ bool deepseek4_step(
 struct Ds4VerifyHooks {
     const std::vector<int> * capture_layer_ids = nullptr;  // e.g. {40,41,42}
     std::vector<float> *     capture_out = nullptr;         // [n_cap*n_embd * n_tokens]
+    // Optional relative token range for layer-major feature readback. Generic
+    // verifier paths may ignore this and return the complete batch.
+    int                      capture_token_begin = 0;
+    int                      capture_token_end = -1;        // exclusive; -1 = n_tokens
     std::vector<float> *     all_logits_out = nullptr;      // [n_vocab * n_tokens]
     std::vector<int32_t> *   argmax_out = nullptr;          // [n_tokens], optional GPU result
     bool                     prefer_argmax_only = false;     // skip logits D2H when available

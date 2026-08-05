@@ -6,7 +6,17 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${BUDGET:=22}"
 : "${VERIFY_MODE:=ddtree}"
 : "${EXTRA_SERVER_ARGS:=--lazy-draft}"
+: "${OPENCODE_TIMEOUT:=3600}"
+: "${OPENCODE_REQUEST_TIMEOUT_MS:=3600000}"
+: "${OPENCODE_CHUNK_TIMEOUT_MS:=3600000}"
 source "$SCRIPT_DIR/common.sh"
+
+for timeout_ms in "$OPENCODE_REQUEST_TIMEOUT_MS" "$OPENCODE_CHUNK_TIMEOUT_MS"; do
+  if [[ ! "$timeout_ms" =~ ^(0|[1-9][0-9]*)$ ]]; then
+    echo "OpenCode timeouts must be canonical non-negative integers (milliseconds)" >&2
+    exit 2
+  fi
+done
 
 CLIENT_OUT="$LOG_DIR/opencode.out"
 EXPORT_OUT="$LOG_DIR/opencode-export.json"
@@ -36,8 +46,8 @@ cat > "$PROJECT_DIR/opencode.json" <<JSON
       "options": {
         "baseURL": "$BASE_URL/v1",
         "apiKey": "$API_KEY",
-        "timeout": 600000,
-        "chunkTimeout": 60000
+        "timeout": $OPENCODE_REQUEST_TIMEOUT_MS,
+        "chunkTimeout": $OPENCODE_CHUNK_TIMEOUT_MS
       },
       "models": {
         "$MODEL_ID": {
@@ -63,11 +73,12 @@ wait_lucebox_server
 
 set +e
 cd "$PROJECT_DIR"
-HOME="$HOME_DIR" \
-XDG_CONFIG_HOME="$HOME_DIR/.config" \
-XDG_DATA_HOME="$HOME_DIR/.local/share" \
-OPENAI_API_KEY="$API_KEY" \
-timeout 300s "$OPENCODE_BIN" run \
+run_with_timeout "$OPENCODE_TIMEOUT" env \
+  HOME="$HOME_DIR" \
+  XDG_CONFIG_HOME="$HOME_DIR/.config" \
+  XDG_DATA_HOME="$HOME_DIR/.local/share" \
+  OPENAI_API_KEY="$API_KEY" \
+  "$OPENCODE_BIN" run \
   --pure \
   --model "lucebox/$MODEL_ID" \
   --format json \

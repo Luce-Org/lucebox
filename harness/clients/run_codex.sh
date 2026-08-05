@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${BUDGET:=22}"
 : "${VERIFY_MODE:=ddtree}"
 : "${EXTRA_SERVER_ARGS:=--lazy-draft}"
+: "${CODEX_TIMEOUT:=3600}"
 if [[ "${MODEL_SERVER:-}" == "llamacpp" ]]; then
   : "${LLAMA_COMPAT_PROXY:=responses}"
 fi
@@ -38,10 +39,11 @@ trap stop_lucebox_server EXIT
 wait_lucebox_server
 
 set +e
-HOME="$CODEX_HOME_DIR" \
-CODEX_HOME="$CODEX_HOME_DIR" \
-OPENAI_API_KEY="$API_KEY" \
-timeout 420s "$CODEX_BIN" exec \
+run_with_timeout "$CODEX_TIMEOUT" env \
+  HOME="$CODEX_HOME_DIR" \
+  CODEX_HOME="$CODEX_HOME_DIR" \
+  OPENAI_API_KEY="$API_KEY" \
+  "$CODEX_BIN" exec \
   --skip-git-repo-check \
   --sandbox "$CODEX_SANDBOX" \
   --model "$MODEL_ID" \

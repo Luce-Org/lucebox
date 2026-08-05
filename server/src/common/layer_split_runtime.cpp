@@ -30,7 +30,7 @@ bool run_layer_split_ar_decode(
     out_tokens.push_back(last_tok);
     if (sampler.needs_logit_processing()) history.push_back(last_tok);
     io.emit(last_tok);
-    if (io.cancelled) {
+    if (io.is_cancelled()) {
         io.emit(-1);
         return true;
     }
@@ -60,7 +60,7 @@ bool run_layer_split_ar_decode(
         if (sampler.needs_logit_processing()) history.push_back(last_tok);
         io.emit(last_tok);
         ++committed;
-        if (io.cancelled) break;
+        if (io.is_cancelled()) break;
         if (is_eos(last_tok)) break;
     }
 

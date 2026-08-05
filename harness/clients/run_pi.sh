@@ -7,6 +7,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${VERIFY_MODE:=ddtree}"
 : "${EXTRA_SERVER_ARGS:=--lazy-draft}"
 : "${PI_TOOLS:=read,grep,find,ls}"
+: "${PI_TIMEOUT:=3600}"
+if [[ ! "$PI_TIMEOUT" =~ ^[0-9]+$ ]]; then
+  echo "PI_TIMEOUT must be a non-negative integer (seconds; 0 disables it)" >&2
+  exit 2
+fi
 source "$SCRIPT_DIR/common.sh"
 
 CLIENT_OUT="$LOG_DIR/pi.out"
@@ -21,7 +26,8 @@ cat > "$AGENT_DIR/settings.json" <<JSON
 {
   "compaction": {
     "enabled": false
-  }
+  },
+  "httpIdleTimeoutMs": 0
 }
 JSON
 
@@ -59,21 +65,32 @@ start_lucebox_server
 trap stop_lucebox_server EXIT
 wait_lucebox_server
 
+pi_env=(
+  "HOME=$HOME_DIR"
+  "PI_CODING_AGENT_DIR=$AGENT_DIR"
+  "PI_CODING_AGENT_SESSION_DIR=$HOME_DIR/sessions"
+  "PI_OFFLINE=1"
+)
+pi_cmd=(
+  "$PI_BIN"
+  --provider lucebox
+  --model "$MODEL_ID"
+  --print
+  --mode json
+  --tools "$PI_TOOLS"
+  --no-session
+  --offline
+  "$PROMPT"
+)
+
 set +e
-HOME="$HOME_DIR" \
-PI_CODING_AGENT_DIR="$AGENT_DIR" \
-PI_CODING_AGENT_SESSION_DIR="$HOME_DIR/sessions" \
-PI_OFFLINE=1 \
-timeout 300s "$PI_BIN" \
-  --provider lucebox \
-  --model "$MODEL_ID" \
-  --print \
-  --mode json \
-  --tools "$PI_TOOLS" \
-  --no-session \
-  --offline \
-  "$PROMPT" \
-  < /dev/null > "$CLIENT_OUT" 2>&1
+if [[ "$PI_TIMEOUT" == "0" ]]; then
+  env "${pi_env[@]}" "${pi_cmd[@]}" \
+    < /dev/null > "$CLIENT_OUT" 2>&1
+else
+  env "${pi_env[@]}" timeout "${PI_TIMEOUT}s" "${pi_cmd[@]}" \
+    < /dev/null > "$CLIENT_OUT" 2>&1
+fi
 RC=$?
 set -e
 

@@ -6,8 +6,10 @@
 //   - Per-client thread: parse HTTP request, enqueue job, wait for completion
 //   - Single worker thread: dequeue jobs, call ModelBackend::generate()
 //
-// Client disconnect detection: the worker writes SSE chunks via send().
-// If send() fails (EPIPE/ECONNRESET), generation aborts immediately.
+// Client disconnect detection: the client thread watches the socket while the
+// worker generates, and streaming writes provide a second failure signal.
+// Heartbeat comments keep long prefill phases alive through HTTP clients with
+// body-idle timeouts.
 
 #pragma once
 
@@ -29,6 +31,7 @@
 #include <nlohmann/json.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
@@ -49,6 +52,23 @@ using json = nlohmann::json;
 // ─── Forward declarations ───────────────────────────────────────────────
 struct ServerJob;
 class SseEmitter;
+
+namespace http_detail {
+// Non-consuming peer-state probe used by the client-thread job monitor.
+// A read half-close is not a disconnect: HTTP clients may finish writing a
+// request and continue reading its response. Public for model-free tests.
+enum class PeerSocketState {
+    Connected,
+    ReadClosed,
+    Disconnected,
+};
+PeerSocketState inspect_peer_socket(SocketHandle fd);
+
+// Incrementally inspect complete SSE lines for the terminal data event.
+// `partial_line` carries an unterminated line across transport chunks.
+bool sse_chunk_has_done(std::string & partial_line,
+                        const char * data, size_t size);
+}
 
 // ─── Server configuration ───────────────────────────────────────────────
 struct ServerConfig {
@@ -327,7 +347,7 @@ private:
                                   PreparedPrompt & prepared);
     std::string apply_pflash_compression(const ParsedRequest & req,
                                          PreparedPrompt & prepared);
-    bool forward_upstream(SocketHandle fd, const ParsedRequest & req,
+    bool forward_upstream(ServerJob * job, const ParsedRequest & req,
                           const PreparedPrompt & prepared);
 
     struct GenerationCacheState {
@@ -372,7 +392,7 @@ private:
         const ParsedRequest & req, const PreparedPrompt & prepared,
         GenerationInputs & inputs);
     void configure_generation_io(
-        SocketHandle fd, const ParsedRequest & req, SseEmitter & emitter,
+        ServerJob * job, const ParsedRequest & req, SseEmitter & emitter,
         GenerationOutputState & output, DaemonIO & io);
 
     // Parse HTTP request from socket.
@@ -406,10 +426,14 @@ private:
     bool send_response(SocketHandle fd, int status, const std::string & content_type,
                        const std::string & body);
     bool send_error(SocketHandle fd, int status, const std::string & message);
-    bool send_sse_headers(SocketHandle fd);
+    bool send_sse_headers(ServerJob * job);
 
     // Send raw bytes with stall detection.
     bool send_all(SocketHandle fd, const void * data, size_t len);
+    bool send_job_bytes(ServerJob * job, const void * data, size_t len);
+    void start_job_stream(ServerJob * job);
+    void stop_job_stream(ServerJob * job);
+    void maybe_send_job_heartbeat(ServerJob * job, bool peer_read_closed);
 
     // Job queue.
     void enqueue(ServerJob * job);
@@ -496,6 +520,14 @@ struct ServerJob {
     bool          done = false;
     std::mutex    mu;
     std::condition_variable cv;
+    // Streaming output is written by both the worker (SSE data) and the
+    // client-thread monitor (heartbeat comments). Serialize complete frames
+    // so their bytes can never interleave.
+    std::mutex    write_mu;
+    bool          stream_ready = false;
+    bool          read_close_probe_sent = false;
+    std::chrono::steady_clock::time_point last_stream_write{};
+    std::atomic<bool> client_disconnected{false};
     ServerJob *   next = nullptr;
 };
 

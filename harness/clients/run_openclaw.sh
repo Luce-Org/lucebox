@@ -7,6 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${VERIFY_MODE:=ddtree}"
 # FA_WINDOW stays 0 (common.sh): finite windows break tool calls.
 : "${EXTRA_SERVER_ARGS:=--lazy-draft}"
+: "${OPENCLAW_TIMEOUT:=3600}"
 source "$SCRIPT_DIR/common.sh"
 
 CLIENT_OUT="$LOG_DIR/openclaw.out"
@@ -82,28 +83,36 @@ cat > "$CONFIG_PATCH" <<JSON
 }
 JSON
 
-HOME="$HOME_DIR" "$OPENCLAW_BIN" config patch --file "$CONFIG_PATCH" > "$LOG_DIR/openclaw-config.out" 2>&1
+run_with_timeout "$OPENCLAW_TIMEOUT" env \
+  HOME="$HOME_DIR" \
+  "$OPENCLAW_BIN" config patch --file "$CONFIG_PATCH" \
+  > "$LOG_DIR/openclaw-config.out" 2>&1
 
 start_lucebox_server
 trap stop_lucebox_server EXIT
 wait_lucebox_server
 
-agent_args=()
+openclaw_cmd=(
+  "$OPENCLAW_BIN" agent
+  --local
+  --json
+  --model "lucebox/$MODEL_ID"
+  --session-id "lucebox-client-harness"
+)
+if [[ "$OPENCLAW_TIMEOUT" != "0" ]]; then
+  openclaw_cmd+=(--timeout "$OPENCLAW_TIMEOUT")
+fi
 if [[ -n "$OPENCLAW_AGENT_ARGS" ]]; then
   read -r -a agent_args <<< "$OPENCLAW_AGENT_ARGS"
+  openclaw_cmd+=("${agent_args[@]}")
 fi
+openclaw_cmd+=(--message "$PROMPT")
 
 set +e
-HOME="$HOME_DIR" \
-OPENAI_API_KEY="$API_KEY" \
-timeout 420s "$OPENCLAW_BIN" agent \
-  --local \
-  --json \
-  --model "lucebox/$MODEL_ID" \
-  --session-id "lucebox-client-harness" \
-  --timeout 300 \
-  "${agent_args[@]}" \
-  --message "$PROMPT" \
+run_with_timeout "$OPENCLAW_TIMEOUT" env \
+  HOME="$HOME_DIR" \
+  OPENAI_API_KEY="$API_KEY" \
+  "${openclaw_cmd[@]}" \
   < /dev/null > "$CLIENT_OUT" 2>&1
 RC=$?
 set -e
