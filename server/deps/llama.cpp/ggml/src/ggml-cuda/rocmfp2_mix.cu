@@ -28,13 +28,46 @@ struct MixEntry {
     const uint8_t * rotations;      // n_experts (unused until p3 rotation lands)
     bool owns_device;     // true => this entry cudaMalloc'd the 3 buffers above
                           // (register_host) and must free them on erase/update
+    int  device;          // device the side-data lives on; frees must happen in that context
 };
 std::mutex g_mix_mtx;
 std::vector<MixEntry> g_mix_registry;
 
+// Resolve the device that owns `p`. The mix side-data must be allocated on the SAME device as
+// the expert tensor it describes: the kernel dereferences both together, and cudaMalloc uses
+// the CURRENT device, which is not necessarily the one the model was loaded onto. Returns the
+// current device when the pointer cannot be attributed (single-device hosts, or host memory),
+// which preserves the previous behaviour exactly.
+static int mix_device_of(const void * p) {
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return 0;
+    cudaPointerAttributes attr{};
+    if (p && cudaPointerGetAttributes(&attr, p) == cudaSuccess) {
+        // cudaMemoryTypeUnregistered/Host leave `device` meaningless; only trust device memory.
+        if (attr.type == cudaMemoryTypeDevice && attr.device >= 0) {
+            return attr.device;
+        }
+    }
+    cudaGetLastError();   // clear the error a non-device pointer sets
+    return dev;
+}
+
+// RAII device switch: restores the previous device even on the early-return error paths.
+struct MixDeviceGuard {
+    int prev = -1;
+    bool active = false;
+    explicit MixDeviceGuard(int dev) {
+        if (cudaGetDevice(&prev) != cudaSuccess) return;
+        if (dev == prev) return;
+        if (cudaSetDevice(dev) == cudaSuccess) active = true;
+    }
+    ~MixDeviceGuard() { if (active) cudaSetDevice(prev); }
+};
+
 // Free an entry's device side-data if it owns it. Caller holds g_mix_mtx.
 void mix_free_entry_device(MixEntry & e) {
     if (!e.owns_device) return;
+    MixDeviceGuard guard(e.device);   // free where it was allocated
     if (e.codebooks) cudaFree((void *) e.codebooks);
     if (e.modes)     cudaFree((void *) e.modes);
     if (e.rotations) cudaFree((void *) e.rotations);
@@ -67,7 +100,8 @@ void mix_register_impl(const void * base, size_t nb02, int n_experts, int out, i
                        const uint8_t * rotations, bool owns_device) {
     mix_validate_shape(in);
     std::lock_guard<std::mutex> lk(g_mix_mtx);
-    MixEntry ne{base, nb02, n_experts, out, in, codebooks, modes, rotations, owns_device};
+    MixEntry ne{base, nb02, n_experts, out, in, codebooks, modes, rotations,
+                owns_device, mix_device_of(base)};
     for (auto & e : g_mix_registry) {
         if (e.base == base) {  // update in place — free the old owned buffers first
             mix_free_entry_device(e);
@@ -105,6 +139,10 @@ extern "C" void ggml_cuda_rocmfp2_mix_register_host(
     mix_validate_shape(in);
     const size_t cb_bytes = (size_t) n_experts * 2 * 4 * sizeof(nv_bfloat16);
     void * cb_dev = nullptr; void * modes_dev = nullptr; void * rots_dev = nullptr;
+    // Allocate where the WEIGHTS are. Without this the side-data lands on the current
+    // device while the kernel runs on the model's device, and the first request
+    // segfaults on a multi-GPU host.
+    MixDeviceGuard guard(mix_device_of(base));
     cudaError_t err = cudaMalloc(&cb_dev, cb_bytes);
     if (err == cudaSuccess) err = cudaMemcpy(cb_dev, codebooks_bf16_host, cb_bytes, cudaMemcpyHostToDevice);
     if (err == cudaSuccess) err = cudaMalloc(&modes_dev, (size_t) n_experts);
