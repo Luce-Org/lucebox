@@ -12,7 +12,10 @@ FAKE_DRAFT="$TMP_DIR/draft.gguf"
 FAKE_SERVER="$TMP_DIR/dflash_server"
 FAKE_PI="$TMP_DIR/pi"
 mkdir -p "$FAKE_BIN"
-touch "$FAKE_TARGET" "$FAKE_DRAFT"
+# The launchers reject zero-byte GGUF placeholders, so give the
+# model-free stubs one byte of content.
+printf stub > "$FAKE_TARGET"
+printf stub > "$FAKE_DRAFT"
 
 cat >"$FAKE_SERVER" <<'EOF'
 #!/usr/bin/env bash
