@@ -10,6 +10,19 @@
 #include <mutex>
 #include <vector>
 
+#if defined(GGML_USE_HIP)
+#ifndef cudaPointerAttributes
+// Same local-mapping pattern topk-rows.cu already uses in this directory: the vendor shim
+// does not map the pointer-attribute API, and these are needed to find which device owns an
+// expert tensor. hipPointerAttribute_t is layout-compatible for the fields read here.
+#define cudaPointerAttributes    hipPointerAttribute_t
+#define cudaPointerGetAttributes hipPointerGetAttributes
+#define cudaMemoryTypeDevice     hipMemoryTypeDevice
+#define cudaMemoryTypeManaged    hipMemoryTypeManaged
+#endif
+#endif
+
+
 #define MIX_QK 32
 #define MIX_QS 8
 #define MIX_BLOCK_BYTES 10
