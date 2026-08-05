@@ -69,13 +69,30 @@ options are available:
   approximate inference policy and must be quality-validated for the target
   workload.
 
+  **Do not reduce it on an adaptive (qtype-105/106) artifact without measuring.**
+  Measured 2026-08-05 on DeepSeek-V4-Flash-0731, exact-copy fidelity over 20
+  identifiers x 3 repeats at temperature 0 — the model is asked to echo a line of
+  Python that is already in its prompt, so anything but a verbatim copy is a defect:
+
+  | artifact | `--ds4-expert-top-k 6` (model default) | `--ds4-expert-top-k 4` |
+  |---|---|---|
+  | adaptive (105 down-experts) | 95.0% | **60.0%** |
+  | uniform (104 down-experts) | 100% | 100% |
+
+  The adaptive failures are not degraded paraphrases, they are degenerate output —
+  `" 0 0 0 0 0 ..."`, repeated markdown fragments, empty strings — on prompts as
+  trivial as "repeat this line". Deterministic, and reproducible across context
+  sizes and with fusion on or off. The uniform artifact tolerates the same
+  approximation perfectly, so top-4 leaves no error margin and the adaptive
+  formats' different error profile crosses the threshold. Serve adaptive artifacts
+  at the model default.
+
 For the validated single-device Strix Halo profile:
 
 ```bash
 ./server/build-hip/dflash_server /opt/models/DeepSeek-V4-Flash.gguf \
   --target-device hip:0 \
-  --ds4-fused-decode \
-  --ds4-expert-top-k 4
+  --ds4-fused-decode
 ```
 
 ### In-process heterogeneous expert parallel
@@ -112,7 +129,6 @@ export LUCE_MMVQ_MAX_NCOLS=4
 ./server/build-hip-dual/dflash_server /path/to/deepseek4-target.gguf \
   --target-device hip:0 \
   --peer-access \
-  --ds4-expert-top-k 4 \
   --ds4-prefill sparse
 ```
 
@@ -161,7 +177,6 @@ export DFLASH_DS4_DRAFT_GPU=0
 
 ./server/build-cuda-hip/dflash_server /path/to/deepseek4-target.gguf \
   --target-device hip:0 \
-  --ds4-expert-top-k 4 \
   --ds4-prefill sparse
 ```
 
@@ -318,8 +333,7 @@ export DFLASH_DS4_SPEC_Q=4
 
 ./server/build-hip/dflash_server /path/to/deepseek4-target.gguf \
   --target-device hip:0 \
-  --ds4-fused-decode \
-  --ds4-expert-top-k 4
+  --ds4-fused-decode
 ```
 
 `DFLASH_DS4_FUSED_VERIFY=1` is the opt-in throughput profile. Its persistent
@@ -364,7 +378,11 @@ tok/s weighted at fixed q=4 and 31.94 tok/s with confidence-adaptive width,
 versus 25.31 tok/s autoregressive. All three configurations scored 10/10 on the
 same five GSM and five Math prompts. The run used `--ds4-expert-top-k 4`, the
 platform `performance` profile, and the GPU `high` performance level; fixed
-q=4 with the model-default six routed experts measured 28.26 tok/s. Enabling
+q=4 with the model-default six routed experts measured 28.26 tok/s. Those
+throughput figures were taken on a UNIFORM artifact, where top-4 is harmless;
+on an adaptive artifact the same setting costs 35 points of exact-copy fidelity
+(see `--ds4-expert-top-k` above), so the 32.12 vs 28.26 tok/s trade is not
+available there. Enabling
 DSpark alone therefore does not guarantee 30 tok/s. Set
 `LUCE_MMVQ_MAX_NCOLS` explicitly to override the platform default. AR, NVIDIA,
 and other HIP architectures retain the shared dispatch default.
