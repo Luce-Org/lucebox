@@ -1,0 +1,83 @@
+schema_version = 1
+
+[toolchain]
+esbmc_version = "8.4"
+esbmc_linux_sha256 = "68bb71128e0c3c2db090955e7a302533a8a11a9d898df7f169c22311a0ec5078"
+verifier_image = "ghcr.io/dusterbloom/lucebox-esbmc-ai-verifier@sha256:9321a4aa371efec1b55e33dff0c1cefbc10778aa7f38b07cb2b84cff1c9ed39e"
+repair_image = "ghcr.io/dusterbloom/lucebox-esbmc-ai-repair@sha256:e33712eac4207a74562fe9d9fda9a9456ce41c175456dda3dd54e7ba7286c597"
+
+[[capsules]]
+id = "prefix-cache-inline"
+description = "Inline prefix-cache prepare, confirm, exact lookup, and structural invariants"
+harness = "formal/prefix_cache/prefix_cache_harness.cpp"
+entry_function = "main"
+include_dirs = ["server/src"]
+timeout_seconds = 120
+defines = [
+  "LUCEBOX_FORMAL_MAX_CAP=4",
+]
+nightly_defines = [
+  "LUCEBOX_FORMAL_MAX_CAP=16",
+]
+esbmc_args = [
+  "--quiet",
+  "--z3",
+  "--unwind", "5",
+  "--memory-leak-check",
+  "--overflow-check",
+]
+trigger_paths = [
+  "formal/**",
+  "server/src/server/prefix_cache_state.h",
+  "server/src/server/prefix_cache.h",
+  "server/src/server/prefix_cache.cpp",
+  "server/test/test_prefix_cache_state.cpp",
+]
+mutable_paths = [
+  "server/src/server/prefix_cache_state.h",
+]
+contract_paths = [
+  "formal/manifest.toml",
+  "formal/prefix_cache/prefix_cache_harness.cpp",
+  "formal/prefix_cache/PROPERTIES.md",
+  "server/test/test_prefix_cache_state.cpp",
+]
+
+[[capsules]]
+id = "prefix-cache-abort-hole"
+description = "Inline prefix-cache free-slot selection after an aborted reservation"
+harness = "formal/prefix_cache/abort_hole_harness.cpp"
+entry_function = "verify_select_inline_free_slot_contract"
+include_dirs = ["server/src"]
+timeout_seconds = 120
+defines = [
+  "LUCEBOX_FORMAL_MAX_CAP=4",
+]
+nightly_defines = [
+  "LUCEBOX_FORMAL_MAX_CAP=16",
+]
+esbmc_args = [
+  "--quiet",
+  "--z3",
+  "--enforce-contract", "verify_select_inline_free_slot_contract",
+  "--unwind", "17",
+  "--overflow-check",
+]
+trigger_paths = [
+  "formal/**",
+  "server/src/server/prefix_cache_state.h",
+  "server/src/server/prefix_cache.h",
+  "server/src/server/prefix_cache.cpp",
+  "server/test/test_prefix_cache_state.cpp",
+]
+mutable_paths = [
+  "server/src/server/prefix_cache_state.h",
+]
+contract_paths = [
+  "formal/manifest.toml",
+  "formal/prefix_cache/abort_hole_harness.cpp",
+  "formal/prefix_cache/ABORT_HOLE_PROPERTIES.md",
+  "server/test/test_prefix_cache_state.cpp",
+]
+native_test = "test_prefix_cache_state"
+native_test_source = "server/test/test_prefix_cache_state.cpp"

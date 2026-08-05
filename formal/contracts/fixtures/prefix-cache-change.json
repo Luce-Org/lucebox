@@ -1,0 +1,10 @@
+{
+  "changed_paths": [
+    "server/src/server/prefix_cache_state.h"
+  ],
+  "expected_coverage_gaps": [],
+  "expected_target_ids": [
+    "prefix-cache-abort-hole",
+    "prefix-cache-inline"
+  ]
+}

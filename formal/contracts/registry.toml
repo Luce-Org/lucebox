@@ -1,0 +1,173 @@
+# Approved minimal-core formal contracts for local planning.
+#
+# This registry is deliberately separate from formal/manifest.toml.  The
+# latter remains the compatibility manifest for the verifier's legacy local
+# mode while the planner uses this file to select approved templates.  This PR
+# adds no CI integration or repository enforcement.
+schema_version = 1
+
+# An edit below changes the definition of formal coverage, not merely a new
+# test.  A later CI integration must load accepted policy from its merge base
+# rather than allowing a change to judge itself.
+[registry]
+description = "Approved Lucebox minimal-core contracts for deterministic local planning"
+compatibility_manifest = "formal/manifest.toml"
+
+[toolchain]
+esbmc_version = "8.4"
+esbmc_linux_sha256 = "68bb71128e0c3c2db090955e7a302533a8a11a9d898df7f169c22311a0ec5078"
+verifier_image = "ghcr.io/dusterbloom/lucebox-esbmc-ai-verifier@sha256:9321a4aa371efec1b55e33dff0c1cefbc10778aa7f38b07cb2b84cff1c9ed39e"
+repair_image = "ghcr.io/dusterbloom/lucebox-esbmc-ai-repair@sha256:e33712eac4207a74562fe9d9fda9a9456ce41c175456dda3dd54e7ba7286c597"
+
+# These are the state-machine areas where an edit without a matched approved
+# target is an advisory coverage gap.  Keep the list narrow; ordinary server
+# implementation edits are not made critical merely by living under server/.
+[[critical_paths]]
+id = "prefix-cache"
+description = "Inline and full prefix-cache slot, reservation, and eviction lifecycle"
+paths = [
+  "server/src/server/prefix_cache_state.h",
+  "server/src/server/prefix_cache.h",
+  "server/src/server/prefix_cache.cpp",
+]
+# These are advisory routing hints, not claims of formal coverage.  Exact
+# boundaries above and approved target triggers remain authoritative.
+watch_paths = [
+  "server/src/server/prefix_cache*.h",
+  "server/src/server/prefix_cache*.cpp",
+  "server/src/server/*snapshot*.h",
+  "server/src/server/*snapshot*.cpp",
+  "server/src/server/*eviction*.h",
+  "server/src/server/*eviction*.cpp",
+]
+include_roots = ["server/src"]
+policy = "advisory"
+
+[[critical_paths]]
+id = "disk-prefix-cache"
+description = "Persistent snapshot load/save/adopt lifecycle"
+paths = [
+  "server/src/server/disk_prefix_cache.h",
+  "server/src/server/disk_prefix_cache.cpp",
+]
+
+[[critical_paths]]
+id = "request-snapshot-lifecycle"
+description = "Request restore, snapshot reservation, confirmation, abort, and cancellation orchestration"
+paths = [
+  "server/src/server/http_server.cpp",
+  "server/src/server/http_server.h",
+]
+
+[[critical_paths]]
+id = "streaming-lifecycle"
+description = "Streaming response state transitions and disconnect cancellation"
+paths = [
+  "server/src/server/sse_emitter.h",
+  "server/src/server/sse_emitter.cpp",
+]
+
+[[critical_paths]]
+id = "tool-hint-state"
+description = "Generation-time tool-hint state machine"
+paths = [
+  "server/src/server/tool_hint.h",
+  "server/src/server/tool_hint.cpp",
+]
+
+# Target policies are inert planner metadata in this PR.  They express the
+# intended result classification if a separately reviewed integration later
+# invokes this registry; they do not install or require a repository check.
+[[targets]]
+id = "prefix-cache-inline"
+policy = "required"
+description = "Inline prefix-cache prepare, confirm, exact lookup, and structural invariants"
+source_paths = [
+  "server/src/server/prefix_cache_state.h",
+]
+trigger_paths = [
+  "formal/contracts/registry.toml",
+  "formal/contracts/templates/prefix-cache-inline.cpp.in",
+  "formal/prefix_cache/PROPERTIES.md",
+  "server/src/server/prefix_cache_state.h",
+  "server/src/server/prefix_cache.h",
+  "server/src/server/prefix_cache.cpp",
+  "server/test/test_prefix_cache_state.cpp",
+]
+symbol = "dflash::common::InlinePrefixCacheState"
+signature = "class dflash::common::InlinePrefixCacheState"
+template = "formal/contracts/templates/prefix-cache-inline.cpp.in"
+entry_function = "main"
+include_dirs = ["server/src"]
+timeout_seconds = 120
+pr_defines = ["LUCEBOX_FORMAL_MAX_CAP=4"]
+nightly_defines = ["LUCEBOX_FORMAL_MAX_CAP=16"]
+pr_esbmc_args = [
+  "--quiet",
+  "--z3",
+  "--unwind", "5",
+  "--memory-leak-check",
+  "--overflow-check",
+]
+nightly_esbmc_args = [
+  "--quiet",
+  "--z3",
+  "--unwind", "5",
+  "--memory-leak-check",
+  "--overflow-check",
+]
+mutable_paths = ["server/src/server/prefix_cache_state.h"]
+contract_paths = [
+  "formal/contracts/registry.toml",
+  "formal/contracts/templates/prefix-cache-inline.cpp.in",
+  "formal/prefix_cache/PROPERTIES.md",
+  "server/test/test_prefix_cache_state.cpp",
+]
+
+[[targets]]
+id = "prefix-cache-abort-hole"
+policy = "required"
+description = "Inline prefix-cache free-slot selection after an aborted reservation"
+source_paths = [
+  "server/src/server/prefix_cache_state.h",
+]
+trigger_paths = [
+  "formal/contracts/registry.toml",
+  "formal/contracts/templates/prefix-cache-abort-hole.cpp.in",
+  "formal/prefix_cache/ABORT_HOLE_PROPERTIES.md",
+  "server/src/server/prefix_cache_state.h",
+  "server/src/server/prefix_cache.h",
+  "server/src/server/prefix_cache.cpp",
+  "server/test/test_prefix_cache_state.cpp",
+]
+symbol = "dflash::common::select_inline_free_slot"
+signature = "int(int next_slot, int capacity, uint64_t occupied_slots)"
+template = "formal/contracts/templates/prefix-cache-abort-hole.cpp.in"
+entry_function = "verify_select_inline_free_slot_contract"
+include_dirs = ["server/src"]
+timeout_seconds = 120
+pr_defines = ["LUCEBOX_FORMAL_MAX_CAP=4"]
+nightly_defines = ["LUCEBOX_FORMAL_MAX_CAP=16"]
+pr_esbmc_args = [
+  "--quiet",
+  "--z3",
+  "--enforce-contract", "verify_select_inline_free_slot_contract",
+  "--unwind", "17",
+  "--overflow-check",
+]
+nightly_esbmc_args = [
+  "--quiet",
+  "--z3",
+  "--enforce-contract", "verify_select_inline_free_slot_contract",
+  "--unwind", "17",
+  "--overflow-check",
+]
+mutable_paths = ["server/src/server/prefix_cache_state.h"]
+contract_paths = [
+  "formal/contracts/registry.toml",
+  "formal/contracts/templates/prefix-cache-abort-hole.cpp.in",
+  "formal/prefix_cache/ABORT_HOLE_PROPERTIES.md",
+  "server/test/test_prefix_cache_state.cpp",
+]
+native_test = "test_prefix_cache_state"
+native_test_source = "server/test/test_prefix_cache_state.cpp"

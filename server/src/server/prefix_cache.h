@@ -12,9 +12,9 @@
 
 #pragma once
 
+#include "prefix_cache_state.h"
 #include "tokenizer.h"
 
-#include <array>
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -42,7 +42,6 @@ std::vector<int> find_all_boundaries(const std::vector<int32_t> & ids,
                                      const ChatMarkers & markers);
 
 // SHA-1 hash of a prefix (truncated to 16 bytes).
-using PrefixHash = std::array<uint8_t, 16>;
 PrefixHash hash_prefix(const int32_t * ids, int count);
 
 // Prefix-aware inline eviction policy. Given the cached prefixes in LRU order
@@ -50,12 +49,8 @@ PrefixHash hash_prefix(const int32_t * ids, int count);
 // whose ids are NOT a strict prefix of any other entry's ids (a "leaf"). Keeping
 // shared ancestor prefixes resident avoids re-prefilling them for later branches.
 // Returns 0 (pure-LRU fallback) when ids_lru is empty or, impossibly, no leaf
-// is found. Pure and model-free so it can be unit-tested without a PrefixCache.
-// The pointer overload is the core (the caller passes pointers into its own
-// entries so no token vectors are copied); the value overload is a convenience
-// wrapper for tests.
-int select_inline_evict_victim(const std::vector<const std::vector<int32_t> *> & ids_lru);
-int select_inline_evict_victim(const std::vector<std::vector<int32_t>> & ids_lru);
+// is found. The implementation lives in prefix_cache_state.h so the exact
+// production policy can also be model-checked without server dependencies.
 
 // Pick the inline snapshot boundary for a request. We cache the boundary before
 // the current user turn (second-to-last marker) and only when it advances past
@@ -163,17 +158,9 @@ private:
     int cap_ = 0;
     ChatMarkers markers_;
 
-    // LRU for inline prefix cache: ordered map of hash → slot.
-    // We use a vector to maintain insertion order (front = oldest).
-    struct LruEntry {
-        PrefixHash           hash;
-        int                  slot;
-        std::vector<int32_t> ids;  // prefix tokens [0, target_cut) for prefix-aware eviction
-    };
-    std::vector<LruEntry> entries_;
-    int next_slot_ = 0;
-    PrefixHash pending_evict_key_{};
-    bool has_pending_evict_ = false;
+    // Boundary detection and hashing live in PrefixCache; all inline-cache
+    // transitions live in this dependency-free core shared with ESBMC.
+    InlinePrefixCacheState inline_state_;
 
     // Full-cache state
     bool full_disabled_ = true;
@@ -194,19 +181,18 @@ private:
     std::atomic<int64_t> lifetime_hits_{0};       // inline cache hits
     std::atomic<int64_t> full_lifetime_hits_{0};  // full-compress cache hits
     std::atomic<int64_t> full_disk_bytes_{0};     // best-effort snapshot of disk usage
-    // Atomic mirrors of `entries_.size()` and `full_entries_.size()`.
+    // Atomic mirrors of `inline_state_.size()` and `full_entries_.size()`.
     // The vectors themselves are mutated only on the daemon thread
     // under the daemon's serialised request loop, but `/props` reads
     // happen from the client thread — calling `.size()` there is a
     // data race per the C++ memory model. Bump these alongside every
     // push_back / erase / clear so the public introspection counters
     // stay well-defined. (Codex r1 P2 follow-up.)
-    std::atomic<int64_t> entries_size_count_{0};       // mirrors entries_.size()
+    std::atomic<int64_t> entries_size_count_{0};       // mirrors inline_state_.size()
     std::atomic<int64_t> full_entries_size_count_{0};  // mirrors full_entries_.size()
 
     // Helpers
-    int find_entry(const PrefixHash & h) const;
-    void move_to_end(int idx);
+    void sync_inline_size();
     int find_full_entry(const PrefixHash & h) const;
     void move_full_to_end(int idx);
 };
