@@ -699,6 +699,21 @@ bool DeepSeek4Backend::load_spec_drafter() {
         return false;
     }
     const PlacementBackend target_kind = placement_backend_of(backend_);
+    // Startup qualification covers only the target GPU. DFLASH_DS4_DRAFT_GPU
+    // can select a different CUDA device, so qualify the resolved draft
+    // device before creating a backend on it.
+    if (draft_kind == PlacementBackend::Cuda &&
+        (draft_kind != target_kind || draft_gpu != cfg_.device.gpu)) {
+        int draft_sm = 0;
+        if (!dspark_supported_on_current_device(draft_gpu, draft_sm)) {
+            std::fprintf(stderr,
+                         "[deepseek4] DSpark disabled: draft CUDA device %d "
+                         "(sm_%d) is not qualified; continuing with "
+                         "autoregressive decode\n",
+                         draft_gpu, draft_sm);
+            return false;
+        }
+    }
     if (draft_kind != target_kind || draft_gpu != cfg_.device.gpu ||
         separate_draft_stream) {
         std::string backend_error;

@@ -641,6 +641,7 @@ def _fingerprint_payload(cfg: Config) -> dict[str, Any]:
     return {
         "cli_version": __version__,
         "variant": cfg.variant,
+        "image": cfg.image,
         "model": asdict(cfg.model),
         "runtime": asdict(cfg.dflash),
         "placement": asdict(cfg.placement),

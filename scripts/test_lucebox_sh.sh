@@ -801,6 +801,11 @@ STUB
     cat > "$shim_dir/systemctl" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "${LUCEBOX_TEST_SYSTEMCTL_LOG:?}"
+if [ "${LUCEBOX_TEST_UNIT_INACTIVE:-0}" = "1" ]; then
+    for arg in "$@"; do
+        [ "$arg" = "is-active" ] && exit 3
+    done
+fi
 exit 0
 STUB
     cat > "$shim_dir/flock" <<'STUB'
@@ -811,12 +816,14 @@ STUB
 
     run_calibration_case() {
         local fail_baseline="$1"
+        local unit_inactive="${2:-0}"
         HOME="$sandbox/home" \
         XDG_CONFIG_HOME="$sandbox/xdg" \
         LUCEBOX_HOME="$state" \
         LUCEBOX_TEST_CLI_LOG="$sandbox/cli.log" \
         LUCEBOX_TEST_SYSTEMCTL_LOG="$sandbox/systemctl.log" \
         LUCEBOX_TEST_FAIL_BASELINE="$fail_baseline" \
+        LUCEBOX_TEST_UNIT_INACTIVE="$unit_inactive" \
         PATH="$shim_dir:$PATH" \
         NO_COLOR=1 \
         bash -c '
@@ -867,6 +874,44 @@ STUB
        || compgen -G "$state/.calibration-run.*" >/dev/null; then
         report fail "$label" \
             "rollback case rc=$rc restarts=$restart_count config=$(<"$state/config.toml") output=$(head -5 <<<"$out")"
+        rm -rf "$sandbox"
+        return
+    fi
+
+    # An originally stopped engine must stay stopped: the commit path stops
+    # the unit instead of restarting it after the last calibration cell.
+    printf 'original\n' > "$state/config.toml"
+    : > "$sandbox/cli.log"
+    : > "$sandbox/systemctl.log"
+    rc=0
+    out=$(run_calibration_case 0 1 2>&1) || rc=$?
+    restart_count=$(grep -cF -- '--user restart lucebox.service' "$sandbox/systemctl.log" || true)
+    local stop_count
+    stop_count=$(grep -cF -- '--user stop lucebox.service' "$sandbox/systemctl.log" || true)
+    if [ "$rc" -ne 0 ] || [ "$(<"$state/config.toml")" != "calibrated=22" ] \
+       || [ "$restart_count" -ne 3 ] || [ "$stop_count" -ne 1 ] \
+       || compgen -G "$state/.calibration-run.*" >/dev/null; then
+        report fail "$label" \
+            "inactive success case rc=$rc restarts=$restart_count stops=$stop_count output=$(head -5 <<<"$out")"
+        rm -rf "$sandbox"
+        return
+    fi
+
+    # And a rollback on an originally stopped engine must also stop the unit,
+    # not restart it.
+    printf 'original\n' > "$state/config.toml"
+    : > "$sandbox/cli.log"
+    : > "$sandbox/systemctl.log"
+    rc=0
+    out=$(run_calibration_case 1 1 2>&1) || rc=$?
+    restart_count=$(grep -cF -- '--user restart lucebox.service' "$sandbox/systemctl.log" || true)
+    stop_count=$(grep -cF -- '--user stop lucebox.service' "$sandbox/systemctl.log" || true)
+    if [ "$rc" -eq 0 ] || [ "$(<"$state/config.toml")" != "original" ] \
+       || [ "$restart_count" -ne 1 ] || [ "$stop_count" -ne 1 ] \
+       || ! grep -qF 'original profile and service state were restored' <<<"$out" \
+       || compgen -G "$state/.calibration-run.*" >/dev/null; then
+        report fail "$label" \
+            "inactive rollback case rc=$rc restarts=$restart_count stops=$stop_count config=$(<"$state/config.toml") output=$(head -5 <<<"$out")"
         rm -rf "$sandbox"
         return
     fi

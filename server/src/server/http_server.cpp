@@ -2807,20 +2807,24 @@ HttpServer::PreparedPrompt HttpServer::prepare_prompt(
     PreparedPrompt prepared;
     prepared.tokens = req.prompt_tokens;
 
-    if (config_.pflash_mode != ServerConfig::PflashMode::OFF &&
-        drafter_tokenizer_ != nullptr) {
-        // GB10's local custom sparse scorer kernels are not qualified. Check
-        // before loading or running the drafter so a stale/manual PFlash
-        // profile degrades to exact prefill instead of touching that path.
-        // A remote drafter runs on its own backend and remains independent.
+    bool pflash_available =
+        config_.pflash_mode != ServerConfig::PflashMode::OFF &&
+        drafter_tokenizer_ != nullptr;
 #if defined(DFLASH27B_BACKEND_CUDA)
-        if (!config_.pflash_remote_drafter &&
-            !flashprefill::local_pflash_supported_on_current_device()) {
-            std::fprintf(stderr,
-                "[pflash] local scorer unavailable on this GPU; using exact prefill\n");
-            return prepared;
-        }
+    // GB10's local custom sparse scorer kernels are not qualified. Check
+    // before loading or running the drafter so a stale/manual PFlash
+    // profile degrades to exact prefill instead of touching that path.
+    // A remote drafter runs on its own backend and remains independent.
+    // Fall through to the context check below so an over-length prompt
+    // still gets the normal 400 instead of reaching exact generation.
+    if (pflash_available && !config_.pflash_remote_drafter &&
+        !flashprefill::local_pflash_supported_on_current_device()) {
+        std::fprintf(stderr,
+            "[pflash] local scorer unavailable on this GPU; using exact prefill\n");
+        pflash_available = false;
+    }
 #endif
+    if (pflash_available) {
         const int prompt_tokens = (int) req.prompt_tokens.size();
         const bool continuation = is_continuation_request(req.messages);
         const bool has_tools = req.tools.is_array() && !req.tools.empty();

@@ -112,7 +112,7 @@ int flash_prefill_forward_q8(
 // ── Unified dispatch ──────────────────────────────────────────────────────────
 // Picks the best available kernel at compile time + runtime buffer type:
 //   BF16 buffers + qualified sm_80 build → flash_prefill_forward_bf16
-//   BF16 buffers + unqualified device   → -2 (caller chooses exact fallback)
+//   BF16 buffers + unqualified device   → flash_prefill_forward_q8 (exact FA)
 //   F16 buffers  + Volta build → flash_prefill_forward_f16
 //   otherwise                  → flash_prefill_forward_q8 (ggml FA fallback)
 //
@@ -127,7 +127,13 @@ inline int flash_prefill_forward(
 {
 #if defined(DFLASH27B_HAVE_FLASHPREFILL) || defined(DFLASH27B_HAVE_SM80_FLASHPREFILL)
     if (qkv_type == GGML_TYPE_BF16) {
-        if (!custom_bf16_sparse_supported_on_current_device()) return -2;
+        if (!custom_bf16_sparse_supported_on_current_device()) {
+            // Unqualified device (e.g. GB10 sm_121): run the exact ggml FA
+            // path instead of failing the scorer.
+            return flash_prefill_forward_q8(backend, Q, K, V, O,
+                batch, seq_len, n_q_heads, n_k_heads, head_dim, scale,
+                qkv_type, cfg);
+        }
         return flash_prefill_forward_bf16(Q, K, V, O,
             batch, seq_len, n_q_heads, n_k_heads, head_dim, scale, cfg);
     }
