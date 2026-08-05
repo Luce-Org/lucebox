@@ -104,6 +104,38 @@ enough to reach 100 tok/s; the next optimization must reduce full-width expert
 kernel time or overlap another independent stage, not add synchronization or
 small matrix shards.
 
+## Grouped attention-output experiment
+
+An opt-in DeepSeek4 experiment splits the eight grouped output-A projections
+after MLA attention: six groups remain on the R9700 and two run concurrently
+on Strix Halo. Shared attention, RoPE, compressors, the authoritative KV cache,
+and output-B remain unchanged on the R9700. The peer owns only its immutable
+weight slice; there is no mirrored cache or speculative rollback state.
+
+The path is intentionally restricted to the existing in-process, same-runtime
+two-GPU scheduler. It refuses IPC and mixed CUDA/HIP pairs. It also runs only
+inside stable explicit-attention verifier graphs with widths 2 through 6.
+`DFLASH_DS4_ATTN_TP_GROUPS` selects the number of tail groups assigned to the
+peer, while `DFLASH_DS4_ATTN_TP_MIN_CONTEXT` can delay activation. Both are
+burn-in controls and the split is disabled by default.
+
+The 2026-08-05 R9700 + Strix Halo q=5 qualification used one warmup and three
+measured 2K-context, 128-token requests. Every request produced the expected
+SHA-256
+`0f785a7ffa406498aafb14553966eaed0f52220fed0f7cc016b66921d104d194`
+with 0.96 DSpark acceptance.
+
+| Plan | Engine tok/s | Client median tok/s | Scheduler splits | Decision |
+|---|---:|---:|---:|---|
+| Established projection on R9700 | 68.3 | 83.162 | 130 | Keep |
+| Output-A groups 6 main / 2 peer | 54.0–54.1 | 65.271 | 259 | Reject as a speed optimization |
+
+The split is numerically correct but about 21% slower. Its small parallel
+projection cannot repay 129 additional scheduler boundaries per verify graph.
+Keep the implementation opt-in as a correctness-tested mechanism for future
+schedulers; do not enable it in the Lucebox performance profile unless the
+cross-device boundary count is reduced first.
+
 ## Reproduction
 
 Use `scripts/qualify_ds4_q5_amd.sh`. The runner records the source commit,
@@ -118,6 +150,9 @@ EXPERT_TOP_K=4
 DYNAMIC_ROUTE_BALANCE=1
 DYNAMIC_MAIN_SLOTS_X4=13
 ```
+
+For the rejected grouped attention-output A/B, add
+`ATTENTION_TP_GROUPS=2 ATTENTION_TP_MIN_CONTEXT=0`; use `0` for the control.
 
 Do not promote a candidate from a microbenchmark alone. It must pass unit/GPU
 oracles, the exact response hash, warmups, and at least three measured model

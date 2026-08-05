@@ -38,6 +38,7 @@ struct MoeHybridConfig;
 struct MoeHybridRoutingStats;
 struct MoeExpertComputeRuntime;
 class MoeHybridStreamEngine;
+struct DeepSeek4AttentionParallelState;
 
 struct DeepSeek4StepTelemetry {
     uint64_t total_us = 0;
@@ -286,6 +287,11 @@ struct DeepSeek4Cache {
 
     // Lazily created on the first deepseek4_step_layer_range call.
     DeepSeek4LayerRangeCache * layer_range_cache = nullptr;
+
+    // Non-owning link to the optional single-process attention-group runtime.
+    // DeepSeek4Backend owns it and releases cached graphs before this pointer or
+    // either GPU backend can disappear.
+    DeepSeek4AttentionParallelState * attention_parallel = nullptr;
 
     ggml_context *        ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;

@@ -9,6 +9,7 @@
 //   6. MoE FFN (hash routing + top-k + shared expert + clamped SwiGLU)
 
 #include "deepseek4_internal.h"
+#include "deepseek4_attention_parallel.h"
 #include "deepseek4_hc_cuda.h"
 #include "internal.h"
 #include "../common/step_graph.h"
@@ -1618,7 +1619,9 @@ static ggml_tensor * build_mla_attention(
         std::vector<DeepSeek4I32ArrayBinding> & i32_array_inputs,
         std::vector<DeepSeek4I64ArrayBinding> & i64_array_inputs,
         std::vector<DeepSeek4F32ArrayBinding> * f32_array_inputs = nullptr,
-        DeepSeek4AttentionImpl attention_impl = DeepSeek4AttentionImpl::Explicit) {
+        DeepSeek4AttentionImpl attention_impl = DeepSeek4AttentionImpl::Explicit,
+        DeepSeek4AttentionParallelState * attention_parallel = nullptr,
+        DeepSeek4AttentionParallelGraphInputs * attention_parallel_inputs = nullptr) {
 
     const int n_embd    = w.n_embd;
     const int head_dim  = w.head_dim;
@@ -1627,6 +1630,23 @@ static ggml_tensor * build_mla_attention(
     const int n_out_group = w.n_out_group;
     const int n_lora_o  = w.n_lora_o;
     const int ratio     = w.compress_ratios[layer_idx];
+    const bool stable_cache_graph = cached_inputs &&
+        cached_inputs->raw_kv_rows && cached_inputs->attn_row_mask;
+    bool use_attention_parallel = attention_parallel &&
+        attention_parallel_inputs && stable_cache_graph &&
+        attention_impl == DeepSeek4AttentionImpl::Explicit &&
+        layer_idx >= 0 &&
+        layer_idx < (int) attention_parallel->layers.size() &&
+        attention_parallel->enabled_for(
+            n_tokens, kv_start, stable_cache_graph);
+    DeepSeek4AttentionParallelLayer * attention_peer_layer =
+        use_attention_parallel
+            ? &attention_parallel->layers[(size_t) layer_idx]
+            : nullptr;
+    if (use_attention_parallel && !attention_peer_layer->output_a) {
+        use_attention_parallel = false;
+        attention_peer_layer = nullptr;
+    }
 
     // ── Q path: cur → q_a → norm → q_b → per-head norm ─────────────
     // q_a: [n_embd, n_tokens] → [n_lora_q, n_tokens]
@@ -2260,9 +2280,6 @@ static ggml_tensor * build_mla_attention(
             rope_n_ctx_orig);
     }
 
-    // Flatten to [head_dim*n_head, n_tokens] for output projection
-    ggml_tensor * attn_out = ggml_reshape_2d(ctx, context, head_dim * n_head, n_tokens);
-
     // ── Grouped output projection ──────────────────────────────────
     // DS4 output uses grouped low-rank projection:
     //   attn_out: [head_dim*n_head, n_tokens] → reshape [group_dim, n_tokens, n_groups]
@@ -2270,17 +2287,84 @@ static ggml_tensor * build_mla_attention(
     //   batched matmul over n_groups: → [n_lora_o, n_tokens, n_groups]
     //   → reshape [n_lora_o*n_groups, n_tokens]
     //   out_b: [n_lora_o*n_groups, n_embd] → final: [n_embd, n_tokens]
-    const int group_dim = head_dim * (n_head / n_out_group);  // 512 * 8 = 4096
-    // Reshape attn_out: [32768, n_tokens] → [4096, 8, n_tokens] → permute to [4096, n_tokens, 8]
-    attn_out = ggml_reshape_3d(ctx, attn_out, group_dim, n_out_group, n_tokens);
-    attn_out = ggml_permute(ctx, attn_out, 0, 2, 1, 3);
-    if (n_tokens == 1) {
-        attn_out = ggml_cont(ctx, attn_out);
+    const int group_dim =
+        head_dim * (n_head / n_out_group);  // 512 * 8 = 4096
+    auto build_group_low = [&](ggml_tensor * branch_context,
+                               ggml_tensor * output_a,
+                               int group_count) {
+        const int branch_heads = group_count * (n_head / n_out_group);
+        // A head slice is strided across tokens. Materialize it locally before
+        // reshaping so both devices consume the same canonical [D,H,T] order.
+        branch_context = ggml_is_contiguous(branch_context)
+            ? branch_context : ggml_cont(ctx, branch_context);
+        ggml_tensor * branch_out = ggml_reshape_2d(
+            ctx, branch_context, head_dim * branch_heads, n_tokens);
+        branch_out = ggml_reshape_3d(
+            ctx, branch_out, group_dim, group_count, n_tokens);
+        branch_out = ggml_permute(ctx, branch_out, 0, 2, 1, 3);
+        if (n_tokens == 1) {
+            branch_out = ggml_cont(ctx, branch_out);
+        }
+        ggml_tensor * out_a_3d = ggml_reshape_3d(
+            ctx, output_a, group_dim, n_lora_o, group_count);
+        return ggml_mul_mat(ctx, out_a_3d, branch_out);
+    };
+
+    ggml_tensor * attn_low = nullptr;
+    if (use_attention_parallel) {
+        const DeepSeek4AttentionParallelPlan & plan =
+            attention_parallel->plan;
+        ggml_tensor * main_output_a = ggml_view_2d(
+            ctx, L.attn_output_a, group_dim,
+            (int64_t) plan.main_groups * n_lora_o,
+            L.attn_output_a->nb[1], 0);
+        const int main_heads =
+            plan.main_groups * plan.heads_per_group;
+        const int peer_heads =
+            plan.peer_groups * plan.heads_per_group;
+        auto context_slice = [&](int first_head, int head_count) {
+            return ggml_view_3d(
+                ctx, context, head_dim, head_count, n_tokens,
+                context->nb[1], context->nb[2],
+                (size_t) first_head * context->nb[1]);
+        };
+        ggml_tensor * main_low = build_group_low(
+            context_slice(0, main_heads), main_output_a,
+            plan.main_groups);
+        ggml_tensor * peer_low = build_group_low(
+            context_slice(main_heads, peer_heads),
+            attention_peer_layer->output_a,
+            plan.peer_groups);
+
+        // Shared attention stays byte-for-byte on the primary GPU. The peer
+        // graph delta starts only after its result, so the scheduler transfers
+        // one compact context slice and executes one independent projection.
+        ggml_build_forward_expand(gf, context);
+        const int peer_node_begin = ggml_graph_n_nodes(gf);
+        ggml_set_output(peer_low);
+        ggml_build_forward_expand(gf, peer_low);
+        const int peer_node_end = ggml_graph_n_nodes(gf);
+        for (int ni = peer_node_begin; ni < peer_node_end; ++ni) {
+            attention_parallel_inputs->peer_nodes.push_back(
+                ggml_graph_node(gf, ni));
+        }
+
+        // Queue the independent primary branch before introducing the only
+        // peer-to-primary dependency for this layer.
+        ggml_build_forward_expand(gf, main_low);
+        ggml_tensor * peer_ready = ggml_ds4_deferred_peer_copy(
+            ctx, peer_low);
+        ggml_set_input(peer_ready);
+        ggml_set_output(peer_ready);
+        attention_parallel_inputs->deferred_peer_copy_nodes.push_back(
+            peer_ready);
+        attention_parallel_inputs->main_output = main_low;
+        attention_parallel_inputs->peer_output = peer_ready;
+        attn_low = ggml_concat(ctx, main_low, peer_ready, 2);
+    } else {
+        attn_low = build_group_low(
+            context, L.attn_output_a, n_out_group);
     }
-    // attn_out is now [group_dim, n_tokens, n_out_group]
-    ggml_tensor * out_a_3d = ggml_reshape_3d(ctx, L.attn_output_a, group_dim, n_lora_o, n_out_group);
-    // out_a_3d: [group_dim, n_lora_o, n_out_group] — ne[2] matches
-    ggml_tensor * attn_low = ggml_mul_mat(ctx, out_a_3d, attn_out);
     // attn_low: [n_lora_o, n_tokens, n_out_group]
     ggml_tensor * out = nullptr;
     const bool grouped_output_projection =
@@ -2300,6 +2384,10 @@ static ggml_tensor * build_mla_attention(
         attn_low = ggml_reshape_2d(
             ctx, attn_low, n_lora_o * n_out_group, n_tokens);
         out = ggml_mul_mat(ctx, L.attn_output_b, attn_low);
+    }
+
+    if (use_attention_parallel) {
+        attention_parallel_inputs->output = out;
     }
 
     return out;
@@ -4608,6 +4696,8 @@ struct DeepSeek4FusedDecodeGraph {
     ggml_tensor * mask_bundle = nullptr;   // additive score mask (0 / -1e30), may be null
     std::vector<ggml_tensor *> hash_ids;
     std::vector<MoeHybridGraphInputs> hybrid_inputs;
+    std::vector<DeepSeek4AttentionParallelGraphInputs>
+        attention_parallel_inputs;
     std::vector<AuthoritativeRouteOutput> authoritative_routes;
     ggml_tensor * logits = nullptr;
     ggml_backend_sched_t sched = nullptr;
@@ -4620,6 +4710,7 @@ struct DeepSeek4FusedDecodeGraph {
         logits = nullptr;
         hash_ids.clear();
         hybrid_inputs.clear();
+        attention_parallel_inputs.clear();
         authoritative_routes.clear();
         shape_key.clear();
         last_use = 0;
@@ -8134,6 +8225,7 @@ void free_deepseek4_cache(DeepSeek4Cache & c) {
     if (c.buf) { ggml_backend_buffer_free(c.buf); c.buf = nullptr; }
     c.layers.clear();
     c.hc_state = nullptr;
+    c.attention_parallel = nullptr;
 }
 
 void reset_deepseek4_cache(DeepSeek4Cache & c) {

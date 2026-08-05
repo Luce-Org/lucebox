@@ -13,6 +13,7 @@
 #include "common/layer_split_backend.h"
 #include "common/layer_split_runtime.h"
 #include "common/layer_split_utils.h"
+#include "deepseek4/deepseek4_attention_parallel.h"
 #include "deepseek4/deepseek4_dspark.h"
 
 #include <memory>
@@ -61,6 +62,33 @@ static bool nearly_equal(float a, float b, float atol = 1.0e-5f, float rtol = 1.
     const float diff = std::fabs(a - b);
     const float scale = std::max(std::fabs(a), std::fabs(b));
     return diff <= atol + rtol * scale;
+}
+
+static void test_attention_group_parallel_plan() {
+    std::fprintf(stderr, "  test_attention_group_parallel_plan ...");
+    const DeepSeek4AttentionParallelPlan plan =
+        plan_deepseek4_attention_groups(64, 8, 2);
+    TEST_ASSERT(plan.valid());
+    TEST_ASSERT(plan.total_groups == 8);
+    TEST_ASSERT(plan.main_groups == 6);
+    TEST_ASSERT(plan.peer_groups == 2);
+    TEST_ASSERT(plan.heads_per_group == 8);
+
+    TEST_ASSERT(!plan_deepseek4_attention_groups(64, 8, 0).valid());
+    TEST_ASSERT(!plan_deepseek4_attention_groups(64, 8, 8).valid());
+    TEST_ASSERT(!plan_deepseek4_attention_groups(63, 8, 2).valid());
+    TEST_ASSERT(!plan_deepseek4_attention_groups(64, 1, 1).valid());
+
+    DeepSeek4AttentionParallelState state;
+    state.plan = plan;
+    state.min_context = 1024;
+    TEST_ASSERT(state.enabled_for(5, 1024, true));
+    TEST_ASSERT(state.enabled_for(6, 1024, true));
+    TEST_ASSERT(!state.enabled_for(1, 1024, true));
+    TEST_ASSERT(!state.enabled_for(7, 1024, true));
+    TEST_ASSERT(!state.enabled_for(5, 1023, true));
+    TEST_ASSERT(!state.enabled_for(5, 1024, false));
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
 static ggml_tensor * test_hc_row_normalize(ggml_context * ctx, ggml_tensor * x) {
@@ -4102,6 +4130,7 @@ int main() {
     }
 
     test_compressor_pooling_correctness(backend);
+    test_attention_group_parallel_plan();
     test_chunked_graph_allocator(backend);
     test_swiglu_ds4_cpu_correctness(backend);
     test_moe_routing_correctness(backend);

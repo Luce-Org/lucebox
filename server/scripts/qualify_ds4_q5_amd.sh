@@ -48,9 +48,11 @@ DYNAMIC_MAIN_SLOTS_X4="${DYNAMIC_MAIN_SLOTS_X4:-}"
 SHARED_FFN_PEER_FRACTION="${SHARED_FFN_PEER_FRACTION:-0}"
 FUSED_OWNER_RESIDUAL="${FUSED_OWNER_RESIDUAL:-0}"
 ALIGN_SHARED_IDS="${ALIGN_SHARED_IDS:-0}"
+ATTENTION_TP_GROUPS="${ATTENTION_TP_GROUPS:-0}"
+ATTENTION_TP_MIN_CONTEXT="${ATTENTION_TP_MIN_CONTEXT:-0}"
 EXPERT_TOP_K="${EXPERT_TOP_K:-4}"
 VERIFY_WIDTH=$((4 + Q5_VERIFY + 2 * Q6_VERIFY))
-RUN_ID="${RUN_ID:-ds4-q${VERIFY_WIDTH}-fr${FORCE_GRAPH_REPLAY}-direct${DIRECT_INDEXER_TOPK}-radix${BLOCK_RADIX_TOPK}-x4p1${FP4_Q5_X4_PLUS1}-cp${CRITICAL_PATH_PLACEMENT}-r${MAIN_TO_PEER_RATE}-sf${SHARED_FFN_PEER_FRACTION}-or${FUSED_OWNER_RESIDUAL}-ai${ALIGN_SHARED_IDS}-$(date -u +%Y%m%dT%H%M%SZ)}"
+RUN_ID="${RUN_ID:-ds4-q${VERIFY_WIDTH}-fr${FORCE_GRAPH_REPLAY}-direct${DIRECT_INDEXER_TOPK}-radix${BLOCK_RADIX_TOPK}-x4p1${FP4_Q5_X4_PLUS1}-cp${CRITICAL_PATH_PLACEMENT}-r${MAIN_TO_PEER_RATE}-sf${SHARED_FFN_PEER_FRACTION}-or${FUSED_OWNER_RESIDUAL}-ai${ALIGN_SHARED_IDS}-at${ATTENTION_TP_GROUPS}-$(date -u +%Y%m%dT%H%M%SZ)}"
 OUT_ROOT="${OUT_ROOT:-$CHECKOUT/results/ds4_q5_context_qualification}"
 OUT_DIR="$OUT_ROOT/$RUN_ID"
 SERVER_LOG="$OUT_DIR/server.log"
@@ -107,6 +109,14 @@ case "$ALIGN_SHARED_IDS" in
     0|1) ;;
     *) echo "ALIGN_SHARED_IDS must be 0 or 1" >&2; exit 2 ;;
 esac
+if [[ ! "$ATTENTION_TP_GROUPS" =~ ^[0-7]$ ]]; then
+    echo "ATTENTION_TP_GROUPS must be an integer from 0 through 7" >&2
+    exit 2
+fi
+if [[ ! "$ATTENTION_TP_MIN_CONTEXT" =~ ^[0-9]+$ ]]; then
+    echo "ATTENTION_TP_MIN_CONTEXT must be a non-negative integer" >&2
+    exit 2
+fi
 if [[ ! "$EXPERT_TOP_K" =~ ^[1-9][0-9]*$ ]] || ((EXPERT_TOP_K > 16)); then
     echo "EXPERT_TOP_K must be an integer from 1 through 16" >&2
     exit 2
@@ -289,6 +299,12 @@ fi
 if [[ "$ALIGN_SHARED_IDS" == 1 ]]; then
     server_env+=("DFLASH_CUDA_MMVQ_MOE_ALIGN_SHARED_IDS=1")
 fi
+if ((ATTENTION_TP_GROUPS > 0)); then
+    server_env+=(
+        "DFLASH_DS4_ATTN_TP_GROUPS=$ATTENTION_TP_GROUPS"
+        "DFLASH_DS4_ATTN_TP_MIN_CONTEXT=$ATTENTION_TP_MIN_CONTEXT"
+    )
+fi
 if [[ -n "$CUDA_DISABLE_GRAPHS_DEVICES" ]]; then
     server_env+=(
         "GGML_CUDA_DISABLE_GRAPHS_DEVICES=$CUDA_DISABLE_GRAPHS_DEVICES"
@@ -381,6 +397,8 @@ server_args=(
     echo "shared_ffn_peer_fraction=$SHARED_FFN_PEER_FRACTION"
     echo "fused_owner_residual=$FUSED_OWNER_RESIDUAL"
     echo "align_shared_ids=$ALIGN_SHARED_IDS"
+    echo "attention_tp_groups=$ATTENTION_TP_GROUPS"
+    echo "attention_tp_min_context=$ATTENTION_TP_MIN_CONTEXT"
     echo "expert_top_k=$EXPERT_TOP_K"
     echo "cache_slots=$CACHE_SLOTS"
     echo "mmvq_max_ncols=$MMVQ_MAX_NCOLS"

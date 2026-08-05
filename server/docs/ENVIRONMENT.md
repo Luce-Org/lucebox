@@ -36,6 +36,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `DFLASH_DS4_TP_TARGETED_JOIN_SPLIT` / `DFLASH_MOE_TP_TARGETED_JOIN_SPLIT` | unset | BURN-IN: start a main-GPU split only at each peer-result join, avoiding an extra peer fence per MoE layer. |
 | `DFLASH_DS4_COMP_PAD_STRIDE` | 16 | BURN-IN: compressed-KV padding bucket (`16`, `32`, `64`, or `128`); wider exact-masked buckets reduce verifier graph recapture churn. |
 | `DFLASH_DS4_DISABLE_GROUPED_OUTPUT_PROJECTION` | unset | DEBUG: restore the materialized output projection when diagnosing grouped-view copies across unlike runtimes. |
+| `DFLASH_DS4_ATTN_TP_GROUPS` / `DFLASH_DS4_ATTN_TP_MIN_CONTEXT` | 0 / 0 | OPT-IN: split tail attention output-A groups onto the existing same-runtime, in-process peer GPU after the selected context. Correct but slower on the qualified R9700 + Strix profile; keep disabled. See `HETEROGENEOUS_STAGE_PLANNER.md`. |
 | `DFLASH_DS4_DRAFT_BACKEND` / `DFLASH_DS4_DRAFT_GPU` | compiled backend / target device | Select the in-process DSpark backend and device. |
 | `DFLASH_CUDA_BACKEND_PATH` / `DFLASH_HIP_BACKEND_PATH` | auto-discovered beside the executable | Explicit peer module file path for a mixed CUDA+HIP build. |
 | `GGML_BATCH_PEER_COPIES` | unset | BURN-IN: batch peer-runtime copies and unlike-runtime host staging with one source wait per split. `GGML_CUDA_BATCH_PEER_COPIES` remains a compatibility alias. |
@@ -92,6 +93,8 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_DRAFT_PERSIST` - laguna_backend.cpp
 - `DFLASH_DROP_COLD` - qwen35moe_backend.cpp, qwen35moe_pipelined_decode.cpp
 - `DFLASH_DS4_ADAPTIVE_WIDTH` - deepseek4_dspark_spec.cpp
+- `DFLASH_DS4_ATTN_TP_GROUPS` - deepseek4_backend.cpp
+- `DFLASH_DS4_ATTN_TP_MIN_CONTEXT` - deepseek4_backend.cpp
 - `DFLASH_DS4_COMP_PAD_STRIDE` - deepseek4_graph.cpp
 - `DFLASH_DS4_CROSS_VENDOR_OWNER_SUMS` - deepseek4_fused_verify.inc
 - `DFLASH_DS4_CUDA_LAYERS` - deepseek4_layer_split_adapter.cpp

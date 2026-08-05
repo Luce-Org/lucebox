@@ -150,6 +150,7 @@ private:
     bool requires_monolithic_model() const;
     bool validate_prefill_mode() const;
     bool init_moe_tensor_parallel();
+    bool init_attention_parallel();
     bool compute_uniform_hybrid_placement(const DeepSeek4Weights & w,
                                           int max_ctx,
                                           MoeHybridPlacement & out,
@@ -158,6 +159,7 @@ private:
     void maybe_save_routing_stats();
 
     std::shared_ptr<MoeHybridStorage> moe_hybrid_;
+    std::shared_ptr<DeepSeek4AttentionParallelState> attention_parallel_;
     MoeHybridPlacement                moe_placement_;
     MoeHybridPlacement                moe_decode_placement_;
     MoeHybridStreamEngine             stream_engine_;

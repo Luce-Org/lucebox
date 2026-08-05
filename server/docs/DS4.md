@@ -28,6 +28,7 @@ DeepSeek V4 Flash is a 43-layer MoE model with:
 |------|-------|
 | Backend selection / init | `src/common/backend_factory.cpp`, `src/deepseek4/deepseek4_backend.{h,cpp}`, `src/deepseek4/deepseek4_layer_split_adapter.{h,cpp}` |
 | Per-shard forward graph | `src/deepseek4/deepseek4_graph.cpp` |
+| Same-process grouped attention-output experiment | `src/deepseek4/deepseek4_attention_parallel.{h,cpp}` |
 | Model weights and metadata | `src/deepseek4/deepseek4_internal.h`, `src/deepseek4/deepseek4_loader.cpp` |
 | HC pre/post CUDA kernel | `src/deepseek4/deepseek4_hc_cuda.cu`, `.h` |
 | DSpark runtime | `src/deepseek4/deepseek4_dspark*.{h,cpp}` |

@@ -1,6 +1,7 @@
 // DeepSeek4Backend implementation — AR-only decode, chunked prefill.
 
 #include "deepseek4_backend.h"
+#include "deepseek4_attention_parallel.h"
 #include "deepseek4_internal.h"
 #include "common/dynamic_backend.h"
 #include "common/peer_access.h"
@@ -148,6 +149,43 @@ struct Ds4MoeTpConfig {
     bool concentrate_secondary = false;
     bool profile_hot_on_secondary = false;
 };
+
+struct Ds4AttentionTpConfig {
+    int peer_groups = 0;
+    int min_context = 0;
+    bool valid = true;
+
+    bool requested() const { return peer_groups > 0; }
+};
+
+static Ds4AttentionTpConfig ds4_attention_tp_config() {
+    Ds4AttentionTpConfig result;
+    const char * groups_raw = std::getenv("DFLASH_DS4_ATTN_TP_GROUPS");
+    if (!groups_raw || !*groups_raw || std::strcmp(groups_raw, "0") == 0) {
+        return result;
+    }
+    char * groups_end = nullptr;
+    const long groups = std::strtol(groups_raw, &groups_end, 10);
+    if (groups_end == groups_raw || *groups_end != '\0' || groups <= 0 ||
+        groups > std::numeric_limits<int>::max()) {
+        result.valid = false;
+        return result;
+    }
+    result.peer_groups = (int) groups;
+
+    const char * context_raw =
+        std::getenv("DFLASH_DS4_ATTN_TP_MIN_CONTEXT");
+    if (!context_raw || !*context_raw) return result;
+    char * context_end = nullptr;
+    const long context = std::strtol(context_raw, &context_end, 10);
+    if (context_end == context_raw || *context_end != '\0' || context < 0 ||
+        context > std::numeric_limits<int>::max()) {
+        result.valid = false;
+        return result;
+    }
+    result.min_context = (int) context;
+    return result;
+}
 
 static Ds4MoeTpConfig ds4_moe_tp_config(int local_gpu) {
     Ds4MoeTpConfig result;
@@ -917,6 +955,9 @@ bool DeepSeek4Backend::init() {
     if (env_flag_enabled("DFLASH_DS4_MOE_TP") && !init_moe_tensor_parallel()) {
         return false;
     }
+    if (!init_attention_parallel()) {
+        return false;
+    }
 
     if (const char * stats_path = std::getenv("DFLASH_DS4_ROUTING_STATS_OUT")) {
         if (*stats_path) {
@@ -1026,6 +1067,52 @@ bool DeepSeek4Backend::init_moe_tensor_parallel() {
                  "[deepseek4-moe-tp] enabled local_experts=%d remote_experts=%d\n",
                  moe_placement_.total_hot,
                  w_.n_layer * w_.n_expert - moe_placement_.total_hot);
+    return true;
+}
+
+bool DeepSeek4Backend::init_attention_parallel() {
+    cache_.attention_parallel = nullptr;
+    attention_parallel_.reset();
+
+    const Ds4AttentionTpConfig attention = ds4_attention_tp_config();
+    if (!attention.valid) {
+        std::fprintf(stderr,
+            "[deepseek4-attn-tp] invalid configuration; "
+            "DFLASH_DS4_ATTN_TP_GROUPS must be a positive integer and "
+            "DFLASH_DS4_ATTN_TP_MIN_CONTEXT must be non-negative\n");
+        return false;
+    }
+    if (!attention.requested()) return true;
+
+    const Ds4MoeTpConfig moe = ds4_moe_tp_config(cfg_.device.gpu);
+    if (!moe.in_process || !expert_backend_ || !moe_hybrid_ ||
+        moe_hybrid_->cold_backend != expert_backend_) {
+        std::fprintf(stderr,
+            "[deepseek4-attn-tp] requires DFLASH_DS4_MOE_TP_INPROC=1 "
+            "and the existing local secondary GPU backend\n");
+        return false;
+    }
+    const BackendPairCapabilities capabilities =
+        backend_pair_capabilities(backend_, expert_backend_);
+    if (!capabilities.same_runtime) {
+        std::fprintf(stderr,
+            "[deepseek4-attn-tp] requires two GPUs in the same runtime; "
+            "mixed CUDA/HIP pairs are not supported\n");
+        return false;
+    }
+
+    auto state = std::make_shared<DeepSeek4AttentionParallelState>();
+    std::string error;
+    if (!init_deepseek4_attention_parallel(
+            backend_, expert_backend_, w_, attention.peer_groups,
+            attention.min_context, *state, &error)) {
+        std::fprintf(stderr,
+            "[deepseek4-attn-tp] initialization failed: %s\n",
+            error.c_str());
+        return false;
+    }
+    attention_parallel_ = std::move(state);
+    cache_.attention_parallel = attention_parallel_.get();
     return true;
 }
 
@@ -1414,6 +1501,8 @@ bool DeepSeek4Backend::park(ParkTarget target) {
     }
     last_logits_.clear();
     last_logits_pos_ = -1;
+    cache_.attention_parallel = nullptr;
+    attention_parallel_.reset();
     free_deepseek4_cache(cache_);
     expert_runtime_.reset();
     stream_engine_.destroy();
@@ -1475,6 +1564,22 @@ bool DeepSeek4Backend::unpark(ParkTarget target) {
 
         if (env_flag_enabled("DFLASH_DS4_MOE_TP") &&
             !init_moe_tensor_parallel()) {
+            free_deepseek4_cache(cache_);
+            free_deepseek4_weights(w_);
+            expert_runtime_.reset();
+            stream_engine_.destroy();
+            moe_hybrid_.reset();
+            if (expert_backend_) {
+                ggml_backend_free(expert_backend_);
+                expert_backend_ = nullptr;
+            }
+            moe_placement_ = {};
+            moe_decode_placement_ = {};
+            return false;
+        }
+        if (!init_attention_parallel()) {
+            cache_.attention_parallel = nullptr;
+            attention_parallel_.reset();
             free_deepseek4_cache(cache_);
             free_deepseek4_weights(w_);
             expert_runtime_.reset();
@@ -2172,6 +2277,8 @@ void DeepSeek4Backend::shutdown() {
     for (int i = 0; i < PREFIX_SLOTS; i++) {
         snapshot_free(i);
     }
+    cache_.attention_parallel = nullptr;
+    attention_parallel_.reset();
     free_deepseek4_cache(cache_);
     expert_runtime_.reset();
     stream_engine_.destroy();

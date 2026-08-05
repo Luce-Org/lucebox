@@ -383,6 +383,9 @@ static bool ds4_build_fused_verify_graph(
     if (hybrid) {
         fg.hybrid_inputs.assign((size_t) w.n_layer, {});
     }
+    if (cache.attention_parallel) {
+        fg.attention_parallel_inputs.assign((size_t) w.n_layer, {});
+    }
     const int n_embd = w.n_embd;
     const int n_hc = w.n_hc;
     const BackendPairCapabilities pair_capabilities = hybrid
@@ -481,6 +484,10 @@ static bool ds4_build_fused_verify_graph(
 
         // ── Batched attention ──
         DeepSeek4AttentionGraphInputs ain{};
+        DeepSeek4AttentionParallelGraphInputs * attention_inputs =
+            cache.attention_parallel
+                ? &fg.attention_parallel_inputs[(size_t) il]
+                : nullptr;
         ain.rope_pos = ex.pos_q;
         ain.neg_pos = ex.neg_q;
         ain.raw_kv_rows = ex.rawrows;
@@ -535,7 +542,11 @@ static bool ds4_build_fused_verify_graph(
         ggml_tensor * normed = build_rms_norm(ctx, attn_in, L.attn_norm, w.rms_eps);
         ggml_tensor * attn_out = build_mla_attention(ctx, gf, normed, w, L, lc, il,
                                                      lane_kv_start, lane_q, &ain,
-                                                     i32b, i32ab, i64ab);
+                                                     i32b, i32ab, i64ab,
+                                                     nullptr,
+                                                     DeepSeek4AttentionImpl::Explicit,
+                                                     cache.attention_parallel,
+                                                     attention_inputs);
         if (!attn_out) return false;
         if (!i32b.empty() || !i32ab.empty() || !i64ab.empty()) {
             std::fprintf(stderr, "[ds4-fused-verify] layer %d dynamic bindings; cannot fuse\n", il);
@@ -911,6 +922,21 @@ static bool ds4_build_fused_verify_graph(
         pin_main(fg.i64_bundle);
         pin_main(fg.mask_bundle);
         for (ggml_tensor * hids : fg.hash_ids) pin_main(hids);
+        for (const DeepSeek4AttentionParallelGraphInputs & inputs :
+             fg.attention_parallel_inputs) {
+            for (ggml_tensor * node : inputs.peer_nodes) {
+                pin_peer(node);
+            }
+            for (ggml_tensor * node :
+                 inputs.deferred_peer_copy_nodes) {
+                pin_main(node);
+                ggml_backend_sched_add_deferred_peer_copy_node(
+                    fg.sched, node);
+            }
+            pin_main(inputs.main_output);
+            pin_main(inputs.peer_output);
+            pin_main(inputs.output);
+        }
         for (const MoeHybridGraphInputs & inputs : fg.hybrid_inputs) {
             if (mixed_policy.pin_route_weights) {
                 for (ggml_tensor * node : inputs.router_nodes) {
