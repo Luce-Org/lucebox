@@ -51,6 +51,14 @@ void platform_close(void * handle) {
 }
 #  else
 void * platform_open() {
+    void * process = dlopen(nullptr, RTLD_LAZY | RTLD_LOCAL);
+    if (process) {
+        if (dlsym(process, "roctxRangePushA") &&
+            dlsym(process, "roctxRangePop")) {
+            return process;
+        }
+        dlclose(process);
+    }
     return dlopen("libroctx64.so", RTLD_LAZY | RTLD_LOCAL);
 }
 DeepSeek4RoctxPush platform_find_push(void * handle) {

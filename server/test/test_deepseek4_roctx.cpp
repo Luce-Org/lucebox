@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -15,6 +16,20 @@
 #endif
 
 using namespace dflash::common;
+
+#if !defined(_WIN32) && defined(DFLASH27B_BACKEND_HIP)
+std::vector<std::string> interposed_events;
+
+extern "C" int roctxRangePushA(const char * message) {
+    interposed_events.emplace_back(std::string("push:") + message);
+    return 0;
+}
+
+extern "C" int roctxRangePop() {
+    interposed_events.emplace_back("pop");
+    return 0;
+}
+#endif
 
 static_assert(std::is_same_v<std::underlying_type_t<InferencePhase>, int32_t>);
 static_assert(std::is_same_v<
@@ -238,6 +253,21 @@ void test_disabled_loader_is_silent_and_unopened() {
     CHECK(loader_diagnostic_calls == 0);
 }
 
+#if !defined(_WIN32) && defined(DFLASH27B_BACKEND_HIP)
+void test_runtime_loader_prefers_interposed_roctx_symbols() {
+    interposed_events.clear();
+    CHECK(setenv("DFLASH_DS4_ROCTX", "1", 1) == 0);
+    {
+        const DeepSeek4RoctxRange range(
+            "ds4.interposed", {InferencePhase::Decode, 1, 0, 43, 0});
+    }
+    CHECK(interposed_events == std::vector<std::string>({
+        "push:ds4.interposed mode=decode tokens=1 layer_begin=0 layer_end=43 device=0",
+        "pop",
+    }));
+}
+#endif
+
 void test_missing_library_is_diagnosed() {
     reset_loader_state();
     const DeepSeek4RoctxCallbacks callbacks = deepseek4_roctx_load_callbacks(
@@ -331,6 +361,9 @@ int main() {
     test_phase_mapping_and_wire_roundtrip();
 #if !defined(_WIN32)
     test_malformed_phases_do_not_desynchronize_pipe();
+#endif
+#if !defined(_WIN32) && defined(DFLASH27B_BACKEND_HIP)
+    test_runtime_loader_prefers_interposed_roctx_symbols();
 #endif
     test_disabled_loader_is_silent_and_unopened();
     test_missing_library_is_diagnosed();
