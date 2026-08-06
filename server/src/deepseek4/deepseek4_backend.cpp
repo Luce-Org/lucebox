@@ -930,6 +930,21 @@ int DeepSeek4Backend::capture_safe_prefill_tokens(
     return safe_tokens;
 }
 
+bool DeepSeek4Backend::supports_batched_spec_feature_capture(
+        bool hybrid,
+        PrefillAttentionMode mode,
+        int n_tokens) {
+    if (mode == PrefillAttentionMode::Exact || n_tokens <= 4 ||
+        n_tokens > DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS) {
+        return false;
+    }
+    // The monolithic layer-major path reads only the requested token range.
+    // Sparse heterogeneous prefill returns every requested capture row; the
+    // caller then retains the final/snapshot window. Other hybrid modes are
+    // tokenwise and must still split at capture boundaries.
+    return !hybrid || mode == PrefillAttentionMode::Sparse;
+}
+
 bool DeepSeek4Backend::init() {
     // The shared MMVQ/MMQ crossover defaults to q=3 for NVIDIA. On gfx1151,
     // DSpark q=4 is faster through MMVQ. Keep AR and other devices unchanged,
@@ -1761,10 +1776,8 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         }
         if (spec_enabled_ && spec_drafter_) {
             const bool batch_final_capture =
-                !w_.moe_hybrid &&
-                cache_.prefill_mode != PrefillAttentionMode::Exact &&
-                n_tok > 4 &&
-                n_tok <= DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS;
+                supports_batched_spec_feature_capture(
+                    w_.moe_hybrid, cache_.prefill_mode, n_tok);
             n_tok = capture_safe_prefill_tokens(
                 i, n_tok, spec_final_from, batch_final_capture,
                 save_snapshot && !snapshot_saved,

@@ -2039,8 +2039,23 @@ static void test_dspark_prefill_capture_boundaries() {
     std::fprintf(stderr, "  test_dspark_prefill_capture_boundaries ...");
 
     using Backend = DeepSeek4Backend;
-    // Layer-major prefill captures only the requested tail from a wide graph,
-    // while generic paths still stop exactly at the final feature window.
+    // Both monolithic layer-major and sparse heterogeneous prefill return the
+    // per-token capture rows needed to retain a tail from one wide graph.
+    TEST_ASSERT(Backend::supports_batched_spec_feature_capture(
+                    false, PrefillAttentionMode::Sparse, 2048));
+    TEST_ASSERT(Backend::supports_batched_spec_feature_capture(
+                    true, PrefillAttentionMode::Sparse, 2048));
+    TEST_ASSERT(!Backend::supports_batched_spec_feature_capture(
+                    true, PrefillAttentionMode::Dense, 2048));
+    TEST_ASSERT(!Backend::supports_batched_spec_feature_capture(
+                    true, PrefillAttentionMode::Exact, 2048));
+    TEST_ASSERT(!Backend::supports_batched_spec_feature_capture(
+                    true, PrefillAttentionMode::Sparse, 4));
+    TEST_ASSERT(!Backend::supports_batched_spec_feature_capture(
+                    true, PrefillAttentionMode::Sparse,
+                    DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS + 1));
+
+    // Generic paths still stop exactly at the final feature window.
     TEST_ASSERT(Backend::capture_safe_prefill_tokens(
                     0, 2048, 1920, true, false, 0, 0) == 2048);
     TEST_ASSERT(Backend::capture_safe_prefill_tokens(

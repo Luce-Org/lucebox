@@ -114,8 +114,14 @@ private:
     void release_spec_drafter(bool mark_parked);
     void keep_spec_feature_tail(std::vector<float> & features,
                                 size_t max_rows) const;
+    // True when a wide prefill path returns per-token DSpark features and the
+    // caller can retain only the requested capture window without splitting.
+    static bool supports_batched_spec_feature_capture(
+        bool hybrid,
+        PrefillAttentionMode mode,
+        int n_tokens);
     // Limit a prefill batch to a region with a uniform DSpark capture policy.
-    // Layer-major prefill can capture a subrange without splitting the final
+    // Wide GPU paths can capture a subrange without splitting the final
     // feature window; other paths still stop exactly at capture boundaries.
     static int capture_safe_prefill_tokens(int token_offset,
                                            int requested_tokens,
