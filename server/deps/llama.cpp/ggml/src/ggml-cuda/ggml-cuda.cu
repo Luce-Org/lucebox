@@ -3428,6 +3428,14 @@ static bool ggml_cuda_batch_peer_copies_enabled() {
     return enabled;
 }
 
+static bool ggml_cuda_destination_peer_copies_enabled() {
+    static const bool enabled = [] {
+        const char * value = getenv("GGML_CUDA_DST_STREAM_PEER_COPIES");
+        return value && *value && strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
 static void ggml_cuda_flush_peer_copy_batch(const char * reason) {
     auto & batch = ggml_cuda_pending_peer_copies;
     if (batch.copies == 0) {
@@ -3504,6 +3512,34 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
             return false;
 #else
 #if defined(GGML_USE_HIP)
+            if (ggml_cuda_destination_peer_copies_enabled() &&
+                (src->flags & GGML_TENSOR_FLAG_DST_STREAM_COPY)) {
+                // The producer split has already been queued when the generic
+                // scheduler reaches this consumer input.  Publish its stream,
+                // then perform the transfer on the destination stream.  The
+                // producer can immediately continue with its independent
+                // branch instead of placing the peer copy in front of it.
+                // Only explicitly marked persistent staging tensors may take
+                // this path: ordinary graph temporaries can be recycled by the
+                // producer before a destination-stream copy has consumed them.
+                ggml_cuda_flush_peer_copy_batch("destination-stream-copy");
+                ggml_cuda_set_device(cuda_ctx_src->device);
+                if (!cuda_ctx_src->copy_event) {
+                    CUDA_CHECK(cudaEventCreateWithFlags(
+                        &cuda_ctx_src->copy_event, cudaEventDisableTiming));
+                }
+                CUDA_CHECK(cudaEventRecord(
+                    cuda_ctx_src->copy_event, cuda_ctx_src->stream()));
+
+                ggml_cuda_set_device(cuda_ctx_dst->device);
+                CUDA_CHECK(cudaStreamWaitEvent(
+                    cuda_ctx_dst->stream(), cuda_ctx_src->copy_event, 0));
+                CUDA_CHECK(cudaMemcpyPeerAsync(
+                    dst->data, cuda_ctx_dst->device,
+                    src->data, cuda_ctx_src->device,
+                    ggml_nbytes(dst), cuda_ctx_dst->stream()));
+                return true;
+            }
             if (ggml_cuda_batch_peer_copies_enabled()) {
                 auto & batch = ggml_cuda_pending_peer_copies;
                 if (batch.copies != 0 &&

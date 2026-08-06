@@ -396,6 +396,7 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
 //                               opt-in until qualified on each AMD target.
 #define MMID_GROUPED_MAX_PAIRS 256
 #define MMID_GROUPED_MAX_TPG   8
+#define MMID_GROUP_REUSE_MAX_PAIRS 5
 #define MMID_META_NG 0
 #define MMID_META_GE 1
 #define MMID_META_GS (MMID_META_GE + MMID_GROUPED_MAX_PAIRS)
@@ -476,6 +477,21 @@ static bool mmid_grouped_device_ok() {
         return e == nullptr || e[0] == '\0' ? -1 : atoi(e);
     }();
     return selected < 0 || selected == ggml_cuda_get_device();
+}
+
+// Decode each expert weight fragment once for every token routed to that
+// expert. This is deliberately opt-in until it has been qualified on each
+// target architecture; DFLASH_MMID_GROUPED remains the independent fallback.
+static bool mmid_group_reuse_env() {
+    static const bool on =
+        mmvq_env_flag("DFLASH_CUDA_MMVQ_MOE_GROUP_REUSE", false);
+    return on;
+}
+
+static bool mmid_group_reuse_ok(ggml_type type, int64_t ncols_dst) {
+    return mmid_group_reuse_env() && ncols_dst >= 2 && ncols_dst <= 5 &&
+        (type == GGML_TYPE_Q2_0_ROCMFP2 ||
+         type == GGML_TYPE_Q3_0_ROCMFPX);
 }
 
 static bool mmid_grouped_arch_ok(int cc) {
@@ -1406,7 +1422,8 @@ static __global__ void mul_mat_vec_q_moe(
 static __global__ void mmid_group_prep(
         int32_t * __restrict__ ids, int32_t * __restrict__ meta,
         const int n_slots, const int n_tok, const int ids_stride,
-        float * __restrict__ gate_w, const int gate_w_stride, const float gate_tau) {
+        float * __restrict__ gate_w, const int gate_w_stride,
+        const float gate_tau, const bool build_groups) {
     __shared__ int sh_expert[MMID_GROUPED_MAX_PAIRS];
     const int np = n_slots*n_tok;
     const int i  = threadIdx.x;
@@ -1463,6 +1480,340 @@ static __global__ void mmid_group_prep(
         meta[MMID_META_GE + r] = e == 0x7FFFFFFF ? -1 : e;
         meta[MMID_META_PT + r] = i / n_slots;
         meta[MMID_META_PS + r] = i % n_slots;
+    }
+    if (!build_groups) {
+        return;
+    }
+    __syncthreads();
+
+    // Build a compact expert-group index over the sorted pairs. The normal
+    // grouped kernel ignores this metadata; the weight-reuse variant maps one
+    // warp to one [start, end) group without a host readback or stream sync.
+    if (i == 0) {
+        int ng = 0;
+        int previous = 0x7FFFFFFF;
+        for (int p = 0; p < np; ++p) {
+            const int current = meta[MMID_META_GE + p];
+            if (p == 0 || current != previous) {
+                meta[MMID_META_GS + ng++] = p;
+                previous = current;
+            }
+        }
+        meta[MMID_META_GS + ng] = np;
+        meta[MMID_META_NG] = ng;
+    }
+}
+
+// Apply one ROCmFP2/ROCmFP3 weight fragment to every activation routed to the
+// same expert. Weight unpacking and scale conversion happen once; each pair
+// retains an independent integer accumulator and the original accumulation
+// order, so its floating-point result matches the single-pair dot product.
+template <ggml_type type, bool c_fp3_packed24, bool c_fp2_packed32>
+static __device__ __forceinline__ void vec_dot_rocmfpx_q8_1_group(
+        const void * __restrict__ vx,
+        const block_q8_1 * const y[MMID_GROUP_REUSE_MAX_PAIRS],
+        const int group_n, const int kbx, const int kby, const int iqs,
+        float out[MMID_GROUP_REUSE_MAX_PAIRS]) {
+    static_assert(type == GGML_TYPE_Q2_0_ROCMFP2 ||
+                  type == GGML_TYPE_Q3_0_ROCMFPX,
+                  "group reuse currently supports ROCmFP2/ROCmFP3 only");
+
+    if constexpr (type == GGML_TYPE_Q2_0_ROCMFP2) {
+        const block_rocmfp2 * bq2 = (const block_rocmfp2 *) vx + kbx;
+        int sumi[MMID_GROUP_REUSE_MAX_PAIRS] = {0};
+
+        if constexpr (c_fp2_packed32) {
+            uint32_t packed32;
+            memcpy(&packed32, bq2->qs + 4*iqs, sizeof(packed32));
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const uint32_t bits8 = (packed32 >> (8*j)) & 0xFFu;
+                const int val = rocmfpx_pack4_fp2_bits8_vec_cuda(bits8);
+#pragma unroll
+                for (int p = 0; p < MMID_GROUP_REUSE_MAX_PAIRS; ++p) {
+                    if (p < group_n) {
+                        const int u = get_int_b4(y[p][kby].qs, 4*iqs + j);
+                        sumi[p] = ggml_cuda_dp4a(val, u, sumi[p]);
+                    }
+                }
+            }
+        } else {
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int val = rocmfpx_pack4_fp2_bits8_vec_cuda(
+                    (uint32_t) bq2->qs[4*iqs + j]);
+#pragma unroll
+                for (int p = 0; p < MMID_GROUP_REUSE_MAX_PAIRS; ++p) {
+                    if (p < group_n) {
+                        const int u = get_int_b4(y[p][kby].qs, 4*iqs + j);
+                        sumi[p] = ggml_cuda_dp4a(val, u, sumi[p]);
+                    }
+                }
+            }
+        }
+
+        const float scale = rocmfpx_ue4m3_to_fp32_finite(bq2->e[iqs]);
+#pragma unroll
+        for (int p = 0; p < MMID_GROUP_REUSE_MAX_PAIRS; ++p) {
+            if (p < group_n) {
+                out[p] = __low2float(y[p][kby].ds) * scale * sumi[p];
+            }
+        }
+    } else {
+        const block_rocmfp3 * bq3 = (const block_rocmfp3 *) vx + kbx;
+        int sumi0[MMID_GROUP_REUSE_MAX_PAIRS] = {0};
+        int sumi1[MMID_GROUP_REUSE_MAX_PAIRS] = {0};
+
+        if constexpr (c_fp3_packed24) {
+            const int byte_offset = 3 * (iqs >> 1);
+            const uint32_t packed24 =
+                (uint32_t) bq3->qs[byte_offset + 0] |
+                ((uint32_t) bq3->qs[byte_offset + 1] << 8) |
+                ((uint32_t) bq3->qs[byte_offset + 2] << 16);
+            const int val0 =
+                rocmfpx_pack4_fp3_bits12_vec_cuda(packed24 & 0xFFFu);
+            const int val1 =
+                rocmfpx_pack4_fp3_bits12_vec_cuda(packed24 >> 12);
+#pragma unroll
+            for (int p = 0; p < MMID_GROUP_REUSE_MAX_PAIRS; ++p) {
+                if (p < group_n) {
+                    const int u0 = get_int_b4(y[p][kby].qs, iqs + 0);
+                    const int u1 = get_int_b4(y[p][kby].qs, iqs + 1);
+                    if (iqs < QK_ROCMFP3/8) {
+                        sumi0[p] = ggml_cuda_dp4a(val0, u0, sumi0[p]);
+                        sumi0[p] = ggml_cuda_dp4a(val1, u1, sumi0[p]);
+                    } else {
+                        sumi1[p] = ggml_cuda_dp4a(val0, u0, sumi1[p]);
+                        sumi1[p] = ggml_cuda_dp4a(val1, u1, sumi1[p]);
+                    }
+                }
+            }
+        } else {
+            uint32_t qs0, qs1, qs2;
+            memcpy(&qs0, bq3->qs + 0, 4);
+            memcpy(&qs1, bq3->qs + 4, 4);
+            memcpy(&qs2, bq3->qs + 8, 4);
+            const uint32_t qs[4] = {qs0, qs1, qs2, 0};
+            const bool first =
+                iqs + VDR_ROCMFP3_Q8_1_MMVQ <= QK_ROCMFP3/8;
+            const bool second = iqs >= QK_ROCMFP3/8;
+#pragma unroll
+            for (int j = 0; j < VDR_ROCMFP3_Q8_1_MMVQ; ++j) {
+                const int base = 4 * (iqs + j);
+                const int start_bit = 12 * (iqs + j);
+                const int reg_idx = start_bit >> 5;
+                const int reg_shift = start_bit & 31;
+                const uint32_t low = qs[reg_idx];
+                const uint32_t high = qs[reg_idx + 1];
+                const uint32_t bits12 = reg_shift == 0 ? low & 0xFFFu :
+                    ((low >> reg_shift) | (high << (32 - reg_shift))) &
+                        0xFFFu;
+                const int val = rocmfpx_pack4_fp3_bits12_vec_cuda(bits12);
+#pragma unroll
+                for (int p = 0; p < MMID_GROUP_REUSE_MAX_PAIRS; ++p) {
+                    if (p < group_n) {
+                        const int u = get_int_b4(y[p][kby].qs, iqs + j);
+                        if (first || (!second && base < QK_ROCMFP3/2)) {
+                            sumi0[p] = ggml_cuda_dp4a(val, u, sumi0[p]);
+                        } else {
+                            sumi1[p] = ggml_cuda_dp4a(val, u, sumi1[p]);
+                        }
+                    }
+                }
+            }
+        }
+
+        const float scale0 = rocmfpx_ue4m3_to_fp32_finite(bq3->e[0]);
+        const float scale1 = rocmfpx_ue4m3_to_fp32_finite(bq3->e[1]);
+#pragma unroll
+        for (int p = 0; p < MMID_GROUP_REUSE_MAX_PAIRS; ++p) {
+            if (p < group_n) {
+                const float db = __low2float(y[p][kby].ds);
+                out[p] = db * (scale0*sumi0[p] + scale1*sumi1[p]);
+            }
+        }
+    }
+}
+
+// One warp owns one unique expert. Repeated routes are processed in chunks of
+// five (the speculative-verify ceiling for this path), avoiding duplicate
+// weight decode work while preserving an independent result for every slot.
+template <ggml_type type, int c_rows_per_block, bool has_fusion,
+          bool c_fp3_packed24 = false, bool c_fp2_packed32 = false>
+__launch_bounds__(MMID_GROUPED_MAX_TPG*ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mul_mat_vec_q_moe_group_reuse(
+        const void * __restrict__ vx, const void * __restrict__ vy,
+        const int32_t * __restrict__ meta,
+        const ggml_cuda_mm_fusion_args_device fusion,
+        float * __restrict__ dst,
+        const uint32_t ncols_x, const uint3 nchannels_y,
+        const uint32_t nrows_x, const uint32_t stride_row_x,
+        const uint32_t stride_col_y, const uint32_t stride_col_dst,
+        const uint32_t stride_channel_x, const uint32_t stride_channel_y,
+        const uint32_t stride_channel_dst) {
+    constexpr int qk = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr = get_vdr_mmvq(type);
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int blocks_per_iter = vdr * warp_size / qi;
+
+    const int group =
+        blockIdx.y*MMID_GROUPED_MAX_TPG + (int) threadIdx.y;
+    const int ng = meta[MMID_META_NG];
+    if (group >= ng) {
+        return;
+    }
+    const int group_start = meta[MMID_META_GS + group];
+    const int group_end = meta[MMID_META_GS + group + 1];
+    const int channel_x = meta[MMID_META_GE + group_start];
+    const int row0 = c_rows_per_block*blockIdx.x;
+
+    if (channel_x < 0) {
+        if (threadIdx.x < c_rows_per_block &&
+            (c_rows_per_block == 1 ||
+             uint32_t(row0 + threadIdx.x) < nrows_x)) {
+            for (int p = group_start; p < group_end; ++p) {
+                const int tok = meta[MMID_META_PT + p];
+                const int slot = meta[MMID_META_PS + p];
+                dst[slot*stride_channel_dst + tok*stride_col_dst + row0 +
+                    threadIdx.x] = 0.0f;
+            }
+        }
+        return;
+    }
+
+    const int blocks_per_row_x = ncols_x/qk;
+    const int kbx_base = channel_x*stride_channel_x + row0*stride_row_x;
+    const bool use_gate = has_fusion && fusion.gate != nullptr;
+
+    for (int chunk = group_start; chunk < group_end;
+         chunk += MMID_GROUP_REUSE_MAX_PAIRS) {
+        const int remaining = group_end - chunk;
+        const int group_n = remaining < MMID_GROUP_REUSE_MAX_PAIRS ?
+            remaining : MMID_GROUP_REUSE_MAX_PAIRS;
+        int tok[MMID_GROUP_REUSE_MAX_PAIRS] = {0};
+        int slot[MMID_GROUP_REUSE_MAX_PAIRS] = {0};
+        const block_q8_1 * y[MMID_GROUP_REUSE_MAX_PAIRS] = {nullptr};
+#pragma unroll
+        for (int p = 0; p < MMID_GROUP_REUSE_MAX_PAIRS; ++p) {
+            if (p < group_n) {
+                tok[p] = meta[MMID_META_PT + chunk + p];
+                slot[p] = meta[MMID_META_PS + chunk + p];
+                const uint32_t channel_y =
+                    fastmodulo((uint32_t) slot[p], nchannels_y);
+                y[p] = ((const block_q8_1 *) vy) +
+                    channel_y*stride_channel_y + tok[p]*stride_col_y;
+            }
+        }
+
+        float tmp[c_rows_per_block][MMID_GROUP_REUSE_MAX_PAIRS] = {{0}};
+        float tmp_gate[c_rows_per_block][MMID_GROUP_REUSE_MAX_PAIRS] = {{0}};
+        for (int kbx = threadIdx.x/(qi/vdr); kbx < blocks_per_row_x;
+             kbx += blocks_per_iter) {
+            const int kby = kbx*(qk/QK8_1);
+            const int kqs = vdr*(threadIdx.x % (qi/vdr));
+#pragma unroll
+            for (int row = 0; row < c_rows_per_block; ++row) {
+                float dots[MMID_GROUP_REUSE_MAX_PAIRS] = {0};
+                vec_dot_rocmfpx_q8_1_group<
+                    type, c_fp3_packed24, c_fp2_packed32>(
+                        vx, y, group_n,
+                        kbx_base + row*stride_row_x + kbx, kby, kqs, dots);
+#pragma unroll
+                for (int p = 0; p < MMID_GROUP_REUSE_MAX_PAIRS; ++p) {
+                    if (p < group_n) {
+                        tmp[row][p] += dots[p];
+                    }
+                }
+                if (use_gate) {
+                    float gate_dots[MMID_GROUP_REUSE_MAX_PAIRS] = {0};
+                    vec_dot_rocmfpx_q8_1_group<
+                        type, c_fp3_packed24, c_fp2_packed32>(
+                            fusion.gate, y, group_n,
+                            kbx_base + row*stride_row_x + kbx, kby, kqs,
+                            gate_dots);
+#pragma unroll
+                    for (int p = 0; p < MMID_GROUP_REUSE_MAX_PAIRS; ++p) {
+                        if (p < group_n) {
+                            tmp_gate[row][p] += gate_dots[p];
+                        }
+                    }
+                }
+            }
+        }
+
+#pragma unroll
+        for (int row = 0; row < c_rows_per_block; ++row) {
+#pragma unroll
+            for (int p = 0; p < MMID_GROUP_REUSE_MAX_PAIRS; ++p) {
+                if (p < group_n) {
+                    tmp[row][p] = warp_reduce_sum<warp_size>(tmp[row][p]);
+                    if (use_gate) {
+                        tmp_gate[row][p] =
+                            warp_reduce_sum<warp_size>(tmp_gate[row][p]);
+                    }
+                }
+            }
+        }
+
+        if (threadIdx.x < c_rows_per_block &&
+            (c_rows_per_block == 1 ||
+             uint32_t(row0 + threadIdx.x) < nrows_x)) {
+            const int row = threadIdx.x;
+#pragma unroll
+            for (int p = 0; p < MMID_GROUP_REUSE_MAX_PAIRS; ++p) {
+                if (p < group_n) {
+                    float result = tmp[row][p];
+                    if constexpr (has_fusion) {
+                        if (fusion.x_bias != nullptr) {
+                            result += ((const float *) fusion.x_bias)[
+                                channel_x*stride_channel_dst + row0 + row];
+                        }
+                        if (use_gate) {
+                            float gate_value = tmp_gate[row][p];
+                            if (fusion.gate_bias != nullptr) {
+                                gate_value +=
+                                    ((const float *) fusion.gate_bias)[
+                                        channel_x*stride_channel_dst +
+                                        row0 + row];
+                            }
+                            switch (fusion.glu_op) {
+                                case GGML_GLU_OP_SWIGLU:
+                                    result *=
+                                        ggml_cuda_op_silu_single(gate_value);
+                                    break;
+                                case GGML_GLU_OP_GEGLU:
+                                    result *=
+                                        ggml_cuda_op_gelu_single(gate_value);
+                                    break;
+                                case GGML_GLU_OP_SWIGLU_OAI:
+                                    result = ggml_cuda_op_swiglu_oai_single(
+                                        gate_value, result,
+                                        fusion.glu_param0,
+                                        fusion.glu_param1);
+                                    break;
+                                case GGML_GLU_OP_SWIGLU_DS4:
+                                    if (fusion.gate_value_scale != 1.0f) {
+                                        gate_value *= fusion.gate_value_scale;
+                                    }
+                                    if (fusion.x_value_scale != 1.0f) {
+                                        result *= fusion.x_value_scale;
+                                    }
+                                    result = ggml_cuda_op_swiglu_ds4_single(
+                                        gate_value, result,
+                                        fusion.glu_param0);
+                                    break;
+                                default:
+                                    result *= gate_value;
+                                    break;
+                            }
+                        }
+                    }
+                    dst[slot[p]*stride_channel_dst +
+                        tok[p]*stride_col_dst + row0 + row] = result;
+                }
+            }
+        }
     }
 }
 
@@ -1682,13 +2033,49 @@ static void mul_mat_vec_q_moe_grouped_launch(
     }
 }
 
+template <ggml_type type, bool c_fp3_packed24 = false,
+          bool c_fp2_packed32 = false>
+static void mul_mat_vec_q_moe_group_reuse_launch(
+        const void * vx, const void * vy, const int32_t * meta,
+        const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
+        const uint32_t ncols_x, const uint3 nchannels_y,
+        const uint32_t nrows_x, const uint32_t stride_row_x,
+        const uint32_t stride_col_y, const uint32_t stride_col_dst,
+        const uint32_t stride_channel_x, const uint32_t stride_channel_y,
+        const uint32_t stride_channel_dst, const int max_groups,
+        const int warp_size, cudaStream_t stream) {
+    constexpr int rows_per_block = 1;
+    const int64_t nblocks_rows = nrows_x;
+    const dim3 block_nums(
+        nblocks_rows,
+        (max_groups + MMID_GROUPED_MAX_TPG - 1)/MMID_GROUPED_MAX_TPG);
+    const dim3 block_dims(warp_size, MMID_GROUPED_MAX_TPG);
+    const bool has_fusion = fusion.gate != nullptr ||
+        fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
+    if (has_fusion) {
+        mul_mat_vec_q_moe_group_reuse<
+            type, rows_per_block, true, c_fp3_packed24,
+            c_fp2_packed32><<<block_nums, block_dims, 0, stream>>>(
+                vx, vy, meta, fusion, dst, ncols_x, nchannels_y, nrows_x,
+                stride_row_x, stride_col_y, stride_col_dst,
+                stride_channel_x, stride_channel_y, stride_channel_dst);
+    } else {
+        mul_mat_vec_q_moe_group_reuse<
+            type, rows_per_block, false, c_fp3_packed24,
+            c_fp2_packed32><<<block_nums, block_dims, 0, stream>>>(
+                vx, vy, meta, fusion, dst, ncols_x, nchannels_y, nrows_x,
+                stride_row_x, stride_col_y, stride_col_dst,
+                stride_channel_x, stride_channel_y, stride_channel_dst);
+    }
+}
+
 static bool mul_mat_vec_q_grouped_dispatch(
         const ggml_type type, const void * vx, const void * vy, const int32_t * meta,
         const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
         const int ncols_x, const int nrows_x, const int nchannels_y,
         const int stride_row_x, const int stride_col_y, const int stride_col_dst,
         const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
-        const int max_groups, cudaStream_t stream) {
+        const int max_groups, const int ncols_dst, cudaStream_t stream) {
 
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const uint3 nchannels_y_fd = init_fastdiv_values((uint32_t) nchannels_y);
@@ -1702,6 +2089,7 @@ static bool mul_mat_vec_q_grouped_dispatch(
             std::getenv("DFLASH_CUDA_MMVQ_MOE_FP2_PACKED32");
         return e && e[0] == '1' && e[1] == '\0';
     }();
+    const bool group_reuse = mmid_group_reuse_ok(type, ncols_dst);
 
     switch (type) {
         case GGML_TYPE_Q4_0:
@@ -1725,6 +2113,26 @@ static bool mul_mat_vec_q_grouped_dispatch(
                 stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst, max_groups, warp_size, stream);
             return true;
         case GGML_TYPE_Q2_0_ROCMFP2:
+            if (group_reuse) {
+                if (fp2_packed32) {
+                    mul_mat_vec_q_moe_group_reuse_launch<
+                        GGML_TYPE_Q2_0_ROCMFP2, false, true>(
+                            vx, vy, meta, fusion, dst, ncols_x,
+                            nchannels_y_fd, nrows_x, stride_row_x,
+                            stride_col_y, stride_col_dst, stride_channel_x,
+                            stride_channel_y, stride_channel_dst, max_groups,
+                            warp_size, stream);
+                } else {
+                    mul_mat_vec_q_moe_group_reuse_launch<
+                        GGML_TYPE_Q2_0_ROCMFP2>(
+                            vx, vy, meta, fusion, dst, ncols_x,
+                            nchannels_y_fd, nrows_x, stride_row_x,
+                            stride_col_y, stride_col_dst, stride_channel_x,
+                            stride_channel_y, stride_channel_dst, max_groups,
+                            warp_size, stream);
+                }
+                return true;
+            }
             if (fp2_packed32) {
                 mul_mat_vec_q_moe_grouped_launch<
                     GGML_TYPE_Q2_0_ROCMFP2, false, true>(
@@ -1742,6 +2150,26 @@ static bool mul_mat_vec_q_grouped_dispatch(
             }
             return true;
         case GGML_TYPE_Q3_0_ROCMFPX:
+            if (group_reuse) {
+                if (fp3_packed24) {
+                    mul_mat_vec_q_moe_group_reuse_launch<
+                        GGML_TYPE_Q3_0_ROCMFPX, true, false>(
+                            vx, vy, meta, fusion, dst, ncols_x,
+                            nchannels_y_fd, nrows_x, stride_row_x,
+                            stride_col_y, stride_col_dst, stride_channel_x,
+                            stride_channel_y, stride_channel_dst, max_groups,
+                            warp_size, stream);
+                } else {
+                    mul_mat_vec_q_moe_group_reuse_launch<
+                        GGML_TYPE_Q3_0_ROCMFPX>(
+                            vx, vy, meta, fusion, dst, ncols_x,
+                            nchannels_y_fd, nrows_x, stride_row_x,
+                            stride_col_y, stride_col_dst, stride_channel_x,
+                            stride_channel_y, stride_channel_dst, max_groups,
+                            warp_size, stream);
+                }
+                return true;
+            }
             if (fp3_packed24) {
                 mul_mat_vec_q_moe_grouped_launch<
                     GGML_TYPE_Q3_0_ROCMFPX, true, false>(
@@ -2794,18 +3222,21 @@ void ggml_cuda_mul_mat_vec_q(
         const int prep_threads = ((np + prep_warp - 1)/prep_warp)*prep_warp;
         mmid_group_prep<<<1, prep_threads, 0, stream>>>(
             prep_ids, mmid_meta.ptr, (int) nchannels_dst, (int) ncols_dst, prep_ids_stride,
-            gate_w, gate_w_stride, gate_tau);
+            gate_w, gate_w_stride, gate_tau,
+            mmid_group_reuse_ok(src0->type, ncols_dst));
         CUDA_CHECK(cudaGetLastError());
         if (mul_mat_vec_q_grouped_dispatch(
                 src0->type, src0->data, src1_q8_d, mmid_meta.ptr, fusion_local, dst_d,
                 (int) ne00, (int) ne01, (int) nchannels_y,
                 (int) s01, (int) stride_col_y, (int) stride_col_dst,
                 (int) s02, (int) stride_channel_y, (int) stride_channel_dst,
-                np, stream)) {
+                np, (int) ncols_dst, stream)) {
             if (mmid_telemetry) {
                 std::fprintf(stderr,
-                    "[dflash-mmid] event=mmvq type=%s width=%lld pairs=%d variant=grouped\n",
-                    ggml_type_name(src0->type), (long long) ncols_dst, np);
+                    "[dflash-mmid] event=mmvq type=%s width=%lld pairs=%d variant=%s\n",
+                    ggml_type_name(src0->type), (long long) ncols_dst, np,
+                    mmid_group_reuse_ok(src0->type, ncols_dst) ?
+                        "group-reuse" : "grouped");
             }
             return;
         }

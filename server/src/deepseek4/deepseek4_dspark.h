@@ -144,6 +144,13 @@ bool deepseek4_dspark_draft_read_async_output(
                                           ggml_backend_t backend,
                                           std::vector<float> & out_hidden,
                                           std::vector<float> * confidence_hidden = nullptr);
+// Borrow the cached graph's device-resident outputs after async submission.
+// The draft runtime retains ownership; callers must consume them before the
+// graph cache is rebuilt, reset, or submitted again.
+bool deepseek4_dspark_draft_device_outputs(
+                                          ggml_backend_t backend,
+                                          ggml_tensor ** out_hidden,
+                                          ggml_tensor ** confidence_hidden = nullptr);
 void deepseek4_dspark_draft_wait(ggml_backend_t backend);
 
 // Batched target verify forward WITH feature capture (defined in

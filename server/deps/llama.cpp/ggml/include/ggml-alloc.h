@@ -46,11 +46,10 @@ GGML_API enum ggml_status    ggml_tallocr_alloc(struct ggml_tallocr * talloc, st
 typedef struct ggml_gallocr * ggml_gallocr_t;
 
 GGML_API ggml_gallocr_t ggml_gallocr_new(ggml_backend_buffer_type_t buft);
-// Uses max_chunk_size as the preferred backing-allocation limit while
-// preserving a single logical graph allocator. Individual tensors are never
-// split and may exceed the limit. This is useful on devices without virtual
-// memory support, where a large contiguous allocation can fail despite
-// sufficient aggregate free memory.
+// Limits each backing allocation while preserving a single logical graph
+// allocator. Tensors are never split across chunks. This is useful on devices
+// without virtual memory support, where a large contiguous allocation can fail
+// despite sufficient aggregate free memory.
 GGML_API ggml_gallocr_t ggml_gallocr_new_with_max_chunk_size(
     ggml_backend_buffer_type_t buft,
     size_t max_chunk_size);

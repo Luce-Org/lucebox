@@ -13,7 +13,6 @@
 #include "internal.h"
 #include "../common/step_graph.h"
 #include "../common/cuda_graph_overrides.h"
-#include "../common/dynamic_backend.h"
 #include "../common/moe_expert_compute.h"
 #include "../common/moe_hybrid_ffn_eval.h"
 #include "../common/moe_hybrid_routing_stats.h"
@@ -589,24 +588,70 @@ static ggml_tensor * build_tail_rope_3d(ggml_context * ctx,
                                          float attn_factor,
                                          float beta_fast,
                                          float beta_slow,
-                                         int n_ctx_orig) {
+                                         int n_ctx_orig,
+                                         std::vector<ggml_tensor *> * backend_nodes = nullptr) {
+    auto track = [backend_nodes](ggml_tensor * tensor) {
+        if (backend_nodes && tensor) backend_nodes->push_back(tensor);
+        return tensor;
+    };
     const int n_nope = head_dim - n_rot;
     // Split: nope [n_nope, n_heads, n_tokens], tail [n_rot, n_heads, n_tokens]
-    ggml_tensor * nope = ggml_view_3d(ctx, x, n_nope, n_heads, n_tokens,
-                                       x->nb[1], x->nb[2], 0);
-    ggml_tensor * tail = ggml_view_3d(ctx, x, n_rot, n_heads, n_tokens,
-                                       x->nb[1], x->nb[2],
-                                       (size_t)n_nope * ggml_type_size(x->type));
+    ggml_tensor * nope = track(ggml_view_3d(
+        ctx, x, n_nope, n_heads, n_tokens, x->nb[1], x->nb[2], 0));
+    ggml_tensor * tail = track(ggml_view_3d(
+        ctx, x, n_rot, n_heads, n_tokens, x->nb[1], x->nb[2],
+        (size_t)n_nope * ggml_type_size(x->type)));
     // tail is non-contiguous (stride between heads = head_dim, not n_rot)
-    tail = ggml_cont(ctx, tail);
+    tail = track(ggml_cont(ctx, tail));
     // Apply rope to the contiguous tail: [n_rot, n_heads, n_tokens]
     // DS4 uses standard sequential pairs (i, i+1), which is GGML_ROPE_TYPE_NORMAL
-    tail = ggml_rope_ext(ctx, tail, pos, nullptr,
-                         n_rot, GGML_ROPE_TYPE_NORMAL, n_ctx_orig,
-                         freq_base, freq_scale,
-                         ext_factor, attn_factor, beta_fast, beta_slow);
+    tail = track(ggml_rope_ext(
+        ctx, tail, pos, nullptr, n_rot, GGML_ROPE_TYPE_NORMAL, n_ctx_orig,
+        freq_base, freq_scale, ext_factor, attn_factor, beta_fast,
+        beta_slow));
     // Concat nope + tail along dim 0 → [head_dim, n_heads, n_tokens]
-    return ggml_concat(ctx, ggml_cont(ctx, nope), tail, 0);
+    nope = track(ggml_cont(ctx, nope));
+    return track(ggml_concat(ctx, nope, tail, 0));
+}
+
+// Apply the inverse tail rotation using ROPE_BACK and positive positions.
+// For a rotary transform this is the same operation as forward RoPE at the
+// negated position.  Keeping the position positive is useful on a scheduled
+// heterogeneous branch: the peer already consumes that proven input for Q,
+// so inverse rotation cannot depend on a second dynamic position tensor.
+static ggml_tensor * build_tail_rope_back_3d(
+        ggml_context * ctx,
+        ggml_tensor * x,
+        ggml_tensor * pos,
+        int n_rot,
+        int head_dim,
+        int n_heads,
+        int n_tokens,
+        float freq_base,
+        float freq_scale,
+        float ext_factor,
+        float attn_factor,
+        float beta_fast,
+        float beta_slow,
+        int n_ctx_orig,
+        std::vector<ggml_tensor *> * backend_nodes = nullptr) {
+    auto track = [backend_nodes](ggml_tensor * tensor) {
+        if (backend_nodes && tensor) backend_nodes->push_back(tensor);
+        return tensor;
+    };
+    const int n_nope = head_dim - n_rot;
+    ggml_tensor * nope = track(ggml_view_3d(
+        ctx, x, n_nope, n_heads, n_tokens, x->nb[1], x->nb[2], 0));
+    ggml_tensor * tail = track(ggml_view_3d(
+        ctx, x, n_rot, n_heads, n_tokens, x->nb[1], x->nb[2],
+        (size_t) n_nope * ggml_type_size(x->type)));
+    tail = track(ggml_cont(ctx, tail));
+    tail = track(ggml_rope_ext_back(
+        ctx, tail, pos, nullptr, n_rot, GGML_ROPE_TYPE_NORMAL, n_ctx_orig,
+        freq_base, freq_scale, ext_factor, attn_factor, beta_fast,
+        beta_slow));
+    nope = track(ggml_cont(ctx, nope));
+    return track(ggml_concat(ctx, nope, tail, 0));
 }
 
 // For KV (single head): x is [head_dim, n_tokens]
@@ -993,7 +1038,9 @@ static void build_compressor_step(
         ggml_tensor * cur_all = nullptr,
         int n_tokens_all = 1,
         int kv_start_all = -1,
-        bool indexer_qat = false) {
+        bool indexer_qat = false,
+        ggml_tensor ** comp_values_out = nullptr) {
+    if (comp_values_out) *comp_values_out = nullptr;
     if (!gf || !cur_last || !ape || !kv_proj || !gate_proj || !norm_weight ||
         !state.state_kv || !state.state_score || !comp_cache || ratio <= 0) {
         return;
@@ -1204,6 +1251,9 @@ static void build_compressor_step(
     if (indexer_qat) {
         pooled = ggml_ds4_indexer_qat(ctx, ggml_cont(ctx, pooled));
     }
+    if (comp_values_out) {
+        *comp_values_out = pooled;
+    }
 
     ggml_tensor * pooled_f16 = ggml_cast(ctx, pooled, GGML_TYPE_F16);
     const int comp_row = token_pos / ratio;
@@ -1330,6 +1380,10 @@ static void build_compressor_step(
             if (indexer_qat) {
                 second_pooled = ggml_ds4_indexer_qat(
                     ctx, ggml_cont(ctx, second_pooled));
+            }
+            if (comp_values_out) {
+                *comp_values_out = ggml_cont(ctx, ggml_concat(
+                    ctx, *comp_values_out, second_pooled, 1));
             }
             ggml_tensor * second_comp_row = ggml_view_1d(
                 ctx, comp_rows_inp, 1, comp_rows_inp->nb[0]);
@@ -1474,33 +1528,10 @@ static int ds4_comp_rows_used(const ggml_tensor * comp_cache, int n_cached, int 
 // rows in [n_comp, padded) are masked to -1e30 in the score matrix, which
 // underflows to exactly 0 in softmax, so a padded read is bit-identical to an
 // unpadded read of the first n_comp rows.
-static int ds4_comp_pad_stride() {
-    static const int stride = [] {
-        constexpr int default_stride = 16;
-        const char * raw = std::getenv("DFLASH_DS4_COMP_PAD_STRIDE");
-        if (!raw || !*raw) return default_stride;
-        const int requested = std::atoi(raw);
-        switch (requested) {
-            case 16:
-            case 32:
-            case 64:
-            case 128:
-                return requested;
-            default:
-                std::fprintf(stderr,
-                    "[deepseek4] invalid DFLASH_DS4_COMP_PAD_STRIDE=%s; "
-                    "using %d\n",
-                    raw, default_stride);
-                return default_stride;
-        }
-    }();
-    return stride;
-}
-
+static constexpr int DS4_COMP_PAD_STRIDE = 16;
 static int ds4_padded_comp_rows(int n_comp, int cap) {
     if (n_comp <= 0) return 0;
-    const int stride = ds4_comp_pad_stride();
-    const int padded = ((n_comp + stride - 1) / stride) * stride;
+    const int padded = ((n_comp + DS4_COMP_PAD_STRIDE - 1) / DS4_COMP_PAD_STRIDE) * DS4_COMP_PAD_STRIDE;
     return padded < cap ? padded : cap;
 }
 
@@ -1603,6 +1634,45 @@ static ggml_tensor * build_indexer_topk(
 
 // ─── MLA Attention Block ────────────────────────────────────────────────
 
+struct DeepSeek4AttentionTpGraphInputs {
+    struct DebugPair {
+        const char * name = nullptr;
+        ggml_tensor * main = nullptr;
+        ggml_tensor * peer = nullptr;
+    };
+
+    std::vector<ggml_tensor *> main_nodes;
+    std::vector<ggml_tensor *> peer_nodes;
+    std::vector<ggml_tensor *> deferred_peer_copy_nodes;
+    std::vector<DebugPair> debug_pairs;
+    ggml_tensor * main_output = nullptr;
+    ggml_tensor * peer_partial = nullptr;
+    ggml_tensor * peer_output = nullptr;
+};
+
+// Reusable R9700-owned storage for the two main-to-peer attention payloads.
+// A fused verifier graph processes layers in order, so one QR buffer and one
+// assembled-KV buffer are sufficient for every selected layer.  Chaining each
+// write through the previous state also makes the reuse dependency explicit to
+// ggml's graph scheduler.
+struct DeepSeek4AttentionTpForkState {
+    ggml_tensor * qr_storage = nullptr;
+    ggml_tensor * qr_state = nullptr;
+    int64_t qr_elements = 0;
+
+    ggml_tensor * kv_storage = nullptr;
+    ggml_tensor * kv_state = nullptr;
+    int64_t kv_elements = 0;
+
+    ggml_tensor * packed_storage = nullptr;
+    ggml_tensor * packed_state = nullptr;
+    int64_t packed_elements = 0;
+
+    ggml_tensor * incremental_storage = nullptr;
+    ggml_tensor * incremental_state = nullptr;
+    int64_t incremental_elements = 0;
+};
+
 static ggml_tensor * build_mla_attention(
         ggml_context * ctx,
         ggml_cgraph * gf,
@@ -1618,25 +1688,149 @@ static ggml_tensor * build_mla_attention(
         std::vector<DeepSeek4I32ArrayBinding> & i32_array_inputs,
         std::vector<DeepSeek4I64ArrayBinding> & i64_array_inputs,
         std::vector<DeepSeek4F32ArrayBinding> * f32_array_inputs = nullptr,
-        DeepSeek4AttentionImpl attention_impl = DeepSeek4AttentionImpl::Explicit) {
+        DeepSeek4AttentionImpl attention_impl = DeepSeek4AttentionImpl::Explicit,
+        const DeepSeek4AttentionTpCacheLayer * attention_tp_cache = nullptr,
+        DeepSeek4AttentionTpGraphInputs * attention_tp = nullptr,
+        const DeepSeek4AttentionGraphInputs * attention_tp_peer_inputs = nullptr,
+        DeepSeek4AttentionTpForkState * attention_tp_fork_state = nullptr) {
+
+    if (attention_tp) *attention_tp = {};
 
     const int n_embd    = w.n_embd;
     const int head_dim  = w.head_dim;
-    const int n_head    = w.n_head;
+    const int total_head = w.n_head;
     const int n_rot     = w.n_rot;
     const int n_out_group = w.n_out_group;
     const int n_lora_o  = w.n_lora_o;
     const int ratio     = w.compress_ratios[layer_idx];
+
+    // Attention cost differs sharply between compressed-layer families.  A
+    // ratio filter lets the heterogeneous planner offload only layers whose
+    // longer score/value work can amortize a device fork.  The default keeps
+    // the original all-layer behavior; a non-negative value selects an exact
+    // compression ratio (for example 4).
+    const char * attention_tp_ratio_raw =
+        std::getenv("DFLASH_DS4_ATTENTION_TP_RATIO");
+    const int attention_tp_ratio = attention_tp_ratio_raw
+        ? std::atoi(attention_tp_ratio_raw) : -1;
+    const bool attention_tp_layer_selected =
+        attention_tp_ratio < 0 || ratio == attention_tp_ratio;
+
+    const bool mirror_attention_cache =
+        attention_tp_layer_selected &&
+        attention_tp && attention_tp_cache && cached_inputs &&
+        attention_tp_peer_inputs && cached_inputs->raw_kv_rows &&
+        attention_tp_peer_inputs->raw_kv_rows &&
+        w.attention_tp_backend && w.attention_tp_peer_groups > 0 &&
+        w.attention_tp_main_groups + w.attention_tp_peer_groups ==
+            n_out_group &&
+        layer_idx >= 0 &&
+        (size_t) layer_idx < w.attention_tp_layers.size();
+    const bool split_attention =
+        mirror_attention_cache && n_tokens > 1 &&
+        attention_impl == DeepSeek4AttentionImpl::Explicit;
+    const bool split_attention_projection_only = split_attention &&
+        ds4_env_flag("DFLASH_DS4_ATTENTION_TP_PROJECTION_ONLY");
+    const bool split_attention_core_only =
+        split_attention && !split_attention_projection_only &&
+        ds4_env_flag("DFLASH_DS4_ATTENTION_TP_CORE_ONLY");
+    const bool split_attention_q =
+        split_attention && !split_attention_projection_only &&
+        !split_attention_core_only;
+    // Cross-architecture F32 score/value GEMMs differ by a few ULPs. In this
+    // routed model those tiny changes can flip a later expert choice and
+    // destroy speculative acceptance. Keep the proven bit-identical Q-head
+    // projection split, then join before score/value attention. A future
+    // deterministic attention kernel can safely extend the owner boundary.
+    const bool split_attention_values = split_attention_core_only ||
+        (split_attention_q &&
+         ds4_env_flag("DFLASH_DS4_ATTENTION_TP_VALUES"));
+    const bool split_attention_direct_kv = split_attention_values &&
+        (split_attention_core_only ||
+         ds4_env_flag("DFLASH_DS4_ATTENTION_TP_DIRECT_KV"));
+    const bool split_attention_flash = split_attention_values &&
+        ds4_env_flag("DFLASH_DS4_ATTENTION_TP_FLASH");
+    const bool split_attention_output_projection =
+        split_attention_values && !split_attention_core_only;
+    const bool split_attention_output_b =
+        (split_attention_output_projection ||
+         split_attention_projection_only) &&
+        ds4_env_flag("DFLASH_DS4_ATTENTION_TP_OUTPUT_B");
+    const int heads_per_group = total_head / n_out_group;
+    const int main_groups = split_attention
+        ? w.attention_tp_main_groups : n_out_group;
+    const int peer_groups = split_attention
+        ? w.attention_tp_peer_groups : 0;
+    const int n_head = main_groups * heads_per_group;
+    const int peer_head = peer_groups * heads_per_group;
+    const DeepSeek4AttentionTpLayer * peer_weights = split_attention
+        ? &w.attention_tp_layers[(size_t) layer_idx] : nullptr;
+
+    auto track_main = [attention_tp](ggml_tensor * tensor) {
+        if (attention_tp && tensor) attention_tp->main_nodes.push_back(tensor);
+        return tensor;
+    };
+    auto track_peer = [attention_tp](ggml_tensor * tensor) {
+        if (attention_tp && tensor) attention_tp->peer_nodes.push_back(tensor);
+        return tensor;
+    };
+    const bool debug_attention_tp = split_attention_q &&
+        ds4_env_flag("DFLASH_DS4_ATTENTION_TP_DEBUG_AB");
+    auto add_debug_pair = [&](const char * name,
+                              ggml_tensor * main,
+                              ggml_tensor * peer) {
+        if (!debug_attention_tp || !main || !peer) return;
+        GGML_ASSERT(main->type == GGML_TYPE_F32);
+        GGML_ASSERT(peer->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_nelements(main) == ggml_nelements(peer));
+        // Snapshot both sides into owned contiguous outputs. Several useful
+        // checkpoints are views into graph inputs or softmax results; retaining
+        // those views directly lets gallocr reuse their storage and also makes
+        // a flat host read invalid when a stride gap is present.
+        main = track_main(ggml_cont(ctx, main));
+        peer = track_peer(ggml_cont(ctx, peer));
+        ggml_set_output(main);
+        ggml_set_output(peer);
+        ggml_build_forward_expand(gf, main);
+        ggml_build_forward_expand(gf, peer);
+        attention_tp->debug_pairs.push_back({name, main, peer});
+    };
+    auto add_debug_main_pair = [&](const char * name,
+                                   ggml_tensor * expected,
+                                   ggml_tensor * actual) {
+        if (!debug_attention_tp || !expected || !actual) return;
+        GGML_ASSERT(expected->type == GGML_TYPE_F32);
+        GGML_ASSERT(actual->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_nelements(expected) == ggml_nelements(actual));
+        expected = track_main(ggml_cont(ctx, expected));
+        actual = track_main(ggml_cont(ctx, actual));
+        ggml_set_output(expected);
+        ggml_set_output(actual);
+        ggml_build_forward_expand(gf, expected);
+        ggml_build_forward_expand(gf, actual);
+        attention_tp->debug_pairs.push_back({name, expected, actual});
+    };
+    ggml_tensor * debug_peer_q_ref = nullptr;
+    ggml_tensor * debug_peer_context_ref = nullptr;
+    ggml_tensor * debug_full_q_ref = nullptr;
+    ggml_tensor * debug_full_context_ref = nullptr;
 
     // ── Q path: cur → q_a → norm → q_b → per-head norm ─────────────
     // q_a: [n_embd, n_tokens] → [n_lora_q, n_tokens]
     ggml_tensor * qr = ggml_mul_mat(ctx, L.attn_q_a, cur);
     // qr_norm is reused by the ratio-4 indexer before the main q_b projection.
     qr = build_rms_norm(ctx, qr, L.attn_q_a_norm, w.rms_eps);
-    // q_b: [n_lora_q, n_tokens] → [n_head * head_dim, n_tokens]
-    ggml_tensor * q = ggml_mul_mat(ctx, L.attn_q_b, qr);
+    // Each TP owner projects only its persistent, contiguous head partition.
+    ggml_tensor * main_q_b = L.attn_q_b;
+    if (split_attention_q) {
+        main_q_b = ggml_view_2d(
+            ctx, L.attn_q_b, w.n_lora_q, (int64_t) n_head * head_dim,
+            L.attn_q_b->nb[1], 0);
+    }
+    ggml_tensor * q = ggml_mul_mat(ctx, main_q_b, qr);
     // Reshape to [head_dim, n_head, n_tokens] for per-head ops
-    q = ggml_reshape_3d(ctx, q, head_dim, n_head, n_tokens);
+    const int q_head = split_attention_q ? n_head : total_head;
+    q = ggml_reshape_3d(ctx, q, head_dim, q_head, n_tokens);
     // Reference DS4 applies unweighted RMSNorm independently to every Q head.
     q = ggml_rms_norm(ctx, q, w.rms_eps);
 
@@ -1676,13 +1870,31 @@ static ggml_tensor * build_mla_attention(
     const bool fuse_q_rope = attention_impl != DeepSeek4AttentionImpl::Explicit &&
                              n_tokens > 1 && head_dim == 512 && n_rot == 64;
     if (!fuse_q_rope) {
-        q = build_tail_rope_3d(ctx, q, rope_pos, n_rot, head_dim, n_head, n_tokens,
+        q = build_tail_rope_3d(ctx, q, rope_pos, n_rot, head_dim, q_head, n_tokens,
                                rope_freq, rope_scale, rope_ext, rope_attn,
                                w.rope_yarn_beta_fast, w.rope_yarn_beta_slow, rope_n_ctx_orig);
     }
     kv = build_tail_rope_2d(ctx, kv, rope_pos, n_rot, head_dim, n_tokens,
                             rope_freq, rope_scale, rope_ext, rope_attn,
                             w.rope_yarn_beta_fast, w.rope_yarn_beta_slow, rope_n_ctx_orig);
+
+    if (debug_attention_tp) {
+        debug_full_q_ref = track_main(ggml_mul_mat(
+            ctx, L.attn_q_b, qr));
+        debug_full_q_ref = ggml_reshape_3d(
+            ctx, debug_full_q_ref, head_dim, total_head, n_tokens);
+        debug_full_q_ref = track_main(ggml_rms_norm(
+            ctx, debug_full_q_ref, w.rms_eps));
+        debug_full_q_ref = track_main(build_tail_rope_3d(
+            ctx, debug_full_q_ref, rope_pos, n_rot, head_dim,
+            total_head, n_tokens, rope_freq, rope_scale, rope_ext,
+            rope_attn, w.rope_yarn_beta_fast, w.rope_yarn_beta_slow,
+            rope_n_ctx_orig));
+        ggml_tensor * debug_main_q_ref = ggml_view_3d(
+            ctx, debug_full_q_ref, head_dim, n_head, n_tokens,
+            debug_full_q_ref->nb[1], debug_full_q_ref->nb[2], 0);
+        add_debug_main_pair("q_main_vs_full", debug_main_q_ref, q);
+    }
 
     // ── Causal batched step (exact multi-token target semantics) ───
     // The target model is causal: token i must not attend to batch tokens
@@ -1789,6 +2001,7 @@ static ggml_tensor * build_mla_attention(
     ggml_tensor * cur_last = ggml_view_2d(
         ctx, cur, n_embd, 1, cur->nb[1], (size_t)(n_tokens - 1) * cur->nb[1]);
     ggml_tensor * comp_kv_source = lc.comp_kv;
+    ggml_tensor * comp_values = nullptr;
     if (ratio > 0 && L.attn_compressor_kv) {
         build_compressor_step(ctx, gf, cur_last,
                               L.attn_compressor_ape,
@@ -1817,7 +2030,9 @@ static ggml_tensor * build_mla_attention(
                               cached_inputs ? cached_inputs->flush_rows : nullptr,
                               (causal_batch || fused_causal) ? cur : nullptr,
                               n_tokens,
-                              kv_start);
+                              kv_start,
+                              false,
+                              &comp_values);
     }
 
     ggml_tensor * index_comp_kv_source = lc.index_comp_kv;
@@ -1929,6 +2144,378 @@ static ggml_tensor * build_mla_attention(
     }
     // kv_attn: [head_dim, n_attn]
 
+    // Build one compact main-to-peer fork payload. Keeping Q-low-rank, current
+    // KV, and compressor emissions together prevents the peer branch from
+    // being split at each new dependency. The scheduler copies this single
+    // tensor before launching the peer split. Do not use the deferred peer-read
+    // op in this direction: direct gfx1151 reads from R9700 VRAM returned zeros
+    // in the model-backed A/B harness, while the normal main-to-peer copy is a
+    // supported HIP transfer. The reverse peer-to-main result path retains the
+    // exact deferred peer-read operation qualified for this pair.
+    ggml_tensor * peer_q = nullptr;
+    ggml_tensor * peer_kv_attn = nullptr;
+    const bool split_attention_worker =
+        split_attention_q || split_attention_core_only;
+    if (split_attention_worker) {
+        if ((!split_attention_direct_kv && !attention_tp_cache->raw_kv) ||
+            (!split_attention_core_only && !peer_weights->attn_q_b) ||
+            (split_attention_output_projection &&
+             !peer_weights->attn_output_a) ||
+            (split_attention_output_b && !peer_weights->attn_output_b) ||
+            (split_attention_q && !attention_tp_peer_inputs->rope_pos) ||
+            !attention_tp_peer_inputs->neg_pos ||
+            !attention_tp_peer_inputs->attn_row_mask) {
+            return nullptr;
+        }
+
+        auto flat_f32_main = [&](ggml_tensor * tensor) {
+            tensor = ds4_cast_if_needed(ctx, tensor, GGML_TYPE_F32);
+            if (!ggml_is_contiguous(tensor)) {
+                tensor = track_main(ggml_cont(ctx, tensor));
+            }
+            return ggml_reshape_1d(ctx, tensor, ggml_nelements(tensor));
+        };
+        const bool dst_stream_staging = attention_tp_fork_state &&
+            ds4_env_flag("DFLASH_DS4_ATTENTION_TP_DST_STREAM_STAGE");
+        const bool packed_dst_stream_staging = dst_stream_staging &&
+            ds4_env_flag("DFLASH_DS4_ATTENTION_TP_PACKED_STAGE");
+        auto stage_for_peer = [&](ggml_tensor * source,
+                                  ggml_tensor *& storage,
+                                  ggml_tensor *& state,
+                                  int64_t & elements,
+                                  const char * name) {
+            source = flat_f32_main(source);
+            const int64_t source_elements = ggml_nelements(source);
+            if (!storage) {
+                storage = track_main(ggml_new_tensor_1d(
+                    ctx, GGML_TYPE_F32, source_elements));
+                ggml_set_name(storage, name);
+                // The base allocation must outlive every asynchronous
+                // destination-stream read made from its state views.
+                ggml_set_output(storage);
+                state = storage;
+                elements = source_elements;
+            } else {
+                // A staging state is scoped to one fused verifier shape and
+                // one selected compression family. Reusing it at another size
+                // would alias an in-flight payload and is a graph-build bug.
+                GGML_ASSERT(elements == source_elements);
+            }
+
+            state = track_main(ggml_cpy(ctx, source, state));
+            ggml_set_name(state, name);
+            ggml_set_output(state);
+            state->flags |= GGML_TENSOR_FLAG_DST_STREAM_COPY;
+            return state;
+        };
+
+        ggml_tensor * peer_qr = nullptr;
+        ggml_tensor * peer_kv = nullptr;
+        ggml_tensor * peer_comp_values = nullptr;
+        if (split_attention_core_only) {
+            // Project and normalize Q once at its native full width on the
+            // R9700.  Only the independent tail heads and the already assembled
+            // latent KV matrix cross to Strix.  Both become inputs of the same
+            // peer graph segment, avoiding the extra early-Q scheduler wave.
+            ggml_tensor * main_q_view = ggml_view_3d(
+                ctx, q, head_dim, n_head, n_tokens,
+                q->nb[1], q->nb[2], 0);
+            ggml_tensor * peer_q_view = ggml_view_3d(
+                ctx, q, head_dim, peer_head, n_tokens,
+                q->nb[1], q->nb[2],
+                (size_t) n_head * q->nb[1]);
+            q = track_main(ggml_cont(ctx, main_q_view));
+            ggml_tensor * main_peer_q = track_main(
+                ggml_cont(ctx, peer_q_view));
+            ggml_tensor * main_kv = ggml_reshape_2d(
+                ctx, flat_f32_main(kv_attn), head_dim, n_attn);
+
+            // One packed producer gives the scheduler a single cross-device
+            // dependency.  Separate Q and KV copies caused an extra main/peer
+            // wave per selected layer even though neither peer calculation can
+            // start before the assembled KV is ready in this core-only mode.
+            const int64_t peer_q_elements = ggml_nelements(main_peer_q);
+            ggml_tensor * main_fork = track_main(ggml_concat(
+                ctx, flat_f32_main(main_peer_q),
+                flat_f32_main(main_kv), 0));
+            if (!ggml_is_contiguous(main_fork)) {
+                main_fork = track_main(ggml_cont(ctx, main_fork));
+            }
+            ggml_set_output(main_fork);
+            ggml_build_forward_expand(gf, main_fork);
+            ggml_tensor * peer_fork = track_peer(
+                ggml_cont(ctx, main_fork));
+            peer_q = ggml_view_3d(
+                ctx, peer_fork, head_dim, peer_head, n_tokens,
+                (size_t) head_dim * sizeof(float),
+                (size_t) head_dim * peer_head * sizeof(float), 0);
+            peer_kv = ggml_view_2d(
+                ctx, peer_fork, head_dim, n_attn,
+                (size_t) head_dim * sizeof(float),
+                (size_t) peer_q_elements * sizeof(float));
+        } else if (split_attention_direct_kv) {
+            // Keep QR and the assembled KV block as two scheduler inputs so
+            // the peer Q projection can start before KV assembly completes.
+            ggml_tensor * main_qr = ggml_reshape_2d(
+                ctx, flat_f32_main(qr), w.n_lora_q, n_tokens);
+            ggml_tensor * main_kv = ggml_reshape_2d(
+                ctx, flat_f32_main(kv_attn), head_dim, n_attn);
+
+            if (packed_dst_stream_staging) {
+                // Wait for assembled KV, then send QR+KV as one persistent
+                // packet. This trades a little early peer-Q overlap for one
+                // cross-device input and two fewer scheduler transitions per
+                // selected layer.
+                ggml_tensor * flat_qr = flat_f32_main(main_qr);
+                ggml_tensor * flat_kv = flat_f32_main(main_kv);
+                const int64_t qr_elements = ggml_nelements(flat_qr);
+                ggml_tensor * main_packet = track_main(ggml_concat(
+                    ctx, flat_qr, flat_kv, 0));
+                if (!ggml_is_contiguous(main_packet)) {
+                    main_packet = track_main(ggml_cont(ctx, main_packet));
+                }
+
+                DeepSeek4AttentionTpForkState & fork =
+                    *attention_tp_fork_state;
+                ggml_tensor * staged_packet = stage_for_peer(
+                    main_packet, fork.packed_storage, fork.packed_state,
+                    fork.packed_elements, "ds4_attn_packed_stage");
+                staged_packet->flags |= GGML_TENSOR_FLAG_DST_STREAM_COPY;
+                ggml_tensor * peer_packet = track_peer(
+                    ggml_cont(ctx, staged_packet));
+                peer_qr = ggml_view_2d(
+                    ctx, peer_packet, w.n_lora_q, n_tokens,
+                    (size_t) w.n_lora_q * sizeof(float), 0);
+                peer_kv = ggml_view_2d(
+                    ctx, peer_packet, head_dim, n_attn,
+                    (size_t) head_dim * sizeof(float),
+                    (size_t) qr_elements * sizeof(float));
+                add_debug_pair("fork_qr", main_qr, peer_qr);
+                add_debug_pair("fork_kv", main_kv, peer_kv);
+            } else if (dst_stream_staging) {
+                DeepSeek4AttentionTpForkState & fork =
+                    *attention_tp_fork_state;
+                ggml_tensor * staged_qr = stage_for_peer(
+                    main_qr, fork.qr_storage, fork.qr_state,
+                    fork.qr_elements, "ds4_attn_qr_stage");
+                ggml_tensor * staged_kv = stage_for_peer(
+                    main_kv, fork.kv_storage, fork.kv_state,
+                    fork.kv_elements, "ds4_attn_kv_stage");
+                main_qr = ggml_reshape_2d(
+                    ctx, staged_qr, w.n_lora_q, n_tokens);
+                main_kv = ggml_reshape_2d(
+                    ctx, staged_kv, head_dim, n_attn);
+                // Scheduler cross-input copies see the reshaped views, so mark
+                // those exact tensors in addition to their persistent states.
+                main_qr->flags |= GGML_TENSOR_FLAG_DST_STREAM_COPY;
+                main_kv->flags |= GGML_TENSOR_FLAG_DST_STREAM_COPY;
+                track_main(main_qr);
+                track_main(main_kv);
+                peer_qr = track_peer(ggml_cont(ctx, main_qr));
+                peer_kv = track_peer(ggml_cont(ctx, main_kv));
+                add_debug_pair("fork_qr", main_qr, peer_qr);
+                add_debug_pair("fork_kv", main_kv, peer_kv);
+            } else {
+                peer_qr = track_peer(ggml_cont(ctx, main_qr));
+                peer_kv = track_peer(ggml_cont(ctx, main_kv));
+                add_debug_pair("fork_qr", main_qr, peer_qr);
+                add_debug_pair("fork_kv", main_kv, peer_kv);
+            }
+        } else {
+            ggml_tensor * main_bundle = nullptr;
+            int64_t bundle_elements = 0;
+            int64_t qr_offset = -1;
+            int64_t kv_offset = -1;
+            int64_t comp_offset = -1;
+            auto append_bundle = [&](ggml_tensor * tensor,
+                                     int64_t * offset) {
+                if (!tensor) return;
+                tensor = flat_f32_main(tensor);
+                *offset = bundle_elements;
+                bundle_elements += ggml_nelements(tensor);
+                main_bundle = main_bundle
+                    ? track_main(ggml_concat(ctx, main_bundle, tensor, 0))
+                    : tensor;
+            };
+            append_bundle(qr, &qr_offset);
+            if (split_attention_values) {
+                append_bundle(kv, &kv_offset);
+                if (comp_values) append_bundle(comp_values, &comp_offset);
+            }
+            if (!main_bundle || qr_offset < 0 ||
+                (split_attention_values && kv_offset < 0)) {
+                return nullptr;
+            }
+            if (!ggml_is_contiguous(main_bundle)) {
+                main_bundle = track_main(ggml_cont(ctx, main_bundle));
+            }
+            if (dst_stream_staging) {
+                DeepSeek4AttentionTpForkState & fork =
+                    *attention_tp_fork_state;
+                main_bundle = stage_for_peer(
+                    main_bundle,
+                    fork.incremental_storage, fork.incremental_state,
+                    fork.incremental_elements,
+                    "ds4_attn_incremental_stage");
+                main_bundle->flags |= GGML_TENSOR_FLAG_DST_STREAM_COPY;
+            } else {
+                ggml_set_output(main_bundle);
+                ggml_build_forward_expand(gf, main_bundle);
+            }
+
+            ggml_tensor * peer_bundle = track_peer(
+                ggml_cont(ctx, main_bundle));
+            add_debug_pair("fork_bundle", main_bundle, peer_bundle);
+
+            auto peer_view_2d = [&](int64_t offset, int64_t width,
+                                    int64_t rows) {
+                GGML_ASSERT(offset >= 0 && width > 0 && rows > 0);
+                return ggml_view_2d(
+                    ctx, peer_bundle, width, rows,
+                    (size_t) width * sizeof(float),
+                    (size_t) offset * sizeof(float));
+            };
+            peer_qr = peer_view_2d(
+                qr_offset, w.n_lora_q, n_tokens);
+            peer_kv = split_attention_values
+                ? peer_view_2d(kv_offset, head_dim, n_tokens)
+                : nullptr;
+            peer_comp_values =
+                split_attention_values && comp_offset >= 0
+                ? peer_view_2d(
+                      comp_offset, head_dim,
+                      ggml_nelements(comp_values) / head_dim)
+                : nullptr;
+        }
+
+        if (split_attention_q) {
+            peer_q = track_peer(ggml_mul_mat(
+                ctx, peer_weights->attn_q_b, peer_qr));
+            peer_q = ggml_reshape_3d(
+                ctx, peer_q, head_dim, peer_head, n_tokens);
+            peer_q = track_peer(ggml_rms_norm(ctx, peer_q, w.rms_eps));
+            peer_q = track_peer(build_tail_rope_3d(
+                ctx, peer_q, attention_tp_peer_inputs->rope_pos,
+                n_rot, head_dim, peer_head, n_tokens,
+                rope_freq, rope_scale, rope_ext, rope_attn,
+                w.rope_yarn_beta_fast, w.rope_yarn_beta_slow,
+                rope_n_ctx_orig, &attention_tp->peer_nodes));
+
+            if (debug_attention_tp) {
+                const int64_t main_head_dim =
+                    (int64_t) n_head * head_dim;
+                ggml_tensor * main_peer_q_b = ggml_view_2d(
+                    ctx, L.attn_q_b, w.n_lora_q,
+                    (int64_t) peer_head * head_dim,
+                    L.attn_q_b->nb[1],
+                    (size_t) main_head_dim * L.attn_q_b->nb[1]);
+                debug_peer_q_ref = track_main(ggml_mul_mat(
+                    ctx, main_peer_q_b, qr));
+                debug_peer_q_ref = ggml_reshape_3d(
+                    ctx, debug_peer_q_ref, head_dim, peer_head, n_tokens);
+                debug_peer_q_ref = track_main(ggml_rms_norm(
+                    ctx, debug_peer_q_ref, w.rms_eps));
+                debug_peer_q_ref = track_main(build_tail_rope_3d(
+                    ctx, debug_peer_q_ref, rope_pos,
+                    n_rot, head_dim, peer_head, n_tokens,
+                    rope_freq, rope_scale, rope_ext, rope_attn,
+                    w.rope_yarn_beta_fast, w.rope_yarn_beta_slow,
+                    rope_n_ctx_orig));
+                add_debug_pair("q", debug_peer_q_ref, peer_q);
+            }
+
+            if (!split_attention_values) {
+                // Q-only mode joins here because score/value attention still
+                // runs as one full-head main-device operation. Full attention
+                // TP must not create this dependency: its main 75% and peer
+                // 25% shards consume their own Q tensors independently and
+                // join only after value aggregation.
+                peer_q = track_peer(ggml_cont(ctx, peer_q));
+                ggml_set_output(peer_q);
+                ggml_build_forward_expand(gf, peer_q);
+                ggml_tensor * peer_q_ready =
+                    ggml_ds4_deferred_peer_copy(ctx, peer_q);
+                ggml_set_input(peer_q_ready);
+                ggml_set_output(peer_q_ready);
+                attention_tp->deferred_peer_copy_nodes.push_back(peer_q_ready);
+                track_main(peer_q_ready);
+                q = track_main(ggml_concat(ctx, q, peer_q_ready, 1));
+                if (debug_attention_tp) {
+                    add_debug_main_pair("q_after_join_vs_full",
+                                        debug_full_q_ref, q);
+                }
+            }
+        }
+
+        // Preserve overwritten peer rows before updating the persistent ring.
+        // They are needed only by q>1 causal verification; q=1 merely mirrors
+        // its new row so the next wide verify never requires a bulk cache copy.
+        ggml_tensor * peer_old_rows = nullptr;
+        if (split_attention_values && !split_attention_direct_kv) {
+            for (int ti = 0; ti < n_tokens; ++ti) {
+                ggml_tensor * slot = ggml_view_2d(
+                    ctx, attention_tp_cache->raw_kv, head_dim, 1,
+                    attention_tp_cache->raw_kv->nb[1],
+                    (size_t) ((kv_start + ti) % w.n_swa) *
+                        attention_tp_cache->raw_kv->nb[1]);
+                ggml_tensor * saved = track_peer(ggml_cont(ctx, slot));
+                ggml_build_forward_expand(gf, saved);
+                peer_old_rows = peer_old_rows
+                    ? track_peer(ggml_concat(
+                          ctx, peer_old_rows, saved, 1))
+                    : saved;
+            }
+            peer_old_rows = track_peer(ds4_cast_if_needed(
+                ctx, peer_old_rows, GGML_TYPE_F32));
+        }
+
+        ggml_tensor * peer_raw_source = nullptr;
+        if (split_attention_values && !split_attention_direct_kv) {
+            peer_raw_source = track_peer(ggml_set_rows(
+                ctx, attention_tp_cache->raw_kv, peer_kv,
+                attention_tp_peer_inputs->raw_kv_rows));
+            ggml_build_forward_expand(gf, peer_raw_source);
+        }
+
+        ggml_tensor * peer_comp_source = attention_tp_cache->comp_kv;
+        if (split_attention_values && !split_attention_direct_kv &&
+            peer_comp_values) {
+            if (!peer_comp_source ||
+                !attention_tp_peer_inputs->attn_comp_rows) {
+                return nullptr;
+            }
+            peer_comp_source = track_peer(ggml_set_rows(
+                ctx, peer_comp_source, peer_comp_values,
+                attention_tp_peer_inputs->attn_comp_rows));
+            ggml_build_forward_expand(gf, peer_comp_source);
+        }
+
+        if (split_attention_values) {
+            if (split_attention_direct_kv) {
+                peer_kv_attn = peer_kv;
+            } else {
+                ggml_tensor * peer_ring = ggml_view_2d(
+                    ctx, peer_raw_source, head_dim, w.n_swa,
+                    peer_raw_source->nb[1], 0);
+                peer_kv_attn = track_peer(ds4_cast_if_needed(
+                    ctx, peer_ring, GGML_TYPE_F32));
+                if (n_comp_attn > 0) {
+                    if (!peer_comp_source || !comp_kv_source) return nullptr;
+                    ggml_tensor * peer_comp = ggml_view_2d(
+                        ctx, peer_comp_source, head_dim, n_comp_attn,
+                        peer_comp_source->nb[1], 0);
+                    peer_comp = track_peer(ds4_cast_if_needed(
+                        ctx, peer_comp, GGML_TYPE_F32));
+                    peer_kv_attn = track_peer(ggml_concat(
+                        ctx, peer_kv_attn, peer_comp, 1));
+                }
+                peer_kv_attn = track_peer(ggml_concat(
+                    ctx, peer_kv_attn, peer_old_rows, 1));
+            }
+            add_debug_pair("kv", kv_attn, peer_kv_attn);
+        }
+    }
+
     // Build one additive mask tensor and share it between the explicit and
     // flash-attention implementations. ggml flash attention expects
     // [n_kv,n_query] F16; the explicit path broadcasts the same values over
@@ -2027,6 +2614,7 @@ static ggml_tensor * build_mla_attention(
         }
     }
     ggml_tensor * context = nullptr;
+    ggml_tensor * peer_context = nullptr;
     bool inverse_rope_fused = false;
     const bool use_flash = attention_impl != DeepSeek4AttentionImpl::Explicit &&
                            n_tokens > 1;
@@ -2198,49 +2786,146 @@ static ggml_tensor * build_mla_attention(
                     w.rope_yarn_beta_slow, rope_n_ctx_orig, fuse_q_rope);
                 inverse_rope_fused = true;
             }
+
         }
     } else {
-        // Flatten q to [head_dim, n_head*n_tokens] for batched matmul.
-        ggml_tensor * q_flat = ggml_reshape_2d(ctx, q, head_dim,
-                                               n_head * n_tokens);
-        ggml_tensor * scores = ggml_mul_mat(ctx, kv_attn, q_flat);
-        scores = ggml_scale(ctx, scores, kq_scale);
-        if (score_mask) {
-            if (n_tokens > 1) {
-                ggml_tensor * m3 = ggml_reshape_3d(ctx, score_mask,
-                                                   n_attn, 1, n_tokens);
-                ggml_tensor * s3 = ggml_reshape_3d(ctx, scores,
-                                                   n_attn, n_head, n_tokens);
-                scores = ggml_reshape_2d(ctx, ggml_add(ctx, s3, m3),
-                                         n_attn, n_head * n_tokens);
-            } else {
-                scores = ggml_add(ctx, scores, score_mask);
+        struct ExplicitAttentionStages {
+            ggml_tensor * scores = nullptr;
+            ggml_tensor * probs = nullptr;
+            ggml_tensor * value_result = nullptr;
+        };
+        auto build_explicit_attention = [&](ggml_tensor * q_shard,
+                                            ggml_tensor * kv_shard,
+                                            ggml_tensor * shard_score_mask,
+                                            ggml_tensor * sinks,
+                                            int shard_heads,
+                                            bool peer,
+                                            ExplicitAttentionStages * stages) {
+            auto track = [&](ggml_tensor * tensor) {
+                return peer ? track_peer(tensor) : track_main(tensor);
+            };
+            ggml_tensor * q_flat = ggml_reshape_2d(
+                ctx, q_shard, head_dim, shard_heads * n_tokens);
+            ggml_tensor * scores = track(ggml_mul_mat(
+                ctx, kv_shard, q_flat));
+            scores = track(ggml_scale(ctx, scores, kq_scale));
+            if (shard_score_mask) {
+                if (n_tokens > 1) {
+                    ggml_tensor * m3 = ggml_reshape_3d(
+                        ctx, shard_score_mask, n_attn, 1, n_tokens);
+                    ggml_tensor * s3 = ggml_reshape_3d(
+                        ctx, scores, n_attn, shard_heads, n_tokens);
+                    scores = track(ggml_reshape_2d(
+                        ctx, ggml_add(ctx, s3, m3), n_attn,
+                        shard_heads * n_tokens));
+                } else {
+                    scores = track(ggml_add(
+                        ctx, scores, shard_score_mask));
+                }
             }
-        }
+            if (stages) stages->scores = scores;
 
-        // DS4 adds one learned per-head sink logit to the denominator, but the
-        // sink contributes no value vector.
-        ggml_tensor * probs = nullptr;
-        if (L.attn_sinks) {
-            ggml_tensor * sink_scores = ggml_reshape_2d(ctx, L.attn_sinks,
-                                                        1, n_head);
-            if (n_tokens > 1) {
-                ggml_tensor * sink_shape = ggml_new_tensor_2d(
-                    ctx, GGML_TYPE_F32, 1, n_head * n_tokens);
-                sink_scores = ggml_repeat(ctx, sink_scores, sink_shape);
+            ggml_tensor * probs = nullptr;
+            if (sinks) {
+                ggml_tensor * sink_scores = ggml_reshape_2d(
+                    ctx, sinks, 1, shard_heads);
+                if (n_tokens > 1) {
+                    ggml_tensor * sink_shape = ggml_new_tensor_2d(
+                        ctx, GGML_TYPE_F32, 1,
+                        shard_heads * n_tokens);
+                    sink_scores = track(ggml_repeat(
+                        ctx, sink_scores, sink_shape));
+                }
+                ggml_tensor * scores_with_sink = track(ggml_concat(
+                    ctx, scores, sink_scores, 0));
+                ggml_tensor * probs_with_sink = track(ggml_soft_max(
+                    ctx, scores_with_sink));
+                probs = ggml_view_2d(
+                    ctx, probs_with_sink, n_attn,
+                    shard_heads * n_tokens, probs_with_sink->nb[1], 0);
+            } else {
+                probs = track(ggml_soft_max(ctx, scores));
             }
-            ggml_tensor * scores_with_sink = ggml_concat(ctx, scores,
-                                                          sink_scores, 0);
-            ggml_tensor * probs_with_sink = ggml_soft_max(ctx,
-                                                           scores_with_sink);
-            probs = ggml_view_2d(ctx, probs_with_sink, n_attn,
-                                 n_head * n_tokens, probs_with_sink->nb[1], 0);
-        } else {
-            probs = ggml_soft_max(ctx, scores);
+            if (stages) stages->probs = probs;
+            ggml_tensor * kv_t = track(ggml_cont(
+                ctx, ggml_transpose(ctx, kv_shard)));
+            ggml_tensor * result = track(ggml_mul_mat(ctx, kv_t, probs));
+            if (stages) stages->value_result = result;
+            return track(ggml_reshape_3d(
+                ctx, result, head_dim, shard_heads, n_tokens));
+        };
+
+        ggml_tensor * main_sinks = L.attn_sinks;
+        if (split_attention_values && main_sinks) {
+            main_sinks = ggml_view_1d(ctx, main_sinks, n_head, 0);
         }
-        ggml_tensor * kv_t = ggml_cont(ctx, ggml_transpose(ctx, kv_attn));
-        context = ggml_mul_mat(ctx, kv_t, probs);
-        context = ggml_reshape_3d(ctx, context, head_dim, n_head, n_tokens);
+        const int main_attention_heads = split_attention_values
+            ? n_head : (split_attention ? total_head : n_head);
+        context = build_explicit_attention(
+            q, kv_attn, score_mask, main_sinks, main_attention_heads,
+            false, nullptr);
+        if (split_attention_values) {
+            ggml_tensor * peer_score_mask = ggml_reshape_2d(
+                ctx, attention_tp_peer_inputs->attn_row_mask,
+                n_attn, n_tokens);
+            ExplicitAttentionStages peer_stages{};
+            if (split_attention_flash) {
+                // One peer flash-attention launch replaces the score, scale,
+                // mask, softmax, transpose, and value kernels. The main shard
+                // retains the exact explicit path; this is independently
+                // qualified because only the peer-head result can differ.
+                ggml_tensor * peer_q_fa = track_peer(ggml_permute(
+                    ctx, peer_q, 0, 2, 1, 3));
+                ggml_tensor * peer_k_fa = track_peer(ggml_reshape_3d(
+                    ctx, peer_kv_attn, head_dim, n_attn, 1));
+                ggml_tensor * peer_mask_fa = track_peer(ds4_cast_if_needed(
+                    ctx, peer_score_mask, GGML_TYPE_F16));
+                if (!ggml_is_contiguous(peer_mask_fa)) {
+                    peer_mask_fa = track_peer(ggml_cont(ctx, peer_mask_fa));
+                }
+                peer_context = track_peer(ggml_flash_attn_ext(
+                    ctx, peer_q_fa, peer_k_fa, peer_k_fa, peer_mask_fa,
+                    kq_scale, 0.0f, 0.0f));
+                if (peer_weights->attn_sinks) {
+                    ggml_flash_attn_ext_add_sinks(
+                        peer_context, peer_weights->attn_sinks);
+                }
+                ggml_flash_attn_ext_set_prec(peer_context, GGML_PREC_F32);
+                ggml_flash_attn_ext_set_ds4_sparse(
+                    peer_context, n_raw, w.n_swa, 0, 32);
+            } else {
+                peer_context = build_explicit_attention(
+                    peer_q, peer_kv_attn, peer_score_mask,
+                    peer_weights->attn_sinks,
+                    peer_head, true, &peer_stages);
+            }
+            if (debug_attention_tp) {
+                ExplicitAttentionStages ref_stages{};
+                ggml_tensor * main_peer_sinks = L.attn_sinks
+                    ? ggml_view_1d(
+                          ctx, L.attn_sinks, peer_head,
+                          (size_t) n_head * L.attn_sinks->nb[0])
+                    : nullptr;
+                debug_peer_context_ref = build_explicit_attention(
+                    debug_peer_q_ref, kv_attn, score_mask,
+                    main_peer_sinks, peer_head, false, &ref_stages);
+                add_debug_pair("score_mask", score_mask, peer_score_mask);
+                if (!split_attention_flash) {
+                    add_debug_pair("scores", ref_stages.scores,
+                                   peer_stages.scores);
+                    add_debug_pair("probs", ref_stages.probs,
+                                   peer_stages.probs);
+                    add_debug_pair("value_result", ref_stages.value_result,
+                                   peer_stages.value_result);
+                }
+                add_debug_pair("context_pre_rope",
+                               debug_peer_context_ref, peer_context);
+
+                debug_full_context_ref = build_explicit_attention(
+                    debug_full_q_ref, kv_attn, score_mask,
+                    L.attn_sinks, total_head, false, nullptr);
+            }
+        }
     }
 
     // ── Inverse tail RoPE on attention output ───────────────────────
@@ -2254,14 +2939,65 @@ static ggml_tensor * build_mla_attention(
             i32_array_inputs.push_back({neg_pos, std::move(neg_vals)});
         }
         context = build_tail_rope_3d(
-            ctx, context, neg_pos, n_rot, head_dim, n_head, n_tokens,
-            rope_freq, rope_scale, rope_ext, rope_attn,
+            ctx, context, neg_pos, n_rot, head_dim,
+            split_attention_values
+                ? n_head
+                : (split_attention ? total_head : n_head),
+            n_tokens, rope_freq, rope_scale, rope_ext, rope_attn,
             w.rope_yarn_beta_fast, w.rope_yarn_beta_slow,
-            rope_n_ctx_orig);
+            rope_n_ctx_orig,
+            split_attention ? &attention_tp->main_nodes : nullptr);
+        if (split_attention_values) {
+            // Keep the peer shard through inverse RoPE as well. Joining the
+            // head contexts here transferred four times more data and left
+            // the complete grouped output-A projection on the main device.
+            peer_context = track_peer(build_tail_rope_3d(
+                ctx, peer_context, attention_tp_peer_inputs->neg_pos,
+                n_rot, head_dim, peer_head, n_tokens,
+                rope_freq, rope_scale, rope_ext, rope_attn,
+                w.rope_yarn_beta_fast, w.rope_yarn_beta_slow,
+                rope_n_ctx_orig, &attention_tp->peer_nodes));
+        }
+        if (debug_attention_tp && split_attention_values) {
+            debug_full_context_ref = track_main(build_tail_rope_3d(
+                ctx, debug_full_context_ref, neg_pos, n_rot, head_dim,
+                total_head, n_tokens, rope_freq, rope_scale, rope_ext,
+                rope_attn, w.rope_yarn_beta_fast,
+                w.rope_yarn_beta_slow, rope_n_ctx_orig));
+            ggml_tensor * debug_main_context_ref = ggml_view_3d(
+                ctx, debug_full_context_ref, head_dim, n_head, n_tokens,
+                debug_full_context_ref->nb[1],
+                debug_full_context_ref->nb[2], 0);
+            ggml_tensor * debug_peer_context_post_ref = ggml_view_3d(
+                ctx, debug_full_context_ref, head_dim, peer_head, n_tokens,
+                debug_full_context_ref->nb[1],
+                debug_full_context_ref->nb[2],
+                (size_t) n_head * debug_full_context_ref->nb[1]);
+            add_debug_main_pair("main_context_post_rope",
+                                debug_main_context_ref, context);
+            add_debug_pair("peer_context_post_rope",
+                           debug_peer_context_post_ref, peer_context);
+        }
     }
 
-    // Flatten to [head_dim*n_head, n_tokens] for output projection
-    ggml_tensor * attn_out = ggml_reshape_2d(ctx, context, head_dim * n_head, n_tokens);
+    if (split_attention_core_only) {
+        // Core-only TP rejoins immediately after score/value attention.  The
+        // large Q and output projections therefore keep their efficient full
+        // width on the R9700, while only the context-dependent attention core
+        // is divided between devices.
+        peer_context = track_peer(ggml_cont(ctx, peer_context));
+        ggml_set_output(peer_context);
+        ggml_build_forward_expand(gf, peer_context);
+        ggml_tensor * peer_context_ready =
+            ggml_ds4_deferred_peer_copy(ctx, peer_context);
+        ggml_set_input(peer_context_ready);
+        ggml_set_output(peer_context_ready);
+        attention_tp->deferred_peer_copy_nodes.push_back(
+            peer_context_ready);
+        track_main(peer_context_ready);
+        context = track_main(ggml_concat(
+            ctx, context, peer_context_ready, 1));
+    }
 
     // ── Grouped output projection ──────────────────────────────────
     // DS4 output uses grouped low-rank projection:
@@ -2270,32 +3006,145 @@ static ggml_tensor * build_mla_attention(
     //   batched matmul over n_groups: → [n_lora_o, n_tokens, n_groups]
     //   → reshape [n_lora_o*n_groups, n_tokens]
     //   out_b: [n_lora_o*n_groups, n_embd] → final: [n_embd, n_tokens]
-    const int group_dim = head_dim * (n_head / n_out_group);  // 512 * 8 = 4096
-    // Reshape attn_out: [32768, n_tokens] → [4096, 8, n_tokens] → permute to [4096, n_tokens, 8]
-    attn_out = ggml_reshape_3d(ctx, attn_out, group_dim, n_out_group, n_tokens);
-    attn_out = ggml_permute(ctx, attn_out, 0, 2, 1, 3);
-    if (n_tokens == 1) {
-        attn_out = ggml_cont(ctx, attn_out);
+    const int group_dim = head_dim * heads_per_group;  // 512 * 8 = 4096
+    auto build_grouped_output_a = [&](ggml_tensor * shard_context,
+                                      ggml_tensor * shard_weights,
+                                      int shard_heads,
+                                      int shard_groups,
+                                      bool peer) {
+        auto track = [&](ggml_tensor * tensor) {
+            return peer ? track_peer(tensor) : track_main(tensor);
+        };
+        ggml_tensor * shard_out = ggml_reshape_2d(
+            ctx, shard_context, head_dim * shard_heads, n_tokens);
+        shard_out = ggml_reshape_3d(
+            ctx, shard_out, group_dim, shard_groups, n_tokens);
+        shard_out = ggml_permute(ctx, shard_out, 0, 2, 1, 3);
+        if (n_tokens == 1) {
+            shard_out = track(ggml_cont(ctx, shard_out));
+        }
+        ggml_tensor * weights_3d = ggml_reshape_3d(
+            ctx, shard_weights, group_dim, n_lora_o, shard_groups);
+        return track(ggml_mul_mat(ctx, weights_3d, shard_out));
+    };
+
+    ggml_tensor * attn_low = nullptr;
+    ggml_tensor * split_main_output = nullptr;
+    if (split_attention_output_projection ||
+        split_attention_projection_only) {
+        ggml_tensor * main_projection_context = context;
+        ggml_tensor * peer_projection_context = peer_context;
+        if (split_attention_projection_only) {
+            // Keep the latency-sensitive score/value attention on the main
+            // GPU, then fork the independent output-head groups.  This costs
+            // one compact context copy per layer and lets both devices stream
+            // their own persistent output-A/B weights in parallel without
+            // duplicating the KV cache or its many small kernels on the peer.
+            main_projection_context = ggml_view_3d(
+                ctx, context, head_dim, n_head, n_tokens,
+                context->nb[1], context->nb[2], 0);
+            // Slicing the head axis leaves the full-head token stride, so the
+            // main shard is not reshapeable until it is packed.  The peer
+            // shard is packed by its cross-device cont below for the same
+            // reason.
+            main_projection_context = track_main(
+                ggml_cont(ctx, main_projection_context));
+            ggml_tensor * peer_context_view = ggml_view_3d(
+                ctx, context, head_dim, peer_head, n_tokens,
+                context->nb[1], context->nb[2],
+                (size_t) n_head * context->nb[1]);
+            peer_projection_context = track_peer(
+                ggml_cont(ctx, peer_context_view));
+        }
+
+        ggml_tensor * main_output_a = ggml_view_2d(
+            ctx, L.attn_output_a, group_dim,
+            (int64_t) n_lora_o * main_groups,
+            L.attn_output_a->nb[1], 0);
+        ggml_tensor * main_low = build_grouped_output_a(
+            main_projection_context, main_output_a,
+            n_head, main_groups, false);
+        ggml_tensor * peer_low = build_grouped_output_a(
+            peer_projection_context, peer_weights->attn_output_a,
+            peer_head, peer_groups, true);
+
+        if (split_attention_output_b) {
+            const int64_t main_lora = (int64_t) n_lora_o * main_groups;
+            ggml_tensor * main_output_b = ggml_view_2d(
+                ctx, L.attn_output_b, main_lora, n_embd,
+                L.attn_output_b->nb[1], 0);
+            auto project_output_b = [&](ggml_tensor * weights,
+                                        ggml_tensor * low,
+                                        int groups,
+                                        bool peer) {
+                ggml_tensor * result = groups > 1
+                    ? ggml_mul_mat_grouped_src(ctx, weights, low)
+                    : ggml_mul_mat(
+                          ctx, weights,
+                          ggml_reshape_2d(
+                              ctx, low, n_lora_o, n_tokens));
+                return peer ? track_peer(result) : track_main(result);
+            };
+            split_main_output = project_output_b(
+                main_output_b, main_low, main_groups, false);
+            ggml_tensor * split_peer_output = project_output_b(
+                peer_weights->attn_output_b, peer_low,
+                peer_groups, true);
+
+            // Carry both partial output-B projections directly into the
+            // existing fused HC-post join. This is the longest owner boundary:
+            // Q, attention, inverse RoPE, output-A, and output-B all overlap,
+            // while HC post performs the one required peer+main addition.
+            split_main_output = track_main(ggml_cont(
+                ctx, split_main_output));
+            split_peer_output = track_peer(ggml_cont(
+                ctx, split_peer_output));
+            ggml_set_output(split_peer_output);
+            ggml_build_forward_expand(gf, split_peer_output);
+            ggml_tensor * split_peer_ready =
+                ggml_ds4_deferred_peer_copy(ctx, split_peer_output);
+            ggml_set_input(split_peer_ready);
+            ggml_set_output(split_peer_ready);
+            attention_tp->deferred_peer_copy_nodes.push_back(
+                split_peer_ready);
+            track_main(split_peer_ready);
+            attention_tp->main_output = split_main_output;
+            attention_tp->peer_output = split_peer_ready;
+        } else {
+            // Join the low-rank group result. For q=5 and a 2/8 peer
+            // split this is 40 KiB/layer instead of 160 KiB of contexts.
+            // Output-B remains one unchanged main-device reduction.
+            peer_low = track_peer(ggml_cont(ctx, peer_low));
+            ggml_set_output(peer_low);
+            ggml_build_forward_expand(gf, peer_low);
+            ggml_tensor * peer_low_ready =
+                ggml_ds4_deferred_peer_copy(ctx, peer_low);
+            ggml_set_input(peer_low_ready);
+            ggml_set_output(peer_low_ready);
+            attention_tp->deferred_peer_copy_nodes.push_back(peer_low_ready);
+            track_main(peer_low_ready);
+            attn_low = track_main(ggml_concat(
+                ctx, main_low, peer_low_ready, 2));
+        }
+    } else {
+        const int output_n_head = split_attention ? total_head : n_head;
+        attn_low = build_grouped_output_a(
+            context, L.attn_output_a, output_n_head,
+            n_out_group, false);
     }
-    // attn_out is now [group_dim, n_tokens, n_out_group]
-    ggml_tensor * out_a_3d = ggml_reshape_3d(ctx, L.attn_output_a, group_dim, n_lora_o, n_out_group);
-    // out_a_3d: [group_dim, n_lora_o, n_out_group] — ne[2] matches
-    ggml_tensor * attn_low = ggml_mul_mat(ctx, out_a_3d, attn_out);
     // attn_low: [n_lora_o, n_tokens, n_out_group]
+    if (split_attention_output_b) {
+        return split_main_output;
+    }
+
     ggml_tensor * out = nullptr;
-    const bool grouped_output_projection =
-        n_tokens > 1 &&
-        !ds4_env_flag("DFLASH_DS4_DISABLE_GROUPED_OUTPUT_PROJECTION");
-    if (grouped_output_projection) {
+    if (n_tokens > 1) {
         // Batched ROCmFPX MMQ consumes src1's channel stride directly. This
         // avoids materializing both permutations (~256 MiB/layer at 2K).
         out = ggml_mul_mat_grouped_src(ctx, L.attn_output_b, attn_low);
     } else {
-        // Preserve the established single-token graph and provide an exact
-        // fallback for heterogeneous runtimes that cannot retain grouped-view
-        // metadata across a scheduler copy. At verifier widths (q <= 4), this
-        // materializes at most 128 KiB per layer rather than the long-prefill
-        // volume avoided by the grouped path.
+        // Preserve the established single-token graph and its numerical
+        // behavior. Decode is intentionally outside the prefill fast path.
         attn_low = ggml_cont(ctx, ggml_permute(ctx, attn_low, 0, 2, 1, 3));
         attn_low = ggml_reshape_2d(
             ctx, attn_low, n_lora_o * n_out_group, n_tokens);
@@ -3021,8 +3870,7 @@ static bool eval_ds4_hybrid(
         ggml_tensor * ffn_normed_backend = nullptr,
         const MoeHybridDeviceOutputs * device_outputs = nullptr) {
     const auto ffn_t0 = Ds4TimingClock::now();
-    if (!storage.cold_expert_ids.empty() &&
-        !storage.down_cold && !storage.gate_up_cold &&
+    if (!storage.down_cold && !storage.gate_up_cold &&
         !(expert_compute && expert_layer)) {
         if (!hybrid_owner || !stream_engine || !stream_engine->is_ready() ||
             !hybrid_owner->has_mmap() ||
@@ -4581,13 +5429,10 @@ bool deepseek4_step(
 // while a variant recurs, which is what the ggml-cuda/HIP graph cache keys
 // on, enabling graph replay for the bulk of decode steps.
 
-static bool ds4_fused_decode_enabled(const DeepSeek4Weights & w) {
-    // The supported control is --ds4-fused-decode, propagated through the
-    // loaded weights. Keep the old environment spelling as a compatibility
-    // fallback for existing launch scripts.
-    static const bool legacy_env_enabled =
+static bool ds4_fused_decode_enabled() {
+    static const bool enabled =
         ds4_env_flag("DFLASH_DS4_FUSED_DECODE");
-    return w.fused_decode || legacy_env_enabled;
+    return enabled;
 }
 
 struct DeepSeek4FusedDecodeGraph {
@@ -4606,8 +5451,22 @@ struct DeepSeek4FusedDecodeGraph {
     ggml_tensor * i32_bundle = nullptr;
     ggml_tensor * i64_bundle = nullptr;
     ggml_tensor * mask_bundle = nullptr;   // additive score mask (0 / -1e30), may be null
+    // Stable inputs allocated directly on the attention peer. They mirror the
+    // tiny host-authored values and therefore never traverse a captured HIP
+    // peer-copy edge.
+    // Keep positive and negative positions as independent peer inputs.  A
+    // second-half view into one bundled input produced the correct positive
+    // Q rotation but stale values for the inverse output rotation when the
+    // fused graph was scheduled across gfx1201 + gfx1151.  Dedicated tensors
+    // avoid that scheduler/view-offset hazard without adding a device copy.
+    ggml_tensor * attention_tp_pos_q = nullptr;
+    ggml_tensor * attention_tp_neg_q = nullptr;
+    ggml_tensor * attention_tp_rawrows = nullptr;
+    ggml_tensor * attention_tp_i64_bundle = nullptr;  // compressor row ids
+    ggml_tensor * attention_tp_mask_bundle = nullptr;
     std::vector<ggml_tensor *> hash_ids;
     std::vector<MoeHybridGraphInputs> hybrid_inputs;
+    std::vector<DeepSeek4AttentionTpGraphInputs> attention_tp_inputs;
     std::vector<AuthoritativeRouteOutput> authoritative_routes;
     ggml_tensor * logits = nullptr;
     ggml_backend_sched_t sched = nullptr;
@@ -4617,9 +5476,15 @@ struct DeepSeek4FusedDecodeGraph {
         i32_bundle = nullptr;
         i64_bundle = nullptr;
         mask_bundle = nullptr;
+        attention_tp_pos_q = nullptr;
+        attention_tp_neg_q = nullptr;
+        attention_tp_rawrows = nullptr;
+        attention_tp_i64_bundle = nullptr;
+        attention_tp_mask_bundle = nullptr;
         logits = nullptr;
         hash_ids.clear();
         hybrid_inputs.clear();
+        attention_tp_inputs.clear();
         authoritative_routes.clear();
         shape_key.clear();
         last_use = 0;
@@ -4651,6 +5516,11 @@ struct DeepSeek4FusedDecodeGraph {
         // Native graph executables outlive ggml graph metadata in the backend
         // cache. Retire them before either the scheduler or metadata arena is
         // released, otherwise a rebuilt slot can inherit the same pointer key.
+        // A heterogeneous graph may have queued work on both device streams;
+        // finish it before invalidating native graph executables or events.
+        if (sched) {
+            ggml_backend_sched_synchronize(sched);
+        }
         invalidate_native_graphs(main_backend, peer_backend);
         if (sched) {
             ggml_backend_sched_free(sched);
@@ -6075,7 +6945,6 @@ static int ds4_try_layer_major_prefill(
         int kv_start,
         std::vector<float> & out_logits,
         const int32_t * token_ids,
-        Ds4VerifyHooks * verify_hooks,
         DeepSeek4StepTelemetry * telemetry) {
     if (!backend || !embed || n_tokens <= 4 ||
         n_tokens > DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS ||
@@ -6083,14 +6952,6 @@ static int ds4_try_layer_major_prefill(
         return 0;
     }
     if (cache.prefill_mode == PrefillAttentionMode::Exact) return 0;
-    // Layer-major prefill returns only the final-position logits. DSpark's
-    // per-layer feature capture is supported below, but verifier requests for
-    // every position's logits/argmax must retain the generic path.
-    if (verify_hooks &&
-        (verify_hooks->all_logits_out || verify_hooks->argmax_out ||
-         verify_hooks->prefer_argmax_only)) {
-        return 0;
-    }
     if (!ds4_backend_is_gpu(backend) || !hc_out_weights.loaded ||
         hc_out_weights.scale_data.empty() || !w.output_hc_fn ||
         !w.output_hc_base) {
@@ -6123,64 +6984,6 @@ static int ds4_try_layer_major_prefill(
     const int64_t hc_dim = (int64_t) n_embd * n_hc;
     const int64_t mix_dim = 2 * (int64_t) n_hc + (int64_t) n_hc * n_hc;
     const int next_pos = kv_start + n_tokens;
-
-    const std::vector<int> * capture_layer_ids =
-        verify_hooks ? verify_hooks->capture_layer_ids : nullptr;
-    std::vector<float> * capture_out =
-        verify_hooks ? verify_hooks->capture_out : nullptr;
-    const bool capture_enabled = capture_layer_ids && capture_out &&
-                                 !capture_layer_ids->empty();
-    const int capture_begin = verify_hooks
-        ? std::clamp(verify_hooks->capture_token_begin, 0, n_tokens) : 0;
-    const int requested_capture_end =
-        verify_hooks && verify_hooks->capture_token_end >= 0
-            ? verify_hooks->capture_token_end : n_tokens;
-    const int capture_end = std::clamp(
-        requested_capture_end, capture_begin, n_tokens);
-    const int capture_tokens = capture_end - capture_begin;
-    std::vector<float> capture_hc_state;
-    if (capture_out) {
-        capture_out->clear();
-    }
-    if (capture_enabled) {
-        capture_out->assign(
-            (size_t) n_tokens * capture_layer_ids->size() * n_embd, 0.0f);
-        capture_hc_state.resize((size_t) hc_dim * capture_tokens);
-    }
-    const auto capture_layer = [&](int layer, ggml_tensor * state) {
-        if (!capture_enabled || capture_tokens <= 0 || !state) return;
-        const auto first = std::find(capture_layer_ids->begin(),
-                                     capture_layer_ids->end(), layer);
-        if (first == capture_layer_ids->end()) return;
-
-        const auto read_t0 = Ds4TimingClock::now();
-        const size_t capture_offset =
-            (size_t) capture_begin * hc_dim * sizeof(float);
-        ggml_backend_tensor_get(state, capture_hc_state.data(), capture_offset,
-                                sizeof(float) * capture_hc_state.size());
-        if (telemetry) {
-            telemetry->full_graph_read_us += ds4_elapsed_us(
-                read_t0, Ds4TimingClock::now());
-        }
-
-        const size_t n_capture = capture_layer_ids->size();
-        for (size_t ci = 0; ci < n_capture; ++ci) {
-            if ((*capture_layer_ids)[ci] != layer) continue;
-            for (int t = capture_begin; t < capture_end; ++t) {
-                float * dst = capture_out->data() +
-                    ((size_t) t * n_capture + ci) * n_embd;
-                const float * src = capture_hc_state.data() +
-                    (size_t) (t - capture_begin) * hc_dim;
-                for (int d = 0; d < n_embd; ++d) {
-                    float sum = 0.0f;
-                    for (int h = 0; h < n_hc; ++h) {
-                        sum += src[(size_t) h * n_embd + d];
-                    }
-                    dst[d] = sum / (float) n_hc;
-                }
-            }
-        }
-    };
 
     Ds4LayerMajorGraphCache * graph_cache = nullptr;
     bool cache_hit = false;
@@ -6351,7 +7154,6 @@ static int ds4_try_layer_major_prefill(
                 telemetry->full_graph_compute_us += ds4_elapsed_us(
                     compute_t0, Ds4TimingClock::now());
             }
-            capture_layer(il, (il & 1) == 0 ? state_b : state_a);
             if (layer.logits) {
                 out_logits.resize((size_t) w.n_vocab);
                 ggml_backend_tensor_get(
@@ -6578,8 +7380,6 @@ static int ds4_try_layer_major_prefill(
                 compute_t0, Ds4TimingClock::now());
         }
 
-        capture_layer(il, state_out);
-
         if (logits) {
             out_logits.resize((size_t) w.n_vocab);
             ggml_backend_tensor_get(logits, out_logits.data(), 0,
@@ -6764,19 +7564,6 @@ bool deepseek4_step_layer_range(
         n_tokens > 4 && n_tokens <= DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS &&
         layer_begin == 0 && is_last_shard && out_logits &&
         ds4_backend_is_gpu(backend);
-    const bool layer_major_hooks_supported =
-        !verify_hooks ||
-        (!verify_hooks->all_logits_out && !verify_hooks->argmax_out &&
-         !verify_hooks->prefer_argmax_only);
-    // The standard layer-major pipeline owns an exact batched compressor.
-    // Let it see the wide prompt before the generic boundary splitter turns
-    // the request into ratio-sized (typically four-token) forwards. It also
-    // owns DSpark feature capture, so the final capture window stays batched.
-    const bool standard_layer_major_prefill =
-        !w.moe_hybrid && cache.prefill_mode != PrefillAttentionMode::Exact &&
-        n_tokens > 4 && n_tokens <= DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS &&
-        layer_begin == 0 && is_last_shard && out_logits &&
-        ds4_backend_is_gpu(backend) && layer_major_hooks_supported;
     // These graphs are rebuilt around an owner join on every layer, so tensor
     // metadata addresses can be recycled for different topologies.  Until
     // the full heterogeneous layer is captured as one stable scheduler graph,
@@ -6794,8 +7581,7 @@ bool deepseek4_step_layer_range(
     // as sequential execution while retaining safe batched prefixes.
     const int first_chunk = deepseek4_safe_compressor_batch_tokens(w, kv_start, n_tokens);
     if (first_chunk > 0 && first_chunk < n_tokens &&
-        !fused_verify_candidate && !heterogeneous_sparse_prefill &&
-        !standard_layer_major_prefill) {
+        !fused_verify_candidate && !heterogeneous_sparse_prefill) {
         const int input_width = layer_begin == 0 ? n_embd : hc_dim;
         std::vector<float> hc_all;
         std::vector<float> shard_out_all;
@@ -6953,13 +7739,14 @@ bool deepseek4_step_layer_range(
 
     // Large full-model prefill batches use the device-resident layer-major
     // pipeline. DSpark verification remains on its exact q=2..4 path below.
-    if (standard_layer_major_prefill) {
+    if (!fused_verify_candidate && n_tokens > 4 &&
+        n_tokens <= DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS && layer_begin == 0 &&
+        is_last_shard && out_logits && ds4_backend_is_gpu(backend)) {
         const int prc = ds4_try_layer_major_prefill(
             fused_decode_graph_cache, backend, w, cache,
             hc_layer_weights_range, hc_output_weights_range,
             hash_routing_tables_range, scratch.hash_expert_ids, embed,
-            n_tokens, kv_start, *out_logits, token_ids, verify_hooks,
-            telemetry);
+            n_tokens, kv_start, *out_logits, token_ids, telemetry);
         if (prc < 0) return false;
         if (prc > 0) {
             if (telemetry) {
@@ -7003,6 +7790,21 @@ bool deepseek4_step_layer_range(
         Ds4FusedVerifyCache & graph_cache = q1_feature_capture
             ? layer_range_cache.fused_capture_graph_cache
             : layer_range_cache.fused_verify_graph_cache;
+        // q>1 executes the head split; q=1 still mirrors its newly written KV
+        // rows through the same graph. Treat both as coherent-cache steps so a
+        // fallback token cannot force a 103 MiB bulk synchronization later.
+        const bool attention_tp_step =
+            w.attention_tp_backend && w.attention_tp_peer_groups > 0;
+        if (attention_tp_step) {
+            if (!deepseek4_sync_attention_tp_cache(cache)) {
+                std::fprintf(stderr,
+                             "[deepseek4-attention-tp] peer KV sync failed\n");
+                return false;
+            }
+            // A failed or unavailable graph must force a resync before any
+            // later attempt; publish the new position only after success.
+            cache.attention_tp_cur_pos = -1;
+        }
         const int vrc = ds4_try_fused_verify_step(
             graph_cache, q1_feature_capture, fused_decode_graph_cache,
             backend, w, cache,
@@ -7020,6 +7822,9 @@ bool deepseek4_step_layer_range(
                 if (vratio == 4) cache.layers[il].n_index_comp = std::max(cache.layers[il].n_index_comp, np / (int) vratio);
             }
             cache.cur_pos = np;
+            if (attention_tp_step) {
+                cache.attention_tp_cur_pos = np;
+            }
             if (telemetry) telemetry->total_us += ds4_elapsed_us(step_t0, Ds4TimingClock::now());
             return true;
         }
@@ -7038,8 +7843,7 @@ bool deepseek4_step_layer_range(
     if (!moe_hybrid && n_tokens == 1 && allow_decode_graph_reuse && layer_begin == 0 && is_last_shard &&
         !(verify_hooks && verify_hooks->capture_layer_ids &&
           verify_hooks->capture_out) &&
-        out_logits && ds4_backend_is_gpu(backend) &&
-        ds4_fused_decode_enabled(w)) {
+        out_logits && ds4_backend_is_gpu(backend) && ds4_fused_decode_enabled()) {
         const int rc = ds4_try_fused_decode_step(
             fused_decode_graph_cache, backend, w, cache, hc_layer_weights_range,
             hc_output_weights_range, hash_routing_tables_range, scratch.hash_expert_ids,
@@ -7127,38 +7931,6 @@ bool deepseek4_step_layer_range(
                                 hc_state.data(), 0, sizeof(float) * hc_state.size());
         hc_state_backend = cached_decode_hc_post_graph.residual_hc;
     }
-    const auto capture_requested = [&](int layer) {
-        if (!verify_hooks || !verify_hooks->capture_layer_ids ||
-            !verify_hooks->capture_out) {
-            return false;
-        }
-        const std::vector<int> & ids = *verify_hooks->capture_layer_ids;
-        return std::find(ids.begin(), ids.end(), layer) != ids.end();
-    };
-    const auto capture_hc_layer = [&](int layer, const float * state) {
-        if (!state || !capture_requested(layer)) return;
-        const std::vector<int> & ids = *verify_hooks->capture_layer_ids;
-        std::vector<float> & capture = *verify_hooks->capture_out;
-        if ((int) capture.size() != (int) ids.size() * n_embd * n_tokens) {
-            capture.assign(
-                (size_t) ids.size() * n_embd * n_tokens, 0.0f);
-        }
-        for (size_t ci = 0; ci < ids.size(); ++ci) {
-            if (ids[ci] != layer) continue;
-            for (int t = 0; t < n_tokens; ++t) {
-                float * dst = capture.data() +
-                    (size_t) t * ids.size() * n_embd + ci * n_embd;
-                const float * hs = state + (size_t) t * hc_dim;
-                for (int d = 0; d < n_embd; ++d) {
-                    float sum = 0.0f;
-                    for (int h = 0; h < n_hc; ++h) {
-                        sum += hs[(size_t) h * n_embd + d];
-                    }
-                    dst[d] = sum / (float) n_hc;
-                }
-            }
-        }
-    };
     for (int il = layer_begin; il < layer_end; ++il) {
         const DeepSeek4Layer & L = w.layers[(size_t)il];
         DeepSeek4LayerCache & lc = cache.layers[(size_t)il];
@@ -7909,15 +8681,25 @@ bool deepseek4_step_layer_range(
                               n_hc);
                 std::memcpy(hc_state.data(), next_hc.data(), next_hc.size() * sizeof(float));
                 if (telemetry) telemetry->hc_post_ffn_us += ds4_elapsed_us(hc_post_ffn_t0, Ds4TimingClock::now());
-                capture_hc_layer(il, hc_state.data());
-            }
-            if ((use_backend_prefill_hc || use_backend_decode_hc_graph ||
-                 use_backend_decode_hc_direct) &&
-                hc_state_backend && capture_requested(il)) {
-                ggml_backend_tensor_get(
-                    hc_state_backend, hc_state.data(), 0,
-                    sizeof(float) * hc_state.size());
-                capture_hc_layer(il, hc_state.data());
+                if (verify_hooks && verify_hooks->capture_layer_ids && verify_hooks->capture_out) {
+                    const std::vector<int> & _ids = *verify_hooks->capture_layer_ids;
+                    for (size_t _ci = 0; _ci < _ids.size(); ++_ci) {
+                        if (_ids[_ci] != il) continue;
+                        const int _ncap = (int) _ids.size();
+                        std::vector<float> & _cap = *verify_hooks->capture_out;
+                        if ((int) _cap.size() != _ncap * n_embd * n_tokens)
+                            _cap.assign((size_t) _ncap * n_embd * n_tokens, 0.0f);
+                        for (int _t = 0; _t < n_tokens; ++_t) {
+                            float * _dst = _cap.data() + (size_t) _t * _ncap * n_embd + (size_t) _ci * n_embd;
+                            const float * _hs = hc_state.data() + (size_t) _t * hc_dim;
+                            for (int _d = 0; _d < n_embd; ++_d) {
+                                float _acc = 0.0f;
+                                for (int _h = 0; _h < n_hc; ++_h) _acc += _hs[(size_t) _h * n_embd + _d];
+                                _dst[_d] = _acc / (float) n_hc;
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -7966,9 +8748,7 @@ bool deepseek4_step_layer_range(
             ggml_context * ctx = ggml_init(params);
             if (!ctx) return false;
 
-            const bool need_all_logits =
-                verify_hooks && verify_hooks->all_logits_out;
-            const bool last_only = n_tokens > 1 && !need_all_logits;
+            const bool last_only = n_tokens > 1;
             const int output_tokens = last_only ? 1 : n_tokens;
             ggml_tensor * inp = ggml_new_tensor_2d(
                 ctx, GGML_TYPE_F32, n_embd, output_tokens);
@@ -8121,6 +8901,57 @@ bool create_deepseek4_cache(ggml_backend_t backend,
     }
 
     ggml_backend_buffer_clear(out.buf, 0);
+    if (w.attention_tp_backend && w.attention_tp_peer_groups > 0) {
+        ggml_init_params peer_params{};
+        peer_params.mem_size = ggml_tensor_overhead() *
+                               (size_t) (w.n_layer * 2 + 8) + 4096;
+        peer_params.no_alloc = true;
+        out.attention_tp_ctx = ggml_init(peer_params);
+        if (!out.attention_tp_ctx) {
+            ggml_backend_buffer_free(out.buf);
+            out.buf = nullptr;
+            ggml_free(out.ctx);
+            out.ctx = nullptr;
+            return false;
+        }
+        out.attention_tp_layers.resize((size_t) w.n_layer);
+        for (int il = 0; il < w.n_layer; ++il) {
+            const DeepSeek4LayerCache & source = out.layers[(size_t) il];
+            DeepSeek4AttentionTpCacheLayer & destination =
+                out.attention_tp_layers[(size_t) il];
+            destination.raw_kv = ggml_dup_tensor(
+                out.attention_tp_ctx, source.raw_kv);
+            char name[64];
+            std::snprintf(name, sizeof(name), "ds4_raw_kv_peer_%d", il);
+            ggml_set_name(destination.raw_kv, name);
+            if (source.comp_kv) {
+                destination.comp_kv = ggml_dup_tensor(
+                    out.attention_tp_ctx, source.comp_kv);
+                std::snprintf(name, sizeof(name),
+                              "ds4_comp_kv_peer_%d", il);
+                ggml_set_name(destination.comp_kv, name);
+            }
+        }
+        out.attention_tp_buf = ggml_backend_alloc_ctx_tensors(
+            out.attention_tp_ctx, w.attention_tp_backend);
+        if (!out.attention_tp_buf) {
+            out.attention_tp_layers.clear();
+            ggml_free(out.attention_tp_ctx);
+            out.attention_tp_ctx = nullptr;
+            ggml_backend_buffer_free(out.buf);
+            out.buf = nullptr;
+            ggml_free(out.ctx);
+            out.ctx = nullptr;
+            return false;
+        }
+        out.attention_tp_backend = w.attention_tp_backend;
+        out.attention_tp_cur_pos = 0;
+        ggml_backend_buffer_clear(out.attention_tp_buf, 0);
+        std::fprintf(stderr,
+                     "[deepseek4-attention-tp] peer KV cache: %.1f MB\n",
+                     ggml_backend_buffer_get_size(out.attention_tp_buf) /
+                         1024.0 / 1024.0);
+    }
     const size_t total_bytes = ggml_backend_buffer_get_size(out.buf);
     std::fprintf(stderr, "[deepseek4] KV cache: %.1f MB for ctx=%d\n",
                  (double)total_bytes / (1024.0 * 1024.0), max_ctx);
@@ -8130,8 +8961,19 @@ bool create_deepseek4_cache(ggml_backend_t backend,
 void free_deepseek4_cache(DeepSeek4Cache & c) {
     delete c.layer_range_cache;
     c.layer_range_cache = nullptr;
-    if (c.ctx) { ggml_free(c.ctx); c.ctx = nullptr; }
+    if (c.attention_tp_buf) {
+        ggml_backend_buffer_free(c.attention_tp_buf);
+        c.attention_tp_buf = nullptr;
+    }
+    if (c.attention_tp_ctx) {
+        ggml_free(c.attention_tp_ctx);
+        c.attention_tp_ctx = nullptr;
+    }
+    c.attention_tp_backend = nullptr;
+    c.attention_tp_layers.clear();
+    c.attention_tp_cur_pos = -1;
     if (c.buf) { ggml_backend_buffer_free(c.buf); c.buf = nullptr; }
+    if (c.ctx) { ggml_free(c.ctx); c.ctx = nullptr; }
     c.layers.clear();
     c.hc_state = nullptr;
 }
@@ -8145,6 +8987,56 @@ void reset_deepseek4_cache(DeepSeek4Cache & c) {
     if (c.buf) {
         ggml_backend_buffer_clear(c.buf, 0);
     }
+    if (c.attention_tp_buf) {
+        ggml_backend_buffer_clear(c.attention_tp_buf, 0);
+        c.attention_tp_cur_pos = 0;
+    }
+}
+
+bool deepseek4_sync_attention_tp_cache(DeepSeek4Cache & c) {
+    if (!c.attention_tp_buf || !c.attention_tp_backend) return true;
+    if (c.attention_tp_cur_pos == c.cur_pos) return true;
+    // The qualified path splits only Q-head projection and never reads the
+    // peer KV mirror. Avoid a full cache copy after every speculative commit.
+    // Keep the old mirror available solely for the explicit value-split
+    // diagnostic while its deterministic-kernel work is unfinished.
+    if (!ds4_env_flag("DFLASH_DS4_ATTENTION_TP_MIRROR_KV")) {
+        c.attention_tp_cur_pos = c.cur_pos;
+        return true;
+    }
+    if (c.attention_tp_layers.size() != c.layers.size()) return false;
+
+    const auto same_layout = [](const ggml_tensor * a,
+                                const ggml_tensor * b) {
+        if (!a || !b || a->type != b->type) return false;
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            if (a->ne[d] != b->ne[d] || a->nb[d] != b->nb[d]) {
+                return false;
+            }
+        }
+        return true;
+    };
+    for (size_t il = 0; il < c.layers.size(); ++il) {
+        const DeepSeek4LayerCache & source = c.layers[il];
+        DeepSeek4AttentionTpCacheLayer & destination =
+            c.attention_tp_layers[il];
+        if (!same_layout(source.raw_kv, destination.raw_kv)) {
+            return false;
+        }
+        ggml_backend_tensor_copy(source.raw_kv, destination.raw_kv);
+        if (!!source.comp_kv != !!destination.comp_kv) return false;
+        if (source.comp_kv) {
+            if (!same_layout(source.comp_kv, destination.comp_kv)) {
+                return false;
+            }
+            ggml_backend_tensor_copy(source.comp_kv, destination.comp_kv);
+        }
+    }
+    c.attention_tp_cur_pos = c.cur_pos;
+    std::fprintf(stderr,
+                 "[deepseek4-attention-tp] synchronized peer KV at pos=%d\n",
+                 c.cur_pos);
+    return true;
 }
 
 namespace {
@@ -8157,49 +9049,6 @@ ggml_tensor * clone_snapshot_tensor(ggml_context * ctx,
     if (!dst) return nullptr;
     if (name && *name) ggml_set_name(dst, name);
     return dst;
-}
-
-ggml_tensor * clone_snapshot_rows(ggml_context * ctx,
-                                  const ggml_tensor * src,
-                                  int live_rows,
-                                  const char * name) {
-    if (!ctx || !src || ggml_n_dims(src) != 2 || live_rows < 0 ||
-        live_rows > src->ne[1]) {
-        return nullptr;
-    }
-    // GGML tensors cannot have an empty physical dimension. Keep one
-    // allocated row for an empty logical prefix, but copy zero bytes below.
-    const int64_t allocated_rows = std::max(1, live_rows);
-    ggml_tensor * dst = ggml_new_tensor_2d(
-        ctx, src->type, src->ne[0], allocated_rows);
-    if (!dst) return nullptr;
-    if (name && *name) ggml_set_name(dst, name);
-    return dst;
-}
-
-size_t tensor_prefix_bytes(const ggml_tensor * tensor, int rows) {
-    if (!tensor || rows <= 0) return 0;
-    return ggml_row_size(tensor->type, tensor->ne[0]) * (size_t) rows;
-}
-
-bool copy_tensor_prefix_from_backend(const ggml_tensor * src,
-                                     ggml_tensor * dst,
-                                     int rows) {
-    if (!src || !dst || rows < 0) return false;
-    const size_t bytes = tensor_prefix_bytes(src, rows);
-    if (bytes > ggml_nbytes(src) || bytes > ggml_nbytes(dst)) return false;
-    if (bytes > 0) ggml_backend_tensor_get(src, dst->data, 0, bytes);
-    return true;
-}
-
-bool copy_tensor_prefix_to_backend(const ggml_tensor * src,
-                                   ggml_tensor * dst,
-                                   int rows) {
-    if (!src || !dst || rows < 0) return false;
-    const size_t bytes = tensor_prefix_bytes(src, rows);
-    if (bytes > ggml_nbytes(src) || bytes > ggml_nbytes(dst)) return false;
-    if (bytes > 0) ggml_backend_tensor_set(dst, src->data, 0, bytes);
-    return true;
 }
 
 bool copy_tensor_from_backend(const ggml_tensor * src, ggml_tensor * dst) {
@@ -8228,44 +9077,14 @@ bool tensors_compatible(const ggml_tensor * a, const ggml_tensor * b) {
     return true;
 }
 
-bool prefix_tensors_compatible(const ggml_tensor * snap,
-                               const ggml_tensor * cache,
-                               int live_rows) {
-    if (!!snap != !!cache) return false;
-    if (!snap) return live_rows == 0;
-    // A right-sized zero/one-row tensor reports one logical GGML dimension,
-    // while its full-capacity cache tensor reports two. Compare the physical
-    // row layout instead of ggml_n_dims() so those valid snapshots restore.
-    if (live_rows < 0 || cache->ne[1] <= 0 ||
-        snap->type != cache->type ||
-        snap->ne[0] != cache->ne[0] || live_rows > cache->ne[1]) {
-        return false;
-    }
-    for (int i = 2; i < GGML_MAX_DIMS; ++i) {
-        if (snap->ne[i] != cache->ne[i]) return false;
-    }
-    return snap->ne[1] == std::max(1, live_rows);
-}
-
 }  // namespace
 
 bool deepseek4_snapshot_save(const DeepSeek4Cache & cache,
                              ggml_backend_t snapshot_backend,
                              DeepSeek4Snapshot & out) {
     if (!snapshot_backend || !cache.ctx || !cache.buf || !cache.hc_state ||
-        cache.layers.size() != (size_t)cache.n_layer || cache.cur_pos < 0 ||
-        cache.cur_pos > cache.max_ctx) {
+        cache.layers.size() != (size_t)cache.n_layer) {
         return false;
-    }
-    for (const auto & layer : cache.layers) {
-        if (layer.n_comp < 0 || layer.n_index_comp < 0 ||
-            (layer.comp_kv && layer.n_comp > layer.comp_kv->ne[1]) ||
-            (!layer.comp_kv && layer.n_comp != 0) ||
-            (layer.index_comp_kv &&
-             layer.n_index_comp > layer.index_comp_kv->ne[1]) ||
-            (!layer.index_comp_kv && layer.n_index_comp != 0)) {
-            return false;
-        }
     }
 
     free_deepseek4_snapshot(out);
@@ -8289,13 +9108,8 @@ bool deepseek4_snapshot_save(const DeepSeek4Cache & cache,
         const auto & src = cache.layers[(size_t)il];
         auto & dst = out.layers[(size_t)il];
         dst.raw_kv = clone_snapshot_tensor(out.ctx, src.raw_kv, nullptr);
-        dst.comp_kv = src.comp_kv
-            ? clone_snapshot_rows(out.ctx, src.comp_kv, src.n_comp, nullptr)
-            : nullptr;
-        dst.index_comp_kv = src.index_comp_kv
-            ? clone_snapshot_rows(out.ctx, src.index_comp_kv,
-                                  src.n_index_comp, nullptr)
-            : nullptr;
+        dst.comp_kv = clone_snapshot_tensor(out.ctx, src.comp_kv, nullptr);
+        dst.index_comp_kv = clone_snapshot_tensor(out.ctx, src.index_comp_kv, nullptr);
         dst.attn_compressor.state_kv =
             clone_snapshot_tensor(out.ctx, src.attn_compressor.state_kv, nullptr);
         dst.attn_compressor.state_score =
@@ -8332,13 +9146,9 @@ bool deepseek4_snapshot_save(const DeepSeek4Cache & cache,
         dst.n_comp = src.n_comp;
         dst.n_index_comp = src.n_index_comp;
         if (!copy_tensor_from_backend(src.raw_kv, dst.raw_kv) ||
-            (src.comp_kv &&
-             !copy_tensor_prefix_from_backend(src.comp_kv, dst.comp_kv,
-                                              src.n_comp)) ||
+            (src.comp_kv && !copy_tensor_from_backend(src.comp_kv, dst.comp_kv)) ||
             (src.index_comp_kv &&
-             !copy_tensor_prefix_from_backend(src.index_comp_kv,
-                                              dst.index_comp_kv,
-                                              src.n_index_comp)) ||
+             !copy_tensor_from_backend(src.index_comp_kv, dst.index_comp_kv)) ||
             (src.attn_compressor.state_kv &&
              !copy_tensor_from_backend(src.attn_compressor.state_kv,
                                        dst.attn_compressor.state_kv)) ||
@@ -8363,79 +9173,30 @@ bool deepseek4_snapshot_save(const DeepSeek4Cache & cache,
 bool deepseek4_snapshot_restore(const DeepSeek4Snapshot & snap,
                                 DeepSeek4Cache & cache) {
     if (!snap.ctx || !cache.ctx || !cache.buf || !snap.hc_state_snap ||
-        snap.layers.size() != cache.layers.size() || snap.cur_pos < 0 ||
-        snap.cur_pos > cache.max_ctx) {
-        std::fprintf(stderr,
-                     "[deepseek4] snapshot restore: invalid header "
-                     "(snap_ctx=%d cache_ctx=%d snap_layers=%zu "
-                     "cache_layers=%zu pos=%d max_ctx=%d)\n",
-                     snap.ctx != nullptr, cache.ctx != nullptr,
-                     snap.layers.size(), cache.layers.size(),
-                     snap.cur_pos, cache.max_ctx);
+        snap.layers.size() != cache.layers.size()) {
         return false;
     }
-    if (!tensors_compatible(snap.hc_state_snap, cache.hc_state)) {
-        std::fprintf(stderr,
-                     "[deepseek4] snapshot restore: incompatible HC state\n");
+    if (!tensors_compatible(snap.hc_state_snap, cache.hc_state) ||
+        !copy_tensor_to_backend(snap.hc_state_snap, cache.hc_state)) {
         return false;
     }
 
-    // Validate the complete layout before changing the live cache. Compressed
-    // tensors are deliberately right-sized to their logical row counts;
-    // inactive capacity rows are not part of the snapshot contract.
-    for (size_t il = 0; il < cache.layers.size(); ++il) {
-        const auto & src = snap.layers[il];
-        const auto & dst = cache.layers[il];
-        const bool raw_ok = tensors_compatible(src.raw_kv, dst.raw_kv);
-        const bool comp_ok = prefix_tensors_compatible(
-            src.comp_kv, dst.comp_kv, src.n_comp);
-        const bool index_ok = prefix_tensors_compatible(
-            src.index_comp_kv, dst.index_comp_kv, src.n_index_comp);
-        const bool attn_kv_ok = tensors_compatible(
-            src.attn_compressor.state_kv, dst.attn_compressor.state_kv);
-        const bool attn_score_ok = tensors_compatible(
-            src.attn_compressor.state_score, dst.attn_compressor.state_score);
-        const bool index_kv_ok = tensors_compatible(
-            src.indexer_compressor.state_kv, dst.indexer_compressor.state_kv);
-        const bool index_score_ok = tensors_compatible(
-            src.indexer_compressor.state_score,
-            dst.indexer_compressor.state_score);
-        if (!raw_ok || !comp_ok || !index_ok || !attn_kv_ok ||
-            !attn_score_ok || !index_kv_ok || !index_score_ok) {
-            std::fprintf(stderr,
-                         "[deepseek4] snapshot restore: incompatible layer %zu "
-                         "(raw=%d comp=%d[%d/%lld/%lld] "
-                         "index=%d[%d/%lld/%lld] states=%d/%d/%d/%d)\n",
-                         il, raw_ok, comp_ok, src.n_comp,
-                         (long long) (src.comp_kv ? src.comp_kv->ne[1] : 0),
-                         (long long) (dst.comp_kv ? dst.comp_kv->ne[1] : 0),
-                         index_ok, src.n_index_comp,
-                         (long long) (src.index_comp_kv
-                             ? src.index_comp_kv->ne[1] : 0),
-                         (long long) (dst.index_comp_kv
-                             ? dst.index_comp_kv->ne[1] : 0),
-                         attn_kv_ok, attn_score_ok,
-                         index_kv_ok, index_score_ok);
-            return false;
-        }
-    }
-
-    if (!copy_tensor_to_backend(snap.hc_state_snap, cache.hc_state)) {
-        std::fprintf(stderr,
-                     "[deepseek4] snapshot restore: HC copy failed\n");
-        return false;
-    }
     for (size_t il = 0; il < cache.layers.size(); ++il) {
         const auto & src = snap.layers[il];
         auto & dst = cache.layers[il];
+        if (!tensors_compatible(src.raw_kv, dst.raw_kv) ||
+            !tensors_compatible(src.comp_kv, dst.comp_kv) ||
+            !tensors_compatible(src.index_comp_kv, dst.index_comp_kv) ||
+            !tensors_compatible(src.attn_compressor.state_kv, dst.attn_compressor.state_kv) ||
+            !tensors_compatible(src.attn_compressor.state_score, dst.attn_compressor.state_score) ||
+            !tensors_compatible(src.indexer_compressor.state_kv, dst.indexer_compressor.state_kv) ||
+            !tensors_compatible(src.indexer_compressor.state_score, dst.indexer_compressor.state_score)) {
+            return false;
+        }
         if (!copy_tensor_to_backend(src.raw_kv, dst.raw_kv) ||
-            (src.comp_kv &&
-             !copy_tensor_prefix_to_backend(src.comp_kv, dst.comp_kv,
-                                            src.n_comp)) ||
+            (src.comp_kv && !copy_tensor_to_backend(src.comp_kv, dst.comp_kv)) ||
             (src.index_comp_kv &&
-             !copy_tensor_prefix_to_backend(src.index_comp_kv,
-                                            dst.index_comp_kv,
-                                            src.n_index_comp)) ||
+             !copy_tensor_to_backend(src.index_comp_kv, dst.index_comp_kv)) ||
             (src.attn_compressor.state_kv &&
              !copy_tensor_to_backend(src.attn_compressor.state_kv,
                                      dst.attn_compressor.state_kv)) ||
@@ -8447,10 +9208,7 @@ bool deepseek4_snapshot_restore(const DeepSeek4Snapshot & snap,
                                      dst.indexer_compressor.state_kv)) ||
             (src.indexer_compressor.state_score &&
              !copy_tensor_to_backend(src.indexer_compressor.state_score,
-                                       dst.indexer_compressor.state_score))) {
-            std::fprintf(stderr,
-                         "[deepseek4] snapshot restore: layer %zu copy failed\n",
-                         il);
+                                     dst.indexer_compressor.state_score))) {
             return false;
         }
         dst.n_comp = src.n_comp;
@@ -8458,6 +9216,9 @@ bool deepseek4_snapshot_restore(const DeepSeek4Snapshot & snap,
     }
 
     cache.cur_pos = snap.cur_pos;
+    if (cache.attention_tp_buf) {
+        cache.attention_tp_cur_pos = -1;
+    }
     return true;
 }
 
@@ -9306,6 +10067,23 @@ bool deepseek4_dspark_draft_read_async_output(
         ggml_backend_tensor_get(
             C.confidence_out, confidence_hidden->data(), 0,
             sizeof(float) * count);
+    }
+    return true;
+}
+
+bool deepseek4_dspark_draft_device_outputs(
+                                          ggml_backend_t backend,
+                                          ggml_tensor ** out_hidden,
+                                          ggml_tensor ** confidence_hidden) {
+    DsparkDraftCache & C = g_dspark_draft_cache;
+    if (!backend || backend != C.backend || !C.ctx || !C.out ||
+        C.block <= 0 || !C.drafter || !out_hidden ||
+        (confidence_hidden && !C.confidence_out)) {
+        return false;
+    }
+    *out_hidden = C.out;
+    if (confidence_hidden) {
+        *confidence_hidden = C.confidence_out;
     }
     return true;
 }

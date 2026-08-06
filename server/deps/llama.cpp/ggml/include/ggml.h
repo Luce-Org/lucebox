@@ -677,6 +677,10 @@ extern "C" {
         GGML_TENSOR_FLAG_PARAM   =  4, // ...contains trainable parameters
         GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
+        // ...is a persistent fork payload whose cross-device copy may run on
+        // the destination stream. Transient allocator storage must never set
+        // this flag because the producer may otherwise reuse it too early.
+        GGML_TENSOR_FLAG_DST_STREAM_COPY = 32,
     };
 
     enum ggml_tri_type {

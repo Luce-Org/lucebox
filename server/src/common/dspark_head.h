@@ -36,6 +36,20 @@ bool dspark_markov_correct_greedy_chain_fused(const DraftWeights & dw,
                                               std::vector<float> * confidence_out = nullptr,
                                               const float * confidence_hidden = nullptr);
 
+// Device-resident sibling of the fused chain. The hidden tensors are outputs
+// of a previously submitted graph on the same backend/stream, so stream order
+// replaces the intermediate device-to-host-to-device round trip.
+bool dspark_markov_correct_greedy_chain_fused_device(
+                                              const DraftWeights & dw,
+                                              ggml_backend_t backend,
+                                              ggml_tensor * lm_head,
+                                              ggml_tensor * local_hidden,
+                                              int q_len,
+                                              int32_t last_tok,
+                                              std::vector<int32_t> & draft_tok,
+                                              std::vector<float> * confidence_out = nullptr,
+                                              ggml_tensor * confidence_hidden = nullptr);
+
 // DDTree candidate generation with the Markov correction: base logits for
 // all n_tokens positions in ONE lm_head matmul; rows 1..n-1 get the low-rank
 // previous-token bias chained along the main (argmax) path; top-K extracted

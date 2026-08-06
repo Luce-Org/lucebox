@@ -385,6 +385,14 @@ extern "C" {
                                             ggml_backend_sched_t sched,
                                             bool enabled);
 
+    // In a non-pipelined scheduler, protect reusable split-input buffers with
+    // stream events instead of blocking the host on every destination stream.
+    // The source waits until the destination has finished the prior generation;
+    // the existing async-copy contract then publishes the new generation.
+    GGML_API void                 ggml_backend_sched_set_single_copy_event_fences(
+                                            ggml_backend_sched_t sched,
+                                            bool enabled);
+
     //
     // Meta backend
     //

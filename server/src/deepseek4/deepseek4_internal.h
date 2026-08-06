@@ -152,6 +152,16 @@ struct DeepSeek4Layer {
 
 // ─── Global weights ─────────────────────────────────────────────────────
 
+// Compact copies of one contiguous attention-head partition. Each output
+// group owns n_head / n_out_group complete heads, so keeping these tensors
+// together lets the peer execute Q -> attention -> output locally.
+struct DeepSeek4AttentionTpLayer {
+    ggml_tensor * attn_q_b      = nullptr;
+    ggml_tensor * attn_sinks    = nullptr;
+    ggml_tensor * attn_output_a = nullptr;
+    ggml_tensor * attn_output_b = nullptr;
+};
+
 struct DeepSeek4Weights {
     ggml_context *        ctx     = nullptr;
     ggml_backend_t        backend = nullptr;
@@ -159,6 +169,15 @@ struct DeepSeek4Weights {
     // Optional row-split buffer for selected dense projections. The buffer
     // owns per-device allocations while the tensor metadata stays in ctx.
     ggml_backend_buffer_t dense_split_buf = nullptr;
+
+    // Optional persistent attention-head partition on the in-process peer.
+    // The backend is borrowed; this struct owns the context and weight buffer.
+    ggml_context * attention_tp_ctx = nullptr;
+    ggml_backend_buffer_t attention_tp_buf = nullptr;
+    ggml_backend_t attention_tp_backend = nullptr;
+    std::vector<DeepSeek4AttentionTpLayer> attention_tp_layers;
+    int attention_tp_main_groups = 0;
+    int attention_tp_peer_groups = 0;
 
     // Global tensors
     ggml_tensor * tok_embd       = nullptr;  // [n_embd, n_vocab]
@@ -268,6 +287,13 @@ struct DeepSeek4LayerCache {
     DeepSeek4CompressorState indexer_compressor;
 };
 
+// The peer needs only attention-visible KV, not compressor or indexer state:
+// the primary computes each new row once and transfers just those new rows.
+struct DeepSeek4AttentionTpCacheLayer {
+    ggml_tensor * raw_kv  = nullptr;
+    ggml_tensor * comp_kv = nullptr;
+};
+
 // Per-shard runtime state for deepseek4_step_layer_range (host-side HC weight
 // cache + cached decode graphs). Defined in deepseek4_graph.cpp; owned by the
 // DeepSeek4Cache below and released by free_deepseek4_cache().
@@ -289,6 +315,14 @@ struct DeepSeek4Cache {
 
     ggml_context *        ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;
+
+    ggml_context * attention_tp_ctx = nullptr;
+    ggml_backend_buffer_t attention_tp_buf = nullptr;
+    ggml_backend_t attention_tp_backend = nullptr;
+    std::vector<DeepSeek4AttentionTpCacheLayer> attention_tp_layers;
+    // Position represented by the peer cache. A mismatch triggers one bulk
+    // synchronization after prefill, prefix restore, or recovery.
+    int attention_tp_cur_pos = -1;
 };
 
 struct DeepSeek4Snapshot;
@@ -324,6 +358,11 @@ bool load_deepseek4_gguf_partial(const std::string & path,
 
 void free_deepseek4_weights(DeepSeek4Weights & w);
 
+bool init_deepseek4_attention_tp(DeepSeek4Weights & w,
+                                 ggml_backend_t peer_backend,
+                                 int peer_groups,
+                                 std::string * err);
+
 // Release graph allocators and host mirrors that retain model tensor pointers.
 // This must run before the owning ggml context is destroyed.
 void deepseek4_release_runtime_graphs(const DeepSeek4Weights & w);
@@ -335,6 +374,7 @@ bool create_deepseek4_cache(ggml_backend_t backend,
 
 void free_deepseek4_cache(DeepSeek4Cache & c);
 void reset_deepseek4_cache(DeepSeek4Cache & c);
+bool deepseek4_sync_attention_tp_cache(DeepSeek4Cache & c);
 int deepseek4_previous_raw_ring_spans(
     int kv_start,
     int n_swa,
@@ -382,10 +422,6 @@ bool deepseek4_step(
 struct Ds4VerifyHooks {
     const std::vector<int> * capture_layer_ids = nullptr;  // e.g. {40,41,42}
     std::vector<float> *     capture_out = nullptr;         // [n_cap*n_embd * n_tokens]
-    // Optional relative token range for layer-major feature readback. Generic
-    // verifier paths may ignore this and return the complete batch.
-    int                      capture_token_begin = 0;
-    int                      capture_token_end = -1;        // exclusive; -1 = n_tokens
     std::vector<float> *     all_logits_out = nullptr;      // [n_vocab * n_tokens]
     std::vector<int32_t> *   argmax_out = nullptr;          // [n_tokens], optional GPU result
     bool                     prefer_argmax_only = false;     // skip logits D2H when available

@@ -186,12 +186,35 @@ struct MarkovChainGraph {
     std::vector<ggml_tensor *> confidence;        // optional sigmoid score per depth
 };
 
+// Make a leaf tensor in the head graph that borrows an already allocated
+// device buffer.  A regular ggml_view_* keeps the producer tensor as a graph
+// dependency; for a cached draft output that would recursively splice the
+// entire draft graph into the Markov graph.  The producer has already been
+// submitted on the same backend stream, so the head only needs a non-owning
+// leaf alias with matching storage metadata.
+ggml_tensor * borrow_device_prefix_2d(ggml_context * ctx,
+                                      ggml_tensor * src,
+                                      int64_t ne0,
+                                      int64_t ne1) {
+    if (!ctx || !src || !src->buffer || !src->data ||
+        src->ne[0] != ne0 || src->ne[1] < ne1) {
+        return nullptr;
+    }
+    ggml_tensor * borrowed = ggml_new_tensor_2d(ctx, src->type, ne0, ne1);
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        borrowed->nb[i] = src->nb[i];
+    }
+    borrowed->buffer = src->buffer;
+    borrowed->data = src->data;
+    borrowed->extra = src->extra;
+    return borrowed;
+}
+
 // Guards shared by the fused Markov paths: head present, usable inputs, and
 // the target lm_head vocab matching the head's training vocab.
 bool dspark_fused_usable(const DraftWeights & dw, ggml_backend_t backend,
-                         ggml_tensor * lm_head, const float * hidden,
-                         const char * who) {
-    if (!dw.dspark.enabled || !hidden || !backend || !lm_head) return false;
+                         ggml_tensor * lm_head, const char * who) {
+    if (!dw.dspark.enabled || !backend || !lm_head) return false;
     if (!dw.dspark.markov_w1 || !dw.dspark.markov_w2) return false;
     if (dw.n_embd <= 0 || dw.dspark.markov_rank <= 0) return false;
     const int vocab = (int)lm_head->ne[1];
@@ -222,7 +245,9 @@ bool build_markov_chain_graph(const DraftWeights & dw,
                               bool corrected_are_outputs,
                               bool confidence_are_outputs,
                               std::vector<uint8_t> & arena,
-                              MarkovChainGraph & out) {
+                              MarkovChainGraph & out,
+                              ggml_tensor * device_hidden = nullptr,
+                              ggml_tensor * device_confidence_hidden = nullptr) {
     const int hdim   = dw.n_embd;
     const int vocab  = (int)lm_head->ne[1];
     const int n_corr = n_positions - first_corrected;
@@ -245,14 +270,51 @@ bool build_markov_chain_graph(const DraftWeights & dw,
     if (!out.ctx) return false;
     out.gf = ggml_new_graph_custom(out.ctx, 512, false);
 
-    out.inp_hidden = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, hdim, n_positions);
-    if (have_confidence) {
-        out.inp_confidence_hidden =
+    if (device_hidden) {
+        if (device_hidden->type != GGML_TYPE_F32 ||
+            device_hidden->ne[0] != hdim ||
+            device_hidden->ne[1] < n_positions ||
+            device_hidden->nb[0] != sizeof(float)) {
+            ggml_free(out.ctx);
+            out.ctx = nullptr;
+            return false;
+        }
+        out.inp_hidden = borrow_device_prefix_2d(
+            out.ctx, device_hidden, hdim, n_positions);
+        if (!out.inp_hidden) {
+            ggml_free(out.ctx);
+            out.ctx = nullptr;
+            return false;
+        }
+    } else {
+        out.inp_hidden =
             ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, hdim, n_positions);
-        ggml_set_input(out.inp_confidence_hidden);
+        ggml_set_input(out.inp_hidden);
+    }
+    if (have_confidence) {
+        if (device_confidence_hidden) {
+            if (device_confidence_hidden->type != GGML_TYPE_F32 ||
+                device_confidence_hidden->ne[0] != hdim ||
+                device_confidence_hidden->ne[1] < n_positions ||
+                device_confidence_hidden->nb[0] != sizeof(float)) {
+                ggml_free(out.ctx);
+                out.ctx = nullptr;
+                return false;
+            }
+            out.inp_confidence_hidden = borrow_device_prefix_2d(
+                out.ctx, device_confidence_hidden, hdim, n_positions);
+            if (!out.inp_confidence_hidden) {
+                ggml_free(out.ctx);
+                out.ctx = nullptr;
+                return false;
+            }
+        } else {
+            out.inp_confidence_hidden = ggml_new_tensor_2d(
+                out.ctx, GGML_TYPE_F32, hdim, n_positions);
+            ggml_set_input(out.inp_confidence_hidden);
+        }
     }
     out.inp_seed   = ggml_new_tensor_1d(out.ctx, GGML_TYPE_I32, 1);
-    ggml_set_input(out.inp_hidden);
     ggml_set_input(out.inp_seed);
 
     out.base = ggml_mul_mat(out.ctx, lm_head, out.inp_hidden);
@@ -317,7 +379,10 @@ bool dspark_markov_correct_greedy_chain_fused(const DraftWeights & dw,
                                               std::vector<float> * confidence_out,
                                               const float * confidence_hidden) {
     if (q_len <= 1) return false;
-    if (!dspark_fused_usable(dw, backend, lm_head, local_hidden, "dspark_fused")) return false;
+    if (!local_hidden ||
+        !dspark_fused_usable(dw, backend, lm_head, "dspark_fused")) {
+        return false;
+    }
     const int hdim   = dw.n_embd;
     const int n_cand = q_len - 1;
 
@@ -382,6 +447,80 @@ bool dspark_markov_correct_greedy_chain_fused(const DraftWeights & dw,
     return true;
 }
 
+bool dspark_markov_correct_greedy_chain_fused_device(
+                                              const DraftWeights & dw,
+                                              ggml_backend_t backend,
+                                              ggml_tensor * lm_head,
+                                              ggml_tensor * local_hidden,
+                                              int q_len,
+                                              int32_t last_tok,
+                                              std::vector<int32_t> & draft_tok,
+                                              std::vector<float> * confidence_out,
+                                              ggml_tensor * confidence_hidden) {
+    if (q_len <= 1 || !local_hidden ||
+        (confidence_out && !confidence_hidden) ||
+        !dspark_fused_usable(
+            dw, backend, lm_head, "dspark_fused_device")) {
+        return false;
+    }
+    const int n_cand = q_len - 1;
+
+    static thread_local std::vector<uint8_t> g_arena_chain_device;
+    MarkovChainGraph g;
+    const bool want_confidence = confidence_out != nullptr;
+    if (confidence_out) confidence_out->clear();
+    if (!build_markov_chain_graph(
+            dw, lm_head, n_cand, /*first_corrected=*/0,
+            /*corrected_are_outputs=*/false,
+            /*confidence_are_outputs=*/want_confidence,
+            g_arena_chain_device, g, local_hidden, confidence_hidden)) {
+        return false;
+    }
+
+    static thread_local ggml_gallocr_t galloc_chain_device = nullptr;
+    if (!galloc_chain_device) {
+        galloc_chain_device =
+            ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    }
+    if (!ggml_gallocr_alloc_graph(galloc_chain_device, g.gf)) {
+        std::fprintf(stderr,
+                     "dspark_fused_device: gallocr_alloc_graph failed\n");
+        ggml_free(g.ctx);
+        return false;
+    }
+
+    ggml_backend_tensor_set(g.inp_seed, &last_tok, 0, sizeof(int32_t));
+    if (ggml_backend_graph_compute(backend, g.gf) != GGML_STATUS_SUCCESS) {
+        std::fprintf(stderr, "dspark_fused_device: graph_compute failed\n");
+        ggml_free(g.ctx);
+        return false;
+    }
+
+    draft_tok.assign((size_t) q_len, 0);
+    draft_tok[0] = last_tok;
+    int32_t t_out[16];
+    float c_out[16] = {};
+    const int n_get = n_cand < 16 ? n_cand : 16;
+    for (int i = 0; i < n_get; ++i) {
+        ggml_backend_tensor_get_async(
+            backend, g.toks[(size_t) i], &t_out[i], 0, sizeof(int32_t));
+        if (want_confidence && g.confidence[(size_t) i]) {
+            ggml_backend_tensor_get_async(
+                backend, g.confidence[(size_t) i], &c_out[i], 0,
+                sizeof(float));
+        }
+    }
+    ggml_backend_synchronize(backend);
+    for (int i = 0; i < n_get; ++i) {
+        draft_tok[(size_t) i + 1] = t_out[i];
+    }
+    if (want_confidence && !g.confidence.empty() && g.confidence[0]) {
+        confidence_out->assign(c_out, c_out + n_get);
+    }
+    ggml_free(g.ctx);
+    return true;
+}
+
 bool dspark_markov_project_topk(const DraftWeights & dw,
                                 ggml_backend_t backend,
                                 ggml_tensor * lm_head,
@@ -391,7 +530,10 @@ bool dspark_markov_project_topk(const DraftWeights & dw,
                                 std::vector<float> & top_log_probs,
                                 std::vector<int32_t> & top_token_ids) {
     if (n_tokens <= 1 || K <= 0) return false;
-    if (!dspark_fused_usable(dw, backend, lm_head, hidden, "dspark_topk")) return false;
+    if (!hidden ||
+        !dspark_fused_usable(dw, backend, lm_head, "dspark_topk")) {
+        return false;
+    }
     const int hdim  = dw.n_embd;
     const int vocab = (int)lm_head->ne[1];
 

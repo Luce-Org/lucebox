@@ -2,6 +2,7 @@
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
 #include "ggml.h"
+#include "rocmfpx.h"
 
 #include <cuda_runtime.h>
 
@@ -81,8 +82,20 @@ static bool run_case(
     }
 
     std::vector<uint8_t> weights_q(ggml_nbytes(weights));
-    const size_t quantized = ggml_quantize_chunk(
-        type, weights_f.data(), weights_q.data(), 0, n_rows * n_experts, k_dim, nullptr);
+    size_t quantized = 0;
+    if (type == GGML_TYPE_Q2_0_ROCMFP2) {
+        quantized = rocmfpx_quantize_fp2(
+            weights_f.data(), weights_q.data(), n_rows*n_experts, k_dim,
+            nullptr);
+    } else if (type == GGML_TYPE_Q3_0_ROCMFPX) {
+        quantized = rocmfpx_quantize_fp3(
+            weights_f.data(), weights_q.data(), n_rows*n_experts, k_dim,
+            nullptr);
+    } else {
+        quantized = ggml_quantize_chunk(
+            type, weights_f.data(), weights_q.data(), 0,
+            n_rows*n_experts, k_dim, nullptr);
+    }
     if (quantized != weights_q.size()) {
         std::fprintf(stderr, "quantize size mismatch type=%s got=%zu expected=%zu\n",
                      ggml_type_name(type), quantized, weights_q.size());
@@ -153,8 +166,9 @@ static int run_child(const char * mode, const char * output_path) {
     std::ofstream output(output_path, std::ios::binary | std::ios::trunc);
     const ggml_type types[] = {
         GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q5_K,
+        GGML_TYPE_Q2_0_ROCMFP2, GGML_TYPE_Q3_0_ROCMFPX,
     };
-    const int widths[] = {2, 4, 8, 9, 16};
+    const int widths[] = {2, 4, 5, 8, 9, 16};
     bool ok = output.good();
     for (ggml_type type : types) {
         for (int width : widths) {
@@ -294,13 +308,20 @@ static std::string child_command(
         const std::string & output_path,
         const std::string & log_path) {
 #if defined(_WIN32)
-    return "set \"DFLASH_MMID_TELEMETRY=1\" && set \"DFLASH_MMID_GROUPED_TYPES=7\" && "
+    return "set \"DFLASH_MMID_TELEMETRY=1\" && set \"DFLASH_MMID_GROUPED_TYPES=15\" && "
+        "set \"DFLASH_CUDA_MMVQ_MOE_FP3_PACKED24=1\" && "
+        "set \"DFLASH_CUDA_MMVQ_MOE_GROUP_REUSE=" +
+        std::string(std::strcmp(mode, "grouped") == 0 ? "1" : "0") + "\" && "
         "set \"DFLASH_MMID_GROUPED=" +
         std::string(std::strcmp(mode, "grouped") == 0 ? "1" : "0") + "\" && " +
         shell_quote(executable) + " --child " + mode + " " + shell_quote(output_path) +
         " 2>" + shell_quote(log_path);
 #else
-    return "DFLASH_MMID_TELEMETRY=1 DFLASH_MMID_GROUPED_TYPES=7 DFLASH_MMID_GROUPED=" +
+    return "DFLASH_MMID_TELEMETRY=1 DFLASH_MMID_GROUPED_TYPES=15 "
+        "DFLASH_CUDA_MMVQ_MOE_FP3_PACKED24=1 "
+        "DFLASH_CUDA_MMVQ_MOE_GROUP_REUSE=" +
+        std::string(std::strcmp(mode, "grouped") == 0 ? "1" : "0") +
+        " DFLASH_MMID_GROUPED=" +
         std::string(std::strcmp(mode, "grouped") == 0 ? "1" : "0") + " " +
         shell_quote(executable) + " --child " + mode + " " + shell_quote(output_path) +
         " 2>" + shell_quote(log_path);
@@ -345,26 +366,36 @@ int main(int argc, char ** argv) {
     const std::vector<char> grouped_log = read_file(grouped_log_path.c_str());
     const size_t legacy_grouped = count_records(legacy_log, "variant=grouped");
     const size_t grouped_grouped = count_records(grouped_log, "variant=grouped");
+    const size_t grouped_reuse = count_records(grouped_log, "variant=group-reuse");
 
     const ggml_type types[] = {
         GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q5_K,
+        GGML_TYPE_Q2_0_ROCMFP2, GGML_TYPE_Q3_0_ROCMFPX,
     };
-    const int widths[] = {2, 4, 8, 9, 16};
+    const int widths[] = {2, 4, 5, 8, 9, 16};
     size_t offset = 0;
     size_t compared_bytes = 0;
     int compared_cases = 0;
     int exact_cases = 0;
     int tolerant_cases = 0;
+    size_t expected_grouped_records = 0;
+    size_t expected_reuse_records = 0;
     bool output_parity = legacy.size() == grouped.size() && !legacy.empty();
     bool grouped_dispatch = true;
     for (ggml_type type : types) {
         for (int width : widths) {
             const bool legacy_mmvq = has_mmvq_record(legacy_log, type, width);
+            const bool expect_reuse =
+                (type == GGML_TYPE_Q2_0_ROCMFP2 ||
+                 type == GGML_TYPE_Q3_0_ROCMFPX) && width <= 5;
             for (bool fused_ds4 : {false, true}) {
                 const size_t case_bytes = (size_t) 128 * 8 * width * sizeof(float);
                 const bool require_exact = legacy_mmvq && !fused_ds4;
                 grouped_dispatch =
-                    has_mmvq_record(grouped_log, type, width, "grouped") && grouped_dispatch;
+                    has_mmvq_record(
+                        grouped_log, type, width,
+                        expect_reuse ? "group-reuse" : "grouped") &&
+                    grouped_dispatch;
                 if (output_parity) {
                     output_parity = compare_case_outputs(
                         legacy, grouped, offset, case_bytes, require_exact);
@@ -381,11 +412,16 @@ int main(int argc, char ** argv) {
                 tolerant_cases += require_exact ? 0 : 1;
                 offset += case_bytes;
             }
+            // One non-fused MUL_MAT_ID plus two inputs to the fused DS4 graph.
+            (expect_reuse ? expected_reuse_records :
+                            expected_grouped_records) += 3;
         }
     }
-    output_parity = output_parity && offset == legacy.size() && compared_cases == 50;
+    output_parity = output_parity && offset == legacy.size() && compared_cases == 84;
     const bool pass = legacy_status == 0 && grouped_status == 0 &&
-        output_parity && grouped_dispatch && legacy_grouped == 0 && grouped_grouped == 75;
+        output_parity && grouped_dispatch && legacy_grouped == 0 &&
+        grouped_grouped == expected_grouped_records &&
+        grouped_reuse == expected_reuse_records;
     if (pass) {
         std::remove(legacy_path.c_str());
         std::remove(grouped_path.c_str());
@@ -394,10 +430,11 @@ int main(int argc, char ** argv) {
     }
     std::printf("[mmid-grouped-test] legacy_status=%d grouped_status=%d bytes=%zu "
                 "compared_cases=%d exact_cases=%d tolerant_cases=%d compared_bytes=%zu "
-                "legacy_grouped=%zu grouped_grouped=%zu "
+                "legacy_grouped=%zu grouped_grouped=%zu grouped_reuse=%zu "
                 "parity=%s\n",
                 legacy_status, grouped_status, legacy.size(), compared_cases, exact_cases,
                 tolerant_cases, compared_bytes, legacy_grouped, grouped_grouped,
+                grouped_reuse,
                 pass ? "PASS" : "FAIL");
     return pass ? 0 : 1;
 }

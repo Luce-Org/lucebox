@@ -67,18 +67,15 @@ public:
                          n, n > 0 ? tokens[0] : -1, n > 1 ? tokens[1] : -1, w_.n_vocab);
             return false;
         }
-        // Sequential verify: q single-token forwards through the same cached
-        // graph as ordinary AR decode. This preserves target arithmetic; exact
-        // rollback still requires a full snapshot and replay after rejection.
-        // DFLASH_DS4_SEQ_VERIFY is a diagnostic. The supported reference mode,
-        // DFLASH_DS4_SPEC_REFERENCE_EXACT, enables both requirements together.
+        // Sequential verify (measurement mode): q single-token forwards through
+        // the legacy AR decode path. Causal by construction, compressor fed every
+        // token. Slow; used to measure the drafter's token-at-a-time accept rate.
+        // It is not a bit-exact oracle: graph shape can change floating-point
+        // reduction order around near-tied logits. Enable: DFLASH_DS4_SEQ_VERIFY=1
+        // (pair with DFLASH_DS4_FULL_SNAP=1 so rollback/replay stay exact).
         static const bool seq_verify = [] {
-            const char * exact =
-                std::getenv("DFLASH_DS4_SPEC_REFERENCE_EXACT");
-            const char * sequential =
-                std::getenv("DFLASH_DS4_SEQ_VERIFY");
-            return (exact && *exact && *exact != '0') ||
-                   (sequential && *sequential && *sequential != '0');
+            const char * v = std::getenv("DFLASH_DS4_SEQ_VERIFY");
+            return v && *v && *v != '0';
         }();
         if (seq_verify) {
             std::vector<int32_t> am_all;
@@ -94,7 +91,7 @@ public:
                                                      tokens.data() + t, 1, base_pos + t, am1,
                                                      keep_logits_ ? &logits1 : nullptr,
                                                      feat1, telemetry_,
-                                                     /*allow_graph_reuse=*/true,
+                                                     /*allow_graph_reuse=*/false,
                                                      moe_hybrid_, expert_runtime_,
                                                      routing_stats_)) {
                     return false;
@@ -112,13 +109,13 @@ public:
             return true;
         }
         std::vector<int32_t> am;
-        // Reuse the normal cached graph for q==1 so reference verification has
-        // exactly the same target arithmetic as ordinary AR decode.
+        // n==1 must take the dynamic (non-reuse) path: the reused decode graph
+        // skips the capture/all-logits hooks (backend HC), which this needs.
         if (!deepseek4_dspark_verify_forward(backend_, device_, w_, cache_, capture_ids_,
                                              embed_buf_.data(), tokens.data(), n, base_pos, am,
                                              keep_logits_ ? &verify_logits_ : nullptr,
                                              verify_features_, telemetry_,
-                                             /*allow_graph_reuse=*/true,
+                                             /*allow_graph_reuse=*/n > 1,
                                              moe_hybrid_, expert_runtime_,
                                              routing_stats_)) {
             return false;
@@ -509,6 +506,21 @@ void spec_rollback_apply(const DeepSeek4SpecRollback & rb, const DeepSeek4Weight
                         lc.raw_kv, src,
                         (size_t) row * lc.raw_kv->nb[1], s.raw_row_bytes);
                 }
+                if (il < cache.attention_tp_layers.size()) {
+                    ggml_tensor * peer_raw =
+                        cache.attention_tp_layers[il].raw_kv;
+                    if (peer_raw && peer_raw->ne[1] == lc.raw_kv->ne[1] &&
+                        ggml_row_size(peer_raw->type, peer_raw->ne[0]) ==
+                            s.raw_row_bytes) {
+                        // The saved main row is byte-identical to the peer
+                        // mirror. Rollback is rare, so a direct synchronous
+                        // write keeps the two persistent rings coherent.
+                        ggml_backend_tensor_set(
+                            peer_raw, src,
+                            (size_t) row * peer_raw->nb[1],
+                            s.raw_row_bytes);
+                    }
+                }
             }
         }
     }
@@ -527,6 +539,9 @@ void spec_rollback_apply(const DeepSeek4SpecRollback & rb, const DeepSeek4Weight
                     cache.hc_state, rb.hc_state.data(), 0, rb.hc_state.size());
             }
         }
+    }
+    if (cache.attention_tp_buf) {
+        cache.attention_tp_cur_pos = commit_pos;
     }
 }
 
@@ -612,13 +627,6 @@ bool deepseek4_dspark_verify_forward(ggml_backend_t backend,
         argmax_out = std::move(gpu_argmax);
         return true;
     }
-    if (n_tokens == 1 && (int) all_logits.size() < w.n_vocab &&
-        (int) last_logits.size() >= w.n_vocab) {
-        // The reference-exact q1 path reuses the normal AR graph. That graph
-        // returns its logits through the regular output vector rather than
-        // the verifier's q-wide hook.
-        all_logits = last_logits;
-    }
     if ((int) all_logits.size() < w.n_vocab * n_tokens) {
         std::fprintf(stderr, "[ds4-verify] all_logits too small: got=%zu need=%d (cap=%zu)\n",
                      all_logits.size(), w.n_vocab * n_tokens, capture_out.size());
@@ -660,12 +668,8 @@ bool run_deepseek4_dspark_spec_decode(
 
     const bool debug = spec_env_flag("DFLASH_DS4_DSPARK_DEBUG");
     const bool timing = spec_env_flag("DFLASH_DS4_TIMING");
-    const bool reference_exact =
-        spec_env_flag("DFLASH_DS4_SPEC_REFERENCE_EXACT");
-    const bool full_snap = reference_exact ||
-        spec_env_flag("DFLASH_DS4_FULL_SNAP");
-    const bool seq_verify_mode = reference_exact ||
-        spec_env_flag("DFLASH_DS4_SEQ_VERIFY");
+    const bool full_snap = spec_env_flag("DFLASH_DS4_FULL_SNAP");
+    const bool seq_verify_mode = spec_env_flag("DFLASH_DS4_SEQ_VERIFY");
     const bool async_rollback = spec_env_flag("DFLASH_DS4_ASYNC_ROLLBACK");
     const bool pinned_rollback = spec_env_flag("DFLASH_DS4_PINNED_ROLLBACK");
     const bool q6_verify =
@@ -677,13 +681,17 @@ bool run_deepseek4_dspark_spec_decode(
         spec_env_flag("DFLASH_DS4_DRAFT_OVERLAP_PROBE");
     const bool draft_overlap_reuse_context =
         spec_env_flag("DFLASH_DS4_DRAFT_OVERLAP_REUSE_CONTEXT");
-    if (reference_exact) {
-        std::fprintf(stderr,
-            "[ds4-spec] reference-exact verifier: sequential target replay "
-            "with full rollback snapshots\n");
-    }
     ggml_backend_t drafter_backend =
         drafter.core.backend ? drafter.core.backend : backend;
+    const bool draft_device_chain_requested =
+        spec_env_flag("DFLASH_DS4_DRAFT_DEVICE_CHAIN");
+    const bool draft_device_chain = draft_device_chain_requested &&
+        drafter_backend == backend && !debug;
+    if (draft_device_chain_requested && !draft_device_chain) {
+        std::fprintf(stderr,
+            "[ds4-spec] device draft/head chain requires the target backend "
+            "and debug mode off; falling back to host staging\n");
+    }
     const bool draft_overlap_probe_active =
         draft_overlap_probe && drafter_backend != backend;
     bool draft_overlap_probe_enabled = draft_overlap_probe_active;
@@ -808,6 +816,9 @@ bool run_deepseek4_dspark_spec_decode(
 
         // Noise block = [seed] + [MASK]*(block-1).
         SpecClock::time_point t0 = SpecClock::now();
+        bool draft_device_pending = false;
+        ggml_tensor * draft_hidden_device = nullptr;
+        ggml_tensor * confidence_hidden_device = nullptr;
         if (q_cap >= 2) {
             noise_ids[0] = lt;
             for (int i = 1; i < block; i++) {
@@ -821,13 +832,30 @@ bool run_deepseek4_dspark_spec_decode(
                 break;
             }
 
-            // Drafter forward -> block normed hidden states.
-            const bool draft_ok = deepseek4_dspark_draft_forward(
-                drafter_backend,
-                drafter, noise_embed.data(),
-                ctx_len > 0 ? feat_win.data() : nullptr,
-                ctx_len, pos, local_hidden,
-                use_confidence_width ? &confidence_hidden : nullptr);
+            // Keep draft outputs on the device when the Markov head shares
+            // this backend. Stream order makes the head wait for the draft
+            // graph without a host round trip or an intermediate synchronize.
+            bool draft_ok = false;
+            if (draft_device_chain) {
+                draft_ok = deepseek4_dspark_draft_forward_async(
+                    drafter_backend, drafter, noise_embed.data(),
+                    ctx_len > 0 ? feat_win.data() : nullptr,
+                    ctx_len, pos);
+                if (draft_ok) {
+                    draft_ok = deepseek4_dspark_draft_device_outputs(
+                        drafter_backend, &draft_hidden_device,
+                        use_confidence_width
+                            ? &confidence_hidden_device : nullptr);
+                    draft_device_pending = draft_ok;
+                }
+            } else {
+                draft_ok = deepseek4_dspark_draft_forward(
+                    drafter_backend,
+                    drafter, noise_embed.data(),
+                    ctx_len > 0 ? feat_win.data() : nullptr,
+                    ctx_len, pos, local_hidden,
+                    use_confidence_width ? &confidence_hidden : nullptr);
+            }
             if (!draft_ok) {
                 std::fprintf(stderr, "[ds4-spec] drafter forward failed\n");
                 ok = false;
@@ -882,24 +910,64 @@ bool run_deepseek4_dspark_spec_decode(
             if (w_cap < q_step_cap) q_step_cap = w_cap;
         }
         if (q_step_cap >= 2) {
-            std::memcpy(padded_hidden.data() + n_embd, local_hidden.data(),
-                        sizeof(float) * (size_t) n_embd * block);
-            if (use_confidence_width) {
-                std::memcpy(padded_confidence_hidden.data() + n_embd,
-                            confidence_hidden.data(),
-                            sizeof(float) * (size_t) n_embd * block);
+            if (draft_device_pending) {
+                ds_ok = dspark_markov_correct_greedy_chain_fused_device(
+                    dw, backend, target.lm_head_tensor(),
+                    draft_hidden_device, q_step_cap, lt, draft_tok,
+                    use_confidence_width ? &draft_confidence : nullptr,
+                    use_confidence_width
+                        ? confidence_hidden_device : nullptr);
+                if (!ds_ok) {
+                    deepseek4_dspark_draft_wait(drafter_backend);
+                    const bool read_ok =
+                        deepseek4_dspark_draft_read_async_output(
+                        drafter_backend, local_hidden,
+                        use_confidence_width ? &confidence_hidden : nullptr);
+                    draft_device_pending = false;
+                    if (!read_ok) {
+                        std::fprintf(stderr,
+                            "[ds4-spec] device draft output read failed\n");
+                        ok = false;
+                        break;
+                    }
+                }
             }
-            ds_ok = dspark_markov_correct_greedy_chain_fused(
+            if (!draft_device_pending) {
+                std::memcpy(
+                    padded_hidden.data() + n_embd, local_hidden.data(),
+                    sizeof(float) * (size_t) n_embd * block);
+                if (use_confidence_width) {
+                    std::memcpy(
+                        padded_confidence_hidden.data() + n_embd,
+                        confidence_hidden.data(),
+                        sizeof(float) * (size_t) n_embd * block);
+                }
+                ds_ok = dspark_markov_correct_greedy_chain_fused(
                             dw, backend, target.lm_head_tensor(), padded_hidden.data(),
                             q_step_cap, lt, draft_tok,
                             use_confidence_width ? &draft_confidence : nullptr,
                             use_confidence_width
                                 ? padded_confidence_hidden.data() : nullptr);
-            if (!ds_ok) {
-                ds_ok = dspark_markov_correct_greedy_chain(dw, backend, target,
-                            padded_hidden.data(), q_step_cap, lt, 0.0f, draft_tok);
+                if (!ds_ok) {
+                    ds_ok = dspark_markov_correct_greedy_chain(
+                        dw, backend, target, padded_hidden.data(),
+                        q_step_cap, lt, 0.0f, draft_tok);
+                }
             }
             if (!ds_ok || (int) draft_tok.size() < 2) {
+                if (draft_device_pending) {
+                    deepseek4_dspark_draft_wait(drafter_backend);
+                    if (!deepseek4_dspark_draft_read_async_output(
+                            drafter_backend, local_hidden,
+                            use_confidence_width
+                                ? &confidence_hidden : nullptr)) {
+                        std::fprintf(stderr,
+                            "[ds4-spec] device draft output fallback failed\n");
+                        ok = false;
+                        break;
+                    }
+                    draft_device_pending = false;
+                }
                 // Fallback: plain projection of the block hiddens.
                 std::vector<int32_t> pj;
                 if (!target.project_hidden_to_tokens(
@@ -1048,7 +1116,7 @@ bool run_deepseek4_dspark_spec_decode(
         // The bonus token is DEFERRED: it becomes the next step's seed, whose
         // KV is written then.
         t0 = SpecClock::now();
-        if (full_snap && accept < q) {
+        if (full_snap) {
             // Legacy: full restore + replay the committed tokens through the
             // target so ring/compressor/n_comp advance exactly.
             std::vector<int32_t> kv_toks;
@@ -1066,7 +1134,7 @@ bool run_deepseek4_dspark_spec_decode(
                 ok = false;
                 break;
             }
-        } else if (!full_snap && accept < q && q > 4) {
+        } else if (accept < q && q > 4) {
             // A rejected wide verify may have crossed two ratio-4 boundaries.
             // Restore the compact pre-verify state and replay only the
             // accepted prefix (at most q5), which is exact and rare at high
@@ -1086,7 +1154,7 @@ bool run_deepseek4_dspark_spec_decode(
                 ok = false;
                 break;
             }
-        } else if (!full_snap && accept < q) {
+        } else if (accept < q) {
             // The prev-half flush is bad only if the boundary sits at-or-past
             // the commit point (its chunk then contains rejected tokens).
             const bool restore_prev = boundary_crossed && first_boundary >= commit_pos;

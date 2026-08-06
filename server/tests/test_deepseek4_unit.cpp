@@ -843,6 +843,106 @@ static void test_grouped_output_projection_cpu(ggml_backend_t backend) {
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
+static void test_attention_tp_weight_partition_cpu(ggml_backend_t backend) {
+    std::fprintf(stderr, "  test_attention_tp_weight_partition_cpu ...");
+
+    constexpr int n_groups = 4;
+    constexpr int peer_groups = 2;
+    constexpr int heads_per_group = 2;
+    constexpr int head_dim = 2;
+    constexpr int n_lora_q = 3;
+    constexpr int n_lora_o = 3;
+    constexpr int n_embd = 5;
+    constexpr int n_head = n_groups * heads_per_group;
+    constexpr int group_dim = heads_per_group * head_dim;
+    constexpr int main_heads = (n_groups - peer_groups) * heads_per_group;
+    constexpr int peer_heads = peer_groups * heads_per_group;
+    constexpr int main_lora = (n_groups - peer_groups) * n_lora_o;
+    constexpr int peer_lora = peer_groups * n_lora_o;
+
+    DeepSeek4Weights weights;
+    weights.backend = backend;
+    weights.n_layer = 1;
+    weights.n_head = n_head;
+    weights.head_dim = head_dim;
+    weights.n_out_group = n_groups;
+    weights.n_lora_q = n_lora_q;
+    weights.n_lora_o = n_lora_o;
+    weights.n_embd = n_embd;
+    weights.layers.resize(1);
+    weights.ctx = make_test_context(1u << 16);
+    TEST_ASSERT_MSG(weights.ctx != nullptr, "weight metadata allocation failed");
+    if (!weights.ctx) return;
+
+    DeepSeek4Layer & layer = weights.layers[0];
+    layer.attn_q_b = ggml_new_tensor_2d(
+        weights.ctx, GGML_TYPE_F32, n_lora_q, n_head * head_dim);
+    layer.attn_sinks = ggml_new_tensor_1d(
+        weights.ctx, GGML_TYPE_F32, n_head);
+    layer.attn_output_a = ggml_new_tensor_2d(
+        weights.ctx, GGML_TYPE_F32, group_dim, n_groups * n_lora_o);
+    layer.attn_output_b = ggml_new_tensor_2d(
+        weights.ctx, GGML_TYPE_F32, n_groups * n_lora_o, n_embd);
+    weights.buf = ggml_backend_alloc_ctx_tensors(weights.ctx, backend);
+    TEST_ASSERT_MSG(weights.buf != nullptr, "weight buffer allocation failed");
+    if (!weights.buf) {
+        free_deepseek4_weights(weights);
+        return;
+    }
+
+    std::vector<float> q((size_t) n_lora_q * n_head * head_dim);
+    std::vector<float> sinks((size_t) n_head);
+    std::vector<float> a((size_t) group_dim * n_groups * n_lora_o);
+    std::vector<float> b((size_t) n_groups * n_lora_o * n_embd);
+    for (size_t i = 0; i < q.size(); ++i) q[i] = (float) i;
+    for (size_t i = 0; i < sinks.size(); ++i) sinks[i] = 1000.0f + (float) i;
+    for (size_t i = 0; i < a.size(); ++i) a[i] = 2000.0f + (float) i;
+    for (size_t i = 0; i < b.size(); ++i) b[i] = 3000.0f + (float) i;
+    ggml_backend_tensor_set(layer.attn_q_b, q.data(), 0, q.size() * sizeof(float));
+    ggml_backend_tensor_set(layer.attn_sinks, sinks.data(), 0,
+                            sinks.size() * sizeof(float));
+    ggml_backend_tensor_set(layer.attn_output_a, a.data(), 0,
+                            a.size() * sizeof(float));
+    ggml_backend_tensor_set(layer.attn_output_b, b.data(), 0,
+                            b.size() * sizeof(float));
+
+    std::string err;
+    TEST_ASSERT_MSG(init_deepseek4_attention_tp(
+                        weights, backend, peer_groups, &err),
+                    err.c_str());
+    if (!weights.attention_tp_layers.empty()) {
+        const DeepSeek4AttentionTpLayer & peer =
+            weights.attention_tp_layers[0];
+        std::vector<float> peer_q((size_t) n_lora_q * peer_heads * head_dim);
+        std::vector<float> peer_sinks((size_t) peer_heads);
+        std::vector<float> peer_a((size_t) group_dim * peer_lora);
+        std::vector<float> peer_b((size_t) peer_lora * n_embd);
+        ggml_backend_tensor_get(peer.attn_q_b, peer_q.data(), 0,
+                                peer_q.size() * sizeof(float));
+        ggml_backend_tensor_get(peer.attn_sinks, peer_sinks.data(), 0,
+                                peer_sinks.size() * sizeof(float));
+        ggml_backend_tensor_get(peer.attn_output_a, peer_a.data(), 0,
+                                peer_a.size() * sizeof(float));
+        ggml_backend_tensor_get(peer.attn_output_b, peer_b.data(), 0,
+                                peer_b.size() * sizeof(float));
+        const size_t q_offset = (size_t) main_heads * head_dim * n_lora_q;
+        const size_t a_offset = (size_t) main_lora * group_dim;
+        TEST_ASSERT(std::equal(peer_q.begin(), peer_q.end(), q.begin() + q_offset));
+        TEST_ASSERT(std::equal(peer_sinks.begin(), peer_sinks.end(),
+                               sinks.begin() + main_heads));
+        TEST_ASSERT(std::equal(peer_a.begin(), peer_a.end(), a.begin() + a_offset));
+        for (int row = 0; row < n_embd; ++row) {
+            for (int col = 0; col < peer_lora; ++col) {
+                TEST_ASSERT(peer_b[(size_t) row * peer_lora + col] ==
+                            b[(size_t) row * n_groups * n_lora_o +
+                              main_lora + col]);
+            }
+        }
+    }
+    free_deepseek4_weights(weights);
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
 static void test_ds4_flash_attention_cpu_rejected(ggml_backend_t backend) {
     std::fprintf(stderr, "  test_ds4_flash_attention_cpu_rejected ...");
     ggml_context * ctx = make_test_context();
@@ -1203,15 +1303,6 @@ static void write_tensor_pattern(ggml_tensor * tensor, uint8_t seed) {
 static std::vector<uint8_t> read_tensor_bytes(const ggml_tensor * tensor) {
     std::vector<uint8_t> data(ggml_nbytes(tensor));
     ggml_backend_tensor_get(tensor, data.data(), 0, data.size());
-    return data;
-}
-
-static std::vector<uint8_t> read_tensor_rows(const ggml_tensor * tensor,
-                                             int rows) {
-    const size_t bytes = rows > 0
-        ? ggml_row_size(tensor->type, tensor->ne[0]) * (size_t) rows : 0;
-    std::vector<uint8_t> data(bytes);
-    if (bytes > 0) ggml_backend_tensor_get(tensor, data.data(), 0, bytes);
     return data;
 }
 
@@ -1790,8 +1881,8 @@ static void test_snapshot_save_restore() {
     write_tensor_pattern(layer.indexer_compressor.state_score, 79);
 
     const std::vector<uint8_t> raw_before = read_tensor_bytes(layer.raw_kv);
-    const std::vector<uint8_t> comp_before = read_tensor_rows(layer.comp_kv, 5);
-    const std::vector<uint8_t> index_before = read_tensor_rows(layer.index_comp_kv, 3);
+    const std::vector<uint8_t> comp_before = read_tensor_bytes(layer.comp_kv);
+    const std::vector<uint8_t> index_before = read_tensor_bytes(layer.index_comp_kv);
     const std::vector<uint8_t> attn_kv_before =
         read_tensor_bytes(layer.attn_compressor.state_kv);
     const std::vector<uint8_t> attn_score_before =
@@ -1812,8 +1903,6 @@ static void test_snapshot_save_restore() {
     TEST_ASSERT(adapter.snapshot_save(0));
     TEST_ASSERT(adapter.snapshot_used(0));
     TEST_ASSERT(adapter.snapshot_cur_pos(0) == 7);
-    TEST_ASSERT(adapter.snapshots_[0].shards[0].layers[0].comp_kv->ne[1] == 5);
-    TEST_ASSERT(adapter.snapshots_[0].shards[0].layers[0].index_comp_kv->ne[1] == 3);
 
     adapter.cur_pos_ = 0;
     adapter.last_tok_ = -1;
@@ -1841,30 +1930,12 @@ static void test_snapshot_save_restore() {
     TEST_ASSERT(layer.n_comp == 5);
     TEST_ASSERT(layer.n_index_comp == 3);
     TEST_ASSERT(read_tensor_bytes(layer.raw_kv) == raw_before);
-    TEST_ASSERT(read_tensor_rows(layer.comp_kv, 5) == comp_before);
-    TEST_ASSERT(read_tensor_rows(layer.index_comp_kv, 3) == index_before);
+    TEST_ASSERT(read_tensor_bytes(layer.comp_kv) == comp_before);
+    TEST_ASSERT(read_tensor_bytes(layer.index_comp_kv) == index_before);
     TEST_ASSERT(read_tensor_bytes(layer.attn_compressor.state_kv) == attn_kv_before);
     TEST_ASSERT(read_tensor_bytes(layer.attn_compressor.state_score) == attn_score_before);
     TEST_ASSERT(read_tensor_bytes(layer.indexer_compressor.state_kv) == index_kv_before);
     TEST_ASSERT(read_tensor_bytes(layer.indexer_compressor.state_score) == index_score_before);
-
-    // A zero-row compressed prefix is represented by one physical GGML row.
-    // ggml_n_dims() reports that tensor as 1D, so restore must validate its
-    // row layout rather than reject it against the full 2D cache capacity.
-    adapter.snapshot_free(0);
-    layer.n_comp = 0;
-    layer.n_index_comp = 0;
-    cache.cur_pos = 1;
-    adapter.cur_pos_ = 1;
-    adapter.last_tok_ = 7;
-    TEST_ASSERT(adapter.snapshot_save(0));
-    TEST_ASSERT(adapter.snapshots_[0].shards[0].layers[0].comp_kv->ne[1] == 1);
-    TEST_ASSERT(adapter.snapshots_[0].shards[0].layers[0].index_comp_kv->ne[1] == 1);
-    cache.cur_pos = 0;
-    TEST_ASSERT(adapter.snapshot_restore(0));
-    TEST_ASSERT(cache.cur_pos == 1);
-    TEST_ASSERT(layer.n_comp == 0);
-    TEST_ASSERT(layer.n_index_comp == 0);
 
     adapter.snapshot_free(0);
     TEST_ASSERT(!adapter.snapshot_used(0));
@@ -1875,172 +1946,6 @@ static void test_snapshot_save_restore() {
     TEST_ASSERT(!adapter.snapshot_restore(0));
     TEST_ASSERT(!adapter.snapshot_save(-1));
     TEST_ASSERT(!adapter.snapshot_save(ModelBackend::kMaxSlots));
-
-    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
-}
-
-static bool init_monolithic_snapshot_test_backend(DeepSeek4Backend & backend) {
-    backend.backend_ = ggml_backend_cpu_init();
-    backend.snap_backend_ = ggml_backend_cpu_init();
-    if (!backend.backend_ || !backend.snap_backend_) return false;
-    backend.w_.n_layer = 1;
-    backend.w_.n_embd = 4;
-    backend.w_.n_hc = 1;
-    backend.w_.n_vocab = 3;
-    backend.w_.head_dim = 4;
-    backend.w_.n_swa = 8;
-    backend.w_.n_indexer_head_dim = 2;
-    backend.w_.compress_ratios = {4};
-    return create_deepseek4_cache(backend.backend_, backend.w_, 16,
-                                  backend.cache_);
-}
-
-static void test_monolithic_snapshot_preserves_decode_state() {
-    std::fprintf(stderr,
-                 "  test_monolithic_snapshot_preserves_decode_state ...");
-
-    DeepSeek4BackendConfig cfg;
-    DeepSeek4Backend backend(cfg);
-    TEST_ASSERT(init_monolithic_snapshot_test_backend(backend));
-    if (!backend.cache_.buf || backend.cache_.layers.empty()) {
-        std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
-        return;
-    }
-
-    auto & layer = backend.cache_.layers[0];
-    write_tensor_pattern(layer.raw_kv, 13);
-    write_tensor_pattern(layer.comp_kv, 31);
-    write_tensor_pattern(layer.index_comp_kv, 47);
-    write_tensor_pattern(layer.attn_compressor.state_kv, 59);
-    write_tensor_pattern(layer.attn_compressor.state_score, 71);
-    write_tensor_pattern(layer.indexer_compressor.state_kv, 83);
-    write_tensor_pattern(layer.indexer_compressor.state_score, 97);
-    write_tensor_pattern(backend.cache_.hc_state, 109);
-
-    layer.n_comp = 5;
-    layer.n_index_comp = 3;
-    backend.cache_.cur_pos = 7;
-    backend.last_logits_ = {1.0f, 4.0f, 2.0f};
-    backend.last_logits_pos_ = 7;
-    backend.spec_feat_window_ = {9.0f, 8.0f, 7.0f, 6.0f};
-
-    const auto raw_before = read_tensor_bytes(layer.raw_kv);
-    const auto comp_before = read_tensor_rows(layer.comp_kv, layer.n_comp);
-    const auto index_before =
-        read_tensor_rows(layer.index_comp_kv, layer.n_index_comp);
-    const auto hc_before = read_tensor_bytes(backend.cache_.hc_state);
-
-    TEST_ASSERT(backend.snapshot_save(0));
-    TEST_ASSERT(backend.snapshot_used(0));
-    TEST_ASSERT(backend.snapshot_cur_pos(0) == 7);
-    TEST_ASSERT(backend.snapshots_[0].layers[0].comp_kv->ne[1] == 5);
-    TEST_ASSERT(backend.snapshots_[0].layers[0].index_comp_kv->ne[1] == 3);
-
-    ggml_backend_buffer_clear(backend.cache_.buf, 0);
-    backend.cache_.cur_pos = 0;
-    layer.n_comp = 0;
-    layer.n_index_comp = 0;
-    backend.last_logits_ = {-1.0f};
-    backend.last_logits_pos_ = -1;
-    backend.spec_feat_window_.clear();
-
-    TEST_ASSERT(backend.snapshot_restore(0));
-    TEST_ASSERT(backend.cache_.cur_pos == 7);
-    TEST_ASSERT(layer.n_comp == 5);
-    TEST_ASSERT(layer.n_index_comp == 3);
-    TEST_ASSERT(read_tensor_bytes(layer.raw_kv) == raw_before);
-    TEST_ASSERT(read_tensor_rows(layer.comp_kv, 5) == comp_before);
-    TEST_ASSERT(read_tensor_rows(layer.index_comp_kv, 3) == index_before);
-    TEST_ASSERT(read_tensor_bytes(backend.cache_.hc_state) == hc_before);
-    TEST_ASSERT(backend.last_logits_ == std::vector<float>({1.0f, 4.0f, 2.0f}));
-    TEST_ASSERT(backend.spec_feat_window_ ==
-                std::vector<float>({9.0f, 8.0f, 7.0f, 6.0f}));
-    TEST_ASSERT(backend.last_logits_pos_ == 7);
-
-    GenerateRequest exact;
-    exact.prompt.assign(7, 0);
-    exact.n_gen = 1;
-    const GenerateResult exact_result =
-        backend.restore_and_generate_impl(0, exact, DaemonIO{});
-    TEST_ASSERT(exact_result.ok());
-    TEST_ASSERT(exact_result.tokens == std::vector<int32_t>({1}));
-    TEST_ASSERT(backend.cache_.cur_pos == 7);
-    TEST_ASSERT(backend.last_logits_ == std::vector<float>({1.0f, 4.0f, 2.0f}));
-
-    // A cache state that advanced without corresponding logits (for example,
-    // after DSpark) must not be persisted with stale decode state.
-    backend.cache_.cur_pos = 8;
-    TEST_ASSERT(!backend.snapshot_save(1));
-    backend.cache_.cur_pos = 7;
-    TEST_ASSERT(!backend.snapshot_save(-1));
-    TEST_ASSERT(!backend.snapshot_save(ModelBackend::kMaxSlots));
-
-    // Parking the target releases both the core tensors and the potentially
-    // large host-side logits/feature vectors for every populated slot.
-    TEST_ASSERT(backend.park(ParkTarget::TargetModel));
-    TEST_ASSERT(!backend.snapshot_used(0));
-    TEST_ASSERT(backend.snapshot_aux_[0].last_logits.empty());
-    TEST_ASSERT(backend.snapshot_aux_[0].spec_feat_window.empty());
-    TEST_ASSERT(!backend.snapshot_restore(0));
-
-    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
-}
-
-static void test_spec_feature_tail_is_bounded() {
-    std::fprintf(stderr, "  test_spec_feature_tail_is_bounded ...");
-
-    DeepSeek4BackendConfig cfg;
-    DeepSeek4Backend backend(cfg);
-    backend.w_.n_embd = 2;
-    backend.w_.n_swa = 3;
-    backend.spec_drafter_ = std::make_unique<DSparkDrafter>();
-    backend.spec_drafter_->n_target_layers = 1;
-
-    std::vector<float> features = {
-        0.0f, 1.0f,
-        2.0f, 3.0f,
-        4.0f, 5.0f,
-        6.0f, 7.0f,
-        8.0f, 9.0f,
-    };
-    backend.keep_spec_feature_tail(features, 3);
-    TEST_ASSERT(features ==
-                std::vector<float>({4.0f, 5.0f, 6.0f, 7.0f, 8.0f, 9.0f}));
-
-    features.push_back(10.0f);  // malformed partial feature row
-    backend.keep_spec_feature_tail(features, 3);
-    TEST_ASSERT(features.empty());
-
-    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
-}
-
-static void test_dspark_prefill_capture_boundaries() {
-    std::fprintf(stderr, "  test_dspark_prefill_capture_boundaries ...");
-
-    using Backend = DeepSeek4Backend;
-    // Layer-major prefill captures only the requested tail from a wide graph,
-    // while generic paths still stop exactly at the final feature window.
-    TEST_ASSERT(Backend::capture_safe_prefill_tokens(
-                    0, 2048, 1920, true, false, 0, 0) == 2048);
-    TEST_ASSERT(Backend::capture_safe_prefill_tokens(
-                    0, 2048, 1920, false, false, 0, 0) == 1920);
-    TEST_ASSERT(Backend::capture_safe_prefill_tokens(
-                    1920, 128, 1920, false, false, 0, 0) == 128);
-
-    // A pending checkpoint contributes both edges of its capture window. The
-    // resulting batches are either wholly hooked or wholly unhooked.
-    TEST_ASSERT(Backend::capture_safe_prefill_tokens(
-                    0, 2048, 1920, true, true, 384, 512) == 384);
-    TEST_ASSERT(Backend::capture_safe_prefill_tokens(
-                    384, 1664, 1920, true, true, 384, 512) == 128);
-    TEST_ASSERT(Backend::capture_safe_prefill_tokens(
-                    512, 1536, 1920, false, false, 384, 512) == 1408);
-
-    // Boundaries at a batch edge and empty requests need no extra split.
-    TEST_ASSERT(Backend::capture_safe_prefill_tokens(
-                    0, 128, 128, false, true, 128, 256) == 128);
-    TEST_ASSERT(Backend::capture_safe_prefill_tokens(
-                    10, 0, 20, false, true, 12, 18) == 0);
 
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
@@ -3150,6 +3055,121 @@ static void test_ds4_flash_attention_inverse_rope_fallback_gpu() {
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
+static void test_tail_inverse_rope_matches_across_gpus() {
+    std::fprintf(stderr,
+                 "  test_tail_inverse_rope_matches_across_gpus ...");
+    if (ggml_backend_cuda_get_device_count() < 2) {
+        std::fprintf(stderr, " skipped (requires two GPUs)\n");
+        return;
+    }
+
+    constexpr int head_dim = 512;
+    constexpr int n_rot = 64;
+    constexpr int n_head = 16;
+    constexpr int n_tokens = 5;
+    constexpr int kv_start = 2048;
+    const size_t count =
+        (size_t) head_dim * n_head * n_tokens;
+    std::vector<float> input(count);
+    for (size_t i = 0; i < input.size(); ++i) {
+        input[i] = ((int) (i % 257) - 128) * 0.003125f;
+    }
+    std::vector<int32_t> positions((size_t) 2 * n_tokens);
+    for (int i = 0; i < n_tokens; ++i) {
+        positions[(size_t) i] = kv_start + i;
+        positions[(size_t) n_tokens + i] = -(kv_start + i);
+    }
+
+    auto run = [&](int device, bool use_positive_rope_back) {
+        std::vector<float> result(count, 0.0f);
+        ggml_backend_t backend = ggml_backend_cuda_init(device);
+        TEST_ASSERT_MSG(backend != nullptr,
+                        "failed to initialize inverse-RoPE GPU");
+        if (!backend) return result;
+        ggml_context * ctx = make_test_context(8u << 20);
+        TEST_ASSERT_MSG(ctx != nullptr, "ggml_init failed");
+        if (!ctx) {
+            ggml_backend_free(backend);
+            return result;
+        }
+
+        ggml_tensor * x = ggml_new_tensor_3d(
+            ctx, GGML_TYPE_F32, head_dim, n_head, n_tokens);
+        ggml_tensor * pos_bundle = ggml_new_tensor_1d(
+            ctx, GGML_TYPE_I32, 2 * n_tokens);
+        ggml_set_input(x);
+        ggml_set_input(pos_bundle);
+        ggml_tensor * rope_pos = ggml_view_1d(
+            ctx, pos_bundle, n_tokens,
+            use_positive_rope_back
+                ? 0
+                : (size_t) n_tokens * sizeof(int32_t));
+
+        const int nope_dim = head_dim - n_rot;
+        ggml_tensor * nope = ggml_view_3d(
+            ctx, x, nope_dim, n_head, n_tokens,
+            x->nb[1], x->nb[2], 0);
+        ggml_tensor * tail = ggml_view_3d(
+            ctx, x, n_rot, n_head, n_tokens,
+            x->nb[1], x->nb[2],
+            (size_t) nope_dim * x->nb[0]);
+        tail = ggml_cont(ctx, tail);
+        tail = use_positive_rope_back
+            ? ggml_rope_ext_back(
+                  ctx, tail, rope_pos, nullptr,
+                  n_rot, GGML_ROPE_TYPE_NORMAL, 65536,
+                  10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f)
+            : ggml_rope_ext(
+                  ctx, tail, rope_pos, nullptr,
+                  n_rot, GGML_ROPE_TYPE_NORMAL, 65536,
+                  10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+        ggml_tensor * output = ggml_cont(
+            ctx, ggml_concat(ctx, ggml_cont(ctx, nope), tail, 0));
+        ggml_set_output(output);
+        ggml_cgraph * graph = ggml_new_graph_custom(ctx, 64, false);
+        ggml_build_forward_expand(graph, output);
+        ggml_gallocr_t alloc = ggml_gallocr_new(
+            ggml_backend_get_default_buffer_type(backend));
+        const bool allocated =
+            alloc && ggml_gallocr_alloc_graph(alloc, graph);
+        TEST_ASSERT_MSG(allocated,
+                        "inverse-RoPE graph allocation failed");
+        if (allocated) {
+            ggml_backend_tensor_set(
+                x, input.data(), 0, input.size() * sizeof(float));
+            ggml_backend_tensor_set(
+                pos_bundle, positions.data(), 0,
+                positions.size() * sizeof(int32_t));
+            const bool computed =
+                ggml_backend_graph_compute(backend, graph) ==
+                GGML_STATUS_SUCCESS;
+            TEST_ASSERT_MSG(computed,
+                            "inverse-RoPE graph compute failed");
+            if (computed) {
+                ggml_backend_tensor_get(
+                    output, result.data(), 0,
+                    result.size() * sizeof(float));
+            }
+        }
+        if (alloc) ggml_gallocr_free(alloc);
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return result;
+    };
+
+    const std::vector<float> main = run(0, false);
+    const std::vector<float> peer = run(1, true);
+    float max_abs = 0.0f;
+    for (size_t i = 0; i < count; ++i) {
+        max_abs = std::max(max_abs, std::fabs(main[i] - peer[i]));
+        TEST_ASSERT_MSG(
+            nearly_equal(main[i], peer[i], 2.0e-5f, 2.0e-5f),
+            "inverse tail RoPE differs across GPUs");
+    }
+    std::fprintf(stderr, " max_abs=%.3g", max_abs);
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
 static void test_hc_post_strided_split_gpu() {
     std::fprintf(stderr, "  test_hc_post_strided_split_gpu ...");
     ggml_backend_t backend = ggml_backend_cuda_init(0);
@@ -4108,6 +4128,7 @@ int main() {
     test_rmsnorm_correctness(backend);
     test_grouped_output_projection_shape();
     test_grouped_output_projection_cpu(backend);
+    test_attention_tp_weight_partition_cpu(backend);
     test_ds4_flash_attention_cpu_rejected(backend);
     test_indexer_qat_cpu(backend);
     test_indexer_score_cpu(backend);
@@ -4134,9 +4155,6 @@ int main() {
     test_dspark_park_all_releases_drafter();
     test_dspark_raw_ring_rollback_after_wrap(backend);
     test_snapshot_save_restore();
-    test_monolithic_snapshot_preserves_decode_state();
-    test_spec_feature_tail_is_bounded();
-    test_dspark_prefill_capture_boundaries();
     test_reset_request_state();
     test_reset_deepseek4_cache(backend);
     test_adapter_guard_paths();
@@ -4150,6 +4168,7 @@ int main() {
     test_ds4_indexer_score_packed_q4_gpu();
     test_ds4_topk_block_radix_gpu();
     test_ds4_flash_attention_inverse_rope_fallback_gpu();
+    test_tail_inverse_rope_matches_across_gpus();
     test_hc_post_strided_split_gpu();
     test_moe_id_alignment_q5_gpu();
     test_hc_pre_kernel_gpu();

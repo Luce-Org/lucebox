@@ -5,6 +5,10 @@ DFlash. DeepSeek4 supports a monolithic HIP backend, a layer-split backend,
 and an in-process heterogeneous expert-parallel backend for a discrete GPU
 paired with Strix Halo.
 
+The qualified q=5 attention-head split for that heterogeneous pair, including
+the exact benchmark recipe and rejected variants, is documented in
+[DS4_HETEROGENEOUS_ATTENTION_TP.md](DS4_HETEROGENEOUS_ATTENTION_TP.md).
+
 ## Model Architecture
 
 DeepSeek V4 Flash is a 43-layer MoE model with:
@@ -124,56 +128,6 @@ decode and 415.52 tok/s median sparse prefill. Those numbers require the full
 qualified manifest, including the burn-in kernel switches; they are not a
 claim for the minimal activation example above.
 
-#### CUDA 3090 + Strix Halo in one process
-
-The mixed-vendor build links the selected target runtime normally and loads
-the other vendor as an isolated backend module. CUDA and HIP device indices
-have separate namespaces, so `cuda:0` and `hip:0` are a valid pair.
-Cross-vendor activations are staged in host memory inside the process; native
-peer access is intentionally not attempted.
-
-```bash
-cmake -S server -B server/build-cuda-hip \
-  -DDFLASH27B_GPU_BACKEND=hip \
-  -DDFLASH27B_ENABLE_MIXED_CUDA_HIP=ON \
-  -DDFLASH27B_CUDA_ARCHITECTURES=86 \
-  -DDFLASH27B_HIP_ARCHITECTURES=gfx1151 \
-  -DCMAKE_BUILD_TYPE=Release
-cmake --build server/build-cuda-hip -j
-ctest --test-dir server/build-cuda-hip -R mixed_cuda_hip --output-on-failure
-```
-
-```bash
-export DFLASH_DS4_MOE_TP=1
-export DFLASH_DS4_MOE_TP_INPROC=1
-export DFLASH_DS4_MOE_TP_BACKEND=cuda
-export DFLASH_DS4_MOE_TP_GPU=0       # cuda:0 (RTX 3090)
-export DFLASH_DS4_MOE_TP_CONCENTRATE_COLD=1
-export DFLASH_DS4_TP_SCHEDULE_BRANCHES=1
-export DFLASH_DS4_TP_TARGETED_JOIN_SPLIT=1
-export GGML_BATCH_PEER_COPIES=1
-# Start conservatively and tune from the startup placement and memory logs;
-# the usable budget depends on the model, placement policy, and free VRAM.
-export DFLASH_EXPERT_BUDGET_MB=85000
-export DFLASH_DS4_DRAFT=/path/to/dspark-draft.gguf
-export DFLASH_DS4_DRAFT_BACKEND=cuda
-export DFLASH_DS4_DRAFT_GPU=0
-
-./server/build-cuda-hip/dflash_server /path/to/deepseek4-target.gguf \
-  --target-device hip:0 \
-  --ds4-expert-top-k 4 \
-  --ds4-prefill sparse
-```
-
-The peer module is normally found beside the executable. Set
-`DFLASH_CUDA_BACKEND_PATH` or `DFLASH_HIP_BACKEND_PATH` only when packaging it
-elsewhere. Sparse/approximate DeepSeek4 prefill remains restricted to a HIP
-target; CUDA-primary ROCmFP2 execution is not yet qualified. The mixed path is
-burn-in functionality. On the qualified 3090 + Strix machine, the tuned top-4
-performance profile held 48.1 tok/s median on the deterministic 128-token
-workload. The all-6-expert reference-exact mode is a correctness profile, not
-a throughput profile.
-
 ### Local single-shard
 
 If the adapter decides all 43 layers fit on one CUDA GPU, it loads a single shard locally and no IPC daemon is involved.
@@ -232,30 +186,18 @@ The runtime logs the chosen split with a `[deepseek4-split] auto-split:` banner.
 | `DFLASH_DS4_CUDA_LAYERS` | Override the auto-split heuristic and pin the first `N` DeepSeek4 layers to CUDA. The remaining `43 - N` layers run on the Halo shard. |
 | `DFLASH_DS4_TIMING` | Enable DS4 timing logs for the layer-split parent and target-shard daemon. Useful for profiling prefill/decode breakdowns; leave unset for normal runs. |
 | `DFLASH_DS4_SPEC` / `DFLASH_DS4_DRAFT` | Enable DSpark and select its GGUF. |
-| `DFLASH_DS4_DRAFT_BACKEND` / `DFLASH_DS4_DRAFT_GPU` | Backend and device for the in-process drafter. |
+| `DFLASH_DS4_DRAFT_GPU` | HIP device for the in-process drafter. |
 | `DFLASH_DS4_MOE_TP` | Enable routed-expert partitioning. |
-| `DFLASH_DS4_MOE_TP_INPROC` | Use two local GPU backends instead of an expert IPC worker. |
-| `DFLASH_DS4_MOE_TP_BACKEND` | Cold expert backend (`cuda` or `hip`); mixed builds default to the peer runtime. |
-| `DFLASH_DS4_MOE_TP_GPU` | Device index within the cold expert backend. |
-| `DFLASH_DS4_MOE_TP_CONCENTRATE_COLD` | Cross-vendor burn-in mode: place complete cold expert layers on the peer to reduce joins. |
-| `DFLASH_DS4_MOE_TP_PEER_HOT` | With a routing profile, place its hottest experts on the secondary owner. |
-| `DFLASH_DS4_CROSS_VENDOR_OWNER_SUMS` | Reduce each owner's routed outputs locally before the final cross-vendor add. This changes floating-point association and is not the byte-identity mode. |
-| `DFLASH_DS4_TP_SCHEDULE_BRANCHES` | Submit the two owner branches independently through the mixed scheduler. |
-| `DFLASH_DS4_TP_TARGETED_JOIN_SPLIT` | Gather the peer result at the join without an extra peer fence per layer. |
-| `DFLASH_DS4_COMP_PAD_STRIDE` | Exact compressed-KV padding bucket; wider buckets trade small masked work for fewer verifier graph captures. |
-| `DFLASH_DS4_DISABLE_GROUPED_OUTPUT_PROJECTION` | Diagnostic fallback for runtimes that cannot preserve grouped projection metadata across a scheduler copy. |
-| `DFLASH_CUDA_BACKEND_PATH` / `DFLASH_HIP_BACKEND_PATH` | Optional explicit peer backend module path. |
+| `DFLASH_DS4_MOE_TP_INPROC` | Use two local HIP backends instead of an expert IPC worker. |
+| `DFLASH_DS4_MOE_TP_GPU` | HIP device that owns the cold expert stack. |
 | `DFLASH_EXPERT_BUDGET_MB` | Main-GPU memory budget for hot experts. |
 | `DFLASH_DS4_HOTNESS_CSV` | Optional per-layer routing profile for hot placement. |
-| `GGML_BATCH_PEER_COPIES` | Batch peer-runtime copies and unlike-runtime pinned-host staging with one source wait per split. The old `GGML_CUDA_BATCH_PEER_COPIES` spelling remains an alias. |
-| `DFLASH_DS4_TP_CRITICAL_PATH_PLACEMENT` | Use the routing profile and measured owner-rate ratio to minimize the predicted two-owner MoE critical path instead of maximizing aggregate hot-hit rate. Requires `DFLASH_DS4_HOTNESS_CSV`. |
-| `DFLASH_DS4_TP_MAIN_TO_PEER_RATE` | Relative main/peer routed-expert rate used by critical-path placement. It must be finite and greater than zero; the default is `3.4`. |
-| `DFLASH_DS4_TP_BALANCE_MIN_HOT` | Minimum hot experts retained on every routed layer by critical-path placement. Defaults to `0`. |
 | `DFLASH_DS4_Q5_VERIFY` | Opt in to the AMD q=5 fused verifier. This also selects the qualified MMVQ width and verifier-cache defaults when they are not explicitly overridden. |
 | `DFLASH_CUDA_MMVQ_FP4_Q5_X4_PLUS1` | Select the q=5 ROCmFP4 dense verifier kernel that reuses the existing x4 dot product for columns 0-3 and the exact scalar path for column 4. Defaults to `1` for q=5 on `gfx1201`; set `0` to force the generic five-column kernel. |
 | `DFLASH_DS4_TP_FUSED_CACHE_SLOTS` | Number of heterogeneous verifier graph slots. Defaults to `2` for q<=4 and `9` for the opt-in q=5 verifier; each slot retains scheduler scratch on both GPUs. |
 | `DFLASH_DS4_VERIFY_FORCE_GRAPH_REPLAY` | Skip the expensive property scan only for a warmed verifier graph. Rebuilt scheduler generations are always validated. Leave unset for the conservative production profile. |
 | `GGML_DS4_FA_SERIAL_INDEX_SCAN` | Restore the serial compressed-row mask scan for an indexed-attention A/B. By default, HIP scans contexts above 512 compressed rows in parallel. |
+| `GGML_CUDA_BATCH_PEER_COPIES` | Batch ordered peer copies behind one dependency. |
 | `DFLASH_MOE_PREFILL_PERSISTENT_OWNER_ALLOC` | Long-prefill arena kill switch; set `0` to restore per-layer owner allocation. |
 
 `DFLASH_DS4_TIMING` enables the existing timing banners:
@@ -316,13 +258,11 @@ whole-model GPU graph uses stable padded reduction shapes, so near-tied greedy
 logits can select a different token than the normal causal verifier even at
 temperature 0. Leave it unset when comparing against the normal verifier, or
 set `DFLASH_DS4_SEQ_VERIFY=1` for the slower token-at-a-time verification
-diagnostic. `DFLASH_DS4_SPEC_REFERENCE_EXACT=1` combines sequential target
-verification with full rollback snapshots for byte-identity checks. Neither
-fused verification nor the separate
+diagnostic. Neither fused verification nor the separate
 `--ds4-expert-top-k 4` approximation should be presented as byte-identical AR.
 
 DSpark can verify against in-process heterogeneous expert placement. The
-drafter remains local to its selected GPU backend; a failed draft load is
+drafter remains local to its selected HIP backend; a failed draft load is
 reported and falls back to normal autoregressive decode. The target cache and
 sampler stay on the main backend while routed target experts execute on their
 configured owners. `--ds4-expert-top-k 4` remains a separate approximate
@@ -353,50 +293,24 @@ the shape that crosses two ratio-4 compressor boundaries, preserves five raw
 SWA rows for rollback, and restores plus replays only the accepted prefix after
 a partial rejection. q<=4 behavior is unchanged when the flag is absent.
 
-The heterogeneous verifier keeps all five lanes in one
-`[n_embd * n_hc, q]` tensor. Attention HC-pre, attention HC-post, FFN HC-pre,
-FFN HC-post, drafter-feature capture, and output HC merge are batched across
-the verifier width. This removes the former per-lane HC controller paths and
-progressive concatenations without changing the verifier result. The split
-HC-post kernel also accepts a token dimension and joins the two owner outputs
-inside that batched kernel.
-
-Critical-path placement models each routed layer as two concurrent branches:
-the main branch includes its fixed shared-expert work and hot routed work,
-while the peer branch executes the remaining routed work. The allocator adds
-the next profiled expert only when its marginal reduction in
-`max(main / main_to_peer_rate, peer)` is positive. The expert memory budget is
-therefore an upper bound; leaving part of it unused is valid when another hot
-expert would lengthen the predicted fork.
-
-On the qualified R9700 + Strix Halo profile, leaving the related q=5 controls
+On the qualified R9700 + Strix Halo profile, leaving the related controls
 unset selects `LUCE_MMVQ_MAX_NCOLS=5`, nine heterogeneous verifier slots, and
 the ROCmFP4 x4+1 dense kernel on `gfx1201`.
 The wider MMVQ ceiling avoids the slow small-matrix crossover, while nine slots
 hold the recurring compressor phases without steady graph rebuilds. The x4+1
 kernel decodes shared weights through the existing four-column vector path and
 retains the original scalar accumulation for the fifth verifier column.
-Explicit environment values still take priority.
-
-Sparse heterogeneous prefill uses a reusable graph allocator with preferred
-128 MiB backing chunks. This avoids depending on one large contiguous HIP
-allocation on devices without virtual-memory-backed buffers. Individual
-tensors remain unsplit and may exceed the preferred chunk size. Prompts ending
-above 4K use a 1K-token prefill shape, and that cap remains sticky for later
-requests in the process so a post-16K request cannot force a fragmented
-1K-to-2K arena replacement. Reproducible decode graph caches are retired before
-a necessary prefill-arena growth; persistent HC mirrors remain resident.
+Explicit environment values still take priority. The hot-36 full sweep peaked
+at 30.561 GiB on the reported 31.86 GiB R9700 and must be requalified on
+smaller devices.
 
 The exact qualification launch used:
 
 ```bash
 export DFLASH_DS4_Q5_VERIFY=1
 export DFLASH_DS4_SPEC_Q=5
-export DFLASH_EXPERT_BUDGET_MB=14350
+export DFLASH_EXPERT_BUDGET_MB=13200 # 36 hot experts/layer on this profile
 export DFLASH_DS4_HOTNESS_CSV=/path/to/ds4_moe_tp_hotness.csv
-export DFLASH_DS4_TP_CRITICAL_PATH_PLACEMENT=1
-export DFLASH_DS4_TP_MAIN_TO_PEER_RATE=4.4
-export DFLASH_DS4_TP_BALANCE_MIN_HOT=0
 ```
 
 The checked-in wrapper reproduces the full exact-context protocol and records
@@ -407,10 +321,6 @@ trace:
 TARGET_MODEL=/path/to/target.gguf \
 DRAFT_MODEL=/path/to/dspark-draft.gguf \
 HOTNESS_CSV=/path/to/ds4_moe_tp_hotness.csv \
-CRITICAL_PATH_PLACEMENT=1 \
-MAIN_TO_PEER_RATE=4.4 \
-BALANCE_MIN_HOT=0 \
-EXPERT_BUDGET_MB=14350 \
 server/scripts/qualify_ds4_q5_amd.sh
 ```
 
@@ -421,44 +331,10 @@ compatible artifact.
 
 At temperature zero, all 25 requests in the 2K -> 4K -> 8K -> 16K -> 2K
 burn-in produced the same expected response hash. With the automatic q=5
-MMVQ/cache/kernel defaults and the critical-path profile above, measured client
-decode medians were 75.818, 74.530, 69.898, 62.685, and 76.703 tok/s. The final
-2K measurements after repeated 16K prefill were 76.685-76.727 tok/s, confirming
-that the bounded sticky arena recovers steady decode rather than merely
-surviving the request. The placement retained 1,688 profiled hot experts, 23-63
-per layer, and the full sweep peaked at 31.089 GiB on the reported 31.86 GiB
-main GPU. Treat these as workload-specific burn-in measurements, not as a
-portable default for unrelated memory layouts.
-
-For an overlap trace, run the same wrapper with the delayed profiler launcher:
-
-```bash
-SERVER_BIN=server/scripts/rocprof_server_wrapper.sh \
-PROFILED_SERVER_BIN=/path/to/dflash_server \
-ROCPROF_OUTPUT_DIR=/path/to/trace-output \
-ROCPROF_START_SECONDS=180 \
-ROCPROF_DURATION_SECONDS=90 \
-server/scripts/qualify_ds4_q5_amd.sh
-
-server/scripts/analyze_rocprof_overlap.py \
-  /path/to/trace-output/trace_kernel_trace.csv
-```
-
-The analyzer reports per-owner busy time, simultaneous kernel-busy time,
-time-binned overlap, and the kernels dominating each owner. Use a steady decode
-window rather than model load or prefill when comparing placement changes.
-
-In the post-batching trace, steady 2K decode windows placed only 16-22% of
-either owner's kernel-busy time inside a simultaneously busy interval. The
-unprofiled server timing attributed 63.7 ms of each 74.4 ms speculative step to
-target verification; draft, head, snapshot, and apply work together accounted
-for the remaining 10.7 ms. Changing the placement rate from 4.4 to 3.8 at the
-same 14,350 MiB budget moved 116 experts to the peer but changed the measured
-2K median by less than 0.1 tok/s. These measurements show that placement is
-already near its local balance point. Further large gains require removing
-split/copy dispatches or parallelizing work outside the routed-expert fork;
-adding the two devices' headline bandwidths is not a valid throughput model
-because attention, routing, HC boundaries, and every layer join remain ordered.
+MMVQ/cache/kernel defaults and the explicit hot-36 hardware profile, measured
+medians were 67.957, 65.927, 62.544, 56.335, and 67.458 tok/s. Treat these as
+workload-specific burn-in measurements, not as a portable default for unrelated
+AMD memory layouts.
 
 On HIP `gfx1151`, enabling DSpark defaults `LUCE_MMVQ_MAX_NCOLS` to `4` when
 the variable is unset. This keeps the four-row verifier on MMVQ. On a 128 GiB

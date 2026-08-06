@@ -1063,14 +1063,203 @@ bool build_deepseek4_moe_hybrid_storage_from_file(
         path, backend, w, placement, nullptr, out, err);
 }
 
+bool init_deepseek4_attention_tp(
+        DeepSeek4Weights & w,
+        ggml_backend_t peer_backend,
+        int peer_groups,
+        std::string * err) {
+    auto fail = [err](const std::string & message) {
+        if (err) *err = message;
+        return false;
+    };
+    if (!peer_backend) return fail("attention TP peer backend is null");
+    if (w.attention_tp_ctx || w.attention_tp_buf ||
+        !w.attention_tp_layers.empty()) {
+        return fail("attention TP is already initialized");
+    }
+    if (w.n_out_group <= 1 || peer_groups <= 0 ||
+        peer_groups >= w.n_out_group) {
+        return fail("attention TP peer groups must leave at least one group "
+                    "on each owner");
+    }
+    if (w.n_head <= 0 || w.n_head % w.n_out_group != 0 ||
+        w.head_dim <= 0 || w.n_lora_q <= 0 || w.n_lora_o <= 0 ||
+        w.n_embd <= 0 || (int) w.layers.size() != w.n_layer) {
+        return fail("attention TP model dimensions are inconsistent");
+    }
+
+    const int main_groups = w.n_out_group - peer_groups;
+    const int heads_per_group = w.n_head / w.n_out_group;
+    const int64_t main_heads = (int64_t) main_groups * heads_per_group;
+    const int64_t peer_heads = (int64_t) peer_groups * heads_per_group;
+    const int64_t group_dim = (int64_t) w.head_dim * heads_per_group;
+    const int64_t main_head_dim = main_heads * w.head_dim;
+    const int64_t peer_head_dim = peer_heads * w.head_dim;
+    const int64_t main_lora = (int64_t) main_groups * w.n_lora_o;
+    const int64_t peer_lora = (int64_t) peer_groups * w.n_lora_o;
+
+    for (int il = 0; il < w.n_layer; ++il) {
+        const DeepSeek4Layer & layer = w.layers[(size_t) il];
+        const ggml_tensor * q = layer.attn_q_b;
+        const ggml_tensor * a = layer.attn_output_a;
+        const ggml_tensor * b = layer.attn_output_b;
+        if (!q || !a || !b ||
+            q->ne[0] != w.n_lora_q ||
+            q->ne[1] != (int64_t) w.n_head * w.head_dim ||
+            a->ne[0] != group_dim ||
+            a->ne[1] != (int64_t) w.n_lora_o * w.n_out_group ||
+            b->ne[0] != (int64_t) w.n_lora_o * w.n_out_group ||
+            b->ne[1] != w.n_embd) {
+            return fail("unexpected attention TP tensor shape at layer " +
+                        std::to_string(il));
+        }
+        if (layer.attn_sinks &&
+            ggml_nelements(layer.attn_sinks) != w.n_head) {
+            return fail("unexpected attention sink shape at layer " +
+                        std::to_string(il));
+        }
+        if (!ggml_is_contiguous(q) || !ggml_is_contiguous(a) ||
+            !ggml_is_contiguous(b) ||
+            w.n_lora_q % ggml_blck_size(q->type) != 0 ||
+            group_dim % ggml_blck_size(a->type) != 0 ||
+            peer_lora % ggml_blck_size(b->type) != 0 ||
+            main_lora % ggml_blck_size(b->type) != 0) {
+            return fail("unsupported attention TP tensor layout at layer " +
+                        std::to_string(il));
+        }
+    }
+
+    ggml_init_params params{};
+    params.mem_size = ggml_tensor_overhead() *
+                      (size_t) (4 * w.n_layer + 8) + 4096;
+    params.no_alloc = true;
+    ggml_context * peer_ctx = ggml_init(params);
+    if (!peer_ctx) {
+        return fail("failed to allocate attention TP metadata");
+    }
+
+    std::vector<DeepSeek4AttentionTpLayer> peer_layers((size_t) w.n_layer);
+    for (int il = 0; il < w.n_layer; ++il) {
+        const DeepSeek4Layer & source = w.layers[(size_t) il];
+        DeepSeek4AttentionTpLayer & destination = peer_layers[(size_t) il];
+        destination.attn_q_b = ggml_new_tensor_2d(
+            peer_ctx, source.attn_q_b->type, w.n_lora_q, peer_head_dim);
+        if (source.attn_sinks) {
+            destination.attn_sinks = ggml_new_tensor_1d(
+                peer_ctx, source.attn_sinks->type, peer_heads);
+        }
+        destination.attn_output_a = ggml_new_tensor_2d(
+            peer_ctx, source.attn_output_a->type, group_dim, peer_lora);
+        destination.attn_output_b = ggml_new_tensor_2d(
+            peer_ctx, source.attn_output_b->type, peer_lora, w.n_embd);
+        ggml_format_name(destination.attn_q_b,
+                         "blk.%d.attn_q_b.peer", il);
+        if (destination.attn_sinks) {
+            ggml_format_name(destination.attn_sinks,
+                             "blk.%d.attn_sinks.peer", il);
+        }
+        ggml_format_name(destination.attn_output_a,
+                         "blk.%d.attn_output_a.peer", il);
+        ggml_format_name(destination.attn_output_b,
+                         "blk.%d.attn_output_b.peer", il);
+    }
+
+    ggml_backend_buffer_t peer_buf =
+        ggml_backend_alloc_ctx_tensors(peer_ctx, peer_backend);
+    if (!peer_buf) {
+        ggml_free(peer_ctx);
+        return fail("failed to allocate attention TP peer weights");
+    }
+    ggml_backend_buffer_set_usage(peer_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    std::vector<uint8_t> staging;
+    for (int il = 0; il < w.n_layer; ++il) {
+        const DeepSeek4Layer & source = w.layers[(size_t) il];
+        const DeepSeek4AttentionTpLayer & destination =
+            peer_layers[(size_t) il];
+
+        size_t bytes = ggml_nbytes(destination.attn_q_b);
+        staging.resize(bytes);
+        ggml_backend_tensor_get(
+            source.attn_q_b, staging.data(),
+            (size_t) main_head_dim * source.attn_q_b->nb[1], bytes);
+        ggml_backend_tensor_set(destination.attn_q_b, staging.data(), 0, bytes);
+
+        if (source.attn_sinks) {
+            bytes = ggml_nbytes(destination.attn_sinks);
+            staging.resize(bytes);
+            ggml_backend_tensor_get(
+                source.attn_sinks, staging.data(),
+                (size_t) main_heads * source.attn_sinks->nb[0], bytes);
+            ggml_backend_tensor_set(
+                destination.attn_sinks, staging.data(), 0, bytes);
+        }
+
+        bytes = ggml_nbytes(destination.attn_output_a);
+        staging.resize(bytes);
+        ggml_backend_tensor_get(
+            source.attn_output_a, staging.data(),
+            (size_t) main_lora * source.attn_output_a->nb[1], bytes);
+        ggml_backend_tensor_set(
+            destination.attn_output_a, staging.data(), 0, bytes);
+
+        const size_t main_row_bytes =
+            ggml_row_size(source.attn_output_b->type, main_lora);
+        const size_t peer_row_bytes =
+            ggml_row_size(source.attn_output_b->type, peer_lora);
+        bytes = ggml_nbytes(destination.attn_output_b);
+        if (main_row_bytes + peer_row_bytes > source.attn_output_b->nb[1] ||
+            peer_row_bytes != destination.attn_output_b->nb[1]) {
+            ggml_backend_buffer_free(peer_buf);
+            ggml_free(peer_ctx);
+            return fail("attention TP row packing mismatch at layer " +
+                        std::to_string(il));
+        }
+        staging.resize(bytes);
+        ggml_backend_tensor_get_2d(
+            source.attn_output_b, staging.data(), main_row_bytes,
+            peer_row_bytes, (size_t) w.n_embd,
+            source.attn_output_b->nb[1],
+            destination.attn_output_b->nb[1]);
+        ggml_backend_tensor_set(
+            destination.attn_output_b, staging.data(), 0, bytes);
+    }
+
+    w.attention_tp_ctx = peer_ctx;
+    w.attention_tp_buf = peer_buf;
+    w.attention_tp_backend = peer_backend;
+    w.attention_tp_layers = std::move(peer_layers);
+    w.attention_tp_main_groups = main_groups;
+    w.attention_tp_peer_groups = peer_groups;
+    std::fprintf(stderr,
+                 "[deepseek4-attention-tp] groups=%d+%d heads=%lld+%lld "
+                 "peer_weights=%.1f MiB\n",
+                 main_groups, peer_groups,
+                 (long long) main_heads, (long long) peer_heads,
+                 ggml_backend_buffer_get_size(peer_buf) / 1024.0 / 1024.0);
+    return true;
+}
+
 void free_deepseek4_weights(DeepSeek4Weights & w) {
     deepseek4_release_runtime_graphs(w);
-    if (w.ctx) { ggml_free(w.ctx); w.ctx = nullptr; }
+    if (w.attention_tp_buf) {
+        ggml_backend_buffer_free(w.attention_tp_buf);
+        w.attention_tp_buf = nullptr;
+    }
+    if (w.attention_tp_ctx) {
+        ggml_free(w.attention_tp_ctx);
+        w.attention_tp_ctx = nullptr;
+    }
+    w.attention_tp_backend = nullptr;
+    w.attention_tp_layers.clear();
+    w.attention_tp_main_groups = 0;
+    w.attention_tp_peer_groups = 0;
     if (w.dense_split_buf) {
         ggml_backend_buffer_free(w.dense_split_buf);
         w.dense_split_buf = nullptr;
     }
     if (w.buf) { ggml_backend_buffer_free(w.buf); w.buf = nullptr; }
+    if (w.ctx) { ggml_free(w.ctx); w.ctx = nullptr; }
     w.layers.clear();
     w.embedder.tok_embd_owned.clear();
     w.embedder.tok_embd_bytes = nullptr;
