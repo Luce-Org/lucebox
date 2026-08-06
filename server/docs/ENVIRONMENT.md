@@ -98,6 +98,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_DS4_DRAFT_BACKEND` - deepseek4_backend.cpp
 - `DFLASH_DS4_DRAFT_GPU` - deepseek4_backend.cpp
 - `DFLASH_DS4_DSPARK_DEBUG` - deepseek4_graph.cpp
+- `DFLASH_DS4_EXACT_PREFILL_BANDS` - deepseek4_backend.cpp
 - `DFLASH_DS4_FUSED_VERIFY` - deepseek4_dspark_spec.cpp, deepseek4_loader.cpp
 - `DFLASH_DS4_HOTNESS_CSV` - deepseek4_backend.cpp
 - `DFLASH_DS4_MOE_TP` - deepseek4_backend.cpp

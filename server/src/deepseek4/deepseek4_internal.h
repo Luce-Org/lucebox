@@ -352,6 +352,16 @@ int deepseek4_safe_compressor_batch_tokens(const DeepSeek4Weights & w,
                                            int kv_start,
                                            int n_tokens);
 
+int deepseek4_prefill_chunk_tokens(PrefillAttentionMode mode,
+                                   bool exact_bands_enabled,
+                                   bool batch_supported,
+                                   int requested_chunk,
+                                   int layer_major_cap);
+
+bool deepseek4_prefill_chunk_needs_logits(bool is_final_chunk,
+                                          bool ends_at_snapshot,
+                                          bool capture_requires_logits);
+
 // Forward: single step (prefill chunk or decode token).
 // embed: [n_embd, n_tokens] input embeddings (post-embedding lookup).
 // hc_state: [n_hc * n_embd] persistent HC residual (updated in-place).
@@ -389,6 +399,9 @@ struct Ds4VerifyHooks {
     std::vector<float> *     all_logits_out = nullptr;      // [n_vocab * n_tokens]
     std::vector<int32_t> *   argmax_out = nullptr;          // [n_tokens], optional GPU result
     bool                     prefer_argmax_only = false;     // skip logits D2H when available
+    // Prefill uses the capture fields too, but must never enter the
+    // intentionally approximate fused-verification path.
+    bool                     allow_fused_verify = true;
 };
 
 bool deepseek4_step_layer_range(

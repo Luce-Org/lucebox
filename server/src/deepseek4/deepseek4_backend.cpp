@@ -559,6 +559,32 @@ static MoeLayerDesc make_ds4_expert_layer_desc(const DeepSeek4Layer & layer) {
 
 }  // namespace
 
+int deepseek4_prefill_chunk_tokens(PrefillAttentionMode mode,
+                                   bool exact_bands_enabled,
+                                   bool batch_supported,
+                                   int requested_chunk,
+                                   int layer_major_cap) {
+    if (!batch_supported || requested_chunk <= 1 || layer_major_cap <= 1) {
+        return 1;
+    }
+
+    const int bounded_chunk = std::max(
+        1, std::min(requested_chunk, layer_major_cap));
+    if (mode == PrefillAttentionMode::Exact) {
+        constexpr int kMaxExactBandTokens = 4;
+        return exact_bands_enabled
+            ? std::min(bounded_chunk, kMaxExactBandTokens)
+            : 1;
+    }
+    return prefill_attention_mode_is_approximate(mode) ? bounded_chunk : 1;
+}
+
+bool deepseek4_prefill_chunk_needs_logits(bool is_final_chunk,
+                                          bool ends_at_snapshot,
+                                          bool capture_requires_logits) {
+    return is_final_chunk || ends_at_snapshot || capture_requires_logits;
+}
+
 DeepSeek4Backend::DeepSeek4Backend(const DeepSeek4BackendConfig & cfg)
     : cfg_(cfg) {}
 
@@ -1316,25 +1342,26 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
     // that snapshot plus the current ubatch, and commits only the final SWA
     // tail. Learned compressor boundaries are emitted inside the same graph.
     //
-    // Mixed hot/cold hybrid execution still has single-token HC semantics, so
-    // retain the reference path there.  --chunk 1 is the explicit fallback.
+    // Mixed hot/cold hybrid execution without the layer-range runtime still
+    // has single-token HC semantics. --chunk 1 is the explicit fallback for
+    // every path.
     const int requested_chunk = cfg_.chunk > 0 ? cfg_.chunk : w_.n_swa;
     const int n_total = (int)tokens.size();
     // Bound the layer-major graph to the topology validated by the prefill
     // kernels. Smaller tail chunks use the same scheduler or its reference
     // fallback.
     const int layer_major_cap = DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS;
-    // Only sparse prefill has a qualified batched mixed-owner HC path. Dense
-    // hybrid execution remains tokenwise; batching it would skip per-token HC
-    // post-mixing and corrupt the hidden state.
-    const bool hybrid_batch_supported =
-        !moe_hybrid_ || cfg_.prefill_mode == PrefillAttentionMode::Sparse;
-    const int chunk =
-        !prefill_attention_mode_is_approximate(cfg_.prefill_mode) ||
-        !hybrid_batch_supported
-        ? 1
-        : std::max(1, std::min(requested_chunk,
-                               layer_major_cap));
+    const bool layer_range_hybrid =
+        moe_hybrid_ && (expert_runtime_.compute || expert_backend_);
+    const bool batch_supported =
+        !moe_hybrid_ ||
+        cfg_.prefill_mode == PrefillAttentionMode::Sparse ||
+        (cfg_.prefill_mode == PrefillAttentionMode::Exact &&
+         layer_range_hybrid);
+    const int chunk = deepseek4_prefill_chunk_tokens(
+        cfg_.prefill_mode,
+        env_flag_enabled("DFLASH_DS4_EXACT_PREFILL_BANDS"),
+        batch_supported, requested_chunk, layer_major_cap);
     int pos = kv_offset;
     const bool save_snapshot =
         snap_slot >= 0 && snap_slot < PREFIX_SLOTS &&
@@ -1421,18 +1448,30 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         DeepSeek4StepTelemetry step_tel;
         if (timing) step_tel.embed_us = elapsed_us(embed_t0, Clock::now());
 
+        const bool capture_final = i + n_tok > spec_final_from;
+        const bool capture_snapshot =
+            !snapshot_saved && i < spec_snap_to &&
+            i + n_tok > spec_snap_from;
+        const bool capture_requested =
+            spec_enabled_ && spec_drafter_ &&
+            (capture_final || capture_snapshot);
+        // The current q=1 hybrid capture path shares the native fused graph,
+        // whose contract includes a logits sink. Preserve that graph until a
+        // capture-only variant is independently qualified.
+        const bool capture_requires_logits = capture_requested && n_tok == 1;
+        const bool ends_at_snapshot =
+            save_snapshot && !snapshot_saved && pos + n_tok == snap_pos;
+        const bool need_logits = deepseek4_prefill_chunk_needs_logits(
+            i + n_tok == n_total, ends_at_snapshot,
+            capture_requires_logits);
         std::vector<float> logits;
+        std::vector<float> * logits_out = need_logits ? &logits : nullptr;
         bool ok = false;
         std::vector<float> hc_state;
         Ds4VerifyHooks spec_hooks;
         std::vector<float> spec_cap;
         Ds4VerifyHooks * hp = nullptr;
-        const bool capture_final = i + n_tok > spec_final_from;
-        const bool capture_snapshot =
-            !snapshot_saved && i < spec_snap_to &&
-            i + n_tok > spec_snap_from;
-        if (spec_enabled_ && spec_drafter_ &&
-            (capture_final || capture_snapshot)) {
+        if (capture_requested) {
             spec_hooks.capture_layer_ids = &spec_drafter_->capture_layer_ids;
             spec_hooks.capture_out = &spec_cap;
             int capture_begin = n_tok;
@@ -1450,13 +1489,14 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
             }
             spec_hooks.capture_token_begin = capture_begin;
             spec_hooks.capture_token_end = capture_end;
+            spec_hooks.allow_fused_verify = false;
             hp = &spec_hooks;
         }
         if (moe_hybrid_ && (expert_runtime_.compute || expert_backend_)) {
             ok = deepseek4_step_layer_range(
                 backend_, cfg_.device.gpu, w_, cache_, hc_state,
                 embed.data(), n_tok, pos,
-                0, w_.n_layer, &logits,
+                0, w_.n_layer, logits_out,
                 tokens.data() + i,
                 timing ? &step_tel : nullptr,
                 /*allow_decode_graph_reuse=*/true, hp,
@@ -1472,12 +1512,11 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                                 hp,
                                 expert_runtime_.compute ? &expert_runtime_ : nullptr);
         } else {
-            ok = deepseek4_step_layer_range(backend_, cfg_.device.gpu, w_, cache_, hc_state,
-                                            embed.data(), n_tok, pos,
-                                            0, w_.n_layer, &logits,
-                                            tokens.data() + i,
-                                            timing ? &step_tel : nullptr,
-                                            cfg_.prefill_mode != PrefillAttentionMode::Sparse, hp);
+            ok = deepseek4_step_layer_range(
+                backend_, cfg_.device.gpu, w_, cache_, hc_state,
+                embed.data(), n_tok, pos, 0, w_.n_layer, logits_out,
+                tokens.data() + i, timing ? &step_tel : nullptr,
+                cfg_.prefill_mode != PrefillAttentionMode::Sparse, hp);
         }
         if (ok && hp && !spec_cap.empty()) {
             const int feat_row = spec_drafter_->n_target_layers * w_.n_embd;
@@ -1501,9 +1540,11 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
             add_step_tel(tel_acc, step_tel);
             steps++;
         }
-        last_logits_ = std::move(logits);
         pos += n_tok;
-        last_logits_pos_ = cache_.cur_pos;
+        if (need_logits) {
+            last_logits_ = std::move(logits);
+            last_logits_pos_ = cache_.cur_pos;
+        }
         i += n_tok;
         if (save_snapshot && !snapshot_saved && pos == snap_pos) {
             snapshot_saved = snapshot_save(snap_slot);

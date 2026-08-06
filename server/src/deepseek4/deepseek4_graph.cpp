@@ -6627,6 +6627,7 @@ bool deepseek4_step_layer_range(
     const bool fused_verify_candidate =
         (!moe_hybrid || fused_hybrid_ready) &&
         n_tokens >= 2 && n_tokens <= 4 && verify_hooks &&
+        verify_hooks->allow_fused_verify &&
         layer_begin == 0 && is_last_shard && out_logits &&
         ds4_backend_is_gpu(backend) && ds4_fused_verify_enabled();
     const bool heterogeneous_sparse_prefill =
@@ -6698,6 +6699,7 @@ bool deepseek4_step_layer_range(
                 chunk_hooks.capture_layer_ids = verify_hooks->capture_layer_ids;
                 chunk_hooks.capture_out = verify_hooks->capture_out ? &chunk_capture : nullptr;
                 chunk_hooks.all_logits_out = verify_hooks->all_logits_out ? &chunk_logits : nullptr;
+                chunk_hooks.allow_fused_verify = verify_hooks->allow_fused_verify;
                 chunk_hooks_ptr = &chunk_hooks;
             }
             if (!deepseek4_step_layer_range(
@@ -6860,7 +6862,8 @@ bool deepseek4_step_layer_range(
         (fused_hybrid_decode && !verify_hooks)
             ? &fused_hybrid_decode_hooks : verify_hooks;
     if ((!moe_hybrid || fused_hybrid_ready) &&
-        ((n_tokens >= 2 && n_tokens <= 4 && verify_hooks) ||
+        ((n_tokens >= 2 && n_tokens <= 4 && verify_hooks &&
+          verify_hooks->allow_fused_verify) ||
          fused_hybrid_decode) &&
         layer_begin == 0 && is_last_shard &&
         out_logits && ds4_backend_is_gpu(backend) && ds4_fused_verify_enabled()) {
