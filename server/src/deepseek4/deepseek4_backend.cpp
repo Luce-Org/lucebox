@@ -581,8 +581,10 @@ int deepseek4_prefill_chunk_tokens(PrefillAttentionMode mode,
 
 bool deepseek4_prefill_chunk_needs_logits(bool is_final_chunk,
                                           bool ends_at_snapshot,
-                                          bool capture_requires_logits) {
-    return is_final_chunk || ends_at_snapshot || capture_requires_logits;
+                                          bool capture_requires_logits,
+                                          bool execution_requires_logits) {
+    return is_final_chunk || ends_at_snapshot || capture_requires_logits ||
+           execution_requires_logits;
 }
 
 DeepSeek4Backend::DeepSeek4Backend(const DeepSeek4BackendConfig & cfg)
@@ -1455,15 +1457,20 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         const bool capture_requested =
             spec_enabled_ && spec_drafter_ &&
             (capture_final || capture_snapshot);
-        // The current q=1 hybrid capture path shares the native fused graph,
-        // whose contract includes a logits sink. Preserve that graph until a
-        // capture-only variant is independently qualified.
+        // Existing q=1 fused and approximate wide schedulers use the logits
+        // sink as an execution-path selector. Preserve those original
+        // topologies: the q=1 per-layer fallback is documented as numerically
+        // distinct, while sparse/layer-major prefill own their batching and
+        // capture contracts. Readout elision is therefore limited to the new
+        // q=2..4 exact bands until sink selection is decoupled from readback.
         const bool capture_requires_logits = capture_requested && n_tok == 1;
+        const bool execution_requires_logits =
+            n_tok == 1 || cfg_.prefill_mode != PrefillAttentionMode::Exact;
         const bool ends_at_snapshot =
             save_snapshot && !snapshot_saved && pos + n_tok == snap_pos;
         const bool need_logits = deepseek4_prefill_chunk_needs_logits(
             i + n_tok == n_total, ends_at_snapshot,
-            capture_requires_logits);
+            capture_requires_logits, execution_requires_logits);
         std::vector<float> logits;
         std::vector<float> * logits_out = need_logits ? &logits : nullptr;
         bool ok = false;

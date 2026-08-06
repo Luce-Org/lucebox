@@ -1698,16 +1698,24 @@ static void test_prefill_chunk_logits_policy() {
     std::fprintf(stderr, "  test_prefill_chunk_logits_policy ...");
     TEST_ASSERT(!deepseek4_prefill_chunk_needs_logits(
         /*is_final_chunk=*/false, /*ends_at_snapshot=*/false,
-        /*capture_requires_logits=*/false));
+        /*capture_requires_logits=*/false,
+        /*execution_requires_logits=*/false));
     TEST_ASSERT(deepseek4_prefill_chunk_needs_logits(
         /*is_final_chunk=*/true, /*ends_at_snapshot=*/false,
-        /*capture_requires_logits=*/false));
+        /*capture_requires_logits=*/false,
+        /*execution_requires_logits=*/false));
     TEST_ASSERT(deepseek4_prefill_chunk_needs_logits(
         /*is_final_chunk=*/false, /*ends_at_snapshot=*/true,
-        /*capture_requires_logits=*/false));
+        /*capture_requires_logits=*/false,
+        /*execution_requires_logits=*/false));
     TEST_ASSERT(deepseek4_prefill_chunk_needs_logits(
         /*is_final_chunk=*/false, /*ends_at_snapshot=*/false,
-        /*capture_requires_logits=*/true));
+        /*capture_requires_logits=*/true,
+        /*execution_requires_logits=*/false));
+    TEST_ASSERT(deepseek4_prefill_chunk_needs_logits(
+        /*is_final_chunk=*/false, /*ends_at_snapshot=*/false,
+        /*capture_requires_logits=*/false,
+        /*execution_requires_logits=*/true));
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 

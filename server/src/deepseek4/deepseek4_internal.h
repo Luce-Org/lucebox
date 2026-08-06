@@ -360,7 +360,8 @@ int deepseek4_prefill_chunk_tokens(PrefillAttentionMode mode,
 
 bool deepseek4_prefill_chunk_needs_logits(bool is_final_chunk,
                                           bool ends_at_snapshot,
-                                          bool capture_requires_logits);
+                                          bool capture_requires_logits,
+                                          bool execution_requires_logits);
 
 // Forward: single step (prefill chunk or decode token).
 // embed: [n_embd, n_tokens] input embeddings (post-embedding lookup).
