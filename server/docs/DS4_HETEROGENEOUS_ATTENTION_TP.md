@@ -77,6 +77,12 @@ without first quiescing both GPU streams; the next graph build then crashed in
 the attention node list. Scheduler teardown and native-graph invalidation now
 synchronize both backends first. The identical nine-request rerun completed.
 
+The matched kernel-level profile and corrected component attribution are in
+[`DS4_HETEROGENEOUS_PROFILE_20260806.md`](DS4_HETEROGENEOUS_PROFILE_20260806.md).
+It proves that the split raises R9700 overlap from 21.20% to 30.67%, but adds
+more Strix work than it removes from the R9700. Do not use the fused verifier's
+small coarse `attention_us` counter as total attention time.
+
 ## Important rejected paths
 
 - Copying ordinary graph temporaries on the destination stream can race the

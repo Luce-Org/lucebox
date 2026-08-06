@@ -85,7 +85,9 @@ def stream_request(
     )
 
     started = time.perf_counter()
+    started_ns = time.perf_counter_ns()
     first_token_at: float | None = None
+    first_token_at_ns: int | None = None
     text_parts: list[str] = []
     usage: dict[str, Any] = {}
     finish_reason: str | None = None
@@ -119,6 +121,7 @@ def stream_request(
                 if piece:
                     if first_token_at is None:
                         first_token_at = time.perf_counter()
+                        first_token_at_ns = time.perf_counter_ns()
                     text_parts.append(str(piece))
     except urllib.error.HTTPError as exc:
         return {
@@ -130,6 +133,7 @@ def stream_request(
         return {"ok": False, "status": status, "error": repr(exc)}
 
     finished = time.perf_counter()
+    finished_ns = time.perf_counter_ns()
     text = "".join(text_parts)
     wall_s = finished - started
     ttft_s = first_token_at - started if first_token_at is not None else None
@@ -144,6 +148,12 @@ def stream_request(
         "ok": status == 200 and bool(text) and saw_done,
         "status": status,
         "stream_done": saw_done,
+        # rocprofv3 dispatch timestamps use the same host monotonic clock. These
+        # boundaries let the overlap analyzer select decode only, excluding
+        # model loading, prefill, and collection-window transitions.
+        "request_start_monotonic_ns": started_ns,
+        "first_token_monotonic_ns": first_token_at_ns,
+        "request_end_monotonic_ns": finished_ns,
         "wall_s": round(wall_s, 6),
         "ttft_s": round(ttft_s, 6) if ttft_s is not None else None,
         "client_decode_s": round(decode_s, 6) if decode_s is not None else None,

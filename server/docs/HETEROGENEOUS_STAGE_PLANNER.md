@@ -104,6 +104,10 @@ enough to reach 100 tok/s; the next optimization must reduce full-width expert
 kernel time or overlap another independent stage, not add synchronization or
 small matrix shards.
 
+The timestamped two-device kernel profile, attention-split attribution, and
+subsequent rejected expert weight-reuse experiments are recorded in
+[`DS4_HETEROGENEOUS_PROFILE_20260806.md`](DS4_HETEROGENEOUS_PROFILE_20260806.md).
+
 ## Reproduction
 
 Use `scripts/qualify_ds4_q5_amd.sh`. The runner records the source commit,
