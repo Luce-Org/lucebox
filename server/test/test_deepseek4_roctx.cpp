@@ -12,6 +12,8 @@
 #include <vector>
 
 #if !defined(_WIN32)
+#include <cerrno>
+#include <csignal>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
@@ -285,7 +287,39 @@ void test_runtime_loader_prefers_interposed_roctx_symbols(
     }
 
     int status = 0;
-    CHECK(waitpid(child, &status, 0) == child);
+    pid_t waited = 0;
+    constexpr int wait_attempts = 500;
+    constexpr unsigned int wait_interval_us = 10000;
+    for (int attempt = 0; attempt < wait_attempts; ++attempt) {
+        waited = waitpid(child, &status, WNOHANG);
+        if (waited == child) break;
+        if (waited < 0 && errno != EINTR) break;
+        usleep(wait_interval_us);
+    }
+
+    if (waited != child) {
+        ++failures;
+        if (waited == 0) {
+            std::fprintf(stderr,
+                         "FAIL %s:%d: ROCTX interposition child timed out\n",
+                         __FILE__, __LINE__);
+        } else {
+            std::fprintf(stderr,
+                         "FAIL %s:%d: waitpid failed for ROCTX interposition child\n",
+                         __FILE__, __LINE__);
+        }
+        if (kill(child, SIGKILL) == 0) {
+            while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+        }
+        return;
+    }
+    if (WIFSIGNALED(status)) {
+        ++failures;
+        std::fprintf(stderr,
+                     "FAIL %s:%d: ROCTX interposition child terminated by signal %d\n",
+                     __FILE__, __LINE__, WTERMSIG(status));
+        return;
+    }
     CHECK(WIFEXITED(status));
     if (WIFEXITED(status)) CHECK(WEXITSTATUS(status) == 0);
 }
