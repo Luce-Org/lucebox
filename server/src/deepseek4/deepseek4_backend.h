@@ -15,6 +15,7 @@
 #include "../common/moe_hybrid_stream.h"
 #include "deepseek4_internal.h"
 #include "deepseek4_dspark.h"
+#include "qwen3/qwen3_drafter.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -55,6 +56,7 @@ public:
                                              const GenerateRequest & req,
                                              const DaemonIO & io) override;
 
+    CompressResult compress(const CompressRequest & req) override;
     bool handle_compress(const std::string & line,
                          const DaemonIO & io) override;
     void free_drafter() override;
@@ -91,6 +93,14 @@ private:
     // Absolute cache position represented by last_logits_. A snapshot is
     // safe only when this matches cache_.cur_pos.
     int                    last_logits_pos_ = -1;
+
+    // PFlash speculative-prefill drafter. This is separate from the DSpark
+    // decode drafter below: it uses a small Qwen model to select prompt spans,
+    // then releases its request scratch before DeepSeek prefill starts.
+    DrafterContext                 pflash_drafter_;
+    bool                           pflash_drafter_loaded_ = false;
+
+    void release_pflash_drafter();
 
     // DSpark speculative decode (opt-in: DFLASH_DS4_SPEC=1 + DFLASH_DS4_DRAFT=<gguf>).
     bool                           spec_enabled_ = false;

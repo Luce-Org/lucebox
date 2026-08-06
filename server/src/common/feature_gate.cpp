@@ -32,6 +32,8 @@ std::string check_feature_compatibility(
         features.pflash_enabled || args.draft_path != nullptr;
     const bool mixed_draft_placement =
         draft_placement_used && target_backend != draft_backend;
+    const bool split_target =
+        args.device.is_layer_split() || args.remote_target_shard.enabled();
 
     // ── IPC auxiliary options × IPC enablement
     if (!args.remote_draft.enabled() &&
@@ -158,6 +160,12 @@ std::string check_feature_compatibility(
         !arch_supports_pflash_compression(arch)) {
         return "model architecture '" + arch +
                "' does not support PFlash compression";
+    }
+    if (features.pflash_enabled && arch == "deepseek4" && split_target &&
+        !mixed_draft_placement) {
+        return "local PFlash compression for deepseek4 requires a "
+               "single-device target; use a monolithic target or place the "
+               "PFlash drafter on a remote backend";
     }
 
     // ── --ds4-prefill × architecture

@@ -3,6 +3,7 @@
 #include "deepseek4_backend.h"
 #include "deepseek4_internal.h"
 #include "common/dynamic_backend.h"
+#include "common/io_utils.h"
 #include "common/peer_access.h"
 #include "common/sampler.h"
 
@@ -1896,14 +1897,123 @@ GenerateResult DeepSeek4Backend::restore_and_generate_impl(
     return generate_from_state(req, io, snap_pos);
 }
 
+ModelBackend::CompressResult DeepSeek4Backend::compress(
+        const CompressRequest & req) {
+    CompressResult result;
+    if (req.input_ids.empty() || req.drafter_path.empty() || parked_) {
+        return result;
+    }
+
+    // DSpark often occupies the secondary GPU on mixed DeepSeek systems.
+    // Release it while PFlash scores the prompt, then restore it before target
+    // generation. Keep the 100 GB DeepSeek target resident: reloading it would
+    // erase PFlash's TTFT gain and parking clears target prefix snapshots. If
+    // the PFlash drafter cannot coexist, the caller can place it remotely.
+    const bool restore_spec = spec_drafter_ != nullptr;
+    bool restore_ok = true;
+
+    if (restore_spec && !park(ParkTarget::DraftModel)) {
+        return result;
+    }
+    if (backend_) ggml_backend_synchronize(backend_);
+    if (expert_backend_) ggml_backend_synchronize(expert_backend_);
+
+    auto load_pflash = [&]() {
+        std::fprintf(stderr,
+                     "[pflash][deepseek4] loading drafter from %s on gpu=%d ...\n",
+                     req.drafter_path.c_str(), req.drafter_gpu);
+        if (!load_drafter(req.drafter_path, /*gpu_layers=*/999,
+                          req.drafter_gpu, pflash_drafter_)) {
+            std::fprintf(stderr,
+                         "[pflash][deepseek4] drafter init failed: %s\n",
+                         dflash27b_last_error());
+            return false;
+        }
+        pflash_drafter_loaded_ = true;
+        std::fprintf(stderr, "[pflash][deepseek4] drafter ready\n");
+        return true;
+    };
+
+    if (!pflash_drafter_loaded_ && !load_pflash()) {
+        // A failed load may leave an owned backend or partial allocations.
+        release_pflash_drafter();
+    }
+
+    if (pflash_drafter_loaded_) {
+        result.compressed_ids = drafter_score_and_compress(
+            pflash_drafter_, req.input_ids, req.keep_ratio);
+        result.ok = !result.compressed_ids.empty();
+        if (result.ok) {
+            std::fprintf(stderr,
+                         "[pflash][deepseek4] %zu -> %zu tokens\n",
+                         req.input_ids.size(), result.compressed_ids.size());
+        } else {
+            std::fprintf(stderr,
+                         "[pflash][deepseek4] compression failed: %s\n",
+                         dflash27b_last_error());
+        }
+    }
+
+    // DSpark restore needs its memory back. Without DSpark, honor persistent
+    // residency so repeated PFlash requests can reuse the PFlash weights.
+    const bool release_after =
+        req.residency_action == DraftResidencyAction::ReleaseAfterUse ||
+        restore_spec;
+    if (release_after) release_pflash_drafter();
+
+    if (restore_spec && !unpark(ParkTarget::DraftModel)) {
+        std::fprintf(stderr,
+                     "[pflash][deepseek4] failed to restore DSpark after compression\n");
+        restore_ok = false;
+    }
+    if (!restore_ok) {
+        result = {};
+    }
+    return result;
+}
+
 bool DeepSeek4Backend::handle_compress(const std::string & line,
                                         const DaemonIO & io) {
-    (void)line; (void)io;
-    std::fprintf(stderr, "[deepseek4] compress not yet supported\n");
-    return false;
+    const bool skip_park = line.size() >= 16 &&
+        line.compare(line.size() - 7, 7, " nopark") == 0;
+
+    char prompt_path[1024];
+    int keep_x1000 = 0;
+    char drafter_path[1024] = {0};
+    const int parsed = std::sscanf(
+        line.c_str() + 9, "%1023s %d %1023s",
+        prompt_path, &keep_x1000, drafter_path);
+    if (parsed < 2) {
+        std::fprintf(stderr,
+                     "[pflash][deepseek4] bad args, need: "
+                     "<bin> <keep_x1000> [drafter.gguf]\n");
+        io.emit(-1);
+        return false;
+    }
+
+    CompressRequest req;
+    req.input_ids = read_int32_file(prompt_path);
+    req.keep_ratio = (float) keep_x1000 / 1000.0f;
+    req.drafter_path = parsed >= 3 && drafter_path[0]
+        ? drafter_path
+        : "/opt/lucebox/models/drafter/Qwen3-0.6B-BF16.gguf";
+    req.skip_park = skip_park;
+
+    CompressResult result = compress(req);
+    for (int32_t token : result.compressed_ids) io.emit(token);
+    io.emit(-1);
+    return result.ok;
+}
+
+void DeepSeek4Backend::release_pflash_drafter() {
+    if (!pflash_drafter_loaded_ && !pflash_drafter_.backend) return;
+    dflash::common::free_drafter(pflash_drafter_);
+    pflash_drafter_loaded_ = false;
+    std::fprintf(stderr, "[pflash][deepseek4] drafter freed\n");
 }
 
 void DeepSeek4Backend::free_drafter() {
+    release_pflash_drafter();
     // Keep the configured path so request-scoped residency and an explicit
     // later `unpark draft` can restore the DSpark model.
     release_spec_drafter(/*mark_parked=*/true);
