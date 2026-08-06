@@ -12,6 +12,7 @@
 #include <vector>
 
 #if !defined(_WIN32)
+#include <sys/wait.h>
 #include <unistd.h>
 #endif
 
@@ -254,17 +255,39 @@ void test_disabled_loader_is_silent_and_unopened() {
 }
 
 #if !defined(_WIN32) && defined(DFLASH27B_BACKEND_HIP)
-void test_runtime_loader_prefers_interposed_roctx_symbols() {
+constexpr const char * roctx_interposition_child_arg =
+    "--roctx-interposition-child";
+
+bool run_runtime_loader_interposition_child() {
     interposed_events.clear();
-    CHECK(setenv("DFLASH_DS4_ROCTX", "1", 1) == 0);
     {
         const DeepSeek4RoctxRange range(
             "ds4.interposed", {InferencePhase::Decode, 1, 0, 43, 0});
     }
-    CHECK(interposed_events == std::vector<std::string>({
+    return interposed_events == std::vector<std::string>({
         "push:ds4.interposed mode=decode tokens=1 layer_begin=0 layer_end=43 device=0",
         "pop",
-    }));
+    });
+}
+
+void test_runtime_loader_prefers_interposed_roctx_symbols(
+        const char * executable) {
+    // Re-exec so the process-scoped callback cache and environment changes
+    // used by this integration check cannot leak into the parent test suite.
+    const pid_t child = fork();
+    CHECK(child >= 0);
+    if (child < 0) return;
+    if (child == 0) {
+        if (setenv("DFLASH_DS4_ROCTX", "1", 1) != 0) _exit(125);
+        execlp(executable, executable, roctx_interposition_child_arg,
+               static_cast<char *>(nullptr));
+        _exit(126);
+    }
+
+    int status = 0;
+    CHECK(waitpid(child, &status, 0) == child);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) CHECK(WEXITSTATUS(status) == 0);
 }
 #endif
 
@@ -355,7 +378,15 @@ void test_missing_callback_is_silent() {
 
 } // namespace
 
-int main() {
+int main(int argc, char ** argv) {
+    (void) argc;
+    (void) argv;
+#if !defined(_WIN32) && defined(DFLASH27B_BACKEND_HIP)
+    if (argc == 2 &&
+        std::string(argv[1]) == roctx_interposition_child_arg) {
+        return run_runtime_loader_interposition_child() ? 0 : 1;
+    }
+#endif
     test_env_policy();
     test_exact_prefill_phase_label();
     test_phase_mapping_and_wire_roundtrip();
@@ -363,7 +394,7 @@ int main() {
     test_malformed_phases_do_not_desynchronize_pipe();
 #endif
 #if !defined(_WIN32) && defined(DFLASH27B_BACKEND_HIP)
-    test_runtime_loader_prefers_interposed_roctx_symbols();
+    test_runtime_loader_prefers_interposed_roctx_symbols(argv[0]);
 #endif
     test_disabled_loader_is_silent_and_unopened();
     test_missing_library_is_diagnosed();
