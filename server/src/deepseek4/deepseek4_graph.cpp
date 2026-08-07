@@ -3694,12 +3694,13 @@ static void hc_pre_auto_into(float * working,
                     n_embd, n_hc, sinkhorn_iters, hc_eps, flat, mix_scratch, serial_fn);
 }
 
-static void hc_pre_batch(std::vector<float> & working,
+static bool hc_pre_batch(std::vector<float> & working,
                          std::vector<float> & post,
                          std::vector<float> & comb,
                          const float * hc_state,
                          const HcWeightsCpu & weights,
                          ggml_tensor * fn_tensor,
+                         int device,
                          int n_tokens,
                          int n_embd,
                          int n_hc,
@@ -3710,7 +3711,20 @@ static void hc_pre_batch(std::vector<float> & working,
     post.resize((size_t)n_tokens * (size_t)n_hc);
     comb.resize((size_t)n_tokens * (size_t)n_hc * (size_t)n_hc);
 
+    std::atomic<bool> device_ready{true};
     ds4_pool_for_tokens(n_tokens, [&](int t0, int t1) {
+#if defined(DFLASH27B_BACKEND_CUDA)
+        thread_local int selected_device = -1;
+        if (selected_device != device) {
+            if (!deepseek4_cuda_hc_set_device(device)) {
+                device_ready.store(false, std::memory_order_relaxed);
+                return;
+            }
+            selected_device = device;
+        }
+#else
+        (void) device;
+#endif
         std::vector<float> flat(hc_dim);
         float mix[24];
         for (int t = t0; t < t1; ++t) {
@@ -3729,6 +3743,7 @@ static void hc_pre_batch(std::vector<float> & working,
                              /*serial_fn=*/n_tokens > 1);
         }
     });
+    return device_ready.load(std::memory_order_relaxed);
 }
 
 static void cpu_hc_post(float * out_hc, const float * block_out,
@@ -6585,6 +6600,21 @@ static bool initialize_layer_range_cache(
     runtime.owns_output = owns_output;
     return true;
 }
+
+bool deepseek4_should_attempt_fused_verify(
+        int n_tokens,
+        const Ds4VerifyHooks * verify_hooks,
+        bool owner_topology_supported,
+        bool full_layer_range,
+        bool has_logits_output,
+        bool gpu_backend,
+        bool fused_verify_enabled) {
+    return owner_topology_supported && n_tokens >= 2 && n_tokens <= 4 &&
+           verify_hooks && verify_hooks->allow_fused_verify &&
+           full_layer_range && has_logits_output && gpu_backend &&
+           fused_verify_enabled;
+}
+
 bool deepseek4_step_layer_range(
         ggml_backend_t backend,
         int device,
@@ -6624,12 +6654,13 @@ bool deepseek4_step_layer_range(
         moe_hybrid->materialized_cold_experts &&
         moe_hybrid->cold_backend_kind == MoeHybridColdBackend::Gpu &&
         moe_hybrid->cold_backend && moe_hybrid->cold_backend != backend;
-    const bool fused_verify_candidate =
-        (!moe_hybrid || fused_hybrid_ready) &&
-        n_tokens >= 2 && n_tokens <= 4 && verify_hooks &&
-        verify_hooks->allow_fused_verify &&
-        layer_begin == 0 && is_last_shard && out_logits &&
-        ds4_backend_is_gpu(backend) && ds4_fused_verify_enabled();
+    const bool fused_verify_candidate = deepseek4_should_attempt_fused_verify(
+        n_tokens, verify_hooks,
+        !moe_hybrid || fused_hybrid_ready,
+        layer_begin == 0 && is_last_shard,
+        out_logits != nullptr,
+        ds4_backend_is_gpu(backend),
+        ds4_fused_verify_enabled());
     const bool heterogeneous_sparse_prefill =
         moe_hybrid && cache.prefill_mode == PrefillAttentionMode::Sparse &&
         n_tokens > 4 && n_tokens <= DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS &&
@@ -6861,12 +6892,11 @@ bool deepseek4_step_layer_range(
     Ds4VerifyHooks * fused_graph_hooks =
         (fused_hybrid_decode && !verify_hooks)
             ? &fused_hybrid_decode_hooks : verify_hooks;
-    if ((!moe_hybrid || fused_hybrid_ready) &&
-        ((n_tokens >= 2 && n_tokens <= 4 && verify_hooks &&
-          verify_hooks->allow_fused_verify) ||
-         fused_hybrid_decode) &&
-        layer_begin == 0 && is_last_shard &&
-        out_logits && ds4_backend_is_gpu(backend) && ds4_fused_verify_enabled()) {
+    const bool fused_hybrid_decode_candidate =
+        fused_hybrid_decode && layer_begin == 0 && is_last_shard &&
+        out_logits && ds4_backend_is_gpu(backend) &&
+        ds4_fused_verify_enabled();
+    if (fused_verify_candidate || fused_hybrid_decode_candidate) {
         const bool q1_feature_capture =
             n_tokens == 1 && verify_hooks && verify_hooks->capture_out;
         // q=1 target-feature capture walks many prompt-position shapes. Keep
@@ -7148,9 +7178,15 @@ bool deepseek4_step_layer_range(
             attn_post_backend = cached.post;
             attn_comb_backend = cached.comb;
         } else {
-            hc_pre_batch(cur, hc_post, hc_comb,
-                         hc_state.data(), hc_lw.attn, L.hc_attn_fn,
-                         n_tokens, n_embd, n_hc, w.n_hc_sinkhorn_iter, w.hc_eps);
+            if (!hc_pre_batch(cur, hc_post, hc_comb,
+                              hc_state.data(), hc_lw.attn, L.hc_attn_fn,
+                              device, n_tokens, n_embd, n_hc,
+                              w.n_hc_sinkhorn_iter, w.hc_eps)) {
+                std::fprintf(stderr,
+                             "[deepseek4] HC-pre device selection failed "
+                             "layer %d attn\n", il);
+                return false;
+            }
         }
         if (telemetry) telemetry->hc_pre_attn_us += ds4_elapsed_us(hc_pre_attn_t0, Ds4TimingClock::now());
 
@@ -7506,9 +7542,15 @@ bool deepseek4_step_layer_range(
             ffn_post_backend = cached.post;
             ffn_comb_backend = cached.comb;
         } else {
-            hc_pre_batch(ffn_working, hc_post, hc_comb,
-                         hc_state.data(), hc_lw.ffn, L.hc_ffn_fn,
-                         n_tokens, n_embd, n_hc, w.n_hc_sinkhorn_iter, w.hc_eps);
+            if (!hc_pre_batch(ffn_working, hc_post, hc_comb,
+                              hc_state.data(), hc_lw.ffn, L.hc_ffn_fn,
+                              device, n_tokens, n_embd, n_hc,
+                              w.n_hc_sinkhorn_iter, w.hc_eps)) {
+                std::fprintf(stderr,
+                             "[deepseek4] HC-pre device selection failed "
+                             "layer %d ffn\n", il);
+                return false;
+            }
         }
         if (telemetry) telemetry->hc_pre_ffn_us += ds4_elapsed_us(hc_pre_ffn_t0, Ds4TimingClock::now());
 

@@ -1413,6 +1413,8 @@ static void test_backend_sampling_penalizes_prompt_history() {
 
     auto decode_one = [&](const SamplerCfg & sampler) {
         backend.last_logits_ = {0.0f, 4.0f, 3.0f};
+        backend.last_logits_pos_ = 1;
+        backend.cache_.cur_pos = 1;
         backend.sampler_ = sampler;
         emitted.clear();
         std::vector<int32_t> generated;
@@ -1433,6 +1435,24 @@ static void test_backend_sampling_penalizes_prompt_history() {
     SamplerCfg penalized;
     penalized.rep_pen = 2.0f;
     TEST_ASSERT(decode_one(penalized) == 2);
+
+    backend.last_logits_ = {0.0f, 4.0f, 3.0f};
+    backend.last_logits_pos_ = 0;
+    backend.cache_.cur_pos = 1;
+    std::vector<int32_t> generated;
+    emitted.clear();
+    TEST_ASSERT(!backend.do_decode(
+        /*committed=*/1, /*n_gen=*/1, /*history_prefix=*/{1},
+        generated, io));
+    TEST_ASSERT(emitted.empty());
+
+    backend.last_logits_.clear();
+    backend.last_logits_pos_ = -1;
+    generated.clear();
+    TEST_ASSERT(!backend.do_decode(
+        /*committed=*/1, /*n_gen=*/1, /*history_prefix=*/{1},
+        generated, io));
+    TEST_ASSERT(emitted.empty());
 
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
@@ -1630,6 +1650,11 @@ static void test_safe_compressor_batch_tokens() {
 static void test_exact_prefill_chunk_policy() {
     std::fprintf(stderr, "  test_exact_prefill_chunk_policy ...");
 
+    TEST_ASSERT(!deepseek4_env_flag_value_enabled(nullptr));
+    TEST_ASSERT(!deepseek4_env_flag_value_enabled(""));
+    TEST_ASSERT(!deepseek4_env_flag_value_enabled("0"));
+    TEST_ASSERT(deepseek4_env_flag_value_enabled("1"));
+
     TEST_ASSERT(deepseek4_prefill_chunk_tokens(
         PrefillAttentionMode::Exact, /*exact_bands_enabled=*/false,
         /*batch_supported=*/true, /*requested_chunk=*/4,
@@ -1719,12 +1744,52 @@ static void test_prefill_chunk_logits_policy() {
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
-static void test_prefill_capture_disables_fused_verify() {
-    std::fprintf(stderr, "  test_prefill_capture_disables_fused_verify ...");
+static void test_prefill_readout_lifecycle_and_fused_exclusion() {
+    std::fprintf(stderr,
+                 "  test_prefill_readout_lifecycle_and_fused_exclusion ...");
+
+    std::vector<float> last_logits = {1.0f, 2.0f};
+    int last_logits_pos = 7;
+    deepseek4_invalidate_prefill_logits_if_skipped(
+        /*need_logits=*/true, last_logits, last_logits_pos);
+    TEST_ASSERT(last_logits == std::vector<float>({1.0f, 2.0f}));
+    TEST_ASSERT(last_logits_pos == 7);
+    deepseek4_invalidate_prefill_logits_if_skipped(
+        /*need_logits=*/false, last_logits, last_logits_pos);
+    TEST_ASSERT(last_logits.empty());
+    TEST_ASSERT(last_logits_pos == -1);
+
+    std::vector<int> capture_ids = {1, 3};
+    std::vector<float> capture;
+    Ds4VerifyHooks prefill_hooks = deepseek4_make_prefill_capture_hooks(
+        &capture_ids, &capture, /*capture_token_begin=*/1,
+        /*capture_token_end=*/3);
+    TEST_ASSERT(prefill_hooks.capture_layer_ids == &capture_ids);
+    TEST_ASSERT(prefill_hooks.capture_out == &capture);
+    TEST_ASSERT(prefill_hooks.capture_token_begin == 1);
+    TEST_ASSERT(prefill_hooks.capture_token_end == 3);
+    TEST_ASSERT(!prefill_hooks.allow_fused_verify);
+    TEST_ASSERT(!deepseek4_should_attempt_fused_verify(
+        /*n_tokens=*/4, &prefill_hooks,
+        /*owner_topology_supported=*/true,
+        /*full_layer_range=*/true,
+        /*has_logits_output=*/true,
+        /*gpu_backend=*/true,
+        /*fused_verify_enabled=*/true));
+
     Ds4VerifyHooks verifier_hooks;
     TEST_ASSERT(verifier_hooks.allow_fused_verify);
-    verifier_hooks.allow_fused_verify = false;
-    TEST_ASSERT(!verifier_hooks.allow_fused_verify);
+    TEST_ASSERT(deepseek4_should_attempt_fused_verify(
+        /*n_tokens=*/4, &verifier_hooks,
+        /*owner_topology_supported=*/true,
+        /*full_layer_range=*/true,
+        /*has_logits_output=*/true,
+        /*gpu_backend=*/true,
+        /*fused_verify_enabled=*/true));
+    TEST_ASSERT(!deepseek4_should_attempt_fused_verify(
+        /*n_tokens=*/1, &verifier_hooks, true, true, true, true, true));
+    TEST_ASSERT(!deepseek4_should_attempt_fused_verify(
+        /*n_tokens=*/5, &verifier_hooks, true, true, true, true, true));
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
@@ -3785,7 +3850,7 @@ int main() {
     test_exact_prefill_chunk_policy();
     test_exact_prefill_band_schedule();
     test_prefill_chunk_logits_policy();
-    test_prefill_capture_disables_fused_verify();
+    test_prefill_readout_lifecycle_and_fused_exclusion();
     test_dspark_park_all_releases_drafter();
     test_dspark_raw_ring_rollback_after_wrap(backend);
     test_snapshot_save_restore();

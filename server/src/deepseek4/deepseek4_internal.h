@@ -358,10 +358,17 @@ int deepseek4_prefill_chunk_tokens(PrefillAttentionMode mode,
                                    int requested_chunk,
                                    int layer_major_cap);
 
+bool deepseek4_env_flag_value_enabled(const char * value);
+
 bool deepseek4_prefill_chunk_needs_logits(bool is_final_chunk,
                                           bool ends_at_snapshot,
                                           bool capture_requires_logits,
                                           bool execution_requires_logits);
+
+void deepseek4_invalidate_prefill_logits_if_skipped(
+    bool need_logits,
+    std::vector<float> & last_logits,
+    int & last_logits_pos);
 
 // Forward: single step (prefill chunk or decode token).
 // embed: [n_embd, n_tokens] input embeddings (post-embedding lookup).
@@ -404,6 +411,21 @@ struct Ds4VerifyHooks {
     // intentionally approximate fused-verification path.
     bool                     allow_fused_verify = true;
 };
+
+Ds4VerifyHooks deepseek4_make_prefill_capture_hooks(
+    const std::vector<int> * capture_layer_ids,
+    std::vector<float> * capture_out,
+    int capture_token_begin,
+    int capture_token_end);
+
+bool deepseek4_should_attempt_fused_verify(
+    int n_tokens,
+    const Ds4VerifyHooks * verify_hooks,
+    bool owner_topology_supported,
+    bool full_layer_range,
+    bool has_logits_output,
+    bool gpu_backend,
+    bool fused_verify_enabled);
 
 bool deepseek4_step_layer_range(
     ggml_backend_t              backend,
