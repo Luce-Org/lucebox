@@ -33,6 +33,9 @@ elif [[ "$TARGET_WAS_EXPLICIT" == "1" ]]; then
 else
   DRAFT="$DEFAULT_DRAFT"
 fi
+# ``external`` is the production CLI contract: the canonical Lucebox launch
+# path owns the engine and this harness only exercises the client protocol.
+# ``lucebox`` and ``llamacpp`` remain explicit standalone comparison modes.
 MODEL_SERVER="${MODEL_SERVER:-lucebox}"
 DFLASH_SERVER_BIN="${DFLASH_SERVER_BIN:-$REPO_DIR/server/build/dflash_server}"
 LLAMA_BUILD_DIR="${LLAMA_BUILD_DIR:-$CLIENT_WORK_DIR/llama-cpp-server-build}"
@@ -77,7 +80,7 @@ fi
 STAMP="${STAMP:-$(date +%Y%m%d-%H%M%S)}"
 BASE_URL="http://$HOST:$PORT"
 LOG_DIR="$RUN_DIR/$STAMP"
-SERVER_LOG="$LOG_DIR/server.log"
+SERVER_LOG="${SERVER_LOG:-$LOG_DIR/server.log}"
 
 mkdir -p "$LOG_DIR"
 
@@ -130,12 +133,15 @@ draft_enabled() {
 }
 
 start_lucebox_server() {
+  if [[ "$MODEL_SERVER" == "external" ]]; then
+    return 0
+  fi
   if [[ "$MODEL_SERVER" == "llamacpp" ]]; then
     start_llamacpp_server
     return
   fi
   if [[ "$MODEL_SERVER" != "lucebox" ]]; then
-    echo "unknown MODEL_SERVER=$MODEL_SERVER; expected lucebox or llamacpp" >&2
+    echo "unknown MODEL_SERVER=$MODEL_SERVER; expected external, lucebox, or llamacpp" >&2
     return 1
   fi
   start_dflash_native_server
@@ -149,13 +155,30 @@ start_dflash_native_server() {
     echo "  cmake --build $REPO_DIR/server/build --target dflash_server -j\$(nproc)" >&2
     return 1
   fi
-  if [[ ! -f "$TARGET" ]]; then
+  if [[ ! -f "$TARGET" || ! -s "$TARGET" ]]; then
     echo "target GGUF not found: $TARGET" >&2
     echo "Set TARGET=/path/to/model.gguf or DFLASH_TARGET=/path/to/model.gguf, or download the default:" >&2
     echo "  hf download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf --local-dir $REPO_DIR/server/models/" >&2
     return 1
   fi
-  if draft_enabled && [[ ! -f "$DRAFT" ]]; then
+  if draft_enabled && [[ -d "$DRAFT" ]]; then
+    local draft_candidates=() candidate
+    while IFS= read -r candidate; do
+      [[ -n "$candidate" ]] && draft_candidates+=("$candidate")
+    done < <(find -L "$DRAFT" -maxdepth 4 -type f \
+      \( -name '*.safetensors' -o -name '*.gguf' \) \
+      -size +0c -print 2>/dev/null | sort)
+    case "${#draft_candidates[@]}" in
+      0) ;;
+      1) DRAFT="${draft_candidates[0]}" ;;
+      *)
+        echo "multiple DFlash draft candidates in $DRAFT; choose one file explicitly:" >&2
+        printf '  %s\n' "${draft_candidates[@]}" >&2
+        return 1
+        ;;
+    esac
+  fi
+  if draft_enabled && [[ ! -f "$DRAFT" || ! -s "$DRAFT" ]]; then
     echo "DFlash draft not found: $DRAFT" >&2
     echo "Set DRAFT=/path/to/dflash-draft.gguf or DFLASH_DRAFT=/path/to/dflash-draft.gguf, or download the default:" >&2
     echo "  hf download Lucebox/Qwen3.6-27B-DFlash-GGUF dflash-draft-3.6-q4_k_m.gguf --local-dir $REPO_DIR/server/models/draft/" >&2
@@ -177,6 +200,34 @@ start_dflash_native_server() {
   if [[ -n "$FA_WINDOW" ]] && [[ "$FA_WINDOW" != "0" ]]; then
     fa_args=(--fa-window "$FA_WINDOW")
   fi
+  local optimization_args=()
+  if [[ -n "${DFLASH_PREFILL_DRAFTER:-}" ]]; then
+    if [[ ! -f "$DFLASH_PREFILL_DRAFTER" || ! -s "$DFLASH_PREFILL_DRAFTER" ]]; then
+      echo "PFlash/KVFlash scorer not found: $DFLASH_PREFILL_DRAFTER" >&2
+      return 1
+    fi
+    optimization_args+=(--prefill-drafter "$DFLASH_PREFILL_DRAFTER")
+  fi
+  if [[ -n "${DFLASH_PREFILL_MODE:-}" && "$DFLASH_PREFILL_MODE" != "off" ]]; then
+    optimization_args+=(
+      --prefill-compression "$DFLASH_PREFILL_MODE"
+      --prefill-keep-ratio "${DFLASH_PREFILL_KEEP:-0.10}"
+      --prefill-threshold "${DFLASH_PREFILL_THRESHOLD:-32768}"
+    )
+  fi
+  if [[ -n "${DFLASH_KVFLASH:-}" && "$DFLASH_KVFLASH" != "off" ]]; then
+    optimization_args+=(
+      --kvflash "$DFLASH_KVFLASH"
+      --kvflash-policy "${DFLASH_KVFLASH_POLICY:-drafter}"
+      --kvflash-tau "${DFLASH_KVFLASH_TAU:-64}"
+    )
+  fi
+  if [[ "${DFLASH_SPARK:-0}" == "1" ]]; then
+    optimization_args+=(--spark)
+    if [[ -n "${DFLASH_SPARK_VRAM_GB:-}" && "$DFLASH_SPARK_VRAM_GB" != "0" && "$DFLASH_SPARK_VRAM_GB" != "0.0" ]]; then
+      optimization_args+=(--spark-vram "$DFLASH_SPARK_VRAM_GB")
+    fi
+  fi
   # Export KV cache type env vars for the C++ server to pick up (only when
   # explicitly requested: the per-axis envs override family defaults).
   if [[ -n "$CACHE_TYPE_K" ]]; then export DFLASH27B_KV_K="$CACHE_TYPE_K"; fi
@@ -190,6 +241,7 @@ start_dflash_native_server() {
     --model-name "$MODEL_ID" \
     "${ddtree_args[@]}" \
     "${fa_args[@]}" \
+    "${optimization_args[@]}" \
     "${extra_args[@]}" \
     > "$SERVER_LOG" 2>&1 &
   SERVER_PID=$!
@@ -269,7 +321,8 @@ wait_lucebox_server() {
       return 0
     fi
     sleep 1
-    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+    if [[ "$MODEL_SERVER" != "external" ]] \
+       && ! kill -0 "$SERVER_PID" 2>/dev/null; then
       echo "server exited early; log: $SERVER_LOG" >&2
       tail -n 160 "$SERVER_LOG" >&2 || true
       return 1
@@ -281,6 +334,9 @@ wait_lucebox_server() {
 }
 
 stop_lucebox_server() {
+  if [[ "$MODEL_SERVER" == "external" ]]; then
+    return 0
+  fi
   if [[ -n "${SERVER_PID:-}" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
     kill "$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true

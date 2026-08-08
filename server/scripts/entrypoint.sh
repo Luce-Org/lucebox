@@ -2,14 +2,14 @@
 # In-container ENTRYPOINT for lucebox-hub.
 #
 # Normal path: the host-side `lucebox` CLI has already populated every
-# DFLASH_* env var from its detection / autotune sweep, so this script
-# just resolves paths and execs the native dflash_server binary.
+# DFLASH_* env var from its model/hardware plan (and optional calibration),
+# so this script just resolves paths and execs the native dflash_server binary.
 #
 # Fallback path: a user runs the image directly (`docker run --gpus all
 # ghcr.io/luce-org/lucebox-hub:cuda12`) with no env-var prep. We then do a
-# minimal VRAM-tiered autotune — same tiers as `lucebox autotune`, kept in
-# sync by hand. Anything more elaborate (driver-version probes, AMD paths,
-# lspci fallbacks) belongs in the host CLI, not here.
+# minimal VRAM-tiered fallback — same conservative tiers as the host planner,
+# kept in sync by hand. NVIDIA and AMD are both supported; elaborate driver/version
+# diagnostics and heterogeneous-backend selection stay in the host CLI.
 
 set -euo pipefail
 
@@ -27,7 +27,7 @@ die()   { printf '\033[1;31m[ERROR]\033[0m %s\n' "$*" >&2; exit 1; }
 # `shell`            — drop into bash inside the container (debug).
 # `lucebox`          — dispatch to the Python CLI. Any subcommand
 #                      `lucebox.sh` doesn't handle on the host arrives here
-#                      (check, config, pull, print-run, smoke, …).
+#                      (check, config, pull, print-run, calibration probes, …).
 # `python` or anything else
 #                    — pass through to exec, so `docker run … python -m foo`
 #                      still works for dev.
@@ -73,6 +73,15 @@ esac
 # write-failure (read-only FS, etc.) gets a warning and we continue.
 write_host_info() {
     local target="/opt/lucebox-hub/HOST_INFO"
+    # If the target dir doesn't exist (e.g. running the entrypoint outside
+    # the canonical container layout: unit tests, plain `docker run` without
+    # a bind mount), don't try to write — bash's own "No such file or
+    # directory" complaint on the `> "$tmp"` redirect below would leak to
+    # stderr regardless of `2>/dev/null` (that suppresses the command's
+    # stderr, not the redirect itself). HOST_INFO is informational.
+    if [ ! -d "$(dirname "$target")" ]; then
+        return 0
+    fi
     local tmp="${target}.tmp.$$"
     local collected_at
     collected_at=$(date -u +%FT%TZ 2>/dev/null || echo "")
@@ -158,6 +167,15 @@ _json_int_or_null() {
 # `nvidia-smi --query-gpu=index,uuid,pci.bus_id,name,compute_cap,memory.total,power.limit
 #               --format=csv,noheader` produced on the host) into a JSON
 # array. Empty CSV → "[]". Each row becomes one object.
+# Strip leading/trailing whitespace from a string. Pure bash (no sed fork)
+# via prefix/suffix removal of the longest run of spaces or tabs.
+_trim() {
+    local s="$1"
+    s="${s#"${s%%[![:space:]]*}"}"   # leading
+    s="${s%"${s##*[![:space:]]}"}"   # trailing
+    printf '%s' "$s"
+}
+
 _emit_gpu_array() {
     local csv="${LUCEBOX_HOST_GPU_LIST_CSV:-}"
     if [ -z "$csv" ]; then
@@ -173,13 +191,13 @@ _emit_gpu_array() {
         # split on `,` alone and trim whitespace per field so both forms parse.
         local idx uuid pci name cc mem plimit
         IFS=',' read -r idx uuid pci name cc mem plimit <<<"$line"
-        idx=$(printf '%s' "$idx" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
-        uuid=$(printf '%s' "$uuid" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
-        pci=$(printf '%s' "$pci" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
-        name=$(printf '%s' "$name" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
-        cc=$(printf '%s' "$cc" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
-        mem=$(printf '%s' "$mem" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
-        plimit=$(printf '%s' "$plimit" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+        idx=$(_trim "$idx")
+        uuid=$(_trim "$uuid")
+        pci=$(_trim "$pci")
+        name=$(_trim "$name")
+        cc=$(_trim "$cc")
+        mem=$(_trim "$mem")
+        plimit=$(_trim "$plimit")
         # Strip units. "24576 MiB" → 24576; "175.00 W" → 175 (truncate).
         local mem_mib vram_gb power_w
         mem_mib=$(printf '%s' "$mem" | awk '{print $1+0}')
@@ -209,13 +227,16 @@ _build_host_info_json() {
     printf '"kernel":%s,'           "$(_json_str_or_null "${LUCEBOX_HOST_KERNEL:-}")"
     printf '"wsl_version":%s,'      "$(_json_str_or_null "${LUCEBOX_HOST_WSL_VERSION:-}")"
     printf '"docker_version":%s,'   "$(_json_str_or_null "${LUCEBOX_HOST_DOCKER_VERSION:-}")"
+    printf '"gpu_vendor":%s,'       "$(_json_str_or_null "${LUCEBOX_HOST_GPU_VENDOR:-}")"
     printf '"nvidia_driver":%s,'    "$(_json_str_or_null "${LUCEBOX_HOST_DRIVER_VERSION:-}")"
     printf '"nvidia_ctk_version":%s,' "$(_json_str_or_null "${LUCEBOX_HOST_NVIDIA_CTK_VERSION:-}")"
+    printf '"rocm_version":%s,'     "$(_json_str_or_null "${LUCEBOX_HOST_ROCM_VERSION:-}")"
     printf '"cpu_model":%s,'        "$(_json_str_or_null "${LUCEBOX_HOST_CPU_MODEL:-}")"
     printf '"nproc":%s,'            "$(_json_int_or_null "${LUCEBOX_HOST_NPROC:-}")"
     printf '"ram_gb":%s,'           "$(_json_int_or_null "${LUCEBOX_HOST_RAM_GB:-}")"
     printf '"gpus":%s,'             "$(_emit_gpu_array)"
     printf '"cuda_visible_devices":%s,' "$(_json_str_or_null "${LUCEBOX_HOST_CUDA_VISIBLE_DEVICES:-}")"
+    printf '"hip_visible_devices":%s,' "$(_json_str_or_null "${LUCEBOX_HOST_HIP_VISIBLE_DEVICES:-}")"
     printf '"source":%s,'           "$(_json_str_or_null "$source_tag")"
     printf '"collector":%s,'        "$(_json_str_or_null "$collector_tag")"
     printf '"collected_at":%s'      "$(_json_str_or_null "$collected_at")"
@@ -225,17 +246,73 @@ _build_host_info_json() {
 write_host_info
 
 # ── detect ─────────────────────────────────────────────────────────────────
-# nvidia-smi is always present here (--gpus all wires the driver in).
+# The host wrapper wires either NVIDIA (--gpus all) or AMD (/dev/kfd +
+# /dev/dri). Direct docker users get the same fallback detection here.
 GPU_VRAM_GB=0
+GPU_COUNT=0
 if command -v nvidia-smi &>/dev/null; then
     if mem_mib=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null \
                   | head -1) && [ -n "$mem_mib" ]; then
-        GPU_VRAM_GB=$((mem_mib / 1024))
+        mem_mib=$(_trim "$mem_mib")
+        if [[ "$mem_mib" =~ ^[0-9]+$ ]]; then
+            GPU_VRAM_GB=$((mem_mib / 1024))
+        fi
+    fi
+    GPU_COUNT=$(nvidia-smi -L 2>/dev/null | awk '/^GPU /{n++} END{print n+0}') || GPU_COUNT=0
+elif command -v amd-smi &>/dev/null; then
+    amd_stats=$(amd-smi static --asic --vram --csv 2>/dev/null | awk -F',' '
+        NR == 1 {
+            for (i = 1; i <= NF; i++) {
+                key = tolower($i); gsub(/^[[:space:]]+|[[:space:]\r]+$/, "", key); col[key] = i
+            }
+            next
+        }
+        {
+            mem = $(col["size"]); arch = $(col["target_graphics_version"])
+            gsub(/^[[:space:]]+|[[:space:]\r]+$/, "", mem)
+            gsub(/^[[:space:]]+|[[:space:]\r]+$/, "", arch)
+            if (mem ~ /^[0-9]+([.][0-9]+)?$/) {
+                n++
+                if (mem > max) { max = mem; max_arch = arch }
+            }
+        }
+        END { if (n) printf "%d %d %s", max / 1024, n, max_arch }
+    ' || echo "")
+    if [ -n "$amd_stats" ]; then
+        read -r GPU_VRAM_GB GPU_COUNT GPU_ARCH <<<"$amd_stats"
+    fi
+elif command -v rocm-smi &>/dev/null; then
+    amd_stats=$(rocm-smi --showproductname --showmeminfo vram --csv 2>/dev/null | awk -F',' '
+        NR == 1 {
+            for (i = 1; i <= NF; i++) {
+                key = tolower($i); gsub(/^[[:space:]]+|[[:space:]\r]+$/, "", key); col[key] = i
+            }
+            next
+        }
+        {
+            bytes = $(col["vram total memory (b)"]); arch = $(col["gfx version"])
+            gsub(/^[[:space:]]+|[[:space:]\r]+$/, "", bytes)
+            gsub(/^[[:space:]]+|[[:space:]\r]+$/, "", arch)
+            if (bytes ~ /^[0-9]+$/) {
+                n++
+                if (bytes > max) { max = bytes; max_arch = arch }
+            }
+        }
+        END { if (n) printf "%d %d %s", max / 1073741824, n, max_arch }
+    ' || echo "")
+    if [ -n "$amd_stats" ]; then
+        read -r GPU_VRAM_GB GPU_COUNT GPU_ARCH <<<"$amd_stats"
     fi
 fi
-GPU_COUNT=0
-if command -v nvidia-smi &>/dev/null; then
-    GPU_COUNT=$(nvidia-smi -L 2>/dev/null | awk '/^GPU /{n++} END{print n+0}') || GPU_COUNT=0
+
+# Strix Halo's unified memory is usable for model weights even when SMI only
+# reports the small fixed VRAM carve-out. Mirror the host wrapper's effective
+# capacity rule for direct `docker run` users.
+if [ "${GPU_ARCH:-}" = "gfx1151" ] && [ "$GPU_VRAM_GB" -lt 12 ]; then
+    host_ram_gb=$(awk '/MemTotal/{printf "%.0f", $2/1024/1024}' /proc/meminfo 2>/dev/null || echo 0)
+    if [ "$host_ram_gb" -ge 32 ]; then
+        GPU_VRAM_GB=$host_ram_gb
+    fi
 fi
 
 # ── fallback autotune (only fills unset env) ───────────────────────────────
@@ -250,14 +327,11 @@ if [ "$GPU_VRAM_GB" -gt 0 ]; then
         IS_WSL=1
     fi
     if [ "$GPU_VRAM_GB" -lt 12 ]; then
-        : "${DFLASH_LAZY:=1}"
         : "${DFLASH_MAX_CTX:=4096}"
         warn "VRAM ${GPU_VRAM_GB} GB < 12 GB — 27B target unlikely to fit"
     elif [ "$GPU_VRAM_GB" -lt 22 ]; then
-        : "${DFLASH_LAZY:=1}"
         : "${DFLASH_MAX_CTX:=32768}"
     elif [ "$GPU_VRAM_GB" -lt 32 ]; then
-        : "${DFLASH_LAZY:=1}"
         if [ "$IS_WSL" = "1" ]; then
             : "${DFLASH_BUDGET:=16}"
             : "${DFLASH_MAX_CTX:=65536}"
@@ -268,6 +342,12 @@ if [ "$GPU_VRAM_GB" -gt 0 ]; then
         : "${DFLASH_MAX_CTX:=131072}"
     fi
 fi
+
+# Do not synthesize DFLASH_LAZY here. dflash_server ignores --lazy-draft
+# unless both a decode draft and a prefill scorer are configured, so setting
+# it from VRAM alone would claim an optimization the runtime cannot apply.
+
+[ "${GPU_ARCH:-}" = "gfx1100" ] && : "${DFLASH_BUDGET:=8}"
 
 : "${DFLASH_BIN:=$DFLASH_DIR/build/test_dflash}"
 : "${DFLASH_SERVER_BIN:=$DFLASH_DIR/build/dflash_server}"
@@ -285,6 +365,12 @@ fi
 : "${DFLASH_PREFILL_KEEP:=0.05}"
 : "${DFLASH_PREFILL_THRESHOLD:=32000}"
 : "${DFLASH_PREFILL_DRAFTER:=}"
+: "${DFLASH_KVFLASH:=off}"
+: "${DFLASH_KVFLASH_POLICY:=drafter}"
+: "${DFLASH_KVFLASH_TAU:=64}"
+: "${DFLASH_SPARK:=0}"
+: "${DFLASH_SPARK_VRAM_GB:=0}"
+: "${DFLASH_DS4_PREFILL:=exact}"
 # Optional server default for requests that omit max_tokens. When unset,
 # the C++ server uses the model-card default.
 : "${DFLASH_DEFAULT_MAX_TOKENS:=}"
@@ -292,11 +378,10 @@ fi
 # share/model_cards/<name>.json). When unset, the C++ server uses its default
 # ("dflash"). Lets an operator surface the real model id without a wrapper.
 : "${DFLASH_MODEL_NAME:=}"
-# Phase-1 (thinking) cap when a request opts into thinking. Default mirrors
-# antirez/ds4 ds4_eval.c: think_max_tokens = max_tokens(16000) - hard_limit
-# reply budget(512) = 15488. The server's own hardcoded default is 10000;
-# overriding here aligns ds4-eval and similar reasoning benches with upstream.
-: "${DFLASH_THINK_MAX:=15488}"
+# Optional phase-1 (thinking) cap. When unset, the native server resolves it
+# from the selected model card, then its per-family and hard fallbacks. A
+# global DeepSeek-derived cap is unsafe for models with larger card budgets.
+: "${DFLASH_THINK_MAX:=}"
 # Soft-close thinking termination dial (PR #326). Lets the AR loop force
 # </think> early when the close-token logit comes within this probability
 # ratio of the chosen-token logit. Range [0.0, 1.0]; 0.0 = disabled (server
@@ -315,6 +400,18 @@ fi
 # the KV footprint. Only emitted to the server CLI when nonzero so
 # unset reproduces the server's own default unchanged.
 : "${DFLASH_FA_WINDOW:=0}"
+# Accelerator placement is resolved by the host CLI. Empty values preserve the
+# server's historical auto:0 defaults for direct Docker users.
+: "${DFLASH_PLACEMENT_MODE:=single}"
+: "${DFLASH_TARGET_DEVICE:=}"
+: "${DFLASH_TARGET_DEVICES:=}"
+: "${DFLASH_TARGET_LAYER_SPLIT:=}"
+: "${DFLASH_DRAFT_DEVICE:=}"
+: "${DFLASH_REMOTE_DRAFT:=0}"
+: "${DFLASH_REMOTE_TARGET_SHARD:=0}"
+: "${DFLASH_PEER_ACCESS:=0}"
+: "${DFLASH_REMOTE_EXPERT_DEVICE:=}"
+: "${DFLASH_BACKEND_IPC_BIN:=$DFLASH_DIR/build/backend_ipc_daemon}"
 
 # ── auto-detect target ─────────────────────────────────────────────────────
 # Target .gguf is typically 10-30 GB (Q4_K_M). Drafts are 1-2 GB (Q8_0 / Q4)
@@ -330,11 +427,20 @@ fi
 if [ -z "$DFLASH_TARGET" ] && [ -d "$DFLASH_DIR/models" ]; then
     # Collect candidates: .gguf files ≥5 GB (target-sized), excluding
     # anything under models/draft/. Sort alphabetically for determinism.
-    mapfile -t TARGET_CANDIDATES < <(
+    TARGET_CANDIDATES=()
+    while IFS= read -r candidate; do
+        [ -n "$candidate" ] || continue
+        # Avoid GNU-only find predicates (`-printf`, `-size +5G`). The native
+        # entrypoint is also exercised from macOS contributor checkouts, and
+        # `wc -c` obtains a regular file's logical size without reading a
+        # sparse multi-gigabyte fixture into memory.
+        candidate_bytes=$(wc -c <"$candidate" 2>/dev/null || echo 0)
+        [ "$candidate_bytes" -gt 5368709120 ] 2>/dev/null \
+            && TARGET_CANDIDATES+=("$candidate")
+    done < <(
         find -L "$DFLASH_DIR/models" -maxdepth 4 -type f -name '*.gguf' \
-            -size +5G \
-            -not -path '*/draft/*' \
-            -printf '%p\n' 2>/dev/null \
+            ! -path '*/draft/*' \
+            -print 2>/dev/null \
           | sort
     )
     case "${#TARGET_CANDIDATES[@]}" in
@@ -366,7 +472,7 @@ fi
 
 # Qwen3.6 DFlash drafters use sliding-window attention in the draft. Some GGUFs
 # carry this metadata directly; keep the documented env override as the startup
-# default so older drafts behave like the autotune-sweep path.
+# default so older drafts retain the documented startup behavior.
 case "$(basename "$DFLASH_TARGET")" in
     *Qwen3.6*|*qwen3.6*)
         if [ -z "${DFLASH27B_DRAFT_SWA:-}" ]; then
@@ -415,6 +521,10 @@ if [ -d "$DFLASH_DRAFT" ]; then
     # then generic dflash-draft-*.gguf legacy, then last-resort *.gguf.
     # The 31B match in the Lucebox repo uses capital B in the filename —
     # -iname handles that without needing to enumerate every case form.
+    # Bash 3.2 + `set -u` treats an expansion of an empty array as an
+    # unbound variable. Keep a non-empty sentinel for an unknown family and
+    # build the combined search list explicitly below. The production image
+    # uses a newer Bash, but this also keeps host-side smoke tests portable.
     case "$(echo "$TARGET_BASENAME" | tr 'A-Z' 'a-z')" in
         *gemma-4-26b*|*gemma4-26b*)
             FAMILY_GLOBS=('*gemma*4*26b*dflash*.gguf' '*dflash*gemma*4*26b*.gguf') ;;
@@ -425,7 +535,7 @@ if [ -d "$DFLASH_DRAFT" ]; then
         *qwen3.6*|*qwen36*)
             FAMILY_GLOBS=('dflash-draft-3.6-*.gguf' '*qwen*3.6*dflash*.gguf') ;;
         *)
-            FAMILY_GLOBS=() ;;
+            FAMILY_GLOBS=('') ;;
     esac
 
     DRAFT_FILE=""
@@ -440,8 +550,14 @@ if [ -d "$DFLASH_DRAFT" ]; then
     # `*.gguf` / safetensors fallbacks.
     GENERIC_GLOBS=('dflash-draft-*.gguf' '*dflash*.gguf' '*.gguf' 'model.safetensors' '*.safetensors')
     family_count="${#FAMILY_GLOBS[@]}"
+    if [ -z "${FAMILY_GLOBS[0]}" ]; then
+        family_count=0
+        ALL_DRAFT_GLOBS=("${GENERIC_GLOBS[@]}")
+    else
+        ALL_DRAFT_GLOBS=("${FAMILY_GLOBS[@]}" "${GENERIC_GLOBS[@]}")
+    fi
     i=0
-    for pattern in "${FAMILY_GLOBS[@]}" "${GENERIC_GLOBS[@]}"; do
+    for pattern in "${ALL_DRAFT_GLOBS[@]}"; do
         # Sort matches lexicographically so the pick is deterministic across
         # filesystems (find's traversal order is filesystem-dependent without
         # an explicit sort). First lexicographic match wins.
@@ -460,10 +576,8 @@ if [ -d "$DFLASH_DRAFT" ]; then
     # even if the init on line ~257 was somehow skipped (e.g. a future refactor
     # that moves the init out of this block, or a partial-rewrite during a
     # rebase that drops it). Coalesce-to-empty inline so a regression can't
-    # re-trip the unbound-variable crash that fired on the sindri sweep with
-    # multiple target GGUFs in models/ (commit a87bb93 was a partial fix —
-    # the recurrence proved that "initialize once at the top of the block"
-    # is too easy to undo). Cost: zero bytes at runtime.
+    # re-trip the unbound-variable crash seen with multiple target GGUFs in
+    # models/. Coalescing at the read site keeps a future refactor safe.
     DRAFT_FAMILY_GLOB="${DRAFT_FAMILY_GLOB:-}"
     if [ -n "$DRAFT_FILE" ] && [ -f "$DRAFT_FILE" ]; then
         DRAFT_ARG="$DRAFT_FILE"
@@ -481,14 +595,58 @@ elif [ -n "$DFLASH_DRAFT" ] && [ ! -f "$DFLASH_DRAFT" ]; then
     DRAFT_ARG=""
 fi
 
-[ "$GPU_COUNT" -gt 1 ] && warn "${GPU_COUNT} GPUs detected — native server layer sharding is not auto-enabled"
+if [ "$GPU_COUNT" -gt 1 ] \
+   && [ -z "$DFLASH_TARGET_DEVICE" ] \
+   && [ -z "$DFLASH_TARGET_DEVICES" ]; then
+    warn "${GPU_COUNT} GPUs detected but no placement profile was supplied; using the server default"
+fi
 
 # ── build + exec native server ────────────────────────────────────────────
 CMD=("$DFLASH_SERVER_BIN" "$DFLASH_TARGET"
      --host "$DFLASH_HOST"
      --port "$DFLASH_PORT"
-     --max-ctx "$DFLASH_MAX_CTX"
-     --think-max-tokens "$DFLASH_THINK_MAX")
+     --max-ctx "$DFLASH_MAX_CTX")
+
+[ -n "$DFLASH_THINK_MAX" ] && CMD+=(--think-max-tokens "$DFLASH_THINK_MAX")
+
+if [ -n "$DFLASH_TARGET_DEVICES" ]; then
+    [ -z "$DFLASH_TARGET_DEVICE" ] \
+        || die "DFLASH_TARGET_DEVICE conflicts with DFLASH_TARGET_DEVICES"
+    [ -n "$DFLASH_TARGET_LAYER_SPLIT" ] \
+        || die "DFLASH_TARGET_DEVICES requires DFLASH_TARGET_LAYER_SPLIT"
+    CMD+=(--target-devices "$DFLASH_TARGET_DEVICES"
+          --target-layer-split "$DFLASH_TARGET_LAYER_SPLIT")
+elif [ -n "$DFLASH_TARGET_DEVICE" ]; then
+    CMD+=(--target-device "$DFLASH_TARGET_DEVICE")
+fi
+[ -n "$DFLASH_DRAFT_DEVICE" ] && CMD+=(--draft-device "$DFLASH_DRAFT_DEVICE")
+
+if [ "$DFLASH_REMOTE_DRAFT" = "1" ] \
+   || [ "$DFLASH_REMOTE_TARGET_SHARD" = "1" ] \
+   || [ -n "$DFLASH_REMOTE_EXPERT_DEVICE" ]; then
+    [ -x "$DFLASH_BACKEND_IPC_BIN" ] \
+        || die "backend IPC daemon missing or not executable at $DFLASH_BACKEND_IPC_BIN"
+fi
+[ "$DFLASH_REMOTE_DRAFT" = "1" ] \
+    && CMD+=(--draft-ipc-bin "$DFLASH_BACKEND_IPC_BIN")
+[ "$DFLASH_REMOTE_TARGET_SHARD" = "1" ] \
+    && CMD+=(--target-shard-ipc-bin "$DFLASH_BACKEND_IPC_BIN")
+[ "$DFLASH_PEER_ACCESS" = "1" ] && CMD+=(--peer-access)
+
+if [ -n "$DFLASH_REMOTE_EXPERT_DEVICE" ]; then
+    [ "$DFLASH_SPARK" = "1" ] \
+        || die "DFLASH_REMOTE_EXPERT_DEVICE requires DFLASH_SPARK=1"
+    case "$DFLASH_REMOTE_EXPERT_DEVICE" in
+        cuda:[0-9]*|hip:[0-9]*) ;;
+        *) die "bad DFLASH_REMOTE_EXPERT_DEVICE (expected cuda:N or hip:N)" ;;
+    esac
+    remote_expert_gpu="${DFLASH_REMOTE_EXPERT_DEVICE##*:}"
+    [[ "$remote_expert_gpu" =~ ^[0-9]+$ ]] \
+        || die "bad DFLASH_REMOTE_EXPERT_DEVICE GPU index"
+    export DFLASH_MOE_EXPERT_COMPUTE_IPC_BIN="$DFLASH_BACKEND_IPC_BIN"
+    export DFLASH_MOE_EXPERT_COMPUTE_IPC_GPU="$remote_expert_gpu"
+    export DFLASH_MOE_EXPERT_COMPUTE_IPC_REQUIRED=1
+fi
 
 # Keep cache defaults owned by dflash_server. In particular, omitting
 # DFLASH_PREFIX_CACHE_SLOTS preserves the native nonzero default instead of
@@ -501,12 +659,13 @@ CMD=("$DFLASH_SERVER_BIN" "$DFLASH_TARGET"
 [ -n "$DRAFT_ARG" ]                && CMD+=(--ddtree --ddtree-budget "$DFLASH_BUDGET")
 [ -n "$DFLASH_DEFAULT_MAX_TOKENS" ] && CMD+=(--default-max-tokens "$DFLASH_DEFAULT_MAX_TOKENS")
 [ -n "$DFLASH_MODEL_NAME" ]         && CMD+=(--model-name "$DFLASH_MODEL_NAME")
+[ -n "$DFLASH_PREFILL_DRAFTER" ]    && CMD+=(--prefill-drafter "$DFLASH_PREFILL_DRAFTER")
 # `--lazy-draft` is silently dropped by the C++ server unless both
 # `--prefill-drafter` and `--draft` are present (look for the runtime
 # warning `--lazy-draft ignored: requires both --prefill-drafter and
 # --draft`). Warn loudly here when the operator's config asked for lazy
-# but we're about to drop it — sweeping past the silent no-op was the
-# fingerprint left in every sindri decode-tuning docker.stderr.
+# but we're about to drop it; otherwise performance measurements silently run
+# a different profile from the one the operator selected.
 if [ "$DFLASH_LAZY" = "1" ]; then
     if [ -z "$DRAFT_ARG" ] || [ -z "$DFLASH_PREFILL_DRAFTER" ]; then
         warn "DFLASH_LAZY=1 ignored: requires both DFLASH_DRAFT and DFLASH_PREFILL_DRAFTER (see entrypoint.sh comment). Continuing without --lazy-draft."
@@ -517,6 +676,23 @@ fi
 [ -n "$DFLASH_CACHE_TYPE_K" ]      && CMD+=(--cache-type-k "$DFLASH_CACHE_TYPE_K")
 [ -n "$DFLASH_CACHE_TYPE_V" ]      && CMD+=(--cache-type-v "$DFLASH_CACHE_TYPE_V")
 [ "$DFLASH_FA_WINDOW" -gt 0 ] 2>/dev/null && CMD+=(--fa-window "$DFLASH_FA_WINDOW")
+if [ "$DFLASH_KVFLASH" != "off" ] && [ -n "$DFLASH_KVFLASH" ]; then
+    CMD+=(--kvflash "$DFLASH_KVFLASH"
+          --kvflash-policy "$DFLASH_KVFLASH_POLICY"
+          --kvflash-tau "$DFLASH_KVFLASH_TAU")
+fi
+if [ "$DFLASH_SPARK" = "1" ]; then
+    CMD+=(--spark)
+    case "$DFLASH_SPARK_VRAM_GB" in
+        0|0.0|0.00|"") ;;
+        *) CMD+=(--spark-vram "$DFLASH_SPARK_VRAM_GB") ;;
+    esac
+fi
+case "$DFLASH_DS4_PREFILL" in
+    exact) ;;
+    dense|sparse) CMD+=(--ds4-prefill "$DFLASH_DS4_PREFILL") ;;
+    *) die "DFLASH_DS4_PREFILL must be exact, dense, or sparse" ;;
+esac
 # Soft-close ratio: emit only when nonzero. The default-string compare
 # guards against the floating-point quirks of `[` numeric tests for
 # values like 0.0/0/0.00 — anything non-"0.0" passes through to the
@@ -532,11 +708,14 @@ if [ "$DFLASH_PREFILL_MODE" != "off" ]; then
     [ -f "$DFLASH_PREFILL_DRAFTER" ] || die "Prefill drafter not found at $DFLASH_PREFILL_DRAFTER"
     CMD+=(--prefill-compression "$DFLASH_PREFILL_MODE"
           --prefill-keep-ratio "$DFLASH_PREFILL_KEEP"
-          --prefill-threshold "$DFLASH_PREFILL_THRESHOLD"
-          --prefill-drafter "$DFLASH_PREFILL_DRAFTER")
+          --prefill-threshold "$DFLASH_PREFILL_THRESHOLD")
 fi
 
-info "lucebox-hub container starting (target=$(basename "$DFLASH_TARGET"), max_ctx=$DFLASH_MAX_CTX, budget=$DFLASH_BUDGET, lazy=$DFLASH_LAZY)"
+if [ "${LUCEBOX_NATIVE:-0}" = "1" ]; then
+    info "lucebox native server starting (target=$(basename "$DFLASH_TARGET"), max_ctx=$DFLASH_MAX_CTX, budget=$DFLASH_BUDGET, lazy=$DFLASH_LAZY)"
+else
+    info "lucebox-hub container starting (target=$(basename "$DFLASH_TARGET"), max_ctx=$DFLASH_MAX_CTX, budget=$DFLASH_BUDGET, lazy=$DFLASH_LAZY)"
+fi
 
 cd "$DFLASH_DIR"
 exec "${CMD[@]}"

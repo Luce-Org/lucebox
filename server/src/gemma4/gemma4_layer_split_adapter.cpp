@@ -600,8 +600,10 @@ bool Gemma4LayerSplitAdapter::run_forward(
                 return false;
             }
             ggml_backend_synchronize(current_shard->backend);
-            ggml_backend_tensor_copy(act_in, next_acts.a);
-            ggml_backend_tensor_copy(orig.tensor, next_orig.tensor);
+            copy_layer_split_tensor(
+                act_in, current_shard->gpu, next_acts.a, shard->gpu);
+            copy_layer_split_tensor(
+                orig.tensor, current_shard->gpu, next_orig.tensor, shard->gpu);
             ggml_backend_synchronize(shard->backend);
             activation_pair_free(acts);
             activation_buffer_free(orig);
@@ -852,8 +854,10 @@ bool Gemma4LayerSplitAdapter::run_mixed_forward(
                 return false;
             }
             ggml_backend_synchronize(current_shard->backend);
-            ggml_backend_tensor_copy(act_in, next_acts.a);
-            ggml_backend_tensor_copy(orig.tensor, next_orig.tensor);
+            copy_layer_split_tensor(
+                act_in, current_shard->gpu, next_acts.a, shard->gpu);
+            copy_layer_split_tensor(
+                orig.tensor, current_shard->gpu, next_orig.tensor, shard->gpu);
             ggml_backend_synchronize(shard->backend);
             activation_pair_free(acts);
             activation_buffer_free(orig);
@@ -1467,8 +1471,10 @@ int run_gemma4_target_shard_ipc_daemon(const char * target_path,
                     break;
                 }
                 ggml_backend_synchronize(current_shard->backend);
-                ggml_backend_tensor_copy(act_in, next_acts.a);
-                ggml_backend_tensor_copy(orig.tensor, next_orig.tensor);
+                copy_layer_split_tensor(
+                    act_in, current_shard->gpu, next_acts.a, shard->gpu);
+                copy_layer_split_tensor(
+                    orig.tensor, current_shard->gpu, next_orig.tensor, shard->gpu);
                 ggml_backend_synchronize(shard->backend);
                 activation_pair_free(acts);
                 activation_buffer_free(orig);

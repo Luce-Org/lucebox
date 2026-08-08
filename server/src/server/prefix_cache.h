@@ -27,15 +27,23 @@ namespace dflash::common {
 // ─── Chat marker detection ──────────────────────────────────────────────
 
 struct ChatMarkers {
-    std::string family;  // "qwen", "gemma", or "laguna"
+    std::string family;  // "qwen", "gemma", "laguna", or "deepseek"
     // Token sequences for boundary detection
     std::vector<int32_t> sys_role_prefix;
     std::vector<std::vector<int32_t>> end_msg_seqs;
     std::vector<std::vector<int32_t>> next_role_starts;
+    // ChatML-style templates delimit a safe boundary with an end marker
+    // followed by the next role marker. DeepSeek's DSML template has no
+    // explicit system/user end marker, so each role start is itself a safe
+    // cut point after the marker has been consumed.
+    bool boundary_on_role_start = false;
 };
 
-// Resolve chat markers from the tokenizer (detects Qwen, Gemma, or Laguna family).
-bool resolve_chat_markers(const Tokenizer & tok, ChatMarkers & out);
+// Resolve chat markers from the tokenizer and detected model architecture.
+// Architecture is required for templates whose delimiters are ordinary text:
+// blindly probing them would classify every tokenizer as that family.
+bool resolve_chat_markers(const Tokenizer & tok, const std::string & arch,
+                          ChatMarkers & out);
 
 // Find all turn-boundary cut points in a token stream.
 std::vector<int> find_all_boundaries(const std::vector<int32_t> & ids,
@@ -92,7 +100,7 @@ public:
     static constexpr int MAX_SLOTS = 64;
 
     // cap = number of prefix-cache slots (0 disables).
-    PrefixCache(int cap, const Tokenizer & tokenizer);
+    PrefixCache(int cap, const Tokenizer & tokenizer, const std::string & arch);
 
     bool disabled() const { return disabled_; }
 

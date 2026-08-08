@@ -26,6 +26,10 @@
 
 namespace dflash::common {
 
+// DSpark's CUDA path is qualified broadly except for the known GB10 sm_121
+// tensor-read failure. Kept pure so the runtime policy has a unit test.
+bool deepseek4_dspark_supports_cuda_sm(int sm);
+
 class DeepSeek4Backend : public ModelBackend {
 public:
     explicit DeepSeek4Backend(const DeepSeek4BackendConfig & cfg);

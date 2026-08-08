@@ -22,7 +22,9 @@
 #include "common/sampler.h"
 #include "common/backend_precision.h"
 #include "common/backend_ipc.h"
+#include "common/platform_env.h"
 #include "common/moe_hybrid_ffn_eval.h"
+#include "flashprefill.h"
 #include "common/moe_hybrid_placement.h"
 #include "placement/pflash_placement.h"
 #include "common/io_utils.h"
@@ -36,6 +38,7 @@
 #include "ggml-cpu.h"
 #include "server/prompt_normalize.h"
 #include "qwen3_drafter_model.h"
+#include "deepseek4/deepseek4_backend.h"
 #include "dflash27b.h"
 #include "gguf.h"
 #include <nlohmann/json.hpp>
@@ -94,6 +97,30 @@ struct ServerUnitFixture {};
             std::to_string(__LINE__) + ": " + #expr + " — " + std::string(msg)); \
     } \
 } while (0)
+
+TEST_CASE(ServerUnitFixture, test_feature_flag_and_sparse_hardware_policy) {
+    constexpr const char * flag = "DFLASH_TEST_FEATURE_FLAG";
+    dflash_unsetenv(flag);
+    TEST_ASSERT(!environment_variable_enabled(flag));
+    dflash_setenv(flag, "0");
+    TEST_ASSERT(!environment_variable_enabled(flag));
+    dflash_setenv(flag, "1");
+    TEST_ASSERT(environment_variable_enabled(flag));
+    dflash_unsetenv(flag);
+
+    TEST_ASSERT(!flashprefill::custom_bf16_sparse_supports_cuda_sm(75));
+    TEST_ASSERT(flashprefill::custom_bf16_sparse_supports_cuda_sm(80));
+    TEST_ASSERT(flashprefill::custom_bf16_sparse_supports_cuda_sm(86));
+    TEST_ASSERT(flashprefill::custom_bf16_sparse_supports_cuda_sm(120));
+    TEST_ASSERT(!flashprefill::custom_bf16_sparse_supports_cuda_sm(121));
+    TEST_ASSERT(flashprefill::local_pflash_supports_cuda_sm(75));
+    TEST_ASSERT(flashprefill::local_pflash_supports_cuda_sm(120));
+    TEST_ASSERT(!flashprefill::local_pflash_supports_cuda_sm(121));
+
+    TEST_ASSERT(deepseek4_dspark_supports_cuda_sm(90));
+    TEST_ASSERT(deepseek4_dspark_supports_cuda_sm(120));
+    TEST_ASSERT(!deepseek4_dspark_supports_cuda_sm(121));
+}
 
 TEST_CASE(ServerUnitFixture, test_daemon_io_external_cancellation_latches) {
     bool cancel = false;
@@ -1822,7 +1849,7 @@ TEST_CASE(ServerUnitFixture, test_resolve_deepseek_chat_markers) {
     TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
 
     ChatMarkers markers;
-    TEST_ASSERT(resolve_chat_markers(tokenizer, markers));
+    TEST_ASSERT(resolve_chat_markers(tokenizer, "deepseek4", markers));
     TEST_ASSERT(markers.family == "deepseek");
     TEST_ASSERT(markers.sys_role_prefix == std::vector<int32_t>({1}));
     TEST_ASSERT(markers.end_msg_seqs ==
@@ -1914,6 +1941,31 @@ TEST_CASE(ServerUnitFixture, test_tool_schema_is_part_of_stable_system_boundary)
                 hash_prefix(prompt_new_user.data(), system_end));
     TEST_ASSERT(hash_prefix(prompt_a.data(), system_end) !=
                 hash_prefix(prompt_new_tools.data(), system_end));
+}
+
+TEST_CASE(ServerUnitFixture, test_deepseek_role_starts_are_safe_boundaries) {
+    // Synthetic DSML-shaped prompt:
+    //   <BOS> system <User> u1 <Assistant> a1 <EOS> <User> u2 <Assistant>
+    // DeepSeek has no explicit system/user end delimiter. The role marker
+    // itself is the safe cut after all preceding content has been consumed.
+    ChatMarkers markers;
+    markers.family = "deepseek4";
+    markers.sys_role_prefix = {10};
+    markers.next_role_starts = {{20}, {30}};
+    markers.boundary_on_role_start = true;
+
+    const std::vector<int32_t> prompt = {
+        10, 100, 20, 200, 30, 300, 40, 20, 400, 30,
+    };
+    const auto bounds = find_all_boundaries(prompt, markers);
+    TEST_ASSERT(bounds == std::vector<int>({3, 5, 8, 10}));
+
+    // The snapshot excludes the current user text while preserving the full
+    // stable conversation prefix, matching the existing ChatML policy.
+    TEST_ASSERT(select_inline_snapshot_boundary(bounds) == 8);
+
+    const std::vector<int32_t> missing_bos = {100, 20, 200, 30};
+    TEST_ASSERT(find_all_boundaries(missing_bos, markers).empty());
 }
 
 TEST_CASE(ServerUnitFixture, test_inline_snapshot_boundary_advances_past_restore) {
@@ -2681,6 +2733,152 @@ TEST_CASE(ServerUnitFixture, test_normalize_responses_tool_followup_messages) {
         TEST_ASSERT(chat_msgs[3].role == "tool");
         TEST_ASSERT(chat_msgs[3].tool_call_id == call_id);
         TEST_ASSERT(chat_msgs[3].content == "Process exited with code 0");
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_normalize_anthropic_tool_followup_messages) {
+    ToolMemory tool_memory;
+    const std::string first_id = "toolu_read_001";
+    const std::string second_id = "toolu_search_002";
+    const std::string raw_tool_turn =
+        "<function=read_file>\n<parameter=path>\nREADME.md\n</parameter>\n"
+        "</function>\n<function=search>\n<parameter=query>\nDFlash\n</parameter>\n"
+        "</function>\n";
+    tool_memory.remember({first_id, second_id}, raw_tool_turn);
+
+    json messages = json::array({
+        {
+            {"role", "assistant"},
+            {"content", json::array({
+                {{"type", "text"}, {"text", "I will inspect both files."}},
+                {
+                    {"type", "tool_use"},
+                    {"id", first_id},
+                    {"name", "read_file"},
+                    {"input", {{"path", "README.md"}}},
+                },
+                {
+                    {"type", "tool_use"},
+                    {"id", second_id},
+                    {"name", "search"},
+                    {"input", {{"query", "DFlash"}}},
+                },
+            })},
+        },
+        {
+            {"role", "user"},
+            {"content", json::array({
+                {
+                    {"type", "tool_result"},
+                    {"tool_use_id", first_id},
+                    {"content", "# Lucebox"},
+                },
+                {
+                    {"type", "tool_result"},
+                    {"tool_use_id", second_id},
+                    {"content", json::array({{
+                        {"type", "text"},
+                        {"text", "Found 3 matches"},
+                    }})},
+                },
+                {{"type", "text"}, {"text", "Now summarize."}},
+            })},
+        },
+    });
+
+    auto chat_msgs = normalize_chat_messages(messages, ApiFormat::ANTHROPIC, tool_memory);
+    TEST_ASSERT(chat_msgs.size() == 4);
+    if (chat_msgs.size() == 4) {
+        TEST_ASSERT(chat_msgs[0].role == "assistant");
+        TEST_ASSERT(chat_msgs[0].content == raw_tool_turn);
+        TEST_ASSERT(chat_msgs[1].role == "tool");
+        TEST_ASSERT(chat_msgs[1].tool_call_id == first_id);
+        TEST_ASSERT(chat_msgs[1].content == "# Lucebox");
+        TEST_ASSERT(chat_msgs[2].role == "tool");
+        TEST_ASSERT(chat_msgs[2].tool_call_id == second_id);
+        TEST_ASSERT(chat_msgs[2].content == "Found 3 matches");
+        TEST_ASSERT(chat_msgs[3].role == "user");
+        TEST_ASSERT(chat_msgs[3].content == "Now summarize.");
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_normalize_responses_parallel_calls_replay_once) {
+    ToolMemory tool_memory;
+    const std::string first_id = "call_read_001";
+    const std::string second_id = "call_search_002";
+    const std::string raw_tool_turn =
+        "<function=read_file>\n<parameter=path>\nREADME.md\n</parameter>\n"
+        "</function>\n<function=search>\n<parameter=query>\nDFlash\n</parameter>\n"
+        "</function>\n";
+    tool_memory.remember({first_id, second_id}, raw_tool_turn);
+
+    json messages = json::array({
+        {
+            {"type", "message"},
+            {"role", "user"},
+            {"content", json::array({{
+                {"type", "input_text"},
+                {"text", "Inspect the repository"},
+            }})},
+        },
+        {
+            {"type", "function_call"},
+            {"call_id", first_id},
+            {"name", "read_file"},
+            {"arguments", R"({"path":"README.md"})"},
+        },
+        {
+            {"type", "function_call"},
+            {"call_id", second_id},
+            {"name", "search"},
+            {"arguments", R"({"query":"DFlash"})"},
+        },
+        {
+            {"type", "function_call_output"},
+            {"call_id", first_id},
+            {"output", "# Lucebox"},
+        },
+        {
+            {"type", "function_call_output"},
+            {"call_id", second_id},
+            {"output", "Found 3 matches"},
+        },
+    });
+
+    auto chat_msgs = normalize_chat_messages(messages, ApiFormat::RESPONSES, tool_memory);
+    TEST_ASSERT(chat_msgs.size() == 4);
+    if (chat_msgs.size() == 4) {
+        TEST_ASSERT(chat_msgs[0].role == "user");
+        TEST_ASSERT(chat_msgs[1].role == "assistant");
+        TEST_ASSERT(chat_msgs[1].content == raw_tool_turn);
+        TEST_ASSERT(chat_msgs[2].role == "tool");
+        TEST_ASSERT(chat_msgs[2].tool_call_id == first_id);
+        TEST_ASSERT(chat_msgs[3].role == "tool");
+        TEST_ASSERT(chat_msgs[3].tool_call_id == second_id);
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_normalize_openai_tool_fallback_survives_restart) {
+    ToolMemory empty_memory;
+    json messages = json::array({{
+        {"role", "assistant"},
+        {"content", "I will inspect it."},
+        {"tool_calls", json::array({{
+            {"id", "call_missing_after_restart"},
+            {"type", "function"},
+            {"function", {
+                {"name", "read_file"},
+                {"arguments", R"({"path":"README.md"})"},
+            }},
+        }})},
+    }});
+
+    auto chat_msgs = normalize_chat_messages(messages, ApiFormat::OPENAI_CHAT, empty_memory);
+    TEST_ASSERT(chat_msgs.size() == 1);
+    if (chat_msgs.size() == 1) {
+        TEST_ASSERT(chat_msgs[0].content.find("I will inspect it.") != std::string::npos);
+        TEST_ASSERT(chat_msgs[0].content.find("<function=read_file>") != std::string::npos);
+        TEST_ASSERT(chat_msgs[0].content.find("README.md") != std::string::npos);
     }
 }
 
@@ -4413,7 +4611,7 @@ TEST_CASE(ServerUnitFixture, test_sampler_needs_logit_processing) {
 
 TEST_CASE(ServerUnitFixture, test_server_config_cache_defaults) {
     ServerConfig cfg;
-    TEST_ASSERT(cfg.prefix_cache_cap == 32);
+    TEST_ASSERT(cfg.prefix_cache_cap == 8);
     TEST_ASSERT(cfg.prefill_cache_cap == 0);
 }
 
@@ -4467,7 +4665,7 @@ TEST_CASE(ServerUnitFixture, test_props_model_card_wholesale_sidecar) {
     };
     ServerConfig cfg = make_props_config_with_sidecar(sidecar);
     Tokenizer    tok;
-    PrefixCache  pc(0, tok);
+    PrefixCache  pc(0, tok, cfg.arch);
     ToolMemory   tm;
     json body = build_props_body(cfg, pc, tm);
 
@@ -4500,7 +4698,7 @@ TEST_CASE(ServerUnitFixture, test_props_model_card_null_on_family_fallback) {
     cfg.hard_limit_reply_budget = 512;
     cfg.think_max_tokens        = 32256;
     Tokenizer    tok;
-    PrefixCache  pc(0, tok);
+    PrefixCache  pc(0, tok, cfg.arch);
     ToolMemory   tm;
     json body = build_props_body(cfg, pc, tm);
 
@@ -4536,7 +4734,7 @@ TEST_CASE(ServerUnitFixture, test_props_budget_envelope_shape) {
     cfg.effort_tiers.max    = 500;
 
     Tokenizer    tok;
-    PrefixCache  pc(0, tok);
+    PrefixCache  pc(0, tok, cfg.arch);
     ToolMemory   tm;
     json body = build_props_body(cfg, pc, tm);
 
@@ -4585,7 +4783,7 @@ TEST_CASE(ServerUnitFixture, test_props_runtime_shape) {
     cfg.draft_device    = "auto:0";
 
     Tokenizer    tok;
-    PrefixCache  pc(0, tok);
+    PrefixCache  pc(0, tok, cfg.arch);
     ToolMemory   tm;
     json body = build_props_body(cfg, pc, tm);
 
@@ -5016,6 +5214,35 @@ TEST_CASE(ServerUnitFixture, test_prefix_key_stable_across_header_change) {
 }
 
 // FlowKV + disk-cache compose tests (T1–T7)
+
+TEST_CASE(ServerUnitFixture, test_pflash_request_policy_preserves_agent_prefixes) {
+    using Mode = ServerConfig::PflashMode;
+    using Strategy = PflashRequestStrategy;
+
+    TEST_ASSERT(select_pflash_request_strategy(
+        Mode::AUTO, 16000, 32000, false, false, false, false) == Strategy::Off);
+    TEST_ASSERT(select_pflash_request_strategy(
+        Mode::AUTO, 64000, 32000, false, false, false, false) ==
+        Strategy::WholePrompt);
+    TEST_ASSERT(select_pflash_request_strategy(
+        Mode::AUTO, 64000, 32000, false, true, true, false) ==
+        Strategy::PreservePrefix);
+    TEST_ASSERT(select_pflash_request_strategy(
+        Mode::AUTO, 64000, 32000, false, false, true, false) ==
+        Strategy::PreservePrefix);
+    TEST_ASSERT(select_pflash_request_strategy(
+        Mode::AUTO, 64000, 32000, true, false, true, false) ==
+        Strategy::PreservePrefix);
+    TEST_ASSERT(select_pflash_request_strategy(
+        Mode::AUTO, 64000, 32000, true, true, true, true) ==
+        Strategy::FlowKv);
+    TEST_ASSERT(select_pflash_request_strategy(
+        Mode::AUTO, 64000, 32000, false, false, false, true) ==
+        Strategy::PreservePrefix);
+    TEST_ASSERT(select_pflash_request_strategy(
+        Mode::ALWAYS, 1, 32000, false, false, false, false) ==
+        Strategy::WholePrompt);
+}
 
 // T4 (compress=false): policy name has no "+compress" suffix.
 TEST_CASE(ServerUnitFixture, test_flowkv_T4_compress_false_policy_name_no_suffix) {

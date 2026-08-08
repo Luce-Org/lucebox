@@ -26,6 +26,10 @@
 
 namespace dflash::common {
 
+bool deepseek4_dspark_supports_cuda_sm(int sm) {
+    return sm != 121;
+}
+
 namespace {
 using Clock = std::chrono::steady_clock;
 
@@ -40,6 +44,19 @@ static uint64_t elapsed_us(Clock::time_point start, Clock::time_point end) {
 static bool env_flag_enabled(const char * name) {
     const char * value = std::getenv(name);
     return value && value[0] && std::strcmp(value, "0") != 0;
+}
+
+static bool dspark_supported_on_current_device(int gpu, int & cuda_sm) {
+    cuda_sm = 0;
+#if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
+    (void) gpu;
+    return true;
+#else
+    cudaDeviceProp prop{};
+    if (cudaGetDeviceProperties(&prop, gpu) != cudaSuccess) return false;
+    cuda_sm = prop.major * 10 + prop.minor;
+    return deepseek4_dspark_supports_cuda_sm(cuda_sm);
+#endif
 }
 
 static void configure_gfx1151_dspark_mmvq_default(int gpu) {
@@ -682,6 +699,21 @@ bool DeepSeek4Backend::load_spec_drafter() {
         return false;
     }
     const PlacementBackend target_kind = placement_backend_of(backend_);
+    // Startup qualification covers only the target GPU. DFLASH_DS4_DRAFT_GPU
+    // can select a different CUDA device, so qualify the resolved draft
+    // device before creating a backend on it.
+    if (draft_kind == PlacementBackend::Cuda &&
+        (draft_kind != target_kind || draft_gpu != cfg_.device.gpu)) {
+        int draft_sm = 0;
+        if (!dspark_supported_on_current_device(draft_gpu, draft_sm)) {
+            std::fprintf(stderr,
+                         "[deepseek4] DSpark disabled: draft CUDA device %d "
+                         "(sm_%d) is not qualified; continuing with "
+                         "autoregressive decode\n",
+                         draft_gpu, draft_sm);
+            return false;
+        }
+    }
     if (draft_kind != target_kind || draft_gpu != cfg_.device.gpu ||
         separate_draft_stream) {
         std::string backend_error;
@@ -771,7 +803,7 @@ void DeepSeek4Backend::release_spec_drafter(bool mark_parked) {
         spec_backend_ = nullptr;
     }
     spec_enabled_ = false;
-    spec_feat_window_.clear();
+    std::vector<float>().swap(spec_feat_window_);
     spec_drafter_parked_ = mark_parked && !spec_draft_path_.empty();
 }
 
@@ -896,7 +928,20 @@ bool DeepSeek4Backend::init() {
                  prefill_attention_mode_name(cfg_.prefill_mode),
                  moe_hybrid_ ? " [hybrid]" : "");
 
-    if (env_flag_enabled("DFLASH_DS4_SPEC")) {
+    const bool dspark_requested = env_flag_enabled("DFLASH_DS4_SPEC");
+    int dspark_cuda_sm = 0;
+    if (dspark_requested &&
+        !dspark_supported_on_current_device(cfg_.device.gpu, dspark_cuda_sm)) {
+        if (dspark_cuda_sm == 121) {
+            std::fprintf(stderr,
+                "[deepseek4] DSpark disabled: CUDA sm_121 is not qualified; "
+                "continuing with autoregressive decode\n");
+        } else {
+            std::fprintf(stderr,
+                "[deepseek4] DSpark disabled: selected CUDA device could not "
+                "be qualified; continuing with autoregressive decode\n");
+        }
+    } else if (dspark_requested) {
         const char * dp = std::getenv("DFLASH_DS4_DRAFT");
         if (dp && *dp) {
             spec_draft_path_ = dp;

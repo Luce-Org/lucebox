@@ -1,9 +1,52 @@
 #include "peer_access.h"
 #include "internal.h"   // dflash_cuda_copy_between_devices
 
+#include <algorithm>
 #include <cstdio>
+#include <mutex>
 
 namespace dflash::common {
+
+namespace {
+
+std::mutex g_peer_pair_cache_mutex;
+
+#if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
+std::mutex g_host_staging_mutex;
+void * g_host_staging = nullptr;
+size_t g_host_staging_capacity = 0;
+
+bool copy_between_hip_devices_via_host(void * dst, int dst_device,
+                                       const void * src, int src_device,
+                                       size_t bytes) {
+    std::lock_guard<std::mutex> lock(g_host_staging_mutex);
+    if (g_host_staging_capacity < bytes) {
+        if (g_host_staging) {
+            if (cudaFreeHost(g_host_staging) != cudaSuccess) {
+                return false;
+            }
+            g_host_staging = nullptr;
+            g_host_staging_capacity = 0;
+        }
+        if (cudaMallocHost(&g_host_staging, bytes) != cudaSuccess) {
+            return false;
+        }
+        g_host_staging_capacity = bytes;
+    }
+
+    if (cudaSetDevice(src_device) != cudaSuccess ||
+        cudaMemcpy(g_host_staging, src, bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        return false;
+    }
+    if (cudaSetDevice(dst_device) != cudaSuccess ||
+        cudaMemcpy(dst, g_host_staging, bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+        return false;
+    }
+    return true;
+}
+#endif
+
+} // namespace
 
 // ── global state ────────────────────────────────────────────────
 bool g_peer_access_opt_in = false;
@@ -19,7 +62,7 @@ bool enable_peer_access_one_way(int device, int peer) {
     if (err != cudaSuccess) return false;
     err = cudaDeviceEnablePeerAccess(peer, 0);
     if (err == cudaErrorPeerAccessAlreadyEnabled) {
-        cudaGetLastError();
+        (void) cudaGetLastError();
         return true;
     }
     return err == cudaSuccess;
@@ -39,17 +82,18 @@ static std::uint64_t peer_pair_key(int a, int b) {
 }
 
 static void log_staged_cross_gpu_once() {
-    static bool logged = false;
-    if (logged) return;
-    logged = true;
-    std::fprintf(stderr,
-                 "[dflash] Using safe (slower) cross-GPU copy via host staging "
-                 "(--peer-access not set or P2P unavailable for this device pair).\n");
+    static std::once_flag once;
+    std::call_once(once, [] {
+        std::fprintf(stderr,
+                     "[dflash] Using safe (slower) cross-GPU copy via host staging "
+                     "(--peer-access not set or P2P unavailable for this device pair).\n");
+    });
 }
 
 bool cross_device_peer_memcpy_ok(int src_device, int dst_device) {
     if (src_device == dst_device) return true;
     if (!g_peer_access_opt_in) return false;
+    std::lock_guard<std::mutex> lock(g_peer_pair_cache_mutex);
     const std::uint64_t k = peer_pair_key(src_device, dst_device);
     const auto it = g_peer_pair_ok_cache.find(k);
     if (it != g_peer_pair_ok_cache.end()) return it->second;
@@ -86,14 +130,13 @@ bool copy_peer_async(void * dst, int dst_device,
     }
     log_staged_cross_gpu_once();
 #if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
-    err = cudaSetDevice(dst_device);
-    if (err != cudaSuccess) return false;
-    err = cudaMemcpyPeerAsync(dst, dst_device, src, src_device, bytes, stream);
-    if (err != cudaSuccess) return false;
-    if (stream) {
-        return cudaStreamSynchronize(stream) == cudaSuccess;
-    }
-    return cudaDeviceSynchronize() == cudaSuccess;
+    // ROCm can report peer access for heterogeneous devices while returning
+    // corrupted data from hipMemcpyPeerAsync (observed on gfx1201 + gfx1151).
+    // Keep the default path correct and reasonably fast with a reusable pinned
+    // buffer. P2P remains available above when the operator explicitly opts in.
+    (void)stream;
+    return copy_between_hip_devices_via_host(
+        dst, dst_device, src, src_device, bytes);
 #else
     return dflash_cuda_copy_between_devices(src_device, src, dst_device, dst, bytes,
                                             nullptr, stream);

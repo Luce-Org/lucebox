@@ -105,7 +105,7 @@ static void print_usage(const char * prog) {
         "                       WARNING: >0 drops system prompt / tool definitions\n"
         "                       from attention at long contexts. Use 0 for tools.\n"
         "  --model-name <name>  Model name for /v1/models (default: dflash)\n"
-        "  --prefix-cache-slots <N>  Prefix cache slots (default: 32, 0 disables)\n"
+        "  --prefix-cache-slots <N>  Prefix cache slots (default: 8; DeepSeek: 4; 0 disables)\n"
         "  --prefill-cache-slots <N> Full prompt/prefill cache slots (default: 0)\n"
         "  --fast-rollback     Enable speculative fast rollback (default: on)\n"
         "  --no-fast-rollback  Disable speculative fast rollback, even with --ddtree\n"
@@ -222,6 +222,7 @@ int main(int argc, char ** argv) {
     std::string cache_type_v;  // explicit --cache-type-v override
     bool target_device_seen = false;
     bool target_devices_seen = false;
+    bool prefix_cache_slots_set = false;
     bool fast_rollback_forced_off = false;
     bool target_split_fast_rollback_cli = false;
     bool adaptive_experts_set = false;  // --adaptive-experts (MoE architectures only)
@@ -353,6 +354,7 @@ int main(int argc, char ** argv) {
             sconfig.model_name = argv[++i];
         } else if (std::strcmp(argv[i], "--prefix-cache-slots") == 0 && i + 1 < argc) {
             sconfig.prefix_cache_cap = std::atoi(argv[++i]);
+            prefix_cache_slots_set = true;
         } else if (std::strcmp(argv[i], "--prefill-cache-slots") == 0 && i + 1 < argc) {
             sconfig.prefill_cache_cap = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--fast-rollback") == 0) {
@@ -626,6 +628,9 @@ int main(int argc, char ** argv) {
     }
     const ResolvedBackendPlan & backend_plan = backend_preparation.plan;
     const std::string & arch = backend_plan.arch();
+    if (!prefix_cache_slots_set) {
+        sconfig.prefix_cache_cap = arch_default_prefix_cache_slots(arch);
+    }
     if (target_split_fast_rollback_cli && arch != "qwen35") {
         std::fprintf(stderr,
             "[server] --target-split-fast-rollback is only supported for "
@@ -1062,7 +1067,9 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "[server] │  pflash_drafter_exec= %s\n",
                      sconfig.pflash_remote_drafter ? "remote-ipc" : "local");
         std::fprintf(stderr, "[server] │  pflash_skip_park= %s\n", sconfig.pflash_skip_park ? "ON" : "off");
-        std::fprintf(stderr, "[server] │  fp_use_bsa      = %s\n", getenv("DFLASH_FP_USE_BSA") ? "ON" : "off");
+        std::fprintf(stderr, "[server] │  fp_use_bsa      = %s\n",
+                     environment_variable_enabled("DFLASH_FP_USE_BSA")
+                         ? "ON" : "off");
         std::fprintf(stderr, "[server] │  fp_alpha        = %s\n", getenv("DFLASH_FP_ALPHA") ? getenv("DFLASH_FP_ALPHA") : "0.12 (default)");
     }
     std::fprintf(stderr, "[server] │  draft_residency = %s\n",

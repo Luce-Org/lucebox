@@ -54,7 +54,8 @@ cat > "$CONFIG_PATCH" <<JSON
   },
   "agents": {
     "defaults": {
-      "model": "lucebox/$MODEL_ID",
+      "model": {"primary": "lucebox/$MODEL_ID"},
+      "models": {"lucebox/$MODEL_ID": {"alias": "Lucebox DFlash"}},
       "workspace": "$REPO_DIR",
       "skipBootstrap": true,
       "contextInjection": "never",

@@ -101,6 +101,101 @@ Reference target: **RTX 3090 (Ampere sm_86)** — all headline numbers. Other NV
 
 `server/` (DFlash) builds with CMake 3.18+ and vendors the required `ggml` sources directly; only `Block-Sparse-Attention` remains a git submodule. No PyTorch is needed for `server/`. `optimizations/megakernel/` is the only component requiring PyTorch 2.0+ (CUDAExtension links against torch C++ libs). Power-tune: `sudo nvidia-smi -pl 220` (3090 sweet spot, re-sweep for other cards).
 
+## Lucebox CLI
+
+The easiest path for both Lucebox buyers and open-source users is one command:
+
+```bash
+# Buyers receive this preinstalled. Other users install the small host wrapper:
+curl -fsSL https://raw.githubusercontent.com/Luce-Org/lucebox/main/install.sh | bash
+
+lucebox
+```
+
+`lucebox` opens the branded menu. **Quick setup** detects NVIDIA CUDA or AMD
+ROCm, lets you choose and download a model, applies a model- and hardware-aware
+**Automatic** profile, offers a one-time on-machine calibration, and starts the
+inference service. Automatic explains its
+DFlash, PFlash, KVFlash, and Spark choices, and also prints the resolved
+prefill, decode, and KV-cache strategy. A typed capability contract prevents
+unsupported model/backend combinations; preview paths are labeled and stay off
+in Automatic. Exact, all-GPU execution remains preferred when it fits. Paging
+or expert offload activates only when the selected model and primary GPU need
+it; Spark also requires enough host RAM for its cold experts. **Review
+optimizations** exposes only model-compatible overrides. DeepSeek sparse
+prefill is available there as an approximate, monolithic-HIP preview; exact MLA
+prefill remains the default. Wi-Fi and device provisioning are intentionally
+outside this inference-only CLI.
+
+**Calibrate and measure performance** runs a fixed three-turn coding workload on
+the selected model and reports measured prefill tok/s, decode tok/s, and warm
+prefix-cache reuse. On DDTree backends it tests at most the planner budget and
+its two nearest safe neighbours. A candidate is accepted only when its
+normalized greedy output and cache behavior are identical and its decode score
+is at least 5% faster; failures restore the original config and engine state.
+Results are cached against the model files, runtime profile, driver, and GPU.
+Spark placement, KVFlash sizing, PFlash request policy, GPU top-K split, and
+DSpark width remain engine-owned adaptive policies rather than a second set of
+CLI heuristics.
+
+Automatic inventories every NVIDIA and AMD accelerator, then writes one
+validated execution plan together with the optimization profile. A model that
+fits stays on the faster primary GPU. When capacity requires it, supported
+architectures are split across same-backend GPUs; DFlash or PFlash work can be
+placed on a companion GPU when the target fits but the complete stack does not.
+Spark-compatible MoE models can place cold experts on a companion accelerator.
+Cross-GPU copies use the correctness-first staged path unless an operator
+explicitly opts into topology-specific peer access.
+
+RTX 3090 + Strix builds use CUDA for the main server and can use the Strix HIP
+companion through the paired native runtime. R9700 + Strix builds use ROCm and
+prefer the discrete R9700, while retaining Strix as a capacity/optimizer
+device. Factory Lucebox systems can ship that runtime preinstalled; a source
+checkout can create the same layout with `./lucebox.sh build hybrid` followed
+by `./lucebox.sh package-runtime`. A normal single-GPU NVIDIA or AMD machine
+keeps using its prebuilt Docker image and requires no native compilation.
+
+**Connect or open your harness** links the running local API to a client the
+engine user already installed: Claude Code, Codex, OpenCode, Hermes, Pi,
+OpenClaw, or Open WebUI. It is available from the same main menu in an installed
+Lucebox and a source checkout. Lucebox does not install the client and does not
+replace its normal cloud configuration. It launches the installed binary with
+an invocation-only override or an additive, Lucebox-owned profile, remembers
+the selection, and shows it on the main menu. For example:
+
+```bash
+lucebox connect codex             # link and open Codex
+lucebox connect opencode --no-launch
+```
+
+The connector verifies the local server before opening the client. Starting
+the same client normally, without `lucebox connect`, continues to use the
+user's existing provider and account.
+
+Contributors can open the same menu from a repository checkout with
+`./lucebox.sh`. Its **Developer tools** can build and run the native C++ engine
+or run isolated compatibility harnesses for Claude Code, Codex, OpenCode,
+Hermes, Pi, OpenClaw, and Open WebUI. Every menu action also has a scriptable
+command, for example:
+
+```bash
+lucebox models select
+lucebox optimize --yes
+lucebox optimize --advanced
+lucebox calibrate                    # cached; --force measures again
+lucebox start
+./lucebox.sh build cuda
+./lucebox.sh native cuda
+./lucebox.sh build hybrid            # CUDA + HIP contributor build
+./lucebox.sh package-runtime         # factory-installable paired runtime
+```
+
+The first-run picker focuses on the model families Lucebox qualifies most
+heavily: Qwen3.6 27B, Qwen3.6 35B-A3B, Laguna XS.2, and DeepSeek V4 Flash.
+Before any download, it checks whether the detected single-GPU, multi-GPU, or
+Lucebox heterogeneous placement can actually run the selected model. Gemma
+presets remain available from `lucebox models list` for existing users.
+
 ## Quick Start On Harnesses
 
 [`harness/`](harness/) contains RTX 3090 client launchers and regression tests
@@ -171,7 +266,9 @@ Prebuilt images on GHCR track `main`. No CUDA toolkit or build needed. Pull the 
 
 | GPU | Image tag |
 |-----|-----------|
-| NVIDIA (CUDA 12+) | `:cuda12` |
+| NVIDIA Turing–Hopper (sm_75–sm_90) | `:cuda12` |
+| NVIDIA RTX 5090 (sm_120) | `:cuda128` |
+| NVIDIA GB10 / DGX Spark (sm_121) | `:cuda13` |
 | AMD (ROCm 6+) | `:rocm` |
 
 Drop a GGUF model target into `server/models/` first, then
@@ -192,6 +289,8 @@ Drop a GGUF model target into `server/models/` first, then
 ```bash
 # 1. Pull the image for your GPU
 docker pull ghcr.io/luce-org/lucebox-hub:cuda12   # NVIDIA
+docker pull ghcr.io/luce-org/lucebox-hub:cuda128  # RTX 5090
+docker pull ghcr.io/luce-org/lucebox-hub:cuda13   # GB10 / DGX Spark
 docker pull ghcr.io/luce-org/lucebox-hub:rocm     # AMD
 
 # 2. Download a target model into server/models/ and the DFlash draft
@@ -272,7 +371,7 @@ Requests that omit `temperature` use the model card's sampling (Qwen3.6: `temper
 | Flag | Default | Effect |
 |---|---|---|
 | `--ddtree` | off (chain) | Enable tree verify |
-| `--ddtree-budget N` | `22` | Tree size. 22 on 3090 (default), 40 on 5090, re-sweep on GB10 |
+| `--ddtree-budget N` | `22` | Tree size. The planner picks a hardware baseline; `lucebox calibrate` verifies it on the actual machine. |
 | `--fa-window N` | `0` / `2048` (full attention) | Sliding FA window. Leave at 0: a finite window breaks tool calls (the full-attention layers lose the system prompt/tools). |
 | `--draft-residency {auto,persistent,request-scoped}` | `auto` | When draft weights are evicted from VRAM. `request-scoped` parks/frees them after each request's draft work (frees VRAM for the target on tight GPUs); `persistent` keeps them resident across requests; `auto` preserves current behavior while honoring the low-VRAM / `--lazy-draft` hint. Reported at `/props.runtime.draft_residency`. |
 | `--lazy-draft` | off | Legacy alias for `--draft-residency=request-scoped` (defer draft load until first request, release after) |
@@ -332,11 +431,11 @@ End-to-end repro: `DFLASH_SAMP=0.8,1.0,0,1.1,42 python server/scripts/bench_llm.
 | `--prefill-drafter <gguf>` | required if on | Drafter weights (Qwen3-0.6B BF16 GGUF) |
 | `--prefill-skip-park` | off | Keep drafter resident across requests (more VRAM, faster) |
 | `PFLASH_FREEZE_HOT_WINDOW=N` | `2` | FlowKV: how many of the most recent messages stay verbatim. Everything older than this window (but after the system prompt) is compressed once and cached. Larger = more recent context kept uncompressed. |
-| `DFLASH_FP_USE_BSA=1` | `0` | Dispatch sparse FA through BSA (sm_80+); required for headline 10.4× |
+| `DFLASH_FP_USE_BSA=1` | `0` | Dispatch sparse FA through BSA (qualified sm_80+ except GB10 sm_121, where PFlash safely stays on exact prefill); required for headline 10.4× |
 | `DFLASH_FP_ALPHA=0.85` | `0.12` | Block-selection threshold; higher = stricter = fewer K-blocks |
 | `DFLASH_FP_PROFILE=1` | `0` | Per-stage timing log |
 
-When compression is on, the request path picks one of three modes automatically, so they never stack: the first turn is sent verbatim (the system prompt stays as a stable cache anchor), multi-turn continuations use **FlowKV** (only the aged history is compressed, recent turns kept verbatim, so the disk prefix cache from `--prefix-cache-slots` keeps hitting), and a single oversized prompt with no prior turns uses whole-prompt PFlash. With `--prefill-compression off` the request path is identical to a build without compression.
+When compression is on, the request policy keeps reusable state reusable. Structured system+user chats and tool requests preserve the target prefix so the live prefix cache can hit on later turns. A continuation also preserves that prefix unless the request explicitly enables FlowKV; in that mode only aged messages are compressed and recent turns remain verbatim. A true long one-shot prompt uses whole-prompt PFlash. Exact repeats can restore a completed PFlash/target snapshot from `--prefill-cache-slots`, skipping both scorer and target prefill. These paths are mutually exclusive; with compression off the request path is unchanged.
 
 **KV cache**
 
@@ -346,14 +445,14 @@ When compression is on, the request path picks one of three modes automatically,
 | `DFLASH27B_KV_TQ3=1` | (default) | Preset TQ3_0 K+V (3.5 bpv, fits 256K @ 24 GB) |
 | `DFLASH27B_KV_Q4=1` | off | Q4_0 K+V (4.5 bpv, legacy, ~128K ceiling) |
 | `--prefix-cache-slots N` | — | Live prefix-cache slot count |
-| `DFLASH_PREFIX_CACHE_SLOTS=N` | `32` | Container-entrypoint equivalent of `--prefix-cache-slots`; the native binary itself uses the CLI flag. |
-| `DFLASH_PREFILL_CACHE_SLOTS=N` | `0` | Container-entrypoint equivalent of `--prefill-cache-slots`; the native binary itself uses the CLI flag. |
+| `DFLASH_PREFIX_CACHE_SLOTS=N` | architecture default (`8`; DeepSeek `4`) | Container-entrypoint equivalent of `--prefix-cache-slots`; the native binary itself uses the CLI flag. |
+| `--prefill-cache-slots N` / `DFLASH_PREFILL_CACHE_SLOTS=N` | `0` | Exact full-prompt snapshot slots. Automatic assigns four for qualified PFlash models; exact repeats skip scorer and target prefill. |
 | `--kv-cache-dir <path>` | — | Persist prefix cache to disk |
 | `--kv-cache-budget N` | — | On-disk cache size cap |
 
 **Bounded KV residency (KVFlash)**
 
-Pages the attention KV cache through a fixed pool of GPU slots; cold 64-token chunks live in host RAM, bit-exact and recallable. Decode speed stops depending on context length and resident KV stays pool-sized at any context. Off by default; works on every model family. Drafter-scored residency is the default on every family: the server finds the Qwen3-0.6B drafter next to the model (or via `--prefill-drafter`) and lazy-loads it as the relevance scorer that decides which chunks stay resident — non-qwen targets (laguna, gemma4) bridge the tokenizer gap by re-tokenizing the context text for the drafter. LRU is the fallback when no drafter is present, or the explicit choice via `--kvflash-policy lru`. Per-model numbers in [Luce KVFlash →](optimizations/kvflash/README.md).
+Pages a conventional attention KV cache through a fixed pool of GPU slots; cold 64-token chunks live in host RAM, bit-exact and recallable. Decode speed stops depending on context length and resident KV stays pool-sized at any context. Automatic enables only qualified model/backend combinations when full KV no longer fits; Laguna's CUDA path remains preview, and DeepSeek uses its native MLA-compressed cache instead of generic KVFlash. Drafter-scored residency uses the shared Qwen3-0.6B scorer; LRU is the fallback when no scorer is present, while qwen35 can use target-native QK scoring. Per-model numbers in [Luce KVFlash →](optimizations/kvflash/README.md).
 
 | Flag / env | Default | Effect |
 |---|---|---|

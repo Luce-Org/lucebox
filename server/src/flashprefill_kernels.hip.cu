@@ -22,6 +22,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_bfloat16.h>
 #include <rocwmma/rocwmma.hpp>
+#include "flashprefill_launchers.h"
 
 // These kernels are WAVE32-ONLY BY DESIGN, not merely wave32-tuned. Kernel 4's
 // accumulator handling assumes the RDNA3 v_wmma_f32_16x16x16 fragment layout
@@ -96,6 +97,12 @@ extern "C" int launch_compute_mean_vector_bf16(
         batch, seq_len, n_kv_heads,
         s_K_b, s_K_n, s_K_h, s_K_d,
         s_mK_b, s_mK_m, s_mK_h, s_mK_d);
+    const hipError_t error = hipPeekAtLastError();
+    if (error != hipSuccess) {
+        fprintf(stderr, "[dflash] mean-vector launch failed: %s\n",
+                hipGetErrorString(error));
+        return -1;
+    }
     return 0;
 }
 
@@ -211,6 +218,12 @@ extern "C" int launch_compute_block_score_bf16(
         s_mK_b, s_mK_m, s_mK_h, s_mK_d,
         s_S_b, s_S_m, s_S_n, s_S_h,
         s_M_b, s_M_m, s_M_n, s_M_h);
+    const hipError_t error = hipPeekAtLastError();
+    if (error != hipSuccess) {
+        fprintf(stderr, "[dflash] block-score launch failed: %s\n",
+                hipGetErrorString(error));
+        return -1;
+    }
     return 0;
 }
 

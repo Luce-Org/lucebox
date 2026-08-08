@@ -24,6 +24,7 @@
 #include "pin_friendly_prompt.h"
 #include "common/sha1.h"
 #include "freeze_history.h"
+#include "flashprefill.h"
 
 #ifdef DFLASH_HAS_CURL
 #include <curl/curl.h>
@@ -873,30 +874,176 @@ std::string render_tool_call_xml(const std::string & name, const json & argument
     return out;
 }
 
+struct ReplayToolCall {
+    std::string id;
+    std::string name;
+    json arguments = json::object();
+};
+
+struct ToolReplay {
+    std::string text;
+    bool exact = false;
+};
+
+std::string extract_text_part(const json & part) {
+    if (!part.is_object()) return "";
+    const std::string type = part.value("type", "");
+    if (type == "text" || type == "input_text" || type == "output_text") {
+        return part.value("text", "");
+    }
+    return "";
+}
+
+std::string extract_text_content(const json & content) {
+    if (content.is_string()) return content.get<std::string>();
+    if (!content.is_array()) return "";
+
+    std::string text;
+    for (const auto & part : content) {
+        text += extract_text_part(part);
+    }
+    return text;
+}
+
+ToolReplay replay_or_render_tool_calls(
+        const std::vector<ReplayToolCall> & calls,
+        ToolMemory & tool_memory) {
+    std::vector<std::string> ids;
+    ids.reserve(calls.size());
+    for (const auto & call : calls) {
+        if (call.id.empty()) {
+            ids.clear();
+            break;
+        }
+        ids.push_back(call.id);
+    }
+    if (!ids.empty()) {
+        std::string replay = tool_memory.lookup(ids);
+        if (!replay.empty()) return {std::move(replay), true};
+    }
+
+    std::string rendered;
+    for (const auto & call : calls) {
+        rendered += render_tool_call_xml(call.name, call.arguments);
+    }
+    return {std::move(rendered), false};
+}
+
+std::vector<ReplayToolCall> openai_tool_calls(const json & value) {
+    std::vector<ReplayToolCall> calls;
+    if (!value.is_array()) return calls;
+    for (const auto & item : value) {
+        if (!item.is_object()) continue;
+        const json function = item.value("function", json::object());
+        calls.push_back({
+            item.value("id", ""),
+            function.value("name", ""),
+            parse_responses_arguments(function),
+        });
+    }
+    return calls;
+}
+
+bool append_anthropic_content(
+        const json & message,
+        ToolMemory & tool_memory,
+        std::vector<ChatMessage> & chat_messages) {
+    if (!message.contains("content") || !message["content"].is_array()) {
+        return false;
+    }
+    const auto & content = message["content"];
+    const std::string role = message.value("role", "user");
+
+    if (role == "assistant") {
+        std::vector<ReplayToolCall> calls;
+        for (const auto & part : content) {
+            if (!part.is_object() || part.value("type", "") != "tool_use") continue;
+            calls.push_back({
+                part.value("id", ""),
+                part.value("name", ""),
+                part.value("input", json::object()),
+            });
+        }
+        if (!calls.empty()) {
+            ToolReplay replay = replay_or_render_tool_calls(calls, tool_memory);
+            if (!replay.exact) {
+                replay.text = extract_text_content(content) + replay.text;
+            }
+            chat_messages.push_back({"assistant", std::move(replay.text)});
+            return true;
+        }
+    }
+
+    if (role != "user") return false;
+    bool has_tool_result = false;
+    for (const auto & part : content) {
+        if (part.is_object() && part.value("type", "") == "tool_result") {
+            has_tool_result = true;
+            break;
+        }
+    }
+    if (!has_tool_result) return false;
+
+    std::string user_text;
+    const auto flush_user_text = [&chat_messages, &user_text]() {
+        if (user_text.empty()) return;
+        chat_messages.push_back({"user", std::move(user_text)});
+        user_text.clear();
+    };
+    for (const auto & part : content) {
+        if (!part.is_object()) continue;
+        if (part.value("type", "") != "tool_result") {
+            user_text += extract_text_part(part);
+            continue;
+        }
+        flush_user_text();
+        std::string output;
+        if (part.contains("content")) {
+            output = extract_text_content(part["content"]);
+            if (output.empty() && !part["content"].is_null() &&
+                !part["content"].is_string()) {
+                output = part["content"].dump();
+            }
+        }
+        chat_messages.push_back({
+            "tool",
+            std::move(output),
+            part.value("tool_use_id", part.value("id", "")),
+        });
+    }
+    flush_user_text();
+    return true;
+}
+
 std::vector<ChatMessage> normalize_chat_messages(
     const json & messages,
     ApiFormat format,
     ToolMemory & tool_memory) {
     std::vector<ChatMessage> chat_msgs;
     std::vector<std::string> system_parts;
+    std::vector<ReplayToolCall> pending_responses_calls;
+    const auto flush_responses_calls = [&]() {
+        if (pending_responses_calls.empty()) return;
+        chat_msgs.push_back({
+            "assistant",
+            replay_or_render_tool_calls(pending_responses_calls, tool_memory).text,
+        });
+        pending_responses_calls.clear();
+    };
 
     if (messages.is_array()) {
         for (const auto & m : messages) {
             if (format == ApiFormat::RESPONSES && m.is_object()) {
                 std::string item_type = m.value("type", "message");
                 if (item_type == "function_call") {
-                    std::string call_id = m.value("call_id", m.value("id", ""));
-                    std::string raw;
-                    if (!call_id.empty()) {
-                        raw = tool_memory.lookup({call_id});
-                    }
-                    if (raw.empty()) {
-                        raw = render_tool_call_xml(m.value("name", ""),
-                                                   parse_responses_arguments(m));
-                    }
-                    chat_msgs.push_back({"assistant", raw});
+                    pending_responses_calls.push_back({
+                        m.value("call_id", m.value("id", "")),
+                        m.value("name", ""),
+                        parse_responses_arguments(m),
+                    });
                     continue;
                 }
+                flush_responses_calls();
                 if (item_type == "function_call_output") {
                     std::string output;
                     if (m.contains("output") && m["output"].is_string()) {
@@ -910,36 +1057,28 @@ std::vector<ChatMessage> normalize_chat_messages(
                 }
             }
 
+            if (format == ApiFormat::ANTHROPIC && m.is_object() &&
+                append_anthropic_content(m, tool_memory, chat_msgs)) {
+                continue;
+            }
+
             ChatMessage cm;
             cm.role = m.value("role", "user");
 
             bool replayed = false;
             if (cm.role == "assistant" && m.contains("tool_calls") &&
                 m["tool_calls"].is_array() && !m["tool_calls"].empty()) {
-                std::vector<std::string> call_ids;
-                for (const auto & tc : m["tool_calls"]) {
-                    std::string id = tc.value("id", "");
-                    if (!id.empty()) call_ids.push_back(id);
+                const auto calls = openai_tool_calls(m["tool_calls"]);
+                ToolReplay replay = replay_or_render_tool_calls(calls, tool_memory);
+                cm.content = std::move(replay.text);
+                if (!replay.exact && m.contains("content")) {
+                    cm.content = extract_text_content(m["content"]) + cm.content;
                 }
-                std::string raw = tool_memory.lookup(call_ids);
-                if (!raw.empty()) {
-                    cm.content = raw;
-                    replayed = true;
-                }
+                replayed = !cm.content.empty();
             }
 
             if (!replayed) {
-                if (m.contains("content") && m["content"].is_string()) {
-                    cm.content = m["content"].get<std::string>();
-                } else if (m.contains("content") && m["content"].is_array()) {
-                    for (const auto & part : m["content"]) {
-                        std::string ptype = part.value("type", "");
-                        if (ptype == "text" || ptype == "input_text" ||
-                            ptype == "output_text") {
-                            cm.content += part.value("text", "");
-                        }
-                    }
-                }
+                if (m.contains("content")) cm.content = extract_text_content(m["content"]);
             }
 
             if (format == ApiFormat::RESPONSES &&
@@ -949,6 +1088,7 @@ std::vector<ChatMessage> normalize_chat_messages(
                 chat_msgs.push_back(std::move(cm));
             }
         }
+        flush_responses_calls();
     } else if (messages.is_string()) {
         chat_msgs.push_back({"user", messages.get<std::string>()});
     }
@@ -1016,7 +1156,7 @@ HttpServer::HttpServer(ModelBackend & backend,
     , tokenizer_(tokenizer)
     , config_(config)
     , chat_format_(ChatFormat::QWEN3)  // default, overridden by arch
-    , prefix_cache_(config.prefix_cache_cap, tokenizer)
+    , prefix_cache_(config.prefix_cache_cap, tokenizer, config.arch)
     , disk_cache_({config.disk_cache_dir,
                    config.disk_cache_budget_mb * (size_t)(1024 * 1024),
                    config.disk_cache_min_tokens,
@@ -2381,6 +2521,31 @@ bool is_continuation_request(const json & messages) {
 
 }  // namespace
 
+PflashRequestStrategy select_pflash_request_strategy(
+        ServerConfig::PflashMode mode,
+        int prompt_tokens,
+        int threshold,
+        bool continuation,
+        bool has_tools,
+        bool has_reusable_prefix,
+        bool flowkv_enabled) {
+    const bool eligible =
+        mode == ServerConfig::PflashMode::ALWAYS ||
+        (mode == ServerConfig::PflashMode::AUTO && prompt_tokens >= threshold);
+    if (!eligible) return PflashRequestStrategy::Off;
+
+    // FlowKV rewrites only aged message bodies and deliberately preserves the
+    // system/tool prefix. It is therefore the only compression mode that may
+    // run on a continuation without invalidating turn-boundary snapshots.
+    if (continuation && flowkv_enabled) {
+        return PflashRequestStrategy::FlowKv;
+    }
+    if (continuation || has_tools || has_reusable_prefix || flowkv_enabled) {
+        return PflashRequestStrategy::PreservePrefix;
+    }
+    return PflashRequestStrategy::WholePrompt;
+}
+
 void HttpServer::apply_flowkv_compression(
         const ParsedRequest & req, PreparedPrompt & prepared) {
     int hot_window = 2;
@@ -2702,40 +2867,76 @@ HttpServer::PreparedPrompt HttpServer::prepare_prompt(
     PreparedPrompt prepared;
     prepared.tokens = req.prompt_tokens;
 
-    if (config_.pflash_mode != ServerConfig::PflashMode::OFF &&
-        drafter_tokenizer_ != nullptr) {
+    bool pflash_available =
+        config_.pflash_mode != ServerConfig::PflashMode::OFF &&
+        drafter_tokenizer_ != nullptr;
+#if defined(DFLASH27B_BACKEND_CUDA)
+    // GB10's local custom sparse scorer kernels are not qualified. Check
+    // before loading or running the drafter so a stale/manual PFlash
+    // profile degrades to exact prefill instead of touching that path.
+    // A remote drafter runs on its own backend and remains independent.
+    // Fall through to the context check below so an over-length prompt
+    // still gets the normal 400 instead of reaching exact generation.
+    if (pflash_available && !config_.pflash_remote_drafter &&
+        !flashprefill::local_pflash_supported_on_current_device()) {
+        std::fprintf(stderr,
+            "[pflash] local scorer unavailable on this GPU; using exact prefill\n");
+        pflash_available = false;
+    }
+#endif
+    if (pflash_available) {
         const int prompt_tokens = (int) req.prompt_tokens.size();
-        bool should_compress =
-            config_.pflash_mode == ServerConfig::PflashMode::ALWAYS ||
-            (config_.pflash_mode == ServerConfig::PflashMode::AUTO &&
-             prompt_tokens >= config_.pflash_threshold);
-        const bool continuation = should_compress &&
-            is_continuation_request(req.messages);
+        const bool continuation = is_continuation_request(req.messages);
+        const bool has_tools = req.tools.is_array() && !req.tools.empty();
+        // A system/developer message followed by a user message is a stable
+        // prefix even before the first assistant turn exists. Preserve it so
+        // turn two can restore target KV instead of inheriting a compressed,
+        // non-matching token stream.
+        const bool has_reusable_prefix =
+            has_tools || (req.messages.is_array() && req.messages.size() > 1);
+        const bool flowkv_enabled =
+            req.disk_cache_policy.compress && req.messages.is_array();
+        const PflashRequestStrategy strategy =
+            select_pflash_request_strategy(
+                config_.pflash_mode,
+                prompt_tokens,
+                config_.pflash_threshold,
+                continuation,
+                has_tools,
+                has_reusable_prefix,
+                flowkv_enabled);
 
-        if (should_compress && continuation &&
-            req.disk_cache_policy.compress && req.messages.is_array()) {
-            // FlowKV owns continuation compression; falling back to whole-
-            // prompt compression would destroy the reusable prefix anchor.
+        if (strategy == PflashRequestStrategy::FlowKv) {
             apply_flowkv_compression(req, prepared);
-            should_compress = false;
-        } else if (should_compress && continuation) {
-            should_compress = false;
+        } else if (strategy == PflashRequestStrategy::PreservePrefix &&
+                   continuation) {
             std::fprintf(stderr,
                 "[pflash] skip-compress (continuation: prior assistant/tool history)\n");
-        }
-
-        if (should_compress && req.disk_cache_policy.compress) {
+        } else if (strategy == PflashRequestStrategy::PreservePrefix && has_tools) {
+            // Whole-prompt compression would rewrite the tool schema and make
+            // the target snapshot unusable on the next agent turn.
+            std::fprintf(stderr,
+                "[pflash] skip-compress (tools: preserving reusable system/tool prefix)\n");
+        } else if (strategy == PflashRequestStrategy::PreservePrefix &&
+                   has_reusable_prefix) {
+            std::fprintf(stderr,
+                "[pflash] skip-compress (chat: preserving reusable system prefix)\n");
+        } else if (strategy == PflashRequestStrategy::PreservePrefix) {
             // Turn one stays verbatim so the next turn can reuse its KV prefix.
-            should_compress = false;
             std::fprintf(stderr,
                 "[flowkv] turn-1 verbatim (system kept as cache anchor)\n");
-        }
-
-        if (should_compress) {
+        } else if (strategy == PflashRequestStrategy::WholePrompt) {
             prepared.error = apply_pflash_compression(req, prepared);
             if (!prepared.error.empty()) {
-                prepared.error_status = 500;
-                return prepared;
+                // PFlash is optional acceleration. The backend restores its
+                // target residency before returning a compression failure,
+                // so an otherwise valid request can safely continue verbatim.
+                std::fprintf(stderr,
+                    "[pflash] %s; falling back to exact prefill\n",
+                    prepared.error.c_str());
+                prepared.error.clear();
+                prepared.tokens = req.prompt_tokens;
+                prepared.compressed = false;
             }
         }
     }

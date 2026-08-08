@@ -1,0 +1,708 @@
+"""Model download orchestration.
+
+Runs *inside* the orchestrator container. Uses `huggingface_hub` directly
+(no subprocess) so we can:
+
+  * drive a Rich progress bar based on real byte counts (the previous
+    `uvx hf download` subprocess produced no visible progress inside the
+    container — hf-xet's TTY detection misfires there),
+  * verify each candidate file's size and sha256 against the repo
+    metadata BEFORE downloading, so a re-run on a host that already has
+    the target GGUF (e.g. previous download into the same models_dir)
+    skips the multi-GB fetch entirely.
+
+The :data:`PRESETS` registry encodes the canonical (target_repo,
+target_file, draft_repo, draft_file) tuple per model — selectable via
+``lucebox models download <name>``. ``DEFAULT_PRESET`` stays pinned to
+Qwen3.6-27B for back-compat with callers that pre-date the registry.
+Drafts are optional: presets that have no published DFlash draft
+(e.g. Laguna's speculator is safetensors, not GGUF) carry
+``draft_repo=None`` and run target-only.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    DownloadColumn,
+    Progress,
+    TextColumn,
+    TimeRemainingColumn,
+    TransferSpeedColumn,
+)
+
+from lucebox.types import Config, HostFacts
+
+if TYPE_CHECKING:
+    from huggingface_hub import HfApi
+
+
+def _configure_huggingface_download() -> None:
+    """Select the progress-friendly downloader before importing HF Hub.
+
+    hf-xet streams a multi-GB file in one final burst, so the polling-based
+    progress bar remains at zero until completion.  Keep this environment
+    change local to download/status operations rather than mutating every
+    ``lucebox`` process merely because the CLI module was imported.
+    """
+    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+
+
+def _new_hf_api() -> HfApi:
+    _configure_huggingface_download()
+    from huggingface_hub import HfApi
+
+    return HfApi()
+
+
+@dataclass(frozen=True, slots=True)
+class ModelPreset:
+    """Canonical (target, draft) repo+filename pair for a supported model.
+
+    ``draft_repo`` and ``draft_file`` may both be ``None`` for models
+    where no GGUF DFlash draft is published (e.g. Laguna's safetensors
+    speculator). In that case the entrypoint runs target-only — DFlash
+    speculative decoding is disabled but the server still works.
+
+    ``speculator_repo`` / ``speculator_files`` describe a safetensors-format
+    decode companion stored under ``models/draft/<speculator_dir>``. Some
+    loaders also require metadata next to ``model.safetensors``; listing every
+    required file here makes download, status, and activation one contract.
+    """
+
+    name: str
+    target_repo: str
+    target_file: str
+    draft_repo: str | None
+    draft_file: str | None
+    approx_total_gb: float
+    approx_target_gb: float
+    approx_draft_gb: float
+    architecture: str
+    native_context: int
+    description: str = ""
+    speculator_dir: str | None = None
+    speculator_repo: str | None = None
+    speculator_files: tuple[str, ...] = ()
+    display_name: str = ""
+    featured_rank: int | None = None
+
+    def __post_init__(self) -> None:
+        speculator_fields = (
+            self.speculator_dir is not None,
+            self.speculator_repo is not None,
+            bool(self.speculator_files),
+        )
+        if any(speculator_fields) and not all(speculator_fields):
+            raise ValueError(
+                "speculator_dir, speculator_repo, and speculator_files must be set together"
+            )
+
+    @property
+    def has_draft(self) -> bool:
+        return bool(self.draft_repo and self.draft_file)
+
+    @property
+    def has_speculator(self) -> bool:
+        return bool(self.speculator_dir and self.speculator_repo and self.speculator_files)
+
+    @property
+    def has_decode_companion(self) -> bool:
+        return self.has_draft or self.has_speculator
+
+    @property
+    def label(self) -> str:
+        """Human-readable catalog label; ``name`` remains the stable CLI id."""
+        return self.display_name or self.name
+
+    @property
+    def featured(self) -> bool:
+        """Whether this preset belongs in the focused first-run picker."""
+        return self.featured_rank is not None
+
+
+# Registry of supported models. Keyed by preset name; the CLI surface
+# exposes these via `lucebox models download <name>` and the
+# `lucebox models list` table. The values come straight from the model
+# cards and published Lucebox artifacts — keep them in sync.
+PRESETS: dict[str, ModelPreset] = {
+    "qwen3.6-27b": ModelPreset(
+        name="qwen3.6-27b",
+        target_repo="unsloth/Qwen3.6-27B-GGUF",
+        target_file="Qwen3.6-27B-Q4_K_M.gguf",
+        draft_repo="Lucebox/Qwen3.6-27B-DFlash-GGUF",
+        draft_file="dflash-draft-3.6-q4_k_m.gguf",
+        approx_total_gb=17,
+        approx_target_gb=15.7,
+        approx_draft_gb=1.3,
+        architecture="qwen35",
+        native_context=262144,
+        display_name="Qwen3.6 27B",
+        featured_rank=1,
+        description="Qwen3.6 27B dense (Q4_K_M) + Qwen3.6 DFlash draft. Lucebox default.",
+    ),
+    "gemma-4-26b": ModelPreset(
+        name="gemma-4-26b",
+        target_repo="bartowski/google_gemma-4-26B-A4B-it-GGUF",
+        target_file="google_gemma-4-26B-A4B-it-Q4_K_M.gguf",
+        draft_repo="Lucebox/gemma-4-26B-A4B-it-DFlash-GGUF",
+        draft_file="gemma-4-26B-A4B-it-DFlash-q8_0.gguf",
+        approx_total_gb=18,
+        approx_target_gb=16.0,
+        approx_draft_gb=2.0,
+        architecture="gemma4",
+        native_context=262144,
+        description="Gemma 4 26B-A4B IT MoE (Q4_K_M) + Lucebox DFlash q8_0 draft.",
+    ),
+    "gemma-4-31b": ModelPreset(
+        name="gemma-4-31b",
+        target_repo="bartowski/google_gemma-4-31B-it-GGUF",
+        target_file="google_gemma-4-31B-it-Q4_K_M.gguf",
+        draft_repo="Lucebox/gemma-4-31B-it-DFlash-GGUF",
+        draft_file="gemma-4-31B-it-DFlash-q8_0.gguf",
+        approx_total_gb=21,
+        approx_target_gb=19.0,
+        approx_draft_gb=2.0,
+        architecture="gemma4",
+        native_context=262144,
+        description="Gemma 4 31B IT dense (Q4_K_M) + Lucebox DFlash q8_0 draft.",
+    ),
+    "laguna-xs.2": ModelPreset(
+        name="laguna-xs.2",
+        target_repo="Lucebox/Laguna-XS.2-GGUF",
+        target_file="laguna-xs2-Q4_K_M.gguf",
+        # Laguna's DFlash companion is safetensors-format. config.json is a
+        # runtime requirement: the native loader reads rope_theta beside the
+        # weights and rejects a lone model.safetensors.
+        draft_repo=None,
+        draft_file=None,
+        speculator_dir="laguna-xs2-speculator",
+        speculator_repo="poolside/Laguna-XS.2-speculator.dflash",
+        speculator_files=("model.safetensors", "config.json"),
+        approx_total_gb=20,
+        approx_target_gb=18.9,
+        approx_draft_gb=1.1,
+        architecture="laguna",
+        # Poolside's model contract is 262K. Hardware-aware planning may pick
+        # a smaller exact-cache context, but the catalog must not erase the
+        # model's native capability (the previous 4K value did exactly that).
+        native_context=262144,
+        display_name="Laguna XS.2",
+        featured_rank=3,
+        description=(
+            "Laguna-XS.2 MoE code model (Q4_K_M) + published DFlash "
+            "safetensors speculator."
+        ),
+    ),
+    "qwen3.6-moe": ModelPreset(
+        name="qwen3.6-moe",
+        target_repo="unsloth/Qwen3.6-35B-A3B-GGUF",
+        # Unsloth's MoE repo publishes both a "UD" (dynamic) and a plain
+        # Q4_K_M family. Verified 2026-05-28 via HfApi.repo_info: the
+        # `-UD-Q4_K_M.gguf` variant (22.1 GB) is the canonical Q4_K_M
+        # release — there is no plain `Q4_K_M.gguf` on the MoE repo.
+        target_file="Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+        # No DFlash draft GGUF has been published for the MoE variant
+        # (probed Lucebox/* and spiritbuun/* repos 2026-05-28 — none
+        # exist). Target-only, mirroring laguna-xs.2's wiring. The
+        # lucebox C++ server speaks the `qwen35moe` arch natively
+        # (server/src/qwen35moe/) so this runs without a draft.
+        draft_repo=None,
+        draft_file=None,
+        approx_total_gb=22,
+        approx_target_gb=22.0,
+        approx_draft_gb=0.0,
+        architecture="qwen35moe",
+        native_context=262144,
+        display_name="Qwen3.6 35B-A3B",
+        featured_rank=2,
+        description=(
+            "Qwen3.6 35B-A3B MoE (3B active per token), Q4_K_M unsloth "
+            "dynamic quant. Target-only — no DFlash MoE draft published "
+            "yet. Uses lucebox's qwen35moe arch backend."
+        ),
+    ),
+    "deepseek-v4-flash": ModelPreset(
+        name="deepseek-v4-flash",
+        target_repo="Lucebox/DeepSeek-V4-Flash-ROCMFPX",
+        target_file="DeepSeek-V4-Flash-ROCMFP2-STRIX.gguf",
+        draft_repo="Lucebox/DeepSeek-V4-Flash-DSpark-Drafter-GGUF",
+        draft_file="DeepSeek-V4-Flash-DSpark-draft-Q4RMFP4-denseF16.gguf",
+        approx_total_gb=114,
+        approx_target_gb=102.4,
+        approx_draft_gb=11.3,
+        architecture="deepseek4",
+        native_context=1048576,
+        display_name="DeepSeek V4 Flash",
+        featured_rank=4,
+        description=(
+            "DeepSeek V4 Flash ROCmFPX target + Lucebox DSpark draft. "
+            "Large-system profile: about 103 GB for the target and 114 GB "
+            "with speculative decoding."
+        ),
+    ),
+}
+
+DEFAULT_PRESET = PRESETS["qwen3.6-27b"]
+
+
+def catalog_presets(*, featured_only: bool = False) -> tuple[ModelPreset, ...]:
+    """Return presets in stable product order.
+
+    The guided picker stays deliberately focused on the models Lucebox tunes
+    and qualifies most heavily. Older supported presets remain addressable by
+    their stable names and visible through ``lucebox models list``.
+    """
+    candidates = (preset for preset in PRESETS.values() if preset.featured or not featured_only)
+    return tuple(
+        sorted(
+            candidates,
+            key=lambda preset: (
+                preset.featured_rank is None,
+                preset.featured_rank if preset.featured_rank is not None else 0,
+                preset.name,
+            ),
+        )
+    )
+
+
+# Shared scorer used by PFlash and by KVFlash's drafter residency policy.
+# It is deliberately separate from each target preset: one ~1.2 GB file is
+# reused by every installed model and can be factory-preloaded on a Lucebox.
+OPTIMIZER_DRAFTER_REPO = "unsloth/Qwen3-0.6B-GGUF"
+OPTIMIZER_DRAFTER_FILE = "Qwen3-0.6B-BF16.gguf"
+OPTIMIZER_DRAFTER_APPROX_GB = 1.2
+
+
+def resolve_preset(name: str | None) -> ModelPreset:
+    """Look up a preset by name, with a friendly error on typos.
+
+    ``None`` (or empty string) resolves to :data:`DEFAULT_PRESET` so
+    callers and the CLI default both flow through one code path.
+    """
+    if not name:
+        return DEFAULT_PRESET
+    if name in PRESETS:
+        return PRESETS[name]
+    normalized = name.strip().casefold()
+    for preset in PRESETS.values():
+        if normalized == preset.label.casefold():
+            return preset
+    # Build a suggestion list — show every known preset; the user's
+    # search space is small, so listing them all is
+    # cheaper and clearer than a fuzzy-match heuristic.
+    known = ", ".join(preset.name for preset in catalog_presets())
+    raise KeyError(f"unknown preset {name!r}. Known presets: {known}")
+
+
+def _file_meta(api: HfApi, repo_id: str, filename: str) -> tuple[int, str | None]:
+    """Return (expected_size, lfs_sha256_or_None) for filename in repo_id."""
+    info = api.model_info(repo_id, files_metadata=True)
+    for sib in info.siblings or []:
+        if sib.rfilename == filename:
+            sha = getattr(sib.lfs, "sha256", None) if sib.lfs else None
+            return int(sib.size or 0), sha
+    raise FileNotFoundError(f"{filename} not present in repo {repo_id}")
+
+
+def _sha256(path: Path, chunk_mb: int = 16) -> str:
+    h = hashlib.sha256()
+    chunk = chunk_mb * 1024 * 1024
+    with path.open("rb") as f:
+        while buf := f.read(chunk):
+            h.update(buf)
+    return h.hexdigest()
+
+
+def _local_matches(path: Path, size: int, sha256: str | None, console: Console) -> bool:
+    """True iff a local file at `path` matches the expected size + sha256.
+
+    Size mismatch shortcircuits (cheap). Sha256 is verified for LFS files
+    (multi-GB GGUFs always carry one) and skipped when the repo doesn't
+    expose a hash. Hashing 17 GB takes ~30s on a fast SSD — worth it to
+    avoid a multi-GB re-download on rate-limited / metered links.
+    """
+    if not path.exists():
+        return False
+    actual_size = path.stat().st_size
+    if actual_size != size:
+        console.print(
+            f"  [yellow]✗[/yellow] {path.name} present but size {actual_size:,} != "
+            f"expected {size:,} — will re-download"
+        )
+        return False
+    if sha256:
+        console.print(f"  [dim]verifying sha256 of {path.name} ({actual_size / 1e9:.1f} GB)…[/dim]")
+        actual_sha = _sha256(path)
+        if actual_sha != sha256:
+            console.print(
+                f"  [yellow]✗[/yellow] {path.name} sha256 {actual_sha[:12]}… != "
+                f"expected {sha256[:12]}… — will re-download"
+            )
+            return False
+    return True
+
+
+def _incomplete_path_candidates(local_dir: Path, filename: str, etag: str | None) -> list[Path]:
+    """Return likely paths of the partial file currently being written.
+
+    huggingface_hub 1.x (with hf-xet) stages downloads under
+    ``{local_dir}/.cache/huggingface/download/`` using a *hashed* name —
+    ``{short_hash(metadata_filename)}.{etag}.incomplete`` — so a naive
+    ``{filename}.incomplete`` poll never sees any growth and the
+    progress bar sits at 0 % for the whole multi-GB transfer.
+
+    We get the *exact* expected staging path from
+    ``get_local_download_paths().incomplete_path(etag)`` when we already
+    know the LFS sha256 (which acts as the etag for Xet downloads), and
+    fall back to globbing every ``*.incomplete`` in the staging dir
+    otherwise. The legacy non-Xet downloader writes a ``.incomplete``
+    next to the destination blob in ``~/.cache/huggingface/hub`` — but
+    when ``local_dir`` is set hf-hub always uses the local staging dir,
+    so the two candidates above cover every code path we hit.
+    """
+    _configure_huggingface_download()
+    from huggingface_hub._local_folder import get_local_download_paths
+
+    paths = get_local_download_paths(local_dir, filename)
+    candidates: list[Path] = []
+    if etag:
+        candidates.append(paths.incomplete_path(etag))
+    # Fallback: every .incomplete file in the staging dir. This is what
+    # rescues us when sha256 is unknown (non-LFS file) or when hf-hub
+    # changes the etag derivation again in some future release.
+    candidates.append(paths.metadata_path.parent)  # sentinel: glob this dir
+    return candidates
+
+
+def _current_bytes(target: Path, candidates: list[Path]) -> int:
+    """Best-effort byte count of the file currently being written."""
+    if target.exists():
+        try:
+            return target.stat().st_size
+        except OSError:
+            pass
+    for c in candidates:
+        if c.is_dir():
+            # Glob every .incomplete in the staging dir; return the
+            # largest (there's typically only one in-flight transfer).
+            largest = 0
+            try:
+                for p in c.glob("*.incomplete"):
+                    try:
+                        largest = max(largest, p.stat().st_size)
+                    except OSError:
+                        continue
+            except OSError:
+                continue
+            if largest:
+                return largest
+        else:
+            try:
+                if c.exists():
+                    return c.stat().st_size
+            except OSError:
+                continue
+    return 0
+
+
+def _download_with_progress(
+    repo_id: str,
+    filename: str,
+    local_dir: Path,
+    expected_size: int,
+    console: Console,
+    etag: str | None = None,
+) -> Path:
+    """Download a single HF file with a Rich progress bar.
+
+    Runs hf_hub_download in a worker thread; the main thread polls the
+    growing file size and updates the Rich progress bar. The polled
+    target is computed via ``get_local_download_paths`` so we hit the
+    actual hf-xet staging path (a hashed filename under
+    ``.cache/huggingface/download/``), not a guess.
+    """
+    _configure_huggingface_download()
+    from huggingface_hub import hf_hub_download
+
+    local_dir.mkdir(parents=True, exist_ok=True)
+    target = local_dir / filename
+    candidates = _incomplete_path_candidates(local_dir, filename, etag)
+
+    result: list[str | None] = [None]
+    error: list[BaseException | None] = [None]
+
+    def _worker() -> None:
+        try:
+            result[0] = hf_hub_download(
+                repo_id=repo_id,
+                filename=filename,
+                local_dir=str(local_dir),
+            )
+        except BaseException as exc:  # propagate to main thread
+            error[0] = exc
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+
+    with Progress(
+        TextColumn("[cyan]{task.description}"),
+        BarColumn(bar_width=40),
+        DownloadColumn(),
+        TransferSpeedColumn(),
+        TimeRemainingColumn(),
+        console=console,
+        transient=False,
+    ) as progress:
+        task = progress.add_task(filename, total=expected_size or 1)
+        while t.is_alive():
+            current = _current_bytes(target, candidates)
+            # Always tick the bar — even at 0 bytes — so Rich repaints
+            # the spinner/ETA and the user sees the UI is alive within
+            # the first poll tick rather than a blank "Downloading…" line.
+            progress.update(task, completed=min(current, expected_size or current or 1))
+            time.sleep(0.5)
+        # Final tick after the worker finishes so the bar paints 100%.
+        if target.exists():
+            progress.update(task, completed=target.stat().st_size)
+
+    t.join(timeout=5)
+    if error[0] is not None:
+        raise error[0]
+    if result[0] is None:
+        raise RuntimeError(f"hf_hub_download returned no path for {filename}")
+    return Path(result[0])
+
+
+def _fetch(
+    api: HfApi,
+    repo_id: str,
+    filename: str,
+    local_dir: Path,
+    console: Console,
+) -> Path:
+    """Verify-or-download a single file. Skips when the local copy matches."""
+    size, sha = _file_meta(api, repo_id, filename)
+    target = local_dir / filename
+    if _local_matches(target, size, sha, console):
+        console.print(f"  [green]✓[/green] {filename} already present (size + sha256 match)")
+        return target
+    # `sha` doubles as the etag for hf-xet's staging path
+    # ({local_dir}/.cache/huggingface/download/{hash}.{etag}.incomplete);
+    # passing it through is what makes the Rich progress bar see real
+    # byte counts during the multi-GB transfer.
+    return _download_with_progress(repo_id, filename, local_dir, size, console, etag=sha)
+
+
+def download_preset(cfg: Config, preset: ModelPreset | None = None) -> int:
+    """Fetch the target and its published decode companion into cfg.models_dir.
+
+    Returns 0 on success, non-zero on failure. Verifies each file's size
+    and (LFS) sha256 against the repo metadata before downloading, so a
+    repeat run with the files already on disk is a no-op + sha256 walk.
+
+    ``preset=None`` resolves to :data:`DEFAULT_PRESET` for back-compat;
+    GGUF drafts live directly under ``models/draft``; safetensors speculators
+    retain their required sidecar metadata in a dedicated subdirectory.
+    """
+    preset = preset or DEFAULT_PRESET
+    console = Console()
+    api = _new_hf_api()
+    models = cfg.models_dir
+    models.mkdir(parents=True, exist_ok=True)
+    draft = models / "draft"
+    draft.mkdir(exist_ok=True)
+
+    try:
+        _fetch(api, preset.target_repo, preset.target_file, models, console)
+        if preset.has_draft:
+            # Narrow the optionals for the type-checker — has_draft is
+            # exactly the predicate that proves these aren't None.
+            assert preset.draft_repo is not None and preset.draft_file is not None
+            _fetch(api, preset.draft_repo, preset.draft_file, draft, console)
+        elif preset.has_speculator:
+            assert preset.speculator_repo is not None
+            assert preset.speculator_dir is not None
+            speculator_dir = draft / preset.speculator_dir
+            for filename in preset.speculator_files:
+                _fetch(api, preset.speculator_repo, filename, speculator_dir, console)
+        else:
+            console.print(
+                f"  [dim]no decode companion published for {preset.name} — "
+                "running target-only[/dim]"
+            )
+    except Exception as exc:
+        console.print(f"[red]download failed:[/red] {exc}")
+        return 1
+    return 0
+
+
+def optimizer_drafter_path(cfg: Config) -> Path:
+    """Host path of the scorer shared by PFlash and KVFlash."""
+    return cfg.models_dir / "drafter" / OPTIMIZER_DRAFTER_FILE
+
+
+def optimizer_drafter_container_path() -> str:
+    """Path seen by the native server inside the runtime image."""
+    return f"/opt/lucebox-hub/server/models/drafter/{OPTIMIZER_DRAFTER_FILE}"
+
+
+def optimizer_drafter_installed(cfg: Config) -> bool:
+    """Presence-only check suitable for an offline, factory-preloaded box."""
+    return local_artifact_present(optimizer_drafter_path(cfg))
+
+
+def local_artifact_present(path: Path) -> bool:
+    """Reject directories, placeholders, and interrupted zero-byte copies."""
+    try:
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def download_optimizer_drafter(cfg: Config) -> int:
+    """Download and verify the shared PFlash/KVFlash scorer."""
+    console = Console()
+    api = _new_hf_api()
+    try:
+        _fetch(
+            api,
+            OPTIMIZER_DRAFTER_REPO,
+            OPTIMIZER_DRAFTER_FILE,
+            cfg.models_dir / "drafter",
+            console,
+        )
+    except Exception as exc:
+        console.print(f"[red]optimizer download failed:[/red] {exc}")
+        return 1
+    return 0
+
+
+def _local_target_path(cfg: Config, preset: ModelPreset) -> Path:
+    return cfg.models_dir / preset.target_file
+
+
+def _local_decode_companion_paths(cfg: Config, preset: ModelPreset) -> tuple[Path, ...]:
+    if preset.has_draft and preset.draft_file:
+        return (cfg.models_dir / "draft" / preset.draft_file,)
+    if preset.has_speculator and preset.speculator_dir:
+        root = cfg.models_dir / "draft" / preset.speculator_dir
+        return tuple(root / filename for filename in preset.speculator_files)
+    return ()
+
+
+def installed_status(cfg: Config, preset: ModelPreset) -> str:
+    """Return ``"installed"`` / ``"partial"`` / ``"absent"`` for a preset.
+
+    Presence-only — doesn't query the network or hash. ``"installed"``
+    requires a non-empty target (and every decode-companion file when one is
+    published);
+    ``"partial"`` means at least one of the two is present but the set is
+    incomplete.
+    """
+    target_exists = local_artifact_present(_local_target_path(cfg, preset))
+    companion_paths = _local_decode_companion_paths(cfg, preset)
+    companion_states = tuple(local_artifact_present(path) for path in companion_paths)
+    if target_exists and all(companion_states):
+        return "installed"
+    if target_exists or any(companion_states):
+        return "partial"
+    return "absent"
+
+
+def installed_size_gb(cfg: Config, preset: ModelPreset) -> float:
+    """Sum of on-disk byte sizes for the preset's files, in decimal GB (1e9)."""
+    total = 0
+    target = _local_target_path(cfg, preset)
+    if target.exists():
+        try:
+            total += target.stat().st_size
+        except OSError:
+            pass
+    for companion in _local_decode_companion_paths(cfg, preset):
+        try:
+            total += companion.stat().st_size
+        except OSError:
+            pass
+    return total / 1e9
+
+
+def installed_presets(cfg: Config) -> list[ModelPreset]:
+    """Return every preset whose files are currently present in cfg.models_dir.
+
+    "Present" follows ``installed_status`` — fully installed only.
+    Partial states (target without draft, etc.) are excluded so the
+    default ``lucebox models`` view stays uncluttered.
+    """
+    out: list[ModelPreset] = []
+    for pres in catalog_presets():
+        if installed_status(cfg, pres) == "installed":
+            out.append(pres)
+    return out
+
+
+def status(cfg: Config, preset: ModelPreset | None = None) -> dict[str, bool]:
+    """Quick presence check — what's already on disk? Size-only, no sha256.
+
+    ``draft_present`` covers either a GGUF draft or every required file in a
+    safetensors speculator. For target-only presets it remains ``True`` because
+    there is no companion to fetch.
+    """
+    preset = preset or DEFAULT_PRESET
+    api = _new_hf_api()
+    out: dict[str, bool] = {}
+    try:
+        size, _ = _file_meta(api, preset.target_repo, preset.target_file)
+        local = cfg.models_dir / preset.target_file
+        out["target_present"] = local.exists() and local.stat().st_size == size
+    except Exception:
+        out["target_present"] = False
+
+    if preset.has_draft:
+        assert preset.draft_repo is not None and preset.draft_file is not None
+        try:
+            size, _ = _file_meta(api, preset.draft_repo, preset.draft_file)
+            local = cfg.models_dir / "draft" / preset.draft_file
+            out["draft_present"] = local.exists() and local.stat().st_size == size
+        except Exception:
+            out["draft_present"] = False
+    elif preset.has_speculator:
+        assert preset.speculator_repo is not None
+        assert preset.speculator_dir is not None
+        root = cfg.models_dir / "draft" / preset.speculator_dir
+        present = True
+        for filename in preset.speculator_files:
+            try:
+                size, _ = _file_meta(api, preset.speculator_repo, filename)
+                local = root / filename
+                present = present and local.exists() and local.stat().st_size == size
+            except Exception:
+                present = False
+        out["draft_present"] = present
+    else:
+        out["draft_present"] = True
+    return out
+
+
+def recommend_preset(host: HostFacts) -> str | None:
+    """Pick a default preset for first-run install. None = ask the user.
+
+    Tiers follow the model size catalog: 22 GB+ → Qwen3.6-27B (the
+    Lucebox default); 16-21 GB plus at least 32 GB host RAM → Laguna-XS.2
+    with Spark expert offload. Otherwise ask explicitly instead of proposing
+    a model that may not have enough GPU/host memory to start safely.
+    """
+    if host.vram_gb >= 22:
+        return "qwen3.6-27b"
+    if host.vram_gb >= 16 and host.ram_gb >= 32:
+        return "laguna-xs.2"
+    return None

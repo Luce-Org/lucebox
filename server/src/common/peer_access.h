@@ -1,4 +1,4 @@
-// CUDA peer-access helpers for multi-GPU inference.
+// Cross-device transport helpers for CUDA and HIP multi-GPU inference.
 //
 // Provides enable_peer_access_pair(), cross_device_peer_memcpy_ok(), and
 // copy_peer_async() — used by DraftFeatureMirror and the speculative-decode

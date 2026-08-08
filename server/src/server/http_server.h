@@ -78,7 +78,7 @@ struct ServerConfig {
     int         max_ctx     = 0;        // 0 = use backend's DevicePlacement default (8192)
     bool        enable_cors = true;
     std::string model_name  = "dflash";
-    int         prefix_cache_cap = 32;  // prefix cache slots (0 disables)
+    int         prefix_cache_cap = 8;  // prefix cache slots (0 disables)
     int         prefill_cache_cap = 0;  // full-prompt/prefill cache slots (0 disables)
 
     // Pin-Friendly Prompt Processor (PPP): LCP pin_end + optional rearrange.
@@ -218,6 +218,25 @@ struct ServerConfig {
     // routing data (hidden states + expert selections) for predictor training.
     std::string collect_routing_path;
 };
+
+// Request-level composition of long-prompt compression and reusable KV
+// prefixes. Exposed as a pure policy function so the cache-sensitive cases
+// stay model-free and unit-testable.
+enum class PflashRequestStrategy {
+    Off,
+    WholePrompt,
+    FlowKv,
+    PreservePrefix,
+};
+
+PflashRequestStrategy select_pflash_request_strategy(
+    ServerConfig::PflashMode mode,
+    int prompt_tokens,
+    int threshold,
+    bool continuation,
+    bool has_tools,
+    bool has_reusable_prefix,
+    bool flowkv_enabled);
 
 // ─── Parsed request ─────────────────────────────────────────────────────
 

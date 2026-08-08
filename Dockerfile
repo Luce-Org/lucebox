@@ -2,30 +2,31 @@
 
 # ─── Stage 1: builder ───────────────────────────────────────────────────────
 # CUDA_VERSION / UBUNTU_VERSION / DFLASH_CUDA_ARCHES are build args so the
-# same Dockerfile can be repinned later. The prebuilt image is the
-# CUDA 12.8 path:
-#   • lucebox-hub:cuda12  — CUDA 12.8.1, sm_75;80;86;89;90;120
+# same Dockerfile serves all published CUDA variants:
+#   • lucebox-hub:cuda12   — CUDA 12.0.1, x86_64, sm_75;80;86;89;90
+#   • lucebox-hub:cuda128  — CUDA 12.8.1, x86_64, sm_120 (RTX 5090)
+#   • lucebox-hub:cuda13   — CUDA 13.0.1, arm64, sm_121 (GB10/DGX Spark)
 # See docker-bake.hcl for the canonical invocation.
-ARG CUDA_VERSION=12.8.1
+ARG CUDA_VERSION=12.0.1
 ARG UBUNTU_VERSION=22.04
 FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION} AS builder
 
 ARG DEBIAN_FRONTEND=noninteractive
 
-# Fat-binary CUDA arch list, semicolon-separated. Defaults cover the CUDA 12.8
-# image. dflash-supported arches in this image:
+# Fat-binary CUDA arch list, semicolon-separated. Defaults cover the broadly
+# compatible CUDA 12 image. dflash-supported arches in this image:
 #   75  Turing      RTX 2080 Ti
 #   80  Ampere      A100
 #   86  Ampere      RTX 3090, A40, A10
 #   89  Ada         RTX 4090, L40
 #   90  Hopper      H100
-#   120 Blackwell   RTX 5090, RTX 5090 Laptop
-# Thor and GB10 prebuilt-image coverage is intentionally omitted.
+# RTX 5090 (sm_120) and GB10 (sm_121) are built by docker-bake.hcl's
+# CUDA 12.8 and CUDA 13 targets, respectively.
 # Pre-Turing arches (sm_60/61/70/72) are intentionally excluded — dflash's
 # BF16/WMMA paths have no fallback below sm_75. Each arch adds ~50-200 MB
 # of fat-binary kernel code and ~3-5 min of nvcc time per .cu translation
 # unit.
-ARG DFLASH_CUDA_ARCHES="75;80;86;89;90;120"
+ARG DFLASH_CUDA_ARCHES="75;80;86;89;90"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
@@ -100,16 +101,18 @@ RUN cmake -S /src/server -B /src/server/build \
         -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
         -DDFLASH27B_USER_CUDA_ARCHITECTURES="${DFLASH_CUDA_ARCHES}" \
         -DCMAKE_CUDA_ARCHITECTURES="${DFLASH_CUDA_ARCHES}" \
-    && cmake --build /src/server/build --target test_dflash dflash_server test_server_unit --parallel
+    && cmake --build /src/server/build \
+        --target test_dflash dflash_server backend_ipc_daemon test_server_unit --parallel
 
 # Prune the build tree to only what the runtime stage needs: the native server,
-# test_dflash, test_server_unit, and the ggml shared libs their embedded rpath
+# backend IPC companion, tests, and the ggml shared libs their embedded rpath
 # ($ORIGIN/deps/...) looks up. Drops ~1 GB per image of CMakeFiles/,
 # libdflash27b.a (statically linked into the binaries), ninja state,
 # compile_commands.json, and the template-instance .o tree from ggml-cuda.
 RUN cd /src/server/build \
     && find . -mindepth 1 -maxdepth 1 \
-            ! -name test_dflash ! -name dflash_server ! -name test_server_unit ! -name deps -exec rm -rf {} + \
+            ! -name test_dflash ! -name dflash_server ! -name backend_ipc_daemon \
+            ! -name test_server_unit ! -name deps -exec rm -rf {} + \
     && find deps -mindepth 1 -type f ! -name 'lib*.so*' -delete \
     && find deps -depth -type d -empty -delete
 
@@ -118,14 +121,16 @@ RUN cd /src/server/build \
 # of these reuses the cached CUDA layers above and only re-runs the
 # runtime stage's uv sync (~70s) instead of the full ~25-minute build.
 #
-# Host-side Python tooling (lucebox/, harness/) is intentionally not copied
-# here: this image is the server. Such tooling can layer on top later via a
-# follow-up COPY directive or a runtime bind-mount during dev.
+# The lucebox CLI is a workspace member (root pyproject + uv.lock), so its
+# source must be present for `uv sync --frozen` in the runtime stage. It runs
+# inside the container — the host wrapper `docker exec`s into it.
 COPY pyproject.toml uv.lock README.md /src/
 COPY server/pyproject.toml server/README.md /src/server/
 COPY server/scripts /src/server/scripts
 COPY optimizations/pflash /src/optimizations/pflash
 COPY optimizations/megakernel /src/optimizations/megakernel
+COPY lucebox/pyproject.toml lucebox/README.md /src/lucebox/
+COPY lucebox/src /src/lucebox/src
 
 # ─── Stage 2: runtime ───────────────────────────────────────────────────────
 # Runtime image: ships nvidia driver libs but no nvcc / dev headers. Matches
@@ -180,9 +185,9 @@ COPY --from=builder /src/optimizations/megakernel/pyproject.toml \
                    /src/optimizations/megakernel/README.md \
                    /opt/lucebox-hub/optimizations/megakernel/
 
-# Host-side Python tooling (lucebox/, harness/) is intentionally absent
-# here: this image is the server base layer. Such tooling can layer on top
-# later via a follow-up COPY directive or a runtime bind-mount during dev.
+# The lucebox CLI package (a workspace member) — installed by the uv sync
+# below and invoked in-container by the host wrapper via `docker exec`.
+COPY --from=builder /src/lucebox /opt/lucebox-hub/lucebox
 
 # server: ship the entrypoint/benchmark scripts, the pyproject + README that uv
 # resolves against, and the pruned build tree (binaries + .so files from the
@@ -205,12 +210,18 @@ COPY --from=builder /src/server/build /opt/lucebox-hub/server/build
 # server/share/model_cards. The canonical copy also lives at
 # /opt/lucebox-hub/share/model_cards for any host-side tooling.
 COPY share/model_cards /opt/lucebox-hub/share/model_cards
+# Dedicated targets for narrow, read-only binds when a selected model is a
+# symlink to storage outside the main models directory.
 RUN mkdir -p /opt/lucebox-hub/server/share \
+             /opt/lucebox-resolved/target \
+             /opt/lucebox-resolved/draft \
+             /opt/lucebox-resolved/draft-dir \
     && ln -s /opt/lucebox-hub/share/model_cards \
              /opt/lucebox-hub/server/share/model_cards
 
 RUN test -x /opt/lucebox-hub/server/build/test_dflash \
     && test -x /opt/lucebox-hub/server/build/dflash_server \
+    && test -x /opt/lucebox-hub/server/build/backend_ipc_daemon \
     && test -x /opt/lucebox-hub/server/build/test_server_unit \
     && test -f /opt/lucebox-hub/server/share/model_cards/qwen3.6-27b.json \
     && chmod +x /opt/lucebox-hub/server/scripts/entrypoint.sh

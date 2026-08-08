@@ -20,26 +20,12 @@
 #include <cuda_bf16.h>
 
 #include "../src/flashprefill.h"
+#include "../src/flashprefill_launchers.h"
+
+using dflash::common::flashprefill::launch_compute_block_score_bf16;
+using dflash::common::flashprefill::launch_compute_mean_vector_bf16;
 
 extern "C" {
-void launch_compute_mean_vector_bf16(
-    const void * K, void * mean_K,
-    int batch, int seq_len, int n_kv_heads, int head_dim, int block_size,
-    int s_K_b, int s_K_n, int s_K_h, int s_K_d,
-    int s_mK_b, int s_mK_m, int s_mK_h, int s_mK_d,
-    cudaStream_t stream);
-
-void launch_compute_block_score_bf16(
-    const void * Q, const void * mean_K, float sm_scale,
-    void * score, void * score_max,
-    int batch, int n_q_heads, int n_k_heads,
-    int seq_len, int head_dim, int block_size,
-    int s_Q_b, int s_Q_n, int s_Q_h, int s_Q_d,
-    int s_mK_b, int s_mK_m, int s_mK_h, int s_mK_d,
-    int s_S_b, int s_S_m, int s_S_n, int s_S_h,
-    int s_M_b, int s_M_m, int s_M_n, int s_M_h,
-    cudaStream_t stream);
-
 void launch_sparse_flash_forward_bf16(
     const void * Q, const void * K, const void * V, void * O,
     const int32_t * block_index, const int32_t * counts,
@@ -110,10 +96,13 @@ int main() {
     int s_cnt_b = M * H, s_cnt_m = H, s_cnt_h = 1;
 
     // ── Kernel 1: compute_mean_vector ──
-    launch_compute_mean_vector_bf16(
+    if (launch_compute_mean_vector_bf16(
         dK, dmK, B, S, Hk, D, BLOCK,
         s_K_b, s_K_n, s_K_h, s_K_d,
-        s_mK_b, s_mK_m, s_mK_h, s_mK_d, 0);
+        s_mK_b, s_mK_m, s_mK_h, s_mK_d, 0) != 0) {
+        std::fprintf(stderr, "[fp-test] kernel 1 launcher failed\n");
+        return 1;
+    }
     CK(cudaDeviceSynchronize());
 
     // Verify host vs GPU mean for one block.
@@ -140,13 +129,16 @@ int main() {
 
     // ── Kernel 2: compute_block_score ──
     float scale = 1.0f / std::sqrt((float)D);
-    launch_compute_block_score_bf16(
+    if (launch_compute_block_score_bf16(
         dQ, dmK, scale, dS, dM,
         B, H, Hk, S, D, BLOCK,
         s_Q_b, s_Q_n, s_Q_h, s_Q_d,
         s_mK_b, s_mK_m, s_mK_h, s_mK_d,
         s_S_b, s_S_m, s_S_n, s_S_h,
-        s_S_b, s_S_m, s_S_n, s_S_h, 0);
+        s_S_b, s_S_m, s_S_n, s_S_h, 0) != 0) {
+        std::fprintf(stderr, "[fp-test] kernel 2 launcher failed\n");
+        return 1;
+    }
     CK(cudaDeviceSynchronize());
     std::printf("[fp-test] kernel 2 (compute_block_score): launch ok\n");
 
@@ -256,9 +248,12 @@ int main() {
         cfg.alpha = 0.12f;
 
         // Warm-up
-        dflash::common::flashprefill::flash_prefill_forward_bf16(
+        if (dflash::common::flashprefill::flash_prefill_forward_bf16(
             bdQ, bdK, bdV, bdO, BB, BS, BH, BHk, BD,
-            1.0f / std::sqrt((float)BD), cfg);
+            1.0f / std::sqrt((float)BD), cfg) != 0) {
+            std::fprintf(stderr, "[fp-test] e2e warm-up failed\n");
+            return 1;
+        }
         CK(cudaDeviceSynchronize());
 
         cudaEvent_t e_a, e_b;
@@ -266,9 +261,12 @@ int main() {
         cudaEventCreate(&e_b);
         cudaEventRecord(e_a);
         for (int it = 0; it < 5; ++it) {
-            dflash::common::flashprefill::flash_prefill_forward_bf16(
+            if (dflash::common::flashprefill::flash_prefill_forward_bf16(
                 bdQ, bdK, bdV, bdO, BB, BS, BH, BHk, BD,
-                1.0f / std::sqrt((float)BD), cfg);
+                1.0f / std::sqrt((float)BD), cfg) != 0) {
+                std::fprintf(stderr, "[fp-test] e2e timed iteration failed\n");
+                return 1;
+            }
         }
         cudaEventRecord(e_b);
         cudaEventSynchronize(e_b);

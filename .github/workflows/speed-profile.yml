@@ -2,8 +2,8 @@ name: Speed Profile
 
 # Report-only speed profile for the inference engine. Runs on the self-hosted
 # RTX 3090 (lucebox3) on PRs that touch the engine or the optimizations, and on
-# manual dispatch. It NEVER blocks a PR (continue-on-error: true) — it publishes a
-# report to the run summary + uploads the JSON / markdown / nsys trace as artifacts.
+# manual dispatch. Benchmark/runtime failures are warnings, not a red PR check;
+# the job publishes a summary plus JSON / markdown / nsys artifacts for triage.
 #
 # Why report-only: perf has run-to-run variance (thermals, clocks, scheduling).
 # Gating a merge on a noisy absolute number produces false failures. We surface the
@@ -30,7 +30,9 @@ jobs:
     name: Speed profile (self-hosted RTX 3090, sm_86)
     runs-on: [self-hosted, gpu, sm86]
     timeout-minutes: 30
-    continue-on-error: true   # report-only: a slow/failed profile must not block the PR
+    # Individual benchmark failures are converted into warnings below. Keeping
+    # the job itself green avoids a misleading red PR check for a report-only
+    # measurement while still preserving logs and artifacts for triage.
 
     # Model paths live on the runner, not in the repo (multi-GB weights). They are
     # overridable via repo variables so the runner owner can point at whatever is
@@ -51,7 +53,7 @@ jobs:
 
       - name: GPU info (and pin clocks to cut variance, if permitted)
         run: |
-          nvidia-smi --query-gpu=name,driver_version,memory.total,power.limit --format=csv
+          nvidia-smi --query-gpu=name,driver_version,memory.total,memory.free,power.limit --format=csv
           # Locking clocks makes the numbers comparable run-to-run. Safe to skip if the
           # runner user can't run nvidia-smi -lgc; the profiler still records the power cap.
           sudo nvidia-smi -lgc 1395 2>/dev/null || echo "clock lock not permitted; continuing"
@@ -94,8 +96,43 @@ jobs:
             echo "::warning title=Speed profile skipped::Model weights not found under $MODELS — see the run summary."
           fi
 
-      - name: Build engine binaries (sm_86, Release)
+      - name: Wait for exclusive GPU capacity
+        id: capacity
         if: steps.models.outputs.present == 'true'
+        env:
+          MIN_FREE_MIB: ${{ vars.LUCEBOX_SPEED_MIN_FREE_MIB || '22000' }}
+        run: |
+          # The 27B target + draft fit on a clean 24 GB 3090, but fail with a
+          # cryptic cudaMalloc error when another process temporarily owns VRAM.
+          # Never kill a user's process: wait briefly, then skip this report.
+          ready=false
+          free_mib=0
+          for attempt in {1..30}; do
+            free_mib=$(nvidia-smi --query-gpu=memory.free \
+              --format=csv,noheader,nounits | sed -n '1p' | tr -d '[:space:]')
+            if [[ "$free_mib" =~ ^[0-9]+$ ]] && [ "$free_mib" -ge "$MIN_FREE_MIB" ]; then
+              ready=true
+              break
+            fi
+            if [ "$attempt" -eq 1 ]; then
+              echo "Only ${free_mib:-unknown} MiB is free; waiting for ${MIN_FREE_MIB} MiB."
+            fi
+            sleep 10
+          done
+          echo "ready=$ready" >> "$GITHUB_OUTPUT"
+          echo "free_mib=${free_mib:-0}" >> "$GITHUB_OUTPUT"
+          if [ "$ready" != true ]; then
+            echo "::warning title=Speed profile skipped::GPU remained busy (${free_mib:-unknown} MiB free; ${MIN_FREE_MIB} MiB required)."
+            {
+              echo "## 🏎️ Speed profile — skipped (GPU busy)"
+              echo ""
+              echo "The RTX 3090 had only \`${free_mib:-unknown} MiB\` free after a five-minute wait;"
+              echo "the model-backed profile requires \`${MIN_FREE_MIB} MiB\`. No process was killed."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Build engine binaries (sm_86, Release)
+        if: steps.models.outputs.present == 'true' && steps.capacity.outputs.ready == 'true'
         run: |
           cd server
           cmake -B build \
@@ -106,7 +143,7 @@ jobs:
           cmake --build build --target test_dflash test_generate -j"$(nproc)"
 
       - name: Install profiler Python deps (isolated, pinned venv)
-        if: steps.models.outputs.present == 'true'
+        if: steps.models.outputs.present == 'true' && steps.capacity.outputs.ready == 'true'
         run: |
           cd server
           # The profiler only needs a tokenizer, so we use a tiny isolated venv
@@ -123,7 +160,8 @@ jobs:
             protobuf==6.31.1
 
       - name: Run speed profiler
-        if: steps.models.outputs.present == 'true'
+        id: profile
+        if: steps.models.outputs.present == 'true' && steps.capacity.outputs.ready == 'true'
         run: |
           cd server
           # Use a committed baseline if one is staged so the report can flag a
@@ -143,6 +181,7 @@ jobs:
           # The nsys pass adds a separate short profiled run; tok/s is measured on clean passes. Run 5
           # timing reps by default so the report can distinguish real deltas from
           # thermal/clock jitter; repo variables can trim this for temporary smoke runs.
+          set +e
           .profiler-venv/bin/python scripts/profile.py \
             --target "$MODELS/$TARGET_MODEL" \
             --draft  "$MODELS/$DRAFT_MODEL" \
@@ -153,6 +192,18 @@ jobs:
             --nsys --check-lossless \
             "${baseline_arg[@]}" \
             --out-json profile.json --out-md profile.md
+          profile_rc=$?
+          set -e
+          echo "exit_code=$profile_rc" >> "$GITHUB_OUTPUT"
+          if [ "$profile_rc" -ne 0 ]; then
+            echo "::warning title=Speed profiler failed::Profiler exited $profile_rc; see its logs and uploaded artifacts."
+            {
+              echo "## 🏎️ Speed profile — profiler failed"
+              echo ""
+              echo "The report-only profiler exited with code \`$profile_rc\`. See the job log for the root cause."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit 0
         env:
           LUCEBOX_SPEED_BASELINE: ${{ vars.LUCEBOX_SPEED_BASELINE || '' }}
           LUCEBOX_SPEED_REGRESS_PCT: ${{ vars.LUCEBOX_SPEED_REGRESS_PCT || '' }}
@@ -161,7 +212,7 @@ jobs:
           LUCEBOX_SPEED_NOISE_RSD_PCT: ${{ vars.LUCEBOX_SPEED_NOISE_RSD_PCT || '' }}
 
       - name: Publish report to the run summary
-        if: always() && steps.models.outputs.present == 'true'
+        if: always() && steps.models.outputs.present == 'true' && steps.capacity.outputs.ready == 'true'
         run: |
           if [ -f server/profile.md ]; then
             { echo "## 🏎️ Speed profile"; echo ""; cat server/profile.md; } >> "$GITHUB_STEP_SUMMARY"
