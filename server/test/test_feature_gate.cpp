@@ -146,6 +146,26 @@ static void test_feature_gate_pflash_requires_drafter_and_supported_arch() {
         args, "gemma4", PlacementBackend::Cuda, features).empty());
     TEST_ASSERT(gate_result(
         args, "qwen35", PlacementBackend::Cuda, features).empty());
+
+    // DeepSeek supports local PFlash through its monolithic backend and
+    // remote PFlash regardless of the target's tokenizer. Its layer-split
+    // adapter does not own a local PFlash drafter yet.
+    BackendArgs deepseek_local;
+    deepseek_local.model_path = "/nonexistent/model.gguf";
+    TEST_ASSERT(gate_result(
+        deepseek_local, "deepseek4", PlacementBackend::Cuda, features).empty());
+
+    BackendArgs deepseek_split;
+    deepseek_split.model_path = "/nonexistent/model.gguf";
+    TEST_ASSERT(parse_placement_device_list(
+        "cuda:0,cuda:1", deepseek_split.device));
+    TEST_ASSERT(!gate_result(
+        deepseek_split, "deepseek4", PlacementBackend::Cuda, features).empty());
+
+    deepseek_split.draft_device.backend = PlacementBackend::Hip;
+    deepseek_split.remote_draft.ipc_bin = "/usr/bin/draft-ipc";
+    TEST_ASSERT(gate_result(
+        deepseek_split, "deepseek4", PlacementBackend::Cuda, features).empty());
 }
 
 static void test_feature_gate_validates_target_split_topology() {

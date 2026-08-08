@@ -213,6 +213,7 @@ What we built:
 
 - **Single 24 GB GPU** target (RTX 3090 reference). On 32+ GB cards, drafter + target can coexist and the park/unpark dance disappears.
 - **Qwen3.6-27B Q4_K_M target + Qwen3-0.6B drafter** is the validated pair. Other targets/drafters need keep_ratio + alpha re-calibration.
+- **DeepSeek V4 Flash is supported experimentally on the monolithic backend.** The HTTP server bridges the DeepSeek and Qwen drafter tokenizers, keeps the large target resident when memory permits, and temporarily releases/restores the DSpark decode drafter. Local layer-split DeepSeek PFlash is not implemented; a remote PFlash drafter remains available for that placement.
 - **NIAH single-needle** is the only retrieval task validated end-to-end. Multi-doc QA, long-form code retrieval, etc. still TBD.
 - **sm_80+** required for BSA (RTX 3090 sm_86 is the reference). On sm_75 (Turing) the build auto-disables BSA and falls back to the WMMA path; expect a slower drafter forward at long ctx.
 
