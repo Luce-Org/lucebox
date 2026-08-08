@@ -1264,6 +1264,12 @@ if(DFLASH27B_TESTS)
         list(APPEND _raw_unit_test_targets test_recurrent_snapshot)
     endif()
 
+    # Pure proposal-shape contract test: no ggml, GPU, or model files.
+    add_executable(test_draft_contract test/test_draft_contract.cpp)
+    target_include_directories(test_draft_contract PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME draft_contract COMMAND test_draft_contract)
+
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_server_unit.cpp")
         set(_server_unit_sources
             test/test_unit_main.cpp
@@ -1426,6 +1432,9 @@ if(DFLASH27B_TESTS)
     # 'make check' — build every registered unit-test target, including the
     # lightweight feature gate added on main, then run the complete CTest set.
     set(_check_deps ${_raw_unit_test_targets})
+    if(TARGET test_draft_contract)
+        list(APPEND _check_deps test_draft_contract)
+    endif()
     if(TARGET test_platform_compat)
         list(APPEND _check_deps test_platform_compat)
     endif()
