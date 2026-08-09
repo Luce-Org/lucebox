@@ -468,8 +468,10 @@ def test_snapshot_restore_requires_identical_auxiliary_state() -> None:
     restored["request"] = 1
     restored["restored"] = True
     restored["cache_position"] = restored["prompt_tokens"]
-    restored["snap_slot"] = 0
-    restored["snap_pos"] = restored["prompt_tokens"]
+    # Full-cache hits receive the restored position separately; these request
+    # fields retain their defaults in the HTTP server.
+    assert restored["snap_slot"] == -1
+    assert restored["snap_pos"] == -1
     records = [
         manifest(),
         snapshot("snapshot_save", 0),
@@ -506,8 +508,8 @@ def test_partial_snapshot_fails() -> None:
     restored["request"] = 1
     restored["restored"] = True
     restored["cache_position"] = 8
-    restored["snap_slot"] = 0
-    restored["snap_pos"] = 8
+    assert restored["snap_slot"] == -1
+    assert restored["snap_pos"] == -1
     records = [
         manifest(),
         snapshot("snapshot_save", 0),

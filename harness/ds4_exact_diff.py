@@ -829,8 +829,6 @@ REPEATED_REQUEST_FIELDS = (
     "prompt_token_ids",
     "prompt_tokens",
     "n_gen",
-    "snap_slot",
-    "snap_pos",
     "temperature",
     "top_p",
     "top_k",
@@ -960,7 +958,6 @@ def validate_snapshot_lifecycle(
         or restored["cache_position"] != prompt_tokens
         or restored_start["cache_position"] != prompt_tokens
         or saved_start["snap_pos"] != prompt_tokens
-        or restored_start["snap_pos"] != prompt_tokens
     ):
         return matrix_failure(
             f"{profile}.q{width}.snapshot_full_prompt",
@@ -970,7 +967,6 @@ def validate_snapshot_lifecycle(
                 "restore": restored["cache_position"],
                 "restored_start": restored_start["cache_position"],
                 "fresh_snap_pos": saved_start["snap_pos"],
-                "restored_snap_pos": restored_start["snap_pos"],
             },
             "snapshot profile requires a full-prompt save and restore",
         )
