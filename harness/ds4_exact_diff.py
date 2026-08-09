@@ -823,6 +823,102 @@ SNAPSHOT_STATE_FIELDS = (
     "spec_feature_count",
 )
 
+REPEATED_REQUEST_FIELDS = (
+    "width",
+    "prompt_token_hash",
+    "prompt_token_ids",
+    "prompt_tokens",
+    "n_gen",
+    "snap_slot",
+    "snap_pos",
+    "temperature",
+    "top_p",
+    "top_k",
+    "seed",
+)
+
+
+def validate_repeated_request_lifecycle(
+    profile: str,
+    width: int,
+    records: list[dict[str, Any]],
+    starts: list[dict[str, Any]],
+) -> Mismatch | None:
+    ordered_starts = sorted(starts, key=lambda record: record["request"])
+    first = ordered_starts[0]
+    repeated = ordered_starts[1]
+    for field in REPEATED_REQUEST_FIELDS:
+        if first[field] != repeated[field]:
+            return matrix_failure(
+                f"{profile}.q{width}.repeated_request.{field}",
+                first[field],
+                repeated[field],
+                "repeated request configuration differs from the first request",
+            )
+
+    token_records = event_index(records, "tokens")
+    first_tokens = token_records[(first["request"],)]["token_ids"]
+    repeated_tokens = token_records[(repeated["request"],)]["token_ids"]
+    if first_tokens != repeated_tokens:
+        return matrix_failure(
+            f"{profile}.q{width}.repeated_tokens",
+            first_tokens,
+            repeated_tokens,
+            "repeated request continuation tokens differ",
+        )
+
+    request_ends = event_index(records, "request_end")
+    first_end = request_ends[(first["request"],)]["cache_position"]
+    repeated_end = request_ends[(repeated["request"],)]["cache_position"]
+    if first_end != repeated_end:
+        return matrix_failure(
+            f"{profile}.q{width}.repeated_cache_position",
+            first_end,
+            repeated_end,
+            "repeated request final cache position differs",
+        )
+
+    if profile == "reset":
+        resets = event_index(records, "reset")
+        expected_reset_keys = {(first["request"],), (repeated["request"],)}
+        if resets.keys() != expected_reset_keys or any(
+            record["cache_position"] != 0 for record in resets.values()
+        ):
+            return matrix_failure(
+                f"{profile}.q{width}.reset_lifecycle",
+                {"requests": sorted(expected_reset_keys), "cache_position": 0},
+                {
+                    "requests": sorted(resets),
+                    "cache_positions": sorted(
+                        record["cache_position"] for record in resets.values()
+                    ),
+                },
+                "reset requests must both begin from an empty cache",
+            )
+        logits = event_index(records, "logits")
+        final_position = first["prompt_tokens"]
+        first_logits = logits.get((first["request"], final_position))
+        repeated_logits = logits.get((repeated["request"], final_position))
+        if first_logits is None or repeated_logits is None:
+            return matrix_failure(
+                f"{profile}.q{width}.repeated_logits",
+                "final logits for both requests",
+                sorted(logits),
+                "reset repetition is missing final logits",
+            )
+        float_diff = first_float_mismatch(
+            first_logits["values"], repeated_logits["values"], TOLERANCES["final_logits"]
+        )
+        if float_diff:
+            index, left, right = float_diff
+            return matrix_failure(
+                f"{profile}.q{width}.repeated_logits[{index}]",
+                left,
+                right,
+                "repeated request final logits exceed tolerance",
+            )
+    return None
+
 
 def validate_snapshot_lifecycle(
     profile: str,
@@ -857,6 +953,26 @@ def validate_snapshot_lifecycle(
             "restored request",
             restored["request"],
             "snapshot restore must belong to the restored request",
+        )
+    prompt_tokens = saved_start["prompt_tokens"]
+    if (
+        saved["cache_position"] != prompt_tokens
+        or restored["cache_position"] != prompt_tokens
+        or restored_start["cache_position"] != prompt_tokens
+        or saved_start["snap_pos"] != prompt_tokens
+        or restored_start["snap_pos"] != prompt_tokens
+    ):
+        return matrix_failure(
+            f"{profile}.q{width}.snapshot_full_prompt",
+            prompt_tokens,
+            {
+                "save": saved["cache_position"],
+                "restore": restored["cache_position"],
+                "restored_start": restored_start["cache_position"],
+                "fresh_snap_pos": saved_start["snap_pos"],
+                "restored_snap_pos": restored_start["snap_pos"],
+            },
+            "snapshot profile requires a full-prompt save and restore",
         )
     for field in SNAPSHOT_STATE_FIELDS:
         if saved[field] != restored[field]:
@@ -1018,13 +1134,16 @@ def validate_matrix(traces: dict[tuple[str, int], list[dict[str, Any]]]) -> Mism
                 "request restore lifecycle differs from the profile contract",
             )
         tokens = [record for record in records if record.get("type") == "tokens"]
-        if len(tokens) < 2 or any(len(record["token_ids"]) < 2 for record in tokens):
+        if len(tokens) != 2 or any(len(record["token_ids"]) < 2 for record in tokens):
             return matrix_failure(
                 f"{profile}.q{width}.continuations",
                 "two requests with multiple tokens",
                 [len(record["token_ids"]) for record in tokens],
                 "multiple continuation tokens are required",
             )
+        repetition_mismatch = validate_repeated_request_lifecycle(profile, width, records, starts)
+        if repetition_mismatch:
+            return repetition_mismatch
         if not any(record.get("type") == "logits" for record in records):
             return matrix_failure(
                 f"{profile}.q{width}.logits", True, False, "final logits are missing"

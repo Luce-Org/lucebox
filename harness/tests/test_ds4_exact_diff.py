@@ -108,11 +108,11 @@ def capture(position: int = 4) -> dict[str, object]:
     }
 
 
-def request_end(cache_position: int = 4) -> dict[str, object]:
+def request_end(cache_position: int = 4, *, request: int = 0) -> dict[str, object]:
     return {
         "schema": MODULE.SCHEMA,
         "type": "request_end",
-        "request": 0,
+        "request": request,
         "ok": True,
         "cache_position": cache_position,
     }
@@ -462,9 +462,14 @@ def test_restored_request_final_position_uses_full_prompt_length(tmp_path: Path)
 
 def test_snapshot_restore_requires_identical_auxiliary_state() -> None:
     fresh = request_start()
+    fresh["snap_slot"] = 0
+    fresh["snap_pos"] = fresh["prompt_tokens"]
     restored = request_start()
     restored["request"] = 1
     restored["restored"] = True
+    restored["cache_position"] = restored["prompt_tokens"]
+    restored["snap_slot"] = 0
+    restored["snap_pos"] = restored["prompt_tokens"]
     records = [
         manifest(),
         snapshot("snapshot_save", 0),
@@ -475,6 +480,42 @@ def test_snapshot_restore_requires_identical_auxiliary_state() -> None:
     mismatch = MODULE.validate_snapshot_lifecycle("snapshot", 1, records, [fresh, restored])
     assert mismatch is not None
     assert mismatch.field == "snapshot.q1.snapshot.spec_feature_hash"
+
+
+def test_repeated_request_token_divergence_fails() -> None:
+    fresh = request_start()
+    repeated = request_start()
+    repeated["request"] = 1
+    records = [
+        tokens(0),
+        tokens(1),
+        request_end(request=0),
+        request_end(request=1),
+    ]
+    records[1]["token_ids"] = [9, 10]
+    mismatch = MODULE.validate_repeated_request_lifecycle("snapshot", 1, records, [fresh, repeated])
+    assert mismatch is not None
+    assert mismatch.field == "snapshot.q1.repeated_tokens"
+
+
+def test_partial_snapshot_fails() -> None:
+    fresh = request_start(prompt_tokens=8)
+    fresh["snap_slot"] = 0
+    fresh["snap_pos"] = 8
+    restored = request_start(prompt_tokens=8)
+    restored["request"] = 1
+    restored["restored"] = True
+    restored["cache_position"] = 8
+    restored["snap_slot"] = 0
+    restored["snap_pos"] = 8
+    records = [
+        manifest(),
+        snapshot("snapshot_save", 0),
+        snapshot("snapshot_restore", 1),
+    ]
+    mismatch = MODULE.validate_snapshot_lifecycle("snapshot", 1, records, [fresh, restored])
+    assert mismatch is not None
+    assert mismatch.field == "snapshot.q1.snapshot_full_prompt"
 
 
 def test_restored_request_uses_snapshot_features_instead_of_prefill_capture() -> None:

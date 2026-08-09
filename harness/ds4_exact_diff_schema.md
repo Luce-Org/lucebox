@@ -50,7 +50,9 @@ To cover all three tail widths with one pinned prompt, its production token coun
 must satisfy `N % 12 == 11`; q=2, q=3, and q=4 then end with widths 1, 2, and 3.
 The comparator rejects a trace set that does not actually contain those rows.
 Every request must end successfully and emit exactly one completion and token
-record. A full-prompt restored request performs no prefill, so its DSpark state
+record. The repeated request must use the same prompt and sampling configuration
+and produce the same continuation tokens; reset repetitions also compare final
+logits. A full-prompt restored request performs no prefill, so its DSpark state
 is authenticated through the snapshot's cache, logits, and feature hashes
 rather than through impossible duplicate capture rows.
 
