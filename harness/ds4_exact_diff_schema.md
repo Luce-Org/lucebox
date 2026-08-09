@@ -55,6 +55,11 @@ and produce the same continuation tokens; reset repetitions also compare final
 logits. A full-prompt restored request performs no prefill, so its DSpark state
 is authenticated through the snapshot's cache, logits, and feature hashes
 rather than through impossible duplicate capture rows.
+Across all eight traces, the comparator requires one binary, revision, model,
+prompt, tolerance contract, and fixed request configuration. Only the profile,
+width, exact-band setting, and per-process port may vary. The observed prompt
+tokens, generation count, sampling settings, and width must also agree with the
+manifest and with every other trace.
 
 The production position filter records:
 
@@ -102,4 +107,6 @@ python3 harness/ds4_exact_diff.py compare \
 The run command hashes its inputs before launching the server, forces greedy
 sampling, keeps exact attention, disables approximate/fused verification, and
 uses `--chunk q` with the exact-band flag disabled for q=1 and enabled for
-q=2..4. Raw traces and server logs belong outside Git.
+q=2..4. `--server-arg` rejects options that could override those fixed
+invariants, and a run without `--draft` clears inherited DSpark activation.
+Raw traces and server logs belong outside Git.

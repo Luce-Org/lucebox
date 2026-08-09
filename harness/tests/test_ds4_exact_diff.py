@@ -16,11 +16,11 @@ sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
 
 
-def manifest(width: int = 1) -> dict[str, object]:
+def manifest(width: int = 1, profile: str = "reset") -> dict[str, object]:
     return {
         "schema": MODULE.SCHEMA,
         "type": "manifest",
-        "profile": "reset",
+        "profile": profile,
         "width": width,
         "revision": "a" * 40,
         "binary_sha256": "b" * 64,
@@ -28,9 +28,15 @@ def manifest(width: int = 1) -> dict[str, object]:
         "drafter_sha256": "d" * 64,
         "prompt_bytes_sha256": "e" * 64,
         "request_config": {
+            "prefill_mode": "exact",
             "prefill_width": width,
             "exact_bands": width > 1,
+            "generated_tokens": 16,
             "port": 18000 + width,
+            "profile": profile,
+            "seed": 1,
+            "server_args": [],
+            "target_device": "hip:0",
             "temperature": 0,
         },
         "tolerances": MODULE.TOLERANCES,
@@ -75,6 +81,15 @@ def request_start(prompt_tokens: int = 4) -> dict[str, object]:
         "top_p": 1.0,
         "top_k": 0,
         "seed": 1,
+    }
+
+
+def model_config() -> dict[str, object]:
+    return {
+        "schema": MODULE.SCHEMA,
+        "type": "model_config",
+        "n_swa": 128,
+        "compressor_boundaries": [4, 8],
     }
 
 
@@ -575,7 +590,7 @@ def test_prompt_token_ids_are_required(tmp_path: Path) -> None:
 
 def test_matrix_requires_model_config_per_trace() -> None:
     traces = {
-        (profile, width): [manifest(width)]
+        (profile, width): [manifest(width, profile)]
         for profile in MODULE.PROFILES
         for width in MODULE.WIDTHS
     }
@@ -584,3 +599,59 @@ def test_matrix_requires_model_config_per_trace() -> None:
     assert mismatch.field == "reset.q1.model_config"
     assert mismatch.oracle == 1
     assert mismatch.candidate == 0
+
+
+def test_matrix_rejects_cross_profile_manifest_identity() -> None:
+    traces = {
+        (profile, width): [manifest(width, profile)]
+        for profile in MODULE.PROFILES
+        for width in MODULE.WIDTHS
+    }
+    traces[("snapshot", 1)][0]["revision"] = "f" * 40
+    mismatch = MODULE.validate_matrix(traces)
+    assert mismatch is not None
+    assert mismatch.field == "snapshot.q1.matrix_manifest"
+
+
+def test_matrix_rejects_mislabeled_request_profile() -> None:
+    traces = {
+        (profile, width): [manifest(width, profile)]
+        for profile in MODULE.PROFILES
+        for width in MODULE.WIDTHS
+    }
+    traces[("snapshot", 1)][0]["request_config"]["profile"] = "reset"
+    mismatch = MODULE.validate_matrix(traces)
+    assert mismatch is not None
+    assert mismatch.field == "snapshot.q1.manifest_coordinates"
+
+
+def test_matrix_rejects_cross_profile_request_identity() -> None:
+    traces = {}
+    for profile in MODULE.PROFILES:
+        for width in MODULE.WIDTHS:
+            start = request_start()
+            start["width"] = width
+            traces[(profile, width)] = [manifest(width, profile), model_config(), start]
+    traces[("snapshot", 1)][2]["prompt_token_ids"] = [9, 10, 11, 12]
+    mismatch = MODULE.validate_matrix(traces)
+    assert mismatch is not None
+    assert mismatch.field == "snapshot.q1.matrix_request"
+
+
+@pytest.mark.parametrize(
+    "server_arg",
+    ["--chunk", "--ds4-prefill=dense", "--prefill-threshold", "--target-devices"],
+)
+def test_reserved_server_argument_fails(server_arg: str) -> None:
+    with pytest.raises(ValueError, match="reserved option"):
+        MODULE.validate_server_args([server_arg])
+
+
+def test_no_draft_environment_clears_inherited_dspark(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DFLASH_DS4_SPEC", "1")
+    monkeypatch.setenv("DFLASH_DS4_DRAFT", "ambient.gguf")
+    monkeypatch.setenv("DFLASH_DS4_SPEC_Q", "3")
+    env = MODULE.build_trace_environment(Path("trace.jsonl"), 2, None)
+    assert env["DFLASH_DS4_SPEC"] == "0"
+    assert "DFLASH_DS4_DRAFT" not in env
+    assert "DFLASH_DS4_SPEC_Q" not in env

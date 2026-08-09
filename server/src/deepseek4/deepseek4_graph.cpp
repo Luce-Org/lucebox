@@ -6925,8 +6925,7 @@ bool deepseek4_step_layer_range(
         (fused_hybrid_decode && !verify_hooks)
             ? &fused_hybrid_decode_hooks : verify_hooks;
     if ((!moe_hybrid || fused_hybrid_ready) &&
-        ((n_tokens >= 2 && n_tokens <= 4 && verify_hooks) ||
-         fused_hybrid_decode) &&
+        (fused_verify_candidate || fused_hybrid_decode) &&
         layer_begin == 0 && is_last_shard &&
         out_logits && ds4_backend_is_gpu(backend) && ds4_fused_verify_enabled()) {
         const bool q1_feature_capture =

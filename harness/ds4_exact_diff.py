@@ -25,6 +25,18 @@ TOLERANCES = {
 }
 WIDTHS = (1, 2, 3, 4)
 PROFILES = ("reset", "snapshot")
+RESERVED_SERVER_OPTIONS = frozenset(
+    {
+        "--chunk",
+        "--draft",
+        "--ds4-prefill",
+        "--host",
+        "--port",
+        "--prefix-cache-slots",
+        "--target-device",
+        "--target-devices",
+    }
+)
 
 
 class TraceError(ValueError):
@@ -1019,6 +1031,56 @@ def validate_capture_coverage(
 
 
 def validate_matrix(traces: dict[tuple[str, int], list[dict[str, Any]]]) -> Mismatch | None:
+    canonical_manifest: dict[str, Any] | None = None
+    for (profile, width), records in sorted(traces.items()):
+        manifest = records[0]
+        request_config = manifest["request_config"]
+        if not isinstance(request_config, dict):
+            return matrix_failure(
+                f"{profile}.q{width}.request_config",
+                "object",
+                type(request_config).__name__,
+                "manifest request configuration must be an object",
+            )
+        expected_coordinates = {
+            "profile": profile,
+            "width": width,
+            "request_profile": profile,
+            "prefill_width": width,
+            "exact_bands": width > 1,
+        }
+        observed_coordinates = {
+            "profile": manifest["profile"],
+            "width": manifest["width"],
+            "request_profile": request_config.get("profile"),
+            "prefill_width": request_config.get("prefill_width"),
+            "exact_bands": request_config.get("exact_bands"),
+        }
+        if observed_coordinates != expected_coordinates:
+            return matrix_failure(
+                f"{profile}.q{width}.manifest_coordinates",
+                expected_coordinates,
+                observed_coordinates,
+                "manifest profile and width must match its matrix entry",
+            )
+
+        normalized_manifest = dict(manifest)
+        normalized_manifest.pop("profile")
+        normalized_manifest.pop("width")
+        normalized_config = dict(request_config)
+        for varying_field in ("profile", "prefill_width", "exact_bands", "port"):
+            normalized_config.pop(varying_field)
+        normalized_manifest["request_config"] = normalized_config
+        if canonical_manifest is None:
+            canonical_manifest = normalized_manifest
+        elif normalized_manifest != canonical_manifest:
+            return matrix_failure(
+                f"{profile}.q{width}.matrix_manifest",
+                canonical_manifest,
+                normalized_manifest,
+                "manifest identity or fixed request configuration differs across traces",
+            )
+
     model_configs: list[dict[str, Any]] = []
     for (profile, width), records in sorted(traces.items()):
         configs = [record for record in records if record.get("type") == "model_config"]
@@ -1045,6 +1107,56 @@ def validate_matrix(traces: dict[tuple[str, int], list[dict[str, Any]]]) -> Mism
                 canonical_config,
                 observed,
                 "model boundary configuration differs across traces",
+            )
+
+    canonical_request: dict[str, Any] | None = None
+    request_identity_fields = (
+        "prompt_token_hash",
+        "prompt_token_ids",
+        "prompt_tokens",
+        "n_gen",
+        "temperature",
+        "top_p",
+        "top_k",
+        "seed",
+    )
+    for (profile, width), records in sorted(traces.items()):
+        starts = sorted(
+            (record for record in records if record.get("type") == "request_start"),
+            key=lambda record: record["request"],
+        )
+        if not starts:
+            return matrix_failure(
+                f"{profile}.q{width}.request_start",
+                "at least one request",
+                0,
+                "trace has no request configuration to authenticate",
+            )
+        start = starts[0]
+        request_config = records[0]["request_config"]
+        expected_request = {
+            "width": width,
+            "n_gen": request_config.get("generated_tokens"),
+            "temperature": request_config.get("temperature"),
+            "seed": request_config.get("seed"),
+        }
+        observed_request = {field: start[field] for field in expected_request}
+        if observed_request != expected_request:
+            return matrix_failure(
+                f"{profile}.q{width}.manifest_request",
+                expected_request,
+                observed_request,
+                "observed request does not match its manifest",
+            )
+        normalized_request = {field: start[field] for field in request_identity_fields}
+        if canonical_request is None:
+            canonical_request = normalized_request
+        elif normalized_request != canonical_request:
+            return matrix_failure(
+                f"{profile}.q{width}.matrix_request",
+                canonical_request,
+                normalized_request,
+                "prompt, generation, or sampling request differs across traces",
             )
 
     reset_candidates = [traces[("reset", width)] for width in WIDTHS[1:]]
@@ -1217,6 +1329,16 @@ def stop_process(process: subprocess.Popen[bytes]) -> None:
         process.wait(timeout=5.0)
 
 
+def validate_server_args(server_args: list[str]) -> None:
+    for value in server_args:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("--server-arg cannot be empty")
+        option = stripped.split("=", 1)[0].split(maxsplit=1)[0]
+        if option in RESERVED_SERVER_OPTIONS or option.startswith("--prefill-"):
+            raise ValueError(f"--server-arg cannot override reserved option {option}")
+
+
 def git_revision(binary: Path, explicit: str | None) -> str:
     if explicit:
         return explicit
@@ -1267,6 +1389,33 @@ def write_manifest(
     path.write_text(json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def build_trace_environment(trace_path: Path, width: int, draft: Path | None) -> dict[str, str]:
+    env = os.environ.copy()
+    env.update(
+        {
+            "DFLASH_DS4_EXACT_TRACE_PATH": str(trace_path),
+            "DFLASH_DS4_EXACT_TRACE_Q": str(width),
+            "DFLASH_DS4_EXACT_PREFILL_BANDS": "1" if width > 1 else "0",
+            "DFLASH_DS4_FUSED_VERIFY": "0",
+            "DFLASH_DS4_FUSED_DECODE": "0",
+            "DFLASH_DS4_FUSED_HYBRID_DECODE": "0",
+        }
+    )
+    if draft:
+        env.update(
+            {
+                "DFLASH_DS4_SPEC": "1",
+                "DFLASH_DS4_DRAFT": str(draft),
+                "DFLASH_DS4_SPEC_Q": "4",
+            }
+        )
+    else:
+        env["DFLASH_DS4_SPEC"] = "0"
+        env.pop("DFLASH_DS4_DRAFT", None)
+        env.pop("DFLASH_DS4_SPEC_Q", None)
+    return env
+
+
 def run_one(
     profile: str,
     width: int,
@@ -1281,25 +1430,7 @@ def run_one(
     log_path = profile_dir / f"q{width}.server.log"
     port = args.port_base + (0 if profile == "reset" else 100) + width
     write_manifest(trace_path, profile, width, args, revision, hashes, port)
-    env = os.environ.copy()
-    env.update(
-        {
-            "DFLASH_DS4_EXACT_TRACE_PATH": str(trace_path),
-            "DFLASH_DS4_EXACT_TRACE_Q": str(width),
-            "DFLASH_DS4_EXACT_PREFILL_BANDS": "1" if width > 1 else "0",
-            "DFLASH_DS4_FUSED_VERIFY": "0",
-            "DFLASH_DS4_FUSED_DECODE": "0",
-            "DFLASH_DS4_FUSED_HYBRID_DECODE": "0",
-        }
-    )
-    if args.draft:
-        env.update(
-            {
-                "DFLASH_DS4_SPEC": "1",
-                "DFLASH_DS4_DRAFT": str(args.draft),
-                "DFLASH_DS4_SPEC_Q": "4",
-            }
-        )
+    env = build_trace_environment(trace_path, width, args.draft)
     cache_slots = "0" if profile == "reset" else "2"
     command = [
         str(args.binary),
@@ -1346,6 +1477,7 @@ def run_one(
 
 
 def run_matrix(args: argparse.Namespace) -> int:
+    validate_server_args(args.server_arg)
     for field in ("binary", "target", "prompt"):
         path = getattr(args, field)
         if not path.is_file():
