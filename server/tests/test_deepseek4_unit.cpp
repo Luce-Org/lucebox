@@ -125,6 +125,7 @@ static void test_exact_trace_serializes_interior_prompt_step() {
     setenv("DFLASH_DS4_EXACT_TRACE_Q", "4", 1);
 
     DeepSeek4Weights weights;
+    weights.compress_ratios = {4, 128};
     auto writer = DeepSeek4ExactTraceWriter::create_from_env(weights);
     GenerateRequest request;
     request.prompt.resize(2048, 1);
@@ -132,6 +133,7 @@ static void test_exact_trace_serializes_interior_prompt_step() {
     TEST_ASSERT(writer != nullptr);
     if (writer) {
         TEST_ASSERT(writer->begin_request(request, false, 0));
+        writer->record_step(3, 3, 6, false);
         TEST_ASSERT(writer->wants_step(512, 4));
         writer->record_step(512, 4, 516, false);
         writer.reset();
@@ -139,6 +141,12 @@ static void test_exact_trace_serializes_interior_prompt_step() {
         std::ifstream input(path);
         const std::string trace(
             (std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+        TEST_ASSERT(trace.find(
+            "\"position_begin\":3,\"position_end\":4") != std::string::npos);
+        TEST_ASSERT(trace.find(
+            "\"position_begin\":4,\"position_end\":6") != std::string::npos);
+        TEST_ASSERT(trace.find(
+            "\"position_begin\":3,\"position_end\":6") == std::string::npos);
         TEST_ASSERT(trace.find(
             "\"position_begin\":512,\"position_end\":516") != std::string::npos);
     }

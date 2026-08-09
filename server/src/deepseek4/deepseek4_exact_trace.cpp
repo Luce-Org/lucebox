@@ -292,18 +292,32 @@ void DeepSeek4ExactTraceWriter::record_step(
         int cache_position,
         bool logits_present) {
     if (!wants_step(position_begin, n_tokens)) return;
-    const int position_end = position_begin + n_tokens;
-    output_ << "{\"schema\":\"" << kSchema
-            << "\",\"type\":\"step\",\"request\":" << request_index_
-            << ",\"position_begin\":" << position_begin
-            << ",\"position_end\":" << position_end
-            << ",\"position\":" << position_end
-            << ",\"width\":" << n_tokens
-            << ",\"cache_position\":" << cache_position
-            << ",\"logits_present\":" << (logits_present ? "true" : "false")
-            << ",\"relations\":";
-    write_relations(position_begin, position_end);
-    output_ << "}\n";
+    const int final_position = position_begin + n_tokens;
+    for (int offset = 0; offset < n_tokens;) {
+        const int chunk_begin = position_begin + offset;
+        int chunk = n_tokens - offset;
+        for (int ratio : compressor_boundaries_) {
+            int position_mod = chunk_begin % ratio;
+            if (position_mod < 0) position_mod += ratio;
+            chunk = std::min(chunk, ratio - position_mod);
+        }
+        const int chunk_end = chunk_begin + chunk;
+        const int chunk_cache_position = chunk_end == final_position
+            ? cache_position : chunk_end;
+        output_ << "{\"schema\":\"" << kSchema
+                << "\",\"type\":\"step\",\"request\":" << request_index_
+                << ",\"position_begin\":" << chunk_begin
+                << ",\"position_end\":" << chunk_end
+                << ",\"position\":" << chunk_end
+                << ",\"width\":" << chunk
+                << ",\"cache_position\":" << chunk_cache_position
+                << ",\"logits_present\":"
+                << (logits_present && chunk_end == final_position ? "true" : "false")
+                << ",\"relations\":";
+        write_relations(chunk_begin, chunk_end);
+        output_ << "}\n";
+        offset += chunk;
+    }
 }
 
 void DeepSeek4ExactTraceWriter::record_layer(
