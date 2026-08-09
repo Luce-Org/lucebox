@@ -14,6 +14,7 @@
 #include "common/layer_split_runtime.h"
 #include "common/layer_split_utils.h"
 #include "deepseek4/deepseek4_dspark.h"
+#include "deepseek4/deepseek4_exact_trace.h"
 
 #include <memory>
 #include <random>
@@ -78,6 +79,12 @@ using TestClock = std::chrono::steady_clock;
 
 static double elapsed_ms(TestClock::time_point t0, TestClock::time_point t1) {
     return std::chrono::duration<double, std::milli>(t1 - t0).count();
+}
+
+static void test_exact_trace_hash_is_deterministic() {
+    const char input[] = "abc";
+    TEST_ASSERT(DeepSeek4ExactTraceWriter::hash_bytes(input, 3) ==
+                "e71fa2190541574b");
 }
 
 struct DeepSeek4FixtureOptions {
@@ -3654,6 +3661,7 @@ int main() {
     }
 
     test_compressor_pooling_correctness(backend);
+    test_exact_trace_hash_is_deterministic();
     test_swiglu_ds4_cpu_correctness(backend);
     test_moe_routing_correctness(backend);
     test_rmsnorm_correctness(backend);

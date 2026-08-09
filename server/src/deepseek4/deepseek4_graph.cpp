@@ -9,6 +9,7 @@
 //   6. MoE FFN (hash routing + top-k + shared expert + clamped SwiGLU)
 
 #include "deepseek4_internal.h"
+#include "deepseek4_exact_trace.h"
 #include "deepseek4_hc_cuda.h"
 #include "deepseek4_roctx.h"
 #include "internal.h"
@@ -239,7 +240,9 @@ static ggml_tensor * build_moe_ffn(ggml_context * ctx,
                                     const DeepSeek4Weights & w,
                                     const DeepSeek4Layer & L,
                                     int layer_idx,
-                                    int n_tokens);
+                                    int n_tokens,
+                                    ggml_tensor ** trace_selected = nullptr,
+                                    ggml_tensor ** trace_weights = nullptr);
 
 struct DeepSeek4CachedDecodeFfnGraph {
     const ggml_context * owner_ctx = nullptr;
@@ -248,17 +251,23 @@ struct DeepSeek4CachedDecodeFfnGraph {
     int n_tokens = 0;
     int n_expert_used = 0;
     bool hash_routed = false;
+    bool trace_routing = false;
     StepGraph sg;
     ggml_tensor * hash_ids = nullptr;
+    ggml_tensor * route_ids = nullptr;
+    ggml_tensor * route_weights = nullptr;
 
     bool valid() const {
         return owner_ctx && backend && layer_idx >= 0 && n_tokens > 0 &&
                sg.ctx && sg.gf && sg.alloc && sg.inp_embed && sg.hidden_states &&
-               (!hash_routed || hash_ids);
+               (!hash_routed || hash_ids) &&
+               (!trace_routing || (route_ids && route_weights));
     }
 
     void free() {
         hash_ids = nullptr;
+        route_ids = nullptr;
+        route_weights = nullptr;
         step_graph_destroy(sg);
         owner_ctx = nullptr;
         backend = nullptr;
@@ -266,6 +275,7 @@ struct DeepSeek4CachedDecodeFfnGraph {
         n_tokens = 0;
         n_expert_used = 0;
         hash_routed = false;
+        trace_routing = false;
     }
 };
 
@@ -424,7 +434,8 @@ static bool build_cached_decode_ffn_graph(
         const DeepSeek4Layer & L,
         int layer_idx,
         int n_tokens,
-        bool hash_routed) {
+        bool hash_routed,
+        bool trace_routing) {
     out.free();
 
     const size_t ctx_size = 16 * 1024 * 1024;
@@ -471,6 +482,10 @@ static bool build_cached_decode_ffn_graph(
         if (w.expert_weight_scale != 1.0f) {
             weights = ggml_scale(out.sg.ctx, weights, w.expert_weight_scale);
         }
+        if (trace_routing) {
+            out.route_ids = out.hash_ids;
+            out.route_weights = weights;
+        }
 
         ggml_tensor * weights_3d = ggml_reshape_3d(out.sg.ctx, weights, 1, n_used, n_tokens);
         ggml_tensor * routed_out = ggml_mul(out.sg.ctx, down_e, weights_3d);
@@ -481,7 +496,10 @@ static bool build_cached_decode_ffn_graph(
 
         ffn_out = ggml_add(out.sg.ctx, shared_out, routed_out);
     } else {
-        ffn_out = build_moe_ffn(out.sg.ctx, ffn_normed, w, L, layer_idx, n_tokens);
+        ffn_out = build_moe_ffn(
+            out.sg.ctx, ffn_normed, w, L, layer_idx, n_tokens,
+            trace_routing ? &out.route_ids : nullptr,
+            trace_routing ? &out.route_weights : nullptr);
     }
 
     if (!ffn_out) {
@@ -490,6 +508,12 @@ static bool build_cached_decode_ffn_graph(
     }
 
     out.sg.hidden_states = ffn_out;
+    if (trace_routing) {
+        ggml_set_output(out.route_ids);
+        ggml_set_output(out.route_weights);
+        ggml_build_forward_expand(out.sg.gf, out.route_ids);
+        ggml_build_forward_expand(out.sg.gf, out.route_weights);
+    }
     ggml_set_output(out.sg.hidden_states);
     ggml_build_forward_expand(out.sg.gf, out.sg.hidden_states);
 
@@ -505,6 +529,7 @@ static bool build_cached_decode_ffn_graph(
     out.n_tokens = n_tokens;
     out.n_expert_used = ds4_effective_expert_count(w);
     out.hash_routed = hash_routed;
+    out.trace_routing = trace_routing;
     return true;
 }
 
@@ -3095,7 +3120,9 @@ static ggml_tensor * build_moe_ffn(
         const DeepSeek4Weights & w,
         const DeepSeek4Layer & L,
         int layer_idx,
-        int n_tokens) {
+        int n_tokens,
+        ggml_tensor ** trace_selected,
+        ggml_tensor ** trace_weights) {
 
     const int n_embd = w.n_embd;
     int n_used = w.n_expert_used;
@@ -3107,6 +3134,8 @@ static ggml_tensor * build_moe_ffn(
         routed_out = ggml_scale(ctx, cur, 0.0f);
     } else {
         Ds4MoeRouting routing = build_moe_routing(ctx, cur, w, L, n_tokens);
+        if (trace_selected) *trace_selected = routing.selected;
+        if (trace_weights) *trace_weights = routing.weights;
         n_used = (int) routing.selected->ne[0];
         ggml_tensor * cur_3d = ggml_reshape_3d(ctx, cur, n_embd, 1, n_tokens);
         ggml_tensor * gate_e = ggml_mul_mat_id(ctx, L.ffn_gate_exps, cur_3d, routing.selected);
@@ -5409,6 +5438,9 @@ static bool eval_ds4_layer_range_hybrid_ffn(
         MoeHybridRoutingStats * routing_stats,
         std::vector<float> & out,
         DeepSeek4StepTelemetry * telemetry,
+        std::vector<int32_t> * trace_routing_ids,
+        std::vector<float> * trace_routing_weights,
+        bool * trace_hash_routed,
         const MoeHybridDeviceOutputs * device_outputs = nullptr) {
     const bool trace_prefill = ds4_env_flag("DFLASH_DS4_PREFILL_TRACE");
     if (trace_prefill) {
@@ -5637,6 +5669,9 @@ static bool eval_ds4_layer_range_hybrid_ffn(
         telemetry->route_select_us +=
             ds4_elapsed_us(route_select_t0, Ds4TimingClock::now());
     }
+    if (trace_routing_ids) *trace_routing_ids = selected;
+    if (trace_routing_weights) *trace_routing_weights = weights;
+    if (trace_hash_routed) *trace_hash_routed = hash_routed;
 
     MoeHybridConfig cfg = make_ds4_moe_hybrid_config(w);
     cfg.n_expert_used = route_width;
@@ -6606,6 +6641,10 @@ bool deepseek4_step_layer_range(
         MoeExpertComputeRuntime * expert_runtime,
         MoeHybridRoutingStats * routing_stats) {
     const auto step_t0 = Ds4TimingClock::now();
+    DeepSeek4ExactTraceWriter * exact_trace =
+        verify_hooks ? verify_hooks->exact_trace : nullptr;
+    const bool exact_trace_step =
+        exact_trace && exact_trace->wants_step(kv_start, n_tokens);
 
     if (!deepseek4_cuda_hc_set_device(device)) {
         std::fprintf(stderr,
@@ -6698,6 +6737,8 @@ bool deepseek4_step_layer_range(
                 chunk_hooks.capture_layer_ids = verify_hooks->capture_layer_ids;
                 chunk_hooks.capture_out = verify_hooks->capture_out ? &chunk_capture : nullptr;
                 chunk_hooks.all_logits_out = verify_hooks->all_logits_out ? &chunk_logits : nullptr;
+                chunk_hooks.allow_fused_verify = verify_hooks->allow_fused_verify;
+                chunk_hooks.exact_trace = verify_hooks->exact_trace;
                 chunk_hooks_ptr = &chunk_hooks;
             }
             if (!deepseek4_step_layer_range(
@@ -7045,6 +7086,8 @@ bool deepseek4_step_layer_range(
         const HcLayerWeightsCpu & hc_lw = hc_layer_weights_range[(size_t)il];
         const int ratio = (int)w.compress_ratios[il];
         bool hash_routed = false;
+        std::vector<int32_t> trace_routing_ids;
+        std::vector<float> trace_routing_weights;
         const ggml_tensor * attn_in_backend = nullptr;
         const ggml_tensor * ffn_in_backend = nullptr;
         const ggml_tensor * attn_post_backend = nullptr;
@@ -7562,6 +7605,9 @@ bool deepseek4_step_layer_range(
                         token_ids, hash_routing_tables_range[(size_t)il],
                         *moe_hybrid, expert_runtime, routing_stats,
                         ffn_out_host, telemetry,
+                        exact_trace_step ? &trace_routing_ids : nullptr,
+                        exact_trace_step ? &trace_routing_weights : nullptr,
+                        exact_trace_step ? &hash_routed : nullptr,
                         ffn_device_join ? &owner_outputs : nullptr)) {
                     std::fprintf(stderr,
                                  "[deepseek4-moe-tp] layer-range FFN failed layer %d\n",
@@ -7595,9 +7641,12 @@ bool deepseek4_step_layer_range(
                     cached.layer_idx != il ||
                     cached.n_tokens != n_tokens ||
                     cached.n_expert_used != n_expert_used ||
-                    cached.hash_routed != hash_routed) {
+                    cached.hash_routed != hash_routed ||
+                    cached.trace_routing != (exact_trace != nullptr)) {
                     const auto ffn_build_t0 = Ds4TimingClock::now();
-                    if (!build_cached_decode_ffn_graph(cached, backend, w, L, il, n_tokens, hash_routed)) {
+                    if (!build_cached_decode_ffn_graph(
+                            cached, backend, w, L, il, n_tokens, hash_routed,
+                            exact_trace != nullptr)) {
                         std::fprintf(stderr, "[deepseek4] cached ffn graph alloc failed layer %d\n", il);
                         return false;
                     }
@@ -7629,6 +7678,16 @@ bool deepseek4_step_layer_range(
                                             sizeof(float) * ffn_out_host.size());
                     if (telemetry) telemetry->ffn_read_us +=
                         ds4_elapsed_us(ffn_read_t0, Ds4TimingClock::now());
+                }
+                if (exact_trace_step && cached.route_ids && cached.route_weights) {
+                    trace_routing_ids.resize(ggml_nelements(cached.route_ids));
+                    trace_routing_weights.resize(ggml_nelements(cached.route_weights));
+                    ggml_backend_tensor_get(
+                        cached.route_ids, trace_routing_ids.data(), 0,
+                        sizeof(int32_t) * trace_routing_ids.size());
+                    ggml_backend_tensor_get(
+                        cached.route_weights, trace_routing_weights.data(), 0,
+                        sizeof(float) * trace_routing_weights.size());
                 }
             }
 
@@ -7713,11 +7772,16 @@ bool deepseek4_step_layer_range(
             }
             if ((use_backend_prefill_hc || use_backend_decode_hc_graph ||
                  use_backend_decode_hc_direct) &&
-                hc_state_backend && capture_requested(il)) {
+                hc_state_backend && (capture_requested(il) || exact_trace_step)) {
                 ggml_backend_tensor_get(
                     hc_state_backend, hc_state.data(), 0,
                     sizeof(float) * hc_state.size());
                 capture_hc_layer(il, hc_state.data());
+            }
+            if (exact_trace_step) {
+                exact_trace->record_layer(
+                    backend, cache, hc_state, il, kv_start, n_tokens,
+                    hash_routed, trace_routing_ids, trace_routing_weights);
             }
         }
     }

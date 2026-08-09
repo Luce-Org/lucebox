@@ -91,6 +91,7 @@ private:
     // Absolute cache position represented by last_logits_. A snapshot is
     // safe only when this matches cache_.cur_pos.
     int                    last_logits_pos_ = -1;
+    std::unique_ptr<DeepSeek4ExactTraceWriter> exact_trace_;
 
     // DSpark speculative decode (opt-in: DFLASH_DS4_SPEC=1 + DFLASH_DS4_DRAFT=<gguf>).
     bool                           spec_enabled_ = false;

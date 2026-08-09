@@ -1,5 +1,6 @@
 // DeepSeek4Backend implementation — AR-only decode, chunked prefill.
 #include "deepseek4_roctx.h"
+#include "deepseek4_exact_trace.h"
 
 #include "deepseek4_backend.h"
 #include "deepseek4_internal.h"
@@ -910,6 +911,11 @@ bool DeepSeek4Backend::init() {
             std::fprintf(stderr, "[deepseek4] DFLASH_DS4_SPEC set but DFLASH_DS4_DRAFT gguf missing\n");
         }
     }
+    if (const char * trace_path = std::getenv("DFLASH_DS4_EXACT_TRACE_PATH");
+        trace_path && *trace_path) {
+        exact_trace_ = DeepSeek4ExactTraceWriter::create_from_env(w_);
+        if (!exact_trace_) return false;
+    }
     return true;
 }
 
@@ -1353,6 +1359,7 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
     // request on can drift by a token or two.
     if (kv_offset == 0) {
         reset_deepseek4_cache(cache_);
+        if (exact_trace_) exact_trace_->record_reset(cache_.cur_pos);
     }
     last_logits_.clear();
     last_logits_pos_ = -1;
@@ -1433,6 +1440,7 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         std::vector<float> hc_state;
         Ds4VerifyHooks spec_hooks;
         std::vector<float> spec_cap;
+        int capture_begin = 0;
         Ds4VerifyHooks * hp = nullptr;
         const bool capture_final = i + n_tok > spec_final_from;
         const bool capture_snapshot =
@@ -1442,7 +1450,7 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
             (capture_final || capture_snapshot)) {
             spec_hooks.capture_layer_ids = &spec_drafter_->capture_layer_ids;
             spec_hooks.capture_out = &spec_cap;
-            int capture_begin = n_tok;
+            capture_begin = n_tok;
             int capture_end = 0;
             if (capture_final) {
                 capture_begin = std::min(
@@ -1457,6 +1465,11 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
             }
             spec_hooks.capture_token_begin = capture_begin;
             spec_hooks.capture_token_end = capture_end;
+            hp = &spec_hooks;
+        }
+        if (exact_trace_) {
+            spec_hooks.exact_trace = exact_trace_.get();
+            spec_hooks.allow_fused_verify = false;
             hp = &spec_hooks;
         }
         if (moe_hybrid_ && (expert_runtime_.compute || expert_backend_)) {
@@ -1499,6 +1512,11 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                     spec_cap.begin() + (size_t) t * feat_row,
                     spec_cap.begin() + (size_t) (t + 1) * feat_row);
             }
+            if (exact_trace_ && spec_drafter_) {
+                exact_trace_->record_capture(
+                    pos, n_tok, capture_begin,
+                    spec_drafter_->capture_layer_ids, spec_cap);
+            }
         }
         if (!ok) {
             std::fprintf(stderr, "[deepseek4] prefill step failed at pos=%d\n", pos);
@@ -1508,8 +1526,16 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
             add_step_tel(tel_acc, step_tel);
             steps++;
         }
-        last_logits_ = std::move(logits);
         pos += n_tok;
+        if (exact_trace_) {
+            exact_trace_->record_step(
+                pos - n_tok, n_tok, cache_.cur_pos, true);
+            if (i + n_tok == n_total ||
+                (save_snapshot && !snapshot_saved && pos == snap_pos)) {
+                exact_trace_->record_logits(cache_.cur_pos, logits);
+            }
+        }
+        last_logits_ = std::move(logits);
         last_logits_pos_ = cache_.cur_pos;
         i += n_tok;
         if (save_snapshot && !snapshot_saved && pos == snap_pos) {
@@ -1673,7 +1699,12 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
 
 GenerateResult DeepSeek4Backend::generate_impl(const GenerateRequest & req,
                                                 const DaemonIO & io) {
-    return generate_from_state(req, io, 0);
+    if (exact_trace_) exact_trace_->begin_request(req, false, 0);
+    GenerateResult result = generate_from_state(req, io, 0);
+    if (exact_trace_) {
+        exact_trace_->end_request(result.ok(), cache_.cur_pos, result.tokens);
+    }
+    return result;
 }
 
 GenerateResult DeepSeek4Backend::generate_from_state(
@@ -1837,6 +1868,9 @@ bool DeepSeek4Backend::snapshot_save(int slot) {
                  "[deepseek4] snapshot saved slot=%d pos=%d size=%.1f MiB\n",
                  slot, snapshots_[slot].cur_pos,
                  (double) (core_bytes + aux_bytes) / (1024.0 * 1024.0));
+    if (exact_trace_) {
+        exact_trace_->record_snapshot("snapshot_save", slot, cache_);
+    }
     return true;
 }
 
@@ -1878,6 +1912,9 @@ bool DeepSeek4Backend::snapshot_restore(int slot) {
     last_logits_ = std::move(restored_logits);
     spec_feat_window_ = std::move(restored_features);
     last_logits_pos_ = cache_.cur_pos;
+    if (exact_trace_) {
+        exact_trace_->record_snapshot("snapshot_restore", slot, cache_);
+    }
     return true;
 }
 
@@ -1897,11 +1934,19 @@ GenerateResult DeepSeek4Backend::restore_and_generate_impl(
                      snap_pos, req.prompt.size());
         return generate_impl(req, io);
     }
+    if (exact_trace_) exact_trace_->begin_request(req, true, snap_pos);
     if (!snapshot_restore(slot)) {
         result.fail(GenerateErrorCode::BackendSpecific, "snapshot restore");
+        if (exact_trace_) {
+            exact_trace_->end_request(false, cache_.cur_pos, result.tokens);
+        }
         return result;
     }
-    return generate_from_state(req, io, snap_pos);
+    result = generate_from_state(req, io, snap_pos);
+    if (exact_trace_) {
+        exact_trace_->end_request(result.ok(), cache_.cur_pos, result.tokens);
+    }
+    return result;
 }
 
 bool DeepSeek4Backend::handle_compress(const std::string & line,
@@ -1928,6 +1973,7 @@ void DeepSeek4Backend::maybe_save_routing_stats() {
 
 void DeepSeek4Backend::shutdown() {
     maybe_save_routing_stats();
+    exact_trace_.reset();
     free_drafter();
     for (int i = 0; i < PREFIX_SLOTS; i++) {
         snapshot_free(i);
