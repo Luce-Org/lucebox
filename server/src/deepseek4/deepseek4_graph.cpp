@@ -6621,6 +6621,20 @@ static bool initialize_layer_range_cache(
     runtime.owns_output = owns_output;
     return true;
 }
+bool deepseek4_should_attempt_fused_verify(
+        int n_tokens,
+        const Ds4VerifyHooks * verify_hooks,
+        bool owner_topology_supported,
+        bool full_layer_range,
+        bool has_logits_output,
+        bool gpu_backend,
+        bool fused_verify_enabled) {
+    return owner_topology_supported && n_tokens >= 2 && n_tokens <= 4 &&
+           verify_hooks && verify_hooks->allow_fused_verify &&
+           full_layer_range && has_logits_output && gpu_backend &&
+           fused_verify_enabled;
+}
+
 bool deepseek4_step_layer_range(
         ggml_backend_t backend,
         int device,
@@ -6663,11 +6677,10 @@ bool deepseek4_step_layer_range(
         moe_hybrid->materialized_cold_experts &&
         moe_hybrid->cold_backend_kind == MoeHybridColdBackend::Gpu &&
         moe_hybrid->cold_backend && moe_hybrid->cold_backend != backend;
-    const bool fused_verify_candidate =
-        (!moe_hybrid || fused_hybrid_ready) &&
-        n_tokens >= 2 && n_tokens <= 4 && verify_hooks &&
-        layer_begin == 0 && is_last_shard && out_logits &&
-        ds4_backend_is_gpu(backend) && ds4_fused_verify_enabled();
+    const bool fused_verify_candidate = deepseek4_should_attempt_fused_verify(
+        n_tokens, verify_hooks, !moe_hybrid || fused_hybrid_ready,
+        layer_begin == 0 && is_last_shard, out_logits != nullptr,
+        ds4_backend_is_gpu(backend), ds4_fused_verify_enabled());
     const bool heterogeneous_sparse_prefill =
         moe_hybrid && cache.prefill_mode == PrefillAttentionMode::Sparse &&
         n_tokens > 4 && n_tokens <= DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS &&

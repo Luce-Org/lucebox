@@ -136,6 +136,11 @@ static void test_exact_trace_serializes_interior_prompt_step() {
         writer->record_step(3, 3, 6, false);
         TEST_ASSERT(writer->wants_step(512, 4));
         writer->record_step(512, 4, 516, false);
+        DeepSeek4Cache cache;
+        cache.cur_pos = 6;
+        writer->record_snapshot(
+            "snapshot_save", 0, cache, {1.0f, 2.0f}, 6,
+            {3.0f, 4.0f, 5.0f});
         writer.reset();
 
         std::ifstream input(path);
@@ -149,6 +154,9 @@ static void test_exact_trace_serializes_interior_prompt_step() {
             "\"position_begin\":3,\"position_end\":6") == std::string::npos);
         TEST_ASSERT(trace.find(
             "\"position_begin\":512,\"position_end\":516") != std::string::npos);
+        TEST_ASSERT(trace.find("\"last_logits_count\":2") != std::string::npos);
+        TEST_ASSERT(trace.find("\"last_logits_position\":6") != std::string::npos);
+        TEST_ASSERT(trace.find("\"spec_feature_count\":3") != std::string::npos);
     }
 
     if (had_path) setenv("DFLASH_DS4_EXACT_TRACE_PATH", old_path_value.c_str(), 1);
@@ -156,6 +164,15 @@ static void test_exact_trace_serializes_interior_prompt_step() {
     if (had_width) setenv("DFLASH_DS4_EXACT_TRACE_Q", old_width_value.c_str(), 1);
     else unsetenv("DFLASH_DS4_EXACT_TRACE_Q");
     unlink(path);
+}
+
+static void test_exact_trace_disables_fused_verify() {
+    Ds4VerifyHooks hooks;
+    TEST_ASSERT(deepseek4_should_attempt_fused_verify(
+        4, &hooks, true, true, true, true, true));
+    hooks.allow_fused_verify = false;
+    TEST_ASSERT(!deepseek4_should_attempt_fused_verify(
+        4, &hooks, true, true, true, true, true));
 }
 
 static std::string write_deepseek4_loader_fixture(const DeepSeek4FixtureOptions & opts) {
@@ -3715,6 +3732,7 @@ int main() {
     test_compressor_pooling_correctness(backend);
     test_exact_trace_hash_is_deterministic();
     test_exact_trace_serializes_interior_prompt_step();
+    test_exact_trace_disables_fused_verify();
     test_swiglu_ds4_cpu_correctness(backend);
     test_moe_routing_correctness(backend);
     test_rmsnorm_correctness(backend);

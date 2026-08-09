@@ -1529,7 +1529,7 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         pos += n_tok;
         if (exact_trace_) {
             exact_trace_->record_step(
-                pos - n_tok, n_tok, cache_.cur_pos, true);
+                pos - n_tok, n_tok, cache_.cur_pos, !logits.empty());
             if (i + n_tok == n_total ||
                 (save_snapshot && !snapshot_saved && pos == snap_pos)) {
                 exact_trace_->record_logits(cache_.cur_pos, logits);
@@ -1869,7 +1869,10 @@ bool DeepSeek4Backend::snapshot_save(int slot) {
                  slot, snapshots_[slot].cur_pos,
                  (double) (core_bytes + aux_bytes) / (1024.0 * 1024.0));
     if (exact_trace_) {
-        exact_trace_->record_snapshot("snapshot_save", slot, cache_);
+        exact_trace_->record_snapshot(
+            "snapshot_save", slot, cache_,
+            snapshot_aux_[slot].last_logits, snapshots_[slot].cur_pos,
+            snapshot_aux_[slot].spec_feat_window);
     }
     return true;
 }
@@ -1913,7 +1916,9 @@ bool DeepSeek4Backend::snapshot_restore(int slot) {
     spec_feat_window_ = std::move(restored_features);
     last_logits_pos_ = cache_.cur_pos;
     if (exact_trace_) {
-        exact_trace_->record_snapshot("snapshot_restore", slot, cache_);
+        exact_trace_->record_snapshot(
+            "snapshot_restore", slot, cache_, last_logits_, last_logits_pos_,
+            spec_feat_window_);
     }
     return true;
 }

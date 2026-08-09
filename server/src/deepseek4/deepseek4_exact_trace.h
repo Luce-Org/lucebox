@@ -45,7 +45,13 @@ public:
         const std::vector<int> & layer_ids,
         const std::vector<float> & rows);
     void record_logits(int position, const std::vector<float> & logits);
-    void record_snapshot(const char * kind, int slot, const DeepSeek4Cache & cache);
+    void record_snapshot(
+        const char * kind,
+        int slot,
+        const DeepSeek4Cache & cache,
+        const std::vector<float> & last_logits,
+        int last_logits_position,
+        const std::vector<float> & spec_features);
 
     static std::string hash_bytes(const void * data, size_t bytes);
     static std::string hash_token_ids(const std::vector<int32_t> & tokens);

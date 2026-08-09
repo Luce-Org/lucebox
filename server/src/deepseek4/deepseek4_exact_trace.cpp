@@ -518,12 +518,30 @@ std::string DeepSeek4ExactTraceWriter::cache_state_hash(
 void DeepSeek4ExactTraceWriter::record_snapshot(
         const char * kind,
         int slot,
-        const DeepSeek4Cache & cache) {
+        const DeepSeek4Cache & cache,
+        const std::vector<float> & last_logits,
+        int last_logits_position,
+        const std::vector<float> & spec_features) {
+    bool non_finite = false;
+    for (float value : last_logits) {
+        non_finite = non_finite || !std::isfinite(value);
+    }
+    for (float value : spec_features) {
+        non_finite = non_finite || !std::isfinite(value);
+    }
     output_ << "{\"schema\":\"" << kSchema
             << "\",\"type\":\"" << kind << "\",\"request\":" << request_index_
             << ",\"slot\":" << slot
             << ",\"cache_position\":" << cache.cur_pos
-            << ",\"state_hash\":\"" << cache_state_hash(cache) << "\"}\n";
+            << ",\"state_hash\":\"" << cache_state_hash(cache) << "\""
+            << ",\"last_logits_hash\":\""
+            << hash_bytes(last_logits.data(), last_logits.size() * sizeof(float)) << "\""
+            << ",\"last_logits_count\":" << last_logits.size()
+            << ",\"last_logits_position\":" << last_logits_position
+            << ",\"spec_feature_hash\":\""
+            << hash_bytes(spec_features.data(), spec_features.size() * sizeof(float)) << "\""
+            << ",\"spec_feature_count\":" << spec_features.size()
+            << ",\"non_finite\":" << (non_finite ? "true" : "false") << "}\n";
 }
 
 std::string DeepSeek4ExactTraceWriter::hash_bytes(const void * data, size_t bytes) {

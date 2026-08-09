@@ -13,7 +13,7 @@ prompt-byte SHA-256, fixed request configuration, exact width, and tolerances.
 The production backend appends request, layer, cache, capture, logits, snapshot,
 reset, continuation-token, and completion records. Each `request_start` carries
 the bounded production prompt token-ID vector as well as its little-endian
-signed-int32 hash, so the packaged token pinner consumes the real producer
+signed-int32 hash, so trace consumers can authenticate the real producer
 schema rather than reconstructing tokenization.
 The backend also appends one `model_config` record containing the exact SWA
 window and every distinct compressor boundary. Boundary relations include the
@@ -32,7 +32,8 @@ cache positions, counts, and state hashes are exact. Floating values use:
 | final logits | `1e-4` | `1e-4` |
 
 The inclusive rule is `abs(a-b) <= atol + rtol * max(abs(a), abs(b))`. Any NaN
-or infinity is a hard failure, including two matching infinities. HC, raw KV,
+or infinity is a hard failure, including two matching infinities. Manifests
+must use these exact built-in tolerances; trace inputs cannot weaken them. HC, raw KV,
 compressed KV, attention-compressor state, indexer-compressor state, and
 indexer KV use exact deterministic byte hashes. Their trace records also carry
 byte counts. DSpark capture records contain every value in every captured row;
@@ -48,6 +49,10 @@ q=1, q=2, q=3, and q=4 use the same prompt bytes and request configuration.
 To cover all three tail widths with one pinned prompt, its production token count
 must satisfy `N % 12 == 11`; q=2, q=3, and q=4 then end with widths 1, 2, and 3.
 The comparator rejects a trace set that does not actually contain those rows.
+Every request must end successfully and emit exactly one completion and token
+record. A full-prompt restored request performs no prefill, so its DSpark state
+is authenticated through the snapshot's cache, logits, and feature hashes
+rather than through impossible duplicate capture rows.
 
 The production position filter records:
 
@@ -65,7 +70,7 @@ The production position filter records:
 The comparator fails if a required matrix relation has no trace evidence. At
 every selected step it also requires the complete oracle layer-key set, checks
 the committed cache position and exact-band readout policy, and requires both
-ends of each request's four-token DSpark final-capture window.
+ends of each non-restored request's four-token DSpark final-capture window.
 
 ## Commands
 

@@ -118,6 +118,31 @@ def request_end(cache_position: int = 4) -> dict[str, object]:
     }
 
 
+def tokens(request: int = 0) -> dict[str, object]:
+    return {
+        "schema": MODULE.SCHEMA,
+        "type": "tokens",
+        "request": request,
+        "token_ids": [7, 8],
+    }
+
+
+def snapshot(kind: str, request: int, *, spec_feature_count: int = 4) -> dict[str, object]:
+    return {
+        "schema": MODULE.SCHEMA,
+        "type": kind,
+        "request": request,
+        "slot": 0,
+        "cache_position": 4,
+        "state_hash": "1" * 16,
+        "last_logits_hash": "2" * 16,
+        "last_logits_count": 8,
+        "last_logits_position": 4,
+        "spec_feature_hash": "3" * 16,
+        "spec_feature_count": spec_feature_count,
+    }
+
+
 def complete_trace(
     width: int = 1,
     *,
@@ -159,7 +184,7 @@ def complete_trace(
                 layer(step_width, position),
             ]
         )
-    records.append(request_end(prompt_tokens))
+    records.extend([tokens(), request_end(prompt_tokens)])
     return records
 
 
@@ -297,6 +322,31 @@ def test_tolerance_boundary_is_inclusive() -> None:
     assert not MODULE.close_enough(1.0, 1.1250001, tolerance)
 
 
+def test_manifest_tolerances_cannot_weaken_contract(tmp_path: Path) -> None:
+    weakened = manifest()
+    weakened["tolerances"] = {name: {"atol": 1e9, "rtol": 1e9} for name in MODULE.TOLERANCES}
+    path = tmp_path / "weakened-tolerances.jsonl"
+    write_trace(path, [weakened, request_start(), step(), layer(), request_end()])
+    with pytest.raises(MODULE.TraceError, match="built-in contract"):
+        MODULE.load_jsonl(path)
+
+
+def test_failed_request_cannot_certify(tmp_path: Path) -> None:
+    failed = request_end()
+    failed["ok"] = False
+    path = tmp_path / "failed-request.jsonl"
+    write_trace(path, [manifest(), request_start(), step(), layer(), failed])
+    with pytest.raises(MODULE.TraceError, match="did not complete successfully"):
+        MODULE.load_jsonl(path)
+
+
+def test_missing_request_completion_cannot_certify(tmp_path: Path) -> None:
+    path = tmp_path / "missing-request-end.jsonl"
+    write_trace(path, [manifest(), request_start(), step(), layer()])
+    with pytest.raises(MODULE.TraceError, match="request_end coverage"):
+        MODULE.load_jsonl(path)
+
+
 def test_first_mismatch_reports_layer_token_and_field(tmp_path: Path) -> None:
     oracle = complete_trace()
     candidate = complete_trace(2)
@@ -408,6 +458,33 @@ def test_restored_request_final_position_uses_full_prompt_length(tmp_path: Path)
         )
         is None
     )
+
+
+def test_snapshot_restore_requires_identical_auxiliary_state() -> None:
+    fresh = request_start()
+    restored = request_start()
+    restored["request"] = 1
+    restored["restored"] = True
+    records = [
+        manifest(),
+        snapshot("snapshot_save", 0),
+        snapshot("snapshot_restore", 1),
+    ]
+    assert MODULE.validate_snapshot_lifecycle("snapshot", 1, records, [fresh, restored]) is None
+    records[-1]["spec_feature_hash"] = "4" * 16
+    mismatch = MODULE.validate_snapshot_lifecycle("snapshot", 1, records, [fresh, restored])
+    assert mismatch is not None
+    assert mismatch.field == "snapshot.q1.snapshot.spec_feature_hash"
+
+
+def test_restored_request_uses_snapshot_features_instead_of_prefill_capture() -> None:
+    fresh = request_start()
+    restored = request_start()
+    restored["request"] = 1
+    restored["restored"] = True
+    restored["cache_position"] = restored["prompt_tokens"]
+    records = [manifest(), fresh, restored, capture(1), capture(4)]
+    assert MODULE.validate_capture_coverage("snapshot", 1, records, [fresh, restored]) is None
 
 
 def test_capture_middle_value_mismatch_fails(tmp_path: Path) -> None:

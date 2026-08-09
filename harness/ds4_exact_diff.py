@@ -163,6 +163,8 @@ def validate_records(path: Path, records: list[dict[str, Any]]) -> None:
                 raise TraceError(
                     f"{path}:manifest:tolerances.{name}.{field} must be finite and non-negative"
                 )
+    if tolerances != TOLERANCES:
+        raise TraceError(f"{path}:manifest:tolerances must equal the built-in contract")
     last_position: dict[int, int] = {}
     for index, record in enumerate(records, 1):
         record_type = record.get("type")
@@ -247,11 +249,33 @@ def validate_records(path: Path, records: list[dict[str, Any]]) -> None:
             )
             validate_float_list(record["rows"], f"{context}:rows")
         elif record_type in {"snapshot_save", "snapshot_restore"}:
-            require(record, ("request", "slot", "cache_position", "state_hash"), context)
+            require(
+                record,
+                (
+                    "request",
+                    "slot",
+                    "cache_position",
+                    "state_hash",
+                    "last_logits_hash",
+                    "last_logits_count",
+                    "last_logits_position",
+                    "spec_feature_hash",
+                    "spec_feature_count",
+                ),
+                context,
+            )
+            if record["last_logits_count"] <= 0:
+                raise TraceError(f"{context}: snapshot logits are missing")
+            if record["last_logits_position"] != record["cache_position"]:
+                raise TraceError(f"{context}: snapshot logits position is stale")
+            if record["spec_feature_count"] < 0:
+                raise TraceError(f"{context}: snapshot feature count is negative")
         elif record_type == "tokens":
             require(record, ("request", "token_ids"), context)
         elif record_type == "request_end":
             require(record, ("request", "ok", "cache_position"), context)
+            if record["ok"] is not True:
+                raise TraceError(f"{context}: request did not complete successfully")
         elif record_type == "reset":
             require(record, ("request", "cache_position"), context)
         elif record_type == "step":
@@ -271,6 +295,15 @@ def validate_records(path: Path, records: list[dict[str, Any]]) -> None:
             )
         elif record_type != "manifest":
             raise TraceError(f"{context}: unknown record type")
+
+    request_starts = [
+        record["request"] for record in records if record.get("type") == "request_start"
+    ]
+    request_ends = [record["request"] for record in records if record.get("type") == "request_end"]
+    token_records = [record["request"] for record in records if record.get("type") == "tokens"]
+    for label, observed in (("request_end", request_ends), ("tokens", token_records)):
+        if sorted(observed) != sorted(request_starts):
+            raise TraceError(f"{path}:{label} coverage does not match request_start coverage")
 
 
 def close_enough(a: float, b: float, tolerance: dict[str, float]) -> bool:
@@ -705,8 +738,32 @@ def compare_profile(
     for event_type, fields in (
         ("tokens", ("token_ids",)),
         ("request_end", ("ok", "cache_position")),
-        ("snapshot_save", ("slot", "cache_position", "state_hash")),
-        ("snapshot_restore", ("slot", "cache_position", "state_hash")),
+        (
+            "snapshot_save",
+            (
+                "slot",
+                "cache_position",
+                "state_hash",
+                "last_logits_hash",
+                "last_logits_count",
+                "last_logits_position",
+                "spec_feature_hash",
+                "spec_feature_count",
+            ),
+        ),
+        (
+            "snapshot_restore",
+            (
+                "slot",
+                "cache_position",
+                "state_hash",
+                "last_logits_hash",
+                "last_logits_count",
+                "last_logits_position",
+                "spec_feature_hash",
+                "spec_feature_count",
+            ),
+        ),
     ):
         refs = event_index(oracle, event_type)
         cands = event_index(candidate, event_type)
@@ -753,6 +810,100 @@ def compare_profile(
 
 def matrix_failure(field: str, expected: Any, observed: Any, detail: str) -> Mismatch:
     return Mismatch("matrix", 0, None, None, None, field, expected, observed, detail)
+
+
+SNAPSHOT_STATE_FIELDS = (
+    "slot",
+    "cache_position",
+    "state_hash",
+    "last_logits_hash",
+    "last_logits_count",
+    "last_logits_position",
+    "spec_feature_hash",
+    "spec_feature_count",
+)
+
+
+def validate_snapshot_lifecycle(
+    profile: str,
+    width: int,
+    records: list[dict[str, Any]],
+    starts: list[dict[str, Any]],
+) -> Mismatch | None:
+    saves = [record for record in records if record.get("type") == "snapshot_save"]
+    restores = [record for record in records if record.get("type") == "snapshot_restore"]
+    if len(saves) != 1 or len(restores) != 1:
+        return matrix_failure(
+            f"{profile}.q{width}.snapshot_count",
+            {"save": 1, "restore": 1},
+            {"save": len(saves), "restore": len(restores)},
+            "snapshot profile requires exactly one save and one restore",
+        )
+    saved = saves[0]
+    restored = restores[0]
+    starts_by_request = {start["request"]: start for start in starts}
+    saved_start = starts_by_request.get(saved["request"])
+    restored_start = starts_by_request.get(restored["request"])
+    if saved_start is None or saved_start["restored"]:
+        return matrix_failure(
+            f"{profile}.q{width}.snapshot_save_request",
+            "fresh request",
+            saved["request"],
+            "snapshot save must belong to the fresh request",
+        )
+    if restored_start is None or not restored_start["restored"]:
+        return matrix_failure(
+            f"{profile}.q{width}.snapshot_restore_request",
+            "restored request",
+            restored["request"],
+            "snapshot restore must belong to the restored request",
+        )
+    for field in SNAPSHOT_STATE_FIELDS:
+        if saved[field] != restored[field]:
+            return matrix_failure(
+                f"{profile}.q{width}.snapshot.{field}",
+                saved[field],
+                restored[field],
+                "restored snapshot state differs from saved state",
+            )
+    drafter = records[0]["drafter_sha256"]
+    if drafter != "none" and saved["spec_feature_count"] <= 0:
+        return matrix_failure(
+            f"{profile}.q{width}.snapshot.spec_feature_count",
+            "positive",
+            saved["spec_feature_count"],
+            "DSpark snapshot features are missing",
+        )
+    return None
+
+
+def validate_capture_coverage(
+    profile: str,
+    width: int,
+    records: list[dict[str, Any]],
+    starts: list[dict[str, Any]],
+) -> Mismatch | None:
+    if records[0]["drafter_sha256"] == "none":
+        return None
+    captures_by_request: dict[int, set[int]] = {}
+    for record in records:
+        if record.get("type") == "capture":
+            captures_by_request.setdefault(record["request"], set()).add(record["position_end"])
+    for start in starts:
+        if start["restored"]:
+            continue
+        request = start["request"]
+        final_position = start["prompt_tokens"]
+        expected_ends = {final_position - 3, final_position}
+        observed = captures_by_request.get(request, set())
+        if not expected_ends.issubset(observed):
+            return matrix_failure(
+                f"{profile}.q{width}.capture.{request}",
+                sorted(expected_ends),
+                sorted(observed),
+                "both ends of the four-token DSpark capture window are required",
+            )
+    return None
 
 
 def validate_matrix(traces: dict[tuple[str, int], list[dict[str, Any]]]) -> Mismatch | None:
@@ -849,12 +1000,22 @@ def validate_matrix(traces: dict[tuple[str, int], list[dict[str, Any]]]) -> Mism
 
     for (profile, width), records in sorted(traces.items()):
         starts = [record for record in records if record.get("type") == "request_start"]
-        if len(starts) < 2:
+        if len(starts) != 2:
             return matrix_failure(
                 f"{profile}.q{width}.repeated_requests",
                 2,
                 len(starts),
-                "same request was not observed twice",
+                "same request must be observed exactly twice",
+            )
+        ordered_starts = sorted(starts, key=lambda record: record["request"])
+        expected_restored = [False, profile == "snapshot"]
+        observed_restored = [start["restored"] for start in ordered_starts]
+        if observed_restored != expected_restored:
+            return matrix_failure(
+                f"{profile}.q{width}.restored_requests",
+                expected_restored,
+                observed_restored,
+                "request restore lifecycle differs from the profile contract",
             )
         tokens = [record for record in records if record.get("type") == "tokens"]
         if len(tokens) < 2 or any(len(record["token_ids"]) < 2 for record in tokens):
@@ -874,32 +1035,12 @@ def validate_matrix(traces: dict[tuple[str, int], list[dict[str, Any]]]) -> Mism
         ):
             return matrix_failure(f"{profile}.q{width}.reset", 2, 0, "reset events are missing")
         if profile == "snapshot":
-            kinds = {record.get("type") for record in records}
-            for kind in ("snapshot_save", "snapshot_restore"):
-                if kind not in kinds:
-                    return matrix_failure(
-                        f"{profile}.q{width}.{kind}", True, False, f"{kind} event is missing"
-                    )
-        drafter = records[0]["drafter_sha256"]
-        if drafter != "none":
-            captures_by_request: dict[int, set[int]] = {}
-            for record in records:
-                if record.get("type") == "capture":
-                    captures_by_request.setdefault(record["request"], set()).add(
-                        record["position_end"]
-                    )
-            for start in starts:
-                request = start["request"]
-                final_position = start["prompt_tokens"]
-                expected_ends = {final_position - 3, final_position}
-                observed = captures_by_request.get(request, set())
-                if not expected_ends.issubset(observed):
-                    return matrix_failure(
-                        f"{profile}.q{width}.capture.{request}",
-                        sorted(expected_ends),
-                        sorted(observed),
-                        "both ends of the four-token DSpark capture window are required",
-                    )
+            snapshot_mismatch = validate_snapshot_lifecycle(profile, width, records, starts)
+            if snapshot_mismatch:
+                return snapshot_mismatch
+        capture_mismatch = validate_capture_coverage(profile, width, records, starts)
+        if capture_mismatch:
+            return capture_mismatch
     return None
 
 

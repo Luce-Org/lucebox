@@ -398,6 +398,15 @@ struct Ds4VerifyHooks {
     DeepSeek4ExactTraceWriter * exact_trace = nullptr;
 };
 
+bool deepseek4_should_attempt_fused_verify(
+    int n_tokens,
+    const Ds4VerifyHooks * verify_hooks,
+    bool owner_topology_supported,
+    bool full_layer_range,
+    bool has_logits_output,
+    bool gpu_backend,
+    bool fused_verify_enabled);
+
 bool deepseek4_step_layer_range(
     ggml_backend_t              backend,
     int                         device,
