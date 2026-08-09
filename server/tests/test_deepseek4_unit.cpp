@@ -29,6 +29,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <iterator>
 #include <numeric>
 #include <sys/stat.h>
 #include <thread>
@@ -104,6 +105,49 @@ static std::string make_temp_gguf_path(const char * prefix) {
         unlink(path);
     }
     return std::string(path) + "-" + prefix + ".gguf";
+}
+
+static void test_exact_trace_serializes_interior_prompt_step() {
+    char path[] = "/tmp/deepseek4-exact-trace-XXXXXX";
+    const int fd = mkstemp(path);
+    TEST_ASSERT(fd >= 0);
+    if (fd < 0) return;
+    close(fd);
+    unlink(path);
+
+    const char * old_path = std::getenv("DFLASH_DS4_EXACT_TRACE_PATH");
+    const char * old_width = std::getenv("DFLASH_DS4_EXACT_TRACE_Q");
+    const bool had_path = old_path != nullptr;
+    const bool had_width = old_width != nullptr;
+    const std::string old_path_value = old_path ? old_path : "";
+    const std::string old_width_value = old_width ? old_width : "";
+    setenv("DFLASH_DS4_EXACT_TRACE_PATH", path, 1);
+    setenv("DFLASH_DS4_EXACT_TRACE_Q", "4", 1);
+
+    DeepSeek4Weights weights;
+    auto writer = DeepSeek4ExactTraceWriter::create_from_env(weights);
+    GenerateRequest request;
+    request.prompt.resize(2048, 1);
+    request.n_gen = 16;
+    TEST_ASSERT(writer != nullptr);
+    if (writer) {
+        TEST_ASSERT(writer->begin_request(request, false, 0));
+        TEST_ASSERT(writer->wants_step(512, 4));
+        writer->record_step(512, 4, 516, false);
+        writer.reset();
+
+        std::ifstream input(path);
+        const std::string trace(
+            (std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+        TEST_ASSERT(trace.find(
+            "\"position_begin\":512,\"position_end\":516") != std::string::npos);
+    }
+
+    if (had_path) setenv("DFLASH_DS4_EXACT_TRACE_PATH", old_path_value.c_str(), 1);
+    else unsetenv("DFLASH_DS4_EXACT_TRACE_PATH");
+    if (had_width) setenv("DFLASH_DS4_EXACT_TRACE_Q", old_width_value.c_str(), 1);
+    else unsetenv("DFLASH_DS4_EXACT_TRACE_Q");
+    unlink(path);
 }
 
 static std::string write_deepseek4_loader_fixture(const DeepSeek4FixtureOptions & opts) {
@@ -3662,6 +3706,7 @@ int main() {
 
     test_compressor_pooling_correctness(backend);
     test_exact_trace_hash_is_deterministic();
+    test_exact_trace_serializes_interior_prompt_step();
     test_swiglu_ds4_cpu_correctness(backend);
     test_moe_routing_correctness(backend);
     test_rmsnorm_correctness(backend);

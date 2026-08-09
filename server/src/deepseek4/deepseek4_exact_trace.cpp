@@ -219,26 +219,8 @@ void DeepSeek4ExactTraceWriter::end_request(
 }
 
 bool DeepSeek4ExactTraceWriter::wants_step(int position_begin, int n_tokens) const {
-    if (request_index_ < 0 || n_tokens <= 0) return false;
-    const int position_end = position_begin + n_tokens;
-    if (position_begin < 16 || position_end >= std::max(0, prompt_tokens_ - 8)) return true;
-    if (snapshot_position_ >= 0 &&
-        near_boundary(position_begin, position_end, snapshot_position_)) {
-        return true;
-    }
-    if (weights_.n_swa > 0 && near_boundary(position_begin, position_end, weights_.n_swa)) {
-        return true;
-    }
-    for (int ratio : compressor_boundaries_) {
-        const int first = ratio;
-        const int last = prompt_tokens_ / ratio * ratio;
-        if (near_boundary(position_begin, position_end, first) ||
-            (last > first && near_boundary(position_begin, position_end, last))) {
-            return true;
-        }
-    }
-    const int capture_begin = std::max(0, prompt_tokens_ - weights_.n_swa);
-    return near_boundary(position_begin, position_end, capture_begin);
+    return request_index_ >= 0 && position_begin >= 0 && n_tokens > 0 &&
+        position_begin + n_tokens <= prompt_tokens_;
 }
 
 void DeepSeek4ExactTraceWriter::record_reset(int cache_position) {
