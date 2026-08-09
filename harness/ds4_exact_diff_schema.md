@@ -71,6 +71,10 @@ ends of each request's four-token DSpark final-capture window.
 
 Generate all traces (two profiles, four exact widths):
 
+The q=2 through q=4 runs require a server revision that implements
+`DFLASH_DS4_EXACT_PREFILL_BANDS`. On a revision without exact bands, comparison
+fails closed because the required step widths and tail coverage are absent.
+
 ```bash
 python3 harness/ds4_exact_diff.py run \
   --binary server/build-hip/dflash_server \
