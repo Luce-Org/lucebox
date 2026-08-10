@@ -6621,6 +6621,35 @@ bool deepseek4_should_attempt_fused_verify(
            fused_verify_enabled;
 }
 
+DeepSeek4RecursiveOutputIntent deepseek4_recursive_output_intent(
+        PrefillAttentionMode mode,
+        bool parent_execute_output_path,
+        bool parent_has_output_storage,
+        bool is_last_shard,
+        int chunk_tokens,
+        bool is_final_chunk) {
+    const bool exact = mode == PrefillAttentionMode::Exact;
+    return {
+        /*execute_output_path=*/exact
+            ? chunk_tokens == 1 ||
+                  (is_final_chunk && parent_execute_output_path)
+            : parent_execute_output_path,
+        /*pass_output_storage=*/
+            parent_has_output_storage &&
+            (!is_last_shard || !exact || is_final_chunk),
+    };
+}
+
+bool deepseek4_should_attempt_fused_hybrid_decode(
+        bool fused_hybrid_decode,
+        bool full_layer_range,
+        bool execute_output_path,
+        bool gpu_backend,
+        bool fused_verify_enabled) {
+    return fused_hybrid_decode && full_layer_range && execute_output_path &&
+           gpu_backend && fused_verify_enabled;
+}
+
 bool deepseek4_step_layer_range(
         ggml_backend_t backend,
         int device,
@@ -6747,14 +6776,14 @@ bool deepseek4_step_layer_range(
                 chunk_hooks_ptr = &chunk_hooks;
             }
             const bool final_chunk = off + chunk == n_tokens;
+            const DeepSeek4RecursiveOutputIntent chunk_intent =
+                deepseek4_recursive_output_intent(
+                    cache.prefill_mode, execute_output_path,
+                    out_logits != nullptr, is_last_shard, chunk, final_chunk);
             std::vector<float> * chunk_output = nullptr;
-            if (out_logits && (!is_last_shard || final_chunk)) {
+            if (chunk_intent.pass_output_storage) {
                 chunk_output = &chunk_out;
             }
-            const bool chunk_execute_output_path =
-                (cache.prefill_mode == PrefillAttentionMode::Exact &&
-                 chunk == 1) ||
-                (final_chunk && execute_output_path);
             if (!deepseek4_step_layer_range(
                     backend, device, w, cache, chunk_hc,
                     embed + (size_t) off * input_width,
@@ -6763,7 +6792,7 @@ bool deepseek4_step_layer_range(
                     token_ids ? token_ids + off : nullptr,
                     telemetry, allow_decode_graph_reuse, chunk_hooks_ptr,
                     moe_hybrid, expert_runtime, routing_stats,
-                    chunk_execute_output_path)) {
+                    chunk_intent.execute_output_path)) {
                 return false;
             }
             hc_all.insert(hc_all.end(), chunk_hc.begin(), chunk_hc.end());
@@ -6916,9 +6945,10 @@ bool deepseek4_step_layer_range(
         (fused_hybrid_decode && !verify_hooks)
             ? &fused_hybrid_decode_hooks : verify_hooks;
     const bool fused_hybrid_decode_candidate =
-        fused_hybrid_decode && layer_begin == 0 && is_last_shard &&
-        execute_output_path && ds4_backend_is_gpu(backend) &&
-        ds4_fused_verify_enabled();
+        deepseek4_should_attempt_fused_hybrid_decode(
+            fused_hybrid_decode, layer_begin == 0 && is_last_shard,
+            execute_output_path, ds4_backend_is_gpu(backend),
+            ds4_fused_verify_enabled());
     if (fused_verify_candidate || fused_hybrid_decode_candidate) {
         const bool q1_feature_capture =
             n_tokens == 1 && verify_hooks && verify_hooks->capture_out;

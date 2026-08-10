@@ -373,6 +373,16 @@ DeepSeek4PrefillOutputIntent deepseek4_prefill_output_intent(
     bool ends_at_snapshot,
     bool external_requires_logits);
 
+DeepSeek4PrefillOutputIntent deepseek4_prepare_prefill_output_intent(
+    PrefillAttentionMode mode,
+    bool exact_bands_active,
+    int n_tokens,
+    bool is_final_chunk,
+    bool ends_at_snapshot,
+    bool external_requires_logits,
+    std::vector<float> & last_logits,
+    int & last_logits_pos);
+
 void deepseek4_invalidate_prefill_logits_if_skipped(
     bool readback_logits,
     std::vector<float> & last_logits,
@@ -438,6 +448,26 @@ bool deepseek4_should_attempt_fused_verify(
     int n_tokens,
     const Ds4VerifyHooks * verify_hooks,
     bool owner_topology_supported,
+    bool full_layer_range,
+    bool execute_output_path,
+    bool gpu_backend,
+    bool fused_verify_enabled);
+
+struct DeepSeek4RecursiveOutputIntent {
+    bool execute_output_path = false;
+    bool pass_output_storage = false;
+};
+
+DeepSeek4RecursiveOutputIntent deepseek4_recursive_output_intent(
+    PrefillAttentionMode mode,
+    bool parent_execute_output_path,
+    bool parent_has_output_storage,
+    bool is_last_shard,
+    int chunk_tokens,
+    bool is_final_chunk);
+
+bool deepseek4_should_attempt_fused_hybrid_decode(
+    bool fused_hybrid_decode,
     bool full_layer_range,
     bool execute_output_path,
     bool gpu_backend,

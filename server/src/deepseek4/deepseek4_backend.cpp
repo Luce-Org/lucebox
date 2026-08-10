@@ -612,6 +612,26 @@ void deepseek4_invalidate_prefill_logits_if_skipped(
     last_logits_pos = -1;
 }
 
+DeepSeek4PrefillOutputIntent deepseek4_prepare_prefill_output_intent(
+        PrefillAttentionMode mode,
+        bool exact_bands_active,
+        int n_tokens,
+        bool is_final_chunk,
+        bool ends_at_snapshot,
+        bool external_requires_logits,
+        std::vector<float> & last_logits,
+        int & last_logits_pos) {
+    const DeepSeek4PrefillOutputIntent intent =
+        deepseek4_prefill_output_intent(
+            mode, exact_bands_active, n_tokens, is_final_chunk,
+            ends_at_snapshot, external_requires_logits);
+    // This preparation function is the production ordering boundary: stale
+    // values are invalidated before the caller can enter any forward path.
+    deepseek4_invalidate_prefill_logits_if_skipped(
+        intent.readback_logits, last_logits, last_logits_pos);
+    return intent;
+}
+
 bool deepseek4_commit_prefill_logits(
         bool readback_logits,
         int vocab_size,
@@ -1527,18 +1547,14 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         // but only a final/snapshot/external consumer receives host logits.
         // Capture hooks request feature rows, not vocabulary values.
         const DeepSeek4PrefillOutputIntent output_intent =
-            deepseek4_prefill_output_intent(
+            deepseek4_prepare_prefill_output_intent(
                 cfg_.prefill_mode, exact_bands_active, n_tok,
                 i + n_tok == n_total, ends_at_snapshot,
-                /*external_requires_logits=*/false);
+                /*external_requires_logits=*/false,
+                last_logits_, last_logits_pos_);
         std::vector<float> logits;
         std::vector<float> * logits_out =
             output_intent.readback_logits ? &logits : nullptr;
-        // A snapshot boundary may have left valid logits for an older cache
-        // position. Invalidate them before a no-readout forward so a partial
-        // failure cannot expose stale state.
-        deepseek4_invalidate_prefill_logits_if_skipped(
-            output_intent.readback_logits, last_logits_, last_logits_pos_);
         bool ok = false;
         std::vector<float> hc_state;
         Ds4VerifyHooks spec_hooks;

@@ -1815,10 +1815,46 @@ static void test_prefill_readout_lifecycle_and_fused_exclusion() {
         /*readback_logits=*/true, last_logits, last_logits_pos);
     TEST_ASSERT(last_logits == std::vector<float>({1.0f, 2.0f}));
     TEST_ASSERT(last_logits_pos == 7);
-    deepseek4_invalidate_prefill_logits_if_skipped(
-        /*readback_logits=*/false, last_logits, last_logits_pos);
+    const auto prepared_no_readback = deepseek4_prepare_prefill_output_intent(
+        PrefillAttentionMode::Exact, /*exact_bands_active=*/true,
+        /*n_tokens=*/1, /*is_final_chunk=*/false,
+        /*ends_at_snapshot=*/false, /*external_requires_logits=*/false,
+        last_logits, last_logits_pos);
+    TEST_ASSERT(prepared_no_readback.execute_output_path);
+    TEST_ASSERT(!prepared_no_readback.readback_logits);
     TEST_ASSERT(last_logits.empty());
     TEST_ASSERT(last_logits_pos == -1);
+
+    // The production recursive selector scopes host-readback suppression to
+    // exact mode. Dense and sparse retain their legacy per-subchunk output.
+    for (PrefillAttentionMode mode :
+         {PrefillAttentionMode::Dense, PrefillAttentionMode::Sparse}) {
+        for (int width : {1, 2, 3, 4}) {
+            const auto interior = deepseek4_recursive_output_intent(
+                mode, /*parent_execute_output_path=*/true,
+                /*parent_has_output_storage=*/true,
+                /*is_last_shard=*/true, /*chunk_tokens=*/width,
+                /*is_final_chunk=*/false);
+            TEST_ASSERT(interior.execute_output_path);
+            TEST_ASSERT(interior.pass_output_storage);
+        }
+    }
+    const auto exact_interior = deepseek4_recursive_output_intent(
+        PrefillAttentionMode::Exact,
+        /*parent_execute_output_path=*/false,
+        /*parent_has_output_storage=*/false,
+        /*is_last_shard=*/true, /*chunk_tokens=*/1,
+        /*is_final_chunk=*/false);
+    TEST_ASSERT(exact_interior.execute_output_path);
+    TEST_ASSERT(!exact_interior.pass_output_storage);
+    const auto exact_final = deepseek4_recursive_output_intent(
+        PrefillAttentionMode::Exact,
+        /*parent_execute_output_path=*/true,
+        /*parent_has_output_storage=*/true,
+        /*is_last_shard=*/true, /*chunk_tokens=*/1,
+        /*is_final_chunk=*/true);
+    TEST_ASSERT(exact_final.execute_output_path);
+    TEST_ASSERT(exact_final.pass_output_storage);
 
     // Final/snapshot readbacks must be current, vocabulary-sized values.
     constexpr int vocab_size = 4;
@@ -1853,6 +1889,14 @@ static void test_prefill_readout_lifecycle_and_fused_exclusion() {
     TEST_ASSERT(prefill_hooks.capture_token_begin == 1);
     TEST_ASSERT(prefill_hooks.capture_token_end == 3);
     TEST_ASSERT(!prefill_hooks.allow_fused_verify);
+    TEST_ASSERT(deepseek4_should_attempt_fused_hybrid_decode(
+        /*fused_hybrid_decode=*/true, /*full_layer_range=*/true,
+        /*execute_output_path=*/prepared_no_readback.execute_output_path,
+        /*gpu_backend=*/true, /*fused_verify_enabled=*/true));
+    TEST_ASSERT(!deepseek4_should_attempt_fused_hybrid_decode(
+        /*fused_hybrid_decode=*/true, /*full_layer_range=*/true,
+        /*execute_output_path=*/false,
+        /*gpu_backend=*/true, /*fused_verify_enabled=*/true));
     TEST_ASSERT(!deepseek4_should_attempt_fused_verify(
         /*n_tokens=*/4, &prefill_hooks,
         /*owner_topology_supported=*/true,
