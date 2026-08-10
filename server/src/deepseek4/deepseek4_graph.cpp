@@ -196,6 +196,12 @@ int deepseek4_previous_raw_ring_spans(
     return count;
 }
 
+bool deepseek4_exact_tokenwise_uses_runtime_raw_row(
+        int token_position,
+        int n_swa) {
+    return n_swa > 0 && token_position >= n_swa - 1;
+}
+
 struct DeepSeek4I32InputBinding {
     ggml_tensor * tensor = nullptr;
     int32_t       value  = 0;
@@ -5726,11 +5732,25 @@ static bool ds4_run_exact_tokenwise_prefill_attention(
         std::vector<DeepSeek4I32ArrayBinding> i32_array_inputs;
         std::vector<DeepSeek4I64ArrayBinding> i64_array_inputs;
         std::vector<DeepSeek4F32ArrayBinding> f32_array_inputs;
+        // q=1 switches to a stable physical-ring reduction once the SWA
+        // window fills. Exact q=2..4 must use the same runtime row topology;
+        // reconstructing chronological spans changes the F32 reduction order
+        // after wrap and can move learned routing weights past the oracle
+        // tolerance even though the raw/compressed cache contents are equal.
+        DeepSeek4AttentionGraphInputs stable_inputs{};
+        const int token_position = kv_start + ti;
+        if (deepseek4_exact_tokenwise_uses_runtime_raw_row(
+                token_position, w.n_swa)) {
+            stable_inputs.raw_kv_rows =
+                ggml_new_tensor_2d(ctx, GGML_TYPE_I64, 1, 1);
+            ggml_set_input(stable_inputs.raw_kv_rows);
+        }
         ggml_cgraph * gf = ggml_new_graph_custom(
             ctx, ds4_attn_step_graph_size(1), false);
         ggml_tensor * normed = build_rms_norm(ctx, inp, L.attn_norm, w.rms_eps);
         ggml_tensor * attn_out = build_mla_attention(
-            ctx, gf, normed, w, L, lc, il, kv_start + ti, 1, nullptr,
+            ctx, gf, normed, w, L, lc, il, token_position, 1,
+            stable_inputs.raw_kv_rows ? &stable_inputs : nullptr,
             i32_inputs, i32_array_inputs, i64_array_inputs, &f32_array_inputs,
             attention_impl);
         ggml_set_output(attn_out);
@@ -5757,6 +5777,11 @@ static bool ds4_run_exact_tokenwise_prefill_attention(
 
         ggml_backend_tensor_set(inp, cur + (size_t) ti * n_embd, 0,
                                 sizeof(float) * (size_t) n_embd);
+        if (stable_inputs.raw_kv_rows) {
+            const int64_t raw_row = token_position % w.n_swa;
+            ggml_backend_tensor_set(
+                stable_inputs.raw_kv_rows, &raw_row, 0, sizeof(raw_row));
+        }
         for (const auto & b : i32_inputs) {
             ggml_backend_tensor_set(b.tensor, &b.value, 0, sizeof(b.value));
         }

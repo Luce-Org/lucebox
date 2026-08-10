@@ -1123,6 +1123,12 @@ static void test_raw_ring_spans_after_wrap() {
     TEST_ASSERT(spans[1].count == 2);
     TEST_ASSERT(spans[0].count + spans[1].count == 7);
 
+    TEST_ASSERT(!deepseek4_exact_tokenwise_uses_runtime_raw_row(-1, 8));
+    TEST_ASSERT(!deepseek4_exact_tokenwise_uses_runtime_raw_row(6, 8));
+    TEST_ASSERT(deepseek4_exact_tokenwise_uses_runtime_raw_row(7, 8));
+    TEST_ASSERT(deepseek4_exact_tokenwise_uses_runtime_raw_row(8, 8));
+    TEST_ASSERT(!deepseek4_exact_tokenwise_uses_runtime_raw_row(8, 0));
+
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 

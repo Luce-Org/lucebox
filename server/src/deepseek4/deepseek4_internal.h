@@ -339,6 +339,9 @@ int deepseek4_previous_raw_ring_spans(
     int kv_start,
     int n_swa,
     DeepSeek4RawRingSpan spans[2]);
+bool deepseek4_exact_tokenwise_uses_runtime_raw_row(
+    int token_position,
+    int n_swa);
 bool deepseek4_snapshot_save(const DeepSeek4Cache & cache,
                              ggml_backend_t snapshot_backend,
                              DeepSeek4Snapshot & out);
