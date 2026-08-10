@@ -1719,28 +1719,89 @@ static void test_exact_prefill_band_schedule() {
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
-static void test_prefill_chunk_logits_policy() {
-    std::fprintf(stderr, "  test_prefill_chunk_logits_policy ...");
-    TEST_ASSERT(!deepseek4_prefill_chunk_needs_logits(
+static void test_prefill_output_intents() {
+    std::fprintf(stderr, "  test_prefill_output_intents ...");
+
+    // Legacy/default exact q1 and explicit --chunk 1 retain both the
+    // established output topology and their historical host readback.
+    const auto legacy_q1 = deepseek4_prefill_output_intent(
+        PrefillAttentionMode::Exact, /*exact_bands_active=*/false,
+        /*n_tokens=*/1, /*is_final_chunk=*/false,
+        /*ends_at_snapshot=*/false, /*external_requires_logits=*/false);
+    TEST_ASSERT(legacy_q1.execute_output_path);
+    TEST_ASSERT(legacy_q1.readback_logits);
+
+    // Dense and sparse policies are outside exact-band readout elision.
+    for (PrefillAttentionMode mode :
+         {PrefillAttentionMode::Dense, PrefillAttentionMode::Sparse}) {
+        const auto intent = deepseek4_prefill_output_intent(
+            mode, false, 4, false, false, false);
+        TEST_ASSERT(intent.execute_output_path);
+        TEST_ASSERT(intent.readback_logits);
+    }
+
+    // Interior singleton leaves created by enabled q2/q3/q4 exact prefill
+    // preserve the q1/fused execution topology without a host logits readback.
+    DeepSeek4Weights failure_weights;
+    failure_weights.compress_ratios = {4, 128};
+    for (int width : {2, 3, 4}) {
+        TEST_ASSERT(deepseek4_safe_compressor_batch_tokens(
+                        failure_weights, /*kv_start=*/2763, width) == 1);
+        const auto fallback = deepseek4_prefill_output_intent(
+            PrefillAttentionMode::Exact, /*exact_bands_active=*/true,
+            /*n_tokens=*/1, /*is_final_chunk=*/false,
+            /*ends_at_snapshot=*/false,
+            /*external_requires_logits=*/false);
+        TEST_ASSERT_MSG(fallback.execute_output_path,
+                        "exact singleton must preserve output topology");
+        TEST_ASSERT_MSG(!fallback.readback_logits,
+                        "exact singleton must skip host logits readback");
+    }
+
+    // A capture-only singleton has the same topology requirement, but capture
+    // values are not an external vocabulary-logits consumer.
+    const auto capture_only = deepseek4_prefill_output_intent(
+        PrefillAttentionMode::Exact, true, 1, false, false, false);
+    TEST_ASSERT(capture_only.execute_output_path);
+    TEST_ASSERT(!capture_only.readback_logits);
+
+    // Final and exact snapshot endpoints still transfer current logits.
+    const auto final_singleton = deepseek4_prefill_output_intent(
+        PrefillAttentionMode::Exact, true, 1, true, false, false);
+    TEST_ASSERT(final_singleton.execute_output_path);
+    TEST_ASSERT(final_singleton.readback_logits);
+    const auto snapshot_singleton = deepseek4_prefill_output_intent(
+        PrefillAttentionMode::Exact, true, 1, false, true, false);
+    TEST_ASSERT(snapshot_singleton.execute_output_path);
+    TEST_ASSERT(snapshot_singleton.readback_logits);
+
+    // A genuine external vocabulary consumer is independently authoritative.
+    const auto external = deepseek4_prefill_output_intent(
+        PrefillAttentionMode::Exact, true, 4, false, false, true);
+    TEST_ASSERT(external.execute_output_path);
+    TEST_ASSERT(external.readback_logits);
+
+    // Geometry from the hardware failure: the 128-token capture window begins
+    // at 2891 - 128 == 2763. A q=2 band beginning at 2762 is split into an
+    // interior singleton ending at 2763, which must not read back logits.
+    constexpr int prompt_tokens = 2891;
+    constexpr int capture_begin = prompt_tokens - 128;
+    TEST_ASSERT(capture_begin == 2763);
+    TEST_ASSERT(DeepSeek4Backend::capture_safe_prefill_tokens(
+                    /*token_offset=*/2762, /*requested_tokens=*/2,
+                    /*final_capture_from=*/capture_begin,
+                    /*batch_final_capture=*/false,
+                    /*snapshot_pending=*/false,
+                    /*snapshot_capture_from=*/0,
+                    /*snapshot_capture_to=*/0) == 1);
+    TEST_ASSERT(deepseek4_safe_compressor_batch_tokens(
+                    failure_weights, capture_begin, /*n_tokens=*/2) == 1);
+    const auto failure_geometry = deepseek4_prefill_output_intent(
+        PrefillAttentionMode::Exact, true, 1,
         /*is_final_chunk=*/false, /*ends_at_snapshot=*/false,
-        /*capture_requires_logits=*/false,
-        /*execution_requires_logits=*/false));
-    TEST_ASSERT(deepseek4_prefill_chunk_needs_logits(
-        /*is_final_chunk=*/true, /*ends_at_snapshot=*/false,
-        /*capture_requires_logits=*/false,
-        /*execution_requires_logits=*/false));
-    TEST_ASSERT(deepseek4_prefill_chunk_needs_logits(
-        /*is_final_chunk=*/false, /*ends_at_snapshot=*/true,
-        /*capture_requires_logits=*/false,
-        /*execution_requires_logits=*/false));
-    TEST_ASSERT(deepseek4_prefill_chunk_needs_logits(
-        /*is_final_chunk=*/false, /*ends_at_snapshot=*/false,
-        /*capture_requires_logits=*/true,
-        /*execution_requires_logits=*/false));
-    TEST_ASSERT(deepseek4_prefill_chunk_needs_logits(
-        /*is_final_chunk=*/false, /*ends_at_snapshot=*/false,
-        /*capture_requires_logits=*/false,
-        /*execution_requires_logits=*/true));
+        /*external_requires_logits=*/false);
+    TEST_ASSERT(failure_geometry.execute_output_path);
+    TEST_ASSERT(!failure_geometry.readback_logits);
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
@@ -1751,11 +1812,34 @@ static void test_prefill_readout_lifecycle_and_fused_exclusion() {
     std::vector<float> last_logits = {1.0f, 2.0f};
     int last_logits_pos = 7;
     deepseek4_invalidate_prefill_logits_if_skipped(
-        /*need_logits=*/true, last_logits, last_logits_pos);
+        /*readback_logits=*/true, last_logits, last_logits_pos);
     TEST_ASSERT(last_logits == std::vector<float>({1.0f, 2.0f}));
     TEST_ASSERT(last_logits_pos == 7);
     deepseek4_invalidate_prefill_logits_if_skipped(
-        /*need_logits=*/false, last_logits, last_logits_pos);
+        /*readback_logits=*/false, last_logits, last_logits_pos);
+    TEST_ASSERT(last_logits.empty());
+    TEST_ASSERT(last_logits_pos == -1);
+
+    // Final/snapshot readbacks must be current, vocabulary-sized values.
+    constexpr int vocab_size = 4;
+    TEST_ASSERT(deepseek4_commit_prefill_logits(
+        /*readback_logits=*/true, vocab_size, /*cache_position=*/2764,
+        std::vector<float>{1.0f, 2.0f, 3.0f, 4.0f},
+        last_logits, last_logits_pos));
+    TEST_ASSERT(last_logits.size() == vocab_size);
+    TEST_ASSERT(last_logits_pos == 2764);
+    TEST_ASSERT(deepseek4_commit_prefill_logits(
+        /*readback_logits=*/true, vocab_size, /*cache_position=*/2891,
+        std::vector<float>{4.0f, 3.0f, 2.0f, 1.0f},
+        last_logits, last_logits_pos));
+    TEST_ASSERT(last_logits.size() == vocab_size);
+    TEST_ASSERT(last_logits.front() == 4.0f);
+    TEST_ASSERT(last_logits_pos == 2891);
+
+    // A malformed readback cannot leave previously current logits visible.
+    TEST_ASSERT(!deepseek4_commit_prefill_logits(
+        /*readback_logits=*/true, vocab_size, /*cache_position=*/3000,
+        std::vector<float>{9.0f}, last_logits, last_logits_pos));
     TEST_ASSERT(last_logits.empty());
     TEST_ASSERT(last_logits_pos == -1);
 
@@ -3849,7 +3933,7 @@ int main() {
     test_safe_compressor_batch_tokens();
     test_exact_prefill_chunk_policy();
     test_exact_prefill_band_schedule();
-    test_prefill_chunk_logits_policy();
+    test_prefill_output_intents();
     test_prefill_readout_lifecycle_and_fused_exclusion();
     test_dspark_park_all_releases_drafter();
     test_dspark_raw_ring_rollback_after_wrap(backend);

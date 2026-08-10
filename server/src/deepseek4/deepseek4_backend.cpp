@@ -582,21 +582,52 @@ int deepseek4_prefill_chunk_tokens(PrefillAttentionMode mode,
     return prefill_attention_mode_is_approximate(mode) ? bounded_chunk : 1;
 }
 
-bool deepseek4_prefill_chunk_needs_logits(bool is_final_chunk,
-                                          bool ends_at_snapshot,
-                                          bool capture_requires_logits,
-                                          bool execution_requires_logits) {
-    return is_final_chunk || ends_at_snapshot || capture_requires_logits ||
-           execution_requires_logits;
+DeepSeek4PrefillOutputIntent deepseek4_prefill_output_intent(
+        PrefillAttentionMode mode,
+        bool exact_bands_active,
+        int n_tokens,
+        bool is_final_chunk,
+        bool ends_at_snapshot,
+        bool external_requires_logits) {
+    const bool legacy_readback =
+        !exact_bands_active &&
+        (n_tokens == 1 || mode != PrefillAttentionMode::Exact);
+    const bool readback_logits =
+        is_final_chunk || ends_at_snapshot || external_requires_logits ||
+        legacy_readback;
+    return {
+        /*execute_output_path=*/
+            readback_logits || n_tokens == 1 ||
+            mode != PrefillAttentionMode::Exact,
+        readback_logits,
+    };
 }
 
 void deepseek4_invalidate_prefill_logits_if_skipped(
-        bool need_logits,
+        bool readback_logits,
         std::vector<float> & last_logits,
         int & last_logits_pos) {
-    if (need_logits) return;
+    if (readback_logits) return;
     last_logits.clear();
     last_logits_pos = -1;
+}
+
+bool deepseek4_commit_prefill_logits(
+        bool readback_logits,
+        int vocab_size,
+        int cache_position,
+        std::vector<float> && logits,
+        std::vector<float> & last_logits,
+        int & last_logits_pos) {
+    if (!readback_logits) return true;
+    if (vocab_size <= 0 || logits.size() != (size_t) vocab_size) {
+        last_logits.clear();
+        last_logits_pos = -1;
+        return false;
+    }
+    last_logits = std::move(logits);
+    last_logits_pos = cache_position;
+    return true;
 }
 
 Ds4VerifyHooks deepseek4_make_prefill_capture_hooks(
@@ -1386,10 +1417,16 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         cfg_.prefill_mode == PrefillAttentionMode::Sparse ||
         (cfg_.prefill_mode == PrefillAttentionMode::Exact &&
          layer_range_hybrid);
+    const bool exact_bands_enabled =
+        env_flag_enabled("DFLASH_DS4_EXACT_PREFILL_BANDS");
     const int chunk = deepseek4_prefill_chunk_tokens(
         cfg_.prefill_mode,
-        env_flag_enabled("DFLASH_DS4_EXACT_PREFILL_BANDS"),
+        exact_bands_enabled,
         batch_supported, requested_chunk, layer_major_cap);
+    const bool exact_bands_active =
+        cfg_.prefill_mode == PrefillAttentionMode::Exact &&
+        exact_bands_enabled && batch_supported && requested_chunk > 1 &&
+        chunk > 1;
     int pos = kv_offset;
     const bool save_snapshot =
         snap_slot >= 0 && snap_slot < PREFIX_SLOTS &&
@@ -1483,27 +1520,25 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         const bool capture_requested =
             spec_enabled_ && spec_drafter_ &&
             (capture_final || capture_snapshot);
-        // Existing q=1 fused and approximate wide schedulers use the logits
-        // sink as an execution-path selector. Preserve those original
-        // topologies: the q=1 per-layer fallback is documented as numerically
-        // distinct, while sparse/layer-major prefill own their batching and
-        // capture contracts. Readout elision is therefore limited to the new
-        // q=2..4 exact bands until sink selection is decoupled from readback.
-        const bool capture_requires_logits = capture_requested && n_tok == 1;
-        const bool execution_requires_logits =
-            n_tok == 1 || cfg_.prefill_mode != PrefillAttentionMode::Exact;
         const bool ends_at_snapshot =
             save_snapshot && !snapshot_saved && pos + n_tok == snap_pos;
-        const bool need_logits = deepseek4_prefill_chunk_needs_logits(
-            i + n_tok == n_total, ends_at_snapshot,
-            capture_requires_logits, execution_requires_logits);
+        // Execution topology and host vocabulary readback are independent.
+        // An exact-band singleton leaf keeps the established q=1/fused graph,
+        // but only a final/snapshot/external consumer receives host logits.
+        // Capture hooks request feature rows, not vocabulary values.
+        const DeepSeek4PrefillOutputIntent output_intent =
+            deepseek4_prefill_output_intent(
+                cfg_.prefill_mode, exact_bands_active, n_tok,
+                i + n_tok == n_total, ends_at_snapshot,
+                /*external_requires_logits=*/false);
         std::vector<float> logits;
-        std::vector<float> * logits_out = need_logits ? &logits : nullptr;
+        std::vector<float> * logits_out =
+            output_intent.readback_logits ? &logits : nullptr;
         // A snapshot boundary may have left valid logits for an older cache
         // position. Invalidate them before a no-readout forward so a partial
         // failure cannot expose stale state.
         deepseek4_invalidate_prefill_logits_if_skipped(
-            need_logits, last_logits_, last_logits_pos_);
+            output_intent.readback_logits, last_logits_, last_logits_pos_);
         bool ok = false;
         std::vector<float> hc_state;
         Ds4VerifyHooks spec_hooks;
@@ -1538,7 +1573,7 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                 /*allow_decode_graph_reuse=*/true, hp,
                 moe_hybrid_.get(),
                 expert_runtime_.compute ? &expert_runtime_ : nullptr,
-                routing_stats_.get());
+                routing_stats_.get(), output_intent.execute_output_path);
         } else if (moe_hybrid_) {
             ok = deepseek4_step(backend_, cfg_.device.gpu, w_, cache_, embed.data(), n_tok, pos, logits,
                                 moe_hybrid_.get(), tokens.data() + i,
@@ -1552,7 +1587,10 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                 backend_, cfg_.device.gpu, w_, cache_, hc_state,
                 embed.data(), n_tok, pos, 0, w_.n_layer, logits_out,
                 tokens.data() + i, timing ? &step_tel : nullptr,
-                cfg_.prefill_mode != PrefillAttentionMode::Sparse, hp);
+                cfg_.prefill_mode != PrefillAttentionMode::Sparse, hp,
+                /*moe_hybrid=*/nullptr, /*expert_runtime=*/nullptr,
+                /*routing_stats=*/nullptr,
+                output_intent.execute_output_path);
         }
         if (ok && hp && !spec_cap.empty()) {
             const int feat_row = spec_drafter_->n_target_layers * w_.n_embd;
@@ -1577,9 +1615,13 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
             steps++;
         }
         pos += n_tok;
-        if (need_logits) {
-            last_logits_ = std::move(logits);
-            last_logits_pos_ = cache_.cur_pos;
+        if (!deepseek4_commit_prefill_logits(
+                output_intent.readback_logits, w_.n_vocab, cache_.cur_pos,
+                std::move(logits), last_logits_, last_logits_pos_)) {
+            std::fprintf(stderr,
+                         "[deepseek4] invalid prefill logits at pos=%d\n",
+                         cache_.cur_pos);
+            return -1;
         }
         i += n_tok;
         if (save_snapshot && !snapshot_saved && pos == snap_pos) {

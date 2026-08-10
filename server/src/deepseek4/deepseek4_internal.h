@@ -360,13 +360,29 @@ int deepseek4_prefill_chunk_tokens(PrefillAttentionMode mode,
 
 bool deepseek4_env_flag_value_enabled(const char * value);
 
-bool deepseek4_prefill_chunk_needs_logits(bool is_final_chunk,
-                                          bool ends_at_snapshot,
-                                          bool capture_requires_logits,
-                                          bool execution_requires_logits);
+struct DeepSeek4PrefillOutputIntent {
+    bool execute_output_path = false;
+    bool readback_logits = false;
+};
+
+DeepSeek4PrefillOutputIntent deepseek4_prefill_output_intent(
+    PrefillAttentionMode mode,
+    bool exact_bands_active,
+    int n_tokens,
+    bool is_final_chunk,
+    bool ends_at_snapshot,
+    bool external_requires_logits);
 
 void deepseek4_invalidate_prefill_logits_if_skipped(
-    bool need_logits,
+    bool readback_logits,
+    std::vector<float> & last_logits,
+    int & last_logits_pos);
+
+bool deepseek4_commit_prefill_logits(
+    bool readback_logits,
+    int vocab_size,
+    int cache_position,
+    std::vector<float> && logits,
     std::vector<float> & last_logits,
     int & last_logits_pos);
 
@@ -423,7 +439,7 @@ bool deepseek4_should_attempt_fused_verify(
     const Ds4VerifyHooks * verify_hooks,
     bool owner_topology_supported,
     bool full_layer_range,
-    bool has_logits_output,
+    bool execute_output_path,
     bool gpu_backend,
     bool fused_verify_enabled);
 
@@ -445,7 +461,8 @@ bool deepseek4_step_layer_range(
     Ds4VerifyHooks *            verify_hooks = nullptr,
     MoeHybridStorage *          moe_hybrid = nullptr,
     MoeExpertComputeRuntime *   expert_runtime = nullptr,
-    MoeHybridRoutingStats *     routing_stats = nullptr);
+    MoeHybridRoutingStats *     routing_stats = nullptr,
+    bool                        execute_output_path = false);
 
 bool build_deepseek4_moe_hybrid_storage_from_file(
     const std::string &         path,

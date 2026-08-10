@@ -1010,7 +1010,7 @@ static int ds4_try_fused_verify_step(
         const float * embed,
         int n_tokens,
         int kv_start,
-        std::vector<float> & out_logits,
+        std::vector<float> * out_logits,
         const int32_t * token_ids,
         Ds4VerifyHooks * hooks,
         DeepSeek4StepTelemetry * telemetry,
@@ -1316,13 +1316,13 @@ static int ds4_try_fused_verify_step(
         ggml_backend_tensor_get(fg->logits, hooks->all_logits_out->data(), 0,
                                 sizeof(float) * (size_t) w.n_vocab * q);
     }
-    if (!argmax_only) {
-        out_logits.resize((size_t) w.n_vocab);
-        ggml_backend_tensor_get(fg->logits, out_logits.data(),
+    if (!argmax_only && out_logits) {
+        out_logits->resize((size_t) w.n_vocab);
+        ggml_backend_tensor_get(fg->logits, out_logits->data(),
                                 (size_t) (q - 1) * (size_t) w.n_vocab * sizeof(float),
                                 sizeof(float) * (size_t) w.n_vocab);
-    } else {
-        out_logits.clear();
+    } else if (out_logits) {
+        out_logits->clear();
     }
     if (hooks->capture_out && ex->capture && ncap > 0) {
         std::vector<float> flat((size_t) w.n_embd * ncap * q);
@@ -1337,7 +1337,9 @@ static int ds4_try_fused_verify_step(
             }
         }
     }
-    if (telemetry) {
+    if (telemetry &&
+        (argmax_only || hooks->all_logits_out || out_logits ||
+         (hooks->capture_out && ex->capture && ncap > 0))) {
         telemetry->full_graph_read_us += ds4_elapsed_us(read_t0, Ds4TimingClock::now());
     }
     return 1;
