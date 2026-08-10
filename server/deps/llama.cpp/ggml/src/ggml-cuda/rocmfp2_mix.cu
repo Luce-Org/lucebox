@@ -10,6 +10,20 @@
 #include <mutex>
 #include <vector>
 
+// MSVC's host toolchain gives nvcc device code neither __builtin_memcpy nor
+// __builtin_assume_aligned. memcpy lowers to the same register moves under
+// every device compiler, and the alignment hint is an optimization-only
+// contract that the callers' address arithmetic already guarantees -- so the
+// MSVC fallback changes nothing except compiling. GCC/Clang (every HIP build,
+// where the wide-load numbers were measured) keep the builtins.
+#if defined(_MSC_VER) && !defined(__clang__)
+#define MIX_MEMCPY(dst, src, n)   memcpy((dst), (src), (n))
+#define MIX_ASSUME_ALIGNED(p, a)  (p)
+#else
+#define MIX_MEMCPY(dst, src, n)   __builtin_memcpy((dst), (src), (n))
+#define MIX_ASSUME_ALIGNED(p, a)  __builtin_assume_aligned((p), (a))
+#endif
+
 #if defined(GGML_USE_HIP)
 #ifndef cudaPointerAttributes
 // Same local-mapping pattern topk-rows.cu already uses in this directory: the vendor shim
@@ -358,12 +372,12 @@ __device__ __forceinline__ void mix_block_accum(
     // (see the in % 128 guard in ggml_cuda_rocmfp2_mix_register_host) rather than
     // left to chance, so this loop can stay branch-free.
     const uintptr_t addr  = (uintptr_t) b;
-    const uint8_t * base8 = (const uint8_t *) __builtin_assume_aligned(
+    const uint8_t * base8 = (const uint8_t *) MIX_ASSUME_ALIGNED(
             (const void *) (addr & ~(uintptr_t) 7), 8);
     const int sh = (int) (addr & 7) * 8;                 // 0, 16, 32, 48
     uint64_t lo, hi;
-    __builtin_memcpy(&lo, base8, 8);
-    __builtin_memcpy(&hi, base8 + 8, 8);
+    MIX_MEMCPY(&lo, base8, 8);
+    MIX_MEMCPY(&hi, base8 + 8, 8);
     const uint64_t codes = (sh == 0) ? lo : ((lo >> sh) | (hi << (64 - sh)));
     const uint8_t  m0    = (uint8_t) (hi >> sh);         // block byte MIX_QS+0
     const uint8_t  m1    = (uint8_t) (hi >> (sh + 8));   // block byte MIX_QS+1
