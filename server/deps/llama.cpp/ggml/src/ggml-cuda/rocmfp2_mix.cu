@@ -589,7 +589,7 @@ __global__ void mix_matvec_rocmfp2_moe_kernel(
         const uint8_t * __restrict__ data, size_t nb02,
         const nv_bfloat16 * __restrict__ codebooks, const uint8_t * __restrict__ modes,
         const float * __restrict__ src1, const int32_t * __restrict__ ids,
-        float * __restrict__ dst, int in, int out, int ne11,
+        float * __restrict__ dst, int in, int out, int n_experts, int ne11,
         int64_t ids_s0, int64_t ids_s1,       // element strides (int32) over slot, token
         int64_t src1_s1, int64_t src1_s2,     // element strides (float) over ne11, token
         int64_t dst_s1, int64_t dst_s2,       // element strides (float) over slot, token
@@ -611,22 +611,38 @@ __global__ void mix_matvec_rocmfp2_moe_kernel(
     // stage BEFORE the row0 early-return so all threads reach the __syncthreads()
     // (`row0 >= out` retires whole warps in the tail block).
     const int expert = ids[(int64_t) token * ids_s1 + (int64_t) slot * ids_s0];
+    // Routed ids come from the router's top-k, which is in-range by construction -- but this
+    // kernel deliberately bypasses the generic host-side id sort that used to sit between the
+    // routing tensor and the weights, so it must not turn a sentinel (-1), a padded batch
+    // slot, or corrupted routing into an unchecked OOB read of codebooks/modes/data. Degrade
+    // an invalid id to a ZERO contribution for this (token, slot): deterministic, and the
+    // same thing a masked-out slot means. All threads still reach the barrier below.
+    const bool bad_expert = expert < 0 || expert >= n_experts;
     // Both tables in one array so the staging stays a single guarded write per thread and one
     // barrier. Gate's table occupies [2*MIX_K, 4*MIX_K).
     __shared__ float s_lut[FUSE_GLU ? 4 * MIX_K : 2 * MIX_K];
-    if ((int) threadIdx.x < 2 * MIX_K) {
+    if (!bad_expert && (int) threadIdx.x < 2 * MIX_K) {
         s_lut[threadIdx.x] =
             __bfloat162float(codebooks[(int64_t) expert * 2 * MIX_K + threadIdx.x]);
     }
     if (FUSE_GLU) {
         const int gt = (int) threadIdx.x - 2 * MIX_K;
-        if (gt >= 0 && gt < 2 * MIX_K) {
+        if (!bad_expert && gt >= 0 && gt < 2 * MIX_K) {
             s_lut[2 * MIX_K + gt] =
                 __bfloat162float(gcodebooks[(int64_t) expert * 2 * MIX_K + gt]);
         }
     }
     __syncthreads();
     if (row0 >= out) return;
+    if (bad_expert) {
+        if (lane == 0) {
+            const int64_t o = (int64_t) token * dst_s2 + (int64_t) slot * dst_s1 + row0;
+            dst[o] = 0.0f;
+            if (row0 + 1 < out) dst[o + 1] = 0.0f;
+        }
+        return;
+    }
+
     const bool two  = (row0 + 1) < out;         // false only for an odd-out tail warp
     const uint8_t     * edata   = data + (int64_t) expert * nb02;
     const int           mode    = (int) modes[expert];
@@ -767,7 +783,7 @@ bool ggml_cuda_rocmfp2_mix_mul_mat_id(
     dim3 grid((out + rows_per_block - 1) / rows_per_block, n_expert_used, n_tokens);
     mix_matvec_rocmfp2_moe_kernel<false><<<grid, dim3(threads), 0, stream>>>(
         (const uint8_t *) e.base, e.nb02, e.codebooks, e.modes,
-        src1, ids, dst, in, out, ne11,
+        src1, ids, dst, in, out, e.n_experts, ne11,
         ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2,
         nullptr, 0, nullptr, nullptr, 0.0f);
     return true;
@@ -803,7 +819,7 @@ bool ggml_cuda_rocmfp2_mix_mul_mat_id_glu(
     dim3 grid((out + rows_per_block - 1) / rows_per_block, n_expert_used, n_tokens);
     mix_matvec_rocmfp2_moe_kernel<true><<<grid, dim3(threads), 0, stream>>>(
         (const uint8_t *) eu.base, eu.nb02, eu.codebooks, eu.modes,
-        src1, ids, dst, in, out, ne11,
+        src1, ids, dst, in, out, eu.n_experts, ne11,
         ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2,
         (const uint8_t *) eg.base, eg.nb02, eg.codebooks, eg.modes, glu_limit);
     return true;

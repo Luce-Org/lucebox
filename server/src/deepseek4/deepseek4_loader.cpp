@@ -341,6 +341,19 @@ static std::vector<uint32_t> compute_compress_ratios(int n_layer) {
 namespace {
 constexpr int DS4_QTYPE_ROCMFP3_MIX = 105;  // GGML_TYPE_Q3_1_ROCMFP3_MIX
 
+
+// 64-bit-safe forward seek. std::fseek takes long, which is 32 bits on Windows, so a
+// size_t payload that passed the checked arithmetic above it could still truncate in
+// the cast. Current dimension ceilings keep sidecar payloads KB-scale, but the seek
+// must not be the one unchecked conversion in a chain built on checked arithmetic.
+static bool ds4_seek_fwd(std::FILE * f, size_t bytes) {
+#ifdef _WIN32
+    return _fseeki64(f, (long long) bytes, SEEK_CUR) == 0;
+#else
+    return fseeko(f, (off_t) bytes, SEEK_CUR) == 0;
+#endif
+}
+
 // Read the "<gguf>.p4mix.bin" sidecar (produced on the H100) and register each
 // qtype-105 fused down-expert tensor's device base + per-expert codebooks/modes
 // with the CUDA/HIP decoder. No-op for uniform (qtype-104) models or when no
@@ -532,7 +545,7 @@ static bool ds4_register_p4mix_sidecar(const std::string & gguf_path,
                                ? out.layers[layer].ffn_down_exps : nullptr;
         const bool resident105 = dt && (int) dt->type == DS4_QTYPE_ROCMFP3_MIX;
         if (!resident105) {
-            if (std::fseek(f, (long) payload, SEEK_CUR) != 0) {
+            if (!ds4_seek_fwd(f, payload)) {
                 std::fprintf(stderr, "[deepseek4] p4mix seek past layer %u failed\n", layer);
                 ok = false; break;
             }
@@ -998,7 +1011,7 @@ static bool ds4_register_gumix_sidecar(const std::string & gguf_path,
         }
         const bool resident106 = gt && (int) gt->type == DS4_QTYPE_ROCMFP2_MIX;
         if (!resident106) {
-            if (std::fseek(f, (long) payload, SEEK_CUR) != 0) {
+            if (!ds4_seek_fwd(f, payload)) {
                 std::fprintf(stderr, "[deepseek4] gumix seek past layer %u surface %u failed\n",
                              layer, surface);
                 ok = false; break;

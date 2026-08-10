@@ -243,6 +243,39 @@ int main() {
     HIP_OK(cudaMemcpy(hf2.data(), d_fused, sizeof(float) * yn, cudaMemcpyDeviceToHost));
     for (size_t i = 0; i < yn; ++i) CHECK(std::memcmp(&hf[i], &hf2[i], 4) == 0);
 
+    // ---- routed-id bounds guard: invalid ids must produce exact zeros, not OOB reads ----
+    // The sync-free path reads ids[] on device with no host-side sort between routing and
+    // weights, so a sentinel (-1), a padded slot, or corrupted routing must degrade to a
+    // zero contribution. Poison the output first so "kernel skipped the write" cannot pass.
+    {
+        std::vector<int32_t> bad_ids((size_t) n_used * ntok);
+        for (size_t i = 0; i < bad_ids.size(); ++i) {
+            bad_ids[i] = (i % 2 == 0) ? -1 : (int32_t) n_experts;   // both out-of-range sides
+        }
+        HIP_OK(cudaMemcpy(d_ids, bad_ids.data(), sizeof(int32_t) * bad_ids.size(),
+                          cudaMemcpyHostToDevice));
+        std::vector<float> poison(yn, 1.0e9f);
+        HIP_OK(cudaMemcpy(d_up_out, poison.data(), sizeof(float) * yn, cudaMemcpyHostToDevice));
+        HIP_OK(cudaMemcpy(d_fused, poison.data(), sizeof(float) * yn, cudaMemcpyHostToDevice));
+        CHECK(ggml_cuda_rocmfp2_mix_mul_mat_id(d_up, d_x, d_ids, d_up_out, in, out, n_used,
+                                               ntok, 1, ids_s0, ids_s1, src1_s1, src1_s2,
+                                               dst_s1, dst_s2, nullptr));
+        CHECK(ggml_cuda_rocmfp2_mix_mul_mat_id_glu(d_up, d_gate, d_x, d_ids, d_fused,
+                                                   in, out, n_used, ntok, 1,
+                                                   ids_s0, ids_s1, src1_s1, src1_s2,
+                                                   dst_s1, dst_s2, limit, nullptr));
+        HIP_OK(cudaDeviceSynchronize());
+        std::vector<float> hz(yn), hzf(yn);
+        HIP_OK(cudaMemcpy(hz.data(), d_up_out, sizeof(float) * yn, cudaMemcpyDeviceToHost));
+        HIP_OK(cudaMemcpy(hzf.data(), d_fused, sizeof(float) * yn, cudaMemcpyDeviceToHost));
+        int nonzero = 0;
+        for (size_t i = 0; i < hz.size(); ++i) {
+            if (hz[i] != 0.0f || hzf[i] != 0.0f) nonzero++;
+        }
+        CHECK(nonzero == 0);
+    }
+
+
     // ---- REFUSALS: a half-registered or mismatched pair must NOT fuse ------------------
     ggml_cuda_rocmfp2_mix_unregister(d_gate);
     CHECK(!ggml_cuda_rocmfp2_mix_mul_mat_id_glu(d_up, d_gate, d_x, d_ids, d_fused,
@@ -267,6 +300,6 @@ int main() {
 
     if (g_fails) { std::fprintf(stderr, "%d FAILURE(S)\n", g_fails); return 1; }
     std::fprintf(stderr, "OK: fused gate/up GLU matches the unfused pair, order is respected, "
-                         "and half-registered/mismatched pairs are refused\n");
+                         "half-registered/mismatched pairs are refused, and out-of-range ids zero\n");
     return 0;
 }

@@ -58,8 +58,11 @@ inline int32_t budget_hook_apply(const std::vector<int32_t> & close_ids,
     started = true;
     inject_pos = 1;
     forced_close = true;
-    // If the model happens to have reached the boundary already emitting close[0], consume
-    // that token as the start of the sequence rather than overriding it with the same value.
+    // Unconditional override. When the model itself sampled close[0] at the boundary this is
+    // a no-op by value -- the emitted token is identical -- so "consume the model's own close
+    // token" falls out of override semantics without a comparison. forced_close still reports
+    // that the hook fired: it marks that the BUDGET decided the close happened here, which is
+    // true whether or not the model concurrently agreed.
     return close_ids.front();
 }
 
