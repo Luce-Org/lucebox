@@ -197,9 +197,11 @@ int deepseek4_previous_raw_ring_spans(
 }
 
 bool deepseek4_exact_tokenwise_uses_runtime_raw_row(
+        bool exact_prefill_stable_raw_order,
         int token_position,
         int n_swa) {
-    return n_swa > 0 && token_position >= n_swa - 1;
+    return exact_prefill_stable_raw_order && n_swa > 0 &&
+           token_position >= n_swa - 1;
 }
 
 struct DeepSeek4I32InputBinding {
@@ -5711,6 +5713,7 @@ static bool ds4_run_exact_tokenwise_prefill_attention(
         int n_tokens,
         int kv_start,
         DeepSeek4AttentionImpl attention_impl,
+        bool exact_prefill_stable_raw_order,
         std::vector<float> & attn_out_host,
         DeepSeek4CachedLayerAlloc & attn_alloc,
         DeepSeek4StepTelemetry * telemetry) {
@@ -5740,7 +5743,7 @@ static bool ds4_run_exact_tokenwise_prefill_attention(
         DeepSeek4AttentionGraphInputs stable_inputs{};
         const int token_position = kv_start + ti;
         if (deepseek4_exact_tokenwise_uses_runtime_raw_row(
-                token_position, w.n_swa)) {
+                exact_prefill_stable_raw_order, token_position, w.n_swa)) {
             stable_inputs.raw_kv_rows =
                 ggml_new_tensor_2d(ctx, GGML_TYPE_I64, 1, 1);
             ggml_set_input(stable_inputs.raw_kv_rows);
@@ -6694,7 +6697,8 @@ bool deepseek4_step_layer_range(
         MoeHybridStorage * moe_hybrid,
         MoeExpertComputeRuntime * expert_runtime,
         MoeHybridRoutingStats * routing_stats,
-        bool execute_output_path) {
+        bool execute_output_path,
+        bool exact_prefill_stable_raw_order) {
     const auto step_t0 = Ds4TimingClock::now();
 
     if (!deepseek4_cuda_hc_set_device(device)) {
@@ -6817,7 +6821,8 @@ bool deepseek4_step_layer_range(
                     token_ids ? token_ids + off : nullptr,
                     telemetry, allow_decode_graph_reuse, chunk_hooks_ptr,
                     moe_hybrid, expert_runtime, routing_stats,
-                    chunk_intent.execute_output_path)) {
+                    chunk_intent.execute_output_path,
+                    exact_prefill_stable_raw_order)) {
                 return false;
             }
             hc_all.insert(hc_all.end(), chunk_hc.begin(), chunk_hc.end());
@@ -7287,7 +7292,8 @@ bool deepseek4_step_layer_range(
                         : DeepSeek4AttentionImpl::Explicit;
                 if (!ds4_run_exact_tokenwise_prefill_attention(
                         backend, w, L, lc, il, cur.data(), n_tokens, kv_start,
-                        attention_impl, attn_out_host,
+                        attention_impl, exact_prefill_stable_raw_order,
+                        attn_out_host,
                         cached_attn_allocs[(size_t) il], telemetry)) {
                     return false;
                 }

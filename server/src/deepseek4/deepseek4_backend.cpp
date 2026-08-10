@@ -1589,7 +1589,8 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                 /*allow_decode_graph_reuse=*/true, hp,
                 moe_hybrid_.get(),
                 expert_runtime_.compute ? &expert_runtime_ : nullptr,
-                routing_stats_.get(), output_intent.execute_output_path);
+                routing_stats_.get(), output_intent.execute_output_path,
+                exact_bands_active);
         } else if (moe_hybrid_) {
             ok = deepseek4_step(backend_, cfg_.device.gpu, w_, cache_, embed.data(), n_tok, pos, logits,
                                 moe_hybrid_.get(), tokens.data() + i,
@@ -1606,7 +1607,8 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                 cfg_.prefill_mode != PrefillAttentionMode::Sparse, hp,
                 /*moe_hybrid=*/nullptr, /*expert_runtime=*/nullptr,
                 /*routing_stats=*/nullptr,
-                output_intent.execute_output_path);
+                output_intent.execute_output_path,
+                exact_bands_active);
         }
         if (ok && hp && !spec_cap.empty()) {
             const int feat_row = spec_drafter_->n_target_layers * w_.n_embd;

@@ -1123,11 +1123,15 @@ static void test_raw_ring_spans_after_wrap() {
     TEST_ASSERT(spans[1].count == 2);
     TEST_ASSERT(spans[0].count + spans[1].count == 7);
 
-    TEST_ASSERT(!deepseek4_exact_tokenwise_uses_runtime_raw_row(-1, 8));
-    TEST_ASSERT(!deepseek4_exact_tokenwise_uses_runtime_raw_row(6, 8));
-    TEST_ASSERT(deepseek4_exact_tokenwise_uses_runtime_raw_row(7, 8));
-    TEST_ASSERT(deepseek4_exact_tokenwise_uses_runtime_raw_row(8, 8));
-    TEST_ASSERT(!deepseek4_exact_tokenwise_uses_runtime_raw_row(8, 0));
+    TEST_ASSERT(!deepseek4_exact_tokenwise_uses_runtime_raw_row(true, -1, 8));
+    TEST_ASSERT(!deepseek4_exact_tokenwise_uses_runtime_raw_row(true, 6, 8));
+    TEST_ASSERT(deepseek4_exact_tokenwise_uses_runtime_raw_row(true, 7, 8));
+    TEST_ASSERT(deepseek4_exact_tokenwise_uses_runtime_raw_row(true, 8, 8));
+    TEST_ASSERT(!deepseek4_exact_tokenwise_uses_runtime_raw_row(true, 8, 0));
+    // Default dynamic speculative verification is exact multi-token work too,
+    // but it must preserve its historical chronological-span topology.
+    TEST_ASSERT(!deepseek4_exact_tokenwise_uses_runtime_raw_row(false, 7, 8));
+    TEST_ASSERT(!deepseek4_exact_tokenwise_uses_runtime_raw_row(false, 8, 8));
 
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
