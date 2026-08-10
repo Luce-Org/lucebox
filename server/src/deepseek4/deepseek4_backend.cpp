@@ -1115,21 +1115,30 @@ bool DeepSeek4Backend::init_hybrid_model() {
             { L.ffn_down_exps, GGML_TYPE_Q3_1_ROCMFP3_MIX, "qtype-105 (mixed ROCmFP3) down" },
             { L.ffn_gate_exps, GGML_TYPE_Q2_1_ROCMFP2_MIX, "qtype-106 (mixed ROCmFP2) gate" },
             { L.ffn_up_exps,   GGML_TYPE_Q2_1_ROCMFP2_MIX, "qtype-106 (mixed ROCmFP2) up"   },
+            { L.ffn_down_exps, GGML_TYPE_Q2_1_ROCMFP2_MIX, "qtype-106 (mixed ROCmFP2) down" },
         };
         for (const auto & m : mix_experts) {
             if (!m.t || m.t->type != m.qtype) {
                 continue;
             }
+            // Mix qtypes decode only from registered resident tensors, so a
+            // cold-slice placement can never serve them. But refusing outright
+            // is wrong when the MONOLITHIC footprint fits the device -- the
+            // 2.5-3.5 bpw mix formats exist precisely so the whole file fits
+            // where a hybrid split of a larger quant was needed. Mirror the
+            // all-hot branch above: drop the partial load and attempt the full
+            // load, failing with the allocator's error if it does not fit.
             std::fprintf(stderr,
-                "[deepseek4] %s experts require monolithic "
-                "residency — hybrid/cold expert placement cannot decode them. "
-                "Enable fused decode or provide enough VRAM to keep all experts "
-                "resident.\n", m.what);
-            // Release the weights this hybrid attempt already loaded before
-            // bailing, so w_ is left empty rather than holding a live context +
-            // GPU buffer on the failure path.
+                "[deepseek4] %s experts cannot decode from hybrid/cold "
+                "placement; falling back to monolithic full load\n", m.what);
             free_deepseek4_weights(w_);
-            return false;
+            if (!load_deepseek4_gguf(cfg_.model_path, backend_, w_)) {
+                std::fprintf(stderr,
+                    "[deepseek4] monolithic fallback failed (model does not "
+                    "fit resident): %s\n", cfg_.model_path);
+                return false;
+            }
+            return true;
         }
     }
 

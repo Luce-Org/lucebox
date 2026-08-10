@@ -897,7 +897,7 @@ static bool ds4_register_dmix_sidecar(const std::string & gguf_path,
 
 constexpr uint32_t DS4_GUMIX_C        = 2;   // codebooks per expert
 constexpr uint32_t DS4_GUMIX_K        = 4;   // levels per codebook (2-bit codes)
-constexpr uint32_t DS4_GUMIX_SURFACES = 2;   // 0 = gate, 1 = up
+constexpr uint32_t DS4_GUMIX_SURFACES = 3;   // 0 = gate, 1 = up, 2 = down
 constexpr uint32_t DS4_GUMIX_QK       = 32;  // MIX_QK block width (rocmfp2_mix.cu)
 
 static bool ds4_register_gumix_sidecar(const std::string & gguf_path,
@@ -906,11 +906,12 @@ static bool ds4_register_gumix_sidecar(const std::string & gguf_path,
     // required[layer][surface]: a qtype-106 gate/up expert resident on this shard.
     const size_t n_layers_out = out.layers.size();
     std::vector<std::array<bool, DS4_GUMIX_SURFACES>> required(
-        n_layers_out, std::array<bool, DS4_GUMIX_SURFACES>{false, false});
+        n_layers_out, std::array<bool, DS4_GUMIX_SURFACES>{false, false, false});
     int n_qtype106 = 0;
     for (size_t li = 0; li < n_layers_out; ++li) {
         const ggml_tensor * ts[DS4_GUMIX_SURFACES] = {
-            out.layers[li].ffn_gate_exps, out.layers[li].ffn_up_exps };
+            out.layers[li].ffn_gate_exps, out.layers[li].ffn_up_exps,
+            out.layers[li].ffn_down_exps };
         for (uint32_t s = 0; s < DS4_GUMIX_SURFACES; ++s) {
             if (ts[s] && (int) ts[s]->type == DS4_QTYPE_ROCMFP2_MIX) {
                 required[li][s] = true; n_qtype106++;
@@ -950,7 +951,7 @@ static bool ds4_register_gumix_sidecar(const std::string & gguf_path,
     (void) reserved;
 
     std::vector<std::array<bool, DS4_GUMIX_SURFACES>> done(
-        n_layers_out, std::array<bool, DS4_GUMIX_SURFACES>{false, false});
+        n_layers_out, std::array<bool, DS4_GUMIX_SURFACES>{false, false, false});
     std::vector<const void *> registered_bases;
     bool ok = true;
     for (uint32_t i = 0; i < n_entries && ok; i++) {
@@ -992,7 +993,8 @@ static bool ds4_register_gumix_sidecar(const std::string & gguf_path,
         ggml_tensor * gt = nullptr;
         if (layer < n_layers_out) {
             gt = (surface == 0) ? out.layers[layer].ffn_gate_exps
-                                : out.layers[layer].ffn_up_exps;
+               : (surface == 1) ? out.layers[layer].ffn_up_exps
+                                : out.layers[layer].ffn_down_exps;
         }
         const bool resident106 = gt && (int) gt->type == DS4_QTYPE_ROCMFP2_MIX;
         if (!resident106) {
@@ -1064,7 +1066,7 @@ static bool ds4_register_gumix_sidecar(const std::string & gguf_path,
                 if (required[li][s] && !done[li][s]) {
                     std::fprintf(stderr, "[deepseek4] gumix sidecar missing resident qtype-106 "
                                  "layer %zu %s; refusing to load\n",
-                                 li, s == 0 ? "gate" : "up");
+                                 li, s == 0 ? "gate" : s == 1 ? "up" : "down");
                     ok = false; break;
                 }
             }
@@ -1894,7 +1896,8 @@ void free_deepseek4_weights(DeepSeek4Weights & w) {
     // that unregister can free per entry without double-freeing. Dropping only one
     // half would still leak the other's codebooks and leave a stale range behind.
     for (auto & L : w.layers) {
-        ggml_tensor * const gu[2] = { L.ffn_gate_exps, L.ffn_up_exps };
+        ggml_tensor * const gu[3] = { L.ffn_gate_exps, L.ffn_up_exps,
+                                      L.ffn_down_exps };
         for (ggml_tensor * t : gu) {
             if (t && t->type == GGML_TYPE_Q2_1_ROCMFP2_MIX && t->data) {
                 ggml_cuda_rocmfp2_mix_unregister(t->data);
