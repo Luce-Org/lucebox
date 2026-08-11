@@ -8589,7 +8589,7 @@ struct ggml_tensor * ggml_ds4_indexer_qat(
     return result;
 }
 
-struct ggml_tensor * ggml_ds4_indexer_score(
+struct ggml_tensor * ggml_ds4_indexer_score_masked(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
         struct ggml_tensor  * head_weights,
@@ -8624,6 +8624,17 @@ struct ggml_tensor * ggml_ds4_indexer_score(
     ggml_set_op_params_i32(result, 0, kv_start);
     ggml_set_op_params_i32(result, 1, ratio);
     return result;
+}
+
+struct ggml_tensor * ggml_ds4_indexer_score(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * head_weights,
+        struct ggml_tensor  * index_comp,
+        int                   kv_start,
+        int                   ratio) {
+    return ggml_ds4_indexer_score_masked(
+        ctx, q, head_weights, index_comp, NULL, kv_start, ratio);
 }
 
 struct ggml_tensor * ggml_ds4_indexer_mask(

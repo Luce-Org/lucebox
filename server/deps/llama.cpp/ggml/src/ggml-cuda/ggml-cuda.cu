@@ -2612,11 +2612,6 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     return use_mul_mat_vec_q;
 }
 
-// The registry-aware mix kernels are laid out over grid.z, so a speculative
-// verification batch is as stream-sync-free as ordinary single-token decode.
-// Keep this aligned with DeepSeek4's maximum speculative verification width.
-static constexpr int DS4_MIX_MMV_MAX_TOKENS = 4;
-
 // Execute an unbiased gate/up GLU while retaining the caller's existing
 // output tensors. Vector kernels write the GLU directly. Large routed-expert
 // MMQ keeps both ordinary matmul writes (and therefore numerical behavior),
@@ -2709,7 +2704,7 @@ static bool ggml_cuda_try_fuse_mul_mat_glu(
     // fusing across two different mul_mat_ids would read one expert's rows with the other's
     // routing. Each launcher additionally returns false unless BOTH halves are registered,
     // so a partial registration keeps the correct unfused path.
-    if (src1->ne[2] <= DS4_MIX_MMV_MAX_TOKENS &&
+    if (src1->ne[2] <= GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS &&
             ggml_cuda_ds4_mix_glu_fusable(gate, up, glu, direct_vector_layout)) {
         const float limit = ggml_get_op_params_f32(glu, 2);
         // dst is the GLU tensor: the fused kernel writes the SwiGLU result straight there and
@@ -3019,7 +3014,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // Kept in sync with the [TAG_MUL_MAT_ID_CUDA_GRAPHS] usability check below.
     if (src0->type == GGML_TYPE_Q3_1_ROCMFP3_MIX
             && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
-            && ne12 <= DS4_MIX_MMV_MAX_TOKENS
+            && ne12 <= GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS
             && ggml_cuda_rocmfp3_mix_mul_mat_id(
                 src0->data, (const float *) src1->data, (const int32_t *) ids->data,
                 (float *) dst->data, (int) ne00, (int) ne01, (int) ids->ne[0],
@@ -3033,7 +3028,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     if (src0->type == GGML_TYPE_Q2_1_ROCMFP2_MIX
             && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
-            && ne12 <= DS4_MIX_MMV_MAX_TOKENS
+            && ne12 <= GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS
             && ggml_cuda_rocmfp2_mix_mul_mat_id(
                 src0->data, (const float *) src1->data, (const int32_t *) ids->data,
                 (float *) dst->data, (int) ne00, (int) ne01, (int) ids->ne[0],
@@ -3845,7 +3840,7 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             const bool mmid_rocmfp3_ok =
                 (is_mmid_105 || is_mmid_106) &&
                 node->src[1]->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 &&
-                node->src[1]->ne[2] <= DS4_MIX_MMV_MAX_TOKENS &&
+                node->src[1]->ne[2] <= GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS &&
                 (is_mmid_105 ? ggml_cuda_rocmfp3_mix_registered(node->src[0]->data)
                              : ggml_cuda_rocmfp2_mix_registered(node->src[0]->data));
             if (mmid_telemetry) {

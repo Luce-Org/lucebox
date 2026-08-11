@@ -29,6 +29,7 @@
 
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "ggml-cuda.h"
 #include "ggml-cpu.h"
 
 #include <algorithm>
@@ -721,10 +722,14 @@ bool run_deepseek4_dspark_spec_decode(
     // Full snapshots change rollback strategy but not the compressor-window
     // limit below. The legacy sequential measurement path is validated only
     // through q=4.
-    int q_cap = full_snap ? block + 1 : 4;
+    int q_cap = full_snap ? block + 1
+                          : GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS;
     if (const char * qs = std::getenv("DFLASH_DS4_SPEC_Q")) {
         const int v = std::atoi(qs);
-        if (v >= 2 && v <= block + 1) q_cap = full_snap ? v : std::min(v, 4);
+        if (v >= 2 && v <= block + 1) {
+            q_cap = full_snap
+                ? v : std::min(v, GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS);
+        }
     }
     if (std::FILE * qf = std::fopen("/tmp/ds4_spec_q", "r")) {
         // Per-request override for perf experiments (no server restart needed).
@@ -732,16 +737,19 @@ bool run_deepseek4_dspark_spec_decode(
         // (diagnoses batched-vs-sequential target divergence).
         int v = 0;
         if (std::fscanf(qf, "%d", &v) == 1 && v >= 1 && v <= block + 1) {
-            q_cap = full_snap ? v : std::min(v, 4);
+            q_cap = full_snap
+                ? v : std::min(v, GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS);
         }
         std::fclose(qf);
     }
-    if (seq_verify_mode && q_cap > 4) {
+    if (seq_verify_mode &&
+        q_cap > GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS) {
         std::fprintf(stderr,
-                     "[ds4-spec] sequential verify supports q<=4; "
-                     "capping requested q=%d to 4\n",
-                     q_cap);
-        q_cap = 4;
+                     "[ds4-spec] sequential verify supports q<=%d; "
+                     "capping requested q=%d to %d\n",
+                     GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS, q_cap,
+                     GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS);
+        q_cap = GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS;
     }
 
     // Snapshot backend for the legacy full-snapshot rollback path.

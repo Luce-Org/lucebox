@@ -1018,6 +1018,8 @@ static int ds4_try_fused_verify_step(
         MoeHybridRoutingStats * routing_stats) {
     if (vc.disabled || mc.disabled) return 0;
     if (!hooks || !hooks->capture_layer_ids) return 0;
+    if (n_tokens < 1 ||
+        n_tokens > GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS) return 0;
     if (!hc_out_weights.loaded || hc_out_weights.scale_data.empty() ||
         !w.output_hc_fn || !w.output_hc_base) { vc.disabled = true; return 0; }
     for (int il = 0; il < w.n_layer; ++il) {

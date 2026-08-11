@@ -6,6 +6,10 @@
 #include "rocmfp3_mix.cuh"
 
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
+    const bool is_mix_type =
+        args.type_x == GGML_TYPE_Q2_1_ROCMFP2_MIX ||
+        args.type_x == GGML_TYPE_Q3_1_ROCMFP3_MIX;
+    GGML_ASSERT(!is_mix_type || (args.mix_codebooks && args.mix_modes));
     switch (args.type_x) {
         case GGML_TYPE_Q4_0:
             mul_mat_q_case<GGML_TYPE_Q4_0>(ctx, args, stream);
@@ -444,9 +448,19 @@ void ggml_cuda_op_mul_mat_q(
     const bool use_stream_k = ((GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA)
                             || GGML_CUDA_CC_IS_CDNA(cc))
                             && src1_ncols == ne11;
+    const void * mix_codebooks_raw = nullptr;
+    const uint8_t * mix_modes = nullptr;
+    if (src0->type == GGML_TYPE_Q2_1_ROCMFP2_MIX) {
+        GGML_ASSERT(ggml_cuda_rocmfp2_mix_mmq_info(
+            src0_dd_i, &mix_codebooks_raw, &mix_modes));
+    } else if (src0->type == GGML_TYPE_Q3_1_ROCMFP3_MIX) {
+        GGML_ASSERT(ggml_cuda_rocmfp3_mix_mmq_info(
+            src0_dd_i, &mix_codebooks_raw, &mix_modes));
+    }
     const mmq_args args = {
         src0_dd_i, src0->type, (const int *) src1_ddq_i, nullptr, nullptr,
-        nullptr, nullptr, dst_dd_i,
+        reinterpret_cast<const nv_bfloat16 *>(mix_codebooks_raw), mix_modes,
+        dst_dd_i,
         ne00, row_diff, src1_ncols, stride01, ne11, nrows_dst,
         1, 1, 0, 0, 0,
         1, 1, 0, 0, 0,

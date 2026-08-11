@@ -1488,7 +1488,7 @@ static ggml_tensor * build_indexer_topk(
     // eliminating the old 16-token tile's 15/16 wasted work at n_scored=1.
     // A live visibility mask also makes padded decode graphs safe to replay as
     // compressed rows are appended within the padding stride.
-    ggml_tensor * scores = ggml_ds4_indexer_score(
+    ggml_tensor * scores = ggml_ds4_indexer_score_masked(
         ctx, index_q, head_weights, comp, visibility_mask,
         kv_start + first_scored, 4);
     ggml_tensor * selected = ggml_top_k(
@@ -1757,6 +1757,13 @@ static ggml_tensor * build_mla_attention(
         ratio == 4 && f32_array_inputs) {
         const int n_index_comp_live = ds4_comp_rows_used(
             lc.index_comp_kv, lc.n_index_comp, 4, token_pos);
+        // Attention and index compression advance together at ratio 4. Reusing
+        // the attention mask is safe only while that invariant and the index
+        // buffer capacity hold; fail at graph construction if state diverges.
+        GGML_ASSERT(lc.index_comp_kv && index_comp_kv_source);
+        GGML_ASSERT(n_index_comp_live == n_comp_live);
+        GGML_ASSERT(!masked_kv ||
+                    cached_inputs->padded_comp <= lc.index_comp_kv->ne[1]);
         // Use the same padded span as attention in a replayable decode graph.
         // The dynamic compressed portion of attn_row_mask is added to the
         // indexer scores, so padding stays invisible while live rows can grow
@@ -5143,7 +5150,6 @@ static bool ds4_build_fused_decode_graph(
         std::vector<DeepSeek4I64ArrayBinding> i64ab;
         std::vector<DeepSeek4F32ArrayBinding> f32ab;
         const bool sparse_decode_flash =
-            cache.prefill_mode == PrefillAttentionMode::Sparse &&
             ds4_env_flag("DFLASH_DS4_SPARSE_DECODE_FLASH");
         const DeepSeek4AttentionImpl attention_impl = sparse_decode_flash
             ? DeepSeek4AttentionImpl::SparseFlash
@@ -6659,7 +6665,8 @@ bool deepseek4_step_layer_range(
         moe_hybrid->cold_backend && moe_hybrid->cold_backend != backend;
     const bool fused_verify_candidate =
         (!moe_hybrid || fused_hybrid_ready) &&
-        n_tokens >= 2 && n_tokens <= 4 && verify_hooks &&
+        n_tokens >= 2 &&
+        n_tokens <= GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS && verify_hooks &&
         layer_begin == 0 && is_last_shard && out_logits &&
         ds4_backend_is_gpu(backend) && ds4_fused_verify_enabled();
     const bool heterogeneous_sparse_prefill =
@@ -6904,7 +6911,8 @@ bool deepseek4_step_layer_range(
         (fused_hybrid_decode && !verify_hooks)
             ? &fused_hybrid_decode_hooks : verify_hooks;
     if ((!moe_hybrid || fused_hybrid_ready) &&
-        ((n_tokens >= 2 && n_tokens <= 4 && verify_hooks) ||
+        ((n_tokens >= 2 &&
+          n_tokens <= GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS && verify_hooks) ||
          fused_hybrid_decode) &&
         layer_begin == 0 && is_last_shard &&
         out_logits && ds4_backend_is_gpu(backend) && ds4_fused_verify_enabled()) {

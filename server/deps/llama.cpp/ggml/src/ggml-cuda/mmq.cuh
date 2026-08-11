@@ -4322,7 +4322,7 @@ static __global__ void mul_mat_q(
         mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
              tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z,
-             mix_codebooks, mix_modes, zt);
+             mix_codebooks, mix_modes, fastdiv(zt, channel_ratio));
         return;
     }
 #endif // (defined(GGML_USE_HIP) && !defined(CDNA4) && !defined(CDNA3)) || __CUDA_ARCH__ < GGML_CUDA_CC_VOLTA
@@ -4403,7 +4403,7 @@ static __global__ void mul_mat_q(
         mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
              tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop,
-             mix_codebooks, mix_modes, zt);
+             mix_codebooks, mix_modes, fastdiv(zt, channel_ratio));
 
         kbc += blocks_per_ne00.z;
         kbc -= fastmodulo(kbc, blocks_per_ne00);
@@ -4473,7 +4473,7 @@ static __global__ void mul_mat_q(
     mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
         (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
          tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop,
-         mix_codebooks, mix_modes, zt);
+         mix_codebooks, mix_modes, fastdiv(zt, channel_ratio));
 }
 
 template <ggml_type type, int mmq_x, bool need_check>

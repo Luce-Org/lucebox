@@ -2645,6 +2645,16 @@ extern "C" {
             struct ggml_tensor  * q,
             struct ggml_tensor  * head_weights,
             struct ggml_tensor  * index_comp,
+            int                   kv_start,
+            int                   ratio);
+
+    // Masked variant for stable-shape decode graphs. visibility_mask is F32
+    // [n_comp,n_tokens], with values <= -1e20 marking rows as invisible.
+    GGML_API struct ggml_tensor * ggml_ds4_indexer_score_masked(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * head_weights,
+            struct ggml_tensor  * index_comp,
             struct ggml_tensor  * visibility_mask,
             int                   kv_start,
             int                   ratio);

@@ -19,6 +19,10 @@ extern "C" {
 #endif
 #define GGML_CUDA_MAX_DEVICES       16
 
+// Maximum token width handled by the registry-aware DS4 mixed-weight MMV
+// kernels. DeepSeek4's fused verifier uses the same limit before graph build.
+#define GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS 4
+
 // backend API
 GGML_BACKEND_API ggml_backend_t ggml_backend_cuda_init(int device);
 
