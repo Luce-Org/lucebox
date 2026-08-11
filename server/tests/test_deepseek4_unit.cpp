@@ -1136,6 +1136,18 @@ static void test_raw_ring_spans_after_wrap() {
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
+static void test_exact_prefill_hybrid_ffn_sub_batch() {
+    std::fprintf(stderr, "  test_exact_prefill_hybrid_ffn_sub_batch ...");
+    // Exact q4 keeps prompt geometry but evaluates independent hybrid-FFN
+    // owner rows as q3+q1. Every non-exact caller retains its prior q4 batch.
+    TEST_ASSERT(deepseek4_exact_prefill_hybrid_ffn_sub_batch(true, 4) == 3);
+    TEST_ASSERT(deepseek4_exact_prefill_hybrid_ffn_sub_batch(true, 3) == 3);
+    TEST_ASSERT(deepseek4_exact_prefill_hybrid_ffn_sub_batch(true, 1) == 1);
+    TEST_ASSERT(deepseek4_exact_prefill_hybrid_ffn_sub_batch(false, 4) == 4);
+    TEST_ASSERT(deepseek4_exact_prefill_hybrid_ffn_sub_batch(false, 5) == 5);
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
 struct ScopedEnvVar {
     explicit ScopedEnvVar(const char * name)
         : name(name ? name : ""),
@@ -3969,6 +3981,7 @@ int main() {
     test_indexer_mask_cpu(backend);
     test_hash_routing_lookup();
     test_raw_ring_spans_after_wrap();
+    test_exact_prefill_hybrid_ffn_sub_batch();
     test_auto_split_computation();
     test_layer_range_validation();
     test_hc_state_dimensions();

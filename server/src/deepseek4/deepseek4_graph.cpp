@@ -204,6 +204,15 @@ bool deepseek4_exact_tokenwise_uses_runtime_raw_row(
            token_position >= n_swa - 1;
 }
 
+int deepseek4_exact_prefill_hybrid_ffn_sub_batch(
+        bool exact_prefill_q1_ffn_order,
+        int n_tokens) {
+    // q=1..3 use the same reduced-stack MMVQ reduction order on gfx1151.
+    // Exactly four rows select a different kernel topology, so retain q=4
+    // prompt geometry while evaluating its independent FFN rows as q=3+q=1.
+    return exact_prefill_q1_ffn_order && n_tokens == 4 ? 3 : n_tokens;
+}
+
 struct DeepSeek4I32InputBinding {
     ggml_tensor * tensor = nullptr;
     int32_t       value  = 0;
@@ -5437,6 +5446,7 @@ static bool eval_ds4_layer_range_hybrid_ffn(
         MoeHybridRoutingStats * routing_stats,
         std::vector<float> & out,
         DeepSeek4StepTelemetry * telemetry,
+        bool exact_prefill_q1_ffn_order,
         const MoeHybridDeviceOutputs * device_outputs = nullptr) {
     const bool trace_prefill = ds4_env_flag("DFLASH_DS4_PREFILL_TRACE");
     if (trace_prefill) {
@@ -5679,16 +5689,48 @@ static bool eval_ds4_layer_range_hybrid_ffn(
                      layer);
     }
     const auto owners_t0 = Ds4TimingClock::now();
-    const bool ok = eval_ds4_hybrid(
-        backend, hybrid.cpu_backend, cfg, desc, &hybrid,
-        hybrid.layers[(size_t)layer], nullptr,
-        layer, n_embd, route_width,
-        device_ffn_input ? nullptr : normed_host.data(),
-        selected.data(), weights.data(),
-        n_tokens, out, hot_alloc, cold_alloc,
-        expert_compute, expert_layer, telemetry,
-        device_ffn_input ? normed : nullptr,
-        device_ffn_input ? device_outputs : nullptr);
+    const int owner_sub_batch =
+        deepseek4_exact_prefill_hybrid_ffn_sub_batch(
+            exact_prefill_q1_ffn_order, n_tokens);
+    bool ok = true;
+    if (owner_sub_batch > 0 && owner_sub_batch < n_tokens) {
+        out.resize((size_t)n_embd * (size_t)n_tokens);
+        std::vector<float> sub_out;
+        for (int token_begin = 0; token_begin < n_tokens;
+             token_begin += owner_sub_batch) {
+            const int token_count =
+                std::min(owner_sub_batch, n_tokens - token_begin);
+            ok = eval_ds4_hybrid(
+                backend, hybrid.cpu_backend, cfg, desc, &hybrid,
+                hybrid.layers[(size_t)layer], nullptr,
+                layer, n_embd, route_width,
+                normed_host.data() + (size_t)token_begin * (size_t)n_embd,
+                selected.data() + (size_t)token_begin * (size_t)route_width,
+                weights.data() + (size_t)token_begin * (size_t)route_width,
+                token_count, sub_out, /*hot_alloc=*/nullptr,
+                /*cold_alloc=*/nullptr, expert_compute, expert_layer,
+                telemetry);
+            if (!ok || sub_out.size() !=
+                    (size_t)n_embd * (size_t)token_count) {
+                ok = false;
+                break;
+            }
+            std::memcpy(
+                out.data() + (size_t)token_begin * (size_t)n_embd,
+                sub_out.data(), sizeof(float) * sub_out.size());
+        }
+    } else {
+        ok = eval_ds4_hybrid(
+            backend, hybrid.cpu_backend, cfg, desc, &hybrid,
+            hybrid.layers[(size_t)layer], nullptr,
+            layer, n_embd, route_width,
+            device_ffn_input ? nullptr : normed_host.data(),
+            selected.data(), weights.data(),
+            n_tokens, out, hot_alloc, cold_alloc,
+            expert_compute, expert_layer, telemetry,
+            device_ffn_input ? normed : nullptr,
+            device_ffn_input ? device_outputs : nullptr);
+    }
     if (trace_prefill) {
         std::fprintf(stderr,
                      "[deepseek4-prefill-trace] layer=%d expert owners=%s "
@@ -6698,7 +6740,8 @@ bool deepseek4_step_layer_range(
         MoeExpertComputeRuntime * expert_runtime,
         MoeHybridRoutingStats * routing_stats,
         bool execute_output_path,
-        bool exact_prefill_stable_raw_order) {
+        bool exact_prefill_stable_raw_order,
+        bool exact_prefill_q1_ffn_order) {
     const auto step_t0 = Ds4TimingClock::now();
 
     if (!deepseek4_cuda_hc_set_device(device)) {
@@ -6822,7 +6865,8 @@ bool deepseek4_step_layer_range(
                     telemetry, allow_decode_graph_reuse, chunk_hooks_ptr,
                     moe_hybrid, expert_runtime, routing_stats,
                     chunk_intent.execute_output_path,
-                    exact_prefill_stable_raw_order)) {
+                    exact_prefill_stable_raw_order,
+                    exact_prefill_q1_ffn_order)) {
                 return false;
             }
             hc_all.insert(hc_all.end(), chunk_hc.begin(), chunk_hc.end());
@@ -7680,6 +7724,7 @@ bool deepseek4_step_layer_range(
                         token_ids, hash_routing_tables_range[(size_t)il],
                         *moe_hybrid, expert_runtime, routing_stats,
                         ffn_out_host, telemetry,
+                        exact_prefill_q1_ffn_order,
                         ffn_device_join ? &owner_outputs : nullptr)) {
                     std::fprintf(stderr,
                                  "[deepseek4-moe-tp] layer-range FFN failed layer %d\n",

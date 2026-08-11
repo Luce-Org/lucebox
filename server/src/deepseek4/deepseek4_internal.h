@@ -343,6 +343,14 @@ bool deepseek4_exact_tokenwise_uses_runtime_raw_row(
     bool exact_prefill_stable_raw_order,
     int token_position,
     int n_swa);
+
+// Exact q=4 prefill must retain the q<=3 owner-kernel reduction order. The
+// four-row dual-owner hybrid FFN path is numerically different from q=1 on the
+// production target.
+// Return the largest owner sub-batch allowed for this production intent.
+int deepseek4_exact_prefill_hybrid_ffn_sub_batch(
+    bool exact_prefill_q1_ffn_order,
+    int n_tokens);
 bool deepseek4_snapshot_save(const DeepSeek4Cache & cache,
                              ggml_backend_t snapshot_backend,
                              DeepSeek4Snapshot & out);
@@ -497,7 +505,8 @@ bool deepseek4_step_layer_range(
     MoeExpertComputeRuntime *   expert_runtime = nullptr,
     MoeHybridRoutingStats *     routing_stats = nullptr,
     bool                        execute_output_path = false,
-    bool                        exact_prefill_stable_raw_order = false);
+    bool                        exact_prefill_stable_raw_order = false,
+    bool                        exact_prefill_q1_ffn_order = false);
 
 bool build_deepseek4_moe_hybrid_storage_from_file(
     const std::string &         path,
