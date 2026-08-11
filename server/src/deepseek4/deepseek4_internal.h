@@ -351,6 +351,8 @@ bool deepseek4_exact_tokenwise_uses_runtime_raw_row(
 int deepseek4_exact_prefill_hybrid_ffn_sub_batch(
     bool exact_prefill_q1_ffn_order,
     int n_tokens);
+bool deepseek4_exact_prefill_route_graph_requires_eager(
+    bool exact_prefill_q1_ffn_order);
 bool deepseek4_snapshot_save(const DeepSeek4Cache & cache,
                              ggml_backend_t snapshot_backend,
                              DeepSeek4Snapshot & out);

@@ -213,6 +213,11 @@ int deepseek4_exact_prefill_hybrid_ffn_sub_batch(
     return exact_prefill_q1_ffn_order && n_tokens == 4 ? 3 : n_tokens;
 }
 
+bool deepseek4_exact_prefill_route_graph_requires_eager(
+        bool exact_prefill_q1_ffn_order) {
+    return exact_prefill_q1_ffn_order;
+}
+
 struct DeepSeek4I32InputBinding {
     ggml_tensor * tensor = nullptr;
     int32_t       value  = 0;
@@ -5565,8 +5570,19 @@ static bool eval_ds4_layer_range_hybrid_ffn(
                                 sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
     }
     const auto route_compute_t0 = Ds4TimingClock::now();
-    const bool route_ok =
-        ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
+    bool route_ok = false;
+    {
+        // This graph is rebuilt in temporary metadata for every exact-band
+        // step. Do not leave a native executable keyed to metadata that is
+        // immediately freed and may be recycled by a persistent owner graph.
+        // The scope ends before owner evaluation, so its stable graphs retain
+        // their normal replay behavior.
+        ScopedCudaGraphOverrides route_graph_scope(
+            deepseek4_exact_prefill_route_graph_requires_eager(
+                exact_prefill_q1_ffn_order));
+        route_ok =
+            ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
+    }
     if (trace_prefill) {
         std::fprintf(stderr,
                      "[deepseek4-prefill-trace] layer=%d ffn route compute=%s\n",

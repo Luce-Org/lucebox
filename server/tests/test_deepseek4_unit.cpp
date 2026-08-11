@@ -1145,6 +1145,8 @@ static void test_exact_prefill_hybrid_ffn_sub_batch() {
     TEST_ASSERT(deepseek4_exact_prefill_hybrid_ffn_sub_batch(true, 1) == 1);
     TEST_ASSERT(deepseek4_exact_prefill_hybrid_ffn_sub_batch(false, 4) == 4);
     TEST_ASSERT(deepseek4_exact_prefill_hybrid_ffn_sub_batch(false, 5) == 5);
+    TEST_ASSERT(deepseek4_exact_prefill_route_graph_requires_eager(true));
+    TEST_ASSERT(!deepseek4_exact_prefill_route_graph_requires_eager(false));
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
