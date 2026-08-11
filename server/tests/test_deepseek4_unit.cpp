@@ -14,6 +14,7 @@
 #include "common/layer_split_runtime.h"
 #include "common/layer_split_utils.h"
 #include "deepseek4/deepseek4_dspark.h"
+#include "deepseek4/deepseek4_exact_trace.h"
 
 #include <memory>
 #include <random>
@@ -28,6 +29,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <iterator>
 #include <numeric>
 #include <sys/stat.h>
 #include <thread>
@@ -80,6 +82,12 @@ static double elapsed_ms(TestClock::time_point t0, TestClock::time_point t1) {
     return std::chrono::duration<double, std::milli>(t1 - t0).count();
 }
 
+static void test_exact_trace_hash_is_deterministic() {
+    const char input[] = "abc";
+    TEST_ASSERT(DeepSeek4ExactTraceWriter::hash_bytes(input, 3) ==
+                "e71fa2190541574b");
+}
+
 struct DeepSeek4FixtureOptions {
     bool include_vocab_size = true;
     uint32_t vocab_size = 128;
@@ -97,6 +105,74 @@ static std::string make_temp_gguf_path(const char * prefix) {
         unlink(path);
     }
     return std::string(path) + "-" + prefix + ".gguf";
+}
+
+static void test_exact_trace_serializes_interior_prompt_step() {
+    char path[] = "/tmp/deepseek4-exact-trace-XXXXXX";
+    const int fd = mkstemp(path);
+    TEST_ASSERT(fd >= 0);
+    if (fd < 0) return;
+    close(fd);
+    unlink(path);
+
+    const char * old_path = std::getenv("DFLASH_DS4_EXACT_TRACE_PATH");
+    const char * old_width = std::getenv("DFLASH_DS4_EXACT_TRACE_Q");
+    const bool had_path = old_path != nullptr;
+    const bool had_width = old_width != nullptr;
+    const std::string old_path_value = old_path ? old_path : "";
+    const std::string old_width_value = old_width ? old_width : "";
+    setenv("DFLASH_DS4_EXACT_TRACE_PATH", path, 1);
+    setenv("DFLASH_DS4_EXACT_TRACE_Q", "4", 1);
+
+    DeepSeek4Weights weights;
+    weights.compress_ratios = {4, 128};
+    auto writer = DeepSeek4ExactTraceWriter::create_from_env(weights);
+    GenerateRequest request;
+    request.prompt.resize(2048, 1);
+    request.n_gen = 16;
+    TEST_ASSERT(writer != nullptr);
+    if (writer) {
+        TEST_ASSERT(writer->begin_request(request, false, 0));
+        writer->record_step(3, 3, 6, false);
+        TEST_ASSERT(writer->wants_step(512, 4));
+        writer->record_step(512, 4, 516, false);
+        DeepSeek4Cache cache;
+        cache.cur_pos = 6;
+        writer->record_snapshot(
+            "snapshot_save", 0, cache, {1.0f, 2.0f}, 6,
+            {3.0f, 4.0f, 5.0f});
+        writer.reset();
+
+        std::ifstream input(path);
+        const std::string trace(
+            (std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+        TEST_ASSERT(trace.find(
+            "\"position_begin\":3,\"position_end\":4") != std::string::npos);
+        TEST_ASSERT(trace.find(
+            "\"position_begin\":4,\"position_end\":6") != std::string::npos);
+        TEST_ASSERT(trace.find(
+            "\"position_begin\":3,\"position_end\":6") == std::string::npos);
+        TEST_ASSERT(trace.find(
+            "\"position_begin\":512,\"position_end\":516") != std::string::npos);
+        TEST_ASSERT(trace.find("\"last_logits_count\":2") != std::string::npos);
+        TEST_ASSERT(trace.find("\"last_logits_position\":6") != std::string::npos);
+        TEST_ASSERT(trace.find("\"spec_feature_count\":3") != std::string::npos);
+    }
+
+    if (had_path) setenv("DFLASH_DS4_EXACT_TRACE_PATH", old_path_value.c_str(), 1);
+    else unsetenv("DFLASH_DS4_EXACT_TRACE_PATH");
+    if (had_width) setenv("DFLASH_DS4_EXACT_TRACE_Q", old_width_value.c_str(), 1);
+    else unsetenv("DFLASH_DS4_EXACT_TRACE_Q");
+    unlink(path);
+}
+
+static void test_exact_trace_disables_fused_verify() {
+    Ds4VerifyHooks hooks;
+    TEST_ASSERT(deepseek4_should_attempt_fused_verify(
+        4, &hooks, true, true, true, true, true));
+    hooks.allow_fused_verify = false;
+    TEST_ASSERT(!deepseek4_should_attempt_fused_verify(
+        4, &hooks, true, true, true, true, true));
 }
 
 static std::string write_deepseek4_loader_fixture(const DeepSeek4FixtureOptions & opts) {
@@ -3654,6 +3730,9 @@ int main() {
     }
 
     test_compressor_pooling_correctness(backend);
+    test_exact_trace_hash_is_deterministic();
+    test_exact_trace_serializes_interior_prompt_step();
+    test_exact_trace_disables_fused_verify();
     test_swiglu_ds4_cpu_correctness(backend);
     test_moe_routing_correctness(backend);
     test_rmsnorm_correctness(backend);

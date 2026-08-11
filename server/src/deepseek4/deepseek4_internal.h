@@ -38,6 +38,7 @@ struct MoeHybridConfig;
 struct MoeHybridRoutingStats;
 struct MoeExpertComputeRuntime;
 class MoeHybridStreamEngine;
+class DeepSeek4ExactTraceWriter;
 
 struct DeepSeek4StepTelemetry {
     uint64_t total_us = 0;
@@ -389,7 +390,22 @@ struct Ds4VerifyHooks {
     std::vector<float> *     all_logits_out = nullptr;      // [n_vocab * n_tokens]
     std::vector<int32_t> *   argmax_out = nullptr;          // [n_tokens], optional GPU result
     bool                     prefer_argmax_only = false;     // skip logits D2H when available
+    // Prefill uses the capture fields too, but must never enter the
+    // intentionally approximate fused-verification path.
+    bool                     allow_fused_verify = true;
+    // Default-null production diagnostic sink. The sink owns all expensive
+    // readbacks and position filtering; normal execution does not construct it.
+    DeepSeek4ExactTraceWriter * exact_trace = nullptr;
 };
+
+bool deepseek4_should_attempt_fused_verify(
+    int n_tokens,
+    const Ds4VerifyHooks * verify_hooks,
+    bool owner_topology_supported,
+    bool full_layer_range,
+    bool has_logits_output,
+    bool gpu_backend,
+    bool fused_verify_enabled);
 
 bool deepseek4_step_layer_range(
     ggml_backend_t              backend,

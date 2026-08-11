@@ -388,6 +388,7 @@ add_library(dflash_common STATIC
     src/gemma4/gemma4_dflash_target.cpp
     src/gemma4/gemma4_layer_split_adapter.cpp
     # DeepSeek V4 Flash target arch
+    src/deepseek4/deepseek4_exact_trace.cpp
     src/deepseek4/deepseek4_loader.cpp
     src/deepseek4/deepseek4_graph.cpp
     src/deepseek4/deepseek4_roctx.cpp
