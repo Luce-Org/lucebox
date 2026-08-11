@@ -1268,14 +1268,13 @@ static int ds4_try_fused_verify_step(
     // ── Compute + read back ──
     const auto compute_t0 = Ds4TimingClock::now();
 
-    // A q=1 feature-capture graph contains HC width-4 matmuls even though it
-    // advances only one token. On gfx1151, selecting MMVQ for those width-4
-    // nodes is correct in eager mode but its HIP graph replay faults against
-    // unified-memory expert mappings. Keep the proven width-3 ceiling only
-    // while q=1 capture graphs are evaluated/captured. q>=2 verification uses
-    // the process ceiling (LUCE_MMVQ_MAX_NCOLS=4 in the optimized launch).
-    const bool capture_eager = capture_cache &&
-        ds4_env_flag("DFLASH_DS4_TP_CAPTURE_EAGER");
+    // q=1 feature capture seeds reference-exact speculation, so it must retain
+    // the process MMVQ/MMQ policy used by native fused decode. On gfx1151 the
+    // width-4 MMVQ nodes are correct in eager mode, while HIP graph replay can
+    // fault against unified-memory expert mappings. Execute capture eagerly
+    // without overriding the process ceiling; q>=2 verification keeps its
+    // normal graph policy.
+    const bool capture_eager = capture_cache;
     // q>=2 verifier graph slots own fixed tensor storage. Position, mask,
     // routing-map, and embedding values are refreshed through stable input
     // buffers above; the graph topology and all allocation addresses remain
@@ -1289,7 +1288,7 @@ static int ds4_try_fused_verify_step(
         ds4_env_flag("DFLASH_DS4_VERIFY_FORCE_GRAPH_REPLAY");
     ScopedCudaGraphOverrides graph_override_scope(
         /*disable_graphs=*/capture_eager,
-        /*mmvq_max_ncols=*/capture_cache ? 3 : 0,
+        /*mmvq_max_ncols=*/0,
         /*skip_property_check=*/force_verify_graph_replay);
     const enum ggml_status compute_status = fg->sched
         ? ggml_backend_sched_graph_compute(fg->sched, fg->sg.gf)

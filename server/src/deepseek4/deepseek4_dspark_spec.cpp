@@ -1105,9 +1105,10 @@ bool run_deepseek4_dspark_spec_decode(
             : 0.0f;
     }
     std::fprintf(stderr,
-                 "[ds4-spec] gen=%d steps=%ld mean_accept=%.2f/%.2f "
+                 "[ds4-spec] gen=%d steps=%ld matched=%ld offered=%ld "
+                 "mean_accept=%.2f/%.2f "
                  "q_cap=%d full_snap=%d\n",
-                 n_generated, steps,
+                 n_generated, steps, accept_sum, offered_sum,
                  steps ? (double) accept_sum / steps : 0.0,
                  steps ? (double) offered_sum / steps : 0.0, q_cap,
                  (int) full_snap);

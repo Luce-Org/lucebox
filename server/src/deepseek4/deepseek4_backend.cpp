@@ -44,6 +44,25 @@ static bool env_flag_enabled(const char * name) {
     return value && value[0] && std::strcmp(value, "0") != 0;
 }
 
+static void emit_exact_verify_trace(
+        bool speculation,
+        const std::vector<int32_t> & tokens) {
+    if (!env_flag_enabled("DFLASH_DS4_EXACT_VERIFY_TRACE")) {
+        return;
+    }
+
+    const bool reference_exact =
+        env_flag_enabled("DFLASH_DS4_SPEC_REFERENCE_EXACT");
+    std::fprintf(stderr,
+                 "[ds4-exact-verify-trace] reference_exact=%d speculation=%d "
+                 "n=%zu ids=[",
+                 (int) reference_exact, (int) speculation, tokens.size());
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        std::fprintf(stderr, "%s%d", i == 0 ? "" : " ", tokens[i]);
+    }
+    std::fprintf(stderr, "]\n");
+}
+
 static void configure_gfx1151_dspark_mmvq_default(int gpu) {
 #if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
     if (!env_flag_enabled("DFLASH_DS4_SPEC") ||
@@ -1837,6 +1856,7 @@ GenerateResult DeepSeek4Backend::generate_from_state(
         result.decode_s = elapsed_s(t1);
         result.accept_rate = accept_rate;
         result.spec_decode_ran = spec_ran;
+        emit_exact_verify_trace(result.spec_decode_ran, result.tokens);
         std::fprintf(stderr, "[deepseek4] DSpark decode: %zu tok in %.3fs (%.1f tok/s) accept_rate=%.2f\n",
                      result.tokens.size(), result.decode_s,
                      result.decode_s > 0 ? result.tokens.size() / result.decode_s : 0.0, accept_rate);
@@ -1855,6 +1875,7 @@ GenerateResult DeepSeek4Backend::generate_from_state(
 
     result.succeed();
     result.tokens = std::move(gen_tokens);
+    emit_exact_verify_trace(false, result.tokens);
     result.decode_s = elapsed_s(t1);
     result.budget_forced_close = forced_close;
     maybe_save_routing_stats();

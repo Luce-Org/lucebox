@@ -6870,13 +6870,19 @@ bool deepseek4_step_layer_range(
     Ds4VerifyHooks * fused_graph_hooks =
         (fused_hybrid_decode && !verify_hooks)
             ? &fused_hybrid_decode_hooks : verify_hooks;
-    if ((!moe_hybrid || fused_hybrid_ready) &&
+    const bool q1_feature_capture =
+        n_tokens == 1 && verify_hooks && verify_hooks->capture_layer_ids &&
+        verify_hooks->capture_out;
+    const bool q1_fused_capture =
+        q1_feature_capture && !moe_hybrid && ds4_fused_decode_enabled(w);
+    const bool fused_verify_enabled = ds4_fused_verify_enabled();
+    const bool fused_verify_path =
         ((n_tokens >= 2 && n_tokens <= 4 && verify_hooks) ||
-         fused_hybrid_decode) &&
+         fused_hybrid_decode) && fused_verify_enabled;
+    if ((!moe_hybrid || fused_hybrid_ready) &&
+        (fused_verify_path || q1_fused_capture) &&
         layer_begin == 0 && is_last_shard &&
-        out_logits && ds4_backend_is_gpu(backend) && ds4_fused_verify_enabled()) {
-        const bool q1_feature_capture =
-            n_tokens == 1 && verify_hooks && verify_hooks->capture_out;
+        out_logits && ds4_backend_is_gpu(backend)) {
         // q=1 target-feature capture walks many prompt-position shapes. Keep
         // it separate from q>=2 verification so prefill cannot evict the
         // expensive warm q=3/q=4 verifier working set.
