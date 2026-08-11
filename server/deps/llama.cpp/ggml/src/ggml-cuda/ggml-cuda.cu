@@ -2612,6 +2612,11 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     return use_mul_mat_vec_q;
 }
 
+// The registry-aware mix kernels are laid out over grid.z, so a speculative
+// verification batch is as stream-sync-free as ordinary single-token decode.
+// Keep this aligned with DeepSeek4's maximum speculative verification width.
+static constexpr int DS4_MIX_MMV_MAX_TOKENS = 4;
+
 // Execute an unbiased gate/up GLU while retaining the caller's existing
 // output tensors. Vector kernels write the GLU directly. Large routed-expert
 // MMQ keeps both ordinary matmul writes (and therefore numerical behavior),
@@ -2704,7 +2709,8 @@ static bool ggml_cuda_try_fuse_mul_mat_glu(
     // fusing across two different mul_mat_ids would read one expert's rows with the other's
     // routing. Each launcher additionally returns false unless BOTH halves are registered,
     // so a partial registration keeps the correct unfused path.
-    if (ggml_cuda_ds4_mix_glu_fusable(gate, up, glu, direct_vector_layout)) {
+    if (src1->ne[2] <= DS4_MIX_MMV_MAX_TOKENS &&
+            ggml_cuda_ds4_mix_glu_fusable(gate, up, glu, direct_vector_layout)) {
         const float limit = ggml_get_op_params_f32(glu, 2);
         // dst is the GLU tensor: the fused kernel writes the SwiGLU result straight there and
         // the two intermediates are never materialised.
@@ -2810,21 +2816,18 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int luce_mmvq_max_ncols = ggml_cuda_mmvq_max_ncols_override > 0
         ? ggml_cuda_mmvq_max_ncols_override
         : luce_mmvq_max_ncols_env;
-    // qtype-105 (Q3_1_ROCMFP3_MIX) has no MMVQ/MMQ kernel: its per-expert
-    // codebook/mode lives in an out-of-band registry the block-local quant
-    // kernels can't reach. Force it onto the dequantize->cuBLAS path, whose
-    // to_fp16 converter consults that registry. This also catches the
-    // mul_mat_id per-expert fallback, which re-enters ggml_cuda_mul_mat with
-    // 105 slices.
-    // qtype-106 (Q2_1_ROCMFP2_MIX) is the gate/up analogue and needs the same
-    // treatment for the same reason -- its codebook is equally out-of-band.
+    // The mix qtypes have no generic MMVQ path because their per-expert
+    // codebooks live in an out-of-band registry. Decode uses the dedicated
+    // fused kernels below. Sparse prefill can opt into their registry-aware
+    // MMQ loaders; otherwise should_use_mmq rejects them and they retain the
+    // exact dequantize->cuBLAS fallback.
     const bool is_rocmfp3_mix = src0->type == GGML_TYPE_Q3_1_ROCMFP3_MIX;
     const bool is_rocmfp2_mix = src0->type == GGML_TYPE_Q2_1_ROCMFP2_MIX;
     const bool is_mix_qtype    = is_rocmfp3_mix || is_rocmfp2_mix;
     bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !is_mix_qtype && !bad_padding_clear
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
         && src1->ne[1] <= luce_mmvq_max_ncols;
-    bool use_mul_mat_q     = ggml_is_quantized(src0->type) && !is_mix_qtype && !bad_padding_clear
+    bool use_mul_mat_q     = ggml_is_quantized(src0->type) && !bad_padding_clear
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
 
     bool any_gpus_with_slow_fp16 = false;
@@ -3006,20 +3009,17 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         }
     };
 
-    // qtype-105 (Q3_1_ROCMFP3_MIX) fused-down-expert MoE decode: run the whole
+    // qtype-105/106 fused routed-expert decode: run the whole
     // mul_mat_id on device with the routing ids read in-kernel, avoiding the
     // generic sort-based fallback below (which needs a host cudaStreamSynchronize
     // + id-sort that serialises decode and disables CUDA-graph capture of the
-    // FFN subgraph). Bit-identical per output element to the fallback's
-    // per-expert-slice path. Gated to the strict single-token decode case
-    // (ne12 == 1), where the fallback also runs every used expert through the
-    // fused f32 single-expert kernel (tokens_per_expert <= 1) — so the output is
-    // bit-identical. Multi-token batches (prefill) fall through to the
-    // dequant->cuBLAS fallback, whose f16 round-trip we must NOT diverge from.
+    // FFN subgraph). The kernel's grid.z is the token dimension, so it handles
+    // both ordinary decode and the small speculative verification batch without
+    // sorting or expanding the weights. Larger batches remain on the prefill path.
     // Kept in sync with the [TAG_MUL_MAT_ID_CUDA_GRAPHS] usability check below.
     if (src0->type == GGML_TYPE_Q3_1_ROCMFP3_MIX
             && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
-            && ne12 == 1
+            && ne12 <= DS4_MIX_MMV_MAX_TOKENS
             && ggml_cuda_rocmfp3_mix_mul_mat_id(
                 src0->data, (const float *) src1->data, (const int32_t *) ids->data,
                 (float *) dst->data, (int) ne00, (int) ne01, (int) ids->ne[0],
@@ -3033,7 +3033,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     if (src0->type == GGML_TYPE_Q2_1_ROCMFP2_MIX
             && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
-            && ne12 == 1
+            && ne12 <= DS4_MIX_MMV_MAX_TOKENS
             && ggml_cuda_rocmfp2_mix_mul_mat_id(
                 src0->data, (const float *) src1->data, (const int32_t *) ids->data,
                 (float *) dst->data, (int) ne00, (int) ne01, (int) ids->ne[0],
@@ -3845,7 +3845,7 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             const bool mmid_rocmfp3_ok =
                 (is_mmid_105 || is_mmid_106) &&
                 node->src[1]->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 &&
-                node->src[1]->ne[2] == 1 &&
+                node->src[1]->ne[2] <= DS4_MIX_MMV_MAX_TOKENS &&
                 (is_mmid_105 ? ggml_cuda_rocmfp3_mix_registered(node->src[0]->data)
                              : ggml_cuda_rocmfp2_mix_registered(node->src[0]->data));
             if (mmid_telemetry) {

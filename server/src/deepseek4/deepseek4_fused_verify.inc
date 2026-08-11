@@ -1289,7 +1289,7 @@ static int ds4_try_fused_verify_step(
         ds4_env_flag("DFLASH_DS4_VERIFY_FORCE_GRAPH_REPLAY");
     ScopedCudaGraphOverrides graph_override_scope(
         /*disable_graphs=*/capture_eager,
-        /*mmvq_max_ncols=*/capture_cache ? 3 : 0,
+        /*mmvq_max_ncols=*/capture_cache && q == 1 ? 3 : 0,
         /*skip_property_check=*/force_verify_graph_replay);
     const enum ggml_status compute_status = fg->sched
         ? ggml_backend_sched_graph_compute(fg->sched, fg->sg.gf)

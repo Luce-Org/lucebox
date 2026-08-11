@@ -984,7 +984,7 @@ static void test_indexer_score_cpu(ggml_backend_t backend) {
     ggml_set_input(weights_t);
     ggml_set_input(comp_t);
     ggml_tensor * scores_t = ggml_ds4_indexer_score(
-        ctx, q_t, weights_t, comp_t, kv_start, ratio);
+        ctx, q_t, weights_t, comp_t, nullptr, kv_start, ratio);
     ggml_set_output(scores_t);
     ggml_cgraph * graph = ggml_new_graph_custom(ctx, 64, false);
     ggml_build_forward_expand(graph, scores_t);

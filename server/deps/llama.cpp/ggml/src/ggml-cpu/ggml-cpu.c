@@ -154,6 +154,7 @@ static void ggml_compute_forward_ds4_indexer_score(
     const struct ggml_tensor * q = dst->src[0];
     const struct ggml_tensor * weights = dst->src[1];
     const struct ggml_tensor * comp = dst->src[2];
+    const struct ggml_tensor * visibility_mask = dst->src[3];
     GGML_ASSERT(q && weights && comp);
     GGML_ASSERT(q->type == GGML_TYPE_F32 && q->ne[0] == 128);
     GGML_ASSERT(weights->type == GGML_TYPE_F32);
@@ -161,6 +162,9 @@ static void ggml_compute_forward_ds4_indexer_score(
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous(q) && ggml_is_contiguous(weights));
     GGML_ASSERT(ggml_is_contiguous(comp) && ggml_is_contiguous(dst));
+    GGML_ASSERT(!visibility_mask ||
+                (visibility_mask->type == GGML_TYPE_F32 &&
+                 ggml_is_contiguous(visibility_mask)));
 
     const int n_head = (int) q->ne[1];
     const int n_tokens = (int) q->ne[2];
@@ -174,11 +178,16 @@ static void ggml_compute_forward_ds4_indexer_score(
     const float * q_data = (const float *) q->data;
     const float * weight_data = (const float *) weights->data;
     const ggml_fp16_t * comp_data = (const ggml_fp16_t *) comp->data;
+    const float * mask_data = visibility_mask
+        ? (const float *) visibility_mask->data : NULL;
     float * dst_data = (float *) dst->data;
     for (int token = params->ith; token < n_tokens; token += params->nth) {
         const int visible = (kv_start + token + 1) / ratio;
         for (int c = 0; c < n_comp; ++c) {
-            if (c >= visible) {
+            const bool row_visible = mask_data
+                ? mask_data[(size_t) token * n_comp + c] > -1.0e20f
+                : c < visible;
+            if (!row_visible) {
                 dst_data[(size_t) token * n_comp + c] = -1.0e30f;
                 continue;
             }

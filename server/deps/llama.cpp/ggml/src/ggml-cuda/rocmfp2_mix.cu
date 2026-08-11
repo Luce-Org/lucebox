@@ -845,6 +845,18 @@ bool ggml_cuda_rocmfp2_mix_registered(const void * vx) {
     return mix_lookup(vx, e, expert);
 }
 
+bool ggml_cuda_rocmfp2_mix_mmq_info(
+        const void * vx, const void ** codebooks, const uint8_t ** modes) {
+    MixEntry e;
+    int expert;
+    if (!mix_lookup(vx, e, expert)) {
+        return false;
+    }
+    *codebooks = e.codebooks + (size_t) expert * 2 * MIX_K;
+    *modes = e.modes + expert;
+    return true;
+}
+
 bool ggml_cuda_rocmfp2_mix_mul_mat_vec(
         const void * vx, const float * x, float * y,
         int in, int out, int ncols,

@@ -149,7 +149,11 @@ extern "C" void ggml_cuda_rocmfp3_mix_register_host(
     if (err == cudaSuccess) err = cudaMemcpy(cb_dev, codebooks_bf16_host, cb_bytes, cudaMemcpyHostToDevice);
     if (err == cudaSuccess) err = cudaMalloc(&modes_dev, (size_t) n_experts);
     if (err == cudaSuccess) err = cudaMemcpy(modes_dev, modes_host, (size_t) n_experts, cudaMemcpyHostToDevice);
-    if (err == cudaSuccess && rotations_host) {
+    bool any_rotation = false;
+    for (int i = 0; rotations_host && i < n_experts; ++i) {
+        any_rotation = any_rotation || rotations_host[i] != 0;
+    }
+    if (err == cudaSuccess && any_rotation) {
         err = cudaMalloc(&rots_dev, (size_t) n_experts);
         if (err == cudaSuccess) err = cudaMemcpy(rots_dev, rotations_host, (size_t) n_experts, cudaMemcpyHostToDevice);
     }
@@ -747,6 +751,18 @@ bool ggml_cuda_rocmfp3_mix_registered(const void * vx) {
     MixEntry e;
     int expert;
     return mix_lookup(vx, e, expert);
+}
+
+bool ggml_cuda_rocmfp3_mix_mmq_info(
+        const void * vx, const void ** codebooks, const uint8_t ** modes) {
+    MixEntry e;
+    int expert;
+    if (!mix_lookup(vx, e, expert) || e.rotations != nullptr) {
+        return false;
+    }
+    *codebooks = e.codebooks + (size_t) expert * 2 * MIX_K;
+    *modes = e.modes + expert;
+    return true;
 }
 
 bool ggml_cuda_rocmfp3_mix_mul_mat_vec(

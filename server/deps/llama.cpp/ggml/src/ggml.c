@@ -8594,6 +8594,7 @@ struct ggml_tensor * ggml_ds4_indexer_score(
         struct ggml_tensor  * q,
         struct ggml_tensor  * head_weights,
         struct ggml_tensor  * index_comp,
+        struct ggml_tensor  * visibility_mask,
         int                   kv_start,
         int                   ratio) {
     GGML_ASSERT(q->type == GGML_TYPE_F32 && q->ne[0] == 128);
@@ -8607,6 +8608,10 @@ struct ggml_tensor * ggml_ds4_indexer_score(
     GGML_ASSERT(q->ne[3] == 1);
     GGML_ASSERT(head_weights->ne[2] == 1 && head_weights->ne[3] == 1);
     GGML_ASSERT(index_comp->ne[2] == 1 && index_comp->ne[3] == 1);
+    GGML_ASSERT(!visibility_mask ||
+                (visibility_mask->type == GGML_TYPE_F32 &&
+                 visibility_mask->ne[0] == index_comp->ne[1] &&
+                 visibility_mask->ne[1] == q->ne[2]));
     GGML_ASSERT(kv_start >= 0 && ratio > 0);
 
     struct ggml_tensor * result = ggml_new_tensor_2d(
@@ -8615,6 +8620,7 @@ struct ggml_tensor * ggml_ds4_indexer_score(
     result->src[0] = q;
     result->src[1] = head_weights;
     result->src[2] = index_comp;
+    result->src[3] = visibility_mask;
     ggml_set_op_params_i32(result, 0, kv_start);
     ggml_set_op_params_i32(result, 1, ratio);
     return result;

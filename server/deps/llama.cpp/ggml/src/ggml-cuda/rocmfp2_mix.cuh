@@ -95,3 +95,9 @@ bool ggml_cuda_rocmfp2_mix_mul_mat_id(
 // True if a qtype-106 tensor base is registered (used by the graph-usability
 // check to confirm the sync-free mul_mat_id path will handle the node).
 bool ggml_cuda_rocmfp2_mix_registered(const void * vx);
+
+// Return the device-resident side data needed by the batched MMQ loader.
+// Pointers are advanced to the expert containing `vx`, so both whole MoE
+// tensors and registered expert slices are safe callers.
+bool ggml_cuda_rocmfp2_mix_mmq_info(
+        const void * vx, const void ** codebooks, const uint8_t ** modes);

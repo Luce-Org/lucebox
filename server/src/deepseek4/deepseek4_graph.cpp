@@ -1418,6 +1418,7 @@ static ggml_tensor * build_indexer_topk(
         int kv_start,
         int n_tokens,
         ggml_tensor * rope_pos,
+        ggml_tensor * visibility_mask,
         std::vector<DeepSeek4I32ArrayBinding> & i32_array_inputs) {
     if (!qr_norm || !cur || !L.indexer_attn_q_b || !L.indexer_proj ||
         !index_comp_source || !rope_pos || n_tokens <= 0 ||
@@ -1482,11 +1483,14 @@ static ggml_tensor * build_indexer_topk(
     GGML_ASSERT(comp->type == GGML_TYPE_F16);
     GGML_ASSERT(ggml_is_contiguous(comp));
 
-    // Fuse comp^T@q, ReLU, per-head weighting and head reduction. The generic
-    // graph would retain [n_comp,64,n_tokens] dots (about 2 GiB at 8K) before
-    // reducing them; this operation stores only the final score matrix.
+    // The fused scorer avoids retaining [n_comp,64,n_tokens] per-head dots.
+    // Its decode specialization treats the 64 heads as the WMMA row batch,
+    // eliminating the old 16-token tile's 15/16 wasted work at n_scored=1.
+    // A live visibility mask also makes padded decode graphs safe to replay as
+    // compressed rows are appended within the padding stride.
     ggml_tensor * scores = ggml_ds4_indexer_score(
-        ctx, index_q, head_weights, comp, kv_start + first_scored, 4);
+        ctx, index_q, head_weights, comp, visibility_mask,
+        kv_start + first_scored, 4);
     ggml_tensor * selected = ggml_top_k(
         ctx, ggml_cont(ctx, scores), top_k);
     if (first_scored == 0) return selected;
@@ -1751,11 +1755,27 @@ static ggml_tensor * build_mla_attention(
     ggml_tensor * indexer_topk = nullptr;
     if (attention_impl == DeepSeek4AttentionImpl::SparseFlash &&
         ratio == 4 && f32_array_inputs) {
-        const int n_index_comp = ds4_comp_rows_used(
+        const int n_index_comp_live = ds4_comp_rows_used(
             lc.index_comp_kv, lc.n_index_comp, 4, token_pos);
+        // Use the same padded span as attention in a replayable decode graph.
+        // The dynamic compressed portion of attn_row_mask is added to the
+        // indexer scores, so padding stays invisible while live rows can grow
+        // within the fixed graph shape.
+        const int n_index_comp = masked_kv
+            ? cached_inputs->padded_comp
+            : n_index_comp_live;
+        ggml_tensor * index_visibility_mask = nullptr;
+        if (masked_kv && n_index_comp > 0) {
+            index_visibility_mask = ggml_view_2d(
+                ctx, cached_inputs->attn_row_mask,
+                n_index_comp, 1,
+                (size_t) n_index_comp * sizeof(float),
+                (size_t) w.n_swa * sizeof(float));
+        }
         indexer_topk = build_indexer_topk(
             ctx, qr, cur, w, L, index_comp_kv_source,
             n_index_comp, kv_start, n_tokens, rope_pos,
+            index_visibility_mask,
             i32_array_inputs);
     }
     // Stable path reads the full physical ring (masking not-yet-written slots)
@@ -1927,8 +1947,11 @@ static ggml_tensor * build_mla_attention(
     }
     ggml_tensor * context = nullptr;
     bool inverse_rope_fused = false;
+    // Decode normally keeps the cheaper explicit path.  Once the trained
+    // indexer has selected a bounded compressed-row set, however, the DS4
+    // compact flash kernel avoids scanning every compressed KV row.
     const bool use_flash = attention_impl != DeepSeek4AttentionImpl::Explicit &&
-                           n_tokens > 1;
+                           (n_tokens > 1 || indexer_topk != nullptr);
     if (use_flash) {
         if (exact_two_band) {
             // A larger scheduling band must retain the numerical topology of
@@ -5118,15 +5141,25 @@ static bool ds4_build_fused_decode_graph(
         std::vector<DeepSeek4I32InputBinding> i32b;
         std::vector<DeepSeek4I32ArrayBinding> i32ab;
         std::vector<DeepSeek4I64ArrayBinding> i64ab;
+        std::vector<DeepSeek4F32ArrayBinding> f32ab;
+        const bool sparse_decode_flash =
+            cache.prefill_mode == PrefillAttentionMode::Sparse &&
+            ds4_env_flag("DFLASH_DS4_SPARSE_DECODE_FLASH");
+        const DeepSeek4AttentionImpl attention_impl = sparse_decode_flash
+            ? DeepSeek4AttentionImpl::SparseFlash
+            : DeepSeek4AttentionImpl::Explicit;
         ggml_tensor * normed = build_rms_norm(ctx, attn_in, L.attn_norm, w.rms_eps);
         ggml_tensor * attn_out = build_mla_attention(ctx, gf, normed, w, L, lc, il,
                                                      kv_start, 1, &ain,
-                                                     i32b, i32ab, i64ab);
+                                                     i32b, i32ab, i64ab,
+                                                     &f32ab, attention_impl);
         if (!attn_out) return false;
-        if (!i32b.empty() || !i32ab.empty() || !i64ab.empty()) {
+        if (!i32b.empty() || !i32ab.empty() || !i64ab.empty() ||
+            !f32ab.empty()) {
             std::fprintf(stderr,
-                         "[deepseek4] fused decode: layer %d created %zu/%zu/%zu dynamic bindings; cannot fuse\n",
-                         il, i32b.size(), i32ab.size(), i64ab.size());
+                         "[deepseek4] fused decode: layer %d created %zu/%zu/%zu/%zu dynamic bindings; cannot fuse\n",
+                         il, i32b.size(), i32ab.size(), i64ab.size(),
+                         f32ab.size());
             return false;
         }
 

@@ -2645,6 +2645,7 @@ extern "C" {
             struct ggml_tensor  * q,
             struct ggml_tensor  * head_weights,
             struct ggml_tensor  * index_comp,
+            struct ggml_tensor  * visibility_mask,
             int                   kv_start,
             int                   ratio);
 
