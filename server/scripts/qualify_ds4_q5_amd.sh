@@ -137,25 +137,24 @@ for visibility_var in HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES; do
 done
 
 # Serialize the host-wide performance-level changes across qualification runs.
-lock_dir="/tmp/dflash-ds4-q5.lock"
-if ! mkdir -m 755 "$lock_dir" 2>/dev/null && [[ ! -d "$lock_dir" ]]; then
-    echo "could not create qualification lock directory: $lock_dir" >&2
+# /dev/kfd is a stable, kernel-owned inode shared by every ROCm user. flock is
+# advisory, so holding it does not interfere with ordinary ROCm device access.
+readonly lock_device="/dev/kfd"
+if [[ -L "$lock_device" || ! -c "$lock_device" ]]; then
+    echo "ROCm lock device is missing or invalid: $lock_device" >&2
     exit 2
 fi
-if [[ -L "$lock_dir" || ! -d "$lock_dir" ]]; then
-    echo "qualification lock path is not a real directory: $lock_dir" >&2
+if ! exec 9<>"$lock_device"; then
+    echo "cannot open ROCm lock device: $lock_device" >&2
     exit 2
 fi
-if [[ -O "$lock_dir" ]] && ! chmod 755 "$lock_dir"; then
-    echo "cannot make qualification lock shared: $lock_dir" >&2
-    exit 2
-fi
-if ! exec 9<"$lock_dir"; then
-    echo "cannot open shared qualification lock: $lock_dir" >&2
+if ! lock_owner="$(stat -Lc '%u' "/proc/$$/fd/9")" ||
+   [[ "$lock_owner" != 0 || ! -c "/proc/$$/fd/9" ]]; then
+    echo "ROCm lock device must be a root-owned character device: $lock_device" >&2
     exit 2
 fi
 if ! flock -n 9; then
-    echo "another DS4 qualification run owns $lock_dir" >&2
+    echo "another DS4 qualification run owns $lock_device" >&2
     exit 2
 fi
 
