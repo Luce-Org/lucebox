@@ -13,6 +13,18 @@ using namespace cub;
 #    include <hipcub/hipcub.hpp>
 #endif
 
+#include <cstdlib>
+#include <cstring>
+
+namespace {
+
+bool ds4_env_flag_enabled(const char * name) {
+    const char * value = std::getenv(name);
+    return value && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
+}  // namespace
+
 #ifdef CUB_TOP_K_AVAILABLE
 
 static void top_k_cub(ggml_cuda_pool & pool,
@@ -1344,7 +1356,7 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     }
 #elif defined(GGML_CUDA_USE_CUB) || defined(GGML_CUDA_USE_HIPCUB)  // CUB_TOP_K_AVAILABLE
 #ifdef GGML_CUDA_USE_HIPCUB
-    if (getenv("GGML_DS4_TOPK_BLOCK_RADIX") != nullptr &&
+    if (ds4_env_flag_enabled("GGML_DS4_TOPK_BLOCK_RADIX") &&
         k == 512 && ncols > 1024 && ncols <= 5120) {
         topk_block_radix_cuda(
             src0_d, dst_d, (int) ncols, (int) nrows, (int) k, stream);

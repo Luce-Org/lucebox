@@ -1309,7 +1309,7 @@ static int ds4_try_fused_verify_step(
     // nodes is correct in eager mode but its HIP graph replay faults against
     // unified-memory expert mappings. Keep the proven width-3 ceiling only
     // while q=1 capture graphs are evaluated/captured. q>=2 verification uses
-    // the process ceiling (LUCE_MMVQ_MAX_NCOLS=4 in the optimized launch).
+    // the process ceiling (LUCE_MMVQ_MAX_NCOLS=5 for q=5 verification).
     const bool capture_eager = capture_cache &&
         ds4_env_flag("DFLASH_DS4_TP_CAPTURE_EAGER");
     // q>=2 verifier graph slots own fixed tensor storage. Position, mask,

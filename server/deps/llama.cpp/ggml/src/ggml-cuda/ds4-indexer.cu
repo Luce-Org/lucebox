@@ -1,5 +1,17 @@
 #include "ds4-indexer.cuh"
 
+#include <cstdlib>
+#include <cstring>
+
+namespace {
+
+bool ds4_env_flag_enabled(const char * name) {
+    const char * value = std::getenv(name);
+    return value && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
+}  // namespace
+
 #if defined(GGML_USE_HIP)
 // rocWMMA 1.x rejects RDNA4/gfx1151 at compile time. Use the optimized path
 // only with rocWMMA 2.x or newer; older or header-less ROCm installations
@@ -564,7 +576,7 @@ void ggml_cuda_op_ds4_indexer_score(
                 ? static_cast<const float *>(visibility_mask->data) : nullptr,
             n_comp, kv_start, n_head, ratio);
     } else if (wmma_capable && n_tokens == 4 && n_head % 4 == 0 &&
-               getenv("GGML_DS4_INDEXER_PACK_Q4") != nullptr) {
+               ds4_env_flag_enabled("GGML_DS4_INDEXER_PACK_Q4")) {
         const dim3 grid((unsigned) ((n_comp + 127) / 128), 1, 1);
         ds4_indexer_score_wmma_q4_kernel<<<grid, 256, 0, stream>>>(
             static_cast<float *>(dst->data),
