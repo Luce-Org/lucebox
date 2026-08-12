@@ -2944,30 +2944,6 @@ static bool eval_moe_owner_expert_major_batched(
         alloc = ggml_gallocr_new(
             ggml_backend_get_default_buffer_type(backend));
     }
-    if (p_alloc && alloc) {
-        const size_t current_bytes =
-            ggml_gallocr_get_buffer_size(alloc, 0);
-        ggml_gallocr_t sizing = ggml_gallocr_new(
-            ggml_backend_get_default_buffer_type(backend));
-        size_t required_bytes = 0;
-        if (sizing) {
-            ggml_gallocr_reserve_n_size(
-                sizing, gf, nullptr, nullptr, &required_bytes);
-            ggml_gallocr_free(sizing);
-        }
-        if (required_bytes > current_bytes && current_bytes > 0) {
-            // The persistent owner arena is reusable only after the previous
-            // layer has completed. ggml_gallocr otherwise allocates the larger
-            // replacement before freeing the old buffer, which can double the
-            // transient VRAM requirement for large prefill chunks.
-            ggml_backend_synchronize(backend);
-            ggml_gallocr_free(*p_alloc);
-            *p_alloc = ggml_gallocr_new(
-                ggml_backend_get_default_buffer_type(backend));
-            alloc = *p_alloc;
-            created_alloc = alloc != nullptr;
-        }
-    }
     if (!alloc || !ggml_gallocr_alloc_graph(alloc, gf)) {
         if (created_alloc) {
             ggml_gallocr_free(*p_alloc);
