@@ -100,10 +100,19 @@ int main() {
     for (int i = 0; i < n_used * ntok; ++i) idsh[i] = i % n_experts;
     HIP_OK(hipMemcpy(d_ids, idsh.data(), sizeof(int32_t) * idsh.size(), hipMemcpyHostToDevice));
 
-    ggml_cuda_rocmfp2_mix_register_host(d_up, rows_bytes, n_experts, out, in,
-                                        books.data(), modes.data());
-    ggml_cuda_rocmfp2_mix_register_host(d_gate, rows_bytes, n_experts, out, in,
-                                        books.data(), modes.data());
+    if (!ggml_cuda_rocmfp2_mix_register_host(
+            d_up, rows_bytes, n_experts, out, in,
+            books.data(), modes.data())) {
+        std::fprintf(stderr, "FAIL: mixed-tensor registration failed\n");
+        return 1;
+    }
+    if (!ggml_cuda_rocmfp2_mix_register_host(
+            d_gate, rows_bytes, n_experts, out, in,
+            books.data(), modes.data())) {
+        ggml_cuda_rocmfp2_mix_unregister(d_up);
+        std::fprintf(stderr, "FAIL: mixed-tensor registration failed\n");
+        return 1;
+    }
 
     const int64_t ids_s0 = 1, ids_s1 = n_used;
     const int64_t src1_s1 = 0, src1_s2 = in;

@@ -61,17 +61,16 @@ constexpr int    OUT  = 32;
 constexpr int    IN   = 128;
 constexpr size_t NB02 = 4096;
 
-void register_as(bool is105, const void * base) {
+bool register_as(bool is105, const void * base) {
     const int K = is105 ? 8 : 4;
     std::vector<uint16_t> books((size_t) E * 2 * (size_t) K, 0x3f80);  // bf16 ~1.0
     std::vector<uint8_t>  modes(E, 1);
     if (is105) {
-        ggml_cuda_rocmfp3_mix_register_host(base, NB02, E, OUT, IN,
-                                           books.data(), modes.data());
-    } else {
-        ggml_cuda_rocmfp2_mix_register_host(base, NB02, E, OUT, IN,
-                                           books.data(), modes.data());
+        return ggml_cuda_rocmfp3_mix_register_host(
+            base, NB02, E, OUT, IN, books.data(), modes.data());
     }
+    return ggml_cuda_rocmfp2_mix_register_host(
+        base, NB02, E, OUT, IN, books.data(), modes.data());
 }
 
 }  // namespace
@@ -117,7 +116,7 @@ int main() {
         if (!t) { std::fprintf(stderr, "SKIP: tensor alloc failed\n"); return 0; }
         t->data = (void *) fake_base(slot++);
         const bool is105 = (t->type == GGML_TYPE_Q3_1_ROCMFP3_MIX);
-        register_as(is105, t->data);
+        CHECK(register_as(is105, t->data), "dense registration succeeds");
         (is105 ? dense105 : dense106).push_back(t->data);
     }
 
@@ -130,7 +129,7 @@ int main() {
         if (!t) { std::fprintf(stderr, "SKIP: tensor alloc failed\n"); return 0; }
         t->data = (void *) fake_base(slot++);
         const bool is105 = (t->type == GGML_TYPE_Q3_1_ROCMFP3_MIX);
-        register_as(is105, t->data);
+        CHECK(register_as(is105, t->data), "expert registration succeeds");
         (is105 ? expert105 : expert106).push_back(t->data);
     }
     w.layers.push_back(L);
@@ -200,7 +199,8 @@ int main() {
             tensor->data = (void *) fake_base(slot++);
             const bool is105 =
                 tensor->type == GGML_TYPE_Q3_1_ROCMFP3_MIX;
-            register_as(is105, tensor->data);
+            CHECK(register_as(is105, tensor->data),
+                  "hybrid registration succeeds");
             (is105 ? hybrid105 : hybrid106).push_back(tensor->data);
         }
 

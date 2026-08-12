@@ -133,8 +133,10 @@ int main() {
     const int64_t d_tok  = out, d_sl  = (int64_t) out * ntokens;
 
     // --- 1. the guard: too few registered slices must be REFUSED, not decoded ---
-    ggml_cuda_rocmfp3_mix_register_host(d_w, slice_bytes, /*n_experts=*/nslices - 1,
-                                        out, in, books.data(), modes.data());
+    CHECK(ggml_cuda_rocmfp3_mix_register_host(
+              d_w, slice_bytes, /*n_experts=*/nslices - 1,
+              out, in, books.data(), modes.data()),
+          "partial slice registration succeeds");
     CHECK(!ggml_cuda_rocmfp3_mix_mul_mat_vec_3d(
               d_w, d_x, d_y3, in, out, nslices, ntokens,
               s1_tok, s1_sl, d_tok, d_sl, nullptr),
@@ -142,12 +144,18 @@ int main() {
     ggml_cuda_rocmfp3_mix_unregister(d_w);
 
     // --- 2. registered metadata must match the requested launch shape -----------
-    ggml_cuda_rocmfp3_mix_register_host(d_w, slice_bytes, nslices, out, in,
-                                        books.data(), modes.data());
+    CHECK(ggml_cuda_rocmfp3_mix_register_host(
+              d_w, slice_bytes, nslices, out, in,
+              books.data(), modes.data()),
+          "full slice registration succeeds");
     CHECK(!ggml_cuda_rocmfp3_mix_mul_mat_vec_3d(
               d_w, d_x, d_y3, in, out + 1, nslices, ntokens,
               s1_tok, s1_sl, d_tok, d_sl, nullptr),
           "3d matvec refuses a shape that differs from its registration");
+    CHECK(!ggml_cuda_rocmfp3_mix_mul_mat_vec(
+              d_w + BLOCK_BYTES, d_x, d_y2, in, out, 1,
+              s1_tok, d_tok, nullptr),
+          "2d matvec refuses an interior block pointer as a full slice");
 
     // --- 3. correctness: 3-D launch vs the validated 2-D entry point, per slice ---
     CHECK(ggml_cuda_rocmfp3_mix_mul_mat_vec_3d(

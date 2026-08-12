@@ -118,53 +118,60 @@ void mix_free_entry_device(MixEntry & e) {
 // is 0 only when nb % 4 == 0, i.e. in % 128 == 0. Any other `in` reads up to 6 B past the
 // tensor allocation, and for the last tensor in a buffer that is a fault.
 //
-void mix_validate_shape(int in) {
+bool mix_validate_shape(int in) {
     if (in % 128 != 0) {
-        GGML_ABORT("rocmfp2_mix: in=%d must be a multiple of 128 (block count nb=%d must be "
-                   "a multiple of 4) so the 16 B wide-load window stays in bounds on the "
-                   "final block; got in %% 128 = %d",
-                   in, in / 32, in % 128);
+        GGML_LOG_ERROR("rocmfp2_mix: in=%d must be a multiple of 128\n", in);
+        return false;
     }
+    return true;
 }
 
-void mix_validate_registration(
+bool mix_validate_registration(
         const void * base, size_t nb02, int n_experts, int out, int in,
         const void * codebooks, const void * modes) {
     if (!base || nb02 == 0 || n_experts <= 0 || out <= 0 || in <= 0 ||
         !codebooks || !modes) {
-        GGML_ABORT("rocmfp2_mix: invalid registration metadata");
+        GGML_LOG_ERROR("rocmfp2_mix: invalid registration metadata\n");
+        return false;
     }
-    mix_validate_shape(in);
+    if (!mix_validate_shape(in)) return false;
 
     const size_t row_bytes = (size_t) (in / MIX_QK) * MIX_BLOCK_BYTES;
     if ((size_t) out > std::numeric_limits<size_t>::max() / row_bytes) {
-        GGML_ABORT("rocmfp2_mix: expert tensor size overflows");
+        GGML_LOG_ERROR("rocmfp2_mix: expert tensor size overflows\n");
+        return false;
     }
     const size_t expert_bytes = (size_t) out * row_bytes;
     if (nb02 < expert_bytes) {
-        GGML_ABORT("rocmfp2_mix: expert stride is smaller than the tensor shape");
+        GGML_LOG_ERROR("rocmfp2_mix: expert stride is smaller than the tensor shape\n");
+        return false;
     }
     const std::uintptr_t address = reinterpret_cast<std::uintptr_t>(base);
     const std::uintptr_t stride = (std::uintptr_t) nb02;
     const std::uintptr_t expert_span = (std::uintptr_t) expert_bytes;
     if ((size_t) stride != nb02 || (size_t) expert_span != expert_bytes) {
-        GGML_ABORT("rocmfp2_mix: expert span does not fit an address");
+        GGML_LOG_ERROR("rocmfp2_mix: expert span does not fit an address\n");
+        return false;
     }
     const std::uintptr_t available =
         std::numeric_limits<std::uintptr_t>::max() - address;
     if ((std::uintptr_t) (n_experts - 1) > available / stride) {
-        GGML_ABORT("rocmfp2_mix: registered expert address range overflows");
+        GGML_LOG_ERROR("rocmfp2_mix: registered expert address range overflows\n");
+        return false;
     }
     const std::uintptr_t last_offset =
         (std::uintptr_t) (n_experts - 1) * stride;
     if (expert_span - 1 > available - last_offset) {
-        GGML_ABORT("rocmfp2_mix: final expert address range overflows");
+        GGML_LOG_ERROR("rocmfp2_mix: final expert address range overflows\n");
+        return false;
     }
     constexpr size_t table_bytes = 2 * MIX_K * sizeof(nv_bfloat16);
     if ((size_t) n_experts >
         std::numeric_limits<size_t>::max() / table_bytes) {
-        GGML_ABORT("rocmfp2_mix: codebook allocation size overflows");
+        GGML_LOG_ERROR("rocmfp2_mix: codebook allocation size overflows\n");
+        return false;
     }
+    return true;
 }
 
 void mix_register_impl(const void * base, size_t nb02, int n_experts, int out, int in,
@@ -190,14 +197,19 @@ void mix_register_impl(const void * base, size_t nb02, int n_experts, int out, i
 // (bf16) and modes from host memory into device buffers, then register. The
 // registry owns these buffers and frees them on unregister/update. On a
 // cudaMalloc failure, allocated buffers are freed before the error propagates.
-extern "C" void ggml_cuda_rocmfp2_mix_register_host(
+extern "C" bool ggml_cuda_rocmfp2_mix_register_host(
         const void * base, size_t nb02, int n_experts, int out, int in,
         const void * codebooks_bf16_host, const uint8_t * modes_host) {
-    mix_validate_registration(
-        base, nb02, n_experts, out, in, codebooks_bf16_host, modes_host);
+    if (!mix_validate_registration(
+            base, nb02, n_experts, out, in,
+            codebooks_bf16_host, modes_host)) {
+        return false;
+    }
     for (int i = 0; i < n_experts; ++i) {
         if (modes_host[i] > 1) {
-            GGML_ABORT("rocmfp2_mix: unsupported mode %u", (unsigned) modes_host[i]);
+            GGML_LOG_ERROR("rocmfp2_mix: unsupported mode %u\n",
+                           (unsigned) modes_host[i]);
+            return false;
         }
     }
     const size_t cb_bytes = (size_t) n_experts * 2 * MIX_K * sizeof(nv_bfloat16);
@@ -208,7 +220,8 @@ extern "C" void ggml_cuda_rocmfp2_mix_register_host(
     const int device = mix_device_of(base);
     MixDeviceGuard guard(device);
     if (!guard.valid) {
-        GGML_ABORT("rocmfp2_mix: failed to select the tensor's device");
+        GGML_LOG_ERROR("rocmfp2_mix: failed to select the tensor's device\n");
+        return false;
     }
     cudaError_t err = cudaMalloc(&cb_dev, cb_bytes);
     if (err == cudaSuccess) err = cudaMemcpy(cb_dev, codebooks_bf16_host, cb_bytes, cudaMemcpyHostToDevice);
@@ -217,11 +230,13 @@ extern "C" void ggml_cuda_rocmfp2_mix_register_host(
     if (err != cudaSuccess) {
         if (cb_dev)    cudaFree(cb_dev);
         if (modes_dev) cudaFree(modes_dev);
-        CUDA_CHECK(err);  // report/abort exactly as before, but only after cleanup
-        return;
+        GGML_LOG_ERROR("rocmfp2_mix: decode-table upload failed: %s\n",
+                       cudaGetErrorString(err));
+        return false;
     }
     mix_register_impl(base, nb02, n_experts, out, in, (const nv_bfloat16 *) cb_dev,
                       (const uint8_t *) modes_dev, device);
+    return true;
 }
 
 extern "C" void ggml_cuda_rocmfp2_mix_unregister(const void * base) {
@@ -235,7 +250,9 @@ extern "C" void ggml_cuda_rocmfp2_mix_unregister(const void * base) {
     }
 }
 
-static bool mix_lookup(const void * vx, MixEntry & out_e, int & out_expert) {
+static bool mix_lookup(
+        const void * vx, MixEntry & out_e, int & out_expert,
+        size_t * out_byte_offset = nullptr) {
     std::lock_guard<std::mutex> lk(g_mix_mtx);
     if (!vx) return false;
     const std::uintptr_t address =
@@ -252,10 +269,19 @@ static bool mix_lookup(const void * vx, MixEntry & out_e, int & out_expert) {
             within_expert < e.expert_bytes) {
             out_e = e;
             out_expert = (int) expert;
+            if (out_byte_offset) {
+                *out_byte_offset = (size_t) within_expert;
+            }
             return true;
         }
     }
     return false;
+}
+
+static bool mix_lookup_expert_base(
+        const void * vx, MixEntry & out_e, int & out_expert) {
+    size_t byte_offset = 0;
+    return mix_lookup(vx, out_e, out_expert, &byte_offset) && byte_offset == 0;
 }
 
 // Branchless decode. Different lanes decode different meta bytes, so `e` is
@@ -334,7 +360,8 @@ __global__ void dequantize_rocmfp2_mix_kernel(
 void dequantize_rocmfp2_mix_to_fp16_cuda(const void * vx, half * y, int64_t k, cudaStream_t stream) {
     MixEntry e;
     int expert;
-    if (!mix_lookup(vx, e, expert)) {
+    size_t byte_offset = 0;
+    if (!mix_lookup(vx, e, expert, &byte_offset)) {
         GGML_ABORT("rocmfp2_mix: tensor slice %p not registered", vx);
     }
     const int64_t registered_elements = (int64_t) e.in * e.out;
@@ -342,6 +369,13 @@ void dequantize_rocmfp2_mix_to_fp16_cuda(const void * vx, half * y, int64_t k, c
         GGML_ABORT("rocmfp2_mix: invalid dequantization range");
     }
     if (k == 0) return;
+    const int64_t requested_blocks = (k + MIX_QK - 1) / MIX_QK;
+    const size_t available_blocks =
+        (e.expert_bytes - byte_offset) / MIX_BLOCK_BYTES;
+    if (byte_offset % MIX_BLOCK_BYTES != 0 ||
+        static_cast<uint64_t>(requested_blocks) > available_blocks) {
+        GGML_ABORT("rocmfp2_mix: invalid dequantization range");
+    }
     const nv_bfloat16 * book = e.codebooks + (size_t) expert * 2 * 4;
     const uint8_t * mode_ptr = e.modes + expert;
     const int threads = 256;
@@ -801,7 +835,7 @@ bool ggml_cuda_rocmfp2_mix_mul_mat_vec_3d(
         cudaStream_t stream) {
     MixEntry e;
     int slice0;
-    if (!mix_lookup(vx, e, slice0)) {
+    if (!mix_lookup_expert_base(vx, e, slice0)) {
         return false;  // not registered -> caller keeps the dequant fallback
     }
     // The registry must cover every slice this launch will index via blockIdx.y.
@@ -839,7 +873,7 @@ bool ggml_cuda_rocmfp2_mix_mul_mat_id(
         int64_t dst_s1, int64_t dst_s2, cudaStream_t stream) {
     MixEntry e;
     int expert0;
-    if (!mix_lookup(vx, e, expert0)) {
+    if (!mix_lookup_expert_base(vx, e, expert0)) {
         return false;  // not registered -> caller falls back to sort + dequant
     }
     if (expert0 != 0 || in != e.in || out != e.out ||
@@ -878,7 +912,8 @@ bool ggml_cuda_rocmfp2_mix_mul_mat_id_glu(
         float glu_limit, cudaStream_t stream) {
     MixEntry eu, eg;
     int expert0_u, expert0_g;
-    if (!mix_lookup(vx_up, eu, expert0_u) || !mix_lookup(vx_gate, eg, expert0_g)) {
+    if (!mix_lookup_expert_base(vx_up, eu, expert0_u) ||
+        !mix_lookup_expert_base(vx_gate, eg, expert0_g)) {
         return false;
     }
     if (expert0_u != 0 || expert0_g != 0 || in != eu.in || out != eu.out ||
@@ -901,14 +936,19 @@ bool ggml_cuda_rocmfp2_mix_mul_mat_id_glu(
 bool ggml_cuda_rocmfp2_mix_registered(const void * vx) {
     MixEntry e;
     int expert;
-    return mix_lookup(vx, e, expert);
+    return mix_lookup_expert_base(vx, e, expert);
 }
 
 bool ggml_cuda_rocmfp2_mix_mmq_info(
         const void * vx, const void ** codebooks, const uint8_t ** modes) {
+    if (!codebooks || !modes) {
+        return false;
+    }
     MixEntry e;
     int expert;
-    if (!mix_lookup(vx, e, expert)) {
+    size_t byte_offset = 0;
+    if (!mix_lookup(vx, e, expert, &byte_offset) ||
+        byte_offset % MIX_BLOCK_BYTES != 0) {
         return false;
     }
     *codebooks = e.codebooks + (size_t) expert * 2 * MIX_K;
@@ -922,7 +962,7 @@ bool ggml_cuda_rocmfp2_mix_mul_mat_vec(
         int64_t x_col_stride, int64_t y_col_stride, cudaStream_t stream) {
     MixEntry e;
     int expert;
-    if (!mix_lookup(vx, e, expert)) {
+    if (!mix_lookup_expert_base(vx, e, expert)) {
         return false;  // not registered -> caller falls back to dequant->cuBLAS
     }
     if (in != e.in || out != e.out || ncols <= 0) {

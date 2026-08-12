@@ -444,7 +444,7 @@ bool build_deepseek4_moe_hybrid_storage_from_file_with_mmap(
 
 // Attach each compact GPU owner tensor to the learned decode-table rows for
 // the global experts stored in that tensor.
-bool register_deepseek4_moe_hybrid_mix_sidecars(
+bool register_deepseek4_moe_hybrid_mix_tables(
     const std::string &         path,
     const DeepSeek4Weights &    w,
     MoeHybridStorage &          storage,

@@ -1,8 +1,8 @@
 #pragma once
 // Runtime decode support for GGML_TYPE_Q3_1_ROCMFP3_MIX (105): per-expert mixed
 // absmax/adaptive ROCmFP3. The 14-byte block wire is identical to q3_0_rocmfpx;
-// the per-expert codebook and mode live out-of-band (loaded from a sidecar into
-// device buffers) and are attached here via a base-pointer registry,
+// the per-expert codebook and mode come from GGUF metadata or a legacy sidecar,
+// then are attached here via a base-pointer registry,
 // because the ggml to_fp16 converter signature carries no expert/codebook context.
 
 #include "common.cuh"

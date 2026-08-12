@@ -92,11 +92,11 @@ GGML_BACKEND_API bool ggml_backend_cuda_topk_rows(const struct ggml_tensor * log
 // Attach learned per-expert decode tables to a mixed-precision tensor. The
 // host variants copy the tables to the device that owns `base`. Call the
 // matching unregister function before releasing the tensor's backing buffer.
-// Null pointers, invalid dimensions, or invalid strides abort before allocation.
-GGML_BACKEND_API void ggml_cuda_rocmfp3_mix_register_host(
+// Returns false without registering when validation or device setup fails.
+GGML_BACKEND_API bool ggml_cuda_rocmfp3_mix_register_host(
         const void * base, size_t expert_stride, int n_experts, int out, int in,
         const void * codebooks_bf16_host, const uint8_t * modes_host);
-GGML_BACKEND_API void ggml_cuda_rocmfp2_mix_register_host(
+GGML_BACKEND_API bool ggml_cuda_rocmfp2_mix_register_host(
         const void * base, size_t expert_stride, int n_experts, int out, int in,
         const void * codebooks_bf16_host, const uint8_t * modes_host);
 GGML_BACKEND_API void ggml_cuda_rocmfp2_mix_unregister(const void * base);

@@ -2,8 +2,8 @@
 // Runtime decode support for GGML_TYPE_Q2_1_ROCMFP2_MIX (106): per-expert mixed
 // absmax/adaptive ROCmFP2. The 10-byte block wire is identical to q2_0_rocmfpx, so
 // a GGUF splice from qtype 107 is offset-preserving;
-// the per-expert codebook and mode live out-of-band (loaded from a sidecar into
-// device buffers) and are attached here via a base-pointer registry,
+// the per-expert codebook and mode come from GGUF metadata or a legacy sidecar,
+// then are attached here via a base-pointer registry,
 // because the ggml to_fp16 converter signature carries no expert/codebook context.
 
 #include "common.cuh"

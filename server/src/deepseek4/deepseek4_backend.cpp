@@ -1463,7 +1463,7 @@ bool DeepSeek4Backend::init_hybrid_model() {
         return fail_hybrid_init();
     }
     if (same_runtime_tp && has_mix_experts &&
-        !register_deepseek4_moe_hybrid_mix_sidecars(
+        !register_deepseek4_moe_hybrid_mix_tables(
             cfg_.model_path, w_, *hybrid, &err)) {
         std::fprintf(stderr,
                      "[deepseek4] failed to register hybrid mixed experts: %s\n",

@@ -164,10 +164,18 @@ int main() {
     for (size_t i = 0; i < idsh.size(); ++i) idsh[i] = (int32_t) ((i * 2 + 1) % n_experts);
     HIP_OK(cudaMemcpy(d_ids, idsh.data(), sizeof(int32_t) * idsh.size(), cudaMemcpyHostToDevice));
 
-    ggml_cuda_rocmfp2_mix_register_host(d_up, rows_bytes, n_experts, out, in,
-                                        books_up.data(), modes_up.data());
-    ggml_cuda_rocmfp2_mix_register_host(d_gate, rows_bytes, n_experts, out, in,
-                                        books_gate.data(), modes_gate.data());
+    CHECK(!ggml_cuda_rocmfp2_mix_register_host(
+              d_up, rows_bytes, n_experts, out, in - 32,
+              books_up.data(), modes_up.data()),
+          "qtype-106 rejects a row that violates its wide-load alignment");
+    CHECK(ggml_cuda_rocmfp2_mix_register_host(
+              d_up, rows_bytes, n_experts, out, in,
+              books_up.data(), modes_up.data()),
+          "up registration succeeds");
+    CHECK(ggml_cuda_rocmfp2_mix_register_host(
+              d_gate, rows_bytes, n_experts, out, in,
+              books_gate.data(), modes_gate.data()),
+          "gate registration succeeds");
 
     const int64_t ids_s0 = 1, ids_s1 = n_used;
     const int64_t src1_s1 = 0, src1_s2 = in;         // ne11 == 1 -> slot broadcast
@@ -278,8 +286,10 @@ int main() {
                                                 limit, nullptr));
     // Re-register with a DIFFERENT out: a shape-mismatched pair must be refused too, because the
     // grid is sized from one half and would index past the other.
-    ggml_cuda_rocmfp2_mix_register_host(d_gate, rows_bytes, n_experts, out / 2, in,
-                                        books_gate.data(), modes_gate.data());
+    CHECK(ggml_cuda_rocmfp2_mix_register_host(
+              d_gate, rows_bytes, n_experts, out / 2, in,
+              books_gate.data(), modes_gate.data()),
+          "shape-mismatch registration succeeds");
     CHECK(!ggml_cuda_rocmfp2_mix_mul_mat_id_glu(d_up, d_gate, d_x, d_ids, d_fused,
                                                 in, out, n_used, ntok, 1,
                                                 ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2,
