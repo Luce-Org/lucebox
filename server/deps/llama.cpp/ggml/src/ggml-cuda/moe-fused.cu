@@ -3,6 +3,7 @@
 #include "ggml-cuda/dequantize.cuh"
 #include "ggml-cuda/mmvq.cuh"
 
+#include <climits>
 #include <cstring>
 
 static __device__ __forceinline__ float silu_f32(float x) {
@@ -451,14 +452,15 @@ static __global__ void ds4_balanced_owner_ids_kernel(
     }
 
     // Assign one shared quota over the complete verification batch. Quarter-
-    // route units expose the otherwise unreachable 16/30 split at q=5 while
-    // keeping the decision device-local and identical on both owners.
-    const int main_quota = (main_slots_x4 * n_tokens) / 4;
-    int assigned_main = 0;
+    // route units allow fractional per-token splits while keeping the decision
+    // device-local and identical on both owners.
+    const int64_t main_quota =
+        ((int64_t) main_slots_x4 * n_tokens) / 4;
+    int64_t assigned_main = 0;
     for (int token = 0; token < n_tokens; ++token) {
-        const int row = token * n_routes;
+        const int64_t row = (int64_t) token * n_routes;
         for (int route = 0; route < n_routes; ++route) {
-            const int index = row + route;
+            const int64_t index = row + route;
             const int32_t global_id = global_ids[index];
             const bool active = router_weights[index] != 0.0f;
             const bool valid_global = global_id >= 0 && global_id < n_expert;
@@ -660,22 +662,30 @@ void ggml_cuda_op_moe_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         GGML_ASSERT(local_lut && local_lut->type == GGML_TYPE_I32);
         GGML_ASSERT(candidate_lut && candidate_lut->type == GGML_TYPE_F32);
         GGML_ASSERT(dst->type == GGML_TYPE_I32);
+        GGML_ASSERT(ggml_are_same_shape(global_ids, weights));
+        GGML_ASSERT(ggml_are_same_shape(global_ids, dst));
         GGML_ASSERT(ggml_is_contiguous(global_ids));
         GGML_ASSERT(ggml_is_contiguous(weights));
         GGML_ASSERT(ggml_is_contiguous(local_lut));
         GGML_ASSERT(ggml_is_contiguous(candidate_lut));
         GGML_ASSERT(ggml_is_contiguous(dst));
 
+        GGML_ASSERT(global_ids->ne[0] > 0 && global_ids->ne[0] <= INT_MAX / 4 &&
+                    global_ids->ne[1] > 0 && global_ids->ne[1] <= INT_MAX);
         const int n_routes = (int) global_ids->ne[0];
         const int n_tokens = (int) global_ids->ne[1];
-        // LUT rows are replicated across verifier tokens. Only dimension 1 is
-        // the base expert domain; using the total element count would permit a
-        // positive out-of-range ID to index a later replica.
-        GGML_ASSERT(local_lut->ne[0] == 1 && local_lut->ne[1] > 0);
+        GGML_ASSERT(local_lut->ne[0] == 1 && local_lut->ne[2] == n_tokens &&
+                    local_lut->ne[3] == 1);
         GGML_ASSERT(candidate_lut->ne[0] == 1 &&
-                    candidate_lut->ne[1] == local_lut->ne[1]);
+                    candidate_lut->ne[1] == local_lut->ne[1] &&
+                    candidate_lut->ne[2] == n_tokens &&
+                    candidate_lut->ne[3] == 1);
+        GGML_ASSERT(local_lut->ne[1] > 0 && local_lut->ne[1] <= INT_MAX);
+        // Dimension 1 is the base expert domain; later dimensions are only
+        // verifier-token replicas and must not expand the valid ID range.
         const int n_expert = (int) local_lut->ne[1];
         const int main_slots_x4 = ggml_get_op_params_i32(dst, 1);
+        GGML_ASSERT(main_slots_x4 > 0 && main_slots_x4 <= 4 * n_routes);
         const bool main_owner = ggml_get_op_params_i32(dst, 2) != 0;
         ds4_balanced_owner_ids_kernel<<<1, 1, 0, ctx.stream()>>>(
             (const int32_t *) global_ids->data,

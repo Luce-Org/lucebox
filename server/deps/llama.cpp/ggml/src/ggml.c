@@ -8425,17 +8425,19 @@ struct ggml_tensor * ggml_ds4_moe_balanced_owner_ids(
     GGML_ASSERT(local_id_lut->type == GGML_TYPE_I32);
     GGML_ASSERT(main_candidate_lut->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_are_same_shape(global_ids, router_weights));
-    GGML_ASSERT(ggml_nelements(local_id_lut) ==
-                ggml_nelements(main_candidate_lut));
-    GGML_ASSERT(local_id_lut->ne[0] == 1 && local_id_lut->ne[1] > 0);
-    GGML_ASSERT(main_candidate_lut->ne[0] == 1 &&
-                main_candidate_lut->ne[1] == local_id_lut->ne[1]);
+    GGML_ASSERT(global_ids->ne[0] > 0 && global_ids->ne[0] <= INT_MAX / 4 &&
+                global_ids->ne[1] > 0 && global_ids->ne[1] <= INT_MAX);
+    GGML_ASSERT(local_id_lut->ne[0] == 1 &&
+                local_id_lut->ne[1] > 0 && local_id_lut->ne[1] <= INT_MAX &&
+                local_id_lut->ne[2] == global_ids->ne[1] &&
+                local_id_lut->ne[3] == 1);
+    GGML_ASSERT(ggml_are_same_shape(local_id_lut, main_candidate_lut));
     GGML_ASSERT(ggml_is_contiguous(global_ids));
     GGML_ASSERT(ggml_is_contiguous(router_weights));
     GGML_ASSERT(ggml_is_contiguous(local_id_lut));
     GGML_ASSERT(ggml_is_contiguous(main_candidate_lut));
     GGML_ASSERT(main_slots_x4 > 0 &&
-                main_slots_x4 <= 4 * global_ids->ne[0]);
+                main_slots_x4 <= 4 * (int) global_ids->ne[0]);
 
     struct ggml_tensor * result = ggml_dup_tensor(ctx, global_ids);
     result->op = GGML_OP_MOE_FUSED;
