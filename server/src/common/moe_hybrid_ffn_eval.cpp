@@ -1,6 +1,5 @@
 #include "moe_hybrid_ffn_eval.h"
 #include "cuda_graph_overrides.h"
-#include "heterogeneous_stage_planner.h"
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -232,10 +231,9 @@ static int dynamic_route_balance_main_slots_x4(
     if (!config.valid) {
         requested_x4 = -1;
     } else if (requested_x4 == 0 && config.main_to_peer_rate > 0.0) {
-        const HeterogeneousStagePlan plan =
-            plan_balanced_heterogeneous_stage_width(
-                4 * n_used, 1, config.main_to_peer_rate, 1.0);
-        requested_x4 = plan.valid() ? plan.main_width : -1;
+        requested_x4 = moe_balanced_main_slots_x4(
+            n_used, config.main_to_peer_rate);
+        if (requested_x4 == 0) requested_x4 = -1;
         if (derived_main_to_peer_rate) {
             *derived_main_to_peer_rate = config.main_to_peer_rate;
         }

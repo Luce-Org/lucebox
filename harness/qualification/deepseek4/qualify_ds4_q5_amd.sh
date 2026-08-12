@@ -93,8 +93,8 @@ case "$DYNAMIC_ROUTE_BALANCE" in
     0|1) ;;
     *) echo "DYNAMIC_ROUTE_BALANCE must be 0 or 1" >&2; exit 2 ;;
 esac
-if [[ ! "$EXPERT_TOP_K" =~ ^[1-9][0-9]*$ ]] || ((EXPERT_TOP_K > 16)); then
-    echo "EXPERT_TOP_K must be an integer from 1 through 16" >&2
+if [[ ! "$EXPERT_TOP_K" =~ ^[1-9][0-9]*$ ]] || ((EXPERT_TOP_K > 6)); then
+    echo "EXPERT_TOP_K must be an integer from 1 through 6" >&2
     exit 2
 fi
 if [[ "$DYNAMIC_MAIN_SLOTS" != auto ]] &&

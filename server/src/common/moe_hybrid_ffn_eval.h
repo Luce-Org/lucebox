@@ -8,11 +8,35 @@
 
 #include "ggml-backend.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
 namespace dflash::common {
+
+// Choose the quarter-route main-owner quota that minimizes the slower owner's
+// estimated completion time. Returns zero for invalid inputs.
+inline int moe_balanced_main_slots_x4(int top_k, double main_to_peer_rate) {
+    if (top_k <= 0 || top_k > std::numeric_limits<int>::max() / 4 ||
+        !std::isfinite(main_to_peer_rate) || main_to_peer_rate <= 0.0) {
+        return 0;
+    }
+
+    const int total = 4 * top_k;
+    const double peer_exact = (double) total / (main_to_peer_rate + 1.0);
+    const int peer_lower = std::clamp((int) std::floor(peer_exact), 0, total);
+    const int peer_upper = std::clamp((int) std::ceil(peer_exact), 0, total);
+    const auto completion_time = [=](int peer) {
+        return std::max((double) (total - peer) / main_to_peer_rate,
+                        (double) peer);
+    };
+    const int peer = completion_time(peer_upper) < completion_time(peer_lower)
+        ? peer_upper : peer_lower;
+    return total - peer;
+}
 
 // GPU-resident residual combine graph: output = residual + hot_out + cold_correction.
 struct ResidualCombineGraph {
