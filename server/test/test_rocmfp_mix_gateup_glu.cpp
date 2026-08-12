@@ -166,16 +166,13 @@ int main() {
 
     CHECK(!ggml_cuda_rocmfp2_mix_register_host(
               d_up, rows_bytes, n_experts, out, in - 32,
-              books_up.data(), modes_up.data()),
-          "qtype-106 rejects a row that violates its wide-load alignment");
+              books_up.data(), modes_up.data()));
     CHECK(ggml_cuda_rocmfp2_mix_register_host(
               d_up, rows_bytes, n_experts, out, in,
-              books_up.data(), modes_up.data()),
-          "up registration succeeds");
+              books_up.data(), modes_up.data()));
     CHECK(ggml_cuda_rocmfp2_mix_register_host(
               d_gate, rows_bytes, n_experts, out, in,
-              books_gate.data(), modes_gate.data()),
-          "gate registration succeeds");
+              books_gate.data(), modes_gate.data()));
 
     const int64_t ids_s0 = 1, ids_s1 = n_used;
     const int64_t src1_s1 = 0, src1_s2 = in;         // ne11 == 1 -> slot broadcast
@@ -288,8 +285,7 @@ int main() {
     // grid is sized from one half and would index past the other.
     CHECK(ggml_cuda_rocmfp2_mix_register_host(
               d_gate, rows_bytes, n_experts, out / 2, in,
-              books_gate.data(), modes_gate.data()),
-          "shape-mismatch registration succeeds");
+              books_gate.data(), modes_gate.data()));
     CHECK(!ggml_cuda_rocmfp2_mix_mul_mat_id_glu(d_up, d_gate, d_x, d_ids, d_fused,
                                                 in, out, n_used, ntok, 1,
                                                 ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2,

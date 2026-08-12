@@ -1106,6 +1106,7 @@ if(DFLASH27B_TESTS)
         endif()
         target_include_directories(test_rocmfp3_mix_registry PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src/ggml-cuda)
         target_link_libraries(test_rocmfp3_mix_registry PRIVATE
             ggml ggml-base ${DFLASH27B_GGML_BACKEND_TARGET})
@@ -1132,6 +1133,7 @@ if(DFLASH27B_TESTS)
         endif()
         target_include_directories(test_rocmfp_mix_slice_matvec PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src/ggml-cuda)
         target_link_libraries(test_rocmfp_mix_slice_matvec PRIVATE
             ggml ggml-base ${DFLASH27B_GGML_BACKEND_TARGET})
@@ -1158,6 +1160,7 @@ if(DFLASH27B_TESTS)
         endif()
         target_include_directories(test_rocmfp_mix_gateup_glu PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src/ggml-cuda)
         target_link_libraries(test_rocmfp_mix_gateup_glu PRIVATE
             ggml ggml-base ${DFLASH27B_GGML_BACKEND_TARGET})
