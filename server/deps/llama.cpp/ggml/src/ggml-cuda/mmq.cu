@@ -561,7 +561,7 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
                 ? (int) parsed
                 : 0;
         }();
-        if (ne11 <= min_ncols) {
+        if (ne11 < min_ncols) {
             return false;
         }
     }

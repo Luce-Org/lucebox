@@ -138,19 +138,7 @@ static __device__ __forceinline__ float vec_dot_rocmfpx_fp2_q8_1_packed32(
 
     const float db = __low2float(bq8_1->ds);
 #ifdef ROCMFP2_AFFINE
-    // affine type-107: value = code*scale - offset, e[0]=scale, e[1]=offset.
-    // val_packed holds codebook(code) = code-1, so the affine dot is
-    // scale*sumi + (scale-offset)*sumq (see vecdotq.cuh).
-    const float scale  = rocmfpx_ue4m3_to_fp32_finite(bq2->e[0]);
-    const float offset = rocmfpx_ue4m3_to_fp32_finite(bq2->e[1]);
-    int sumq = 0;
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        const int u = get_int_b4(bq8_1->qs, 4*iqs + j);
-        sumq += (int8_t)(u & 0xFF) + (int8_t)((u >> 8) & 0xFF)
-              + (int8_t)((u >> 16) & 0xFF) + (int8_t)((u >> 24) & 0xFF);
-    }
-    return db * (scale * sumi + (scale - offset) * sumq);
+    return rocmfpx_fp2_affine_dot(bq2, bq8_1, sumi, iqs, db);
 #else
     return db * rocmfpx_ue4m3_to_fp32_finite(bq2->e[iqs]) * sumi;
 #endif
@@ -1500,7 +1488,8 @@ static __global__ void mmid_group_prep(
 // their concurrent weight reads are served once from DRAM, then from L1/L2.
 // Weight traffic approaches (union of routed experts) instead of
 // (n_expert_used x n_tokens) expert-matrix reads.
-template <ggml_type type, int c_rows_per_block, bool has_fusion>
+template <ggml_type type, int c_rows_per_block, bool has_fusion,
+          bool fp3_packed24 = false, bool fp2_packed32 = false>
 __launch_bounds__(MMID_GROUPED_MAX_TPG*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_moe_grouped(
         const void * __restrict__ vx, const void * __restrict__ vy, const int32_t * __restrict__ meta,
@@ -1516,6 +1505,10 @@ static __global__ void mul_mat_vec_q_moe_grouped(
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+    static_assert(!fp3_packed24 || type == GGML_TYPE_Q3_0_ROCMFPX,
+                  "packed FP3 grouped dispatch requires ROCmFP3 weights");
+    static_assert(!fp2_packed32 || type == GGML_TYPE_Q2_0_ROCMFP2,
+                  "packed FP2 grouped dispatch requires ROCmFP2 weights");
 
     const uint32_t p = blockIdx.y*MMID_GROUPED_MAX_TPG + threadIdx.y;
     if (p >= np) {
@@ -1578,14 +1571,34 @@ static __global__ void mul_mat_vec_q_moe_grouped(
 
 #pragma unroll
         for (int i = 0; i < c_rows_per_block; ++i) {
-            tmp[i] += vec_dot_q_cuda(
-                vx, &y[kby],
-                kbx_offset + i*stride_row_x + kbx, kqs);
+            if constexpr (fp2_packed32) {
+                tmp[i] += vec_dot_rocmfpx_fp2_q8_1_packed32(
+                    vx, &y[kby],
+                    kbx_offset + i*stride_row_x + kbx, kqs);
+            } else if constexpr (fp3_packed24) {
+                tmp[i] += vec_dot_rocmfpx_fp3_q8_1_packed24(
+                    vx, &y[kby],
+                    kbx_offset + i*stride_row_x + kbx, kqs);
+            } else {
+                tmp[i] += vec_dot_q_cuda(
+                    vx, &y[kby],
+                    kbx_offset + i*stride_row_x + kbx, kqs);
+            }
             if constexpr (has_fusion) {
                 if (use_gate) {
-                    tmp_gate[i] += vec_dot_q_cuda(
-                        vgate, &y[kby],
-                        kbx_offset + i*stride_row_x + kbx, kqs);
+                    if constexpr (fp2_packed32) {
+                        tmp_gate[i] += vec_dot_rocmfpx_fp2_q8_1_packed32(
+                            vgate, &y[kby],
+                            kbx_offset + i*stride_row_x + kbx, kqs);
+                    } else if constexpr (fp3_packed24) {
+                        tmp_gate[i] += vec_dot_rocmfpx_fp3_q8_1_packed24(
+                            vgate, &y[kby],
+                            kbx_offset + i*stride_row_x + kbx, kqs);
+                    } else {
+                        tmp_gate[i] += vec_dot_q_cuda(
+                            vgate, &y[kby],
+                            kbx_offset + i*stride_row_x + kbx, kqs);
+                    }
                 }
             }
         }
@@ -1649,7 +1662,8 @@ static __global__ void mul_mat_vec_q_moe_grouped(
     }
 }
 
-template <ggml_type type>
+template <ggml_type type, bool fp3_packed24 = false,
+          bool fp2_packed32 = false>
 static void mul_mat_vec_q_moe_grouped_launch(
         const void * vx, const void * vy, const int32_t * meta, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
@@ -1664,15 +1678,21 @@ static void mul_mat_vec_q_moe_grouped_launch(
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
     if (has_fusion) {
-        mul_mat_vec_q_moe_grouped<type, rows_per_block, true><<<block_nums, block_dims, 0, stream>>>(
-            vx, vy, meta, fusion, dst, (uint32_t) np, ncols_x, nchannels_y, nrows_x,
-            stride_row_x, stride_col_y, stride_col_dst,
-            stride_channel_x, stride_channel_y, stride_channel_dst);
+        mul_mat_vec_q_moe_grouped<
+            type, rows_per_block, true, fp3_packed24, fp2_packed32>
+            <<<block_nums, block_dims, 0, stream>>>(
+                vx, vy, meta, fusion, dst, (uint32_t) np, ncols_x,
+                nchannels_y, nrows_x, stride_row_x, stride_col_y,
+                stride_col_dst, stride_channel_x, stride_channel_y,
+                stride_channel_dst);
     } else {
-        mul_mat_vec_q_moe_grouped<type, rows_per_block, false><<<block_nums, block_dims, 0, stream>>>(
-            vx, vy, meta, fusion, dst, (uint32_t) np, ncols_x, nchannels_y, nrows_x,
-            stride_row_x, stride_col_y, stride_col_dst,
-            stride_channel_x, stride_channel_y, stride_channel_dst);
+        mul_mat_vec_q_moe_grouped<
+            type, rows_per_block, false, fp3_packed24, fp2_packed32>
+            <<<block_nums, block_dims, 0, stream>>>(
+                vx, vy, meta, fusion, dst, (uint32_t) np, ncols_x,
+                nchannels_y, nrows_x, stride_row_x, stride_col_y,
+                stride_col_dst, stride_channel_x, stride_channel_y,
+                stride_channel_dst);
     }
 }
 
@@ -1709,17 +1729,45 @@ static bool mul_mat_vec_q_grouped_dispatch(
                 stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst, max_groups, warp_size, stream);
             return true;
         case GGML_TYPE_Q2_0_ROCMFP2:
-            mul_mat_vec_q_moe_grouped_launch<GGML_TYPE_Q2_0_ROCMFP2>(
-                vx, vy, meta, fusion, dst, ncols_x, nchannels_y_fd, nrows_x,
-                stride_row_x, stride_col_y, stride_col_dst, stride_channel_x,
-                stride_channel_y, stride_channel_dst, max_groups, warp_size, stream);
+            if (mmvq_env_flag("DFLASH_CUDA_MMVQ_MOE_FP2_PACKED32")) {
+                mul_mat_vec_q_moe_grouped_launch<
+                    GGML_TYPE_Q2_0_ROCMFP2, false, true>(
+                        vx, vy, meta, fusion, dst, ncols_x, nchannels_y_fd,
+                        nrows_x, stride_row_x, stride_col_y, stride_col_dst,
+                        stride_channel_x, stride_channel_y, stride_channel_dst,
+                        max_groups, warp_size, stream);
+            } else {
+                mul_mat_vec_q_moe_grouped_launch<
+                    GGML_TYPE_Q2_0_ROCMFP2>(
+                        vx, vy, meta, fusion, dst, ncols_x, nchannels_y_fd,
+                        nrows_x, stride_row_x, stride_col_y, stride_col_dst,
+                        stride_channel_x, stride_channel_y, stride_channel_dst,
+                        max_groups, warp_size, stream);
+            }
             return true;
-        case GGML_TYPE_Q3_0_ROCMFPX:
-            mul_mat_vec_q_moe_grouped_launch<GGML_TYPE_Q3_0_ROCMFPX>(
-                vx, vy, meta, fusion, dst, ncols_x, nchannels_y_fd, nrows_x,
-                stride_row_x, stride_col_y, stride_col_dst, stride_channel_x,
-                stride_channel_y, stride_channel_dst, max_groups, warp_size, stream);
+        case GGML_TYPE_Q3_0_ROCMFPX: {
+            const bool packed =
+                mmvq_env_flag("DFLASH_CUDA_MMVQ_MOE_FP3_PACKED24") &&
+                std::getenv(
+                    "DFLASH_CUDA_MMVQ_MOE_FP3_PACKED24_RUNTIME_DISABLE") ==
+                    nullptr;
+            if (packed) {
+                mul_mat_vec_q_moe_grouped_launch<
+                    GGML_TYPE_Q3_0_ROCMFPX, true>(
+                        vx, vy, meta, fusion, dst, ncols_x, nchannels_y_fd,
+                        nrows_x, stride_row_x, stride_col_y, stride_col_dst,
+                        stride_channel_x, stride_channel_y, stride_channel_dst,
+                        max_groups, warp_size, stream);
+            } else {
+                mul_mat_vec_q_moe_grouped_launch<
+                    GGML_TYPE_Q3_0_ROCMFPX>(
+                        vx, vy, meta, fusion, dst, ncols_x, nchannels_y_fd,
+                        nrows_x, stride_row_x, stride_col_y, stride_col_dst,
+                        stride_channel_x, stride_channel_y, stride_channel_dst,
+                        max_groups, warp_size, stream);
+            }
             return true;
+        }
         default:
             return false;
     }

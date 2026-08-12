@@ -93,10 +93,11 @@ struct MoeHybridLayerStorage {
     std::vector<int32_t> hot_expert_ids;
     std::vector<int32_t> cold_expert_ids;
     std::vector<int32_t> hot_local_by_global;
-    // Optional decode ownership is a subset of the physically resident hot
-    // experts. Prefill can use every resident expert while decode retains a
-    // separately balanced fork. Empty means identical to hot_local_by_global.
+    // Optional decode ownership is independent of the physical maps used by
+    // prefill. Empty maps fall back to hot_local_by_global and
+    // cold_local_by_global respectively.
     std::vector<int32_t> decode_hot_local_by_global;
+    std::vector<int32_t> decode_cold_local_by_global;
     std::vector<int32_t> cold_local_by_global;
 
     // --- Bounded GPU expert cache (laguna) ---

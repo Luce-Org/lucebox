@@ -1566,6 +1566,9 @@ bool DeepSeek4Backend::init_hybrid_model() {
             MoeHybridLayerStorage & layer = hybrid->layers[(size_t) il];
             layer.decode_hot_local_by_global.assign(
                 (size_t) w_.n_expert, -1);
+            layer.decode_cold_local_by_global.assign(
+                (size_t) w_.n_expert, -1);
+            std::vector<uint8_t> decode_hot((size_t) w_.n_expert, 0);
             for (int32_t expert :
                     moe_decode_placement_.hot_expert_ids[(size_t) il]) {
                 if (expert < 0 || expert >= w_.n_expert ||
@@ -1576,38 +1579,28 @@ bool DeepSeek4Backend::init_hybrid_model() {
                                  (int) expert, il);
                     return fail_hybrid_init();
                 }
-                layer.decode_hot_local_by_global[(size_t) expert] =
-                    layer.hot_local_by_global[(size_t) expert];
+                decode_hot[(size_t) expert] = 1;
             }
-        }
-    }
-
-    // The physical placement is shared by both phases. Decode may own only a
-    // subset so its fast main branch does not outrun and then wait on the peer;
-    // prefill continues to consume every resident expert.
-    if (!moe_decode_placement_.empty()) {
-        if (!moe_decode_placement_.matches(
-                w_.n_layer, w_.n_expert, w_.n_expert_used)) {
-            std::fprintf(stderr,
-                         "[deepseek4] decode placement dimensions are invalid\n");
-            return false;
-        }
-        for (int il = 0; il < w_.n_layer; ++il) {
-            MoeHybridLayerStorage & layer = hybrid->layers[(size_t) il];
-            layer.decode_hot_local_by_global.assign(
-                (size_t) w_.n_expert, -1);
-            for (int32_t expert :
-                    moe_decode_placement_.hot_expert_ids[(size_t) il]) {
-                if (expert < 0 || expert >= w_.n_expert ||
-                    layer.hot_local_by_global[(size_t) expert] < 0) {
-                    std::fprintf(stderr,
-                                 "[deepseek4] decode owner expert %d in layer "
-                                 "%d is not resident\n",
-                                 (int) expert, il);
-                    return false;
-                }
-                layer.decode_hot_local_by_global[(size_t) expert] =
+            for (int expert = 0; expert < w_.n_expert; ++expert) {
+                const int32_t hot =
                     layer.hot_local_by_global[(size_t) expert];
+                const int32_t cold =
+                    layer.cold_local_by_global[(size_t) expert];
+                if (decode_hot[(size_t) expert]) {
+                    layer.decode_hot_local_by_global[(size_t) expert] = hot;
+                } else if (cold >= 0) {
+                    layer.decode_cold_local_by_global[(size_t) expert] = cold;
+                } else if (hot >= 0) {
+                    // A resident-only expert cannot move to the secondary
+                    // owner, so retain it on the primary during decode.
+                    layer.decode_hot_local_by_global[(size_t) expert] = hot;
+                } else {
+                    std::fprintf(stderr,
+                                 "[deepseek4] decode expert %d in layer %d "
+                                 "has no resident owner\n",
+                                 expert, il);
+                    return fail_hybrid_init();
+                }
             }
         }
     }
@@ -1623,10 +1616,12 @@ bool DeepSeek4Backend::init_hybrid_model() {
                 std::fprintf(stderr,
                              "[deepseek4] decode-all-cold requires a full "
                              "secondary expert stack (layer=%d)\n", il);
-                return false;
+                return fail_hybrid_init();
             }
             layer.decode_hot_local_by_global.assign(
                 (size_t) w_.n_expert, -1);
+            layer.decode_cold_local_by_global =
+                layer.cold_local_by_global;
         }
         std::fprintf(stderr,
                      "[deepseek4] speculative verifier routes all experts "

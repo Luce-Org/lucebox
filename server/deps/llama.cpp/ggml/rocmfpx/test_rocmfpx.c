@@ -103,6 +103,31 @@ static void check_weighted_imatrix_fp2(void) {
     assert(weighted_err < plain_err);
 }
 
+#ifdef ROCMFP2_AFFINE
+static void check_fp2_affine_encoding(void) {
+    float src[QK_ROCMFP2];
+    block_rocmfp2 quantized;
+
+    for (int i = 0; i < QK_ROCMFP2; ++i) {
+        src[i] = -2.0f + 4.0f*(float) i/(float) (QK_ROCMFP2 - 1);
+    }
+    rocmfpx_quantize_row_fp2_ref(src, &quantized, QK_ROCMFP2);
+
+    const float scale = rocmfpx_ue4m3_to_fp32(quantized.e[0]);
+    const float offset = rocmfpx_ue4m3_to_fp32(quantized.e[1]);
+    assert(scale > 0.0f);
+    assert(offset > 0.0f);
+    for (int i = 0; i < QK_ROCMFP2; ++i) {
+        const float q = floorf((src[i] + offset)/scale + 0.5f);
+        const uint8_t expected =
+            (uint8_t) fminf(3.0f, fmaxf(0.0f, q));
+        const uint8_t actual =
+            (quantized.qs[i >> 2] >> (2*(i & 3))) & 0x3;
+        assert(actual == expected);
+    }
+}
+#endif
+
 static void check_large_finite_values(void) {
     float src[QK_ROCMFPX] = { 0 };
     float imatrix[QK_ROCMFPX];
@@ -189,6 +214,9 @@ int main(void) {
     assert(mse3 < mse2);
 
     check_weighted_imatrix_fp2();
+#ifdef ROCMFP2_AFFINE
+    check_fp2_affine_encoding();
+#endif
     check_weighted_imatrix_fp3();
     check_large_finite_values();
 

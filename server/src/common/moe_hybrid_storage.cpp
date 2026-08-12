@@ -337,6 +337,7 @@ bool build_moe_hybrid_storage(const MoeHybridConfig & cfg,
                 dst.cold_expert_ids.push_back((int32_t)expert);
             }
         }
+        dst.decode_cold_local_by_global = dst.cold_local_by_global;
 
         // Populate the model-sized VRAM bitmask from hot expert IDs.
         dst.reset_expert_vram_mask(cfg.n_expert);
@@ -553,6 +554,7 @@ bool build_moe_hybrid_storage_from_file(
                 }
             }
         }
+        dst.decode_cold_local_by_global = dst.cold_local_by_global;
 
         // Populate the model-sized VRAM bitmask from hot expert IDs.
         dst.reset_expert_vram_mask(cfg.n_expert);

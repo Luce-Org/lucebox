@@ -18,12 +18,16 @@ server_dir=$(cd "$script_dir/.." && pwd)
 build_dir=${DFLASH_BUILD_DIR:-$server_dir/build-hip-dual}
 binary=$build_dir/dflash_server
 
-for path in "$target" "$draft" "$binary"; do
+for path in "$target" "$draft"; do
     if [[ ! -f $path ]]; then
         echo "missing required file: $path" >&2
         exit 1
     fi
 done
+if [[ ! -f $binary || ! -x $binary ]]; then
+    echo "missing executable: $binary" >&2
+    exit 1
+fi
 
 main_device=${DS4_MAIN_DEVICE:-hip:0}
 peer_device=${DS4_PEER_DEVICE:-1}
@@ -71,9 +75,6 @@ export DFLASH_CUDA_MMVQ_MOE_FP2_PACKED32=${DFLASH_CUDA_MMVQ_MOE_FP2_PACKED32:-1}
 export DFLASH_CUDA_MMVQ_MOE_FP3_PACKED24=${DFLASH_CUDA_MMVQ_MOE_FP3_PACKED24:-1}
 export DFLASH_CUDA_MMVQ_MOE_FP3_PACKED24_DECODE_ONLY=${DFLASH_CUDA_MMVQ_MOE_FP3_PACKED24_DECODE_ONLY:-1}
 export DFLASH_CUDA_MMVQ_FP4_X4=${DFLASH_CUDA_MMVQ_FP4_X4:-1}
-export DFLASH_ROCMFP2_FIXED_K=${DFLASH_ROCMFP2_FIXED_K:-1}
-export DFLASH_ROCMFP3_FIXED_K=${DFLASH_ROCMFP3_FIXED_K:-1}
-export DFLASH_ROCMFP4_UNROLL2=${DFLASH_ROCMFP4_UNROLL2:-1}
 export DFLASH_DS4_TP_MASKED_ROUTES=${DFLASH_DS4_TP_MASKED_ROUTES:-1}
 export DFLASH_DS4_TP_DEVICE_JOIN=${DFLASH_DS4_TP_DEVICE_JOIN:-1}
 export DFLASH_DS4_TP_NATIVE_ROUTE_WIDTH=${DFLASH_DS4_TP_NATIVE_ROUTE_WIDTH:-1}

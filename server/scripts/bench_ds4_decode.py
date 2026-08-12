@@ -16,6 +16,11 @@ PROMPT = (
 )
 
 
+def is_beta_sequence(content: str) -> bool:
+    words = content.split()
+    return bool(words) and all(word == "BETA" for word in words)
+
+
 def run_request(url: str, model: str, max_tokens: int, timeout: float) -> dict:
     body = json.dumps(
         {
@@ -51,6 +56,7 @@ def run_request(url: str, model: str, max_tokens: int, timeout: float) -> dict:
         "cached_prefix_tokens": timings.get("cached_prefix_tokens"),
         "finish_reason": choice.get("finish_reason"),
         "output_sha256": hashlib.sha256(content.encode()).hexdigest(),
+        "output_matches_prompt": is_beta_sequence(content),
         "wall_seconds": wall_seconds,
     }
 
@@ -61,6 +67,8 @@ def validate_run(run: dict, max_tokens: int) -> None:
             f"expected {max_tokens} completion tokens, got "
             f"{run['completion_tokens']}"
         )
+    if not run["output_matches_prompt"]:
+        raise RuntimeError("model output did not contain only the requested BETA sequence")
     if run["cache_hit"] or run["cached_prefix_tokens"] not in (None, 0):
         raise RuntimeError("benchmark request reused a cached prefix")
     throughput = run["decode_tokens_per_second"]

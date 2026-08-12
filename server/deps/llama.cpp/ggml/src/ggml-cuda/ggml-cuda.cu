@@ -3118,8 +3118,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int64_t ne_get_rows = ne12 * n_expert_used;
 
     std::vector<int32_t> ids_to_sorted_host;
-    ids_to_sorted_host.reserve(2*ne_get_rows);
-    std::vector<int32_t> ids_from_sorted_host(ne_get_rows);
+    ids_to_sorted_host.reserve(ne_get_rows);
+    std::vector<int32_t> ids_from_sorted_host(ne_get_rows, -1);
 
     ggml_cuda_pool_alloc<int32_t> ids_buf_dev(ctx.pool(), 2*ne_get_rows);
 
@@ -3135,41 +3135,54 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     for (int64_t i02 = 0; i02 < ne02; ++i02) { // expert matrices
         for (int64_t i12 = 0; i12 < ne12; ++i12) { // tokens
             for (int64_t iex = 0; iex < n_expert_used; ++iex) {
-                int32_t expert_to_use = *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
+                const int32_t expert_to_use = *(const int32_t *)(
+                    ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
                 if (expert_to_use < 0) {
-                    // Masked/dummy slot (the caller's weight for it is zero,
-                    // so the contribution cancels downstream). Fold it into
-                    // expert 0 to keep the sorted-row invariant, mirroring
-                    // the MMQ sorter which compacts negative ids.
-                    expert_to_use = 0;
+                    continue;
                 }
-                assert(expert_to_use >= 0 && expert_to_use < ne02);
+                assert(expert_to_use < ne02);
                 if (expert_to_use == i02) {
-                    ids_from_sorted_host[i12*n_expert_used + iex] = ids_to_sorted_host.size();
+                    ids_from_sorted_host[i12*n_expert_used + iex] =
+                        (int32_t) ids_to_sorted_host.size();
                     ids_to_sorted_host.push_back(i12*ne11 + iex % ne11);
                     tokens_per_expert[i02]++;
-                    // NOTE: no break here. Dummy/masked routing can assign the
-                    // same expert id to several slots of one token; breaking
-                    // after the first match would drop those duplicate rows.
+                    // Do not break: one token may route several slots to the
+                    // same expert.
                 }
             }
         }
     }
-    GGML_ASSERT(ids_to_sorted_host.size() == size_t(ne_get_rows));
+    const size_t n_valid_rows = ids_to_sorted_host.size();
+    const bool has_masked_rows = n_valid_rows < (size_t) ne_get_rows;
+    GGML_ASSERT(n_valid_rows + (has_masked_rows ? 1 : 0) <=
+                (size_t) ne_get_rows);
+    if (has_masked_rows) {
+        const int32_t zero_row = (int32_t) n_valid_rows;
+        for (int32_t & row : ids_from_sorted_host) {
+            if (row < 0) row = zero_row;
+        }
+    }
 
-    ids_to_sorted_host.insert(ids_to_sorted_host.end(), ids_from_sorted_host.begin(), ids_from_sorted_host.end());
-
-    CUDA_CHECK(cudaMemcpyAsync(ids_buf_dev.ptr, ids_to_sorted_host.data(), 2*ne_get_rows*sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    std::vector<int32_t> sorted_ids_host(2*ne_get_rows, 0);
+    std::copy(ids_to_sorted_host.begin(), ids_to_sorted_host.end(),
+              sorted_ids_host.begin());
+    std::copy(ids_from_sorted_host.begin(), ids_from_sorted_host.end(),
+              sorted_ids_host.begin() + ne_get_rows);
+    CUDA_CHECK(cudaMemcpyAsync(ids_buf_dev.ptr, sorted_ids_host.data(),
+                               2*ne_get_rows*sizeof(int32_t),
+                               cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    const int32_t * ids_to_sorted   = ids_buf_dev.ptr + 0*ne_get_rows;
-    const int32_t * ids_from_sorted = ids_buf_dev.ptr + 1*ne_get_rows;
+    const int32_t * ids_to_sorted   = ids_buf_dev.ptr;
+    const int32_t * ids_from_sorted = ids_buf_dev.ptr + ne_get_rows;
 
-    get_rows_cuda(src1->data, src1->type, ids_to_sorted, src1_sorted.ptr, type_src1_sorted,
-        ne10, nb11, nb12, nb13,
-        ne_get_rows, 1, 1, sizeof(int32_t), ne_get_rows*sizeof(int32_t), ne_get_rows*sizeof(int32_t),
-        ne10*ts_src1_sorted, ne_get_rows*ne10*ts_src1_sorted, ne_get_rows*ne10*ts_src1_sorted, stream);
-    CUDA_CHECK(cudaGetLastError());
+    if (n_valid_rows > 0) {
+        get_rows_cuda(src1->data, src1->type, ids_to_sorted, src1_sorted.ptr, type_src1_sorted,
+            ne10, nb11, nb12, nb13,
+            n_valid_rows, 1, 1, sizeof(int32_t), n_valid_rows*sizeof(int32_t), n_valid_rows*sizeof(int32_t),
+            ne10*ts_src1_sorted, n_valid_rows*ne10*ts_src1_sorted, n_valid_rows*ne10*ts_src1_sorted, stream);
+        CUDA_CHECK(cudaGetLastError());
+    }
 
     char * src1_data_cur = (char *) src1_sorted.ptr;
     char *  dst_data_cur = (char *)  dst_sorted.ptr;
@@ -3218,6 +3231,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
         src1_data_cur += src1_slice.nb[2];
         dst_data_cur  +=  dst_slice.nb[2];
+    }
+    if (has_masked_rows) {
+        CUDA_CHECK(cudaMemsetAsync(
+            dst_sorted.ptr + n_valid_rows*ne0*ts_dst_sorted, 0,
+            ne0*ts_dst_sorted, stream));
     }
 
     get_rows_cuda(dst_sorted.ptr, type_dst_sorted, ids_from_sorted, dst->data, dst->type,

@@ -8049,17 +8049,6 @@ bool deepseek4_step_layer_range(
                 const bool device_input_enabled =
                     !device_input_env || !*device_input_env ||
                     std::strcmp(device_input_env, "0") != 0;
-                bool owner_stacks_overlap = false;
-                const size_t owner_map_size = std::min(
-                    layer_storage.hot_local_by_global.size(),
-                    layer_storage.cold_local_by_global.size());
-                for (size_t expert = 0; expert < owner_map_size; ++expert) {
-                    if (layer_storage.hot_local_by_global[expert] >= 0 &&
-                        layer_storage.cold_local_by_global[expert] >= 0) {
-                        owner_stacks_overlap = true;
-                        break;
-                    }
-                }
                 const bool ffn_device_join_possible =
                     device_input_enabled &&
                     n_tokens >= 512 &&
@@ -8072,8 +8061,7 @@ bool deepseek4_step_layer_range(
                     // results into the device join tensors. A genuine split
                     // uses the expert-major host-combine path; treating it as
                     // device-resident makes HC-post read stale tensors.
-                    cold_stack && cold_stack->ne[2] == w.n_expert &&
-                    !owner_stacks_overlap;
+                    cold_stack && cold_stack->ne[2] == w.n_expert;
                 ffn_device_join =
                     use_backend_prefill_hc && ffn_in_backend &&
                     local_expert_runtime &&

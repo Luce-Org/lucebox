@@ -1180,6 +1180,10 @@ bool build_moe_hybrid_ffn_graph(
         storage.decode_hot_local_by_global.empty()
             ? storage.hot_local_by_global
             : storage.decode_hot_local_by_global;
+    const std::vector<int32_t> & decode_cold =
+        storage.decode_cold_local_by_global.empty()
+            ? storage.cold_local_by_global
+            : storage.decode_cold_local_by_global;
     const bool decode_has_hot = std::any_of(
         decode_hot.begin(), decode_hot.end(),
         [](int32_t local) { return local >= 0; });
@@ -1192,7 +1196,7 @@ bool build_moe_hybrid_ffn_graph(
         &out.hot_local_lut, &out.hot_valid_lut,
         &out.hot_remap_nodes, &out.hot_nodes};
     MoeOwnerGraphSpec secondary_owner{
-        &storage.cold_local_by_global,
+        &decode_cold,
         storage.gate_cold, storage.up_cold, storage.down_cold,
         storage.gate_up_cold,
         &out.cold_local_lut, &out.cold_valid_lut,
@@ -3325,7 +3329,7 @@ bool eval_moe_hybrid_ffn_batched(
         cold_on_gpu && storage.cold_backend &&
         storage.cold_backend != gpu_backend &&
         n_hot_stack > 0 && n_cold_stack > 0 &&
-        n_cold_stack <= cfg.n_expert;
+        n_cold_stack < cfg.n_expert;
     if (inprocess_expert_major) {
         static bool logged = false;
         if (!logged) {

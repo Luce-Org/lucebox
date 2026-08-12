@@ -258,6 +258,7 @@ int main() {
         {2048, 4096, 31, "actual_down_n31"},
     };
     const char * shape_filter = std::getenv("DFLASH_TEST_SHAPE");
+    bool matched_shape = false;
 
     bool ok = true;
     for (const QuantCase & quant : quant_cases) {
@@ -265,12 +266,18 @@ int main() {
             if (shape_filter && std::strcmp(shape.label, shape_filter) != 0) {
                 continue;
             }
+            matched_shape = true;
             if (std::strncmp(shape.label, "actual_", 7) == 0 &&
                 quant.type != GGML_TYPE_Q2_0_ROCMFP2) {
                 continue;
             }
             ok = test_case(hip_backend, quant, shape) && ok;
         }
+    }
+    if (shape_filter && !matched_shape) {
+        std::fprintf(stderr, "DFLASH_TEST_SHAPE matched no shape: %s\n",
+                     shape_filter);
+        ok = false;
     }
 
     ggml_backend_free(hip_backend);
