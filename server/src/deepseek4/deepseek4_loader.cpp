@@ -667,6 +667,13 @@ static bool ds4_register_p4mix_sidecar(const std::string & gguf_path,
         return false;
     }
     (void) reserved;
+    if (n_layers == 0 || (size_t) n_layers > out.layers.size()) {
+        std::fprintf(stderr,
+                     "[deepseek4] p4mix table has invalid entry count %u\n",
+                     n_layers);
+        std::fclose(f);
+        return false;
+    }
 
     std::vector<bool> done(out.layers.size(), false);  // resident layers registered
     std::vector<const void *> registered_bases;        // for unwind on failure
@@ -959,6 +966,15 @@ static bool ds4_register_dmix_sidecar(const std::string & gguf_path,
         std::fclose(f);
         return false;
     }
+    const uint64_t max_entries =
+        (uint64_t) n_layers_out * DS4_DMIX_CLASSES;
+    if (n_entries == 0 || (uint64_t) n_entries > max_entries) {
+        std::fprintf(stderr,
+                     "[deepseek4] dmix table has invalid entry count %u\n",
+                     n_entries);
+        std::fclose(f);
+        return false;
+    }
 
     std::vector<const void *> registered_bases;  // unwound on any failure below
     bool ok = true;
@@ -1150,6 +1166,15 @@ static bool ds4_register_gumix_sidecar(const std::string & gguf_path,
         return false;
     }
     (void) reserved;
+    const uint64_t max_entries =
+        (uint64_t) n_layers_out * DS4_GUMIX_SURFACES;
+    if (n_entries == 0 || (uint64_t) n_entries > max_entries) {
+        std::fprintf(stderr,
+                     "[deepseek4] gumix table has invalid entry count %u\n",
+                     n_entries);
+        std::fclose(f);
+        return false;
+    }
 
     std::vector<std::array<bool, DS4_GUMIX_SURFACES>> done(
         n_layers_out, std::array<bool, DS4_GUMIX_SURFACES>{false, false, false});
