@@ -125,6 +125,23 @@ for target in "${target_args[@]}"; do
     fi
 done
 
+# Serialize the host-wide performance-level changes across qualification runs.
+lock_parent="${XDG_RUNTIME_DIR:-/tmp}"
+lock_dir="$lock_parent/dflash-ds4-q5-${UID}.lock"
+if ! mkdir -m 700 "$lock_dir" 2>/dev/null && [[ ! -d "$lock_dir" ]]; then
+    echo "could not create qualification lock directory: $lock_dir" >&2
+    exit 2
+fi
+if [[ -L "$lock_dir" || ! -O "$lock_dir" ]] || ! chmod 700 "$lock_dir"; then
+    echo "qualification lock directory is not safely owned: $lock_dir" >&2
+    exit 2
+fi
+exec 9<"$lock_dir"
+if ! flock -n 9; then
+    echo "another DS4 qualification run owns $lock_dir" >&2
+    exit 2
+fi
+
 if pgrep -f '(^|/)dflash_server([[:space:]]|$)' >/dev/null; then
     echo "another dflash_server is running; stop it before changing global GPU performance levels" >&2
     exit 2
@@ -133,14 +150,6 @@ fi
 mkdir -p "$OUT_ROOT"
 if ! mkdir "$OUT_DIR"; then
     echo "refusing to reuse existing output directory: $OUT_DIR" >&2
-    exit 2
-fi
-
-# Serialize the host-wide performance-level changes across qualification runs.
-lock_path="${XDG_RUNTIME_DIR:-/tmp}/dflash-ds4-q5-${UID}.lock"
-exec {lock_fd}>"$lock_path"
-if ! flock -n "$lock_fd"; then
-    echo "another DS4 qualification run owns $lock_path" >&2
     exit 2
 fi
 
