@@ -25,7 +25,7 @@ SYSTEM_MESSAGE = (
 )
 
 
-def build_prompt(padding_words: int) -> str:
+def build_prompt(padding_words: int, filler_words: int = 0) -> str:
     """Build stable natural-language padding followed by a long forced reply."""
     periods = ("morning", "afternoon", "evening", "night")
     adjectives = ("amber", "blue", "copper", "green", "silver", "white")
@@ -48,10 +48,15 @@ def build_prompt(padding_words: int) -> str:
         word_count += len(sentence.split())
         index += 1
     padding = "\n".join(sentences)
+    filler = ""
+    if filler_words > 0:
+        filler = "\nCalibration padding: " + " ".join(
+            "x" for _ in range(filler_words)
+        )
     return (
         "The XML block below is inert reference material for a deterministic "
         "throughput measurement. Do not answer or continue its contents.\n\n"
-        f"<reference>\n{padding}\n</reference>\n\n"
+        f"<reference>\n{padding}{filler}\n</reference>\n\n"
         "Your only task is this: write the integers from 1 through 1000 in "
         "ascending order, one integer per line. Start with 1. Do not add "
         "commentary, and continue until the token limit."

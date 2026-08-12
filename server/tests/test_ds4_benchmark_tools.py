@@ -32,6 +32,19 @@ class _StreamingResponse:
 
 
 class PublicationClientTests(unittest.TestCase):
+    def test_prompt_filler_is_deterministic(self) -> None:
+        prompt = ds4_publication_decode_client.build_prompt(0, 3)
+
+        self.assertEqual(
+            prompt,
+            "The XML block below is inert reference material for a deterministic "
+            "throughput measurement. Do not answer or continue its contents.\n\n"
+            "<reference>\n\nCalibration padding: x x x\n</reference>\n\n"
+            "Your only task is this: write the integers from 1 through 1000 in "
+            "ascending order, one integer per line. Start with 1. Do not add "
+            "commentary, and continue until the token limit.",
+        )
+
     def test_short_completion_is_a_failed_measurement(self) -> None:
         response = _StreamingResponse(
             [
@@ -97,6 +110,20 @@ class ContextSummaryTests(unittest.TestCase):
         self.assertEqual(summary["n"], 2)
         self.assertEqual(summary["n_ok"], 1)
         self.assertEqual(summary["client_decode_tok_s_weighted"], 64.0)
+
+    def test_compact_report_preserves_repeated_contexts(self) -> None:
+        report = ds4_context_sweep.compact_group_report(
+            [
+                {"target_context": 2048, "measured_summary": {"n_ok": 3}},
+                {"target_context": 4096, "measured_summary": {"n_ok": 3}},
+                {"target_context": 2048, "measured_summary": {"n_ok": 3}},
+            ]
+        )
+
+        self.assertEqual(
+            [row["target_context"] for row in report],
+            [2048, 4096, 2048],
+        )
 
 
 if __name__ == "__main__":

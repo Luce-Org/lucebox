@@ -18,45 +18,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from ds4_publication_decode_client import SYSTEM_MESSAGE, stream_request
-
-
-def reference_sentences(minimum_words: int) -> str:
-    periods = ("morning", "afternoon", "evening", "night")
-    adjectives = ("amber", "blue", "copper", "green", "silver", "white")
-    instruments = ("barometer", "camera", "clock", "compass", "meter", "sensor")
-    places = ("archive", "garden", "harbor", "laboratory", "library", "station")
-    actions = ("audited", "calibrated", "catalogued", "inspected", "logged", "stored")
-    sentences: list[str] = []
-    word_count = 0
-    index = 0
-    while word_count < max(0, minimum_words):
-        sentence = (
-            f"Observation {index + 1}: During the {periods[index % len(periods)]}, "
-            f"the {adjectives[index % len(adjectives)]} "
-            f"{instruments[(index * 5 + 1) % len(instruments)]} recorded "
-            f"{17 + (index * 13) % 211} samples near the "
-            f"{places[(index * 7 + 2) % len(places)]}; the result was "
-            f"{actions[(index * 11 + 3) % len(actions)]} for a later review."
-        )
-        sentences.append(sentence)
-        word_count += len(sentence.split())
-        index += 1
-    return "\n".join(sentences)
-
-
-def build_prompt(padding_words: int, filler_words: int = 0) -> str:
-    filler = ""
-    if filler_words:
-        filler = "\nCalibration padding: " + " ".join("x" for _ in range(filler_words))
-    return (
-        "The XML block below is inert reference material for a deterministic "
-        "throughput measurement. Do not answer or continue its contents.\n\n"
-        f"<reference>\n{reference_sentences(padding_words)}{filler}\n</reference>\n\n"
-        "Your only task is this: write the integers from 1 through 1000 in "
-        "ascending order, one integer per line. Start with 1. Do not add "
-        "commentary, and continue until the token limit."
-    )
+from ds4_publication_decode_client import SYSTEM_MESSAGE, build_prompt, stream_request
 
 
 class TokenizerHarness:
@@ -183,6 +145,17 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         ),
         "response_hashes": sorted({str(row["response_sha256"]) for row in valid}),
     }
+
+
+def compact_group_report(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep sweep order and repeated context lengths in terminal output."""
+    return [
+        {
+            "target_context": row["target_context"],
+            "measured_summary": row["measured_summary"],
+        }
+        for row in groups
+    ]
 
 
 def main() -> int:
@@ -328,7 +301,7 @@ def main() -> int:
     }
     args.json_out.parent.mkdir(parents=True, exist_ok=True)
     args.json_out.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps({str(row["target_context"]): row["measured_summary"] for row in groups}, indent=2))
+    print(json.dumps(compact_group_report(groups), indent=2))
     return 1 if failed or len(groups) != len(args.targets) else 0
 
 
