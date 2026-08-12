@@ -164,6 +164,14 @@ static int dynamic_route_balance_main_slots_x4(
         const char * raw_slots = moe_policy_env(
             "DFLASH_MOE_TP_DYNAMIC_MAIN_SLOTS",
             "DFLASH_DS4_TP_DYNAMIC_MAIN_SLOTS");
+        const int explicit_count =
+            (raw_slots_x4 && *raw_slots_x4 ? 1 : 0) +
+            (raw_slots_x2 && *raw_slots_x2 ? 1 : 0) +
+            (raw_slots && *raw_slots ? 1 : 0);
+        if (explicit_count > 1) {
+            result.valid = false;
+            return result;
+        }
         const char * raw = raw_slots;
         long scale = 4L;
         if (raw_slots_x4 && *raw_slots_x4) {
@@ -1128,6 +1136,7 @@ bool build_moe_hybrid_ffn_graph(
     out.output = nullptr;
     out.main_output = nullptr;
     out.peer_output = nullptr;
+    out.dynamic_route_balance = false;
     if (!ctx || !inp || !global_ids || !router_weights || n_tokens <= 0 ||
         cfg.n_embd <= 0 || cfg.n_ff_exp <= 0 || cfg.n_expert <= 0 ||
         cfg.n_expert_used <= 0) {
@@ -1183,6 +1192,7 @@ bool build_moe_hybrid_ffn_graph(
     }
     out.dynamic_route_balance = dynamic_main_slots_x4 > 0;
     if (dynamic_main_slots_x4 > 0) {
+        out.dynamic_route_balance = true;
         static std::once_flag active_log;
         std::call_once(
             active_log,

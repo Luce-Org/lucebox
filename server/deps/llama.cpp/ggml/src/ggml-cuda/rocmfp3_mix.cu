@@ -7,6 +7,7 @@
 // standalone swiglu_ds4 kernel applies, not a re-derivation.
 #include "unary.cuh"
 #include "convert.cuh"
+#include <cstdint>
 #include <mutex>
 #include <vector>
 
@@ -182,12 +183,18 @@ extern "C" void ggml_cuda_rocmfp3_mix_unregister(const void * base) {
 
 static bool mix_lookup(const void * vx, MixEntry & out_e, int & out_expert) {
     std::lock_guard<std::mutex> lk(g_mix_mtx);
-    const char * p = (const char *) vx;
+    if (!vx) return false;
+    const std::uintptr_t address =
+        reinterpret_cast<std::uintptr_t>(vx);
     for (const auto & e : g_mix_registry) {
-        const char * b = (const char *) e.base;
-        if (p >= b && p < b + (size_t) e.n_experts * e.nb02) {
+        if (!e.base || e.nb02 == 0 || e.n_experts <= 0) continue;
+        const std::uintptr_t base =
+            reinterpret_cast<std::uintptr_t>(e.base);
+        if (address < base) continue;
+        const std::uintptr_t expert = (address - base) / e.nb02;
+        if (expert < static_cast<std::uintptr_t>(e.n_experts)) {
             out_e = e;
-            out_expert = (int) (((size_t) (p - b)) / e.nb02);
+            out_expert = (int) expert;
             return true;
         }
     }

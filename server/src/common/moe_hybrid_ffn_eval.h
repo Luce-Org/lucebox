@@ -114,6 +114,10 @@ struct MoeHybridFfnTelemetry {
 // map global router IDs to each backend's compact expert stack and mask the
 // slots owned by the other backend without a host-side routing round trip.
 struct MoeHybridGraphInputs {
+    // True only when this graph actually uses batch-wide owner balancing.
+    // The request can fall back to static ownership for unsupported maps or
+    // widths, so consumers must not infer this from the process environment.
+    bool dynamic_route_balance = false;
     ggml_tensor * router_weights = nullptr;
     // True only when this graph can safely assign routes dynamically. The LUT
     // refresh path uses the effective graph decision rather than the raw env

@@ -48,11 +48,8 @@ DYNAMIC_MAIN_SLOTS="${DYNAMIC_MAIN_SLOTS:-auto}"
 DYNAMIC_MAIN_SLOTS_X2="${DYNAMIC_MAIN_SLOTS_X2:-}"
 DYNAMIC_MAIN_SLOTS_X4="${DYNAMIC_MAIN_SLOTS_X4:-}"
 EXPERT_TOP_K="${EXPERT_TOP_K:-4}"
-VERIFY_WIDTH=$((4 + Q5_VERIFY))
-RUN_ID="${RUN_ID:-ds4-q${VERIFY_WIDTH}-k${EXPERT_TOP_K}-fr${FORCE_GRAPH_REPLAY}-direct${DIRECT_INDEXER_TOPK}-radix${BLOCK_RADIX_TOPK}-x4p1${FP4_Q5_X4_PLUS1}-cp${CRITICAL_PATH_PLACEMENT}-r${MAIN_TO_PEER_RATE}-$(date -u +%Y%m%dT%H%M%SZ)}"
+RUN_ID="${RUN_ID:-}"
 OUT_ROOT="${OUT_ROOT:-$CHECKOUT/results/ds4_q5_context_qualification}"
-OUT_DIR="$OUT_ROOT/$RUN_ID"
-SERVER_LOG="$OUT_DIR/server.log"
 
 for executable in "$SERVER_BIN" "$TOKENIZER_HARNESS"; do
     if [[ ! -f "$executable" || ! -x "$executable" ]]; then
@@ -118,6 +115,20 @@ if [[ -n "$DYNAMIC_MAIN_SLOTS_X4" ]] &&
     echo "DYNAMIC_MAIN_SLOTS_X4 must be empty or an integer from 4 through $((4 * EXPERT_TOP_K))" >&2
     exit 2
 fi
+explicit_route_quotas=0
+if [[ "$DYNAMIC_MAIN_SLOTS" != auto ]]; then
+    ((explicit_route_quotas += 1))
+fi
+if [[ -n "$DYNAMIC_MAIN_SLOTS_X2" ]]; then
+    ((explicit_route_quotas += 1))
+fi
+if [[ -n "$DYNAMIC_MAIN_SLOTS_X4" ]]; then
+    ((explicit_route_quotas += 1))
+fi
+if ((explicit_route_quotas > 1)); then
+    echo "set at most one dynamic main-slot quota" >&2
+    exit 2
+fi
 case "$FP4_Q5_X4_PLUS1" in
     auto|0|1) ;;
     *) echo "FP4_Q5_X4_PLUS1 must be auto, 0, or 1" >&2; exit 2 ;;
@@ -149,12 +160,6 @@ fi
 case "$HASH_MODELS" in
     0|1) ;;
     *) echo "HASH_MODELS must be 0 or 1" >&2; exit 2 ;;
-esac
-case "$RUN_ID" in
-    ""|.|..|*[!A-Za-z0-9._-]*)
-        echo "RUN_ID may contain only letters, numbers, dot, underscore, and hyphen" >&2
-        exit 2
-        ;;
 esac
 for numeric_setting in PORT MAX_CTX EXPERT_BUDGET_MB WARMUP RUNS MAX_TOKENS \
     VRAM_MONITOR_SECONDS CUDA_GRAPH_STATS_EVERY; do
@@ -188,6 +193,19 @@ for target in "${target_args[@]}"; do
         exit 2
     fi
 done
+
+VERIFY_WIDTH=$((4 + Q5_VERIFY))
+if [[ -z "$RUN_ID" ]]; then
+    RUN_ID="ds4-q${VERIFY_WIDTH}-k${EXPERT_TOP_K}-fr${FORCE_GRAPH_REPLAY}-direct${DIRECT_INDEXER_TOPK}-radix${BLOCK_RADIX_TOPK}-x4p1${FP4_Q5_X4_PLUS1}-cp${CRITICAL_PATH_PLACEMENT}-r${MAIN_TO_PEER_RATE}-$(date -u +%Y%m%dT%H%M%SZ)"
+fi
+case "$RUN_ID" in
+    .|..|*[!A-Za-z0-9._-]*)
+        echo "RUN_ID may contain only letters, numbers, dot, underscore, and hyphen" >&2
+        exit 2
+        ;;
+esac
+OUT_DIR="$OUT_ROOT/$RUN_ID"
+SERVER_LOG="$OUT_DIR/server.log"
 
 # The script changes physical cards 0 and 1 with rocm-smi. A visibility mask
 # that reorders those cards would apply the performance levels to the wrong
