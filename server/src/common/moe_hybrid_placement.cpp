@@ -292,12 +292,20 @@ bool MoeHybridPlacement::expand_from_stats_with_layer_bytes(
         (size_t) stats.n_layer,
         std::vector<uint8_t>((size_t) stats.n_expert, 0));
     uint64_t used_bytes = 0;
+    tmp.total_hot = 0;
     for (int il = 0; il < stats.n_layer; ++il) {
         const auto & ids = tmp.hot_expert_ids[(size_t) il];
-        if ((int) ids.size() != tmp.hot_counts[(size_t) il]) {
+        const int hot_count = tmp.hot_counts[(size_t) il];
+        if (hot_count < 0 || ids.size() != (size_t) hot_count) {
             if (err) *err = "existing placement count does not match ids";
             return false;
         }
+        if (ids.size() > (size_t) (std::numeric_limits<int>::max() -
+                                  tmp.total_hot)) {
+            if (err) *err = "existing placement expert count overflow";
+            return false;
+        }
+        tmp.total_hot += hot_count;
         const uint64_t expert_bytes = layer_expert_bytes[(size_t) il];
         if (expert_bytes > 0 && ids.size() >
                 (std::numeric_limits<uint64_t>::max() - used_bytes) /

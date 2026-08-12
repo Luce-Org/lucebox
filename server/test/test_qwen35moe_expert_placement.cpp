@@ -94,6 +94,7 @@ TEST_CASE(Qwen35MoeExpertPlacementFixture, moe_expert_placement_suite) {
     };
     residency_stats.layer_totals = {506, 1701};
     MoeHybridPlacement expanded = balanced;
+    expanded.total_hot = 999;  // Expansion must derive this aggregate from IDs.
     REQUIRE(MoeHybridPlacement::expand_from_stats_with_layer_bytes(
         residency_stats, {100, 100}, 600, expanded, &err));
     REQUIRE(expanded.total_hot == 6);
