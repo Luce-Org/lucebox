@@ -12,7 +12,8 @@ ROCPROF_DURATION_SECONDS="${ROCPROF_DURATION_SECONDS:-90}"
 
 if [[ ! "$ROCPROF_START_SECONDS" =~ ^[0-9]+$ ]] ||
    [[ ! "$ROCPROF_DURATION_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
-    echo "rocprof collection timing must use non-negative integer seconds" >&2
+    echo "ROCPROF_START_SECONDS must be non-negative and " \
+         "ROCPROF_DURATION_SECONDS must be positive integer seconds" >&2
     exit 2
 fi
 

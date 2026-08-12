@@ -61,8 +61,9 @@ for input in "$TARGET_MODEL" "$DRAFT_MODEL" "$HOTNESS_CSV" "$CONTEXT_CLIENT"; do
         exit 2
     fi
 done
-if [[ -n "$DECODE_HOTNESS_CSV" && ! -e "$DECODE_HOTNESS_CSV" ]]; then
-    echo "missing decode hotness path: $DECODE_HOTNESS_CSV" >&2
+if [[ -n "$DECODE_HOTNESS_CSV" &&
+      ( ! -f "$DECODE_HOTNESS_CSV" || ! -r "$DECODE_HOTNESS_CSV" ) ]]; then
+    echo "decode hotness profile is missing or unreadable: $DECODE_HOTNESS_CSV" >&2
     exit 2
 fi
 
@@ -115,8 +116,9 @@ case "$CRITICAL_PATH_PLACEMENT" in
     *) echo "CRITICAL_PATH_PLACEMENT must be 0 or 1" >&2; exit 2 ;;
 esac
 if [[ ! "$MAIN_TO_PEER_RATE" =~ ^[0-9]+([.][0-9]+)?$ ]] ||
-   ! awk -v value="$MAIN_TO_PEER_RATE" 'BEGIN { exit !(value > 0) }'; then
-    echo "MAIN_TO_PEER_RATE must be greater than zero" >&2
+   ! awk -v value="$MAIN_TO_PEER_RATE" \
+       'BEGIN { number = value + 0; max = 1.7976931348623157e308; exit !(number > 0 && number <= max) }'; then
+    echo "MAIN_TO_PEER_RATE must be a finite number greater than zero" >&2
     exit 2
 fi
 if [[ ! "$BALANCE_MIN_HOT" =~ ^[0-9]+$ ]]; then

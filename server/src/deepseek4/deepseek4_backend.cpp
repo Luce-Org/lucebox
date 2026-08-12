@@ -1088,6 +1088,13 @@ bool DeepSeek4Backend::compute_uniform_hybrid_placement(const DeepSeek4Weights &
     const bool critical_path_placement =
         !tp.all_on_secondary && !concentrate_requested &&
         env_flag_enabled("DFLASH_DS4_TP_CRITICAL_PATH_PLACEMENT");
+    if (critical_path_placement && tp.profile_hot_on_secondary) {
+        if (err) {
+            *err = "critical-path placement is incompatible with "
+                   "DFLASH_DS4_MOE_TP_PEER_HOT";
+        }
+        return false;
+    }
     const int requested_cold =
         w.n_layer * std::max(0, w.n_expert - hot_per_layer);
     if (concentrate_requested && requested_cold >= w.n_expert) {

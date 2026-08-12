@@ -5,6 +5,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <limits>
 #include <string>
 
 using namespace dflash::common;
@@ -107,6 +109,32 @@ TEST_CASE(Qwen35MoeExpertPlacementFixture, moe_expert_placement_suite) {
     MoeHybridPlacement over_budget = balanced;
     REQUIRE(!MoeHybridPlacement::expand_from_stats_with_layer_bytes(
         residency_stats, {100, 100}, 300, over_budget, &err));
+
+    MoeHybridRoutingStats overflow_stats;
+    overflow_stats.n_layer = 1;
+    overflow_stats.n_expert = 2;
+    overflow_stats.n_expert_used = 1;
+    overflow_stats.counts = {
+        std::numeric_limits<uint64_t>::max(), 1,
+    };
+    overflow_stats.layer_totals = {0};
+    REQUIRE(!MoeHybridPlacement::build_critical_path_balanced_from_stats(
+        overflow_stats, {100}, {100}, 200,
+        balance_cfg, balanced, &err));
+    REQUIRE(err == "routing profile count overflow");
+
+    const auto overflow_csv = std::filesystem::temp_directory_path() /
+        "moe-hybrid-routing-overflow.csv";
+    {
+        std::ofstream stream(overflow_csv);
+        stream << "# hotness table: n_layer=1 n_expert=2 n_expert_used=1\n"
+               << std::numeric_limits<uint64_t>::max() << ",1\n";
+    }
+    MoeHybridRoutingStats loaded_overflow;
+    REQUIRE(!MoeHybridRoutingStats::load_csv(
+        overflow_csv.string(), loaded_overflow, &err));
+    REQUIRE(err == "routing profile count overflow at layer 0");
+    std::filesystem::remove(overflow_csv);
 
     balance_cfg.main_to_peer_rate = 0.0;
     REQUIRE(!MoeHybridPlacement::build_critical_path_balanced_from_stats(

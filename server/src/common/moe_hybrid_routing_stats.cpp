@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <numeric>
 
 namespace dflash::common {
@@ -293,7 +294,13 @@ bool MoeHybridRoutingStats::load_csv(const std::string & path,
     for (int il = 0; il < file_n_layer; ++il) {
         uint64_t total = 0;
         for (int ie = 0; ie < file_n_expert; ++ie) {
-            total += tmp.counts[tmp.index_of(il, ie)];
+            const uint64_t count = tmp.counts[tmp.index_of(il, ie)];
+            if (count > std::numeric_limits<uint64_t>::max() - total) {
+                if (err) *err = "routing profile count overflow at layer " +
+                    std::to_string(il);
+                return false;
+            }
+            total += count;
         }
         tmp.layer_totals[(size_t)il] = total;
     }

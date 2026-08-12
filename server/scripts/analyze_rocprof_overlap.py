@@ -6,15 +6,16 @@ from __future__ import annotations
 import argparse
 import csv
 from collections import defaultdict
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 
 def merge_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
     if not intervals:
         return []
-    intervals.sort()
-    merged = [intervals[0]]
-    for start, end in intervals[1:]:
+    ordered = sorted(intervals)
+    merged = [ordered[0]]
+    for start, end in ordered[1:]:
         prev_start, prev_end = merged[-1]
         if start <= prev_end:
             if end > prev_end:
@@ -30,15 +31,48 @@ def merge_nearby_intervals(
     """Merge dispatch bursts separated only by launch-sized idle gaps."""
     if not intervals:
         return []
-    intervals.sort()
-    merged = [intervals[0]]
-    for start, end in intervals[1:]:
+    ordered = sorted(intervals)
+    merged = [ordered[0]]
+    for start, end in ordered[1:]:
         prev_start, prev_end = merged[-1]
         if start <= prev_end + max_gap_ns:
             merged[-1] = (prev_start, max(prev_end, end))
         else:
             merged.append((start, end))
     return merged
+
+
+def clip_intervals(
+    intervals: Sequence[tuple[int, int]], window_start: int, window_end: int
+) -> list[tuple[int, int]]:
+    """Return only the portions of intervals inside a half-open window."""
+    return [
+        (max(start, window_start), min(end, window_end))
+        for start, end in intervals
+        if end > window_start and start < window_end
+    ]
+
+
+def build_timeline_bursts(
+    intervals_by_agent: Mapping[str, Sequence[tuple[int, int]]],
+    agents: Sequence[str],
+    window_start: int,
+    window_end: int,
+    merge_gap_ns: int,
+    per_agent_limit: int,
+) -> list[tuple[int, int, str]]:
+    """Build a time-ordered timeline with an independent cap per agent."""
+    bursts: list[tuple[int, int, str]] = []
+    for agent in agents:
+        clipped = clip_intervals(
+            intervals_by_agent[agent], window_start, window_end
+        )
+        merged = merge_nearby_intervals(clipped, merge_gap_ns)
+        bursts.extend(
+            (start, end, agent)
+            for start, end in merged[:per_agent_limit]
+        )
+    return sorted(bursts)
 
 
 def intersect_intervals(
@@ -90,6 +124,8 @@ def main() -> int:
     args = parser.parse_args()
     if args.bin_ms <= 0 or args.window_start_s < 0:
         parser.error("bin size must be positive and window start non-negative")
+    if args.timeline_max < 0 or args.timeline_merge_gap_us < 0:
+        parser.error("timeline limits and merge gap must be non-negative")
 
     intervals_by_agent: dict[str, list[tuple[int, int]]] = defaultdict(list)
     trace_start: int | None = None
@@ -190,21 +226,19 @@ def main() -> int:
 
     if args.timeline_max > 0:
         gap_ns = max(0, int(args.timeline_merge_gap_us * 1e3))
-        bursts: list[tuple[int, int, str]] = []
-        for agent in agents:
-            for start, end in merge_nearby_intervals(
-                intervals_by_agent[agent], gap_ns
-            ):
-                start = max(start, window_start)
-                end = min(end, window_end)
-                if start < end:
-                    bursts.append((start, end, agent))
-        bursts.sort()
+        bursts = build_timeline_bursts(
+            intervals_by_agent,
+            agents,
+            window_start,
+            window_end,
+            gap_ns,
+            args.timeline_max,
+        )
         print(
             "timeline_start_s,duration_us,agent,"
             f"merge_gap_us={args.timeline_merge_gap_us:g}"
         )
-        for start, end, agent in bursts[: args.timeline_max]:
+        for start, end, agent in bursts:
             print(
                 f"{(start-trace_start)/1e9:.9f},"
                 f"{(end-start)/1e3:.3f},{agent}"

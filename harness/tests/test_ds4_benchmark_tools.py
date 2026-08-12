@@ -21,6 +21,7 @@ QUALIFIER = (
 )
 sys.path.insert(0, str(BENCHMARKS_DIR))
 
+import analyze_rocprof_overlap  # noqa: E402
 import ds4_context_sweep  # noqa: E402
 import ds4_publication_decode_client  # noqa: E402
 
@@ -199,6 +200,26 @@ class ContextSummaryTests(unittest.TestCase):
         self.assertEqual(
             [row["target_context"] for row in report],
             [2048, 4096, 2048],
+        )
+
+
+class RocprofTimelineTests(unittest.TestCase):
+    def test_window_is_clipped_before_merge_and_cap_is_per_agent(self) -> None:
+        bursts = analyze_rocprof_overlap.build_timeline_bursts(
+            {
+                "gpu0": [(0, 95), (105, 110), (150, 160)],
+                "gpu1": [(101, 104), (140, 150)],
+            },
+            ["gpu0", "gpu1"],
+            window_start=100,
+            window_end=200,
+            merge_gap_ns=20,
+            per_agent_limit=1,
+        )
+
+        self.assertEqual(
+            bursts,
+            [(101, 104, "gpu1"), (105, 110, "gpu0")],
         )
 
 

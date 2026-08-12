@@ -432,8 +432,14 @@ bool MoeHybridPlacement::build_critical_path_balanced_from_stats(
         auto & prefix = prefix_counts[(size_t) il];
         prefix.assign((size_t) tmp.n_expert + 1, 0);
         for (int n = 0; n < tmp.n_expert; ++n) {
-            prefix[(size_t) n + 1] = prefix[(size_t) n] +
+            const uint64_t count =
                 stats.count(il, ranked[(size_t) il][(size_t) n]);
+            if (count > std::numeric_limits<uint64_t>::max() -
+                            prefix[(size_t) n]) {
+                if (err) *err = "routing profile count overflow";
+                return false;
+            }
+            prefix[(size_t) n + 1] = prefix[(size_t) n] + count;
         }
         if (layer_expert_bytes[(size_t) il] > 0) {
             tmp.hot_counts[(size_t) il] = floor;
