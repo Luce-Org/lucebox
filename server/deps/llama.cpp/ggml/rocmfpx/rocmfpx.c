@@ -719,8 +719,11 @@ static uint8_t rocmfpx_choose_scale_fp8_weighted_mse(const float * x, int n, con
 #ifdef ROCMFP2_AFFINE
 static uint8_t rocmfpx_quantize_fp2_affine_code(
         float x, float scale, float offset) {
-    if (!isfinite(x) || !(scale > 0.0f)) {
+    if (!(scale > 0.0f)) {
         return 0;
+    }
+    if (!isfinite(x)) {
+        x = 0.0f;
     }
     const float q = floorf((x + offset) / scale + 0.5f);
     return (uint8_t) fminf(3.0f, fmaxf(0.0f, q));

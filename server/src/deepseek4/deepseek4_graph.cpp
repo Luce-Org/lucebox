@@ -5639,7 +5639,7 @@ static bool eval_ds4_layer_range_hybrid_ffn(
         std::strcmp(device_input_env, "0") != 0;
     const bool device_ffn_input =
         device_input_enabled &&
-        !expert_compute && n_tokens >= 512 &&
+        !expert_compute && moe_expert_major_prefill_enabled(n_tokens) &&
         layer_storage.cold_backend_kind == MoeHybridColdBackend::Gpu &&
         layer_storage.cold_backend && layer_storage.cold_backend != backend &&
         hot_stack_ref && hot_stack_ref->ne[2] > 0 &&
@@ -8051,7 +8051,7 @@ bool deepseek4_step_layer_range(
                     std::strcmp(device_input_env, "0") != 0;
                 const bool ffn_device_join_possible =
                     device_input_enabled &&
-                    n_tokens >= 512 &&
+                    moe_expert_major_prefill_enabled(n_tokens) &&
                     layer_storage.cold_backend_kind ==
                         MoeHybridColdBackend::Gpu &&
                     layer_storage.cold_backend &&

@@ -2627,7 +2627,7 @@ static bool eval_moe_hybrid_remote_cold_batched(
 // reduced-stack MUL_MAT_ID stream-k path (which is both slow for a 24-expert
 // stack and unstable for very large batches) and lets each expert's weights be
 // reused across all of its prompt rows.
-static bool expert_major_prefill_enabled(int n_tokens) {
+bool moe_expert_major_prefill_enabled(int n_tokens) {
     static const bool enabled = []() {
         const char * raw = std::getenv("DFLASH_MOE_EXPERT_MAJOR_PREFILL");
         return !raw || !*raw || std::strcmp(raw, "0") != 0;
@@ -3301,7 +3301,7 @@ bool eval_moe_hybrid_ffn_batched(
                             : 0;
     const bool cold_on_gpu = storage.cold_backend_kind == MoeHybridColdBackend::Gpu;
     const bool inprocess_expert_major =
-        !expert_compute && expert_major_prefill_enabled(n_tokens) &&
+        !expert_compute && moe_expert_major_prefill_enabled(n_tokens) &&
         cold_on_gpu && storage.cold_backend &&
         storage.cold_backend != gpu_backend &&
         n_hot_stack > 0 && n_cold_stack > 0 &&
@@ -3318,25 +3318,6 @@ bool eval_moe_hybrid_ffn_batched(
         const auto wall_t0 = HybridClock::now();
         std::vector<float> hot_partial;
         std::vector<float> cold_partial;
-        // A full secondary stack may intentionally duplicate the primary's
-        // hot experts for single-owner decode. During split prefill, mask
-        // those duplicate routes on the peer so every expert contribution is
-        // still evaluated exactly once.
-        std::vector<int32_t> cold_prefill_local;
-        const std::vector<int32_t> * cold_owner_local =
-            &storage.cold_local_by_global;
-        if (n_cold_stack == cfg.n_expert) {
-            cold_prefill_local = storage.cold_local_by_global;
-            for (size_t expert = 0;
-                 expert < cold_prefill_local.size() &&
-                 expert < storage.hot_local_by_global.size();
-                 ++expert) {
-                if (storage.hot_local_by_global[expert] >= 0) {
-                    cold_prefill_local[expert] = -1;
-                }
-            }
-            cold_owner_local = &cold_prefill_local;
-        }
         std::string hot_err;
         std::string cold_err;
         const auto cold_t0 = HybridClock::now();
@@ -3347,7 +3328,7 @@ bool eval_moe_hybrid_ffn_batched(
             return eval_moe_owner_expert_major_batched(
                 storage.cold_backend, cfg, desc,
                 storage.gate_cold, storage.up_cold, storage.down_cold,
-                storage.gate_up_cold, *cold_owner_local,
+                storage.gate_up_cold, storage.cold_local_by_global,
                 cur_host, selected_ids, selected_weights, n_tokens,
                 /*include_shared=*/false, cold_partial, &cold_err,
                 cur_backend, gpu_backend, nullptr, nullptr,
@@ -3390,7 +3371,7 @@ bool eval_moe_hybrid_ffn_batched(
     // instead. The primary-local map takes priority in the core evaluator, so
     // skip_hot makes the duplicated secondary stack evaluate its routes only.
     const bool inprocess_full_cold_hot_expert_major =
-        !expert_compute && expert_major_prefill_enabled(n_tokens) &&
+        !expert_compute && moe_expert_major_prefill_enabled(n_tokens) &&
         cold_on_gpu && storage.cold_backend &&
         storage.cold_backend != gpu_backend &&
         n_hot_stack > 0 && n_cold_stack == cfg.n_expert;

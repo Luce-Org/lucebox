@@ -125,6 +125,22 @@ static void check_fp2_affine_encoding(void) {
             (quantized.qs[i >> 2] >> (2*(i & 3))) & 0x3;
         assert(actual == expected);
     }
+
+    src[0] = NAN;
+    src[1] = INFINITY;
+    src[2] = -INFINITY;
+    rocmfpx_quantize_row_fp2_ref(src, &quantized, QK_ROCMFP2);
+
+    const float nonfinite_scale = rocmfpx_ue4m3_to_fp32(quantized.e[0]);
+    const float nonfinite_offset = rocmfpx_ue4m3_to_fp32(quantized.e[1]);
+    const float zero_q = floorf(nonfinite_offset/nonfinite_scale + 0.5f);
+    const uint8_t zero_code =
+        (uint8_t) fminf(3.0f, fmaxf(0.0f, zero_q));
+    for (int i = 0; i < 3; ++i) {
+        const uint8_t actual =
+            (quantized.qs[i >> 2] >> (2*(i & 3))) & 0x3;
+        assert(actual == zero_code);
+    }
 }
 #endif
 

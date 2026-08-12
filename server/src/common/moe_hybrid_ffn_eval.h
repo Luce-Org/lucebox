@@ -250,6 +250,8 @@ bool eval_moe_batched_prefill_ffn(
     int                             n_tokens,
     std::vector<float> &            out,
     std::string *                   err = nullptr);
+// Shared policy gate for paths that consume expert-major prefill outputs.
+bool moe_expert_major_prefill_enabled(int n_tokens);
 
 // Optional device-resident owner destinations for long heterogeneous prefill.
 // When present, the hot/shared and cold partials are copied directly into
