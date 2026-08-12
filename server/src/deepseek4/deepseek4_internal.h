@@ -442,6 +442,14 @@ bool build_deepseek4_moe_hybrid_storage_from_file_with_mmap(
     std::string *               err = nullptr,
     ggml_backend_t              cold_gpu_backend = nullptr);
 
+// Attach each compact GPU owner tensor to the learned decode-table rows for
+// the global experts stored in that tensor.
+bool register_deepseek4_moe_hybrid_mix_sidecars(
+    const std::string &         path,
+    const DeepSeek4Weights &    w,
+    MoeHybridStorage &          storage,
+    std::string *               err = nullptr);
+
 // Snapshot
 struct DeepSeek4Snapshot {
     int cur_pos = 0;

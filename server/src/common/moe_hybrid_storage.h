@@ -225,6 +225,10 @@ struct MoeHybridStorage {
     bool has_mmap() const { return mmap_data != nullptr && mmap_size > 0; }
 };
 
+// Remove decode-table registrations while their owner tensors are still
+// alive. This is idempotent and is also called by MoeHybridStorage's destructor.
+void unregister_moe_hybrid_mix_tensors(MoeHybridStorage & storage);
+
 // Expert tensor file data for split loading (one entry per expert tensor).
 struct ExpertTensorFileData {
     const uint8_t * data = nullptr;

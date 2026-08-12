@@ -64,23 +64,10 @@ options are available:
   load because the fused graph must reference every expert tensor directly.
   If that allocation fails, the backend logs the fallback and continues with
   hybrid expert placement and layered decode.
-- **Adaptive (qtype-105/106) artifacts require MONOLITHIC EXPERT RESIDENCY.** Hybrid or
-  cold expert placement cannot decode them: the per-expert codebooks are registered against
-  resident tensor bases, so an expert paged to the host has nowhere to read its codebook
-  from. The backend says so and refuses rather than producing wrong output:
-
-  ```
-  [deepseek4] qtype-105 (mixed ROCmFP3) down experts require monolithic residency —
-  hybrid/cold expert placement cannot decode them. Enable fused decode or provide
-  enough VRAM to keep all experts resident.
-  ```
-
-  Practical floor: the 0731 adaptive artifacts are ~102.3 GB, so they need a device that can
-  hold that plus KV and activations. Measured 2026-08-05 — an 80 GB H100 fails at load
-  (`cudaMalloc failed` on a 97161 MiB expert buffer, then hybrid is refused for the reason
-  above), while a 140 GB H200 and Strix Halo's 125 GiB unified memory both serve them. A
-  UNIFORM artifact has no such constraint and runs fine under hybrid placement, so this is
-  specific to the adaptive formats and worth checking before choosing a deployment target.
+- Adaptive qtype-105/106 experts work in monolithic mode and across two GPUs
+  using the same runtime. The loader gives each GPU's compact tensor the
+  decode-table rows for the experts it owns. CPU expert offload and mixed
+  CUDA/HIP peers keep the safe monolithic fallback.
 
 - `--ds4-expert-top-k N` keeps the highest-ranked `N` routed experts and
   renormalizes their weights. `0` uses the model default. Reducing this value is an

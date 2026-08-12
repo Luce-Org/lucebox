@@ -1343,23 +1343,29 @@ bool DeepSeek4Backend::init_hybrid_model() {
         return true;
     }
 
-    // qtype-105 (Q3_1_ROCMFP3_MIX) is decodable only by the fused CUDA/HIP
-    // kernel driven by the per-expert sidecar codebooks/modes. Hybrid storage
-    // slices the stacked down-expert tensor into separate hot/cold buffers that
-    // carry no sidecar metadata, and the CPU cold path has no type-105 traits —
-    // so a hybrid placement has no working decode path (the GPU cold path hits
-    // the unregistered-tensor abort; the CPU cold path has no vec_dot for 105).
-    // Fail at load with a clear message instead of starting a server that
-    // crashes or emits garbage at first decode. (The all-hot case above reloads
-    // the full monolithic model and never reaches here.)
-    // The same reasoning applies verbatim to qtype-106 (Q2_1_ROCMFP2_MIX) gate/up: hybrid
-    // slicing drops their registry metadata too, and there is no CPU vec_dot for 106 either.
-    // Only the down projection was checked, so a model with adaptive gate/up over uniform
-    // down experts passed this gate and went on to materialise unregistered hot/cold tensors
-    // -- aborting at first decode, or worse, decoding with whatever the registry lookup
-    // returned. Check every expert tensor that can carry a mix qtype.
+    const Ds4MoeTpConfig tp = ds4_moe_tp_config(cfg_.device.gpu);
+    const bool inprocess_tp = tp.requested && tp.in_process;
+    const PlacementBackend local_kind =
+        cfg_.device.backend == PlacementBackend::Auto
+            ? compiled_placement_backend() : cfg_.device.backend;
+    if (inprocess_tp && !tp.backend_valid) {
+        std::fprintf(stderr,
+                     "[deepseek4-moe-tp] invalid DFLASH_DS4_MOE_TP_BACKEND; "
+                     "expected cuda or hip\n");
+        return false;
+    }
+    const bool same_runtime_tp = inprocess_tp && tp.backend_valid &&
+        tp.secondary_backend == local_kind;
+
+    // Mix qtypes need a learned decode table for every resident tensor. The
+    // same-runtime GPU path registers the matching expert subset after it
+    // creates both owner tensors. CPU offload and cross-runtime peers keep the
+    // existing monolithic fallback.
+    bool has_mix_experts = false;
     for (const auto & L : w_.layers) {
         const struct { ggml_tensor * t; int qtype; const char * what; } mix_experts[] = {
+            { L.ffn_gate_exps, GGML_TYPE_Q3_1_ROCMFP3_MIX, "qtype-105 (mixed ROCmFP3) gate" },
+            { L.ffn_up_exps,   GGML_TYPE_Q3_1_ROCMFP3_MIX, "qtype-105 (mixed ROCmFP3) up"   },
             { L.ffn_down_exps, GGML_TYPE_Q3_1_ROCMFP3_MIX, "qtype-105 (mixed ROCmFP3) down" },
             { L.ffn_gate_exps, GGML_TYPE_Q2_1_ROCMFP2_MIX, "qtype-106 (mixed ROCmFP2) gate" },
             { L.ffn_up_exps,   GGML_TYPE_Q2_1_ROCMFP2_MIX, "qtype-106 (mixed ROCmFP2) up"   },
@@ -1369,13 +1375,9 @@ bool DeepSeek4Backend::init_hybrid_model() {
             if (!m.t || m.t->type != m.qtype) {
                 continue;
             }
-            // Mix qtypes decode only from registered resident tensors, so a
-            // cold-slice placement can never serve them. But refusing outright
-            // is wrong when the MONOLITHIC footprint fits the device -- the
-            // 2.5-3.5 bpw mix formats exist precisely so the whole file fits
-            // where a hybrid split of a larger quant was needed. Mirror the
-            // all-hot branch above: drop the partial load and attempt the full
-            // load, failing with the allocator's error if it does not fit.
+            has_mix_experts = true;
+            if (same_runtime_tp) continue;
+
             std::fprintf(stderr,
                 "[deepseek4] %s experts cannot decode from hybrid/cold "
                 "placement; falling back to monolithic full load\n", m.what);
@@ -1390,22 +1392,29 @@ bool DeepSeek4Backend::init_hybrid_model() {
         }
     }
 
+#if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
+    if (same_runtime_tp && has_mix_experts) {
+        const char * mix_mmq = std::getenv("DFLASH_DS4_MIX_MMQ_PREFILL");
+        if (mix_mmq && std::strcmp(mix_mmq, "0") == 0) {
+            std::fprintf(stderr,
+                         "[deepseek4] heterogeneous mixed experts require "
+                         "DFLASH_DS4_MIX_MMQ_PREFILL=1\n");
+            return false;
+        }
+        if ((!mix_mmq || !mix_mmq[0]) &&
+            ::setenv("DFLASH_DS4_MIX_MMQ_PREFILL", "1", 1) != 0) {
+            std::fprintf(stderr,
+                         "[deepseek4] failed to enable mixed-expert MMQ prefill\n");
+            return false;
+        }
+    }
+#endif
+
     auto hybrid = std::make_shared<MoeHybridStorage>();
     MoeHybridConfig hybrid_cfg = make_ds4_parent_worker_cfg(w_);
-    const Ds4MoeTpConfig tp = ds4_moe_tp_config(cfg_.device.gpu);
-    const bool inprocess_tp = tp.requested && tp.in_process;
     if (inprocess_tp) {
         const int expert_gpu = tp.secondary_gpu;
         const PlacementBackend expert_kind = tp.secondary_backend;
-        if (!tp.backend_valid) {
-            std::fprintf(stderr,
-                         "[deepseek4-moe-tp] invalid DFLASH_DS4_MOE_TP_BACKEND; "
-                         "expected cuda or hip\n");
-            return false;
-        }
-        const PlacementBackend local_kind =
-            cfg_.device.backend == PlacementBackend::Auto
-                ? compiled_placement_backend() : cfg_.device.backend;
         if (expert_kind == local_kind && expert_gpu == cfg_.device.gpu) {
             std::fprintf(stderr,
                          "[deepseek4-moe-tp] in-process secondary device must "
@@ -1442,6 +1451,20 @@ bool DeepSeek4Backend::init_hybrid_model() {
             cfg_.model_path, backend_, w_, moe_placement_, &hybrid_cfg,
             *hybrid, &err, expert_backend_)) {
         std::fprintf(stderr, "[deepseek4] failed to build hybrid expert storage: %s\n", err.c_str());
+        hybrid.reset();
+        if (expert_backend_) {
+            ggml_backend_free(expert_backend_);
+            expert_backend_ = nullptr;
+        }
+        return false;
+    }
+    if (same_runtime_tp && has_mix_experts &&
+        !register_deepseek4_moe_hybrid_mix_sidecars(
+            cfg_.model_path, w_, *hybrid, &err)) {
+        std::fprintf(stderr,
+                     "[deepseek4] failed to register hybrid mixed experts: %s\n",
+                     err.c_str());
+        hybrid.reset();
         if (expert_backend_) {
             ggml_backend_free(expert_backend_);
             expert_backend_ = nullptr;

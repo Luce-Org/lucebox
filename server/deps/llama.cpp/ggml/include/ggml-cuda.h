@@ -89,6 +89,20 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_reg(void);
 GGML_BACKEND_API bool ggml_backend_cuda_topk_rows(const struct ggml_tensor * logits, int k,
                                                   float * probs_out, int32_t * ids_out);
 
+// Attach learned per-expert decode tables to a mixed-precision tensor. The
+// host variants copy the tables to the device that owns `base`. Call the
+// matching unregister function before releasing the tensor's backing buffer.
+GGML_BACKEND_API void ggml_cuda_rocmfp3_mix_register_host(
+        const void * base, size_t expert_stride, int n_experts, int out, int in,
+        const void * codebooks_bf16_host, const uint8_t * modes_host,
+        const uint8_t * rotations_host);
+GGML_BACKEND_API void ggml_cuda_rocmfp2_mix_register_host(
+        const void * base, size_t expert_stride, int n_experts, int out, int in,
+        const void * codebooks_bf16_host, const uint8_t * modes_host,
+        const uint8_t * rotations_host);
+GGML_BACKEND_API void ggml_cuda_rocmfp2_mix_unregister(const void * base);
+GGML_BACKEND_API void ggml_cuda_rocmfp3_mix_unregister(const void * base);
+
 #ifdef  __cplusplus
 }
 #endif
