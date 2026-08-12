@@ -52,6 +52,26 @@ TEST_CASE(Qwen35MoeExpertPlacementFixture, moe_expert_placement_suite) {
     REQUIRE(loaded.hot_expert_ids == placement.hot_expert_ids);
     std::filesystem::remove(tmp);
 
+    MoeHybridPlacement malformed = placement;
+    malformed.hot_expert_ids[0][1] = malformed.hot_expert_ids[0][0];
+    REQUIRE(!malformed.valid(&err));
+    REQUIRE(err == "placement contains a duplicate expert at layer 0");
+
+    {
+        std::ofstream stream(tmp);
+        stream << R"({
+            "n_layer": 1,
+            "n_expert": 4,
+            "n_expert_used": 2,
+            "total_hot": 2,
+            "hot_counts": [2],
+            "hot_expert_ids": [[1, 1]]
+        })";
+    }
+    REQUIRE(!MoeHybridPlacement::load_json(tmp.string(), loaded, &err));
+    REQUIRE(err == "placement contains a duplicate expert at layer 0");
+    std::filesystem::remove(tmp);
+
     // Aggregate hit-rate placement can overfeed a highly skewed layer while a
     // flat layer remains peer-bound. The critical-path model stops at each
     // layer's branch crossover and may deliberately leave spare memory unused.
@@ -122,7 +142,7 @@ TEST_CASE(Qwen35MoeExpertPlacementFixture, moe_expert_placement_suite) {
     REQUIRE(!MoeHybridPlacement::build_critical_path_balanced_from_stats(
         overflow_stats, {100}, {100}, 200,
         balance_cfg, balanced, &err));
-    REQUIRE(err == "routing profile count overflow");
+    REQUIRE(err == "routing profile count overflow at layer 0");
 
     const auto overflow_csv = std::filesystem::temp_directory_path() /
         "moe-hybrid-routing-overflow.csv";

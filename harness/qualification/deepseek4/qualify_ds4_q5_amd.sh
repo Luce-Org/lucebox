@@ -49,6 +49,12 @@ OUT_ROOT="${OUT_ROOT:-$CHECKOUT/results/ds4_q5_context_qualification}"
 OUT_DIR="$OUT_ROOT/$RUN_ID"
 SERVER_LOG="$OUT_DIR/server.log"
 
+for required_command in flock pgrep python3 rocm-smi sha256sum; do
+    if ! command -v "$required_command" >/dev/null 2>&1; then
+        echo "required command is unavailable: $required_command" >&2
+        exit 2
+    fi
+done
 for executable in "$SERVER_BIN" "$TOKENIZER_HARNESS"; do
     if [[ ! -f "$executable" || ! -x "$executable" ]]; then
         echo "required executable is missing or not executable: $executable" >&2
@@ -143,7 +149,8 @@ case "$RUN_ID" in
         exit 2
         ;;
 esac
-for numeric_setting in PORT MAX_CTX EXPERT_BUDGET_MB WARMUP RUNS MAX_TOKENS VRAM_MONITOR_SECONDS; do
+for numeric_setting in PORT MAX_CTX EXPERT_BUDGET_MB WARMUP RUNS MAX_TOKENS \
+    VRAM_MONITOR_SECONDS CUDA_GRAPH_STATS_EVERY; do
     numeric_value="${!numeric_setting}"
     if [[ ! "$numeric_value" =~ ^(0|[1-9][0-9]{0,8})$ ]]; then
         echo "$numeric_setting must be a non-negative decimal integer with at most 9 digits" >&2
@@ -151,8 +158,8 @@ for numeric_setting in PORT MAX_CTX EXPERT_BUDGET_MB WARMUP RUNS MAX_TOKENS VRAM
     fi
 done
 if (( PORT < 1 || PORT > 65535 || MAX_CTX < 1 || EXPERT_BUDGET_MB < 1 ||
-      RUNS < 1 || MAX_TOKENS < 1 )); then
-    echo "PORT, MAX_CTX, EXPERT_BUDGET_MB, RUNS, and MAX_TOKENS must be positive (PORT <= 65535)" >&2
+      RUNS < 1 || MAX_TOKENS < 1 || CUDA_GRAPH_STATS_EVERY < 1 )); then
+    echo "PORT, MAX_CTX, EXPERT_BUDGET_MB, RUNS, MAX_TOKENS, and CUDA_GRAPH_STATS_EVERY must be positive (PORT <= 65535)" >&2
     exit 2
 fi
 if [[ ! "$EXPECTED_SHA256" =~ ^[0-9a-f]{64}$ ]]; then

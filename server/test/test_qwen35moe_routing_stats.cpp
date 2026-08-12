@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -51,6 +52,24 @@ TEST_CASE(Qwen35MoeRoutingStatsFixture, moe_routing_stats_suite) {
     REQUIRE(loaded.count(0, 2) == 2);
     REQUIRE(loaded.layer_totals[1] == 2);
 
+    std::filesystem::remove(tmp);
+
+    {
+        std::ofstream stream(tmp);
+        stream << "# hotness table: n_layer=1 n_expert=2 n_expert_used=1\n"
+               << "1,-1\n";
+    }
+    REQUIRE(!MoeHybridRoutingStats::load_csv(tmp.string(), loaded, &err));
+    REQUIRE(err == "malformed value in row 0");
+
+    {
+        std::ofstream stream(tmp);
+        stream << "# hotness table: n_layer=999999999999999999999 "
+                  "n_expert=2 n_expert_used=1\n"
+               << "1,1\n";
+    }
+    REQUIRE(!MoeHybridRoutingStats::load_csv(tmp.string(), loaded, &err));
+    REQUIRE(err == "invalid routing profile header");
     std::filesystem::remove(tmp);
     std::printf("OK\n");
 }

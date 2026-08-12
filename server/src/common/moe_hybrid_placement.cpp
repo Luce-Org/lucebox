@@ -11,12 +11,74 @@
 
 namespace dflash::common {
 
+namespace {
+
+bool validate_placement(const MoeHybridPlacement & placement,
+                        bool require_total,
+                        std::string * err) {
+    if (placement.n_layer <= 0 || placement.n_expert <= 0 ||
+        placement.n_expert_used <= 0 ||
+        placement.n_expert_used > placement.n_expert ||
+        (size_t) placement.n_layer >
+            (size_t) std::numeric_limits<int>::max() /
+                (size_t) placement.n_expert ||
+        placement.hot_counts.size() != (size_t) placement.n_layer ||
+        placement.hot_expert_ids.size() != (size_t) placement.n_layer) {
+        if (err) *err = "invalid placement dimensions";
+        return false;
+    }
+
+    int computed_total = 0;
+    for (int il = 0; il < placement.n_layer; ++il) {
+        const int hot_count = placement.hot_counts[(size_t) il];
+        const auto & ids = placement.hot_expert_ids[(size_t) il];
+        if (hot_count < 0 || hot_count > placement.n_expert ||
+            ids.size() != (size_t) hot_count) {
+            if (err) {
+                *err = "placement count does not match expert ids at layer " +
+                    std::to_string(il);
+            }
+            return false;
+        }
+        computed_total += hot_count;
+        for (int32_t id : ids) {
+            if (id < 0 || id >= placement.n_expert) {
+                if (err) {
+                    *err = "placement expert id is out of range at layer " +
+                        std::to_string(il);
+                }
+                return false;
+            }
+        }
+        std::vector<int32_t> sorted_ids = ids;
+        std::sort(sorted_ids.begin(), sorted_ids.end());
+        if (std::adjacent_find(sorted_ids.begin(), sorted_ids.end()) !=
+            sorted_ids.end()) {
+            if (err) {
+                *err = "placement contains a duplicate expert at layer " +
+                    std::to_string(il);
+            }
+            return false;
+        }
+    }
+    if (require_total && placement.total_hot != computed_total) {
+        if (err) *err = "placement total does not match its layer counts";
+        return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+bool MoeHybridPlacement::valid(std::string * err) const {
+    return validate_placement(*this, true, err);
+}
+
 bool MoeHybridPlacement::matches(int n_layer_, int n_expert_, int n_expert_used_) const {
     return n_layer == n_layer_ &&
            n_expert == n_expert_ &&
            n_expert_used == n_expert_used_ &&
-           (int)hot_counts.size() == n_layer &&
-           (int)hot_expert_ids.size() == n_layer;
+           valid();
 }
 
 bool MoeHybridPlacement::matches(const MoeHybridConfig & cfg) const {
@@ -28,7 +90,9 @@ bool MoeHybridPlacement::empty() const {
 }
 
 bool MoeHybridPlacement::is_hot(int layer_idx, int expert_idx) const {
-    if (layer_idx < 0 || layer_idx >= n_layer || expert_idx < 0 || expert_idx >= n_expert) {
+    if (layer_idx < 0 || layer_idx >= n_layer || expert_idx < 0 ||
+        expert_idx >= n_expert ||
+        (size_t) layer_idx >= hot_expert_ids.size()) {
         return false;
     }
     const auto & hot = hot_expert_ids[(size_t)layer_idx];
@@ -37,11 +101,7 @@ bool MoeHybridPlacement::is_hot(int layer_idx, int expert_idx) const {
 
 bool MoeHybridPlacement::save_json(const std::string & path, const std::string & arch_name,
                                    std::string * err) const {
-    if (n_layer <= 0 || n_expert <= 0 || (int)hot_counts.size() != n_layer ||
-        (int)hot_expert_ids.size() != n_layer) {
-        if (err) *err = "placement not initialized";
-        return false;
-    }
+    if (!valid(err)) return false;
 
     nlohmann::json j;
     j["arch"] = arch_name;
@@ -99,12 +159,7 @@ bool MoeHybridPlacement::load_json(const std::string & path,
         return false;
     }
 
-    if (tmp.n_layer <= 0 || tmp.n_expert <= 0 || tmp.n_expert_used <= 0 ||
-        (int)tmp.hot_counts.size() != tmp.n_layer ||
-        (int)tmp.hot_expert_ids.size() != tmp.n_layer) {
-        if (err) *err = "invalid placement dimensions";
-        return false;
-    }
+    if (!tmp.valid(err)) return false;
 
     out = std::move(tmp);
     return true;
@@ -115,10 +170,7 @@ bool MoeHybridPlacement::build_from_stats(const MoeHybridRoutingStats & stats,
                                           int min_hot_per_layer,
                                           MoeHybridPlacement & out,
                                           std::string * err) {
-    if (stats.empty() || stats.n_layer <= 0 || stats.n_expert <= 0) {
-        if (err) *err = "stats not initialized";
-        return false;
-    }
+    if (!stats.valid(err)) return false;
     if (min_hot_per_layer < 0) min_hot_per_layer = 0;
     if (total_hot_budget <= 0) {
         if (err) *err = "total_hot_budget must be > 0";
@@ -126,7 +178,8 @@ bool MoeHybridPlacement::build_from_stats(const MoeHybridRoutingStats & stats,
     }
 
     const int per_layer_floor = std::min(min_hot_per_layer, stats.n_expert);
-    const int floor_total = per_layer_floor * stats.n_layer;
+    const int64_t floor_total =
+        (int64_t) per_layer_floor * stats.n_layer;
     if (floor_total > total_hot_budget) {
         if (err) *err = "min_hot_per_layer exceeds total budget";
         return false;
@@ -143,7 +196,7 @@ bool MoeHybridPlacement::build_from_stats(const MoeHybridRoutingStats & stats,
         ranked[(size_t)il] = stats.ranked_experts(il);
     }
 
-    int remaining = total_hot_budget - floor_total;
+    int64_t remaining = (int64_t) total_hot_budget - floor_total;
     while (remaining > 0) {
         int best_layer = -1;
         uint64_t best_gain = 0;
@@ -184,10 +237,7 @@ bool MoeHybridPlacement::build_from_stats_with_layer_bytes(
     int min_hot_per_layer,
     MoeHybridPlacement & out,
     std::string * err) {
-    if (stats.empty() || stats.n_layer <= 0 || stats.n_expert <= 0) {
-        if (err) *err = "stats not initialized";
-        return false;
-    }
+    if (!stats.valid(err)) return false;
     if ((int)layer_expert_bytes.size() != stats.n_layer) {
         if (err) *err = "layer_expert_bytes size mismatch";
         return false;
@@ -201,8 +251,14 @@ bool MoeHybridPlacement::build_from_stats_with_layer_bytes(
     const int per_layer_floor = std::min(min_hot_per_layer, stats.n_expert);
     uint64_t floor_bytes = 0;
     for (int il = 0; il < stats.n_layer; ++il) {
-        if (layer_expert_bytes[(size_t)il] > 0)
-            floor_bytes += (uint64_t)per_layer_floor * layer_expert_bytes[(size_t)il];
+        const uint64_t expert_bytes = layer_expert_bytes[(size_t) il];
+        if (expert_bytes > 0 && (uint64_t) per_layer_floor >
+                (std::numeric_limits<uint64_t>::max() - floor_bytes) /
+                    expert_bytes) {
+            if (err) *err = "minimum hot placement byte count overflow";
+            return false;
+        }
+        floor_bytes += (uint64_t) per_layer_floor * expert_bytes;
     }
     if (floor_bytes > total_hot_budget_bytes) {
         if (err) *err = "min_hot_per_layer exceeds byte budget";
@@ -269,19 +325,18 @@ bool MoeHybridPlacement::expand_from_stats_with_layer_bytes(
     uint64_t total_hot_budget_bytes,
     MoeHybridPlacement & in_out,
     std::string * err) {
-    if (stats.empty() || stats.n_layer <= 0 || stats.n_expert <= 0) {
-        if (err) *err = "stats not initialized";
-        return false;
-    }
+    if (!stats.valid(err)) return false;
     if ((int) layer_expert_bytes.size() != stats.n_layer) {
         if (err) *err = "layer_expert_bytes size mismatch";
         return false;
     }
-    if (!in_out.matches(
-            stats.n_layer, stats.n_expert, stats.n_expert_used)) {
+    if (in_out.n_layer != stats.n_layer ||
+        in_out.n_expert != stats.n_expert ||
+        in_out.n_expert_used != stats.n_expert_used) {
         if (err) *err = "existing placement shape does not match stats";
         return false;
     }
+    if (!validate_placement(in_out, false, err)) return false;
     if (total_hot_budget_bytes == 0) {
         if (err) *err = "total_hot_budget_bytes must be > 0";
         return false;
@@ -384,10 +439,7 @@ bool MoeHybridPlacement::build_critical_path_balanced_from_stats(
     const MoeHybridCriticalPathConfig & config,
     MoeHybridPlacement & out,
     std::string * err) {
-    if (stats.empty() || stats.n_layer <= 0 || stats.n_expert <= 0) {
-        if (err) *err = "stats not initialized";
-        return false;
-    }
+    if (!stats.valid(err)) return false;
     if ((int) layer_expert_bytes.size() != stats.n_layer ||
         (int) layer_main_fixed_bytes.size() != stats.n_layer) {
         if (err) *err = "critical-path layer byte vector size mismatch";
@@ -442,11 +494,6 @@ bool MoeHybridPlacement::build_critical_path_balanced_from_stats(
         for (int n = 0; n < tmp.n_expert; ++n) {
             const uint64_t count =
                 stats.count(il, ranked[(size_t) il][(size_t) n]);
-            if (count > std::numeric_limits<uint64_t>::max() -
-                            prefix[(size_t) n]) {
-                if (err) *err = "routing profile count overflow";
-                return false;
-            }
             prefix[(size_t) n + 1] = prefix[(size_t) n] + count;
         }
         if (layer_expert_bytes[(size_t) il] > 0) {

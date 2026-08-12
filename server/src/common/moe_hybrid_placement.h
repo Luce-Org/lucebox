@@ -49,6 +49,7 @@ struct MoeHybridPlacement {
     // Ranked hot expert ids kept on GPU per layer.
     std::vector<std::vector<int32_t>> hot_expert_ids;
 
+    bool valid(std::string * err = nullptr) const;
     bool matches(int n_layer, int n_expert, int n_expert_used) const;
     bool matches(const MoeHybridConfig & cfg) const;
     bool empty() const;
