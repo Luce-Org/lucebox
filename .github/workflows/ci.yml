@@ -34,6 +34,9 @@ jobs:
       - name: Lint Python surfaces touched by lucebox tooling
         run: uv run --frozen --extra dev ruff check .
 
+      - name: Run validation-v2 model-free contract tests
+        run: uv run --frozen --extra dev pytest -q harness/validation_v2/tests
+
   build:
     name: Build (cmake + uv sync --extra megakernel)
     runs-on: ubuntu-latest

@@ -139,3 +139,5 @@ backends.
 - `clients/`: real client launchers
 - `clients/prompts/`: short prompts used by the launchers
 - `benchmarks/`: direct generation benchmark against OpenAI-compatible servers
+- `validation_v2/`: fail-closed matrix lifecycle, exact scoring, provenance, and
+  prompt-clustered statistical analysis for publication campaigns
