@@ -2,6 +2,8 @@
 
 #pragma once
 
+#include "inference_phase.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -15,6 +17,7 @@ struct TargetShardDaemonForwardRequest {
     int ubatch = 0;
     bool want_argmax = false;
     bool want_logits = false;
+    InferencePhase semantic_phase = InferencePhase::Unspecified;
     const std::vector<float> * boundary_activation = nullptr;
     const std::vector<int32_t> * token_ids = nullptr;
 };

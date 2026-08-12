@@ -470,6 +470,8 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
             // DS4 attention carries sparse-layout and fused-RoPE semantics.
             // The generic CPU kernel does not implement that contract.
             return !ggml_flash_attn_ext_is_ds4(op);
+        case GGML_OP_PAGED_ATTN:
+            return false;
         case GGML_OP_OUT_PROD:
             return (src0->type == GGML_TYPE_F32 || (ggml_is_quantized(src0->type) && src0->ne[2] == src1->ne[2] && src0->ne[3] == src1->ne[3])) &&
                 src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;

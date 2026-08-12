@@ -23,11 +23,13 @@
 
 #include "deepseek4_dspark.h"
 #include "deepseek4_internal.h"
+#include "deepseek4_roctx.h"
 #include "internal.h"
 #include "common/dspark_head.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "ggml-cuda.h"
 #include "ggml-cpu.h"
 
 #include <algorithm>
@@ -585,6 +587,7 @@ bool deepseek4_dspark_verify_forward(ggml_backend_t backend,
                                      MoeHybridStorage * moe_hybrid,
                                      MoeExpertComputeRuntime * expert_runtime,
                                      MoeHybridRoutingStats * routing_stats) {
+    const DeepSeek4RoctxPhaseScope roctx_phase(InferencePhase::Verify);
     std::vector<float> hc_state;
     std::vector<float> all_logits;
     std::vector<float> last_logits;
@@ -664,6 +667,12 @@ bool run_deepseek4_dspark_spec_decode(
         spec_env_flag("DFLASH_DS4_FULL_SNAP");
     const bool seq_verify_mode = reference_exact ||
         spec_env_flag("DFLASH_DS4_SEQ_VERIFY");
+    const InferencePhase roctx_phase = reference_exact
+        ? InferencePhase::ReferenceExact
+        : (seq_verify_mode ? InferencePhase::Sequential : InferencePhase::Batched);
+    const DeepSeek4RoctxRange roctx_range(
+        "ds4.spec_decode",
+        {roctx_phase, n_gen, 0, target_w.n_layer, device});
     const bool async_rollback = spec_env_flag("DFLASH_DS4_ASYNC_ROLLBACK");
     const bool pinned_rollback = spec_env_flag("DFLASH_DS4_PINNED_ROLLBACK");
     const bool draft_overlap_probe =
@@ -713,10 +722,14 @@ bool run_deepseek4_dspark_spec_decode(
     // Full snapshots change rollback strategy but not the compressor-window
     // limit below. The legacy sequential measurement path is validated only
     // through q=4.
-    int q_cap = full_snap ? block + 1 : 4;
+    int q_cap = full_snap ? block + 1
+                          : GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS;
     if (const char * qs = std::getenv("DFLASH_DS4_SPEC_Q")) {
         const int v = std::atoi(qs);
-        if (v >= 2 && v <= block + 1) q_cap = full_snap ? v : std::min(v, 4);
+        if (v >= 2 && v <= block + 1) {
+            q_cap = full_snap
+                ? v : std::min(v, GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS);
+        }
     }
     if (std::FILE * qf = std::fopen("/tmp/ds4_spec_q", "r")) {
         // Per-request override for perf experiments (no server restart needed).
@@ -724,16 +737,19 @@ bool run_deepseek4_dspark_spec_decode(
         // (diagnoses batched-vs-sequential target divergence).
         int v = 0;
         if (std::fscanf(qf, "%d", &v) == 1 && v >= 1 && v <= block + 1) {
-            q_cap = full_snap ? v : std::min(v, 4);
+            q_cap = full_snap
+                ? v : std::min(v, GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS);
         }
         std::fclose(qf);
     }
-    if (seq_verify_mode && q_cap > 4) {
+    if (seq_verify_mode &&
+        q_cap > GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS) {
         std::fprintf(stderr,
-                     "[ds4-spec] sequential verify supports q<=4; "
-                     "capping requested q=%d to 4\n",
-                     q_cap);
-        q_cap = 4;
+                     "[ds4-spec] sequential verify supports q<=%d; "
+                     "capping requested q=%d to %d\n",
+                     GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS, q_cap,
+                     GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS);
+        q_cap = GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS;
     }
 
     // Snapshot backend for the legacy full-snapshot rollback path.

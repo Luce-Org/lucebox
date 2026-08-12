@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -36,6 +37,21 @@ bool stream_daemon_status(const TargetShardDaemonCallbacks & callbacks,
                      daemon_prefix(callbacks), status);
         return false;
     }
+    return true;
+}
+
+bool forward_payload_bytes(int hidden, int n_tokens, size_t & bytes) {
+    if (hidden <= 0 || n_tokens <= 0 ||
+        static_cast<size_t>(n_tokens) >
+            std::numeric_limits<size_t>::max() / static_cast<size_t>(hidden)) {
+        return false;
+    }
+    const size_t elements = static_cast<size_t>(n_tokens) *
+        static_cast<size_t>(hidden);
+    if (elements > std::numeric_limits<size_t>::max() / sizeof(float)) {
+        return false;
+    }
+    bytes = elements * sizeof(float);
     return true;
 }
 
@@ -117,34 +133,40 @@ int run_target_shard_ipc_daemon_loop(
         int has_token_ids = 0;
         int forward_ubatch = 0;
         int token_count = 0;
+        int32_t semantic_phase_value = 0;
         size_t bytes = 0;
         bool payload_ok = false;
+        bool framing_fields_present = false;
+        bool command_fields_ok = false;
+        bool pipe_forward = false;
+        bool shared_forward = false;
+        uint64_t shared_seq = 0;
 
         if (cmd == "forward_pipe") {
+            pipe_forward = true;
             iss >> base_pos >> n_tokens >> want_argmax >> want_logits >> bytes >>
                 has_token_ids >> forward_ubatch >> token_count;
-            const size_t expected_bytes =
-                (size_t)std::max(0, n_tokens) * (size_t)hidden * sizeof(float);
-            if (payload_fd >= 0 && n_tokens > 0 && bytes == expected_bytes) {
-                host_act.assign(bytes / sizeof(float), 0.0f);
-                payload_ok = read_exact_fd(payload_fd, host_act.data(), bytes);
+            framing_fields_present = static_cast<bool>(iss);
+            if (framing_fields_present) {
+                iss >> semantic_phase_value;
+                const bool phase_present = static_cast<bool>(iss);
+                if (phase_present) {
+                    iss >> std::ws;
+                    command_fields_ok = iss.eof();
+                }
             }
         } else if (cmd == "forward_shared") {
-            uint64_t seq = 0;
-            iss >> base_pos >> n_tokens >> want_argmax >> want_logits >> bytes >> seq >>
-                has_token_ids >> forward_ubatch >> token_count;
-            const size_t expected_bytes =
-                (size_t)std::max(0, n_tokens) * (size_t)hidden * sizeof(float);
-            const auto * header =
-                static_cast<const BackendIpcSharedPayloadHeader *>(shared_payload);
-            if (shared_payload && shared_payload != MAP_FAILED && shared_payload_data &&
-                seq != 0 && n_tokens > 0 && bytes == expected_bytes &&
-                backend_ipc_payload_in_bounds(0, bytes, shared_payload_capacity) &&
-                backend_ipc_shared_payload_header_matches(
-                    header, seq, static_cast<uint64_t>(bytes))) {
-                host_act.assign(bytes / sizeof(float), 0.0f);
-                std::memcpy(host_act.data(), shared_payload_data, bytes);
-                payload_ok = true;
+            shared_forward = true;
+            iss >> base_pos >> n_tokens >> want_argmax >> want_logits >> bytes >>
+                shared_seq >> has_token_ids >> forward_ubatch >> token_count;
+            framing_fields_present = static_cast<bool>(iss);
+            if (framing_fields_present) {
+                iss >> semantic_phase_value;
+                const bool phase_present = static_cast<bool>(iss);
+                if (phase_present) {
+                    iss >> std::ws;
+                    command_fields_ok = iss.eof();
+                }
             }
         } else {
             if (cmd == "reset_request_state") {
@@ -194,18 +216,45 @@ int run_target_shard_ipc_daemon_loop(
             continue;
         }
 
-        bool ok = payload_ok && base_pos >= 0 && n_tokens > 0;
-        if (ok && has_token_ids) {
-            ok = payload_fd >= 0 && token_count == n_tokens;
-            if (ok) {
-                token_ids.assign((size_t)n_tokens, 0);
-                ok = read_exact_fd(payload_fd, token_ids.data(),
-                                   sizeof(int32_t) * token_ids.size());
+        size_t expected_bytes = 0;
+        const bool framing_ok = framing_fields_present && base_pos >= 0 &&
+            forward_ubatch >= 0 && (want_argmax == 0 || want_argmax == 1) &&
+            (want_logits == 0 || want_logits == 1) &&
+            (has_token_ids == 0 || has_token_ids == 1) &&
+            forward_payload_bytes(hidden, n_tokens, expected_bytes) &&
+            bytes == expected_bytes &&
+            token_count == (has_token_ids ? n_tokens : 0);
+
+        if (framing_ok && pipe_forward && payload_fd >= 0) {
+            host_act.assign(bytes / sizeof(float), 0.0f);
+            payload_ok = read_exact_fd(payload_fd, host_act.data(), bytes);
+        } else if (framing_ok && shared_forward) {
+            const auto * header =
+                static_cast<const BackendIpcSharedPayloadHeader *>(shared_payload);
+            if (shared_payload && shared_payload != MAP_FAILED &&
+                shared_payload_data && shared_seq != 0 &&
+                backend_ipc_payload_in_bounds(0, bytes, shared_payload_capacity) &&
+                backend_ipc_shared_payload_header_matches(
+                    header, shared_seq, static_cast<uint64_t>(bytes))) {
+                host_act.assign(bytes / sizeof(float), 0.0f);
+                std::memcpy(host_act.data(), shared_payload_data, bytes);
+                payload_ok = true;
             }
-        } else {
-            token_ids.clear();
-            ok = ok && token_count == 0;
         }
+
+        const int token_fd = payload_fd >= 0 ? payload_fd : stream_fd;
+        bool token_ids_ok = !has_token_ids;
+        token_ids.clear();
+        if (framing_ok && has_token_ids) {
+            token_ids.assign(static_cast<size_t>(n_tokens), 0);
+            token_ids_ok = read_exact_fd(
+                token_fd, token_ids.data(), sizeof(int32_t) * token_ids.size());
+        }
+
+        InferencePhase semantic_phase = InferencePhase::Unspecified;
+        const bool semantic_phase_ok = command_fields_ok &&
+            inference_phase_from_wire_value(semantic_phase_value, semantic_phase);
+        bool ok = framing_ok && payload_ok && token_ids_ok && semantic_phase_ok;
 
         TargetShardDaemonForwardResponse resp;
         if (ok) {
@@ -215,6 +264,7 @@ int run_target_shard_ipc_daemon_loop(
             req.ubatch = forward_ubatch > 0 ? forward_ubatch : n_tokens;
             req.want_argmax = want_argmax != 0;
             req.want_logits = want_logits != 0;
+            req.semantic_phase = semantic_phase;
             req.boundary_activation = &host_act;
             req.token_ids = has_token_ids ? &token_ids : nullptr;
             ok = callbacks.forward(req, resp);
@@ -222,6 +272,7 @@ int run_target_shard_ipc_daemon_loop(
 
         const int32_t status = ok ? 0 : -1;
         if (!write_exact_fd(stream_fd, &status, sizeof(status))) break;
+        if (!framing_ok) break;
         if (!ok) continue;
 
         if (!write_exact_fd(stream_fd, &resp.last_tok, sizeof(resp.last_tok))) break;

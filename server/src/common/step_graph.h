@@ -47,7 +47,9 @@ struct StepGraph {
     // reused by the copy-mode persistent fast path.
     bool            built_view = false;
     ggml_tensor *   hidden_input = nullptr;        // lm-head projection only
-    // [n_tokens,n_head_kv] i64; step-invariant KV write (carries kv_start). Null on non-graph paths.
+    // [n_tokens,n_head_kv] i64 physical destination rows for ggml_set_rows.
+    // Used by contiguous replay, KVFlash, and paged attention; null when the
+    // graph uses the legacy contiguous ggml_cpy write.
     ggml_tensor *   kv_write_rows = nullptr;
 
     // Output

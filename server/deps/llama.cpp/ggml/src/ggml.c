@@ -618,6 +618,31 @@ FILE * ggml_fopen(const char * fname, const char * mode) {
 
 }
 
+// qtype 105/106 carry a per-expert LEARNED CODEBOOK out of band -- GGUF KV for 105, the
+// loader sidecar for 106 -- which the generic type_traits signature cannot reach. The
+// uniform fixed-level decoders used to be wired in here as a "fallback". That was wrong:
+// for a mode-0 (uniform) expert the fixed decoder coincidentally agrees, but for a mode-1
+// (adaptive) expert it SILENTLY PRODUCES WRONG VALUES, so any generic CPU op, offload or
+// tool path quietly corrupted adaptive experts instead of refusing an operation it cannot
+// perform. Aborting is the only correct generic behaviour; the real decoders are the
+// dedicated CUDA/HIP mul_mat_id kernels and the registry-aware to_fp16 shim.
+static void rocmfpx_mix_to_float_unsupported(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    GGML_UNUSED(x); GGML_UNUSED(y); GGML_UNUSED(k);
+    GGML_ABORT("rocmfpx_mix: generic CPU dequantization is unsupported -- the per-expert "
+               "codebook is out-of-band. Use the CUDA/HIP mix path (mul_mat_id or the "
+               "registry-aware to_fp16 shim).");
+}
+// Symmetric hole: producing one of these types needs a FITTED per-expert codebook plus the
+// sidecar/KV that carries it. from_float_ref could previously mint a qtype-105/106 tensor
+// with no codebook at all -- a tensor nothing can decode correctly.
+static void rocmfpx_mix_from_float_unsupported(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    GGML_UNUSED(x); GGML_UNUSED(y); GGML_UNUSED(k);
+    GGML_ABORT("rocmfpx_mix: quantization requires a fitted per-expert codebook and its "
+               "sidecar/KV. These tensors must come from an exporter that fits "
+               "per-expert codebooks and emits them alongside the weights.");
+}
+
+
 static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
     [GGML_TYPE_I8] = {
         .type_name                = "i8",
@@ -754,6 +779,33 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .is_quantized             = true,
         .to_float                 = (ggml_to_float_t) rocmfpx_dequantize_row_fp3,
         .from_float_ref           = (ggml_from_float_t) rocmfpx_quantize_row_fp3_ref,
+    },
+    [GGML_TYPE_Q3_1_ROCMFP3_MIX] = {
+        // Per-expert mixed absmax/adaptive ROCmFP3 (P4). Same 14B block wire as
+        // q3_0; the per-expert codebook lives in GGUF KV and decode happens in the
+        // dedicated CUDA/HIP mul_mat_id path. The generic to_float/from_float_ref ABORT:
+        // see rocmfpx_mix_to_float_unsupported above for why a fixed-level fallback here
+        // is not merely approximate but silently wrong for adaptive experts.
+        .type_name                = "q3_1_rocmfp3_mix",
+        .blck_size                = QK_ROCMFP3,
+        .type_size                = sizeof(block_rocmfp3),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) rocmfpx_mix_to_float_unsupported,
+        .from_float_ref           = (ggml_from_float_t) rocmfpx_mix_from_float_unsupported,
+    },
+    [GGML_TYPE_Q2_1_ROCMFP2_MIX] = {
+        // Per-expert mixed absmax/adaptive ROCmFP2 (gate/up). Same 10B block wire as
+        // q2_0, so a GGUF splice from 107 is offset-preserving; the per-expert
+        // codebook travels in the loader sidecar and decode happens in the dedicated
+        // CUDA/HIP mul_mat_id path. The generic to_float/from_float_ref ABORT: see
+        // rocmfpx_mix_to_float_unsupported above for why a fixed-level fallback here is
+        // not merely approximate but silently wrong for adaptive experts.
+        .type_name                = "q2_1_rocmfp2_mix",
+        .blck_size                = QK_ROCMFP2,
+        .type_size                = sizeof(block_rocmfp2),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) rocmfpx_mix_to_float_unsupported,
+        .from_float_ref           = (ggml_from_float_t) rocmfpx_mix_from_float_unsupported,
     },
     [GGML_TYPE_Q2_0_ROCMFP2] = {
         .type_name                = "q2_0_rocmfp2",
@@ -1146,9 +1198,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DS4_INDEXER_MASK",
 
     "MUL_MAT_GROUPED_SRC",
+
+    "PAGED_ATTN",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1271,9 +1325,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "ds4_indexer_mask(x,topk)",
 
     "X*grouped(Y)",
+
+    "paged_attn(q,k,v)",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5614,6 +5670,58 @@ struct ggml_tensor * ggml_flash_attn_sparse(
     return result;
 }
 
+// ggml_paged_attn
+
+struct ggml_tensor * ggml_paged_attn(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * block_table,
+        struct ggml_tensor  * kv_seq_lens,
+        float                 scale,
+        int                   block_size,
+        int                   max_kv_seq_len) {
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q4_0 || k->type == GGML_TYPE_Q8_0);
+    GGML_ASSERT(v->type == GGML_TYPE_F16 || v->type == GGML_TYPE_Q4_0 || v->type == GGML_TYPE_Q8_0);
+    GGML_ASSERT(block_table->type == GGML_TYPE_I32);
+    GGML_ASSERT(kv_seq_lens->type == GGML_TYPE_I32);
+
+    GGML_ASSERT(q->ne[0] == k->ne[0] && q->ne[0] == v->ne[0]);
+    GGML_ASSERT(k->ne[1] == v->ne[1]);
+    GGML_ASSERT(k->ne[2] > 0);
+    GGML_ASSERT(k->ne[2] == v->ne[2]);
+    GGML_ASSERT(q->ne[2] % k->ne[2] == 0);
+    GGML_ASSERT(q->ne[3] == 1 && k->ne[3] == 1 && v->ne[3] == 1);
+
+    GGML_ASSERT(block_table->ne[0] > 0);
+    GGML_ASSERT(block_table->ne[1] == q->ne[1]);
+    GGML_ASSERT(block_table->ne[2] == 1 && block_table->ne[3] == 1);
+    GGML_ASSERT(kv_seq_lens->ne[0] == q->ne[1]);
+    GGML_ASSERT(kv_seq_lens->ne[1] == 1 && kv_seq_lens->ne[2] == 1 && kv_seq_lens->ne[3] == 1);
+
+    GGML_ASSERT(block_size > 0);
+    GGML_ASSERT(k->ne[1] % block_size == 0);
+    GGML_ASSERT(max_kv_seq_len > 0);
+    GGML_ASSERT(max_kv_seq_len <= k->ne[1]);
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, q->ne);
+
+    ggml_set_op_params_f32(result, 0, scale);
+    ggml_set_op_params_i32(result, 1, block_size);
+    ggml_set_op_params_i32(result, 2, max_kv_seq_len);
+
+    result->op     = GGML_OP_PAGED_ATTN;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = block_table;
+    result->src[4] = kv_seq_lens;
+
+    return result;
+}
+
 // ggml_flash_attn_back
 
 struct ggml_tensor * ggml_flash_attn_back(
@@ -8481,11 +8589,12 @@ struct ggml_tensor * ggml_ds4_indexer_qat(
     return result;
 }
 
-struct ggml_tensor * ggml_ds4_indexer_score(
+struct ggml_tensor * ggml_ds4_indexer_score_masked(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
         struct ggml_tensor  * head_weights,
         struct ggml_tensor  * index_comp,
+        struct ggml_tensor  * visibility_mask,
         int                   kv_start,
         int                   ratio) {
     GGML_ASSERT(q->type == GGML_TYPE_F32 && q->ne[0] == 128);
@@ -8499,6 +8608,10 @@ struct ggml_tensor * ggml_ds4_indexer_score(
     GGML_ASSERT(q->ne[3] == 1);
     GGML_ASSERT(head_weights->ne[2] == 1 && head_weights->ne[3] == 1);
     GGML_ASSERT(index_comp->ne[2] == 1 && index_comp->ne[3] == 1);
+    GGML_ASSERT(!visibility_mask ||
+                (visibility_mask->type == GGML_TYPE_F32 &&
+                 visibility_mask->ne[0] == index_comp->ne[1] &&
+                 visibility_mask->ne[1] == q->ne[2]));
     GGML_ASSERT(kv_start >= 0 && ratio > 0);
 
     struct ggml_tensor * result = ggml_new_tensor_2d(
@@ -8507,9 +8620,21 @@ struct ggml_tensor * ggml_ds4_indexer_score(
     result->src[0] = q;
     result->src[1] = head_weights;
     result->src[2] = index_comp;
+    result->src[3] = visibility_mask;
     ggml_set_op_params_i32(result, 0, kv_start);
     ggml_set_op_params_i32(result, 1, ratio);
     return result;
+}
+
+struct ggml_tensor * ggml_ds4_indexer_score(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * head_weights,
+        struct ggml_tensor  * index_comp,
+        int                   kv_start,
+        int                   ratio) {
+    return ggml_ds4_indexer_score_masked(
+        ctx, q, head_weights, index_comp, NULL, kv_start, ratio);
 }
 
 struct ggml_tensor * ggml_ds4_indexer_mask(

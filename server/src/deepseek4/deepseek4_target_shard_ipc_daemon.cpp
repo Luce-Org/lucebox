@@ -6,6 +6,7 @@
 
 #include "deepseek4_layer_split_adapter.h"
 #include "deepseek4_internal.h"
+#include "deepseek4_roctx.h"
 #include "common/target_shard_ipc.h"
 #include "common/target_shard_ipc_daemon.h"
 
@@ -216,6 +217,7 @@ int run_deepseek4_target_shard_ipc_daemon(
 
     callbacks.forward = [&](const TargetShardDaemonForwardRequest & req,
                             TargetShardDaemonForwardResponse & resp) -> bool {
+        const DeepSeek4RoctxPhaseScope roctx_phase(req.semantic_phase);
         const int n_tokens = req.n_tokens;
         if (!req.boundary_activation || n_tokens <= 0 || req.base_pos < 0 ||
             req.base_pos + n_tokens > max_ctx ||

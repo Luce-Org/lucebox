@@ -91,15 +91,24 @@ static std::string find_model_cards_dir(const std::string & repo_root_hint) {
     if (!repo_root_hint.empty()) {
         candidates.push_back(repo_root_hint + "/share/model_cards");
     }
+    // An explicit override has to beat implicit discovery. This used to be tried LAST,
+    // after the cwd-relative path, so running from any directory that happened to contain
+    // share/model_cards silently ignored the operator's DFLASH_MODEL_CARDS_DIR.
+    if (const char * envp = std::getenv("DFLASH_MODEL_CARDS_DIR")) {
+        candidates.push_back(envp);
+    }
     std::string bd = self_bin_dir();
     if (!bd.empty()) {
         candidates.push_back(bd + "/../share/model_cards");
         candidates.push_back(bd + "/share/model_cards");
+        // CMake build tree: the binary is at <repo>/server/build-*/dflash_server while
+        // share/ sits at the repo root, two levels up. That is the layout every developer
+        // run and both eval boxes use, and without this the shipped cards resolve to
+        // nothing -- observed on the H200 as "no share/model_cards/ directory found;
+        // tried 3 candidate(s)" with the cards sitting right there in the checkout.
+        candidates.push_back(bd + "/../../share/model_cards");
     }
     candidates.push_back("share/model_cards");
-    if (const char * envp = std::getenv("DFLASH_MODEL_CARDS_DIR")) {
-        candidates.push_back(envp);
-    }
 
     for (const auto & c : candidates) {
         std::error_code ec;
@@ -283,6 +292,28 @@ static bool family_fallback(const std::string & arch, ModelCard & out) {
         out.max_tokens                 = 32768;
         out.complex_problem_max_tokens = 0;
         out.source_label = "family:laguna";
+        return true;
+    }
+    if (arch == "deepseek4") {
+        // There was no entry here, so every DeepSeek4 artifact — including the
+        // published ROCmFPX GGUFs — fell through to the §3.4 hard fallback. That
+        // clamped replies hard enough to truncate ~35% of HumanEval completions
+        // mid-code on a 27B-class model, which reads as a quality problem and is
+        // not one.
+        //
+        // 32768 matches the conservative ceiling used for the other families. The
+        // upstream card recommends up to 384K output for the high/max reasoning
+        // levels, but this is the no-sidecar safety net and the comment above is
+        // explicit that these values are deliberately not aspirational; ship
+        // share/model_cards/<general.name>.json to get the real figures.
+        out.max_tokens                 = 32768;
+        out.complex_problem_max_tokens = 0;
+        // DeepSeek's visible answer after `</think>` is terse, so the 512 default
+        // from ds4_eval.c fits the style — but chat-formatted code answers wrap the
+        // function in prose, and 512 clips those. 4096 matches Qwen's reasoning for
+        // the same failure mode.
+        out.hard_limit_reply_budget    = 4096;
+        out.source_label = "family:deepseek4";
         return true;
     }
     return false;

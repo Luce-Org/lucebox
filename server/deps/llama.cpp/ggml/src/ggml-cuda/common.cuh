@@ -990,7 +990,21 @@ struct ggml_cuda_type_traits<GGML_TYPE_Q2_0_ROCMFP2> {
 };
 
 template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q2_1_ROCMFP2_MIX> {
+    static constexpr int qk = QK_ROCMFP2;
+    static constexpr int qr = QR_ROCMFP2;
+    static constexpr int qi = QI_ROCMFP2;
+};
+
+template<>
 struct ggml_cuda_type_traits<GGML_TYPE_Q3_0_ROCMFPX> {
+    static constexpr int qk = QK_ROCMFP3;
+    static constexpr int qr = QR_ROCMFP3;
+    static constexpr int qi = QI_ROCMFP3;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q3_1_ROCMFP3_MIX> {
     static constexpr int qk = QK_ROCMFP3;
     static constexpr int qr = QR_ROCMFP3;
     static constexpr int qi = QI_ROCMFP3;

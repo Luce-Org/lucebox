@@ -1,6 +1,8 @@
 // DeepSeek4Backend implementation — AR-only decode, chunked prefill.
+#include "deepseek4_roctx.h"
 
 #include "deepseek4_backend.h"
+#include "deepseek4_budget_hook.h"
 #include "deepseek4_internal.h"
 #include "common/dynamic_backend.h"
 #include "common/peer_access.h"
@@ -1198,6 +1200,53 @@ bool DeepSeek4Backend::init_hybrid_model() {
         return true;
     }
 
+    // qtype-105 (Q3_1_ROCMFP3_MIX) is decodable only by the fused CUDA/HIP
+    // kernel driven by the per-expert sidecar codebooks/modes. Hybrid storage
+    // slices the stacked down-expert tensor into separate hot/cold buffers that
+    // carry no sidecar metadata, and the CPU cold path has no type-105 traits —
+    // so a hybrid placement has no working decode path (the GPU cold path hits
+    // the unregistered-tensor abort; the CPU cold path has no vec_dot for 105).
+    // Fail at load with a clear message instead of starting a server that
+    // crashes or emits garbage at first decode. (The all-hot case above reloads
+    // the full monolithic model and never reaches here.)
+    // The same reasoning applies verbatim to qtype-106 (Q2_1_ROCMFP2_MIX) gate/up: hybrid
+    // slicing drops their registry metadata too, and there is no CPU vec_dot for 106 either.
+    // Only the down projection was checked, so a model with adaptive gate/up over uniform
+    // down experts passed this gate and went on to materialise unregistered hot/cold tensors
+    // -- aborting at first decode, or worse, decoding with whatever the registry lookup
+    // returned. Check every expert tensor that can carry a mix qtype.
+    for (const auto & L : w_.layers) {
+        const struct { ggml_tensor * t; int qtype; const char * what; } mix_experts[] = {
+            { L.ffn_down_exps, GGML_TYPE_Q3_1_ROCMFP3_MIX, "qtype-105 (mixed ROCmFP3) down" },
+            { L.ffn_gate_exps, GGML_TYPE_Q2_1_ROCMFP2_MIX, "qtype-106 (mixed ROCmFP2) gate" },
+            { L.ffn_up_exps,   GGML_TYPE_Q2_1_ROCMFP2_MIX, "qtype-106 (mixed ROCmFP2) up"   },
+            { L.ffn_down_exps, GGML_TYPE_Q2_1_ROCMFP2_MIX, "qtype-106 (mixed ROCmFP2) down" },
+        };
+        for (const auto & m : mix_experts) {
+            if (!m.t || m.t->type != m.qtype) {
+                continue;
+            }
+            // Mix qtypes decode only from registered resident tensors, so a
+            // cold-slice placement can never serve them. But refusing outright
+            // is wrong when the MONOLITHIC footprint fits the device -- the
+            // 2.5-3.5 bpw mix formats exist precisely so the whole file fits
+            // where a hybrid split of a larger quant was needed. Mirror the
+            // all-hot branch above: drop the partial load and attempt the full
+            // load, failing with the allocator's error if it does not fit.
+            std::fprintf(stderr,
+                "[deepseek4] %s experts cannot decode from hybrid/cold "
+                "placement; falling back to monolithic full load\n", m.what);
+            free_deepseek4_weights(w_);
+            if (!load_deepseek4_gguf(cfg_.model_path, backend_, w_)) {
+                std::fprintf(stderr,
+                    "[deepseek4] monolithic fallback failed (model does not "
+                    "fit resident): %s\n", cfg_.model_path);
+                return false;
+            }
+            return true;
+        }
+    }
+
     auto hybrid = std::make_shared<MoeHybridStorage>();
     MoeHybridConfig hybrid_cfg = make_ds4_parent_worker_cfg(w_);
     const Ds4MoeTpConfig tp = ds4_moe_tp_config(cfg_.device.gpu);
@@ -1416,6 +1465,12 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                                   int kv_offset,
                                   int snap_slot,
                                   int snap_pos) {
+    const InferencePhase phase = deepseek4_roctx_prefill_phase(
+        prefill_attention_mode_name(cfg_.prefill_mode));
+    const DeepSeek4RoctxPhaseScope roctx_phase(phase);
+    const DeepSeek4RoctxRange roctx_range(
+        "ds4.prefill",
+        {phase, static_cast<int>(tokens.size()), 0, w_.n_layer, cfg_.device.gpu});
     // The all-hot layer-range path supports causal chunked prefill. The
     // optimized graph snapshots the previous raw SWA window, attends over
     // that snapshot plus the current ubatch, and commits only the final SWA
@@ -1677,6 +1732,7 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
                                   const DaemonIO & io,
                                   const BudgetHook & budget_hook,
                                   bool * forced_close_out) {
+    const DeepSeek4RoctxPhaseScope roctx_phase(InferencePhase::Decode);
     if (forced_close_out) *forced_close_out = false;
     const bool timing = env_flag_enabled("DFLASH_DS4_TIMING");
     const auto phase_t0 = Clock::now();
@@ -1691,21 +1747,19 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
         }
     }
 
+    // Budget-hook state. The close sequence is injected one token per step, then decoding
+    // CONTINUES so the model can spend the reserved reply budget on a visible answer. The
+    // previous implementation pushed the whole close sequence and broke out of the loop, which
+    // (a) never ran a forward over the injected tokens, so KV state did not reflect them, and
+    // (b) ended generation, so the reply budget was reserved and never usable. Measured on
+    // DeepSeek-V4-Flash: total tokens came to exactly thinking_ceiling + len(close_sequence)
+    // for close sequences of 1, 3 and 23 tokens -- zero tokens of answer in every case, while
+    // finish_reason still reported "stop". This mirrors qwen35_backend's override-and-continue.
+    bool budget_close_started = false;
+    size_t close_inject_pos = 0;
+
     for (int generated = 0; generated < n_gen; generated++) {
         if (io.is_cancelled()) break;
-
-        // Budget hook: force-close if remaining budget hits threshold
-        if (!budget_hook.close_token_ids.empty() &&
-            (n_gen - generated) <= budget_hook.hard_limit_remaining) {
-            // Inject close-tag tokens
-            for (int32_t close_tok : budget_hook.close_token_ids) {
-                out_tokens.push_back(close_tok);
-                io.emit(close_tok);
-                if (io.is_cancelled()) break;
-            }
-            if (forced_close_out) *forced_close_out = true;
-            break;
-        }
 
         // Get last logits and sample
         std::vector<float> logits;
@@ -1785,6 +1839,20 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
             }
         }
         if (timing) tel_acc.sample_us += elapsed_us(sample_t0, Clock::now());
+
+        // Budget hook: steer the tail of the window into the close sequence, then let the model
+        // keep going. Runs before history.push_back so penalty history records what was
+        // actually emitted. The rule lives in a header-only helper so it is testable without a
+        // model; see deepseek4_budget_hook.h for why this overrides rather than appends.
+        {
+            bool hook_forced = false;
+            next_token = dflash::deepseek4::budget_hook_apply(
+                budget_hook.close_token_ids, n_gen - generated,
+                budget_hook.hard_limit_remaining, next_token,
+                budget_close_started, close_inject_pos, hook_forced);
+            if (hook_forced && forced_close_out) *forced_close_out = true;
+        }
+
         if (process_logits) {
             history.push_back(next_token);
         }

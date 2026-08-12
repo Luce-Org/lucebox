@@ -810,6 +810,16 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         return {GGML_BACKEND_SPLIT_AXIS_1, {0}, 1, {1}};
     };
 
+    auto handle_paged_attn = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        // Paged attention currently rejects layer-split targets, so the meta
+        // backend can only see a fully mirrored op. Add sharded semantics when
+        // paged layer splitting is implemented and can be exercised end to end.
+        for (int i = 0; i < 5; i++) {
+            GGML_ASSERT(src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        }
+        return src_ss[0];
+    };
+
     auto handle_ssm_conv = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         if (src_ss[0].axis == src_ss[1].axis) {
             if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0) {
@@ -1043,6 +1053,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 // Block-sparse FA is CUDA-only; treat like flash_attn_ext for
                 // multi-device split (all sources on same device as output).
                 split_state = handle_flash_attn_ext(src_ss);
+            } break;
+            case GGML_OP_PAGED_ATTN: {
+                split_state = handle_paged_attn(src_ss);
             } break;
             case GGML_OP_FLASH_ATTN_BACK: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);

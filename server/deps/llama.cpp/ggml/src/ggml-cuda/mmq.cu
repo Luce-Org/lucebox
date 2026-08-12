@@ -2,8 +2,14 @@
 #include "mmq.cuh"
 #include "quantize.cuh"
 #include "mmid.cuh"
+#include "rocmfp2_mix.cuh"
+#include "rocmfp3_mix.cuh"
 
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
+    const bool is_mix_type =
+        args.type_x == GGML_TYPE_Q2_1_ROCMFP2_MIX ||
+        args.type_x == GGML_TYPE_Q3_1_ROCMFP3_MIX;
+    GGML_ASSERT(!is_mix_type || (args.mix_codebooks && args.mix_modes));
     switch (args.type_x) {
         case GGML_TYPE_Q4_0:
             mul_mat_q_case<GGML_TYPE_Q4_0>(ctx, args, stream);
@@ -25,6 +31,12 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
             break;
         case GGML_TYPE_Q2_0_ROCMFP2:
             mul_mat_q_case<GGML_TYPE_Q2_0_ROCMFP2>(ctx, args, stream);
+            break;
+        case GGML_TYPE_Q2_1_ROCMFP2_MIX:
+            mul_mat_q_case<GGML_TYPE_Q2_1_ROCMFP2_MIX>(ctx, args, stream);
+            break;
+        case GGML_TYPE_Q3_1_ROCMFP3_MIX:
+            mul_mat_q_case<GGML_TYPE_Q3_1_ROCMFP3_MIX>(ctx, args, stream);
             break;
         case GGML_TYPE_Q3_0_ROCMFPX:
             mul_mat_q_case<GGML_TYPE_Q3_0_ROCMFPX>(ctx, args, stream);
@@ -124,6 +136,18 @@ static void ggml_cuda_mul_mat_q_impl(
     const char  * src0_d = (const char  *) src0->data;
     const float * src1_d = (const float *) src1->data;
     float       *  dst_d = (float       *)  dst->data;
+
+    const void * mix_codebooks_raw = nullptr;
+    const uint8_t * mix_modes = nullptr;
+    if (src0->type == GGML_TYPE_Q2_1_ROCMFP2_MIX) {
+        GGML_ASSERT(ggml_cuda_rocmfp2_mix_mmq_info(
+            src0->data, &mix_codebooks_raw, &mix_modes));
+    } else if (src0->type == GGML_TYPE_Q3_1_ROCMFP3_MIX) {
+        GGML_ASSERT(ggml_cuda_rocmfp3_mix_mmq_info(
+            src0->data, &mix_codebooks_raw, &mix_modes));
+    }
+    const nv_bfloat16 * mix_codebooks =
+        reinterpret_cast<const nv_bfloat16 *>(mix_codebooks_raw);
 
     // Temporary weight tensors may have an allocation tail read by tiled MMQ.
     // Clear it once for each projection before launching either multiply.
@@ -238,7 +262,8 @@ static void ggml_cuda_mul_mat_q_impl(
         const int64_t s13 = ne12*s12;
 
         const mmq_args args = {
-            src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, dst_d,
+            src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr,
+            mix_codebooks, mix_modes, dst_d,
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
@@ -248,6 +273,23 @@ static void ggml_cuda_mul_mat_q_impl(
             mmq_args pair_args = args;
             pair_args.x = (const char *) src0_pair->data;
             pair_args.dst = (float *) dst_pair->data;
+            if (src0_pair->type == GGML_TYPE_Q2_1_ROCMFP2_MIX) {
+                const void * pair_codebooks = nullptr;
+                const uint8_t * pair_modes = nullptr;
+                GGML_ASSERT(ggml_cuda_rocmfp2_mix_mmq_info(
+                    src0_pair->data, &pair_codebooks, &pair_modes));
+                pair_args.mix_codebooks =
+                    reinterpret_cast<const nv_bfloat16 *>(pair_codebooks);
+                pair_args.mix_modes = pair_modes;
+            } else if (src0_pair->type == GGML_TYPE_Q3_1_ROCMFP3_MIX) {
+                const void * pair_codebooks = nullptr;
+                const uint8_t * pair_modes = nullptr;
+                GGML_ASSERT(ggml_cuda_rocmfp3_mix_mmq_info(
+                    src0_pair->data, &pair_codebooks, &pair_modes));
+                pair_args.mix_codebooks =
+                    reinterpret_cast<const nv_bfloat16 *>(pair_codebooks);
+                pair_args.mix_modes = pair_modes;
+            }
             ggml_cuda_mul_mat_q_switch_type(ctx, pair_args, stream);
         }
         return;
@@ -322,7 +364,8 @@ static void ggml_cuda_mul_mat_q_impl(
 
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
     const mmq_args args = {
-        src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
+        src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(),
+        mix_codebooks, mix_modes, dst_d,
         ne00, ne01, ne_get_rows, s01, n_routes_quantized, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
@@ -333,6 +376,23 @@ static void ggml_cuda_mul_mat_q_impl(
         mmq_args pair_args = args;
         pair_args.x = (const char *) src0_pair->data;
         pair_args.dst = (float *) dst_pair->data;
+        if (src0_pair->type == GGML_TYPE_Q2_1_ROCMFP2_MIX) {
+            const void * pair_codebooks = nullptr;
+            const uint8_t * pair_modes = nullptr;
+            GGML_ASSERT(ggml_cuda_rocmfp2_mix_mmq_info(
+                src0_pair->data, &pair_codebooks, &pair_modes));
+            pair_args.mix_codebooks =
+                reinterpret_cast<const nv_bfloat16 *>(pair_codebooks);
+            pair_args.mix_modes = pair_modes;
+        } else if (src0_pair->type == GGML_TYPE_Q3_1_ROCMFP3_MIX) {
+            const void * pair_codebooks = nullptr;
+            const uint8_t * pair_modes = nullptr;
+            GGML_ASSERT(ggml_cuda_rocmfp3_mix_mmq_info(
+                src0_pair->data, &pair_codebooks, &pair_modes));
+            pair_args.mix_codebooks =
+                reinterpret_cast<const nv_bfloat16 *>(pair_codebooks);
+            pair_args.mix_modes = pair_modes;
+        }
         ggml_cuda_mul_mat_q_switch_type(ctx, pair_args, stream);
     }
 }
@@ -388,8 +448,19 @@ void ggml_cuda_op_mul_mat_q(
     const bool use_stream_k = ((GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA)
                             || GGML_CUDA_CC_IS_CDNA(cc))
                             && src1_ncols == ne11;
+    const void * mix_codebooks_raw = nullptr;
+    const uint8_t * mix_modes = nullptr;
+    if (src0->type == GGML_TYPE_Q2_1_ROCMFP2_MIX) {
+        GGML_ASSERT(ggml_cuda_rocmfp2_mix_mmq_info(
+            src0_dd_i, &mix_codebooks_raw, &mix_modes));
+    } else if (src0->type == GGML_TYPE_Q3_1_ROCMFP3_MIX) {
+        GGML_ASSERT(ggml_cuda_rocmfp3_mix_mmq_info(
+            src0_dd_i, &mix_codebooks_raw, &mix_modes));
+    }
     const mmq_args args = {
-        src0_dd_i, src0->type, (const int *) src1_ddq_i, nullptr, nullptr, dst_dd_i,
+        src0_dd_i, src0->type, (const int *) src1_ddq_i, nullptr, nullptr,
+        reinterpret_cast<const nv_bfloat16 *>(mix_codebooks_raw), mix_modes,
+        dst_dd_i,
         ne00, row_diff, src1_ncols, stride01, ne11, nrows_dst,
         1, 1, 0, 0, 0,
         1, 1, 0, 0, 0,
@@ -445,6 +516,24 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
             mmq_supported = GGML_CUDA_CC_IS_RDNA3_5(cc) ||
                             GGML_CUDA_CC_IS_RDNA4(cc);
             break;
+        case GGML_TYPE_Q2_1_ROCMFP2_MIX: {
+            static const bool mix_mmq_enabled = []() {
+                const char * value = getenv("DFLASH_DS4_MIX_MMQ_PREFILL");
+                return value != nullptr && !(value[0] == '0' && value[1] == '\0');
+            }();
+            mmq_supported = mix_mmq_enabled &&
+                (GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc));
+            break;
+        }
+        case GGML_TYPE_Q3_1_ROCMFP3_MIX: {
+            static const bool mix_mmq_enabled = []() {
+                const char * value = getenv("DFLASH_DS4_MIX_MMQ_PREFILL");
+                return value != nullptr && !(value[0] == '0' && value[1] == '\0');
+            }();
+            mmq_supported = mix_mmq_enabled &&
+                (GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc));
+            break;
+        }
         default:
             mmq_supported = false;
             break;

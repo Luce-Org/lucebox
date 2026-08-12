@@ -1825,13 +1825,14 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
             group4_shmem, stream);
     }
     // Long causal-prefill chunks can have thousands of physical raw rows but
-    // at most raw_window visible rows for any one token. Compacting only the
-    // score storage lets the same exact four-head kernel remain at two-block
-    // occupancy. Keep the ordinary path for shapes that already fit, avoiding
-    // a bounds-scan launch where it cannot improve grouping.
+    // at most raw_window visible rows for any one token. Indexed decode has a
+    // full physical raw ring plus a bounded set of selected compressed rows.
+    // Compacting score storage lets both shapes keep the four-head kernel at
+    // two-block occupancy. Ordinary dense shapes avoid the extra bounds scan.
     const bool compact_group4 =
         !sparse && mask && n_heads % group4 == 0 &&
-        raw_rows > raw_window && group4_shmem > 24 * 1024 &&
+        (raw_rows > raw_window || indexed_mask) &&
+        group4_shmem > 24 * 1024 &&
         compact_group4_shmem <= 24 * 1024;
     if (compact_group4) {
         ggml_cuda_pool_alloc<int> visibility_bounds_alloc(ctx.pool());

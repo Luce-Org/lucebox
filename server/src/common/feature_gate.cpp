@@ -3,6 +3,9 @@
 #include "feature_gate.h"
 
 #include "model_capabilities.h"
+#include "paged_attention_config.h"
+
+#include <climits>
 
 namespace dflash::common {
 
@@ -158,6 +161,44 @@ std::string check_feature_compatibility(
         !arch_supports_pflash_compression(arch)) {
         return "model architecture '" + arch +
                "' does not support PFlash compression";
+    }
+
+    // ── --paged-attention × architecture, placement, and decode features
+    // Paged decode swaps the contiguous K/V cache for a block table owned by
+    // the monolithic qwen35 backend, so every rule below is about reaching
+    // that one code path. All are errors rather than warnings: running dense
+    // instead would hide the memory behavior the flag was chosen for.
+    if (args.paged_attention) {
+        if (!arch_supports_paged_attention(arch, /*is_layer_split=*/false)) {
+            return "--paged-attention requires a Qwen3.5/Qwen3.6 dense target "
+                   "(architecture '" + arch + "' has no paged decode path)";
+        }
+        // No rule for "requires a CUDA or HIP build": those are the only two
+        // backends this binary can be configured with, and GGML_OP_PAGED_ATTN
+        // is compiled into both.
+        if (args.device.is_layer_split() ||
+            args.remote_target_shard.enabled()) {
+            return "--paged-attention requires one local target device";
+        }
+        if (args.draft_path != nullptr || args.remote_draft.enabled() ||
+            args.ddtree_mode) {
+            return "--paged-attention requires autoregressive decode without a "
+                   "draft or DDTree";
+        }
+        if (args.fa_window != 0) {
+            return "--paged-attention requires full attention (--fa-window 0)";
+        }
+        if (features.pflash_enabled) {
+            return "--paged-attention cannot be combined with PFlash prefill "
+                   "compression";
+        }
+        // The pool rounds max_ctx up to a whole number of blocks, so the top
+        // of the range is what can be rounded without overflowing int.
+        if (args.device.max_ctx <= 0 ||
+            args.device.max_ctx > INT_MAX - PAGED_BLOCK_SIZE + 1) {
+            return "--paged-attention requires a positive --max-ctx small "
+                   "enough to round up to whole blocks";
+        }
     }
 
     // ── --ds4-prefill × architecture

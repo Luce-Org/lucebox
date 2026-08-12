@@ -25,6 +25,7 @@
 #include "gguf.h"
 
 #include "dflash27b.h"
+#include "common/paged_attention_config.h"
 
 namespace dflash::common {
 
@@ -419,6 +420,14 @@ struct TargetCache {
     // kv_k_rotated) query per full-attention layer, written by the graph
     // when QwenGraphInputs::q_capture is set. F32 [head_dim, n_head, n_fa].
     ggml_tensor * q_cap = nullptr;
+
+    // Paged-attention metadata, resident next to the K/V pool (only when the
+    // cache was created with paged_attention). Living here instead of as
+    // gallocr-managed graph inputs lets decode steps update them append-only
+    // — one table entry per new 16-token block plus a 4-byte length per step
+    // — instead of re-uploading the whole live table before every compute.
+    ggml_tensor * paged_block_table = nullptr;   // I32 [max_blocks, 1]
+    ggml_tensor * paged_kv_seq_lens = nullptr;   // I32 [1]
 };
 
 // Snapshot the current SSM+conv state into TargetCache::*_snap tensors.
@@ -529,14 +538,18 @@ bool restore_target_cache_chain(const PrefixSnapshot * thick,
 // tensors. When smaller than max_ctx, a KvFlashPager maps logical positions to
 // pool slots and pages cold chunks to host (bounded KV residency); the
 // logical context bound stays max_ctx. Recurrent (DeltaNet) state is
-// unaffected.
+// unaffected. When `paged_attention` is true, ctx_alloc may instead be
+// max_ctx rounded up to PAGED_BLOCK_SIZE so the last partial page has physical
+// rows. Non-paged callers retain the legacy rule that ctx_alloc cannot grow
+// the allocation beyond max_ctx.
 bool create_target_cache(const TargetWeights & w,
                          int max_ctx,
                          int max_verify_tokens,
                          ggml_backend_t backend,
                          TargetCache & out,
                          bool prefill_only = false,
-                         int ctx_alloc = 0);
+                         int ctx_alloc = 0,
+                         bool paged_attention = false);
 
 // `f32_ssm_intermediates` enables exact per-token checkpoints for the opt-in
 // layer-split fast rollback path. The default preserves the established Q8_0
@@ -551,7 +564,8 @@ bool create_target_cache_partial(const TargetWeights & w,
                                  int layer_end,
                                  bool allocate_target_feat,
                                  int ctx_alloc = 0,
-                                 bool f32_ssm_intermediates = false);
+                                 bool f32_ssm_intermediates = false,
+                                 bool paged_attention = false);
 
 void free_target_cache(TargetCache & c);
 
@@ -608,8 +622,12 @@ struct QwenGraphInputs {
     int           fa_window = 0;  // sliding window for FA layers: 0 = full attention
     bool          last_token_logits_only = false; // if true, only compute logits for last token (prefill optimization)
     ggml_tensor * parent_ids = nullptr; // [n_tokens] i32; tree mode when non-null
-    // [n_tokens,n_head_kv] i64; non-null = step-invariant KV write via ggml_set_rows (carries kv_start).
+    // [n_tokens,n_head_kv] i64 physical destination rows; non-null selects the
+    // step-invariant ggml_set_rows KV write.
     ggml_tensor * kv_write_rows = nullptr;
+    // Paged decode: attention reads cache.paged_block_table /
+    // cache.paged_kv_seq_lens instead of a dense KV view.
+    bool paged_attention = false;
     // Capture the LAST token's post-RoPE/post-rotation Q per full-attention
     // layer into cache.q_cap (KVFlash target-QK scorer). Step-invariant:
     // node properties depend only on n_tokens and the layer index.

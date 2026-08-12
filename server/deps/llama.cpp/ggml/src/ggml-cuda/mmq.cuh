@@ -68,7 +68,9 @@ static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
             return MMQ_Q8_1_DS_LAYOUT_D4;
         case GGML_TYPE_Q4_0_ROCMFP4_FAST:
         case GGML_TYPE_Q2_0_ROCMFP2:
+        case GGML_TYPE_Q2_1_ROCMFP2_MIX:
         case GGML_TYPE_Q3_0_ROCMFPX:
+        case GGML_TYPE_Q3_1_ROCMFP3_MIX:
             return MMQ_Q8_1_DS_LAYOUT_D4;
         case GGML_TYPE_MXFP4:
             return MMQ_Q8_1_DS_LAYOUT_D4;
@@ -237,7 +239,9 @@ static constexpr __host__ __device__ tile_x_sizes mmq_get_dp4a_tile_x_sizes(ggml
         case GGML_TYPE_Q8_0:    return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_Q4_0_ROCMFP4_FAST: return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_Q2_0_ROCMFP2: return MMQ_DP4A_TXS_Q8_0_16;
+        case GGML_TYPE_Q2_1_ROCMFP2_MIX: return MMQ_DP4A_TXS_Q8_0_16;
         case GGML_TYPE_Q3_0_ROCMFPX: return MMQ_DP4A_TXS_Q8_0_16;
+        case GGML_TYPE_Q3_1_ROCMFP3_MIX: return MMQ_DP4A_TXS_Q8_0_16;
         case GGML_TYPE_MXFP4:   return MMQ_DP4A_TXS_Q8_1;
         case GGML_TYPE_NVFP4:   return MMQ_DP4A_TXS_Q8_0_16;
         case GGML_TYPE_Q2_K:    return MMQ_DP4A_TXS_Q2_K;
@@ -284,7 +288,9 @@ static constexpr __host__ __device__ int mmq_get_mma_tile_x_k(ggml_type type) {
         case GGML_TYPE_Q8_0:    return MMQ_MMA_TILE_X_K_Q8_0;
         case GGML_TYPE_Q4_0_ROCMFP4_FAST: return MMQ_MMA_TILE_X_K_Q8_0;
         case GGML_TYPE_Q2_0_ROCMFP2: return MMQ_MMA_TILE_X_K_Q3_K;
+        case GGML_TYPE_Q2_1_ROCMFP2_MIX: return MMQ_MMA_TILE_X_K_Q3_K;
         case GGML_TYPE_Q3_0_ROCMFPX: return MMQ_MMA_TILE_X_K_Q3_K;
+        case GGML_TYPE_Q3_1_ROCMFP3_MIX: return MMQ_MMA_TILE_X_K_Q3_K;
         // tile sizes are the same for Q8_1 and FP4 for blackwell
         case GGML_TYPE_MXFP4:   return MMQ_MMA_TILE_X_K_Q8_1;
         case GGML_TYPE_NVFP4:   return MMQ_MMA_TILE_X_K_NVFP4;
@@ -1039,6 +1045,339 @@ static __device__ __forceinline__ void load_tiles_rocmfpx_dual(
 #else
         x_df[i*(2*MMQ_TILE_NE_K*2/QI8_0) + i/(QI8_0/4) + kscale] = traits::scale(block, scale_half);
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    }
+}
+
+// Sparse prefill for qtype-106 uses the same compact 10-byte wire format as
+// qtype-107, but each expert supplies two learned four-level codebooks.  MMQ
+// needs int8 tiles, so quantize those tiny codebooks once per K tile, then fold
+// the codebook scale into the block's ordinary UE4M3 scale.  The additional
+// error is bounded to half an int8 step (measured below 0.4% of codebook range)
+// and this path is opt-in because sparse prefill is already approximate.
+struct rocmfp2_mix_mmq_lut {
+    int   packed[2];
+    float scale[2];
+};
+
+template <int mmq_y>
+static __device__ __forceinline__ rocmfp2_mix_mmq_lut * rocmfp2_mix_mmq_lut_ptr(
+        int * __restrict__ x_tile) {
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    constexpr size_t base_bytes =
+        (size_t) mmq_y * MMQ_MMA_TILE_X_K_Q3_K * sizeof(int);
+#else
+    constexpr tile_x_sizes txs =
+        mmq_get_dp4a_tile_x_sizes(GGML_TYPE_Q2_1_ROCMFP2_MIX, mmq_y);
+    constexpr size_t base_bytes =
+        (size_t) txs.qs * sizeof(int) +
+        (size_t) txs.dm * sizeof(half2) +
+        (size_t) txs.sc * sizeof(int);
+#endif
+    return reinterpret_cast<rocmfp2_mix_mmq_lut *>(
+        reinterpret_cast<char *>(x_tile) + base_bytes);
+}
+
+static __device__ __forceinline__ int rocmfp2_mix_pack4(
+        const uint8_t * qs, int base, int packed_lut) {
+    const uint32_t bits8 = qs[base >> 2];
+#if defined(GGML_USE_HIP)
+    const uint32_t selectors =
+        ((bits8 >> 0) & 3u) |
+        (((bits8 >> 2) & 3u) << 8) |
+        (((bits8 >> 4) & 3u) << 16) |
+        (((bits8 >> 6) & 3u) << 24);
+    return (int) __builtin_amdgcn_perm(0, (uint32_t) packed_lut, selectors);
+#else
+    const uint8_t * lut = reinterpret_cast<const uint8_t *>(&packed_lut);
+    const char4 values = make_char4(
+        (int8_t) lut[(bits8 >> 0) & 3u],
+        (int8_t) lut[(bits8 >> 2) & 3u],
+        (int8_t) lut[(bits8 >> 4) & 3u],
+        (int8_t) lut[(bits8 >> 6) & 3u]);
+    return *reinterpret_cast<const int *>(&values);
+#endif
+}
+
+template <int mmq_y, bool need_check>
+static __device__ __forceinline__ void load_tiles_rocmfp2_mix(
+        const char * __restrict__ x, int * __restrict__ x_tile,
+        const int kbx0, const int i_max, const int stride,
+        const nv_bfloat16 * __restrict__ codebooks,
+        const uint8_t * __restrict__ modes, const int expert) {
+    constexpr int nwarps = mmq_get_nwarps_device();
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int groups_per_block = QK_ROCMFPX / 4;
+    constexpr int blocks_per_tile = MMQ_ITER_K / QK_ROCMFPX;
+    constexpr int threads_per_row = blocks_per_tile * groups_per_block / 2;
+    static_assert(threads_per_row == 32, "ROCmFP2 mix MMQ loader expects 32 lanes per row");
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    int   * x_qs = reinterpret_cast<int *>(x_tile);
+    float * x_df = reinterpret_cast<float *>(x_qs + 2*MMQ_TILE_NE_K);
+#else
+    constexpr tile_x_sizes txs =
+        mmq_get_dp4a_tile_x_sizes(GGML_TYPE_Q2_1_ROCMFP2_MIX, mmq_y);
+    int   * x_qs = reinterpret_cast<int *>(x_tile);
+    float * x_df = reinterpret_cast<float *>(x_qs + txs.qs);
+#endif
+
+    rocmfp2_mix_mmq_lut * lut = rocmfp2_mix_mmq_lut_ptr<mmq_y>(x_tile);
+    const int linear_tid = threadIdx.y * warp_size + threadIdx.x;
+    const int mode = modes[expert];
+    if (linear_tid < 2) {
+        if (mode == 0) {
+            lut->packed[linear_tid] = (int) 0x020100ffu; // {-1, 0, 1, 2}
+            lut->scale[linear_tid] = 1.0f;
+        } else {
+            const nv_bfloat16 * book = codebooks +
+                ((int64_t) expert * 2 + linear_tid) * 4;
+            float values[4];
+            float max_abs = 0.0f;
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                values[k] = __bfloat162float(book[k]);
+                max_abs = fmaxf(max_abs, fabsf(values[k]));
+            }
+            const float scale = max_abs > 0.0f ? max_abs / 127.0f : 1.0f;
+            uint32_t packed = 0;
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const int q = max(-127, min(127, __float2int_rn(values[k] / scale)));
+                packed |= (uint32_t) (uint8_t) (int8_t) q << (8*k);
+            }
+            lut->packed[linear_tid] = (int) packed;
+            lut->scale[linear_tid] = scale;
+        }
+    }
+    __syncthreads();
+
+    constexpr int nrows = warp_size / threads_per_row;
+    const int txi = warp_size > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
+    const int kbx = txi / (groups_per_block / 2);
+    const int group = txi % (groups_per_block / 2);
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nrows*nwarps) {
+        int i = i0 + (nrows == 1 ? threadIdx.y :
+            threadIdx.y*nrows + threadIdx.x/threads_per_row);
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        const block_rocmfp2 * block =
+            reinterpret_cast<const block_rocmfp2 *>(x) + kbx0 + i*stride + kbx;
+        const int k0 = kbx*groups_per_block + group;
+        const int q0 = mode == 0
+            ? rocmfpx_pack4_fp2_vec_cuda(block->qs, 4*group)
+            : rocmfp2_mix_pack4(block->qs, 4*group,
+                                lut->packed[block->e[0] >> 7]);
+        const int q1 = mode == 0
+            ? rocmfpx_pack4_fp2_vec_cuda(block->qs, 4*(group + groups_per_block/2))
+            : rocmfp2_mix_pack4(block->qs, 4*(group + groups_per_block/2),
+                                lut->packed[block->e[1] >> 7]);
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        x_qs[i*MMQ_MMA_TILE_X_K_Q3_K + k0] = q0;
+        x_qs[i*MMQ_MMA_TILE_X_K_Q3_K + k0 + groups_per_block/2] = q1;
+#else
+        x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0] = q0;
+        x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0 + groups_per_block/2] = q1;
+#endif
+    }
+
+    constexpr int scales_per_tile = 2*blocks_per_tile;
+    constexpr int scale_rows_per_warp = warp_size / scales_per_tile;
+    const int kscale = threadIdx.x % scales_per_tile;
+    const int scale_block = kscale / 2;
+    const int scale_half = kscale % 2;
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps*scale_rows_per_warp) {
+        int i = i0 + threadIdx.y*scale_rows_per_warp +
+            threadIdx.x/scales_per_tile;
+        if (need_check) {
+            i = min(i, i_max);
+        }
+        const block_rocmfp2 * block =
+            reinterpret_cast<const block_rocmfp2 *>(x) +
+            kbx0 + i*stride + scale_block;
+        const uint8_t meta = block->e[scale_half];
+        const float block_scale = rocmfpx_ue4m3_to_fp32_finite(
+            mode == 0 ? meta : (meta & 0x7f));
+        const float scale = mode == 0 ? block_scale :
+            block_scale * lut->scale[meta >> 7];
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        x_df[i*MMQ_MMA_TILE_X_K_Q3_K + kscale] = scale;
+#else
+        x_df[i*(2*MMQ_TILE_NE_K*2/QI8_0) + i/(QI8_0/4) + kscale] = scale;
+#endif
+    }
+}
+
+// Qtype-105 is the eight-level counterpart of qtype-106. Quantizing each
+// learned codebook to signed int8 lets it use the same Q8_0 x Q8_1 MMQ dot
+// product as the fixed qtype-104 path, without materializing an F16 matrix.
+struct rocmfp3_mix_mmq_lut {
+    int   packed[4]; // two packed int32 values for each eight-level codebook
+    float scale[2];
+};
+
+template <int mmq_y>
+static __device__ __forceinline__ rocmfp3_mix_mmq_lut * rocmfp3_mix_mmq_lut_ptr(
+        int * __restrict__ x_tile) {
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    constexpr size_t base_bytes =
+        (size_t) mmq_y * MMQ_MMA_TILE_X_K_Q3_K * sizeof(int);
+#else
+    constexpr tile_x_sizes txs =
+        mmq_get_dp4a_tile_x_sizes(GGML_TYPE_Q3_1_ROCMFP3_MIX, mmq_y);
+    constexpr size_t base_bytes =
+        (size_t) txs.qs * sizeof(int) +
+        (size_t) txs.dm * sizeof(half2) +
+        (size_t) txs.sc * sizeof(int);
+#endif
+    return reinterpret_cast<rocmfp3_mix_mmq_lut *>(
+        reinterpret_cast<char *>(x_tile) + base_bytes);
+}
+
+static __device__ __forceinline__ int rocmfp3_mix_pack4(
+        const uint8_t * qs, int base, const int * packed_lut) {
+    const int8_t * lut = reinterpret_cast<const int8_t *>(packed_lut);
+    uint32_t packed = 0;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const int bit = (base + k) * 3;
+        const int byte = bit >> 3;
+        const int shift = bit & 7;
+        uint32_t bits = qs[byte];
+        if (byte + 1 < QS_ROCMFP3) {
+            bits |= (uint32_t) qs[byte + 1] << 8;
+        }
+        const uint32_t code = (bits >> shift) & 7u;
+        packed |= (uint32_t) (uint8_t) lut[code] << (8*k);
+    }
+    return (int) packed;
+}
+
+template <int mmq_y, bool need_check>
+static __device__ __forceinline__ void load_tiles_rocmfp3_mix(
+        const char * __restrict__ x, int * __restrict__ x_tile,
+        const int kbx0, const int i_max, const int stride,
+        const nv_bfloat16 * __restrict__ codebooks,
+        const uint8_t * __restrict__ modes, const int expert) {
+    constexpr int nwarps = mmq_get_nwarps_device();
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int groups_per_block = QK_ROCMFPX / 4;
+    constexpr int blocks_per_tile = MMQ_ITER_K / QK_ROCMFPX;
+    constexpr int threads_per_row = blocks_per_tile * groups_per_block / 2;
+    static_assert(threads_per_row == 32, "ROCmFP3 mix MMQ loader expects 32 lanes per row");
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    int   * x_qs = reinterpret_cast<int *>(x_tile);
+    float * x_df = reinterpret_cast<float *>(x_qs + 2*MMQ_TILE_NE_K);
+#else
+    constexpr tile_x_sizes txs =
+        mmq_get_dp4a_tile_x_sizes(GGML_TYPE_Q3_1_ROCMFP3_MIX, mmq_y);
+    int   * x_qs = reinterpret_cast<int *>(x_tile);
+    float * x_df = reinterpret_cast<float *>(x_qs + txs.qs);
+#endif
+
+    rocmfp3_mix_mmq_lut * lut = rocmfp3_mix_mmq_lut_ptr<mmq_y>(x_tile);
+    const int linear_tid = threadIdx.y * warp_size + threadIdx.x;
+    const int mode = modes[expert];
+    if (linear_tid < 2) {
+        if (mode == 0) {
+            lut->packed[2*linear_tid + 0] = (int) 0x04020100u;
+            lut->packed[2*linear_tid + 1] = (int) 0xfcfeff00u;
+            lut->scale[linear_tid] = 1.0f;
+        } else {
+            const nv_bfloat16 * book = codebooks +
+                ((int64_t) expert * 2 + linear_tid) * 8;
+            float values[8];
+            float max_abs = 0.0f;
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                values[k] = __bfloat162float(book[k]);
+                max_abs = fmaxf(max_abs, fabsf(values[k]));
+            }
+            const float scale = max_abs > 0.0f ? max_abs / 127.0f : 1.0f;
+#pragma unroll
+            for (int word = 0; word < 2; ++word) {
+                uint32_t packed = 0;
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    const int idx = 4*word + k;
+                    const int q = max(-127, min(127,
+                        __float2int_rn(values[idx] / scale)));
+                    packed |= (uint32_t) (uint8_t) (int8_t) q << (8*k);
+                }
+                lut->packed[2*linear_tid + word] = (int) packed;
+            }
+            lut->scale[linear_tid] = scale;
+        }
+    }
+    __syncthreads();
+
+    constexpr int nrows = warp_size / threads_per_row;
+    const int txi = warp_size > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
+    const int kbx = txi / (groups_per_block / 2);
+    const int group = txi % (groups_per_block / 2);
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nrows*nwarps) {
+        int i = i0 + (nrows == 1 ? threadIdx.y :
+            threadIdx.y*nrows + threadIdx.x/threads_per_row);
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        const block_rocmfp3 * block =
+            reinterpret_cast<const block_rocmfp3 *>(x) + kbx0 + i*stride + kbx;
+        const int k0 = kbx*groups_per_block + group;
+        const int q0 = mode == 0
+            ? rocmfpx_pack4_fp3_vec_cuda(block->qs, 4*group)
+            : rocmfp3_mix_pack4(block->qs, 4*group,
+                                lut->packed + 2*(block->e[0] >> 7));
+        const int q1 = mode == 0
+            ? rocmfpx_pack4_fp3_vec_cuda(block->qs, 4*(group + groups_per_block/2))
+            : rocmfp3_mix_pack4(block->qs, 4*(group + groups_per_block/2),
+                                lut->packed + 2*(block->e[1] >> 7));
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        x_qs[i*MMQ_MMA_TILE_X_K_Q3_K + k0] = q0;
+        x_qs[i*MMQ_MMA_TILE_X_K_Q3_K + k0 + groups_per_block/2] = q1;
+#else
+        x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0] = q0;
+        x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0 + groups_per_block/2] = q1;
+#endif
+    }
+
+    constexpr int scales_per_tile = 2*blocks_per_tile;
+    constexpr int scale_rows_per_warp = warp_size / scales_per_tile;
+    const int kscale = threadIdx.x % scales_per_tile;
+    const int scale_block = kscale / 2;
+    const int scale_half = kscale % 2;
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps*scale_rows_per_warp) {
+        int i = i0 + threadIdx.y*scale_rows_per_warp +
+            threadIdx.x/scales_per_tile;
+        if (need_check) {
+            i = min(i, i_max);
+        }
+        const block_rocmfp3 * block =
+            reinterpret_cast<const block_rocmfp3 *>(x) +
+            kbx0 + i*stride + scale_block;
+        const uint8_t meta = block->e[scale_half];
+        const float block_scale = rocmfpx_ue4m3_to_fp32_finite(
+            mode == 0 ? meta : (meta & 0x7f));
+        const float scale = mode == 0 ? block_scale :
+            block_scale * lut->scale[meta >> 7];
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        x_df[i*MMQ_MMA_TILE_X_K_Q3_K + kscale] = scale;
+#else
+        x_df[i*(2*MMQ_TILE_NE_K*2/QI8_0) + i/(QI8_0/4) + kscale] = scale;
+#endif
     }
 }
 
@@ -3606,6 +3945,26 @@ struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_Q2_0_ROCMFP2> {
 };
 
 template <int mmq_x, int mmq_y, bool need_check>
+struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_Q2_1_ROCMFP2_MIX> {
+    static constexpr int              vdr          = VDR_ROCMFP2_Q8_1_MMQ;
+    // The learned-codebook loader is called explicitly from
+    // mul_mat_q_process_tile because it needs registry side data.
+    static constexpr load_tiles_mmq_t load_tiles   = nullptr;
+    static constexpr vec_dot_mmq_t    vec_dot_mma  = vec_dot_q8_0_16_q8_1_mma<mmq_x, mmq_y>;
+    static constexpr vec_dot_mmq_t    vec_dot_dp4a = vec_dot_q8_0_16_q8_1_dp4a<mmq_x, mmq_y>;
+};
+
+template <int mmq_x, int mmq_y, bool need_check>
+struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_Q3_1_ROCMFP3_MIX> {
+    static constexpr int              vdr          = VDR_ROCMFP3_Q8_1_MMQ;
+    // The learned-codebook loader is called explicitly from
+    // mul_mat_q_process_tile because it needs registry side data.
+    static constexpr load_tiles_mmq_t load_tiles   = nullptr;
+    static constexpr vec_dot_mmq_t    vec_dot_mma  = vec_dot_q8_0_16_q8_1_mma<mmq_x, mmq_y>;
+    static constexpr vec_dot_mmq_t    vec_dot_dp4a = vec_dot_q8_0_16_q8_1_dp4a<mmq_x, mmq_y>;
+};
+
+template <int mmq_x, int mmq_y, bool need_check>
 struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_Q3_0_ROCMFPX> {
     static constexpr int              vdr          = VDR_ROCMFP3_Q8_1_MMQ;
     static constexpr load_tiles_mmq_t load_tiles   = load_tiles_rocmfpx_dual<GGML_TYPE_Q3_0_ROCMFPX, mmq_y, need_check>;
@@ -3743,7 +4102,9 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         const char * __restrict__ x, const int offset_x, const int * __restrict__ y,
         const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
         const int stride_row_x, const int ncols_y, const int stride_col_dst,
-        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop) {
+        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop,
+        const nv_bfloat16 * __restrict__ mix_codebooks,
+        const uint8_t * __restrict__ mix_modes, const int mix_expert) {
 
     constexpr int              warp_size  = ggml_cuda_get_physical_warp_size();
     constexpr int              nwarps     = mmq_get_nwarps_device();
@@ -3782,7 +4143,17 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     constexpr bool ytile_use_int2 = (mmq_x * MMQ_TILE_Y_K % (2 * nwarps * warp_size)) == 0;
 
     for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
-        load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
+        if constexpr (type == GGML_TYPE_Q2_1_ROCMFP2_MIX) {
+            load_tiles_rocmfp2_mix<mmq_y, need_check>(
+                x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x,
+                mix_codebooks, mix_modes, mix_expert);
+        } else if constexpr (type == GGML_TYPE_Q3_1_ROCMFP3_MIX) {
+            load_tiles_rocmfp3_mix<mmq_y, need_check>(
+                x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x,
+                mix_codebooks, mix_modes, mix_expert);
+        } else {
+            load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
+        }
         {
             const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
             if constexpr (ytile_use_int2) {
@@ -3858,7 +4229,10 @@ template <ggml_type type, int mmq_x, bool need_check>
 #endif // defined(GGML_USE_HIP)
 static __global__ void mul_mat_q(
         const char * __restrict__ x, const int * __restrict__ y, const int32_t * __restrict__ ids_dst,
-        const int32_t * __restrict__ expert_bounds, float * __restrict__ dst, float * __restrict__ tmp_fixup,
+        const int32_t * __restrict__ expert_bounds,
+        const nv_bfloat16 * __restrict__ mix_codebooks,
+        const uint8_t * __restrict__ mix_modes,
+        float * __restrict__ dst, float * __restrict__ tmp_fixup,
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
@@ -3947,7 +4321,8 @@ static __global__ void mul_mat_q(
         constexpr bool fixup = false;
         mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
+             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z,
+             mix_codebooks, mix_modes, fastdiv(zt, channel_ratio));
         return;
     }
 #endif // (defined(GGML_USE_HIP) && !defined(CDNA4) && !defined(CDNA3)) || __CUDA_ARCH__ < GGML_CUDA_CC_VOLTA
@@ -4027,7 +4402,8 @@ static __global__ void mul_mat_q(
         constexpr bool fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
         mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
+             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop,
+             mix_codebooks, mix_modes, fastdiv(zt, channel_ratio));
 
         kbc += blocks_per_ne00.z;
         kbc -= fastmodulo(kbc, blocks_per_ne00);
@@ -4096,7 +4472,8 @@ static __global__ void mul_mat_q(
     constexpr bool fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
     mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
         (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
-         tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
+         tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop,
+         mix_codebooks, mix_modes, fastdiv(zt, channel_ratio));
 }
 
 template <ggml_type type, int mmq_x, bool need_check>
@@ -4239,7 +4616,8 @@ static __global__ void mul_mat_q_stream_k_fixup(
 }
 
 struct mmq_args {
-    const char * x; ggml_type type_x; const int * y; const int32_t * ids_dst; const int32_t * expert_bounds; float * dst;
+    const char * x; ggml_type type_x; const int * y; const int32_t * ids_dst; const int32_t * expert_bounds;
+    const nv_bfloat16 * mix_codebooks; const uint8_t * mix_modes; float * dst;
     int64_t ncols_x; int64_t nrows_x; int64_t ncols_dst; int64_t stride_row_x; int64_t ncols_y; int64_t nrows_dst;
     int64_t nchannels_x; int64_t nchannels_y; int64_t stride_channel_x; int64_t stride_channel_y; int64_t stride_channel_dst;
     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
@@ -4251,7 +4629,13 @@ static size_t mmq_get_nbytes_shared(const int mmq_x, const int mmq_y, const int 
     const tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(type, mmq_y);
     const int mmq_tile_x_k = mmq_get_mma_tile_x_k(type);
     const size_t nbs_ids = mmq_x*sizeof(int);
-    const size_t nbs_x = (turing_mma_available(cc) || amd_mfma_available(cc) || amd_wmma_available(cc)) ? mmq_y*mmq_tile_x_k*sizeof(int) : txs.qs*sizeof(int) + txs.dm*sizeof(half2) + txs.sc*sizeof(int);
+    const size_t nbs_mix = type == GGML_TYPE_Q2_1_ROCMFP2_MIX
+        ? sizeof(rocmfp2_mix_mmq_lut)
+        : type == GGML_TYPE_Q3_1_ROCMFP3_MIX
+            ? sizeof(rocmfp3_mix_mmq_lut) : 0;
+    const size_t nbs_x = ((turing_mma_available(cc) || amd_mfma_available(cc) || amd_wmma_available(cc))
+        ? mmq_y*mmq_tile_x_k*sizeof(int)
+        : txs.qs*sizeof(int) + txs.dm*sizeof(half2) + txs.sc*sizeof(int)) + nbs_mix;
     const size_t nbs_y = mmq_x * (sizeof(block_q8_1_mmq));
     return nbs_ids + nbs_x + GGML_PAD(nbs_y, nwarps*warp_size*sizeof(int));
 }
@@ -4293,7 +4677,8 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
         if (args.nrows_x % mmq_y == 0) {
             constexpr bool need_check = false;
             mul_mat_q<type, mmq_x, need_check><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
-                (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr,
+                (args.x, args.y, args.ids_dst, args.expert_bounds,
+                 args.mix_codebooks, args.mix_modes, args.dst, nullptr,
                  blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
                  channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
                  sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
@@ -4301,7 +4686,8 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
         } else {
             constexpr bool need_check = true;
             mul_mat_q<type, mmq_x, need_check><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
-                (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr,
+                (args.x, args.y, args.ids_dst, args.expert_bounds,
+                 args.mix_codebooks, args.mix_modes, args.dst, nullptr,
                  blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
                  channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
                  sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
@@ -4333,7 +4719,8 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     if (args.nrows_x % mmq_y == 0) {
         constexpr bool need_check = false;
         mul_mat_q<type, mmq_x, need_check><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
-            (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr,
+            (args.x, args.y, args.ids_dst, args.expert_bounds,
+             args.mix_codebooks, args.mix_modes, args.dst, tmp_fixup.ptr,
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
@@ -4351,7 +4738,8 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     } else {
         constexpr bool need_check = true;
         mul_mat_q<type, mmq_x, need_check><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
-            (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr,
+            (args.x, args.y, args.ids_dst, args.expert_bounds,
+             args.mix_codebooks, args.mix_modes, args.dst, tmp_fixup.ptr,
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
@@ -4464,7 +4852,9 @@ extern DECL_MMQ_CASE(GGML_TYPE_Q5_1);
 extern DECL_MMQ_CASE(GGML_TYPE_Q8_0);
 extern DECL_MMQ_CASE(GGML_TYPE_Q4_0_ROCMFP4_FAST);
 extern DECL_MMQ_CASE(GGML_TYPE_Q2_0_ROCMFP2);
+extern DECL_MMQ_CASE(GGML_TYPE_Q2_1_ROCMFP2_MIX);
 extern DECL_MMQ_CASE(GGML_TYPE_Q3_0_ROCMFPX);
+extern DECL_MMQ_CASE(GGML_TYPE_Q3_1_ROCMFP3_MIX);
 extern DECL_MMQ_CASE(GGML_TYPE_MXFP4);
 extern DECL_MMQ_CASE(GGML_TYPE_NVFP4);
 extern DECL_MMQ_CASE(GGML_TYPE_Q2_K);

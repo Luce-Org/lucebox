@@ -94,7 +94,8 @@ bool build_target_step(
     int kq_stride_pad = KQ_MASK_PAD,
     bool capture_moe_router = false,
     bool kvflash_mask = false,
-    bool capture_qk = false);
+    bool capture_qk = false,
+    bool paged_attention = false);
 
 // Full target forward: DDTree tree-verify mode.
 bool build_target_step_tree(

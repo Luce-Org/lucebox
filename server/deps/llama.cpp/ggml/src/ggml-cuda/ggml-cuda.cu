@@ -24,6 +24,7 @@
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/fattn.cuh"
 #include "ggml-cuda/fattn-sparse.cuh"
+#include "ggml-cuda/paged-attn.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/turbo-wht.cuh"
 #include "ggml-cuda/im2col.cuh"
@@ -31,6 +32,8 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/rocmfp3_mix.cuh"
+#include "ggml-cuda/rocmfp2_mix.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
@@ -2613,6 +2616,50 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 // output tensors. Vector kernels write the GLU directly. Large routed-expert
 // MMQ keeps both ordinary matmul writes (and therefore numerical behavior),
 // but shares the identical ids sort and F32->Q8 activation quantization.
+// Whether the DeepSeek4 mix-qtype (105/106) fused gate/up+SwiGLU path may run for this
+// triple. Deliberately NOT static: the dispatcher below is, and a graph-level test cannot
+// tell "correctly refused to fuse" from "fused and happened to be right", so the negative
+// cases are only testable if the predicate itself is reachable. One definition, two callers.
+//
+// direct_layout is passed in rather than recomputed so this cannot drift from the value the
+// sibling vector-fusion paths are gated on.
+bool ggml_cuda_ds4_mix_glu_fusable(
+        const ggml_tensor * gate,
+        const ggml_tensor * up,
+        const ggml_tensor * glu,
+        bool direct_layout) {
+    if (!direct_layout || !gate || !up || !glu) {
+        return false;
+    }
+    const ggml_tensor * src0 = up->src[0];
+    const ggml_tensor * src1 = up->src[1];
+    const ggml_tensor * ids  = up->src[2];
+    if (!src0 || !src1 || !ids || !gate->src[0]) {
+        return false;
+    }
+    // Both halves must be the SAME mul_mat_id shape over the same activations and the same
+    // routing ids. Matching weight types alone would let two unrelated mul_mat_ids fuse,
+    // reading one expert's rows under the other's routing.
+    if (up->op != GGML_OP_MUL_MAT_ID || gate->op != GGML_OP_MUL_MAT_ID) {
+        return false;
+    }
+    if (gate->src[1] != src1 || gate->src[2] != ids) {
+        return false;
+    }
+    if (gate->src[0]->type != src0->type) {
+        return false;
+    }
+    if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU_DS4) {
+        return false;
+    }
+    if (src1->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32 ||
+        ids->type != GGML_TYPE_I32) {
+        return false;
+    }
+    return src0->type == GGML_TYPE_Q2_1_ROCMFP2_MIX ||
+           src0->type == GGML_TYPE_Q3_1_ROCMFP3_MIX;
+}
+
 static bool ggml_cuda_try_fuse_mul_mat_glu(
         ggml_backend_cuda_context & ctx,
         ggml_tensor * gate,
@@ -2638,6 +2685,59 @@ static bool ggml_cuda_try_fuse_mul_mat_glu(
         ggml_are_same_stride(gate, glu->src[0]) &&
         ggml_are_same_shape(up, glu->src[1]) &&
         ggml_are_same_stride(up, glu->src[1]);
+
+    // ---- DeepSeek4 mix qtypes (105/106) --------------------------------------------------
+    // These cannot go through mul_mat_vec_q at all: get_mmvq_mmid_max_batch returns 0 for them
+    // because their learned per-expert codebooks live in a side registry that the mmvq kernels
+    // know nothing about. So they were the only expert types paying the UNFUSED shape -- two
+    // mul_mat_id launches plus a separate swiglu_ds4 pass -- which the profile measured as
+    // 30100 launches against qtype 107's 15050, and ~102% of the observed 4.6% decode gap.
+    //
+    // Placed after direct_vector_layout and gated on it: this path writes straight into
+    // glu->data and derives its strides from glu->nb, which is exactly the aliasing the
+    // other direct vector fusions guard against. The guard postdates this kernel upstream,
+    // and carrying the kernel forward without it would silently fuse a reshaped graph with
+    // the wrong token/expert mapping.
+    //
+    // gate is validated as an operand, not just by weight type: a matching src0 type says
+    // nothing about whether gate consumes the same activations and routing ids as up, and
+    // fusing across two different mul_mat_ids would read one expert's rows with the other's
+    // routing. Each launcher additionally returns false unless BOTH halves are registered,
+    // so a partial registration keeps the correct unfused path.
+    if (src1->ne[2] <= GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS &&
+            ggml_cuda_ds4_mix_glu_fusable(gate, up, glu, direct_vector_layout)) {
+        const float limit = ggml_get_op_params_f32(glu, 2);
+        // dst is the GLU tensor: the fused kernel writes the SwiGLU result straight there and
+        // the two intermediates are never materialised.
+        const int64_t ids_s0  = (int64_t) (ids->nb[0] / sizeof(int32_t));
+        const int64_t ids_s1  = (int64_t) (ids->nb[1] / sizeof(int32_t));
+        const int64_t src1_s1 = (int64_t) (src1->nb[1] / sizeof(float));
+        const int64_t src1_s2 = (int64_t) (src1->nb[2] / sizeof(float));
+        const int64_t dst_s1  = (int64_t) (glu->nb[1] / sizeof(float));
+        const int64_t dst_s2  = (int64_t) (glu->nb[2] / sizeof(float));
+        const int in  = (int) src0->ne[0];
+        const int out = (int) src0->ne[1];
+        const int n_expert_used = (int) ids->ne[0];
+        const int n_tokens = (int) src1->ne[2];
+        const int ne11     = (int) src1->ne[1];
+
+        if (src0->type == GGML_TYPE_Q2_1_ROCMFP2_MIX
+                && ggml_cuda_rocmfp2_mix_mul_mat_id_glu(
+                    src0->data, gate->src[0]->data,
+                    (const float *) src1->data, (const int32_t *) ids->data,
+                    (float *) glu->data, in, out, n_expert_used, n_tokens, ne11,
+                    ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2, limit, ctx.stream())) {
+            return true;
+        }
+        if (src0->type == GGML_TYPE_Q3_1_ROCMFP3_MIX
+                && ggml_cuda_rocmfp3_mix_mul_mat_id_glu(
+                    src0->data, gate->src[0]->data,
+                    (const float *) src1->data, (const int32_t *) ids->data,
+                    (float *) glu->data, in, out, n_expert_used, n_tokens, ne11,
+                    ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2, limit, ctx.stream())) {
+            return true;
+        }
+    }
 
     if (direct_vector_layout && ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
         ggml_cuda_mm_fusion_args_host fusion_data{};
@@ -2711,7 +2811,15 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int luce_mmvq_max_ncols = ggml_cuda_mmvq_max_ncols_override > 0
         ? ggml_cuda_mmvq_max_ncols_override
         : luce_mmvq_max_ncols_env;
-    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear
+    // The mix qtypes have no generic MMVQ path because their per-expert
+    // codebooks live in an out-of-band registry. Decode uses the dedicated
+    // fused kernels below. Sparse prefill can opt into their registry-aware
+    // MMQ loaders; otherwise should_use_mmq rejects them and they retain the
+    // exact dequantize->cuBLAS fallback.
+    const bool is_rocmfp3_mix = src0->type == GGML_TYPE_Q3_1_ROCMFP3_MIX;
+    const bool is_rocmfp2_mix = src0->type == GGML_TYPE_Q2_1_ROCMFP2_MIX;
+    const bool is_mix_qtype    = is_rocmfp3_mix || is_rocmfp2_mix;
+    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !is_mix_qtype && !bad_padding_clear
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
         && src1->ne[1] <= luce_mmvq_max_ncols;
     bool use_mul_mat_q     = ggml_is_quantized(src0->type) && !bad_padding_clear
@@ -2757,6 +2865,84 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     bool use_batched_cublas_f16  = src0->type == GGML_TYPE_F16 && (src1->type == GGML_TYPE_F16 || !any_gpus_with_slow_fp16);
     bool use_batched_cublas_bf16 = src0->type == GGML_TYPE_BF16 && bf16_mma_hardware_available(cc);
     bool use_batched_cublas_f32  = src0->type == GGML_TYPE_F32;
+
+    // qtype-105 fused MMVQ decode path: for batch-1 (decode) matvecs, decode the
+    // quantized blocks inline instead of the dequantize->cuBLAS round-trip. This
+    // catches the mul_mat_id per-expert slices (which re-enter here with a 105
+    // src0 slice + f32 sorted tokens). Larger batches (prefill) fall through to
+    // the dequant fallback. Returns false (=> fall through) if unregistered.
+    // DFLASH_MIX_FUSED=0 forces the dequant->cuBLAS fallback (A/B against the
+    // fused path on the same binary). Default on.
+    static const bool mix_fused_on = []() {
+        const char * e = getenv("DFLASH_MIX_FUSED");
+        return e ? atoi(e) != 0 : true;
+    }();
+    if (mix_fused_on && is_rocmfp3_mix && !split
+            && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+            && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)
+            && src1->ne[2] == 1 && src1->ne[3] == 1
+            && src1->ne[1] <= luce_mmvq_max_ncols) {
+        if (ggml_cuda_rocmfp3_mix_mul_mat_vec(
+                src0->data, (const float *) src1->data, (float *) dst->data,
+                (int) src0->ne[0], (int) src0->ne[1], (int) src1->ne[1],
+                (int64_t) (src1->nb[1] / sizeof(float)),
+                (int64_t) (dst->nb[1] / sizeof(float)), ctx.stream())) {
+            return;
+        }
+    }
+
+    if (mix_fused_on && is_rocmfp2_mix && !split
+            && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+            && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)
+            && src1->ne[2] == 1 && src1->ne[3] == 1
+            && src1->ne[1] <= luce_mmvq_max_ncols) {
+        if (ggml_cuda_rocmfp2_mix_mul_mat_vec(
+                src0->data, (const float *) src1->data, (float *) dst->data,
+                (int) src0->ne[0], (int) src0->ne[1], (int) src1->ne[1],
+                (int64_t) (src1->nb[1] / sizeof(float)),
+                (int64_t) (dst->nb[1] / sizeof(float)), ctx.stream())) {
+            return;
+        }
+    }
+
+    // 3-D batched slice: the target's attn_output_a is reshaped to
+    // [group_dim, n_lora_o, n_out_group] and mul_mat'd against a matching 3-D src1
+    // (deepseek4_graph.cpp:2122), so src1->ne[2] > 1 and the two 2-D hooks above
+    // reject it on `src1->ne[2] == 1`. Falling through is not neutral: for a mix
+    // qtype the generic chain ends at dequant->cuBLAS, which reads the blocks, writes
+    // a full f16 copy, then reads that back -- MORE bytes than the f16 weight it
+    // replaced. This is ~31% of the attention weight read, so it has to be handled
+    // rather than merely allowed.
+    //
+    // ne[1] is the token count here (not a column batch), so no ncols cap applies:
+    // the kernel gives each (row, token, slice) its own warp exactly as the MoE path
+    // does. src0->ne[2] must equal src1->ne[2]; anything else is not this pattern.
+    if (mix_fused_on && is_mix_qtype && !split
+            && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+            && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)
+            && src1->ne[3] == 1 && src0->ne[3] == 1
+            && src1->ne[2] > 1 && src0->ne[2] == src1->ne[2]) {
+        const int    nslices = (int) src0->ne[2];
+        const int    ntokens = (int) src1->ne[1];
+        // ne[1] is the token dim and ne[2] the slice dim, so nb[1]/nb[2] are the TOKEN
+        // and SLICE strides. The callee names its parameters accordingly; do not reorder.
+        const int64_t s1_tok = (int64_t) (src1->nb[1] / sizeof(float));
+        const int64_t s1_sl  = (int64_t) (src1->nb[2] / sizeof(float));
+        const int64_t d_tok  = (int64_t) (dst->nb[1]  / sizeof(float));
+        const int64_t d_sl   = (int64_t) (dst->nb[2]  / sizeof(float));
+        const bool handled = is_rocmfp3_mix
+            ? ggml_cuda_rocmfp3_mix_mul_mat_vec_3d(
+                  src0->data, (const float *) src1->data, (float *) dst->data,
+                  (int) src0->ne[0], (int) src0->ne[1], nslices, ntokens,
+                  s1_tok, s1_sl, d_tok, d_sl, ctx.stream())
+            : ggml_cuda_rocmfp2_mix_mul_mat_vec_3d(
+                  src0->data, (const float *) src1->data, (float *) dst->data,
+                  (int) src0->ne[0], (int) src0->ne[1], nslices, ntokens,
+                  s1_tok, s1_sl, d_tok, d_sl, ctx.stream());
+        if (handled) {
+            return;
+        }
+    }
 
     if (grouped_src) {
         // Only MMQ's grouped activation quantizer understands the physical
@@ -2817,6 +3003,42 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                 mmvq_mmid_max, path);
         }
     };
+
+    // qtype-105/106 fused routed-expert decode: run the whole
+    // mul_mat_id on device with the routing ids read in-kernel, avoiding the
+    // generic sort-based fallback below (which needs a host cudaStreamSynchronize
+    // + id-sort that serialises decode and disables CUDA-graph capture of the
+    // FFN subgraph). The kernel's grid.z is the token dimension, so it handles
+    // both ordinary decode and the small speculative verification batch without
+    // sorting or expanding the weights. Larger batches remain on the prefill path.
+    // Kept in sync with the [TAG_MUL_MAT_ID_CUDA_GRAPHS] usability check below.
+    if (src0->type == GGML_TYPE_Q3_1_ROCMFP3_MIX
+            && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+            && ne12 <= GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS
+            && ggml_cuda_rocmfp3_mix_mul_mat_id(
+                src0->data, (const float *) src1->data, (const int32_t *) ids->data,
+                (float *) dst->data, (int) ne00, (int) ne01, (int) ids->ne[0],
+                (int) ne12, (int) ne11,
+                (int64_t) (ids->nb[0] / sizeof(int32_t)), (int64_t) (ids->nb[1] / sizeof(int32_t)),
+                (int64_t) (nb11 / sizeof(float)), (int64_t) (nb12 / sizeof(float)),
+                (int64_t) (nb1 / sizeof(float)), (int64_t) (nb2 / sizeof(float)),
+                ctx.stream())) {
+        return;
+    }
+
+    if (src0->type == GGML_TYPE_Q2_1_ROCMFP2_MIX
+            && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+            && ne12 <= GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS
+            && ggml_cuda_rocmfp2_mix_mul_mat_id(
+                src0->data, (const float *) src1->data, (const int32_t *) ids->data,
+                (float *) dst->data, (int) ne00, (int) ne01, (int) ids->ne[0],
+                (int) ne12, (int) ne11,
+                (int64_t) (ids->nb[0] / sizeof(int32_t)), (int64_t) (ids->nb[1] / sizeof(int32_t)),
+                (int64_t) (nb11 / sizeof(float)), (int64_t) (nb12 / sizeof(float)),
+                (int64_t) (nb1 / sizeof(float)), (int64_t) (nb2 / sizeof(float)),
+                ctx.stream())) {
+        return;
+    }
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
@@ -3287,6 +3509,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_FLASH_ATTN_SPARSE:
             ggml_cuda_flash_attn_sparse(ctx, dst);
             break;
+        case GGML_OP_PAGED_ATTN:
+            ggml_cuda_paged_attn(ctx, dst);
+            break;
         case GGML_OP_CROSS_ENTROPY_LOSS:
             ggml_cuda_cross_entropy_loss(ctx, dst);
             break;
@@ -3601,16 +3826,33 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             const bool mmid_mmq_ok = ggml_is_quantized(node->src[0]->type) &&
                 ggml_cuda_should_use_mmq(node->src[0]->type, cc,
                                          node->src[1]->ne[2], node->src[0]->ne[2]);
+            // qtype-105 takes the stream-sync-free MoE path above (no host
+            // synchronize), so it is safe to capture. Mirror that path's gate
+            // exactly, incl. the registry check, so we never skip-disable while
+            // the runtime actually falls back to the sync path.
+            // Each mix qtype has its OWN registry; querying the 105 one for a 106
+            // node always answers false, which would mark every qtype-106 node
+            // graph-ineligible and silently disable capture for the whole FFN
+            // subgraph -- forfeiting the win b21583c bought. Dispatch on the type,
+            // matching the runtime gate exactly, as the comment above requires.
+            const bool is_mmid_105 = node->src[0]->type == GGML_TYPE_Q3_1_ROCMFP3_MIX;
+            const bool is_mmid_106 = node->src[0]->type == GGML_TYPE_Q2_1_ROCMFP2_MIX;
+            const bool mmid_rocmfp3_ok =
+                (is_mmid_105 || is_mmid_106) &&
+                node->src[1]->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 &&
+                node->src[1]->ne[2] <= GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS &&
+                (is_mmid_105 ? ggml_cuda_rocmfp3_mix_registered(node->src[0]->data)
+                             : ggml_cuda_rocmfp2_mix_registered(node->src[0]->data));
             if (mmid_telemetry) {
                 std::fprintf(stderr,
                     "[dflash-mmid] event=graph name=%s type=%s ne11=%lld width=%lld "
-                    "mmvq_max=%d mmvq_ok=%d mmq_ok=%d node_eligible=%d\n",
+                    "mmvq_max=%d mmvq_ok=%d mmq_ok=%d rocmfp3_ok=%d node_eligible=%d\n",
                     node->name, ggml_type_name(node->src[0]->type),
                     (long long) node->src[1]->ne[1], (long long) node->ne[2],
-                    mmvq_mmid_max, mmid_mmvq_ok, mmid_mmq_ok,
-                    mmid_mmvq_ok || mmid_mmq_ok);
+                    mmvq_mmid_max, mmid_mmvq_ok, mmid_mmq_ok, mmid_rocmfp3_ok,
+                    mmid_mmvq_ok || mmid_mmq_ok || mmid_rocmfp3_ok);
             }
-            if (!mmid_mmvq_ok && !mmid_mmq_ok) {
+            if (!mmid_mmvq_ok && !mmid_mmq_ok && !mmid_rocmfp3_ok) {
                 // under these conditions, the mul_mat_id operation will need to synchronize the stream, so we cannot use CUDA graphs
                 // TODO: figure out a way to enable for larger batch sizes, without hurting performance
                 // ref: https://github.com/ggml-org/llama.cpp/pull/18958
@@ -5977,6 +6219,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
         case GGML_OP_FLASH_ATTN_SPARSE:
             return true;  // Always supported on CUDA
+        case GGML_OP_PAGED_ATTN:
+            return ggml_cuda_paged_attn_supported(op);
         case GGML_OP_CROSS_ENTROPY_LOSS:
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
         case GGML_OP_OPT_STEP_ADAMW:

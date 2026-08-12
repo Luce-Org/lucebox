@@ -78,10 +78,13 @@ bool create_target_cache(const TargetWeights & w,
                          ggml_backend_t backend,
                          TargetCache & out,
                          bool prefill_only,
-                         int ctx_alloc) {
+                         int ctx_alloc,
+                         bool paged_attention) {
     return create_target_cache_partial(w, max_ctx, max_verify_tokens, backend,
                                        out, prefill_only,
-                                       0, w.n_layer, true, ctx_alloc);
+                                       0, w.n_layer, true, ctx_alloc,
+                                       /*f32_ssm_intermediates=*/false,
+                                       paged_attention);
 }
 
 bool create_target_cache_partial(const TargetWeights & w,
@@ -94,7 +97,8 @@ bool create_target_cache_partial(const TargetWeights & w,
                                  int layer_end,
                                  bool allocate_target_feat,
                                  int ctx_alloc,
-                                 bool f32_ssm_intermediates) {
+                                 bool f32_ssm_intermediates,
+                                 bool paged_attention) {
     if (layer_begin < 0) layer_begin = 0;
     if (layer_end < 0 || layer_end > w.n_layer) layer_end = w.n_layer;
     if (layer_begin > layer_end) {
@@ -141,7 +145,16 @@ bool create_target_cache_partial(const TargetWeights & w,
     // physical pool capacity; logical positions are mapped to pool slots
     // by KvFlashPager. The 256-stride rounding applies to whichever capacity
     // is in effect.
-    const int ctx_phys = (ctx_alloc > 0 && ctx_alloc < max_ctx) ? ctx_alloc : max_ctx;
+    // KVFlash may shrink the physical pool. Only an explicitly paged caller
+    // may grow it to the next whole block, and it must size the pool to
+    // exactly that: silent drift here would break block alignment.
+    const bool bounded_pool = ctx_alloc > 0 && ctx_alloc < max_ctx;
+    const bool paged_padding = paged_attention && ctx_alloc > 0;
+    if (paged_attention) {
+        GGML_ASSERT(ctx_alloc == paged_token_capacity(max_ctx));
+    }
+    const int ctx_phys =
+        (bounded_pool || paged_padding) ? ctx_alloc : max_ctx;
     const int max_ctx_alloc = needs_256_stride
         ? ((ctx_phys + 255) / 256) * 256
         : ctx_phys;
@@ -207,6 +220,22 @@ bool create_target_cache_partial(const TargetWeights & w,
         out.q_cap = ggml_new_tensor_3d(out.base_ctx, GGML_TYPE_F32,
                                        head_dim, w.n_head, n_full_attn);
         ggml_set_name(out.q_cap, "q_cap");
+
+        // Paged-attention metadata is persistent like the K/V pool itself so
+        // decode steps can update it append-only; a gallocr graph input would
+        // need every live entry re-uploaded before every compute because its
+        // buffer region may be recycled between attention consumers.
+        if (paged_attention) {
+            out.paged_block_table = ggml_new_tensor_2d(
+                out.base_ctx, GGML_TYPE_I32, paged_block_count(max_ctx), 1);
+            ggml_set_name(out.paged_block_table, "paged_block_table");
+            out.paged_kv_seq_lens =
+                ggml_new_tensor_1d(out.base_ctx, GGML_TYPE_I32, 1);
+            ggml_set_name(out.paged_kv_seq_lens, "paged_kv_seq_lens");
+        } else {
+            out.paged_block_table = nullptr;
+            out.paged_kv_seq_lens = nullptr;
+        }
 
         out.base_buf = ggml_backend_alloc_ctx_tensors(out.base_ctx, backend);
         if (!out.base_buf) {
@@ -645,7 +674,9 @@ static ggml_tensor * build_full_attn_block(
     ggml_tensor * q_tail_capture = nullptr,
     int q_tail_start = 0,
     ggml_tensor * kv_write_rows = nullptr,
-    ggml_tensor ** q_fa_out = nullptr   // post-RoPE/post-rotation Q [head_dim, n_tokens, n_head]
+    ggml_tensor ** q_fa_out = nullptr,  // post-RoPE/post-rotation Q [head_dim, n_tokens, n_head]
+    ggml_tensor * paged_block_table = nullptr,
+    ggml_tensor * paged_kv_seq_lens = nullptr
 ) {
     const int head_dim = w.n_embd_head_k;
     const int n_head = w.n_head;
@@ -734,7 +765,9 @@ static ggml_tensor * build_full_attn_block(
     }
 
     if (kv_write_rows) {
-        // Step-invariant: constant dst pointer, idx carries kv_start. set_rows needs contiguous src.
+        // Step-invariant: the destination tensor stays fixed while the input
+        // indices carry contiguous, KVFlash, or paged physical rows.
+        // ggml_set_rows requires a contiguous source.
         ggml_tensor * Kcur_cont = ggml_is_contiguous(Kcur_T) ? Kcur_T : ggml_cont(ctx, Kcur_T);
         ggml_tensor * Vcur_cont = ggml_is_contiguous(Vcur_T) ? Vcur_T : ggml_cont(ctx, Vcur_T);
         ggml_build_forward_expand(gf, ggml_set_rows(ctx, cache_k, Kcur_cont, kv_write_rows));
@@ -754,12 +787,7 @@ static ggml_tensor * build_full_attn_block(
     }
 
     // ── Flash attention over the valid slice
-    // fa_window > 0: attend only to the last fa_window positions (cuts FA cost
-    // during spec-decode verify at long contexts).
-    const int win_start = (fa_window > 0 && kv_start > fa_window)
-                              ? (kv_start - fa_window) : 0;
     const int kv_len = kv_start + n_tokens;
-    const int win_len = kv_len - win_start;
 
     // Stride-256 FA span when (a) TQ3_0 requires it, or (b) the step-invariant
     // set_rows KV write is active (kv_write_rows): a fixed span within each
@@ -770,11 +798,12 @@ static ggml_tensor * build_full_attn_block(
     const bool  step_invariant = (kv_write_rows != nullptr);
     const int fattn_stride  = (kv_k_type == GGML_TYPE_TQ3_0 || kv_v_type == GGML_TYPE_TQ3_0 ||
                                step_invariant) ? 256 : 1;
-    int win_len_padded = ((win_len + fattn_stride - 1) / fattn_stride) * fattn_stride;
-    if (step_invariant) {
-        // Never view past the cache tensor (max_ctx may not be 256-aligned).
-        win_len_padded = std::min(win_len_padded, (int)cache_k->ne[1]);
-    }
+    // Round a KV span up to the FA stride; `clamp` bounds it to the physical
+    // cache rows (max_ctx may not be 256-aligned).
+    const auto padded_kv_len = [&](int len, bool clamp) {
+        const int padded = ((len + fattn_stride - 1) / fattn_stride) * fattn_stride;
+        return clamp ? std::min(padded, (int)cache_k->ne[1]) : padded;
+    };
 
     ggml_tensor * Qfa = ggml_permute(ctx, Q, 0, 2, 1, 3);
     // When K is rotated (TQ3_0 or explicit FWHT), Q needs forward rotation too.
@@ -792,22 +821,51 @@ static ggml_tensor * build_full_attn_block(
     // cosine (orthogonal transform).
     if (q_fa_out) *q_fa_out = Qfa;
 
-    // K and V from cache: a windowed view starting at win_start.
-    ggml_tensor * Kfa = ggml_view_3d(ctx, cache_k,
-        head_dim, win_len_padded, n_head_kv,
-        cache_k->nb[1], cache_k->nb[2], cache_k->nb[1] * win_start);
-    ggml_tensor * Vfa = ggml_view_3d(ctx, cache_v,
-        head_dim, win_len_padded, n_head_kv,
-        cache_v->nb[1], cache_v->nb[2], cache_v->nb[1] * win_start);
-
-    // Causal mask: for n_tokens==1 we don't need one (a single query attending
-    // to all keys is trivially causal). For n_tokens>1 the caller must provide
-    // a mask shaped [kv_len, n_tokens] with 0 for attendable positions and
-    // -inf for positions beyond the causal boundary.
     const float kq_scale = 1.0f / std::sqrt((float)head_dim);
-    ggml_tensor * attn = ggml_flash_attn_ext(ctx, Qfa, Kfa, Vfa, attn_mask,
-                                             kq_scale, 0.0f, 0.0f);
-    // attn: [head_dim, n_head, n_tokens] (permuted)
+    ggml_tensor * attn = nullptr;
+    if (paged_block_table) {
+        GGML_ASSERT(paged_kv_seq_lens);
+        // The launch bound lands in op_params, and the ggml-cuda graph cache
+        // memcmps the whole ggml_tensor: a live kv_len here would differ on
+        // every decode step and force a re-capture per token. Pad it on the
+        // same 256-token stride the dense path uses for win_len_padded, so the
+        // paged node's properties are stable within each window. Exact
+        // per-sequence extents still come from kv_seq_lens on device; a larger
+        // bound only over-sizes the partition grid, and partitions past the
+        // real length exit with a zero-weight sentinel. Clamped because
+        // ggml_paged_attn asserts max_kv_seq_len <= k->ne[1].
+        const int paged_launch_len = padded_kv_len(kv_len, /*clamp=*/true);
+        attn = ggml_paged_attn(ctx, Qfa, cache_k, cache_v,
+                               paged_block_table, paged_kv_seq_lens,
+                               kq_scale, PAGED_BLOCK_SIZE,
+                               paged_launch_len);
+    } else {
+        // fa_window > 0: attend only to the last fa_window positions (cuts FA
+        // cost during spec-decode verify at long contexts). Paged attention
+        // ignores the window entirely — it walks the block table for the whole
+        // sequence — which is why build_target_step rejects the combination.
+        const int win_start = (fa_window > 0 && kv_start > fa_window)
+                                  ? (kv_start - fa_window) : 0;
+        const int win_len = kv_len - win_start;
+        // Never view past the cache tensor when step-invariant.
+        const int win_len_padded = padded_kv_len(win_len, /*clamp=*/step_invariant);
+
+        // K and V from cache: a windowed view starting at win_start.
+        ggml_tensor * Kfa = ggml_view_3d(ctx, cache_k,
+            head_dim, win_len_padded, n_head_kv,
+            cache_k->nb[1], cache_k->nb[2], cache_k->nb[1] * win_start);
+        ggml_tensor * Vfa = ggml_view_3d(ctx, cache_v,
+            head_dim, win_len_padded, n_head_kv,
+            cache_v->nb[1], cache_v->nb[2], cache_v->nb[1] * win_start);
+
+        // A single query needs no causal mask. Multi-token callers supply one.
+        attn = ggml_flash_attn_ext(ctx, Qfa, Kfa, Vfa, attn_mask,
+                                   kq_scale, 0.0f, 0.0f);
+    }
+    // Dense output is [D,Hq,n_tokens]; paged output is [D,n_seq,Hq].
+    // They are layout-equivalent here because the paged path is decode-only
+    // and n_tokens/n_seq is exactly one. A future batched integration must
+    // permute the paged result before this reshape.
 
     // Un-rotate the FA output from FWHT-rotated V space (only when V is TQ3).
     if (out_rotate) {
@@ -1299,7 +1357,9 @@ QwenGraphOutputs build_qwen35_graph(
                                         /*q_tail_capture=*/nullptr,
                                         /*q_tail_start=*/0,
                                         in.kv_write_rows,
-                                        want_q_cap ? &q_fa : nullptr);
+                                        want_q_cap ? &q_fa : nullptr,
+                                        in.paged_attention ? cache.paged_block_table : nullptr,
+                                        in.paged_attention ? cache.paged_kv_seq_lens : nullptr);
             if (want_q_cap && q_fa) {
                 // Last token's Q, all heads: src [head_dim, 1, n_head] view of
                 // [head_dim, n_tokens, n_head]; dst = q_cap plane fa_idx

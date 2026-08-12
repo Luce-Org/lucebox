@@ -435,6 +435,8 @@ extern "C" {
         GGML_TYPE_Q6_0_ROCMFPX      = 102,
         GGML_TYPE_Q8_0_ROCMFPX      = 103,
         GGML_TYPE_Q3_0_ROCMFPX      = 104,
+        GGML_TYPE_Q3_1_ROCMFP3_MIX  = 105, // per-expert mixed absmax/adaptive ROCmFP3 (P4); codebook in GGUF KV
+        GGML_TYPE_Q2_1_ROCMFP2_MIX  = 106, // per-expert mixed absmax/adaptive ROCmFP2 (gate/up); codebook in sidecar
         GGML_TYPE_Q2_0_ROCMFP2      = 107,
         GGML_TYPE_COUNT   = 108,
     };
@@ -612,6 +614,8 @@ extern "C" {
         // Keep extension operations appended so established GGML op ordinals
         // remain stable within a protocol generation.
         GGML_OP_MUL_MAT_GROUPED_SRC,
+
+        GGML_OP_PAGED_ATTN,
 
         GGML_OP_COUNT,
     };
@@ -2458,6 +2462,30 @@ extern "C" {
             float                 scale,
             float                 alpha);
 
+    // Decode-only attention over independently allocated physical KV blocks.
+    // q:            [D, n_seq, n_head] F32 (one query per sequence)
+    // k/v:          [D, pool_tokens, n_head_kv]
+    // block_table:  [max_blocks, n_seq] I32
+    // kv_seq_lens: [n_seq] I32 (valid cached K/V tokens per sequence)
+    // max_kv_seq_len: host-known maximum of kv_seq_lens, used to size the
+    //                 CUDA/HIP launch without reading block-table capacity
+    // res:          [D, n_seq, n_head] F32
+    //
+    // A logical token t is read from physical row
+    // block_table[t/block_size, seq]*block_size + t%block_size.
+    // The initial CUDA/HIP implementation supports D=256 and independently
+    // typed F16, Q4_0, or Q8_0 K/V pools.
+    GGML_API struct ggml_tensor * ggml_paged_attn(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * block_table,
+            struct ggml_tensor  * kv_seq_lens,
+            float                 scale,
+            int                   block_size,
+            int                   max_kv_seq_len);
+
     // TurboQuant FWHT rotation. direction: 0 = forward, 1 = inverse.
     // Applies signs1 -> FWHT -> signs2 (forward) or signs2 -> FWHT -> signs1 (inverse).
     // Used for KV cache rotation in TurboQuant quantization types (TQ3_0).
@@ -2617,6 +2645,17 @@ extern "C" {
             struct ggml_tensor  * q,
             struct ggml_tensor  * head_weights,
             struct ggml_tensor  * index_comp,
+            int                   kv_start,
+            int                   ratio);
+
+    // Masked variant for stable-shape decode graphs. visibility_mask is F32
+    // [n_comp,n_tokens], with values <= -1e20 marking rows as invisible.
+    GGML_API struct ggml_tensor * ggml_ds4_indexer_score_masked(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * head_weights,
+            struct ggml_tensor  * index_comp,
+            struct ggml_tensor  * visibility_mask,
             int                   kv_start,
             int                   ratio);
 

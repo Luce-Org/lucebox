@@ -12,8 +12,10 @@
 
 #include "common/feature_gate.h"
 #include "common/model_capabilities.h"
+#include "common/paged_attention_config.h"
 #include "placement/placement_config.h"
 
+#include <climits>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -345,6 +347,90 @@ static void test_feature_gate_layer_split_requires_supported_arch() {
     TEST_ASSERT(gate_result(single, "qwen3", PlacementBackend::Cuda).empty());
 }
 
+static void test_feature_gate_paged_attention_requires_qwen35_monolithic() {
+    BackendArgs args;
+    args.model_path = "/nonexistent/model.gguf";
+    args.paged_attention = true;
+    TEST_ASSERT(gate_result(args, "qwen35", PlacementBackend::Cuda).empty());
+    TEST_ASSERT(gate_result(args, "qwen35", PlacementBackend::Hip).empty());
+
+    // Only qwen35 has a paged decode path. qwen35moe shares Qwen35Config, so
+    // its rejection is this gate's job — the factory's field-presence
+    // cross-check cannot tell the two apart.
+    for (const char * arch : {"qwen35moe", "laguna", "qwen3",
+                              "gemma4", "deepseek4"}) {
+        TEST_ASSERT(!gate_result(args, arch, PlacementBackend::Cuda).empty());
+    }
+
+    // Only the monolithic qwen35 backend owns a paged K/V pool. Both
+    // placements are supported qwen35 launches without the flag, so the
+    // rejection has to come from the paged rule.
+    BackendArgs split = args;
+    TEST_ASSERT(parse_placement_device_list("cuda:0,cuda:1", split.device));
+    TEST_ASSERT(!gate_result(split, "qwen35", PlacementBackend::Cuda).empty());
+
+    BackendArgs remote_shard = args;
+    remote_shard.remote_target_shard.ipc_bin = "/usr/bin/target-shard";
+    TEST_ASSERT(!gate_result(
+        remote_shard, "qwen35", PlacementBackend::Cuda).empty());
+
+    for (BackendArgs * relaxed : {&split, &remote_shard}) {
+        relaxed->paged_attention = false;
+        TEST_ASSERT(gate_result(
+            *relaxed, "qwen35", PlacementBackend::Cuda).empty());
+    }
+}
+
+static void test_feature_gate_paged_attention_requires_plain_ar_decode() {
+    BackendArgs base;
+    base.model_path = "/nonexistent/model.gguf";
+    base.paged_attention = true;
+
+    BackendArgs draft = base;
+    draft.draft_path = "/nonexistent/draft.gguf";
+    TEST_ASSERT(!gate_result(draft, "qwen35", PlacementBackend::Cuda).empty());
+
+    BackendArgs ddtree = base;
+    ddtree.ddtree_mode = true;
+    TEST_ASSERT(!gate_result(ddtree, "qwen35", PlacementBackend::Cuda).empty());
+
+    BackendArgs windowed = base;
+    windowed.fa_window = 4096;
+    TEST_ASSERT(!gate_result(
+        windowed, "qwen35", PlacementBackend::Cuda).empty());
+
+    BackendFeatureConfig pflash;
+    pflash.pflash_enabled = true;
+    pflash.pflash_drafter_configured = true;
+    TEST_ASSERT(!gate_result(
+        base, "qwen35", PlacementBackend::Cuda, pflash).empty());
+
+    // The pool rounds max_ctx up to whole blocks, so both ends of the range
+    // are rejected: nothing to allocate, and rounding that overflows int.
+    BackendArgs empty_ctx = base;
+    empty_ctx.device.max_ctx = 0;
+    TEST_ASSERT(!gate_result(
+        empty_ctx, "qwen35", PlacementBackend::Cuda).empty());
+
+    BackendArgs huge_ctx = base;
+    huge_ctx.device.max_ctx = INT_MAX;
+    TEST_ASSERT(!gate_result(
+        huge_ctx, "qwen35", PlacementBackend::Cuda).empty());
+
+    BackendArgs max_ctx = base;
+    max_ctx.device.max_ctx = INT_MAX - PAGED_BLOCK_SIZE + 1;
+    TEST_ASSERT(gate_result(
+        max_ctx, "qwen35", PlacementBackend::Cuda).empty());
+
+    // None of these are rules about paged attention itself: without the flag
+    // every one of them is a supported qwen35 launch.
+    for (BackendArgs * args : {&draft, &ddtree, &windowed, &empty_ctx,
+                               &huge_ctx}) {
+        args->paged_attention = false;
+        TEST_ASSERT(gate_result(*args, "qwen35", PlacementBackend::Cuda).empty());
+    }
+}
+
 // ── Inert-flag warnings ─────────────────────────────────────────────────
 // Warnings must never gate admission, so each case also asserts the same
 // configuration passes check_feature_compatibility().
@@ -470,6 +556,12 @@ static void test_model_capability_tables() {
     TEST_ASSERT(!arch_supports_verify_width("qwen36", false));
     TEST_ASSERT(!arch_supports_fa_window("qwen36", false));
     TEST_ASSERT(!arch_supports_draft_swa("qwen36", false));
+    TEST_ASSERT(!arch_supports_paged_attention("qwen36", false));
+
+    // Paged decode lives in the monolithic qwen35 backend alone.
+    TEST_ASSERT(arch_supports_paged_attention("qwen35", false));
+    TEST_ASSERT(!arch_supports_paged_attention("qwen35", true));
+    TEST_ASSERT(!arch_supports_paged_attention("qwen35moe", false));
 }
 
 int main() {
@@ -487,6 +579,8 @@ int main() {
     RUN_TEST(test_feature_gate_ds4_decode_options_require_monolithic_hip);
     RUN_TEST(test_feature_gate_remote_draft_requires_supported_arch);
     RUN_TEST(test_feature_gate_layer_split_requires_supported_arch);
+    RUN_TEST(test_feature_gate_paged_attention_requires_qwen35_monolithic);
+    RUN_TEST(test_feature_gate_paged_attention_requires_plain_ar_decode);
     RUN_TEST(test_feature_warnings_silent_when_supported);
     RUN_TEST(test_feature_warnings_report_inert_draft);
     RUN_TEST(test_feature_warnings_report_inert_decode_tunables);

@@ -947,13 +947,11 @@ static void test_indexer_score_cpu(ggml_backend_t backend) {
     ggml_fp32_to_fp16_row(comp_f32.data(), comp_f16.data(),
                           (int64_t) comp_f32.size());
     std::vector<float> expected((size_t) n_comp * n_tokens);
+    std::vector<float> visibility_mask((size_t) n_comp * n_tokens, 0.0f);
+    std::vector<float> masked_expected((size_t) n_comp * n_tokens);
     for (int token = 0; token < n_tokens; ++token) {
         const int visible = (kv_start + token + 1) / ratio;
         for (int comp = 0; comp < n_comp; ++comp) {
-            if (comp >= visible) {
-                expected[(size_t) token * n_comp + comp] = -1.0e30f;
-                continue;
-            }
             float score = 0.0f;
             for (int head = 0; head < n_head; ++head) {
                 const float * q_row = q.data() +
@@ -967,7 +965,13 @@ static void test_indexer_score_cpu(ggml_backend_t backend) {
                 score += std::max(dot, 0.0f) *
                     weights[(size_t) token * n_head + head];
             }
-            expected[(size_t) token * n_comp + comp] = score;
+            const size_t index = (size_t) token * n_comp + comp;
+            expected[index] = comp < visible ? score : -1.0e30f;
+            if ((token + 2 * comp) % 5 == 0) {
+                visibility_mask[index] = -1.0e30f;
+            }
+            masked_expected[index] = visibility_mask[index] <= -1.0e20f
+                ? -1.0e30f : score;
         }
     }
 
@@ -980,14 +984,21 @@ static void test_indexer_score_cpu(ggml_backend_t backend) {
         ctx, GGML_TYPE_F32, n_head, n_tokens);
     ggml_tensor * comp_t = ggml_new_tensor_2d(
         ctx, GGML_TYPE_F16, 128, n_comp);
+    ggml_tensor * visibility_mask_t = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F32, n_comp, n_tokens);
     ggml_set_input(q_t);
     ggml_set_input(weights_t);
     ggml_set_input(comp_t);
+    ggml_set_input(visibility_mask_t);
     ggml_tensor * scores_t = ggml_ds4_indexer_score(
         ctx, q_t, weights_t, comp_t, kv_start, ratio);
+    ggml_tensor * masked_scores_t = ggml_ds4_indexer_score_masked(
+        ctx, q_t, weights_t, comp_t, visibility_mask_t, kv_start, ratio);
     ggml_set_output(scores_t);
+    ggml_set_output(masked_scores_t);
     ggml_cgraph * graph = ggml_new_graph_custom(ctx, 64, false);
     ggml_build_forward_expand(graph, scores_t);
+    ggml_build_forward_expand(graph, masked_scores_t);
     ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
     TEST_ASSERT_MSG(ggml_gallocr_alloc_graph(alloc, graph),
                     "indexer score graph allocation failed");
@@ -996,6 +1007,8 @@ static void test_indexer_score_cpu(ggml_backend_t backend) {
                             weights.size() * sizeof(float));
     ggml_backend_tensor_set(comp_t, comp_f16.data(), 0,
                             comp_f16.size() * sizeof(ggml_fp16_t));
+    ggml_backend_tensor_set(visibility_mask_t, visibility_mask.data(), 0,
+                            visibility_mask.size() * sizeof(float));
     TEST_ASSERT_MSG(ggml_backend_graph_compute(backend, graph) ==
                         GGML_STATUS_SUCCESS,
                     "indexer score graph compute failed");
@@ -1005,6 +1018,14 @@ static void test_indexer_score_cpu(ggml_backend_t backend) {
     for (size_t i = 0; i < actual.size(); ++i) {
         TEST_ASSERT_MSG(nearly_equal(actual[i], expected[i], 2e-5f, 2e-5f),
                         "indexer score output mismatch");
+    }
+    std::vector<float> masked_actual(masked_expected.size());
+    ggml_backend_tensor_get(masked_scores_t, masked_actual.data(), 0,
+                            masked_actual.size() * sizeof(float));
+    for (size_t i = 0; i < masked_actual.size(); ++i) {
+        TEST_ASSERT_MSG(
+            nearly_equal(masked_actual[i], masked_expected[i], 2e-5f, 2e-5f),
+            "masked indexer score output mismatch");
     }
     ggml_gallocr_free(alloc);
     ggml_free(ctx);
@@ -1932,7 +1953,7 @@ static void test_prefill_readout_lifecycle_and_fused_exclusion() {
     Ds4VerifyHooks verifier_hooks;
     TEST_ASSERT(verifier_hooks.allow_fused_verify);
     TEST_ASSERT(deepseek4_should_attempt_fused_verify(
-        /*n_tokens=*/4, &verifier_hooks,
+        /*n_tokens=*/GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS, &verifier_hooks,
         /*owner_topology_supported=*/true,
         /*full_layer_range=*/true,
         /*has_logits_output=*/true,
@@ -1941,7 +1962,8 @@ static void test_prefill_readout_lifecycle_and_fused_exclusion() {
     TEST_ASSERT(!deepseek4_should_attempt_fused_verify(
         /*n_tokens=*/1, &verifier_hooks, true, true, true, true, true));
     TEST_ASSERT(!deepseek4_should_attempt_fused_verify(
-        /*n_tokens=*/5, &verifier_hooks, true, true, true, true, true));
+        /*n_tokens=*/GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS + 1,
+        &verifier_hooks, true, true, true, true, true));
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 

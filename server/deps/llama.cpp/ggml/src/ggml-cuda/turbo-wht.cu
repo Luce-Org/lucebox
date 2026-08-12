@@ -2,11 +2,13 @@
 #include "tq3-quant.cuh"
 #include "cpy-utils.cuh"
 
-// Each thread independently transforms one 128-element group.
 // Supports non-contiguous src via separate src/dst strides (dim0 must be
 // contiguous in both). This lets us skip ggml_cont before turbo_wht when
 // the input comes from ggml_permute with dim0 unchanged.
-static __global__ void k_turbo_wht(
+#if defined(GGML_USE_HIP)
+// Keep the established scalar implementation on HIP. The cooperative helper
+// below is a 32-lane CUDA-warp primitive and has not been qualified on wave64.
+static __global__ void k_turbo_wht_scalar(
         const char * __restrict__ src_base,
         char       * __restrict__ dst_base,
         const int64_t ne00,
@@ -41,6 +43,55 @@ static __global__ void k_turbo_wht(
 
     for (int i = 0; i < 128; i++) out_row[i] = x[i];
 }
+#else
+// One CUDA warp transforms one 128-element group (four values per lane).
+// The previous one-thread implementation kept a 128-float local array per
+// thread, causing register spills and 23-42 us launches for only 1-3 blocks on
+// sm_86. This uses the same warp-cooperative primitive already exercised by
+// the chunked-attention path.
+static __global__ void k_turbo_wht_warp(
+        const char * __restrict__ src_base,
+        char       * __restrict__ dst_base,
+        const int64_t ne00,
+        const int64_t ne01,
+        const int64_t ne02,
+        const int64_t src_nb1,
+        const int64_t src_nb2,
+        const int64_t dst_nb1,
+        const int64_t dst_nb2,
+        const int64_t total_groups,
+        const int64_t groups_per_row,
+        int           direction) {
+    constexpr int warp_size_local = 32;
+    const int warp = threadIdx.x / warp_size_local;
+    const int lane = threadIdx.x & (warp_size_local - 1);
+    const int64_t gid = (int64_t)blockIdx.x * (blockDim.x / warp_size_local) + warp;
+    if (gid >= total_groups) return;
+
+    const int64_t g   = gid % groups_per_row;
+    const int64_t rem = gid / groups_per_row;
+    const int64_t i01 = rem % ne01;
+    const int64_t i02 = rem / ne01;
+
+    const float * row = (const float *)(src_base + i01 * src_nb1 + i02 * src_nb2) + g * QK_TQ3_0_GROUP;
+    float * out_row   = (float *)(dst_base + i01 * dst_nb1 + i02 * dst_nb2) + g * QK_TQ3_0_GROUP;
+    const int base = lane * 4;
+
+    float v0 = row[base + 0];
+    float v1 = row[base + 1];
+    float v2 = row[base + 2];
+    float v3 = row[base + 3];
+    if (direction == 0) {
+        warp_tq3_rotate_forward(v0, v1, v2, v3);
+    } else {
+        warp_tq3_rotate_inverse(v0, v1, v2, v3);
+    }
+    out_row[base + 0] = v0;
+    out_row[base + 1] = v1;
+    out_row[base + 2] = v2;
+    out_row[base + 3] = v3;
+}
+#endif
 
 // Fused kernel: FWHT-rotate a non-contiguous F32 source and quantize directly
 // to Q4_0 (or Q8_0). Eliminates the intermediate F32 buffer and two kernel
@@ -101,13 +152,22 @@ void ggml_cuda_op_turbo_wht(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     const int64_t total_groups   = groups_per_row * ne01 * ne02;
 
     constexpr int THREADS_PER_BLOCK = 128;
+#if defined(GGML_USE_HIP)
     const int n_blocks = (int)((total_groups + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
+#else
+    constexpr int GROUPS_PER_BLOCK = THREADS_PER_BLOCK / 32;
+    const int n_blocks = (int)((total_groups + GROUPS_PER_BLOCK - 1) / GROUPS_PER_BLOCK);
+#endif
 
     // Destination strides are always contiguous
     const int64_t dst_nb1 = ne00 * sizeof(float);
     const int64_t dst_nb2 = ne00 * ne01 * sizeof(float);
 
-    k_turbo_wht<<<n_blocks, THREADS_PER_BLOCK, 0, ctx.stream()>>>(
+#if defined(GGML_USE_HIP)
+    k_turbo_wht_scalar<<<n_blocks, THREADS_PER_BLOCK, 0, ctx.stream()>>>(
+#else
+    k_turbo_wht_warp<<<n_blocks, THREADS_PER_BLOCK, 0, ctx.stream()>>>(
+#endif
         (const char *)src0->data, (char *)dst->data,
         ne00, ne01, ne02,
         src0->nb[1], src0->nb[2],

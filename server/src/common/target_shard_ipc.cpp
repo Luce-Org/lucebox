@@ -231,6 +231,7 @@ bool TargetShardIpcSession::forward(
     const size_t bytes = boundary_activation.size() * sizeof(float);
     const int want_argmax = req.want_argmax ? 1 : 0;
     const int want_logits = req.want_logits ? 1 : 0;
+    const int32_t semantic_phase = inference_phase_wire_value(req.semantic_phase);
     const int forward_ubatch = ubatch > 0 ? ubatch : n_tokens;
     std::vector<int32_t> empty_ids;
     const std::vector<int32_t> * ids = token_ids ? token_ids : &empty_ids;
@@ -243,14 +244,16 @@ bool TargetShardIpcSession::forward(
                          bytes, process_.shared_payload_capacity());
             return false;
         }
-        std::fprintf(cmd, "forward_shared %d %d %d %d %zu %" PRIu64 " %d %d %d\n",
+        std::fprintf(cmd, "forward_shared %d %d %d %d %zu %" PRIu64 " %d %d %d %d\n",
                      base_pos, n_tokens, want_argmax, want_logits, bytes, seq,
-                     token_ids ? 1 : 0, forward_ubatch, (int)ids->size());
+                     token_ids ? 1 : 0, forward_ubatch, (int)ids->size(),
+                     semantic_phase);
         std::fflush(cmd);
     } else if (payload_fd >= 0) {
-        std::fprintf(cmd, "forward_pipe %d %d %d %d %zu %d %d %d\n",
+        std::fprintf(cmd, "forward_pipe %d %d %d %d %zu %d %d %d %d\n",
                      base_pos, n_tokens, want_argmax, want_logits, bytes,
-                     token_ids ? 1 : 0, forward_ubatch, (int)ids->size());
+                     token_ids ? 1 : 0, forward_ubatch, (int)ids->size(),
+                     semantic_phase);
         std::fflush(cmd);
         if (!write_exact_fd(payload_fd, boundary_activation.data(), bytes)) {
             std::fprintf(stderr, "target-shard payload write failed\n");

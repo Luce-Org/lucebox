@@ -390,6 +390,7 @@ add_library(dflash_common STATIC
     # DeepSeek V4 Flash target arch
     src/deepseek4/deepseek4_loader.cpp
     src/deepseek4/deepseek4_graph.cpp
+    src/deepseek4/deepseek4_roctx.cpp
     src/deepseek4/deepseek4_backend.cpp
     src/deepseek4/deepseek4_daemon.cpp
     src/deepseek4/deepseek4_layer_split_adapter.cpp
@@ -421,6 +422,7 @@ add_library(dflash_common STATIC
     src/common/dflash_draft_graph.cpp
     src/common/dflash_draft_kv.cpp
     src/common/dflash_spec_decode.cpp
+    src/common/paged_kv_pool.cpp
     src/common/layer_split_backend.cpp
     src/common/layer_split_runtime.cpp
     src/qwen35/graph_builders.cpp
@@ -757,6 +759,8 @@ target_link_libraries(dflash_common
         ${DFLASH27B_GGML_BACKEND_TARGET}
         ggml-base
         nlohmann_json::nlohmann_json
+    PRIVATE
+        ${CMAKE_DL_LIBS}
 )
 # OpenMP for parallel MoE expert compute kernel (saturate memory bandwidth).
 find_package(OpenMP)
@@ -880,6 +884,20 @@ if(DFLASH27B_TESTS)
             ${DFLASH27B_GGML_BACKEND_TARGET}
             hip::host)
         list(APPEND _raw_unit_test_targets test_rocmfpx_mmq)
+
+
+
+
+        # Benchmark, not a test: built with the tests but deliberately NOT added to
+        # _raw_unit_test_targets, so ctest stays deterministic. Measures the launch-count
+        # claim the fusion rests on.
+        add_executable(bench_rocmfp_mix_gateup_glu test/bench_rocmfp_mix_gateup_glu.cpp)
+        set_source_files_properties(test/bench_rocmfp_mix_gateup_glu.cpp PROPERTIES LANGUAGE HIP)
+        set_target_properties(bench_rocmfp_mix_gateup_glu PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
+        target_include_directories(bench_rocmfp_mix_gateup_glu PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
+        target_link_libraries(bench_rocmfp_mix_gateup_glu PRIVATE
+            ggml ggml-base ${DFLASH27B_GGML_BACKEND_TARGET} hip::host)
     endif()
     add_executable(test_qwen35_tensor_parallel test/test_qwen35_tensor_parallel.cpp)
     target_include_directories(test_qwen35_tensor_parallel PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
@@ -978,6 +996,17 @@ if(DFLASH27B_TESTS)
             ggml-base)
         list(APPEND _raw_unit_test_targets test_mmq_streamk_iq4_xs)
     endif()
+    if(DFLASH27B_GPU_BACKEND STREQUAL "cuda" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_turbo_wht_warp.cu")
+        find_package(CUDAToolkit REQUIRED)
+        add_executable(test_turbo_wht_warp test/test_turbo_wht_warp.cu)
+        set_target_properties(test_turbo_wht_warp PROPERTIES CUDA_ARCHITECTURES "${_dflash_archs}")
+        target_include_directories(test_turbo_wht_warp PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src/ggml-cuda)
+        target_link_libraries(test_turbo_wht_warp PRIVATE CUDA::cudart)
+        list(APPEND _raw_unit_test_targets test_turbo_wht_warp)
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_drafter_tail_capture_guard.cpp")
         # RED phase binary: same source WITHOUT the fix flag — documents the bug.
         add_executable(test_drafter_tail_capture_guard_red
@@ -1007,6 +1036,23 @@ if(DFLASH27B_TESTS)
         endif()
         list(APPEND _raw_unit_test_targets test_deepseek4_unit)
     endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_deepseek4_roctx.cpp")
+        add_executable(test_deepseek4_roctx
+            test/test_deepseek4_roctx.cpp
+            src/deepseek4/deepseek4_roctx.cpp
+            src/common/target_shard_ipc_daemon.cpp)
+        target_include_directories(test_deepseek4_roctx PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+            target_compile_definitions(test_deepseek4_roctx PRIVATE
+                DFLASH27B_BACKEND_HIP=1)
+        endif()
+        if(NOT WIN32)
+            set_target_properties(test_deepseek4_roctx PROPERTIES ENABLE_EXPORTS ON)
+        endif()
+        target_link_libraries(test_deepseek4_roctx PRIVATE ${CMAKE_DL_LIBS})
+        list(APPEND _raw_unit_test_targets test_deepseek4_roctx)
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ggml_rmsnorm_batch.cpp")
         add_executable(test_ggml_rmsnorm_batch test/test_ggml_rmsnorm_batch.cpp)
         target_include_directories(test_ggml_rmsnorm_batch PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
@@ -1020,6 +1066,177 @@ if(DFLASH27B_TESTS)
             target_link_libraries(test_ggml_rmsnorm_batch PRIVATE CUDA::cudart)
         endif()
         add_test(NAME ggml_rmsnorm_batch COMMAND test_ggml_rmsnorm_batch)
+    endif()
+    # POSIX-only fixture: it builds its temp model/sidecar stand-ins with symlink()/getpid()
+    # under /tmp and probes them with access(R_OK). Porting that to Win32 would mean
+    # CreateSymbolicLinkW (which needs privilege or developer mode) for a test that is already
+    # gated on DS4_TEST_MODEL and skips without it -- disproportionate. Excluded on Windows so
+    # a tests-enabled MSVC build compiles; the portable coverage lives in
+    # test_ds4_mix_registry_teardown and test_ds4_dmix_entry_validation, which need no model.
+    if(NOT WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ds4_load_transactional.cpp")
+        add_executable(test_ds4_load_transactional test/test_ds4_load_transactional.cpp)
+        target_include_directories(test_ds4_load_transactional PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+            target_compile_definitions(test_ds4_load_transactional PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
+        else()
+            target_compile_definitions(test_ds4_load_transactional PRIVATE DFLASH27B_BACKEND_CUDA=1 GGML_USE_CUDA)
+        endif()
+        target_link_libraries(test_ds4_load_transactional PRIVATE dflash_common ggml ggml-cpu ${DFLASH27B_GGML_BACKEND_TARGET} ggml-base)
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            find_package(CUDAToolkit REQUIRED)
+            target_link_libraries(test_ds4_load_transactional PRIVATE CUDA::cudart)
+        else()
+            target_link_libraries(test_ds4_load_transactional PRIVATE hip::host)
+        endif()
+        # Self-skips (returns 0) unless DS4_TEST_MODEL points at a qtype-105 model.
+        add_test(NAME ds4_load_transactional COMMAND test_ds4_load_transactional)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_rocmfp3_mix_registry.cpp")
+        # Backend-general: the kernels declare cudaStream_t and ggml's vendors/hip.h maps the
+        # cuda* spellings onto hip*, so the same source builds for both. These were hip-only,
+        # which left the qtype-105/106 numerics verified on gfx1151 alone.
+        add_executable(test_rocmfp3_mix_registry test/test_rocmfp3_mix_registry.cpp)
+        if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+            set_source_files_properties(test/test_rocmfp3_mix_registry.cpp PROPERTIES LANGUAGE HIP)
+            set_target_properties(test_rocmfp3_mix_registry PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
+            target_compile_definitions(test_rocmfp3_mix_registry PRIVATE GGML_USE_HIP)
+        else()
+            set_source_files_properties(test/test_rocmfp3_mix_registry.cpp PROPERTIES LANGUAGE CUDA)
+            set_target_properties(test_rocmfp3_mix_registry PROPERTIES CUDA_ARCHITECTURES "${_dflash_archs}")
+        endif()
+        target_include_directories(test_rocmfp3_mix_registry PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src/ggml-cuda)
+        target_link_libraries(test_rocmfp3_mix_registry PRIVATE
+            ggml ggml-base ${DFLASH27B_GGML_BACKEND_TARGET})
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            find_package(CUDAToolkit REQUIRED)
+            target_link_libraries(test_rocmfp3_mix_registry PRIVATE CUDA::cudart)
+        else()
+            target_link_libraries(test_rocmfp3_mix_registry PRIVATE hip::host)
+        endif()
+        list(APPEND _raw_unit_test_targets test_rocmfp3_mix_registry)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_rocmfp_mix_slice_matvec.cpp")
+        # Backend-general: the kernels declare cudaStream_t and ggml's vendors/hip.h maps the
+        # cuda* spellings onto hip*, so the same source builds for both. These were hip-only,
+        # which left the qtype-105/106 numerics verified on gfx1151 alone.
+        add_executable(test_rocmfp_mix_slice_matvec test/test_rocmfp_mix_slice_matvec.cpp)
+        if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+            set_source_files_properties(test/test_rocmfp_mix_slice_matvec.cpp PROPERTIES LANGUAGE HIP)
+            set_target_properties(test_rocmfp_mix_slice_matvec PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
+            target_compile_definitions(test_rocmfp_mix_slice_matvec PRIVATE GGML_USE_HIP)
+        else()
+            set_source_files_properties(test/test_rocmfp_mix_slice_matvec.cpp PROPERTIES LANGUAGE CUDA)
+            set_target_properties(test_rocmfp_mix_slice_matvec PROPERTIES CUDA_ARCHITECTURES "${_dflash_archs}")
+        endif()
+        target_include_directories(test_rocmfp_mix_slice_matvec PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src/ggml-cuda)
+        target_link_libraries(test_rocmfp_mix_slice_matvec PRIVATE
+            ggml ggml-base ${DFLASH27B_GGML_BACKEND_TARGET})
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            find_package(CUDAToolkit REQUIRED)
+            target_link_libraries(test_rocmfp_mix_slice_matvec PRIVATE CUDA::cudart)
+        else()
+            target_link_libraries(test_rocmfp_mix_slice_matvec PRIVATE hip::host)
+        endif()
+        list(APPEND _raw_unit_test_targets test_rocmfp_mix_slice_matvec)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_rocmfp_mix_gateup_glu.cpp")
+        # Backend-general: the kernels declare cudaStream_t and ggml's vendors/hip.h maps the
+        # cuda* spellings onto hip*, so the same source builds for both. These were hip-only,
+        # which left the qtype-105/106 numerics verified on gfx1151 alone.
+        add_executable(test_rocmfp_mix_gateup_glu test/test_rocmfp_mix_gateup_glu.cpp)
+        if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+            set_source_files_properties(test/test_rocmfp_mix_gateup_glu.cpp PROPERTIES LANGUAGE HIP)
+            set_target_properties(test_rocmfp_mix_gateup_glu PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
+            target_compile_definitions(test_rocmfp_mix_gateup_glu PRIVATE GGML_USE_HIP)
+        else()
+            set_source_files_properties(test/test_rocmfp_mix_gateup_glu.cpp PROPERTIES LANGUAGE CUDA)
+            set_target_properties(test_rocmfp_mix_gateup_glu PROPERTIES CUDA_ARCHITECTURES "${_dflash_archs}")
+        endif()
+        target_include_directories(test_rocmfp_mix_gateup_glu PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src/ggml-cuda)
+        target_link_libraries(test_rocmfp_mix_gateup_glu PRIVATE
+            ggml ggml-base ${DFLASH27B_GGML_BACKEND_TARGET})
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            find_package(CUDAToolkit REQUIRED)
+            target_link_libraries(test_rocmfp_mix_gateup_glu PRIVATE CUDA::cudart)
+        else()
+            target_link_libraries(test_rocmfp_mix_gateup_glu PRIVATE hip::host)
+        endif()
+        list(APPEND _raw_unit_test_targets test_rocmfp_mix_gateup_glu)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_rocmfp_mix_glu_fusable.cpp")
+        # Pure admission logic on tensor metadata -- no device work, no kernels. Deliberately
+        # OUTSIDE the hip-only block: the predicate it checks lives in ggml-cuda.cu and is
+        # compiled for both backends, so the negative cases are worth exercising under CUDA
+        # too. Source language follows the backend.
+        add_executable(test_rocmfp_mix_glu_fusable test/test_rocmfp_mix_glu_fusable.cpp)
+        if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+            set_source_files_properties(test/test_rocmfp_mix_glu_fusable.cpp PROPERTIES LANGUAGE HIP)
+            set_target_properties(test_rocmfp_mix_glu_fusable PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
+        else()
+            set_source_files_properties(test/test_rocmfp_mix_glu_fusable.cpp PROPERTIES LANGUAGE CUDA)
+            set_target_properties(test_rocmfp_mix_glu_fusable PROPERTIES CUDA_ARCHITECTURES "${_dflash_archs}")
+        endif()
+        target_include_directories(test_rocmfp_mix_glu_fusable PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
+        target_link_libraries(test_rocmfp_mix_glu_fusable PRIVATE
+            ggml ggml-base ${DFLASH27B_GGML_BACKEND_TARGET})
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            find_package(CUDAToolkit REQUIRED)
+            target_link_libraries(test_rocmfp_mix_glu_fusable PRIVATE CUDA::cudart)
+        else()
+            target_link_libraries(test_rocmfp_mix_glu_fusable PRIVATE hip::host)
+        endif()
+        list(APPEND _raw_unit_test_targets test_rocmfp_mix_glu_fusable)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ds4_mix_registry_teardown.cpp")
+        # Synthetic fixture: exercises free_deepseek4_weights' registry teardown with a
+        # hand-built weights object, so it needs no model and cannot pass vacuously.
+        add_executable(test_ds4_mix_registry_teardown test/test_ds4_mix_registry_teardown.cpp)
+        target_include_directories(test_ds4_mix_registry_teardown PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+            target_compile_definitions(test_ds4_mix_registry_teardown PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
+        else()
+            target_compile_definitions(test_ds4_mix_registry_teardown PRIVATE DFLASH27B_BACKEND_CUDA=1 GGML_USE_CUDA)
+        endif()
+        target_link_libraries(test_ds4_mix_registry_teardown PRIVATE dflash_common ggml ggml-cpu ${DFLASH27B_GGML_BACKEND_TARGET} ggml-base)
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            find_package(CUDAToolkit REQUIRED)
+            target_link_libraries(test_ds4_mix_registry_teardown PRIVATE CUDA::cudart)
+        else()
+            target_link_libraries(test_ds4_mix_registry_teardown PRIVATE hip::host)
+        endif()
+        add_test(NAME ds4_mix_registry_teardown COMMAND test_ds4_mix_registry_teardown)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ds4_budget_hook.cpp")
+        # Thinking-budget force-close rule. Header-only logic, so unlike the other ds4 tests
+        # this needs no backend, no ggml and no CUDA/HIP link at all.
+        add_executable(test_ds4_budget_hook test/test_ds4_budget_hook.cpp test/test_unit_main.cpp)
+        target_include_directories(test_ds4_budget_hook PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        add_test(NAME ds4_budget_hook COMMAND test_ds4_budget_hook)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ds4_dmix_entry_validation.cpp")
+        # Pure validation logic against the loader's shared rule function: no model, no GPU.
+        add_executable(test_ds4_dmix_entry_validation test/test_ds4_dmix_entry_validation.cpp)
+        target_include_directories(test_ds4_dmix_entry_validation PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+            target_compile_definitions(test_ds4_dmix_entry_validation PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
+        else()
+            target_compile_definitions(test_ds4_dmix_entry_validation PRIVATE DFLASH27B_BACKEND_CUDA=1 GGML_USE_CUDA)
+        endif()
+        target_link_libraries(test_ds4_dmix_entry_validation PRIVATE dflash_common ggml ggml-cpu ${DFLASH27B_GGML_BACKEND_TARGET} ggml-base)
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            find_package(CUDAToolkit REQUIRED)
+            target_link_libraries(test_ds4_dmix_entry_validation PRIVATE CUDA::cudart)
+        else()
+            target_link_libraries(test_ds4_dmix_entry_validation PRIVATE hip::host)
+        endif()
+        add_test(NAME ds4_dmix_entry_validation COMMAND test_ds4_dmix_entry_validation)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ds4_dspark_load.cpp")
         add_executable(test_ds4_dspark_load test/test_ds4_dspark_load.cpp)
@@ -1138,6 +1355,15 @@ if(DFLASH27B_TESTS)
         if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
             target_link_libraries(test_kvflash PRIVATE CUDA::cudart)
         endif()
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_paged_kv_pool.cpp")
+        # Pure host-side allocator test: no model, ggml, or GPU is required.
+        add_executable(test_paged_kv_pool
+            test/test_paged_kv_pool.cpp
+            src/common/paged_kv_pool.cpp)
+        target_include_directories(test_paged_kv_pool PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        list(APPEND _raw_unit_test_targets test_paged_kv_pool)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_dflash.cpp")
         add_executable(test_dflash test/test_dflash.cpp)
@@ -1382,10 +1608,22 @@ if(DFLASH27B_TESTS)
                     set(_unit_ctest_name qwen35_split_tree_guard)
                 elseif(_unit_target STREQUAL "test_recurrent_snapshot")
                     set(_unit_ctest_name recurrent_snapshot)
+                elseif(_unit_target STREQUAL "test_paged_kv_pool")
+                    set(_unit_ctest_name paged_kv_pool)
                 endif()
                 add_test(NAME "${_unit_ctest_name}" COMMAND ${_unit_target})
                 if(_unit_target STREQUAL "test_deepseek4_mmid_grouped_cuda")
                     set_tests_properties("${_unit_ctest_name}" PROPERTIES SKIP_RETURN_CODE 77)
+                endif()
+                if(_unit_target STREQUAL "test_rocmfp3_mix_registry")
+                    # Its leak assertion reads GLOBAL free VRAM (cudaMemGetInfo) before and
+                    # after 4000 register/unregister cycles, so any other test allocating on
+                    # the device concurrently is charged to it as a leak. Observed exactly
+                    # that: passes alone, and under `ctest -j 3` reported a 591 MB "leak" that
+                    # belonged to a neighbour. Serialise it rather than loosen the threshold --
+                    # a tolerance wide enough to absorb another test's allocation would be wide
+                    # enough to hide the leak this test exists to catch.
+                    set_tests_properties("${_unit_ctest_name}" PROPERTIES RUN_SERIAL TRUE)
                 endif()
             endif()
         endforeach()
@@ -1452,6 +1690,45 @@ if(DFLASH27B_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src
             ${DFLASH27B_SRC_INCLUDE_DIRS})
     endif()
+    endif()
+
+    if((DFLASH27B_GPU_BACKEND STREQUAL "cuda" OR
+        DFLASH27B_GPU_BACKEND STREQUAL "hip")
+       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_paged_attention.cpp")
+        add_executable(test_paged_attention test/test_paged_attention.cpp)
+        target_link_libraries(test_paged_attention PRIVATE
+            ggml ${DFLASH27B_GGML_BACKEND_TARGET} ggml-base)
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            target_link_libraries(test_paged_attention PRIVATE CUDA::cudart)
+        else()
+            target_link_libraries(test_paged_attention PRIVATE hip::host)
+        endif()
+        target_include_directories(test_paged_attention PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src)
+        add_test(NAME paged_attention COMMAND test_paged_attention)
+        add_test(NAME paged_attention_direct
+                 COMMAND test_paged_attention --direct)
+        set_tests_properties(paged_attention_direct PROPERTIES
+            ENVIRONMENT "GGML_CUDA_PAGED_ATTN_FORCE_PARTITIONS=1")
+        if(TARGET check)
+            add_dependencies(check test_paged_attention)
+        endif()
+    endif()
+    if((DFLASH27B_GPU_BACKEND STREQUAL "cuda" OR
+        DFLASH27B_GPU_BACKEND STREQUAL "hip")
+       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/bench_paged_attention.cpp")
+        add_executable(bench_paged_attention test/bench_paged_attention.cpp)
+        target_link_libraries(bench_paged_attention PRIVATE
+            ggml ${DFLASH27B_GGML_BACKEND_TARGET} ggml-base)
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            target_link_libraries(bench_paged_attention PRIVATE CUDA::cudart)
+        else()
+            target_link_libraries(bench_paged_attention PRIVATE hip::host)
+        endif()
+        target_include_directories(bench_paged_attention PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src)
     endif()
 endif()
 

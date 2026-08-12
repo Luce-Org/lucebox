@@ -104,6 +104,8 @@ static void print_usage(const char * prog) {
         "  --fa-window <N>     Flash-attention sliding window (default: 0=full).\n"
         "                       WARNING: >0 drops system prompt / tool definitions\n"
         "                       from attention at long contexts. Use 0 for tools.\n"
+        "  --paged-attention   Use 16-token paged KV blocks for Qwen3.6-27B\n"
+        "                       autoregressive decode (experimental)\n"
         "  --model-name <name>  Model name for /v1/models (default: dflash)\n"
         "  --prefix-cache-slots <N>  Prefix cache slots (default: 32, 0 disables)\n"
         "  --prefill-cache-slots <N> Full prompt/prefill cache slots (default: 0)\n"
@@ -349,6 +351,8 @@ int main(int argc, char ** argv) {
             }
         } else if (std::strcmp(argv[i], "--fa-window") == 0 && i + 1 < argc) {
             bargs.fa_window = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--paged-attention") == 0) {
+            bargs.paged_attention = true;
         } else if (std::strcmp(argv[i], "--model-name") == 0 && i + 1 < argc) {
             sconfig.model_name = argv[++i];
         } else if (std::strcmp(argv[i], "--prefix-cache-slots") == 0 && i + 1 < argc) {
@@ -631,6 +635,20 @@ int main(int argc, char ** argv) {
             "[server] --target-split-fast-rollback is only supported for "
             "qwen35 targets (detected '%s')\n", arch.c_str());
         return 2;
+    }
+
+    // Paged decode owns its K/V through a block table that the snapshot format
+    // cannot describe yet, so the caches it would restore into are turned off.
+    // This rewrites ServerConfig rather than rejecting the launch, which is why
+    // it lives here and not in the gate.
+    if (bargs.paged_attention) {
+        std::fprintf(stderr,
+            "[server] --paged-attention disables prefix/prefill snapshots "
+            "until their format stores page tables\n");
+        sconfig.prefix_cache_cap = 0;
+        sconfig.prefill_cache_cap = 0;
+        sconfig.disk_cache_dir.clear();
+        sconfig.disk_cache_policy.mode = DiskPrefixCacheMode::Off;
     }
 
     // Sync max_ctx: if --max-ctx was not provided, use the backend's default.

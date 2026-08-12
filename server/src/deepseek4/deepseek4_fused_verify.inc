@@ -1018,6 +1018,8 @@ static int ds4_try_fused_verify_step(
         MoeHybridRoutingStats * routing_stats) {
     if (vc.disabled || mc.disabled) return 0;
     if (!hooks || !hooks->capture_layer_ids) return 0;
+    if (n_tokens < 1 ||
+        n_tokens > GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS) return 0;
     if (!hc_out_weights.loaded || hc_out_weights.scale_data.empty() ||
         !w.output_hc_fn || !w.output_hc_base) { vc.disabled = true; return 0; }
     for (int il = 0; il < w.n_layer; ++il) {
@@ -1289,7 +1291,7 @@ static int ds4_try_fused_verify_step(
         ds4_env_flag("DFLASH_DS4_VERIFY_FORCE_GRAPH_REPLAY");
     ScopedCudaGraphOverrides graph_override_scope(
         /*disable_graphs=*/capture_eager,
-        /*mmvq_max_ncols=*/capture_cache ? 3 : 0,
+        /*mmvq_max_ncols=*/capture_cache && q == 1 ? 3 : 0,
         /*skip_property_check=*/force_verify_graph_replay);
     const enum ggml_status compute_status = fg->sched
         ? ggml_backend_sched_graph_compute(fg->sched, fg->sg.gf)
