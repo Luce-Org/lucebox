@@ -1255,18 +1255,29 @@ static __global__ void k_topk_block_radix_f32_i32(
         int           k) {
     constexpr int BLOCK_THREADS = 256;
     using block_sort = hipcub::BlockRadixSort<
-        float, BLOCK_THREADS, ITEMS_PER_THREAD, int>;
+        uint32_t, BLOCK_THREADS, ITEMS_PER_THREAD, int>;
     __shared__ typename block_sort::TempStorage storage;
 
     const int row = (int) blockIdx.x;
     const int first = (int) threadIdx.x * ITEMS_PER_THREAD;
     const float * x_row = x + (size_t) row * ncols;
-    float keys[ITEMS_PER_THREAD];
+    uint32_t keys[ITEMS_PER_THREAD];
     int indices[ITEMS_PER_THREAD];
 #pragma unroll
     for (int item = 0; item < ITEMS_PER_THREAD; ++item) {
         const int col = first + item;
-        keys[item] = col < ncols ? x_row[col] : -INFINITY;
+        if (col < ncols) {
+            const uint32_t bits = (uint32_t) __float_as_int(x_row[col]);
+            const uint32_t ordered = (bits & 0x80000000u)
+                ? ~bits : (bits ^ 0x80000000u);
+            // Padding uses zero. Every real score gets a nonzero sortable key,
+            // so even a valid -infinity outranks padded lanes. Zero is reachable
+            // only for one negative-NaN bit pattern, whose top-k order is not
+            // defined; mapping it to one still keeps the index valid.
+            keys[item] = ordered == 0 ? 1 : ordered;
+        } else {
+            keys[item] = 0;
+        }
         indices[item] = col;
     }
 

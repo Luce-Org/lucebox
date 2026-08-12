@@ -150,7 +150,23 @@ def fit_prompt(
 
 
 def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    valid = [row for row in rows if row.get("ok")]
+    required_numeric_fields = (
+        "client_decode_tok_s",
+        "client_decode_s",
+        "prompt_tokens",
+        "completion_tokens",
+    )
+    valid = [
+        row
+        for row in rows
+        if row.get("ok")
+        and all(
+            isinstance(row.get(field), (int, float))
+            and not isinstance(row.get(field), bool)
+            for field in required_numeric_fields
+        )
+        and float(row["client_decode_s"]) > 0
+    ]
     rates = [float(row["client_decode_tok_s"]) for row in valid]
     decode_seconds = sum(float(row["client_decode_s"]) for row in valid)
     completion_tokens = sum(int(row["completion_tokens"]) for row in valid)
@@ -190,6 +206,34 @@ def main() -> int:
     parser.add_argument("--calibration-server-tokens", type=int, default=1956)
     parser.add_argument("--prepare-only", action="store_true")
     args = parser.parse_args()
+
+    if not args.model_gguf.is_file():
+        parser.error(f"--model-gguf is not a file: {args.model_gguf}")
+    if not args.tokenizer_harness.is_file() or not os.access(
+        args.tokenizer_harness, os.X_OK
+    ):
+        parser.error(
+            f"--tokenizer-harness is not an executable file: {args.tokenizer_harness}"
+        )
+    if not args.targets or any(target < 1 for target in args.targets):
+        parser.error("--targets must contain positive context lengths")
+    if args.max_tokens < 1:
+        parser.error("--max-tokens must be positive")
+    if args.warmup < 0:
+        parser.error("--warmup must be non-negative")
+    if args.runs < 1:
+        parser.error("--runs must be positive")
+    if args.padding_words < 0:
+        parser.error("--padding-words must be non-negative")
+    if args.calibration_server_tokens < 1:
+        parser.error("--calibration-server-tokens must be positive")
+    if args.expected_sha256 is not None and (
+        len(args.expected_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in args.expected_sha256)
+    ):
+        parser.error(
+            "--expected-sha256 must contain exactly 64 lowercase hexadecimal characters"
+        )
 
     tokenizer = TokenizerHarness(args.tokenizer_harness, args.model_gguf)
     try:

@@ -697,17 +697,16 @@ bool run_deepseek4_dspark_spec_decode(
     }
     // Laguna-style adaptive verify width: EWMA of accepted candidates, width =
     // ewma + 2 (avg_commit << block means the wide tail is usually wasted).
-    // Prefer an explicit process-level policy. Retain /tmp/ds4_awidth only as
-    // a compatibility fallback for older experiment harnesses.
+    // Keep this process-local: a shared filesystem control would let an
+    // unrelated user or benchmark change live inference behavior.
     bool adaptive_width = true;
     if (const char * raw = std::getenv("DFLASH_DS4_ADAPTIVE_WIDTH")) {
         adaptive_width = raw[0] && std::strcmp(raw, "0") != 0;
-    } else if (std::FILE * f = std::fopen("/tmp/ds4_awidth", "r")) {
-        int value = 1;
-        if (std::fscanf(f, "%d", &value) == 1) {
-            adaptive_width = value != 0;
-        }
-        std::fclose(f);
+    }
+    // The adaptive policy was calibrated only through q=4. Q5 is an explicit
+    // fixed-width mode and must not be silently narrowed.
+    if (q5_verify) {
+        adaptive_width = false;
     }
     const bool use_confidence_width = adaptive_width && !seq_verify_mode &&
         drafter.confidence_w != nullptr && drafter.confidence_b != nullptr &&
@@ -722,8 +721,10 @@ bool run_deepseek4_dspark_spec_decode(
     // The explicit q5 path handles the second ratio-4 boundary in-graph and
     // restores/replays only a rejected q5 prefix, avoiding full snapshots on
     // the overwhelmingly common all-accepted path.
-    const int fast_cap = q5_verify
-        ? block + 1 : GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS;
+    const int fast_cap = std::min(
+        block + 1,
+        q5_verify ? DS4_Q5_VERIFY_TOKENS
+                  : DS4_CONSERVATIVE_VERIFY_MAX_TOKENS);
     int q_cap = full_snap ? block + 1 : fast_cap;
     if (const char * qs = std::getenv("DFLASH_DS4_SPEC_Q")) {
         const int v = std::atoi(qs);
@@ -731,24 +732,14 @@ bool run_deepseek4_dspark_spec_decode(
             q_cap = full_snap ? v : std::min(v, fast_cap);
         }
     }
-    if (std::FILE * qf = std::fopen("/tmp/ds4_spec_q", "r")) {
-        // Per-request override for perf experiments (no server restart needed).
-        // q=1 disables drafting: pure AR pushed through the batched-verify path
-        // (diagnoses batched-vs-sequential target divergence).
-        int v = 0;
-        if (std::fscanf(qf, "%d", &v) == 1 && v >= 1 && v <= block + 1) {
-            q_cap = full_snap ? v : std::min(v, fast_cap);
-        }
-        std::fclose(qf);
-    }
     if (seq_verify_mode &&
-        q_cap > GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS) {
+        q_cap > DS4_CONSERVATIVE_VERIFY_MAX_TOKENS) {
         std::fprintf(stderr,
                      "[ds4-spec] sequential verify supports q<=%d; "
                      "capping requested q=%d to %d\n",
-                     GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS, q_cap,
-                     GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS);
-        q_cap = GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS;
+                     DS4_CONSERVATIVE_VERIFY_MAX_TOKENS, q_cap,
+                     DS4_CONSERVATIVE_VERIFY_MAX_TOKENS);
+        q_cap = DS4_CONSERVATIVE_VERIFY_MAX_TOKENS;
     }
 
     // Snapshot backend for the legacy full-snapshot rollback path.
@@ -842,7 +833,7 @@ bool run_deepseek4_dspark_spec_decode(
             }
         }
         tm_draft += spec_ms_since(t0);
-        if (q5_verify && steps == 0) {
+        if (debug && q5_verify && steps == 0) {
             std::fprintf(stderr, "[ds4-q5] draft-ready block=%d hidden=%zu\n",
                          block, local_hidden.size());
         }
@@ -876,8 +867,13 @@ bool run_deepseek4_dspark_spec_decode(
             return v && *v && *v != '0';
         }();
         int q_step_cap = (seq_verify_mode || fused_verify_mode)
-                       ? std::min(q_cap, q5_verify ? 5 : 4)
-                       : std::min(q_cap, 4 - (pos & 3));
+                       ? std::min(
+                             q_cap,
+                             q5_verify ? DS4_Q5_VERIFY_TOKENS
+                                       : DS4_CONSERVATIVE_VERIFY_MAX_TOKENS)
+                       : std::min(
+                             q_cap,
+                             DS4_CONSERVATIVE_VERIFY_MAX_TOKENS - (pos & 3));
         if (adaptive_width && !use_confidence_width && !seq_verify_mode) {
             const int w_cap = (int) ewma_accept + 2;
             if (w_cap < q_step_cap) q_step_cap = w_cap;
@@ -941,7 +937,7 @@ bool run_deepseek4_dspark_spec_decode(
         if ((int) draft_tok.size() > q_step_cap) draft_tok.resize(q_step_cap);
         const int q = (int) draft_tok.size();   // seed + candidates
         tm_head += spec_ms_since(t0);
-        if (q5_verify && steps == 0) {
+        if (debug && q5_verify && steps == 0) {
             std::fprintf(stderr, "[ds4-q5] head-ready q=%d\n", q);
         }
 
@@ -985,7 +981,7 @@ bool run_deepseek4_dspark_spec_decode(
                 pos, q);
         }
         tm_save += spec_ms_since(t0);
-        if (q5_verify && steps == 0) {
+        if (debug && q5_verify && steps == 0) {
             std::fprintf(stderr, "[ds4-q5] rollback-ready rows=%d\n",
                          rollback.raw_count);
         }
@@ -997,7 +993,7 @@ bool run_deepseek4_dspark_spec_decode(
         // ── ONE batched verify (writes cache + captures features for all q) ──
         t0 = SpecClock::now();
         int verify_last = -1;
-        if (q5_verify && steps == 0) {
+        if (debug && q5_verify && steps == 0) {
             std::fprintf(stderr, "[ds4-q5] verify-begin q=%d pos=%d\n", q, pos);
         }
         const bool verify_ok =

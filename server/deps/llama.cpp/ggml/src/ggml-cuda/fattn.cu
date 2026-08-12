@@ -1777,8 +1777,20 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32_supported(const ggml_tensor * dst)
     const int raw_window = (int) (ds4_layout >> 16);
     const int sparse_block_size = (int) (ds4_layout & 0xffffu);
     const int rope_flags = ggml_get_op_params_i32(dst, 7);
+    if (sparse_keep_rows == INT_MIN) {
+        return false;
+    }
+    if (raw_rows < 0 || raw_rows > n_kv ||
+        (ds4_layout != 0 && (raw_window <= 0 || sparse_block_size <= 0)) ||
+        (sparse_keep_rows != 0 && !mask) ||
+        (rope_flags & ~3) != 0 ||
+        ((rope_flags & 2) != 0 && (rope_flags & 1) == 0)) {
+        return false;
+    }
+    const int n_comp_rows = n_kv - raw_rows;
     if (indexer_topk &&
         (sparse_keep_rows >= 0 || -sparse_keep_rows > 512 ||
+         -sparse_keep_rows > n_comp_rows ||
          indexer_topk->type != GGML_TYPE_I32 ||
          indexer_topk->ne[0] != -sparse_keep_rows ||
          indexer_topk->ne[1] != Q->ne[1] ||
@@ -1786,13 +1798,25 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32_supported(const ggml_tensor * dst)
          !ggml_is_contiguous(indexer_topk))) {
         return false;
     }
-    if (raw_rows < 0 || raw_rows > n_kv ||
-        (ds4_layout != 0 && (raw_window <= 0 || sparse_block_size <= 0)) ||
-        sparse_keep_rows == INT_MIN ||
-        (sparse_keep_rows != 0 && !mask) ||
-        (rope_flags & ~3) != 0 ||
-        ((rope_flags & 2) != 0 && (rope_flags & 1) == 0)) {
-        return false;
+    if (indexer_topk) {
+        constexpr int group4 = 4;
+        const int indexed_capacity = -sparse_keep_rows;
+        const int requested_raw_window =
+            raw_window > 0 ? raw_window : raw_rows;
+        const int effective_raw_window =
+            std::max(1, std::min(requested_raw_window, raw_rows));
+        const int compact_score_stride =
+            effective_raw_window + indexed_capacity;
+        const size_t compact_group4_shmem =
+            ((size_t) group4 * compact_score_stride +
+             (size_t) group4 * 256) * sizeof(float) +
+            (size_t) group4 * 4 * sizeof(int) +
+            ((rope_flags & 2) != 0
+                ? (size_t) group4 * 64 * sizeof(float) : 0);
+        if (!mask || raw_rows <= 0 || n_comp_rows <= 0 ||
+            n_heads % group4 != 0 || compact_group4_shmem > 24 * 1024) {
+            return false;
+        }
     }
 
     return true;
@@ -1836,7 +1860,7 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
                         n_comp_blocks > 0;
     const bool indexed_mask = sparse_keep_rows < 0 && n_comp_rows > 0;
     const int indexed_capacity = indexed_mask
-        ? min(-sparse_keep_rows, n_comp_rows) : 0;
+        ? -sparse_keep_rows : 0;
 
     ds4_inverse_rope_params inverse_rope{};
     const int rope_flags = ggml_get_op_params_i32(dst, 7);
@@ -1925,7 +1949,8 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
     // Four heads win while two blocks can remain resident in 48 KiB of LDS.
     // Beyond that point, two-head grouping trades some K/V reuse for higher
     // occupancy; larger working sets fall back to the single-head kernel.
-    if (!sparse && n_heads % group4 == 0 && group4_shmem <= 24 * 1024) {
+    if (!sparse && !indexer_topk && n_heads % group4 == 0 &&
+        group4_shmem <= 24 * 1024) {
         return ds4_launch_flash_attn_d512_grouped<group4>(
             dst, Q, K, V, mask, sinks, kv_f16, kv_f32,
             n_tokens, n_heads, n_kv, scale, raw_rows,
@@ -1943,7 +1968,7 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
     const bool compact_group4 =
         !sparse && mask && n_heads % group4 == 0 &&
         (raw_rows > raw_window || indexed_mask) &&
-        group4_shmem > 24 * 1024 &&
+        (indexed_mask || group4_shmem > 24 * 1024) &&
         compact_group4_shmem <= 24 * 1024;
     if (compact_group4) {
         ggml_cuda_pool_alloc<int> visibility_bounds_alloc(ctx.pool());
@@ -2047,6 +2072,11 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
             inverse_rope_coefficients,
             forward_rope_coefficients,
             compact_group4_shmem, stream);
+    }
+    // Direct top-k indices are consumed only by the compact four-head path.
+    // Never let an unsupported shape silently fall through to dense attention.
+    if (indexer_topk) {
+        return false;
     }
     if (!sparse && n_heads % group2 == 0 && group2_shmem <= 48 * 1024) {
         return ds4_launch_flash_attn_d512_grouped<group2>(

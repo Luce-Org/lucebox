@@ -38,10 +38,15 @@ OUT_ROOT="${OUT_ROOT:-$CHECKOUT/results/ds4_q5_context_qualification}"
 OUT_DIR="$OUT_ROOT/$RUN_ID"
 SERVER_LOG="$OUT_DIR/server.log"
 
-for required in "$SERVER_BIN" "$TOKENIZER_HARNESS" "$TARGET_MODEL" \
-    "$DRAFT_MODEL" "$HOTNESS_CSV" "$CONTEXT_CLIENT"; do
-    if [[ ! -e "$required" ]]; then
-        echo "missing required path: $required" >&2
+for executable in "$SERVER_BIN" "$TOKENIZER_HARNESS"; do
+    if [[ ! -f "$executable" || ! -x "$executable" ]]; then
+        echo "required executable is missing or not executable: $executable" >&2
+        exit 2
+    fi
+done
+for input in "$TARGET_MODEL" "$DRAFT_MODEL" "$HOTNESS_CSV" "$CONTEXT_CLIENT"; do
+    if [[ ! -f "$input" || ! -r "$input" ]]; then
+        echo "required input is missing or unreadable: $input" >&2
         exit 2
     fi
 done
@@ -82,13 +87,84 @@ case "$HASH_MODELS" in
     0|1) ;;
     *) echo "HASH_MODELS must be 0 or 1" >&2; exit 2 ;;
 esac
+case "$RUN_ID" in
+    ""|.|..|*[!A-Za-z0-9._-]*)
+        echo "RUN_ID may contain only letters, numbers, dot, underscore, and hyphen" >&2
+        exit 2
+        ;;
+esac
+for numeric_setting in PORT MAX_CTX EXPERT_BUDGET_MB WARMUP RUNS MAX_TOKENS VRAM_MONITOR_SECONDS; do
+    numeric_value="${!numeric_setting}"
+    if [[ ! "$numeric_value" =~ ^[0-9]{1,9}$ ]]; then
+        echo "$numeric_setting must be a non-negative integer with at most 9 digits" >&2
+        exit 2
+    fi
+done
+if (( PORT < 1 || PORT > 65535 || MAX_CTX < 1 || EXPERT_BUDGET_MB < 1 ||
+      RUNS < 1 || MAX_TOKENS < 1 )); then
+    echo "PORT, MAX_CTX, EXPERT_BUDGET_MB, RUNS, and MAX_TOKENS must be positive (PORT <= 65535)" >&2
+    exit 2
+fi
+if [[ ! "$EXPECTED_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "EXPECTED_SHA256 must contain exactly 64 lowercase hexadecimal characters" >&2
+    exit 2
+fi
+read -r -a target_args <<<"$TARGETS"
+if (( ${#target_args[@]} == 0 )); then
+    echo "TARGETS must contain at least one context length" >&2
+    exit 2
+fi
+for target in "${target_args[@]}"; do
+    if [[ ! "$target" =~ ^[1-9][0-9]{0,8}$ ]]; then
+        echo "TARGETS must contain only positive integers" >&2
+        exit 2
+    fi
+    if (( target + MAX_TOKENS > MAX_CTX )); then
+        echo "target context $target plus MAX_TOKENS exceeds MAX_CTX=$MAX_CTX" >&2
+        exit 2
+    fi
+done
 
-if pgrep -f "dflash_server .*--port ${PORT}([[:space:]]|$)" >/dev/null; then
-    echo "benchmark port $PORT is already owned by another dflash_server" >&2
+if pgrep -f '(^|/)dflash_server([[:space:]]|$)' >/dev/null; then
+    echo "another dflash_server is running; stop it before changing global GPU performance levels" >&2
     exit 2
 fi
 
-mkdir -p "$OUT_DIR"
+mkdir -p "$OUT_ROOT"
+if ! mkdir "$OUT_DIR"; then
+    echo "refusing to reuse existing output directory: $OUT_DIR" >&2
+    exit 2
+fi
+
+# Serialize the host-wide performance-level changes across qualification runs.
+lock_path="${XDG_RUNTIME_DIR:-/tmp}/dflash-ds4-q5-${UID}.lock"
+exec {lock_fd}>"$lock_path"
+if ! flock -n "$lock_fd"; then
+    echo "another DS4 qualification run owns $lock_path" >&2
+    exit 2
+fi
+
+perf_level() {
+    rocm-smi -d "$1" --showperflevel 2>/dev/null |
+        awk -F: '/Performance Level:/ { value=$NF; gsub(/^[[:space:]]+|[[:space:]]+$/, "", value); print value; exit }'
+}
+
+restore_perf_level() {
+    local gpu="$1"
+    local level="$2"
+    if [[ -n "$level" && "$level" =~ ^[A-Za-z0-9_-]+$ ]]; then
+        rocm-smi -d "$gpu" --setperflevel "$level" >/dev/null 2>&1 || true
+    fi
+}
+
+rocm-smi --showproductname --showdriverversion --showperflevel --showclocks \
+    --showmeminfo vram >"$OUT_DIR/rocm-smi-before.txt" 2>&1 || true
+gpu0_perf_before="$(perf_level 0 || true)"
+gpu1_perf_before="$(perf_level 1 || true)"
+if [[ -z "$gpu0_perf_before" || -z "$gpu1_perf_before" ]]; then
+    echo "could not read both GPU performance levels; no settings were changed" >&2
+    exit 2
+fi
 
 server_pid=""
 monitor_pid=""
@@ -101,13 +177,13 @@ cleanup() {
         kill -TERM "$server_pid" 2>/dev/null || true
         wait "$server_pid" 2>/dev/null || true
     fi
+    restore_perf_level 0 "$gpu0_perf_before"
+    restore_perf_level 1 "$gpu1_perf_before"
 }
 trap cleanup EXIT
 
-rocm-smi -d 0 --setperflevel auto >/dev/null 2>&1 || true
-rocm-smi -d 1 --setperflevel high >/dev/null 2>&1 || true
-printf '0\n' >/tmp/ds4_awidth
-rm -f /tmp/ds4_spec_q
+rocm-smi -d 0 --setperflevel auto >/dev/null
+rocm-smi -d 1 --setperflevel high >/dev/null
 
 server_env=(
     env -i
@@ -165,6 +241,14 @@ server_env=(
     "DFLASH_DS4_DRAFT_CONTEXT_KV_CACHE=1"
     "DFLASH_MOE_FUSED_COMBINE=0"
 )
+
+# env -i deliberately removes ambient tuning knobs, but visibility is part of
+# device selection and must follow the caller exactly (including an empty mask).
+for visibility_var in HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES; do
+    if declare -p "$visibility_var" >/dev/null 2>&1; then
+        server_env+=("$visibility_var=${!visibility_var}")
+    fi
+done
 
 if [[ "$MMVQ_MAX_NCOLS" != auto ]]; then
     server_env+=("LUCE_MMVQ_MAX_NCOLS=$MMVQ_MAX_NCOLS")
@@ -228,19 +312,16 @@ server_args=(
     echo "runs=$RUNS"
     echo "max_tokens=$MAX_TOKENS"
     echo "max_ctx=$MAX_CTX"
-    sha256sum "$SERVER_BIN"
-    stat -c 'target_model=%n bytes=%s mtime=%y' "$TARGET_MODEL"
-    stat -c 'draft_model=%n bytes=%s mtime=%y' "$DRAFT_MODEL"
+    sha256sum -- "$SERVER_BIN"
+    stat -c 'target_model=%n bytes=%s mtime=%y' -- "$TARGET_MODEL"
+    stat -c 'draft_model=%n bytes=%s mtime=%y' -- "$DRAFT_MODEL"
     if [[ "$HASH_MODELS" == 1 ]]; then
-        sha256sum "$TARGET_MODEL" "$DRAFT_MODEL"
+        sha256sum -- "$TARGET_MODEL" "$DRAFT_MODEL"
     fi
     printf 'server_env='; printf '%q ' "${server_env[@]}"; echo
     printf 'server_args='; printf '%q ' "${server_args[@]}"; echo
     date -u '+started_utc=%Y-%m-%dT%H:%M:%SZ'
 } >"$OUT_DIR/manifest.txt"
-
-rocm-smi --showproductname --showdriverversion --showperflevel --showclocks \
-    --showmeminfo vram >"$OUT_DIR/rocm-smi-before.txt" 2>&1 || true
 
 "${server_env[@]}" "${server_args[@]}" >"$SERVER_LOG" 2>&1 &
 server_pid=$!
@@ -273,8 +354,6 @@ if [[ "$VRAM_MONITOR_SECONDS" -gt 0 ]]; then
     monitor_pid=$!
 fi
 
-# shellcheck disable=SC2206
-target_args=($TARGETS)
 python3 "$CONTEXT_CLIENT" \
     --url "http://127.0.0.1:$PORT" \
     --model dflash \

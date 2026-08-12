@@ -5593,6 +5593,9 @@ void ggml_flash_attn_ext_set_ds4_indexer_topk(
     GGML_ASSERT(a->src[5] == NULL);
     GGML_ASSERT(selected && selected->type == GGML_TYPE_I32);
     GGML_ASSERT(ggml_is_contiguous(selected));
+    const int32_t keep_rows = ggml_get_op_params_i32(a, 5);
+    GGML_ASSERT(keep_rows < 0 && keep_rows != INT32_MIN);
+    GGML_ASSERT(selected->ne[0] == -(int64_t) keep_rows);
     GGML_ASSERT(selected->ne[1] == a->src[0]->ne[1]);
     GGML_ASSERT(selected->ne[2] == 1 && selected->ne[3] == 1);
     a->src[5] = selected;

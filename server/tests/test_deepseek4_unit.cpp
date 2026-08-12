@@ -2612,6 +2612,23 @@ static void test_ds4_flash_attention_parallel_index_scan_gpu() {
     TEST_ASSERT_MSG(ggml_backend_supports_op(backend, direct_output),
                     "GPU rejected direct-top-k DS4 attention");
 
+    ggml_tensor * short_kv = ggml_new_tensor_3d(
+        ctx, GGML_TYPE_F32, head_dim, raw_rows + 128, 1);
+    ggml_tensor * short_mask = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F16, raw_rows + 128, n_tokens);
+    ggml_tensor * oversized_topk = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_I32, selected_rows, n_tokens);
+    ggml_tensor * oversized_output = ggml_flash_attn_ext(
+        ctx, q, short_kv, short_kv, short_mask,
+        1.0f / std::sqrt((float) head_dim), 0.0f, 0.0f);
+    ggml_flash_attn_ext_set_ds4_sparse(
+        oversized_output, raw_rows, raw_window, -selected_rows, 1);
+    ggml_flash_attn_ext_set_ds4_indexer_topk(
+        oversized_output, oversized_topk);
+    TEST_ASSERT_MSG(
+        !ggml_backend_supports_op(backend, oversized_output),
+        "GPU accepted direct top-k wider than the live compressed span");
+
     ggml_cgraph * graph = ggml_new_graph_custom(ctx, 64, false);
     ggml_build_forward_expand(graph, output);
     ggml_build_forward_expand(graph, direct_output);
@@ -2940,6 +2957,32 @@ static void test_ds4_topk_block_radix_gpu() {
                 std::equal(ref_begin, ref_begin + k, candidate_begin),
                 "block-radix top-k changed the selected row set");
         }
+
+        // Padding and a valid -infinity score used to share the same radix
+        // key. Prove that padded columns can never be returned on a tie.
+        std::fill(
+            score_data.begin(), score_data.end(),
+            -std::numeric_limits<float>::infinity());
+        ggml_backend_tensor_set(scores, score_data.data(), 0,
+                                score_data.size() * sizeof(float));
+        TEST_ASSERT_MSG(
+            ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS,
+            "block-radix -infinity top-k failed");
+        ggml_backend_tensor_get(selected, candidate.data(), 0,
+                                candidate.size() * sizeof(int32_t));
+        for (int32_t index : candidate) {
+            TEST_ASSERT_MSG(
+                index >= 0 && index < ncols,
+                "block-radix top-k returned a padded column");
+        }
+        for (int row = 0; row < nrows; ++row) {
+            for (int col = 0; col < ncols; ++col) {
+                score_data[(size_t) row * ncols + col] =
+                    (float) (((col * 4051) + row * 997) % ncols);
+            }
+        }
+        ggml_backend_tensor_set(scores, score_data.data(), 0,
+                                score_data.size() * sizeof(float));
 
         auto measure_us = [&](bool block_radix) {
             if (block_radix) {

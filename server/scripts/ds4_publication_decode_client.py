@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import json
 import statistics
 import time
@@ -17,7 +18,6 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
-
 
 SYSTEM_MESSAGE = (
     "You are a helpful assistant. Answer the user's question directly and "
@@ -126,7 +126,13 @@ def stream_request(
             "status": exc.code,
             "error": exc.read().decode("utf-8", errors="replace")[-4000:],
         }
-    except (urllib.error.URLError, TimeoutError, ConnectionResetError) as exc:
+    except (
+        urllib.error.URLError,
+        TimeoutError,
+        ConnectionResetError,
+        http.client.IncompleteRead,
+        http.client.RemoteDisconnected,
+    ) as exc:
         return {"ok": False, "status": status, "error": repr(exc)}
 
     finished = time.perf_counter()
@@ -140,8 +146,9 @@ def stream_request(
         if decode_s is not None and decode_s > 0 and completion_tokens > 0
         else None
     )
-    return {
-        "ok": status == 200 and bool(text) and saw_done,
+    full_completion = completion_tokens == max_tokens
+    result = {
+        "ok": status == 200 and bool(text) and saw_done and full_completion,
         "status": status,
         "stream_done": saw_done,
         "wall_s": round(wall_s, 6),
@@ -156,6 +163,12 @@ def stream_request(
         "response_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
         "response_text": text,
     }
+    if not full_completion:
+        result["error"] = (
+            f"short completion: expected {max_tokens} tokens, "
+            f"received {completion_tokens}"
+        )
+    return result
 
 
 def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
@@ -198,6 +211,15 @@ def main() -> int:
     parser.add_argument("--runs", type=int, default=5)
     parser.add_argument("--json-out", type=Path, required=True)
     args = parser.parse_args()
+
+    if args.padding_words < 0:
+        parser.error("--padding-words must be non-negative")
+    if args.max_tokens < 1:
+        parser.error("--max-tokens must be positive")
+    if args.warmup < 0:
+        parser.error("--warmup must be non-negative")
+    if args.runs < 1:
+        parser.error("--runs must be positive")
 
     prompt = build_prompt(args.padding_words)
     records: list[dict[str, Any]] = []

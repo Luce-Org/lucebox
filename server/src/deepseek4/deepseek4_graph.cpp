@@ -6770,11 +6770,12 @@ bool deepseek4_step_layer_range(
         moe_hybrid->cold_backend_kind == MoeHybridColdBackend::Gpu &&
         moe_hybrid->cold_backend && moe_hybrid->cold_backend != backend;
     const bool q5_verify_candidate =
-        n_tokens == 5 && ds4_env_flag("DFLASH_DS4_Q5_VERIFY");
+        n_tokens == DS4_Q5_VERIFY_TOKENS &&
+        ds4_env_flag("DFLASH_DS4_Q5_VERIFY");
     const bool fused_verify_candidate =
         (!moe_hybrid || fused_hybrid_ready) &&
         n_tokens >= 2 &&
-        (n_tokens <= GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS ||
+        (n_tokens <= DS4_CONSERVATIVE_VERIFY_MAX_TOKENS ||
          q5_verify_candidate) && verify_hooks &&
         layer_begin == 0 && is_last_shard && out_logits &&
         ds4_backend_is_gpu(backend) && ds4_fused_verify_enabled();
@@ -7022,7 +7023,7 @@ bool deepseek4_step_layer_range(
             ? &fused_hybrid_decode_hooks : verify_hooks;
     if ((!moe_hybrid || fused_hybrid_ready) &&
         ((n_tokens >= 2 &&
-          (n_tokens <= GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS ||
+          (n_tokens <= DS4_CONSERVATIVE_VERIFY_MAX_TOKENS ||
            q5_verify_candidate) && verify_hooks) ||
          fused_hybrid_decode) &&
         layer_begin == 0 && is_last_shard &&
@@ -7060,9 +7061,11 @@ bool deepseek4_step_layer_range(
         // above because the fused graph models that boundary explicitly. If
         // graph construction was unavailable, fail closed instead of running
         // an unsafe dynamic batch or silently degrading into q=3 + q=1.
-        if (first_chunk > 0 && first_chunk < n_tokens) {
+        if ((first_chunk > 0 && first_chunk < n_tokens) ||
+            n_tokens > DS4_CONSERVATIVE_VERIFY_MAX_TOKENS) {
             std::fprintf(stderr,
-                         "[ds4-fused-verify] boundary-spanning graph unavailable\n");
+                         "[ds4-fused-verify] safe graph unavailable for q=%d\n",
+                         n_tokens);
             return false;
         }
     }
