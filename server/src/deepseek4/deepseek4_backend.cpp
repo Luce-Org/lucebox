@@ -17,6 +17,7 @@
 #include "ggml-cuda.h"
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -55,6 +56,29 @@ static bool positive_env_double(const char * name, double fallback,
         parsed <= 0.0) {
         if (err) {
             *err = std::string(name) + " must be a finite value greater than zero";
+        }
+        return false;
+    }
+    out = parsed;
+    return true;
+}
+
+static bool env_int_in_range(const char * name, int fallback,
+                             int minimum, int maximum,
+                             int & out, std::string * err) {
+    out = fallback;
+    const char * raw = std::getenv(name);
+    if (!raw || !*raw) return true;
+
+    int parsed = 0;
+    const char * end = raw + std::strlen(raw);
+    const auto result = std::from_chars(raw, end, parsed);
+    if (result.ec != std::errc{} || result.ptr != end ||
+        parsed < minimum || parsed > maximum) {
+        if (err) {
+            *err = std::string(name) + " must be an integer from " +
+                   std::to_string(minimum) + " through " +
+                   std::to_string(maximum);
         }
         return false;
     }
@@ -1129,12 +1153,9 @@ bool DeepSeek4Backend::compute_uniform_hybrid_placement(const DeepSeek4Weights &
 
         int active_experts = cfg_.expert_top_k > 0
             ? cfg_.expert_top_k : w.n_expert_used;
-        if (const char * raw_top_k = std::getenv("DFLASH_DS4_TOPK")) {
-            const int env_top_k = std::atoi(raw_top_k);
-            if (env_top_k > 0) active_experts = env_top_k;
-        }
-        if (active_experts <= 0 || active_experts > w.n_expert_used) {
-            if (err) *err = "critical-path placement active expert count is invalid";
+        if (!env_int_in_range(
+                "DFLASH_DS4_TOPK", active_experts,
+                1, w.n_expert_used, active_experts, err)) {
             return false;
         }
 
@@ -1147,9 +1168,10 @@ bool DeepSeek4Backend::compute_uniform_hybrid_placement(const DeepSeek4Weights &
         MoeHybridCriticalPathConfig balance_cfg;
         balance_cfg.active_experts = active_experts;
         balance_cfg.main_to_peer_rate = main_to_peer_rate;
-        if (const char * raw_floor =
-                std::getenv("DFLASH_DS4_TP_BALANCE_MIN_HOT")) {
-            balance_cfg.min_hot_per_layer = std::max(0, std::atoi(raw_floor));
+        if (!env_int_in_range(
+                "DFLASH_DS4_TP_BALANCE_MIN_HOT", 0,
+                0, w.n_expert, balance_cfg.min_hot_per_layer, err)) {
+            return false;
         }
 
         std::vector<uint64_t> main_fixed_bytes((size_t) w.n_layer, 0);

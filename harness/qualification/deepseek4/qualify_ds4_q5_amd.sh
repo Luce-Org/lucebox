@@ -127,8 +127,10 @@ if [[ ! "$MAIN_TO_PEER_RATE" =~ ^[0-9]+([.][0-9]+)?$ ]] ||
     echo "MAIN_TO_PEER_RATE must be a finite number greater than zero" >&2
     exit 2
 fi
-if [[ ! "$BALANCE_MIN_HOT" =~ ^[0-9]+$ ]]; then
-    echo "BALANCE_MIN_HOT must be a non-negative integer" >&2
+if [[ ! "$BALANCE_MIN_HOT" =~ ^[0-9]+$ ]] ||
+   (( ${#BALANCE_MIN_HOT} > 10 )) ||
+   { (( ${#BALANCE_MIN_HOT} == 10 )) && [[ "$BALANCE_MIN_HOT" > "2147483647" ]]; }; then
+    echo "BALANCE_MIN_HOT must be an integer from 0 through 2147483647" >&2
     exit 2
 fi
 if [[ "$MMVQ_MAX_NCOLS" != auto && ! "$MMVQ_MAX_NCOLS" =~ ^[1-8]$ ]]; then
