@@ -95,8 +95,8 @@ case "$RUN_ID" in
 esac
 for numeric_setting in PORT MAX_CTX EXPERT_BUDGET_MB WARMUP RUNS MAX_TOKENS VRAM_MONITOR_SECONDS; do
     numeric_value="${!numeric_setting}"
-    if [[ ! "$numeric_value" =~ ^[0-9]{1,9}$ ]]; then
-        echo "$numeric_setting must be a non-negative integer with at most 9 digits" >&2
+    if [[ ! "$numeric_value" =~ ^(0|[1-9][0-9]{0,8})$ ]]; then
+        echo "$numeric_setting must be a non-negative decimal integer with at most 9 digits" >&2
         exit 2
     fi
 done
@@ -125,18 +125,35 @@ for target in "${target_args[@]}"; do
     fi
 done
 
+# The script changes physical cards 0 and 1 with rocm-smi. A visibility mask
+# that reorders those cards would apply the performance levels to the wrong
+# logical devices, so this qualification only accepts the canonical order.
+for visibility_var in HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES; do
+    if declare -p "$visibility_var" >/dev/null 2>&1 &&
+       [[ "${!visibility_var}" != "0,1" ]]; then
+        echo "$visibility_var must be unset or exactly 0,1" >&2
+        exit 2
+    fi
+done
+
 # Serialize the host-wide performance-level changes across qualification runs.
-lock_parent="${XDG_RUNTIME_DIR:-/tmp}"
-lock_dir="$lock_parent/dflash-ds4-q5-${UID}.lock"
-if ! mkdir -m 700 "$lock_dir" 2>/dev/null && [[ ! -d "$lock_dir" ]]; then
+lock_dir="/tmp/dflash-ds4-q5.lock"
+if ! mkdir -m 755 "$lock_dir" 2>/dev/null && [[ ! -d "$lock_dir" ]]; then
     echo "could not create qualification lock directory: $lock_dir" >&2
     exit 2
 fi
-if [[ -L "$lock_dir" || ! -O "$lock_dir" ]] || ! chmod 700 "$lock_dir"; then
-    echo "qualification lock directory is not safely owned: $lock_dir" >&2
+if [[ -L "$lock_dir" || ! -d "$lock_dir" ]]; then
+    echo "qualification lock path is not a real directory: $lock_dir" >&2
     exit 2
 fi
-exec 9<"$lock_dir"
+if [[ -O "$lock_dir" ]] && ! chmod 755 "$lock_dir"; then
+    echo "cannot make qualification lock shared: $lock_dir" >&2
+    exit 2
+fi
+if ! exec 9<"$lock_dir"; then
+    echo "cannot open shared qualification lock: $lock_dir" >&2
+    exit 2
+fi
 if ! flock -n 9; then
     echo "another DS4 qualification run owns $lock_dir" >&2
     exit 2
@@ -251,8 +268,8 @@ server_env=(
     "DFLASH_MOE_FUSED_COMBINE=0"
 )
 
-# env -i deliberately removes ambient tuning knobs, but visibility is part of
-# device selection and must follow the caller exactly (including an empty mask).
+# env -i deliberately removes ambient tuning knobs. Canonical visibility masks
+# validated above remain part of the recorded launch environment.
 for visibility_var in HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES; do
     if declare -p "$visibility_var" >/dev/null 2>&1; then
         server_env+=("$visibility_var=${!visibility_var}")

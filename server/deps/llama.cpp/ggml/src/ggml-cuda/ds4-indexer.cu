@@ -1,16 +1,5 @@
 #include "ds4-indexer.cuh"
-
-#include <cstdlib>
-#include <cstring>
-
-namespace {
-
-bool ds4_env_flag_enabled(const char * name) {
-    const char * value = std::getenv(name);
-    return value && value[0] != '\0' && std::strcmp(value, "0") != 0;
-}
-
-}  // namespace
+#include "ds4-env.cuh"
 
 #if defined(GGML_USE_HIP)
 // rocWMMA 1.x rejects RDNA4/gfx1151 at compile time. Use the optimized path

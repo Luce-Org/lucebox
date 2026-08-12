@@ -1,4 +1,5 @@
 #include "argsort.cuh"
+#include "ds4-env.cuh"
 #include "top-k.cuh"
 
 #ifdef GGML_CUDA_USE_CUB
@@ -12,18 +13,6 @@ using namespace cub;
 #ifdef GGML_CUDA_USE_HIPCUB
 #    include <hipcub/hipcub.hpp>
 #endif
-
-#include <cstdlib>
-#include <cstring>
-
-namespace {
-
-bool ds4_env_flag_enabled(const char * name) {
-    const char * value = std::getenv(name);
-    return value && value[0] != '\0' && std::strcmp(value, "0") != 0;
-}
-
-}  // namespace
 
 #ifdef CUB_TOP_K_AVAILABLE
 

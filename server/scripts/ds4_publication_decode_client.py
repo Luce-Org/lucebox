@@ -126,10 +126,14 @@ def stream_request(
                         first_token_at = time.perf_counter()
                     text_parts.append(str(piece))
     except urllib.error.HTTPError as exc:
+        try:
+            error_body = exc.read().decode("utf-8", errors="replace")[-4000:]
+        except (OSError, http.client.HTTPException) as body_error:
+            error_body = f"could not read HTTP error response: {body_error!r}"
         return {
             "ok": False,
             "status": exc.code,
-            "error": exc.read().decode("utf-8", errors="replace")[-4000:],
+            "error": error_body,
         }
     except (
         urllib.error.URLError,

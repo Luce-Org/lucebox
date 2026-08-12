@@ -74,15 +74,18 @@ static bool configure_dspark_mmvq_defaults(int gpu) {
             return false;
         }
         fp4_x4 = std::getenv("DFLASH_CUDA_MMVQ_FP4_X4");
-        if (!fp4_x4 || std::strcmp(fp4_x4, "1") != 0) {
+        // Zero deliberately selects the generic five-column MMVQ fallback.
+        if (!fp4_x4 ||
+            (std::strcmp(fp4_x4, "0") != 0 &&
+             std::strcmp(fp4_x4, "1") != 0)) {
             std::fprintf(stderr,
-                         "[deepseek4] q5 requires "
-                         "DFLASH_CUDA_MMVQ_FP4_X4=1\n");
+                         "[deepseek4] DFLASH_CUDA_MMVQ_FP4_X4 must be 0 or 1\n");
             return false;
         }
 
         cudaDeviceProp prop{};
-        if (std::getenv("DFLASH_CUDA_MMVQ_FP4_Q5_X4_PLUS1") == nullptr &&
+        if (std::strcmp(fp4_x4, "1") == 0 &&
+            std::getenv("DFLASH_CUDA_MMVQ_FP4_Q5_X4_PLUS1") == nullptr &&
             cudaGetDeviceProperties(&prop, gpu) == cudaSuccess &&
             std::strncmp(prop.gcnArchName, "gfx1201", 7) == 0 &&
             ::setenv("DFLASH_CUDA_MMVQ_FP4_Q5_X4_PLUS1", "1", 0) == 0) {

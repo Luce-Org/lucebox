@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import http.client
 import io
+import os
+import subprocess
 import sys
 import unittest
 from contextlib import redirect_stderr
@@ -9,6 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
+QUALIFIER = SCRIPTS_DIR / "qualify_ds4_q5_amd.sh"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import ds4_context_sweep  # noqa: E402
@@ -29,6 +32,14 @@ class _StreamingResponse:
 
     def __iter__(self):
         return iter(self._lines)
+
+
+class _TruncatedErrorBody:
+    def read(self) -> bytes:
+        raise http.client.IncompleteRead(b"partial")
+
+    def close(self) -> None:
+        pass
 
 
 class PublicationClientTests(unittest.TestCase):
@@ -79,6 +90,27 @@ class PublicationClientTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("IncompleteRead", result["error"])
 
+    def test_incomplete_http_error_body_is_reported(self) -> None:
+        error = ds4_publication_decode_client.urllib.error.HTTPError(
+            "http://127.0.0.1:1/v1/chat/completions",
+            503,
+            "Service Unavailable",
+            {},
+            _TruncatedErrorBody(),
+        )
+        with mock.patch.object(
+            ds4_publication_decode_client.urllib.request,
+            "urlopen",
+            side_effect=error,
+        ):
+            result = ds4_publication_decode_client.stream_request(
+                "http://127.0.0.1:1", "dflash", "prompt", max_tokens=2
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], 503)
+        self.assertIn("IncompleteRead", result["error"])
+
     def test_zero_runs_is_rejected(self) -> None:
         argv = ["publication-client", "--json-out", "unused.json", "--runs", "0"]
         with (
@@ -89,6 +121,43 @@ class PublicationClientTests(unittest.TestCase):
             ds4_publication_decode_client.main()
 
         self.assertEqual(error.exception.code, 2)
+
+
+class QualifierPreflightTests(unittest.TestCase):
+    def run_qualifier(self, **overrides: str) -> subprocess.CompletedProcess[str]:
+        fixture = str(Path(__file__).resolve())
+        environment = os.environ.copy()
+        environment.pop("HIP_VISIBLE_DEVICES", None)
+        environment.pop("ROCR_VISIBLE_DEVICES", None)
+        environment.update(
+            {
+                "TARGET_MODEL": fixture,
+                "DRAFT_MODEL": fixture,
+                "HOTNESS_CSV": fixture,
+                "SERVER_BIN": sys.executable,
+                "TOKENIZER_HARNESS": sys.executable,
+                **overrides,
+            }
+        )
+        return subprocess.run(
+            ["bash", str(QUALIFIER)],
+            capture_output=True,
+            check=False,
+            env=environment,
+            text=True,
+        )
+
+    def test_leading_zero_integer_is_rejected(self) -> None:
+        result = self.run_qualifier(PORT="08")
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("decimal integer", result.stderr)
+
+    def test_reordered_visible_devices_are_rejected(self) -> None:
+        result = self.run_qualifier(HIP_VISIBLE_DEVICES="1,0")
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("must be unset or exactly 0,1", result.stderr)
 
 
 class ContextSummaryTests(unittest.TestCase):
