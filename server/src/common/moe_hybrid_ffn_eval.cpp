@@ -1,5 +1,6 @@
 #include "moe_hybrid_ffn_eval.h"
 #include "cuda_graph_overrides.h"
+#include "heterogeneous_stage_planner.h"
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -12,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <future>
+#include <limits>
 #include <mutex>
 
 namespace dflash::common {
@@ -131,14 +133,28 @@ const MoeHybridGraphPolicy & moe_hybrid_graph_policy() {
     return policy;
 }
 
-static int dynamic_route_balance_main_slots_x4() {
-    static const int slots_x4 = [] {
+// The serial balanced-owner assignment is qualified for the q=5 DSpark
+// verifier. Wider batches retain the ordinary parallel owner remap.
+constexpr int kDynamicRouteBalanceMaxTokens = 5;
+
+static int dynamic_route_balance_main_slots_x4(
+        int n_used,
+        double * derived_main_to_peer_rate) {
+    struct DynamicRouteBalanceConfig {
+        bool enabled = false;
+        bool valid = true;
+        long explicit_main_slots_x4 = 0;
+        double main_to_peer_rate = 0.0;
+    };
+    static const DynamicRouteBalanceConfig config = [] {
+        DynamicRouteBalanceConfig result;
         const char * enabled = moe_policy_env(
             "DFLASH_MOE_TP_DYNAMIC_ROUTE_BALANCE",
             "DFLASH_DS4_TP_DYNAMIC_ROUTE_BALANCE");
         if (!enabled || !*enabled || std::strcmp(enabled, "0") == 0) {
-            return 0;
+            return result;
         }
+        result.enabled = true;
         const char * raw_slots_x4 = moe_policy_env(
             "DFLASH_MOE_TP_DYNAMIC_MAIN_SLOTS_X4",
             "DFLASH_DS4_TP_DYNAMIC_MAIN_SLOTS_X4");
@@ -148,41 +164,86 @@ static int dynamic_route_balance_main_slots_x4() {
         const char * raw_slots = moe_policy_env(
             "DFLASH_MOE_TP_DYNAMIC_MAIN_SLOTS",
             "DFLASH_DS4_TP_DYNAMIC_MAIN_SLOTS");
-        const char * raw = "3";
-        long minimum = 1;
-        long maximum = 6;
-        int scale = 4;
+        const char * raw = raw_slots;
+        long scale = 4L;
         if (raw_slots_x4 && *raw_slots_x4) {
             raw = raw_slots_x4;
-            minimum = 4;
-            maximum = 24;
-            scale = 1;
+            scale = 1L;
         } else if (raw_slots_x2 && *raw_slots_x2) {
             raw = raw_slots_x2;
-            minimum = 2;
-            maximum = 12;
-            scale = 2;
-        } else if (raw_slots && *raw_slots) {
-            raw = raw_slots;
+            scale = 2L;
+        }
+        if (raw && *raw) {
+            errno = 0;
+            char * end = nullptr;
+            const long value = std::strtol(raw, &end, 10);
+            if (errno == ERANGE || end == raw || *end != '\0' || value <= 0 ||
+                value > std::numeric_limits<long>::max() / scale) {
+                result.valid = false;
+                return result;
+            }
+            result.explicit_main_slots_x4 = scale * value;
+            return result;
         }
 
-        errno = 0;
-        char * end = nullptr;
-        const long requested = std::strtol(raw, &end, 10);
-        if (errno == ERANGE || end == raw || *end != '\0' ||
-            requested < minimum || requested > maximum) {
+        // The legacy top-4 default assigned three routes to the main owner.
+        // Express that as a 3:1 rate so the same policy scales with model top-k.
+        result.main_to_peer_rate = 3.0;
+        const char * raw_rate = moe_policy_env(
+            "DFLASH_MOE_TP_MAIN_TO_PEER_RATE",
+            "DFLASH_DS4_TP_MAIN_TO_PEER_RATE");
+        if (raw_rate && *raw_rate) {
+            errno = 0;
+            char * end = nullptr;
+            const double value = std::strtod(raw_rate, &end);
+            if (errno == ERANGE || end == raw_rate || *end != '\0' ||
+                !std::isfinite(value) || value <= 0.0) {
+                result.valid = false;
+                return result;
+            }
+            result.main_to_peer_rate = value;
+        }
+        return result;
+    }();
+
+    if (derived_main_to_peer_rate) {
+        *derived_main_to_peer_rate = 0.0;
+    }
+    if (!config.enabled) return 0;
+    if (n_used <= 0 || n_used > std::numeric_limits<int>::max() / 4) {
+        static std::once_flag invalid_top_k_log;
+        std::call_once(invalid_top_k_log, [n_used] {
+            std::fprintf(stderr,
+                "[moe-hybrid] dynamic route balance disabled: invalid "
+                "top-k=%d\n", n_used);
+        });
+        return 0;
+    }
+
+    long requested_x4 = config.explicit_main_slots_x4;
+    if (!config.valid) {
+        requested_x4 = -1;
+    } else if (requested_x4 == 0 && config.main_to_peer_rate > 0.0) {
+        const HeterogeneousStagePlan plan =
+            plan_balanced_heterogeneous_stage_width(
+                4 * n_used, 1, config.main_to_peer_rate, 1.0);
+        requested_x4 = plan.valid() ? plan.main_width : -1;
+        if (derived_main_to_peer_rate) {
+            *derived_main_to_peer_rate = config.main_to_peer_rate;
+        }
+    }
+    if (requested_x4 < 4 || requested_x4 > 4L * n_used) {
+        static std::once_flag invalid_log;
+        std::call_once(invalid_log, [n_used] {
             std::fprintf(stderr,
                 "[moe-hybrid] dynamic route balance disabled: "
-                "main slot quota is malformed or out of range\n");
-            return 0;
-        }
-        const int requested_x4 = (int) requested * scale;
-        std::fprintf(stderr,
-            "[moe-hybrid] dynamic route balance requested: main_slots=%.2f\n",
-            0.25 * (double) requested_x4);
-        return requested_x4;
-    }();
-    return slots_x4;
+                "four times the main slot quota must be in [4,%ld] "
+                "for top-k=%d\n",
+                4L * n_used, n_used);
+        });
+        return 0;
+    }
+    return (int) requested_x4;
 }
 
 static void add_hybrid_telemetry(MoeHybridFfnTelemetry & dst,
@@ -1093,40 +1154,53 @@ bool build_moe_hybrid_ffn_graph(
         &out.cold_local_lut, &out.cold_valid_lut,
         &out.cold_remap_nodes, &out.cold_nodes};
 
-    const bool secondary_has_all_experts =
-        secondary_owner.available() && secondary_owner.local_by_global &&
+    double derived_main_to_peer_rate = 0.0;
+    int dynamic_main_slots_x4 =
+        route_balance == MoeHybridRouteBalance::Allowed
+            ? dynamic_route_balance_main_slots_x4(
+                  n_used, &derived_main_to_peer_rate)
+            : 0;
+
+    const bool complete_secondary_map =
+        secondary_owner.local_by_global &&
         (int) secondary_owner.local_by_global->size() == cfg.n_expert &&
-        std::all_of(
+        std::none_of(
             secondary_owner.local_by_global->begin(),
             secondary_owner.local_by_global->end(),
-            [](int32_t local) { return local >= 0; });
-    const int requested_main_slots_x4 =
-        route_balance == MoeHybridRouteBalance::Allowed &&
-                primary_owner.available()
-            ? dynamic_route_balance_main_slots_x4()
-            : 0;
-    if (requested_main_slots_x4 > 0 && !secondary_has_all_experts) {
-        static std::once_flag warning_once;
-        std::call_once(warning_once, [] {
+            [](int32_t local) { return local < 0; });
+    if (dynamic_main_slots_x4 > 0 &&
+        (n_tokens > kDynamicRouteBalanceMaxTokens ||
+         !primary_owner.available() ||
+         !secondary_owner.available() || !complete_secondary_map)) {
+        static std::once_flag fallback_log;
+        std::call_once(fallback_log, [n_tokens] {
             std::fprintf(stderr,
-                "[moe-hybrid] dynamic route balance disabled: "
-                "the secondary owner does not contain every expert\n");
+                "[moe-hybrid] dynamic route balance disabled for an "
+                "unsupported owner map or batch size (tokens=%d)\n",
+                n_tokens);
         });
+        dynamic_main_slots_x4 = 0;
     }
-    if (secondary_has_all_experts &&
-        requested_main_slots_x4 > 4 * n_used) {
-        static std::once_flag warning_once;
-        std::call_once(warning_once, [] {
-            std::fprintf(stderr,
-                "[moe-hybrid] dynamic main slot quota exceeds the route "
-                "width and was clamped\n");
-        });
-    }
-    const int dynamic_main_slots_x4 =
-        secondary_has_all_experts
-            ? std::min(requested_main_slots_x4, 4 * n_used)
-            : 0;
     out.dynamic_route_balance = dynamic_main_slots_x4 > 0;
+    if (dynamic_main_slots_x4 > 0) {
+        static std::once_flag active_log;
+        std::call_once(
+            active_log,
+            [dynamic_main_slots_x4, n_used, derived_main_to_peer_rate] {
+                if (derived_main_to_peer_rate > 0.0) {
+                    std::fprintf(stderr,
+                        "[moe-hybrid] dynamic route balance active: "
+                        "main_slots=%.2f top_k=%d main_to_peer_rate=%.3f\n",
+                        0.25 * (double) dynamic_main_slots_x4, n_used,
+                        derived_main_to_peer_rate);
+                } else {
+                    std::fprintf(stderr,
+                        "[moe-hybrid] dynamic route balance active: "
+                        "main_slots=%.2f\n",
+                        0.25 * (double) dynamic_main_slots_x4);
+                }
+            });
+    }
 
     // Keep graph construction order stable: both remaps, then both optional ID
     // alignments, then both expert branches.
