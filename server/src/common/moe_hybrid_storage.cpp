@@ -42,8 +42,8 @@ void unregister_mix_tensor(ggml_tensor * tensor) {
 
 }  // namespace
 
-void unregister_moe_hybrid_mix_tensors(MoeHybridStorage & storage) {
-    for (MoeHybridLayerStorage & layer : storage.layers) {
+void MoeHybridStorage::unregister_mix_tensors() {
+    for (MoeHybridLayerStorage & layer : layers) {
         unregister_mix_tensor(layer.gate_hot);
         unregister_mix_tensor(layer.up_hot);
         unregister_mix_tensor(layer.down_hot);
@@ -178,7 +178,7 @@ static ggml_tensor * new_like_with_expert_count(ggml_context * ctx, ggml_tensor 
 MoeHybridStorage::~MoeHybridStorage() {
     // Registry entries point into the owner buffers, so remove them before the
     // buffers can be released or their addresses reused.
-    unregister_moe_hybrid_mix_tensors(*this);
+    unregister_mix_tensors();
     if (prefill_route_alloc) {
         ggml_gallocr_free(prefill_route_alloc);
         prefill_route_alloc = nullptr;

@@ -28,6 +28,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <limits>
 #include <string>
 #include <array>
 #include <vector>
@@ -355,6 +356,7 @@ constexpr uint32_t DS4_P4MIX_C           = 2;          // codebooks per expert
 constexpr uint32_t DS4_P4MIX_K           = 8;          // levels per codebook
 constexpr uint32_t DS4_P4MIX_QK          = 32;         // MIX_QK block width (rocmfp3_mix.cu)
 constexpr uint8_t  DS4_P4MIX_MAX_MODE    = 1;          // 0 = fixed, 1 = adaptive
+constexpr uint32_t DS4_GUMIX_K           = 4;          // qtype-106 levels per codebook
 
 struct Ds4MixTable {
     ggml_type type;
@@ -364,7 +366,6 @@ struct Ds4MixTable {
     size_t books_per_expert;
     const std::vector<uint16_t> & books;
     const std::vector<uint8_t> & modes;
-    const std::vector<uint8_t> & rotations;
 };
 
 static bool ds4_register_compact_mix_tensor(
@@ -392,14 +393,28 @@ static bool ds4_register_compact_mix_tensor(
                      label.c_str(), (int) table.type);
         return false;
     }
+    const size_t expected_books_per_expert =
+        table.type == GGML_TYPE_Q3_1_ROCMFP3_MIX ? 2u * DS4_P4MIX_K
+                                                  : 2u * DS4_GUMIX_K;
+    if (table.books_per_expert != expected_books_per_expert ||
+        (size_t) table.n_experts >
+            std::numeric_limits<size_t>::max() / table.books_per_expert ||
+        global_expert_ids.size() > (size_t) table.n_experts ||
+        global_expert_ids.size() >
+            (size_t) std::numeric_limits<int>::max()) {
+        std::fprintf(stderr,
+                     "[deepseek4] compact mix metadata is too large for %s\n",
+                     label.c_str());
+        return false;
+    }
+    const size_t expected_books =
+        (size_t) table.n_experts * table.books_per_expert;
     if (target->type != table.type || !target->data ||
         target->ne[0] != (int64_t) table.in_dim ||
         target->ne[1] != (int64_t) table.out_dim ||
         target->ne[2] != (int64_t) global_expert_ids.size() ||
         table.modes.size() != table.n_experts ||
-        table.rotations.size() != table.n_experts ||
-        table.books.size() !=
-            (size_t) table.n_experts * table.books_per_expert) {
+        table.books.size() != expected_books) {
         std::fprintf(stderr,
                      "[deepseek4] invalid compact mix metadata for %s\n",
                      label.c_str());
@@ -409,7 +424,6 @@ static bool ds4_register_compact_mix_tensor(
     std::vector<uint16_t> books(
         global_expert_ids.size() * table.books_per_expert);
     std::vector<uint8_t> modes(global_expert_ids.size());
-    std::vector<uint8_t> rotations(global_expert_ids.size());
     std::vector<bool> seen(table.n_experts, false);
     for (size_t local = 0; local < global_expert_ids.size(); ++local) {
         const int32_t global = global_expert_ids[local];
@@ -431,19 +445,18 @@ static bool ds4_register_compact_mix_tensor(
             table.books.data() + (size_t) global * table.books_per_expert,
             table.books_per_expert * sizeof(uint16_t));
         modes[local] = table.modes[(size_t) global];
-        rotations[local] = table.rotations[(size_t) global];
     }
 
     if (table.type == GGML_TYPE_Q3_1_ROCMFP3_MIX) {
         ggml_cuda_rocmfp3_mix_register_host(
             target->data, target->nb[2], (int) global_expert_ids.size(),
             (int) table.out_dim, (int) table.in_dim, books.data(),
-            modes.data(), rotations.data());
+            modes.data());
     } else {
         ggml_cuda_rocmfp2_mix_register_host(
             target->data, target->nb[2], (int) global_expert_ids.size(),
             (int) table.out_dim, (int) table.in_dim, books.data(),
-            modes.data(), rotations.data());
+            modes.data());
     }
     registered_bases.push_back(target->data);
     return true;
@@ -692,9 +705,8 @@ static bool ds4_register_p4mix_sidecar(const std::string & gguf_path,
             std::fprintf(stderr, "[deepseek4] truncated p4mix entry (layer %u)\n", layer);
             ok = false; break;
         }
-        // Value validation: only modes 0/1 are decoded, and rotation is not yet
-        // implemented (the CUDA kernel ignores e.rotations), so a nonzero rotation
-        // would silently produce wrong output — reject it.
+        // Only modes 0/1 are decoded. Rotation is not implemented, so accepting
+        // a nonzero value would silently produce incorrect output.
         for (uint32_t e = 0; e < E && ok; ++e) {
             if (modes[e] > DS4_P4MIX_MAX_MODE) {
                 std::fprintf(stderr, "[deepseek4] p4mix layer %u expert %u unsupported mode %u\n",
@@ -711,13 +723,13 @@ static bool ds4_register_p4mix_sidecar(const std::string & gguf_path,
         if (hybrid) {
             const Ds4MixTable table{
                 GGML_TYPE_Q3_1_ROCMFP3_MIX, E, odim, idim,
-                (size_t) C * K, books, modes, rots};
+                (size_t) C * K, books, modes};
             ok = ds4_register_hybrid_mix_tensors(
                 *hybrid, layer, 2, table, registered_bases);
         } else {
             ggml_cuda_rocmfp3_mix_register_host(
                 dt->data, dt->nb[2], (int) E, (int) odim, (int) idim,
-                books.data(), modes.data(), rots.data());
+                books.data(), modes.data());
             registered_bases.push_back(dt->data);
         }
         if (!ok) break;
@@ -749,11 +761,9 @@ static bool ds4_register_p4mix_sidecar(const std::string & gguf_path,
 }
 constexpr int DS4_QTYPE_ROCMFP2_MIX = 106;  // GGML_TYPE_Q2_1_ROCMFP2_MIX
 
-// Read the "<gguf>.gumix.bin" sidecar and register each qtype-106 gate/up expert
-// tensor's device base + per-expert codebooks/modes with the CUDA/HIP decoder.
-// Mirrors ds4_register_p4mix_sidecar's contract and validation discipline; three
-// things genuinely differ, and each is why this is a separate function rather than
-// a parameterised one:
+// Read the "<gguf>.gumix.bin" sidecar and register each qtype-106 expert tensor's
+// device base and per-expert decode tables. This format differs from p4mix in
+// three ways:
 //
 //   1. TWO tensors per layer. The serving GGUF stores gate and up separately
 //      (ffn_gate_exps / ffn_up_exps), so an entry carries a `surface` selector and
@@ -764,9 +774,7 @@ constexpr int DS4_QTYPE_ROCMFP2_MIX = 106;  // GGML_TYPE_Q2_1_ROCMFP2_MIX
 //      is keyed by base pointer and frees what it owns, so sharing one buffer
 //      between two entries would double-free on unregister.
 //   3. No rotation field. The qtype-106 encoder never emits rotation, so the wire
-//      omits it entirely rather than carrying a byte that must always be zero. The
-//      kernel's register_host still takes a rotations argument, so zeros are
-//      passed explicitly.
+//      omits it entirely rather than carrying a byte that must always be zero.
 // ---- "<gguf>.dmix.bin": per-tensor codebooks for DENSE mix-qtype tensors ----
 // Registers dense (non-MoE) qtype-105/106 tensors -- the attention stack -- with the
 // device decoder. Motivated by measurement rather than symmetry: on attention the learned
@@ -977,18 +985,18 @@ static bool ds4_register_dmix_sidecar(const std::string & gguf_path,
             std::memcpy(books.data() + (size_t) sl * C * K, book_one.data(),
                         book_one.size() * 2);
         }
-        std::vector<uint8_t> modes(nslices, mode), rots(nslices, 0);
+        std::vector<uint8_t> modes(nslices, mode);
 
         const int in_dim  = (int) t->ne[0];
         const int out_dim = (int) (t->ne[1] / (int64_t) nslices);
         if (qtype == (uint32_t) DS4_QTYPE_ROCMFP3_MIX) {
             ggml_cuda_rocmfp3_mix_register_host(t->data, nb02, (int) nslices,
                                                 out_dim, in_dim, books.data(),
-                                                modes.data(), rots.data());
+                                                modes.data());
         } else {
             ggml_cuda_rocmfp2_mix_register_host(t->data, nb02, (int) nslices,
                                                 out_dim, in_dim, books.data(),
-                                                modes.data(), rots.data());
+                                                modes.data());
         }
         registered_bases.push_back(t->data);
         covered[layer][cls] = true;
@@ -1023,7 +1031,6 @@ static bool ds4_register_dmix_sidecar(const std::string & gguf_path,
 }
 
 constexpr uint32_t DS4_GUMIX_C        = 2;   // codebooks per expert
-constexpr uint32_t DS4_GUMIX_K        = 4;   // levels per codebook (2-bit codes)
 constexpr uint32_t DS4_GUMIX_SURFACES = 3;   // 0 = gate, 1 = up, 2 = down
 constexpr uint32_t DS4_GUMIX_QK       = 32;  // MIX_QK block width (rocmfp2_mix.cu)
 
@@ -1031,7 +1038,7 @@ static bool ds4_register_gumix_sidecar(const std::string & gguf_path,
                                       const TargetLoadPlan & plan,
                                       const DeepSeek4Weights & out,
                                       MoeHybridStorage * hybrid = nullptr) {
-    // required[layer][surface]: a qtype-106 gate/up expert resident on this shard.
+    // required[layer][surface]: a resident qtype-106 expert tensor on this shard.
     const size_t n_layers_out = out.layers.size();
     std::vector<std::array<bool, DS4_GUMIX_SURFACES>> required(
         n_layers_out, std::array<bool, DS4_GUMIX_SURFACES>{false, false, false});
@@ -1046,10 +1053,10 @@ static bool ds4_register_gumix_sidecar(const std::string & gguf_path,
             }
         }
     }
-    if (n_qtype106 == 0) return true;  // uniform (qtype-107) gate/up — nothing to do
+    if (n_qtype106 == 0) return true;  // uniform (qtype-107) experts — nothing to do
 
     if (plan.skip_expert_tensors && !hybrid) {
-        std::fprintf(stderr, "[deepseek4] qtype-106 gate/up experts not resident on this "
+        std::fprintf(stderr, "[deepseek4] qtype-106 experts not resident on this "
                      "shard (skip_expert_tensors) — fused decode disabled here\n");
         return true;
     }
@@ -1058,7 +1065,7 @@ static bool ds4_register_gumix_sidecar(const std::string & gguf_path,
     std::vector<uint8_t> sc_embedded;  // outlives f when the blob came from GGUF KV
     FILE * f = ds4_open_sidecar(gguf_path, "deepseek4.gumix.sidecar", ".gumix.bin", sc_embedded);
     if (!f) {
-        std::fprintf(stderr, "[deepseek4] qtype-106 gate/up experts require sidecar but it "
+        std::fprintf(stderr, "[deepseek4] qtype-106 experts require sidecar but it "
                      "is missing: %s\n", sc_path.c_str());
         return false;
     }
@@ -1160,7 +1167,6 @@ static bool ds4_register_gumix_sidecar(const std::string & gguf_path,
         }
 
         std::vector<uint8_t> modes(E);
-        std::vector<uint8_t> rots(E, 0);   // wire carries none; kernel ignores it
         std::vector<uint16_t> books(book_elems);
         if (std::fread(modes.data(), 1, E, f) != E ||
             std::fread(books.data(), sizeof(uint16_t), books.size(), f) != books.size()) {
@@ -1180,13 +1186,13 @@ static bool ds4_register_gumix_sidecar(const std::string & gguf_path,
         if (hybrid) {
             const Ds4MixTable table{
                 GGML_TYPE_Q2_1_ROCMFP2_MIX, E, odim, idim,
-                (size_t) C * K, books, modes, rots};
+                (size_t) C * K, books, modes};
             ok = ds4_register_hybrid_mix_tensors(
                 *hybrid, layer, surface, table, registered_bases);
         } else {
             ggml_cuda_rocmfp2_mix_register_host(
                 gt->data, gt->nb[2], (int) E, (int) odim, (int) idim,
-                books.data(), modes.data(), rots.data());
+                books.data(), modes.data());
             registered_bases.push_back(gt->data);
         }
         if (!ok) break;
@@ -1265,12 +1271,12 @@ bool register_deepseek4_moe_hybrid_mix_sidecars(
     TargetLoadPlan plan;
     plan.skip_expert_tensors = true;
     if (!ds4_register_gumix_sidecar(path, plan, w, &storage)) {
-        unregister_moe_hybrid_mix_tensors(storage);
+        storage.unregister_mix_tensors();
         if (err) *err = "failed to register compact qtype-106 expert tensors";
         return false;
     }
     if (!ds4_register_p4mix_sidecar(path, plan, w, &storage)) {
-        unregister_moe_hybrid_mix_tensors(storage);
+        storage.unregister_mix_tensors();
         if (err) *err = "failed to register compact qtype-105 expert tensors";
         return false;
     }
@@ -1812,13 +1818,9 @@ bool load_deepseek4_gguf_partial(const std::string & path,
     gguf_free(gctx);
     // Note: meta_ctx is now owned by out.ctx — do NOT free it here.
 
-    // qtype-105 mixed-policy down-experts: register per-expert codebooks now
-    // that tensor data pointers are final (no-op for uniform models). A qtype-105
-    // model with a missing/invalid/mismatched sidecar has no working decode path,
-    // so fail the load here rather than aborting at first decode.
-    // qtype-106 mixed-policy gate/up experts: same contract as the qtype-105 call
-    // below, on the other MoE surface. Registered first so a gate/up failure unwinds
-    // before any down-expert entries exist.
+    // Register mixed-expert decode tables after tensor data pointers are final.
+    // A missing or invalid table makes the corresponding qtype undecodable, so
+    // fail the load here instead of crashing on the first request.
     // Dense (attention) mix-qtype tensors first: a dense failure unwinds before any MoE
     // entries exist, keeping the teardown order the reverse of registration.
     if (!ds4_register_dmix_sidecar(path, out)) {
@@ -1829,7 +1831,7 @@ bool load_deepseek4_gguf_partial(const std::string & path,
     }
 
     if (!ds4_register_gumix_sidecar(path, plan, out)) {
-        std::fprintf(stderr, "[deepseek4] qtype-106 gate/up sidecar registration failed "
+        std::fprintf(stderr, "[deepseek4] qtype-106 sidecar registration failed "
                      "for %s\n", path.c_str());
         free_deepseek4_weights(out);
         return false;
@@ -2086,11 +2088,8 @@ void free_deepseek4_weights(DeepSeek4Weights & w) {
             ggml_cuda_rocmfp3_mix_unregister(dt->data);
         }
     }
-    // Same contract for qtype-106 gate/up, and it needs both halves: the gumix
-    // sidecar registers the SPLIT form, one entry per tensor, and each entry owns
-    // its own device copy of the (shared) codebooks — duplicated deliberately so
-    // that unregister can free per entry without double-freeing. Dropping only one
-    // half would still leak the other's codebooks and leave a stale range behind.
+    // qtype-106 can appear on gate, up, or down. Each tensor owns a separate
+    // registry entry and must be removed before its backing buffer is released.
     for (auto & L : w.layers) {
         ggml_tensor * const gu[3] = { L.ffn_gate_exps, L.ffn_up_exps,
                                       L.ffn_down_exps };

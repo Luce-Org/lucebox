@@ -64,13 +64,13 @@ constexpr size_t NB02 = 4096;
 void register_as(bool is105, const void * base) {
     const int K = is105 ? 8 : 4;
     std::vector<uint16_t> books((size_t) E * 2 * (size_t) K, 0x3f80);  // bf16 ~1.0
-    std::vector<uint8_t>  modes(E, 1), rots(E, 0);
+    std::vector<uint8_t>  modes(E, 1);
     if (is105) {
         ggml_cuda_rocmfp3_mix_register_host(base, NB02, E, OUT, IN,
-                                           books.data(), modes.data(), rots.data());
+                                           books.data(), modes.data());
     } else {
         ggml_cuda_rocmfp2_mix_register_host(base, NB02, E, OUT, IN,
-                                           books.data(), modes.data(), rots.data());
+                                           books.data(), modes.data());
     }
 }
 

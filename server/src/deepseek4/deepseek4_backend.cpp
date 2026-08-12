@@ -1411,6 +1411,15 @@ bool DeepSeek4Backend::init_hybrid_model() {
 #endif
 
     auto hybrid = std::make_shared<MoeHybridStorage>();
+    const auto fail_hybrid_init = [&]() {
+        stream_engine_.destroy();
+        hybrid.reset();
+        if (expert_backend_) {
+            ggml_backend_free(expert_backend_);
+            expert_backend_ = nullptr;
+        }
+        return false;
+    };
     MoeHybridConfig hybrid_cfg = make_ds4_parent_worker_cfg(w_);
     if (inprocess_tp) {
         const int expert_gpu = tp.secondary_gpu;
@@ -1451,12 +1460,7 @@ bool DeepSeek4Backend::init_hybrid_model() {
             cfg_.model_path, backend_, w_, moe_placement_, &hybrid_cfg,
             *hybrid, &err, expert_backend_)) {
         std::fprintf(stderr, "[deepseek4] failed to build hybrid expert storage: %s\n", err.c_str());
-        hybrid.reset();
-        if (expert_backend_) {
-            ggml_backend_free(expert_backend_);
-            expert_backend_ = nullptr;
-        }
-        return false;
+        return fail_hybrid_init();
     }
     if (same_runtime_tp && has_mix_experts &&
         !register_deepseek4_moe_hybrid_mix_sidecars(
@@ -1464,12 +1468,7 @@ bool DeepSeek4Backend::init_hybrid_model() {
         std::fprintf(stderr,
                      "[deepseek4] failed to register hybrid mixed experts: %s\n",
                      err.c_str());
-        hybrid.reset();
-        if (expert_backend_) {
-            ggml_backend_free(expert_backend_);
-            expert_backend_ = nullptr;
-        }
-        return false;
+        return fail_hybrid_init();
     }
 
     // The physical placement is shared by both phases. Decode may own only a
@@ -1480,7 +1479,7 @@ bool DeepSeek4Backend::init_hybrid_model() {
                 w_.n_layer, w_.n_expert, w_.n_expert_used)) {
             std::fprintf(stderr,
                          "[deepseek4] decode placement dimensions are invalid\n");
-            return false;
+            return fail_hybrid_init();
         }
         for (int il = 0; il < w_.n_layer; ++il) {
             MoeHybridLayerStorage & layer = hybrid->layers[(size_t) il];
@@ -1494,7 +1493,7 @@ bool DeepSeek4Backend::init_hybrid_model() {
                                  "[deepseek4] decode owner expert %d in layer "
                                  "%d is not resident\n",
                                  (int) expert, il);
-                    return false;
+                    return fail_hybrid_init();
                 }
                 layer.decode_hot_local_by_global[(size_t) expert] =
                     layer.hot_local_by_global[(size_t) expert];
@@ -1512,12 +1511,12 @@ bool DeepSeek4Backend::init_hybrid_model() {
         }
         if (max_expert_bytes == 0) {
             std::fprintf(stderr, "[deepseek4] failed to compute streaming expert size\n");
-            return false;
+            return fail_hybrid_init();
         }
         if (!stream_engine_.init(backend_, max_expert_bytes, &err)) {
             std::fprintf(stderr, "[deepseek4] failed to init cold-expert stream engine: %s\n",
                          err.c_str());
-            return false;
+            return fail_hybrid_init();
         }
         std::fprintf(stderr,
                      "[deepseek4] cold-expert stream engine ready: pinned=%.1f MiB scratch=%.1f MiB\n",
