@@ -226,6 +226,10 @@ struct MoeHybridStorage {
     bool matches(const MoeHybridConfig & cfg) const;
     bool empty() const;
     bool has_mmap() const { return mmap_data != nullptr && mmap_size > 0; }
+
+    // Decode/verify graph arenas are shape caches, not model state. Release
+    // them before a new bulk prefill needs substantially larger workspaces.
+    void release_graph_caches();
 };
 
 // Expert tensor file data for split loading (one entry per expert tensor).

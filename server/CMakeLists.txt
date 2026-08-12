@@ -177,6 +177,16 @@ endif()
 option(DFLASH27B_FA_ALL_QUANTS "Compile ggml-cuda fattn kernels for all KV-quant pairs" ON)
 set(GGML_CUDA_FA_ALL_QUANTS ${DFLASH27B_FA_ALL_QUANTS} CACHE BOOL "" FORCE)
 
+# Some third-party qtype-107 GGUFs encode one affine (scale, offset) pair per
+# 32-weight block instead of the original two-scale layout. This is a wire
+# format choice, so keep it explicit and build-wide.
+option(DFLASH27B_ROCMFP2_AFFINE
+    "Interpret qtype-107 ROCmFP2 blocks as affine code*scale-offset weights"
+    OFF)
+if(DFLASH27B_ROCMFP2_AFFINE)
+    add_compile_definitions(ROCMFP2_AFFINE=1)
+endif()
+
 # HIP Phase 2 — opt-in rocWMMA flashprefill kernels (Strix Halo / gfx1151).
 # Default OFF (Phase 1 = ggml q8 fallback). Set ON for the 1.7-2.7× compress
 # speedup at 8K-32K context. Requires rocwmma headers installed under
@@ -357,6 +367,10 @@ if(DFLASH27B_GPU_BACKEND STREQUAL "hip" OR
     )
     target_include_directories(ggml-hip BEFORE PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src/hip_compat)
+    # HIP's clang driver otherwise finds Ubuntu's older libamdhip64 before the
+    # configured ROCm runtime when it expands --hip-link.
+    get_filename_component(_dflash_hip_runtime_dir "${hip_DIR}/../.." ABSOLUTE)
+    add_link_options("-L${_dflash_hip_runtime_dir}")
 endif()
 
 if(DFLASH27B_ENABLE_MIXED_CUDA_HIP)
@@ -989,6 +1003,11 @@ if(DFLASH27B_TESTS)
         else()
             target_link_libraries(test_deepseek4_mmid_grouped_cuda PRIVATE CUDA::cudart)
         endif()
+        # The grouped test includes rocmfpx.h unconditionally; expose it to both
+        # backends (previously only HIP resolved it, so the default CUDA build
+        # could not compile this target).
+        target_include_directories(test_deepseek4_mmid_grouped_cuda PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/rocmfpx)
         target_link_libraries(test_deepseek4_mmid_grouped_cuda PRIVATE
             ggml ${DFLASH27B_GGML_BACKEND_TARGET})
         list(APPEND _raw_unit_test_targets test_deepseek4_mmid_grouped_cuda)

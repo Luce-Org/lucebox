@@ -2544,6 +2544,18 @@ TEST_CASE(ServerUnitFixture, test_max_output_alias_precedence_ignores_shadowed_i
     TEST_ASSERT(
         resolve_max_output_tokens({{"max_output_tokens", 200}}, 400) == 200);
     TEST_ASSERT(resolve_max_output_tokens(json::object(), 400) == 400);
+    // "Unlimited" sentinels from clients such as PocketPal must fall back
+    // to the default rather than yielding a zero-token budget.
+    TEST_ASSERT(
+        resolve_max_output_tokens({{"max_completion_tokens", -1}}, 400) == 400);
+    TEST_ASSERT(
+        resolve_max_output_tokens({{"max_completion_tokens", 0}}, 400) == 400);
+    TEST_ASSERT(
+        resolve_max_output_tokens({{"max_tokens", -1}}, 400) == 400);
+    TEST_ASSERT(
+        resolve_max_output_tokens({{"max_output_tokens", -1}}, 400) == 400);
+    TEST_ASSERT(
+        resolve_max_output_tokens({{"max_completion_tokens", 8}}, 400) == 8);
 }
 
 TEST_CASE(ServerUnitFixture, test_pflash_placement_same_backend_local) {

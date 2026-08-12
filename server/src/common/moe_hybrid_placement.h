@@ -20,9 +20,11 @@ struct MoeHybridRoutingStats;  // forward decl
 struct MoeHybridCriticalPathConfig {
     int active_experts = 0;
     int min_hot_per_layer = 0;
+    // Zero means no additional ceiling. A finite ceiling is useful when the
+    // per-layer graph scratch grows faster than the resident-weight budget.
+    int max_hot_per_layer = 0;
     double main_to_peer_rate = 1.0;
 };
-
 inline uint64_t moe_hybrid_core_bytes_from_memory(const char * log_prefix,
                                                   size_t gpu_free,
                                                   size_t gpu_total) {

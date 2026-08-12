@@ -215,13 +215,17 @@ static bool test_case(
 }
 
 int main() {
+    setenv("DFLASH_CUDA_MMQ_FP2_AFFINE", "1", 1);
+    setenv("DFLASH_CUDA_MMQ_FP2_AFFINE_GENERAL", "1", 1);
     hipDeviceProp_t properties{};
     if (hipGetDeviceProperties(&properties, 0) != hipSuccess) {
         std::fprintf(stderr, "failed to query HIP device 0\n");
         return 1;
     }
-    if (std::strncmp(properties.gcnArchName, "gfx1151", 7) != 0) {
-        std::printf("SKIP: ROCmFPX MMQ is gfx1151-only (found %s)\n", properties.gcnArchName);
+    if (std::strncmp(properties.gcnArchName, "gfx1151", 7) != 0 &&
+        std::strncmp(properties.gcnArchName, "gfx1100", 7) != 0) {
+        std::printf("SKIP: ROCmFPX MMQ test expects gfx1100/gfx1151 (found %s)\n",
+                    properties.gcnArchName);
         return 0;
     }
 
@@ -242,11 +246,29 @@ int main() {
     const Shape shapes[] = {
         {256, 64, 64, "full"},
         {288, 70, 67, "tail"},
+        {4096, 64, 7, "expert_gate_up_n7"},
+        {4096, 64, 16, "expert_gate_up_n16"},
+        {4096, 64, 31, "expert_gate_up_n31"},
+        {4096, 64, 33, "expert_gate_up_n33"},
+        {2048, 64, 7, "expert_down_n7"},
+        {2048, 64, 16, "expert_down_n16"},
+        {2048, 64, 31, "expert_down_n31"},
+        {2048, 64, 33, "expert_down_n33"},
+        {4096, 4096, 31, "actual_gate_up_n31"},
+        {2048, 4096, 31, "actual_down_n31"},
     };
+    const char * shape_filter = std::getenv("DFLASH_TEST_SHAPE");
 
     bool ok = true;
     for (const QuantCase & quant : quant_cases) {
         for (const Shape & shape : shapes) {
+            if (shape_filter && std::strcmp(shape.label, shape_filter) != 0) {
+                continue;
+            }
+            if (std::strncmp(shape.label, "actual_", 7) == 0 &&
+                quant.type != GGML_TYPE_Q2_0_ROCMFP2) {
+                continue;
+            }
             ok = test_case(hip_backend, quant, shape) && ok;
         }
     }

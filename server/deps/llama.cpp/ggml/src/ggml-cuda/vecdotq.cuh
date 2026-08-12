@@ -525,7 +525,23 @@ static __device__ __forceinline__ float vec_dot_rocmfpx_fp2_q8_1(
     }
 
     const float db = __low2float(bq8_1->ds);
+#ifdef ROCMFP2_AFFINE
+    // affine type-107: value = code*scale - offset, e[0]=scale, e[1]=offset.
+    // val_packed holds codebook(code) = code-1, so sumi = sum((c-1)*q) and the
+    // affine dot is scale*sum(c*q) - offset*sum(q) = scale*sumi + (scale-offset)*sumq.
+    const float scale  = rocmfpx_ue4m3_to_fp32_finite(bq2->e[0]);
+    const float offset = rocmfpx_ue4m3_to_fp32_finite(bq2->e[1]);
+    int sumq = 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int u = get_int_b4(bq8_1->qs, 4*iqs + j);
+        sumq += (int8_t)(u & 0xFF) + (int8_t)((u >> 8) & 0xFF)
+              + (int8_t)((u >> 16) & 0xFF) + (int8_t)((u >> 24) & 0xFF);
+    }
+    return db * (scale * sumi + (scale - offset) * sumq);
+#else
     return db * rocmfpx_ue4m3_to_fp32_finite(bq2->e[iqs]) * sumi;
+#endif
 }
 
 static __device__ __forceinline__ float vec_dot_rocmfpx_fp3_q8_1(

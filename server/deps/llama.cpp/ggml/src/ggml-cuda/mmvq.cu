@@ -137,7 +137,23 @@ static __device__ __forceinline__ float vec_dot_rocmfpx_fp2_q8_1_packed32(
     }
 
     const float db = __low2float(bq8_1->ds);
+#ifdef ROCMFP2_AFFINE
+    // affine type-107: value = code*scale - offset, e[0]=scale, e[1]=offset.
+    // val_packed holds codebook(code) = code-1, so the affine dot is
+    // scale*sumi + (scale-offset)*sumq (see vecdotq.cuh).
+    const float scale  = rocmfpx_ue4m3_to_fp32_finite(bq2->e[0]);
+    const float offset = rocmfpx_ue4m3_to_fp32_finite(bq2->e[1]);
+    int sumq = 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int u = get_int_b4(bq8_1->qs, 4*iqs + j);
+        sumq += (int8_t)(u & 0xFF) + (int8_t)((u >> 8) & 0xFF)
+              + (int8_t)((u >> 16) & 0xFF) + (int8_t)((u >> 24) & 0xFF);
+    }
+    return db * (scale * sumi + (scale - offset) * sumq);
+#else
     return db * rocmfpx_ue4m3_to_fp32_finite(bq2->e[iqs]) * sumi;
+#endif
 }
 
 // Dense q4 verification applies one weight row to four token activations.
@@ -409,7 +425,7 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
 //                               tokens unless enabled. The ROCmFP formats are
 //                               opt-in until qualified on each AMD target.
 #define MMID_GROUPED_MAX_PAIRS 256
-#define MMID_GROUPED_MAX_TPG   8
+#define MMID_GROUPED_MAX_TPG   2
 #define MMID_META_NG 0
 #define MMID_META_GE 1
 #define MMID_META_GS (MMID_META_GE + MMID_GROUPED_MAX_PAIRS)
@@ -1484,8 +1500,7 @@ static __global__ void mmid_group_prep(
 // their concurrent weight reads are served once from DRAM, then from L1/L2.
 // Weight traffic approaches (union of routed experts) instead of
 // (n_expert_used x n_tokens) expert-matrix reads.
-template <ggml_type type, int c_rows_per_block, bool has_fusion,
-          bool c_fp3_packed24 = false, bool c_fp2_packed32 = false>
+template <ggml_type type, int c_rows_per_block, bool has_fusion>
 __launch_bounds__(MMID_GROUPED_MAX_TPG*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_moe_grouped(
         const void * __restrict__ vx, const void * __restrict__ vy, const int32_t * __restrict__ meta,
@@ -1563,38 +1578,14 @@ static __global__ void mul_mat_vec_q_moe_grouped(
 
 #pragma unroll
         for (int i = 0; i < c_rows_per_block; ++i) {
-            if constexpr (type == GGML_TYPE_Q2_0_ROCMFP2 &&
-                          c_fp2_packed32) {
-                tmp[i] += vec_dot_rocmfpx_fp2_q8_1_packed32(
-                    vx, &y[kby],
-                    kbx_offset + i*stride_row_x + kbx, kqs);
-            } else if constexpr (type == GGML_TYPE_Q3_0_ROCMFPX &&
-                                 c_fp3_packed24) {
-                tmp[i] += vec_dot_rocmfpx_fp3_q8_1_packed24(
-                    vx, &y[kby],
-                    kbx_offset + i*stride_row_x + kbx, kqs);
-            } else {
-                tmp[i] += vec_dot_q_cuda(
-                    vx, &y[kby],
-                    kbx_offset + i*stride_row_x + kbx, kqs);
-            }
+            tmp[i] += vec_dot_q_cuda(
+                vx, &y[kby],
+                kbx_offset + i*stride_row_x + kbx, kqs);
             if constexpr (has_fusion) {
                 if (use_gate) {
-                    if constexpr (type == GGML_TYPE_Q2_0_ROCMFP2 &&
-                                  c_fp2_packed32) {
-                        tmp_gate[i] += vec_dot_rocmfpx_fp2_q8_1_packed32(
-                            vgate, &y[kby],
-                            kbx_offset + i*stride_row_x + kbx, kqs);
-                    } else if constexpr (type == GGML_TYPE_Q3_0_ROCMFPX &&
-                                         c_fp3_packed24) {
-                        tmp_gate[i] += vec_dot_rocmfpx_fp3_q8_1_packed24(
-                            vgate, &y[kby],
-                            kbx_offset + i*stride_row_x + kbx, kqs);
-                    } else {
-                        tmp_gate[i] += vec_dot_q_cuda(
-                            vgate, &y[kby],
-                            kbx_offset + i*stride_row_x + kbx, kqs);
-                    }
+                    tmp_gate[i] += vec_dot_q_cuda(
+                        vgate, &y[kby],
+                        kbx_offset + i*stride_row_x + kbx, kqs);
                 }
             }
         }
@@ -1658,8 +1649,7 @@ static __global__ void mul_mat_vec_q_moe_grouped(
     }
 }
 
-template <ggml_type type, bool c_fp3_packed24 = false,
-          bool c_fp2_packed32 = false>
+template <ggml_type type>
 static void mul_mat_vec_q_moe_grouped_launch(
         const void * vx, const void * vy, const int32_t * meta, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
@@ -1667,23 +1657,19 @@ static void mul_mat_vec_q_moe_grouped_launch(
         const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
         const int np, const int warp_size, cudaStream_t stream) {
 
-    constexpr int rows_per_block = 2;
+    constexpr int rows_per_block = 4;
     const int64_t nblocks_rows = (nrows_x + rows_per_block - 1)/rows_per_block;
     const dim3 block_nums(nblocks_rows, (np + MMID_GROUPED_MAX_TPG - 1)/MMID_GROUPED_MAX_TPG);
     const dim3 block_dims(warp_size, MMID_GROUPED_MAX_TPG);
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
     if (has_fusion) {
-        mul_mat_vec_q_moe_grouped<type, rows_per_block, true,
-                                  c_fp3_packed24,
-                                  c_fp2_packed32><<<block_nums, block_dims, 0, stream>>>(
+        mul_mat_vec_q_moe_grouped<type, rows_per_block, true><<<block_nums, block_dims, 0, stream>>>(
             vx, vy, meta, fusion, dst, (uint32_t) np, ncols_x, nchannels_y, nrows_x,
             stride_row_x, stride_col_y, stride_col_dst,
             stride_channel_x, stride_channel_y, stride_channel_dst);
     } else {
-        mul_mat_vec_q_moe_grouped<type, rows_per_block, false,
-                                  c_fp3_packed24,
-                                  c_fp2_packed32><<<block_nums, block_dims, 0, stream>>>(
+        mul_mat_vec_q_moe_grouped<type, rows_per_block, false><<<block_nums, block_dims, 0, stream>>>(
             vx, vy, meta, fusion, dst, (uint32_t) np, ncols_x, nchannels_y, nrows_x,
             stride_row_x, stride_col_y, stride_col_dst,
             stride_channel_x, stride_channel_y, stride_channel_dst);
@@ -1700,16 +1686,6 @@ static bool mul_mat_vec_q_grouped_dispatch(
 
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const uint3 nchannels_y_fd = init_fastdiv_values((uint32_t) nchannels_y);
-    static const bool fp3_packed24 = []() {
-        const char * e =
-            std::getenv("DFLASH_CUDA_MMVQ_MOE_FP3_PACKED24");
-        return e && e[0] == '1' && e[1] == '\0';
-    }();
-    static const bool fp2_packed32 = []() {
-        const char * e =
-            std::getenv("DFLASH_CUDA_MMVQ_MOE_FP2_PACKED32");
-        return e && e[0] == '1' && e[1] == '\0';
-    }();
 
     switch (type) {
         case GGML_TYPE_Q4_0:
@@ -1733,38 +1709,16 @@ static bool mul_mat_vec_q_grouped_dispatch(
                 stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst, max_groups, warp_size, stream);
             return true;
         case GGML_TYPE_Q2_0_ROCMFP2:
-            if (fp2_packed32) {
-                mul_mat_vec_q_moe_grouped_launch<
-                    GGML_TYPE_Q2_0_ROCMFP2, false, true>(
-                        vx, vy, meta, fusion, dst, ncols_x, nchannels_y_fd,
-                        nrows_x, stride_row_x, stride_col_y, stride_col_dst,
-                        stride_channel_x, stride_channel_y,
-                        stride_channel_dst, max_groups, warp_size, stream);
-            } else {
-                mul_mat_vec_q_moe_grouped_launch<
-                    GGML_TYPE_Q2_0_ROCMFP2>(
-                        vx, vy, meta, fusion, dst, ncols_x, nchannels_y_fd,
-                        nrows_x, stride_row_x, stride_col_y, stride_col_dst,
-                        stride_channel_x, stride_channel_y,
-                        stride_channel_dst, max_groups, warp_size, stream);
-            }
+            mul_mat_vec_q_moe_grouped_launch<GGML_TYPE_Q2_0_ROCMFP2>(
+                vx, vy, meta, fusion, dst, ncols_x, nchannels_y_fd, nrows_x,
+                stride_row_x, stride_col_y, stride_col_dst, stride_channel_x,
+                stride_channel_y, stride_channel_dst, max_groups, warp_size, stream);
             return true;
         case GGML_TYPE_Q3_0_ROCMFPX:
-            if (fp3_packed24) {
-                mul_mat_vec_q_moe_grouped_launch<
-                    GGML_TYPE_Q3_0_ROCMFPX, true, false>(
-                        vx, vy, meta, fusion, dst, ncols_x, nchannels_y_fd,
-                        nrows_x, stride_row_x, stride_col_y, stride_col_dst,
-                        stride_channel_x, stride_channel_y,
-                        stride_channel_dst, max_groups, warp_size, stream);
-            } else {
-                mul_mat_vec_q_moe_grouped_launch<
-                    GGML_TYPE_Q3_0_ROCMFPX>(
-                        vx, vy, meta, fusion, dst, ncols_x, nchannels_y_fd,
-                        nrows_x, stride_row_x, stride_col_y, stride_col_dst,
-                        stride_channel_x, stride_channel_y,
-                        stride_channel_dst, max_groups, warp_size, stream);
-            }
+            mul_mat_vec_q_moe_grouped_launch<GGML_TYPE_Q3_0_ROCMFPX>(
+                vx, vy, meta, fusion, dst, ncols_x, nchannels_y_fd, nrows_x,
+                stride_row_x, stride_col_y, stride_col_dst, stride_channel_x,
+                stride_channel_y, stride_channel_dst, max_groups, warp_size, stream);
             return true;
         default:
             return false;
@@ -1996,11 +1950,13 @@ static void mul_mat_vec_q_moe_launch(
             std::getenv("DFLASH_CUDA_MMVQ_MOE_Q4_WARP_GROUPS");
         return e && e[0] == '2' && e[1] == '\0';
     }();
-    static const bool fp3_packed24 = []() {
+    static const bool fp3_packed24_configured = []() {
         const char * e =
             std::getenv("DFLASH_CUDA_MMVQ_MOE_FP3_PACKED24");
         return e && e[0] == '1' && e[1] == '\0';
     }();
+    const bool fp3_packed24 = fp3_packed24_configured &&
+        std::getenv("DFLASH_CUDA_MMVQ_MOE_FP3_PACKED24_RUNTIME_DISABLE") == nullptr;
     static const bool fp2_packed32 = []() {
         const char * e =
             std::getenv("DFLASH_CUDA_MMVQ_MOE_FP2_PACKED32");

@@ -1692,9 +1692,19 @@ static void test_hybrid_prefill_chunk_tokens() {
     TEST_ASSERT(deepseek4_hybrid_prefill_chunk_tokens(0, 8192) == 1);
     TEST_ASSERT(deepseek4_hybrid_prefill_chunk_tokens(
                     2048, 2048, 1024) == 1024);
+    TEST_ASSERT(deepseek4_hybrid_prefill_step_tokens(2048, 0, 70000) == 2048);
+    TEST_ASSERT(deepseek4_hybrid_prefill_step_tokens(
+                    2048, 30720, 70000) == 2048);
+    TEST_ASSERT(deepseek4_hybrid_prefill_step_tokens(
+                    2048, 31744, 70000) == 1024);
+    TEST_ASSERT(deepseek4_hybrid_prefill_step_tokens(
+                    2048, 32768, 70000) == 1024);
+    TEST_ASSERT(deepseek4_hybrid_prefill_step_tokens(
+                    512, 65536, 57) == 57);
+    TEST_ASSERT(deepseek4_hybrid_prefill_step_tokens(
+                    2048, 32768, 0) == 0);
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
-
 static void test_dspark_park_all_releases_drafter() {
     std::fprintf(stderr, "  test_dspark_park_all_releases_drafter ...");
 

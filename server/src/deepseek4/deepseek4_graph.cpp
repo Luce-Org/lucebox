@@ -4821,6 +4821,45 @@ struct DeepSeek4LayerRangeCache {
                owns_output == candidate_owns_output;
     }
 
+    // A decoded response leaves q=1 graphs and tail-chunk prefill arenas in
+    // VRAM. Before the first large chunk of the next request, release those
+    // reproducible shape-specific allocations so the new HC/attention graphs
+    // do not have to coexist with them at peak memory.
+    void prepare_for_new_prefill() {
+        shared_prefill_attn_alloc.free();
+        prefill_hc_pre_graph.free();
+        prefill_hc_post_graph.free();
+        prefill_moe_hc_post_graph.free();
+        for (auto & graph : cached_decode_attn_hc_pre_graphs) {
+            graph.free();
+        }
+        for (auto & graph : cached_decode_ffn_hc_pre_graphs) {
+            graph.free();
+        }
+        cached_decode_hc_post_graph.free();
+        for (auto & per_layer : cached_decode_attn_graphs) {
+            for (auto & graph : per_layer) graph.free();
+        }
+        for (auto & graph : cached_decode_ffn_graphs) graph.free();
+        cached_decode_output_graph.free();
+        cached_dynamic_output_alloc.free();
+        fused_decode_graph_cache.evict_graphs();
+        fused_verify_graph_cache.destroy();
+        fused_capture_graph_cache.destroy();
+        decode_shared_inputs.free();
+    }
+
+    // Successful heterogeneous prefill no longer needs any batch-width graph
+    // arenas. Retire them before speculative verification constructs its
+    // q<=8 graphs; weights, HC mirrors, KV, and captured features are owned by
+    // other objects and intentionally remain resident.
+    void release_prefill_scratch() {
+        shared_prefill_attn_alloc.free();
+        prefill_hc_pre_graph.free();
+        prefill_hc_post_graph.free();
+        prefill_moe_hc_post_graph.free();
+    }
+
     void reset() {
         for (auto & alloc : cached_attn_allocs) {
             alloc.free();
@@ -7016,6 +7055,44 @@ bool deepseek4_step_layer_range(
     auto & fused_decode_graph_cache = layer_range_cache.fused_decode_graph_cache;
     auto & decode_shared_inputs = layer_range_cache.decode_shared_inputs;
 
+    // Tiny request prefixes comfortably coexist with the verifier's cached
+    // q<=8 graphs. Evicting those graphs for every multi-token request turns
+    // steady-state speculative decode back into a cold graph-build path. The
+    // attention workspace starts its bulk growth regime at 512 tokens, so
+    // reserve the destructive cleanup for those genuinely large prefills.
+    constexpr int k_bulk_prefill_cleanup_tokens = 512;
+    if (heterogeneous_sparse_prefill && kv_start == 0 &&
+        n_tokens >= k_bulk_prefill_cleanup_tokens) {
+        ggml_backend_synchronize(backend);
+        if (moe_hybrid && moe_hybrid->cold_backend &&
+            moe_hybrid->cold_backend != backend) {
+            ggml_backend_synchronize(moe_hybrid->cold_backend);
+        }
+        layer_range_cache.prepare_for_new_prefill();
+        if (moe_hybrid) {
+            // Speculative verification also owns per-layer q<=8 MoE graph
+            // caches outside DeepSeek4LayerRangeCache. They can retain enough
+            // primary VRAM to make the next 2K-token attention arena fail,
+            // especially when the full cold verifier stack is duplicated.
+            moe_hybrid->release_graph_caches();
+            if (moe_hybrid->prefill_route_alloc) {
+                ggml_gallocr_free(moe_hybrid->prefill_route_alloc);
+                moe_hybrid->prefill_route_alloc = nullptr;
+            }
+            if (moe_hybrid->prefill_hot_alloc) {
+                ggml_gallocr_free(moe_hybrid->prefill_hot_alloc);
+                moe_hybrid->prefill_hot_alloc = nullptr;
+            }
+            if (moe_hybrid->prefill_cold_alloc) {
+                ggml_gallocr_free(moe_hybrid->prefill_cold_alloc);
+                moe_hybrid->prefill_cold_alloc = nullptr;
+            }
+        }
+        std::fprintf(stderr,
+                     "[deepseek4] released prior decode/tail arenas before "
+                     "new heterogeneous prefill\n");
+    }
+
     // Per-layer execution with CPU-side HC
     DeepSeek4LayerRangeScratch & scratch = layer_range_cache.scratch;
     const int n_expert_used = ds4_effective_expert_count(w);
@@ -7416,11 +7493,42 @@ bool deepseek4_step_layer_range(
                     if (!build_cached_decode_attn_graph(candidate, backend, w, L, lc, il, kv_start,
                                                         n_raw, n_comp_attn, n_index_comp,
                                                         shared_inputs)) {
-                        std::fprintf(stderr, "[deepseek4] cached attn graph alloc failed layer %d\n", il);
-                        return false;
+                        // Out of memory (tight primary GPU in split mode):
+                        // the decode attention graphs accumulate one ~16 MiB
+                        // entry per (layer, shape) as n_comp grows. Evict all
+                        // reproducible decode/prefill caches and retry once
+                        // before giving up.
+                        std::fprintf(stderr,
+                                     "[deepseek4] cached attn graph alloc failed layer %d; "
+                                     "evicting decode caches and retrying\n", il);
+                        ggml_backend_synchronize(backend);
+                        for (auto & other : cached_decode_attn_graphs) {
+                            for (auto & g : other) g.free();
+                            other.clear();
+                        }
+                        layer_range_cache.shared_prefill_attn_alloc.free();
+                        for (auto & alloc : layer_range_cache.cached_attn_allocs) {
+                            alloc.free();
+                        }
+                        layer_range_cache.fused_decode_graph_cache.evict_graphs();
+                        layer_range_cache.fused_verify_graph_cache.destroy();
+                        layer_range_cache.fused_capture_graph_cache.destroy();
+                        per_layer.emplace_back();
+                        auto & candidate2 = per_layer.back();
+                        if (!build_cached_decode_attn_graph(
+                                candidate2, backend, w, L, lc, il, kv_start,
+                                n_raw, n_comp_attn, n_index_comp,
+                                shared_inputs)) {
+                            std::fprintf(stderr,
+                                         "[deepseek4] cached attn graph alloc failed layer %d "
+                                         "after eviction\n", il);
+                            return false;
+                        }
+                        it = std::prev(per_layer.end());
+                    } else {
+                        it = std::prev(per_layer.end());
                     }
                     if (telemetry) telemetry->attn_build_us += ds4_elapsed_us(attn_build_t0, Ds4TimingClock::now());
-                    it = std::prev(per_layer.end());
                 }
                 cached_attn = &*it;
                 gf = cached_attn->sg.gf;
@@ -7536,8 +7644,43 @@ bool deepseek4_step_layer_range(
                         ggml_backend_cuda_get_device_memory(
                             device, &free_bytes, &total_bytes);
                         (void) total_bytes;
+                        // The route and hot-owner arenas belong to the
+                        // preceding layer at this point. Aggregate HIP free
+                        // memory can look sufficient while no individual
+                        // chunk is large enough for the replacement attention
+                        // arena, so retire these completed workspaces on every
+                        // growth instead of relying solely on the byte count.
+                        // They are recreated lazily by the FFN later in this
+                        // layer and contain no persistent model state.
+                        if (moe_hybrid &&
+                            (moe_hybrid->prefill_route_alloc ||
+                             moe_hybrid->prefill_hot_alloc)) {
+                            ggml_backend_synchronize(backend);
+                            if (moe_hybrid->cold_backend &&
+                                moe_hybrid->cold_backend != backend) {
+                                ggml_backend_synchronize(
+                                    moe_hybrid->cold_backend);
+                            }
+                            if (moe_hybrid->prefill_route_alloc) {
+                                ggml_gallocr_free(
+                                    moe_hybrid->prefill_route_alloc);
+                                moe_hybrid->prefill_route_alloc = nullptr;
+                            }
+                            if (moe_hybrid->prefill_hot_alloc) {
+                                ggml_gallocr_free(
+                                    moe_hybrid->prefill_hot_alloc);
+                                moe_hybrid->prefill_hot_alloc = nullptr;
+                            }
+                        }
+                        // HIP may split a ~650 MiB gallocr reservation into
+                        // several backend buffers. At tightly packed DS4
+                        // placements the nominal free-byte check can pass
+                        // while the largest follow-up chunk still fails due
+                        // to fragmentation and layer-local owner workspaces.
+                        // Evict those reproducible workspaces earlier so the
+                        // final DSpark capture band has a contiguous cushion.
                         constexpr size_t growth_margin =
-                            128u * 1024u * 1024u;
+                            384u * 1024u * 1024u;
                         const size_t replaceable_bytes =
                             free_bytes + attn_bytes_before;
                         if (replaceable_bytes < required_bytes + growth_margin) {
@@ -7558,6 +7701,22 @@ bool deepseek4_step_layer_range(
                             // their F16 HC mirrors are required by the active
                             // prefill and must remain resident.
                             layer_range_cache.fused_decode_graph_cache.evict_graphs();
+                            // The previous layer's routing and hot-owner
+                            // workspaces are also complete. On large chunks
+                            // they can otherwise prevent the shared attention
+                            // arena from growing by only a few dozen MiB.
+                            if (moe_hybrid) {
+                                if (moe_hybrid->prefill_route_alloc) {
+                                    ggml_gallocr_free(
+                                        moe_hybrid->prefill_route_alloc);
+                                    moe_hybrid->prefill_route_alloc = nullptr;
+                                }
+                                if (moe_hybrid->prefill_hot_alloc) {
+                                    ggml_gallocr_free(
+                                        moe_hybrid->prefill_hot_alloc);
+                                    moe_hybrid->prefill_hot_alloc = nullptr;
+                                }
+                            }
                             size_t free_after_evict = 0;
                             ggml_backend_cuda_get_device_memory(
                                 device, &free_after_evict, &total_bytes);
@@ -7571,6 +7730,30 @@ bool deepseek4_step_layer_range(
                                 attn_bytes_before / (1024.0 * 1024.0),
                                 free_bytes / (1024.0 * 1024.0),
                                 free_after_evict / (1024.0 * 1024.0));
+                        }
+                        // ggml_gallocr grows its backend buffer by allocating
+                        // the replacement before releasing the current arena.
+                        // On tightly packed heterogeneous placements even a
+                        // tiny shape increase can therefore require roughly
+                        // twice the whole prefill scratch allocation. No node
+                        // from the previous layer/chunk remains live here, so
+                        // release the old arena first and recreate the
+                        // allocator before assigning this graph's tensors.
+                        if (attn_bytes_before > 0) {
+                            ggml_backend_synchronize(backend);
+                            attn_alloc.free();
+                            attn_alloc.alloc =
+                                ggml_gallocr_new_with_max_chunk_size(
+                                    ggml_backend_get_default_buffer_type(
+                                        backend),
+                                    shared_prefill_max_chunk);
+                            attn_alloc.owner_ctx = w.ctx;
+                            attn_alloc.backend = backend;
+                            std::fprintf(stderr,
+                                "[deepseek4] released %.1f MiB shared "
+                                "prefill scratch before %.1f MiB growth\n",
+                                attn_bytes_before / (1024.0 * 1024.0),
+                                required_bytes / (1024.0 * 1024.0));
                         }
                     }
                 }
@@ -7690,6 +7873,38 @@ bool deepseek4_step_layer_range(
                               n_hc);
                 std::memcpy(hc_state.data(), next_hc.data(), next_hc.size() * sizeof(float));
                 if (telemetry) telemetry->hc_post_attn_us += ds4_elapsed_us(hc_post_attn_t0, Ds4TimingClock::now());
+            }
+        }
+
+        // At long contexts the shared attention arena grows past the point
+        // where it can coexist with the primary-owner expert workspace on a
+        // tightly packed discrete GPU. The attention result has already been
+        // copied into, and consumed by, the persistent HC-post graph above;
+        // no attention tensor remains live for the FFN. Retire only these
+        // large arenas here. The next layer recreates one after releasing the
+        // preceding hot-owner workspace, keeping the normal <=12K fast path
+        // allocation-free across layers.
+        constexpr int k_long_context_attn_release_pos = 14336;
+        constexpr size_t k_long_context_attn_release_bytes =
+            384u * 1024u * 1024u;
+        if (!ds4_env_flag(
+                "DFLASH_DS4_DISABLE_LONG_CONTEXT_ARENA_HANDOFF") &&
+            heterogeneous_sparse_prefill &&
+            kv_start >= k_long_context_attn_release_pos &&
+            shared_prefill_attn_alloc.alloc &&
+            ggml_gallocr_get_buffer_size(
+                shared_prefill_attn_alloc.alloc, 0) >=
+                k_long_context_attn_release_bytes) {
+            const size_t released_bytes = ggml_gallocr_get_buffer_size(
+                shared_prefill_attn_alloc.alloc, 0);
+            ggml_backend_synchronize(backend);
+            shared_prefill_attn_alloc.free();
+            static std::atomic<bool> logged_long_context_attn_release{false};
+            if (!logged_long_context_attn_release.exchange(true)) {
+                std::fprintf(stderr,
+                    "[deepseek4] long-context attention/FFN arena handoff "
+                    "active (released %.1f MiB)\n",
+                    released_bytes / (1024.0 * 1024.0));
             }
         }
 
@@ -7819,11 +8034,51 @@ bool deepseek4_step_layer_range(
                     : layer_storage.gate_cold;
                 const bool local_expert_runtime =
                     !expert_runtime || !expert_runtime->compute_ptr();
+                // The device-resident owner join is only populated when the
+                // FFN actually writes hot/cold outputs to device tensors
+                // (eval_ds4_layer_range_hybrid_ffn forwards device_outputs
+                // only when its device_ffn_input conditions hold). Mirror
+                // those conditions here: otherwise the moe HC-post graph
+                // reads never-written block_out/block_out_cold and the HC
+                // state becomes garbage.
+                ggml_tensor * hot_stack = layer_storage.gate_up_hot
+                    ? layer_storage.gate_up_hot
+                    : layer_storage.gate_hot;
+                const char * device_input_env =
+                    std::getenv("DFLASH_MOE_PREFILL_DEVICE_INPUT");
+                const bool device_input_enabled =
+                    !device_input_env || !*device_input_env ||
+                    std::strcmp(device_input_env, "0") != 0;
+                bool owner_stacks_overlap = false;
+                const size_t owner_map_size = std::min(
+                    layer_storage.hot_local_by_global.size(),
+                    layer_storage.cold_local_by_global.size());
+                for (size_t expert = 0; expert < owner_map_size; ++expert) {
+                    if (layer_storage.hot_local_by_global[expert] >= 0 &&
+                        layer_storage.cold_local_by_global[expert] >= 0) {
+                        owner_stacks_overlap = true;
+                        break;
+                    }
+                }
+                const bool ffn_device_join_possible =
+                    device_input_enabled &&
+                    n_tokens >= 512 &&
+                    layer_storage.cold_backend_kind ==
+                        MoeHybridColdBackend::Gpu &&
+                    layer_storage.cold_backend &&
+                    layer_storage.cold_backend != backend &&
+                    hot_stack && hot_stack->ne[2] > 0 &&
+                    // Only the full-secondary owner path publishes hot/cold
+                    // results into the device join tensors. A genuine split
+                    // uses the expert-major host-combine path; treating it as
+                    // device-resident makes HC-post read stale tensors.
+                    cold_stack && cold_stack->ne[2] == w.n_expert &&
+                    !owner_stacks_overlap;
                 ffn_device_join =
                     use_backend_prefill_hc && ffn_in_backend &&
                     local_expert_runtime &&
                     prefill_moe_hc_post_graph.valid() &&
-                    cold_stack && cold_stack->ne[2] == w.n_expert;
+                    ffn_device_join_possible;
                 if (ffn_device_join) {
                     static bool logged_device_join = false;
                     if (!logged_device_join) {
@@ -8225,6 +8480,60 @@ void reset_deepseek4_cache(DeepSeek4Cache & c) {
     }
     if (c.buf) {
         ggml_backend_buffer_clear(c.buf, 0);
+    }
+}
+
+void deepseek4_release_prefill_scratch(
+        DeepSeek4Cache & c,
+        MoeHybridStorage * moe_hybrid) {
+    DeepSeek4LayerRangeCache * runtime = c.layer_range_cache;
+    ggml_backend_t primary_backend = runtime ? runtime->backend : nullptr;
+    ggml_backend_t cold_backend = moe_hybrid ? moe_hybrid->cold_backend : nullptr;
+
+    // The last owner/attention graph can still be executing asynchronously.
+    // All arenas below are backend allocations, so synchronize both owners
+    // before destroying either side.
+    if (primary_backend) {
+        ggml_backend_synchronize(primary_backend);
+    }
+    if (cold_backend && cold_backend != primary_backend) {
+        ggml_backend_synchronize(cold_backend);
+    }
+
+    size_t free_before = 0;
+    size_t total_bytes = 0;
+    if (runtime && runtime->device >= 0) {
+        ggml_backend_cuda_get_device_memory(
+            runtime->device, &free_before, &total_bytes);
+    }
+
+    if (runtime) {
+        runtime->release_prefill_scratch();
+    }
+    if (moe_hybrid) {
+        if (moe_hybrid->prefill_route_alloc) {
+            ggml_gallocr_free(moe_hybrid->prefill_route_alloc);
+            moe_hybrid->prefill_route_alloc = nullptr;
+        }
+        if (moe_hybrid->prefill_hot_alloc) {
+            ggml_gallocr_free(moe_hybrid->prefill_hot_alloc);
+            moe_hybrid->prefill_hot_alloc = nullptr;
+        }
+        if (moe_hybrid->prefill_cold_alloc) {
+            ggml_gallocr_free(moe_hybrid->prefill_cold_alloc);
+            moe_hybrid->prefill_cold_alloc = nullptr;
+        }
+    }
+
+    if (runtime && runtime->device >= 0) {
+        size_t free_after = 0;
+        ggml_backend_cuda_get_device_memory(
+            runtime->device, &free_after, &total_bytes);
+        std::fprintf(stderr,
+                     "[deepseek4] released prefill scratch before decode: "
+                     "primary free %.1f->%.1f MiB\n",
+                     free_before / (1024.0 * 1024.0),
+                     free_after / (1024.0 * 1024.0));
     }
 }
 

@@ -339,6 +339,10 @@ bool create_deepseek4_cache(ggml_backend_t backend,
 
 void free_deepseek4_cache(DeepSeek4Cache & c);
 void reset_deepseek4_cache(DeepSeek4Cache & c);
+// Release only reproducible large-batch graph arenas after prefill. KV/model
+// state and the DSpark feature tail remain live for the following decode.
+void deepseek4_release_prefill_scratch(DeepSeek4Cache & c,
+                                       MoeHybridStorage * moe_hybrid);
 int deepseek4_previous_raw_ring_spans(
     int kv_start,
     int n_swa,

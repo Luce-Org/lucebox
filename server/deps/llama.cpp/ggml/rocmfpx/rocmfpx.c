@@ -785,9 +785,17 @@ void rocmfpx_dequantize_row_fp2(const block_rocmfp2 * GGML_RESTRICT x, float * G
         float * yb = y + ib*QK_ROCMFP2;
 
         for (int i = 0; i < QK_ROCMFP2; ++i) {
+#ifdef ROCMFP2_AFFINE
+            // affine type-107: value = code*scale - offset, e[0]=scale, e[1]=offset
+            const float scale  = rocmfpx_ue4m3_to_fp32(xb->e[0]);
+            const float offset = rocmfpx_ue4m3_to_fp32(xb->e[1]);
+            const uint8_t code = (uint8_t) ((xb->qs[i >> 2] >> (2*(i & 3))) & 3u);
+            yb[i] = (float) code * scale - offset;
+#else
             const float scale = rocmfpx_ue4m3_to_fp32(xb->e[i >= QK_ROCMFP2/2]);
             const uint8_t code = (uint8_t) ((xb->qs[i >> 2] >> (2*(i & 3))) & 3u);
             yb[i] = kvalues_rocmfp2[code] * scale;
+#endif
         }
     }
 }

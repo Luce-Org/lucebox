@@ -462,6 +462,13 @@ bool MoeHybridPlacement::build_critical_path_balanced_from_stats(
 
     const int floor = std::clamp(
         config.min_hot_per_layer, 0, stats.n_expert);
+    const int ceiling = config.max_hot_per_layer > 0
+        ? std::clamp(config.max_hot_per_layer, 0, stats.n_expert)
+        : stats.n_expert;
+    if (ceiling < floor) {
+        if (err) *err = "max_hot_per_layer is smaller than min_hot_per_layer";
+        return false;
+    }
     uint64_t used_bytes = 0;
     for (int il = 0; il < stats.n_layer; ++il) {
         const uint64_t expert_bytes = layer_expert_bytes[(size_t) il];
@@ -544,7 +551,7 @@ bool MoeHybridPlacement::build_critical_path_balanced_from_stats(
         }
 
         double best_cost = std::numeric_limits<double>::infinity();
-        for (int hot_count = floor; hot_count <= tmp.n_expert; ++hot_count) {
+        for (int hot_count = floor; hot_count <= ceiling; ++hot_count) {
             const uint64_t extra_count = (uint64_t) (hot_count - floor);
             if (extra_count > 0 &&
                 expert_bytes > remaining / extra_count) {
@@ -642,5 +649,4 @@ bool MoeHybridPlacement::build_critical_path_balanced_from_stats(
     out = std::move(tmp);
     return true;
 }
-
 }  // namespace dflash::common

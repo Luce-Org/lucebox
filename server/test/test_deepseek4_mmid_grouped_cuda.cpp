@@ -2,6 +2,7 @@
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
 #include "ggml.h"
+#include "rocmfpx.h"
 
 #include <cuda_runtime.h>
 
@@ -81,8 +82,18 @@ static bool run_case(
     }
 
     std::vector<uint8_t> weights_q(ggml_nbytes(weights));
-    const size_t quantized = ggml_quantize_chunk(
-        type, weights_f.data(), weights_q.data(), 0, n_rows * n_experts, k_dim, nullptr);
+    const size_t quantized =
+        type == GGML_TYPE_Q2_0_ROCMFP2
+            ? rocmfpx_quantize_fp2(
+                  weights_f.data(), weights_q.data(), n_rows * n_experts,
+                  k_dim, nullptr)
+        : type == GGML_TYPE_Q3_0_ROCMFPX
+            ? rocmfpx_quantize_fp3(
+                  weights_f.data(), weights_q.data(), n_rows * n_experts,
+                  k_dim, nullptr)
+            : ggml_quantize_chunk(
+                  type, weights_f.data(), weights_q.data(), 0,
+                  n_rows * n_experts, k_dim, nullptr);
     if (quantized != weights_q.size()) {
         std::fprintf(stderr, "quantize size mismatch type=%s got=%zu expected=%zu\n",
                      ggml_type_name(type), quantized, weights_q.size());
@@ -152,7 +163,8 @@ static int run_child(const char * mode, const char * output_path) {
 
     std::ofstream output(output_path, std::ios::binary | std::ios::trunc);
     const ggml_type types[] = {
-        GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q5_K,
+        GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0,
+        GGML_TYPE_Q5_K, GGML_TYPE_Q2_0_ROCMFP2, GGML_TYPE_Q3_0_ROCMFPX,
     };
     const int widths[] = {2, 4, 8, 9, 16};
     bool ok = output.good();
@@ -294,13 +306,17 @@ static std::string child_command(
         const std::string & output_path,
         const std::string & log_path) {
 #if defined(_WIN32)
-    return "set \"DFLASH_MMID_TELEMETRY=1\" && set \"DFLASH_MMID_GROUPED_TYPES=7\" && "
+    return "set \"DFLASH_MMID_TELEMETRY=1\" && set \"DFLASH_MMID_GROUPED_TYPES=15\" && "
+        "set \"DFLASH_CUDA_MMVQ_MOE_FP2_PACKED32=1\" && "
+        "set \"DFLASH_CUDA_MMVQ_MOE_FP3_PACKED24=1\" && "
         "set \"DFLASH_MMID_GROUPED=" +
         std::string(std::strcmp(mode, "grouped") == 0 ? "1" : "0") + "\" && " +
         shell_quote(executable) + " --child " + mode + " " + shell_quote(output_path) +
         " 2>" + shell_quote(log_path);
 #else
-    return "DFLASH_MMID_TELEMETRY=1 DFLASH_MMID_GROUPED_TYPES=7 DFLASH_MMID_GROUPED=" +
+    return "DFLASH_MMID_TELEMETRY=1 DFLASH_MMID_GROUPED_TYPES=15 "
+        "DFLASH_CUDA_MMVQ_MOE_FP2_PACKED32=1 DFLASH_CUDA_MMVQ_MOE_FP3_PACKED24=1 "
+        "DFLASH_MMID_GROUPED=" +
         std::string(std::strcmp(mode, "grouped") == 0 ? "1" : "0") + " " +
         shell_quote(executable) + " --child " + mode + " " + shell_quote(output_path) +
         " 2>" + shell_quote(log_path);
@@ -347,7 +363,8 @@ int main(int argc, char ** argv) {
     const size_t grouped_grouped = count_records(grouped_log, "variant=grouped");
 
     const ggml_type types[] = {
-        GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q5_K,
+        GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0,
+        GGML_TYPE_Q5_K, GGML_TYPE_Q2_0_ROCMFP2, GGML_TYPE_Q3_0_ROCMFPX,
     };
     const int widths[] = {2, 4, 8, 9, 16};
     size_t offset = 0;
@@ -383,9 +400,9 @@ int main(int argc, char ** argv) {
             }
         }
     }
-    output_parity = output_parity && offset == legacy.size() && compared_cases == 50;
+    output_parity = output_parity && offset == legacy.size() && compared_cases == 70;
     const bool pass = legacy_status == 0 && grouped_status == 0 &&
-        output_parity && grouped_dispatch && legacy_grouped == 0 && grouped_grouped == 75;
+        output_parity && grouped_dispatch && legacy_grouped == 0 && grouped_grouped == 105;
     if (pass) {
         std::remove(legacy_path.c_str());
         std::remove(grouped_path.c_str());

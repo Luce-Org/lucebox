@@ -67,11 +67,16 @@ static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
         case GGML_TYPE_Q8_0:
             return MMQ_Q8_1_DS_LAYOUT_D4;
         case GGML_TYPE_Q4_0_ROCMFP4_FAST:
-        case GGML_TYPE_Q2_0_ROCMFP2:
         case GGML_TYPE_Q2_1_ROCMFP2_MIX:
         case GGML_TYPE_Q3_0_ROCMFPX:
         case GGML_TYPE_Q3_1_ROCMFP3_MIX:
             return MMQ_Q8_1_DS_LAYOUT_D4;
+        case GGML_TYPE_Q2_0_ROCMFP2:
+#ifdef ROCMFP2_AFFINE
+            return MMQ_Q8_1_DS_LAYOUT_DS4;
+#else
+            return MMQ_Q8_1_DS_LAYOUT_D4;
+#endif
         case GGML_TYPE_MXFP4:
             return MMQ_Q8_1_DS_LAYOUT_D4;
         case GGML_TYPE_NVFP4:
@@ -242,7 +247,12 @@ static constexpr __host__ __device__ tile_x_sizes mmq_get_dp4a_tile_x_sizes(ggml
         case GGML_TYPE_Q5_1:    return MMQ_DP4A_TXS_Q8_1;
         case GGML_TYPE_Q8_0:    return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_Q4_0_ROCMFP4_FAST: return MMQ_DP4A_TXS_Q8_0;
-        case GGML_TYPE_Q2_0_ROCMFP2: return MMQ_DP4A_TXS_Q8_0_16;
+        case GGML_TYPE_Q2_0_ROCMFP2:
+#ifdef ROCMFP2_AFFINE
+            return MMQ_DP4A_TXS_Q8_1;
+#else
+            return MMQ_DP4A_TXS_Q8_0_16;
+#endif
         case GGML_TYPE_Q2_1_ROCMFP2_MIX: return MMQ_DP4A_TXS_Q8_0_16;
         case GGML_TYPE_Q3_0_ROCMFPX: return MMQ_DP4A_TXS_Q8_0_16;
         case GGML_TYPE_Q3_1_ROCMFP3_MIX: return MMQ_DP4A_TXS_Q8_0_16;
@@ -291,7 +301,12 @@ static constexpr __host__ __device__ int mmq_get_mma_tile_x_k(ggml_type type) {
         case GGML_TYPE_Q5_1:    return MMQ_MMA_TILE_X_K_Q8_1;
         case GGML_TYPE_Q8_0:    return MMQ_MMA_TILE_X_K_Q8_0;
         case GGML_TYPE_Q4_0_ROCMFP4_FAST: return MMQ_MMA_TILE_X_K_Q8_0;
-        case GGML_TYPE_Q2_0_ROCMFP2: return MMQ_MMA_TILE_X_K_Q3_K;
+        case GGML_TYPE_Q2_0_ROCMFP2:
+#ifdef ROCMFP2_AFFINE
+            return MMQ_MMA_TILE_X_K_Q8_1;
+#else
+            return MMQ_MMA_TILE_X_K_Q3_K;
+#endif
         case GGML_TYPE_Q2_1_ROCMFP2_MIX: return MMQ_MMA_TILE_X_K_Q3_K;
         case GGML_TYPE_Q3_0_ROCMFPX: return MMQ_MMA_TILE_X_K_Q3_K;
         case GGML_TYPE_Q3_1_ROCMFP3_MIX: return MMQ_MMA_TILE_X_K_Q3_K;
@@ -1388,6 +1403,95 @@ static __device__ __forceinline__ void load_tiles_rocmfp3_mix(
 #endif
     }
 }
+
+#ifdef ROCMFP2_AFFINE
+// Affine FP2 is a Q8_1-style integer tile: raw codes c in [0,3] plus
+// dm=(scale,-offset). The ordinary Q8_1 dot then evaluates
+//   scale*d*dot(c,q) - offset*(d*sum(q))
+// exactly, using the activation block's stored sum for the affine correction.
+template <int mmq_y, bool need_check>
+static __device__ __forceinline__ void load_tiles_rocmfp2_affine(
+    const char * __restrict__ x, int * __restrict__ x_tile,
+    const int kbx0, const int i_max, const int stride) {
+    constexpr int nwarps = mmq_get_nwarps_device();
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int groups_per_block = QK_ROCMFP2 / 4;
+    constexpr int blocks_per_tile = MMQ_ITER_K / QK_ROCMFP2;
+    constexpr int threads_per_row =
+        blocks_per_tile * groups_per_block / 2;
+    static_assert(threads_per_row == 32,
+                  "affine ROCmFP2 MMQ loader expects 32 lanes per row");
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    int   * x_qs = (int *) x_tile;
+    half2 * x_dm = (half2 *) (x_qs + 2*MMQ_TILE_NE_K);
+#else
+    constexpr tile_x_sizes txs =
+        mmq_get_dp4a_tile_x_sizes(GGML_TYPE_Q2_0_ROCMFP2, mmq_y);
+    int   * x_qs = (int *) x_tile;
+    half2 * x_dm = (half2 *) (x_qs + txs.qs);
+#endif
+
+    constexpr int nrows = warp_size / threads_per_row;
+    const int txi = warp_size > threads_per_row
+        ? threadIdx.x % threads_per_row : threadIdx.x;
+    const int kbx = txi / (groups_per_block / 2);
+    const int group = txi % (groups_per_block / 2);
+
+    auto pack_raw4 = [](const block_rocmfp2 * block, int base) {
+        const uint32_t bits = block->qs[base >> 2];
+        return (int) (((bits >> 0) & 3u) |
+                      (((bits >> 2) & 3u) << 8) |
+                      (((bits >> 4) & 3u) << 16) |
+                      (((bits >> 6) & 3u) << 24));
+    };
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nrows*nwarps) {
+        int i = i0 + (nrows == 1
+            ? threadIdx.y
+            : threadIdx.y*nrows + threadIdx.x/threads_per_row);
+        if (need_check) i = min(i, i_max);
+
+        const block_rocmfp2 * block =
+            (const block_rocmfp2 *) x + kbx0 + i*stride + kbx;
+        const int k0 = kbx*groups_per_block + group;
+        const int q0 = pack_raw4(block, 4*group);
+        const int q1 = pack_raw4(
+            block, 4*(group + groups_per_block/2));
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        x_qs[i*MMQ_MMA_TILE_X_K_Q8_1 + k0] = q0;
+        x_qs[i*MMQ_MMA_TILE_X_K_Q8_1 + k0 + groups_per_block/2] = q1;
+#else
+        x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0] = q0;
+        x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0 + groups_per_block/2] = q1;
+#endif
+    }
+
+    constexpr int scale_rows_per_warp = warp_size / blocks_per_tile;
+    const int kscale = threadIdx.x % blocks_per_tile;
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y;
+         i0 += nwarps*scale_rows_per_warp) {
+        int i = i0 + threadIdx.y*scale_rows_per_warp +
+                threadIdx.x/blocks_per_tile;
+        if (need_check) i = min(i, i_max);
+
+        const block_rocmfp2 * block =
+            (const block_rocmfp2 *) x + kbx0 + i*stride + kscale;
+        const float scale =
+            rocmfpx_ue4m3_to_fp32_finite(block->e[0]);
+        const float offset =
+            rocmfpx_ue4m3_to_fp32_finite(block->e[1]);
+        const half2 dm = make_half2(scale, -offset);
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        x_dm[i*MMQ_MMA_TILE_X_K_Q8_1 + kscale] = dm;
+#else
+        x_dm[i*(2*MMQ_TILE_NE_K/QI8_1) +
+             i/(QI8_1/2) + kscale] = dm;
+#endif
+    }
+}
+#endif
 
 template <int mmq_y, bool need_check>
 static __device__ __forceinline__ void load_tiles_mxfp4_fp4(const char * __restrict__ x,
@@ -3947,9 +4051,15 @@ struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_Q4_0_ROCMFP4_FAST> {
 template <int mmq_x, int mmq_y, bool need_check>
 struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_Q2_0_ROCMFP2> {
     static constexpr int              vdr          = VDR_ROCMFP2_Q8_1_MMQ;
+#ifdef ROCMFP2_AFFINE
+    static constexpr load_tiles_mmq_t load_tiles   = load_tiles_rocmfp2_affine<mmq_y, need_check>;
+    static constexpr vec_dot_mmq_t    vec_dot_mma  = vec_dot_q8_1_q8_1_mma<mmq_x, mmq_y>;
+    static constexpr vec_dot_mmq_t    vec_dot_dp4a = vec_dot_q8_1_q8_1_dp4a<mmq_x, mmq_y>;
+#else
     static constexpr load_tiles_mmq_t load_tiles   = load_tiles_rocmfpx_dual<GGML_TYPE_Q2_0_ROCMFP2, mmq_y, need_check>;
     static constexpr vec_dot_mmq_t    vec_dot_mma  = vec_dot_q8_0_16_q8_1_mma<mmq_x, mmq_y>;
     static constexpr vec_dot_mmq_t    vec_dot_dp4a = vec_dot_q8_0_16_q8_1_dp4a<mmq_x, mmq_y>;
+#endif
 };
 
 template <int mmq_x, int mmq_y, bool need_check>

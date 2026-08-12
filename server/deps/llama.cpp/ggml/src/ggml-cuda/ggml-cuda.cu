@@ -2582,6 +2582,14 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
                              dst->type == GGML_TYPE_F32 &&
                              ncols_dst <= (is_mul_mat_id ? MMVQ_MAX_MOE_BATCH_SIZE : MMVQ_MAX_BATCH_SIZE);
+#ifdef ROCMFP2_AFFINE
+    // The affine MMVQ dot includes the offset correction in vecdotq.cuh.
+    // Keep the conservative dequantize fallback unless explicitly enabled.
+    if (src0->type == GGML_TYPE_Q2_0_ROCMFP2 &&
+        std::getenv("DFLASH_CUDA_MMVQ_FP2_AFFINE") == nullptr) {
+        use_mul_mat_vec_q = false;
+    }
+#endif // ROCMFP2_AFFINE
 
     // fusion is not universally faster on Pascal
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -2773,7 +2781,9 @@ static bool ggml_cuda_try_fuse_mul_mat_glu(
         }
 
         const int64_t ncols = ids ? src1->ne[2] : src1->ne[1];
-        if (ggml_cuda_should_use_mmq(src0->type, cc, ncols, src0->ne[2])) {
+        if (ggml_cuda_should_use_mmq(
+                src0->type, cc, ncols,
+                ids ? src0->ne[2] : /*n_experts=*/0)) {
             ggml_cuda_mul_mat_q_pair(
                 ctx, up->src[0], gate->src[0], src1, ids, up, gate);
             ggml_cuda_op_swiglu_ds4(ctx, glu);
@@ -2824,6 +2834,23 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         && src1->ne[1] <= luce_mmvq_max_ncols;
     bool use_mul_mat_q     = ggml_is_quantized(src0->type) && !bad_padding_clear
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
+
+#ifdef ROCMFP2_AFFINE
+    // Both MMVQ and MMQ carry the affine offset correction. Keep ordinary
+    // (non-fused) MMQ behind a second A/B switch: it is numerically correct on
+    // gfx1100, but the small per-expert down projections regress model prefill
+    // throughput. The phase-scoped master switch still enables the qualified
+    // paired gate/up fusion independently.
+    if (src0->type == GGML_TYPE_Q2_0_ROCMFP2) {
+        if (std::getenv("DFLASH_CUDA_MMVQ_FP2_AFFINE") == nullptr) {
+            use_mul_mat_vec_q = false;
+        }
+        if (std::getenv("DFLASH_CUDA_MMQ_FP2_AFFINE") == nullptr ||
+            std::getenv("DFLASH_CUDA_MMQ_FP2_AFFINE_GENERAL") == nullptr) {
+            use_mul_mat_q = false;
+        }
+    }
+#endif // ROCMFP2_AFFINE
 
     bool any_gpus_with_slow_fp16 = false;
 
@@ -3108,13 +3135,22 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     for (int64_t i02 = 0; i02 < ne02; ++i02) { // expert matrices
         for (int64_t i12 = 0; i12 < ne12; ++i12) { // tokens
             for (int64_t iex = 0; iex < n_expert_used; ++iex) {
-                const int32_t expert_to_use = *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
+                int32_t expert_to_use = *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
+                if (expert_to_use < 0) {
+                    // Masked/dummy slot (the caller's weight for it is zero,
+                    // so the contribution cancels downstream). Fold it into
+                    // expert 0 to keep the sorted-row invariant, mirroring
+                    // the MMQ sorter which compacts negative ids.
+                    expert_to_use = 0;
+                }
                 assert(expert_to_use >= 0 && expert_to_use < ne02);
                 if (expert_to_use == i02) {
                     ids_from_sorted_host[i12*n_expert_used + iex] = ids_to_sorted_host.size();
                     ids_to_sorted_host.push_back(i12*ne11 + iex % ne11);
                     tokens_per_expert[i02]++;
-                    break;
+                    // NOTE: no break here. Dummy/masked routing can assign the
+                    // same expert id to several slots of one token; breaking
+                    // after the first match would drop those duplicate rows.
                 }
             }
         }
