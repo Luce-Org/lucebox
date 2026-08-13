@@ -101,6 +101,23 @@ Reference target: **RTX 3090 (Ampere sm_86)** — all headline numbers. Other NV
 
 `server/` (DFlash) builds with CMake 3.18+ and vendors the required `ggml` sources directly; only `Block-Sparse-Attention` remains a git submodule. No PyTorch is needed for `server/`. `optimizations/megakernel/` is the only component requiring PyTorch 2.0+ (CUDAExtension links against torch C++ libs). Power-tune: `sudo nvidia-smi -pl 220` (3090 sweet spot, re-sweep for other cards).
 
+## Recommended Setups
+
+Use the flags below as the recommended starting configuration for each supported
+model and tested hardware setup. Replace placeholder device indices and paths for your system.
+
+Entries are `dflash_server` settings unless the cell shows another command.
+
+| Model | RTX 3090 (24 GB) | Strix Halo `gfx1151` | Strix Halo + R9700 `gfx1201` |
+|---|---|---|---|
+| **Qwen 3.5/3.6 27B Q4_K_M** | `DFLASH27B_KV_TQ3=1`<br>`--target-device cuda:0`<br>`--draft-device cuda:0`<br>`--ddtree`<br>`--ddtree-budget 22`<br>`--draft-residency auto`<br>`--prefill-compression auto`<br>`--prefill-drafter <path>`<br>`--kvflash auto` | `--target-device hip:0`<br>`--draft-device hip:0`<br>`--ddtree`<br>`--ddtree-budget 22`<br>`--draft-residency persistent`<br>`--prefill-compression auto`<br>`--prefill-drafter <path>`<br>`--kvflash auto` | `HIP_VISIBLE_DEVICES=<r9700-index>`<br>`--target-device hip:0`<br>`--draft-device hip:0`<br>`--ddtree`<br>`--ddtree-budget 22`<br>`--draft-residency persistent`<br>`--prefill-compression auto`<br>`--prefill-drafter <path>`<br>`--kvflash auto` |
+| **Qwen 3.6 35B-A3B Q4_K_M** | `--target-device cuda:0`<br>`--spark`<br>`--kvflash auto` | `--target-device hip:0`<br>`--kvflash auto` | `HIP_VISIBLE_DEVICES=<r9700-index>`<br>`--target-device hip:0`<br>`--kvflash auto` |
+| **Laguna XS 2.1 33B Q4_K_M** | `--target-device cuda:0`<br>`--draft <path>`<br>`--prefill-drafter <path>`<br>`--max-ctx 262144`<br>`--kvflash 8192`<br>`--chunk 1024` | `--target-device hip:0`<br>`--kvflash auto` | `HIP_VISIBLE_DEVICES=<r9700-index>`<br>`--target-device hip:0`<br>`--kvflash auto` |
+| **Gemma 4 26B-A4B / 31B** | `--target-device cuda:0`<br>`--draft-device cuda:0`<br>`--kvflash auto` | `--target-device hip:0`<br>`--draft-device hip:0`<br>`--kvflash auto` | `HIP_VISIBLE_DEVICES=<r9700-index>`<br>`--target-device hip:0`<br>`--draft-device hip:0`<br>`--kvflash auto` |
+| **DeepSeek V4 Flash 0731 adaptive ROCmFPX** | — | `DFLASH_DS4_SPEC=1`<br>`DFLASH_DS4_SPEC_Q=4`<br>`DFLASH_DS4_FUSED_VERIFY=1`<br>`DFLASH_DS4_DRAFT=<path>`<br>`DFLASH_DS4_DRAFT_GPU=0`<br>`--target-device hip:0`<br>`--ds4-fused-decode`<br>`--ds4-expert-top-k 6`<br>`--ds4-prefill exact` | — |
+| **DeepSeek V4 Flash ROCmFPX (dual-GPU burn-in)** | — | — | Single HIP binary CMake: `-DDFLASH27B_HIP_ARCHITECTURES='gfx1151;gfx1201'`<br>`-DGGML_HIP_GRAPHS=ON`<br>`HIP_VISIBLE_DEVICES=<r9700-index>,<strix-index>`<br>`DFLASH_DS4_MOE_TP=1`<br>`DFLASH_DS4_MOE_TP_INPROC=1`<br>`DFLASH_DS4_MOE_TP_GPU=1`<br>`DFLASH_EXPERT_BUDGET_MB=11700`<br>`DFLASH_DS4_SPEC=1`<br>`DFLASH_DS4_SPEC_Q=4`<br>`DFLASH_DS4_FUSED_VERIFY=1`<br>`DFLASH_DS4_DRAFT=<path>`<br>`DFLASH_DS4_DRAFT_GPU=0`<br>`LUCE_MMVQ_MAX_NCOLS=4`<br>`--target-device hip:0`<br>`--peer-access`<br>`--ds4-expert-top-k 4` (approximate)<br>`--ds4-prefill sparse` (approximate) |
+| **Qwen 3.5 0.8B Megakernel** | `uv run --directory optimizations/megakernel python final_bench.py --backend bf16` | — | — |
+
 ## Quick Start On Harnesses
 
 [`harness/`](harness/) contains RTX 3090 client launchers and regression tests

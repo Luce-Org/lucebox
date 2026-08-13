@@ -26,6 +26,13 @@
 
 namespace dflash::common {
 
+// Bounds the sparse heterogeneous prefill arena once accumulated attention
+// context dominates its memory footprint. Decode batching is unaffected.
+int deepseek4_hybrid_prefill_chunk_tokens(
+    int requested_chunk,
+    int context_end,
+    int current_cap = 0);
+
 class DeepSeek4Backend : public ModelBackend {
 public:
     explicit DeepSeek4Backend(const DeepSeek4BackendConfig & cfg);
@@ -99,13 +106,22 @@ private:
     ggml_backend_t                 spec_backend_ = nullptr;
     std::unique_ptr<DSparkDrafter> spec_drafter_;
     std::vector<float>             spec_feat_window_;
+    // Once a long prompt selects the fragmentation-safe prefill shape, retain
+    // it for later requests so the HIP arenas never switch back under load.
+    int                            hybrid_prefill_chunk_cap_ = 0;
 
     bool load_spec_drafter();
     void release_spec_drafter(bool mark_parked);
     void keep_spec_feature_tail(std::vector<float> & features,
                                 size_t max_rows) const;
+    // True when a wide prefill path returns per-token DSpark features and the
+    // caller can retain only the requested capture window without splitting.
+    static bool supports_batched_spec_feature_capture(
+        bool hybrid,
+        PrefillAttentionMode mode,
+        int n_tokens);
     // Limit a prefill batch to a region with a uniform DSpark capture policy.
-    // Layer-major prefill can capture a subrange without splitting the final
+    // Wide GPU paths can capture a subrange without splitting the final
     // feature window; other paths still stop exactly at capture boundaries.
     static int capture_safe_prefill_tokens(int token_offset,
                                            int requested_tokens,
@@ -143,11 +159,13 @@ private:
     bool compute_uniform_hybrid_placement(const DeepSeek4Weights & w,
                                           int max_ctx,
                                           MoeHybridPlacement & out,
+                                          MoeHybridPlacement * decode_out,
                                           std::string * err) const;
     void maybe_save_routing_stats();
 
     std::shared_ptr<MoeHybridStorage> moe_hybrid_;
     MoeHybridPlacement                moe_placement_;
+    MoeHybridPlacement                moe_decode_placement_;
     MoeHybridStreamEngine             stream_engine_;
     MoeExpertComputeRuntime            expert_runtime_;
     std::shared_ptr<MoeHybridRoutingStats> routing_stats_;

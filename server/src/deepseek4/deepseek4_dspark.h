@@ -178,7 +178,8 @@ bool deepseek4_dspark_verify_forward(ggml_backend_t backend,
 // Minimal speculative-decode rollback state. Rejected positions must restore
 // the physical SWA rows they overwrote after the ring wraps; otherwise a later
 // causal verify reads rejected-token KV as if it were older committed history.
-// This remains much smaller than a full target-cache snapshot because q <= 4.
+// This remains much smaller than a full target-cache snapshot because the
+// verifier width is bounded by the DSpark block (currently q <= 5).
 struct DeepSeek4SpecRollback {
     int raw_pos = 0;
     int raw_count = 0;

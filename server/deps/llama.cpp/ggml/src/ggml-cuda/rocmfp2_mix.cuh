@@ -2,35 +2,11 @@
 // Runtime decode support for GGML_TYPE_Q2_1_ROCMFP2_MIX (106): per-expert mixed
 // absmax/adaptive ROCmFP2. The 10-byte block wire is identical to q2_0_rocmfpx, so
 // a GGUF splice from qtype 107 is offset-preserving;
-// the per-expert codebook + mode + rotation flag live out-of-band (loaded from a
-// sidecar into device buffers) and are attached here via a base-pointer registry,
+// the per-expert codebook and mode come from GGUF metadata or a legacy sidecar,
+// then are attached here via a base-pointer registry,
 // because the ggml to_fp16 converter signature carries no expert/codebook context.
 
 #include "common.cuh"
-
-extern "C" {
-
-// Register per-expert decode side-data for one gate or up expert tensor.
-// NOTE: the serving GGUF stores gate and up SEPARATELY (ffn_gate_exps /
-// ffn_up_exps), and one codebook pair is fitted per fused expert covering
-// BOTH halves -- so the two tensors register the SAME codebook buffer. Do not
-// assume a registered base owns its codebook exclusively.
-//   base        : device pointer to the tensor's block data (src0->data)
-//   nb02        : byte stride between experts (src0->nb[2])
-//   n_experts   : number of experts (ne02)
-//   out, in     : per-expert weight dims (rows, cols)
-//   codebooks   : device buffer, n_experts * 2 * 4 __hip_bfloat16 (2 books x 4 levels)
-//   modes       : device buffer, n_experts uint8 (0 fixed qtype-107 levels, 1 adaptive 7s1c)
-//   rotations   : device buffer, n_experts uint8 -- always 0 here. The qtype-106
-//                 encoder never emits rotation and the kernel ignores it; the
-//                 loader passes zeros and rejects anything else.
-GGML_API void ggml_cuda_rocmfp2_mix_register(
-        const void * base, size_t nb02, int n_experts, int out, int in,
-        const void * codebooks, const void * modes, const void * rotations);
-
-GGML_API void ggml_cuda_rocmfp2_mix_unregister(const void * base);
-
-}
 
 // Dequantize one expert slice (k elements = out*in) starting at vx to half.
 // Called from ggml_get_to_fp16_cuda for type 106; resolves the expert + codebook
@@ -96,8 +72,16 @@ bool ggml_cuda_rocmfp2_mix_mul_mat_id(
 // check to confirm the sync-free mul_mat_id path will handle the node).
 bool ggml_cuda_rocmfp2_mix_registered(const void * vx);
 
+// Hold this lock from side-data lookup through asynchronous kernel launch.
+// Unregister/update waits for the lock, synchronizes the owning device, and
+// only then frees the registry-owned codebooks and modes.
+void ggml_cuda_rocmfp2_mix_registry_lock();
+void ggml_cuda_rocmfp2_mix_registry_unlock();
+
 // Return the device-resident side data needed by the batched MMQ loader.
 // Pointers are advanced to the expert containing `vx`, so both whole MoE
-// tensors and registered expert slices are safe callers.
+// tensors and registered expert slices are safe callers. A caller that uses
+// the returned pointers in an asynchronous launch must hold the registry lock
+// until that launch has been enqueued.
 bool ggml_cuda_rocmfp2_mix_mmq_info(
         const void * vx, const void ** codebooks, const uint8_t ** modes);

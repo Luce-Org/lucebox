@@ -15,6 +15,8 @@
 // relative delta. Single stream and back-to-back launches on purpose: that is the decode
 // dependency chain, where launch overhead cannot be hidden.
 
+#include "ggml-cuda.h"
+
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
@@ -23,12 +25,6 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
-
-extern "C" void ggml_cuda_rocmfp2_mix_register_host(
-    const void * base, size_t nb02, int n_experts, int out, int in,
-    const void * codebooks_bf16_host, const uint8_t * modes_host,
-    const uint8_t * rotations_host);
-extern "C" void ggml_cuda_rocmfp2_mix_unregister(const void * base);
 
 bool ggml_cuda_rocmfp2_mix_mul_mat_id(
     const void * vx, const float * src1, const int32_t * ids, float * dst,
@@ -83,7 +79,7 @@ int main() {
     }
     std::vector<uint16_t> books((size_t) n_experts * 2 * K);
     for (size_t i = 0; i < books.size(); ++i) books[i] = f32_to_bf16(-0.5f + 0.2f * (float) (i % 5));
-    std::vector<uint8_t> modes(n_experts, 1), rots(n_experts, 0);
+    std::vector<uint8_t> modes(n_experts, 1);
 
     void * d_up = nullptr, * d_gate = nullptr;
     float * d_x = nullptr, * d_a = nullptr, * d_b = nullptr;
@@ -104,10 +100,19 @@ int main() {
     for (int i = 0; i < n_used * ntok; ++i) idsh[i] = i % n_experts;
     HIP_OK(hipMemcpy(d_ids, idsh.data(), sizeof(int32_t) * idsh.size(), hipMemcpyHostToDevice));
 
-    ggml_cuda_rocmfp2_mix_register_host(d_up, rows_bytes, n_experts, out, in,
-                                        books.data(), modes.data(), rots.data());
-    ggml_cuda_rocmfp2_mix_register_host(d_gate, rows_bytes, n_experts, out, in,
-                                        books.data(), modes.data(), rots.data());
+    if (!ggml_cuda_rocmfp2_mix_register_host(
+            d_up, rows_bytes, n_experts, out, in,
+            books.data(), modes.data())) {
+        std::fprintf(stderr, "FAIL: mixed-tensor registration failed\n");
+        return 1;
+    }
+    if (!ggml_cuda_rocmfp2_mix_register_host(
+            d_gate, rows_bytes, n_experts, out, in,
+            books.data(), modes.data())) {
+        ggml_cuda_rocmfp2_mix_unregister(d_up);
+        std::fprintf(stderr, "FAIL: mixed-tensor registration failed\n");
+        return 1;
+    }
 
     const int64_t ids_s0 = 1, ids_s1 = n_used;
     const int64_t src1_s1 = 0, src1_s2 = in;

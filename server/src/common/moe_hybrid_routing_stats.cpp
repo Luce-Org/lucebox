@@ -1,26 +1,112 @@
 #include "moe_hybrid_routing_stats.h"
 
 #include <algorithm>
+#include <charconv>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <numeric>
+#include <system_error>
 
 namespace dflash::common {
+
+namespace {
+
+bool routing_shape_size(int n_layer, int n_expert, size_t & size) {
+    if (n_layer <= 0 || n_expert <= 0 ||
+        (size_t) n_layer > std::numeric_limits<size_t>::max() /
+                             (size_t) n_expert) {
+        return false;
+    }
+    size = (size_t) n_layer * (size_t) n_expert;
+    return size <= (size_t) std::numeric_limits<int>::max();
+}
+
+bool parse_routing_header(const std::string & line,
+                          int & n_layer,
+                          int & n_expert,
+                          int & n_expert_used) {
+    size_t offset = 0;
+    const auto consume = [&](const char * literal) {
+        const size_t length = std::strlen(literal);
+        if (line.compare(offset, length, literal) != 0) return false;
+        offset += length;
+        return true;
+    };
+    const auto parse_int = [&](int & value) {
+        const char * begin = line.data() + offset;
+        const char * end = line.data() + line.size();
+        const auto result = std::from_chars(begin, end, value);
+        if (result.ec != std::errc{} || result.ptr == begin) return false;
+        offset = (size_t) (result.ptr - line.data());
+        return true;
+    };
+
+    if (!consume("# hotness table: n_layer=") || !parse_int(n_layer) ||
+        !consume(" n_expert=") || !parse_int(n_expert) ||
+        !consume(" n_expert_used=") || !parse_int(n_expert_used)) {
+        return false;
+    }
+    return line.find_first_not_of(" \t\r", offset) == std::string::npos;
+}
+
+bool parse_count_row(const std::string & line, std::vector<uint64_t> & row) {
+    const auto parse_value = [&](size_t begin, size_t end) {
+        const size_t first = line.find_first_not_of(" \t\r", begin);
+        if (first == std::string::npos || first >= end) return false;
+        const size_t last = line.find_last_not_of(" \t\r", end - 1);
+        if (last < first) return false;
+
+        uint64_t value = 0;
+        const char * value_begin = line.data() + first;
+        const char * value_end = line.data() + last + 1;
+        const auto parsed = std::from_chars(value_begin, value_end, value);
+        if (parsed.ec != std::errc{} || parsed.ptr != value_end) return false;
+        row.push_back(value);
+        return true;
+    };
+
+    // Commas are the canonical format. Preserve whitespace-separated legacy
+    // profiles so existing DFLASH_*_HOTNESS files remain loadable.
+    if (line.find(',') == std::string::npos) {
+        size_t begin = line.find_first_not_of(" \t\r");
+        while (begin != std::string::npos) {
+            const size_t end = line.find_first_of(" \t\r", begin);
+            const size_t token_end = end == std::string::npos ? line.size() : end;
+            if (!parse_value(begin, token_end)) return false;
+            begin = line.find_first_not_of(" \t\r", token_end);
+        }
+        return true;
+    }
+
+    size_t begin = 0;
+    while (begin <= line.size()) {
+        const size_t comma = line.find(',', begin);
+        const size_t end = comma == std::string::npos ? line.size() : comma;
+        if (!parse_value(begin, end)) return false;
+        if (comma == std::string::npos) return true;
+        begin = comma + 1;
+    }
+    return false;
+}
+
+}  // namespace
 
 size_t MoeHybridRoutingStats::index_of(int layer_idx, int expert_idx) const {
     return (size_t)layer_idx * (size_t)n_expert + (size_t)expert_idx;
 }
 
 bool MoeHybridRoutingStats::init(int n_layer_, int n_expert_, int n_expert_used_) {
-    if (n_layer_ <= 0 || n_expert_ <= 0 || n_expert_used_ <= 0) {
+    size_t count_size = 0;
+    if (!routing_shape_size(n_layer_, n_expert_, count_size) ||
+        n_expert_used_ <= 0 || n_expert_used_ > n_expert_) {
         return false;
     }
     n_layer = n_layer_;
     n_expert = n_expert_;
     n_expert_used = n_expert_used_;
-    counts.assign((size_t)n_layer * (size_t)n_expert, 0);
+    counts.assign(count_size, 0);
     layer_totals.assign((size_t)n_layer, 0);
     return true;
 }
@@ -29,12 +115,47 @@ bool MoeHybridRoutingStats::init(const MoeHybridConfig & cfg) {
     return init(cfg.n_layer, cfg.n_expert, cfg.n_expert_used);
 }
 
+bool MoeHybridRoutingStats::valid(std::string * err) const {
+    size_t count_size = 0;
+    if (!routing_shape_size(n_layer, n_expert, count_size) ||
+        n_expert_used <= 0 || n_expert_used > n_expert) {
+        if (err) *err = "invalid routing profile dimensions";
+        return false;
+    }
+    if (counts.size() != count_size ||
+        layer_totals.size() != (size_t) n_layer) {
+        if (err) *err = "routing profile storage does not match its dimensions";
+        return false;
+    }
+    for (int il = 0; il < n_layer; ++il) {
+        uint64_t total = 0;
+        for (int ie = 0; ie < n_expert; ++ie) {
+            const uint64_t value = counts[index_of(il, ie)];
+            if (value > std::numeric_limits<uint64_t>::max() - total) {
+                if (err) {
+                    *err = "routing profile count overflow at layer " +
+                        std::to_string(il);
+                }
+                return false;
+            }
+            total += value;
+        }
+        if (total != layer_totals[(size_t) il]) {
+            if (err) {
+                *err = "routing profile total mismatch at layer " +
+                    std::to_string(il);
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
 bool MoeHybridRoutingStats::matches(int n_layer_, int n_expert_, int n_expert_used_) const {
     return n_layer == n_layer_ &&
            n_expert == n_expert_ &&
            n_expert_used == n_expert_used_ &&
-           counts.size() == (size_t)n_layer * (size_t)n_expert &&
-           layer_totals.size() == (size_t)n_layer;
+           valid();
 }
 
 bool MoeHybridRoutingStats::matches(const MoeHybridConfig & cfg) const {
@@ -49,7 +170,8 @@ uint64_t MoeHybridRoutingStats::count(int layer_idx, int expert_idx) const {
     if (layer_idx < 0 || layer_idx >= n_layer || expert_idx < 0 || expert_idx >= n_expert) {
         return 0;
     }
-    return counts[index_of(layer_idx, expert_idx)];
+    const size_t index = index_of(layer_idx, expert_idx);
+    return index < counts.size() ? counts[index] : 0;
 }
 
 bool MoeHybridRoutingStats::observe(int layer_idx, const int32_t * expert_ids, int n_ids) {
@@ -97,7 +219,12 @@ bool MoeHybridRoutingStats::observe_selected_tensor(ggml_backend_t backend,
 }
 
 std::vector<int> MoeHybridRoutingStats::ranked_experts(int layer_idx) const {
-    if (layer_idx < 0 || layer_idx >= n_layer) return {};
+    size_t count_size = 0;
+    if (layer_idx < 0 || layer_idx >= n_layer ||
+        !routing_shape_size(n_layer, n_expert, count_size) ||
+        counts.size() != count_size) {
+        return {};
+    }
     std::vector<int> ranked((size_t)n_expert);
     std::iota(ranked.begin(), ranked.end(), 0);
     std::stable_sort(ranked.begin(), ranked.end(),
@@ -120,7 +247,7 @@ std::vector<int> MoeHybridRoutingStats::hot_experts(int layer_idx, int hot_count
 }
 
 void MoeHybridRoutingStats::print_freq_analysis() const {
-    if (n_layer <= 0 || n_expert <= 0 || counts.empty()) return;
+    if (!valid()) return;
 
     uint64_t total_all = 0;
     for (int il = 0; il < n_layer; ++il) total_all += layer_totals[(size_t)il];
@@ -189,10 +316,7 @@ void MoeHybridRoutingStats::print_freq_analysis() const {
 }
 
 bool MoeHybridRoutingStats::save_csv(const std::string & path, std::string * err) const {
-    if (n_layer <= 0 || n_expert <= 0 || counts.size() != (size_t)n_layer * (size_t)n_expert) {
-        if (err) *err = "routing stats not initialized";
-        return false;
-    }
+    if (!valid(err)) return false;
 
     std::ofstream f(path);
     if (!f) {
@@ -230,44 +354,69 @@ bool MoeHybridRoutingStats::load_csv(const std::string & path,
     }
 
     int file_n_layer = 0, file_n_expert = 0, file_n_expert_used = 0;
+    bool header_seen = false;
     std::vector<uint64_t> all_counts;
     std::string line;
+    int row_index = 0;
 
     while (std::getline(f, line)) {
         if (line.empty() || line[0] == '#') {
-            if (line.find("n_layer=") != std::string::npos) {
-                std::sscanf(line.c_str(), "# hotness table: n_layer=%d n_expert=%d n_expert_used=%d",
-                            &file_n_layer, &file_n_expert, &file_n_expert_used);
+            if (line.rfind("# hotness table:", 0) == 0) {
+                int parsed_layer = 0;
+                int parsed_expert = 0;
+                int parsed_used = 0;
+                size_t shape_size = 0;
+                if (header_seen || !parse_routing_header(
+                        line, parsed_layer, parsed_expert, parsed_used) ||
+                    !routing_shape_size(
+                        parsed_layer, parsed_expert, shape_size) ||
+                    parsed_used <= 0 || parsed_used > parsed_expert) {
+                    if (err) *err = "invalid routing profile header";
+                    return false;
+                }
+                file_n_layer = parsed_layer;
+                file_n_expert = parsed_expert;
+                file_n_expert_used = parsed_used;
+                header_seen = true;
             }
             continue;
         }
 
         std::vector<uint64_t> row;
-        const char * p = line.c_str();
-        while (*p) {
-            while (*p == ' ' || *p == '\t') ++p;
-            if (!*p) break;
-            char * end = nullptr;
-            uint64_t val = std::strtoull(p, &end, 10);
-            if (end == p) {
-                if (err) *err = "malformed value in row " + std::to_string((int)(all_counts.size() / std::max((size_t)file_n_expert, (size_t)1)));
-                return false;
+        if (!parse_count_row(line, row)) {
+            if (err) {
+                *err = "malformed value in row " +
+                    std::to_string(row_index);
             }
-            row.push_back(val);
-            p = end;
-            if (*p == ',') ++p;
+            return false;
         }
 
         if (row.empty()) continue;
+        if (row.size() > (size_t) std::numeric_limits<int>::max()) {
+            if (err) *err = "routing profile row is too wide";
+            return false;
+        }
 
         if (file_n_expert == 0) {
             file_n_expert = (int)row.size();
         } else if ((int)row.size() != file_n_expert) {
-            if (err) *err = "inconsistent row width at layer " + std::to_string((int)(all_counts.size() / (size_t)file_n_expert));
+            if (err) {
+                *err = "inconsistent row width at layer " +
+                    std::to_string(row_index);
+            }
             return false;
         }
 
+        if (row.size() > all_counts.max_size() - all_counts.size()) {
+            if (err) *err = "routing profile is too large";
+            return false;
+        }
         all_counts.insert(all_counts.end(), row.begin(), row.end());
+        ++row_index;
+    }
+    if (f.bad()) {
+        if (err) *err = "failed while reading routing profile";
+        return false;
     }
 
     if (file_n_expert <= 0 || all_counts.empty()) {
@@ -275,11 +424,26 @@ bool MoeHybridRoutingStats::load_csv(const std::string & path,
         return false;
     }
 
-    const int detected_layers = (int)(all_counts.size() / (size_t)file_n_expert);
+    const size_t detected_layers_size =
+        all_counts.size() / (size_t) file_n_expert;
+    if (detected_layers_size > (size_t) std::numeric_limits<int>::max()) {
+        if (err) *err = "routing profile has too many layers";
+        return false;
+    }
+    const int detected_layers = (int) detected_layers_size;
     if (file_n_layer == 0) file_n_layer = detected_layers;
-    if (file_n_expert_used == 0) file_n_expert_used = 8;  // default
+    if (file_n_expert_used == 0) {
+        file_n_expert_used = std::min(8, file_n_expert);
+    }
 
-    if ((int)all_counts.size() != file_n_layer * file_n_expert) {
+    size_t expected_count_size = 0;
+    if (!routing_shape_size(
+            file_n_layer, file_n_expert, expected_count_size) ||
+        file_n_expert_used <= 0 || file_n_expert_used > file_n_expert) {
+        if (err) *err = "invalid routing profile dimensions";
+        return false;
+    }
+    if (all_counts.size() != expected_count_size) {
         if (err) *err = "row count (" + std::to_string(detected_layers) + ") doesn't match n_layer (" + std::to_string(file_n_layer) + ")";
         return false;
     }
@@ -293,11 +457,18 @@ bool MoeHybridRoutingStats::load_csv(const std::string & path,
     for (int il = 0; il < file_n_layer; ++il) {
         uint64_t total = 0;
         for (int ie = 0; ie < file_n_expert; ++ie) {
-            total += tmp.counts[tmp.index_of(il, ie)];
+            const uint64_t count = tmp.counts[tmp.index_of(il, ie)];
+            if (count > std::numeric_limits<uint64_t>::max() - total) {
+                if (err) *err = "routing profile count overflow at layer " +
+                    std::to_string(il);
+                return false;
+            }
+            total += count;
         }
         tmp.layer_totals[(size_t)il] = total;
     }
 
+    if (!tmp.valid(err)) return false;
     out = std::move(tmp);
     return true;
 }

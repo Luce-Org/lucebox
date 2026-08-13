@@ -64,23 +64,10 @@ options are available:
   load because the fused graph must reference every expert tensor directly.
   If that allocation fails, the backend logs the fallback and continues with
   hybrid expert placement and layered decode.
-- **Adaptive (qtype-105/106) artifacts require MONOLITHIC EXPERT RESIDENCY.** Hybrid or
-  cold expert placement cannot decode them: the per-expert codebooks are registered against
-  resident tensor bases, so an expert paged to the host has nowhere to read its codebook
-  from. The backend says so and refuses rather than producing wrong output:
-
-  ```
-  [deepseek4] qtype-105 (mixed ROCmFP3) down experts require monolithic residency —
-  hybrid/cold expert placement cannot decode them. Enable fused decode or provide
-  enough VRAM to keep all experts resident.
-  ```
-
-  Practical floor: the 0731 adaptive artifacts are ~102.3 GB, so they need a device that can
-  hold that plus KV and activations. Measured 2026-08-05 — an 80 GB H100 fails at load
-  (`cudaMalloc failed` on a 97161 MiB expert buffer, then hybrid is refused for the reason
-  above), while a 140 GB H200 and Strix Halo's 125 GiB unified memory both serve them. A
-  UNIFORM artifact has no such constraint and runs fine under hybrid placement, so this is
-  specific to the adaptive formats and worth checking before choosing a deployment target.
+- Adaptive qtype-105/106 experts work in monolithic mode and across two GPUs
+  using the same runtime. The loader gives each GPU's compact tensor the
+  decode-table rows for the experts it owns. CPU expert offload and mixed
+  CUDA/HIP peers keep the safe monolithic fallback.
 
 - `--ds4-expert-top-k N` keeps the highest-ranked `N` routed experts and
   renormalizes their weights. `0` uses the model default. Reducing this value is an
@@ -283,7 +270,12 @@ The runtime logs the chosen split with a `[deepseek4-split] auto-split:` banner.
 | `DFLASH_EXPERT_BUDGET_MB` | Main-GPU memory budget for hot experts. |
 | `DFLASH_DS4_HOTNESS_CSV` | Optional per-layer routing profile for hot placement. |
 | `GGML_BATCH_PEER_COPIES` | Batch peer-runtime copies and unlike-runtime pinned-host staging with one source wait per split. The old `GGML_CUDA_BATCH_PEER_COPIES` spelling remains an alias. |
-| `DFLASH_DS4_TP_FUSED_CACHE_SLOTS` | Number of heterogeneous verifier graph slots. Defaults to `2`; each slot retains scheduler scratch on both GPUs. |
+| `DFLASH_DS4_TP_CRITICAL_PATH_PLACEMENT` | Use the routing profile and measured owner-rate ratio to minimize the predicted two-owner MoE critical path instead of maximizing aggregate hot-hit rate. Requires `DFLASH_DS4_HOTNESS_CSV`. |
+| `DFLASH_DS4_TP_MAIN_TO_PEER_RATE` | Relative main/peer routed-expert rate used by critical-path placement. It must be finite and greater than zero; the default is `3.4`. |
+| `DFLASH_DS4_TP_BALANCE_MIN_HOT` | Minimum hot experts retained on every routed layer by critical-path placement. Defaults to `0`. |
+| `DFLASH_DS4_Q5_VERIFY` | Opt in to the AMD q=5 fused verifier. This also selects the qualified MMVQ width and verifier-cache defaults when they are not explicitly overridden. |
+| `DFLASH_CUDA_MMVQ_FP4_Q5_X4_PLUS1` | Select the q=5 ROCmFP4 dense verifier kernel that reuses the existing x4 dot product for columns 0-3 and the exact scalar path for column 4. Defaults to `1` for q=5 on `gfx1201`; set `0` to force the generic five-column kernel. |
+| `DFLASH_DS4_TP_FUSED_CACHE_SLOTS` | Number of heterogeneous verifier graph slots. Defaults to `2` for q<=4 and `9` for the opt-in q=5 verifier; each slot retains scheduler scratch on both GPUs. |
 | `DFLASH_DS4_VERIFY_FORCE_GRAPH_REPLAY` | Skip the expensive property scan only for a warmed verifier graph. Rebuilt scheduler generations are always validated. Leave unset for the conservative production profile. |
 | `GGML_DS4_FA_SERIAL_INDEX_SCAN` | Restore the serial compressed-row mask scan for an indexed-attention A/B. By default, HIP scans contexts above 512 compressed rows in parallel. |
 | `DFLASH_MOE_PREFILL_PERSISTENT_OWNER_ALLOC` | Long-prefill arena kill switch; set `0` to restore per-layer owner allocation. |
@@ -389,6 +381,120 @@ The required burn-in sequence is repeated requests at 2K, 4K, 8K, and 16K in
 one process, followed by another 2K request to force additional eviction. Run
 with `DFLASH_DS4_TP_FUSED_CACHE_SLOTS=2`; first qualify with forced replay
 unset, then repeat with it enabled as a separate performance A/B.
+
+### Experimental AMD q=5 verifier
+
+`DFLASH_DS4_Q5_VERIFY=1` enables a five-row fused verifier on HIP. It handles
+the shape that crosses two ratio-4 compressor boundaries, preserves five raw
+SWA rows for rollback, and restores plus replays only the accepted prefix after
+a partial rejection. q<=4 behavior is unchanged when the flag is absent.
+
+The heterogeneous verifier keeps all five lanes in one
+`[n_embd * n_hc, q]` tensor. Attention HC-pre, attention HC-post, FFN HC-pre,
+FFN HC-post, drafter-feature capture, and output HC merge are batched across
+the verifier width. This removes the former per-lane HC controller paths and
+progressive concatenations without changing the verifier result. The split
+HC-post kernel also accepts a token dimension and joins the two owner outputs
+inside that batched kernel.
+
+Critical-path placement models each routed layer as two concurrent branches:
+the main branch includes its fixed shared-expert work and hot routed work,
+while the peer branch executes the remaining routed work. The allocator adds
+the next profiled expert only when its marginal reduction in
+`max(main / main_to_peer_rate, peer)` is positive. The expert memory budget is
+therefore an upper bound; leaving part of it unused is valid when another hot
+expert would lengthen the predicted fork.
+
+On the qualified R9700 + Strix Halo profile, leaving the related q=5 controls
+unset selects `LUCE_MMVQ_MAX_NCOLS=5`, nine heterogeneous verifier slots, and
+the ROCmFP4 x4+1 dense kernel on `gfx1201`.
+The wider MMVQ ceiling avoids the slow small-matrix crossover, while nine slots
+hold the recurring compressor phases without steady graph rebuilds. The x4+1
+kernel decodes shared weights through the existing four-column vector path and
+retains the original scalar accumulation for the fifth verifier column.
+Explicit environment values still take priority.
+
+Sparse heterogeneous prefill uses a reusable graph allocator with preferred
+128 MiB backing chunks. This avoids depending on one large contiguous HIP
+allocation on devices without virtual-memory-backed buffers. Individual
+tensors remain unsplit and may exceed the preferred chunk size. Prompts ending
+above 4K use a 1K-token prefill shape, and that cap remains sticky for later
+requests in the process so a post-16K request cannot force a fragmented
+1K-to-2K arena replacement. Reproducible decode graph caches are retired before
+a necessary prefill-arena growth; persistent HC mirrors remain resident.
+
+The exact qualification launch used:
+
+```bash
+export DFLASH_DS4_Q5_VERIFY=1
+export DFLASH_DS4_SPEC_Q=5
+export DFLASH_EXPERT_BUDGET_MB=14350
+export DFLASH_DS4_HOTNESS_CSV=/path/to/ds4_moe_tp_hotness.csv
+export DFLASH_DS4_TP_CRITICAL_PATH_PLACEMENT=1
+export DFLASH_DS4_TP_MAIN_TO_PEER_RATE=4.4
+export DFLASH_DS4_TP_BALANCE_MIN_HOT=0
+```
+
+The checked-in wrapper reproduces the full exact-context protocol and records
+the manifest, response hashes, server log, ROCm state, and a two-second VRAM
+trace:
+
+```bash
+TARGET_MODEL=/path/to/target.gguf \
+DRAFT_MODEL=/path/to/dspark-draft.gguf \
+HOTNESS_CSV=/path/to/ds4_moe_tp_hotness.csv \
+CRITICAL_PATH_PLACEMENT=1 \
+MAIN_TO_PEER_RATE=4.4 \
+BALANCE_MIN_HOT=0 \
+EXPERT_BUDGET_MB=14350 \
+harness/qualification/deepseek4/qualify_ds4_q5_amd.sh
+```
+
+Its q=5 MMVQ width, verifier slots, and x4+1 controls default to `auto`, so the
+run also verifies the platform defaults. `EXPECTED_SHA256` can override the
+qualified deterministic-workload hash when intentionally testing another
+compatible artifact.
+
+At temperature zero, all 25 requests in the 2K -> 4K -> 8K -> 16K -> 2K
+burn-in produced the same expected response hash. With the automatic q=5
+MMVQ/cache/kernel defaults and the critical-path profile above, measured client
+decode medians were 75.818, 74.530, 69.898, 62.685, and 76.703 tok/s. The final
+2K measurements after repeated 16K prefill were 76.685-76.727 tok/s, confirming
+that the bounded sticky arena recovers steady decode rather than merely
+surviving the request. The placement retained 1,688 profiled hot experts, 23-63
+per layer, and the full sweep peaked at 31.089 GiB on the reported 31.86 GiB
+main GPU. Treat these as workload-specific burn-in measurements, not as a
+portable default for unrelated memory layouts.
+
+For an overlap trace, run the same wrapper with the delayed profiler launcher:
+
+```bash
+SERVER_BIN=harness/qualification/deepseek4/rocprof_server_wrapper.sh \
+PROFILED_SERVER_BIN=/path/to/dflash_server \
+ROCPROF_OUTPUT_DIR=/path/to/trace-output \
+ROCPROF_START_SECONDS=180 \
+ROCPROF_DURATION_SECONDS=90 \
+harness/qualification/deepseek4/qualify_ds4_q5_amd.sh
+
+harness/qualification/deepseek4/analyze_rocprof_overlap.py \
+  /path/to/trace-output/trace_kernel_trace.csv
+```
+
+The analyzer reports per-owner busy time, simultaneous kernel-busy time,
+time-binned overlap, and the kernels dominating each owner. Use a steady decode
+window rather than model load or prefill when comparing placement changes.
+
+In the post-batching trace, steady 2K decode windows placed only 16-22% of
+either owner's kernel-busy time inside a simultaneously busy interval. The
+unprofiled server timing attributed 63.7 ms of each 74.4 ms speculative step to
+target verification; draft, head, snapshot, and apply work together accounted
+for the remaining 10.7 ms. Changing the placement rate from 4.4 to 3.8 at the
+same 14,350 MiB budget moved 116 experts to the peer but changed the measured
+2K median by less than 0.1 tok/s. These measurements show that placement is
+already near its local balance point. Further large gains require removing
+split/copy dispatches or parallelizing work outside the routed-expert fork;
+adding the two devices' headline bandwidths is not a valid throughput model
+because attention, routing, HC boundaries, and every layer join remain ordered.
 
 On HIP `gfx1151`, enabling DSpark defaults `LUCE_MMVQ_MAX_NCOLS` to `4` when
 the variable is unset. This keeps the four-row verifier on MMVQ. On a 128 GiB

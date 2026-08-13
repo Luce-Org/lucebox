@@ -1,4 +1,5 @@
 #include "argsort.cuh"
+#include "ds4-env.cuh"
 #include "top-k.cuh"
 
 #ifdef GGML_CUDA_USE_CUB
@@ -8,6 +9,10 @@
 using namespace cub;
 #    endif  // CCCL_MAJOR_VERSION >= 3 && CCCL_MINOR_VERSION >= 2
 #endif      // GGML_CUDA_USE_CUB
+
+#ifdef GGML_CUDA_USE_HIPCUB
+#    include <hipcub/hipcub.hpp>
+#endif
 
 #ifdef CUB_TOP_K_AVAILABLE
 
@@ -1234,6 +1239,88 @@ static void topk_argmax_cuda(const float * x,
 
 #endif  // !defined(GGML_CUDA_USE_CUB)
 
+#ifdef GGML_CUDA_USE_HIPCUB
+
+// DS4's learned long-context indexer asks for 512 rows from roughly 2K--5K
+// candidates. The generic HIP fallback initializes an index array, copies all
+// scores, performs a device-wide segmented full sort, then copies the first
+// 512 indices. For these few-row, bounded-width shapes, keep the same dynamic
+// selection semantics in one block: rocPRIM radix-sorts keys and indices in
+// registers/LDS and writes only the requested prefix. This remains opt-in
+// until model-backed output parity and context-sweep performance are proven.
+template <int ITEMS_PER_THREAD>
+static __global__ void k_topk_block_radix_f32_i32(
+        const float * x,
+        int         * dst,
+        int           ncols,
+        int           k) {
+    constexpr int BLOCK_THREADS = 256;
+    using block_sort = hipcub::BlockRadixSort<
+        uint32_t, BLOCK_THREADS, ITEMS_PER_THREAD, int>;
+    __shared__ typename block_sort::TempStorage storage;
+
+    const int row = (int) blockIdx.x;
+    const int first = (int) threadIdx.x * ITEMS_PER_THREAD;
+    const float * x_row = x + (size_t) row * ncols;
+    uint32_t keys[ITEMS_PER_THREAD];
+    int indices[ITEMS_PER_THREAD];
+#pragma unroll
+    for (int item = 0; item < ITEMS_PER_THREAD; ++item) {
+        const int col = first + item;
+        if (col < ncols) {
+            const uint32_t bits = (uint32_t) __float_as_int(x_row[col]);
+            const uint32_t ordered = (bits & 0x80000000u)
+                ? ~bits : (bits ^ 0x80000000u);
+            // Padding uses zero. Every real score gets a nonzero sortable key,
+            // so even a valid -infinity outranks padded lanes. Zero is reachable
+            // only for one negative-NaN bit pattern, whose top-k order is not
+            // defined; mapping it to one still keeps the index valid.
+            keys[item] = ordered == 0 ? 1 : ordered;
+        } else {
+            keys[item] = 0;
+        }
+        indices[item] = col;
+    }
+
+    block_sort(storage).SortDescending(keys, indices);
+
+#pragma unroll
+    for (int item = 0; item < ITEMS_PER_THREAD; ++item) {
+        const int rank = first + item;
+        if (rank < k) {
+            dst[(size_t) row * k + rank] = indices[item];
+        }
+    }
+}
+
+static void topk_block_radix_cuda(
+        const float * x,
+        int         * dst,
+        int           ncols,
+        int           nrows,
+        int           k,
+        cudaStream_t  stream) {
+    const dim3 blocks((unsigned) nrows, 1, 1);
+    constexpr int threads = 256;
+    if (ncols <= 2048) {
+        k_topk_block_radix_f32_i32<8><<<blocks, threads, 0, stream>>>(
+            x, dst, ncols, k);
+    } else if (ncols <= 3072) {
+        k_topk_block_radix_f32_i32<12><<<blocks, threads, 0, stream>>>(
+            x, dst, ncols, k);
+    } else if (ncols <= 4096) {
+        k_topk_block_radix_f32_i32<16><<<blocks, threads, 0, stream>>>(
+            x, dst, ncols, k);
+    } else {
+        GGML_ASSERT(ncols <= 5120);
+        k_topk_block_radix_f32_i32<20><<<blocks, threads, 0, stream>>>(
+            x, dst, ncols, k);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+#endif  // GGML_CUDA_USE_HIPCUB
+
 void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0   = dst->src[0];
     const float *       src0_d = (const float *) src0->data;
@@ -1257,6 +1344,14 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         top_k_cub(pool, src0_d + i * ncols, dst_d + i * k, ncols, k, stream);
     }
 #elif defined(GGML_CUDA_USE_CUB) || defined(GGML_CUDA_USE_HIPCUB)  // CUB_TOP_K_AVAILABLE
+#ifdef GGML_CUDA_USE_HIPCUB
+    if (ds4_env_flag_enabled("GGML_DS4_TOPK_BLOCK_RADIX") &&
+        k == 512 && ncols > 1024 && ncols <= 5120) {
+        topk_block_radix_cuda(
+            src0_d, dst_d, (int) ncols, (int) nrows, (int) k, stream);
+        return;
+    }
+#endif
     // Fall back to argsort + copy
     const int    ncols_pad      = next_power_of_2(ncols);
     const size_t shared_mem     = ncols_pad * sizeof(int);

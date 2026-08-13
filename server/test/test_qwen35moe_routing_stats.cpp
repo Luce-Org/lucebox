@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -51,6 +52,44 @@ TEST_CASE(Qwen35MoeRoutingStatsFixture, moe_routing_stats_suite) {
     REQUIRE(loaded.count(0, 2) == 2);
     REQUIRE(loaded.layer_totals[1] == 2);
 
+    std::filesystem::remove(tmp);
+
+    {
+        std::ofstream stream(tmp);
+        stream << "# hotness table: n_layer=1 n_expert=2 n_expert_used=1\n"
+               << "1,-1\n";
+    }
+    REQUIRE(!MoeHybridRoutingStats::load_csv(tmp.string(), loaded, &err));
+    REQUIRE(err == "malformed value in row 0");
+
+    {
+        std::ofstream stream(tmp);
+        stream << "# hotness table: n_layer=999999999999999999999 "
+                  "n_expert=2 n_expert_used=1\n"
+               << "1,1\n";
+    }
+    REQUIRE(!MoeHybridRoutingStats::load_csv(tmp.string(), loaded, &err));
+    REQUIRE(err == "invalid routing profile header");
+
+    {
+        std::ofstream stream(tmp);
+        stream << "# hotness table: n_layer=2 n_expert=4 n_expert_used=2\n"
+               << "1 2 3 4\n"
+               << "5\t6 7\t8\n";
+    }
+    REQUIRE(MoeHybridRoutingStats::load_csv(tmp.string(), loaded, &err));
+    REQUIRE(loaded.matches(2, 4, 2));
+    REQUIRE(loaded.count(0, 2) == 3);
+    REQUIRE(loaded.count(1, 3) == 8);
+
+    {
+        std::ofstream stream(tmp, std::ios::binary);
+        stream << "# hotness table: n_layer=1 n_expert=2 n_expert_used=1\r\n"
+               << "9,10\r\n";
+    }
+    REQUIRE(MoeHybridRoutingStats::load_csv(tmp.string(), loaded, &err));
+    REQUIRE(loaded.matches(1, 2, 1));
+    REQUIRE(loaded.count(0, 1) == 10);
     std::filesystem::remove(tmp);
     std::printf("OK\n");
 }

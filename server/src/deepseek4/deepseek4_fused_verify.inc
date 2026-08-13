@@ -1,4 +1,4 @@
-// ─── Fused whole-model graph (n_tokens = q in [1,4]) ────────────────────
+// ─── Fused whole-model graph (n_tokens = q in [1,5]) ────────────────────
 // One whole-model graph per (q, flush, padded-comp) shape: batched attention
 // (causal mask input) + batched MoE, per-token fused HC chains, in-graph
 // optional drafter-feature capture and q-wide logits. The spec loop guarantees a
@@ -166,20 +166,38 @@ static void ds4_fused_verify_refresh_hybrid_luts(
         const int il = (int) hi;
         const MoeHybridLayerStorage & layer = hybrid->layers[(size_t) il];
         const MoeHybridGraphInputs & inputs = fg.hybrid_inputs[hi];
+        const bool dynamic_route_balance = inputs.dynamic_route_balance;
+        const std::vector<int32_t> & preferred_hot =
+            dynamic_route_balance ||
+                    layer.decode_hot_local_by_global.empty()
+                ? layer.hot_local_by_global
+                : layer.decode_hot_local_by_global;
         std::vector<int32_t> hot_lut((size_t) w.n_expert, invalid_route);
         std::vector<int32_t> cold_lut((size_t) w.n_expert, invalid_route);
         std::vector<float> hot_valid((size_t) w.n_expert, 0.0f);
         std::vector<float> cold_valid((size_t) w.n_expert, 0.0f);
         for (int ie = 0; ie < w.n_expert; ++ie) {
-            const int32_t hot = layer.hot_local_by_global[(size_t) ie];
             const int32_t cold = layer.cold_local_by_global[(size_t) ie];
+            int32_t hot = preferred_hot[(size_t) ie];
+            // A phase-specific placement may move a resident expert to the
+            // peer only when the peer owns a copy. Otherwise retain its
+            // physical main-owner route so no selected expert is dropped.
+            if (hot < 0 && cold < 0) {
+                hot = layer.hot_local_by_global[(size_t) ie];
+            }
             if (hot >= 0) {
                 hot_lut[(size_t) ie] = hot;
                 hot_valid[(size_t) ie] = 1.0f;
             }
-            if (cold >= 0 && hot < 0) {
+            if (cold >= 0) {
                 cold_lut[(size_t) ie] = cold;
-                cold_valid[(size_t) ie] = 1.0f;
+                // In dynamic mode this LUT is the main-residency candidate
+                // set, copied independently to peer. The peer selector keeps
+                // its exact complement after the per-token main cap. Static
+                // placement retains the ordinary cold-validity mask.
+                cold_valid[(size_t) ie] = dynamic_route_balance
+                    ? (hot >= 0 ? 1.0f : 0.0f)
+                    : (hot < 0 ? 1.0f : 0.0f);
             }
         }
         ds4_fv_set_repeated_rows(inputs.hot_local_lut, hot_lut);
@@ -253,14 +271,18 @@ static void ds4_fused_consume_route_diagnostics(
                 route.layer < (int) hybrid->layers.size()) {
                 const MoeHybridLayerStorage & layer =
                     hybrid->layers[(size_t) route.layer];
+                const std::vector<int32_t> & decode_hot =
+                    layer.decode_hot_local_by_global.empty()
+                        ? layer.hot_local_by_global
+                        : layer.decode_hot_local_by_global;
                 for (int i = 0; i < route.width; ++i) {
                     const int32_t id = token_ids[i];
                     if (token_weights[i] == 0.0f || id < 0 ||
-                        id >= (int32_t) layer.hot_local_by_global.size()) {
+                        id >= (int32_t) decode_hot.size()) {
                         continue;
                     }
                     ++cache_total;
-                    if (layer.hot_local_by_global[(size_t) id] >= 0) {
+                    if (decode_hot[(size_t) id] >= 0) {
                         ++cache_hot;
                     }
                 }
@@ -287,7 +309,15 @@ static void ds4_fused_consume_route_diagnostics(
 static size_t ds4_fused_verify_hybrid_slot_limit() {
     static const size_t limit = []() {
         const char * raw = std::getenv("DFLASH_DS4_TP_FUSED_CACHE_SLOTS");
-        const long requested = raw ? std::strtol(raw, nullptr, 10) : 2;
+        // q=5 advances through four ratio-4 phases and crosses a ratio-128
+        // boundary in the 128-token qualification request. With two slots the
+        // nine recurring shapes rebuild on every step. Nine slots were
+        // model-qualified at 28.5 GiB peak on the 31.9 GiB R9700. q<=4 keeps
+        // the conservative two-slot default.
+        const long default_slots =
+            ds4_env_flag("DFLASH_DS4_Q5_VERIFY") ? 9 : 2;
+        const long requested = raw ? std::strtol(raw, nullptr, 10)
+                                   : default_slots;
         return (size_t) std::max<long>(
             1, std::min<long>(requested,
                               (long) Ds4FusedVerifyCache::kSlotCount));
@@ -386,11 +416,11 @@ static bool ds4_build_fused_verify_graph(
     ex.ape128 = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, q); ggml_set_input(ex.ape128);
     ex.st4 = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, q); ggml_set_input(ex.st4);
     ex.st128 = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, q); ggml_set_input(ex.st128);
-    // comp emission scalars per layer: i32 {ape_row(unused batched), comp_pos},
-    // i64 {comp_row}; reuse the decode-style bundles (2 i32 + 1 i64 per layer).
+    // Up to two compressor emissions per layer. q<=4 uses at most one; q=5
+    // can touch two ratio-4 boundaries when it starts at position mod 4 == 3.
     fg.i32_bundle = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 2 * (int64_t) w.n_layer);
     ggml_set_input(fg.i32_bundle);
-    fg.i64_bundle = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, 1 * (int64_t) w.n_layer);
+    fg.i64_bundle = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, 2 * (int64_t) w.n_layer);
     ggml_set_input(fg.i64_bundle);
 
     // Mask bundle: q>1 preserves the q ring rows that the batch overwrites,
@@ -416,16 +446,18 @@ static bool ds4_build_fused_verify_graph(
     ggml_set_input(fg.mask_bundle);
     int64_t mask_off = 0;
 
-    // per-token HC streams
-    std::vector<ggml_tensor *> hc_cur(q);
-    for (int t = 0; t < q; ++t) {
-        ggml_tensor * col = ggml_view_2d(ctx, fg.inp_embed, n_embd, 1,
-                                         fg.inp_embed->nb[1], (size_t) t * fg.inp_embed->nb[1]);
-        hc_cur[(size_t) t] = ggml_repeat_4d(ctx, col, n_embd, n_hc, 1, 1);
-    }
+    // Keep every speculative lane in one HC tensor. The previous graph built
+    // five independent HC ops and progressively concatenated their outputs at
+    // every pre/post boundary. HC kernels already support a token dimension,
+    // so preserve it throughout the verifier and issue one batched op instead.
+    ggml_tensor * embed_3d = ggml_reshape_3d(
+        ctx, fg.inp_embed, n_embd, 1, q);
+    ggml_tensor * hc_repeated = ggml_repeat_4d(
+        ctx, embed_3d, n_embd, n_hc, q, 1);
+    ggml_tensor * hc_cur = ggml_reshape_2d(
+        ctx, hc_repeated, (int64_t) n_embd * n_hc, q);
 
-    std::vector<ggml_tensor *> capture_pieces(
-        capture_ids.size() * (size_t) q, nullptr);   // order [ci][t]
+    std::vector<ggml_tensor *> capture_layers(capture_ids.size(), nullptr);
 
     for (int il = 0; il < w.n_layer; ++il) {
         const DeepSeek4Layer & L = w.layers[(size_t) il];
@@ -439,20 +471,16 @@ static bool ds4_build_fused_verify_graph(
         const int lane_token_pos = lane_kv_start + lane_q - 1;
         const size_t hybrid_idx = (size_t) il;
 
-        // ── HC pre (attention), per token ──
-        std::vector<ggml_tensor *> hc_flat(lane_q), split_attn(lane_q);
-        ggml_tensor * attn_in = nullptr;
-        for (int t = 0; t < lane_q; ++t) {
-            const size_t token_idx = (size_t) lane_start + (size_t) t;
-            hc_flat[(size_t) t] = ggml_reshape_1d(
-                ctx, hc_cur[token_idx], (int64_t) n_embd * n_hc);
-            ggml_tensor * working = ds4_build_fused_hc_pre(ctx, w, hc_flat[(size_t) t],
-                                                           mc.fn_attn_f16[(size_t) il], L.hc_attn_base,
-                                                           hlw.attn, &split_attn[(size_t) t]);
-            if (!working) return false;
-            ggml_tensor * w2 = ggml_reshape_2d(ctx, working, n_embd, 1);
-            attn_in = attn_in ? ggml_concat(ctx, attn_in, w2, 1) : w2;
-        }
+        // ── Batched HC pre (attention) ──
+        ggml_tensor * hc_flat = hc_cur;
+        ggml_tensor * split_attn = nullptr;
+        ggml_tensor * attn_working = ds4_build_fused_hc_pre(
+            ctx, w, hc_flat, mc.fn_attn_f16[(size_t) il], L.hc_attn_base,
+            hlw.attn, &split_attn);
+        if (!attn_working) return false;
+        // HC-pre stores working and split values together per token. Materialize
+        // the strided working view once, replacing q kernels and q-1 concats.
+        ggml_tensor * attn_in = ggml_cont(ctx, attn_working);
 
         // ── Batched attention ──
         DeepSeek4AttentionGraphInputs ain{};
@@ -460,20 +488,36 @@ static bool ds4_build_fused_verify_graph(
         ain.neg_pos = ex.neg_q;
         ain.raw_kv_rows = ex.rawrows;
         if (ratio > 0) {
+            int n_flush = 0;
+            for (int t = 0; t < lane_q; ++t) {
+                if (((lane_kv_start + t + 1) % ratio) == 0) ++n_flush;
+            }
+            const int n_comp_inputs = std::max(1, n_flush);
             ggml_tensor * ape_all = (ratio == 4) ? ex.ape4 : ex.ape128;
             ggml_tensor * state_all = (ratio == 4) ? ex.st4 : ex.st128;
             ain.attn_ape_row = ape_all;
             ain.attn_state_rows = state_all;
-            ain.attn_comp_pos = ggml_view_1d(ctx, fg.i32_bundle, 1, ((size_t) il * 2 + 1) * sizeof(int32_t));
-            ain.attn_comp_rows = ggml_view_2d(ctx, fg.i64_bundle, 1, 1, sizeof(int64_t),
-                                              (size_t) il * sizeof(int64_t));
+            ain.attn_comp_pos = ggml_view_1d(
+                ctx, fg.i32_bundle, n_comp_inputs,
+                (size_t) il * 2 * sizeof(int32_t));
+            ain.attn_comp_rows = ggml_view_1d(
+                ctx, fg.i64_bundle, n_comp_inputs,
+                (size_t) il * 2 * sizeof(int64_t));
         }
         if (ratio == 4) {
+            int n_flush = 0;
+            for (int t = 0; t < lane_q; ++t) {
+                if (((lane_kv_start + t + 1) % ratio) == 0) ++n_flush;
+            }
+            const int n_comp_inputs = std::max(1, n_flush);
             ain.index_ape_row = ex.ape4;
             ain.index_state_rows = ex.st4;
-            ain.index_comp_pos = ggml_view_1d(ctx, fg.i32_bundle, 1, ((size_t) il * 2 + 1) * sizeof(int32_t));
-            ain.index_comp_rows = ggml_view_2d(ctx, fg.i64_bundle, 1, 1, sizeof(int64_t),
-                                               (size_t) il * sizeof(int64_t));
+            ain.index_comp_pos = ggml_view_1d(
+                ctx, fg.i32_bundle, n_comp_inputs,
+                (size_t) il * 2 * sizeof(int32_t));
+            ain.index_comp_rows = ggml_view_1d(
+                ctx, fg.i64_bundle, n_comp_inputs,
+                (size_t) il * 2 * sizeof(int64_t));
         }
         int padded = 0;
         if (ratio > 0 && lc.comp_kv) {
@@ -501,27 +545,18 @@ static bool ds4_build_fused_verify_graph(
             return false;
         }
 
-        // ── HC post (attention) + HC pre (FFN), per token ──
-        ggml_tensor * ffn_in = nullptr;
-        std::vector<ggml_tensor *> split_ffn(lane_q);
-        for (int t = 0; t < lane_q; ++t) {
-            const size_t token_idx = (size_t) lane_start + (size_t) t;
-            ggml_tensor * ao = ggml_view_2d(ctx, attn_out, n_embd, 1,
-                                            attn_out->nb[1], (size_t) t * attn_out->nb[1]);
-            ggml_tensor * ao_flat = ggml_reshape_1d(ctx, ggml_cont(ctx, ao), n_embd);
-            ggml_tensor * hc_next = ggml_ds4_hc_post(ctx, hc_flat[(size_t) t], ao_flat,
-                                                     split_attn[(size_t) t], n_hc);
-            hc_cur[token_idx] = ggml_reshape_2d(
-                ctx, hc_next, n_embd, n_hc);
-            hc_flat[(size_t) t] = ggml_reshape_1d(
-                ctx, hc_cur[token_idx], (int64_t) n_embd * n_hc);
-            ggml_tensor * fworking = ds4_build_fused_hc_pre(ctx, w, hc_flat[(size_t) t],
-                                                            mc.fn_ffn_f16[(size_t) il], L.hc_ffn_base,
-                                                            hlw.ffn, &split_ffn[(size_t) t]);
-            if (!fworking) return false;
-            ggml_tensor * f2 = ggml_reshape_2d(ctx, fworking, n_embd, 1);
-            ffn_in = ffn_in ? ggml_concat(ctx, ffn_in, f2, 1) : f2;
-        }
+        // ── Batched HC post (attention) + HC pre (FFN) ──
+        ggml_tensor * attn_batch = ggml_is_contiguous(attn_out)
+            ? attn_out : ggml_cont(ctx, attn_out);
+        hc_cur = ggml_ds4_hc_post(
+            ctx, hc_flat, attn_batch, split_attn, n_hc);
+        hc_flat = hc_cur;
+        ggml_tensor * split_ffn = nullptr;
+        ggml_tensor * ffn_working = ds4_build_fused_hc_pre(
+            ctx, w, hc_flat, mc.fn_ffn_f16[(size_t) il], L.hc_ffn_base,
+            hlw.ffn, &split_ffn);
+        if (!ffn_working) return false;
+        ggml_tensor * ffn_in = ggml_cont(ctx, ffn_working);
 
         // ── Batched FFN ──
         ggml_tensor * ffn_normed = build_rms_norm(ctx, ffn_in, L.ffn_norm, w.rms_eps);
@@ -679,7 +714,8 @@ static bool ds4_build_fused_verify_graph(
                         hybrid_cfg, desc,
                         hybrid->layers[(size_t) il], ffn_normed,
                         first_ids, first_weights, lane_q, inputs, true,
-                        allow_fused_combine, join_mode)) {
+                        allow_fused_combine, join_mode,
+                        MoeHybridRouteBalance::Disabled)) {
                     return false;
                 }
                 ffn_out = inputs.output;
@@ -690,7 +726,8 @@ static bool ds4_build_fused_verify_graph(
                         hybrid_cfg, desc,
                         hybrid->layers[(size_t) il], ffn_normed,
                         padded_ids, padded_weights, lane_q, inputs, false,
-                        allow_fused_combine, join_mode)) {
+                        allow_fused_combine, join_mode,
+                        MoeHybridRouteBalance::Disabled)) {
                     return false;
                 }
                 ffn_out = ggml_add(ctx, ffn_out, inputs.output);
@@ -715,64 +752,39 @@ static bool ds4_build_fused_verify_graph(
         }
         if (!ffn_out) return false;
 
-        // ── HC post (FFN), per token; capture at drafter layers ──
-        for (int t = 0; t < lane_q; ++t) {
-            const size_t token_idx = (size_t) lane_start + (size_t) t;
-            ggml_tensor * hc_next = nullptr;
-            if (fused_hc_join_inputs) {
-                ggml_tensor * main_part = ggml_view_2d(
-                    ctx, fused_hc_join_inputs->main_output, n_embd, 1,
-                    fused_hc_join_inputs->main_output->nb[1],
-                    (size_t) t * fused_hc_join_inputs->main_output->nb[1]);
-                ggml_tensor * peer_part = ggml_view_2d(
-                    ctx, fused_hc_join_inputs->peer_output, n_embd, 1,
-                    fused_hc_join_inputs->peer_output->nb[1],
-                    (size_t) t * fused_hc_join_inputs->peer_output->nb[1]);
-                hc_next = ggml_ds4_hc_post_split(
-                    ctx, hc_flat[(size_t) t], main_part, peer_part,
-                    split_ffn[(size_t) t], n_hc);
-            } else {
-                ggml_tensor * fo = ggml_view_2d(
-                    ctx, ffn_out, n_embd, 1, ffn_out->nb[1],
-                    (size_t) t * ffn_out->nb[1]);
-                ggml_tensor * fo_flat = ggml_reshape_1d(
-                    ctx, ggml_cont(ctx, fo), n_embd);
-                hc_next = ggml_ds4_hc_post(
-                    ctx, hc_flat[(size_t) t], fo_flat,
-                    split_ffn[(size_t) t], n_hc);
-            }
-            hc_cur[token_idx] = ggml_reshape_2d(
-                ctx, hc_next, n_embd, n_hc);
+        // ── Batched HC post (FFN); capture at drafter layers ──
+        if (fused_hc_join_inputs) {
+            hc_cur = ggml_ds4_hc_post_split(
+                ctx, hc_flat, fused_hc_join_inputs->main_output,
+                fused_hc_join_inputs->peer_output, split_ffn, n_hc);
+        } else {
+            ggml_tensor * ffn_batch = ggml_is_contiguous(ffn_out)
+                ? ffn_out : ggml_cont(ctx, ffn_out);
+            hc_cur = ggml_ds4_hc_post(
+                ctx, hc_flat, ffn_batch, split_ffn, n_hc);
         }
         for (size_t ci = 0; ci < capture_ids.size(); ++ci) {
             if (capture_ids[ci] != il) continue;
-            for (int t = 0; t < lane_q; ++t) {
-                const size_t token_idx =
-                    (size_t) lane_start + (size_t) t;
-                ggml_tensor * hs = hc_cur[token_idx];             // [n_embd, n_hc]
-                ggml_tensor * hsT = ggml_cont(ctx, ggml_transpose(ctx, hs)); // [n_hc, n_embd]
-                ggml_tensor * summed = ggml_sum_rows(ctx, hsT);   // [1, n_embd]
-                ggml_tensor * mean = ggml_scale(ctx, summed, 1.0f / (float) n_hc);
-                capture_pieces[ci * (size_t) q + (size_t) t] =
-                    ggml_reshape_1d(ctx, ggml_cont(ctx, mean), n_embd);
-            }
+            ggml_tensor * hs = ggml_reshape_3d(
+                ctx, hc_cur, n_embd, n_hc, lane_q);
+            ggml_tensor * hs_t = ggml_cont(
+                ctx, ggml_transpose(ctx, hs));                    // [n_hc,n_embd,q]
+            ggml_tensor * summed = ggml_sum_rows(ctx, hs_t);      // [1,n_embd,q]
+            ggml_tensor * mean = ggml_scale(
+                ctx, summed, 1.0f / (float) n_hc);
+            capture_layers[ci] = ggml_reshape_2d(
+                ctx, mean, n_embd, lane_q);                       // [n_embd,q]
         }
     }
 
-    // ── Output: per-token HC merge → batched out_norm + lm_head ──
-    ggml_tensor * final_all = nullptr;
-    for (int t = 0; t < q; ++t) {
-        ggml_tensor * hc_flat = ggml_reshape_1d(ctx, hc_cur[(size_t) t], (int64_t) n_embd * n_hc);
-        ggml_tensor * onorm = ggml_rms_norm(ctx, hc_flat, w.hc_eps);
-        ggml_tensor * omix = ggml_mul_mat(ctx, mc.fn_out_f16, onorm);
-        omix = ggml_reshape_1d(ctx, omix, ggml_nelements(omix));
-        ggml_tensor * obase = ds4_fused_hc_base_f32(ctx, w.output_hc_base);
-        if (!obase || hc_out_weights.scale_data.empty()) return false;
-        ggml_tensor * fe = ggml_ds4_hc_out(ctx, omix, obase, hc_flat, n_hc,
-                                           hc_out_weights.scale_data[0]);
-        ggml_tensor * fe2 = ggml_reshape_2d(ctx, fe, n_embd, 1);
-        final_all = final_all ? ggml_concat(ctx, final_all, fe2, 1) : fe2;
-    }
+    // ── Batched output HC merge → out_norm + lm_head ──
+    ggml_tensor * onorm = ggml_rms_norm(ctx, hc_cur, w.hc_eps);
+    ggml_tensor * omix = ggml_mul_mat(ctx, mc.fn_out_f16, onorm);
+    omix = ggml_reshape_2d(ctx, omix, ggml_nelements(omix) / q, q);
+    ggml_tensor * obase = ds4_fused_hc_base_f32(ctx, w.output_hc_base);
+    if (!obase || hc_out_weights.scale_data.empty()) return false;
+    ggml_tensor * final_all = ggml_ds4_hc_out(
+        ctx, omix, obase, hc_cur, n_hc, hc_out_weights.scale_data[0]);
     ggml_tensor * out_normed = build_rms_norm(ctx, final_all, w.out_norm, w.rms_eps);
     fg.logits = ggml_mul_mat(ctx, w.output, out_normed);   // [n_vocab, q]
     ggml_set_output(fg.logits);
@@ -783,16 +795,18 @@ static bool ds4_build_fused_verify_graph(
         ggml_build_forward_expand(gf, ex.argmax);
     }
 
-    if (!capture_pieces.empty()) {
-        for (ggml_tensor * piece : capture_pieces) {
-            if (!piece) {
+    if (!capture_layers.empty()) {
+        for (ggml_tensor * layer : capture_layers) {
+            if (!layer) {
                 std::fprintf(stderr, "[ds4-fused-verify] capture layer id is invalid\n");
                 return false;
             }
         }
-        ggml_tensor * cap = capture_pieces[0];
-        for (size_t i = 1; i < capture_pieces.size(); ++i) {
-            cap = ggml_concat(ctx, cap, capture_pieces[i], 0);
+        // Concatenating layer matrices on dim 0 produces the token-major
+        // [n_capture*n_embd,q] layout consumed by the drafter directly.
+        ggml_tensor * cap = capture_layers[0];
+        for (size_t i = 1; i < capture_layers.size(); ++i) {
+            cap = ggml_concat(ctx, cap, capture_layers[i], 0);
         }
         ex.capture = cap;
         ggml_set_output(ex.capture);
@@ -1167,17 +1181,27 @@ static int ds4_try_fused_verify_step(
     ds4_fv_set(ex->st128, lv.data(), sizeof(int64_t) * q);
 
     std::vector<int32_t> i32v((size_t) w.n_layer * 2, 0);
-    std::vector<int64_t> i64v((size_t) w.n_layer * 1, 0);
+    std::vector<int64_t> i64v((size_t) w.n_layer * 2, 0);
     for (int il = 0; il < w.n_layer; ++il) {
         const int ratio = (int) w.compress_ratios[il];
         if (ratio > 0) {
-            int pos_b = -1;   // boundary position inside the batch (if any)
+            int n_flush = 0;
             for (int t = 0; t < q; ++t) {
-                if (((kv_start + t + 1) % ratio) == 0) { pos_b = kv_start + t; break; }
+                if (((kv_start + t + 1) % ratio) != 0) continue;
+                GGML_ASSERT(n_flush < 2);
+                const int pos_b = kv_start + t;
+                i32v[(size_t) il * 2 + (size_t) n_flush] =
+                    pos_b + 1 - ratio;
+                i64v[(size_t) il * 2 + (size_t) n_flush] =
+                    pos_b / ratio;
+                ++n_flush;
             }
-            i32v[(size_t) il * 2 + 0] = token_pos % ratio;
-            i32v[(size_t) il * 2 + 1] = (pos_b >= 0 ? pos_b : token_pos) + 1 - ratio;
-            i64v[(size_t) il] = (pos_b >= 0 ? pos_b : token_pos) / ratio;
+            if (n_flush == 0) {
+                // The graph does not consume these values in a no-flush shape,
+                // but initialize them deterministically for diagnostics.
+                i32v[(size_t) il * 2] = token_pos + 1 - ratio;
+                i64v[(size_t) il * 2] = token_pos / ratio;
+            }
         }
     }
     ds4_fv_set(fg->i32_bundle, i32v.data(), sizeof(int32_t) * i32v.size());
@@ -1275,7 +1299,7 @@ static int ds4_try_fused_verify_step(
     // nodes is correct in eager mode but its HIP graph replay faults against
     // unified-memory expert mappings. Keep the proven width-3 ceiling only
     // while q=1 capture graphs are evaluated/captured. q>=2 verification uses
-    // the process ceiling (LUCE_MMVQ_MAX_NCOLS=4 in the optimized launch).
+    // the process ceiling (LUCE_MMVQ_MAX_NCOLS=5 for q=5 verification).
     const bool capture_eager = capture_cache &&
         ds4_env_flag("DFLASH_DS4_TP_CAPTURE_EAGER");
     // q>=2 verifier graph slots own fixed tensor storage. Position, mask,
@@ -1327,17 +1351,10 @@ static int ds4_try_fused_verify_step(
         out_logits->clear();
     }
     if (hooks->capture_out && ex->capture && ncap > 0) {
-        std::vector<float> flat((size_t) w.n_embd * ncap * q);
-        ggml_backend_tensor_get(ex->capture, flat.data(), 0, sizeof(float) * flat.size());
-        hooks->capture_out->assign((size_t) ncap * w.n_embd * q, 0.0f);
-        for (int ci = 0; ci < ncap; ++ci) {
-            for (int t = 0; t < q; ++t) {
-                const float * src = flat.data() + ((size_t) ci * q + t) * w.n_embd;
-                float * dst = hooks->capture_out->data() +
-                              (size_t) t * ncap * w.n_embd + (size_t) ci * w.n_embd;
-                std::memcpy(dst, src, sizeof(float) * (size_t) w.n_embd);
-            }
-        }
+        hooks->capture_out->resize((size_t) ncap * w.n_embd * q);
+        ggml_backend_tensor_get(
+            ex->capture, hooks->capture_out->data(), 0,
+            sizeof(float) * hooks->capture_out->size());
     }
     if (telemetry &&
         (argmax_only || hooks->all_logits_out || out_logits ||

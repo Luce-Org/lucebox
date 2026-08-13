@@ -14,6 +14,10 @@
 
 namespace dflash::common {
 
+// Choose the quarter-route main-owner quota that minimizes the slower owner's
+// estimated completion time. Returns zero for invalid inputs.
+int moe_balanced_main_slots_x4(int top_k, double main_to_peer_rate);
+
 // GPU-resident residual combine graph: output = residual + hot_out + cold_correction.
 struct ResidualCombineGraph {
     ggml_context * ctx = nullptr;
@@ -114,6 +118,10 @@ struct MoeHybridFfnTelemetry {
 // map global router IDs to each backend's compact expert stack and mask the
 // slots owned by the other backend without a host-side routing round trip.
 struct MoeHybridGraphInputs {
+    // True only when this graph actually uses batch-wide owner balancing.
+    // The request can fall back to static ownership for unsupported maps or
+    // widths, so consumers must not infer this from the process environment.
+    bool dynamic_route_balance = false;
     ggml_tensor * router_weights = nullptr;
     std::vector<ggml_tensor *> router_nodes;
     // q>1 decomposes the six selected routes into a four-wide head and a
@@ -162,6 +170,11 @@ enum class MoeHybridJoinMode {
     CanonicalRouteOrder,
 };
 
+enum class MoeHybridRouteBalance {
+    Allowed,
+    Disabled,
+};
+
 // Process-wide graph policy parsed once from the model-neutral environment
 // variables. Legacy DS4 spellings remain accepted by the implementation, but
 // graph builders and scheduler setup consume this typed view instead of
@@ -203,7 +216,9 @@ bool build_moe_hybrid_ffn_graph(
     bool                           include_shared = true,
     bool                           allow_fused_combine = false,
     MoeHybridJoinMode              join_mode =
-                                       MoeHybridJoinMode::OwnerPartialSums);
+                                       MoeHybridJoinMode::OwnerPartialSums,
+    MoeHybridRouteBalance          route_balance =
+                                       MoeHybridRouteBalance::Allowed);
 
 int moe_hybrid_expert_compute_batch_limit();
 int moe_hybrid_expert_compute_ipc_batch_limit(int n_tokens);

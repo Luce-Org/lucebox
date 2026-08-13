@@ -20,8 +20,9 @@ extern "C" {
 #define GGML_CUDA_MAX_DEVICES       16
 
 // Maximum token width handled by the registry-aware DS4 mixed-weight MMV
-// kernels. DeepSeek4's fused verifier uses the same limit before graph build.
-#define GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS 4
+// kernels. The kernel maps tokens to grid.z and is validated for q=5;
+// wider batches remain on the MMQ path.
+#define GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS 5
 
 // backend API
 GGML_BACKEND_API ggml_backend_t ggml_backend_cuda_init(int device);
@@ -87,6 +88,19 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_reg(void);
 // ggml_backend_graph_compute() producing `logits` has returned.
 GGML_BACKEND_API bool ggml_backend_cuda_topk_rows(const struct ggml_tensor * logits, int k,
                                                   float * probs_out, int32_t * ids_out);
+
+// Attach learned per-expert decode tables to a mixed-precision tensor. The
+// host variants copy the tables to the device that owns `base`. Call the
+// matching unregister function before releasing the tensor's backing buffer.
+// Returns false without registering when validation or device setup fails.
+GGML_BACKEND_API bool ggml_cuda_rocmfp3_mix_register_host(
+        const void * base, size_t expert_stride, int n_experts, int out, int in,
+        const void * codebooks_bf16_host, const uint8_t * modes_host);
+GGML_BACKEND_API bool ggml_cuda_rocmfp2_mix_register_host(
+        const void * base, size_t expert_stride, int n_experts, int out, int in,
+        const void * codebooks_bf16_host, const uint8_t * modes_host);
+GGML_BACKEND_API void ggml_cuda_rocmfp2_mix_unregister(const void * base);
+GGML_BACKEND_API void ggml_cuda_rocmfp3_mix_unregister(const void * base);
 
 #ifdef  __cplusplus
 }

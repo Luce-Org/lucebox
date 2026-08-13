@@ -321,6 +321,40 @@ static ggml_context * make_test_context(size_t mem_size = 1u << 20) {
     return ggml_init(params);
 }
 
+static void test_chunked_graph_allocator(ggml_backend_t backend) {
+    std::fprintf(stderr, "  test_chunked_graph_allocator ...");
+    ggml_context * ctx = make_test_context();
+    TEST_ASSERT_MSG(ctx != nullptr, "ggml_init failed");
+    if (!ctx) {
+        std::fprintf(stderr, " FAIL\n");
+        return;
+    }
+
+    // The input and output must coexist. Each fits under the cap, while their
+    // combined live range does not, so the allocator must create two chunks.
+    constexpr int64_t n_elements = 96 * 1024; // 384 KiB of F32
+    ggml_tensor * input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_elements);
+    ggml_set_input(input);
+    ggml_tensor * output = ggml_dup(ctx, input);
+    ggml_set_output(output);
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 16, false);
+    ggml_build_forward_expand(graph, output);
+
+    constexpr size_t max_chunk_size = 512u * 1024u;
+    ggml_gallocr_t alloc = ggml_gallocr_new_with_max_chunk_size(
+        ggml_backend_get_default_buffer_type(backend), max_chunk_size);
+    TEST_ASSERT_MSG(alloc != nullptr, "chunked graph allocator creation failed");
+    if (alloc) {
+        TEST_ASSERT_MSG(ggml_gallocr_alloc_graph(alloc, graph),
+                        "chunked graph allocation failed");
+        TEST_ASSERT_MSG(ggml_gallocr_get_buffer_n_chunks(alloc, 0) == 2,
+                        "graph allocator did not split the backing buffer");
+        ggml_gallocr_free(alloc);
+    }
+    ggml_free(ctx);
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
 static void test_dspark_confidence_uses_separate_hidden(ggml_backend_t backend) {
     std::fprintf(stderr, "  test_dspark_confidence_uses_separate_hidden ...");
 
@@ -1953,7 +1987,7 @@ static void test_prefill_readout_lifecycle_and_fused_exclusion() {
     Ds4VerifyHooks verifier_hooks;
     TEST_ASSERT(verifier_hooks.allow_fused_verify);
     TEST_ASSERT(deepseek4_should_attempt_fused_verify(
-        /*n_tokens=*/GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS, &verifier_hooks,
+        /*n_tokens=*/DS4_CONSERVATIVE_VERIFY_MAX_TOKENS, &verifier_hooks,
         /*owner_topology_supported=*/true,
         /*full_layer_range=*/true,
         /*has_logits_output=*/true,
@@ -1962,8 +1996,37 @@ static void test_prefill_readout_lifecycle_and_fused_exclusion() {
     TEST_ASSERT(!deepseek4_should_attempt_fused_verify(
         /*n_tokens=*/1, &verifier_hooks, true, true, true, true, true));
     TEST_ASSERT(!deepseek4_should_attempt_fused_verify(
-        /*n_tokens=*/GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS + 1,
+        /*n_tokens=*/DS4_Q5_VERIFY_TOKENS,
         &verifier_hooks, true, true, true, true, true));
+    TEST_ASSERT(!deepseek4_should_attempt_fused_verify(
+        /*n_tokens=*/DS4_Q5_VERIFY_TOKENS + 1,
+        &verifier_hooks, true, true, true, true, true));
+    TEST_ASSERT(!deepseek4_should_attempt_wide_fused_verify(
+        DS4_Q5_VERIFY_TOKENS, &verifier_hooks,
+        /*q5_enabled=*/false, true, true, true, true, true));
+    TEST_ASSERT(deepseek4_should_attempt_wide_fused_verify(
+        DS4_Q5_VERIFY_TOKENS, &verifier_hooks,
+        /*q5_enabled=*/true, true, true, true, true, true));
+    TEST_ASSERT(!deepseek4_should_attempt_wide_fused_verify(
+        DS4_Q5_VERIFY_TOKENS, &verifier_hooks,
+        /*q5_enabled=*/true, true, true,
+        /*has_output_storage=*/false, true, true));
+    TEST_ASSERT(!deepseek4_should_attempt_wide_fused_verify(
+        DS4_CONSERVATIVE_VERIFY_MAX_TOKENS, &verifier_hooks,
+        /*q5_enabled=*/true, true, true, true, true, true));
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+static void test_hybrid_prefill_chunk_tokens() {
+    std::fprintf(stderr, "  test_hybrid_prefill_chunk_tokens ...");
+    TEST_ASSERT(deepseek4_hybrid_prefill_chunk_tokens(2048, 0) == 2048);
+    TEST_ASSERT(deepseek4_hybrid_prefill_chunk_tokens(2048, 4096) == 2048);
+    TEST_ASSERT(deepseek4_hybrid_prefill_chunk_tokens(2048, 4097) == 1024);
+    TEST_ASSERT(deepseek4_hybrid_prefill_chunk_tokens(1024, 8192) == 1024);
+    TEST_ASSERT(deepseek4_hybrid_prefill_chunk_tokens(512, 8192) == 512);
+    TEST_ASSERT(deepseek4_hybrid_prefill_chunk_tokens(0, 8192) == 1);
+    TEST_ASSERT(deepseek4_hybrid_prefill_chunk_tokens(
+                    2048, 2048, 1024) == 1024);
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
@@ -2020,7 +2083,8 @@ static void test_dspark_raw_ring_rollback_after_wrap(ggml_backend_t backend) {
     layer.n_comp = 2;
     layer.n_index_comp = 2;
     DeepSeek4SpecRollback rollback;
-    deepseek4_spec_rollback_save(cache, rollback, 10, 4);
+    deepseek4_spec_rollback_save(cache, rollback, 10, 6);
+    TEST_ASSERT(rollback.raw_count == 6);
 
     auto overwrite_row = [&](int absolute_pos, uint8_t value) {
         const int row = absolute_pos % weights.n_swa;
@@ -2034,7 +2098,7 @@ static void test_dspark_raw_ring_rollback_after_wrap(ggml_backend_t backend) {
                   expected.begin() + (size_t) row * layer.raw_kv->nb[1] + row_bytes,
                   value);
     };
-    for (int t = 0; t < 4; ++t) {
+    for (int t = 0; t < 6; ++t) {
         overwrite_row(10 + t, (uint8_t) (0xa0 + t));
     }
 
@@ -2310,8 +2374,23 @@ static void test_dspark_prefill_capture_boundaries() {
     std::fprintf(stderr, "  test_dspark_prefill_capture_boundaries ...");
 
     using Backend = DeepSeek4Backend;
-    // Layer-major prefill captures only the requested tail from a wide graph,
-    // while generic paths still stop exactly at the final feature window.
+    // Both monolithic layer-major and sparse heterogeneous prefill return the
+    // per-token capture rows needed to retain a tail from one wide graph.
+    TEST_ASSERT(Backend::supports_batched_spec_feature_capture(
+                    false, PrefillAttentionMode::Sparse, 2048));
+    TEST_ASSERT(Backend::supports_batched_spec_feature_capture(
+                    true, PrefillAttentionMode::Sparse, 2048));
+    TEST_ASSERT(!Backend::supports_batched_spec_feature_capture(
+                    true, PrefillAttentionMode::Dense, 2048));
+    TEST_ASSERT(!Backend::supports_batched_spec_feature_capture(
+                    true, PrefillAttentionMode::Exact, 2048));
+    TEST_ASSERT(!Backend::supports_batched_spec_feature_capture(
+                    true, PrefillAttentionMode::Sparse, 4));
+    TEST_ASSERT(!Backend::supports_batched_spec_feature_capture(
+                    true, PrefillAttentionMode::Sparse,
+                    DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS + 1));
+
+    // Generic paths still stop exactly at the final feature window.
     TEST_ASSERT(Backend::capture_safe_prefill_tokens(
                     0, 2048, 1920, true, false, 0, 0) == 2048);
     TEST_ASSERT(Backend::capture_safe_prefill_tokens(
@@ -2906,6 +2985,10 @@ static void test_ds4_flash_attention_parallel_index_scan_gpu() {
         ctx, GGML_TYPE_F32, head_dim, n_kv, 1);
     ggml_tensor * mask = ggml_new_tensor_2d(
         ctx, GGML_TYPE_F16, n_kv, n_tokens);
+    ggml_tensor * direct_mask = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F16, n_kv, n_tokens);
+    ggml_tensor * direct_topk = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_I32, selected_rows, n_tokens);
     ggml_tensor * output = ggml_flash_attn_ext(
         ctx, q, kv, kv, mask, 1.0f / std::sqrt((float) head_dim),
         0.0f, 0.0f);
@@ -2913,12 +2996,39 @@ static void test_ds4_flash_attention_parallel_index_scan_gpu() {
     // enters the compact four-head HIP path and exceeds the parallel threshold.
     ggml_flash_attn_ext_set_ds4_sparse(
         output, raw_rows, raw_window, -selected_rows, 1);
+    ggml_tensor * direct_output = ggml_flash_attn_ext(
+        ctx, q, kv, kv, direct_mask,
+        1.0f / std::sqrt((float) head_dim), 0.0f, 0.0f);
+    ggml_flash_attn_ext_set_ds4_sparse(
+        direct_output, raw_rows, raw_window, -selected_rows, 1);
+    ggml_flash_attn_ext_set_ds4_indexer_topk(direct_output, direct_topk);
     ggml_set_output(output);
+    ggml_set_output(direct_output);
     TEST_ASSERT_MSG(ggml_backend_supports_op(backend, output),
                     "GPU rejected exact indexed DS4 attention");
+    TEST_ASSERT_MSG(ggml_backend_supports_op(backend, direct_output),
+                    "GPU rejected direct-top-k DS4 attention");
+
+    ggml_tensor * short_kv = ggml_new_tensor_3d(
+        ctx, GGML_TYPE_F32, head_dim, raw_rows + 128, 1);
+    ggml_tensor * short_mask = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F16, raw_rows + 128, n_tokens);
+    ggml_tensor * oversized_topk = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_I32, selected_rows, n_tokens);
+    ggml_tensor * oversized_output = ggml_flash_attn_ext(
+        ctx, q, short_kv, short_kv, short_mask,
+        1.0f / std::sqrt((float) head_dim), 0.0f, 0.0f);
+    ggml_flash_attn_ext_set_ds4_sparse(
+        oversized_output, raw_rows, raw_window, -selected_rows, 1);
+    ggml_flash_attn_ext_set_ds4_indexer_topk(
+        oversized_output, oversized_topk);
+    TEST_ASSERT_MSG(
+        !ggml_backend_supports_op(backend, oversized_output),
+        "GPU accepted direct top-k wider than the live compressed span");
 
     ggml_cgraph * graph = ggml_new_graph_custom(ctx, 64, false);
     ggml_build_forward_expand(graph, output);
+    ggml_build_forward_expand(graph, direct_output);
     ggml_gallocr_t alloc = ggml_gallocr_new(
         ggml_backend_get_default_buffer_type(backend));
     const bool allocated = ggml_gallocr_alloc_graph(alloc, graph);
@@ -2928,6 +3038,10 @@ static void test_ds4_flash_attention_parallel_index_scan_gpu() {
         std::vector<float> kv_data((size_t) head_dim * n_kv);
         std::vector<ggml_fp16_t> mask_data(
             (size_t) n_kv * n_tokens, ggml_fp32_to_fp16(-1.0e30f));
+        std::vector<ggml_fp16_t> direct_mask_data(
+            (size_t) n_kv * n_tokens, ggml_fp32_to_fp16(-1.0e30f));
+        std::vector<int32_t> direct_topk_data(
+            (size_t) selected_rows * n_tokens);
         for (size_t i = 0; i < q_data.size(); ++i) {
             q_data[i] = ((int) (i % 31) - 15) * 0.001f;
         }
@@ -2937,11 +3051,26 @@ static void test_ds4_flash_attention_parallel_index_scan_gpu() {
         for (int token = 0; token < n_tokens; ++token) {
             ggml_fp16_t * token_mask =
                 mask_data.data() + (size_t) token * n_kv;
+            ggml_fp16_t * token_direct_mask =
+                direct_mask_data.data() + (size_t) token * n_kv;
             for (int row = raw_rows - raw_window; row < raw_rows; ++row) {
                 token_mask[row] = ggml_fp32_to_fp16(0.0f);
+                token_direct_mask[row] = ggml_fp32_to_fp16(0.0f);
             }
             for (int row = token; row < n_comp_rows; row += 2) {
                 token_mask[raw_rows + row] = ggml_fp32_to_fp16(0.0f);
+            }
+            for (int row = 0; row < n_comp_rows; ++row) {
+                token_direct_mask[raw_rows + row] =
+                    ggml_fp32_to_fp16(0.0f);
+            }
+            // The model's top-k is score ordered. Reverse the physical order
+            // here so this test proves that the direct path restores the old
+            // ascending accumulation order rather than merely accepting an
+            // already sorted fixture.
+            for (int rank = 0; rank < selected_rows; ++rank) {
+                direct_topk_data[(size_t) token * selected_rows + rank] =
+                    token + 2 * (selected_rows - 1 - rank);
             }
         }
         ggml_backend_tensor_set(q, q_data.data(), 0,
@@ -2950,6 +3079,12 @@ static void test_ds4_flash_attention_parallel_index_scan_gpu() {
                                 kv_data.size() * sizeof(float));
         ggml_backend_tensor_set(mask, mask_data.data(), 0,
                                 mask_data.size() * sizeof(ggml_fp16_t));
+        ggml_backend_tensor_set(
+            direct_mask, direct_mask_data.data(), 0,
+            direct_mask_data.size() * sizeof(ggml_fp16_t));
+        ggml_backend_tensor_set(
+            direct_topk, direct_topk_data.data(), 0,
+            direct_topk_data.size() * sizeof(int32_t));
 
         const char * previous_serial =
             std::getenv("GGML_DS4_FA_SERIAL_INDEX_SCAN");
@@ -2957,6 +3092,7 @@ static void test_ds4_flash_attention_parallel_index_scan_gpu() {
             ? previous_serial : "";
         std::vector<float> serial((size_t) ggml_nelements(output));
         std::vector<float> parallel(serial.size());
+        std::vector<float> direct(serial.size());
         {
             setenv("GGML_DS4_FA_SERIAL_INDEX_SCAN", "1", 1);
             ScopedCudaGraphOverrides eager(
@@ -2982,6 +3118,8 @@ static void test_ds4_flash_attention_parallel_index_scan_gpu() {
                 "parallel indexed attention failed");
             ggml_backend_tensor_get(output, parallel.data(), 0,
                                     parallel.size() * sizeof(float));
+            ggml_backend_tensor_get(direct_output, direct.data(), 0,
+                                    direct.size() * sizeof(float));
         }
         if (previous_serial) {
             setenv("GGML_DS4_FA_SERIAL_INDEX_SCAN",
@@ -2993,6 +3131,286 @@ static void test_ds4_flash_attention_parallel_index_scan_gpu() {
             TEST_ASSERT_MSG(
                 nearly_equal(serial[i], parallel[i], 1.0e-6f, 1.0e-6f),
                 "parallel index scan changed attention output");
+            TEST_ASSERT_MSG(
+                serial[i] == direct[i],
+                "direct top-k changed attention output");
+        }
+    }
+
+    ggml_gallocr_free(alloc);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+static void test_ds4_indexer_score_packed_q4_gpu() {
+    std::fprintf(stderr, "  test_ds4_indexer_score_packed_q4_gpu ...");
+#if !defined(GGML_USE_HIP)
+    std::fprintf(stderr, " skipped (HIP-only candidate)\n");
+    return;
+#endif
+    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    if (!backend) {
+        std::fprintf(stderr, " skipped (no GPU backend)\n");
+        return;
+    }
+
+    constexpr int dim = 128;
+    constexpr int n_heads = 64;
+    constexpr int n_tokens = 4;
+    constexpr int n_comp = 4160;
+    constexpr int kv_start = 16384;
+    constexpr int ratio = 4;
+    ggml_context * ctx = make_test_context(4u << 20);
+    TEST_ASSERT_MSG(ctx != nullptr, "ggml_init failed");
+    if (!ctx) {
+        ggml_backend_free(backend);
+        std::fprintf(stderr, " FAIL\n");
+        return;
+    }
+
+    ggml_tensor * q = ggml_new_tensor_3d(
+        ctx, GGML_TYPE_F32, dim, n_heads, n_tokens);
+    ggml_tensor * weights = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F32, n_heads, n_tokens);
+    ggml_tensor * comp = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F16, dim, n_comp);
+    ggml_tensor * scores = ggml_ds4_indexer_score(
+        ctx, q, weights, comp, kv_start, ratio);
+    ggml_set_output(scores);
+    TEST_ASSERT_MSG(ggml_backend_supports_op(backend, scores),
+                    "GPU rejected packed-q4 indexer fixture");
+
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 16, false);
+    ggml_build_forward_expand(graph, scores);
+    ggml_gallocr_t alloc = ggml_gallocr_new(
+        ggml_backend_get_default_buffer_type(backend));
+    const bool allocated = ggml_gallocr_alloc_graph(alloc, graph);
+    TEST_ASSERT_MSG(allocated, "packed-q4 indexer graph allocation failed");
+    if (allocated) {
+        std::vector<float> q_data((size_t) dim * n_heads * n_tokens);
+        std::vector<float> weight_data((size_t) n_heads * n_tokens);
+        std::vector<ggml_fp16_t> comp_data((size_t) dim * n_comp);
+        for (size_t i = 0; i < q_data.size(); ++i) {
+            q_data[i] = ((int) (i % 31) - 15) * 0.0078125f;
+        }
+        for (size_t i = 0; i < weight_data.size(); ++i) {
+            weight_data[i] = ((int) (i % 17) - 8) * 0.015625f;
+        }
+        for (size_t i = 0; i < comp_data.size(); ++i) {
+            comp_data[i] = ggml_fp32_to_fp16(
+                ((int) (i % 29) - 14) * 0.0078125f);
+        }
+        ggml_backend_tensor_set(q, q_data.data(), 0,
+                                q_data.size() * sizeof(float));
+        ggml_backend_tensor_set(weights, weight_data.data(), 0,
+                                weight_data.size() * sizeof(float));
+        ggml_backend_tensor_set(comp, comp_data.data(), 0,
+                                comp_data.size() * sizeof(ggml_fp16_t));
+
+        const char * previous = std::getenv("GGML_DS4_INDEXER_PACK_Q4");
+        const std::string previous_value = previous ? previous : "";
+        std::vector<float> reference((size_t) n_comp * n_tokens);
+        std::vector<float> candidate(reference.size());
+        ScopedCudaGraphOverrides eager(
+            /*disable_graphs=*/true,
+            /*mmvq_max_ncols=*/0,
+            /*skip_property_check=*/false);
+        unsetenv("GGML_DS4_INDEXER_PACK_Q4");
+        TEST_ASSERT_MSG(
+            ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS,
+            "reference q4 indexer score failed");
+        ggml_backend_tensor_get(scores, reference.data(), 0,
+                                reference.size() * sizeof(float));
+
+        setenv("GGML_DS4_INDEXER_PACK_Q4", "1", 1);
+        TEST_ASSERT_MSG(
+            ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS,
+            "packed q4 indexer score failed");
+        ggml_backend_tensor_get(scores, candidate.data(), 0,
+                                candidate.size() * sizeof(float));
+        TEST_ASSERT_MSG(
+            std::memcmp(reference.data(), candidate.data(),
+                        reference.size() * sizeof(float)) == 0,
+            "packed q4 indexer changed score bits");
+
+        auto measure_us = [&](bool packed) {
+            if (packed) {
+                setenv("GGML_DS4_INDEXER_PACK_Q4", "1", 1);
+            } else {
+                unsetenv("GGML_DS4_INDEXER_PACK_Q4");
+            }
+            constexpr int warmups = 3;
+            constexpr int iterations = 30;
+            for (int i = 0; i < warmups; ++i) {
+                ggml_backend_graph_compute(backend, graph);
+            }
+            ggml_backend_synchronize(backend);
+            const auto begin = std::chrono::steady_clock::now();
+            for (int i = 0; i < iterations; ++i) {
+                ggml_backend_graph_compute(backend, graph);
+            }
+            ggml_backend_synchronize(backend);
+            const auto end = std::chrono::steady_clock::now();
+            return std::chrono::duration<double, std::micro>(end - begin).count() /
+                iterations;
+        };
+        const double reference_us = measure_us(false);
+        const double packed_us = measure_us(true);
+        std::fprintf(stderr, " reference=%.1fus packed=%.1fus",
+                     reference_us, packed_us);
+
+        if (previous) {
+            setenv("GGML_DS4_INDEXER_PACK_Q4", previous_value.c_str(), 1);
+        } else {
+            unsetenv("GGML_DS4_INDEXER_PACK_Q4");
+        }
+    }
+
+    ggml_gallocr_free(alloc);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+static void test_ds4_topk_block_radix_gpu() {
+    std::fprintf(stderr, "  test_ds4_topk_block_radix_gpu ...");
+#if !defined(GGML_USE_HIP)
+    std::fprintf(stderr, " skipped (HIP-only candidate)\n");
+    return;
+#endif
+    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    if (!backend) {
+        std::fprintf(stderr, " skipped (no GPU backend)\n");
+        return;
+    }
+
+    constexpr int ncols = 4160;
+    constexpr int nrows = 4;
+    constexpr int k = 512;
+    ggml_context * ctx = make_test_context(1u << 20);
+    TEST_ASSERT_MSG(ctx != nullptr, "ggml_init failed");
+    if (!ctx) {
+        ggml_backend_free(backend);
+        std::fprintf(stderr, " FAIL\n");
+        return;
+    }
+
+    ggml_tensor * scores = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F32, ncols, nrows);
+    ggml_tensor * selected = ggml_top_k(ctx, scores, k);
+    ggml_set_output(selected);
+    TEST_ASSERT_MSG(ggml_backend_supports_op(backend, selected),
+                    "GPU rejected long-context top-k fixture");
+
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 16, false);
+    ggml_build_forward_expand(graph, selected);
+    ggml_gallocr_t alloc = ggml_gallocr_new(
+        ggml_backend_get_default_buffer_type(backend));
+    const bool allocated = ggml_gallocr_alloc_graph(alloc, graph);
+    TEST_ASSERT_MSG(allocated, "top-k graph allocation failed");
+    if (allocated) {
+        std::vector<float> score_data((size_t) ncols * nrows);
+        for (int row = 0; row < nrows; ++row) {
+            for (int col = 0; col < ncols; ++col) {
+                // 4051 is coprime with 4160, producing one exact permutation
+                // of unique integer-valued scores per row. Output order is not
+                // part of TOP_K's contract, so compare the selected sets.
+                score_data[(size_t) row * ncols + col] =
+                    (float) (((col * 4051) + row * 997) % ncols);
+            }
+        }
+        ggml_backend_tensor_set(scores, score_data.data(), 0,
+                                score_data.size() * sizeof(float));
+
+        const char * previous = std::getenv("GGML_DS4_TOPK_BLOCK_RADIX");
+        const std::string previous_value = previous ? previous : "";
+        std::vector<int32_t> reference((size_t) k * nrows);
+        std::vector<int32_t> candidate(reference.size());
+        ScopedCudaGraphOverrides eager(
+            /*disable_graphs=*/true,
+            /*mmvq_max_ncols=*/0,
+            /*skip_property_check=*/false);
+        unsetenv("GGML_DS4_TOPK_BLOCK_RADIX");
+        TEST_ASSERT_MSG(
+            ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS,
+            "reference long-context top-k failed");
+        ggml_backend_tensor_get(selected, reference.data(), 0,
+                                reference.size() * sizeof(int32_t));
+
+        setenv("GGML_DS4_TOPK_BLOCK_RADIX", "1", 1);
+        TEST_ASSERT_MSG(
+            ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS,
+            "block-radix long-context top-k failed");
+        ggml_backend_tensor_get(selected, candidate.data(), 0,
+                                candidate.size() * sizeof(int32_t));
+
+        for (int row = 0; row < nrows; ++row) {
+            auto ref_begin = reference.begin() + (size_t) row * k;
+            auto candidate_begin = candidate.begin() + (size_t) row * k;
+            std::sort(ref_begin, ref_begin + k);
+            std::sort(candidate_begin, candidate_begin + k);
+            TEST_ASSERT_MSG(
+                std::equal(ref_begin, ref_begin + k, candidate_begin),
+                "block-radix top-k changed the selected row set");
+        }
+
+        // Padding and a valid -infinity score used to share the same radix
+        // key. Prove that padded columns can never be returned on a tie.
+        std::fill(
+            score_data.begin(), score_data.end(),
+            -std::numeric_limits<float>::infinity());
+        ggml_backend_tensor_set(scores, score_data.data(), 0,
+                                score_data.size() * sizeof(float));
+        TEST_ASSERT_MSG(
+            ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS,
+            "block-radix -infinity top-k failed");
+        ggml_backend_tensor_get(selected, candidate.data(), 0,
+                                candidate.size() * sizeof(int32_t));
+        for (int32_t index : candidate) {
+            TEST_ASSERT_MSG(
+                index >= 0 && index < ncols,
+                "block-radix top-k returned a padded column");
+        }
+        for (int row = 0; row < nrows; ++row) {
+            for (int col = 0; col < ncols; ++col) {
+                score_data[(size_t) row * ncols + col] =
+                    (float) (((col * 4051) + row * 997) % ncols);
+            }
+        }
+        ggml_backend_tensor_set(scores, score_data.data(), 0,
+                                score_data.size() * sizeof(float));
+
+        auto measure_us = [&](bool block_radix) {
+            if (block_radix) {
+                setenv("GGML_DS4_TOPK_BLOCK_RADIX", "1", 1);
+            } else {
+                unsetenv("GGML_DS4_TOPK_BLOCK_RADIX");
+            }
+            constexpr int warmups = 5;
+            constexpr int iterations = 100;
+            for (int i = 0; i < warmups; ++i) {
+                ggml_backend_graph_compute(backend, graph);
+            }
+            ggml_backend_synchronize(backend);
+            const auto begin = std::chrono::steady_clock::now();
+            for (int i = 0; i < iterations; ++i) {
+                ggml_backend_graph_compute(backend, graph);
+            }
+            ggml_backend_synchronize(backend);
+            const auto end = std::chrono::steady_clock::now();
+            return std::chrono::duration<double, std::micro>(end - begin).count() /
+                iterations;
+        };
+        const double reference_us = measure_us(false);
+        const double candidate_us = measure_us(true);
+        std::fprintf(stderr, " reference=%.1fus block_radix=%.1fus",
+                     reference_us, candidate_us);
+
+        if (previous) {
+            setenv("GGML_DS4_TOPK_BLOCK_RADIX", previous_value.c_str(), 1);
+        } else {
+            unsetenv("GGML_DS4_TOPK_BLOCK_RADIX");
         }
     }
 
@@ -3163,12 +3581,16 @@ static void test_hc_post_strided_split_gpu() {
 
     std::vector<float> residual((size_t) hc_dim * n_tokens);
     std::vector<float> block_out((size_t) n_embd * n_tokens);
+    std::vector<float> main_block((size_t) n_embd * n_tokens);
+    std::vector<float> peer_block((size_t) n_embd * n_tokens);
     std::vector<float> split_storage((size_t) split_stride * n_tokens, -99.0f);
     for (size_t i = 0; i < residual.size(); ++i) {
         residual[i] = ((int) (i % 17) - 8) * 0.03125f;
     }
     for (size_t i = 0; i < block_out.size(); ++i) {
         block_out[i] = ((int) (i % 11) - 5) * 0.0625f;
+        main_block[i] = block_out[i] * 0.25f;
+        peer_block[i] = block_out[i] - main_block[i];
     }
     for (int token = 0; token < n_tokens; ++token) {
         float * split = split_storage.data() + (size_t) token * split_stride;
@@ -3209,6 +3631,10 @@ static void test_hc_post_strided_split_gpu() {
         ctx, GGML_TYPE_F32, hc_dim, n_tokens);
     ggml_tensor * block_t = ggml_new_tensor_2d(
         ctx, GGML_TYPE_F32, n_embd, n_tokens);
+    ggml_tensor * main_t = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F32, n_embd, n_tokens);
+    ggml_tensor * peer_t = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F32, n_embd, n_tokens);
     ggml_tensor * split_storage_t = ggml_new_tensor_2d(
         ctx, GGML_TYPE_F32, split_stride, n_tokens);
     ggml_tensor * split_t = ggml_view_2d(
@@ -3217,10 +3643,14 @@ static void test_hc_post_strided_split_gpu() {
     TEST_ASSERT(!ggml_is_contiguous(split_t));
     ggml_tensor * output_t = ggml_ds4_hc_post(
         ctx, residual_t, block_t, split_t, n_hc);
+    ggml_tensor * split_output_t = ggml_ds4_hc_post_split(
+        ctx, residual_t, main_t, peer_t, split_t, n_hc);
     ggml_set_output(output_t);
+    ggml_set_output(split_output_t);
 
     ggml_cgraph * graph = ggml_new_graph_custom(ctx, 64, false);
     ggml_build_forward_expand(graph, output_t);
+    ggml_build_forward_expand(graph, split_output_t);
     ggml_gallocr_t alloc = ggml_gallocr_new(
         ggml_backend_get_default_buffer_type(backend));
     const bool allocated = ggml_gallocr_alloc_graph(alloc, graph);
@@ -3230,6 +3660,10 @@ static void test_hc_post_strided_split_gpu() {
                                 residual.size() * sizeof(float));
         ggml_backend_tensor_set(block_t, block_out.data(), 0,
                                 block_out.size() * sizeof(float));
+        ggml_backend_tensor_set(main_t, main_block.data(), 0,
+                                main_block.size() * sizeof(float));
+        ggml_backend_tensor_set(peer_t, peer_block.data(), 0,
+                                peer_block.size() * sizeof(float));
         ggml_backend_tensor_set(split_storage_t, split_storage.data(), 0,
                                 split_storage.size() * sizeof(float));
         const bool computed =
@@ -3237,12 +3671,18 @@ static void test_hc_post_strided_split_gpu() {
         TEST_ASSERT_MSG(computed, "strided HC-post graph compute failed");
         if (computed) {
             std::vector<float> actual(expected.size());
+            std::vector<float> split_actual(expected.size());
             ggml_backend_tensor_get(output_t, actual.data(), 0,
                                     actual.size() * sizeof(float));
+            ggml_backend_tensor_get(split_output_t, split_actual.data(), 0,
+                                    split_actual.size() * sizeof(float));
             for (size_t i = 0; i < actual.size(); ++i) {
                 TEST_ASSERT_MSG(nearly_equal(actual[i], expected[i],
                                              1.0e-6f, 1.0e-6f),
                                 "strided HC-post output mismatch");
+                TEST_ASSERT_MSG(nearly_equal(split_actual[i], expected[i],
+                                             1.0e-6f, 1.0e-6f),
+                                "batched split HC-post output mismatch");
             }
         }
     }
@@ -3994,6 +4434,7 @@ int main() {
     }
 
     test_compressor_pooling_correctness(backend);
+    test_chunked_graph_allocator(backend);
     test_swiglu_ds4_cpu_correctness(backend);
     test_moe_routing_correctness(backend);
     test_rmsnorm_correctness(backend);
@@ -4026,6 +4467,7 @@ int main() {
     test_exact_prefill_band_schedule();
     test_prefill_output_intents();
     test_prefill_readout_lifecycle_and_fused_exclusion();
+    test_hybrid_prefill_chunk_tokens();
     test_dspark_park_all_releases_drafter();
     test_dspark_raw_ring_rollback_after_wrap(backend);
     test_snapshot_save_restore();
@@ -4042,6 +4484,8 @@ int main() {
 #if defined(GGML_USE_CUDA) || defined(GGML_USE_HIP)
     test_ds4_flash_attention_keep_cap_gpu();
     test_ds4_flash_attention_parallel_index_scan_gpu();
+    test_ds4_indexer_score_packed_q4_gpu();
+    test_ds4_topk_block_radix_gpu();
     test_ds4_flash_attention_inverse_rope_fallback_gpu();
     test_hc_post_strided_split_gpu();
     test_hc_pre_kernel_gpu();

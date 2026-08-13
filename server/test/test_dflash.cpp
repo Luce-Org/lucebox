@@ -1603,8 +1603,14 @@ int main(int argc, char ** argv) {
             for (int il = 0; il < w.n_layer; ++il) {
                 for (int32_t eid : default_route_ids[(size_t)il]) {
                     if (eid >= 0 && eid < w.n_expert) {
-                        biased_stats.counts[(size_t)il * (size_t)w.n_expert + (size_t)eid] = 0;
-                        forced_cold_count++;
+                        uint64_t & count = biased_stats.counts[
+                            (size_t) il * (size_t) w.n_expert +
+                            (size_t) eid];
+                        if (count != 0) {
+                            count = 0;
+                            biased_stats.layer_totals[(size_t) il]--;
+                            forced_cold_count++;
+                        }
                     }
                 }
             }

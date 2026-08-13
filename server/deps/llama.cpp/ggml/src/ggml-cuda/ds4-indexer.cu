@@ -1,4 +1,5 @@
 #include "ds4-indexer.cuh"
+#include "ds4-env.cuh"
 
 #if defined(GGML_USE_HIP)
 // rocWMMA 1.x rejects RDNA4/gfx1151 at compile time. Use the optimized path
@@ -350,6 +351,120 @@ static __global__ void ds4_indexer_score_decode_wmma_kernel(
     }
 }
 
+// The speculative verifier scores exactly four query tokens. The general
+// WMMA kernel places those four tokens in a 16-row tile and executes twelve
+// zero rows for every head. Pack four consecutive heads into the tile instead:
+// row = 4*head_in_group + token. The post-WMMA loop still accumulates heads in
+// their original order, preserving the established F32 numerical topology.
+static __global__ void ds4_indexer_score_wmma_q4_kernel(
+        float       * scores,
+        const float * q,
+        const float * weights,
+        const half  * index_comp,
+        const float * visibility_mask,
+        int           n_comp,
+        int           kv_start,
+        int           n_head,
+        int           ratio) {
+    const int tile_c = (int) blockIdx.x * 128;
+    const int tid = (int) threadIdx.x;
+    const int warp = tid >> 5;
+
+    __shared__ half a_sh[16 * 128];
+    __shared__ half b_sh[128 * 128];
+    __shared__ float c_sh[8 * 16 * 16];
+    __shared__ float weight_sh[16];
+
+    float acc[2] = {0.0f, 0.0f};
+
+    for (int i = tid; i < 128 * 128; i += 256) {
+        const int c = i >> 7;
+        const int d = i & 127;
+        const int comp = tile_c + c;
+        b_sh[d + c * 128] = comp < n_comp
+            ? index_comp[(size_t) comp * 128 + d]
+            : __float2half(0.0f);
+    }
+    __syncthreads();
+
+    for (int head_base = 0; head_base < n_head; head_base += 4) {
+        for (int pair = tid; pair < 16 * 64; pair += 256) {
+            const int row = pair >> 6;
+            const int d = (pair & 63) * 2;
+            const int token = row & 3;
+            const int head = head_base + (row >> 2);
+            const float2 q_value = *reinterpret_cast<const float2 *>(
+                q + ((size_t) token * n_head + head) * 128 + d);
+            *reinterpret_cast<half2 *>(a_sh + row * 128 + d) =
+                __floats2half2_rn(q_value.x, q_value.y);
+        }
+        if (tid < 16) {
+            const int token = tid & 3;
+            const int head = head_base + (tid >> 2);
+            weight_sh[tid] = weights[(size_t) token * n_head + head];
+        }
+        __syncthreads();
+
+        ds4_wmma::fragment<ds4_wmma::matrix_a, 16, 16, 16,
+                           ds4_indexer_wmma_half,
+                           ds4_wmma::row_major> a_frag;
+        ds4_wmma::fragment<ds4_wmma::matrix_b, 16, 16, 16,
+                           ds4_indexer_wmma_half,
+                           ds4_wmma::col_major> b_frag;
+        ds4_wmma::fragment<ds4_wmma::accumulator, 16, 16, 16,
+                           float> c_frag;
+        ds4_wmma::fill_fragment(c_frag, 0.0f);
+        const int col0 = warp * 16;
+        for (int k0 = 0; k0 < 128; k0 += 16) {
+            const ds4_indexer_wmma_half * a_wmma =
+                reinterpret_cast<const ds4_indexer_wmma_half *>(a_sh);
+            const ds4_indexer_wmma_half * b_wmma =
+                reinterpret_cast<const ds4_indexer_wmma_half *>(b_sh);
+            ds4_wmma::load_matrix_sync(a_frag, a_wmma + k0, 128);
+            ds4_wmma::load_matrix_sync(
+                b_frag, b_wmma + col0 * 128 + k0, 128);
+            ds4_wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+        }
+        ds4_wmma::store_matrix_sync(
+            c_sh + warp * 16 * 16, c_frag, 16,
+            ds4_wmma::mem_row_major);
+        __syncthreads();
+
+        int slot = 0;
+        for (int output = tid; output < 4 * 128;
+             output += 256, ++slot) {
+            const int token = output >> 7;
+            const int local_comp = output & 127;
+            const int comp_tile = local_comp >> 4;
+            const int comp_col = local_comp & 15;
+#pragma unroll
+            for (int head_in_group = 0; head_in_group < 4;
+                 ++head_in_group) {
+                const int row = 4 * head_in_group + token;
+                const float dot = c_sh[
+                    comp_tile * 16 * 16 + row * 16 + comp_col];
+                acc[slot] += fmaxf(dot, 0.0f) * weight_sh[row];
+            }
+        }
+        __syncthreads();
+    }
+
+    int slot = 0;
+    for (int output = tid; output < 4 * 128;
+         output += 256, ++slot) {
+        const int token = output >> 7;
+        const int comp = tile_c + (output & 127);
+        if (comp < n_comp) {
+            const int visible = (kv_start + token + 1) / ratio;
+            const bool row_visible = visibility_mask
+                ? visibility_mask[(size_t) token * n_comp + comp] > -1.0e20f
+                : comp < visible;
+            scores[(size_t) token * n_comp + comp] =
+                row_visible ? acc[slot] : -1.0e30f;
+        }
+    }
+}
+
 #endif
 
 static __global__ void ds4_indexer_score_scalar_kernel(
@@ -442,6 +557,17 @@ void ggml_cuda_op_ds4_indexer_score(
     if (wmma_capable && n_tokens == 1) {
         const dim3 grid((unsigned) ((n_comp + 127) / 128), 1, 1);
         ds4_indexer_score_decode_wmma_kernel<<<grid, 256, 0, stream>>>(
+            static_cast<float *>(dst->data),
+            static_cast<const float *>(q->data),
+            static_cast<const float *>(weights->data),
+            static_cast<const half *>(comp->data),
+            visibility_mask
+                ? static_cast<const float *>(visibility_mask->data) : nullptr,
+            n_comp, kv_start, n_head, ratio);
+    } else if (wmma_capable && n_tokens == 4 && n_head % 4 == 0 &&
+               ds4_env_flag_enabled("GGML_DS4_INDEXER_PACK_Q4")) {
+        const dim3 grid((unsigned) ((n_comp + 127) / 128), 1, 1);
+        ds4_indexer_score_wmma_q4_kernel<<<grid, 256, 0, stream>>>(
             static_cast<float *>(dst->data),
             static_cast<const float *>(q->data),
             static_cast<const float *>(weights->data),

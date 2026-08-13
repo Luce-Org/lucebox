@@ -28,6 +28,33 @@
 
 namespace dflash::common {
 
+namespace {
+
+void unregister_mix_tensor(ggml_tensor * tensor) {
+    if (!tensor || !tensor->data) return;
+
+    if (tensor->type == GGML_TYPE_Q3_1_ROCMFP3_MIX) {
+        ggml_cuda_rocmfp3_mix_unregister(tensor->data);
+    } else if (tensor->type == GGML_TYPE_Q2_1_ROCMFP2_MIX) {
+        ggml_cuda_rocmfp2_mix_unregister(tensor->data);
+    }
+}
+
+}  // namespace
+
+void MoeHybridStorage::unregister_mix_tensors() {
+    for (MoeHybridLayerStorage & layer : layers) {
+        unregister_mix_tensor(layer.gate_hot);
+        unregister_mix_tensor(layer.up_hot);
+        unregister_mix_tensor(layer.down_hot);
+        unregister_mix_tensor(layer.gate_up_hot);
+        unregister_mix_tensor(layer.gate_cold);
+        unregister_mix_tensor(layer.up_cold);
+        unregister_mix_tensor(layer.down_cold);
+        unregister_mix_tensor(layer.gate_up_cold);
+    }
+}
+
 static bool duplicate_hot_experts_on_cold_gpu() {
     static const bool enabled = []() {
         const char * raw = std::getenv("DFLASH_MOE_DUPLICATE_HOT_ON_COLD");
@@ -149,6 +176,9 @@ static ggml_tensor * new_like_with_expert_count(ggml_context * ctx, ggml_tensor 
 } // namespace
 
 MoeHybridStorage::~MoeHybridStorage() {
+    // Registry entries point into the owner buffers, so remove them before the
+    // buffers can be released or their addresses reused.
+    unregister_mix_tensors();
     if (prefill_route_alloc) {
         ggml_gallocr_free(prefill_route_alloc);
         prefill_route_alloc = nullptr;
@@ -294,6 +324,7 @@ bool build_moe_hybrid_storage(const MoeHybridConfig & cfg,
             dst.hot_local_by_global[(size_t)expert] = (int32_t)i;
             is_hot[(size_t)expert] = 1;
         }
+        dst.decode_hot_local_by_global = dst.hot_local_by_global;
         for (int expert = 0; expert < cfg.n_expert; ++expert) {
             if (duplicate_hot_on_cold || !is_hot[(size_t)expert]) {
                 dst.cold_local_by_global[(size_t)expert] = (int32_t)dst.cold_expert_ids.size();
@@ -507,6 +538,7 @@ bool build_moe_hybrid_storage_from_file(
             dst.hot_local_by_global[(size_t)expert] = (int32_t)i;
             is_hot[(size_t)expert] = 1;
         }
+        dst.decode_hot_local_by_global = dst.hot_local_by_global;
         if (allocate_cold) {
             for (int expert = 0; expert < cfg.n_expert; ++expert) {
                 if (duplicate_hot_on_cold || !is_hot[(size_t)expert]) {

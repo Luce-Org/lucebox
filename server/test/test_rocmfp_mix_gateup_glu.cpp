@@ -33,18 +33,13 @@
 //    tensor with an undecoded one.
 
 #include "ds4_test_gpu_runtime.h"
+#include "ggml-cuda.h"
 
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <vector>
-
-extern "C" void ggml_cuda_rocmfp2_mix_register_host(
-    const void * base, size_t nb02, int n_experts, int out, int in,
-    const void * codebooks_bf16_host, const uint8_t * modes_host,
-    const uint8_t * rotations_host);
-extern "C" void ggml_cuda_rocmfp2_mix_unregister(const void * base);
 
 bool ggml_cuda_rocmfp2_mix_mul_mat_id(
     const void * vx, const float * src1, const int32_t * ids, float * dst,
@@ -144,7 +139,6 @@ int main() {
         books_gate[i] = f32_to_bf16( 0.5f - 0.21f * (float) (i % 5));
     }
     std::vector<uint8_t> modes_up(n_experts, 1), modes_gate(n_experts, 1);  // 1 = adaptive
-    std::vector<uint8_t> rots(n_experts, 0);
 
     void * d_up = nullptr, * d_gate = nullptr;
     float * d_x = nullptr, * d_up_out = nullptr, * d_gate_out = nullptr, * d_fused = nullptr;
@@ -170,10 +164,15 @@ int main() {
     for (size_t i = 0; i < idsh.size(); ++i) idsh[i] = (int32_t) ((i * 2 + 1) % n_experts);
     HIP_OK(cudaMemcpy(d_ids, idsh.data(), sizeof(int32_t) * idsh.size(), cudaMemcpyHostToDevice));
 
-    ggml_cuda_rocmfp2_mix_register_host(d_up, rows_bytes, n_experts, out, in,
-                                        books_up.data(), modes_up.data(), rots.data());
-    ggml_cuda_rocmfp2_mix_register_host(d_gate, rows_bytes, n_experts, out, in,
-                                        books_gate.data(), modes_gate.data(), rots.data());
+    CHECK(!ggml_cuda_rocmfp2_mix_register_host(
+              d_up, rows_bytes, n_experts, out, in - 32,
+              books_up.data(), modes_up.data()));
+    CHECK(ggml_cuda_rocmfp2_mix_register_host(
+              d_up, rows_bytes, n_experts, out, in,
+              books_up.data(), modes_up.data()));
+    CHECK(ggml_cuda_rocmfp2_mix_register_host(
+              d_gate, rows_bytes, n_experts, out, in,
+              books_gate.data(), modes_gate.data()));
 
     const int64_t ids_s0 = 1, ids_s1 = n_used;
     const int64_t src1_s1 = 0, src1_s2 = in;         // ne11 == 1 -> slot broadcast
@@ -284,8 +283,9 @@ int main() {
                                                 limit, nullptr));
     // Re-register with a DIFFERENT out: a shape-mismatched pair must be refused too, because the
     // grid is sized from one half and would index past the other.
-    ggml_cuda_rocmfp2_mix_register_host(d_gate, rows_bytes, n_experts, out / 2, in,
-                                        books_gate.data(), modes_gate.data(), rots.data());
+    CHECK(ggml_cuda_rocmfp2_mix_register_host(
+              d_gate, rows_bytes, n_experts, out / 2, in,
+              books_gate.data(), modes_gate.data()));
     CHECK(!ggml_cuda_rocmfp2_mix_mul_mat_id_glu(d_up, d_gate, d_x, d_ids, d_fused,
                                                 in, out, n_used, ntok, 1,
                                                 ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2,

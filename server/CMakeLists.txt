@@ -61,8 +61,8 @@ find_package(nlohmann_json CONFIG QUIET)
 if(NOT nlohmann_json_FOUND)
     include(FetchContent)
     set(_dflash_json_fetch_args
-        URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz
-        URL_HASH SHA256=d6c65aca6b1ed68e7a182f4757257b107ae403032760ed6ef121c9d55e81757d
+        URL https://codeload.github.com/nlohmann/json/tar.gz/9cca280a4d0ccf0c08f47a99aa71d1b0e52f8d03 # v3.11.3
+        URL_HASH SHA256=0dbc5e40a01ff142e7e68c03e85247a4dcede2f592d12d3677dee3664d17975a
     )
     if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.24")
         list(APPEND _dflash_json_fetch_args DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
@@ -1106,6 +1106,7 @@ if(DFLASH27B_TESTS)
         endif()
         target_include_directories(test_rocmfp3_mix_registry PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src/ggml-cuda)
         target_link_libraries(test_rocmfp3_mix_registry PRIVATE
             ggml ggml-base ${DFLASH27B_GGML_BACKEND_TARGET})
@@ -1132,6 +1133,7 @@ if(DFLASH27B_TESTS)
         endif()
         target_include_directories(test_rocmfp_mix_slice_matvec PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src/ggml-cuda)
         target_link_libraries(test_rocmfp_mix_slice_matvec PRIVATE
             ggml ggml-base ${DFLASH27B_GGML_BACKEND_TARGET})
@@ -1158,6 +1160,7 @@ if(DFLASH27B_TESTS)
         endif()
         target_include_directories(test_rocmfp_mix_gateup_glu PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src/ggml-cuda)
         target_link_libraries(test_rocmfp_mix_gateup_glu PRIVATE
             ggml ggml-base ${DFLASH27B_GGML_BACKEND_TARGET})

@@ -93,6 +93,10 @@ struct MoeHybridLayerStorage {
     std::vector<int32_t> hot_expert_ids;
     std::vector<int32_t> cold_expert_ids;
     std::vector<int32_t> hot_local_by_global;
+    // Optional decode ownership is a subset of the physically resident hot
+    // experts. Prefill can use every resident expert while decode retains a
+    // separately balanced fork. Empty means identical to hot_local_by_global.
+    std::vector<int32_t> decode_hot_local_by_global;
     std::vector<int32_t> cold_local_by_global;
 
     // --- Bounded GPU expert cache (laguna) ---
@@ -216,6 +220,9 @@ struct MoeHybridStorage {
     // Per-layer file region metadata for streaming (populated when mmap is active).
     std::vector<LayerExpertRegions> layer_regions;
 
+    // Remove decode-table registrations while their owner tensors are alive.
+    // Safe to call repeatedly, including during failed partial registration.
+    void unregister_mix_tensors();
     bool matches(const MoeHybridConfig & cfg) const;
     bool empty() const;
     bool has_mmap() const { return mmap_data != nullptr && mmap_size > 0; }

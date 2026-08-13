@@ -1,7 +1,9 @@
 #include "CppUnitTestFramework.hpp"
+#include "../src/common/moe_hybrid_ffn_eval.h"
 #include "../src/common/moe_hybrid_storage.h"
 
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 using namespace dflash::common;
@@ -34,4 +36,43 @@ TEST_CASE(MoeHybridStorageFixture, expert_residency_tracks_model_sized_expert_se
     storage.clear_expert_hot(256);
     REQUIRE(!storage.is_expert_hot(256));
     REQUIRE(!storage.all_routed_are_hot(all_hot.data(), (int)all_hot.size()));
+}
+
+TEST_CASE(MoeHybridStorageFixture, heterogeneous_route_balance_scales_with_model_top_k) {
+    REQUIRE(moe_balanced_main_slots_x4(4, 4.4) == 13);
+    REQUIRE(moe_balanced_main_slots_x4(6, 4.4) == 20);
+    REQUIRE(moe_balanced_main_slots_x4(0, 4.4) == 0);
+    REQUIRE(moe_balanced_main_slots_x4(6, 0.0) == 0);
+}
+
+TEST_CASE(MoeHybridStorageFixture, fractional_route_quota_rounds_over_the_batch) {
+    ggml_init_params params{
+        /*mem_size=*/1024 * 1024,
+        /*mem_buffer=*/nullptr,
+        /*no_alloc=*/true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    REQUIRE(ctx != nullptr);
+
+    ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 6, 5);
+    ggml_tensor * weights = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 6, 5);
+    ggml_tensor * local_lut =
+        ggml_new_tensor_4d(ctx, GGML_TYPE_I32, 1, 8, 5, 1);
+    ggml_tensor * candidate_lut =
+        ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 8, 5, 1);
+    REQUIRE(ids && weights && local_lut && candidate_lut);
+
+    // top-k 6 at a 3:1 owner rate is 4.5 main routes per token. Across a
+    // five-token verifier batch the exact quota is 22.5, which rounds to 23.
+    ggml_tensor * owner_ids = ggml_ds4_moe_balanced_owner_ids(
+        ctx, ids, weights, local_lut, candidate_lut,
+        /*main_slots_x4=*/18, /*main_owner=*/true);
+    REQUIRE(owner_ids != nullptr);
+    int32_t main_quota = 0;
+    std::memcpy(&main_quota,
+                owner_ids->op_params + sizeof(int32_t),
+                sizeof(main_quota));
+    REQUIRE(main_quota == 23);
+
+    ggml_free(ctx);
 }

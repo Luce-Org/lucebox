@@ -3,6 +3,7 @@
 #include "ggml-cuda/dequantize.cuh"
 #include "ggml-cuda/mmvq.cuh"
 
+#include <climits>
 #include <cstring>
 
 static __device__ __forceinline__ float silu_f32(float x) {
@@ -435,6 +436,48 @@ static __global__ void ds4_align_moe_ids_kernel(
     }
 }
 
+static __global__ void ds4_balanced_owner_ids_kernel(
+        const int32_t * __restrict__ global_ids,
+        const float * __restrict__ router_weights,
+        const int32_t * __restrict__ local_id_lut,
+        const float * __restrict__ main_candidate_lut,
+        int32_t * __restrict__ owner_ids,
+        int n_routes,
+        int n_tokens,
+        int n_expert,
+        int main_quota,
+        bool main_owner) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) {
+        return;
+    }
+
+    // Assign one shared, host-rounded quota over the complete verification
+    // batch while keeping the decision device-local and identical on both
+    // owners.
+    int64_t assigned_main = 0;
+    for (int token = 0; token < n_tokens; ++token) {
+        const int64_t row = (int64_t) token * n_routes;
+        for (int route = 0; route < n_routes; ++route) {
+            const int64_t index = row + route;
+            const int32_t global_id = global_ids[index];
+            const bool active = router_weights[index] != 0.0f;
+            const bool valid_global = global_id >= 0 && global_id < n_expert;
+            const bool main_candidate = active && valid_global &&
+                main_candidate_lut[global_id] != 0.0f;
+            const bool route_on_main =
+                main_candidate && assigned_main < main_quota;
+            if (route_on_main) {
+                ++assigned_main;
+            }
+
+            const bool keep = active && valid_global &&
+                (main_owner ? route_on_main : !route_on_main);
+            const int32_t local_id = keep ? local_id_lut[global_id] : -1;
+            owner_ids[index] = local_id >= 0 ? local_id : -1;
+        }
+    }
+}
+
 static ggml_tensor make_contiguous_f32_tensor(
         float * data,
         int64_t ne0,
@@ -607,6 +650,52 @@ static void ggml_cuda_op_ds4_moe_owner_split(
 
 void ggml_cuda_op_moe_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int mode = ggml_get_op_params_i32(dst, 0);
+    if (mode == GGML_MOE_FUSED_BALANCED_OWNER_IDS) {
+        const ggml_tensor * global_ids = dst->src[0];
+        const ggml_tensor * weights = dst->src[1];
+        const ggml_tensor * local_lut = dst->src[2];
+        const ggml_tensor * candidate_lut = dst->src[3];
+        GGML_ASSERT(global_ids && global_ids->type == GGML_TYPE_I32);
+        GGML_ASSERT(weights && weights->type == GGML_TYPE_F32);
+        GGML_ASSERT(local_lut && local_lut->type == GGML_TYPE_I32);
+        GGML_ASSERT(candidate_lut && candidate_lut->type == GGML_TYPE_F32);
+        GGML_ASSERT(dst->type == GGML_TYPE_I32);
+        GGML_ASSERT(ggml_are_same_shape(global_ids, weights));
+        GGML_ASSERT(ggml_are_same_shape(global_ids, dst));
+        GGML_ASSERT(ggml_is_contiguous(global_ids));
+        GGML_ASSERT(ggml_is_contiguous(weights));
+        GGML_ASSERT(ggml_is_contiguous(local_lut));
+        GGML_ASSERT(ggml_is_contiguous(candidate_lut));
+        GGML_ASSERT(ggml_is_contiguous(dst));
+
+        GGML_ASSERT(global_ids->ne[0] > 0 && global_ids->ne[0] <= INT_MAX / 4 &&
+                    global_ids->ne[1] > 0 && global_ids->ne[1] <= INT_MAX &&
+                    global_ids->ne[2] == 1 && global_ids->ne[3] == 1);
+        const int n_routes = (int) global_ids->ne[0];
+        const int n_tokens = (int) global_ids->ne[1];
+        GGML_ASSERT(local_lut->ne[0] == 1 && local_lut->ne[2] == n_tokens &&
+                    local_lut->ne[3] == 1);
+        GGML_ASSERT(candidate_lut->ne[0] == 1 &&
+                    candidate_lut->ne[1] == local_lut->ne[1] &&
+                    candidate_lut->ne[2] == n_tokens &&
+                    candidate_lut->ne[3] == 1);
+        GGML_ASSERT(local_lut->ne[1] > 0 && local_lut->ne[1] <= INT_MAX);
+        // Dimension 1 is the base expert domain; later dimensions are only
+        // verifier-token replicas and must not expand the valid ID range.
+        const int n_expert = (int) local_lut->ne[1];
+        const int main_quota = ggml_get_op_params_i32(dst, 1);
+        GGML_ASSERT(main_quota > 0 &&
+                    (int64_t) main_quota <= (int64_t) n_routes * n_tokens);
+        const bool main_owner = ggml_get_op_params_i32(dst, 2) != 0;
+        ds4_balanced_owner_ids_kernel<<<1, 1, 0, ctx.stream()>>>(
+            (const int32_t *) global_ids->data,
+            (const float *) weights->data,
+            (const int32_t *) local_lut->data,
+            (const float *) candidate_lut->data,
+            (int32_t *) dst->data,
+            n_routes, n_tokens, n_expert, main_quota, main_owner);
+        return;
+    }
     if (mode == GGML_MOE_FUSED_ALIGN_IDS) {
         const ggml_tensor * ids = dst->src[0];
         GGML_ASSERT(ids && ids->type == GGML_TYPE_I32);

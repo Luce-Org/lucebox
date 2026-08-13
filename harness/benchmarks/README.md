@@ -103,3 +103,16 @@ Each run writes:
 Prompt files are JSONL. Each line needs `id` and either `prompt` or `messages`.
 Optional `expect_contains` and `expect_regex` fields define lightweight accuracy
 checks.
+
+---
+
+## DeepSeek 4 exact-context benchmark
+
+`deepseek4/ds4_publication_decode_client.py` runs a deterministic streaming
+decode workload and records timing, token counts, and response hashes.
+`deepseek4/ds4_context_sweep.py` uses the target model's tokenizer to run the
+same workload at exact context lengths.
+
+The AMD q=5 hardware launcher is kept separately under
+`harness/qualification/deepseek4/` because it changes GPU performance settings
+and assumes a specific two-GPU layout.

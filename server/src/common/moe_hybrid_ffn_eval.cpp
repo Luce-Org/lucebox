@@ -5,12 +5,15 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <future>
+#include <limits>
+#include <mutex>
 
 namespace dflash::common {
 
@@ -127,6 +130,154 @@ const MoeHybridGraphPolicy & moe_hybrid_graph_policy() {
         return result;
     }();
     return policy;
+}
+
+int moe_balanced_main_slots_x4(int top_k, double main_to_peer_rate) {
+    if (top_k <= 0 || top_k > std::numeric_limits<int>::max() / 4 ||
+        !std::isfinite(main_to_peer_rate) || main_to_peer_rate <= 0.0) {
+        return 0;
+    }
+
+    const int total = 4 * top_k;
+    const double peer_exact = (double) total / (main_to_peer_rate + 1.0);
+    const int peer_lower = std::clamp((int) std::floor(peer_exact), 0, total);
+    const int peer_upper = std::clamp((int) std::ceil(peer_exact), 0, total);
+    const auto completion_time = [=](int peer) {
+        return std::max((double) (total - peer) / main_to_peer_rate,
+                        (double) peer);
+    };
+    const int peer = completion_time(peer_upper) < completion_time(peer_lower)
+        ? peer_upper : peer_lower;
+    return total - peer;
+}
+
+// The serial balanced-owner assignment is qualified for the q=5 DSpark
+// verifier. Wider batches retain the ordinary parallel owner remap.
+constexpr int kDynamicRouteBalanceMaxTokens = 5;
+
+static int dynamic_route_balance_main_slots_x4(
+        int n_used,
+        double * derived_main_to_peer_rate) {
+    struct DynamicRouteBalanceConfig {
+        bool enabled = false;
+        bool valid = true;
+        long explicit_main_slots_x4 = 0;
+        double main_to_peer_rate = 0.0;
+    };
+    static const DynamicRouteBalanceConfig config = [] {
+        DynamicRouteBalanceConfig result;
+        const char * enabled = moe_policy_env(
+            "DFLASH_MOE_TP_DYNAMIC_ROUTE_BALANCE",
+            "DFLASH_DS4_TP_DYNAMIC_ROUTE_BALANCE");
+        if (!enabled || !*enabled || std::strcmp(enabled, "0") == 0) {
+            return result;
+        }
+        result.enabled = true;
+        const char * raw_slots_x4 = moe_policy_env(
+            "DFLASH_MOE_TP_DYNAMIC_MAIN_SLOTS_X4",
+            "DFLASH_DS4_TP_DYNAMIC_MAIN_SLOTS_X4");
+        const char * raw_slots_x2 = moe_policy_env(
+            "DFLASH_MOE_TP_DYNAMIC_MAIN_SLOTS_X2",
+            "DFLASH_DS4_TP_DYNAMIC_MAIN_SLOTS_X2");
+        const char * raw_slots = moe_policy_env(
+            "DFLASH_MOE_TP_DYNAMIC_MAIN_SLOTS",
+            "DFLASH_DS4_TP_DYNAMIC_MAIN_SLOTS");
+        const int explicit_count =
+            (raw_slots_x4 && *raw_slots_x4 ? 1 : 0) +
+            (raw_slots_x2 && *raw_slots_x2 ? 1 : 0) +
+            (raw_slots && *raw_slots ? 1 : 0);
+        if (explicit_count > 1) {
+            result.valid = false;
+            return result;
+        }
+        const char * raw = raw_slots;
+        long scale = 4L;
+        if (raw_slots_x4 && *raw_slots_x4) {
+            raw = raw_slots_x4;
+            scale = 1L;
+        } else if (raw_slots_x2 && *raw_slots_x2) {
+            raw = raw_slots_x2;
+            scale = 2L;
+        }
+        if (raw && *raw) {
+            errno = 0;
+            char * end = nullptr;
+            const long value = std::strtol(raw, &end, 10);
+            if (errno == ERANGE || end == raw || *end != '\0' || value <= 0 ||
+                value > std::numeric_limits<long>::max() / scale) {
+                result.valid = false;
+                return result;
+            }
+            result.explicit_main_slots_x4 = scale * value;
+            return result;
+        }
+
+        // The legacy top-4 default assigned three routes to the main owner.
+        // Express that as a 3:1 rate so the same policy scales with model top-k.
+        result.main_to_peer_rate = 3.0;
+        const char * raw_rate = moe_policy_env(
+            "DFLASH_MOE_TP_MAIN_TO_PEER_RATE",
+            "DFLASH_DS4_TP_MAIN_TO_PEER_RATE");
+        if (raw_rate && *raw_rate) {
+            errno = 0;
+            char * end = nullptr;
+            const double value = std::strtod(raw_rate, &end);
+            if (errno == ERANGE || end == raw_rate || *end != '\0' ||
+                !std::isfinite(value) || value <= 0.0) {
+                result.valid = false;
+                return result;
+            }
+            result.main_to_peer_rate = value;
+        }
+        return result;
+    }();
+
+    if (derived_main_to_peer_rate) {
+        *derived_main_to_peer_rate = 0.0;
+    }
+    if (!config.enabled) return 0;
+    if (n_used <= 0 || n_used > std::numeric_limits<int>::max() / 4) {
+        static std::once_flag invalid_top_k_log;
+        std::call_once(invalid_top_k_log, [n_used] {
+            std::fprintf(stderr,
+                "[moe-hybrid] dynamic route balance disabled: invalid "
+                "top-k=%d\n", n_used);
+        });
+        return 0;
+    }
+
+    if (!config.valid) {
+        static std::once_flag malformed_log;
+        std::call_once(malformed_log, [] {
+            std::fprintf(stderr,
+                "[moe-hybrid] dynamic route balance disabled: "
+                "main-slot or transfer-rate configuration is malformed or "
+                "conflicting\n");
+        });
+        return 0;
+    }
+
+    long requested_x4 = config.explicit_main_slots_x4;
+    if (requested_x4 == 0 && config.main_to_peer_rate > 0.0) {
+        requested_x4 = moe_balanced_main_slots_x4(
+            n_used, config.main_to_peer_rate);
+        if (requested_x4 == 0) requested_x4 = -1;
+        if (derived_main_to_peer_rate) {
+            *derived_main_to_peer_rate = config.main_to_peer_rate;
+        }
+    }
+    if (requested_x4 < 4 || requested_x4 > 4L * n_used) {
+        static std::once_flag invalid_log;
+        std::call_once(invalid_log, [n_used] {
+            std::fprintf(stderr,
+                "[moe-hybrid] dynamic route balance disabled: "
+                "four times the main slot quota must be in [4,%ld] "
+                "for top-k=%d\n",
+                4L * n_used, n_used);
+        });
+        return 0;
+    }
+    return (int) requested_x4;
 }
 
 static void add_hybrid_telemetry(MoeHybridFfnTelemetry & dst,
@@ -756,6 +907,8 @@ static bool build_moe_owner_remap(
         ggml_tensor * global_ids,
         ggml_tensor * router_weights,
         int n_tokens,
+        int dynamic_main_slots_x4,
+        bool main_owner,
         MoeOwnerGraphSpec & owner) {
     if (!owner.local_by_global ||
         (int) owner.local_by_global->size() != cfg.n_expert ||
@@ -784,6 +937,24 @@ static bool build_moe_owner_remap(
         ggml_set_output(*owner.valid_lut);
     }
 
+    if (dynamic_main_slots_x4 > 0) {
+        // The secondary owner must hold every expert because it receives the
+        // exact complement of the capped primary routes.
+        if (!main_owner && std::any_of(
+                owner.local_by_global->begin(), owner.local_by_global->end(),
+                [](int32_t local) { return local < 0; })) {
+            return false;
+        }
+        owner.local_ids = track(ggml_ds4_moe_balanced_owner_ids(
+            ctx, global_ids, router_weights,
+            *owner.local_lut, *owner.valid_lut,
+            dynamic_main_slots_x4, main_owner));
+        // Negative owner IDs suppress non-owned routes exactly in the
+        // dedicated MMVQ kernels, so the canonical route weights can be reused.
+        owner.masked_weights = router_weights;
+        return owner.local_ids != nullptr;
+    }
+
     // Store immutable q-replicated lookup rows as graph inputs instead of
     // running owner-local REPEAT kernels in every layer and verifier step.
     ggml_tensor * mapped = track(ggml_get_rows(
@@ -805,9 +976,12 @@ static bool prepare_moe_owner_branch(
         ggml_tensor * global_ids,
         ggml_tensor * router_weights,
         int n_tokens,
+        int dynamic_main_slots_x4,
+        bool main_owner,
         MoeOwnerGraphSpec & owner) {
     return !owner.available() || build_moe_owner_remap(
-        ctx, cfg, global_ids, router_weights, n_tokens, owner);
+        ctx, cfg, global_ids, router_weights, n_tokens,
+        dynamic_main_slots_x4, main_owner, owner);
 }
 
 static void align_moe_owner_routes(
@@ -982,11 +1156,13 @@ bool build_moe_hybrid_ffn_graph(
     MoeHybridGraphInputs &         out,
     bool                           include_shared,
     bool                           allow_fused_combine,
-    MoeHybridJoinMode              join_mode) {
+    MoeHybridJoinMode              join_mode,
+    MoeHybridRouteBalance          route_balance) {
 
     out.output = nullptr;
     out.main_output = nullptr;
     out.peer_output = nullptr;
+    out.dynamic_route_balance = false;
     if (!ctx || !inp || !global_ids || !router_weights || n_tokens <= 0 ||
         cfg.n_embd <= 0 || cfg.n_ff_exp <= 0 || cfg.n_expert <= 0 ||
         cfg.n_expert_used <= 0) {
@@ -995,6 +1171,7 @@ bool build_moe_hybrid_ffn_graph(
 
     const bool canonical_route_join =
         join_mode == MoeHybridJoinMode::CanonicalRouteOrder;
+    const int n_used = cfg.n_expert_used;
     // Both owner remaps consume the same normalized top-k route weights.
     // Expose the canonical tensor so the scheduler can keep it on the primary
     // backend rather than discovering it late through the secondary branch.
@@ -1012,12 +1189,62 @@ bool build_moe_hybrid_ffn_graph(
         &out.cold_local_lut, &out.cold_valid_lut,
         &out.cold_remap_nodes, &out.cold_nodes};
 
+    double derived_main_to_peer_rate = 0.0;
+    int dynamic_main_slots_x4 =
+        route_balance == MoeHybridRouteBalance::Allowed
+            ? dynamic_route_balance_main_slots_x4(
+                  n_used, &derived_main_to_peer_rate)
+            : 0;
+
+    const bool complete_secondary_map =
+        secondary_owner.local_by_global &&
+        (int) secondary_owner.local_by_global->size() == cfg.n_expert &&
+        std::none_of(
+            secondary_owner.local_by_global->begin(),
+            secondary_owner.local_by_global->end(),
+            [](int32_t local) { return local < 0; });
+    if (dynamic_main_slots_x4 > 0 &&
+        (n_tokens > kDynamicRouteBalanceMaxTokens ||
+         !primary_owner.available() ||
+         !secondary_owner.available() || !complete_secondary_map)) {
+        static std::once_flag fallback_log;
+        std::call_once(fallback_log, [n_tokens] {
+            std::fprintf(stderr,
+                "[moe-hybrid] dynamic route balance disabled for an "
+                "unsupported owner map or batch size (tokens=%d)\n",
+                n_tokens);
+        });
+        dynamic_main_slots_x4 = 0;
+    }
+    out.dynamic_route_balance = dynamic_main_slots_x4 > 0;
+    if (dynamic_main_slots_x4 > 0) {
+        static std::once_flag active_log;
+        std::call_once(
+            active_log,
+            [dynamic_main_slots_x4, n_used, derived_main_to_peer_rate] {
+                if (derived_main_to_peer_rate > 0.0) {
+                    std::fprintf(stderr,
+                        "[moe-hybrid] dynamic route balance active: "
+                        "main_slots=%.2f top_k=%d main_to_peer_rate=%.3f\n",
+                        0.25 * (double) dynamic_main_slots_x4, n_used,
+                        derived_main_to_peer_rate);
+                } else {
+                    std::fprintf(stderr,
+                        "[moe-hybrid] dynamic route balance active: "
+                        "main_slots=%.2f\n",
+                        0.25 * (double) dynamic_main_slots_x4);
+                }
+            });
+    }
+
     // Keep graph construction order stable: both remaps, then both optional ID
     // alignments, then both expert branches.
     if (!prepare_moe_owner_branch(
-            ctx, cfg, global_ids, router_weights, n_tokens, primary_owner) ||
+            ctx, cfg, global_ids, router_weights, n_tokens,
+            dynamic_main_slots_x4, true, primary_owner) ||
         !prepare_moe_owner_branch(
-            ctx, cfg, global_ids, router_weights, n_tokens, secondary_owner)) {
+            ctx, cfg, global_ids, router_weights, n_tokens,
+            dynamic_main_slots_x4, false, secondary_owner)) {
         return false;
     }
     align_moe_owner_routes(ctx, n_tokens, primary_owner);

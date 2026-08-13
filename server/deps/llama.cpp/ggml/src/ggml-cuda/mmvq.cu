@@ -733,6 +733,14 @@ static bool rocmfp4_x4_enabled() {
     return enabled;
 }
 
+static bool rocmfp4_q5_x4_plus1_enabled() {
+    static const bool enabled = []() {
+        const char * value = std::getenv("DFLASH_CUDA_MMVQ_FP4_Q5_X4_PLUS1");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    return enabled;
+}
+
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false,
           int fixed_ncols_x = 0, bool unroll_k_loop_2 = false,
           bool reuse_rocmfp4_weights = false,
@@ -772,8 +780,9 @@ static __global__ void mul_mat_vec_q(
     static_assert(!c_fp3_packed24 || type == GGML_TYPE_Q3_0_ROCMFPX,
                   "packed FP3 MMVQ specialization requires ROCmFP3 weights");
     static_assert(!c_fp4_x4 ||
-                      (type == GGML_TYPE_Q4_0_ROCMFP4_FAST && ncols_dst == 4),
-                  "FP4 x4 MMVQ specialization requires ROCmFP4-fast q4");
+                      (type == GGML_TYPE_Q4_0_ROCMFP4_FAST &&
+                       (ncols_dst == 4 || ncols_dst == 5)),
+                  "FP4 x4 MMVQ specialization requires ROCmFP4-fast q4/q5");
 
     const uint32_t channel_dst = blockIdx.y;
 
@@ -987,6 +996,11 @@ static __global__ void mul_mat_vec_q(
                     tmp[1][i] += dots.y;
                     tmp[2][i] += dots.z;
                     tmp[3][i] += dots.w;
+                    if constexpr (ncols_dst == 5) {
+                        tmp[4][i] += vec_dot_q_mmvq<type, false>(
+                            vx, &y[4*stride_col_y + kby],
+                            kbx_offset + i*stride_row_x + kbx, kqs);
+                    }
                     if constexpr (has_fusion) {
                         if (use_gate) {
                             const float4 gate_dots =
@@ -1002,6 +1016,11 @@ static __global__ void mul_mat_vec_q(
                             tmp_gate[1][i] += gate_dots.y;
                             tmp_gate[2][i] += gate_dots.z;
                             tmp_gate[3][i] += gate_dots.w;
+                            if constexpr (ncols_dst == 5) {
+                                tmp_gate[4][i] += vec_dot_q_mmvq<type, false>(
+                                    vgate, &y[4*stride_col_y + kby],
+                                    kbx_offset + i*stride_row_x + kbx, kqs);
+                            }
                         }
                     }
                 }
@@ -2210,6 +2229,22 @@ static void mul_mat_vec_q_switch_ncols_dst(
     if constexpr (type == GGML_TYPE_Q4_0_ROCMFP4_FAST) {
         if (!has_ids && ncols_dst == 4 && rocmfp4_x4_enabled()) {
             constexpr int c_ncols_dst = 4;
+            std::pair<dim3, dim3> dims = calc_launch_params<type>(
+                c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst,
+                warp_size, table_id);
+            mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, 0,
+                                        false, false, false, true>(
+                vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd,
+                stride_row_x, stride_col_y, stride_col_dst,
+                channel_ratio_fd, stride_channel_x, stride_channel_y,
+                stride_channel_dst, sample_ratio_fd, stride_sample_x,
+                stride_sample_y, stride_sample_dst, dims.first, dims.second,
+                0, ids_stride, stream);
+            return;
+        }
+        if (!has_ids && ncols_dst == 5 && rocmfp4_x4_enabled() &&
+            rocmfp4_q5_x4_plus1_enabled()) {
+            constexpr int c_ncols_dst = 5;
             std::pair<dim3, dim3> dims = calc_launch_params<type>(
                 c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst,
                 warp_size, table_id);

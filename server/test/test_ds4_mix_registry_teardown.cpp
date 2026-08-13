@@ -23,6 +23,8 @@
 // on them and never dereferences, exactly as test_rocmfp3_mix_registry relies on.
 
 #include "deepseek4_internal.h"
+#include "common/moe_hybrid_storage.h"
+#include "ggml-cuda.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -30,16 +32,9 @@
 
 using dflash::common::DeepSeek4Layer;
 using dflash::common::DeepSeek4Weights;
+using dflash::common::MoeHybridStorage;
 using dflash::common::free_deepseek4_weights;
 
-extern "C" void ggml_cuda_rocmfp3_mix_register_host(
-    const void * base, size_t nb02, int n_experts, int out, int in,
-    const void * codebooks_bf16_host, const uint8_t * modes_host,
-    const uint8_t * rotations_host);
-extern "C" void ggml_cuda_rocmfp2_mix_register_host(
-    const void * base, size_t nb02, int n_experts, int out, int in,
-    const void * codebooks_bf16_host, const uint8_t * modes_host,
-    const uint8_t * rotations_host);
 bool ggml_cuda_rocmfp3_mix_registered(const void * vx);
 bool ggml_cuda_rocmfp2_mix_registered(const void * vx);
 
@@ -66,17 +61,16 @@ constexpr int    OUT  = 32;
 constexpr int    IN   = 128;
 constexpr size_t NB02 = 4096;
 
-void register_as(bool is105, const void * base) {
+bool register_as(bool is105, const void * base) {
     const int K = is105 ? 8 : 4;
     std::vector<uint16_t> books((size_t) E * 2 * (size_t) K, 0x3f80);  // bf16 ~1.0
-    std::vector<uint8_t>  modes(E, 1), rots(E, 0);
+    std::vector<uint8_t>  modes(E, 1);
     if (is105) {
-        ggml_cuda_rocmfp3_mix_register_host(base, NB02, E, OUT, IN,
-                                           books.data(), modes.data(), rots.data());
-    } else {
-        ggml_cuda_rocmfp2_mix_register_host(base, NB02, E, OUT, IN,
-                                           books.data(), modes.data(), rots.data());
+        return ggml_cuda_rocmfp3_mix_register_host(
+            base, NB02, E, OUT, IN, books.data(), modes.data());
     }
+    return ggml_cuda_rocmfp2_mix_register_host(
+        base, NB02, E, OUT, IN, books.data(), modes.data());
 }
 
 }  // namespace
@@ -122,7 +116,7 @@ int main() {
         if (!t) { std::fprintf(stderr, "SKIP: tensor alloc failed\n"); return 0; }
         t->data = (void *) fake_base(slot++);
         const bool is105 = (t->type == GGML_TYPE_Q3_1_ROCMFP3_MIX);
-        register_as(is105, t->data);
+        CHECK(register_as(is105, t->data), "dense registration succeeds");
         (is105 ? dense105 : dense106).push_back(t->data);
     }
 
@@ -135,7 +129,7 @@ int main() {
         if (!t) { std::fprintf(stderr, "SKIP: tensor alloc failed\n"); return 0; }
         t->data = (void *) fake_base(slot++);
         const bool is105 = (t->type == GGML_TYPE_Q3_1_ROCMFP3_MIX);
-        register_as(is105, t->data);
+        CHECK(register_as(is105, t->data), "expert registration succeeds");
         (is105 ? expert105 : expert106).push_back(t->data);
     }
     w.layers.push_back(L);
@@ -169,6 +163,67 @@ int main() {
                  stale_expert, expert105.size() + expert106.size());
     CHECK(stale_dense == 0, "NO dense attention mix entry survives free_deepseek4_weights");
     CHECK(stale_expert == 0, "no expert mix entry survives free_deepseek4_weights");
+
+    // Hybrid loading owns separate compact tensors on the primary and
+    // secondary GPUs. MoeHybridStorage must unregister all of them before it
+    // releases either owner's buffers.
+    std::vector<const void *> hybrid105, hybrid106;
+    {
+        ggml_context * hybrid_ctx = ggml_init(ip);
+        if (!hybrid_ctx) {
+            std::fprintf(stderr, "SKIP: hybrid ggml_init failed\n");
+            return g_fails ? 1 : 0;
+        }
+
+        MoeHybridStorage hybrid;
+        hybrid.layers.resize(1);
+        auto & layer = hybrid.layers[0];
+        layer.hot_ctx = hybrid_ctx;
+        layer.gate_hot  = ggml_new_tensor_2d(
+            hybrid_ctx, GGML_TYPE_Q2_1_ROCMFP2_MIX, IN, OUT);
+        layer.down_hot  = ggml_new_tensor_2d(
+            hybrid_ctx, GGML_TYPE_Q3_1_ROCMFP3_MIX, IN, OUT);
+        layer.gate_cold = ggml_new_tensor_2d(
+            hybrid_ctx, GGML_TYPE_Q2_1_ROCMFP2_MIX, IN, OUT);
+        layer.down_cold = ggml_new_tensor_2d(
+            hybrid_ctx, GGML_TYPE_Q3_1_ROCMFP3_MIX, IN, OUT);
+
+        ggml_tensor * compact[] = {
+            layer.gate_hot, layer.down_hot, layer.gate_cold, layer.down_cold,
+        };
+        for (ggml_tensor * tensor : compact) {
+            if (!tensor) {
+                std::fprintf(stderr, "SKIP: hybrid tensor alloc failed\n");
+                return g_fails ? 1 : 0;
+            }
+            tensor->data = (void *) fake_base(slot++);
+            const bool is105 =
+                tensor->type == GGML_TYPE_Q3_1_ROCMFP3_MIX;
+            CHECK(register_as(is105, tensor->data),
+                  "hybrid registration succeeds");
+            (is105 ? hybrid105 : hybrid106).push_back(tensor->data);
+        }
+
+        size_t live_hybrid = 0;
+        for (const void * base : hybrid105) {
+            live_hybrid += ggml_cuda_rocmfp3_mix_registered(base) ? 1 : 0;
+        }
+        for (const void * base : hybrid106) {
+            live_hybrid += ggml_cuda_rocmfp2_mix_registered(base) ? 1 : 0;
+        }
+        CHECK(live_hybrid == hybrid105.size() + hybrid106.size(),
+              "every compact owner registration resolves before teardown");
+    }
+
+    size_t stale_hybrid = 0;
+    for (const void * base : hybrid105) {
+        stale_hybrid += ggml_cuda_rocmfp3_mix_registered(base) ? 1 : 0;
+    }
+    for (const void * base : hybrid106) {
+        stale_hybrid += ggml_cuda_rocmfp2_mix_registered(base) ? 1 : 0;
+    }
+    CHECK(stale_hybrid == 0,
+          "no compact mix entry survives MoeHybridStorage teardown");
 
     std::fprintf(stderr, g_fails ? "MIX REGISTRY TEARDOWN TEST FAILED (%d)\n"
                                  : "MIX REGISTRY TEARDOWN TEST OK\n", g_fails);

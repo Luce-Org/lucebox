@@ -2420,6 +2420,15 @@ extern "C" {
             int                  keep_rows,
             int                  block_size);
 
+    // Attach the exact DS4 compressed-row selection directly to flash
+    // attention. selected is I32 [keep_rows,n_batch] and indexes the
+    // compressed span (that is, rows after raw_rows). The DS4 HIP kernel sorts
+    // these score-ordered indices into physical-row order before reduction so
+    // the numerical topology stays identical to the mask-derived path.
+    GGML_API void ggml_flash_attn_ext_set_ds4_indexer_topk(
+            struct ggml_tensor * a,
+            struct ggml_tensor * selected);
+
     // Fuse DS4's inverse 64-d tail RoPE into the D=512 flash-attention
     // writeback. q_unrotated additionally asks the kernel to apply the forward
     // tail RoPE to Q from shared F32. This is exact-only plumbing: both paths
@@ -2504,6 +2513,7 @@ extern "C" {
         GGML_MOE_FUSED_DEFERRED_PEER_COPY = -3,
         GGML_MOE_FUSED_OWNER_SPLIT        = -4,
         GGML_MOE_FUSED_ALIGN_IDS          = -5,
+        GGML_MOE_FUSED_BALANCED_OWNER_IDS = -6,
     };
 
     // Word offsets in ggml_tensor::op_params for the deferred peer-copy op.
@@ -2573,6 +2583,20 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * expert_ids);
 
+    // Map global route IDs directly to one owner's compact expert stack while
+    // assigning a batch-wide main-resident quota encoded as four times the
+    // desired routes per token. The peer owner receives the exact complement.
+    // This fuses the former repeated-LUT lookup and route masking chain into
+    // one small device-local operation.
+    GGML_API struct ggml_tensor * ggml_ds4_moe_balanced_owner_ids(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * global_ids,
+            struct ggml_tensor  * router_weights,
+            struct ggml_tensor  * local_id_lut,
+            struct ggml_tensor  * main_candidate_lut,
+            int                   main_slots_x4,
+            bool                  main_owner);
+
     // Copy an F32 peer-GPU tensor only after a scheduler-provided device event
     // has completed. The scheduler writes the native event handle into the op
     // parameters and deliberately leaves src on its owner backend.
@@ -2608,7 +2632,8 @@ extern "C" {
 
     // Exact mode-1 variant for heterogeneous MoE verification. It computes
     // block_out[d] = peer_block[d] + main_block[d] inside the HC-post kernel,
-    // eliminating the standalone reduction and tokenwise CONT copies.
+    // eliminating the standalone reduction and tokenwise CONT copies. All
+    // non-base tensors may carry the same n_tokens second dimension.
     GGML_API struct ggml_tensor * ggml_ds4_hc_post_split(
             struct ggml_context * ctx,
             struct ggml_tensor  * residual_hc,
