@@ -8426,7 +8426,8 @@ struct ggml_tensor * ggml_ds4_moe_balanced_owner_ids(
     GGML_ASSERT(main_candidate_lut->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_are_same_shape(global_ids, router_weights));
     GGML_ASSERT(global_ids->ne[0] > 0 && global_ids->ne[0] <= INT_MAX / 4 &&
-                global_ids->ne[1] > 0 && global_ids->ne[1] <= INT_MAX);
+                global_ids->ne[1] > 0 && global_ids->ne[1] <= INT_MAX &&
+                global_ids->ne[2] == 1 && global_ids->ne[3] == 1);
     GGML_ASSERT(local_id_lut->ne[0] == 1 &&
                 local_id_lut->ne[1] > 0 && local_id_lut->ne[1] <= INT_MAX &&
                 local_id_lut->ne[2] == global_ids->ne[1] &&
@@ -8438,6 +8439,9 @@ struct ggml_tensor * ggml_ds4_moe_balanced_owner_ids(
     GGML_ASSERT(ggml_is_contiguous(main_candidate_lut));
     GGML_ASSERT(main_slots_x4 > 0 &&
                 main_slots_x4 <= 4 * (int) global_ids->ne[0]);
+    const int64_t main_quota =
+        ((int64_t) main_slots_x4 * global_ids->ne[1] + 2) / 4;
+    GGML_ASSERT(main_quota > 0 && main_quota <= INT_MAX);
 
     struct ggml_tensor * result = ggml_dup_tensor(ctx, global_ids);
     result->op = GGML_OP_MOE_FUSED;
@@ -8446,7 +8450,7 @@ struct ggml_tensor * ggml_ds4_moe_balanced_owner_ids(
     result->src[2] = local_id_lut;
     result->src[3] = main_candidate_lut;
     ggml_set_op_params_i32(result, 0, GGML_MOE_FUSED_BALANCED_OWNER_IDS);
-    ggml_set_op_params_i32(result, 1, main_slots_x4);
+    ggml_set_op_params_i32(result, 1, (int32_t) main_quota);
     ggml_set_op_params_i32(result, 2, main_owner ? 1 : 0);
     return result;
 }

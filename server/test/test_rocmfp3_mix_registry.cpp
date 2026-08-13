@@ -12,8 +12,11 @@
 #include "ggml-cuda.h"
 #include "rocmfp3_mix.cuh"
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <thread>
 #include <vector>
 
 static int g_fails = 0;
@@ -93,7 +96,34 @@ int main() {
     ggml_cuda_rocmfp3_mix_unregister(b0);
     CHECK(!ggml_cuda_rocmfp3_mix_registered(b0), "b0 gone after update+unregister");
 
-    // 5. no device-memory leak across many register/unregister cycles. A missing
+    // 5. Teardown cannot free side data between lookup and asynchronous kernel
+    //    enqueue. Dispatchers hold this lock across both operations; unregister
+    //    must wait until the launch has been handed to the device.
+    CHECK(ggml_cuda_rocmfp3_mix_register_host(
+              b0, nb02, E, out, in, books.data(), modes.data()),
+          "registration before dispatch lock test succeeds");
+    std::atomic<bool> teardown_started{false};
+    std::atomic<bool> teardown_finished{false};
+    ggml_cuda_rocmfp3_mix_registry_lock();
+    std::thread teardown([&] {
+        teardown_started.store(true, std::memory_order_release);
+        ggml_cuda_rocmfp3_mix_unregister(b0);
+        teardown_finished.store(true, std::memory_order_release);
+    });
+    while (!teardown_started.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    CHECK(!teardown_finished.load(std::memory_order_acquire),
+          "unregister waits for an in-flight dispatch");
+    ggml_cuda_rocmfp3_mix_registry_unlock();
+    teardown.join();
+    CHECK(teardown_finished.load(std::memory_order_acquire),
+          "unregister completes after dispatch releases the registry");
+    CHECK(!ggml_cuda_rocmfp3_mix_registered(b0),
+          "dispatch lock test leaves no registry entry");
+
+    // 6. no device-memory leak across many register/unregister cycles. A missing
     //    cudaFree in unregister (or on update) leaks ~E*(2*8*2 + 1) bytes per
     //    cycle; 4000 cycles would produce a measurable free-VRAM drop.
     cudaDeviceSynchronize();

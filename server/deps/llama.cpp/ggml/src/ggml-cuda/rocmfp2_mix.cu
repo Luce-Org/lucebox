@@ -57,7 +57,10 @@ struct MixEntry {
     const uint8_t * modes;          // n_experts
     int  device;          // device the side-data lives on; frees must happen in that context
 };
-std::mutex g_mix_mtx;
+// Dispatch wrappers keep this lock from lookup through kernel enqueue. It is
+// recursive because MMQ takes the public dispatch lock and then calls the
+// ordinary lookup helper, which also protects itself.
+std::recursive_mutex g_mix_mtx;
 std::vector<MixEntry> g_mix_registry;
 
 // Resolve the device that owns `p`. The mix side-data must be allocated on the SAME device as
@@ -96,12 +99,15 @@ struct MixDeviceGuard {
     ~MixDeviceGuard() { if (active) cudaSetDevice(prev); }
 };
 
-// Free an entry's device side-data. Caller holds g_mix_mtx.
+// Free an entry's device side-data. Caller holds g_mix_mtx, so no new launch
+// can acquire these pointers. Synchronizing here drains launches that released
+// the lock after enqueueing but are still running on the device.
 void mix_free_entry_device(MixEntry & e) {
     MixDeviceGuard guard(e.device);   // free where it was allocated
     if (!guard.valid) {
         GGML_ABORT("rocmfp2_mix: failed to select the side-data device");
     }
+    CUDA_CHECK(cudaDeviceSynchronize());
     const cudaError_t codebook_err = e.codebooks
         ? cudaFree((void *) e.codebooks) : cudaSuccess;
     const cudaError_t mode_err = e.modes
@@ -177,7 +183,7 @@ bool mix_validate_registration(
 void mix_register_impl(const void * base, size_t nb02, int n_experts, int out, int in,
                        const nv_bfloat16 * codebooks, const uint8_t * modes,
                        int device) {
-    std::lock_guard<std::mutex> lk(g_mix_mtx);
+    std::lock_guard<std::recursive_mutex> lk(g_mix_mtx);
     const size_t expert_bytes =
         (size_t) out * (size_t) (in / MIX_QK) * MIX_BLOCK_BYTES;
     MixEntry ne{base, nb02, expert_bytes, n_experts, out, in, codebooks, modes,
@@ -240,7 +246,7 @@ extern "C" bool ggml_cuda_rocmfp2_mix_register_host(
 }
 
 extern "C" void ggml_cuda_rocmfp2_mix_unregister(const void * base) {
-    std::lock_guard<std::mutex> lk(g_mix_mtx);
+    std::lock_guard<std::recursive_mutex> lk(g_mix_mtx);
     for (size_t i = 0; i < g_mix_registry.size(); ++i) {
         if (g_mix_registry[i].base == base) {
             mix_free_entry_device(g_mix_registry[i]);
@@ -253,7 +259,7 @@ extern "C" void ggml_cuda_rocmfp2_mix_unregister(const void * base) {
 static bool mix_lookup(
         const void * vx, MixEntry & out_e, int & out_expert,
         size_t * out_byte_offset = nullptr) {
-    std::lock_guard<std::mutex> lk(g_mix_mtx);
+    std::lock_guard<std::recursive_mutex> lk(g_mix_mtx);
     if (!vx) return false;
     const std::uintptr_t address =
         reinterpret_cast<std::uintptr_t>(vx);
@@ -358,6 +364,7 @@ __global__ void dequantize_rocmfp2_mix_kernel(
 }
 
 void dequantize_rocmfp2_mix_to_fp16_cuda(const void * vx, half * y, int64_t k, cudaStream_t stream) {
+    std::lock_guard<std::recursive_mutex> dispatch_lock(g_mix_mtx);
     MixEntry e;
     int expert;
     size_t byte_offset = 0;
@@ -833,6 +840,7 @@ bool ggml_cuda_rocmfp2_mix_mul_mat_vec_3d(
         int64_t src1_token_stride, int64_t src1_slice_stride,
         int64_t dst_token_stride,  int64_t dst_slice_stride,
         cudaStream_t stream) {
+    std::lock_guard<std::recursive_mutex> dispatch_lock(g_mix_mtx);
     MixEntry e;
     int slice0;
     if (!mix_lookup_expert_base(vx, e, slice0)) {
@@ -871,6 +879,7 @@ bool ggml_cuda_rocmfp2_mix_mul_mat_id(
         int64_t ids_s0, int64_t ids_s1,
         int64_t src1_s1, int64_t src1_s2,
         int64_t dst_s1, int64_t dst_s2, cudaStream_t stream) {
+    std::lock_guard<std::recursive_mutex> dispatch_lock(g_mix_mtx);
     MixEntry e;
     int expert0;
     if (!mix_lookup_expert_base(vx, e, expert0)) {
@@ -910,6 +919,7 @@ bool ggml_cuda_rocmfp2_mix_mul_mat_id_glu(
         int64_t src1_s1, int64_t src1_s2,
         int64_t dst_s1, int64_t dst_s2,
         float glu_limit, cudaStream_t stream) {
+    std::lock_guard<std::recursive_mutex> dispatch_lock(g_mix_mtx);
     MixEntry eu, eg;
     int expert0_u, expert0_g;
     if (!mix_lookup_expert_base(vx_up, eu, expert0_u) ||
@@ -939,6 +949,14 @@ bool ggml_cuda_rocmfp2_mix_registered(const void * vx) {
     return mix_lookup_expert_base(vx, e, expert);
 }
 
+void ggml_cuda_rocmfp2_mix_registry_lock() {
+    g_mix_mtx.lock();
+}
+
+void ggml_cuda_rocmfp2_mix_registry_unlock() {
+    g_mix_mtx.unlock();
+}
+
 bool ggml_cuda_rocmfp2_mix_mmq_info(
         const void * vx, const void ** codebooks, const uint8_t ** modes) {
     if (!codebooks || !modes) {
@@ -960,6 +978,7 @@ bool ggml_cuda_rocmfp2_mix_mul_mat_vec(
         const void * vx, const float * x, float * y,
         int in, int out, int ncols,
         int64_t x_col_stride, int64_t y_col_stride, cudaStream_t stream) {
+    std::lock_guard<std::recursive_mutex> dispatch_lock(g_mix_mtx);
     MixEntry e;
     int expert;
     if (!mix_lookup_expert_base(vx, e, expert)) {

@@ -32,6 +32,10 @@ case "$Q5_VERIFY" in
 esac
 FP4_Q5_X4_PLUS1="${FP4_Q5_X4_PLUS1:-auto}"
 CRITICAL_PATH_PLACEMENT="${CRITICAL_PATH_PLACEMENT:-0}"
+MAIN_TO_PEER_RATE_EXPLICIT=0
+if [[ -n "${MAIN_TO_PEER_RATE:-}" ]]; then
+    MAIN_TO_PEER_RATE_EXPLICIT=1
+fi
 MAIN_TO_PEER_RATE="${MAIN_TO_PEER_RATE:-3.4}"
 BALANCE_MIN_HOT="${BALANCE_MIN_HOT:-0}"
 EXPERT_BUDGET_MB="${EXPERT_BUDGET_MB:-13200}"
@@ -194,9 +198,38 @@ for target in "${target_args[@]}"; do
     fi
 done
 
+DYNAMIC_BALANCE_ENV_NAME=""
+DYNAMIC_BALANCE_ENV_VALUE=""
+DYNAMIC_BALANCE_LABEL="off"
+if [[ "$DYNAMIC_ROUTE_BALANCE" == 1 ]]; then
+    if [[ "$DYNAMIC_MAIN_SLOTS" != auto ]]; then
+        DYNAMIC_BALANCE_ENV_NAME="DFLASH_MOE_TP_DYNAMIC_MAIN_SLOTS"
+        DYNAMIC_BALANCE_ENV_VALUE="$DYNAMIC_MAIN_SLOTS"
+        DYNAMIC_BALANCE_LABEL="s${DYNAMIC_MAIN_SLOTS}"
+    elif [[ -n "$DYNAMIC_MAIN_SLOTS_X2" ]]; then
+        DYNAMIC_BALANCE_ENV_NAME="DFLASH_MOE_TP_DYNAMIC_MAIN_SLOTS_X2"
+        DYNAMIC_BALANCE_ENV_VALUE="$DYNAMIC_MAIN_SLOTS_X2"
+        DYNAMIC_BALANCE_LABEL="s2x${DYNAMIC_MAIN_SLOTS_X2}"
+    elif [[ -n "$DYNAMIC_MAIN_SLOTS_X4" ]]; then
+        DYNAMIC_BALANCE_ENV_NAME="DFLASH_MOE_TP_DYNAMIC_MAIN_SLOTS_X4"
+        DYNAMIC_BALANCE_ENV_VALUE="$DYNAMIC_MAIN_SLOTS_X4"
+        DYNAMIC_BALANCE_LABEL="s4x${DYNAMIC_MAIN_SLOTS_X4}"
+    elif [[ "$EXPERT_TOP_K" == 4 && "$MAIN_TO_PEER_RATE_EXPLICIT" == 0 ]]; then
+        # Preserve the qualified top-4 default. Automatic rate-based scaling is
+        # for widened top-k or an explicit operator override.
+        DYNAMIC_BALANCE_ENV_NAME="DFLASH_MOE_TP_DYNAMIC_MAIN_SLOTS"
+        DYNAMIC_BALANCE_ENV_VALUE=3
+        DYNAMIC_BALANCE_LABEL="s3"
+    else
+        DYNAMIC_BALANCE_ENV_NAME="DFLASH_MOE_TP_MAIN_TO_PEER_RATE"
+        DYNAMIC_BALANCE_ENV_VALUE="$MAIN_TO_PEER_RATE"
+        DYNAMIC_BALANCE_LABEL="r${MAIN_TO_PEER_RATE}"
+    fi
+fi
+
 VERIFY_WIDTH=$((4 + Q5_VERIFY))
 if [[ -z "$RUN_ID" ]]; then
-    RUN_ID="ds4-q${VERIFY_WIDTH}-k${EXPERT_TOP_K}-fr${FORCE_GRAPH_REPLAY}-direct${DIRECT_INDEXER_TOPK}-radix${BLOCK_RADIX_TOPK}-x4p1${FP4_Q5_X4_PLUS1}-cp${CRITICAL_PATH_PLACEMENT}-r${MAIN_TO_PEER_RATE}-$(date -u +%Y%m%dT%H%M%SZ)"
+    RUN_ID="ds4-q${VERIFY_WIDTH}-k${EXPERT_TOP_K}-fr${FORCE_GRAPH_REPLAY}-direct${DIRECT_INDEXER_TOPK}-radix${BLOCK_RADIX_TOPK}-x4p1${FP4_Q5_X4_PLUS1}-cp${CRITICAL_PATH_PLACEMENT}-bal${DYNAMIC_BALANCE_LABEL}-$(date -u +%Y%m%dT%H%M%SZ)"
 fi
 case "$RUN_ID" in
     .|..|*[!A-Za-z0-9._-]*)
@@ -373,23 +406,8 @@ fi
 if [[ "$DYNAMIC_ROUTE_BALANCE" == 1 ]]; then
     server_env+=(
         "DFLASH_MOE_TP_DYNAMIC_ROUTE_BALANCE=1"
-        "DFLASH_MOE_TP_MAIN_TO_PEER_RATE=$MAIN_TO_PEER_RATE"
+        "$DYNAMIC_BALANCE_ENV_NAME=$DYNAMIC_BALANCE_ENV_VALUE"
     )
-    if [[ "$DYNAMIC_MAIN_SLOTS" != auto ]]; then
-        server_env+=(
-            "DFLASH_MOE_TP_DYNAMIC_MAIN_SLOTS=$DYNAMIC_MAIN_SLOTS"
-        )
-    fi
-    if [[ -n "$DYNAMIC_MAIN_SLOTS_X2" ]]; then
-        server_env+=(
-            "DFLASH_MOE_TP_DYNAMIC_MAIN_SLOTS_X2=$DYNAMIC_MAIN_SLOTS_X2"
-        )
-    fi
-    if [[ -n "$DYNAMIC_MAIN_SLOTS_X4" ]]; then
-        server_env+=(
-            "DFLASH_MOE_TP_DYNAMIC_MAIN_SLOTS_X4=$DYNAMIC_MAIN_SLOTS_X4"
-        )
-    fi
 fi
 if [[ -n "$CUDA_DISABLE_GRAPHS_DEVICES" ]]; then
     server_env+=(

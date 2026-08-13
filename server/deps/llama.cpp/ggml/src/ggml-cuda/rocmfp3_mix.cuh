@@ -70,8 +70,16 @@ bool ggml_cuda_rocmfp3_mix_mul_mat_id(
 // check to confirm the sync-free mul_mat_id path will handle the node).
 bool ggml_cuda_rocmfp3_mix_registered(const void * vx);
 
+// Hold this lock from side-data lookup through asynchronous kernel launch.
+// Unregister/update waits for the lock, synchronizes the owning device, and
+// only then frees the registry-owned codebooks and modes.
+void ggml_cuda_rocmfp3_mix_registry_lock();
+void ggml_cuda_rocmfp3_mix_registry_unlock();
+
 // Return the device-resident side data needed by the batched MMQ loader.
 // Pointers are advanced to the expert containing `vx`, so both whole MoE
-// tensors and registered expert slices are safe callers.
+// tensors and registered expert slices are safe callers. A caller that uses
+// the returned pointers in an asynchronous launch must hold the registry lock
+// until that launch has been enqueued.
 bool ggml_cuda_rocmfp3_mix_mmq_info(
         const void * vx, const void ** codebooks, const uint8_t ** modes);

@@ -5,6 +5,36 @@
 #include "rocmfp2_mix.cuh"
 #include "rocmfp3_mix.cuh"
 
+namespace {
+
+class mix_registry_dispatch_guard {
+public:
+    explicit mix_registry_dispatch_guard(ggml_type type) : type_(type) {
+        if (type_ == GGML_TYPE_Q2_1_ROCMFP2_MIX) {
+            ggml_cuda_rocmfp2_mix_registry_lock();
+        } else if (type_ == GGML_TYPE_Q3_1_ROCMFP3_MIX) {
+            ggml_cuda_rocmfp3_mix_registry_lock();
+        }
+    }
+
+    ~mix_registry_dispatch_guard() {
+        if (type_ == GGML_TYPE_Q2_1_ROCMFP2_MIX) {
+            ggml_cuda_rocmfp2_mix_registry_unlock();
+        } else if (type_ == GGML_TYPE_Q3_1_ROCMFP3_MIX) {
+            ggml_cuda_rocmfp3_mix_registry_unlock();
+        }
+    }
+
+    mix_registry_dispatch_guard(const mix_registry_dispatch_guard &) = delete;
+    mix_registry_dispatch_guard & operator=(
+        const mix_registry_dispatch_guard &) = delete;
+
+private:
+    ggml_type type_;
+};
+
+}  // namespace
+
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     const bool is_mix_type =
         args.type_x == GGML_TYPE_Q2_1_ROCMFP2_MIX ||
@@ -137,6 +167,10 @@ static void ggml_cuda_mul_mat_q_impl(
     const float * src1_d = (const float *) src1->data;
     float       *  dst_d = (float       *)  dst->data;
 
+    // Keep mix side data alive until every MMQ launch using it is enqueued.
+    // Registry teardown takes the same lock and drains the owning device before
+    // freeing those buffers.
+    mix_registry_dispatch_guard mix_guard(src0->type);
     const void * mix_codebooks_raw = nullptr;
     const uint8_t * mix_modes = nullptr;
     if (src0->type == GGML_TYPE_Q2_1_ROCMFP2_MIX) {
@@ -448,6 +482,7 @@ void ggml_cuda_op_mul_mat_q(
     const bool use_stream_k = ((GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA)
                             || GGML_CUDA_CC_IS_CDNA(cc))
                             && src1_ncols == ne11;
+    mix_registry_dispatch_guard mix_guard(src0->type);
     const void * mix_codebooks_raw = nullptr;
     const uint8_t * mix_modes = nullptr;
     if (src0->type == GGML_TYPE_Q2_1_ROCMFP2_MIX) {

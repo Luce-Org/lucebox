@@ -144,19 +144,13 @@ class QualifierPreflightTests(unittest.TestCase):
                 **overrides,
             }
         )
-        with tempfile.TemporaryDirectory() as command_dir:
-            for command in ("flock", "pgrep", "python3", "rocm-smi", "sha256sum"):
-                stub = Path(command_dir) / command
-                stub.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-                stub.chmod(0o755)
-            environment["PATH"] = command_dir + os.pathsep + environment["PATH"]
-            return subprocess.run(
-                ["bash", str(QUALIFIER)],
-                capture_output=True,
-                check=False,
-                env=environment,
-                text=True,
-            )
+        return subprocess.run(
+            ["bash", str(QUALIFIER)],
+            capture_output=True,
+            check=False,
+            env=environment,
+            text=True,
+        )
 
     def test_leading_zero_integer_is_rejected(self) -> None:
         result = self.run_qualifier(PORT="08")

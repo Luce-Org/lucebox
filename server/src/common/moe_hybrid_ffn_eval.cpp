@@ -246,10 +246,19 @@ static int dynamic_route_balance_main_slots_x4(
         return 0;
     }
 
-    long requested_x4 = config.explicit_main_slots_x4;
     if (!config.valid) {
-        requested_x4 = -1;
-    } else if (requested_x4 == 0 && config.main_to_peer_rate > 0.0) {
+        static std::once_flag malformed_log;
+        std::call_once(malformed_log, [] {
+            std::fprintf(stderr,
+                "[moe-hybrid] dynamic route balance disabled: "
+                "main-slot or transfer-rate configuration is malformed or "
+                "conflicting\n");
+        });
+        return 0;
+    }
+
+    long requested_x4 = config.explicit_main_slots_x4;
+    if (requested_x4 == 0 && config.main_to_peer_rate > 0.0) {
         requested_x4 = moe_balanced_main_slots_x4(
             n_used, config.main_to_peer_rate);
         if (requested_x4 == 0) requested_x4 = -1;
