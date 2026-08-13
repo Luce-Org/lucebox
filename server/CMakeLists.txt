@@ -1143,6 +1143,33 @@ if(DFLASH27B_TESTS)
         endif()
         list(APPEND _raw_unit_test_targets test_rocmfp_mix_slice_matvec)
     endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_rocmfp_mix_mmq.cpp")
+        # Correctness gate for the BATCHED (MMQ) path of qtypes 105/106. Backend-general
+        # for the same reason as the tests below it, and doubly so here: the batched path
+        # was gated to RDNA behind an env var, so it had never been exercised on CUDA at
+        # all and had no correctness test on either vendor.
+        add_executable(test_rocmfp_mix_mmq test/test_rocmfp_mix_mmq.cpp)
+        if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+            set_source_files_properties(test/test_rocmfp_mix_mmq.cpp PROPERTIES LANGUAGE HIP)
+            set_target_properties(test_rocmfp_mix_mmq PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
+            target_compile_definitions(test_rocmfp_mix_mmq PRIVATE GGML_USE_HIP)
+        else()
+            set_source_files_properties(test/test_rocmfp_mix_mmq.cpp PROPERTIES LANGUAGE CUDA)
+            set_target_properties(test_rocmfp_mix_mmq PROPERTIES CUDA_ARCHITECTURES "${_dflash_archs}")
+        endif()
+        target_include_directories(test_rocmfp_mix_mmq PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src/ggml-cuda)
+        target_link_libraries(test_rocmfp_mix_mmq PRIVATE
+            ggml ggml-base ${DFLASH27B_GGML_BACKEND_TARGET})
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            find_package(CUDAToolkit REQUIRED)
+            target_link_libraries(test_rocmfp_mix_mmq PRIVATE CUDA::cudart)
+        else()
+            target_link_libraries(test_rocmfp_mix_mmq PRIVATE hip::host)
+        endif()
+        list(APPEND _raw_unit_test_targets test_rocmfp_mix_mmq)
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_rocmfp_mix_gateup_glu.cpp")
         # Backend-general: the kernels declare cudaStream_t and ggml's vendors/hip.h maps the
         # cuda* spellings onto hip*, so the same source builds for both. These were hip-only,
