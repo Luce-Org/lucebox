@@ -481,14 +481,14 @@ portable default for unrelated memory layouts.
 For an overlap trace, run the same wrapper with the delayed profiler launcher:
 
 ```bash
-SERVER_BIN=server/scripts/rocprof_server_wrapper.sh \
+SERVER_BIN=harness/qualification/deepseek4/rocprof_server_wrapper.sh \
 PROFILED_SERVER_BIN=/path/to/dflash_server \
 ROCPROF_OUTPUT_DIR=/path/to/trace-output \
 ROCPROF_START_SECONDS=180 \
 ROCPROF_DURATION_SECONDS=90 \
-server/scripts/qualify_ds4_q5_amd.sh
+harness/qualification/deepseek4/qualify_ds4_q5_amd.sh
 
-server/scripts/analyze_rocprof_overlap.py \
+harness/qualification/deepseek4/analyze_rocprof_overlap.py \
   /path/to/trace-output/trace_kernel_trace.csv
 ```
 

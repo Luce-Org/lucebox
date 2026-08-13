@@ -49,12 +49,6 @@ OUT_ROOT="${OUT_ROOT:-$CHECKOUT/results/ds4_q5_context_qualification}"
 OUT_DIR="$OUT_ROOT/$RUN_ID"
 SERVER_LOG="$OUT_DIR/server.log"
 
-for required_command in flock pgrep python3 rocm-smi sha256sum; do
-    if ! command -v "$required_command" >/dev/null 2>&1; then
-        echo "required command is unavailable: $required_command" >&2
-        exit 2
-    fi
-done
 for executable in "$SERVER_BIN" "$TOKENIZER_HARNESS"; do
     if [[ ! -f "$executable" || ! -x "$executable" ]]; then
         echo "required executable is missing or not executable: $executable" >&2
@@ -191,6 +185,13 @@ for visibility_var in HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES; do
     if declare -p "$visibility_var" >/dev/null 2>&1 &&
        [[ "${!visibility_var}" != "0,1" ]]; then
         echo "$visibility_var must be unset or exactly 0,1" >&2
+        exit 2
+    fi
+done
+
+for required_command in flock pgrep python3 rocm-smi sha256sum; do
+    if ! command -v "$required_command" >/dev/null 2>&1; then
+        echo "required command is unavailable: $required_command" >&2
         exit 2
     fi
 done

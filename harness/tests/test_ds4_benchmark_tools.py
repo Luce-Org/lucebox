@@ -12,14 +12,10 @@ from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BENCHMARKS_DIR = REPO_ROOT / "harness" / "benchmarks" / "deepseek4"
-QUALIFIER = (
-    REPO_ROOT
-    / "harness"
-    / "qualification"
-    / "deepseek4"
-    / "qualify_ds4_q5_amd.sh"
-)
+QUALIFICATION_DIR = REPO_ROOT / "harness" / "qualification" / "deepseek4"
+QUALIFIER = QUALIFICATION_DIR / "qualify_ds4_q5_amd.sh"
 sys.path.insert(0, str(BENCHMARKS_DIR))
+sys.path.insert(0, str(QUALIFICATION_DIR))
 
 import analyze_rocprof_overlap  # noqa: E402
 import ds4_context_sweep  # noqa: E402
