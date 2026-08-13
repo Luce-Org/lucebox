@@ -6,14 +6,14 @@ set -euo pipefail
 # after 16K. Optional A/B switches are deliberately explicit.
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-CHECKOUT="${CHECKOUT:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
+CHECKOUT="${CHECKOUT:-$(cd "$SCRIPT_DIR/../../.." && pwd)}"
 BUILD_DIR="${BUILD_DIR:-$CHECKOUT/server/build-hip-dual}"
 SERVER_BIN="${SERVER_BIN:-$BUILD_DIR/dflash_server}"
 TOKENIZER_HARNESS="${TOKENIZER_HARNESS:-$BUILD_DIR/test_tokenizer_harness}"
 TARGET_MODEL="${TARGET_MODEL:?set TARGET_MODEL to the target GGUF path}"
 DRAFT_MODEL="${DRAFT_MODEL:?set DRAFT_MODEL to the DSpark draft GGUF path}"
 HOTNESS_CSV="${HOTNESS_CSV:?set HOTNESS_CSV to the expert hotness CSV path}"
-CONTEXT_CLIENT="${CONTEXT_CLIENT:-$SCRIPT_DIR/ds4_context_sweep.py}"
+CONTEXT_CLIENT="${CONTEXT_CLIENT:-$CHECKOUT/harness/benchmarks/deepseek4/ds4_context_sweep.py}"
 EXPECTED_SHA256="${EXPECTED_SHA256:-0f785a7ffa406498aafb14553966eaed0f52220fed0f7cc016b66921d104d194}"
 PORT="${PORT:-18109}"
 MAX_CTX="${MAX_CTX:-18432}"

@@ -10,9 +10,16 @@ from contextlib import redirect_stderr
 from pathlib import Path
 from unittest import mock
 
-SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
-QUALIFIER = SCRIPTS_DIR / "qualify_ds4_q5_amd.sh"
-sys.path.insert(0, str(SCRIPTS_DIR))
+REPO_ROOT = Path(__file__).resolve().parents[2]
+BENCHMARKS_DIR = REPO_ROOT / "harness" / "benchmarks" / "deepseek4"
+QUALIFIER = (
+    REPO_ROOT
+    / "harness"
+    / "qualification"
+    / "deepseek4"
+    / "qualify_ds4_q5_amd.sh"
+)
+sys.path.insert(0, str(BENCHMARKS_DIR))
 
 import ds4_context_sweep  # noqa: E402
 import ds4_publication_decode_client  # noqa: E402

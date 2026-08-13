@@ -139,3 +139,4 @@ backends.
 - `clients/`: real client launchers
 - `clients/prompts/`: short prompts used by the launchers
 - `benchmarks/`: direct generation benchmark against OpenAI-compatible servers
+- `qualification/`: reproducible, hardware-specific performance qualification

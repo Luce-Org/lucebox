@@ -426,7 +426,7 @@ trace:
 TARGET_MODEL=/path/to/target.gguf \
 DRAFT_MODEL=/path/to/dspark-draft.gguf \
 HOTNESS_CSV=/path/to/ds4_moe_tp_hotness.csv \
-server/scripts/qualify_ds4_q5_amd.sh
+harness/qualification/deepseek4/qualify_ds4_q5_amd.sh
 ```
 
 Its q=5 MMVQ width, verifier slots, and x4+1 controls default to `auto`, so the
