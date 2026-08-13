@@ -1841,6 +1841,25 @@ GenerateResult DeepSeek4Backend::generate_from_state(
     // The DSpark verifier is greedy-only. Route sampling and penalties through
     // AR so the request's sampler contract is not silently ignored.
     const bool sampling_requires_ar = sampler_.needs_logit_processing();
+    // A drafter was loaded and the operator asked for spec decode, but this
+    // request routes to AR anyway. Say why, once: the DS4 model card defaults
+    // temperature to 1.0, so a request that merely OMITS temperature lands
+    // here — the server then decodes pure AR while the startup log still says
+    // "spec-decode ENABLED", which reads as a spec-engagement regression.
+    if (spec_enabled_ && spec_drafter_ && req.n_gen > 0 &&
+        (req.force_ar_decode || budget_requires_ar || sampling_requires_ar)) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            std::fprintf(stderr,
+                "[deepseek4] DSpark spec loaded but this request decodes AR: "
+                "force_ar=%d stop_tokens=%d sampling=%d (temp=%.2f rep_pen=%.2f "
+                "freq_pen=%.2f pres_pen=%.2f; greedy needs temperature 0)\n",
+                req.force_ar_decode ? 1 : 0, budget_requires_ar ? 1 : 0,
+                sampling_requires_ar ? 1 : 0, sampler_.temp,
+                sampler_.rep_pen, sampler_.freq_pen, sampler_.pres_pen);
+        }
+    }
     if (spec_enabled_ && spec_drafter_ && req.n_gen > 0 &&
         !req.force_ar_decode && !budget_requires_ar && !sampling_requires_ar) {
         if (last_logits_.empty()) {

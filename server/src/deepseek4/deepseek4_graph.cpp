@@ -6779,6 +6779,35 @@ bool deepseek4_step_layer_range(
          q5_verify_candidate) && verify_hooks &&
         layer_begin == 0 && is_last_shard && out_logits &&
         ds4_backend_is_gpu(backend) && ds4_fused_verify_enabled();
+    // Fused verify has many preconditions and declining any of them is
+    // invisible: the request still decodes, still reports a healthy acceptance
+    // rate, and only the throughput differs. Name the failed condition once so
+    // a slow DSpark run can be attributed from the log instead of guessed at.
+    // (No run has yet tripped this on gfx1151 — it is here so that the next
+    // "spec decode is slow" report starts from evidence.)
+    if (ds4_fused_verify_enabled() && !fused_verify_candidate &&
+        n_tokens >= 2 && layer_begin == 0 && is_last_shard) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            std::fprintf(stderr,
+                "[deepseek4] DFLASH_DS4_FUSED_VERIFY=1 but fused verify is "
+                "inactive: n_tokens=%d (cap %d) verify_hooks=%d out_logits=%d "
+                "backend_gpu=%d moe_hybrid=%d expert_runtime=%d "
+                "materialized_cold=%d cold_backend_kind_gpu=%d "
+                "cold_backend_distinct=%d; verify falls back to the dense "
+                "full-expert path\n",
+                n_tokens, GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS,
+                verify_hooks ? 1 : 0, out_logits ? 1 : 0,
+                ds4_backend_is_gpu(backend) ? 1 : 0,
+                moe_hybrid ? 1 : 0, expert_runtime ? 1 : 0,
+                moe_hybrid && moe_hybrid->materialized_cold_experts ? 1 : 0,
+                moe_hybrid && moe_hybrid->cold_backend_kind ==
+                    MoeHybridColdBackend::Gpu ? 1 : 0,
+                moe_hybrid && moe_hybrid->cold_backend &&
+                    moe_hybrid->cold_backend != backend ? 1 : 0);
+        }
+    }
     const bool heterogeneous_sparse_prefill =
         !fused_verify_candidate && moe_hybrid &&
         cache.prefill_mode == PrefillAttentionMode::Sparse &&
