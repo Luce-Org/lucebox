@@ -2,6 +2,8 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
+#include "CppUnitTestFramework.hpp"
+#include "scoped_env.h"
 
 #include <algorithm>
 #include <cmath>
@@ -10,6 +12,8 @@
 #include <cstring>
 #include <set>
 #include <vector>
+
+using namespace CppUnitTestFramework;
 
 namespace {
 
@@ -332,49 +336,45 @@ bool rejects_unlaunchable_gqa(ggml_backend_t backend) {
 
 }  // namespace
 
-int main(int argc, char ** argv) {
-    ggml_backend_t backend = ggml_backend_cuda_init(0);
-    if (!backend) {
-        std::fprintf(stderr, "GPU backend unavailable\n");
-        return 1;
-    }
+struct PagedAttention : CommonFixture {
+    using CommonFixture::CommonFixture;
 
-    const TestCase partitioned_case{
-        "partitioned",
-        65,
-        // Retains page boundaries and >64 blocks, while pinning both context
-        // clamps: negative becomes empty and over-capacity becomes 65 blocks.
-        {-7, 1, 15, 16, 17, 31, 33, 257, 511, 1025, 2000},
-        true,
-    };
-    // CTest also runs this case with the environment
-    // GGML_CUDA_PAGED_ATTN_FORCE_PARTITIONS=1 (paged_attention_direct),
-    // so despite its name it pins the partitioned path on small shapes.
-    const TestCase direct_case{
-        "direct",
-        64,
-        {0, 1, 15, 16, 17, 257, 511},
-        false,
-    };
-    const bool direct =
-        argc == 2 && std::strcmp(argv[1], "--direct") == 0;
-    if (argc > 2 || (argc == 2 && !direct)) {
-        std::fprintf(stderr, "usage: %s [--direct]\n", argv[0]);
-        ggml_backend_free(backend);
-        return 2;
-    }
-    const TestCase & test_case = direct ? direct_case : partitioned_case;
+void run_paged_attention_case(const TestCase & test_case) {
+    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    REQUIRE_NOT_NULL(backend);
 
     const ggml_type types[] = {
         GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0,
     };
-    bool ok = rejects_unlaunchable_gqa(backend);
+    CHECK(rejects_unlaunchable_gqa(backend));
     for (ggml_type k_type : types) {
         for (ggml_type v_type : types) {
-            ok = run_case(backend, test_case, k_type, v_type) && ok;
+            CHECK(run_case(backend, test_case, k_type, v_type));
         }
     }
 
     ggml_backend_free(backend);
-    return ok ? 0 : 1;
+}
+
+};
+TEST_CASE(PagedAttention, PartitionedPathMatchesReference) {
+    run_paged_attention_case({
+        "partitioned",
+        65,
+        {-7, 1, 15, 16, 17, 31, 33, 257, 511, 1025, 2000},
+        true,
+    });
+}
+
+TEST_CASE(PagedAttention, DirectPathMatchesReference) {
+    luce_test::ScopedEnvVar force_partitions(
+        "GGML_CUDA_PAGED_ATTN_FORCE_PARTITIONS",
+        "1"
+    );
+    run_paged_attention_case({
+        "direct",
+        64,
+        {0, 1, 15, 16, 17, 257, 511},
+        false,
+    });
 }

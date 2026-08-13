@@ -6,6 +6,8 @@
 
 #include "dflash27b.h"
 #include "internal.h"
+#include "CppUnitTestFramework.hpp"
+#include "model_test_paths.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -18,28 +20,26 @@
 #include <vector>
 
 using namespace dflash::common;
+using namespace CppUnitTestFramework;
 
-int main(int argc, char ** argv) {
-    if (argc < 2) {
-        std::fprintf(stderr, "usage: %s <model.safetensors>\n", argv[0]);
-        return 2;
-    }
-    const char * path = argv[1];
+struct SmokeLoadDraft : CommonFixture {
+    using CommonFixture::CommonFixture;
+};
+TEST_CASE(SmokeLoadDraft, LoadsConfiguredModel) {
+    const auto path = luce_test::require_model(luce_test::kDraftModelEnv);
 
     // Initialize CUDA backend
     ggml_backend_t backend = ggml_backend_cuda_init(0);
-    if (!backend) {
-        std::fprintf(stderr, "ggml_backend_cuda_init(0) failed\n");
-        return 1;
-    }
+    REQUIRE_NOT_NULL(backend);
     std::printf("cuda backend: %s\n", ggml_backend_name(backend));
 
     DraftWeights w;
-    if (!load_draft_safetensors(path, backend, w)) {
+    const bool loaded = load_draft_safetensors(path.c_str(), backend, w);
+    if (!loaded) {
         std::fprintf(stderr, "load_draft_safetensors failed: %s\n",
                      dflash27b_last_error());
         ggml_backend_free(backend);
-        return 1;
+        REQUIRE(loaded);
     }
 
     // Count tensors and total bytes
@@ -79,8 +79,11 @@ int main(int argc, char ** argv) {
     }
     std::printf("\n");
 
+    CHECK_NOT_NULL(w.fc);
+    CHECK_NOT_NULL(w.hidden_norm);
+    CHECK(!w.layers.empty());
+
     free_draft_weights(w);
     ggml_backend_free(backend);
     std::printf("OK\n");
-    return 0;
 }

@@ -1257,11 +1257,6 @@ if(DFLASH27B_TESTS)
             target_link_libraries(test_ds4_dspark_load PRIVATE hip::host)
         endif()
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_load_draft.cpp")
-        add_executable(smoke_load_draft test/smoke_load_draft.cpp)
-        target_include_directories(smoke_load_draft PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
-        target_link_libraries(smoke_load_draft PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
-    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/spike_thin_copy.cpp")
         add_executable(spike_thin_copy test/spike_thin_copy.cpp)
         target_include_directories(spike_thin_copy PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
@@ -1281,16 +1276,6 @@ if(DFLASH27B_TESTS)
         add_executable(test_vs_oracle test/test_vs_oracle.cpp)
         target_include_directories(test_vs_oracle PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         target_link_libraries(test_vs_oracle PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
-    endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_load_target.cpp")
-        add_executable(smoke_load_target test/smoke_load_target.cpp)
-        target_include_directories(smoke_load_target PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
-        target_link_libraries(smoke_load_target PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
-    endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_load_target_laguna.cpp")
-        add_executable(smoke_load_target_laguna test/smoke_load_target_laguna.cpp)
-        target_include_directories(smoke_load_target_laguna PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
-        target_link_libraries(smoke_load_target_laguna PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_laguna_forward.cpp")
         add_executable(smoke_laguna_forward test/smoke_laguna_forward.cpp)
@@ -1479,6 +1464,7 @@ if(DFLASH27B_TESTS)
             test/test_drafter_tail_capture_guard.cpp
             test/test_drafter_warm_path_regression.cpp
             test/test_qwen3_buffer_plan.cpp
+            test/test_model_test_paths.cpp
             test/test_gguf_mmap.cpp
             test/test_kv_quant.cpp
             test/test_kvflash_placement.cpp
@@ -1555,6 +1541,68 @@ if(DFLASH27B_TESTS)
         endif()
         unset(_server_unit_sources)
         list(APPEND _raw_unit_test_targets test_server_unit)
+    endif()
+
+    if((DFLASH27B_GPU_BACKEND STREQUAL "cuda" OR
+        DFLASH27B_GPU_BACKEND STREQUAL "hip")
+       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_load_draft.cpp"
+       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_load_target.cpp"
+       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_load_target_laguna.cpp"
+       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_paged_attention.cpp")
+        add_executable(test_model_smoke
+            test/test_unit_main.cpp
+            test/smoke_load_draft.cpp
+            test/smoke_load_target.cpp
+            test/smoke_load_target_laguna.cpp
+            test/test_paged_attention.cpp)
+        target_include_directories(test_model_smoke PRIVATE
+            ${DFLASH27B_SRC_INCLUDE_DIRS}
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src)
+        if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+            target_compile_definitions(test_model_smoke PRIVATE
+                DFLASH27B_BACKEND_HIP=1
+                GGML_USE_HIP)
+        else()
+            target_compile_definitions(test_model_smoke PRIVATE
+                DFLASH27B_BACKEND_CUDA=1
+                DFLASH27B_CUDA_MIN_SM=${_dflash_cuda_min_sm})
+        endif()
+        target_link_libraries(test_model_smoke PRIVATE
+            dflash_common
+            ggml
+            ggml-base
+            ${DFLASH27B_GGML_BACKEND_TARGET})
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            find_package(CUDAToolkit REQUIRED)
+            target_link_libraries(test_model_smoke PRIVATE CUDA::cudart)
+        else()
+            target_link_libraries(test_model_smoke PRIVATE hip::host)
+        endif()
+        if(CMAKE_CROSSCOMPILING)
+            add_test(NAME model_smoke COMMAND test_model_smoke)
+        else()
+            set(_model_smoke_ctest_generated
+                "${CMAKE_CURRENT_BINARY_DIR}/test_model_smoke_discovered_tests.cmake")
+            set(_model_smoke_ctest_include
+                "${CMAKE_CURRENT_BINARY_DIR}/test_model_smoke_discovered_tests_include.cmake")
+            file(GENERATE OUTPUT "${_model_smoke_ctest_include}"
+                CONTENT "include([==[${_model_smoke_ctest_generated}]==] OPTIONAL)\n")
+            set_property(DIRECTORY APPEND PROPERTY TEST_INCLUDE_FILES
+                "${_model_smoke_ctest_include}")
+            add_custom_command(TARGET test_model_smoke POST_BUILD
+                COMMAND ${CMAKE_COMMAND}
+                    -DTEST_EXECUTABLE=$<TARGET_FILE:test_model_smoke>
+                    -DTEST_WORKING_DIR=${CMAKE_CURRENT_BINARY_DIR}
+                    -DCTEST_FILE=${_model_smoke_ctest_generated}
+                    -DTEST_PREFIX=test_model_smoke.
+                    -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/DiscoverCppUnitTests.cmake
+                VERBATIM
+                COMMENT "Discovering CppUnitTestFramework tests for test_model_smoke")
+            unset(_model_smoke_ctest_generated)
+            unset(_model_smoke_ctest_include)
+        endif()
+        list(APPEND _raw_unit_test_targets test_model_smoke)
     endif()
 
     # Feature/architecture gate tests. check_feature_compatibility(),
@@ -1662,11 +1710,8 @@ if(DFLASH27B_TESTS)
     # CUDA::cudart so the toolkit headers are on the compile line (same as
     # test_dflash historically had alone).
     set(_dflash_internal_h_cuda_tests
-        smoke_load_draft
         smoke_draft_graph
         test_vs_oracle
-        smoke_load_target
-        smoke_load_target_laguna
         smoke_laguna_forward
         bench_laguna_ttft
         bench_laguna_pflash
@@ -1674,6 +1719,7 @@ if(DFLASH27B_TESTS)
         smoke_target_forward
         test_generate
         test_dflash
+        test_model_smoke
     )
     foreach(_t IN LISTS _dflash_internal_h_cuda_tests)
         if(TARGET ${_t})
@@ -1695,29 +1741,6 @@ if(DFLASH27B_TESTS)
     endif()
     endif()
 
-    if((DFLASH27B_GPU_BACKEND STREQUAL "cuda" OR
-        DFLASH27B_GPU_BACKEND STREQUAL "hip")
-       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_paged_attention.cpp")
-        add_executable(test_paged_attention test/test_paged_attention.cpp)
-        target_link_libraries(test_paged_attention PRIVATE
-            ggml ${DFLASH27B_GGML_BACKEND_TARGET} ggml-base)
-        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
-            target_link_libraries(test_paged_attention PRIVATE CUDA::cudart)
-        else()
-            target_link_libraries(test_paged_attention PRIVATE hip::host)
-        endif()
-        target_include_directories(test_paged_attention PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
-            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src)
-        add_test(NAME paged_attention COMMAND test_paged_attention)
-        add_test(NAME paged_attention_direct
-                 COMMAND test_paged_attention --direct)
-        set_tests_properties(paged_attention_direct PROPERTIES
-            ENVIRONMENT "GGML_CUDA_PAGED_ATTN_FORCE_PARTITIONS=1")
-        if(TARGET check)
-            add_dependencies(check test_paged_attention)
-        endif()
-    endif()
     if((DFLASH27B_GPU_BACKEND STREQUAL "cuda" OR
         DFLASH27B_GPU_BACKEND STREQUAL "hip")
        AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/bench_paged_attention.cpp")
