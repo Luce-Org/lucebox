@@ -373,6 +373,44 @@ sampler stay on the main backend while routed target experts execute on their
 configured owners. `--ds4-expert-top-k 4` remains a separate approximate
 policy; omit it to retain the model's default six routed experts.
 
+### Silent AR fallback (check this before calling spec decode broken)
+
+The DSpark verifier is greedy-only, so the server routes a request to plain
+autoregressive decode — with the drafter loaded and `DSpark spec-decode
+ENABLED` already printed at startup — whenever any of these hold:
+
+- the effective sampler is non-greedy (`temperature > 0`, repetition or
+  presence/frequency penalties),
+- the request carries budget stop tokens,
+- the request forces AR explicitly.
+
+The sampler trap is the subtle one: when a request **omits** `temperature`,
+the HTTP layer falls back to the model card's sampling defaults, and
+`share/model_cards/deepseek-v4-flash-0731-rocmfpx.json` sets
+`temperature: 1.0`. A temperature-less benchmark request therefore decodes
+pure AR on any build that ships the card, while the same request engages
+speculation on a tree without it — which looks exactly like a spec-decode
+regression between the two binaries. It is not one; send
+`"temperature": 0.0` explicitly. The tell in the log is `decode tokens=N
+steps=N-1` (one step per token) instead of `[ds4-spec] gen=... steps=...`
+lines; the server also now logs one `DSpark spec loaded but this request
+decodes AR: ...` line naming the condition the first time it happens.
+
+Speculative throughput is acceptance-bound, and acceptance is workload-bound:
+on the gfx1151 host, code/math prompts (accept 0.83–0.90, ~2.4 committed
+tokens per verify step) measured 24–27 tok/s where open-ended prose (accept
+0.64–0.69, ~1.1 committed per step) measured 16–18 tok/s from the same server
+under the same flags. Judge a spec-decode number against the acceptance it
+was measured at, not against the headline figure from a different prompt mix
+(see the gfx1151 numbers below for the measured governor/top-k envelope).
+
+Measure on an otherwise idle box. Strix Halo decode is unified-memory
+bandwidth bound, so an unrelated co-tenant compile on the same host dropped
+the identical request from 18.2 to 3.8 tok/s — a 5x swing with no change to
+the acceptance rate or the step count, which is what makes it easy to misread
+as a model or kernel regression. Record `/proc/loadavg` alongside any tok/s
+figure, and re-run anything anomalous before believing it.
+
 ### Verifier graph-cache safety
 
 Every heterogeneous verifier slot owns a scheduler and its per-backend scratch
