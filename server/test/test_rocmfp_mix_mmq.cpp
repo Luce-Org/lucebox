@@ -41,6 +41,7 @@
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -192,6 +193,68 @@ bool run_ggml_mul_mat(ggml_backend_t backend, const MixType & mt,
     return true;
 }
 
+// The MoE dispatch: ggml_mul_mat_id, which is what DeepSeek-V4's routed
+// experts use. This is a DIFFERENT ladder from ggml_mul_mat above — a fused
+// mix kernel for narrow batches, then mmvq, then MMQ, then a host-synchronised
+// sort-and-dequantize fallback — and ggml_cuda_should_use_mmq gates the MMQ
+// rung of it. Set DFLASH_MMID_TELEMETRY=1 to print the chosen path per call.
+bool run_ggml_mul_mat_id(ggml_backend_t backend, const MixType & mt,
+                         const std::vector<uint8_t> & blocks,
+                         const std::vector<float> & xh,
+                         const std::vector<int32_t> & ids_h,
+                         int in, int out, int n_experts, int n_tokens,
+                         int top_k, bool mmq, std::vector<float> & out_rows) {
+    ggml_init_params ip{};
+    ip.mem_size = ggml_tensor_overhead() * 8 + ggml_graph_overhead();
+    ip.no_alloc = true;
+    ggml_context * ctx = ggml_init(ip);
+    if (!ctx) return false;
+
+    // src0 [in, out, n_experts]; src1 [in, top_k, n_tokens]; ids [top_k, n_tokens]
+    ggml_tensor * w   = ggml_new_tensor_3d(ctx, mt.type, in, out, n_experts);
+    ggml_tensor * x   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, in, top_k, n_tokens);
+    ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, top_k, n_tokens);
+    ggml_set_input(x);
+    ggml_set_input(ids);
+    ggml_tensor * y = ggml_mul_mat_id(ctx, w, x, ids);
+    ggml_set_output(y);
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, y);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buf) { ggml_free(ctx); return false; }
+
+    ggml_backend_tensor_set(w, blocks.data(), 0, blocks.size());
+    ggml_backend_tensor_set(x, xh.data(), 0, sizeof(float) * xh.size());
+    ggml_backend_tensor_set(ids, ids_h.data(), 0, sizeof(int32_t) * ids_h.size());
+
+    const int K = 8;
+    std::vector<uint16_t> books((size_t)n_experts * 2 * K);
+    for (size_t i = 0; i < books.size(); ++i) {
+        const float v = 0.25f * (float)((int)(i % 7) - 3) + 0.05f * (float)(i / 16);
+        uint32_t bits; std::memcpy(&bits, &v, 4);
+        books[i] = (uint16_t)(bits >> 16);
+    }
+    std::vector<uint8_t> modes(n_experts), rots(n_experts, 0);
+    for (int e = 0; e < n_experts; ++e) modes[(size_t)e] = (uint8_t)(e & 1);
+
+    const size_t slice_bytes = blocks.size() / (size_t)n_experts;
+    mt.register_host(w->data, slice_bytes, n_experts, out, in,
+                     books.data(), modes.data(), rots.data());
+
+    ggml_cuda_set_mix_mmq_enabled(mmq);
+    ggml_backend_graph_compute(backend, gf);
+    ggml_cuda_clear_mix_mmq_override();
+
+    out_rows.resize(ggml_nelements(y));
+    ggml_backend_tensor_get(y, out_rows.data(), 0, sizeof(float) * out_rows.size());
+
+    mt.unregister(w->data);
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    return true;
+}
+
 }  // namespace
 
 int main() {
@@ -334,6 +397,119 @@ int main() {
                          std::to_string(100.0 * e_mmq.rms / ref_mag) +
                          "% of |ref| max " + std::to_string(ref_mag) +
                          ", over the 1% bar");
+                }
+            }
+        }
+    }
+
+    // ---- MoE: ggml_mul_mat_id, the path DeepSeek-V4's routed experts take ----
+    //
+    // The dense loop above deliberately uses n_experts == 1: a 3-D src0 through
+    // ggml_mul_mat does not reach MMQ, so a multi-expert case THERE would
+    // compare a path against itself. The real MoE dispatch is ggml_mul_mat_id,
+    // which has its own ladder (fused mix kernel for narrow batches -> mmvq ->
+    // MMQ -> host-synchronised sort fallback) and which ggml_cuda_should_use_mmq
+    // gates. Leaving it untested is what let "expert counts > 1 are covered" be
+    // claimed when they were not.
+    //
+    // The cross-check here is MMQ against dequantize+GEMM through the same
+    // mul_mat_id call: two independent implementations of one operation. The
+    // widths straddle the ladder deliberately, and the report says for each
+    // width whether the toggle changed the result at all — which is the only
+    // way to see, from outside, where MMQ actually engages for MoE.
+    {
+        const int n_experts = 8, top_k = 2;
+        const int in = 256, out = 32;
+        const int token_widths[] = { 1, 4, 64, 512 };
+        for (const MixType & mt : types) {
+            const size_t block_bytes = ggml_type_size(mt.type);
+            const int    qk          = ggml_blck_size(mt.type);
+            const size_t nb          = (size_t)(in / qk);
+            const size_t slice_bytes = (size_t)out * nb * block_bytes;
+            std::vector<uint8_t> blocks =
+                make_blocks(slice_bytes * (size_t)n_experts, block_bytes);
+
+            for (int n_tokens : token_widths) {
+                std::vector<float> xh((size_t)in * top_k * n_tokens);
+                for (auto & v : xh) v = 0.5f - (float)(rnd() % 1000) / 1000.0f;
+                // A token's top-k picks must be DISTINCT: the runtime's sort
+                // fallback records one entry per (expert, token) and breaks on
+                // the first match, so a duplicated expert makes it emit fewer
+                // rows than ne12*n_expert_used and trip its own assert. Real
+                // top-k routing cannot select an expert twice; sampling with
+                // replacement here produced an abort that looked like a kernel
+                // bug and was bad fixture data.
+                std::vector<int32_t> ids((size_t)top_k * n_tokens);
+                {
+                    std::vector<int32_t> pool(n_experts);
+                    for (int e = 0; e < n_experts; ++e) pool[(size_t)e] = e;
+                    for (int t = 0; t < n_tokens; ++t) {
+                        for (int k = 0; k < top_k; ++k) {
+                            const int j = k + (int)(rnd() % (unsigned)(n_experts - k));
+                            std::swap(pool[(size_t)k], pool[(size_t)j]);
+                            ids[(size_t)t * top_k + k] = pool[(size_t)k];
+                        }
+                    }
+                }
+
+                std::vector<float> y_mmq, y_deq;
+                if (!run_ggml_mul_mat_id(backend, mt, blocks, xh, ids, in, out,
+                                         n_experts, n_tokens, top_k, true, y_mmq) ||
+                    !run_ggml_mul_mat_id(backend, mt, blocks, xh, ids, in, out,
+                                         n_experts, n_tokens, top_k, false, y_deq)) {
+                    fail(std::string(mt.label) + " mul_mat_id: graph run failed");
+                    continue;
+                }
+
+                // Timed repeat: which is actually faster at this width, the
+                // MMQ path or whatever declining it lands on? For mul_mat_id
+                // that fallback is the host-synchronised sort, not a dense GEMM.
+                double t_mmq = 0.0, t_deq = 0.0;
+                {
+                    std::vector<float> scratch;
+                    const int reps = 5;
+                    auto clk = []() {
+                        return std::chrono::duration<double>(
+                            std::chrono::steady_clock::now().time_since_epoch()).count();
+                    };
+                    run_ggml_mul_mat_id(backend, mt, blocks, xh, ids, in, out,
+                                        n_experts, n_tokens, top_k, true, scratch);
+                    const double a0 = clk();
+                    for (int r = 0; r < reps; ++r)
+                        run_ggml_mul_mat_id(backend, mt, blocks, xh, ids, in, out,
+                                            n_experts, n_tokens, top_k, true, scratch);
+                    t_mmq = (clk() - a0) / reps;
+                    run_ggml_mul_mat_id(backend, mt, blocks, xh, ids, in, out,
+                                        n_experts, n_tokens, top_k, false, scratch);
+                    const double b0 = clk();
+                    for (int r = 0; r < reps; ++r)
+                        run_ggml_mul_mat_id(backend, mt, blocks, xh, ids, in, out,
+                                            n_experts, n_tokens, top_k, false, scratch);
+                    t_deq = (clk() - b0) / reps;
+                }
+
+                const Err e = compare(y_mmq, y_deq);
+                double mag = 0.0;
+                for (float v : y_deq) mag = std::max(mag, (double)std::fabs(v));
+                const bool engaged = (y_mmq != y_deq);
+                std::printf("%-24s mul_mat_id experts=%d top_k=%d tokens=%-4d | "
+                            "MMQ %s | rms vs dequant %.5g (%.3f%% of |ref| %.4g)\n",
+                            mt.label, n_experts, top_k, n_tokens,
+                            engaged ? "engaged    " : "NOT engaged", e.rms,
+                            mag > 0 ? 100.0 * e.rms / mag : 0.0, mag);
+                std::printf("%-24s     timing: mmq-on %.3f ms | mmq-off %.3f ms | %s\n",
+                            mt.label, t_mmq * 1e3, t_deq * 1e3,
+                            t_mmq < t_deq ? "MMQ-ON faster" : "MMQ-OFF faster");
+
+                // Only assert accuracy where the toggle actually changed the
+                // kernel. Where it did not, there is nothing to compare and
+                // saying "pass" would be the vacuous result this guards against.
+                if (engaged && e.rms > kRelRms * mag) {
+                    fail(std::string(mt.label) + " mul_mat_id tokens=" +
+                         std::to_string(n_tokens) + ": MMQ rms " +
+                         std::to_string(e.rms) + " is " +
+                         std::to_string(mag > 0 ? 100.0 * e.rms / mag : 0.0) +
+                         "% of |ref|, over the 1% bar");
                 }
             }
         }

@@ -563,6 +563,16 @@ void ggml_cuda_clear_mix_mmq_override() {
 // measured on ne11 4..16 verify batches. It therefore takes the conservative
 // RDNA 3.5 bound, which keeps every measured NVIDIA win and declines only the
 // widths nothing has measured there. Raise it with the env var once swept.
+//
+// CRITICAL: this cap is for the DENSE path only, and mul_mat_id opts out below.
+// The cap is worth having because declining MMQ on a dense multiply hands the
+// work to a well-tiled dense GEMM. Declining it on a mul_mat_id does something
+// entirely different: it falls to the host-synchronised sort path (a
+// cudaStreamSynchronize, a CPU-side id sort, an expand — and no CUDA-graph
+// capture). Measured on H200 with 8 experts / top_k 2 at 512 tokens,
+// q2_1_rocmfp2_mix: 0.412 ms with this cap applied vs 0.202 ms without, i.e.
+// applying the dense cap to MoE costs 2.04x on exactly the widths a prefill
+// uses. Same threshold, opposite consequence.
 static int64_t mix_mmq_max_ne11(int cc) {
     static const int64_t override_value = []() -> int64_t {
         const char * value = getenv("DFLASH_MIX_MMQ_MAX_NE11");
@@ -578,6 +588,13 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
 #ifdef GGML_CUDA_FORCE_CUBLAS
     return false;
 #endif // GGML_CUDA_FORCE_CUBLAS
+
+    // Which dispatch is asking? The dense call sites pass 0 (or 1 for a 2-D
+    // src0 through the fused gate/up pair); ggml_cuda_mul_mat_id passes the
+    // real expert count. Only the mix qtypes act on this, and only to skip a
+    // width cap that would send MoE to the host-sync fallback — see
+    // mix_mmq_max_ne11.
+    const bool is_mul_mat_id = n_experts > 1;
 
     bool mmq_supported;
 
@@ -637,7 +654,7 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
             //
             // Width-gated: see mix_mmq_max_ne11 for why wide batches decline.
             mmq_supported = ggml_cuda_mix_mmq_enabled() &&
-                ne11 <= mix_mmq_max_ne11(cc) &&
+                (is_mul_mat_id || ne11 <= mix_mmq_max_ne11(cc)) &&
                 (GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc) ||
                  GGML_CUDA_CC_IS_NVIDIA(cc));
             break;
@@ -660,7 +677,7 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
             //
             // Width-gated: see mix_mmq_max_ne11 for why wide batches decline.
             mmq_supported = ggml_cuda_mix_mmq_enabled() &&
-                ne11 <= mix_mmq_max_ne11(cc) &&
+                (is_mul_mat_id || ne11 <= mix_mmq_max_ne11(cc)) &&
                 (GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc) ||
                  GGML_CUDA_CC_IS_NVIDIA(cc));
             break;
