@@ -19,6 +19,9 @@
 #  include <sys/socket.h>
 #  include <sys/wait.h>
 #  include <unistd.h>
+#  if defined(__linux__)
+#    include <sched.h>
+#  endif
 extern char ** environ;
 #endif
 
@@ -52,6 +55,15 @@ bool request_declares_tool(const json & tools, const std::string & name) {
     return false;
 }
 
+std::string format_cpu_affinity(const std::vector<int> & cpus) {
+    std::string value;
+    for (const int cpu : cpus) {
+        if (!value.empty()) value.push_back(',');
+        value += std::to_string(cpu);
+    }
+    return value;
+}
+
 #if !defined(_WIN32)
 bool send_all_socket(int fd, const void * data, size_t bytes) {
     const char * cursor = static_cast<const char *>(data);
@@ -74,7 +86,8 @@ bool send_all_socket(int fd, const void * data, size_t bytes) {
 
 std::vector<std::string> executor_environment(
         int resource_percentage,
-        const std::string & accelerator_relation) {
+        const std::string & accelerator_relation,
+        const std::vector<int> & cpu_affinity) {
     std::vector<std::string> values;
     static constexpr const char * kResourceKey =
         "DFLASH_TOOL_SPECULATION_RESOURCE_PERCENTAGE=";
@@ -84,8 +97,13 @@ std::vector<std::string> executor_environment(
         "DFLASH_TOOL_SPECULATION_ACCELERATOR_RELATION=";
     static constexpr size_t kRelationKeyLen =
         sizeof("DFLASH_TOOL_SPECULATION_ACCELERATOR_RELATION=") - 1;
+    static constexpr const char * kCpuAffinityKey =
+        "DFLASH_TOOL_SPECULATION_CPU_AFFINITY=";
+    static constexpr size_t kCpuAffinityKeyLen =
+        sizeof("DFLASH_TOOL_SPECULATION_CPU_AFFINITY=") - 1;
     bool resource_replaced = false;
     bool relation_replaced = false;
+    bool cpu_affinity_replaced = false;
     for (char ** item = environ; item && *item; ++item) {
         const std::string value(*item);
         if (value.compare(0, kResourceKeyLen, kResourceKey) == 0) {
@@ -97,6 +115,16 @@ std::vector<std::string> executor_environment(
             values.push_back(
                 std::string(kRelationKey) + accelerator_relation);
             relation_replaced = true;
+        } else if (value.compare(
+                       0, kCpuAffinityKeyLen, kCpuAffinityKey) == 0) {
+            // Drop a stale inherited value when this executor has no CPU
+            // lane. Otherwise replace it with the verified canonical list.
+            if (!cpu_affinity.empty()) {
+                values.push_back(
+                    std::string(kCpuAffinityKey) +
+                    format_cpu_affinity(cpu_affinity));
+                cpu_affinity_replaced = true;
+            }
         } else {
             values.push_back(value);
         }
@@ -109,9 +137,56 @@ std::vector<std::string> executor_environment(
     if (!relation_replaced) {
         values.push_back(std::string(kRelationKey) + accelerator_relation);
     }
+    if (!cpu_affinity.empty() && !cpu_affinity_replaced) {
+        values.push_back(
+            std::string(kCpuAffinityKey) +
+            format_cpu_affinity(cpu_affinity));
+    }
     values.push_back("DFLASH_TOOL_SPECULATION=1");
     return values;
 }
+
+#  if defined(__linux__)
+bool pin_and_verify_child_cpu_affinity(
+        pid_t child,
+        const std::vector<int> & cpus,
+        std::string & error) {
+    if (cpus.empty()) {
+        error.clear();
+        return true;
+    }
+    cpu_set_t requested;
+    CPU_ZERO(&requested);
+    for (const int cpu : cpus) {
+        if (cpu < 0 || cpu >= CPU_SETSIZE) {
+            error = "executor CPU is outside CPU_SETSIZE: " +
+                    std::to_string(cpu);
+            return false;
+        }
+        CPU_SET(cpu, &requested);
+    }
+    if (::sched_setaffinity(child, sizeof(requested), &requested) != 0) {
+        error = std::string("executor sched_setaffinity failed: ") +
+                std::strerror(errno);
+        return false;
+    }
+    cpu_set_t observed;
+    CPU_ZERO(&observed);
+    if (::sched_getaffinity(child, sizeof(observed), &observed) != 0) {
+        error = std::string("executor sched_getaffinity failed: ") +
+                std::strerror(errno);
+        return false;
+    }
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+        if (CPU_ISSET(cpu, &requested) != CPU_ISSET(cpu, &observed)) {
+            error = "executor CPU affinity verification mismatch";
+            return false;
+        }
+    }
+    error.clear();
+    return true;
+}
+#  endif
 #endif
 
 }  // namespace
@@ -200,6 +275,135 @@ bool parse_tool_speculation_prediction(
     out.confidence = confidence;
     error.clear();
     return true;
+}
+
+bool parse_tool_speculation_cpu_affinity(
+        const std::string & value,
+        std::vector<int> & out,
+        std::string & error) {
+    out.clear();
+    if (value.empty()) {
+        error = "tool CPU affinity must not be empty";
+        return false;
+    }
+    size_t cursor = 0;
+    while (cursor < value.size()) {
+        const size_t comma = value.find(',', cursor);
+        const size_t end = comma == std::string::npos ? value.size() : comma;
+        const std::string token = value.substr(cursor, end - cursor);
+        if (token.empty()) {
+            error = "tool CPU affinity contains an empty item";
+            out.clear();
+            return false;
+        }
+        const size_t dash = token.find('-');
+        auto parse_cpu = [&](const std::string & item, int & cpu) {
+            if (item.empty() || !std::all_of(
+                    item.begin(), item.end(), [](unsigned char character) {
+                        return character >= '0' && character <= '9';
+                    })) {
+                return false;
+            }
+            char * parsed_end = nullptr;
+            errno = 0;
+            const long parsed = std::strtol(item.c_str(), &parsed_end, 10);
+            if (errno != 0 || !parsed_end || *parsed_end != '\0' ||
+                parsed < 0 || parsed > std::numeric_limits<int>::max()) {
+                return false;
+            }
+            cpu = static_cast<int>(parsed);
+            return true;
+        };
+        int first = -1;
+        int last = -1;
+        if (dash == std::string::npos) {
+            if (!parse_cpu(token, first)) {
+                error = "invalid tool CPU affinity item: " + token;
+                out.clear();
+                return false;
+            }
+            last = first;
+        } else if (token.find('-', dash + 1) != std::string::npos ||
+                   !parse_cpu(token.substr(0, dash), first) ||
+                   !parse_cpu(token.substr(dash + 1), last) ||
+                   first > last) {
+            error = "invalid tool CPU affinity range: " + token;
+            out.clear();
+            return false;
+        }
+        if (static_cast<unsigned long long>(last) -
+                static_cast<unsigned long long>(first) > 65535ULL) {
+            error = "tool CPU affinity range is too large: " + token;
+            out.clear();
+            return false;
+        }
+        for (int cpu = first; cpu <= last; ++cpu) {
+            out.push_back(cpu);
+            if (cpu == std::numeric_limits<int>::max()) break;
+        }
+        if (comma == std::string::npos) break;
+        cursor = comma + 1;
+    }
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    error.clear();
+    return true;
+}
+
+bool qualify_tool_speculation_cpu_affinity(
+        ToolSpeculationConfig & config,
+        std::string & error) {
+    config.model_cpu_affinity.clear();
+    config.cpu_affinity_isolated = false;
+    if (config.cpu_affinity.empty()) {
+        error.clear();
+        return true;
+    }
+#if defined(__linux__)
+    if (config.executor_path.empty() || config.in_process_executor) {
+        error = "tool CPU affinity requires a child-process executor";
+        return false;
+    }
+    const long configured_cpus = ::sysconf(_SC_NPROCESSORS_CONF);
+    if (configured_cpus <= 0) {
+        error = "cannot determine configured CPU count";
+        return false;
+    }
+    cpu_set_t model_set;
+    CPU_ZERO(&model_set);
+    if (::sched_getaffinity(0, sizeof(model_set), &model_set) != 0) {
+        error = std::string("model sched_getaffinity failed: ") +
+                std::strerror(errno);
+        return false;
+    }
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+        if (CPU_ISSET(cpu, &model_set)) {
+            config.model_cpu_affinity.push_back(cpu);
+        }
+    }
+    if (config.model_cpu_affinity.empty()) {
+        error = "model CPU affinity is empty";
+        return false;
+    }
+    for (const int cpu : config.cpu_affinity) {
+        if (cpu < 0 || cpu >= CPU_SETSIZE || cpu >= configured_cpus) {
+            error = "tool CPU is not configured on this host: " +
+                    std::to_string(cpu);
+            return false;
+        }
+        if (CPU_ISSET(cpu, &model_set)) {
+            error = "tool CPU affinity overlaps model CPU " +
+                    std::to_string(cpu);
+            return false;
+        }
+    }
+    config.cpu_affinity_isolated = true;
+    error.clear();
+    return true;
+#else
+    error = "tool CPU affinity isolation is supported only on Linux";
+    return false;
+#endif
 }
 
 bool ToolSpeculationPolicy::load_file(
@@ -490,6 +694,8 @@ void ToolSpeculationAttempt::start() {
         {"mode", "speculative"},
         {"resource_percentage", admission_.resource_percentage},
         {"accelerator_relation", admission_.accelerator_relation},
+        {"cpu_affinity", config_.cpu_affinity},
+        {"cpu_affinity_isolated", config_.cpu_affinity_isolated},
         {"call", {
             {"name", prediction_.call.name},
             {"arguments", prediction_.call.arguments},
@@ -565,7 +771,8 @@ void ToolSpeculationAttempt::start() {
     }
 
     std::vector<std::string> env_storage = executor_environment(
-        admission_.resource_percentage, admission_.accelerator_relation);
+        admission_.resource_percentage, admission_.accelerator_relation,
+        config_.cpu_affinity);
     std::vector<char *> env;
     env.reserve(env_storage.size() + 1);
     for (std::string & value : env_storage) env.push_back(value.data());
@@ -595,6 +802,32 @@ void ToolSpeculationAttempt::start() {
         ::close(output_pipe[0]);
         return;
     }
+
+#  if defined(__linux__)
+    if (!config_.cpu_affinity.empty()) {
+        std::string affinity_error;
+        if (!pin_and_verify_child_cpu_affinity(
+                child, config_.cpu_affinity, affinity_error)) {
+            ::kill(child, SIGKILL);
+            int child_status = 0;
+            while (::waitpid(child, &child_status, 0) < 0 && errno == EINTR) {}
+            ::close(input_socket[0]);
+            ::close(output_pipe[0]);
+            launch_error_ = std::move(affinity_error);
+            return;
+        }
+    }
+#  else
+    if (!config_.cpu_affinity.empty()) {
+        ::kill(child, SIGKILL);
+        int child_status = 0;
+        while (::waitpid(child, &child_status, 0) < 0 && errno == EINTR) {}
+        ::close(input_socket[0]);
+        ::close(output_pipe[0]);
+        launch_error_ = "tool CPU affinity isolation is supported only on Linux";
+        return;
+    }
+#  endif
 
     child_pid_ = static_cast<int>(child);
     child_stdin_fd_ = input_socket[0];
@@ -640,6 +873,8 @@ json ToolSpeculationAttempt::base_metadata() const {
          admission_.admitted
             ? json(admission_.accelerator_relation)
             : json(nullptr)},
+        {"cpu_affinity", config_.cpu_affinity},
+        {"cpu_affinity_isolated", config_.cpu_affinity_isolated},
     };
     return metadata;
 }

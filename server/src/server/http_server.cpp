@@ -817,8 +817,16 @@ json build_props_body(const ServerConfig & config,
             {"model_expert_ownership_unique",
              config.tool_speculation.model_expert_ownership_unique},
             {"compute_isolation",
-             config.tool_speculation.hip_reserved_tool_compute_units > 0
-                 ? "disjoint_hip_cu_masks" : "none"},
+             config.tool_speculation.cpu_affinity_isolated
+                 ? "disjoint_cpu_affinity"
+                 : config.tool_speculation.hip_reserved_tool_compute_units > 0
+                     ? "disjoint_hip_cu_masks" : "none"},
+            {"cpu_affinity_isolated",
+             config.tool_speculation.cpu_affinity_isolated},
+            {"tool_cpu_affinity",
+             config.tool_speculation.cpu_affinity},
+            {"model_cpu_affinity",
+             config.tool_speculation.model_cpu_affinity},
             {"hip_tool_device",
              config.tool_speculation.hip_tool_device >= 0
                  ? json(config.tool_speculation.hip_tool_device)

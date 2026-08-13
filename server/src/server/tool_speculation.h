@@ -55,6 +55,12 @@ bool parse_tool_speculation_prediction(const json & value,
                                        ToolSpeculationPrediction & out,
                                        std::string & error);
 
+// Parse a Linux CPU-list such as "14-15,30-31". The result is sorted and
+// deduplicated so it can be compared directly with an observed affinity mask.
+bool parse_tool_speculation_cpu_affinity(const std::string & value,
+                                         std::vector<int> & out,
+                                         std::string & error);
+
 struct ToolSpeculationLane {
     // Backend-neutral executor capacity. A CUDA adapter may map this to an
     // MPS share; a ROCm, CPU, I/O, or remote adapter may interpret it using
@@ -160,6 +166,12 @@ struct ToolSpeculationConfig {
     // complementary CU masks. Zero means no model-side CU reservation.
     int hip_tool_device = -1;
     int hip_reserved_tool_compute_units = 0;
+    // Optional child-process CPU lane. Startup verifies that these logical
+    // CPUs are disjoint from the model process affinity; every child is pinned
+    // and re-read before its request payload is released.
+    std::vector<int> cpu_affinity;
+    std::vector<int> model_cpu_affinity;
+    bool cpu_affinity_isolated = false;
     bool enabled() const {
         return (!executor_path.empty() || in_process_executor) &&
                !allowed_tools.empty() &&
@@ -168,10 +180,20 @@ struct ToolSpeculationConfig {
     const char * execution_mode() const {
         return in_process_executor
             ? in_process_executor->mode_name()
-            : executor_path.empty() ? "disabled" : "child_process";
+            : executor_path.empty()
+                ? "disabled"
+                : cpu_affinity.empty()
+                    ? "child_process"
+                    : "child_process_cpu_affinity";
     }
     bool allows(const std::string & name) const;
 };
+
+// Capture the model process affinity and fail closed unless it is physically
+// disjoint from the configured child executor CPUs. No-op when no CPU lane is
+// requested.
+bool qualify_tool_speculation_cpu_affinity(ToolSpeculationConfig & config,
+                                           std::string & error);
 
 // One request-scoped attempt. The configured executable is invoked without a
 // shell and receives one JSON request on stdin. It must emit one JSON envelope

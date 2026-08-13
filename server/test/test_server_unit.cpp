@@ -4641,6 +4641,9 @@ TEST_CASE(ServerUnitFixture, test_props_tool_speculation_shape) {
     TEST_ASSERT(disabled["model_routing_static"].get<bool>());
     TEST_ASSERT(disabled["model_expert_ownership_unique"].get<bool>());
     TEST_ASSERT(disabled["compute_isolation"].get<std::string>() == "none");
+    TEST_ASSERT(!disabled["cpu_affinity_isolated"].get<bool>());
+    TEST_ASSERT(disabled["tool_cpu_affinity"].empty());
+    TEST_ASSERT(disabled["model_cpu_affinity"].empty());
     TEST_ASSERT(disabled["hip_tool_device"].is_null());
     TEST_ASSERT(disabled["hip_reserved_tool_compute_units"].get<int>() == 0);
     TEST_ASSERT(disabled["profile_lanes"].empty());
@@ -4691,6 +4694,20 @@ TEST_CASE(ServerUnitFixture, test_props_tool_speculation_shape) {
     TEST_ASSERT(!enabled["profile_lanes"][0]
                         ["requires_unique_expert_ownership"].get<bool>());
 
+    cfg.tool_speculation.cpu_affinity = {14, 30};
+    cfg.tool_speculation.model_cpu_affinity = {0, 1, 2, 3};
+    cfg.tool_speculation.cpu_affinity_isolated = true;
+    body = build_props_body(cfg, pc, tm);
+    const json & cpu_isolated = body["tool_speculation"];
+    TEST_ASSERT(cpu_isolated["compute_isolation"].get<std::string>() ==
+                "disjoint_cpu_affinity");
+    TEST_ASSERT(cpu_isolated["cpu_affinity_isolated"].get<bool>());
+    TEST_ASSERT(cpu_isolated["tool_cpu_affinity"] ==
+                json::array({14, 30}));
+    TEST_ASSERT(cpu_isolated["model_cpu_affinity"] ==
+                json::array({0, 1, 2, 3}));
+
+    cfg.tool_speculation.cpu_affinity_isolated = false;
     cfg.tool_speculation.hip_tool_device = 1;
     cfg.tool_speculation.hip_reserved_tool_compute_units = 1;
     body = build_props_body(cfg, pc, tm);

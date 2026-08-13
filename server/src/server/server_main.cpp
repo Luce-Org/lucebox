@@ -189,6 +189,10 @@ static void print_usage(const char * prog) {
 #endif
         "  --tool-spec-profile <path>   Measured resource-lane frontier JSON.\n"
         "  --tool-spec-allow <name>     Allow one read-only/idempotent tool; repeatable.\n"
+        "  --tool-spec-cpu-affinity <LIST>\n"
+        "                               Pin child tools to Linux CPUs/ranges, e.g.\n"
+        "                               14-15,30-31. The model process affinity\n"
+        "                               must exclude every listed CPU.\n"
         "  --tool-spec-timeout-ms <N>   Executor result timeout (default: 60000).\n"
         "  --tool-spec-max-model-slowdown <R>\n"
         "                               Reject lanes slower than this inference\n"
@@ -576,6 +580,15 @@ int main(int argc, char ** argv) {
                 return 2;
             }
             sconfig.tool_speculation.allowed_tools.push_back(name);
+        } else if (std::strcmp(argv[i], "--tool-spec-cpu-affinity") == 0 &&
+                   i + 1 < argc) {
+            std::string affinity_error;
+            if (!parse_tool_speculation_cpu_affinity(
+                    argv[++i], sconfig.tool_speculation.cpu_affinity,
+                    affinity_error)) {
+                std::fprintf(stderr, "[server] %s\n", affinity_error.c_str());
+                return 2;
+            }
         } else if (std::strcmp(argv[i], "--tool-spec-timeout-ms") == 0 &&
                    i + 1 < argc) {
             sconfig.tool_speculation.timeout_ms = std::atoi(argv[++i]);
@@ -680,7 +693,8 @@ int main(int argc, char ** argv) {
         !sconfig.tool_speculation.executor_path.empty() ||
         static_cast<bool>(sconfig.tool_speculation.in_process_executor) ||
         !sconfig.tool_speculation.profile_path.empty() ||
-        !sconfig.tool_speculation.allowed_tools.empty();
+        !sconfig.tool_speculation.allowed_tools.empty() ||
+        !sconfig.tool_speculation.cpu_affinity.empty();
     if (tool_speculation_requested) {
         sconfig.tool_speculation.model_routing_static =
             !environment_flag_enabled(
@@ -721,6 +735,19 @@ int main(int argc, char ** argv) {
                 sconfig.tool_speculation.profile_path, profile_error)) {
             std::fprintf(stderr, "[server] %s\n", profile_error.c_str());
             return 2;
+        }
+        std::string cpu_affinity_error;
+        if (!qualify_tool_speculation_cpu_affinity(
+                sconfig.tool_speculation, cpu_affinity_error)) {
+            std::fprintf(stderr, "[server] %s\n", cpu_affinity_error.c_str());
+            return 2;
+        }
+        if (sconfig.tool_speculation.cpu_affinity_isolated) {
+            std::fprintf(stderr,
+                "[server] disjoint CPU tool lane: %zu model logical CPUs, "
+                "%zu reserved tool logical CPUs\n",
+                sconfig.tool_speculation.model_cpu_affinity.size(),
+                sconfig.tool_speculation.cpu_affinity.size());
         }
         const std::string & executor_contract =
             sconfig.tool_speculation.policy.executor_contract();

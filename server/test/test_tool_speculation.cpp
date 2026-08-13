@@ -14,6 +14,9 @@
 #if !defined(_WIN32)
 #  include <sys/stat.h>
 #  include <unistd.h>
+#  if defined(__linux__)
+#    include <sched.h>
+#  endif
 #endif
 
 using dflash::common::ApiFormat;
@@ -27,6 +30,8 @@ using dflash::common::ToolSpeculationPolicy;
 using dflash::common::ToolSpeculationPrediction;
 using dflash::common::json;
 using dflash::common::parse_tool_speculation_prediction;
+using dflash::common::parse_tool_speculation_cpu_affinity;
+using dflash::common::qualify_tool_speculation_cpu_affinity;
 using dflash::common::render_tool_speculation_sse;
 
 namespace {
@@ -234,6 +239,19 @@ TEST_CASE(ToolSpeculationFixture, prediction_requires_declared_tool) {
     CHECK(error.find("not declared") != std::string::npos);
 }
 
+TEST_CASE(ToolSpeculationFixture, cpu_affinity_parser_canonicalizes_ranges) {
+    std::vector<int> cpus;
+    std::string error;
+    CHECK(parse_tool_speculation_cpu_affinity(
+        "30-31,15,14-15", cpus, error));
+    CHECK(cpus == std::vector<int>({14, 15, 30, 31}));
+
+    CHECK(!parse_tool_speculation_cpu_affinity("14,,15", cpus, error));
+    CHECK(cpus.empty());
+    CHECK(!parse_tool_speculation_cpu_affinity("15-14", cpus, error));
+    CHECK(cpus.empty());
+}
+
 TEST_CASE(ToolSpeculationFixture, empirical_policy_selects_resource_by_confidence) {
     ToolSpeculationPolicy policy;
     std::string error;
@@ -413,6 +431,71 @@ TEST_CASE(ToolSpeculationFixture, in_process_mismatch_cancels_private_result) {
 }
 
 #if !defined(_WIN32)
+TEST_CASE(ToolSpeculationFixture, cpu_affinity_reaches_child_executor) {
+#if defined(__linux__)
+    cpu_set_t allowed;
+    CPU_ZERO(&allowed);
+    CHECK(::sched_getaffinity(0, sizeof(allowed), &allowed) == 0);
+    int selected_cpu = -1;
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+        if (CPU_ISSET(cpu, &allowed)) {
+            selected_cpu = cpu;
+            break;
+        }
+    }
+    CHECK(selected_cpu >= 0);
+    const std::string selected = std::to_string(selected_cpu);
+    const std::string path = make_executor_script(
+        "IFS= read -r control\n"
+        "observed=$(awk '/Cpus_allowed_list/{print $2}' /proc/self/status)\n"
+        "printf '{\"ok\":true,\"result\":{\"configured\":\"%s\","
+        "\"observed\":\"%s\"}}\\n' "
+        "\"$DFLASH_TOOL_SPECULATION_CPU_AFFINITY\" \"$observed\"\n");
+    ToolSpeculationConfig config = test_config(path);
+    config.cpu_affinity = {selected_cpu};
+    config.cpu_affinity_isolated = true;
+    CHECK(std::string(config.execution_mode()) ==
+          "child_process_cpu_affinity");
+    auto attempt = ToolSpeculationAttempt::create(
+        config, prediction(), "request_cpu_affinity");
+    attempt->start();
+    const json metadata = attempt->resolve({
+        ToolCall{"call_1", "lookup", R"({"a":1,"b":2})"},
+    });
+    ::unlink(path.c_str());
+    CHECK(metadata["status"] == "hit");
+    CHECK(metadata["cpu_affinity_isolated"].get<bool>());
+    CHECK(metadata["result"]["configured"] == selected);
+    CHECK(metadata["result"]["observed"] == selected);
+#else
+    CHECK(true);
+#endif
+}
+
+TEST_CASE(ToolSpeculationFixture, cpu_affinity_qualification_rejects_overlap) {
+#if defined(__linux__)
+    cpu_set_t allowed;
+    CPU_ZERO(&allowed);
+    CHECK(::sched_getaffinity(0, sizeof(allowed), &allowed) == 0);
+    int selected_cpu = -1;
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+        if (CPU_ISSET(cpu, &allowed)) {
+            selected_cpu = cpu;
+            break;
+        }
+    }
+    CHECK(selected_cpu >= 0);
+    ToolSpeculationConfig config = test_config();
+    config.cpu_affinity = {selected_cpu};
+    std::string error;
+    CHECK(!qualify_tool_speculation_cpu_affinity(config, error));
+    CHECK(error.find("overlaps model CPU") != std::string::npos);
+    CHECK(!config.cpu_affinity_isolated);
+#else
+    CHECK(true);
+#endif
+}
+
 TEST_CASE(ToolSpeculationFixture, exact_match_exposes_result_and_resource_share) {
     const std::string control_path = make_temp_path();
     const std::string path = make_executor_script(
