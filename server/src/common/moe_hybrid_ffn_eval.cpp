@@ -1209,7 +1209,6 @@ bool build_moe_hybrid_ffn_graph(
     }
     out.dynamic_route_balance = dynamic_main_slots_x4 > 0;
     if (dynamic_main_slots_x4 > 0) {
-        out.dynamic_route_balance = true;
         static std::once_flag active_log;
         std::call_once(
             active_log,

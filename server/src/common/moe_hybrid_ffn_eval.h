@@ -123,10 +123,6 @@ struct MoeHybridGraphInputs {
     // widths, so consumers must not infer this from the process environment.
     bool dynamic_route_balance = false;
     ggml_tensor * router_weights = nullptr;
-    // True only when this graph can safely assign routes dynamically. The LUT
-    // refresh path uses the effective graph decision rather than the raw env
-    // request, which may be disabled for a sparse secondary expert stack.
-    bool dynamic_route_balance = false;
     std::vector<ggml_tensor *> router_nodes;
     // q>1 decomposes the six selected routes into a four-wide head and a
     // padded two-wide tail.  Keep those derived ID/weight tensors on the main
