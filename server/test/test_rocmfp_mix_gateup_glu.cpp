@@ -33,7 +33,10 @@
 //    tensor with an undecoded one.
 
 #include "ds4_test_gpu_runtime.h"
+#include "CppUnitTestFramework.hpp"
 #include "ggml-cuda.h"
+using CppUnitTestFramework::CommonFixture;
+#undef CHECK
 
 #include <cmath>
 #include <cstdint>
@@ -105,11 +108,16 @@ static float host_swiglu_ds4(float gate, float up, float limit) {
     return silu * up;
 }
 
-int main() {
+namespace {
+struct RocmfpMixGateupGluFixture : CommonFixture {
+    using CommonFixture::CommonFixture;
+};
+}
+
+TEST_CASE(RocmfpMixGateupGluFixture, fused_gateup_glu) {
     int ndev = 0;
     if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev == 0) {
-        std::fprintf(stderr, "SKIP: no HIP device\n");
-        return 0;
+        SKIP("no HIP device available");
     }
 
     // in must be a multiple of 128: the wide block load reads 128 weights at a time and would
@@ -298,8 +306,7 @@ int main() {
     HIP_OK(cudaFree(d_up_out)); HIP_OK(cudaFree(d_gate_out));
     HIP_OK(cudaFree(d_fused));  HIP_OK(cudaFree(d_swapped));
 
-    if (g_fails) { std::fprintf(stderr, "%d FAILURE(S)\n", g_fails); return 1; }
+    if (g_fails) { std::fprintf(stderr, "%d FAILURE(S)\n", g_fails); REQUIRE_TRUE(false); }
     std::fprintf(stderr, "OK: fused gate/up GLU matches the unfused pair, order is respected, "
                          "half-registered/mismatched pairs are refused, and out-of-range ids zero\n");
-    return 0;
 }

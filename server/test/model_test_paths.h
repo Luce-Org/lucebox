@@ -1,8 +1,9 @@
 #pragma once
 
+#include "CppUnitTestFramework.hpp"
+
 #include <cstdlib>
 #include <filesystem>
-#include <stdexcept>
 #include <string>
 #include <string_view>
 
@@ -22,7 +23,7 @@ inline std::filesystem::path require_path(
     const std::string name(environment_variable);
     const char * const value = std::getenv(name.c_str());
     if (!value || !*value) {
-        throw std::runtime_error(
+        throw CppUnitTestFramework::TestSkippedException(
             "required test asset is not configured: set " + name
         );
     }
@@ -33,7 +34,7 @@ inline std::filesystem::path require_path(
         ? std::filesystem::is_directory(path, error)
         : std::filesystem::is_regular_file(path, error);
     if (!valid || error) {
-        throw std::runtime_error(
+        throw CppUnitTestFramework::TestSkippedException(
             "configured test asset is unavailable for " + name + ": " + path.string()
         );
     }

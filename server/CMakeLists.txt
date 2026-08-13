@@ -808,7 +808,6 @@ if(DFLASH27B_TESTS)
         if(WIN32)
             target_link_libraries(test_platform_compat PRIVATE ws2_32)
         endif()
-        add_test(NAME platform_compat COMMAND test_platform_compat)
     endif()
 
     if(DFLASH27B_GPU_BACKEND STREQUAL "hip"
@@ -832,7 +831,6 @@ if(DFLASH27B_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
         target_link_libraries(test_cuda_comm_api PRIVATE
             ggml-cuda ggml ggml-base)
-        add_test(NAME cuda_comm_api COMMAND test_cuda_comm_api)
     endif()
 
     if(DFLASH27B_ENABLE_MIXED_CUDA_HIP)
@@ -902,7 +900,6 @@ if(DFLASH27B_TESTS)
     add_executable(test_qwen35_tensor_parallel test/test_qwen35_tensor_parallel.cpp)
     target_include_directories(test_qwen35_tensor_parallel PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
     target_link_libraries(test_qwen35_tensor_parallel PRIVATE dflash_common)
-    add_test(NAME qwen35_tensor_parallel COMMAND test_qwen35_tensor_parallel)
 
     if(DFLASH27B_GPU_BACKEND STREQUAL "cuda" AND _dflash_cuda_min_sm GREATER_EQUAL 80 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_flashprefill_kernels.cpp")
         add_executable(test_flashprefill_kernels test/test_flashprefill_kernels.cpp)
@@ -1065,7 +1062,6 @@ if(DFLASH27B_TESTS)
             find_package(CUDAToolkit REQUIRED)
             target_link_libraries(test_ggml_rmsnorm_batch PRIVATE CUDA::cudart)
         endif()
-        add_test(NAME ggml_rmsnorm_batch COMMAND test_ggml_rmsnorm_batch)
     endif()
     # POSIX-only fixture: it builds its temp model/sidecar stand-ins with symlink()/getpid()
     # under /tmp and probes them with access(R_OK). Porting that to Win32 would mean
@@ -1214,7 +1210,6 @@ if(DFLASH27B_TESTS)
         else()
             target_link_libraries(test_ds4_mix_registry_teardown PRIVATE hip::host)
         endif()
-        add_test(NAME ds4_mix_registry_teardown COMMAND test_ds4_mix_registry_teardown)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ds4_budget_hook.cpp")
         # Thinking-budget force-close rule. Header-only logic, so unlike the other ds4 tests
@@ -1239,7 +1234,6 @@ if(DFLASH27B_TESTS)
         else()
             target_link_libraries(test_ds4_dmix_entry_validation PRIVATE hip::host)
         endif()
-        add_test(NAME ds4_dmix_entry_validation COMMAND test_ds4_dmix_entry_validation)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ds4_dspark_load.cpp")
         add_executable(test_ds4_dspark_load test/test_ds4_dspark_load.cpp)
@@ -1629,12 +1623,69 @@ if(DFLASH27B_TESTS)
             target_compile_definitions(test_feature_gate PRIVATE
                 DFLASH27B_BACKEND_CUDA=1)
         endif()
-        add_test(NAME feature_gate COMMAND test_feature_gate)
     endif()
+
+    function(dflash_discover_cppunit_tests target)
+        if(CMAKE_CROSSCOMPILING)
+            add_test(NAME "${target}" COMMAND ${target})
+            set_tests_properties("${target}" PROPERTIES SKIP_RETURN_CODE 77)
+            return()
+        endif()
+
+        set(_ctest_generated
+            "${CMAKE_CURRENT_BINARY_DIR}/${target}_discovered_tests.cmake")
+        set(_ctest_include
+            "${CMAKE_CURRENT_BINARY_DIR}/${target}_discovered_tests_include.cmake")
+        file(GENERATE OUTPUT "${_ctest_include}"
+            CONTENT "include([==[${_ctest_generated}]==] OPTIONAL)\n")
+        set_property(DIRECTORY APPEND PROPERTY TEST_INCLUDE_FILES
+            "${_ctest_include}")
+        add_custom_command(TARGET ${target} POST_BUILD
+            COMMAND ${CMAKE_COMMAND}
+                -DTEST_EXECUTABLE=$<TARGET_FILE:${target}>
+                -DTEST_WORKING_DIR=${CMAKE_CURRENT_BINARY_DIR}
+                -DCTEST_FILE=${_ctest_generated}
+                -DTEST_PREFIX=${target}.
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/DiscoverCppUnitTests.cmake
+            VERBATIM
+            COMMENT "Discovering CppUnitTestFramework tests for ${target}")
+    endfunction()
+
+    set(_cppunit_test_targets
+        test_server_unit
+        test_model_smoke)
+    set(_new_cppunit_test_targets
+        test_platform_compat
+        test_feature_gate
+        test_qwen35_split_tree_guard
+        test_recurrent_snapshot
+        test_ds4_mix_registry_teardown
+        test_ds4_dmix_entry_validation
+        test_ggml_rmsnorm_batch
+        test_qwen35_tensor_parallel
+        test_deepseek4_hc_cuda
+        test_flashprefill_kernels
+        test_cuda_comm_api
+        test_mmq_streamk_iq4_xs
+        test_rms_norm_hip
+        test_rocmfp3_mix_registry
+        test_rocmfp_mix_slice_matvec
+        test_rocmfp_mix_gateup_glu
+        test_rocmfp_mix_glu_fusable)
+    foreach(_cppunit_target IN LISTS _new_cppunit_test_targets)
+        if(TARGET ${_cppunit_target})
+            target_sources(${_cppunit_target} PRIVATE test/test_unit_main.cpp)
+            dflash_discover_cppunit_tests(${_cppunit_target})
+            list(APPEND _cppunit_test_targets ${_cppunit_target})
+            list(APPEND _raw_unit_test_targets ${_cppunit_target})
+        endif()
+    endforeach()
+    unset(_new_cppunit_test_targets)
 
     if(_raw_unit_test_targets)
         foreach(_unit_target IN LISTS _raw_unit_test_targets)
-            if(NOT _unit_target STREQUAL "test_server_unit")
+            list(FIND _cppunit_test_targets "${_unit_target}" _cppunit_target_index)
+            if(_cppunit_target_index EQUAL -1)
                 # Preserve the established CTest names used by CI filters and
                 # downstream scripts even though dependency tracking uses the
                 # executable target names.
@@ -1663,9 +1714,7 @@ if(DFLASH27B_TESTS)
                     set(_unit_ctest_name paged_kv_pool)
                 endif()
                 add_test(NAME "${_unit_ctest_name}" COMMAND ${_unit_target})
-                if(_unit_target STREQUAL "test_deepseek4_mmid_grouped_cuda")
-                    set_tests_properties("${_unit_ctest_name}" PROPERTIES SKIP_RETURN_CODE 77)
-                endif()
+                set_tests_properties("${_unit_ctest_name}" PROPERTIES SKIP_RETURN_CODE 77)
                 if(_unit_target STREQUAL "test_rocmfp3_mix_registry")
                     # Its leak assertion reads GLOBAL free VRAM (cudaMemGetInfo) before and
                     # after 4000 register/unregister cycles, so any other test allocating on
@@ -1679,7 +1728,9 @@ if(DFLASH27B_TESTS)
             endif()
         endforeach()
         unset(_unit_ctest_name)
+        unset(_cppunit_target_index)
     endif()
+    unset(_cppunit_test_targets)
 
     # 'make check' — build every registered unit-test target, including the
     # lightweight feature gate added on main, then run the complete CTest set.

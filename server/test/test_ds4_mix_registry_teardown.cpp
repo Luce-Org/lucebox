@@ -22,6 +22,7 @@
 // The tensor `data` pointers are opaque keys: the registry only does pointer-range arithmetic
 // on them and never dereferences, exactly as test_rocmfp3_mix_registry relies on.
 
+#include "CppUnitTestFramework.hpp"
 #include "deepseek4_internal.h"
 #include "common/moe_hybrid_storage.h"
 #include "ggml-cuda.h"
@@ -29,6 +30,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <vector>
+
+using namespace CppUnitTestFramework;
 
 using dflash::common::DeepSeek4Layer;
 using dflash::common::DeepSeek4Weights;
@@ -38,16 +41,14 @@ using dflash::common::free_deepseek4_weights;
 bool ggml_cuda_rocmfp3_mix_registered(const void * vx);
 bool ggml_cuda_rocmfp2_mix_registered(const void * vx);
 
-static int g_fails = 0;
-#define CHECK(cond, msg)                                                        \
-    do {                                                                        \
-        if (!(cond)) { std::fprintf(stderr, "FAIL: %s\n", (msg)); ++g_fails; }  \
-    } while (0)
-
 namespace {
 
 // Distinct, aligned, non-overlapping stand-ins for device bases. Spaced well beyond the
 // registered span (nb02 * n_experts) so no two ranges can be confused for one another.
+struct Ds4MixRegistryTeardownFixture : CommonFixture {
+    using CommonFixture::CommonFixture;
+};
+
 const void * fake_base(int i) {
     return (const void *) (uintptr_t) (0x100000000ull + (uintptr_t) i * 0x1000000ull);
 }
@@ -75,15 +76,14 @@ bool register_as(bool is105, const void * base) {
 
 }  // namespace
 
-int main() {
+TEST_CASE(Ds4MixRegistryTeardownFixture, unregisters_all_mix_tensor_classes) {
     // Tensors live in a no_alloc context: only type and data are read by the teardown, and
     // free_deepseek4_weights owns the context afterwards.
     struct ggml_init_params ip = { /*mem_size=*/ 32u * 1024u * 1024u,
                                   /*mem_buffer=*/ nullptr, /*no_alloc=*/ true };
     ggml_context * ctx = ggml_init(ip);
     if (!ctx) {
-        std::fprintf(stderr, "SKIP: ggml_init failed\n");
-        return 0;
+        SKIP("ggml_init failed");
     }
 
     DeepSeek4Weights w;
@@ -98,9 +98,13 @@ int main() {
 
     // One layer carrying BOTH populations: five dense attention classes and the three expert
     // tensors. The dense half is what regressed; the expert half must keep working.
-    DeepSeek4Layer L{};
+    DeepSeek4Layer & L = w.layers.emplace_back();
     int slot = 0;
     std::vector<const void *> dense105, dense106, expert105, expert106;
+    auto skip_after_cleanup = [&](const char * reason) {
+        free_deepseek4_weights(w);
+        SKIP(reason);
+    };
 
     // Dense: mix 105 and 106 across classes deliberately -- the sidecar records a qtype per
     // entry precisely so an artifact may do this, and the teardown must dispatch on the
@@ -113,10 +117,10 @@ int main() {
         (L.attn_output_b = mk(GGML_TYPE_Q3_1_ROCMFP3_MIX)),
     };
     for (ggml_tensor * t : dense_t) {
-        if (!t) { std::fprintf(stderr, "SKIP: tensor alloc failed\n"); return 0; }
+        if (!t) skip_after_cleanup("dense tensor allocation failed");
         t->data = (void *) fake_base(slot++);
         const bool is105 = (t->type == GGML_TYPE_Q3_1_ROCMFP3_MIX);
-        CHECK(register_as(is105, t->data), "dense registration succeeds");
+        CHECK(register_as(is105, t->data));
         (is105 ? dense105 : dense106).push_back(t->data);
     }
 
@@ -126,18 +130,15 @@ int main() {
     L.ffn_up_exps   = mk(GGML_TYPE_Q2_1_ROCMFP2_MIX);
     ggml_tensor * const exp_t[3] = { L.ffn_down_exps, L.ffn_gate_exps, L.ffn_up_exps };
     for (ggml_tensor * t : exp_t) {
-        if (!t) { std::fprintf(stderr, "SKIP: tensor alloc failed\n"); return 0; }
+        if (!t) skip_after_cleanup("expert tensor allocation failed");
         t->data = (void *) fake_base(slot++);
         const bool is105 = (t->type == GGML_TYPE_Q3_1_ROCMFP3_MIX);
-        CHECK(register_as(is105, t->data), "expert registration succeeds");
+        CHECK(register_as(is105, t->data));
         (is105 ? expert105 : expert106).push_back(t->data);
     }
-    w.layers.push_back(L);
-
     // The fixture must actually contain dense entries, or everything below is vacuous. This
     // is the assertion the review asked for, and it is why the fixture is synthetic.
-    CHECK(!dense105.empty() && !dense106.empty(),
-          "fixture contains dense mix tensors of BOTH qtypes (else the test proves nothing)");
+    CHECK(!dense105.empty() && !dense106.empty());
 
     size_t live = 0;
     for (const void * b : dense105)  live += ggml_cuda_rocmfp3_mix_registered(b) ? 1 : 0;
@@ -146,11 +147,11 @@ int main() {
     for (const void * b : expert106) live += ggml_cuda_rocmfp2_mix_registered(b) ? 1 : 0;
     const size_t total = dense105.size() + dense106.size() +
                          expert105.size() + expert106.size();
-    CHECK(live == total, "every registration resolves before teardown");
+    CHECK(live == total);
 
     free_deepseek4_weights(w);
-    CHECK(w.ctx == nullptr, "context released by teardown");
-    CHECK(w.layers.empty(), "layers cleared by teardown");
+    CHECK(w.ctx == nullptr);
+    CHECK(w.layers.empty());
 
     // THE REGRESSION: dense entries must be gone, not just the expert ones.
     size_t stale_dense = 0, stale_expert = 0;
@@ -161,8 +162,8 @@ int main() {
     std::fprintf(stderr, "note: after teardown %zu/%zu dense and %zu/%zu expert entries "
                  "still resolve\n", stale_dense, dense105.size() + dense106.size(),
                  stale_expert, expert105.size() + expert106.size());
-    CHECK(stale_dense == 0, "NO dense attention mix entry survives free_deepseek4_weights");
-    CHECK(stale_expert == 0, "no expert mix entry survives free_deepseek4_weights");
+    CHECK(stale_dense == 0);
+    CHECK(stale_expert == 0);
 
     // Hybrid loading owns separate compact tensors on the primary and
     // secondary GPUs. MoeHybridStorage must unregister all of them before it
@@ -171,8 +172,7 @@ int main() {
     {
         ggml_context * hybrid_ctx = ggml_init(ip);
         if (!hybrid_ctx) {
-            std::fprintf(stderr, "SKIP: hybrid ggml_init failed\n");
-            return g_fails ? 1 : 0;
+            SKIP("hybrid ggml_init failed");
         }
 
         MoeHybridStorage hybrid;
@@ -193,14 +193,12 @@ int main() {
         };
         for (ggml_tensor * tensor : compact) {
             if (!tensor) {
-                std::fprintf(stderr, "SKIP: hybrid tensor alloc failed\n");
-                return g_fails ? 1 : 0;
+                SKIP("hybrid tensor allocation failed");
             }
             tensor->data = (void *) fake_base(slot++);
             const bool is105 =
                 tensor->type == GGML_TYPE_Q3_1_ROCMFP3_MIX;
-            CHECK(register_as(is105, tensor->data),
-                  "hybrid registration succeeds");
+            CHECK(register_as(is105, tensor->data));
             (is105 ? hybrid105 : hybrid106).push_back(tensor->data);
         }
 
@@ -211,8 +209,7 @@ int main() {
         for (const void * base : hybrid106) {
             live_hybrid += ggml_cuda_rocmfp2_mix_registered(base) ? 1 : 0;
         }
-        CHECK(live_hybrid == hybrid105.size() + hybrid106.size(),
-              "every compact owner registration resolves before teardown");
+        CHECK(live_hybrid == hybrid105.size() + hybrid106.size());
     }
 
     size_t stale_hybrid = 0;
@@ -222,10 +219,5 @@ int main() {
     for (const void * base : hybrid106) {
         stale_hybrid += ggml_cuda_rocmfp2_mix_registered(base) ? 1 : 0;
     }
-    CHECK(stale_hybrid == 0,
-          "no compact mix entry survives MoeHybridStorage teardown");
-
-    std::fprintf(stderr, g_fails ? "MIX REGISTRY TEARDOWN TEST FAILED (%d)\n"
-                                 : "MIX REGISTRY TEARDOWN TEST OK\n", g_fails);
-    return g_fails ? 1 : 0;
+    CHECK(stale_hybrid == 0);
 }

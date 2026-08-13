@@ -15,6 +15,9 @@
 // No device work: every case is pure admission logic on tensor metadata.
 
 #include "ggml.h"
+#include "CppUnitTestFramework.hpp"
+using CppUnitTestFramework::CommonFixture;
+#undef CHECK
 
 #include <cstdio>
 #include <cstring>
@@ -60,7 +63,13 @@ struct Triple {
 
 }  // namespace
 
-int main() {
+namespace {
+struct RocmfpMixGluFusableFixture : CommonFixture {
+    using CommonFixture::CommonFixture;
+};
+}
+
+TEST_CASE(RocmfpMixGluFusableFixture, admission_predicate) {
     // The happy path: everything matched, layout direct. Establishes that the negative
     // cases below fail for the reason under test and not because the fixture is malformed.
     {
@@ -147,5 +156,5 @@ int main() {
 
     std::fprintf(stderr, g_fails ? "MIX GLU FUSABLE TEST FAILED (%d)\n"
                                  : "MIX GLU FUSABLE TEST OK\n", g_fails);
-    return g_fails ? 1 : 0;
+    REQUIRE_TRUE(g_fails == 0);
 }

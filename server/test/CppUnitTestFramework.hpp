@@ -70,6 +70,21 @@ namespace CppUnitTestFramework {
         std::string m_message;
     };
 
+    struct TestSkippedException :
+        std::exception
+    {
+        TestSkippedException(std::string message)
+          : m_message(std::move(message))
+        {}
+
+        const char* what() const noexcept override {
+            return m_message.data();
+        }
+
+    private:
+        std::string m_message;
+    };
+
     //--------------------------------------------------------------------------------------------------------
     //--------------------------------------------------------------------------------------------------------
     //--------------------------------------------------------------------------------------------------------
@@ -324,7 +339,7 @@ namespace CppUnitTestFramework {
             GetTestVector().push_back(std::move(details));
         }
 
-        static bool Run(const RunOptions* options, const ILoggerPtr& logger) {
+        static int Run(const RunOptions* options, const ILoggerPtr& logger) {
             const auto& all_test_cases = GetTestVector();
 
             if (options->DiscoveryMode) {
@@ -339,7 +354,7 @@ namespace CppUnitTestFramework {
 
                     std::cout << std::endl;
                 }
-                return true;
+                return 0;
             }
 
             logger->BeginRun(all_test_cases.size());
@@ -358,8 +373,11 @@ namespace CppUnitTestFramework {
                 logger->EnterTest(test_case.Name);
 
                 bool test_failed = true;
+                bool test_skipped = false;
                 try {
                     test_failed = test_case.Callback(logger);
+                } catch (const TestSkippedException&) {
+                    test_skipped = true;
                 } catch (const AssertException&) {
                     // REQUIRE* statement failed.  No need to do anything else.
                 } catch (const std::exception& e) {
@@ -368,18 +386,27 @@ namespace CppUnitTestFramework {
                     logger->UnhandledException("<unstructured>");
                 }
 
-                logger->ExitTest(test_failed);
-
-                if (test_failed) {
-                    fail_count++;
+                if (test_skipped) {
+                    logger->SkipTest(test_case.Name);
+                    skip_count++;
                 } else {
+                    logger->ExitTest(test_failed);
+                }
+
+                if (!test_skipped && test_failed) {
+                    fail_count++;
+                } else if (!test_skipped) {
                     pass_count++;
                 }
             }
 
             logger->EndRun(pass_count, fail_count, skip_count);
 
-            return (fail_count == 0);
+            if (fail_count != 0) {
+                return 1;
+            }
+
+            return pass_count == 0 && skip_count != 0 ? 77 : 0;
         }
 
     private:
@@ -862,6 +889,8 @@ void TestCase_##TestName::Run()
 #define CHECK_CLOSE_FRACTION(Left, Right, Fraction) \
     CppUnitTestFramework::CommonFixture::HandleAssert(CppUnitTestFramework::AssertType::Continue, _CPPUTF_ASSERT_LOCATION, CppUnitTestFramework::Assert::CloseFraction((Left), (Right), (Fraction)))
 
+#define SKIP(Message) throw CppUnitTestFramework::TestSkippedException((Message))
+
 //------------------------------------------------------------------------------------------------------------
 
 #define UNUSED_RETURN(Expression) [[maybe_unused]] auto _CPPUTF_NEXT_MAYBEUNUSED_NAME = Expression
@@ -875,11 +904,11 @@ int main(int argc, const char* argv[]) {
         return 2;
     }
 
-    bool success = CppUnitTestFramework::TestRegistry::Run(
+    const int result = CppUnitTestFramework::TestRegistry::Run(
         &options,
         CppUnitTestFramework::ConsoleLogger::Create(&options)
     );
 
-    return success ? 0 : 1;
+    return result;
 }
 #endif

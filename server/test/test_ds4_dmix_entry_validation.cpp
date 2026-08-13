@@ -14,6 +14,8 @@
 // test share one definition -- the parser reads from a FILE*, and covering each case through
 // it would need a hand-forged sidecar on disk per case.
 
+#include "CppUnitTestFramework.hpp"
+
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -26,13 +28,13 @@ extern "C" const char * ds4_dmix_entry_reject_reason(
     uint32_t C, uint32_t K, uint8_t mode,
     uint32_t n_layers, bool already_covered);
 
-static int g_fails = 0;
-#define CHECK(cond, msg)                                                        \
-    do {                                                                        \
-        if (!(cond)) { std::fprintf(stderr, "FAIL: %s\n", (msg)); ++g_fails; }  \
-    } while (0)
+using namespace CppUnitTestFramework;
 
 namespace {
+struct Ds4DmixEntryValidationFixture : CommonFixture {
+    using CommonFixture::CommonFixture;
+};
+
 constexpr uint32_t Q105 = 105, Q106 = 106;
 constexpr uint32_t N_LAYERS = 43;
 
@@ -42,40 +44,27 @@ const char * ok106(uint8_t mode = 1, bool dup = false) {
 }
 }  // namespace
 
-int main() {
+TEST_CASE(Ds4DmixEntryValidationFixture, rejects_malformed_dmix_entries) {
     // Baseline: a valid entry is accepted, so the rejections below are attributable.
-    CHECK(ok106() == nullptr, "well-formed qtype-106 entry is accepted");
-    CHECK(ds4_dmix_entry_reject_reason(42, 4, Q105, 4096, 2, 8, 0, N_LAYERS, false) == nullptr,
-          "well-formed qtype-105 entry at the range edges is accepted");
+    CHECK(ok106() == nullptr);
+    CHECK(ds4_dmix_entry_reject_reason(42, 4, Q105, 4096, 2, 8, 0, N_LAYERS, false) == nullptr);
 
     // THE TWO REGRESSIONS.
-    CHECK(ok106(/*mode=*/2) != nullptr, "mode=2 is REJECTED");
-    CHECK(ok106(/*mode=*/255) != nullptr, "mode=255 is REJECTED");
-    CHECK(ok106(/*mode=*/1, /*dup=*/true) != nullptr,
-          "duplicate (layer, class) is REJECTED");
+    CHECK(ok106(/*mode=*/2) != nullptr);
+    CHECK(ok106(/*mode=*/255) != nullptr);
+    CHECK(ok106(/*mode=*/1, /*dup=*/true) != nullptr);
     // Both valid modes remain accepted -- the bound must not be off by one.
-    CHECK(ok106(/*mode=*/0) == nullptr, "mode=0 (fixed) still accepted");
-    CHECK(ok106(/*mode=*/1) == nullptr, "mode=1 (adaptive) still accepted");
+    CHECK(ok106(/*mode=*/0) == nullptr);
+    CHECK(ok106(/*mode=*/1) == nullptr);
 
     // Pre-existing rules, kept covered so the extraction did not drop any of them.
-    CHECK(ds4_dmix_entry_reject_reason(N_LAYERS, 0, Q106, 16, 2, 4, 1, N_LAYERS, false) != nullptr,
-          "layer >= n_layers is REJECTED");
-    CHECK(ds4_dmix_entry_reject_reason(0, 5, Q106, 16, 2, 4, 1, N_LAYERS, false) != nullptr,
-          "class >= DS4_DMIX_CLASSES is REJECTED");
-    CHECK(ds4_dmix_entry_reject_reason(0, 0, 107, 16, 2, 4, 1, N_LAYERS, false) != nullptr,
-          "a non-mix qtype is REJECTED");
-    CHECK(ds4_dmix_entry_reject_reason(0, 0, Q105, 16, 2, 4, 1, N_LAYERS, false) != nullptr,
-          "qtype-105 with K=4 is REJECTED (105 wants K=8)");
-    CHECK(ds4_dmix_entry_reject_reason(0, 0, Q106, 16, 2, 8, 1, N_LAYERS, false) != nullptr,
-          "qtype-106 with K=8 is REJECTED (106 wants K=4)");
-    CHECK(ds4_dmix_entry_reject_reason(0, 0, Q106, 16, 3, 4, 1, N_LAYERS, false) != nullptr,
-          "C != 2 is REJECTED");
-    CHECK(ds4_dmix_entry_reject_reason(0, 0, Q106, 0, 2, 4, 1, N_LAYERS, false) != nullptr,
-          "nslices == 0 is REJECTED");
-    CHECK(ds4_dmix_entry_reject_reason(0, 0, Q106, 4097, 2, 4, 1, N_LAYERS, false) != nullptr,
-          "nslices > 4096 is REJECTED");
+    CHECK(ds4_dmix_entry_reject_reason(N_LAYERS, 0, Q106, 16, 2, 4, 1, N_LAYERS, false) != nullptr);
+    CHECK(ds4_dmix_entry_reject_reason(0, 5, Q106, 16, 2, 4, 1, N_LAYERS, false) != nullptr);
+    CHECK(ds4_dmix_entry_reject_reason(0, 0, 107, 16, 2, 4, 1, N_LAYERS, false) != nullptr);
+    CHECK(ds4_dmix_entry_reject_reason(0, 0, Q105, 16, 2, 4, 1, N_LAYERS, false) != nullptr);
+    CHECK(ds4_dmix_entry_reject_reason(0, 0, Q106, 16, 2, 8, 1, N_LAYERS, false) != nullptr);
+    CHECK(ds4_dmix_entry_reject_reason(0, 0, Q106, 16, 3, 4, 1, N_LAYERS, false) != nullptr);
+    CHECK(ds4_dmix_entry_reject_reason(0, 0, Q106, 0, 2, 4, 1, N_LAYERS, false) != nullptr);
+    CHECK(ds4_dmix_entry_reject_reason(0, 0, Q106, 4097, 2, 4, 1, N_LAYERS, false) != nullptr);
 
-    std::fprintf(stderr, g_fails ? "DMIX ENTRY VALIDATION TEST FAILED (%d)\n"
-                                 : "DMIX ENTRY VALIDATION TEST OK\n", g_fails);
-    return g_fails ? 1 : 0;
 }

@@ -1,3 +1,4 @@
+#include "CppUnitTestFramework.hpp"
 #include "internal.h"
 
 #include "ggml-backend.h"
@@ -7,21 +8,19 @@
 #include <cstdio>
 #include <vector>
 
+using namespace CppUnitTestFramework;
+
 using dflash::common::TargetCache;
 using dflash::common::restore_ssm_state;
 using dflash::common::snapshot_ssm_state;
 
-static int failures = 0;
-
-#define CHECK(expr) do { \
-    if (!(expr)) { \
-        std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #expr); \
-        failures++; \
-    } \
-} while (0)
+namespace {
+struct RecurrentSnapshotFixture : CommonFixture {
+    using CommonFixture::CommonFixture;
+};
+}
 
 static void set_tensor(ggml_tensor * tensor, const std::vector<float> & values) {
-    CHECK(ggml_nelements(tensor) == (int64_t)values.size());
     ggml_backend_tensor_set(tensor, values.data(), 0,
                             values.size() * sizeof(float));
 }
@@ -33,10 +32,10 @@ static std::vector<float> get_tensor(const ggml_tensor * tensor) {
     return values;
 }
 
-int main() {
+TEST_CASE(RecurrentSnapshotFixture, snapshot_and_restore_recurrent_state) {
     ggml_backend_t backend = ggml_backend_cpu_init();
     CHECK(backend != nullptr);
-    if (!backend) return 1;
+    if (!backend) SKIP("CPU backend is unavailable");
 
     ggml_init_params params{};
     params.mem_size = 8 * ggml_tensor_overhead();
@@ -45,7 +44,7 @@ int main() {
     CHECK(ctx != nullptr);
     if (!ctx) {
         ggml_backend_free(backend);
-        return 1;
+        SKIP("could not initialize ggml context");
     }
 
     ggml_tensor * ssm = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, 3);
@@ -57,7 +56,7 @@ int main() {
     if (!buffer) {
         ggml_free(ctx);
         ggml_backend_free(backend);
-        return 1;
+        SKIP("could not allocate CPU backend tensors");
     }
 
     TargetCache cache;
@@ -75,6 +74,8 @@ int main() {
     const std::vector<float> ssm_mutated(ssm_original.size(), -1.0f);
     const std::vector<float> conv_mutated(conv_original.size(), -2.0f);
 
+    CHECK(ggml_nelements(ssm) == (int64_t) ssm_original.size());
+    CHECK(ggml_nelements(conv) == (int64_t) conv_original.size());
     set_tensor(ssm, ssm_original);
     set_tensor(conv, conv_original);
     CHECK(snapshot_ssm_state(cache, backend));
@@ -99,11 +100,4 @@ int main() {
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
     ggml_backend_free(backend);
-
-    if (failures != 0) {
-        std::fprintf(stderr, "%d recurrent snapshot test(s) failed\n", failures);
-        return 1;
-    }
-    std::printf("recurrent snapshot tests passed\n");
-    return 0;
 }

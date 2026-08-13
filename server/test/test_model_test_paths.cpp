@@ -3,8 +3,6 @@
 #include "scoped_env.h"
 
 #include <filesystem>
-#include <stdexcept>
-
 using namespace CppUnitTestFramework;
 
 struct ModelTestPaths : CommonFixture {
@@ -15,7 +13,7 @@ TEST_CASE(ModelTestPaths, RejectsMissingRequiredAsset) {
     luce_test::ScopedEnvVar unset(kTestEnvironmentVariable, nullptr);
 
     REQUIRE_THROW(
-        std::runtime_error,
+        TestSkippedException,
         luce_test::require_model(kTestEnvironmentVariable)
     );
 }
