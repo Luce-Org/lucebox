@@ -102,6 +102,31 @@ TEST_CASE(Qwen35MoeExpertPlacementFixture, moe_expert_placement_suite) {
     REQUIRE(balanced.is_hot(0, 2));
     REQUIRE(balanced.is_hot(1, 0));
 
+    // Ratio-greedy selection picks the four-byte layer first and strands two
+    // bytes. The exact frontier correctly spends all six bytes on the larger
+    // improvement from layer 0.
+    MoeHybridRoutingStats unequal_size_stats;
+    unequal_size_stats.n_layer = 2;
+    unequal_size_stats.n_expert = 2;
+    unequal_size_stats.n_expert_used = 1;
+    unequal_size_stats.counts = {
+        80, 20,
+        90, 10,
+    };
+    unequal_size_stats.layer_totals = {100, 100};
+    MoeHybridCriticalPathConfig unequal_size_cfg;
+    unequal_size_cfg.active_experts = 1;
+    unequal_size_cfg.main_to_peer_rate = 100.0;
+    MoeHybridPlacement unequal_size;
+    REQUIRE(MoeHybridPlacement::build_critical_path_balanced_from_stats(
+        unequal_size_stats,
+        /*layer_expert_bytes=*/{6, 4},
+        /*layer_main_fixed_bytes=*/{0, 0},
+        /*total_hot_budget_bytes=*/6,
+        unequal_size_cfg, unequal_size, &err));
+    REQUIRE(unequal_size.hot_counts == std::vector<int>({1, 0}));
+    REQUIRE(unequal_size.is_hot(0, 0));
+
     // A phase-specific decode placement remains intact while a second profile
     // spends otherwise-unused bytes on prefill residency.
     MoeHybridRoutingStats residency_stats;

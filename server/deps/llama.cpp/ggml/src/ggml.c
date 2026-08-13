@@ -8427,6 +8427,9 @@ struct ggml_tensor * ggml_ds4_moe_balanced_owner_ids(
     GGML_ASSERT(ggml_are_same_shape(global_ids, router_weights));
     GGML_ASSERT(ggml_nelements(local_id_lut) ==
                 ggml_nelements(main_candidate_lut));
+    GGML_ASSERT(local_id_lut->ne[0] == 1 && local_id_lut->ne[1] > 0);
+    GGML_ASSERT(main_candidate_lut->ne[0] == 1 &&
+                main_candidate_lut->ne[1] == local_id_lut->ne[1]);
     GGML_ASSERT(ggml_is_contiguous(global_ids));
     GGML_ASSERT(ggml_is_contiguous(router_weights));
     GGML_ASSERT(ggml_is_contiguous(local_id_lut));

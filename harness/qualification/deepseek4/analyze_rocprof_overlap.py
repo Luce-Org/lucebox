@@ -5,9 +5,29 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+
+
+def parse_dispatch(
+    row: Mapping[str, str | None],
+) -> tuple[str, int, int, str] | None:
+    """Parse one rocprof dispatch, ignoring partial or malformed rows."""
+    agent = row.get("Agent_Id")
+    start_text = row.get("Start_Timestamp")
+    end_text = row.get("End_Timestamp")
+    if not agent or start_text is None or end_text is None:
+        return None
+    try:
+        start = int(start_text)
+        end = int(end_text)
+    except ValueError:
+        return None
+    if end <= start:
+        return None
+    return agent, start, end, row.get("Kernel_Name") or "<unknown>"
 
 
 def merge_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -122,8 +142,19 @@ def main() -> int:
         help="merge same-agent intervals separated by at most this gap",
     )
     args = parser.parse_args()
+    float_args = [
+        args.bin_ms,
+        args.window_start_s,
+        args.timeline_merge_gap_us,
+    ]
+    if args.window_end_s is not None:
+        float_args.append(args.window_end_s)
+    if not all(math.isfinite(value) for value in float_args):
+        parser.error("floating-point options must be finite")
     if args.bin_ms <= 0 or args.window_start_s < 0:
         parser.error("bin size must be positive and window start non-negative")
+    if args.window_end_s is not None and args.window_end_s < 0:
+        parser.error("window end must be non-negative")
     if args.timeline_max < 0 or args.timeline_merge_gap_us < 0:
         parser.error("timeline limits and merge gap must be non-negative")
 
@@ -132,11 +163,10 @@ def main() -> int:
     trace_end: int | None = None
     with args.kernel_trace.open(newline="") as handle:
         for row in csv.DictReader(handle):
-            agent = row["Agent_Id"]
-            start = int(row["Start_Timestamp"])
-            end = int(row["End_Timestamp"])
-            if end <= start:
+            parsed = parse_dispatch(row)
+            if parsed is None:
                 continue
+            agent, start, end, _ = parsed
             intervals_by_agent[agent].append((start, end))
             trace_start = start if trace_start is None else min(trace_start, start)
             trace_end = end if trace_end is None else max(trace_end, end)
@@ -174,12 +204,14 @@ def main() -> int:
     if args.top > 0:
         with args.kernel_trace.open(newline="") as handle:
             for row in csv.DictReader(handle):
-                agent = row["Agent_Id"]
-                start = max(window_start, int(row["Start_Timestamp"]))
-                end = min(window_end, int(row["End_Timestamp"]))
+                parsed = parse_dispatch(row)
+                if parsed is None:
+                    continue
+                agent, dispatch_start, dispatch_end, name = parsed
+                start = max(window_start, dispatch_start)
+                end = min(window_end, dispatch_end)
                 if end <= start:
                     continue
-                name = row["Kernel_Name"]
                 duration_by_kernel[agent][name] += end - start
                 count_by_kernel[agent][name] += 1
 

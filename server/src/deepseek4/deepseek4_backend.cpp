@@ -1676,19 +1676,16 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
     const bool bound_hybrid_scratch =
         moe_hybrid_ &&
         cfg_.prefill_mode == PrefillAttentionMode::Sparse;
-    const int safe_chunk = bound_hybrid_scratch
+    const int chunk = bound_hybrid_scratch
         ? deepseek4_hybrid_prefill_chunk_tokens(
               base_chunk, kv_offset + n_total,
               hybrid_prefill_chunk_cap_)
         : base_chunk;
-    if (safe_chunk < base_chunk) {
+    if (chunk < base_chunk) {
         hybrid_prefill_chunk_cap_ = hybrid_prefill_chunk_cap_ > 0
-            ? std::min(hybrid_prefill_chunk_cap_, safe_chunk)
-            : safe_chunk;
+            ? std::min(hybrid_prefill_chunk_cap_, chunk)
+            : chunk;
     }
-    const int chunk = bound_hybrid_scratch && hybrid_prefill_chunk_cap_ > 0
-        ? std::min(base_chunk, hybrid_prefill_chunk_cap_)
-        : base_chunk;
     if (chunk < base_chunk) {
         std::fprintf(stderr,
                      "[deepseek4] hybrid prefill scratch bound: "

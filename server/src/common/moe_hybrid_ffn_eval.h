@@ -115,6 +115,10 @@ struct MoeHybridFfnTelemetry {
 // slots owned by the other backend without a host-side routing round trip.
 struct MoeHybridGraphInputs {
     ggml_tensor * router_weights = nullptr;
+    // True only when this graph can safely assign routes dynamically. The LUT
+    // refresh path uses the effective graph decision rather than the raw env
+    // request, which may be disabled for a sparse secondary expert stack.
+    bool dynamic_route_balance = false;
     std::vector<ggml_tensor *> router_nodes;
     // q>1 decomposes the six selected routes into a four-wide head and a
     // padded two-wide tail.  Keep those derived ID/weight tensors on the main
@@ -162,6 +166,11 @@ enum class MoeHybridJoinMode {
     CanonicalRouteOrder,
 };
 
+enum class MoeHybridRouteBalance {
+    Allowed,
+    Disabled,
+};
+
 // Process-wide graph policy parsed once from the model-neutral environment
 // variables. Legacy DS4 spellings remain accepted by the implementation, but
 // graph builders and scheduler setup consume this typed view instead of
@@ -203,7 +212,9 @@ bool build_moe_hybrid_ffn_graph(
     bool                           include_shared = true,
     bool                           allow_fused_combine = false,
     MoeHybridJoinMode              join_mode =
-                                       MoeHybridJoinMode::OwnerPartialSums);
+                                       MoeHybridJoinMode::OwnerPartialSums,
+    MoeHybridRouteBalance          route_balance =
+                                       MoeHybridRouteBalance::Allowed);
 
 int moe_hybrid_expert_compute_batch_limit();
 int moe_hybrid_expert_compute_ipc_batch_limit(int n_tokens);

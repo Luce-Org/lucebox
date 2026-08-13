@@ -52,14 +52,10 @@ bool parse_routing_header(const std::string & line,
 }
 
 bool parse_count_row(const std::string & line, std::vector<uint64_t> & row) {
-    size_t begin = 0;
-    while (begin <= line.size()) {
-        const size_t comma = line.find(',', begin);
-        const size_t end = comma == std::string::npos ? line.size() : comma;
-        const size_t first = line.find_first_not_of(" \t", begin);
-        if (first == std::string::npos) return row.empty();
-        if (first >= end) return false;
-        const size_t last = line.find_last_not_of(" \t", end - 1);
+    const auto parse_value = [&](size_t begin, size_t end) {
+        const size_t first = line.find_first_not_of(" \t\r", begin);
+        if (first == std::string::npos || first >= end) return false;
+        const size_t last = line.find_last_not_of(" \t\r", end - 1);
         if (last < first) return false;
 
         uint64_t value = 0;
@@ -68,6 +64,27 @@ bool parse_count_row(const std::string & line, std::vector<uint64_t> & row) {
         const auto parsed = std::from_chars(value_begin, value_end, value);
         if (parsed.ec != std::errc{} || parsed.ptr != value_end) return false;
         row.push_back(value);
+        return true;
+    };
+
+    // Commas are the canonical format. Preserve whitespace-separated legacy
+    // profiles so existing DFLASH_*_HOTNESS files remain loadable.
+    if (line.find(',') == std::string::npos) {
+        size_t begin = line.find_first_not_of(" \t\r");
+        while (begin != std::string::npos) {
+            const size_t end = line.find_first_of(" \t\r", begin);
+            const size_t token_end = end == std::string::npos ? line.size() : end;
+            if (!parse_value(begin, token_end)) return false;
+            begin = line.find_first_not_of(" \t\r", token_end);
+        }
+        return true;
+    }
+
+    size_t begin = 0;
+    while (begin <= line.size()) {
+        const size_t comma = line.find(',', begin);
+        const size_t end = comma == std::string::npos ? line.size() : comma;
+        if (!parse_value(begin, end)) return false;
         if (comma == std::string::npos) return true;
         begin = comma + 1;
     }

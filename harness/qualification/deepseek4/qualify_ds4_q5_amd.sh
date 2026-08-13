@@ -26,6 +26,10 @@ DIRECT_INDEXER_TOPK="${DIRECT_INDEXER_TOPK:-1}"
 BLOCK_RADIX_TOPK="${BLOCK_RADIX_TOPK:-1}"
 PACK_Q4_INDEXER="${PACK_Q4_INDEXER:-0}"
 Q5_VERIFY="${Q5_VERIFY:-1}"
+case "$Q5_VERIFY" in
+    0|1) ;;
+    *) echo "Q5_VERIFY must be 0 or 1" >&2; exit 2 ;;
+esac
 FP4_Q5_X4_PLUS1="${FP4_Q5_X4_PLUS1:-auto}"
 CRITICAL_PATH_PLACEMENT="${CRITICAL_PATH_PLACEMENT:-0}"
 MAIN_TO_PEER_RATE="${MAIN_TO_PEER_RATE:-3.4}"
@@ -82,10 +86,6 @@ esac
 case "$PACK_Q4_INDEXER" in
     0|1) ;;
     *) echo "PACK_Q4_INDEXER must be 0 or 1" >&2; exit 2 ;;
-esac
-case "$Q5_VERIFY" in
-    0|1) ;;
-    *) echo "Q5_VERIFY must be 0 or 1" >&2; exit 2 ;;
 esac
 if [[ "${Q6_VERIFY:-0}" != 0 ]]; then
     echo "Q6_VERIFY is unsupported; use Q5_VERIFY=1" >&2

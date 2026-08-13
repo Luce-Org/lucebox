@@ -160,15 +160,13 @@ static void ds4_fused_verify_refresh_hybrid_luts(
         MoeHybridStorage * hybrid,
         DeepSeek4FusedDecodeGraph & fg) {
     if (!hybrid) return;
-    const bool dynamic_route_balance =
-        ds4_env_flag("DFLASH_DS4_TP_DYNAMIC_ROUTE_BALANCE") ||
-        ds4_env_flag("DFLASH_MOE_TP_DYNAMIC_ROUTE_BALANCE");
     const int32_t invalid_route =
         ds4_env_flag("DFLASH_DS4_TP_MASKED_ROUTES") ? -1 : 0;
     for (size_t hi = 0; hi < fg.hybrid_inputs.size(); ++hi) {
         const int il = (int) hi;
         const MoeHybridLayerStorage & layer = hybrid->layers[(size_t) il];
         const MoeHybridGraphInputs & inputs = fg.hybrid_inputs[hi];
+        const bool dynamic_route_balance = inputs.dynamic_route_balance;
         const std::vector<int32_t> & preferred_hot =
             dynamic_route_balance ||
                     layer.decode_hot_local_by_global.empty()
@@ -716,7 +714,8 @@ static bool ds4_build_fused_verify_graph(
                         hybrid_cfg, desc,
                         hybrid->layers[(size_t) il], ffn_normed,
                         first_ids, first_weights, lane_q, inputs, true,
-                        allow_fused_combine, join_mode)) {
+                        allow_fused_combine, join_mode,
+                        MoeHybridRouteBalance::Disabled)) {
                     return false;
                 }
                 ffn_out = inputs.output;
@@ -727,7 +726,8 @@ static bool ds4_build_fused_verify_graph(
                         hybrid_cfg, desc,
                         hybrid->layers[(size_t) il], ffn_normed,
                         padded_ids, padded_weights, lane_q, inputs, false,
-                        allow_fused_combine, join_mode)) {
+                        allow_fused_combine, join_mode,
+                        MoeHybridRouteBalance::Disabled)) {
                     return false;
                 }
                 ffn_out = ggml_add(ctx, ffn_out, inputs.output);

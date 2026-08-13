@@ -520,32 +520,110 @@ bool MoeHybridPlacement::build_critical_path_balanced_from_stats(
             peer_work);
     };
 
-    uint64_t remaining = total_hot_budget_bytes - used_bytes;
-    while (true) {
-        int best_layer = -1;
-        double best_value = 0.0;
-        double best_gain = 0.0;
-        for (int il = 0; il < tmp.n_layer; ++il) {
-            const int current = tmp.hot_counts[(size_t) il];
-            const uint64_t bytes = layer_expert_bytes[(size_t) il];
-            if (current >= tmp.n_expert || bytes == 0 || bytes > remaining) {
-                continue;
+    struct LayerChoice {
+        uint64_t bytes = 0;
+        double cost = 0.0;
+        int hot_count = 0;
+    };
+    struct PlacementState {
+        uint64_t bytes = 0;
+        double cost = 0.0;
+        size_t previous = 0;
+        int hot_count = 0;
+    };
+
+    const uint64_t remaining = total_hot_budget_bytes - used_bytes;
+    std::vector<std::vector<LayerChoice>> layer_choices(
+        (size_t) tmp.n_layer);
+    for (int il = 0; il < tmp.n_layer; ++il) {
+        const uint64_t expert_bytes = layer_expert_bytes[(size_t) il];
+        auto & choices = layer_choices[(size_t) il];
+        if (expert_bytes == 0) {
+            choices.push_back({0, 0.0, 0});
+            continue;
+        }
+
+        double best_cost = std::numeric_limits<double>::infinity();
+        for (int hot_count = floor; hot_count <= tmp.n_expert; ++hot_count) {
+            const uint64_t extra_count = (uint64_t) (hot_count - floor);
+            if (extra_count > 0 &&
+                expert_bytes > remaining / extra_count) {
+                break;
             }
-            const double gain =
-                layer_cost(il, current) - layer_cost(il, current + 1);
-            if (!(gain > 0.0)) continue;
-            const double value = gain / (double) bytes;
-            if (best_layer < 0 || value > best_value ||
-                (value == best_value && gain > best_gain)) {
-                best_layer = il;
-                best_value = value;
-                best_gain = gain;
+            const uint64_t bytes = extra_count * expert_bytes;
+            const double cost = layer_cost(il, hot_count);
+            if (!std::isfinite(cost)) {
+                if (err) *err = "critical-path layer cost is not finite";
+                return false;
+            }
+            // Larger counts with no lower layer cost are dominated by this
+            // layer's earlier choices and cannot improve a global solution.
+            if (cost < best_cost) {
+                choices.push_back({bytes, cost, hot_count});
+                best_cost = cost;
             }
         }
-        if (best_layer < 0) break;
-        const uint64_t bytes = layer_expert_bytes[(size_t) best_layer];
-        tmp.hot_counts[(size_t) best_layer]++;
-        remaining -= bytes;
+    }
+
+    // Multiple-choice knapsack over each layer's non-dominated hot counts.
+    // The frontier stays sparse in bytes, so byte budgets do not need to be
+    // quantized and differently sized expert tensors remain exact.
+    std::vector<std::vector<PlacementState>> stages((size_t) tmp.n_layer + 1);
+    stages[0].push_back({0, 0.0, 0, 0});
+    for (int il = 0; il < tmp.n_layer; ++il) {
+        const auto & previous = stages[(size_t) il];
+        std::vector<PlacementState> candidates;
+        for (size_t previous_index = 0;
+             previous_index < previous.size(); ++previous_index) {
+            const PlacementState & base = previous[previous_index];
+            for (const LayerChoice & choice : layer_choices[(size_t) il]) {
+                if (choice.bytes > remaining - base.bytes) continue;
+                candidates.push_back({
+                    base.bytes + choice.bytes,
+                    base.cost + choice.cost,
+                    previous_index,
+                    choice.hot_count,
+                });
+            }
+        }
+        std::sort(candidates.begin(), candidates.end(),
+            [](const PlacementState & left, const PlacementState & right) {
+                if (left.bytes != right.bytes) return left.bytes < right.bytes;
+                if (left.cost != right.cost) return left.cost < right.cost;
+                if (left.hot_count != right.hot_count) {
+                    return left.hot_count < right.hot_count;
+                }
+                return left.previous < right.previous;
+            });
+
+        auto & frontier = stages[(size_t) il + 1];
+        double best_cost = std::numeric_limits<double>::infinity();
+        for (const PlacementState & candidate : candidates) {
+            if (candidate.cost < best_cost) {
+                frontier.push_back(candidate);
+                best_cost = candidate.cost;
+            }
+        }
+        if (frontier.empty()) {
+            if (err) *err = "critical-path placement has no feasible solution";
+            return false;
+        }
+    }
+
+    const auto & final_stage = stages.back();
+    size_t state_index = (size_t) std::distance(
+        final_stage.begin(),
+        std::min_element(
+            final_stage.begin(), final_stage.end(),
+            [](const PlacementState & left, const PlacementState & right) {
+                return left.cost < right.cost ||
+                    (left.cost == right.cost && left.bytes < right.bytes);
+            }));
+    for (int il = tmp.n_layer - 1; il >= 0; --il) {
+        const PlacementState & state =
+            stages[(size_t) il + 1][state_index];
+        tmp.hot_counts[(size_t) il] = state.hot_count;
+        state_index = state.previous;
     }
 
     tmp.total_hot =

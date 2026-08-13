@@ -668,7 +668,13 @@ void ggml_cuda_op_moe_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
 
         const int n_routes = (int) global_ids->ne[0];
         const int n_tokens = (int) global_ids->ne[1];
-        const int n_expert = (int) ggml_nelements(local_lut);
+        // LUT rows are replicated across verifier tokens. Only dimension 1 is
+        // the base expert domain; using the total element count would permit a
+        // positive out-of-range ID to index a later replica.
+        GGML_ASSERT(local_lut->ne[0] == 1 && local_lut->ne[1] > 0);
+        GGML_ASSERT(candidate_lut->ne[0] == 1 &&
+                    candidate_lut->ne[1] == local_lut->ne[1]);
+        const int n_expert = (int) local_lut->ne[1];
         const int main_slots_x4 = ggml_get_op_params_i32(dst, 1);
         const bool main_owner = ggml_get_op_params_i32(dst, 2) != 0;
         ds4_balanced_owner_ids_kernel<<<1, 1, 0, ctx.stream()>>>(

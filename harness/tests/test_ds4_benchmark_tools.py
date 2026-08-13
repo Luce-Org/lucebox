@@ -5,8 +5,9 @@ import io
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -163,6 +164,13 @@ class QualifierPreflightTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("must be unset or exactly 0,1", result.stderr)
 
+    def test_nonnumeric_q5_mode_is_rejected_cleanly(self) -> None:
+        result = self.run_qualifier(Q5_VERIFY="invalid")
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("Q5_VERIFY must be 0 or 1", result.stderr)
+        self.assertNotIn("unbound variable", result.stderr)
+
 
 class ContextSummaryTests(unittest.TestCase):
     def test_ok_row_without_decode_metrics_is_excluded(self) -> None:
@@ -200,6 +208,44 @@ class ContextSummaryTests(unittest.TestCase):
 
 
 class RocprofTimelineTests(unittest.TestCase):
+    def test_nonfinite_float_options_are_rejected(self) -> None:
+        for option, value in (
+            ("--bin-ms", "nan"),
+            ("--window-start-s", "inf"),
+            ("--window-end-s", "-inf"),
+            ("--timeline-merge-gap-us", "nan"),
+        ):
+            with self.subTest(option=option):
+                argv = ["rocprof-overlap", "unused.csv", option, value]
+                with (
+                    mock.patch.object(sys, "argv", argv),
+                    redirect_stderr(io.StringIO()),
+                    self.assertRaises(SystemExit) as error,
+                ):
+                    analyze_rocprof_overlap.main()
+
+                self.assertEqual(error.exception.code, 2)
+
+    def test_malformed_dispatch_rows_are_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            trace = Path(directory) / "trace.csv"
+            trace.write_text(
+                "Agent_Id,Start_Timestamp,End_Timestamp,Kernel_Name\n"
+                "gpu0,100,200,kernel0\n"
+                "gpu0,invalid,250,broken\n"
+                "gpu1,120,180,kernel1\n",
+                encoding="utf-8",
+            )
+            argv = ["rocprof-overlap", str(trace), "--top", "0"]
+            with (
+                mock.patch.object(sys, "argv", argv),
+                redirect_stdout(io.StringIO()),
+            ):
+                result = analyze_rocprof_overlap.main()
+
+        self.assertEqual(result, 0)
+        self.assertIsNone(analyze_rocprof_overlap.parse_dispatch({}))
+
     def test_window_is_clipped_before_merge_and_cap_is_per_agent(self) -> None:
         bursts = analyze_rocprof_overlap.build_timeline_bursts(
             {
