@@ -1,4 +1,5 @@
 #include "common.cuh"
+#include "ggml-cuda.h"
 #include "mmq.cuh"
 #include "quantize.cuh"
 #include "mmid.cuh"
@@ -471,6 +472,108 @@ void ggml_cuda_op_mul_mat_q(
     GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_padded_row_size);
 }
 
+#ifndef GGML_CUDA_MIX_MMQ_DEFAULT
+// OFF unless a caller opts in — ggml_cuda_set_mix_mmq_enabled() from a model
+// backend, or DFLASH_MIX_MMQ=1. No in-tree backend opts in today, on purpose:
+// this path applies to dense ggml_mul_mat, and DeepSeek-V4's 105/106 tensors
+// are MoE experts reached through ggml_mul_mat_id, so turning it on changes
+// nothing for DS4. That was MEASURED, not assumed — six serving configs
+// byte-identical either way, a 3974-token prefill at 184.1 s +/-0.1%, and a
+// controlled decode A/B at 21.72 / 21.72 / 21.74 tok/s on gfx1151.
+//
+// The win this path exists for was measured out of tree, on a dense 3.3 bpw
+// consumer of these qtypes: 81.0 tok/s against 43.5 with it off, on the same
+// 122-item task suite at equal quality. A process-wide default would extend
+// that result to models it was never measured on, so the enable stays with
+// whichever backend can show the measurement.
+#define GGML_CUDA_MIX_MMQ_DEFAULT false
+#endif
+
+// ── Batched path for the mix qtypes (105/106) ───────────────────────────
+// Without it, ne11 > 1 falls back to dequantize-to-bf16 + dense GEMM, which
+// discards the whole point of a sub-4 bpw artifact for the duration of the
+// multiply (measured: 48% of a 16-token speculative verify's GPU time inside
+// dequantize_rocmfp{2,3}_mix_kernel).
+//
+// Runtime-settable rather than a function-local static so a single process can
+// A/B both paths; test_rocmfp_mix_mmq compares them against the validated
+// matvec kernel that way. Env var still provides the default.
+static bool g_mix_mmq_forced     = false;
+static bool g_mix_mmq_forced_val = false;
+
+static const char * mix_mmq_env_value() {
+    const char * value = getenv("DFLASH_MIX_MMQ");
+    if (value == nullptr) {
+        // Legacy spelling; the flag predates its use outside DS4 prefill.
+        value = getenv("DFLASH_DS4_MIX_MMQ_PREFILL");
+    }
+    return value;
+}
+
+bool ggml_cuda_mix_mmq_env_pinned() {
+    static const bool pinned = mix_mmq_env_value() != nullptr;
+    return pinned;
+}
+
+// Precedence: an explicit set_ call (the test's A/B harness) beats the
+// environment, which beats the compiled default. Backends opting in for their
+// own model must therefore check ggml_cuda_mix_mmq_env_pinned() first, so an
+// operator running DFLASH_MIX_MMQ=0 is not silently overridden.
+bool ggml_cuda_mix_mmq_enabled() {
+    if (g_mix_mmq_forced) {
+        return g_mix_mmq_forced_val;
+    }
+    if (ggml_cuda_mix_mmq_env_pinned()) {
+        static const bool from_env = []() {
+            const char * value = mix_mmq_env_value();
+            return !(value[0] == '0' && value[1] == '\0');
+        }();
+        return from_env;
+    }
+    return GGML_CUDA_MIX_MMQ_DEFAULT;
+}
+
+void ggml_cuda_set_mix_mmq_enabled(bool enabled) {
+    g_mix_mmq_forced     = true;
+    g_mix_mmq_forced_val = enabled;
+}
+
+void ggml_cuda_clear_mix_mmq_override() {
+    g_mix_mmq_forced = false;
+}
+
+// Widest ne11 at which the mix-qtype MMQ path still beats dequantize-to-bf16 +
+// dense GEMM. MMQ is not uniformly better: it wins by a lot when the batch is
+// narrow and loses when it is wide, because the dequant path hands a wide N to
+// a well-tiled dense GEMM while the MMQ kernel does not tile as far. Measured
+// out of tree on a dense 3.3 bpw artifact carrying 71 mix tensors (the only
+// dense consumer of these qtypes so far), prefill tok/s, MMQ off -> on:
+//
+//   ne11        8      16      64     256    1024    2048
+//   gfx1151  1.80x   1.77x   1.65x   1.05x   0.89x   0.86x
+//   gfx1201  5.11x   4.02x   3.26x   1.83x   1.13x   0.98x
+//
+// so the crossover sits between 256 and 1024 on RDNA 3.5 and between 1024 and
+// 2048 on RDNA 4. Decline MMQ past it rather than making the operator choose:
+// decode (ne11 == 1) never reaches this gate at all, and a served request wants
+// the narrow-batch win on its speculative-verify steps AND the wide-batch win
+// on its prefill, which one process-wide boolean cannot deliver.
+//
+// NVIDIA has no width sweep yet — the H200 result behind this path (1.20x) was
+// measured on ne11 4..16 verify batches. It therefore takes the conservative
+// RDNA 3.5 bound, which keeps every measured NVIDIA win and declines only the
+// widths nothing has measured there. Raise it with the env var once swept.
+static int64_t mix_mmq_max_ne11(int cc) {
+    static const int64_t override_value = []() -> int64_t {
+        const char * value = getenv("DFLASH_MIX_MMQ_MAX_NE11");
+        return value ? strtoll(value, nullptr, 10) : -1;
+    }();
+    if (override_value >= 0) {
+        return override_value;
+    }
+    return GGML_CUDA_CC_IS_RDNA4(cc) ? 1024 : 256;
+}
+
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
 #ifdef GGML_CUDA_FORCE_CUBLAS
     return false;
@@ -517,21 +620,49 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
                             GGML_CUDA_CC_IS_RDNA4(cc);
             break;
         case GGML_TYPE_Q2_1_ROCMFP2_MIX: {
-            static const bool mix_mmq_enabled = []() {
-                const char * value = getenv("DFLASH_DS4_MIX_MMQ_PREFILL");
-                return value != nullptr && !(value[0] == '0' && value[1] == '\0');
-            }();
-            mmq_supported = mix_mmq_enabled &&
-                (GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc));
+            // Batched path for the mix qtypes. Without it, ne11 > 1 falls back
+            // to dequantize-to-bf16 + dense GEMM, which throws away the whole
+            // point of a 3.3 bpw artifact for the duration of the multiply:
+            // measured 48% of a 16-token speculative verify's GPU time inside
+            // dequantize_rocmfp{2,3}_mix_kernel.
+            //
+            // Enabling it on gfx1201 measured 1.7-1.9x on that verify AND
+            // halved the batch-vs-sequential logit drift (0.774 -> 0.380),
+            // because the dequant path rounds through bf16 where MMQ keeps
+            // integer dot products. Faster and more faithful.
+            //
+            // NVIDIA is opted in behind the same env var so the claim can be
+            // measured rather than assumed: the DP4A tile these types declare
+            // is portable, but nothing has gated it here yet.
+            //
+            // Width-gated: see mix_mmq_max_ne11 for why wide batches decline.
+            mmq_supported = ggml_cuda_mix_mmq_enabled() &&
+                ne11 <= mix_mmq_max_ne11(cc) &&
+                (GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc) ||
+                 GGML_CUDA_CC_IS_NVIDIA(cc));
             break;
         }
         case GGML_TYPE_Q3_1_ROCMFP3_MIX: {
-            static const bool mix_mmq_enabled = []() {
-                const char * value = getenv("DFLASH_DS4_MIX_MMQ_PREFILL");
-                return value != nullptr && !(value[0] == '0' && value[1] == '\0');
-            }();
-            mmq_supported = mix_mmq_enabled &&
-                (GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc));
+            // Batched path for the mix qtypes. Without it, ne11 > 1 falls back
+            // to dequantize-to-bf16 + dense GEMM, which throws away the whole
+            // point of a 3.3 bpw artifact for the duration of the multiply:
+            // measured 48% of a 16-token speculative verify's GPU time inside
+            // dequantize_rocmfp{2,3}_mix_kernel.
+            //
+            // Enabling it on gfx1201 measured 1.7-1.9x on that verify AND
+            // halved the batch-vs-sequential logit drift (0.774 -> 0.380),
+            // because the dequant path rounds through bf16 where MMQ keeps
+            // integer dot products. Faster and more faithful.
+            //
+            // NVIDIA is opted in behind the same env var so the claim can be
+            // measured rather than assumed: the DP4A tile these types declare
+            // is portable, but nothing has gated it here yet.
+            //
+            // Width-gated: see mix_mmq_max_ne11 for why wide batches decline.
+            mmq_supported = ggml_cuda_mix_mmq_enabled() &&
+                ne11 <= mix_mmq_max_ne11(cc) &&
+                (GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc) ||
+                 GGML_CUDA_CC_IS_NVIDIA(cc));
             break;
         }
         default:
