@@ -25,8 +25,10 @@
 #include <array>
 #include <algorithm>
 #include <cassert>
+#include <cerrno>
 #include <cfloat>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -160,6 +162,60 @@ static int ggml_cuda_highest_compiled_arch(const int arch) {
 #define MATRIX_ROW_PADDING 512 // last row of quant. matrices is a multiple of this to avoid out-of-bounds memory accesses
 
 #define GGML_CUDA_MAX_STREAMS 8
+
+#if defined(GGML_USE_HIP)
+// Optional Lucebox experiment: reserve the lowest CUs on one HIP device for a
+// trusted in-process tool stream. Every lazily-created ggml stream on that
+// device receives the complementary CU mask, creating a real disjoint lane
+// inside one HIP context. Default behavior is unchanged when the variable is
+// absent. Format: DFLASH_HIP_RESERVED_TOOL_LANE=DEVICE:CUS (for example 0:1).
+static inline bool dflash_hip_model_stream_mask(
+        int device, std::vector<uint32_t> & mask, int & reserved_cus) {
+    const char * raw = std::getenv("DFLASH_HIP_RESERVED_TOOL_LANE");
+    if (!raw || !*raw) return false;
+
+    errno = 0;
+    char * separator = nullptr;
+    const long configured_device = std::strtol(raw, &separator, 10);
+    if (errno != 0 || separator == raw || !separator || *separator != ':') {
+        GGML_ABORT(
+            "DFLASH_HIP_RESERVED_TOOL_LANE must be DEVICE:CUS, got '%s'\n",
+            raw);
+    }
+    char * end = nullptr;
+    errno = 0;
+    const long configured_cus = std::strtol(separator + 1, &end, 10);
+    if (errno != 0 || !end || *end != '\0' || configured_device < 0 ||
+        configured_cus <= 0) {
+        GGML_ABORT(
+            "DFLASH_HIP_RESERVED_TOOL_LANE must be DEVICE:CUS with positive "
+            "integers, got '%s'\n", raw);
+    }
+    if (configured_device != device) return false;
+
+    hipDeviceProp_t properties{};
+    const hipError_t status = hipGetDeviceProperties(&properties, device);
+    if (status != hipSuccess) {
+        GGML_ABORT(
+            "DFLASH_HIP_RESERVED_TOOL_LANE could not inspect HIP device %d: "
+            "%s\n",
+            device, hipGetErrorString(status));
+    }
+    if (configured_cus >= properties.multiProcessorCount) {
+        GGML_ABORT(
+            "DFLASH_HIP_RESERVED_TOOL_LANE reserves %ld of %d CUs on device "
+            "%d; at least one model CU is required\n",
+            configured_cus, properties.multiProcessorCount, device);
+    }
+    reserved_cus = static_cast<int>(configured_cus);
+    mask.assign(
+        static_cast<size_t>((properties.multiProcessorCount + 31) / 32), 0);
+    for (int cu = reserved_cus; cu < properties.multiProcessorCount; ++cu) {
+        mask[static_cast<size_t>(cu / 32)] |= uint32_t{1} << (cu % 32);
+    }
+    return true;
+}
+#endif
 
 [[noreturn]]
 void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg);
@@ -1486,6 +1542,37 @@ struct ggml_backend_cuda_context {
     cudaStream_t stream(int device, int stream) {
         if (streams[device][stream] == nullptr) {
             ggml_cuda_set_device(device);
+#if defined(GGML_USE_HIP)
+            std::vector<uint32_t> model_cu_mask;
+            int reserved_cus = 0;
+            const bool disjoint_tool_lane = dflash_hip_model_stream_mask(
+                device, model_cu_mask, reserved_cus);
+            if (disjoint_tool_lane) {
+                CUDA_CHECK(hipExtStreamCreateWithCUMask(
+                    &streams[device][stream],
+                    static_cast<uint32_t>(model_cu_mask.size()),
+                    model_cu_mask.data()));
+                if (low_priority_streams) {
+#if HIP_VERSION_MAJOR >= 7
+                    hipStreamAttrValue priority{};
+                    priority.priority = stream_priority;
+                    CUDA_CHECK(hipStreamSetAttribute(
+                        streams[device][stream],
+                        hipStreamAttributePriority, &priority));
+#else
+                    GGML_ABORT(
+                        "DFLASH_HIP_RESERVED_TOOL_LANE requires ROCm 7+ "
+                        "to preserve low-priority DSpark streams\n");
+#endif
+                }
+                if (stream == 0) {
+                    std::fprintf(stderr,
+                        "ggml_hip: device %d model streams exclude %d "
+                        "low CU(s) reserved for in-process tools\n",
+                        device, reserved_cus);
+                }
+            } else
+#endif
             if (low_priority_streams) {
                 CUDA_CHECK(cudaStreamCreateWithPriority(
                     &streams[device][stream], cudaStreamNonBlocking,

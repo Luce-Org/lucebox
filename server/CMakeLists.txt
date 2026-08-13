@@ -1466,6 +1466,7 @@ if(DFLASH27B_TESTS)
         set(_server_unit_sources
             test/test_unit_main.cpp
             test/test_server_unit.cpp
+            test/test_tool_speculation.cpp
             test/test_anchor_params.cpp
             test/test_derived_scalars.cpp
             test/test_adaptive_keep_ratio.cpp
@@ -1497,6 +1498,7 @@ if(DFLASH27B_TESTS)
         add_executable(test_server_unit ${_server_unit_sources})
         target_sources(test_server_unit PRIVATE
             src/server/http_server.cpp
+            src/server/tool_speculation.cpp
             src/server/model_card.cpp
             src/server/prompt_normalize.cpp
             src/qwen3/anchor_scan.cpp)
@@ -1746,12 +1748,15 @@ if(DFLASH27B_SERVER)
         add_executable(dflash_server
             src/server/server_main.cpp
             src/server/http_server.cpp
+            src/server/tool_speculation.cpp
             src/server/model_card.cpp
             src/server/prompt_normalize.cpp
         )
         target_include_directories(dflash_server PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
             target_compile_definitions(dflash_server PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
+            target_sources(dflash_server PRIVATE
+                src/server/tool_speculation_hip_probe.cpp)
             if(DFLASH27B_ENABLE_MIXED_CUDA_HIP)
                 target_compile_definitions(dflash_server PRIVATE
                     DFLASH27B_BACKEND_MIXED=1)
@@ -1778,7 +1783,11 @@ if(DFLASH27B_SERVER)
             find_package(CUDAToolkit REQUIRED)
             target_link_libraries(dflash_server PRIVATE CUDA::cudart)
         else()
-            target_link_libraries(dflash_server PRIVATE hip::host)
+            # ggml-hip finds hipBLAS in a child-directory scope. The trusted
+            # in-process tool adapter also calls hipBLAS directly, so import
+            # the target in this scope before linking the server executable.
+            find_package(hipblas REQUIRED)
+            target_link_libraries(dflash_server PRIVATE hip::host roc::hipblas)
         endif()
 
         # Copy share/status.html next to the binary so it can be found at runtime.

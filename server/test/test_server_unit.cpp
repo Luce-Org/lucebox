@@ -4619,6 +4619,88 @@ TEST_CASE(ServerUnitFixture, test_props_budget_envelope_shape) {
     TEST_ASSERT(body["server"]["props_schema"].get<int>() == 2);
 }
 
+TEST_CASE(ServerUnitFixture, test_props_tool_speculation_shape) {
+    ServerConfig cfg;
+    Tokenizer tok;
+    PrefixCache pc(0, tok);
+    ToolMemory tm;
+
+    json body = build_props_body(cfg, pc, tm);
+    TEST_ASSERT(body.contains("tool_speculation"));
+    const json & disabled = body["tool_speculation"];
+    TEST_ASSERT(!disabled["enabled"].get<bool>());
+    TEST_ASSERT(disabled["profile_status"].is_null());
+    TEST_ASSERT(disabled["executor_contract"].is_null());
+    TEST_ASSERT(disabled["protocol"].get<std::string>() ==
+                "dflash.tool-speculation.v1");
+    TEST_ASSERT(disabled["requires_client_support"].get<bool>());
+    TEST_ASSERT(disabled["preserves_token_speculation"].get<bool>());
+    TEST_ASSERT(disabled["unqualified_lane_policy"].get<std::string>() ==
+                "defer");
+    TEST_ASSERT(disabled["allowed_tools"].empty());
+    TEST_ASSERT(disabled["model_routing_static"].get<bool>());
+    TEST_ASSERT(disabled["model_expert_ownership_unique"].get<bool>());
+    TEST_ASSERT(disabled["compute_isolation"].get<std::string>() == "none");
+    TEST_ASSERT(disabled["hip_tool_device"].is_null());
+    TEST_ASSERT(disabled["hip_reserved_tool_compute_units"].get<int>() == 0);
+    TEST_ASSERT(disabled["profile_lanes"].empty());
+
+    cfg.tool_speculation.executor_path = "/trusted/tool-adapter";
+    cfg.tool_speculation.profile_path = "/measured/frontier.json";
+    cfg.tool_speculation.allowed_tools = {"lookup"};
+    std::string profile_error;
+    TEST_ASSERT(cfg.tool_speculation.policy.load_json(json{
+        {"path_summary", {
+            {"25", {
+                {"decode_interference_qualified", true},
+                {"hit", {
+                    {"control_task_mean_ms", 100.0},
+                    {"speculative_task_mean_ms", 80.0},
+                    {"model_slowdown_percent", 2.0},
+                }},
+                {"miss", {
+                    {"control_task_mean_ms", 100.0},
+                    {"speculative_task_mean_ms", 101.0},
+                    {"model_slowdown_percent", 2.0},
+                }},
+            }},
+        }},
+    }, profile_error));
+
+    body = build_props_body(cfg, pc, tm);
+    const json & enabled = body["tool_speculation"];
+    TEST_ASSERT(enabled["enabled"].get<bool>());
+    TEST_ASSERT(enabled["profile_status"].get<std::string>() == "qualified");
+    TEST_ASSERT(enabled["allowed_tools"] == json::array({"lookup"}));
+    TEST_ASSERT(enabled["preserves_token_speculation"].get<bool>());
+    TEST_ASSERT(enabled["unqualified_lane_policy"].get<std::string>() ==
+                "defer");
+    TEST_ASSERT(enabled["profile_lanes"].size() == 1);
+    TEST_ASSERT(enabled["profile_lanes"][0]
+                       ["resource_percentage"].get<int>() == 25);
+    TEST_ASSERT(std::fabs(enabled["profile_lanes"][0]
+                            ["model_slowdown_ratio"].get<double>() - 1.02) <
+                1e-9);
+    TEST_ASSERT(enabled["profile_lanes"][0]
+                       ["decode_interference_qualified"].get<bool>());
+    TEST_ASSERT(enabled["profile_lanes"][0]
+                       ["accelerator_relation"].get<std::string>() ==
+                "unspecified");
+    TEST_ASSERT(!enabled["profile_lanes"][0]
+                        ["requires_static_model_routing"].get<bool>());
+    TEST_ASSERT(!enabled["profile_lanes"][0]
+                        ["requires_unique_expert_ownership"].get<bool>());
+
+    cfg.tool_speculation.hip_tool_device = 1;
+    cfg.tool_speculation.hip_reserved_tool_compute_units = 1;
+    body = build_props_body(cfg, pc, tm);
+    const json & isolated = body["tool_speculation"];
+    TEST_ASSERT(isolated["compute_isolation"].get<std::string>() ==
+                "disjoint_hip_cu_masks");
+    TEST_ASSERT(isolated["hip_tool_device"].get<int>() == 1);
+    TEST_ASSERT(isolated["hip_reserved_tool_compute_units"].get<int>() == 1);
+}
+
 // ─── /props.runtime captures full config (§4.16) ──────────────────────
 // Snapshot/bench tooling reads /props.runtime wholesale into
 // result.json.server_info; this test pins the field set so additions
@@ -4849,6 +4931,40 @@ TEST_CASE(ServerUnitFixture, test_model_backend_retries_empty_spec_restore_once_
     TEST_ASSERT(result.spec_decode_ran);
     TEST_ASSERT(backend.restore_calls == 2);
     TEST_ASSERT(backend.restore_saw_force_ar);
+}
+
+TEST_CASE(ServerUnitFixture, test_model_backend_can_forbid_ar_retry) {
+    EmptySpecRetryBackend backend;
+    GenerateRequest req;
+    req.prompt = {1, 2, 3};
+    req.n_gen = 4;
+    req.allow_decode_mode_retry = false;
+    DaemonIO io;
+
+    GenerateResult result = backend.generate(req, io);
+
+    TEST_ASSERT(result.ok());
+    TEST_ASSERT(result.tokens.empty());
+    TEST_ASSERT(result.spec_decode_ran);
+    TEST_ASSERT(backend.generate_calls == 1);
+    TEST_ASSERT(!backend.generate_saw_force_ar);
+}
+
+TEST_CASE(ServerUnitFixture, test_model_backend_restore_can_forbid_ar_retry) {
+    EmptySpecRetryBackend backend;
+    GenerateRequest req;
+    req.prompt = {1, 2, 3};
+    req.n_gen = 4;
+    req.allow_decode_mode_retry = false;
+    DaemonIO io;
+
+    GenerateResult result = backend.restore_and_generate(7, req, io);
+
+    TEST_ASSERT(result.ok());
+    TEST_ASSERT(result.tokens.empty());
+    TEST_ASSERT(result.spec_decode_ran);
+    TEST_ASSERT(backend.restore_calls == 1);
+    TEST_ASSERT(!backend.restore_saw_force_ar);
 }
 
 TEST_CASE(ServerUnitFixture, test_model_backend_retries_empty_visible_spec_generate_once_with_ar) {

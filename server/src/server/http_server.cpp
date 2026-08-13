@@ -706,6 +706,20 @@ json build_props_body(const ServerConfig & config,
     // benchmarks to silently run at temp=0 (degenerate-decode collapse)
     // when the model card specifies temp=1.0/top_p=0.95/top_k=64.
     const auto & smp = config.sampler_defaults;
+    json tool_spec_lanes = json::array();
+    for (const auto & lane : config.tool_speculation.policy.lanes()) {
+        tool_spec_lanes.push_back({
+            {"resource_percentage", lane.resource_percentage},
+            {"model_slowdown_ratio", lane.model_slowdown_ratio},
+            {"decode_interference_qualified",
+             lane.decode_interference_qualified},
+            {"accelerator_relation", lane.accelerator_relation},
+            {"requires_static_model_routing",
+             lane.requires_static_model_routing},
+            {"requires_unique_expert_ownership",
+             lane.requires_unique_expert_ownership},
+        });
+    }
     json body = {
         {"default_generation_settings", {
             {"n_ctx",          config.max_ctx},
@@ -779,6 +793,39 @@ json build_props_body(const ServerConfig & config,
             {"enabled",       config.speculative_enabled},
             {"ddtree_budget", config.speculative_enabled
                                 ? json(config.ddtree_budget) : json(nullptr)},
+        }},
+        {"tool_speculation", {
+            {"enabled", config.tool_speculation.enabled()},
+            {"execution_mode", config.tool_speculation.execution_mode()},
+            {"profile_status",
+             config.tool_speculation.policy.empty()
+                 ? json(nullptr)
+                 : json(config.tool_speculation.policy.profile_status())},
+            {"executor_contract",
+             config.tool_speculation.policy.executor_contract().empty()
+                 ? json(nullptr)
+                 : json(config.tool_speculation.policy.executor_contract())},
+            {"protocol", "dflash.tool-speculation.v1"},
+            {"requires_client_support", true},
+            {"preserves_token_speculation", true},
+            {"unqualified_lane_policy", "defer"},
+            {"allowed_tools", config.tool_speculation.allowed_tools},
+            {"max_model_slowdown_ratio",
+             config.tool_speculation.max_model_slowdown_ratio},
+            {"model_routing_static",
+             config.tool_speculation.model_routing_static},
+            {"model_expert_ownership_unique",
+             config.tool_speculation.model_expert_ownership_unique},
+            {"compute_isolation",
+             config.tool_speculation.hip_reserved_tool_compute_units > 0
+                 ? "disjoint_hip_cu_masks" : "none"},
+            {"hip_tool_device",
+             config.tool_speculation.hip_tool_device >= 0
+                 ? json(config.tool_speculation.hip_tool_device)
+                 : json(nullptr)},
+            {"hip_reserved_tool_compute_units",
+             config.tool_speculation.hip_reserved_tool_compute_units},
+            {"profile_lanes", tool_spec_lanes},
         }},
         {"sampling", {
             {"capabilities", {
@@ -1609,6 +1656,18 @@ bool HttpServer::parse_common_request_fields(
     if (body.contains("tools")) req.tools = body["tools"];
     // Tool choice constraint for hint generation.
     if (body.contains("tool_choice")) req.tool_choice = body["tool_choice"];
+
+    if (body.contains("tool_speculation")) {
+        ToolSpeculationPrediction prediction;
+        std::string prediction_error;
+        if (!parse_tool_speculation_prediction(
+                body["tool_speculation"], req.tools, prediction,
+                prediction_error)) {
+            send_error(fd, 400, prediction_error);
+            return false;
+        }
+        req.tool_speculation = std::move(prediction);
+    }
 
     if (body.contains("prefix_cache") && body["prefix_cache"].is_object()) {
         const auto & prefix_cache = body["prefix_cache"];
@@ -3339,6 +3398,11 @@ void HttpServer::prepare_generation_inputs(
     inputs.request.n_gen = inputs.generation_cap;
     inputs.request.sampler = req.sampler;
     inputs.request.do_sample = req.sampler.needs_logit_processing();
+    // An opted-in external tool may overlap the chosen decoder, but it must
+    // never cause speculative decoding to be retried as AR. If the selected
+    // decoder cannot produce output, surface that outcome unchanged.
+    inputs.request.allow_decode_mode_retry =
+        !req.tool_speculation.has_value();
     // Tokens are delivered through DaemonIO so all API formats share the
     // same disconnect and streaming state machine.
     inputs.request.stream = false;
@@ -3566,6 +3630,14 @@ void HttpServer::process_job(ServerJob * job) {
         return;
     }
 
+    std::unique_ptr<ToolSpeculationAttempt> tool_speculation;
+    if (req.tool_speculation.has_value()) {
+        tool_speculation = ToolSpeculationAttempt::create(
+            config_.tool_speculation, *req.tool_speculation,
+            req.response_id);
+        tool_speculation->start();
+    }
+
     auto & effective_prompt = prepared.tokens;
     const bool pflash_compressed = prepared.compressed;
 
@@ -3697,6 +3769,18 @@ void HttpServer::process_job(ServerJob * job) {
     }
     if (req.stream && !client_disconnected) {
         auto final_chunks = emitter.emit_finish(completion_tokens, &gen_timings);
+        if (tool_speculation) {
+            const json metadata = tool_speculation->resolve(emitter.tool_calls());
+            const std::string extension = render_tool_speculation_sse(
+                req.format, req.response_id, req.model, metadata);
+            // Keep the standard terminal event last: [DONE], message_stop,
+            // or response.completed. Only opted-in clients see this extension.
+            if (final_chunks.empty()) {
+                final_chunks.push_back(extension);
+            } else {
+                final_chunks.insert(final_chunks.end() - 1, extension);
+            }
+        }
         for (const auto & chunk : final_chunks) {
             if (!send_job_bytes(job, chunk.data(), chunk.size())) {
                 client_disconnected = true;
@@ -3704,14 +3788,20 @@ void HttpServer::process_job(ServerJob * job) {
             }
         }
     } else if (!req.stream && !client_disconnected) {
-        const json response = build_non_streaming_response(
+        json response = build_non_streaming_response(
             req, result, n_gen_cap, gen_timings, tokenizer_, emitter);
+        if (tool_speculation) {
+            response["dflash_tool_speculation"] =
+                tool_speculation->resolve(emitter.tool_calls());
+        }
         // Streaming uses non-blocking sends; restore blocking mode before
         // writing a complete JSON response on this shared socket path.
         const int flags = sock_get_flags(fd);
         if (flags >= 0) sock_set_block(fd);
         send_response(fd, 200, "application/json",
                       response.dump() + "\n");
+    } else if (tool_speculation) {
+        tool_speculation->cancel("client_disconnected");
     }
 
     if (client_disconnected) {

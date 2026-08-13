@@ -18,6 +18,7 @@
 #include "tokenizer.h"
 #include "chat_template.h"
 #include "tool_memory.h"
+#include "tool_speculation.h"
 #include "prefix_cache.h"
 #include "disk_prefix_cache.h"
 #include "freeze_history.h"
@@ -37,6 +38,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #if !defined(_WIN32)
@@ -217,6 +219,11 @@ struct ServerConfig {
     // Routing data collection (--collect-routing <path>): write binary per-token
     // routing data (hidden states + expert selections) for predictor training.
     std::string collect_routing_path;
+
+    // Lossless external-tool speculation. Off unless the operator configures
+    // an executor, an empirical interference profile, and an explicit
+    // read-only/idempotent tool allowlist.
+    ToolSpeculationConfig tool_speculation;
 };
 
 // ─── Parsed request ─────────────────────────────────────────────────────
@@ -236,6 +243,10 @@ struct ParsedRequest {
     json                      messages;
     // Original request body (for upstream proxy forwarding)
     json                      raw_body;
+    // Concrete invocation predicted by a caller or future semantic sidecar.
+    // The engine may execute it privately, but never exposes its result until
+    // the model emits the exact canonical invocation.
+    std::optional<ToolSpeculationPrediction> tool_speculation;
     // Response ID
     std::string               response_id;
     // Thinking/reasoning state

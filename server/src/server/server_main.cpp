@@ -12,6 +12,9 @@
 //                              [--max-tokens 4096] [--target-device auto:0]
 
 #include "http_server.h"
+#if defined(DFLASH27B_BACKEND_HIP)
+#include "tool_speculation_hip_probe.h"
+#endif
 #include "chat_template.h"
 #include "model_card.h"
 #include "common/backend_factory.h"
@@ -26,6 +29,7 @@
 #include "placement/draft_residency.h"
 
 #include <algorithm>
+#include <cmath>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -34,6 +38,10 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
 
 using namespace dflash::common;
 
@@ -62,6 +70,11 @@ static bool parse_double_list(const char * value, std::vector<double> & out) {
         if (!*p) return false;
     }
     return !out.empty();
+}
+
+static bool environment_flag_enabled(const char * name) {
+    const char * value = std::getenv(name);
+    return value && *value && std::strcmp(value, "0") != 0;
 }
 
 static void print_usage(const char * prog) {
@@ -165,6 +178,24 @@ static void print_usage(const char * prog) {
         "                         Drafter lifetime policy (default: auto)\n"
         "  --lazy-draft                Legacy alias for --draft-residency=request-scoped\n"
         "\n"
+        "Speculative external tools (opt-in, POSIX):\n"
+        "  --tool-spec-executor <path>  Trusted executor adapter. Receives one\n"
+        "                               dflash.tool-speculation.v1 JSON request\n"
+        "                               on stdin; no shell is used.\n"
+#if defined(DFLASH27B_BACKEND_HIP)
+        "  --tool-spec-hip-sgemm-probe <DEVICE:MATRIX>\n"
+        "                               Benchmark-only trusted in-process HIP\n"
+        "                               executor with a per-lane CU-masked stream.\n"
+#endif
+        "  --tool-spec-profile <path>   Measured resource-lane frontier JSON.\n"
+        "  --tool-spec-allow <name>     Allow one read-only/idempotent tool; repeatable.\n"
+        "  --tool-spec-timeout-ms <N>   Executor result timeout (default: 60000).\n"
+        "  --tool-spec-max-model-slowdown <R>\n"
+        "                               Reject lanes slower than this inference\n"
+        "                               ratio (default: 1.20).\n"
+        "                               Every admitted lane must pass exact-output\n"
+        "                               decode-interference qualification.\n"
+        "\n"
         "PFlash upstream proxy (forward compressed prompt to a backend):\n"
         "  --prefill-upstream-base <URL>   OpenAI-compatible upstream. Compressed\n"
         "                              requests POST the raw prompt to\n"
@@ -216,6 +247,9 @@ int main(int argc, char ** argv) {
     // Parse arguments.
     BackendArgs bargs;
     ServerConfig sconfig;
+    int tool_spec_hip_probe_device = -1;
+    int tool_spec_hip_probe_matrix = 0;
+    int tool_spec_hip_probe_total_cus = 0;
     bargs.model_path = argv[1];
     bool   spark_autotune = false; // --spark: self-tuning hot/cold MoE residency
     int    spark_slots = -1;       // --spark-slots: explicit cache slots/layer (-1=auto)
@@ -506,6 +540,62 @@ int main(int argc, char ** argv) {
         } else if (std::strcmp(argv[i], "--lazy-draft") == 0) {
             sconfig.lazy_draft = true;
             sconfig.draft_residency = DraftResidencyPolicy::RequestScoped;
+        } else if (std::strcmp(argv[i], "--tool-spec-executor") == 0 &&
+                   i + 1 < argc) {
+            sconfig.tool_speculation.executor_path = argv[++i];
+#if defined(DFLASH27B_BACKEND_HIP)
+        } else if (std::strcmp(argv[i], "--tool-spec-hip-sgemm-probe") == 0 &&
+                   i + 1 < argc) {
+            const char * value = argv[++i];
+            char * separator = nullptr;
+            const long device = std::strtol(value, &separator, 10);
+            if (separator == value || !separator || *separator != ':') {
+                std::fprintf(stderr,
+                    "[server] --tool-spec-hip-sgemm-probe expects DEVICE:MATRIX\n");
+                return 2;
+            }
+            char * end = nullptr;
+            const long matrix = std::strtol(separator + 1, &end, 10);
+            if (!end || *end != '\0' || device < 0 ||
+                matrix <= 0 || matrix > 8192) {
+                std::fprintf(stderr,
+                    "[server] invalid --tool-spec-hip-sgemm-probe DEVICE:MATRIX\n");
+                return 2;
+            }
+            tool_spec_hip_probe_device = static_cast<int>(device);
+            tool_spec_hip_probe_matrix = static_cast<int>(matrix);
+#endif
+        } else if (std::strcmp(argv[i], "--tool-spec-profile") == 0 &&
+                   i + 1 < argc) {
+            sconfig.tool_speculation.profile_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--tool-spec-allow") == 0 &&
+                   i + 1 < argc) {
+            const std::string name = argv[++i];
+            if (name.empty()) {
+                std::fprintf(stderr, "[server] --tool-spec-allow needs a name\n");
+                return 2;
+            }
+            sconfig.tool_speculation.allowed_tools.push_back(name);
+        } else if (std::strcmp(argv[i], "--tool-spec-timeout-ms") == 0 &&
+                   i + 1 < argc) {
+            sconfig.tool_speculation.timeout_ms = std::atoi(argv[++i]);
+            if (sconfig.tool_speculation.timeout_ms <= 0) {
+                std::fprintf(stderr,
+                    "[server] --tool-spec-timeout-ms must be positive\n");
+                return 2;
+            }
+        } else if (std::strcmp(
+                       argv[i], "--tool-spec-max-model-slowdown") == 0 &&
+                   i + 1 < argc) {
+            sconfig.tool_speculation.max_model_slowdown_ratio =
+                std::atof(argv[++i]);
+            if (!std::isfinite(
+                    sconfig.tool_speculation.max_model_slowdown_ratio) ||
+                sconfig.tool_speculation.max_model_slowdown_ratio < 1.0) {
+                std::fprintf(stderr,
+                    "[server] --tool-spec-max-model-slowdown must be >= 1\n");
+                return 2;
+            }
         } else if (std::strcmp(argv[i], "--chat-template-file") == 0 && i + 1 < argc) {
             const char * path = argv[++i];
             std::FILE * f = std::fopen(path, "rb");
@@ -569,6 +659,156 @@ int main(int argc, char ** argv) {
             print_usage(argv[0]);
             return 2;
         }
+    }
+
+    if (tool_spec_hip_probe_device >= 0) {
+#if defined(DFLASH27B_BACKEND_HIP)
+        std::string executor_error;
+        sconfig.tool_speculation.in_process_executor =
+            create_hip_sgemm_tool_speculation_executor(
+                tool_spec_hip_probe_device,
+                tool_spec_hip_probe_matrix,
+                tool_spec_hip_probe_total_cus,
+                executor_error);
+        if (!sconfig.tool_speculation.in_process_executor) {
+            std::fprintf(stderr, "[server] %s\n", executor_error.c_str());
+            return 2;
+        }
+#endif
+    }
+    const bool tool_speculation_requested =
+        !sconfig.tool_speculation.executor_path.empty() ||
+        static_cast<bool>(sconfig.tool_speculation.in_process_executor) ||
+        !sconfig.tool_speculation.profile_path.empty() ||
+        !sconfig.tool_speculation.allowed_tools.empty();
+    if (tool_speculation_requested) {
+        sconfig.tool_speculation.model_routing_static =
+            !environment_flag_enabled(
+                "DFLASH_MOE_TP_DYNAMIC_ROUTE_BALANCE") &&
+            !environment_flag_enabled(
+                "DFLASH_DS4_TP_DYNAMIC_ROUTE_BALANCE");
+        sconfig.tool_speculation.model_expert_ownership_unique =
+            !environment_flag_enabled("DFLASH_MOE_DUPLICATE_HOT_ON_COLD");
+        const bool has_child_executor =
+            !sconfig.tool_speculation.executor_path.empty();
+        const bool has_in_process_executor =
+            static_cast<bool>(sconfig.tool_speculation.in_process_executor);
+        if (has_child_executor == has_in_process_executor ||
+            sconfig.tool_speculation.profile_path.empty() ||
+            sconfig.tool_speculation.allowed_tools.empty()) {
+            std::fprintf(stderr,
+                "[server] tool speculation requires exactly one executor, "
+                "--tool-spec-profile, and at least one --tool-spec-allow\n");
+            return 2;
+        }
+#if !defined(_WIN32)
+        if (has_child_executor &&
+            ::access(sconfig.tool_speculation.executor_path.c_str(), X_OK) != 0) {
+            std::fprintf(stderr,
+                "[server] tool speculation executor is not executable: %s\n",
+                sconfig.tool_speculation.executor_path.c_str());
+            return 2;
+        }
+#endif
+        std::sort(sconfig.tool_speculation.allowed_tools.begin(),
+                  sconfig.tool_speculation.allowed_tools.end());
+        sconfig.tool_speculation.allowed_tools.erase(
+            std::unique(sconfig.tool_speculation.allowed_tools.begin(),
+                        sconfig.tool_speculation.allowed_tools.end()),
+            sconfig.tool_speculation.allowed_tools.end());
+        std::string profile_error;
+        if (!sconfig.tool_speculation.policy.load_file(
+                sconfig.tool_speculation.profile_path, profile_error)) {
+            std::fprintf(stderr, "[server] %s\n", profile_error.c_str());
+            return 2;
+        }
+        const std::string & executor_contract =
+            sconfig.tool_speculation.policy.executor_contract();
+        if (!executor_contract.empty() &&
+            executor_contract !=
+                sconfig.tool_speculation.execution_mode()) {
+            std::fprintf(stderr,
+                "[server] tool profile requires executor '%s', got '%s'\n",
+                executor_contract.c_str(),
+                sconfig.tool_speculation.execution_mode());
+            return 2;
+        }
+        if (sconfig.tool_speculation.policy.benchmark_only() &&
+            !has_in_process_executor) {
+            std::fprintf(stderr,
+                "[server] provisional_benchmark_only tool profiles cannot "
+                "enable an external production executor\n");
+            return 2;
+        }
+        if (has_in_process_executor) {
+            int max_same_gpu_percentage = 0;
+            for (const auto & lane :
+                 sconfig.tool_speculation.policy.lanes()) {
+                if (lane.decode_interference_qualified &&
+                    lane.accelerator_relation == "same_physical_gpu") {
+                    max_same_gpu_percentage = std::max(
+                        max_same_gpu_percentage,
+                        lane.resource_percentage);
+                }
+            }
+            if (max_same_gpu_percentage > 0) {
+                const int reserved_cus =
+                    (tool_spec_hip_probe_total_cus *
+                         max_same_gpu_percentage +
+                     99) /
+                    100;
+                if (reserved_cus <= 0 ||
+                    reserved_cus >= tool_spec_hip_probe_total_cus) {
+                    std::fprintf(stderr,
+                        "[server] same-GPU HIP tool lane would reserve %d "
+                        "of %d CUs; at least one model CU is required\n",
+                        reserved_cus, tool_spec_hip_probe_total_cus);
+                    return 2;
+                }
+                const std::string isolation =
+                    std::to_string(tool_spec_hip_probe_device) + ":" +
+                    std::to_string(reserved_cus);
+                const char * existing =
+                    std::getenv("DFLASH_HIP_RESERVED_TOOL_LANE");
+                if (existing && *existing && isolation != existing) {
+                    std::fprintf(stderr,
+                        "[server] DFLASH_HIP_RESERVED_TOOL_LANE=%s "
+                        "conflicts with profile-required %s\n",
+                        existing, isolation.c_str());
+                    return 2;
+                }
+                set_environment_variable(
+                    "DFLASH_HIP_RESERVED_TOOL_LANE",
+                    isolation.c_str(), true);
+                sconfig.tool_speculation.hip_tool_device =
+                    tool_spec_hip_probe_device;
+                sconfig.tool_speculation.hip_reserved_tool_compute_units =
+                    reserved_cus;
+                std::fprintf(stderr,
+                    "[server] disjoint HIP tool lane: device %d reserves "
+                    "%d/%d low CU(s); model streams use the complement\n",
+                    tool_spec_hip_probe_device, reserved_cus,
+                    tool_spec_hip_probe_total_cus);
+            }
+        }
+        if (sconfig.tool_speculation.policy.requires_static_model_routing() &&
+            !sconfig.tool_speculation.model_routing_static) {
+            std::fprintf(stderr,
+                "[server] same-physical-GPU tool lanes require static model "
+                "routing; disable DFLASH_MOE_TP_DYNAMIC_ROUTE_BALANCE and "
+                "DFLASH_DS4_TP_DYNAMIC_ROUTE_BALANCE\n");
+            return 2;
+        }
+        if (sconfig.tool_speculation.policy.requires_unique_expert_ownership() &&
+            !sconfig.tool_speculation.model_expert_ownership_unique) {
+            std::fprintf(stderr,
+                "[server] same-physical-GPU tool lanes require unique expert "
+                "ownership; disable DFLASH_MOE_DUPLICATE_HOT_ON_COLD\n");
+            return 2;
+        }
+        std::fprintf(stderr,
+            "[server] tool speculation preserves token speculation; "
+            "unqualified resource lanes are deferred\n");
     }
     if (fast_rollback_forced_off) {
         bargs.fast_rollback = false;
@@ -1057,6 +1297,30 @@ int main(int argc, char ** argv) {
     std::fprintf(stderr, "[server] │  prefix_cache    = %d slots\n", sconfig.prefix_cache_cap);
     std::fprintf(stderr, "[server] │  prefill_cache   = %d slots\n", sconfig.prefill_cache_cap);
     std::fprintf(stderr, "[server] │  cors            = %s\n", sconfig.enable_cors ? "ON" : "off");
+    std::fprintf(stderr, "[server] │  tool_speculation= %s\n",
+                 sconfig.tool_speculation.enabled() ? "ON" : "off");
+    if (sconfig.tool_speculation.enabled()) {
+        std::fprintf(stderr, "[server] │  tool_spec_exec  = %s\n",
+                     sconfig.tool_speculation.execution_mode());
+        std::fprintf(stderr, "[server] │  tool_spec_profile= %s\n",
+                     sconfig.tool_speculation.profile_path.c_str());
+        std::fprintf(stderr, "[server] │  tool_spec_decode = %s\n",
+                     "spec preserved (unqualified lanes deferred)");
+        std::fprintf(stderr, "[server] │  tool_spec_routing= %s\n",
+                     sconfig.tool_speculation.model_routing_static
+                         ? "static" : "dynamic");
+        std::fprintf(stderr, "[server] │  tool_spec_experts= %s\n",
+                     sconfig.tool_speculation.model_expert_ownership_unique
+                         ? "unique ownership" : "duplicated ownership");
+        std::fprintf(stderr, "[server] │  tool_spec_lanes =");
+        for (const auto & lane : sconfig.tool_speculation.policy.lanes()) {
+            std::fprintf(stderr, " %d%%:%s",
+                         lane.resource_percentage,
+                         lane.decode_interference_qualified
+                             ? "qualified" : "deferred");
+        }
+        std::fprintf(stderr, "\n");
+    }
     std::fprintf(stderr, "[server] │  cache_type_k    = %s\n",
 #ifdef GGML_USE_HIP
         cache_type_k.empty() ? "q4_0 (default, HIP)" : cache_type_k.c_str());
