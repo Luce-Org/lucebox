@@ -70,7 +70,7 @@ TEST_CASE(MoeHybridStorageFixture, fractional_route_quota_rounds_over_the_batch)
     REQUIRE(owner_ids != nullptr);
     int32_t main_quota = 0;
     std::memcpy(&main_quota,
-                owner_ids->op_params + sizeof(int32_t),
+                owner_ids->op_params + 1,
                 sizeof(main_quota));
     REQUIRE(main_quota == 23);
 
