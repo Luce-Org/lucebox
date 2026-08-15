@@ -198,6 +198,34 @@ static float pflash_keep_ratio(const ServerConfig & cfg, int n_tokens) {
     return curve.back().second;
 }
 
+namespace http_detail {
+
+int flowkv_activation_threshold(const ServerConfig & config) {
+    return config.pflash_mode == ServerConfig::PflashMode::ALWAYS
+        ? kFlowKvInertMinTokens
+        : std::max(kFlowKvInertMinTokens, config.pflash_threshold);
+}
+
+bool flowkv_should_activate(const ServerConfig & config,
+                            int aged_token_estimate) {
+    return aged_token_estimate >= flowkv_activation_threshold(config);
+}
+
+float resolve_pflash_keep_ratio(float configured_ratio,
+                                const std::string & session_id,
+                                const HttpServerSessions & sessions) {
+    return session_id.empty()
+        ? configured_ratio
+        : sessions.get_keep_ratio(session_id);
+}
+
+bool should_clamp_flowkv_disk_cache(
+        bool flowkv, const DiskPrefixCachePolicy & policy) {
+    return flowkv && policy.compress;
+}
+
+}  // namespace http_detail
+
 // ─── curl helpers for upstream proxy ─────────────────────────────────────
 #ifdef DFLASH_HAS_CURL
 
@@ -2402,7 +2430,6 @@ void HttpServer::apply_flowkv_compression(
     const int aged_begin = 1;
     const int aged_end = message_count - hot_window;
 
-    static constexpr int kFlowKvInertMinTokens = 512;
     struct AgedMessage {
         int index = -1;
         std::vector<int32_t> drafter_ids;
@@ -2412,8 +2439,9 @@ void HttpServer::apply_flowkv_compression(
     // FlowKV's curve follows the total request length, not the size of each
     // individual message. This makes one configuration adapt consistently as
     // a conversation grows.
-    const float keep_ratio = pflash_keep_ratio(
-        config_, (int) req.prompt_tokens.size());
+    const float keep_ratio = http_detail::resolve_pflash_keep_ratio(
+        pflash_keep_ratio(config_, (int) req.prompt_tokens.size()),
+        req.session_id, sessions_);
 
     auto message_text = [](const json & message) {
         std::string content;
@@ -2447,7 +2475,7 @@ void HttpServer::apply_flowkv_compression(
 
         auto ids = drafter_tokenizer_->encode(content);
         aged_token_estimate += (int) ids.size();
-        if ((int) ids.size() < kFlowKvInertMinTokens) continue;
+        if ((int) ids.size() < http_detail::kFlowKvInertMinTokens) continue;
 
         // The same aged message can be revisited at a different point on the
         // context-length curve. Include the selected ratio in the cache key so
@@ -2460,10 +2488,9 @@ void HttpServer::apply_flowkv_compression(
     }
 
     const int activation_threshold =
-        config_.pflash_mode == ServerConfig::PflashMode::ALWAYS
-            ? kFlowKvInertMinTokens
-            : std::max(kFlowKvInertMinTokens, config_.pflash_threshold);
-    if (aged_token_estimate < activation_threshold) {
+        http_detail::flowkv_activation_threshold(config_);
+    if (!http_detail::flowkv_should_activate(
+            config_, aged_token_estimate)) {
         std::fprintf(stderr,
             "[flowkv] aged band %d toks < activation threshold %d — skip\n",
             aged_token_estimate, activation_threshold);
@@ -2472,7 +2499,7 @@ void HttpServer::apply_flowkv_compression(
     if (aged_messages.empty()) {
         std::fprintf(stderr,
             "[flowkv] no aged messages >= %d tokens — skip\n",
-            kFlowKvInertMinTokens);
+            http_detail::kFlowKvInertMinTokens);
         return;
     }
 
@@ -2652,9 +2679,8 @@ std::string HttpServer::apply_pflash_compression(
 
     ModelBackend::CompressRequest compress_request;
     compress_request.input_ids = std::move(drafter_ids);
-    compress_request.keep_ratio = req.session_id.empty()
-        ? pflash_keep_ratio(config_, prompt_tokens)
-        : sessions_.get_keep_ratio(req.session_id);
+    compress_request.keep_ratio = http_detail::resolve_pflash_keep_ratio(
+        pflash_keep_ratio(config_, prompt_tokens), req.session_id, sessions_);
     compress_request.drafter_path = config_.pflash_drafter_path;
     compress_request.drafter_gpu = config_.pflash_drafter_gpu;
     compress_request.skip_park = config_.pflash_skip_park;
@@ -2988,7 +3014,8 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
     // FlowKV may rewrite aged messages, so only its stable system prefix is
     // safe for scoped disk reuse. Whole-prompt PFlash requires Full scope.
     int system_end = 0;
-    if (prepared.flowkv) {
+    if (http_detail::should_clamp_flowkv_disk_cache(
+            prepared.flowkv, req.disk_cache_policy)) {
         const auto boundaries = find_all_boundaries(
             effective_prompt, prefix_cache_.chat_markers());
         system_end = boundaries.empty() ? 0 : boundaries[0];
@@ -3004,7 +3031,7 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
                 "[flowkv] disk-clamp: system_end=%d < min=%d — disk off\n",
                 system_end, config_.disk_cache_min_tokens);
         }
-    } else if (prepared.compressed &&
+    } else if (prepared.compressed && !prepared.flowkv &&
                cache.disk_policy.mode != DiskPrefixCacheMode::Full) {
         cache.disk_policy.mode = DiskPrefixCacheMode::Off;
     }

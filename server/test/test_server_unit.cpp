@@ -5131,10 +5131,15 @@ TEST_CASE(ServerUnitFixture, test_flowkv_T4_compress_true_policy_name_has_suffix
     TEST_ASSERT(name.find("+compress") != std::string::npos);
 }
 
-// T4: default DiskPrefixCachePolicy has compress=false (no-op).
+// T4: compression-aware disk clamping remains opt-in.
 TEST_CASE(ServerUnitFixture, test_flowkv_T4_default_no_compress) {
     DiskPrefixCachePolicy p;
-    TEST_ASSERT_MSG(!p.compress, "default compress must be false (byte-identical to pr364-base)");
+    TEST_ASSERT_MSG(!p.compress, "FlowKV disk clamping must default to off");
+    TEST_ASSERT(!http_detail::should_clamp_flowkv_disk_cache(true, p));
+
+    p.compress = true;
+    TEST_ASSERT(http_detail::should_clamp_flowkv_disk_cache(true, p));
+    TEST_ASSERT(!http_detail::should_clamp_flowkv_disk_cache(false, p));
 }
 
 // T6: frozen_block_key is deterministic — same tokens → same hash.
@@ -5254,20 +5259,40 @@ TEST_CASE(ServerUnitFixture, test_flowkv_T1_system_end_boundary_first) {
     }
 }
 
-// T5: AUTO activates from aggregate aged history; tiny individual messages
-// remain verbatim because the scoring overhead exceeds their prefill savings.
+// T5: exercise the production FlowKV activation decision and defaults.
 TEST_CASE(ServerUnitFixture, test_flowkv_T5_aggregate_activation_threshold) {
-    static constexpr int kFkvInertMinTokens = 512;
-    const int configured_threshold = 12000;
-    const std::vector<int> aged_message_tokens = {7000, 6000};
-    int aged_total = 0;
-    for (int tokens : aged_message_tokens) aged_total += tokens;
+    ServerConfig config;
+    config.pflash_mode = ServerConfig::PflashMode::AUTO;
 
-    TEST_ASSERT(aged_message_tokens[0] < configured_threshold);
-    TEST_ASSERT(aged_message_tokens[1] < configured_threshold);
-    TEST_ASSERT(aged_total >= configured_threshold);
-    TEST_ASSERT(400 < kFkvInertMinTokens);
-    TEST_ASSERT(7000 >= kFkvInertMinTokens);
+    TEST_ASSERT(http_detail::flowkv_activation_threshold(config) == 32000);
+    TEST_ASSERT(!http_detail::flowkv_should_activate(config, 13000));
+    TEST_ASSERT(http_detail::flowkv_should_activate(config, 32000));
+
+    config.pflash_threshold = 12000;
+    TEST_ASSERT(!http_detail::flowkv_should_activate(config, 11999));
+    TEST_ASSERT(http_detail::flowkv_should_activate(config, 13000));
+
+    config.pflash_mode = ServerConfig::PflashMode::ALWAYS;
+    TEST_ASSERT(http_detail::flowkv_activation_threshold(config) ==
+                http_detail::kFlowKvInertMinTokens);
+    TEST_ASSERT(http_detail::flowkv_should_activate(
+        config, http_detail::kFlowKvInertMinTokens));
+}
+
+// Session feedback overrides the static/curve ratio for both whole-prompt
+// PFlash and FlowKV.
+TEST_CASE(ServerUnitFixture, test_flowkv_session_keep_ratio_override) {
+    HttpServerSessions sessions;
+    sessions.update("adaptive", 0.95f);
+
+    const float configured_ratio = 0.05f;
+    const float static_ratio = http_detail::resolve_pflash_keep_ratio(
+        configured_ratio, "", sessions);
+    const float adaptive_ratio = http_detail::resolve_pflash_keep_ratio(
+        configured_ratio, "adaptive", sessions);
+
+    TEST_ASSERT(std::fabs(static_ratio - configured_ratio) < 1e-6f);
+    TEST_ASSERT(std::fabs(adaptive_ratio - 0.09f) < 1e-6f);
 }
 
 // ═══════════════════════════════════════════════════════════════════════

@@ -219,6 +219,23 @@ struct ServerConfig {
     std::string collect_routing_path;
 };
 
+namespace http_detail {
+
+inline constexpr int kFlowKvInertMinTokens = 512;
+
+// Small policy helpers kept outside HttpServer so model-free unit tests use
+// the same decisions as the request path.
+int flowkv_activation_threshold(const ServerConfig & config);
+bool flowkv_should_activate(const ServerConfig & config,
+                            int aged_token_estimate);
+float resolve_pflash_keep_ratio(float configured_ratio,
+                                const std::string & session_id,
+                                const HttpServerSessions & sessions);
+bool should_clamp_flowkv_disk_cache(
+    bool flowkv, const DiskPrefixCachePolicy & policy);
+
+}  // namespace http_detail
+
 // ─── Parsed request ─────────────────────────────────────────────────────
 
 struct ParsedRequest {
