@@ -769,14 +769,41 @@ bool Qwen35Backend::snapshot_adopt(int slot, ggml_context * ctx,
 // ── Compress (pflash) ───────────────────────────────────────────────────
 
 ModelBackend::CompressResult Qwen35Backend::compress(const CompressRequest & req) {
-    CompressResult result;
-    if (req.input_ids.empty() || req.drafter_path.empty()) return result;
+    const auto results = compress_batch({req});
+    return results.empty() ? CompressResult{} : results.front();
+}
+
+std::vector<ModelBackend::CompressResult> Qwen35Backend::compress_batch(
+        const std::vector<CompressRequest> & requests) {
+    std::vector<CompressResult> results(requests.size());
+    if (requests.empty()) return results;
+
+    const CompressRequest * load_request = nullptr;
+    for (const auto & request : requests) {
+        if (request.input_ids.empty() || request.drafter_path.empty()) continue;
+        if (load_request == nullptr) {
+            load_request = &request;
+        } else if (request.drafter_path != load_request->drafter_path ||
+                   request.drafter_gpu != load_request->drafter_gpu ||
+                   request.skip_park != load_request->skip_park ||
+                   request.residency_action != load_request->residency_action) {
+            // A residency window can host only one drafter. Preserve the base
+            // API's per-request behavior for heterogeneous batches.
+            return ModelBackend::compress_batch(requests);
+        }
+    }
+    if (load_request == nullptr) return results;
+    const bool should_park = !load_request->skip_park;
+    const bool release_after_use =
+        load_request->residency_action == DraftResidencyAction::ReleaseAfterUse;
 
     // Park target+draft to free VRAM for the drafter (unless skip_park).
-    // Also destroy the main target step graph allocator to release its CUDA buffer.
+    // A FlowKV request may contain many aged messages. Keep this residency
+    // window around the whole batch so those messages do not reload all three
+    // models independently.
     const bool was_target_parked = target_parked_;
     const bool was_draft_parked  = draft_parked_;
-    if (!req.skip_park) {
+    if (should_park) {
         step_graph_destroy(sg_);
         if (!target_parked_) park(ParkTarget::TargetModel);
         if (!draft_parked_)  park(ParkTarget::DraftModel);
@@ -796,16 +823,16 @@ ModelBackend::CompressResult Qwen35Backend::compress(const CompressRequest & req
     if (!drafter_loaded_) {
         // drafter_ctx_.backend == nullptr → load_drafter creates its own
         std::fprintf(stderr, "[compress] loading drafter from %s ...\n",
-                     req.drafter_path.c_str());
-        if (!load_drafter(req.drafter_path, /*gpu_layers=*/999,
-                          req.drafter_gpu, drafter_ctx_)) {
+                     load_request->drafter_path.c_str());
+        if (!load_drafter(load_request->drafter_path, /*gpu_layers=*/999,
+                          load_request->drafter_gpu, drafter_ctx_)) {
             std::fprintf(stderr, "[compress] drafter init failed: %s\n",
                          dflash27b_last_error());
-            if (!req.skip_park) {
+            if (should_park) {
                 if (!was_target_parked) unpark(ParkTarget::TargetModel);
                 if (!was_draft_parked)  unpark(ParkTarget::DraftModel);
             }
-            return result;
+            return results;
         }
         drafter_loaded_ = true;
         std::fprintf(stderr, "[compress] drafter ready\n");
@@ -818,25 +845,31 @@ ModelBackend::CompressResult Qwen35Backend::compress(const CompressRequest & req
         }
     }
 
-    result.compressed_ids = drafter_score_and_compress(
-        drafter_ctx_, req.input_ids, req.keep_ratio);
-    result.ok = !result.compressed_ids.empty();
-    if (result.ok) {
-        std::fprintf(stderr, "[compress] %zu -> %zu tokens\n",
-                     req.input_ids.size(), result.compressed_ids.size());
+    for (size_t index = 0; index < requests.size(); ++index) {
+        const auto & request = requests[index];
+        if (request.input_ids.empty() || request.drafter_path.empty()) continue;
+
+        auto & result = results[index];
+        result.compressed_ids = drafter_score_and_compress(
+            drafter_ctx_, request.input_ids, request.keep_ratio);
+        result.ok = !result.compressed_ids.empty();
+        if (result.ok) {
+            std::fprintf(stderr, "[compress] %zu -> %zu tokens\n",
+                         request.input_ids.size(), result.compressed_ids.size());
+        }
     }
 
-    if (req.residency_action == DraftResidencyAction::ReleaseAfterUse) {
+    if (release_after_use) {
         free_drafter();
     }
 
     // Restore park state
-    if (!req.skip_park) {
+    if (should_park) {
         if (!was_target_parked) unpark(ParkTarget::TargetModel);
         if (!was_draft_parked)  unpark(ParkTarget::DraftModel);
     }
 
-    return result;
+    return results;
 }
 
 bool Qwen35Backend::handle_compress(const std::string & line, const DaemonIO & io) {

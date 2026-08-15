@@ -3207,6 +3207,33 @@ struct MockBackend : ModelBackend {
     void shutdown() override {}
 };
 
+struct MockBatchCompressBackend : MockBackend {
+    int compress_calls = 0;
+
+    CompressResult compress(const CompressRequest & request) override {
+        ++compress_calls;
+        CompressResult result;
+        result.ok = !request.input_ids.empty();
+        if (result.ok) result.compressed_ids = {request.input_ids.front()};
+        return result;
+    }
+};
+
+TEST_CASE(ServerUnitFixture, test_compress_batch_default_preserves_order) {
+    MockBatchCompressBackend backend;
+    std::vector<ModelBackend::CompressRequest> requests(3);
+    requests[0].input_ids = {11, 12};
+    requests[1].input_ids = {21, 22};
+    requests[2].input_ids = {31, 32};
+
+    const auto results = backend.compress_batch(requests);
+    TEST_ASSERT(results.size() == requests.size());
+    TEST_ASSERT(backend.compress_calls == 3);
+    TEST_ASSERT(results[0].compressed_ids == std::vector<int32_t>({11}));
+    TEST_ASSERT(results[1].compressed_ids == std::vector<int32_t>({21}));
+    TEST_ASSERT(results[2].compressed_ids == std::vector<int32_t>({31}));
+}
+
 struct MockMemoryOnlySnapshotBackend : MockBackend {
     bool snapshot_used(int slot) const override { return slot == 0; }
 };
@@ -5227,16 +5254,20 @@ TEST_CASE(ServerUnitFixture, test_flowkv_T1_system_end_boundary_first) {
     }
 }
 
-// T5 (inert-guard): aged_token_estimate < 512 → FlowKV-OFF.
-// Tests the guard constant and comparison logic.
-TEST_CASE(ServerUnitFixture, test_flowkv_T5_inert_guard_token_count) {
+// T5: AUTO activates from aggregate aged history; tiny individual messages
+// remain verbatim because the scoring overhead exceeds their prefill savings.
+TEST_CASE(ServerUnitFixture, test_flowkv_T5_aggregate_activation_threshold) {
     static constexpr int kFkvInertMinTokens = 512;
-    // Below threshold: FlowKV should not fire.
+    const int configured_threshold = 12000;
+    const std::vector<int> aged_message_tokens = {7000, 6000};
+    int aged_total = 0;
+    for (int tokens : aged_message_tokens) aged_total += tokens;
+
+    TEST_ASSERT(aged_message_tokens[0] < configured_threshold);
+    TEST_ASSERT(aged_message_tokens[1] < configured_threshold);
+    TEST_ASSERT(aged_total >= configured_threshold);
     TEST_ASSERT(400 < kFkvInertMinTokens);
-    TEST_ASSERT(511 < kFkvInertMinTokens);
-    // At or above threshold: FlowKV may fire.
-    TEST_ASSERT(512 >= kFkvInertMinTokens);
-    TEST_ASSERT(1024 >= kFkvInertMinTokens);
+    TEST_ASSERT(7000 >= kFkvInertMinTokens);
 }
 
 // ═══════════════════════════════════════════════════════════════════════

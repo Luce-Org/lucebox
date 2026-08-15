@@ -116,6 +116,8 @@ public:
                         int32_t last_tok = -1) override;
 
     CompressResult compress(const CompressRequest & req) override;
+    std::vector<CompressResult> compress_batch(
+        const std::vector<CompressRequest> & requests) override;
     bool handle_compress(const std::string & line,
                          const DaemonIO & io) override;
     void free_drafter() override;

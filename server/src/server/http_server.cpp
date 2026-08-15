@@ -34,6 +34,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cctype>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -2401,122 +2402,180 @@ void HttpServer::apply_flowkv_compression(
     const int aged_begin = 1;
     const int aged_end = message_count - hot_window;
 
-    // Small aged bands cost more to compress than they save during prefill.
-    int aged_token_estimate = 0;
-    for (int index = aged_begin; index < aged_end; ++index) {
-        const auto & message = req.messages[index];
-        if (!message.is_object()) continue;
+    static constexpr int kFlowKvInertMinTokens = 512;
+    struct AgedMessage {
+        int index = -1;
+        std::vector<int32_t> drafter_ids;
+        PrefixHash cache_key{};
+    };
 
+    // FlowKV's curve follows the total request length, not the size of each
+    // individual message. This makes one configuration adapt consistently as
+    // a conversation grows.
+    const float keep_ratio = pflash_keep_ratio(
+        config_, (int) req.prompt_tokens.size());
+
+    auto message_text = [](const json & message) {
         std::string content;
-        if (message.contains("content")) {
-            const auto & value = message["content"];
-            if (value.is_string()) {
-                content = value.get<std::string>();
-            } else if (value.is_array()) {
-                for (const auto & part : value) {
-                    if (!part.is_object()) continue;
-                    const std::string type = part.value("type", "");
-                    if (type == "text" || type == "input_text" ||
-                        type == "output_text") {
-                        content += part.value("text", "");
-                    }
+        if (!message.is_object() || !message.contains("content")) {
+            return content;
+        }
+        const auto & value = message["content"];
+        if (value.is_string()) {
+            content = value.get<std::string>();
+        } else if (value.is_array()) {
+            for (const auto & part : value) {
+                if (!part.is_object()) continue;
+                const std::string type = part.value("type", "");
+                if (type == "text" || type == "input_text" ||
+                    type == "output_text") {
+                    content += part.value("text", "");
                 }
             }
         }
-        if (!content.empty()) {
-            aged_token_estimate +=
-                (int) drafter_tokenizer_->encode(content).size();
-        }
+        return content;
+    };
+
+    // AUTO is based on the aggregate aged history, matching the total-prompt
+    // threshold users configure. Once active, avoid tiny per-message scoring
+    // jobs that cost more than they remove.
+    int aged_token_estimate = 0;
+    std::vector<AgedMessage> aged_messages;
+    for (int index = aged_begin; index < aged_end; ++index) {
+        const std::string content = message_text(req.messages[index]);
+        if (content.empty()) continue;
+
+        auto ids = drafter_tokenizer_->encode(content);
+        aged_token_estimate += (int) ids.size();
+        if ((int) ids.size() < kFlowKvInertMinTokens) continue;
+
+        // The same aged message can be revisited at a different point on the
+        // context-length curve. Include the selected ratio in the cache key so
+        // a 10% result is not reused when the larger context asks for 2%.
+        ids.push_back((int32_t) std::lround(keep_ratio * 1000000.0f));
+        const PrefixHash key = frozen_block_key(
+            ids.data(), 0, (int) ids.size());
+        ids.pop_back();
+        aged_messages.push_back({index, std::move(ids), key});
     }
 
-    static constexpr int kFlowKvInertMinTokens = 512;
-    if (aged_token_estimate < kFlowKvInertMinTokens) {
+    const int activation_threshold =
+        config_.pflash_mode == ServerConfig::PflashMode::ALWAYS
+            ? kFlowKvInertMinTokens
+            : std::max(kFlowKvInertMinTokens, config_.pflash_threshold);
+    if (aged_token_estimate < activation_threshold) {
         std::fprintf(stderr,
-            "[flowkv] inert-guard: aged band %d toks < %d — skip\n",
-            aged_token_estimate, kFlowKvInertMinTokens);
+            "[flowkv] aged band %d toks < activation threshold %d — skip\n",
+            aged_token_estimate, activation_threshold);
+        return;
+    }
+    if (aged_messages.empty()) {
+        std::fprintf(stderr,
+            "[flowkv] no aged messages >= %d tokens — skip\n",
+            kFlowKvInertMinTokens);
         return;
     }
 
     json modified_messages = req.messages;
     bool any_compressed = false;
     int cache_hits = 0;
+    const auto residency_action = resolve_draft_residency_action(
+        config_.draft_residency,
+        DraftResidencyContext{
+            DraftResidencyUse::PFlashCompress,
+            config_.lazy_draft,
+            !config_.draft_path.empty(),
+        });
 
-    for (int index = aged_begin; index < aged_end; ++index) {
-        auto & message = modified_messages[index];
-        if (!message.is_object()) continue;
+    std::vector<ModelBackend::CompressRequest> compress_requests;
+    std::vector<int> compress_message_indices;
+    std::vector<PrefixHash> compress_cache_keys;
+    compress_requests.reserve(aged_messages.size());
+    compress_message_indices.reserve(aged_messages.size());
+    compress_cache_keys.reserve(aged_messages.size());
 
-        std::string content;
-        if (message.contains("content")) {
-            const auto & value = message["content"];
-            if (value.is_string()) {
-                content = value.get<std::string>();
-            } else if (value.is_array()) {
-                for (const auto & part : value) {
-                    if (!part.is_object()) continue;
-                    const std::string type = part.value("type", "");
-                    if (type == "text" || type == "input_text" ||
-                        type == "output_text") {
-                        content += part.value("text", "");
-                    }
-                }
-            }
-        }
-        if (content.empty()) continue;
-
-        auto drafter_ids = drafter_tokenizer_->encode(content);
-        if ((int) drafter_ids.size() < config_.pflash_threshold) continue;
-
-        const PrefixHash cache_key = frozen_block_key(
-            drafter_ids.data(), 0, (int) drafter_ids.size());
-
-        std::string compressed_text;
-        auto cache_it = frozen_content_cache_.find(cache_key);
+    for (auto & aged : aged_messages) {
+        auto cache_it = frozen_content_cache_.find(aged.cache_key);
         if (cache_it != frozen_content_cache_.end()) {
-            compressed_text = cache_it->second;
+            modified_messages[aged.index]["content"] = cache_it->second;
+            any_compressed = true;
             ++cache_hits;
             std::fprintf(stderr,
                 "[flowkv] msg[%d] cache hit (%zu drafter toks)\n",
-                index, drafter_ids.size());
-        } else {
-            ModelBackend::CompressRequest compress_request;
-            compress_request.input_ids = std::move(drafter_ids);
-            compress_request.keep_ratio = pflash_keep_ratio(
-                config_, (int) compress_request.input_ids.size());
-            compress_request.drafter_path = config_.pflash_drafter_path;
-            compress_request.drafter_gpu = config_.pflash_drafter_gpu;
-            compress_request.skip_park = config_.pflash_skip_park;
-            compress_request.residency_action = resolve_draft_residency_action(
-                config_.draft_residency,
-                DraftResidencyContext{
-                    DraftResidencyUse::PFlashCompress,
-                    config_.lazy_draft,
-                    !config_.draft_path.empty(),
-                });
-
-            auto result = backend_.compress(compress_request);
-            if (!result.ok || result.compressed_ids.empty()) {
-                std::fprintf(stderr,
-                    "[flowkv] msg[%d] compress failed — kept verbatim\n",
-                    index);
-                continue;
-            }
-            compressed_text = drafter_tokenizer_->decode(result.compressed_ids);
-            std::fprintf(stderr,
-                "[flowkv] msg[%d] %zu → %zu drafter toks (keep=%.2f)\n",
-                index, compress_request.input_ids.size(),
-                result.compressed_ids.size(), compress_request.keep_ratio);
-
-            if (frozen_content_cache_.size() >= kFrozenCacheMax) {
-                std::fprintf(stderr,
-                    "[flowkv] cache full (%zu entries) — clearing\n",
-                    frozen_content_cache_.size());
-                frozen_content_cache_.clear();
-            }
-            frozen_content_cache_.emplace(cache_key, compressed_text);
+                aged.index, aged.drafter_ids.size());
+            continue;
         }
 
-        message["content"] = compressed_text;
+        ModelBackend::CompressRequest compress_request;
+        compress_request.input_ids = std::move(aged.drafter_ids);
+        compress_request.keep_ratio = keep_ratio;
+        compress_request.drafter_path = config_.pflash_drafter_path;
+        compress_request.drafter_gpu = config_.pflash_drafter_gpu;
+        compress_request.skip_park = config_.pflash_skip_park;
+        compress_request.residency_action = residency_action;
+        compress_requests.push_back(std::move(compress_request));
+        compress_message_indices.push_back(aged.index);
+        compress_cache_keys.push_back(aged.cache_key);
+    }
+
+    std::vector<ModelBackend::CompressResult> compress_results;
+    if (!compress_requests.empty()) {
+        if (config_.pflash_remote_drafter) {
+            compress_results.resize(compress_requests.size());
+            if (!pflash_remote_.active() &&
+                !pflash_remote_.start(config_.pflash_remote.ipc_bin,
+                                      config_.pflash_drafter_path,
+                                      config_.pflash_drafter_gpu,
+                                      config_.pflash_remote.work_dir)) {
+                std::fprintf(stderr,
+                    "[flowkv] remote PFlash drafter start failed\n");
+            } else {
+                for (size_t index = 0; index < compress_requests.size(); ++index) {
+                    auto & result = compress_results[index];
+                    result.ok = pflash_remote_.compress(
+                        compress_requests[index].input_ids,
+                        compress_requests[index].keep_ratio,
+                        result.compressed_ids);
+                }
+                if (residency_action == DraftResidencyAction::ReleaseAfterUse) {
+                    pflash_remote_.close();
+                }
+            }
+        } else {
+            compress_results = backend_.compress_batch(compress_requests);
+        }
+    }
+
+    for (size_t index = 0; index < compress_requests.size(); ++index) {
+        if (index >= compress_results.size() ||
+            !compress_results[index].ok ||
+            compress_results[index].compressed_ids.empty()) {
+            std::fprintf(stderr,
+                "[flowkv] msg[%d] compress failed — kept verbatim\n",
+                compress_message_indices[index]);
+            continue;
+        }
+
+        const auto & result = compress_results[index];
+        const std::string compressed_text =
+            drafter_tokenizer_->decode(result.compressed_ids);
+        modified_messages[compress_message_indices[index]]["content"] =
+            compressed_text;
         any_compressed = true;
+        std::fprintf(stderr,
+            "[flowkv] msg[%d] %zu → %zu drafter toks (keep=%.2f)\n",
+            compress_message_indices[index],
+            compress_requests[index].input_ids.size(),
+            result.compressed_ids.size(), compress_requests[index].keep_ratio);
+
+        if (frozen_content_cache_.size() >= kFrozenCacheMax) {
+            std::fprintf(stderr,
+                "[flowkv] cache full (%zu entries) — clearing\n",
+                frozen_content_cache_.size());
+            frozen_content_cache_.clear();
+        }
+        frozen_content_cache_.emplace(
+            compress_cache_keys[index], compressed_text);
     }
 
     if (!any_compressed) {
@@ -2560,11 +2619,12 @@ void HttpServer::apply_flowkv_compression(
     const int tokens_before = (int) prepared.tokens.size();
     prepared.tokens = tokenizer_.encode(rendered);
     prepared.compressed = true;
+    prepared.flowkv = true;
     std::fprintf(stderr,
         "[flowkv] %d → %d target toks "
-        "(%d aged msgs, %d cache hits, hot_window=%d)\n",
+        "(%zu eligible aged msgs, %d cache hits, keep=%.3f, hot_window=%d)\n",
         tokens_before, (int) prepared.tokens.size(),
-        aged_end - aged_begin, cache_hits, hot_window);
+        aged_messages.size(), cache_hits, keep_ratio, hot_window);
 }
 
 std::string HttpServer::apply_pflash_compression(
@@ -2712,16 +2772,17 @@ HttpServer::PreparedPrompt HttpServer::prepare_prompt(
         const bool continuation = should_compress &&
             is_continuation_request(req.messages);
 
-        if (should_compress && continuation &&
-            req.disk_cache_policy.compress && req.messages.is_array()) {
-            // FlowKV owns continuation compression; falling back to whole-
-            // prompt compression would destroy the reusable prefix anchor.
+        if (should_compress && continuation && req.messages.is_array()) {
+            // FlowKV owns continuation compression automatically. Falling
+            // back to whole-prompt compression would destroy the reusable
+            // system/tool prefix anchor, and requiring a separate disk-cache
+            // flag made --prefill-compression auto silently do nothing.
             apply_flowkv_compression(req, prepared);
             should_compress = false;
         } else if (should_compress && continuation) {
             should_compress = false;
             std::fprintf(stderr,
-                "[pflash] skip-compress (continuation: prior assistant/tool history)\n");
+                "[pflash] skip-compress (continuation without messages array)\n");
         }
 
         if (should_compress && req.disk_cache_policy.compress) {
@@ -2927,7 +2988,7 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
     // FlowKV may rewrite aged messages, so only its stable system prefix is
     // safe for scoped disk reuse. Whole-prompt PFlash requires Full scope.
     int system_end = 0;
-    if (prepared.compressed && req.disk_cache_policy.compress) {
+    if (prepared.flowkv) {
         const auto boundaries = find_all_boundaries(
             effective_prompt, prefix_cache_.chat_markers());
         system_end = boundaries.empty() ? 0 : boundaries[0];
@@ -3307,7 +3368,7 @@ void HttpServer::finalize_generation_cache(
     if (!prepared.compressed) {
         recent_disk_prompts_.insert(
             recent_disk_prompts_.begin(), effective_prompt);
-    } else if (req.disk_cache_policy.compress) {
+    } else if (prepared.flowkv) {
         // FlowKV history is rewritten; retain the verbatim prompt for future
         // Auto-boundary comparisons.
         recent_disk_prompts_.insert(

@@ -330,6 +330,7 @@ private:
     struct PreparedPrompt {
         std::vector<int32_t> tokens;
         bool compressed = false;
+        bool flowkv = false;
         int full_cache_served_tokens = -1;
         int full_cache_hit_slot = -1;
         int full_cache_hit_len = 0;
@@ -480,7 +481,7 @@ private:
     std::vector<std::vector<int32_t>> recent_tool_prefixes_;
 
     // FlowKV freeze-history: per-message compression cache.
-    // Key: SHA-1 hash of the drafter-token slice for an aged message.
+    // Key: SHA-1 hash of the drafter-token slice and selected keep ratio.
     // Value: compressed content text (output of drafter_tokenizer_->decode).
     // Bounded to kFrozenCacheMax entries; cleared on overflow (simple eviction).
     static constexpr size_t kFrozenCacheMax = 256;
