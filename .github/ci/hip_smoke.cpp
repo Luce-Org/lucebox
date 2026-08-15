@@ -1,5 +1,5 @@
-// Self-contained HIP kernel correctness smoke for the lucebox3 R9700
-// (Radeon AI PRO R9700, gfx1201). Compiled and run by the gpu-tests-amd CI job to
+// Self-contained HIP kernel correctness smoke for the AMD GPUs on lucebox3.
+// Compiled and run once for gfx1201 and once for gfx1151 by gpu-tests-amd to
 // prove the ROCm/HIP compute path actually executes on AMD hardware (GitHub
 // hosted runners have no GPU). No model weights, deterministic, fast.
 #include <hip/hip_runtime.h>

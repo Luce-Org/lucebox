@@ -282,22 +282,35 @@ jobs:
             -R 'rocmfp3_mix_registry|rocmfp_mix_slice_matvec|rocmfp_mix_gateup_glu|ds4_mix_registry_teardown'
 
   gpu-tests-amd:
-    name: GPU tests (self-hosted Radeon AI PRO R9700, gfx1201 / ROCm)
-    # Companion to the NVIDIA jobs: lucebox3 now carries an R9700 and exercises
-    # the HIP path on gfx1201. GitHub-hosted runners cannot execute these kernels.
+    name: GPU tests (${{ matrix.device_name }}, ${{ matrix.arch }} / ROCm)
+    # Companion to the NVIDIA jobs: lucebox3 carries both an R9700 and the Strix
+    # Halo iGPU. Run the same HIP suite once per device with an explicit visibility
+    # mask. GitHub-hosted runners cannot execute these kernels.
     # hipcc is not on the runner's minimal PATH, so invoke it by absolute path.
     #
     # SECURITY: same model as gpu-tests - fork PRs run only after a maintainer
     # approves the workflow run (approval_policy=all_external_contributors).
-    # Gate only on the fast workspace check, not the hosted CPU build. Every GPU
-    # job has a machine-specific runner label and concurrency group, so the R9700
-    # can verify in parallel with both NVIDIA machines.
+    # Gate only on the fast workspace check, not the hosted CPU build. The two AMD
+    # matrix jobs share one physical runner and therefore execute one at a time.
     needs: [uv-workspace]
-    runs-on: [self-hosted, lucebox3, r9700]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - device_name: Radeon AI PRO R9700
+            arch: gfx1201
+            device_index: "0"
+            concurrency_key: r9700
+          - device_name: Strix Halo Radeon 8060S
+            arch: gfx1151
+            device_index: "1"
+            concurrency_key: strix-halo
+    runs-on: [self-hosted, lucebox3]
     timeout-minutes: 20
-    # Serialize across PRs on this physical R9700.
+    env:
+      HIP_VISIBLE_DEVICES: ${{ matrix.device_index }}
     concurrency:
-      group: lucebox3-r9700-runner
+      group: lucebox3-${{ matrix.concurrency_key }}-runner
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -334,14 +347,14 @@ jobs:
           fi
           wait $PROBE && echo "KFD healthy" || { echo "::error::rocminfo exited non-zero"; cat /tmp/rocminfo.out | tail -5; exit 1; }
 
-      - name: ROCm smoke (rocminfo sees gfx1201)
-        run: cat /tmp/rocminfo.out | grep -E "Name:|Marketing Name:" | grep -iE "gfx1201|R9700"
+      - name: ROCm inventory includes ${{ matrix.arch }}
+        run: cat /tmp/rocminfo.out | grep -E "Name:|Marketing Name:" | grep -F "${{ matrix.arch }}"
 
-      - name: Build + run HIP vector-add on the R9700
+      - name: Build + run HIP vector-add on ${{ matrix.device_name }}
         # Self-contained HIP kernel correctness test (no model weights). This is
         # the execution the GitHub-hosted jobs cannot do.
         run: |
-          /opt/rocm/bin/hipcc --offload-arch=gfx1201 -O2 \
+          /opt/rocm/bin/hipcc --offload-arch=${{ matrix.arch }} -O2 \
             -o "$RUNNER_TEMP/hip_smoke" .github/ci/hip_smoke.cpp
           "$RUNNER_TEMP/hip_smoke"
 
@@ -349,7 +362,7 @@ jobs:
         run: |
           cmake -S server -B "$RUNNER_TEMP/rocmfp-build" \
             -DDFLASH27B_GPU_BACKEND=hip \
-            -DDFLASH27B_HIP_ARCHITECTURES=gfx1201 \
+            -DDFLASH27B_HIP_ARCHITECTURES=${{ matrix.arch }} \
             -DDFLASH27B_SERVER=OFF \
             -DDFLASH27B_TESTS=ON \
             -DGGML_HIP_GRAPHS=ON \
