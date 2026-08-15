@@ -436,6 +436,86 @@ static bool curl_forward(const std::string & url,
     curl_easy_cleanup(curl);
     return res == CURLE_OK && response_sent;
 }
+
+struct CurlJsonResponse {
+    std::string body;
+    bool too_large = false;
+};
+
+static size_t curl_write_json(
+        char * ptr, size_t size, size_t nmemb, void * userdata) {
+    constexpr size_t kMaxResponseBytes = 4 * 1024 * 1024;
+    const size_t total = size * nmemb;
+    auto * response = static_cast<CurlJsonResponse *>(userdata);
+    if (total > kMaxResponseBytes - response->body.size()) {
+        response->too_large = true;
+        return 0;
+    }
+    response->body.append(ptr, total);
+    return total;
+}
+
+static bool curl_post_json(
+        const std::string & url,
+        const std::string & api_key,
+        const json & request,
+        int timeout_ms,
+        json & response,
+        std::string & error) {
+    CURL * curl = curl_easy_init();
+    if (!curl) {
+        error = "curl initialization failed";
+        return false;
+    }
+
+    const std::string body = request.dump();
+    struct curl_slist * headers = nullptr;
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+    if (!api_key.empty()) {
+        const std::string auth = "Authorization: Bearer " + api_key;
+        headers = curl_slist_append(headers, auth.c_str());
+    }
+    CurlJsonResponse output;
+    char curl_error[CURL_ERROR_SIZE] = {};
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)body.size());
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS,
+                     (long)(std::min)(timeout_ms, 5000));
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, (long)timeout_ms);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_json);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &output);
+    curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, curl_error);
+
+    const CURLcode result = curl_easy_perform(curl);
+    long status = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+
+    if (output.too_large) {
+        error = "response exceeds 4 MiB";
+        return false;
+    }
+    if (result != CURLE_OK) {
+        error = curl_error[0] ? curl_error : curl_easy_strerror(result);
+        return false;
+    }
+    if (status < 200 || status >= 300) {
+        error = "HTTP status " + std::to_string(status);
+        return false;
+    }
+    try {
+        response = json::parse(output.body);
+    } catch (const std::exception & exception) {
+        error = std::string("invalid JSON response: ") + exception.what();
+        return false;
+    }
+    error.clear();
+    return true;
+}
 #endif // DFLASH_HAS_CURL
 
 // ─── /props constants ───────────────────────────────────────────────────
@@ -808,6 +888,13 @@ json build_props_body(const ServerConfig & config,
             {"enabled",       config.speculative_enabled},
             {"ddtree_budget", config.speculative_enabled
                                 ? json(config.ddtree_budget) : json(nullptr)},
+        }},
+        {"tool_speculation", {
+            {"enabled", config.tool_speculation.enabled()},
+            {"protocol", kToolSpeculationProtocol},
+            {"schedule", "before_model"},
+            {"provider", "external"},
+            {"allowed_tools", config.tool_speculation.allowed_tools},
         }},
         {"sampling", {
             {"capabilities", {
@@ -1993,6 +2080,17 @@ bool HttpServer::route_request(SocketHandle fd, const HttpRequest & hr) {
 
         const std::vector<ChatMessage> chat_messages =
             normalize_chat_messages(req.messages, req.format, tool_memory_);
+        req.tool_speculation_messages = json::array();
+        for (const ChatMessage & message : chat_messages) {
+            json normalized = {
+                {"role", message.role},
+                {"content", message.content},
+            };
+            if (!message.tool_call_id.empty()) {
+                normalized["tool_call_id"] = message.tool_call_id;
+            }
+            req.tool_speculation_messages.push_back(std::move(normalized));
+        }
         // Reasoning must be applied BEFORE rendering: the template injects
         // the empty <think>\n\n</think>\n\n block when thinking is disabled.
         apply_request_reasoning(body, req);
@@ -3644,12 +3742,35 @@ void HttpServer::process_job(ServerJob * job) {
     }
     if (req.stream) start_job_stream(job);
 
+    // Predictor-first scheduling is intentional. The external service must
+    // return only after the private tool has started, so its model compute
+    // cannot contend with the target decoder. The target backend is untouched.
+    ToolSpeculationTransport tool_transport;
+#ifdef DFLASH_HAS_CURL
+    if (config_.tool_speculation.enabled()) {
+        const std::string endpoint = config_.tool_speculation.endpoint;
+        const std::string api_key = config_.tool_speculation.api_key;
+        tool_transport = [endpoint, api_key](
+                const json & request, int timeout_ms,
+                json & response, std::string & error) {
+            return curl_post_json(endpoint, api_key, request, timeout_ms,
+                                  response, error);
+        };
+    }
+#endif
+    auto tool_speculation = ToolSpeculationAttempt::begin(
+        config_.tool_speculation, req.response_id,
+        req.tool_speculation_messages, req.tools, req.tool_choice,
+        std::move(tool_transport));
+
     PreparedPrompt prepared = prepare_prompt(req);
     if (prepared.error_status != 0) {
+        if (tool_speculation) tool_speculation->cancel("prompt_rejected");
         fail_request(prepared.error_status, prepared.error);
         return;
     }
     if (forward_upstream(job, req, prepared)) {
+        if (tool_speculation) tool_speculation->cancel("upstream_generation");
         finish_job();
         return;
     }
@@ -3777,14 +3898,41 @@ void HttpServer::process_job(ServerJob * job) {
         status_.update_completion_tokens(completion_tokens);
         broadcast_status();
     }
-    // Serialize final frames after disabling heartbeat comments so no comment
-    // can appear after the protocol's [DONE] marker.
-    stop_job_stream(job);
     if (job->client_disconnected.load(std::memory_order_acquire)) {
         client_disconnected = true;
     }
+    json tool_speculation_metadata;
+    bool has_tool_speculation_metadata = false;
+    if (tool_speculation) {
+        has_tool_speculation_metadata = true;
+        if (client_disconnected) {
+            tool_speculation_metadata =
+                tool_speculation->cancel("client_disconnected");
+        } else if (!result.ok()) {
+            tool_speculation_metadata =
+                tool_speculation->cancel("generation_failed");
+        } else {
+            tool_speculation_metadata =
+                tool_speculation->finish(emitter.tool_calls());
+        }
+    }
+
+    // Serialize final frames after disabling heartbeat comments so no comment
+    // can appear after the protocol's terminal event. Heartbeats stay active
+    // while a successful commit waits for the external tool to finish.
+    stop_job_stream(job);
     if (req.stream && !client_disconnected) {
         auto final_chunks = emitter.emit_finish(completion_tokens, &gen_timings);
+        if (has_tool_speculation_metadata) {
+            const std::string extension = render_tool_speculation_sse(
+                req.format, req.response_id, req.model,
+                tool_speculation_metadata);
+            if (final_chunks.empty()) {
+                final_chunks.push_back(extension);
+            } else {
+                final_chunks.insert(final_chunks.end() - 1, extension);
+            }
+        }
         for (const auto & chunk : final_chunks) {
             if (!send_job_bytes(job, chunk.data(), chunk.size())) {
                 client_disconnected = true;
@@ -3792,8 +3940,12 @@ void HttpServer::process_job(ServerJob * job) {
             }
         }
     } else if (!req.stream && !client_disconnected) {
-        const json response = build_non_streaming_response(
+        json response = build_non_streaming_response(
             req, result, n_gen_cap, gen_timings, tokenizer_, emitter);
+        if (has_tool_speculation_metadata) {
+            response["dflash_tool_speculation"] =
+                std::move(tool_speculation_metadata);
+        }
         // Streaming uses non-blocking sends; restore blocking mode before
         // writing a complete JSON response on this shared socket path.
         const int flags = sock_get_flags(fd);

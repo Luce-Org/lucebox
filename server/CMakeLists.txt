@@ -468,6 +468,7 @@ add_library(dflash_common STATIC
     src/server/chat_template.cpp
     src/server/tool_parser.cpp
     src/server/tool_hint.cpp
+    src/server/tool_speculation.cpp
     src/server/reasoning.cpp
     src/server/tool_memory.cpp
     src/server/sse_emitter.cpp
@@ -1557,6 +1558,16 @@ if(DFLASH27B_TESTS)
         list(APPEND _raw_unit_test_targets test_server_unit)
     endif()
 
+    add_executable(test_tool_speculation
+        test/test_unit_main.cpp
+        test/test_tool_speculation.cpp
+        src/server/tool_speculation.cpp)
+    target_include_directories(test_tool_speculation PRIVATE
+        ${DFLASH27B_SRC_INCLUDE_DIRS})
+    target_link_libraries(test_tool_speculation PRIVATE
+        nlohmann_json::nlohmann_json)
+    list(APPEND _raw_unit_test_targets test_tool_speculation)
+
     # Feature/architecture gate tests. check_feature_compatibility(),
     # collect_feature_warnings() and the capability table are pure functions,
     # so this target deliberately compiles only feature_gate.cpp and
@@ -1741,7 +1752,9 @@ if(DFLASH27B_SERVER)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/server/server_main.cpp")
         find_package(CURL QUIET)
         if(NOT CURL_FOUND)
-            message(WARNING "CURL not found — building dflash_server without passthrough proxy")
+            message(WARNING
+                "CURL not found — building dflash_server without passthrough "
+                "proxy or tool speculation")
         endif()
         add_executable(dflash_server
             src/server/server_main.cpp

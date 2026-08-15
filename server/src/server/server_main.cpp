@@ -26,6 +26,7 @@
 #include "placement/draft_residency.h"
 
 #include <algorithm>
+#include <cmath>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -173,6 +174,14 @@ static void print_usage(const char * prog) {
         "                              through to <URL>/v1/chat/completions.\n"
         "  --prefill-upstream-key <KEY>    Bearer token for the upstream.\n"
         "  --prefill-upstream-model <NAME> Model name on forwarded requests.\n"
+        "\n"
+        "Speculative tools (optional external service):\n"
+        "  --tool-spec-endpoint <URL>  Model-agnostic speculation service.\n"
+        "  --tool-spec-key <KEY>       Optional bearer token.\n"
+        "  --tool-spec-allow <NAME>    Read-only/idempotent tool; repeat per tool.\n"
+        "  --tool-spec-min-confidence <P>  Admission threshold (default: 0.75).\n"
+        "  --tool-spec-start-timeout-ms <N> Predictor/start timeout (default: 2000).\n"
+        "  --tool-spec-finish-timeout-ms <N> Tool-result timeout (default: 60000).\n"
         "\n"
         "Disk KV cache:\n"
         "  --kv-cache-dir <path>       Directory for ondisk KV cache (enables feature)\n"
@@ -506,6 +515,42 @@ int main(int argc, char ** argv) {
         } else if (std::strcmp(argv[i], "--lazy-draft") == 0) {
             sconfig.lazy_draft = true;
             sconfig.draft_residency = DraftResidencyPolicy::RequestScoped;
+        } else if (std::strcmp(argv[i], "--tool-spec-endpoint") == 0 &&
+                   i + 1 < argc) {
+            sconfig.tool_speculation.endpoint = argv[++i];
+        } else if (std::strcmp(argv[i], "--tool-spec-key") == 0 &&
+                   i + 1 < argc) {
+            sconfig.tool_speculation.api_key = argv[++i];
+        } else if (std::strcmp(argv[i], "--tool-spec-allow") == 0 &&
+                   i + 1 < argc) {
+            sconfig.tool_speculation.allowed_tools.emplace_back(argv[++i]);
+        } else if (std::strcmp(argv[i], "--tool-spec-min-confidence") == 0 &&
+                   i + 1 < argc) {
+            char * end = nullptr;
+            const double value = std::strtod(argv[++i], &end);
+            if (!end || *end != '\0' || !std::isfinite(value) ||
+                value < 0.0 || value > 1.0) {
+                std::fprintf(stderr,
+                    "[server] --tool-spec-min-confidence must be between 0 and 1\n");
+                return 2;
+            }
+            sconfig.tool_speculation.min_confidence = value;
+        } else if (std::strcmp(argv[i], "--tool-spec-start-timeout-ms") == 0 &&
+                   i + 1 < argc) {
+            sconfig.tool_speculation.start_timeout_ms = std::atoi(argv[++i]);
+            if (sconfig.tool_speculation.start_timeout_ms <= 0) {
+                std::fprintf(stderr,
+                    "[server] --tool-spec-start-timeout-ms must be positive\n");
+                return 2;
+            }
+        } else if (std::strcmp(argv[i], "--tool-spec-finish-timeout-ms") == 0 &&
+                   i + 1 < argc) {
+            sconfig.tool_speculation.finish_timeout_ms = std::atoi(argv[++i]);
+            if (sconfig.tool_speculation.finish_timeout_ms <= 0) {
+                std::fprintf(stderr,
+                    "[server] --tool-spec-finish-timeout-ms must be positive\n");
+                return 2;
+            }
         } else if (std::strcmp(argv[i], "--chat-template-file") == 0 && i + 1 < argc) {
             const char * path = argv[++i];
             std::FILE * f = std::fopen(path, "rb");
@@ -569,6 +614,35 @@ int main(int argc, char ** argv) {
             print_usage(argv[0]);
             return 2;
         }
+    }
+    std::sort(sconfig.tool_speculation.allowed_tools.begin(),
+              sconfig.tool_speculation.allowed_tools.end());
+    sconfig.tool_speculation.allowed_tools.erase(
+        std::unique(sconfig.tool_speculation.allowed_tools.begin(),
+                    sconfig.tool_speculation.allowed_tools.end()),
+        sconfig.tool_speculation.allowed_tools.end());
+    const bool tool_speculation_requested =
+        !sconfig.tool_speculation.endpoint.empty() ||
+        !sconfig.tool_speculation.api_key.empty() ||
+        !sconfig.tool_speculation.allowed_tools.empty();
+    if (tool_speculation_requested && !sconfig.tool_speculation.enabled()) {
+        std::fprintf(stderr,
+            "[server] tool speculation requires --tool-spec-endpoint and at "
+            "least one --tool-spec-allow\n");
+        return 2;
+    }
+#ifndef DFLASH_HAS_CURL
+    if (sconfig.tool_speculation.enabled()) {
+        std::fprintf(stderr,
+            "[server] tool speculation requires a build with libcurl\n");
+        return 2;
+    }
+#endif
+    if (sconfig.tool_speculation.enabled() &&
+        !sconfig.pflash_upstream_base.empty()) {
+        std::fprintf(stderr,
+            "[server] tool speculation currently requires local generation\n");
+        return 2;
     }
     if (fast_rollback_forced_off) {
         bargs.fast_rollback = false;
@@ -1057,6 +1131,13 @@ int main(int argc, char ** argv) {
     std::fprintf(stderr, "[server] │  prefix_cache    = %d slots\n", sconfig.prefix_cache_cap);
     std::fprintf(stderr, "[server] │  prefill_cache   = %d slots\n", sconfig.prefill_cache_cap);
     std::fprintf(stderr, "[server] │  cors            = %s\n", sconfig.enable_cors ? "ON" : "off");
+    std::fprintf(stderr, "[server] │  tool_speculation= %s\n",
+                 sconfig.tool_speculation.enabled() ? "ON" : "off");
+    if (sconfig.tool_speculation.enabled()) {
+        std::fprintf(stderr,
+            "[server] │  tool_spec_service= external, predictor-first, tools=%zu\n",
+            sconfig.tool_speculation.allowed_tools.size());
+    }
     std::fprintf(stderr, "[server] │  cache_type_k    = %s\n",
 #ifdef GGML_USE_HIP
         cache_type_k.empty() ? "q4_0 (default, HIP)" : cache_type_k.c_str());

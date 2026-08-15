@@ -4694,6 +4694,22 @@ TEST_CASE(ServerUnitFixture, test_props_runtime_shape) {
     TEST_ASSERT(body["runtime"]["draft_device"].is_null());
 }
 
+TEST_CASE(ServerUnitFixture, test_props_tool_speculation_is_model_agnostic) {
+    ServerConfig cfg;
+    cfg.tool_speculation.endpoint = "http://127.0.0.1:19090/v1/speculate";
+    cfg.tool_speculation.allowed_tools = {"get_weather"};
+    Tokenizer tokenizer;
+    PrefixCache prefix_cache(0, tokenizer);
+    ToolMemory tool_memory;
+
+    const json feature = build_props_body(
+        cfg, prefix_cache, tool_memory)["tool_speculation"];
+    TEST_ASSERT(feature["enabled"].get<bool>());
+    TEST_ASSERT(feature["protocol"] == kToolSpeculationProtocol);
+    TEST_ASSERT(feature["schedule"] == "before_model");
+    TEST_ASSERT(feature["provider"] == "external");
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // usage.timings — per-request prefill / decode wall-clock breakdown
 // surfaced under usage.timings (spec §6.3). Tests cover all three

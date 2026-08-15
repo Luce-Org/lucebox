@@ -18,6 +18,7 @@
 #include "tokenizer.h"
 #include "chat_template.h"
 #include "tool_memory.h"
+#include "tool_speculation.h"
 #include "prefix_cache.h"
 #include "disk_prefix_cache.h"
 #include "freeze_history.h"
@@ -217,6 +218,11 @@ struct ServerConfig {
     // Routing data collection (--collect-routing <path>): write binary per-token
     // routing data (hidden states + expert selections) for predictor training.
     std::string collect_routing_path;
+
+    // Optional external service for model-agnostic speculative tool execution.
+    // The service starts work before model compute; exact-call verification
+    // remains inside the engine.
+    ToolSpeculationConfig tool_speculation;
 };
 
 namespace http_detail {
@@ -251,6 +257,8 @@ struct ParsedRequest {
     json                      tool_choice;
     // Original messages (for response formatting)
     json                      messages;
+    // Provider-neutral role/content messages for tool speculation.
+    json                      tool_speculation_messages;
     // Original request body (for upstream proxy forwarding)
     json                      raw_body;
     // Response ID
