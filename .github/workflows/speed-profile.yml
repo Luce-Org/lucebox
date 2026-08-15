@@ -1,7 +1,7 @@
 name: Speed Profile
 
 # Report-only speed profile for the inference engine. Runs on the self-hosted
-# RTX 3090 (lucebox3) on PRs that touch the engine or the optimizations, and on
+# RTX 3090 (lucebox-rtx3090) on PRs that touch the engine or the optimizations, and on
 # manual dispatch. It NEVER blocks a PR (continue-on-error: true) — it publishes a
 # report to the run summary + uploads the JSON / markdown / nsys trace as artifacts.
 #
@@ -22,13 +22,13 @@ on:
 # fight over the GPU. cancel-in-progress=false: let a queued profile finish rather
 # than killing it mid-measurement.
 concurrency:
-  group: lucebox3-gpu-runner
+  group: lucebox-rtx3090-gpu-runner
   cancel-in-progress: false
 
 jobs:
   speed-profile:
     name: Speed profile (self-hosted RTX 3090, sm_86)
-    runs-on: [self-hosted, gpu, sm86]
+    runs-on: [self-hosted, lucebox-rtx3090]
     timeout-minutes: 30
     continue-on-error: true   # report-only: a slow/failed profile must not block the PR
 
@@ -51,7 +51,8 @@ jobs:
 
       - name: GPU info (and pin clocks to cut variance, if permitted)
         run: |
-          nvidia-smi --query-gpu=name,driver_version,memory.total,power.limit --format=csv
+          nvidia-smi --query-gpu=name,compute_cap,driver_version,memory.total,power.limit --format=csv
+          test "$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | tr -d '[:space:]')" = "8.6"
           # Locking clocks makes the numbers comparable run-to-run. Safe to skip if the
           # runner user can't run nvidia-smi -lgc; the profiler still records the power cap.
           sudo nvidia-smi -lgc 1395 2>/dev/null || echo "clock lock not permitted; continuing"
@@ -100,6 +101,7 @@ jobs:
           cd server
           cmake -B build \
             -DCMAKE_CUDA_ARCHITECTURES="86" \
+            -DDFLASH27B_USER_CUDA_ARCHITECTURES="86" \
             -DDFLASH27B_ENABLE_BSA=OFF \
             -DDFLASH27B_FA_ALL_QUANTS=OFF \
             -DCMAKE_BUILD_TYPE=Release

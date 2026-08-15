@@ -136,7 +136,9 @@ jobs:
     name: GPU tests (self-hosted RTX 3090, sm_86)
     # Runs only after the GitHub-hosted jobs pass. Those compile the dflash
     # kernels for sm_86 but execute on GPU-less VMs, so the kernel never runs.
-    # This job lands on lucebox3 (RTX 3090) and actually executes it.
+    # This job is pinned to the dedicated lucebox-rtx3090 runner and actually
+    # executes the kernels there. Machine-specific labels prevent stale labels
+    # on another box from accepting the job after a hardware change.
     #
     # SECURITY: fork PRs DO run here, but only after a maintainer approves the
     # workflow run. The repo enforces approval_policy=all_external_contributors,
@@ -149,12 +151,12 @@ jobs:
     # real hardware, so serializing it behind the cloud build only delayed
     # the strongest signal this CI produces.
     needs: [uv-workspace]
-    runs-on: [self-hosted, gpu, sm86]
+    runs-on: [self-hosted, lucebox-rtx3090]
     timeout-minutes: 30
     # Serialize CUDA jobs across PRs (one RTX 3090). The ROCm job has its
     # own group: different physical GPU, no contention.
     concurrency:
-      group: lucebox3-gpu-runner
+      group: lucebox-rtx3090-gpu-runner
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -163,15 +165,18 @@ jobs:
           token: ${{ secrets.SUBMODULE_PAT || secrets.GITHUB_TOKEN }}
 
       - name: GPU smoke (nvidia-smi)
-        run: nvidia-smi --query-gpu=name,driver_version,memory.total,power.limit --format=csv
+        run: |
+          nvidia-smi --query-gpu=name,compute_cap,driver_version,memory.total,power.limit --format=csv
+          test "$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | tr -d '[:space:]')" = "8.6"
 
       - name: Build GPU test binary (sm_86, runner-local CUDA)
         # Uses the runner's own nvcc (/usr/bin/nvcc); no Jimver download since
-        # lucebox3 already has the CUDA toolkit installed.
+        # lucebox-rtx3090 already has the CUDA toolkit installed.
         run: |
           cd server
           cmake -B build \
             -DCMAKE_CUDA_ARCHITECTURES="86" \
+            -DDFLASH27B_USER_CUDA_ARCHITECTURES="86" \
             -DDFLASH27B_ENABLE_BSA=OFF \
             -DDFLASH27B_FA_ALL_QUANTS=OFF \
             -DCMAKE_BUILD_TYPE=Release
@@ -201,7 +206,7 @@ jobs:
       # Optional model-backed end-to-end smoke (real spec-decode on the 3090),
       # disabled by default because it builds dflash_server and lazy-loads the
       # ~16 GB Qwen3.6-27B target + draft (~1-2 min). The weights are already
-      # staged at /opt/models on lucebox3 (override with repo var
+      # staged at /opt/models on lucebox-rtx3090 (override with repo var
       # LUCEBOX_MODELS_DIR). Verified working on the runner. To enable, uncomment;
       # continue-on-error keeps a heavy/slow run from ever blocking a PR.
       # - name: dflash end-to-end smoke (model-backed)
@@ -219,33 +224,75 @@ jobs:
       #       -H 'Content-Type: application/json' \
       #       -d '{"prompt":"The capital of France is","max_tokens":8}' | grep -q '"text"'
 
+  gpu-tests-dgx:
+    name: GPU tests (self-hosted DGX GB10, sm_121 verifier)
+    # Independent NVIDIA verifier on the DGX GB10. It runs the same focused
+    # kernel and graph regressions as the RTX 3090 on ARM64 + CUDA 13, catching
+    # architecture-specific failures without depending on lucebox3 hardware.
+    # Fork PRs retain the same maintainer-approval requirement as gpu-tests.
+    needs: [uv-workspace]
+    runs-on: [self-hosted, dgx-gb10]
+    timeout-minutes: 30
+    concurrency:
+      group: dgx-gb10-a197-gpu-runner
+      cancel-in-progress: false
+    env:
+      CUDA_HOME: /usr/local/cuda
+      CUDACXX: /usr/local/cuda/bin/nvcc
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          submodules: recursive
+          token: ${{ secrets.SUBMODULE_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: GPU and CUDA smoke (GB10, sm_121)
+        run: |
+          nvidia-smi --query-gpu=name,compute_cap,driver_version --format=csv
+          test "$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | tr -d '[:space:]')" = "12.1"
+          "$CUDACXX" --version
+
+      - name: Build focused verifier tests (sm_121, runner-local CUDA)
+        run: |
+          cd server
+          cmake -B build \
+            -DCMAKE_CUDA_COMPILER="$CUDACXX" \
+            -DCMAKE_CUDA_ARCHITECTURES="121" \
+            -DDFLASH27B_USER_CUDA_ARCHITECTURES="121" \
+            -DDFLASH27B_ENABLE_BSA=OFF \
+            -DDFLASH27B_FA_ALL_QUANTS=OFF \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build \
+            --target test_flash_attn_sparse test_deepseek4_mmid_grouped_cuda \
+              test_deepseek4_unit test_rocmfp3_mix_registry \
+              test_rocmfp_mix_slice_matvec test_rocmfp_mix_gateup_glu \
+              test_ds4_mix_registry_teardown \
+            -j"$(nproc)"
+
+      - name: Run focused verifier tests on the DGX GB10
+        run: |
+          ./server/build/test_flash_attn_sparse
+          ./server/build/test_deepseek4_mmid_grouped_cuda
+          ./server/build/test_deepseek4_unit
+          ctest --test-dir server/build --output-on-failure \
+            -R 'rocmfp3_mix_registry|rocmfp_mix_slice_matvec|rocmfp_mix_gateup_glu|ds4_mix_registry_teardown'
+
   gpu-tests-amd:
-    name: GPU tests (self-hosted Radeon 8060S, gfx1151 / ROCm)
-    # Companion to gpu-tests: exercises the OTHER half of lucebox3 - the Strix
-    # Halo iGPU - via ROCm/HIP. GitHub-hosted runners cannot touch an AMD GPU at
-    # all. The runner is pinned to ROCm 6.4.4 on kernel 6.14 (ROCm 7.2 page-
-    # faults on gfx1151); hipcc is not on the runner's minimal PATH, so it is
-    # invoked by absolute path.
+    name: GPU tests (self-hosted Radeon AI PRO R9700, gfx1201 / ROCm)
+    # Companion to the NVIDIA jobs: lucebox3 now carries an R9700 and exercises
+    # the HIP path on gfx1201. GitHub-hosted runners cannot execute these kernels.
+    # hipcc is not on the runner's minimal PATH, so invoke it by absolute path.
     #
     # SECURITY: same model as gpu-tests - fork PRs run only after a maintainer
     # approves the workflow run (approval_policy=all_external_contributors).
-    # Gate only on the 1-minute workspace check and the NVIDIA GPU job, NOT the
-    # ~18-minute hosted CPU build: the GPU job compiles the same tree itself in
-    # ~2 minutes on real hardware. The NVIDIA dependency keeps the two
-    # self-hosted GPU jobs from entering the same concurrency group
-    # simultaneously; GitHub cancels older pending jobs in a group even when
-    # cancel-in-progress is false.
-    needs: [uv-workspace, gpu-tests]
-    if: ${{ always() && needs['uv-workspace'].result == 'success' }}
-    runs-on: [self-hosted, rocm, gfx1151]
+    # Gate only on the fast workspace check, not the hosted CPU build. Every GPU
+    # job has a machine-specific runner label and concurrency group, so the R9700
+    # can verify in parallel with both NVIDIA machines.
+    needs: [uv-workspace]
+    runs-on: [self-hosted, lucebox3, r9700]
     timeout-minutes: 20
-    # Serialize across PRs per GPU. NOT the same group as the CUDA job:
-    # the combo box has two distinct GPUs (RTX 3090 + Strix iGPU), and a
-    # shared group only holds one waiting job, so the Radeon leg was
-    # chronically displaced ("higher priority waiting request") by every
-    # new CUDA job entering the queue.
+    # Serialize across PRs on this physical R9700.
     concurrency:
-      group: lucebox3-rocm-runner
+      group: lucebox3-r9700-runner
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -282,14 +329,14 @@ jobs:
           fi
           wait $PROBE && echo "KFD healthy" || { echo "::error::rocminfo exited non-zero"; cat /tmp/rocminfo.out | tail -5; exit 1; }
 
-      - name: ROCm smoke (rocminfo sees gfx1151)
-        run: cat /tmp/rocminfo.out | grep -E "Name:|Marketing Name:" | grep -iE "gfx1151|Radeon 8060S"
+      - name: ROCm smoke (rocminfo sees gfx1201)
+        run: cat /tmp/rocminfo.out | grep -E "Name:|Marketing Name:" | grep -iE "gfx1201|R9700"
 
-      - name: Build + run HIP vector-add on the Radeon 8060S
+      - name: Build + run HIP vector-add on the R9700
         # Self-contained HIP kernel correctness test (no model weights). This is
         # the execution the GitHub-hosted jobs cannot do.
         run: |
-          /opt/rocm/bin/hipcc --offload-arch=gfx1151 -O2 \
+          /opt/rocm/bin/hipcc --offload-arch=gfx1201 -O2 \
             -o "$RUNNER_TEMP/hip_smoke" .github/ci/hip_smoke.cpp
           "$RUNNER_TEMP/hip_smoke"
 
@@ -297,7 +344,7 @@ jobs:
         run: |
           cmake -S server -B "$RUNNER_TEMP/rocmfp-build" \
             -DDFLASH27B_GPU_BACKEND=hip \
-            -DDFLASH27B_HIP_ARCHITECTURES=gfx1151 \
+            -DDFLASH27B_HIP_ARCHITECTURES=gfx1201 \
             -DDFLASH27B_SERVER=OFF \
             -DDFLASH27B_TESTS=ON \
             -DGGML_HIP_GRAPHS=ON \
