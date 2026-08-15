@@ -153,6 +153,9 @@ jobs:
     needs: [uv-workspace]
     runs-on: [self-hosted, lucebox-rtx3090]
     timeout-minutes: 30
+    env:
+      CUDA_HOME: /usr/local/cuda
+      CUDACXX: /usr/local/cuda/bin/nvcc
     # Serialize CUDA jobs across PRs (one RTX 3090). The ROCm job has its
     # own group: different physical GPU, no contention.
     concurrency:
@@ -168,13 +171,15 @@ jobs:
         run: |
           nvidia-smi --query-gpu=name,compute_cap,driver_version,memory.total,power.limit --format=csv
           test "$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | tr -d '[:space:]')" = "8.6"
+          "$CUDACXX" --version
 
       - name: Build GPU test binary (sm_86, runner-local CUDA)
-        # Uses the runner's own nvcc (/usr/bin/nvcc); no Jimver download since
+        # Uses the runner's coherent /usr/local/cuda toolkit; no Jimver download since
         # lucebox-rtx3090 already has the CUDA toolkit installed.
         run: |
           cd server
           cmake -B build \
+            -DCMAKE_CUDA_COMPILER="$CUDACXX" \
             -DCMAKE_CUDA_ARCHITECTURES="86" \
             -DDFLASH27B_USER_CUDA_ARCHITECTURES="86" \
             -DDFLASH27B_ENABLE_BSA=OFF \
@@ -226,9 +231,10 @@ jobs:
 
   gpu-tests-dgx:
     name: GPU tests (self-hosted DGX GB10, sm_121 verifier)
-    # Independent NVIDIA verifier on the DGX GB10. It runs the same focused
-    # kernel and graph regressions as the RTX 3090 on ARM64 + CUDA 13, catching
+    # Independent NVIDIA verifier on the DGX GB10. It runs the portable verifier,
+    # graph, and mixed-quant regressions on ARM64 + CUDA 13, catching
     # architecture-specific failures without depending on lucebox3 hardware.
+    # The sparse-attention allocator smoke remains on the discrete RTX 3090.
     # Fork PRs retain the same maintainer-approval requirement as gpu-tests.
     needs: [uv-workspace]
     runs-on: [self-hosted, dgx-gb10]
@@ -262,7 +268,7 @@ jobs:
             -DDFLASH27B_FA_ALL_QUANTS=OFF \
             -DCMAKE_BUILD_TYPE=Release
           cmake --build build \
-            --target test_flash_attn_sparse test_deepseek4_mmid_grouped_cuda \
+            --target test_deepseek4_mmid_grouped_cuda \
               test_deepseek4_unit test_rocmfp3_mix_registry \
               test_rocmfp_mix_slice_matvec test_rocmfp_mix_gateup_glu \
               test_ds4_mix_registry_teardown \
@@ -270,7 +276,6 @@ jobs:
 
       - name: Run focused verifier tests on the DGX GB10
         run: |
-          ./server/build/test_flash_attn_sparse
           ./server/build/test_deepseek4_mmid_grouped_cuda
           ./server/build/test_deepseek4_unit
           ctest --test-dir server/build --output-on-failure \

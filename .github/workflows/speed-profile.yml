@@ -38,6 +38,8 @@ jobs:
     # draft path; keep the older LUCEBOX_SPEED_PROFILE_* variable names as aliases
     # so existing repo settings continue to work.
     env:
+      CUDA_HOME: /usr/local/cuda
+      CUDACXX: /usr/local/cuda/bin/nvcc
       MODELS: ${{ vars.LUCEBOX_MODELS_DIR || '/opt/models' }}
       TARGET_MODEL: ${{ vars.LUCEBOX_TARGET_MODEL || vars.LUCEBOX_SPEED_PROFILE_TARGET || 'Qwen3.6-27B-Q4_K_M.gguf' }}
       DRAFT_MODEL: ${{ vars.LUCEBOX_DRAFT_MODEL || vars.LUCEBOX_SPEED_PROFILE_DRAFT || 'draft/dflash-draft-3.6-q4_k_m.gguf' }}
@@ -100,6 +102,7 @@ jobs:
         run: |
           cd server
           cmake -B build \
+            -DCMAKE_CUDA_COMPILER="$CUDACXX" \
             -DCMAKE_CUDA_ARCHITECTURES="86" \
             -DDFLASH27B_USER_CUDA_ARCHITECTURES="86" \
             -DDFLASH27B_ENABLE_BSA=OFF \
