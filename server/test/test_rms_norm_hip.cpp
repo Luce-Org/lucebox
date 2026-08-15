@@ -47,10 +47,13 @@ TEST_CASE(RmsNormHipFixture, rms_norm_matches_cpu) {
 
     int device_count = 0;
     const cudaError_t device_status = cudaGetDeviceCount(&device_count);
-    if (device_status == cudaErrorNoDevice || device_count == 0) {
+    if (device_status == cudaErrorNoDevice) {
         SKIP("no HIP device available");
     }
     CK(device_status);
+    if (device_count == 0) {
+        SKIP("no HIP device available");
+    }
 
     cudaDeviceProp prop;
     CK(cudaGetDeviceProperties(&prop, 0));

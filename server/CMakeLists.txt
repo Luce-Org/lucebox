@@ -1575,6 +1575,7 @@ if(DFLASH27B_TESTS)
         endif()
         if(CMAKE_CROSSCOMPILING)
             add_test(NAME model_smoke COMMAND test_model_smoke)
+            set_tests_properties(model_smoke PROPERTIES SKIP_RETURN_CODE 77)
         else()
             set(_model_smoke_ctest_generated
                 "${CMAKE_CURRENT_BINARY_DIR}/test_model_smoke_discovered_tests.cmake")
