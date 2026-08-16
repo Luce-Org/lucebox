@@ -101,24 +101,25 @@ __global__ void compute_mean_vector_kernel_bf16(
 }
 
 // Public launcher (called from C++).
-extern "C" void launch_compute_mean_vector_bf16(
+extern "C" int launch_compute_mean_vector_bf16(
     const void * K, void * mean_K,
     int batch, int seq_len, int n_kv_heads, int head_dim, int block_size,
     int s_K_b, int s_K_n, int s_K_h, int s_K_d,
     int s_mK_b, int s_mK_m, int s_mK_h, int s_mK_d,
     cudaStream_t stream)
 {
+    if (head_dim != 128 || block_size != 128) {
+        return -1;
+    }
     const int n_k_blocks = (seq_len + block_size - 1) / block_size;
     dim3 grid(n_k_blocks, batch * n_kv_heads, 1);
     dim3 block(head_dim, 1, 1);
-    if (head_dim == 128 && block_size == 128) {
-        compute_mean_vector_kernel_bf16<128, 128><<<grid, block, 0, stream>>>(
-            (const __nv_bfloat16 *)K, (__nv_bfloat16 *)mean_K,
-            batch, seq_len, n_kv_heads,
-            s_K_b, s_K_n, s_K_h, s_K_d,
-            s_mK_b, s_mK_m, s_mK_h, s_mK_d);
-    }
-    // Only D_HEAD=128 BLOCK=128 dispatched here. Add other combos when new heads/blocks needed.
+    compute_mean_vector_kernel_bf16<128, 128><<<grid, block, 0, stream>>>(
+        (const __nv_bfloat16 *)K, (__nv_bfloat16 *)mean_K,
+        batch, seq_len, n_kv_heads,
+        s_K_b, s_K_n, s_K_h, s_K_d,
+        s_mK_b, s_mK_m, s_mK_h, s_mK_d);
+    return 0;
 }
 
 // ---- Kernel 2: compute_block_score ----
@@ -229,7 +230,7 @@ __global__ void compute_block_score_kernel_bf16(
     }
 }
 
-extern "C" void launch_compute_block_score_bf16(
+extern "C" int launch_compute_block_score_bf16(
     const void * Q, const void * mean_K, float sm_scale,
     void * score, void * score_max,
     int batch, int n_q_heads, int n_k_heads,
@@ -240,20 +241,22 @@ extern "C" void launch_compute_block_score_bf16(
     int s_M_b, int s_M_m, int s_M_n, int s_M_h,
     cudaStream_t stream)
 {
+    if (head_dim != 128 || block_size != 128) {
+        return -1;
+    }
     const int M = (seq_len + block_size - 1) / block_size;
     dim3 grid(M, batch * n_q_heads, 1);
     dim3 block(block_size, 1, 1);
     size_t smem = block_size * sizeof(float);
-    if (head_dim == 128 && block_size == 128) {
-        compute_block_score_kernel_bf16<128, 128, 1><<<grid, block, smem, stream>>>(
-            (const __nv_bfloat16 *)Q, (const __nv_bfloat16 *)mean_K, sm_scale,
-            (float *)score, (float *)score_max,
-            batch, n_q_heads, n_k_heads, M, M,
-            s_Q_b, s_Q_n, s_Q_h, s_Q_d,
-            s_mK_b, s_mK_m, s_mK_h, s_mK_d,
-            s_S_b, s_S_m, s_S_n, s_S_h,
-            s_M_b, s_M_m, s_M_n, s_M_h);
-    }
+    compute_block_score_kernel_bf16<128, 128, 1><<<grid, block, smem, stream>>>(
+        (const __nv_bfloat16 *)Q, (const __nv_bfloat16 *)mean_K, sm_scale,
+        (float *)score, (float *)score_max,
+        batch, n_q_heads, n_k_heads, M, M,
+        s_Q_b, s_Q_n, s_Q_h, s_Q_d,
+        s_mK_b, s_mK_m, s_mK_h, s_mK_d,
+        s_S_b, s_S_m, s_S_n, s_S_h,
+        s_M_b, s_M_m, s_M_n, s_M_h);
+    return 0;
 }
 
 // ---- Kernel 4: sparse_flash_forward ----
@@ -943,7 +946,6 @@ extern "C" void launch_sparse_flash_forward_bf16(
     }
 #endif
 }
-
 
 // ---- Kernel 3: block_select on GPU ----
 //

@@ -1,4 +1,6 @@
 cmake_minimum_required(VERSION 3.21)  # 3.21 adds first-class HIP language support (project(LANGUAGES ... HIP))
+include("${CMAKE_CURRENT_LIST_DIR}/cmake/DflashCudaArchitectures.cmake")
+
 set(DFLASH27B_GPU_BACKEND "cuda" CACHE STRING "GPU backend to build: cuda or hip")
 set_property(CACHE DFLASH27B_GPU_BACKEND PROPERTY STRINGS cuda hip)
 option(DFLASH27B_ENABLE_MIXED_CUDA_HIP
@@ -27,6 +29,13 @@ set(GGML_CUDA_MODULE OFF CACHE BOOL "Build CUDA as a runtime-loadable module" FO
 set(GGML_HIP_MODULE OFF CACHE BOOL "Build HIP as a runtime-loadable module" FORCE)
 
 if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+    # Validate an explicit user list before CUDA compiler detection so malformed
+    # values fail with the same deterministic message on every toolchain.
+    if(DEFINED CMAKE_CUDA_ARCHITECTURES)
+        dflash_parse_cuda_architectures(
+            _dflash_user_cuda_min_sm _dflash_user_cuda_numeric_archs
+            "${CMAKE_CUDA_ARCHITECTURES}")
+    endif()
     set(DFLASH27B_USER_CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
     project(dflash LANGUAGES C CXX CUDA)
 elseif(DFLASH27B_GPU_BACKEND STREQUAL "hip")
@@ -214,6 +223,8 @@ if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
             list(APPEND _dflash_archs "121")
         endif()
     endif()
+    dflash_parse_cuda_architectures(
+        _dflash_cuda_min_sm _dflash_cuda_numeric_archs "${_dflash_archs}")
     # Keep the vendored ggml-cuda build aligned with the resolved dflash arch list.
     # Otherwise ggml may inherit CMake's compiler-default arch (for example sm_52),
     # which triggers massive first-request PTX JIT on newer GPUs even though
@@ -260,8 +271,7 @@ if(DFLASH27B_GPU_BACKEND STREQUAL "cuda" AND NOT DEFINED _dflash_is_consumer_bla
     set(_dflash_is_consumer_blackwell OFF)
     # Iterate the resolved dflash_common arch list, not raw CMAKE_CUDA_ARCHITECTURES,
     # which is empty on the default path (the project supplies its own list above).
-    foreach(_arch IN LISTS _dflash_archs)
-        string(REGEX REPLACE "[^0-9]" "" _dflash_arch_num "${_arch}")
+    foreach(_dflash_arch_num IN LISTS _dflash_cuda_numeric_archs)
         if(_dflash_arch_num MATCHES "^12[0-9]$")
             set(_dflash_is_consumer_blackwell ON)
             break()
@@ -510,9 +520,6 @@ if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
         src/cuda_cross_device_copy.cpp
         src/deepseek4/deepseek4_hc_cuda.cu)
     set_target_properties(dflash_common PROPERTIES CUDA_ARCHITECTURES "${_dflash_archs}")
-    list(GET _dflash_archs 0 _dflash_cuda_min_sm)
-    # Strip any trailing 'a' suffix (e.g. "121a" -> "121")
-    string(REGEX REPLACE "[^0-9]" "" _dflash_cuda_min_sm "${_dflash_cuda_min_sm}")
     target_compile_definitions(dflash_common PRIVATE
         DFLASH27B_BACKEND_CUDA=1
         DFLASH27B_CUDA_MIN_SM=${_dflash_cuda_min_sm}
@@ -618,10 +625,11 @@ elseif(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
     set(_dflash_has_sm80 OFF)
     set(_dflash_has_sm70 OFF)
     set(_dflash_has_sm60 OFF)
-    foreach(_arch IN LISTS _dflash_archs)
-        string(REGEX REPLACE "[^0-9]" "" _arch_num "${_arch}")
+    set(_dflash_sm80_archs "")
+    foreach(_arch _arch_num IN ZIP_LISTS _dflash_archs _dflash_cuda_numeric_archs)
         if(_arch_num GREATER_EQUAL 80)
             set(_dflash_has_sm80 ON)
+            list(APPEND _dflash_sm80_archs "${_arch}")
         endif()
         if(_arch_num GREATER_EQUAL 70 AND _arch_num LESS 80)
             set(_dflash_has_sm70 ON)
@@ -641,16 +649,20 @@ elseif(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
     endif()
 
     if(_dflash_has_sm80)
+        # CUDA_ARCHITECTURES is a target property, not a source property.  Keep
+        # the BF16 WMMA translation unit in its own object target so a mixed
+        # fatbinary (for example 86;70) never compiles it for an unsupported SM.
+        add_library(dflash_flashprefill_sm80 OBJECT src/flashprefill_kernels.cu)
+        set_target_properties(dflash_flashprefill_sm80 PROPERTIES
+            CUDA_ARCHITECTURES "${_dflash_sm80_archs}"
+            POSITION_INDEPENDENT_CODE ON)
+        target_link_libraries(dflash_flashprefill_sm80 PRIVATE CUDA::cudart)
         target_sources(dflash_common PRIVATE
-            src/flashprefill_kernels.cu
+            $<TARGET_OBJECTS:dflash_flashprefill_sm80>
             src/pflash_ggml_adapter.cpp)
         target_compile_definitions(dflash_common PRIVATE
             DFLASH27B_HAVE_CUDA_WMMA_FLASHPREFILL=1
             DFLASH27B_HAVE_SM80_FLASHPREFILL=1)
-        # BF16 WMMA kernels require sm_80+.  Restrict compilation to those
-        # arches so nvcc never instantiates m16n16k16 BF16 WMMA on Volta/Pascal.
-        set_source_files_properties(src/flashprefill_kernels.cu PROPERTIES
-            CUDA_ARCHITECTURES "80;86;90;100;110;120;121")
     endif()
     if(_dflash_has_sm70)
         target_sources(dflash_common PRIVATE src/flashprefill_f16.cu)
@@ -686,10 +698,10 @@ if(DFLASH27B_GPU_BACKEND STREQUAL "hip" AND DFLASH27B_ENABLE_BSA AND NOT DFLASH2
     set(DFLASH27B_ENABLE_BSA OFF)
 endif()
 if(DFLASH27B_ENABLE_BSA)
-    foreach(_arch IN LISTS _dflash_archs)
-        if(_arch LESS 80)
+    foreach(_arch_num IN LISTS _dflash_cuda_numeric_archs)
+        if(_arch_num LESS 80)
             message(WARNING
-                "DFLASH27B_ENABLE_BSA=ON requested but CUDA_ARCHITECTURES contains '${_arch}' (<80); "
+                "DFLASH27B_ENABLE_BSA=ON requested but CUDA_ARCHITECTURES contains an SM below 80; "
                 "disabling BSA (the spec-prefill path will fall back to the WMMA kernel).")
             set(DFLASH27B_ENABLE_BSA OFF)
             break()
