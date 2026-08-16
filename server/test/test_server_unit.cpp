@@ -765,6 +765,41 @@ TEST_CASE(ServerUnitFixture, test_parse_tool_code_wrapper) {
     }
 }
 
+TEST_CASE(ServerUnitFixture, test_parse_function_call_wrapper) {
+    std::string text =
+        "<function_call>\n"
+        "{\"name\": \"bash\", \"arguments\": {\"command\": \"echo 'hello'\"}}\n"
+        "</function_call>";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "bash");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["command"] == "echo 'hello'");
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_bare_function_json_with_parameters) {
+    std::string text =
+        "<function>\n"
+        "{\n"
+        "  \"name\": \"bash\",\n"
+        "  \"parameters\": {\n"
+        "    \"command\": \"ls -la \\\"/home/dpavlin/aimax project\\\"\"\n"
+        "  }\n"
+        "}\n"
+        "</function>";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "bash");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["command"] == "ls -la \"/home/dpavlin/aimax project\"");
+    }
+}
+
+
+
 TEST_CASE(ServerUnitFixture, test_parse_tool_allowed_filter) {
     std::string text =
         "<function=blocked_tool>\n"
@@ -1282,6 +1317,49 @@ TEST_CASE(ServerUnitFixture, test_emitter_tool_buffer_detection) {
     // Tool call text should not leak into accumulated content
     TEST_ASSERT(em.accumulated_text().find("<tool_call>") == std::string::npos);
 }
+
+TEST_CASE(ServerUnitFixture, test_emitter_function_call_tool_buffer_detection) {
+    // When the emitter sees <function_call>, it should buffer and parse tools.
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, bash_tools());
+    em.emit_start();
+    em.emit_token("<function_call>\n"
+                  "{\"name\": \"bash\", \"arguments\": {\"command\": \"ls -la\"}}\n"
+                  "</function_call>");
+    em.emit_finish(20);
+
+    TEST_ASSERT(!em.tool_calls().empty());
+    if (!em.tool_calls().empty()) {
+        TEST_ASSERT(em.tool_calls()[0].name == "bash");
+    }
+    // Tool call text should not leak into accumulated content
+    TEST_ASSERT(em.accumulated_text().find("<function_call>") == std::string::npos);
+    TEST_ASSERT(em.accumulated_text().find("bash") == std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_bare_function_json_tool_buffer_detection) {
+    // When the emitter sees <function>, it should buffer and parse tools.
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, bash_tools());
+    em.emit_start();
+    em.emit_token("<function>\n"
+                  "{\n"
+                  "  \"name\": \"bash\",\n"
+                  "  \"parameters\": {\n"
+                  "    \"command\": \"ls -la \\\"/home/dpavlin/aimax project\\\"\"\n"
+                  "  }\n"
+                  "}\n"
+                  "</function>");
+    em.emit_finish(20);
+
+    TEST_ASSERT(!em.tool_calls().empty());
+    if (!em.tool_calls().empty()) {
+        TEST_ASSERT(em.tool_calls()[0].name == "bash");
+    }
+    // Tool call text should not leak into accumulated content
+    TEST_ASSERT(em.accumulated_text().find("<function>") == std::string::npos);
+    TEST_ASSERT(em.accumulated_text().find("bash") == std::string::npos);
+}
+
+
 
 TEST_CASE(ServerUnitFixture, test_emitter_anthropic_tool_use_blocks) {
     // The Anthropic streaming tool-use branch used to be a no-op; the model
