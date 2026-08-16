@@ -418,6 +418,20 @@ struct ModelBackend {
     // Typed compress API (preferred for in-process callers).
     virtual CompressResult compress(const CompressRequest & req);
 
+    // Compress several independent prompt spans under one backend residency
+    // window. The default preserves existing behavior; backends that park
+    // large target/draft weights can override this to park once for the whole
+    // batch instead of once per span.
+    virtual std::vector<CompressResult> compress_batch(
+        const std::vector<CompressRequest> & requests) {
+        std::vector<CompressResult> results;
+        results.reserve(requests.size());
+        for (const auto & request : requests) {
+            results.push_back(compress(request));
+        }
+        return results;
+    }
+
     // Legacy string-based compress (for daemon_loop stdin protocol).
     // `line` is the full "compress ..." command line.
     virtual bool handle_compress(const std::string & line,

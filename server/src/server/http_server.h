@@ -219,6 +219,23 @@ struct ServerConfig {
     std::string collect_routing_path;
 };
 
+namespace http_detail {
+
+inline constexpr int kFlowKvInertMinTokens = 512;
+
+// Small policy helpers kept outside HttpServer so model-free unit tests use
+// the same decisions as the request path.
+int flowkv_activation_threshold(const ServerConfig & config);
+bool flowkv_should_activate(const ServerConfig & config,
+                            int aged_token_estimate);
+float resolve_pflash_keep_ratio(float configured_ratio,
+                                const std::string & session_id,
+                                const HttpServerSessions & sessions);
+bool should_clamp_flowkv_disk_cache(
+    bool flowkv, const DiskPrefixCachePolicy & policy);
+
+}  // namespace http_detail
+
 // ─── Parsed request ─────────────────────────────────────────────────────
 
 struct ParsedRequest {
@@ -330,6 +347,7 @@ private:
     struct PreparedPrompt {
         std::vector<int32_t> tokens;
         bool compressed = false;
+        bool flowkv = false;
         int full_cache_served_tokens = -1;
         int full_cache_hit_slot = -1;
         int full_cache_hit_len = 0;
@@ -480,7 +498,7 @@ private:
     std::vector<std::vector<int32_t>> recent_tool_prefixes_;
 
     // FlowKV freeze-history: per-message compression cache.
-    // Key: SHA-1 hash of the drafter-token slice for an aged message.
+    // Key: SHA-1 hash of the drafter-token slice and selected keep ratio.
     // Value: compressed content text (output of drafter_tokenizer_->decode).
     // Bounded to kFrozenCacheMax entries; cleared on overflow (simple eviction).
     static constexpr size_t kFrozenCacheMax = 256;

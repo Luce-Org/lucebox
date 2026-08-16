@@ -34,6 +34,7 @@
 #include "common/kvflash_pager.h"
 #include "placement/draft_residency.h"
 #include "common/gguf_bounds.h"
+#include "common/gguf_inspect.h"
 #include "ggml-cpu.h"
 #include "server/prompt_normalize.h"
 #include "qwen3_drafter_model.h"
@@ -765,6 +766,41 @@ TEST_CASE(ServerUnitFixture, test_parse_tool_code_wrapper) {
     }
 }
 
+TEST_CASE(ServerUnitFixture, test_parse_function_call_wrapper) {
+    std::string text =
+        "<function_call>\n"
+        "{\"name\": \"bash\", \"arguments\": {\"command\": \"echo 'hello'\"}}\n"
+        "</function_call>";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "bash");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["command"] == "echo 'hello'");
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_bare_function_json_with_parameters) {
+    std::string text =
+        "<function>\n"
+        "{\n"
+        "  \"name\": \"bash\",\n"
+        "  \"parameters\": {\n"
+        "    \"command\": \"ls -la \\\"/home/dpavlin/aimax project\\\"\"\n"
+        "  }\n"
+        "}\n"
+        "</function>";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "bash");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["command"] == "ls -la \"/home/dpavlin/aimax project\"");
+    }
+}
+
+
+
 TEST_CASE(ServerUnitFixture, test_parse_tool_allowed_filter) {
     std::string text =
         "<function=blocked_tool>\n"
@@ -1282,6 +1318,49 @@ TEST_CASE(ServerUnitFixture, test_emitter_tool_buffer_detection) {
     // Tool call text should not leak into accumulated content
     TEST_ASSERT(em.accumulated_text().find("<tool_call>") == std::string::npos);
 }
+
+TEST_CASE(ServerUnitFixture, test_emitter_function_call_tool_buffer_detection) {
+    // When the emitter sees <function_call>, it should buffer and parse tools.
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, bash_tools());
+    em.emit_start();
+    em.emit_token("<function_call>\n"
+                  "{\"name\": \"bash\", \"arguments\": {\"command\": \"ls -la\"}}\n"
+                  "</function_call>");
+    em.emit_finish(20);
+
+    TEST_ASSERT(!em.tool_calls().empty());
+    if (!em.tool_calls().empty()) {
+        TEST_ASSERT(em.tool_calls()[0].name == "bash");
+    }
+    // Tool call text should not leak into accumulated content
+    TEST_ASSERT(em.accumulated_text().find("<function_call>") == std::string::npos);
+    TEST_ASSERT(em.accumulated_text().find("bash") == std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_bare_function_json_tool_buffer_detection) {
+    // When the emitter sees <function>, it should buffer and parse tools.
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, bash_tools());
+    em.emit_start();
+    em.emit_token("<function>\n"
+                  "{\n"
+                  "  \"name\": \"bash\",\n"
+                  "  \"parameters\": {\n"
+                  "    \"command\": \"ls -la \\\"/home/dpavlin/aimax project\\\"\"\n"
+                  "  }\n"
+                  "}\n"
+                  "</function>");
+    em.emit_finish(20);
+
+    TEST_ASSERT(!em.tool_calls().empty());
+    if (!em.tool_calls().empty()) {
+        TEST_ASSERT(em.tool_calls()[0].name == "bash");
+    }
+    // Tool call text should not leak into accumulated content
+    TEST_ASSERT(em.accumulated_text().find("<function>") == std::string::npos);
+    TEST_ASSERT(em.accumulated_text().find("bash") == std::string::npos);
+}
+
+
 
 TEST_CASE(ServerUnitFixture, test_emitter_anthropic_tool_use_blocks) {
     // The Anthropic streaming tool-use branch used to be a no-op; the model
@@ -3207,6 +3286,33 @@ struct MockBackend : ModelBackend {
     void shutdown() override {}
 };
 
+struct MockBatchCompressBackend : MockBackend {
+    int compress_calls = 0;
+
+    CompressResult compress(const CompressRequest & request) override {
+        ++compress_calls;
+        CompressResult result;
+        result.ok = !request.input_ids.empty();
+        if (result.ok) result.compressed_ids = {request.input_ids.front()};
+        return result;
+    }
+};
+
+TEST_CASE(ServerUnitFixture, test_compress_batch_default_preserves_order) {
+    MockBatchCompressBackend backend;
+    std::vector<ModelBackend::CompressRequest> requests(3);
+    requests[0].input_ids = {11, 12};
+    requests[1].input_ids = {21, 22};
+    requests[2].input_ids = {31, 32};
+
+    const auto results = backend.compress_batch(requests);
+    TEST_ASSERT(results.size() == requests.size());
+    TEST_ASSERT(backend.compress_calls == 3);
+    TEST_ASSERT(results[0].compressed_ids == std::vector<int32_t>({11}));
+    TEST_ASSERT(results[1].compressed_ids == std::vector<int32_t>({21}));
+    TEST_ASSERT(results[2].compressed_ids == std::vector<int32_t>({31}));
+}
+
 struct MockMemoryOnlySnapshotBackend : MockBackend {
     bool snapshot_used(int slot) const override { return slot == 0; }
 };
@@ -5104,10 +5210,15 @@ TEST_CASE(ServerUnitFixture, test_flowkv_T4_compress_true_policy_name_has_suffix
     TEST_ASSERT(name.find("+compress") != std::string::npos);
 }
 
-// T4: default DiskPrefixCachePolicy has compress=false (no-op).
+// T4: compression-aware disk clamping remains opt-in.
 TEST_CASE(ServerUnitFixture, test_flowkv_T4_default_no_compress) {
     DiskPrefixCachePolicy p;
-    TEST_ASSERT_MSG(!p.compress, "default compress must be false (byte-identical to pr364-base)");
+    TEST_ASSERT_MSG(!p.compress, "FlowKV disk clamping must default to off");
+    TEST_ASSERT(!http_detail::should_clamp_flowkv_disk_cache(true, p));
+
+    p.compress = true;
+    TEST_ASSERT(http_detail::should_clamp_flowkv_disk_cache(true, p));
+    TEST_ASSERT(!http_detail::should_clamp_flowkv_disk_cache(false, p));
 }
 
 // T6: frozen_block_key is deterministic — same tokens → same hash.
@@ -5227,16 +5338,40 @@ TEST_CASE(ServerUnitFixture, test_flowkv_T1_system_end_boundary_first) {
     }
 }
 
-// T5 (inert-guard): aged_token_estimate < 512 → FlowKV-OFF.
-// Tests the guard constant and comparison logic.
-TEST_CASE(ServerUnitFixture, test_flowkv_T5_inert_guard_token_count) {
-    static constexpr int kFkvInertMinTokens = 512;
-    // Below threshold: FlowKV should not fire.
-    TEST_ASSERT(400 < kFkvInertMinTokens);
-    TEST_ASSERT(511 < kFkvInertMinTokens);
-    // At or above threshold: FlowKV may fire.
-    TEST_ASSERT(512 >= kFkvInertMinTokens);
-    TEST_ASSERT(1024 >= kFkvInertMinTokens);
+// T5: exercise the production FlowKV activation decision and defaults.
+TEST_CASE(ServerUnitFixture, test_flowkv_T5_aggregate_activation_threshold) {
+    ServerConfig config;
+    config.pflash_mode = ServerConfig::PflashMode::AUTO;
+
+    TEST_ASSERT(http_detail::flowkv_activation_threshold(config) == 32000);
+    TEST_ASSERT(!http_detail::flowkv_should_activate(config, 13000));
+    TEST_ASSERT(http_detail::flowkv_should_activate(config, 32000));
+
+    config.pflash_threshold = 12000;
+    TEST_ASSERT(!http_detail::flowkv_should_activate(config, 11999));
+    TEST_ASSERT(http_detail::flowkv_should_activate(config, 13000));
+
+    config.pflash_mode = ServerConfig::PflashMode::ALWAYS;
+    TEST_ASSERT(http_detail::flowkv_activation_threshold(config) ==
+                http_detail::kFlowKvInertMinTokens);
+    TEST_ASSERT(http_detail::flowkv_should_activate(
+        config, http_detail::kFlowKvInertMinTokens));
+}
+
+// Session feedback overrides the static/curve ratio for both whole-prompt
+// PFlash and FlowKV.
+TEST_CASE(ServerUnitFixture, test_flowkv_session_keep_ratio_override) {
+    HttpServerSessions sessions;
+    sessions.update("adaptive", 0.95f);
+
+    const float configured_ratio = 0.05f;
+    const float static_ratio = http_detail::resolve_pflash_keep_ratio(
+        configured_ratio, "", sessions);
+    const float adaptive_ratio = http_detail::resolve_pflash_keep_ratio(
+        configured_ratio, "adaptive", sessions);
+
+    TEST_ASSERT(std::fabs(static_ratio - configured_ratio) < 1e-6f);
+    TEST_ASSERT(std::fabs(adaptive_ratio - 0.09f) < 1e-6f);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -5421,4 +5556,34 @@ TEST_CASE(ServerUnitFixture, test_gguf_bounds_error_reports_operands) {
     const std::string o = gguf_bounds_error("target GGUF", "t", "f32",
                                             kMax, 10, 10, 100);
     TEST_ASSERT(o.find("overflow") != std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_qwen35_embedded_mtp_target_layer_count) {
+    uint32_t target_layers = 0;
+    std::string error;
+
+    TEST_ASSERT(derive_effective_target_layer_count(
+        "qwen35", 64, 0, target_layers, error));
+    TEST_ASSERT(target_layers == 64);
+
+    TEST_ASSERT(derive_effective_target_layer_count(
+        "qwen35", 65, 1, target_layers, error));
+    TEST_ASSERT(target_layers == 64);
+
+    TEST_ASSERT(derive_effective_target_layer_count(
+        "qwen35moe", 81, 1, target_layers, error));
+    TEST_ASSERT(target_layers == 80);
+
+    TEST_ASSERT(!derive_effective_target_layer_count(
+        "qwen35", 1, 1, target_layers, error));
+    TEST_ASSERT(error.find("smaller than block_count") != std::string::npos);
+
+    TEST_ASSERT(!derive_effective_target_layer_count(
+        "qwen35", 0, 0, target_layers, error));
+    TEST_ASSERT(error.find("greater than zero") != std::string::npos);
+
+    // Do not reinterpret similarly named metadata for unrelated architectures.
+    TEST_ASSERT(derive_effective_target_layer_count(
+        "laguna", 65, 1, target_layers, error));
+    TEST_ASSERT(target_layers == 65);
 }

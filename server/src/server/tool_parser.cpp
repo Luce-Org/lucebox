@@ -54,12 +54,16 @@ static std::string generate_call_id() {
 }
 
 static const char TOOL_OPEN[] = "<tool_call>";
+static const char FUNCTION_CALL_OPEN[] = "<function_call>";
 static const char FUNCTION_OPEN[] = "<function=";
+static const char BARE_FUNCTION_OPEN[] = "<function>";
 static const char FUNCTION_SPACE_OPEN[] = "<function ";
 static const char FUNCNAME_OPEN[] = "<funcname>";
 static const char TOOL_CODE_OPEN[] = "<tool_code>";
 static const char ATTRIBUTE_PARAMETER_OPEN[] = "<parameter name=";
 static const char ARG_KEY_OPEN[] = "<arg_key>";
+
+
 
 static bool valid_tool_name(const std::string & name) {
     if (name.empty() || name.size() > 64) return false;
@@ -101,7 +105,9 @@ bool find_tool_syntax_start(const std::string & text, const json & tools,
     size_t idx = text.find('<');
     while (idx != std::string::npos) {
         if (text.compare(idx, sizeof(TOOL_OPEN) - 1, TOOL_OPEN) == 0 ||
+            text.compare(idx, sizeof(FUNCTION_CALL_OPEN) - 1, FUNCTION_CALL_OPEN) == 0 ||
             text.compare(idx, sizeof(FUNCTION_OPEN) - 1, FUNCTION_OPEN) == 0 ||
+            text.compare(idx, sizeof(BARE_FUNCTION_OPEN) - 1, BARE_FUNCTION_OPEN) == 0 ||
             text.compare(idx, sizeof(FUNCTION_SPACE_OPEN) - 1,
                          FUNCTION_SPACE_OPEN) == 0 ||
             text.compare(idx, sizeof(FUNCNAME_OPEN) - 1, FUNCNAME_OPEN) == 0 ||
@@ -131,7 +137,9 @@ bool find_tool_syntax_start(const std::string & text, const json & tools,
 
 size_t tool_syntax_holdback(const json & tools) {
     // Longest fixed opener is `<parameter name=` (16 bytes).
-    size_t holdback = sizeof(ATTRIBUTE_PARAMETER_OPEN) - 2;
+    size_t holdback = std::max({sizeof(ATTRIBUTE_PARAMETER_OPEN) - 2,
+                                sizeof(FUNCTION_CALL_OPEN) - 2,
+                                sizeof(BARE_FUNCTION_OPEN) - 2});
     if (!tools.is_array()) return holdback;
     for (const auto & tool : tools) {
         const std::string name = declared_tool_name(tool);
@@ -340,6 +348,18 @@ static const std::regex & re_tool_code() {
     static std::regex r(R"(<tool_code>([\s\S]*?)</tool_code>)");
     return r;
 }
+
+static const std::regex & re_function_call() {
+    static std::regex r(R"(<function_call>([\s\S]*?)</function_call>)");
+    return r;
+}
+
+static const std::regex & re_bare_function_json() {
+    static std::regex r(R"(<function>([\s\S]*?)</function>)");
+    return r;
+}
+
+
 
 // Pattern 5: `call:<ns>?<verb>{` opener. The sentinel alternation in front
 // rejects narrative usages like "I'll call:foo{x:1}" where `call:` is glued
@@ -558,6 +578,15 @@ static bool parse_json_tool_call(const json & obj, std::string & out_name, json 
             } else {
                 return false;
             }
+        } else if (obj.contains("parameters")) {
+            if (obj["parameters"].is_object()) {
+                args = obj["parameters"];
+            } else if (obj["parameters"].is_string()) {
+                try { args = json::parse(obj["parameters"].get<std::string>()); }
+                catch (...) { return false; }
+            } else {
+                return false;
+            }
         }
     } else if (obj.contains("function") && obj["function"].is_object()) {
         const auto & fn = obj["function"];
@@ -568,6 +597,15 @@ static bool parse_json_tool_call(const json & obj, std::string & out_name, json 
                 args = fn["arguments"];
             } else if (fn["arguments"].is_string()) {
                 try { args = json::parse(fn["arguments"].get<std::string>()); }
+                catch (...) { return false; }
+            } else {
+                return false;
+            }
+        } else if (fn.contains("parameters")) {
+            if (fn["parameters"].is_object()) {
+                args = fn["parameters"];
+            } else if (fn["parameters"].is_string()) {
+                try { args = json::parse(fn["parameters"].get<std::string>()); }
                 catch (...) { return false; }
             } else {
                 return false;
@@ -1085,6 +1123,58 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
             } catch (...) {}
         }
     }
+
+    // Pattern 4b: <function_call>{JSON}</function_call>
+    {
+        auto begin = std::sregex_iterator(text.begin(), text.end(), re_function_call());
+        auto end = std::sregex_iterator();
+        for (auto it = begin; it != end; ++it) {
+            size_t pos = it->position();
+            if (overlaps(removals, pos)) continue;
+            std::string inner = (*it)[1].str();
+            // trim
+            size_t s = inner.find_first_not_of(" \t\n\r");
+            if (s != std::string::npos) inner = inner.substr(s);
+            size_t e = inner.find_last_not_of(" \t\n\r");
+            if (e != std::string::npos) inner = inner.substr(0, e + 1);
+            try {
+                json obj = json::parse(inner);
+                std::string name;
+                json args;
+                if (parse_json_tool_call(obj, name, args)) {
+                    size_t pos = it->position();
+                    add_call(name, args, pos, pos + it->length());
+                }
+            } catch (...) {}
+        }
+    }
+
+    // Pattern 4c: <function>{JSON}</function>
+    {
+        auto begin = std::sregex_iterator(text.begin(), text.end(), re_bare_function_json());
+        auto end = std::sregex_iterator();
+        for (auto it = begin; it != end; ++it) {
+            size_t pos = it->position();
+            if (overlaps(removals, pos)) continue;
+            std::string inner = (*it)[1].str();
+            // trim
+            size_t s = inner.find_first_not_of(" \t\n\r");
+            if (s != std::string::npos) inner = inner.substr(s);
+            size_t e = inner.find_last_not_of(" \t\n\r");
+            if (e != std::string::npos) inner = inner.substr(0, e + 1);
+            try {
+                json obj = json::parse(inner);
+                std::string name;
+                json args;
+                if (parse_json_tool_call(obj, name, args)) {
+                    size_t pos = it->position();
+                    add_call(name, args, pos, pos + it->length());
+                }
+            } catch (...) {}
+        }
+    }
+
+
 
     // Pattern 5: call:<ns>?<verb>{relaxed-JSON args}
     //

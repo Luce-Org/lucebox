@@ -45,8 +45,8 @@ struct DiskPrefixCachePolicy {
     DiskPrefixCacheMode mode = DiskPrefixCacheMode::Full;
     int fixed_tokens = 0;
     int auto_window = 30;
-    // When true: compose with FlowKV aged-history compression.
-    // compress=false (default) → byte-identical to pr364-base behaviour.
+    // When true, clamp FlowKV disk snapshots to its stable system prefix.
+    // False preserves the operator-selected disk-cache scope.
     bool compress = false;
 };
 
