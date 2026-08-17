@@ -54,6 +54,10 @@ GGML_BACKEND_API size_t ggml_backend_cuda_graph_invalidate_range(
 // previous value so scoped callers can restore nested overrides correctly.
 GGML_BACKEND_API bool ggml_backend_cuda_set_graphs_disabled_override(bool disabled);
 
+// Number of launches of the dense F32 dim-0 concat-transpose specialization.
+// Intended for focused correctness tests of the dispatch guard.
+GGML_BACKEND_API size_t ggml_backend_cuda_get_concat_transpose_f32_count(void);
+
 // device buffer
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device);
 

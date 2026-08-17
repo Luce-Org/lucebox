@@ -197,7 +197,9 @@ function formatMessages(messagesStr) {
 
 function update(data) {
   const badge = document.getElementById('phase-badge');
-  badge.textContent = data.phase;
+  badge.textContent = data.active_requests
+    ? data.phase + ' (' + data.active_requests + ' active)'
+    : data.phase;
   badge.className = 'badge badge-' + data.phase;
   document.getElementById('total-req').textContent = data.total_requests;
 

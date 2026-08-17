@@ -14,6 +14,7 @@
 #pragma once
 
 #include "socket_handle.h"
+#include "client_send_buffer.h"
 #include "common/model_backend.h"
 #include "tokenizer.h"
 #include "chat_template.h"
@@ -31,9 +32,11 @@
 #include "model_card.h"
 #include "adaptive_keep_ratio.h"
 #include "server_status.h"
+#include "sse_emitter.h"
 #include <nlohmann/json.hpp>
 
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -56,7 +59,6 @@ using json = nlohmann::json;
 
 // ─── Forward declarations ───────────────────────────────────────────────
 struct ServerJob;
-class SseEmitter;
 
 namespace http_detail {
 // Non-consuming peer-state probe used by the client-thread job monitor.
@@ -73,6 +75,16 @@ PeerSocketState inspect_peer_socket(SocketHandle fd);
 // `partial_line` carries an unterminated line across transport chunks.
 bool sse_chunk_has_done(std::string & partial_line,
                         const char * data, size_t size);
+
+// Advance one heartbeat on an already-nonblocking job socket without waiting
+// for writability. `offset` preserves a partial write across monitor ticks.
+// Public for the model-free socket regression test.
+enum class HeartbeatSendResult {
+    Complete,
+    Retry,
+    Disconnected,
+};
+HeartbeatSendResult try_send_sse_heartbeat(SocketHandle fd, size_t & offset);
 }
 
 // ─── Server configuration ───────────────────────────────────────────────
@@ -181,6 +193,9 @@ struct ServerConfig {
     // server_main after CLI parse.
     std::string target_device;
     std::string draft_device;
+    // Idle-to-busy batching window. It is ignored by single-slot engines and
+    // never delays an already decoding request.
+    int admission_coalesce_ms = 20;
 
     // PFlash (speculative prefill compression)
     enum class PflashMode { OFF, AUTO, ALWAYS };
@@ -232,6 +247,23 @@ struct ServerConfig {
     // remote predictors may overlap. DS4 verifies the exact canonical call.
     SemanticToolPredictorConfig semantic_tool_predictor;
 };
+
+namespace http_detail {
+
+inline constexpr int kFlowKvInertMinTokens = 512;
+
+// Small policy helpers kept outside HttpServer so model-free unit tests use
+// the same decisions as the request path.
+int flowkv_activation_threshold(const ServerConfig & config);
+bool flowkv_should_activate(const ServerConfig & config,
+                            int aged_token_estimate);
+float resolve_pflash_keep_ratio(float configured_ratio,
+                                const std::string & session_id,
+                                const HttpServerSessions & sessions);
+bool should_clamp_flowkv_disk_cache(
+    bool flowkv, const DiskPrefixCachePolicy & policy);
+
+}  // namespace http_detail
 
 // ─── Parsed request ─────────────────────────────────────────────────────
 
@@ -364,6 +396,7 @@ private:
     struct PreparedPrompt {
         std::vector<int32_t> tokens;
         bool compressed = false;
+        bool flowkv = false;
         int full_cache_served_tokens = -1;
         int full_cache_hit_slot = -1;
         int full_cache_hit_len = 0;
@@ -429,6 +462,36 @@ private:
         ServerJob * job, const ParsedRequest & req, SseEmitter & emitter,
         GenerationOutputState & output, DaemonIO & io);
 
+    // Worker thread, concurrent mode (the backend exposes a SeqEngine):
+    // iteration-level scheduler. Admission is claim-only; this baseline
+    // drains its pending prefill between decode iterations, then advances
+    // active slots together in one batched step.
+    void scheduler_loop(SeqEngine & engine);
+
+    // Non-blocking dequeue used for admission polling between decode steps.
+    ServerJob * try_dequeue();
+    // Bounded wait used only during an idle-to-busy admission window.
+    ServerJob * dequeue_for(
+        std::chrono::steady_clock::duration timeout);
+
+    // Concurrent-scheduler token delivery and shared response construction.
+    // A send buffer keeps slow clients off the shared decode loop.
+    bool deliver_generation_token(
+        ServerJob * job, const ParsedRequest & req, SseEmitter & emitter,
+        int32_t token, int & completion_tokens,
+        ClientSendBuffer & send_buffer);
+    void send_nonstream_response(
+        const ParsedRequest & req, SocketHandle fd, SseEmitter & emitter,
+        const std::vector<int32_t> & gen_tokens, int n_gen_cap,
+        bool budget_forced_close, bool degenerate_decode_close,
+        const GenTimings & gen_timings,
+        ClientSendBuffer * send_buffer = nullptr);
+    std::string format_http_response(
+        int status, const std::string & content_type,
+        const std::string & body);
+    static std::array<std::string, 2> sse_error_close_chunks(
+        const std::string & message);
+
     // Parse HTTP request from socket.
     struct HttpRequest {
         std::string method;
@@ -467,7 +530,8 @@ private:
     bool send_all(SocketHandle fd, const void * data, size_t len);
     bool send_job_bytes(ServerJob * job, const void * data, size_t len);
     void start_job_stream(ServerJob * job);
-    void stop_job_stream(ServerJob * job);
+    void stop_job_stream(ServerJob * job,
+                         ClientSendBuffer * pending_output = nullptr);
     void maybe_send_job_heartbeat(ServerJob * job, bool peer_read_closed);
 
     // Job queue.
@@ -516,7 +580,7 @@ private:
     std::vector<std::vector<int32_t>> recent_tool_prefixes_;
 
     // FlowKV freeze-history: per-message compression cache.
-    // Key: SHA-1 hash of the drafter-token slice for an aged message.
+    // Key: SHA-1 hash of the drafter-token slice and selected keep ratio.
     // Value: compressed content text (output of drafter_tokenizer_->decode).
     // Bounded to kFrozenCacheMax entries; cleared on overflow (simple eviction).
     static constexpr size_t kFrozenCacheMax = 256;
@@ -564,9 +628,19 @@ struct ServerJob {
     std::mutex    write_mu;
     bool          stream_ready = false;
     bool          read_close_probe_sent = false;
+    size_t        heartbeat_offset = 0;
     std::chrono::steady_clock::time_point last_stream_write{};
     std::atomic<bool> client_disconnected{false};
     ServerJob *   next = nullptr;
+
+    // Concurrent-scheduler state that survives a pool-full admission retry.
+    // The classic worker leaves these fields untouched.
+    bool          announced = false;
+    bool          sse_started = false;
+    // First concurrent-scheduler attempt; retained across busy deferrals so
+    // server-side prefill/elapsed telemetry does not erase queueing delay.
+    std::chrono::steady_clock::time_point parallel_started_at{};
+    std::unique_ptr<SseEmitter> emitter;
 };
 
 // ─── Parse session_id from a chat-completion JSON body ──────────────────

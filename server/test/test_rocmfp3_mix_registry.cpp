@@ -9,8 +9,11 @@
 // the register_host allocations) fails the leak assertion below.
 
 #include "ds4_test_gpu_runtime.h"
+#include "CppUnitTestFramework.hpp"
 #include "ggml-cuda.h"
 #include "rocmfp3_mix.cuh"
+using CppUnitTestFramework::CommonFixture;
+#undef CHECK
 
 #include <atomic>
 #include <chrono>
@@ -25,7 +28,20 @@ static int g_fails = 0;
         if (!(cond)) { std::fprintf(stderr, "FAIL: %s\n", (msg)); ++g_fails; }  \
     } while (0)
 
-int main() {
+namespace {
+struct Rocmfp3MixRegistryFixture : CommonFixture {
+    using CommonFixture::CommonFixture;
+};
+}
+
+TEST_CASE(Rocmfp3MixRegistryFixture, registry_lifecycle) {
+    int device_count = 0;
+    const cudaError_t device_status = cudaGetDeviceCount(&device_count);
+    if (device_status == cudaErrorNoDevice || device_count == 0) {
+        SKIP("no CUDA/HIP device available");
+    }
+    REQUIRE_TRUE(device_status == cudaSuccess);
+
     const int    E    = 8, out = 64, in = 64;
     const size_t expert_bytes = (size_t) out * (in / 32) * 14;
     const size_t nb02 = 4096;  // includes alignment padding after each payload
@@ -152,5 +168,5 @@ int main() {
 
     std::fprintf(stderr, g_fails ? "REGISTRY TEST FAILED (%d)\n"
                                  : "REGISTRY TEST OK\n", g_fails);
-    return g_fails ? 1 : 0;
+    REQUIRE_TRUE(g_fails == 0);
 }

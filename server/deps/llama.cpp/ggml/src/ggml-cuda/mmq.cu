@@ -629,6 +629,11 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
                     return ne11 <= 128;
                 case GGML_TYPE_Q6_K:
                     return ne11 <= (GGML_CUDA_CC_IS_RDNA3_0(cc) ? 128 : 256);
+                // Wide Q4_K batches on gfx1151 favor dequantization +
+                // hipBLAS; keep MMQ for decode/small-prefill shapes and for
+                // the unmeasured RDNA 3.0 family.
+                case GGML_TYPE_Q4_K:
+                    return !GGML_CUDA_CC_IS_RDNA3_5(cc) || ne11 <= 256;
                 case GGML_TYPE_IQ2_XS:
                 case GGML_TYPE_IQ2_S:
                     return GGML_CUDA_CC_IS_RDNA3_5(cc) || ne11 <= 128;

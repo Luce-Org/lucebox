@@ -62,7 +62,7 @@ if(_discover_output)
 
         file(APPEND "${CTEST_FILE}"
             "add_test([==[${_ctest_name}]==] [==[${TEST_EXECUTABLE}]==] --exact [==[${_test_keyword}]==])\n"
-            "set_tests_properties([==[${_ctest_name}]==] PROPERTIES WORKING_DIRECTORY [==[${TEST_WORKING_DIR}]==])\n")
+            "set_tests_properties([==[${_ctest_name}]==] PROPERTIES WORKING_DIRECTORY [==[${TEST_WORKING_DIR}]==] SKIP_RETURN_CODE 77)\n")
         list(APPEND _discovered_ctest_names "${_ctest_name}")
     endforeach()
 endif()

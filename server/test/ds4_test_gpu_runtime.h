@@ -14,6 +14,9 @@
 
 #if defined(GGML_USE_HIP)
 #include "vendors/hip.h"
+#ifndef cudaErrorNoDevice
+#define cudaErrorNoDevice hipErrorNoDevice
+#endif
 #elif defined(GGML_USE_MUSA)
 #include "vendors/musa.h"
 #else

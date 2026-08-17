@@ -1,3 +1,5 @@
+#include "CppUnitTestFramework.hpp"
+
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
@@ -9,17 +11,24 @@
 #include <cstdlib>
 #include <vector>
 
-int main(int argc, char ** argv) {
-    const int n_tokens = argc > 1 ? std::max(1, std::atoi(argv[1])) : 64;
-    const bool initialize_peer = argc <= 2 || std::atoi(argv[2]) != 0;
-    const int device = argc > 3 ? std::max(0, std::atoi(argv[3])) : 0;
+using namespace CppUnitTestFramework;
+
+namespace {
+struct GgmlRmsnormBatchFixture : CommonFixture {
+    using CommonFixture::CommonFixture;
+};
+}
+
+TEST_CASE(GgmlRmsnormBatchFixture, rmsnorm_batch) {
+    constexpr int n_tokens = 64;
+    constexpr bool initialize_peer = true;
+    constexpr int device = 0;
     constexpr int n_embd = 4096;
     constexpr float eps = 1.0e-6f;
 
     ggml_backend_t backend = ggml_backend_cuda_init(device);
     if (!backend) {
-        std::fprintf(stderr, "failed to initialize GPU %d\n", device);
-        return 2;
+        SKIP("CUDA/HIP backend unavailable");
     }
 
     // Leave a second HIP device initialized, matching the heterogeneous
@@ -33,7 +42,11 @@ int main(int argc, char ** argv) {
     params.mem_size = 2 * 1024 * 1024;
     params.no_alloc = true;
     ggml_context * ctx = ggml_init(params);
-    if (!ctx) return 3;
+    if (!ctx) {
+        if (peer) ggml_backend_free(peer);
+        ggml_backend_free(backend);
+        REQUIRE(ctx != nullptr);
+    }
 
     ggml_tensor * input = ggml_new_tensor_2d(
         ctx, GGML_TYPE_F32, n_embd, n_tokens);
@@ -50,8 +63,12 @@ int main(int argc, char ** argv) {
     ggml_gallocr_t alloc = ggml_gallocr_new(
         ggml_backend_get_default_buffer_type(backend));
     if (!alloc || !ggml_gallocr_alloc_graph(alloc, graph)) {
-        std::fprintf(stderr, "graph allocation failed\n");
-        return 4;
+        if (alloc) ggml_gallocr_free(alloc);
+        ggml_free(ctx);
+        if (peer) ggml_backend_free(peer);
+        ggml_backend_free(backend);
+        REQUIRE(alloc != nullptr);
+        REQUIRE(false);
     }
 
     std::vector<float> input_data((size_t)n_embd * n_tokens);
@@ -70,16 +87,19 @@ int main(int argc, char ** argv) {
     const enum ggml_status status = ggml_backend_graph_compute(backend, graph);
     if (status != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "graph compute failed: %d\n", (int)status);
-        return 5;
     }
 
     std::vector<float> output_data(input_data.size());
-    ggml_backend_tensor_get(output, output_data.data(), 0,
-                            output_data.size() * sizeof(float));
+    if (status == GGML_STATUS_SUCCESS) {
+        ggml_backend_tensor_get(output, output_data.data(), 0,
+                                output_data.size() * sizeof(float));
+    }
+    bool finite = status == GGML_STATUS_SUCCESS;
     for (float value : output_data) {
         if (!std::isfinite(value)) {
             std::fprintf(stderr, "non-finite output\n");
-            return 6;
+            finite = false;
+            break;
         }
     }
     std::printf("PASS device=%d peer=%s tokens=%d embd=%d\n",
@@ -89,5 +109,5 @@ int main(int argc, char ** argv) {
     ggml_free(ctx);
     if (peer) ggml_backend_free(peer);
     ggml_backend_free(backend);
-    return 0;
+    REQUIRE(finite);
 }

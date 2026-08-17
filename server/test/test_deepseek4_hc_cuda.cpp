@@ -27,6 +27,8 @@
 // Written in CUDA spellings; the hip_compat/ shim maps them onto HIP exactly as
 // the kernel and the rms_norm_hip / flashprefill tests do.
 
+#include "CppUnitTestFramework.hpp"
+
 #include <cstdio>
 #include <cmath>
 #include <vector>
@@ -37,18 +39,30 @@
 #include "deepseek4/deepseek4_hc_cuda.h"
 
 using dflash::common::deepseek4_cuda_hc_pre;
+using namespace CppUnitTestFramework;
 
 #define CK(call) do { \
     cudaError_t e = (call); \
     if (e != cudaSuccess) { \
         std::fprintf(stderr, "HIP error %s at %s:%d: %s\n", #call, __FILE__, __LINE__, cudaGetErrorString(e)); \
-        return 1; \
+        REQUIRE(e == cudaSuccess); \
     } \
 } while (0)
 
 static inline float sigmoidf(float x) { return 1.0f / (1.0f + std::exp(-x)); }
 
-int main() {
+namespace {
+struct Deepseek4HcCudaFixture : CommonFixture {
+    using CommonFixture::CommonFixture;
+};
+}
+
+TEST_CASE(Deepseek4HcCudaFixture, hc_pre_cpu_parity) {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+        SKIP("CUDA/HIP device unavailable");
+    }
+
     // DS4-Flash HC config: n_hc = 4 (mix_dim = 2*4 + 4*4 = 24). NOTE: the kernel's
     // d_mix is fixed at kMixDim=24 while deepseek4_cuda_hc_pre still admits n_hc<=8
     // (mix_dim up to 80), so n_hc>4 overflows d_mix in the kernel today -- a latent
@@ -97,7 +111,7 @@ int main() {
                                working.data(), post.data(), comb.data())) {
         std::fprintf(stderr, "[ds4-hc-test] FAIL: deepseek4_cuda_hc_pre returned false\n");
         cudaFree(d_fn);
-        return 1;
+        REQUIRE(false);
     }
     cudaFree(d_fn);
 
@@ -194,8 +208,7 @@ int main() {
     const float TOL = 1e-4f;
     if (max_abs > TOL) {
         std::fprintf(stderr, "[ds4-hc-test] FAIL: max_abs_diff %.3e exceeds tol %.3e\n", max_abs, TOL);
-        return 1;
     }
     std::printf("[ds4-hc-test] PASS\n");
-    return 0;
+    REQUIRE(max_abs <= TOL);
 }

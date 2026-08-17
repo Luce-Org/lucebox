@@ -18,6 +18,8 @@
 #include <vector>
 #include <random>
 #include <cuda_runtime.h>
+#include "CppUnitTestFramework.hpp"
+using CppUnitTestFramework::CommonFixture;
 
 extern "C" void launch_rms_norm_mul_w_f32(
     const float * src, const float * w, float * dst,
@@ -28,14 +30,30 @@ extern "C" void launch_rms_norm_mul_w_f32(
     cudaError_t e = (call); \
     if (e != cudaSuccess) { \
         std::fprintf(stderr, "HIP error %s at %s:%d: %s\n", #call, __FILE__, __LINE__, cudaGetErrorString(e)); \
-        return 1; \
+        REQUIRE_TRUE(false); \
     } \
 } while (0)
 
-int main() {
+namespace {
+struct RmsNormHipFixture : CommonFixture {
+    using CommonFixture::CommonFixture;
+};
+}
+
+TEST_CASE(RmsNormHipFixture, rms_norm_matches_cpu) {
     constexpr int N_TOK  = 64;
     constexpr int HIDDEN = 2048;   // > block(256): forces the strided load loop
     constexpr float EPS  = 1e-5f;
+
+    int device_count = 0;
+    const cudaError_t device_status = cudaGetDeviceCount(&device_count);
+    if (device_status == cudaErrorNoDevice) {
+        SKIP("no HIP device available");
+    }
+    CK(device_status);
+    if (device_count == 0) {
+        SKIP("no HIP device available");
+    }
 
     cudaDeviceProp prop;
     CK(cudaGetDeviceProperties(&prop, 0));
@@ -89,8 +107,7 @@ int main() {
     const float TOL = 1e-4f;
     if (max_abs > TOL) {
         std::fprintf(stderr, "[rmsnorm-test] FAIL: max_abs_diff %.3e exceeds tol %.3e\n", max_abs, TOL);
-        return 1;
+        REQUIRE_TRUE(false);
     }
     std::printf("[rmsnorm-test] PASS\n");
-    return 0;
 }

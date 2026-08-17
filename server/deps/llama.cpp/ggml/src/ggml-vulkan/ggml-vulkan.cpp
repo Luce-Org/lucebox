@@ -13141,6 +13141,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
     case GGML_OP_SET_ROWS:
+        GGML_ASSERT(ggml_get_op_params_i32(node, 0) == 0);
         ggml_vk_set_rows(ctx, compute_ctx, src0, src1, node);
 
         break;
@@ -15537,6 +15538,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
         case GGML_OP_SET_ROWS:
             {
+                if (ggml_get_op_params_i32(op, 0) != 0) {
+                    return false;
+                }
                 switch (op->type) {
                     case GGML_TYPE_F32:
                     case GGML_TYPE_F16:
@@ -15776,6 +15780,11 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             return true; // all inputs are contiguous, see ggml.c
         case GGML_OP_GATED_DELTA_NET:
             {
+                // The Vulkan kernel addresses state by compact sequence row
+                // and does not consume the physical-slot mapping in src[8].
+                if (op->src[8] != nullptr) {
+                    return false;
+                }
                 const uint32_t S_v = op->src[2]->ne[0];
                 if (S_v != 32 && S_v != 64 && S_v != 128) {
                     return false;

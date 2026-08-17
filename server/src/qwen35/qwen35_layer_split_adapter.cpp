@@ -12,6 +12,7 @@
 #include "common/snapshot_backend.h"
 #include "qwen35/layer_split_forward.h"
 #include "qwen35/qwen35_layer_split_dflash_target.h"
+#include "qwen35/prefill_helpers.h"
 #include "qwen3/qwen3_drafter.h"
 #include "qwen3/qwen3_kvflash_scorer.h"
 #include "kv_quant.h"
@@ -534,10 +535,8 @@ bool Qwen35LayerSplitAdapter::prefill(const std::vector<int32_t> & prompt,
             base_pos, (size_t)base_pos + prompt.size(), cfg_.device.max_ctx);
         return false;
     }
-    int ubatch = cfg_.chunk > 0 ? cfg_.chunk : 512;
-    if (const char * s = std::getenv("DFLASH27B_PREFILL_UBATCH")) {
-        ubatch = std::max(1, std::atoi(s));
-    }
+    const int ubatch = qwen35_prefill_ubatch(
+        cfg_.chunk > 0 ? cfg_.chunk : 512);
     if (use_mixed_target_split()) {
         const bool ok = run_qwen35_mixed_layer_split_forward(
             shards_, remote_target_shard_, shards_.front().weights,

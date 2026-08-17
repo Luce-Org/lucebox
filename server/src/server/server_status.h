@@ -10,6 +10,7 @@
 #include <chrono>
 #include <functional>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -35,6 +36,7 @@ enum class InferencePhase {
     IDLE,
     PREFILL,
     DECODE,
+    MIXED,
 };
 
 static inline const char * phase_name(InferencePhase p) {
@@ -42,6 +44,7 @@ static inline const char * phase_name(InferencePhase p) {
     case InferencePhase::IDLE:    return "idle";
     case InferencePhase::PREFILL: return "prefill";
     case InferencePhase::DECODE:  return "decode";
+    case InferencePhase::MIXED:   return "mixed";
     default:                      return "unknown";
     }
 }
@@ -67,6 +70,7 @@ public:
                      bool is_stream, const RequestInfo & info) {
         std::lock_guard<std::mutex> lk(mu_);
         phase_ = InferencePhase::PREFILL;
+        active_requests_ = 0;
         prompt_excerpt_ = prompt_excerpt;
         prompt_tokens_ = prompt_tokens;
         completion_tokens_ = 0;
@@ -109,6 +113,27 @@ public:
     void set_idle() {
         std::lock_guard<std::mutex> lk(mu_);
         phase_ = InferencePhase::IDLE;
+        active_requests_ = 0;
+        prompt_excerpt_.clear();
+        draft_tokens_.clear();
+    }
+
+    // Concurrent serving intentionally exposes only aggregate live state.
+    // A single request record/token feed cannot represent multiple slots
+    // without mixing unrelated requests.
+    void set_concurrent_requests(int n, int prefilling) {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (n < 0 || prefilling < 0 || prefilling > n) {
+            throw std::invalid_argument("invalid concurrent request counts");
+        }
+        if (active_requests_ == 0 && n > 0) {
+            started_at_ = std::chrono::steady_clock::now();
+        }
+        active_requests_ = n;
+        phase_ = n == 0 ? InferencePhase::IDLE
+               : prefilling == n ? InferencePhase::PREFILL
+               : prefilling == 0 ? InferencePhase::DECODE
+                                 : InferencePhase::MIXED;
         prompt_excerpt_.clear();
         draft_tokens_.clear();
     }
@@ -136,6 +161,7 @@ public:
         RequestInfo info;
         bool cache_hit = false, pflash = false, spec_decode = false;
         std::string messages_json;
+        int active_requests = 0;
 
         {
             std::lock_guard<std::mutex> lk(mu_);
@@ -152,6 +178,7 @@ public:
             pflash = pflash_;
             spec_decode = spec_decode_;
             messages_json = messages_json_;
+            active_requests = active_requests_;
             if (phase != InferencePhase::IDLE) {
                 elapsed_s = std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - started_at_).count();
@@ -161,8 +188,9 @@ public:
         json j;
         j["phase"] = phase_name(phase);
         j["total_requests"] = total_requests;
+        j["active_requests"] = active_requests;
 
-        if (phase != InferencePhase::IDLE) {
+        if (phase != InferencePhase::IDLE && active_requests == 0) {
             j["current"] = {
                 {"prompt_excerpt", prompt_excerpt},
                 {"prompt_tokens", prompt_tokens},
@@ -226,6 +254,7 @@ private:
     bool pflash_ = false;
     bool spec_decode_ = false;
     std::string messages_json_;
+    int active_requests_ = 0;
 
     // History.
     std::vector<PerfRecord> perf_history_;

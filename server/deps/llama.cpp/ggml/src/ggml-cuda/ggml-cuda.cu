@@ -3987,6 +3987,9 @@ static bool ggml_cuda_should_fuse_rope_set_rows(const ggml_tensor * rope,
     if (rope->op != GGML_OP_ROPE || view->op != GGML_OP_VIEW || set_rows->op != GGML_OP_SET_ROWS) {
         return false;
     }
+    if (ggml_get_op_params_i32(set_rows, 0) != 0) {
+        return false;
+    }
     // ne3 not tested
     if (rope->src[0]->ne[3] != 1) {
         return false;
@@ -5986,6 +5989,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             } break;
         case GGML_OP_SET_ROWS:
             {
+                if (ggml_get_op_params_i32(op, 0) != 0 &&
+                    op->type != GGML_TYPE_F32 &&
+                    op->type != GGML_TYPE_F16 &&
+                    op->type != GGML_TYPE_BF16) {
+                    return false;
+                }
                 return (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
                        op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_Q4_1 || op->type == GGML_TYPE_Q5_0 ||
                        op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q8_0 || op->type == GGML_TYPE_IQ4_NL ||

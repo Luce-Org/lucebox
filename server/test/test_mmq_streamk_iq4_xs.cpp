@@ -19,6 +19,8 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml-cuda.h"
+#include "CppUnitTestFramework.hpp"
+using CppUnitTestFramework::CommonFixture;
 
 #include <cmath>
 #include <cstdint>
@@ -198,11 +200,16 @@ bool run_case(ggml_backend_t cpu, ggml_backend_t cuda, const Shape & shape, uint
 
 } // namespace
 
-int main() {
+namespace {
+struct MmqStreamkIq4XsFixture : CommonFixture {
+    using CommonFixture::CommonFixture;
+};
+}
+
+TEST_CASE(MmqStreamkIq4XsFixture, iq4_xs_streamk_correctness) {
     const int device_count = ggml_backend_cuda_get_device_count();
     if (device_count == 0) {
-        std::printf("SKIP: no CUDA device available\n");
-        return 0;
+        SKIP("no CUDA device available");
     }
 
     char description[256] = {};
@@ -220,7 +227,7 @@ int main() {
         if (cuda != nullptr) {
             ggml_backend_free(cuda);
         }
-        return 1;
+        REQUIRE_TRUE(false);
     }
     ggml_backend_cpu_set_n_threads(cpu, 4);
 
@@ -246,10 +253,9 @@ int main() {
     if (failures != 0) {
         std::fprintf(stderr, "FAILED: %d/%zu IQ4_XS MMQ cases\n",
             failures, sizeof(shapes) / sizeof(shapes[0]));
-        return 1;
+        REQUIRE_TRUE(false);
     }
     std::printf("ALL PASS: %zu/%zu IQ4_XS MMQ cases\n",
         sizeof(shapes) / sizeof(shapes[0]),
         sizeof(shapes) / sizeof(shapes[0]));
-    return 0;
 }

@@ -1,10 +1,11 @@
-// Self-contained HIP kernel correctness smoke for the lucebox3 Strix Halo iGPU
-// (Radeon 8060S, gfx1151). Compiled and run by the gpu-tests-amd CI job to
+// Self-contained HIP kernel correctness smoke for the AMD GPUs on lucebox3.
+// Compiled and run once for gfx1201 and once for gfx1151 by gpu-tests-amd to
 // prove the ROCm/HIP compute path actually executes on AMD hardware (GitHub
 // hosted runners have no GPU). No model weights, deterministic, fast.
 #include <hip/hip_runtime.h>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 __global__ void vadd(const float* a, const float* b, float* c, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -15,10 +16,28 @@ __global__ void vadd(const float* a, const float* b, float* c, int n) {
     fprintf(stderr, "HIP error at line %d: %s\n", __LINE__, hipGetErrorString(e)); \
     return 2; } } while (0)
 
-int main() {
+static bool arch_matches(const char* actual, const char* expected) {
+    const size_t expected_len = std::strlen(expected);
+    return std::strncmp(actual, expected, expected_len) == 0 &&
+           (actual[expected_len] == '\0' || actual[expected_len] == ':');
+}
+
+int main(int argc, char** argv) {
+    if (argc != 2) {
+        std::fprintf(stderr, "usage: %s <expected-gfx-arch>\n", argv[0]);
+        return 2;
+    }
+
     hipDeviceProp_t p;
     CK(hipGetDeviceProperties(&p, 0));
     printf("HIP device 0: %s (%s, %d CUs)\n", p.name, p.gcnArchName, p.multiProcessorCount);
+    if (!arch_matches(p.gcnArchName, argv[1])) {
+        std::fprintf(stderr,
+                     "HIP device selection mismatch: expected %s after "
+                     "HIP_VISIBLE_DEVICES filtering, got %s (%s)\n",
+                     argv[1], p.gcnArchName, p.name);
+        return 3;
+    }
 
     const int n = 1 << 20;
     const size_t sz = n * sizeof(float);

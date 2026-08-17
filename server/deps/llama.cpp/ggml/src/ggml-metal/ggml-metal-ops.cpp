@@ -355,6 +355,7 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             } break;
         case GGML_OP_SET_ROWS:
             {
+                GGML_ASSERT(ggml_get_op_params_i32(node, 0) == 0);
                 n_fuse = ggml_metal_op_set_rows(ctx, idx);
             } break;
         case GGML_OP_DIAG:

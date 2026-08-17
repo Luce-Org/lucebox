@@ -22,6 +22,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "sampler.h"
+#include "concurrency/seq_engine.h"
 #include "placement/draft_residency.h"
 
 namespace dflash::common {
@@ -325,6 +326,19 @@ struct ModelBackend {
     virtual GenerateResult generate_impl(const GenerateRequest & req,
                                          const DaemonIO & io) = 0;
 
+    // ── Concurrent serving ───────────────────────────────────────────
+    // Backends that can hold several live sequences at once and execute a
+    // batched decode over paged KV expose them as decode slots through a
+    // SeqEngine (common/concurrency/seq_engine.h). Any additional
+    // per-sequence model state is an implementation detail of that engine.
+    // nullptr — the
+    // default — means this backend serves one request at a time and the
+    // server drives it through generate().
+    //
+    // The engine is owned by the backend; the returned pointer is borrowed
+    // and stays valid until shutdown().
+    virtual SeqEngine * seq_engine() { return nullptr; }
+
     // ── Snapshots ────────────────────────────────────────────────────
     // With right-sized CPU-resident snapshots, each slot costs only
     // ~(cur_pos × 5 KB) of system RAM, so we can afford many slots.
@@ -422,6 +436,20 @@ struct ModelBackend {
 
     // Typed compress API (preferred for in-process callers).
     virtual CompressResult compress(const CompressRequest & req);
+
+    // Compress several independent prompt spans under one backend residency
+    // window. The default preserves existing behavior; backends that park
+    // large target/draft weights can override this to park once for the whole
+    // batch instead of once per span.
+    virtual std::vector<CompressResult> compress_batch(
+        const std::vector<CompressRequest> & requests) {
+        std::vector<CompressResult> results;
+        results.reserve(requests.size());
+        for (const auto & request : requests) {
+            results.push_back(compress(request));
+        }
+        return results;
+    }
 
     // Legacy string-based compress (for daemon_loop stdin protocol).
     // `line` is the full "compress ..." command line.

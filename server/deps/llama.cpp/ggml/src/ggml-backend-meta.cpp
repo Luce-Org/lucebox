@@ -817,6 +817,10 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         for (int i = 0; i < 5; i++) {
             GGML_ASSERT(src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         }
+        GGML_ASSERT(tensor->src[5] == nullptr ||
+                    src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        GGML_ASSERT(tensor->src[6] == nullptr ||
+                    src_ss[6].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         return src_ss[0];
     };
 
@@ -835,7 +839,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     auto handle_gated_delta_net = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
                 src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
-                src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+                (tensor->src[8] == nullptr || src_ss[8].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED)) {
             return src_ss[0];
         }
         GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1);
@@ -846,6 +851,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         // state shape is (S_v*S_v*H, K, n_seqs); the heads dim is nested inside axis 0,
         // so a head-aligned split on the input cache reshapes to axis 0 here (not axis 2).
         GGML_ASSERT(src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_2 || src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_1 || src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_0);
+        GGML_ASSERT(tensor->src[8] == nullptr ||
+                    src_ss[8].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         return {GGML_BACKEND_SPLIT_AXIS_0, {0}, 1, {1}};
     };
 

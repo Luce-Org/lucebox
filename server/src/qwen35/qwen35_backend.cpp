@@ -1,4 +1,5 @@
 #include "qwen35_backend.h"
+#include "concurrency/qwen35_seq_engine.h"
 #include "common/chain_rollback_policy.h"
 #include "placement/skip_park_guard.h"
 #include "qwen35_dflash_target.h"
@@ -8,6 +9,7 @@
 #include "common/dflash_draft_graph.h"
 #include "peer_access.h"
 #include "attn_masks.h"
+#include "prefill_helpers.h"
 #include "common/sampler.h"
 #ifdef DFLASH27B_HAVE_GPU_SAMPLER
 #include "common/geometric_sampler_cuda.h"
@@ -89,6 +91,35 @@ static int env_int_or_default(const char * name, int fallback) {
     return fallback;
 }
 
+static void configure_concurrent_hipblaslt_default(
+        const Qwen35Config & cfg) {
+#if (defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)) && !defined(_WIN32)
+    if (!cfg.paged_attention || cfg.max_concurrency <= 1 ||
+        std::getenv("ROCBLAS_USE_HIPBLASLT") != nullptr) {
+        return;
+    }
+
+    cudaDeviceProp prop{};
+    if (cudaGetDeviceProperties(&prop, cfg.device.gpu) != cudaSuccess ||
+        std::strncmp(prop.gcnArchName, "gfx1151", 7) != 0) {
+        return;
+    }
+
+    // The concurrent Qwen workload spends most of its time in wide Q4_K
+    // dequantize + GEMM steps. ROCm 7.2's hipBLASLt route is consistently
+    // faster for those gfx1151 shapes. Preserve an explicit environment value
+    // so ROCBLAS_USE_HIPBLASLT=0 remains an opt-out.
+    if (::setenv("ROCBLAS_USE_HIPBLASLT", "1", 0) == 0) {
+        std::fprintf(
+            stderr,
+            "[qwen35] gfx1151 concurrent mode: enabled rocBLAS hipBLASLt "
+            "(set ROCBLAS_USE_HIPBLASLT=0 to disable)\n");
+    }
+#else
+    (void)cfg;
+#endif
+}
+
 static int dflash_min_tokens_floor() {
     static const int value = env_int_or_default("DFLASH_MIN_TOKENS", 0);
     return value;
@@ -134,6 +165,41 @@ static FILE * open_dflash_floor_log() {
     return out;
 #endif
 }
+
+// Persistent concurrent-cache bytes that do not scale with the physical
+// paged pool. The estimate mirrors create_target_cache_partial(): recurrent
+// state for N slots, target features, paged metadata, Q capture, and the
+// dead-row scratch block. Prefill reads the pool directly, so there is no
+// staging K/V or staging recurrent slab to reserve.
+static int64_t concurrent_fixed_cache_bytes(
+        const TargetWeights & w, int max_ctx, int n_slots,
+        int64_t kv_bytes_per_token) {
+    const int64_t n_full_attn =
+        w.n_layer / w.full_attention_interval;
+    const int64_t n_delta = w.n_layer - n_full_attn;
+    const int64_t head_v_dim = w.ssm_d_inner / w.ssm_dt_rank;
+    const int64_t conv_ch =
+        w.ssm_d_inner + 2LL * w.ssm_n_group * w.ssm_d_state;
+    const int64_t state_per_layer =
+        (head_v_dim * head_v_dim * w.ssm_dt_rank +
+         (int64_t)(w.ssm_d_conv - 1) * conv_ch) *
+        (int64_t)sizeof(float);
+    const int64_t recurrent =
+        state_per_layer * n_delta * (int64_t)n_slots;
+    const int64_t target_feat =
+        (int64_t)w.n_capture_layers * w.n_embd *
+        std::min(max_ctx, 4096) * (int64_t)sizeof(uint16_t);
+    const int64_t q_capture =
+        (int64_t)w.n_embd_head_k * w.n_head * n_full_attn *
+        (int64_t)sizeof(float);
+    const int64_t paged_metadata =
+        ((int64_t)paged_block_count(max_ctx) * n_slots + n_slots) *
+        (int64_t)sizeof(int32_t);
+    const int64_t scratch =
+        kv_bytes_per_token * PAGED_BLOCK_SIZE;
+    return recurrent + target_feat + q_capture +
+           paged_metadata + scratch;
+}
 }  // namespace
 
 #define IS_EOS_TOK(tok, w)                                         \
@@ -176,6 +242,8 @@ KvFlashAutoBudget Qwen35Backend::make_kvflash_budget(const TargetWeights & w,
 // ── init() ──────────────────────────────────────────────────────────────
 
 bool Qwen35Backend::init() {
+    configure_concurrent_hipblaslt_default(cfg_);
+
     const bool use_remote_draft = cfg_.remote_draft.enabled();
     const bool tensor_parallel = cfg_.device.is_tensor_parallel();
     split_gpus_ = !use_remote_draft && cfg_.draft_path &&
@@ -307,12 +375,82 @@ bool Qwen35Backend::init() {
     }
     // Paged mode sizes the KV cache to whole blocks; otherwise KVFlash
     // decides the allocation (0 = full max_ctx).
-    const int ctx_alloc = cfg_.paged_attention
-        ? paged_token_capacity(cfg_.device.max_ctx)
-        : kvflash_tokens_;
+    const int n_slots = concurrent_slots();
+    const int max_concurrent_prefills = n_slots > 1
+        ? std::clamp(
+              env_int_or_default("DFLASH_MAX_CONCURRENT_PREFILLS", 8),
+              1, std::min(n_slots, 8))
+        : 1;
+    const int mixed_prefill_tokens = std::max(
+        1, env_int_or_default("DFLASH_MIXED_PREFILL_TOKENS", 2048));
+    const int long_mixed_prefill_tokens = std::max(
+        1, env_int_or_default("DFLASH_LONG_MIXED_PREFILL_TOKENS", 4096));
+    const int long_prefill_threshold = std::max(
+        1, env_int_or_default("DFLASH_LONG_PREFILL_THRESHOLD", 768));
+    const int idle_prefill_tokens = std::max(
+        1, env_int_or_default("DFLASH_IDLE_PREFILL_TOKENS", 4096));
+    const int prefill_quantum = std::max(
+        1, env_int_or_default("DFLASH_PREFILL_ALLOCATION_QUANTUM", 512));
+    if (n_slots > 1 && !cfg_.paged_attention) {
+        set_last_error("--max-concurrency requires --paged-attention");
+        return false;
+    }
+    // Concurrent slots share one physical pool. An explicit
+    // --kv-pool-tokens is rounded up to a whole block; otherwise capacity is
+    // derived from device-free memory after subtracting fixed concurrent cache
+    // state and a runtime graph reserve. This decouples max-concurrency from
+    // startup K/V allocation while retaining at least one full logical context.
+    // One extra scratch block is appended to the K/V tensors (outside the
+    // pool's index space) as the write target of dead decode-batch rows.
+    int64_t pool_tokens = 0;
+    if (n_slots > 1) {
+        if (cfg_.kv_pool_tokens > 0) {
+            pool_tokens = (int64_t)paged_token_capacity(
+                (int)std::min<int64_t>(
+                    cfg_.kv_pool_tokens, INT32_MAX - PAGED_BLOCK_SIZE));
+        } else {
+            PagedKvAutoBudget budget;
+            // TODO: Size tensor-parallel pools from each device's free memory
+            // and account for fixed cache tensors mirrored by the meta backend.
+            budget.free_bytes = (int64_t)gpu_free;
+            budget.bytes_per_token = kvf_budget.bytes_per_token;
+            budget.reserve_bytes = kvf_budget.reserve_bytes;
+            budget.fixed_cache_bytes = concurrent_fixed_cache_bytes(
+                w_, cfg_.device.max_ctx, n_slots, budget.bytes_per_token);
+            pool_tokens = paged_kv_auto_pool_tokens(
+                cfg_.device.max_ctx, n_slots, budget);
+            const int64_t one_context =
+                paged_token_capacity(cfg_.device.max_ctx);
+            std::fprintf(stderr,
+                "[parallel] auto KV pool: %lld tokens "
+                "(free %.2f GiB - fixed %.2f GiB - reserve %.2f GiB, "
+                "%.2f KiB/token; logical cap %lld)\n",
+                (long long)pool_tokens,
+                budget.free_bytes / 1073741824.0,
+                budget.fixed_cache_bytes / 1073741824.0,
+                budget.reserve_bytes / 1073741824.0,
+                budget.bytes_per_token / 1024.0,
+                (long long)n_slots * one_context);
+            if (pool_tokens < one_context) {
+                set_last_error(
+                    "not enough device memory for one max_ctx paged sequence; "
+                    "lower --max-ctx or set --kv-pool-tokens explicitly");
+                return false;
+            }
+        }
+        if (pool_tokens + PAGED_BLOCK_SIZE > INT32_MAX) {
+            set_last_error("paged KV pool exceeds INT32_MAX tokens");
+            return false;
+        }
+    }
+    const int ctx_alloc = n_slots > 1
+        ? (int)(pool_tokens + PAGED_BLOCK_SIZE)
+        : (cfg_.paged_attention
+               ? paged_token_capacity(cfg_.device.max_ctx)
+               : kvflash_tokens_);
     if (!create_target_cache(w_, cfg_.device.max_ctx, max_verify_tokens, target_backend_, cache_,
                              /*prefill_only=*/true, ctx_alloc,
-                             cfg_.paged_attention)) {
+                             cfg_.paged_attention, n_slots)) {
         std::fprintf(stderr, "cache: %s\n", dflash27b_last_error());
         return false;
     }
@@ -332,18 +470,43 @@ bool Qwen35Backend::init() {
             return false;
         }
         try {
+            const uint32_t pool_blocks = n_slots > 1
+                ? (uint32_t)(pool_tokens / PAGED_BLOCK_SIZE)
+                : (uint32_t)paged_block_count(cfg_.device.max_ctx);
             paged_kv_pool_ = std::make_unique<PagedKvPool>(
-                (uint32_t)paged_block_count(cfg_.device.max_ctx),
-                /*max_sequences=*/1, PAGED_BLOCK_SIZE);
+                pool_blocks, /*max_sequences=*/(uint32_t)n_slots,
+                PAGED_BLOCK_SIZE);
         } catch (const std::exception & e) {
             std::fprintf(stderr, "[paged-attention] pool init failed: %s\n",
                          e.what());
             return false;
         }
+        if (n_slots > 1) {
+            seq_engine_ = std::make_unique<Qwen35SeqEngine>(
+                *this, *paged_kv_pool_, cfg_.device.max_ctx,
+                /*scratch_row=*/pool_tokens,
+                max_concurrent_prefills, mixed_prefill_tokens,
+                long_mixed_prefill_tokens, long_prefill_threshold,
+                idle_prefill_tokens, prefill_quantum);
+            std::printf("[parallel] %d decode slots, up to %d packed prefills "
+                        "(mixed short/long %d/%d at >=%d tokens, "
+                        "idle %d, quantum %d), "
+                        "pool %u blocks x %u tokens"
+                        " (%lld shared tokens, per-seq max_ctx %d)\n",
+                        n_slots, max_concurrent_prefills,
+                        mixed_prefill_tokens, long_mixed_prefill_tokens,
+                        long_prefill_threshold, idle_prefill_tokens, prefill_quantum,
+                        paged_kv_pool_->physical_block_count(),
+                        paged_kv_pool_->block_size(),
+                        (long long)pool_tokens, cfg_.device.max_ctx);
+        }
         std::printf("[paged-attention] %u physical blocks x %u tokens "
-                    "(%d logical tokens)\n",
+                    "(%llu pool tokens, per-sequence max_ctx %d)\n",
                     paged_kv_pool_->physical_block_count(),
-                    paged_kv_pool_->block_size(), cfg_.device.max_ctx);
+                    paged_kv_pool_->block_size(),
+                    (unsigned long long)paged_kv_pool_->physical_block_count() *
+                        paged_kv_pool_->block_size(),
+                    cfg_.device.max_ctx);
         std::fflush(stdout);
     }
     if (kvflash_active()) {
@@ -539,6 +702,49 @@ void Qwen35Backend::end_paged_sequence() {
     }
     paged_sequence_.reset();
 }
+
+// ── Concurrent slot serving (--max-concurrency N) ──────────────────────
+//
+// The engine lives in concurrency/qwen35_seq_engine.cpp; what stays here is the
+// model-level policy it borrows — EOS identity and the min-tokens floor,
+// both shared with the AR decode path.
+
+bool Qwen35Backend::token_is_eos(int32_t token) const {
+    return IS_EOS_TOK(token, w_);
+}
+
+int32_t Qwen35Backend::apply_min_tokens_floor(int32_t tok, int generated,
+                                              size_t logits_row_offset) {
+    // MIN_TOKENS_BEFORE_EOS (env DFLASH_MIN_TOKENS, default off): same
+    // policy as do_ar_decode — if the slot would stop before emitting the
+    // floor, substitute the best non-EOS token. The logits row is fetched
+    // on demand so the (common) GPU-argmax path pays nothing when the
+    // floor is off or not triggered.
+    const int floor = dflash_min_tokens_floor();
+    if (floor <= 0 || generated >= floor || !IS_EOS_TOK(tok, w_)) return tok;
+    const int vocab = w_.n_vocab;
+    std::vector<float> buf((size_t)vocab);
+    ggml_backend_tensor_get(sg_.logits, buf.data(), logits_row_offset,
+                            sizeof(float) * (size_t)vocab);
+    int alt = -1;
+    float best = -1e30f;
+    for (int v = 0; v < vocab; v++) {
+        if (IS_EOS_TOK(v, w_)) continue;
+        if (buf[(size_t)v] > best) { best = buf[(size_t)v]; alt = v; }
+    }
+    if (alt < 0) return tok;
+    FILE * log = open_dflash_floor_log();
+    if (log) {
+        std::fprintf(log, "[floor] eos@%d -> alt=%d\n", generated, alt);
+        std::fclose(log);
+    }
+    return alt;
+}
+
+SeqEngine * Qwen35Backend::seq_engine() {
+    return seq_engine_.get();
+}
+
 
 // ── print_ready_banner ──────────────────────────────────────────────────
 
@@ -769,14 +975,41 @@ bool Qwen35Backend::snapshot_adopt(int slot, ggml_context * ctx,
 // ── Compress (pflash) ───────────────────────────────────────────────────
 
 ModelBackend::CompressResult Qwen35Backend::compress(const CompressRequest & req) {
-    CompressResult result;
-    if (req.input_ids.empty() || req.drafter_path.empty()) return result;
+    const auto results = compress_batch({req});
+    return results.empty() ? CompressResult{} : results.front();
+}
+
+std::vector<ModelBackend::CompressResult> Qwen35Backend::compress_batch(
+        const std::vector<CompressRequest> & requests) {
+    std::vector<CompressResult> results(requests.size());
+    if (requests.empty()) return results;
+
+    const CompressRequest * load_request = nullptr;
+    for (const auto & request : requests) {
+        if (request.input_ids.empty() || request.drafter_path.empty()) continue;
+        if (load_request == nullptr) {
+            load_request = &request;
+        } else if (request.drafter_path != load_request->drafter_path ||
+                   request.drafter_gpu != load_request->drafter_gpu ||
+                   request.skip_park != load_request->skip_park ||
+                   request.residency_action != load_request->residency_action) {
+            // A residency window can host only one drafter. Preserve the base
+            // API's per-request behavior for heterogeneous batches.
+            return ModelBackend::compress_batch(requests);
+        }
+    }
+    if (load_request == nullptr) return results;
+    const bool should_park = !load_request->skip_park;
+    const bool release_after_use =
+        load_request->residency_action == DraftResidencyAction::ReleaseAfterUse;
 
     // Park target+draft to free VRAM for the drafter (unless skip_park).
-    // Also destroy the main target step graph allocator to release its CUDA buffer.
+    // A FlowKV request may contain many aged messages. Keep this residency
+    // window around the whole batch so those messages do not reload all three
+    // models independently.
     const bool was_target_parked = target_parked_;
     const bool was_draft_parked  = draft_parked_;
-    if (!req.skip_park) {
+    if (should_park) {
         step_graph_destroy(sg_);
         if (!target_parked_) park(ParkTarget::TargetModel);
         if (!draft_parked_)  park(ParkTarget::DraftModel);
@@ -796,16 +1029,16 @@ ModelBackend::CompressResult Qwen35Backend::compress(const CompressRequest & req
     if (!drafter_loaded_) {
         // drafter_ctx_.backend == nullptr → load_drafter creates its own
         std::fprintf(stderr, "[compress] loading drafter from %s ...\n",
-                     req.drafter_path.c_str());
-        if (!load_drafter(req.drafter_path, /*gpu_layers=*/999,
-                          req.drafter_gpu, drafter_ctx_)) {
+                     load_request->drafter_path.c_str());
+        if (!load_drafter(load_request->drafter_path, /*gpu_layers=*/999,
+                          load_request->drafter_gpu, drafter_ctx_)) {
             std::fprintf(stderr, "[compress] drafter init failed: %s\n",
                          dflash27b_last_error());
-            if (!req.skip_park) {
+            if (should_park) {
                 if (!was_target_parked) unpark(ParkTarget::TargetModel);
                 if (!was_draft_parked)  unpark(ParkTarget::DraftModel);
             }
-            return result;
+            return results;
         }
         drafter_loaded_ = true;
         std::fprintf(stderr, "[compress] drafter ready\n");
@@ -818,25 +1051,31 @@ ModelBackend::CompressResult Qwen35Backend::compress(const CompressRequest & req
         }
     }
 
-    result.compressed_ids = drafter_score_and_compress(
-        drafter_ctx_, req.input_ids, req.keep_ratio);
-    result.ok = !result.compressed_ids.empty();
-    if (result.ok) {
-        std::fprintf(stderr, "[compress] %zu -> %zu tokens\n",
-                     req.input_ids.size(), result.compressed_ids.size());
+    for (size_t index = 0; index < requests.size(); ++index) {
+        const auto & request = requests[index];
+        if (request.input_ids.empty() || request.drafter_path.empty()) continue;
+
+        auto & result = results[index];
+        result.compressed_ids = drafter_score_and_compress(
+            drafter_ctx_, request.input_ids, request.keep_ratio);
+        result.ok = !result.compressed_ids.empty();
+        if (result.ok) {
+            std::fprintf(stderr, "[compress] %zu -> %zu tokens\n",
+                         request.input_ids.size(), result.compressed_ids.size());
+        }
     }
 
-    if (req.residency_action == DraftResidencyAction::ReleaseAfterUse) {
+    if (release_after_use) {
         free_drafter();
     }
 
     // Restore park state
-    if (!req.skip_park) {
+    if (should_park) {
         if (!was_target_parked) unpark(ParkTarget::TargetModel);
         if (!was_draft_parked)  unpark(ParkTarget::DraftModel);
     }
 
-    return result;
+    return results;
 }
 
 bool Qwen35Backend::handle_compress(const std::string & line, const DaemonIO & io) {
@@ -1006,6 +1245,14 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
                                             const DaemonIO & io) {
     GenerateResult result;
     DaemonIO out_io = io.with_token_callback(req.on_token);
+    if (concurrent_slots() > 1) {
+        // begin_paged_sequence would reset the shared pool under every live
+        // slot; the scheduler must use the seq_* API instead.
+        result.fail(GenerateErrorCode::BackendSpecific,
+                    "generate() is unavailable with --max-concurrency; "
+                    "use the concurrent slot API");
+        return result;
+    }
     sampler_ = req.sampler;
     if (req.do_sample && sampler_.seed != 0) {
         sampler_rng_.seed(sampler_.seed);
@@ -1229,7 +1476,7 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
                                /*with_mask=*/pool, /*capture=*/false,
                                /*capture_delta_intermediate=*/false,
                                /*fa_window=*/0,
-                               /*last_token_logits_only=*/false,
+                               /*logits_tail_rows=*/0,
                                cfg_.kq_stride_pad,
                                should_capture_moe_router(),
                                /*kvflash_mask=*/pool,
@@ -1299,10 +1546,7 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
                                int kv_offset) {
     const int hidden = w_.n_embd;
     const int vocab  = w_.n_vocab;
-    int prefill_ubatch = 512;
-    if (const char * s = std::getenv("DFLASH27B_PREFILL_UBATCH")) {
-        prefill_ubatch = std::max(1, std::atoi(s));
-    }
+    int prefill_ubatch = qwen35_prefill_ubatch(512);
     const int prompt_len = (int)tokens.size();
     prefill_last_logits_valid_ = false;
 
@@ -1416,7 +1660,8 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
                                with_mask, /*capture=*/true,
                                /*capture_delta_intermediate=*/false,
                                /*fa_window=*/0,
-                               /*last_token_logits_only=*/(start + n_tokens < prompt_len),
+                               /*logits_tail_rows=*/
+                                   (start + n_tokens < prompt_len ? 1 : 0),
                                cfg_.kq_stride_pad,
                                should_capture_moe_router(),
                                /*kvflash_mask=*/kvf_paged)) {
@@ -1448,13 +1693,7 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
 
         // Positions (M-RoPE)
         std::vector<int32_t> pos_buf((size_t)4 * n_tokens, 0);
-        for (int i = 0; i < n_tokens; i++) {
-            const int p = kv_pos + i;
-            pos_buf[4 * i + 0] = p;
-            pos_buf[4 * i + 1] = p;
-            pos_buf[4 * i + 2] = p;
-            pos_buf[4 * i + 3] = 0;
-        }
+        fill_qwen35_mrope_positions(pos_buf.data(), kv_pos, n_tokens);
         ggml_backend_tensor_set(sg_.positions, pos_buf.data(), 0,
                                 sizeof(int32_t) * pos_buf.size());
 
@@ -1487,13 +1726,8 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
             ggml_backend_tensor_set(sg_.attn_mask, mask_buf.data(), 0,
                                     sizeof(uint16_t) * mask_buf.size());
         } else if (sg_.attn_mask) {
-            const int win_start = 0;
-            const int kv_len = kv_pos + n_tokens - win_start;
-            std::vector<uint16_t> mask_buf;
-            const int kv_pad_override = (int)sg_.attn_mask->ne[0];
-            build_causal_mask(mask_buf, kv_len, n_tokens, kv_pos, cfg_.kq_stride_pad, win_start, kv_pad_override);
-            ggml_backend_tensor_set(sg_.attn_mask, mask_buf.data(), 0,
-                                    sizeof(uint16_t) * mask_buf.size());
+            upload_qwen35_causal_mask(
+                sg_.attn_mask, kv_pos, n_tokens, cfg_.kq_stride_pad);
         }
 
         // Compute
@@ -1784,7 +2018,6 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
     if (n_gen <= 0) return true;
 
     auto t_dec0_ar = std::chrono::steady_clock::now();
-    const int _min_floor = dflash_min_tokens_floor();
     static const int _repeat_guard = []{
         const int explicit_guard =
             env_int_or_default("DFLASH_DEGENERATE_RUN_TOKENS", -1);
@@ -1850,7 +2083,7 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
                                /*with_mask=*/pool, /*capture=*/false,
                                /*capture_delta_intermediate=*/false,
                                /*fa_window=*/0,
-                               /*last_token_logits_only=*/false,
+                               /*logits_tail_rows=*/0,
                                cfg_.kq_stride_pad,
                                should_capture_moe_router(),
                                /*kvflash_mask=*/pool,
@@ -1951,29 +2184,8 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
             }
         }
 
-        // MIN_TOKENS_BEFORE_EOS (env DFLASH_MIN_TOKENS, default 0=off): if the
-        // model tries to stop before producing N tokens in this decode call,
-        // suppress EOS and take the best NON-eos token instead. Targets the Q4
-        // 'preamble then stop, no tool_call' agentic stall. Env-gated so the
-        // default production lane is byte-for-byte unchanged.
-        {
-            if (_min_floor > 0 && (int)out_tokens.size() < _min_floor && IS_EOS_TOK(next_tok, w_)) {
-                int alt = -1; float altbest = -1e30f;
-                for (int v = 0; v < vocab; v++) {
-                    if (IS_EOS_TOK(v, w_)) continue;
-                    if (logits_buf[v] > altbest) { altbest = logits_buf[v]; alt = v; }
-                }
-                if (alt >= 0) {
-                    // Debug-only diagnostic: writes happen exclusively when the
-                    // operator opts into DFLASH_MIN_TOKENS, so the default
-                    // production lane never touches /tmp/dflash_floor.log.
-                    // Bound the local evidence file before appending.
-                    FILE* _d = open_dflash_floor_log();
-                    if (_d) { std::fprintf(_d, "[floor] eos@%d -> alt=%d\n", (int)out_tokens.size(), alt); std::fclose(_d); }
-                    next_tok = alt;
-                }
-            }
-        }
+        next_tok = apply_min_tokens_floor(
+            next_tok, (int)out_tokens.size(), /*logits_row_offset=*/0);
 
         maybe_force_close(next_tok);
 

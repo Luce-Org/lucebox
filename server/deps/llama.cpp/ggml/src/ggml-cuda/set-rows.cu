@@ -191,7 +191,8 @@ static __global__ void k_set_rows(const src_t * __restrict__ src0,
                                   const uint3   ne01,
                                   const uint3   ne02,
                                   const uint3   ne11_fd,
-                                  const uint3   ne12_fd) {
+                                  const uint3   ne12_fd,
+                                  const bool    skip_negative) {
     const int64_t i = int64_t(blockDim.x) * blockIdx.x + threadIdx.x;
 
     if (i >= ne_total) {
@@ -218,6 +219,9 @@ static __global__ void k_set_rows(const src_t * __restrict__ src0,
     const int64_t i10 = i01;
 
     const int64_t dst_row = *(src1 + i10*s10 + i11*s11 + i12*s12);
+    if (skip_negative && dst_row < 0) {
+        return;
+    }
 
     const src_t * src0_row = src0 + i01*s01 + i02*s02 + i03*s03;
     dst_t * dst_row_ptr    = dst + dst_row*s1 + i02*s2 + i03*s3;
@@ -238,7 +242,8 @@ static void set_rows_cuda(
         const size_t nb01, const size_t nb02, const size_t nb03,
         const size_t nb10, const size_t nb11, const size_t nb12,
         const size_t nb1, const size_t nb2, const size_t nb3,
-        cudaStream_t stream) {
+        cudaStream_t stream,
+        bool skip_negative) {
 
     const int64_t ne_total = ne00 * ne01 * ne02 * ne03;
     const int num_blocks = (ne_total + CUDA_SET_ROWS_BLOCK_SIZE - 1) / CUDA_SET_ROWS_BLOCK_SIZE;
@@ -265,7 +270,7 @@ static void set_rows_cuda(
 
         k_set_rows<<<grid_size, block_size, 0, stream>>>(src0_d, src1_d, dst_d, ne_total, ne10, ne11, ne12, ne13, s01,
                                                          s02, s03, s10, s11, s12, s1, s2, s3, ne00_fd, ne01_fd, ne02_fd,
-                                                         ne11_fd, ne12_fd);
+                                                         ne11_fd, ne12_fd, skip_negative);
     }
 }
 
@@ -277,6 +282,9 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
     GGML_TENSOR_BINARY_OP_LOCALS
 
     cudaStream_t stream = ctx.stream();
+    const bool skip_negative = ggml_get_op_params_i32(dst, 0) != 0;
+    GGML_ASSERT(!skip_negative || dst->type == GGML_TYPE_F32 ||
+                dst->type == GGML_TYPE_F16 || dst->type == GGML_TYPE_BF16);
 
 
     if (dst->type == GGML_TYPE_F32) {
@@ -287,7 +295,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             nb01, nb02, nb03,
             nb10, nb11, nb12,
             nb1, nb2, nb3,
-            stream
+            stream, skip_negative
         );
     } else if (dst->type == GGML_TYPE_F16) {
         set_rows_cuda(
@@ -297,7 +305,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             nb01, nb02, nb03,
             nb10, nb11, nb12,
             nb1, nb2, nb3,
-            stream
+            stream, skip_negative
         );
     } else if (dst->type == GGML_TYPE_BF16) {
         set_rows_cuda(
@@ -307,7 +315,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             nb01, nb02, nb03,
             nb10, nb11, nb12,
             nb1, nb2, nb3,
-            stream
+            stream, skip_negative
         );
     } else if (dst->type == GGML_TYPE_Q4_0) {
         set_rows_cuda_quant<idx_t, block_q4_0, QK4_0, quantize_f32_q4_0_block>(
@@ -533,6 +541,10 @@ static void set_rows_dual_dispatch(ggml_backend_cuda_context & ctx, ggml_tensor 
 
 bool ggml_cuda_set_rows_dual_supported(const ggml_tensor * a, const ggml_tensor * b) {
     if (a->op != GGML_OP_SET_ROWS || b->op != GGML_OP_SET_ROWS) {
+        return false;
+    }
+    if (ggml_get_op_params_i32(a, 0) != 0 ||
+        ggml_get_op_params_i32(b, 0) != 0) {
         return false;
     }
     if (a->type != b->type || a->data == b->data) {

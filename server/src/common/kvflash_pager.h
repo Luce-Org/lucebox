@@ -599,6 +599,15 @@ struct KvFlashAutoBudget {
     int     speed_cap_tokens = 16384;
 };
 
+// The compatibility gate can reject a fixed KVFlash pool before model setup.
+// "auto" is deliberately excluded: only the backend's VRAM-aware sizing can
+// determine whether an automatic pool will actually be active.
+inline bool kvflash_fixed_pool_requested(const char * value) {
+    return value != nullptr &&
+           std::strcmp(value, "auto") != 0 &&
+           std::atoi(value) > 0;
+}
+
 // Pool size from DFLASH_KVFLASH for a backend with `cfg` protections:
 // 0 = off; otherwise rounded to a 256 multiple, floored at
 // min_pool_tokens(cfg) (eviction must keep a victim) and clamped to

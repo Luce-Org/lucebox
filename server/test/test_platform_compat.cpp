@@ -1,3 +1,4 @@
+#include "CppUnitTestFramework.hpp"
 #include "common/platform_env.h"
 #include "server/socket_handle.h"
 
@@ -10,47 +11,47 @@
 #include <unistd.h>
 #endif
 
+using namespace CppUnitTestFramework;
 using namespace dflash::common;
 
 namespace {
 
-int fail(const char * message) {
-    std::fprintf(stderr, "platform compatibility test failed: %s\n", message);
-    return 1;
-}
+struct PlatformCompatFixture : CommonFixture {
+    using CommonFixture::CommonFixture;
+};
 
 }  // namespace
 
-int main() {
+TEST_CASE(PlatformCompatFixture, platform_environment_and_socket_compatibility) {
     constexpr const char * kEnvName = "DFLASH_PLATFORM_COMPAT_TEST";
 
     if (unset_environment_variable(kEnvName) != 0) {
-        return fail("could not clear test environment variable");
+        CHECK(false);
     }
     if (set_environment_variable(kEnvName, "original", true) != 0) {
-        return fail("could not set environment variable");
+        CHECK(false);
     }
     if (set_environment_variable(kEnvName, "replacement", false) != 0) {
-        return fail("non-overwriting environment update failed");
+        CHECK(false);
     }
     const char * value = std::getenv(kEnvName);
     if (value == nullptr || std::strcmp(value, "original") != 0) {
-        return fail("overwrite=false replaced the existing value");
+        CHECK(false);
     }
     if (set_environment_variable(kEnvName, "replacement", true) != 0) {
-        return fail("overwriting environment update failed");
+        CHECK(false);
     }
     value = std::getenv(kEnvName);
     if (value == nullptr || std::strcmp(value, "replacement") != 0) {
-        return fail("overwrite=true did not replace the existing value");
+        CHECK(false);
     }
     if (unset_environment_variable(kEnvName) != 0 ||
         std::getenv(kEnvName) != nullptr) {
-        return fail("could not remove environment variable");
+        CHECK(false);
     }
 
     if (socket_is_valid(kInvalidSocket)) {
-        return fail("invalid socket sentinel reported as valid");
+        CHECK(false);
     }
 
 #if defined(_WIN32)
@@ -59,7 +60,7 @@ int main() {
     WSADATA wsa_data{};
     const int wsa_error = WSAStartup(MAKEWORD(2, 2), &wsa_data);
     if (wsa_error != 0) {
-        return fail("WSAStartup failed");
+        CHECK(false);
     }
 #endif
 
@@ -68,7 +69,8 @@ int main() {
 #if defined(_WIN32)
         WSACleanup();
 #endif
-        return fail("could not create a TCP socket");
+        CHECK(false);
+        return;
     }
 
 #if defined(_WIN32)
@@ -78,5 +80,4 @@ int main() {
     ::close(socket_handle);
 #endif
 
-    return 0;
 }

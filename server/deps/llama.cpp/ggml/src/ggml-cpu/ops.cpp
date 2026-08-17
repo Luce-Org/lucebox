@@ -5005,6 +5005,7 @@ static void ggml_compute_forward_set_rows_f32(
     const int64_t ir1 = std::min(ir0 + dr, nr);
 
     ggml_from_float_t const from_float = ggml_get_type_traits_cpu(dst->type)->from_float;
+    const bool masked = ggml_get_op_params_i32(dst, 0) != 0;
 
     for (int64_t i03 = 0; i03 < ne03; ++i03) {
         for (int64_t i02 = 0; i02 < ne02; ++i02) {
@@ -5014,6 +5015,10 @@ static void ggml_compute_forward_set_rows_f32(
                 const int64_t i10 = i;
 
                 const int64_t i1 = *(idx_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
+
+                if (i1 < 0 && masked) {
+                    continue;
+                }
 
                 GGML_ASSERT(i1 >= 0 && i1 < ne1);
 
@@ -10518,11 +10523,13 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     ggml_tensor * src_g     = dst->src[3];
     ggml_tensor * src_beta  = dst->src[4];
     ggml_tensor * src_state = dst->src[5];
+    ggml_tensor * src_active_slots = dst->src[8];
 
     const int64_t S_v      = src_v->ne[0];
     const int64_t H        = src_v->ne[1];
     const int64_t n_tokens = src_v->ne[2];
     const int64_t n_seqs   = src_v->ne[3];
+    const int64_t n_state_slots = src_state->ne[3];
 
     GGML_ASSERT(ggml_is_contiguous_rows(src_q));
     GGML_ASSERT(ggml_is_contiguous_rows(src_k));
@@ -10556,10 +10563,24 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     // attn_scores: S_v * H * n_tokens * n_seqs floats
     // new_states:  S_v * S_v * H * n_seqs floats
     const int64_t attn_score_elems = S_v * H * n_tokens * n_seqs;
-    float * attn_out_base  = (float *)dst->data;
-    float * state_out_base = (float *)dst->data + attn_score_elems;
+    float * attn_out_base = (float *)dst->data;
+    float * compact_state_out_base =
+        (float *)dst->data + attn_score_elems;
+    const bool inplace_state = ggml_get_op_params_i32(dst, 1) != 0;
+    float * state_out_base = inplace_state
+        ? (float *)src_state->data
+        : compact_state_out_base;
 
     const float * state_in_base = (const float *)src_state->data;
+    const int32_t * active_slot_ids = src_active_slots
+        ? (const int32_t *)src_active_slots->data
+        : nullptr;
+    if (src_active_slots) {
+        GGML_ASSERT(inplace_state);
+        GGML_ASSERT(src_active_slots->type == GGML_TYPE_I32);
+        GGML_ASSERT(ggml_is_contiguous(src_active_slots));
+        GGML_ASSERT(ggml_nelements(src_active_slots) == n_seqs);
+    }
 
   //const int64_t rq1 = nev1 / neq1;
   //const int64_t rk1 = nev1 / nek1;
@@ -10571,6 +10592,13 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     for (int64_t ir = ir0; ir < ir1; ++ir) {
         const int64_t iv1 = ir % H; // head_index
         const int64_t iv3 = ir / H; // sequence
+        const int32_t mapped_seq = active_slot_ids
+            ? active_slot_ids[iv3]
+            : (int32_t)iv3;
+        const int32_t physical_seq =
+            mapped_seq >= 0 && mapped_seq < n_state_slots
+                ? mapped_seq
+                : -1;
 
         const int64_t iq1 = iv1 % neq1;
         const int64_t ik1 = iv1 % nek1;
@@ -10578,11 +10606,19 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
         const int64_t iq3 = iv3 / rq3;
         const int64_t ik3 = iv3 / rk3;
 
-        float * s_out = state_out_base + (iv3 * H + iv1) * S_v * S_v;
+        float * s_out = physical_seq >= 0
+            ? state_out_base + ((int64_t)physical_seq * H + iv1) * S_v * S_v
+            : compact_state_out_base + (iv3 * H + iv1) * S_v * S_v;
 
         // copy input state into output buffer and operate in-place
-        const float * s_in = state_in_base + (iv3 * H + iv1) * S_v * S_v;
-        memcpy(s_out, s_in, S_v * S_v * sizeof(float));
+        const float * s_in = physical_seq >= 0
+            ? state_in_base + ((int64_t)physical_seq * H + iv1) * S_v * S_v
+            : nullptr;
+        if (!s_in) {
+            memset(s_out, 0, S_v * S_v * sizeof(float));
+        } else if (s_out != s_in) {
+            memcpy(s_out, s_in, S_v * S_v * sizeof(float));
+        }
 
         // attn output pointer for first token of this (head, seq)
         float * attn_data = attn_out_base + (iv3 * n_tokens * H + iv1) * S_v;

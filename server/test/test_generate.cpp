@@ -9,9 +9,12 @@
 //
 // Usage:
 //   test_generate <qwen35.gguf> <prompt_ids.bin> <n_gen> <out_ids.bin>
+//   test_generate --seq-engine-contract <qwen35.gguf> [slots]
 
 #include "dflash27b.h"
 #include "internal.h"
+#include "qwen35/qwen35_backend.h"
+#include "seq_engine_contract.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -48,7 +51,7 @@
 
 using namespace dflash::common;
 
-struct StepGraph {
+struct GenerateStepGraph {
     ggml_context *    ctx = nullptr;
     ggml_cgraph *     gf  = nullptr;
     ggml_gallocr_t    alloc = nullptr;
@@ -61,7 +64,7 @@ struct StepGraph {
 // `kv_start` updates drive the correct KV cache slot. The graph is cheap to
 // rebuild — all the weights + KV cache stay persistent.
 static bool build_step_graph(
-    StepGraph & sg,
+    GenerateStepGraph & sg,
     const TargetWeights & w,
     TargetCache & cache,
     ggml_backend_t backend,
@@ -104,7 +107,7 @@ static bool build_step_graph(
     return ggml_gallocr_alloc_graph(sg.alloc, sg.gf);
 }
 
-static std::vector<int32_t> read_int32_file(const std::string & path) {
+static std::vector<int32_t> read_generate_tokens(const std::string & path) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f) return {};
     auto sz = (size_t)f.tellg();
@@ -114,17 +117,79 @@ static std::vector<int32_t> read_int32_file(const std::string & path) {
     return out;
 }
 
-static bool write_int32_file(const std::string & path, const std::vector<int32_t> & v) {
+static bool write_generate_tokens(const std::string & path,
+                                  const std::vector<int32_t> & v) {
     std::ofstream f(path, std::ios::binary);
     if (!f) return false;
     f.write((const char *)v.data(), v.size() * sizeof(int32_t));
     return (bool)f;
 }
 
+static int run_seq_engine_contract(const char * gguf_path, int slots) {
+    if (slots < 2 || slots > 64) {
+        std::fprintf(stderr, "slots must be in [2, 64], got %d\n", slots);
+        return 2;
+    }
+
+    // Keep this mode independent of a caller's KVFlash environment: paged
+    // attention and KVFlash are intentionally mutually exclusive. Prevent
+    // arbitrary raw token IDs from ending the checker before its three
+    // batched steps have exercised state carry.
+    unsetenv("DFLASH_KVFLASH");
+    setenv("DFLASH_MIN_TOKENS", "8", 1);
+
+    Qwen35Config cfg;
+    cfg.target_path = gguf_path;
+    cfg.device.gpu = 0;
+    cfg.device.max_ctx = 256;
+    cfg.draft_gpu = 0;
+    cfg.paged_attention = true;
+    cfg.max_concurrency = slots;
+
+    Qwen35Backend backend(cfg);
+    if (!backend.init()) {
+        std::fprintf(stderr, "seq-engine backend init failed: %s\n",
+                     dflash27b_last_error());
+        return 1;
+    }
+
+    SeqEngine * engine = backend.seq_engine();
+    if (!engine) {
+        std::fprintf(stderr,
+                     "seq-engine backend did not expose a concurrent engine\n");
+        return 1;
+    }
+
+    const std::vector<std::string> violations =
+        check_seq_engine_contract(*engine);
+    for (const std::string & violation : violations) {
+        std::fprintf(stderr, "seq-engine contract: %s\n", violation.c_str());
+    }
+    if (!violations.empty()) return 1;
+
+    std::printf("seq-engine contract passed against Qwen35Backend (%d slots)\n",
+                slots);
+    return 0;
+}
+
 int main(int argc, char ** argv) {
+    if (argc >= 2 &&
+        std::strcmp(argv[1], "--seq-engine-contract") == 0) {
+        if (argc < 3 || argc > 4) {
+            std::fprintf(stderr,
+                "usage: %s --seq-engine-contract <qwen35.gguf> [slots]\n",
+                argv[0]);
+            return 2;
+        }
+        const int slots = argc == 4 ? std::atoi(argv[3]) : 4;
+        return run_seq_engine_contract(argv[2], slots);
+    }
+
     if (argc < 5) {
         std::fprintf(stderr,
-            "usage: %s <qwen35.gguf> <prompt_ids.bin> <n_gen> <out_ids.bin>\n", argv[0]);
+            "usage: %s <qwen35.gguf> <prompt_ids.bin> <n_gen> <out_ids.bin>\n"
+            "       %s --seq-engine-contract <qwen35.gguf> [slots]\n",
+            argv[0], argv[0]);
         return 2;
     }
     const char * gguf_path   = argv[1];
@@ -187,7 +252,7 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    auto prompt = read_int32_file(prompt_path);
+    auto prompt = read_generate_tokens(prompt_path);
     if (prompt.empty()) { std::fprintf(stderr, "empty prompt bin\n"); return 1; }
     std::printf("[prompt] %zu tokens: ", prompt.size());
     for (auto t : prompt) std::printf("%d ", t);
@@ -204,7 +269,7 @@ int main(int argc, char ** argv) {
     const int hidden = DFLASH27B_TARGET_HIDDEN;
     std::vector<float> embed_buf(hidden);
 
-    StepGraph sg;
+    GenerateStepGraph sg;
 
     // ── Helper: run one step given current token + absolute position
     auto run_step = [&](int32_t tok, int pos) -> int32_t {
@@ -273,7 +338,7 @@ int main(int argc, char ** argv) {
     for (int i = 0; i < n_gen; i++) std::printf("%d ", all_tokens[prompt.size() + i]);
     std::printf("\n");
 
-    write_int32_file(out_path, all_tokens);
+    write_generate_tokens(out_path, all_tokens);
     std::printf("[out] wrote %zu tokens to %s\n", all_tokens.size(), out_path);
 
     if (sg.alloc) ggml_gallocr_free(sg.alloc);

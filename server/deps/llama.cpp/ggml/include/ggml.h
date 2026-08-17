@@ -1738,6 +1738,15 @@ extern "C" {
             struct ggml_tensor  * b,  // source
             struct ggml_tensor  * c); // row indices
 
+    // As ggml_set_rows, but negative row ids are ignored. Intended for
+    // fixed-shape graph buckets whose padding rows must not update state.
+    // Backends that do not implement masking must report this op unsupported.
+    GGML_API struct ggml_tensor * ggml_set_rows_masked(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * c);
+
     GGML_API struct ggml_tensor * ggml_diag(
         struct ggml_context     * ctx,
         struct ggml_tensor      * a);
@@ -2484,13 +2493,24 @@ extern "C" {
     // block_table[t/block_size, seq]*block_size + t%block_size.
     // The initial CUDA/HIP implementation supports D=256 and independently
     // typed F16, Q4_0, or Q8_0 K/V pools.
-    GGML_API struct ggml_tensor * ggml_paged_attn(
+    // active_slot_ids optionally maps compact query rows to physical block-
+    // table columns / length entries. A negative id is a padding row and
+    // produces a zero attention output. NULL selects row identity.
+    // query_positions optionally carries per-row inclusive causal positions
+    // (I32 [n_query], requires active_slot_ids): row i attends the first
+    // min(kv_seq_len, positions[i]+1) cached tokens of its sequence, so
+    // prefill chunks can attend the paged pool causally. A negative position
+    // marks a padding row. NULL keeps the decode semantics (full cached
+    // length per row).
+    GGML_API struct ggml_tensor * ggml_paged_attn_ext(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,
             struct ggml_tensor  * k,
             struct ggml_tensor  * v,
             struct ggml_tensor  * block_table,
             struct ggml_tensor  * kv_seq_lens,
+            struct ggml_tensor  * active_slot_ids,
+            struct ggml_tensor  * query_positions,
             float                 scale,
             int                   block_size,
             int                   max_kv_seq_len);
@@ -2849,6 +2869,19 @@ extern "C" {
             struct ggml_tensor  * g,
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state);
+
+    // Compact-batch in-place recurrence. active_slot_ids maps the compact
+    // sequence axis to physical state slabs; negative or out-of-range ids
+    // use zero state and do not write back.
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_active_inplace(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * active_slot_ids);
 
     GGML_API void ggml_gated_delta_net_set_skip_intermediate(
             struct ggml_tensor * tensor,

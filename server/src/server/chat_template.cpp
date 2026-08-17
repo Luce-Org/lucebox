@@ -44,22 +44,24 @@ static const char QWEN3_TOOL_SUFFIX[] =
     "current knowledge and do not tell the user about function calls\n"
     "</IMPORTANT>";
 
-static const char DEEPSEEK4_TOOL_PREAMBLE[] =
-    "# Tools\n\nYou have access to these functions:\n<tools>\n";
-
-static const char DEEPSEEK4_TOOL_FORMAT[] =
-    "\n</tools>\n\n"
-    "When calling a function, reply with exactly one call in this format "
-    "and nothing after it:\n"
-    "<tool_call>\n"
-    "<function=FUNCTION_NAME>\n"
-    "<parameter=PARAMETER_NAME>\n"
-    "PARAMETER_VALUE\n"
-    "</parameter>\n"
-    "</function>\n"
-    "</tool_call>\n"
-    "Use the exact function and parameter names from <tools>, and include all "
-    "required parameters.";
+// Appends "<available_tools>\n{tool}\n...</available_tools>\n\n" to result.
+// Each tool is pretty-printed as compact JSON; falls back to the raw
+// tools_json string if parsing fails.
+static void append_available_tools(std::string & result,
+                                   const std::string & tools_json) {
+    result += "<available_tools>\n";
+    try {
+        const nlohmann::json tools = nlohmann::json::parse(tools_json);
+        for (const auto & t : tools) {
+            result += t.dump();
+            result += "\n";
+        }
+    } catch (const std::exception &) {
+        result += tools_json;
+        result += "\n";
+    }
+    result += "</available_tools>\n\n";
+}
 
 ChatFormat chat_format_for_arch(const std::string & arch) {
     if (arch == "deepseek4") return ChatFormat::DEEPSEEK4;
@@ -216,19 +218,8 @@ std::string render_chat_template(
                 // example (thinking and non-thinking variants).
                 result += "\n\n### Tools\n\n"
                           "You may call functions to assist with the user query.\n"
-                          "All available function signatures are listed below:\n"
-                          "<available_tools>\n";
-                try {
-                    const nlohmann::json tools = nlohmann::json::parse(tools_json);
-                    for (const auto & t : tools) {
-                        result += t.dump();
-                        result += "\n";
-                    }
-                } catch (const std::exception &) {
-                    result += tools_json;
-                    result += "\n";
-                }
-                result += "</available_tools>\n\n";
+                          "All available function signatures are listed below:\n";
+                append_available_tools(result, tools_json);
                 if (enable_thinking) {
                     result += "Wrap your thinking in '<think>', '</think>' tags, "
                               "followed by a function call. For each function call, "
@@ -377,24 +368,29 @@ std::string render_chat_template(
         // DeepSeek V4 Flash DSML renderer, matching the ds4 reference server:
         //   <｜begin▁of▁sentence｜>{system}<｜User｜>{user}<｜Assistant｜></think>
         // Completed assistant turns are terminated with <｜end▁of▁sentence｜>.
-        bool has_system = false;
         std::string system_content;
         for (const auto & msg : messages) {
             if (msg.role != "system") continue;
             if (!system_content.empty()) system_content += "\n\n";
             system_content += msg.content;
-            has_system = true;
         }
 
         result = "<｜begin▁of▁sentence｜>";
         if (has_tools) {
-            result += DEEPSEEK4_TOOL_PREAMBLE;
-            result += tools_json;
-            result += DEEPSEEK4_TOOL_FORMAT;
-            result += tool_call_required
-                ? "\nYou MUST call exactly one of these functions to answer this request."
-                : "\nIf a function is applicable, call it instead of answering from memory.";
-            if (has_system) result += "\n\n";
+            result += "### Tools\n\n"
+                      "You may call functions to assist with the user query. "
+                      "All available function signatures are listed below:\n";
+            append_available_tools(result, tools_json);
+            result += "For each function call, you MUST return a single JSON object "
+                      "within '<function_call>' and '</function_call>' tags, "
+                      "containing the function name and arguments, like this:\n"
+                       "<function_call>\n"
+                       "{\"name\": \"function_name\", \"arguments\": {\"param_name\": \"value\"}}\n"
+                       "</function_call>\n\n";
+            if (tool_call_required) {
+                result += "You MUST call exactly one available function and emit no "
+                          "text outside its <function_call> tags.\n\n";
+            }
         }
         result += system_content;
 

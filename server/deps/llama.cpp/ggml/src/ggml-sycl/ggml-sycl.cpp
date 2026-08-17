@@ -3997,6 +3997,7 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
             ggml_sycl_op_set(ctx, dst);
             break;
         case GGML_OP_SET_ROWS:
+            GGML_ASSERT(ggml_get_op_params_i32(dst, 0) == 0);
             ggml_sycl_op_set_rows(ctx, dst);
             break;
         case GGML_OP_DUP:
@@ -4778,6 +4779,9 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
 
         case GGML_OP_SET_ROWS:
             {
+                if (ggml_get_op_params_i32(op, 0) != 0) {
+                    return false;
+                }
                 return ((op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
                          op->type == GGML_TYPE_Q8_0 || op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q5_0 ||
                          op->type == GGML_TYPE_Q4_1 || op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_IQ4_NL) &&
@@ -4951,8 +4955,9 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_RWKV_WKV6:
         case GGML_OP_RWKV_WKV7:
         case GGML_OP_GATED_LINEAR_ATTN:
-        case GGML_OP_GATED_DELTA_NET:
             return true;
+        case GGML_OP_GATED_DELTA_NET:
+            return op->src[8] == nullptr;
         case GGML_OP_SSM_CONV:
             return op->type == GGML_TYPE_F32 &&
                    op->src[0]->type == GGML_TYPE_F32 &&

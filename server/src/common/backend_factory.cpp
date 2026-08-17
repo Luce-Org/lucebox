@@ -271,6 +271,8 @@ std::unique_ptr<ModelBackend> create_backend(
         cfg.stream_fd          = args.stream_fd;
         cfg.fa_window          = args.fa_window;
         cfg.paged_attention    = args.paged_attention;
+        cfg.max_concurrency    = args.max_concurrency;
+        cfg.kv_pool_tokens     = args.kv_pool_tokens;
         cfg.kq_stride_pad      = args.kq_stride_pad;
         cfg.draft_swa_window   = args.draft_swa_window;
         cfg.draft_ctx_max      = args.draft_ctx_max;

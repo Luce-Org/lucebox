@@ -51,6 +51,18 @@ struct StepGraph {
     // Used by contiguous replay, KVFlash, and paged attention; null when the
     // graph uses the legacy contiguous ggml_cpy write.
     ggml_tensor *   kv_write_rows = nullptr;
+    // Compact decode row -> physical sequence slot. Padding rows carry -1.
+    // state_slot_ids has the same shape but maps padding to a safe readable
+    // slot for graph-level conv-state gathers.
+    ggml_tensor *   active_slot_ids = nullptr;
+    ggml_tensor *   state_slot_ids = nullptr;
+    // Ragged paged read (concurrent prefill): per-row block-table column and
+    // inclusive causal position, [n_tokens] i32 each. Padding rows carry -1.
+    ggml_tensor *   paged_query_seq_ids = nullptr;
+    ggml_tensor *   paged_query_positions = nullptr;
+    // Multi-prompt steps: i32 row indices gathered from the final norm
+    // before the LM head (committing rows + decode rows).
+    ggml_tensor *   logits_row_indices = nullptr;
 
     // Output
     ggml_tensor *   logits = nullptr;
@@ -81,6 +93,11 @@ inline void step_graph_free(StepGraph & sg) {
     sg.hidden_input = nullptr;
     sg.parent_ids = nullptr;
     sg.kv_write_rows = nullptr;
+    sg.active_slot_ids = nullptr;
+    sg.state_slot_ids = nullptr;
+    sg.paged_query_seq_ids = nullptr;
+    sg.paged_query_positions = nullptr;
+    sg.logits_row_indices = nullptr;
     sg.logits = nullptr;
     sg.hidden_states = nullptr;
     sg.argmax_tokens = nullptr;

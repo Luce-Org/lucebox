@@ -26,6 +26,7 @@
 #include "kvflash_pager.h"
 #include "kvflash_qk.h"
 #include "attn_masks.h"
+#include "prefill_helpers.h"
 #include "qwen3_drafter.h"
 #include "qwen3_kvflash_scorer.h"
 
@@ -278,7 +279,7 @@ struct BatchStepper {
         gi.n_tokens    = NB;
         gi.kv_start    = pool - NB;      // span = whole pool
         gi.kv_write_rows = kv_write_rows;
-        gi.last_token_logits_only = true;
+        gi.logits_tail_rows = 1;
         QwenGraphOutputs go = build_qwen35_graph(ctx, gf, *w, *cache, gi);
         if (!go.logits) return false;
         logits = go.logits;
@@ -304,10 +305,7 @@ struct BatchStepper {
         ggml_backend_tensor_set(inp_embed, embed_buf.data(), 0,
                                 sizeof(float) * embed_buf.size());
         std::vector<int32_t> p4((size_t)4 * NB);
-        for (int i = 0; i < NB; i++) {
-            p4[4 * i + 0] = p4[4 * i + 1] = p4[4 * i + 2] = pos_base + i;
-            p4[4 * i + 3] = 0;
-        }
+        fill_qwen35_mrope_positions(p4.data(), pos_base, NB);
         ggml_backend_tensor_set(positions, p4.data(), 0, sizeof(int32_t) * p4.size());
         // [n_tokens, n_head_kv] ne0-major: (token i, head h) at i + h*NB.
         std::vector<int64_t> rows((size_t)NB * w->n_head_kv);

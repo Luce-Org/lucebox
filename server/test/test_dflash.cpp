@@ -1266,7 +1266,7 @@ int main(int argc, char ** argv) {
                                    /*capture=*/false,
                                    /*capture_delta_intermediate=*/false,
                                    /*fa_window=*/0,
-                                   /*last_token_logits_only=*/false,
+                                   /*logits_tail_rows=*/0,
                                    g_kq_stride_pad)) {
                 std::fprintf(stderr, "profile build N=%d failed\n", n); return 1;
             }
@@ -1373,7 +1373,7 @@ int main(int argc, char ** argv) {
                                    /*capture=*/false,
                                    /*capture_delta_intermediate=*/false,
                                    /*fa_window=*/g_fa_window,
-                                   /*last_token_logits_only=*/false,
+                                   /*logits_tail_rows=*/0,
                                    g_kq_stride_pad)) {
                 std::fprintf(stderr, "[time-breakdown] build failed for %s\n", sc.label);
                 step_graph_destroy(tsg);
@@ -1458,7 +1458,7 @@ int main(int argc, char ** argv) {
                                    /*capture=*/true,
                                    /*capture_delta_intermediate=*/true,
                                    /*fa_window=*/g_fa_window,
-                                   /*last_token_logits_only=*/false,
+                                   /*logits_tail_rows=*/0,
                                    g_kq_stride_pad)) {
                 std::fprintf(stderr, "[time-breakdown] verify+capture build failed ctx=%d\n", ctx);
                 step_graph_destroy(vsg);
@@ -2076,7 +2076,7 @@ int main(int argc, char ** argv) {
                                         start, nt, with_m, true,
                                         /*capture_delta_intermediate=*/false,
                                         /*fa_window=*/0,
-                                        /*last_token_logits_only=*/false,
+                                        /*logits_tail_rows=*/0,
                                         g_kq_stride_pad)) {
                     std::fprintf(stderr, "prefill build @%d\n", start); return -1;
                 }
@@ -2117,7 +2117,7 @@ int main(int argc, char ** argv) {
                                int32_t pos, int fa_w, float * logits_out) -> bool {
             if (!build_target_step(dsg, w, cache, backend,
                                     kv_start, 1, false, true, false, fa_w,
-                                    /*last_token_logits_only=*/false,
+                                    /*logits_tail_rows=*/0,
                                     g_kq_stride_pad)) {
                 std::fprintf(stderr, "decode build failed\n"); return false;
             }
@@ -2874,7 +2874,7 @@ int main(int argc, char ** argv) {
                                 /*with_mask=*/true, /*capture=*/true,
                                 /*capture_delta_intermediate=*/false,
                                 /*fa_window=*/g_fa_window,
-                                /*last_token_logits_only=*/true,
+                                /*logits_tail_rows=*/1,
                                 g_kq_stride_pad)) {
             // Issue #114: gallocr OOM. Free all prefix snapshots so the next
             // request has VRAM headroom; abort this request cleanly in daemon
@@ -2926,7 +2926,7 @@ int main(int argc, char ** argv) {
                                 /*with_mask=*/pf_with_mask, /*capture=*/true,
                                 /*capture_delta_intermediate=*/false,
                                 /*fa_window=*/g_fa_window,
-                                /*last_token_logits_only=*/true,
+                                /*logits_tail_rows=*/1,
                                 g_kq_stride_pad)) {
             std::fprintf(stderr, "prefill build @%d failed (OOM)\n", start);
             for (int _i = 0; _i < PREFIX_CACHE_SLOTS; _i++) free_prefix_snapshot(prefix_snapshots[_i]);
@@ -2978,7 +2978,7 @@ int main(int argc, char ** argv) {
             if (daemon_mode) { stream_emit(-1); goto _req_aborted_oom; } else return 1;
         }
 
-        // Logits are [vocab, 1] (last_token_logits_only), read from offset 0.
+        // Logits are [vocab, 1] (logits_tail_rows=1), read from offset 0.
         pf_logits_buf.assign(vocab, 0.0f);
         ggml_backend_tensor_get(sg.logits, pf_logits_buf.data(), 0,
                                 sizeof(float) * vocab);
@@ -3791,7 +3791,7 @@ int main(int argc, char ** argv) {
                                     /*with_mask=*/true, /*capture=*/true,
                                     /*capture_delta_intermediate=*/fast_rollback,
                                     verify_fa_window,
-                                    /*last_token_logits_only=*/false,
+                                    /*logits_tail_rows=*/0,
                                     g_kq_stride_pad)) {
                 std::fprintf(stderr, "verify build failed\n"); return 1;
             }
@@ -3854,7 +3854,7 @@ int main(int argc, char ** argv) {
                                         /*with_mask=*/false, /*capture=*/true,
                                         /*capture_delta_intermediate=*/false,
                                         /*fa_window=*/0,
-                                        /*last_token_logits_only=*/false,
+                                        /*logits_tail_rows=*/0,
                                         g_kq_stride_pad)) {
                     std::fprintf(stderr, "seq verify build %d failed\n", i); return 1;
                 }
@@ -4072,7 +4072,7 @@ int main(int argc, char ** argv) {
                                     committed, commit_n,
                                     replay_with_mask, /*capture=*/true,
                                     false, replay_fa_window,
-                                    /*last_token_logits_only=*/false,
+                                    /*logits_tail_rows=*/0,
                                     g_kq_stride_pad)) {
                 std::fprintf(stderr, "replay build failed\n"); return 1;
             }

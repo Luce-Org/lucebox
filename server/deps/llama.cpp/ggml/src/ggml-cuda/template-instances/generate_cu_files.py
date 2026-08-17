@@ -104,6 +104,8 @@ for type in TYPES_MMQ:
             "GGML_TYPE_Q3_1_ROCMFP3_MIX",
         }:
             guard = "#define GGML_CUDA_ROCMFPX_MMQ_TILE 1\n"
+        if type == "GGML_TYPE_Q4_K":
+            guard = "#define LUCEBOX_RDNA_MMQ_Y 64\n"
         f.write(SOURCE_MMQ.format(type=type, guard=guard))
 
 for type in range(1, 17):

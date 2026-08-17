@@ -14,6 +14,7 @@ ToolMemory::ToolMemory(size_t max_entries, size_t max_bytes)
 void ToolMemory::remember(const std::vector<std::string> & call_ids,
                           const std::string & raw_text) {
     if (disabled() || raw_text.empty()) return;
+    std::lock_guard<std::mutex> lk(mu_);
 
     // Deduplicate call_ids
     std::vector<std::string> unique_ids;
@@ -58,6 +59,7 @@ void ToolMemory::remember(const std::vector<std::string> & call_ids,
 }
 
 std::string ToolMemory::lookup(const std::vector<std::string> & call_ids) {
+    std::lock_guard<std::mutex> lk(mu_);
     std::string result_text;
     bool first = true;
 

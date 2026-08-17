@@ -4,6 +4,7 @@
 #include "graph_builders.h"
 #include "step_graph.h"
 #include "attn_masks.h"
+#include "prefill_helpers.h"
 #include "common/geometric_draft_topk_cuda.h"
 #include "ggml-backend-impl.h"
 // gpu_runtime_compat.h maps the raw cudaStream_t / cudaMemcpy* symbols used
@@ -267,7 +268,7 @@ bool Qwen35DFlashTarget::verify_batch(
                            need_mask, /*capture=*/true,
                            /*capture_delta_intermediate=*/do_capture,
                            pool ? 0 : fa_window_,
-                           /*last_token_logits_only=*/false,
+                           /*logits_tail_rows=*/0,
                            kq_stride_pad_,
                            /*capture_moe_router=*/false,
                            /*kvflash_mask=*/pool)) {
@@ -302,14 +303,9 @@ bool Qwen35DFlashTarget::verify_batch(
     ggml_backend_tensor_set(sg_.inp_embed, embed.data(), 0,
                             sizeof(float) * embed.size());
 
-    // Qwen35 uses interleaved positions: 4 ints per token.
+    // GGML M-RoPE positions are axis-major.
     std::vector<int32_t> pos(4 * n_tokens);
-    for (int i = 0; i < n_tokens; i++) {
-        pos[4 * i + 0] = base_pos + i;
-        pos[4 * i + 1] = base_pos + i;
-        pos[4 * i + 2] = base_pos + i;
-        pos[4 * i + 3] = 0;
-    }
+    fill_qwen35_mrope_positions(pos.data(), base_pos, n_tokens);
     ggml_backend_tensor_set(sg_.positions, pos.data(), 0,
                             sizeof(int32_t) * pos.size());
 

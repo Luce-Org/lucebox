@@ -34,6 +34,8 @@
 #include "common/kvflash_pager.h"
 #include "placement/draft_residency.h"
 #include "common/gguf_bounds.h"
+#include "common/gguf_inspect.h"
+#include "qwen35/prefill_helpers.h"
 #include "ggml-cpu.h"
 #include "server/prompt_normalize.h"
 #include "qwen3_drafter_model.h"
@@ -43,6 +45,7 @@
 
 #include <filesystem>
 #include <cmath>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -97,6 +100,13 @@ struct ServerUnitFixture {};
     } \
 } while (0)
 
+TEST_CASE(ServerUnitFixture, test_api_format_names_are_total) {
+    CHECK(std::string(api_format_name(ApiFormat::OPENAI_CHAT)) == "chat");
+    CHECK(std::string(api_format_name(ApiFormat::ANTHROPIC)) == "anthropic");
+    CHECK(std::string(api_format_name(ApiFormat::RESPONSES)) == "responses");
+    CHECK(std::string(api_format_name(ApiFormat::COMPLETIONS)) == "completions");
+}
+
 TEST_CASE(ServerUnitFixture, test_daemon_io_external_cancellation_latches) {
     bool cancel = false;
     DaemonIO io;
@@ -142,6 +152,47 @@ TEST_CASE(ServerUnitFixture, test_http_peer_socket_probe_preserves_half_close) {
                 http_detail::PeerSocketState::Disconnected);
     close(sockets[1]);
 }
+
+TEST_CASE(ServerUnitFixture, test_http_heartbeat_never_waits_for_stalled_peer) {
+    int sockets[2] = {-1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    TEST_ASSERT(fcntl(sockets[0], F_SETFL, O_NONBLOCK) == 0);
+    const int sndbuf = 4096;
+    TEST_ASSERT(setsockopt(sockets[0], SOL_SOCKET, SO_SNDBUF,
+                           &sndbuf, sizeof(sndbuf)) == 0);
+
+    const std::string fill(4096, 'x');
+    ssize_t sent = 0;
+    do {
+        sent = send(sockets[0], fill.data(), fill.size(), MSG_NOSIGNAL);
+    } while (sent > 0);
+    TEST_ASSERT(sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+
+    const auto started = std::chrono::steady_clock::now();
+    size_t heartbeat_offset = 0;
+    TEST_ASSERT(http_detail::try_send_sse_heartbeat(
+                    sockets[0], heartbeat_offset) ==
+                http_detail::HeartbeatSendResult::Retry);
+    TEST_ASSERT(heartbeat_offset < sizeof(": keep-alive\n\n") - 1);
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    TEST_ASSERT(elapsed < std::chrono::milliseconds(100));
+
+    // Once the peer drains, retrying completes the same heartbeat rather than
+    // treating temporary backpressure as a disconnect.
+    char drained[8192];
+    while (recv(sockets[1], drained, sizeof(drained), MSG_DONTWAIT) > 0) {}
+    TEST_ASSERT(http_detail::try_send_sse_heartbeat(
+                    sockets[0], heartbeat_offset) ==
+                http_detail::HeartbeatSendResult::Complete);
+    TEST_ASSERT(heartbeat_offset == 0);
+    const std::string expected = ": keep-alive\n\n";
+    TEST_ASSERT(recv(sockets[1], drained, sizeof(drained), 0) ==
+                (ssize_t)expected.size());
+    TEST_ASSERT(std::memcmp(drained, expected.data(), expected.size()) == 0);
+
+    close(sockets[0]);
+    close(sockets[1]);
+}
 #endif
 
 TEST_CASE(ServerUnitFixture, test_http_sse_done_scanner_requires_terminal_line) {
@@ -168,6 +219,36 @@ TEST_CASE(ServerUnitFixture, test_http_sse_done_scanner_requires_terminal_line) 
     TEST_ASSERT(http_detail::sse_chunk_has_done(
         partial_line, second.data(), second.size()));
     TEST_ASSERT(partial_line.empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_qwen35_mrope_positions_axis_major) {
+    std::vector<int32_t> standalone(4 * 5, -1);
+    fill_qwen35_mrope_positions(
+        standalone.data(), /*base_pos=*/7, /*n_tokens=*/5);
+    const std::vector<int32_t> expected{
+        7, 8, 9, 10, 11,
+        7, 8, 9, 10, 11,
+        7, 8, 9, 10, 11,
+        0, 0, 0, 0, 0,
+    };
+    TEST_ASSERT(standalone == expected);
+
+    constexpr int packed_tokens = 8;
+    std::vector<int32_t> packed(4 * packed_tokens, -1);
+    fill_qwen35_mrope_positions(
+        packed.data(), packed_tokens, /*token_offset=*/2,
+        /*base_pos=*/20, /*n_tokens=*/3);
+    for (int axis = 0; axis < 4; ++axis) {
+        for (int row = 0; row < packed_tokens; ++row) {
+            const bool in_segment = row >= 2 && row < 5;
+            const int expected_value = !in_segment
+                ? -1
+                : (axis < 3 ? 20 + row - 2 : 0);
+            TEST_ASSERT(
+                packed[(size_t)axis * packed_tokens + row] ==
+                expected_value);
+        }
+    }
 }
 
 // ─── Helper: create an SseEmitter with minimal config ──────────────────
@@ -765,6 +846,41 @@ TEST_CASE(ServerUnitFixture, test_parse_tool_code_wrapper) {
     }
 }
 
+TEST_CASE(ServerUnitFixture, test_parse_function_call_wrapper) {
+    std::string text =
+        "<function_call>\n"
+        "{\"name\": \"bash\", \"arguments\": {\"command\": \"echo 'hello'\"}}\n"
+        "</function_call>";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "bash");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["command"] == "echo 'hello'");
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_bare_function_json_with_parameters) {
+    std::string text =
+        "<function>\n"
+        "{\n"
+        "  \"name\": \"bash\",\n"
+        "  \"parameters\": {\n"
+        "    \"command\": \"ls -la \\\"/home/dpavlin/aimax project\\\"\"\n"
+        "  }\n"
+        "}\n"
+        "</function>";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "bash");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["command"] == "ls -la \"/home/dpavlin/aimax project\"");
+    }
+}
+
+
+
 TEST_CASE(ServerUnitFixture, test_parse_tool_allowed_filter) {
     std::string text =
         "<function=blocked_tool>\n"
@@ -1282,6 +1398,49 @@ TEST_CASE(ServerUnitFixture, test_emitter_tool_buffer_detection) {
     // Tool call text should not leak into accumulated content
     TEST_ASSERT(em.accumulated_text().find("<tool_call>") == std::string::npos);
 }
+
+TEST_CASE(ServerUnitFixture, test_emitter_function_call_tool_buffer_detection) {
+    // When the emitter sees <function_call>, it should buffer and parse tools.
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, bash_tools());
+    em.emit_start();
+    em.emit_token("<function_call>\n"
+                  "{\"name\": \"bash\", \"arguments\": {\"command\": \"ls -la\"}}\n"
+                  "</function_call>");
+    em.emit_finish(20);
+
+    TEST_ASSERT(!em.tool_calls().empty());
+    if (!em.tool_calls().empty()) {
+        TEST_ASSERT(em.tool_calls()[0].name == "bash");
+    }
+    // Tool call text should not leak into accumulated content
+    TEST_ASSERT(em.accumulated_text().find("<function_call>") == std::string::npos);
+    TEST_ASSERT(em.accumulated_text().find("bash") == std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_bare_function_json_tool_buffer_detection) {
+    // When the emitter sees <function>, it should buffer and parse tools.
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, bash_tools());
+    em.emit_start();
+    em.emit_token("<function>\n"
+                  "{\n"
+                  "  \"name\": \"bash\",\n"
+                  "  \"parameters\": {\n"
+                  "    \"command\": \"ls -la \\\"/home/dpavlin/aimax project\\\"\"\n"
+                  "  }\n"
+                  "}\n"
+                  "</function>");
+    em.emit_finish(20);
+
+    TEST_ASSERT(!em.tool_calls().empty());
+    if (!em.tool_calls().empty()) {
+        TEST_ASSERT(em.tool_calls()[0].name == "bash");
+    }
+    // Tool call text should not leak into accumulated content
+    TEST_ASSERT(em.accumulated_text().find("<function>") == std::string::npos);
+    TEST_ASSERT(em.accumulated_text().find("bash") == std::string::npos);
+}
+
+
 
 TEST_CASE(ServerUnitFixture, test_emitter_anthropic_tool_use_blocks) {
     // The Anthropic streaming tool-use branch used to be a no-op; the model
@@ -2168,6 +2327,38 @@ TEST_CASE(ServerUnitFixture, test_pflash_config_defaults) {
     TEST_ASSERT(cfg.draft_residency == DraftResidencyPolicy::Auto);
 }
 
+TEST_CASE(ServerUnitFixture, test_concurrent_status_is_aggregate_only) {
+    ServerStatus status;
+    ServerStatus::RequestInfo info;
+    info.model = "classic-model";
+    status.set_running("classic prompt", 12, true, info);
+    json snapshot = status.to_json();
+    TEST_ASSERT(snapshot["active_requests"] == 0);
+    TEST_ASSERT(snapshot["current"]["model"] == "classic-model");
+
+    status.set_concurrent_requests(2, 2);
+    snapshot = status.to_json();
+    TEST_ASSERT(snapshot["phase"] == "prefill");
+    TEST_ASSERT(snapshot["active_requests"] == 2);
+    TEST_ASSERT(snapshot["current"].is_null());
+
+    status.set_concurrent_requests(2, 1);
+    snapshot = status.to_json();
+    TEST_ASSERT(snapshot["phase"] == "mixed");
+    TEST_ASSERT(snapshot["active_requests"] == 2);
+
+    status.set_concurrent_requests(2, 0);
+    snapshot = status.to_json();
+    TEST_ASSERT(snapshot["phase"] == "decode");
+    TEST_ASSERT(snapshot["active_requests"] == 2);
+
+    status.set_idle();
+    snapshot = status.to_json();
+    TEST_ASSERT(snapshot["phase"] == "idle");
+    TEST_ASSERT(snapshot["active_requests"] == 0);
+    TEST_ASSERT(snapshot["current"].is_null());
+}
+
 TEST_CASE(ServerUnitFixture, test_pflash_config_modes) {
     ServerConfig cfg;
     cfg.pflash_mode = ServerConfig::PflashMode::AUTO;
@@ -2570,9 +2761,10 @@ TEST_CASE(ServerUnitFixture, test_deepseek4_render_required_tool_instructions) {
         tools,
         /*tool_call_required=*/true);
 
-    TEST_ASSERT(out.find("<tools>\n" + tools + "\n</tools>") !=
-                std::string::npos);
-    TEST_ASSERT(out.find("<function=FUNCTION_NAME>") != std::string::npos);
+    TEST_ASSERT(out.find("<available_tools>\n") != std::string::npos);
+    TEST_ASSERT(out.find("\"name\":\"weather.get\"") != std::string::npos);
+    TEST_ASSERT(out.find("</available_tools>") != std::string::npos);
+    TEST_ASSERT(out.find("<function_call>") != std::string::npos);
     TEST_ASSERT(out.find("MUST call exactly one") != std::string::npos);
     TEST_ASSERT(out.find("<｜User｜>What is the weather?") !=
                 std::string::npos);
@@ -2589,7 +2781,7 @@ TEST_CASE(ServerUnitFixture, test_deepseek4_auto_tool_is_not_forced) {
         msgs, ChatFormat::DEEPSEEK4, true, false, tools,
         /*tool_call_required=*/false);
 
-    TEST_ASSERT(out.find("If a function is applicable") != std::string::npos);
+    TEST_ASSERT(out.find("You may call functions") != std::string::npos);
     TEST_ASSERT(out.find("MUST call exactly one") == std::string::npos);
 }
 
@@ -3247,6 +3439,33 @@ struct MockBackend : ModelBackend {
     void free_drafter() override {}
     void shutdown() override {}
 };
+
+struct MockBatchCompressBackend : MockBackend {
+    int compress_calls = 0;
+
+    CompressResult compress(const CompressRequest & request) override {
+        ++compress_calls;
+        CompressResult result;
+        result.ok = !request.input_ids.empty();
+        if (result.ok) result.compressed_ids = {request.input_ids.front()};
+        return result;
+    }
+};
+
+TEST_CASE(ServerUnitFixture, test_compress_batch_default_preserves_order) {
+    MockBatchCompressBackend backend;
+    std::vector<ModelBackend::CompressRequest> requests(3);
+    requests[0].input_ids = {11, 12};
+    requests[1].input_ids = {21, 22};
+    requests[2].input_ids = {31, 32};
+
+    const auto results = backend.compress_batch(requests);
+    TEST_ASSERT(results.size() == requests.size());
+    TEST_ASSERT(backend.compress_calls == 3);
+    TEST_ASSERT(results[0].compressed_ids == std::vector<int32_t>({11}));
+    TEST_ASSERT(results[1].compressed_ids == std::vector<int32_t>({21}));
+    TEST_ASSERT(results[2].compressed_ids == std::vector<int32_t>({31}));
+}
 
 struct MockMemoryOnlySnapshotBackend : MockBackend {
     bool snapshot_used(int slot) const override { return slot == 0; }
@@ -4568,7 +4787,6 @@ TEST_CASE(ServerUnitFixture, test_props_model_card_wholesale_sidecar) {
     PrefixCache  pc(0, tok);
     ToolMemory   tm;
     json body = build_props_body(cfg, pc, tm);
-
     TEST_ASSERT(body.contains("model_card"));
     TEST_ASSERT(!body["model_card"].is_null());
     // `source` is the upstream URL, NOT the filepath. The filepath label
@@ -4824,6 +5042,7 @@ TEST_CASE(ServerUnitFixture, test_props_runtime_shape) {
     cfg.chunk           = 512;
     cfg.target_device   = "auto:0";
     cfg.draft_device    = "auto:0";
+    TEST_ASSERT(cfg.admission_coalesce_ms == 20);
 
     Tokenizer    tok;
     PrefixCache  pc(0, tok);
@@ -4842,12 +5061,17 @@ TEST_CASE(ServerUnitFixture, test_props_runtime_shape) {
     TEST_ASSERT(rt["chunk"].get<int>()                   == 512);
     TEST_ASSERT(rt["target_device"].get<std::string>()   == "auto:0");
     TEST_ASSERT(rt["draft_device"].get<std::string>()    == "auto:0");
+    TEST_ASSERT(rt["continuous_batching"]["admission_coalesce_ms"]
+                    .get<int>() == 20);
     TEST_ASSERT(body["pflash"]["draft_residency"].get<std::string>() == "persistent");
 
     // draft_device is null when no draft model is loaded.
     cfg.draft_device.clear();
+    cfg.admission_coalesce_ms = 7;
     body = build_props_body(cfg, pc, tm);
     TEST_ASSERT(body["runtime"]["draft_device"].is_null());
+    TEST_ASSERT(body["runtime"]["continuous_batching"]
+                    ["admission_coalesce_ms"].get<int>() == 7);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -5322,10 +5546,15 @@ TEST_CASE(ServerUnitFixture, test_flowkv_T4_compress_true_policy_name_has_suffix
     TEST_ASSERT(name.find("+compress") != std::string::npos);
 }
 
-// T4: default DiskPrefixCachePolicy has compress=false (no-op).
+// T4: compression-aware disk clamping remains opt-in.
 TEST_CASE(ServerUnitFixture, test_flowkv_T4_default_no_compress) {
     DiskPrefixCachePolicy p;
-    TEST_ASSERT_MSG(!p.compress, "default compress must be false (byte-identical to pr364-base)");
+    TEST_ASSERT_MSG(!p.compress, "FlowKV disk clamping must default to off");
+    TEST_ASSERT(!http_detail::should_clamp_flowkv_disk_cache(true, p));
+
+    p.compress = true;
+    TEST_ASSERT(http_detail::should_clamp_flowkv_disk_cache(true, p));
+    TEST_ASSERT(!http_detail::should_clamp_flowkv_disk_cache(false, p));
 }
 
 // T6: frozen_block_key is deterministic — same tokens → same hash.
@@ -5445,16 +5674,40 @@ TEST_CASE(ServerUnitFixture, test_flowkv_T1_system_end_boundary_first) {
     }
 }
 
-// T5 (inert-guard): aged_token_estimate < 512 → FlowKV-OFF.
-// Tests the guard constant and comparison logic.
-TEST_CASE(ServerUnitFixture, test_flowkv_T5_inert_guard_token_count) {
-    static constexpr int kFkvInertMinTokens = 512;
-    // Below threshold: FlowKV should not fire.
-    TEST_ASSERT(400 < kFkvInertMinTokens);
-    TEST_ASSERT(511 < kFkvInertMinTokens);
-    // At or above threshold: FlowKV may fire.
-    TEST_ASSERT(512 >= kFkvInertMinTokens);
-    TEST_ASSERT(1024 >= kFkvInertMinTokens);
+// T5: exercise the production FlowKV activation decision and defaults.
+TEST_CASE(ServerUnitFixture, test_flowkv_T5_aggregate_activation_threshold) {
+    ServerConfig config;
+    config.pflash_mode = ServerConfig::PflashMode::AUTO;
+
+    TEST_ASSERT(http_detail::flowkv_activation_threshold(config) == 32000);
+    TEST_ASSERT(!http_detail::flowkv_should_activate(config, 13000));
+    TEST_ASSERT(http_detail::flowkv_should_activate(config, 32000));
+
+    config.pflash_threshold = 12000;
+    TEST_ASSERT(!http_detail::flowkv_should_activate(config, 11999));
+    TEST_ASSERT(http_detail::flowkv_should_activate(config, 13000));
+
+    config.pflash_mode = ServerConfig::PflashMode::ALWAYS;
+    TEST_ASSERT(http_detail::flowkv_activation_threshold(config) ==
+                http_detail::kFlowKvInertMinTokens);
+    TEST_ASSERT(http_detail::flowkv_should_activate(
+        config, http_detail::kFlowKvInertMinTokens));
+}
+
+// Session feedback overrides the static/curve ratio for both whole-prompt
+// PFlash and FlowKV.
+TEST_CASE(ServerUnitFixture, test_flowkv_session_keep_ratio_override) {
+    HttpServerSessions sessions;
+    sessions.update("adaptive", 0.95f);
+
+    const float configured_ratio = 0.05f;
+    const float static_ratio = http_detail::resolve_pflash_keep_ratio(
+        configured_ratio, "", sessions);
+    const float adaptive_ratio = http_detail::resolve_pflash_keep_ratio(
+        configured_ratio, "adaptive", sessions);
+
+    TEST_ASSERT(std::fabs(static_ratio - configured_ratio) < 1e-6f);
+    TEST_ASSERT(std::fabs(adaptive_ratio - 0.09f) < 1e-6f);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -5639,4 +5892,34 @@ TEST_CASE(ServerUnitFixture, test_gguf_bounds_error_reports_operands) {
     const std::string o = gguf_bounds_error("target GGUF", "t", "f32",
                                             kMax, 10, 10, 100);
     TEST_ASSERT(o.find("overflow") != std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_qwen35_embedded_mtp_target_layer_count) {
+    uint32_t target_layers = 0;
+    std::string error;
+
+    TEST_ASSERT(derive_effective_target_layer_count(
+        "qwen35", 64, 0, target_layers, error));
+    TEST_ASSERT(target_layers == 64);
+
+    TEST_ASSERT(derive_effective_target_layer_count(
+        "qwen35", 65, 1, target_layers, error));
+    TEST_ASSERT(target_layers == 64);
+
+    TEST_ASSERT(derive_effective_target_layer_count(
+        "qwen35moe", 81, 1, target_layers, error));
+    TEST_ASSERT(target_layers == 80);
+
+    TEST_ASSERT(!derive_effective_target_layer_count(
+        "qwen35", 1, 1, target_layers, error));
+    TEST_ASSERT(error.find("smaller than block_count") != std::string::npos);
+
+    TEST_ASSERT(!derive_effective_target_layer_count(
+        "qwen35", 0, 0, target_layers, error));
+    TEST_ASSERT(error.find("greater than zero") != std::string::npos);
+
+    // Do not reinterpret similarly named metadata for unrelated architectures.
+    TEST_ASSERT(derive_effective_target_layer_count(
+        "laguna", 65, 1, target_layers, error));
+    TEST_ASSERT(target_layers == 65);
 }

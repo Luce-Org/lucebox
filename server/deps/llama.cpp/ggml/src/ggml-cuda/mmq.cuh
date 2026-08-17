@@ -107,9 +107,9 @@ struct tile_x_sizes {
     int sc;
 };
 
-// RDNA uses 128x128, eight-warp MMQ tiles by default. ROCmFPX template
-// instances use 64x64, four-warp tiles: their unpacking pressure makes the
-// smaller tile faster on gfx1151 without changing other quant formats.
+// RDNA uses 128x128, eight-warp MMQ tiles by default. Q4_K narrows the row
+// dimension to 128x64, while ROCmFPX uses 64x64 four-warp tiles. Their
+// unpacking pressure makes the smaller tiles faster on gfx1151.
 #ifndef LUCEBOX_RDNA_MMQ_TILE_OVERRIDE
 #define LUCEBOX_RDNA_MMQ_TILE_OVERRIDE 1
 #endif
@@ -171,6 +171,8 @@ static int get_mmq_y_host(const int cc) {
     if (LUCEBOX_RDNA_TILE_HOST(cc)) {
 #if defined(GGML_CUDA_ROCMFPX_MMQ_TILE)
         return 64;
+#elif defined(LUCEBOX_RDNA_MMQ_Y)
+        return LUCEBOX_RDNA_MMQ_Y;
 #else
         return 128;
 #endif
@@ -191,6 +193,8 @@ static constexpr __device__ int get_mmq_y_device() {
 #if LUCEBOX_RDNA_TILE_DEVICE
 #if defined(GGML_CUDA_ROCMFPX_MMQ_TILE)
     return 64;
+#elif defined(LUCEBOX_RDNA_MMQ_Y)
+    return LUCEBOX_RDNA_MMQ_Y;
 #else
     return 128;
 #endif
@@ -344,6 +348,8 @@ static int mmq_get_nwarps_host(const int cc, const int warp_size) {
     if (LUCEBOX_RDNA_TILE_HOST(cc)) {
 #if defined(GGML_CUDA_ROCMFPX_MMQ_TILE)
         return 4;
+#elif defined(LUCEBOX_RDNA_MMQ_Y)
+        return 4;
 #else
         return 8;
 #endif
@@ -359,6 +365,8 @@ static int mmq_get_nwarps_host(const int /*cc*/, const int warp_size) {
 static constexpr __device__ int mmq_get_nwarps_device() {
 #if LUCEBOX_RDNA_TILE_DEVICE
 #if defined(GGML_CUDA_ROCMFPX_MMQ_TILE)
+    return 4;
+#elif defined(LUCEBOX_RDNA_MMQ_Y)
     return 4;
 #else
     return 8;

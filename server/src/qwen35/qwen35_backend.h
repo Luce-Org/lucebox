@@ -20,7 +20,8 @@
 #include "ddtree.h"
 #include "dflash_feature_ring.h"
 #include "common/dflash_draft_kv.h"
-#include "common/paged_kv_pool.h"
+#include "common/concurrency/paged_kv_pool.h"
+#include "concurrency/qwen35_seq_engine.h"
 #include "internal.h"         // TargetWeights, TargetCache, DraftWeights, PrefixSnapshot
 #include "qwen3/qwen3_drafter.h"  // DrafterContext, load_drafter, free_drafter, drafter_score_and_compress
 #include "kvflash_pager.h"         // bounded KV residency pool
@@ -54,6 +55,16 @@ struct Qwen35Config {
     int          fa_window       = 0;  // 0 = full attention. qwen3.6 full-attn layers must see the whole context; a finite window drops the system prompt/tools -> breaks tool calls.
     bool         paged_attention = false;
     int          kq_stride_pad   = 32;   // KQ_MASK_PAD or 256 for TBQ
+
+    // Concurrent slot serving (--max-concurrency). > 1 requires paged_attention:
+    // the backend allocates this many sequence slots (sequence-indexed
+    // recurrent state + one block-table column each) and serves them through
+    // a Qwen35SeqEngine instead of generate().
+    int          max_concurrency = 1;
+    // Total paged K/V pool size in tokens shared by all slots
+    // (--kv-pool-tokens; rounded up to whole 16-token blocks).
+    // 0 derives the shared physical capacity from available device memory.
+    int64_t      kv_pool_tokens  = 0;
 
     // Draft
     int          draft_swa_window = 0;
@@ -116,6 +127,8 @@ public:
                         int32_t last_tok = -1) override;
 
     CompressResult compress(const CompressRequest & req) override;
+    std::vector<CompressResult> compress_batch(
+        const std::vector<CompressRequest> & requests) override;
     bool handle_compress(const std::string & line,
                          const DaemonIO & io) override;
     void free_drafter() override;
@@ -126,6 +139,16 @@ public:
     bool supports_dflash_spec_decode() const override { return !cfg_.paged_attention; }
     DFlashTarget * dflash_target() override;
     bool supports_remote_draft() const override { return true; }
+
+    // ── Concurrent slot serving (paged AR decode over N sequences) ────
+    // Non-null once init() has built the engine (--max-concurrency N with paged
+    // attention); null otherwise, which is what tells the server to serve
+    // one request at a time through generate().
+    SeqEngine * seq_engine() override;
+
+    // EOS identity of the loaded weights. Model-level, so it stays on the
+    // backend and is shared by the AR decode path and the engine.
+    bool token_is_eos(int32_t token) const;
 
     void shutdown() override;
 
@@ -266,14 +289,35 @@ private:
     std::size_t     prefill_last_logits_offset_ = 0;
     bool            prefill_last_logits_valid_  = false;
 
-    // The HTTP worker still runs one request at a time. The allocator and
-    // attention op are sequence-aware; this first integration owns one live
-    // sequence until recurrent DeltaNet state is also sequence-indexed.
-    // Page size comes from PAGED_BLOCK_SIZE (internal.h), shared with the
-    // graph builder and the cache's block-aligned physical sizing.
+    // The single-request path owns one live sequence. The allocator and
+    // attention op are sequence-aware; concurrent serving uses the engine
+    // below and adds the Qwen-specific sequence-indexed DeltaNet state.
+    // Page size comes from PAGED_BLOCK_SIZE (paged_attention_config.h),
+    // shared with the graph builder and the cache's block-aligned sizing.
     std::unique_ptr<PagedKvPool> paged_kv_pool_;
     std::optional<PagedKvSequenceHandle> paged_sequence_;
     PagedKvRequestId paged_request_id_ = 0;
+
+    // ── Concurrent slot engine (--max-concurrency N; only when concurrent_slots()>1)
+    // Slot count from configuration alone: init() needs it to size the pool
+    // before the engine exists, and generate_impl() needs it to refuse the
+    // single-sequence path. Afterwards the engine is the authority
+    // (SeqEngine::slot_count()).
+    int concurrent_slots() const {
+        return cfg_.max_concurrency > 1 ? cfg_.max_concurrency : 1;
+    }
+
+    // Built by init() when the backend has more than one decode slot. It
+    // borrows this backend's weights, cache, step graph and paged pool —
+    // hence the friendship — and owns everything else concurrent serving
+    // needs (Qwen35SlotManager, slot prefill, the batched decode step).
+    std::unique_ptr<Qwen35SeqEngine> seq_engine_;
+    friend class Qwen35SeqEngine;
+
+    // DFLASH_MIN_TOKENS floor for the slot paths (mirrors do_ar_decode's
+    // EOS suppression); fetches the slot's logits row on demand.
+    int32_t apply_min_tokens_floor(int32_t tok, int generated,
+                                   size_t logits_row_offset);
 
     // ── DFlashTarget adapter (lazy-built) ────────────────────────────
     std::unique_ptr<DFlashTarget> dflash_target_;
