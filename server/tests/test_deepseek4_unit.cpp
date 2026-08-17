@@ -1178,6 +1178,30 @@ static void test_raw_ring_spans_after_wrap() {
     TEST_ASSERT(spans[1].count == 2);
     TEST_ASSERT(spans[0].count + spans[1].count == 7);
 
+    TEST_ASSERT(!deepseek4_exact_tokenwise_uses_runtime_raw_row(true, -1, 8));
+    TEST_ASSERT(!deepseek4_exact_tokenwise_uses_runtime_raw_row(true, 6, 8));
+    TEST_ASSERT(deepseek4_exact_tokenwise_uses_runtime_raw_row(true, 7, 8));
+    TEST_ASSERT(deepseek4_exact_tokenwise_uses_runtime_raw_row(true, 8, 8));
+    TEST_ASSERT(!deepseek4_exact_tokenwise_uses_runtime_raw_row(true, 8, 0));
+    // Default dynamic speculative verification is exact multi-token work too,
+    // but it must preserve its historical chronological-span topology.
+    TEST_ASSERT(!deepseek4_exact_tokenwise_uses_runtime_raw_row(false, 7, 8));
+    TEST_ASSERT(!deepseek4_exact_tokenwise_uses_runtime_raw_row(false, 8, 8));
+
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+static void test_exact_prefill_hybrid_ffn_sub_batch() {
+    std::fprintf(stderr, "  test_exact_prefill_hybrid_ffn_sub_batch ...");
+    // Exact q4 keeps prompt geometry but evaluates independent hybrid-FFN
+    // owner rows as q3+q1. Every non-exact caller retains its prior q4 batch.
+    TEST_ASSERT(deepseek4_exact_prefill_hybrid_ffn_sub_batch(true, 4) == 3);
+    TEST_ASSERT(deepseek4_exact_prefill_hybrid_ffn_sub_batch(true, 3) == 3);
+    TEST_ASSERT(deepseek4_exact_prefill_hybrid_ffn_sub_batch(true, 1) == 1);
+    TEST_ASSERT(deepseek4_exact_prefill_hybrid_ffn_sub_batch(false, 4) == 4);
+    TEST_ASSERT(deepseek4_exact_prefill_hybrid_ffn_sub_batch(false, 5) == 5);
+    TEST_ASSERT(deepseek4_exact_prefill_route_graph_requires_eager(true));
+    TEST_ASSERT(!deepseek4_exact_prefill_route_graph_requires_eager(false));
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
@@ -1468,6 +1492,8 @@ static void test_backend_sampling_penalizes_prompt_history() {
 
     auto decode_one = [&](const SamplerCfg & sampler) {
         backend.last_logits_ = {0.0f, 4.0f, 3.0f};
+        backend.last_logits_pos_ = 1;
+        backend.cache_.cur_pos = 1;
         backend.sampler_ = sampler;
         emitted.clear();
         std::vector<int32_t> generated;
@@ -1488,6 +1514,24 @@ static void test_backend_sampling_penalizes_prompt_history() {
     SamplerCfg penalized;
     penalized.rep_pen = 2.0f;
     TEST_ASSERT(decode_one(penalized) == 2);
+
+    backend.last_logits_ = {0.0f, 4.0f, 3.0f};
+    backend.last_logits_pos_ = 0;
+    backend.cache_.cur_pos = 1;
+    std::vector<int32_t> generated;
+    emitted.clear();
+    TEST_ASSERT(!backend.do_decode(
+        /*committed=*/1, /*n_gen=*/1, /*history_prefix=*/{1},
+        generated, io));
+    TEST_ASSERT(emitted.empty());
+
+    backend.last_logits_.clear();
+    backend.last_logits_pos_ = -1;
+    generated.clear();
+    TEST_ASSERT(!backend.do_decode(
+        /*committed=*/1, /*n_gen=*/1, /*history_prefix=*/{1},
+        generated, io));
+    TEST_ASSERT(emitted.empty());
 
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
@@ -1679,6 +1723,297 @@ static void test_safe_compressor_batch_tokens() {
     w.compress_ratios.clear();
     TEST_ASSERT(deepseek4_safe_compressor_batch_tokens(w, 17, 9) == 9);
     TEST_ASSERT(deepseek4_safe_compressor_batch_tokens(w, 17, 0) == 0);
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+static void test_exact_prefill_chunk_policy() {
+    std::fprintf(stderr, "  test_exact_prefill_chunk_policy ...");
+
+    TEST_ASSERT(!deepseek4_env_flag_value_enabled(nullptr));
+    TEST_ASSERT(!deepseek4_env_flag_value_enabled(""));
+    TEST_ASSERT(!deepseek4_env_flag_value_enabled("0"));
+    TEST_ASSERT(deepseek4_env_flag_value_enabled("1"));
+
+    TEST_ASSERT(deepseek4_prefill_chunk_tokens(
+        PrefillAttentionMode::Exact, /*exact_bands_enabled=*/false,
+        /*batch_supported=*/true, /*requested_chunk=*/4,
+        /*layer_major_cap=*/512) == 1);
+    TEST_ASSERT(deepseek4_prefill_chunk_tokens(
+        PrefillAttentionMode::Exact, /*exact_bands_enabled=*/true,
+        /*batch_supported=*/true, /*requested_chunk=*/1,
+        /*layer_major_cap=*/512) == 1);
+    TEST_ASSERT(deepseek4_prefill_chunk_tokens(
+        PrefillAttentionMode::Exact, true, true, 2, 512) == 2);
+    TEST_ASSERT(deepseek4_prefill_chunk_tokens(
+        PrefillAttentionMode::Exact, true, true, 3, 512) == 3);
+    TEST_ASSERT(deepseek4_prefill_chunk_tokens(
+        PrefillAttentionMode::Exact, true, true, 4, 512) == 4);
+    TEST_ASSERT(deepseek4_prefill_chunk_tokens(
+        PrefillAttentionMode::Exact, true, true, 8, 512) == 4);
+    TEST_ASSERT(deepseek4_prefill_chunk_tokens(
+        PrefillAttentionMode::Exact, true,
+        /*batch_supported=*/false, 4, 512) == 1);
+
+    TEST_ASSERT(deepseek4_prefill_chunk_tokens(
+        PrefillAttentionMode::Dense, false,
+        /*batch_supported=*/false, 8, 512) == 1);
+    TEST_ASSERT(deepseek4_prefill_chunk_tokens(
+        PrefillAttentionMode::Sparse, false,
+        /*batch_supported=*/true, 8, 512) == 8);
+    TEST_ASSERT(deepseek4_prefill_chunk_tokens(
+        PrefillAttentionMode::Sparse, false,
+        /*batch_supported=*/true, 1024, 512) == 512);
+
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+static void test_exact_prefill_band_schedule() {
+    std::fprintf(stderr, "  test_exact_prefill_band_schedule ...");
+    DeepSeek4Weights w;
+    w.compress_ratios = {4, 128};
+
+    for (int width = 1; width <= 4; ++width) {
+        for (int start = 0; start <= 5; ++start) {
+            for (int total = 1; total <= 9; ++total) {
+                int consumed = 0;
+                while (consumed < total) {
+                    int outer = std::min(width, total - consumed);
+                    int inner = 0;
+                    while (inner < outer) {
+                        const int pos = start + consumed + inner;
+                        const int step = deepseek4_safe_compressor_batch_tokens(
+                            w, pos, outer - inner);
+                        TEST_ASSERT(step >= 1 && step <= width);
+                        TEST_ASSERT((pos % 4) + step <= 4);
+                        inner += step;
+                    }
+                    TEST_ASSERT(inner == outer);
+                    consumed += outer;
+                }
+                TEST_ASSERT(consumed == total);
+            }
+        }
+    }
+
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+static void test_prefill_output_intents() {
+    std::fprintf(stderr, "  test_prefill_output_intents ...");
+
+    // Legacy/default exact q1 and explicit --chunk 1 retain both the
+    // established output topology and their historical host readback.
+    const auto legacy_q1 = deepseek4_prefill_output_intent(
+        PrefillAttentionMode::Exact, /*exact_bands_active=*/false,
+        /*n_tokens=*/1, /*is_final_chunk=*/false,
+        /*ends_at_snapshot=*/false, /*external_requires_logits=*/false);
+    TEST_ASSERT(legacy_q1.execute_output_path);
+    TEST_ASSERT(legacy_q1.readback_logits);
+
+    // Dense and sparse policies are outside exact-band readout elision.
+    for (PrefillAttentionMode mode :
+         {PrefillAttentionMode::Dense, PrefillAttentionMode::Sparse}) {
+        const auto intent = deepseek4_prefill_output_intent(
+            mode, false, 4, false, false, false);
+        TEST_ASSERT(intent.execute_output_path);
+        TEST_ASSERT(intent.readback_logits);
+    }
+
+    // Interior singleton leaves created by enabled q2/q3/q4 exact prefill
+    // preserve the q1/fused execution topology without a host logits readback.
+    DeepSeek4Weights failure_weights;
+    failure_weights.compress_ratios = {4, 128};
+    for (int width : {2, 3, 4}) {
+        TEST_ASSERT(deepseek4_safe_compressor_batch_tokens(
+                        failure_weights, /*kv_start=*/2763, width) == 1);
+        const auto fallback = deepseek4_prefill_output_intent(
+            PrefillAttentionMode::Exact, /*exact_bands_active=*/true,
+            /*n_tokens=*/1, /*is_final_chunk=*/false,
+            /*ends_at_snapshot=*/false,
+            /*external_requires_logits=*/false);
+        TEST_ASSERT_MSG(fallback.execute_output_path,
+                        "exact singleton must preserve output topology");
+        TEST_ASSERT_MSG(!fallback.readback_logits,
+                        "exact singleton must skip host logits readback");
+    }
+
+    // A capture-only singleton has the same topology requirement, but capture
+    // values are not an external vocabulary-logits consumer.
+    const auto capture_only = deepseek4_prefill_output_intent(
+        PrefillAttentionMode::Exact, true, 1, false, false, false);
+    TEST_ASSERT(capture_only.execute_output_path);
+    TEST_ASSERT(!capture_only.readback_logits);
+
+    // Final and exact snapshot endpoints still transfer current logits.
+    const auto final_singleton = deepseek4_prefill_output_intent(
+        PrefillAttentionMode::Exact, true, 1, true, false, false);
+    TEST_ASSERT(final_singleton.execute_output_path);
+    TEST_ASSERT(final_singleton.readback_logits);
+    const auto snapshot_singleton = deepseek4_prefill_output_intent(
+        PrefillAttentionMode::Exact, true, 1, false, true, false);
+    TEST_ASSERT(snapshot_singleton.execute_output_path);
+    TEST_ASSERT(snapshot_singleton.readback_logits);
+
+    // A genuine external vocabulary consumer is independently authoritative.
+    const auto external = deepseek4_prefill_output_intent(
+        PrefillAttentionMode::Exact, true, 4, false, false, true);
+    TEST_ASSERT(external.execute_output_path);
+    TEST_ASSERT(external.readback_logits);
+
+    // Geometry from the hardware failure: the 128-token capture window begins
+    // at 2891 - 128 == 2763. A q=2 band beginning at 2762 is split into an
+    // interior singleton ending at 2763, which must not read back logits.
+    constexpr int prompt_tokens = 2891;
+    constexpr int capture_begin = prompt_tokens - 128;
+    TEST_ASSERT(capture_begin == 2763);
+    TEST_ASSERT(DeepSeek4Backend::capture_safe_prefill_tokens(
+                    /*token_offset=*/2762, /*requested_tokens=*/2,
+                    /*final_capture_from=*/capture_begin,
+                    /*batch_final_capture=*/false,
+                    /*snapshot_pending=*/false,
+                    /*snapshot_capture_from=*/0,
+                    /*snapshot_capture_to=*/0) == 1);
+    TEST_ASSERT(deepseek4_safe_compressor_batch_tokens(
+                    failure_weights, capture_begin, /*n_tokens=*/2) == 1);
+    const auto failure_geometry = deepseek4_prefill_output_intent(
+        PrefillAttentionMode::Exact, true, 1,
+        /*is_final_chunk=*/false, /*ends_at_snapshot=*/false,
+        /*external_requires_logits=*/false);
+    TEST_ASSERT(failure_geometry.execute_output_path);
+    TEST_ASSERT(!failure_geometry.readback_logits);
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+static void test_prefill_readout_lifecycle_and_fused_exclusion() {
+    std::fprintf(stderr,
+                 "  test_prefill_readout_lifecycle_and_fused_exclusion ...");
+
+    std::vector<float> last_logits = {1.0f, 2.0f};
+    int last_logits_pos = 7;
+    deepseek4_invalidate_prefill_logits_if_skipped(
+        /*readback_logits=*/true, last_logits, last_logits_pos);
+    TEST_ASSERT(last_logits == std::vector<float>({1.0f, 2.0f}));
+    TEST_ASSERT(last_logits_pos == 7);
+    const auto prepared_no_readback = deepseek4_prepare_prefill_output_intent(
+        PrefillAttentionMode::Exact, /*exact_bands_active=*/true,
+        /*n_tokens=*/1, /*is_final_chunk=*/false,
+        /*ends_at_snapshot=*/false, /*external_requires_logits=*/false,
+        last_logits, last_logits_pos);
+    TEST_ASSERT(prepared_no_readback.execute_output_path);
+    TEST_ASSERT(!prepared_no_readback.readback_logits);
+    TEST_ASSERT(last_logits.empty());
+    TEST_ASSERT(last_logits_pos == -1);
+
+    // The production recursive selector scopes host-readback suppression to
+    // exact mode. Dense and sparse retain their legacy per-subchunk output.
+    for (PrefillAttentionMode mode :
+         {PrefillAttentionMode::Dense, PrefillAttentionMode::Sparse}) {
+        for (int width : {1, 2, 3, 4}) {
+            const auto interior = deepseek4_recursive_output_intent(
+                mode, /*parent_execute_output_path=*/true,
+                /*parent_has_output_storage=*/true,
+                /*is_last_shard=*/true, /*chunk_tokens=*/width,
+                /*is_final_chunk=*/false);
+            TEST_ASSERT(interior.execute_output_path);
+            TEST_ASSERT(interior.pass_output_storage);
+        }
+    }
+    const auto exact_interior = deepseek4_recursive_output_intent(
+        PrefillAttentionMode::Exact,
+        /*parent_execute_output_path=*/false,
+        /*parent_has_output_storage=*/false,
+        /*is_last_shard=*/true, /*chunk_tokens=*/1,
+        /*is_final_chunk=*/false);
+    TEST_ASSERT(exact_interior.execute_output_path);
+    TEST_ASSERT(!exact_interior.pass_output_storage);
+    const auto exact_final = deepseek4_recursive_output_intent(
+        PrefillAttentionMode::Exact,
+        /*parent_execute_output_path=*/true,
+        /*parent_has_output_storage=*/true,
+        /*is_last_shard=*/true, /*chunk_tokens=*/1,
+        /*is_final_chunk=*/true);
+    TEST_ASSERT(exact_final.execute_output_path);
+    TEST_ASSERT(exact_final.pass_output_storage);
+
+    // Final/snapshot readbacks must be current, vocabulary-sized values.
+    constexpr int vocab_size = 4;
+    TEST_ASSERT(deepseek4_commit_prefill_logits(
+        /*readback_logits=*/true, vocab_size, /*cache_position=*/2764,
+        std::vector<float>{1.0f, 2.0f, 3.0f, 4.0f},
+        last_logits, last_logits_pos));
+    TEST_ASSERT(last_logits.size() == vocab_size);
+    TEST_ASSERT(last_logits_pos == 2764);
+    TEST_ASSERT(deepseek4_commit_prefill_logits(
+        /*readback_logits=*/true, vocab_size, /*cache_position=*/2891,
+        std::vector<float>{4.0f, 3.0f, 2.0f, 1.0f},
+        last_logits, last_logits_pos));
+    TEST_ASSERT(last_logits.size() == vocab_size);
+    TEST_ASSERT(last_logits.front() == 4.0f);
+    TEST_ASSERT(last_logits_pos == 2891);
+
+    // A malformed readback cannot leave previously current logits visible.
+    TEST_ASSERT(!deepseek4_commit_prefill_logits(
+        /*readback_logits=*/true, vocab_size, /*cache_position=*/3000,
+        std::vector<float>{9.0f}, last_logits, last_logits_pos));
+    TEST_ASSERT(last_logits.empty());
+    TEST_ASSERT(last_logits_pos == -1);
+
+    std::vector<int> capture_ids = {1, 3};
+    std::vector<float> capture;
+    Ds4VerifyHooks prefill_hooks = deepseek4_make_prefill_capture_hooks(
+        &capture_ids, &capture, /*capture_token_begin=*/1,
+        /*capture_token_end=*/3);
+    TEST_ASSERT(prefill_hooks.capture_layer_ids == &capture_ids);
+    TEST_ASSERT(prefill_hooks.capture_out == &capture);
+    TEST_ASSERT(prefill_hooks.capture_token_begin == 1);
+    TEST_ASSERT(prefill_hooks.capture_token_end == 3);
+    TEST_ASSERT(!prefill_hooks.allow_fused_verify);
+    TEST_ASSERT(deepseek4_should_attempt_fused_hybrid_decode(
+        /*fused_hybrid_decode=*/true, /*full_layer_range=*/true,
+        /*execute_output_path=*/prepared_no_readback.execute_output_path,
+        /*gpu_backend=*/true, /*fused_verify_enabled=*/true));
+    TEST_ASSERT(!deepseek4_should_attempt_fused_hybrid_decode(
+        /*fused_hybrid_decode=*/true, /*full_layer_range=*/true,
+        /*execute_output_path=*/false,
+        /*gpu_backend=*/true, /*fused_verify_enabled=*/true));
+    TEST_ASSERT(!deepseek4_should_attempt_fused_verify(
+        /*n_tokens=*/4, &prefill_hooks,
+        /*owner_topology_supported=*/true,
+        /*full_layer_range=*/true,
+        /*has_logits_output=*/true,
+        /*gpu_backend=*/true,
+        /*fused_verify_enabled=*/true));
+
+    Ds4VerifyHooks verifier_hooks;
+    TEST_ASSERT(verifier_hooks.allow_fused_verify);
+    TEST_ASSERT(deepseek4_should_attempt_fused_verify(
+        /*n_tokens=*/DS4_CONSERVATIVE_VERIFY_MAX_TOKENS, &verifier_hooks,
+        /*owner_topology_supported=*/true,
+        /*full_layer_range=*/true,
+        /*has_logits_output=*/true,
+        /*gpu_backend=*/true,
+        /*fused_verify_enabled=*/true));
+    TEST_ASSERT(!deepseek4_should_attempt_fused_verify(
+        /*n_tokens=*/1, &verifier_hooks, true, true, true, true, true));
+    TEST_ASSERT(!deepseek4_should_attempt_fused_verify(
+        /*n_tokens=*/DS4_Q5_VERIFY_TOKENS,
+        &verifier_hooks, true, true, true, true, true));
+    TEST_ASSERT(!deepseek4_should_attempt_fused_verify(
+        /*n_tokens=*/DS4_Q5_VERIFY_TOKENS + 1,
+        &verifier_hooks, true, true, true, true, true));
+    TEST_ASSERT(!deepseek4_should_attempt_wide_fused_verify(
+        DS4_Q5_VERIFY_TOKENS, &verifier_hooks,
+        /*q5_enabled=*/false, true, true, true, true, true));
+    TEST_ASSERT(deepseek4_should_attempt_wide_fused_verify(
+        DS4_Q5_VERIFY_TOKENS, &verifier_hooks,
+        /*q5_enabled=*/true, true, true, true, true, true));
+    TEST_ASSERT(!deepseek4_should_attempt_wide_fused_verify(
+        DS4_Q5_VERIFY_TOKENS, &verifier_hooks,
+        /*q5_enabled=*/true, true, true,
+        /*has_output_storage=*/false, true, true));
+    TEST_ASSERT(!deepseek4_should_attempt_wide_fused_verify(
+        DS4_CONSERVATIVE_VERIFY_MAX_TOKENS, &verifier_hooks,
+        /*q5_enabled=*/true, true, true, true, true, true));
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
@@ -4111,6 +4446,7 @@ int main() {
     test_indexer_mask_cpu(backend);
     test_hash_routing_lookup();
     test_raw_ring_spans_after_wrap();
+    test_exact_prefill_hybrid_ffn_sub_batch();
     test_auto_split_computation();
     test_layer_range_validation();
     test_hc_state_dimensions();
@@ -4127,6 +4463,10 @@ int main() {
     test_dspark_loader_contract_and_bounds(backend);
     test_dspark_confidence_uses_separate_hidden(backend);
     test_safe_compressor_batch_tokens();
+    test_exact_prefill_chunk_policy();
+    test_exact_prefill_band_schedule();
+    test_prefill_output_intents();
+    test_prefill_readout_lifecycle_and_fused_exclusion();
     test_hybrid_prefill_chunk_tokens();
     test_dspark_park_all_releases_drafter();
     test_dspark_raw_ring_rollback_after_wrap(backend);
