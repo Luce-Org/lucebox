@@ -229,6 +229,27 @@ bool CanonicalToolInvocation::from_tool_call(
     }
 }
 
+bool build_tool_speculation_prediction(
+        const std::string & name,
+        const json & arguments,
+        double confidence,
+        ToolSpeculationPrediction & out,
+        std::string & error) {
+    if (!std::isfinite(confidence) || confidence < 0.0 || confidence > 1.0) {
+        error = "tool prediction confidence must be between 0 and 1";
+        return false;
+    }
+    CanonicalToolInvocation invocation;
+    if (!CanonicalToolInvocation::from_parts(
+            name, arguments, invocation, error)) {
+        return false;
+    }
+    out.call = std::move(invocation);
+    out.confidence = confidence;
+    error.clear();
+    return true;
+}
+
 bool parse_tool_speculation_prediction(
         const json & value,
         const json & tools,
@@ -261,18 +282,17 @@ bool parse_tool_speculation_prediction(
         error = "tool_speculation.call.arguments is required";
         return false;
     }
-    CanonicalToolInvocation invocation;
-    if (!CanonicalToolInvocation::from_parts(
-            call["name"].get<std::string>(), call["arguments"], invocation,
-            error)) {
+    ToolSpeculationPrediction prediction;
+    if (!build_tool_speculation_prediction(
+            call["name"].get<std::string>(), call["arguments"], confidence,
+            prediction, error)) {
         return false;
     }
-    if (!request_declares_tool(tools, invocation.name)) {
+    if (!request_declares_tool(tools, prediction.call.name)) {
         error = "tool_speculation.call.name is not declared in tools";
         return false;
     }
-    out.call = std::move(invocation);
-    out.confidence = confidence;
+    out = std::move(prediction);
     error.clear();
     return true;
 }

@@ -4,6 +4,7 @@
 #include <nlohmann/json.hpp>
 
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <memory>
 #include <stdexcept>
@@ -28,6 +29,7 @@ using dflash::common::ToolSpeculationExecution;
 using dflash::common::ToolSpeculationExecutor;
 using dflash::common::ToolSpeculationPolicy;
 using dflash::common::ToolSpeculationPrediction;
+using dflash::common::build_tool_speculation_prediction;
 using dflash::common::json;
 using dflash::common::parse_tool_speculation_prediction;
 using dflash::common::parse_tool_speculation_cpu_affinity;
@@ -213,6 +215,21 @@ TEST_CASE(ToolSpeculationFixture, canonical_identity_ignores_argument_order) {
         "lookup", json{{"a", 1}, {"b", 2}}, second, error));
     CHECK(first == second);
     CHECK(first.arguments_json == R"({"a":1,"b":2})");
+}
+
+TEST_CASE(ToolSpeculationFixture, engine_prediction_uses_canonical_boundary) {
+    ToolSpeculationPrediction value;
+    std::string error;
+    CHECK(build_tool_speculation_prediction(
+        "lookup", json{{"b", 2}, {"a", 1}}, 0.75, value, error));
+    CHECK(error.empty());
+    CHECK(value.call.name == "lookup");
+    CHECK(value.call.arguments_json == "{\"a\":1,\"b\":2}");
+    CHECK(std::fabs(value.confidence - 0.75) < 1e-9);
+    CHECK(!build_tool_speculation_prediction(
+        "lookup", json::array(), 0.75, value, error));
+    CHECK(!build_tool_speculation_prediction(
+        "lookup", json::object(), 1.01, value, error));
 }
 
 TEST_CASE(ToolSpeculationFixture, prediction_requires_declared_tool) {

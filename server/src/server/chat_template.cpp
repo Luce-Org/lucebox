@@ -44,6 +44,23 @@ static const char QWEN3_TOOL_SUFFIX[] =
     "current knowledge and do not tell the user about function calls\n"
     "</IMPORTANT>";
 
+static const char DEEPSEEK4_TOOL_PREAMBLE[] =
+    "# Tools\n\nYou have access to these functions:\n<tools>\n";
+
+static const char DEEPSEEK4_TOOL_FORMAT[] =
+    "\n</tools>\n\n"
+    "When calling a function, reply with exactly one call in this format "
+    "and nothing after it:\n"
+    "<tool_call>\n"
+    "<function=FUNCTION_NAME>\n"
+    "<parameter=PARAMETER_NAME>\n"
+    "PARAMETER_VALUE\n"
+    "</parameter>\n"
+    "</function>\n"
+    "</tool_call>\n"
+    "Use the exact function and parameter names from <tools>, and include all "
+    "required parameters.";
+
 ChatFormat chat_format_for_arch(const std::string & arch) {
     if (arch == "deepseek4") return ChatFormat::DEEPSEEK4;
     if (arch == "laguna") return ChatFormat::LAGUNA;
@@ -57,7 +74,8 @@ std::string render_chat_template(
     ChatFormat format,
     bool add_generation_prompt,
     bool enable_thinking,
-    const std::string & tools_json)
+    const std::string & tools_json,
+    bool tool_call_required)
 {
     std::string result;
     bool has_tools = !tools_json.empty() && tools_json != "[]" && tools_json != "null";
@@ -370,10 +388,12 @@ std::string render_chat_template(
 
         result = "<｜begin▁of▁sentence｜>";
         if (has_tools) {
-            // Tool schema rendering is not implemented for the native DSML
-            // path yet; keep the JSON visible in the system prefix rather than
-            // silently dropping it.
+            result += DEEPSEEK4_TOOL_PREAMBLE;
             result += tools_json;
+            result += DEEPSEEK4_TOOL_FORMAT;
+            result += tool_call_required
+                ? "\nYou MUST call exactly one of these functions to answer this request."
+                : "\nIf a function is applicable, call it instead of answering from memory.";
             if (has_system) result += "\n\n";
         }
         result += system_content;

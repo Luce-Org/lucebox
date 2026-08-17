@@ -134,7 +134,11 @@ bool load_qwen3_drafter_model(const std::string & path,
     out.head_dim   = (int)get_u32(gctx, "qwen3.attention.key_length", 128);
     out.rope_theta = get_f32(gctx, "qwen3.rope.freq_base", 1000000.0f);
 
-    // Detect weight quant type from blk.0.attn_q.weight; support BF16 and Q8_0.
+    // Preserve Q8_0 storage when the predictor reuses the production compact
+    // GGUF.  Activations/KV still use the backend precision policy; ggml's
+    // mul_mat and get_rows kernels dequantize Q8_0 weights as they are read.
+    // This avoids expanding a 0.6B sidecar to BF16 merely to use the native
+    // IPC lane.
     ggml_type wtype = GGML_TYPE_BF16;
     {
         int64_t tidx = gguf_find_tensor(gctx, "blk.0.attn_q.weight");
@@ -142,8 +146,16 @@ bool load_qwen3_drafter_model(const std::string & path,
             wtype = gguf_get_tensor_type(gctx, tidx);
         }
     }
+    if (wtype == GGML_TYPE_Q8_0) {
+        out.weight_type = GGML_TYPE_Q8_0;
+    } else if (wtype != GGML_TYPE_BF16 && wtype != GGML_TYPE_F16) {
+        set_last_error(std::string("unsupported Qwen3-0.6B weight type: ") +
+                       ggml_type_name(wtype));
+        gguf_free(gctx);
+        return false;
+    }
     std::fprintf(stderr, "[qwen3-0.6b] detected weight type: %s\n",
-                 wtype == GGML_TYPE_Q8_0 ? "Q8_0" : "BF16");
+                 ggml_type_name(wtype));
     std::fflush(stderr);
 
     // Compute total tensor metadata size for context allocation.

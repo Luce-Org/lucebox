@@ -25,6 +25,7 @@ enum class BackendIpcMode {
     Invalid,
     DFlashDraft,
     PFlashCompress,
+    Qwen3ToolPredict,
     Qwen35TargetShard,
     Gemma4TargetShard,
     LagunaTargetShard,

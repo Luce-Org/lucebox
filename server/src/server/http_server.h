@@ -19,6 +19,8 @@
 #include "chat_template.h"
 #include "tool_memory.h"
 #include "tool_speculation.h"
+#include "semantic_tool_hint.h"
+#include "native_semantic_tool_predictor.h"
 #include "prefix_cache.h"
 #include "disk_prefix_cache.h"
 #include "freeze_history.h"
@@ -36,6 +38,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -224,6 +227,10 @@ struct ServerConfig {
     // an executor, an empirical interference profile, and an explicit
     // read-only/idempotent tool allowlist.
     ToolSpeculationConfig tool_speculation;
+    // Model-agnostic tool-call prediction. Native predictors run before the
+    // model by default so shared accelerator compute cannot slow decoding;
+    // remote predictors may overlap. DS4 verifies the exact canonical call.
+    SemanticToolPredictorConfig semantic_tool_predictor;
 };
 
 // ─── Parsed request ─────────────────────────────────────────────────────
@@ -247,6 +254,18 @@ struct ParsedRequest {
     // The engine may execute it privately, but never exposes its result until
     // the model emits the exact canonical invocation.
     std::optional<ToolSpeculationPrediction> tool_speculation;
+    // Engine-side Qwen prediction may start a private external tool as soon
+    // as it is ready. The model's eventual canonical call remains authoritative.
+    struct AutomaticToolSpeculationLaunch {
+        std::shared_ptr<ToolSpeculationAttempt> attempt;
+        double predictor_wall_ms = 0.0;
+        std::string prediction_source;
+        std::string predictor_error;
+    };
+    bool                      automatic_tool_speculation_enabled = true;
+    std::shared_future<AutomaticToolSpeculationLaunch>
+                              automatic_tool_speculation;
+    std::shared_future<SemanticToolPrediction> semantic_tool_prediction;
     // Response ID
     std::string               response_id;
     // Thinking/reasoning state
@@ -313,6 +332,10 @@ public:
 
     // Set the chat template format (detected from model arch).
     void set_chat_format(ChatFormat fmt) { chat_format_ = fmt; }
+
+    // Start the optional native Qwen predictor after target construction.
+    // HTTP-only predictor configurations need no persistent initialization.
+    bool init_semantic_tool_predictor(std::string & error);
 
     // Start listening. Blocks until shutdown() is called.
     int run();
@@ -431,6 +454,7 @@ private:
         ParsedRequest & req);
     bool validate_request_context(SocketHandle fd, const ParsedRequest & req);
     void log_parsed_request(const ParsedRequest & req) const;
+    void launch_semantic_tool_prediction(ParsedRequest & req) const;
     void enqueue_request_and_wait(SocketHandle fd, ParsedRequest req);
 
     // Send HTTP response helpers.
@@ -457,6 +481,7 @@ private:
     ServerConfig     config_;
     ChatFormat       chat_format_;
     PFlashDrafterIpcClient pflash_remote_;
+    std::shared_ptr<NativeSemanticToolPredictor> native_semantic_predictor_;
     ToolMemory       tool_memory_;
     PrefixCache      prefix_cache_;
     DiskPrefixCache  disk_cache_;

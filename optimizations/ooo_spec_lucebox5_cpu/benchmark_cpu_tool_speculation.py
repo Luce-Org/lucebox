@@ -32,6 +32,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 TOOL_NAME = "benchmark_cpu_sparse"
 PROTOCOL = "dflash.tool-speculation.v1"
+NATIVE_PREDICTION_SOURCE = "native-qwen3"
 SPARSE_ROWS = 4096
 SPARSE_NONZEROS_PER_ROW = 16
 SPARSE_THREADS = 2
@@ -102,8 +103,11 @@ def request_body(
     max_tokens: int,
     *,
     prediction: dict[str, int] | None,
+    automatic_prediction: bool = False,
+    tool_choice: str | None = None,
 ) -> dict[str, Any]:
     compact = json.dumps(arguments, separators=(",", ":"))
+    prompt = f"Return only this JSON object and nothing else: {compact}"
     body: dict[str, Any] = {
         "model": "dflash",
         "stream": False,
@@ -112,11 +116,14 @@ def request_body(
         "messages": [
             {
                 "role": "user",
-                "content": f"Return only this JSON object and nothing else: {compact}",
+                "content": prompt,
             }
         ],
         "tools": [tool_definition()],
+        "automatic_tool_speculation": automatic_prediction,
     }
+    if tool_choice is not None:
+        body["tool_choice"] = tool_choice
     if prediction is not None:
         body["tool_speculation"] = {
             "call": {"name": TOOL_NAME, "arguments": prediction},
@@ -168,6 +175,14 @@ def normalize_tool_call(result: dict[str, Any]) -> dict[str, Any] | None:
                 parsed.get("arguments", parsed.get("function_args")),
             ),
         )
+        if (
+            arguments is None
+            and isinstance(parsed.get("parameter"), str)
+            and "parameter_value" in parsed
+        ):
+            # DeepSeek may serialize a one-argument native call as a compact
+            # name/value envelope. It is semantically the same function call.
+            arguments = {parsed["parameter"]: parsed["parameter_value"]}
         if arguments is None and isinstance(name, str):
             arguments = {
                 key: value
@@ -246,10 +261,18 @@ def post_model(
     timeout: float,
     *,
     prediction: dict[str, int] | None = None,
+    automatic_prediction: bool = False,
+    tool_choice: str | None = None,
 ) -> dict[str, Any]:
     result, wall_ms = post_json(
         url,
-        request_body(arguments, max_tokens, prediction=prediction),
+        request_body(
+            arguments,
+            max_tokens,
+            prediction=prediction,
+            automatic_prediction=automatic_prediction,
+            tool_choice=tool_choice,
+        ),
         timeout,
     )
     return observation(result, wall_ms)
@@ -772,6 +795,94 @@ def native_speculative(
     }
 
 
+def native_qwen_control(
+    args: argparse.Namespace,
+    arguments: dict[str, int],
+    label: str,
+) -> dict[str, Any]:
+    started = time.perf_counter()
+    model = post_model(
+        args.url,
+        arguments,
+        args.max_tokens,
+        args.timeout,
+        automatic_prediction=False,
+        tool_choice="required",
+    )
+    tool = run_executor(
+        args.binary,
+        arguments,
+        args.tool_cpus,
+        args.timeout,
+        f"{label}-tool",
+    )
+    validate_model_call(model, arguments)
+    result = tool["result"]
+    return {
+        "mode": "control",
+        "task_ms": (time.perf_counter() - started) * 1000.0,
+        **model,
+        "tool_wall_ms": float(tool["wall_ms"]),
+        "tool_compute_ms": float(result["compute_ms"]),
+        "tool_checksum": result["checksum"],
+        "tool_cpu_affinity": result["cpu_affinity"],
+        "prediction_hit": False,
+        "predictor_wall_ms": 0.0,
+    }
+
+
+def native_qwen_speculative(
+    args: argparse.Namespace,
+    arguments: dict[str, int],
+    label: str,
+) -> dict[str, Any]:
+    started = time.perf_counter()
+    model = post_model(
+        args.url,
+        arguments,
+        args.max_tokens,
+        args.timeout,
+        automatic_prediction=True,
+        tool_choice="required",
+    )
+    validate_model_call(model, arguments)
+    metadata = model["speculation"] if isinstance(
+        model["speculation"], dict
+    ) else {}
+    prediction_hit = metadata.get("status") == "hit"
+    if prediction_hit:
+        tool_result = metadata.get("result")
+        if not isinstance(tool_result, dict):
+            raise RuntimeError("automatic hit did not expose a tool result")
+        tool_wall_ms = float(metadata.get("executor_wall_ms", math.nan))
+    else:
+        # This is the real miss path: discard the private speculative result,
+        # then execute the authoritative model call normally.
+        fallback = run_executor(
+            args.binary,
+            arguments,
+            args.tool_cpus,
+            args.timeout,
+            f"{label}-fallback",
+        )
+        tool_result = fallback["result"]
+        tool_wall_ms = float(fallback["wall_ms"])
+    return {
+        "mode": "qwen_speculative",
+        "task_ms": (time.perf_counter() - started) * 1000.0,
+        **model,
+        "tool_wall_ms": tool_wall_ms,
+        "tool_compute_ms": float(tool_result["compute_ms"]),
+        "tool_checksum": tool_result["checksum"],
+        "tool_cpu_affinity": tool_result["cpu_affinity"],
+        "prediction_hit": prediction_hit,
+        "predictor_wall_ms": float(metadata.get("predictor_wall_ms", 0.0)),
+        "prediction_source": metadata.get("prediction_source"),
+        "prediction_status": metadata.get("status"),
+        "prediction_reason": metadata.get("reason"),
+    }
+
+
 def summarize_native(
     pairs: list[dict[str, Any]], resamples: int, seed: int
 ) -> dict[str, Any]:
@@ -793,11 +904,28 @@ def summarize_native(
     speculative_tool = statistics.median(
         row["tool_compute_ms"] for row in speculative
     )
+    paired_speedups = [
+        float(pair["control"]["task_ms"])
+        / float(pair["speculative"]["task_ms"])
+        for pair in pairs
+    ]
     return {
         "pairs": len(pairs),
         "control_task_p50_ms": control_task,
+        "control_task_p95_ms": percentile(
+            (row["task_ms"] for row in controls), 0.95
+        ),
+        "control_task_max_ms": max(row["task_ms"] for row in controls),
         "speculative_task_p50_ms": speculative_task,
+        "speculative_task_p95_ms": percentile(
+            (row["task_ms"] for row in speculative), 0.95
+        ),
+        "speculative_task_max_ms": max(
+            row["task_ms"] for row in speculative
+        ),
         "exact_hit_speedup": control_task / speculative_task,
+        "paired_speedup_p05": percentile(paired_speedups, 0.05),
+        "paired_speedup_min": min(paired_speedups),
         "exact_hit_speedup_bootstrap_95ci": bootstrap_speedup_ci(
             pairs, resamples, seed
         ),
@@ -1019,6 +1147,134 @@ def native(args: argparse.Namespace) -> None:
         raise SystemExit("native CPU tool-speculation production gate failed")
 
 
+def native_qwen(args: argparse.Namespace) -> None:
+    props = get_json(props_url(args.url), args.timeout)
+    tool_props = props.get("tool_speculation")
+    if not isinstance(tool_props, dict) or not tool_props.get("enabled"):
+        raise SystemExit("server tool speculation is not enabled")
+    if not tool_props.get("automatic_prediction_enabled"):
+        raise SystemExit("server automatic Qwen prediction is not enabled")
+    if tool_props.get("execution_mode") != "child_process_cpu_affinity":
+        raise SystemExit("automatic benchmark requires the isolated CPU executor")
+    if tool_props.get("tool_cpu_affinity") != args.tool_cpus:
+        raise SystemExit("server tool CPU affinity differs from benchmark")
+
+    arguments = expected_arguments(
+        args.rows,
+        args.nonzeros_per_row,
+        args.iterations,
+        args.threads,
+        args.tool_seed,
+    )
+    for warmup in range(args.warmups):
+        native_qwen_control(
+            args, arguments, f"qwen-warm-{warmup}-control"
+        )
+        native_qwen_speculative(
+            args, arguments, f"qwen-warm-{warmup}-speculative"
+        )
+
+    generator = random.Random(args.seed)
+    pairs: list[dict[str, Any]] = []
+    for pair_index in range(args.pairs):
+        order = ["control", "speculative"]
+        generator.shuffle(order)
+        rows: dict[str, dict[str, Any]] = {}
+        for arm in order:
+            rows[arm] = (
+                native_qwen_control(
+                    args, arguments, f"qwen-{pair_index}-control"
+                )
+                if arm == "control"
+                else native_qwen_speculative(
+                    args, arguments, f"qwen-{pair_index}-speculative"
+                )
+            )
+        pairs.append({"pair_index": pair_index, "arm_order": order, **rows})
+        print(json.dumps({
+            "phase": "native-qwen",
+            "pair": pair_index + 1,
+            "control_ms": round(rows["control"]["task_ms"], 3),
+            "speculative_ms": round(rows["speculative"]["task_ms"], 3),
+            "speedup": round(
+                rows["control"]["task_ms"] /
+                rows["speculative"]["task_ms"], 3),
+            "prediction_status": rows["speculative"]["prediction_status"],
+            "predictor_ms": round(
+                rows["speculative"]["predictor_wall_ms"], 3),
+        }, sort_keys=True), flush=True)
+
+    summary = summarize_native(pairs, args.bootstrap_resamples, args.seed)
+    speculative = [pair["speculative"] for pair in pairs]
+    hits = sum(row["prediction_hit"] for row in speculative)
+    summary.update({
+        "qwen_prediction_hits": hits,
+        "qwen_prediction_hit_rate": hits / len(speculative),
+        "qwen_predictor_p50_ms": statistics.median(
+            row["predictor_wall_ms"] for row in speculative
+        ),
+        "qwen_predictor_p95_ms": percentile(
+            (row["predictor_wall_ms"] for row in speculative), 0.95
+        ),
+        "qwen_prediction_source_valid": all(
+            row["prediction_source"] == NATIVE_PREDICTION_SOURCE
+            for row in speculative
+        ),
+    })
+    checks = {
+        "all_model_outputs_identical": summary["all_model_outputs_identical"],
+        "all_calls_identical": summary["all_calls_identical"],
+        "all_tool_outputs_equivalent": summary["all_tool_outputs_equivalent"],
+        "ds4_active": summary["median_accept_rate"] > 0,
+        "prediction_source": summary["qwen_prediction_source_valid"],
+        "prediction_hit_rate":
+            summary["qwen_prediction_hit_rate"] >= args.min_prediction_hit_rate,
+        "speedup": summary["exact_hit_speedup"] >= args.min_speedup,
+        "speedup_ci_low":
+            summary["exact_hit_speedup_bootstrap_95ci"][0] >=
+            args.min_speedup_ci_low,
+        "speedup_p05":
+            summary["paired_speedup_p05"] >= args.min_speedup_p05,
+        "model_slowdown": summary["model_compute_slowdown_percent"] <=
+            args.max_model_slowdown_percent,
+    }
+    report = {
+        "phase": "native_qwen_engine",
+        "host": "lucebox5",
+        "config": report_config(args, arguments),
+        "methodology": {
+            "control": "DS4 generation, then the authoritative CPU-pinned tool",
+            "speculative": "Qwen3-0.6B predicts the call; the engine launches the private CPU-pinned tool before DS4 finishes",
+            "prediction_cost": "included in speculative request wall time",
+            "miss_cost": "included by running the authoritative tool after every miss",
+            "commit": "exact canonical function name and arguments",
+            "semantic_token_injection": False,
+        },
+        "server_snapshot": {"tool_speculation": tool_props},
+        "production_gate": {
+            "passed": all(checks.values()),
+            "checks": checks,
+            "thresholds": {
+                "min_speedup": args.min_speedup,
+                "min_speedup_ci_low": args.min_speedup_ci_low,
+                "min_speedup_p05": args.min_speedup_p05,
+                "min_prediction_hit_rate": args.min_prediction_hit_rate,
+                "max_model_slowdown_percent":
+                    args.max_model_slowdown_percent,
+            },
+        },
+        "summary": summary,
+        "pairs": pairs,
+    }
+    write_report(args.output, report)
+    print(json.dumps({
+        "production_gate": report["production_gate"],
+        "summary": summary,
+    }, indent=2, sort_keys=True), flush=True)
+    if not report["production_gate"]["passed"]:
+        raise SystemExit("automatic Qwen tool-speculation gate failed")
+
+
 def report_config(
     args: argparse.Namespace, arguments: dict[str, int]
 ) -> dict[str, Any]:
@@ -1091,6 +1347,15 @@ def main() -> None:
     native_parser.add_argument("--min-speedup", type=float, default=1.80)
     native_parser.add_argument("--min-speedup-ci-low", type=float, default=1.70)
 
+    qwen_parser = subparsers.add_parser("native-qwen")
+    add_common_arguments(qwen_parser)
+    qwen_parser.add_argument("--iterations", type=int, required=True)
+    qwen_parser.add_argument("--bootstrap-resamples", type=int, default=20_000)
+    qwen_parser.add_argument("--min-speedup", type=float, default=1.60)
+    qwen_parser.add_argument("--min-speedup-ci-low", type=float, default=1.50)
+    qwen_parser.add_argument("--min-speedup-p05", type=float, default=1.25)
+    qwen_parser.add_argument("--min-prediction-hit-rate", type=float, default=0.90)
+
     args = parser.parse_args()
     if not args.binary.is_file():
         parser.error(f"executor binary does not exist: {args.binary}")
@@ -1128,7 +1393,16 @@ def main() -> None:
             or args.min_speedup_ci_low > args.min_speedup
         ):
             parser.error("native benchmark settings are invalid")
-        native(args)
+        if args.phase == "native-qwen":
+            if (
+                not 0.0 <= args.min_prediction_hit_rate <= 1.0
+                or args.min_speedup_p05 <= 1.0
+                or args.min_speedup_p05 > args.min_speedup
+            ):
+                parser.error("native Qwen benchmark settings are invalid")
+            native_qwen(args)
+        else:
+            native(args)
 
 
 if __name__ == "__main__":

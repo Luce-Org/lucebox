@@ -3,7 +3,6 @@
 #include "../src/common/moe_hybrid_storage.h"
 
 #include <cstdint>
-#include <cstring>
 #include <vector>
 
 using namespace dflash::common;
@@ -68,10 +67,7 @@ TEST_CASE(MoeHybridStorageFixture, fractional_route_quota_rounds_over_the_batch)
         ctx, ids, weights, local_lut, candidate_lut,
         /*main_slots_x4=*/18, /*main_owner=*/true);
     REQUIRE(owner_ids != nullptr);
-    int32_t main_quota = 0;
-    std::memcpy(&main_quota,
-                owner_ids->op_params + sizeof(int32_t),
-                sizeof(main_quota));
+    const int32_t main_quota = owner_ids->op_params[1];
     REQUIRE(main_quota == 23);
 
     ggml_free(ctx);

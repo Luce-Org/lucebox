@@ -34,6 +34,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cctype>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -71,6 +72,7 @@ static inline bool sock_is_eintr (int e) { return e == WSAEINTR; }
 static inline bool sock_is_eagain(int e) { return e == WSAEWOULDBLOCK; }
 #else
 #include <fcntl.h>
+#include <netdb.h>
 #include <sys/stat.h>
 static inline int sock_get_flags(SocketHandle fd) { return fcntl(fd, F_GETFL, 0); }
 static inline void sock_set_nonblock(SocketHandle fd) { int f = fcntl(fd, F_GETFL, 0); if (f >= 0) fcntl(fd, F_SETFL, f | O_NONBLOCK); }
@@ -409,6 +411,262 @@ static bool curl_forward(const std::string & url,
 }
 #endif // DFLASH_HAS_CURL
 
+namespace {
+
+struct SemanticSidecarUrl {
+    std::string host;
+    std::string port;
+    std::string path;
+};
+
+bool parse_semantic_sidecar_url(
+        const std::string & value, SemanticSidecarUrl & out) {
+    constexpr char kHttpPrefix[] = "http://";
+    if (value.rfind(kHttpPrefix, 0) != 0) return false;
+    const size_t authority_begin = sizeof(kHttpPrefix) - 1;
+    const size_t path_begin = value.find('/', authority_begin);
+    const std::string authority = value.substr(
+        authority_begin,
+        path_begin == std::string::npos
+            ? std::string::npos
+            : path_begin - authority_begin);
+    if (authority.empty() || authority.find('@') != std::string::npos) {
+        return false;
+    }
+
+    const size_t colon = authority.rfind(':');
+    if (colon == std::string::npos) {
+        out.host = authority;
+        out.port = "80";
+    } else {
+        out.host = authority.substr(0, colon);
+        out.port = authority.substr(colon + 1);
+    }
+    out.path = path_begin == std::string::npos
+        ? "/" : value.substr(path_begin);
+    if (out.host.empty() || out.port.empty() || out.path.empty()) return false;
+    if (out.host.front() == '[' || out.host.find(':') != std::string::npos) {
+        // The production bridge is loopback IPv4. Reject ambiguous IPv6
+        // authority parsing instead of silently connecting to the wrong host.
+        return false;
+    }
+    return std::all_of(out.port.begin(), out.port.end(), [](unsigned char ch) {
+        return std::isdigit(ch) != 0;
+    });
+}
+
+bool semantic_sidecar_send_all(
+        SocketHandle fd, const char * data, size_t size) {
+    size_t sent = 0;
+    while (sent < size) {
+#if defined(_WIN32)
+        const int n = ::send(
+            fd, data + sent,
+            static_cast<int>(std::min<size_t>(size - sent, INT_MAX)), 0);
+#else
+        const ssize_t n = ::send(
+            fd, data + sent, size - sent, MSG_NOSIGNAL);
+#endif
+        if (n <= 0) return false;
+        sent += static_cast<size_t>(n);
+    }
+    return true;
+}
+
+void set_semantic_sidecar_socket_timeout(SocketHandle fd, int timeout_ms) {
+#if defined(_WIN32)
+    const DWORD timeout = static_cast<DWORD>(timeout_ms);
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO,
+               reinterpret_cast<const char *>(&timeout), sizeof(timeout));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO,
+               reinterpret_cast<const char *>(&timeout), sizeof(timeout));
+#else
+    struct timeval timeout{};
+    timeout.tv_sec = timeout_ms / 1000;
+    timeout.tv_usec = (timeout_ms % 1000) * 1000;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+#endif
+}
+
+std::string lowercase_ascii(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(),
+        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    return value;
+}
+
+bool decode_chunked_http_body(
+        const std::string & encoded, std::string & decoded) {
+    size_t offset = 0;
+    while (true) {
+        const size_t line_end = encoded.find("\r\n", offset);
+        if (line_end == std::string::npos) return false;
+        const std::string size_text = encoded.substr(offset, line_end - offset);
+        const size_t extension = size_text.find(';');
+        const std::string hex = size_text.substr(0, extension);
+        size_t parsed = 0;
+        unsigned long chunk_size = 0;
+        try {
+            chunk_size = std::stoul(hex, &parsed, 16);
+        } catch (...) {
+            return false;
+        }
+        if (parsed != hex.size()) return false;
+        offset = line_end + 2;
+        if (chunk_size == 0) return true;
+        if (chunk_size > encoded.size() - std::min(offset, encoded.size())) {
+            return false;
+        }
+        decoded.append(encoded, offset, static_cast<size_t>(chunk_size));
+        offset += static_cast<size_t>(chunk_size);
+        if (offset + 2 > encoded.size() ||
+            encoded.compare(offset, 2, "\r\n") != 0) {
+            return false;
+        }
+        offset += 2;
+    }
+}
+
+SemanticToolPrediction request_semantic_tool_prediction(
+        const SemanticToolPredictorConfig & config,
+        const json & payload,
+        const json & request_tools) {
+    const auto started = std::chrono::steady_clock::now();
+    SemanticToolPrediction prediction;
+    prediction.source = config.model;
+    auto finish = [&]() {
+        prediction.wall_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - started).count();
+        return prediction;
+    };
+
+    SemanticSidecarUrl url;
+    if (!parse_semantic_sidecar_url(config.url, url)) {
+        prediction.error = "predictor_url_must_be_http_host_port_path";
+        return finish();
+    }
+
+    struct addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo * addresses = nullptr;
+    if (getaddrinfo(url.host.c_str(), url.port.c_str(), &hints, &addresses) != 0) {
+        prediction.error = "predictor_host_resolution_failed";
+        return finish();
+    }
+
+    SocketHandle fd = kInvalidSocket;
+    for (auto * address = addresses; address; address = address->ai_next) {
+        fd = socket(address->ai_family, address->ai_socktype,
+                    address->ai_protocol);
+        if (!socket_is_valid(fd)) continue;
+        set_semantic_sidecar_socket_timeout(fd, config.timeout_ms);
+        if (connect(fd, address->ai_addr,
+                    static_cast<socklen_t>(address->ai_addrlen)) == 0) {
+            break;
+        }
+        socket_close(fd);
+        fd = kInvalidSocket;
+    }
+    freeaddrinfo(addresses);
+    if (!socket_is_valid(fd)) {
+        prediction.error = "predictor_connect_failed";
+        return finish();
+    }
+
+    const std::string body = payload.dump();
+    const std::string request =
+        "POST " + url.path + " HTTP/1.1\r\n" +
+        "Host: " + url.host + ":" + url.port + "\r\n" +
+        "Content-Type: application/json\r\n" +
+        "Accept: application/json\r\n" +
+        "Connection: close\r\n" +
+        "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" +
+        body;
+    if (!semantic_sidecar_send_all(fd, request.data(), request.size())) {
+        socket_close(fd);
+        prediction.error = "predictor_send_failed";
+        return finish();
+    }
+
+    constexpr size_t kMaxResponseBytes = 1024 * 1024;
+    std::string response;
+    std::array<char, 8192> buffer{};
+    while (response.size() < kMaxResponseBytes) {
+#if defined(_WIN32)
+        const int received = recv(
+            fd, buffer.data(), static_cast<int>(buffer.size()), 0);
+#else
+        const ssize_t received = recv(fd, buffer.data(), buffer.size(), 0);
+#endif
+        if (received == 0) break;
+        if (received < 0) {
+            socket_close(fd);
+            prediction.error = "predictor_receive_failed_or_timed_out";
+            return finish();
+        }
+        response.append(buffer.data(), static_cast<size_t>(received));
+    }
+    socket_close(fd);
+    if (response.size() >= kMaxResponseBytes) {
+        prediction.error = "predictor_response_too_large";
+        return finish();
+    }
+
+    const size_t header_end = response.find("\r\n\r\n");
+    const size_t status_end = response.find("\r\n");
+    if (header_end == std::string::npos || status_end == std::string::npos) {
+        prediction.error = "predictor_malformed_http_response";
+        return finish();
+    }
+    const std::string status_line = response.substr(0, status_end);
+    const size_t status_space = status_line.find(' ');
+    if (status_space == std::string::npos ||
+        status_line.size() < status_space + 4) {
+        prediction.error = "predictor_malformed_http_status";
+        return finish();
+    }
+    const int status = std::atoi(status_line.c_str() + status_space + 1);
+    if (status < 200 || status >= 300) {
+        prediction.error = "predictor_http_status_" + std::to_string(status);
+        return finish();
+    }
+
+    const std::string headers = lowercase_ascii(
+        response.substr(status_end + 2, header_end - status_end - 2));
+    const std::string encoded_body = response.substr(header_end + 4);
+    std::string response_body;
+    if (headers.find("transfer-encoding: chunked") != std::string::npos) {
+        if (!decode_chunked_http_body(encoded_body, response_body)) {
+            prediction.error = "predictor_invalid_chunked_response";
+            return finish();
+        }
+    } else {
+        response_body = encoded_body;
+    }
+
+    json response_json;
+    try {
+        response_json = json::parse(response_body);
+    } catch (...) {
+        prediction.error = "predictor_response_invalid_json";
+        return finish();
+    }
+    if (!parse_semantic_tool_prediction(
+            response_json, request_tools, prediction.call,
+            prediction.error)) {
+        return finish();
+    }
+    if (!materialize_declared_tool_defaults(
+            request_tools, prediction.call, prediction.error)) {
+        return finish();
+    }
+    prediction.ok = true;
+    return finish();
+}
+
+}  // namespace
+
 // ─── /props constants ───────────────────────────────────────────────────
 //
 // SERVER_NAME / SERVER_VERSION mirror the Python server's identity strings
@@ -547,6 +805,15 @@ static const json * find_tool_function(const json & tools,
         if (fn.value("name", "") == name) return &fn;
     }
     return nullptr;
+}
+
+static bool tool_choice_requires_call(const json & tool_choice) {
+    if (tool_choice.is_string()) {
+        return tool_choice.get<std::string>() == "required";
+    }
+    return tool_choice.is_object() && tool_choice.contains("function") &&
+           tool_choice["function"].is_object() &&
+           !tool_choice["function"].value("name", "").empty();
 }
 
 static std::string first_tool_parameter_name(const json & function_def) {
@@ -796,6 +1063,27 @@ json build_props_body(const ServerConfig & config,
         }},
         {"tool_speculation", {
             {"enabled", config.tool_speculation.enabled()},
+            {"automatic_prediction_enabled",
+             config.tool_speculation.enabled() &&
+                 config.semantic_tool_predictor.enabled()},
+            {"prediction_source",
+             config.semantic_tool_predictor.native_enabled()
+                 ? json("native-qwen3")
+                 : config.semantic_tool_predictor.http_enabled()
+                     ? json(config.semantic_tool_predictor.model)
+                     : json(nullptr)},
+            {"prediction_confidence",
+             config.semantic_tool_predictor.enabled()
+                 ? json(config.semantic_tool_predictor.execution_confidence)
+                 : json(nullptr)},
+            {"predictor_schedule",
+             config.semantic_tool_predictor.native_enabled()
+                 ? json(native_tool_predictor_schedule_name(
+                       config.semantic_tool_predictor.native_schedule))
+                 : config.semantic_tool_predictor.http_enabled()
+                     ? json("overlap") : json(nullptr)},
+            {"predictor_decode_isolated",
+             config.semantic_tool_predictor.native_runs_before_model()},
             {"execution_mode", config.tool_speculation.execution_mode()},
             {"profile_status",
              config.tool_speculation.policy.empty()
@@ -806,7 +1094,9 @@ json build_props_body(const ServerConfig & config,
                  ? json(nullptr)
                  : json(config.tool_speculation.policy.executor_contract())},
             {"protocol", "dflash.tool-speculation.v1"},
-            {"requires_client_support", true},
+            {"requires_client_support",
+             !(config.tool_speculation.enabled() &&
+               config.semantic_tool_predictor.enabled())},
             {"preserves_token_speculation", true},
             {"unqualified_lane_policy", "defer"},
             {"allowed_tools", config.tool_speculation.allowed_tools},
@@ -1272,6 +1562,24 @@ HttpServer::~HttpServer() {
     #endif
 }
 
+bool HttpServer::init_semantic_tool_predictor(std::string & error) {
+    error.clear();
+    if (!config_.semantic_tool_predictor.native_enabled()) return true;
+    native_semantic_predictor_ = NativeSemanticToolPredictor::create(
+        config_.semantic_tool_predictor, error);
+    if (native_semantic_predictor_) return true;
+    // An explicitly configured HTTP lane is a valid fail-open fallback. The
+    // target remains authoritative and still verifies every prediction.
+    if (config_.semantic_tool_predictor.http_enabled()) {
+        std::fprintf(stderr,
+            "[tool-hint] native predictor unavailable (%s); using HTTP fallback\n",
+            error.c_str());
+        error.clear();
+        return true;
+    }
+    return false;
+}
+
 void HttpServer::shutdown() {
     // Signal worker and accept loop to stop.
     stopping_.store(true);
@@ -1664,6 +1972,15 @@ bool HttpServer::parse_common_request_fields(
     if (body.contains("tools")) req.tools = body["tools"];
     // Tool choice constraint for hint generation.
     if (body.contains("tool_choice")) req.tool_choice = body["tool_choice"];
+    if (body.contains("automatic_tool_speculation")) {
+        if (!body["automatic_tool_speculation"].is_boolean()) {
+            send_error(fd, 400,
+                "automatic_tool_speculation must be a boolean");
+            return false;
+        }
+        req.automatic_tool_speculation_enabled =
+            body["automatic_tool_speculation"].get<bool>();
+    }
 
     if (body.contains("tool_speculation")) {
         ToolSpeculationPrediction prediction;
@@ -1940,7 +2257,8 @@ bool HttpServer::render_and_tokenize_request(
     } else {
         rendered = render_chat_template(
             chat_messages, chat_format_, /*add_generation_prompt=*/true,
-            req.thinking_enabled, tools_json);
+            req.thinking_enabled, tools_json,
+            tool_choice_requires_call(req.tool_choice));
     }
 
     req.started_in_thinking = prompt_ends_in_open_think(rendered);
@@ -1979,6 +2297,112 @@ void HttpServer::log_parsed_request(const ParsedRequest & req) const {
         req.thinking_enabled ? "true" : "false",
         req.started_in_thinking ? "true" : "false",
         req.stop_sequences.size(), req.model.c_str());
+}
+
+void HttpServer::launch_semantic_tool_prediction(ParsedRequest & req) const {
+    if (req.semantic_tool_prediction.valid() ||
+        req.automatic_tool_speculation.valid()) {
+        return;
+    }
+    const bool automatic_execution =
+        req.automatic_tool_speculation_enabled &&
+        !req.tool_speculation.has_value() &&
+        config_.tool_speculation.enabled();
+    if (!automatic_execution ||
+        !config_.semantic_tool_predictor.enabled() || req.tools.empty() ||
+        !req.raw_body.is_object()) {
+        return;
+    }
+    const SemanticToolPredictorConfig predictor =
+        config_.semantic_tool_predictor;
+    json semantic_request = req.raw_body;
+    // Endpoint parsers normalize Anthropic/Responses dialogue into req.messages.
+    // Supplying it here gives both transports one OpenAI-shaped semantic view.
+    semantic_request["messages"] = req.messages;
+    semantic_request["tools"] = req.tools;
+    if (!req.tool_choice.is_null()) {
+        semantic_request["tool_choice"] = req.tool_choice;
+    }
+    const json payload = build_semantic_tool_predictor_request(
+        semantic_request,
+        predictor.model.empty() ? "native-qwen3" : predictor.model,
+        predictor.max_tokens);
+    const json tools = req.tools;
+    const auto native = native_semantic_predictor_;
+    req.semantic_tool_prediction = std::async(
+        std::launch::async,
+        [predictor, payload, tools, native]() {
+            SemanticToolPrediction native_result;
+            if (native && native->active()) {
+                native_result = native->predict(payload, tools);
+                if (native_result.ok || !predictor.http_enabled()) {
+                    return native_result;
+                }
+            }
+            if (predictor.http_enabled()) {
+                SemanticToolPrediction fallback =
+                    request_semantic_tool_prediction(predictor, payload, tools);
+                if (!fallback.ok && !native_result.error.empty()) {
+                    fallback.error = "native=" + native_result.error +
+                                     ";http=" + fallback.error;
+                }
+                return fallback;
+            }
+            if (native_result.error.empty()) {
+                native_result.error = "native_predictor_not_initialized";
+            }
+            return native_result;
+        }).share();
+    if (automatic_execution) {
+        const auto semantic_prediction = req.semantic_tool_prediction;
+        const ToolSpeculationConfig tool_config = config_.tool_speculation;
+        const double confidence = predictor.execution_confidence;
+        const std::string request_id = req.response_id;
+        req.automatic_tool_speculation = std::async(
+            std::launch::async,
+            [semantic_prediction, tool_config, confidence, request_id]() {
+                ParsedRequest::AutomaticToolSpeculationLaunch launch;
+                try {
+                    const SemanticToolPrediction & semantic =
+                        semantic_prediction.get();
+                    launch.predictor_wall_ms = semantic.wall_ms;
+                    launch.prediction_source = semantic.source;
+                    if (!semantic.ok) {
+                        launch.predictor_error = semantic.error.empty()
+                            ? "predictor_unavailable" : semantic.error;
+                        return launch;
+                    }
+                    ToolSpeculationPrediction prediction;
+                    std::string error;
+                    const json arguments = json::parse(
+                        semantic.call.arguments.dump());
+                    if (!build_tool_speculation_prediction(
+                            semantic.call.name, arguments, confidence,
+                            prediction, error)) {
+                        launch.predictor_error = std::move(error);
+                        return launch;
+                    }
+                    auto attempt = ToolSpeculationAttempt::create(
+                        tool_config, prediction, request_id);
+                    launch.attempt = std::shared_ptr<ToolSpeculationAttempt>(
+                        attempt.release());
+                    launch.attempt->start();
+                } catch (const std::exception & error) {
+                    launch.predictor_error =
+                        std::string("automatic_prediction_failed: ") +
+                        error.what();
+                } catch (...) {
+                    launch.predictor_error =
+                        "automatic_prediction_failed: unknown error";
+                }
+                return launch;
+            }).share();
+    }
+    std::fprintf(stderr,
+        "[tool-hint] launched predictor transport=%s%s tools=%zu execute=%s\n",
+        native ? "native-qwen3" : "http",
+        native && predictor.http_enabled() ? "+http-fallback" : "",
+        json_array_size(req.tools), automatic_execution ? "true" : "false");
 }
 
 void HttpServer::enqueue_request_and_wait(SocketHandle fd, ParsedRequest req) {
@@ -2078,6 +2502,9 @@ bool HttpServer::route_request(SocketHandle fd, const HttpRequest & hr) {
     }
 
     if (!validate_request_context(fd, req)) return true;
+    if (!config_.semantic_tool_predictor.native_runs_before_model()) {
+        launch_semantic_tool_prediction(req);
+    }
     log_parsed_request(req);
     enqueue_request_and_wait(fd, std::move(req));
     return true;
@@ -2621,7 +3048,8 @@ void HttpServer::apply_flowkv_compression(
     } else {
         rendered = render_chat_template(
             chat_messages, chat_format_, /*add_generation_prompt=*/true,
-            req.thinking_enabled, tools_json);
+            req.thinking_enabled, tools_json,
+            tool_choice_requires_call(req.tool_choice));
     }
 
     const int tokens_before = (int) prepared.tokens.size();
@@ -3406,11 +3834,16 @@ void HttpServer::prepare_generation_inputs(
     inputs.request.n_gen = inputs.generation_cap;
     inputs.request.sampler = req.sampler;
     inputs.request.do_sample = req.sampler.needs_logit_processing();
-    // An opted-in external tool may overlap the chosen decoder, but it must
-    // never cause speculative decoding to be retried as AR. If the selected
-    // decoder cannot produce output, surface that outcome unchanged.
+    // Tool prediction must never change the target decoder or trigger an
+    // autoregressive retry. DS4/DSpark remains authoritative on every arm.
+    const bool semantic_tool_request =
+        req.automatic_tool_speculation_enabled &&
+        config_.tool_speculation.enabled() &&
+        config_.semantic_tool_predictor.enabled() &&
+        !req.tools.empty();
     inputs.request.allow_decode_mode_retry =
-        !req.tool_speculation.has_value();
+        !req.tool_speculation.has_value() &&
+        !semantic_tool_request;
     // Tokens are delivered through DaemonIO so all API formats share the
     // same disconnect and streaming state machine.
     inputs.request.stream = false;
@@ -3530,7 +3963,7 @@ void HttpServer::worker_loop() {
 
 void HttpServer::process_job(ServerJob * job) {
     SocketHandle fd = job->fd;
-    const auto & req = job->req;
+    auto & req = job->req;
     auto started_at = std::chrono::steady_clock::now();
 
     // Track live status for /status page. RAII guard ensures idle on all paths.
@@ -3627,6 +4060,26 @@ void HttpServer::process_job(ServerJob * job) {
         }
     }
     if (req.stream) start_job_stream(job);
+
+    if (config_.semantic_tool_predictor.native_runs_before_model()) {
+        const auto predictor_wait_started = std::chrono::steady_clock::now();
+        launch_semantic_tool_prediction(req);
+        if (req.automatic_tool_speculation.valid()) {
+            req.automatic_tool_speculation.wait();
+        } else if (req.semantic_tool_prediction.valid()) {
+            req.semantic_tool_prediction.wait();
+        }
+        const double predictor_wait_ms =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - predictor_wait_started)
+                .count();
+        if (req.automatic_tool_speculation.valid() ||
+            req.semantic_tool_prediction.valid()) {
+            std::fprintf(stderr,
+                "[tool-hint] before-model barrier complete %.1f ms\n",
+                predictor_wait_ms);
+        }
+    }
 
     PreparedPrompt prepared = prepare_prompt(req);
     if (prepared.error_status != 0) {
@@ -3775,12 +4228,61 @@ void HttpServer::process_job(ServerJob * job) {
     if (job->client_disconnected.load(std::memory_order_acquire)) {
         client_disconnected = true;
     }
+    auto finish_tool_speculation = [&](bool cancel) -> std::optional<json> {
+        if (tool_speculation) {
+            json metadata = cancel
+                ? tool_speculation->cancel("client_disconnected")
+                : tool_speculation->resolve(emitter.tool_calls());
+            metadata["prediction_source"] = "client";
+            return metadata;
+        }
+        if (!req.automatic_tool_speculation.valid()) return std::nullopt;
+        try {
+            const ParsedRequest::AutomaticToolSpeculationLaunch & launch =
+                req.automatic_tool_speculation.get();
+            json metadata;
+            if (launch.attempt) {
+                metadata = cancel
+                    ? launch.attempt->cancel("client_disconnected")
+                    : launch.attempt->resolve(emitter.tool_calls());
+            } else {
+                metadata = {
+                    {"protocol", "dflash.tool-speculation.v1"},
+                    {"status", "deferred"},
+                    {"reason", "predictor_unavailable"},
+                };
+                if (!launch.predictor_error.empty()) {
+                    metadata["detail"] = launch.predictor_error;
+                }
+            }
+            metadata["prediction_source"] =
+                launch.prediction_source.empty()
+                    ? "predictor" : launch.prediction_source;
+            metadata["predictor_wall_ms"] = launch.predictor_wall_ms;
+            return metadata;
+        } catch (const std::exception & error) {
+            return json{
+                {"protocol", "dflash.tool-speculation.v1"},
+                {"status", "failed"},
+                {"reason", "predictor_future_failure"},
+                {"detail", error.what()},
+                {"prediction_source", "predictor"},
+            };
+        } catch (...) {
+            return json{
+                {"protocol", "dflash.tool-speculation.v1"},
+                {"status", "failed"},
+                {"reason", "predictor_future_failure"},
+                {"detail", "unknown error"},
+                {"prediction_source", "predictor"},
+            };
+        }
+    };
     if (req.stream && !client_disconnected) {
         auto final_chunks = emitter.emit_finish(completion_tokens, &gen_timings);
-        if (tool_speculation) {
-            const json metadata = tool_speculation->resolve(emitter.tool_calls());
+        if (auto metadata = finish_tool_speculation(false)) {
             const std::string extension = render_tool_speculation_sse(
-                req.format, req.response_id, req.model, metadata);
+                req.format, req.response_id, req.model, *metadata);
             // Keep the standard terminal event last: [DONE], message_stop,
             // or response.completed. Only opted-in clients see this extension.
             if (final_chunks.empty()) {
@@ -3798,9 +4300,8 @@ void HttpServer::process_job(ServerJob * job) {
     } else if (!req.stream && !client_disconnected) {
         json response = build_non_streaming_response(
             req, result, n_gen_cap, gen_timings, tokenizer_, emitter);
-        if (tool_speculation) {
-            response["dflash_tool_speculation"] =
-                tool_speculation->resolve(emitter.tool_calls());
+        if (auto metadata = finish_tool_speculation(false)) {
+            response["dflash_tool_speculation"] = std::move(*metadata);
         }
         // Streaming uses non-blocking sends; restore blocking mode before
         // writing a complete JSON response on this shared socket path.
@@ -3808,8 +4309,8 @@ void HttpServer::process_job(ServerJob * job) {
         if (flags >= 0) sock_set_block(fd);
         send_response(fd, 200, "application/json",
                       response.dump() + "\n");
-    } else if (tool_speculation) {
-        tool_speculation->cancel("client_disconnected");
+    } else {
+        finish_tool_speculation(true);
     }
 
     if (client_disconnected) {

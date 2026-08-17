@@ -2295,6 +2295,11 @@ TEST_CASE(ServerUnitFixture, test_pflash_raw_body_preserved) {
     TEST_ASSERT(req.raw_body["temperature"].get<float>() > 0.6f);
 }
 
+TEST_CASE(ServerUnitFixture, test_tool_speculation_defaults_to_automatic_prediction) {
+    ParsedRequest req;
+    TEST_ASSERT(req.automatic_tool_speculation_enabled);
+}
+
 TEST_CASE(ServerUnitFixture, test_parse_request_sampler_applies_defaults_and_overrides) {
     SamplingDefaults defaults;
     defaults.has_temperature = true;
@@ -2550,6 +2555,42 @@ TEST_CASE(ServerUnitFixture, test_deepseek4_render_empty_chat_gen_prompt) {
     const std::string expected =
         "<｜begin▁of▁sentence｜><｜Assistant｜></think>";
     TEST_ASSERT(out == expected);
+}
+
+TEST_CASE(ServerUnitFixture, test_deepseek4_render_required_tool_instructions) {
+    std::vector<ChatMessage> msgs = {
+        {"user", "What is the weather?", ""},
+    };
+    const std::string tools =
+        R"([{"type":"function","function":{"name":"weather.get","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}])";
+    const std::string out = render_chat_template(
+        msgs, ChatFormat::DEEPSEEK4,
+        /*add_generation_prompt=*/true,
+        /*enable_thinking=*/false,
+        tools,
+        /*tool_call_required=*/true);
+
+    TEST_ASSERT(out.find("<tools>\n" + tools + "\n</tools>") !=
+                std::string::npos);
+    TEST_ASSERT(out.find("<function=FUNCTION_NAME>") != std::string::npos);
+    TEST_ASSERT(out.find("MUST call exactly one") != std::string::npos);
+    TEST_ASSERT(out.find("<｜User｜>What is the weather?") !=
+                std::string::npos);
+    const std::string suffix = "<｜Assistant｜></think>";
+    TEST_ASSERT(out.size() >= suffix.size());
+    TEST_ASSERT(out.compare(out.size() - suffix.size(), suffix.size(), suffix) == 0);
+}
+
+TEST_CASE(ServerUnitFixture, test_deepseek4_auto_tool_is_not_forced) {
+    std::vector<ChatMessage> msgs = {{"user", "Hello", ""}};
+    const std::string tools =
+        R"([{"type":"function","function":{"name":"weather.get","parameters":{"type":"object","properties":{}}}}])";
+    const std::string out = render_chat_template(
+        msgs, ChatFormat::DEEPSEEK4, true, false, tools,
+        /*tool_call_required=*/false);
+
+    TEST_ASSERT(out.find("If a function is applicable") != std::string::npos);
+    TEST_ASSERT(out.find("MUST call exactly one") == std::string::npos);
 }
 
 TEST_CASE(ServerUnitFixture, test_jinja_render_basic) {
@@ -4629,6 +4670,9 @@ TEST_CASE(ServerUnitFixture, test_props_tool_speculation_shape) {
     TEST_ASSERT(body.contains("tool_speculation"));
     const json & disabled = body["tool_speculation"];
     TEST_ASSERT(!disabled["enabled"].get<bool>());
+    TEST_ASSERT(!disabled["automatic_prediction_enabled"].get<bool>());
+    TEST_ASSERT(disabled["prediction_source"].is_null());
+    TEST_ASSERT(disabled["prediction_confidence"].is_null());
     TEST_ASSERT(disabled["profile_status"].is_null());
     TEST_ASSERT(disabled["executor_contract"].is_null());
     TEST_ASSERT(disabled["protocol"].get<std::string>() ==
@@ -4673,6 +4717,8 @@ TEST_CASE(ServerUnitFixture, test_props_tool_speculation_shape) {
     body = build_props_body(cfg, pc, tm);
     const json & enabled = body["tool_speculation"];
     TEST_ASSERT(enabled["enabled"].get<bool>());
+    TEST_ASSERT(!enabled["automatic_prediction_enabled"].get<bool>());
+    TEST_ASSERT(!enabled["predictor_decode_isolated"].get<bool>());
     TEST_ASSERT(enabled["profile_status"].get<std::string>() == "qualified");
     TEST_ASSERT(enabled["allowed_tools"] == json::array({"lookup"}));
     TEST_ASSERT(enabled["preserves_token_speculation"].get<bool>());
@@ -4693,6 +4739,45 @@ TEST_CASE(ServerUnitFixture, test_props_tool_speculation_shape) {
                         ["requires_static_model_routing"].get<bool>());
     TEST_ASSERT(!enabled["profile_lanes"][0]
                         ["requires_unique_expert_ownership"].get<bool>());
+
+    cfg.semantic_tool_predictor.native_model_path = "/models/qwen3-0.6b.gguf";
+    cfg.semantic_tool_predictor.native_ipc_bin = "/bin/backend-ipc";
+    body = build_props_body(cfg, pc, tm);
+    const json & automatic = body["tool_speculation"];
+    TEST_ASSERT(automatic["automatic_prediction_enabled"].get<bool>());
+    TEST_ASSERT(!automatic["requires_client_support"].get<bool>());
+    TEST_ASSERT(automatic["prediction_source"].get<std::string>() ==
+                "native-qwen3");
+    TEST_ASSERT(std::fabs(
+        automatic["prediction_confidence"].get<double>() - 0.75) < 1e-9);
+    TEST_ASSERT(automatic["predictor_schedule"].get<std::string>() ==
+                "before-model");
+    TEST_ASSERT(automatic["predictor_decode_isolated"].get<bool>());
+
+    cfg.semantic_tool_predictor.native_schedule =
+        NativeToolPredictorSchedule::Overlap;
+    body = build_props_body(cfg, pc, tm);
+    const json & overlapping = body["tool_speculation"];
+    TEST_ASSERT(overlapping["predictor_schedule"].get<std::string>() ==
+                "overlap");
+    TEST_ASSERT(!overlapping["predictor_decode_isolated"].get<bool>());
+    cfg.semantic_tool_predictor.native_schedule =
+        NativeToolPredictorSchedule::BeforeModel;
+
+    cfg.semantic_tool_predictor.native_model_path.clear();
+    cfg.semantic_tool_predictor.native_ipc_bin.clear();
+    cfg.semantic_tool_predictor.url = "http://127.0.0.1:9000/v1/chat/completions";
+    cfg.semantic_tool_predictor.model = "remote-predictor";
+    body = build_props_body(cfg, pc, tm);
+    const json & remote = body["tool_speculation"];
+    TEST_ASSERT(remote["automatic_prediction_enabled"].get<bool>());
+    TEST_ASSERT(remote["prediction_source"].get<std::string>() ==
+                "remote-predictor");
+    TEST_ASSERT(!remote["predictor_decode_isolated"].get<bool>());
+    cfg.semantic_tool_predictor.url.clear();
+    cfg.semantic_tool_predictor.model.clear();
+    cfg.semantic_tool_predictor.native_model_path = "/models/qwen3-0.6b.gguf";
+    cfg.semantic_tool_predictor.native_ipc_bin = "/bin/backend-ipc";
 
     cfg.tool_speculation.cpu_affinity = {14, 30};
     cfg.tool_speculation.model_cpu_affinity = {0, 1, 2, 3};

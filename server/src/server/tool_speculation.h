@@ -44,6 +44,15 @@ struct ToolSpeculationPrediction {
     double confidence = 0.0;
 };
 
+// Construct a canonical prediction from an engine-side predictor. This is
+// the same validation boundary used for caller-supplied predictions, minus
+// the request-schema check performed by the semantic predictor itself.
+bool build_tool_speculation_prediction(const std::string & name,
+                                       const json & arguments,
+                                       double confidence,
+                                       ToolSpeculationPrediction & out,
+                                       std::string & error);
+
 // Parse the request extension:
 //   "tool_speculation": {
 //     "call": {"name": "...", "arguments": {...}},

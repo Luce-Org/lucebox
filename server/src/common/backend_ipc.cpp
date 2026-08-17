@@ -29,6 +29,7 @@ const char * backend_ipc_mode_name(BackendIpcMode mode) {
         case BackendIpcMode::Invalid: return "invalid";
         case BackendIpcMode::DFlashDraft: return "dflash-draft";
         case BackendIpcMode::PFlashCompress: return "pflash-compress";
+        case BackendIpcMode::Qwen3ToolPredict: return "qwen3-tool-predict";
         case BackendIpcMode::Qwen35TargetShard: return "qwen35-target-shard";
         case BackendIpcMode::Gemma4TargetShard: return "gemma4-target-shard";
         case BackendIpcMode::LagunaTargetShard: return "laguna-target-shard";
@@ -45,6 +46,10 @@ bool parse_backend_ipc_mode(const std::string & value, BackendIpcMode & out) {
     }
     if (value == "pflash-compress") {
         out = BackendIpcMode::PFlashCompress;
+        return true;
+    }
+    if (value == "qwen3-tool-predict") {
+        out = BackendIpcMode::Qwen3ToolPredict;
         return true;
     }
     if (value == "qwen35-target-shard") {
