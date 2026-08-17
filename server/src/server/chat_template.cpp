@@ -44,6 +44,25 @@ static const char QWEN3_TOOL_SUFFIX[] =
     "current knowledge and do not tell the user about function calls\n"
     "</IMPORTANT>";
 
+// Appends "<available_tools>\n{tool}\n...</available_tools>\n\n" to result.
+// Each tool is pretty-printed as compact JSON; falls back to the raw
+// tools_json string if parsing fails.
+static void append_available_tools(std::string & result,
+                                   const std::string & tools_json) {
+    result += "<available_tools>\n";
+    try {
+        const nlohmann::json tools = nlohmann::json::parse(tools_json);
+        for (const auto & t : tools) {
+            result += t.dump();
+            result += "\n";
+        }
+    } catch (const std::exception &) {
+        result += tools_json;
+        result += "\n";
+    }
+    result += "</available_tools>\n\n";
+}
+
 ChatFormat chat_format_for_arch(const std::string & arch) {
     if (arch == "deepseek4") return ChatFormat::DEEPSEEK4;
     if (arch == "laguna") return ChatFormat::LAGUNA;
@@ -198,19 +217,8 @@ std::string render_chat_template(
                 // example (thinking and non-thinking variants).
                 result += "\n\n### Tools\n\n"
                           "You may call functions to assist with the user query.\n"
-                          "All available function signatures are listed below:\n"
-                          "<available_tools>\n";
-                try {
-                    const nlohmann::json tools = nlohmann::json::parse(tools_json);
-                    for (const auto & t : tools) {
-                        result += t.dump();
-                        result += "\n";
-                    }
-                } catch (const std::exception &) {
-                    result += tools_json;
-                    result += "\n";
-                }
-                result += "</available_tools>\n\n";
+                          "All available function signatures are listed below:\n";
+                append_available_tools(result, tools_json);
                 if (enable_thinking) {
                     result += "Wrap your thinking in '<think>', '</think>' tags, "
                               "followed by a function call. For each function call, "
@@ -359,22 +367,25 @@ std::string render_chat_template(
         // DeepSeek V4 Flash DSML renderer, matching the ds4 reference server:
         //   <｜begin▁of▁sentence｜>{system}<｜User｜>{user}<｜Assistant｜></think>
         // Completed assistant turns are terminated with <｜end▁of▁sentence｜>.
-        bool has_system = false;
         std::string system_content;
         for (const auto & msg : messages) {
             if (msg.role != "system") continue;
             if (!system_content.empty()) system_content += "\n\n";
             system_content += msg.content;
-            has_system = true;
         }
 
         result = "<｜begin▁of▁sentence｜>";
         if (has_tools) {
-            // Tool schema rendering is not implemented for the native DSML
-            // path yet; keep the JSON visible in the system prefix rather than
-            // silently dropping it.
-            result += tools_json;
-            if (has_system) result += "\n\n";
+            result += "### Tools\n\n"
+                      "You may call functions to assist with the user query. "
+                      "All available function signatures are listed below:\n";
+            append_available_tools(result, tools_json);
+            result += "For each function call, you MUST return a single JSON object "
+                      "within '<function_call>' and '</function_call>' tags, "
+                      "containing the function name and arguments, like this:\n"
+                      "<function_call>\n"
+                      "{\"name\": \"function_name\", \"arguments\": {\"param_name\": \"value\"}}\n"
+                      "</function_call>\n\n";
         }
         result += system_content;
 
