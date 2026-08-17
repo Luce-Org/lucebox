@@ -245,13 +245,13 @@ else()
     set(_dflash_archs "")
 endif()
 
-# Consumer Blackwell workaround: skip sm_12x→sm_12xa replacement and FP4
+# Consumer Blackwell workaround: skip sm_120→sm_120a replacement and FP4
 # mmq kernels that can trigger illegal-instruction faults on consumer chips.
-# By default, auto-enable when the resolved CUDA arch list includes a 12x
-# entry. Set DFLASH27B_USE_BLACKWELL_CONSUMER_FIX=ON to force this behavior
-# explicitly (for cross-compiles or custom arch lists).
+# Auto-enable only for SM 12.0. GB10 is SM 12.1 and must retain its native FP4
+# path. Set DFLASH27B_USE_BLACKWELL_CONSUMER_FIX=ON to force this behavior for
+# a custom consumer architecture list.
 option(DFLASH27B_USE_BLACKWELL_CONSUMER_FIX
-    "Enable ggml consumer-Blackwell workaround (skip sm_12x→sm_12xa, exclude FP4 mmq kernels)" OFF)
+    "Enable ggml consumer-Blackwell workaround (skip sm_120→sm_120a, exclude FP4 mmq kernels)" OFF)
 if(DFLASH27B_USE_BLACKWELL_CONSUMER_FIX)
     set(_dflash_is_consumer_blackwell ON)
 endif()
@@ -262,16 +262,18 @@ if(DFLASH27B_GPU_BACKEND STREQUAL "cuda" AND NOT DEFINED _dflash_is_consumer_bla
     # which is empty on the default path (the project supplies its own list above).
     foreach(_arch IN LISTS _dflash_archs)
         string(REGEX REPLACE "[^0-9]" "" _dflash_arch_num "${_arch}")
-        if(_dflash_arch_num MATCHES "^12[0-9]$")
+        if(_dflash_arch_num STREQUAL "120")
             set(_dflash_is_consumer_blackwell ON)
             break()
         endif()
     endforeach()
 endif()
 
-if(DFLASH27B_GPU_BACKEND STREQUAL "cuda" AND _dflash_is_consumer_blackwell)
-    set(GGML_CUDA_BLACKWELL_CONSUMER ON CACHE BOOL
-        "Skip sm_12X→sm_12Xa for consumer Blackwell (no FP4)" FORCE)
+if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+    # Force both states so reconfiguring a persistent build directory from
+    # SM 12.0 to GB10 cannot retain a stale consumer-only cache value.
+    set(GGML_CUDA_BLACKWELL_CONSUMER ${_dflash_is_consumer_blackwell} CACHE BOOL
+        "Skip sm_120→sm_120a for consumer Blackwell (no FP4)" FORCE)
 endif()
 
 if(WIN32)
