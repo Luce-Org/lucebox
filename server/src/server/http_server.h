@@ -591,7 +591,6 @@ struct ServerJob {
     // so their bytes can never interleave.
     std::mutex    write_mu;
     bool          stream_ready = false;
-    bool          read_close_probe_sent = false;
     size_t        heartbeat_offset = 0;
     std::chrono::steady_clock::time_point last_stream_write{};
     std::atomic<bool> client_disconnected{false};
