@@ -270,10 +270,33 @@ if(DFLASH27B_GPU_BACKEND STREQUAL "cuda" AND NOT DEFINED _dflash_is_consumer_bla
 endif()
 
 if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
-    # Force both states so reconfiguring a persistent build directory from
-    # SM 12.0 to GB10 cannot retain a stale consumer-only cache value.
-    set(GGML_CUDA_BLACKWELL_CONSUMER ${_dflash_is_consumer_blackwell} CACHE BOOL
-        "Skip sm_120→sm_120a for consumer Blackwell (no FP4)" FORCE)
+    # Keep auto-detection out of the cache so it is recomputed when a persistent
+    # build directory changes architecture. Remove values auto-cached by older
+    # dflash versions, while preserving ggml's own operator-facing cache option.
+    if(DEFINED CACHE{GGML_CUDA_BLACKWELL_CONSUMER})
+        get_property(_dflash_blackwell_cache_help CACHE
+            GGML_CUDA_BLACKWELL_CONSUMER PROPERTY HELPSTRING)
+        if(_dflash_blackwell_cache_help STREQUAL
+               "Skip sm_12X→sm_12Xa for consumer Blackwell (no FP4)" OR
+           _dflash_blackwell_cache_help STREQUAL
+               "Skip sm_120→sm_120a for consumer Blackwell (no FP4)")
+            unset(GGML_CUDA_BLACKWELL_CONSUMER CACHE)
+        endif()
+        unset(_dflash_blackwell_cache_help)
+    endif()
+
+    # The public dflash override takes precedence when enabled. Otherwise an
+    # operator-provided ggml value is honored, and only an undefined value is
+    # filled from architecture auto-detection.
+    if(DFLASH27B_USE_BLACKWELL_CONSUMER_FIX OR
+       NOT DEFINED GGML_CUDA_BLACKWELL_CONSUMER)
+        set(GGML_CUDA_BLACKWELL_CONSUMER ${_dflash_is_consumer_blackwell})
+    endif()
+    # Record the resolved state for CI without changing ggml's operator-facing
+    # cache option.
+    set(DFLASH27B_EFFECTIVE_BLACKWELL_CONSUMER
+        ${GGML_CUDA_BLACKWELL_CONSUMER} CACHE INTERNAL
+        "Resolved consumer-Blackwell workaround state" FORCE)
 endif()
 
 if(WIN32)

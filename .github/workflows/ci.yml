@@ -198,7 +198,7 @@ jobs:
             -DDFLASH27B_FA_ALL_QUANTS=OFF \
             -DCMAKE_BUILD_TYPE=Release
           if [[ "$CUDA_ARCH" == "121" ]]; then
-            grep -q '^GGML_CUDA_BLACKWELL_CONSUMER:BOOL=OFF$' build/CMakeCache.txt
+            grep -q '^DFLASH27B_EFFECTIVE_BLACKWELL_CONSUMER:INTERNAL=OFF$' build/CMakeCache.txt
           fi
           targets=(
             test_deepseek4_mmid_grouped_cuda
