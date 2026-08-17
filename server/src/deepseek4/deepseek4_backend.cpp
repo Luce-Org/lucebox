@@ -1780,6 +1780,10 @@ int deepseek4_hybrid_prefill_chunk_tokens(
         : bounded;
 }
 
+bool deepseek4_prefill_allows_decode_graph_reuse(bool save_snapshot) {
+    return !save_snapshot;
+}
+
 int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                                   const DaemonIO & io,
                                   int kv_offset,
@@ -1976,7 +1980,12 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                 0, w_.n_layer, logits_out,
                 tokens.data() + i,
                 timing ? &step_tel : nullptr,
-                /*allow_decode_graph_reuse=*/true, hp,
+                // Snapshot prefill owns transient checkpoint graph metadata.
+                // Keep it out of the persistent q=1 decode-graph cache so an
+                // executable cannot outlive its tensor-parent metadata.
+                /*allow_decode_graph_reuse=*/
+                    deepseek4_prefill_allows_decode_graph_reuse(save_snapshot),
+                hp,
                 moe_hybrid_.get(),
                 expert_runtime_.compute ? &expert_runtime_ : nullptr,
                 routing_stats_.get(), output_intent.execute_output_path,

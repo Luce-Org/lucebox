@@ -1764,6 +1764,9 @@ static void test_exact_prefill_chunk_policy() {
         PrefillAttentionMode::Sparse, false,
         /*batch_supported=*/true, 1024, 512) == 512);
 
+    TEST_ASSERT(deepseek4_prefill_allows_decode_graph_reuse(false));
+    TEST_ASSERT(!deepseek4_prefill_allows_decode_graph_reuse(true));
+
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
