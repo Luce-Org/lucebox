@@ -13,6 +13,7 @@ namespace dflash::common {
 
 static const char THINK_OPEN[]  = "<think>";
 static const char THINK_CLOSE[] = "</think>";
+static const char FUNCTION_CALLS_OPEN[] = "<function_calls>";
 static constexpr size_t THINK_OPEN_LEN  = 7;
 static constexpr size_t THINK_CLOSE_LEN = 8;
 
@@ -308,7 +309,7 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
             size_t idx = window_.find(THINK_CLOSE);
             size_t tool_idx = std::string::npos;
             bool tool_hit = has_request_tools(tools_) &&
-                            find_tool_syntax_start(window_, tools_, tool_idx);
+                            (tool_idx = window_.find(FUNCTION_CALLS_OPEN)) != std::string::npos;
 
             if (idx != std::string::npos && (tool_idx == std::string::npos || idx < tool_idx)) {
                 std::string pre = window_.substr(0, idx);
@@ -373,6 +374,7 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
                     }
                 }
                 tool_buffer_ = window_.substr(tool_idx);
+                tool_from_reasoning_ = true;
                 window_.clear();
                 mode_ = StreamMode::TOOL_BUFFER;
                 continue;
@@ -446,6 +448,7 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
                 // Tool-call syntax. Keep the full tag/function text buffered
                 // until finish so the parser can validate it.
                 tool_buffer_ = window_.substr(h.pos);
+                tool_from_reasoning_ = false;
                 window_.clear();
                 mode_ = StreamMode::TOOL_BUFFER;
             }
@@ -455,6 +458,7 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
         if (accumulated_content_.find_first_not_of(" \t\n\r") == std::string::npos &&
             starts_with_potential_bare_json_tool(window_, tools_)) {
             tool_buffer_ = window_;
+            tool_from_reasoning_ = false;
             tool_buffer_fallback_to_content_ = true;
             window_.clear();
             mode_ = StreamMode::TOOL_BUFFER;
@@ -614,17 +618,53 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
             if (!parsed.cleaned_text.empty()) {
                 size_t think_close = parsed.cleaned_text.find(THINK_CLOSE);
                 if (think_close != std::string::npos) {
+                    if (first_content_token_index_ == -1) {
+                        first_content_token_index_ = emit_token_count_;
+                    }
                     std::string reasoning = parsed.cleaned_text.substr(0, think_close);
                     std::string content = parsed.cleaned_text.substr(think_close + THINK_CLOSE_LEN);
                     if (!reasoning.empty()) {
                         reasoning_text_ += reasoning;
                         if (format_ == ApiFormat::OPENAI_CHAT) {
                             out.push_back(format_openai_delta({{"reasoning_content", reasoning}}));
+                        } else if (format_ == ApiFormat::ANTHROPIC) {
+                            if (active_kind_ != "thinking") {
+                                out.push_back(sse_event("content_block_stop",
+                                    json({{"type", "content_block_stop"}, {"index", block_index_}}).dump()));
+                                block_index_++;
+                                active_kind_ = "thinking";
+                                json new_block = {{"type", "thinking"}, {"thinking", ""}};
+                                out.push_back(sse_event("content_block_start",
+                                    json({{"type", "content_block_start"}, {"index", block_index_},
+                                          {"content_block", new_block}}).dump()));
+                            }
+                            out.push_back(sse_event("content_block_delta",
+                                json({{"type", "content_block_delta"}, {"index", block_index_},
+                                      {"delta", {{"type", "thinking_delta"}, {"thinking", reasoning}}}}).dump()));
                         }
                     }
                     if (!content.empty()) {
                         accumulated_content_ += content;
                         emit_content_delta(out, content);
+                    }
+                } else if (tool_from_reasoning_) {
+                    reasoning_text_ += parsed.cleaned_text;
+                    if (format_ == ApiFormat::OPENAI_CHAT) {
+                        out.push_back(format_openai_delta({{"reasoning_content", parsed.cleaned_text}}));
+                    } else if (format_ == ApiFormat::ANTHROPIC) {
+                        if (active_kind_ != "thinking") {
+                            out.push_back(sse_event("content_block_stop",
+                                json({{"type", "content_block_stop"}, {"index", block_index_}}).dump()));
+                            block_index_++;
+                            active_kind_ = "thinking";
+                            json new_block = {{"type", "thinking"}, {"thinking", ""}};
+                            out.push_back(sse_event("content_block_start",
+                                json({{"type", "content_block_start"}, {"index", block_index_},
+                                      {"content_block", new_block}}).dump()));
+                        }
+                        out.push_back(sse_event("content_block_delta",
+                            json({{"type", "content_block_delta"}, {"index", block_index_},
+                                  {"delta", {{"type", "thinking_delta"}, {"thinking", parsed.cleaned_text}}}}).dump()));
                     }
                 } else {
                     accumulated_content_ += parsed.cleaned_text;

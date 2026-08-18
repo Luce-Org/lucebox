@@ -176,6 +176,12 @@ static json find_tool_properties(const json & tools, const std::string & name) {
                 return params["properties"];
             }
         }
+        if (fn.contains("input_schema") && fn["input_schema"].is_object()) {
+            const auto & params = fn["input_schema"];
+            if (params.contains("properties") && params["properties"].is_object()) {
+                return params["properties"];
+            }
+        }
     }
     return json::object();
 }
@@ -183,8 +189,7 @@ static json find_tool_properties(const json & tools, const std::string & name) {
 // Convert a string value to its JSON-schema-typed equivalent.
 static json convert_param_value(const std::string & val, const std::string & key,
                                 const json & props) {
-    if (val == "null") return nullptr;
-    if (!props.contains(key)) return val;
+    if (!props.contains(key)) return val == "null" ? nullptr : json(val);
 
     const auto & cfg = props[key];
     std::string ptype = "string";
@@ -206,6 +211,7 @@ static json convert_param_value(const std::string & val, const std::string & key
 
     // string types
     if (ptype == "string" || ptype == "str" || ptype == "enum") return val;
+    if (val == "null") return nullptr;
 
     // integer types
     if (ptype.substr(0, 3) == "int" || ptype == "integer") {
@@ -1212,13 +1218,20 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
                         }
                     }
                 } else {
+                    size_t cursor = 0;
+                    bool valid_body = true;
                     auto pbegin = std::sregex_iterator(body.begin(), body.end(), re_param);
                     auto pend = std::sregex_iterator();
                     for (auto pit = pbegin; pit != pend; ++pit) {
+                        size_t ppos = pit->position();
+                        if (!trim_ws(body.substr(cursor, ppos - cursor)).empty()) { valid_body = false; break; }
                         std::string k = (*pit)[2].str();
+                        if (args.contains(k)) { valid_body = false; break; }
                         std::string v = trim_ws((*pit)[3].str());
                         args[k] = convert_param_value(v, k, find_tool_properties(tools, fn_name));
+                        cursor = ppos + pit->length();
                     }
+                    if (!valid_body || (!args.empty() && !trim_ws(body.substr(cursor)).empty())) continue;
                 }
                 block_calls.push_back({fn_name, std::move(args)});
             }

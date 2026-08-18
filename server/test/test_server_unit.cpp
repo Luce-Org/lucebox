@@ -5758,3 +5758,49 @@ TEST_CASE(ServerUnitFixture, test_emitter_function_calls_inside_reasoning) {
     TEST_ASSERT(em.reasoning_text().find("Analyzing build files.") != std::string::npos);
     TEST_ASSERT(all.find("\"finish_reason\":\"tool_calls\"") != std::string::npos);
 }
+
+TEST_CASE(ServerUnitFixture, test_parse_function_calls_anthropic_input_schema) {
+    json anthropic_tools = json::array({
+        {
+            {"name", "read"},
+            {"description", "Read a file"},
+            {"input_schema", {
+                {"type", "object"},
+                {"properties", {
+                    {"path", {{"type", "string"}}},
+                    {"offset", {{"type", "integer"}}}
+                }}
+            }}
+        }
+    });
+
+    const std::string text =
+        "<function_calls>\n"
+        "<invoke name=\"read\">\n"
+        "  <param name=\"path\">main.cpp</param>\n"
+        "  <param name=\"offset\">42</param>\n"
+        "</invoke>\n"
+        "</function_calls>";
+
+    auto result = parse_tool_calls(text, anthropic_tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["path"] == "main.cpp");
+        TEST_ASSERT(args["offset"] == 42);
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_function_calls_unclosed_think_flushes_reasoning) {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, read_tools(), false);
+    auto c1 = em.emit_token("<think>Analyzing build files without closing tag.\n");
+    auto c2 = em.emit_token("<function_calls>\n  <invoke name=\"read\">\n    <param name=\"path\">CMakeLists.txt</param>\n  </invoke>\n</function_calls>");
+    auto fin = em.emit_finish(2);
+
+    std::string all = concat(c1) + concat(c2) + concat(fin);
+    TEST_ASSERT(em.tool_calls().size() == 1);
+    TEST_ASSERT(em.reasoning_text().find("Analyzing build files without closing tag.") != std::string::npos);
+    TEST_ASSERT(em.accumulated_text().find("Analyzing build files") == std::string::npos);
+    TEST_ASSERT(all.find("\"finish_reason\":\"tool_calls\"") != std::string::npos);
+}
+
