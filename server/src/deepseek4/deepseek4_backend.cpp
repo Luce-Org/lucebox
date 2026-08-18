@@ -5,6 +5,7 @@
 #include "deepseek4_budget_hook.h"
 #include "deepseek4_internal.h"
 #include "common/dynamic_backend.h"
+#include "common/cuda_graph_overrides.h"
 #include "common/peer_access.h"
 #include "common/sampler.h"
 
@@ -1847,6 +1848,10 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
     const bool save_snapshot =
         snap_slot >= 0 && snap_slot < PREFIX_SLOTS &&
         snap_pos > kv_offset && snap_pos <= kv_offset + n_total;
+    // Snapshot construction owns transient checkpoint tensor metadata across
+    // thousands of prefill steps. Keep native HIP graph capture/replay eager
+    // for this scope so backend executables cannot retain those parent links.
+    ScopedCudaGraphOverrides snapshot_graph_scope(save_snapshot);
     // New sequence: clear the cache buffer so compressor state double-buffers
     // and compressed-KV rows start from zeros, exactly like a fresh server.
     // Without this, the first flush windows of a request pool over the
