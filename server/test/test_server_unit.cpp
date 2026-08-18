@@ -860,6 +860,36 @@ TEST_CASE(ServerUnitFixture, test_parse_function_call_wrapper) {
     }
 }
 
+TEST_CASE(ServerUnitFixture, test_parse_legacy_openai_function_call_json) {
+    const std::string text =
+        "{\"function_call\":{\"arguments\":"
+        "\"{\\\"location\\\":\\\"test-city\\\"}\","
+        "\"name\":\"get_weather\"}}";
+    const auto result = parse_tool_calls(text, weather_tools());
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "get_weather");
+        const auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["location"] == "test-city");
+    }
+    TEST_ASSERT(result.cleaned_text.empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_deepseek_function_parameters_json) {
+    const std::string text =
+        "{\"function\":\"get_weather\",\"parameters\":{"
+        "\"location\":\"test-city\",\"unit\":\"celsius\"}}";
+    const auto result = parse_tool_calls(text, weather_tools());
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "get_weather");
+        const auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["location"] == "test-city");
+        TEST_ASSERT(args["unit"] == "celsius");
+    }
+    TEST_ASSERT(result.cleaned_text.empty());
+}
+
 TEST_CASE(ServerUnitFixture, test_parse_bare_function_json_with_parameters) {
     std::string text =
         "<function>\n"
@@ -1438,6 +1468,36 @@ TEST_CASE(ServerUnitFixture, test_emitter_bare_function_json_tool_buffer_detecti
     // Tool call text should not leak into accumulated content
     TEST_ASSERT(em.accumulated_text().find("<function>") == std::string::npos);
     TEST_ASSERT(em.accumulated_text().find("bash") == std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_named_json_with_multiple_tools) {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, read_and_bash_tools());
+    em.emit_start();
+    em.emit_token("{\"function\":\"bash\",");
+    em.emit_token("\"parameters\":{\"command\":\"pwd\"}}");
+    const auto finish = em.emit_finish(20);
+
+    TEST_ASSERT(em.tool_calls().size() == 1);
+    if (!em.tool_calls().empty()) {
+        TEST_ASSERT(em.tool_calls()[0].name == "bash");
+        const auto args = json::parse(em.tool_calls()[0].arguments);
+        TEST_ASSERT(args["command"] == "pwd");
+    }
+    TEST_ASSERT(em.accumulated_text().empty());
+    const std::string wire = concat(finish);
+    TEST_ASSERT(wire.find("bash") != std::string::npos);
+    TEST_ASSERT(wire.find("tool_calls") != std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_multi_tool_json_content_is_preserved) {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, read_and_bash_tools());
+    em.emit_start();
+    em.emit_token("{\"status\":\"ok\"}");
+    const auto finish = em.emit_finish(20);
+
+    TEST_ASSERT(em.tool_calls().empty());
+    TEST_ASSERT(em.accumulated_text() == "{\"status\":\"ok\"}");
+    TEST_ASSERT(concat(finish).find("status") != std::string::npos);
 }
 
 
@@ -4785,6 +4845,18 @@ TEST_CASE(ServerUnitFixture, test_props_model_card_null_on_family_fallback) {
     TEST_ASSERT(body["budget_envelope"]["model_card_source"].get<std::string>() ==
                 "family:qwen35");
     TEST_ASSERT(body["budget_envelope"]["default_max_tokens"].get<int>() == 32768);
+}
+
+TEST_CASE(ServerUnitFixture, test_props_deepseek4_tool_capability) {
+    ServerConfig cfg;
+    cfg.arch = "deepseek4";
+    Tokenizer tok;
+    PrefixCache pc(0, tok);
+    ToolMemory tm;
+    const json body = build_props_body(cfg, pc, tm);
+
+    TEST_ASSERT(body["tools"]["supported"].get<bool>());
+    TEST_ASSERT(body["capabilities"]["tools_supported"].get<bool>());
 }
 
 TEST_CASE(ServerUnitFixture, test_props_budget_envelope_shape) {

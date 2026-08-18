@@ -560,7 +560,7 @@ static bool parse_complete_parameter_body(const std::string & body,
 
 // ─── JSON tool call parser ──────────────────────────────────────────────
 
-// Parse {"name": ..., "arguments": ...} or {"function": {"name": ..., "arguments": ...}}
+// Parse the named JSON tool-call envelopes emitted by supported chat models.
 static bool parse_json_tool_call(const json & obj, std::string & out_name, json & out_args) {
     if (!obj.is_object()) return false;
 
@@ -588,8 +588,18 @@ static bool parse_json_tool_call(const json & obj, std::string & out_name, json 
                 return false;
             }
         }
-    } else if (obj.contains("function") && obj["function"].is_object()) {
-        const auto & fn = obj["function"];
+    } else if (obj.contains("function") && obj["function"].is_string()) {
+        name = obj["function"].get<std::string>();
+        if (!obj.contains("parameters") || !obj["parameters"].is_object()) {
+            return false;
+        }
+        args = obj["parameters"];
+    } else if ((obj.contains("function") && obj["function"].is_object()) ||
+               (obj.contains("function_call") &&
+                obj["function_call"].is_object())) {
+        const auto & fn = obj.contains("function")
+            ? obj["function"]
+            : obj["function_call"];
         if (!fn.contains("name") || !fn["name"].is_string()) return false;
         name = fn["name"].get<std::string>();
         if (fn.contains("arguments")) {

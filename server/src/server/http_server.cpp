@@ -665,7 +665,7 @@ json build_props_body(const ServerConfig & config,
     const bool is_qwen = (config.arch.rfind("qwen", 0) == 0);
     const bool reasoning_supported = is_qwen;
     const bool speculative_supported = is_qwen;
-    const bool tools_supported = is_qwen;
+    const bool tools_supported = is_qwen || config.arch == "deepseek4";
 
     auto pcs  = prefix_cache.stats();
     auto pcfs = prefix_cache.full_stats();

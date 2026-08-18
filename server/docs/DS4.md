@@ -22,6 +22,15 @@ DeepSeek V4 Flash is a 43-layer MoE model with:
 | Indexer | Top-k scorer on ratio-4 layers for compressed KV selection |
 | HC (Hierarchical Controller) | 4 parallel residual streams, Sinkhorn-normalized combine |
 
+## Tool-call compatibility
+
+The native DeepSeek V4 renderer requests `<function_call>` output. The parser
+also accepts named bare-JSON fallbacks emitted by compatible checkpoints:
+`{"function":"name","parameters":{...}}` and the legacy OpenAI
+`{"function_call":{"name":"name","arguments":{...}}}` envelope. Named JSON
+calls remain unambiguous when a request supplies more than one tool; ordinary
+JSON that does not resolve to an allowed tool is preserved as assistant text.
+
 ## Code Layout
 
 | Area | Files |

@@ -20,13 +20,9 @@ static bool has_request_tools(const json & tools) {
     return tools.is_array() && !tools.empty();
 }
 
-static bool has_single_request_tool(const json & tools) {
-    return tools.is_array() && tools.size() == 1 && tools[0].is_object();
-}
-
 static bool starts_with_potential_bare_json_tool(const std::string & text,
                                                  const json & tools) {
-    if (!has_single_request_tool(tools)) return false;
+    if (!has_request_tools(tools)) return false;
     size_t first = text.find_first_not_of(" \t\n\r");
     return first != std::string::npos && text[first] == '{';
 }
