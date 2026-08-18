@@ -99,6 +99,7 @@ namespace dflash::common {
 namespace {
 constexpr auto kClientMonitorInterval = std::chrono::milliseconds(250);
 constexpr auto kSseHeartbeatInterval = std::chrono::seconds(15);
+constexpr auto kReadClosedProbeInterval = std::chrono::seconds(1);
 constexpr char kSseHeartbeat[] = ": keep-alive\n\n";
 }
 
@@ -4174,7 +4175,6 @@ void HttpServer::start_job_stream(ServerJob * job) {
     std::lock_guard<std::mutex> lock(job->write_mu);
     if (job->client_disconnected.load(std::memory_order_acquire)) return;
     job->stream_ready = true;
-    job->read_close_probe_sent = false;
     job->heartbeat_offset = 0;
     job->last_stream_write = std::chrono::steady_clock::now();
 }
@@ -4200,10 +4200,9 @@ void HttpServer::maybe_send_job_heartbeat(
         return;
     }
     const auto now = std::chrono::steady_clock::now();
-    const bool probe_read_close =
-        peer_read_closed && !job->read_close_probe_sent;
-    if (!probe_read_close &&
-        now - job->last_stream_write < kSseHeartbeatInterval) {
+    const auto heartbeat_interval =
+        peer_read_closed ? kReadClosedProbeInterval : kSseHeartbeatInterval;
+    if (now - job->last_stream_write < heartbeat_interval) {
         return;
     }
 
@@ -4217,7 +4216,6 @@ void HttpServer::maybe_send_job_heartbeat(
         return;
     }
     if (result == http_detail::HeartbeatSendResult::Retry) return;
-    if (probe_read_close) job->read_close_probe_sent = true;
     job->last_stream_write = now;
 }
 
