@@ -34,7 +34,10 @@ LeafExecutor = Callable[[dict[str, Any]], dict[str, Any]]
 
 
 def load_pattern() -> CompiledPattern:
-    default = Path(__file__).with_name("results") / "trace-compiled-training-traces.json"
+    default = (
+        Path(__file__).with_name("results")
+        / "multiturn-cached-wordref-production-6tasks.json"
+    )
     report = Path(os.environ.get(TRAINING_REPORT_ENV, str(default)))
     return mine_pattern(load_training_traces(report, required_steps=5))
 
@@ -97,7 +100,11 @@ def execute_branch(
         leaf_request = {**request, "call": call}
         envelope = leaf_executor(leaf_request)
         result = envelope.get("result") if isinstance(envelope, dict) else None
-        if not envelope.get("ok") or not isinstance(result, dict):
+        if (
+            not isinstance(envelope, dict)
+            or not envelope.get("ok")
+            or not isinstance(result, dict)
+        ):
             raise RuntimeError("leaf tool returned an invalid result")
         if (
             result.get("call_sha256") != call_sha256(call)

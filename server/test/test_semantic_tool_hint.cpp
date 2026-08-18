@@ -80,6 +80,63 @@ TEST_CASE(SemanticToolHintFixture, rejects_unknown_predicted_function) {
     CHECK(error == "predictor_selected_unknown_function");
 }
 
+TEST_CASE(SemanticToolHintFixture, parses_strict_json_content_fallback) {
+    const json response = {
+        {"choices", json::array({{
+            {"message", {
+                {"content",
+                 "  {\"name\":\"get_weather\",\"arguments\":{\"city\":\"Rome\"}}\n"},
+            }},
+        }})},
+    };
+    SemanticToolCall call;
+    std::string error;
+    CHECK(parse_semantic_tool_prediction(
+        response, weather_tools(), call, error));
+    CHECK(call.name == "get_weather");
+    CHECK(call.arguments["city"] == "Rome");
+}
+
+TEST_CASE(SemanticToolHintFixture, rejects_ambiguous_sidecar_calls) {
+    const json function = {
+        {"name", "get_weather"},
+        {"arguments", "{\"city\":\"Rome\"}"},
+    };
+    const json response = {
+        {"choices", json::array({{
+            {"message", {
+                {"content",
+                 "{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Rome\"}}"},
+                {"tool_calls", json::array({
+                    {{"function", function}},
+                    {{"function", function}},
+                })},
+            }},
+        }})},
+    };
+    SemanticToolCall call;
+    std::string error;
+    CHECK(!parse_semantic_tool_prediction(
+        response, weather_tools(), call, error));
+    CHECK(error == "predictor_response_requires_single_tool_call");
+}
+
+TEST_CASE(SemanticToolHintFixture, rejects_prose_wrapped_json_content) {
+    const json response = {
+        {"choices", json::array({{
+            {"message", {
+                {"content",
+                 "call {\"name\":\"get_weather\",\"arguments\":{\"city\":\"Rome\"}}"},
+            }},
+        }})},
+    };
+    SemanticToolCall call;
+    std::string error;
+    CHECK(!parse_semantic_tool_prediction(
+        response, weather_tools(), call, error));
+    CHECK(error == "predictor_response_has_no_valid_call");
+}
+
 TEST_CASE(SemanticToolHintFixture, materializes_declared_optional_defaults) {
     json tools = weather_tools();
     tools[0]["function"]["parameters"]["properties"]["unit"]["default"] =
@@ -134,19 +191,20 @@ TEST_CASE(SemanticToolHintFixture, native_predictor_config_is_independent_of_htt
     CHECK(config.native_enabled());
     CHECK(!config.http_enabled());
     CHECK(config.enabled());
-    CHECK(config.native_runs_before_model());
-    CHECK(std::string(native_tool_predictor_schedule_name(
-              config.native_schedule)) == "before-model");
 }
 
-TEST_CASE(SemanticToolHintFixture, native_predictor_overlap_is_explicit) {
-    NativeToolPredictorSchedule schedule =
-        NativeToolPredictorSchedule::BeforeModel;
-    CHECK(parse_native_tool_predictor_schedule("overlap", schedule));
-    CHECK(schedule == NativeToolPredictorSchedule::Overlap);
-    CHECK(std::string(native_tool_predictor_schedule_name(schedule)) ==
-          "overlap");
-    CHECK(!parse_native_tool_predictor_schedule("automatic", schedule));
+TEST_CASE(SemanticToolHintFixture, native_prompt_honors_tool_choice_none) {
+    const json request = {
+        {"messages", json::array({{
+            {"role", "user"},
+            {"content", "Do not call a tool"},
+        }})},
+        {"tools", weather_tools()},
+        {"tool_choice", "none"},
+    };
+    std::string error;
+    CHECK(build_native_semantic_tool_predictor_prompt(request, error).empty());
+    CHECK(error == "native_predictor_tool_choice_none");
 }
 
 TEST_CASE(SemanticToolHintFixture, native_prompt_uses_qwen_tool_contract) {
@@ -171,6 +229,19 @@ TEST_CASE(SemanticToolHintFixture, native_prompt_uses_qwen_tool_contract) {
     CHECK(prompt.find("<function=example_function_name>") ==
           std::string::npos);
     CHECK(prompt.find("<think>\n\n</think>") != std::string::npos);
+}
+
+TEST_CASE(SemanticToolHintFixture, native_prompt_honors_preprocessing_deadline) {
+    const json request = {
+        {"messages", json::array({{{"role", "user"}, {"content", "weather"}}})},
+        {"tools", weather_tools()},
+    };
+    const auto expired = std::chrono::steady_clock::now() -
+        std::chrono::milliseconds(1);
+    std::string error;
+    CHECK(build_native_semantic_tool_predictor_prompt(
+              request, error, &expired).empty());
+    CHECK(error == "native_predictor_timeout");
 }
 
 TEST_CASE(SemanticToolHintFixture, parses_native_qwen_xml_semantics) {

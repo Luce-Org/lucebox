@@ -2491,6 +2491,18 @@ TEST_CASE(ServerUnitFixture, test_tool_speculation_defaults_to_automatic_predict
     TEST_ASSERT(req.automatic_tool_speculation_enabled);
 }
 
+TEST_CASE(ServerUnitFixture, test_tool_choice_none_disables_speculation) {
+    TEST_ASSERT(http_detail::tool_choice_disables_tool_calls("none"));
+    TEST_ASSERT(http_detail::tool_choice_disables_tool_calls(
+        json{{"type", "none"}}));
+    TEST_ASSERT(!http_detail::tool_choice_disables_tool_calls(nullptr));
+    TEST_ASSERT(!http_detail::tool_choice_disables_tool_calls("auto"));
+    TEST_ASSERT(!http_detail::tool_choice_disables_tool_calls("required"));
+    TEST_ASSERT(!http_detail::tool_choice_disables_tool_calls(
+        json{{"type", "function"},
+             {"function", {{"name", "lookup"}}}}));
+}
+
 TEST_CASE(ServerUnitFixture, test_parse_request_sampler_applies_defaults_and_overrides) {
     SamplingDefaults defaults;
     defaults.has_temperature = true;
@@ -2746,43 +2758,6 @@ TEST_CASE(ServerUnitFixture, test_deepseek4_render_empty_chat_gen_prompt) {
     const std::string expected =
         "<｜begin▁of▁sentence｜><｜Assistant｜></think>";
     TEST_ASSERT(out == expected);
-}
-
-TEST_CASE(ServerUnitFixture, test_deepseek4_render_required_tool_instructions) {
-    std::vector<ChatMessage> msgs = {
-        {"user", "What is the weather?", ""},
-    };
-    const std::string tools =
-        R"([{"type":"function","function":{"name":"weather.get","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}])";
-    const std::string out = render_chat_template(
-        msgs, ChatFormat::DEEPSEEK4,
-        /*add_generation_prompt=*/true,
-        /*enable_thinking=*/false,
-        tools,
-        /*tool_call_required=*/true);
-
-    TEST_ASSERT(out.find("<available_tools>\n") != std::string::npos);
-    TEST_ASSERT(out.find("\"name\":\"weather.get\"") != std::string::npos);
-    TEST_ASSERT(out.find("</available_tools>") != std::string::npos);
-    TEST_ASSERT(out.find("<function_call>") != std::string::npos);
-    TEST_ASSERT(out.find("MUST call exactly one") != std::string::npos);
-    TEST_ASSERT(out.find("<｜User｜>What is the weather?") !=
-                std::string::npos);
-    const std::string suffix = "<｜Assistant｜></think>";
-    TEST_ASSERT(out.size() >= suffix.size());
-    TEST_ASSERT(out.compare(out.size() - suffix.size(), suffix.size(), suffix) == 0);
-}
-
-TEST_CASE(ServerUnitFixture, test_deepseek4_auto_tool_is_not_forced) {
-    std::vector<ChatMessage> msgs = {{"user", "Hello", ""}};
-    const std::string tools =
-        R"([{"type":"function","function":{"name":"weather.get","parameters":{"type":"object","properties":{}}}}])";
-    const std::string out = render_chat_template(
-        msgs, ChatFormat::DEEPSEEK4, true, false, tools,
-        /*tool_call_required=*/false);
-
-    TEST_ASSERT(out.find("You may call functions") != std::string::npos);
-    TEST_ASSERT(out.find("MUST call exactly one") == std::string::npos);
 }
 
 TEST_CASE(ServerUnitFixture, test_jinja_render_basic) {
@@ -4137,11 +4112,39 @@ TEST_CASE(ServerUnitFixture, test_backend_ipc_rejects_public_work_dir) {
     cfg.bin = "/bin/true";
     cfg.payload_path = "/tmp/dflash_test_backend_ipc_payload";
     cfg.work_dir = dir_path;
+    cfg.require_private_work_dir = true;
 
     BackendIpcProcess proc;
     TEST_ASSERT(!proc.start(cfg));
     TEST_ASSERT(!proc.active());
     rmdir(dir_path.c_str());
+}
+
+TEST_CASE(ServerUnitFixture, test_backend_ipc_readiness_timeout) {
+    const std::string script_path =
+        "/tmp/dflash_test_backend_ipc_readiness_timeout.sh";
+    unlink(script_path.c_str());
+    int fd = open(script_path.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0700);
+    TEST_ASSERT(fd >= 0);
+    if (fd < 0) return;
+    const char script[] = "#!/bin/sh\nwhile :; do :; done\n";
+    TEST_ASSERT(write(fd, script, sizeof(script) - 1) ==
+                static_cast<ssize_t>(sizeof(script) - 1));
+    close(fd);
+    TEST_ASSERT(chmod(script_path.c_str(), 0700) == 0);
+
+    BackendIpcLaunchConfig cfg;
+    cfg.bin = script_path;
+    cfg.payload_path = "/tmp/dflash_test_backend_ipc_payload";
+    cfg.readiness_timeout_ms = 50;
+    const auto started = std::chrono::steady_clock::now();
+    BackendIpcProcess proc;
+    TEST_ASSERT(!proc.start(cfg));
+    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started).count();
+    TEST_ASSERT(elapsed_ms < 1000);
+    TEST_ASSERT(!proc.active());
+    unlink(script_path.c_str());
 }
 
 TEST_CASE(ServerUnitFixture, test_backend_ipc_payload_pipe_round_trip) {
@@ -4913,7 +4916,8 @@ TEST_CASE(ServerUnitFixture, test_props_tool_speculation_shape) {
     TEST_ASSERT(disabled["executor_contract"].is_null());
     TEST_ASSERT(disabled["protocol"].get<std::string>() ==
                 "dflash.tool-speculation.v1");
-    TEST_ASSERT(disabled["requires_client_support"].get<bool>());
+    TEST_ASSERT(!disabled["client_prediction_required"].get<bool>());
+    TEST_ASSERT(!disabled["client_result_handling_required"].get<bool>());
     TEST_ASSERT(disabled["preserves_token_speculation"].get<bool>());
     TEST_ASSERT(disabled["unqualified_lane_policy"].get<std::string>() ==
                 "defer");
@@ -4953,6 +4957,8 @@ TEST_CASE(ServerUnitFixture, test_props_tool_speculation_shape) {
     const json & enabled = body["tool_speculation"];
     TEST_ASSERT(enabled["enabled"].get<bool>());
     TEST_ASSERT(!enabled["automatic_prediction_enabled"].get<bool>());
+    TEST_ASSERT(enabled["client_prediction_required"].get<bool>());
+    TEST_ASSERT(enabled["client_result_handling_required"].get<bool>());
     TEST_ASSERT(!enabled["predictor_decode_isolated"].get<bool>());
     TEST_ASSERT(enabled["profile_status"].get<std::string>() == "qualified");
     TEST_ASSERT(enabled["executor_contract"].get<std::string>() ==
@@ -4978,7 +4984,8 @@ TEST_CASE(ServerUnitFixture, test_props_tool_speculation_shape) {
     body = build_props_body(cfg, pc, tm);
     const json & automatic = body["tool_speculation"];
     TEST_ASSERT(automatic["automatic_prediction_enabled"].get<bool>());
-    TEST_ASSERT(!automatic["requires_client_support"].get<bool>());
+    TEST_ASSERT(!automatic["client_prediction_required"].get<bool>());
+    TEST_ASSERT(automatic["client_result_handling_required"].get<bool>());
     TEST_ASSERT(automatic["prediction_source"].get<std::string>() ==
                 "native-qwen3");
     TEST_ASSERT(std::fabs(
@@ -4986,16 +4993,6 @@ TEST_CASE(ServerUnitFixture, test_props_tool_speculation_shape) {
     TEST_ASSERT(automatic["predictor_schedule"].get<std::string>() ==
                 "before-model");
     TEST_ASSERT(automatic["predictor_decode_isolated"].get<bool>());
-
-    cfg.semantic_tool_predictor.native_schedule =
-        NativeToolPredictorSchedule::Overlap;
-    body = build_props_body(cfg, pc, tm);
-    const json & overlapping = body["tool_speculation"];
-    TEST_ASSERT(overlapping["predictor_schedule"].get<std::string>() ==
-                "overlap");
-    TEST_ASSERT(!overlapping["predictor_decode_isolated"].get<bool>());
-    cfg.semantic_tool_predictor.native_schedule =
-        NativeToolPredictorSchedule::BeforeModel;
 
     cfg.semantic_tool_predictor.native_model_path.clear();
     cfg.semantic_tool_predictor.native_ipc_bin.clear();
@@ -5006,7 +5003,9 @@ TEST_CASE(ServerUnitFixture, test_props_tool_speculation_shape) {
     TEST_ASSERT(remote["automatic_prediction_enabled"].get<bool>());
     TEST_ASSERT(remote["prediction_source"].get<std::string>() ==
                 "remote-predictor");
-    TEST_ASSERT(!remote["predictor_decode_isolated"].get<bool>());
+    TEST_ASSERT(remote["predictor_schedule"].get<std::string>() ==
+                "before-model");
+    TEST_ASSERT(remote["predictor_decode_isolated"].get<bool>());
     cfg.semantic_tool_predictor.url.clear();
     cfg.semantic_tool_predictor.model.clear();
     cfg.semantic_tool_predictor.native_model_path = "/models/qwen3-0.6b.gguf";

@@ -18,7 +18,6 @@ PREDICTOR_MAX_CTX="${PREDICTOR_MAX_CTX:-4096}"
 PREDICTOR_MAX_TOKENS="${PREDICTOR_MAX_TOKENS:-256}"
 PREDICTOR_TIMEOUT_MS="${PREDICTOR_TIMEOUT_MS:-2000}"
 PREDICTOR_CONFIDENCE="${PREDICTOR_CONFIDENCE:-0.75}"
-PREDICTOR_SCHEDULE="${PREDICTOR_SCHEDULE:-before-model}"
 # The qualified 0731 launcher disables caches for cold throughput benchmarks.
 # Tool-using agent loops need turn-boundary reuse; this later CLI flag wins
 # without modifying the qualified model/DSpark arguments.
@@ -26,7 +25,7 @@ PREFIX_CACHE_SLOTS_OVERRIDE="${PREFIX_CACHE_SLOTS_OVERRIDE:-32}"
 
 cache_args=()
 if [[ -n "${PREFIX_CACHE_SLOTS_OVERRIDE}" ]]; then
-  [[ "${PREFIX_CACHE_SLOTS_OVERRIDE}" =~ ^[1-9][0-9]*$ ]] || {
+  [[ "${PREFIX_CACHE_SLOTS_OVERRIDE}" =~ ^(0|[1-9][0-9]*)$ ]] || {
     printf 'invalid PREFIX_CACHE_SLOTS_OVERRIDE: %s\n' \
       "${PREFIX_CACHE_SLOTS_OVERRIDE}" >&2
     exit 2
@@ -38,15 +37,17 @@ if [[ -n "${PREFIX_CACHE_SLOTS_OVERRIDE}" ]]; then
   cache_args+=(--prefix-cache-slots "${PREFIX_CACHE_SLOTS_OVERRIDE}")
 fi
 
-for required in \
-  "${CANDIDATE_BUILD}/dflash_server" \
-  "${PREDICTOR_IPC_BIN}" \
-  "${PREDICTOR_MODEL}"; do
-  [[ -e "${required}" ]] || {
-    printf 'missing Qwen tool-predictor path: %s\n' "${required}" >&2
+for binary in "${CANDIDATE_BUILD}/dflash_server" "${PREDICTOR_IPC_BIN}"; do
+  [[ -f "${binary}" && -x "${binary}" ]] || {
+    printf 'Qwen tool-predictor binary is not executable: %s\n' "${binary}" >&2
     exit 2
   }
 done
+[[ -f "${PREDICTOR_MODEL}" ]] || {
+  printf 'Qwen tool-predictor model is not a regular file: %s\n' \
+    "${PREDICTOR_MODEL}" >&2
+  exit 2
+}
 
 export LD_LIBRARY_PATH="${CANDIDATE_BUILD}/deps/llama.cpp/ggml/src:${CANDIDATE_BUILD}/deps/llama.cpp/ggml/src/ggml-hip:${LD_LIBRARY_PATH:-}"
 export LUCE_MMVQ_MAX_NCOLS=5
@@ -58,6 +59,5 @@ exec "${CANDIDATE_BUILD}/dflash_server" "$@" \
   --tool-hint-native-max-ctx "${PREDICTOR_MAX_CTX}" \
   --tool-hint-max-tokens "${PREDICTOR_MAX_TOKENS}" \
   --tool-hint-timeout-ms "${PREDICTOR_TIMEOUT_MS}" \
-  --tool-hint-native-schedule "${PREDICTOR_SCHEDULE}" \
   --tool-hint-execution-confidence "${PREDICTOR_CONFIDENCE}" \
   "${cache_args[@]}"

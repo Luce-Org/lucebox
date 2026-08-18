@@ -50,7 +50,7 @@ def execute(request: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(arguments, dict):
         raise ValueError("tool arguments must be an object")
 
-    expected = request.get("cpu_affinity") or []
+    expected = request.get("cpu_affinity", [])
     if not isinstance(expected, list) or not all(
         isinstance(cpu, int) and cpu >= 0 for cpu in expected
     ):

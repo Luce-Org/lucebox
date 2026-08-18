@@ -10,6 +10,7 @@ from benchmark_cpu_tool_speculation import (
     parse_cpu_list,
     percentile,
     props_url,
+    require_qualified_cpu_tool_props,
     request_body,
 )
 
@@ -76,6 +77,37 @@ class CpuToolSpeculationBenchmarkTest(unittest.TestCase):
                 "arguments": {"stage_ref": "workflow_taskf_stage_one"},
             },
         )
+
+    def test_automatic_gate_requires_qualified_disjoint_lane(self) -> None:
+        args = argparse.Namespace(tool_cpus=[14, 15])
+        tool_props = {
+            "enabled": True,
+            "automatic_prediction_enabled": True,
+            "execution_mode": "child_process_cpu_affinity",
+            "profile_status": "qualified",
+            "compute_isolation": "disjoint_cpu_affinity",
+            "cpu_affinity_isolated": True,
+            "preserves_token_speculation": True,
+            "tool_cpu_affinity": [14, 15],
+            "model_cpu_affinity": [0, 1],
+        }
+        self.assertIs(
+            require_qualified_cpu_tool_props(
+                {"tool_speculation": tool_props}, args, automatic=True
+            ),
+            tool_props,
+        )
+        with self.assertRaisesRegex(SystemExit, "profile_status"):
+            require_qualified_cpu_tool_props(
+                {
+                    "tool_speculation": {
+                        **tool_props,
+                        "profile_status": "unqualified",
+                    }
+                },
+                args,
+                automatic=True,
+            )
 
 
 if __name__ == "__main__":

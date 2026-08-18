@@ -53,6 +53,12 @@ from bfcl_replay_tool_executor import (
     canonical_call,
 )
 
+RESULTS_DIR = Path(__file__).with_name("results")
+CANONICAL_TRAINING_REPORT = (
+    RESULTS_DIR / "multiturn-cached-wordref-production-6tasks.json"
+)
+CANONICAL_WORKFLOW_REGISTRY = RESULTS_DIR / "trace-workflow-registry.json"
+
 
 @dataclass(frozen=True)
 class ArgumentBinding:
@@ -580,20 +586,24 @@ def post_turn(
     max_tokens: int,
     *,
     automatic_tool_speculation: bool = False,
+    tool_speculation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    request = {
+        "model": "dflash",
+        "messages": messages,
+        "tools": tools,
+        "tool_choice": tool_choice,
+        "temperature": 0,
+        "seed": args.seed,
+        "max_tokens": max_tokens,
+        "stream": False,
+        "automatic_tool_speculation": automatic_tool_speculation,
+    }
+    if tool_speculation is not None:
+        request["tool_speculation"] = tool_speculation
     result, wall_ms = post_json(
         args.url,
-        {
-            "model": "dflash",
-            "messages": messages,
-            "tools": tools,
-            "tool_choice": tool_choice,
-            "temperature": 0,
-            "seed": args.seed,
-            "max_tokens": max_tokens,
-            "stream": False,
-            "automatic_tool_speculation": automatic_tool_speculation,
-        },
+        request,
         args.timeout,
     )
     observation = model_observation(result, wall_ms)
@@ -728,25 +738,54 @@ def final_answer_correct(content: str, expected: str) -> bool:
 
 def post_final(
     args: argparse.Namespace,
-    expected: str,
+    messages: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Measure the same minimal final-response turn for every benchmark arm."""
+    """Ask the model to derive the receipt from the actual tool conversation."""
     return post_turn(
         args,
         [
+            *messages,
             {
-                "role": "system",
+                "role": "user",
                 "content": (
-                    "Return the opaque workflow receipt from the user message exactly. "
-                    "Do not explain, reformat, or add any characters."
+                    "Copy the final_ref strings from the completed tool result in "
+                    "their original item order. Return exactly one receipt in the "
+                    "form workflow_complete:ref_one,ref_two. Replace the example "
+                    "references with the actual values. Use no spaces or prose."
                 ),
             },
-            {"role": "user", "content": expected},
         ],
         [],
         "none",
         args.final_max_tokens,
     )
+
+
+def stage_result_message(
+    pattern: CompiledPattern,
+    step_index: int,
+    branches: list[dict[str, Any]],
+    tool_call_id: str,
+) -> dict[str, Any]:
+    step = pattern.steps[step_index]
+    content = {
+        "stage": step_index + 1,
+        "complete": step_index + 1 == len(pattern.steps),
+        "items": [
+            {
+                **branch["root"],
+                "call_ref": branch["steps"][-1]["tool_result"]["call_ref"],
+            }
+            for branch in branches
+        ],
+        "side_effects": False,
+    }
+    return {
+        "role": "tool",
+        "tool_call_id": tool_call_id,
+        "name": f"batch_{step.tool}",
+        "content": json.dumps(content, sort_keys=True, separators=(",", ":")),
+    }
 
 
 def flatten_graph_calls(graph: dict[str, Any]) -> list[str]:
@@ -774,6 +813,7 @@ def run_stage_batched(
     """Run a strong non-speculative baseline with parallel calls per stage."""
     started = time.perf_counter()
     stage_messages = stage_batched_messages(task, pattern)
+    final_messages = list(stage_messages)
     current_tools: list[dict[str, Any]] = []
     branches = [
         {"root": root, "steps": [], "final_ref": ""} for root in task["items"]
@@ -839,12 +879,21 @@ def run_stage_batched(
                     "tool_wall_ms": tool["wall_ms"],
                 }
             )
+        if step_index + 1 == len(pattern.steps):
+            final_messages.extend(
+                [
+                    model["assistant_message"],
+                    stage_result_message(
+                        pattern, step_index, branches, model["calls"][0]["id"]
+                    ),
+                ]
+            )
         turns.append(model)
 
     for branch in branches:
         branch["final_ref"] = branch["steps"][-1]["tool_result"]["call_ref"]
     expected = expected_final(branches)
-    final = post_final(args, expected)
+    final = post_final(args, final_messages)
     all_turns = [*turns, final]
     graph = {"branches": branches}
     return {
@@ -931,12 +980,15 @@ def run_macro(
         args,
         messages,
         tools,
-        "required",
+        {"type": "function", "function": {"name": pattern.macro_name}},
         args.macro_max_tokens,
         automatic_tool_speculation=speculative,
     )
     if len(model["calls"]) != 1:
-        raise RuntimeError(f"{task['id']}: macro turn emitted {len(model['calls'])} calls")
+        raise RuntimeError(
+            f"{task['id']}: macro turn emitted {len(model['calls'])} calls; "
+            f"content={model['content']!r}"
+        )
     emitted = model["calls"][0]
     macro_correct = emitted["call"] == expected_call
     if not macro_correct:
@@ -981,7 +1033,7 @@ def run_macro(
         ]
     )
     expected = expected_final(graph["branches"])
-    final = post_final(args, expected)
+    final = post_final(args, messages)
     all_turns = [model, final]
     return {
         "task_ms": (time.perf_counter() - started) * 1_000.0,
@@ -1011,6 +1063,199 @@ def run_macro(
     }
 
 
+def interference_observation_qualified(observation: dict[str, Any]) -> bool:
+    compiled = observation["compiled"]
+    speculative = observation["speculative"]
+    return (
+        compiled["cache_hit"] == speculative["cache_hit"]
+        and compiled["cached_prefix_tokens"]
+        == speculative["cached_prefix_tokens"]
+        and compiled["completion_tokens"]
+        == speculative["completion_tokens"]
+        and compiled["call_sha256"] == speculative["call_sha256"]
+        and compiled["accept_rate"] > 0.0
+        and speculative["accept_rate"] > 0.0
+    )
+
+
+def measure_private_miss(
+    args: argparse.Namespace,
+    target_task: dict[str, Any],
+    predicted_task: dict[str, Any],
+    pattern: CompiledPattern,
+) -> dict[str, Any]:
+    """Verify that a wrong workflow never crosses the exact-match gate."""
+    target_ref = workflow_reference(target_task, pattern)
+    predicted_ref = workflow_reference(predicted_task, pattern)
+    if target_ref == predicted_ref:
+        raise ValueError("privacy miss requires distinct workflow references")
+    expected_call = {
+        "name": pattern.macro_name,
+        "arguments": {"workflow_ref": target_ref},
+    }
+    predicted_call = {
+        "name": pattern.macro_name,
+        "arguments": {"workflow_ref": predicted_ref},
+    }
+    observation = post_turn(
+        args,
+        macro_messages(target_task, pattern),
+        [pattern.macro_tool(args.max_branches, target_ref)],
+        {"type": "function", "function": {"name": pattern.macro_name}},
+        args.macro_max_tokens,
+        tool_speculation={"call": predicted_call, "confidence": 1.0},
+    )
+    if (
+        len(observation["calls"]) != 1
+        or observation["calls"][0]["call"] != expected_call
+    ):
+        raise RuntimeError("privacy miss did not emit the expected authoritative call")
+    metadata = observation.get("speculation")
+    passed = (
+        isinstance(metadata, dict)
+        and metadata.get("status") == "miss"
+        and metadata.get("reason") == "invocation_mismatch"
+        and metadata.get("prediction") == predicted_call
+        and "result" not in metadata
+    )
+    return {
+        "passed": passed,
+        "status": metadata.get("status") if isinstance(metadata, dict) else None,
+        "reason": metadata.get("reason") if isinstance(metadata, dict) else None,
+        "private_result_exposed": (
+            "result" in metadata if isinstance(metadata, dict) else None
+        ),
+        "prediction_sha256": hashlib.sha256(
+            canonical_call(predicted_call).encode()
+        ).hexdigest(),
+        "authoritative_call_sha256": hashlib.sha256(
+            canonical_call(expected_call).encode()
+        ).hexdigest(),
+    }
+
+
+def interference_probe_qualified(probe: dict[str, Any]) -> bool:
+    """Return whether every repeated probe used matched measured conditions."""
+    observations = probe.get("observations")
+    if isinstance(observations, list):
+        return bool(observations) and all(
+            interference_observation_qualified(observation)
+            for observation in observations
+        )
+    return interference_observation_qualified(probe)
+
+
+def measure_interference_probe(
+    args: argparse.Namespace,
+    task: dict[str, Any],
+    pattern: CompiledPattern,
+    pair_index: int,
+    previous: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Compare target compute with repeated, immediately warmed prompts."""
+    messages = macro_messages(task, pattern)
+    workflow_ref = workflow_reference(task, pattern)
+    tools = [pattern.macro_tool(args.max_branches, workflow_ref)]
+    expected_call = {
+        "name": pattern.macro_name,
+        "arguments": {"workflow_ref": workflow_ref},
+    }
+    tool_choice = {
+        "type": "function",
+        "function": {"name": pattern.macro_name},
+    }
+    observations: list[dict[str, Any]] = []
+    if isinstance(previous, dict):
+        prior_observations = previous.get("observations")
+        if isinstance(prior_observations, list):
+            observations.extend(prior_observations)
+        elif isinstance(previous.get("compiled"), dict) and isinstance(
+            previous.get("speculative"), dict
+        ):
+            observations.append(
+                {
+                    "order": previous.get("order", ["compiled", "speculative"]),
+                    "compiled": previous["compiled"],
+                    "speculative": previous["speculative"],
+                }
+            )
+
+    while len(observations) < args.interference_repetitions:
+        repetition = len(observations)
+        order = (
+            [False, True]
+            if (pair_index + repetition) % 2 == 0
+            else [True, False]
+        )
+        measured: dict[str, dict[str, Any]] = {}
+        for automatic in order:
+            # Prefix-cache order dominated the old six-sample p95. Warm the
+            # exact prompt immediately before each observation so the probe
+            # measures predictor/tool interference, not arm ordering.
+            post_turn(
+                args,
+                messages,
+                tools,
+                tool_choice,
+                args.macro_max_tokens,
+                automatic_tool_speculation=False,
+            )
+            observation = post_turn(
+                args,
+                messages,
+                tools,
+                tool_choice,
+                args.macro_max_tokens,
+                automatic_tool_speculation=automatic,
+            )
+            if (
+                len(observation["calls"]) != 1
+                or observation["calls"][0]["call"] != expected_call
+            ):
+                raise RuntimeError(
+                    f"{task['id']}: interference probe emitted an invalid macro call"
+                )
+            metadata = observation.get("speculation")
+            if automatic and (
+                not isinstance(metadata, dict)
+                or metadata.get("status") != "hit"
+                or metadata.get("prediction_source") != NATIVE_PREDICTION_SOURCE
+                or metadata.get("prediction") != expected_call
+            ):
+                raise RuntimeError(
+                    f"{task['id']}: interference probe did not produce an exact Qwen hit"
+                )
+            measured["speculative" if automatic else "compiled"] = {
+                "model_compute_ms": observation["model_compute_ms"],
+                "prefill_ms": observation["prefill_ms"],
+                "decode_ms": observation["decode_ms"],
+                "completion_tokens": observation["completion_tokens"],
+                "accept_rate": observation["accept_rate"],
+                "cache_hit": observation["cache_hit"],
+                "cached_prefix_tokens": observation["cached_prefix_tokens"],
+                "call_sha256": hashlib.sha256(
+                    canonical_call(expected_call).encode()
+                ).hexdigest(),
+            }
+        observations.append(
+            {
+                "order": [
+                    "speculative" if value else "compiled" for value in order
+                ],
+                **measured,
+            }
+        )
+
+    probe = {
+        "repetitions": len(observations),
+        "observations": observations,
+    }
+    # A cache miss is valid when both observations miss identically. Requiring
+    # a hit made an otherwise matched, zero-cache comparison fail closed.
+    probe["qualified"] = interference_probe_qualified(probe)
+    return probe
+
+
 def macro_signature(arm: dict[str, Any]) -> dict[str, Any]:
     turn = arm["call_turns"][0]
     return {
@@ -1038,14 +1283,23 @@ def bootstrap_speedup_ci(
     return [percentile(values, 0.025), percentile(values, 0.975)]
 
 
-def paired_slowdown(
+def paired_probe_slowdown(
     pairs: list[dict[str, Any]], metric: str, quantile: float
 ) -> float:
-    ratios = [
-        pair["speculative"][metric] / pair["compiled"][metric]
-        for pair in pairs
-        if pair["compiled"][metric] > 0.0
-    ]
+    ratios = []
+    for pair in pairs:
+        probe = pair["interference_probe"]
+        observations = probe.get("observations")
+        if not isinstance(observations, list):
+            observations = [probe]
+        paired_ratios = [
+            observation["speculative"][metric]
+            / observation["compiled"][metric]
+            for observation in observations
+            if observation["compiled"][metric] > 0.0
+        ]
+        if paired_ratios:
+            ratios.append(statistics.median(paired_ratios))
     return 100.0 * (percentile(ratios, quantile) - 1.0)
 
 
@@ -1150,14 +1404,21 @@ def summarize(
         "predictor_p50_ms": statistics.median(
             pair["speculative"]["predictor_ms"] for pair in pairs
         ),
-        "model_compute_slowdown_p50_percent": paired_slowdown(
+        "model_compute_slowdown_p50_percent": paired_probe_slowdown(
             pairs, "model_compute_ms", 0.50
         ),
-        "model_compute_slowdown_p95_percent": paired_slowdown(
+        "model_compute_slowdown_p95_percent": paired_probe_slowdown(
             pairs, "model_compute_ms", 0.95
         ),
-        "decode_slowdown_p50_percent": paired_slowdown(pairs, "decode_ms", 0.50),
-        "decode_slowdown_p95_percent": paired_slowdown(pairs, "decode_ms", 0.95),
+        "decode_slowdown_p50_percent": paired_probe_slowdown(
+            pairs, "decode_ms", 0.50
+        ),
+        "decode_slowdown_p95_percent": paired_probe_slowdown(
+            pairs, "decode_ms", 0.95
+        ),
+        "all_interference_probes_qualified": all(
+            pair["interference_probe"]["qualified"] for pair in pairs
+        ),
         "continuation_cache_hit_rate": sum(
             turn["cache_hit"] and turn["cached_prefix_tokens"] > 0
             for turn in continuation_turns
@@ -1224,6 +1485,8 @@ def production_checks(summary: dict[str, Any], args: argparse.Namespace) -> dict
         > 1.0,
         "prediction_hit_rate": summary["pattern_prediction_hit_rate"] == 1.0,
         "prediction_source": summary["all_predictions_from_qwen"],
+        "private_miss_result_hidden": summary["private_miss_result_hidden"],
+        "interference_probes": summary["all_interference_probes_qualified"],
         "model_slowdown_p50": summary["model_compute_slowdown_p50_percent"]
         <= args.max_model_slowdown_percent,
         "model_slowdown_p95": summary["model_compute_slowdown_p95_percent"]
@@ -1299,6 +1562,7 @@ def compact_pair(pair: dict[str, Any]) -> dict[str, Any]:
             arm: compact_arm(pair[arm])
             for arm in ("stage_batched", "compiled", "speculative")
         },
+        "interference_probe": pair["interference_probe"],
     }
 
 
@@ -1354,6 +1618,16 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
         parser.error("--binary must be an executable tool adapter")
     if not args.training_report.is_file():
         parser.error("--training-report must be an existing trace file or report")
+    if args.training_report != CANONICAL_TRAINING_REPORT.resolve():
+        parser.error(
+            "--training-report must be the committed canonical report used by "
+            "the deployed trace executor"
+        )
+    if args.workflow_registry != CANONICAL_WORKFLOW_REGISTRY.resolve():
+        parser.error(
+            "--workflow-registry must be the committed canonical registry used "
+            "by the deployed trace executor"
+        )
     if (
         args.pairs <= 0
         or args.warmup_tasks < 0
@@ -1361,12 +1635,77 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
         or args.timeout <= 0
         or min(args.call_max_tokens, args.macro_max_tokens, args.final_max_tokens) <= 0
         or args.bootstrap_resamples <= 0
+        or args.interference_repetitions < 3
+        or args.interference_repetitions % 2 == 0
         or args.min_production_pairs < 2
         or args.min_e2e_speedup <= 1.0
         or args.min_e2e_speedup_p05 <= 1.0
         or args.min_incremental_speedup <= 1.0
     ):
         parser.error("benchmark counts and thresholds are invalid")
+
+
+def refresh_existing_report(
+    args: argparse.Namespace,
+    pattern: CompiledPattern,
+    measured_tasks: list[dict[str, Any]],
+    prefix_cache: dict[str, Any],
+    tool_speculation: dict[str, Any],
+) -> bool:
+    """Add newly introduced safety gates without repeating long timing arms."""
+    report = json.loads(args.output.read_text(encoding="utf-8"))
+    if not isinstance(report, dict):
+        raise ValueError("existing report is not a JSON object")
+    recorded_pattern = report.get("pattern")
+    if (
+        report.get("schema_version") != 1
+        or not isinstance(recorded_pattern, dict)
+        or recorded_pattern.get("fingerprint") != pattern.fingerprint
+        or recorded_pattern.get("training_report_sha256")
+        != file_sha256(args.training_report)
+        or recorded_pattern.get("workflow_registry_sha256")
+        != file_sha256(args.workflow_registry)
+        or not report.get("production_gate", {}).get("passed")
+        or len(report.get("pairs", [])) != args.pairs
+    ):
+        raise ValueError("existing report does not match this qualified run")
+
+    privacy_miss = measure_private_miss(
+        args, measured_tasks[0], measured_tasks[1], pattern
+    )
+    summary = report.get("summary")
+    if not isinstance(summary, dict) or summary.get("tasks") != args.pairs:
+        raise ValueError("existing report summary does not match --pairs")
+    summary["private_miss_result_hidden"] = privacy_miss["passed"]
+    checks = production_checks(summary, args)
+    report["privacy_miss"] = privacy_miss
+    report["methodology"]["additive_gate_refresh"] = (
+        "the wrong-call privacy probe and server snapshot were refreshed after "
+        "the timing arms; no recorded timing was recomputed"
+    )
+    report["production_gate"]["checks"] = checks
+    report["production_gate"]["passed"] = all(checks.values())
+    ending_props = get_json(props_url(args.url), args.timeout)
+    report["server_snapshot"]["prefix_cache_before"] = prefix_cache
+    report["server_snapshot"]["prefix_cache_after"] = ending_props.get(
+        "prefix_cache"
+    )
+    report["server_snapshot"]["tool_speculation"] = tool_speculation
+    args.output.write_text(
+        json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    print(
+        json.dumps(
+            {
+                "production_gate": report["production_gate"],
+                "privacy_miss": privacy_miss,
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+    return report["production_gate"]["passed"]
 
 
 def main() -> int:
@@ -1377,7 +1716,7 @@ def main() -> int:
     parser.add_argument(
         "--workflow-registry",
         type=Path,
-        default=Path(__file__).with_name("results") / "trace-workflow-registry.json",
+        default=CANONICAL_WORKFLOW_REGISTRY,
     )
     parser.add_argument("--tool-cpus", type=parse_cpu_list, default="14-15,30-31")
     parser.add_argument("--pairs", type=int, default=6)
@@ -1390,6 +1729,7 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=180.0)
     parser.add_argument("--seed", type=int, default=814)
     parser.add_argument("--bootstrap-resamples", type=int, default=20_000)
+    parser.add_argument("--interference-repetitions", type=int, default=3)
     parser.add_argument("--min-production-pairs", type=int, default=6)
     parser.add_argument("--min-e2e-speedup", type=float, default=2.0)
     parser.add_argument("--min-e2e-speedup-p05", type=float, default=1.5)
@@ -1402,6 +1742,11 @@ def main() -> int:
         "--resume-partial",
         action="store_true",
         help="resume the strictly matching <output>.partial checkpoint",
+    )
+    parser.add_argument(
+        "--refresh-report",
+        action="store_true",
+        help="run additive safety gates against an existing passing report",
     )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
@@ -1434,6 +1779,11 @@ def main() -> int:
                 f"engine tool_speculation.{key}={tool_speculation.get(key)!r}, "
                 f"expected {expected!r}"
             )
+    if tool_speculation.get("tool_cpu_affinity") != args.tool_cpus:
+        raise SystemExit(
+            "engine tool CPU affinity does not match --tool-cpus: "
+            f"{tool_speculation.get('tool_cpu_affinity')!r} != {args.tool_cpus!r}"
+        )
     if pattern.macro_name not in tool_speculation.get("allowed_tools", []):
         raise SystemExit(f"engine does not allow compiled macro {pattern.macro_name!r}")
 
@@ -1453,6 +1803,14 @@ def main() -> int:
     write_workflow_registry(
         args.workflow_registry, pattern, [*warmup_tasks, *measured_tasks]
     )
+    if args.refresh_report:
+        if not args.output.is_file():
+            parser.error("--refresh-report requires an existing --output")
+        if not refresh_existing_report(
+            args, pattern, measured_tasks, prefix_cache, tool_speculation
+        ):
+            raise SystemExit("refreshed workflow production gate failed")
+        return 0
     generator = random.Random(args.seed)
     arm_orders = []
     for _ in measured_tasks:
@@ -1527,7 +1885,48 @@ def main() -> int:
             flush=True,
         )
 
+    for pair_index, pair in enumerate(pairs):
+        previous_probe = pair.get("interference_probe")
+        if (
+            isinstance(previous_probe, dict)
+            and isinstance(previous_probe.get("observations"), list)
+            and len(previous_probe["observations"])
+            >= args.interference_repetitions
+        ):
+            pair["interference_probe"]["qualified"] = (
+                interference_probe_qualified(pair["interference_probe"])
+            )
+            continue
+        pair["interference_probe"] = measure_interference_probe(
+            args,
+            measured_tasks[pair_index],
+            pattern,
+            pair_index,
+            previous_probe if isinstance(previous_probe, dict) else None,
+        )
+        partial_output.write_text(
+            json.dumps(
+                {"schema_version": 1, "complete": False, "pairs": pairs},
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        print(
+            json.dumps(
+                {
+                    "interference_probe": pair_index + 1,
+                    "qualified": pair["interference_probe"]["qualified"],
+                }
+            ),
+            flush=True,
+        )
+
+    privacy_miss = measure_private_miss(
+        args, measured_tasks[0], measured_tasks[1], pattern
+    )
     summary = summarize(pairs, args.bootstrap_resamples, args.seed)
+    summary["private_miss_result_hidden"] = privacy_miss["passed"]
     ending_props = get_json(props_url(args.url), args.timeout)
     ending_prefix_cache = ending_props.get("prefix_cache")
     if not isinstance(ending_prefix_cache, dict):
@@ -1545,9 +1944,13 @@ def main() -> int:
             "macro_name": pattern.macro_name,
             "fingerprint": pattern.fingerprint,
             "training_traces": pattern.training_traces,
-            "training_report": str(args.training_report),
+            "training_report": str(
+                args.training_report.relative_to(Path(__file__).resolve().parent)
+            ),
             "training_report_sha256": file_sha256(args.training_report),
-            "workflow_registry": str(args.workflow_registry),
+            "workflow_registry": str(
+                args.workflow_registry.relative_to(Path(__file__).resolve().parent)
+            ),
             "workflow_registry_sha256": file_sha256(args.workflow_registry),
             "root_fields": list(pattern.root_fields),
             "steps": [
@@ -1615,6 +2018,7 @@ def main() -> int:
                 "max_decode_slowdown_p95_percent": args.max_decode_slowdown_p95_percent,
             },
         },
+        "privacy_miss": privacy_miss,
         "summary": summary,
         "pairs": [compact_pair(pair) for pair in pairs],
     }

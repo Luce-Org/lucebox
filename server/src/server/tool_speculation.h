@@ -156,6 +156,7 @@ struct ToolSpeculationConfig {
 // Capture the model process affinity and fail closed unless it is physically
 // disjoint from the configured child executor CPUs. No-op when no CPU lane is
 // requested.
+bool tool_speculation_executor_isolation_supported();
 bool qualify_tool_speculation_cpu_affinity(ToolSpeculationConfig & config,
                                            std::string & error);
 

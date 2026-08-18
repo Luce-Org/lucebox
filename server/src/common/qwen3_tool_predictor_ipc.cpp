@@ -148,16 +148,19 @@ bool Qwen3ToolPredictorIpcClient::start(
         const std::string & model_path,
         int gpu,
         int max_ctx,
-        const std::string & work_dir) {
+        const std::string & work_dir,
+        int readiness_timeout_ms) {
 #if defined(_WIN32)
     (void)bin; (void)model_path; (void)gpu; (void)max_ctx; (void)work_dir;
+    (void)readiness_timeout_ms;
     std::fprintf(stderr,
                  "Qwen3 tool-predictor IPC is only implemented on POSIX hosts\n");
     return false;
 #else
     std::lock_guard<std::timed_mutex> lock(mutex_);
     close_locked();
-    if (bin.empty() || model_path.empty() || max_ctx <= 0) return false;
+    if (bin.empty() || model_path.empty() || max_ctx <= 0 ||
+        readiness_timeout_ms <= 0) return false;
 
     BackendIpcLaunchConfig launch;
     launch.bin = bin;
@@ -166,6 +169,9 @@ bool Qwen3ToolPredictorIpcClient::start(
     launch.work_dir = work_dir;
     launch.args.push_back("--target-gpu=" + std::to_string(std::max(0, gpu)));
     launch.args.push_back("--max-ctx=" + std::to_string(max_ctx));
+    launch.readiness_timeout_ms = readiness_timeout_ms;
+    launch.isolate_inherited_fds = true;
+    launch.require_private_work_dir = true;
     if (!process_.start(launch)) {
         std::fprintf(stderr, "[tool-predictor-ipc] backend process start failed\n");
         return false;

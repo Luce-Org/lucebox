@@ -8,31 +8,6 @@
 
 namespace dflash::common {
 
-const char * native_tool_predictor_schedule_name(
-        NativeToolPredictorSchedule schedule) {
-    switch (schedule) {
-        case NativeToolPredictorSchedule::BeforeModel:
-            return "before-model";
-        case NativeToolPredictorSchedule::Overlap:
-            return "overlap";
-    }
-    return "unknown";
-}
-
-bool parse_native_tool_predictor_schedule(
-        const std::string & value,
-        NativeToolPredictorSchedule & out) {
-    if (value == "before-model") {
-        out = NativeToolPredictorSchedule::BeforeModel;
-        return true;
-    }
-    if (value == "overlap") {
-        out = NativeToolPredictorSchedule::Overlap;
-        return true;
-    }
-    return false;
-}
-
 namespace {
 
 bool request_has_function(const json & tools, const std::string & name) {
@@ -102,23 +77,6 @@ bool parse_call_object(const json & value, SemanticToolCall & out) {
     return true;
 }
 
-bool parse_content_call(const std::string & content, SemanticToolCall & out) {
-    for (size_t offset = 0; offset < content.size(); ++offset) {
-        if (content[offset] != '{') continue;
-        try {
-            const auto value = json::parse(
-                content.begin() + static_cast<std::ptrdiff_t>(offset),
-                content.end(), nullptr, false);
-            if (!value.is_discarded() && parse_call_object(value, out)) {
-                return true;
-            }
-        } catch (...) {
-            // Continue scanning for a later strict object.
-        }
-    }
-    return false;
-}
-
 std::string trim_copy(std::string value) {
     const auto is_space = [](unsigned char ch) { return std::isspace(ch); };
     value.erase(value.begin(), std::find_if_not(
@@ -126,6 +84,11 @@ std::string trim_copy(std::string value) {
     value.erase(std::find_if_not(value.rbegin(), value.rend(), is_space).base(),
                 value.end());
     return value;
+}
+
+bool parse_content_call(const std::string & content, SemanticToolCall & out) {
+    const json value = json::parse(trim_copy(content), nullptr, false);
+    return !value.is_discarded() && parse_call_object(value, out);
 }
 
 bool parse_qwen_tagged_call_repair(
@@ -187,14 +150,29 @@ bool parse_qwen_bare_single_tool_arguments(
     return true;
 }
 
-std::string semantic_message_content(const json & message) {
-    const auto content = message.find("content");
-    if (content == message.end() || content->is_null()) return {};
-    if (content->is_string()) return content->get<std::string>();
-    if (!content->is_array()) return content->dump();
+bool semantic_deadline_expired(
+        const std::chrono::steady_clock::time_point * deadline) {
+    return deadline && std::chrono::steady_clock::now() >= *deadline;
+}
 
-    std::string text;
+bool semantic_message_content(
+        const json & message,
+        const std::chrono::steady_clock::time_point * deadline,
+        std::string & text) {
+    text.clear();
+    const auto content = message.find("content");
+    if (content == message.end() || content->is_null()) return true;
+    if (content->is_string()) {
+        text = content->get<std::string>();
+        return !semantic_deadline_expired(deadline);
+    }
+    if (!content->is_array()) {
+        text = content->dump();
+        return !semantic_deadline_expired(deadline);
+    }
+
     for (const auto & part : *content) {
+        if (semantic_deadline_expired(deadline)) return false;
         if (part.is_string()) {
             text += part.get<std::string>();
             continue;
@@ -206,7 +184,7 @@ std::string semantic_message_content(const json & message) {
             text += part.value("text", "");
         }
     }
-    return text;
+    return !semantic_deadline_expired(deadline);
 }
 
 std::string forced_tool_name(const json & choice) {
@@ -240,13 +218,17 @@ bool parse_semantic_tool_prediction(
 
     bool parsed = false;
     const auto calls = message->find("tool_calls");
-    if (calls != message->end() && calls->is_array() && calls->size() == 1) {
+    if (calls != message->end()) {
+        if (!calls->is_array() || calls->size() != 1 ||
+            !(*calls)[0].is_object()) {
+            error = "predictor_response_requires_single_tool_call";
+            return false;
+        }
         const auto function = (*calls)[0].find("function");
         if (function != (*calls)[0].end()) {
             parsed = parse_call_object(*function, out);
         }
-    }
-    if (!parsed) {
+    } else {
         const auto content = message->find("content");
         if (content != message->end() && content->is_string()) {
             parsed = parse_content_call(content->get<std::string>(), out);
@@ -337,8 +319,19 @@ json build_semantic_tool_predictor_request(
 
 std::string build_native_semantic_tool_predictor_prompt(
         const json & predictor_request,
-        std::string & error) {
+        std::string & error,
+        const std::chrono::steady_clock::time_point * deadline) {
     error.clear();
+    if (semantic_deadline_expired(deadline)) {
+        error = "native_predictor_timeout";
+        return {};
+    }
+    const json choice = predictor_request.value("tool_choice", json("auto"));
+    if ((choice.is_string() && choice.get<std::string>() == "none") ||
+        (choice.is_object() && choice.value("type", "") == "none")) {
+        error = "native_predictor_tool_choice_none";
+        return {};
+    }
     const auto messages = predictor_request.find("messages");
     if (messages == predictor_request.end() || !messages->is_array() ||
         messages->empty()) {
@@ -359,11 +352,20 @@ std::string build_native_semantic_tool_predictor_prompt(
     std::vector<PredictorMessage> chat;
     chat.reserve(messages->size());
     for (const auto & message : *messages) {
+        if (semantic_deadline_expired(deadline)) {
+            error = "native_predictor_timeout";
+            return {};
+        }
         if (!message.is_object()) continue;
         std::string role = message.value("role", "user");
         if (role == "developer") role = "system";
+        std::string content;
+        if (!semantic_message_content(message, deadline, content)) {
+            error = "native_predictor_timeout";
+            return {};
+        }
         chat.push_back({
-            std::move(role), semantic_message_content(message),
+            std::move(role), std::move(content),
             message.value("tool_calls", json::array()),
         });
     }
@@ -373,7 +375,6 @@ std::string build_native_semantic_tool_predictor_prompt(
     }
 
     std::string constraint;
-    const json choice = predictor_request.value("tool_choice", json("auto"));
     if (choice.is_string() && choice.get<std::string>() == "required") {
         constraint = "You must call exactly one available function.";
     } else if (const std::string name = forced_tool_name(choice);
@@ -405,7 +406,13 @@ std::string build_native_semantic_tool_predictor_prompt(
         "You may call one or more functions to assist with the user query.\n\n"
         "You are provided with function signatures within <tools></tools> XML tags:\n"
         "<tools>";
-    for (const auto & tool : tools) rendered += tool.dump();
+    for (const auto & tool : tools) {
+        if (semantic_deadline_expired(deadline)) {
+            error = "native_predictor_timeout";
+            return {};
+        }
+        rendered += tool.dump();
+    }
     rendered +=
         "\n</tools>\n\n"
         "For each function call, return a json object with function name and "
@@ -416,6 +423,10 @@ std::string build_native_semantic_tool_predictor_prompt(
 
     bool in_tool_response = false;
     for (size_t index = begin; index < chat.size(); ++index) {
+        if (semantic_deadline_expired(deadline)) {
+            error = "native_predictor_timeout";
+            return {};
+        }
         const auto & message = chat[index];
         if (message.role == "tool") {
             if (!in_tool_response) {
@@ -436,6 +447,10 @@ std::string build_native_semantic_tool_predictor_prompt(
         rendered += "<|im_start|>" + message.role + "\n" + message.content;
         if (message.role == "assistant" && message.tool_calls.is_array()) {
             for (const auto & raw_call : message.tool_calls) {
+                if (semantic_deadline_expired(deadline)) {
+                    error = "native_predictor_timeout";
+                    return {};
+                }
                 if (!raw_call.is_object()) continue;
                 const json & call = raw_call.contains("function") &&
                                          raw_call["function"].is_object()
@@ -454,6 +469,10 @@ std::string build_native_semantic_tool_predictor_prompt(
         rendered += "<|im_end|>\n";
     }
     rendered += "<|im_start|>assistant\n<think>\n\n</think>\n\n";
+    if (semantic_deadline_expired(deadline)) {
+        error = "native_predictor_timeout";
+        return {};
+    }
     return rendered;
 }
 

@@ -534,15 +534,23 @@ TEST_CASE(ToolSpeculationFixture, executor_does_not_inherit_server_fds) {
 #endif
 }
 
-TEST_CASE(ToolSpeculationFixture, executor_environment_overrides_stale_enable_flag) {
+TEST_CASE(ToolSpeculationFixture, executor_environment_is_minimal) {
     const char * previous = std::getenv("DFLASH_TOOL_SPECULATION");
     const bool had_previous = previous != nullptr;
     const std::string previous_value = previous ? previous : "";
+    const char * previous_secret = std::getenv("DFLASH_TEST_SERVER_SECRET");
+    const bool had_previous_secret = previous_secret != nullptr;
+    const std::string previous_secret_value = previous_secret
+        ? previous_secret : "";
     CHECK(::setenv("DFLASH_TOOL_SPECULATION", "0", 1) == 0);
+    CHECK(::setenv("DFLASH_TEST_SERVER_SECRET", "must-not-leak", 1) == 0);
     const std::string path = make_executor_script(
         "IFS= read -r control\n"
-        "printf '{\"ok\":true,\"result\":{\"enabled\":\"%s\"}}\\n' "
-        "\"$DFLASH_TOOL_SPECULATION\"\n");
+        "secret=false\n"
+        "if [ \"${DFLASH_TEST_SERVER_SECRET+x}\" = x ]; then secret=true; fi\n"
+        "printf '{\"ok\":true,\"result\":{\"enabled\":\"%s\","
+        "\"secret_inherited\":%s}}\\n' "
+        "\"$DFLASH_TOOL_SPECULATION\" \"$secret\"\n");
     ToolSpeculationConfig config = test_config(path);
     auto attempt = ToolSpeculationAttempt::create(
         config, prediction(), "request_clean_environment");
@@ -557,9 +565,16 @@ TEST_CASE(ToolSpeculationFixture, executor_environment_overrides_stale_enable_fl
     } else {
         CHECK(::unsetenv("DFLASH_TOOL_SPECULATION") == 0);
     }
+    if (had_previous_secret) {
+        CHECK(::setenv(
+            "DFLASH_TEST_SERVER_SECRET", previous_secret_value.c_str(), 1) == 0);
+    } else {
+        CHECK(::unsetenv("DFLASH_TEST_SERVER_SECRET") == 0);
+    }
 
     CHECK(metadata["status"] == "hit");
     CHECK(metadata["result"]["enabled"] == "1");
+    CHECK(!metadata["result"]["secret_inherited"].get<bool>());
 }
 
 TEST_CASE(ToolSpeculationFixture, qualified_lane_keeps_speculative_decode) {

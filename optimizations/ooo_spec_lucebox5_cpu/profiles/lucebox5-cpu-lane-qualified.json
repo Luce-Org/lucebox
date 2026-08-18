@@ -28,6 +28,7 @@
       "model_slowdown": true,
       "private_miss_result_hidden": true
     },
+    "private_miss_evidence": "results/trace-compiled-engine-qwen-production-6pairs-compact.json",
     "host": "lucebox5",
     "model_cpu_affinity": [
       0,

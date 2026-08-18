@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from benchmark_trace_compiled_workflows import mine_pattern, simulated_tool_result
+from bfcl_replay_tool_executor import execute as execute_bfcl
 from test_benchmark_trace_compiled_workflows import workflow_trace
 from trace_compiled_tool_executor import execute_macro, resolve_items
 
@@ -69,6 +70,31 @@ class TraceCompiledToolExecutorTest(unittest.TestCase):
             )
         with self.assertRaisesRegex(ValueError, "workflow_ref"):
             resolve_items({"items": self.items}, self.pattern, self.registry)
+
+    def test_rejects_non_object_leaf_response(self) -> None:
+        request = {
+            "call": {
+                "name": self.pattern.macro_name,
+                "arguments": {"workflow_ref": self.workflow_ref},
+            }
+        }
+        with self.assertRaisesRegex(RuntimeError, "invalid result"):
+            execute_macro(
+                request,
+                self.pattern,
+                lambda _request: None,  # type: ignore[arg-type,return-value]
+                self.registry,
+            )
+
+    def test_leaf_rejects_explicit_null_affinity(self) -> None:
+        with self.assertRaisesRegex(ValueError, "cpu_affinity"):
+            execute_bfcl(
+                {
+                    "protocol": "dflash.tool-speculation.v1",
+                    "cpu_affinity": None,
+                    "call": {"name": "lookup", "arguments": {}},
+                }
+            )
 
 
 if __name__ == "__main__":

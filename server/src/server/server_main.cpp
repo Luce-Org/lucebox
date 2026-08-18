@@ -27,6 +27,7 @@
 #include "kvflash_pager.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
 #include <charconv>
 #include <csignal>
@@ -69,6 +70,26 @@ static bool parse_double_list(const char * value, std::vector<double> & out) {
         if (!*p) return false;
     }
     return !out.empty();
+}
+
+static bool parse_int_strict(const char * value, int & out) {
+    if (!value || !*value) return false;
+    const char * end = value + std::strlen(value);
+    const auto parsed = std::from_chars(value, end, out);
+    return parsed.ec == std::errc{} && parsed.ptr == end;
+}
+
+static bool parse_double_strict(const char * value, double & out) {
+    if (!value || !*value) return false;
+    char * end = nullptr;
+    errno = 0;
+    const double parsed = std::strtod(value, &end);
+    if (errno == ERANGE || end == value || !end || *end != '\0' ||
+        !std::isfinite(parsed)) {
+        return false;
+    }
+    out = parsed;
+    return true;
 }
 
 static bool environment_flag_enabled(const char * name) {
@@ -197,10 +218,6 @@ static void print_usage(const char * prog) {
         "  --tool-hint-native-gpu <N>  Predictor GPU (default: 0).\n"
         "  --tool-hint-native-max-ctx <N>\n"
         "                               Predictor context capacity (default: 4096).\n"
-        "  --tool-hint-native-schedule <MODE>\n"
-        "                               before-model (default) runs Qwen before DS4\n"
-        "                               so shared-GPU decoding cannot be slowed;\n"
-        "                               overlap is an experimental throughput mode.\n"
         "  --tool-hint-native-work-dir <PATH>\n"
         "                               Optional private IPC scratch directory.\n"
         "  --tool-hint-timeout-ms <N>  Hard native/HTTP predictor deadline\n"
@@ -289,7 +306,6 @@ int main(int argc, char ** argv) {
     bool fast_rollback_forced_off = false;
     bool target_split_fast_rollback_cli = false;
     bool adaptive_experts_set = false;  // --adaptive-experts (MoE architectures only)
-    bool native_tool_predictor_schedule_set = false;
 
     // Track which thinking-budget tunables the operator set via CLI.
     // Those values win over the model card (spec §3.1: "Explicit CLI
@@ -623,36 +639,28 @@ int main(int argc, char ** argv) {
             sconfig.semantic_tool_predictor.native_work_dir = argv[++i];
         } else if (std::strcmp(argv[i], "--tool-hint-native-gpu") == 0 &&
                    i + 1 < argc) {
-            sconfig.semantic_tool_predictor.native_gpu = std::atoi(argv[++i]);
-            if (sconfig.semantic_tool_predictor.native_gpu < 0) {
+            if (!parse_int_strict(
+                    argv[++i], sconfig.semantic_tool_predictor.native_gpu) ||
+                sconfig.semantic_tool_predictor.native_gpu < 0) {
                 std::fprintf(stderr,
                     "[server] --tool-hint-native-gpu must be non-negative\n");
                 return 2;
             }
         } else if (std::strcmp(argv[i], "--tool-hint-native-max-ctx") == 0 &&
                    i + 1 < argc) {
-            sconfig.semantic_tool_predictor.native_max_ctx = std::atoi(argv[++i]);
-            if (sconfig.semantic_tool_predictor.native_max_ctx <= 0) {
+            if (!parse_int_strict(
+                    argv[++i], sconfig.semantic_tool_predictor.native_max_ctx) ||
+                sconfig.semantic_tool_predictor.native_max_ctx <= 0) {
                 std::fprintf(stderr,
                     "[server] --tool-hint-native-max-ctx must be positive\n");
-                return 2;
-            }
-        } else if (std::strcmp(argv[i], "--tool-hint-native-schedule") == 0 &&
-                   i + 1 < argc) {
-            native_tool_predictor_schedule_set = true;
-            if (!parse_native_tool_predictor_schedule(
-                    argv[++i],
-                    sconfig.semantic_tool_predictor.native_schedule)) {
-                std::fprintf(stderr,
-                    "[server] --tool-hint-native-schedule must be "
-                    "before-model or overlap\n");
                 return 2;
             }
         } else if ((std::strcmp(argv[i], "--tool-hint-timeout-ms") == 0 ||
                     std::strcmp(argv[i], "--tool-hint-sidecar-timeout-ms") == 0) &&
                    i + 1 < argc) {
-            sconfig.semantic_tool_predictor.timeout_ms = std::atoi(argv[++i]);
-            if (sconfig.semantic_tool_predictor.timeout_ms <= 0) {
+            if (!parse_int_strict(
+                    argv[++i], sconfig.semantic_tool_predictor.timeout_ms) ||
+                sconfig.semantic_tool_predictor.timeout_ms <= 0) {
                 std::fprintf(stderr,
                     "[server] --tool-hint-timeout-ms must be positive\n");
                 return 2;
@@ -660,8 +668,9 @@ int main(int argc, char ** argv) {
         } else if ((std::strcmp(argv[i], "--tool-hint-max-tokens") == 0 ||
                     std::strcmp(argv[i], "--tool-hint-sidecar-max-tokens") == 0) &&
                    i + 1 < argc) {
-            sconfig.semantic_tool_predictor.max_tokens = std::atoi(argv[++i]);
-            if (sconfig.semantic_tool_predictor.max_tokens <= 0) {
+            if (!parse_int_strict(
+                    argv[++i], sconfig.semantic_tool_predictor.max_tokens) ||
+                sconfig.semantic_tool_predictor.max_tokens <= 0) {
                 std::fprintf(stderr,
                     "[server] --tool-hint-max-tokens must be positive\n");
                 return 2;
@@ -669,9 +678,8 @@ int main(int argc, char ** argv) {
         } else if (std::strcmp(
                        argv[i], "--tool-hint-execution-confidence") == 0 &&
                    i + 1 < argc) {
-            sconfig.semantic_tool_predictor.execution_confidence =
-                std::atof(argv[++i]);
-            if (!std::isfinite(
+            if (!parse_double_strict(
+                    argv[++i],
                     sconfig.semantic_tool_predictor.execution_confidence) ||
                 sconfig.semantic_tool_predictor.execution_confidence < 0.0 ||
                 sconfig.semantic_tool_predictor.execution_confidence > 1.0) {
@@ -704,8 +712,9 @@ int main(int argc, char ** argv) {
             }
         } else if (std::strcmp(argv[i], "--tool-spec-timeout-ms") == 0 &&
                    i + 1 < argc) {
-            sconfig.tool_speculation.timeout_ms = std::atoi(argv[++i]);
-            if (sconfig.tool_speculation.timeout_ms <= 0) {
+            if (!parse_int_strict(
+                    argv[++i], sconfig.tool_speculation.timeout_ms) ||
+                sconfig.tool_speculation.timeout_ms <= 0) {
                 std::fprintf(stderr,
                     "[server] --tool-spec-timeout-ms must be positive\n");
                 return 2;
@@ -713,9 +722,8 @@ int main(int argc, char ** argv) {
         } else if (std::strcmp(
                        argv[i], "--tool-spec-max-model-slowdown") == 0 &&
                    i + 1 < argc) {
-            sconfig.tool_speculation.max_model_slowdown_ratio =
-                std::atof(argv[++i]);
-            if (!std::isfinite(
+            if (!parse_double_strict(
+                    argv[++i],
                     sconfig.tool_speculation.max_model_slowdown_ratio) ||
                 sconfig.tool_speculation.max_model_slowdown_ratio < 1.0) {
                 std::fprintf(stderr,
@@ -800,8 +808,7 @@ int main(int argc, char ** argv) {
     const bool semantic_native_predictor_requested =
         !sconfig.semantic_tool_predictor.native_model_path.empty() ||
         !sconfig.semantic_tool_predictor.native_ipc_bin.empty() ||
-        !sconfig.semantic_tool_predictor.native_work_dir.empty() ||
-        native_tool_predictor_schedule_set;
+        !sconfig.semantic_tool_predictor.native_work_dir.empty();
     if (semantic_native_predictor_requested &&
         !sconfig.semantic_tool_predictor.native_enabled()) {
         std::fprintf(stderr,
@@ -815,6 +822,12 @@ int main(int argc, char ** argv) {
         !sconfig.tool_speculation.allowed_tools.empty() ||
         !sconfig.tool_speculation.cpu_affinity.empty();
     if (tool_speculation_requested) {
+        if (!tool_speculation_executor_isolation_supported()) {
+            std::fprintf(stderr,
+                "[server] tool speculation requires Linux glibc >= 2.34 "
+                "for child descriptor isolation\n");
+            return 2;
+        }
         if (sconfig.tool_speculation.executor_path.empty() ||
             sconfig.tool_speculation.profile_path.empty() ||
             sconfig.tool_speculation.allowed_tools.empty()) {
@@ -1390,11 +1403,9 @@ int main(int argc, char ** argv) {
             std::fprintf(stderr,
                 "[server] │  tool_hint_gpu   = %d (max_ctx=%d)\n",
                 predictor.native_gpu, predictor.native_max_ctx);
-            std::fprintf(stderr,
-                "[server] │  tool_hint_schedule= %s\n",
-                native_tool_predictor_schedule_name(
-                    predictor.native_schedule));
         }
+        std::fprintf(stderr,
+            "[server] │  tool_hint_schedule= before-model\n");
         std::fprintf(stderr, "[server] │  tool_hint_timeout= %d ms\n",
                      predictor.timeout_ms);
         std::fprintf(stderr, "[server] │  tool_hint_execute= %s (confidence=%.3f)\n",

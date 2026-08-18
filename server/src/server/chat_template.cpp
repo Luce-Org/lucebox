@@ -76,8 +76,7 @@ std::string render_chat_template(
     ChatFormat format,
     bool add_generation_prompt,
     bool enable_thinking,
-    const std::string & tools_json,
-    bool tool_call_required)
+    const std::string & tools_json)
 {
     std::string result;
     bool has_tools = !tools_json.empty() && tools_json != "[]" && tools_json != "null";
@@ -384,13 +383,9 @@ std::string render_chat_template(
             result += "For each function call, you MUST return a single JSON object "
                       "within '<function_call>' and '</function_call>' tags, "
                       "containing the function name and arguments, like this:\n"
-                       "<function_call>\n"
-                       "{\"name\": \"function_name\", \"arguments\": {\"param_name\": \"value\"}}\n"
-                       "</function_call>\n\n";
-            if (tool_call_required) {
-                result += "You MUST call exactly one available function and emit no "
-                          "text outside its <function_call> tags.\n\n";
-            }
+                      "<function_call>\n"
+                      "{\"name\": \"function_name\", \"arguments\": {\"param_name\": \"value\"}}\n"
+                      "</function_call>\n\n";
         }
         result += system_content;
 

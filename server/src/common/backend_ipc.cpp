@@ -8,6 +8,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <chrono>
+#include <array>
+#include <algorithm>
+#include <climits>
+#include <limits>
 #include <string>
 #include <thread>
 #include <vector>
@@ -15,6 +19,7 @@
 #if !defined(_WIN32)
 #  include <cerrno>
 #  include <fcntl.h>
+#  include <poll.h>
 #  include <signal.h>
 #  include <sys/mman.h>
 #  include <sys/stat.h>
@@ -26,6 +31,85 @@
 #endif
 
 namespace dflash::common {
+
+namespace {
+
+#if !defined(_WIN32)
+bool read_exact_with_timeout(int fd, void * data, size_t bytes,
+                             int timeout_ms, bool & timed_out) {
+    timed_out = false;
+    auto * cursor = static_cast<char *>(data);
+    size_t received = 0;
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(timeout_ms);
+    while (received < bytes) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            timed_out = true;
+            return false;
+        }
+        const int64_t remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - now).count();
+        pollfd descriptor{fd, POLLIN | POLLHUP, 0};
+        const int wait_ms = static_cast<int>((std::min)(
+            int64_t{INT_MAX}, (std::max)(int64_t{1}, remaining)));
+        const int polled = ::poll(&descriptor, 1, wait_ms);
+        if (polled == 0) {
+            timed_out = true;
+            return false;
+        }
+        if (polled < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (descriptor.revents & (POLLERR | POLLNVAL)) return false;
+        const ssize_t count = ::read(fd, cursor + received, bytes - received);
+        if (count == 0) return false;
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        received += static_cast<size_t>(count);
+    }
+    return true;
+}
+
+bool close_descriptor_range(unsigned int first, unsigned int last) {
+    if (first > last) return true;
+#if defined(__linux__) && defined(SYS_close_range)
+    int rc = -1;
+    do {
+        rc = static_cast<int>(::syscall(SYS_close_range, first, last, 0));
+    } while (rc != 0 && errno == EINTR);
+    return rc == 0;
+#else
+    (void)first;
+    (void)last;
+    errno = ENOSYS;
+    return false;
+#endif
+}
+
+bool isolate_child_descriptors(int payload_fd, int stream_fd, int shared_fd) {
+    std::array<int, 3> keep{payload_fd, stream_fd, shared_fd};
+    std::sort(keep.begin(), keep.end());
+    unsigned int first = STDERR_FILENO + 1;
+    int previous = -1;
+    for (const int fd : keep) {
+        if (fd < static_cast<int>(first) || fd == previous) continue;
+        if (!close_descriptor_range(first, static_cast<unsigned int>(fd - 1))) {
+            return false;
+        }
+        first = static_cast<unsigned int>(fd) + 1U;
+        previous = fd;
+    }
+    return close_descriptor_range(
+        first, (std::numeric_limits<unsigned int>::max)());
+}
+#endif
+
+}  // namespace
 
 const char * backend_ipc_mode_name(BackendIpcMode mode) {
     switch (mode) {
@@ -112,7 +196,7 @@ bool BackendIpcProcess::start(const BackendIpcLaunchConfig & cfg) {
 #else
     close();
     if (cfg.bin.empty() || cfg.payload_path.empty()) return false;
-    if (!init_work_dir(cfg.work_dir)) return false;
+    if (!init_work_dir(cfg.work_dir, cfg.require_private_work_dir)) return false;
 
     int cmd_pipe[2] = {-1, -1};
     int payload_pipe[2] = {-1, -1};
@@ -198,6 +282,14 @@ bool BackendIpcProcess::start(const BackendIpcLaunchConfig & cfg) {
         argv.reserve(argv_storage.size() + 1);
         for (std::string & arg : argv_storage) argv.push_back(arg.data());
         argv.push_back(nullptr);
+        if (cfg.isolate_inherited_fds &&
+            !isolate_child_descriptors(
+                payload_pipe[0], stream_pipe[1], shared_payload_fd_)) {
+            std::fprintf(stderr,
+                         "backend-ipc descriptor isolation failed: %s\n",
+                         std::strerror(errno));
+            _exit(127);
+        }
         ::execv(exec_bin.c_str(), argv.data());
         std::fprintf(stderr, "backend-ipc exec failed: %s: %s\n",
                      exec_bin.c_str(), std::strerror(errno));
@@ -217,7 +309,13 @@ bool BackendIpcProcess::start(const BackendIpcLaunchConfig & cfg) {
         return false;
     }
     int32_t status = -1;
-    if (!read_exact_fd(stream_fd_, &status, sizeof(status)) || status != 0) {
+    bool readiness_timed_out = false;
+    const bool status_read = cfg.readiness_timeout_ms > 0
+        ? read_exact_with_timeout(stream_fd_, &status, sizeof(status),
+                                  cfg.readiness_timeout_ms,
+                                  readiness_timed_out)
+        : read_exact_fd(stream_fd_, &status, sizeof(status));
+    if (!status_read || status != 0) {
         int child_status = 0;
         const pid_t exited = ::waitpid(pid_, &child_status, WNOHANG);
         if (exited == pid_) {
@@ -236,9 +334,17 @@ bool BackendIpcProcess::start(const BackendIpcLaunchConfig & cfg) {
             }
             pid_ = -1;
         } else {
-            std::fprintf(stderr, "backend-ipc daemon did not become ready (status=%d)\n", status);
+            std::fprintf(stderr,
+                         readiness_timed_out
+                             ? "backend-ipc daemon readiness timed out after %d ms\n"
+                             : "backend-ipc daemon did not become ready (status=%d)\n",
+                         readiness_timed_out ? cfg.readiness_timeout_ms : status);
         }
-        close();
+        if (pid_ > 0 && cfg.readiness_timeout_ms > 0) {
+            terminate();
+        } else {
+            close();
+        }
         return false;
     }
     active_ = true;
@@ -430,7 +536,8 @@ bool BackendIpcProcess::init_shared_payload(size_t bytes) {
     return true;
 }
 
-bool BackendIpcProcess::init_work_dir(const std::string & requested) {
+bool BackendIpcProcess::init_work_dir(const std::string & requested,
+                                      bool require_private) {
     if (!requested.empty()) {
         work_dir_ = requested;
         owns_work_dir_ = false;
@@ -442,14 +549,18 @@ bool BackendIpcProcess::init_work_dir(const std::string & requested) {
             }
         }
         struct stat st;
-        if (::lstat(work_dir_.c_str(), &st) != 0 ||
+        const int stat_result = require_private
+            ? ::lstat(work_dir_.c_str(), &st)
+            : ::stat(work_dir_.c_str(), &st);
+        if (stat_result != 0 ||
             !S_ISDIR(st.st_mode)) {
             std::fprintf(stderr,
-                "backend-ipc work_dir is not a real directory: %s\n",
+                "backend-ipc work_dir is not a directory: %s\n",
                 work_dir_.c_str());
             return false;
         }
-        if (st.st_uid != ::geteuid() || (st.st_mode & 0777) != 0700) {
+        if (require_private &&
+            (st.st_uid != ::geteuid() || (st.st_mode & 0777) != 0700)) {
             std::fprintf(stderr,
                 "backend-ipc work_dir must be owned by the server and mode 0700: %s\n",
                 work_dir_.c_str());

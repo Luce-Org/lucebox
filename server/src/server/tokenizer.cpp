@@ -18,6 +18,20 @@
 
 namespace dflash::common {
 
+namespace {
+
+bool preprocessing_deadline_expired(
+        const std::chrono::steady_clock::time_point * deadline,
+        size_t & operations,
+        bool & timed_out) {
+    if (!deadline || (operations++ & 255U) != 0U) return false;
+    if (std::chrono::steady_clock::now() < *deadline) return false;
+    timed_out = true;
+    return true;
+}
+
+}  // namespace
+
 // ─── Unicode helpers ────────────────────────────────────────────────────
 
 static int utf8_len(uint8_t c) {
@@ -147,11 +161,15 @@ static bool is_newline(uint32_t cp) {
 //   \s+(?!\S) |
 //   \s+
 
-std::vector<std::string> Tokenizer::pre_tokenize(const std::string & text) const {
+std::vector<std::string> Tokenizer::pre_tokenize(
+        const std::string & text,
+        const std::chrono::steady_clock::time_point * deadline,
+        bool & timed_out) const {
     std::vector<std::string> pieces;
     const char * s = text.c_str();
     const size_t len = text.size();
     size_t pos = 0;
+    size_t operations = 0;
 
     auto peek_cp = [&](size_t p, int * cplen) -> uint32_t {
         if (p >= len) { *cplen = 0; return 0; }
@@ -159,6 +177,8 @@ std::vector<std::string> Tokenizer::pre_tokenize(const std::string & text) const
     };
 
     while (pos < len) {
+        if (preprocessing_deadline_expired(
+                deadline, operations, timed_out)) return {};
         size_t start = pos;
         int cplen = 0;
         uint32_t cp = peek_cp(pos, &cplen);
@@ -204,6 +224,8 @@ std::vector<std::string> Tokenizer::pre_tokenize(const std::string & text) const
             // One or more letter/mark chars
             if (cl > 0 && (is_letter(c) || is_mark(c))) {
                 while (cl > 0 && (is_letter(c) || is_mark(c))) {
+                    if (preprocessing_deadline_expired(
+                            deadline, operations, timed_out)) return {};
                     p += cl;
                     c = peek_cp(p, &cl);
                 }
@@ -234,12 +256,16 @@ std::vector<std::string> Tokenizer::pre_tokenize(const std::string & text) const
             size_t punc_start = p;
             while (cl > 0 && !is_whitespace(c) && !is_letter(c) &&
                    !is_mark(c) && !is_digit(c)) {
+                if (preprocessing_deadline_expired(
+                        deadline, operations, timed_out)) return {};
                 p += cl;
                 c = peek_cp(p, &cl);
             }
             if (p > punc_start) {
                 // Trailing newlines
                 while (cl > 0 && is_newline(c)) {
+                    if (preprocessing_deadline_expired(
+                            deadline, operations, timed_out)) return {};
                     p += cl;
                     c = peek_cp(p, &cl);
                 }
@@ -256,11 +282,15 @@ std::vector<std::string> Tokenizer::pre_tokenize(const std::string & text) const
             uint32_t c = peek_cp(p, &cl);
             // Consume leading whitespace
             while (cl > 0 && is_whitespace(c) && !is_newline(c)) {
+                if (preprocessing_deadline_expired(
+                        deadline, operations, timed_out)) return {};
                 p += cl;
                 c = peek_cp(p, &cl);
             }
             if (cl > 0 && is_newline(c)) {
                 while (cl > 0 && is_newline(c)) {
+                    if (preprocessing_deadline_expired(
+                            deadline, operations, timed_out)) return {};
                     p += cl;
                     c = peek_cp(p, &cl);
                 }
@@ -277,6 +307,8 @@ std::vector<std::string> Tokenizer::pre_tokenize(const std::string & text) const
             c = peek_cp(p, &cl);
             size_t prev_p = pos;  // position before last whitespace char
             while (cl > 0 && is_whitespace(c)) {
+                if (preprocessing_deadline_expired(
+                        deadline, operations, timed_out)) return {};
                 prev_p = p;
                 p += cl;
                 c = peek_cp(p, &cl);
@@ -351,18 +383,30 @@ static std::string byte_to_gpt2_unicode(uint8_t b) {
 }
 
 // Convert a raw UTF-8 text piece to GPT-2 byte-encoded form for BPE lookup.
-static std::string encode_gpt2_bpe(const std::string & text) {
+static std::string encode_gpt2_bpe(
+        const std::string & text,
+        const std::chrono::steady_clock::time_point * deadline,
+        size_t & operations,
+        bool & timed_out) {
     std::string out;
     out.reserve(text.size() * 2);  // GPT-2 encoding may expand
     for (uint8_t b : text) {
+        if (preprocessing_deadline_expired(
+                deadline, operations, timed_out)) return {};
         out += byte_to_gpt2_unicode(b);
     }
     return out;
 }
 
 // Encode a single pre-tokenized piece using BPE merges.
-std::vector<int32_t> Tokenizer::bpe_encode_piece(const std::string & piece) const {
+std::vector<int32_t> Tokenizer::bpe_encode_piece(
+        const std::string & piece,
+        const std::chrono::steady_clock::time_point * deadline,
+        bool & timed_out) const {
     if (piece.empty()) return {};
+    size_t operations = 0;
+    if (preprocessing_deadline_expired(
+            deadline, operations, timed_out)) return {};
 
     std::vector<std::string> symbols;
 
@@ -380,6 +424,8 @@ std::vector<int32_t> Tokenizer::bpe_encode_piece(const std::string & piece) cons
         std::string encoded;
         encoded.reserve(sp_piece.size());
         for (char c : sp_piece) {
+            if (preprocessing_deadline_expired(
+                    deadline, operations, timed_out)) return {};
             if (c == ' ') {
                 encoded += "\xe2\x96\x81";
             } else {
@@ -397,6 +443,8 @@ std::vector<int32_t> Tokenizer::bpe_encode_piece(const std::string & piece) cons
         const char * p = encoded.c_str();
         const char * end = p + encoded.size();
         while (p < end) {
+            if (preprocessing_deadline_expired(
+                    deadline, operations, timed_out)) return {};
             int cplen;
             utf8_decode(p, (size_t)(end - p), &cplen);
             if (cplen <= 0) cplen = 1;
@@ -414,7 +462,9 @@ std::vector<int32_t> Tokenizer::bpe_encode_piece(const std::string & piece) cons
         }
     } else {
         // GPT-2 BPE: convert raw text to GPT-2 byte encoding for vocab lookup.
-        std::string encoded = encode_gpt2_bpe(piece);
+        std::string encoded = encode_gpt2_bpe(
+            piece, deadline, operations, timed_out);
+        if (timed_out) return {};
 
         // Try to find the encoded piece as a single token first.
         auto it = token_to_id_.find(encoded);
@@ -424,6 +474,8 @@ std::vector<int32_t> Tokenizer::bpe_encode_piece(const std::string & piece) cons
 
         // Split into individual GPT-2-encoded bytes as initial BPE symbols.
         for (size_t i = 0; i < piece.size(); i++) {
+            if (preprocessing_deadline_expired(
+                    deadline, operations, timed_out)) return {};
             std::string sym = byte_to_gpt2_unicode((uint8_t)piece[i]);
             auto sit = token_to_id_.find(sym);
             if (sit != token_to_id_.end()) {
@@ -446,10 +498,14 @@ std::vector<int32_t> Tokenizer::bpe_encode_piece(const std::string & piece) cons
 
     // Iteratively merge the highest-priority pair until no more merges apply.
     while (symbols.size() > 1) {
+        if (preprocessing_deadline_expired(
+                deadline, operations, timed_out)) return {};
         int best_rank = std::numeric_limits<int>::max();
         size_t best_pos = SIZE_MAX;
 
         for (size_t i = 0; i + 1 < symbols.size(); i++) {
+            if (preprocessing_deadline_expired(
+                    deadline, operations, timed_out)) return {};
             std::string pair = symbols[i] + " " + symbols[i + 1];
             auto mit = merge_rank_.find(pair);
             if (mit != merge_rank_.end() && mit->second < best_rank) {
@@ -469,6 +525,8 @@ std::vector<int32_t> Tokenizer::bpe_encode_piece(const std::string & piece) cons
     std::vector<int32_t> ids;
     ids.reserve(symbols.size());
     for (const auto & sym : symbols) {
+        if (preprocessing_deadline_expired(
+                deadline, operations, timed_out)) return {};
         auto sit = token_to_id_.find(sym);
         if (sit != token_to_id_.end()) {
             ids.push_back(sit->second);
@@ -493,6 +551,8 @@ std::vector<int32_t> Tokenizer::bpe_encode_piece(const std::string & piece) cons
             const char * p = sym.c_str();
             const char * end = p + sym.size();
             while (p < end) {
+                if (preprocessing_deadline_expired(
+                        deadline, operations, timed_out)) return {};
                 int cplen;
                 uint32_t cp = utf8_decode(p, (size_t)(end - p), &cplen);
                 uint8_t orig_byte;
@@ -633,13 +693,25 @@ bool Tokenizer::load_from_gguf(const char * model_path) {
     return true;
 }
 
-std::vector<int32_t> Tokenizer::encode(const std::string & text) const {
+std::vector<int32_t> Tokenizer::encode_impl(
+        const std::string & text,
+        const std::chrono::steady_clock::time_point * deadline,
+        bool & timed_out) const {
+    size_t operations = 0;
+    if (preprocessing_deadline_expired(
+            deadline, operations, timed_out)) return {};
     // If no added tokens, fast path: pre-tokenize → BPE entire text.
     if (added_tokens_.empty()) {
-        std::vector<std::string> pieces = pre_tokenize(text);
+        std::vector<std::string> pieces = pre_tokenize(
+            text, deadline, timed_out);
+        if (timed_out) return {};
         std::vector<int32_t> ids;
         for (const auto & piece : pieces) {
-            auto piece_ids = bpe_encode_piece(piece);
+            if (preprocessing_deadline_expired(
+                    deadline, operations, timed_out)) return {};
+            auto piece_ids = bpe_encode_piece(
+                piece, deadline, timed_out);
+            if (timed_out) return {};
             ids.insert(ids.end(), piece_ids.begin(), piece_ids.end());
         }
         return ids;
@@ -650,9 +722,13 @@ std::vector<int32_t> Tokenizer::encode(const std::string & text) const {
     std::vector<int32_t> ids;
     size_t pos = 0;
     while (pos < text.size()) {
+        if (preprocessing_deadline_expired(
+                deadline, operations, timed_out)) return {};
         // Try to match any added token at current position.
         bool matched = false;
         for (const auto & [tok_str, tok_id] : added_tokens_) {
+            if (preprocessing_deadline_expired(
+                    deadline, operations, timed_out)) return {};
             if (pos + tok_str.size() <= text.size() &&
                 text.compare(pos, tok_str.size(), tok_str) == 0) {
                 ids.push_back(tok_id);
@@ -666,6 +742,8 @@ std::vector<int32_t> Tokenizer::encode(const std::string & text) const {
         // Find the next special token (or end of string).
         size_t next_special = text.size();
         for (const auto & [tok_str, tok_id] : added_tokens_) {
+            if (preprocessing_deadline_expired(
+                    deadline, operations, timed_out)) return {};
             size_t found = text.find(tok_str, pos);
             if (found != std::string::npos && found < next_special) {
                 next_special = found;
@@ -674,14 +752,36 @@ std::vector<int32_t> Tokenizer::encode(const std::string & text) const {
 
         // Pre-tokenize + BPE the normal segment.
         std::string segment = text.substr(pos, next_special - pos);
-        std::vector<std::string> pieces = pre_tokenize(segment);
+        std::vector<std::string> pieces = pre_tokenize(
+            segment, deadline, timed_out);
+        if (timed_out) return {};
         for (const auto & piece : pieces) {
-            auto piece_ids = bpe_encode_piece(piece);
+            auto piece_ids = bpe_encode_piece(
+                piece, deadline, timed_out);
+            if (timed_out) return {};
             ids.insert(ids.end(), piece_ids.begin(), piece_ids.end());
         }
         pos = next_special;
     }
     return ids;
+}
+
+std::vector<int32_t> Tokenizer::encode(const std::string & text) const {
+    bool timed_out = false;
+    return encode_impl(text, nullptr, timed_out);
+}
+
+bool Tokenizer::encode_until(
+        const std::string & text,
+        std::chrono::steady_clock::time_point deadline,
+        std::vector<int32_t> & out) const {
+    bool timed_out = false;
+    out = encode_impl(text, &deadline, timed_out);
+    if (timed_out || std::chrono::steady_clock::now() >= deadline) {
+        out.clear();
+        return false;
+    }
+    return true;
 }
 
 // GPT-2 byte-level BPE uses a Unicode mapping where each byte 0-255 is

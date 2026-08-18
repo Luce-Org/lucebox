@@ -4,24 +4,13 @@
 
 #include <nlohmann/json.hpp>
 
+#include <chrono>
 #include <string>
 
 namespace dflash::common {
 
 using json = nlohmann::json;
 using ordered_json = nlohmann::ordered_json;
-
-enum class NativeToolPredictorSchedule {
-    BeforeModel,
-    Overlap,
-};
-
-const char * native_tool_predictor_schedule_name(
-    NativeToolPredictorSchedule schedule);
-
-bool parse_native_tool_predictor_schedule(
-    const std::string & value,
-    NativeToolPredictorSchedule & out);
 
 struct SemanticToolPredictorConfig {
     std::string url;
@@ -33,8 +22,6 @@ struct SemanticToolPredictorConfig {
     int native_max_ctx = 4096;
     int timeout_ms = 2000;
     int max_tokens = 96;
-    NativeToolPredictorSchedule native_schedule =
-        NativeToolPredictorSchedule::BeforeModel;
     // Conservative prior used by the measured tool-execution admission
     // policy. The base predictor currently emits no calibrated probability.
     double execution_confidence = 0.75;
@@ -44,10 +31,6 @@ struct SemanticToolPredictorConfig {
         return !native_model_path.empty() && !native_ipc_bin.empty();
     }
     bool enabled() const { return native_enabled() || http_enabled(); }
-    bool native_runs_before_model() const {
-        return native_enabled() &&
-            native_schedule == NativeToolPredictorSchedule::BeforeModel;
-    }
 };
 
 struct SemanticToolCall {
@@ -94,7 +77,8 @@ json build_semantic_tool_predictor_request(
 // decoded response is parsed semantically before any target token IDs exist.
 std::string build_native_semantic_tool_predictor_prompt(
     const json & predictor_request,
-    std::string & error);
+    std::string & error,
+    const std::chrono::steady_clock::time_point * deadline = nullptr);
 
 bool parse_native_semantic_tool_prediction(
     const std::string & generated_text,

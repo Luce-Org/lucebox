@@ -253,6 +253,14 @@ bool should_clamp_flowkv_disk_cache(
     return flowkv && policy.compress;
 }
 
+bool tool_choice_disables_tool_calls(const json & tool_choice) {
+    if (tool_choice.is_string()) {
+        return tool_choice.get<std::string>() == "none";
+    }
+    return tool_choice.is_object() &&
+           tool_choice.value("type", "") == "none";
+}
+
 }  // namespace http_detail
 
 // ─── curl helpers for upstream proxy ─────────────────────────────────────
@@ -817,6 +825,53 @@ SemanticToolPrediction request_semantic_tool_prediction(
     return finish();
 }
 
+SemanticToolPrediction predict_semantic_tool_call(
+        const SemanticToolPredictorConfig & config,
+        const json & payload,
+        const json & request_tools,
+        const std::shared_ptr<NativeSemanticToolPredictor> & native) {
+    const auto started = std::chrono::steady_clock::now();
+    SemanticToolPrediction native_result;
+    if (native && native->active()) {
+        native_result = native->predict(payload, request_tools);
+        if (native_result.ok || !config.http_enabled()) {
+            return native_result;
+        }
+    }
+    if (!config.http_enabled()) {
+        if (native_result.error.empty()) {
+            native_result.error = "native_predictor_not_initialized";
+        }
+        return native_result;
+    }
+
+    const double elapsed_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - started).count();
+    const int remaining_ms = config.timeout_ms -
+        static_cast<int>(std::ceil(elapsed_ms));
+    if (remaining_ms <= 0) {
+        native_result.source = config.model;
+        native_result.ok = false;
+        native_result.error = native_result.error.empty()
+            ? "predictor_timeout"
+            : "native=" + native_result.error + ";http=predictor_timeout";
+        native_result.wall_ms = elapsed_ms;
+        return native_result;
+    }
+
+    SemanticToolPredictorConfig fallback_config = config;
+    fallback_config.timeout_ms = remaining_ms;
+    SemanticToolPrediction fallback = request_semantic_tool_prediction(
+        fallback_config, payload, request_tools);
+    if (!fallback.ok && !native_result.error.empty()) {
+        fallback.error = "native=" + native_result.error +
+                         ";http=" + fallback.error;
+    }
+    fallback.wall_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - started).count();
+    return fallback;
+}
+
 }  // namespace
 
 // ─── /props constants ───────────────────────────────────────────────────
@@ -945,15 +1000,6 @@ static const json * find_tool_function(const json & tools,
         if (fn.value("name", "") == name) return &fn;
     }
     return nullptr;
-}
-
-static bool tool_choice_requires_call(const json & tool_choice) {
-    if (tool_choice.is_string()) {
-        return tool_choice.get<std::string>() == "required";
-    }
-    return tool_choice.is_object() && tool_choice.contains("function") &&
-           tool_choice["function"].is_object() &&
-           !tool_choice["function"].value("name", "").empty();
 }
 
 static std::string first_tool_parameter_name(const json & function_def) {
@@ -1216,13 +1262,10 @@ json build_props_body(const ServerConfig & config,
                  ? json(config.semantic_tool_predictor.execution_confidence)
                  : json(nullptr)},
             {"predictor_schedule",
-             config.semantic_tool_predictor.native_enabled()
-                 ? json(native_tool_predictor_schedule_name(
-                       config.semantic_tool_predictor.native_schedule))
-                 : config.semantic_tool_predictor.http_enabled()
-                     ? json("overlap") : json(nullptr)},
+             config.semantic_tool_predictor.enabled()
+                 ? json("before-model") : json(nullptr)},
             {"predictor_decode_isolated",
-             config.semantic_tool_predictor.native_runs_before_model()},
+             config.semantic_tool_predictor.enabled()},
             {"execution_mode", config.tool_speculation.execution_mode()},
             {"profile_status",
              config.tool_speculation.policy.empty()
@@ -1233,9 +1276,11 @@ json build_props_body(const ServerConfig & config,
                  ? json(nullptr)
                  : json(config.tool_speculation.policy.executor_contract())},
             {"protocol", "dflash.tool-speculation.v1"},
-            {"requires_client_support",
-             !(config.tool_speculation.enabled() &&
-               config.semantic_tool_predictor.enabled())},
+            {"client_prediction_required",
+             config.tool_speculation.enabled() &&
+                 !config.semantic_tool_predictor.enabled()},
+            {"client_result_handling_required",
+             config.tool_speculation.enabled()},
             {"preserves_token_speculation", true},
             {"unqualified_lane_policy", "defer"},
             {"allowed_tools", config.tool_speculation.allowed_tools},
@@ -2118,6 +2163,11 @@ bool HttpServer::parse_common_request_fields(
     }
 
     if (body.contains("tool_speculation")) {
+        if (http_detail::tool_choice_disables_tool_calls(req.tool_choice)) {
+            send_error(fd, 400,
+                "tool_speculation cannot be used when tool_choice is none");
+            return false;
+        }
         ToolSpeculationPrediction prediction;
         std::string prediction_error;
         if (!parse_tool_speculation_prediction(
@@ -2392,8 +2442,7 @@ bool HttpServer::render_and_tokenize_request(
     } else {
         rendered = render_chat_template(
             chat_messages, chat_format_, /*add_generation_prompt=*/true,
-            req.thinking_enabled, tools_json,
-            tool_choice_requires_call(req.tool_choice));
+            req.thinking_enabled, tools_json);
     }
 
     req.started_in_thinking = prompt_ends_in_open_think(rendered);
@@ -2434,20 +2483,17 @@ void HttpServer::log_parsed_request(const ParsedRequest & req) const {
         req.stop_sequences.size(), req.model.c_str());
 }
 
-void HttpServer::launch_semantic_tool_prediction(ParsedRequest & req) const {
-    if (req.semantic_tool_prediction.valid() ||
-        req.automatic_tool_speculation.valid()) {
-        return;
-    }
-    const bool automatic_execution =
-        req.automatic_tool_speculation_enabled &&
-        !req.tool_speculation.has_value() &&
-        config_.tool_speculation.enabled();
-    if (!automatic_execution ||
-        !config_.semantic_tool_predictor.enabled() || req.tools.empty() ||
-        !req.raw_body.is_object()) {
-        return;
-    }
+void HttpServer::start_automatic_tool_speculation(ParsedRequest & req) const {
+    if (req.automatic_tool_speculation.has_value() ||
+        !req.automatic_tool_speculation_enabled ||
+        req.tool_speculation.has_value() ||
+        !config_.tool_speculation.enabled() ||
+        !config_.semantic_tool_predictor.enabled() ||
+        http_detail::tool_choice_disables_tool_calls(req.tool_choice) ||
+        req.tools.empty() || !req.raw_body.is_object()) return;
+
+    req.automatic_tool_speculation.emplace();
+    auto & launch = *req.automatic_tool_speculation;
     const SemanticToolPredictorConfig predictor =
         config_.semantic_tool_predictor;
     json semantic_request = req.raw_body;
@@ -2464,104 +2510,44 @@ void HttpServer::launch_semantic_tool_prediction(ParsedRequest & req) const {
         predictor.max_tokens);
     const json tools = req.tools;
     const auto native = native_semantic_predictor_;
-    req.semantic_tool_prediction = std::async(
-        std::launch::async,
-        [predictor, payload, tools, native]() {
-            const auto prediction_started = std::chrono::steady_clock::now();
-            SemanticToolPrediction native_result;
-            if (native && native->active()) {
-                native_result = native->predict(payload, tools);
-                if (native_result.ok || !predictor.http_enabled()) {
-                    return native_result;
-                }
+    try {
+        const SemanticToolPrediction semantic = predict_semantic_tool_call(
+            predictor, payload, tools, native);
+        launch.predictor_wall_ms = semantic.wall_ms;
+        launch.prediction_source = semantic.source;
+        if (!semantic.ok) {
+            launch.predictor_error = semantic.error.empty()
+                ? "predictor_unavailable" : semantic.error;
+        } else {
+            ToolSpeculationPrediction prediction;
+            std::string error;
+            const json arguments = json::parse(semantic.call.arguments.dump());
+            if (!build_tool_speculation_prediction(
+                    semantic.call.name, arguments,
+                    predictor.execution_confidence, prediction, error)) {
+                launch.predictor_error = std::move(error);
+            } else {
+                auto attempt = ToolSpeculationAttempt::create(
+                    config_.tool_speculation, prediction, req.response_id);
+                launch.attempt = std::shared_ptr<ToolSpeculationAttempt>(
+                    std::move(attempt));
+                launch.attempt->start();
             }
-            if (predictor.http_enabled()) {
-                const double elapsed_ms =
-                    std::chrono::duration<double, std::milli>(
-                        std::chrono::steady_clock::now() -
-                        prediction_started).count();
-                const int remaining_ms = predictor.timeout_ms -
-                    static_cast<int>(std::ceil(elapsed_ms));
-                if (remaining_ms <= 0) {
-                    native_result.source = predictor.model;
-                    native_result.ok = false;
-                    native_result.error = native_result.error.empty()
-                        ? "predictor_timeout"
-                        : "native=" + native_result.error +
-                          ";http=predictor_timeout";
-                    native_result.wall_ms = elapsed_ms;
-                    return native_result;
-                }
-                SemanticToolPredictorConfig fallback_config = predictor;
-                fallback_config.timeout_ms = remaining_ms;
-                SemanticToolPrediction fallback =
-                    request_semantic_tool_prediction(
-                        fallback_config, payload, tools);
-                if (!fallback.ok && !native_result.error.empty()) {
-                    fallback.error = "native=" + native_result.error +
-                                     ";http=" + fallback.error;
-                }
-                fallback.wall_ms =
-                    std::chrono::duration<double, std::milli>(
-                        std::chrono::steady_clock::now() -
-                        prediction_started).count();
-                return fallback;
-            }
-            if (native_result.error.empty()) {
-                native_result.error = "native_predictor_not_initialized";
-            }
-            return native_result;
-        }).share();
-    if (automatic_execution) {
-        const auto semantic_prediction = req.semantic_tool_prediction;
-        const ToolSpeculationConfig tool_config = config_.tool_speculation;
-        const double confidence = predictor.execution_confidence;
-        const std::string request_id = req.response_id;
-        req.automatic_tool_speculation = std::async(
-            std::launch::async,
-            [semantic_prediction, tool_config, confidence, request_id]() {
-                ParsedRequest::AutomaticToolSpeculationLaunch launch;
-                try {
-                    const SemanticToolPrediction & semantic =
-                        semantic_prediction.get();
-                    launch.predictor_wall_ms = semantic.wall_ms;
-                    launch.prediction_source = semantic.source;
-                    if (!semantic.ok) {
-                        launch.predictor_error = semantic.error.empty()
-                            ? "predictor_unavailable" : semantic.error;
-                        return launch;
-                    }
-                    ToolSpeculationPrediction prediction;
-                    std::string error;
-                    const json arguments = json::parse(
-                        semantic.call.arguments.dump());
-                    if (!build_tool_speculation_prediction(
-                            semantic.call.name, arguments, confidence,
-                            prediction, error)) {
-                        launch.predictor_error = std::move(error);
-                        return launch;
-                    }
-                    auto attempt = ToolSpeculationAttempt::create(
-                        tool_config, prediction, request_id);
-                    launch.attempt = std::shared_ptr<ToolSpeculationAttempt>(
-                        attempt.release());
-                    launch.attempt->start();
-                } catch (const std::exception & error) {
-                    launch.predictor_error =
-                        std::string("automatic_prediction_failed: ") +
-                        error.what();
-                } catch (...) {
-                    launch.predictor_error =
-                        "automatic_prediction_failed: unknown error";
-                }
-                return launch;
-            }).share();
+        }
+    } catch (const std::exception & error) {
+        launch.predictor_error =
+            std::string("automatic_prediction_failed: ") + error.what();
+    } catch (...) {
+        launch.predictor_error =
+            "automatic_prediction_failed: unknown error";
     }
     std::fprintf(stderr,
-        "[tool-hint] launched predictor transport=%s%s tools=%zu execute=%s\n",
+        "[tool-hint] predictor complete transport=%s%s tools=%zu "
+        "execute=%s wall_ms=%.1f\n",
         native ? "native-qwen3" : "http",
         native && predictor.http_enabled() ? "+http-fallback" : "",
-        json_array_size(req.tools), automatic_execution ? "true" : "false");
+        json_array_size(req.tools), launch.attempt ? "true" : "false",
+        launch.predictor_wall_ms);
 }
 
 void HttpServer::enqueue_request_and_wait(SocketHandle fd, ParsedRequest req) {
@@ -2660,9 +2646,6 @@ bool HttpServer::route_request(SocketHandle fd, const HttpRequest & hr) {
     }
 
     if (!validate_request_context(fd, req)) return true;
-    if (!config_.semantic_tool_predictor.native_runs_before_model()) {
-        launch_semantic_tool_prediction(req);
-    }
     log_parsed_request(req);
     enqueue_request_and_wait(fd, std::move(req));
     return true;
@@ -3271,8 +3254,7 @@ void HttpServer::apply_flowkv_compression(
     } else {
         rendered = render_chat_template(
             chat_messages, chat_format_, /*add_generation_prompt=*/true,
-            req.thinking_enabled, tools_json,
-            tool_choice_requires_call(req.tool_choice));
+            req.thinking_enabled, tools_json);
     }
 
     const int tokens_before = (int) prepared.tokens.size();
@@ -4345,26 +4327,6 @@ void HttpServer::process_job(ServerJob * job) {
     }
     if (req.stream) start_job_stream(job);
 
-    if (config_.semantic_tool_predictor.native_runs_before_model()) {
-        const auto predictor_wait_started = std::chrono::steady_clock::now();
-        launch_semantic_tool_prediction(req);
-        if (req.automatic_tool_speculation.valid()) {
-            req.automatic_tool_speculation.wait();
-        } else if (req.semantic_tool_prediction.valid()) {
-            req.semantic_tool_prediction.wait();
-        }
-        const double predictor_wait_ms =
-            std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - predictor_wait_started)
-                .count();
-        if (req.automatic_tool_speculation.valid() ||
-            req.semantic_tool_prediction.valid()) {
-            std::fprintf(stderr,
-                "[tool-hint] before-model barrier complete %.1f ms\n",
-                predictor_wait_ms);
-        }
-    }
-
     PreparedPrompt prepared = prepare_prompt(req);
     if (prepared.error_status != 0) {
         fail_request(prepared.error_status, prepared.error);
@@ -4374,6 +4336,11 @@ void HttpServer::process_job(ServerJob * job) {
         finish_job();
         return;
     }
+
+    // The only qualified schedule predicts before target compute. This keeps
+    // shared-GPU deployments deterministic; the admitted external tool then
+    // overlaps target generation.
+    start_automatic_tool_speculation(req);
 
     std::unique_ptr<ToolSpeculationAttempt> tool_speculation;
     if (req.tool_speculation.has_value()) {
@@ -4521,47 +4488,28 @@ void HttpServer::process_job(ServerJob * job) {
             metadata["prediction_source"] = "client";
             return metadata;
         }
-        if (!req.automatic_tool_speculation.valid()) return std::nullopt;
-        try {
-            const ParsedRequest::AutomaticToolSpeculationLaunch & launch =
-                req.automatic_tool_speculation.get();
-            json metadata;
-            if (launch.attempt) {
-                metadata = cancel_reason
-                    ? launch.attempt->cancel(cancel_reason)
-                    : launch.attempt->resolve(emitter.tool_calls());
-            } else {
-                metadata = {
-                    {"protocol", "dflash.tool-speculation.v1"},
-                    {"status", "deferred"},
-                    {"reason", "predictor_unavailable"},
-                };
-                if (!launch.predictor_error.empty()) {
-                    metadata["detail"] = launch.predictor_error;
-                }
+        if (!req.automatic_tool_speculation.has_value()) return std::nullopt;
+        const ParsedRequest::AutomaticToolSpeculationLaunch & launch =
+            *req.automatic_tool_speculation;
+        json metadata;
+        if (launch.attempt) {
+            metadata = cancel_reason
+                ? launch.attempt->cancel(cancel_reason)
+                : launch.attempt->resolve(emitter.tool_calls());
+        } else {
+            metadata = {
+                {"protocol", "dflash.tool-speculation.v1"},
+                {"status", "deferred"},
+                {"reason", "predictor_unavailable"},
+            };
+            if (!launch.predictor_error.empty()) {
+                metadata["detail"] = launch.predictor_error;
             }
-            metadata["prediction_source"] =
-                launch.prediction_source.empty()
-                    ? "predictor" : launch.prediction_source;
-            metadata["predictor_wall_ms"] = launch.predictor_wall_ms;
-            return metadata;
-        } catch (const std::exception & error) {
-            return json{
-                {"protocol", "dflash.tool-speculation.v1"},
-                {"status", "failed"},
-                {"reason", "predictor_future_failure"},
-                {"detail", error.what()},
-                {"prediction_source", "predictor"},
-            };
-        } catch (...) {
-            return json{
-                {"protocol", "dflash.tool-speculation.v1"},
-                {"status", "failed"},
-                {"reason", "predictor_future_failure"},
-                {"detail", "unknown error"},
-                {"prediction_source", "predictor"},
-            };
         }
+        metadata["prediction_source"] = launch.prediction_source.empty()
+            ? "predictor" : launch.prediction_source;
+        metadata["predictor_wall_ms"] = launch.predictor_wall_ms;
+        return metadata;
     };
     // A partial tool call from a failed generation is not authoritative.
     // Keep its speculative result private just as we do on disconnect.

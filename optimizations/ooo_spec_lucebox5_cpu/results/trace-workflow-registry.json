@@ -1,0 +1,121 @@
+{
+  "pattern_fingerprint": "06d95882b485daf3f30f3fc12ea62ccfd18656de9deafa2f4ed77c49bb8c0645",
+  "schema_version": 1,
+  "workflows": {
+    "workflow_taska": {
+      "items": [
+        {
+          "customer_email": "agent-taska-taska@example.test",
+          "destination": "Rome"
+        },
+        {
+          "customer_email": "agent-taska-taskb@example.test",
+          "destination": "Milan"
+        }
+      ],
+      "pattern_fingerprint": "06d95882b485daf3f30f3fc12ea62ccfd18656de9deafa2f4ed77c49bb8c0645"
+    },
+    "workflow_taskb": {
+      "items": [
+        {
+          "customer_email": "agent-taskb-taskcw@example.test",
+          "destination": "Naples"
+        },
+        {
+          "customer_email": "agent-taskb-taskcx@example.test",
+          "destination": "Rome"
+        },
+        {
+          "customer_email": "agent-taskb-taskcy@example.test",
+          "destination": "Milan"
+        }
+      ],
+      "pattern_fingerprint": "06d95882b485daf3f30f3fc12ea62ccfd18656de9deafa2f4ed77c49bb8c0645"
+    },
+    "workflow_taskc": {
+      "items": [
+        {
+          "customer_email": "agent-taskc-taskgs@example.test",
+          "destination": "Florence"
+        },
+        {
+          "customer_email": "agent-taskc-taskgt@example.test",
+          "destination": "Naples"
+        },
+        {
+          "customer_email": "agent-taskc-taskgv@example.test",
+          "destination": "Milan"
+        },
+        {
+          "customer_email": "agent-taskc-taskhb@example.test",
+          "destination": "Milan"
+        }
+      ],
+      "pattern_fingerprint": "06d95882b485daf3f30f3fc12ea62ccfd18656de9deafa2f4ed77c49bb8c0645"
+    },
+    "workflow_taskd": {
+      "items": [
+        {
+          "customer_email": "agent-taskd-taskko@example.test",
+          "destination": "Bologna"
+        },
+        {
+          "customer_email": "agent-taskd-taskkp@example.test",
+          "destination": "Florence"
+        }
+      ],
+      "pattern_fingerprint": "06d95882b485daf3f30f3fc12ea62ccfd18656de9deafa2f4ed77c49bb8c0645"
+    },
+    "workflow_taske": {
+      "items": [
+        {
+          "customer_email": "agent-taske-taskok@example.test",
+          "destination": "Turin"
+        },
+        {
+          "customer_email": "agent-taske-taskom@example.test",
+          "destination": "Florence"
+        },
+        {
+          "customer_email": "agent-taske-taskon@example.test",
+          "destination": "Naples"
+        }
+      ],
+      "pattern_fingerprint": "06d95882b485daf3f30f3fc12ea62ccfd18656de9deafa2f4ed77c49bb8c0645"
+    },
+    "workflow_taskf": {
+      "items": [
+        {
+          "customer_email": "agent-taskf-tasksg@example.test",
+          "destination": "Milan"
+        },
+        {
+          "customer_email": "agent-taskf-tasksh@example.test",
+          "destination": "Turin"
+        },
+        {
+          "customer_email": "agent-taskf-tasksi@example.test",
+          "destination": "Bologna"
+        },
+        {
+          "customer_email": "agent-taskf-tasksz@example.test",
+          "destination": "Turin"
+        }
+      ],
+      "pattern_fingerprint": "06d95882b485daf3f30f3fc12ea62ccfd18656de9deafa2f4ed77c49bb8c0645"
+    },
+    "workflow_warmalm": {
+      "items": [
+        {
+          "customer_email": "agent-warmalm-taska@example.test",
+          "destination": "Turin"
+        },
+        {
+          "customer_email": "agent-warmalm-taskb@example.test",
+          "destination": "Bologna"
+        }
+      ],
+      "pattern_fingerprint": "06d95882b485daf3f30f3fc12ea62ccfd18656de9deafa2f4ed77c49bb8c0645"
+    }
+  }
+}

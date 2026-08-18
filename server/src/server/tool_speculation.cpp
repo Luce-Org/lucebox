@@ -27,7 +27,15 @@
 #    include <features.h>
 #    include <sched.h>
 #  endif
-extern char ** environ;
+#endif
+
+#if !defined(_WIN32) && defined(__GLIBC__) && defined(__GLIBC_PREREQ)
+#  if __GLIBC_PREREQ(2, 34)
+#    define DFLASH_TOOL_SPEC_HAS_CLOSEFROM 1
+#  endif
+#endif
+#ifndef DFLASH_TOOL_SPEC_HAS_CLOSEFROM
+#  define DFLASH_TOOL_SPEC_HAS_CLOSEFROM 0
 #endif
 
 namespace dflash::common {
@@ -104,75 +112,41 @@ std::vector<std::string> executor_environment(
         const std::string & accelerator_relation,
         const std::vector<int> & cpu_affinity) {
     std::vector<std::string> values;
-    static constexpr const char * kResourceKey =
-        "DFLASH_TOOL_SPECULATION_RESOURCE_PERCENTAGE=";
-    static constexpr size_t kResourceKeyLen =
-        sizeof("DFLASH_TOOL_SPECULATION_RESOURCE_PERCENTAGE=") - 1;
-    static constexpr const char * kRelationKey =
-        "DFLASH_TOOL_SPECULATION_ACCELERATOR_RELATION=";
-    static constexpr size_t kRelationKeyLen =
-        sizeof("DFLASH_TOOL_SPECULATION_ACCELERATOR_RELATION=") - 1;
-    static constexpr const char * kCpuAffinityKey =
-        "DFLASH_TOOL_SPECULATION_CPU_AFFINITY=";
-    static constexpr size_t kCpuAffinityKeyLen =
-        sizeof("DFLASH_TOOL_SPECULATION_CPU_AFFINITY=") - 1;
-    static constexpr const char * kEnabledKey =
-        "DFLASH_TOOL_SPECULATION=";
-    static constexpr size_t kEnabledKeyLen =
-        sizeof("DFLASH_TOOL_SPECULATION=") - 1;
-    bool resource_replaced = false;
-    bool relation_replaced = false;
-    bool cpu_affinity_replaced = false;
-    bool enabled_replaced = false;
-    for (char ** item = environ; item && *item; ++item) {
-        const std::string value(*item);
-        if (value.compare(0, kResourceKeyLen, kResourceKey) == 0) {
-            values.push_back(
-                std::string(kResourceKey) +
-                std::to_string(resource_percentage));
-            resource_replaced = true;
-        } else if (value.compare(0, kRelationKeyLen, kRelationKey) == 0) {
-            values.push_back(
-                std::string(kRelationKey) + accelerator_relation);
-            relation_replaced = true;
-        } else if (value.compare(
-                       0, kCpuAffinityKeyLen, kCpuAffinityKey) == 0) {
-            // Drop a stale inherited value when this executor has no CPU
-            // lane. Otherwise replace it with the verified canonical list.
-            if (!cpu_affinity.empty()) {
-                values.push_back(
-                    std::string(kCpuAffinityKey) +
-                    format_cpu_affinity(cpu_affinity));
-                cpu_affinity_replaced = true;
-            }
-        } else if (value.compare(0, kEnabledKeyLen, kEnabledKey) == 0) {
-            values.push_back(std::string(kEnabledKey) + "1");
-            enabled_replaced = true;
-        } else {
-            values.push_back(value);
+    // Do not copy the long-running server's environment into a tool process:
+    // it commonly contains model-provider keys and upstream credentials. Keep
+    // only the small runtime surface needed by executable/script adapters.
+    static constexpr const char * kInherited[] = {
+        "PATH",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TZ",
+        "LD_LIBRARY_PATH",
+        "DFLASH_TRACE_TRAINING_REPORT",
+        "DFLASH_TRACE_WORKFLOW_REGISTRY",
+    };
+    for (const char * name : kInherited) {
+        if (const char * value = std::getenv(name); value && *value) {
+            values.push_back(std::string(name) + "=" + value);
         }
     }
-    if (!resource_replaced) {
+    values.push_back("DFLASH_TOOL_SPECULATION=1");
+    values.push_back(
+        "DFLASH_TOOL_SPECULATION_RESOURCE_PERCENTAGE=" +
+        std::to_string(resource_percentage));
+    values.push_back(
+        "DFLASH_TOOL_SPECULATION_ACCELERATOR_RELATION=" +
+        accelerator_relation);
+    if (!cpu_affinity.empty()) {
         values.push_back(
-            std::string(kResourceKey) +
-            std::to_string(resource_percentage));
-    }
-    if (!relation_replaced) {
-        values.push_back(std::string(kRelationKey) + accelerator_relation);
-    }
-    if (!cpu_affinity.empty() && !cpu_affinity_replaced) {
-        values.push_back(
-            std::string(kCpuAffinityKey) +
+            "DFLASH_TOOL_SPECULATION_CPU_AFFINITY=" +
             format_cpu_affinity(cpu_affinity));
-    }
-    if (!enabled_replaced) {
-        values.push_back(std::string(kEnabledKey) + "1");
     }
     return values;
 }
 
 #  if defined(__linux__)
-bool pin_and_verify_child_cpu_affinity(
+bool wait_for_child_cpu_affinity(
         pid_t child,
         const std::vector<int> & cpus,
         std::string & error) {
@@ -190,31 +164,41 @@ bool pin_and_verify_child_cpu_affinity(
         }
         CPU_SET(cpu, &requested);
     }
-    if (::sched_setaffinity(child, sizeof(requested), &requested) != 0) {
-        error = std::string("executor sched_setaffinity failed: ") +
-                std::strerror(errno);
-        return false;
-    }
-    cpu_set_t observed;
-    CPU_ZERO(&observed);
-    if (::sched_getaffinity(child, sizeof(observed), &observed) != 0) {
-        error = std::string("executor sched_getaffinity failed: ") +
-                std::strerror(errno);
-        return false;
-    }
-    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
-        if (CPU_ISSET(cpu, &requested) != CPU_ISSET(cpu, &observed)) {
-            error = "executor CPU affinity verification mismatch";
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(250);
+    do {
+        cpu_set_t observed;
+        CPU_ZERO(&observed);
+        if (::sched_getaffinity(child, sizeof(observed), &observed) == 0) {
+            bool matches = true;
+            for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+                if (CPU_ISSET(cpu, &requested) != CPU_ISSET(cpu, &observed)) {
+                    matches = false;
+                    break;
+                }
+            }
+            if (matches) {
+                error.clear();
+                return true;
+            }
+        } else if (errno != EINTR) {
+            error = std::string("executor sched_getaffinity failed: ") +
+                    std::strerror(errno);
             return false;
         }
-    }
-    error.clear();
-    return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    } while (std::chrono::steady_clock::now() < deadline);
+    error = "executor CPU affinity verification mismatch";
+    return false;
 }
 #  endif
 #endif
 
 }  // namespace
+
+bool tool_speculation_executor_isolation_supported() {
+    return DFLASH_TOOL_SPEC_HAS_CLOSEFROM != 0;
+}
 
 bool CanonicalToolInvocation::from_parts(
         const std::string & name,
@@ -405,6 +389,10 @@ bool qualify_tool_speculation_cpu_affinity(
         return true;
     }
 #if defined(__linux__)
+    if (::access("/usr/bin/taskset", X_OK) != 0) {
+        error = "tool CPU affinity requires executable /usr/bin/taskset";
+        return false;
+    }
     const long configured_cpus = ::sysconf(_SC_NPROCESSORS_CONF);
     if (configured_cpus <= 0) {
         error = "cannot determine configured CPU count";
@@ -770,8 +758,7 @@ void ToolSpeculationAttempt::start() {
     if (spawn_status == 0 && output_pipe[1] != STDOUT_FILENO) {
         spawn_status = posix_spawn_file_actions_addclose(&actions, output_pipe[1]);
     }
-#  if defined(__GLIBC__) && defined(__GLIBC_PREREQ)
-#    if __GLIBC_PREREQ(2, 34)
+#  if DFLASH_TOOL_SPEC_HAS_CLOSEFROM
     // The executor receives only stdin/stdout/stderr. In particular, it must
     // not inherit listening sockets, live client connections, model IPC pipes,
     // or accelerator descriptors from the long-running server.
@@ -779,7 +766,6 @@ void ToolSpeculationAttempt::start() {
         spawn_status = posix_spawn_file_actions_addclosefrom_np(
             &actions, STDERR_FILENO + 1);
     }
-#    endif
 #  endif
 
     std::vector<std::string> env_storage = executor_environment(
@@ -790,17 +776,28 @@ void ToolSpeculationAttempt::start() {
     for (std::string & value : env_storage) env.push_back(value.data());
     env.push_back(nullptr);
 
-    std::string executable = config_.executor_path;
+    std::string executable = config_.cpu_affinity.empty()
+        ? config_.executor_path
+        : "/usr/bin/taskset";
     std::string protocol_arg = "--dflash-tool-spec-v1";
-    char * argv[] = {
-        executable.data(),
-        protocol_arg.data(),
-        nullptr,
-    };
+    std::string affinity_arg = format_cpu_affinity(config_.cpu_affinity);
+    std::string taskset_cpu_arg = "-c";
+    std::vector<char *> argv;
+    argv.push_back(executable.data());
+    if (!config_.cpu_affinity.empty()) {
+        // taskset applies the mask before execve(), so no executor startup
+        // code can run on the model CPUs. The request payload remains withheld
+        // until the parent verifies the resulting mask below.
+        argv.push_back(taskset_cpu_arg.data());
+        argv.push_back(affinity_arg.data());
+        argv.push_back(config_.executor_path.data());
+    }
+    argv.push_back(protocol_arg.data());
+    argv.push_back(nullptr);
     pid_t child = -1;
     if (spawn_status == 0) {
         spawn_status = ::posix_spawn(
-            &child, executable.c_str(), &actions, &attributes, argv,
+            &child, executable.c_str(), &actions, &attributes, argv.data(),
             env.data());
     }
     if (actions_initialized) {
@@ -822,7 +819,7 @@ void ToolSpeculationAttempt::start() {
 #  if defined(__linux__)
     if (!config_.cpu_affinity.empty()) {
         std::string affinity_error;
-        if (!pin_and_verify_child_cpu_affinity(
+        if (!wait_for_child_cpu_affinity(
                 child, config_.cpu_affinity, affinity_error)) {
             signal_executor_process_group(child, SIGKILL);
             int child_status = 0;

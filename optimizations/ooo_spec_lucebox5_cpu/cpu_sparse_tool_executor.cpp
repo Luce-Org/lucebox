@@ -135,48 +135,30 @@ json execute(const json & request) {
         throw std::runtime_error("only benchmark_cpu_sparse is allowed");
     }
     const json & arguments = request["call"].at("arguments");
-    if (!arguments.is_object()) {
-        throw std::runtime_error("arguments must be an object");
+    if (!arguments.is_object() || arguments.size() != 1 ||
+        !arguments.contains("iterations")) {
+        throw std::runtime_error("arguments must contain only iterations");
     }
-    const int rows = arguments.contains("rows")
-        ? integer_argument(arguments, "rows", 64, 1 << 20) : kRows;
-    const int nonzeros = arguments.contains("nonzeros_per_row")
-        ? integer_argument(arguments, "nonzeros_per_row", 1, 256)
-        : kNonzerosPerRow;
+    const int rows = kRows;
+    const int nonzeros = kNonzerosPerRow;
     const int iterations = integer_argument(
         arguments, "iterations", 1, 1'000'000);
-    const int threads = arguments.contains("threads")
-        ? integer_argument(arguments, "threads", 1, 64) : kThreads;
-    if (static_cast<uint64_t>(rows) * static_cast<uint64_t>(nonzeros) >
-        16ULL * 1024ULL * 1024ULL) {
-        throw std::runtime_error("sparse matrix exceeds the 16M-entry limit");
-    }
-    uint64_t seed = kSeed;
-    if (arguments.contains("seed")) {
-        if (!arguments["seed"].is_number_integer()) {
-            throw std::runtime_error("seed must be an unsigned integer");
-        }
-        if (arguments["seed"].is_number_unsigned()) {
-            seed = arguments["seed"].get<uint64_t>();
-        } else {
-            const int64_t signed_seed = arguments["seed"].get<int64_t>();
-            if (signed_seed < 0) {
-                throw std::runtime_error("seed must be an unsigned integer");
-            }
-            seed = static_cast<uint64_t>(signed_seed);
-        }
-    }
+    const int threads = kThreads;
+    const uint64_t seed = kSeed;
 
     std::vector<int> expected_affinity;
-    if (request.contains("cpu_affinity")) {
-        expected_affinity = request["cpu_affinity"].get<std::vector<int>>();
-        std::sort(expected_affinity.begin(), expected_affinity.end());
-        expected_affinity.erase(
-            std::unique(expected_affinity.begin(), expected_affinity.end()),
-            expected_affinity.end());
+    const auto affinity_value = request.find("cpu_affinity");
+    if (affinity_value == request.end() || !affinity_value->is_array() ||
+        affinity_value->empty()) {
+        throw std::runtime_error("cpu_affinity must be a non-empty array");
     }
+    expected_affinity = affinity_value->get<std::vector<int>>();
+    std::sort(expected_affinity.begin(), expected_affinity.end());
+    expected_affinity.erase(
+        std::unique(expected_affinity.begin(), expected_affinity.end()),
+        expected_affinity.end());
     const std::vector<int> affinity = observed_affinity();
-    if (!expected_affinity.empty() && affinity != expected_affinity) {
+    if (affinity != expected_affinity) {
         throw std::runtime_error("observed CPU affinity does not match request");
     }
     if (!affinity.empty() && threads > static_cast<int>(affinity.size())) {

@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <string>
 #include <unordered_map>
@@ -31,6 +32,12 @@ public:
     // ─── Encode ──────────────────────────────────────────────────────
     // Tokenize a UTF-8 string into token IDs.
     std::vector<int32_t> encode(const std::string & text) const;
+    // Predictor preprocessing uses the same tokenizer but must not overrun a
+    // request deadline. Returns false and clears `out` on expiry.
+    bool encode_until(
+        const std::string & text,
+        std::chrono::steady_clock::time_point deadline,
+        std::vector<int32_t> & out) const;
 
     // ─── Decode ──────────────────────────────────────────────────────
     // Convert a single token ID to its text representation.
@@ -55,10 +62,20 @@ public:
 
 private:
     // Pre-tokenize text into pieces using Qwen3/3.5 regex pattern.
-    std::vector<std::string> pre_tokenize(const std::string & text) const;
+    std::vector<std::string> pre_tokenize(
+        const std::string & text,
+        const std::chrono::steady_clock::time_point * deadline,
+        bool & timed_out) const;
 
     // Apply BPE merges to a single pre-tokenized piece.
-    std::vector<int32_t> bpe_encode_piece(const std::string & piece) const;
+    std::vector<int32_t> bpe_encode_piece(
+        const std::string & piece,
+        const std::chrono::steady_clock::time_point * deadline,
+        bool & timed_out) const;
+    std::vector<int32_t> encode_impl(
+        const std::string & text,
+        const std::chrono::steady_clock::time_point * deadline,
+        bool & timed_out) const;
 
     // Vocabulary: id → token string
     std::vector<std::string> id_to_token_;

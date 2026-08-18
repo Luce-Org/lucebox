@@ -41,7 +41,6 @@
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
-#include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -242,9 +241,9 @@ struct ServerConfig {
     // an executor, an empirical interference profile, and an explicit
     // read-only/idempotent tool allowlist.
     ToolSpeculationConfig tool_speculation;
-    // Model-agnostic tool-call prediction. Native predictors run before the
-    // model by default so shared accelerator compute cannot slow decoding;
-    // remote predictors may overlap. DS4 verifies the exact canonical call.
+    // Model-agnostic tool-call prediction. Predictors run before the target;
+    // only the allowlisted external tool overlaps target generation. This is
+    // the qualified schedule on shared and single-accelerator deployments.
     SemanticToolPredictorConfig semantic_tool_predictor;
 };
 
@@ -262,6 +261,9 @@ float resolve_pflash_keep_ratio(float configured_ratio,
                                 const HttpServerSessions & sessions);
 bool should_clamp_flowkv_disk_cache(
     bool flowkv, const DiskPrefixCachePolicy & policy);
+// True for API dialects that explicitly prohibit a tool call. Used before
+// either caller-supplied or automatic speculative execution can start.
+bool tool_choice_disables_tool_calls(const json & tool_choice);
 
 }  // namespace http_detail
 
@@ -286,8 +288,8 @@ struct ParsedRequest {
     // The engine may execute it privately, but never exposes its result until
     // the model emits the exact canonical invocation.
     std::optional<ToolSpeculationPrediction> tool_speculation;
-    // Engine-side Qwen prediction may start a private external tool as soon
-    // as it is ready. The model's eventual canonical call remains authoritative.
+    // Engine-side prediction may start a private external tool before target
+    // generation. The model's eventual canonical call remains authoritative.
     struct AutomaticToolSpeculationLaunch {
         std::shared_ptr<ToolSpeculationAttempt> attempt;
         double predictor_wall_ms = 0.0;
@@ -295,9 +297,8 @@ struct ParsedRequest {
         std::string predictor_error;
     };
     bool                      automatic_tool_speculation_enabled = true;
-    std::shared_future<AutomaticToolSpeculationLaunch>
+    std::optional<AutomaticToolSpeculationLaunch>
                               automatic_tool_speculation;
-    std::shared_future<SemanticToolPrediction> semantic_tool_prediction;
     // Response ID
     std::string               response_id;
     // Thinking/reasoning state
@@ -517,7 +518,7 @@ private:
         ParsedRequest & req);
     bool validate_request_context(SocketHandle fd, const ParsedRequest & req);
     void log_parsed_request(const ParsedRequest & req) const;
-    void launch_semantic_tool_prediction(ParsedRequest & req) const;
+    void start_automatic_tool_speculation(ParsedRequest & req) const;
     void enqueue_request_and_wait(SocketHandle fd, ParsedRequest req);
 
     // Send HTTP response helpers.

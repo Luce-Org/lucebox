@@ -149,6 +149,7 @@ int main(int argc, char ** argv) {
     }
 
     const std::vector<Case> cases = production_cases();
+    constexpr size_t kMinimumExactMatches = 9;
     size_t valid = 0;
     size_t name_matches = 0;
     size_t exact_matches = 0;
@@ -178,6 +179,7 @@ int main(int argc, char ** argv) {
         {"valid", valid},
         {"name_matches", name_matches},
         {"exact_matches", exact_matches},
+        {"minimum_exact_matches", kMinimumExactMatches},
         {"name_accuracy", cases.empty() ? 0.0
                                          : static_cast<double>(name_matches) /
                                                static_cast<double>(cases.size())},
@@ -187,5 +189,8 @@ int main(int argc, char ** argv) {
         {"wall_p50_ms", wall_p50},
     };
     std::printf("%s\n", summary.dump().c_str());
-    return valid == cases.size() && name_matches == cases.size() ? 0 : 1;
+    return valid == cases.size() && name_matches == cases.size() &&
+                   exact_matches >= kMinimumExactMatches
+        ? 0
+        : 1;
 }

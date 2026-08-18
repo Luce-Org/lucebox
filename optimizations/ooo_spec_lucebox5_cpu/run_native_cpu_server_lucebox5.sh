@@ -8,19 +8,36 @@ executor="${TOOL_SPEC_EXECUTOR:-$experiment/cpu_sparse_tool_executor}"
 profile="${TOOL_SPEC_PROFILE:-$experiment/profiles/lucebox5-cpu-lane-qualified.json}"
 allowed="${TOOL_SPEC_ALLOW:-benchmark_cpu_sparse}"
 native_wrapper_dir="${NATIVE_WRAPPER_DIR:-$experiment/native-wrapper}"
-candidate_build="${CANDIDATE_BUILD:-$experiment/engine-ooo-spec/server/build-hip-dual}"
-predictor_model="${PREDICTOR_MODEL:-$experiment/models/Qwen3-0.6B-Q8_0.gguf}"
+candidate_link="$native_wrapper_dir/candidate-build"
+predictor_model="$experiment/models/Qwen3-0.6B-Q8_0.gguf"
 
-for required in \
+[[ -L "$candidate_link" ]] || {
+    printf 'missing durable candidate-build symlink: %s\n' "$candidate_link" >&2
+    exit 2
+}
+if ! candidate_build="$(readlink -f -- "$candidate_link")"; then
+    printf 'cannot resolve candidate-build symlink: %s\n' "$candidate_link" >&2
+    exit 2
+fi
+[[ -n "$candidate_build" && -d "$candidate_build" ]] || {
+    printf 'invalid candidate-build symlink: %s\n' "$candidate_link" >&2
+    exit 2
+}
+
+for binary in \
     "$launcher" \
     "$executor" \
-    "$profile" \
     "$native_wrapper_dir/dflash_server" \
     "$candidate_build/dflash_server" \
-    "$candidate_build/backend_ipc_daemon" \
-    "$predictor_model"; do
-    [[ -e "$required" ]] || {
-        printf 'missing required path: %s\n' "$required" >&2
+    "$candidate_build/backend_ipc_daemon"; do
+    [[ -f "$binary" && -x "$binary" ]] || {
+        printf 'required binary is not executable: %s\n' "$binary" >&2
+        exit 2
+    }
+done
+for data_file in "$profile" "$predictor_model"; do
+    [[ -f "$data_file" ]] || {
+        printf 'required data file is not regular: %s\n' "$data_file" >&2
         exit 2
     }
 done
@@ -40,14 +57,6 @@ exec env \
     PATH="$root/.local/bin:/opt/rocm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
     ENGINE_DIR="$root/lucebox-engine-0731" \
     BUILD_DIR="$native_wrapper_dir" \
-    CANDIDATE_BUILD="$candidate_build" \
-    PREDICTOR_MODEL="$predictor_model" \
-    PREDICTOR_GPU="${PREDICTOR_GPU:-1}" \
-    PREDICTOR_MAX_CTX="${PREDICTOR_MAX_CTX:-4096}" \
-    PREDICTOR_MAX_TOKENS="${PREDICTOR_MAX_TOKENS:-256}" \
-    PREDICTOR_CONFIDENCE="${PREDICTOR_CONFIDENCE:-0.75}" \
-    PREDICTOR_SCHEDULE="${PREDICTOR_SCHEDULE:-before-model}" \
-    PREFIX_CACHE_SLOTS_OVERRIDE="${PREFIX_CACHE_SLOTS_OVERRIDE:-}" \
     QUALIFIED_CONFIG_DIR="/opt/lucebox-manage/qualified/r9700_deepseek/runtime-config" \
     TARGET_MODEL="$root/lucebox-models/DeepSeek-V4-Flash-0731-ROCMFPX-MIX-STRIX.gguf" \
     DRAFT_MODEL="$root/lucebox-models/DeepSeek-V4-Flash-0731-DSpark-draft-Q4RMFP4-denseF16.gguf" \

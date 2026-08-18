@@ -502,7 +502,9 @@ bool Qwen3Backend::do_decode(int committed, int n_gen,
             ggml_free(ectx);
         }
 
-        if (!do_step(embed_buf.data(), 1, committed, logits)) {
+        // `committed` was advanced when `next` was accepted. Write that token
+        // at its zero-based KV position instead of skipping one cache slot.
+        if (!do_step(embed_buf.data(), 1, committed - 1, logits)) {
             return false;
         }
     }

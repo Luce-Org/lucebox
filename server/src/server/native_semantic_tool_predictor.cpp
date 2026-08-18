@@ -7,6 +7,10 @@
 
 namespace dflash::common {
 
+namespace {
+constexpr int kNativePredictorStartupTimeoutMs = 60000;
+}
+
 std::shared_ptr<NativeSemanticToolPredictor>
 NativeSemanticToolPredictor::create(
         const SemanticToolPredictorConfig & config,
@@ -26,7 +30,7 @@ NativeSemanticToolPredictor::create(
     if (!predictor->ipc_.start(
             config.native_ipc_bin, config.native_model_path,
             config.native_gpu, config.native_max_ctx,
-            config.native_work_dir)) {
+            config.native_work_dir, kNativePredictorStartupTimeoutMs)) {
         error = "native_predictor_ipc_start_failed";
         return nullptr;
     }
@@ -50,12 +54,20 @@ SemanticToolPrediction NativeSemanticToolPredictor::predict(
 
     std::string prompt_error;
     const std::string prompt = build_native_semantic_tool_predictor_prompt(
-        predictor_request, prompt_error);
+        predictor_request, prompt_error, &deadline);
     if (prompt.empty()) {
         prediction.error = std::move(prompt_error);
         return finish();
     }
-    const std::vector<int32_t> prompt_ids = tokenizer_.encode(prompt);
+    if (std::chrono::steady_clock::now() >= deadline) {
+        prediction.error = "native_predictor_timeout";
+        return finish();
+    }
+    std::vector<int32_t> prompt_ids;
+    if (!tokenizer_.encode_until(prompt, deadline, prompt_ids)) {
+        prediction.error = "native_predictor_timeout";
+        return finish();
+    }
     if (prompt_ids.empty()) {
         prediction.error = "native_predictor_prompt_tokenization_failed";
         return finish();

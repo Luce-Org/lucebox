@@ -124,6 +124,15 @@ struct BackendIpcLaunchConfig {
     std::string work_dir;
     BackendIpcPayloadTransport payload_transport = BackendIpcPayloadTransport::Auto;
     size_t shared_payload_bytes = 0;
+    // Optional sidecars can fail closed instead of waiting forever for their
+    // initial status word. Zero preserves the legacy unbounded startup wait.
+    int readiness_timeout_ms = 0;
+    // Security-sensitive sidecars inherit only stdin/stdout/stderr and the
+    // explicitly configured payload/response descriptors.
+    bool isolate_inherited_fds = false;
+    // Keep legacy backend work directories compatible while allowing private
+    // sidecars to require an owned, non-symlink 0700 directory.
+    bool require_private_work_dir = false;
 };
 
 struct BackendIpcPayloadSegment {
@@ -165,7 +174,7 @@ public:
 private:
     void close_impl(bool force_terminate);
 #if !defined(_WIN32)
-    bool init_work_dir(const std::string & requested);
+    bool init_work_dir(const std::string & requested, bool require_private);
     bool init_shared_payload(size_t bytes);
 
     pid_t pid_ = -1;

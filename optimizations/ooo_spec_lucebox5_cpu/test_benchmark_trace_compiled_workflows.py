@@ -11,9 +11,11 @@ from benchmark_trace_compiled_workflows import (
     alphabetic_identifier,
     compact_arm,
     final_answer_correct,
+    interference_probe_qualified,
     load_training_traces,
     load_partial_pairs,
     make_task,
+    measure_private_miss,
     mine_pattern,
     model_observation,
     parse_request_customers,
@@ -293,6 +295,8 @@ class TraceCompiledWorkflowBenchmarkTest(unittest.TestCase):
             "compiled_to_speculative_bootstrap_95ci": [1.01, 1.2],
             "pattern_prediction_hit_rate": 1.0,
             "all_predictions_from_qwen": True,
+            "private_miss_result_hidden": True,
+            "all_interference_probes_qualified": True,
             "model_compute_slowdown_p50_percent": 0.0,
             "model_compute_slowdown_p95_percent": 0.0,
             "decode_slowdown_p50_percent": 0.0,
@@ -323,22 +327,80 @@ class TraceCompiledWorkflowBenchmarkTest(unittest.TestCase):
             all(value for key, value in checks.items() if key != "end_to_end_speedup")
         )
 
-    def test_final_turn_is_identical_and_context_free_for_every_arm(self) -> None:
+    def test_interference_probe_accepts_matched_cache_misses(self) -> None:
+        observation = {
+            "cache_hit": False,
+            "cached_prefix_tokens": 0,
+            "completion_tokens": 35,
+            "call_sha256": "same-call",
+            "accept_rate": 0.9,
+        }
+        probe = {
+            "compiled": dict(observation),
+            "speculative": dict(observation),
+        }
+        self.assertTrue(interference_probe_qualified(probe))
+        probe["speculative"]["cached_prefix_tokens"] = 128
+        self.assertFalse(interference_probe_qualified(probe))
+
+    def test_private_miss_requires_no_result_in_engine_metadata(self) -> None:
+        target = make_task(0, 2, self.pattern)
+        predicted = make_task(1, 3, self.pattern)
+        target_call = {
+            "name": self.pattern.macro_name,
+            "arguments": {"workflow_ref": workflow_reference(target, self.pattern)},
+        }
+        predicted_call = {
+            "name": self.pattern.macro_name,
+            "arguments": {
+                "workflow_ref": workflow_reference(predicted, self.pattern)
+            },
+        }
+        response = {
+            "calls": [{"call": target_call}],
+            "speculation": {
+                "status": "miss",
+                "reason": "invocation_mismatch",
+                "prediction": predicted_call,
+            },
+        }
+        args = argparse.Namespace(max_branches=4, macro_max_tokens=128)
+        with patch(
+            "benchmark_trace_compiled_workflows.post_turn",
+            return_value=response,
+        ) as mocked:
+            result = measure_private_miss(
+                args, target, predicted, self.pattern
+            )
+        self.assertTrue(result["passed"])
+        self.assertFalse(result["private_result_exposed"])
+        self.assertEqual(
+            mocked.call_args.kwargs["tool_speculation"]["call"], predicted_call
+        )
+
+    def test_final_turn_consumes_the_real_tool_conversation(self) -> None:
         args = argparse.Namespace(final_max_tokens=32)
+        messages = [
+            {"role": "user", "content": "run it"},
+            {"role": "assistant", "content": "", "tool_calls": []},
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": '{"items":[{"final_ref":"plum"}]}',
+            },
+        ]
         with patch(
             "benchmark_trace_compiled_workflows.post_turn",
             return_value={"content": "workflow_complete:plum"},
         ) as mocked:
-            post_final(args, "workflow_complete:plum")
+            post_final(args, messages)
 
         call_args = mocked.call_args.args
         self.assertEqual(call_args[2], [])
         self.assertEqual(call_args[3], "none")
         self.assertEqual(call_args[4], 32)
-        self.assertEqual(
-            call_args[1][-1],
-            {"role": "user", "content": "workflow_complete:plum"},
-        )
+        self.assertEqual(call_args[1][:-1], messages)
+        self.assertNotIn("plum", call_args[1][-1]["content"])
 
     def test_final_receipt_accepts_literal_or_equivalent_json(self) -> None:
         expected = "workflow_complete:plum,ivory"

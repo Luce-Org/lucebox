@@ -39,17 +39,14 @@ enum class ChatFormat {
 //   false → assistant starts with <think>\n\n</think>\n\n (skip thinking)
 //
 // `tools_json` is an optional JSON string containing the tool definitions
-// array. When non-empty, tool-capable templates inject a tool preamble into
-// the system message instructing the model how to emit <tool_call> tags.
-// `tool_call_required` strengthens that instruction for OpenAI
-// `tool_choice="required"` and forced-function requests.
+// array. When non-empty, the Qwen3/3.5 template injects a tool preamble
+// into the system message instructing the model how to emit <tool_call> tags.
 std::string render_chat_template(
     const std::vector<ChatMessage> & messages,
     ChatFormat format,
     bool add_generation_prompt = true,
     bool enable_thinking = false,
-    const std::string & tools_json = "",
-    bool tool_call_required = false);
+    const std::string & tools_json = "");
 
 // Detect the appropriate chat format for an architecture.
 ChatFormat chat_format_for_arch(const std::string & arch);

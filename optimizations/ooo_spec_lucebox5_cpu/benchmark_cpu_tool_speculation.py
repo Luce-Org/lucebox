@@ -21,6 +21,7 @@ import math
 import os
 import random
 import re
+import signal
 import statistics
 import subprocess
 import time
@@ -314,6 +315,7 @@ def start_executor(
         text=True,
         env=environment,
         preexec_fn=pin_child,
+        start_new_session=True,
     )
     assert process.stdin is not None
     process.stdin.write(
@@ -330,11 +332,15 @@ def start_executor(
 
 def finish_executor(handle: dict[str, Any], timeout: float) -> dict[str, Any]:
     process: subprocess.Popen[str] = handle["process"]
+    elapsed = time.perf_counter() - float(handle["started"])
+    remaining = timeout - elapsed
+    if remaining <= 0 and process.poll() is None:
+        stop_executor(handle)
+        raise RuntimeError("CPU executor timed out")
     try:
-        stdout, stderr = process.communicate(timeout=timeout)
+        stdout, stderr = process.communicate(timeout=max(0.001, remaining))
     except subprocess.TimeoutExpired:
-        process.kill()
-        stdout, stderr = process.communicate(timeout=5)
+        stop_executor(handle)
         raise RuntimeError("CPU executor timed out")
     wall_ms = (time.perf_counter() - float(handle["started"])) * 1000.0
     if process.returncode != 0:
@@ -356,11 +362,17 @@ def finish_executor(handle: dict[str, Any], timeout: float) -> dict[str, Any]:
 def stop_executor(handle: dict[str, Any]) -> None:
     process: subprocess.Popen[str] = handle["process"]
     if process.poll() is None:
-        process.terminate()
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
         try:
             process.wait(timeout=1.0)
         except subprocess.TimeoutExpired:
-            process.kill()
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
             process.wait(timeout=5.0)
 
 
@@ -547,8 +559,10 @@ def run_direct_miss(
         wrong["iterations"] += 1
     started = time.perf_counter()
     private = start_executor(args.binary, wrong, args.tool_cpus, f"{label}-wrong")
-    model = post_model(args.url, arguments, args.max_tokens, args.timeout)
-    stop_executor(private)
+    try:
+        model = post_model(args.url, arguments, args.max_tokens, args.timeout)
+    finally:
+        stop_executor(private)
     authoritative = run_executor(
         args.binary,
         arguments,
@@ -562,7 +576,6 @@ def run_direct_miss(
         "task_ms": (time.perf_counter() - started) * 1000.0,
         "model": model,
         "authoritative_tool": authoritative,
-        "private_result_exposed": False,
     }
 
 
@@ -665,9 +678,6 @@ def qualify(args: argparse.Namespace) -> None:
         "ds4_active": ds4_active,
         "model_slowdown": slowdown_percent <= args.max_model_slowdown_percent,
         "direct_speedup": speedup >= args.min_qualification_speedup,
-        "private_miss_result_hidden": all(
-            not row["private_result_exposed"] for row in misses
-        ),
     }
     passed = all(checks.values())
     profile = {
@@ -979,11 +989,14 @@ def summarize_native(
     }
 
 
-def native(args: argparse.Namespace) -> None:
-    props = get_json(props_url(args.url), args.timeout)
+def require_qualified_cpu_tool_props(
+    props: dict[str, Any], args: argparse.Namespace, *, automatic: bool = False
+) -> dict[str, Any]:
     tool_props = props.get("tool_speculation")
     if not isinstance(tool_props, dict) or not tool_props.get("enabled"):
         raise SystemExit("server tool speculation is not enabled")
+    if automatic and not tool_props.get("automatic_prediction_enabled"):
+        raise SystemExit("server automatic Qwen prediction is not enabled")
     expected_props = {
         "execution_mode": "child_process_cpu_affinity",
         "profile_status": "qualified",
@@ -1004,6 +1017,12 @@ def native(args: argparse.Namespace) -> None:
         args.tool_cpus
     ):
         raise SystemExit("server model/tool CPU affinity is not disjoint")
+    return tool_props
+
+
+def native(args: argparse.Namespace) -> None:
+    props = get_json(props_url(args.url), args.timeout)
+    tool_props = require_qualified_cpu_tool_props(props, args)
 
     arguments = expected_arguments(
         args.rows,
@@ -1149,15 +1168,9 @@ def native(args: argparse.Namespace) -> None:
 
 def native_qwen(args: argparse.Namespace) -> None:
     props = get_json(props_url(args.url), args.timeout)
-    tool_props = props.get("tool_speculation")
-    if not isinstance(tool_props, dict) or not tool_props.get("enabled"):
-        raise SystemExit("server tool speculation is not enabled")
-    if not tool_props.get("automatic_prediction_enabled"):
-        raise SystemExit("server automatic Qwen prediction is not enabled")
-    if tool_props.get("execution_mode") != "child_process_cpu_affinity":
-        raise SystemExit("automatic benchmark requires the isolated CPU executor")
-    if tool_props.get("tool_cpu_affinity") != args.tool_cpus:
-        raise SystemExit("server tool CPU affinity differs from benchmark")
+    tool_props = require_qualified_cpu_tool_props(
+        props, args, automatic=True
+    )
 
     arguments = expected_arguments(
         args.rows,

@@ -30,7 +30,8 @@ public:
                const std::string & model_path,
                int gpu,
                int max_ctx,
-               const std::string & work_dir);
+               const std::string & work_dir,
+               int readiness_timeout_ms);
 
     // Requests are serialized: one compact predictor model owns one KV cache.
     // On transport or generation failure the lane closes and fails shut.
