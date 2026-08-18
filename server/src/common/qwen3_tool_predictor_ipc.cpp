@@ -18,7 +18,7 @@ bool read_qwen3_tool_predictor_response(
         std::string & error) {
     output_ids.clear();
     error.clear();
-#if defined(_WIN32)
+#if !defined(__linux__)
     (void)stream_fd;
     (void)max_tokens;
     (void)timeout_ms;
@@ -135,7 +135,7 @@ bool Qwen3ToolPredictorIpcClient::predict(
         std::string & error) {
     output_ids.clear();
     error.clear();
-#if defined(_WIN32)
+#if !defined(__linux__)
     (void)prompt_ids; (void)max_tokens; (void)timeout_ms;
     error = "native_predictor_ipc_unsupported";
     return false;
