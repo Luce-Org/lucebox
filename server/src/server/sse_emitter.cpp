@@ -306,7 +306,11 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
             }
 
             size_t idx = window_.find(THINK_CLOSE);
-            if (idx != std::string::npos) {
+            size_t tool_idx = std::string::npos;
+            bool tool_hit = has_request_tools(tools_) &&
+                            find_tool_syntax_start(window_, tools_, tool_idx);
+
+            if (idx != std::string::npos && (tool_idx == std::string::npos || idx < tool_idx)) {
                 std::string pre = window_.substr(0, idx);
                 if (!pre.empty()) {
                     reasoning_text_ += pre;
@@ -339,6 +343,38 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
                 }
                 window_ = window_.substr(idx + THINK_CLOSE_LEN);
                 mode_ = StreamMode::CONTENT;
+                continue;
+            }
+            if (tool_hit) {
+                std::string pre = window_.substr(0, tool_idx);
+                if (!pre.empty()) {
+                    reasoning_text_ += pre;
+                    switch (format_) {
+                    case ApiFormat::OPENAI_CHAT:
+                        out.push_back(format_openai_delta({{"reasoning_content", pre}}));
+                        break;
+                    case ApiFormat::ANTHROPIC: {
+                        if (active_kind_ != "thinking") {
+                            out.push_back(sse_event("content_block_stop",
+                                json({{"type", "content_block_stop"}, {"index", block_index_}}).dump()));
+                            block_index_++;
+                            active_kind_ = "thinking";
+                            json new_block = {{"type", "thinking"}, {"thinking", ""}};
+                            out.push_back(sse_event("content_block_start",
+                                json({{"type", "content_block_start"}, {"index", block_index_},
+                                      {"content_block", new_block}}).dump()));
+                        }
+                        out.push_back(sse_event("content_block_delta",
+                            json({{"type", "content_block_delta"}, {"index", block_index_},
+                                  {"delta", {{"type", "thinking_delta"}, {"thinking", pre}}}}).dump()));
+                        break;
+                    }
+                    default: break;
+                    }
+                }
+                tool_buffer_ = window_.substr(tool_idx);
+                window_.clear();
+                mode_ = StreamMode::TOOL_BUFFER;
                 continue;
             }
             // No close tag yet — emit safe prefix if window is large enough
@@ -576,8 +612,24 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
 
             // Emit any cleaned text from the tool buffer
             if (!parsed.cleaned_text.empty()) {
-                accumulated_content_ += parsed.cleaned_text;
-                emit_content_delta(out, parsed.cleaned_text);
+                size_t think_close = parsed.cleaned_text.find(THINK_CLOSE);
+                if (think_close != std::string::npos) {
+                    std::string reasoning = parsed.cleaned_text.substr(0, think_close);
+                    std::string content = parsed.cleaned_text.substr(think_close + THINK_CLOSE_LEN);
+                    if (!reasoning.empty()) {
+                        reasoning_text_ += reasoning;
+                        if (format_ == ApiFormat::OPENAI_CHAT) {
+                            out.push_back(format_openai_delta({{"reasoning_content", reasoning}}));
+                        }
+                    }
+                    if (!content.empty()) {
+                        accumulated_content_ += content;
+                        emit_content_delta(out, content);
+                    }
+                } else {
+                    accumulated_content_ += parsed.cleaned_text;
+                    emit_content_delta(out, parsed.cleaned_text);
+                }
             }
 
             fr = "tool_calls";

@@ -5704,3 +5704,57 @@ TEST_CASE(ServerUnitFixture, test_qwen35_embedded_mtp_target_layer_count) {
         "laguna", 65, 1, target_layers, error));
     TEST_ASSERT(target_layers == 65);
 }
+
+TEST_CASE(ServerUnitFixture, test_parse_function_calls_invoke_xml) {
+    const std::string text =
+        "Reading configuration:\n"
+        "<function_calls>\n"
+        "<invoke name=\"read\">\n"
+        "  <param name=\"path\">server.go</param>\n"
+        "  <param name=\"offset\">10</param>\n"
+        "  <param name=\"limit\">50</param>\n"
+        "</invoke>\n"
+        "</function_calls>";
+
+    auto result = parse_tool_calls(text, read_tools());
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "read");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["path"] == "server.go");
+        TEST_ASSERT(args["offset"] == 10);
+        TEST_ASSERT(args["limit"] == 50);
+    }
+    TEST_ASSERT(result.cleaned_text == "Reading configuration:");
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_function_calls_invoke_json) {
+    const std::string text =
+        "<function_calls>\n"
+        "<invoke name=\"read\">\n"
+        "  {\"path\": \"app.py\", \"offset\": \"5\"}\n"
+        "</invoke>\n"
+        "</function_calls>";
+
+    auto result = parse_tool_calls(text, read_tools());
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "read");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["path"] == "app.py");
+        TEST_ASSERT(args["offset"] == 5);
+    }
+    TEST_ASSERT(result.cleaned_text.empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_function_calls_inside_reasoning) {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, read_tools(), false);
+    auto c1 = em.emit_token("<think>Analyzing build files.\n");
+    auto c2 = em.emit_token("<function_calls>\n  <invoke name=\"read\">\n    <param name=\"path\">CMakeLists.txt</param>\n  </invoke>\n</function_calls>\n</think>");
+    auto fin = em.emit_finish(2);
+
+    std::string all = concat(c1) + concat(c2) + concat(fin);
+    TEST_ASSERT(em.tool_calls().size() == 1);
+    TEST_ASSERT(em.reasoning_text().find("Analyzing build files.") != std::string::npos);
+    TEST_ASSERT(all.find("\"finish_reason\":\"tool_calls\"") != std::string::npos);
+}
