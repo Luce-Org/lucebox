@@ -24,6 +24,20 @@ extern "C" {
 // wider batches remain on the MMQ path.
 #define GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS 5
 
+// Batched (MMQ) path for the mix qtypes 105/106. Off unless a caller opts in:
+// the measured benefit belongs to models whose mix tensors are dense and go
+// through ggml_mul_mat, so the model backend that wants it enables it for
+// itself rather than every model paying for one model's win.
+// DFLASH_MIX_MMQ=0/1 (legacy: DFLASH_DS4_MIX_MMQ_PREFILL) overrides both.
+GGML_BACKEND_API bool ggml_cuda_mix_mmq_enabled(void);
+// Force the toggle regardless of environment, so one process can A/B both
+// paths; test_rocmfp_mix_mmq uses this against the validated matvec kernel.
+GGML_BACKEND_API void ggml_cuda_set_mix_mmq_enabled(bool enabled);
+GGML_BACKEND_API void ggml_cuda_clear_mix_mmq_override(void);
+// True when the environment pinned the toggle, so a backend's opt-in knows to
+// leave an explicit operator choice alone.
+GGML_BACKEND_API bool ggml_cuda_mix_mmq_env_pinned(void);
+
 // backend API
 GGML_BACKEND_API ggml_backend_t ggml_backend_cuda_init(int device);
 

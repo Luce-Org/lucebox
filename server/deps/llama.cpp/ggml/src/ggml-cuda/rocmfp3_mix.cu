@@ -396,8 +396,42 @@ __device__ __forceinline__ float mix_warp_shfl_down(float v, int off) {
 // tree reduction changes the rounding and flips tokens.) The block's byte loads
 // do not depend on acc, so unrolling the caller over several blocks lets the
 // compiler overlap their loads even though the acc-add chain stays serial.
-__device__ __forceinline__ void mix_block_accum(
-        const uint8_t * __restrict__ b, const float * __restrict__ xc, int col0,
+// Stage a block's 32 activations into registers with float4 loads.
+//
+// Measured motivation (H200, dense decode of these qtypes): the per-block j loop
+// below reads xc[col0 + 0 .. 31], and nvcc emitted 32 separate 32-bit
+// LDG.E.CONSTANT for them — 320 of the kernel's 355 global load instructions,
+// against 35 for the weights. ncu put the kernel at 1.65% DRAM throughput,
+// 97% L1 throughput and 98.4% L1 hit rate with 56% of all warp cycles stalled
+// on LG throttle: not bandwidth bound, bound purely on the NUMBER of narrow
+// global load instructions. The 32 floats are contiguous (128 B), so four at a
+// time costs one instruction instead of four.
+//
+// Bit-exact: this changes only how the SAME 32 f32 values reach registers. The
+// j loop still consumes them in ascending order into the same acc chain.
+//
+// The alignment test is warp- AND block-uniform (col0 is always a multiple of
+// MIX_QK, i.e. 128 B, so xc+col0 has xc's alignment), so the branch costs no
+// divergence. The scalar arm is not dead code: ggml hands this kernel a src1
+// row pointer, and a strided/offset column would land unaligned.
+__device__ __forceinline__ void mix_load_x32(
+        const float * __restrict__ xp, float (&xv)[MIX_QK]) {
+    if ((((uintptr_t) xp) & 15u) == 0) {
+        const float4 * __restrict__ p4 = (const float4 *) xp;
+        #pragma unroll
+        for (int k = 0; k < MIX_QK / 4; ++k) {
+            const float4 v = p4[k];
+            xv[4*k + 0] = v.x; xv[4*k + 1] = v.y;
+            xv[4*k + 2] = v.z; xv[4*k + 3] = v.w;
+        }
+    } else {
+        #pragma unroll
+        for (int j = 0; j < MIX_QK; ++j) xv[j] = xp[j];
+    }
+}
+
+__device__ __forceinline__ void mix_block_accum_x(
+        const uint8_t * __restrict__ b, const float (&xv)[MIX_QK],
         int mode, const float * __restrict__ lut, float & acc) {
     // Stage the whole 14-byte block into registers with one 2-byte-wide copy,
     // then decode the fp3 codes out of registers instead of re-reading the
@@ -418,7 +452,7 @@ __device__ __forceinline__ void mix_block_accum(
         #pragma unroll
         for (int j = 0; j < MIX_QK; ++j) {
             const float s = (j < MIX_QK/2) ? s0 : s1;
-            acc += s * mix_fp3_fixed(mix_fp3_code(buf, j)) * xc[col0 + j];
+            acc += s * mix_fp3_fixed(mix_fp3_code(buf, j)) * xv[j];
         }
     } else {
         const float s0 = mix_ue4m3(m0 & 0x7F), s1 = mix_ue4m3(m1 & 0x7F);
@@ -435,9 +469,39 @@ __device__ __forceinline__ void mix_block_accum(
         for (int j = 0; j < MIX_QK; ++j) {
             const float s = (j < MIX_QK/2) ? s0 : s1;
             const float * bk = (j < MIX_QK/2) ? bk0 : bk1;
-            acc += s * bk[mix_fp3_code(buf, j)] * xc[col0 + j];
+            acc += s * bk[mix_fp3_code(buf, j)] * xv[j];
         }
     }
+}
+
+// Original (col0-addressed) entry point, kept for the MoE and 3-D slice kernels.
+// Stages the activations itself; identical arithmetic.
+__device__ __forceinline__ void mix_block_accum(
+        const uint8_t * __restrict__ b, const float * __restrict__ xc, int col0,
+        int mode, const float * __restrict__ lut, float & acc) {
+    float xv[MIX_QK];
+    mix_load_x32(xc + col0, xv);
+    mix_block_accum_x(b, xv, mode, lut, acc);
+}
+
+// Two output rows, ONE activation stage. The 32 activations a block consumes are
+// the same for every row, so loading them once and folding both rows against the
+// registers halves the (dominant) activation load issue per unit work. This is
+// the same register-blocking the MoE kernel below already does — the dense 2-D
+// kernel never got it because the model this family was built for is MoE and
+// never took this path.
+//
+// Bit-exact: each row keeps its own accumulator and its own ascending-j fold over
+// the same block sequence, so acc0/acc1 match the one-row-per-warp kernel element
+// for element.
+__device__ __forceinline__ void mix_block_accum2(
+        const uint8_t * __restrict__ b0, const uint8_t * __restrict__ b1,
+        const float * __restrict__ xp, int mode, const float * __restrict__ lut,
+        float & acc0, float & acc1) {
+    float xv[MIX_QK];
+    mix_load_x32(xp, xv);
+    mix_block_accum_x(b0, xv, mode, lut, acc0);
+    mix_block_accum_x(b1, xv, mode, lut, acc1);
 }
 
 // The lane's block loop is unrolled by MIX_UNROLL into a SINGLE accumulator kept
@@ -456,7 +520,8 @@ __global__ void mix_matvec_rocmfp3_kernel(
         float * __restrict__ y, int in, int out,
         int64_t x_col_stride, int64_t y_col_stride) {
     const int warps_per_block = blockDim.x / MIX_WARP;
-    const int row  = blockIdx.x * warps_per_block + (threadIdx.x / MIX_WARP);
+    const int warp = blockIdx.x * warps_per_block + (threadIdx.x / MIX_WARP);
+    const int row  = warp * 2;                  // two output rows per warp
     const int lane = threadIdx.x % MIX_WARP;
     const int col  = blockIdx.y;
     // Widen the 2 * MIX_K bf16 codebook to f32 in LDS once per workgroup rather than
@@ -471,8 +536,14 @@ __global__ void mix_matvec_rocmfp3_kernel(
     if (row >= out) return;
     const int mode = (int) mode_ptr[0];
     const int nb   = in / MIX_QK;
-    const uint8_t * rowbase = data + (int64_t) row * nb * MIX_BLOCK_BYTES;
-    const float   * xc      = x + (int64_t) col * x_col_stride;
+    // `two` is warp-uniform, so the hot loop never diverges. It is false only for
+    // the tail warp of an odd `out`; that warp reuses row0's base so every load
+    // stays in bounds and acc1 is simply never stored.
+    const bool two = (row + 1) < out;
+    const uint8_t * rowbase0 = data + (int64_t) row * nb * MIX_BLOCK_BYTES;
+    const uint8_t * rowbase1 = two ? data + (int64_t) (row + 1) * nb * MIX_BLOCK_BYTES
+                                   : rowbase0;
+    const float   * xc       = x + (int64_t) col * x_col_stride;
     // f32 accumulate of f32-dequantized weights * f32 activations. The dequant
     // is bit-exact vs the reference (validated in ~/p4-validate/hip). This is
     // slightly higher precision than the f16 dequant->cuBLAS fallback; on the
@@ -480,7 +551,7 @@ __global__ void mix_matvec_rocmfp3_kernel(
     // noise band, with every divergence a shared model-limited miss, a harness
     // answer-extraction artifact, or an HE formatting coin-flip -- no reasoning
     // regression. Kept f32 for simplicity/speed (no per-weight rounding ops).
-    float acc = 0.0f;
+    float acc0 = 0.0f, acc1 = 0.0f;
     int blk = lane;
     // Main body: MIX_UNROLL blocks per iteration, each accumulated in stride
     // order into the single acc. The blocks' byte loads are independent (only
@@ -489,18 +560,35 @@ __global__ void mix_matvec_rocmfp3_kernel(
     for (; blk + 3 * MIX_WARP < nb; blk += MIX_UNROLL * MIX_WARP) {
         const int b0 = blk, b1 = blk + MIX_WARP;
         const int b2 = blk + 2 * MIX_WARP, b3 = blk + 3 * MIX_WARP;
-        mix_block_accum(rowbase + (int64_t) b0 * MIX_BLOCK_BYTES, xc, b0 * MIX_QK, mode, s_lut, acc);
-        mix_block_accum(rowbase + (int64_t) b1 * MIX_BLOCK_BYTES, xc, b1 * MIX_QK, mode, s_lut, acc);
-        mix_block_accum(rowbase + (int64_t) b2 * MIX_BLOCK_BYTES, xc, b2 * MIX_QK, mode, s_lut, acc);
-        mix_block_accum(rowbase + (int64_t) b3 * MIX_BLOCK_BYTES, xc, b3 * MIX_QK, mode, s_lut, acc);
+        mix_block_accum2(rowbase0 + (int64_t) b0 * MIX_BLOCK_BYTES,
+                         rowbase1 + (int64_t) b0 * MIX_BLOCK_BYTES,
+                         xc + b0 * MIX_QK, mode, s_lut, acc0, acc1);
+        mix_block_accum2(rowbase0 + (int64_t) b1 * MIX_BLOCK_BYTES,
+                         rowbase1 + (int64_t) b1 * MIX_BLOCK_BYTES,
+                         xc + b1 * MIX_QK, mode, s_lut, acc0, acc1);
+        mix_block_accum2(rowbase0 + (int64_t) b2 * MIX_BLOCK_BYTES,
+                         rowbase1 + (int64_t) b2 * MIX_BLOCK_BYTES,
+                         xc + b2 * MIX_QK, mode, s_lut, acc0, acc1);
+        mix_block_accum2(rowbase0 + (int64_t) b3 * MIX_BLOCK_BYTES,
+                         rowbase1 + (int64_t) b3 * MIX_BLOCK_BYTES,
+                         xc + b3 * MIX_QK, mode, s_lut, acc0, acc1);
     }
     // Remainder: fewer than MIX_UNROLL strided blocks left for this lane.
     for (; blk < nb; blk += MIX_WARP) {
-        mix_block_accum(rowbase + (int64_t) blk * MIX_BLOCK_BYTES, xc, blk * MIX_QK, mode, s_lut, acc);
+        mix_block_accum2(rowbase0 + (int64_t) blk * MIX_BLOCK_BYTES,
+                         rowbase1 + (int64_t) blk * MIX_BLOCK_BYTES,
+                         xc + blk * MIX_QK, mode, s_lut, acc0, acc1);
     }
     #pragma unroll
-    for (int off = MIX_WARP/2; off > 0; off >>= 1) acc += mix_warp_shfl_down(acc, off);
-    if (lane == 0) y[(int64_t) col * y_col_stride + row] = acc;
+    for (int off = MIX_WARP/2; off > 0; off >>= 1) {
+        acc0 += mix_warp_shfl_down(acc0, off);
+        acc1 += mix_warp_shfl_down(acc1, off);
+    }
+    if (lane == 0) {
+        const int64_t o = (int64_t) col * y_col_stride + row;
+        y[o] = acc0;
+        if (two) y[o + 1] = acc1;
+    }
 }
 
 // ---- stream-sync-free fused MoE matvec (mul_mat_id) ----
@@ -910,7 +998,9 @@ bool ggml_cuda_rocmfp3_mix_mul_mat_vec(
     // give the scheduler finer packing/tail balance on this BW-bound matvec.
     const int warps_per_block = 2;               // 64 threads
     const int threads = warps_per_block * MIX_WARP;
-    dim3 grid((out + warps_per_block - 1) / warps_per_block, ncols, 1);
+    // Each warp now owns TWO rows, so a block covers 2 * warps_per_block of them.
+    const int rows_per_block = 2 * warps_per_block;
+    dim3 grid((out + rows_per_block - 1) / rows_per_block, ncols, 1);
     mix_matvec_rocmfp3_kernel<<<grid, dim3(threads), 0, stream>>>(
         (const uint8_t *) vx, book, mode_ptr, x, y, in, out, x_col_stride, y_col_stride);
     return true;
