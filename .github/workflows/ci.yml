@@ -357,6 +357,28 @@ jobs:
             --output-on-failure \
             -R 'rocmfp4_reference|rocmfpx_reference|rocmfp4_hip_tail|rocmfpx_mmq|deepseek4_mmid_grouped_cuda|deepseek4_unit|recurrent_snapshot|ChainRollbackPolicy|rocmfp3_mix_registry|rocmfp_mix_slice_matvec|rocmfp_mix_gateup_glu|ds4_mix_registry_teardown|test_model_smoke\.PagedAttention\.|batched_gdn$|concat_transpose$'
 
+      - name: Build + test affine ROCmFP2 GPU paths
+        # Keep the default wire-format build above and compile the affine layout
+        # separately so both configurations remain covered. The focused tests
+        # assert real MMVQ/MMQ dispatch rather than accepting a BLAS fallback.
+        run: |
+          cmake -S server -B "$RUNNER_TEMP/rocmfp-affine-build" \
+            -DDFLASH27B_GPU_BACKEND=hip \
+            -DDFLASH27B_HIP_ARCHITECTURES="$EXPECTED_HIP_ARCH" \
+            -DDFLASH27B_SERVER=OFF \
+            -DDFLASH27B_TESTS=ON \
+            -DDFLASH27B_ROCMFP2_AFFINE=ON \
+            -DGGML_HIP_GRAPHS=ON \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_HIP_FLAGS=-DDFLASH_WAVE_SIZE=32
+          cmake --build "$RUNNER_TEMP/rocmfp-affine-build" \
+            --target test_rocmfpx test_rocmfpx_mmq \
+              test_deepseek4_mmid_grouped_cuda \
+            --parallel 8
+          ctest --test-dir "$RUNNER_TEMP/rocmfp-affine-build" \
+            --output-on-failure \
+            -R 'rocmfpx_reference|rocmfpx_mmq|deepseek4_mmid_grouped_cuda'
+
   build-windows:
     name: Build Windows (MSVC + CUDA, library + server targets)
     runs-on: windows-2022

@@ -156,7 +156,7 @@ or fixed-codebook expert tensors. Adaptive qtype-105/106 expert tensors remain
 monolithic-only because their codebook registrations cannot follow a sliced
 expert allocation.
 
-Build for both targets with affine qtype-107 MMQ enabled:
+Build for both targets with affine qtype-107 support enabled:
 
 ```bash
 cmake -S server -B server/build-hip-dual \
@@ -203,9 +203,10 @@ python3 server/scripts/bench_ds4_decode.py \
   --max-tokens 512
 ```
 
-The harness rejects partial generations and cache hits, requires the measured
-outputs to be byte-identical, and records server-reported decode timing,
-acceptance, and output SHA-256 values as JSON. On a Radeon RX 7900 XT plus
+The harness rejects partial generations, cache hits, and autoregressive
+fallbacks, requires the measured outputs to be byte-identical, and records
+server-reported decode timing, acceptance, and output SHA-256 values as JSON.
+On a Radeon RX 7900 XT plus
 Ryzen AI Max+ 395, a clean rebase onto upstream `main` using the script's
 default 10,200 MiB expert budget and 135,168-token context produced 100%
 speculative acceptance and one byte-identical output digest:
@@ -220,7 +221,9 @@ Retain that JSON with the target and draft GGUF SHA-256 values, build revision,
 ROCm version, GPU identifiers, launch environment, and context length. An
 earlier qualified build produced three 46.8 tok/s runs; its previous
 same-hardware route/dispatch baseline was 37.7 tok/s, a 24.1% improvement.
-The affine MMQ path also remained finite on both gfx1100 and gfx1151.
+The checked-in kernel test verifies actual affine MMQ dispatch on gfx1151 and
+gfx12xx. gfx1100 uses the supported non-MMQ fallback and is not claimed as an
+MMQ qualification.
 
 Sparse-prefill records used several explicitly different approximation
 profiles and must not be compared as if the launch settings were identical.

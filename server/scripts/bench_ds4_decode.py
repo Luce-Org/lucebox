@@ -52,6 +52,7 @@ def run_request(url: str, model: str, max_tokens: int, timeout: float) -> dict:
         "decode_seconds": timings.get("decode_ms", 0.0) / 1000.0,
         "decode_tokens_per_second": timings.get("decode_tokens_per_sec"),
         "accept_rate": usage.get("accept_rate"),
+        "spec_decode_ran": usage.get("spec_decode_ran"),
         "cache_hit": timings.get("cache_hit"),
         "cached_prefix_tokens": timings.get("cached_prefix_tokens"),
         "finish_reason": choice.get("finish_reason"),
@@ -71,6 +72,8 @@ def validate_run(run: dict, max_tokens: int) -> None:
         raise RuntimeError("model output did not contain only the requested BETA sequence")
     if run["cache_hit"] or run["cached_prefix_tokens"] not in (None, 0):
         raise RuntimeError("benchmark request reused a cached prefix")
+    if run["spec_decode_ran"] is not True:
+        raise RuntimeError("speculative decode did not run")
     throughput = run["decode_tokens_per_second"]
     if throughput is None or throughput <= 0:
         raise RuntimeError("server did not report positive decode throughput")

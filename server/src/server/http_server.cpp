@@ -2253,8 +2253,9 @@ json build_openai_completion_response(
     // usage.completion_tokens_details.reasoning_tokens — OpenAI o1/o3
     // standard location; kept in sync with finish_details.thinking_tokens.
     // usage.timings — per-request prefill/decode wall clock, additive to
-    // the OpenAI shape (ignored by clients that don't recognize it). See
-    // docs/specs/thinking-budget.md §6.3.
+    // the OpenAI shape (ignored by clients that don't recognize it).
+    // spec_decode_ran disambiguates a real zero-acceptance speculative run
+    // from an autoregressive fallback. See docs/specs/thinking-budget.md §6.3.
     const int prompt_tokens = (int) req.prompt_tokens.size();
     const json usage = {
         {"prompt_tokens", prompt_tokens},
@@ -2265,6 +2266,7 @@ json build_openai_completion_response(
         }},
         {"timings", build_timings_json(timings, counts.total)},
         {"accept_rate", result.accept_rate},
+        {"spec_decode_ran", result.spec_decode_ran},
     };
     return {
         {"id", req.response_id},
@@ -2332,6 +2334,7 @@ json build_anthropic_response(
         {"output_tokens", counts.total},
         {"timings", build_timings_json(timings, counts.total)},
         {"accept_rate", result.accept_rate},
+        {"spec_decode_ran", result.spec_decode_ran},
     };
     return {
         {"id", req.response_id},
@@ -2381,6 +2384,7 @@ json build_responses_api_response(
         {"total_tokens", prompt_tokens + counts.total},
         {"timings", build_timings_json(timings, counts.total)},
         {"accept_rate", result.accept_rate},
+        {"spec_decode_ran", result.spec_decode_ran},
     };
     return {
         {"id", req.response_id},

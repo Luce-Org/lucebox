@@ -5,6 +5,12 @@
 #include "rocmfp2_mix.cuh"
 #include "rocmfp3_mix.cuh"
 
+static thread_local size_t g_mmq_launch_count = 0;
+
+extern "C" size_t ggml_backend_cuda_get_mmq_launch_count(void) {
+    return g_mmq_launch_count;
+}
+
 namespace {
 
 class mix_registry_dispatch_guard {
@@ -40,6 +46,7 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
         args.type_x == GGML_TYPE_Q2_1_ROCMFP2_MIX ||
         args.type_x == GGML_TYPE_Q3_1_ROCMFP3_MIX;
     GGML_ASSERT(!is_mix_type || (args.mix_codebooks && args.mix_modes));
+    ++g_mmq_launch_count;
     switch (args.type_x) {
         case GGML_TYPE_Q4_0:
             mul_mat_q_case<GGML_TYPE_Q4_0>(ctx, args, stream);

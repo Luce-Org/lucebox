@@ -8,6 +8,12 @@
 #include <cstdlib>
 #include <cstring>
 
+static thread_local size_t g_mmvq_launch_count = 0;
+
+extern "C" size_t ggml_backend_cuda_get_mmvq_launch_count(void) {
+    return g_mmvq_launch_count;
+}
+
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
 
 static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) {
@@ -2621,6 +2627,8 @@ void ggml_cuda_mul_mat_vec_q(
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
+
+    ++g_mmvq_launch_count;
 
     GGML_TENSOR_BINARY_OP_LOCALS;
 

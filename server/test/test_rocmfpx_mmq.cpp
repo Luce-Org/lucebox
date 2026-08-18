@@ -31,6 +31,15 @@ struct Shape {
     const char * label;
 };
 
+enum class DispatchPath {
+    MMVQ,
+    MMQ,
+};
+
+static const char * dispatch_path_name(DispatchPath path) {
+    return path == DispatchPath::MMVQ ? "MMVQ" : "MMQ";
+}
+
 static std::vector<float> make_values(size_t count, int stride, float scale) {
     std::vector<float> values(count);
     for (size_t i = 0; i < count; ++i) {
@@ -58,7 +67,8 @@ static bool run_backend(
         const Shape & shape,
         const std::vector<uint8_t> & weights_data,
         const std::vector<float> & input_data,
-        std::vector<float> & output_data) {
+        std::vector<float> & output_data,
+        DispatchPath expected_path) {
     ggml_init_params params{};
     params.mem_size = 16 * 1024 * 1024;
     params.no_alloc = true;
@@ -98,9 +108,38 @@ static bool run_backend(
     if (ok) {
         ggml_backend_tensor_set(weights, weights_data.data(), 0, weights_data.size());
         ggml_backend_tensor_set(input, input_data.data(), 0, input_data.size() * sizeof(float));
+
+        const size_t mmvq_before = ggml_backend_cuda_get_mmvq_launch_count();
+        const size_t mmq_before = ggml_backend_cuda_get_mmq_launch_count();
+        const int previous_mmvq_max =
+            ggml_backend_cuda_set_mmvq_max_ncols_override(
+                expected_path == DispatchPath::MMVQ ? 8 : 1);
+        const bool previous_graphs_disabled =
+            ggml_backend_cuda_set_graphs_disabled_override(true);
         ok = ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
+        ggml_backend_cuda_set_graphs_disabled_override(previous_graphs_disabled);
+        ggml_backend_cuda_set_mmvq_max_ncols_override(previous_mmvq_max);
+        const size_t mmvq_delta =
+            ggml_backend_cuda_get_mmvq_launch_count() - mmvq_before;
+        const size_t mmq_delta =
+            ggml_backend_cuda_get_mmq_launch_count() - mmq_before;
         if (!ok) {
             std::fprintf(stderr, "backend graph compute failed\n");
+        } else {
+            const bool dispatch_matches =
+                expected_path == DispatchPath::MMVQ
+                    ? mmvq_delta == 1 && mmq_delta == 0
+                    : mmvq_delta == 0 && mmq_delta == 1;
+            if (!dispatch_matches) {
+                std::fprintf(
+                    stderr,
+                    "%s: expected %s dispatch, observed MMVQ=%zu MMQ=%zu\n",
+                    shape.label,
+                    dispatch_path_name(expected_path),
+                    mmvq_delta,
+                    mmq_delta);
+                ok = false;
+            }
         }
     }
 
@@ -178,7 +217,8 @@ static bool compare_outputs(
 static bool test_case(
         ggml_backend_t hip_backend,
         const QuantCase & quant,
-        const Shape & shape) {
+        const Shape & shape,
+        DispatchPath expected_path) {
     const std::vector<float> weights_f32 =
         make_values((size_t) shape.k * shape.m, 37, 0.015625f);
     const std::vector<float> input_f32 =
@@ -207,14 +247,21 @@ static bool test_case(
         reference_mul_mat(quant, shape, weights_quantized, input_f32);
     std::vector<float> actual;
     if (!run_backend(
-            hip_backend, quant.type, shape, weights_quantized, input_f32, actual)) {
-        std::fprintf(stderr, "%s/%s: HIP MMQ run failed\n", quant.label, shape.label);
+            hip_backend, quant.type, shape, weights_quantized, input_f32, actual,
+            expected_path)) {
+        std::fprintf(
+            stderr,
+            "%s/%s: HIP %s run failed\n",
+            quant.label,
+            shape.label,
+            dispatch_path_name(expected_path));
         return false;
     }
     return compare_outputs(quant, shape, expected, actual);
 }
 
 int main() {
+    setenv("DFLASH_CUDA_MMVQ_FP2_AFFINE", "1", 1);
     setenv("DFLASH_CUDA_MMQ_FP2_AFFINE", "1", 1);
     setenv("DFLASH_CUDA_MMQ_FP2_AFFINE_GENERAL", "1", 1);
     hipDeviceProp_t properties{};
@@ -223,13 +270,11 @@ int main() {
         return 1;
     }
     if (std::strncmp(properties.gcnArchName, "gfx1151", 7) != 0 &&
-        std::strncmp(properties.gcnArchName, "gfx1100", 7) != 0) {
-        std::printf("SKIP: ROCmFPX MMQ test expects gfx1100/gfx1151 (found %s)\n",
+        std::strncmp(properties.gcnArchName, "gfx12", 5) != 0) {
+        std::printf("SKIP: ROCmFPX dispatch test expects gfx1151/gfx12xx (found %s)\n",
                     properties.gcnArchName);
         return 0;
     }
-
-    setenv("LUCE_MMVQ_MAX_NCOLS", "1", 1);
 
     ggml_backend_t hip_backend = ggml_backend_cuda_init(0);
     if (!hip_backend) {
@@ -271,7 +316,9 @@ int main() {
                 quant.type != GGML_TYPE_Q2_0_ROCMFP2) {
                 continue;
             }
-            ok = test_case(hip_backend, quant, shape) && ok;
+            const DispatchPath expected_path =
+                shape.n <= 8 ? DispatchPath::MMVQ : DispatchPath::MMQ;
+            ok = test_case(hip_backend, quant, shape, expected_path) && ok;
         }
     }
     if (shape_filter && !matched_shape) {
