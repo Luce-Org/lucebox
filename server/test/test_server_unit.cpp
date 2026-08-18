@@ -5806,16 +5806,37 @@ TEST_CASE(ServerUnitFixture, test_emitter_function_calls_unclosed_think_flushes_
 
 TEST_CASE(ServerUnitFixture, test_emitter_function_calls_content_tokens_accounting) {
     auto em = make_emitter(ApiFormat::OPENAI_CHAT, read_tools(), false);
+    // Token 0: reasoning
     em.emit_token("<think>Analyzing build configuration.\n");
+    // Token 1: function_calls
     em.emit_token("<function_calls>\n  <invoke name=\"read\">\n    <param name=\"path\">CMakeLists.txt</param>\n  </invoke>\n</function_calls>\n");
+    // Token 2: close think
     em.emit_token("</think>\n");
+    // Token 3: content
     em.emit_token("Here is the build summary.");
     em.emit_finish(4);
 
     TEST_ASSERT(em.tool_calls().size() == 1);
-    TEST_ASSERT(em.first_content_token_index() == 2);
+    TEST_ASSERT(em.first_content_token_index() == 3);
     TEST_ASSERT(em.emit_token_count() == 4);
-    TEST_ASSERT(em.emit_token_count() - em.first_content_token_index() == 2);
+    TEST_ASSERT(em.emit_token_count() - em.first_content_token_index() == 1);
 }
+
+TEST_CASE(ServerUnitFixture, test_emitter_function_calls_param_with_literal_think_close) {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, read_tools(), false);
+    // Token 0: reasoning
+    em.emit_token("<think>Searching for tag.\n");
+    // Token 1: parameter with literal </think> inside
+    em.emit_token("<function_calls>\n  <invoke name=\"read\">\n    <param name=\"path\">test_</think>.cpp</param>\n  </invoke>\n</function_calls>\n");
+    // Token 2: real close think + trailing content in same token
+    em.emit_token("</think> Found file.");
+    em.emit_finish(3);
+
+    TEST_ASSERT(em.tool_calls().size() == 1);
+    TEST_ASSERT(em.first_content_token_index() == 2);
+    TEST_ASSERT(em.emit_token_count() == 3);
+    TEST_ASSERT(em.emit_token_count() - em.first_content_token_index() == 1);
+}
+
 
 

@@ -286,9 +286,22 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
     while (true) {
         if (mode_ == StreamMode::TOOL_BUFFER) {
             if (tool_from_reasoning_ && first_content_token_index_ < 0) {
-                if (window_.find(THINK_CLOSE) != std::string::npos ||
-                    (tool_buffer_ + window_).find(THINK_CLOSE) != std::string::npos) {
-                    first_content_token_index_ = emit_token_count_ - 1;
+                const std::string full = tool_buffer_ + window_;
+                const size_t fc_close = full.find("</function_calls>");
+                if (fc_close != std::string::npos) {
+                    const size_t search_start = fc_close + std::strlen("</function_calls>");
+                    const size_t think_close = full.find(THINK_CLOSE, search_start);
+                    if (think_close != std::string::npos) {
+                        const size_t after_think = think_close + THINK_CLOSE_LEN;
+                        if (after_think < full.size() &&
+                            full.find_first_not_of(" \t\r\n", after_think) != std::string::npos) {
+                            // The current token already carries content after </think>
+                            first_content_token_index_ = emit_token_count_ - 1;
+                        } else {
+                            // First real content token starts on the next token
+                            first_content_token_index_ = emit_token_count_;
+                        }
+                    }
                 }
             }
             tool_buffer_ += window_;
