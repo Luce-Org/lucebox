@@ -343,6 +343,20 @@ int deepseek4_previous_raw_ring_spans(
     int kv_start,
     int n_swa,
     DeepSeek4RawRingSpan spans[2]);
+bool deepseek4_exact_tokenwise_uses_runtime_raw_row(
+    bool exact_prefill_stable_raw_order,
+    int token_position,
+    int n_swa);
+
+// Exact q=4 prefill must retain the q<=3 owner-kernel reduction order. The
+// four-row dual-owner hybrid FFN path is numerically different from q=1 on the
+// production target.
+// Return the largest owner sub-batch allowed for this production intent.
+int deepseek4_exact_prefill_hybrid_ffn_sub_batch(
+    bool exact_prefill_q1_ffn_order,
+    int n_tokens);
+bool deepseek4_exact_prefill_route_graph_requires_eager(
+    bool exact_prefill_q1_ffn_order);
 bool deepseek4_snapshot_save(const DeepSeek4Cache & cache,
                              ggml_backend_t snapshot_backend,
                              DeepSeek4Snapshot & out);
@@ -355,6 +369,50 @@ bool deepseek4_snapshot_restore(const DeepSeek4Snapshot & snap,
 int deepseek4_safe_compressor_batch_tokens(const DeepSeek4Weights & w,
                                            int kv_start,
                                            int n_tokens);
+
+int deepseek4_prefill_chunk_tokens(PrefillAttentionMode mode,
+                                   bool exact_bands_enabled,
+                                   bool batch_supported,
+                                   int requested_chunk,
+                                   int layer_major_cap);
+
+bool deepseek4_env_flag_value_enabled(const char * value);
+
+struct DeepSeek4PrefillOutputIntent {
+    bool execute_output_path = false;
+    bool readback_logits = false;
+};
+
+DeepSeek4PrefillOutputIntent deepseek4_prefill_output_intent(
+    PrefillAttentionMode mode,
+    bool exact_bands_active,
+    int n_tokens,
+    bool is_final_chunk,
+    bool ends_at_snapshot,
+    bool external_requires_logits);
+
+DeepSeek4PrefillOutputIntent deepseek4_prepare_prefill_output_intent(
+    PrefillAttentionMode mode,
+    bool exact_bands_active,
+    int n_tokens,
+    bool is_final_chunk,
+    bool ends_at_snapshot,
+    bool external_requires_logits,
+    std::vector<float> & last_logits,
+    int & last_logits_pos);
+
+void deepseek4_invalidate_prefill_logits_if_skipped(
+    bool readback_logits,
+    std::vector<float> & last_logits,
+    int & last_logits_pos);
+
+bool deepseek4_commit_prefill_logits(
+    bool readback_logits,
+    int vocab_size,
+    int cache_position,
+    std::vector<float> && logits,
+    std::vector<float> & last_logits,
+    int & last_logits_pos);
 
 // Forward: single step (prefill chunk or decode token).
 // embed: [n_embd, n_tokens] input embeddings (post-embedding lookup).
@@ -393,7 +451,62 @@ struct Ds4VerifyHooks {
     std::vector<float> *     all_logits_out = nullptr;      // [n_vocab * n_tokens]
     std::vector<int32_t> *   argmax_out = nullptr;          // [n_tokens], optional GPU result
     bool                     prefer_argmax_only = false;     // skip logits D2H when available
+    // Prefill uses the capture fields too, but must never enter the
+    // intentionally approximate fused-verification path.
+    bool                     allow_fused_verify = true;
 };
+
+Ds4VerifyHooks deepseek4_make_prefill_capture_hooks(
+    const std::vector<int> * capture_layer_ids,
+    std::vector<float> * capture_out,
+    int capture_token_begin,
+    int capture_token_end);
+
+bool deepseek4_should_attempt_fused_verify(
+    int n_tokens,
+    const Ds4VerifyHooks * verify_hooks,
+    bool owner_topology_supported,
+    bool full_layer_range,
+    bool execute_output_path,
+    bool gpu_backend,
+    bool fused_verify_enabled);
+
+bool deepseek4_should_attempt_wide_fused_verify(
+    int n_tokens,
+    const Ds4VerifyHooks * verify_hooks,
+    bool q5_enabled,
+    bool owner_topology_supported,
+    bool full_layer_range,
+    bool has_output_storage,
+    bool gpu_backend,
+    bool fused_verify_enabled);
+
+bool deepseek4_should_warn_fused_verify_inactive(
+    int n_tokens,
+    const Ds4VerifyHooks * verify_hooks,
+    bool full_layer_range,
+    bool fused_verify_enabled,
+    bool fused_verify_candidate);
+
+struct DeepSeek4RecursiveOutputIntent {
+    bool execute_output_path = false;
+    bool pass_output_storage = false;
+};
+
+DeepSeek4RecursiveOutputIntent deepseek4_recursive_output_intent(
+    PrefillAttentionMode mode,
+    bool parent_execute_output_path,
+    bool parent_has_output_storage,
+    bool is_last_shard,
+    int chunk_tokens,
+    bool is_final_chunk);
+
+bool deepseek4_should_attempt_fused_hybrid_decode(
+    bool fused_hybrid_decode,
+    bool full_layer_range,
+    bool execute_output_path,
+    bool gpu_backend,
+    bool fused_verify_enabled);
 
 bool deepseek4_step_layer_range(
     ggml_backend_t              backend,
@@ -413,7 +526,10 @@ bool deepseek4_step_layer_range(
     Ds4VerifyHooks *            verify_hooks = nullptr,
     MoeHybridStorage *          moe_hybrid = nullptr,
     MoeExpertComputeRuntime *   expert_runtime = nullptr,
-    MoeHybridRoutingStats *     routing_stats = nullptr);
+    MoeHybridRoutingStats *     routing_stats = nullptr,
+    bool                        execute_output_path = false,
+    bool                        exact_prefill_stable_raw_order = false,
+    bool                        exact_prefill_q1_ffn_order = false);
 
 bool build_deepseek4_moe_hybrid_storage_from_file(
     const std::string &         path,

@@ -33,6 +33,8 @@ int deepseek4_hybrid_prefill_chunk_tokens(
     int context_end,
     int current_cap = 0);
 
+bool deepseek4_prefill_allows_decode_graph_reuse(bool save_snapshot);
+
 class DeepSeek4Backend : public ModelBackend {
 public:
     explicit DeepSeek4Backend(const DeepSeek4BackendConfig & cfg);
