@@ -151,6 +151,19 @@ int moe_balanced_main_slots_x4(int top_k, double main_to_peer_rate) {
     return total - peer;
 }
 
+MoeHybridOwnerMapView moe_hybrid_owner_maps(
+        const MoeHybridLayerStorage & storage,
+        bool dynamic_route_balance) {
+    return {
+        dynamic_route_balance || storage.decode_hot_local_by_global.empty()
+            ? &storage.hot_local_by_global
+            : &storage.decode_hot_local_by_global,
+        dynamic_route_balance || storage.decode_cold_local_by_global.empty()
+            ? &storage.cold_local_by_global
+            : &storage.decode_cold_local_by_global,
+    };
+}
+
 // The serial balanced-owner assignment is qualified for the q=5 DSpark
 // verifier. Wider batches retain the ordinary parallel owner remap.
 constexpr int kDynamicRouteBalanceMaxTokens = 5;
@@ -1176,32 +1189,6 @@ bool build_moe_hybrid_ffn_graph(
     // Expose the canonical tensor so the scheduler can keep it on the primary
     // backend rather than discovering it late through the secondary branch.
     out.router_weights = router_weights;
-    const std::vector<int32_t> & decode_hot =
-        storage.decode_hot_local_by_global.empty()
-            ? storage.hot_local_by_global
-            : storage.decode_hot_local_by_global;
-    const std::vector<int32_t> & decode_cold =
-        storage.decode_cold_local_by_global.empty()
-            ? storage.cold_local_by_global
-            : storage.decode_cold_local_by_global;
-    const bool decode_has_hot = std::any_of(
-        decode_hot.begin(), decode_hot.end(),
-        [](int32_t local) { return local >= 0; });
-    MoeOwnerGraphSpec primary_owner{
-        &decode_hot,
-        decode_has_hot ? storage.gate_hot : nullptr,
-        decode_has_hot ? storage.up_hot : nullptr,
-        decode_has_hot ? storage.down_hot : nullptr,
-        decode_has_hot ? storage.gate_up_hot : nullptr,
-        &out.hot_local_lut, &out.hot_valid_lut,
-        &out.hot_remap_nodes, &out.hot_nodes};
-    MoeOwnerGraphSpec secondary_owner{
-        &decode_cold,
-        storage.gate_cold, storage.up_cold, storage.down_cold,
-        storage.gate_up_cold,
-        &out.cold_local_lut, &out.cold_valid_lut,
-        &out.cold_remap_nodes, &out.cold_nodes};
-
     double derived_main_to_peer_rate = 0.0;
     int dynamic_main_slots_x4 =
         route_balance == MoeHybridRouteBalance::Allowed
@@ -1209,17 +1196,35 @@ bool build_moe_hybrid_ffn_graph(
                   n_used, &derived_main_to_peer_rate)
             : 0;
 
+    // Dynamic balancing routes by physical residency, not by the optional
+    // phase-specific decode placement. In particular, the decode peer map may
+    // intentionally omit experts assigned to the main owner, while the
+    // physical peer map still contains the complete fallback copy required by
+    // the dynamic complement.
+    const MoeHybridOwnerMapView physical_maps =
+        moe_hybrid_owner_maps(storage, true);
     const bool complete_secondary_map =
-        secondary_owner.local_by_global &&
-        (int) secondary_owner.local_by_global->size() == cfg.n_expert &&
+        physical_maps.peer &&
+        (int) physical_maps.peer->size() == cfg.n_expert &&
         std::none_of(
-            secondary_owner.local_by_global->begin(),
-            secondary_owner.local_by_global->end(),
+            physical_maps.peer->begin(), physical_maps.peer->end(),
             [](int32_t local) { return local < 0; });
+    const bool physical_primary_map_available =
+        physical_maps.main &&
+        (int) physical_maps.main->size() == cfg.n_expert &&
+        std::any_of(
+            physical_maps.main->begin(), physical_maps.main->end(),
+            [](int32_t local) { return local >= 0; });
+    const bool physical_primary_available = physical_primary_map_available &&
+        (storage.gate_up_hot || (storage.gate_hot && storage.up_hot)) &&
+        storage.down_hot;
+    const bool physical_secondary_available =
+        (storage.gate_up_cold || (storage.gate_cold && storage.up_cold)) &&
+        storage.down_cold;
     if (dynamic_main_slots_x4 > 0 &&
         (n_tokens > kDynamicRouteBalanceMaxTokens ||
-         !primary_owner.available() ||
-         !secondary_owner.available() || !complete_secondary_map)) {
+         !physical_primary_available ||
+         !physical_secondary_available || !complete_secondary_map)) {
         static std::once_flag fallback_log;
         std::call_once(fallback_log, [n_tokens] {
             std::fprintf(stderr,
@@ -1230,6 +1235,27 @@ bool build_moe_hybrid_ffn_graph(
         dynamic_main_slots_x4 = 0;
     }
     out.dynamic_route_balance = dynamic_main_slots_x4 > 0;
+
+    const MoeHybridOwnerMapView owner_maps =
+        moe_hybrid_owner_maps(storage, out.dynamic_route_balance);
+    const bool main_has_experts = owner_maps.main && std::any_of(
+        owner_maps.main->begin(), owner_maps.main->end(),
+        [](int32_t local) { return local >= 0; });
+    MoeOwnerGraphSpec primary_owner{
+        owner_maps.main,
+        main_has_experts ? storage.gate_hot : nullptr,
+        main_has_experts ? storage.up_hot : nullptr,
+        main_has_experts ? storage.down_hot : nullptr,
+        main_has_experts ? storage.gate_up_hot : nullptr,
+        &out.hot_local_lut, &out.hot_valid_lut,
+        &out.hot_remap_nodes, &out.hot_nodes};
+    MoeOwnerGraphSpec secondary_owner{
+        owner_maps.peer,
+        storage.gate_cold, storage.up_cold, storage.down_cold,
+        storage.gate_up_cold,
+        &out.cold_local_lut, &out.cold_valid_lut,
+        &out.cold_remap_nodes, &out.cold_nodes};
+
     if (dynamic_main_slots_x4 > 0) {
         static std::once_flag active_log;
         std::call_once(

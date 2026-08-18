@@ -2,6 +2,7 @@
 #include "../src/common/moe_hybrid_ffn_eval.h"
 #include "../src/common/moe_hybrid_storage.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <vector>
 
@@ -42,6 +43,27 @@ TEST_CASE(MoeHybridStorageFixture, heterogeneous_route_balance_scales_with_model
     REQUIRE(moe_balanced_main_slots_x4(6, 4.4) == 20);
     REQUIRE(moe_balanced_main_slots_x4(0, 4.4) == 0);
     REQUIRE(moe_balanced_main_slots_x4(6, 0.0) == 0);
+}
+
+TEST_CASE(MoeHybridStorageFixture, dynamic_route_balance_uses_physical_owner_maps) {
+    MoeHybridLayerStorage storage;
+    storage.hot_local_by_global = {0, -1, 1, -1};
+    storage.cold_local_by_global = {0, 1, 2, 3};
+    storage.decode_hot_local_by_global = {-1, -1, 1, -1};
+    storage.decode_cold_local_by_global = {0, 1, -1, 3};
+
+    const MoeHybridOwnerMapView static_maps =
+        moe_hybrid_owner_maps(storage, false);
+    REQUIRE(static_maps.main == &storage.decode_hot_local_by_global);
+    REQUIRE(static_maps.peer == &storage.decode_cold_local_by_global);
+
+    const MoeHybridOwnerMapView dynamic_maps =
+        moe_hybrid_owner_maps(storage, true);
+    REQUIRE(dynamic_maps.main == &storage.hot_local_by_global);
+    REQUIRE(dynamic_maps.peer == &storage.cold_local_by_global);
+    REQUIRE(std::none_of(
+        dynamic_maps.peer->begin(), dynamic_maps.peer->end(),
+        [](int32_t local) { return local < 0; }));
 }
 
 TEST_CASE(MoeHybridStorageFixture, fractional_route_quota_rounds_over_the_batch) {

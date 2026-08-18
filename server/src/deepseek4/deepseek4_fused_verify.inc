@@ -167,16 +167,10 @@ static void ds4_fused_verify_refresh_hybrid_luts(
         const MoeHybridLayerStorage & layer = hybrid->layers[(size_t) il];
         const MoeHybridGraphInputs & inputs = fg.hybrid_inputs[hi];
         const bool dynamic_route_balance = inputs.dynamic_route_balance;
-        const std::vector<int32_t> & decode_hot =
-            dynamic_route_balance ||
-                    layer.decode_hot_local_by_global.empty()
-                ? layer.hot_local_by_global
-                : layer.decode_hot_local_by_global;
-        const std::vector<int32_t> & decode_cold =
-            dynamic_route_balance ||
-                    layer.decode_cold_local_by_global.empty()
-                ? layer.cold_local_by_global
-                : layer.decode_cold_local_by_global;
+        const MoeHybridOwnerMapView owner_maps =
+            moe_hybrid_owner_maps(layer, dynamic_route_balance);
+        const std::vector<int32_t> & decode_hot = *owner_maps.main;
+        const std::vector<int32_t> & decode_cold = *owner_maps.peer;
         std::vector<int32_t> hot_lut((size_t) w.n_expert, invalid_route);
         std::vector<int32_t> cold_lut((size_t) w.n_expert, invalid_route);
         std::vector<float> hot_valid((size_t) w.n_expert, 0.0f);
