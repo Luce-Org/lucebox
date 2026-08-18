@@ -1813,6 +1813,7 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         DeepSeek4StepTelemetry step_tel;
         if (timing) step_tel.embed_us = elapsed_us(embed_t0, Clock::now());
 
+        const bool need_logits = (i + n_tok >= n_total);
         std::vector<float> logits;
         bool ok = false;
         std::vector<float> hc_state;
@@ -1848,7 +1849,7 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
             ok = deepseek4_step_layer_range(
                 backend_, cfg_.device.gpu, w_, cache_, hc_state,
                 embed.data(), n_tok, pos,
-                0, w_.n_layer, &logits,
+                0, w_.n_layer, need_logits ? &logits : nullptr,
                 tokens.data() + i,
                 timing ? &step_tel : nullptr,
                 /*allow_decode_graph_reuse=*/true, hp,
@@ -1862,11 +1863,12 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                                 timing ? &step_tel : nullptr,
                                 routing_stats_.get(),
                                 hp,
-                                expert_runtime_.compute ? &expert_runtime_ : nullptr);
+                                expert_runtime_.compute ? &expert_runtime_ : nullptr,
+                                need_logits);
         } else {
             ok = deepseek4_step_layer_range(backend_, cfg_.device.gpu, w_, cache_, hc_state,
                                             embed.data(), n_tok, pos,
-                                            0, w_.n_layer, &logits,
+                                            0, w_.n_layer, need_logits ? &logits : nullptr,
                                             tokens.data() + i,
                                             timing ? &step_tel : nullptr,
                                             cfg_.prefill_mode != PrefillAttentionMode::Sparse, hp);
@@ -1893,7 +1895,9 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
             add_step_tel(tel_acc, step_tel);
             steps++;
         }
-        last_logits_ = std::move(logits);
+        if (need_logits) {
+            last_logits_ = std::move(logits);
+        }
         pos += n_tok;
         last_logits_pos_ = cache_.cur_pos;
         i += n_tok;

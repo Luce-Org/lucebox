@@ -122,6 +122,9 @@ struct tile_x_sizes {
 
 static int get_mmq_x_max_host(const int cc) {
     if (LUCEBOX_RDNA_TILE_HOST(cc)) {
+        if (GGML_CUDA_CC_IS_RDNA3(cc)) {
+            return 48;
+        }
 #if defined(GGML_CUDA_ROCMFPX_MMQ_TILE)
         return 64;
 #else
@@ -139,7 +142,9 @@ static int get_mmq_x_max_host(const int cc) {
 
 static constexpr __device__ int get_mmq_x_max_device() {
 #if LUCEBOX_RDNA_TILE_DEVICE
-#if defined(GGML_CUDA_ROCMFPX_MMQ_TILE)
+#if defined(RDNA3)
+    return 48;
+#elif defined(GGML_CUDA_ROCMFPX_MMQ_TILE)
     return 64;
 #else
     return 128;
@@ -169,6 +174,9 @@ static constexpr __device__ int get_mmq_x_max_device() {
 
 static int get_mmq_y_host(const int cc) {
     if (LUCEBOX_RDNA_TILE_HOST(cc)) {
+        if (GGML_CUDA_CC_IS_RDNA3(cc)) {
+            return 64;
+        }
 #if defined(GGML_CUDA_ROCMFPX_MMQ_TILE)
         return 64;
 #else
@@ -189,7 +197,9 @@ static constexpr __device__ int get_iter_k([[maybe_unused]] const ggml_type type
 
 static constexpr __device__ int get_mmq_y_device() {
 #if LUCEBOX_RDNA_TILE_DEVICE
-#if defined(GGML_CUDA_ROCMFPX_MMQ_TILE)
+#if defined(RDNA3)
+    return 64;
+#elif defined(GGML_CUDA_ROCMFPX_MMQ_TILE)
     return 64;
 #else
     return 128;
@@ -342,6 +352,9 @@ static constexpr __device__ int mmq_get_granularity_device(const int /*mmq_x*/) 
 #if defined(GGML_USE_HIP)
 static int mmq_get_nwarps_host(const int cc, const int warp_size) {
     if (LUCEBOX_RDNA_TILE_HOST(cc)) {
+        if (GGML_CUDA_CC_IS_RDNA3(cc)) {
+            return 4;
+        }
 #if defined(GGML_CUDA_ROCMFPX_MMQ_TILE)
         return 4;
 #else
@@ -358,7 +371,9 @@ static int mmq_get_nwarps_host(const int /*cc*/, const int warp_size) {
 
 static constexpr __device__ int mmq_get_nwarps_device() {
 #if LUCEBOX_RDNA_TILE_DEVICE
-#if defined(GGML_CUDA_ROCMFPX_MMQ_TILE)
+#if defined(RDNA3)
+    return 4;
+#elif defined(GGML_CUDA_ROCMFPX_MMQ_TILE)
     return 4;
 #else
     return 8;

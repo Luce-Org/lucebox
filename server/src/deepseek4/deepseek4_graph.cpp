@@ -4079,7 +4079,8 @@ static bool deepseek4_step_hybrid(
         MoeHybridStreamEngine * stream_engine,
         DeepSeek4StepTelemetry * telemetry,
         MoeHybridRoutingStats * routing_stats,
-        MoeExpertComputeRuntime * expert_runtime) {
+        MoeExpertComputeRuntime * expert_runtime,
+        bool need_logits = true) {
     const auto step_t0 = Ds4TimingClock::now();
     const int n_embd = w.n_embd;
     const int n_hc = w.n_hc;
@@ -4495,6 +4496,15 @@ static bool deepseek4_step_hybrid(
     if (hot_alloc) ggml_gallocr_free(hot_alloc);
     if (cold_alloc) ggml_gallocr_free(cold_alloc);
 
+    if (!need_logits) {
+        out_logits.clear();
+        cache.cur_pos = kv_start + n_tokens;
+        if (telemetry) {
+            telemetry->total_us += ds4_elapsed_us(step_t0, Ds4TimingClock::now());
+        }
+        return true;
+    }
+
     // ── Output HC pre → norm → logits ───────────────────────────────────
     const auto output_t0 = Ds4TimingClock::now();
     std::vector<float> final_embd((size_t)n_embd * (size_t)n_tokens);
@@ -4576,7 +4586,8 @@ bool deepseek4_step(
         DeepSeek4StepTelemetry * telemetry,
         MoeHybridRoutingStats * routing_stats,
         Ds4VerifyHooks * verify_hooks,
-        MoeExpertComputeRuntime * expert_runtime) {
+        MoeExpertComputeRuntime * expert_runtime,
+        bool need_logits) {
     if (w.moe_hybrid && moe_hybrid != nullptr) {
         if (!deepseek4_cuda_hc_set_device(device)) {
             std::fprintf(stderr,
@@ -4587,13 +4598,13 @@ bool deepseek4_step(
         return deepseek4_step_hybrid(backend, w, cache, *moe_hybrid,
                                      embed, n_tokens, kv_start, out_logits,
                                      token_ids, stream_engine, telemetry, routing_stats,
-                                     expert_runtime);
+                                     expert_runtime, need_logits);
     }
 
     std::vector<float> hc_state;
     return deepseek4_step_layer_range(
         backend, device, w, cache, hc_state, embed, n_tokens, kv_start,
-        0, w.n_layer, &out_logits, token_ids, telemetry,
+        0, w.n_layer, need_logits ? &out_logits : nullptr, token_ids, telemetry,
         /*allow_decode_graph_reuse=*/verify_hooks == nullptr, verify_hooks,
         /*moe_hybrid=*/nullptr, expert_runtime, routing_stats);
 }
