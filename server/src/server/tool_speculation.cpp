@@ -1003,6 +1003,13 @@ bool ToolSpeculationAttempt::collect_executor_result(
             return false;
         }
         if (polled == 0) continue;
+        if (std::chrono::steady_clock::now() >= deadline) {
+            error = "executor_timeout";
+            terminate_executor();
+            wait_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - wait_started).count();
+            return false;
+        }
         if (descriptor.revents & (POLLERR | POLLNVAL)) {
             error = "executor_stdout_failed";
             terminate_executor();

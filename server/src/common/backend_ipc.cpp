@@ -4,6 +4,7 @@
 #include "io_utils.h"
 
 #include <cctype>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
@@ -12,7 +13,6 @@
 #include <array>
 #include <algorithm>
 #include <climits>
-#include <limits>
 #include <string>
 #include <thread>
 #include <vector>
@@ -22,7 +22,6 @@
 #  include <fcntl.h>
 #  include <signal.h>
 #  include <sys/mman.h>
-#  include <sys/resource.h>
 #  include <sys/stat.h>
 #  include <sys/wait.h>
 #  if defined(__linux__)
@@ -36,24 +35,7 @@ namespace dflash::common {
 namespace {
 
 #if !defined(_WIN32)
-unsigned int descriptor_scan_limit() {
-    struct rlimit limit {};
-    if (::getrlimit(RLIMIT_NOFILE, &limit) == 0 &&
-        limit.rlim_cur != RLIM_INFINITY && limit.rlim_cur > 0) {
-        return static_cast<unsigned int>((std::min)(
-            static_cast<uint64_t>(limit.rlim_cur),
-            static_cast<uint64_t>(INT_MAX)));
-    }
-    const long open_max = ::sysconf(_SC_OPEN_MAX);
-    if (open_max <= 0) return 0;
-    return static_cast<unsigned int>((std::min)(
-        static_cast<uint64_t>(open_max),
-        static_cast<uint64_t>(INT_MAX)));
-}
-
-bool close_descriptor_range(unsigned int first,
-                            unsigned int last,
-                            unsigned int scan_limit) {
+bool close_descriptor_range(unsigned int first, unsigned int last) {
     if (first > last) return true;
 #if defined(__linux__) && defined(SYS_close_range)
     int rc = -1;
@@ -62,44 +44,131 @@ bool close_descriptor_range(unsigned int first,
     } while (rc != 0 && errno == EINTR);
     if (rc == 0) return true;
 #endif
-
-    // close_range is Linux-specific and may also be blocked by an older
-    // kernel or seccomp policy. Fall back to the POSIX descriptor space that
-    // was captured before fork, and verify every ambiguous close failure.
-    if (scan_limit == 0 || first >= scan_limit) return scan_limit != 0;
-    const unsigned int upper = (std::min)(last, scan_limit - 1U);
-    for (unsigned int fd = first; fd <= upper; ++fd) {
-        if (::close(static_cast<int>(fd)) == 0 || errno == EBADF) continue;
-        const int close_error = errno;
-        errno = 0;
-        if (::fcntl(static_cast<int>(fd), F_GETFD) < 0 && errno == EBADF) {
-            continue;
-        }
-        errno = close_error;
-        return false;
-    }
-    return true;
+    return false;
 }
 
-bool isolate_child_descriptors(int payload_fd,
-                               int stream_fd,
-                               int shared_fd,
-                               unsigned int scan_limit) {
+bool descriptor_is_kept(const std::array<int, 3> & keep, int fd) {
+    return fd == keep[0] || fd == keep[1] || fd == keep[2];
+}
+
+// close_range can be unavailable on an older kernel or denied by seccomp.
+// Enumerate the descriptors that actually exist instead of trusting the
+// current RLIMIT_NOFILE: a process may have opened a high descriptor before
+// lowering its soft limit. Raw getdents64 keeps this post-fork path free of
+// libc directory-stream allocation and turns an unavailable /proc into a
+// fail-closed launch.
+bool close_unlisted_descriptors(const std::array<int, 3> & keep) {
+#if defined(__linux__) && defined(SYS_getdents64)
+    struct LinuxDirent64 {
+        uint64_t inode;
+        int64_t offset;
+        unsigned short record_bytes;
+        unsigned char type;
+        char name[1];
+    };
+
+    const int directory_fd = ::open(
+        "/proc/self/fd", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (directory_fd < 0) return false;
+
+    alignas(long) char entries[4096];
+    bool ok = true;
+    int failure = 0;
+    while (ok) {
+        long bytes = -1;
+        do {
+            bytes = ::syscall(
+                SYS_getdents64, directory_fd, entries, sizeof(entries));
+        } while (bytes < 0 && errno == EINTR);
+        if (bytes == 0) break;
+        if (bytes < 0) {
+            ok = false;
+            failure = errno;
+            break;
+        }
+
+        size_t cursor = 0;
+        while (cursor < static_cast<size_t>(bytes)) {
+            auto * entry = reinterpret_cast<LinuxDirent64 *>(entries + cursor);
+            constexpr size_t name_offset = offsetof(LinuxDirent64, name);
+            if (static_cast<size_t>(bytes) - cursor <= name_offset ||
+                entry->record_bytes <= name_offset ||
+                entry->record_bytes > static_cast<size_t>(bytes) - cursor) {
+                ok = false;
+                failure = EIO;
+                break;
+            }
+            const size_t name_bytes = entry->record_bytes - name_offset;
+            const char * terminator = static_cast<const char *>(
+                std::memchr(entry->name, '\0', name_bytes));
+            if (!terminator) {
+                ok = false;
+                failure = EIO;
+                break;
+            }
+
+            uint64_t parsed = 0;
+            bool numeric = terminator != entry->name;
+            for (const char * digit = entry->name; digit < terminator; ++digit) {
+                if (*digit < '0' || *digit > '9') {
+                    numeric = false;
+                    break;
+                }
+                parsed = parsed * 10U + static_cast<unsigned int>(*digit - '0');
+                if (parsed > static_cast<uint64_t>(INT_MAX)) {
+                    numeric = false;
+                    break;
+                }
+            }
+            if (numeric) {
+                const int fd = static_cast<int>(parsed);
+                if (fd > STDERR_FILENO && fd != directory_fd &&
+                    !descriptor_is_kept(keep, fd) &&
+                    ::close(fd) != 0 && errno != EBADF) {
+                    const int close_error = errno;
+                    errno = 0;
+                    if (!(::fcntl(fd, F_GETFD) < 0 && errno == EBADF)) {
+                        ok = false;
+                        failure = close_error;
+                        break;
+                    }
+                }
+            }
+            cursor += entry->record_bytes;
+        }
+    }
+
+    if (::close(directory_fd) != 0 && ok) {
+        ok = false;
+        failure = errno;
+    }
+    if (!ok) errno = failure == 0 ? EIO : failure;
+    return ok;
+#else
+    (void)keep;
+    errno = ENOTSUP;
+    return false;
+#endif
+}
+
+bool isolate_child_descriptors(
+        int payload_fd, int stream_fd, int shared_fd) {
     std::array<int, 3> keep{payload_fd, stream_fd, shared_fd};
     std::sort(keep.begin(), keep.end());
     unsigned int first = STDERR_FILENO + 1;
     int previous = -1;
+    bool ranges_closed = true;
     for (const int fd : keep) {
         if (fd < static_cast<int>(first) || fd == previous) continue;
-        if (!close_descriptor_range(
-                first, static_cast<unsigned int>(fd - 1), scan_limit)) {
-            return false;
+        if (!close_descriptor_range(first, static_cast<unsigned int>(fd - 1))) {
+            ranges_closed = false;
+            break;
         }
         first = static_cast<unsigned int>(fd) + 1U;
         previous = fd;
     }
-    return close_descriptor_range(
-        first, (std::numeric_limits<unsigned int>::max)(), scan_limit);
+    if (ranges_closed && close_descriptor_range(first, UINT_MAX)) return true;
+    return close_unlisted_descriptors(keep);
 }
 #endif
 
@@ -191,15 +260,6 @@ bool BackendIpcProcess::start(const BackendIpcLaunchConfig & cfg) {
     close();
     if (cfg.bin.empty() || cfg.payload_path.empty()) return false;
     if (!init_work_dir(cfg.work_dir, cfg.require_private_work_dir)) return false;
-    const unsigned int descriptor_limit = cfg.isolate_inherited_fds
-        ? descriptor_scan_limit() : 0;
-    if (cfg.isolate_inherited_fds && descriptor_limit == 0) {
-        std::fprintf(stderr,
-                     "backend-ipc cannot determine descriptor scan limit\n");
-        close();
-        return false;
-    }
-
     int cmd_pipe[2] = {-1, -1};
     int payload_pipe[2] = {-1, -1};
     int stream_pipe[2] = {-1, -1};
@@ -295,8 +355,7 @@ bool BackendIpcProcess::start(const BackendIpcLaunchConfig & cfg) {
         argv.push_back(nullptr);
         if (cfg.isolate_inherited_fds &&
             !isolate_child_descriptors(
-                payload_pipe[0], stream_pipe[1], shared_payload_fd_,
-                descriptor_limit)) {
+                payload_pipe[0], stream_pipe[1], shared_payload_fd_)) {
             std::fprintf(stderr,
                          "backend-ipc descriptor isolation failed: %s\n",
                          std::strerror(errno));

@@ -21,6 +21,8 @@ namespace dflash::common {
 
 namespace {
 
+constexpr size_t kMaxAddedTokenBytes = 4096;
+
 bool preprocessing_deadline_expired(
         const std::chrono::steady_clock::time_point * deadline,
         size_t & operations,
@@ -666,6 +668,13 @@ bool Tokenizer::load_from_gguf(const char * model_path) {
             if (ttype == 3 || ttype == 4) {
                 const std::string & tok = id_to_token_[i];
                 if (!tok.empty()) {
+                    if (tok.size() > kMaxAddedTokenBytes) {
+                        std::fprintf(stderr,
+                            "[tokenizer] special token %d exceeds %zu-byte limit\n",
+                            i, kMaxAddedTokenBytes);
+                        gguf_free(gctx);
+                        return false;
+                    }
                     added_tokens_.push_back({tok, (int32_t)i});
                 }
             }

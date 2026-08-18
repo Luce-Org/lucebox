@@ -2017,6 +2017,25 @@ TEST_CASE(ServerUnitFixture, test_tokenizer_added_token_search_obeys_deadline) {
     unlink(path.c_str());
 }
 
+TEST_CASE(ServerUnitFixture, test_tokenizer_rejects_oversized_added_token) {
+    gguf_context * fixture = gguf_init_empty();
+    const std::string oversized(4097U, 'x');
+    const char * tokens[] = {"x", oversized.c_str()};
+    const uint32_t token_types[] = {1, 3};
+    gguf_set_arr_str(fixture, "tokenizer.ggml.tokens", tokens, 2);
+    gguf_set_arr_data(fixture, "tokenizer.ggml.token_type", GGUF_TYPE_UINT32,
+                      token_types, sizeof(token_types));
+    gguf_set_val_str(fixture, "tokenizer.ggml.model", "gpt2");
+    gguf_set_val_str(fixture, "tokenizer.ggml.pre", "qwen35");
+    const std::string path = "/tmp/dflash_test_oversized_special_token.gguf";
+    gguf_write_to_file(fixture, path.c_str(), /*only_meta=*/false);
+    gguf_free(fixture);
+
+    Tokenizer tokenizer;
+    TEST_ASSERT(!tokenizer.load_from_gguf(path.c_str()));
+    unlink(path.c_str());
+}
+
 TEST_CASE(ServerUnitFixture, test_hash_prefix_deterministic) {
     std::vector<int32_t> ids = {100, 200, 300, 400, 500};
     auto h1 = hash_prefix(ids.data(), (int)ids.size());
@@ -2907,6 +2926,39 @@ TEST_CASE(ServerUnitFixture, test_normalize_responses_tool_followup_messages) {
         TEST_ASSERT(chat_msgs[3].tool_call_id == call_id);
         TEST_ASSERT(chat_msgs[3].content == "Process exited with code 0");
     }
+    const json predictor_messages =
+        http_detail::canonical_predictor_messages(std::move(chat_msgs));
+    TEST_ASSERT(predictor_messages.size() == 4);
+    TEST_ASSERT(predictor_messages[2]["role"] == "assistant");
+    TEST_ASSERT(predictor_messages[2]["content"] == raw_tool_call);
+    TEST_ASSERT(predictor_messages[3]["role"] == "tool");
+    TEST_ASSERT(predictor_messages[3]["content"] ==
+                "Process exited with code 0");
+    TEST_ASSERT(predictor_messages[3]["tool_call_id"] == call_id);
+
+    const json predictor_tools = json::array({{
+        {"type", "function"},
+        {"function", {
+            {"name", "exec_command"},
+            {"parameters", {
+                {"type", "object"},
+                {"properties", {{"cmd", {{"type", "string"}}}}},
+            }},
+        }},
+    }});
+    std::string predictor_error;
+    const auto predictor_request = build_semantic_tool_predictor_request(
+        predictor_messages, predictor_tools, "required", "native-qwen3", 32,
+        predictor_error);
+    TEST_ASSERT(predictor_request.has_value());
+    const std::string predictor_prompt =
+        build_native_semantic_tool_predictor_prompt(
+            *predictor_request, predictor_error);
+    TEST_ASSERT(predictor_error.empty());
+    TEST_ASSERT(predictor_prompt.find(raw_tool_call) != std::string::npos);
+    TEST_ASSERT(predictor_prompt.find(
+        "<tool_response>\nProcess exited with code 0\n</tool_response>") !=
+        std::string::npos);
 }
 
 // ═══════════════════════════════════════════════════════════════════════

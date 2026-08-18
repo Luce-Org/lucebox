@@ -32,19 +32,17 @@ json production_tools() {
 )json");
 }
 
-json make_request(const std::string & prompt, const json & tools,
-                  int32_t max_tokens) {
-    return {
-        {"model", "native-qwen3"},
-        {"messages", json::array({{
+std::optional<SemanticToolPredictorRequest> make_request(
+        const std::string & prompt,
+        const json & tools,
+        int32_t max_tokens,
+        std::string & error) {
+    return build_semantic_tool_predictor_request(
+        json::array({{
             {"role", "user"},
             {"content", prompt},
-        }})},
-        {"tools", tools},
-        {"tool_choice", "required"},
-        {"temperature", 0},
-        {"max_tokens", max_tokens},
-    };
+        }}),
+        tools, "required", "native-qwen3", max_tokens, error);
 }
 
 std::vector<Case> production_cases() {
@@ -141,8 +139,13 @@ int main(int argc, char ** argv) {
     if (argc > 4) {
         const std::string prompt = argv[4];
         std::string generated;
-        const auto prediction = predictor->predict(
-            make_request(prompt, tools, config.max_tokens), tools, &generated);
+        const auto request = make_request(
+            prompt, tools, config.max_tokens, error);
+        if (!request.has_value()) {
+            std::fprintf(stderr, "request rejected: %s\n", error.c_str());
+            return 1;
+        }
+        const auto prediction = predictor->predict(*request, tools, &generated);
         print_prediction("custom", prediction, "", ordered_json::object(),
                          generated);
         return prediction.ok ? 0 : 1;
@@ -156,9 +159,13 @@ int main(int argc, char ** argv) {
     std::vector<double> walls;
     for (const Case & test_case : cases) {
         std::string generated;
-        const auto prediction = predictor->predict(
-            make_request(test_case.prompt, tools, config.max_tokens), tools,
-            &generated);
+        const auto request = make_request(
+            test_case.prompt, tools, config.max_tokens, error);
+        if (!request.has_value()) {
+            std::fprintf(stderr, "request rejected: %s\n", error.c_str());
+            return 1;
+        }
+        const auto prediction = predictor->predict(*request, tools, &generated);
         print_prediction(test_case.id, prediction, test_case.expected_name,
                          test_case.expected_arguments, generated);
         valid += prediction.ok ? 1 : 0;

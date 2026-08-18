@@ -372,26 +372,33 @@ def stop_executor(handle: dict[str, Any]) -> None:
         except PermissionError:
             return True
 
+    def wait_for_group_exit(timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        while group_exists():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            if process.poll() is None:
+                try:
+                    process.wait(timeout=min(0.01, remaining))
+                except subprocess.TimeoutExpired:
+                    pass
+            else:
+                time.sleep(min(0.01, remaining))
+        return True
+
     try:
         os.killpg(pgid, signal.SIGTERM)
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):
         pass
 
-    grace_deadline = time.monotonic() + 1.0
-    while group_exists() and time.monotonic() < grace_deadline:
-        if process.poll() is None:
-            try:
-                process.wait(timeout=0.01)
-            except subprocess.TimeoutExpired:
-                pass
-        else:
-            time.sleep(0.01)
-
-    if group_exists():
+    if not wait_for_group_exit(1.0):
         try:
             os.killpg(pgid, signal.SIGKILL)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             pass
+        if not wait_for_group_exit(5.0):
+            raise RuntimeError("CPU executor process group did not stop")
 
     if process.poll() is None:
         try:

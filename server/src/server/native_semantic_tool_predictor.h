@@ -22,7 +22,8 @@ public:
     NativeSemanticToolPredictor & operator=(
         const NativeSemanticToolPredictor &) = delete;
 
-    SemanticToolPrediction predict(const json & predictor_request,
+    SemanticToolPrediction predict(
+                                   const SemanticToolPredictorRequest & predictor_request,
                                    const json & request_tools,
                                    std::string * generated_text = nullptr);
 

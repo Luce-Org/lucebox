@@ -38,7 +38,7 @@ NativeSemanticToolPredictor::create(
 }
 
 SemanticToolPrediction NativeSemanticToolPredictor::predict(
-        const json & predictor_request,
+        const SemanticToolPredictorRequest & predictor_request,
         const json & request_tools,
         std::string * generated_text) {
     const auto started = std::chrono::steady_clock::now();
@@ -89,6 +89,10 @@ SemanticToolPrediction NativeSemanticToolPredictor::predict(
     std::vector<int32_t> output_ids;
     if (!ipc_.predict(prompt_ids, config_.max_tokens, remaining_ms,
                       output_ids, prediction.error)) {
+        return finish();
+    }
+    if (std::chrono::steady_clock::now() >= deadline) {
+        prediction.error = "native_predictor_timeout";
         return finish();
     }
     const std::string generated = tokenizer_.decode(output_ids);

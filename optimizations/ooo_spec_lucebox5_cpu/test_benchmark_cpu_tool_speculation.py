@@ -52,6 +52,50 @@ class CpuToolSpeculationBenchmarkTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "did not stop"):
                 stop_executor({"process": process, "pgid": 4321})
 
+    def test_stop_executor_waits_for_group_after_sigkill(self) -> None:
+        process = Mock(pid=4321)
+        process.poll.return_value = 0
+        alive = True
+
+        def kill_group(_pgid: int, sent_signal: int) -> None:
+            nonlocal alive
+            if sent_signal == signal.SIGKILL:
+                alive = False
+            elif sent_signal == 0 and not alive:
+                raise ProcessLookupError
+
+        with (
+            patch(
+                "benchmark_cpu_tool_speculation.os.killpg",
+                side_effect=kill_group,
+            ) as killpg,
+            patch(
+                "benchmark_cpu_tool_speculation.time.monotonic",
+                side_effect=[0.0, 2.0, 3.0],
+            ),
+        ):
+            stop_executor({"process": process, "pgid": 4321})
+
+        calls = [call.args[1] for call in killpg.call_args_list]
+        self.assertEqual(calls, [signal.SIGTERM, 0, signal.SIGKILL, 0])
+
+    def test_stop_executor_reports_permission_failure_cleanly(self) -> None:
+        process = Mock(pid=4321)
+        process.poll.return_value = 0
+
+        with (
+            patch(
+                "benchmark_cpu_tool_speculation.os.killpg",
+                side_effect=PermissionError,
+            ),
+            patch(
+                "benchmark_cpu_tool_speculation.time.monotonic",
+                side_effect=[0.0, 2.0, 3.0, 9.0],
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "did not stop"):
+                stop_executor({"process": process, "pgid": 4321})
+
     def test_cpu_list_parser_canonicalizes_ranges(self) -> None:
         self.assertEqual(parse_cpu_list("30-31,15,14-15"), [14, 15, 30, 31])
         with self.assertRaises(argparse.ArgumentTypeError):

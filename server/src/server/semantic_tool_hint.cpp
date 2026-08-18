@@ -281,6 +281,41 @@ std::string forced_tool_name(const json & choice) {
     return choice.value("name", "");
 }
 
+json canonical_semantic_tools(const json & tools) {
+    json canonical = json::array();
+    if (!tools.is_array()) return canonical;
+    for (const auto & tool : tools) {
+        if (!tool.is_object()) continue;
+        const json * source = &tool;
+        const auto wrapped = tool.find("function");
+        if (wrapped != tool.end() && wrapped->is_object()) source = &*wrapped;
+        const std::string name = source->value("name", "");
+        if (name.empty()) continue;
+
+        json function = {{"name", name}};
+        const auto description = source->find("description");
+        if (description != source->end() && description->is_string()) {
+            function["description"] = *description;
+        }
+        for (const char * schema_key : {"parameters", "input_schema"}) {
+            const auto schema = source->find(schema_key);
+            if (schema != source->end() && schema->is_object()) {
+                function["parameters"] = *schema;
+                break;
+            }
+        }
+        const auto strict = source->find("strict");
+        if (strict != source->end() && strict->is_boolean()) {
+            function["strict"] = *strict;
+        }
+        canonical.push_back({
+            {"type", "function"},
+            {"function", std::move(function)},
+        });
+    }
+    return canonical;
+}
+
 }  // namespace
 
 bool parse_semantic_tool_prediction(
@@ -384,7 +419,8 @@ bool materialize_declared_tool_defaults(
     return true;
 }
 
-json build_semantic_tool_predictor_request(
+std::optional<SemanticToolPredictorRequest>
+build_semantic_tool_predictor_request(
         const json & messages,
         const json & tools,
         const json & tool_choice,
@@ -412,7 +448,7 @@ json build_semantic_tool_predictor_request(
             effective_choice, nullptr, request_budget, 0,
             budget_operations, budget_timed_out)) {
         error = "predictor_request_too_large";
-        return nullptr;
+        return std::nullopt;
     }
     json request = {
         {"model", sidecar_model},
@@ -420,14 +456,27 @@ json build_semantic_tool_predictor_request(
         {"temperature", 0},
         {"max_tokens", max_tokens},
         {"messages", messages},
-        {"tools", tools},
+        {"tools", canonical_semantic_tools(tools)},
         {"tool_choice", effective_choice},
     };
-    return request;
+    // Tool-schema normalization can add OpenAI wrapper objects. Validate the
+    // canonical result once before granting the bounded-request type; native
+    // rendering then relies on that type instead of scanning the same payload
+    // for a third time.
+    size_t canonical_budget = kMaxNativePredictorRequestBytes;
+    size_t canonical_operations = 0;
+    bool canonical_timed_out = false;
+    if (!semantic_json_within_budget(
+            request, nullptr, canonical_budget, 0,
+            canonical_operations, canonical_timed_out)) {
+        error = "predictor_request_too_large";
+        return std::nullopt;
+    }
+    return SemanticToolPredictorRequest(std::move(request));
 }
 
 std::string build_native_semantic_tool_predictor_prompt(
-        const json & predictor_request,
+        const SemanticToolPredictorRequest & bounded_request,
         std::string & error,
         const std::chrono::steady_clock::time_point * deadline) {
     error.clear();
@@ -435,17 +484,7 @@ std::string build_native_semantic_tool_predictor_prompt(
         error = "native_predictor_timeout";
         return {};
     }
-    size_t request_budget = kMaxNativePredictorRequestBytes;
-    size_t budget_operations = 0;
-    bool budget_timed_out = false;
-    if (!semantic_json_within_budget(
-            predictor_request, deadline, request_budget, 0,
-            budget_operations, budget_timed_out)) {
-        error = budget_timed_out
-            ? "native_predictor_timeout"
-            : "native_predictor_request_too_large";
-        return {};
-    }
+    const json & predictor_request = bounded_request.payload();
     const json choice = predictor_request.value("tool_choice", json("auto"));
     if ((choice.is_string() && choice.get<std::string>() == "none") ||
         (choice.is_object() && choice.value("type", "") == "none")) {

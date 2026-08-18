@@ -553,6 +553,7 @@ bool semantic_sidecar_send_all(
             (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL))) {
             return false;
         }
+        if (std::chrono::steady_clock::now() >= deadline) return false;
 #if defined(_WIN32)
         const int n = ::send(
             fd, data + sent,
@@ -629,7 +630,8 @@ bool semantic_sidecar_connect(
     }
     int socket_error = 0;
     socklen_t error_size = static_cast<socklen_t>(sizeof(socket_error));
-    if (polled <= 0 || !(descriptor.revents & POLLOUT) ||
+    if (std::chrono::steady_clock::now() >= deadline ||
+        polled <= 0 || !(descriptor.revents & POLLOUT) ||
         getsockopt(fd, SOL_SOCKET, SO_ERROR,
                    reinterpret_cast<char *>(&socket_error), &error_size) != 0 ||
         socket_error != 0) {
@@ -749,6 +751,11 @@ SemanticToolPrediction request_semantic_tool_prediction(
             prediction.error = "predictor_receive_failed";
             return finish();
         }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            socket_close(fd);
+            prediction.error = "predictor_timeout";
+            return finish();
+        }
 #if defined(_WIN32)
         const int received = recv(
             fd, buffer.data(), static_cast<int>(buffer.size()), 0);
@@ -827,13 +834,13 @@ SemanticToolPrediction request_semantic_tool_prediction(
 
 SemanticToolPrediction predict_semantic_tool_call(
         const SemanticToolPredictorConfig & config,
-        const json & payload,
+        const SemanticToolPredictorRequest & request,
         const json & request_tools,
         const std::shared_ptr<NativeSemanticToolPredictor> & native) {
     const auto started = std::chrono::steady_clock::now();
     SemanticToolPrediction native_result;
     if (native && native->active()) {
-        native_result = native->predict(payload, request_tools);
+        native_result = native->predict(request, request_tools);
         if (native_result.ok || !config.http_enabled()) {
             return native_result;
         }
@@ -862,7 +869,7 @@ SemanticToolPrediction predict_semantic_tool_call(
     SemanticToolPredictorConfig fallback_config = config;
     fallback_config.timeout_ms = remaining_ms;
     SemanticToolPrediction fallback = request_semantic_tool_prediction(
-        fallback_config, payload, request_tools);
+        fallback_config, request.payload(), request_tools);
     if (!fallback.ok && !native_result.error.empty()) {
         fallback.error = "native=" + native_result.error +
                          ";http=" + fallback.error;
@@ -1481,6 +1488,25 @@ std::vector<ChatMessage> normalize_chat_messages(
 
     return chat_msgs;
 }
+
+namespace http_detail {
+
+json canonical_predictor_messages(std::vector<ChatMessage> messages) {
+    json canonical = json::array();
+    for (ChatMessage & message : messages) {
+        json item = {
+            {"role", std::move(message.role)},
+            {"content", std::move(message.content)},
+        };
+        if (!message.tool_call_id.empty()) {
+            item["tool_call_id"] = std::move(message.tool_call_id);
+        }
+        canonical.push_back(std::move(item));
+    }
+    return canonical;
+}
+
+}  // namespace http_detail
 
 // ─── Disk-cache identity salt ───────────────────────────────────────────
 // Compute a 16-byte salt from inputs that affect KV cache validity:
@@ -2496,19 +2522,36 @@ void HttpServer::start_automatic_tool_speculation(ParsedRequest & req) const {
     auto & launch = *req.automatic_tool_speculation;
     const SemanticToolPredictorConfig predictor =
         config_.semantic_tool_predictor;
+    const auto native = native_semantic_predictor_;
+    auto log_completion = [&]() {
+        std::fprintf(stderr,
+            "[tool-hint] predictor complete transport=%s%s tools=%zu "
+            "execute=%s wall_ms=%.1f\n",
+            native ? "native-qwen3" : "http",
+            native && predictor.http_enabled() ? "+http-fallback" : "",
+            json_array_size(req.tools), launch.attempt ? "true" : "false",
+            launch.predictor_wall_ms);
+    };
+    const auto preflight_started = std::chrono::steady_clock::now();
     std::string payload_error;
-    const json payload = build_semantic_tool_predictor_request(
-        req.messages, req.tools, req.tool_choice,
+    const json & predictor_messages = req.predictor_messages.is_array()
+        ? req.predictor_messages : req.messages;
+    const auto payload = build_semantic_tool_predictor_request(
+        predictor_messages, req.tools, req.tool_choice,
         predictor.model.empty() ? "native-qwen3" : predictor.model,
         predictor.max_tokens, payload_error);
-    if (!payload_error.empty()) {
-        launch.predictor_error = std::move(payload_error);
+    if (!payload.has_value()) {
+        launch.predictor_error = payload_error.empty()
+            ? "predictor_request_invalid" : std::move(payload_error);
+        launch.prediction_source = "request-preflight";
+        launch.predictor_wall_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - preflight_started).count();
+        log_completion();
         return;
     }
-    const auto native = native_semantic_predictor_;
     try {
         const SemanticToolPrediction semantic = predict_semantic_tool_call(
-            predictor, payload, req.tools, native);
+            predictor, *payload, req.tools, native);
         launch.predictor_wall_ms = semantic.wall_ms;
         launch.prediction_source = semantic.source;
         if (!semantic.ok) {
@@ -2537,13 +2580,7 @@ void HttpServer::start_automatic_tool_speculation(ParsedRequest & req) const {
         launch.predictor_error =
             "automatic_prediction_failed: unknown error";
     }
-    std::fprintf(stderr,
-        "[tool-hint] predictor complete transport=%s%s tools=%zu "
-        "execute=%s wall_ms=%.1f\n",
-        native ? "native-qwen3" : "http",
-        native && predictor.http_enabled() ? "+http-fallback" : "",
-        json_array_size(req.tools), launch.attempt ? "true" : "false",
-        launch.predictor_wall_ms);
+    log_completion();
 }
 
 void HttpServer::enqueue_request_and_wait(SocketHandle fd, ParsedRequest req) {
@@ -2626,6 +2663,18 @@ bool HttpServer::route_request(SocketHandle fd, const HttpRequest & hr) {
         }
 
         if (!render_and_tokenize_request(fd, render_messages, req)) return true;
+
+        if (config_.semantic_tool_predictor.enabled() &&
+            config_.tool_speculation.enabled() &&
+            config_.pflash_upstream_base.empty() &&
+            req.automatic_tool_speculation_enabled &&
+            !req.tool_speculation.has_value() &&
+            !http_detail::tool_choice_disables_tool_calls(req.tool_choice) &&
+            !req.tools.empty()) {
+            req.predictor_messages =
+                http_detail::canonical_predictor_messages(
+                    std::move(render_messages));
+        }
 
         // count_tokens: short-circuit after tokenization. Skip generation
         // entirely — Anthropic's contract is just {"input_tokens": N}.

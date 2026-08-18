@@ -5,7 +5,9 @@
 #include <nlohmann/json.hpp>
 
 #include <chrono>
+#include <optional>
 #include <string>
+#include <utility>
 
 namespace dflash::common {
 
@@ -48,6 +50,25 @@ struct SemanticToolPrediction {
     double wall_ms = 0.0;
 };
 
+// A predictor payload that has passed the recursive byte/depth admission gate.
+// Keeping construction private makes the native prompt renderer's bounded-input
+// invariant explicit and prevents accidental duplicate validation work.
+class SemanticToolPredictorRequest {
+public:
+    const json & payload() const { return payload_; }
+
+private:
+    explicit SemanticToolPredictorRequest(json payload)
+        : payload_(std::move(payload)) {}
+
+    friend std::optional<SemanticToolPredictorRequest>
+    build_semantic_tool_predictor_request(
+        const json &, const json &, const json &, const std::string &, int,
+        std::string &);
+
+    json payload_;
+};
+
 // Parse one OpenAI-compatible sidecar response and reject calls whose
 // function name is absent from the request schema.  Arguments remain decoded
 // JSON values; sidecar token IDs are never accepted by the target.
@@ -69,7 +90,8 @@ bool materialize_declared_tool_defaults(
 // Build the bounded OpenAI-compatible request sent to the predictor. Only
 // normalized dialogue/tool semantics are copied; target-only extensions are
 // omitted. Oversized inputs fail before any full-field copy.
-json build_semantic_tool_predictor_request(
+std::optional<SemanticToolPredictorRequest>
+build_semantic_tool_predictor_request(
     const json & messages,
     const json & tools,
     const json & tool_choice,
@@ -80,7 +102,7 @@ json build_semantic_tool_predictor_request(
 // Native predictor bridge. The prompt uses the Qwen tool template and the
 // decoded response is parsed semantically before any target token IDs exist.
 std::string build_native_semantic_tool_predictor_prompt(
-    const json & predictor_request,
+    const SemanticToolPredictorRequest & predictor_request,
     std::string & error,
     const std::chrono::steady_clock::time_point * deadline = nullptr);
 

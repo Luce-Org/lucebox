@@ -176,15 +176,17 @@ TEST_CASE(SemanticToolHintFixture, predictor_request_forwards_only_semantics) {
         {"prefix_cache", {{"scope", "full"}}},
     };
     std::string error;
-    const json request = build_semantic_tool_predictor_request(
+    const auto request = build_semantic_tool_predictor_request(
         target["messages"], target["tools"], target["tool_choice"],
         "Qwen3-0.6B", 32, error);
     CHECK(error.empty());
-    CHECK(request["model"] == "Qwen3-0.6B");
-    CHECK(request["max_tokens"] == 32);
-    CHECK(request["tool_choice"] == "required");
-    CHECK(!request.contains("tool_speculation"));
-    CHECK(!request.contains("prefix_cache"));
+    REQUIRE(request.has_value());
+    const json & payload = request->payload();
+    CHECK(payload["model"] == "Qwen3-0.6B");
+    CHECK(payload["max_tokens"] == 32);
+    CHECK(payload["tool_choice"] == "required");
+    CHECK(!payload.contains("tool_speculation"));
+    CHECK(!payload.contains("prefix_cache"));
 }
 
 TEST_CASE(SemanticToolHintFixture, predictor_request_rejects_oversized_fields_before_copy) {
@@ -193,10 +195,42 @@ TEST_CASE(SemanticToolHintFixture, predictor_request_rejects_oversized_fields_be
         {"content", std::string(300U * 1024U, 'x')},
     }});
     std::string error;
-    const json request = build_semantic_tool_predictor_request(
+    const auto request = build_semantic_tool_predictor_request(
         messages, weather_tools(), nullptr, "Qwen3-0.6B", 32, error);
-    CHECK(request.is_null());
+    CHECK(!request.has_value());
     CHECK(error == "predictor_request_too_large");
+
+    const json small_messages = json::array({{
+        {"role", "user"}, {"content", "weather"},
+    }});
+    json oversized_tools = weather_tools();
+    oversized_tools[0]["function"]["description"] =
+        std::string(300U * 1024U, 'x');
+    const auto oversized_tool_request = build_semantic_tool_predictor_request(
+        small_messages, oversized_tools, nullptr, "Qwen3-0.6B", 32, error);
+    CHECK(!oversized_tool_request.has_value());
+    CHECK(error == "predictor_request_too_large");
+}
+
+TEST_CASE(SemanticToolHintFixture, predictor_request_canonicalizes_anthropic_tools) {
+    const json tools = json::array({{
+        {"name", "get_weather"},
+        {"description", "Read weather"},
+        {"input_schema", {
+            {"type", "object"},
+            {"properties", {{"city", {{"type", "string"}}}}},
+        }},
+    }});
+    std::string error;
+    const auto request = build_semantic_tool_predictor_request(
+        json::array({{{"role", "user"}, {"content", "weather"}}}),
+        tools, nullptr, "Qwen3-0.6B", 32, error);
+    REQUIRE(request.has_value());
+    const json & canonical = request->payload()["tools"][0];
+    CHECK(canonical["type"] == "function");
+    CHECK(canonical["function"]["name"] == "get_weather");
+    CHECK(canonical["function"].contains("parameters"));
+    CHECK(!canonical["function"].contains("input_schema"));
 }
 
 TEST_CASE(SemanticToolHintFixture, native_predictor_config_is_independent_of_http) {
@@ -209,31 +243,24 @@ TEST_CASE(SemanticToolHintFixture, native_predictor_config_is_independent_of_htt
 }
 
 TEST_CASE(SemanticToolHintFixture, native_prompt_honors_tool_choice_none) {
-    const json request = {
-        {"messages", json::array({{
-            {"role", "user"},
-            {"content", "Do not call a tool"},
-        }})},
-        {"tools", weather_tools()},
-        {"tool_choice", "none"},
-    };
     std::string error;
-    CHECK(build_native_semantic_tool_predictor_prompt(request, error).empty());
+    const auto request = build_semantic_tool_predictor_request(
+        json::array({{{"role", "user"}, {"content", "Do not call a tool"}}}),
+        weather_tools(), "none", "Qwen3-0.6B", 32, error);
+    REQUIRE(request.has_value());
+    CHECK(build_native_semantic_tool_predictor_prompt(*request, error).empty());
     CHECK(error == "native_predictor_tool_choice_none");
 }
 
 TEST_CASE(SemanticToolHintFixture, native_prompt_uses_qwen_tool_contract) {
-    const json request = {
-        {"messages", json::array({{
-            {"role", "user"},
-            {"content", "What is the weather in Rome?"},
-        }})},
-        {"tools", weather_tools()},
-        {"tool_choice", "required"},
-    };
     std::string error;
+    const auto request = build_semantic_tool_predictor_request(
+        json::array({{{"role", "user"},
+                      {"content", "What is the weather in Rome?"}}}),
+        weather_tools(), "required", "Qwen3-0.6B", 32, error);
+    REQUIRE(request.has_value());
     const std::string prompt =
-        build_native_semantic_tool_predictor_prompt(request, error);
+        build_native_semantic_tool_predictor_prompt(*request, error);
     CHECK(error.empty());
     CHECK(prompt.find("You must call exactly one available function.") !=
           std::string::npos);
@@ -247,38 +274,16 @@ TEST_CASE(SemanticToolHintFixture, native_prompt_uses_qwen_tool_contract) {
 }
 
 TEST_CASE(SemanticToolHintFixture, native_prompt_honors_preprocessing_deadline) {
-    const json request = {
-        {"messages", json::array({{{"role", "user"}, {"content", "weather"}}})},
-        {"tools", weather_tools()},
-    };
+    std::string error;
+    const auto request = build_semantic_tool_predictor_request(
+        json::array({{{"role", "user"}, {"content", "weather"}}}),
+        weather_tools(), nullptr, "Qwen3-0.6B", 32, error);
+    REQUIRE(request.has_value());
     const auto expired = std::chrono::steady_clock::now() -
         std::chrono::milliseconds(1);
-    std::string error;
     CHECK(build_native_semantic_tool_predictor_prompt(
-              request, error, &expired).empty());
+              *request, error, &expired).empty());
     CHECK(error == "native_predictor_timeout");
-}
-
-TEST_CASE(SemanticToolHintFixture, native_prompt_rejects_oversized_input_before_rendering) {
-    json request = {
-        {"messages", json::array({{{"role", "user"}, {"content", "weather"}}})},
-        {"tools", weather_tools()},
-    };
-    const std::string oversized(300U * 1024U, 'x');
-    const auto deadline = std::chrono::steady_clock::now() +
-        std::chrono::seconds(5);
-    std::string error;
-
-    request["messages"][0]["content"] = oversized;
-    CHECK(build_native_semantic_tool_predictor_prompt(
-              request, error, &deadline).empty());
-    CHECK(error == "native_predictor_request_too_large");
-
-    request["messages"][0]["content"] = "weather";
-    request["tools"][0]["function"]["description"] = oversized;
-    CHECK(build_native_semantic_tool_predictor_prompt(
-              request, error, &deadline).empty());
-    CHECK(error == "native_predictor_request_too_large");
 }
 
 TEST_CASE(SemanticToolHintFixture, parses_native_qwen_xml_semantics) {

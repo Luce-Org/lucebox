@@ -264,6 +264,11 @@ bool should_clamp_flowkv_disk_cache(
 // True for API dialects that explicitly prohibit a tool call. Used before
 // either caller-supplied or automatic speculative execution can start.
 bool tool_choice_disables_tool_calls(const json & tool_choice);
+// Convert the exact normalized dialogue rendered for the target into the
+// OpenAI-compatible message shape consumed by semantic predictors. The input
+// is taken by value so callers can move the rendered message storage into the
+// predictor payload without another full content copy.
+json canonical_predictor_messages(std::vector<ChatMessage> messages);
 
 }  // namespace http_detail
 
@@ -282,6 +287,11 @@ struct ParsedRequest {
     json                      tool_choice;
     // Original messages (for response formatting)
     json                      messages;
+    // Canonical dialogue used by the semantic predictor. Responses API
+    // function_call/function_call_output items are represented here as the
+    // assistant/tool turns seen by the target instead of disappearing during
+    // predictor prompt construction.
+    json                      predictor_messages;
     // Original request body (for upstream proxy forwarding)
     json                      raw_body;
     // Concrete invocation predicted by a caller or future semantic sidecar.

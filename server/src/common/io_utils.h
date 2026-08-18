@@ -137,17 +137,27 @@ static inline bool read_exact_fd_until(
                 deadline - now).count();
         pollfd descriptor{fd, POLLIN | POLLHUP, 0};
         const int wait_ms = static_cast<int>((std::min)(
-            int64_t{INT_MAX}, (std::max)(int64_t{1}, remaining)));
+            int64_t{INT_MAX}, (std::max)(int64_t{0}, remaining)));
         const int polled = ::poll(&descriptor, 1, wait_ms);
         if (polled == 0) {
-            timed_out = true;
-            return false;
+            if (std::chrono::steady_clock::now() >= deadline) {
+                timed_out = true;
+                return false;
+            }
+            continue;
         }
         if (polled < 0) {
             if (errno == EINTR) continue;
             return false;
         }
         if (descriptor.revents & (POLLERR | POLLNVAL)) return false;
+        // Readiness does not extend the wall-clock budget. In particular, a
+        // descriptor that becomes readable during poll's final millisecond
+        // must not be consumed after the deadline.
+        if (std::chrono::steady_clock::now() >= deadline) {
+            timed_out = true;
+            return false;
+        }
         const ssize_t count = ::read(
             fd, cursor + received, bytes - received);
         if (count == 0) return false;

@@ -202,6 +202,11 @@ bool Qwen3ToolPredictorIpcClient::predict(
         active_ = false;
         return false;
     }
+    if (std::chrono::steady_clock::now() >= deadline) {
+        output_ids.clear();
+        error = "native_predictor_timeout";
+        return false;
+    }
     return true;
 #endif
 }
