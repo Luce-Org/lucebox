@@ -3,6 +3,7 @@
 #include "backend_ipc.h"
 #include "io_utils.h"
 
+#include <cctype>
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
@@ -19,9 +20,9 @@
 #if !defined(_WIN32)
 #  include <cerrno>
 #  include <fcntl.h>
-#  include <poll.h>
 #  include <signal.h>
 #  include <sys/mman.h>
+#  include <sys/resource.h>
 #  include <sys/stat.h>
 #  include <sys/wait.h>
 #  if defined(__linux__)
@@ -35,77 +36,70 @@ namespace dflash::common {
 namespace {
 
 #if !defined(_WIN32)
-bool read_exact_with_timeout(int fd, void * data, size_t bytes,
-                             int timeout_ms, bool & timed_out) {
-    timed_out = false;
-    auto * cursor = static_cast<char *>(data);
-    size_t received = 0;
-    const auto deadline = std::chrono::steady_clock::now() +
-        std::chrono::milliseconds(timeout_ms);
-    while (received < bytes) {
-        const auto now = std::chrono::steady_clock::now();
-        if (now >= deadline) {
-            timed_out = true;
-            return false;
-        }
-        const int64_t remaining =
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                deadline - now).count();
-        pollfd descriptor{fd, POLLIN | POLLHUP, 0};
-        const int wait_ms = static_cast<int>((std::min)(
-            int64_t{INT_MAX}, (std::max)(int64_t{1}, remaining)));
-        const int polled = ::poll(&descriptor, 1, wait_ms);
-        if (polled == 0) {
-            timed_out = true;
-            return false;
-        }
-        if (polled < 0) {
-            if (errno == EINTR) continue;
-            return false;
-        }
-        if (descriptor.revents & (POLLERR | POLLNVAL)) return false;
-        const ssize_t count = ::read(fd, cursor + received, bytes - received);
-        if (count == 0) return false;
-        if (count < 0) {
-            if (errno == EINTR) continue;
-            return false;
-        }
-        received += static_cast<size_t>(count);
+unsigned int descriptor_scan_limit() {
+    struct rlimit limit {};
+    if (::getrlimit(RLIMIT_NOFILE, &limit) == 0 &&
+        limit.rlim_cur != RLIM_INFINITY && limit.rlim_cur > 0) {
+        return static_cast<unsigned int>((std::min)(
+            static_cast<uint64_t>(limit.rlim_cur),
+            static_cast<uint64_t>(INT_MAX)));
     }
-    return true;
+    const long open_max = ::sysconf(_SC_OPEN_MAX);
+    if (open_max <= 0) return 0;
+    return static_cast<unsigned int>((std::min)(
+        static_cast<uint64_t>(open_max),
+        static_cast<uint64_t>(INT_MAX)));
 }
 
-bool close_descriptor_range(unsigned int first, unsigned int last) {
+bool close_descriptor_range(unsigned int first,
+                            unsigned int last,
+                            unsigned int scan_limit) {
     if (first > last) return true;
 #if defined(__linux__) && defined(SYS_close_range)
     int rc = -1;
     do {
         rc = static_cast<int>(::syscall(SYS_close_range, first, last, 0));
     } while (rc != 0 && errno == EINTR);
-    return rc == 0;
-#else
-    (void)first;
-    (void)last;
-    errno = ENOSYS;
-    return false;
+    if (rc == 0) return true;
 #endif
+
+    // close_range is Linux-specific and may also be blocked by an older
+    // kernel or seccomp policy. Fall back to the POSIX descriptor space that
+    // was captured before fork, and verify every ambiguous close failure.
+    if (scan_limit == 0 || first >= scan_limit) return scan_limit != 0;
+    const unsigned int upper = (std::min)(last, scan_limit - 1U);
+    for (unsigned int fd = first; fd <= upper; ++fd) {
+        if (::close(static_cast<int>(fd)) == 0 || errno == EBADF) continue;
+        const int close_error = errno;
+        errno = 0;
+        if (::fcntl(static_cast<int>(fd), F_GETFD) < 0 && errno == EBADF) {
+            continue;
+        }
+        errno = close_error;
+        return false;
+    }
+    return true;
 }
 
-bool isolate_child_descriptors(int payload_fd, int stream_fd, int shared_fd) {
+bool isolate_child_descriptors(int payload_fd,
+                               int stream_fd,
+                               int shared_fd,
+                               unsigned int scan_limit) {
     std::array<int, 3> keep{payload_fd, stream_fd, shared_fd};
     std::sort(keep.begin(), keep.end());
     unsigned int first = STDERR_FILENO + 1;
     int previous = -1;
     for (const int fd : keep) {
         if (fd < static_cast<int>(first) || fd == previous) continue;
-        if (!close_descriptor_range(first, static_cast<unsigned int>(fd - 1))) {
+        if (!close_descriptor_range(
+                first, static_cast<unsigned int>(fd - 1), scan_limit)) {
             return false;
         }
         first = static_cast<unsigned int>(fd) + 1U;
         previous = fd;
     }
     return close_descriptor_range(
-        first, (std::numeric_limits<unsigned int>::max)());
+        first, (std::numeric_limits<unsigned int>::max)(), scan_limit);
 }
 #endif
 
@@ -197,6 +191,14 @@ bool BackendIpcProcess::start(const BackendIpcLaunchConfig & cfg) {
     close();
     if (cfg.bin.empty() || cfg.payload_path.empty()) return false;
     if (!init_work_dir(cfg.work_dir, cfg.require_private_work_dir)) return false;
+    const unsigned int descriptor_limit = cfg.isolate_inherited_fds
+        ? descriptor_scan_limit() : 0;
+    if (cfg.isolate_inherited_fds && descriptor_limit == 0) {
+        std::fprintf(stderr,
+                     "backend-ipc cannot determine descriptor scan limit\n");
+        close();
+        return false;
+    }
 
     int cmd_pipe[2] = {-1, -1};
     int payload_pipe[2] = {-1, -1};
@@ -209,6 +211,7 @@ bool BackendIpcProcess::start(const BackendIpcLaunchConfig & cfg) {
         if (payload_pipe[1] >= 0) ::close(payload_pipe[1]);
         if (stream_pipe[0] >= 0) ::close(stream_pipe[0]);
         if (stream_pipe[1] >= 0) ::close(stream_pipe[1]);
+        close();
         return false;
     }
     const bool shared_required =
@@ -221,6 +224,7 @@ bool BackendIpcProcess::start(const BackendIpcLaunchConfig & cfg) {
         ::close(cmd_pipe[0]); ::close(cmd_pipe[1]);
         ::close(payload_pipe[0]); ::close(payload_pipe[1]);
         ::close(stream_pipe[0]); ::close(stream_pipe[1]);
+        close();
         return false;
     }
     if (shared_requested && cfg.shared_payload_bytes > 0) {
@@ -251,6 +255,13 @@ bool BackendIpcProcess::start(const BackendIpcLaunchConfig & cfg) {
         return false;
     }
     if (pid_ == 0) {
+        if (cfg.require_private_work_dir &&
+            (work_dir_fd_ < 0 || ::fchdir(work_dir_fd_) != 0)) {
+            std::fprintf(stderr,
+                         "backend-ipc private work_dir chdir failed: %s\n",
+                         std::strerror(errno));
+            _exit(127);
+        }
         if (cmd_pipe[0] != STDIN_FILENO && ::dup2(cmd_pipe[0], STDIN_FILENO) < 0) {
             std::fprintf(stderr, "backend-ipc dup2 failed: %s\n", std::strerror(errno));
             _exit(127);
@@ -284,7 +295,8 @@ bool BackendIpcProcess::start(const BackendIpcLaunchConfig & cfg) {
         argv.push_back(nullptr);
         if (cfg.isolate_inherited_fds &&
             !isolate_child_descriptors(
-                payload_pipe[0], stream_pipe[1], shared_payload_fd_)) {
+                payload_pipe[0], stream_pipe[1], shared_payload_fd_,
+                descriptor_limit)) {
             std::fprintf(stderr,
                          "backend-ipc descriptor isolation failed: %s\n",
                          std::strerror(errno));
@@ -310,10 +322,11 @@ bool BackendIpcProcess::start(const BackendIpcLaunchConfig & cfg) {
     }
     int32_t status = -1;
     bool readiness_timed_out = false;
+    const auto readiness_deadline = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds((std::max)(0, cfg.readiness_timeout_ms));
     const bool status_read = cfg.readiness_timeout_ms > 0
-        ? read_exact_with_timeout(stream_fd_, &status, sizeof(status),
-                                  cfg.readiness_timeout_ms,
-                                  readiness_timed_out)
+        ? read_exact_fd_until(stream_fd_, &status, sizeof(status),
+                              readiness_deadline, readiness_timed_out)
         : read_exact_fd(stream_fd_, &status, sizeof(status));
     if (!status_read || status != 0) {
         int child_status = 0;
@@ -415,8 +428,19 @@ void BackendIpcProcess::close_impl(bool force_terminate) {
         }
         pid_ = -1;
     }
-    if (owns_work_dir_ && !work_dir_.empty()) {
-        ::rmdir(work_dir_.c_str());
+    bool remove_owned_work_dir = owns_work_dir_ && !work_dir_.empty();
+    if (work_dir_fd_ >= 0) {
+        struct stat opened {};
+        struct stat named {};
+        remove_owned_work_dir = remove_owned_work_dir &&
+            ::fstat(work_dir_fd_, &opened) == 0 &&
+            ::lstat(work_dir_.c_str(), &named) == 0 &&
+            opened.st_dev == named.st_dev && opened.st_ino == named.st_ino;
+        ::close(work_dir_fd_);
+        work_dir_fd_ = -1;
+    }
+    if (remove_owned_work_dir) {
+        (void)::rmdir(work_dir_.c_str());
     }
 #else
     (void)force_terminate;
@@ -433,6 +457,62 @@ void BackendIpcProcess::close_impl(bool force_terminate) {
 
 std::string BackendIpcProcess::next_path(const char * prefix) {
     return work_dir_ + "/" + prefix + "_" + std::to_string(seq_++) + ".bin";
+}
+
+bool BackendIpcProcess::write_private_file(
+        const char * prefix,
+        const void * data,
+        size_t bytes,
+        std::string & name) {
+    name.clear();
+#if defined(_WIN32)
+    (void)prefix; (void)data; (void)bytes;
+    return false;
+#else
+    if (work_dir_fd_ < 0 || !prefix || !*prefix ||
+        (bytes > 0 && !data)) {
+        return false;
+    }
+    for (const char * cursor = prefix; *cursor; ++cursor) {
+        const unsigned char character = static_cast<unsigned char>(*cursor);
+        if (!std::isalnum(character) && character != '_' && character != '-') {
+            return false;
+        }
+    }
+    for (int attempt = 0; attempt < 16; ++attempt) {
+        name = std::string(prefix) + "_" + std::to_string(::getpid()) + "_" +
+               std::to_string(seq_++) + ".bin";
+        const int fd = ::openat(
+            work_dir_fd_, name.c_str(),
+            O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+        if (fd < 0) {
+            if (errno == EEXIST) continue;
+            name.clear();
+            return false;
+        }
+        const bool written = write_exact_fd(fd, data, bytes);
+        const bool closed = ::close(fd) == 0;
+        if (written && closed) return true;
+        (void)::unlinkat(work_dir_fd_, name.c_str(), 0);
+        name.clear();
+        return false;
+    }
+    name.clear();
+    return false;
+#endif
+}
+
+bool BackendIpcProcess::remove_private_file(const std::string & name) {
+#if defined(_WIN32)
+    (void)name;
+    return false;
+#else
+    if (work_dir_fd_ < 0 || name.empty() ||
+        name.find('/') != std::string::npos) {
+        return false;
+    }
+    return ::unlinkat(work_dir_fd_, name.c_str(), 0) == 0 || errno == ENOENT;
+#endif
 }
 
 bool BackendIpcProcess::write_shared_payload(const void * data, size_t bytes, uint64_t & seq) {
@@ -538,6 +618,61 @@ bool BackendIpcProcess::init_shared_payload(size_t bytes) {
 
 bool BackendIpcProcess::init_work_dir(const std::string & requested,
                                       bool require_private) {
+    if (require_private) {
+        std::string parent = "/tmp";
+        if (!requested.empty()) {
+            parent = requested;
+            if (::mkdir(parent.c_str(), 0700) != 0 && errno != EEXIST) {
+                std::fprintf(stderr, "backend-ipc mkdir failed: %s: %s\n",
+                             parent.c_str(), std::strerror(errno));
+                return false;
+            }
+            struct stat parent_stat {};
+            if (::lstat(parent.c_str(), &parent_stat) != 0 ||
+                !S_ISDIR(parent_stat.st_mode) ||
+                parent_stat.st_uid != ::geteuid() ||
+                (parent_stat.st_mode & 0777) != 0700) {
+                std::fprintf(stderr,
+                    "backend-ipc private work base must be an owned, "
+                    "non-symlink mode-0700 directory: %s\n",
+                    parent.c_str());
+                return false;
+            }
+        }
+
+        std::string templ = parent + "/backend-ipc-private-XXXXXX";
+        std::vector<char> buf(templ.begin(), templ.end());
+        buf.push_back('\0');
+        char * dir = ::mkdtemp(buf.data());
+        if (!dir) {
+            std::fprintf(stderr,
+                         "backend-ipc private mkdtemp failed: %s\n",
+                         std::strerror(errno));
+            return false;
+        }
+        work_dir_ = dir;
+        work_dir_fd_ = ::open(
+            work_dir_.c_str(),
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        struct stat opened {};
+        if (work_dir_fd_ < 0 || ::fstat(work_dir_fd_, &opened) != 0 ||
+            !S_ISDIR(opened.st_mode) || opened.st_uid != ::geteuid() ||
+            (opened.st_mode & 0777) != 0700) {
+            std::fprintf(stderr,
+                         "backend-ipc cannot retain private work directory: %s\n",
+                         std::strerror(errno));
+            if (work_dir_fd_ >= 0) {
+                ::close(work_dir_fd_);
+                work_dir_fd_ = -1;
+            }
+            (void)::rmdir(work_dir_.c_str());
+            work_dir_.clear();
+            return false;
+        }
+        owns_work_dir_ = true;
+        return true;
+    }
+
     if (!requested.empty()) {
         work_dir_ = requested;
         owns_work_dir_ = false;
@@ -549,20 +684,9 @@ bool BackendIpcProcess::init_work_dir(const std::string & requested,
             }
         }
         struct stat st;
-        const int stat_result = require_private
-            ? ::lstat(work_dir_.c_str(), &st)
-            : ::stat(work_dir_.c_str(), &st);
-        if (stat_result != 0 ||
-            !S_ISDIR(st.st_mode)) {
+        if (::stat(work_dir_.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
             std::fprintf(stderr,
                 "backend-ipc work_dir is not a directory: %s\n",
-                work_dir_.c_str());
-            return false;
-        }
-        if (require_private &&
-            (st.st_uid != ::geteuid() || (st.st_mode & 0777) != 0700)) {
-            std::fprintf(stderr,
-                "backend-ipc work_dir must be owned by the server and mode 0700: %s\n",
                 work_dir_.c_str());
             return false;
         }

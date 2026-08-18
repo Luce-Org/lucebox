@@ -131,7 +131,7 @@ struct BackendIpcLaunchConfig {
     // explicitly configured payload/response descriptors.
     bool isolate_inherited_fds = false;
     // Keep legacy backend work directories compatible while allowing private
-    // sidecars to require an owned, non-symlink 0700 directory.
+    // sidecars to require a fresh 0700 child of an owned, non-symlink base.
     bool require_private_work_dir = false;
 };
 
@@ -165,6 +165,13 @@ public:
     const std::string & work_dir() const { return work_dir_; }
 
     std::string next_path(const char * prefix);
+    // Create/remove a regular file relative to the retained private directory
+    // descriptor. The returned name is relative to the daemon's private cwd.
+    bool write_private_file(const char * prefix,
+                            const void * data,
+                            size_t bytes,
+                            std::string & name);
+    bool remove_private_file(const std::string & name);
     bool write_shared_payload(const void * data, size_t bytes, uint64_t & seq);
     bool write_shared_payload_segments(const BackendIpcPayloadSegment * segments,
                                        size_t n_segments,
@@ -178,6 +185,7 @@ private:
     bool init_shared_payload(size_t bytes);
 
     pid_t pid_ = -1;
+    int work_dir_fd_ = -1;
 #endif
     FILE * cmd_ = nullptr;
     int payload_fd_ = -1;

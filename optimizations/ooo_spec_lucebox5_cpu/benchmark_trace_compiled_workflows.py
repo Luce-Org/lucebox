@@ -774,7 +774,7 @@ def stage_result_message(
         "items": [
             {
                 **branch["root"],
-                "call_ref": branch["steps"][-1]["tool_result"]["call_ref"],
+                "final_ref": branch["steps"][-1]["tool_result"]["call_ref"],
             }
             for branch in branches
         ],
@@ -1629,7 +1629,7 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
             "by the deployed trace executor"
         )
     if (
-        args.pairs <= 0
+        args.pairs < 2
         or args.warmup_tasks < 0
         or not 2 <= args.min_branches <= args.max_branches <= 4
         or args.timeout <= 0
@@ -1657,40 +1657,80 @@ def refresh_existing_report(
     if not isinstance(report, dict):
         raise ValueError("existing report is not a JSON object")
     recorded_pattern = report.get("pattern")
+    production_gate = report.get("production_gate")
+    recorded_pairs = report.get("pairs")
     if (
         report.get("schema_version") != 1
         or not isinstance(recorded_pattern, dict)
+        or not isinstance(production_gate, dict)
+        or not isinstance(recorded_pairs, list)
         or recorded_pattern.get("fingerprint") != pattern.fingerprint
         or recorded_pattern.get("training_report_sha256")
         != file_sha256(args.training_report)
         or recorded_pattern.get("workflow_registry_sha256")
         != file_sha256(args.workflow_registry)
-        or not report.get("production_gate", {}).get("passed")
-        or len(report.get("pairs", [])) != args.pairs
+        or not production_gate.get("passed")
+        or len(recorded_pairs) != args.pairs
     ):
         raise ValueError("existing report does not match this qualified run")
 
-    privacy_miss = measure_private_miss(
-        args, measured_tasks[0], measured_tasks[1], pattern
-    )
     summary = report.get("summary")
     if not isinstance(summary, dict) or summary.get("tasks") != args.pairs:
         raise ValueError("existing report summary does not match --pairs")
+    required_refresh_fields = {
+        "stage_batched_to_speculative_speedup_p50",
+        "stage_batched_to_speculative_bootstrap_95ci",
+        "stage_batched_to_speculative_speedup_p05",
+        "compiled_to_speculative_speedup_p50",
+        "compiled_to_speculative_bootstrap_95ci",
+        "pattern_prediction_hit_rate",
+        "all_predictions_from_qwen",
+        "all_interference_probes_qualified",
+        "model_compute_slowdown_p50_percent",
+        "model_compute_slowdown_p95_percent",
+        "decode_slowdown_p50_percent",
+        "decode_slowdown_p95_percent",
+        "prefix_cache_configured",
+        "all_calls_stable",
+        "all_tool_results_stable",
+        "macro_output_stability_rate",
+        "all_final_answers_correct",
+        "all_final_outputs_stable",
+        "all_macro_calls_correct",
+        "all_ds4_active",
+    }
+    missing_refresh_fields = sorted(required_refresh_fields - summary.keys())
+    if missing_refresh_fields:
+        raise ValueError(
+            "existing report predates interference probes; rerun the full "
+            "benchmark without --refresh-report (missing summary fields: "
+            + ", ".join(missing_refresh_fields)
+            + ")"
+        )
+    methodology = report.get("methodology")
+    if not isinstance(methodology, dict):
+        raise ValueError("existing report has no methodology object")
+    server_snapshot = report.get("server_snapshot")
+    if not isinstance(server_snapshot, dict):
+        raise ValueError("existing report has no server_snapshot object")
+    privacy_miss = measure_private_miss(
+        args, measured_tasks[0], measured_tasks[1], pattern
+    )
     summary["private_miss_result_hidden"] = privacy_miss["passed"]
     checks = production_checks(summary, args)
     report["privacy_miss"] = privacy_miss
-    report["methodology"]["additive_gate_refresh"] = (
+    methodology["additive_gate_refresh"] = (
         "the wrong-call privacy probe and server snapshot were refreshed after "
         "the timing arms; no recorded timing was recomputed"
     )
-    report["production_gate"]["checks"] = checks
-    report["production_gate"]["passed"] = all(checks.values())
+    production_gate["checks"] = checks
+    production_gate["passed"] = all(checks.values())
     ending_props = get_json(props_url(args.url), args.timeout)
-    report["server_snapshot"]["prefix_cache_before"] = prefix_cache
-    report["server_snapshot"]["prefix_cache_after"] = ending_props.get(
+    server_snapshot["prefix_cache_before"] = prefix_cache
+    server_snapshot["prefix_cache_after"] = ending_props.get(
         "prefix_cache"
     )
-    report["server_snapshot"]["tool_speculation"] = tool_speculation
+    server_snapshot["tool_speculation"] = tool_speculation
     args.output.write_text(
         json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )

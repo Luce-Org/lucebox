@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstddef>
 #include <utility>
 
 namespace dflash::common {
@@ -155,6 +156,90 @@ bool semantic_deadline_expired(
     return deadline && std::chrono::steady_clock::now() >= *deadline;
 }
 
+constexpr size_t kMaxNativePredictorRequestBytes = 256U * 1024U;
+constexpr size_t kMaxNativePredictorJsonDepth = 64U;
+
+bool semantic_take_budget(size_t bytes, size_t & remaining) {
+    if (bytes > remaining) return false;
+    remaining -= bytes;
+    return true;
+}
+
+bool semantic_string_within_budget(
+        const std::string & value,
+        const std::chrono::steady_clock::time_point * deadline,
+        size_t & remaining,
+        size_t & operations,
+        bool & timed_out) {
+    if (!semantic_take_budget(2, remaining)) return false;
+    for (const unsigned char character : value) {
+        if ((operations++ & 255U) == 0U &&
+            semantic_deadline_expired(deadline)) {
+            timed_out = true;
+            return false;
+        }
+        const size_t encoded_bytes = character < 0x20U
+            ? 6U : (character == '"' || character == '\\' ? 2U : 1U);
+        if (!semantic_take_budget(encoded_bytes, remaining)) return false;
+    }
+    return true;
+}
+
+bool semantic_json_within_budget(
+        const json & value,
+        const std::chrono::steady_clock::time_point * deadline,
+        size_t & remaining,
+        size_t depth,
+        size_t & operations,
+        bool & timed_out) {
+    if (depth > kMaxNativePredictorJsonDepth) return false;
+    if ((operations++ & 255U) == 0U &&
+        semantic_deadline_expired(deadline)) {
+        timed_out = true;
+        return false;
+    }
+    if (value.is_null()) return semantic_take_budget(4, remaining);
+    if (value.is_boolean()) return semantic_take_budget(5, remaining);
+    if (value.is_number()) return semantic_take_budget(64, remaining);
+    if (value.is_string()) {
+        return semantic_string_within_budget(
+            value.get_ref<const json::string_t &>(), deadline,
+            remaining, operations, timed_out);
+    }
+    if (value.is_array()) {
+        if (!semantic_take_budget(2, remaining)) return false;
+        bool first = true;
+        for (const auto & element : value) {
+            if (!first && !semantic_take_budget(1, remaining)) return false;
+            first = false;
+            if (!semantic_json_within_budget(
+                    element, deadline, remaining, depth + 1,
+                    operations, timed_out)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if (value.is_object()) {
+        if (!semantic_take_budget(2, remaining)) return false;
+        bool first = true;
+        for (const auto & item : value.items()) {
+            if (!first && !semantic_take_budget(1, remaining)) return false;
+            first = false;
+            if (!semantic_string_within_budget(
+                    item.key(), deadline, remaining, operations, timed_out) ||
+                !semantic_take_budget(1, remaining) ||
+                !semantic_json_within_budget(
+                    item.value(), deadline, remaining, depth + 1,
+                    operations, timed_out)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
 bool semantic_message_content(
         const json & message,
         const std::chrono::steady_clock::time_point * deadline,
@@ -300,20 +385,44 @@ bool materialize_declared_tool_defaults(
 }
 
 json build_semantic_tool_predictor_request(
-        const json & target_request,
+        const json & messages,
+        const json & tools,
+        const json & tool_choice,
         const std::string & sidecar_model,
-        int max_tokens) {
+        int max_tokens,
+        std::string & error) {
+    error.clear();
+    size_t request_budget = kMaxNativePredictorRequestBytes;
+    size_t budget_operations = 0;
+    bool budget_timed_out = false;
+    const json default_choice = "auto";
+    const json & effective_choice = tool_choice.is_null()
+        ? default_choice : tool_choice;
+    if (!semantic_take_budget(512, request_budget) ||
+        !semantic_string_within_budget(
+            sidecar_model, nullptr, request_budget,
+            budget_operations, budget_timed_out) ||
+        !semantic_json_within_budget(
+            messages, nullptr, request_budget, 0,
+            budget_operations, budget_timed_out) ||
+        !semantic_json_within_budget(
+            tools, nullptr, request_budget, 0,
+            budget_operations, budget_timed_out) ||
+        !semantic_json_within_budget(
+            effective_choice, nullptr, request_budget, 0,
+            budget_operations, budget_timed_out)) {
+        error = "predictor_request_too_large";
+        return nullptr;
+    }
     json request = {
         {"model", sidecar_model},
         {"stream", false},
         {"temperature", 0},
         {"max_tokens", max_tokens},
+        {"messages", messages},
+        {"tools", tools},
+        {"tool_choice", effective_choice},
     };
-    for (const char * key : {"messages", "tools", "tool_choice"}) {
-        const auto it = target_request.find(key);
-        if (it != target_request.end()) request[key] = *it;
-    }
-    if (!request.contains("tool_choice")) request["tool_choice"] = "auto";
     return request;
 }
 
@@ -324,6 +433,17 @@ std::string build_native_semantic_tool_predictor_prompt(
     error.clear();
     if (semantic_deadline_expired(deadline)) {
         error = "native_predictor_timeout";
+        return {};
+    }
+    size_t request_budget = kMaxNativePredictorRequestBytes;
+    size_t budget_operations = 0;
+    bool budget_timed_out = false;
+    if (!semantic_json_within_budget(
+            predictor_request, deadline, request_budget, 0,
+            budget_operations, budget_timed_out)) {
+        error = budget_timed_out
+            ? "native_predictor_timeout"
+            : "native_predictor_request_too_large";
         return {};
     }
     const json choice = predictor_request.value("tool_choice", json("auto"));

@@ -66,12 +66,16 @@ bool materialize_declared_tool_defaults(
     SemanticToolCall & call,
     std::string & error);
 
-// Build the small OpenAI-compatible request sent to the predictor.  Only
-// dialogue/tool semantics are forwarded; target-only extensions are omitted.
+// Build the bounded OpenAI-compatible request sent to the predictor. Only
+// normalized dialogue/tool semantics are copied; target-only extensions are
+// omitted. Oversized inputs fail before any full-field copy.
 json build_semantic_tool_predictor_request(
-    const json & target_request,
+    const json & messages,
+    const json & tools,
+    const json & tool_choice,
     const std::string & sidecar_model,
-    int max_tokens);
+    int max_tokens,
+    std::string & error);
 
 // Native predictor bridge. The prompt uses the Qwen tool template and the
 // decoded response is parsed semantically before any target token IDs exist.

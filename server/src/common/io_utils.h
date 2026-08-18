@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include <algorithm>
+#include <chrono>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
@@ -18,6 +21,7 @@
 #  include <windows.h>
 #else
 #  include <cerrno>
+#  include <poll.h>
 #  include <unistd.h>
 #endif
 
@@ -106,6 +110,52 @@ static inline bool read_exact_fd(int fd, void * data, size_t bytes) {
             return false;
         }
         done += (size_t)n;
+    }
+    return true;
+}
+
+// Read a complete protocol field under one wall-clock deadline. The helper is
+// shared by startup handshakes and request/response IPC so partial reads and
+// timeout behavior cannot drift between sidecars.
+static inline bool read_exact_fd_until(
+        int fd,
+        void * data,
+        size_t bytes,
+        const std::chrono::steady_clock::time_point & deadline,
+        bool & timed_out) {
+    char * cursor = static_cast<char *>(data);
+    size_t received = 0;
+    timed_out = false;
+    while (received < bytes) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            timed_out = true;
+            return false;
+        }
+        const int64_t remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - now).count();
+        pollfd descriptor{fd, POLLIN | POLLHUP, 0};
+        const int wait_ms = static_cast<int>((std::min)(
+            int64_t{INT_MAX}, (std::max)(int64_t{1}, remaining)));
+        const int polled = ::poll(&descriptor, 1, wait_ms);
+        if (polled == 0) {
+            timed_out = true;
+            return false;
+        }
+        if (polled < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (descriptor.revents & (POLLERR | POLLNVAL)) return false;
+        const ssize_t count = ::read(
+            fd, cursor + received, bytes - received);
+        if (count == 0) return false;
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        received += static_cast<size_t>(count);
     }
     return true;
 }

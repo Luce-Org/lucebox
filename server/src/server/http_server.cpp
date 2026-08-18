@@ -2490,29 +2490,25 @@ void HttpServer::start_automatic_tool_speculation(ParsedRequest & req) const {
         !config_.tool_speculation.enabled() ||
         !config_.semantic_tool_predictor.enabled() ||
         http_detail::tool_choice_disables_tool_calls(req.tool_choice) ||
-        req.tools.empty() || !req.raw_body.is_object()) return;
+        req.tools.empty()) return;
 
     req.automatic_tool_speculation.emplace();
     auto & launch = *req.automatic_tool_speculation;
     const SemanticToolPredictorConfig predictor =
         config_.semantic_tool_predictor;
-    json semantic_request = req.raw_body;
-    // Endpoint parsers normalize Anthropic/Responses dialogue into req.messages.
-    // Supplying it here gives both transports one OpenAI-shaped semantic view.
-    semantic_request["messages"] = req.messages;
-    semantic_request["tools"] = req.tools;
-    if (!req.tool_choice.is_null()) {
-        semantic_request["tool_choice"] = req.tool_choice;
-    }
+    std::string payload_error;
     const json payload = build_semantic_tool_predictor_request(
-        semantic_request,
+        req.messages, req.tools, req.tool_choice,
         predictor.model.empty() ? "native-qwen3" : predictor.model,
-        predictor.max_tokens);
-    const json tools = req.tools;
+        predictor.max_tokens, payload_error);
+    if (!payload_error.empty()) {
+        launch.predictor_error = std::move(payload_error);
+        return;
+    }
     const auto native = native_semantic_predictor_;
     try {
         const SemanticToolPrediction semantic = predict_semantic_tool_call(
-            predictor, payload, tools, native);
+            predictor, payload, req.tools, native);
         launch.predictor_wall_ms = semantic.wall_ms;
         launch.prediction_source = semantic.source;
         if (!semantic.ok) {

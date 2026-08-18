@@ -327,7 +327,7 @@ def start_executor(
     )
     process.stdin.close()
     process.stdin = None
-    return {"process": process, "started": started}
+    return {"process": process, "pgid": process.pid, "started": started}
 
 
 def finish_executor(handle: dict[str, Any], timeout: float) -> dict[str, Any]:
@@ -361,19 +361,43 @@ def finish_executor(handle: dict[str, Any], timeout: float) -> dict[str, Any]:
 
 def stop_executor(handle: dict[str, Any]) -> None:
     process: subprocess.Popen[str] = handle["process"]
-    if process.poll() is None:
+    pgid = int(handle.get("pgid", process.pid))
+
+    def group_exists() -> bool:
         try:
-            os.killpg(process.pid, signal.SIGTERM)
+            os.killpg(pgid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+
+    grace_deadline = time.monotonic() + 1.0
+    while group_exists() and time.monotonic() < grace_deadline:
+        if process.poll() is None:
+            try:
+                process.wait(timeout=0.01)
+            except subprocess.TimeoutExpired:
+                pass
+        else:
+            time.sleep(0.01)
+
+    if group_exists():
+        try:
+            os.killpg(pgid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+
+    if process.poll() is None:
         try:
-            process.wait(timeout=1.0)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
             process.wait(timeout=5.0)
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError("CPU executor process group did not stop") from error
 
 
 def run_executor(

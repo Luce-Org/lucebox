@@ -2002,6 +2002,21 @@ TEST_CASE(ServerUnitFixture, test_resolve_deepseek_chat_markers) {
     unlink(path.c_str());
 }
 
+TEST_CASE(ServerUnitFixture, test_tokenizer_added_token_search_obeys_deadline) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    const std::string long_input(32U * 1024U * 1024U, 'x');
+    const auto started = std::chrono::steady_clock::now();
+    const auto deadline = started + std::chrono::milliseconds(1);
+    std::vector<int32_t> output;
+    TEST_ASSERT(!tokenizer.encode_until(long_input, deadline, output));
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    TEST_ASSERT(elapsed < std::chrono::seconds(1));
+    TEST_ASSERT(output.empty());
+    unlink(path.c_str());
+}
+
 TEST_CASE(ServerUnitFixture, test_hash_prefix_deterministic) {
     std::vector<int32_t> ids = {100, 200, 300, 400, 500};
     auto h1 = hash_prefix(ids.data(), (int)ids.size());

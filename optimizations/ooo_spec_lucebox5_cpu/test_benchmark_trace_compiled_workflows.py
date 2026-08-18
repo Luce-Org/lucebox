@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from benchmark_trace_compiled_workflows import (
+    CANONICAL_TRAINING_REPORT,
+    CANONICAL_WORKFLOW_REGISTRY,
     alphabetic_identifier,
     compact_arm,
     final_answer_correct,
+    file_sha256,
     interference_probe_qualified,
     load_training_traces,
     load_partial_pairs,
@@ -21,9 +25,12 @@ from benchmark_trace_compiled_workflows import (
     parse_request_customers,
     post_final,
     production_checks,
+    refresh_existing_report,
     simulated_tool_result,
     stage_batch_tool,
     stage_batched_messages,
+    stage_result_message,
+    validate_args,
     stage_reference,
     workflow_reference,
 )
@@ -217,6 +224,53 @@ class TraceCompiledWorkflowBenchmarkTest(unittest.TestCase):
         self.assertEqual(set(parameters["properties"]), {"stage_ref"})
         self.assertEqual(parameters["properties"]["stage_ref"]["enum"], [stage_ref])
         self.assertEqual(stage_ref, "workflow_taskc_stage_three")
+
+    def test_stage_result_exposes_the_requested_final_ref(self) -> None:
+        message = stage_result_message(
+            self.pattern,
+            len(self.pattern.steps) - 1,
+            [
+                {
+                    "root": {
+                        "customer_email": "a@example.test",
+                        "destination": "Rome",
+                    },
+                    "steps": [{"tool_result": {"call_ref": "plum"}}],
+                }
+            ],
+            "call_stage",
+        )
+        content = json.loads(message["content"])
+        self.assertEqual(content["items"][0]["final_ref"], "plum")
+        self.assertNotIn("call_ref", content["items"][0])
+
+    def test_validation_requires_two_pairs_for_privacy_probe(self) -> None:
+        class RaisingParser:
+            @staticmethod
+            def error(message: str) -> None:
+                raise ValueError(message)
+
+        args = argparse.Namespace(
+            binary=Path(sys.executable),
+            training_report=CANONICAL_TRAINING_REPORT.resolve(),
+            workflow_registry=CANONICAL_WORKFLOW_REGISTRY.resolve(),
+            pairs=1,
+            warmup_tasks=0,
+            min_branches=2,
+            max_branches=4,
+            timeout=1.0,
+            call_max_tokens=1,
+            macro_max_tokens=1,
+            final_max_tokens=1,
+            bootstrap_resamples=1,
+            interference_repetitions=3,
+            min_production_pairs=2,
+            min_e2e_speedup=2.0,
+            min_e2e_speedup_p05=1.5,
+            min_incremental_speedup=1.05,
+        )
+        with self.assertRaisesRegex(ValueError, "counts and thresholds"):
+            validate_args(RaisingParser(), args)
 
     def test_parses_multiple_native_tool_calls(self) -> None:
         response = {
@@ -456,6 +510,39 @@ class TraceCompiledWorkflowBenchmarkTest(unittest.TestCase):
             path.write_text(json.dumps(checkpoint), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "does not match"):
                 load_partial_pairs(path, tasks, orders)
+
+    def test_refresh_rejects_reports_that_predate_interference_probes(self) -> None:
+        tasks = [make_task(0, 2, self.pattern), make_task(1, 3, self.pattern)]
+        report = {
+            "schema_version": 1,
+            "pattern": {
+                "fingerprint": self.pattern.fingerprint,
+                "training_report_sha256": file_sha256(
+                    CANONICAL_TRAINING_REPORT
+                ),
+                "workflow_registry_sha256": file_sha256(
+                    CANONICAL_WORKFLOW_REGISTRY
+                ),
+            },
+            "production_gate": {"passed": True},
+            "pairs": [{}, {}],
+            "summary": {"tasks": 2},
+            "methodology": {},
+            "server_snapshot": {},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "report.json"
+            output.write_text(json.dumps(report), encoding="utf-8")
+            args = argparse.Namespace(
+                output=output,
+                pairs=2,
+                training_report=CANONICAL_TRAINING_REPORT,
+                workflow_registry=CANONICAL_WORKFLOW_REGISTRY,
+            )
+            with self.assertRaisesRegex(ValueError, "predates interference"):
+                refresh_existing_report(
+                    args, self.pattern, tasks, {}, {}
+                )
 
 
 if __name__ == "__main__":

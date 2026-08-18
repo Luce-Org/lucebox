@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <string_view>
 #include <utility>
 
 namespace dflash::common {
@@ -27,6 +28,44 @@ bool preprocessing_deadline_expired(
     if (!deadline || (operations++ & 255U) != 0U) return false;
     if (std::chrono::steady_clock::now() < *deadline) return false;
     timed_out = true;
+    return true;
+}
+
+bool preprocessing_find_until(
+        const std::string & text,
+        const std::string & needle,
+        size_t start,
+        const std::chrono::steady_clock::time_point * deadline,
+        bool & timed_out,
+        size_t & found) {
+    found = std::string::npos;
+    if (needle.empty()) {
+        found = start <= text.size() ? start : std::string::npos;
+        return true;
+    }
+    if (start > text.size() || needle.size() > text.size() - start) {
+        return true;
+    }
+
+    constexpr size_t kSearchPositionsPerDeadlineCheck = 4096;
+    const size_t last_start = text.size() - needle.size();
+    size_t cursor = start;
+    while (cursor <= last_start) {
+        if (deadline && std::chrono::steady_clock::now() >= *deadline) {
+            timed_out = true;
+            return false;
+        }
+        const size_t positions = (std::min)(
+            kSearchPositionsPerDeadlineCheck, last_start - cursor + 1);
+        const size_t view_bytes = positions + needle.size() - 1;
+        const std::string_view window(text.data() + cursor, view_bytes);
+        const size_t local = window.find(needle);
+        if (local != std::string_view::npos && local < positions) {
+            found = cursor + local;
+            return true;
+        }
+        cursor += positions;
+    }
     return true;
 }
 
@@ -744,7 +783,11 @@ std::vector<int32_t> Tokenizer::encode_impl(
         for (const auto & [tok_str, tok_id] : added_tokens_) {
             if (preprocessing_deadline_expired(
                     deadline, operations, timed_out)) return {};
-            size_t found = text.find(tok_str, pos);
+            size_t found = std::string::npos;
+            if (!preprocessing_find_until(
+                    text, tok_str, pos, deadline, timed_out, found)) {
+                return {};
+            }
             if (found != std::string::npos && found < next_special) {
                 next_special = found;
             }

@@ -51,7 +51,7 @@ if fuser -s /dev/kfd 2>/dev/null; then
     exit 75
 fi
 
-exec env \
+exec env -i \
     HOME="$root" \
     USER="lucebox5" \
     PATH="$root/.local/bin:/opt/rocm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \

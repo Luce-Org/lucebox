@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import signal
+import subprocess
 import unittest
+from unittest.mock import Mock, patch
 
 from benchmark_cpu_tool_speculation import (
     TOOL_NAME,
@@ -12,10 +15,43 @@ from benchmark_cpu_tool_speculation import (
     props_url,
     require_qualified_cpu_tool_props,
     request_body,
+    stop_executor,
 )
 
 
 class CpuToolSpeculationBenchmarkTest(unittest.TestCase):
+    def test_stop_executor_signals_group_after_leader_exit(self) -> None:
+        process = Mock(pid=4321)
+        process.poll.return_value = 0
+
+        def kill_group(_pgid: int, sent_signal: int) -> None:
+            if sent_signal == 0:
+                raise ProcessLookupError
+
+        with patch(
+            "benchmark_cpu_tool_speculation.os.killpg",
+            side_effect=kill_group,
+        ) as killpg:
+            stop_executor({"process": process, "pgid": 4321})
+
+        killpg.assert_any_call(4321, signal.SIGTERM)
+
+    def test_stop_executor_converts_final_wait_timeout(self) -> None:
+        process = Mock(pid=4321)
+        process.poll.return_value = None
+        process.wait.side_effect = subprocess.TimeoutExpired("executor", 5.0)
+
+        def kill_group(_pgid: int, sent_signal: int) -> None:
+            if sent_signal == 0:
+                raise ProcessLookupError
+
+        with patch(
+            "benchmark_cpu_tool_speculation.os.killpg",
+            side_effect=kill_group,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "did not stop"):
+                stop_executor({"process": process, "pgid": 4321})
+
     def test_cpu_list_parser_canonicalizes_ranges(self) -> None:
         self.assertEqual(parse_cpu_list("30-31,15,14-15"), [14, 15, 30, 31])
         with self.assertRaises(argparse.ArgumentTypeError):
