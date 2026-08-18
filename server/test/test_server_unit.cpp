@@ -466,6 +466,41 @@ TEST_CASE(ServerUnitFixture, test_emitter_started_in_thinking_without_open_tag) 
     TEST_ASSERT(all.find("\"content\":\"Thinking Process") == std::string::npos);
 }
 
+TEST_CASE(ServerUnitFixture, test_emitter_started_in_thinking_with_function_calls_no_think_close) {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, read_tools(), true);
+    auto c1 = em.emit_token("Let me read the key files.\n\n");
+    auto c2 = em.emit_token("<function_calls>\n  <invoke name=\"read\">\n    <param name=\"path\">README.md</param>\n  </invoke>\n</function_calls>");
+    auto fin = em.emit_finish(2);
+
+    std::string all = concat(c1) + concat(c2) + concat(fin);
+    TEST_ASSERT(em.tool_calls().size() == 1);
+    if (!em.tool_calls().empty()) {
+        TEST_ASSERT(em.tool_calls()[0].name == "read");
+        TEST_ASSERT(json::parse(em.tool_calls()[0].arguments)["path"] == "README.md");
+    }
+    TEST_ASSERT(em.reasoning_text().find("Let me read the key files.") != std::string::npos);
+    TEST_ASSERT(em.reasoning_text().find("<invoke") == std::string::npos);
+    TEST_ASSERT(em.reasoning_text().find("<function_calls>") == std::string::npos);
+    TEST_ASSERT(em.accumulated_text().empty());
+    TEST_ASSERT(all.find("\"finish_reason\":\"tool_calls\"") != std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_tool_call_inside_think_block_does_not_leak_think_close) {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, read_tools(), false);
+    auto c1 = em.emit_token("<think>Planning files.\n");
+    auto c2 = em.emit_token("<function_calls>\n  <invoke name=\"read\">\n    <param name=\"path\">README.md</param>\n  </invoke>\n</function_calls>\nMore reasoning before close.\n</think>\nHere is the answer.");
+    auto fin = em.emit_finish(2);
+
+    std::string all = concat(c1) + concat(c2) + concat(fin);
+    TEST_ASSERT(em.tool_calls().size() == 1);
+    TEST_ASSERT(em.reasoning_text().find("Planning files.") != std::string::npos);
+    TEST_ASSERT(em.reasoning_text().find("More reasoning before close.") != std::string::npos);
+    TEST_ASSERT(em.accumulated_text().find("</think>") == std::string::npos);
+    TEST_ASSERT(em.accumulated_text().find("More reasoning") == std::string::npos);
+    TEST_ASSERT(em.accumulated_text().find("Here is the answer.") != std::string::npos);
+    TEST_ASSERT(all.find("\"finish_reason\":\"tool_calls\"") != std::string::npos);
+}
+
 TEST_CASE(ServerUnitFixture, test_reasoning_unclosed_think) {
     auto r = parse_reasoning("<think>still thinking no close",
                              true, false);
@@ -772,6 +807,363 @@ TEST_CASE(ServerUnitFixture, test_parse_space_function_tool_xml_rejects_malforme
     auto unknown_result = parse_tool_calls(unknown, read_tools());
     TEST_ASSERT(unknown_result.tool_calls.empty());
     TEST_ASSERT(unknown_result.cleaned_text == unknown);
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_function_calls_multi_invoke_xml) {
+    const std::string text =
+        "Hello! I'm happy to help you analyze this project and propose improvements.\n\n"
+        "Let me first read the remaining key files to fully understand the project.\n\n"
+        "<function_calls>\n"
+        "  <invoke name=\"read\">\n"
+        "    <param name=\"path\">README.md</param>\n"
+        "  </invoke>\n"
+        "  <invoke name=\"read\">\n"
+        "    <param name=\"path\">server.go</param>\n"
+        "  </invoke>\n"
+        "  <invoke name=\"read\">\n"
+        "    <param name=\"path\">internal/rfid/reader_test.go</param>\n"
+        "  </invoke>\n"
+        "  <invoke name=\"read\">\n"
+        "    <param name=\"path\">internal/rfidops/ops_test.go</param>\n"
+        "  </invoke>\n"
+        "</function_calls>";
+
+    auto result = parse_tool_calls(text, read_tools());
+    TEST_ASSERT(result.tool_calls.size() == 4);
+    if (result.tool_calls.size() == 4) {
+        TEST_ASSERT(result.tool_calls[0].name == "read");
+        TEST_ASSERT(json::parse(result.tool_calls[0].arguments)["path"] == "README.md");
+        TEST_ASSERT(result.tool_calls[1].name == "read");
+        TEST_ASSERT(json::parse(result.tool_calls[1].arguments)["path"] == "server.go");
+        TEST_ASSERT(result.tool_calls[2].name == "read");
+        TEST_ASSERT(json::parse(result.tool_calls[2].arguments)["path"] == "internal/rfid/reader_test.go");
+        TEST_ASSERT(result.tool_calls[3].name == "read");
+        TEST_ASSERT(json::parse(result.tool_calls[3].arguments)["path"] == "internal/rfidops/ops_test.go");
+    }
+    TEST_ASSERT(result.cleaned_text ==
+                "Hello! I'm happy to help you analyze this project and propose improvements.\n\n"
+                "Let me first read the remaining key files to fully understand the project.");
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_function_calls_pi_agent_multi_invoke) {
+    const std::string text =
+        " Hello! I'm happy to help you analyze this project and propose improvements.\n\n"
+        " Let me read the remaining key files I haven't seen yet to fully understand the codebase.\n\n"
+        " <function_calls>\n"
+        "   <invoke name=\"read\">\n"
+        "     <param name=\"path\">README.md</param>\n"
+        "   </invoke>\n"
+        "   <invoke name=\"read\">\n"
+        "     <param name=\"path\">server.go</param>\n"
+        "   </invoke>\n"
+        "   <invoke name=\"read\">\n"
+        "     <param name=\"path\">internal/rfid/reader_test.go</param>\n"
+        "   </invoke>\n"
+        "   <invoke name=\"read\">\n"
+        "     <param name=\"path\">internal/rfidops/ops_test.go</param>\n"
+        "   </invoke>\n"
+        " </function_calls>";
+
+    auto result = parse_tool_calls(text, read_tools());
+    TEST_ASSERT(result.tool_calls.size() == 4);
+    if (result.tool_calls.size() == 4) {
+        TEST_ASSERT(result.tool_calls[0].name == "read");
+        TEST_ASSERT(json::parse(result.tool_calls[0].arguments)["path"] == "README.md");
+        TEST_ASSERT(result.tool_calls[1].name == "read");
+        TEST_ASSERT(json::parse(result.tool_calls[1].arguments)["path"] == "server.go");
+        TEST_ASSERT(result.tool_calls[2].name == "read");
+        TEST_ASSERT(json::parse(result.tool_calls[2].arguments)["path"] == "internal/rfid/reader_test.go");
+        TEST_ASSERT(result.tool_calls[3].name == "read");
+        TEST_ASSERT(json::parse(result.tool_calls[3].arguments)["path"] == "internal/rfidops/ops_test.go");
+    }
+    TEST_ASSERT(result.cleaned_text ==
+                "Hello! I'm happy to help you analyze this project and propose improvements.\n\n"
+                " Let me read the remaining key files I haven't seen yet to fully understand the codebase.");
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_function_calls_invoke_xml) {
+    const std::string text =
+        "Reading configuration:\n"
+        "<function_calls>\n"
+        "<invoke name=\"read\">\n"
+        "  <param name=\"path\">server.go</param>\n"
+        "  <param name=\"offset\">10</param>\n"
+        "  <param name=\"limit\">50</param>\n"
+        "</invoke>\n"
+        "</function_calls>";
+
+    auto result = parse_tool_calls(text, read_tools());
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "read");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["path"] == "server.go");
+        TEST_ASSERT(args["offset"] == 10);
+        TEST_ASSERT(args["limit"] == 50);
+    }
+    TEST_ASSERT(result.cleaned_text == "Reading configuration:");
+}
+
+static json anthropic_read_tools() {
+    return json::array({
+        {{"name", "read"},
+         {"input_schema", {
+             {"type", "object"},
+             {"properties", {
+                 {"path", {{"type", "string"}}},
+                 {"offset", {{"type", "integer"}}},
+                 {"limit", {{"type", "integer"}}}
+             }},
+             {"required", json::array({"path"})}
+         }}}
+    });
+}
+
+TEST_CASE(ServerUnitFixture, test_find_tool_syntax_start_function_calls) {
+    size_t pos = 0;
+    TEST_ASSERT(find_tool_syntax_start("Thought\n<function_calls>\n<invoke", json(), pos));
+    TEST_ASSERT(pos == 8);
+
+    size_t pos2 = 0;
+    TEST_ASSERT(find_tool_syntax_start("Here:\n<function_calls><invoke name=\"read\">", json(), pos2));
+    TEST_ASSERT(pos2 == 6);
+
+    // Natural-language prose starting with <invoke should not trigger tool opener
+    size_t pos3 = 0;
+    TEST_ASSERT(!find_tool_syntax_start("We should <invoke the changes now", json(), pos3));
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_invoke_json_body_coerces_types) {
+    const std::string text =
+        "<function_calls>\n"
+        "<invoke name=\"read\">\n"
+        "  {\"path\": \"server.go\", \"offset\": \"10\", \"limit\": \"50\"}\n"
+        "</invoke>\n"
+        "</function_calls>";
+
+    auto result = parse_tool_calls(text, read_tools());
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "read");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["path"] == "server.go");
+        TEST_ASSERT(args["offset"] == 10);
+        TEST_ASSERT(args["limit"] == 50);
+    }
+    TEST_ASSERT(result.cleaned_text.empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_invoke_json_body_preserves_string_null) {
+    const std::string text =
+        "<function_calls>\n"
+        "<invoke name=\"read\">\n"
+        "  {\"path\": \"null\", \"offset\": \"10\"}\n"
+        "</invoke>\n"
+        "</function_calls>";
+
+    auto result = parse_tool_calls(text, read_tools());
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "read");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["path"] == "null");
+        TEST_ASSERT(args["offset"] == 10);
+    }
+}
+
+
+TEST_CASE(ServerUnitFixture, test_parse_invoke_json_body_union_type) {
+    json tools = json::array({
+        {
+            {"type", "function"},
+            {"function", {
+                {"name", "search"},
+                {"parameters", {
+                    {"type", "object"},
+                    {"properties", {
+                        {"limit", {{"type", json::array({"integer", "null"})}}},
+                        {"query", {{"type", "string"}}}
+                    }}
+                }}
+            }}
+        }
+    });
+
+    const std::string text1 =
+        "<function_calls>\n"
+        "<invoke name=\"search\">\n"
+        "  {\"query\": \"test\", \"limit\": \"20\"}\n"
+        "</invoke>\n"
+        "</function_calls>";
+
+    auto result1 = parse_tool_calls(text1, tools);
+    TEST_ASSERT(result1.tool_calls.size() == 1);
+    if (!result1.tool_calls.empty()) {
+        auto args = json::parse(result1.tool_calls[0].arguments);
+        TEST_ASSERT(args["query"] == "test");
+        TEST_ASSERT(args["limit"] == 20);
+    }
+
+    const std::string text2 =
+        "<function_calls>\n"
+        "<invoke name=\"search\">\n"
+        "  {\"query\": \"null\", \"limit\": \"null\"}\n"
+        "</invoke>\n"
+        "</function_calls>";
+
+    auto result2 = parse_tool_calls(text2, tools);
+    TEST_ASSERT(result2.tool_calls.size() == 1);
+    if (!result2.tool_calls.empty()) {
+        auto args = json::parse(result2.tool_calls[0].arguments);
+        TEST_ASSERT(args["query"] == "null");
+        TEST_ASSERT(args["limit"].is_null());
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_tool_call_inside_unclosed_think_block_routes_to_reasoning) {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, read_tools(), false);
+    auto c1 = em.emit_token("<think>Planning files.\n");
+    auto c2 = em.emit_token("<function_calls>\n  <invoke name=\"read\">\n    <param name=\"path\">README.md</param>\n  </invoke>\n</function_calls>\nStill thinking about what to do next without close tag.");
+    auto fin = em.emit_finish(2);
+
+    std::string all = concat(c1) + concat(c2) + concat(fin);
+    TEST_ASSERT(em.tool_calls().size() == 1);
+    TEST_ASSERT(em.reasoning_text().find("Planning files.") != std::string::npos);
+    TEST_ASSERT(em.reasoning_text().find("Still thinking about what to do next") != std::string::npos);
+    TEST_ASSERT(em.accumulated_text().empty());
+    TEST_ASSERT(all.find("\"finish_reason\":\"tool_calls\"") != std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_invoke_anthropic_input_schema) {
+    const std::string text =
+        "<function_calls>\n"
+        "<invoke name=\"read\">\n"
+        "  <param name=\"path\">app.py</param>\n"
+        "  <param name=\"offset\">5</param>\n"
+        "  <param name=\"limit\">25</param>\n"
+        "</invoke>\n"
+        "</function_calls>";
+
+    auto result = parse_tool_calls(text, anthropic_read_tools());
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "read");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["path"] == "app.py");
+        TEST_ASSERT(args["offset"] == 5);
+        TEST_ASSERT(args["limit"] == 25);
+    }
+    TEST_ASSERT(result.cleaned_text.empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_invoke_rejects_empty_or_malformed_body) {
+    // Required parameter missing in empty body
+    const std::string empty_body = "<function_calls><invoke name=\"read\"></invoke></function_calls>";
+    auto empty_result = parse_tool_calls(empty_body, read_tools());
+    TEST_ASSERT(empty_result.tool_calls.empty());
+    TEST_ASSERT(empty_result.cleaned_text == empty_body);
+
+    // Required parameter missing in non-empty XML body (offset present, but required path missing)
+    const std::string missing_req_xml =
+        "<function_calls><invoke name=\"read\"><param name=\"offset\">10</param></invoke></function_calls>";
+    auto missing_req_result = parse_tool_calls(missing_req_xml, read_tools());
+    TEST_ASSERT(missing_req_result.tool_calls.empty());
+    TEST_ASSERT(missing_req_result.cleaned_text == missing_req_xml);
+
+    // Required parameter missing in inline JSON body
+    const std::string missing_req_json =
+        "<function_calls><invoke name=\"read\">{\"offset\": 10}</invoke></function_calls>";
+    auto missing_req_json_result = parse_tool_calls(missing_req_json, read_tools());
+    TEST_ASSERT(missing_req_json_result.tool_calls.empty());
+    TEST_ASSERT(missing_req_json_result.cleaned_text == missing_req_json);
+
+    // Mismatched parameter tags (<param> closed by </parameter>)
+    const std::string mismatched_tags =
+        "<function_calls><invoke name=\"read\"><param name=\"path\">foo.go</parameter></invoke></function_calls>";
+    auto mismatched_result = parse_tool_calls(mismatched_tags, read_tools());
+    TEST_ASSERT(mismatched_result.tool_calls.empty());
+    TEST_ASSERT(mismatched_result.cleaned_text == mismatched_tags);
+
+    // Malformed body with unclosed junk
+    const std::string malformed_body =
+        "<function_calls><invoke name=\"read\"><param name=\"path\">foo.go</unclosed junk</invoke></function_calls>";
+    auto malformed_result = parse_tool_calls(malformed_body, read_tools());
+    TEST_ASSERT(malformed_result.tool_calls.empty());
+    TEST_ASSERT(malformed_result.cleaned_text == malformed_body);
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_function_calls_partial_block_retains_unparsed) {
+    const std::string text =
+        "<function_calls>\n"
+        "  <invoke name=\"read\">\n"
+        "    <param name=\"path\">valid.go</param>\n"
+        "  </invoke>\n"
+        "  <invoke name=\"read\">\n"
+        "    <param name=\"path\">broken.go</unclosed junk\n"
+        "  </invoke>\n"
+        "</function_calls>";
+
+    auto result = parse_tool_calls(text, read_tools());
+    TEST_ASSERT(result.tool_calls.empty());
+    // Unparsed invoke should leave entire text untouched
+    TEST_ASSERT(result.cleaned_text == text);
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_invoke_attribute_quotes) {
+    // Valid double quotes
+    auto r1 = parse_tool_calls("<function_calls><invoke name=\"read\"><param name=\"path\">foo.go</param></invoke></function_calls>", read_tools());
+    TEST_ASSERT(r1.tool_calls.size() == 1);
+    TEST_ASSERT(r1.cleaned_text.empty());
+
+    // Valid single quotes
+    auto r2 = parse_tool_calls("<function_calls><invoke name='read'><param name='path'>foo.go</param></invoke></function_calls>", read_tools());
+    TEST_ASSERT(r2.tool_calls.size() == 1);
+    TEST_ASSERT(r2.cleaned_text.empty());
+
+    // Valid unquoted attribute
+    auto r3 = parse_tool_calls("<function_calls><invoke name=read><param name=path>foo.go</param></invoke></function_calls>", read_tools());
+    TEST_ASSERT(r3.tool_calls.size() == 1);
+    TEST_ASSERT(r3.cleaned_text.empty());
+
+    // Valid invoke with >4 whitespace characters
+    auto r3b = parse_tool_calls("<function_calls><invoke        name=\"read\"><param name=\"path\">foo.go</param></invoke></function_calls>", read_tools());
+    TEST_ASSERT(r3b.tool_calls.size() == 1);
+    TEST_ASSERT(r3b.cleaned_text.empty());
+
+    // Unclosed double quote on invoke name
+    const std::string unclosed1 = "<function_calls><invoke name=\"read><param name=\"path\">foo.go</param></invoke></function_calls>";
+    auto r4 = parse_tool_calls(unclosed1, read_tools());
+    TEST_ASSERT(r4.tool_calls.empty());
+    TEST_ASSERT(r4.cleaned_text == unclosed1);
+
+    // Unclosed single quote on invoke name
+    const std::string unclosed2 = "<function_calls><invoke name='read><param name='path'>foo.go</param></invoke></function_calls>";
+    auto r5 = parse_tool_calls(unclosed2, read_tools());
+    TEST_ASSERT(r5.tool_calls.empty());
+    TEST_ASSERT(r5.cleaned_text == unclosed2);
+
+    // Unclosed double quote on param name
+    const std::string unclosed3 = "<function_calls><invoke name=\"read\"><param name=\"path>foo.go</param></invoke></function_calls>";
+    auto r6 = parse_tool_calls(unclosed3, read_tools());
+    TEST_ASSERT(r6.tool_calls.empty());
+    TEST_ASSERT(r6.cleaned_text == unclosed3);
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_function_calls_empty_block_stripped) {
+    const std::string empty_fc = "<function_calls>\n   \n</function_calls>";
+    auto result = parse_tool_calls(empty_fc, read_tools());
+    TEST_ASSERT(result.tool_calls.empty());
+    TEST_ASSERT(result.cleaned_text == empty_fc);
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_function_calls_unclosed_block) {
+    // Missing </function_calls> - unclosed <function_calls> remains untouched
+    const std::string text =
+        "<function_calls>\n"
+        "<invoke name=\"read\"><param name=\"path\">foo.go</param></invoke>";
+    auto result = parse_tool_calls(text, read_tools());
+    TEST_ASSERT(result.tool_calls.empty());
+    TEST_ASSERT(result.cleaned_text == text);
 }
 
 TEST_CASE(ServerUnitFixture, test_parse_json_tool_call) {

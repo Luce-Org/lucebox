@@ -140,6 +140,8 @@ private:
 
     // Emit a content delta (format-specific).
     void emit_content_delta(std::vector<std::string> & out, const std::string & text);
+    // Emit a reasoning delta (format-specific).
+    void emit_reasoning_delta(std::vector<std::string> & out, const std::string & text);
 
     // SSE data line
     static std::string sse_data(const std::string & json_str);
@@ -153,6 +155,7 @@ private:
     ToolMemory * tool_memory_;
 
     StreamMode   mode_;
+    StreamMode   tool_entry_mode_ = StreamMode::CONTENT;
     std::string  window_;           // holdback buffer
     std::string  tool_buffer_;      // accumulated tool text
     bool         tool_buffer_fallback_to_content_ = false;

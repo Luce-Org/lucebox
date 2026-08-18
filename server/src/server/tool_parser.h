@@ -1,6 +1,6 @@
 // Tool call parser — extracts structured tool calls from generated text.
 //
-// Supports 11 detection patterns:
+// Supports 12 detection patterns:
 //   1. <tool_call><function=name>...</function></tool_call>  (Qwen XML)
 //   2. <function=name>...</function>                          (bare function XML)
 //   3. <function=name(k="v")></function>                      (function signature)
@@ -12,6 +12,7 @@
 //   9. call:<ns>?<verb>{relaxed-JSON-args}                    (gemma plain-text)
 //  10. Bare JSON objects  {"name":..., "arguments":...}       (raw JSON)
 //  11. Whole-response JSON args for one declared tool          {"arg":...}
+//  12. <function_calls><invoke name=name>...</invoke>         (agent invoke XML)
 
 #pragma once
 

@@ -55,6 +55,7 @@ static std::string generate_call_id() {
 
 static const char TOOL_OPEN[] = "<tool_call>";
 static const char FUNCTION_CALL_OPEN[] = "<function_call>";
+static const char FUNCTION_CALLS_OPEN[] = "<function_calls>";
 static const char FUNCTION_OPEN[] = "<function=";
 static const char BARE_FUNCTION_OPEN[] = "<function>";
 static const char FUNCTION_SPACE_OPEN[] = "<function ";
@@ -106,6 +107,7 @@ bool find_tool_syntax_start(const std::string & text, const json & tools,
     while (idx != std::string::npos) {
         if (text.compare(idx, sizeof(TOOL_OPEN) - 1, TOOL_OPEN) == 0 ||
             text.compare(idx, sizeof(FUNCTION_CALL_OPEN) - 1, FUNCTION_CALL_OPEN) == 0 ||
+            text.compare(idx, sizeof(FUNCTION_CALLS_OPEN) - 1, FUNCTION_CALLS_OPEN) == 0 ||
             text.compare(idx, sizeof(FUNCTION_OPEN) - 1, FUNCTION_OPEN) == 0 ||
             text.compare(idx, sizeof(BARE_FUNCTION_OPEN) - 1, BARE_FUNCTION_OPEN) == 0 ||
             text.compare(idx, sizeof(FUNCTION_SPACE_OPEN) - 1,
@@ -136,8 +138,9 @@ bool find_tool_syntax_start(const std::string & text, const json & tools,
 }
 
 size_t tool_syntax_holdback(const json & tools) {
-    // Longest fixed opener is `<parameter name=` (16 bytes).
+    // Retain longest fixed openers: `<parameter name=` (16B), `<function_calls>` (16B).
     size_t holdback = std::max({sizeof(ATTRIBUTE_PARAMETER_OPEN) - 2,
+                                sizeof(FUNCTION_CALLS_OPEN) - 2,
                                 sizeof(FUNCTION_CALL_OPEN) - 2,
                                 sizeof(BARE_FUNCTION_OPEN) - 2});
     if (!tools.is_array()) return holdback;
@@ -151,54 +154,89 @@ size_t tool_syntax_holdback(const json & tools) {
     return holdback;
 }
 
+// Find matching function definition in tools array.
+static const json * find_tool_definition(const json & tools, const std::string & name) {
+    if (tools.is_null() || !tools.is_array() || tools.empty()) return nullptr;
+    for (const auto & t : tools) {
+        if (!t.is_object()) continue;
+        if (t.contains("function") && t["function"].is_object()) {
+            if (t["function"].value("name", "") == name) {
+                return &t["function"];
+            }
+        } else if (t.value("name", "") == name) {
+            return &t;
+        }
+    }
+    return nullptr;
+}
+
 // Check if a function name is in the allowed tools list.
 static bool tool_allowed(const json & tools, const std::string & name) {
     if (tools.is_null() || !tools.is_array() || tools.empty()) return true;
-    for (const auto & t : tools) {
-        const auto & fn = t.contains("function") ? t["function"] : t;
-        if (fn.is_object() && fn.value("name", "") == name) return true;
-    }
-    return false;
+    return find_tool_definition(tools, name) != nullptr;
 }
 
 // Find parameter schema properties for a function.
 static json find_tool_properties(const json & tools, const std::string & name) {
-    if (tools.is_null() || !tools.is_array()) return json::object();
-    for (const auto & t : tools) {
-        const auto & fn = t.contains("function") ? t["function"] : t;
-        if (!fn.is_object() || fn.value("name", "") != name) continue;
-        if (fn.contains("parameters") && fn["parameters"].is_object()) {
-            const auto & params = fn["parameters"];
-            if (params.contains("properties") && params["properties"].is_object()) {
-                return params["properties"];
+    const json * fn = find_tool_definition(tools, name);
+    if (!fn) return json::object();
+    const json & schema = fn->contains("parameters") ? (*fn)["parameters"]
+                        : fn->contains("input_schema") ? (*fn)["input_schema"]
+                        : json();
+    if (schema.is_object() && schema.contains("properties") && schema["properties"].is_object()) {
+        return schema["properties"];
+    }
+    return json::object();
+}
+
+static bool tool_has_missing_required(const json & tools,
+                                      const std::string & name,
+                                      const json & args) {
+    const json * fn = find_tool_definition(tools, name);
+    if (!fn) return false;
+    const json & schema = fn->contains("parameters") ? (*fn)["parameters"]
+                        : fn->contains("input_schema") ? (*fn)["input_schema"]
+                        : json();
+    if (schema.is_object() && schema.contains("required") && schema["required"].is_array()) {
+        for (const auto & req : schema["required"]) {
+            if (req.is_string() && !args.contains(req.get<std::string>())) {
+                return true;
             }
         }
     }
-    return json::object();
+    return false;
 }
 
 // Convert a string value to its JSON-schema-typed equivalent.
 static json convert_param_value(const std::string & val, const std::string & key,
                                 const json & props) {
-    if (val == "null") return nullptr;
-    if (!props.contains(key)) return val;
+    if (!props.is_object() || !props.contains(key)) return val;
 
     const auto & cfg = props[key];
     std::string ptype = "string";
+    bool allows_null = false;
     if (cfg.is_object() && cfg.contains("type")) {
         const auto & t = cfg["type"];
         if (t.is_string()) {
             ptype = t.get<std::string>();
+            if (ptype == "null") allows_null = true;
         } else if (t.is_array()) {
-            // JSON Schema allows "type": ["string","null"]; take the first
-            // non-null string entry instead of throwing.
+            // JSON Schema allows "type": ["integer","null"]; find non-null type
+            // and record whether null is permitted.
             for (const auto & e : t) {
-                if (e.is_string() && e.get<std::string>() != "null") {
-                    ptype = e.get<std::string>();
-                    break;
+                if (e.is_string()) {
+                    if (e.get<std::string>() == "null") allows_null = true;
+                    else if (ptype == "string") ptype = e.get<std::string>();
                 }
             }
         }
+    }
+    if (cfg.is_object() && cfg.value("nullable", false)) {
+        allows_null = true;
+    }
+
+    if (val == "null") {
+        return allows_null ? json(nullptr) : json(val);
     }
 
     // string types
@@ -356,6 +394,30 @@ static const std::regex & re_function_call() {
 
 static const std::regex & re_bare_function_json() {
     static std::regex r(R"(<function>([\s\S]*?)</function>)");
+    return r;
+}
+
+static const std::regex & re_function_calls_block() {
+    static std::regex r(R"(<function_calls>([\s\S]*?)</function_calls>)");
+    return r;
+}
+
+static const std::regex & re_invoke_xml() {
+    static std::regex r(
+        R"re(<invoke\s+(?:name|tool)\s*=\s*(?:"([A-Za-z_][\w.\-]*)"|'([A-Za-z_][\w.\-]*)'|([A-Za-z_][\w.\-]*))\s*>([\s\S]*?)</invoke>)re");
+    return r;
+}
+
+static std::string extract_matched_invoke_name(const std::smatch & m) {
+    if (m[1].matched) return m[1].str();
+    if (m[2].matched) return m[2].str();
+    if (m[3].matched) return m[3].str();
+    return "";
+}
+
+static const std::regex & re_invoke_param_xml() {
+    static std::regex r(
+        R"re(<(param|parameter)(?:\s+name\s*=\s*(?:"([A-Za-z_][\w.\-]*)"|'([A-Za-z_][\w.\-]*)'|([A-Za-z_][\w.\-]*))|=([A-Za-z_][\w.\-]*))\s*>([\s\S]*?)</\1>)re");
     return r;
 }
 
@@ -556,6 +618,60 @@ static bool parse_complete_parameter_body(const std::string & body,
     }
 
     return found_param && trim_ws(body.substr(cursor)).empty();
+}
+
+static bool parse_invoke_body(const std::string & body,
+                             const std::string & fn_name,
+                             const json & tools,
+                             json & out_args) {
+    const json props = find_tool_properties(tools, fn_name);
+    out_args = json::object();
+    const std::string trimmed = trim_ws(body);
+    if (trimmed.empty()) {
+        return !tool_has_missing_required(tools, fn_name, out_args);
+    }
+
+    // 1. Match inline JSON body inside <invoke>
+    if (trimmed.front() == '{' && trimmed.back() == '}') {
+        try {
+            json obj = json::parse(trimmed);
+            if (obj.is_object()) {
+                for (auto & [k, v] : obj.items()) {
+                    if (v.is_string()) {
+                        out_args[k] = convert_param_value(v.get<std::string>(), k, props);
+                    } else {
+                        out_args[k] = v;
+                    }
+                }
+                return !tool_has_missing_required(tools, fn_name, out_args);
+            }
+        } catch (...) {}
+    }
+
+    // 2. Match XML parameters: <param name="...">, <parameter name="...">, <param=...>, <parameter=...>
+    size_t cursor = 0;
+    bool found_param = false;
+    auto pbegin = std::sregex_iterator(body.begin(), body.end(), re_invoke_param_xml());
+    auto pend = std::sregex_iterator();
+    for (auto pit = pbegin; pit != pend; ++pit) {
+        const size_t pos = pit->position();
+        if (!trim_ws(body.substr(cursor, pos - cursor)).empty()) return false;
+
+        std::string key;
+        for (int g : {2, 3, 4, 5}) {
+            if ((*pit)[g].matched) { key = (*pit)[g].str(); break; }
+        }
+        if (key.empty() || out_args.contains(key)) return false;
+
+        out_args[key] = convert_param_value(trim_ws((*pit)[6].str()), key, props);
+        found_param = true;
+        cursor = pos + pit->length();
+    }
+    if (found_param && trim_ws(body.substr(cursor)).empty()) {
+        return !tool_has_missing_required(tools, fn_name, out_args);
+    }
+
+    return false;
 }
 
 // ─── JSON tool call parser ──────────────────────────────────────────────
@@ -807,6 +923,8 @@ static bool parse_function_sig_args(const std::string & arg_text, json & out_arg
     }
     return true;
 }
+
+
 
 // ─── Main parser ────────────────────────────────────────────────────────
 
@@ -1171,6 +1289,50 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
                     add_call(name, args, pos, pos + it->length());
                 }
             } catch (...) {}
+        }
+    }
+
+    // Pattern 4d: <function_calls><invoke name="NAME">...<param name="K">V</param>...</invoke></function_calls>
+    {
+        auto fbegin = std::sregex_iterator(text.begin(), text.end(), re_function_calls_block());
+        auto fend = std::sregex_iterator();
+        for (auto fit = fbegin; fit != fend; ++fit) {
+            const size_t bstart = fit->position();
+            const size_t bend = bstart + fit->length();
+            if (overlaps(removals, bstart)) continue;
+
+            const std::string block_content = (*fit)[1].str();
+            auto begin = std::sregex_iterator(block_content.begin(), block_content.end(), re_invoke_xml());
+            auto end = std::sregex_iterator();
+            std::vector<std::pair<std::string, json>> block_calls;
+            bool valid = true;
+            size_t cursor = 0;
+
+            for (auto it = begin; it != end; ++it) {
+                const size_t rel_pos = it->position();
+                if (!trim_ws(block_content.substr(cursor, rel_pos - cursor)).empty()) {
+                    valid = false;
+                    break;
+                }
+                const std::string fn_name = extract_matched_invoke_name(*it);
+                if (fn_name.empty() || !tool_allowed(tools, fn_name)) {
+                    valid = false;
+                    break;
+                }
+                json args;
+                if (!parse_invoke_body((*it)[4].str(), fn_name, tools, args)) {
+                    valid = false;
+                    break;
+                }
+                block_calls.push_back({fn_name, std::move(args)});
+                cursor = rel_pos + it->length();
+            }
+
+            if (valid && !block_calls.empty() && trim_ws(block_content.substr(cursor)).empty()) {
+                for (auto & bc : block_calls) {
+                    add_call(bc.first, bc.second, bstart, bend);
+                }
+            }
         }
     }
 

@@ -16,6 +16,14 @@ static const char THINK_CLOSE[] = "</think>";
 static constexpr size_t THINK_OPEN_LEN  = 7;
 static constexpr size_t THINK_CLOSE_LEN = 8;
 
+static std::string trim_ws(const std::string & v) {
+    const char * ws = " \t\r\n";
+    const size_t a = v.find_first_not_of(ws);
+    if (a == std::string::npos) return std::string();
+    const size_t b = v.find_last_not_of(ws);
+    return v.substr(a, b - a + 1);
+}
+
 static bool has_request_tools(const json & tools) {
     return tools.is_array() && !tools.empty();
 }
@@ -83,6 +91,7 @@ SseEmitter::SseEmitter(ApiFormat format,
     , tools_(tools)
     , tool_memory_(tool_memory)
     , mode_(started_in_thinking ? StreamMode::REASONING : StreamMode::CONTENT)
+    , tool_entry_mode_(started_in_thinking ? StreamMode::REASONING : StreamMode::CONTENT)
     , active_kind_(started_in_thinking ? "thinking" : "text")
     , stop_sequences_(stop_sequences)
     , created_at_(unix_timestamp())
@@ -305,71 +314,48 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
                 checked_think_prefix_ = true;
             }
 
-            size_t idx = window_.find(THINK_CLOSE);
-            if (idx != std::string::npos) {
-                std::string pre = window_.substr(0, idx);
+            size_t think_close_idx = window_.find(THINK_CLOSE);
+            size_t tool_idx = std::string::npos;
+            bool tool_hit = has_request_tools(tools_) &&
+                            find_tool_syntax_start(window_, tools_, tool_idx);
+
+            struct Hit { size_t pos; int type; };  // 1=think_close, 2=tool
+            std::vector<Hit> hits;
+            if (think_close_idx != std::string::npos) hits.push_back({think_close_idx, 1});
+            if (tool_hit)                             hits.push_back({tool_idx, 2});
+
+            if (!hits.empty()) {
+                std::sort(hits.begin(), hits.end(),
+                          [](const Hit & a, const Hit & b) { return a.pos < b.pos; });
+                auto & h = hits[0];
+                std::string pre = window_.substr(0, h.pos);
                 if (!pre.empty()) {
                     reasoning_text_ += pre;
-                    // Emit reasoning delta
-                    switch (format_) {
-                    case ApiFormat::OPENAI_CHAT:
-                        out.push_back(format_openai_delta({{"reasoning_content", pre}}));
-                        break;
-                    case ApiFormat::ANTHROPIC: {
-                        if (active_kind_ != "thinking") {
-                            out.push_back(sse_event("content_block_stop",
-                                json({{"type", "content_block_stop"}, {"index", block_index_}}).dump()));
-                            block_index_++;
-                            active_kind_ = "thinking";
-                            json new_block = {{"type", "thinking"}, {"thinking", ""}};
-                            out.push_back(sse_event("content_block_start",
-                                json({{"type", "content_block_start"}, {"index", block_index_},
-                                      {"content_block", new_block}}).dump()));
-                        }
-                        out.push_back(sse_event("content_block_delta",
-                            json({{"type", "content_block_delta"}, {"index", block_index_},
-                                  {"delta", {{"type", "thinking_delta"}, {"thinking", pre}}}}).dump()));
-                        break;
-                    }
-                    case ApiFormat::RESPONSES:
-                        // Responses API doesn't stream reasoning — it's stripped
-                        break;
-                    default: break;
-                    }
+                    emit_reasoning_delta(out, pre);
                 }
-                window_ = window_.substr(idx + THINK_CLOSE_LEN);
-                mode_ = StreamMode::CONTENT;
+
+                if (h.type == 1) {
+                    window_ = window_.substr(h.pos + THINK_CLOSE_LEN);
+                    mode_ = StreamMode::CONTENT;
+                } else {
+                    // Tool-call syntax inside reasoning
+                    tool_buffer_ = window_.substr(h.pos);
+                    window_.clear();
+                    tool_entry_mode_ = StreamMode::REASONING;
+                    mode_ = StreamMode::TOOL_BUFFER;
+                }
                 continue;
             }
-            // No close tag yet — emit safe prefix if window is large enough
-            if (window_.size() > std::max(BASE_HOLDBACK, stop_holdback_)) {
-                size_t cut = utf8_safe_len(window_, window_.size() - std::max(BASE_HOLDBACK, stop_holdback_));
+
+            // No close tag or tool start yet — emit safe prefix if window is large enough
+            const size_t holdback = has_request_tools(tools_)
+                ? std::max({BASE_HOLDBACK, stop_holdback_, tool_syntax_holdback(tools_)})
+                : std::max(BASE_HOLDBACK, stop_holdback_);
+            if (window_.size() > holdback) {
+                size_t cut = utf8_safe_len(window_, window_.size() - holdback);
                 if (cut == 0) break;  // not enough complete chars yet
                 std::string safe = window_.substr(0, cut);
-                reasoning_text_ += safe;
-                switch (format_) {
-                case ApiFormat::OPENAI_CHAT:
-                    out.push_back(format_openai_delta({{"reasoning_content", safe}}));
-                    break;
-                case ApiFormat::ANTHROPIC:
-                    if (active_kind_ != "thinking") {
-                        out.push_back(sse_event("content_block_stop",
-                            json({{"type", "content_block_stop"}, {"index", block_index_}}).dump()));
-                        block_index_++;
-                        active_kind_ = "thinking";
-                        json new_block = {{"type", "thinking"}, {"thinking", ""}};
-                        out.push_back(sse_event("content_block_start",
-                            json({{"type", "content_block_start"}, {"index", block_index_},
-                                  {"content_block", new_block}}).dump()));
-                    }
-                    out.push_back(sse_event("content_block_delta",
-                        json({{"type", "content_block_delta"}, {"index", block_index_},
-                              {"delta", {{"type", "thinking_delta"}, {"thinking", safe}}}}).dump()));
-                    break;
-                case ApiFormat::RESPONSES:
-                    break;
-                default: break;
-                }
+                emit_reasoning_delta(out, safe);
                 window_ = window_.substr(cut);
             }
             break;
@@ -411,6 +397,7 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
                 // until finish so the parser can validate it.
                 tool_buffer_ = window_.substr(h.pos);
                 window_.clear();
+                tool_entry_mode_ = StreamMode::CONTENT;
                 mode_ = StreamMode::TOOL_BUFFER;
             }
             continue;
@@ -421,6 +408,7 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
             tool_buffer_ = window_;
             tool_buffer_fallback_to_content_ = true;
             window_.clear();
+            tool_entry_mode_ = StreamMode::CONTENT;
             mode_ = StreamMode::TOOL_BUFFER;
             continue;
         }
@@ -497,6 +485,35 @@ void SseEmitter::emit_content_delta(std::vector<std::string> & out,
     }
 }
 
+void SseEmitter::emit_reasoning_delta(std::vector<std::string> & out, const std::string & text) {
+    if (text.empty()) return;
+    reasoning_text_ += text;
+    switch (format_) {
+    case ApiFormat::OPENAI_CHAT:
+        out.push_back(format_openai_delta({{"reasoning_content", text}}));
+        break;
+    case ApiFormat::ANTHROPIC:
+        if (active_kind_ != "thinking") {
+            if (!active_kind_.empty()) {
+                out.push_back(sse_event("content_block_stop",
+                    json({{"type", "content_block_stop"}, {"index", block_index_}}).dump()));
+                block_index_++;
+            }
+            active_kind_ = "thinking";
+            json new_block = {{"type", "thinking"}, {"thinking", ""}};
+            out.push_back(sse_event("content_block_start",
+                json({{"type", "content_block_start"}, {"index", block_index_},
+                      {"content_block", new_block}}).dump()));
+        }
+        out.push_back(sse_event("content_block_delta",
+            json({{"type", "content_block_delta"}, {"index", block_index_},
+                  {"delta", {{"type", "thinking_delta"}, {"thinking", text}}}}).dump()));
+        break;
+    default:
+        break;
+    }
+}
+
 // ─── emit_finish ────────────────────────────────────────────────────────
 
 std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
@@ -505,17 +522,15 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
 
     // Flush remaining window
     if (mode_ == StreamMode::REASONING && !window_.empty()) {
-        reasoning_text_ += window_;
-        switch (format_) {
-        case ApiFormat::OPENAI_CHAT:
-            out.push_back(format_openai_delta({{"reasoning_content", window_}}));
-            break;
-        case ApiFormat::ANTHROPIC:
-            out.push_back(sse_event("content_block_delta",
-                json({{"type", "content_block_delta"}, {"index", block_index_},
-                      {"delta", {{"type", "thinking_delta"}, {"thinking", window_}}}}).dump()));
-            break;
-        default: break;
+        size_t tool_idx = std::string::npos;
+        if (has_request_tools(tools_) && find_tool_syntax_start(window_, tools_, tool_idx)) {
+            std::string pre = window_.substr(0, tool_idx);
+            emit_reasoning_delta(out, pre);
+            tool_buffer_ = window_.substr(tool_idx);
+            tool_entry_mode_ = StreamMode::REASONING;
+            mode_ = StreamMode::TOOL_BUFFER;
+        } else {
+            emit_reasoning_delta(out, window_);
         }
     } else if (mode_ == StreamMode::CONTENT && !window_.empty()) {
         // Zero-argument Laguna calls in the stripped form are just the bare
@@ -544,6 +559,7 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
                         // path accepts (it emits name-only bodies as
                         // zero-argument calls).
                         tool_buffer_ = "<tool_call>" + tail + "</tool_call>";
+                        tool_entry_mode_ = StreamMode::CONTENT;
                         mode_ = StreamMode::TOOL_BUFFER;
                         zero_arg_call = true;
                         break;
@@ -574,10 +590,31 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
                 tool_memory_->remember(ids, accumulated_raw_);
             }
 
-            // Emit any cleaned text from the tool buffer
+            // Emit any cleaned text from the tool buffer. If the buffer contains </think>,
+            // split at </think> and route the prefix to reasoning before emitting the remainder as content.
             if (!parsed.cleaned_text.empty()) {
-                accumulated_content_ += parsed.cleaned_text;
-                emit_content_delta(out, parsed.cleaned_text);
+                size_t think_close_pos = parsed.cleaned_text.find(THINK_CLOSE);
+                if (think_close_pos != std::string::npos) {
+                    std::string reasoning_part = parsed.cleaned_text.substr(0, think_close_pos);
+                    std::string content_part = parsed.cleaned_text.substr(think_close_pos + THINK_CLOSE_LEN);
+                    emit_reasoning_delta(out, reasoning_part);
+                    if (!content_part.empty()) {
+                        if (first_content_token_index_ < 0) {
+                            first_content_token_index_ = reasoning_text_.empty() ? 0 : std::max(0, emit_token_count_ - 1);
+                        }
+                        accumulated_content_ += content_part;
+                        emit_content_delta(out, content_part);
+                    }
+                } else if (tool_entry_mode_ == StreamMode::REASONING) {
+                    // Tool call was inside unclosed <think>; suffix remains reasoning.
+                    emit_reasoning_delta(out, parsed.cleaned_text);
+                } else {
+                    if (first_content_token_index_ < 0) {
+                        first_content_token_index_ = reasoning_text_.empty() ? 0 : std::max(0, emit_token_count_ - 1);
+                    }
+                    accumulated_content_ += parsed.cleaned_text;
+                    emit_content_delta(out, parsed.cleaned_text);
+                }
             }
 
             fr = "tool_calls";
