@@ -1845,9 +1845,17 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         exact_bands_enabled && batch_supported && requested_chunk > 1 &&
         chunk > 1;
     int pos = kv_offset;
-    const bool save_snapshot =
+    const bool snapshot_requested =
         snap_slot >= 0 && snap_slot < PREFIX_SLOTS &&
         snap_pos > kv_offset && snap_pos <= kv_offset + n_total;
+    // A checkpoint at the terminal prompt boundary needs no special prefill
+    // graph or chunk boundary: the ordinary final chunk already commits the
+    // exact cache and logits that snapshot_save() records. Defer only that
+    // terminal save until the loop completes, while retaining the existing
+    // in-loop handling for checkpoints inside the prompt.
+    const bool terminal_snapshot =
+        snapshot_requested && snap_pos == kv_offset + n_total;
+    const bool save_snapshot = snapshot_requested && !terminal_snapshot;
     // Snapshot construction owns transient checkpoint tensor metadata across
     // thousands of prefill steps. Keep native HIP graph capture/replay eager
     // for this scope so backend executables cannot retain those parent links.
@@ -2065,6 +2073,15 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                     (size_t) spec_old_rows_for_final +
                     (size_t) final_new_rows);
             }
+        }
+    }
+    if (terminal_snapshot && pos == snap_pos) {
+        snapshot_saved = snapshot_save(snap_slot);
+        if (!snapshot_saved) {
+            std::fprintf(stderr,
+                         "[deepseek4] failed to save terminal snapshot "
+                         "slot=%d pos=%d\n",
+                         snap_slot, snap_pos);
         }
     }
     keep_spec_feature_tail(spec_feat_window_,
