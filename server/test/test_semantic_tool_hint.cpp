@@ -233,6 +233,31 @@ TEST_CASE(SemanticToolHintFixture, predictor_request_canonicalizes_anthropic_too
     CHECK(!canonical["function"].contains("input_schema"));
 }
 
+TEST_CASE(SemanticToolHintFixture, predictor_request_handles_non_string_tool_names) {
+    json tools = json::array({
+        {{"type", "function"}, {"function", {{"name", 42}}}},
+        {{"name", false}, {"input_schema", {{"type", "object"}}}},
+        weather_tools()[0],
+    });
+    std::string error;
+    const auto request = build_semantic_tool_predictor_request(
+        json::array({{{"role", "user"}, {"content", "weather"}}}),
+        tools, nullptr, "Qwen3-0.6B", 32, error);
+    REQUIRE(request.has_value());
+    CHECK(error.empty());
+    REQUIRE(request->payload()["tools"].size() == 1);
+    CHECK(request->payload()["tools"][0]["function"]["name"] ==
+          "get_weather");
+
+    tools = json::array({
+        {{"type", "function"}, {"function", {{"name", 42}}}},
+    });
+    CHECK(!build_semantic_tool_predictor_request(
+        json::array({{{"role", "user"}, {"content", "weather"}}}),
+        tools, nullptr, "Qwen3-0.6B", 32, error).has_value());
+    CHECK(error == "predictor_request_has_no_valid_tools");
+}
+
 TEST_CASE(SemanticToolHintFixture, native_predictor_config_is_independent_of_http) {
     SemanticToolPredictorConfig config;
     config.native_model_path = "/models/qwen3-0.6b.gguf";

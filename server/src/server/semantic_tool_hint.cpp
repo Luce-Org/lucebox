@@ -11,14 +11,21 @@ namespace dflash::common {
 
 namespace {
 
+std::string string_member(const json & object, const char * key) {
+    if (!object.is_object()) return {};
+    const auto member = object.find(key);
+    return member != object.end() && member->is_string()
+        ? member->get<std::string>() : std::string{};
+}
+
 bool request_has_function(const json & tools, const std::string & name) {
     if (!tools.is_array() || name.empty()) return false;
     for (const auto & tool : tools) {
         if (!tool.is_object()) continue;
-        if (tool.value("name", "") == name) return true;
+        if (string_member(tool, "name") == name) return true;
         const auto function = tool.find("function");
         if (function != tool.end() && function->is_object() &&
-            function->value("name", "") == name) {
+            string_member(*function, "name") == name) {
             return true;
         }
     }
@@ -30,10 +37,10 @@ std::string sole_request_function(const json & tools) {
     std::string sole;
     for (const auto & tool : tools) {
         if (!tool.is_object()) continue;
-        std::string name = tool.value("name", "");
+        std::string name = string_member(tool, "name");
         const auto function = tool.find("function");
         if (name.empty() && function != tool.end() && function->is_object()) {
-            name = function->value("name", "");
+            name = string_member(*function, "name");
         }
         if (name.empty()) continue;
         if (!sole.empty() && sole != name) return {};
@@ -59,8 +66,8 @@ bool parse_arguments(const json & value, ordered_json & out) {
 
 bool parse_call_object(const json & value, SemanticToolCall & out) {
     if (!value.is_object()) return false;
-    const std::string name = value.value(
-        "name", value.value("function", std::string{}));
+    std::string name = string_member(value, "name");
+    if (name.empty()) name = string_member(value, "function");
     if (name.empty()) return false;
 
     const json * arguments = nullptr;
@@ -263,10 +270,10 @@ bool semantic_message_content(
             continue;
         }
         if (!part.is_object()) continue;
-        const std::string type = part.value("type", "");
+        const std::string type = string_member(part, "type");
         if (type == "text" || type == "input_text" ||
             type == "output_text") {
-            text += part.value("text", "");
+            text += string_member(part, "text");
         }
     }
     return !semantic_deadline_expired(deadline);
@@ -276,9 +283,9 @@ std::string forced_tool_name(const json & choice) {
     if (!choice.is_object()) return {};
     const auto function = choice.find("function");
     if (function != choice.end() && function->is_object()) {
-        return function->value("name", "");
+        return string_member(*function, "name");
     }
-    return choice.value("name", "");
+    return string_member(choice, "name");
 }
 
 json canonical_semantic_tools(const json & tools) {
@@ -289,7 +296,7 @@ json canonical_semantic_tools(const json & tools) {
         const json * source = &tool;
         const auto wrapped = tool.find("function");
         if (wrapped != tool.end() && wrapped->is_object()) source = &*wrapped;
-        const std::string name = source->value("name", "");
+        const std::string name = string_member(*source, "name");
         if (name.empty()) continue;
 
         json function = {{"name", name}};
@@ -385,7 +392,7 @@ bool materialize_declared_tool_defaults(
         const json & candidate = tool.contains("function") &&
                 tool["function"].is_object()
             ? tool["function"] : tool;
-        if (candidate.value("name", "") == call.name) {
+        if (string_member(candidate, "name") == call.name) {
             function = &candidate;
             break;
         }
@@ -450,13 +457,18 @@ build_semantic_tool_predictor_request(
         error = "predictor_request_too_large";
         return std::nullopt;
     }
+    json canonical_tools = canonical_semantic_tools(tools);
+    if (canonical_tools.empty()) {
+        error = "predictor_request_has_no_valid_tools";
+        return std::nullopt;
+    }
     json request = {
         {"model", sidecar_model},
         {"stream", false},
         {"temperature", 0},
         {"max_tokens", max_tokens},
         {"messages", messages},
-        {"tools", canonical_semantic_tools(tools)},
+        {"tools", std::move(canonical_tools)},
         {"tool_choice", effective_choice},
     };
     // Tool-schema normalization can add OpenAI wrapper objects. Validate the
@@ -487,7 +499,7 @@ std::string build_native_semantic_tool_predictor_prompt(
     const json & predictor_request = bounded_request.payload();
     const json choice = predictor_request.value("tool_choice", json("auto"));
     if ((choice.is_string() && choice.get<std::string>() == "none") ||
-        (choice.is_object() && choice.value("type", "") == "none")) {
+        (choice.is_object() && string_member(choice, "type") == "none")) {
         error = "native_predictor_tool_choice_none";
         return {};
     }
@@ -516,7 +528,8 @@ std::string build_native_semantic_tool_predictor_prompt(
             return {};
         }
         if (!message.is_object()) continue;
-        std::string role = message.value("role", "user");
+        std::string role = string_member(message, "role");
+        if (role.empty()) role = "user";
         if (role == "developer") role = "system";
         std::string content;
         if (!semantic_message_content(message, deadline, content)) {
@@ -614,7 +627,7 @@ std::string build_native_semantic_tool_predictor_prompt(
                 const json & call = raw_call.contains("function") &&
                                          raw_call["function"].is_object()
                     ? raw_call["function"] : raw_call;
-                const std::string name = call.value("name", "");
+                const std::string name = string_member(call, "name");
                 if (name.empty() || !call.contains("arguments")) continue;
                 if (!message.content.empty()) rendered += "\n";
                 rendered += "<tool_call>\n{\"name\": \"" + name +

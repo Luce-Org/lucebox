@@ -75,11 +75,11 @@ bool Qwen3ToolPredictorIpcClient::start(
         int max_ctx,
         const std::string & work_dir,
         int readiness_timeout_ms) {
-#if defined(_WIN32)
+#if !defined(__linux__)
     (void)bin; (void)model_path; (void)gpu; (void)max_ctx; (void)work_dir;
     (void)readiness_timeout_ms;
     std::fprintf(stderr,
-                 "Qwen3 tool-predictor IPC is only implemented on POSIX hosts\n");
+                 "Qwen3 tool-predictor IPC is only implemented on Linux hosts\n");
     return false;
 #else
     std::lock_guard<std::timed_mutex> lock(mutex_);
