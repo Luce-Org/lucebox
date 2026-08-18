@@ -2027,7 +2027,7 @@ static void test_prefill_readout_lifecycle_and_fused_exclusion() {
         /*full_layer_range=*/true,
         /*fused_verify_enabled=*/true,
         /*fused_verify_candidate=*/false));
-    TEST_ASSERT(deepseek4_should_warn_fused_verify_inactive(
+    TEST_ASSERT(!deepseek4_should_warn_fused_verify_inactive(
         /*n_tokens=*/4, /*verify_hooks=*/nullptr,
         /*full_layer_range=*/true,
         /*fused_verify_enabled=*/true,

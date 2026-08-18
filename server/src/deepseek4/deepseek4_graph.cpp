@@ -6893,8 +6893,8 @@ bool deepseek4_should_warn_fused_verify_inactive(
         bool fused_verify_enabled,
         bool fused_verify_candidate) {
     return fused_verify_enabled && !fused_verify_candidate &&
-           n_tokens >= 2 && full_layer_range &&
-           (!verify_hooks || verify_hooks->allow_fused_verify);
+           n_tokens >= 2 && full_layer_range && verify_hooks &&
+           verify_hooks->allow_fused_verify;
 }
 
 DeepSeek4RecursiveOutputIntent deepseek4_recursive_output_intent(
