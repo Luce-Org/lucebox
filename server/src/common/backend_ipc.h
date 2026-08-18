@@ -140,6 +140,9 @@ public:
 
     bool start(const BackendIpcLaunchConfig & cfg);
     void close();
+    // Stop a wedged daemon without waiting indefinitely for graceful EOF
+    // handling. Used by optional sidecar lanes with hard deadlines.
+    void terminate();
 
     bool active() const { return active_; }
     FILE * command_stream() const { return cmd_; }
@@ -160,6 +163,7 @@ public:
     bool read_shared_payload(void * data, size_t bytes, uint64_t seq) const;
 
 private:
+    void close_impl(bool force_terminate);
 #if !defined(_WIN32)
     bool init_work_dir(const std::string & requested);
     bool init_shared_payload(size_t bytes);

@@ -12,9 +12,6 @@
 //                              [--max-tokens 4096] [--target-device auto:0]
 
 #include "http_server.h"
-#if defined(DFLASH27B_BACKEND_HIP)
-#include "tool_speculation_hip_probe.h"
-#endif
 #include "chat_template.h"
 #include "model_card.h"
 #include "common/backend_factory.h"
@@ -206,10 +203,9 @@ static void print_usage(const char * prog) {
         "                               overlap is an experimental throughput mode.\n"
         "  --tool-hint-native-work-dir <PATH>\n"
         "                               Optional private IPC scratch directory.\n"
-        "  --tool-hint-sidecar-timeout-ms <N>\n"
-        "                               Hard sidecar deadline (default: 2000).\n"
-        "  --tool-hint-sidecar-max-tokens <N>\n"
-        "                               Predictor completion cap (default: 96).\n"
+        "  --tool-hint-timeout-ms <N>  Hard native/HTTP predictor deadline\n"
+        "                               (default: 2000).\n"
+        "  --tool-hint-max-tokens <N>  Predictor completion cap (default: 96).\n"
         "  --tool-hint-execution-confidence <P>\n"
         "                               Calibrated 0..1 prior for automatic external\n"
         "                               tool admission (default: 0.75).\n"
@@ -219,11 +215,6 @@ static void print_usage(const char * prog) {
         "  --tool-spec-executor <path>  Trusted executor adapter. Receives one\n"
         "                               dflash.tool-speculation.v1 JSON request\n"
         "                               on stdin; no shell is used.\n"
-#if defined(DFLASH27B_BACKEND_HIP)
-        "  --tool-spec-hip-sgemm-probe <DEVICE:MATRIX>\n"
-        "                               Benchmark-only trusted in-process HIP\n"
-        "                               executor with a per-lane CU-masked stream.\n"
-#endif
         "  --tool-spec-profile <path>   Measured resource-lane frontier JSON.\n"
         "  --tool-spec-allow <name>     Allow one read-only/idempotent tool; repeatable.\n"
         "  --tool-spec-cpu-affinity <LIST>\n"
@@ -287,9 +278,6 @@ int main(int argc, char ** argv) {
     // Parse arguments.
     BackendArgs bargs;
     ServerConfig sconfig;
-    int tool_spec_hip_probe_device = -1;
-    int tool_spec_hip_probe_matrix = 0;
-    int tool_spec_hip_probe_total_cus = 0;
     bargs.model_path = argv[1];
     bool   spark_autotune = false; // --spark: self-tuning hot/cold MoE residency
     int    spark_slots = -1;       // --spark-slots: explicit cache slots/layer (-1=auto)
@@ -660,20 +648,22 @@ int main(int argc, char ** argv) {
                     "before-model or overlap\n");
                 return 2;
             }
-        } else if (std::strcmp(argv[i], "--tool-hint-sidecar-timeout-ms") == 0 &&
+        } else if ((std::strcmp(argv[i], "--tool-hint-timeout-ms") == 0 ||
+                    std::strcmp(argv[i], "--tool-hint-sidecar-timeout-ms") == 0) &&
                    i + 1 < argc) {
             sconfig.semantic_tool_predictor.timeout_ms = std::atoi(argv[++i]);
             if (sconfig.semantic_tool_predictor.timeout_ms <= 0) {
                 std::fprintf(stderr,
-                    "[server] --tool-hint-sidecar-timeout-ms must be positive\n");
+                    "[server] --tool-hint-timeout-ms must be positive\n");
                 return 2;
             }
-        } else if (std::strcmp(argv[i], "--tool-hint-sidecar-max-tokens") == 0 &&
+        } else if ((std::strcmp(argv[i], "--tool-hint-max-tokens") == 0 ||
+                    std::strcmp(argv[i], "--tool-hint-sidecar-max-tokens") == 0) &&
                    i + 1 < argc) {
             sconfig.semantic_tool_predictor.max_tokens = std::atoi(argv[++i]);
             if (sconfig.semantic_tool_predictor.max_tokens <= 0) {
                 std::fprintf(stderr,
-                    "[server] --tool-hint-sidecar-max-tokens must be positive\n");
+                    "[server] --tool-hint-max-tokens must be positive\n");
                 return 2;
             }
         } else if (std::strcmp(
@@ -692,28 +682,6 @@ int main(int argc, char ** argv) {
         } else if (std::strcmp(argv[i], "--tool-spec-executor") == 0 &&
                    i + 1 < argc) {
             sconfig.tool_speculation.executor_path = argv[++i];
-#if defined(DFLASH27B_BACKEND_HIP)
-        } else if (std::strcmp(argv[i], "--tool-spec-hip-sgemm-probe") == 0 &&
-                   i + 1 < argc) {
-            const char * value = argv[++i];
-            char * separator = nullptr;
-            const long device = std::strtol(value, &separator, 10);
-            if (separator == value || !separator || *separator != ':') {
-                std::fprintf(stderr,
-                    "[server] --tool-spec-hip-sgemm-probe expects DEVICE:MATRIX\n");
-                return 2;
-            }
-            char * end = nullptr;
-            const long matrix = std::strtol(separator + 1, &end, 10);
-            if (!end || *end != '\0' || device < 0 ||
-                matrix <= 0 || matrix > 8192) {
-                std::fprintf(stderr,
-                    "[server] invalid --tool-spec-hip-sgemm-probe DEVICE:MATRIX\n");
-                return 2;
-            }
-            tool_spec_hip_probe_device = static_cast<int>(device);
-            tool_spec_hip_probe_matrix = static_cast<int>(matrix);
-#endif
         } else if (std::strcmp(argv[i], "--tool-spec-profile") == 0 &&
                    i + 1 < argc) {
             sconfig.tool_speculation.profile_path = argv[++i];
@@ -819,21 +787,6 @@ int main(int argc, char ** argv) {
         }
     }
 
-    if (tool_spec_hip_probe_device >= 0) {
-#if defined(DFLASH27B_BACKEND_HIP)
-        std::string executor_error;
-        sconfig.tool_speculation.in_process_executor =
-            create_hip_sgemm_tool_speculation_executor(
-                tool_spec_hip_probe_device,
-                tool_spec_hip_probe_matrix,
-                tool_spec_hip_probe_total_cus,
-                executor_error);
-        if (!sconfig.tool_speculation.in_process_executor) {
-            std::fprintf(stderr, "[server] %s\n", executor_error.c_str());
-            return 2;
-        }
-#endif
-    }
     const bool semantic_http_predictor_requested =
         !sconfig.semantic_tool_predictor.url.empty() ||
         !sconfig.semantic_tool_predictor.model.empty();
@@ -858,33 +811,20 @@ int main(int argc, char ** argv) {
     }
     const bool tool_speculation_requested =
         !sconfig.tool_speculation.executor_path.empty() ||
-        static_cast<bool>(sconfig.tool_speculation.in_process_executor) ||
         !sconfig.tool_speculation.profile_path.empty() ||
         !sconfig.tool_speculation.allowed_tools.empty() ||
         !sconfig.tool_speculation.cpu_affinity.empty();
     if (tool_speculation_requested) {
-        sconfig.tool_speculation.model_routing_static =
-            !environment_flag_enabled(
-                "DFLASH_MOE_TP_DYNAMIC_ROUTE_BALANCE") &&
-            !environment_flag_enabled(
-                "DFLASH_DS4_TP_DYNAMIC_ROUTE_BALANCE");
-        sconfig.tool_speculation.model_expert_ownership_unique =
-            !environment_flag_enabled("DFLASH_MOE_DUPLICATE_HOT_ON_COLD");
-        const bool has_child_executor =
-            !sconfig.tool_speculation.executor_path.empty();
-        const bool has_in_process_executor =
-            static_cast<bool>(sconfig.tool_speculation.in_process_executor);
-        if (has_child_executor == has_in_process_executor ||
+        if (sconfig.tool_speculation.executor_path.empty() ||
             sconfig.tool_speculation.profile_path.empty() ||
             sconfig.tool_speculation.allowed_tools.empty()) {
             std::fprintf(stderr,
-                "[server] tool speculation requires exactly one executor, "
+                "[server] tool speculation requires --tool-spec-executor, "
                 "--tool-spec-profile, and at least one --tool-spec-allow\n");
             return 2;
         }
 #if !defined(_WIN32)
-        if (has_child_executor &&
-            ::access(sconfig.tool_speculation.executor_path.c_str(), X_OK) != 0) {
+        if (::access(sconfig.tool_speculation.executor_path.c_str(), X_OK) != 0) {
             std::fprintf(stderr,
                 "[server] tool speculation executor is not executable: %s\n",
                 sconfig.tool_speculation.executor_path.c_str());
@@ -925,79 +865,6 @@ int main(int argc, char ** argv) {
                 "[server] tool profile requires executor '%s', got '%s'\n",
                 executor_contract.c_str(),
                 sconfig.tool_speculation.execution_mode());
-            return 2;
-        }
-        if (sconfig.tool_speculation.policy.benchmark_only() &&
-            !has_in_process_executor) {
-            std::fprintf(stderr,
-                "[server] provisional_benchmark_only tool profiles cannot "
-                "enable an external production executor\n");
-            return 2;
-        }
-        if (has_in_process_executor) {
-            int max_same_gpu_percentage = 0;
-            for (const auto & lane :
-                 sconfig.tool_speculation.policy.lanes()) {
-                if (lane.decode_interference_qualified &&
-                    lane.accelerator_relation == "same_physical_gpu") {
-                    max_same_gpu_percentage = std::max(
-                        max_same_gpu_percentage,
-                        lane.resource_percentage);
-                }
-            }
-            if (max_same_gpu_percentage > 0) {
-                const int reserved_cus =
-                    (tool_spec_hip_probe_total_cus *
-                         max_same_gpu_percentage +
-                     99) /
-                    100;
-                if (reserved_cus <= 0 ||
-                    reserved_cus >= tool_spec_hip_probe_total_cus) {
-                    std::fprintf(stderr,
-                        "[server] same-GPU HIP tool lane would reserve %d "
-                        "of %d CUs; at least one model CU is required\n",
-                        reserved_cus, tool_spec_hip_probe_total_cus);
-                    return 2;
-                }
-                const std::string isolation =
-                    std::to_string(tool_spec_hip_probe_device) + ":" +
-                    std::to_string(reserved_cus);
-                const char * existing =
-                    std::getenv("DFLASH_HIP_RESERVED_TOOL_LANE");
-                if (existing && *existing && isolation != existing) {
-                    std::fprintf(stderr,
-                        "[server] DFLASH_HIP_RESERVED_TOOL_LANE=%s "
-                        "conflicts with profile-required %s\n",
-                        existing, isolation.c_str());
-                    return 2;
-                }
-                set_environment_variable(
-                    "DFLASH_HIP_RESERVED_TOOL_LANE",
-                    isolation.c_str(), true);
-                sconfig.tool_speculation.hip_tool_device =
-                    tool_spec_hip_probe_device;
-                sconfig.tool_speculation.hip_reserved_tool_compute_units =
-                    reserved_cus;
-                std::fprintf(stderr,
-                    "[server] disjoint HIP tool lane: device %d reserves "
-                    "%d/%d low CU(s); model streams use the complement\n",
-                    tool_spec_hip_probe_device, reserved_cus,
-                    tool_spec_hip_probe_total_cus);
-            }
-        }
-        if (sconfig.tool_speculation.policy.requires_static_model_routing() &&
-            !sconfig.tool_speculation.model_routing_static) {
-            std::fprintf(stderr,
-                "[server] same-physical-GPU tool lanes require static model "
-                "routing; disable DFLASH_MOE_TP_DYNAMIC_ROUTE_BALANCE and "
-                "DFLASH_DS4_TP_DYNAMIC_ROUTE_BALANCE\n");
-            return 2;
-        }
-        if (sconfig.tool_speculation.policy.requires_unique_expert_ownership() &&
-            !sconfig.tool_speculation.model_expert_ownership_unique) {
-            std::fprintf(stderr,
-                "[server] same-physical-GPU tool lanes require unique expert "
-                "ownership; disable DFLASH_MOE_DUPLICATE_HOT_ON_COLD\n");
             return 2;
         }
         std::fprintf(stderr,
@@ -1541,12 +1408,6 @@ int main(int argc, char ** argv) {
                      sconfig.tool_speculation.profile_path.c_str());
         std::fprintf(stderr, "[server] │  tool_spec_decode = %s\n",
                      "spec preserved (unqualified lanes deferred)");
-        std::fprintf(stderr, "[server] │  tool_spec_routing= %s\n",
-                     sconfig.tool_speculation.model_routing_static
-                         ? "static" : "dynamic");
-        std::fprintf(stderr, "[server] │  tool_spec_experts= %s\n",
-                     sconfig.tool_speculation.model_expert_ownership_unique
-                         ? "unique ownership" : "duplicated ownership");
         std::fprintf(stderr, "[server] │  tool_spec_lanes =");
         for (const auto & lane : sconfig.tool_speculation.policy.lanes()) {
             std::fprintf(stderr, " %d%%:%s",

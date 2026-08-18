@@ -4,18 +4,24 @@
 #include <nlohmann/json.hpp>
 
 #include <chrono>
+#include <cerrno>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
 #if !defined(_WIN32)
+#  include <fcntl.h>
+#  include <signal.h>
 #  include <sys/stat.h>
 #  include <unistd.h>
 #  if defined(__linux__)
+#    include <features.h>
 #    include <sched.h>
 #  endif
 #endif
@@ -25,8 +31,6 @@ using dflash::common::CanonicalToolInvocation;
 using dflash::common::ToolCall;
 using dflash::common::ToolSpeculationAttempt;
 using dflash::common::ToolSpeculationConfig;
-using dflash::common::ToolSpeculationExecution;
-using dflash::common::ToolSpeculationExecutor;
 using dflash::common::ToolSpeculationPolicy;
 using dflash::common::ToolSpeculationPrediction;
 using dflash::common::build_tool_speculation_prediction;
@@ -39,69 +43,6 @@ using dflash::common::render_tool_speculation_sse;
 namespace {
 struct ToolSpeculationFixture {};
 
-struct FakeExecutionState {
-    json request;
-    std::vector<std::string> controls;
-    bool terminated = false;
-    bool collected = false;
-};
-
-class FakeExecution final : public ToolSpeculationExecution {
-public:
-    explicit FakeExecution(std::shared_ptr<FakeExecutionState> state)
-        : state_(std::move(state)) {}
-
-    bool send_control(const std::string & operation) override {
-        state_->controls.push_back(operation);
-        return operation == "commit" || operation == "cancel";
-    }
-
-    bool collect_result(int timeout_ms,
-                        size_t max_result_bytes,
-                        json & result,
-                        double & wait_ms,
-                        std::string & error) override {
-        (void) timeout_ms;
-        state_->collected = true;
-        result = {{"value", 42}};
-        wait_ms = 0.0;
-        if (result.dump().size() > max_result_bytes) {
-            error = "executor_result_too_large";
-            return false;
-        }
-        error.clear();
-        return true;
-    }
-
-    void terminate(bool allow_control_grace) override {
-        (void) allow_control_grace;
-        state_->terminated = true;
-    }
-
-private:
-    std::shared_ptr<FakeExecutionState> state_;
-};
-
-class FakeExecutor final : public ToolSpeculationExecutor {
-public:
-    explicit FakeExecutor(std::shared_ptr<FakeExecutionState> state)
-        : state_(std::move(state)) {}
-
-    std::unique_ptr<ToolSpeculationExecution> start(
-            const json & request, std::string & error) override {
-        state_->request = request;
-        error.clear();
-        return std::make_unique<FakeExecution>(state_);
-    }
-
-    const char * mode_name() const override {
-        return "fake_in_process";
-    }
-
-private:
-    std::shared_ptr<FakeExecutionState> state_;
-};
-
 json policy_fixture(bool decode_interference_qualified = true) {
     auto path = [decode_interference_qualified](
                     double hit_task, double miss_task,
@@ -109,6 +50,7 @@ json policy_fixture(bool decode_interference_qualified = true) {
         return json{
             {"decode_interference_qualified",
              decode_interference_qualified},
+            {"accelerator_relation", "non_accelerator"},
             {"hit", {
                 {"control_task_mean_ms", 100.0},
                 {"speculative_task_mean_ms", hit_task},
@@ -122,6 +64,8 @@ json policy_fixture(bool decode_interference_qualified = true) {
         };
     };
     json fixture = {
+        {"profile_status", "qualified"},
+        {"executor", "child_process"},
         {"path_summary", {
             {"25", path(80.0, 101.0, 2.0)},
             {"50", path(60.0, 110.0, 7.0)},
@@ -309,81 +253,44 @@ TEST_CASE(ToolSpeculationFixture, profile_metadata_is_fail_closed) {
     ToolSpeculationPolicy policy;
     std::string error;
     json fixture = policy_fixture();
-    fixture["profile_status"] = "provisional_benchmark_only";
-    fixture["executor"] = "in_process_hip_cu_mask";
     CHECK(policy.load_json(fixture, error));
-    CHECK(policy.benchmark_only());
-    CHECK(policy.executor_contract() == "in_process_hip_cu_mask");
+    CHECK(policy.profile_status() == "qualified");
+    CHECK(policy.executor_contract() == "child_process");
+
+    fixture["profile_status"] = "provisional_benchmark_only";
+    CHECK(!policy.load_json(fixture, error));
+    CHECK(policy.empty());
 
     fixture["profile_status"] = "unknown";
     CHECK(!policy.load_json(fixture, error));
     CHECK(policy.empty());
+
+    fixture = policy_fixture();
+    fixture.erase("executor");
+    CHECK(!policy.load_json(fixture, error));
+    CHECK(policy.empty());
+
+    fixture = policy_fixture();
+    fixture.erase("profile_status");
+    CHECK(!policy.load_json(fixture, error));
+    CHECK(policy.empty());
+
+    fixture = policy_fixture();
+    fixture["path_summary"]["25"].erase("accelerator_relation");
+    CHECK(!policy.load_json(fixture, error));
+    CHECK(policy.empty());
 }
 
-TEST_CASE(ToolSpeculationFixture, same_gpu_profile_declares_routing_requirements) {
+TEST_CASE(ToolSpeculationFixture, same_gpu_profile_is_rejected) {
     ToolSpeculationPolicy policy;
     std::string error;
     json fixture = policy_fixture();
     for (auto & lane : fixture["path_summary"]) {
         lane["accelerator_relation"] = "same_physical_gpu";
     }
-    CHECK(policy.load_json(fixture, error));
-    CHECK(!policy.requires_static_model_routing());
-    CHECK(!policy.requires_unique_expert_ownership());
-
-    for (auto & lane : fixture["path_summary"]) {
-        lane["requires_static_model_routing"] = true;
-    }
-    CHECK(policy.load_json(fixture, error));
-    CHECK(policy.requires_static_model_routing());
-    CHECK(!policy.requires_unique_expert_ownership());
-
-    for (auto & lane : fixture["path_summary"]) {
-        lane["requires_unique_expert_ownership"] = true;
-    }
-    CHECK(policy.load_json(fixture, error));
-    CHECK(policy.requires_static_model_routing());
-    CHECK(policy.requires_unique_expert_ownership());
-    const auto decision = policy.choose(1.0, 2.0);
-    CHECK(decision.admitted);
-    CHECK(decision.accelerator_relation == "same_physical_gpu");
-}
-
-TEST_CASE(ToolSpeculationFixture, same_gpu_profile_obeys_measured_break_even) {
-    ToolSpeculationPolicy policy;
-    std::string error;
-    CHECK(policy.load_json(json{
-        {"path_summary", {
-            {"100", {
-                {"accelerator_relation", "same_physical_gpu"},
-                {"requires_static_model_routing", true},
-                {"requires_unique_expert_ownership", true},
-                {"decode_interference_qualified", true},
-                {"hit", {
-                    {"control_task_mean_ms", 2670.178},
-                    {"speculative_task_mean_ms", 2389.530},
-                    {"model_slowdown_percent", 169.109},
-                }},
-                {"miss", {
-                    {"control_task_mean_ms", 2670.178},
-                    {"speculative_task_mean_ms", 4171.884},
-                    {"model_slowdown_percent", 169.109},
-                }},
-            }},
-        }},
-    }, error));
-
-    const auto below = policy.choose(0.84, 3.0);
-    CHECK(!below.admitted);
-    CHECK(below.reason == "below_profile_break_even");
-
-    const auto above = policy.choose(0.85, 3.0);
-    CHECK(above.admitted);
-    CHECK(above.resource_percentage == 100);
-
-    const auto guarded = policy.choose(1.0, 1.20);
-    CHECK(!guarded.admitted);
-    CHECK(guarded.reason == "model_slowdown_guardrail");
+    CHECK(!policy.load_json(fixture, error));
+    CHECK(error.find("accelerator_relation") != std::string::npos);
+    CHECK(policy.empty());
 }
 
 TEST_CASE(ToolSpeculationFixture, non_allowlisted_tool_is_deferred) {
@@ -398,53 +305,6 @@ TEST_CASE(ToolSpeculationFixture, non_allowlisted_tool_is_deferred) {
     CHECK(metadata["status"] == "deferred");
     CHECK(metadata["reason"] == "tool_not_allowlisted");
     CHECK(!metadata.contains("result"));
-}
-
-TEST_CASE(ToolSpeculationFixture, in_process_exact_match_commits_private_result) {
-    auto state = std::make_shared<FakeExecutionState>();
-    ToolSpeculationConfig config = test_config();
-    config.executor_path.clear();
-    config.in_process_executor = std::make_shared<FakeExecutor>(state);
-    CHECK(config.enabled());
-    CHECK(std::string(config.execution_mode()) == "fake_in_process");
-
-    auto attempt = ToolSpeculationAttempt::create(
-        config, prediction(), "request_in_process_hit");
-    attempt->start();
-    CHECK(attempt->running());
-    CHECK(state->request["call"]["name"] == "lookup");
-    CHECK(state->request["resource_percentage"] == 100);
-
-    const json metadata = attempt->resolve({
-        ToolCall{"call_1", "lookup", R"({"b":2,"a":1})"},
-    });
-    CHECK(metadata["status"] == "hit");
-    CHECK(metadata["result"]["value"] == 42);
-    CHECK(state->collected);
-    CHECK(state->controls.size() == 1);
-    CHECK(state->controls[0] == "commit");
-    CHECK(!state->terminated);
-}
-
-TEST_CASE(ToolSpeculationFixture, in_process_mismatch_cancels_private_result) {
-    auto state = std::make_shared<FakeExecutionState>();
-    ToolSpeculationConfig config = test_config();
-    config.executor_path.clear();
-    config.in_process_executor = std::make_shared<FakeExecutor>(state);
-
-    auto attempt = ToolSpeculationAttempt::create(
-        config, prediction(), "request_in_process_miss");
-    attempt->start();
-    const json metadata = attempt->resolve({
-        ToolCall{"call_1", "lookup", R"({"a":999})"},
-    });
-    CHECK(metadata["status"] == "miss");
-    CHECK(metadata["reason"] == "invocation_mismatch");
-    CHECK(!metadata.contains("result"));
-    CHECK(!state->collected);
-    CHECK(state->terminated);
-    CHECK(state->controls.size() == 1);
-    CHECK(state->controls[0] == "cancel");
 }
 
 #if !defined(_WIN32)
@@ -535,7 +395,7 @@ TEST_CASE(ToolSpeculationFixture, exact_match_exposes_result_and_resource_share)
     CHECK(metadata["status"] == "hit");
     CHECK(metadata["resource_percentage"] == 100);
     CHECK(metadata["result"]["resource"] == "100");
-    CHECK(metadata["result"]["relation"] == "unspecified");
+    CHECK(metadata["result"]["relation"] == "non_accelerator");
     CHECK(metadata["result"]["value"] == 42);
     CHECK(control.find("\"op\":\"commit\"") != std::string::npos);
     CHECK(control.find("\"authoritative_resource_percentage\":100") !=
@@ -573,6 +433,133 @@ TEST_CASE(ToolSpeculationFixture, executor_failure_is_private) {
     CHECK(metadata["status"] == "failed");
     CHECK(metadata["reason"] == "executor_launch_failed");
     CHECK(!metadata.contains("result"));
+}
+
+TEST_CASE(ToolSpeculationFixture, executor_timeout_starts_at_launch) {
+    const std::string path = make_executor_script(
+        "sleep 1\n"
+        "printf '{\"ok\":true,\"result\":{\"value\":42}}\\n'\n");
+    ToolSpeculationConfig config = test_config(path);
+    config.timeout_ms = 25;
+    auto attempt = ToolSpeculationAttempt::create(
+        config, prediction(), "request_launch_deadline");
+    attempt->start();
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    const auto resolve_started = std::chrono::steady_clock::now();
+    const json metadata = attempt->resolve({
+        ToolCall{"call_1", "lookup", R"({"a":1,"b":2})"},
+    });
+    const double resolve_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - resolve_started).count();
+    ::unlink(path.c_str());
+
+    CHECK(metadata["status"] == "failed");
+    CHECK(metadata["reason"] == "speculative_executor_failure");
+    CHECK(metadata["detail"] == "executor_timeout");
+    CHECK(!metadata.contains("result"));
+    CHECK(resolve_ms < 500.0);
+}
+
+TEST_CASE(ToolSpeculationFixture, executor_timeout_terminates_process_group) {
+#if defined(__linux__)
+    const std::string marker_path = make_temp_path();
+    const std::string path = make_executor_script(
+        "sleep 10 &\n"
+        "printf '%s' \"$!\" > \"" + marker_path + "\"\n"
+        "IFS= read -r control\n"
+        "wait\n");
+    ToolSpeculationConfig config = test_config(path);
+    config.timeout_ms = 100;
+    auto attempt = ToolSpeculationAttempt::create(
+        config, prediction(), "request_process_group_deadline");
+    attempt->start();
+    const json metadata = attempt->resolve({
+        ToolCall{"call_1", "lookup", R"({"a":1,"b":2})"},
+    });
+    const std::string child_text = read_text_file(marker_path);
+    ::unlink(path.c_str());
+    ::unlink(marker_path.c_str());
+
+    CHECK(metadata["status"] == "failed");
+    CHECK(metadata["detail"] == "executor_timeout");
+    CHECK(!child_text.empty());
+    if (child_text.empty()) return;
+    const pid_t child = static_cast<pid_t>(std::stol(child_text));
+    bool gone = false;
+    for (int retry = 0; retry < 50; ++retry) {
+        if (::kill(child, 0) != 0 && errno == ESRCH) {
+            gone = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    CHECK(gone);
+#else
+    CHECK(true);
+#endif
+}
+
+TEST_CASE(ToolSpeculationFixture, executor_does_not_inherit_server_fds) {
+#if defined(__GLIBC__) && defined(__GLIBC_PREREQ)
+#  if __GLIBC_PREREQ(2, 34)
+    const std::string marker_path = make_temp_path();
+    const int marker_fd = ::open(marker_path.c_str(), O_RDONLY);
+    CHECK(marker_fd >= 0);
+    const std::string path = make_executor_script(
+        "IFS= read -r control\n"
+        "leaked=false\n"
+        "for descriptor in /proc/self/fd/*; do\n"
+        "  target=$(readlink \"$descriptor\" 2>/dev/null || true)\n"
+        "  if [ \"$target\" = \"" + marker_path + "\" ]; then leaked=true; fi\n"
+        "done\n"
+        "printf '{\"ok\":true,\"result\":{\"leaked\":%s}}\\n' \"$leaked\"\n");
+    ToolSpeculationConfig config = test_config(path);
+    auto attempt = ToolSpeculationAttempt::create(
+        config, prediction(), "request_fd_isolation");
+    attempt->start();
+    const json metadata = attempt->resolve({
+        ToolCall{"call_1", "lookup", R"({"a":1,"b":2})"},
+    });
+    ::close(marker_fd);
+    ::unlink(path.c_str());
+    ::unlink(marker_path.c_str());
+
+    CHECK(metadata["status"] == "hit");
+    CHECK(!metadata["result"]["leaked"].get<bool>());
+#  else
+    CHECK(true);
+#  endif
+#else
+    CHECK(true);
+#endif
+}
+
+TEST_CASE(ToolSpeculationFixture, executor_environment_overrides_stale_enable_flag) {
+    const char * previous = std::getenv("DFLASH_TOOL_SPECULATION");
+    const bool had_previous = previous != nullptr;
+    const std::string previous_value = previous ? previous : "";
+    CHECK(::setenv("DFLASH_TOOL_SPECULATION", "0", 1) == 0);
+    const std::string path = make_executor_script(
+        "IFS= read -r control\n"
+        "printf '{\"ok\":true,\"result\":{\"enabled\":\"%s\"}}\\n' "
+        "\"$DFLASH_TOOL_SPECULATION\"\n");
+    ToolSpeculationConfig config = test_config(path);
+    auto attempt = ToolSpeculationAttempt::create(
+        config, prediction(), "request_clean_environment");
+    attempt->start();
+    const json metadata = attempt->resolve({
+        ToolCall{"call_1", "lookup", R"({"a":1,"b":2})"},
+    });
+    ::unlink(path.c_str());
+    if (had_previous) {
+        CHECK(::setenv(
+            "DFLASH_TOOL_SPECULATION", previous_value.c_str(), 1) == 0);
+    } else {
+        CHECK(::unsetenv("DFLASH_TOOL_SPECULATION") == 0);
+    }
+
+    CHECK(metadata["status"] == "hit");
+    CHECK(metadata["result"]["enabled"] == "1");
 }
 
 TEST_CASE(ToolSpeculationFixture, qualified_lane_keeps_speculative_decode) {

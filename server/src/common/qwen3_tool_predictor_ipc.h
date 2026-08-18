@@ -9,6 +9,7 @@
 
 #include "backend_ipc.h"
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <mutex>
@@ -35,6 +36,7 @@ public:
     // On transport or generation failure the lane closes and fails shut.
     bool predict(const std::vector<int32_t> & prompt_ids,
                  int max_tokens,
+                 int timeout_ms,
                  std::vector<int32_t> & output_ids,
                  std::string & error);
 
@@ -44,10 +46,20 @@ public:
 private:
     void close_locked();
 
-    mutable std::mutex mutex_;
+    mutable std::timed_mutex mutex_;
     BackendIpcProcess process_;
-    bool active_ = false;
+    std::atomic<bool> active_{false};
 };
+
+// Read one daemon response under a single wall-clock deadline. Kept outside
+// the client so the timeout and partial-response behavior can be unit tested
+// without loading a model.
+bool read_qwen3_tool_predictor_response(
+    int stream_fd,
+    int max_tokens,
+    int timeout_ms,
+    std::vector<int32_t> & output_ids,
+    std::string & error);
 
 int run_qwen3_tool_predictor_ipc_daemon(const char * model_path,
                                          int gpu,

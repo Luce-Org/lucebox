@@ -1,8 +1,16 @@
 #include "CppUnitTestFramework.hpp"
 
+#include "common/qwen3_tool_predictor_ipc.h"
 #include "server/semantic_tool_hint.h"
 
+#include <chrono>
+#include <cstdint>
 #include <string>
+#include <vector>
+
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
 
 namespace {
 struct SemanticToolHintFixture {};
@@ -245,4 +253,45 @@ TEST_CASE(SemanticToolHintFixture, native_parser_rejects_multiple_calls) {
     CHECK(!parse_native_semantic_tool_prediction(
         call + call, weather_tools(), prediction, error));
     CHECK(error == "native_predictor_response_has_multiple_calls");
+}
+
+TEST_CASE(SemanticToolHintFixture, native_ipc_response_obeys_hard_deadline) {
+#if !defined(_WIN32)
+    int descriptors[2] = {-1, -1};
+    CHECK(::pipe(descriptors) == 0);
+    const auto started = std::chrono::steady_clock::now();
+    std::vector<int32_t> output;
+    std::string error;
+    CHECK(!read_qwen3_tool_predictor_response(
+        descriptors[0], 8, 25, output, error));
+    const double elapsed_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - started).count();
+    ::close(descriptors[0]);
+    ::close(descriptors[1]);
+    CHECK(error == "native_predictor_timeout");
+    CHECK(output.empty());
+    CHECK(elapsed_ms < 500.0);
+#else
+    CHECK(true);
+#endif
+}
+
+TEST_CASE(SemanticToolHintFixture, native_ipc_response_reads_complete_payload) {
+#if !defined(_WIN32)
+    int descriptors[2] = {-1, -1};
+    CHECK(::pipe(descriptors) == 0);
+    const int32_t response[] = {0, 3, 17, 18, 19};
+    CHECK(::write(descriptors[1], response, sizeof(response)) ==
+          static_cast<ssize_t>(sizeof(response)));
+    ::close(descriptors[1]);
+    std::vector<int32_t> output;
+    std::string error;
+    CHECK(read_qwen3_tool_predictor_response(
+        descriptors[0], 8, 100, output, error));
+    ::close(descriptors[0]);
+    CHECK(error.empty());
+    CHECK(output == std::vector<int32_t>({17, 18, 19}));
+#else
+    CHECK(true);
+#endif
 }

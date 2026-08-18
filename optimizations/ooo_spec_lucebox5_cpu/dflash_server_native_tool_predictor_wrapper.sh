@@ -16,6 +16,7 @@ PREDICTOR_IPC_BIN="${PREDICTOR_IPC_BIN:-${CANDIDATE_BUILD}/backend_ipc_daemon}"
 PREDICTOR_GPU="${PREDICTOR_GPU:-1}"
 PREDICTOR_MAX_CTX="${PREDICTOR_MAX_CTX:-4096}"
 PREDICTOR_MAX_TOKENS="${PREDICTOR_MAX_TOKENS:-256}"
+PREDICTOR_TIMEOUT_MS="${PREDICTOR_TIMEOUT_MS:-2000}"
 PREDICTOR_CONFIDENCE="${PREDICTOR_CONFIDENCE:-0.75}"
 PREDICTOR_SCHEDULE="${PREDICTOR_SCHEDULE:-before-model}"
 # The qualified 0731 launcher disables caches for cold throughput benchmarks.
@@ -55,7 +56,8 @@ exec "${CANDIDATE_BUILD}/dflash_server" "$@" \
   --tool-hint-native-ipc-bin "${PREDICTOR_IPC_BIN}" \
   --tool-hint-native-gpu "${PREDICTOR_GPU}" \
   --tool-hint-native-max-ctx "${PREDICTOR_MAX_CTX}" \
-  --tool-hint-sidecar-max-tokens "${PREDICTOR_MAX_TOKENS}" \
+  --tool-hint-max-tokens "${PREDICTOR_MAX_TOKENS}" \
+  --tool-hint-timeout-ms "${PREDICTOR_TIMEOUT_MS}" \
   --tool-hint-native-schedule "${PREDICTOR_SCHEDULE}" \
   --tool-hint-execution-confidence "${PREDICTOR_CONFIDENCE}" \
   "${cache_args[@]}"

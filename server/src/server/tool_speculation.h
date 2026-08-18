@@ -84,11 +84,9 @@ struct ToolSpeculationLane {
     // token speculation is never disabled or replaced with AR decode.
     bool decode_interference_qualified = false;
     // Physical relationship between the tool accelerator and the model's
-    // primary accelerator. Same-GPU lanes have stricter runtime requirements
-    // because stream priority and CU masks do not isolate shared kernels.
+    // primary accelerator. Production child executors may use CPU/I/O or a
+    // separate physical accelerator, but never the model's accelerator.
     std::string accelerator_relation = "unspecified";
-    bool requires_static_model_routing = false;
-    bool requires_unique_expert_ownership = false;
 };
 
 struct ToolSpeculationAdmission {
@@ -99,32 +97,6 @@ struct ToolSpeculationAdmission {
     bool decode_interference_qualified = false;
     std::string accelerator_relation = "unspecified";
     std::string reason;
-};
-
-// Optional trusted in-process executor. This avoids a second accelerator
-// process/context on runtimes where process-level time-slicing defeats CU or
-// stream isolation. Implementations remain behind the same allowlist,
-// empirical admission policy, exact-call commit, and private-result boundary
-// as the child-process adapter.
-class ToolSpeculationExecution {
-public:
-    virtual ~ToolSpeculationExecution() = default;
-    virtual bool send_control(const std::string & operation) = 0;
-    virtual bool collect_result(int timeout_ms,
-                                size_t max_result_bytes,
-                                json & result,
-                                double & wait_ms,
-                                std::string & error) = 0;
-    virtual void terminate(bool allow_control_grace) = 0;
-};
-
-class ToolSpeculationExecutor {
-public:
-    virtual ~ToolSpeculationExecutor() = default;
-    virtual std::unique_ptr<ToolSpeculationExecution> start(
-        const json & request,
-        std::string & error) = 0;
-    virtual const char * mode_name() const = 0;
 };
 
 // Runtime policy loaded from a qualification report's `path_summary`. This
@@ -144,11 +116,6 @@ public:
     const std::vector<ToolSpeculationLane> & lanes() const { return lanes_; }
     const std::string & profile_status() const { return profile_status_; }
     const std::string & executor_contract() const { return executor_contract_; }
-    bool benchmark_only() const {
-        return profile_status_ == "provisional_benchmark_only";
-    }
-    bool requires_static_model_routing() const;
-    bool requires_unique_expert_ownership() const;
 
 private:
     std::vector<ToolSpeculationLane> lanes_;
@@ -159,7 +126,6 @@ private:
 
 struct ToolSpeculationConfig {
     std::string executor_path;
-    std::shared_ptr<ToolSpeculationExecutor> in_process_executor;
     std::string profile_path;
     std::vector<std::string> allowed_tools;
     ToolSpeculationPolicy policy;
@@ -167,14 +133,6 @@ struct ToolSpeculationConfig {
     int cancel_grace_ms = 100;
     size_t max_result_bytes = 1024 * 1024;
     double max_model_slowdown_ratio = 1.20;
-    // Snapshot of the model routing mode used to validate profile/runtime
-    // compatibility at startup and expose it through /props.
-    bool model_routing_static = true;
-    bool model_expert_ownership_unique = true;
-    // Runtime evidence that the model and an in-process HIP tool use
-    // complementary CU masks. Zero means no model-side CU reservation.
-    int hip_tool_device = -1;
-    int hip_reserved_tool_compute_units = 0;
     // Optional child-process CPU lane. Startup verifies that these logical
     // CPUs are disjoint from the model process affinity; every child is pinned
     // and re-read before its request payload is released.
@@ -182,18 +140,15 @@ struct ToolSpeculationConfig {
     std::vector<int> model_cpu_affinity;
     bool cpu_affinity_isolated = false;
     bool enabled() const {
-        return (!executor_path.empty() || in_process_executor) &&
-               !allowed_tools.empty() &&
+        return !executor_path.empty() && !allowed_tools.empty() &&
                !policy.empty();
     }
     const char * execution_mode() const {
-        return in_process_executor
-            ? in_process_executor->mode_name()
-            : executor_path.empty()
-                ? "disabled"
-                : cpu_affinity.empty()
-                    ? "child_process"
-                    : "child_process_cpu_affinity";
+        return executor_path.empty()
+            ? "disabled"
+            : cpu_affinity.empty()
+                ? "child_process"
+                : "child_process_cpu_affinity";
     }
     bool allows(const std::string & name) const;
 };
@@ -257,8 +212,6 @@ private:
     bool running_ = false;
     bool resolved_ = false;
     std::string launch_error_;
-    std::unique_ptr<ToolSpeculationExecution> in_process_execution_;
-
 #if !defined(_WIN32)
     int child_stdin_fd_ = -1;
     int child_stdout_fd_ = -1;

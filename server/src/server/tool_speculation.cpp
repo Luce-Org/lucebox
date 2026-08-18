@@ -1,3 +1,7 @@
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#  define _GNU_SOURCE
+#endif
+
 #include "tool_speculation.h"
 
 #include <algorithm>
@@ -20,6 +24,7 @@
 #  include <sys/wait.h>
 #  include <unistd.h>
 #  if defined(__linux__)
+#    include <features.h>
 #    include <sched.h>
 #  endif
 extern char ** environ;
@@ -84,6 +89,16 @@ bool send_all_socket(int fd, const void * data, size_t bytes) {
     return true;
 }
 
+void signal_executor_process_group(
+        pid_t leader, int signal, bool leader_fallback = true) {
+    if (leader <= 0) return;
+    if (::kill(-leader, signal) != 0 && errno == ESRCH && leader_fallback) {
+        // Defensive fallback for older platforms that ignored the requested
+        // spawn process group.
+        (void)::kill(leader, signal);
+    }
+}
+
 std::vector<std::string> executor_environment(
         int resource_percentage,
         const std::string & accelerator_relation,
@@ -101,9 +116,14 @@ std::vector<std::string> executor_environment(
         "DFLASH_TOOL_SPECULATION_CPU_AFFINITY=";
     static constexpr size_t kCpuAffinityKeyLen =
         sizeof("DFLASH_TOOL_SPECULATION_CPU_AFFINITY=") - 1;
+    static constexpr const char * kEnabledKey =
+        "DFLASH_TOOL_SPECULATION=";
+    static constexpr size_t kEnabledKeyLen =
+        sizeof("DFLASH_TOOL_SPECULATION=") - 1;
     bool resource_replaced = false;
     bool relation_replaced = false;
     bool cpu_affinity_replaced = false;
+    bool enabled_replaced = false;
     for (char ** item = environ; item && *item; ++item) {
         const std::string value(*item);
         if (value.compare(0, kResourceKeyLen, kResourceKey) == 0) {
@@ -125,6 +145,9 @@ std::vector<std::string> executor_environment(
                     format_cpu_affinity(cpu_affinity));
                 cpu_affinity_replaced = true;
             }
+        } else if (value.compare(0, kEnabledKeyLen, kEnabledKey) == 0) {
+            values.push_back(std::string(kEnabledKey) + "1");
+            enabled_replaced = true;
         } else {
             values.push_back(value);
         }
@@ -142,7 +165,9 @@ std::vector<std::string> executor_environment(
             std::string(kCpuAffinityKey) +
             format_cpu_affinity(cpu_affinity));
     }
-    values.push_back("DFLASH_TOOL_SPECULATION=1");
+    if (!enabled_replaced) {
+        values.push_back(std::string(kEnabledKey) + "1");
+    }
     return values;
 }
 
@@ -380,10 +405,6 @@ bool qualify_tool_speculation_cpu_affinity(
         return true;
     }
 #if defined(__linux__)
-    if (config.executor_path.empty() || config.in_process_executor) {
-        error = "tool CPU affinity requires a child-process executor";
-        return false;
-    }
     const long configured_cpus = ::sysconf(_SC_NPROCESSORS_CONF);
     if (configured_cpus <= 0) {
         error = "cannot determine configured CPU count";
@@ -465,29 +486,24 @@ bool ToolSpeculationPolicy::load_json(
         return false;
     }
 
-    if (report.contains("profile_status")) {
-        if (!report["profile_status"].is_string()) {
-            error = "tool-speculation profile_status must be a string";
-            return false;
-        }
-        profile_status_ = report["profile_status"].get<std::string>();
-        if (profile_status_ != "qualified" &&
-            profile_status_ != "provisional_benchmark_only") {
-            error = "tool-speculation profile_status must be qualified or "
-                    "provisional_benchmark_only";
-            return false;
-        }
+    if (!report.contains("profile_status") ||
+        !report["profile_status"].is_string()) {
+        error = "tool-speculation profile needs profile_status=qualified";
+        return false;
     }
-    if (report.contains("executor")) {
-        if (!report["executor"].is_string()) {
-            error = "tool-speculation executor contract must be a string";
-            return false;
-        }
-        executor_contract_ = report["executor"].get<std::string>();
-        if (executor_contract_.empty()) {
-            error = "tool-speculation executor contract cannot be empty";
-            return false;
-        }
+    profile_status_ = report["profile_status"].get<std::string>();
+    if (profile_status_ != "qualified") {
+        error = "tool-speculation profile_status must be qualified";
+        return false;
+    }
+    if (!report.contains("executor") || !report["executor"].is_string()) {
+        error = "tool-speculation profile needs an executor contract";
+        return false;
+    }
+    executor_contract_ = report["executor"].get<std::string>();
+    if (executor_contract_.empty()) {
+        error = "tool-speculation executor contract cannot be empty";
+        return false;
     }
 
     std::vector<double> controls;
@@ -520,34 +536,18 @@ bool ToolSpeculationPolicy::load_json(
                 decode_interference_qualified =
                     paths["decode_interference_qualified"].get<bool>();
             }
-            const std::string accelerator_relation =
-                paths.value("accelerator_relation", "unspecified");
-            if (accelerator_relation != "unspecified" &&
-                accelerator_relation != "non_accelerator" &&
-                accelerator_relation != "separate_physical_gpu" &&
-                accelerator_relation != "same_physical_gpu") {
+            if (!paths.contains("accelerator_relation") ||
+                !paths["accelerator_relation"].is_string()) {
                 throw std::runtime_error(
-                    "accelerator_relation must be unspecified, "
-                    "non_accelerator, separate_physical_gpu, or "
-                    "same_physical_gpu");
+                    "accelerator_relation must be explicit");
             }
-            bool requires_static_model_routing = false;
-            if (paths.contains("requires_static_model_routing")) {
-                if (!paths["requires_static_model_routing"].is_boolean()) {
-                    throw std::runtime_error(
-                        "requires_static_model_routing must be boolean");
-                }
-                requires_static_model_routing =
-                    paths["requires_static_model_routing"].get<bool>();
-            }
-            bool requires_unique_expert_ownership = false;
-            if (paths.contains("requires_unique_expert_ownership")) {
-                if (!paths["requires_unique_expert_ownership"].is_boolean()) {
-                    throw std::runtime_error(
-                        "requires_unique_expert_ownership must be boolean");
-                }
-                requires_unique_expert_ownership =
-                    paths["requires_unique_expert_ownership"].get<bool>();
+            const std::string accelerator_relation =
+                paths["accelerator_relation"].get<std::string>();
+            if (accelerator_relation != "non_accelerator" &&
+                accelerator_relation != "separate_physical_gpu") {
+                throw std::runtime_error(
+                    "accelerator_relation must be non_accelerator or "
+                    "separate_physical_gpu");
             }
             if (!finite_positive(hit_control) ||
                 !finite_positive(miss_control) ||
@@ -565,8 +565,6 @@ bool ToolSpeculationPolicy::load_json(
                 1.0 + slowdown_percent / 100.0,
                 decode_interference_qualified,
                 accelerator_relation,
-                requires_static_model_routing,
-                requires_unique_expert_ownership,
             });
             controls.push_back(control);
         }
@@ -596,22 +594,6 @@ bool ToolSpeculationPolicy::load_json(
     baseline_task_ms_ = median(std::move(controls));
     error.clear();
     return true;
-}
-
-bool ToolSpeculationPolicy::requires_static_model_routing() const {
-    return std::any_of(
-        lanes_.begin(), lanes_.end(),
-        [](const ToolSpeculationLane & lane) {
-            return lane.requires_static_model_routing;
-        });
-}
-
-bool ToolSpeculationPolicy::requires_unique_expert_ownership() const {
-    return std::any_of(
-        lanes_.begin(), lanes_.end(),
-        [](const ToolSpeculationLane & lane) {
-            return lane.requires_unique_expert_ownership;
-        });
 }
 
 ToolSpeculationAdmission ToolSpeculationPolicy::choose(
@@ -722,20 +704,6 @@ void ToolSpeculationAttempt::start() {
         }},
     };
     started_at_ = std::chrono::steady_clock::now();
-    if (config_.in_process_executor) {
-        in_process_execution_ =
-            config_.in_process_executor->start(request, launch_error_);
-        running_ = static_cast<bool>(in_process_execution_);
-        if (running_) {
-            std::fprintf(stderr,
-                "[tool-spec] launched request=%s tool=%s confidence=%.3f "
-                "resource=%d%% mode=%s\n",
-                request_id_.c_str(), prediction_.call.name.c_str(),
-                prediction_.confidence, admission_.resource_percentage,
-                config_.execution_mode());
-        }
-        return;
-    }
 #if defined(_WIN32)
     launch_error_ = "tool speculation child executors are not implemented on Windows";
     return;
@@ -769,6 +737,19 @@ void ToolSpeculationAttempt::start() {
     posix_spawn_file_actions_t actions;
     int spawn_status = posix_spawn_file_actions_init(&actions);
     const bool actions_initialized = spawn_status == 0;
+    posix_spawnattr_t attributes;
+    const int attributes_status = posix_spawnattr_init(&attributes);
+    const bool attributes_initialized = attributes_status == 0;
+    if (spawn_status == 0 && attributes_status != 0) {
+        spawn_status = attributes_status;
+    }
+    if (spawn_status == 0) {
+        spawn_status = posix_spawnattr_setpgroup(&attributes, 0);
+    }
+    if (spawn_status == 0) {
+        spawn_status = posix_spawnattr_setflags(
+            &attributes, POSIX_SPAWN_SETPGROUP);
+    }
     if (spawn_status == 0) {
         spawn_status = posix_spawn_file_actions_adddup2(
             &actions, input_socket[1], STDIN_FILENO);
@@ -789,6 +770,17 @@ void ToolSpeculationAttempt::start() {
     if (spawn_status == 0 && output_pipe[1] != STDOUT_FILENO) {
         spawn_status = posix_spawn_file_actions_addclose(&actions, output_pipe[1]);
     }
+#  if defined(__GLIBC__) && defined(__GLIBC_PREREQ)
+#    if __GLIBC_PREREQ(2, 34)
+    // The executor receives only stdin/stdout/stderr. In particular, it must
+    // not inherit listening sockets, live client connections, model IPC pipes,
+    // or accelerator descriptors from the long-running server.
+    if (spawn_status == 0) {
+        spawn_status = posix_spawn_file_actions_addclosefrom_np(
+            &actions, STDERR_FILENO + 1);
+    }
+#    endif
+#  endif
 
     std::vector<std::string> env_storage = executor_environment(
         admission_.resource_percentage, admission_.accelerator_relation,
@@ -808,10 +800,14 @@ void ToolSpeculationAttempt::start() {
     pid_t child = -1;
     if (spawn_status == 0) {
         spawn_status = ::posix_spawn(
-            &child, executable.c_str(), &actions, nullptr, argv, env.data());
+            &child, executable.c_str(), &actions, &attributes, argv,
+            env.data());
     }
     if (actions_initialized) {
         posix_spawn_file_actions_destroy(&actions);
+    }
+    if (attributes_initialized) {
+        posix_spawnattr_destroy(&attributes);
     }
     ::close(input_socket[1]);
     ::close(output_pipe[1]);
@@ -828,7 +824,7 @@ void ToolSpeculationAttempt::start() {
         std::string affinity_error;
         if (!pin_and_verify_child_cpu_affinity(
                 child, config_.cpu_affinity, affinity_error)) {
-            ::kill(child, SIGKILL);
+            signal_executor_process_group(child, SIGKILL);
             int child_status = 0;
             while (::waitpid(child, &child_status, 0) < 0 && errno == EINTR) {}
             ::close(input_socket[0]);
@@ -839,7 +835,7 @@ void ToolSpeculationAttempt::start() {
     }
 #  else
     if (!config_.cpu_affinity.empty()) {
-        ::kill(child, SIGKILL);
+        signal_executor_process_group(child, SIGKILL);
         int child_status = 0;
         while (::waitpid(child, &child_status, 0) < 0 && errno == EINTR) {}
         ::close(input_socket[0]);
@@ -900,10 +896,6 @@ json ToolSpeculationAttempt::base_metadata() const {
 }
 
 bool ToolSpeculationAttempt::send_control(const char * operation) {
-    if (in_process_execution_) {
-        return operation && *operation &&
-            in_process_execution_->send_control(operation);
-    }
 #if defined(_WIN32)
     (void)operation;
     return false;
@@ -921,12 +913,6 @@ bool ToolSpeculationAttempt::send_control(const char * operation) {
 }
 
 void ToolSpeculationAttempt::terminate_executor(bool allow_control_grace) {
-    if (in_process_execution_) {
-        in_process_execution_->terminate(allow_control_grace);
-        in_process_execution_.reset();
-        running_ = false;
-        return;
-    }
 #if !defined(_WIN32)
     if (child_stdin_fd_ >= 0) {
         ::close(child_stdin_fd_);
@@ -956,17 +942,21 @@ void ToolSpeculationAttempt::terminate_executor(bool allow_control_grace) {
         if (allow_control_grace && wait_until(
                 std::chrono::steady_clock::now() +
                 std::chrono::milliseconds(grace_ms))) {
+            // The executor contract does not permit detached descendants.
+            // Clean up any process that outlived its group leader.
+            signal_executor_process_group(pid, SIGKILL, false);
             return;
         }
-        ::kill(pid, SIGTERM);
+        signal_executor_process_group(pid, SIGTERM);
         const int term_grace_ms = allow_control_grace
             ? std::min(20, grace_ms) : grace_ms;
         if (wait_until(std::chrono::steady_clock::now() +
                        std::chrono::milliseconds(term_grace_ms))) {
+            signal_executor_process_group(pid, SIGKILL, false);
             return;
         }
         int status = 0;
-        ::kill(pid, SIGKILL);
+        signal_executor_process_group(pid, SIGKILL);
         while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
         child_pid_ = -1;
     }
@@ -978,14 +968,6 @@ bool ToolSpeculationAttempt::collect_executor_result(
         json & result,
         double & wait_ms,
         std::string & error) {
-    if (in_process_execution_) {
-        const bool ok = in_process_execution_->collect_result(
-            config_.timeout_ms, config_.max_result_bytes,
-            result, wait_ms, error);
-        in_process_execution_.reset();
-        running_ = false;
-        return ok;
-    }
 #if defined(_WIN32)
     (void)result;
     wait_ms = 0.0;
@@ -993,8 +975,14 @@ bool ToolSpeculationAttempt::collect_executor_result(
     return false;
 #else
     const auto wait_started = std::chrono::steady_clock::now();
-    const auto deadline = wait_started +
+    const auto deadline = started_at_ +
         std::chrono::milliseconds(std::max(1, config_.timeout_ms));
+    if (wait_started >= deadline) {
+        error = "executor_timeout";
+        terminate_executor();
+        wait_ms = 0.0;
+        return false;
+    }
     std::string output;
     bool eof = false;
     while (!eof) {
@@ -1074,6 +1062,9 @@ bool ToolSpeculationAttempt::collect_executor_result(
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
+    // A successful adapter must not leave detached subprocesses behind.
+    signal_executor_process_group(
+        static_cast<pid_t>(child_pid_), SIGKILL, false);
     child_pid_ = -1;
     running_ = false;
     wait_ms = std::chrono::duration<double, std::milli>(

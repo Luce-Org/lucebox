@@ -1947,8 +1947,6 @@ if(DFLASH27B_SERVER)
         target_include_directories(dflash_server PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
             target_compile_definitions(dflash_server PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
-            target_sources(dflash_server PRIVATE
-                src/server/tool_speculation_hip_probe.cpp)
             if(DFLASH27B_ENABLE_MIXED_CUDA_HIP)
                 target_compile_definitions(dflash_server PRIVATE
                     DFLASH27B_BACKEND_MIXED=1)
@@ -1975,11 +1973,7 @@ if(DFLASH27B_SERVER)
             find_package(CUDAToolkit REQUIRED)
             target_link_libraries(dflash_server PRIVATE CUDA::cudart)
         else()
-            # ggml-hip finds hipBLAS in a child-directory scope. The trusted
-            # in-process tool adapter also calls hipBLAS directly, so import
-            # the target in this scope before linking the server executable.
-            find_package(hipblas REQUIRED)
-            target_link_libraries(dflash_server PRIVATE hip::host roc::hipblas)
+            target_link_libraries(dflash_server PRIVATE hip::host)
         endif()
 
         # Copy share/status.html next to the binary so it can be found at runtime.

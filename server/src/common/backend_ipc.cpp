@@ -7,12 +7,15 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
 #include <string>
+#include <thread>
 #include <vector>
 
 #if !defined(_WIN32)
 #  include <cerrno>
 #  include <fcntl.h>
+#  include <signal.h>
 #  include <sys/mman.h>
 #  include <sys/stat.h>
 #  include <sys/wait.h>
@@ -248,7 +251,19 @@ bool BackendIpcProcess::start(const BackendIpcLaunchConfig & cfg) {
 }
 
 void BackendIpcProcess::close() {
+    close_impl(false);
+}
+
+void BackendIpcProcess::terminate() {
+    close_impl(true);
+}
+
+void BackendIpcProcess::close_impl(bool force_terminate) {
 #if !defined(_WIN32)
+    const pid_t child = pid_;
+    if (force_terminate && child > 0) {
+        (void)::kill(child, SIGTERM);
+    }
     if (cmd_) {
         std::fclose(cmd_);
         cmd_ = nullptr;
@@ -269,14 +284,36 @@ void BackendIpcProcess::close() {
         ::close(shared_payload_fd_);
         shared_payload_fd_ = -1;
     }
-    if (pid_ > 0) {
+    if (child > 0) {
         int status = 0;
-        ::waitpid(pid_, &status, 0);
+        if (force_terminate) {
+            bool reaped = false;
+            const auto deadline = std::chrono::steady_clock::now() +
+                std::chrono::milliseconds(100);
+            while (std::chrono::steady_clock::now() < deadline) {
+                const pid_t waited = ::waitpid(child, &status, WNOHANG);
+                if (waited == child ||
+                    (waited < 0 && errno == ECHILD)) {
+                    reaped = true;
+                    break;
+                }
+                if (waited < 0 && errno != EINTR) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            if (!reaped) {
+                (void)::kill(child, SIGKILL);
+                while (::waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+            }
+        } else {
+            while (::waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+        }
         pid_ = -1;
     }
     if (owns_work_dir_ && !work_dir_.empty()) {
         ::rmdir(work_dir_.c_str());
     }
+#else
+    (void)force_terminate;
 #endif
     active_ = false;
     owns_work_dir_ = false;
@@ -403,12 +440,20 @@ bool BackendIpcProcess::init_work_dir(const std::string & requested) {
                              work_dir_.c_str(), std::strerror(errno));
                 return false;
             }
-            struct stat st;
-            if (::stat(work_dir_.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
-                std::fprintf(stderr, "backend-ipc work_dir is not a directory: %s\n",
-                             work_dir_.c_str());
-                return false;
-            }
+        }
+        struct stat st;
+        if (::lstat(work_dir_.c_str(), &st) != 0 ||
+            !S_ISDIR(st.st_mode)) {
+            std::fprintf(stderr,
+                "backend-ipc work_dir is not a real directory: %s\n",
+                work_dir_.c_str());
+            return false;
+        }
+        if (st.st_uid != ::geteuid() || (st.st_mode & 0777) != 0700) {
+            std::fprintf(stderr,
+                "backend-ipc work_dir must be owned by the server and mode 0700: %s\n",
+                work_dir_.c_str());
+            return false;
         }
         return true;
     }

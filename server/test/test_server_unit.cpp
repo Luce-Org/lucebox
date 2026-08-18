@@ -4126,6 +4126,24 @@ TEST_CASE(ServerUnitFixture, test_backend_ipc_rejects_file_work_dir) {
     unlink(file_path.c_str());
 }
 
+TEST_CASE(ServerUnitFixture, test_backend_ipc_rejects_public_work_dir) {
+    const std::string dir_path =
+        "/tmp/dflash_test_backend_ipc_public_work_dir";
+    rmdir(dir_path.c_str());
+    TEST_ASSERT(mkdir(dir_path.c_str(), 0755) == 0);
+    TEST_ASSERT(chmod(dir_path.c_str(), 0755) == 0);
+
+    BackendIpcLaunchConfig cfg;
+    cfg.bin = "/bin/true";
+    cfg.payload_path = "/tmp/dflash_test_backend_ipc_payload";
+    cfg.work_dir = dir_path;
+
+    BackendIpcProcess proc;
+    TEST_ASSERT(!proc.start(cfg));
+    TEST_ASSERT(!proc.active());
+    rmdir(dir_path.c_str());
+}
+
 TEST_CASE(ServerUnitFixture, test_backend_ipc_payload_pipe_round_trip) {
     int payload_pipe[2] = {-1, -1};
     int status_pipe[2] = {-1, -1};
@@ -4900,14 +4918,10 @@ TEST_CASE(ServerUnitFixture, test_props_tool_speculation_shape) {
     TEST_ASSERT(disabled["unqualified_lane_policy"].get<std::string>() ==
                 "defer");
     TEST_ASSERT(disabled["allowed_tools"].empty());
-    TEST_ASSERT(disabled["model_routing_static"].get<bool>());
-    TEST_ASSERT(disabled["model_expert_ownership_unique"].get<bool>());
     TEST_ASSERT(disabled["compute_isolation"].get<std::string>() == "none");
     TEST_ASSERT(!disabled["cpu_affinity_isolated"].get<bool>());
     TEST_ASSERT(disabled["tool_cpu_affinity"].empty());
     TEST_ASSERT(disabled["model_cpu_affinity"].empty());
-    TEST_ASSERT(disabled["hip_tool_device"].is_null());
-    TEST_ASSERT(disabled["hip_reserved_tool_compute_units"].get<int>() == 0);
     TEST_ASSERT(disabled["profile_lanes"].empty());
 
     cfg.tool_speculation.executor_path = "/trusted/tool-adapter";
@@ -4915,8 +4929,11 @@ TEST_CASE(ServerUnitFixture, test_props_tool_speculation_shape) {
     cfg.tool_speculation.allowed_tools = {"lookup"};
     std::string profile_error;
     TEST_ASSERT(cfg.tool_speculation.policy.load_json(json{
+        {"profile_status", "qualified"},
+        {"executor", "child_process"},
         {"path_summary", {
             {"25", {
+                {"accelerator_relation", "non_accelerator"},
                 {"decode_interference_qualified", true},
                 {"hit", {
                     {"control_task_mean_ms", 100.0},
@@ -4938,6 +4955,8 @@ TEST_CASE(ServerUnitFixture, test_props_tool_speculation_shape) {
     TEST_ASSERT(!enabled["automatic_prediction_enabled"].get<bool>());
     TEST_ASSERT(!enabled["predictor_decode_isolated"].get<bool>());
     TEST_ASSERT(enabled["profile_status"].get<std::string>() == "qualified");
+    TEST_ASSERT(enabled["executor_contract"].get<std::string>() ==
+                "child_process");
     TEST_ASSERT(enabled["allowed_tools"] == json::array({"lookup"}));
     TEST_ASSERT(enabled["preserves_token_speculation"].get<bool>());
     TEST_ASSERT(enabled["unqualified_lane_policy"].get<std::string>() ==
@@ -4952,11 +4971,7 @@ TEST_CASE(ServerUnitFixture, test_props_tool_speculation_shape) {
                        ["decode_interference_qualified"].get<bool>());
     TEST_ASSERT(enabled["profile_lanes"][0]
                        ["accelerator_relation"].get<std::string>() ==
-                "unspecified");
-    TEST_ASSERT(!enabled["profile_lanes"][0]
-                        ["requires_static_model_routing"].get<bool>());
-    TEST_ASSERT(!enabled["profile_lanes"][0]
-                        ["requires_unique_expert_ownership"].get<bool>());
+                "non_accelerator");
 
     cfg.semantic_tool_predictor.native_model_path = "/models/qwen3-0.6b.gguf";
     cfg.semantic_tool_predictor.native_ipc_bin = "/bin/backend-ipc";
@@ -5009,16 +5024,6 @@ TEST_CASE(ServerUnitFixture, test_props_tool_speculation_shape) {
                 json::array({14, 30}));
     TEST_ASSERT(cpu_isolated["model_cpu_affinity"] ==
                 json::array({0, 1, 2, 3}));
-
-    cfg.tool_speculation.cpu_affinity_isolated = false;
-    cfg.tool_speculation.hip_tool_device = 1;
-    cfg.tool_speculation.hip_reserved_tool_compute_units = 1;
-    body = build_props_body(cfg, pc, tm);
-    const json & isolated = body["tool_speculation"];
-    TEST_ASSERT(isolated["compute_isolation"].get<std::string>() ==
-                "disjoint_hip_cu_masks");
-    TEST_ASSERT(isolated["hip_tool_device"].get<int>() == 1);
-    TEST_ASSERT(isolated["hip_reserved_tool_compute_units"].get<int>() == 1);
 }
 
 // ─── /props.runtime captures full config (§4.16) ──────────────────────
@@ -5257,40 +5262,6 @@ TEST_CASE(ServerUnitFixture, test_model_backend_retries_empty_spec_restore_once_
     TEST_ASSERT(result.spec_decode_ran);
     TEST_ASSERT(backend.restore_calls == 2);
     TEST_ASSERT(backend.restore_saw_force_ar);
-}
-
-TEST_CASE(ServerUnitFixture, test_model_backend_can_forbid_ar_retry) {
-    EmptySpecRetryBackend backend;
-    GenerateRequest req;
-    req.prompt = {1, 2, 3};
-    req.n_gen = 4;
-    req.allow_decode_mode_retry = false;
-    DaemonIO io;
-
-    GenerateResult result = backend.generate(req, io);
-
-    TEST_ASSERT(result.ok());
-    TEST_ASSERT(result.tokens.empty());
-    TEST_ASSERT(result.spec_decode_ran);
-    TEST_ASSERT(backend.generate_calls == 1);
-    TEST_ASSERT(!backend.generate_saw_force_ar);
-}
-
-TEST_CASE(ServerUnitFixture, test_model_backend_restore_can_forbid_ar_retry) {
-    EmptySpecRetryBackend backend;
-    GenerateRequest req;
-    req.prompt = {1, 2, 3};
-    req.n_gen = 4;
-    req.allow_decode_mode_retry = false;
-    DaemonIO io;
-
-    GenerateResult result = backend.restore_and_generate(7, req, io);
-
-    TEST_ASSERT(result.ok());
-    TEST_ASSERT(result.tokens.empty());
-    TEST_ASSERT(result.spec_decode_ran);
-    TEST_ASSERT(backend.restore_calls == 1);
-    TEST_ASSERT(!backend.restore_saw_force_ar);
 }
 
 TEST_CASE(ServerUnitFixture, test_model_backend_retries_empty_visible_spec_generate_once_with_ar) {

@@ -197,10 +197,6 @@ struct GenerateRequest {
     // path returns success but emits no tokens, so each backend can route the
     // retry through its existing AR path without copying retry policy.
     bool                       force_ar_decode = false;
-    // Opt out of the common speculative-to-AR empty-output retry. Tool
-    // speculation sets this false so the external optimization can never
-    // change the request's model decode strategy.
-    bool                       allow_decode_mode_retry = true;
 };
 
 // Stable, backend-independent generation failure categories. Backends should
@@ -373,7 +369,6 @@ struct ModelBackend {
     static bool should_retry_empty_spec_decode(const GenerateRequest & req,
                                                const GenerateResult & result) {
         return req.n_gen > 0
-            && req.allow_decode_mode_retry
             && !req.force_ar_decode
             && result.ok()
             && result.spec_decode_ran

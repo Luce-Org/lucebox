@@ -6,9 +6,10 @@ compute window; the predicted read-only tool runs on reserved CPU cores while
 DeepSeek-V4-0731 decodes with DS4/DSpark on R9700 + Strix. The result stays
 private unless DeepSeek emits the exact same canonical function and arguments.
 
-This path does not inject tokens, replace DSpark, or retry speculative decoding
-with autoregressive decoding. A wrong prediction is discarded and the caller
-executes the target model's authoritative call normally.
+This path does not inject tokens or replace DSpark. Tool prediction does not
+alter the target decoder's selection or normal recovery policy. A wrong
+prediction is discarded and the caller executes the target model's
+authoritative call normally.
 
 ## Production result
 
@@ -52,14 +53,16 @@ hash for provenance.
 
 - Only explicitly allowlisted, read-only/idempotent tools are eligible.
 - The external result is committed only on an exact canonical call match.
-- The executor is launched directly without a shell and has a hard timeout.
+- The executor is launched directly without a shell and has a hard deadline
+  measured from launch; inherited server file descriptors are closed.
 - Lucebox5 reserves CPUs `14-15,30-31`; the model uses `0-13,16-29`.
-- Startup fails closed if CPU masks overlap or the measured lane profile fails.
+- Startup fails closed if CPU masks overlap, the measured lane profile is not
+  qualified, or its executor contract differs from the configured lane.
 - `before-model` is the native predictor default, so shared-GPU prediction
   cannot reduce target prefill/decode throughput.
 - The same API works on a single GPU: run the predictor before the target and
-  overlap only the CPU tool. An HTTP predictor can use the same verification
-  and executor path on other model families.
+  overlap only the CPU tool. A local or numeric-IPv4 HTTP predictor can use the
+  same verification and executor path on other model families.
 
 The speedup applies to tool-using request latency, not token throughput. Its
 real-world value depends on exact predictor hit rate and on how much tool work
@@ -81,9 +84,10 @@ Launch the qualified single-call configuration on an otherwise idle Lucebox5:
 ```
 
 The launcher defaults to Qwen3-0.6B Q8_0 on predictor GPU 1. Override placement
-with `PREDICTOR_MODEL`, `PREDICTOR_GPU`, `PREDICTOR_MAX_CTX`, and
-`PREDICTOR_MAX_TOKENS`. The adjacent `candidate-build` symlink in the wrapper
-selects a build even though the qualified launcher clears ambient variables.
+with `PREDICTOR_MODEL`, `PREDICTOR_GPU`, `PREDICTOR_MAX_CTX`,
+`PREDICTOR_MAX_TOKENS`, and `PREDICTOR_TIMEOUT_MS`. The adjacent
+`candidate-build` symlink in the wrapper selects a build even though the
+qualified launcher clears ambient variables.
 
 Run the single-call paired gate:
 

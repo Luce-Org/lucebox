@@ -1,5 +1,6 @@
 #include "native_semantic_tool_predictor.h"
 
+#include <algorithm>
 #include <chrono>
 #include <utility>
 #include <vector>
@@ -37,6 +38,8 @@ SemanticToolPrediction NativeSemanticToolPredictor::predict(
         const json & request_tools,
         std::string * generated_text) {
     const auto started = std::chrono::steady_clock::now();
+    const auto deadline = started +
+        std::chrono::milliseconds(std::max(1, config_.timeout_ms));
     SemanticToolPrediction prediction;
     prediction.source = "native-qwen3";
     auto finish = [&]() {
@@ -63,8 +66,16 @@ SemanticToolPrediction NativeSemanticToolPredictor::predict(
         return finish();
     }
 
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) {
+        prediction.error = "native_predictor_timeout";
+        return finish();
+    }
+    const int remaining_ms = std::max(1, static_cast<int>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - now).count()));
     std::vector<int32_t> output_ids;
-    if (!ipc_.predict(prompt_ids, config_.max_tokens,
+    if (!ipc_.predict(prompt_ids, config_.max_tokens, remaining_ms,
                       output_ids, prediction.error)) {
         return finish();
     }

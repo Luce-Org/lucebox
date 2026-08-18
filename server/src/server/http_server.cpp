@@ -58,7 +58,7 @@ typedef long ssize_t;
 #define poll(fds,nfds,timeout)  WSAPoll(fds,nfds,timeout)
 // Replace fcntl(F_GETFL) / fcntl(F_SETFL, O_NONBLOCK) with ioctlsocket
 static inline int sock_get_flags(SocketHandle fd) { (void)fd; return 0; /* stub */ }
-static inline void sock_set_nonblock(SocketHandle fd) { u_long m = 1; ioctlsocket(fd, FIONBIO, &m); }
+static inline bool sock_set_nonblock(SocketHandle fd) { u_long m = 1; return ioctlsocket(fd, FIONBIO, &m) == 0; }
 static inline void sock_set_block(SocketHandle fd) { u_long m = 0; ioctlsocket(fd, FIONBIO, &m); }
 static inline void socket_close(SocketHandle fd) { closesocket(fd); }
 #define SETSOCKOPT_CAST (const char *)
@@ -76,7 +76,7 @@ static inline bool sock_is_eagain(int e) { return e == WSAEWOULDBLOCK; }
 #include <netdb.h>
 #include <sys/stat.h>
 static inline int sock_get_flags(SocketHandle fd) { return fcntl(fd, F_GETFL, 0); }
-static inline void sock_set_nonblock(SocketHandle fd) { int f = fcntl(fd, F_GETFL, 0); if (f >= 0) fcntl(fd, F_SETFL, f | O_NONBLOCK); }
+static inline bool sock_set_nonblock(SocketHandle fd) { int f = fcntl(fd, F_GETFL, 0); return f >= 0 && fcntl(fd, F_SETFL, f | O_NONBLOCK) == 0; }
 static inline void sock_set_block(SocketHandle fd) { int f = fcntl(fd, F_GETFL, 0); if (f >= 0) fcntl(fd, F_SETFL, f & ~O_NONBLOCK); }
 static inline void socket_close(SocketHandle fd) { ::close(fd); }
 #define SETSOCKOPT_CAST  /* empty on POSIX */
@@ -502,19 +502,49 @@ bool parse_semantic_sidecar_url(
         ? "/" : value.substr(path_begin);
     if (out.host.empty() || out.port.empty() || out.path.empty()) return false;
     if (out.host.front() == '[' || out.host.find(':') != std::string::npos) {
-        // The production bridge is loopback IPv4. Reject ambiguous IPv6
-        // authority parsing instead of silently connecting to the wrong host.
+        // Reject ambiguous IPv6 authority parsing instead of silently
+        // connecting to the wrong host.
         return false;
     }
-    return std::all_of(out.port.begin(), out.port.end(), [](unsigned char ch) {
+    if (!std::all_of(out.port.begin(), out.port.end(), [](unsigned char ch) {
         return std::isdigit(ch) != 0;
-    });
+    })) {
+        return false;
+    }
+    try {
+        const unsigned long port = std::stoul(out.port);
+        if (port == 0 || port > 65535) return false;
+    } catch (...) {
+        return false;
+    }
+    // A numeric address makes the configured wall-clock deadline independent
+    // of an unbounded platform DNS resolver. Keep localhost as the ergonomic
+    // production spelling for an on-host predictor.
+    if (out.host == "localhost") out.host = "127.0.0.1";
+    in_addr address{};
+    return ::inet_pton(AF_INET, out.host.c_str(), &address) == 1;
 }
 
 bool semantic_sidecar_send_all(
-        SocketHandle fd, const char * data, size_t size) {
+        SocketHandle fd,
+        const char * data,
+        size_t size,
+        const std::chrono::steady_clock::time_point & deadline) {
     size_t sent = 0;
     while (sent < size) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) return false;
+        const int remaining_ms = std::max(1, static_cast<int>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - now).count()));
+        struct pollfd descriptor{fd, POLLOUT, 0};
+        const int polled = poll(&descriptor, 1, remaining_ms);
+        if (polled < 0 && sock_is_eintr(sock_errno())) continue;
+        if (polled <= 0 ||
+            !(descriptor.revents & POLLOUT) ||
+            (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+            return false;
+        }
 #if defined(_WIN32)
         const int n = ::send(
             fd, data + sent,
@@ -523,26 +553,83 @@ bool semantic_sidecar_send_all(
         const ssize_t n = ::send(
             fd, data + sent, size - sent, MSG_NOSIGNAL);
 #endif
+        if (n < 0 && (sock_is_eintr(sock_errno()) ||
+                      sock_is_eagain(sock_errno()))) {
+            continue;
+        }
         if (n <= 0) return false;
         sent += static_cast<size_t>(n);
     }
     return true;
 }
 
-void set_semantic_sidecar_socket_timeout(SocketHandle fd, int timeout_ms) {
+bool semantic_sidecar_connect(
+        const SemanticSidecarUrl & url,
+        const std::chrono::steady_clock::time_point & deadline,
+        SocketHandle & fd) {
+    fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (!socket_is_valid(fd)) return false;
+    if (!sock_set_nonblock(fd)) {
+        socket_close(fd);
+        fd = kInvalidSocket;
+        return false;
+    }
+
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(static_cast<uint16_t>(std::stoul(url.port)));
+    if (::inet_pton(AF_INET, url.host.c_str(), &address.sin_addr) != 1) {
+        socket_close(fd);
+        fd = kInvalidSocket;
+        return false;
+    }
+    if (::connect(fd, reinterpret_cast<const sockaddr *>(&address),
+                  static_cast<socklen_t>(sizeof(address))) == 0) {
+        return true;
+    }
+    const int connect_error = sock_errno();
 #if defined(_WIN32)
-    const DWORD timeout = static_cast<DWORD>(timeout_ms);
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO,
-               reinterpret_cast<const char *>(&timeout), sizeof(timeout));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO,
-               reinterpret_cast<const char *>(&timeout), sizeof(timeout));
+    const bool pending = connect_error == WSAEWOULDBLOCK ||
+                         connect_error == WSAEINPROGRESS ||
+                         connect_error == WSAEINVAL;
 #else
-    struct timeval timeout{};
-    timeout.tv_sec = timeout_ms / 1000;
-    timeout.tv_usec = (timeout_ms % 1000) * 1000;
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    const bool pending = connect_error == EINPROGRESS ||
+                         connect_error == EWOULDBLOCK;
 #endif
+    if (!pending) {
+        socket_close(fd);
+        fd = kInvalidSocket;
+        return false;
+    }
+
+    struct pollfd descriptor{fd, POLLOUT, 0};
+    int polled = -1;
+    while (true) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            socket_close(fd);
+            fd = kInvalidSocket;
+            return false;
+        }
+        const int remaining_ms = std::max(1, static_cast<int>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - now).count()));
+        descriptor.revents = 0;
+        polled = poll(&descriptor, 1, remaining_ms);
+        if (polled < 0 && sock_is_eintr(sock_errno())) continue;
+        break;
+    }
+    int socket_error = 0;
+    socklen_t error_size = static_cast<socklen_t>(sizeof(socket_error));
+    if (polled <= 0 || !(descriptor.revents & POLLOUT) ||
+        getsockopt(fd, SOL_SOCKET, SO_ERROR,
+                   reinterpret_cast<char *>(&socket_error), &error_size) != 0 ||
+        socket_error != 0) {
+        socket_close(fd);
+        fd = kInvalidSocket;
+        return false;
+    }
+    return true;
 }
 
 std::string lowercase_ascii(std::string value) {
@@ -588,6 +675,8 @@ SemanticToolPrediction request_semantic_tool_prediction(
         const json & payload,
         const json & request_tools) {
     const auto started = std::chrono::steady_clock::now();
+    const auto deadline = started +
+        std::chrono::milliseconds(std::max(1, config.timeout_ms));
     SemanticToolPrediction prediction;
     prediction.source = config.model;
     auto finish = [&]() {
@@ -598,34 +687,12 @@ SemanticToolPrediction request_semantic_tool_prediction(
 
     SemanticSidecarUrl url;
     if (!parse_semantic_sidecar_url(config.url, url)) {
-        prediction.error = "predictor_url_must_be_http_host_port_path";
-        return finish();
-    }
-
-    struct addrinfo hints{};
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    struct addrinfo * addresses = nullptr;
-    if (getaddrinfo(url.host.c_str(), url.port.c_str(), &hints, &addresses) != 0) {
-        prediction.error = "predictor_host_resolution_failed";
+        prediction.error = "predictor_url_must_use_http_numeric_ipv4";
         return finish();
     }
 
     SocketHandle fd = kInvalidSocket;
-    for (auto * address = addresses; address; address = address->ai_next) {
-        fd = socket(address->ai_family, address->ai_socktype,
-                    address->ai_protocol);
-        if (!socket_is_valid(fd)) continue;
-        set_semantic_sidecar_socket_timeout(fd, config.timeout_ms);
-        if (connect(fd, address->ai_addr,
-                    static_cast<socklen_t>(address->ai_addrlen)) == 0) {
-            break;
-        }
-        socket_close(fd);
-        fd = kInvalidSocket;
-    }
-    freeaddrinfo(addresses);
-    if (!socket_is_valid(fd)) {
+    if (!semantic_sidecar_connect(url, deadline, fd)) {
         prediction.error = "predictor_connect_failed";
         return finish();
     }
@@ -639,9 +706,11 @@ SemanticToolPrediction request_semantic_tool_prediction(
         "Connection: close\r\n" +
         "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" +
         body;
-    if (!semantic_sidecar_send_all(fd, request.data(), request.size())) {
+    if (!semantic_sidecar_send_all(
+            fd, request.data(), request.size(), deadline)) {
         socket_close(fd);
-        prediction.error = "predictor_send_failed";
+        prediction.error = std::chrono::steady_clock::now() >= deadline
+            ? "predictor_timeout" : "predictor_send_failed";
         return finish();
     }
 
@@ -649,6 +718,29 @@ SemanticToolPrediction request_semantic_tool_prediction(
     std::string response;
     std::array<char, 8192> buffer{};
     while (response.size() < kMaxResponseBytes) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            socket_close(fd);
+            prediction.error = "predictor_timeout";
+            return finish();
+        }
+        const int remaining_ms = std::max(1, static_cast<int>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - now).count()));
+        struct pollfd descriptor{fd, POLLIN | POLLHUP, 0};
+        const int polled = poll(&descriptor, 1, remaining_ms);
+        if (polled < 0 && sock_is_eintr(sock_errno())) continue;
+        if (polled == 0) {
+            socket_close(fd);
+            prediction.error = "predictor_timeout";
+            return finish();
+        }
+        if (polled < 0 ||
+            (descriptor.revents & (POLLERR | POLLNVAL))) {
+            socket_close(fd);
+            prediction.error = "predictor_receive_failed";
+            return finish();
+        }
 #if defined(_WIN32)
         const int received = recv(
             fd, buffer.data(), static_cast<int>(buffer.size()), 0);
@@ -657,8 +749,12 @@ SemanticToolPrediction request_semantic_tool_prediction(
 #endif
         if (received == 0) break;
         if (received < 0) {
+            if (sock_is_eintr(sock_errno()) ||
+                sock_is_eagain(sock_errno())) {
+                continue;
+            }
             socket_close(fd);
-            prediction.error = "predictor_receive_failed_or_timed_out";
+            prediction.error = "predictor_receive_failed";
             return finish();
         }
         response.append(buffer.data(), static_cast<size_t>(received));
@@ -1025,10 +1121,6 @@ json build_props_body(const ServerConfig & config,
             {"decode_interference_qualified",
              lane.decode_interference_qualified},
             {"accelerator_relation", lane.accelerator_relation},
-            {"requires_static_model_routing",
-             lane.requires_static_model_routing},
-            {"requires_unique_expert_ownership",
-             lane.requires_unique_expert_ownership},
         });
     }
     json body = {
@@ -1149,27 +1241,15 @@ json build_props_body(const ServerConfig & config,
             {"allowed_tools", config.tool_speculation.allowed_tools},
             {"max_model_slowdown_ratio",
              config.tool_speculation.max_model_slowdown_ratio},
-            {"model_routing_static",
-             config.tool_speculation.model_routing_static},
-            {"model_expert_ownership_unique",
-             config.tool_speculation.model_expert_ownership_unique},
             {"compute_isolation",
              config.tool_speculation.cpu_affinity_isolated
-                 ? "disjoint_cpu_affinity"
-                 : config.tool_speculation.hip_reserved_tool_compute_units > 0
-                     ? "disjoint_hip_cu_masks" : "none"},
+                 ? "disjoint_cpu_affinity" : "none"},
             {"cpu_affinity_isolated",
              config.tool_speculation.cpu_affinity_isolated},
             {"tool_cpu_affinity",
              config.tool_speculation.cpu_affinity},
             {"model_cpu_affinity",
              config.tool_speculation.model_cpu_affinity},
-            {"hip_tool_device",
-             config.tool_speculation.hip_tool_device >= 0
-                 ? json(config.tool_speculation.hip_tool_device)
-                 : json(nullptr)},
-            {"hip_reserved_tool_compute_units",
-             config.tool_speculation.hip_reserved_tool_compute_units},
             {"profile_lanes", tool_spec_lanes},
         }},
         {"sampling", {
@@ -2387,6 +2467,7 @@ void HttpServer::launch_semantic_tool_prediction(ParsedRequest & req) const {
     req.semantic_tool_prediction = std::async(
         std::launch::async,
         [predictor, payload, tools, native]() {
+            const auto prediction_started = std::chrono::steady_clock::now();
             SemanticToolPrediction native_result;
             if (native && native->active()) {
                 native_result = native->predict(payload, tools);
@@ -2395,12 +2476,35 @@ void HttpServer::launch_semantic_tool_prediction(ParsedRequest & req) const {
                 }
             }
             if (predictor.http_enabled()) {
+                const double elapsed_ms =
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() -
+                        prediction_started).count();
+                const int remaining_ms = predictor.timeout_ms -
+                    static_cast<int>(std::ceil(elapsed_ms));
+                if (remaining_ms <= 0) {
+                    native_result.source = predictor.model;
+                    native_result.ok = false;
+                    native_result.error = native_result.error.empty()
+                        ? "predictor_timeout"
+                        : "native=" + native_result.error +
+                          ";http=predictor_timeout";
+                    native_result.wall_ms = elapsed_ms;
+                    return native_result;
+                }
+                SemanticToolPredictorConfig fallback_config = predictor;
+                fallback_config.timeout_ms = remaining_ms;
                 SemanticToolPrediction fallback =
-                    request_semantic_tool_prediction(predictor, payload, tools);
+                    request_semantic_tool_prediction(
+                        fallback_config, payload, tools);
                 if (!fallback.ok && !native_result.error.empty()) {
                     fallback.error = "native=" + native_result.error +
                                      ";http=" + fallback.error;
                 }
+                fallback.wall_ms =
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() -
+                        prediction_started).count();
                 return fallback;
             }
             if (native_result.error.empty()) {
@@ -3955,16 +4059,9 @@ void HttpServer::prepare_generation_inputs(
     inputs.request.n_gen = inputs.generation_cap;
     inputs.request.sampler = req.sampler;
     inputs.request.do_sample = req.sampler.needs_logit_processing();
-    // Tool prediction must never change the target decoder or trigger an
-    // autoregressive retry. DS4/DSpark remains authoritative on every arm.
-    const bool semantic_tool_request =
-        req.automatic_tool_speculation_enabled &&
-        config_.tool_speculation.enabled() &&
-        config_.semantic_tool_predictor.enabled() &&
-        !req.tools.empty();
-    inputs.request.allow_decode_mode_retry =
-        !req.tool_speculation.has_value() &&
-        !semantic_tool_request;
+    // External tool prediction is deliberately absent from GenerateRequest.
+    // It must not change the target decoder, including the backend's normal
+    // empty-speculation recovery policy.
     // Tokens are delivered through DaemonIO so all API formats share the
     // same disconnect and streaming state machine.
     inputs.request.stream = false;
@@ -4415,10 +4512,11 @@ void HttpServer::process_job(ServerJob * job) {
     if (job->client_disconnected.load(std::memory_order_acquire)) {
         client_disconnected = true;
     }
-    auto finish_tool_speculation = [&](bool cancel) -> std::optional<json> {
+    auto finish_tool_speculation = [
+            &](const char * cancel_reason) -> std::optional<json> {
         if (tool_speculation) {
-            json metadata = cancel
-                ? tool_speculation->cancel("client_disconnected")
+            json metadata = cancel_reason
+                ? tool_speculation->cancel(cancel_reason)
                 : tool_speculation->resolve(emitter.tool_calls());
             metadata["prediction_source"] = "client";
             return metadata;
@@ -4429,8 +4527,8 @@ void HttpServer::process_job(ServerJob * job) {
                 req.automatic_tool_speculation.get();
             json metadata;
             if (launch.attempt) {
-                metadata = cancel
-                    ? launch.attempt->cancel("client_disconnected")
+                metadata = cancel_reason
+                    ? launch.attempt->cancel(cancel_reason)
                     : launch.attempt->resolve(emitter.tool_calls());
             } else {
                 metadata = {
@@ -4465,9 +4563,14 @@ void HttpServer::process_job(ServerJob * job) {
             };
         }
     };
+    // A partial tool call from a failed generation is not authoritative.
+    // Keep its speculative result private just as we do on disconnect.
+    const char * generation_cancel_reason =
+        result.ok() ? nullptr : "generation_failed";
     if (req.stream && !client_disconnected) {
         auto final_chunks = emitter.emit_finish(completion_tokens, &gen_timings);
-        if (auto metadata = finish_tool_speculation(false)) {
+        if (auto metadata = finish_tool_speculation(
+                generation_cancel_reason)) {
             const std::string extension = render_tool_speculation_sse(
                 req.format, req.response_id, req.model, *metadata);
             // Keep the standard terminal event last: [DONE], message_stop,
@@ -4487,7 +4590,8 @@ void HttpServer::process_job(ServerJob * job) {
     } else if (!req.stream && !client_disconnected) {
         json response = build_non_streaming_response(
             req, result, n_gen_cap, gen_timings, tokenizer_, emitter);
-        if (auto metadata = finish_tool_speculation(false)) {
+        if (auto metadata = finish_tool_speculation(
+                generation_cancel_reason)) {
             response["dflash_tool_speculation"] = std::move(*metadata);
         }
         // Streaming uses non-blocking sends; restore blocking mode before
@@ -4496,7 +4600,7 @@ void HttpServer::process_job(ServerJob * job) {
         send_response(fd, 200, "application/json",
                       response.dump() + "\n");
     } else {
-        finish_tool_speculation(true);
+        finish_tool_speculation("client_disconnected");
     }
 
     if (client_disconnected) {
