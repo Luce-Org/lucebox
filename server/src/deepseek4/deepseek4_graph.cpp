@@ -60,6 +60,11 @@ static bool ds4_env_flag(const char * name) {
     return value && value[0] && std::strcmp(value, "0") != 0;
 }
 
+// F32 key-side accumulation protects the short-context quality baseline while
+// still avoiding a full-cache F16 -> F32 conversion once attention is large
+// enough for that conversion to dominate verifier time.
+static constexpr int DS4_FUSED_VERIFY_F16_F32_K_MAX_ATTN = 512;
+
 static int ds4_effective_expert_count(const DeepSeek4Weights & w) {
     int requested = w.routed_expert_top_k;
     if (const char * value = std::getenv("DFLASH_DS4_TOPK")) {
@@ -1701,6 +1706,7 @@ static ggml_tensor * build_mla_attention(
     const bool layer_major_batch =
         causal_batch && attention_impl != DeepSeek4AttentionImpl::Explicit;
     ggml_tensor * old_rows_scratch = nullptr;
+    ggml_tensor * old_rows_scratch_f16 = nullptr;
     int n_old_rows = 0;
     ggml_tensor * prior_rows_scratch = nullptr;
     int n_prior_rows = 0;
@@ -1718,6 +1724,7 @@ static ggml_tensor * build_mla_attention(
                 ? ggml_concat(ctx, old_rows_scratch, saved, 1) : saved;
             n_old_rows++;
         }
+        old_rows_scratch_f16 = old_rows_scratch;
         old_rows_scratch = ds4_cast_if_needed(ctx, old_rows_scratch, GGML_TYPE_F32);
     } else if (causal_batch && !layer_major_batch) {
         // Copy the to-be-overwritten rows FIRST; same-stream build order runs
@@ -1947,13 +1954,51 @@ static ggml_tensor * build_mla_attention(
     } else {
         kv_attn = raw_kv_view(0, n_raw);
     }
-    if (n_comp_attn > 0 && comp_kv_source) {
-        ggml_tensor * comp = ggml_view_2d(ctx, comp_kv_source, head_dim, n_comp_attn, comp_kv_source->nb[1], 0);
-        comp = ds4_cast_if_needed(ctx, comp, GGML_TYPE_F32);
-        kv_attn = ggml_concat(ctx, kv_attn, comp, 1);
-    }
-    if (old_rows_scratch) {
-        kv_attn = ggml_concat(ctx, kv_attn, old_rows_scratch, 1);
+    const bool fused_explicit_f16_kv = w.fused_verify_f16_kv &&
+        masked_kv && n_tokens > 1 &&
+        attention_impl == DeepSeek4AttentionImpl::Explicit &&
+        kv_attn->type == GGML_TYPE_F32 &&
+        raw_kv_source->type == GGML_TYPE_F16 &&
+        (!comp_kv_source || comp_kv_source->type == GGML_TYPE_F16) &&
+        (!old_rows_scratch_f16 ||
+         old_rows_scratch_f16->type == GGML_TYPE_F16);
+    if (fused_explicit_f16_kv) {
+        // DS4's persistent MLA caches are already F16. Feed those tensors
+        // directly to the established explicit attention matmuls instead of
+        // casting the entire long-context cache to F32 on every verifier step.
+        // Current writes are consumed through their set_rows results, while
+        // preserved overwritten rows retain the same cached F16 values.
+        kv_attn = ggml_view_2d(
+            ctx, raw_kv_source, head_dim, n_raw, raw_kv_source->nb[1], 0);
+        if (n_comp_attn > 0 && comp_kv_source) {
+            ggml_tensor * comp = ggml_view_2d(
+                ctx, comp_kv_source, head_dim, n_comp_attn,
+                comp_kv_source->nb[1], 0);
+            kv_attn = ggml_concat(ctx, kv_attn, comp, 1);
+        }
+        if (old_rows_scratch_f16) {
+            kv_attn = ggml_concat(
+                ctx, kv_attn, old_rows_scratch_f16, 1);
+        }
+        static std::atomic<bool> explicit_f16_kv_logged{false};
+        if (!explicit_f16_kv_logged.exchange(true)) {
+            std::fprintf(stderr,
+                "[deepseek4] fused explicit F16 K/V active: tokens=%d "
+                "compressed=%d\n",
+                n_tokens, n_comp_attn);
+            explicit_f16_kv_logged = true;
+        }
+    } else {
+        if (n_comp_attn > 0 && comp_kv_source) {
+            ggml_tensor * comp = ggml_view_2d(
+                ctx, comp_kv_source, head_dim, n_comp_attn,
+                comp_kv_source->nb[1], 0);
+            comp = ds4_cast_if_needed(ctx, comp, GGML_TYPE_F32);
+            kv_attn = ggml_concat(ctx, kv_attn, comp, 1);
+        }
+        if (old_rows_scratch) {
+            kv_attn = ggml_concat(ctx, kv_attn, old_rows_scratch, 1);
+        }
     }
     // kv_attn: [head_dim, n_attn]
 
@@ -2235,6 +2280,22 @@ static ggml_tensor * build_mla_attention(
         ggml_tensor * q_flat = ggml_reshape_2d(ctx, q, head_dim,
                                                n_head * n_tokens);
         ggml_tensor * scores = ggml_mul_mat(ctx, kv_attn, q_flat);
+        const bool explicit_f16_f32_k_short = fused_explicit_f16_kv &&
+            n_attn <= DS4_FUSED_VERIFY_F16_F32_K_MAX_ATTN;
+        if (explicit_f16_f32_k_short) {
+            // Keep Q and accumulation in F32 while retaining the persistent
+            // cache in F16. This isolates the key-side accuracy cost of the
+            // default HIP F16 GEMM path without changing cache topology.
+            ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
+            static std::atomic<bool> f32_k_short_logged{false};
+            if (!f32_k_short_logged.exchange(true)) {
+                std::fprintf(stderr,
+                    "[deepseek4] fused explicit short-cache F32 K active: "
+                    "n_attn=%d threshold=%d\n", n_attn,
+                    DS4_FUSED_VERIFY_F16_F32_K_MAX_ATTN);
+                f32_k_short_logged = true;
+            }
+        }
         scores = ggml_scale(ctx, scores, kq_scale);
         if (score_mask) {
             if (n_tokens > 1) {

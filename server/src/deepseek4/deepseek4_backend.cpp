@@ -758,6 +758,7 @@ bool DeepSeek4Backend::load_model() {
     }
     w_.routed_expert_top_k = cfg_.expert_top_k;
     w_.fused_decode = cfg_.fused_decode && !moe_hybrid_;
+    w_.fused_verify_f16_kv = cfg_.fused_verify_f16_kv && !moe_hybrid_;
     if (cfg_.fused_decode && moe_hybrid_) {
         std::fprintf(stderr,
                      "[deepseek4] fused decode unavailable with hybrid expert placement; "

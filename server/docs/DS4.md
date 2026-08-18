@@ -343,8 +343,17 @@ export DFLASH_DS4_SPEC_Q=4
 
 ./server/build-hip/dflash_server /path/to/deepseek4-target.gguf \
   --target-device hip:0 \
+  --ds4-fused-verify-f16-kv \
   --ds4-fused-decode
 ```
+
+`--ds4-fused-verify-f16-kv` feeds the persistent F16 MLA cache directly to
+batched explicit verifier attention instead of converting the full cache to
+F32 on every speculative step. Key-side accumulation remains F32 through 512
+attention rows to preserve the short-context quality baseline. The option is
+currently qualified only for a single HIP target and remains off by default.
+It changes verifier floating-point inputs and can change generated tokens, so
+re-run workload quality checks before enabling it for another checkpoint.
 
 `DFLASH_DS4_FUSED_VERIFY=1` is the opt-in throughput profile. Its persistent
 whole-model GPU graph uses stable padded reduction shapes, so near-tied greedy

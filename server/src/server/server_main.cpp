@@ -97,6 +97,8 @@ static void print_usage(const char * prog) {
         "  --peer-access        Enable peer access for multi-GPU placement\n"
         "  --chunk <N>          Chunked-prefill chunk size (default: 512)\n"
         "  --ds4-fused-decode   Enable DeepSeek4 single-graph GPU decode\n"
+        "  --ds4-fused-verify-f16-kv\n"
+        "                       Reuse F16 MLA cache in batched DeepSeek4 verification\n"
         "  --ds4-expert-top-k <N>\n"
         "                       Keep and renormalize the highest-ranked N routed experts\n"
         "                       (0=model default; single-device DeepSeek4 only)\n"
@@ -338,6 +340,8 @@ int main(int argc, char ** argv) {
             bargs.chunk = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--ds4-fused-decode") == 0) {
             bargs.ds4_fused_decode = true;
+        } else if (std::strcmp(argv[i], "--ds4-fused-verify-f16-kv") == 0) {
+            bargs.ds4_fused_verify_f16_kv = true;
         } else if (std::strcmp(argv[i], "--ds4-expert-top-k") == 0 && i + 1 < argc) {
             bargs.ds4_expert_top_k = std::atoi(argv[++i]);
             if (bargs.ds4_expert_top_k < 0) {
@@ -1092,6 +1096,8 @@ int main(int argc, char ** argv) {
     if (arch == "deepseek4") {
         std::fprintf(stderr, "[server] │  ds4_fused      = %s\n",
                      bargs.ds4_fused_decode ? "ON" : "off");
+        std::fprintf(stderr, "[server] │  ds4_verify_f16kv= %s\n",
+                     bargs.ds4_fused_verify_f16_kv ? "ON" : "off");
         if (bargs.ds4_expert_top_k > 0) {
             std::fprintf(stderr, "[server] │  ds4_expert_topk= %d\n",
                          bargs.ds4_expert_top_k);

@@ -59,6 +59,7 @@ struct BackendArgs {
     // deepseek4-specific decode options
     int             ds4_expert_top_k = 0;  // 0 = model default
     bool            ds4_fused_decode = false;
+    bool            ds4_fused_verify_f16_kv = false;
 
     // Attention and speculative-decode options. Individual backends consume
     // only the fields they support.

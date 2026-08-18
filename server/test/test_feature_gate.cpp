@@ -271,6 +271,18 @@ void test_feature_gate_ds4_decode_options_require_monolithic_hip() {
     CHECK(gate_result(
         fused, "deepseek4", PlacementBackend::Hip).empty());
 
+    BackendArgs f16_kv = gate_args_hip_deepseek4();
+    f16_kv.ds4_fused_verify_f16_kv = true;
+    CHECK(!gate_result(
+        f16_kv, "deepseek4", PlacementBackend::Cuda).empty());
+    CHECK(gate_result(
+        f16_kv, "deepseek4", PlacementBackend::Hip).empty());
+
+    BackendArgs split_f16_kv = f16_kv;
+    split_f16_kv.device.layer_split_gpus = {0, 1};
+    CHECK(!gate_result(
+        split_f16_kv, "deepseek4", PlacementBackend::Hip).empty());
+
     BackendArgs topk = gate_args_hip_deepseek4();
     topk.ds4_expert_top_k = 4;
     CHECK(!gate_result(

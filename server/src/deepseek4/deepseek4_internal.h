@@ -239,6 +239,7 @@ struct DeepSeek4Weights {
     // GGUF is loaded; they are not model metadata.
     int  routed_expert_top_k = 0;  // 0 = model default (n_expert_used)
     bool fused_decode        = false;
+    bool fused_verify_f16_kv = false;
 };
 
 inline bool deepseek4_is_eos_tok(int tok, const DeepSeek4Weights & w) {
@@ -313,6 +314,7 @@ struct DeepSeek4BackendConfig {
     int          max_ctx      = 0;     // 0 = auto from SWA + compression capacity
     int          expert_top_k = 0;     // 0 = use all model-routed experts
     bool         fused_decode = false; // single-graph GPU decode
+    bool         fused_verify_f16_kv = false; // F16 KV in batched verifier attention
 };
 
 // ─── Function declarations ──────────────────────────────────────────────
