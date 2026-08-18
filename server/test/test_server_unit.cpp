@@ -5804,3 +5804,18 @@ TEST_CASE(ServerUnitFixture, test_emitter_function_calls_unclosed_think_flushes_
     TEST_ASSERT(all.find("\"finish_reason\":\"tool_calls\"") != std::string::npos);
 }
 
+TEST_CASE(ServerUnitFixture, test_emitter_function_calls_content_tokens_accounting) {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, read_tools(), false);
+    em.emit_token("<think>Analyzing build configuration.\n");
+    em.emit_token("<function_calls>\n  <invoke name=\"read\">\n    <param name=\"path\">CMakeLists.txt</param>\n  </invoke>\n</function_calls>\n");
+    em.emit_token("</think>\n");
+    em.emit_token("Here is the build summary.");
+    em.emit_finish(4);
+
+    TEST_ASSERT(em.tool_calls().size() == 1);
+    TEST_ASSERT(em.first_content_token_index() == 2);
+    TEST_ASSERT(em.emit_token_count() == 4);
+    TEST_ASSERT(em.emit_token_count() - em.first_content_token_index() == 2);
+}
+
+

@@ -285,6 +285,12 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
     // State machine loop — processes the window
     while (true) {
         if (mode_ == StreamMode::TOOL_BUFFER) {
+            if (tool_from_reasoning_ && first_content_token_index_ < 0) {
+                if (window_.find(THINK_CLOSE) != std::string::npos ||
+                    (tool_buffer_ + window_).find(THINK_CLOSE) != std::string::npos) {
+                    first_content_token_index_ = emit_token_count_ - 1;
+                }
+            }
             tool_buffer_ += window_;
             window_.clear();
             break;
@@ -618,11 +624,11 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
             if (!parsed.cleaned_text.empty()) {
                 size_t think_close = parsed.cleaned_text.find(THINK_CLOSE);
                 if (think_close != std::string::npos) {
-                    if (first_content_token_index_ == -1) {
-                        first_content_token_index_ = emit_token_count_;
-                    }
                     std::string reasoning = parsed.cleaned_text.substr(0, think_close);
                     std::string content = parsed.cleaned_text.substr(think_close + THINK_CLOSE_LEN);
+                    if (first_content_token_index_ == -1) {
+                        first_content_token_index_ = content.empty() ? emit_token_count_ : std::max(0, emit_token_count_ - 1);
+                    }
                     if (!reasoning.empty()) {
                         reasoning_text_ += reasoning;
                         if (format_ == ApiFormat::OPENAI_CHAT) {
