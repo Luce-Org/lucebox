@@ -719,9 +719,11 @@ bool DeepSeek4Backend::load_model() {
         (force_full || need_monolithic)) {
         std::fprintf(stderr,
                      "[deepseek4] monolithic execution requested "
-                     "(forced=%s, fused_decode=%s, prefill=%s)\n",
+                     "(forced=%s, fused_decode=%s, "
+                     "fused_verify_f16_kv=%s, prefill=%s)\n",
                      force_full ? "yes" : "no",
                      cfg_.fused_decode ? "on" : "off",
+                     cfg_.fused_verify_f16_kv ? "on" : "off",
                      prefill_attention_mode_name(cfg_.prefill_mode));
         if (!load_deepseek4_gguf(cfg_.model_path, backend_, w_)) {
             if (prefill_attention_mode_is_approximate(cfg_.prefill_mode)) {
