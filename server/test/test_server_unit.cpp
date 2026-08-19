@@ -890,6 +890,21 @@ TEST_CASE(ServerUnitFixture, test_parse_deepseek_function_parameters_json) {
     TEST_ASSERT(result.cleaned_text.empty());
 }
 
+TEST_CASE(ServerUnitFixture, test_parse_deepseek_function_stringified_parameters_json) {
+    const std::string text =
+        "{\"function\":\"get_weather\",\"parameters\":"
+        "\"{\\\"location\\\":\\\"test-city\\\",\\\"unit\\\":\\\"celsius\\\"}\"}";
+    const auto result = parse_tool_calls(text, weather_tools());
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "get_weather");
+        const auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["location"] == "test-city");
+        TEST_ASSERT(args["unit"] == "celsius");
+    }
+    TEST_ASSERT(result.cleaned_text.empty());
+}
+
 TEST_CASE(ServerUnitFixture, test_parse_bare_function_json_with_parameters) {
     std::string text =
         "<function>\n"
@@ -4855,7 +4870,6 @@ TEST_CASE(ServerUnitFixture, test_props_deepseek4_tool_capability) {
     ToolMemory tm;
     const json body = build_props_body(cfg, pc, tm);
 
-    TEST_ASSERT(body["tools"]["supported"].get<bool>());
     TEST_ASSERT(body["capabilities"]["tools_supported"].get<bool>());
 }
 

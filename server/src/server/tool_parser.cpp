@@ -590,10 +590,17 @@ static bool parse_json_tool_call(const json & obj, std::string & out_name, json 
         }
     } else if (obj.contains("function") && obj["function"].is_string()) {
         name = obj["function"].get<std::string>();
-        if (!obj.contains("parameters") || !obj["parameters"].is_object()) {
+        if (!obj.contains("parameters")) {
             return false;
         }
-        args = obj["parameters"];
+        if (obj["parameters"].is_object()) {
+            args = obj["parameters"];
+        } else if (obj["parameters"].is_string()) {
+            try { args = json::parse(obj["parameters"].get<std::string>()); }
+            catch (...) { return false; }
+        } else {
+            return false;
+        }
     } else if ((obj.contains("function") && obj["function"].is_object()) ||
                (obj.contains("function_call") &&
                 obj["function_call"].is_object())) {
