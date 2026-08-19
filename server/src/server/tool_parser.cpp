@@ -577,6 +577,27 @@ static bool coerce_relaxed_json(const std::string & payload, json & out) {
     if (auto_close(rewritten, out)) {
         return true;
     }
+
+    // Repair premature array/object closures emitted mid-array by LLMs (e.g. `}]}, {` -> `}, {`)
+    auto repair_premature_closes = [](const std::string & s) -> std::string {
+        static const std::regex re1(R"(\}\s*\]\s*\}\s*,\s*\{)");
+        static const std::regex re2(R"(\}\s*\]\s*,\s*\{)");
+        std::string r = std::regex_replace(s, re1, "}, {");
+        r = std::regex_replace(r, re2, "}, {");
+        return r;
+    };
+
+    std::string repaired = repair_premature_closes(rewritten);
+    if (repaired != rewritten) {
+        json rep_parsed = json::parse(repaired, nullptr, false);
+        if (!rep_parsed.is_discarded()) {
+            out = std::move(rep_parsed);
+            return true;
+        }
+        if (auto_close(repaired, out)) {
+            return true;
+        }
+    }
     return false;
 }
 

@@ -5973,6 +5973,28 @@ TEST_CASE(ServerUnitFixture, test_parse_function_call_raw_regex_escapes) {
     }
 }
 
+TEST_CASE(ServerUnitFixture, test_parse_function_call_premature_array_close) {
+    std::string text =
+        "<function_call>\n"
+        "{\"name\": \"edit\", \"arguments\": {\"path\": \"internal/rfid/reader.go\", "
+        "\"edits\": [{\"oldText\": \"a\", \"newText\": \"b\"}, {\"oldText\": \"c\", \"newText\": \"d\"}]}, "
+        "{\"oldText\": \"e\", \"newText\": \"f\"}]}"
+        "\n</function_call>";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "edit");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["path"] == "internal/rfid/reader.go");
+        TEST_ASSERT(args["edits"].is_array());
+        TEST_ASSERT(args["edits"].size() == 3);
+        TEST_ASSERT(args["edits"][0]["oldText"] == "a");
+        TEST_ASSERT(args["edits"][1]["oldText"] == "c");
+        TEST_ASSERT(args["edits"][2]["oldText"] == "e");
+    }
+}
+
+
 
 
 
