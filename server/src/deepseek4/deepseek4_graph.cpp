@@ -6255,12 +6255,14 @@ static int ds4_try_layer_major_prefill(
             // Do not evict a full/larger chunk for an equal-size graph at a
             // later position or for a short tail. Both execute with the shared
             // scratch arena below, but only the dominant topology stays cached.
+            // When logits are needed on a tail/terminal step, execute it
+            // transiently rather than evicting the dominant no-logits graph.
             const bool same_owner = candidate.owner_ctx == w.ctx &&
                                     candidate.backend == backend &&
                                     candidate.mode == cache.prefill_mode;
-            if (!candidate.ready || !same_owner ||
-                n_tokens > candidate.n_tokens ||
-                (n_tokens == candidate.n_tokens && candidate.has_logits != logits_needed)) {
+            const bool can_cache_dominant = !logits_needed;
+            if (can_cache_dominant && (!candidate.ready || !same_owner ||
+                n_tokens > candidate.n_tokens)) {
                 graph_cache = &candidate;
                 graph_cache->destroy();
                 graph_cache->owner_ctx = w.ctx;
@@ -6268,7 +6270,7 @@ static int ds4_try_layer_major_prefill(
                 graph_cache->mode = cache.prefill_mode;
                 graph_cache->n_tokens = n_tokens;
                 graph_cache->kv_start = kv_start;
-                graph_cache->has_logits = logits_needed;
+                graph_cache->has_logits = false;
                 graph_cache->layers.resize((size_t) w.n_layer);
                 cache_build = true;
             }
