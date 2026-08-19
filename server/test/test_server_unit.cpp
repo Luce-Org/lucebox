@@ -5943,5 +5943,22 @@ TEST_CASE(ServerUnitFixture, test_emitter_function_calls_param_with_literal_thin
     TEST_ASSERT(em.emit_token_count() - em.first_content_token_index() == 1);
 }
 
+TEST_CASE(ServerUnitFixture, test_parse_function_call_unclosed_outer_brace) {
+    std::string text =
+        "<function_call>\n"
+        "{\"name\": \"edit\", \"arguments\": {\"path\": \"internal/rfid/reader.go\", \"edits\": [{\"oldText\": \"a\", \"newText\": \"b\"}]}"
+        "\n</function_call>";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "edit");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["path"] == "internal/rfid/reader.go");
+        TEST_ASSERT(args["edits"].is_array());
+        TEST_ASSERT(args["edits"].size() == 1);
+    }
+}
+
+
 
 

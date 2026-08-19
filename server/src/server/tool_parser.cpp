@@ -428,12 +428,56 @@ static size_t balanced_braces_end(const std::string & text, size_t open) {
 // The rewrite walks the buffer char-by-char tracking string state so it
 // doesn't mangle identifiers that live inside string values.
 static bool coerce_relaxed_json(const std::string & payload, json & out) {
+    auto auto_close = [](const std::string & s, json & res) -> bool {
+        bool in_str = false;
+        bool escape = false;
+        std::vector<char> stack;
+        for (size_t i = 0; i < s.size(); ++i) {
+            char c = s[i];
+            if (escape) {
+                escape = false;
+                continue;
+            }
+            if (c == '\\' && in_str) {
+                escape = true;
+                continue;
+            }
+            if (c == '"') {
+                in_str = !in_str;
+                continue;
+            }
+            if (!in_str) {
+                if (c == '{') stack.push_back('}');
+                else if (c == '[') stack.push_back(']');
+                else if (c == '}' || c == ']') {
+                    if (!stack.empty() && stack.back() == c) stack.pop_back();
+                }
+            }
+        }
+        if (!stack.empty()) {
+            std::string closed = s;
+            while (!stack.empty()) {
+                closed.push_back(stack.back());
+                stack.pop_back();
+            }
+            json parsed = json::parse(closed, nullptr, false);
+            if (!parsed.is_discarded()) {
+                res = std::move(parsed);
+                return true;
+            }
+        }
+        return false;
+    };
+
     {
         json parsed = json::parse(payload, nullptr, false);
         if (!parsed.is_discarded()) {
             out = std::move(parsed);
             return true;
         }
+    }
+    if (auto_close(payload, out)) {
+        return true;
     }
 
     // Permissive pass.
@@ -505,9 +549,14 @@ static bool coerce_relaxed_json(const std::string & payload, json & out) {
     }
 
     json parsed = json::parse(rewritten, nullptr, false);
-    if (parsed.is_discarded()) return false;
-    out = std::move(parsed);
-    return true;
+    if (!parsed.is_discarded()) {
+        out = std::move(parsed);
+        return true;
+    }
+    if (auto_close(rewritten, out)) {
+        return true;
+    }
+    return false;
 }
 
 
@@ -1139,12 +1188,14 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
             size_t e = inner.find_last_not_of(" \t\n\r");
             if (e != std::string::npos) inner = inner.substr(0, e + 1);
             try {
-                json obj = json::parse(inner);
-                std::string name;
-                json args;
-                if (parse_json_tool_call(obj, name, args)) {
-                    size_t pos = it->position();
-                    add_call(name, args, pos, pos + it->length());
+                json obj;
+                if (coerce_relaxed_json(inner, obj)) {
+                    std::string name;
+                    json args;
+                    if (parse_json_tool_call(obj, name, args)) {
+                        size_t pos = it->position();
+                        add_call(name, args, pos, pos + it->length());
+                    }
                 }
             } catch (...) {}
         }
@@ -1164,12 +1215,14 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
             size_t e = inner.find_last_not_of(" \t\n\r");
             if (e != std::string::npos) inner = inner.substr(0, e + 1);
             try {
-                json obj = json::parse(inner);
-                std::string name;
-                json args;
-                if (parse_json_tool_call(obj, name, args)) {
-                    size_t pos = it->position();
-                    add_call(name, args, pos, pos + it->length());
+                json obj;
+                if (coerce_relaxed_json(inner, obj)) {
+                    std::string name;
+                    json args;
+                    if (parse_json_tool_call(obj, name, args)) {
+                        size_t pos = it->position();
+                        add_call(name, args, pos, pos + it->length());
+                    }
                 }
             } catch (...) {}
         }
@@ -1189,12 +1242,14 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
             size_t e = inner.find_last_not_of(" \t\n\r");
             if (e != std::string::npos) inner = inner.substr(0, e + 1);
             try {
-                json obj = json::parse(inner);
-                std::string name;
-                json args;
-                if (parse_json_tool_call(obj, name, args)) {
-                    size_t pos = it->position();
-                    add_call(name, args, pos, pos + it->length());
+                json obj;
+                if (coerce_relaxed_json(inner, obj)) {
+                    std::string name;
+                    json args;
+                    if (parse_json_tool_call(obj, name, args)) {
+                        size_t pos = it->position();
+                        add_call(name, args, pos, pos + it->length());
+                    }
                 }
             } catch (...) {}
         }
@@ -1224,8 +1279,8 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
                 std::string body = trim_ws((*it)[2].str());
                 json args = json::object();
                 if (!body.empty() && body.front() == '{') {
-                    json raw_args = json::parse(body, nullptr, false);
-                    if (raw_args.is_discarded() || !raw_args.is_object()) continue;
+                    json raw_args;
+                    if (!coerce_relaxed_json(body, raw_args) || !raw_args.is_object()) continue;
                     json props = find_tool_properties(tools, fn_name);
                     for (auto & [k, v] : raw_args.items()) {
                         if (v.is_string()) {
