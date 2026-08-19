@@ -60,10 +60,10 @@ static bool ds4_env_flag(const char * name) {
     return value && value[0] && std::strcmp(value, "0") != 0;
 }
 
-// F32 key-side accumulation protects the short-context quality baseline while
-// still avoiding a full-cache F16 -> F32 conversion once attention is large
-// enough for that conversion to dominate verifier time.
-static constexpr int DS4_FUSED_VERIFY_F16_F32_K_MAX_ATTN = 512;
+// F32 key/value-side accumulation protects the short-context quality baseline
+// while still avoiding a full-cache F16 -> F32 conversion once attention is
+// large enough for that conversion to dominate verifier time.
+static constexpr int DS4_FUSED_VERIFY_F16_F32_KV_MAX_ATTN = 512;
 
 static int ds4_effective_expert_count(const DeepSeek4Weights & w) {
     int requested = w.routed_expert_top_k;
@@ -2280,20 +2280,20 @@ static ggml_tensor * build_mla_attention(
         ggml_tensor * q_flat = ggml_reshape_2d(ctx, q, head_dim,
                                                n_head * n_tokens);
         ggml_tensor * scores = ggml_mul_mat(ctx, kv_attn, q_flat);
-        const bool explicit_f16_f32_k_short = fused_explicit_f16_kv &&
-            n_attn <= DS4_FUSED_VERIFY_F16_F32_K_MAX_ATTN;
-        if (explicit_f16_f32_k_short) {
+        const bool explicit_f16_f32_kv_short = fused_explicit_f16_kv &&
+            n_attn <= DS4_FUSED_VERIFY_F16_F32_KV_MAX_ATTN;
+        if (explicit_f16_f32_kv_short) {
             // Keep Q and accumulation in F32 while retaining the persistent
-            // cache in F16. This isolates the key-side accuracy cost of the
-            // default HIP F16 GEMM path without changing cache topology.
+            // cache in F16. The value-side matmul below uses the same bounded
+            // precision policy without changing cache topology.
             ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
-            static std::atomic<bool> f32_k_short_logged{false};
-            if (!f32_k_short_logged.exchange(true)) {
+            static std::atomic<bool> f32_kv_short_logged{false};
+            if (!f32_kv_short_logged.exchange(true)) {
                 std::fprintf(stderr,
-                    "[deepseek4] fused explicit short-cache F32 K active: "
+                    "[deepseek4] fused explicit short-cache F32 K/V active: "
                     "n_attn=%d threshold=%d\n", n_attn,
-                    DS4_FUSED_VERIFY_F16_F32_K_MAX_ATTN);
-                f32_k_short_logged = true;
+                    DS4_FUSED_VERIFY_F16_F32_KV_MAX_ATTN);
+                f32_kv_short_logged = true;
             }
         }
         scores = ggml_scale(ctx, scores, kq_scale);
@@ -2332,6 +2332,12 @@ static ggml_tensor * build_mla_attention(
         }
         ggml_tensor * kv_t = ggml_cont(ctx, ggml_transpose(ctx, kv_attn));
         context = ggml_mul_mat(ctx, kv_t, probs);
+        if (explicit_f16_f32_kv_short) {
+            // Match the pre-existing F32-cache path on the value-side matmul
+            // as well. The same short-window bound contains its conversion
+            // cost, while probabilities and accumulation stay in F32.
+            ggml_mul_mat_set_prec(context, GGML_PREC_F32);
+        }
         context = ggml_reshape_3d(ctx, context, head_dim, n_head, n_tokens);
     }
 

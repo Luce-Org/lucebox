@@ -674,7 +674,7 @@ DeepSeek4Backend::~DeepSeek4Backend() {
 }
 
 bool DeepSeek4Backend::requires_monolithic_model() const {
-    return cfg_.fused_decode ||
+    return cfg_.fused_decode || cfg_.fused_verify_f16_kv ||
            prefill_attention_mode_is_approximate(cfg_.prefill_mode);
 }
 
@@ -763,6 +763,11 @@ bool DeepSeek4Backend::load_model() {
         std::fprintf(stderr,
                      "[deepseek4] fused decode unavailable with hybrid expert placement; "
                      "using layered decode\n");
+    }
+    if (cfg_.fused_verify_f16_kv && moe_hybrid_) {
+        std::fprintf(stderr,
+                     "[deepseek4] fused verifier F16 K/V unavailable with hybrid "
+                     "expert placement; using F32 verifier attention\n");
     }
     return true;
 }
