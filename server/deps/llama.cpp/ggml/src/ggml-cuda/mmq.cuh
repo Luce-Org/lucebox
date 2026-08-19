@@ -153,7 +153,22 @@ static constexpr __device__ int get_mmq_x_max_device() {
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     return 128;
 #else // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE)
+
+#if defined(GGML_USE_HIP)
     return 64;
+#else // defined(GGML_USE_HIP)
+
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+#ifdef GGML_CUDA_FORCE_MMQ
+    return 128;
+#else // GGML_CUDA_FORCE_MMQ
+    return MMQ_DP4A_MAX_BATCH_SIZE;
+#endif // GGML_CUDA_FORCE_MMQ
+#else // __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+    return 64;
+#endif // __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+
+#endif // defined(GGML_USE_HIP)
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
 }
 

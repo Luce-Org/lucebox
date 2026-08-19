@@ -6013,6 +6013,7 @@ struct Ds4LayerMajorGraphCache {
     PrefillAttentionMode mode = PrefillAttentionMode::Exact;
     int n_tokens = 0;
     int kv_start = -1;
+    bool has_logits = false;
     bool ready = false;
     ggml_context * state_ctx = nullptr;
     ggml_backend_buffer_t state_buf = nullptr;
@@ -6021,9 +6022,11 @@ struct Ds4LayerMajorGraphCache {
     std::vector<Ds4LayerMajorCachedLayer> layers;
 
     bool matches(const DeepSeek4Weights & w, ggml_backend_t b,
-                 PrefillAttentionMode m, int tokens, int start) const {
+                 PrefillAttentionMode m, int tokens, int start,
+                 bool logits_needed) const {
         return ready && owner_ctx == w.ctx && backend == b && mode == m &&
                n_tokens == tokens && kv_start == start &&
+               has_logits == logits_needed &&
                layers.size() == (size_t) w.n_layer;
     }
 
@@ -6045,6 +6048,7 @@ struct Ds4LayerMajorGraphCache {
         mode = PrefillAttentionMode::Exact;
         n_tokens = 0;
         kv_start = -1;
+        has_logits = false;
         ready = false;
     }
 };
@@ -6236,10 +6240,11 @@ static int ds4_try_layer_major_prefill(
     Ds4LayerMajorGraphCache * graph_cache = nullptr;
     bool cache_hit = false;
     bool cache_build = false;
+    const bool logits_needed = (out_logits != nullptr);
     if (token_ids) {
         for (auto & candidate : ds4_layer_major_graph_caches) {
             if (candidate.matches(w, backend, cache.prefill_mode,
-                                  n_tokens, kv_start)) {
+                                  n_tokens, kv_start, logits_needed)) {
                 graph_cache = &candidate;
                 cache_hit = true;
                 break;
@@ -6254,7 +6259,8 @@ static int ds4_try_layer_major_prefill(
                                     candidate.backend == backend &&
                                     candidate.mode == cache.prefill_mode;
             if (!candidate.ready || !same_owner ||
-                n_tokens > candidate.n_tokens) {
+                n_tokens > candidate.n_tokens ||
+                (n_tokens == candidate.n_tokens && candidate.has_logits != logits_needed)) {
                 graph_cache = &candidate;
                 graph_cache->destroy();
                 graph_cache->owner_ctx = w.ctx;
@@ -6262,6 +6268,7 @@ static int ds4_try_layer_major_prefill(
                 graph_cache->mode = cache.prefill_mode;
                 graph_cache->n_tokens = n_tokens;
                 graph_cache->kv_start = kv_start;
+                graph_cache->has_logits = logits_needed;
                 graph_cache->layers.resize((size_t) w.n_layer);
                 cache_build = true;
             }
