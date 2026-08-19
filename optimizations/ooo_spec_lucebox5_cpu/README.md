@@ -40,6 +40,15 @@ model-agnostic mechanisms that do pay back:
   -27% on 3-4-turn tasks). DeepSeek-V4 continuation snapshots are stored
   without final logits (`DFLASH_DS4_SNAPSHOT_STALE_LOGITS=1`, set by the flag)
   and are never restored at full prompt length.
+- Dependency-aware execution: a call may reference an earlier call's result
+  with `"$k.path"` placeholders (1-based call index, dotted field path; whole
+  placeholders keep the JSON type, embedded ones stringify). Such calls are
+  not launched from the stream; once their inputs resolve the server
+  substitutes the values and runs each wave concurrently on the same lane,
+  then reports `resolved_arguments`, `dependencies`, `wave` and the result.
+  A chain of k dependent steps therefore costs one planning turn plus one
+  joiner turn instead of k model turns (the LLMCompiler pattern, executed
+  inside the engine, still committed only on the authoritative template).
 - The executor result budget now starts when the authoritative call is known
   (`--tool-spec-timeout-ms` counted from commit, absolute lifetime 20x), so a
   slow target generation can no longer expire a finished result.

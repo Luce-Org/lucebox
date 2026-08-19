@@ -165,6 +165,8 @@ def run_task(task_id: str, prompt: str, expect: list[str], arm: str) -> dict:
         tool_calls = msg.get("tool_calls") or []
         early = resp.get("dflash_early_dispatch") or []
         early_hits = {e["result"]["call_sha256"]: e["result"] for e in early if e.get("status") == "hit" and isinstance(e.get("result"), dict)}
+        # server-resolved calls (including dependent ones executed server-side) keyed by call id
+        early_by_id = {e["call_id"]: e for e in early if e.get("status") == "hit" and isinstance(e.get("result"), dict) and e.get("call_id")}
         turn = {"turn": turn_index, "model_wall_ms": wall, "prompt_tokens": usage.get("prompt_tokens"), "completion_tokens": usage.get("completion_tokens"),
                 "timings": usage.get("timings"), "n_calls": len(tool_calls), "early": [(e.get("name"), e.get("status")) for e in early],
                 "finish": (resp.get("choices") or [{}])[0].get("finish_reason")}
@@ -231,13 +233,17 @@ def run_task(task_id: str, prompt: str, expect: list[str], arm: str) -> dict:
                 break
             wave += 1
             stats["max_parallel"] = max(stats["max_parallel"], len(ready))
-            # early-dispatch hits (only for calls whose args had no placeholders)
+            # early-dispatch hits: by call id (covers server-side dependent execution) or by canonical sha
             todo = []
             for p in ready:
                 sha = rest_tools.call_sha256(p["name"], p["resolved_args"])
                 if p["deps"]:
                     stats["dep_calls"] += 1
-                if not p["deps"] and sha in early_hits:
+                ent = early_by_id.get(p["id"])
+                if ent is not None:
+                    p["result"] = ent["result"]; p["source"] = "early_dispatch_hit" + ("_dependent" if ent.get("dependencies") else ""); stats["early_hits"] += 1
+                    results_by_idx[p["idx"]] = p["result"]
+                elif not p["deps"] and sha in early_hits:
                     p["result"] = early_hits[sha]; p["source"] = "early_dispatch_hit"; stats["early_hits"] += 1
                     results_by_idx[p["idx"]] = p["result"]
                 else:

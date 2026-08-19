@@ -4216,6 +4216,7 @@ void HttpServer::scan_early_dispatch(const ParsedRequest & req,
             output.early_entries.push_back(std::move(entry));
             continue;
         }
+        entry.call_index = (int) output.early_entries.size() + 1;
         bool duplicate = false;
         for (const EarlyDispatchEntry & previous : output.early_entries) {
             if (previous.attempt && previous.call == entry.call) {
@@ -4230,6 +4231,22 @@ void HttpServer::scan_early_dispatch(const ParsedRequest & req,
         }
         if (!config_.tool_speculation.allows(entry.call.name)) {
             entry.skip_reason = "tool_not_allowlisted";
+            output.early_entries.push_back(std::move(entry));
+            continue;
+        }
+        entry.dependencies = find_tool_call_dependencies(entry.call.arguments);
+        if (!entry.dependencies.empty()) {
+            // Dependent call: executed server-side once its inputs resolve
+            // (see resolve_early_dispatch), saving a model turn per chain level.
+            bool valid = true;
+            for (int dep : entry.dependencies) {
+                if (dep < 1 || dep >= entry.call_index ||
+                    !output.early_entries[(size_t) dep - 1].skip_reason.empty()) {
+                    valid = false;
+                    break;
+                }
+            }
+            if (!valid) entry.skip_reason = "unresolvable_dependency";
             output.early_entries.push_back(std::move(entry));
             continue;
         }
@@ -4255,29 +4272,38 @@ json HttpServer::resolve_early_dispatch(
         GenerationOutputState & output,
         const std::vector<ToolCall> & authoritative_calls,
         const char * cancel_reason) {
-    json out = json::array();
-    for (EarlyDispatchEntry & entry : output.early_entries) {
-        json item = {
-            {"name", entry.call.name},
-            {"arguments", entry.call.arguments},
-            {"launched_at_token", entry.token_index},
-        };
-        if (!entry.attempt) {
-            item["status"] = "skipped";
-            item["reason"] = entry.skip_reason;
-            out.push_back(std::move(item));
-            continue;
-        }
-        const ToolCall * match = nullptr;
-        for (const ToolCall & call : authoritative_calls) {
+    auto find_match = [&](const CanonicalToolInvocation & call) -> const ToolCall * {
+        for (const ToolCall & candidate : authoritative_calls) {
             CanonicalToolInvocation canonical;
             std::string error;
-            if (CanonicalToolInvocation::from_tool_call(call, canonical, error) &&
-                canonical == entry.call) {
-                match = &call;
-                break;
+            if (CanonicalToolInvocation::from_tool_call(candidate, canonical, error) &&
+                canonical == call) {
+                return &candidate;
             }
         }
+        return nullptr;
+    };
+    std::vector<json> items(output.early_entries.size());
+    // Pass 1: calls launched during decode (no dependencies).
+    for (size_t i = 0; i < output.early_entries.size(); ++i) {
+        EarlyDispatchEntry & entry = output.early_entries[i];
+        json & item = items[i];
+        item = {
+            {"name", entry.call.name},
+            {"arguments", entry.call.arguments},
+            {"call_index", entry.call_index},
+            {"launched_at_token", entry.token_index},
+        };
+        if (!entry.dependencies.empty()) item["dependencies"] = entry.dependencies;
+        if (!entry.attempt) {
+            if (!entry.skip_reason.empty()) {
+                item["status"] = "skipped";
+                item["reason"] = entry.skip_reason;
+                entry.done = true;
+            }
+            continue;  // dependent calls are handled below
+        }
+        const ToolCall * match = find_match(entry.call);
         json metadata = (cancel_reason || !match)
             ? entry.attempt->cancel(
                   cancel_reason ? cancel_reason : "no_matching_authoritative_call")
@@ -4286,7 +4312,106 @@ json HttpServer::resolve_early_dispatch(
             item[it.key()] = it.value();
         }
         if (match) item["call_id"] = match->id;
-        out.push_back(std::move(item));
+        if (metadata.value("status", "") == "hit" && metadata.contains("result")) {
+            entry.result = metadata["result"];
+        }
+        entry.done = true;
+    }
+    // Pass 2: dependent calls, wave by wave. Each wave launches every call
+    // whose inputs are resolved, concurrently, then collects them.
+    constexpr int kMaxWaves = 8;
+    for (int wave = 1; wave <= kMaxWaves && !cancel_reason; ++wave) {
+        std::vector<size_t> ready;
+        for (size_t i = 0; i < output.early_entries.size(); ++i) {
+            EarlyDispatchEntry & entry = output.early_entries[i];
+            if (entry.done || entry.dependencies.empty()) continue;
+            bool inputs_ready = true;
+            bool inputs_failed = false;
+            for (int dep : entry.dependencies) {
+                const EarlyDispatchEntry & source = output.early_entries[(size_t) dep - 1];
+                if (!source.done) inputs_ready = false;
+                else if (source.result.is_null()) inputs_failed = true;
+            }
+            if (inputs_failed) {
+                items[i]["status"] = "skipped";
+                items[i]["reason"] = "dependency_failed";
+                entry.done = true;
+                continue;
+            }
+            if (inputs_ready) ready.push_back(i);
+        }
+        if (ready.empty()) break;
+        std::vector<std::unique_ptr<ToolSpeculationAttempt>> launched(ready.size());
+        std::vector<CanonicalToolInvocation> resolved_calls(ready.size());
+        for (size_t r = 0; r < ready.size(); ++r) {
+            EarlyDispatchEntry & entry = output.early_entries[ready[r]];
+            json & item = items[ready[r]];
+            std::string error;
+            json resolved_args;
+            const bool ok = substitute_tool_call_dependencies(
+                entry.call.arguments,
+                [&](int index) -> const json * {
+                    if (index < 1 || (size_t) index > output.early_entries.size()) return nullptr;
+                    const EarlyDispatchEntry & source = output.early_entries[(size_t) index - 1];
+                    return source.result.is_null() ? nullptr : &source.result;
+                },
+                resolved_args, error);
+            if (!ok || !CanonicalToolInvocation::from_parts(
+                    entry.call.name, resolved_args, resolved_calls[r], error)) {
+                item["status"] = "skipped";
+                item["reason"] = "dependency_substitution: " + error;
+                entry.done = true;
+                continue;
+            }
+            entry.resolved_arguments = resolved_args;
+            entry.wave = wave;
+            item["resolved_arguments"] = resolved_args;
+            item["wave"] = wave;
+            ToolSpeculationPrediction prediction;
+            if (!build_tool_speculation_prediction(
+                    entry.call.name, resolved_args, 1.0, prediction, error)) {
+                item["status"] = "skipped";
+                item["reason"] = "prediction: " + error;
+                entry.done = true;
+                continue;
+            }
+            launched[r] = ToolSpeculationAttempt::create(
+                config_.tool_speculation, prediction, "dependent");
+            launched[r]->start();
+            std::fprintf(stderr,
+                "[early-dispatch] dependent launch tool=%s wave=%d call=%d\n",
+                entry.call.name.c_str(), wave, entry.call_index);
+        }
+        for (size_t r = 0; r < ready.size(); ++r) {
+            if (!launched[r]) continue;
+            EarlyDispatchEntry & entry = output.early_entries[ready[r]];
+            json & item = items[ready[r]];
+            const ToolCall * match = find_match(entry.call);  // template as emitted
+            json metadata;
+            if (!match) {
+                metadata = launched[r]->cancel("no_matching_authoritative_call");
+            } else {
+                ToolCall resolved_call = *match;
+                resolved_call.arguments = resolved_calls[r].arguments_json;
+                metadata = launched[r]->resolve(std::vector<ToolCall>{resolved_call});
+                item["call_id"] = match->id;
+            }
+            for (auto it = metadata.begin(); it != metadata.end(); ++it) {
+                item[it.key()] = it.value();
+            }
+            if (metadata.value("status", "") == "hit" && metadata.contains("result")) {
+                entry.result = metadata["result"];
+            }
+            entry.done = true;
+        }
+    }
+    json out = json::array();
+    for (size_t i = 0; i < items.size(); ++i) {
+        if (!output.early_entries[i].done) {
+            items[i]["status"] = "skipped";
+            items[i]["reason"] = cancel_reason ? cancel_reason : "dependency_unresolved";
+        }
+        out.push_back(std::move(items[i]));
     }
     return out;
 }

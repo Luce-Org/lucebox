@@ -5,12 +5,14 @@
 #include "tool_speculation.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <thread>
 #include <utility>
@@ -1209,6 +1211,140 @@ json ToolSpeculationAttempt::cancel(const std::string & reason) {
     metadata["status"] = "cancelled";
     metadata["reason"] = reason;
     return metadata;
+}
+
+namespace {
+
+// Matches "$12.some.path" starting at `pos`; returns length or 0.
+size_t match_placeholder(const std::string & text, size_t pos, int & index,
+                         std::string & path) {
+    if (pos >= text.size() || text[pos] != '$') return 0;
+    size_t i = pos + 1;
+    size_t digits_begin = i;
+    while (i < text.size() && std::isdigit(static_cast<unsigned char>(text[i]))) ++i;
+    if (i == digits_begin || i >= text.size() || text[i] != '.') return 0;
+    ++i;
+    size_t path_begin = i;
+    // A path starts with a letter or underscore so money-like text such as
+    // "$5.00" is never mistaken for a reference.
+    if (i >= text.size() ||
+        !(std::isalpha(static_cast<unsigned char>(text[i])) || text[i] == '_')) return 0;
+    while (i < text.size() &&
+           (std::isalnum(static_cast<unsigned char>(text[i])) || text[i] == '_' || text[i] == '.')) ++i;
+    if (i == path_begin) return 0;
+    while (i > path_begin && text[i - 1] == '.') --i;  // trailing dots are text
+    if (i == path_begin) return 0;
+    try {
+        index = std::stoi(text.substr(digits_begin, path_begin - 1 - digits_begin));
+    } catch (...) { return 0; }
+    path = text.substr(path_begin, i - path_begin);
+    return i - pos;
+}
+
+const json * lookup_path(const json & root, const std::string & path) {
+    const json * cur = &root;
+    size_t start = 0;
+    while (start <= path.size()) {
+        const size_t dot = path.find('.', start);
+        const std::string key = path.substr(start, dot == std::string::npos ? std::string::npos : dot - start);
+        if (!cur->is_object() || !cur->contains(key)) return nullptr;
+        cur = &(*cur)[key];
+        if (dot == std::string::npos) break;
+        start = dot + 1;
+    }
+    return cur;
+}
+
+const json * lookup_result_field(const json & result, const std::string & path) {
+    if (const json * direct = lookup_path(result, path)) return direct;
+    if (result.is_object() && result.contains("value") && result["value"].is_object()) {
+        return lookup_path(result["value"], path);
+    }
+    return nullptr;
+}
+
+void collect_dependencies(const json & value, std::vector<int> & out) {
+    if (value.is_string()) {
+        const std::string & text = value.get_ref<const std::string &>();
+        for (size_t i = 0; i < text.size(); ++i) {
+            int index = 0; std::string path;
+            const size_t len = match_placeholder(text, i, index, path);
+            if (len > 0) {
+                if (std::find(out.begin(), out.end(), index) == out.end()) out.push_back(index);
+                i += len - 1;
+            }
+        }
+    } else if (value.is_array() || value.is_object()) {
+        for (const auto & item : value) collect_dependencies(item, out);
+    }
+}
+
+bool substitute_value(const json & value,
+                      const std::function<const json *(int)> & result_for_call,
+                      json & out, std::string & error) {
+    if (value.is_string()) {
+        const std::string & text = value.get_ref<const std::string &>();
+        int index = 0; std::string path;
+        const size_t whole = match_placeholder(text, 0, index, path);
+        if (whole == text.size() && whole > 0) {
+            const json * result = result_for_call(index);
+            if (!result) { error = "missing result for call " + std::to_string(index); return false; }
+            const json * field = lookup_result_field(*result, path);
+            if (!field) { error = "field '" + path + "' not in result of call " + std::to_string(index); return false; }
+            out = *field;
+            return true;
+        }
+        std::string built;
+        for (size_t i = 0; i < text.size();) {
+            const size_t len = match_placeholder(text, i, index, path);
+            if (len == 0) { built += text[i]; ++i; continue; }
+            const json * result = result_for_call(index);
+            if (!result) { error = "missing result for call " + std::to_string(index); return false; }
+            const json * field = lookup_result_field(*result, path);
+            if (!field) { error = "field '" + path + "' not in result of call " + std::to_string(index); return false; }
+            built += field->is_string() ? field->get<std::string>() : field->dump();
+            i += len;
+        }
+        out = built;
+        return true;
+    }
+    if (value.is_array()) {
+        out = json::array();
+        for (const auto & item : value) {
+            json sub;
+            if (!substitute_value(item, result_for_call, sub, error)) return false;
+            out.push_back(std::move(sub));
+        }
+        return true;
+    }
+    if (value.is_object()) {
+        out = json::object();
+        for (auto it = value.begin(); it != value.end(); ++it) {
+            json sub;
+            if (!substitute_value(it.value(), result_for_call, sub, error)) return false;
+            out[it.key()] = std::move(sub);
+        }
+        return true;
+    }
+    out = value;
+    return true;
+}
+
+}  // namespace
+
+std::vector<int> find_tool_call_dependencies(const json & arguments) {
+    std::vector<int> deps;
+    collect_dependencies(arguments, deps);
+    return deps;
+}
+
+bool substitute_tool_call_dependencies(
+        const json & arguments,
+        const std::function<const json *(int)> & result_for_call,
+        json & resolved,
+        std::string & error) {
+    error.clear();
+    return substitute_value(arguments, result_for_call, resolved, error);
 }
 
 std::vector<ClosedToolCallBlock> find_closed_tool_call_blocks(

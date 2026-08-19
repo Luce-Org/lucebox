@@ -13,6 +13,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -241,6 +242,19 @@ struct ClosedToolCallBlock {
 };
 std::vector<ClosedToolCallBlock> find_closed_tool_call_blocks(
     const std::string & text, size_t from);
+
+// Dependency placeholders between calls of one response: a string argument
+// "$k.path" (or embedded "...$k.path...") refers to field `path` of the
+// executor result of the k-th call (1-based). `path` is a dotted path; when
+// it is absent at the result root and the result has a "value" object, the
+// lookup is retried under "value". Whole-string placeholders keep the JSON
+// type of the referenced value; embedded ones are stringified.
+std::vector<int> find_tool_call_dependencies(const nlohmann::json & arguments);
+bool substitute_tool_call_dependencies(
+    const nlohmann::json & arguments,
+    const std::function<const nlohmann::json *(int)> & result_for_call,
+    nlohmann::json & resolved,
+    std::string & error);
 
 // Custom SSE extension emitted only for requests that supplied
 // `tool_speculation`. Non-streaming responses use the same object under the

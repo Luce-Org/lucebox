@@ -3,6 +3,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cerrno>
 #include <cmath>
@@ -478,6 +479,34 @@ TEST_CASE(ToolSpeculationFixture, closed_tool_blocks_are_found_as_they_stream) {
     CHECK(blocks[0].end == nested.size());
     // Unclosed opener yields nothing.
     CHECK(find_closed_tool_call_blocks("<function=lookup><parameter=a>1</parameter>", 0).empty());
+}
+
+TEST_CASE(ToolSpeculationFixture, dependency_placeholders_resolve_between_calls) {
+    using dflash::common::find_tool_call_dependencies;
+    using dflash::common::substitute_tool_call_dependencies;
+    const json args = json::parse(R"json({"latitude":"$1.latitude","longitude":"$1.value.longitude","label":"city $2.name (#$1.id)","plain":3})json");
+    auto deps = find_tool_call_dependencies(args);
+    std::sort(deps.begin(), deps.end());
+    CHECK(deps.size() == 2u);
+    CHECK(deps[0] == 1);
+    CHECK(deps[1] == 2);
+    const json r1 = json::parse(R"json({"value":{"latitude":35.6769,"longitude":139.7639},"id":7})json");
+    const json r2 = json::parse(R"json({"name":"Tokyo"})json");
+    json resolved;
+    std::string error;
+    const bool ok = substitute_tool_call_dependencies(
+        args, [&](int index) -> const json * { return index == 1 ? &r1 : index == 2 ? &r2 : nullptr; },
+        resolved, error);
+    CHECK(ok);
+    CHECK(resolved["latitude"] == 35.6769);        // whole-string placeholder keeps the number type
+    CHECK(resolved["longitude"] == 139.7639);      // explicit value.path
+    CHECK(resolved["label"] == "city Tokyo (#7)"); // embedded placeholders stringify
+    CHECK(resolved["plain"] == 3);
+    // Missing field fails closed.
+    json bad;
+    CHECK(!substitute_tool_call_dependencies(
+        json::parse(R"json({"x":"$1.nope"})json"), [&](int) { return &r1; }, bad, error));
+    CHECK(find_tool_call_dependencies(json::parse(R"json({"a":"costs $5.00 today"})json")).empty());
 }
 
 TEST_CASE(ToolSpeculationFixture, executor_timeout_starts_at_launch) {

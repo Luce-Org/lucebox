@@ -470,10 +470,16 @@ private:
     };
 
     struct EarlyDispatchEntry {
-        CanonicalToolInvocation call;
-        std::unique_ptr<ToolSpeculationAttempt> attempt;  // null when skipped
+        CanonicalToolInvocation call;                     // as emitted (may hold $k.path refs)
+        std::unique_ptr<ToolSpeculationAttempt> attempt;  // null when skipped or dependent
         int token_index = 0;
+        int call_index = 0;                               // 1-based position in this response
         std::string skip_reason;
+        std::vector<int> dependencies;                    // call indices referenced by $k.path
+        nlohmann::json resolved_arguments;                // after substitution (dependent calls)
+        nlohmann::json result;                            // executor result on hit
+        bool done = false;
+        int wave = 0;
     };
     struct GenerationOutputState {
         int completion_tokens = 0;
