@@ -5994,6 +5994,24 @@ TEST_CASE(ServerUnitFixture, test_parse_function_call_premature_array_close) {
     }
 }
 
+TEST_CASE(ServerUnitFixture, test_parse_function_call_xml_parameters) {
+    std::string text =
+        "<function_call>\n"
+        "<invoke_name>read</invoke_name>\n"
+        "<parameters>\n"
+        "<path>internal/rfid/reader.go</path>\n"
+        "</parameters>\n"
+        "</function_call>";
+    auto result = parse_tool_calls(text, read_tools());
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "read");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["path"] == "internal/rfid/reader.go");
+    }
+}
+
+
 
 
 

@@ -658,6 +658,95 @@ static bool parse_complete_parameter_body(const std::string & body,
     return found_param && trim_ws(body.substr(cursor)).empty();
 }
 
+// Parse XML-formatted function calls inside <function_call> envelopes
+static bool parse_xml_function_call(const std::string & inner, const json & tools,
+                                    std::string & out_name, json & out_args) {
+    static const std::regex re_name(
+        R"(<(?:invoke_name|name|funcname|function)>([A-Za-z_][\w.\-]*)</(?:invoke_name|name|funcname|function)>)");
+    static const std::regex re_invoke_attr(
+        R"(<(?:invoke|function)\s+(?:name|tool)\s*=\s*["']?([A-Za-z_][\w.\-]*)["']?)");
+    static const std::regex re_params_block(
+        R"(<(?:parameters|params|arguments)>([\s\S]*?)</(?:parameters|params|arguments)>)");
+    static const std::regex re_param_attr(
+        R"(<(?:param|parameter)\s+name\s*=\s*["']?([A-Za-z_][\w.\-]*)["']?\s*>([\s\S]*?)</(?:param|parameter)>)");
+    static const std::regex re_param_eq(
+        R"(<parameter=([A-Za-z_][\w.\-]*)>([\s\S]*?)</parameter>)");
+    static const std::regex re_child_tag(
+        R"(<([A-Za-z_][\w.\-]*)>([\s\S]*?)</\1>)");
+
+    std::string name;
+    std::smatch m;
+    if (std::regex_search(inner, m, re_name)) {
+        name = m[1].str();
+    } else if (std::regex_search(inner, m, re_invoke_attr)) {
+        name = m[1].str();
+    }
+    if (name.empty() || !tool_allowed(tools, name)) return false;
+
+    std::string params_body = inner;
+    if (std::regex_search(inner, m, re_params_block)) {
+        params_body = m[1].str();
+    }
+
+    json props = find_tool_properties(tools, name);
+    json args = json::object();
+
+    // Check if params_body is inline JSON
+    std::string trimmed_params = trim_ws(params_body);
+    if (!trimmed_params.empty() && trimmed_params.front() == '{') {
+        json raw_json;
+        if (coerce_relaxed_json(trimmed_params, raw_json) && raw_json.is_object()) {
+            for (auto & [k, v] : raw_json.items()) {
+                if (v.is_string()) {
+                    args[k] = convert_param_value(v.get<std::string>(), k, props);
+                } else {
+                    args[k] = v;
+                }
+            }
+            out_name = name;
+            out_args = std::move(args);
+            return true;
+        }
+    }
+
+    // Check <param name="...">...</param>
+    auto pbegin = std::sregex_iterator(params_body.begin(), params_body.end(), re_param_attr);
+    auto pend = std::sregex_iterator();
+    for (auto it = pbegin; it != pend; ++it) {
+        std::string k = (*it)[1].str();
+        std::string v = trim_ws((*it)[2].str());
+        args[k] = convert_param_value(v, k, props);
+    }
+
+    // Check <parameter=...>...</parameter>
+    auto pebegin = std::sregex_iterator(params_body.begin(), params_body.end(), re_param_eq);
+    auto peend = std::sregex_iterator();
+    for (auto it = pebegin; it != peend; ++it) {
+        std::string k = (*it)[1].str();
+        std::string v = trim_ws((*it)[2].str());
+        args[k] = convert_param_value(v, k, props);
+    }
+
+    // Check direct child tags <tag>val</tag>
+    auto cbegin = std::sregex_iterator(params_body.begin(), params_body.end(), re_child_tag);
+    auto cend = std::sregex_iterator();
+    for (auto it = cbegin; it != cend; ++it) {
+        std::string tag = (*it)[1].str();
+        if (tag == "parameters" || tag == "params" || tag == "arguments" ||
+            tag == "invoke_name" || tag == "name" || tag == "function" || tag == "funcname") {
+            continue;
+        }
+        if (!args.contains(tag)) {
+            std::string v = trim_ws((*it)[2].str());
+            args[tag] = convert_param_value(v, tag, props);
+        }
+    }
+
+    out_name = name;
+    out_args = std::move(args);
+    return true;
+}
+
 // ─── JSON tool call parser ──────────────────────────────────────────────
 
 // Parse the named JSON tool-call envelopes emitted by supported chat models.
@@ -1243,7 +1332,7 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
         }
     }
 
-    // Pattern 4b: <function_call>{JSON}</function_call>
+    // Pattern 4b: <function_call>{JSON or XML}</function_call>
     {
         auto begin = std::sregex_iterator(text.begin(), text.end(), re_function_call());
         auto end = std::sregex_iterator();
@@ -1256,6 +1345,7 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
             if (s != std::string::npos) inner = inner.substr(s);
             size_t e = inner.find_last_not_of(" \t\n\r");
             if (e != std::string::npos) inner = inner.substr(0, e + 1);
+            bool parsed = false;
             try {
                 json obj;
                 if (coerce_relaxed_json(inner, obj)) {
@@ -1264,9 +1354,17 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
                     if (parse_json_tool_call(obj, name, args)) {
                         size_t pos = it->position();
                         add_call(name, args, pos, pos + it->length());
+                        parsed = true;
                     }
                 }
             } catch (...) {}
+            if (!parsed) {
+                std::string name;
+                json args = json::object();
+                if (parse_xml_function_call(inner, tools, name, args)) {
+                    add_call(name, args, pos, pos + it->length());
+                }
+            }
         }
     }
 
