@@ -283,9 +283,11 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
         if (mode_ == StreamMode::TOOL_BUFFER) {
             if (tool_from_reasoning_ && first_content_token_index_ < 0) {
                 const std::string full = tool_buffer_ + window_;
-                const size_t fc_close = full.find("</function_calls>");
+                size_t fc_close = full.find("</function_calls>");
+                if (fc_close == std::string::npos) fc_close = full.find("</function_call>");
+                if (fc_close == std::string::npos) fc_close = full.find("</tool_call>");
                 if (fc_close != std::string::npos) {
-                    const size_t search_start = fc_close + std::strlen("</function_calls>");
+                    const size_t search_start = fc_close;
                     const size_t think_close = full.find(THINK_CLOSE, search_start);
                     if (think_close != std::string::npos) {
                         const size_t after_think = think_close + THINK_CLOSE_LEN;
@@ -324,7 +326,7 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
             size_t idx = window_.find(THINK_CLOSE);
             size_t tool_idx = std::string::npos;
             bool tool_hit = has_request_tools(tools_) &&
-                            (tool_idx = window_.find(FUNCTION_CALLS_OPEN)) != std::string::npos;
+                            find_tool_syntax_start(window_, tools_, tool_idx);
 
             if (idx != std::string::npos && (tool_idx == std::string::npos || idx < tool_idx)) {
                 std::string pre = window_.substr(0, idx);
@@ -785,6 +787,25 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
         } else if (tool_buffer_fallback_to_content_) {
             accumulated_content_ += tool_buffer_;
             emit_content_delta(out, tool_buffer_);
+        } else if (tool_from_reasoning_) {
+            reasoning_text_ += tool_buffer_;
+            if (format_ == ApiFormat::OPENAI_CHAT) {
+                out.push_back(format_openai_delta({{"reasoning_content", tool_buffer_}}));
+            } else if (format_ == ApiFormat::ANTHROPIC) {
+                if (active_kind_ != "thinking") {
+                    out.push_back(sse_event("content_block_stop",
+                        json({{"type", "content_block_stop"}, {"index", block_index_}}).dump()));
+                    block_index_++;
+                    active_kind_ = "thinking";
+                    json new_block = {{"type", "thinking"}, {"thinking", ""}};
+                    out.push_back(sse_event("content_block_start",
+                        json({{"type", "content_block_start"}, {"index", block_index_},
+                              {"content_block", new_block}}).dump()));
+                }
+                out.push_back(sse_event("content_block_delta",
+                    json({{"type", "content_block_delta"}, {"index", block_index_},
+                          {"delta", {{"type", "thinking_delta"}, {"thinking", tool_buffer_}}}}).dump()));
+            }
         } else {
             // Tool syntax was detected but no valid call parsed. Do not leak
             // malformed/incomplete XML back to the user as assistant text.

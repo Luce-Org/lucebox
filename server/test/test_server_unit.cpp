@@ -6011,6 +6011,23 @@ TEST_CASE(ServerUnitFixture, test_parse_function_call_xml_parameters) {
     }
 }
 
+TEST_CASE(ServerUnitFixture, test_emitter_function_call_inside_reasoning_without_think_close) {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, bash_tools(), false);
+    // Token 0: start of thinking
+    em.emit_token("<think>\nLet me search for calls to Reset().\n\n");
+    // Token 1: function_call inside reasoning without </think>
+    em.emit_token("<function_call>\n<invoke_name>bash</invoke_name>\n<parameters>\n<command>grep -rn '\\.Reset(' koha-rfid/</command>\n</parameters>\n</function_call>");
+    em.emit_finish(2);
+
+    TEST_ASSERT(em.tool_calls().size() == 1);
+    if (!em.tool_calls().empty()) {
+        TEST_ASSERT(em.tool_calls()[0].name == "bash");
+        auto args = json::parse(em.tool_calls()[0].arguments);
+        TEST_ASSERT(args["command"] == "grep -rn '\\.Reset(' koha-rfid/");
+    }
+}
+
+
 
 
 
