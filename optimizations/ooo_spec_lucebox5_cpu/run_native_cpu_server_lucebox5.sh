@@ -68,4 +68,5 @@ exec env -i \
     TOOL_SPEC_CPU_AFFINITY="14-15,30-31" \
     TOOL_SPEC_MAX_MODEL_SLOWDOWN="1.05" \
     LUCEBOX_INFERENCE_PROFILE="quality" \
+    PREDICTOR="1" \
     "$launcher"

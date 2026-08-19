@@ -27,11 +27,12 @@ PREFIX_CACHE_SLOTS_OVERRIDE="${PREFIX_CACHE_SLOTS_OVERRIDE:-32}"
 # launched the moment its call block closes in the token stream, N calls per
 # response, each committed on exact match. End-of-turn snapshots (default on)
 # let the next turn of a tool conversation restore everything and prefill one
-# delta. PREDICTOR=0 disables the pre-generation Qwen3 lane (recommended when
-# tools answer in under ~2 s; keep it for slow, recurring workflows).
+# delta. PREDICTOR=1 enables the pre-generation Qwen3 lane (opt-in: it only
+# pays back for slow, recurring workflows; for sub-second tools it costs more
+# than it saves, so it is off by default).
 EARLY_DISPATCH="${EARLY_DISPATCH:-1}"
 END_TURN_SNAPSHOT="${END_TURN_SNAPSHOT:-1}"
-PREDICTOR="${PREDICTOR:-1}"
+PREDICTOR="${PREDICTOR:-0}"
 for toggle in EARLY_DISPATCH END_TURN_SNAPSHOT PREDICTOR; do
   [[ "${!toggle}" == "0" || "${!toggle}" == "1" ]] || {
     printf '%s must be 0 or 1\n' "${toggle}" >&2

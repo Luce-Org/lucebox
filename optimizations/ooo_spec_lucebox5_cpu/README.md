@@ -65,7 +65,8 @@ digits, and the pre-generation predictor is only worth enabling for slow,
 recurring workflows.
 
 Wrapper toggles: `EARLY_DISPATCH=1`, `END_TURN_SNAPSHOT=1` (defaults) and
-`PREDICTOR=1` (default; set `PREDICTOR=0` when tools answer in under ~2 s).
+`PREDICTOR=0` (default; the qualified single-call launcher sets `PREDICTOR=1`,
+worth it only for slow, recurring workflows).
 Artifacts: `realapi/results/*.json`. Harness: `realapi/` (public-API suite,
 many-call suite), `terminal_bench/` (harbor agent + docker-exec executor).
 
