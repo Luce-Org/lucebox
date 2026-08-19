@@ -359,7 +359,7 @@ int deepseek4_safe_compressor_batch_tokens(const DeepSeek4Weights & w,
 // Forward: single step (prefill chunk or decode token).
 // embed: [n_embd, n_tokens] input embeddings (post-embedding lookup).
 // hc_state: [n_hc * n_embd] persistent HC residual (updated in-place).
-// Returns logits for last token.
+// Returns logits for last token in out_logits when need_logits is true; out_logits is left untouched/empty when need_logits is false.
 struct Ds4VerifyHooks;
 
 bool deepseek4_step(
