@@ -628,4 +628,44 @@ bool deepseek4_cuda_hc_pre_device_params(const void * hc_state_device,
                                 true);
 }
 
+bool deepseek4_cuda_hc_upload_f16(int          device,
+                                  const void * host_f16,
+                                  size_t       bytes,
+                                  void **      device_out) {
+    if (!host_f16 || bytes == 0 || !device_out) {
+        return false;
+    }
+    if (!deepseek4_cuda_hc_set_device(device)) {
+        return false;
+    }
+    void * ptr = nullptr;
+    cudaError_t err = cudaMalloc(&ptr, bytes);
+    if (err != cudaSuccess) {
+        hc_log_cuda_error("hc f16 mirror malloc", err);
+        return false;
+    }
+    err = cudaMemcpy(ptr, host_f16, bytes, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        hc_log_cuda_error("hc f16 mirror upload", err);
+        cudaFree(ptr);
+        return false;
+    }
+    *device_out = ptr;
+    return true;
+}
+
+void deepseek4_cuda_hc_free(int device, void * device_ptr) {
+    if (!device_ptr) {
+        return;
+    }
+    // Best effort: unified addressing lets cudaFree release memory from any
+    // current device, so never leak the mirror just because the owning device
+    // could not be selected (e.g. during shutdown).
+    (void) deepseek4_cuda_hc_set_device(device);
+    const cudaError_t err = cudaFree(device_ptr);
+    if (err != cudaSuccess) {
+        hc_log_cuda_error("hc f16 mirror free", err);
+    }
+}
+
 } // namespace dflash::common
