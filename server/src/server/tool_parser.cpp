@@ -489,10 +489,31 @@ static bool coerce_relaxed_json(const std::string & payload, json & out) {
     for (size_t i = 0; i < payload.size(); ) {
         char c = payload[i];
         if (in_str) {
-            // Inside a string we already opened. Mirror escapes verbatim.
             if (c == '\\' && i + 1 < payload.size()) {
-                rewritten += c;
-                rewritten += payload[i + 1];
+                char nxt = payload[i + 1];
+                if (nxt == '"' || nxt == '\\' || nxt == '/' || nxt == 'b' ||
+                    nxt == 'f' || nxt == 'n' || nxt == 'r' || nxt == 't') {
+                    rewritten += c;
+                    rewritten += nxt;
+                    i += 2;
+                    continue;
+                }
+                if (nxt == 'u' && i + 5 < payload.size()) {
+                    auto is_hex = [](char h) {
+                        return (h >= '0' && h <= '9') || (h >= 'a' && h <= 'f') ||
+                               (h >= 'A' && h <= 'F');
+                    };
+                    if (is_hex(payload[i + 2]) && is_hex(payload[i + 3]) &&
+                        is_hex(payload[i + 4]) && is_hex(payload[i + 5])) {
+                        rewritten += "\\u";
+                        rewritten += payload.substr(i + 2, 4);
+                        i += 6;
+                        continue;
+                    }
+                }
+                // Non-standard escape (e.g. \., \(, \+, \*, \s, etc.). Escape backslash.
+                rewritten += "\\\\";
+                rewritten += nxt;
                 i += 2;
                 continue;
             }

@@ -5959,6 +5959,21 @@ TEST_CASE(ServerUnitFixture, test_parse_function_call_unclosed_outer_brace) {
     }
 }
 
+TEST_CASE(ServerUnitFixture, test_parse_function_call_raw_regex_escapes) {
+    std::string text =
+        "<function_call>\n"
+        "{\"name\": \"bash\", \"arguments\": {\"command\": \"grep -rn '\\.Reset(' koha-rfid/ 2>/dev/null || grep -rn '\\.Reset(' .\"}}"
+        "\n</function_call>";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "bash");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["command"] == "grep -rn '\\.Reset(' koha-rfid/ 2>/dev/null || grep -rn '\\.Reset(' .");
+    }
+}
+
+
 
 
 
