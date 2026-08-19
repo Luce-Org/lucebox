@@ -388,6 +388,9 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
                     default: break;
                     }
                 }
+                std::fprintf(stderr,
+                    "[server] entering TOOL_BUFFER from REASONING request_id=%s\n",
+                    request_id_.c_str());
                 tool_buffer_ = window_.substr(tool_idx);
                 tool_from_reasoning_ = true;
                 window_.clear();
@@ -462,6 +465,9 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
             } else {
                 // Tool-call syntax. Keep the full tag/function text buffered
                 // until finish so the parser can validate it.
+                std::fprintf(stderr,
+                    "[server] entering TOOL_BUFFER from CONTENT request_id=%s trigger=%.40s\n",
+                    request_id_.c_str(), window_.substr(h.pos).c_str());
                 tool_buffer_ = window_.substr(h.pos);
                 tool_from_reasoning_ = false;
                 window_.clear();
@@ -622,6 +628,15 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
         tool_calls_ = std::move(parsed.tool_calls);
 
         if (!tool_calls_.empty()) {
+            std::string names;
+            for (size_t i = 0; i < tool_calls_.size(); i++) {
+                if (i > 0) names += ", ";
+                names += tool_calls_[i].name;
+            }
+            std::fprintf(stderr,
+                "[server] tool_call parsed successfully request_id=%s count=%zu tools=[%s]\n",
+                request_id_.c_str(), tool_calls_.size(), names.c_str());
+
             // Remember for tool memory
             if (tool_memory_) {
                 std::vector<std::string> ids;
@@ -775,8 +790,9 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
             // malformed/incomplete XML back to the user as assistant text.
             std::fprintf(stderr,
                 "[server] tool_call parse failed; suppressing buffered tool text "
-                "request_id=%s format=%d bytes=%zu\n",
-                request_id_.c_str(), (int)format_, tool_buffer_.size());
+                "request_id=%s format=%d bytes=%zu payload=<<<\n%s\n>>>\n",
+                request_id_.c_str(), (int)format_, tool_buffer_.size(),
+                tool_buffer_.c_str());
         }
     }
 
