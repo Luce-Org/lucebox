@@ -3555,13 +3555,15 @@ struct Ds4HcMatvecPool {
             workers.emplace_back([this, i]() {
                 uint64_t last = 0;
                 for (;;) {
-                    uint64_t s = last;
-                    for (int spins = 0; spins < 65536; ++spins) {
-                        s = seq.load(std::memory_order_acquire);
-                        if (s != last || stop.load(std::memory_order_relaxed)) {
-                            break;
+                    uint64_t s = seq.load(std::memory_order_acquire);
+                    if (s == last && !stop.load(std::memory_order_relaxed)) {
+                        for (int spins = 0; spins < 65536; ++spins) {
+                            s = seq.load(std::memory_order_acquire);
+                            if (s != last || stop.load(std::memory_order_relaxed)) {
+                                break;
+                            }
+                            cpu_relax();
                         }
-                        cpu_relax();
                     }
                     if (s == last && !stop.load(std::memory_order_relaxed)) {
                         std::unique_lock<std::mutex> lk(wait_mu);
@@ -3574,31 +3576,32 @@ struct Ds4HcMatvecPool {
                     if (stop.load(std::memory_order_relaxed)) return;
                     last = s;
                     const Job j = job;
-                    if (i >= j.active_workers) continue;
-                    const int chunk = (j.rows + j.active_workers - 1) / j.active_workers;
-                    const int r0 = i * chunk;
-                    const int r1 = j.rows < r0 + chunk ? j.rows : r0 + chunk;
-                    if (row_fn) {
-                        for (int r = r0; r < r1; ++r) row_fn(r);
-                    } else {
-                        int r = r0;
+                    if (i < j.active_workers) {
+                        const int chunk = (j.rows + j.active_workers - 1) / j.active_workers;
+                        const int r0 = i * chunk;
+                        const int r1 = j.rows < r0 + chunk ? j.rows : r0 + chunk;
+                        if (row_fn) {
+                            for (int r = r0; r < r1; ++r) row_fn(r);
+                        } else {
+                            int r = r0;
 #if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
-                        if (ds4_cpu_has_f16c()) {
-                            for (; r + 2 < r1; r += 3) {
-                                cpu_dot_f16_rows3_f16c(
-                                    j.mat + (size_t) (r + 0) * j.cols,
-                                    j.mat + (size_t) (r + 1) * j.cols,
-                                    j.mat + (size_t) (r + 2) * j.cols,
-                                    j.x, j.cols,
-                                    &j.out[r + 0], &j.out[r + 1], &j.out[r + 2]);
+                            if (ds4_cpu_has_f16c()) {
+                                for (; r + 2 < r1; r += 3) {
+                                    cpu_dot_f16_rows3_f16c(
+                                        j.mat + (size_t) (r + 0) * j.cols,
+                                        j.mat + (size_t) (r + 1) * j.cols,
+                                        j.mat + (size_t) (r + 2) * j.cols,
+                                        j.x, j.cols,
+                                        &j.out[r + 0], &j.out[r + 1], &j.out[r + 2]);
+                                }
+                            }
+#endif
+                            for (; r < r1; ++r) {
+                                j.out[r] = cpu_dot_f16_row(j.mat + (size_t) r * j.cols, j.x, j.cols);
                             }
                         }
-#endif
-                        for (; r < r1; ++r) {
-                            j.out[r] = cpu_dot_f16_row(j.mat + (size_t) r * j.cols, j.x, j.cols);
-                        }
+                        remaining.fetch_sub(1, std::memory_order_acq_rel);
                     }
-                    remaining.fetch_sub(1, std::memory_order_acq_rel);
                 }
             });
         }
@@ -3630,7 +3633,7 @@ struct Ds4HcMatvecPool {
         }
         wait_cv.notify_all();
         int spins = 0;
-        while (remaining.load(std::memory_order_acquire) != 0) {
+        while (remaining.load(std::memory_order_acquire) > 0) {
             if (++spins < 65536) { cpu_relax(); }
             else { std::this_thread::yield(); spins = 0; }
         }
@@ -3652,7 +3655,7 @@ struct Ds4HcMatvecPool {
         }
         wait_cv.notify_all();
         int spins = 0;
-        while (remaining.load(std::memory_order_acquire) != 0) {
+        while (remaining.load(std::memory_order_acquire) > 0) {
             if (++spins < 65536) { cpu_relax(); }
             else { std::this_thread::yield(); spins = 0; }
         }
