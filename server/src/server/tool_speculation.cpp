@@ -39,6 +39,9 @@
 #endif
 
 namespace dflash::common {
+
+// Absolute executor lifetime = timeout_ms * this multiplier (measured from launch).
+constexpr int kExecutorLifetimeMultiplier = 20;
 namespace {
 
 constexpr size_t kMaxExecutorRequestBytes = 64 * 1024;
@@ -656,6 +659,17 @@ ToolSpeculationAttempt::ToolSpeculationAttempt(
         admission_.reason = "engine_disabled";
     } else if (!config_.allows(prediction_.call.name)) {
         admission_.reason = "tool_not_allowlisted";
+    } else if (prediction_.confidence >= 1.0) {
+        // Authoritative call (early dispatch): no interference gate needed,
+        // the model already emitted it; run it on the isolated lane.
+        admission_.admitted = true;
+        admission_.resource_percentage = 100;
+        admission_.expected_task_ms = 0.0;
+        admission_.expected_speedup = 1.0;
+        admission_.decode_interference_qualified = true;
+        admission_.accelerator_relation =
+            config_.cpu_affinity.empty() ? "unspecified" : "non_accelerator";
+        admission_.reason = "authoritative_call";
     } else {
         admission_ = config_.policy.choose(
             prediction_.confidence, config_.max_model_slowdown_ratio);
@@ -972,8 +986,13 @@ bool ToolSpeculationAttempt::collect_executor_result(
     return false;
 #else
     const auto wait_started = std::chrono::steady_clock::now();
-    const auto deadline = started_at_ +
-        std::chrono::milliseconds(std::max(1, config_.timeout_ms));
+    // The result budget starts when the authoritative call is known, so a
+    // long target generation (seconds to minutes) cannot expire a finished
+    // result. An absolute lifetime cap still bounds runaway executors.
+    const auto deadline = std::min(
+        wait_started + std::chrono::milliseconds(std::max(1, config_.timeout_ms)),
+        started_at_ + std::chrono::milliseconds(
+            std::max(1, config_.timeout_ms) * kExecutorLifetimeMultiplier));
     if (wait_started >= deadline) {
         error = "executor_timeout";
         terminate_executor();
@@ -1190,6 +1209,39 @@ json ToolSpeculationAttempt::cancel(const std::string & reason) {
     metadata["status"] = "cancelled";
     metadata["reason"] = reason;
     return metadata;
+}
+
+std::vector<ClosedToolCallBlock> find_closed_tool_call_blocks(
+        const std::string & text, size_t from) {
+    struct Wrapper { const char * open; const char * close; };
+    static const Wrapper kWrappers[] = {
+        {"<function_call>", "</function_call>"},
+        {"<tool_call>", "</tool_call>"},
+        {"<function=", "</function>"},
+    };
+    std::vector<ClosedToolCallBlock> blocks;
+    size_t cursor = std::min(from, text.size());
+    while (cursor < text.size()) {
+        // Earliest opener at/after cursor across wrappers.
+        size_t best_open = std::string::npos;
+        const Wrapper * best = nullptr;
+        for (const Wrapper & w : kWrappers) {
+            const size_t pos = text.find(w.open, cursor);
+            if (pos != std::string::npos && pos < best_open) {
+                best_open = pos;
+                best = &w;
+            }
+        }
+        if (!best) break;
+        const size_t close = text.find(best->close, best_open + std::strlen(best->open));
+        if (close == std::string::npos) break;  // block still streaming
+        ClosedToolCallBlock block;
+        block.begin = best_open;
+        block.end = close + std::strlen(best->close);
+        blocks.push_back(block);
+        cursor = block.end;  // nested wrappers inside are covered by this block
+    }
+    return blocks;
 }
 
 std::string render_tool_speculation_sse(

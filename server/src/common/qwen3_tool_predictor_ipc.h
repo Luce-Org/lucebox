@@ -10,6 +10,7 @@
 #include "backend_ipc.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <mutex>
@@ -42,14 +43,32 @@ public:
                  std::string & error);
 
     bool active() const;
+    // After a timeout/transport failure the lane fails shut. Relaunch the
+    // daemon with the original parameters, at most once per cooldown.
+    bool try_restart();
     void close();
 
 private:
     void close_locked();
+    bool start_locked(const std::string & bin,
+                      const std::string & model_path,
+                      int gpu,
+                      int max_ctx,
+                      const std::string & work_dir,
+                      int readiness_timeout_ms);
 
     mutable std::timed_mutex mutex_;
     BackendIpcProcess process_;
     std::atomic<bool> active_{false};
+    // Launch parameters retained for try_restart().
+    std::string launch_bin_;
+    std::string launch_model_path_;
+    int launch_gpu_ = 0;
+    int launch_max_ctx_ = 0;
+    std::string launch_work_dir_;
+    int launch_readiness_timeout_ms_ = 0;
+    bool launch_params_set_ = false;
+    std::chrono::steady_clock::time_point last_restart_attempt_{};
 };
 
 // Read one daemon response under a single wall-clock deadline. Kept outside

@@ -239,6 +239,10 @@ static void print_usage(const char * prog) {
         "                               14-15,30-31. The model process affinity\n"
         "                               must exclude every listed CPU.\n"
         "  --tool-spec-timeout-ms <N>   Executor result timeout (default: 60000).\n"
+        "  --early-dispatch      Launch allowlisted tool calls as soon as their call block\n"
+        "                        closes in the token stream (results: dflash_early_dispatch).\n"
+        "  --end-turn-snapshot   After tool-enabled generations, cache prompt+output so the\n"
+        "                        next turn restores the whole conversation (one delta prefill).\n"
         "  --tool-spec-max-model-slowdown <R>\n"
         "                               Reject lanes slower than this inference\n"
         "                               ratio (default: 1.20).\n"
@@ -710,6 +714,13 @@ int main(int argc, char ** argv) {
                 std::fprintf(stderr, "[server] %s\n", affinity_error.c_str());
                 return 2;
             }
+        } else if (std::strcmp(argv[i], "--early-dispatch") == 0) {
+            sconfig.early_dispatch = true;
+        } else if (std::strcmp(argv[i], "--end-turn-snapshot") == 0) {
+            sconfig.end_turn_snapshot = true;
+            // DeepSeek-V4 continuation snapshots are taken after DSpark decode and
+            // carry no final logits; the server never restores them at full length.
+            ::setenv("DFLASH_DS4_SNAPSHOT_STALE_LOGITS", "1", 0);
         } else if (std::strcmp(argv[i], "--tool-spec-timeout-ms") == 0 &&
                    i + 1 < argc) {
             if (!parse_int_strict(
@@ -829,11 +840,10 @@ int main(int argc, char ** argv) {
             return 2;
         }
         if (sconfig.tool_speculation.executor_path.empty() ||
-            sconfig.tool_speculation.profile_path.empty() ||
             sconfig.tool_speculation.allowed_tools.empty()) {
             std::fprintf(stderr,
-                "[server] tool speculation requires --tool-spec-executor, "
-                "--tool-spec-profile, and at least one --tool-spec-allow\n");
+                "[server] tool speculation requires --tool-spec-executor "
+                "and at least one --tool-spec-allow\n");
             return 2;
         }
 #if !defined(_WIN32)
@@ -851,10 +861,17 @@ int main(int argc, char ** argv) {
                         sconfig.tool_speculation.allowed_tools.end()),
             sconfig.tool_speculation.allowed_tools.end());
         std::string profile_error;
-        if (!sconfig.tool_speculation.policy.load_file(
+        if (!sconfig.tool_speculation.profile_path.empty() &&
+            !sconfig.tool_speculation.policy.load_file(
                 sconfig.tool_speculation.profile_path, profile_error)) {
             std::fprintf(stderr, "[server] %s\n", profile_error.c_str());
             return 2;
+        }
+        if (sconfig.tool_speculation.profile_path.empty()) {
+            std::fprintf(stderr,
+                "[server] tool speculation: no --tool-spec-profile; only "
+                "authoritative early-dispatch launches are admitted "
+                "(predictor-based speculation stays deferred)\n");
         }
         std::string cpu_affinity_error;
         if (!qualify_tool_speculation_cpu_affinity(

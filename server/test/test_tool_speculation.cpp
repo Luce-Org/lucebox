@@ -435,6 +435,51 @@ TEST_CASE(ToolSpeculationFixture, executor_failure_is_private) {
     CHECK(!metadata.contains("result"));
 }
 
+TEST_CASE(ToolSpeculationFixture, finished_result_survives_long_generation) {
+    // The result budget starts at commit time: a result that was ready long
+    // before the authoritative call arrived (slow target) must still count.
+    const std::string path = make_executor_script(
+        "printf '{\"ok\":true,\"result\":{\"value\":42}}\\n'\n");
+    ToolSpeculationConfig config = test_config(path);
+    config.timeout_ms = 25;
+    auto attempt = ToolSpeculationAttempt::create(
+        config, prediction(), "request_late_commit");
+    attempt->start();
+    // Much longer than timeout_ms, shorter than the absolute lifetime cap.
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    const json metadata = attempt->resolve({
+        ToolCall{"call_1", "lookup", R"({"a":1,"b":2})"},
+    });
+    ::unlink(path.c_str());
+
+    CHECK(metadata["status"] == "hit");
+    CHECK(metadata["result"]["value"] == 42);
+}
+
+TEST_CASE(ToolSpeculationFixture, closed_tool_blocks_are_found_as_they_stream) {
+    using dflash::common::find_closed_tool_call_blocks;
+    const std::string partial =
+        "Let me check.\n<function_call>\n{\"name\": \"a\", \"arguments\": {}}\n</function_call>\n"
+        "<function_call>\n{\"name\": \"b\", \"argu";
+    auto blocks = find_closed_tool_call_blocks(partial, 0);
+    CHECK(blocks.size() == 1u);
+    CHECK(partial.substr(blocks[0].begin, blocks[0].end - blocks[0].begin).find("\"a\"") != std::string::npos);
+    // Second block closes later; scanning from the end of the first one finds only it.
+    const std::string full = partial + "ments\": {\"x\": 1}}\n</function_call>";
+    blocks = find_closed_tool_call_blocks(full, blocks[0].end);
+    CHECK(blocks.size() == 1u);
+    CHECK(full.substr(blocks[0].begin, blocks[0].end - blocks[0].begin).find("\"b\"") != std::string::npos);
+    // Nested wrappers are reported once (outermost block).
+    const std::string nested =
+        "<tool_call><function=lookup><parameter=a>1</parameter></function></tool_call>";
+    blocks = find_closed_tool_call_blocks(nested, 0);
+    CHECK(blocks.size() == 1u);
+    CHECK(blocks[0].begin == 0u);
+    CHECK(blocks[0].end == nested.size());
+    // Unclosed opener yields nothing.
+    CHECK(find_closed_tool_call_blocks("<function=lookup><parameter=a>1</parameter>", 0).empty());
+}
+
 TEST_CASE(ToolSpeculationFixture, executor_timeout_starts_at_launch) {
     const std::string path = make_executor_script(
         "sleep 1\n"

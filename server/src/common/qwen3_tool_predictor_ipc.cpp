@@ -75,6 +75,43 @@ bool Qwen3ToolPredictorIpcClient::start(
         int max_ctx,
         const std::string & work_dir,
         int readiness_timeout_ms) {
+    std::lock_guard<std::timed_mutex> lock(mutex_);
+    launch_bin_ = bin;
+    launch_model_path_ = model_path;
+    launch_gpu_ = gpu;
+    launch_max_ctx_ = max_ctx;
+    launch_work_dir_ = work_dir;
+    launch_readiness_timeout_ms_ = readiness_timeout_ms;
+    launch_params_set_ = true;
+    return start_locked(bin, model_path, gpu, max_ctx, work_dir,
+                        readiness_timeout_ms);
+}
+
+bool Qwen3ToolPredictorIpcClient::try_restart() {
+    constexpr auto kCooldown = std::chrono::seconds(30);
+    std::unique_lock<std::timed_mutex> lock(mutex_, std::try_to_lock);
+    if (!lock.owns_lock()) return false;
+    if (active_.load(std::memory_order_acquire)) return true;
+    if (!launch_params_set_) return false;
+    const auto now = std::chrono::steady_clock::now();
+    if (last_restart_attempt_.time_since_epoch().count() != 0 &&
+        now - last_restart_attempt_ < kCooldown) {
+        return false;
+    }
+    last_restart_attempt_ = now;
+    std::fprintf(stderr, "[tool-predictor-ipc] relaunching predictor daemon\n");
+    return start_locked(launch_bin_, launch_model_path_, launch_gpu_,
+                        launch_max_ctx_, launch_work_dir_,
+                        launch_readiness_timeout_ms_);
+}
+
+bool Qwen3ToolPredictorIpcClient::start_locked(
+        const std::string & bin,
+        const std::string & model_path,
+        int gpu,
+        int max_ctx,
+        const std::string & work_dir,
+        int readiness_timeout_ms) {
 #if !defined(__linux__)
     (void)bin; (void)model_path; (void)gpu; (void)max_ctx; (void)work_dir;
     (void)readiness_timeout_ms;
@@ -82,7 +119,6 @@ bool Qwen3ToolPredictorIpcClient::start(
                  "Qwen3 tool-predictor IPC is only implemented on Linux hosts\n");
     return false;
 #else
-    std::lock_guard<std::timed_mutex> lock(mutex_);
     close_locked();
     if (bin.empty() || model_path.empty() || max_ctx <= 0 ||
         readiness_timeout_ms <= 0) return false;

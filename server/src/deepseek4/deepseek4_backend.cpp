@@ -2201,10 +2201,20 @@ GenerateResult DeepSeek4Backend::generate_from_state(
 // ── Snapshots ───────────────────────────────────────────────────────────
 
 bool DeepSeek4Backend::snapshot_save(int slot) {
+    // Continuation snapshots taken after DSpark decode carry no final
+    // logits (the DSpark API does not return them). With
+    // DFLASH_DS4_SNAPSHOT_STALE_LOGITS=1 (set by --end-turn-snapshot) they
+    // are saved with EMPTY logits and an empty drafter feature window; a
+    // restore must prefill at least one more token, which the server
+    // guarantees by never restoring such slots at full prompt length.
+    static const bool allow_stale = [] {
+        const char * v = std::getenv("DFLASH_DS4_SNAPSHOT_STALE_LOGITS");
+        return v && *v && *v != '0';
+    }();
+    const bool logits_valid = last_logits_pos_ == cache_.cur_pos &&
+        w_.n_vocab > 0 && last_logits_.size() == (size_t) w_.n_vocab;
     if (slot < 0 || slot >= PREFIX_SLOTS || !snap_backend_ ||
-        cache_.cur_pos <= 0 || last_logits_pos_ != cache_.cur_pos ||
-        w_.n_vocab <= 0 ||
-        last_logits_.size() != (size_t) w_.n_vocab) {
+        cache_.cur_pos <= 0 || (!logits_valid && !allow_stale)) {
         return false;
     }
 
@@ -2215,10 +2225,18 @@ bool DeepSeek4Backend::snapshot_save(int slot) {
 
     try {
         auto & aux = snapshot_aux_[slot];
-        aux.last_logits = last_logits_;
-        aux.spec_feat_window = spec_feat_window_;
-        keep_spec_feature_tail(aux.spec_feat_window,
-                               (size_t) std::max(0, w_.n_swa));
+        aux.stale_logits = !logits_valid;
+        if (logits_valid) {
+            aux.last_logits = last_logits_;
+            aux.spec_feat_window = spec_feat_window_;
+            keep_spec_feature_tail(aux.spec_feat_window,
+                                   (size_t) std::max(0, w_.n_swa));
+        } else {
+            // The feature window only covers prompt-time positions here; an
+            // empty window keeps the drafter aligned after restore.
+            aux.last_logits.clear();
+            aux.spec_feat_window.clear();
+        }
         aux.used = true;
     } catch (const std::bad_alloc &) {
         snapshot_free(slot);
@@ -2249,7 +2267,7 @@ bool DeepSeek4Backend::snapshot_used(int slot) const {
     const auto & aux = snapshot_aux_[slot];
     return snap.ctx != nullptr && snap.buf != nullptr && snap.cur_pos > 0 &&
            aux.used && w_.n_vocab > 0 &&
-           aux.last_logits.size() == (size_t) w_.n_vocab;
+           (aux.stale_logits || aux.last_logits.size() == (size_t) w_.n_vocab);
 }
 
 int DeepSeek4Backend::snapshot_cur_pos(int slot) const {
@@ -2274,7 +2292,7 @@ bool DeepSeek4Backend::snapshot_restore(int slot) {
     }
     last_logits_ = std::move(restored_logits);
     spec_feat_window_ = std::move(restored_features);
-    last_logits_pos_ = cache_.cur_pos;
+    last_logits_pos_ = last_logits_.empty() ? -1 : cache_.cur_pos;
     return true;
 }
 

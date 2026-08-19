@@ -2513,7 +2513,7 @@ void HttpServer::start_automatic_tool_speculation(ParsedRequest & req) const {
     if (req.automatic_tool_speculation.has_value() ||
         !req.automatic_tool_speculation_enabled ||
         req.tool_speculation.has_value() ||
-        !config_.tool_speculation.enabled() ||
+        !config_.tool_speculation.predictive_enabled() ||
         !config_.semantic_tool_predictor.enabled() ||
         http_detail::tool_choice_disables_tool_calls(req.tool_choice) ||
         req.tools.empty()) return;
@@ -2665,7 +2665,7 @@ bool HttpServer::route_request(SocketHandle fd, const HttpRequest & hr) {
         if (!render_and_tokenize_request(fd, render_messages, req)) return true;
 
         if (config_.semantic_tool_predictor.enabled() &&
-            config_.tool_speculation.enabled() &&
+            config_.tool_speculation.predictive_enabled() &&
             config_.pflash_upstream_base.empty() &&
             req.automatic_tool_speculation_enabled &&
             !req.tool_speculation.has_value() &&
@@ -3665,6 +3665,16 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
     if (!cache.using_restore) {
         auto [inline_slot, inline_len] =
             prefix_cache_.lookup(effective_prompt);
+        if (inline_slot >= 0 && inline_len >= (int) effective_prompt.size() &&
+            eot_slots_.count(inline_slot)) {
+            // End-of-turn snapshots carry no final logits; with nothing left
+            // to prefill the backend could not continue. Fresh prefill instead.
+            std::fprintf(stderr,
+                "[pc] skipping full-length restore of end-of-turn slot=%d\n",
+                inline_slot);
+            inline_slot = -1;
+            inline_len = 0;
+        }
         cache.cache_slot = inline_slot;
         cache.prefix_len = inline_len;
         cache.using_restore = cache.cache_slot >= 0;
@@ -4005,6 +4015,7 @@ void HttpServer::finalize_generation_cache(
                     cache.snap_cut, saved_position, cache.snap_slot);
                 prefix_cache_.confirm_inline_snap(
                     cache.snap_slot, cache.snap_cut, effective_prompt);
+                eot_slots_.erase(cache.snap_slot);
                 // Track for shutdown save. The key may be stricter than a
                 // Qwen chunk-aligned snapshot, which is safe: matching the
                 // longer token prefix necessarily matches saved KV rows.
@@ -4028,6 +4039,38 @@ void HttpServer::finalize_generation_cache(
     }
 
     if (cache.disk_hit) backend_.snapshot_free(kDiskStagingSlot);
+
+    // End-of-turn continuation snapshot: for tool-enabled requests, cache
+    // prompt+output so the next request of the same conversation restores
+    // everything up to the appended tool results and prefills one delta.
+    if (config_.end_turn_snapshot && !prefix_cache_.disabled() &&
+        result.ok() && generation_produced_output && !result.tokens.empty() &&
+        !req.tools.empty()) {
+        std::vector<int32_t> all_tokens(effective_prompt);
+        all_tokens.insert(all_tokens.end(),
+                          result.tokens.begin(), result.tokens.end());
+        const int cut = (int) all_tokens.size();
+        const auto prepared_eot = prefix_cache_.prepare_inline_snap(
+            all_tokens, 0, false, cut);
+        if (prepared_eot.first >= 0 && prepared_eot.second == cut) {
+            const int slot = prepared_eot.first;
+            backend_.snapshot_free(slot);
+            if (backend_.snapshot_save(slot) &&
+                backend_.snapshot_cur_pos(slot) == cut) {
+                prefix_cache_.confirm_inline_snap(slot, cut, all_tokens);
+                slot_tokens_[slot] = all_tokens;
+                eot_slots_.insert(slot);
+                std::fprintf(stderr,
+                    "[pc] end-of-turn snapshot saved slot=%d pos=%d\n",
+                    slot, cut);
+            } else {
+                backend_.snapshot_free(slot);
+                prefix_cache_.abort_inline_snap(slot);
+                std::fprintf(stderr,
+                    "[pc] end-of-turn snapshot unavailable (backend declined)\n");
+            }
+        }
+    }
 
     // Long conversations get a continued checkpoint after crossing the
     // configured interval so a future turn can restore prompt plus output.
@@ -4143,6 +4186,111 @@ void HttpServer::prepare_generation_inputs(
     inputs.request.stall_skip_tokens = &inputs.stall_skip_tokens;
 }
 
+// ─── Early dispatch ──────────────────────────────────────────────────────
+// Launch allowlisted tool calls the moment their call block closes in the
+// token stream. Each launched call is resolved independently against the
+// authoritative parsed calls (exact canonical match), so N calls in one
+// response overlap both the remaining decode and each other.
+
+void HttpServer::scan_early_dispatch(const ParsedRequest & req,
+                                     GenerationOutputState & output) {
+    const auto blocks = find_closed_tool_call_blocks(
+        output.early_text, output.early_scan_pos);
+    for (const ClosedToolCallBlock & block : blocks) {
+        output.early_scan_pos = block.end;
+        EarlyDispatchEntry entry;
+        entry.token_index = output.completion_tokens;
+        const std::string segment =
+            output.early_text.substr(block.begin, block.end - block.begin);
+        ToolParseResult parsed = parse_tool_calls(segment, req.tools);
+        if (parsed.tool_calls.size() != 1) {
+            entry.skip_reason = parsed.tool_calls.empty()
+                ? "unparseable_block" : "multiple_calls_in_block";
+            output.early_entries.push_back(std::move(entry));
+            continue;
+        }
+        std::string error;
+        if (!CanonicalToolInvocation::from_tool_call(
+                parsed.tool_calls[0], entry.call, error)) {
+            entry.skip_reason = "canonicalize: " + error;
+            output.early_entries.push_back(std::move(entry));
+            continue;
+        }
+        bool duplicate = false;
+        for (const EarlyDispatchEntry & previous : output.early_entries) {
+            if (previous.attempt && previous.call == entry.call) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) {
+            entry.skip_reason = "duplicate_call";
+            output.early_entries.push_back(std::move(entry));
+            continue;
+        }
+        if (!config_.tool_speculation.allows(entry.call.name)) {
+            entry.skip_reason = "tool_not_allowlisted";
+            output.early_entries.push_back(std::move(entry));
+            continue;
+        }
+        ToolSpeculationPrediction prediction;
+        if (!build_tool_speculation_prediction(
+                entry.call.name, entry.call.arguments, 1.0, prediction, error)) {
+            entry.skip_reason = "prediction: " + error;
+            output.early_entries.push_back(std::move(entry));
+            continue;
+        }
+        entry.attempt = ToolSpeculationAttempt::create(
+            config_.tool_speculation, prediction, req.response_id);
+        entry.attempt->start();
+        std::fprintf(stderr,
+            "[early-dispatch] launched request=%s tool=%s at_token=%d\n",
+            req.response_id.c_str(), entry.call.name.c_str(),
+            output.completion_tokens);
+        output.early_entries.push_back(std::move(entry));
+    }
+}
+
+json HttpServer::resolve_early_dispatch(
+        GenerationOutputState & output,
+        const std::vector<ToolCall> & authoritative_calls,
+        const char * cancel_reason) {
+    json out = json::array();
+    for (EarlyDispatchEntry & entry : output.early_entries) {
+        json item = {
+            {"name", entry.call.name},
+            {"arguments", entry.call.arguments},
+            {"launched_at_token", entry.token_index},
+        };
+        if (!entry.attempt) {
+            item["status"] = "skipped";
+            item["reason"] = entry.skip_reason;
+            out.push_back(std::move(item));
+            continue;
+        }
+        const ToolCall * match = nullptr;
+        for (const ToolCall & call : authoritative_calls) {
+            CanonicalToolInvocation canonical;
+            std::string error;
+            if (CanonicalToolInvocation::from_tool_call(call, canonical, error) &&
+                canonical == entry.call) {
+                match = &call;
+                break;
+            }
+        }
+        json metadata = (cancel_reason || !match)
+            ? entry.attempt->cancel(
+                  cancel_reason ? cancel_reason : "no_matching_authoritative_call")
+            : entry.attempt->resolve(std::vector<ToolCall>{*match});
+        for (auto it = metadata.begin(); it != metadata.end(); ++it) {
+            item[it.key()] = it.value();
+        }
+        if (match) item["call_id"] = match->id;
+        out.push_back(std::move(item));
+    }
+    return out;
+}
+
 void HttpServer::configure_generation_io(
         ServerJob * job, const ParsedRequest & req, SseEmitter & emitter,
         GenerationOutputState & output, DaemonIO & io) {
@@ -4182,6 +4330,12 @@ void HttpServer::configure_generation_io(
         if (!text.empty()) {
             output.visible_output_seen = true;
             broadcast_token(text);
+            if (output.early_dispatch) {
+                output.early_text += text;
+                if (text.find('>') != std::string::npos) {
+                    scan_early_dispatch(req, output);
+                }
+            }
         }
         if (!req.stream || text.empty()) return true;
 
@@ -4411,6 +4565,10 @@ void HttpServer::process_job(ServerJob * job) {
 
     DaemonIO io;
     GenerationOutputState output;
+    output.early_dispatch = config_.early_dispatch &&
+        config_.tool_speculation.enabled() && !req.tools.empty() &&
+        req.automatic_tool_speculation_enabled &&
+        !http_detail::tool_choice_disables_tool_calls(req.tool_choice);
     configure_generation_io(job, req, emitter, output, io);
     int & completion_tokens = output.completion_tokens;
     bool & visible_output_seen = output.visible_output_seen;
@@ -4574,6 +4732,17 @@ void HttpServer::process_job(ServerJob * job) {
                 final_chunks.insert(final_chunks.end() - 1, extension);
             }
         }
+        if (output.early_dispatch) {
+            const json early = {{"early_dispatch", resolve_early_dispatch(
+                output, emitter.tool_calls(), generation_cancel_reason)}};
+            const std::string extension = render_tool_speculation_sse(
+                req.format, req.response_id, req.model, early);
+            if (final_chunks.empty()) {
+                final_chunks.push_back(extension);
+            } else {
+                final_chunks.insert(final_chunks.end() - 1, extension);
+            }
+        }
         for (const auto & chunk : final_chunks) {
             if (!send_job_bytes(job, chunk.data(), chunk.size())) {
                 client_disconnected = true;
@@ -4587,6 +4756,10 @@ void HttpServer::process_job(ServerJob * job) {
                 generation_cancel_reason)) {
             response["dflash_tool_speculation"] = std::move(*metadata);
         }
+        if (output.early_dispatch) {
+            response["dflash_early_dispatch"] = resolve_early_dispatch(
+                output, emitter.tool_calls(), generation_cancel_reason);
+        }
         // Streaming uses non-blocking sends; restore blocking mode before
         // writing a complete JSON response on this shared socket path.
         sock_set_block(fd);
@@ -4594,6 +4767,9 @@ void HttpServer::process_job(ServerJob * job) {
                       response.dump() + "\n");
     } else {
         finish_tool_speculation("client_disconnected");
+        if (output.early_dispatch) {
+            resolve_early_dispatch(output, emitter.tool_calls(), "client_disconnected");
+        }
     }
 
     if (client_disconnected) {

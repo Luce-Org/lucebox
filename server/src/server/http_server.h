@@ -50,6 +50,7 @@
 #include <unistd.h>
 #endif
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace dflash::common {
@@ -96,6 +97,14 @@ struct ServerConfig {
     std::string model_name  = "dflash";
     int         prefix_cache_cap = 32;  // prefix cache slots (0 disables)
     int         prefill_cache_cap = 0;  // full-prompt/prefill cache slots (0 disables)
+    // After a generation in a tool-enabled request, snapshot prompt+output
+    // into the inline prefix cache so the next turn of the same conversation
+    // restores everything up to the new tool result (one delta prefill).
+    bool        end_turn_snapshot = false;
+    // Launch every allowlisted tool call through the tool-speculation
+    // executor lane the moment its call block closes in the token stream
+    // (no predictor needed, N calls per response, per-call exact commit).
+    bool        early_dispatch = false;
 
     // Pin-Friendly Prompt Processor (PPP): LCP pin_end + optional rearrange.
     // See docs/PIN_FRIENDLY_PROMPT.md. Env: DFLASH_PPP=0|1,
@@ -460,10 +469,21 @@ private:
         std::vector<int32_t> stall_skip_tokens;
     };
 
+    struct EarlyDispatchEntry {
+        CanonicalToolInvocation call;
+        std::unique_ptr<ToolSpeculationAttempt> attempt;  // null when skipped
+        int token_index = 0;
+        std::string skip_reason;
+    };
     struct GenerationOutputState {
         int completion_tokens = 0;
         bool visible_output_seen = false;
         bool client_disconnected = false;
+        // Early dispatch (stream-based tool launch).
+        bool early_dispatch = false;
+        std::string early_text;
+        size_t early_scan_pos = 0;
+        std::vector<EarlyDispatchEntry> early_entries;
     };
 
     void prepare_generation_inputs(
@@ -472,6 +492,14 @@ private:
     void configure_generation_io(
         ServerJob * job, const ParsedRequest & req, SseEmitter & emitter,
         GenerationOutputState & output, DaemonIO & io);
+    // Early dispatch: scan newly streamed text for closed tool-call blocks and
+    // launch allowlisted calls; resolve them against the authoritative calls.
+    void scan_early_dispatch(const ParsedRequest & req,
+                             GenerationOutputState & output);
+    nlohmann::json resolve_early_dispatch(
+        GenerationOutputState & output,
+        const std::vector<ToolCall> & authoritative_calls,
+        const char * cancel_reason);
 
     // Worker thread, concurrent mode (the backend exposes a SeqEngine):
     // iteration-level scheduler. Admission is claim-only; this baseline
@@ -586,6 +614,9 @@ private:
 
     // Track prompt tokens for each snapshot slot (for shutdown save).
     std::unordered_map<int, std::vector<int32_t>> slot_tokens_;
+    // Inline slots holding end-of-turn continuation snapshots. They carry no
+    // usable final logits, so they are never restored at full prompt length.
+    std::unordered_set<int> eot_slots_;
     std::vector<std::vector<int32_t>> recent_disk_prompts_;
     // Recent tool-bearing prompt prefixes for PPP LCP annotate.
     std::vector<std::vector<int32_t>> recent_tool_prefixes_;

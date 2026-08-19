@@ -23,7 +23,25 @@ PREDICTOR_CONFIDENCE="${PREDICTOR_CONFIDENCE:-0.75}"
 # without modifying the qualified model/DSpark arguments.
 PREFIX_CACHE_SLOTS_OVERRIDE="${PREFIX_CACHE_SLOTS_OVERRIDE:-32}"
 
+# Stream-based early dispatch (default on): every allowlisted tool call is
+# launched the moment its call block closes in the token stream, N calls per
+# response, each committed on exact match. End-of-turn snapshots (default on)
+# let the next turn of a tool conversation restore everything and prefill one
+# delta. PREDICTOR=0 disables the pre-generation Qwen3 lane (recommended when
+# tools answer in under ~2 s; keep it for slow, recurring workflows).
+EARLY_DISPATCH="${EARLY_DISPATCH:-1}"
+END_TURN_SNAPSHOT="${END_TURN_SNAPSHOT:-1}"
+PREDICTOR="${PREDICTOR:-1}"
+for toggle in EARLY_DISPATCH END_TURN_SNAPSHOT PREDICTOR; do
+  [[ "${!toggle}" == "0" || "${!toggle}" == "1" ]] || {
+    printf '%s must be 0 or 1\n' "${toggle}" >&2
+    exit 2
+  }
+done
+
 cache_args=()
+[[ "${EARLY_DISPATCH}" == "1" ]] && cache_args+=(--early-dispatch)
+[[ "${END_TURN_SNAPSHOT}" == "1" ]] && cache_args+=(--end-turn-snapshot)
 if [[ -n "${PREFIX_CACHE_SLOTS_OVERRIDE}" ]]; then
   [[ "${PREFIX_CACHE_SLOTS_OVERRIDE}" =~ ^(0|[1-9][0-9]*)$ ]] || {
     printf 'invalid PREFIX_CACHE_SLOTS_OVERRIDE: %s\n' \
@@ -52,12 +70,19 @@ done
 export LD_LIBRARY_PATH="${CANDIDATE_BUILD}/deps/llama.cpp/ggml/src:${CANDIDATE_BUILD}/deps/llama.cpp/ggml/src/ggml-hip:${LD_LIBRARY_PATH:-}"
 export LUCE_MMVQ_MAX_NCOLS=5
 
+predictor_args=()
+if [[ "${PREDICTOR}" == "1" ]]; then
+  predictor_args=(
+    --tool-hint-native-model "${PREDICTOR_MODEL}"
+    --tool-hint-native-ipc-bin "${PREDICTOR_IPC_BIN}"
+    --tool-hint-native-gpu "${PREDICTOR_GPU}"
+    --tool-hint-native-max-ctx "${PREDICTOR_MAX_CTX}"
+    --tool-hint-max-tokens "${PREDICTOR_MAX_TOKENS}"
+    --tool-hint-timeout-ms "${PREDICTOR_TIMEOUT_MS}"
+    --tool-hint-execution-confidence "${PREDICTOR_CONFIDENCE}"
+  )
+fi
+
 exec "${CANDIDATE_BUILD}/dflash_server" "$@" \
-  --tool-hint-native-model "${PREDICTOR_MODEL}" \
-  --tool-hint-native-ipc-bin "${PREDICTOR_IPC_BIN}" \
-  --tool-hint-native-gpu "${PREDICTOR_GPU}" \
-  --tool-hint-native-max-ctx "${PREDICTOR_MAX_CTX}" \
-  --tool-hint-max-tokens "${PREDICTOR_MAX_TOKENS}" \
-  --tool-hint-timeout-ms "${PREDICTOR_TIMEOUT_MS}" \
-  --tool-hint-execution-confidence "${PREDICTOR_CONFIDENCE}" \
+  "${predictor_args[@]}" \
   "${cache_args[@]}"

@@ -1,0 +1,1841 @@
+{
+ "tag": "dag5",
+ "results": [
+  {
+   "task": "s01",
+   "arm": "dag",
+   "prompt": "What is the current temperature in Tokyo, Paris and Cairo?",
+   "final": "Here are the current temperatures:\n\n- **Tokyo**: 25.5 \u00b0C (humidity 88%, wind 2.9 km/h)\n- **Paris**: 28.8 \u00b0C (humidity 43%, wind 22.7 km/h)\n- **Cairo**: 33.6 \u00b0C (humidity 37%, wind 9.4 km/h)",
+   "correct": true,
+   "wall_ms": 42846.05355001986,
+   "turns": 3,
+   "model_ms": 42845.34509200603,
+   "tool_wait_ms": 0.18588898819871247,
+   "calls": 6,
+   "early_hits": 6,
+   "waves": 2,
+   "max_parallel": 3,
+   "dep_calls": 0,
+   "errors": 0,
+   "turn_log": [
+    {
+     "turn": 0,
+     "model_wall_ms": 6061.288104014238,
+     "prompt_tokens": 762,
+     "completion_tokens": 134,
+     "n_calls": 3,
+     "early": [
+      [
+       "geocode_city",
+       "hit"
+      ],
+      [
+       "geocode_city",
+       "hit"
+      ],
+      [
+       "geocode_city",
+       "hit"
+      ]
+     ],
+     "finish": "tool_calls",
+     "tool_wait_ms": 0.07622299017384648,
+     "waves": 1,
+     "tools": [
+      {
+       "name": "geocode_city",
+       "args": {
+        "city": "Tokyo, Japan"
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 62.68519000150263,
+       "deps": []
+      },
+      {
+       "name": "geocode_city",
+       "args": {
+        "city": "Paris, France"
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 42.27932301000692,
+       "deps": []
+      },
+      {
+       "name": "geocode_city",
+       "args": {
+        "city": "Cairo, Egypt"
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 45.10259599192068,
+       "deps": []
+      }
+     ]
+    },
+    {
+     "turn": 1,
+     "model_wall_ms": 10960.316718003014,
+     "prompt_tokens": 1038,
+     "completion_tokens": 134,
+     "n_calls": 3,
+     "early": [
+      [
+       "get_weather",
+       "hit"
+      ],
+      [
+       "get_weather",
+       "hit"
+      ],
+      [
+       "get_weather",
+       "hit"
+      ]
+     ],
+     "finish": "tool_calls",
+     "tool_wait_ms": 0.10966599802486598,
+     "waves": 1,
+     "tools": [
+      {
+       "name": "get_weather",
+       "args": {
+        "latitude": 35.6769,
+        "longitude": 139.7639
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 153.92055199481547,
+       "deps": []
+      },
+      {
+       "name": "get_weather",
+       "args": {
+        "latitude": 48.8535,
+        "longitude": 2.3484
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 155.72316100588068,
+       "deps": []
+      },
+      {
+       "name": "get_weather",
+       "args": {
+        "latitude": 30.0444,
+        "longitude": 31.2357
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 142.8820269939024,
+       "deps": []
+      }
+     ]
+    },
+    {
+     "turn": 2,
+     "model_wall_ms": 25823.740269988775,
+     "prompt_tokens": 1445,
+     "completion_tokens": 80,
+     "n_calls": 0,
+     "early": [],
+     "finish": "stop"
+    }
+   ]
+  },
+  {
+   "task": "s01",
+   "arm": "parallel",
+   "prompt": "What is the current temperature in Tokyo, Paris and Cairo?",
+   "final": "Here are the current temperatures:\n\n- **Tokyo, Japan**: 25.5 \u00b0C (humidity 88%, wind 2.9 km/h)\n- **Paris, France**: 28.8 \u00b0C (humidity 43%, wind 22.7 km/h)\n- **Cairo, Egypt**: 33.6 \u00b0C (humidity 37%, wind 9.4 km/h)",
+   "correct": true,
+   "wall_ms": 48667.152615002124,
+   "turns": 3,
+   "model_ms": 48666.702660993906,
+   "tool_wait_ms": 0.20384200615808368,
+   "calls": 6,
+   "early_hits": 6,
+   "waves": 2,
+   "max_parallel": 3,
+   "dep_calls": 0,
+   "errors": 0,
+   "turn_log": [
+    {
+     "turn": 0,
+     "model_wall_ms": 5277.855696011102,
+     "prompt_tokens": 644,
+     "completion_tokens": 142,
+     "n_calls": 3,
+     "early": [
+      [
+       "geocode_city",
+       "hit"
+      ],
+      [
+       "geocode_city",
+       "hit"
+      ],
+      [
+       "geocode_city",
+       "hit"
+      ]
+     ],
+     "finish": "tool_calls",
+     "tool_wait_ms": 0.09666100959293544,
+     "waves": 1,
+     "tools": [
+      {
+       "name": "geocode_city",
+       "args": {
+        "city": "Tokyo, Japan"
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 62.89316198672168,
+       "deps": []
+      },
+      {
+       "name": "geocode_city",
+       "args": {
+        "city": "Paris, France"
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 47.854299016762525,
+       "deps": []
+      },
+      {
+       "name": "geocode_city",
+       "args": {
+        "city": "Cairo, Egypt"
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 64.94328498956747,
+       "deps": []
+      }
+     ]
+    },
+    {
+     "turn": 1,
+     "model_wall_ms": 16968.42953300802,
+     "prompt_tokens": 928,
+     "completion_tokens": 136,
+     "n_calls": 3,
+     "early": [
+      [
+       "get_weather",
+       "hit"
+      ],
+      [
+       "get_weather",
+       "hit"
+      ],
+      [
+       "get_weather",
+       "hit"
+      ]
+     ],
+     "finish": "tool_calls",
+     "tool_wait_ms": 0.10718099656514823,
+     "waves": 1,
+     "tools": [
+      {
+       "name": "get_weather",
+       "args": {
+        "latitude": 35.6769,
+        "longitude": 139.7639
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 152.60900201974437,
+       "deps": []
+      },
+      {
+       "name": "get_weather",
+       "args": {
+        "latitude": 48.8535,
+        "longitude": 2.3484
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 153.62220199313015,
+       "deps": []
+      },
+      {
+       "name": "get_weather",
+       "args": {
+        "latitude": 30.0444,
+        "longitude": 31.2357
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 153.9577109797392,
+       "deps": []
+      }
+     ]
+    },
+    {
+     "turn": 2,
+     "model_wall_ms": 26420.417431974784,
+     "prompt_tokens": 1337,
+     "completion_tokens": 86,
+     "n_calls": 0,
+     "early": [],
+     "finish": "stop"
+    }
+   ]
+  },
+  {
+   "task": "s01",
+   "arm": "react",
+   "prompt": "What is the current temperature in Tokyo, Paris and Cairo?",
+   "final": "\n",
+   "correct": false,
+   "wall_ms": 61936.48661702173,
+   "turns": 10,
+   "model_ms": 61935.58852598653,
+   "tool_wait_ms": 0.40299701504409313,
+   "calls": 5,
+   "early_hits": 5,
+   "waves": 5,
+   "max_parallel": 1,
+   "dep_calls": 0,
+   "errors": 0,
+   "turn_log": [
+    {
+     "turn": 0,
+     "model_wall_ms": 2463.075141014997,
+     "prompt_tokens": 624,
+     "completion_tokens": 41,
+     "n_calls": 0,
+     "early": [],
+     "finish": "stop",
+     "nudged": true
+    },
+    {
+     "turn": 1,
+     "model_wall_ms": 4749.348801997257,
+     "prompt_tokens": 707,
+     "completion_tokens": 31,
+     "n_calls": 1,
+     "early": [
+      [
+       "geocode_city",
+       "hit"
+      ]
+     ],
+     "finish": "tool_calls",
+     "tool_wait_ms": 0.07511102012358606,
+     "waves": 1,
+     "tools": [
+      {
+       "name": "geocode_city",
+       "args": {
+        "city": "Tokyo, Japan"
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 56.27366798580624,
+       "deps": []
+      }
+     ]
+    },
+    {
+     "turn": 2,
+     "model_wall_ms": 3614.1322900075465,
+     "prompt_tokens": 786,
+     "completion_tokens": 40,
+     "n_calls": 1,
+     "early": [
+      [
+       "get_weather",
+       "hit"
+      ]
+     ],
+     "finish": "tool_calls",
+     "tool_wait_ms": 0.08110198541544378,
+     "waves": 1,
+     "tools": [
+      {
+       "name": "get_weather",
+       "args": {
+        "latitude": 35.6769,
+        "longitude": 139.7639
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 134.6444190130569,
+       "deps": []
+      }
+     ]
+    },
+    {
+     "turn": 3,
+     "model_wall_ms": 9573.28670399147,
+     "prompt_tokens": 922,
+     "completion_tokens": 31,
+     "n_calls": 1,
+     "early": [
+      [
+       "geocode_city",
+       "hit"
+      ]
+     ],
+     "finish": "tool_calls",
+     "tool_wait_ms": 0.07976000779308379,
+     "waves": 1,
+     "tools": [
+      {
+       "name": "geocode_city",
+       "args": {
+        "city": "Paris, France"
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 73.51973498589359,
+       "deps": []
+      }
+     ]
+    },
+    {
+     "turn": 4,
+     "model_wall_ms": 4443.268611998064,
+     "prompt_tokens": 1008,
+     "completion_tokens": 52,
+     "n_calls": 0,
+     "early": [
+      [
+       "",
+       "skipped"
+      ]
+     ],
+     "finish": "stop",
+     "nudged": true
+    },
+    {
+     "turn": 5,
+     "model_wall_ms": 6143.834121001419,
+     "prompt_tokens": 1052,
+     "completion_tokens": 52,
+     "n_calls": 0,
+     "early": [
+      [
+       "",
+       "skipped"
+      ]
+     ],
+     "finish": "stop",
+     "nudged": true
+    },
+    {
+     "turn": 6,
+     "model_wall_ms": 8048.965918977046,
+     "prompt_tokens": 1096,
+     "completion_tokens": 52,
+     "n_calls": 0,
+     "early": [
+      [
+       "",
+       "skipped"
+      ]
+     ],
+     "finish": "stop",
+     "nudged": true
+    },
+    {
+     "turn": 7,
+     "model_wall_ms": 7713.250561006134,
+     "prompt_tokens": 1140,
+     "completion_tokens": 40,
+     "n_calls": 1,
+     "early": [
+      [
+       "get_weather",
+       "hit"
+      ]
+     ],
+     "finish": "tool_calls",
+     "tool_wait_ms": 0.08467902080155909,
+     "waves": 1,
+     "tools": [
+      {
+       "name": "get_weather",
+       "args": {
+        "latitude": 48.8535,
+        "longitude": 2.3484
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 133.43762900331058,
+       "deps": []
+      }
+     ]
+    },
+    {
+     "turn": 8,
+     "model_wall_ms": 10522.122813999886,
+     "prompt_tokens": 1272,
+     "completion_tokens": 32,
+     "n_calls": 1,
+     "early": [
+      [
+       "geocode_city",
+       "hit"
+      ]
+     ],
+     "finish": "tool_calls",
+     "tool_wait_ms": 0.08234498091042042,
+     "waves": 1,
+     "tools": [
+      {
+       "name": "geocode_city",
+       "args": {
+        "city": "Cairo, Egypt"
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 55.82553398562595,
+       "deps": []
+      }
+     ]
+    },
+    {
+     "turn": 9,
+     "model_wall_ms": 4664.3035619927105,
+     "prompt_tokens": 1351,
+     "completion_tokens": 53,
+     "n_calls": 0,
+     "early": [
+      [
+       "",
+       "skipped"
+      ]
+     ],
+     "finish": "stop"
+    }
+   ]
+  },
+  {
+   "task": "s02",
+   "arm": "dag",
+   "prompt": "Give today's ECB rate from EUR to USD, JPY, GBP and CHF.",
+   "final": "Today's ECB reference rates (August 19, 2026) for 1 EUR:\n\n- USD: 1.1605\n- JPY: 184.62\n- GBP: 0.85608\n- CHF: 0.9402",
+   "correct": true,
+   "wall_ms": 15056.874913017964,
+   "turns": 2,
+   "model_ms": 15056.630214006873,
+   "tool_wait_ms": 0.10943601955659688,
+   "calls": 4,
+   "early_hits": 4,
+   "waves": 1,
+   "max_parallel": 4,
+   "dep_calls": 0,
+   "errors": 0,
+   "turn_log": [
+    {
+     "turn": 0,
+     "model_wall_ms": 5835.811372002354,
+     "prompt_tokens": 766,
+     "completion_tokens": 161,
+     "n_calls": 4,
+     "early": [
+      [
+       "exchange_rate",
+       "hit"
+      ],
+      [
+       "exchange_rate",
+       "hit"
+      ],
+      [
+       "exchange_rate",
+       "hit"
+      ],
+      [
+       "exchange_rate",
+       "hit"
+      ]
+     ],
+     "finish": "tool_calls",
+     "tool_wait_ms": 0.10943601955659688,
+     "waves": 1,
+     "tools": [
+      {
+       "name": "exchange_rate",
+       "args": {
+        "base": "EUR",
+        "quote": "USD"
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 112.84439198789187,
+       "deps": []
+      },
+      {
+       "name": "exchange_rate",
+       "args": {
+        "base": "EUR",
+        "quote": "JPY"
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 165.68928697961383,
+       "deps": []
+      },
+      {
+       "name": "exchange_rate",
+       "args": {
+        "base": "EUR",
+        "quote": "GBP"
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 91.22754100826569,
+       "deps": []
+      },
+      {
+       "name": "exchange_rate",
+       "args": {
+        "base": "EUR",
+        "quote": "CHF"
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 104.269027011469,
+       "deps": []
+      }
+     ]
+    },
+    {
+     "turn": 1,
+     "model_wall_ms": 9220.818842004519,
+     "prompt_tokens": 1083,
+     "completion_tokens": 54,
+     "n_calls": 0,
+     "early": [],
+     "finish": "stop"
+    }
+   ]
+  },
+  {
+   "task": "s02",
+   "arm": "parallel",
+   "prompt": "Give today's ECB rate from EUR to USD, JPY, GBP and CHF.",
+   "final": "Today's ECB reference rates (August 19, 2026):\n\n- EUR to USD: 1.1605\n- EUR to JPY: 184.62\n- EUR to GBP: 0.85608\n- EUR to CHF: 0.9402",
+   "correct": true,
+   "wall_ms": 15310.205977002624,
+   "turns": 2,
+   "model_ms": 15309.96703900746,
+   "tool_wait_ms": 0.10549701983109117,
+   "calls": 4,
+   "early_hits": 4,
+   "waves": 1,
+   "max_parallel": 4,
+   "dep_calls": 0,
+   "errors": 0,
+   "turn_log": [
+    {
+     "turn": 0,
+     "model_wall_ms": 6200.128458003746,
+     "prompt_tokens": 648,
+     "completion_tokens": 174,
+     "n_calls": 4,
+     "early": [
+      [
+       "exchange_rate",
+       "hit"
+      ],
+      [
+       "exchange_rate",
+       "hit"
+      ],
+      [
+       "exchange_rate",
+       "hit"
+      ],
+      [
+       "exchange_rate",
+       "hit"
+      ]
+     ],
+     "finish": "tool_calls",
+     "tool_wait_ms": 0.10549701983109117,
+     "waves": 1,
+     "tools": [
+      {
+       "name": "exchange_rate",
+       "args": {
+        "base": "EUR",
+        "quote": "USD"
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 146.71371001168154,
+       "deps": []
+      },
+      {
+       "name": "exchange_rate",
+       "args": {
+        "base": "EUR",
+        "quote": "JPY"
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 121.21956300688908,
+       "deps": []
+      },
+      {
+       "name": "exchange_rate",
+       "args": {
+        "base": "EUR",
+        "quote": "GBP"
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 91.81882499251515,
+       "deps": []
+      },
+      {
+       "name": "exchange_rate",
+       "args": {
+        "base": "EUR",
+        "quote": "CHF"
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 99.06998599763028,
+       "deps": []
+      }
+     ]
+    },
+    {
+     "turn": 1,
+     "model_wall_ms": 9109.838581003714,
+     "prompt_tokens": 978,
+     "completion_tokens": 57,
+     "n_calls": 0,
+     "early": [],
+     "finish": "stop"
+    }
+   ]
+  },
+  {
+   "task": "s02",
+   "arm": "react",
+   "prompt": "Give today's ECB rate from EUR to USD, JPY, GBP and CHF.",
+   "final": "Today's ECB reference rates (2026-08-19):\n\n- EUR/USD: 1.1605\n- EUR/JPY: 184.62\n- EUR/GBP: 0.85608\n- EUR/CHF: 0.9402",
+   "correct": true,
+   "wall_ms": 20711.145517998375,
+   "turns": 6,
+   "model_ms": 20710.506681003608,
+   "tool_wait_ms": 0.3125560178887099,
+   "calls": 4,
+   "early_hits": 4,
+   "waves": 4,
+   "max_parallel": 1,
+   "dep_calls": 0,
+   "errors": 0,
+   "turn_log": [
+    {
+     "turn": 0,
+     "model_wall_ms": 2473.6549759982154,
+     "prompt_tokens": 628,
+     "completion_tokens": 42,
+     "n_calls": 0,
+     "early": [],
+     "finish": "stop",
+     "nudged": true
+    },
+    {
+     "turn": 1,
+     "model_wall_ms": 5110.993534995941,
+     "prompt_tokens": 712,
+     "completion_tokens": 33,
+     "n_calls": 1,
+     "early": [
+      [
+       "exchange_rate",
+       "hit"
+      ]
+     ],
+     "finish": "tool_calls",
+     "tool_wait_ms": 0.07724401075392962,
+     "waves": 1,
+     "tools": [
+      {
+       "name": "exchange_rate",
+       "args": {
+        "base": "EUR",
+        "quote": "USD"
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 106.79515398805961,
+       "deps": []
+      }
+     ]
+    },
+    {
+     "turn": 2,
+     "model_wall_ms": 3109.7467670042533,
+     "prompt_tokens": 786,
+     "completion_tokens": 34,
+     "n_calls": 1,
+     "early": [
+      [
+       "exchange_rate",
+       "hit"
+      ]
+     ],
+     "finish": "tool_calls",
+     "tool_wait_ms": 0.08004001574590802,
+     "waves": 1,
+     "tools": [
+      {
+       "name": "exchange_rate",
+       "args": {
+        "base": "EUR",
+        "quote": "JPY"
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 105.7148189865984,
+       "deps": []
+      }
+     ]
+    },
+    {
+     "turn": 3,
+     "model_wall_ms": 3161.816945997998,
+     "prompt_tokens": 862,
+     "completion_tokens": 34,
+     "n_calls": 1,
+     "early": [
+      [
+       "exchange_rate",
+       "hit"
+      ]
+     ],
+     "finish": "tool_calls",
+     "tool_wait_ms": 0.07756598643027246,
+     "waves": 1,
+     "tools": [
+      {
+       "name": "exchange_rate",
+       "args": {
+        "base": "EUR",
+        "quote": "GBP"
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 118.68807600694709,
+       "deps": []
+      }
+     ]
+    },
+    {
+     "turn": 4,
+     "model_wall_ms": 3303.1189760076813,
+     "prompt_tokens": 939,
+     "completion_tokens": 34,
+     "n_calls": 1,
+     "early": [
+      [
+       "exchange_rate",
+       "hit"
+      ]
+     ],
+     "finish": "tool_calls",
+     "tool_wait_ms": 0.0777060049585998,
+     "waves": 1,
+     "tools": [
+      {
+       "name": "exchange_rate",
+       "args": {
+        "base": "EUR",
+        "quote": "CHF"
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 94.63021199917421,
+       "deps": []
+      }
+     ]
+    },
+    {
+     "turn": 5,
+     "model_wall_ms": 3551.175480999518,
+     "prompt_tokens": 1015,
+     "completion_tokens": 59,
+     "n_calls": 0,
+     "early": [],
+     "finish": "stop"
+    }
+   ]
+  },
+  {
+   "task": "s03",
+   "arm": "dag",
+   "prompt": "For Peru (PE) and Kenya (KE): latest population and the current temperature in the capital (use the capital coordinates from the country tool).",
+   "final": "Here are the facts:\n\n- **Peru (PE)**: Latest population = 34,576,665 (2025). Capital: Lima. Current temperature in Lima: **20.6\u00b0C**, wind 12.3 km/h, humidity 63%.\n- **Kenya (KE)**: Latest population = 57,532,493 (2025). Capital: Nairobi. Current temperature in Nairobi: **19.4\u00b0C**, wind 10.3 km/h, humidity 66%.",
+   "correct": true,
+   "wall_ms": 41740.33516799682,
+   "turns": 3,
+   "model_ms": 41739.9368310289,
+   "tool_wait_ms": 0.21066502085886896,
+   "calls": 4,
+   "early_hits": 4,
+   "waves": 2,
+   "max_parallel": 2,
+   "dep_calls": 0,
+   "errors": 0,
+   "turn_log": [
+    {
+     "turn": 0,
+     "model_wall_ms": 4029.1229840076994,
+     "prompt_tokens": 779,
+     "completion_tokens": 84,
+     "n_calls": 2,
+     "early": [
+      [
+       "country_info",
+       "hit"
+      ],
+      [
+       "country_info",
+       "hit"
+      ]
+     ],
+     "finish": "tool_calls",
+     "tool_wait_ms": 0.09278400102630258,
+     "waves": 1,
+     "tools": [
+      {
+       "name": "country_info",
+       "args": {
+        "country_code": "PE"
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 174.40542500116862,
+       "deps": []
+      },
+      {
+       "name": "country_info",
+       "args": {
+        "country_code": "KE"
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 147.82701901276596,
+       "deps": []
+      }
+     ]
+    },
+    {
+     "turn": 1,
+     "model_wall_ms": 12448.150962009095,
+     "prompt_tokens": 1029,
+     "completion_tokens": 112,
+     "n_calls": 2,
+     "early": [
+      [
+       "get_weather",
+       "hit"
+      ],
+      [
+       "get_weather",
+       "hit"
+      ]
+     ],
+     "finish": "tool_calls",
+     "tool_wait_ms": 0.11788101983256638,
+     "waves": 1,
+     "tools": [
+      {
+       "name": "get_weather",
+       "args": {
+        "latitude": -12.0931,
+        "longitude": -77.0465
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 135.51722301053815,
+       "deps": []
+      },
+      {
+       "name": "get_weather",
+       "args": {
+        "latitude": -1.27975,
+        "longitude": 36.8126
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 134.3319920124486,
+       "deps": []
+      }
+     ]
+    },
+    {
+     "turn": 2,
+     "model_wall_ms": 25262.662885012105,
+     "prompt_tokens": 1328,
+     "completion_tokens": 104,
+     "n_calls": 0,
+     "early": [],
+     "finish": "stop"
+    }
+   ]
+  },
+  {
+   "task": "s03",
+   "arm": "parallel",
+   "prompt": "For Peru (PE) and Kenya (KE): latest population and the current temperature in the capital (use the capital coordinates from the country tool).",
+   "final": "Here are the facts:\n\n- **Peru (PE)**: latest population ~34.6 million (2025), capital Lima. Current temperature in Lima: **20.6 \u00b0C** (humidity 63%, wind 12.3 km/h).\n- **Kenya (KE)**: latest population ~57.5 million (2025), capital Nairobi. Current temperature in Nairobi: **19.4 \u00b0C** (humidity 66%, wind 10.3 km/h).",
+   "correct": true,
+   "wall_ms": 42618.159953999566,
+   "turns": 3,
+   "model_ms": 42617.77362902649,
+   "tool_wait_ms": 0.1919599890243262,
+   "calls": 4,
+   "early_hits": 4,
+   "waves": 2,
+   "max_parallel": 2,
+   "dep_calls": 0,
+   "errors": 0,
+   "turn_log": [
+    {
+     "turn": 0,
+     "model_wall_ms": 6240.457170002628,
+     "prompt_tokens": 661,
+     "completion_tokens": 53,
+     "n_calls": 2,
+     "early": [
+      [
+       "country_info",
+       "hit"
+      ],
+      [
+       "country_info",
+       "hit"
+      ]
+     ],
+     "finish": "tool_calls",
+     "tool_wait_ms": 0.0897579884622246,
+     "waves": 1,
+     "tools": [
+      {
+       "name": "country_info",
+       "args": {
+        "country_code": "PE"
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 5164.004570018733,
+       "deps": []
+      },
+      {
+       "name": "country_info",
+       "args": {
+        "country_code": "KE"
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 4522.460197011242,
+       "deps": []
+      }
+     ]
+    },
+    {
+     "turn": 1,
+     "model_wall_ms": 12545.376653026324,
+     "prompt_tokens": 880,
+     "completion_tokens": 105,
+     "n_calls": 2,
+     "early": [
+      [
+       "get_weather",
+       "hit"
+      ],
+      [
+       "get_weather",
+       "hit"
+      ]
+     ],
+     "finish": "tool_calls",
+     "tool_wait_ms": 0.1022020005621016,
+     "waves": 1,
+     "tools": [
+      {
+       "name": "get_weather",
+       "args": {
+        "latitude": -12.0931,
+        "longitude": -77.0465
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 147.9178789886646,
+       "deps": []
+      },
+      {
+       "name": "get_weather",
+       "args": {
+        "latitude": -1.27975,
+        "longitude": 36.8126
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 146.11748501192778,
+       "deps": []
+      }
+     ]
+    },
+    {
+     "turn": 2,
+     "model_wall_ms": 23831.939805997536,
+     "prompt_tokens": 1172,
+     "completion_tokens": 102,
+     "n_calls": 0,
+     "early": [],
+     "finish": "stop"
+    }
+   ]
+  },
+  {
+   "task": "s03",
+   "arm": "react",
+   "prompt": "For Peru (PE) and Kenya (KE): latest population and the current temperature in the capital (use the capital coordinates from the country tool).",
+   "final": "**Final answer:**\n\n- **Peru (PE)**: latest population **34,576,665** (2025); capital Lima \u2014 current temperature **20.6 \u00b0C**.\n- **Kenya (KE)**: latest population **57,532,493** (2025); capital Nairobi \u2014 current temperature **19.4 \u00b0C**.",
+   "correct": true,
+   "wall_ms": 53266.92037898465,
+   "turns": 6,
+   "model_ms": 53266.274048015475,
+   "tool_wait_ms": 0.3394070081412792,
+   "calls": 4,
+   "early_hits": 4,
+   "waves": 4,
+   "max_parallel": 1,
+   "dep_calls": 0,
+   "errors": 0,
+   "turn_log": [
+    {
+     "turn": 0,
+     "model_wall_ms": 3271.5004039928317,
+     "prompt_tokens": 641,
+     "completion_tokens": 27,
+     "n_calls": 1,
+     "early": [
+      [
+       "country_info",
+       "hit"
+      ]
+     ],
+     "finish": "tool_calls",
+     "tool_wait_ms": 0.07595200440846384,
+     "waves": 1,
+     "tools": [
+      {
+       "name": "country_info",
+       "args": {
+        "country_code": "PE"
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 174.80643099406734,
+       "deps": []
+      }
+     ]
+    },
+    {
+     "turn": 1,
+     "model_wall_ms": 5085.682861012174,
+     "prompt_tokens": 754,
+     "completion_tokens": 27,
+     "n_calls": 1,
+     "early": [
+      [
+       "country_info",
+       "hit"
+      ]
+     ],
+     "finish": "tool_calls",
+     "tool_wait_ms": 0.07772599929012358,
+     "waves": 1,
+     "tools": [
+      {
+       "name": "country_info",
+       "args": {
+        "country_code": "KE"
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 132.9498209815938,
+       "deps": []
+      }
+     ]
+    },
+    {
+     "turn": 2,
+     "model_wall_ms": 5165.933378011687,
+     "prompt_tokens": 865,
+     "completion_tokens": 39,
+     "n_calls": 1,
+     "early": [
+      [
+       "get_weather",
+       "hit"
+      ]
+     ],
+     "finish": "tool_calls",
+     "tool_wait_ms": 0.08104200242087245,
+     "waves": 1,
+     "tools": [
+      {
+       "name": "get_weather",
+       "args": {
+        "latitude": -12.0931,
+        "longitude": -77.0465
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 133.28985701082274,
+       "deps": []
+      }
+     ]
+    },
+    {
+     "turn": 3,
+     "model_wall_ms": 11812.486623006407,
+     "prompt_tokens": 1000,
+     "completion_tokens": 53,
+     "n_calls": 0,
+     "early": [
+      [
+       "",
+       "skipped"
+      ]
+     ],
+     "finish": "stop",
+     "nudged": true
+    },
+    {
+     "turn": 4,
+     "model_wall_ms": 13081.007144006435,
+     "prompt_tokens": 1043,
+     "completion_tokens": 39,
+     "n_calls": 1,
+     "early": [
+      [
+       "get_weather",
+       "hit"
+      ]
+     ],
+     "finish": "tool_calls",
+     "tool_wait_ms": 0.10468700202181935,
+     "waves": 1,
+     "tools": [
+      {
+       "name": "get_weather",
+       "args": {
+        "latitude": -1.27975,
+        "longitude": 36.8126
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 130.51305001135916,
+       "deps": []
+      }
+     ]
+    },
+    {
+     "turn": 5,
+     "model_wall_ms": 14849.663637985941,
+     "prompt_tokens": 1177,
+     "completion_tokens": 72,
+     "n_calls": 0,
+     "early": [],
+     "finish": "stop"
+    }
+   ]
+  },
+  {
+   "task": "s04",
+   "arm": "dag",
+   "prompt": "Give a one-sentence Wikipedia summary of the Colosseum and of Machu Picchu, and the current wind speed in Rome and in Cusco.",
+   "final": "I already have all the values. Here is the final answer:\n\n- **Colosseum**: The Colosseum is an elliptical amphitheatre in the centre of Rome, Italy, the largest ancient amphitheatre ever built, with construction begun under Vespasian in 7\ufffd\ufffd\ufffd2 and completed in AD 8\ufffd\ufffd\ufffd0 under Titus.\n- **Machu Picchu**: Machu Picchu is a 1\ufffd\ufffd\ufffd5th-century Inca citadel in southern Peru, located on a mountain ridge at 2,4\ufffd\ufffd\ufffd3\ufffd\ufffd\ufffd0 meters, about 8\ufffd\ufffd\ufffd0 kilometers northwest of Cusco.\n- **Current wind speed in Rome**: 1\ufffd\ufffd\ufffd3.9 km/h.\n- **Current wind speed in Cusco**: 0.6 km/h.",
+   "correct": true,
+   "wall_ms": 113166.43613099586,
+   "turns": 5,
+   "model_ms": 113031.09780402156,
+   "tool_wait_ms": 134.90319199627265,
+   "calls": 8,
+   "early_hits": 6,
+   "waves": 4,
+   "max_parallel": 4,
+   "dep_calls": 1,
+   "errors": 1,
+   "turn_log": [
+    {
+     "turn": 0,
+     "model_wall_ms": 26114.305026014335,
+     "prompt_tokens": 782,
+     "completion_tokens": 405,
+     "n_calls": 6,
+     "early": [
+      [
+       "geocode_city",
+       "hit"
+      ],
+      [
+       "geocode_city",
+       "hit"
+      ],
+      [
+       "wikipedia_summary",
+       "hit"
+      ],
+      [
+       "wikipedia_summary",
+       "hit"
+      ],
+      [
+       "get_weather",
+       "hit"
+      ],
+      [
+       "get_weather",
+       "hit"
+      ]
+     ],
+     "finish": "tool_calls",
+     "tool_wait_ms": 134.7315909806639,
+     "waves": 2,
+     "tools": [
+      {
+       "name": "geocode_city",
+       "args": {
+        "city": "Rome, Italy"
+       },
+       "source": "early_dispatch_hit",
+       "ok": false,
+       "elapsed_ms": 12061.798856011592,
+       "deps": []
+      },
+      {
+       "name": "geocode_city",
+       "args": {
+        "city": "Cusco"
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 246.1121389933396,
+       "deps": []
+      },
+      {
+       "name": "wikipedia_summary",
+       "args": {
+        "title": "Colosseum"
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 81.69468102278188,
+       "deps": []
+      },
+      {
+       "name": "wikipedia_summary",
+       "args": {
+        "title": "Machu Picchu"
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 69.08390601165593,
+       "deps": []
+      },
+      {
+       "name": "get_weather",
+       "args": {
+        "latitude": "$1.latitude",
+        "longitude": "$1.longitude"
+       },
+       "source": "dep_error",
+       "ok": false,
+       "elapsed_ms": 0.0,
+       "deps": [
+        1,
+        1
+       ]
+      },
+      {
+       "name": "get_weather",
+       "args": {
+        "latitude": -13.5171,
+        "longitude": -71.9785
+       },
+       "source": "client_exec",
+       "ok": true,
+       "elapsed_ms": 133.4968979936093,
+       "deps": [
+        2,
+        2
+       ]
+      }
+     ]
+    },
+    {
+     "turn": 1,
+     "model_wall_ms": 43085.90617001755,
+     "prompt_tokens": 1671,
+     "completion_tokens": 77,
+     "n_calls": 1,
+     "early": [
+      [
+       "geocode_city",
+       "hit"
+      ]
+     ],
+     "finish": "tool_calls",
+     "tool_wait_ms": 0.08285499643534422,
+     "waves": 1,
+     "tools": [
+      {
+       "name": "geocode_city",
+       "args": {
+        "city": "Rome, Italy"
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 60.64393601263873,
+       "deps": []
+      }
+     ]
+    },
+    {
+     "turn": 2,
+     "model_wall_ms": 4994.846866000444,
+     "prompt_tokens": 1801,
+     "completion_tokens": 54,
+     "n_calls": 1,
+     "early": [
+      [
+       "get_weather",
+       "hit"
+      ]
+     ],
+     "finish": "tool_calls",
+     "tool_wait_ms": 0.08874601917341352,
+     "waves": 1,
+     "tools": [
+      {
+       "name": "get_weather",
+       "args": {
+        "latitude": 41.8933,
+        "longitude": 12.4829
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 139.90156500949524,
+       "deps": []
+      }
+     ]
+    },
+    {
+     "turn": 3,
+     "model_wall_ms": 14792.466377984965,
+     "prompt_tokens": 1949,
+     "completion_tokens": 144,
+     "n_calls": 0,
+     "early": [],
+     "finish": "stop",
+     "nudged": true
+    },
+    {
+     "turn": 4,
+     "model_wall_ms": 24043.57336400426,
+     "prompt_tokens": 2142,
+     "completion_tokens": 165,
+     "n_calls": 0,
+     "early": [],
+     "finish": "stop"
+    }
+   ]
+  },
+  {
+   "task": "s04",
+   "arm": "parallel",
+   "prompt": "Give a one-sentence Wikipedia summary of the Colosseum and of Machu Picchu, and the current wind speed in Rome and in Cusco.",
+   "final": "I have all the data. Here is the final answer:\n\n- **Colosseum**: The Colosseum is an elliptical amphitheatre in the centre of Rome, Italy, the largest ancient amphitheatre ever built, constructed under the Flavian dynasty.\n- **Machu Picchu**: Machu Picchu is a 15th-century Inca citadel in southern Peru, located on a mountain ridge at 2,430 meters, northwest of Cusco.\n- **Current wind speed in Rome**: 13.9 km/h.\n- **Current wind speed in Cusco**: 0.6 km/h.",
+   "correct": true,
+   "wall_ms": 72677.72351999884,
+   "turns": 3,
+   "model_ms": 72677.24154799362,
+   "tool_wait_ms": 0.23422000231221318,
+   "calls": 6,
+   "early_hits": 6,
+   "waves": 2,
+   "max_parallel": 4,
+   "dep_calls": 0,
+   "errors": 0,
+   "turn_log": [
+    {
+     "turn": 0,
+     "model_wall_ms": 7485.359696001979,
+     "prompt_tokens": 664,
+     "completion_tokens": 188,
+     "n_calls": 4,
+     "early": [
+      [
+       "wikipedia_summary",
+       "hit"
+      ],
+      [
+       "wikipedia_summary",
+       "hit"
+      ],
+      [
+       "geocode_city",
+       "hit"
+      ],
+      [
+       "geocode_city",
+       "hit"
+      ]
+     ],
+     "finish": "tool_calls",
+     "tool_wait_ms": 0.11745101073756814,
+     "waves": 1,
+     "tools": [
+      {
+       "name": "wikipedia_summary",
+       "args": {
+        "title": "Colosseum"
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 81.97758501046337,
+       "deps": []
+      },
+      {
+       "name": "wikipedia_summary",
+       "args": {
+        "title": "Machu Picchu"
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 68.74155899276957,
+       "deps": []
+      },
+      {
+       "name": "geocode_city",
+       "args": {
+        "city": "Rome, Italy"
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 349.6462359908037,
+       "deps": []
+      },
+      {
+       "name": "geocode_city",
+       "args": {
+        "city": "Cusco, Peru"
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 269.2330519785173,
+       "deps": []
+      }
+     ]
+    },
+    {
+     "turn": 1,
+     "model_wall_ms": 29763.04830299341,
+     "prompt_tokens": 1263,
+     "completion_tokens": 108,
+     "n_calls": 2,
+     "early": [
+      [
+       "get_weather",
+       "hit"
+      ],
+      [
+       "get_weather",
+       "hit"
+      ]
+     ],
+     "finish": "tool_calls",
+     "tool_wait_ms": 0.11676899157464504,
+     "waves": 1,
+     "tools": [
+      {
+       "name": "get_weather",
+       "args": {
+        "latitude": 41.8933,
+        "longitude": 12.4829
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 131.9612179941032,
+       "deps": []
+      },
+      {
+       "name": "get_weather",
+       "args": {
+        "latitude": -13.5171,
+        "longitude": -71.9785
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 143.22944500599988,
+       "deps": []
+      }
+     ]
+    },
+    {
+     "turn": 2,
+     "model_wall_ms": 35428.83354899823,
+     "prompt_tokens": 1556,
+     "completion_tokens": 127,
+     "n_calls": 0,
+     "early": [],
+     "finish": "stop"
+    }
+   ]
+  },
+  {
+   "task": "s04",
+   "arm": "react",
+   "prompt": "Give a one-sentence Wikipedia summary of the Colosseum and of Machu Picchu, and the current wind speed in Rome and in Cusco.",
+   "final": "\n\n",
+   "correct": false,
+   "wall_ms": 93528.74868601793,
+   "turns": 10,
+   "model_ms": 93527.81790104927,
+   "tool_wait_ms": 0.39724301313981414,
+   "calls": 5,
+   "early_hits": 5,
+   "waves": 5,
+   "max_parallel": 1,
+   "dep_calls": 0,
+   "errors": 0,
+   "turn_log": [
+    {
+     "turn": 0,
+     "model_wall_ms": 10989.259896014119,
+     "prompt_tokens": 644,
+     "completion_tokens": 181,
+     "n_calls": 1,
+     "early": [
+      [
+       "wikipedia_summary",
+       "hit"
+      ]
+     ],
+     "finish": "tool_calls",
+     "tool_wait_ms": 0.07663300493732095,
+     "waves": 1,
+     "tools": [
+      {
+       "name": "wikipedia_summary",
+       "args": {
+        "title": "Colosseum"
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 76.52852998580784,
+       "deps": []
+      }
+     ]
+    },
+    {
+     "turn": 1,
+     "model_wall_ms": 18521.31282101618,
+     "prompt_tokens": 997,
+     "completion_tokens": 55,
+     "n_calls": 1,
+     "early": [
+      [
+       "wikipedia_summary",
+       "hit"
+      ]
+     ],
+     "finish": "tool_calls",
+     "tool_wait_ms": 0.08363701635971665,
+     "waves": 1,
+     "tools": [
+      {
+       "name": "wikipedia_summary",
+       "args": {
+        "title": "Machu Picchu"
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 69.98663899139501,
+       "deps": []
+      }
+     ]
+    },
+    {
+     "turn": 2,
+     "model_wall_ms": 8941.274813987548,
+     "prompt_tokens": 1181,
+     "completion_tokens": 68,
+     "n_calls": 1,
+     "early": [
+      [
+       "geocode_city",
+       "hit"
+      ]
+     ],
+     "finish": "tool_calls",
+     "tool_wait_ms": 0.08028000593185425,
+     "waves": 1,
+     "tools": [
+      {
+       "name": "geocode_city",
+       "args": {
+        "city": "Rome, Italy"
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 71.62075099768117,
+       "deps": []
+      }
+     ]
+    },
+    {
+     "turn": 3,
+     "model_wall_ms": 4422.434547013836,
+     "prompt_tokens": 1302,
+     "completion_tokens": 48,
+     "n_calls": 1,
+     "early": [
+      [
+       "get_weather",
+       "hit"
+      ]
+     ],
+     "finish": "tool_calls",
+     "tool_wait_ms": 0.07923800149001181,
+     "waves": 1,
+     "tools": [
+      {
+       "name": "get_weather",
+       "args": {
+        "latitude": 41.8933,
+        "longitude": 12.4829
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 161.22347000055015,
+       "deps": []
+      }
+     ]
+    },
+    {
+     "turn": 4,
+     "model_wall_ms": 10752.883092005504,
+     "prompt_tokens": 1444,
+     "completion_tokens": 48,
+     "n_calls": 1,
+     "early": [
+      [
+       "geocode_city",
+       "hit"
+      ]
+     ],
+     "finish": "tool_calls",
+     "tool_wait_ms": 0.07745498442091048,
+     "waves": 1,
+     "tools": [
+      {
+       "name": "geocode_city",
+       "args": {
+        "city": "Cusco"
+       },
+       "source": "early_dispatch_hit",
+       "ok": true,
+       "elapsed_ms": 61.827508005080745,
+       "deps": []
+      }
+     ]
+    },
+    {
+     "turn": 5,
+     "model_wall_ms": 5735.243677016115,
+     "prompt_tokens": 1559,
+     "completion_tokens": 64,
+     "n_calls": 0,
+     "early": [
+      [
+       "",
+       "skipped"
+      ]
+     ],
+     "finish": "stop",
+     "nudged": true
+    },
+    {
+     "turn": 6,
+     "model_wall_ms": 7853.041015012423,
+     "prompt_tokens": 1613,
+     "completion_tokens": 64,
+     "n_calls": 0,
+     "early": [
+      [
+       "",
+       "skipped"
+      ]
+     ],
+     "finish": "stop",
+     "nudged": true
+    },
+    {
+     "turn": 7,
+     "model_wall_ms": 9759.342893987196,
+     "prompt_tokens": 1667,
+     "completion_tokens": 54,
+     "n_calls": 0,
+     "early": [
+      [
+       "",
+       "skipped"
+      ]
+     ],
+     "finish": "stop",
+     "nudged": true
+    },
+    {
+     "turn": 8,
+     "model_wall_ms": 8276.063522003824,
+     "prompt_tokens": 1711,
+     "completion_tokens": 54,
+     "n_calls": 0,
+     "early": [
+      [
+       "",
+       "skipped"
+      ]
+     ],
+     "finish": "stop",
+     "nudged": true
+    },
+    {
+     "turn": 9,
+     "model_wall_ms": 8276.96162299253,
+     "prompt_tokens": 1755,
+     "completion_tokens": 54,
+     "n_calls": 0,
+     "early": [
+      [
+       "",
+       "skipped"
+      ]
+     ],
+     "finish": "stop"
+    }
+   ]
+  }
+ ]
+}

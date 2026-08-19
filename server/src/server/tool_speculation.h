@@ -139,9 +139,15 @@ struct ToolSpeculationConfig {
     std::vector<int> cpu_affinity;
     std::vector<int> model_cpu_affinity;
     bool cpu_affinity_isolated = false;
+    // An executor plus an allowlist enables the lane. A measured resource
+    // profile is only required for speculative (confidence < 1) launches;
+    // authoritative calls dispatched from the model's own stream are admitted
+    // without one.
     bool enabled() const {
-        return !executor_path.empty() && !allowed_tools.empty() &&
-               !policy.empty();
+        return !executor_path.empty() && !allowed_tools.empty();
+    }
+    bool predictive_enabled() const {
+        return enabled() && !policy.empty();
     }
     const char * execution_mode() const {
         return executor_path.empty()
@@ -222,6 +228,19 @@ private:
     int child_pid_ = -1;
 #endif
 };
+
+// Locate closed tool-call blocks in streamed text. Supports the
+// `<function_call>…</function_call>`, `<tool_call>…</tool_call>` and
+// `<function=NAME>…</function>` wrappers. Each result is the [begin, end)
+// byte range of one complete outermost block at or after `from`; nested
+// wrappers are reported once. Blocks whose closer has not streamed yet are
+// not reported, so a caller can dispatch as soon as a block is complete.
+struct ClosedToolCallBlock {
+    size_t begin = 0;
+    size_t end = 0;
+};
+std::vector<ClosedToolCallBlock> find_closed_tool_call_blocks(
+    const std::string & text, size_t from);
 
 // Custom SSE extension emitted only for requests that supplied
 // `tool_speculation`. Non-streaming responses use the same object under the

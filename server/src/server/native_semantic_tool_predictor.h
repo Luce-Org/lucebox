@@ -27,7 +27,10 @@ public:
                                    const json & request_tools,
                                    std::string * generated_text = nullptr);
 
-    bool active() const { return ipc_.active(); }
+    // A failed lane (timeout, transport error) is relaunched lazily, at most
+    // once per cooldown, so one slow prediction does not disable the feature
+    // for the server lifetime.
+    bool active() const { return ipc_.active() || ipc_.try_restart(); }
 
 private:
     explicit NativeSemanticToolPredictor(
@@ -35,7 +38,7 @@ private:
 
     SemanticToolPredictorConfig config_;
     Tokenizer tokenizer_;
-    Qwen3ToolPredictorIpcClient ipc_;
+    mutable Qwen3ToolPredictorIpcClient ipc_;
 };
 
 }  // namespace dflash::common
