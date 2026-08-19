@@ -1813,7 +1813,8 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         DeepSeek4StepTelemetry step_tel;
         if (timing) step_tel.embed_us = elapsed_us(embed_t0, Clock::now());
 
-        const bool need_logits = (i + n_tok >= n_total);
+        const bool at_snap_boundary = save_snapshot && !snapshot_saved && (pos + n_tok >= snap_pos);
+        const bool need_logits = (i + n_tok >= n_total) || at_snap_boundary;
         std::vector<float> logits;
         bool ok = false;
         std::vector<float> hc_state;

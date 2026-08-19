@@ -6124,7 +6124,7 @@ static int ds4_try_layer_major_prefill(
         const float * embed,
         int n_tokens,
         int kv_start,
-        std::vector<float> & out_logits,
+        std::vector<float> * out_logits,
         const int32_t * token_ids,
         Ds4VerifyHooks * verify_hooks,
         DeepSeek4StepTelemetry * telemetry) {
@@ -6403,10 +6403,10 @@ static int ds4_try_layer_major_prefill(
                     compute_t0, Ds4TimingClock::now());
             }
             capture_layer(il, (il & 1) == 0 ? state_b : state_a);
-            if (layer.logits) {
-                out_logits.resize((size_t) w.n_vocab);
+            if (layer.logits && out_logits) {
+                out_logits->resize((size_t) w.n_vocab);
                 ggml_backend_tensor_get(
-                    layer.logits, out_logits.data(), 0,
+                    layer.logits, out_logits->data(), 0,
                     sizeof(float) * (size_t) w.n_vocab);
             }
 
@@ -6421,7 +6421,7 @@ static int ds4_try_layer_major_prefill(
             }
         }
         cache.cur_pos = next_pos;
-        return out_logits.empty() ? -1 : 1;
+        return (out_logits && out_logits->empty()) ? -1 : 1;
     }
 
     ggml_tensor * state_in = state_a;
@@ -6540,7 +6540,7 @@ static int ds4_try_layer_major_prefill(
         ggml_build_forward_expand(gf, state_copy);
 
         ggml_tensor * logits = nullptr;
-        if (il + 1 == w.n_layer) {
+        if (out_logits && il + 1 == w.n_layer) {
             ggml_tensor * last_hc = ggml_view_2d(
                 ctx, hc_next, hc_dim, 1, hc_next->nb[1],
                 (size_t) (n_tokens - 1) * hc_next->nb[1]);
@@ -6631,9 +6631,9 @@ static int ds4_try_layer_major_prefill(
 
         capture_layer(il, state_out);
 
-        if (logits) {
-            out_logits.resize((size_t) w.n_vocab);
-            ggml_backend_tensor_get(logits, out_logits.data(), 0,
+        if (logits && out_logits) {
+            out_logits->resize((size_t) w.n_vocab);
+            ggml_backend_tensor_get(logits, out_logits->data(), 0,
                                     sizeof(float) * (size_t) w.n_vocab);
         }
 
@@ -6665,7 +6665,7 @@ static int ds4_try_layer_major_prefill(
         ggml_free(state_ctx);
     }
     cache.cur_pos = next_pos;
-    return out_logits.empty() ? -1 : 1;
+    return (out_logits && out_logits->empty()) ? -1 : 1;
 }
 
 static bool ds4_hc_layer_weights_ready(const HcWeightsCpu & weights,
@@ -6811,7 +6811,7 @@ bool deepseek4_step_layer_range(
         !fused_verify_candidate && moe_hybrid &&
         cache.prefill_mode == PrefillAttentionMode::Sparse &&
         n_tokens > 4 && n_tokens <= DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS &&
-        layer_begin == 0 && is_last_shard && out_logits &&
+        layer_begin == 0 && is_last_shard &&
         ds4_backend_is_gpu(backend);
     const bool layer_major_hooks_supported =
         !verify_hooks ||
@@ -6824,7 +6824,7 @@ bool deepseek4_step_layer_range(
     const bool standard_layer_major_prefill =
         !w.moe_hybrid && cache.prefill_mode != PrefillAttentionMode::Exact &&
         n_tokens > 4 && n_tokens <= DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS &&
-        layer_begin == 0 && is_last_shard && out_logits &&
+        layer_begin == 0 && is_last_shard &&
         ds4_backend_is_gpu(backend) && layer_major_hooks_supported;
     // These graphs are rebuilt around an owner join on every layer, so tensor
     // metadata addresses can be recycled for different topologies.  Until
@@ -7018,7 +7018,7 @@ bool deepseek4_step_layer_range(
             fused_decode_graph_cache, backend, w, cache,
             hc_layer_weights_range, hc_output_weights_range,
             hash_routing_tables_range, scratch.hash_expert_ids, embed,
-            n_tokens, kv_start, *out_logits, token_ids, verify_hooks,
+            n_tokens, kv_start, out_logits, token_ids, verify_hooks,
             telemetry);
         if (prc < 0) return false;
         if (prc > 0) {
