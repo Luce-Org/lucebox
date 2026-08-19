@@ -7168,7 +7168,7 @@ bool deepseek4_step_layer_range(
         use_backend_decode_hc && !use_backend_decode_hc_direct;
     const bool use_backend_prefill_hc =
         heterogeneous_sparse_prefill &&
-        ds4_env_flag("DFLASH_DS4_HYBRID_PREFILL_GPU_HC");
+        !ds4_env_flag("DFLASH_DS4_DISABLE_HYBRID_PREFILL_GPU_HC");
     ggml_tensor * hc_state_backend = nullptr;
     if (use_backend_prefill_hc) {
         if (!ds4_fused_ensure_fn_mirrors(

@@ -9,27 +9,69 @@
 
 #if defined(GGML_USE_HIP)
 
-__device__ static float ds4_fa_block_sum(float v) {
-    __shared__ float smem[256];
-    const int tid = threadIdx.x;
-    smem[tid] = v;
-    __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) smem[tid] += smem[tid + stride];
-        __syncthreads();
+__device__ __forceinline__ float ds4_warp_reduce_max(float v) {
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+#if defined(__HIP_PLATFORM_AMD__)
+        v = fmaxf(v, __shfl_xor(v, mask, 32));
+#else
+        v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, mask, 32));
+#endif
     }
+    return v;
+}
+
+__device__ __forceinline__ float ds4_warp_reduce_sum(float v) {
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+#if defined(__HIP_PLATFORM_AMD__)
+        v += __shfl_xor(v, mask, 32);
+#else
+        v += __shfl_xor_sync(0xffffffffu, v, mask, 32);
+#endif
+    }
+    return v;
+}
+
+__device__ static float ds4_fa_block_sum(float v) {
+    v = ds4_warp_reduce_sum(v);
+    __shared__ float smem[8];
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp_id = tid >> 5;
+    if (lane == 0) {
+        smem[warp_id] = v;
+    }
+    __syncthreads();
+    if (warp_id == 0) {
+        float val = (lane < 8) ? smem[lane] : 0.0f;
+        val = ds4_warp_reduce_sum(val);
+        if (lane == 0) {
+            smem[0] = val;
+        }
+    }
+    __syncthreads();
     return smem[0];
 }
 
 __device__ static float ds4_fa_block_max(float v) {
-    __shared__ float smem[256];
+    v = ds4_warp_reduce_max(v);
+    __shared__ float smem[8];
     const int tid = threadIdx.x;
-    smem[tid] = v;
-    __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) smem[tid] = fmaxf(smem[tid], smem[tid + stride]);
-        __syncthreads();
+    const int lane = tid & 31;
+    const int warp_id = tid >> 5;
+    if (lane == 0) {
+        smem[warp_id] = v;
     }
+    __syncthreads();
+    if (warp_id == 0) {
+        float val = (lane < 8) ? smem[lane] : -3.402823466e38f;
+        val = ds4_warp_reduce_max(val);
+        if (lane == 0) {
+            smem[0] = val;
+        }
+    }
+    __syncthreads();
     return smem[0];
 }
 
@@ -642,8 +684,12 @@ __global__ static void ds4_flash_attn_d512_shared_kv_kernel(
             if (mask_v > -1.0e20f) {
                 dot = 0.0f;
 #pragma unroll
-                for (int d = 0; d < D; ++d) {
-                    const float qv = inverse_rope.forward_q_enabled && d >= D - 64
+                for (int d = 0; d < D - 64; ++d) {
+                    dot += qh[d] * kb[d];
+                }
+#pragma unroll
+                for (int d = D - 64; d < D; ++d) {
+                    const float qv = inverse_rope.forward_q_enabled
                         ? q_rope_tail[d - (D - 64)] : qh[d];
                     dot += qv * kb[d];
                 }
@@ -687,8 +733,12 @@ __global__ static void ds4_flash_attn_d512_shared_kv_kernel(
             const KV * kr = k + (size_t) r * D;
             float dot = 0.0f;
 #pragma unroll
-            for (int d = 0; d < D; ++d) {
-                const float qv = inverse_rope.forward_q_enabled && d >= D - 64
+            for (int d = 0; d < D - 64; ++d) {
+                dot += qh[d] * ds4_fa_load<KV, Mask>(kr + d);
+            }
+#pragma unroll
+            for (int d = D - 64; d < D; ++d) {
+                const float qv = inverse_rope.forward_q_enabled
                     ? q_rope_tail[d - (D - 64)] : qh[d];
                 dot += qv * ds4_fa_load<KV, Mask>(kr + d);
             }
@@ -884,14 +934,21 @@ __global__ static void ds4_flash_attn_d512_shared_kv_grouped_kernel(
         if (visible) {
             const KV * kr = k + (size_t) r * D;
 #pragma unroll
-            for (int d = 0; d < D; ++d) {
+            for (int d = 0; d < D - 64; ++d) {
                 const float kv = ds4_fa_load<KV, Mask>(kr + d);
 #pragma unroll
                 for (int j = 0; j < HEADS_PER_BLOCK; ++j) {
-                    const float qv =
-                        inverse_rope.forward_q_enabled && d >= D - 64
-                            ? q_rope_tail[(size_t) j * 64 + d - (D - 64)]
-                            : qh[j][d];
+                    dot[j] += qh[j][d] * kv;
+                }
+            }
+#pragma unroll
+            for (int d = D - 64; d < D; ++d) {
+                const float kv = ds4_fa_load<KV, Mask>(kr + d);
+#pragma unroll
+                for (int j = 0; j < HEADS_PER_BLOCK; ++j) {
+                    const float qv = inverse_rope.forward_q_enabled
+                        ? q_rope_tail[(size_t) j * 64 + d - (D - 64)]
+                        : qh[j][d];
                     dot[j] += qv * kv;
                 }
             }
@@ -906,29 +963,35 @@ __global__ static void ds4_flash_attn_d512_shared_kv_grouped_kernel(
         }
     }
 
-    // Match ds4_fa_block_max independently for every grouped head.
+    // Match ds4_fa_block_max independently for every grouped head via warp shuffles.
+    const int lane = tid & 31;
+    const int warp_id = tid >> 5;
 #pragma unroll
     for (int j = 0; j < HEADS_PER_BLOCK; ++j) {
-        reduction[(size_t) j * N_THREADS + tid] = local_max[j];
+        const float v = ds4_warp_reduce_max(local_max[j]);
+        if (lane == 0) {
+            reduction[(size_t) j * 8 + warp_id] = v;
+        }
     }
     __syncthreads();
-    for (int stride = N_THREADS / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
+    float max_score[HEADS_PER_BLOCK];
+    if (warp_id == 0) {
 #pragma unroll
-            for (int j = 0; j < HEADS_PER_BLOCK; ++j) {
-                float * row = reduction + (size_t) j * N_THREADS;
-                row[tid] = fmaxf(row[tid], row[tid + stride]);
+        for (int j = 0; j < HEADS_PER_BLOCK; ++j) {
+            float v = (lane < 8) ? reduction[(size_t) j * 8 + lane] : -3.402823466e38f;
+            v = ds4_warp_reduce_max(v);
+            if (lane == 0) {
+                reduction[j] = v;
             }
         }
-        __syncthreads();
     }
-
-    float max_score[HEADS_PER_BLOCK];
-    float local_sum[HEADS_PER_BLOCK] = {};
+    __syncthreads();
 #pragma unroll
     for (int j = 0; j < HEADS_PER_BLOCK; ++j) {
-        max_score[j] = reduction[(size_t) j * N_THREADS];
+        max_score[j] = reduction[j];
     }
+    float local_sum[HEADS_PER_BLOCK] = {};
+
     for (int r = tid; r < n_kv; r += blockDim.x) {
 #pragma unroll
         for (int j = 0; j < HEADS_PER_BLOCK; ++j) {
@@ -945,27 +1008,30 @@ __global__ static void ds4_flash_attn_d512_shared_kv_grouped_kernel(
         }
     }
 
-    // Match ds4_fa_block_sum independently for every grouped head.
+    // Match ds4_fa_block_sum independently for every grouped head via warp shuffles.
 #pragma unroll
     for (int j = 0; j < HEADS_PER_BLOCK; ++j) {
-        reduction[(size_t) j * N_THREADS + tid] = local_sum[j];
+        const float v = ds4_warp_reduce_sum(local_sum[j]);
+        if (lane == 0) {
+            reduction[(size_t) j * 8 + warp_id] = v;
+        }
     }
     __syncthreads();
-    for (int stride = N_THREADS / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
+    float inv_denom[HEADS_PER_BLOCK];
+    if (warp_id == 0) {
 #pragma unroll
-            for (int j = 0; j < HEADS_PER_BLOCK; ++j) {
-                float * row = reduction + (size_t) j * N_THREADS;
-                row[tid] += row[tid + stride];
+        for (int j = 0; j < HEADS_PER_BLOCK; ++j) {
+            float v = (lane < 8) ? reduction[(size_t) j * 8 + lane] : 0.0f;
+            v = ds4_warp_reduce_sum(v);
+            if (lane == 0) {
+                reduction[j] = 1.0f / v;
             }
         }
-        __syncthreads();
     }
-
-    float inv_denom[HEADS_PER_BLOCK];
+    __syncthreads();
 #pragma unroll
     for (int j = 0; j < HEADS_PER_BLOCK; ++j) {
-        inv_denom[j] = 1.0f / reduction[(size_t) j * N_THREADS];
+        inv_denom[j] = reduction[j];
     }
 
     // Underflow can make the non-zero envelope differ by head, so retain one
@@ -1079,8 +1145,7 @@ __global__ static void ds4_flash_attn_d512_shared_kv_grouped_kernel(
             const int h = h_begin + j;
             float * out = dst +
                 ((size_t) t * (size_t) n_heads + (size_t) h) * D + D - 64;
-            out[2 * pair + 0] = y0;
-            out[2 * pair + 1] = y1;
+            *reinterpret_cast<float2 *>(out + 2 * pair) = make_float2(y0, y1);
         }
     }
 }
@@ -1251,14 +1316,21 @@ __global__ static void ds4_flash_attn_d512_shared_kv_grouped_compact_kernel(
         if (visible) {
             const KV * kr = k + (size_t) r * D;
 #pragma unroll
-            for (int d = 0; d < D; ++d) {
+            for (int d = 0; d < D - 64; ++d) {
                 const float kv = ds4_fa_load<KV, Mask>(kr + d);
 #pragma unroll
                 for (int j = 0; j < HEADS_PER_BLOCK; ++j) {
-                    const float qv =
-                        inverse_rope.forward_q_enabled && d >= D - 64
-                            ? q_rope_tail[(size_t) j * 64 + d - (D - 64)]
-                            : qh[j][d];
+                    dot[j] += qh[j][d] * kv;
+                }
+            }
+#pragma unroll
+            for (int d = D - 64; d < D; ++d) {
+                const float kv = ds4_fa_load<KV, Mask>(kr + d);
+#pragma unroll
+                for (int j = 0; j < HEADS_PER_BLOCK; ++j) {
+                    const float qv = inverse_rope.forward_q_enabled
+                        ? q_rope_tail[(size_t) j * 64 + d - (D - 64)]
+                        : qh[j][d];
                     dot[j] += qv * kv;
                 }
             }
@@ -1273,28 +1345,35 @@ __global__ static void ds4_flash_attn_d512_shared_kv_grouped_compact_kernel(
         }
     }
 
+    // Match ds4_fa_block_max independently for every grouped head via warp shuffles.
+    const int lane = tid & 31;
+    const int warp_id = tid >> 5;
 #pragma unroll
     for (int j = 0; j < HEADS_PER_BLOCK; ++j) {
-        reduction[(size_t) j * N_THREADS + tid] = local_max[j];
+        const float v = ds4_warp_reduce_max(local_max[j]);
+        if (lane == 0) {
+            reduction[(size_t) j * 8 + warp_id] = v;
+        }
     }
     __syncthreads();
-    for (int stride = N_THREADS / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
+    float max_score[HEADS_PER_BLOCK];
+    if (warp_id == 0) {
 #pragma unroll
-            for (int j = 0; j < HEADS_PER_BLOCK; ++j) {
-                float * row = reduction + (size_t) j * N_THREADS;
-                row[tid] = fmaxf(row[tid], row[tid + stride]);
+        for (int j = 0; j < HEADS_PER_BLOCK; ++j) {
+            float v = (lane < 8) ? reduction[(size_t) j * 8 + lane] : -3.402823466e38f;
+            v = ds4_warp_reduce_max(v);
+            if (lane == 0) {
+                reduction[j] = v;
             }
         }
-        __syncthreads();
     }
-
-    float max_score[HEADS_PER_BLOCK];
-    float local_sum[HEADS_PER_BLOCK] = {};
+    __syncthreads();
 #pragma unroll
     for (int j = 0; j < HEADS_PER_BLOCK; ++j) {
-        max_score[j] = reduction[(size_t) j * N_THREADS];
+        max_score[j] = reduction[j];
     }
+    float local_sum[HEADS_PER_BLOCK] = {};
+
     for (int iteration = 0; iteration < score_iteration_count; ++iteration) {
         int score_index;
         int bound_value;
@@ -1342,26 +1421,30 @@ __global__ static void ds4_flash_attn_d512_shared_kv_grouped_compact_kernel(
         }
     }
 
+    // Match ds4_fa_block_sum independently for every grouped head via warp shuffles.
 #pragma unroll
     for (int j = 0; j < HEADS_PER_BLOCK; ++j) {
-        reduction[(size_t) j * N_THREADS + tid] = local_sum[j];
+        const float v = ds4_warp_reduce_sum(local_sum[j]);
+        if (lane == 0) {
+            reduction[(size_t) j * 8 + warp_id] = v;
+        }
     }
     __syncthreads();
-    for (int stride = N_THREADS / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
+    float inv_denom[HEADS_PER_BLOCK];
+    if (warp_id == 0) {
 #pragma unroll
-            for (int j = 0; j < HEADS_PER_BLOCK; ++j) {
-                float * row = reduction + (size_t) j * N_THREADS;
-                row[tid] += row[tid + stride];
+        for (int j = 0; j < HEADS_PER_BLOCK; ++j) {
+            float v = (lane < 8) ? reduction[(size_t) j * 8 + lane] : 0.0f;
+            v = ds4_warp_reduce_sum(v);
+            if (lane == 0) {
+                reduction[j] = 1.0f / v;
             }
         }
-        __syncthreads();
     }
-
-    float inv_denom[HEADS_PER_BLOCK];
+    __syncthreads();
 #pragma unroll
     for (int j = 0; j < HEADS_PER_BLOCK; ++j) {
-        inv_denom[j] = 1.0f / reduction[(size_t) j * N_THREADS];
+        inv_denom[j] = reduction[j];
     }
 
     // Finish the shared envelope before the value phase reads it.
@@ -1519,11 +1602,11 @@ __global__ static void ds4_flash_attn_d512_shared_kv_grouped_compact_kernel(
                 } else {
                     float * out = dst +
                         ((size_t) t * (size_t) n_heads + (size_t) h) * D + d0;
-                    out[0] = value0;
-                    out[1] = value1;
                     if constexpr (VALUES_PER_THREAD == 4) {
-                        out[2] = acc2[j] * inv_denom[j];
-                        out[3] = acc3[j] * inv_denom[j];
+                        *reinterpret_cast<float4 *>(out) = make_float4(
+                            value0, value1, acc2[j] * inv_denom[j], acc3[j] * inv_denom[j]);
+                    } else {
+                        *reinterpret_cast<float2 *>(out) = make_float2(value0, value1);
                     }
                 }
             }
@@ -1549,8 +1632,7 @@ __global__ static void ds4_flash_attn_d512_shared_kv_grouped_compact_kernel(
             const int h = h_begin + j;
             float * out = dst +
                 ((size_t) t * (size_t) n_heads + (size_t) h) * D + D - 64;
-            out[2 * pair + 0] = y0;
-            out[2 * pair + 1] = y1;
+            *reinterpret_cast<float2 *>(out + 2 * pair) = make_float2(y0, y1);
         }
     }
 }
