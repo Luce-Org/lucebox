@@ -6333,14 +6333,12 @@ TEST_CASE(ServerUnitFixture, test_parse_tool_calls_function_call_wrapping_tool_c
 }
 
 TEST_CASE(ServerUnitFixture, test_sse_emitter_unclosed_tool_in_think_with_tool_close_in_answer) {
-    SseEmitter emitter("chatcmpl_test", "test-model", bash_tools());
-    std::vector<std::string> chunks;
+    auto emitter = make_emitter(ApiFormat::OPENAI, bash_tools());
     std::string text = "<think>unclosed <function_call>read(path=\"a.go\")</think>Answer with </function_call> example";
-    emitter.emit_token(text, 1, chunks);
-    emitter.emit_finish("stop", chunks);
+    auto c1 = emitter.emit_token(text);
+    auto c2 = emitter.emit_finish(0);
 
-    std::string full_sse;
-    for (const auto & c : chunks) full_sse += c;
+    std::string full_sse = concat(c1) + concat(c2);
     TEST_ASSERT(full_sse.find("Answer with </function_call> example") != std::string::npos);
 }
 
