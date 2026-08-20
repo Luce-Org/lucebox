@@ -1101,6 +1101,28 @@ static bool parse_function_sig_args(const std::string & arg_text, json & out_arg
     return true;
 }
 
+// Parse Python-style tool invocation `name(k="v", ...)` or `name()`
+static bool parse_python_call(const std::string & text, const json & tools,
+                              std::string & out_name, json & out_args) {
+    std::string trimmed = trim_ws(text);
+    size_t paren_open = trimmed.find('(');
+    if (paren_open == std::string::npos || trimmed.empty() || trimmed.back() != ')') {
+        return false;
+    }
+    std::string fn_name = trim_ws(trimmed.substr(0, paren_open));
+    if (fn_name.empty() || !tool_allowed(tools, fn_name)) {
+        return false;
+    }
+    std::string arg_text = trimmed.substr(paren_open + 1, trimmed.size() - paren_open - 2);
+    json args;
+    if (!parse_function_sig_args(arg_text, args)) {
+        return false;
+    }
+    out_name = fn_name;
+    out_args = std::move(args);
+    return true;
+}
+
 // ─── Main parser ────────────────────────────────────────────────────────
 
 ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
@@ -1220,24 +1242,45 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
         }
     }
 
-    // Pattern 1: <tool_call>...<function=NAME>...params...</function>...</tool_call>
+    // Pattern 1: <tool_call>...</tool_call> (supports Qwen XML, Python call, JSON, or XML function)
     {
         auto begin = std::sregex_iterator(text.begin(), text.end(), re_tool_call_complete());
         auto end = std::sregex_iterator();
         for (auto it = begin; it != end; ++it) {
+            size_t pos = it->position();
+            if (overlaps(removals, pos)) continue;
             std::string body = (*it)[1].str();
             std::smatch fn_match;
-            if (!std::regex_search(body, fn_match, re_tool_call_function())) continue;
-            std::string fn_text = fn_match[1].matched ? fn_match[1].str() : fn_match[2].str();
-            size_t gt = fn_text.find('>');
-            if (gt == std::string::npos) continue;
-            std::string fn_name = fn_text.substr(0, gt);
-            while (!fn_name.empty() && fn_name.back() == ' ') fn_name.pop_back();
-            while (!fn_name.empty() && fn_name.front() == ' ') fn_name.erase(fn_name.begin());
-            std::string params_region = fn_text.substr(gt + 1);
-
-            add_call(fn_name, parse_xml_params(params_region, fn_name, tools),
-                     it->position(), it->position() + it->length());
+            if (std::regex_search(body, fn_match, re_tool_call_function())) {
+                std::string fn_text = fn_match[1].matched ? fn_match[1].str() : fn_match[2].str();
+                size_t gt = fn_text.find('>');
+                if (gt != std::string::npos) {
+                    std::string fn_name = fn_text.substr(0, gt);
+                    while (!fn_name.empty() && fn_name.back() == ' ') fn_name.pop_back();
+                    while (!fn_name.empty() && fn_name.front() == ' ') fn_name.erase(fn_name.begin());
+                    std::string params_region = fn_text.substr(gt + 1);
+                    add_call(fn_name, parse_xml_params(params_region, fn_name, tools),
+                             pos, pos + it->length());
+                    continue;
+                }
+            }
+            std::string fn_name;
+            json args;
+            if (parse_python_call(body, tools, fn_name, args)) {
+                add_call(fn_name, args, pos, pos + it->length());
+                continue;
+            }
+            try {
+                json obj;
+                if (coerce_relaxed_json(body, obj) && parse_json_tool_call(obj, fn_name, args)) {
+                    add_call(fn_name, args, pos, pos + it->length());
+                    continue;
+                }
+            } catch (...) {}
+            if (parse_xml_function_call(body, tools, fn_name, args)) {
+                add_call(fn_name, args, pos, pos + it->length());
+                continue;
+            }
         }
     }
 
@@ -1419,7 +1462,7 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
         }
     }
 
-    // Pattern 4b: <function_call>{JSON or XML}</function_call>
+    // Pattern 4b: <function_call>{JSON, XML, python-sig, or nested <tool_call>/<invoke>}</function_call>
     {
         auto begin = std::sregex_iterator(text.begin(), text.end(), re_function_call());
         auto end = std::sregex_iterator();
@@ -1427,6 +1470,52 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
             size_t pos = it->position();
             if (overlaps(removals, pos)) continue;
             std::string inner = (*it)[1].str();
+
+            // Check if inner contains nested <tool_call>...</tool_call> blocks
+            static const std::regex re_inner_tc(R"(<tool_call>([\s\S]*?)</tool_call>)");
+            auto tc_begin = std::sregex_iterator(inner.begin(), inner.end(), re_inner_tc);
+            auto tc_end = std::sregex_iterator();
+            bool found_inner = false;
+            for (auto tcit = tc_begin; tcit != tc_end; ++tcit) {
+                std::string tc_body = (*tcit)[1].str();
+                std::string fn_name;
+                json args;
+                if (parse_python_call(tc_body, tools, fn_name, args) ||
+                    parse_xml_function_call(tc_body, tools, fn_name, args)) {
+                    add_call(fn_name, args, pos, pos + it->length());
+                    found_inner = true;
+                } else {
+                    try {
+                        json obj;
+                        if (coerce_relaxed_json(tc_body, obj) && parse_json_tool_call(obj, fn_name, args)) {
+                            add_call(fn_name, args, pos, pos + it->length());
+                            found_inner = true;
+                        }
+                    } catch (...) {}
+                }
+            }
+            if (found_inner) continue;
+
+            // Check if inner contains multiple <invoke>...</invoke> blocks
+            static const std::regex re_inner_inv(R"(<invoke\s+(?:name|tool)\s*=\s*["']?([A-Za-z_][\w.\-]*)["']?\s*>([\s\S]*?)</invoke>)");
+            auto inv_begin = std::sregex_iterator(inner.begin(), inner.end(), re_inner_inv);
+            auto inv_end = std::sregex_iterator();
+            size_t inv_count = 0;
+            for (auto init = inv_begin; init != inv_end; ++init) inv_count++;
+            if (inv_count > 1) {
+                for (auto init = inv_begin; init != inv_end; ++init) {
+                    std::string fn_name = (*init)[1].str();
+                    std::string inv_full = (*init)[0].str();
+                    std::string dummy_name;
+                    json args;
+                    if (parse_xml_function_call(inv_full, tools, dummy_name, args)) {
+                        add_call(fn_name, args, pos, pos + it->length());
+                        found_inner = true;
+                    }
+                }
+                if (found_inner) continue;
+            }
+
             // trim
             size_t s = inner.find_first_not_of(" \t\n\r");
             if (s != std::string::npos) inner = inner.substr(s);
@@ -1439,7 +1528,6 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
                     std::string name;
                     json args;
                     if (parse_json_tool_call(obj, name, args)) {
-                        size_t pos = it->position();
                         add_call(name, args, pos, pos + it->length());
                         parsed = true;
                     }

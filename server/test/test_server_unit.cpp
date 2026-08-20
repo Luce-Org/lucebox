@@ -6200,6 +6200,75 @@ TEST_CASE(ServerUnitFixture, test_parse_function_call_xml_unrecognized_text_in_p
     TEST_ASSERT(result2.tool_calls.empty());
 }
 
+TEST_CASE(ServerUnitFixture, test_parse_tool_calls_python_style_in_tool_call) {
+    std::string text =
+        "<tool_call>\n"
+        "bash(command=\"ls -la /home/dpavlin/koha-rfid-go/internal/rfidops\")\n"
+        "</tool_call>";
+    auto result = parse_tool_calls(text, bash_tools());
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "bash");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["command"] == "ls -la /home/dpavlin/koha-rfid-go/internal/rfidops");
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_tool_calls_multi_python_style_in_function_call) {
+    json tools = json::array({
+        {{"type", "function"}, {"function", {{"name", "bash"}, {"parameters", {{"type", "object"}, {"properties", {{"command", {{"type", "string"}}}}}}}}}},
+        {{"type", "function"}, {"function", {{"name", "read"}, {"parameters", {{"type", "object"}, {"properties", {{"path", {{"type", "string"}}}}}}}}}}
+    });
+
+    std::string text =
+        "<function_call>\n"
+        "<tool_call>\n"
+        "bash(command=\"ls -la /home/dpavlin/koha-rfid-go/internal/rfidops\")\n"
+        "</tool_call>\n"
+        "<tool_call>\n"
+        "read(path=\"/home/dpavlin/koha-rfid-go/internal/rfidops/rfidops.go\")\n"
+        "</tool_call>\n"
+        "</function_call>";
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 2);
+    if (result.tool_calls.size() == 2) {
+        TEST_ASSERT(result.tool_calls[0].name == "bash");
+        auto args0 = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args0["command"] == "ls -la /home/dpavlin/koha-rfid-go/internal/rfidops");
+
+        TEST_ASSERT(result.tool_calls[1].name == "read");
+        auto args1 = json::parse(result.tool_calls[1].arguments);
+        TEST_ASSERT(args1["path"] == "/home/dpavlin/koha-rfid-go/internal/rfidops/rfidops.go");
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_tool_calls_multi_tool_call_blocks) {
+    json tools = json::array({
+        {{"type", "function"}, {"function", {{"name", "bash"}, {"parameters", {{"type", "object"}, {"properties", {{"command", {{"type", "string"}}}}}}}}}},
+        {{"type", "function"}, {"function", {{"name", "read"}, {"parameters", {{"type", "object"}, {"properties", {{"path", {{"type", "string"}}}}}}}}}}
+    });
+
+    std::string text =
+        "<tool_call>\n"
+        "bash(command=\"ls -la /tmp\")\n"
+        "</tool_call>\n"
+        "<tool_call>\n"
+        "read(path=\"server_test.go\")\n"
+        "</tool_call>";
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 2);
+    if (result.tool_calls.size() == 2) {
+        TEST_ASSERT(result.tool_calls[0].name == "bash");
+        auto args0 = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args0["command"] == "ls -la /tmp");
+
+        TEST_ASSERT(result.tool_calls[1].name == "read");
+        auto args1 = json::parse(result.tool_calls[1].arguments);
+        TEST_ASSERT(args1["path"] == "server_test.go");
+    }
+}
+
+
 
 
 
