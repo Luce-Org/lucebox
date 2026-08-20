@@ -6332,6 +6332,55 @@ TEST_CASE(ServerUnitFixture, test_parse_tool_calls_function_call_wrapping_tool_c
     TEST_ASSERT(result.cleaned_text.find("Trailing text") != std::string::npos);
 }
 
+TEST_CASE(ServerUnitFixture, test_sse_emitter_unclosed_tool_in_think_with_tool_close_in_answer) {
+    SseEmitter emitter("chatcmpl_test", "test-model", bash_tools());
+    std::vector<std::string> chunks;
+    std::string text = "<think>unclosed <function_call>read(path=\"a.go\")</think>Answer with </function_call> example";
+    emitter.emit_token(text, 1, chunks);
+    emitter.emit_finish("stop", chunks);
+
+    std::string full_sse;
+    for (const auto & c : chunks) full_sse += c;
+    TEST_ASSERT(full_sse.find("Answer with </function_call> example") != std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_xml_function_call_param_named_name_or_function_accepted) {
+    json tools = json::array({
+        {{"type", "function"}, {"function", {{"name", "create_user"}, {"parameters", {{"type", "object"}, {"properties", {{"name", {{"type", "string"}}}, {"function", {{"type", "string"}}}}}}}}}}
+    });
+
+    std::string text =
+        "<function_call>\n"
+        "<invoke_name>create_user</invoke_name>\n"
+        "<parameters>\n"
+        "<name>alice</name>\n"
+        "<function>admin</function>\n"
+        "</parameters>\n"
+        "</function_call>";
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "create_user");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["name"] == "alice");
+        TEST_ASSERT(args["function"] == "admin");
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_xml_function_call_valid_param_followed_by_garbage_rejected) {
+    std::string text =
+        "<function_call>\n"
+        "<invoke_name>bash</invoke_name>\n"
+        "<parameters>\n"
+        "<command>ls -la</command>\n"
+        "unparsed trailing garbage\n"
+        "</parameters>\n"
+        "</function_call>";
+    auto result = parse_tool_calls(text, bash_tools());
+    TEST_ASSERT(result.tool_calls.empty());
+}
+
+
 
 
 

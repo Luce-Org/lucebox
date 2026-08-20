@@ -32,16 +32,17 @@ static size_t find_reasoning_think_close(const std::string & s) {
     static const std::vector<std::string> close_tags = {
         "</function_calls>", "</function_call>", "</tool_call>", "</tool_code>", "</function>"
     };
+    static const std::vector<std::string> open_tags = {
+        "<function_calls>", "<function_call>", "<tool_call>", "<tool_code>", "<function="
+    };
 
     // Select the latest tool closing marker that has a subsequent THINK_CLOSE
     size_t best_think_close = std::string::npos;
     size_t latest_tool_close_end = 0;
-    bool has_any_tool_close = false;
 
     for (const auto & tag : close_tags) {
         size_t pos = 0;
         while ((pos = s.find(tag, pos)) != std::string::npos) {
-            has_any_tool_close = true;
             size_t end_tag = pos + tag.size();
             size_t tc = s.find(THINK_CLOSE, end_tag);
             if (tc != std::string::npos) {
@@ -58,14 +59,27 @@ static size_t find_reasoning_think_close(const std::string & s) {
         return best_think_close;
     }
 
-    // If tool close markers were found but none had a subsequent </think>,
-    // then </think> has not arrived yet after the tool close.
-    if (has_any_tool_close) {
+    size_t first_think = s.find(THINK_CLOSE);
+    if (first_think == std::string::npos) {
         return std::string::npos;
     }
 
-    // No tool closing marker existed anywhere (e.g. unclosed tool envelope followed by </think>).
-    return s.find(THINK_CLOSE);
+    // Check if an unclosed tool envelope started before first_think and closed after first_think
+    // (which indicates first_think was a literal inside an in-flight tool payload).
+    for (const auto & ot : open_tags) {
+        size_t opos = 0;
+        while ((opos = s.find(ot, opos)) != std::string::npos) {
+            if (opos > first_think) break;
+            for (const auto & ct : close_tags) {
+                if (s.find(ct, first_think) != std::string::npos) {
+                    return std::string::npos;
+                }
+            }
+            opos += ot.size();
+        }
+    }
+
+    return first_think;
 }
 
 static std::string gen_item_id() {

@@ -794,13 +794,26 @@ static bool parse_xml_function_call(const std::string & inner, const json & tool
     auto cend = std::sregex_iterator();
     for (auto it = cbegin; it != cend; ++it) {
         std::string tag = (*it)[1].str();
-        if (tag == "parameters" || tag == "params" || tag == "arguments" ||
-            tag == "invoke_name" || tag == "name" || tag == "function" || tag == "funcname") {
-            continue;
+        if (!has_params_block) {
+            if (tag == "parameters" || tag == "params" || tag == "arguments" ||
+                tag == "invoke_name" || tag == "name" || tag == "function" || tag == "funcname") {
+                continue;
+            }
         }
         if (!args.contains(tag)) {
             std::string v = trim_ws((*it)[2].str());
             args[tag] = convert_param_value(v, tag, props);
+        }
+    }
+
+    // Validate that all non-whitespace content in params_body was consumed
+    if (has_params_block) {
+        std::string unconsumed_params = params_body;
+        unconsumed_params = std::regex_replace(unconsumed_params, re_param_attr, "");
+        unconsumed_params = std::regex_replace(unconsumed_params, re_param_eq, "");
+        unconsumed_params = std::regex_replace(unconsumed_params, re_child_tag, "");
+        if (!trim_ws(unconsumed_params).empty()) {
+            return false;
         }
     }
 
