@@ -6333,7 +6333,7 @@ TEST_CASE(ServerUnitFixture, test_parse_tool_calls_function_call_wrapping_tool_c
 }
 
 TEST_CASE(ServerUnitFixture, test_sse_emitter_unclosed_tool_in_think_with_tool_close_in_answer) {
-    auto emitter = make_emitter(ApiFormat::OPENAI, bash_tools());
+    auto emitter = make_emitter(ApiFormat::OPENAI_CHAT, bash_tools());
     std::string text = "<think>unclosed <function_call>read(path=\"a.go\")</think>Answer with </function_call> example";
     auto c1 = emitter.emit_token(text);
     auto c2 = emitter.emit_finish(0);
