@@ -36,7 +36,7 @@ static std::string extract_tool_name(const json & tool) {
     return tool.value("name", "");
 }
 
-static size_t find_reasoning_think_close(const std::string & s, const json & tools = json(), bool in_stream = false) {
+static size_t find_reasoning_think_close(const std::string & s, const json & tools = json()) {
     static const std::vector<std::string> close_tags = {
         "</function_calls>", "</function_call>", "</tool_call>", "</tool_code>", "</function>",
         "</invoke>"
@@ -83,20 +83,20 @@ static size_t find_reasoning_think_close(const std::string & s, const json & too
         return std::string::npos;
     }
 
-    if (in_stream) {
-        size_t tool_start = 0;
-        if (find_tool_syntax_start(s, tools, tool_start) && tool_start < first_think) {
-            for (const auto & ct : close_tags) {
-                if (s.find(ct, first_think) != std::string::npos) {
-                    return std::string::npos;
-                }
+    // If an unclosed tool envelope started before first_think, check if any closer exists after first_think.
+    // If so, first_think was inside the tool envelope, so it is not a valid thinking boundary.
+    size_t tool_start = 0;
+    if (find_tool_syntax_start(s, tools, tool_start) && tool_start < first_think) {
+        for (const auto & ct : close_tags) {
+            if (s.find(ct, first_think) != std::string::npos) {
+                return std::string::npos;
             }
-            if (tools.is_array()) {
-                for (const auto & tool : tools) {
-                    std::string name = extract_tool_name(tool);
-                    if (!name.empty() && s.find("</" + name + ">", first_think) != std::string::npos) {
-                        return std::string::npos;
-                    }
+        }
+        if (tools.is_array()) {
+            for (const auto & tool : tools) {
+                std::string name = extract_tool_name(tool);
+                if (!name.empty() && s.find("</" + name + ">", first_think) != std::string::npos) {
+                    return std::string::npos;
                 }
             }
         }
@@ -360,7 +360,7 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
         if (mode_ == StreamMode::TOOL_BUFFER) {
             if (tool_from_reasoning_ && first_content_token_index_ < 0) {
                 const std::string full = tool_buffer_ + window_;
-                size_t think_close = find_reasoning_think_close(full, tools_, /*in_stream=*/true);
+                size_t think_close = find_reasoning_think_close(full, tools_);
                 if (think_close != std::string::npos) {
                     const size_t after_think = think_close + THINK_CLOSE_LEN;
                     if (after_think < full.size() &&
@@ -658,10 +658,7 @@ void SseEmitter::emit_reasoning_delta(std::vector<std::string> & out,
         break;
 
     case ApiFormat::RESPONSES:
-        out.push_back(format_responses_event("response.reasoning.delta", {
-            {"item_id", msg_item_id_}, {"output_index", 0},
-            {"content_index", 0}, {"delta", text}
-        }));
+        // Responses API doesn't stream reasoning — it's stripped
         break;
 
     default:

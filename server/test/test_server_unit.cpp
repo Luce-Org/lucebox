@@ -6365,9 +6365,11 @@ TEST_CASE(ServerUnitFixture, test_sse_emitter_unclosed_tool_in_think_with_tool_c
         }
     }
 
-    TEST_ASSERT(content_deltas == "Answer with </function_call> example");
-    TEST_ASSERT(reasoning_deltas.find("unclosed <function_call>") != std::string::npos);
-    TEST_ASSERT(emitter.accumulated_text() == "Answer with </function_call> example");
+    TEST_ASSERT(emitter.tool_calls().empty());
+    TEST_ASSERT(content_deltas.empty());
+    TEST_ASSERT(reasoning_deltas.find("Answer with </function_call> example") != std::string::npos);
+    TEST_ASSERT(emitter.accumulated_text().empty());
+    TEST_ASSERT(emitter.reasoning_text().find("Answer with </function_call> example") != std::string::npos);
 }
 
 TEST_CASE(ServerUnitFixture, test_parse_xml_function_call_param_named_name_or_function_accepted) {
