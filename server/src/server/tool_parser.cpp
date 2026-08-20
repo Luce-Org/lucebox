@@ -1077,7 +1077,11 @@ static bool parse_function_sig_args(const std::string & arg_text, json & out_arg
                     pos++;
                 }
             }
-            if (pos < arg_text.size()) pos++;  // skip closing quote
+            if (pos >= arg_text.size()) {
+                // Unterminated quoted string
+                return false;
+            }
+            pos++;  // skip closing quote
             out_args[key] = val;
         } else {
             // non-string value — read until comma or end
@@ -1093,6 +1097,10 @@ static bool parse_function_sig_args(const std::string & arg_text, json & out_arg
                 else if (c == ',' && depth == 0) break;
                 end++;
             }
+            if (depth != 0) {
+                // Unterminated brackets
+                return false;
+            }
             std::string raw = arg_text.substr(pos, end - pos);
             while (!raw.empty() && raw.back() == ' ') raw.pop_back();
             pos = end;
@@ -1102,6 +1110,18 @@ static bool parse_function_sig_args(const std::string & arg_text, json & out_arg
                 out_args[key] = json::parse(raw);
             } catch (...) {
                 out_args[key] = raw;
+            }
+        }
+
+        // Skip whitespace after value and require comma or end
+        while (pos < arg_text.size() && (arg_text[pos] == ' ' || arg_text[pos] == '\t' ||
+               arg_text[pos] == '\n' || arg_text[pos] == '\r'))
+            pos++;
+        if (pos < arg_text.size()) {
+            if (arg_text[pos] == ',') {
+                pos++;
+            } else {
+                return false;
             }
         }
     }

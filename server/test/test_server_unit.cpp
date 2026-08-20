@@ -6268,6 +6268,32 @@ TEST_CASE(ServerUnitFixture, test_parse_tool_calls_multi_tool_call_blocks) {
     }
 }
 
+TEST_CASE(ServerUnitFixture, test_parse_tool_calls_python_style_unterminated_quote_rejected) {
+    std::string text1 =
+        "<tool_call>\n"
+        "bash(command=\"ls -la /tmp)\n"
+        "</tool_call>";
+    auto result1 = parse_tool_calls(text1, bash_tools());
+    TEST_ASSERT(result1.tool_calls.empty());
+
+    std::string text2 =
+        "<function_call>\n"
+        "bash(command='ls -la /tmp)\n"
+        "</function_call>";
+    auto result2 = parse_tool_calls(text2, bash_tools());
+    TEST_ASSERT(result2.tool_calls.empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_tool_calls_python_style_trailing_garbage_rejected) {
+    std::string text =
+        "<tool_call>\n"
+        "bash(command=\"ls -la /tmp\" unexpected_garbage)\n"
+        "</tool_call>";
+    auto result = parse_tool_calls(text, bash_tools());
+    TEST_ASSERT(result.tool_calls.empty());
+}
+
+
 
 
 
