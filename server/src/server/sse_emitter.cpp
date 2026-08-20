@@ -36,10 +36,12 @@ static size_t find_reasoning_think_close(const std::string & s) {
     // Select the latest tool closing marker that has a subsequent THINK_CLOSE
     size_t best_think_close = std::string::npos;
     size_t latest_tool_close_end = 0;
+    bool has_any_tool_close = false;
 
     for (const auto & tag : close_tags) {
         size_t pos = 0;
         while ((pos = s.find(tag, pos)) != std::string::npos) {
+            has_any_tool_close = true;
             size_t end_tag = pos + tag.size();
             size_t tc = s.find(THINK_CLOSE, end_tag);
             if (tc != std::string::npos) {
@@ -56,8 +58,13 @@ static size_t find_reasoning_think_close(const std::string & s) {
         return best_think_close;
     }
 
-    // If no tool closing marker had a subsequent THINK_CLOSE, check if THINK_CLOSE exists directly
-    // (e.g. unclosed tool envelope followed by </think>)
+    // If tool close markers were found but none had a subsequent </think>,
+    // then </think> has not arrived yet after the tool close.
+    if (has_any_tool_close) {
+        return std::string::npos;
+    }
+
+    // No tool closing marker existed anywhere (e.g. unclosed tool envelope followed by </think>).
     return s.find(THINK_CLOSE);
 }
 
