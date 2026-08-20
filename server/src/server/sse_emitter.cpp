@@ -39,7 +39,7 @@ static std::string extract_tool_name(const json & tool) {
 static size_t find_reasoning_think_close(const std::string & s, const json & tools = json()) {
     static const std::vector<std::string> close_tags = {
         "</function_calls>", "</function_call>", "</tool_call>", "</tool_code>", "</function>",
-        "</invoke>", "</parameter>", "</parameters>", "</arguments>", "</params>"
+        "</invoke>"
     };
 
     // Select the latest tool closing marker that has a subsequent THINK_CLOSE

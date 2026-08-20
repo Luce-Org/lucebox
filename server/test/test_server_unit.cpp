@@ -6388,9 +6388,63 @@ TEST_CASE(ServerUnitFixture, test_sse_emitter_declared_tool_in_think_with_litera
     auto c1 = emitter.emit_token(text);
     auto c2 = emitter.emit_finish(0);
 
-    std::string full_sse = concat(c1) + concat(c2);
-    TEST_ASSERT(full_sse.find("Visible answer") != std::string::npos);
+    std::string content_deltas;
+    std::string reasoning_deltas;
+    for (const auto & chunk_str : c1) {
+        if (chunk_str.rfind("data: ", 0) == 0) {
+            std::string payload = chunk_str.substr(6);
+            size_t end = payload.find("\n\n");
+            if (end != std::string::npos) payload = payload.substr(0, end);
+            if (payload != "[DONE]") {
+                try {
+                    auto j = json::parse(payload);
+                    if (j.contains("choices") && !j["choices"].empty() && j["choices"][0].contains("delta")) {
+                        const auto & delta = j["choices"][0]["delta"];
+                        if (delta.contains("content") && delta["content"].is_string()) {
+                            content_deltas += delta["content"].get<std::string>();
+                        }
+                        if (delta.contains("reasoning_content") && delta["reasoning_content"].is_string()) {
+                            reasoning_deltas += delta["reasoning_content"].get<std::string>();
+                        }
+                    }
+                } catch (...) {}
+            }
+        }
+    }
+
+    TEST_ASSERT(content_deltas == "Visible answer");
+    TEST_ASSERT(reasoning_deltas.find("in payload") != std::string::npos);
 }
+
+TEST_CASE(ServerUnitFixture, test_sse_emitter_nested_param_close_with_literal_think) {
+    auto emitter = make_emitter(ApiFormat::OPENAI_CHAT, bash_tools());
+    std::string text = "<think><function_call><invoke_name>bash</invoke_name><parameters><parameter name=\"cmd\">ls</parameter><parameter name=\"desc\">literal </think> inside</parameter></parameters></function_call></think>Final content";
+    auto c1 = emitter.emit_token(text);
+    auto c2 = emitter.emit_finish(0);
+
+    std::string content_deltas;
+    for (const auto & chunk_str : c1) {
+        if (chunk_str.rfind("data: ", 0) == 0) {
+            std::string payload = chunk_str.substr(6);
+            size_t end = payload.find("\n\n");
+            if (end != std::string::npos) payload = payload.substr(0, end);
+            if (payload != "[DONE]") {
+                try {
+                    auto j = json::parse(payload);
+                    if (j.contains("choices") && !j["choices"].empty() && j["choices"][0].contains("delta")) {
+                        const auto & delta = j["choices"][0]["delta"];
+                        if (delta.contains("content") && delta["content"].is_string()) {
+                            content_deltas += delta["content"].get<std::string>();
+                        }
+                    }
+                } catch (...) {}
+            }
+        }
+    }
+
+    TEST_ASSERT(content_deltas == "Final content");
+}
+
 
 
 
