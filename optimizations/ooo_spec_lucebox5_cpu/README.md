@@ -53,6 +53,11 @@ server, answers identical (`realapi/rest_bench.py`, artifacts in
 | client tool wait | 3.0 s | **0.0 s** |
 | 10-task wall (end-of-turn snapshots) | 174 s | **156 s** (-10%, up to -27% on 3-4-turn tasks) |
 
+With `--prefetch-prefill` on top (full stack, `realapi/results/rest_full_stack_10tasks.json`):
+paired speedup **x1.44 aggregate / x1.30 median**, 17/17 calls hidden, 21.4 s
+of client tool wait removed, and **72.3 s of prefill moved off the critical
+path across 15 prefetched turns**; 9/10 correct vs 8/10 for control.
+
 Many-call tasks (4-8 calls each, `realapi/dag_bench.py`): parallel calls +
 early dispatch complete in 11 model turns vs 32 for one-call-per-turn,
 20/20 calls hidden, 4/4 vs 2/4 tasks correct, 1.28x end to end.
