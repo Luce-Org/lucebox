@@ -711,6 +711,8 @@ static bool parse_xml_function_call(const std::string & inner, const json & tool
         R"(<(?:invoke_name|name|funcname|function)>([A-Za-z_][\w.\-]*)</(?:invoke_name|name|funcname|function)>)");
     static const std::regex re_invoke_attr(
         R"(<(?:invoke|function)\s+(?:name|tool)\s*=\s*["']?([A-Za-z_][\w.\-]*)["']?)");
+    static const std::regex re_invoke_wrapper(
+        R"(<(?:invoke|function)\s+(?:name|tool)\s*=\s*["']?[A-Za-z_][\w.\-]*["']?\s*(?:/>|>(?:\s*</(?:invoke|function)>)?))");
     static const std::regex re_params_block(
         R"(<(?:parameters|params|arguments)>([\s\S]*?)</(?:parameters|params|arguments)>)");
     static const std::regex re_param_attr(
@@ -796,19 +798,10 @@ static bool parse_xml_function_call(const std::string & inner, const json & tool
         return true;
     }
 
-    // args is empty: only succeed if the parameter block or envelope remainder is legitimately empty.
-    if (has_params_block) {
-        if (trim_ws(params_body).empty()) {
-            out_name = name;
-            out_args = std::move(args);
-            return true;
-        }
-        return false;
-    }
-
-    // No <parameters> wrapper: check if the remainder of inner after stripping the name tag is empty.
+    // args is empty: only succeed if the parameter block and envelope remainder are legitimately empty.
     std::string remainder = std::regex_replace(inner, re_name, "");
-    remainder = std::regex_replace(remainder, re_invoke_attr, "");
+    remainder = std::regex_replace(remainder, re_invoke_wrapper, "");
+    remainder = std::regex_replace(remainder, re_params_block, "");
     if (trim_ws(remainder).empty()) {
         out_name = name;
         out_args = std::move(args);

@@ -283,22 +283,27 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
         if (mode_ == StreamMode::TOOL_BUFFER) {
             if (tool_from_reasoning_ && first_content_token_index_ < 0) {
                 const std::string full = tool_buffer_ + window_;
-                size_t fc_close = full.find("</function_calls>");
-                if (fc_close == std::string::npos) fc_close = full.find("</function_call>");
-                if (fc_close == std::string::npos) fc_close = full.find("</tool_call>");
-                if (fc_close != std::string::npos) {
-                    const size_t search_start = fc_close;
-                    const size_t think_close = full.find(THINK_CLOSE, search_start);
-                    if (think_close != std::string::npos) {
-                        const size_t after_think = think_close + THINK_CLOSE_LEN;
-                        if (after_think < full.size() &&
-                            full.find_first_not_of(" \t\r\n", after_think) != std::string::npos) {
-                            // The current token already carries content after </think>
-                            first_content_token_index_ = emit_token_count_ - 1;
-                        } else {
-                            // First real content token starts on the next token
-                            first_content_token_index_ = emit_token_count_;
-                        }
+                size_t search_start = 0;
+                for (const char * tag : {"</function_calls>", "</function_call>", "</tool_call>", "</tool_code>", "</function>"}) {
+                    size_t c = full.find(tag);
+                    if (c != std::string::npos) {
+                        size_t end_tag = c + std::strlen(tag);
+                        if (end_tag > search_start) search_start = end_tag;
+                    }
+                }
+                size_t think_close = full.find(THINK_CLOSE, search_start);
+                if (think_close == std::string::npos && search_start == 0) {
+                    think_close = full.find(THINK_CLOSE);
+                }
+                if (think_close != std::string::npos) {
+                    const size_t after_think = think_close + THINK_CLOSE_LEN;
+                    if (after_think < full.size() &&
+                        full.find_first_not_of(" \t\r\n", after_think) != std::string::npos) {
+                        // The current token already carries content after </think>
+                        first_content_token_index_ = emit_token_count_ - 1;
+                    } else {
+                        // First real content token starts on the next token
+                        first_content_token_index_ = emit_token_count_;
                     }
                 }
             }
@@ -788,7 +793,18 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
             accumulated_content_ += tool_buffer_;
             emit_content_delta(out, tool_buffer_);
         } else if (tool_from_reasoning_) {
-            size_t think_close = tool_buffer_.find(THINK_CLOSE);
+            size_t search_start = 0;
+            for (const char * tag : {"</function_calls>", "</function_call>", "</tool_call>", "</tool_code>", "</function>"}) {
+                size_t c = tool_buffer_.find(tag);
+                if (c != std::string::npos) {
+                    size_t end_tag = c + std::strlen(tag);
+                    if (end_tag > search_start) search_start = end_tag;
+                }
+            }
+            size_t think_close = tool_buffer_.find(THINK_CLOSE, search_start);
+            if (think_close == std::string::npos && search_start == 0) {
+                think_close = tool_buffer_.find(THINK_CLOSE);
+            }
             if (think_close != std::string::npos) {
                 std::string reasoning = tool_buffer_.substr(0, think_close);
                 std::string content = tool_buffer_.substr(think_close + THINK_CLOSE_LEN);

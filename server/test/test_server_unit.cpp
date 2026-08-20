@@ -6067,6 +6067,74 @@ TEST_CASE(ServerUnitFixture, test_emitter_unparsed_reasoning_tool_with_think_clo
     TEST_ASSERT(em.reasoning_text().find("Here is the answer.") == std::string::npos);
 }
 
+TEST_CASE(ServerUnitFixture, test_parse_function_call_xml_empty_params_with_trailing_garbage_fails) {
+    std::string text =
+        "<function_call>\n"
+        "<invoke_name>bash</invoke_name>\n"
+        "<parameters></parameters>\n"
+        "unexpected trailing text\n"
+        "</function_call>";
+    auto result = parse_tool_calls(text, bash_tools());
+    TEST_ASSERT(result.tool_calls.empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_function_call_xml_zero_arg_invoke_tag_succeeds) {
+    std::string text1 =
+        "<function_call>\n"
+        "<invoke name=\"bash\"></invoke>\n"
+        "</function_call>";
+    auto result1 = parse_tool_calls(text1, bash_tools());
+    TEST_ASSERT(result1.tool_calls.size() == 1);
+    if (!result1.tool_calls.empty()) {
+        TEST_ASSERT(result1.tool_calls[0].name == "bash");
+        TEST_ASSERT(result1.tool_calls[0].arguments == "{}");
+    }
+
+    std::string text2 =
+        "<function_call>\n"
+        "<invoke name=\"bash\"/>\n"
+        "</function_call>";
+    auto result2 = parse_tool_calls(text2, bash_tools());
+    TEST_ASSERT(result2.tool_calls.size() == 1);
+    if (!result2.tool_calls.empty()) {
+        TEST_ASSERT(result2.tool_calls[0].name == "bash");
+        TEST_ASSERT(result2.tool_calls[0].arguments == "{}");
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_unparsed_reasoning_tool_with_embedded_literal_think_close) {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, bash_tools(), false);
+    // Token 0: start of thinking
+    em.emit_token("<think>\nThinking about code.\n\n");
+    // Token 1: unparsed tool containing embedded literal </think> before the envelope close and real </think>
+    em.emit_token("<function_call>\n<invoke_name>bash</invoke_name>\nmalformed echo '</think>'\n</function_call>\n</think>\nActual response content.");
+    em.emit_finish(2);
+
+    TEST_ASSERT(em.tool_calls().empty());
+    // Content should start with "Actual response content." and NOT leak "malformed echo"
+    TEST_ASSERT(em.accumulated_text().find("Actual response content.") != std::string::npos);
+    TEST_ASSERT(em.accumulated_text().find("malformed echo") == std::string::npos);
+    // Reasoning should contain the tool buffer with its embedded '</think>'
+    TEST_ASSERT(em.reasoning_text().find("malformed echo '</think>'") != std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_unclosed_tool_marker_records_first_content_token_index) {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, bash_tools(), false);
+    // Token 0: start of thinking
+    em.emit_token("<think>\nThinking...\n");
+    // Token 1: unclosed tool marker and think close
+    em.emit_token("<function_call>\n<invoke_name>bash</invoke_name>\n</think>\nFirst word ");
+    // Token 2: subsequent content
+    em.emit_token("second word ");
+    // Token 3: final content
+    em.emit_token("third word.");
+    em.emit_finish(4);
+
+    TEST_ASSERT(em.first_content_token_index() == 1);
+    TEST_ASSERT(em.accumulated_text().find("First word second word third word.") != std::string::npos);
+}
+
+
 
 
 
