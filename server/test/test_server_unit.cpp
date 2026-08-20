@@ -6134,6 +6134,73 @@ TEST_CASE(ServerUnitFixture, test_emitter_unclosed_tool_marker_records_first_con
     TEST_ASSERT(em.accumulated_text().find("First word second word third word.") != std::string::npos);
 }
 
+TEST_CASE(ServerUnitFixture, test_emitter_unparsed_reasoning_tool_with_subsequent_closing_tag_in_content) {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, bash_tools(), false);
+    // Token 0: start of thinking
+    em.emit_token("<think>\nThinking about code.\n\n");
+    // Token 1: unparsed tool inside reasoning followed by </think> and content that mentions </function_call>
+    em.emit_token("<function_call>\n<invoke_name>bash</invoke_name>\nmalformed\n</function_call>\n</think>\nHere is the answer which mentions </function_call> tag.");
+    em.emit_finish(2);
+
+    TEST_ASSERT(em.tool_calls().empty());
+    // Content should contain the full text after </think>
+    TEST_ASSERT(em.accumulated_text().find("Here is the answer which mentions </function_call> tag.") != std::string::npos);
+    // Reasoning should NOT contain the answer
+    TEST_ASSERT(em.reasoning_text().find("Here is the answer") == std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_function_call_xml_zero_arg_invoke_with_explicit_empty_params_succeeds) {
+    std::string text1 =
+        "<function_call>\n"
+        "<invoke name=\"bash\">\n"
+        "<parameters></parameters>\n"
+        "</invoke>\n"
+        "</function_call>";
+    auto result1 = parse_tool_calls(text1, bash_tools());
+    TEST_ASSERT(result1.tool_calls.size() == 1);
+    if (!result1.tool_calls.empty()) {
+        TEST_ASSERT(result1.tool_calls[0].name == "bash");
+        TEST_ASSERT(result1.tool_calls[0].arguments == "{}");
+    }
+
+    std::string text2 =
+        "<function_call>\n"
+        "<invoke name=\"bash\">\n"
+        "<parameters/>\n"
+        "</invoke>\n"
+        "</function_call>";
+    auto result2 = parse_tool_calls(text2, bash_tools());
+    TEST_ASSERT(result2.tool_calls.size() == 1);
+    if (!result2.tool_calls.empty()) {
+        TEST_ASSERT(result2.tool_calls[0].name == "bash");
+        TEST_ASSERT(result2.tool_calls[0].arguments == "{}");
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_function_call_xml_unrecognized_text_in_params_block_fails) {
+    std::string text1 =
+        "<function_call>\n"
+        "<invoke_name>bash</invoke_name>\n"
+        "<parameters>\n"
+        "unrecognized parameter text\n"
+        "</parameters>\n"
+        "</function_call>";
+    auto result1 = parse_tool_calls(text1, bash_tools());
+    TEST_ASSERT(result1.tool_calls.empty());
+
+    std::string text2 =
+        "<function_call>\n"
+        "<invoke name=\"bash\">\n"
+        "<parameters>\n"
+        "unrecognized parameter text\n"
+        "</parameters>\n"
+        "</invoke>\n"
+        "</function_call>";
+    auto result2 = parse_tool_calls(text2, bash_tools());
+    TEST_ASSERT(result2.tool_calls.empty());
+}
+
+
 
 
 

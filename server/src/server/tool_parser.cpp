@@ -711,10 +711,12 @@ static bool parse_xml_function_call(const std::string & inner, const json & tool
         R"(<(?:invoke_name|name|funcname|function)>([A-Za-z_][\w.\-]*)</(?:invoke_name|name|funcname|function)>)");
     static const std::regex re_invoke_attr(
         R"(<(?:invoke|function)\s+(?:name|tool)\s*=\s*["']?([A-Za-z_][\w.\-]*)["']?)");
-    static const std::regex re_invoke_wrapper(
-        R"(<(?:invoke|function)\s+(?:name|tool)\s*=\s*["']?[A-Za-z_][\w.\-]*["']?\s*(?:/>|>(?:\s*</(?:invoke|function)>)?))");
+    static const std::regex re_invoke_full(
+        R"(<(?:invoke|function)\s+(?:name|tool)\s*=\s*["']?[A-Za-z_][\w.\-]*["']?\s*(?:/>|>([\s\S]*?)</(?:invoke|function)>))");
     static const std::regex re_params_block(
         R"(<(?:parameters|params|arguments)>([\s\S]*?)</(?:parameters|params|arguments)>)");
+    static const std::regex re_params_self_closing(
+        R"(<(?:parameters|params|arguments)\s*/>)");
     static const std::regex re_param_attr(
         R"(<(?:param|parameter)\s+name\s*=\s*["']?([A-Za-z_][\w.\-]*)["']?\s*>([\s\S]*?)</(?:param|parameter)>)");
     static const std::regex re_param_eq(
@@ -735,6 +737,9 @@ static bool parse_xml_function_call(const std::string & inner, const json & tool
     bool has_params_block = false;
     if (std::regex_search(inner, m, re_params_block)) {
         params_body = m[1].str();
+        has_params_block = true;
+    } else if (std::regex_search(inner, re_params_self_closing)) {
+        params_body.clear();
         has_params_block = true;
     }
 
@@ -798,10 +803,28 @@ static bool parse_xml_function_call(const std::string & inner, const json & tool
         return true;
     }
 
+    // If a parameters block was present but contained unrecognized non-whitespace text, reject
+    if (has_params_block && !trim_ws(params_body).empty()) {
+        return false;
+    }
+
     // args is empty: only succeed if the parameter block and envelope remainder are legitimately empty.
-    std::string remainder = std::regex_replace(inner, re_name, "");
-    remainder = std::regex_replace(remainder, re_invoke_wrapper, "");
-    remainder = std::regex_replace(remainder, re_params_block, "");
+    std::string remainder = inner;
+    std::smatch m_inv;
+    if (std::regex_search(remainder, m_inv, re_invoke_full)) {
+        std::string inner_inv = m_inv[1].matched ? m_inv[1].str() : "";
+        inner_inv = std::regex_replace(inner_inv, re_params_block, "");
+        inner_inv = std::regex_replace(inner_inv, re_params_self_closing, "");
+        if (!trim_ws(inner_inv).empty()) {
+            return false;
+        }
+        remainder = std::regex_replace(remainder, re_invoke_full, "");
+    } else {
+        remainder = std::regex_replace(remainder, re_name, "");
+        remainder = std::regex_replace(remainder, re_params_block, "");
+        remainder = std::regex_replace(remainder, re_params_self_closing, "");
+    }
+
     if (trim_ws(remainder).empty()) {
         out_name = name;
         out_args = std::move(args);
