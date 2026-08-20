@@ -6378,6 +6378,22 @@ TEST_CASE(ServerUnitFixture, test_parse_xml_function_call_valid_param_followed_b
     TEST_ASSERT(result.tool_calls.empty());
 }
 
+TEST_CASE(ServerUnitFixture, test_sse_emitter_declared_tool_in_think_with_literal_think_close) {
+    json tools = json::array({
+        {{"type", "function"}, {"function", {{"name", "edit"}, {"parameters", {{"type", "object"}, {"properties", {{"path", {{"type", "string"}}}}}}}}}}
+    });
+
+    auto emitter = make_emitter(ApiFormat::OPENAI_CHAT, tools);
+    std::string text = "<think><edit>literal </think> in payload</edit></think>Visible answer";
+    auto c1 = emitter.emit_token(text);
+    auto c2 = emitter.emit_finish(0);
+
+    std::string full_sse = concat(c1) + concat(c2);
+    TEST_ASSERT(full_sse.find("Visible answer") != std::string::npos);
+}
+
+
+
 
 
 

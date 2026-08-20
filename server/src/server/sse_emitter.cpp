@@ -28,19 +28,25 @@ static bool starts_with_potential_bare_json_tool(const std::string & text,
     return first != std::string::npos && text[first] == '{';
 }
 
-static size_t find_reasoning_think_close(const std::string & s) {
+static std::string extract_tool_name(const json & tool) {
+    if (!tool.is_object()) return "";
+    if (tool.contains("function") && tool["function"].is_object()) {
+        return tool["function"].value("name", "");
+    }
+    return tool.value("name", "");
+}
+
+static size_t find_reasoning_think_close(const std::string & s, const json & tools = json()) {
     static const std::vector<std::string> close_tags = {
-        "</function_calls>", "</function_call>", "</tool_call>", "</tool_code>", "</function>"
-    };
-    static const std::vector<std::string> open_tags = {
-        "<function_calls>", "<function_call>", "<tool_call>", "<tool_code>", "<function="
+        "</function_calls>", "</function_call>", "</tool_call>", "</tool_code>", "</function>",
+        "</invoke>", "</parameter>", "</parameters>", "</arguments>", "</params>"
     };
 
     // Select the latest tool closing marker that has a subsequent THINK_CLOSE
     size_t best_think_close = std::string::npos;
     size_t latest_tool_close_end = 0;
 
-    for (const auto & tag : close_tags) {
+    auto check_close = [&](const std::string & tag) {
         size_t pos = 0;
         while ((pos = s.find(tag, pos)) != std::string::npos) {
             size_t end_tag = pos + tag.size();
@@ -52,6 +58,19 @@ static size_t find_reasoning_think_close(const std::string & s) {
                 }
             }
             pos = end_tag;
+        }
+    };
+
+    for (const auto & tag : close_tags) {
+        check_close(tag);
+    }
+
+    if (tools.is_array()) {
+        for (const auto & tool : tools) {
+            std::string name = extract_tool_name(tool);
+            if (!name.empty()) {
+                check_close("</" + name + ">");
+            }
         }
     }
 
@@ -66,16 +85,20 @@ static size_t find_reasoning_think_close(const std::string & s) {
 
     // Check if an unclosed tool envelope started before first_think and closed after first_think
     // (which indicates first_think was a literal inside an in-flight tool payload).
-    for (const auto & ot : open_tags) {
-        size_t opos = 0;
-        while ((opos = s.find(ot, opos)) != std::string::npos) {
-            if (opos > first_think) break;
-            for (const auto & ct : close_tags) {
-                if (s.find(ct, first_think) != std::string::npos) {
+    size_t tool_start = 0;
+    if (find_tool_syntax_start(s, tools, tool_start) && tool_start < first_think) {
+        for (const auto & ct : close_tags) {
+            if (s.find(ct, first_think) != std::string::npos) {
+                return std::string::npos;
+            }
+        }
+        if (tools.is_array()) {
+            for (const auto & tool : tools) {
+                std::string name = extract_tool_name(tool);
+                if (!name.empty() && s.find("</" + name + ">", first_think) != std::string::npos) {
                     return std::string::npos;
                 }
             }
-            opos += ot.size();
         }
     }
 
@@ -337,7 +360,7 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
         if (mode_ == StreamMode::TOOL_BUFFER) {
             if (tool_from_reasoning_ && first_content_token_index_ < 0) {
                 const std::string full = tool_buffer_ + window_;
-                size_t think_close = find_reasoning_think_close(full);
+                size_t think_close = find_reasoning_think_close(full, tools_);
                 if (think_close != std::string::npos) {
                     const size_t after_think = think_close + THINK_CLOSE_LEN;
                     if (after_think < full.size() &&
@@ -836,7 +859,7 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
             accumulated_content_ += tool_buffer_;
             emit_content_delta(out, tool_buffer_);
         } else if (tool_from_reasoning_) {
-            size_t think_close = find_reasoning_think_close(tool_buffer_);
+            size_t think_close = find_reasoning_think_close(tool_buffer_, tools_);
             if (think_close != std::string::npos) {
                 std::string reasoning = tool_buffer_.substr(0, think_close);
                 std::string content = tool_buffer_.substr(think_close + THINK_CLOSE_LEN);
