@@ -5,7 +5,6 @@
   {
    "task": "t01",
    "arm": "control",
-   "prompt": "What is the current temperature in Tokyo, Japan?",
    "final": "The current temperature in Tokyo, Japan is **27.1 \u00b0C**, with a relative humidity of 77% and a wind speed of 5.8 km/h.",
    "correct": true,
    "wall_ms": 15558.266364998417,
@@ -16,92 +15,11 @@
    "calls": 2,
    "turns": 3,
    "multi_call_turns": 0,
-   "spec_statuses": [],
-   "turn_log": [
-    {
-     "turn": 0,
-     "model_wall_ms": 2556.7058679880574,
-     "prompt_tokens": 627,
-     "completion_tokens": 47,
-     "timings": {
-      "cache_hit": true,
-      "cached_prefix_tokens": 627,
-      "decode_ms": 2528.7,
-      "decode_tokens_per_sec": 18.6,
-      "effective_prompt_tokens": 627,
-      "prefill_ms": 0.0,
-      "prefilled_tokens": 0
-     },
-     "spec": null,
-     "n_calls": 1,
-     "early": null,
-     "tools": [
-      {
-       "name": "geocode_city",
-       "args": {
-        "city": "Tokyo, Japan"
-       },
-       "source": "client_exec",
-       "elapsed_ms": 46.83510700124316,
-       "ok": true
-      }
-     ],
-     "tool_wait_ms": 48.09037000813987
-    },
-    {
-     "turn": 1,
-     "model_wall_ms": 3608.9189630001783,
-     "prompt_tokens": 722,
-     "completion_tokens": 40,
-     "timings": {
-      "cache_hit": true,
-      "cached_prefix_tokens": 674,
-      "decode_ms": 1413.0,
-      "decode_tokens_per_sec": 28.3,
-      "effective_prompt_tokens": 722,
-      "prefill_ms": 2151.6,
-      "prefilled_tokens": 48
-     },
-     "spec": null,
-     "n_calls": 1,
-     "early": null,
-     "tools": [
-      {
-       "name": "get_weather",
-       "args": {
-        "latitude": 35.6769,
-        "longitude": 139.7639
-       },
-       "source": "client_exec",
-       "elapsed_ms": 133.43716200324707,
-       "ok": true
-      }
-     ],
-     "tool_wait_ms": 134.39336798910517
-    },
-    {
-     "turn": 2,
-     "model_wall_ms": 9209.744264997425,
-     "prompt_tokens": 858,
-     "completion_tokens": 36,
-     "timings": {
-      "cache_hit": true,
-      "cached_prefix_tokens": 675,
-      "decode_ms": 1367.1,
-      "decode_tokens_per_sec": 26.3,
-      "effective_prompt_tokens": 858,
-      "prefill_ms": 7794.2,
-      "prefilled_tokens": 183
-     },
-     "spec": null,
-     "n_calls": 0
-    }
-   ]
+   "spec_statuses": []
   },
   {
    "task": "t01",
    "arm": "spec",
-   "prompt": "What is the current temperature in Tokyo, Japan?",
    "final": "The current temperature in Tokyo, Japan is **27.1 \u00b0C**, with a relative humidity of 77% and a wind speed of 5.8 km/h.",
    "correct": true,
    "wall_ms": 15358.044439999503,
@@ -112,112 +30,11 @@
    "calls": 2,
    "turns": 3,
    "multi_call_turns": 0,
-   "spec_statuses": [],
-   "turn_log": [
-    {
-     "turn": 0,
-     "model_wall_ms": 2616.3770029961597,
-     "prompt_tokens": 627,
-     "completion_tokens": 47,
-     "timings": {
-      "cache_hit": true,
-      "cached_prefix_tokens": 627,
-      "decode_ms": 2601.1,
-      "decode_tokens_per_sec": 18.1,
-      "effective_prompt_tokens": 627,
-      "prefill_ms": 0.0,
-      "prefilled_tokens": 0
-     },
-     "spec": null,
-     "n_calls": 1,
-     "early": [
-      {
-       "name": "geocode_city",
-       "status": "hit",
-       "reason": null,
-       "detail": null,
-       "launched_at_token": 46,
-       "executor_wall_ms": 215.592922,
-       "commit_wait_ms": 0.020658
-      }
-     ],
-     "tools": [
-      {
-       "name": "geocode_city",
-       "args": {
-        "city": "Tokyo, Japan"
-       },
-       "source": "early_dispatch_hit",
-       "elapsed_ms": 55.95636198995635,
-       "ok": true
-      }
-     ],
-     "tool_wait_ms": 0.0002809974830597639
-    },
-    {
-     "turn": 1,
-     "model_wall_ms": 3666.411012003664,
-     "prompt_tokens": 722,
-     "completion_tokens": 40,
-     "timings": {
-      "cache_hit": true,
-      "cached_prefix_tokens": 675,
-      "decode_ms": 1392.4,
-      "decode_tokens_per_sec": 28.7,
-      "effective_prompt_tokens": 722,
-      "prefill_ms": 2088.6,
-      "prefilled_tokens": 47
-     },
-     "spec": null,
-     "n_calls": 1,
-     "early": [
-      {
-       "name": "get_weather",
-       "status": "hit",
-       "reason": null,
-       "detail": null,
-       "launched_at_token": 39,
-       "executor_wall_ms": 174.515653,
-       "commit_wait_ms": 172.339541
-      }
-     ],
-     "tools": [
-      {
-       "name": "get_weather",
-       "args": {
-        "latitude": 35.6769,
-        "longitude": 139.7639
-       },
-       "source": "early_dispatch_hit",
-       "elapsed_ms": 130.91137798619457,
-       "ok": true
-      }
-     ],
-     "tool_wait_ms": 0.00025999906938523054
-    },
-    {
-     "turn": 2,
-     "model_wall_ms": 9074.978306001867,
-     "prompt_tokens": 858,
-     "completion_tokens": 36,
-     "timings": {
-      "cache_hit": true,
-      "cached_prefix_tokens": 675,
-      "decode_ms": 1284.8,
-      "decode_tokens_per_sec": 28.0,
-      "effective_prompt_tokens": 858,
-      "prefill_ms": 7760.2,
-      "prefilled_tokens": 183
-     },
-     "spec": null,
-     "n_calls": 0
-    }
-   ]
+   "spec_statuses": []
   },
   {
    "task": "t02",
    "arm": "spec",
-   "prompt": "What is the capital of Peru, and what is the weather there right now?",
    "final": "The capital of Peru is **Lima**. The current weather there is:\n\n- **Temperature**: 17.0 \u00b0C\n- **Relative humidity**: 87%\n- **Wind speed**: 12.7 km/h\n- **Local time**: 05:30 (early morning)",
    "correct": true,
    "wall_ms": 30821.174509997945,
@@ -228,112 +45,11 @@
    "calls": 2,
    "turns": 3,
    "multi_call_turns": 0,
-   "spec_statuses": [],
-   "turn_log": [
-    {
-     "turn": 0,
-     "model_wall_ms": 4471.302567006205,
-     "prompt_tokens": 633,
-     "completion_tokens": 82,
-     "timings": {
-      "cache_hit": true,
-      "cached_prefix_tokens": 633,
-      "decode_ms": 4444.3,
-      "decode_tokens_per_sec": 18.5,
-      "effective_prompt_tokens": 633,
-      "prefill_ms": 0.0,
-      "prefilled_tokens": 0
-     },
-     "spec": null,
-     "n_calls": 1,
-     "early": [
-      {
-       "name": "country_info",
-       "status": "hit",
-       "reason": null,
-       "detail": null,
-       "launched_at_token": 81,
-       "executor_wall_ms": 282.360157,
-       "commit_wait_ms": 0.020258
-      }
-     ],
-     "tools": [
-      {
-       "name": "country_info",
-       "args": {
-        "country_code": "PE"
-       },
-       "source": "early_dispatch_hit",
-       "elapsed_ms": 177.91554100404028,
-       "ok": true
-      }
-     ],
-     "tool_wait_ms": 0.00010100484360009432
-    },
-    {
-     "turn": 1,
-     "model_wall_ms": 11390.137110007345,
-     "prompt_tokens": 801,
-     "completion_tokens": 92,
-     "timings": {
-      "cache_hit": true,
-      "cached_prefix_tokens": 633,
-      "decode_ms": 4035.6,
-      "decode_tokens_per_sec": 22.8,
-      "effective_prompt_tokens": 801,
-      "prefill_ms": 7146.9,
-      "prefilled_tokens": 168
-     },
-     "spec": null,
-     "n_calls": 1,
-     "early": [
-      {
-       "name": "get_weather",
-       "status": "hit",
-       "reason": null,
-       "detail": null,
-       "launched_at_token": 91,
-       "executor_wall_ms": 184.667308,
-       "commit_wait_ms": 167.086601
-      }
-     ],
-     "tools": [
-      {
-       "name": "get_weather",
-       "args": {
-        "latitude": -12.0931,
-        "longitude": -77.0465
-       },
-       "source": "early_dispatch_hit",
-       "elapsed_ms": 139.9597200070275,
-       "ok": true
-      }
-     ],
-     "tool_wait_ms": 0.0004810135578736663
-    },
-    {
-     "turn": 2,
-     "model_wall_ms": 14959.51566300937,
-     "prompt_tokens": 995,
-     "completion_tokens": 60,
-     "timings": {
-      "cache_hit": true,
-      "cached_prefix_tokens": 716,
-      "decode_ms": 2955.6,
-      "decode_tokens_per_sec": 20.3,
-      "effective_prompt_tokens": 995,
-      "prefill_ms": 11964.3,
-      "prefilled_tokens": 279
-     },
-     "spec": null,
-     "n_calls": 0
-    }
-   ]
+   "spec_statuses": []
   },
   {
    "task": "t02",
    "arm": "control",
-   "prompt": "What is the capital of Peru, and what is the weather there right now?",
    "final": "The capital of Peru is **Lima**. The current weather there (as of the local time) is:\n\n- **Temperature**: 17.0 \u00b0C\n- **Wind speed**: 12.7 km/h\n- **Relative humidity**: 87%\n\nSo, in Lima right now it's about 17\u00b0C with moderate wind and high humidity.",
    "correct": true,
    "wall_ms": 28369.652487002895,
@@ -344,92 +60,11 @@
    "calls": 2,
    "turns": 3,
    "multi_call_turns": 0,
-   "spec_statuses": [],
-   "turn_log": [
-    {
-     "turn": 0,
-     "model_wall_ms": 4423.772279013065,
-     "prompt_tokens": 633,
-     "completion_tokens": 82,
-     "timings": {
-      "cache_hit": true,
-      "cached_prefix_tokens": 633,
-      "decode_ms": 4410.8,
-      "decode_tokens_per_sec": 18.6,
-      "effective_prompt_tokens": 633,
-      "prefill_ms": 0.0,
-      "prefilled_tokens": 0
-     },
-     "spec": null,
-     "n_calls": 1,
-     "early": null,
-     "tools": [
-      {
-       "name": "country_info",
-       "args": {
-        "country_code": "PE"
-       },
-       "source": "client_exec",
-       "elapsed_ms": 186.55424100870732,
-       "ok": true
-      }
-     ],
-     "tool_wait_ms": 187.13089800439775
-    },
-    {
-     "turn": 1,
-     "model_wall_ms": 7236.5132619888755,
-     "prompt_tokens": 801,
-     "completion_tokens": 91,
-     "timings": {
-      "cache_hit": true,
-      "cached_prefix_tokens": 716,
-      "decode_ms": 3601.0,
-      "decode_tokens_per_sec": 25.3,
-      "effective_prompt_tokens": 801,
-      "prefill_ms": 3605.3,
-      "prefilled_tokens": 85
-     },
-     "spec": null,
-     "n_calls": 1,
-     "early": null,
-     "tools": [
-      {
-       "name": "get_weather",
-       "args": {
-        "latitude": -12.0931,
-        "longitude": -77.0465
-       },
-       "source": "client_exec",
-       "elapsed_ms": 120.29432100825943,
-       "ok": true
-      }
-     ],
-     "tool_wait_ms": 120.94621799769811
-    },
-    {
-     "turn": 2,
-     "model_wall_ms": 16401.038380005048,
-     "prompt_tokens": 994,
-     "completion_tokens": 74,
-     "timings": {
-      "cache_hit": true,
-      "cached_prefix_tokens": 716,
-      "decode_ms": 4537.3,
-      "decode_tokens_per_sec": 16.3,
-      "effective_prompt_tokens": 994,
-      "prefill_ms": 11830.9,
-      "prefilled_tokens": 278
-     },
-     "spec": null,
-     "n_calls": 0
-    }
-   ]
+   "spec_statuses": []
   },
   {
    "task": "t03",
    "arm": "control",
-   "prompt": "Convert 250 EUR to JPY using today's ECB rate.",
    "final": "250 EUR \u00d7 184.87 JPY/EUR = 46,217.50 JPY.\n\n**250 EUR = 46,217.50 JPY** (based on the ECB reference rate of 184.87 JPY per EUR on 2026-08-18).",
    "correct": true,
    "wall_ms": 8157.817761006299,
@@ -440,62 +75,11 @@
    "calls": 1,
    "turns": 2,
    "multi_call_turns": 0,
-   "spec_statuses": [],
-   "turn_log": [
-    {
-     "turn": 0,
-     "model_wall_ms": 3062.7377689961577,
-     "prompt_tokens": 631,
-     "completion_tokens": 56,
-     "timings": {
-      "cache_hit": true,
-      "cached_prefix_tokens": 631,
-      "decode_ms": 3037.4,
-      "decode_tokens_per_sec": 18.4,
-      "effective_prompt_tokens": 631,
-      "prefill_ms": 0.0,
-      "prefilled_tokens": 0
-     },
-     "spec": null,
-     "n_calls": 1,
-     "early": null,
-     "tools": [
-      {
-       "name": "exchange_rate",
-       "args": {
-        "base": "EUR",
-        "quote": "JPY"
-       },
-       "source": "client_exec",
-       "elapsed_ms": 238.74939398956485,
-       "ok": true
-      }
-     ],
-     "tool_wait_ms": 239.9546249944251
-    },
-    {
-     "turn": 1,
-     "model_wall_ms": 4854.855181998573,
-     "prompt_tokens": 730,
-     "completion_tokens": 56,
-     "timings": {
-      "cache_hit": true,
-      "cached_prefix_tokens": 687,
-      "decode_ms": 2981.6,
-      "decode_tokens_per_sec": 18.8,
-      "effective_prompt_tokens": 730,
-      "prefill_ms": 1841.1,
-      "prefilled_tokens": 43
-     },
-     "spec": null,
-     "n_calls": 0
-    }
-   ]
+   "spec_statuses": []
   },
   {
    "task": "t03",
    "arm": "spec",
-   "prompt": "Convert 250 EUR to JPY using today's ECB rate.",
    "final": "The current ECB rate is 1 EUR = 184.87 JPY.\n\n250 EUR \u00d7 184.87 JPY/EUR = 46,217.5 JPY.\n\n**250 EUR = 46,217.5 JPY** (based on the ECB reference rate of 184.87 JPY per EUR).",
    "correct": true,
    "wall_ms": 8343.007469986333,
@@ -506,72 +90,11 @@
    "calls": 1,
    "turns": 2,
    "multi_call_turns": 0,
-   "spec_statuses": [],
-   "turn_log": [
-    {
-     "turn": 0,
-     "model_wall_ms": 3003.4026190114673,
-     "prompt_tokens": 631,
-     "completion_tokens": 56,
-     "timings": {
-      "cache_hit": true,
-      "cached_prefix_tokens": 631,
-      "decode_ms": 2914.7,
-      "decode_tokens_per_sec": 19.2,
-      "effective_prompt_tokens": 631,
-      "prefill_ms": 0.0,
-      "prefilled_tokens": 0
-     },
-     "spec": null,
-     "n_calls": 1,
-     "early": [
-      {
-       "name": "exchange_rate",
-       "status": "hit",
-       "reason": null,
-       "detail": null,
-       "launched_at_token": 55,
-       "executor_wall_ms": 288.641677,
-       "commit_wait_ms": 73.779679
-      }
-     ],
-     "tools": [
-      {
-       "name": "exchange_rate",
-       "args": {
-        "base": "EUR",
-        "quote": "JPY"
-       },
-       "source": "early_dispatch_hit",
-       "elapsed_ms": 243.52755800646264,
-       "ok": true
-      }
-     ],
-     "tool_wait_ms": 0.0002810120349749923
-    },
-    {
-     "turn": 1,
-     "model_wall_ms": 5339.466000004904,
-     "prompt_tokens": 729,
-     "completion_tokens": 63,
-     "timings": {
-      "cache_hit": true,
-      "cached_prefix_tokens": 688,
-      "decode_ms": 3679.8,
-      "decode_tokens_per_sec": 17.1,
-      "effective_prompt_tokens": 729,
-      "prefill_ms": 1632.1,
-      "prefilled_tokens": 41
-     },
-     "spec": null,
-     "n_calls": 0
-    }
-   ]
+   "spec_statuses": []
   },
   {
    "task": "t04",
    "arm": "spec",
-   "prompt": "How much is 1000 USD in CHF today, and what is the population of Switzerland?",
    "final": "I have the exchange rate and population data.\n\n**Exchange rate:** 1 USD = 0.81254 CHF (as of 2026-08-18).  \nSo 1000 USD = 1000 \u00d7 0.81254 = **812.54 CHF**.\n\n**Population of Switzerland:** 9,092,436 (2025 estimate).\n\n**Answer:** 1000 USD is **812.54 CHF** today, and the population of Switzerland is **9,092,436**.",
    "correct": true,
    "wall_ms": 20309.253782004816,
@@ -582,90 +105,11 @@
    "calls": 2,
    "turns": 2,
    "multi_call_turns": 1,
-   "spec_statuses": [],
-   "turn_log": [
-    {
-     "turn": 0,
-     "model_wall_ms": 5525.102127998252,
-     "prompt_tokens": 638,
-     "completion_tokens": 111,
-     "timings": {
-      "cache_hit": true,
-      "cached_prefix_tokens": 638,
-      "decode_ms": 5442.5,
-      "decode_tokens_per_sec": 20.4,
-      "effective_prompt_tokens": 638,
-      "prefill_ms": 0.0,
-      "prefilled_tokens": 0
-     },
-     "spec": null,
-     "n_calls": 2,
-     "early": [
-      {
-       "name": "exchange_rate",
-       "status": "hit",
-       "reason": null,
-       "detail": null,
-       "launched_at_token": 84,
-       "executor_wall_ms": 897.704057,
-       "commit_wait_ms": 0.019827
-      },
-      {
-       "name": "country_info",
-       "status": "hit",
-       "reason": null,
-       "detail": null,
-       "launched_at_token": 110,
-       "executor_wall_ms": 237.912045,
-       "commit_wait_ms": 52.883115
-      }
-     ],
-     "tools": [
-      {
-       "name": "exchange_rate",
-       "args": {
-        "base": "USD",
-        "quote": "CHF"
-       },
-       "source": "early_dispatch_hit",
-       "elapsed_ms": 149.64668000175152,
-       "ok": true
-      },
-      {
-       "name": "country_info",
-       "args": {
-        "country_code": "CH"
-       },
-       "source": "early_dispatch_hit",
-       "elapsed_ms": 192.7166679961374,
-       "ok": true
-      }
-     ],
-     "tool_wait_ms": 0.00031999661587178707
-    },
-    {
-     "turn": 1,
-     "model_wall_ms": 14783.97547500208,
-     "prompt_tokens": 870,
-     "completion_tokens": 103,
-     "timings": {
-      "cache_hit": true,
-      "cached_prefix_tokens": 638,
-      "decode_ms": 4939.3,
-      "decode_tokens_per_sec": 20.9,
-      "effective_prompt_tokens": 870,
-      "prefill_ms": 9800.8,
-      "prefilled_tokens": 232
-     },
-     "spec": null,
-     "n_calls": 0
-    }
-   ]
+   "spec_statuses": []
   },
   {
    "task": "t04",
    "arm": "control",
-   "prompt": "How much is 1000 USD in CHF today, and what is the population of Switzerland?",
    "final": "I have the exchange rate and population data.\n\n- 1 USD = 0.81254 CHF (as of 2026-08-18)\n- Population of Switzerland: 9,092,436 (2025 estimate)\n\nSo 1,000 USD = 1,000 \u00d7 0.81254 = 812.54 CHF.\n\n**Answer:** 1,000 USD is **812.54 CHF** today. The population of Switzerland is **9,092,436**.",
    "correct": true,
    "wall_ms": 16063.770667999052,
@@ -676,71 +120,11 @@
    "calls": 2,
    "turns": 2,
    "multi_call_turns": 1,
-   "spec_statuses": [],
-   "turn_log": [
-    {
-     "turn": 0,
-     "model_wall_ms": 5489.753089001169,
-     "prompt_tokens": 638,
-     "completion_tokens": 111,
-     "timings": {
-      "cache_hit": true,
-      "cached_prefix_tokens": 638,
-      "decode_ms": 5475.6,
-      "decode_tokens_per_sec": 20.3,
-      "effective_prompt_tokens": 638,
-      "prefill_ms": 0.0,
-      "prefilled_tokens": 0
-     },
-     "spec": null,
-     "n_calls": 2,
-     "early": null,
-     "tools": [
-      {
-       "name": "exchange_rate",
-       "args": {
-        "base": "USD",
-        "quote": "CHF"
-       },
-       "source": "client_exec",
-       "elapsed_ms": 189.14113999926485,
-       "ok": true
-      },
-      {
-       "name": "country_info",
-       "args": {
-        "country_code": "CH"
-       },
-       "source": "client_exec",
-       "elapsed_ms": 224.5101290027378,
-       "ok": true
-      }
-     ],
-     "tool_wait_ms": 226.30627299076878
-    },
-    {
-     "turn": 1,
-     "model_wall_ms": 10347.541076989728,
-     "prompt_tokens": 871,
-     "completion_tokens": 101,
-     "timings": {
-      "cache_hit": true,
-      "cached_prefix_tokens": 752,
-      "decode_ms": 5249.5,
-      "decode_tokens_per_sec": 19.2,
-      "effective_prompt_tokens": 871,
-      "prefill_ms": 5068.8,
-      "prefilled_tokens": 119
-     },
-     "spec": null,
-     "n_calls": 0
-    }
-   ]
+   "spec_statuses": []
   },
   {
    "task": "t05",
    "arm": "control",
-   "prompt": "Give me a one-sentence summary of the Wikipedia article about the capital of Australia.",
    "final": "Canberra is the capital city of Australia and the largest population centre in the Australian Capital Territory, with an estimated population of 484,630 as of 2025, making it Australia's largest inland city and the eighth-largest Australian city by population.",
    "correct": true,
    "wall_ms": 22015.6279369985,
@@ -751,91 +135,11 @@
    "calls": 2,
    "turns": 3,
    "multi_call_turns": 0,
-   "spec_statuses": [],
-   "turn_log": [
-    {
-     "turn": 0,
-     "model_wall_ms": 4357.29956299474,
-     "prompt_tokens": 634,
-     "completion_tokens": 71,
-     "timings": {
-      "cache_hit": true,
-      "cached_prefix_tokens": 634,
-      "decode_ms": 4331.7,
-      "decode_tokens_per_sec": 16.4,
-      "effective_prompt_tokens": 634,
-      "prefill_ms": 0.0,
-      "prefilled_tokens": 0
-     },
-     "spec": null,
-     "n_calls": 1,
-     "early": null,
-     "tools": [
-      {
-       "name": "country_info",
-       "args": {
-        "country_code": "AU"
-       },
-       "source": "client_exec",
-       "elapsed_ms": 293.111211998621,
-       "ok": true
-      }
-     ],
-     "tool_wait_ms": 293.96554800041486
-    },
-    {
-     "turn": 1,
-     "model_wall_ms": 8661.060334008653,
-     "prompt_tokens": 788,
-     "completion_tokens": 44,
-     "timings": {
-      "cache_hit": true,
-      "cached_prefix_tokens": 634,
-      "decode_ms": 2011.7,
-      "decode_tokens_per_sec": 21.9,
-      "effective_prompt_tokens": 788,
-      "prefill_ms": 6612.6,
-      "prefilled_tokens": 154
-     },
-     "spec": null,
-     "n_calls": 1,
-     "early": null,
-     "tools": [
-      {
-       "name": "wikipedia_summary",
-       "args": {
-        "title": "Canberra"
-       },
-       "source": "client_exec",
-       "elapsed_ms": 91.78103199519683,
-       "ok": true
-      }
-     ],
-     "tool_wait_ms": 92.5724109984003
-    },
-    {
-     "turn": 2,
-     "model_wall_ms": 8610.47539600986,
-     "prompt_tokens": 980,
-     "completion_tokens": 51,
-     "timings": {
-      "cache_hit": true,
-      "cached_prefix_tokens": 832,
-      "decode_ms": 2049.2,
-      "decode_tokens_per_sec": 24.9,
-      "effective_prompt_tokens": 980,
-      "prefill_ms": 6508.9,
-      "prefilled_tokens": 148
-     },
-     "spec": null,
-     "n_calls": 0
-    }
-   ]
+   "spec_statuses": []
   },
   {
    "task": "t05",
    "arm": "spec",
-   "prompt": "Give me a one-sentence summary of the Wikipedia article about the capital of Australia.",
    "final": "Canberra is the capital city of Australia and the largest population centre in the Australian Capital Territory, with an estimated population of 484,630 as of 2025, making it Australia's largest inland city and the eighth-largest Australian city by population.",
    "correct": true,
    "wall_ms": 18646.617443009745,
@@ -846,111 +150,11 @@
    "calls": 2,
    "turns": 3,
    "multi_call_turns": 0,
-   "spec_statuses": [],
-   "turn_log": [
-    {
-     "turn": 0,
-     "model_wall_ms": 4450.223805004498,
-     "prompt_tokens": 634,
-     "completion_tokens": 71,
-     "timings": {
-      "cache_hit": true,
-      "cached_prefix_tokens": 634,
-      "decode_ms": 4327.9,
-      "decode_tokens_per_sec": 16.4,
-      "effective_prompt_tokens": 634,
-      "prefill_ms": 0.0,
-      "prefilled_tokens": 0
-     },
-     "spec": null,
-     "n_calls": 1,
-     "early": [
-      {
-       "name": "country_info",
-       "status": "hit",
-       "reason": null,
-       "detail": null,
-       "launched_at_token": 70,
-       "executor_wall_ms": 332.820657,
-       "commit_wait_ms": 107.919011
-      }
-     ],
-     "tools": [
-      {
-       "name": "country_info",
-       "args": {
-        "country_code": "AU"
-       },
-       "source": "early_dispatch_hit",
-       "elapsed_ms": 288.70048899261747,
-       "ok": true
-      }
-     ],
-     "tool_wait_ms": 0.00010999792721122503
-    },
-    {
-     "turn": 1,
-     "model_wall_ms": 5384.207971990691,
-     "prompt_tokens": 788,
-     "completion_tokens": 44,
-     "timings": {
-      "cache_hit": true,
-      "cached_prefix_tokens": 707,
-      "decode_ms": 1717.2,
-      "decode_tokens_per_sec": 25.6,
-      "effective_prompt_tokens": 788,
-      "prefill_ms": 3502.9,
-      "prefilled_tokens": 81
-     },
-     "spec": null,
-     "n_calls": 1,
-     "early": [
-      {
-       "name": "wikipedia_summary",
-       "status": "hit",
-       "reason": null,
-       "detail": null,
-       "launched_at_token": 43,
-       "executor_wall_ms": 150.932628,
-       "commit_wait_ms": 136.017041
-      }
-     ],
-     "tools": [
-      {
-       "name": "wikipedia_summary",
-       "args": {
-        "title": "Canberra"
-       },
-       "source": "early_dispatch_hit",
-       "elapsed_ms": 106.73281000345014,
-       "ok": true
-      }
-     ],
-     "tool_wait_ms": 0.0003210006980225444
-    },
-    {
-     "turn": 2,
-     "model_wall_ms": 8811.971435992746,
-     "prompt_tokens": 981,
-     "completion_tokens": 51,
-     "timings": {
-      "cache_hit": true,
-      "cached_prefix_tokens": 832,
-      "decode_ms": 2290.7,
-      "decode_tokens_per_sec": 22.3,
-      "effective_prompt_tokens": 981,
-      "prefill_ms": 6489.3,
-      "prefilled_tokens": 149
-     },
-     "spec": null,
-     "n_calls": 0
-    }
-   ]
+   "spec_statuses": []
   },
   {
    "task": "t06",
    "arm": "spec",
-   "prompt": "What is 100 Norwegian kroner (NOK) worth in EUR right now, and what is the population of Norway?",
    "final": "Based on the data:\n\n- **Exchange rate**: 1 NOK = 0.09172 EUR. So 100 NOK = 100 \u00d7 0.09172 = **9.172 EUR**.\n- **Population of Norway**: **5,610,870** (as of 2025).\n\n**Final answer:**  \n100 Norwegian kroner is worth **9.17 EUR** right now, and the population of Norway is **5,610,870**.",
    "correct": true,
    "wall_ms": 19807.6814369997,
@@ -961,90 +165,11 @@
    "calls": 2,
    "turns": 2,
    "multi_call_turns": 1,
-   "spec_statuses": [],
-   "turn_log": [
-    {
-     "turn": 0,
-     "model_wall_ms": 5366.782056007651,
-     "prompt_tokens": 644,
-     "completion_tokens": 127,
-     "timings": {
-      "cache_hit": true,
-      "cached_prefix_tokens": 644,
-      "decode_ms": 5061.7,
-      "decode_tokens_per_sec": 25.1,
-      "effective_prompt_tokens": 644,
-      "prefill_ms": 0.0,
-      "prefilled_tokens": 0
-     },
-     "spec": null,
-     "n_calls": 2,
-     "early": [
-      {
-       "name": "exchange_rate",
-       "status": "hit",
-       "reason": null,
-       "detail": null,
-       "launched_at_token": 100,
-       "executor_wall_ms": 593.155843,
-       "commit_wait_ms": 0.022512
-      },
-      {
-       "name": "country_info",
-       "status": "hit",
-       "reason": null,
-       "detail": null,
-       "launched_at_token": 126,
-       "executor_wall_ms": 292.846631,
-       "commit_wait_ms": 278.024677
-      }
-     ],
-     "tools": [
-      {
-       "name": "exchange_rate",
-       "args": {
-        "base": "NOK",
-        "quote": "EUR"
-       },
-       "source": "early_dispatch_hit",
-       "elapsed_ms": 352.3055629921146,
-       "ok": true
-      },
-      {
-       "name": "country_info",
-       "args": {
-        "country_code": "NO"
-       },
-       "source": "early_dispatch_hit",
-       "elapsed_ms": 247.52976899617352,
-       "ok": true
-      }
-     ],
-     "tool_wait_ms": 0.0002799934009090066
-    },
-    {
-     "turn": 1,
-     "model_wall_ms": 14440.735345007852,
-     "prompt_tokens": 892,
-     "completion_tokens": 96,
-     "timings": {
-      "cache_hit": true,
-      "cached_prefix_tokens": 644,
-      "decode_ms": 4061.3,
-      "decode_tokens_per_sec": 23.6,
-      "effective_prompt_tokens": 892,
-      "prefill_ms": 10340.8,
-      "prefilled_tokens": 248
-     },
-     "spec": null,
-     "n_calls": 0
-    }
-   ]
+   "spec_statuses": []
   },
   {
    "task": "t06",
    "arm": "control",
-   "prompt": "What is 100 Norwegian kroner (NOK) worth in EUR right now, and what is the population of Norway?",
    "final": "Based on the data:\n\n- **Exchange rate**: 1 NOK = 0.09172 EUR. So 100 NOK = 100 \u00d7 0.09172 = **9.172 EUR**.\n- **Population of Norway**: **5,610,870** (as of 2025).\n\nSo, 100 Norwegian kroner is worth about **9.17 EUR** right now, and the population of Norway is approximately **5.61 million**.",
    "correct": true,
    "wall_ms": 14283.205893996637,
@@ -1055,71 +180,11 @@
    "calls": 2,
    "turns": 2,
    "multi_call_turns": 1,
-   "spec_statuses": [],
-   "turn_log": [
-    {
-     "turn": 0,
-     "model_wall_ms": 5106.984379002824,
-     "prompt_tokens": 644,
-     "completion_tokens": 127,
-     "timings": {
-      "cache_hit": true,
-      "cached_prefix_tokens": 644,
-      "decode_ms": 5092.8,
-      "decode_tokens_per_sec": 24.9,
-      "effective_prompt_tokens": 644,
-      "prefill_ms": 0.0,
-      "prefilled_tokens": 0
-     },
-     "spec": null,
-     "n_calls": 2,
-     "early": null,
-     "tools": [
-      {
-       "name": "exchange_rate",
-       "args": {
-        "base": "NOK",
-        "quote": "EUR"
-       },
-       "source": "client_exec",
-       "elapsed_ms": 277.71654799289536,
-       "ok": true
-      },
-      {
-       "name": "country_info",
-       "args": {
-        "country_code": "NO"
-       },
-       "source": "client_exec",
-       "elapsed_ms": 287.3382880061399,
-       "ok": true
-      }
-     ],
-     "tool_wait_ms": 288.54252699238714
-    },
-    {
-     "turn": 1,
-     "model_wall_ms": 8887.533714994788,
-     "prompt_tokens": 893,
-     "completion_tokens": 95,
-     "timings": {
-      "cache_hit": true,
-      "cached_prefix_tokens": 772,
-      "decode_ms": 3823.6,
-      "decode_tokens_per_sec": 24.8,
-      "effective_prompt_tokens": 893,
-      "prefill_ms": 5035.0,
-      "prefilled_tokens": 121
-     },
-     "spec": null,
-     "n_calls": 0
-    }
-   ]
+   "spec_statuses": []
   },
   {
    "task": "t07",
    "arm": "control",
-   "prompt": "Compare the current temperature in Rome and in Paris.",
    "final": "\n\n",
    "correct": false,
    "wall_ms": 25540.156161994673,
@@ -1130,122 +195,11 @@
    "calls": 3,
    "turns": 4,
    "multi_call_turns": 0,
-   "spec_statuses": [],
-   "turn_log": [
-    {
-     "turn": 0,
-     "model_wall_ms": 4091.527842989308,
-     "prompt_tokens": 627,
-     "completion_tokens": 61,
-     "timings": {
-      "cache_hit": true,
-      "cached_prefix_tokens": 615,
-      "decode_ms": 3576.3,
-      "decode_tokens_per_sec": 17.1,
-      "effective_prompt_tokens": 627,
-      "prefill_ms": 488.7,
-      "prefilled_tokens": 12
-     },
-     "spec": null,
-     "n_calls": 1,
-     "early": null,
-     "tools": [
-      {
-       "name": "geocode_city",
-       "args": {
-        "city": "Rome, Italy"
-       },
-       "source": "client_exec",
-       "elapsed_ms": 332.9224159970181,
-       "ok": true
-      }
-     ],
-     "tool_wait_ms": 334.24036799988244
-    },
-    {
-     "turn": 1,
-     "model_wall_ms": 3974.2628910025815,
-     "prompt_tokens": 741,
-     "completion_tokens": 31,
-     "timings": {
-      "cache_hit": true,
-      "cached_prefix_tokens": 688,
-      "decode_ms": 1515.3,
-      "decode_tokens_per_sec": 20.5,
-      "effective_prompt_tokens": 741,
-      "prefill_ms": 2304.6,
-      "prefilled_tokens": 53
-     },
-     "spec": null,
-     "n_calls": 1,
-     "early": null,
-     "tools": [
-      {
-       "name": "geocode_city",
-       "args": {
-        "city": "Paris, France"
-       },
-       "source": "client_exec",
-       "elapsed_ms": 350.45954599627294,
-       "ok": true
-      }
-     ],
-     "tool_wait_ms": 351.17094599991105
-    },
-    {
-     "turn": 2,
-     "model_wall_ms": 4926.092463996611,
-     "prompt_tokens": 827,
-     "completion_tokens": 57,
-     "timings": {
-      "cache_hit": true,
-      "cached_prefix_tokens": 772,
-      "decode_ms": 2424.0,
-      "decode_tokens_per_sec": 23.5,
-      "effective_prompt_tokens": 827,
-      "prefill_ms": 2315.8,
-      "prefilled_tokens": 55
-     },
-     "spec": null,
-     "n_calls": 1,
-     "early": null,
-     "tools": [
-      {
-       "name": "get_weather",
-       "args": {
-        "latitude": 41.8933,
-        "longitude": 12.4829
-       },
-       "source": "client_exec",
-       "elapsed_ms": 197.50946899875998,
-       "ok": true
-      }
-     ],
-     "tool_wait_ms": 198.31380200048443
-    },
-    {
-     "turn": 3,
-     "model_wall_ms": 11664.017203991534,
-     "prompt_tokens": 977,
-     "completion_tokens": 52,
-     "timings": {
-      "cache_hit": true,
-      "cached_prefix_tokens": 772,
-      "decode_ms": 2789.8,
-      "decode_tokens_per_sec": 18.6,
-      "effective_prompt_tokens": 977,
-      "prefill_ms": 8831.6,
-      "prefilled_tokens": 205
-     },
-     "spec": null,
-     "n_calls": 0
-    }
-   ]
+   "spec_statuses": []
   },
   {
    "task": "t07",
    "arm": "spec",
-   "prompt": "Compare the current temperature in Rome and in Paris.",
    "final": "\n\n",
    "correct": false,
    "wall_ms": 23741.53215000115,
@@ -1256,152 +210,11 @@
    "calls": 3,
    "turns": 4,
    "multi_call_turns": 0,
-   "spec_statuses": [],
-   "turn_log": [
-    {
-     "turn": 0,
-     "model_wall_ms": 3752.207224999438,
-     "prompt_tokens": 627,
-     "completion_tokens": 61,
-     "timings": {
-      "cache_hit": true,
-      "cached_prefix_tokens": 627,
-      "decode_ms": 3551.7,
-      "decode_tokens_per_sec": 17.2,
-      "effective_prompt_tokens": 627,
-      "prefill_ms": 0.0,
-      "prefilled_tokens": 0
-     },
-     "spec": null,
-     "n_calls": 1,
-     "early": [
-      {
-       "name": "geocode_city",
-       "status": "hit",
-       "reason": null,
-       "detail": null,
-       "launched_at_token": 60,
-       "executor_wall_ms": 404.501868,
-       "commit_wait_ms": 185.424815
-      }
-     ],
-     "tools": [
-      {
-       "name": "geocode_city",
-       "args": {
-        "city": "Rome, Italy"
-       },
-       "source": "early_dispatch_hit",
-       "elapsed_ms": 359.4421909947414,
-       "ok": true
-      }
-     ],
-     "tool_wait_ms": 0.00031999661587178707
-    },
-    {
-     "turn": 1,
-     "model_wall_ms": 3775.7132289989386,
-     "prompt_tokens": 741,
-     "completion_tokens": 31,
-     "timings": {
-      "cache_hit": true,
-      "cached_prefix_tokens": 689,
-      "decode_ms": 1514.5,
-      "decode_tokens_per_sec": 20.5,
-      "effective_prompt_tokens": 741,
-      "prefill_ms": 2246.3,
-      "prefilled_tokens": 52
-     },
-     "spec": null,
-     "n_calls": 1,
-     "early": [
-      {
-       "name": "geocode_city",
-       "status": "hit",
-       "reason": null,
-       "detail": null,
-       "launched_at_token": 30,
-       "executor_wall_ms": 276.686251,
-       "commit_wait_ms": 0.020519
-      }
-     ],
-     "tools": [
-      {
-       "name": "geocode_city",
-       "args": {
-        "city": "Paris, France"
-       },
-       "source": "early_dispatch_hit",
-       "elapsed_ms": 96.25852100725751,
-       "ok": true
-      }
-     ],
-     "tool_wait_ms": 0.00013101089280098677
-    },
-    {
-     "turn": 2,
-     "model_wall_ms": 5012.436550998245,
-     "prompt_tokens": 827,
-     "completion_tokens": 57,
-     "timings": {
-      "cache_hit": true,
-      "cached_prefix_tokens": 773,
-      "decode_ms": 2424.2,
-      "decode_tokens_per_sec": 23.5,
-      "effective_prompt_tokens": 827,
-      "prefill_ms": 2260.9,
-      "prefilled_tokens": 54
-     },
-     "spec": null,
-     "n_calls": 1,
-     "early": [
-      {
-       "name": "get_weather",
-       "status": "hit",
-       "reason": null,
-       "detail": null,
-       "launched_at_token": 56,
-       "executor_wall_ms": 500.262313,
-       "commit_wait_ms": 280.18584
-      }
-     ],
-     "tools": [
-      {
-       "name": "get_weather",
-       "args": {
-        "latitude": 41.8933,
-        "longitude": 12.4829
-       },
-       "source": "early_dispatch_hit",
-       "elapsed_ms": 454.53713899769355,
-       "ok": true
-      }
-     ],
-     "tool_wait_ms": 0.0004309986252337694
-    },
-    {
-     "turn": 3,
-     "model_wall_ms": 11200.820291996934,
-     "prompt_tokens": 977,
-     "completion_tokens": 52,
-     "timings": {
-      "cache_hit": true,
-      "cached_prefix_tokens": 773,
-      "decode_ms": 2400.5,
-      "decode_tokens_per_sec": 21.7,
-      "effective_prompt_tokens": 977,
-      "prefill_ms": 8739.8,
-      "prefilled_tokens": 204
-     },
-     "spec": null,
-     "n_calls": 0
-    }
-   ]
+   "spec_statuses": []
   },
   {
    "task": "t08",
    "arm": "spec",
-   "prompt": "What are the latest population and the income level of Kenya according to the World Bank?",
    "final": "Kenya\u2019s latest total population is **57,532,493** (2025 estimate), and its income level is **Lower middle income**.",
    "correct": true,
    "wall_ms": 7936.900239001261,
@@ -1412,71 +225,11 @@
    "calls": 1,
    "turns": 2,
    "multi_call_turns": 0,
-   "spec_statuses": [],
-   "turn_log": [
-    {
-     "turn": 0,
-     "model_wall_ms": 2115.090406005038,
-     "prompt_tokens": 634,
-     "completion_tokens": 43,
-     "timings": {
-      "cache_hit": true,
-      "cached_prefix_tokens": 634,
-      "decode_ms": 2089.1,
-      "decode_tokens_per_sec": 20.6,
-      "effective_prompt_tokens": 634,
-      "prefill_ms": 0.0,
-      "prefilled_tokens": 0
-     },
-     "spec": null,
-     "n_calls": 1,
-     "early": [
-      {
-       "name": "country_info",
-       "status": "hit",
-       "reason": null,
-       "detail": null,
-       "launched_at_token": 42,
-       "executor_wall_ms": 236.798886,
-       "commit_wait_ms": 0.023213
-      }
-     ],
-     "tools": [
-      {
-       "name": "country_info",
-       "args": {
-        "country_code": "KE"
-       },
-       "source": "early_dispatch_hit",
-       "elapsed_ms": 191.78703099896666,
-       "ok": true
-      }
-     ],
-     "tool_wait_ms": 0.000300002284348011
-    },
-    {
-     "turn": 1,
-     "model_wall_ms": 5821.664981995127,
-     "prompt_tokens": 761,
-     "completion_tokens": 31,
-     "timings": {
-      "cache_hit": true,
-      "cached_prefix_tokens": 677,
-      "decode_ms": 2213.6,
-      "decode_tokens_per_sec": 14.0,
-      "effective_prompt_tokens": 761,
-      "prefill_ms": 3577.1,
-      "prefilled_tokens": 84
-     },
-     "spec": null,
-     "n_calls": 0
-    }
-   ]
+   "spec_statuses": []
   },
   {
    "task": "t08",
    "arm": "control",
-   "prompt": "What are the latest population and the income level of Kenya according to the World Bank?",
    "final": "Kenya\u2019s latest total population is **57,532,493** (as of 2025), and its income level is **Lower middle income**.",
    "correct": true,
    "wall_ms": 7582.602692011278,
@@ -1487,61 +240,11 @@
    "calls": 1,
    "turns": 2,
    "multi_call_turns": 0,
-   "spec_statuses": [],
-   "turn_log": [
-    {
-     "turn": 0,
-     "model_wall_ms": 2150.30235699669,
-     "prompt_tokens": 634,
-     "completion_tokens": 43,
-     "timings": {
-      "cache_hit": true,
-      "cached_prefix_tokens": 634,
-      "decode_ms": 2136.0,
-      "decode_tokens_per_sec": 20.1,
-      "effective_prompt_tokens": 634,
-      "prefill_ms": 0.0,
-      "prefilled_tokens": 0
-     },
-     "spec": null,
-     "n_calls": 1,
-     "early": null,
-     "tools": [
-      {
-       "name": "country_info",
-       "args": {
-        "country_code": "KE"
-       },
-       "source": "client_exec",
-       "elapsed_ms": 191.02183300128672,
-       "ok": true
-      }
-     ],
-     "tool_wait_ms": 191.65764001081698
-    },
-    {
-     "turn": 1,
-     "model_wall_ms": 5240.498316008598,
-     "prompt_tokens": 761,
-     "completion_tokens": 33,
-     "timings": {
-      "cache_hit": true,
-      "cached_prefix_tokens": 678,
-      "decode_ms": 1736.0,
-      "decode_tokens_per_sec": 19.0,
-      "effective_prompt_tokens": 761,
-      "prefill_ms": 3476.3,
-      "prefilled_tokens": 83
-     },
-     "spec": null,
-     "n_calls": 0
-    }
-   ]
+   "spec_statuses": []
   },
   {
    "task": "t09",
    "arm": "control",
-   "prompt": "Summarize the Wikipedia page for Mount Everest in one sentence.",
    "final": "{\"name\": \"wikipedia_summary\", \"arguments\": {\"title\": \"Mount Everest\"}}",
    "correct": true,
    "wall_ms": 1209.0138510102406,
@@ -1552,31 +255,11 @@
    "calls": 0,
    "turns": 1,
    "multi_call_turns": 0,
-   "spec_statuses": [],
-   "turn_log": [
-    {
-     "turn": 0,
-     "model_wall_ms": 1208.993111999007,
-     "prompt_tokens": 629,
-     "completion_tokens": 21,
-     "timings": {
-      "cache_hit": true,
-      "cached_prefix_tokens": 629,
-      "decode_ms": 1183.1,
-      "decode_tokens_per_sec": 17.8,
-      "effective_prompt_tokens": 629,
-      "prefill_ms": 0.0,
-      "prefilled_tokens": 0
-     },
-     "spec": null,
-     "n_calls": 0
-    }
-   ]
+   "spec_statuses": []
   },
   {
    "task": "t09",
    "arm": "spec",
-   "prompt": "Summarize the Wikipedia page for Mount Everest in one sentence.",
    "final": "{\"name\": \"wikipedia_summary\", \"arguments\": {\"title\": \"Mount Everest\"}}",
    "correct": true,
    "wall_ms": 802.1219459915301,
@@ -1587,31 +270,11 @@
    "calls": 0,
    "turns": 1,
    "multi_call_turns": 0,
-   "spec_statuses": [],
-   "turn_log": [
-    {
-     "turn": 0,
-     "model_wall_ms": 802.1040129970061,
-     "prompt_tokens": 629,
-     "completion_tokens": 21,
-     "timings": {
-      "cache_hit": true,
-      "cached_prefix_tokens": 629,
-      "decode_ms": 785.9,
-      "decode_tokens_per_sec": 26.7,
-      "effective_prompt_tokens": 629,
-      "prefill_ms": 0.0,
-      "prefilled_tokens": 0
-     },
-     "spec": null,
-     "n_calls": 0
-    }
-   ]
+   "spec_statuses": []
   },
   {
    "task": "t10",
    "arm": "spec",
-   "prompt": "What is the wind speed right now in Reykjavik, Iceland?",
    "final": "The current wind speed in Reykjavik, Iceland is 5.8 km/h.",
    "correct": true,
    "wall_ms": 17566.261821004446,
@@ -1622,112 +285,11 @@
    "calls": 2,
    "turns": 3,
    "multi_call_turns": 0,
-   "spec_statuses": [],
-   "turn_log": [
-    {
-     "turn": 0,
-     "model_wall_ms": 3082.6664979977068,
-     "prompt_tokens": 632,
-     "completion_tokens": 57,
-     "timings": {
-      "cache_hit": true,
-      "cached_prefix_tokens": 632,
-      "decode_ms": 3056.1,
-      "decode_tokens_per_sec": 18.7,
-      "effective_prompt_tokens": 632,
-      "prefill_ms": 0.0,
-      "prefilled_tokens": 0
-     },
-     "spec": null,
-     "n_calls": 1,
-     "early": [
-      {
-       "name": "geocode_city",
-       "status": "hit",
-       "reason": null,
-       "detail": null,
-       "launched_at_token": 56,
-       "executor_wall_ms": 237.316894,
-       "commit_wait_ms": 0.022943
-      }
-     ],
-     "tools": [
-      {
-       "name": "geocode_city",
-       "args": {
-        "city": "Reykjavik, Iceland"
-       },
-       "source": "early_dispatch_hit",
-       "elapsed_ms": 142.4902950093383,
-       "ok": true
-      }
-     ],
-     "tool_wait_ms": 0.00034099502954632044
-    },
-    {
-     "turn": 1,
-     "model_wall_ms": 4764.993210003013,
-     "prompt_tokens": 757,
-     "completion_tokens": 39,
-     "timings": {
-      "cache_hit": true,
-      "cached_prefix_tokens": 689,
-      "decode_ms": 1598.9,
-      "decode_tokens_per_sec": 24.4,
-      "effective_prompt_tokens": 757,
-      "prefill_ms": 2901.1,
-      "prefilled_tokens": 68
-     },
-     "spec": null,
-     "n_calls": 1,
-     "early": [
-      {
-       "name": "get_weather",
-       "status": "hit",
-       "reason": null,
-       "detail": null,
-       "launched_at_token": 38,
-       "executor_wall_ms": 460.773363,
-       "commit_wait_ms": 226.100054
-      }
-     ],
-     "tools": [
-      {
-       "name": "get_weather",
-       "args": {
-        "latitude": 64.146,
-        "longitude": -21.9422
-       },
-       "source": "early_dispatch_hit",
-       "elapsed_ms": 415.86555700632744,
-       "ok": true
-      }
-     ],
-     "tool_wait_ms": 0.0002400047378614545
-    },
-    {
-     "turn": 2,
-     "model_wall_ms": 9718.319134000922,
-     "prompt_tokens": 892,
-     "completion_tokens": 20,
-     "timings": {
-      "cache_hit": true,
-      "cached_prefix_tokens": 690,
-      "decode_ms": 1138.8,
-      "decode_tokens_per_sec": 17.6,
-      "effective_prompt_tokens": 892,
-      "prefill_ms": 8546.9,
-      "prefilled_tokens": 202
-     },
-     "spec": null,
-     "n_calls": 0
-    }
-   ]
+   "spec_statuses": []
   },
   {
    "task": "t10",
    "arm": "control",
-   "prompt": "What is the wind speed right now in Reykjavik, Iceland?",
    "final": "The current wind speed in Reykjavik, Iceland is 5.8 km/h.",
    "correct": true,
    "wall_ms": 17662.67708799569,
@@ -1738,87 +300,7 @@
    "calls": 2,
    "turns": 3,
    "multi_call_turns": 0,
-   "spec_statuses": [],
-   "turn_log": [
-    {
-     "turn": 0,
-     "model_wall_ms": 3224.210572006996,
-     "prompt_tokens": 632,
-     "completion_tokens": 57,
-     "timings": {
-      "cache_hit": true,
-      "cached_prefix_tokens": 632,
-      "decode_ms": 3209.8,
-      "decode_tokens_per_sec": 17.8,
-      "effective_prompt_tokens": 632,
-      "prefill_ms": 0.0,
-      "prefilled_tokens": 0
-     },
-     "spec": null,
-     "n_calls": 1,
-     "early": null,
-     "tools": [
-      {
-       "name": "geocode_city",
-       "args": {
-        "city": "Reykjavik, Iceland"
-       },
-       "source": "client_exec",
-       "elapsed_ms": 109.68413899536245,
-       "ok": true
-      }
-     ],
-     "tool_wait_ms": 110.50902100396343
-    },
-    {
-     "turn": 1,
-     "model_wall_ms": 4412.82057799981,
-     "prompt_tokens": 757,
-     "completion_tokens": 39,
-     "timings": {
-      "cache_hit": true,
-      "cached_prefix_tokens": 690,
-      "decode_ms": 1555.1,
-      "decode_tokens_per_sec": 25.1,
-      "effective_prompt_tokens": 757,
-      "prefill_ms": 2842.6,
-      "prefilled_tokens": 67
-     },
-     "spec": null,
-     "n_calls": 1,
-     "early": null,
-     "tools": [
-      {
-       "name": "get_weather",
-       "args": {
-        "latitude": 64.146,
-        "longitude": -21.9422
-       },
-       "source": "client_exec",
-       "elapsed_ms": 230.11769700678997,
-       "ok": true
-      }
-     ],
-     "tool_wait_ms": 231.37832300562877
-    },
-    {
-     "turn": 2,
-     "model_wall_ms": 9683.499639999354,
-     "prompt_tokens": 892,
-     "completion_tokens": 20,
-     "timings": {
-      "cache_hit": true,
-      "cached_prefix_tokens": 690,
-      "decode_ms": 1131.8,
-      "decode_tokens_per_sec": 17.7,
-      "effective_prompt_tokens": 892,
-      "prefill_ms": 8523.1,
-      "prefilled_tokens": 202
-     },
-     "spec": null,
-     "n_calls": 0
-    }
-   ]
+   "spec_statuses": []
   }
  ]
 }
