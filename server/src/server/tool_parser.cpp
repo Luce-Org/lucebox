@@ -256,6 +256,13 @@ static bool overlaps(const std::vector<Span> & spans, size_t pos) {
     return false;
 }
 
+static bool overlaps(const std::vector<Span> & spans, size_t start, size_t end) {
+    for (const auto & s : spans) {
+        if (std::max(s.start, start) < std::min(s.end, end)) return true;
+    }
+    return false;
+}
+
 static size_t include_preceding_tool_call_open(const std::string & text, size_t pos) {
     size_t wrapper = text.rfind("<tool_call>", pos);
     if (wrapper == std::string::npos) return pos;
@@ -1468,7 +1475,7 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
         auto end = std::sregex_iterator();
         for (auto it = begin; it != end; ++it) {
             size_t pos = it->position();
-            if (overlaps(removals, pos)) continue;
+            if (overlaps(removals, pos, pos + it->length())) continue;
             std::string inner = (*it)[1].str();
 
             // Check if inner contains nested <tool_call>...</tool_call> blocks
@@ -1537,6 +1544,8 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
                 std::string name;
                 json args = json::object();
                 if (parse_xml_function_call(inner, tools, name, args)) {
+                    add_call(name, args, pos, pos + it->length());
+                } else if (parse_python_call(inner, tools, name, args)) {
                     add_call(name, args, pos, pos + it->length());
                 }
             }
