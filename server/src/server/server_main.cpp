@@ -219,6 +219,7 @@ static void print_usage(const char * prog) {
         "  --tool-spec-timeout-ms <N>   Executor result timeout (default: 60000).\n"
         "  --early-dispatch      Launch allowlisted tool calls as soon as their call block\n"
         "                        closes in the token stream (results: dflash_early_dispatch).\n"
+        "  --tool-spec-max-executors <N>  Server-wide concurrent executor cap (default: 16).\n"
         "  --prefetch-prefill    Prefill the deterministic next tool turn before the\n"
         "                        client requests it (with --early-dispatch + --end-turn-snapshot).\n"
         "  --end-turn-snapshot   After tool-enabled generations, cache prompt+output so the\n"
@@ -631,6 +632,15 @@ int main(int argc, char ** argv) {
             }
         } else if (std::strcmp(argv[i], "--early-dispatch") == 0) {
             sconfig.early_dispatch = true;
+        } else if (std::strcmp(argv[i], "--tool-spec-max-executors") == 0 &&
+                   i + 1 < argc) {
+            if (!parse_int_strict(argv[++i],
+                    sconfig.tool_speculation.max_concurrent_executors) ||
+                sconfig.tool_speculation.max_concurrent_executors < 0) {
+                std::fprintf(stderr,
+                    "[server] --tool-spec-max-executors must be >= 0\n");
+                return 2;
+            }
         } else if (std::strcmp(argv[i], "--prefetch-prefill") == 0) {
             sconfig.prefetch_prefill = true;
         } else if (std::strcmp(argv[i], "--end-turn-snapshot") == 0) {

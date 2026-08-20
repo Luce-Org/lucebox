@@ -3960,11 +3960,18 @@ json HttpServer::resolve_early_dispatch(
 // snapshot, prefill the delta and cache the result so the next request
 // starts at decode speed. Every failure path bails silently to the normal
 // request path — this is an optimization, never a correctness dependency.
+bool HttpServer::has_pending_jobs() {
+    std::lock_guard<std::mutex> lock(queue_mu_);
+    return queue_head_ != nullptr;
+}
+
 void HttpServer::prefetch_next_turn(
         const ParsedRequest & req, SseEmitter & emitter,
         const GenerationOutputState & output, const json & early_items) {
     if (!config_.prefetch_prefill || !output.early_dispatch) return;
     if (!early_items.is_array() || early_items.empty()) return;
+    // Never make a waiting client pay for speculative prefill.
+    if (has_pending_jobs()) return;
     const auto & calls = emitter.tool_calls();
     if (calls.empty()) return;
     std::vector<const json *> results(calls.size(), nullptr);
@@ -4013,6 +4020,7 @@ void HttpServer::prefetch_next_turn(
     prefetch_request.snap_pos = (int) tokens.size();
     DaemonIO prefetch_io;
     prefetch_io.stream_fd = -1;
+    prefetch_io.should_cancel = [this]() { return has_pending_jobs(); };
     const GenerateResult prefetch_result = restore_slot >= 0
         ? backend_.restore_and_generate(restore_slot, prefetch_request,
                                         prefetch_io)
@@ -4032,6 +4040,10 @@ void HttpServer::prefetch_next_turn(
     } else {
         backend_.snapshot_free(snap_slot);
         prefix_cache_.abort_inline_snap(snap_slot);
+        if (prefetch_io.cancelled) {
+            std::fprintf(stderr,
+                "[prefetch] yielded to a queued request\n");
+        }
     }
 }
 

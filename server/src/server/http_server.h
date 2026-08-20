@@ -494,6 +494,10 @@ private:
         const ParsedRequest & req, SseEmitter & emitter,
         const GenerationOutputState & output,
         const nlohmann::json & early_items);
+    // True when a client request is waiting for the worker. Prefetch work
+    // yields to real traffic: it is skipped when a request is queued and
+    // cancelled at the next chunk boundary when one arrives mid-prefill.
+    bool has_pending_jobs();
 
     // Worker thread, concurrent mode (the backend exposes a SeqEngine):
     // iteration-level scheduler. Admission is claim-only; this baseline

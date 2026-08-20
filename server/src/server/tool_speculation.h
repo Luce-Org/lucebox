@@ -125,12 +125,19 @@ private:
     std::string executor_contract_;
 };
 
+// Number of speculative executor children currently alive across the
+// server. Used to bound concurrent tool work under load.
+int tool_speculation_running_executors();
+
 struct ToolSpeculationConfig {
     std::string executor_path;
     std::string profile_path;
     std::vector<std::string> allowed_tools;
     ToolSpeculationPolicy policy;
     int timeout_ms = 60000;
+    // Server-wide cap on concurrently running executor children. New
+    // attempts beyond the cap are deferred (reason "executor_saturated").
+    int max_concurrent_executors = 16;
     int cancel_grace_ms = 100;
     size_t max_result_bytes = 1024 * 1024;
     double max_model_slowdown_ratio = 1.20;
@@ -223,6 +230,8 @@ private:
     bool running_ = false;
     bool resolved_ = false;
     std::string launch_error_;
+    bool holds_executor_slot_ = false;
+    void release_executor_slot();
 #if !defined(_WIN32)
     int child_stdin_fd_ = -1;
     int child_stdout_fd_ = -1;

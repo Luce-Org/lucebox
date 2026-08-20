@@ -5,6 +5,7 @@
 #include "tool_speculation.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cerrno>
 #include <cmath>
@@ -44,6 +45,8 @@ namespace dflash::common {
 
 // Absolute executor lifetime = timeout_ms * this multiplier (measured from launch).
 constexpr int kExecutorLifetimeMultiplier = 20;
+
+std::atomic<int> g_running_executors{0};
 namespace {
 
 constexpr size_t kMaxExecutorRequestBytes = 64 * 1024;
@@ -678,8 +681,16 @@ ToolSpeculationAttempt::ToolSpeculationAttempt(
     }
 }
 
+void ToolSpeculationAttempt::release_executor_slot() {
+    if (holds_executor_slot_) {
+        holds_executor_slot_ = false;
+        g_running_executors.fetch_sub(1, std::memory_order_acq_rel);
+    }
+}
+
 ToolSpeculationAttempt::~ToolSpeculationAttempt() {
     if (!resolved_) terminate_executor();
+    release_executor_slot();
 }
 
 std::unique_ptr<ToolSpeculationAttempt> ToolSpeculationAttempt::create(
@@ -690,10 +701,24 @@ std::unique_ptr<ToolSpeculationAttempt> ToolSpeculationAttempt::create(
         new ToolSpeculationAttempt(config, prediction, request_id));
 }
 
+int tool_speculation_running_executors() {
+    return g_running_executors.load(std::memory_order_relaxed);
+}
+
 void ToolSpeculationAttempt::start() {
     if (started_) return;
     started_ = true;
     if (!admission_.admitted) return;
+    if (config_.max_concurrent_executors > 0) {
+        const int running = g_running_executors.fetch_add(1, std::memory_order_acq_rel);
+        if (running >= config_.max_concurrent_executors) {
+            g_running_executors.fetch_sub(1, std::memory_order_acq_rel);
+            admission_.admitted = false;
+            admission_.reason = "executor_saturated";
+            return;
+        }
+        holds_executor_slot_ = true;
+    }
     const json request = {
         {"protocol", "dflash.tool-speculation.v1"},
         {"request_id", request_id_},
@@ -975,6 +1000,7 @@ void ToolSpeculationAttempt::terminate_executor(bool allow_control_grace) {
     }
 #endif
     running_ = false;
+    release_executor_slot();
 }
 
 bool ToolSpeculationAttempt::collect_executor_result(
@@ -1092,6 +1118,7 @@ bool ToolSpeculationAttempt::collect_executor_result(
         static_cast<pid_t>(child_pid_), SIGKILL, false);
     child_pid_ = -1;
     running_ = false;
+    release_executor_slot();
     wait_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - wait_started).count();
     if (!WIFEXITED(child_status) || WEXITSTATUS(child_status) != 0) {

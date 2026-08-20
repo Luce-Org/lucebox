@@ -509,6 +509,30 @@ TEST_CASE(ToolSpeculationFixture, dependency_placeholders_resolve_between_calls)
     CHECK(find_tool_call_dependencies(json::parse(R"json({"a":"costs $5.00 today"})json")).empty());
 }
 
+TEST_CASE(ToolSpeculationFixture, executor_cap_defers_excess_attempts) {
+    const std::string path = make_executor_script(
+        "sleep 2\n"
+        "printf '{\"ok\":true,\"result\":{\"value\":1}}\\n'\n");
+    ToolSpeculationConfig config = test_config(path);
+    config.max_concurrent_executors = 1;
+    auto first = ToolSpeculationAttempt::create(config, prediction(), "cap_first");
+    first->start();
+    CHECK(first->running());
+    {
+        auto second = ToolSpeculationAttempt::create(
+            config, prediction(), "cap_second");
+        second->start();
+        CHECK(!second->running());
+        const json deferred = second->resolve({});
+        CHECK(deferred["status"] == "deferred");
+        CHECK(deferred["reason"] == "executor_saturated");
+    }
+    first->cancel("test_teardown");
+    first.reset();
+    ::unlink(path.c_str());
+    CHECK(dflash::common::tool_speculation_running_executors() == 0);
+}
+
 TEST_CASE(ToolSpeculationFixture, executor_timeout_starts_at_launch) {
     const std::string path = make_executor_script(
         "sleep 1\n"
