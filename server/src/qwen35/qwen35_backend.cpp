@@ -26,6 +26,7 @@
 #include "qwen3/qwen3_kvflash_scorer.h"
 
 #include "ggml-cuda.h"
+#include "ggml-backend-impl.h"
 #include "common/snapshot_backend.h"
 #include "pflash_ggml_adapter.h"
 #include "flashprefill.h"
@@ -2456,6 +2457,33 @@ static float qwen35_dspark_confidence_threshold() {
     return kThreshold;
 }
 
+// Resolve the target lm_head to a tensor whose data is readable on the
+// draft backend. In tensor-parallel mode the lm_head is a meta tensor whose
+// data pointer is a placeholder; the real data is mirrored (a full copy) on
+// every rank. Return the simple tensor of the rank that matches the draft
+// GPU (a local read on the draft backend), else nullptr so the caller falls
+// back to the host chain.
+static ggml_tensor * resolve_fused_lm_head(ggml_tensor * lm_head,
+                                           const DevicePlacement & device,
+                                           int draft_gpu) {
+    if (!lm_head) return nullptr;
+    if (!lm_head->buffer ||
+        !ggml_backend_buft_is_meta(ggml_backend_buffer_get_type(lm_head->buffer))) {
+        return lm_head;  // simple tensor: data pointer is real, use as-is
+    }
+    // Meta tensor: the lm_head is mirrored (full copy) on every rank. Read
+    // it from the rank that matches the draft GPU so the fused graph does a
+    // local read on the draft backend.
+    for (size_t j = 0; j < device.layer_split_gpus.size(); ++j) {
+        if (device.layer_split_gpus[j] == draft_gpu) {
+            ggml_tensor * simple = ggml_backend_meta_simple_tensor(lm_head, j);
+            return (simple && simple->data) ? simple : nullptr;
+        }
+    }
+    // Draft GPU is not a target rank; fall back to the host chain.
+    return nullptr;
+}
+
 // Adaptive speculation policy: a spec step (draft + heads + width-q verify)
 // costs about DFLASH_QWEN35_SPEC_STEP_RATIO plain-decode steps, so it only
 // pays off while the drafter gets more than (ratio - 1) of its tokens
@@ -3025,11 +3053,20 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 if (fused_dspark) {
                     // One graph for every candidate: markov-corrected tokens
                     // plus (when gated) the confidence score per position.
+                    // The lm_head must be readable on the draft backend; in
+                    // tensor-parallel mode that is the simple tensor of the
+                    // rank matching the draft GPU (lm_head is mirrored on
+                    // every rank).
                     std::vector<float> conf_scores;
-                    ds_ok = dspark_markov_correct_greedy_chain_fused(
-                        dw_, draft_backend_, target->lm_head_tensor(),
-                        local_hidden.data(), q_len, last_tok, draft_tok,
-                        conf_threshold > 0.0f ? &conf_scores : nullptr);
+                    ggml_tensor * fused_lm_head =
+                        resolve_fused_lm_head(target->lm_head_tensor(),
+                                              cfg_.device, cfg_.draft_gpu);
+                    if (fused_lm_head) {
+                        ds_ok = dspark_markov_correct_greedy_chain_fused(
+                            dw_, draft_backend_, fused_lm_head,
+                            local_hidden.data(), q_len, last_tok, draft_tok,
+                            conf_threshold > 0.0f ? &conf_scores : nullptr);
+                    }
                     if (ds_ok && conf_threshold > 0.0f) {
                         // Truncate the chain at the first low-confidence
                         // position: draft_tok[0] is the seed, candidate i
@@ -3220,11 +3257,16 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                         std::fprintf(stderr,
                             "[qwen35-spec] DSpark Markov head active for DDTree candidates\n");
                     }
-                    topk_ok = dspark_markov_project_topk(dw_, draft_backend_,
-                                                         target->lm_head_tensor(),
-                                                         local_hidden.data(), q_len, K,
-                                                         cfg_.ddtree_temp, last_tok,
-                                                         top_lp, top_ids);
+                    ggml_tensor * fused_lm_head =
+                        resolve_fused_lm_head(target->lm_head_tensor(),
+                                              cfg_.device, cfg_.draft_gpu);
+                    if (fused_lm_head) {
+                        topk_ok = dspark_markov_project_topk(dw_, draft_backend_,
+                                                             fused_lm_head,
+                                                             local_hidden.data(), q_len, K,
+                                                             cfg_.ddtree_temp, last_tok,
+                                                             top_lp, top_ids);
+                    }
                 }
                 if (!topk_ok &&
                     !target->project_hidden_to_topk(local_hidden.data(), q_len, K,
