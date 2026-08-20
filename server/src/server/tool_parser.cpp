@@ -578,13 +578,59 @@ static bool coerce_relaxed_json(const std::string & payload, json & out) {
         return true;
     }
 
-    // Repair premature array/object closures emitted mid-array by LLMs (e.g. `}]}, {` -> `}, {`)
+    // Repair premature array/object closures emitted mid-array by LLMs (e.g. `}]}, {` -> `}, {`).
+    // Structural scan: only replaces outside of string literals to avoid mutating argument values.
     auto repair_premature_closes = [](const std::string & s) -> std::string {
-        static const std::regex re1(R"(\}\s*\]\s*\}\s*,\s*\{)");
-        static const std::regex re2(R"(\}\s*\]\s*,\s*\{)");
-        std::string r = std::regex_replace(s, re1, "}, {");
-        r = std::regex_replace(r, re2, "}, {");
-        return r;
+        std::string res;
+        res.reserve(s.size());
+        bool in_str = false;
+        bool escape = false;
+        for (size_t i = 0; i < s.size(); ) {
+            char c = s[i];
+            if (escape) {
+                escape = false;
+                res += c;
+                i++;
+                continue;
+            }
+            if (c == '\\' && in_str) {
+                escape = true;
+                res += c;
+                i++;
+                continue;
+            }
+            if (c == '"') {
+                in_str = !in_str;
+                res += c;
+                i++;
+                continue;
+            }
+            if (!in_str && c == '}') {
+                // Look ahead for premature close: \s* \]\s* ( \}\s* )? ,\s* \{
+                size_t j = i + 1;
+                while (j < s.size() && (s[j] == ' ' || s[j] == '\t' || s[j] == '\n' || s[j] == '\r')) j++;
+                if (j < s.size() && s[j] == ']') {
+                    j++;
+                    while (j < s.size() && (s[j] == ' ' || s[j] == '\t' || s[j] == '\n' || s[j] == '\r')) j++;
+                    if (j < s.size() && s[j] == '}') {
+                        j++;
+                        while (j < s.size() && (s[j] == ' ' || s[j] == '\t' || s[j] == '\n' || s[j] == '\r')) j++;
+                    }
+                    if (j < s.size() && s[j] == ',') {
+                        j++;
+                        while (j < s.size() && (s[j] == ' ' || s[j] == '\t' || s[j] == '\n' || s[j] == '\r')) j++;
+                        if (j < s.size() && s[j] == '{') {
+                            res += "}, {";
+                            i = j + 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+            res += c;
+            i++;
+        }
+        return res;
     };
 
     std::string repaired = repair_premature_closes(rewritten);
@@ -684,8 +730,10 @@ static bool parse_xml_function_call(const std::string & inner, const json & tool
     if (name.empty() || !tool_allowed(tools, name)) return false;
 
     std::string params_body = inner;
+    bool has_params_block = false;
     if (std::regex_search(inner, m, re_params_block)) {
         params_body = m[1].str();
+        has_params_block = true;
     }
 
     json props = find_tool_properties(tools, name);
@@ -742,9 +790,32 @@ static bool parse_xml_function_call(const std::string & inner, const json & tool
         }
     }
 
-    out_name = name;
-    out_args = std::move(args);
-    return true;
+    if (!args.empty()) {
+        out_name = name;
+        out_args = std::move(args);
+        return true;
+    }
+
+    // args is empty: only succeed if the parameter block or envelope remainder is legitimately empty.
+    if (has_params_block) {
+        if (trim_ws(params_body).empty()) {
+            out_name = name;
+            out_args = std::move(args);
+            return true;
+        }
+        return false;
+    }
+
+    // No <parameters> wrapper: check if the remainder of inner after stripping the name tag is empty.
+    std::string remainder = std::regex_replace(inner, re_name, "");
+    remainder = std::regex_replace(remainder, re_invoke_attr, "");
+    if (trim_ws(remainder).empty()) {
+        out_name = name;
+        out_args = std::move(args);
+        return true;
+    }
+
+    return false;
 }
 
 // ─── JSON tool call parser ──────────────────────────────────────────────

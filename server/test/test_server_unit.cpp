@@ -6027,6 +6027,47 @@ TEST_CASE(ServerUnitFixture, test_emitter_function_call_inside_reasoning_without
     }
 }
 
+TEST_CASE(ServerUnitFixture, test_parse_function_call_premature_close_inside_string_unmutated) {
+    std::string text =
+        "<function_call>\n"
+        "{\"name\": \"bash\", \"arguments\": {\"command\": \"echo '}]}, {'\"}}"
+        "\n</function_call>";
+    auto result = parse_tool_calls(text, bash_tools());
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "bash");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["command"] == "echo '}]}, {'");
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_function_call_xml_unrecognized_params_fails) {
+    std::string text =
+        "<function_call>\n"
+        "<invoke_name>bash</invoke_name>\n"
+        "malformed plain text without xml parameter tags\n"
+        "</function_call>";
+    auto result = parse_tool_calls(text, bash_tools());
+    TEST_ASSERT(result.tool_calls.empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_unparsed_reasoning_tool_with_think_close_splits_content) {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, bash_tools(), false);
+    // Token 0: start of thinking
+    em.emit_token("<think>\nThinking about the problem.\n\n");
+    // Token 1: malformed function call inside reasoning followed by </think> and content
+    em.emit_token("<function_call>\n<invoke_name>bash</invoke_name>\nmalformed text\n</function_call>\n</think>\nHere is the answer.");
+    em.emit_finish(2);
+
+    // No tool calls parsed
+    TEST_ASSERT(em.tool_calls().empty());
+    // Content should contain the text after </think>
+    TEST_ASSERT(em.accumulated_text().find("Here is the answer.") != std::string::npos);
+    // Reasoning text should NOT contain the post-think text
+    TEST_ASSERT(em.reasoning_text().find("Here is the answer.") == std::string::npos);
+}
+
+
 
 
 
