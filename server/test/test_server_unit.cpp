@@ -6388,9 +6388,12 @@ TEST_CASE(ServerUnitFixture, test_sse_emitter_declared_tool_in_think_with_litera
     auto c1 = emitter.emit_token(text);
     auto c2 = emitter.emit_finish(0);
 
+    std::vector<std::string> all_chunks = c1;
+    all_chunks.insert(all_chunks.end(), c2.begin(), c2.end());
+
     std::string content_deltas;
     std::string reasoning_deltas;
-    for (const auto & chunk_str : c1) {
+    for (const auto & chunk_str : all_chunks) {
         if (chunk_str.rfind("data: ", 0) == 0) {
             std::string payload = chunk_str.substr(6);
             size_t end = payload.find("\n\n");
@@ -6422,8 +6425,11 @@ TEST_CASE(ServerUnitFixture, test_sse_emitter_nested_param_close_with_literal_th
     auto c1 = emitter.emit_token(text);
     auto c2 = emitter.emit_finish(0);
 
+    std::vector<std::string> all_chunks = c1;
+    all_chunks.insert(all_chunks.end(), c2.begin(), c2.end());
+
     std::string content_deltas;
-    for (const auto & chunk_str : c1) {
+    for (const auto & chunk_str : all_chunks) {
         if (chunk_str.rfind("data: ", 0) == 0) {
             std::string payload = chunk_str.substr(6);
             size_t end = payload.find("\n\n");
