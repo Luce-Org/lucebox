@@ -108,25 +108,6 @@ float get_f32(gguf_context * g, const char * key, float def) {
     return gguf_get_val_f32(g, k);
 }
 
-bool supported_weight_storage(ggml_type type) {
-    return type == GGML_TYPE_Q8_0 || type == GGML_TYPE_BF16 ||
-           type == GGML_TYPE_F16;
-}
-
-ggml_type tensor_storage_type(gguf_context * gctx, const char * name,
-                              ggml_type fallback, bool & ok) {
-    const int64_t index = gguf_find_tensor(gctx, name);
-    if (index < 0) return fallback;
-    const ggml_type type = gguf_get_tensor_type(gctx, index);
-    if (!supported_weight_storage(type)) {
-        set_last_error(std::string("unsupported Qwen3-0.6B storage type for ") +
-                       name + ": " + ggml_type_name(type));
-        ok = false;
-        return fallback;
-    }
-    return type;
-}
-
 } // namespace
 
 bool load_qwen3_drafter_model(const std::string & path,
@@ -153,11 +134,7 @@ bool load_qwen3_drafter_model(const std::string & path,
     out.head_dim   = (int)get_u32(gctx, "qwen3.attention.key_length", 128);
     out.rope_theta = get_f32(gctx, "qwen3.rope.freq_base", 1000000.0f);
 
-    // Preserve Q8_0 storage when the predictor reuses the production compact
-    // GGUF.  Activations/KV still use the backend precision policy; ggml's
-    // mul_mat and get_rows kernels dequantize Q8_0 weights as they are read.
-    // This avoids expanding a 0.6B sidecar to BF16 merely to use the native
-    // IPC lane.
+    // Detect weight quant type from blk.0.attn_q.weight; support BF16 and Q8_0.
     ggml_type wtype = GGML_TYPE_BF16;
     {
         int64_t tidx = gguf_find_tensor(gctx, "blk.0.attn_q.weight");
@@ -165,16 +142,8 @@ bool load_qwen3_drafter_model(const std::string & path,
             wtype = gguf_get_tensor_type(gctx, tidx);
         }
     }
-    if (supported_weight_storage(wtype)) {
-        out.weight_type = wtype;
-    } else {
-        set_last_error(std::string("unsupported Qwen3-0.6B weight type: ") +
-                       ggml_type_name(wtype));
-        gguf_free(gctx);
-        return false;
-    }
     std::fprintf(stderr, "[qwen3-0.6b] detected weight type: %s\n",
-                 ggml_type_name(wtype));
+                 wtype == GGML_TYPE_Q8_0 ? "Q8_0" : "BF16");
     std::fflush(stderr);
 
     // Compute total tensor metadata size for context allocation.
@@ -197,76 +166,30 @@ bool load_qwen3_drafter_model(const std::string & path,
     const int n_vocab   = out.n_vocab;
     const int q_dim     = n_head * head_dim;
     const int kv_dim    = n_head_kv * head_dim;
-    bool storage_types_ok = true;
-    const ggml_type token_type = tensor_storage_type(
-        gctx, "token_embd.weight", out.weight_type, storage_types_ok);
-    const ggml_type output_type = tensor_storage_type(
-        gctx, "output.weight", token_type, storage_types_ok);
+    const ggml_type weight_type = out.weight_type;
 
     // Top-level tensors.
-    out.tok_embd = ggml_new_tensor_2d(out.ctx, token_type, n_embd, n_vocab);
+    out.tok_embd = ggml_new_tensor_2d(out.ctx, weight_type, n_embd, n_vocab);
     out.out_norm = ggml_new_tensor_1d(out.ctx, GGML_TYPE_F32, n_embd);
-    out.output   = ggml_new_tensor_2d(out.ctx, output_type, n_embd, n_vocab);
+    out.output   = ggml_new_tensor_2d(out.ctx, weight_type, n_embd, n_vocab);
     ggml_set_name(out.tok_embd, "token_embd.weight");
     ggml_set_name(out.out_norm, "output_norm.weight");
     ggml_set_name(out.output,   "output.weight");
 
     out.layers.resize(n_layer);
-    char tensor_name[128];
     for (int il = 0; il < n_layer; ++il) {
         auto & L = out.layers[il];
         L.attn_norm = ggml_new_tensor_1d(out.ctx, GGML_TYPE_F32, n_embd);
-        std::snprintf(tensor_name, sizeof(tensor_name),
-                      "blk.%d.attn_q.weight", il);
-        L.wq = ggml_new_tensor_2d(
-            out.ctx, tensor_storage_type(gctx, tensor_name, out.weight_type,
-                                          storage_types_ok),
-            n_embd, q_dim);
-        std::snprintf(tensor_name, sizeof(tensor_name),
-                      "blk.%d.attn_k.weight", il);
-        L.wk = ggml_new_tensor_2d(
-            out.ctx, tensor_storage_type(gctx, tensor_name, out.weight_type,
-                                          storage_types_ok),
-            n_embd, kv_dim);
-        std::snprintf(tensor_name, sizeof(tensor_name),
-                      "blk.%d.attn_v.weight", il);
-        L.wv = ggml_new_tensor_2d(
-            out.ctx, tensor_storage_type(gctx, tensor_name, out.weight_type,
-                                          storage_types_ok),
-            n_embd, kv_dim);
-        std::snprintf(tensor_name, sizeof(tensor_name),
-                      "blk.%d.attn_output.weight", il);
-        L.wo = ggml_new_tensor_2d(
-            out.ctx, tensor_storage_type(gctx, tensor_name, out.weight_type,
-                                          storage_types_ok),
-            q_dim, n_embd);
+        L.wq        = ggml_new_tensor_2d(out.ctx, weight_type, n_embd, q_dim);
+        L.wk        = ggml_new_tensor_2d(out.ctx, weight_type, n_embd, kv_dim);
+        L.wv        = ggml_new_tensor_2d(out.ctx, weight_type, n_embd, kv_dim);
+        L.wo        = ggml_new_tensor_2d(out.ctx, weight_type, q_dim, n_embd);
         L.q_norm    = ggml_new_tensor_1d(out.ctx, GGML_TYPE_F32, head_dim);
         L.k_norm    = ggml_new_tensor_1d(out.ctx, GGML_TYPE_F32, head_dim);
         L.ffn_norm  = ggml_new_tensor_1d(out.ctx, GGML_TYPE_F32, n_embd);
-        std::snprintf(tensor_name, sizeof(tensor_name),
-                      "blk.%d.ffn_gate.weight", il);
-        L.ffn_gate = ggml_new_tensor_2d(
-            out.ctx, tensor_storage_type(gctx, tensor_name, out.weight_type,
-                                          storage_types_ok),
-            n_embd, n_ff);
-        std::snprintf(tensor_name, sizeof(tensor_name),
-                      "blk.%d.ffn_up.weight", il);
-        L.ffn_up = ggml_new_tensor_2d(
-            out.ctx, tensor_storage_type(gctx, tensor_name, out.weight_type,
-                                          storage_types_ok),
-            n_embd, n_ff);
-        std::snprintf(tensor_name, sizeof(tensor_name),
-                      "blk.%d.ffn_down.weight", il);
-        L.ffn_down = ggml_new_tensor_2d(
-            out.ctx, tensor_storage_type(gctx, tensor_name, out.weight_type,
-                                          storage_types_ok),
-            n_ff, n_embd);
-    }
-    if (!storage_types_ok) {
-        gguf_free(gctx);
-        ggml_free(out.ctx);
-        out.ctx = nullptr;
-        return false;
+        L.ffn_gate  = ggml_new_tensor_2d(out.ctx, weight_type, n_embd, n_ff);
+        L.ffn_up    = ggml_new_tensor_2d(out.ctx, weight_type, n_embd, n_ff);
+        L.ffn_down  = ggml_new_tensor_2d(out.ctx, weight_type, n_ff, n_embd);
     }
 
     out.buf = ggml_backend_alloc_ctx_tensors(out.ctx, backend);

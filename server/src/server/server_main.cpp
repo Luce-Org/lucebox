@@ -207,28 +207,6 @@ static void print_usage(const char * prog) {
         "  --lazy-draft                Legacy alias for --draft-residency=request-scoped\n"
         "\n"
         "Tool-call prediction (lossless exact verification):\n"
-        "  --tool-hint-sidecar-url <URL>\n"
-        "                               OpenAI-compatible chat-completions endpoint.\n"
-        "  --tool-hint-sidecar-model <NAME>\n"
-        "                               Predictor model served by that endpoint.\n"
-        "  --tool-hint-native-model <PATH>\n"
-        "                               Qwen3-0.6B GGUF for the native PFlash runtime.\n"
-        "  --tool-hint-native-ipc-bin <PATH>\n"
-        "                               Matching backend_ipc_daemon executable.\n"
-        "  --tool-hint-native-gpu <N>  Predictor GPU (default: 0).\n"
-        "  --tool-hint-native-max-ctx <N>\n"
-        "                               Predictor context capacity (default: 4096).\n"
-        "  --tool-hint-native-work-dir <PATH>\n"
-        "                               Optional private IPC scratch directory.\n"
-        "  --tool-hint-timeout-ms <N>  Hard native/HTTP predictor deadline\n"
-        "                               (default: 2000).\n"
-        "  --tool-hint-max-tokens <N>  Predictor completion cap (default: 96).\n"
-        "  --tool-hint-execution-confidence <P>\n"
-        "                               Calibrated 0..1 prior for automatic external\n"
-        "                               tool admission (default: 0.75).\n"
-        "                               The target verifies every hint.\n"
-        "\n"
-        "Speculative external tools (opt-in, POSIX):\n"
         "  --tool-spec-executor <path>  Trusted executor adapter. Receives one\n"
         "                               dflash.tool-speculation.v1 JSON request\n"
         "                               on stdin; no shell is used.\n"
@@ -241,6 +219,8 @@ static void print_usage(const char * prog) {
         "  --tool-spec-timeout-ms <N>   Executor result timeout (default: 60000).\n"
         "  --early-dispatch      Launch allowlisted tool calls as soon as their call block\n"
         "                        closes in the token stream (results: dflash_early_dispatch).\n"
+        "  --prefetch-prefill    Prefill the deterministic next tool turn before the\n"
+        "                        client requests it (with --early-dispatch + --end-turn-snapshot).\n"
         "  --end-turn-snapshot   After tool-enabled generations, cache prompt+output so the\n"
         "                        next turn restores the whole conversation (one delta prefill).\n"
         "  --tool-spec-max-model-slowdown <R>\n"
@@ -626,71 +606,6 @@ int main(int argc, char ** argv) {
         } else if (std::strcmp(argv[i], "--lazy-draft") == 0) {
             sconfig.lazy_draft = true;
             sconfig.draft_residency = DraftResidencyPolicy::RequestScoped;
-        } else if (std::strcmp(argv[i], "--tool-hint-sidecar-url") == 0 &&
-                   i + 1 < argc) {
-            sconfig.semantic_tool_predictor.url = argv[++i];
-        } else if (std::strcmp(argv[i], "--tool-hint-sidecar-model") == 0 &&
-                   i + 1 < argc) {
-            sconfig.semantic_tool_predictor.model = argv[++i];
-        } else if (std::strcmp(argv[i], "--tool-hint-native-model") == 0 &&
-                   i + 1 < argc) {
-            sconfig.semantic_tool_predictor.native_model_path = argv[++i];
-        } else if (std::strcmp(argv[i], "--tool-hint-native-ipc-bin") == 0 &&
-                   i + 1 < argc) {
-            sconfig.semantic_tool_predictor.native_ipc_bin = argv[++i];
-        } else if (std::strcmp(argv[i], "--tool-hint-native-work-dir") == 0 &&
-                   i + 1 < argc) {
-            sconfig.semantic_tool_predictor.native_work_dir = argv[++i];
-        } else if (std::strcmp(argv[i], "--tool-hint-native-gpu") == 0 &&
-                   i + 1 < argc) {
-            if (!parse_int_strict(
-                    argv[++i], sconfig.semantic_tool_predictor.native_gpu) ||
-                sconfig.semantic_tool_predictor.native_gpu < 0) {
-                std::fprintf(stderr,
-                    "[server] --tool-hint-native-gpu must be non-negative\n");
-                return 2;
-            }
-        } else if (std::strcmp(argv[i], "--tool-hint-native-max-ctx") == 0 &&
-                   i + 1 < argc) {
-            if (!parse_int_strict(
-                    argv[++i], sconfig.semantic_tool_predictor.native_max_ctx) ||
-                sconfig.semantic_tool_predictor.native_max_ctx <= 0) {
-                std::fprintf(stderr,
-                    "[server] --tool-hint-native-max-ctx must be positive\n");
-                return 2;
-            }
-        } else if ((std::strcmp(argv[i], "--tool-hint-timeout-ms") == 0 ||
-                    std::strcmp(argv[i], "--tool-hint-sidecar-timeout-ms") == 0) &&
-                   i + 1 < argc) {
-            if (!parse_int_strict(
-                    argv[++i], sconfig.semantic_tool_predictor.timeout_ms) ||
-                sconfig.semantic_tool_predictor.timeout_ms <= 0) {
-                std::fprintf(stderr,
-                    "[server] --tool-hint-timeout-ms must be positive\n");
-                return 2;
-            }
-        } else if ((std::strcmp(argv[i], "--tool-hint-max-tokens") == 0 ||
-                    std::strcmp(argv[i], "--tool-hint-sidecar-max-tokens") == 0) &&
-                   i + 1 < argc) {
-            if (!parse_int_strict(
-                    argv[++i], sconfig.semantic_tool_predictor.max_tokens) ||
-                sconfig.semantic_tool_predictor.max_tokens <= 0) {
-                std::fprintf(stderr,
-                    "[server] --tool-hint-max-tokens must be positive\n");
-                return 2;
-            }
-        } else if (std::strcmp(
-                       argv[i], "--tool-hint-execution-confidence") == 0 &&
-                   i + 1 < argc) {
-            if (!parse_double_strict(
-                    argv[++i],
-                    sconfig.semantic_tool_predictor.execution_confidence) ||
-                sconfig.semantic_tool_predictor.execution_confidence < 0.0 ||
-                sconfig.semantic_tool_predictor.execution_confidence > 1.0) {
-                std::fprintf(stderr,
-                    "[server] --tool-hint-execution-confidence must be between 0 and 1\n");
-                return 2;
-            }
         } else if (std::strcmp(argv[i], "--tool-spec-executor") == 0 &&
                    i + 1 < argc) {
             sconfig.tool_speculation.executor_path = argv[++i];
@@ -716,6 +631,8 @@ int main(int argc, char ** argv) {
             }
         } else if (std::strcmp(argv[i], "--early-dispatch") == 0) {
             sconfig.early_dispatch = true;
+        } else if (std::strcmp(argv[i], "--prefetch-prefill") == 0) {
+            sconfig.prefetch_prefill = true;
         } else if (std::strcmp(argv[i], "--end-turn-snapshot") == 0) {
             sconfig.end_turn_snapshot = true;
             // DeepSeek-V4 continuation snapshots are taken after DSpark decode and
@@ -806,27 +723,6 @@ int main(int argc, char ** argv) {
         }
     }
 
-    const bool semantic_http_predictor_requested =
-        !sconfig.semantic_tool_predictor.url.empty() ||
-        !sconfig.semantic_tool_predictor.model.empty();
-    if (semantic_http_predictor_requested &&
-        !sconfig.semantic_tool_predictor.http_enabled()) {
-        std::fprintf(stderr,
-            "[server] HTTP semantic tool hints require both "
-            "--tool-hint-sidecar-url and --tool-hint-sidecar-model\n");
-        return 2;
-    }
-    const bool semantic_native_predictor_requested =
-        !sconfig.semantic_tool_predictor.native_model_path.empty() ||
-        !sconfig.semantic_tool_predictor.native_ipc_bin.empty() ||
-        !sconfig.semantic_tool_predictor.native_work_dir.empty();
-    if (semantic_native_predictor_requested &&
-        !sconfig.semantic_tool_predictor.native_enabled()) {
-        std::fprintf(stderr,
-            "[server] native semantic tool hints require both "
-            "--tool-hint-native-model and --tool-hint-native-ipc-bin\n");
-        return 2;
-    }
     const bool tool_speculation_requested =
         !sconfig.tool_speculation.executor_path.empty() ||
         !sconfig.tool_speculation.profile_path.empty() ||
@@ -1404,31 +1300,6 @@ int main(int argc, char ** argv) {
     std::fprintf(stderr, "[server] │  cors            = %s\n", sconfig.enable_cors ? "ON" : "off");
     std::fprintf(stderr, "[server] │  tool_speculation= %s\n",
                  sconfig.tool_speculation.enabled() ? "ON" : "off");
-    std::fprintf(stderr, "[server] │  tool_call_predictor= %s\n",
-                 sconfig.semantic_tool_predictor.enabled() ? "ON" : "off");
-    if (sconfig.semantic_tool_predictor.enabled()) {
-        const auto & predictor = sconfig.semantic_tool_predictor;
-        std::fprintf(stderr, "[server] │  tool_hint_transport= %s%s\n",
-                     predictor.native_enabled() ? "native-qwen3" : "http",
-                     predictor.native_enabled() && predictor.http_enabled()
-                         ? "+http-fallback" : "");
-        std::fprintf(stderr, "[server] │  tool_hint_model = %s\n",
-                     predictor.native_enabled()
-                         ? predictor.native_model_path.c_str()
-                         : predictor.model.c_str());
-        if (predictor.native_enabled()) {
-            std::fprintf(stderr,
-                "[server] │  tool_hint_gpu   = %d (max_ctx=%d)\n",
-                predictor.native_gpu, predictor.native_max_ctx);
-        }
-        std::fprintf(stderr,
-            "[server] │  tool_hint_schedule= before-model\n");
-        std::fprintf(stderr, "[server] │  tool_hint_timeout= %d ms\n",
-                     predictor.timeout_ms);
-        std::fprintf(stderr, "[server] │  tool_hint_execute= %s (confidence=%.3f)\n",
-                     sconfig.tool_speculation.enabled() ? "ON" : "off",
-                     predictor.execution_confidence);
-    }
     if (sconfig.tool_speculation.enabled()) {
         std::fprintf(stderr, "[server] │  tool_spec_exec  = %s\n",
                      sconfig.tool_speculation.execution_mode());
@@ -1561,13 +1432,6 @@ int main(int argc, char ** argv) {
 
     HttpServer server(*backend, tokenizer, sconfig);
     server.set_chat_format(chat_format_for_arch(arch));
-    std::string semantic_predictor_error;
-    if (!server.init_semantic_tool_predictor(semantic_predictor_error)) {
-        std::fprintf(stderr,
-            "[server] native semantic tool predictor initialization failed: %s\n",
-            semantic_predictor_error.c_str());
-        return 1;
-    }
     g_server = &server;
     std::signal(SIGTERM, signal_handler);
     std::signal(SIGINT, signal_handler);

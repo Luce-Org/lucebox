@@ -23,6 +23,15 @@
      "model_wall_ms": 6061.288104014238,
      "prompt_tokens": 762,
      "completion_tokens": 134,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 762,
+      "decode_ms": 6032.9,
+      "decode_tokens_per_sec": 22.2,
+      "effective_prompt_tokens": 762,
+      "prefill_ms": 0.0,
+      "prefilled_tokens": 0
+     },
      "n_calls": 3,
      "early": [
       [
@@ -79,6 +88,15 @@
      "model_wall_ms": 10960.316718003014,
      "prompt_tokens": 1038,
      "completion_tokens": 134,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 896,
+      "decode_ms": 4396.3,
+      "decode_tokens_per_sec": 30.5,
+      "effective_prompt_tokens": 1038,
+      "prefill_ms": 6362.2,
+      "prefilled_tokens": 142
+     },
      "n_calls": 3,
      "early": [
       [
@@ -138,6 +156,15 @@
      "model_wall_ms": 25823.740269988775,
      "prompt_tokens": 1445,
      "completion_tokens": 80,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 897,
+      "decode_ms": 2464.0,
+      "decode_tokens_per_sec": 32.5,
+      "effective_prompt_tokens": 1445,
+      "prefill_ms": 23324.1,
+      "prefilled_tokens": 548
+     },
      "n_calls": 0,
      "early": [],
      "finish": "stop"
@@ -166,6 +193,15 @@
      "model_wall_ms": 5277.855696011102,
      "prompt_tokens": 644,
      "completion_tokens": 142,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 644,
+      "decode_ms": 5155.3,
+      "decode_tokens_per_sec": 27.5,
+      "effective_prompt_tokens": 644,
+      "prefill_ms": 0.0,
+      "prefilled_tokens": 0
+     },
      "n_calls": 3,
      "early": [
       [
@@ -222,6 +258,15 @@
      "model_wall_ms": 16968.42953300802,
      "prompt_tokens": 928,
      "completion_tokens": 136,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 644,
+      "decode_ms": 4573.5,
+      "decode_tokens_per_sec": 29.7,
+      "effective_prompt_tokens": 928,
+      "prefill_ms": 12181.9,
+      "prefilled_tokens": 284
+     },
      "n_calls": 3,
      "early": [
       [
@@ -281,6 +326,15 @@
      "model_wall_ms": 26420.417431974784,
      "prompt_tokens": 1337,
      "completion_tokens": 86,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 787,
+      "decode_ms": 3023.1,
+      "decode_tokens_per_sec": 28.4,
+      "effective_prompt_tokens": 1337,
+      "prefill_ms": 23366.7,
+      "prefilled_tokens": 550
+     },
      "n_calls": 0,
      "early": [],
      "finish": "stop"
@@ -309,6 +363,15 @@
      "model_wall_ms": 2463.075141014997,
      "prompt_tokens": 624,
      "completion_tokens": 41,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 624,
+      "decode_ms": 2436.6,
+      "decode_tokens_per_sec": 16.8,
+      "effective_prompt_tokens": 624,
+      "prefill_ms": 0.0,
+      "prefilled_tokens": 0
+     },
      "n_calls": 0,
      "early": [],
      "finish": "stop",
@@ -319,6 +382,15 @@
      "model_wall_ms": 4749.348801997257,
      "prompt_tokens": 707,
      "completion_tokens": 31,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 624,
+      "decode_ms": 1221.8,
+      "decode_tokens_per_sec": 25.4,
+      "effective_prompt_tokens": 707,
+      "prefill_ms": 3496.9,
+      "prefilled_tokens": 83
+     },
      "n_calls": 1,
      "early": [
       [
@@ -347,6 +419,15 @@
      "model_wall_ms": 3614.1322900075465,
      "prompt_tokens": 786,
      "completion_tokens": 40,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 738,
+      "decode_ms": 1214.7,
+      "decode_tokens_per_sec": 32.9,
+      "effective_prompt_tokens": 786,
+      "prefill_ms": 2208.0,
+      "prefilled_tokens": 48
+     },
      "n_calls": 1,
      "early": [
       [
@@ -376,6 +457,15 @@
      "model_wall_ms": 9573.28670399147,
      "prompt_tokens": 922,
      "completion_tokens": 31,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 738,
+      "decode_ms": 1591.9,
+      "decode_tokens_per_sec": 19.5,
+      "effective_prompt_tokens": 922,
+      "prefill_ms": 7949.3,
+      "prefilled_tokens": 184
+     },
      "n_calls": 1,
      "early": [
       [
@@ -404,6 +494,15 @@
      "model_wall_ms": 4443.268611998064,
      "prompt_tokens": 1008,
      "completion_tokens": 52,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 953,
+      "decode_ms": 2062.3,
+      "decode_tokens_per_sec": 25.2,
+      "effective_prompt_tokens": 1008,
+      "prefill_ms": 2352.2,
+      "prefilled_tokens": 55
+     },
      "n_calls": 0,
      "early": [
       [
@@ -419,6 +518,15 @@
      "model_wall_ms": 6143.834121001419,
      "prompt_tokens": 1052,
      "completion_tokens": 52,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 953,
+      "decode_ms": 1786.6,
+      "decode_tokens_per_sec": 29.1,
+      "effective_prompt_tokens": 1052,
+      "prefill_ms": 4315.4,
+      "prefilled_tokens": 99
+     },
      "n_calls": 0,
      "early": [
       [
@@ -434,6 +542,15 @@
      "model_wall_ms": 8048.965918977046,
      "prompt_tokens": 1096,
      "completion_tokens": 52,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 954,
+      "decode_ms": 1749.1,
+      "decode_tokens_per_sec": 29.7,
+      "effective_prompt_tokens": 1096,
+      "prefill_ms": 6265.9,
+      "prefilled_tokens": 142
+     },
      "n_calls": 0,
      "early": [
       [
@@ -449,6 +566,15 @@
      "model_wall_ms": 7713.250561006134,
      "prompt_tokens": 1140,
      "completion_tokens": 40,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 1011,
+      "decode_ms": 1925.9,
+      "decode_tokens_per_sec": 20.8,
+      "effective_prompt_tokens": 1140,
+      "prefill_ms": 5593.3,
+      "prefilled_tokens": 129
+     },
      "n_calls": 1,
      "early": [
       [
@@ -478,6 +604,15 @@
      "model_wall_ms": 10522.122813999886,
      "prompt_tokens": 1272,
      "completion_tokens": 32,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 1055,
+      "decode_ms": 1213.3,
+      "decode_tokens_per_sec": 26.4,
+      "effective_prompt_tokens": 1272,
+      "prefill_ms": 9272.9,
+      "prefilled_tokens": 217
+     },
      "n_calls": 1,
      "early": [
       [
@@ -506,6 +641,15 @@
      "model_wall_ms": 4664.3035619927105,
      "prompt_tokens": 1351,
      "completion_tokens": 53,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 1304,
+      "decode_ms": 2518.7,
+      "decode_tokens_per_sec": 21.0,
+      "effective_prompt_tokens": 1351,
+      "prefill_ms": 2108.4,
+      "prefilled_tokens": 47
+     },
      "n_calls": 0,
      "early": [
       [
@@ -539,6 +683,15 @@
      "model_wall_ms": 5835.811372002354,
      "prompt_tokens": 766,
      "completion_tokens": 161,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 766,
+      "decode_ms": 5674.6,
+      "decode_tokens_per_sec": 28.4,
+      "effective_prompt_tokens": 766,
+      "prefill_ms": 0.0,
+      "prefilled_tokens": 0
+     },
      "n_calls": 4,
      "early": [
       [
@@ -613,6 +766,15 @@
      "model_wall_ms": 9220.818842004519,
      "prompt_tokens": 1083,
      "completion_tokens": 54,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 927,
+      "decode_ms": 2327.4,
+      "decode_tokens_per_sec": 23.2,
+      "effective_prompt_tokens": 1083,
+      "prefill_ms": 6833.4,
+      "prefilled_tokens": 156
+     },
      "n_calls": 0,
      "early": [],
      "finish": "stop"
@@ -641,6 +803,15 @@
      "model_wall_ms": 6200.128458003746,
      "prompt_tokens": 648,
      "completion_tokens": 174,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 648,
+      "decode_ms": 6044.0,
+      "decode_tokens_per_sec": 28.8,
+      "effective_prompt_tokens": 648,
+      "prefill_ms": 0.0,
+      "prefilled_tokens": 0
+     },
      "n_calls": 4,
      "early": [
       [
@@ -715,6 +886,15 @@
      "model_wall_ms": 9109.838581003714,
      "prompt_tokens": 978,
      "completion_tokens": 57,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 822,
+      "decode_ms": 2133.0,
+      "decode_tokens_per_sec": 26.7,
+      "effective_prompt_tokens": 978,
+      "prefill_ms": 6948.0,
+      "prefilled_tokens": 156
+     },
      "n_calls": 0,
      "early": [],
      "finish": "stop"
@@ -743,6 +923,15 @@
      "model_wall_ms": 2473.6549759982154,
      "prompt_tokens": 628,
      "completion_tokens": 42,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 628,
+      "decode_ms": 2448.0,
+      "decode_tokens_per_sec": 17.2,
+      "effective_prompt_tokens": 628,
+      "prefill_ms": 0.0,
+      "prefilled_tokens": 0
+     },
      "n_calls": 0,
      "early": [],
      "finish": "stop",
@@ -753,6 +942,15 @@
      "model_wall_ms": 5110.993534995941,
      "prompt_tokens": 712,
      "completion_tokens": 33,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 628,
+      "decode_ms": 1435.9,
+      "decode_tokens_per_sec": 23.0,
+      "effective_prompt_tokens": 712,
+      "prefill_ms": 3649.1,
+      "prefilled_tokens": 84
+     },
      "n_calls": 1,
      "early": [
       [
@@ -782,6 +980,15 @@
      "model_wall_ms": 3109.7467670042533,
      "prompt_tokens": 786,
      "completion_tokens": 34,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 745,
+      "decode_ms": 1125.3,
+      "decode_tokens_per_sec": 30.2,
+      "effective_prompt_tokens": 786,
+      "prefill_ms": 1821.1,
+      "prefilled_tokens": 41
+     },
      "n_calls": 1,
      "early": [
       [
@@ -811,6 +1018,15 @@
      "model_wall_ms": 3161.816945997998,
      "prompt_tokens": 862,
      "completion_tokens": 34,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 820,
+      "decode_ms": 1183.5,
+      "decode_tokens_per_sec": 28.7,
+      "effective_prompt_tokens": 862,
+      "prefill_ms": 1800.6,
+      "prefilled_tokens": 42
+     },
      "n_calls": 1,
      "early": [
       [
@@ -840,6 +1056,15 @@
      "model_wall_ms": 3303.1189760076813,
      "prompt_tokens": 939,
      "completion_tokens": 34,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 896,
+      "decode_ms": 1313.8,
+      "decode_tokens_per_sec": 25.9,
+      "effective_prompt_tokens": 939,
+      "prefill_ms": 1834.0,
+      "prefilled_tokens": 43
+     },
      "n_calls": 1,
      "early": [
       [
@@ -869,6 +1094,15 @@
      "model_wall_ms": 3551.175480999518,
      "prompt_tokens": 1015,
      "completion_tokens": 59,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 973,
+      "decode_ms": 1691.4,
+      "decode_tokens_per_sec": 34.9,
+      "effective_prompt_tokens": 1015,
+      "prefill_ms": 1829.3,
+      "prefilled_tokens": 42
+     },
      "n_calls": 0,
      "early": [],
      "finish": "stop"
@@ -897,6 +1131,15 @@
      "model_wall_ms": 4029.1229840076994,
      "prompt_tokens": 779,
      "completion_tokens": 84,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 779,
+      "decode_ms": 4002.7,
+      "decode_tokens_per_sec": 21.0,
+      "effective_prompt_tokens": 779,
+      "prefill_ms": 0.0,
+      "prefilled_tokens": 0
+     },
      "n_calls": 2,
      "early": [
       [
@@ -939,6 +1182,15 @@
      "model_wall_ms": 12448.150962009095,
      "prompt_tokens": 1029,
      "completion_tokens": 112,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 863,
+      "decode_ms": 4971.7,
+      "decode_tokens_per_sec": 22.5,
+      "effective_prompt_tokens": 1029,
+      "prefill_ms": 7447.0,
+      "prefilled_tokens": 166
+     },
      "n_calls": 2,
      "early": [
       [
@@ -983,6 +1235,15 @@
      "model_wall_ms": 25262.662885012105,
      "prompt_tokens": 1328,
      "completion_tokens": 104,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 864,
+      "decode_ms": 5393.8,
+      "decode_tokens_per_sec": 19.3,
+      "effective_prompt_tokens": 1328,
+      "prefill_ms": 19838.5,
+      "prefilled_tokens": 464
+     },
      "n_calls": 0,
      "early": [],
      "finish": "stop"
@@ -1011,6 +1272,15 @@
      "model_wall_ms": 6240.457170002628,
      "prompt_tokens": 661,
      "completion_tokens": 53,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 661,
+      "decode_ms": 1659.6,
+      "decode_tokens_per_sec": 31.9,
+      "effective_prompt_tokens": 661,
+      "prefill_ms": 0.0,
+      "prefilled_tokens": 0
+     },
      "n_calls": 2,
      "early": [
       [
@@ -1053,6 +1323,15 @@
      "model_wall_ms": 12545.376653026324,
      "prompt_tokens": 880,
      "completion_tokens": 105,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 714,
+      "decode_ms": 5295.6,
+      "decode_tokens_per_sec": 19.8,
+      "effective_prompt_tokens": 880,
+      "prefill_ms": 7217.0,
+      "prefilled_tokens": 166
+     },
      "n_calls": 2,
      "early": [
       [
@@ -1097,6 +1376,15 @@
      "model_wall_ms": 23831.939805997536,
      "prompt_tokens": 1172,
      "completion_tokens": 102,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 715,
+      "decode_ms": 4264.7,
+      "decode_tokens_per_sec": 23.9,
+      "effective_prompt_tokens": 1172,
+      "prefill_ms": 19537.8,
+      "prefilled_tokens": 457
+     },
      "n_calls": 0,
      "early": [],
      "finish": "stop"
@@ -1125,6 +1413,15 @@
      "model_wall_ms": 3271.5004039928317,
      "prompt_tokens": 641,
      "completion_tokens": 27,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 595,
+      "decode_ms": 1203.1,
+      "decode_tokens_per_sec": 22.4,
+      "effective_prompt_tokens": 641,
+      "prefill_ms": 1837.0,
+      "prefilled_tokens": 46
+     },
      "n_calls": 1,
      "early": [
       [
@@ -1153,6 +1450,15 @@
      "model_wall_ms": 5085.682861012174,
      "prompt_tokens": 754,
      "completion_tokens": 27,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 668,
+      "decode_ms": 1214.0,
+      "decode_tokens_per_sec": 22.2,
+      "effective_prompt_tokens": 754,
+      "prefill_ms": 3679.0,
+      "prefilled_tokens": 86
+     },
      "n_calls": 1,
      "early": [
       [
@@ -1181,6 +1487,15 @@
      "model_wall_ms": 5165.933378011687,
      "prompt_tokens": 865,
      "completion_tokens": 39,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 781,
+      "decode_ms": 1346.2,
+      "decode_tokens_per_sec": 29.0,
+      "effective_prompt_tokens": 865,
+      "prefill_ms": 3595.7,
+      "prefilled_tokens": 84
+     },
      "n_calls": 1,
      "early": [
       [
@@ -1210,6 +1525,15 @@
      "model_wall_ms": 11812.486623006407,
      "prompt_tokens": 1000,
      "completion_tokens": 53,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 781,
+      "decode_ms": 2510.6,
+      "decode_tokens_per_sec": 21.1,
+      "effective_prompt_tokens": 1000,
+      "prefill_ms": 9272.9,
+      "prefilled_tokens": 219
+     },
      "n_calls": 0,
      "early": [
       [
@@ -1225,6 +1549,15 @@
      "model_wall_ms": 13081.007144006435,
      "prompt_tokens": 1043,
      "completion_tokens": 39,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 782,
+      "decode_ms": 1535.4,
+      "decode_tokens_per_sec": 25.4,
+      "effective_prompt_tokens": 1043,
+      "prefill_ms": 11356.1,
+      "prefilled_tokens": 261
+     },
      "n_calls": 1,
      "early": [
       [
@@ -1254,6 +1587,15 @@
      "model_wall_ms": 14849.663637985941,
      "prompt_tokens": 1177,
      "completion_tokens": 72,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 911,
+      "decode_ms": 3182.0,
+      "decode_tokens_per_sec": 22.6,
+      "effective_prompt_tokens": 1177,
+      "prefill_ms": 11636.6,
+      "prefilled_tokens": 266
+     },
      "n_calls": 0,
      "early": [],
      "finish": "stop"
@@ -1282,6 +1624,15 @@
      "model_wall_ms": 26114.305026014335,
      "prompt_tokens": 782,
      "completion_tokens": 405,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 782,
+      "decode_ms": 18672.9,
+      "decode_tokens_per_sec": 21.7,
+      "effective_prompt_tokens": 782,
+      "prefill_ms": 0.0,
+      "prefilled_tokens": 0
+     },
      "n_calls": 6,
      "early": [
       [
@@ -1388,6 +1739,15 @@
      "model_wall_ms": 43085.90617001755,
      "prompt_tokens": 1671,
      "completion_tokens": 77,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 782,
+      "decode_ms": 4618.6,
+      "decode_tokens_per_sec": 16.7,
+      "effective_prompt_tokens": 1671,
+      "prefill_ms": 38332.5,
+      "prefilled_tokens": 889
+     },
      "n_calls": 1,
      "early": [
       [
@@ -1416,6 +1776,15 @@
      "model_wall_ms": 4994.846866000444,
      "prompt_tokens": 1801,
      "completion_tokens": 54,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 1748,
+      "decode_ms": 2259.3,
+      "decode_tokens_per_sec": 23.9,
+      "effective_prompt_tokens": 1801,
+      "prefill_ms": 2455.1,
+      "prefilled_tokens": 53
+     },
      "n_calls": 1,
      "early": [
       [
@@ -1445,6 +1814,15 @@
      "model_wall_ms": 14792.466377984965,
      "prompt_tokens": 1949,
      "completion_tokens": 144,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 1748,
+      "decode_ms": 6003.1,
+      "decode_tokens_per_sec": 24.0,
+      "effective_prompt_tokens": 1949,
+      "prefill_ms": 8745.0,
+      "prefilled_tokens": 201
+     },
      "n_calls": 0,
      "early": [],
      "finish": "stop",
@@ -1455,6 +1833,15 @@
      "model_wall_ms": 24043.57336400426,
      "prompt_tokens": 2142,
      "completion_tokens": 165,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 1749,
+      "decode_ms": 6834.4,
+      "decode_tokens_per_sec": 24.1,
+      "effective_prompt_tokens": 2142,
+      "prefill_ms": 17172.7,
+      "prefilled_tokens": 393
+     },
      "n_calls": 0,
      "early": [],
      "finish": "stop"
@@ -1483,6 +1870,15 @@
      "model_wall_ms": 7485.359696001979,
      "prompt_tokens": 664,
      "completion_tokens": 188,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 664,
+      "decode_ms": 7158.8,
+      "decode_tokens_per_sec": 26.3,
+      "effective_prompt_tokens": 664,
+      "prefill_ms": 0.0,
+      "prefilled_tokens": 0
+     },
      "n_calls": 4,
      "early": [
       [
@@ -1553,6 +1949,15 @@
      "model_wall_ms": 29763.04830299341,
      "prompt_tokens": 1263,
      "completion_tokens": 108,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 664,
+      "decode_ms": 4108.8,
+      "decode_tokens_per_sec": 26.3,
+      "effective_prompt_tokens": 1263,
+      "prefill_ms": 25619.9,
+      "prefilled_tokens": 599
+     },
      "n_calls": 2,
      "early": [
       [
@@ -1597,6 +2002,15 @@
      "model_wall_ms": 35428.83354899823,
      "prompt_tokens": 1556,
      "completion_tokens": 127,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 854,
+      "decode_ms": 5395.1,
+      "decode_tokens_per_sec": 23.5,
+      "effective_prompt_tokens": 1556,
+      "prefill_ms": 29995.7,
+      "prefilled_tokens": 702
+     },
      "n_calls": 0,
      "early": [],
      "finish": "stop"
@@ -1625,6 +2039,15 @@
      "model_wall_ms": 10989.259896014119,
      "prompt_tokens": 644,
      "completion_tokens": 181,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 595,
+      "decode_ms": 9006.6,
+      "decode_tokens_per_sec": 20.1,
+      "effective_prompt_tokens": 644,
+      "prefill_ms": 1956.0,
+      "prefilled_tokens": 49
+     },
      "n_calls": 1,
      "early": [
       [
@@ -1653,6 +2076,15 @@
      "model_wall_ms": 18521.31282101618,
      "prompt_tokens": 997,
      "completion_tokens": 55,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 644,
+      "decode_ms": 3183.4,
+      "decode_tokens_per_sec": 17.3,
+      "effective_prompt_tokens": 997,
+      "prefill_ms": 15202.1,
+      "prefilled_tokens": 353
+     },
      "n_calls": 1,
      "early": [
       [
@@ -1681,6 +2113,15 @@
      "model_wall_ms": 8941.274813987548,
      "prompt_tokens": 1181,
      "completion_tokens": 68,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 1052,
+      "decode_ms": 3290.2,
+      "decode_tokens_per_sec": 20.7,
+      "effective_prompt_tokens": 1181,
+      "prefill_ms": 5619.9,
+      "prefilled_tokens": 129
+     },
      "n_calls": 1,
      "early": [
       [
@@ -1709,6 +2150,15 @@
      "model_wall_ms": 4422.434547013836,
      "prompt_tokens": 1302,
      "completion_tokens": 48,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 1249,
+      "decode_ms": 1786.8,
+      "decode_tokens_per_sec": 26.9,
+      "effective_prompt_tokens": 1302,
+      "prefill_ms": 2414.6,
+      "prefilled_tokens": 53
+     },
      "n_calls": 1,
      "early": [
       [
@@ -1738,6 +2188,15 @@
      "model_wall_ms": 10752.883092005504,
      "prompt_tokens": 1444,
      "completion_tokens": 48,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 1249,
+      "decode_ms": 2226.4,
+      "decode_tokens_per_sec": 21.6,
+      "effective_prompt_tokens": 1444,
+      "prefill_ms": 8403.4,
+      "prefilled_tokens": 195
+     },
      "n_calls": 1,
      "early": [
       [
@@ -1766,6 +2225,15 @@
      "model_wall_ms": 5735.243677016115,
      "prompt_tokens": 1559,
      "completion_tokens": 64,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 1492,
+      "decode_ms": 2648.8,
+      "decode_tokens_per_sec": 24.2,
+      "effective_prompt_tokens": 1559,
+      "prefill_ms": 3048.5,
+      "prefilled_tokens": 67
+     },
      "n_calls": 0,
      "early": [
       [
@@ -1781,6 +2249,15 @@
      "model_wall_ms": 7853.041015012423,
      "prompt_tokens": 1613,
      "completion_tokens": 64,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 1492,
+      "decode_ms": 2572.9,
+      "decode_tokens_per_sec": 24.9,
+      "effective_prompt_tokens": 1613,
+      "prefill_ms": 5241.4,
+      "prefilled_tokens": 121
+     },
      "n_calls": 0,
      "early": [
       [
@@ -1796,6 +2273,15 @@
      "model_wall_ms": 9759.342893987196,
      "prompt_tokens": 1667,
      "completion_tokens": 54,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 1493,
+      "decode_ms": 2183.2,
+      "decode_tokens_per_sec": 24.7,
+      "effective_prompt_tokens": 1667,
+      "prefill_ms": 7537.3,
+      "prefilled_tokens": 174
+     },
      "n_calls": 0,
      "early": [
       [
@@ -1811,6 +2297,15 @@
      "model_wall_ms": 8276.063522003824,
      "prompt_tokens": 1711,
      "completion_tokens": 54,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 1572,
+      "decode_ms": 2173.6,
+      "decode_tokens_per_sec": 24.8,
+      "effective_prompt_tokens": 1711,
+      "prefill_ms": 6063.1,
+      "prefilled_tokens": 139
+     },
      "n_calls": 0,
      "early": [
       [
@@ -1826,6 +2321,15 @@
      "model_wall_ms": 8276.96162299253,
      "prompt_tokens": 1755,
      "completion_tokens": 54,
+     "timings": {
+      "cache_hit": true,
+      "cached_prefix_tokens": 1626,
+      "decode_ms": 2639.2,
+      "decode_tokens_per_sec": 20.5,
+      "effective_prompt_tokens": 1755,
+      "prefill_ms": 5602.3,
+      "prefilled_tokens": 129
+     },
      "n_calls": 0,
      "early": [
       [

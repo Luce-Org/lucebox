@@ -124,6 +124,7 @@ def run_task(task_id: str, prompt: str, expect: list[str], arm: str, single_call
         early = resp.get("dflash_early_dispatch") or []
         turn["early"] = [{k: e.get(k) for k in ("name", "status", "reason", "detail", "launched_at_token", "executor_wall_ms", "commit_wait_ms")} for e in early] if early else None
         early_hits = {e["result"]["call_sha256"]: e["result"] for e in early if e.get("status") == "hit" and isinstance(e.get("result"), dict)}
+        early_content = {e["result"]["call_sha256"]: e["tool_message_content"] for e in early if e.get("status") == "hit" and isinstance(e.get("result"), dict) and e.get("tool_message_content")}
         for i, (cid, name, args) in enumerate(parsed):
             if results[i] is None and args is not None and name in rest_tools.TOOL_NAMES:
                 sha = rest_tools.call_sha256(name, args)
@@ -145,7 +146,10 @@ def run_task(task_id: str, prompt: str, expect: list[str], arm: str, single_call
         turn["tools"] = [{"name": parsed[i][1], "args": parsed[i][2], "source": sources[i], "elapsed_ms": results[i].get("elapsed_ms"), "ok": results[i].get("ok")} for i in range(len(parsed))]
         turn["tool_wait_ms"] = wait
         for i, (cid, name, args) in enumerate(parsed):
-            messages.append({"role": "tool", "tool_call_id": cid, "content": rest_tools.format_result(results[i])})
+            sha = rest_tools.call_sha256(name, args) if args is not None else None
+            # Echo the server's canonical tool text so prefetch-prefill hits.
+            content = early_content.get(sha) or rest_tools.format_result(results[i])
+            messages.append({"role": "tool", "tool_call_id": cid, "content": content})
         turns.append(turn)
     wall_ms = (time.perf_counter() - t_start) * 1000.0
     correct = final is not None and all(e.lower() in final.lower() for e in expect)

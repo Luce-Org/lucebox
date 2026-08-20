@@ -8,7 +8,6 @@
 #include "gemma4/gemma4_layer_split_adapter.h"
 #include "laguna/laguna_layer_split_adapter.h"
 #include "pflash_drafter_ipc.h"
-#include "qwen3_tool_predictor_ipc.h"
 #include "common/platform_env.h"
 #include "qwen35_target_shard_ipc.h"
 
@@ -118,8 +117,6 @@ int main(int argc, char ** argv) {
             "[--shared-payload-fd=FD --shared-payload-bytes=N] [--draft-gpu=N]\n"
             "   or: %s --backend-ipc-mode=pflash-compress <drafter.gguf> "
             "--stream-fd=FD [--draft-gpu=N]\n"
-            "   or: %s --backend-ipc-mode=qwen3-tool-predict <qwen3.gguf> "
-            "--stream-fd=FD --target-gpu=N --max-ctx=N\n"
             "   or: %s --backend-ipc-mode=qwen35-target-shard <target.gguf> "
             "--stream-fd=FD --target-gpu=N --layer-begin=N --layer-end=N "
             "--max-ctx=N [--hidden=N --vocab=N --max-tokens=N]\n"
@@ -136,8 +133,6 @@ int main(int argc, char ** argv) {
             "--layer-ends=N[,N...] --max-ctx=N\n"
             "   or: %s --backend-ipc-mode=moe-expert-compute <target.gguf> "
             "--stream-fd=FD --target-gpu=N --placement=PATH\n",
-            argv[0],
-            argv[0],
             argv[0],
             argv[0],
             argv[0],
@@ -320,9 +315,6 @@ int main(int argc, char ** argv) {
                                                shared_payload_bytes);
         case BackendIpcMode::PFlashCompress:
             return run_pflash_drafter_ipc_daemon(payload_path, draft_gpu, stream_fd);
-        case BackendIpcMode::Qwen3ToolPredict:
-            return run_qwen3_tool_predictor_ipc_daemon(
-                payload_path, target_gpu, max_ctx, stream_fd);
         case BackendIpcMode::Qwen35TargetShard:
             if (target_gpus.empty()) target_gpus.push_back(target_gpu);
             if (layer_begins.empty()) layer_begins.push_back(layer_begin);

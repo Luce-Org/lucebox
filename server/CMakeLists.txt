@@ -446,7 +446,6 @@ add_library(dflash_common STATIC
     src/common/dflash_draft_ipc.cpp
     src/common/dflash_draft_ipc_daemon.cpp
     src/common/pflash_drafter_ipc.cpp
-    src/common/qwen3_tool_predictor_ipc.cpp
     src/common/dflash_draft_graph.cpp
     src/common/dflash_draft_kv.cpp
     src/common/dflash_spec_decode.cpp
@@ -498,8 +497,6 @@ add_library(dflash_common STATIC
     src/server/chat_template.cpp
     src/server/tool_parser.cpp
     src/server/tool_hint.cpp
-    src/server/semantic_tool_hint.cpp
-    src/server/native_semantic_tool_predictor.cpp
     src/server/reasoning.cpp
     src/server/tool_memory.cpp
     src/server/sse_emitter.cpp
@@ -1534,7 +1531,6 @@ if(DFLASH27B_TESTS)
             test/test_unit_main.cpp
             test/test_server_unit.cpp
             test/test_tool_speculation.cpp
-            test/test_semantic_tool_hint.cpp
             test/test_anchor_params.cpp
             test/test_derived_scalars.cpp
             test/test_adaptive_keep_ratio.cpp
@@ -1995,7 +1991,6 @@ if(DFLASH27B_SERVER)
         add_executable(backend_ipc_daemon
             src/ipc/backend_ipc_main.cpp
             src/common/pflash_drafter_ipc_daemon.cpp
-            src/common/qwen3_tool_predictor_ipc_daemon.cpp
         )
         target_include_directories(backend_ipc_daemon PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         if(DFLASH27B_GPU_BACKEND STREQUAL "hip")

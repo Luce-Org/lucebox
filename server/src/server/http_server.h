@@ -20,8 +20,6 @@
 #include "chat_template.h"
 #include "tool_memory.h"
 #include "tool_speculation.h"
-#include "semantic_tool_hint.h"
-#include "native_semantic_tool_predictor.h"
 #include "prefix_cache.h"
 #include "disk_prefix_cache.h"
 #include "freeze_history.h"
@@ -105,6 +103,10 @@ struct ServerConfig {
     // executor lane the moment its call block closes in the token stream
     // (no predictor needed, N calls per response, per-call exact commit).
     bool        early_dispatch = false;
+    // After a tool turn whose early-dispatched results all committed,
+    // prefill the deterministic next-turn prompt into the prefix cache
+    // before the client's next request arrives.
+    bool        prefetch_prefill = false;
 
     // Pin-Friendly Prompt Processor (PPP): LCP pin_end + optional rearrange.
     // See docs/PIN_FRIENDLY_PROMPT.md. Env: DFLASH_PPP=0|1,
@@ -253,7 +255,6 @@ struct ServerConfig {
     // Model-agnostic tool-call prediction. Predictors run before the target;
     // only the allowlisted external tool overlaps target generation. This is
     // the qualified schedule on shared and single-accelerator deployments.
-    SemanticToolPredictorConfig semantic_tool_predictor;
 };
 
 namespace http_detail {
@@ -274,11 +275,6 @@ bool should_clamp_flowkv_disk_cache(
 // either caller-supplied or automatic speculative execution can start.
 bool tool_choice_disables_tool_calls(const json & tool_choice);
 // Convert the exact normalized dialogue rendered for the target into the
-// OpenAI-compatible message shape consumed by semantic predictors. The input
-// is taken by value so callers can move the rendered message storage into the
-// predictor payload without another full content copy.
-json canonical_predictor_messages(std::vector<ChatMessage> messages);
-
 }  // namespace http_detail
 
 // ─── Parsed request ─────────────────────────────────────────────────────
@@ -295,13 +291,7 @@ struct ParsedRequest {
     // Tool choice constraint (stored for hint generation)
     json                      tool_choice;
     // Original messages (for response formatting)
-    json                      messages;
-    // Canonical dialogue used by the semantic predictor. Responses API
-    // function_call/function_call_output items are represented here as the
-    // assistant/tool turns seen by the target instead of disappearing during
-    // predictor prompt construction.
-    json                      predictor_messages;
-    // Original request body (for upstream proxy forwarding)
+    json                      messages;    // Original request body (for upstream proxy forwarding)
     json                      raw_body;
     // Concrete invocation predicted by a caller or future semantic sidecar.
     // The engine may execute it privately, but never exposes its result until
@@ -309,15 +299,9 @@ struct ParsedRequest {
     std::optional<ToolSpeculationPrediction> tool_speculation;
     // Engine-side prediction may start a private external tool before target
     // generation. The model's eventual canonical call remains authoritative.
-    struct AutomaticToolSpeculationLaunch {
-        std::shared_ptr<ToolSpeculationAttempt> attempt;
-        double predictor_wall_ms = 0.0;
-        std::string prediction_source;
-        std::string predictor_error;
-    };
+    // Request opt-out ("automatic_tool_speculation": false disables early
+    // dispatch for this request).
     bool                      automatic_tool_speculation_enabled = true;
-    std::optional<AutomaticToolSpeculationLaunch>
-                              automatic_tool_speculation;
     // Response ID
     std::string               response_id;
     // Thinking/reasoning state
@@ -384,10 +368,6 @@ public:
 
     // Set the chat template format (detected from model arch).
     void set_chat_format(ChatFormat fmt) { chat_format_ = fmt; }
-
-    // Start the optional native Qwen predictor after target construction.
-    // HTTP-only predictor configurations need no persistent initialization.
-    bool init_semantic_tool_predictor(std::string & error);
 
     // Start listening. Blocks until shutdown() is called.
     int run();
@@ -506,6 +486,14 @@ private:
         GenerationOutputState & output,
         const std::vector<ToolCall> & authoritative_calls,
         const char * cancel_reason);
+    bool render_messages_to_tokens(
+        const std::vector<ChatMessage> & chat_messages,
+        const ParsedRequest & req, bool & started_in_thinking,
+        std::vector<int32_t> & tokens, std::string & error);
+    void prefetch_next_turn(
+        const ParsedRequest & req, SseEmitter & emitter,
+        const GenerationOutputState & output,
+        const nlohmann::json & early_items);
 
     // Worker thread, concurrent mode (the backend exposes a SeqEngine):
     // iteration-level scheduler. Admission is claim-only; this baseline
@@ -561,9 +549,7 @@ private:
         SocketHandle fd, const std::vector<ChatMessage> & chat_messages,
         ParsedRequest & req);
     bool validate_request_context(SocketHandle fd, const ParsedRequest & req);
-    void log_parsed_request(const ParsedRequest & req) const;
-    void start_automatic_tool_speculation(ParsedRequest & req) const;
-    void enqueue_request_and_wait(SocketHandle fd, ParsedRequest req);
+    void log_parsed_request(const ParsedRequest & req) const;    void enqueue_request_and_wait(SocketHandle fd, ParsedRequest req);
 
     // Send HTTP response helpers.
     bool send_response(SocketHandle fd, int status, const std::string & content_type,
@@ -589,9 +575,7 @@ private:
     Tokenizer *      drafter_tokenizer_ = nullptr;  // pflash drafter (optional)
     ServerConfig     config_;
     ChatFormat       chat_format_;
-    PFlashDrafterIpcClient pflash_remote_;
-    std::shared_ptr<NativeSemanticToolPredictor> native_semantic_predictor_;
-    ToolMemory       tool_memory_;
+    PFlashDrafterIpcClient pflash_remote_;    ToolMemory       tool_memory_;
     PrefixCache      prefix_cache_;
     DiskPrefixCache  disk_cache_;
 

@@ -483,165 +483,6 @@ struct SemanticSidecarUrl {
     std::string path;
 };
 
-bool parse_semantic_sidecar_url(
-        const std::string & value, SemanticSidecarUrl & out) {
-    constexpr char kHttpPrefix[] = "http://";
-    if (value.rfind(kHttpPrefix, 0) != 0) return false;
-    const size_t authority_begin = sizeof(kHttpPrefix) - 1;
-    const size_t path_begin = value.find('/', authority_begin);
-    const std::string authority = value.substr(
-        authority_begin,
-        path_begin == std::string::npos
-            ? std::string::npos
-            : path_begin - authority_begin);
-    if (authority.empty() || authority.find('@') != std::string::npos) {
-        return false;
-    }
-
-    const size_t colon = authority.rfind(':');
-    if (colon == std::string::npos) {
-        out.host = authority;
-        out.port = "80";
-    } else {
-        out.host = authority.substr(0, colon);
-        out.port = authority.substr(colon + 1);
-    }
-    out.path = path_begin == std::string::npos
-        ? "/" : value.substr(path_begin);
-    if (out.host.empty() || out.port.empty() || out.path.empty()) return false;
-    if (out.host.front() == '[' || out.host.find(':') != std::string::npos) {
-        // Reject ambiguous IPv6 authority parsing instead of silently
-        // connecting to the wrong host.
-        return false;
-    }
-    if (!std::all_of(out.port.begin(), out.port.end(), [](unsigned char ch) {
-        return std::isdigit(ch) != 0;
-    })) {
-        return false;
-    }
-    try {
-        const unsigned long port = std::stoul(out.port);
-        if (port == 0 || port > 65535) return false;
-    } catch (...) {
-        return false;
-    }
-    // A numeric address makes the configured wall-clock deadline independent
-    // of an unbounded platform DNS resolver. Keep localhost as the ergonomic
-    // production spelling for an on-host predictor.
-    if (out.host == "localhost") out.host = "127.0.0.1";
-    in_addr address{};
-    return ::inet_pton(AF_INET, out.host.c_str(), &address) == 1;
-}
-
-bool semantic_sidecar_send_all(
-        SocketHandle fd,
-        const char * data,
-        size_t size,
-        const std::chrono::steady_clock::time_point & deadline) {
-    size_t sent = 0;
-    while (sent < size) {
-        const auto now = std::chrono::steady_clock::now();
-        if (now >= deadline) return false;
-        const int remaining_ms = std::max(1, static_cast<int>(
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                deadline - now).count()));
-        struct pollfd descriptor{fd, POLLOUT, 0};
-        const int polled = poll(&descriptor, 1, remaining_ms);
-        if (polled < 0 && sock_is_eintr(sock_errno())) continue;
-        if (polled <= 0 ||
-            !(descriptor.revents & POLLOUT) ||
-            (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL))) {
-            return false;
-        }
-        if (std::chrono::steady_clock::now() >= deadline) return false;
-#if defined(_WIN32)
-        const int n = ::send(
-            fd, data + sent,
-            static_cast<int>(std::min<size_t>(size - sent, INT_MAX)), 0);
-#else
-        const ssize_t n = ::send(
-            fd, data + sent, size - sent, MSG_NOSIGNAL);
-#endif
-        if (n < 0 && (sock_is_eintr(sock_errno()) ||
-                      sock_is_eagain(sock_errno()))) {
-            continue;
-        }
-        if (n <= 0) return false;
-        sent += static_cast<size_t>(n);
-    }
-    return true;
-}
-
-bool semantic_sidecar_connect(
-        const SemanticSidecarUrl & url,
-        const std::chrono::steady_clock::time_point & deadline,
-        SocketHandle & fd) {
-    fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (!socket_is_valid(fd)) return false;
-    if (!sock_set_nonblock(fd)) {
-        socket_close(fd);
-        fd = kInvalidSocket;
-        return false;
-    }
-
-    sockaddr_in address{};
-    address.sin_family = AF_INET;
-    address.sin_port = htons(static_cast<uint16_t>(std::stoul(url.port)));
-    if (::inet_pton(AF_INET, url.host.c_str(), &address.sin_addr) != 1) {
-        socket_close(fd);
-        fd = kInvalidSocket;
-        return false;
-    }
-    if (::connect(fd, reinterpret_cast<const sockaddr *>(&address),
-                  static_cast<socklen_t>(sizeof(address))) == 0) {
-        return true;
-    }
-    const int connect_error = sock_errno();
-#if defined(_WIN32)
-    const bool pending = connect_error == WSAEWOULDBLOCK ||
-                         connect_error == WSAEINPROGRESS ||
-                         connect_error == WSAEINVAL;
-#else
-    const bool pending = connect_error == EINPROGRESS ||
-                         connect_error == EWOULDBLOCK;
-#endif
-    if (!pending) {
-        socket_close(fd);
-        fd = kInvalidSocket;
-        return false;
-    }
-
-    struct pollfd descriptor{fd, POLLOUT, 0};
-    int polled = -1;
-    while (true) {
-        const auto now = std::chrono::steady_clock::now();
-        if (now >= deadline) {
-            socket_close(fd);
-            fd = kInvalidSocket;
-            return false;
-        }
-        const int remaining_ms = std::max(1, static_cast<int>(
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                deadline - now).count()));
-        descriptor.revents = 0;
-        polled = poll(&descriptor, 1, remaining_ms);
-        if (polled < 0 && sock_is_eintr(sock_errno())) continue;
-        break;
-    }
-    int socket_error = 0;
-    socklen_t error_size = static_cast<socklen_t>(sizeof(socket_error));
-    if (std::chrono::steady_clock::now() >= deadline ||
-        polled <= 0 || !(descriptor.revents & POLLOUT) ||
-        getsockopt(fd, SOL_SOCKET, SO_ERROR,
-                   reinterpret_cast<char *>(&socket_error), &error_size) != 0 ||
-        socket_error != 0) {
-        socket_close(fd);
-        fd = kInvalidSocket;
-        return false;
-    }
-    return true;
-}
-
 std::string lowercase_ascii(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(),
         [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
@@ -678,205 +519,6 @@ bool decode_chunked_http_body(
         }
         offset += 2;
     }
-}
-
-SemanticToolPrediction request_semantic_tool_prediction(
-        const SemanticToolPredictorConfig & config,
-        const json & payload,
-        const json & request_tools) {
-    const auto started = std::chrono::steady_clock::now();
-    const auto deadline = started +
-        std::chrono::milliseconds(std::max(1, config.timeout_ms));
-    SemanticToolPrediction prediction;
-    prediction.source = config.model;
-    auto finish = [&]() {
-        prediction.wall_ms = std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - started).count();
-        return prediction;
-    };
-
-    SemanticSidecarUrl url;
-    if (!parse_semantic_sidecar_url(config.url, url)) {
-        prediction.error = "predictor_url_must_use_http_numeric_ipv4";
-        return finish();
-    }
-
-    SocketHandle fd = kInvalidSocket;
-    if (!semantic_sidecar_connect(url, deadline, fd)) {
-        prediction.error = "predictor_connect_failed";
-        return finish();
-    }
-
-    const std::string body = payload.dump();
-    const std::string request =
-        "POST " + url.path + " HTTP/1.1\r\n" +
-        "Host: " + url.host + ":" + url.port + "\r\n" +
-        "Content-Type: application/json\r\n" +
-        "Accept: application/json\r\n" +
-        "Connection: close\r\n" +
-        "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" +
-        body;
-    if (!semantic_sidecar_send_all(
-            fd, request.data(), request.size(), deadline)) {
-        socket_close(fd);
-        prediction.error = std::chrono::steady_clock::now() >= deadline
-            ? "predictor_timeout" : "predictor_send_failed";
-        return finish();
-    }
-
-    constexpr size_t kMaxResponseBytes = 1024 * 1024;
-    std::string response;
-    std::array<char, 8192> buffer{};
-    while (response.size() < kMaxResponseBytes) {
-        const auto now = std::chrono::steady_clock::now();
-        if (now >= deadline) {
-            socket_close(fd);
-            prediction.error = "predictor_timeout";
-            return finish();
-        }
-        const int remaining_ms = std::max(1, static_cast<int>(
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                deadline - now).count()));
-        struct pollfd descriptor{fd, POLLIN | POLLHUP, 0};
-        const int polled = poll(&descriptor, 1, remaining_ms);
-        if (polled < 0 && sock_is_eintr(sock_errno())) continue;
-        if (polled == 0) {
-            socket_close(fd);
-            prediction.error = "predictor_timeout";
-            return finish();
-        }
-        if (polled < 0 ||
-            (descriptor.revents & (POLLERR | POLLNVAL))) {
-            socket_close(fd);
-            prediction.error = "predictor_receive_failed";
-            return finish();
-        }
-        if (std::chrono::steady_clock::now() >= deadline) {
-            socket_close(fd);
-            prediction.error = "predictor_timeout";
-            return finish();
-        }
-#if defined(_WIN32)
-        const int received = recv(
-            fd, buffer.data(), static_cast<int>(buffer.size()), 0);
-#else
-        const ssize_t received = recv(fd, buffer.data(), buffer.size(), 0);
-#endif
-        if (received == 0) break;
-        if (received < 0) {
-            if (sock_is_eintr(sock_errno()) ||
-                sock_is_eagain(sock_errno())) {
-                continue;
-            }
-            socket_close(fd);
-            prediction.error = "predictor_receive_failed";
-            return finish();
-        }
-        response.append(buffer.data(), static_cast<size_t>(received));
-    }
-    socket_close(fd);
-    if (response.size() >= kMaxResponseBytes) {
-        prediction.error = "predictor_response_too_large";
-        return finish();
-    }
-
-    const size_t header_end = response.find("\r\n\r\n");
-    const size_t status_end = response.find("\r\n");
-    if (header_end == std::string::npos || status_end == std::string::npos) {
-        prediction.error = "predictor_malformed_http_response";
-        return finish();
-    }
-    const std::string status_line = response.substr(0, status_end);
-    const size_t status_space = status_line.find(' ');
-    if (status_space == std::string::npos ||
-        status_line.size() < status_space + 4) {
-        prediction.error = "predictor_malformed_http_status";
-        return finish();
-    }
-    const int status = std::atoi(status_line.c_str() + status_space + 1);
-    if (status < 200 || status >= 300) {
-        prediction.error = "predictor_http_status_" + std::to_string(status);
-        return finish();
-    }
-
-    const std::string headers = lowercase_ascii(
-        response.substr(status_end + 2, header_end - status_end - 2));
-    const std::string encoded_body = response.substr(header_end + 4);
-    std::string response_body;
-    if (headers.find("transfer-encoding: chunked") != std::string::npos) {
-        if (!decode_chunked_http_body(encoded_body, response_body)) {
-            prediction.error = "predictor_invalid_chunked_response";
-            return finish();
-        }
-    } else {
-        response_body = encoded_body;
-    }
-
-    json response_json;
-    try {
-        response_json = json::parse(response_body);
-    } catch (...) {
-        prediction.error = "predictor_response_invalid_json";
-        return finish();
-    }
-    if (!parse_semantic_tool_prediction(
-            response_json, request_tools, prediction.call,
-            prediction.error)) {
-        return finish();
-    }
-    if (!materialize_declared_tool_defaults(
-            request_tools, prediction.call, prediction.error)) {
-        return finish();
-    }
-    prediction.ok = true;
-    return finish();
-}
-
-SemanticToolPrediction predict_semantic_tool_call(
-        const SemanticToolPredictorConfig & config,
-        const SemanticToolPredictorRequest & request,
-        const json & request_tools,
-        const std::shared_ptr<NativeSemanticToolPredictor> & native) {
-    const auto started = std::chrono::steady_clock::now();
-    SemanticToolPrediction native_result;
-    if (native && native->active()) {
-        native_result = native->predict(request, request_tools);
-        if (native_result.ok || !config.http_enabled()) {
-            return native_result;
-        }
-    }
-    if (!config.http_enabled()) {
-        if (native_result.error.empty()) {
-            native_result.error = "native_predictor_not_initialized";
-        }
-        return native_result;
-    }
-
-    const double elapsed_ms = std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - started).count();
-    const int remaining_ms = config.timeout_ms -
-        static_cast<int>(std::ceil(elapsed_ms));
-    if (remaining_ms <= 0) {
-        native_result.source = config.model;
-        native_result.ok = false;
-        native_result.error = native_result.error.empty()
-            ? "predictor_timeout"
-            : "native=" + native_result.error + ";http=predictor_timeout";
-        native_result.wall_ms = elapsed_ms;
-        return native_result;
-    }
-
-    SemanticToolPredictorConfig fallback_config = config;
-    fallback_config.timeout_ms = remaining_ms;
-    SemanticToolPrediction fallback = request_semantic_tool_prediction(
-        fallback_config, request.payload(), request_tools);
-    if (!fallback.ok && !native_result.error.empty()) {
-        fallback.error = "native=" + native_result.error +
-                         ";http=" + fallback.error;
-    }
-    fallback.wall_ms = std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - started).count();
-    return fallback;
 }
 
 }  // namespace
@@ -1257,22 +899,22 @@ json build_props_body(const ServerConfig & config,
             {"enabled", config.tool_speculation.enabled()},
             {"automatic_prediction_enabled",
              config.tool_speculation.enabled() &&
-                 config.semantic_tool_predictor.enabled()},
+                 false},
             {"prediction_source",
-             config.semantic_tool_predictor.native_enabled()
+             false
                  ? json("native-qwen3")
-                 : config.semantic_tool_predictor.http_enabled()
-                     ? json(config.semantic_tool_predictor.model)
+                 : false
+                     ? json(nullptr)
                      : json(nullptr)},
             {"prediction_confidence",
-             config.semantic_tool_predictor.enabled()
-                 ? json(config.semantic_tool_predictor.execution_confidence)
+             false
+                 ? json(nullptr)
                  : json(nullptr)},
             {"predictor_schedule",
-             config.semantic_tool_predictor.enabled()
+             false
                  ? json("before-model") : json(nullptr)},
             {"predictor_decode_isolated",
-             config.semantic_tool_predictor.enabled()},
+             false},
             {"execution_mode", config.tool_speculation.execution_mode()},
             {"profile_status",
              config.tool_speculation.policy.empty()
@@ -1285,7 +927,7 @@ json build_props_body(const ServerConfig & config,
             {"protocol", "dflash.tool-speculation.v1"},
             {"client_prediction_required",
              config.tool_speculation.enabled() &&
-                 !config.semantic_tool_predictor.enabled()},
+                 !false},
             {"client_result_handling_required",
              config.tool_speculation.enabled()},
             {"preserves_token_speculation", true},
@@ -1490,21 +1132,6 @@ std::vector<ChatMessage> normalize_chat_messages(
 }
 
 namespace http_detail {
-
-json canonical_predictor_messages(std::vector<ChatMessage> messages) {
-    json canonical = json::array();
-    for (ChatMessage & message : messages) {
-        json item = {
-            {"role", std::move(message.role)},
-            {"content", std::move(message.content)},
-        };
-        if (!message.tool_call_id.empty()) {
-            item["tool_call_id"] = std::move(message.tool_call_id);
-        }
-        canonical.push_back(std::move(item));
-    }
-    return canonical;
-}
 
 }  // namespace http_detail
 
@@ -1758,24 +1385,6 @@ HttpServer::~HttpServer() {
     #ifdef DFLASH_HAS_CURL
     curl_global_cleanup();
     #endif
-}
-
-bool HttpServer::init_semantic_tool_predictor(std::string & error) {
-    error.clear();
-    if (!config_.semantic_tool_predictor.native_enabled()) return true;
-    native_semantic_predictor_ = NativeSemanticToolPredictor::create(
-        config_.semantic_tool_predictor, error);
-    if (native_semantic_predictor_) return true;
-    // An explicitly configured HTTP lane is a valid fail-open fallback. The
-    // target remains authoritative and still verifies every prediction.
-    if (config_.semantic_tool_predictor.http_enabled()) {
-        std::fprintf(stderr,
-            "[tool-hint] native predictor unavailable (%s); using HTTP fallback\n",
-            error.c_str());
-        error.clear();
-        return true;
-    }
-    return false;
 }
 
 void HttpServer::shutdown() {
@@ -2432,23 +2041,20 @@ void HttpServer::apply_request_reasoning(
 }
 
 // Render messages to prompt text and tokenize into req.prompt_tokens.
-bool HttpServer::render_and_tokenize_request(
-        SocketHandle fd, const std::vector<ChatMessage> & chat_messages,
-        ParsedRequest & req) {
+
+bool HttpServer::render_messages_to_tokens(
+        const std::vector<ChatMessage> & chat_messages,
+        const ParsedRequest & req, bool & started_in_thinking,
+        std::vector<int32_t> & tokens, std::string & error) {
     std::string tools_json;
     if (req.tools.is_array() && !req.tools.empty()) {
         tools_json = req.tools.dump();
     }
-
     std::string rendered;
     if (!config_.chat_template_src.empty()) {
-        // Jinja path: --chat-template-file overrides the hardcoded
-        // QWEN3/LAGUNA renderer. Used for tool-using agents that need the
-        // Anthropic tool_use envelope (e.g. froggeric Qwen3.6 template).
-        //
-        // Special tokens like <|im_start|> / <|im_end|> are stored verbatim
-        // in the GGUF vocab — use raw_token() to skip the GPT-2 byte decode
-        // (otherwise <0xC4><0x91> nonsense appears).
+        // Jinja path: --chat-template-file overrides the hardcoded renderer.
+        // Special tokens are stored verbatim in the GGUF vocab — raw_token()
+        // skips the GPT-2 byte decode.
         const std::string & bos = tokenizer_.bos_id() >= 0
             ? tokenizer_.raw_token(tokenizer_.bos_id())
             : std::string();
@@ -2461,8 +2067,7 @@ bool HttpServer::render_and_tokenize_request(
                 /*add_generation_prompt=*/true,
                 req.thinking_enabled, tools_json);
         } catch (const std::exception & e) {
-            send_error(fd, 500,
-                std::string("chat template (jinja) render failed: ") + e.what());
+            error = std::string("chat template (jinja) render failed: ") + e.what();
             return false;
         }
     } else {
@@ -2470,9 +2075,22 @@ bool HttpServer::render_and_tokenize_request(
             chat_messages, chat_format_, /*add_generation_prompt=*/true,
             req.thinking_enabled, tools_json);
     }
+    started_in_thinking = prompt_ends_in_open_think(rendered);
+    tokens = tokenizer_.encode(rendered);
+    return true;
+}
 
-    req.started_in_thinking = prompt_ends_in_open_think(rendered);
-    req.prompt_tokens = tokenizer_.encode(rendered);
+bool HttpServer::render_and_tokenize_request(
+        SocketHandle fd, const std::vector<ChatMessage> & chat_messages,
+        ParsedRequest & req) {
+    std::string error;
+    bool started_in_thinking = false;
+    if (!render_messages_to_tokens(chat_messages, req, started_in_thinking,
+                                   req.prompt_tokens, error)) {
+        send_error(fd, 500, error);
+        return false;
+    }
+    req.started_in_thinking = started_in_thinking;
     return true;
 }
 
@@ -2507,80 +2125,6 @@ void HttpServer::log_parsed_request(const ParsedRequest & req) const {
         req.thinking_enabled ? "true" : "false",
         req.started_in_thinking ? "true" : "false",
         req.stop_sequences.size(), req.model.c_str());
-}
-
-void HttpServer::start_automatic_tool_speculation(ParsedRequest & req) const {
-    if (req.automatic_tool_speculation.has_value() ||
-        !req.automatic_tool_speculation_enabled ||
-        req.tool_speculation.has_value() ||
-        !config_.tool_speculation.predictive_enabled() ||
-        !config_.semantic_tool_predictor.enabled() ||
-        http_detail::tool_choice_disables_tool_calls(req.tool_choice) ||
-        req.tools.empty()) return;
-
-    req.automatic_tool_speculation.emplace();
-    auto & launch = *req.automatic_tool_speculation;
-    const SemanticToolPredictorConfig predictor =
-        config_.semantic_tool_predictor;
-    const auto native = native_semantic_predictor_;
-    auto log_completion = [&]() {
-        std::fprintf(stderr,
-            "[tool-hint] predictor complete transport=%s%s tools=%zu "
-            "execute=%s wall_ms=%.1f\n",
-            native ? "native-qwen3" : "http",
-            native && predictor.http_enabled() ? "+http-fallback" : "",
-            json_array_size(req.tools), launch.attempt ? "true" : "false",
-            launch.predictor_wall_ms);
-    };
-    const auto preflight_started = std::chrono::steady_clock::now();
-    std::string payload_error;
-    const json & predictor_messages = req.predictor_messages.is_array()
-        ? req.predictor_messages : req.messages;
-    const auto payload = build_semantic_tool_predictor_request(
-        predictor_messages, req.tools, req.tool_choice,
-        predictor.model.empty() ? "native-qwen3" : predictor.model,
-        predictor.max_tokens, payload_error);
-    if (!payload.has_value()) {
-        launch.predictor_error = payload_error.empty()
-            ? "predictor_request_invalid" : std::move(payload_error);
-        launch.prediction_source = "request-preflight";
-        launch.predictor_wall_ms = std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - preflight_started).count();
-        log_completion();
-        return;
-    }
-    try {
-        const SemanticToolPrediction semantic = predict_semantic_tool_call(
-            predictor, *payload, req.tools, native);
-        launch.predictor_wall_ms = semantic.wall_ms;
-        launch.prediction_source = semantic.source;
-        if (!semantic.ok) {
-            launch.predictor_error = semantic.error.empty()
-                ? "predictor_unavailable" : semantic.error;
-        } else {
-            ToolSpeculationPrediction prediction;
-            std::string error;
-            const json arguments = json::parse(semantic.call.arguments.dump());
-            if (!build_tool_speculation_prediction(
-                    semantic.call.name, arguments,
-                    predictor.execution_confidence, prediction, error)) {
-                launch.predictor_error = std::move(error);
-            } else {
-                auto attempt = ToolSpeculationAttempt::create(
-                    config_.tool_speculation, prediction, req.response_id);
-                launch.attempt = std::shared_ptr<ToolSpeculationAttempt>(
-                    std::move(attempt));
-                launch.attempt->start();
-            }
-        }
-    } catch (const std::exception & error) {
-        launch.predictor_error =
-            std::string("automatic_prediction_failed: ") + error.what();
-    } catch (...) {
-        launch.predictor_error =
-            "automatic_prediction_failed: unknown error";
-    }
-    log_completion();
 }
 
 void HttpServer::enqueue_request_and_wait(SocketHandle fd, ParsedRequest req) {
@@ -2663,18 +2207,6 @@ bool HttpServer::route_request(SocketHandle fd, const HttpRequest & hr) {
         }
 
         if (!render_and_tokenize_request(fd, render_messages, req)) return true;
-
-        if (config_.semantic_tool_predictor.enabled() &&
-            config_.tool_speculation.predictive_enabled() &&
-            config_.pflash_upstream_base.empty() &&
-            req.automatic_tool_speculation_enabled &&
-            !req.tool_speculation.has_value() &&
-            !http_detail::tool_choice_disables_tool_calls(req.tool_choice) &&
-            !req.tools.empty()) {
-            req.predictor_messages =
-                http_detail::canonical_predictor_messages(
-                    std::move(render_messages));
-        }
 
         // count_tokens: short-circuit after tokenization. Skip generation
         // entirely — Anthropic's contract is just {"input_tokens": N}.
@@ -4314,6 +3846,12 @@ json HttpServer::resolve_early_dispatch(
         if (match) item["call_id"] = match->id;
         if (metadata.value("status", "") == "hit" && metadata.contains("result")) {
             entry.result = metadata["result"];
+            // Canonical tool-message text: a client that echoes this string as
+            // the tool message content gets a guaranteed prefetch-prefill hit.
+            item["tool_message_content"] =
+                entry.result.is_object() && entry.result.contains("value")
+                    ? entry.result["value"].dump()
+                    : entry.result.dump();
         }
         entry.done = true;
     }
@@ -4414,6 +3952,87 @@ json HttpServer::resolve_early_dispatch(
         out.push_back(std::move(items[i]));
     }
     return out;
+}
+
+// Prefetch-prefill: after a tool turn whose early-dispatched results all
+// committed, the next request is fully determined (conversation + assistant
+// output + canonical tool messages). Render it, restore the end-of-turn
+// snapshot, prefill the delta and cache the result so the next request
+// starts at decode speed. Every failure path bails silently to the normal
+// request path — this is an optimization, never a correctness dependency.
+void HttpServer::prefetch_next_turn(
+        const ParsedRequest & req, SseEmitter & emitter,
+        const GenerationOutputState & output, const json & early_items) {
+    if (!config_.prefetch_prefill || !output.early_dispatch) return;
+    if (!early_items.is_array() || early_items.empty()) return;
+    const auto & calls = emitter.tool_calls();
+    if (calls.empty()) return;
+    std::vector<const json *> results(calls.size(), nullptr);
+    for (const auto & item : early_items) {
+        if (!item.is_object() || item.value("status", "") != "hit") continue;
+        const std::string call_id = item.value("call_id", "");
+        for (size_t i = 0; i < calls.size(); ++i) {
+            if (calls[i].id == call_id) { results[i] = &item; break; }
+        }
+    }
+    for (const json * item : results) {
+        if (!item || item->value("tool_message_content", "").empty()) return;
+    }
+    std::vector<std::string> call_ids;
+    call_ids.reserve(calls.size());
+    for (const auto & call : calls) call_ids.push_back(call.id);
+    const std::string raw_assistant = tool_memory_.lookup(call_ids);
+    if (raw_assistant.empty()) return;
+
+    std::vector<ChatMessage> next_messages =
+        normalize_chat_messages(req.messages, req.format, tool_memory_);
+    next_messages.push_back({"assistant", raw_assistant});
+    for (size_t i = 0; i < calls.size(); ++i) {
+        next_messages.push_back({"tool",
+            results[i]->value("tool_message_content", ""), calls[i].id});
+    }
+    bool started_in_thinking = false;
+    std::vector<int32_t> tokens;
+    std::string error;
+    if (!render_messages_to_tokens(next_messages, req, started_in_thinking,
+                                   tokens, error)) return;
+    if ((int) tokens.size() + 16 > config_.max_ctx) return;
+
+    const auto started = std::chrono::steady_clock::now();
+    auto [restore_slot, prefix_len] = prefix_cache_.lookup(tokens);
+    if (prefix_len >= (int) tokens.size()) return;  // already cached
+    const auto prepared = prefix_cache_.prepare_inline_snap(
+        tokens, prefix_len, false, (int) tokens.size());
+    if (prepared.first < 0 || prepared.second != (int) tokens.size()) return;
+    const int snap_slot = prepared.first;
+    backend_.snapshot_free(snap_slot);
+    GenerateRequest prefetch_request;
+    prefetch_request.prompt = tokens;
+    prefetch_request.n_gen = 0;
+    prefetch_request.snap_slot = snap_slot;
+    prefetch_request.snap_pos = (int) tokens.size();
+    DaemonIO prefetch_io;
+    prefetch_io.stream_fd = -1;
+    const GenerateResult prefetch_result = restore_slot >= 0
+        ? backend_.restore_and_generate(restore_slot, prefetch_request,
+                                        prefetch_io)
+        : backend_.generate(prefetch_request, prefetch_io);
+    if (prefetch_result.ok() && backend_.snapshot_used(snap_slot) &&
+        backend_.snapshot_cur_pos(snap_slot) == (int) tokens.size()) {
+        prefix_cache_.confirm_inline_snap(snap_slot, (int) tokens.size(),
+                                          tokens);
+        eot_slots_.erase(snap_slot);
+        slot_tokens_[snap_slot] = tokens;
+        std::fprintf(stderr,
+            "[prefetch] next-turn KV ready pos=%zu (%.1fs off the critical "
+            "path)\n",
+            tokens.size(),
+            std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - started).count());
+    } else {
+        backend_.snapshot_free(snap_slot);
+        prefix_cache_.abort_inline_snap(snap_slot);
+    }
 }
 
 void HttpServer::configure_generation_io(
@@ -4661,11 +4280,6 @@ void HttpServer::process_job(ServerJob * job) {
         return;
     }
 
-    // The only qualified schedule predicts before target compute. This keeps
-    // shared-GPU deployments deterministic; the admitted external tool then
-    // overlaps target generation.
-    start_automatic_tool_speculation(req);
-
     std::unique_ptr<ToolSpeculationAttempt> tool_speculation;
     if (req.tool_speculation.has_value()) {
         tool_speculation = ToolSpeculationAttempt::create(
@@ -4816,29 +4430,9 @@ void HttpServer::process_job(ServerJob * job) {
             metadata["prediction_source"] = "client";
             return metadata;
         }
-        if (!req.automatic_tool_speculation.has_value()) return std::nullopt;
-        const ParsedRequest::AutomaticToolSpeculationLaunch & launch =
-            *req.automatic_tool_speculation;
-        json metadata;
-        if (launch.attempt) {
-            metadata = cancel_reason
-                ? launch.attempt->cancel(cancel_reason)
-                : launch.attempt->resolve(emitter.tool_calls());
-        } else {
-            metadata = {
-                {"protocol", "dflash.tool-speculation.v1"},
-                {"status", "deferred"},
-                {"reason", "predictor_unavailable"},
-            };
-            if (!launch.predictor_error.empty()) {
-                metadata["detail"] = launch.predictor_error;
-            }
-        }
-        metadata["prediction_source"] = launch.prediction_source.empty()
-            ? "predictor" : launch.prediction_source;
-        metadata["predictor_wall_ms"] = launch.predictor_wall_ms;
-        return metadata;
+        return std::nullopt;
     };
+    json early_items = json::array();
     // A partial tool call from a failed generation is not authoritative.
     // Keep its speculative result private just as we do on disconnect.
     const char * generation_cancel_reason =
@@ -4858,8 +4452,9 @@ void HttpServer::process_job(ServerJob * job) {
             }
         }
         if (output.early_dispatch) {
-            const json early = {{"early_dispatch", resolve_early_dispatch(
-                output, emitter.tool_calls(), generation_cancel_reason)}};
+            early_items = resolve_early_dispatch(
+                output, emitter.tool_calls(), generation_cancel_reason);
+            const json early = {{"early_dispatch", early_items}};
             const std::string extension = render_tool_speculation_sse(
                 req.format, req.response_id, req.model, early);
             if (final_chunks.empty()) {
@@ -4882,8 +4477,9 @@ void HttpServer::process_job(ServerJob * job) {
             response["dflash_tool_speculation"] = std::move(*metadata);
         }
         if (output.early_dispatch) {
-            response["dflash_early_dispatch"] = resolve_early_dispatch(
+            early_items = resolve_early_dispatch(
                 output, emitter.tool_calls(), generation_cancel_reason);
+            response["dflash_early_dispatch"] = early_items;
         }
         // Streaming uses non-blocking sends; restore blocking mode before
         // writing a complete JSON response on this shared socket path.
@@ -4893,8 +4489,12 @@ void HttpServer::process_job(ServerJob * job) {
     } else {
         finish_tool_speculation("client_disconnected");
         if (output.early_dispatch) {
-            resolve_early_dispatch(output, emitter.tool_calls(), "client_disconnected");
+            resolve_early_dispatch(output, emitter.tool_calls(),
+                                   "client_disconnected");
         }
+    }
+    if (!client_disconnected && !generation_cancel_reason) {
+        prefetch_next_turn(req, emitter, output, early_items);
     }
 
     if (client_disconnected) {

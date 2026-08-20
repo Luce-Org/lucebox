@@ -1,230 +1,82 @@
-# CPU-isolated tool speculation on Lucebox5
+# Speculative tool execution
 
-The engine can ask a small model for one concrete tool call before the target
-model runs. If the call is allowlisted and its measured execution lane is
-qualified, the engine starts the read-only tool privately. The target model
-remains authoritative: the result is released only when the emitted function
-name and canonical arguments match exactly.
+Lossless acceleration of tool-calling requests. The model stays authoritative:
+speculative work is exposed only on an exact canonical match, and every failure
+path falls back to the normal request flow.
 
-On Lucebox5, Qwen3-0.6B Q8_0 predicts on Strix and then leaves its compute
-window. The CPU tool runs on logical CPUs `14-15,30-31` while
-DeepSeek-V4-0731 + DS4/DSpark runs on R9700 + Strix and CPUs
-`0-13,16-29`. This path neither injects tokens nor replaces DSpark.
+Three engine flags, designed to be enabled together:
 
-## Stream-based early dispatch and end-of-turn snapshots (2026-08-19 revision)
-
-Measured on real tools, the pre-generation predictor alone does not pay back:
-on 10 multi-step tasks over live public APIs (`realapi/rest_bench.py`, keyless
-geocoding/weather/World Bank/Wikipedia/FX endpoints, 0.1-0.9 s latency) the
-Qwen3-0.6B lane hit 3 of 17 calls and spent 9.4 s of serial predictor time to
-save 0.8 s of tool wait; on 20 terminal-bench 2.0 tasks it hit 0 of 75
-read-only calls (`terminal_bench/`). This revision keeps every existing lane
-(CPU isolation, qualified profiles, predictor, trace compilation) and adds two
-model-agnostic mechanisms that do pay back:
-
-- `--early-dispatch`: every allowlisted tool call is launched through the same
+- `--early-dispatch` — every allowlisted tool call is launched through the
   isolated executor lane the moment its call block
-  (`<function_call>…</function_call>`, `<tool_call>…</tool_call>`,
-  `<function=…>…</function>`) closes in the token stream. No predictor is
-  involved, N calls per response are supported, each call is committed
-  independently on an exact canonical match against the parsed authoritative
-  calls, and the result list is returned as `dflash_early_dispatch` in the
-  non-streaming JSON body (for SSE it rides in the existing extension event as
-  `dflash_tool_speculation.early_dispatch`, before the terminal event). On the REST suite
-  this turned 3/17 hits into **17/17** and client-side tool wait from 3.0 s
-  into **0.0 s**, with identical answers.
-- `--end-turn-snapshot`: after a tool-enabled generation the server snapshots
-  prompt+output into the inline prefix cache, so the next turn of the same
-  conversation restores everything and prefills only the appended tool
-  results. Control wall on the REST suite dropped 174 s -> 156 s (-10%, up to
-  -27% on 3-4-turn tasks). DeepSeek-V4 continuation snapshots are stored
-  without final logits (`DFLASH_DS4_SNAPSHOT_STALE_LOGITS=1`, set by the flag)
-  and are never restored at full prompt length.
-- Dependency-aware execution: a call may reference an earlier call's result
-  with `"$k.path"` placeholders (1-based call index, dotted field path; whole
-  placeholders keep the JSON type, embedded ones stringify). Such calls are
-  not launched from the stream; once their inputs resolve the server
-  substitutes the values and runs each wave concurrently on the same lane,
-  then reports `resolved_arguments`, `dependencies`, `wave` and the result.
-  A chain of k dependent steps therefore costs one planning turn plus one
-  joiner turn instead of k model turns (the LLMCompiler pattern, executed
-  inside the engine, still committed only on the authoritative template).
-- The executor result budget now starts when the authoritative call is known
-  (`--tool-spec-timeout-ms` counted from commit, absolute lifetime 20x), so a
-  slow target generation can no longer expire a finished result.
-- The native predictor daemon is relaunched lazily (30 s cooldown) after a
-  timeout or transport failure instead of staying off for the server lifetime.
+  (`<function_call>`, `<tool_call>`, `<function=>`) closes in the token
+  stream. N calls per response run concurrently; each commits independently
+  against the parsed authoritative calls. Results are returned as
+  `dflash_early_dispatch` (JSON body) / inside the
+  `dflash_tool_speculation` SSE extension event. Calls whose arguments
+  reference earlier results with `"$k.path"` placeholders are resolved and
+  executed server-side, wave by wave.
+- `--end-turn-snapshot` — after a tool-enabled generation the server
+  snapshots prompt+output into the inline prefix cache, so the next turn of
+  the conversation restores everything instead of a stale boundary.
+- `--prefetch-prefill` — after a turn whose early-dispatched results all
+  committed, the next request is fully determined (conversation + assistant
+  output + canonical tool messages). The server renders it, prefills it and
+  caches the KV before the client's next request arrives; a client that
+  echoes each hit's `tool_message_content` string starts its next turn at
+  decode speed. Any mismatch silently takes the normal path.
 
-Multi-call responses plus early dispatch collapse turns: on 4 small many-call
-tasks (`realapi/dag_bench.py`, 4-8 calls each) a parallel-calling agent needed
-11 model turns vs 32 for one-call-per-turn, 20/20 calls hidden, 4/4 correct
-vs 2/4, 1.28x faster end to end; the remaining time is model compute (prefill
-of results, decode of calls), identical across arms. Gains scale with call
-count and tool latency; for sub-second tools they stay in the low single
-digits, and the pre-generation predictor is only worth enabling for slow,
-recurring workflows.
+Clients can also supply a concrete prediction up front via the
+`tool_speculation` request extension (unchanged), and opt out per request
+with `"automatic_tool_speculation": false`.
 
-Wrapper toggles: `EARLY_DISPATCH=1`, `END_TURN_SNAPSHOT=1` (defaults) and
-`PREDICTOR=0` (default; the qualified single-call launcher sets `PREDICTOR=1`,
-worth it only for slow, recurring workflows).
-Artifacts: `realapi/results/*.json`. Harness: `realapi/` (public-API suite,
-many-call suite), `terminal_bench/` (harbor agent + docker-exec executor).
+## Safety
 
+- Only tools named by `--tool-spec-allow` ever run speculatively; the
+  executor is spawned without a shell, with a minimal environment, closed
+  descriptors, an optional pinned CPU lane disjoint from the model
+  (`--tool-spec-cpu-affinity`), launch-based lifetime caps and a
+  commit-based result deadline (`--tool-spec-timeout-ms`).
+- `--tool-spec-profile` (a measured interference profile) is required only
+  for client-supplied predictions with confidence < 1; authoritative
+  early-dispatch launches need no profile.
 
-## Measured result
+## Measured (Lucebox5, DeepSeek-V4-0731 + DSpark, live public APIs)
 
-The 2026-08-18 production run used six paired tasks: two each with 10, 15,
-and 20 leaf calls. Each branch contained five serial, deterministic read-only
-calls; independent branches ran concurrently. Arm order was randomized.
-Every arm included model turns, tool time, and a final answer produced from
-the actual assistant/tool conversation.
+10 multi-step tasks over keyless real APIs (geocoding, weather, World Bank,
+Wikipedia, FX; 0.1-0.9 s latency), control vs speculative arm on the same
+server, answers identical (`realapi/rest_bench.py`, artifacts in
+`realapi/results/`):
 
-| Metric | Result |
-| --- | ---: |
-| Stage-batched workflow, p50 | 87.998 s |
-| Trace-compiled workflow, p50 | 32.877 s |
-| Trace-compiled + speculative workflow, p50 | **20.474 s** |
-| End-to-end paired speedup, p50 | **4.3597x** |
-| End-to-end bootstrap 95% CI | **3.7696x–4.8252x** |
-| End-to-end paired speedup, p05 | **3.6680x** |
-| Trace compilation alone, paired p50 | **2.6876x** |
-| Early launch on top of compilation, paired p50 | **1.7676x** |
-| Early-launch bootstrap 95% CI | **1.2590x–1.8002x** |
-| Exposed tool wait, compiled / speculative p50 | 10.149 s / **0.030 ms** |
-| Qwen prediction latency, p50 | 201.0 ms |
-| Target model-compute change, p50 / p95 | -0.027% / +0.090% |
-| Target decode change, p50 / p95 | -0.658% / +0.374% |
-| Exact Qwen predictor hits | 6 / 6 |
+| | control | speculative |
+|---|---|---|
+| tool calls hidden | 0/17 | **17/17** |
+| client tool wait | 3.0 s | **0.0 s** |
+| 10-task wall (end-of-turn snapshots) | 174 s | **156 s** (-10%, up to -27% on 3-4-turn tasks) |
 
-The slowdown figures come from a separate controlled A/B probe. Each task had
-three alternating repetitions per arm, and every observation was preceded by
-the same warm request. The gate compares the per-task median ratios and
-requires matching cache state, completion tokens, call digest, and active
-DS4 decoding.
+Many-call tasks (4-8 calls each, `realapi/dag_bench.py`): parallel calls +
+early dispatch complete in 11 model turns vs 32 for one-call-per-turn,
+20/20 calls hidden, 4/4 vs 2/4 tasks correct, 1.28x end to end.
 
-All 22 gates passed, including stable leaf-call and result digests, exact
-final answers, exact macro calls, CPU isolation, controlled p50/p95 model
-slowdown, and a wrong-call probe in which no private result crossed the
-exact-match gate.
+Gains scale with tool latency and call count: on benchmarks with
+millisecond in-memory tools there is nothing to hide, while each second of
+real API latency is a second saved per call. An earlier revision's
+pre-generation predictor (Qwen3-0.6B) was measured at 3/17 hits on these
+APIs and 0/75 on terminal-bench against ~0.5 s serial cost per turn, and
+was removed; the history preserves it.
 
-These numbers apply to recognized, side-effect-free recurring workflows. The
-4.36x combines fewer model/tool synchronization barriers from trace
-compilation with the 1.77x gain from early tool launch. It is not a claim that
-arbitrary single tool calls become 4.36x faster. The broader Qwen smoke suite
-currently protects a 9/12 exact-argument baseline; a predictor miss falls back
-to the authoritative call without changing the target output.
-
-Evidence:
-
-- `results/trace-compiled-engine-qwen-production-6pairs-compact.json`
-  (`sha256:b1194bd1447f772dc9c90e6e801e99646bdce121e1b300398c45b54540b87d20`)
-- `results/multiturn-cached-wordref-production-6tasks.json`
-  (`sha256:2475697d418bffed0e9668da26ce6c88a85a952ce97d99749f440f97f9ac5bf9`)
-- `results/trace-workflow-registry.json`
-  (the benchmark artifact records its exact hash)
-
-The report and registry paths inside the result are repository-relative, and
-their recorded hashes match the committed files.
-
-The full source report is retained deliberately. Its original per-call
-speculation performance gate did not pass; the compiler reads only the two
-executions whose calls, results, dataflow, and side-effect flags are valid.
-That failed baseline is the reason the workflow was compiled. No model was
-trained on this report, and the passing 4.36x result is recorded separately.
-
-## Runtime contract
-
-- Tools must be explicitly allowlisted and read-only or idempotent.
-- A result is committed only on one exact canonical call match. Multiple,
-  malformed, failed, timed-out, cancelled, or different calls are discarded.
-- The child receives a minimal environment and only standard streams. Tool
-  speculation fails closed unless Linux glibc 2.34+ descriptor isolation is
-  available.
-- CPU affinity is applied before the executor starts and is re-read before
-  the request payload is released. The model and tool masks must be disjoint.
-- Executors run in their own process group with a launch-based deadline and a
-  bounded output size. Cancellation removes descendants.
-- Native predictor IPC has a bounded startup, a private `0700` work directory,
-  an inherited-descriptor allowlist, serialized requests, and deadline-aware
-  prompt construction, tokenization, and generation.
-- A production profile must declare a qualified non-accelerator or separate
-  physical-GPU lane and match the configured executor contract.
-
-Automatic prediction means clients do not need to send a prediction hint.
-Clients do need to consume `dflash_tool_speculation.result` on a `hit` and use
-it as the tool result; ignoring the extension remains correct but forfeits the
-latency gain.
-
-The schedule also supports a single GPU because predictor compute finishes
-before target compute begins; only the CPU tool overlaps target generation.
-Both models still have to fit in memory. The production numbers above were
-measured on Lucebox5's dual-GPU placement, not on a single-GPU machine.
-
-## Reproduce on Lucebox5
-
-Build the deterministic sparse adapter used to qualify the CPU lane:
+## Reproduce
 
 ```bash
-JSON_INCLUDE=/path/to/server/deps/json/include \
-  ./build_cpu_sparse_executor.sh ./cpu_sparse_tool_executor
+# server (wraps the qualified 0731 launcher's binary selection)
+BUILD_DIR=$PWD/realapi TOOL_SPEC_EXECUTOR=$PWD/realapi/rest_tool_executor.py \
+  TOOL_SPEC_ALLOW=geocode_city,get_weather,country_info,wikipedia_summary,exchange_rate \
+  ./realapi/launch_server.sh
+
+# paired benchmark (control vs speculative, alternating order, primed)
+python3 realapi/rest_bench.py run1 --tasks 10
+python3 realapi/rest_summary.py run1
+
+# many-call / dependency benchmark
+python3 realapi/dag_bench.py run2 --small --tasks 4
 ```
 
-Launch the qualified server:
-
-```bash
-./run_native_cpu_server_lucebox5.sh
-```
-
-The launcher uses Qwen3-0.6B Q8_0 on predictor GPU 1 and the build selected by
-the wrapper's adjacent `candidate-build` symlink. It clears ambient variables.
-`PREDICTOR_MODEL`, `PREDICTOR_GPU`, `PREDICTOR_MAX_CTX`,
-`PREDICTOR_MAX_TOKENS`, and `PREDICTOR_TIMEOUT_MS` apply only when invoking
-the wrapper directly.
-
-Run the single-call gate:
-
-```bash
-python3 benchmark_cpu_tool_speculation.py native-qwen \
-  --url http://127.0.0.1:18145/v1/chat/completions \
-  --binary ./cpu_sparse_tool_executor \
-  --tool-cpus 14-15,30-31 \
-  --iterations 172452 \
-  --max-tokens 32 \
-  --pairs 20 \
-  --warmups 5 \
-  --bootstrap-resamples 20000 \
-  --min-speedup 1.6 \
-  --min-speedup-ci-low 1.5 \
-  --min-speedup-p05 1.5 \
-  --min-prediction-hit-rate 1.0 \
-  --max-model-slowdown-percent 5 \
-  --output results/qwen-auto-production-20pairs.json
-```
-
-For the workflow gate, launch with the trace executor and macro allowlist:
-
-```bash
-TOOL_SPEC_EXECUTOR=./trace_compiled_tool_executor.py \
-TOOL_SPEC_ALLOW=resolve_customer,list_open_orders,get_order_details,calculate_shipping,prepare_customer_summary,execute_customer_workflows \
-  ./run_native_cpu_server_lucebox5.sh
-```
-
-Then run:
-
-```bash
-python3 benchmark_trace_compiled_workflows.py \
-  --binary ./bfcl_replay_tool_executor.py \
-  --training-report results/multiturn-cached-wordref-production-6tasks.json \
-  --workflow-registry results/trace-workflow-registry.json \
-  --pairs 6 \
-  --warmup-tasks 1 \
-  --min-branches 2 \
-  --max-branches 4 \
-  --interference-repetitions 3 \
-  --seed 814 \
-  --bootstrap-resamples 20000 \
-  --output results/trace-compiled-engine-qwen-production-6pairs-compact.json
-```
-
-The harness exits nonzero on any correctness, privacy, isolation, DS4,
-slowdown, hit-rate, or speed failure.
