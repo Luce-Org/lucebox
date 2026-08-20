@@ -6293,6 +6293,46 @@ TEST_CASE(ServerUnitFixture, test_parse_tool_calls_python_style_trailing_garbage
     TEST_ASSERT(result.tool_calls.empty());
 }
 
+TEST_CASE(ServerUnitFixture, test_parse_tool_calls_python_style_json_string_with_brackets_succeeds) {
+    json tools = json::array({
+        {{"type", "function"}, {"function", {{"name", "edit"}, {"parameters", {{"type", "object"}, {"properties", {{"path", {{"type", "string"}}}, {"edits", {{"type", "array"}}}}}}}}}}
+    });
+
+    std::string text =
+        "<tool_call>\n"
+        "edit(path=\"foo.go\", edits=[{\"oldText\": \"if (x) {\", \"newText\": \"if (y) {\"}])\n"
+        "</tool_call>";
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "edit");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["path"] == "foo.go");
+        TEST_ASSERT(args["edits"].is_array());
+        TEST_ASSERT(args["edits"].size() == 1);
+        TEST_ASSERT(args["edits"][0]["oldText"] == "if (x) {");
+        TEST_ASSERT(args["edits"][0]["newText"] == "if (y) {");
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_tool_calls_function_call_wrapping_tool_call_cleans_envelope_tags) {
+    std::string text =
+        "Leading text <function_call>\n"
+        "<tool_call>\n"
+        "bash(command=\"ls -la\")\n"
+        "</tool_call>\n"
+        "</function_call> Trailing text";
+    auto result = parse_tool_calls(text, bash_tools());
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    TEST_ASSERT(result.cleaned_text.find("<function_call>") == std::string::npos);
+    TEST_ASSERT(result.cleaned_text.find("</function_call>") == std::string::npos);
+    TEST_ASSERT(result.cleaned_text.find("<tool_call>") == std::string::npos);
+    TEST_ASSERT(result.cleaned_text.find("</tool_call>") == std::string::npos);
+    TEST_ASSERT(result.cleaned_text.find("Leading text") != std::string::npos);
+    TEST_ASSERT(result.cleaned_text.find("Trailing text") != std::string::npos);
+}
+
+
 
 
 

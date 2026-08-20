@@ -1084,11 +1084,28 @@ static bool parse_function_sig_args(const std::string & arg_text, json & out_arg
             pos++;  // skip closing quote
             out_args[key] = val;
         } else {
-            // non-string value — read until comma or end
+            // non-string value (JSON array/object, number, bool, null) — read until delimiter comma or end
             size_t end = pos;
             int depth = 0;
+            char in_str = 0;
             while (end < arg_text.size()) {
                 char c = arg_text[end];
+                if (in_str) {
+                    if (c == '\\' && end + 1 < arg_text.size()) {
+                        end += 2;
+                        continue;
+                    }
+                    if (c == in_str) {
+                        in_str = 0;
+                    }
+                    end++;
+                    continue;
+                }
+                if (c == '"' || c == '\'') {
+                    in_str = c;
+                    end++;
+                    continue;
+                }
                 if (c == '(' || c == '[' || c == '{') depth++;
                 else if (c == ')' || c == ']' || c == '}') {
                     if (depth == 0) break;
@@ -1097,8 +1114,8 @@ static bool parse_function_sig_args(const std::string & arg_text, json & out_arg
                 else if (c == ',' && depth == 0) break;
                 end++;
             }
-            if (depth != 0) {
-                // Unterminated brackets
+            if (in_str != 0 || depth != 0) {
+                // Unterminated string or brackets inside complex argument
                 return false;
             }
             std::string raw = arg_text.substr(pos, end - pos);
@@ -1495,7 +1512,19 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
         auto end = std::sregex_iterator();
         for (auto it = begin; it != end; ++it) {
             size_t pos = it->position();
-            if (overlaps(removals, pos, pos + it->length())) continue;
+            size_t len = it->length();
+            if (overlaps(removals, pos, pos + len)) {
+                // Outer <function_call> envelope wrapped one or more inner tool calls
+                // that were already claimed. Add the outer tags to removals so they do
+                // not leak into assistant output.
+                size_t open_tag_len = std::strlen("<function_call>");
+                size_t close_tag_len = std::strlen("</function_call>");
+                removals.push_back({pos, pos + open_tag_len});
+                if (len >= close_tag_len) {
+                    removals.push_back({pos + len - close_tag_len, pos + len});
+                }
+                continue;
+            }
             std::string inner = (*it)[1].str();
 
             // Check if inner contains nested <tool_call>...</tool_call> blocks
@@ -1775,7 +1804,12 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
         std::string cleaned;
         size_t cursor = 0;
         for (const auto & span : removals) {
-            if (span.start < cursor) continue;
+            if (span.start < cursor) {
+                if (span.end > cursor) {
+                    cursor = span.end;
+                }
+                continue;
+            }
             cleaned += text.substr(cursor, span.start - cursor);
             cursor = span.end;
         }
