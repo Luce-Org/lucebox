@@ -6338,8 +6338,36 @@ TEST_CASE(ServerUnitFixture, test_sse_emitter_unclosed_tool_in_think_with_tool_c
     auto c1 = emitter.emit_token(text);
     auto c2 = emitter.emit_finish(0);
 
-    std::string full_sse = concat(c1) + concat(c2);
-    TEST_ASSERT(full_sse.find("Answer with </function_call> example") != std::string::npos);
+    std::vector<std::string> all_chunks = c1;
+    all_chunks.insert(all_chunks.end(), c2.begin(), c2.end());
+
+    std::string content_deltas;
+    std::string reasoning_deltas;
+    for (const auto & chunk_str : all_chunks) {
+        if (chunk_str.rfind("data: ", 0) == 0) {
+            std::string payload = chunk_str.substr(6);
+            size_t end = payload.find("\n\n");
+            if (end != std::string::npos) payload = payload.substr(0, end);
+            if (payload != "[DONE]") {
+                try {
+                    auto j = json::parse(payload);
+                    if (j.contains("choices") && !j["choices"].empty() && j["choices"][0].contains("delta")) {
+                        const auto & delta = j["choices"][0]["delta"];
+                        if (delta.contains("content") && delta["content"].is_string()) {
+                            content_deltas += delta["content"].get<std::string>();
+                        }
+                        if (delta.contains("reasoning_content") && delta["reasoning_content"].is_string()) {
+                            reasoning_deltas += delta["reasoning_content"].get<std::string>();
+                        }
+                    }
+                } catch (...) {}
+            }
+        }
+    }
+
+    TEST_ASSERT(content_deltas == "Answer with </function_call> example");
+    TEST_ASSERT(reasoning_deltas.find("unclosed <function_call>") != std::string::npos);
+    TEST_ASSERT(emitter.accumulated_text() == "Answer with </function_call> example");
 }
 
 TEST_CASE(ServerUnitFixture, test_parse_xml_function_call_param_named_name_or_function_accepted) {
@@ -6373,6 +6401,19 @@ TEST_CASE(ServerUnitFixture, test_parse_xml_function_call_valid_param_followed_b
         "<command>ls -la</command>\n"
         "unparsed trailing garbage\n"
         "</parameters>\n"
+        "</function_call>";
+    auto result = parse_tool_calls(text, bash_tools());
+    TEST_ASSERT(result.tool_calls.empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_xml_function_call_valid_params_with_garbage_in_envelope_rejected) {
+    std::string text =
+        "<function_call>\n"
+        "<invoke_name>bash</invoke_name>\n"
+        "<parameters>\n"
+        "<command>ls -la</command>\n"
+        "</parameters>\n"
+        "trailing_garbage_outside_params\n"
         "</function_call>";
     auto result = parse_tool_calls(text, bash_tools());
     TEST_ASSERT(result.tool_calls.empty());

@@ -141,6 +141,12 @@ private:
     // Emit a content delta (format-specific).
     void emit_content_delta(std::vector<std::string> & out, const std::string & text);
 
+    // Emit a reasoning delta (format-specific).
+    void emit_reasoning_delta(std::vector<std::string> & out, const std::string & text);
+
+    // Flush text that may contain a thinking boundary into reasoning and/or content.
+    void flush_reasoning_and_content(std::vector<std::string> & out, const std::string & raw_text);
+
     // SSE data line
     static std::string sse_data(const std::string & json_str);
     static std::string sse_event(const std::string & type, const std::string & json_str);

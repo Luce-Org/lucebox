@@ -817,6 +817,37 @@ static bool parse_xml_function_call(const std::string & inner, const json & tool
         }
     }
 
+    // Validate that the entire envelope remainder is legitimately clean (no trailing garbage)
+    std::string remainder = inner;
+    std::smatch m_inv;
+    if (std::regex_search(remainder, m_inv, re_invoke_full)) {
+        std::string inner_inv = m_inv[1].matched ? m_inv[1].str() : "";
+        inner_inv = std::regex_replace(inner_inv, re_params_block, "");
+        inner_inv = std::regex_replace(inner_inv, re_params_self_closing, "");
+        inner_inv = std::regex_replace(inner_inv, re_param_attr, "");
+        inner_inv = std::regex_replace(inner_inv, re_param_eq, "");
+        if (!has_params_block) {
+            inner_inv = std::regex_replace(inner_inv, re_child_tag, "");
+        }
+        if (!trim_ws(inner_inv).empty()) {
+            return false;
+        }
+        remainder = std::regex_replace(remainder, re_invoke_full, "");
+    } else {
+        remainder = std::regex_replace(remainder, re_name, "");
+        remainder = std::regex_replace(remainder, re_params_block, "");
+        remainder = std::regex_replace(remainder, re_params_self_closing, "");
+        remainder = std::regex_replace(remainder, re_param_attr, "");
+        remainder = std::regex_replace(remainder, re_param_eq, "");
+        if (!has_params_block) {
+            remainder = std::regex_replace(remainder, re_child_tag, "");
+        }
+    }
+
+    if (!trim_ws(remainder).empty()) {
+        return false;
+    }
+
     if (!args.empty()) {
         out_name = name;
         out_args = std::move(args);
@@ -828,30 +859,9 @@ static bool parse_xml_function_call(const std::string & inner, const json & tool
         return false;
     }
 
-    // args is empty: only succeed if the parameter block and envelope remainder are legitimately empty.
-    std::string remainder = inner;
-    std::smatch m_inv;
-    if (std::regex_search(remainder, m_inv, re_invoke_full)) {
-        std::string inner_inv = m_inv[1].matched ? m_inv[1].str() : "";
-        inner_inv = std::regex_replace(inner_inv, re_params_block, "");
-        inner_inv = std::regex_replace(inner_inv, re_params_self_closing, "");
-        if (!trim_ws(inner_inv).empty()) {
-            return false;
-        }
-        remainder = std::regex_replace(remainder, re_invoke_full, "");
-    } else {
-        remainder = std::regex_replace(remainder, re_name, "");
-        remainder = std::regex_replace(remainder, re_params_block, "");
-        remainder = std::regex_replace(remainder, re_params_self_closing, "");
-    }
-
-    if (trim_ws(remainder).empty()) {
-        out_name = name;
-        out_args = std::move(args);
-        return true;
-    }
-
-    return false;
+    out_name = name;
+    out_args = std::move(args);
+    return true;
 }
 
 // ─── JSON tool call parser ──────────────────────────────────────────────

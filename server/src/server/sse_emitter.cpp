@@ -36,7 +36,7 @@ static std::string extract_tool_name(const json & tool) {
     return tool.value("name", "");
 }
 
-static size_t find_reasoning_think_close(const std::string & s, const json & tools = json()) {
+static size_t find_reasoning_think_close(const std::string & s, const json & tools = json(), bool in_stream = false) {
     static const std::vector<std::string> close_tags = {
         "</function_calls>", "</function_call>", "</tool_call>", "</tool_code>", "</function>",
         "</invoke>"
@@ -83,20 +83,20 @@ static size_t find_reasoning_think_close(const std::string & s, const json & too
         return std::string::npos;
     }
 
-    // Check if an unclosed tool envelope started before first_think and closed after first_think
-    // (which indicates first_think was a literal inside an in-flight tool payload).
-    size_t tool_start = 0;
-    if (find_tool_syntax_start(s, tools, tool_start) && tool_start < first_think) {
-        for (const auto & ct : close_tags) {
-            if (s.find(ct, first_think) != std::string::npos) {
-                return std::string::npos;
-            }
-        }
-        if (tools.is_array()) {
-            for (const auto & tool : tools) {
-                std::string name = extract_tool_name(tool);
-                if (!name.empty() && s.find("</" + name + ">", first_think) != std::string::npos) {
+    if (in_stream) {
+        size_t tool_start = 0;
+        if (find_tool_syntax_start(s, tools, tool_start) && tool_start < first_think) {
+            for (const auto & ct : close_tags) {
+                if (s.find(ct, first_think) != std::string::npos) {
                     return std::string::npos;
+                }
+            }
+            if (tools.is_array()) {
+                for (const auto & tool : tools) {
+                    std::string name = extract_tool_name(tool);
+                    if (!name.empty() && s.find("</" + name + ">", first_think) != std::string::npos) {
+                        return std::string::npos;
+                    }
                 }
             }
         }
@@ -360,7 +360,7 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
         if (mode_ == StreamMode::TOOL_BUFFER) {
             if (tool_from_reasoning_ && first_content_token_index_ < 0) {
                 const std::string full = tool_buffer_ + window_;
-                size_t think_close = find_reasoning_think_close(full, tools_);
+                size_t think_close = find_reasoning_think_close(full, tools_, /*in_stream=*/true);
                 if (think_close != std::string::npos) {
                     const size_t after_think = think_close + THINK_CLOSE_LEN;
                     if (after_think < full.size() &&
@@ -631,6 +631,64 @@ void SseEmitter::emit_content_delta(std::vector<std::string> & out,
     }
 }
 
+void SseEmitter::emit_reasoning_delta(std::vector<std::string> & out,
+                                      const std::string & text) {
+    if (text.empty()) return;
+    reasoning_text_ += text;
+
+    switch (format_) {
+    case ApiFormat::OPENAI_CHAT:
+        out.push_back(format_openai_delta({{"reasoning_content", text}}));
+        break;
+
+    case ApiFormat::ANTHROPIC:
+        if (active_kind_ != "thinking") {
+            out.push_back(sse_event("content_block_stop",
+                json({{"type", "content_block_stop"}, {"index", block_index_}}).dump()));
+            block_index_++;
+            active_kind_ = "thinking";
+            json new_block = {{"type", "thinking"}, {"thinking", ""}};
+            out.push_back(sse_event("content_block_start",
+                json({{"type", "content_block_start"}, {"index", block_index_},
+                      {"content_block", new_block}}).dump()));
+        }
+        out.push_back(sse_event("content_block_delta",
+            json({{"type", "content_block_delta"}, {"index", block_index_},
+                  {"delta", {{"type", "thinking_delta"}, {"thinking", text}}}}).dump()));
+        break;
+
+    case ApiFormat::RESPONSES:
+        out.push_back(format_responses_event("response.reasoning.delta", {
+            {"item_id", msg_item_id_}, {"output_index", 0},
+            {"content_index", 0}, {"delta", text}
+        }));
+        break;
+
+    default:
+        break;
+    }
+}
+
+void SseEmitter::flush_reasoning_and_content(std::vector<std::string> & out,
+                                             const std::string & raw_text) {
+    if (raw_text.empty()) return;
+    size_t think_close = find_reasoning_think_close(raw_text, tools_);
+    if (think_close != std::string::npos) {
+        std::string reasoning = raw_text.substr(0, think_close);
+        std::string content = raw_text.substr(think_close + THINK_CLOSE_LEN);
+        if (first_content_token_index_ == -1) {
+            first_content_token_index_ = content.empty() ? emit_token_count_ : std::max(0, emit_token_count_ - 1);
+        }
+        emit_reasoning_delta(out, reasoning);
+        if (!content.empty()) {
+            accumulated_content_ += content;
+            emit_content_delta(out, content);
+        }
+    } else {
+        emit_reasoning_delta(out, raw_text);
+    }
+}
+
 // ─── emit_finish ────────────────────────────────────────────────────────
 
 std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
@@ -719,56 +777,8 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
 
             // Emit any cleaned text from the tool buffer
             if (!parsed.cleaned_text.empty()) {
-                size_t think_close = parsed.cleaned_text.find(THINK_CLOSE);
-                if (think_close != std::string::npos) {
-                    std::string reasoning = parsed.cleaned_text.substr(0, think_close);
-                    std::string content = parsed.cleaned_text.substr(think_close + THINK_CLOSE_LEN);
-                    if (first_content_token_index_ == -1) {
-                        first_content_token_index_ = content.empty() ? emit_token_count_ : std::max(0, emit_token_count_ - 1);
-                    }
-                    if (!reasoning.empty()) {
-                        reasoning_text_ += reasoning;
-                        if (format_ == ApiFormat::OPENAI_CHAT) {
-                            out.push_back(format_openai_delta({{"reasoning_content", reasoning}}));
-                        } else if (format_ == ApiFormat::ANTHROPIC) {
-                            if (active_kind_ != "thinking") {
-                                out.push_back(sse_event("content_block_stop",
-                                    json({{"type", "content_block_stop"}, {"index", block_index_}}).dump()));
-                                block_index_++;
-                                active_kind_ = "thinking";
-                                json new_block = {{"type", "thinking"}, {"thinking", ""}};
-                                out.push_back(sse_event("content_block_start",
-                                    json({{"type", "content_block_start"}, {"index", block_index_},
-                                          {"content_block", new_block}}).dump()));
-                            }
-                            out.push_back(sse_event("content_block_delta",
-                                json({{"type", "content_block_delta"}, {"index", block_index_},
-                                      {"delta", {{"type", "thinking_delta"}, {"thinking", reasoning}}}}).dump()));
-                        }
-                    }
-                    if (!content.empty()) {
-                        accumulated_content_ += content;
-                        emit_content_delta(out, content);
-                    }
-                } else if (tool_from_reasoning_) {
-                    reasoning_text_ += parsed.cleaned_text;
-                    if (format_ == ApiFormat::OPENAI_CHAT) {
-                        out.push_back(format_openai_delta({{"reasoning_content", parsed.cleaned_text}}));
-                    } else if (format_ == ApiFormat::ANTHROPIC) {
-                        if (active_kind_ != "thinking") {
-                            out.push_back(sse_event("content_block_stop",
-                                json({{"type", "content_block_stop"}, {"index", block_index_}}).dump()));
-                            block_index_++;
-                            active_kind_ = "thinking";
-                            json new_block = {{"type", "thinking"}, {"thinking", ""}};
-                            out.push_back(sse_event("content_block_start",
-                                json({{"type", "content_block_start"}, {"index", block_index_},
-                                      {"content_block", new_block}}).dump()));
-                        }
-                        out.push_back(sse_event("content_block_delta",
-                            json({{"type", "content_block_delta"}, {"index", block_index_},
-                                  {"delta", {{"type", "thinking_delta"}, {"thinking", parsed.cleaned_text}}}}).dump()));
-                    }
+                if (tool_from_reasoning_) {
+                    flush_reasoning_and_content(out, parsed.cleaned_text);
                 } else {
                     accumulated_content_ += parsed.cleaned_text;
                     emit_content_delta(out, parsed.cleaned_text);
@@ -859,57 +869,7 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
             accumulated_content_ += tool_buffer_;
             emit_content_delta(out, tool_buffer_);
         } else if (tool_from_reasoning_) {
-            size_t think_close = find_reasoning_think_close(tool_buffer_, tools_);
-            if (think_close != std::string::npos) {
-                std::string reasoning = tool_buffer_.substr(0, think_close);
-                std::string content = tool_buffer_.substr(think_close + THINK_CLOSE_LEN);
-                if (first_content_token_index_ == -1) {
-                    first_content_token_index_ = content.empty() ? emit_token_count_ : std::max(0, emit_token_count_ - 1);
-                }
-                if (!reasoning.empty()) {
-                    reasoning_text_ += reasoning;
-                    if (format_ == ApiFormat::OPENAI_CHAT) {
-                        out.push_back(format_openai_delta({{"reasoning_content", reasoning}}));
-                    } else if (format_ == ApiFormat::ANTHROPIC) {
-                        if (active_kind_ != "thinking") {
-                            out.push_back(sse_event("content_block_stop",
-                                json({{"type", "content_block_stop"}, {"index", block_index_}}).dump()));
-                            block_index_++;
-                            active_kind_ = "thinking";
-                            json new_block = {{"type", "thinking"}, {"thinking", ""}};
-                            out.push_back(sse_event("content_block_start",
-                                json({{"type", "content_block_start"}, {"index", block_index_},
-                                      {"content_block", new_block}}).dump()));
-                        }
-                        out.push_back(sse_event("content_block_delta",
-                            json({{"type", "content_block_delta"}, {"index", block_index_},
-                                  {"delta", {{"type", "thinking_delta"}, {"thinking", reasoning}}}}).dump()));
-                    }
-                }
-                if (!content.empty()) {
-                    accumulated_content_ += content;
-                    emit_content_delta(out, content);
-                }
-            } else {
-                reasoning_text_ += tool_buffer_;
-                if (format_ == ApiFormat::OPENAI_CHAT) {
-                    out.push_back(format_openai_delta({{"reasoning_content", tool_buffer_}}));
-                } else if (format_ == ApiFormat::ANTHROPIC) {
-                    if (active_kind_ != "thinking") {
-                        out.push_back(sse_event("content_block_stop",
-                            json({{"type", "content_block_stop"}, {"index", block_index_}}).dump()));
-                        block_index_++;
-                        active_kind_ = "thinking";
-                        json new_block = {{"type", "thinking"}, {"thinking", ""}};
-                        out.push_back(sse_event("content_block_start",
-                            json({{"type", "content_block_start"}, {"index", block_index_},
-                                  {"content_block", new_block}}).dump()));
-                    }
-                    out.push_back(sse_event("content_block_delta",
-                        json({{"type", "content_block_delta"}, {"index", block_index_},
-                              {"delta", {{"type", "thinking_delta"}, {"thinking", tool_buffer_}}}}).dump()));
-                }
-            }
+            flush_reasoning_and_content(out, tool_buffer_);
         } else {
             // Tool syntax was detected but no valid call parsed. Do not leak
             // malformed/incomplete XML back to the user as assistant text.
