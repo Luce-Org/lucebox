@@ -193,8 +193,10 @@ GenerateResult LayerSplitBackend::restore_and_generate_impl(
     GenerateRequest delta_req = req;
     delta_req.prompt = std::vector<int32_t>(
         req.prompt.begin() + snap_pos, req.prompt.end());
-    return run_from_state(delta_req, io, snap_pos, /*reset_state=*/false,
-                          req.prompt);
+    result = run_from_state(delta_req, io, snap_pos, /*reset_state=*/false,
+                            req.prompt);
+    if (result.ok()) result.restored_prefix_tokens = snap_pos;
+    return result;
 }
 
 ModelBackend::CompressResult

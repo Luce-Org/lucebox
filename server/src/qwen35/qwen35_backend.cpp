@@ -1406,6 +1406,7 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
 
     const int snap_pos = prefix_snapshots_[slot].cur_pos;
     cache_.cur_pos = snap_pos;
+    result.restored_prefix_tokens = snap_pos;
 
     // FIX(prefix-cache + spec-decode): restore_target_cache brings back KV /
     // recurrent state / target_feat, but the draft-side feature mirror is left
@@ -1457,6 +1458,7 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
             "fresh prefill fallback\n", snap_pos, prompt_len);
         reset_recurrent_state(cache_);
         cache_.cur_pos = 0;
+        result.restored_prefix_tokens = 0;
         auto t_prefill_start = std::chrono::steady_clock::now();
         committed = do_prefill(req.prompt, out_io, req.snap_pos, req.snap_slot);
         if (committed < 0) {

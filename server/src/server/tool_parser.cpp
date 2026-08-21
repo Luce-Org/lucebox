@@ -61,6 +61,10 @@ static const char BARE_FUNCTION_OPEN[] = "<function>";
 static const char FUNCTION_SPACE_OPEN[] = "<function ";
 static const char FUNCNAME_OPEN[] = "<funcname>";
 static const char TOOL_CODE_OPEN[] = "<tool_code>";
+static const char DSML_TOOL_OPEN[] = "<?DSML?tool>";
+static const char DSML_TOOL_CLOSE[] = "</?DSML?tool>";
+static const char DSML_TOOL_CALL_OPEN[] = "<?DSML?tool_call>";
+static const char DSML_TOOL_CALL_CLOSE[] = "</?DSML?tool_call>";
 static const char ATTRIBUTE_PARAMETER_OPEN[] = "<parameter name=";
 static const char ARG_KEY_OPEN[] = "<arg_key>";
 
@@ -114,6 +118,10 @@ bool find_tool_syntax_start(const std::string & text, const json & tools,
                          FUNCTION_SPACE_OPEN) == 0 ||
             text.compare(idx, sizeof(FUNCNAME_OPEN) - 1, FUNCNAME_OPEN) == 0 ||
             text.compare(idx, sizeof(TOOL_CODE_OPEN) - 1, TOOL_CODE_OPEN) == 0 ||
+            text.compare(idx, sizeof(DSML_TOOL_OPEN) - 1,
+                         DSML_TOOL_OPEN) == 0 ||
+            text.compare(idx, sizeof(DSML_TOOL_CALL_OPEN) - 1,
+                         DSML_TOOL_CALL_OPEN) == 0 ||
             text.compare(idx, sizeof(ATTRIBUTE_PARAMETER_OPEN) - 1,
                          ATTRIBUTE_PARAMETER_OPEN) == 0 ||
             declared_tool_open_at(text, idx, tools)) {
@@ -142,7 +150,8 @@ size_t tool_syntax_holdback(const json & tools) {
     size_t holdback = std::max({sizeof(ATTRIBUTE_PARAMETER_OPEN) - 2,
                                 sizeof(FUNCTION_CALLS_OPEN) - 2,
                                 sizeof(FUNCTION_CALL_OPEN) - 2,
-                                sizeof(BARE_FUNCTION_OPEN) - 2});
+                                sizeof(BARE_FUNCTION_OPEN) - 2,
+                                sizeof(DSML_TOOL_CALL_OPEN) - 2});
     if (!tools.is_array()) return holdback;
     for (const auto & tool : tools) {
         const std::string name = declared_tool_name(tool);
@@ -851,6 +860,34 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
         positioned_calls.emplace_back(start, std::move(tc));
         removals.push_back({start, end});
     };
+
+    // DeepSeek's vocabulary contains native DSML wrapper tokens. Although
+    // the chat template asks for <function_call>, the model can emit a valid
+    // OpenAI-shaped JSON call inside <?DSML?tool> (or tool_call) instead.
+    // Claim the whole wrapper so it cannot leak as assistant prose.
+    const auto parse_dsml_wrappers = [&](const char * open,
+                                         const char * close) {
+        const size_t open_len = std::strlen(open);
+        const size_t close_len = std::strlen(close);
+        size_t cursor = 0;
+        while ((cursor = text.find(open, cursor)) != std::string::npos) {
+            const size_t body_start = cursor + open_len;
+            const size_t body_end = text.find(close, body_start);
+            if (body_end == std::string::npos) break;
+            const std::string body = trim_ws(
+                text.substr(body_start, body_end - body_start));
+            const json object = json::parse(body, nullptr, false);
+            std::string name;
+            json args;
+            if (!object.is_discarded() &&
+                parse_json_tool_call(object, name, args)) {
+                add_call(name, args, cursor, body_end + close_len);
+            }
+            cursor = body_end + close_len;
+        }
+    };
+    parse_dsml_wrappers(DSML_TOOL_OPEN, DSML_TOOL_CLOSE);
+    parse_dsml_wrappers(DSML_TOOL_CALL_OPEN, DSML_TOOL_CALL_CLOSE);
 
     // Pattern 8 (Laguna): <tool_call>NAME\n<arg_key>K</arg_key>\n
     // <arg_value>V</arg_value>...\n</tool_call>. Values are raw strings or

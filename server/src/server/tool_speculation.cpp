@@ -6,7 +6,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <cctype>
 #include <cerrno>
 #include <cmath>
 #include <cstdio>
@@ -14,8 +13,8 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
-#include <functional>
 #include <limits>
+#include <system_error>
 #include <thread>
 #include <utility>
 
@@ -61,9 +60,14 @@ bool request_declares_tool(const json & tools, const std::string & name) {
     if (!tools.is_array() || name.empty()) return false;
     for (const auto & tool : tools) {
         if (!tool.is_object()) continue;
-        if (tool.value("name", "") == name) return true;
+        if (tool.contains("name") && tool["name"].is_string() &&
+            tool["name"].get<std::string>() == name) {
+            return true;
+        }
         if (tool.contains("function") && tool["function"].is_object() &&
-            tool["function"].value("name", "") == name) {
+            tool["function"].contains("name") &&
+            tool["function"]["name"].is_string() &&
+            tool["function"]["name"].get<std::string>() == name) {
             return true;
         }
     }
@@ -107,9 +111,27 @@ void close_child_descriptors_from_four(int open_max) {
     for (int fd = 4; fd < open_max; ++fd) (void)::close(fd);
 }
 
-bool send_all_socket(int fd, const void * data, size_t bytes) {
+int bounded_poll_timeout_ms(
+        std::chrono::steady_clock::time_point deadline,
+        std::chrono::steady_clock::time_point now) {
+    const int64_t remaining =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - now).count();
+    return static_cast<int>(std::min<int64_t>(
+        std::numeric_limits<int>::max(), std::max<int64_t>(1, remaining)));
+}
+
+bool send_all_socket_until(
+        int fd,
+        const void * data,
+        size_t bytes,
+        std::chrono::steady_clock::time_point deadline) {
     const char * cursor = static_cast<const char *>(data);
     while (bytes > 0) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            errno = ETIMEDOUT;
+            return false;
+        }
         int flags = 0;
 #  if defined(MSG_NOSIGNAL)
         flags = MSG_NOSIGNAL;
@@ -117,6 +139,27 @@ bool send_all_socket(int fd, const void * data, size_t bytes) {
         const ssize_t written = ::send(fd, cursor, bytes, flags);
         if (written < 0) {
             if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                const auto now = std::chrono::steady_clock::now();
+                if (now >= deadline) {
+                    errno = ETIMEDOUT;
+                    return false;
+                }
+                const int remaining_ms =
+                    bounded_poll_timeout_ms(deadline, now);
+                pollfd descriptor{fd, POLLOUT, 0};
+                const int polled = ::poll(&descriptor, 1, remaining_ms);
+                if (polled < 0 && errno == EINTR) continue;
+                if (polled <= 0) {
+                    if (polled == 0) errno = ETIMEDOUT;
+                    return false;
+                }
+                if (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                    errno = EPIPE;
+                    return false;
+                }
+                continue;
+            }
             return false;
         }
         if (written == 0) return false;
@@ -151,6 +194,9 @@ std::vector<std::string> executor_environment(
         "LC_CTYPE",
         "TZ",
         "LD_LIBRARY_PATH",
+        // Non-secret root used by read-only coding-tool adapters. The child
+        // still validates and confines every requested path beneath it.
+        "DFLASH_TOOL_WORKSPACE",
         "DFLASH_TRACE_TRAINING_REPORT",
         "DFLASH_TRACE_WORKFLOW_REGISTRY",
     };
@@ -406,6 +452,11 @@ bool parse_tool_speculation_cpu_affinity(
         }
         if (comma == std::string::npos) break;
         cursor = comma + 1;
+        if (cursor == value.size()) {
+            error = "tool CPU affinity contains an empty item";
+            out.clear();
+            return false;
+        }
     }
     std::sort(out.begin(), out.end());
     out.erase(std::unique(out.begin(), out.end()), out.end());
@@ -423,10 +474,6 @@ bool qualify_tool_speculation_cpu_affinity(
         return true;
     }
 #if defined(__linux__)
-    if (::access("/usr/bin/taskset", X_OK) != 0) {
-        error = "tool CPU affinity requires executable /usr/bin/taskset";
-        return false;
-    }
     const long configured_cpus = ::sysconf(_SC_NPROCESSORS_CONF);
     if (configured_cpus <= 0) {
         error = "cannot determine configured CPU count";
@@ -674,9 +721,9 @@ ToolSpeculationAdmission ToolSpeculationPolicy::choose(
     return decision;
 }
 
-bool ToolSpeculationConfig::allows(const std::string & name) const {
-    return std::find(allowed_tools.begin(), allowed_tools.end(), name) !=
-           allowed_tools.end();
+bool ToolSpeculationConfig::allows_read_only(const std::string & name) const {
+    return std::find(read_only_tools.begin(), read_only_tools.end(), name) !=
+           read_only_tools.end();
 }
 
 ToolSpeculationAttempt::ToolSpeculationAttempt(
@@ -688,18 +735,21 @@ ToolSpeculationAttempt::ToolSpeculationAttempt(
     , request_id_(request_id) {
     if (!config_.enabled()) {
         admission_.reason = "engine_disabled";
-    } else if (!config_.allows(prediction_.call.name)) {
-        admission_.reason = "tool_not_allowlisted";
+    } else if (!config_.allows_read_only(prediction_.call.name)) {
+        admission_.reason = "tool_not_declared_read_only";
     } else if (prediction_.authoritative) {
-        // Authoritative call (early dispatch): no interference gate needed,
-        // the model already emitted it; run it on the isolated lane.
+        if (!config_.cpu_affinity_isolated) {
+            admission_.reason = "resource_isolation_required";
+            return;
+        }
+        // The model already emitted this call, but overlapping it with the
+        // remaining decode is still safe only on a verified disjoint lane.
         admission_.admitted = true;
         admission_.resource_percentage = 100;
         admission_.expected_task_ms = 0.0;
         admission_.expected_speedup = 1.0;
         admission_.decode_interference_qualified = true;
-        admission_.accelerator_relation =
-            config_.cpu_affinity.empty() ? "unspecified" : "non_accelerator";
+        admission_.accelerator_relation = "non_accelerator";
         admission_.reason = "authoritative_call";
     } else {
         admission_ = config_.policy.choose(
@@ -708,8 +758,7 @@ ToolSpeculationAttempt::ToolSpeculationAttempt(
 }
 
 void ToolSpeculationAttempt::release_executor_slot() {
-    if (holds_executor_slot_) {
-        holds_executor_slot_ = false;
+    if (holds_executor_slot_.exchange(false, std::memory_order_acq_rel)) {
         g_running_executors.fetch_sub(1, std::memory_order_acq_rel);
     }
 }
@@ -744,7 +793,7 @@ void ToolSpeculationAttempt::start() {
         admission_.reason = "executor_saturated";
         return;
     }
-    holds_executor_slot_ = true;
+    holds_executor_slot_.store(true, std::memory_order_release);
     const json request = {
         {"protocol", "dflash.tool-speculation.v1"},
         {"request_id", request_id_},
@@ -1007,12 +1056,36 @@ void ToolSpeculationAttempt::start() {
     child_pid_ = static_cast<int>(child);
     child_stdin_fd_ = input_socket[0];
     child_stdout_fd_ = output_pipe[0];
-    const int flags = ::fcntl(child_stdout_fd_, F_GETFL, 0);
-    if (flags >= 0) {
-        ::fcntl(child_stdout_fd_, F_SETFL, flags | O_NONBLOCK);
+    const int input_flags = ::fcntl(child_stdin_fd_, F_GETFL, 0);
+    if (input_flags < 0 ||
+        ::fcntl(child_stdin_fd_, F_SETFL, input_flags | O_NONBLOCK) != 0) {
+        launch_error_ = std::string("executor stdin nonblocking setup failed: ") +
+                        std::strerror(errno);
+        terminate_executor();
+        return;
+    }
+    const int output_flags = ::fcntl(child_stdout_fd_, F_GETFL, 0);
+    if (output_flags < 0 ||
+        ::fcntl(child_stdout_fd_, F_SETFL, output_flags | O_NONBLOCK) != 0) {
+        launch_error_ = std::string("executor stdout nonblocking setup failed: ") +
+                        std::strerror(errno);
+        terminate_executor();
+        return;
     }
     running_ = true;
-    if (!send_all_socket(child_stdin_fd_, payload.data(), payload.size())) {
+    start_executor_watchdog();
+    if (!launch_error_.empty()) {
+        terminate_executor();
+        return;
+    }
+    // Fork/exec and affinity verification can be slow on a loaded inference
+    // host.  Do not spend the executor's entire I/O budget before its stdin is
+    // ready; the absolute lifetime watchdog still starts at launch and bounds
+    // the total process lifetime.
+    const auto write_deadline = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(std::max(1, config_.timeout_ms));
+    if (!send_all_socket_until(
+            child_stdin_fd_, payload.data(), payload.size(), write_deadline)) {
         launch_error_ = std::string("executor request write failed: ") +
                         std::strerror(errno);
         terminate_executor();
@@ -1023,6 +1096,54 @@ void ToolSpeculationAttempt::start() {
         "resource=%d%%\n",
         request_id_.c_str(), prediction_.call.name.c_str(),
         prediction_.confidence, admission_.resource_percentage);
+#endif
+}
+
+void ToolSpeculationAttempt::start_executor_watchdog() {
+#if !defined(_WIN32)
+    if (child_pid_ <= 0 || lifetime_watchdog_.joinable()) return;
+    {
+        std::lock_guard<std::mutex> lock(lifetime_watchdog_mu_);
+        lifetime_watchdog_stop_ = false;
+    }
+    lifetime_expired_.store(false, std::memory_order_release);
+    const pid_t pid = static_cast<pid_t>(child_pid_);
+    const auto deadline = started_at_ + std::chrono::milliseconds(
+        static_cast<std::chrono::milliseconds::rep>(
+            std::max(1, config_.timeout_ms)) *
+        static_cast<std::chrono::milliseconds::rep>(
+            kExecutorLifetimeMultiplier));
+    try {
+        lifetime_watchdog_ = std::thread([this, pid, deadline]() {
+            std::unique_lock<std::mutex> lock(lifetime_watchdog_mu_);
+            if (lifetime_watchdog_cv_.wait_until(
+                    lock, deadline,
+                    [this]() { return lifetime_watchdog_stop_; })) {
+                return;
+            }
+            lock.unlock();
+            lifetime_expired_.store(true, std::memory_order_release);
+            signal_executor_process_group(pid, SIGKILL);
+            // The process remains an unreaped child, so its PID cannot be
+            // reused. Releasing admission here prevents a generation that
+            // never resolves the attempt from monopolizing a global slot.
+            release_executor_slot();
+        });
+    } catch (const std::system_error & exception) {
+        launch_error_ = std::string("executor watchdog start failed: ") +
+                        exception.what();
+    }
+#endif
+}
+
+void ToolSpeculationAttempt::stop_executor_watchdog() {
+#if !defined(_WIN32)
+    {
+        std::lock_guard<std::mutex> lock(lifetime_watchdog_mu_);
+        lifetime_watchdog_stop_ = true;
+    }
+    lifetime_watchdog_cv_.notify_all();
+    if (lifetime_watchdog_.joinable()) lifetime_watchdog_.join();
 #endif
 }
 
@@ -1067,13 +1188,16 @@ bool ToolSpeculationAttempt::send_control(const char * operation) {
         {"op", operation},
         {"authoritative_resource_percentage", 100},
     }).dump() + "\n";
-    return send_all_socket(
-        child_stdin_fd_, command.data(), command.size());
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(std::max(1, config_.cancel_grace_ms));
+    return send_all_socket_until(
+        child_stdin_fd_, command.data(), command.size(), deadline);
 #endif
 }
 
 void ToolSpeculationAttempt::terminate_executor(bool allow_control_grace) {
 #if !defined(_WIN32)
+    stop_executor_watchdog();
     if (child_stdin_fd_ >= 0) {
         ::close(child_stdin_fd_);
         child_stdin_fd_ = -1;
@@ -1141,6 +1265,12 @@ bool ToolSpeculationAttempt::collect_executor_result(
     return false;
 #else
     const auto wait_started = std::chrono::steady_clock::now();
+    if (lifetime_expired_.load(std::memory_order_acquire)) {
+        error = "executor_lifetime_exceeded";
+        terminate_executor();
+        wait_ms = 0.0;
+        return false;
+    }
     // The result budget starts when the authoritative call is known, so a
     // long target generation (seconds to minutes) cannot expire a finished
     // result. An absolute lifetime cap still bounds runaway executors.
@@ -1162,6 +1292,13 @@ bool ToolSpeculationAttempt::collect_executor_result(
     std::string output;
     bool eof = false;
     while (!eof) {
+        if (lifetime_expired_.load(std::memory_order_acquire)) {
+            error = "executor_lifetime_exceeded";
+            terminate_executor();
+            wait_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - wait_started).count();
+            return false;
+        }
         const auto now = std::chrono::steady_clock::now();
         if (now >= deadline) {
             error = "executor_timeout";
@@ -1170,9 +1307,7 @@ bool ToolSpeculationAttempt::collect_executor_result(
                 std::chrono::steady_clock::now() - wait_started).count();
             return false;
         }
-        const int remaining_ms = std::max(1, static_cast<int>(
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                deadline - now).count()));
+        const int remaining_ms = bounded_poll_timeout_ms(deadline, now);
         pollfd descriptor{child_stdout_fd_, POLLIN | POLLHUP, 0};
         const int polled = ::poll(&descriptor, 1, remaining_ms);
         if (polled < 0) {
@@ -1221,6 +1356,14 @@ bool ToolSpeculationAttempt::collect_executor_result(
                 return false;
             }
         }
+    }
+    stop_executor_watchdog();
+    if (lifetime_expired_.load(std::memory_order_acquire)) {
+        error = "executor_lifetime_exceeded";
+        terminate_executor();
+        wait_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - wait_started).count();
+        return false;
     }
     ::close(child_stdout_fd_);
     child_stdout_fd_ = -1;
@@ -1311,6 +1454,15 @@ json ToolSpeculationAttempt::resolve(
         metadata["reason"] = admission_.reason;
         return metadata;
     }
+#if !defined(_WIN32)
+    if (lifetime_expired_.load(std::memory_order_acquire)) {
+        metadata["status"] = "failed";
+        metadata["reason"] = "speculative_executor_failure";
+        metadata["detail"] = "executor_lifetime_exceeded";
+        terminate_executor();
+        return metadata;
+    }
+#endif
     if (!launch_error_.empty() || !running_) {
         metadata["status"] = "failed";
         metadata["reason"] = "executor_launch_failed";
@@ -1391,140 +1543,6 @@ json ToolSpeculationAttempt::cancel(const std::string & reason) {
     return metadata;
 }
 
-namespace {
-
-// Matches "$12.some.path" starting at `pos`; returns length or 0.
-size_t match_placeholder(const std::string & text, size_t pos, int & index,
-                         std::string & path) {
-    if (pos >= text.size() || text[pos] != '$') return 0;
-    size_t i = pos + 1;
-    size_t digits_begin = i;
-    while (i < text.size() && std::isdigit(static_cast<unsigned char>(text[i]))) ++i;
-    if (i == digits_begin || i >= text.size() || text[i] != '.') return 0;
-    ++i;
-    size_t path_begin = i;
-    // A path starts with a letter or underscore so money-like text such as
-    // "$5.00" is never mistaken for a reference.
-    if (i >= text.size() ||
-        !(std::isalpha(static_cast<unsigned char>(text[i])) || text[i] == '_')) return 0;
-    while (i < text.size() &&
-           (std::isalnum(static_cast<unsigned char>(text[i])) || text[i] == '_' || text[i] == '.')) ++i;
-    if (i == path_begin) return 0;
-    while (i > path_begin && text[i - 1] == '.') --i;  // trailing dots are text
-    if (i == path_begin) return 0;
-    try {
-        index = std::stoi(text.substr(digits_begin, path_begin - 1 - digits_begin));
-    } catch (...) { return 0; }
-    path = text.substr(path_begin, i - path_begin);
-    return i - pos;
-}
-
-const json * lookup_path(const json & root, const std::string & path) {
-    const json * cur = &root;
-    size_t start = 0;
-    while (start <= path.size()) {
-        const size_t dot = path.find('.', start);
-        const std::string key = path.substr(start, dot == std::string::npos ? std::string::npos : dot - start);
-        if (!cur->is_object() || !cur->contains(key)) return nullptr;
-        cur = &(*cur)[key];
-        if (dot == std::string::npos) break;
-        start = dot + 1;
-    }
-    return cur;
-}
-
-const json * lookup_result_field(const json & result, const std::string & path) {
-    if (const json * direct = lookup_path(result, path)) return direct;
-    if (result.is_object() && result.contains("value") && result["value"].is_object()) {
-        return lookup_path(result["value"], path);
-    }
-    return nullptr;
-}
-
-void collect_dependencies(const json & value, std::vector<int> & out) {
-    if (value.is_string()) {
-        const std::string & text = value.get_ref<const std::string &>();
-        for (size_t i = 0; i < text.size(); ++i) {
-            int index = 0; std::string path;
-            const size_t len = match_placeholder(text, i, index, path);
-            if (len > 0) {
-                if (std::find(out.begin(), out.end(), index) == out.end()) out.push_back(index);
-                i += len - 1;
-            }
-        }
-    } else if (value.is_array() || value.is_object()) {
-        for (const auto & item : value) collect_dependencies(item, out);
-    }
-}
-
-bool substitute_value(const json & value,
-                      const std::function<const json *(int)> & result_for_call,
-                      json & out, std::string & error) {
-    if (value.is_string()) {
-        const std::string & text = value.get_ref<const std::string &>();
-        int index = 0; std::string path;
-        const size_t whole = match_placeholder(text, 0, index, path);
-        if (whole == text.size() && whole > 0) {
-            const json * result = result_for_call(index);
-            if (!result) { error = "missing result for call " + std::to_string(index); return false; }
-            const json * field = lookup_result_field(*result, path);
-            if (!field) { error = "field '" + path + "' not in result of call " + std::to_string(index); return false; }
-            out = *field;
-            return true;
-        }
-        std::string built;
-        for (size_t i = 0; i < text.size();) {
-            const size_t len = match_placeholder(text, i, index, path);
-            if (len == 0) { built += text[i]; ++i; continue; }
-            const json * result = result_for_call(index);
-            if (!result) { error = "missing result for call " + std::to_string(index); return false; }
-            const json * field = lookup_result_field(*result, path);
-            if (!field) { error = "field '" + path + "' not in result of call " + std::to_string(index); return false; }
-            built += field->is_string() ? field->get<std::string>() : field->dump();
-            i += len;
-        }
-        out = built;
-        return true;
-    }
-    if (value.is_array()) {
-        out = json::array();
-        for (const auto & item : value) {
-            json sub;
-            if (!substitute_value(item, result_for_call, sub, error)) return false;
-            out.push_back(std::move(sub));
-        }
-        return true;
-    }
-    if (value.is_object()) {
-        out = json::object();
-        for (auto it = value.begin(); it != value.end(); ++it) {
-            json sub;
-            if (!substitute_value(it.value(), result_for_call, sub, error)) return false;
-            out[it.key()] = std::move(sub);
-        }
-        return true;
-    }
-    out = value;
-    return true;
-}
-
-}  // namespace
-
-std::vector<int> find_tool_call_dependencies(const json & arguments) {
-    std::vector<int> deps;
-    collect_dependencies(arguments, deps);
-    return deps;
-}
-
-bool substitute_tool_call_dependencies(
-        const json & arguments,
-        const std::function<const json *(int)> & result_for_call,
-        json & resolved,
-        std::string & error) {
-    error.clear();
-    return substitute_value(arguments, result_for_call, resolved, error);
-}
-
 std::vector<ClosedToolCallBlock> find_closed_tool_call_blocks(
         const std::string & text, size_t from) {
     struct Wrapper { const char * open; const char * close; };
@@ -1532,6 +1550,8 @@ std::vector<ClosedToolCallBlock> find_closed_tool_call_blocks(
         {"<function_call>", "</function_call>"},
         {"<tool_call>", "</tool_call>"},
         {"<function=", "</function>"},
+        {"<?DSML?tool>", "</?DSML?tool>"},
+        {"<?DSML?tool_call>", "</?DSML?tool_call>"},
     };
     std::vector<ClosedToolCallBlock> blocks;
     size_t cursor = std::min(from, text.size());
@@ -1547,11 +1567,29 @@ std::vector<ClosedToolCallBlock> find_closed_tool_call_blocks(
             }
         }
         if (!best) break;
-        const size_t close = text.find(best->close, best_open + std::strlen(best->open));
-        if (close == std::string::npos) break;  // block still streaming
+        const size_t open_size = std::strlen(best->open);
+        const size_t close_size = std::strlen(best->close);
+        size_t scan = best_open + open_size;
+        size_t close = std::string::npos;
+        size_t depth = 1;
+        while (depth > 0) {
+            const size_t nested_open = text.find(best->open, scan);
+            const size_t next_close = text.find(best->close, scan);
+            if (next_close == std::string::npos) break;
+            if (nested_open != std::string::npos &&
+                nested_open < next_close) {
+                ++depth;
+                scan = nested_open + open_size;
+                continue;
+            }
+            --depth;
+            close = next_close;
+            scan = next_close + close_size;
+        }
+        if (depth != 0) break;  // outer block is still streaming
         ClosedToolCallBlock block;
         block.begin = best_open;
-        block.end = close + std::strlen(best->close);
+        block.end = close + close_size;
         blocks.push_back(block);
         cursor = block.end;  // nested wrappers inside are covered by this block
     }

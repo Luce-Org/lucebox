@@ -2499,10 +2499,10 @@ GenerateResult DeepSeek4Backend::generate_from_state(
 bool DeepSeek4Backend::snapshot_save(int slot) {
     // Continuation snapshots taken after DSpark decode carry no final
     // logits (the DSpark API does not return them). With
-    // DFLASH_DS4_SNAPSHOT_STALE_LOGITS=1 (set by --end-turn-snapshot) they
-    // are saved with EMPTY logits and an empty drafter feature window; a
-    // restore must prefill at least one more token, which the server
-    // guarantees by never restoring such slots at full prompt length.
+    // DFLASH_DS4_SNAPSHOT_STALE_LOGITS=1 they are saved with EMPTY logits and
+    // an empty drafter feature window; a restore must prefill at least one more
+    // token. Agent Turn Cache does not enable this path: it checkpoints before
+    // decode and canonically prefills the emitted tool-call suffix instead.
     static const bool allow_stale = [] {
         const char * v = std::getenv("DFLASH_DS4_SNAPSHOT_STALE_LOGITS");
         return v && *v && *v != '0';
@@ -2624,7 +2624,9 @@ GenerateResult DeepSeek4Backend::restore_and_generate_impl(
         result.fail(GenerateErrorCode::BackendSpecific, "snapshot restore");
         return result;
     }
-    return generate_from_state(req, io, snap_pos);
+    result = generate_from_state(req, io, snap_pos);
+    if (result.ok()) result.restored_prefix_tokens = snap_pos;
+    return result;
 }
 
 bool DeepSeek4Backend::handle_compress(const std::string & line,

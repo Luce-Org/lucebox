@@ -683,6 +683,7 @@ GenerateResult Qwen3Backend::restore_and_generate_impl(int slot,
     }
     cache_.cur_pos = snap.cur_pos;
     const int prefix_len = snap.cur_pos;
+    result.restored_prefix_tokens = prefix_len;
 
     // Set up sampler
     sampler_ = req.sampler;

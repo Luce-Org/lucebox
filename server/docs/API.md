@@ -2,7 +2,7 @@
 
 HTTP server exposing OpenAI-compatible, Anthropic, and Responses API endpoints
 for inference with speculative decoding. Model-independent — works with any
-backend (qwen35, qwen3, gemma4, laguna).
+backend (deepseek4, qwen35, qwen3, gemma4, laguna).
 
 ---
 
@@ -48,6 +48,8 @@ backend (qwen35, qwen3, gemma4, laguna).
 | `top_logprobs` | int | — | Number of top logprobs per token | ❌ TODO |
 | `response_format` | object | — | JSON mode / structured output | ❌ TODO |
 | `tool_choice` | string/object | — | Tool choice / force tool usage | ✅ |
+| `agent_turn_cache` | bool | server setting | Prefill a canonical completed tool-call turn from a pre-decode checkpoint for reuse by the next agent request; `false` is a request-scoped control arm | ✅ |
+| `automatic_tool_speculation` | bool | `false` | Opt in to isolated early execution for operator-declared read-only tools; see [coding-agent integration](TOOL_SPECULATION.md) | ✅ |
 | `logit_bias` | object | — | Per-token logit adjustments | ❌ TODO |
 | `user` | string | — | End-user identifier (tracking) | ❌ TODO |
 | `stream_options` | object | — | Streaming options (e.g. include_usage) | ❌ TODO 🔴 |
@@ -67,6 +69,11 @@ backend (qwen35, qwen3, gemma4, laguna).
 | `usage.prompt_tokens` | ✅ |
 | `usage.completion_tokens` | ✅ |
 | `usage.total_tokens` | ✅ |
+| `usage.timings.agent_turn_cache_hit` | ✅ Backend-confirmed restore of generated assistant-turn state |
+| `usage.timings.cached_prefix_tokens` | ✅ Tokens actually supplied by the restored backend snapshot |
+| `usage.timings.prefilled_tokens` | ✅ Tokens evaluated after any restore |
+| `usage.timings.effective_prompt_tokens` | ✅ Prompt tokens after engine rewrites/compression |
+| `usage.timings.prefill_ms` / `decode_ms` | ✅ Backend phase timings |
 | `choices[].logprobs` | ❌ TODO |
 
 ---
@@ -91,6 +98,8 @@ backend (qwen35, qwen3, gemma4, laguna).
 | `thinking` | object | — | Thinking mode (`{"type":"enabled"}`) | ✅ |
 | `tools` | array | — | Tool definitions | ✅ |
 | `tool_choice` | string/object | — | Tool choice / force tool usage | ✅ |
+| `agent_turn_cache` | bool | server setting | Prefill a canonical completed tool-call turn from a pre-decode checkpoint for reuse by the next agent request; `false` is a request-scoped control arm | ✅ |
+| `automatic_tool_speculation` | bool | `false` | Opt in to isolated early execution for operator-declared read-only tools; see [coding-agent integration](TOOL_SPECULATION.md) | ✅ |
 | `stop_sequences` | array | — | Stop sequences | ✅ |
 | `metadata` | object | — | Request metadata (tracing) | ❌ TODO |
 
@@ -122,6 +131,8 @@ Follows Anthropic Messages API structure with `content` blocks:
 | `reasoning` | object | — | Reasoning effort | ✅ |
 | `tools` | array | — | Tool definitions | ✅ |
 | `tool_choice` | string/object | — | Tool choice / force tool usage | ✅ |
+| `agent_turn_cache` | bool | server setting | Prefill a canonical completed tool-call turn from a pre-decode checkpoint for reuse by the next agent request; `false` is a request-scoped control arm | ✅ |
+| `automatic_tool_speculation` | bool | `false` | Opt in to isolated early execution for operator-declared read-only tools; see [coding-agent integration](TOOL_SPECULATION.md) | ✅ |
 | `parallel_tool_calls` | bool | — | Allow parallel tool calls | ❌ TODO 🔴 |
 | `store` | bool | — | Persist response | ❌ TODO 🔴 |
 | `include` | array | — | Include extra response fields | ❌ TODO 🔴 |
@@ -177,10 +188,11 @@ When `temperature = 0`:
 | Thinking/reasoning | ✅ | OpenAI `reasoning.effort`, Anthropic `thinking.type` |
 | Prefix cache (memory) | ✅ | Automatic KV cache reuse |
 | Prefix cache (disk) | ✅ | Persistent across restarts |
+| Agent Turn Cache | ✅ | Reuses generated tool-call turns; enabled with `--agent-turn-cache` |
 | PFlash (speculative prefill) | ✅ | Compresses long prompts |
 | Client disconnect detection | ✅ | Aborts generation on disconnect |
 | CORS | ✅ | Enabled by default |
-| Tool memory | ✅ | Caches tool call results |
+| Tool memory | ✅ | Replays raw generated tool-call text by call ID |
 
 ---
 

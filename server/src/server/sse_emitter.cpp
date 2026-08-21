@@ -59,7 +59,8 @@ json build_timings_json(const GenTimings & t, int completion_tokens) {
         {"cache_hit",             t.cache_hit},
         {"cached_prefix_tokens",  t.cached_prefix_tokens},
         {"prefilled_tokens",      t.prefilled_tokens},
-        {"effective_prompt_tokens", t.effective_prompt_tokens}
+        {"effective_prompt_tokens", t.effective_prompt_tokens},
+        {"agent_turn_cache_hit",  t.agent_turn_cache_hit}
     };
 }
 

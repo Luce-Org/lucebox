@@ -95,13 +95,13 @@ struct ServerConfig {
     std::string model_name  = "dflash";
     int         prefix_cache_cap = 32;  // prefix cache slots (0 disables)
     int         prefill_cache_cap = 0;  // full-prompt/prefill cache slots (0 disables)
-    // After a generation in a tool-enabled request, snapshot prompt+output
-    // into the inline prefix cache so the next turn of the same conversation
-    // restores everything up to the new tool result (one delta prefill).
-    bool        end_turn_snapshot = false;
-    // Launch every allowlisted tool call through the tool-speculation
-    // executor lane the moment its call block closes in the token stream
-    // (no predictor needed, N calls per response, per-call exact commit).
+    // Build canonical prompt+tool-call KV from a pre-decode checkpoint after
+    // the response is complete. The next request restores that stateless-
+    // equivalent prefix and prefills only the appended tool result.
+    bool        agent_turn_cache = false;
+    // Launch every operator-declared read-only tool call through the
+    // tool-speculation executor lane the moment its call block closes in the
+    // token stream (no predictor needed, N calls per response, exact commit).
     bool        early_dispatch = false;
     // After a tool turn whose early-dispatched results all committed,
     // prefill the deterministic next-turn prompt into the prefix cache
@@ -248,13 +248,11 @@ struct ServerConfig {
     // routing data (hidden states + expert selections) for predictor training.
     std::string collect_routing_path;
 
-    // Lossless external-tool speculation. Off unless the operator configures
-    // an executor and an explicit, operator-reviewed tool allowlist. A profile
-    // is additionally required for predictions made before model emission.
+    // Verified read-only tool speculation. Off unless the operator configures
+    // an executor and an explicit operator-declared read-only tool set. A
+    // profile is additionally required for predictions made before model
+    // emission.
     ToolSpeculationConfig tool_speculation;
-    // Model-agnostic tool-call prediction. Predictors run before the target;
-    // only the allowlisted external tool overlaps target generation. This is
-    // the qualified schedule on shared and single-accelerator deployments.
 };
 
 namespace http_detail {
@@ -274,7 +272,23 @@ bool should_clamp_flowkv_disk_cache(
 // True for API dialects that explicitly prohibit a tool call. Used before
 // either caller-supplied or automatic speculative execution can start.
 bool tool_choice_disables_tool_calls(const json & tool_choice);
-// Convert the exact normalized dialogue rendered for the target into the
+// Caller-supplied predictions and stream-based automatic dispatch are two
+// alternative execution paths. Accepting both would execute one call twice.
+bool tool_speculation_modes_conflict(const json & body);
+// Engine-only request extensions must not leak into an upstream provider's
+// API body when Lucebox is running as a compression proxy.
+void strip_engine_request_fields_for_upstream(json & body);
+// Render the exact tool-role content used by both clients and prefetch. String
+// values stay unquoted; structured JSON remains compact JSON.
+std::string tool_message_content_for_result(const json & result);
+
+// A continuation snapshot is valid for a later stateless API request only
+// when the completed-turn rendering begins with the exact prompt tokens that
+// were checkpointed before decode. Re-tokenization may change a BPE boundary;
+// that case must miss rather than rewrite the caller's prompt.
+bool canonical_turn_extends_prompt(
+    const std::vector<int32_t> & prompt,
+    const std::vector<int32_t> & completed_turn);
 }  // namespace http_detail
 
 // ─── Parsed request ─────────────────────────────────────────────────────
@@ -290,18 +304,22 @@ struct ParsedRequest {
     json                      tools;
     // Tool choice constraint (stored for hint generation)
     json                      tool_choice;
-    // Original messages (for response formatting)
-    json                      messages;    // Original request body (for upstream proxy forwarding)
+    // Original messages (for response formatting).
+    json                      messages;
+    // Original request body (for upstream proxy forwarding).
     json                      raw_body;
-    // Concrete invocation predicted by a caller or future semantic sidecar.
+    // Concrete invocation supplied by a caller before generation.
     // The engine may execute it privately, but never exposes its result until
     // the model emits the exact canonical invocation.
     std::optional<ToolSpeculationPrediction> tool_speculation;
-    // Engine-side prediction may start a private external tool before target
-    // generation. The model's eventual canonical call remains authoritative.
-    // Fail closed: automatic early dispatch requires an explicit request
-    // opt-in ("automatic_tool_speculation": true).
+    // Stream-based automatic dispatch starts only after the model emits a
+    // complete call. Fail closed: it requires an explicit request opt-in
+    // ("automatic_tool_speculation": true).
     bool                      automatic_tool_speculation_enabled = false;
+    // Resolved server/request policy for caching the end of a tool-call turn.
+    // The operator enables the capability; a request may explicitly disable
+    // it for isolation or measurement.
+    bool                      agent_turn_cache_enabled = false;
     // Response ID
     std::string               response_id;
     // Thinking/reasoning state
@@ -429,6 +447,8 @@ private:
         int snap_slot = -1;
         int snap_cut = 0;
         bool snap_prepared = false;
+        int agent_prompt_snap_pos = 0;
+        bool agent_prompt_snap_prepared = false;
     };
 
     GenerationCacheState prepare_generation_cache(
@@ -439,6 +459,16 @@ private:
         const GenerationCacheState & cache, const GenerateResult & result,
         int completion_tokens, bool visible_output_seen,
         bool client_disconnected);
+    void remember_agent_turn(
+        const ParsedRequest & req, const PreparedPrompt & prepared,
+        const GenerationCacheState & cache,
+        const GenerateResult & result, const SseEmitter & emitter,
+        int completion_tokens, bool visible_output_seen,
+        bool client_disconnected);
+    // A backend slot can move between ordinary, control-arm, and generated
+    // agent-turn ownership. Clear every side table before freeing or
+    // overwriting the slot so failed snapshots cannot leave stale telemetry.
+    void forget_inline_slot_metadata(int slot);
 
     struct GenerationInputs {
         GenerateRequest request;
@@ -450,17 +480,11 @@ private:
     };
 
     struct EarlyDispatchEntry {
-        CanonicalToolInvocation call;                     // as emitted (may hold $k.path refs)
-        std::unique_ptr<ToolSpeculationAttempt> attempt;  // null when skipped or dependent
+        CanonicalToolInvocation call;
+        std::unique_ptr<ToolSpeculationAttempt> attempt;  // null when skipped
         int token_index = 0;
-        int call_index = 0;                               // 1-based position in this response
+        int call_index = 0;  // 1-based position in this response
         std::string skip_reason;
-        std::vector<int> dependencies;                    // call indices referenced by $k.path
-        nlohmann::json resolved_arguments;                // after substitution (dependent calls)
-        nlohmann::json result;                            // executor result on hit
-        bool has_result = false;                          // JSON null is a valid result
-        bool done = false;
-        int wave = 0;
     };
     struct GenerationOutputState {
         int completion_tokens = 0;
@@ -481,7 +505,7 @@ private:
         ServerJob * job, const ParsedRequest & req, SseEmitter & emitter,
         GenerationOutputState & output, DaemonIO & io);
     // Early dispatch: scan newly streamed text for closed tool-call blocks and
-    // launch allowlisted calls; resolve them against the authoritative calls.
+    // launch declared read-only calls; resolve them against authoritative calls.
     void scan_early_dispatch(const ParsedRequest & req,
                              GenerationOutputState & output);
     nlohmann::json resolve_early_dispatch(
@@ -555,7 +579,8 @@ private:
         SocketHandle fd, const std::vector<ChatMessage> & chat_messages,
         ParsedRequest & req);
     bool validate_request_context(SocketHandle fd, const ParsedRequest & req);
-    void log_parsed_request(const ParsedRequest & req) const;    void enqueue_request_and_wait(SocketHandle fd, ParsedRequest req);
+    void log_parsed_request(const ParsedRequest & req) const;
+    void enqueue_request_and_wait(SocketHandle fd, ParsedRequest req);
 
     // Send HTTP response helpers.
     bool send_response(SocketHandle fd, int status, const std::string & content_type,
@@ -581,7 +606,8 @@ private:
     Tokenizer *      drafter_tokenizer_ = nullptr;  // pflash drafter (optional)
     ServerConfig     config_;
     ChatFormat       chat_format_;
-    PFlashDrafterIpcClient pflash_remote_;    ToolMemory       tool_memory_;
+    PFlashDrafterIpcClient pflash_remote_;
+    ToolMemory       tool_memory_;
     PrefixCache      prefix_cache_;
     DiskPrefixCache  disk_cache_;
 
@@ -610,9 +636,15 @@ private:
 
     // Track prompt tokens for each snapshot slot (for shutdown save).
     std::unordered_map<int, std::vector<int32_t>> slot_tokens_;
-    // Inline slots holding end-of-turn continuation snapshots. They carry no
-    // usable final logits, so they are never restored at full prompt length.
-    std::unordered_set<int> eot_slots_;
+    // Inline slots holding agent-turn continuation snapshots. Some backends
+    // cannot retain final logits there, so these are not restored at full
+    // prompt length.
+    std::unordered_set<int> agent_turn_cache_slots_;
+    // Ordinary snapshots produced by an explicit request-scoped control arm.
+    // Treatment requests exclude these entries so an A/B cannot report work
+    // warmed by its control. Control requests may still use ordinary treatment
+    // entries, which makes the comparison conservative.
+    std::unordered_set<int> agent_turn_control_slots_;
     std::vector<std::vector<int32_t>> recent_disk_prompts_;
     // Recent tool-bearing prompt prefixes for PPP LCP annotate.
     std::vector<std::vector<int32_t>> recent_tool_prefixes_;

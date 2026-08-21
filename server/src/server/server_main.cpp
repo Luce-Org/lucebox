@@ -93,11 +93,6 @@ static bool parse_double_strict(const char * value, double & out) {
     return true;
 }
 
-static bool environment_flag_enabled(const char * name) {
-    const char * value = std::getenv(name);
-    return value && *value && std::strcmp(value, "0") != 0;
-}
-
 static void print_usage(const char * prog) {
     std::fprintf(stderr,
         "Usage: %s <model.gguf> [options]\n"
@@ -214,24 +209,27 @@ static void print_usage(const char * prog) {
         "                         Drafter lifetime policy (default: auto)\n"
         "  --lazy-draft                Legacy alias for --draft-residency=request-scoped\n"
         "\n"
-        "Tool-call prediction (lossless exact verification):\n"
+        "Verified read-only tool execution:\n"
         "  --tool-spec-executor <path>  Trusted executor adapter. Receives one\n"
         "                               dflash.tool-speculation.v1 JSON request\n"
         "                               on stdin; no shell is used.\n"
         "  --tool-spec-profile <path>   Measured resource-lane frontier JSON.\n"
-        "  --tool-spec-allow <name>     Allow one operator-reviewed tool; repeatable.\n"
+        "  --tool-spec-read-only <name> Declare one read-only tool; repeatable.\n"
+        "  --tool-spec-allow <name>     Deprecated alias for --tool-spec-read-only.\n"
         "  --tool-spec-cpu-affinity <LIST>\n"
         "                               Pin child tools to Linux CPUs/ranges, e.g.\n"
         "                               14-15,30-31. The model process affinity\n"
         "                               must exclude every listed CPU.\n"
         "  --tool-spec-timeout-ms <N>   Executor result timeout (default: 60000).\n"
-        "  --early-dispatch      Launch allowlisted tool calls as soon as their call block\n"
+        "  --early-dispatch      Launch declared read-only calls as soon as their call block\n"
         "                        closes in the token stream (results: dflash_early_dispatch).\n"
         "  --tool-spec-max-executors <N>  Server-wide concurrent executor cap (default: 16; 0 = unlimited).\n"
         "  --prefetch-prefill    Prefill the deterministic next tool turn before the\n"
-        "                        client requests it (with --early-dispatch + --end-turn-snapshot).\n"
-        "  --end-turn-snapshot   After tool-enabled generations, cache prompt+output so the\n"
-        "                        next turn restores the whole conversation (one delta prefill).\n"
+        "                        client requests it (with --early-dispatch + --agent-turn-cache).\n"
+        "  --agent-turn-cache    Cache canonical completed-turn KV from a prompt\n"
+        "                        checkpoint, so the next agent turn prefills only\n"
+        "                        the appended tool result.\n"
+        "  --end-turn-snapshot   Deprecated alias for --agent-turn-cache.\n"
         "  --tool-spec-max-model-slowdown <R>\n"
         "                               Reject lanes slower than this inference\n"
         "                               ratio (default: 1.20).\n"
@@ -653,14 +651,21 @@ int main(int argc, char ** argv) {
         } else if (std::strcmp(argv[i], "--tool-spec-profile") == 0 &&
                    i + 1 < argc) {
             sconfig.tool_speculation.profile_path = argv[++i];
-        } else if (std::strcmp(argv[i], "--tool-spec-allow") == 0 &&
+        } else if ((std::strcmp(argv[i], "--tool-spec-read-only") == 0 ||
+                    std::strcmp(argv[i], "--tool-spec-allow") == 0) &&
                    i + 1 < argc) {
+            if (std::strcmp(argv[i], "--tool-spec-allow") == 0) {
+                std::fprintf(stderr,
+                    "[server] warning: --tool-spec-allow is deprecated; "
+                    "use --tool-spec-read-only\n");
+            }
             const std::string name = argv[++i];
             if (name.empty()) {
-                std::fprintf(stderr, "[server] --tool-spec-allow needs a name\n");
+                std::fprintf(stderr,
+                    "[server] --tool-spec-read-only needs a name\n");
                 return 2;
             }
-            sconfig.tool_speculation.allowed_tools.push_back(name);
+            sconfig.tool_speculation.read_only_tools.push_back(name);
         } else if (std::strcmp(argv[i], "--tool-spec-cpu-affinity") == 0 &&
                    i + 1 < argc) {
             std::string affinity_error;
@@ -683,12 +688,14 @@ int main(int argc, char ** argv) {
             }
         } else if (std::strcmp(argv[i], "--prefetch-prefill") == 0) {
             sconfig.prefetch_prefill = true;
-        } else if (std::strcmp(argv[i], "--end-turn-snapshot") == 0) {
-            sconfig.end_turn_snapshot = true;
-            // DeepSeek-V4 continuation snapshots are taken after DSpark decode and
-            // carry no final logits; the server never restores them at full length.
-            set_environment_variable(
-                "DFLASH_DS4_SNAPSHOT_STALE_LOGITS", "1", false);
+        } else if (std::strcmp(argv[i], "--agent-turn-cache") == 0 ||
+                   std::strcmp(argv[i], "--end-turn-snapshot") == 0) {
+            if (std::strcmp(argv[i], "--end-turn-snapshot") == 0) {
+                std::fprintf(stderr,
+                    "[server] warning: --end-turn-snapshot is deprecated; "
+                    "use --agent-turn-cache\n");
+            }
+            sconfig.agent_turn_cache = true;
         } else if (std::strcmp(argv[i], "--tool-spec-timeout-ms") == 0 &&
                    i + 1 < argc) {
             if (!parse_int_strict(
@@ -776,20 +783,20 @@ int main(int argc, char ** argv) {
     const bool tool_speculation_requested =
         !sconfig.tool_speculation.executor_path.empty() ||
         !sconfig.tool_speculation.profile_path.empty() ||
-        !sconfig.tool_speculation.allowed_tools.empty() ||
+        !sconfig.tool_speculation.read_only_tools.empty() ||
         !sconfig.tool_speculation.cpu_affinity.empty();
     if (sconfig.prefetch_prefill &&
-        (!sconfig.early_dispatch || !sconfig.end_turn_snapshot)) {
+        (!sconfig.early_dispatch || !sconfig.agent_turn_cache)) {
         std::fprintf(stderr,
             "[server] --prefetch-prefill requires --early-dispatch and "
-            "--end-turn-snapshot\n");
+            "--agent-turn-cache\n");
         return 2;
     }
     if ((sconfig.early_dispatch || sconfig.prefetch_prefill) &&
         !tool_speculation_requested) {
         std::fprintf(stderr,
             "[server] --early-dispatch requires --tool-spec-executor and "
-            "at least one --tool-spec-allow\n");
+            "at least one --tool-spec-read-only\n");
         return 2;
     }
     if (tool_speculation_requested) {
@@ -800,10 +807,10 @@ int main(int argc, char ** argv) {
             return 2;
         }
         if (sconfig.tool_speculation.executor_path.empty() ||
-            sconfig.tool_speculation.allowed_tools.empty()) {
+            sconfig.tool_speculation.read_only_tools.empty()) {
             std::fprintf(stderr,
                 "[server] tool speculation requires --tool-spec-executor "
-                "and at least one --tool-spec-allow\n");
+                "and at least one --tool-spec-read-only\n");
             return 2;
         }
 #if !defined(_WIN32)
@@ -814,12 +821,12 @@ int main(int argc, char ** argv) {
             return 2;
         }
 #endif
-        std::sort(sconfig.tool_speculation.allowed_tools.begin(),
-                  sconfig.tool_speculation.allowed_tools.end());
-        sconfig.tool_speculation.allowed_tools.erase(
-            std::unique(sconfig.tool_speculation.allowed_tools.begin(),
-                        sconfig.tool_speculation.allowed_tools.end()),
-            sconfig.tool_speculation.allowed_tools.end());
+        std::sort(sconfig.tool_speculation.read_only_tools.begin(),
+                  sconfig.tool_speculation.read_only_tools.end());
+        sconfig.tool_speculation.read_only_tools.erase(
+            std::unique(sconfig.tool_speculation.read_only_tools.begin(),
+                        sconfig.tool_speculation.read_only_tools.end()),
+            sconfig.tool_speculation.read_only_tools.end());
         std::string profile_error;
         if (!sconfig.tool_speculation.profile_path.empty() &&
             !sconfig.tool_speculation.policy.load_file(
@@ -837,6 +844,13 @@ int main(int argc, char ** argv) {
         if (!qualify_tool_speculation_cpu_affinity(
                 sconfig.tool_speculation, cpu_affinity_error)) {
             std::fprintf(stderr, "[server] %s\n", cpu_affinity_error.c_str());
+            return 2;
+        }
+        if (sconfig.early_dispatch &&
+            !sconfig.tool_speculation.cpu_affinity_isolated) {
+            std::fprintf(stderr,
+                "[server] --early-dispatch requires a verified disjoint "
+                "--tool-spec-cpu-affinity lane\n");
             return 2;
         }
         if (sconfig.tool_speculation.cpu_affinity_isolated) {
@@ -1011,6 +1025,13 @@ int main(int argc, char ** argv) {
         sconfig.prefill_cache_cap = 0;
         sconfig.disk_cache_dir.clear();
         sconfig.disk_cache_policy.mode = DiskPrefixCacheMode::Off;
+    }
+    if (sconfig.agent_turn_cache && sconfig.prefix_cache_cap <= 0) {
+        std::fprintf(stderr,
+            "[server] --agent-turn-cache requires an enabled inline prefix "
+            "cache; remove --no-prefix-cache/--paged-attention or configure "
+            "at least one prefix-cache slot\n");
+        return 2;
     }
 
     // Sync max_ctx: if --max-ctx was not provided, use the backend's default.
@@ -1426,6 +1447,8 @@ int main(int argc, char ** argv) {
     }
     std::fprintf(stderr, "[server] │  ddtree_budget   = %d\n", bargs.ddtree_budget);
     std::fprintf(stderr, "[server] │  prefix_cache    = %d slots\n", sconfig.prefix_cache_cap);
+    std::fprintf(stderr, "[server] │  agent_turn_cache= %s\n",
+                 sconfig.agent_turn_cache ? "ON" : "off");
     std::fprintf(stderr, "[server] │  prefill_cache   = %d slots\n", sconfig.prefill_cache_cap);
     std::fprintf(stderr, "[server] │  cors            = %s\n", sconfig.enable_cors ? "ON" : "off");
     std::fprintf(stderr, "[server] │  tool_speculation= %s\n",

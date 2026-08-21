@@ -1,0 +1,45 @@
+[
+  {
+    "id": "lucebox_staging_slots",
+    "prompt": "In the real server code, call read_file only for src/server/http_server.cpp lines 2370-2380 and src/common/model_backend.h lines 340-355. Then stop using tools and determine the numeric backend slots reserved for Agent Turn Cache canonical replay and disk-cache staging, naming both constants and showing how the values follow from the backend slot limit.",
+    "answer_terms": [
+      "kAgentTurnStagingSlot",
+      "62",
+      "kDiskStagingSlot",
+      "63"
+    ],
+    "evidence_terms": [
+      "static constexpr int kMaxSlots = 64;",
+      "constexpr int kDiskStagingSlot = ModelBackend::kMaxSlots - 1;",
+      "constexpr int kAgentTurnStagingSlot = ModelBackend::kMaxSlots - 2;"
+    ]
+  },
+  {
+    "id": "lucebox_hit_telemetry",
+    "prompt": "Call read_file only for src/server/http_server.cpp lines 4588-4602. Then stop using tools and trace how usage.timings.agent_turn_cache_hit becomes true. Distinguish the backend result field from the clamped local variable: explicitly name the exact result.<field> that supplies the restored token count, plus the additional slot-membership condition.",
+    "answer_terms": [
+      "restored_prefix_tokens",
+      "agent_turn_cache_slots_",
+      "agent_turn_cache_hit"
+    ],
+    "evidence_terms": [
+      "result.restored_prefix_tokens",
+      "const bool cache_hit = cached_prefix_tokens > 0;",
+      "agent_turn_cache_slots_.count(cache_slot) != 0"
+    ]
+  },
+  {
+    "id": "lucebox_cli_guard",
+    "prompt": "Call read_file only for src/server/server_main.cpp lines 689-704 and 1029-1041. Then stop using tools and give the deprecated alias for --agent-turn-cache, the required cache kind enforced at startup, and the source file.",
+    "answer_terms": [
+      "--end-turn-snapshot",
+      "inline prefix cache",
+      "src/server/server_main.cpp"
+    ],
+    "evidence_terms": [
+      "--end-turn-snapshot is deprecated",
+      "sconfig.agent_turn_cache && sconfig.prefix_cache_cap <= 0",
+      "--agent-turn-cache requires an enabled inline prefix"
+    ]
+  }
+]

@@ -46,6 +46,7 @@ struct GenTimings {
     int    cached_prefix_tokens = 0;
     int    prefilled_tokens     = 0;
     int    effective_prompt_tokens = 0;
+    bool   agent_turn_cache_hit = false;
 };
 
 // Build the `timings` sub-object emitted under `usage`.
@@ -58,6 +59,8 @@ struct GenTimings {
 //   cached_prefix_tokens    = effective-prompt tokens supplied by that snapshot
 //   prefilled_tokens        = effective-prompt tokens computed for this request
 //   effective_prompt_tokens = total prompt tokens seen by the backend
+//   agent_turn_cache_hit     = whether the restored snapshot included the
+//                              preceding generated agent turn
 nlohmann::json build_timings_json(const GenTimings & t, int completion_tokens);
 
 // Manages SSE streaming for a single request.
@@ -97,6 +100,10 @@ public:
 
     // Get accumulated content (for non-streaming).
     const std::string & accumulated_text() const { return accumulated_content_; }
+
+    // Exact visible model text before tool-call normalization. This is the
+    // text ToolMemory replays when clients return structured tool calls.
+    const std::string & accumulated_raw() const { return accumulated_raw_; }
 
     // Get the parsed tool calls (after emit_finish).
     const std::vector<ToolCall> & tool_calls() const { return tool_calls_; }

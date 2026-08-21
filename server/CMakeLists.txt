@@ -1333,14 +1333,6 @@ if(DFLASH27B_TESTS)
         target_include_directories(smoke_qwen3_forward PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         target_link_libraries(smoke_qwen3_forward PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_qwen3_tool_predictor_ipc.cpp")
-        add_executable(smoke_qwen3_tool_predictor_ipc
-            test/smoke_qwen3_tool_predictor_ipc.cpp)
-        target_include_directories(smoke_qwen3_tool_predictor_ipc PRIVATE
-            ${DFLASH27B_SRC_INCLUDE_DIRS})
-        target_link_libraries(smoke_qwen3_tool_predictor_ipc PRIVATE
-            dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
-    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_vs_oracle.cpp")
         add_executable(test_vs_oracle test/test_vs_oracle.cpp)
         target_include_directories(test_vs_oracle PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})

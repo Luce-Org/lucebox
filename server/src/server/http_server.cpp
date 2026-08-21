@@ -34,7 +34,6 @@
 #include <cerrno>
 #include <chrono>
 #include <cctype>
-#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -58,7 +57,7 @@ typedef long ssize_t;
 #define poll(fds,nfds,timeout)  WSAPoll(fds,nfds,timeout)
 // Replace fcntl(F_GETFL) / fcntl(F_SETFL, O_NONBLOCK) with ioctlsocket
 static inline int sock_get_flags(SocketHandle fd) { (void)fd; return 0; /* stub */ }
-static inline bool sock_set_nonblock(SocketHandle fd) { u_long m = 1; return ioctlsocket(fd, FIONBIO, &m) == 0; }
+static inline void sock_set_nonblock(SocketHandle fd) { u_long m = 1; ioctlsocket(fd, FIONBIO, &m); }
 static inline void sock_set_block(SocketHandle fd) { u_long m = 0; ioctlsocket(fd, FIONBIO, &m); }
 static inline void socket_close(SocketHandle fd) { closesocket(fd); }
 #define SETSOCKOPT_CAST (const char *)
@@ -73,10 +72,9 @@ static inline bool sock_is_eintr (int e) { return e == WSAEINTR; }
 static inline bool sock_is_eagain(int e) { return e == WSAEWOULDBLOCK; }
 #else
 #include <fcntl.h>
-#include <netdb.h>
 #include <sys/stat.h>
 static inline int sock_get_flags(SocketHandle fd) { return fcntl(fd, F_GETFL, 0); }
-static inline bool sock_set_nonblock(SocketHandle fd) { int f = fcntl(fd, F_GETFL, 0); return f >= 0 && fcntl(fd, F_SETFL, f | O_NONBLOCK) == 0; }
+static inline void sock_set_nonblock(SocketHandle fd) { int f = fcntl(fd, F_GETFL, 0); if (f >= 0) fcntl(fd, F_SETFL, f | O_NONBLOCK); }
 static inline void sock_set_block(SocketHandle fd) { int f = fcntl(fd, F_GETFL, 0); if (f >= 0) fcntl(fd, F_SETFL, f & ~O_NONBLOCK); }
 static inline void socket_close(SocketHandle fd) { ::close(fd); }
 #define SETSOCKOPT_CAST  /* empty on POSIX */
@@ -260,6 +258,33 @@ bool tool_choice_disables_tool_calls(const json & tool_choice) {
     }
     return tool_choice.is_object() &&
            tool_choice.value("type", "") == "none";
+}
+
+bool tool_speculation_modes_conflict(const json & body) {
+    return body.contains("tool_speculation") &&
+           body.contains("automatic_tool_speculation") &&
+           body["automatic_tool_speculation"].is_boolean() &&
+           body["automatic_tool_speculation"].get<bool>();
+}
+
+void strip_engine_request_fields_for_upstream(json & body) {
+    if (!body.is_object()) return;
+    body.erase("tool_speculation");
+    body.erase("automatic_tool_speculation");
+    body.erase("agent_turn_cache");
+}
+
+std::string tool_message_content_for_result(const json & result) {
+    const json & content = result.is_object() && result.contains("value")
+        ? result["value"] : result;
+    return content.is_string() ? content.get<std::string>() : content.dump();
+}
+
+bool canonical_turn_extends_prompt(
+        const std::vector<int32_t> & prompt,
+        const std::vector<int32_t> & completed_turn) {
+    return !prompt.empty() && completed_turn.size() > prompt.size() &&
+           std::equal(prompt.begin(), prompt.end(), completed_turn.begin());
 }
 
 }  // namespace http_detail
@@ -475,54 +500,6 @@ static bool curl_forward(const std::string & url,
     return res == CURLE_OK && response_sent;
 }
 #endif // DFLASH_HAS_CURL
-
-namespace {
-
-struct SemanticSidecarUrl {
-    std::string host;
-    std::string port;
-    std::string path;
-};
-
-std::string lowercase_ascii(std::string value) {
-    std::transform(value.begin(), value.end(), value.begin(),
-        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-    return value;
-}
-
-bool decode_chunked_http_body(
-        const std::string & encoded, std::string & decoded) {
-    size_t offset = 0;
-    while (true) {
-        const size_t line_end = encoded.find("\r\n", offset);
-        if (line_end == std::string::npos) return false;
-        const std::string size_text = encoded.substr(offset, line_end - offset);
-        const size_t extension = size_text.find(';');
-        const std::string hex = size_text.substr(0, extension);
-        size_t parsed = 0;
-        unsigned long chunk_size = 0;
-        try {
-            chunk_size = std::stoul(hex, &parsed, 16);
-        } catch (...) {
-            return false;
-        }
-        if (parsed != hex.size()) return false;
-        offset = line_end + 2;
-        if (chunk_size == 0) return true;
-        if (chunk_size > encoded.size() - std::min(offset, encoded.size())) {
-            return false;
-        }
-        decoded.append(encoded, offset, static_cast<size_t>(chunk_size));
-        offset += static_cast<size_t>(chunk_size);
-        if (offset + 2 > encoded.size() ||
-            encoded.compare(offset, 2, "\r\n") != 0) {
-            return false;
-        }
-        offset += 2;
-    }
-}
-
-}  // namespace
 
 // ─── /props constants ───────────────────────────────────────────────────
 //
@@ -905,7 +882,18 @@ json build_props_body(const ServerConfig & config,
                                 ? json(config.ddtree_budget) : json(nullptr)},
         }},
         {"tool_speculation", {
-            {"enabled", config.tool_speculation.enabled()},
+            {"enabled",
+             config.tool_speculation.predictive_enabled() ||
+                 (config.early_dispatch &&
+                  config.tool_speculation.enabled() &&
+                  config.tool_speculation.cpu_affinity_isolated)},
+            {"configured", config.tool_speculation.enabled()},
+            {"caller_prediction_enabled",
+             config.tool_speculation.predictive_enabled()},
+            {"automatic_early_dispatch_enabled",
+             config.early_dispatch &&
+                 config.tool_speculation.enabled() &&
+                 config.tool_speculation.cpu_affinity_isolated},
             {"automatic_prediction_enabled", false},
             {"prediction_source", json(nullptr)},
             {"prediction_confidence", json(nullptr)},
@@ -921,12 +909,16 @@ json build_props_body(const ServerConfig & config,
                  ? json(nullptr)
                  : json(config.tool_speculation.policy.executor_contract())},
             {"protocol", "dflash.tool-speculation.v1"},
-            {"client_prediction_required", config.tool_speculation.enabled()},
+            {"client_prediction_required", false},
+            {"request_opt_in_required", true},
             {"client_result_handling_required",
-             config.tool_speculation.enabled()},
+             config.tool_speculation.predictive_enabled() ||
+                 (config.early_dispatch &&
+                  config.tool_speculation.enabled() &&
+                  config.tool_speculation.cpu_affinity_isolated)},
             {"preserves_token_speculation", true},
             {"unqualified_lane_policy", "defer"},
-            {"allowed_tools", config.tool_speculation.allowed_tools},
+            {"read_only_tools", config.tool_speculation.read_only_tools},
             {"max_model_slowdown_ratio",
              config.tool_speculation.max_model_slowdown_ratio},
             {"compute_isolation",
@@ -954,6 +946,7 @@ json build_props_body(const ServerConfig & config,
             {"capacity",      pcs.capacity},
             {"in_use",        pcs.in_use},
             {"lifetime_hits", pcs.lifetime_hits},
+            {"agent_turn_cache_enabled", config.agent_turn_cache},
         }},
         {"full_cache", {
             {"enabled",       pcfs.enabled},
@@ -1033,15 +1026,117 @@ std::string render_tool_call_xml(const std::string & name, const json & argument
     return out;
 }
 
+std::string anthropic_content_text(const json & content) {
+    if (content.is_string()) return content.get<std::string>();
+    if (!content.is_array()) return content.is_null() ? "" : content.dump();
+
+    std::string out;
+    for (const auto & part : content) {
+        if (part.is_string()) {
+            out += part.get<std::string>();
+            continue;
+        }
+        if (!part.is_object()) continue;
+        const std::string type = part.value("type", "");
+        if (type == "text" || type == "input_text" ||
+            type == "output_text") {
+            out += part.value("text", "");
+        }
+    }
+    return out;
+}
+
 std::vector<ChatMessage> normalize_chat_messages(
     const json & messages,
     ApiFormat format,
     ToolMemory & tool_memory) {
     std::vector<ChatMessage> chat_msgs;
     std::vector<std::string> system_parts;
+    bool responses_call_group_active = false;
+    bool responses_call_group_exact = false;
+    std::string responses_call_group_raw;
 
     if (messages.is_array()) {
         for (const auto & m : messages) {
+            if (format == ApiFormat::ANTHROPIC && m.is_object() &&
+                m.contains("content") && m["content"].is_array()) {
+                const std::string role = m.value("role", "user");
+                const auto & blocks = m["content"];
+
+                if (role == "assistant") {
+                    std::vector<std::string> call_ids;
+                    for (const auto & block : blocks) {
+                        if (block.is_object() &&
+                            block.value("type", "") == "tool_use") {
+                            const std::string id = block.value("id", "");
+                            if (!id.empty()) call_ids.push_back(id);
+                        }
+                    }
+                    if (!call_ids.empty()) {
+                        std::string raw = tool_memory.lookup(call_ids);
+                        if (raw.empty()) {
+                            // ToolMemory is process-local. A request arriving
+                            // after restart still needs a valid stateless
+                            // fallback even though it cannot reproduce hidden
+                            // reasoning or provider-specific surface text.
+                            for (const auto & block : blocks) {
+                                if (!block.is_object()) continue;
+                                const std::string type =
+                                    block.value("type", "");
+                                if (type == "text") {
+                                    raw += block.value("text", "");
+                                } else if (type == "tool_use") {
+                                    raw += render_tool_call_xml(
+                                        block.value("name", ""),
+                                        block.value("input", json::object()));
+                                }
+                            }
+                        }
+                        chat_msgs.push_back({"assistant", std::move(raw)});
+                        continue;
+                    }
+                }
+
+                bool has_tool_result = false;
+                for (const auto & block : blocks) {
+                    if (block.is_object() &&
+                        block.value("type", "") == "tool_result") {
+                        has_tool_result = true;
+                        break;
+                    }
+                }
+                if (has_tool_result) {
+                    // Anthropic carries tool results inside a user message;
+                    // the model template expects the same canonical tool role
+                    // used by the OpenAI and Responses adapters.
+                    for (const auto & block : blocks) {
+                        if (!block.is_object()) continue;
+                        const std::string type = block.value("type", "");
+                        if (type == "tool_result") {
+                            chat_msgs.push_back({
+                                "tool",
+                                anthropic_content_text(
+                                    block.value("content", json())),
+                                block.value("tool_use_id", ""),
+                            });
+                        } else if (type == "text") {
+                            const std::string text = block.value("text", "");
+                            if (!text.empty()) {
+                                chat_msgs.push_back({role, text});
+                            }
+                        }
+                    }
+                    continue;
+                }
+            }
+
+            if (format == ApiFormat::RESPONSES &&
+                (!m.is_object() || m.value("type", "message") !=
+                    "function_call")) {
+                responses_call_group_active = false;
+                responses_call_group_exact = false;
+                responses_call_group_raw.clear();
+            }
             if (format == ApiFormat::RESPONSES && m.is_object()) {
                 std::string item_type = m.value("type", "message");
                 if (item_type == "function_call") {
@@ -1050,11 +1145,39 @@ std::vector<ChatMessage> normalize_chat_messages(
                     if (!call_id.empty()) {
                         raw = tool_memory.lookup({call_id});
                     }
-                    if (raw.empty()) {
-                        raw = render_tool_call_xml(m.value("name", ""),
-                                                   parse_responses_arguments(m));
+                    const bool exact_raw = !raw.empty();
+                    if (!exact_raw) {
+                        raw = render_tool_call_xml(
+                            m.value("name", ""),
+                            parse_responses_arguments(m));
                     }
-                    chat_msgs.push_back({"assistant", raw});
+                    // Responses represents parallel calls as consecutive flat
+                    // items. ToolMemory maps every call ID to the same raw
+                    // assistant turn; replay that block once, not once per ID.
+                    // After restart, combine the canonical per-call fallbacks
+                    // into one assistant turn. If a later ID still has the
+                    // exact block, it supersedes an earlier fallback.
+                    if (responses_call_group_active && !chat_msgs.empty() &&
+                        chat_msgs.back().role == "assistant") {
+                        if (exact_raw && !responses_call_group_exact) {
+                            chat_msgs.back().content = raw;
+                            responses_call_group_exact = true;
+                            responses_call_group_raw = raw;
+                        } else if (exact_raw && responses_call_group_exact) {
+                            if (raw != responses_call_group_raw) {
+                                chat_msgs.push_back({"assistant", raw});
+                                responses_call_group_raw = raw;
+                            }
+                        } else if (!responses_call_group_exact) {
+                            chat_msgs.back().content += raw;
+                        }
+                    } else {
+                        chat_msgs.push_back({"assistant", raw});
+                        responses_call_group_active = true;
+                        responses_call_group_exact = exact_raw;
+                        responses_call_group_raw = exact_raw
+                            ? raw : std::string();
+                    }
                     continue;
                 }
                 if (item_type == "function_call_output") {
@@ -1125,10 +1248,6 @@ std::vector<ChatMessage> normalize_chat_messages(
     return chat_msgs;
 }
 
-namespace http_detail {
-
-}  // namespace http_detail
-
 // ─── Disk-cache identity salt ───────────────────────────────────────────
 // Compute a 16-byte salt from inputs that affect KV cache validity:
 //   model path + stat(size + mtime)  [covers rope/yarn — GGUF-derived],
@@ -1180,7 +1299,8 @@ HttpServer::HttpServer(ModelBackend & backend,
     , tokenizer_(tokenizer)
     , config_(config)
     , chat_format_(ChatFormat::QWEN3)  // default, overridden by arch
-    , prefix_cache_(config.prefix_cache_cap, tokenizer)
+    , prefix_cache_(config.prefix_cache_cap, tokenizer,
+                    config.agent_turn_cache ? 2 : 1)
     , disk_cache_({config.disk_cache_dir,
                    config.disk_cache_budget_mb * (size_t)(1024 * 1024),
                    config.disk_cache_min_tokens,
@@ -1790,6 +1910,26 @@ bool HttpServer::parse_common_request_fields(
         req.automatic_tool_speculation_enabled =
             body["automatic_tool_speculation"].get<bool>();
     }
+    req.agent_turn_cache_enabled = config_.agent_turn_cache;
+    if (body.contains("agent_turn_cache")) {
+        if (!body["agent_turn_cache"].is_boolean()) {
+            send_error(fd, 400, "agent_turn_cache must be a boolean");
+            return false;
+        }
+        const bool requested = body["agent_turn_cache"].get<bool>();
+        if (requested && !config_.agent_turn_cache) {
+            send_error(fd, 400,
+                "agent_turn_cache is not enabled on this server");
+            return false;
+        }
+        req.agent_turn_cache_enabled = requested;
+    }
+
+    if (http_detail::tool_speculation_modes_conflict(body)) {
+        send_error(fd, 400,
+            "tool_speculation and automatic_tool_speculation=true are mutually exclusive");
+        return false;
+    }
 
     if (body.contains("tool_speculation")) {
         if (http_detail::tool_choice_disables_tool_calls(req.tool_choice)) {
@@ -2229,11 +2369,12 @@ bool HttpServer::route_request(SocketHandle fd, const HttpRequest & hr) {
 
 namespace {
 
-// Staging slot for disk-cache loads: the last ModelBackend slot, reserved
-// so it never collides with PrefixCache slots (inline uses 0..cap-1, full
-// uses cap..cap+full_cap-1 — safe as long as total cache slots stay below
-// kMaxSlots - 1).
+// Backend-only staging slots live above both PrefixCache pools. Agent Turn
+// Cache snapshots the exact prompt-end prefill into slot 62, then restores it
+// to prefill the canonical completed-turn suffix into a normal cache slot.
+// Disk-cache loads retain slot 63.
 constexpr int kDiskStagingSlot = ModelBackend::kMaxSlots - 1;
+constexpr int kAgentTurnStagingSlot = ModelBackend::kMaxSlots - 2;
 
 struct CompletionTokenCounts {
     int total = 0;
@@ -3076,6 +3217,7 @@ bool HttpServer::forward_upstream(
             });
     } else {
         json body = req.raw_body;
+        http_detail::strip_engine_request_fields_for_upstream(body);
         body["model"] = upstream_model;
 
         std::fprintf(stderr,
@@ -3193,15 +3335,49 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
         }
     }
     if (!cache.using_restore) {
+        // Keep request-scoped treatment and control data from contaminating
+        // each other. A control cannot restore generated-turn snapshots; a
+        // treatment cannot restore ordinary snapshots created by a control.
+        const auto * excluded_slots = req.agent_turn_cache_enabled
+            ? &agent_turn_control_slots_ : &agent_turn_cache_slots_;
         auto [inline_slot, inline_len] =
-            prefix_cache_.lookup(effective_prompt);
-        if (inline_slot >= 0 && inline_len >= (int) effective_prompt.size() &&
-            eot_slots_.count(inline_slot)) {
-            // End-of-turn snapshots carry no final logits; with nothing left
-            // to prefill the backend could not continue. Fresh prefill instead.
+            prefix_cache_.lookup(effective_prompt, excluded_slots);
+        if (req.agent_turn_cache_enabled &&
+            !agent_turn_cache_slots_.count(inline_slot)) {
+            int best_slot = -1;
+            int best_lcp = 0;
+            const std::vector<int32_t> * best_tokens = nullptr;
+            for (int slot : agent_turn_cache_slots_) {
+                const auto it = slot_tokens_.find(slot);
+                if (it == slot_tokens_.end()) continue;
+                const int lcp = PinFriendlyPrompt::longest_common_prefix_len(
+                    it->second, effective_prompt);
+                if (lcp > best_lcp) {
+                    best_slot = slot;
+                    best_lcp = lcp;
+                    best_tokens = &it->second;
+                }
+            }
+            if (best_tokens && best_lcp > 0) {
+                const int cached_token = best_lcp < (int) best_tokens->size()
+                    ? (*best_tokens)[(size_t) best_lcp] : -1;
+                const int prompt_token = best_lcp < (int) effective_prompt.size()
+                    ? effective_prompt[(size_t) best_lcp] : -1;
+                std::fprintf(stderr,
+                    "[agent-turn-cache] miss best_slot=%d lcp=%d cached=%zu "
+                    "prompt=%zu next_cached_token=%d next_prompt_token=%d\n",
+                    best_slot, best_lcp, best_tokens->size(),
+                    effective_prompt.size(), cached_token, prompt_token);
+            }
+        }
+        if (inline_slot >= 0 && agent_turn_cache_slots_.count(inline_slot) &&
+            inline_len >= (int) effective_prompt.size()) {
+            // Avoid full-length restores: some backends retain
+            // no final logits there, so there would be nothing to continue.
             std::fprintf(stderr,
-                "[pc] skipping full-length restore of end-of-turn slot=%d\n",
-                inline_slot);
+                "[agent-turn-cache] skipping restore slot=%d "
+                "prefix_len=%d prompt=%zu\n",
+                inline_slot, inline_len, effective_prompt.size());
             inline_slot = -1;
             inline_len = 0;
         }
@@ -3371,6 +3547,7 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
                 // must not remain discoverable on every later request.
                 // Inline and full caches use disjoint slot ranges, so
                 // invalidating both ownership tables is unambiguous.
+                forget_inline_slot_metadata(cache.cache_slot);
                 backend_.snapshot_free(cache.cache_slot);
                 prefix_cache_.abort_inline_snap(cache.cache_slot);
                 prefix_cache_.abort_full_snap(cache.cache_slot);
@@ -3428,9 +3605,17 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
         }
     }
 
-    // A generation can save only one snapshot during prefill. Tool-heavy
-    // requests prefer the reusable system/tool boundary; otherwise an
-    // enabled exact full-prompt cache retains its existing priority.
+    // A generation can save only one snapshot during prefill. Treatment
+    // requests reserve it for the exact prompt end: after a tool call is
+    // parsed, that state lets us prefill the canonical completed-turn suffix
+    // instead of trusting numerically different post-decode KV. Other
+    // requests retain the ordinary inline/full cache policy.
+    const bool stage_agent_prompt =
+        config_.agent_turn_cache && req.agent_turn_cache_enabled &&
+        !req.tools.empty() && !prepared.compressed && !ppp_rewrote &&
+        !effective_prompt.empty() &&
+        cache.cache_slot != kAgentTurnStagingSlot;
+
     auto prepare_inline = [&]() {
         const auto prepared_snapshot = prefix_cache_.prepare_inline_snap(
             effective_prompt,
@@ -3452,17 +3637,25 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
         }
     };
 
-    if (prefer_inline_snap || cache.using_restore) {
-        prepare_inline();
-    }
-    if (!cache.using_restore && cache.snap_slot < 0) {
-        prepare_full();
-    }
+    if (stage_agent_prompt) {
+        cache.agent_prompt_snap_pos = (int) effective_prompt.size();
+        cache.agent_prompt_snap_prepared = true;
+        backend_.snapshot_free(kAgentTurnStagingSlot);
+        generate_request.snap_slot = kAgentTurnStagingSlot;
+        generate_request.snap_pos = cache.agent_prompt_snap_pos;
+    } else {
+        if (prefer_inline_snap || cache.using_restore) {
+            prepare_inline();
+        }
+        if (!cache.using_restore && cache.snap_slot < 0) {
+            prepare_full();
+        }
 
-    // Full cache may be disabled or already contain this exact key. Fall
-    // back to an inline snapshot when no target has been selected yet.
-    if (!cache.full_snap_prepared && cache.snap_slot < 0) {
-        prepare_inline();
+        // Full cache may be disabled or already contain this exact key. Fall
+        // back to an inline snapshot when no target has been selected yet.
+        if (!cache.full_snap_prepared && cache.snap_slot < 0) {
+            prepare_inline();
+        }
     }
 
     // Never destroy the snapshot needed by this request's restore. With a
@@ -3476,6 +3669,7 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
     }
     cache.snap_prepared = cache.snap_slot >= 0;
     if (cache.snap_prepared) {
+        forget_inline_slot_metadata(cache.snap_slot);
         backend_.snapshot_free(cache.snap_slot);
         generate_request.snap_slot = cache.snap_slot;
         generate_request.snap_pos = cache.snap_cut;
@@ -3487,7 +3681,8 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
     std::fprintf(stderr,
         "[server] chat CACHE %s restore=%s slot=%d prefix_len=%d "
         "effective_prompt=%zu pflash=%s disk_policy=%s disk_hit=%s "
-        "snap_slot=%d snap_pos=%d full_snap_slot=%d full_snap_pos=%d\n",
+        "snap_slot=%d snap_pos=%d full_snap_slot=%d full_snap_pos=%d "
+        "agent_prompt_snap=%d\n",
         req.response_id.c_str(),
         cache.using_restore ? "true" : "false",
         cache.cache_slot, cache.prefix_len, effective_prompt.size(),
@@ -3495,7 +3690,9 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
         disk_prefix_cache_policy_name(cache.disk_policy).c_str(),
         cache.disk_hit ? "true" : "false",
         cache.snap_slot, cache.snap_cut,
-        cache.full_snap_slot, cache.full_snap_pos);
+        cache.full_snap_slot, cache.full_snap_pos,
+        cache.agent_prompt_snap_prepared
+            ? cache.agent_prompt_snap_pos : 0);
 
     status_.set_flags(
         cache.using_restore, prepared.compressed,
@@ -3545,7 +3742,11 @@ void HttpServer::finalize_generation_cache(
                     cache.snap_cut, saved_position, cache.snap_slot);
                 prefix_cache_.confirm_inline_snap(
                     cache.snap_slot, cache.snap_cut, effective_prompt);
-                eot_slots_.erase(cache.snap_slot);
+                forget_inline_slot_metadata(cache.snap_slot);
+                if (config_.agent_turn_cache &&
+                    !req.agent_turn_cache_enabled) {
+                    agent_turn_control_slots_.insert(cache.snap_slot);
+                }
                 // Track for shutdown save. The key may be stricter than a
                 // Qwen chunk-aligned snapshot, which is safe: matching the
                 // longer token prefix necessarily matches saved KV rows.
@@ -3569,38 +3770,6 @@ void HttpServer::finalize_generation_cache(
     }
 
     if (cache.disk_hit) backend_.snapshot_free(kDiskStagingSlot);
-
-    // End-of-turn continuation snapshot: for tool-enabled requests, cache
-    // prompt+output so the next request of the same conversation restores
-    // everything up to the appended tool results and prefills one delta.
-    if (config_.end_turn_snapshot && !prefix_cache_.disabled() &&
-        result.ok() && generation_produced_output && !result.tokens.empty() &&
-        !req.tools.empty()) {
-        std::vector<int32_t> all_tokens(effective_prompt);
-        all_tokens.insert(all_tokens.end(),
-                          result.tokens.begin(), result.tokens.end());
-        const int cut = (int) all_tokens.size();
-        const auto prepared_eot = prefix_cache_.prepare_inline_snap(
-            all_tokens, 0, false, cut);
-        if (prepared_eot.first >= 0 && prepared_eot.second == cut) {
-            const int slot = prepared_eot.first;
-            backend_.snapshot_free(slot);
-            if (backend_.snapshot_save(slot) &&
-                backend_.snapshot_cur_pos(slot) == cut) {
-                prefix_cache_.confirm_inline_snap(slot, cut, all_tokens);
-                slot_tokens_[slot] = all_tokens;
-                eot_slots_.insert(slot);
-                std::fprintf(stderr,
-                    "[pc] end-of-turn snapshot saved slot=%d pos=%d\n",
-                    slot, cut);
-            } else {
-                backend_.snapshot_free(slot);
-                prefix_cache_.abort_inline_snap(slot);
-                std::fprintf(stderr,
-                    "[pc] end-of-turn snapshot unavailable (backend declined)\n");
-            }
-        }
-    }
 
     // Long conversations get a continued checkpoint after crossing the
     // configured interval so a future turn can restore prompt plus output.
@@ -3636,6 +3805,138 @@ void HttpServer::finalize_generation_cache(
     static constexpr size_t kMaxRecentDiskPrompts = 256;
     if (recent_disk_prompts_.size() > kMaxRecentDiskPrompts) {
         recent_disk_prompts_.resize(kMaxRecentDiskPrompts);
+    }
+}
+
+void HttpServer::forget_inline_slot_metadata(int slot) {
+    if (slot < 0) return;
+    agent_turn_cache_slots_.erase(slot);
+    agent_turn_control_slots_.erase(slot);
+    slot_tokens_.erase(slot);
+}
+
+void HttpServer::remember_agent_turn(
+        const ParsedRequest & req, const PreparedPrompt & prepared,
+        const GenerationCacheState & cache,
+        const GenerateResult & result, const SseEmitter & emitter,
+        int completion_tokens, bool visible_output_seen,
+        bool client_disconnected) {
+    const bool generation_produced_output = result.ok() &&
+        completion_tokens > 0 && visible_output_seen && !client_disconnected;
+    if (!config_.agent_turn_cache || !req.agent_turn_cache_enabled ||
+        !generation_produced_output ||
+        result.tokens.empty() || req.tools.empty() ||
+        emitter.tool_calls().empty() || emitter.accumulated_raw().empty()) {
+        return;
+    }
+    // Compressed and DiffPin-rewritten prompts require their own replay
+    // contract. Fail closed until the served tokens are the request tokens.
+    if (prepared.compressed || prepared.tokens != req.prompt_tokens) {
+        std::fprintf(stderr,
+            "[agent-turn-cache] replay skipped for rewritten prompt\n");
+        return;
+    }
+
+    std::vector<ChatMessage> completed_messages =
+        normalize_chat_messages(req.messages, req.format, tool_memory_);
+    completed_messages.push_back({"assistant", emitter.accumulated_raw()});
+    const std::string tools_json =
+        req.tools.is_array() && !req.tools.empty() ? req.tools.dump() : "";
+    std::string rendered;
+    try {
+        if (!config_.chat_template_src.empty()) {
+            const std::string & bos = tokenizer_.bos_id() >= 0
+                ? tokenizer_.raw_token(tokenizer_.bos_id())
+                : std::string();
+            const std::string & eos = tokenizer_.eos_id() >= 0
+                ? tokenizer_.raw_token(tokenizer_.eos_id())
+                : std::string();
+            rendered = render_chat_template_jinja(
+                config_.chat_template_src, completed_messages, bos, eos,
+                /*add_generation_prompt=*/false,
+                req.thinking_enabled, tools_json);
+        } else {
+            rendered = render_chat_template(
+                completed_messages, chat_format_,
+                /*add_generation_prompt=*/false,
+                req.thinking_enabled, tools_json);
+        }
+    } catch (const std::exception & error) {
+        std::fprintf(stderr,
+            "[agent-turn-cache] completed-turn render failed: %s\n",
+            error.what());
+        return;
+    }
+    std::vector<int32_t> canonical_prefix = tokenizer_.encode(rendered);
+    if (canonical_prefix.empty()) return;
+    if (!http_detail::canonical_turn_extends_prompt(
+            prepared.tokens, canonical_prefix)) {
+        std::fprintf(stderr,
+            "[agent-turn-cache] canonical replay skipped: completed turn "
+            "does not extend checkpointed prompt (prompt=%zu turn=%zu)\n",
+            prepared.tokens.size(), canonical_prefix.size());
+        return;
+    }
+
+    // Replay the canonical stateless-request tokenization, not the token IDs
+    // sampled during decode. Rewriting a later caller prompt to generated BPE
+    // IDs would make the feature stateful and invalidate a cache-off control.
+    if (prefix_cache_.disabled() || !cache.agent_prompt_snap_prepared) {
+        return;
+    }
+    const int staged_position =
+        backend_.snapshot_cur_pos(kAgentTurnStagingSlot);
+    if (!backend_.snapshot_used(kAgentTurnStagingSlot) ||
+        staged_position <= 0 ||
+        staged_position > (int) prepared.tokens.size()) {
+        std::fprintf(stderr,
+            "[agent-turn-cache] canonical replay unavailable "
+            "(staged_pos=%d prompt=%zu)\n",
+            staged_position, prepared.tokens.size());
+        return;
+    }
+
+    const int emitted_end = (int) canonical_prefix.size();
+    const auto prepared_turn = prefix_cache_.prepare_inline_snap(
+        canonical_prefix, 0, false, emitted_end);
+    if (prepared_turn.first < 0 || prepared_turn.second != emitted_end) return;
+
+    const int slot = prepared_turn.first;
+    forget_inline_slot_metadata(slot);
+    backend_.snapshot_free(slot);
+    GenerateRequest replay_request;
+    replay_request.prompt = canonical_prefix;
+    replay_request.n_gen = 0;
+    replay_request.snap_slot = slot;
+    replay_request.snap_pos = emitted_end;
+    DaemonIO replay_io;
+    replay_io.stream_fd = -1;
+    const auto replay_started = std::chrono::steady_clock::now();
+    const GenerateResult replay_result = backend_.restore_and_generate(
+        kAgentTurnStagingSlot, replay_request, replay_io);
+    const double replay_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - replay_started).count();
+    const int saved_position = replay_result.ok() &&
+        backend_.snapshot_used(slot)
+        ? backend_.snapshot_cur_pos(slot) : 0;
+    if (saved_position > staged_position && saved_position <= emitted_end) {
+        prefix_cache_.confirm_inline_snap(
+            slot, saved_position, canonical_prefix);
+        canonical_prefix.resize(static_cast<size_t>(saved_position));
+        slot_tokens_[slot] = std::move(canonical_prefix);
+        agent_turn_cache_slots_.insert(slot);
+        std::fprintf(stderr,
+            "[agent-turn-cache] canonical replay saved slot=%d pos=%d "
+            "source=%d emitted_end=%d replay_ms=%.1f\n",
+            slot, saved_position, staged_position, emitted_end, replay_ms);
+    } else {
+        backend_.snapshot_free(slot);
+        prefix_cache_.abort_inline_snap(slot);
+        std::fprintf(stderr,
+            "[agent-turn-cache] canonical replay failed "
+            "(ok=%d saved_pos=%d source=%d emitted_end=%d replay_ms=%.1f)\n",
+            replay_result.ok() ? 1 : 0, saved_position, staged_position,
+            emitted_end, replay_ms);
     }
 }
 
@@ -3717,9 +4018,9 @@ void HttpServer::prepare_generation_inputs(
 }
 
 // ─── Early dispatch ──────────────────────────────────────────────────────
-// Launch allowlisted tool calls the moment their call block closes in the
-// token stream. Each launched call is resolved independently against the
-// authoritative parsed calls (exact canonical match), so N calls in one
+// Launch operator-declared read-only tool calls when their call block closes
+// in the token stream. Each launched call is resolved independently against
+// the authoritative parsed calls (exact canonical match), so N calls in one
 // response overlap both the remaining decode and each other.
 
 void HttpServer::scan_early_dispatch(const ParsedRequest & req,
@@ -3747,30 +4048,8 @@ void HttpServer::scan_early_dispatch(const ParsedRequest & req,
             continue;
         }
         entry.call_index = ++output.early_call_count;
-        if (!config_.tool_speculation.allows(entry.call.name)) {
-            entry.skip_reason = "tool_not_allowlisted";
-            output.early_entries.push_back(std::move(entry));
-            continue;
-        }
-        entry.dependencies = find_tool_call_dependencies(entry.call.arguments);
-        if (!entry.dependencies.empty()) {
-            // Dependent call: executed server-side once its inputs resolve
-            // (see resolve_early_dispatch), saving a model turn per chain level.
-            bool valid = true;
-            for (int dep : entry.dependencies) {
-                const auto source = std::find_if(
-                    output.early_entries.begin(), output.early_entries.end(),
-                    [dep](const EarlyDispatchEntry & candidate) {
-                        return candidate.call_index == dep;
-                    });
-                if (dep < 1 || dep >= entry.call_index ||
-                    source == output.early_entries.end() ||
-                    !source->skip_reason.empty()) {
-                    valid = false;
-                    break;
-                }
-            }
-            if (!valid) entry.skip_reason = "unresolvable_dependency";
+        if (!config_.tool_speculation.allows_read_only(entry.call.name)) {
+            entry.skip_reason = "tool_not_declared_read_only";
             output.early_entries.push_back(std::move(entry));
             continue;
         }
@@ -3800,175 +4079,57 @@ json HttpServer::resolve_early_dispatch(
     // Match by occurrence, not only by canonical arguments. Two identical
     // calls with distinct IDs are two authoritative invocations and must each
     // receive their own executor attempt and result.
-    std::vector<const ToolCall *> matches(output.early_entries.size(), nullptr);
     std::vector<bool> claimed(authoritative_calls.size(), false);
-    for (size_t i = 0; i < output.early_entries.size(); ++i) {
-        const EarlyDispatchEntry & entry = output.early_entries[i];
-        if (entry.call_index <= 0) continue;
-        for (size_t j = 0; j < authoritative_calls.size(); ++j) {
-            if (claimed[j]) continue;
-            CanonicalToolInvocation canonical;
-            std::string error;
-            if (CanonicalToolInvocation::from_tool_call(
-                    authoritative_calls[j], canonical, error) &&
-                canonical == entry.call) {
-                matches[i] = &authoritative_calls[j];
-                claimed[j] = true;
-                break;
-            }
-        }
-    }
-    auto find_entry = [&](int call_index) -> EarlyDispatchEntry * {
-        const auto found = std::find_if(
-            output.early_entries.begin(), output.early_entries.end(),
-            [call_index](const EarlyDispatchEntry & candidate) {
-                return candidate.call_index == call_index;
-            });
-        return found == output.early_entries.end() ? nullptr : &*found;
-    };
-    auto store_hit_result = [](EarlyDispatchEntry & entry, json & item,
-                               const json & result) {
-        entry.result = result;
-        entry.has_result = true;
-        // Canonical tool-message text: a client that echoes this string as
-        // the tool message content gets a guaranteed prefetch-prefill hit.
-        item["tool_message_content"] =
-            entry.result.is_object() && entry.result.contains("value")
-                ? entry.result["value"].dump()
-                : entry.result.dump();
-    };
-    std::vector<json> items(output.early_entries.size());
-    // Pass 1: calls launched during decode (no dependencies).
-    for (size_t i = 0; i < output.early_entries.size(); ++i) {
-        EarlyDispatchEntry & entry = output.early_entries[i];
-        json & item = items[i];
-        item = {
+    json items = json::array();
+    for (EarlyDispatchEntry & entry : output.early_entries) {
+        json item = {
             {"name", entry.call.name},
             {"arguments", entry.call.arguments},
             {"call_index", entry.call_index},
             {"launched_at_token", entry.token_index},
         };
-        if (!entry.dependencies.empty()) item["dependencies"] = entry.dependencies;
         if (!entry.attempt) {
-            if (!entry.skip_reason.empty()) {
-                item["status"] = "skipped";
-                item["reason"] = entry.skip_reason;
-                entry.done = true;
-            }
-            continue;  // dependent calls are handled below
+            item["status"] = "skipped";
+            item["reason"] = entry.skip_reason.empty()
+                ? "not_launched" : entry.skip_reason;
+            items.push_back(std::move(item));
+            continue;
         }
-        const ToolCall * match = matches[i];
+        const ToolCall * match = nullptr;
+        if (!cancel_reason && entry.call_index > 0) {
+            for (size_t j = 0; j < authoritative_calls.size(); ++j) {
+                if (claimed[j]) continue;
+                CanonicalToolInvocation canonical;
+                std::string error;
+                if (CanonicalToolInvocation::from_tool_call(
+                        authoritative_calls[j], canonical, error) &&
+                    canonical == entry.call) {
+                    match = &authoritative_calls[j];
+                    claimed[j] = true;
+                    break;
+                }
+            }
+        }
         json metadata = (cancel_reason || !match)
             ? entry.attempt->cancel(
-                  cancel_reason ? cancel_reason : "no_matching_authoritative_call")
+                  cancel_reason ? cancel_reason
+                                : "no_matching_authoritative_call")
             : entry.attempt->resolve(std::vector<ToolCall>{*match});
         for (auto it = metadata.begin(); it != metadata.end(); ++it) {
             item[it.key()] = it.value();
         }
         if (match) item["call_id"] = match->id;
-        if (metadata.value("status", "") == "hit" && metadata.contains("result")) {
-            store_hit_result(entry, item, metadata["result"]);
+        if (metadata.value("status", "") == "hit" &&
+            metadata.contains("result")) {
+            // Canonical tool-message text: a client that echoes this string
+            // gets an exact prefetch-prefill prompt match.
+            item["tool_message_content"] =
+                http_detail::tool_message_content_for_result(
+                    metadata["result"]);
         }
-        entry.done = true;
+        items.push_back(std::move(item));
     }
-    // Pass 2: dependent calls, wave by wave. Each wave launches every call
-    // whose inputs are resolved, concurrently, then collects them.
-    constexpr int kMaxWaves = 8;
-    for (int wave = 1; wave <= kMaxWaves && !cancel_reason; ++wave) {
-        std::vector<size_t> ready;
-        for (size_t i = 0; i < output.early_entries.size(); ++i) {
-            EarlyDispatchEntry & entry = output.early_entries[i];
-            if (entry.done || entry.dependencies.empty()) continue;
-            bool inputs_ready = true;
-            bool inputs_failed = false;
-            for (int dep : entry.dependencies) {
-                const EarlyDispatchEntry * source = find_entry(dep);
-                if (!source || !source->done) inputs_ready = false;
-                else if (!source->has_result) inputs_failed = true;
-            }
-            if (inputs_failed) {
-                items[i]["status"] = "skipped";
-                items[i]["reason"] = "dependency_failed";
-                entry.done = true;
-                continue;
-            }
-            if (inputs_ready) ready.push_back(i);
-        }
-        if (ready.empty()) break;
-        std::vector<std::unique_ptr<ToolSpeculationAttempt>> launched(ready.size());
-        std::vector<CanonicalToolInvocation> resolved_calls(ready.size());
-        for (size_t r = 0; r < ready.size(); ++r) {
-            EarlyDispatchEntry & entry = output.early_entries[ready[r]];
-            json & item = items[ready[r]];
-            std::string error;
-            json resolved_args;
-            const bool ok = substitute_tool_call_dependencies(
-                entry.call.arguments,
-                [&](int index) -> const json * {
-                    const EarlyDispatchEntry * source = find_entry(index);
-                    return source && source->has_result
-                        ? &source->result : nullptr;
-                },
-                resolved_args, error);
-            if (!ok || !CanonicalToolInvocation::from_parts(
-                    entry.call.name, resolved_args, resolved_calls[r], error)) {
-                item["status"] = "skipped";
-                item["reason"] = "dependency_substitution: " + error;
-                entry.done = true;
-                continue;
-            }
-            entry.resolved_arguments = resolved_args;
-            entry.wave = wave;
-            item["resolved_arguments"] = resolved_args;
-            item["wave"] = wave;
-            ToolSpeculationPrediction prediction;
-            if (!build_tool_speculation_prediction(
-                    entry.call.name, resolved_args, 1.0, prediction, error)) {
-                item["status"] = "skipped";
-                item["reason"] = "prediction: " + error;
-                entry.done = true;
-                continue;
-            }
-            prediction.authoritative = true;
-            launched[r] = ToolSpeculationAttempt::create(
-                config_.tool_speculation, prediction, "dependent");
-            launched[r]->start();
-            std::fprintf(stderr,
-                "[early-dispatch] dependent launch tool=%s wave=%d call=%d\n",
-                entry.call.name.c_str(), wave, entry.call_index);
-        }
-        for (size_t r = 0; r < ready.size(); ++r) {
-            if (!launched[r]) continue;
-            EarlyDispatchEntry & entry = output.early_entries[ready[r]];
-            json & item = items[ready[r]];
-            const ToolCall * match = matches[ready[r]];  // template as emitted
-            json metadata;
-            if (!match) {
-                metadata = launched[r]->cancel("no_matching_authoritative_call");
-            } else {
-                ToolCall resolved_call = *match;
-                resolved_call.arguments = resolved_calls[r].arguments_json;
-                metadata = launched[r]->resolve(std::vector<ToolCall>{resolved_call});
-                item["call_id"] = match->id;
-            }
-            for (auto it = metadata.begin(); it != metadata.end(); ++it) {
-                item[it.key()] = it.value();
-            }
-            if (metadata.value("status", "") == "hit" && metadata.contains("result")) {
-                store_hit_result(entry, item, metadata["result"]);
-            }
-            entry.done = true;
-        }
-    }
-    json out = json::array();
-    for (size_t i = 0; i < items.size(); ++i) {
-        if (!output.early_entries[i].done) {
-            items[i]["status"] = "skipped";
-            items[i]["reason"] = cancel_reason ? cancel_reason : "dependency_unresolved";
-        }
-        out.push_back(std::move(items[i]));
-    }
-    return out;
+    return items;
 }
 
 // Prefetch-prefill: after a tool turn whose early-dispatched results all
@@ -4035,6 +4196,7 @@ void HttpServer::prefetch_next_turn(
         prefix_cache_.cancel_inline_snap(snap_slot);
         return;
     }
+    forget_inline_slot_metadata(snap_slot);
     backend_.snapshot_free(snap_slot);
     GenerateRequest prefetch_request;
     prefetch_request.prompt = tokens;
@@ -4055,22 +4217,29 @@ void HttpServer::prefetch_next_turn(
         ? backend_.restore_and_generate(restore_slot, prefetch_request,
                                         prefetch_io)
         : backend_.generate(prefetch_request, prefetch_io);
-    if (prefetch_result.ok() && backend_.snapshot_used(snap_slot) &&
+    // The worker cannot dequeue while this function runs, so a queued job is
+    // proof that a real request arrived before prefill completed. Never keep
+    // or advertise work for which that request may have waited.
+    const bool request_waiting =
+        prefetch_cancelled->load(std::memory_order_acquire) ||
+        has_pending_jobs();
+    if (!request_waiting && prefetch_result.ok() &&
+        backend_.snapshot_used(snap_slot) &&
         backend_.snapshot_cur_pos(snap_slot) == (int) tokens.size()) {
         prefix_cache_.confirm_inline_snap(snap_slot, (int) tokens.size(),
                                           tokens);
-        eot_slots_.erase(snap_slot);
+        forget_inline_slot_metadata(snap_slot);
         slot_tokens_[snap_slot] = tokens;
         std::fprintf(stderr,
-            "[prefetch] next-turn KV ready pos=%zu (%.1fs off the critical "
-            "path)\n",
+            "[prefetch] next-turn KV ready pos=%zu (%.1fs, completed before "
+            "the next request arrived)\n",
             tokens.size(),
             std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - started).count());
     } else {
         backend_.snapshot_free(snap_slot);
         prefix_cache_.abort_inline_snap(snap_slot);
-        if (prefetch_cancelled->load(std::memory_order_acquire)) {
+        if (request_waiting) {
             std::fprintf(stderr,
                 "[prefetch] yielded to a queued request\n");
         }
@@ -4216,7 +4385,7 @@ void HttpServer::worker_loop() {
 
 void HttpServer::process_job(ServerJob * job) {
     SocketHandle fd = job->fd;
-    auto & req = job->req;
+    const auto & req = job->req;
     auto started_at = std::chrono::steady_clock::now();
 
     // Track live status for /status page. RAII guard ensures idle on all paths.
@@ -4411,26 +4580,27 @@ void HttpServer::process_job(ServerJob * job) {
             old_keep, new_keep, ema, result.accept_rate);
     }
 
-    finalize_generation_cache(
-        req, prepared, cache, result, completion_tokens,
-        visible_output_seen, client_disconnected);
-
     // Finalize.
     // Per-request wall-clock timings forwarded to the response's
     // `usage.timings` (OpenAI Chat usage chunk, Anthropic
     // message_delta usage, Responses response.completed usage).
     // See docs/specs/thinking-budget.md §6.3.
     const int effective_prompt_tokens = (int) effective_prompt.size();
-    const int cached_prefix_tokens = using_restore
-        ? (std::clamp)(prefix_len, 0, effective_prompt_tokens)
+    const int cached_prefix_tokens = result.ok()
+        ? (std::clamp)(result.restored_prefix_tokens, 0,
+                      effective_prompt_tokens)
         : 0;
+    const bool cache_hit = cached_prefix_tokens > 0;
+    const bool agent_turn_cache_hit = cache_hit &&
+        agent_turn_cache_slots_.count(cache_slot) != 0;
     GenTimings gen_timings{
         result.prefill_s,
         result.decode_s,
-        using_restore,
+        cache_hit,
         cached_prefix_tokens,
         effective_prompt_tokens - cached_prefix_tokens,
         effective_prompt_tokens,
+        agent_turn_cache_hit,
     };
 
     // Record performance for /status page.
@@ -4441,15 +4611,14 @@ void HttpServer::process_job(ServerJob * job) {
         // Use actual prefilled token count: on cache hit the backend only
         // prefills the delta beyond the cached prefix, so dividing the full
         // prompt size by delta time would be wrong.
-        const int prefill_tokens = using_restore
-            ? (std::max)(0, (int)effective_prompt.size() - prefix_len)
-            : (int)effective_prompt.size();
+        const int prefill_tokens =
+            (std::max)(0, effective_prompt_tokens - cached_prefix_tokens);
         perf.prefill_tok_s = (result.prefill_s > 0.0)
             ? (double)prefill_tokens / result.prefill_s : 0.0;
         perf.decode_tok_s = (result.decode_s > 0.0)
             ? (double)completion_tokens / result.decode_s : 0.0;
         perf.accept_rate = result.accept_rate;
-        perf.cache_hit = using_restore;
+        perf.cache_hit = cache_hit;
         perf.pflash = pflash_compressed;
         perf.spec_decode = result.spec_decode_ran;
         perf.timestamp = std::chrono::steady_clock::now();
@@ -4535,9 +4704,22 @@ void HttpServer::process_job(ServerJob * job) {
                                    "client_disconnected");
         }
     }
+    // Tool-call parsing becomes authoritative only when the emitter finishes.
+    // Commit ordinary snapshots now, then record the exact completed turn and
+    // its continuation snapshot before any optional next-turn prefill.
+    finalize_generation_cache(
+        req, prepared, cache, result, completion_tokens,
+        visible_output_seen, client_disconnected);
+    remember_agent_turn(
+        req, prepared, cache, result, emitter, completion_tokens,
+        visible_output_seen, client_disconnected);
+    backend_.snapshot_free(kAgentTurnStagingSlot);
     if (!client_disconnected && !generation_cancel_reason) {
         prefetch_next_turn(req, emitter, output, early_items);
     }
+    // Canonical turn replay and optional next-turn prefill happen after the
+    // main generation's first cleanup pass and may allocate their own scratch.
+    backend_.release_scratch();
 
     if (client_disconnected) {
         std::fprintf(stderr, "[server] client disconnected — generation aborted "

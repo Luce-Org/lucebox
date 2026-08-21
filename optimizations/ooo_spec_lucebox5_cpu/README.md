@@ -1,100 +1,164 @@
-# Speculative tool execution
+# Agent Turn Cache for coding agents
 
-Lossless acceleration of tool-calling requests. The model stays authoritative:
-speculative work is exposed only on an exact canonical match, and every failure
-path falls back to the normal request flow.
+Coding agents repeatedly resend a growing transcript. After the model emits a
+tool call, the next request contains the same prompt, that generated assistant
+turn, and a comparatively small tool result. A normal prompt cache can reuse
+the old input, but it does not own the model state created while generating the
+tool call.
 
-Three engine flags, designed to be enabled together:
+`--agent-turn-cache` checkpoints normal prompt-end state before decode. After a
+real tool call is parsed, Lucebox restores that checkpoint and prefills the
+canonical completed-turn suffix into a cache slot. On the next request it
+restores the completed turn and prefills only the appended tool result. No
+tool is executed by the server, and the client tool loop remains unchanged.
 
-- `--early-dispatch` — every allowlisted tool call is launched through the
-  isolated executor lane the moment its call block
-  (`<function_call>`, `<tool_call>`, `<function=>`) closes in the token
-  stream. N calls per response run concurrently; each commits independently
-  against the parsed authoritative calls. Results are returned as
-  `dflash_early_dispatch` (JSON body) / inside the
-  `dflash_tool_speculation` SSE extension event. Calls whose arguments
-  reference earlier results with `"$k.path"` placeholders are resolved and
-  executed server-side, wave by wave.
-- `--end-turn-snapshot` — after a tool-enabled generation the server
-  snapshots prompt+output into the inline prefix cache, so the next turn of
-  the conversation restores everything instead of a stale boundary.
-- `--prefetch-prefill` — after a turn whose early-dispatched results all
-  committed, the next request is fully determined (conversation + assistant
-  output + canonical tool messages). The server renders it, prefills it and
-  caches the KV before the client's next request arrives; a client that
-  echoes each hit's `tool_message_content` string starts its next turn at
-  decode speed. Any mismatch silently takes the normal path.
+The implementation renders and tokenizes the completed turn exactly as the
+next stateless API request will. That tokenization must extend the checkpointed
+prompt without changing any prior token; a BPE-boundary change fails closed and
+the next request uses normal prefill. Lucebox never rewrites caller input to the
+token IDs sampled during decode. Canonical prefill also avoids trusting live
+post-generation state, which can be numerically different from ordinary
+transcript prefill. A hit is reported only after the backend confirms that it
+restored the snapshot; any checkpoint or replay failure falls back to normal
+prefill.
 
-Clients can also supply a concrete prediction up front via the
-`tool_speculation` request extension (unchanged). Automatic early dispatch is
-off by default and requires an explicit per-request opt-in with
-`"automatic_tool_speculation": true`.
+The canonical suffix replay starts after response delivery and can overlap the
+client's tool execution. A fast tool can return before replay finishes, so the
+benchmark measures both backend prefill and the full follow-up request.
 
-## Safety
+## Start the server
 
-- Automatic early dispatch is fail-closed per request: omitting
-  `automatic_tool_speculation` leaves it disabled. The server never infers
-  whether a tool is safe; the operator supplies exact names with
-  `--tool-spec-allow`.
-- Only tools named by `--tool-spec-allow` ever run speculatively; the
-  executor is spawned without a shell, with a minimal environment, closed
-  descriptors, an optional pinned CPU lane disjoint from the model
-  (`--tool-spec-cpu-affinity`), launch-based lifetime caps and a
-  commit-based result deadline (`--tool-spec-timeout-ms`). Executors can also
-  attach `_speculation_fresh_until_unix_ms`; expired live-data results are
-  rejected immediately before commit and run again through the normal path.
-- Allow immediate execution only for read-only tools. A side-effecting
-  executor must stage the change until the engine sends `commit`, or provide
-  transactional rollback; idempotency alone does not make wrong arguments
-  safe.
-- `--tool-spec-profile` (a measured interference profile) is required for
-  every client-supplied prediction. Only calls already emitted by the model
-  and launched through early dispatch are authoritative without a profile;
-  a client cannot obtain that status by reporting confidence 1.
-
-## Measured (Lucebox5, DeepSeek-V4-0731 + DSpark, live public APIs)
-
-10 multi-step tasks over keyless real APIs (geocoding, weather, World Bank,
-Wikipedia, FX; 0.1-0.9 s latency), control vs speculative arm on the same
-server (`realapi/rest_bench.py`, historical performance traces in
-`realapi/results/`):
-
-| | control | speculative |
-|---|---|---|
-| tool calls hidden | 0/17 | **17/17** |
-| client tool wait | 3.0 s | **0.0 s** |
-| 10-task wall (end-of-turn snapshots) | 174 s | **156 s** (-10%, up to -27% on 3-4-turn tasks) |
-
-With `--prefetch-prefill` on top (full stack, `realapi/results/rest_full_stack_10tasks.json`):
-paired speedup **x1.44 aggregate / x1.30 median**, 17/17 calls hidden, 21.4 s
-of client tool wait removed, and **72.3 s of prefill moved off the critical
-path across 15 prefetched turns**.
-
-Those committed traces predate the current result-derived correctness gate and
-are latency evidence only. Current `rest_bench.py` and `dag_bench.py` require
-successful tool execution plus values derived from every answer-producing tool
-result; rerun them before making accuracy claims. The earlier corrupted DAG
-trace was removed rather than presented as correctness evidence.
-
-Gains scale with tool latency and call count: on benchmarks with
-millisecond in-memory tools there is nothing to hide, while each second of
-real API latency is a second saved per call. An earlier revision's
-pre-generation predictor (Qwen3-0.6B) was measured at 3/17 hits on these
-APIs and 0/75 on terminal-bench against ~0.5 s serial cost per turn, and
-was removed; the history preserves it.
-
-## Reproduce
+Add the feature to a normal server command:
 
 ```bash
-# server (wraps the qualified 0731 launcher's binary selection)
-TBSPEC_EXECUTOR=$PWD/realapi/rest_tool_executor.py \
-  TBSPEC_ALLOW=geocode_city,get_weather,country_info,wikipedia_summary,exchange_rate \
-  ./realapi/launch_server.sh
-
-# paired benchmark (control vs speculative, alternating order, primed)
-python3 realapi/rest_bench.py run1 --tasks 10
-python3 realapi/rest_summary.py run1
-
-# many-call / dependency benchmark
-python3 realapi/dag_bench.py run2 --small --tasks 4
+./server/build/dflash_server model.gguf \
+  --agent-turn-cache \
+  [normal model options]
 ```
+
+The reference wrapper adds that flag for you:
+
+```bash
+optimizations/ooo_spec_lucebox5_cpu/agentic_coding/launch_server.sh \
+  ./server/build/dflash_server model.gguf [normal model options]
+```
+
+When the server flag is present, agent-turn caching applies by default to
+requests that produce a parsed tool call. Clients can run a request-scoped A/B
+test without restarting the model:
+
+```json
+{
+  "model": "deepseek-v4-flash",
+  "messages": ["..."],
+  "tools": ["..."],
+  "agent_turn_cache": false
+}
+```
+
+Set the field to `true` for the cache arm. Asking for `true` on a server that
+was not started with `--agent-turn-cache` returns HTTP 400 instead of silently
+running a different configuration. Control-origin ordinary snapshots are not
+eligible in the cache arm, and the benchmark gives each pair a shared opaque
+prompt ID derived from a recorded run-unique nonce so earlier pairs and prior
+benchmark invocations cannot warm either measurement. The initial prompts are
+identical, exact normalized assistant/tool transcript parity (including
+reasoning) and equal served token counts gate every follow-up, and arm order
+alternates. The runner records `/props`; the publication gate requires the
+separate full-prompt cache to be disabled so it cannot warm the second arm
+outside the request-scoped inline-cache isolation.
+
+Every response exposes backend-confirmed work under `usage.timings`:
+
+```json
+{
+  "agent_turn_cache_hit": true,
+  "cache_hit": true,
+  "cached_prefix_tokens": 958,
+  "prefilled_tokens": 95,
+  "effective_prompt_tokens": 1053,
+  "prefill_ms": 3960.1
+}
+```
+
+`agent_turn_cache_hit` is narrower than `cache_hit`: it is true only when the
+restored entry contains a generated assistant tool-call turn. The token counts
+come from the backend's actual restore, not from the cache candidate selected
+by the HTTP layer.
+
+## Agentic-coding benchmark
+
+`agentic_coding/` contains a workspace-confined implementation of
+`read_file`, `search_code`, and `list_files`, a deterministic repository
+fixture, and a paired `control/cache` benchmark. Fixture prompts name the files
+to inspect so the smoke test holds model planning variance constant. Both arms
+execute tools on the client. Their only engine difference is the
+`agent_turn_cache` request field.
+
+```bash
+cd optimizations/ooo_spec_lucebox5_cpu/agentic_coding
+python3 -m unittest -v test_coding_tools.py
+
+DFLASH_BENCH_HARDWARE='host/GPU/CPU description' \
+DFLASH_SERVER_BUILD_ID='git commit or immutable image digest' \
+  python3 coding_bench.py run1 --repetitions 5
+python3 coding_summary.py run1
+```
+
+For an additional smoke over the real server tree:
+
+```bash
+python3 coding_bench.py lucebox-smoke \
+  --workspace ../../../server \
+  --tasks-file tasks_lucebox.json \
+  --repetitions 1
+```
+
+The summary rejects a publication claim unless all of these hold:
+
+- every expected pair exists and both arms pass the evidence-derived answer
+  checks;
+- control and cache produce the same normalized assistant/tool transcript,
+  including reasoning, the canonical sequence of tool names, arguments,
+  byte-identical results, and final answer;
+- corresponding follow-up prompts have equal token counts;
+- every eligible cache follow-up reports a real agent-turn-cache hit and the
+  control arm reports none;
+- cached turns prefill fewer tokens;
+- follow-up prefill time, full follow-up request time, and whole agent-loop
+  time each have a positive bootstrap confidence interval;
+- the engine, workload, hardware, inputs, and artifact are reproducible;
+- the recorded server capability snapshot confirms Agent Turn Cache was on and
+  the full-prompt cache was off for pair isolation.
+
+The artifact records the run-isolation nonce. Pass `--run-id` (or
+`DFLASH_BENCH_RUN_ID`) when an external harness needs a predetermined value;
+otherwise the runner generates a fresh one so even an `--overwrite` rerun
+cannot inherit exact prompt entries from an earlier invocation.
+
+The fixture is an integration smoke test, not a headline workload. Publish a
+performance number only from representative coding-agent tasks, enough paired
+runs, and the complete artifact. There is intentionally no headline speedup in
+this directory until those gates pass.
+
+## Optional early read-only tools
+
+Early tool dispatch is separate from Agent Turn Cache. It can overlap a slow,
+operator-approved read-only tool with the tail of tool-call generation, but it
+requires a confined executor and a CPU lane disjoint from model inference. It
+is not required for turn-cache gains and is disabled in the cache benchmark.
+
+To enable the reference executor as an additional experiment:
+
+```bash
+DFLASH_ENABLE_EARLY_DISPATCH=1 \
+DFLASH_TOOL_WORKSPACE=/absolute/path/to/repository \
+DFLASH_TOOL_CPU_AFFINITY=14-15 \
+  ./agentic_coding/launch_server.sh \
+  ../../server/build/dflash_server model.gguf [normal model options]
+```
+
+Do not declare shell commands, writes, package installation, tests with side
+effects, or deployment actions as read-only. The complete executor protocol
+and fallback contract are documented in
+[`server/docs/TOOL_SPECULATION.md`](../../server/docs/TOOL_SPECULATION.md).

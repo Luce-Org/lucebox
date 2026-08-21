@@ -1,10 +1,10 @@
-// Lossless, confidence-gated speculative tool execution.
+// Verified, confidence-gated read-only tool execution.
 //
-// The model remains authoritative. A predicted allowlisted invocation may run
+// The model remains authoritative. A predicted read-only invocation may run
 // while inference is in flight, but its result is returned only when the
-// emitted tool name and canonical JSON arguments match exactly. Operators
-// must not allow immediate external side effects unless the executor provides
-// staging or transactional rollback.
+// emitted tool name and canonical JSON arguments match exactly. The operator
+// explicitly declares each eligible tool read-only; side effects are outside
+// this interface's contract because a mismatch cannot undo them.
 
 #pragma once
 
@@ -13,11 +13,14 @@
 
 #include <nlohmann/json.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
-#include <functional>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace dflash::common {
@@ -138,7 +141,10 @@ int tool_speculation_running_executors();
 struct ToolSpeculationConfig {
     std::string executor_path;
     std::string profile_path;
-    std::vector<std::string> allowed_tools;
+    // Names explicitly declared read-only by the operator. The executor is
+    // trusted to implement this contract; request-provided tool schemas never
+    // expand the set.
+    std::vector<std::string> read_only_tools;
     ToolSpeculationPolicy policy;
     int timeout_ms = 60000;
     // Server-wide cap on concurrently running executor children. New
@@ -154,12 +160,12 @@ struct ToolSpeculationConfig {
     std::vector<int> cpu_affinity;
     std::vector<int> model_cpu_affinity;
     bool cpu_affinity_isolated = false;
-    // An executor plus an allowlist enables the lane. A measured resource
-    // profile is required for every request-supplied prediction. Calls marked
-    // authoritative by the engine after exact model emission are admitted
-    // without one.
+    // An executor plus a read-only capability set enables the lane. A measured
+    // resource profile is required for every request-supplied prediction.
+    // Calls marked authoritative by the engine after exact model emission are
+    // admitted without one.
     bool enabled() const {
-        return !executor_path.empty() && !allowed_tools.empty();
+        return !executor_path.empty() && !read_only_tools.empty();
     }
     bool predictive_enabled() const {
         return enabled() && !policy.empty();
@@ -171,7 +177,7 @@ struct ToolSpeculationConfig {
                 ? "child_process"
                 : "child_process_cpu_affinity";
     }
-    bool allows(const std::string & name) const;
+    bool allows_read_only(const std::string & name) const;
 };
 
 // Report whether this build can close every non-protocol descriptor before
@@ -223,6 +229,8 @@ private:
 
     json base_metadata() const;
     bool send_control(const char * operation);
+    void start_executor_watchdog();
+    void stop_executor_watchdog();
     void terminate_executor(bool allow_control_grace = false);
     bool collect_executor_result(json & result,
                                  double & wait_ms,
@@ -237,9 +245,14 @@ private:
     bool running_ = false;
     bool resolved_ = false;
     std::string launch_error_;
-    bool holds_executor_slot_ = false;
+    std::atomic<bool> holds_executor_slot_{false};
     void release_executor_slot();
 #if !defined(_WIN32)
+    std::atomic<bool> lifetime_expired_{false};
+    std::thread lifetime_watchdog_;
+    std::mutex lifetime_watchdog_mu_;
+    std::condition_variable lifetime_watchdog_cv_;
+    bool lifetime_watchdog_stop_ = false;
     int child_stdin_fd_ = -1;
     int child_stdout_fd_ = -1;
     int child_pid_ = -1;
@@ -259,22 +272,10 @@ struct ClosedToolCallBlock {
 std::vector<ClosedToolCallBlock> find_closed_tool_call_blocks(
     const std::string & text, size_t from);
 
-// Dependency placeholders between calls of one response: a string argument
-// "$k.path" (or embedded "...$k.path...") refers to field `path` of the
-// executor result of the k-th call (1-based). `path` is a dotted path; when
-// it is absent at the result root and the result has a "value" object, the
-// lookup is retried under "value". Whole-string placeholders keep the JSON
-// type of the referenced value; embedded ones are stringified.
-std::vector<int> find_tool_call_dependencies(const nlohmann::json & arguments);
-bool substitute_tool_call_dependencies(
-    const nlohmann::json & arguments,
-    const std::function<const nlohmann::json *(int)> & result_for_call,
-    nlohmann::json & resolved,
-    std::string & error);
-
-// Custom SSE extension emitted only for requests that supplied
-// `tool_speculation`. Non-streaming responses use the same object under the
-// top-level `dflash_tool_speculation` key.
+// Custom SSE extension emitted only for requests that explicitly opt into a
+// tool-speculation entry point. Non-streaming caller predictions use the same
+// object under the top-level `dflash_tool_speculation` key; automatic early
+// dispatch uses `dflash_early_dispatch`.
 std::string render_tool_speculation_sse(ApiFormat api_format,
                                         const std::string & request_id,
                                         const std::string & model,
