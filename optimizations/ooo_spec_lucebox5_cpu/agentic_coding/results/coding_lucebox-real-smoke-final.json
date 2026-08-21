@@ -1,0 +1,921 @@
+{
+  "schema": "lucebox.agent-turn-cache-benchmark.v1",
+  "tag": "lucebox-real-smoke-final",
+  "run_id": "lucebox-real-20260822-final",
+  "created_at": "2026-08-21T22:01:22.195464+00:00",
+  "benchmark_checkout": {
+    "commit": "da8850f94d21ce713f07cdabc8694abec9bfe83f",
+    "dirty": false
+  },
+  "workspace_revision": {
+    "commit": "da8850f94d21ce713f07cdabc8694abec9bfe83f",
+    "dirty": false
+  },
+  "runtime": {
+    "platform": "Linux-7.0.0-28-generic-x86_64-with-glibc2.39",
+    "python": "3.12.3",
+    "model": "deepseek-v4-flash",
+    "server_build_id": "sha256:b04f77e78266301768d5faa43a42674c7ba68bea1aa0ee70c643466cbdcd639c",
+    "hardware_note": "Lucebox5; Radeon AI PRO R9700 + Ryzen AI Max 395/8060S; ROCm 7.2.4",
+    "url": "http://127.0.0.1:18145/v1/chat/completions",
+    "props_url": "http://127.0.0.1:18145/props",
+    "max_turns": 5,
+    "max_tokens": 512,
+    "timeout_seconds": 1800
+  },
+  "workspace": "/home/lucebox5/codex-pr614-final-20260821/server",
+  "server_props": {
+    "api": {
+      "endpoints": [
+        "GET /health",
+        "GET /props",
+        "GET /status",
+        "GET /status/events",
+        "GET /status/json",
+        "GET /v1/models",
+        "POST /v1/chat/completions",
+        "POST /v1/messages",
+        "POST /v1/messages/count_tokens",
+        "POST /v1/responses"
+      ]
+    },
+    "budget_envelope": {
+      "default_max_tokens": 4096,
+      "effort_tiers": {
+        "high": 18432,
+        "low": 3584,
+        "max": 18432,
+        "medium": 14336,
+        "x-high": 18432
+      },
+      "hard_limit_reply_budget": 0,
+      "model_card_source": "family:deepseek4",
+      "think_max_tokens": 4096
+    },
+    "build_info": "luce-dflash v0.0.0+cpp props_schema=2",
+    "capabilities": {
+      "reasoning_supported": false,
+      "speculative_supported": false,
+      "tools_supported": true
+    },
+    "daemon": {
+      "alive": true
+    },
+    "default_generation_settings": {
+      "min_p": 0.0,
+      "n_ctx": 18432,
+      "repeat_penalty": 1.0,
+      "temperature": 0.0,
+      "top_k": 0,
+      "top_p": 1.0
+    },
+    "full_cache": {
+      "capacity": 0,
+      "disk_bytes": 0,
+      "disk_policy": "off",
+      "enabled": false,
+      "in_use": 0,
+      "lifetime_hits": 0
+    },
+    "model": {
+      "arch": "deepseek4",
+      "draft_path": null,
+      "tokenizer_id": null
+    },
+    "model_alias": "deepseek-v4-flash",
+    "model_card": null,
+    "model_path": "/home/lucebox5/lucebox-models/DeepSeek-V4-Flash-0731-ROCMFPX-MIX-STRIX.gguf",
+    "pflash": {
+      "bsa_alpha": null,
+      "bsa_enabled": null,
+      "draft_residency": "auto",
+      "drafter_gguf": null,
+      "enabled": false,
+      "keep_ratio": null,
+      "lm_head_fix": null,
+      "mode": "off",
+      "skip_park": null,
+      "threshold": null
+    },
+    "prefix_cache": {
+      "agent_turn_cache_enabled": true,
+      "capacity": 32,
+      "in_use": 29,
+      "lifetime_hits": 25
+    },
+    "reasoning": {
+      "default": null,
+      "supported": false,
+      "supported_efforts": []
+    },
+    "runtime": {
+      "backend": "hip",
+      "chunk": 2048,
+      "continuous_batching": {
+        "admission_coalesce_ms": 20
+      },
+      "draft_device": null,
+      "draft_residency": "auto",
+      "fa_window": 0,
+      "kv_cache_k": "q4_0",
+      "kv_cache_v": "q4_0",
+      "lazy_draft": false,
+      "target_device": "hip:0",
+      "target_sharding": false
+    },
+    "sampling": {
+      "capabilities": {
+        "supports_frequency_penalty": true,
+        "supports_seed": true,
+        "supports_temperature": true,
+        "supports_top_k": true,
+        "supports_top_p": true
+      }
+    },
+    "server": {
+      "name": "luce-dflash",
+      "props_schema": 2,
+      "version": "0.0.0+cpp"
+    },
+    "speculative": {
+      "ddtree_budget": null,
+      "enabled": false
+    },
+    "speculative_mode": "off",
+    "tool_replay": {
+      "current_bytes": 11054,
+      "current_entries": 28,
+      "max_bytes": 67108864,
+      "max_entries": 50000
+    },
+    "tool_speculation": {
+      "automatic_early_dispatch_enabled": true,
+      "automatic_prediction_enabled": false,
+      "caller_prediction_enabled": true,
+      "client_prediction_required": false,
+      "client_result_handling_required": true,
+      "compute_isolation": "disjoint_cpu_affinity",
+      "configured": true,
+      "cpu_affinity_isolated": true,
+      "enabled": true,
+      "execution_mode": "child_process_cpu_affinity",
+      "executor_contract": "child_process_cpu_affinity",
+      "max_model_slowdown_ratio": 1.05,
+      "model_cpu_affinity": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29
+      ],
+      "prediction_confidence": null,
+      "prediction_source": null,
+      "predictor_decode_isolated": false,
+      "predictor_schedule": null,
+      "preserves_token_speculation": true,
+      "profile_lanes": [
+        {
+          "accelerator_relation": "non_accelerator",
+          "decode_interference_qualified": true,
+          "model_slowdown_ratio": 1.0011341375399527,
+          "resource_percentage": 100
+        }
+      ],
+      "profile_status": "qualified",
+      "protocol": "dflash.tool-speculation.v1",
+      "read_only_tools": [
+        "list_dir",
+        "read_file",
+        "search_files"
+      ],
+      "request_opt_in_required": true,
+      "tool_cpu_affinity": [
+        14,
+        15,
+        30,
+        31
+      ],
+      "unqualified_lane_policy": "defer"
+    }
+  },
+  "workspace_sha256": "64a00e969accfbc499d7e30ab05f7aafb8a9bf132d72a3cd28f73153278a13fc",
+  "tasks_file": "/home/lucebox5/codex-pr614-final-20260821/optimizations/ooo_spec_lucebox5_cpu/agentic_coding/tasks_lucebox.json",
+  "tasks_sha256": "56f9e84bf4edc69dbe51b881e67c53b16f5af8711ae5928a1383b2fdfb8ace7c",
+  "tool_schema_sha256": "d5af5bb1b057702cdf7e8bf567fc0f52b8c225714e8557c227308c2d71a4f06a",
+  "repetitions": 1,
+  "task_count": 3,
+  "task_ids": [
+    "lucebox_staging_slots",
+    "lucebox_hit_telemetry",
+    "lucebox_cli_guard"
+  ],
+  "arm_order": "alternating by task and repetition",
+  "arm_isolation": "identical initial prompts within each pair; exact normalized assistant/tool transcript parity and equal served token counts gate every follow-up; a recorded run-unique opaque pair ID prevents reuse from earlier pairs or benchmark invocations; control requests exclude generated-turn slots and treatment requests exclude ordinary control-origin snapshots; arm order alternates",
+  "results": [
+    {
+      "task": "lucebox_staging_slots",
+      "repetition": 0,
+      "pair_id": "6eef003d1397df01",
+      "arm": "control",
+      "prompt": "In the real server code, call read_file only for src/server/http_server.cpp lines 2370-2380 and src/common/model_backend.h lines 340-355. Then stop using tools and determine the numeric backend slots reserved for Agent Turn Cache canonical replay and disk-cache staging, naming both constants and showing how the values follow from the backend slot limit.",
+      "final": "From the evidence:\n\n- `ModelBackend::kMaxSlots = 64` (defined in `src/common/model_backend.h` line 348)\n- In `src/server/http_server.cpp` lines 2376-2377:\n  - `kDiskStagingSlot = ModelBackend::kMaxSlots - 1` → `64 - 1 = 63`\n  - `kAgentTurnStagingSlot = ModelBackend::kMaxSlots - 2` → `64 - 2 = 62`\n\nThe numeric backend slots reserved are:\n- **Agent Turn Cache canonical replay**: slot **62** (`kAgentTurnStagingSlot`)\n- **Disk-cache staging**: slot **63** (`kDiskStagingSlot`)\n\nBoth follow from the backend slot limit `kMaxSlots = 64` by subtracting 1 and 2 respectively, placing them as the top two slots above the normal cache pools.",
+      "correct": true,
+      "validation": {
+        "ok": true,
+        "missing_answer_terms": [],
+        "missing_evidence_terms": [],
+        "successful_tool_calls": 2,
+        "failed_tool_calls": 0,
+        "successful_evidence_collected": true,
+        "all_tools_succeeded": true
+      },
+      "wall_ms": 93393.99518800201,
+      "model_ms": 93391.4350620471,
+      "tool_wait_ms": 2.422899007797241,
+      "calls": 2,
+      "eligible_followup_turns": 1,
+      "agent_turn_cache_hits": 0,
+      "unexpected_agent_turn_cache_hits": 0,
+      "eligible_prefill_ms": 56640.2,
+      "eligible_model_wall_ms": 64914.99137104256,
+      "eligible_prefilled_tokens": 1396,
+      "eligible_effective_prompt_tokens": 1396,
+      "timing_records_complete": true,
+      "trace_sha256": "405597b58e9717087fafbe2ba11fc986ca8308e955d6acff0d6bbb70aecde8c5",
+      "assistant_trace_sha256": "2d8e092c3e99caaf5944f62e00c9f810f17cab5159aa5b8d32a815ea0dd9955e",
+      "trace": [
+        {
+          "assistant_reasoning": "",
+          "assistant_content": "I'll read the specified file sections to understand the backend slot constants and their relationships.\n\n",
+          "tool_calls": [
+            {
+              "name": "read_file",
+              "arguments": {
+                "end_line": 2380,
+                "path": "src/server/http_server.cpp",
+                "start_line": 2370
+              },
+              "result": "{\"content\":\"2370: namespace {\\n2371: \\n2372: // Backend-only staging slots live above both PrefixCache pools. Agent Turn\\n2373: // Cache snapshots the exact prompt-end prefill into slot 62, then restores it\\n2374: // to prefill the canonical completed-turn suffix into a normal cache slot.\\n2375: // Disk-cache loads retain slot 63.\\n2376: constexpr int kDiskStagingSlot = ModelBackend::kMaxSlots - 1;\\n2377: constexpr int kAgentTurnStagingSlot = ModelBackend::kMaxSlots - 2;\\n2378: \\n2379: struct CompletionTokenCounts {\\n2380:     int total = 0;\",\"content_truncated\":false,\"end_line\":2380,\"path\":\"src/server/http_server.cpp\",\"sha256\":\"2342c2cc807e882cf781e03451f1dd233956156587193792a30a17050598e202\",\"start_line\":2370,\"total_lines\":5096}"
+            },
+            {
+              "name": "read_file",
+              "arguments": {
+                "end_line": 355,
+                "path": "src/common/model_backend.h",
+                "start_line": 340
+              },
+              "result": "{\"content\":\"340:     //\\n341:     // The engine is owned by the backend; the returned pointer is borrowed\\n342:     // and stays valid until shutdown().\\n343:     virtual SeqEngine * seq_engine() { return nullptr; }\\n344: \\n345:     // ── Snapshots ────────────────────────────────────────────────────\\n346:     // With right-sized CPU-resident snapshots, each slot costs only\\n347:     // ~(cur_pos × 5 KB) of system RAM, so we can afford many slots.\\n348:     static constexpr int kMaxSlots = 64;\\n349: \\n350:     virtual bool snapshot_save(int slot) = 0;\\n351:     virtual void snapshot_free(int slot) = 0;\\n352:     virtual bool snapshot_used(int slot) const = 0;\\n353:     virtual int  snapshot_cur_pos(int slot) const = 0;\\n354: \\n355:     // RESTORE <slot> <prompt_path> <n_gen> — restore snapshot + generate.\",\"content_truncated\":false,\"end_line\":355,\"path\":\"src/common/model_backend.h\",\"sha256\":\"6f7b167af9a976afa37acd9e7bf22a01fc362534a908f88f1ea2d1437eefc32e\",\"start_line\":340,\"total_lines\":533}"
+            }
+          ]
+        },
+        {
+          "assistant_reasoning": "",
+          "assistant_content": "From the evidence:\n\n- `ModelBackend::kMaxSlots = 64` (defined in `src/common/model_backend.h` line 348)\n- In `src/server/http_server.cpp` lines 2376-2377:\n  - `kDiskStagingSlot = ModelBackend::kMaxSlots - 1` → `64 - 1 = 63`\n  - `kAgentTurnStagingSlot = ModelBackend::kMaxSlots - 2` → `64 - 2 = 62`\n\nThe numeric backend slots reserved are:\n- **Agent Turn Cache canonical replay**: slot **62** (`kAgentTurnStagingSlot`)\n- **Disk-cache staging**: slot **63** (`kDiskStagingSlot`)\n\nBoth follow from the backend slot limit `kMaxSlots = 64` by subtracting 1 and 2 respectively, placing them as the top two slots above the normal cache pools.",
+          "tool_calls": []
+        }
+      ],
+      "turns": 2,
+      "turn_log": [
+        {
+          "turn": 0,
+          "model_wall_ms": 28476.443691004533,
+          "cache_eligible": false,
+          "timings": {
+            "agent_turn_cache_hit": false,
+            "cache_hit": false,
+            "cached_prefix_tokens": 0,
+            "decode_ms": 4246.0,
+            "decode_tokens_per_sec": 24.7,
+            "effective_prompt_tokens": 602,
+            "prefill_ms": 24223.3,
+            "prefilled_tokens": 602
+          },
+          "tools": [
+            {
+              "name": "read_file",
+              "arguments": {
+                "end_line": 2380,
+                "path": "src/server/http_server.cpp",
+                "start_line": 2370
+              },
+              "source": "client_exec",
+              "ok": true
+            },
+            {
+              "name": "read_file",
+              "arguments": {
+                "end_line": 355,
+                "path": "src/common/model_backend.h",
+                "start_line": 340
+              },
+              "source": "client_exec",
+              "ok": true
+            }
+          ],
+          "tool_wait_ms": 2.422899007797241
+        },
+        {
+          "turn": 1,
+          "model_wall_ms": 64914.99137104256,
+          "cache_eligible": true,
+          "timings": {
+            "agent_turn_cache_hit": false,
+            "cache_hit": false,
+            "cached_prefix_tokens": 0,
+            "decode_ms": 7844.7,
+            "decode_tokens_per_sec": 25.2,
+            "effective_prompt_tokens": 1396,
+            "prefill_ms": 56640.2,
+            "prefilled_tokens": 1396
+          },
+          "tools": []
+        }
+      ]
+    },
+    {
+      "task": "lucebox_staging_slots",
+      "repetition": 0,
+      "pair_id": "6eef003d1397df01",
+      "arm": "cache",
+      "prompt": "In the real server code, call read_file only for src/server/http_server.cpp lines 2370-2380 and src/common/model_backend.h lines 340-355. Then stop using tools and determine the numeric backend slots reserved for Agent Turn Cache canonical replay and disk-cache staging, naming both constants and showing how the values follow from the backend slot limit.",
+      "final": "From the evidence:\n\n- `ModelBackend::kMaxSlots = 64` (defined in `src/common/model_backend.h` line 348)\n- In `src/server/http_server.cpp` lines 2376-2377:\n  - `kDiskStagingSlot = ModelBackend::kMaxSlots - 1` → `64 - 1 = 63`\n  - `kAgentTurnStagingSlot = ModelBackend::kMaxSlots - 2` → `64 - 2 = 62`\n\nThe numeric backend slots reserved are:\n- **Agent Turn Cache canonical replay**: slot **62** (`kAgentTurnStagingSlot`)\n- **Disk-cache staging**: slot **63** (`kDiskStagingSlot`)\n\nBoth follow from the backend slot limit `kMaxSlots = 64` by subtracting 1 and 2 respectively, placing them as the top two slots above the normal cache pools.",
+      "correct": true,
+      "validation": {
+        "ok": true,
+        "missing_answer_terms": [],
+        "missing_evidence_terms": [],
+        "successful_tool_calls": 2,
+        "failed_tool_calls": 0,
+        "successful_evidence_collected": true,
+        "all_tools_succeeded": true
+      },
+      "wall_ms": 68442.71251099417,
+      "model_ms": 68440.35922293551,
+      "tool_wait_ms": 2.2918530157767236,
+      "calls": 2,
+      "eligible_followup_turns": 1,
+      "agent_turn_cache_hits": 1,
+      "unexpected_agent_turn_cache_hits": 0,
+      "eligible_prefill_ms": 27612.3,
+      "eligible_model_wall_ms": 39984.9812159664,
+      "eligible_prefilled_tokens": 681,
+      "eligible_effective_prompt_tokens": 1396,
+      "timing_records_complete": true,
+      "trace_sha256": "405597b58e9717087fafbe2ba11fc986ca8308e955d6acff0d6bbb70aecde8c5",
+      "assistant_trace_sha256": "2d8e092c3e99caaf5944f62e00c9f810f17cab5159aa5b8d32a815ea0dd9955e",
+      "trace": [
+        {
+          "assistant_reasoning": "",
+          "assistant_content": "I'll read the specified file sections to understand the backend slot constants and their relationships.\n\n",
+          "tool_calls": [
+            {
+              "name": "read_file",
+              "arguments": {
+                "end_line": 2380,
+                "path": "src/server/http_server.cpp",
+                "start_line": 2370
+              },
+              "result": "{\"content\":\"2370: namespace {\\n2371: \\n2372: // Backend-only staging slots live above both PrefixCache pools. Agent Turn\\n2373: // Cache snapshots the exact prompt-end prefill into slot 62, then restores it\\n2374: // to prefill the canonical completed-turn suffix into a normal cache slot.\\n2375: // Disk-cache loads retain slot 63.\\n2376: constexpr int kDiskStagingSlot = ModelBackend::kMaxSlots - 1;\\n2377: constexpr int kAgentTurnStagingSlot = ModelBackend::kMaxSlots - 2;\\n2378: \\n2379: struct CompletionTokenCounts {\\n2380:     int total = 0;\",\"content_truncated\":false,\"end_line\":2380,\"path\":\"src/server/http_server.cpp\",\"sha256\":\"2342c2cc807e882cf781e03451f1dd233956156587193792a30a17050598e202\",\"start_line\":2370,\"total_lines\":5096}"
+            },
+            {
+              "name": "read_file",
+              "arguments": {
+                "end_line": 355,
+                "path": "src/common/model_backend.h",
+                "start_line": 340
+              },
+              "result": "{\"content\":\"340:     //\\n341:     // The engine is owned by the backend; the returned pointer is borrowed\\n342:     // and stays valid until shutdown().\\n343:     virtual SeqEngine * seq_engine() { return nullptr; }\\n344: \\n345:     // ── Snapshots ────────────────────────────────────────────────────\\n346:     // With right-sized CPU-resident snapshots, each slot costs only\\n347:     // ~(cur_pos × 5 KB) of system RAM, so we can afford many slots.\\n348:     static constexpr int kMaxSlots = 64;\\n349: \\n350:     virtual bool snapshot_save(int slot) = 0;\\n351:     virtual void snapshot_free(int slot) = 0;\\n352:     virtual bool snapshot_used(int slot) const = 0;\\n353:     virtual int  snapshot_cur_pos(int slot) const = 0;\\n354: \\n355:     // RESTORE <slot> <prompt_path> <n_gen> — restore snapshot + generate.\",\"content_truncated\":false,\"end_line\":355,\"path\":\"src/common/model_backend.h\",\"sha256\":\"6f7b167af9a976afa37acd9e7bf22a01fc362534a908f88f1ea2d1437eefc32e\",\"start_line\":340,\"total_lines\":533}"
+            }
+          ]
+        },
+        {
+          "assistant_reasoning": "",
+          "assistant_content": "From the evidence:\n\n- `ModelBackend::kMaxSlots = 64` (defined in `src/common/model_backend.h` line 348)\n- In `src/server/http_server.cpp` lines 2376-2377:\n  - `kDiskStagingSlot = ModelBackend::kMaxSlots - 1` → `64 - 1 = 63`\n  - `kAgentTurnStagingSlot = ModelBackend::kMaxSlots - 2` → `64 - 2 = 62`\n\nThe numeric backend slots reserved are:\n- **Agent Turn Cache canonical replay**: slot **62** (`kAgentTurnStagingSlot`)\n- **Disk-cache staging**: slot **63** (`kDiskStagingSlot`)\n\nBoth follow from the backend slot limit `kMaxSlots = 64` by subtracting 1 and 2 respectively, placing them as the top two slots above the normal cache pools.",
+          "tool_calls": []
+        }
+      ],
+      "turns": 2,
+      "turn_log": [
+        {
+          "turn": 0,
+          "model_wall_ms": 28455.378006969113,
+          "cache_eligible": false,
+          "timings": {
+            "agent_turn_cache_hit": false,
+            "cache_hit": false,
+            "cached_prefix_tokens": 0,
+            "decode_ms": 4205.4,
+            "decode_tokens_per_sec": 25.0,
+            "effective_prompt_tokens": 602,
+            "prefill_ms": 24247.5,
+            "prefilled_tokens": 602
+          },
+          "tools": [
+            {
+              "name": "read_file",
+              "arguments": {
+                "end_line": 2380,
+                "path": "src/server/http_server.cpp",
+                "start_line": 2370
+              },
+              "source": "client_exec",
+              "ok": true
+            },
+            {
+              "name": "read_file",
+              "arguments": {
+                "end_line": 355,
+                "path": "src/common/model_backend.h",
+                "start_line": 340
+              },
+              "source": "client_exec",
+              "ok": true
+            }
+          ],
+          "tool_wait_ms": 2.2918530157767236
+        },
+        {
+          "turn": 1,
+          "model_wall_ms": 39984.9812159664,
+          "cache_eligible": true,
+          "timings": {
+            "agent_turn_cache_hit": true,
+            "cache_hit": true,
+            "cached_prefix_tokens": 715,
+            "decode_ms": 7788.2,
+            "decode_tokens_per_sec": 25.4,
+            "effective_prompt_tokens": 1396,
+            "prefill_ms": 27612.3,
+            "prefilled_tokens": 681
+          },
+          "tools": []
+        }
+      ]
+    },
+    {
+      "task": "lucebox_hit_telemetry",
+      "repetition": 0,
+      "pair_id": "e487b59a9c3d74d0",
+      "arm": "cache",
+      "prompt": "Call read_file only for src/server/http_server.cpp lines 4588-4602. Then stop using tools and trace how usage.timings.agent_turn_cache_hit becomes true. Distinguish the backend result field from the clamped local variable: explicitly name the exact result.<field> that supplies the restored token count, plus the additional slot-membership condition.",
+      "final": "Based on the evidence, `usage.timings.agent_turn_cache_hit` becomes true when both `cache_hit` is true and `agent_turn_cache_slots_.count(cache_slot) != 0`. The `cache_hit` is derived from `cached_prefix_tokens > 0`, where `cached_prefix_tokens` is the clamped local variable from `result.restored_prefix_tokens` (clamped between 0 and `effective_prompt_tokens`). The backend result field that supplies the restored token count is `result.restored_prefix_tokens`. The additional slot-membership condition is `agent_turn_cache_slots_.count(cache_slot) != 0`.\n\nThe exact result field is `restored_prefix_tokens` on the `result` object. The additional condition is membership in `agent_turn_cache_slots_` for the `cache_slot`.",
+      "correct": true,
+      "validation": {
+        "ok": true,
+        "missing_answer_terms": [],
+        "missing_evidence_terms": [],
+        "successful_tool_calls": 1,
+        "failed_tool_calls": 0,
+        "successful_evidence_collected": true,
+        "all_tools_succeeded": true
+      },
+      "wall_ms": 51351.42441402422,
+      "model_ms": 51349.900228960905,
+      "tool_wait_ms": 1.4722280320711434,
+      "calls": 1,
+      "eligible_followup_turns": 1,
+      "agent_turn_cache_hits": 1,
+      "unexpected_agent_turn_cache_hits": 0,
+      "eligible_prefill_ms": 15050.1,
+      "eligible_model_wall_ms": 25370.964079978876,
+      "eligible_prefilled_tokens": 368,
+      "eligible_effective_prompt_tokens": 1017,
+      "timing_records_complete": true,
+      "trace_sha256": "17203749b5dceee36bb4b74c88d968b04ff40620ee3e9669cedfa88cfe13434a",
+      "assistant_trace_sha256": "e4aca0e8531922c993bfe55096f03271d2997365ddb5c4e921facc6efd2b881e",
+      "trace": [
+        {
+          "assistant_reasoning": "",
+          "assistant_content": "",
+          "tool_calls": [
+            {
+              "name": "read_file",
+              "arguments": {
+                "end_line": 4602,
+                "path": "src/server/http_server.cpp",
+                "start_line": 4588
+              },
+              "result": "{\"content\":\"4588:     const int effective_prompt_tokens = (int) effective_prompt.size();\\n4589:     const int cached_prefix_tokens = result.ok()\\n4590:         ? (std::clamp)(result.restored_prefix_tokens, 0,\\n4591:                       effective_prompt_tokens)\\n4592:         : 0;\\n4593:     const bool cache_hit = cached_prefix_tokens > 0;\\n4594:     const bool agent_turn_cache_hit = cache_hit &&\\n4595:         agent_turn_cache_slots_.count(cache_slot) != 0;\\n4596:     GenTimings gen_timings{\\n4597:         result.prefill_s,\\n4598:         result.decode_s,\\n4599:         cache_hit,\\n4600:         cached_prefix_tokens,\\n4601:         effective_prompt_tokens - cached_prefix_tokens,\\n4602:         effective_prompt_tokens,\",\"content_truncated\":false,\"end_line\":4602,\"path\":\"src/server/http_server.cpp\",\"sha256\":\"2342c2cc807e882cf781e03451f1dd233956156587193792a30a17050598e202\",\"start_line\":4588,\"total_lines\":5096}"
+            }
+          ]
+        },
+        {
+          "assistant_reasoning": "",
+          "assistant_content": "Based on the evidence, `usage.timings.agent_turn_cache_hit` becomes true when both `cache_hit` is true and `agent_turn_cache_slots_.count(cache_slot) != 0`. The `cache_hit` is derived from `cached_prefix_tokens > 0`, where `cached_prefix_tokens` is the clamped local variable from `result.restored_prefix_tokens` (clamped between 0 and `effective_prompt_tokens`). The backend result field that supplies the restored token count is `result.restored_prefix_tokens`. The additional slot-membership condition is `agent_turn_cache_slots_.count(cache_slot) != 0`.\n\nThe exact result field is `restored_prefix_tokens` on the `result` object. The additional condition is membership in `agent_turn_cache_slots_` for the `cache_slot`.",
+          "tool_calls": []
+        }
+      ],
+      "turns": 2,
+      "turn_log": [
+        {
+          "turn": 0,
+          "model_wall_ms": 25978.93614898203,
+          "cache_eligible": false,
+          "timings": {
+            "agent_turn_cache_hit": false,
+            "cache_hit": false,
+            "cached_prefix_tokens": 0,
+            "decode_ms": 1759.8,
+            "decode_tokens_per_sec": 25.6,
+            "effective_prompt_tokens": 600,
+            "prefill_ms": 24204.2,
+            "prefilled_tokens": 600
+          },
+          "tools": [
+            {
+              "name": "read_file",
+              "arguments": {
+                "end_line": 4602,
+                "path": "src/server/http_server.cpp",
+                "start_line": 4588
+              },
+              "source": "client_exec",
+              "ok": true
+            }
+          ],
+          "tool_wait_ms": 1.4722280320711434
+        },
+        {
+          "turn": 1,
+          "model_wall_ms": 25370.964079978876,
+          "cache_eligible": true,
+          "timings": {
+            "agent_turn_cache_hit": true,
+            "cache_hit": true,
+            "cached_prefix_tokens": 649,
+            "decode_ms": 8273.1,
+            "decode_tokens_per_sec": 23.1,
+            "effective_prompt_tokens": 1017,
+            "prefill_ms": 15050.1,
+            "prefilled_tokens": 368
+          },
+          "tools": []
+        }
+      ]
+    },
+    {
+      "task": "lucebox_hit_telemetry",
+      "repetition": 0,
+      "pair_id": "e487b59a9c3d74d0",
+      "arm": "control",
+      "prompt": "Call read_file only for src/server/http_server.cpp lines 4588-4602. Then stop using tools and trace how usage.timings.agent_turn_cache_hit becomes true. Distinguish the backend result field from the clamped local variable: explicitly name the exact result.<field> that supplies the restored token count, plus the additional slot-membership condition.",
+      "final": "Based on the evidence, `usage.timings.agent_turn_cache_hit` becomes true when both `cache_hit` is true and `agent_turn_cache_slots_.count(cache_slot) != 0`. The `cache_hit` is derived from `cached_prefix_tokens > 0`, where `cached_prefix_tokens` is the clamped local variable from `result.restored_prefix_tokens` (clamped between 0 and `effective_prompt_tokens`). The backend result field that supplies the restored token count is `result.restored_prefix_tokens`. The additional slot-membership condition is `agent_turn_cache_slots_.count(cache_slot) != 0`.\n\nThe exact result field is `restored_prefix_tokens` on the `result` object. The additional condition is membership in `agent_turn_cache_slots_` for the `cache_slot`.",
+      "correct": true,
+      "validation": {
+        "ok": true,
+        "missing_answer_terms": [],
+        "missing_evidence_terms": [],
+        "successful_tool_calls": 1,
+        "failed_tool_calls": 0,
+        "successful_evidence_collected": true,
+        "all_tools_succeeded": true
+      },
+      "wall_ms": 51045.282537001185,
+      "model_ms": 51043.794960016385,
+      "tool_wait_ms": 1.437783008441329,
+      "calls": 1,
+      "eligible_followup_turns": 1,
+      "agent_turn_cache_hits": 0,
+      "unexpected_agent_turn_cache_hits": 0,
+      "eligible_prefill_ms": 16898.1,
+      "eligible_model_wall_ms": 25130.50138304243,
+      "eligible_prefilled_tokens": 417,
+      "eligible_effective_prompt_tokens": 1017,
+      "timing_records_complete": true,
+      "trace_sha256": "17203749b5dceee36bb4b74c88d968b04ff40620ee3e9669cedfa88cfe13434a",
+      "assistant_trace_sha256": "e4aca0e8531922c993bfe55096f03271d2997365ddb5c4e921facc6efd2b881e",
+      "trace": [
+        {
+          "assistant_reasoning": "",
+          "assistant_content": "",
+          "tool_calls": [
+            {
+              "name": "read_file",
+              "arguments": {
+                "end_line": 4602,
+                "path": "src/server/http_server.cpp",
+                "start_line": 4588
+              },
+              "result": "{\"content\":\"4588:     const int effective_prompt_tokens = (int) effective_prompt.size();\\n4589:     const int cached_prefix_tokens = result.ok()\\n4590:         ? (std::clamp)(result.restored_prefix_tokens, 0,\\n4591:                       effective_prompt_tokens)\\n4592:         : 0;\\n4593:     const bool cache_hit = cached_prefix_tokens > 0;\\n4594:     const bool agent_turn_cache_hit = cache_hit &&\\n4595:         agent_turn_cache_slots_.count(cache_slot) != 0;\\n4596:     GenTimings gen_timings{\\n4597:         result.prefill_s,\\n4598:         result.decode_s,\\n4599:         cache_hit,\\n4600:         cached_prefix_tokens,\\n4601:         effective_prompt_tokens - cached_prefix_tokens,\\n4602:         effective_prompt_tokens,\",\"content_truncated\":false,\"end_line\":4602,\"path\":\"src/server/http_server.cpp\",\"sha256\":\"2342c2cc807e882cf781e03451f1dd233956156587193792a30a17050598e202\",\"start_line\":4588,\"total_lines\":5096}"
+            }
+          ]
+        },
+        {
+          "assistant_reasoning": "",
+          "assistant_content": "Based on the evidence, `usage.timings.agent_turn_cache_hit` becomes true when both `cache_hit` is true and `agent_turn_cache_slots_.count(cache_slot) != 0`. The `cache_hit` is derived from `cached_prefix_tokens > 0`, where `cached_prefix_tokens` is the clamped local variable from `result.restored_prefix_tokens` (clamped between 0 and `effective_prompt_tokens`). The backend result field that supplies the restored token count is `result.restored_prefix_tokens`. The additional slot-membership condition is `agent_turn_cache_slots_.count(cache_slot) != 0`.\n\nThe exact result field is `restored_prefix_tokens` on the `result` object. The additional condition is membership in `agent_turn_cache_slots_` for the `cache_slot`.",
+          "tool_calls": []
+        }
+      ],
+      "turns": 2,
+      "turn_log": [
+        {
+          "turn": 0,
+          "model_wall_ms": 25913.293576973956,
+          "cache_eligible": false,
+          "timings": {
+            "agent_turn_cache_hit": false,
+            "cache_hit": false,
+            "cached_prefix_tokens": 0,
+            "decode_ms": 1752.8,
+            "decode_tokens_per_sec": 25.7,
+            "effective_prompt_tokens": 600,
+            "prefill_ms": 24157.5,
+            "prefilled_tokens": 600
+          },
+          "tools": [
+            {
+              "name": "read_file",
+              "arguments": {
+                "end_line": 4602,
+                "path": "src/server/http_server.cpp",
+                "start_line": 4588
+              },
+              "source": "client_exec",
+              "ok": true
+            }
+          ],
+          "tool_wait_ms": 1.437783008441329
+        },
+        {
+          "turn": 1,
+          "model_wall_ms": 25130.50138304243,
+          "cache_eligible": true,
+          "timings": {
+            "agent_turn_cache_hit": false,
+            "cache_hit": true,
+            "cached_prefix_tokens": 600,
+            "decode_ms": 8216.8,
+            "decode_tokens_per_sec": 23.2,
+            "effective_prompt_tokens": 1017,
+            "prefill_ms": 16898.1,
+            "prefilled_tokens": 417
+          },
+          "tools": []
+        }
+      ]
+    },
+    {
+      "task": "lucebox_cli_guard",
+      "repetition": 0,
+      "pair_id": "70b2d1863594cce8",
+      "arm": "control",
+      "prompt": "Call read_file only for src/server/server_main.cpp lines 689-704 and 1029-1041. Then stop using tools and give the deprecated alias for --agent-turn-cache, the required cache kind enforced at startup, and the source file.",
+      "final": "Based on the evidence:\n\n- The deprecated alias for `--agent-turn-cache` is `--end-turn-snapshot` (lines 691-696).\n- The required cache kind enforced at startup is an **enabled inline prefix cache** (lines 1029-1034), meaning `--agent-turn-cache` requires that the prefix cache is not disabled (i.e., `--no-prefix-cache`/`--paged-attention` must be absent and at least one prefix-cache slot configured).\n- The source file is `src/server/server_main.cpp`.",
+      "correct": true,
+      "validation": {
+        "ok": true,
+        "missing_answer_terms": [],
+        "missing_evidence_terms": [],
+        "successful_tool_calls": 2,
+        "failed_tool_calls": 0,
+        "successful_evidence_collected": true,
+        "all_tools_succeeded": true
+      },
+      "wall_ms": 93190.24180696579,
+      "model_ms": 93188.13853798201,
+      "tool_wait_ms": 2.049289003480226,
+      "calls": 2,
+      "eligible_followup_turns": 1,
+      "agent_turn_cache_hits": 0,
+      "unexpected_agent_turn_cache_hits": 0,
+      "eligible_prefill_ms": 60303.7,
+      "eligible_model_wall_ms": 66215.57719499106,
+      "eligible_prefilled_tokens": 1486,
+      "eligible_effective_prompt_tokens": 1486,
+      "timing_records_complete": true,
+      "trace_sha256": "da3840ba82419473f02e2741e8914a99b41caef2fd182c44354501f9322996ad",
+      "assistant_trace_sha256": "18027b0dc6df83d98372e98f26f61bd00d087294533c6fc2ea258a3186ce8bbd",
+      "trace": [
+        {
+          "assistant_reasoning": "",
+          "assistant_content": "I'll read the specified lines from the file.\n\n",
+          "tool_calls": [
+            {
+              "name": "read_file",
+              "arguments": {
+                "end_line": 704,
+                "path": "src/server/server_main.cpp",
+                "start_line": 689
+              },
+              "result": "{\"content\":\"689:         } else if (std::strcmp(argv[i], \\\"--prefetch-prefill\\\") == 0) {\\n690:             sconfig.prefetch_prefill = true;\\n691:         } else if (std::strcmp(argv[i], \\\"--agent-turn-cache\\\") == 0 ||\\n692:                    std::strcmp(argv[i], \\\"--end-turn-snapshot\\\") == 0) {\\n693:             if (std::strcmp(argv[i], \\\"--end-turn-snapshot\\\") == 0) {\\n694:                 std::fprintf(stderr,\\n695:                     \\\"[server] warning: --end-turn-snapshot is deprecated; \\\"\\n696:                     \\\"use --agent-turn-cache\\\\n\\\");\\n697:             }\\n698:             sconfig.agent_turn_cache = true;\\n699:         } else if (std::strcmp(argv[i], \\\"--tool-spec-timeout-ms\\\") == 0 &&\\n700:                    i + 1 < argc) {\\n701:             if (!parse_int_strict(\\n702:                     argv[++i], sconfig.tool_speculation.timeout_ms) ||\\n703:                 sconfig.tool_speculation.timeout_ms <= 0) {\\n704:                 std::fprintf(stderr,\",\"content_truncated\":false,\"end_line\":704,\"path\":\"src/server/server_main.cpp\",\"sha256\":\"d1f45e4a0b45068d1092cc01117f1e90eb2f68085c64697de9a0b6cb1664fc46\",\"start_line\":689,\"total_lines\":1637}"
+            },
+            {
+              "name": "read_file",
+              "arguments": {
+                "end_line": 1041,
+                "path": "src/server/server_main.cpp",
+                "start_line": 1029
+              },
+              "result": "{\"content\":\"1029:     if (sconfig.agent_turn_cache && sconfig.prefix_cache_cap <= 0) {\\n1030:         std::fprintf(stderr,\\n1031:             \\\"[server] --agent-turn-cache requires an enabled inline prefix \\\"\\n1032:             \\\"cache; remove --no-prefix-cache/--paged-attention or configure \\\"\\n1033:             \\\"at least one prefix-cache slot\\\\n\\\");\\n1034:         return 2;\\n1035:     }\\n1036: \\n1037:     // Sync max_ctx: if --max-ctx was not provided, use the backend's default.\\n1038:     // This prevents the HTTP server from accepting prompts larger than the\\n1039:     // KV cache the backend actually allocates.\\n1040:     if (sconfig.max_ctx <= 0) {\\n1041:         sconfig.max_ctx = bargs.device.max_ctx;\",\"content_truncated\":false,\"end_line\":1041,\"path\":\"src/server/server_main.cpp\",\"sha256\":\"d1f45e4a0b45068d1092cc01117f1e90eb2f68085c64697de9a0b6cb1664fc46\",\"start_line\":1029,\"total_lines\":1637}"
+            }
+          ]
+        },
+        {
+          "assistant_reasoning": "",
+          "assistant_content": "Based on the evidence:\n\n- The deprecated alias for `--agent-turn-cache` is `--end-turn-snapshot` (lines 691-696).\n- The required cache kind enforced at startup is an **enabled inline prefix cache** (lines 1029-1034), meaning `--agent-turn-cache` requires that the prefix cache is not disabled (i.e., `--no-prefix-cache`/`--paged-attention` must be absent and at least one prefix-cache slot configured).\n- The source file is `src/server/server_main.cpp`.",
+          "tool_calls": []
+        }
+      ],
+      "turns": 2,
+      "turn_log": [
+        {
+          "turn": 0,
+          "model_wall_ms": 26972.561342990957,
+          "cache_eligible": false,
+          "timings": {
+            "agent_turn_cache_hit": false,
+            "cache_hit": false,
+            "cached_prefix_tokens": 0,
+            "decode_ms": 3437.7,
+            "decode_tokens_per_sec": 28.2,
+            "effective_prompt_tokens": 581,
+            "prefill_ms": 23450.9,
+            "prefilled_tokens": 581
+          },
+          "tools": [
+            {
+              "name": "read_file",
+              "arguments": {
+                "end_line": 704,
+                "path": "src/server/server_main.cpp",
+                "start_line": 689
+              },
+              "source": "client_exec",
+              "ok": true
+            },
+            {
+              "name": "read_file",
+              "arguments": {
+                "end_line": 1041,
+                "path": "src/server/server_main.cpp",
+                "start_line": 1029
+              },
+              "source": "client_exec",
+              "ok": true
+            }
+          ],
+          "tool_wait_ms": 2.049289003480226
+        },
+        {
+          "turn": 1,
+          "model_wall_ms": 66215.57719499106,
+          "cache_eligible": true,
+          "timings": {
+            "agent_turn_cache_hit": false,
+            "cache_hit": false,
+            "cached_prefix_tokens": 0,
+            "decode_ms": 5885.1,
+            "decode_tokens_per_sec": 20.7,
+            "effective_prompt_tokens": 1486,
+            "prefill_ms": 60303.7,
+            "prefilled_tokens": 1486
+          },
+          "tools": []
+        }
+      ]
+    },
+    {
+      "task": "lucebox_cli_guard",
+      "repetition": 0,
+      "pair_id": "70b2d1863594cce8",
+      "arm": "cache",
+      "prompt": "Call read_file only for src/server/server_main.cpp lines 689-704 and 1029-1041. Then stop using tools and give the deprecated alias for --agent-turn-cache, the required cache kind enforced at startup, and the source file.",
+      "final": "Based on the evidence:\n\n- The deprecated alias for `--agent-turn-cache` is `--end-turn-snapshot` (lines 691-696).\n- The required cache kind enforced at startup is an **enabled inline prefix cache** (lines 1029-1034), meaning `--agent-turn-cache` requires that the prefix cache is not disabled (i.e., `--no-prefix-cache`/`--paged-attention` must be absent and at least one prefix-cache slot configured).\n- The source file is `src/server/server_main.cpp`.",
+      "correct": true,
+      "validation": {
+        "ok": true,
+        "missing_answer_terms": [],
+        "missing_evidence_terms": [],
+        "successful_tool_calls": 2,
+        "failed_tool_calls": 0,
+        "successful_evidence_collected": true,
+        "all_tools_succeeded": true
+      },
+      "wall_ms": 69442.87059397902,
+      "model_ms": 69440.19884901354,
+      "tool_wait_ms": 2.6188259944319725,
+      "calls": 2,
+      "eligible_followup_turns": 1,
+      "agent_turn_cache_hits": 1,
+      "unexpected_agent_turn_cache_hits": 0,
+      "eligible_prefill_ms": 32564.6,
+      "eligible_model_wall_ms": 42553.57499001548,
+      "eligible_prefilled_tokens": 800,
+      "eligible_effective_prompt_tokens": 1486,
+      "timing_records_complete": true,
+      "trace_sha256": "da3840ba82419473f02e2741e8914a99b41caef2fd182c44354501f9322996ad",
+      "assistant_trace_sha256": "18027b0dc6df83d98372e98f26f61bd00d087294533c6fc2ea258a3186ce8bbd",
+      "trace": [
+        {
+          "assistant_reasoning": "",
+          "assistant_content": "I'll read the specified lines from the file.\n\n",
+          "tool_calls": [
+            {
+              "name": "read_file",
+              "arguments": {
+                "end_line": 704,
+                "path": "src/server/server_main.cpp",
+                "start_line": 689
+              },
+              "result": "{\"content\":\"689:         } else if (std::strcmp(argv[i], \\\"--prefetch-prefill\\\") == 0) {\\n690:             sconfig.prefetch_prefill = true;\\n691:         } else if (std::strcmp(argv[i], \\\"--agent-turn-cache\\\") == 0 ||\\n692:                    std::strcmp(argv[i], \\\"--end-turn-snapshot\\\") == 0) {\\n693:             if (std::strcmp(argv[i], \\\"--end-turn-snapshot\\\") == 0) {\\n694:                 std::fprintf(stderr,\\n695:                     \\\"[server] warning: --end-turn-snapshot is deprecated; \\\"\\n696:                     \\\"use --agent-turn-cache\\\\n\\\");\\n697:             }\\n698:             sconfig.agent_turn_cache = true;\\n699:         } else if (std::strcmp(argv[i], \\\"--tool-spec-timeout-ms\\\") == 0 &&\\n700:                    i + 1 < argc) {\\n701:             if (!parse_int_strict(\\n702:                     argv[++i], sconfig.tool_speculation.timeout_ms) ||\\n703:                 sconfig.tool_speculation.timeout_ms <= 0) {\\n704:                 std::fprintf(stderr,\",\"content_truncated\":false,\"end_line\":704,\"path\":\"src/server/server_main.cpp\",\"sha256\":\"d1f45e4a0b45068d1092cc01117f1e90eb2f68085c64697de9a0b6cb1664fc46\",\"start_line\":689,\"total_lines\":1637}"
+            },
+            {
+              "name": "read_file",
+              "arguments": {
+                "end_line": 1041,
+                "path": "src/server/server_main.cpp",
+                "start_line": 1029
+              },
+              "result": "{\"content\":\"1029:     if (sconfig.agent_turn_cache && sconfig.prefix_cache_cap <= 0) {\\n1030:         std::fprintf(stderr,\\n1031:             \\\"[server] --agent-turn-cache requires an enabled inline prefix \\\"\\n1032:             \\\"cache; remove --no-prefix-cache/--paged-attention or configure \\\"\\n1033:             \\\"at least one prefix-cache slot\\\\n\\\");\\n1034:         return 2;\\n1035:     }\\n1036: \\n1037:     // Sync max_ctx: if --max-ctx was not provided, use the backend's default.\\n1038:     // This prevents the HTTP server from accepting prompts larger than the\\n1039:     // KV cache the backend actually allocates.\\n1040:     if (sconfig.max_ctx <= 0) {\\n1041:         sconfig.max_ctx = bargs.device.max_ctx;\",\"content_truncated\":false,\"end_line\":1041,\"path\":\"src/server/server_main.cpp\",\"sha256\":\"d1f45e4a0b45068d1092cc01117f1e90eb2f68085c64697de9a0b6cb1664fc46\",\"start_line\":1029,\"total_lines\":1637}"
+            }
+          ]
+        },
+        {
+          "assistant_reasoning": "",
+          "assistant_content": "Based on the evidence:\n\n- The deprecated alias for `--agent-turn-cache` is `--end-turn-snapshot` (lines 691-696).\n- The required cache kind enforced at startup is an **enabled inline prefix cache** (lines 1029-1034), meaning `--agent-turn-cache` requires that the prefix cache is not disabled (i.e., `--no-prefix-cache`/`--paged-attention` must be absent and at least one prefix-cache slot configured).\n- The source file is `src/server/server_main.cpp`.",
+          "tool_calls": []
+        }
+      ],
+      "turns": 2,
+      "turn_log": [
+        {
+          "turn": 0,
+          "model_wall_ms": 26886.623858998064,
+          "cache_eligible": false,
+          "timings": {
+            "agent_turn_cache_hit": false,
+            "cache_hit": false,
+            "cached_prefix_tokens": 0,
+            "decode_ms": 3429.9,
+            "decode_tokens_per_sec": 28.3,
+            "effective_prompt_tokens": 581,
+            "prefill_ms": 23454.4,
+            "prefilled_tokens": 581
+          },
+          "tools": [
+            {
+              "name": "read_file",
+              "arguments": {
+                "end_line": 704,
+                "path": "src/server/server_main.cpp",
+                "start_line": 689
+              },
+              "source": "client_exec",
+              "ok": true
+            },
+            {
+              "name": "read_file",
+              "arguments": {
+                "end_line": 1041,
+                "path": "src/server/server_main.cpp",
+                "start_line": 1029
+              },
+              "source": "client_exec",
+              "ok": true
+            }
+          ],
+          "tool_wait_ms": 2.6188259944319725
+        },
+        {
+          "turn": 1,
+          "model_wall_ms": 42553.57499001548,
+          "cache_eligible": true,
+          "timings": {
+            "agent_turn_cache_hit": true,
+            "cache_hit": true,
+            "cached_prefix_tokens": 686,
+            "decode_ms": 5836.5,
+            "decode_tokens_per_sec": 20.9,
+            "effective_prompt_tokens": 1486,
+            "prefill_ms": 32564.6,
+            "prefilled_tokens": 800
+          },
+          "tools": []
+        }
+      ]
+    }
+  ]
+}
