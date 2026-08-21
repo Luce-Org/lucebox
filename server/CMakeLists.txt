@@ -177,6 +177,16 @@ endif()
 option(DFLASH27B_FA_ALL_QUANTS "Compile ggml-cuda fattn kernels for all KV-quant pairs" ON)
 set(GGML_CUDA_FA_ALL_QUANTS ${DFLASH27B_FA_ALL_QUANTS} CACHE BOOL "" FORCE)
 
+# Some third-party qtype-107 GGUFs encode one affine (scale, offset) pair per
+# 32-weight block instead of the original two-scale layout. This is a wire
+# format choice, so keep it explicit and build-wide.
+option(DFLASH27B_ROCMFP2_AFFINE
+    "Interpret qtype-107 ROCmFP2 blocks as affine code*scale-offset weights"
+    OFF)
+if(DFLASH27B_ROCMFP2_AFFINE)
+    add_compile_definitions(ROCMFP2_AFFINE=1)
+endif()
+
 # HIP Phase 2 — opt-in rocWMMA flashprefill kernels (Strix Halo / gfx1151).
 # Default OFF (Phase 1 = ggml q8 fallback). Set ON for the 1.7-2.7× compress
 # speedup at 8K-32K context. Requires rocwmma headers installed under
@@ -357,6 +367,10 @@ if(DFLASH27B_GPU_BACKEND STREQUAL "hip" OR
     )
     target_include_directories(ggml-hip BEFORE PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src/hip_compat)
+    # HIP's clang driver otherwise finds Ubuntu's older libamdhip64 before the
+    # configured ROCm runtime when it expands --hip-link.
+    get_filename_component(_dflash_hip_runtime_dir "${hip_DIR}/../.." ABSOLUTE)
+    add_link_options("-L${_dflash_hip_runtime_dir}")
 endif()
 
 if(DFLASH27B_ENABLE_MIXED_CUDA_HIP)
@@ -428,6 +442,7 @@ add_library(dflash_common STATIC
     src/kv_cache.cpp
     src/kv_quant.cpp
     src/delta_net_chunked.cpp
+    src/delta_net_specla.cpp
     # Laguna-XS.2 (Poolside) target arch
     src/laguna/laguna_target_loader.cpp
     src/laguna/laguna_target_graph.cpp
@@ -592,6 +607,10 @@ if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
     target_sources(dflash_common PRIVATE src/common/geometric_draft_topk_cuda.cu)
     set_source_files_properties(src/common/geometric_draft_topk_cuda.cu
         PROPERTIES LANGUAGE HIP)
+    # Fused SpecLA accepted-state commit (one launch for all delta layers).
+    target_sources(dflash_common PRIVATE src/common/specla_commit_cuda.cu)
+    set_source_files_properties(src/common/specla_commit_cuda.cu
+        PROPERTIES LANGUAGE HIP)
     # PUBLIC so test consumers (test_dflash / test_draft_topk_cuda) also take the
     # GPU draft top-K path instead of the CPU fallback.
     target_compile_definitions(dflash_common PUBLIC DFLASH27B_HAVE_DRAFT_TOPK=1)
@@ -626,7 +645,8 @@ elseif(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
     target_sources(dflash_common PRIVATE
         src/flashprefill_select.cpp
         src/flashprefill.cpp
-        src/common/geometric_draft_topk_cuda.cu)
+        src/common/geometric_draft_topk_cuda.cu
+        src/common/specla_commit_cuda.cu)
     # PUBLIC so consumers (e.g. the test_dflash executable) also see the macro
     # and take the GPU draft top-K path instead of the CPU fallback. Same macro
     # name as the HIP branch above (backend-neutral).
@@ -989,6 +1009,11 @@ if(DFLASH27B_TESTS)
         else()
             target_link_libraries(test_deepseek4_mmid_grouped_cuda PRIVATE CUDA::cudart)
         endif()
+        # The grouped test includes rocmfpx.h unconditionally; expose it to both
+        # backends (previously only HIP resolved it, so the default CUDA build
+        # could not compile this target).
+        target_include_directories(test_deepseek4_mmid_grouped_cuda PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/rocmfpx)
         target_link_libraries(test_deepseek4_mmid_grouped_cuda PRIVATE
             ggml ${DFLASH27B_GGML_BACKEND_TARGET})
         list(APPEND _raw_unit_test_targets test_deepseek4_mmid_grouped_cuda)
@@ -1526,6 +1551,18 @@ if(DFLASH27B_TESTS)
         list(APPEND _raw_unit_test_targets test_recurrent_snapshot)
     endif()
 
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_delta_net_specla.cpp")
+        # GPU parity test: SpecLA topology-masked verify + factor-based state
+        # reconstruction vs the fused sequential gated-delta-net kernel.
+        # Exits 77 (ctest SKIP) when no GPU is present.
+        add_executable(test_delta_net_specla test/test_delta_net_specla.cpp)
+        target_include_directories(test_delta_net_specla PRIVATE
+            ${DFLASH27B_SRC_INCLUDE_DIRS})
+        target_link_libraries(test_delta_net_specla PRIVATE
+            dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
+        list(APPEND _raw_unit_test_targets test_delta_net_specla)
+    endif()
+
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_server_unit.cpp")
         set(_server_unit_sources
             test/test_unit_main.cpp
@@ -1539,6 +1576,7 @@ if(DFLASH27B_TESTS)
             test/test_admission.cpp
             test/test_restore_delta.cpp
             test/test_chain_rollback_policy.cpp
+            test/test_ddtree_tau.cpp
             test/test_anchor_transitive.cpp
             test/test_drafter_early_exit_score_range.cpp
             test/test_drafter_tail_capture_guard.cpp

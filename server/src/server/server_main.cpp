@@ -22,14 +22,15 @@
 #include "common/moe_hybrid_routing_stats.h"
 #include "common/platform_env.h"
 #include "common/peer_access.h"
+#include "common/specla_mode.h"
 #include "placement/pflash_placement.h"
 #include "placement/draft_residency.h"
 #include "kvflash_pager.h"
 
 #include <algorithm>
 #include <cerrno>
-#include <cmath>
 #include <charconv>
+#include <cmath>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -128,6 +129,8 @@ static void print_usage(const char * prog) {
         "  --peer-access        Enable peer access for multi-GPU placement\n"
         "  --chunk <N>          Chunked-prefill chunk size (default: 512)\n"
         "  --ds4-fused-decode   Enable DeepSeek4 single-graph GPU decode\n"
+        "  --ds4-fused-verify-f16-kv\n"
+        "                       Reuse F16 MLA cache in batched DeepSeek4 verification\n"
         "  --ds4-expert-top-k <N>\n"
         "                       Keep and renormalize the highest-ranked N routed experts\n"
         "                       (0=model default; single-device DeepSeek4 only)\n"
@@ -151,8 +154,13 @@ static void print_usage(const char * prog) {
         "  --prefill-cache-slots <N> Full prompt/prefill cache slots (default: 0)\n"
         "  --fast-rollback     Enable speculative fast rollback (default: on)\n"
         "  --no-fast-rollback  Disable speculative fast rollback, even with --ddtree\n"
+        "  --specla            Enable speculative linear-attention verification\n"
+        "                       when supported (Qwen3.6 uses DDTree automatically)\n"
+        "  --specla-top-k <K>  SpecLA draft-tree width (default: 4)\n"
         "  --ddtree             Enable DDTree speculative decode\n"
         "  --ddtree-budget <N>  DDTree budget (default: 22)\n"
+        "  --ddtree-tau <T>     Confidence margin on cumulative log-prob\n"
+        "                       (default: 6 with --specla; otherwise off)\n"
         "  --verify-width <N>   laguna chain spec verify width (default: base 8,\n"
         "                       trimmed per step by drafter confidence; N = fixed base)\n"
         "  --adaptive-experts [tau]  MoE expert-count gating on verify batches\n"
@@ -219,7 +227,7 @@ static void print_usage(const char * prog) {
         "  --tool-spec-timeout-ms <N>   Executor result timeout (default: 60000).\n"
         "  --early-dispatch      Launch allowlisted tool calls as soon as their call block\n"
         "                        closes in the token stream (results: dflash_early_dispatch).\n"
-        "  --tool-spec-max-executors <N>  Server-wide concurrent executor cap (default: 16).\n"
+        "  --tool-spec-max-executors <N>  Server-wide concurrent executor cap (default: 16; 0 = unlimited).\n"
         "  --prefetch-prefill    Prefill the deterministic next tool turn before the\n"
         "                        client requests it (with --early-dispatch + --end-turn-snapshot).\n"
         "  --end-turn-snapshot   After tool-enabled generations, cache prompt+output so the\n"
@@ -291,6 +299,9 @@ int main(int argc, char ** argv) {
     bool fast_rollback_forced_off = false;
     bool target_split_fast_rollback_cli = false;
     bool adaptive_experts_set = false;  // --adaptive-experts (MoE architectures only)
+    bool ddtree_tau_set = false;
+    bool specla_top_k_set = false;
+    int  specla_top_k = 4;
 
     // Track which thinking-budget tunables the operator set via CLI.
     // Those values win over the model card (spec §3.1: "Explicit CLI
@@ -393,6 +404,8 @@ int main(int argc, char ** argv) {
             bargs.chunk = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--ds4-fused-decode") == 0) {
             bargs.ds4_fused_decode = true;
+        } else if (std::strcmp(argv[i], "--ds4-fused-verify-f16-kv") == 0) {
+            bargs.ds4_fused_verify_f16_kv = true;
         } else if (std::strcmp(argv[i], "--ds4-expert-top-k") == 0 && i + 1 < argc) {
             bargs.ds4_expert_top_k = std::atoi(argv[++i]);
             if (bargs.ds4_expert_top_k < 0) {
@@ -462,11 +475,38 @@ int main(int argc, char ** argv) {
             sconfig.prefill_cache_cap = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--fast-rollback") == 0) {
             bargs.fast_rollback = true;
+        } else if (std::strcmp(argv[i], "--specla") == 0) {
+            bargs.specla_mode = true;
+            bargs.fast_rollback = true;
+        } else if (std::strcmp(argv[i], "--specla-top-k") == 0 && i + 1 < argc) {
+            const char * value = argv[++i];
+            const char * end = value + std::strlen(value);
+            const auto parsed = std::from_chars(value, end, specla_top_k);
+            if (parsed.ec != std::errc{} || parsed.ptr != end || specla_top_k <= 0) {
+                std::fprintf(stderr,
+                    "--specla-top-k expects a positive integer, got '%s'\n", value);
+                return 2;
+            }
+            specla_top_k_set = true;
         } else if (std::strcmp(argv[i], "--ddtree") == 0) {
             bargs.ddtree_mode = true;
             bargs.fast_rollback = true;
         } else if (std::strcmp(argv[i], "--ddtree-budget") == 0 && i + 1 < argc) {
             bargs.ddtree_budget = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--ddtree-tau") == 0 && i + 1 < argc) {
+            const char * value = argv[++i];
+            char * end = nullptr;
+            errno = 0;
+            const float tau = std::strtof(value, &end);
+            if (errno == ERANGE || end == value || *end != '\0' ||
+                !std::isfinite(tau) || tau < 0.0f) {
+                std::fprintf(stderr,
+                    "--ddtree-tau expects a non-negative finite number, got '%s'\n",
+                    value);
+                return 2;
+            }
+            bargs.ddtree_tau = tau;
+            ddtree_tau_set = true;
         } else if (std::strcmp(argv[i], "--adaptive-experts") == 0) {
             const char * tau = "0.80";
             if (i + 1 < argc && argv[i + 1][0] != '-') {
@@ -647,7 +687,8 @@ int main(int argc, char ** argv) {
             sconfig.end_turn_snapshot = true;
             // DeepSeek-V4 continuation snapshots are taken after DSpark decode and
             // carry no final logits; the server never restores them at full length.
-            ::setenv("DFLASH_DS4_SNAPSHOT_STALE_LOGITS", "1", 0);
+            set_environment_variable(
+                "DFLASH_DS4_SNAPSHOT_STALE_LOGITS", "1", false);
         } else if (std::strcmp(argv[i], "--tool-spec-timeout-ms") == 0 &&
                    i + 1 < argc) {
             if (!parse_int_strict(
@@ -732,17 +773,30 @@ int main(int argc, char ** argv) {
             return 2;
         }
     }
-
     const bool tool_speculation_requested =
         !sconfig.tool_speculation.executor_path.empty() ||
         !sconfig.tool_speculation.profile_path.empty() ||
         !sconfig.tool_speculation.allowed_tools.empty() ||
         !sconfig.tool_speculation.cpu_affinity.empty();
+    if (sconfig.prefetch_prefill &&
+        (!sconfig.early_dispatch || !sconfig.end_turn_snapshot)) {
+        std::fprintf(stderr,
+            "[server] --prefetch-prefill requires --early-dispatch and "
+            "--end-turn-snapshot\n");
+        return 2;
+    }
+    if ((sconfig.early_dispatch || sconfig.prefetch_prefill) &&
+        !tool_speculation_requested) {
+        std::fprintf(stderr,
+            "[server] --early-dispatch requires --tool-spec-executor and "
+            "at least one --tool-spec-allow\n");
+        return 2;
+    }
     if (tool_speculation_requested) {
         if (!tool_speculation_executor_isolation_supported()) {
             std::fprintf(stderr,
-                "[server] tool speculation requires Linux glibc >= 2.34 "
-                "for child descriptor isolation\n");
+                "[server] this platform cannot isolate tool executor "
+                "descriptors\n");
             return 2;
         }
         if (sconfig.tool_speculation.executor_path.empty() ||
@@ -807,6 +861,20 @@ int main(int argc, char ** argv) {
             "[server] tool speculation preserves token speculation; "
             "unqualified resource lanes are deferred\n");
     }
+
+    if (specla_top_k_set && !bargs.specla_mode) {
+        std::fprintf(stderr, "[server] --specla-top-k requires --specla\n");
+        return 2;
+    }
+    if (bargs.specla_mode && fast_rollback_forced_off) {
+        std::fprintf(stderr,
+            "[server] --specla is incompatible with --no-fast-rollback\n");
+        return 2;
+    }
+    if (bargs.specla_mode && !ddtree_tau_set) {
+        bargs.ddtree_tau = 6.0f;
+    }
+
     if (fast_rollback_forced_off) {
         bargs.fast_rollback = false;
         target_split_fast_rollback_cli = false;
@@ -879,11 +947,56 @@ int main(int argc, char ** argv) {
     }
     const ResolvedBackendPlan & backend_plan = backend_preparation.plan;
     const std::string & arch = backend_plan.arch();
+    const bool kvflash_requested =
+        kvflash_pool_requested(std::getenv("DFLASH_KVFLASH"));
     if (target_split_fast_rollback_cli && arch != "qwen35") {
         std::fprintf(stderr,
             "[server] --target-split-fast-rollback is only supported for "
             "qwen35 targets (detected '%s')\n", arch.c_str());
         return 2;
+    }
+
+    // SpecLA is the verification mode, not a proposal algorithm. Select the
+    // proposal adapter supported by this model. Qwen3.6 currently has a
+    // DDTree adapter; future model families may select DSpark here instead.
+    if (bargs.specla_mode) {
+        const bool supported = arch == "qwen35" && !bargs.device.is_multi_device();
+        if (supported) {
+            if (!bargs.draft_path) {
+                std::fprintf(stderr,
+                    "[server] Qwen3.6 SpecLA requires --draft <path>\n");
+                return 2;
+            }
+            bargs.ddtree_mode = true;
+            if (kvflash_requested) {
+                // KVFlash installs a paged attention-KV layout and therefore
+                // disables the factor-cache migration required by SpecLA.
+                // Keep the compatible proposal adapter, but report the
+                // effective verification mode accurately.
+                std::fprintf(stderr,
+                    "[server] warning: --specla is unavailable with KVFlash; "
+                    "using ordinary DDTree verification\n");
+                bargs.specla_mode = false;
+                unset_environment_variable("DFLASH_SPECLA");
+            } else {
+                set_environment_variable("DFLASH_SPECLA", "1", true);
+                if (specla_top_k_set) {
+                    set_environment_variable(
+                        "DFLASH_SPECLA_TOPK", std::to_string(specla_top_k).c_str(), true);
+                } else {
+                    specla_top_k = specla_tree_topk();
+                }
+            }
+        } else {
+            std::fprintf(stderr,
+                "[server] warning: --specla is unavailable for architecture '%s' "
+                "with placement %s; using the architecture's normal decode path\n",
+                arch.c_str(), placement_device_name(bargs.device).c_str());
+            bargs.specla_mode = false;
+            if (!ddtree_tau_set) {
+                bargs.ddtree_tau = std::numeric_limits<float>::infinity();
+            }
+        }
     }
 
     // Paged decode owns its K/V through a block table that the snapshot format
@@ -1283,6 +1396,8 @@ int main(int argc, char ** argv) {
     if (arch == "deepseek4") {
         std::fprintf(stderr, "[server] │  ds4_fused      = %s\n",
                      bargs.ds4_fused_decode ? "ON" : "off");
+        std::fprintf(stderr, "[server] │  ds4_verify_f16kv= %s\n",
+                     bargs.ds4_fused_verify_f16_kv ? "ON" : "off");
         if (bargs.ds4_expert_top_k > 0) {
             std::fprintf(stderr, "[server] │  ds4_expert_topk= %d\n",
                          bargs.ds4_expert_top_k);
@@ -1299,6 +1414,11 @@ int main(int argc, char ** argv) {
                              "[server] │     Use --fa-window 0 for tool-call workloads.\n");
     }
     std::fprintf(stderr, "[server] │  ddtree          = %s\n", bargs.ddtree_mode ? "ON" : "off");
+    std::fprintf(stderr, "[server] │  specla          = %s\n", bargs.specla_mode ? "ON" : "off");
+    if (bargs.specla_mode) {
+        std::fprintf(stderr, "[server] │  specla_top_k    = %d\n", specla_top_k);
+        std::fprintf(stderr, "[server] │  ddtree_tau      = %.3g\n", bargs.ddtree_tau);
+    }
     std::fprintf(stderr, "[server] │  fast_rollback   = %s\n", bargs.fast_rollback ? "ON" : "off");
     if (bargs.device.is_layer_split()) {
         std::fprintf(stderr, "[server] │  split_rollback  = %s\n",

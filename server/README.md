@@ -170,6 +170,12 @@ Run it directly:
   --model-name luce-dflash
 ```
 
+Use `--specla` to enable speculative linear-attention verification when the
+target supports it. The runtime chooses a compatible proposal adapter; the
+current monolithic Qwen3.5/Qwen3.6 path uses DDTree with tested defaults.
+Hardware- or checkpoint-specific overrides remain available through
+`--ddtree-budget`, `--ddtree-tau`, `--specla-top-k`, and `--draft-swa`.
+
 ### Compression proxy mode
 
 `dflash_server` can run as a **PFlash compression proxy** in front of any

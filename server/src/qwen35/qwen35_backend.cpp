@@ -17,6 +17,7 @@
 #endif
 #include "common/io_utils.h"
 #include "common/restore_delta.h"
+#include "common/specla_mode.h"
 #include "qwen35_tensor_parallel.h"
 #include "qwen3/qwen3_drafter.h"
 #include "qwen3/qwen3_kvflash_scorer.h"
@@ -28,6 +29,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
@@ -1587,9 +1589,11 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         const int max_verify_tokens = cfg_.ddtree_mode
             ? std::max<int>(dw_.block_size, cfg_.ddtree_budget + 1)
             : dw_.block_size;
+        const bool enable_specla = cfg_.fast_rollback &&
+            !cfg_.device.is_tensor_parallel() && !kvflash_active();
         if (!migrate_prefill_cache(w_, cfg_.device.max_ctx,
                                    max_verify_tokens,
-                                   target_backend_, cache_)) {
+                                   target_backend_, cache_, enable_specla)) {
             std::fprintf(stderr, "prefill: rollback cache migration failed: %s\n",
                          dflash27b_last_error());
             return -1;
@@ -2428,15 +2432,22 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     // ── DFlash spec-decode: draft → verify → accept → replay ──────────
 
     DFlashTarget * target = dflash_target();
+    auto finish_speculative_state = [&]() {
+        if (target->finish_speculative_state()) return true;
+        std::fprintf(stderr, "spec-decode: final SpecLA state flush failed\n");
+        return false;
+    };
     const bool use_remote_draft = cfg_.remote_draft.enabled() && remote_draft_.active();
     const int q_len = dw_.block_size > 0 ? dw_.block_size : DFLASH27B_DRAFT_BLOCK_SIZE;
     const int max_verify_tokens = cfg_.ddtree_mode
         ? std::max<int>(dw_.block_size, cfg_.ddtree_budget + 1)
         : dw_.block_size;
     if ((cfg_.fast_rollback || cfg_.ddtree_mode) && !cache_.rollback_ctx) {
+        const bool enable_specla = cfg_.fast_rollback &&
+            !cfg_.device.is_tensor_parallel() && !kvflash_active();
         if (!migrate_prefill_cache(w_, cfg_.device.max_ctx,
                                    max_verify_tokens,
-                                   target_backend_, cache_)) {
+                                   target_backend_, cache_, enable_specla)) {
             std::fprintf(stderr, "spec-decode: rollback cache migration failed: %s\n",
                          dflash27b_last_error());
             return false;
@@ -2462,7 +2473,8 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     int n_hint_accepted = 0;
     int target_forwards = 0;
     const ChainRollbackPolicy rollback_policy =
-        resolve_chain_rollback_policy(cfg_.device.is_tensor_parallel());
+        resolve_chain_rollback_policy(cfg_.device.is_tensor_parallel(),
+                                      target->exact_fast_rollback());
     const int fast_rollback_threshold =
         rollback_policy.fast_rollback_threshold;
     RollbackDiag rollback_diag;
@@ -2525,10 +2537,12 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             cache_.last_tok = out_tokens.back();
             const int ar_n_gen = n_gen - n_generated;
             if (ar_n_gen <= 0) {
+                if (!finish_speculative_state()) return false;
                 log_target_forward_stats();
                 io.emit(-1);
                 return true;
             }
+            if (!finish_speculative_state()) return false;
             BudgetHook tail_hook = budget_hook ? *budget_hook : BudgetHook{};
             bool ok = do_ar_decode(committed, ar_n_gen, out_tokens, io,
                                     tail_hook, forced_close_out,
@@ -2559,6 +2573,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             !use_remote_draft &&
             draft_feature_mirror_can_view(feature_mirror_, committed, draft_ctx, mirror_slot0);
 
+        bool used_draft_kv = false;
         const auto profile_draft_start = profile_start();
         if (use_remote_draft) {
             local_hidden.clear();
@@ -2590,6 +2605,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 }
             }
             if (use_draft_kv) {
+                used_draft_kv = true;
                 if (!draft_kv_begin_step(draft_kv_, dw_, draft_backend_,
                                          feature_mirror_, committed)) {
                     std::fprintf(stderr, "spec-decode: draft-kv step prep failed\n");
@@ -2693,24 +2709,118 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
         if (use_tree_verify) {
             const int L = q_len - 1;
-            const int K = (cfg_.ddtree_budget > L) ? 8 : 1;
-            std::vector<float>   top_lp;
-            std::vector<int32_t> top_ids;
-            const auto profile_project_start = profile_start();
-            if (!target->project_hidden_to_topk(local_hidden.data(), q_len, K,
-                                                cfg_.ddtree_temp, top_lp, top_ids)) {
-                std::fprintf(stderr, "spec-decode: ddtree topk projection failed\n");
-                step_graph_destroy(draft_sg);
-                return false;
+            // The paper's end-to-end tree route uses top-k=4.  Wider top-k
+            // spends projection and scheduling work on low-ranked siblings;
+            // keep the legacy width only outside SpecLA.
+            const int K = (cfg_.ddtree_budget > L)
+                ? (target->exact_fast_rollback()
+                    ? std::min(specla_tree_topk(), w_.n_vocab)
+                    : 8)
+                : 1;
+            DDTree tree;
+            if (target->exact_fast_rollback() && K > 1 &&
+                specla_conditional_draft_enabled()) {
+                // SpecLA §6.2: every expanded branch is proposed from that
+                // branch's exact token prefix, avoiding the old one-spine
+                // approximation. This is experimental for the current
+                // five-layer drafter because every prefix requires a rerun.
+                bool conditional_ok = true;
+                std::vector<float> row_hidden((size_t)hidden);
+                DDTreeConditionalTopK conditional_topk =
+                    [&](const std::vector<int32_t> & prefix, int next_depth,
+                        std::vector<float> & top_lp,
+                        std::vector<int32_t> & top_ids) -> bool {
+                    if (!conditional_ok || next_depth < 1 || next_depth > L ||
+                        (int)prefix.size() != next_depth - 1) {
+                        conditional_ok = false;
+                        return false;
+                    }
+
+                    if (prefix.empty()) {
+                        std::memcpy(row_hidden.data(),
+                                    local_hidden.data() + (size_t)hidden,
+                                    sizeof(float) * (size_t)hidden);
+                    } else {
+                        noise_ids[0] = last_tok;
+                        for (int i = 1; i < q_len; ++i) {
+                            noise_ids[(size_t)i] = i <= (int)prefix.size()
+                                ? prefix[(size_t)i - 1]
+                                : target->mask_token_id();
+                        }
+                        if (!target->embed_tokens(noise_ids.data(), q_len,
+                                                  noise_embed.data())) {
+                            conditional_ok = false;
+                            return false;
+                        }
+                        const auto branch_draft_start = profile_start();
+                        ggml_tensor * branch_input = used_draft_kv
+                            ? draft_kv_.inp_embed : draft_sg.inp_embed;
+                        ggml_cgraph * branch_graph = used_draft_kv
+                            ? draft_kv_.gf : draft_sg.gf;
+                        ggml_tensor * branch_hidden = used_draft_kv
+                            ? draft_kv_.hidden_states : draft_sg.hidden_states;
+                        if (!branch_input || !branch_graph || !branch_hidden) {
+                            conditional_ok = false;
+                            return false;
+                        }
+                        ggml_backend_tensor_set(branch_input, noise_embed.data(), 0,
+                                                sizeof(float) * noise_embed.size());
+                        if (ggml_backend_graph_compute(draft_backend_, branch_graph) !=
+                            GGML_STATUS_SUCCESS) {
+                            conditional_ok = false;
+                            return false;
+                        }
+                        ggml_backend_tensor_get(
+                            branch_hidden, row_hidden.data(),
+                            (size_t)next_depth * hidden * sizeof(float),
+                            sizeof(float) * (size_t)hidden);
+                        profile_add(profile_draft_s, branch_draft_start);
+                    }
+
+                    const auto branch_project_start = profile_start();
+                    const bool ok = target->project_hidden_to_topk(
+                        row_hidden.data(), 1, K, cfg_.ddtree_temp,
+                        top_lp, top_ids);
+                    profile_add(profile_project_s, branch_project_start);
+                    conditional_ok = conditional_ok && ok;
+                    return ok;
+                };
+                tree = build_ddtree_conditional(
+                    conditional_topk, L, K, cfg_.ddtree_budget,
+                    cfg_.ddtree_chain_seed, cfg_.ddtree_tau);
+                if (!conditional_ok || tree.n_nodes == 0) {
+                    std::fprintf(stderr,
+                        "spec-decode: conditioned ddtree proposal failed\n");
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
+            } else {
+                std::vector<float> top_lp;
+                std::vector<int32_t> top_ids;
+                const auto profile_project_start = profile_start();
+                if (!target->project_hidden_to_topk(local_hidden.data(), q_len, K,
+                                                    cfg_.ddtree_temp,
+                                                    top_lp, top_ids)) {
+                    std::fprintf(stderr,
+                        "spec-decode: ddtree topk projection failed\n");
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
+                profile_add(profile_project_s, profile_project_start);
+                tree = build_ddtree(
+                    top_lp.data() + (size_t)K,
+                    top_ids.data() + (size_t)K,
+                    L, K, cfg_.ddtree_budget, cfg_.ddtree_chain_seed,
+                    cfg_.ddtree_tau);
             }
-            profile_add(profile_project_s, profile_project_start);
-            // Tree depth L draws from draft rows 1..q_len-1 (row 0 = the seed).
-            // Known limitation: branch descendants beyond depth 1 still come
-            // from one spine-conditioned block-draft forward, so a confident
-            // draft may not beat the chain.
-            DDTree tree = build_ddtree(top_lp.data() + (size_t)K, top_ids.data() + (size_t)K,
-                                       L, K, cfg_.ddtree_budget, cfg_.ddtree_chain_seed);
-            const int N = cfg_.ddtree_budget + 1;   // fixed alloc width
+            // SpecLA schedules the retained topology directly. Never execute
+            // fake padding nodes: confidence pruning must reduce target work,
+            // and this loop already rebuilds the topology-dependent graph.
+            const int N = target->exact_fast_rollback()
+                ? 1 + tree.n_nodes
+                : (std::isfinite(cfg_.ddtree_tau)
+                    ? 1 + tree.n_nodes
+                    : cfg_.ddtree_budget + 1);
 
             std::vector<int32_t> flat_tokens((size_t)N, 0);
             flat_tokens[0] = last_tok;
@@ -2905,7 +3015,13 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             if (can_commit_bonus) {
                 const int bonus_pos = committed + total_emitted;
                 std::vector<int32_t> bonus_vec(1, next_token);
-                if (!target->verify_batch(bonus_vec, bonus_pos, bonus_last_tok, nullptr)) {
+                // A delayed-state target must consume the accepted tree path
+                // inside this verify and capture the committed bonus as the
+                // next pending factor. A normal target has already materialized
+                // the tree rollback and may keep the ordinary writeback path.
+                const bool delayed_bonus = target->exact_fast_rollback();
+                if (!target->verify_batch(bonus_vec, bonus_pos, bonus_last_tok,
+                                          nullptr, delayed_bonus)) {
                     std::fprintf(stderr, "spec-decode: tree bonus replay failed\n");
                     step_graph_destroy(draft_sg);
                     return false;
@@ -2918,6 +3034,12 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 }
                 if (bonus_logits.empty()) {
                     std::fprintf(stderr, "spec-decode: tree bonus logits empty\n");
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
+                if (delayed_bonus && !target->rollback_to(bonus_pos, 1)) {
+                    std::fprintf(stderr,
+                        "spec-decode: tree bonus factor commit failed\n");
                     step_graph_destroy(draft_sg);
                     return false;
                 }
@@ -3100,9 +3222,14 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 fast_rolled_back = true;
                 rollback_diag.record_fast_rollback(accept_n);
             } else {
-                // Rollback failed (CUDA error / unsupported state type). The
-                // pre-verify snapshot is still valid, so degrade to the legacy
-                // restore+replay path below instead of aborting the request.
+                if (!target->rollback_failure_is_recoverable()) {
+                    std::fprintf(stderr, "spec-decode: rollback_to failed after "
+                                         "an in-place commit attempt; aborting\n");
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
+                // The pre-verify snapshot is still valid, so degrade to the
+                // legacy restore+replay path below.
                 std::fprintf(stderr, "spec-decode: rollback_to failed; "
                                      "falling back to restore+replay\n");
                 rollback_diag.record_failed_fallback();
@@ -3303,10 +3430,12 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 (float)((double)n_accept_sum / (double)total_draft_pos);
             const int ar_n_gen = n_gen - n_generated;
             if (ar_n_gen <= 0) {
+                if (!finish_speculative_state()) return false;
                 log_target_forward_stats();
                 io.emit(-1);
                 return true;
             }
+            if (!finish_speculative_state()) return false;
             BudgetHook tail_hook = budget_hook ? *budget_hook : BudgetHook{};
             bool ok = do_ar_decode(committed, ar_n_gen, out_tokens, io,
                                     tail_hook, forced_close_out,
@@ -3346,10 +3475,12 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 (float)((double)n_accept_sum / (double)total_draft_pos);
             const int ar_n_gen = n_gen - n_generated;
             if (ar_n_gen <= 0) {
+                if (!finish_speculative_state()) return false;
                 log_target_forward_stats();
                 io.emit(-1);
                 return true;
             }
+            if (!finish_speculative_state()) return false;
             BudgetHook tail_hook = budget_hook ? *budget_hook : BudgetHook{};
             tail_hook.close_token_ids.clear();
             bool ok = do_ar_decode(committed, ar_n_gen, out_tokens, io,
@@ -3362,6 +3493,10 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         if (hit_eos) break;
     }
 
+    if (!finish_speculative_state()) {
+        step_graph_destroy(draft_sg);
+        return false;
+    }
     step_graph_destroy(draft_sg);
 
     auto t_dec1 = std::chrono::steady_clock::now();

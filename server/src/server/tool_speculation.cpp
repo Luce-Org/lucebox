@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <functional>
@@ -27,18 +28,9 @@
 #  include <sys/wait.h>
 #  include <unistd.h>
 #  if defined(__linux__)
-#    include <features.h>
 #    include <sched.h>
+#    include <sys/syscall.h>
 #  endif
-#endif
-
-#if !defined(_WIN32) && defined(__GLIBC__) && defined(__GLIBC_PREREQ)
-#  if __GLIBC_PREREQ(2, 34)
-#    define DFLASH_TOOL_SPEC_HAS_CLOSEFROM 1
-#  endif
-#endif
-#ifndef DFLASH_TOOL_SPEC_HAS_CLOSEFROM
-#  define DFLASH_TOOL_SPEC_HAS_CLOSEFROM 0
 #endif
 
 namespace dflash::common {
@@ -50,6 +42,8 @@ std::atomic<int> g_running_executors{0};
 namespace {
 
 constexpr size_t kMaxExecutorRequestBytes = 64 * 1024;
+constexpr const char * kFreshUntilUnixMsField =
+    "_speculation_fresh_until_unix_ms";
 
 bool finite_positive(double value) {
     return std::isfinite(value) && value > 0.0;
@@ -86,6 +80,33 @@ std::string format_cpu_affinity(const std::vector<int> & cpus) {
 }
 
 #if !defined(_WIN32)
+[[noreturn]] void report_child_spawn_error(int error_fd, int error_number) {
+    const char * cursor = reinterpret_cast<const char *>(&error_number);
+    size_t remaining = sizeof(error_number);
+    while (remaining > 0) {
+        const ssize_t written = ::write(error_fd, cursor, remaining);
+        if (written > 0) {
+            cursor += written;
+            remaining -= static_cast<size_t>(written);
+            continue;
+        }
+        if (written < 0 && errno == EINTR) continue;
+        break;
+    }
+    ::_exit(127);
+}
+
+void close_child_descriptors_from_four(int open_max) {
+#  if defined(__linux__) && defined(SYS_close_range)
+    // The raw syscall is async-signal-safe after fork. Keep fd 3 as the
+    // close-on-exec error channel until execve succeeds.
+    if (::syscall(SYS_close_range, 4u, ~0u, 0u) == 0) return;
+#  endif
+    // Portable fallback for older Linux kernels and other POSIX systems.
+    // open_max is captured in the parent because sysconf is not safe here.
+    for (int fd = 4; fd < open_max; ++fd) (void)::close(fd);
+}
+
 bool send_all_socket(int fd, const void * data, size_t bytes) {
     const char * cursor = static_cast<const char *>(data);
     while (bytes > 0) {
@@ -205,7 +226,11 @@ bool wait_for_child_cpu_affinity(
 }  // namespace
 
 bool tool_speculation_executor_isolation_supported() {
-    return DFLASH_TOOL_SPEC_HAS_CLOSEFROM != 0;
+#if defined(_WIN32)
+    return false;
+#else
+    return true;
+#endif
 }
 
 bool CanonicalToolInvocation::from_parts(
@@ -263,6 +288,7 @@ bool build_tool_speculation_prediction(
     }
     out.call = std::move(invocation);
     out.confidence = confidence;
+    out.authoritative = false;
     error.clear();
     return true;
 }
@@ -664,7 +690,7 @@ ToolSpeculationAttempt::ToolSpeculationAttempt(
         admission_.reason = "engine_disabled";
     } else if (!config_.allows(prediction_.call.name)) {
         admission_.reason = "tool_not_allowlisted";
-    } else if (prediction_.confidence >= 1.0) {
+    } else if (prediction_.authoritative) {
         // Authoritative call (early dispatch): no interference gate needed,
         // the model already emitted it; run it on the isolated lane.
         admission_.admitted = true;
@@ -709,16 +735,16 @@ void ToolSpeculationAttempt::start() {
     if (started_) return;
     started_ = true;
     if (!admission_.admitted) return;
-    if (config_.max_concurrent_executors > 0) {
-        const int running = g_running_executors.fetch_add(1, std::memory_order_acq_rel);
-        if (running >= config_.max_concurrent_executors) {
-            g_running_executors.fetch_sub(1, std::memory_order_acq_rel);
-            admission_.admitted = false;
-            admission_.reason = "executor_saturated";
-            return;
-        }
-        holds_executor_slot_ = true;
+    const int running =
+        g_running_executors.fetch_add(1, std::memory_order_acq_rel);
+    if (config_.max_concurrent_executors > 0 &&
+        running >= config_.max_concurrent_executors) {
+        g_running_executors.fetch_sub(1, std::memory_order_acq_rel);
+        admission_.admitted = false;
+        admission_.reason = "executor_saturated";
+        return;
     }
+    holds_executor_slot_ = true;
     const json request = {
         {"protocol", "dflash.tool-speculation.v1"},
         {"request_id", request_id_},
@@ -735,11 +761,13 @@ void ToolSpeculationAttempt::start() {
     started_at_ = std::chrono::steady_clock::now();
 #if defined(_WIN32)
     launch_error_ = "tool speculation child executors are not implemented on Windows";
+    release_executor_slot();
     return;
 #else
     const std::string payload = request.dump() + "\n";
     if (payload.size() > kMaxExecutorRequestBytes) {
         launch_error_ = "executor request exceeds 64 KiB";
+        release_executor_slot();
         return;
     }
 
@@ -747,6 +775,7 @@ void ToolSpeculationAttempt::start() {
     if (::socketpair(AF_UNIX, SOCK_STREAM, 0, input_socket) != 0) {
         launch_error_ = std::string("executor stdin socket failed: ") +
                         std::strerror(errno);
+        release_executor_slot();
         return;
     }
 #  if defined(SO_NOSIGPIPE)
@@ -760,54 +789,9 @@ void ToolSpeculationAttempt::start() {
                         std::strerror(errno);
         ::close(input_socket[0]);
         ::close(input_socket[1]);
+        release_executor_slot();
         return;
     }
-
-    posix_spawn_file_actions_t actions;
-    int spawn_status = posix_spawn_file_actions_init(&actions);
-    const bool actions_initialized = spawn_status == 0;
-    posix_spawnattr_t attributes;
-    const int attributes_status = posix_spawnattr_init(&attributes);
-    const bool attributes_initialized = attributes_status == 0;
-    if (spawn_status == 0 && attributes_status != 0) {
-        spawn_status = attributes_status;
-    }
-    if (spawn_status == 0) {
-        spawn_status = posix_spawnattr_setpgroup(&attributes, 0);
-    }
-    if (spawn_status == 0) {
-        spawn_status = posix_spawnattr_setflags(
-            &attributes, POSIX_SPAWN_SETPGROUP);
-    }
-    if (spawn_status == 0) {
-        spawn_status = posix_spawn_file_actions_adddup2(
-            &actions, input_socket[1], STDIN_FILENO);
-    }
-    if (spawn_status == 0) {
-        spawn_status = posix_spawn_file_actions_adddup2(
-            &actions, output_pipe[1], STDOUT_FILENO);
-    }
-    if (spawn_status == 0) {
-        spawn_status = posix_spawn_file_actions_addclose(&actions, output_pipe[0]);
-    }
-    if (spawn_status == 0) {
-        spawn_status = posix_spawn_file_actions_addclose(&actions, input_socket[0]);
-    }
-    if (spawn_status == 0 && input_socket[1] != STDIN_FILENO) {
-        spawn_status = posix_spawn_file_actions_addclose(&actions, input_socket[1]);
-    }
-    if (spawn_status == 0 && output_pipe[1] != STDOUT_FILENO) {
-        spawn_status = posix_spawn_file_actions_addclose(&actions, output_pipe[1]);
-    }
-#  if DFLASH_TOOL_SPEC_HAS_CLOSEFROM
-    // The executor receives only stdin/stdout/stderr. In particular, it must
-    // not inherit listening sockets, live client connections, model IPC pipes,
-    // or accelerator descriptors from the long-running server.
-    if (spawn_status == 0) {
-        spawn_status = posix_spawn_file_actions_addclosefrom_np(
-            &actions, STDERR_FILENO + 1);
-    }
-#  endif
 
     std::vector<std::string> env_storage = executor_environment(
         admission_.resource_percentage, admission_.accelerator_relation,
@@ -817,45 +801,191 @@ void ToolSpeculationAttempt::start() {
     for (std::string & value : env_storage) env.push_back(value.data());
     env.push_back(nullptr);
 
-    std::string executable = config_.cpu_affinity.empty()
-        ? config_.executor_path
-        : "/usr/bin/taskset";
     std::string protocol_arg = "--dflash-tool-spec-v1";
-    std::string affinity_arg = format_cpu_affinity(config_.cpu_affinity);
-    std::string taskset_cpu_arg = "-c";
     std::vector<char *> argv;
-    argv.push_back(executable.data());
-    if (!config_.cpu_affinity.empty()) {
-        // taskset applies the mask before execve(), so no executor startup
-        // code can run on the model CPUs. The request payload remains withheld
-        // until the parent verifies the resulting mask below.
-        argv.push_back(taskset_cpu_arg.data());
-        argv.push_back(affinity_arg.data());
-        argv.push_back(config_.executor_path.data());
-    }
+    argv.push_back(config_.executor_path.data());
     argv.push_back(protocol_arg.data());
     argv.push_back(nullptr);
     pid_t child = -1;
+
+#  if !defined(__linux__)
+    if (!config_.cpu_affinity.empty()) {
+        launch_error_ = "tool CPU affinity isolation is supported only on Linux";
+        ::close(input_socket[0]);
+        ::close(input_socket[1]);
+        ::close(output_pipe[0]);
+        ::close(output_pipe[1]);
+        release_executor_slot();
+        return;
+    }
+#  endif
+
+#  if !defined(__linux__) && defined(POSIX_SPAWN_CLOEXEC_DEFAULT)
+    // Darwin provides an atomic close-on-exec-default policy. It avoids a
+    // linear close loop while retaining only stdio and the two explicit dup2
+    // actions. Linux uses the fork/close_range path below so CPU affinity is
+    // applied before any executor or dynamic-loader code runs.
+    posix_spawn_file_actions_t actions;
+    int spawn_status = ::posix_spawn_file_actions_init(&actions);
+    const bool actions_initialized = spawn_status == 0;
+    posix_spawnattr_t attributes;
+    const int attributes_status = ::posix_spawnattr_init(&attributes);
+    const bool attributes_initialized = attributes_status == 0;
+    if (spawn_status == 0 && attributes_status != 0) {
+        spawn_status = attributes_status;
+    }
+    if (spawn_status == 0) {
+        spawn_status = ::posix_spawnattr_setpgroup(&attributes, 0);
+    }
+    if (spawn_status == 0) {
+        spawn_status = ::posix_spawnattr_setflags(
+            &attributes,
+            POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_CLOEXEC_DEFAULT);
+    }
+    if (spawn_status == 0) {
+        spawn_status = ::posix_spawn_file_actions_adddup2(
+            &actions, input_socket[1], STDIN_FILENO);
+    }
+    if (spawn_status == 0) {
+        spawn_status = ::posix_spawn_file_actions_adddup2(
+            &actions, output_pipe[1], STDOUT_FILENO);
+    }
     if (spawn_status == 0) {
         spawn_status = ::posix_spawn(
-            &child, executable.c_str(), &actions, &attributes, argv.data(),
-            env.data());
+            &child, config_.executor_path.c_str(), &actions, &attributes,
+            argv.data(), env.data());
     }
-    if (actions_initialized) {
-        posix_spawn_file_actions_destroy(&actions);
-    }
-    if (attributes_initialized) {
-        posix_spawnattr_destroy(&attributes);
-    }
+    if (actions_initialized) ::posix_spawn_file_actions_destroy(&actions);
+    if (attributes_initialized) ::posix_spawnattr_destroy(&attributes);
     ::close(input_socket[1]);
     ::close(output_pipe[1]);
     if (spawn_status != 0) {
-        launch_error_ = std::string("executor spawn failed: ") +
-                        std::strerror(spawn_status);
         ::close(input_socket[0]);
         ::close(output_pipe[0]);
+        launch_error_ = std::string("executor spawn failed: ") +
+                        std::strerror(spawn_status);
+        release_executor_slot();
         return;
     }
+#  else
+    int spawn_error_pipe[2] = {-1, -1};
+    if (::pipe(spawn_error_pipe) != 0 ||
+        ::fcntl(spawn_error_pipe[1], F_SETFD, FD_CLOEXEC) != 0) {
+        const int pipe_error = errno;
+        if (spawn_error_pipe[0] >= 0) ::close(spawn_error_pipe[0]);
+        if (spawn_error_pipe[1] >= 0) ::close(spawn_error_pipe[1]);
+        ::close(input_socket[0]);
+        ::close(input_socket[1]);
+        ::close(output_pipe[0]);
+        ::close(output_pipe[1]);
+        launch_error_ = std::string("executor error pipe failed: ") +
+                        std::strerror(pipe_error);
+        release_executor_slot();
+        return;
+    }
+
+    const long configured_open_max = ::sysconf(_SC_OPEN_MAX);
+    const int open_max = configured_open_max > 4 &&
+                         configured_open_max <= std::numeric_limits<int>::max()
+        ? static_cast<int>(configured_open_max)
+        : 65536;
+
+#  if defined(__linux__)
+    cpu_set_t child_affinity;
+    CPU_ZERO(&child_affinity);
+    for (const int cpu : config_.cpu_affinity) {
+        if (cpu < 0 || cpu >= CPU_SETSIZE) {
+            ::close(spawn_error_pipe[0]);
+            ::close(spawn_error_pipe[1]);
+            ::close(input_socket[0]);
+            ::close(input_socket[1]);
+            ::close(output_pipe[0]);
+            ::close(output_pipe[1]);
+            launch_error_ = "executor CPU is outside CPU_SETSIZE: " +
+                            std::to_string(cpu);
+            release_executor_slot();
+            return;
+        }
+        CPU_SET(cpu, &child_affinity);
+    }
+#  endif
+
+    child = ::fork();
+    if (child == 0) {
+        // Only async-signal-safe operations are used between fork and exec.
+        // Apply affinity before descriptor cleanup or dynamic loader startup,
+        // so the executor never consumes the model's reserved CPUs.
+#  if defined(__linux__)
+        if (!config_.cpu_affinity.empty() &&
+            ::sched_setaffinity(0, sizeof(child_affinity), &child_affinity) != 0) {
+            report_child_spawn_error(spawn_error_pipe[1], errno);
+        }
+#  endif
+        if (::setpgid(0, 0) != 0) {
+            report_child_spawn_error(spawn_error_pipe[1], errno);
+        }
+        if (::dup2(input_socket[1], STDIN_FILENO) < 0 ||
+            ::dup2(output_pipe[1], STDOUT_FILENO) < 0) {
+            report_child_spawn_error(spawn_error_pipe[1], errno);
+        }
+        if (spawn_error_pipe[1] != STDERR_FILENO + 1 &&
+            ::dup2(spawn_error_pipe[1], STDERR_FILENO + 1) < 0) {
+            report_child_spawn_error(spawn_error_pipe[1], errno);
+        }
+        const int child_error_fd = STDERR_FILENO + 1;
+        if (::fcntl(child_error_fd, F_SETFD, FD_CLOEXEC) != 0) {
+            report_child_spawn_error(child_error_fd, errno);
+        }
+        // The executor receives only stdin/stdout/stderr. In particular, it
+        // cannot retain listening sockets, live clients, model IPC pipes, or
+        // accelerator descriptors from the long-running server.
+        close_child_descriptors_from_four(open_max);
+        ::execve(config_.executor_path.c_str(), argv.data(), env.data());
+        report_child_spawn_error(child_error_fd, errno);
+    }
+
+    const int fork_error = child < 0 ? errno : 0;
+    ::close(input_socket[1]);
+    ::close(output_pipe[1]);
+    ::close(spawn_error_pipe[1]);
+    if (child < 0) {
+        launch_error_ = std::string("executor spawn failed: ") +
+                        std::strerror(fork_error);
+        ::close(input_socket[0]);
+        ::close(output_pipe[0]);
+        ::close(spawn_error_pipe[0]);
+        release_executor_slot();
+        return;
+    }
+
+    int child_spawn_error = 0;
+    size_t error_bytes = 0;
+    while (error_bytes < sizeof(child_spawn_error)) {
+        const ssize_t count = ::read(
+            spawn_error_pipe[0],
+            reinterpret_cast<char *>(&child_spawn_error) + error_bytes,
+            sizeof(child_spawn_error) - error_bytes);
+        if (count > 0) {
+            error_bytes += static_cast<size_t>(count);
+            continue;
+        }
+        if (count < 0 && errno == EINTR) continue;
+        break;
+    }
+    ::close(spawn_error_pipe[0]);
+    if (error_bytes != 0) {
+        int child_status = 0;
+        while (::waitpid(child, &child_status, 0) < 0 && errno == EINTR) {}
+        ::close(input_socket[0]);
+        ::close(output_pipe[0]);
+        launch_error_ = error_bytes == sizeof(child_spawn_error)
+            ? std::string("executor spawn failed: ") +
+                  std::strerror(child_spawn_error)
+            : "executor spawn failed: incomplete child error";
+        release_executor_slot();
+        return;
+    }
+#  endif
 
 #  if defined(__linux__)
     if (!config_.cpu_affinity.empty()) {
@@ -868,18 +998,9 @@ void ToolSpeculationAttempt::start() {
             ::close(input_socket[0]);
             ::close(output_pipe[0]);
             launch_error_ = std::move(affinity_error);
+            release_executor_slot();
             return;
         }
-    }
-#  else
-    if (!config_.cpu_affinity.empty()) {
-        signal_executor_process_group(child, SIGKILL);
-        int child_status = 0;
-        while (::waitpid(child, &child_status, 0) < 0 && errno == EINTR) {}
-        ::close(input_socket[0]);
-        ::close(output_pipe[0]);
-        launch_error_ = "tool CPU affinity isolation is supported only on Linux";
-        return;
     }
 #  endif
 
@@ -909,6 +1030,7 @@ json ToolSpeculationAttempt::base_metadata() const {
     json metadata = {
         {"protocol", "dflash.tool-speculation.v1"},
         {"confidence", prediction_.confidence},
+        {"authoritative", prediction_.authoritative},
         {"prediction", {
             {"name", prediction_.call.name},
             {"arguments", prediction_.call.arguments},
@@ -977,26 +1099,31 @@ void ToolSpeculationAttempt::terminate_executor(bool allow_control_grace) {
             return false;
         };
         const int grace_ms = std::max(0, config_.cancel_grace_ms);
+        bool reaped = false;
         if (allow_control_grace && wait_until(
                 std::chrono::steady_clock::now() +
                 std::chrono::milliseconds(grace_ms))) {
             // The executor contract does not permit detached descendants.
             // Clean up any process that outlived its group leader.
             signal_executor_process_group(pid, SIGKILL, false);
-            return;
+            reaped = true;
         }
-        signal_executor_process_group(pid, SIGTERM);
-        const int term_grace_ms = allow_control_grace
-            ? std::min(20, grace_ms) : grace_ms;
-        if (wait_until(std::chrono::steady_clock::now() +
-                       std::chrono::milliseconds(term_grace_ms))) {
-            signal_executor_process_group(pid, SIGKILL, false);
-            return;
+        if (!reaped) {
+            signal_executor_process_group(pid, SIGTERM);
+            const int term_grace_ms = allow_control_grace
+                ? std::min(20, grace_ms) : grace_ms;
+            if (wait_until(std::chrono::steady_clock::now() +
+                           std::chrono::milliseconds(term_grace_ms))) {
+                signal_executor_process_group(pid, SIGKILL, false);
+                reaped = true;
+            }
         }
-        int status = 0;
-        signal_executor_process_group(pid, SIGKILL);
-        while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
-        child_pid_ = -1;
+        if (!reaped) {
+            int status = 0;
+            signal_executor_process_group(pid, SIGKILL);
+            while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+            child_pid_ = -1;
+        }
     }
 #endif
     running_ = false;
@@ -1017,10 +1144,15 @@ bool ToolSpeculationAttempt::collect_executor_result(
     // The result budget starts when the authoritative call is known, so a
     // long target generation (seconds to minutes) cannot expire a finished
     // result. An absolute lifetime cap still bounds runaway executors.
+    using Milliseconds = std::chrono::milliseconds;
+    const Milliseconds result_timeout{
+        static_cast<Milliseconds::rep>(std::max(1, config_.timeout_ms))};
+    const Milliseconds lifetime_timeout{
+        result_timeout.count() *
+        static_cast<Milliseconds::rep>(kExecutorLifetimeMultiplier)};
     const auto deadline = std::min(
-        wait_started + std::chrono::milliseconds(std::max(1, config_.timeout_ms)),
-        started_at_ + std::chrono::milliseconds(
-            std::max(1, config_.timeout_ms) * kExecutorLifetimeMultiplier));
+        wait_started + result_timeout,
+        started_at_ + lifetime_timeout);
     if (wait_started >= deadline) {
         error = "executor_timeout";
         terminate_executor();
@@ -1102,8 +1234,11 @@ bool ToolSpeculationAttempt::collect_executor_result(
             if (errno == EINTR) continue;
             error = std::string("executor_wait_failed: ") +
                     std::strerror(errno);
+            signal_executor_process_group(
+                static_cast<pid_t>(child_pid_), SIGKILL, false);
             child_pid_ = -1;
             running_ = false;
+            release_executor_slot();
             return false;
         }
         if (std::chrono::steady_clock::now() >= deadline) {
@@ -1136,6 +1271,22 @@ bool ToolSpeculationAttempt::collect_executor_result(
             return false;
         }
         result = envelope["result"];
+        if (result.is_object() && result.contains(kFreshUntilUnixMsField)) {
+            const json & fresh_until = result[kFreshUntilUnixMsField];
+            if (!fresh_until.is_number_integer() &&
+                !fresh_until.is_number_unsigned()) {
+                error = "executor_invalid_freshness_deadline";
+                return false;
+            }
+            const int64_t fresh_until_ms = fresh_until.get<int64_t>();
+            const int64_t now_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+            if (fresh_until_ms < now_ms) {
+                error = "executor_result_expired";
+                return false;
+            }
+        }
         error.clear();
         return true;
     } catch (const std::exception & exception) {

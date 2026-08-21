@@ -5,6 +5,12 @@
 #include "rocmfp2_mix.cuh"
 #include "rocmfp3_mix.cuh"
 
+static thread_local size_t g_mmq_launch_count = 0;
+
+extern "C" size_t ggml_backend_cuda_get_mmq_launch_count(void) {
+    return g_mmq_launch_count;
+}
+
 namespace {
 
 class mix_registry_dispatch_guard {
@@ -40,6 +46,7 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
         args.type_x == GGML_TYPE_Q2_1_ROCMFP2_MIX ||
         args.type_x == GGML_TYPE_Q3_1_ROCMFP3_MIX;
     GGML_ASSERT(!is_mix_type || (args.mix_codebooks && args.mix_modes));
+    ++g_mmq_launch_count;
     switch (args.type_x) {
         case GGML_TYPE_Q4_0:
             mul_mat_q_case<GGML_TYPE_Q4_0>(ctx, args, stream);
@@ -510,6 +517,62 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
 #ifdef GGML_CUDA_FORCE_CUBLAS
     return false;
 #endif // GGML_CUDA_FORCE_CUBLAS
+
+#ifdef ROCMFP2_AFFINE
+    // The affine Q8_1 tile loader carries scale and -offset and uses the
+    // activation sum correction. Keep it opt-in until model-level validation.
+    if (type == GGML_TYPE_Q2_0_ROCMFP2 &&
+        std::getenv("DFLASH_CUDA_MMQ_FP2_AFFINE") == nullptr) {
+        return false;
+    }
+    // Batched expert MMQ is finite with the affine correction, but its
+    // gather/quantize path is slower than grouped MMVQ at DS4 verify width.
+    if (type == GGML_TYPE_Q2_0_ROCMFP2 && n_experts > 1) {
+        return false;
+    }
+    if (type == GGML_TYPE_Q2_0_ROCMFP2) {
+        const char * runtime_disable = std::getenv(
+            "DFLASH_CUDA_MMQ_FP2_AFFINE_RUNTIME_DISABLE");
+        if (runtime_disable && *runtime_disable &&
+            std::strcmp(runtime_disable, "0") != 0) {
+            return false;
+        }
+    }
+    if (type == GGML_TYPE_Q2_0_ROCMFP2) {
+        // Owner-isolation/qualification switch. AMD architecture codes are
+        // accepted in decimal or 0x form (for example 0x1100 or 0x1151).
+        static const int required_cc = [] {
+            const char * raw = std::getenv(
+                "DFLASH_CUDA_MMQ_FP2_AFFINE_CC");
+            if (!raw || !*raw) return 0;
+            char * end = nullptr;
+            const long parsed = std::strtol(raw, &end, 0);
+            return end && end != raw && *end == '\0' && parsed > 0 &&
+                           parsed <= INT_MAX
+                ? (int) parsed
+                : 0;
+        }();
+        if (required_cc > 0 && cc != required_cc) {
+            return false;
+        }
+    }
+    if (type == GGML_TYPE_Q2_0_ROCMFP2) {
+        static const int min_ncols = [] {
+            const char * raw = std::getenv(
+                "DFLASH_CUDA_MMQ_FP2_AFFINE_MIN_NCOLS");
+            if (!raw || !*raw) return 0;
+            char * end = nullptr;
+            const long parsed = std::strtol(raw, &end, 10);
+            return end && end != raw && *end == '\0' && parsed > 0 &&
+                           parsed <= INT_MAX
+                ? (int) parsed
+                : 0;
+        }();
+        if (ne11 < min_ncols) {
+            return false;
+        }
+    }
+#endif // ROCMFP2_AFFINE
 
     bool mmq_supported;
 

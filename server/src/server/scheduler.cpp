@@ -138,7 +138,13 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         for (size_t i = 0; i < drains.size();) {
             DrainJob & d = drains[i];
             const size_t pending_before = d.send_buffer.pending();
-            const bool ok = d.send_buffer.flush(d.fd);
+            bool ok = false;
+            if (d.job) {
+                std::lock_guard<std::mutex> lock(d.job->write_mu);
+                ok = d.send_buffer.flush(d.fd);
+            } else {
+                ok = d.send_buffer.flush(d.fd);
+            }
             if (d.send_buffer.pending() < pending_before) {
                 d.deadline = std::chrono::steady_clock::now() +
                              kClientStallTimeout;
@@ -311,7 +317,12 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         // until they are out (or the drain gives up).
         bool drained = s.client_disconnected;
         if (!drained) {
-            drained = s.send_buffer.flush(s.fd) ? s.send_buffer.empty() : true;
+            if (s.job) {
+                std::lock_guard<std::mutex> lock(s.job->write_mu);
+                drained = s.send_buffer.flush(s.fd) ? s.send_buffer.empty() : true;
+            } else {
+                drained = s.send_buffer.flush(s.fd) ? s.send_buffer.empty() : true;
+            }
         }
         if (drained) {
             finish_job(s.job);
@@ -689,7 +700,12 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             for (int i = 0; i < n_slots; i++) {
                 SchedSlot & s = slots[(size_t)i];
                 if (!s.job || s.client_disconnected) continue;
-                if (!s.send_buffer.flush(s.fd)) {
+                bool flush_ok = false;
+                {
+                    std::lock_guard<std::mutex> lock(s.job->write_mu);
+                    flush_ok = s.send_buffer.flush(s.fd);
+                }
+                if (!flush_ok) {
                     s.client_disconnected = true;
                     s.finished = true;
                     continue;

@@ -43,6 +43,10 @@ struct CanonicalToolInvocation {
 struct ToolSpeculationPrediction {
     CanonicalToolInvocation call;
     double confidence = 0.0;
+    // Set only after the model has emitted this exact call in its token
+    // stream. Request-supplied predictions are never authoritative, even
+    // when the caller reports confidence 1.0.
+    bool authoritative = false;
 };
 
 // Construct a canonical prediction from an engine-side predictor. This is
@@ -137,6 +141,7 @@ struct ToolSpeculationConfig {
     int timeout_ms = 60000;
     // Server-wide cap on concurrently running executor children. New
     // attempts beyond the cap are deferred (reason "executor_saturated").
+    // Zero disables the cap.
     int max_concurrent_executors = 16;
     int cancel_grace_ms = 100;
     size_t max_result_bytes = 1024 * 1024;
@@ -148,8 +153,8 @@ struct ToolSpeculationConfig {
     std::vector<int> model_cpu_affinity;
     bool cpu_affinity_isolated = false;
     // An executor plus an allowlist enables the lane. A measured resource
-    // profile is only required for speculative (confidence < 1) launches;
-    // authoritative calls dispatched from the model's own stream are admitted
+    // profile is required for every request-supplied prediction. Calls marked
+    // authoritative by the engine after exact model emission are admitted
     // without one.
     bool enabled() const {
         return !executor_path.empty() && !allowed_tools.empty();

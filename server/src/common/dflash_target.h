@@ -62,6 +62,14 @@ struct DFlashTarget {
     // When true, verify_batch captures intermediates and rollback_to() works.
     virtual bool supports_fast_rollback() const { return false; }
 
+    // Whether fast rollback is an exact, low-overhead device-side commit for
+    // which the replay breakeven threshold does not apply.
+    virtual bool exact_fast_rollback() const { return false; }
+
+    // Whether restore+replay remains safe after rollback_to() returns false.
+    // In-place commit implementations override this while active.
+    virtual bool rollback_failure_is_recoverable() const { return true; }
+
     // Roll back recurrent state to position `commit_n` within the last
     // verify batch (0-indexed). Uses SSM intermediate states captured during
     // verify. Also truncates KV to `base_pos + commit_n`. No replay needed.
@@ -69,6 +77,11 @@ struct DFlashTarget {
     virtual bool rollback_to(int base_pos, int commit_n) {
         (void)base_pos; (void)commit_n; return false;
     }
+
+    // Flush any accepted recurrent factors intentionally left pending for
+    // fusion with the next verify. Called once before a successful decode
+    // returns (EOS, cancellation, or token budget).
+    virtual bool finish_speculative_state() { return true; }
 
     // ── DDTree tree-structured verify ───────────────────────────────
     // Whether this target can verify a draft tree (ancestor-masked batched

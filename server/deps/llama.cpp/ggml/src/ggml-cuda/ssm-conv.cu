@@ -244,7 +244,148 @@ static void ssm_conv_f32_cuda(const float * src0, const float * src1, const int 
     }
 }
 
+template <int d_conv>
+static __global__ void ssm_conv_specla_hld_f32(
+        const float * __restrict__ x,          // [d_inner, n_t]
+        const float * __restrict__ weight,     // [d_conv, d_inner]
+        float * __restrict__ state,            // [d_conv-1, d_inner]
+        const int * __restrict__ meta,
+        const int64_t * __restrict__ factor_ptrs,
+        float * __restrict__ packed,
+        int d_inner,
+        int n_t,
+        int n_layers,
+        int layer,
+        int pending_bank,
+        int n_chains,
+        int wave) {
+    const int wave_chain = blockIdx.x;
+    const int channel = blockIdx.y * blockDim.x + threadIdx.x;
+    if (channel >= d_inner) return;
+
+    const int order_off    = meta[6];
+    const int offsets_off  = meta[7];
+    const int parent_off   = meta[8];
+    const int boundary_off = meta[9];
+    const int wave_off     = meta[10];
+    int chain = 0;
+    while (chain < n_chains && meta[wave_off + chain] < wave) ++chain;
+    chain += wave_chain;
+    if (chain >= n_chains || meta[wave_off + chain] != wave) return;
+
+    float window[d_conv - 1];
+    const float * pending_x = (const float *)(uintptr_t)
+        factor_ptrs[pending_bank*4 + 3];
+    float * current_x = (float *)(uintptr_t)
+        factor_ptrs[(1 - pending_bank)*4 + 3];
+    const int parent_boundary = meta[parent_off + chain];
+    if (parent_boundary < 0) {
+#pragma unroll
+        for (int j = 0; j < d_conv - 1; ++j) {
+            window[j] = state[(size_t)channel * (d_conv - 1) + j];
+        }
+        // Delayed commit: compact accepted inputs from the preceding verify
+        // are consumed before the current root chain. Only this committed
+        // window is written to durable state.
+        const int pending_count = meta[5];
+        for (int t = 0; t < pending_count; ++t) {
+#pragma unroll
+            for (int j = 0; j < d_conv - 2; ++j) window[j] = window[j + 1];
+            window[d_conv - 2] = pending_x[
+                (size_t)channel + (size_t)d_inner*(layer + (size_t)n_layers*t)];
+        }
+#pragma unroll
+        for (int j = 0; j < d_conv - 1; ++j) {
+            state[(size_t)channel * (d_conv - 1) + j] = window[j];
+        }
+    } else {
+        const size_t boundary_base =
+            ((size_t)n_t + (size_t)parent_boundary*(d_conv - 1))*d_inner;
+#pragma unroll
+        for (int j = 0; j < d_conv - 1; ++j) {
+            window[j] = packed[boundary_base + (size_t)j*d_inner + channel];
+        }
+    }
+
+    const int begin = meta[offsets_off + chain];
+    const int end   = meta[offsets_off + chain + 1];
+    for (int p = begin; p < end; ++p) {
+        const int node = meta[order_off + p];
+        const float x_val = x[(size_t)node*d_inner + channel];
+        float sum = 0.0f;
+#pragma unroll
+        for (int j = 0; j < d_conv - 1; ++j) {
+            sum += window[j] * weight[(size_t)channel*d_conv + j];
+        }
+        sum += x_val * weight[(size_t)channel*d_conv + d_conv - 1];
+        packed[(size_t)node*d_inner + channel] =
+            ggml_cuda_op_silu_single(sum);
+        current_x[(size_t)channel +
+            (size_t)d_inner*(layer + (size_t)n_layers*node)] = x_val;
+
+#pragma unroll
+        for (int j = 0; j < d_conv - 2; ++j) window[j] = window[j + 1];
+        window[d_conv - 2] = x_val;
+        const int boundary = meta[boundary_off + node];
+        if (boundary >= 0) {
+            const size_t boundary_base =
+                ((size_t)n_t + (size_t)boundary*(d_conv - 1))*d_inner;
+#pragma unroll
+            for (int j = 0; j < d_conv - 1; ++j) {
+                packed[boundary_base + (size_t)j*d_inner + channel] = window[j];
+            }
+        }
+    }
+}
+
+static void ssm_conv_specla_hld_cuda(ggml_backend_cuda_context & ctx,
+                                      ggml_tensor * dst) {
+    ggml_tensor * x         = dst->src[0];
+    ggml_tensor * weight    = dst->src[1];
+    ggml_tensor * state     = dst->src[2];
+    ggml_tensor * hld       = dst->src[3];
+    ggml_tensor * factor_ptrs = dst->src[4];
+    const int d_conv  = (int)weight->ne[0];
+    const int d_inner = (int)x->ne[0];
+    const int n_t     = (int)x->ne[1];
+    const int n_chains = ggml_get_op_params_i32(dst, 2);
+    const int n_waves  = ggml_get_op_params_i32(dst, 3);
+    const int n_layers = ggml_get_op_params_i32(dst, 4);
+    const int layer = ggml_get_op_params_i32(dst, 5);
+    const int pending_bank = ggml_get_op_params_i32(dst, 6);
+    const int max_parallel_chains = ggml_get_op_params_i32(dst, 7);
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_F32);
+    GGML_ASSERT(state->type == GGML_TYPE_F32 && factor_ptrs->type == GGML_TYPE_I64);
+    GGML_ASSERT(hld->type == GGML_TYPE_I32 && n_chains > 0 && n_waves > 0);
+
+    const dim3 block(128);
+    const dim3 grid((unsigned)max_parallel_chains,
+                    (unsigned)((d_inner + 127)/128), 1);
+    auto launch = [&](auto DC, int wave) {
+        constexpr int kDC = decltype(DC)::value;
+        ssm_conv_specla_hld_f32<kDC><<<grid, block, 0, ctx.stream()>>>(
+            (const float *)x->data, (const float *)weight->data,
+            (float *)state->data, (const int *)hld->data,
+            (const int64_t *)factor_ptrs->data, (float *)dst->data,
+            d_inner, n_t, n_layers, layer, pending_bank, n_chains, wave);
+    };
+    for (int wave = 0; wave < n_waves; ++wave) {
+        switch (d_conv) {
+            case 3: launch(std::integral_constant<int, 3>{}, wave); break;
+            case 4: launch(std::integral_constant<int, 4>{}, wave); break;
+            case 5: launch(std::integral_constant<int, 5>{}, wave); break;
+            case 9: launch(std::integral_constant<int, 9>{}, wave); break;
+            default: GGML_ABORT("SpecLA ssm_conv supports kernel sizes 3, 4, 5, 9.");
+        }
+    }
+}
+
 void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * silu_dst) {
+    if (ggml_get_op_params_i32(dst, 0) == 1) {
+        GGML_ASSERT(silu_dst == nullptr);
+        ssm_conv_specla_hld_cuda(ctx, dst);
+        return;
+    }
     const struct ggml_tensor * src0 = dst->src[0];  // conv_x
     const struct ggml_tensor * src1 = dst->src[1];  // conv1d.weight
     // dflash27b_ggml: optional src[2] = parent_ids (i32) enables tree mode

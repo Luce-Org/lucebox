@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Launch the PR#614 build (DeepSeek-V4-0731 + DSpark on R9700+Strix) with the
-# native Qwen3-0.6B tool predictor and the terminal-bench docker-exec executor
-# on the reserved CPU lane. Mirrors run_native_cpu_server_lucebox5.sh.
+# Launch the slim PR#614 build (DeepSeek-V4-0731 + DSpark on R9700+Strix) with
+# model-emitted early dispatch and the public-REST executor on the reserved CPU
+# lane. The superseded native Qwen predictor is intentionally not part of this
+# path.
 set -euo pipefail
 root="/home/lucebox5"
 experiment="$root/tool-spec-cpu-20260813"
@@ -9,15 +10,18 @@ tb="$root/tbspec"
 launcher="$experiment/run-deepseek-0731-cpu-tool.sh"
 executor="${TBSPEC_EXECUTOR:-$tb/tb_tool_executor.py}"
 profile="$root/codex-pr614-simplify-20260818/optimizations/ooo_spec_lucebox5_cpu/profiles/lucebox5-cpu-lane-qualified.json"
-allowed="${TBSPEC_ALLOW:-read_file,list_dir,search_files}"
+allowed="${TBSPEC_ALLOW:-geocode_city,get_weather,country_info,wikipedia_summary,exchange_rate}"
 native_wrapper_dir="$tb/wrapper"
 candidate_build="$(readlink -f "$native_wrapper_dir/candidate-build")"
-predictor_model="$experiment/models/Qwen3-0.6B-Q8_0.gguf"
 for f in "$launcher" "$executor" "$native_wrapper_dir/dflash_server" "$candidate_build/dflash_server" "$candidate_build/backend_ipc_daemon"; do
   [[ -x "$f" ]] || { echo "not executable: $f" >&2; exit 2; }
 done
-[[ -f "$profile" && -f "$predictor_model" ]] || { echo "missing data file" >&2; exit 2; }
+[[ -f "$profile" ]] || { echo "missing data file: $profile" >&2; exit 2; }
 if pgrep -x dflash_server >/dev/null; then echo "dflash_server already running" >&2; exit 75; fi
+if [[ -e /dev/kfd ]]; then
+  command -v fuser >/dev/null || { echo "cannot verify /dev/kfd ownership: fuser missing" >&2; exit 2; }
+  if fuser -s /dev/kfd; then echo "/dev/kfd is already in use" >&2; exit 75; fi
+fi
 exec env -i \
   HOME="$root" USER="lucebox5" \
   PATH="$root/.local/bin:/opt/rocm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \

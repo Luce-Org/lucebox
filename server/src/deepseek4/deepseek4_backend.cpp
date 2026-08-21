@@ -6,6 +6,7 @@
 #include "deepseek4_internal.h"
 #include "common/dynamic_backend.h"
 #include "common/peer_access.h"
+#include "common/platform_env.h"
 #include "common/sampler.h"
 
 #if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
@@ -45,6 +46,68 @@ static bool env_flag_enabled(const char * name) {
     return value && value[0] && std::strcmp(value, "0") != 0;
 }
 
+struct AffineMmqPrefillScope {
+    bool active = false;
+
+    explicit AffineMmqPrefillScope(bool speculative_decode) {
+        // A dedicated phase-only switch matters here: setting the ordinary
+        // MMQ opt-in in the server environment exposes it while DSpark's
+        // persistent graphs are initialized, before this scope exists. Keep
+        // the master switch absent at startup and raise it only around the
+        // target prefill call.
+        static const bool configured =
+            env_flag_enabled("DFLASH_CUDA_MMQ_FP2_AFFINE_PREFILL_ONLY");
+        active = speculative_decode && configured;
+        set_enabled(true);
+    }
+
+    void set_enabled(bool enabled) {
+        if (!active) return;
+        if (enabled) {
+            set_environment_variable(
+                "DFLASH_CUDA_MMQ_FP2_AFFINE", "1", true);
+            unset_environment_variable(
+                "DFLASH_CUDA_MMQ_FP2_AFFINE_RUNTIME_DISABLE");
+        } else {
+            unset_environment_variable("DFLASH_CUDA_MMQ_FP2_AFFINE");
+            set_environment_variable(
+                "DFLASH_CUDA_MMQ_FP2_AFFINE_RUNTIME_DISABLE", "1", true);
+        }
+    }
+
+    ~AffineMmqPrefillScope() {
+        if (active) {
+            set_enabled(false);
+        }
+    }
+};
+
+struct PackedFp3DecodeScope {
+    bool active = false;
+
+    explicit PackedFp3DecodeScope(bool speculative_decode) {
+        // The packed FP3 MMVQ specialization is faster for q4 verification
+        // on gfx1151, but slower for the heterogeneous expert sub-batches
+        // used by bulk prefill. Keep the configured kernel available to the
+        // decoder while selecting the reference FP3 kernel during prefill.
+        active = speculative_decode &&
+            env_flag_enabled(
+                "DFLASH_CUDA_MMVQ_MOE_FP3_PACKED24_DECODE_ONLY") &&
+            env_flag_enabled("DFLASH_CUDA_MMVQ_MOE_FP3_PACKED24");
+        if (active) {
+            set_environment_variable(
+                "DFLASH_CUDA_MMVQ_MOE_FP3_PACKED24_RUNTIME_DISABLE",
+                "1", true);
+        }
+    }
+
+    ~PackedFp3DecodeScope() {
+        if (active) {
+            unset_environment_variable(
+                "DFLASH_CUDA_MMVQ_MOE_FP3_PACKED24_RUNTIME_DISABLE");
+        }
+    }
+};
 static bool positive_env_double(const char * name, double fallback,
                                 double & out, std::string * err) {
     out = fallback;
@@ -444,9 +507,16 @@ static uint64_t estimate_ds4_cache_bytes(const DeepSeek4Weights & w, int max_ctx
         total_bytes += window * head_dim * sizeof(float) * 2;
 
         if (ratio == 4) {
-            const size_t index_comp_width = (size_t) w.n_indexer_head * (size_t) w.n_indexer_head_dim;
-            total_bytes += comp_cap * index_comp_width * sizeof(uint16_t);
-            total_bytes += window * index_comp_width * sizeof(float) * 2;
+            // index_comp_kv is per-head: ne0 = n_indexer_head_dim (see
+            // deepseek4_graph.cpp). The full 64-head width lives only in the
+            // fixed-size state_kv/state_score scratch (index_state_rows rows),
+            // which does not scale with context. The old estimate multiplied
+            // by n_indexer_head here, overcounting 256K context by ~13x and
+            // falsely rejecting large contexts in hybrid placement.
+            total_bytes += comp_cap * (size_t) w.n_indexer_head_dim * sizeof(uint16_t);
+            total_bytes += window * (size_t) w.n_indexer_head_dim * sizeof(float) * 2;
+            total_bytes += (size_t) 2 * 2 * ratio * (size_t) w.n_indexer_head *
+                           (size_t) w.n_indexer_head_dim * sizeof(float);
         }
     }
 
@@ -584,6 +654,7 @@ static bool fill_profiled_hot_placement(const DeepSeek4Weights & w,
 static bool compute_ds4_hybrid_budget_info(const DeepSeek4Weights & w,
                                            ggml_backend_t backend,
                                            int max_ctx,
+                                           bool all_cold,
                                            Ds4HybridBudgetInfo & out,
                                            std::string * err) {
     out = {};
@@ -606,8 +677,11 @@ static bool compute_ds4_hybrid_budget_info(const DeepSeek4Weights & w,
         "deepseek4", out.gpu_free, out.gpu_total);
     out.kv_bytes = estimate_ds4_cache_bytes(w, max_ctx);
 
-    if (out.gpu_total > out.core_bytes + out.kv_bytes + out.warm_bytes + out.safety_bytes) {
-        out.expert_budget = out.gpu_total - out.core_bytes - out.kv_bytes - out.warm_bytes - out.safety_bytes;
+    // In all-cold mode the KV cache is owned by the secondary (Strix)
+    // backend, so it must not consume the primary GPU's expert budget.
+    const uint64_t main_charge = all_cold ? 0 : out.kv_bytes;
+    if (out.gpu_total > out.core_bytes + main_charge + out.warm_bytes + out.safety_bytes) {
+        out.expert_budget = out.gpu_total - out.core_bytes - main_charge - out.warm_bytes - out.safety_bytes;
     }
     if (out.expert_budget > out.mem.total_expert_bytes) {
         out.expert_budget = out.mem.total_expert_bytes;
@@ -674,7 +748,7 @@ DeepSeek4Backend::~DeepSeek4Backend() {
 }
 
 bool DeepSeek4Backend::requires_monolithic_model() const {
-    return cfg_.fused_decode ||
+    return cfg_.fused_decode || cfg_.fused_verify_f16_kv ||
            prefill_attention_mode_is_approximate(cfg_.prefill_mode);
 }
 
@@ -719,9 +793,11 @@ bool DeepSeek4Backend::load_model() {
         (force_full || need_monolithic)) {
         std::fprintf(stderr,
                      "[deepseek4] monolithic execution requested "
-                     "(forced=%s, fused_decode=%s, prefill=%s)\n",
+                     "(forced=%s, fused_decode=%s, "
+                     "fused_verify_f16_kv=%s, prefill=%s)\n",
                      force_full ? "yes" : "no",
                      cfg_.fused_decode ? "on" : "off",
+                     cfg_.fused_verify_f16_kv ? "on" : "off",
                      prefill_attention_mode_name(cfg_.prefill_mode));
         if (!load_deepseek4_gguf(cfg_.model_path, backend_, w_)) {
             if (prefill_attention_mode_is_approximate(cfg_.prefill_mode)) {
@@ -758,10 +834,16 @@ bool DeepSeek4Backend::load_model() {
     }
     w_.routed_expert_top_k = cfg_.expert_top_k;
     w_.fused_decode = cfg_.fused_decode && !moe_hybrid_;
+    w_.fused_verify_f16_kv = cfg_.fused_verify_f16_kv && !moe_hybrid_;
     if (cfg_.fused_decode && moe_hybrid_) {
         std::fprintf(stderr,
                      "[deepseek4] fused decode unavailable with hybrid expert placement; "
                      "using layered decode\n");
+    }
+    if (cfg_.fused_verify_f16_kv && moe_hybrid_) {
+        std::fprintf(stderr,
+                     "[deepseek4] fused verifier F16 K/V unavailable with hybrid "
+                     "expert placement; using F32 verifier attention\n");
     }
     return true;
 }
@@ -1105,11 +1187,12 @@ bool DeepSeek4Backend::compute_uniform_hybrid_placement(const DeepSeek4Weights &
                                                        std::string * err) const {
     if (decode_out) *decode_out = {};
     Ds4HybridBudgetInfo budget;
-    if (!compute_ds4_hybrid_budget_info(w, backend_, max_ctx, budget, err)) {
+    const Ds4MoeTpConfig tp = ds4_moe_tp_config(cfg_.device.gpu);
+    if (!compute_ds4_hybrid_budget_info(w, backend_, max_ctx,
+                                        tp.all_on_secondary, budget, err)) {
         return false;
     }
 
-    const Ds4MoeTpConfig tp = ds4_moe_tp_config(cfg_.device.gpu);
     int hot_per_layer = tp.all_on_secondary ? 0 : budget.max_hot_per_layer;
     if (tp.all_on_secondary) {
         std::fprintf(stderr,
@@ -1188,6 +1271,11 @@ bool DeepSeek4Backend::compute_uniform_hybrid_placement(const DeepSeek4Weights &
                 0, w.n_expert, balance_cfg.min_hot_per_layer, err)) {
             return false;
         }
+        if (!env_int_in_range(
+                "DFLASH_DS4_TP_BALANCE_MAX_HOT", 0,
+                0, w.n_expert, balance_cfg.max_hot_per_layer, err)) {
+            return false;
+        }
 
         std::vector<uint64_t> main_fixed_bytes((size_t) w.n_layer, 0);
         for (int il = 0; il < w.n_layer; ++il) {
@@ -1239,9 +1327,10 @@ bool DeepSeek4Backend::compute_uniform_hybrid_placement(const DeepSeek4Weights &
             : (double) out.total_hot / (double) out.hot_counts.size();
         std::fprintf(stderr,
                      "[deepseek4] hybrid critical-path placement: "
-                     "profile=%s active=%d main/peer=%.3f "
+                     "profile=%s active=%d main/peer=%.3f cap=%d "
                      "hot/layer=%.1f [%d,%d]\n",
                      balance_profile_path, active_experts, main_to_peer_rate,
+                     balance_cfg.max_hot_per_layer,
                      mean_hot,
                      min_hot != out.hot_counts.end() ? *min_hot : 0,
                      max_hot != out.hot_counts.end() ? *max_hot : 0);
@@ -1485,6 +1574,9 @@ bool DeepSeek4Backend::init_hybrid_model() {
             MoeHybridLayerStorage & layer = hybrid->layers[(size_t) il];
             layer.decode_hot_local_by_global.assign(
                 (size_t) w_.n_expert, -1);
+            layer.decode_cold_local_by_global.assign(
+                (size_t) w_.n_expert, -1);
+            std::vector<uint8_t> decode_hot((size_t) w_.n_expert, 0);
             for (int32_t expert :
                     moe_decode_placement_.hot_expert_ids[(size_t) il]) {
                 if (expert < 0 || expert >= w_.n_expert ||
@@ -1495,12 +1587,54 @@ bool DeepSeek4Backend::init_hybrid_model() {
                                  (int) expert, il);
                     return fail_hybrid_init();
                 }
-                layer.decode_hot_local_by_global[(size_t) expert] =
+                decode_hot[(size_t) expert] = 1;
+            }
+            for (int expert = 0; expert < w_.n_expert; ++expert) {
+                const int32_t hot =
                     layer.hot_local_by_global[(size_t) expert];
+                const int32_t cold =
+                    layer.cold_local_by_global[(size_t) expert];
+                if (decode_hot[(size_t) expert]) {
+                    layer.decode_hot_local_by_global[(size_t) expert] = hot;
+                } else if (cold >= 0) {
+                    layer.decode_cold_local_by_global[(size_t) expert] = cold;
+                } else if (hot >= 0) {
+                    // A resident-only expert cannot move to the secondary
+                    // owner, so retain it on the primary during decode.
+                    layer.decode_hot_local_by_global[(size_t) expert] = hot;
+                } else {
+                    std::fprintf(stderr,
+                                 "[deepseek4] decode expert %d in layer %d "
+                                 "has no resident owner\n",
+                                 expert, il);
+                    return fail_hybrid_init();
+                }
             }
         }
     }
 
+    if (env_flag_enabled("DFLASH_DS4_DECODE_ALL_COLD")) {
+        for (int il = 0; il < w_.n_layer; ++il) {
+            MoeHybridLayerStorage & layer = hybrid->layers[(size_t) il];
+            if (layer.cold_local_by_global.size() !=
+                (size_t) w_.n_expert ||
+                std::any_of(layer.cold_local_by_global.begin(),
+                            layer.cold_local_by_global.end(),
+                            [](int32_t local) { return local < 0; })) {
+                std::fprintf(stderr,
+                             "[deepseek4] decode-all-cold requires a full "
+                             "secondary expert stack (layer=%d)\n", il);
+                return fail_hybrid_init();
+            }
+            layer.decode_hot_local_by_global.assign(
+                (size_t) w_.n_expert, -1);
+            layer.decode_cold_local_by_global =
+                layer.cold_local_by_global;
+        }
+        std::fprintf(stderr,
+                     "[deepseek4] speculative verifier routes all experts "
+                     "to the duplicated secondary stack\n");
+    }
     if (hybrid->has_mmap() && !hybrid->materialized_cold_experts) {
         size_t max_expert_bytes = 0;
         for (const auto & layer : hybrid->layers) {
@@ -1665,7 +1799,16 @@ int deepseek4_hybrid_prefill_chunk_tokens(
         int context_end,
         int current_cap) {
     constexpr int long_context_begin = 4096;
-    constexpr int long_context_chunk = 1024;
+    static const int long_context_chunk = [] {
+        const char * raw = std::getenv("DFLASH_DS4_LONG_CONTEXT_CHUNK");
+        if (!raw || !*raw) return 1024;
+        char * end = nullptr;
+        const long parsed = std::strtol(raw, &end, 10);
+        return end && end != raw && *end == '\0' && parsed > 0 &&
+                       parsed <= DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS
+            ? (int) parsed
+            : 1024;
+    }();
     int bounded = std::max(1, requested_chunk);
     if (current_cap > 0) {
         bounded = std::min(bounded, current_cap);
@@ -1675,6 +1818,46 @@ int deepseek4_hybrid_prefill_chunk_tokens(
         : bounded;
 }
 
+int deepseek4_hybrid_prefill_step_tokens(
+        int configured_chunk,
+        int position,
+        int remaining_tokens) {
+    // Late-context pressure bound: below this position full-width chunks
+    // are used; at/above it chunks shrink to late_context_chunk. 32768 is
+    // the conservative default (the 2K attention arena needs ~1.19 GiB at
+    // ~80K and hits a fragmentation cliff on a 10.2 GB budget); operators
+    // with more headroom may raise it (DFLASH_DS4_LATE_CONTEXT_BEGIN).
+    static const int late_context_begin = [] {
+        const char * raw = std::getenv("DFLASH_DS4_LATE_CONTEXT_BEGIN");
+        if (!raw || !*raw) return 32768;
+        char * end = nullptr;
+        const long parsed = std::strtol(raw, &end, 10);
+        return end && end != raw && *end == '\0' && parsed > 0 &&
+                       parsed <= 262144
+            ? (int) parsed
+            : 32768;
+    }();
+    constexpr int late_context_chunk = 1024;
+    if (remaining_tokens <= 0) return 0;
+
+    int bounded = std::min(std::max(1, configured_chunk), remaining_tokens);
+    // Lower-residency expert placements have enough primary VRAM to retain a
+    // full 2K attention arena even at the context limit. Allow qualification
+    // runs for those placements to bypass the conservative pressure bound.
+    if (env_flag_enabled("DFLASH_DS4_DISABLE_ADAPTIVE_PREFILL")) {
+        return bounded;
+    }
+    // Stop exactly on the boundary so a non-aligned prefix or restored
+    // snapshot cannot carry one oversized attention arena into the late
+    // context region.
+    if (position < late_context_begin &&
+        position + bounded > late_context_begin) {
+        return late_context_begin - position;
+    }
+    return position >= late_context_begin
+        ? std::min(bounded, late_context_chunk)
+        : bounded;
+}
 int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                                   const DaemonIO & io,
                                   int kv_offset,
@@ -1686,6 +1869,14 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
     const DeepSeek4RoctxRange roctx_range(
         "ds4.prefill",
         {phase, static_cast<int>(tokens.size()), 0, w_.n_layer, cfg_.device.gpu});
+    // The native affine MMQ loader is a large-prefill optimization. DSpark's
+    // fused verifier contains wider HC-expanded FP2 matmuls whose MMQ variant
+    // is not yet qualified. Keep the opt-in active throughout prefill, then
+    // disable it on every exit before speculative decode begins.
+    AffineMmqPrefillScope affine_mmq_scope(
+        spec_enabled_ && spec_drafter_ != nullptr);
+    PackedFp3DecodeScope packed_fp3_decode_scope(
+        spec_enabled_ && spec_drafter_ != nullptr);
     // The all-hot layer-range path supports causal chunked prefill. The
     // optimized graph snapshots the previous raw SWA window, attends over
     // that snapshot plus the current ubatch, and commits only the final SWA
@@ -1784,12 +1975,35 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
     const auto phase_t0 = Clock::now();
     DeepSeek4StepTelemetry tel_acc;
     int steps = 0;
+    bool capture_band_scratch_released = false;
 
     bool snapshot_saved = false;
+    bool late_context_chunk_logged = false;
     for (int i = 0; i < n_total;) {
         if (io.is_cancelled()) return pos;
 
-        int n_tok = std::min(chunk, n_total - i);
+        int n_tok = bound_hybrid_scratch
+            ? deepseek4_hybrid_prefill_step_tokens(chunk, pos, n_total - i)
+            : std::min(chunk, n_total - i);
+        if (!late_context_chunk_logged && n_tok < chunk &&
+            pos >= 32768 && n_total - i >= chunk) {
+            late_context_chunk_logged = true;
+            std::fprintf(stderr,
+                         "[deepseek4] late-context prefill pressure bound: "
+                         "chunk %d->%d at pos=%d\n",
+                         chunk, n_tok, pos);
+        }
+        // Keep the final heterogeneous band large enough for expert-major
+        // execution. A tiny (<512) remainder falls back to grouped
+        // mul_mat_id; the qualified affine MMQ path is deliberately disabled
+        // there and a full 256-expert duplicate stack makes that tail far more
+        // expensive than slightly rebalancing the preceding chunk.
+        const int tail_tokens = n_total - (i + n_tok);
+        if (moe_hybrid_ && spec_enabled_ && spec_drafter_ &&
+            tail_tokens > 0 && tail_tokens < 512 &&
+            n_tok >= 1024 - tail_tokens) {
+            n_tok -= 512 - tail_tokens;
+        }
         // A snapshot must represent an exact token boundary. Split a batched
         // prefill chunk when the requested boundary falls inside it.
         if (save_snapshot && !snapshot_saved &&
@@ -1804,6 +2018,24 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                 i, n_tok, spec_final_from, batch_final_capture,
                 save_snapshot && !snapshot_saved,
                 spec_snap_from, spec_snap_to);
+        }
+
+        // Bulk prompt graphs and the final DSpark feature-capture graph have
+        // different HC/owner arena shapes. Once all earlier chunks are
+        // complete, retire their reusable prefill arenas before entering the
+        // final capture band. Keeping both generations resident can cost more
+        // than 300 MiB and needlessly makes the highest-throughput expert
+        // placement fail only on the last chunk.
+        const bool entering_final_capture_band =
+            spec_enabled_ && spec_drafter_ && i > 0 &&
+            i + n_tok > spec_final_from;
+        if (entering_final_capture_band &&
+            !capture_band_scratch_released) {
+            deepseek4_release_prefill_scratch(cache_, moe_hybrid_.get());
+            capture_band_scratch_released = true;
+            std::fprintf(stderr,
+                         "[deepseek4] released bulk prefill scratch before "
+                         "final DSpark capture band\n");
         }
 
         // Embed tokens
@@ -1844,6 +2076,13 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
             spec_hooks.capture_token_end = capture_end;
             hp = &spec_hooks;
         }
+        // DSpark consumes the final SWA-width target features directly. Keep
+        // the high-throughput native affine MMQ on bulk chunks, but evaluate
+        // any feature-capture band through the established affine fallback so
+        // an experimental expert kernel cannot poison the speculative handoff.
+        static const bool affine_capture_enabled =
+            env_flag_enabled("DFLASH_CUDA_MMQ_FP2_AFFINE_CAPTURE");
+        affine_mmq_scope.set_enabled(hp == nullptr || affine_capture_enabled);
         if (moe_hybrid_ && (expert_runtime_.compute || expert_backend_)) {
             ok = deepseek4_step_layer_range(
                 backend_, cfg_.device.gpu, w_, cache_, hc_state,
@@ -1920,8 +2159,35 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
     }
     keep_spec_feature_tail(spec_feat_window_,
                            (size_t) std::max(0, w_.n_swa));
+    if (timing && spec_enabled_ && spec_drafter_ &&
+        !spec_feat_window_.empty()) {
+        size_t nonfinite = 0;
+        double square_sum = 0.0;
+        float min_value = std::numeric_limits<float>::infinity();
+        float max_value = -std::numeric_limits<float>::infinity();
+        for (float value : spec_feat_window_) {
+            if (!std::isfinite(value)) {
+                ++nonfinite;
+                continue;
+            }
+            square_sum += (double) value * (double) value;
+            min_value = std::min(min_value, value);
+            max_value = std::max(max_value, value);
+        }
+        const size_t finite = spec_feat_window_.size() - nonfinite;
+        std::fprintf(stderr,
+                     "[deepseek4] prefill DSpark feature tail: values=%zu "
+                     "nonfinite=%zu rms=%.4f min=%.4f max=%.4f\n",
+                     spec_feat_window_.size(), nonfinite,
+                     finite ? std::sqrt(square_sum / (double) finite) : 0.0,
+                     finite ? min_value : 0.0f,
+                     finite ? max_value : 0.0f);
+    }
     if (timing) {
         log_step_tel("prefill", n_total, steps, elapsed_s(phase_t0), tel_acc);
+    }
+    if (spec_enabled_ && spec_drafter_) {
+        deepseek4_release_prefill_scratch(cache_, moe_hybrid_.get());
     }
     return pos;
 }
@@ -2126,6 +2392,25 @@ GenerateResult DeepSeek4Backend::generate_from_state(
     // The DSpark verifier is greedy-only. Route sampling and penalties through
     // AR so the request's sampler contract is not silently ignored.
     const bool sampling_requires_ar = sampler_.needs_logit_processing();
+    // A drafter was loaded and the operator asked for spec decode, but this
+    // request routes to AR anyway. Say why, once: the DS4 model card defaults
+    // temperature to 1.0, so a request that merely OMITS temperature lands
+    // here — the server then decodes pure AR while the startup log still says
+    // "spec-decode ENABLED", which reads as a spec-engagement regression.
+    if (spec_enabled_ && spec_drafter_ && req.n_gen > 0 &&
+        (req.force_ar_decode || budget_requires_ar || sampling_requires_ar)) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            std::fprintf(stderr,
+                "[deepseek4] DSpark spec loaded but this request decodes AR: "
+                "force_ar=%d stop_tokens=%d sampling=%d (temp=%.2f rep_pen=%.2f "
+                "freq_pen=%.2f pres_pen=%.2f; greedy needs temperature 0)\n",
+                req.force_ar_decode ? 1 : 0, budget_requires_ar ? 1 : 0,
+                sampling_requires_ar ? 1 : 0, sampler_.temp,
+                sampler_.rep_pen, sampler_.freq_pen, sampler_.pres_pen);
+        }
+    }
     if (spec_enabled_ && spec_drafter_ && req.n_gen > 0 &&
         !req.force_ar_decode && !budget_requires_ar && !sampling_requires_ar) {
         if (last_logits_.empty()) {
@@ -2135,6 +2420,17 @@ GenerateResult DeepSeek4Backend::generate_from_state(
         int seed = 0;
         { float mv = last_logits_[0];
           for (int i = 1; i < w_.n_vocab; i++) if (last_logits_[i] > mv) { mv = last_logits_[i]; seed = i; } }
+        if (env_flag_enabled("DFLASH_DS4_TIMING")) {
+            size_t nonfinite_logits = 0;
+            for (float value : last_logits_) {
+                nonfinite_logits += !std::isfinite(value);
+            }
+            std::fprintf(stderr,
+                         "[deepseek4] speculative handoff: seed=%d "
+                         "seed_logit=%.6f nonfinite_logits=%zu\n",
+                         seed, last_logits_[(size_t) seed],
+                         nonfinite_logits);
+        }
         std::vector<int32_t> gen;
         gen.push_back(seed);
         out_io.emit(seed);
@@ -2310,6 +2606,18 @@ GenerateResult DeepSeek4Backend::restore_and_generate_impl(
                      "[pc] DeepSeek snapshot longer than prompt "
                      "(snap=%d > prompt=%zu) -- fresh prefill fallback\n",
                      snap_pos, req.prompt.size());
+        return generate_impl(req, io);
+    }
+    if (snap_pos == (int) req.prompt.size() &&
+        snapshot_aux_[slot].stale_logits) {
+        // A continuation-only snapshot has K/V state but no logits for the
+        // final cached token. With no prompt delta there is nothing to prefill
+        // to reconstruct those logits, so restore would fail on the first
+        // decode step. Recompute the prompt instead of treating the cache hit
+        // as a request failure.
+        std::fprintf(stderr,
+                     "[pc] DeepSeek stale-logit snapshot has no prompt delta "
+                     "(snap=%d) -- fresh prefill fallback\n", snap_pos);
         return generate_impl(req, io);
     }
     if (!snapshot_restore(slot)) {

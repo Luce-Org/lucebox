@@ -175,6 +175,21 @@ static ggml_tensor * new_like_with_expert_count(ggml_context * ctx, ggml_tensor 
 
 } // namespace
 
+void MoeHybridStorage::release_graph_caches() {
+    for (auto & layer : layers) {
+        layer.hot_graph.free();
+        layer.cold_graph.free();
+        for (auto & graph : layer.hot_graph_by_width) graph.free();
+        for (auto & graph : layer.cold_graph_by_width) graph.free();
+        layer.hot_graph_by_width.clear();
+        layer.cold_graph_by_width.clear();
+        layer.hot_batched_graph.free();
+        for (auto & graph : layer.hot_batched_mixed) graph.free();
+        for (auto & graph : layer.cold_batched_mixed) graph.free();
+        layer.shared_batched_graph.free();
+    }
+}
+
 MoeHybridStorage::~MoeHybridStorage() {
     // Registry entries point into the owner buffers, so remove them before the
     // buffers can be released or their addresses reused.
@@ -191,17 +206,8 @@ MoeHybridStorage::~MoeHybridStorage() {
         ggml_gallocr_free(prefill_cold_alloc);
         prefill_cold_alloc = nullptr;
     }
+    release_graph_caches();
     for (auto & layer : layers) {
-        layer.hot_graph.free();
-        layer.cold_graph.free();
-        for (auto & graph : layer.hot_graph_by_width) graph.free();
-        for (auto & graph : layer.cold_graph_by_width) graph.free();
-        layer.hot_graph_by_width.clear();
-        layer.cold_graph_by_width.clear();
-        layer.hot_batched_graph.free();
-        for (auto & g : layer.hot_batched_mixed) g.free();
-        for (auto & g : layer.cold_batched_mixed) g.free();
-        layer.shared_batched_graph.free();
         if (layer.hot_buf) {
             ggml_backend_buffer_free(layer.hot_buf);
             layer.hot_buf = nullptr;
@@ -331,6 +337,7 @@ bool build_moe_hybrid_storage(const MoeHybridConfig & cfg,
                 dst.cold_expert_ids.push_back((int32_t)expert);
             }
         }
+        dst.decode_cold_local_by_global = dst.cold_local_by_global;
 
         // Populate the model-sized VRAM bitmask from hot expert IDs.
         dst.reset_expert_vram_mask(cfg.n_expert);
@@ -547,6 +554,7 @@ bool build_moe_hybrid_storage_from_file(
                 }
             }
         }
+        dst.decode_cold_local_by_global = dst.cold_local_by_global;
 
         // Populate the model-sized VRAM bitmask from hot expert IDs.
         dst.reset_expert_vram_mask(cfg.n_expert);

@@ -18,6 +18,19 @@ namespace dflash::common {
 // estimated completion time. Returns zero for invalid inputs.
 int moe_balanced_main_slots_x4(int top_k, double main_to_peer_rate);
 
+// Select the phase-specific owner maps for ordinary routing, or the physical
+// residency maps required by dynamic route balancing. The peer physical map
+// must remain complete because it receives the exact complement of the
+// dynamically capped main-owner routes.
+struct MoeHybridOwnerMapView {
+    const std::vector<int32_t> * main = nullptr;
+    const std::vector<int32_t> * peer = nullptr;
+};
+
+MoeHybridOwnerMapView moe_hybrid_owner_maps(
+    const MoeHybridLayerStorage & storage,
+    bool dynamic_route_balance);
+
 // GPU-resident residual combine graph: output = residual + hot_out + cold_correction.
 struct ResidualCombineGraph {
     ggml_context * ctx = nullptr;
@@ -250,6 +263,8 @@ bool eval_moe_batched_prefill_ffn(
     int                             n_tokens,
     std::vector<float> &            out,
     std::string *                   err = nullptr);
+// Shared policy gate for paths that consume expert-major prefill outputs.
+bool moe_expert_major_prefill_enabled(int n_tokens);
 
 // Optional device-resident owner destinations for long heterogeneous prefill.
 // When present, the hot/shared and cold partials are copied directly into

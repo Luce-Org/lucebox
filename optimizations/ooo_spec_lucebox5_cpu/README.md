@@ -35,16 +35,19 @@ with `"automatic_tool_speculation": false`.
   executor is spawned without a shell, with a minimal environment, closed
   descriptors, an optional pinned CPU lane disjoint from the model
   (`--tool-spec-cpu-affinity`), launch-based lifetime caps and a
-  commit-based result deadline (`--tool-spec-timeout-ms`).
-- `--tool-spec-profile` (a measured interference profile) is required only
-  for client-supplied predictions with confidence < 1; authoritative
-  early-dispatch launches need no profile.
+  commit-based result deadline (`--tool-spec-timeout-ms`). Executors can also
+  attach `_speculation_fresh_until_unix_ms`; expired live-data results are
+  rejected immediately before commit and run again through the normal path.
+- `--tool-spec-profile` (a measured interference profile) is required for
+  every client-supplied prediction. Only calls already emitted by the model
+  and launched through early dispatch are authoritative without a profile;
+  a client cannot obtain that status by reporting confidence 1.
 
 ## Measured (Lucebox5, DeepSeek-V4-0731 + DSpark, live public APIs)
 
 10 multi-step tasks over keyless real APIs (geocoding, weather, World Bank,
 Wikipedia, FX; 0.1-0.9 s latency), control vs speculative arm on the same
-server, answers identical (`realapi/rest_bench.py`, artifacts in
+server (`realapi/rest_bench.py`, historical performance traces in
 `realapi/results/`):
 
 | | control | speculative |
@@ -56,11 +59,13 @@ server, answers identical (`realapi/rest_bench.py`, artifacts in
 With `--prefetch-prefill` on top (full stack, `realapi/results/rest_full_stack_10tasks.json`):
 paired speedup **x1.44 aggregate / x1.30 median**, 17/17 calls hidden, 21.4 s
 of client tool wait removed, and **72.3 s of prefill moved off the critical
-path across 15 prefetched turns**; 9/10 correct vs 8/10 for control.
+path across 15 prefetched turns**.
 
-Many-call tasks (4-8 calls each, `realapi/dag_bench.py`): parallel calls +
-early dispatch complete in 11 model turns vs 32 for one-call-per-turn,
-20/20 calls hidden, 4/4 vs 2/4 tasks correct, 1.28x end to end.
+Those committed traces predate the current result-derived correctness gate and
+are latency evidence only. Current `rest_bench.py` and `dag_bench.py` require
+successful tool execution plus values derived from every answer-producing tool
+result; rerun them before making accuracy claims. The earlier corrupted DAG
+trace was removed rather than presented as correctness evidence.
 
 Gains scale with tool latency and call count: on benchmarks with
 millisecond in-memory tools there is nothing to hide, while each second of
@@ -73,8 +78,8 @@ was removed; the history preserves it.
 
 ```bash
 # server (wraps the qualified 0731 launcher's binary selection)
-BUILD_DIR=$PWD/realapi TOOL_SPEC_EXECUTOR=$PWD/realapi/rest_tool_executor.py \
-  TOOL_SPEC_ALLOW=geocode_city,get_weather,country_info,wikipedia_summary,exchange_rate \
+TBSPEC_EXECUTOR=$PWD/realapi/rest_tool_executor.py \
+  TBSPEC_ALLOW=geocode_city,get_weather,country_info,wikipedia_summary,exchange_rate \
   ./realapi/launch_server.sh
 
 # paired benchmark (control vs speculative, alternating order, primed)
@@ -84,4 +89,3 @@ python3 realapi/rest_summary.py run1
 # many-call / dependency benchmark
 python3 realapi/dag_bench.py run2 --small --tasks 4
 ```
-

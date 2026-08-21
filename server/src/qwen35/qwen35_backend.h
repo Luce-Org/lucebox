@@ -18,6 +18,8 @@
 #include "placement/remote_draft_config.h"
 #include "step_graph.h"
 #include "ddtree.h"
+
+#include <limits>
 #include "dflash_feature_ring.h"
 #include "common/dflash_draft_kv.h"
 #include "common/concurrency/paged_kv_pool.h"
@@ -83,6 +85,8 @@ struct Qwen35Config {
     int          ddtree_budget   = 22;
     float        ddtree_temp     = 1.0f;
     bool         ddtree_chain_seed = true;
+    // SpecLA confidence margin on cumulative path log-prob (off when inf).
+    float        ddtree_tau      = std::numeric_limits<float>::infinity();
     bool         use_feature_mirror = false;
 };
 

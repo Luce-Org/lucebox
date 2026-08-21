@@ -101,6 +101,7 @@ namespace dflash::common {
 namespace {
 constexpr auto kClientMonitorInterval = std::chrono::milliseconds(250);
 constexpr auto kSseHeartbeatInterval = std::chrono::seconds(15);
+constexpr auto kReadClosedProbeInterval = std::chrono::seconds(1);
 constexpr char kSseHeartbeat[] = ": keep-alive\n\n";
 }
 
@@ -568,14 +569,22 @@ static size_t json_array_size(const json & value) {
 }
 
 int resolve_max_output_tokens(const json & body, int default_max_tokens) {
+    // OpenAI-compatible clients (e.g. PocketPal's "Unlimited") send
+    // max_completion_tokens: -1 to mean "no explicit limit"; 0 is also
+    // invalid as a budget. Treat non-positive values as unset so they
+    // fall back to the server default instead of yielding zero tokens.
+    auto field_or_default = [&](const char * key) {
+        const int value = body.at(key).get<int>();
+        return value > 0 ? value : default_max_tokens;
+    };
     if (body.contains("max_tokens")) {
-        return body.at("max_tokens").get<int>();
+        return field_or_default("max_tokens");
     }
     if (body.contains("max_output_tokens")) {
-        return body.at("max_output_tokens").get<int>();
+        return field_or_default("max_output_tokens");
     }
     if (body.contains("max_completion_tokens")) {
-        return body.at("max_completion_tokens").get<int>();
+        return field_or_default("max_completion_tokens");
     }
     return default_max_tokens;
 }
@@ -722,7 +731,7 @@ json build_props_body(const ServerConfig & config,
     const bool is_qwen = (config.arch.rfind("qwen", 0) == 0);
     const bool reasoning_supported = is_qwen;
     const bool speculative_supported = is_qwen;
-    const bool tools_supported = is_qwen;
+    const bool tools_supported = is_qwen || config.arch == "deepseek4";
 
     auto pcs  = prefix_cache.stats();
     auto pcfs = prefix_cache.full_stats();
@@ -897,24 +906,11 @@ json build_props_body(const ServerConfig & config,
         }},
         {"tool_speculation", {
             {"enabled", config.tool_speculation.enabled()},
-            {"automatic_prediction_enabled",
-             config.tool_speculation.enabled() &&
-                 false},
-            {"prediction_source",
-             false
-                 ? json("native-qwen3")
-                 : false
-                     ? json(nullptr)
-                     : json(nullptr)},
-            {"prediction_confidence",
-             false
-                 ? json(nullptr)
-                 : json(nullptr)},
-            {"predictor_schedule",
-             false
-                 ? json("before-model") : json(nullptr)},
-            {"predictor_decode_isolated",
-             false},
+            {"automatic_prediction_enabled", false},
+            {"prediction_source", json(nullptr)},
+            {"prediction_confidence", json(nullptr)},
+            {"predictor_schedule", json(nullptr)},
+            {"predictor_decode_isolated", false},
             {"execution_mode", config.tool_speculation.execution_mode()},
             {"profile_status",
              config.tool_speculation.policy.empty()
@@ -925,9 +921,7 @@ json build_props_body(const ServerConfig & config,
                  ? json(nullptr)
                  : json(config.tool_speculation.policy.executor_contract())},
             {"protocol", "dflash.tool-speculation.v1"},
-            {"client_prediction_required",
-             config.tool_speculation.enabled() &&
-                 !false},
+            {"client_prediction_required", config.tool_speculation.enabled()},
             {"client_result_handling_required",
              config.tool_speculation.enabled()},
             {"preserves_token_speculation", true},
@@ -2402,8 +2396,9 @@ json build_openai_completion_response(
     // usage.completion_tokens_details.reasoning_tokens — OpenAI o1/o3
     // standard location; kept in sync with finish_details.thinking_tokens.
     // usage.timings — per-request prefill/decode wall clock, additive to
-    // the OpenAI shape (ignored by clients that don't recognize it). See
-    // docs/specs/thinking-budget.md §6.3.
+    // the OpenAI shape (ignored by clients that don't recognize it).
+    // spec_decode_ran disambiguates a real zero-acceptance speculative run
+    // from an autoregressive fallback. See docs/specs/thinking-budget.md §6.3.
     const int prompt_tokens = (int) req.prompt_tokens.size();
     const json usage = {
         {"prompt_tokens", prompt_tokens},
@@ -2414,6 +2409,7 @@ json build_openai_completion_response(
         }},
         {"timings", build_timings_json(timings, counts.total)},
         {"accept_rate", result.accept_rate},
+        {"spec_decode_ran", result.spec_decode_ran},
     };
     return {
         {"id", req.response_id},
@@ -2481,6 +2477,7 @@ json build_anthropic_response(
         {"output_tokens", counts.total},
         {"timings", build_timings_json(timings, counts.total)},
         {"accept_rate", result.accept_rate},
+        {"spec_decode_ran", result.spec_decode_ran},
     };
     return {
         {"id", req.response_id},
@@ -2530,6 +2527,7 @@ json build_responses_api_response(
         {"total_tokens", prompt_tokens + counts.total},
         {"timings", build_timings_json(timings, counts.total)},
         {"accept_rate", result.accept_rate},
+        {"spec_decode_ran", result.spec_decode_ran},
     };
     return {
         {"id", req.response_id},
@@ -3748,19 +3746,7 @@ void HttpServer::scan_early_dispatch(const ParsedRequest & req,
             output.early_entries.push_back(std::move(entry));
             continue;
         }
-        entry.call_index = (int) output.early_entries.size() + 1;
-        bool duplicate = false;
-        for (const EarlyDispatchEntry & previous : output.early_entries) {
-            if (previous.attempt && previous.call == entry.call) {
-                duplicate = true;
-                break;
-            }
-        }
-        if (duplicate) {
-            entry.skip_reason = "duplicate_call";
-            output.early_entries.push_back(std::move(entry));
-            continue;
-        }
+        entry.call_index = ++output.early_call_count;
         if (!config_.tool_speculation.allows(entry.call.name)) {
             entry.skip_reason = "tool_not_allowlisted";
             output.early_entries.push_back(std::move(entry));
@@ -3772,8 +3758,14 @@ void HttpServer::scan_early_dispatch(const ParsedRequest & req,
             // (see resolve_early_dispatch), saving a model turn per chain level.
             bool valid = true;
             for (int dep : entry.dependencies) {
+                const auto source = std::find_if(
+                    output.early_entries.begin(), output.early_entries.end(),
+                    [dep](const EarlyDispatchEntry & candidate) {
+                        return candidate.call_index == dep;
+                    });
                 if (dep < 1 || dep >= entry.call_index ||
-                    !output.early_entries[(size_t) dep - 1].skip_reason.empty()) {
+                    source == output.early_entries.end() ||
+                    !source->skip_reason.empty()) {
                     valid = false;
                     break;
                 }
@@ -3789,6 +3781,7 @@ void HttpServer::scan_early_dispatch(const ParsedRequest & req,
             output.early_entries.push_back(std::move(entry));
             continue;
         }
+        prediction.authoritative = true;
         entry.attempt = ToolSpeculationAttempt::create(
             config_.tool_speculation, prediction, req.response_id);
         entry.attempt->start();
@@ -3804,16 +3797,45 @@ json HttpServer::resolve_early_dispatch(
         GenerationOutputState & output,
         const std::vector<ToolCall> & authoritative_calls,
         const char * cancel_reason) {
-    auto find_match = [&](const CanonicalToolInvocation & call) -> const ToolCall * {
-        for (const ToolCall & candidate : authoritative_calls) {
+    // Match by occurrence, not only by canonical arguments. Two identical
+    // calls with distinct IDs are two authoritative invocations and must each
+    // receive their own executor attempt and result.
+    std::vector<const ToolCall *> matches(output.early_entries.size(), nullptr);
+    std::vector<bool> claimed(authoritative_calls.size(), false);
+    for (size_t i = 0; i < output.early_entries.size(); ++i) {
+        const EarlyDispatchEntry & entry = output.early_entries[i];
+        if (entry.call_index <= 0) continue;
+        for (size_t j = 0; j < authoritative_calls.size(); ++j) {
+            if (claimed[j]) continue;
             CanonicalToolInvocation canonical;
             std::string error;
-            if (CanonicalToolInvocation::from_tool_call(candidate, canonical, error) &&
-                canonical == call) {
-                return &candidate;
+            if (CanonicalToolInvocation::from_tool_call(
+                    authoritative_calls[j], canonical, error) &&
+                canonical == entry.call) {
+                matches[i] = &authoritative_calls[j];
+                claimed[j] = true;
+                break;
             }
         }
-        return nullptr;
+    }
+    auto find_entry = [&](int call_index) -> EarlyDispatchEntry * {
+        const auto found = std::find_if(
+            output.early_entries.begin(), output.early_entries.end(),
+            [call_index](const EarlyDispatchEntry & candidate) {
+                return candidate.call_index == call_index;
+            });
+        return found == output.early_entries.end() ? nullptr : &*found;
+    };
+    auto store_hit_result = [](EarlyDispatchEntry & entry, json & item,
+                               const json & result) {
+        entry.result = result;
+        entry.has_result = true;
+        // Canonical tool-message text: a client that echoes this string as
+        // the tool message content gets a guaranteed prefetch-prefill hit.
+        item["tool_message_content"] =
+            entry.result.is_object() && entry.result.contains("value")
+                ? entry.result["value"].dump()
+                : entry.result.dump();
     };
     std::vector<json> items(output.early_entries.size());
     // Pass 1: calls launched during decode (no dependencies).
@@ -3835,7 +3857,7 @@ json HttpServer::resolve_early_dispatch(
             }
             continue;  // dependent calls are handled below
         }
-        const ToolCall * match = find_match(entry.call);
+        const ToolCall * match = matches[i];
         json metadata = (cancel_reason || !match)
             ? entry.attempt->cancel(
                   cancel_reason ? cancel_reason : "no_matching_authoritative_call")
@@ -3845,13 +3867,7 @@ json HttpServer::resolve_early_dispatch(
         }
         if (match) item["call_id"] = match->id;
         if (metadata.value("status", "") == "hit" && metadata.contains("result")) {
-            entry.result = metadata["result"];
-            // Canonical tool-message text: a client that echoes this string as
-            // the tool message content gets a guaranteed prefetch-prefill hit.
-            item["tool_message_content"] =
-                entry.result.is_object() && entry.result.contains("value")
-                    ? entry.result["value"].dump()
-                    : entry.result.dump();
+            store_hit_result(entry, item, metadata["result"]);
         }
         entry.done = true;
     }
@@ -3866,9 +3882,9 @@ json HttpServer::resolve_early_dispatch(
             bool inputs_ready = true;
             bool inputs_failed = false;
             for (int dep : entry.dependencies) {
-                const EarlyDispatchEntry & source = output.early_entries[(size_t) dep - 1];
-                if (!source.done) inputs_ready = false;
-                else if (source.result.is_null()) inputs_failed = true;
+                const EarlyDispatchEntry * source = find_entry(dep);
+                if (!source || !source->done) inputs_ready = false;
+                else if (!source->has_result) inputs_failed = true;
             }
             if (inputs_failed) {
                 items[i]["status"] = "skipped";
@@ -3889,9 +3905,9 @@ json HttpServer::resolve_early_dispatch(
             const bool ok = substitute_tool_call_dependencies(
                 entry.call.arguments,
                 [&](int index) -> const json * {
-                    if (index < 1 || (size_t) index > output.early_entries.size()) return nullptr;
-                    const EarlyDispatchEntry & source = output.early_entries[(size_t) index - 1];
-                    return source.result.is_null() ? nullptr : &source.result;
+                    const EarlyDispatchEntry * source = find_entry(index);
+                    return source && source->has_result
+                        ? &source->result : nullptr;
                 },
                 resolved_args, error);
             if (!ok || !CanonicalToolInvocation::from_parts(
@@ -3913,6 +3929,7 @@ json HttpServer::resolve_early_dispatch(
                 entry.done = true;
                 continue;
             }
+            prediction.authoritative = true;
             launched[r] = ToolSpeculationAttempt::create(
                 config_.tool_speculation, prediction, "dependent");
             launched[r]->start();
@@ -3924,7 +3941,7 @@ json HttpServer::resolve_early_dispatch(
             if (!launched[r]) continue;
             EarlyDispatchEntry & entry = output.early_entries[ready[r]];
             json & item = items[ready[r]];
-            const ToolCall * match = find_match(entry.call);  // template as emitted
+            const ToolCall * match = matches[ready[r]];  // template as emitted
             json metadata;
             if (!match) {
                 metadata = launched[r]->cancel("no_matching_authoritative_call");
@@ -3938,7 +3955,7 @@ json HttpServer::resolve_early_dispatch(
                 item[it.key()] = it.value();
             }
             if (metadata.value("status", "") == "hit" && metadata.contains("result")) {
-                entry.result = metadata["result"];
+                store_hit_result(entry, item, metadata["result"]);
             }
             entry.done = true;
         }
@@ -4012,6 +4029,12 @@ void HttpServer::prefetch_next_turn(
         tokens, prefix_len, false, (int) tokens.size());
     if (prepared.first < 0 || prepared.second != (int) tokens.size()) return;
     const int snap_slot = prepared.first;
+    if (snap_slot == restore_slot) {
+        // Never free the snapshot we are about to restore. This can happen
+        // when the inline reservation selects the current best prefix slot.
+        prefix_cache_.cancel_inline_snap(snap_slot);
+        return;
+    }
     backend_.snapshot_free(snap_slot);
     GenerateRequest prefetch_request;
     prefetch_request.prompt = tokens;
@@ -4020,7 +4043,14 @@ void HttpServer::prefetch_next_turn(
     prefetch_request.snap_pos = (int) tokens.size();
     DaemonIO prefetch_io;
     prefetch_io.stream_fd = -1;
-    prefetch_io.should_cancel = [this]() { return has_pending_jobs(); };
+    auto prefetch_cancelled = std::make_shared<std::atomic<bool>>(false);
+    prefetch_io.should_cancel = [this, prefetch_cancelled]() {
+        const bool cancelled = has_pending_jobs();
+        if (cancelled) {
+            prefetch_cancelled->store(true, std::memory_order_release);
+        }
+        return cancelled;
+    };
     const GenerateResult prefetch_result = restore_slot >= 0
         ? backend_.restore_and_generate(restore_slot, prefetch_request,
                                         prefetch_io)
@@ -4040,7 +4070,7 @@ void HttpServer::prefetch_next_turn(
     } else {
         backend_.snapshot_free(snap_slot);
         prefix_cache_.abort_inline_snap(snap_slot);
-        if (prefetch_io.cancelled) {
+        if (prefetch_cancelled->load(std::memory_order_acquire)) {
             std::fprintf(stderr,
                 "[prefetch] yielded to a queued request\n");
         }
@@ -4783,7 +4813,6 @@ void HttpServer::start_job_stream(ServerJob * job) {
     std::lock_guard<std::mutex> lock(job->write_mu);
     if (job->client_disconnected.load(std::memory_order_acquire)) return;
     job->stream_ready = true;
-    job->read_close_probe_sent = false;
     job->heartbeat_offset = 0;
     job->last_stream_write = std::chrono::steady_clock::now();
 }
@@ -4809,10 +4838,9 @@ void HttpServer::maybe_send_job_heartbeat(
         return;
     }
     const auto now = std::chrono::steady_clock::now();
-    const bool probe_read_close =
-        peer_read_closed && !job->read_close_probe_sent;
-    if (!probe_read_close &&
-        now - job->last_stream_write < kSseHeartbeatInterval) {
+    const auto heartbeat_interval =
+        peer_read_closed ? kReadClosedProbeInterval : kSseHeartbeatInterval;
+    if (now - job->last_stream_write < heartbeat_interval) {
         return;
     }
 
@@ -4826,7 +4854,6 @@ void HttpServer::maybe_send_job_heartbeat(
         return;
     }
     if (result == http_detail::HeartbeatSendResult::Retry) return;
-    if (probe_read_close) job->read_close_probe_sent = true;
     job->last_stream_write = now;
 }
 

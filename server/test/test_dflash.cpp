@@ -19,11 +19,16 @@
 //                    <n_gen> <out_ids.bin>
 
 #include "dflash27b.h"
+#include <limits>
 #include "internal.h"
+#include "delta_net_specla.h"
+#include "specla_commit_cuda.h"
+#include "specla_mode.h"
 #include "draft_graph.h"
 #include "qwen3_drafter.h"
 #include "gpu_runtime_compat.h"
 #include "chain_rollback_policy.h"
+#include "platform_env.h"
 #include "laguna_daemon.h"  // arch dispatch - laguna targets are served by
                             // dflash::common::run_laguna_daemon() instead of the
                             // qwen35 + DFlash + DDTree pipeline below.
@@ -59,10 +64,12 @@ using to_fp32_cuda_t = void (*)(const void *, float *, int64_t, cudaStream_t);
 to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type);
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cinttypes>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 
 #ifdef _WIN32
 #define setenv(name, value, overwrite) _putenv_s(name, value)
@@ -753,6 +760,11 @@ int main(int argc, char ** argv) {
     int   ddtree_budget = 64;
     float ddtree_temp   = 1.0f;   // softmax temperature for top-K extract
     bool  ddtree_chain_seed = true;  // pre-seed full chain (vs paper's pure best-first)
+    float ddtree_tau    = std::numeric_limits<float>::infinity();  // SpecLA confidence margin
+    bool  ddtree_tau_set = false;
+    bool  specla_mode   = false;
+    bool  specla_top_k_set = false;
+    int   specla_top_k  = 4;
     bool  profile_scaling = false;  // microbench: time target forward at varying N
     bool  time_breakdown  = false;  // one-token time breakdown: prefill/decode/verify × ctx size
     bool  hybrid_bench_only = false; // skip monolithic scenarios, run only hybrid/pipelined
@@ -804,10 +816,42 @@ int main(int argc, char ** argv) {
         if      (std::strcmp(argv[i], "--daemon") == 0)        daemon_mode = true;
         else if (std::strcmp(argv[i], "--seq-verify") == 0)    seq_verify = true;
         else if (std::strcmp(argv[i], "--fast-rollback") == 0) fast_rollback = true;
+        else if (std::strcmp(argv[i], "--specla") == 0) {
+            specla_mode = true;
+            ddtree_mode = true;
+            fast_rollback = true;
+        }
+        else if (std::strncmp(argv[i], "--specla-top-k=", 15) == 0) {
+            const char * value = argv[i] + 15;
+            char * end = nullptr;
+            const long parsed = std::strtol(value, &end, 10);
+            if (end == value || *end != '\0' || parsed <= 0 || parsed > INT_MAX) {
+                std::fprintf(stderr, "bad --specla-top-k value: %s\n", value);
+                return 2;
+            }
+            specla_top_k = (int)parsed;
+            specla_top_k_set = true;
+        }
         else if (std::strcmp(argv[i], "--ddtree") == 0)        { ddtree_mode = true; fast_rollback = true; }
         else if (std::strncmp(argv[i], "--ddtree-budget=", 16) == 0) {
             ddtree_budget = std::atoi(argv[i] + 16);
             if (ddtree_budget <= 0) ddtree_budget = 64;
+        }
+        else if (std::strncmp(argv[i], "--ddtree-tau=", 13) == 0) {
+            const char * tau_str = argv[i] + 13;
+            char * end = nullptr;
+            errno = 0;
+            const float tau = std::strtof(tau_str, &end);
+            // Mirror --ddtree-temp/--ddtree-budget: invalid values fall back
+            // to the documented default instead of silently enabling the
+            // pruned-tree path (atof("garbage") would read as 0.0).
+            if (end == tau_str || *end != '\0' ||
+                !std::isfinite(tau) || tau <= 0.0f) {
+                ddtree_tau = std::numeric_limits<float>::infinity();
+            } else {
+                ddtree_tau = tau;
+                ddtree_tau_set = true;
+            }
         }
         else if (std::strncmp(argv[i], "--ddtree-temp=", 14) == 0) {
             ddtree_temp = (float)std::atof(argv[i] + 14);
@@ -1045,8 +1089,23 @@ int main(int argc, char ** argv) {
         (void)n;
 #endif
     };
+    if (specla_mode && seq_verify) {
+        std::fprintf(stderr, "--specla and --seq-verify are mutually exclusive\n");
+        return 2;
+    }
     if (fast_rollback && seq_verify && !ddtree_mode) {
         std::fprintf(stderr, "--fast-rollback and --seq-verify are mutually exclusive\n");
+        return 2;
+    }
+    if (specla_mode) {
+        if (!ddtree_tau_set) ddtree_tau = 6.0f;
+        set_environment_variable("DFLASH_SPECLA", "1", true);
+        if (specla_top_k_set) {
+            set_environment_variable(
+                "DFLASH_SPECLA_TOPK", std::to_string(specla_top_k).c_str(), true);
+        }
+    } else if (specla_top_k_set) {
+        std::fprintf(stderr, "--specla-top-k requires --specla\n");
         return 2;
     }
     if (target_split_dflash) target_split_load_draft = true;
@@ -3256,7 +3315,13 @@ int main(int argc, char ** argv) {
 
         // DDTree top-K: use GPU argmax for draft_tok; full logits transfer
         // only when DDTree needs top-K (K>1) for sibling expansion.
-        const int ddtree_K = (ddtree_budget > q_len - 1) ? 8 : 1;
+        // Match the SpecLA paper's tree route (top-k=4) when factor-buffered
+        // state is active; retain the historical top-8 baseline otherwise.
+        const int ddtree_K = (ddtree_budget > q_len - 1)
+            ? (!cache.factor_k.empty()
+                ? std::min(dflash::common::specla_tree_topk(), vocab)
+                : 8)
+            : 1;
 
         if (draft_hidden_bridge) {
             for (int i = 0; i < q_len; i++) {
@@ -3385,14 +3450,38 @@ int main(int argc, char ** argv) {
                 ddtree_top_log_probs.data(),
                 ddtree_top_token_ids.data(),
                 L, ddtree_K, ddtree_budget,
-                ddtree_chain_seed);
+                ddtree_chain_seed, ddtree_tau);
 
             const int N_actual = 1 + tree.n_nodes;  // actual tree size
-            const int N = ddtree_budget + 1;         // fixed allocation size for gallocr reuse
+            // The HLD graph is topology-specific and rebuilt for this round,
+            // so padding pruned trees only wastes target work.
+            const int N = !cache.factor_k.empty()
+                ? N_actual
+                : (std::isfinite(ddtree_tau) ? N_actual : ddtree_budget + 1);
+
+            // Root-inclusive parent topology, including harmless padding
+            // children. SpecLA consumes this schedule during graph build so
+            // every delta layer executes state-resident HLD chains.
+            std::vector<int32_t> parent_ids(N, 0);
+            parent_ids[0] = -1;
+            for (int i = 1; i < N_actual; i++) {
+                parent_ids[i] = (int32_t)tree.parents[i];
+            }
+            SpecLAHLDSchedule hld;
+            const SpecLAHLDSchedule * hld_ptr = nullptr;
+            if (!cache.factor_k.empty()) {
+                hld = make_specla_hld_schedule(
+                    parent_ids.data(), N, cache.specla_pending_count);
+                if (hld.packed.empty()) {
+                    std::fprintf(stderr, "ddtree HLD schedule failed\n");
+                    return 1;
+                }
+                hld_ptr = &hld;
+            }
 
             if (!build_target_step_tree(sg, w, cache, backend,
                                         /*kv_start=*/committed, /*n_tokens=*/N,
-                                        g_fa_window, g_kq_stride_pad)) {
+                                        g_fa_window, g_kq_stride_pad, hld_ptr)) {
                 std::fprintf(stderr, "ddtree verify build failed\n"); return 1;
             }
             T_verify_build = sync_us();
@@ -3450,14 +3539,23 @@ int main(int argc, char ** argv) {
             ggml_backend_tensor_set(sg.attn_mask, mask_buf.data(), 0,
                                     sizeof(uint16_t) * mask_buf.size());
 
-            // parent_ids: actual tree nodes, then padding → point to root (slot 0)
-            std::vector<int32_t> parent_ids(N, 0);
-            parent_ids[0] = -1;
-            for (int i = 1; i < N_actual; i++) parent_ids[i] = (int32_t)tree.parents[i];
-            // Padding slots: parent=0 (root). DeltaNet kernel processes them
-            // but their outputs are never used (masked out in attention).
-            ggml_backend_tensor_set(sg.parent_ids, parent_ids.data(), 0,
-                                    sizeof(int32_t) * N);
+            // Padding slots remain root children. Their outputs are ignored.
+            if (sg.parent_ids->buffer) {
+                ggml_backend_tensor_set(sg.parent_ids, parent_ids.data(), 0,
+                                        sizeof(int32_t) * N);
+            }
+
+            // SpecLA: ancestor masks over the same root-inclusive node order.
+            if (sg.specla_m_strict) {
+                std::vector<float> sp_ms((size_t)N * N);
+                std::vector<float> sp_mi((size_t)N * N);
+                std::vector<float> sp_me((size_t)N * N);
+                fill_specla_masks(parent_ids.data(), N,
+                                  sp_ms.data(), sp_mi.data(), sp_me.data());
+                ggml_backend_tensor_set(sg.specla_m_strict, sp_ms.data(), 0, sizeof(float) * sp_ms.size());
+                ggml_backend_tensor_set(sg.specla_m_incl,   sp_mi.data(), 0, sizeof(float) * sp_mi.size());
+                ggml_backend_tensor_set(sg.specla_m_eye,    sp_me.data(), 0, sizeof(float) * sp_me.size());
+            }
 
             T_verify_set = sync_us();
             tt_verify_set += std::chrono::duration<double, std::micro>(T_verify_set - T_verify_build).count();
@@ -3587,13 +3685,8 @@ int main(int argc, char ** argv) {
             // the next iteration feeds it to w.embedder.embed(), that fails,
             // and the decode loop returns 1 without writing the output file
             // or printing the summary line (issue #191).
-            if (hit_eos || last_tok < 0 || IS_EOS_TOK(last_tok, w)) {
-                committed    += commit_n;
-                n_generated  += commit_n;
-                n_accept_sum += commit_n;
-                n_draft_steps++;
-                break;
-            }
+            const bool stop_after_tree_commit =
+                hit_eos || last_tok < 0 || IS_EOS_TOK(last_tok, w);
 
             // Rollback: per-layer DeltaNet SSM and conv state + KV compaction
             // for full-attention layers.
@@ -3617,12 +3710,65 @@ int main(int argc, char ** argv) {
             {
                 const int n_delta = (int)sg.delta_captures.size();
                 cudaStream_t stream = nullptr;
+                // SpecLA: keep the accepted raw factors pending. A pure spine
+                // is already contiguous and only rotates banks; a sibling
+                // walk is compacted into path order in one kernel. The next
+                // HLD verify applies both GDN and conv factors while their
+                // state tiles are resident.
+                const bool specla_commit = !cache.factor_k.empty();
+                if (specla_commit) {
+                    if (!cache.factor_k_all || !cache.factor_v_new_all ||
+                        !cache.factor_g_ps_all || !cache.conv_factor_all ||
+                        !cache.factor_k_all_alt || !cache.factor_v_new_all_alt ||
+                        !cache.factor_g_ps_all_alt || !cache.conv_factor_all_alt) {
+                        std::fprintf(stderr, "ddtree SpecLA factor banks missing\n");
+                        return 1;
+                    }
+                    SpeclaFactorBanks banks;
+                    banks.k[0]    = (float *)cache.factor_k_all->data;
+                    banks.v[0]    = (float *)cache.factor_v_new_all->data;
+                    banks.g[0]    = (float *)cache.factor_g_ps_all->data;
+                    banks.conv[0] = (float *)cache.conv_factor_all->data;
+                    banks.k[1]    = (float *)cache.factor_k_all_alt->data;
+                    banks.v[1]    = (float *)cache.factor_v_new_all_alt->data;
+                    banks.g[1]    = (float *)cache.factor_g_ps_all_alt->data;
+                    banks.conv[1] = (float *)cache.conv_factor_all_alt->data;
+
+                    const int old_pending_bank = cache.specla_pending_bank;
+                    if (walked_sibling_for_rollback) {
+                        if (!cache.specla_idx || !cache.specla_idx->data) {
+                            std::fprintf(stderr, "ddtree SpecLA index buffer missing\n");
+                            return 1;
+                        }
+                        std::vector<int32_t> acc_idx(
+                            accepted.begin(), accepted.begin() + commit_n);
+                        ggml_backend_tensor_set(cache.specla_idx, acc_idx.data(), 0,
+                                                acc_idx.size()*sizeof(int32_t));
+                    }
+                    int new_pending_bank = old_pending_bank;
+                    if (!specla_rotate_pending_factors(
+                            banks,
+                            walked_sibling_for_rollback
+                                ? (const int32_t *)cache.specla_idx->data : nullptr,
+                            old_pending_bank, walked_sibling_for_rollback, commit_n,
+                            (int)cache.factor_k_all->ne[0],
+                            (int)cache.factor_v_new_all->ne[0],
+                            (int)cache.factor_k_all->ne[1],
+                            n_delta, (int)cache.conv_factor_all->ne[0],
+                            /*stream=*/nullptr, &new_pending_bank)) {
+                        std::fprintf(stderr, "ddtree SpecLA factor rotation failed\n");
+                        return 1;
+                    }
+                    cache.specla_pending_bank = new_pending_bank;
+                    cache.specla_pending_count = commit_n;
+                }
                 for (int il = 0; il < n_delta; il++) {
                     const DeltaNetCapture & cap = sg.delta_captures[il];
-                    if (!cap.ssm_intermediate_states || !cap.conv_input) {
+                    if ((!specla_commit && !cap.ssm_intermediate_states) || !cap.conv_input) {
                         std::fprintf(stderr, "ddtree rollback: missing capture layer %d\n", il);
                         return 1;
                     }
+                    if (specla_commit) continue;
                     // SSM state rollback: source is cache.ssm_intermediate_states
                     // ([S_v, S_v, H_v, max_verify_tokens]) at slot rollback_dfs.
                     // Destination is cache.ssm_state[il] (f32). Use ggml's
@@ -3781,6 +3927,7 @@ int main(int argc, char ** argv) {
             n_generated  += commit_n;
             n_accept_sum += commit_n;  // for stats
             n_draft_steps++;
+            if (stop_after_tree_commit) break;
             continue;  // skip the rest of the verify/commit logic for this iter
         }
 
@@ -3802,6 +3949,21 @@ int main(int argc, char ** argv) {
             if (!w.embedder.embed(draft_tok.data(), q_len, verify_embed.data())) return 1;
             ggml_backend_tensor_set(sg.inp_embed, verify_embed.data(), 0,
                                     sizeof(float) * verify_embed.size());
+
+            // SpecLA: chain topology masks (parents[t] = t-1), host-filled
+            // like the attention mask below.
+            if (sg.specla_m_strict) {
+                std::vector<int32_t> sp_parents(q_len);
+                for (int t = 0; t < q_len; t++) sp_parents[t] = t - 1;
+                std::vector<float> sp_ms((size_t)q_len * q_len);
+                std::vector<float> sp_mi((size_t)q_len * q_len);
+                std::vector<float> sp_me((size_t)q_len * q_len);
+                fill_specla_masks(sp_parents.data(), q_len,
+                                  sp_ms.data(), sp_mi.data(), sp_me.data());
+                ggml_backend_tensor_set(sg.specla_m_strict, sp_ms.data(), 0, sizeof(float) * sp_ms.size());
+                ggml_backend_tensor_set(sg.specla_m_incl,   sp_mi.data(), 0, sizeof(float) * sp_mi.size());
+                ggml_backend_tensor_set(sg.specla_m_eye,    sp_me.data(), 0, sizeof(float) * sp_me.size());
+            }
 
             // M-RoPE axis-major layout: [axis0_tok0..axis0_tokN-1, axis1_..., axis2_..., axis3_...].
             // First 3 axes hold the token position; axis 3 is always 0 for text.
@@ -3946,7 +4108,47 @@ int main(int argc, char ** argv) {
 
             // Rollback SSM + conv state unless we fully accepted (in which case
             // state after processing all q_len tokens is exactly what we want).
-            if (commit_n < q_len) {
+            //
+            // SpecLA (DFLASH_SPECLA=1): current candidates remain outside the
+            // durable state, so their bank is rotated even on full acceptance.
+            const bool specla_commit = !cache.factor_k.empty();
+            if (specla_commit) {
+                if (!cache.factor_k_all || !cache.factor_v_new_all ||
+                    !cache.factor_g_ps_all || !cache.conv_factor_all ||
+                    !cache.factor_k_all_alt || !cache.factor_v_new_all_alt ||
+                    !cache.factor_g_ps_all_alt || !cache.conv_factor_all_alt) {
+                    std::fprintf(stderr, "SpecLA factor banks missing\n");
+                    return 1;
+                }
+                SpeclaFactorBanks banks;
+                banks.k[0]    = (float *)cache.factor_k_all->data;
+                banks.v[0]    = (float *)cache.factor_v_new_all->data;
+                banks.g[0]    = (float *)cache.factor_g_ps_all->data;
+                banks.conv[0] = (float *)cache.conv_factor_all->data;
+                banks.k[1]    = (float *)cache.factor_k_all_alt->data;
+                banks.v[1]    = (float *)cache.factor_v_new_all_alt->data;
+                banks.g[1]    = (float *)cache.factor_g_ps_all_alt->data;
+                banks.conv[1] = (float *)cache.conv_factor_all_alt->data;
+
+                // The accepted prefix is already contiguous in the bank the
+                // HLD verify just produced. Rotate it into the pending role;
+                // the next verify fuses its recurrent update with state load.
+                int new_pending_bank = cache.specla_pending_bank;
+                if (!specla_rotate_pending_factors(
+                        banks, /*idx_dev=*/nullptr, cache.specla_pending_bank,
+                        /*walked_sibling=*/false, commit_n,
+                        (int)cache.factor_k_all->ne[0],
+                        (int)cache.factor_v_new_all->ne[0],
+                        (int)cache.factor_k_all->ne[1],
+                        (int)cache.factor_k.size(),
+                        (int)cache.conv_factor_all->ne[0],
+                        /*stream=*/nullptr, &new_pending_bank)) {
+                    std::fprintf(stderr, "SpecLA factor bank rotation failed\n");
+                    return 1;
+                }
+                cache.specla_pending_bank = new_pending_bank;
+                cache.specla_pending_count = commit_n;
+            } else if (commit_n < q_len) {
                 const int rollback_idx = commit_n - 1;  // index into per-step intermediates
                 // Temporary ctx for view tensors (no data alloc — views inherit
                 // data pointers from their already-live sources).
@@ -4134,6 +4336,46 @@ int main(int argc, char ** argv) {
         n_generated  += commit_n;
         n_accept_sum += accept_n;
         n_draft_steps++;
+    }
+
+    // A pending path is normally consumed by the following HLD verify. At a
+    // generation boundary there is no following verify, so materialize it
+    // once to leave reusable cache/snapshot state exact.
+    if (!cache.factor_k.empty() && cache.specla_pending_count > 0) {
+        if (!cache.factor_k_all || !cache.factor_v_new_all ||
+            !cache.factor_g_ps_all || !cache.conv_factor_all ||
+            !cache.factor_k_all_alt || !cache.factor_v_new_all_alt ||
+            !cache.factor_g_ps_all_alt || !cache.conv_factor_all_alt ||
+            !cache.specla_state_ptrs || !cache.specla_conv_state_ptrs) {
+            std::fprintf(stderr, "final SpecLA state flush buffers missing\n");
+            return 1;
+        }
+        SpeclaFactorBanks banks;
+        banks.k[0]    = (float *)cache.factor_k_all->data;
+        banks.v[0]    = (float *)cache.factor_v_new_all->data;
+        banks.g[0]    = (float *)cache.factor_g_ps_all->data;
+        banks.conv[0] = (float *)cache.conv_factor_all->data;
+        banks.k[1]    = (float *)cache.factor_k_all_alt->data;
+        banks.v[1]    = (float *)cache.factor_v_new_all_alt->data;
+        banks.g[1]    = (float *)cache.factor_g_ps_all_alt->data;
+        banks.conv[1] = (float *)cache.conv_factor_all_alt->data;
+
+        if (!specla_flush_pending_factors(
+                banks,
+                (float * const *)cache.specla_state_ptrs->data,
+                (float * const *)cache.specla_conv_state_ptrs->data,
+                cache.specla_pending_bank, cache.specla_pending_count,
+                (int)cache.factor_k_all->ne[0],
+                (int)cache.factor_v_new_all->ne[0],
+                (int)cache.factor_k_all->ne[1],
+                (int)cache.ssm_state.size(),
+                (int)cache.conv_factor_all->ne[0], w.ssm_d_conv,
+                /*stream=*/nullptr)) {
+            std::fprintf(stderr, "final SpecLA state flush failed\n");
+            return 1;
+        }
+        cache.specla_pending_count = 0;
+        ggml_backend_synchronize(target_backend);
     }
 
     auto t_gen1 = std::chrono::steady_clock::now();

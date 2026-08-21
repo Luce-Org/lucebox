@@ -29,10 +29,22 @@ def main() -> int:
         name, args = call.get("name"), call.get("arguments")
         if name not in rest_tools.READ_ONLY_TOOLS or not isinstance(args, dict):
             raise ValueError("tool not eligible")
-        expected = request.get("cpu_affinity") or []
-        if expected and hasattr(os, "sched_getaffinity") and sorted(os.sched_getaffinity(0)) != sorted(set(int(c) for c in expected)):
+        expected = request.get("cpu_affinity", [])
+        if (not isinstance(expected, list) or not expected or
+                any(isinstance(cpu, bool) or not isinstance(cpu, int) for cpu in expected)):
+            raise ValueError("non-empty integer cpu affinity required")
+        if not hasattr(os, "sched_getaffinity"):
+            raise ValueError("cpu affinity inspection unavailable")
+        if sorted(os.sched_getaffinity(0)) != sorted(set(expected)):
             raise ValueError("cpu affinity mismatch")
         raw = rest_tools.run_tool(name, args)
+        if not isinstance(raw, dict) or raw.get("ok") is not True:
+            sys.stdout.write(json.dumps({
+                "ok": False,
+                "error": raw.get("value") if isinstance(raw, dict) else "invalid tool result",
+            }, separators=(",", ":")) + "\n")
+            sys.stdout.flush()
+            return 0
         sys.stdout.write(json.dumps({"ok": True, "result": raw}, separators=(",", ":")) + "\n")
         sys.stdout.flush()
         return 0
@@ -43,4 +55,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

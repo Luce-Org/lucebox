@@ -14,11 +14,14 @@ from unittest import mock
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BENCHMARKS_DIR = REPO_ROOT / "harness" / "benchmarks" / "deepseek4"
 QUALIFICATION_DIR = REPO_ROOT / "harness" / "qualification" / "deepseek4"
+SERVER_SCRIPTS_DIR = REPO_ROOT / "server" / "scripts"
 QUALIFIER = QUALIFICATION_DIR / "qualify_ds4_q5_amd.sh"
 sys.path.insert(0, str(BENCHMARKS_DIR))
 sys.path.insert(0, str(QUALIFICATION_DIR))
+sys.path.insert(0, str(SERVER_SCRIPTS_DIR))
 
 import analyze_rocprof_overlap  # noqa: E402
+import bench_ds4_decode  # noqa: E402
 import ds4_context_sweep  # noqa: E402
 import ds4_publication_decode_client  # noqa: E402
 
@@ -126,6 +129,39 @@ class PublicationClientTests(unittest.TestCase):
             ds4_publication_decode_client.main()
 
         self.assertEqual(error.exception.code, 2)
+
+
+class ControlledDecodeBenchmarkTests(unittest.TestCase):
+    @staticmethod
+    def valid_run(**overrides: object) -> dict:
+        run = {
+            "completion_tokens": 512,
+            "output_matches_prompt": True,
+            "cache_hit": False,
+            "cached_prefix_tokens": 0,
+            "decode_tokens_per_second": 47.0,
+            "spec_decode_ran": True,
+            "accept_rate": 1.0,
+        }
+        run.update(overrides)
+        return run
+
+    def test_speculative_run_is_accepted(self) -> None:
+        bench_ds4_decode.validate_run(self.valid_run(), max_tokens=512)
+
+    def test_autoregressive_fallback_is_rejected(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "speculative decode did not run"):
+            bench_ds4_decode.validate_run(
+                self.valid_run(spec_decode_ran=False, accept_rate=0.0),
+                max_tokens=512,
+            )
+
+    def test_missing_speculative_signal_is_rejected(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "speculative decode did not run"):
+            bench_ds4_decode.validate_run(
+                self.valid_run(spec_decode_ran=None),
+                max_tokens=512,
+            )
 
 
 class QualifierPreflightTests(unittest.TestCase):

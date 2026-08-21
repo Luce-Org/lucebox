@@ -716,8 +716,137 @@ static uint8_t rocmfpx_choose_scale_fp8_weighted_mse(const float * x, int n, con
     return best_e;
 }
 
+#ifdef ROCMFP2_AFFINE
+static uint8_t rocmfpx_quantize_fp2_affine_code(
+        float x, float scale, float offset) {
+    if (!(scale > 0.0f)) {
+        return 0;
+    }
+    if (!isfinite(x)) {
+        x = 0.0f;
+    }
+    const float q = floorf((x + offset) / scale + 0.5f);
+    return (uint8_t) fminf(3.0f, fmaxf(0.0f, q));
+}
+
+static float rocmfpx_fp2_affine_block_mse(
+        const float * x, int n, const float * mse_weights,
+        uint8_t scale_e, uint8_t offset_e, float best_err) {
+    const float scale = rocmfpx_ue4m3_to_fp32(scale_e);
+    const float offset = rocmfpx_ue4m3_to_fp32(offset_e);
+    float err = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        if (!isfinite(x[i])) continue;
+        const float weight = mse_weights ? mse_weights[i] : 1.0f;
+        if (!(weight > 0.0f)) continue;
+        const uint8_t code =
+            rocmfpx_quantize_fp2_affine_code(x[i], scale, offset);
+        const float delta = x[i] - ((float) code * scale - offset);
+        err += weight * delta * delta;
+        if (err > best_err) return err;
+    }
+    return err;
+}
+
+static void rocmfpx_choose_fp2_affine_params(
+        const float * x, int n, const float * mse_weights,
+        uint8_t * scale_e, uint8_t * offset_e) {
+    float min_value = INFINITY;
+    float max_value = -INFINITY;
+    for (int pass = 0; pass < 2 && min_value == INFINITY; ++pass) {
+        for (int i = 0; i < n; ++i) {
+            if (!isfinite(x[i])) continue;
+            if (pass == 0 && mse_weights && !(mse_weights[i] > 0.0f)) {
+                continue;
+            }
+            min_value = fminf(min_value, x[i]);
+            max_value = fmaxf(max_value, x[i]);
+        }
+        if (!mse_weights) break;
+    }
+    if (min_value == INFINITY ||
+        (min_value == 0.0f && max_value == 0.0f)) {
+        *scale_e = 0;
+        *offset_e = 0;
+        return;
+    }
+
+    const float initial_offset = fmaxf(0.0f, -min_value);
+    const float initial_scale =
+        fmaxf((max_value + initial_offset) / 3.0f,
+              rocmfpx_ue4m3_to_fp32(1));
+    uint8_t best_scale = rocmfpx_nearest_scale_ue4m3(initial_scale);
+    uint8_t best_offset = rocmfpx_nearest_scale_ue4m3(initial_offset);
+    float best_err = rocmfpx_fp2_affine_block_mse(
+        x, n, mse_weights, best_scale, best_offset, INFINITY);
+
+    for (int e = 1; e <= 0x7e; ++e) {
+        const float err = rocmfpx_fp2_affine_block_mse(
+            x, n, mse_weights, (uint8_t) e, best_offset, best_err);
+        if (err < best_err || (err == best_err && e < best_scale)) {
+            best_err = err;
+            best_scale = (uint8_t) e;
+        }
+    }
+    for (int e = 0; e <= 0x7e; ++e) {
+        const float err = rocmfpx_fp2_affine_block_mse(
+            x, n, mse_weights, best_scale, (uint8_t) e, best_err);
+        if (err < best_err || (err == best_err && e < best_offset)) {
+            best_err = err;
+            best_offset = (uint8_t) e;
+        }
+    }
+    for (int e = 1; e <= 0x7e; ++e) {
+        const float err = rocmfpx_fp2_affine_block_mse(
+            x, n, mse_weights, (uint8_t) e, best_offset, best_err);
+        if (err < best_err || (err == best_err && e < best_scale)) {
+            best_err = err;
+            best_scale = (uint8_t) e;
+        }
+    }
+    *scale_e = best_scale;
+    *offset_e = best_offset;
+}
+
+static void rocmfpx_quantize_row_fp2_affine(
+        const float * GGML_RESTRICT x,
+        block_rocmfp2 * GGML_RESTRICT y, int64_t k,
+        const float * GGML_RESTRICT quant_weights, float sigma2) {
+    const int64_t nb = k / QK_ROCMFP2;
+    for (int64_t ib = 0; ib < nb; ++ib) {
+        const float * xb = x + ib*QK_ROCMFP2;
+        block_rocmfp2 * yb = y + ib;
+        float mse_weights[QK_ROCMFP2];
+        const float * block_weights = NULL;
+        if (quant_weights) {
+            float max_abs;
+            float max_abs_weight;
+            rocmfpx_prepare_mse_weights(
+                mse_weights, xb, QK_ROCMFP2,
+                quant_weights + ib*QK_ROCMFP2, sigma2,
+                &max_abs, &max_abs_weight);
+            block_weights = mse_weights;
+        }
+        rocmfpx_choose_fp2_affine_params(
+            xb, QK_ROCMFP2, block_weights, &yb->e[0], &yb->e[1]);
+        const float scale = rocmfpx_ue4m3_to_fp32(yb->e[0]);
+        const float offset = rocmfpx_ue4m3_to_fp32(yb->e[1]);
+        memset(yb->qs, 0, sizeof(yb->qs));
+        for (int i = 0; i < QK_ROCMFP2; ++i) {
+            const uint8_t code =
+                rocmfpx_quantize_fp2_affine_code(xb[i], scale, offset);
+            yb->qs[i >> 2] |= (uint8_t) (code << (2*(i & 3)));
+        }
+    }
+}
+#endif
+
 void rocmfpx_quantize_row_fp2_ref(const float * GGML_RESTRICT x, block_rocmfp2 * GGML_RESTRICT y, int64_t k) {
     assert(k % QK_ROCMFP2 == 0);
+#ifdef ROCMFP2_AFFINE
+    rocmfpx_quantize_row_fp2_affine(x, y, k, NULL, 0.0f);
+    return;
+#endif
 
     const int64_t nb = k / QK_ROCMFP2;
     for (int64_t ib = 0; ib < nb; ++ib) {
@@ -745,6 +874,11 @@ void rocmfpx_quantize_row_fp2_ref(const float * GGML_RESTRICT x, block_rocmfp2 *
 static void rocmfpx_quantize_row_fp2_weighted(
         const float * GGML_RESTRICT x, block_rocmfp2 * GGML_RESTRICT y, int64_t k, const float * GGML_RESTRICT quant_weights) {
     assert(k % QK_ROCMFP2 == 0);
+#ifdef ROCMFP2_AFFINE
+    rocmfpx_quantize_row_fp2_affine(
+        x, y, k, quant_weights, rocmfpx_row_sigma2(x, k));
+    return;
+#endif
 
     const float sigma2 = rocmfpx_row_sigma2(x, k);
 
@@ -785,9 +919,17 @@ void rocmfpx_dequantize_row_fp2(const block_rocmfp2 * GGML_RESTRICT x, float * G
         float * yb = y + ib*QK_ROCMFP2;
 
         for (int i = 0; i < QK_ROCMFP2; ++i) {
+#ifdef ROCMFP2_AFFINE
+            // affine type-107: value = code*scale - offset, e[0]=scale, e[1]=offset
+            const float scale  = rocmfpx_ue4m3_to_fp32(xb->e[0]);
+            const float offset = rocmfpx_ue4m3_to_fp32(xb->e[1]);
+            const uint8_t code = (uint8_t) ((xb->qs[i >> 2] >> (2*(i & 3))) & 3u);
+            yb[i] = (float) code * scale - offset;
+#else
             const float scale = rocmfpx_ue4m3_to_fp32(xb->e[i >= QK_ROCMFP2/2]);
             const uint8_t code = (uint8_t) ((xb->qs[i >> 2] >> (2*(i & 3))) & 3u);
             yb[i] = kvalues_rocmfp2[code] * scale;
+#endif
         }
     }
 }

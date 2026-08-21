@@ -15,6 +15,7 @@ Usage: dag_bench.py <tag> [--tasks N] [--arms react,parallel,dag]
 from __future__ import annotations
 
 import json
+import os
 import re
 import statistics
 import sys
@@ -22,11 +23,14 @@ import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
-sys.path.insert(0, "/home/lucebox5/tbspec")
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR))
 import rest_tools  # noqa: E402
 
-URL = "http://127.0.0.1:18145/v1/chat/completions"
+URL = os.environ.get(
+    "TBSPEC_SERVER_URL", "http://127.0.0.1:18145/v1/chat/completions")
 MODEL = "deepseek-v4-flash"
 MAX_TURNS = {"react": 30, "parallel": 10, "dag": 8}
 MAX_TOKENS = {"react": 512, "parallel": 1024, "dag": 1024}
@@ -78,8 +82,11 @@ TASKS_SMALL = [
     ("s04", "Give a one-sentence Wikipedia summary of the Colosseum and of Machu Picchu, and the current wind speed in Rome and in Cusco.", ["colosseum", "machu", "rome", "cusco"]),
 ]
 
-PLACEHOLDER = re.compile(r"^\$(\d+)\.([A-Za-z_][A-Za-z0-9_]*)$")
-EMBEDDED = re.compile(r"\$(\d+)\.([A-Za-z_][A-Za-z0-9_]*)")
+RESULT_PATH = r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*"
+PLACEHOLDER = re.compile(rf"^\$(\d+)\.({RESULT_PATH})$")
+EMBEDDED = re.compile(rf"\$(\d+)\.({RESULT_PATH})")
+SUMMARY_ONLY_TASKS = {"d09"}
+_MISSING = object()
 
 
 def wait_server(max_wait: float = 1200.0) -> None:
@@ -113,6 +120,16 @@ def prime(messages: list[dict]) -> None:
               "max_tokens": 1, "stream": False, "automatic_tool_speculation": False})
 
 
+def _result_path(result: dict, path: str):
+    parts = path.split(".")
+    cursor = result if parts[0] == "value" else result.get("value", _MISSING)
+    for part in parts:
+        if not isinstance(cursor, dict) or part not in cursor:
+            return _MISSING
+        cursor = cursor[part]
+    return cursor
+
+
 def resolve_args(args: dict, results: dict[int, dict]) -> tuple[dict, list[int], str | None]:
     """Substitute $k.field placeholders. Returns (resolved_args, deps, error)."""
     deps: list[int] = []
@@ -122,27 +139,39 @@ def resolve_args(args: dict, results: dict[int, dict]) -> tuple[dict, list[int],
         if isinstance(value, str):
             m = PLACEHOLDER.match(value.strip())
             if m:
-                k, field = int(m.group(1)), m.group(2)
+                k, path = int(m.group(1)), m.group(2)
                 deps.append(k)
                 res = results.get(k)
                 if res is None:
                     out[key] = value
                     continue
-                val = (res.get("value") or {}).get(field)
-                if val is None:
-                    err = f"missing field {field} in result of call {k}"
+                val = _result_path(res, path)
+                if val is _MISSING:
+                    err = f"missing field {path} in result of call {k}"
                     out[key] = value
                 else:
                     out[key] = val
                 continue
             if "$" in value and EMBEDDED.search(value):
+                missing = []
+
                 def _sub(mm):
-                    k, field = int(mm.group(1)), mm.group(2)
+                    k, path = int(mm.group(1)), mm.group(2)
                     deps.append(k)
                     res = results.get(k)
-                    v = (res.get("value") or {}).get(field) if res else None
-                    return str(v) if v is not None else mm.group(0)
+                    resolved = _result_path(res, path) if res else _MISSING
+                    if resolved is _MISSING:
+                        missing.append((k, path))
+                        return mm.group(0)
+                    if isinstance(resolved, str):
+                        return resolved
+                    return json.dumps(
+                        resolved, sort_keys=True, separators=(",", ":"))
+
                 out[key] = EMBEDDED.sub(_sub, value)
+                if missing and err is None:
+                    k, path = missing[0]
+                    err = f"missing field {path} in result of call {k}"
                 continue
         out[key] = value
     return out, deps, err
@@ -154,6 +183,7 @@ def run_task(task_id: str, prompt: str, expect: list[str], arm: str) -> dict:
     turns = []
     final = None
     stats = {"model_ms": 0.0, "tool_wait_ms": 0.0, "calls": 0, "early_hits": 0, "waves": 0, "max_parallel": 0, "dep_calls": 0, "errors": 0}
+    answer_results = []
     nudges = 0
     for turn_index in range(MAX_TURNS[arm]):
         body = {"model": MODEL, "messages": messages, "tools": rest_tools.TOOLS, "tool_choice": "auto", "temperature": 0,
@@ -176,11 +206,13 @@ def run_task(task_id: str, prompt: str, expect: list[str], arm: str) -> dict:
         messages.append(assistant)
         if not tool_calls:
             content = msg.get("content") or ""
-            looks_unfinished = (not re.search(r"\d", content) or len(content.strip()) < 20 or
+            needs_number = task_id not in SUMMARY_ONLY_TASKS
+            looks_unfinished = ((needs_number and not re.search(r"\d", content)) or len(content.strip()) < 20 or
                                 re.match(r"^\s*(Now|Next|Let me|I'll|I will|I need|Then|First|Okay|OK)\b", content) is not None)
             if looks_unfinished and nudges < 4:
                 nudges += 1
-                messages.append({"role": "user", "content": "Do not describe what you will do. Call the tool now (use the function-call format), or if you already have every value from the tools, give the final answer with the numbers."})
+                suffix = " with the requested values" if not needs_number else " with the numbers"
+                messages.append({"role": "user", "content": "Do not describe what you will do. Call the tool now (use the function-call format), or if you already have every value from the tools, give the final answer" + suffix + "."})
                 turn["nudged"] = True
                 turns.append(turn)
                 continue
@@ -263,20 +295,29 @@ def run_task(task_id: str, prompt: str, expect: list[str], arm: str) -> dict:
         turn["tools"] = [{"name": p["name"], "args": p.get("resolved_args", p["args"]), "source": p["source"], "ok": (p["result"] or {}).get("ok"),
                           "elapsed_ms": (p["result"] or {}).get("elapsed_ms"), "deps": p.get("deps")} for p in parsed]
         for p in parsed:
+            if isinstance(p.get("result"), dict):
+                answer_results.append(p["result"])
             messages.append({"role": "tool", "tool_call_id": p["id"], "content": rest_tools.format_result(p["result"])})
         turns.append(turn)
     wall_ms = (time.perf_counter() - t_start) * 1000.0
+    validation = rest_tools.validate_answer_from_results(
+        prompt, final, answer_results)
+    number_ok = task_id in SUMMARY_ONLY_TASKS or (
+        final is not None and re.search(r"\d", final) is not None)
     correct = (final is not None and all(e.lower() in final.lower() for e in expect)
-               and re.search(r"\d", final) is not None and stats["calls"] > 0)
+               and number_ok and stats["calls"] > 0 and stats["errors"] == 0
+               and validation["ok"])
     return {"task": task_id, "arm": arm, "prompt": prompt, "final": final, "correct": correct, "wall_ms": wall_ms,
-            "turns": len(turns), **stats, "turn_log": turns}
+            "turns": len(turns), "validation": validation, **stats, "turn_log": turns}
 
 
 def main() -> None:
     tag = sys.argv[1]
     n = int(sys.argv[sys.argv.index("--tasks") + 1]) if "--tasks" in sys.argv else len(TASKS)
     arms = sys.argv[sys.argv.index("--arms") + 1].split(",") if "--arms" in sys.argv else ["dag", "parallel", "react"]
-    out_path = f"/home/lucebox5/tbspec/results/dag_{tag}.json"
+    results_dir = SCRIPT_DIR / "results"
+    results_dir.mkdir(exist_ok=True)
+    out_path = results_dir / f"dag_{tag}.json"
     results = []
     tasks = TASKS_SMALL if "--small" in sys.argv else TASKS
     for tid, prompt, expect in tasks[:n]:
@@ -286,7 +327,8 @@ def main() -> None:
             results.append(r)
             print(f"{tid} {arm:8} wall={r['wall_ms']/1000:6.1f}s turns={r['turns']:2} calls={r['calls']:2} waves={r['waves']} maxpar={r['max_parallel']:2} "
                   f"early_hits={r['early_hits']:2} tool_wait={r['tool_wait_ms']/1000:5.2f}s model={r['model_ms']/1000:6.1f}s errors={r['errors']} correct={r['correct']} | {(r['final'] or '')[:80]!r}", flush=True)
-            json.dump({"tag": tag, "results": results}, open(out_path, "w"), indent=1)
+            with out_path.open("w", encoding="utf-8") as output:
+                json.dump({"tag": tag, "results": results}, output, indent=1)
     by = {}
     for r in results:
         by.setdefault(r["task"], {})[r["arm"]] = r
@@ -296,11 +338,12 @@ def main() -> None:
         print(f"{arm:8}: wall sum {sum(r['wall_ms'] for r in rs)/1000:7.1f}s  turns {sum(r['turns'] for r in rs):3}  calls {sum(r['calls'] for r in rs):3}  "
               f"tool_wait {sum(r['tool_wait_ms'] for r in rs)/1000:5.1f}s  early_hits {sum(r['early_hits'] for r in rs):3}  correct {sum(r['correct'] for r in rs)}/{len(rs)}")
     for a, b in (("react", "parallel"), ("react", "dag"), ("parallel", "dag")):
-        ratios = [by[t][a]["wall_ms"] / by[t][b]["wall_ms"] for t in by if a in by[t] and b in by[t]]
+        ratios = [by[t][a]["wall_ms"] / by[t][b]["wall_ms"] for t in by if a in by[t] and b in by[t] and by[t][b]["wall_ms"] > 0]
         if ratios:
-            print(f"{a} / {b}: median x{statistics.median(ratios):.2f} mean x{statistics.mean(ratios):.2f} aggregate x{sum(by[t][a]['wall_ms'] for t in by if a in by[t] and b in by[t]) / sum(by[t][b]['wall_ms'] for t in by if a in by[t] and b in by[t]):.2f}")
+            denominator = sum(by[t][b]['wall_ms'] for t in by if a in by[t] and b in by[t] and by[t][b]["wall_ms"] > 0)
+            numerator = sum(by[t][a]['wall_ms'] for t in by if a in by[t] and b in by[t] and by[t][b]["wall_ms"] > 0)
+            print(f"{a} / {b}: median x{statistics.median(ratios):.2f} mean x{statistics.mean(ratios):.2f} aggregate x{numerator / denominator:.2f}")
 
 
 if __name__ == "__main__":
     main()
-

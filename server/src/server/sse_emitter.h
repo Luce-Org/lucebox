@@ -153,6 +153,7 @@ private:
     ToolMemory * tool_memory_;
 
     StreamMode   mode_;
+    bool         tool_from_reasoning_ = false;
     std::string  window_;           // holdback buffer
     std::string  tool_buffer_;      // accumulated tool text
     bool         tool_buffer_fallback_to_content_ = false;

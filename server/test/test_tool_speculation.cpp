@@ -171,6 +171,7 @@ TEST_CASE(ToolSpeculationFixture, engine_prediction_uses_canonical_boundary) {
     CHECK(value.call.name == "lookup");
     CHECK(value.call.arguments_json == "{\"a\":1,\"b\":2}");
     CHECK(std::fabs(value.confidence - 0.75) < 1e-9);
+    CHECK(!value.authoritative);
     CHECK(!build_tool_speculation_prediction(
         "lookup", json::array(), 0.75, value, error));
     CHECK(!build_tool_speculation_prediction(
@@ -199,6 +200,52 @@ TEST_CASE(ToolSpeculationFixture, prediction_requires_declared_tool) {
     CHECK(!parse_tool_speculation_prediction(
         undeclared, tools, parsed, error));
     CHECK(error.find("not declared") != std::string::npos);
+}
+
+TEST_CASE(ToolSpeculationFixture,
+          request_confidence_one_does_not_bypass_profile_admission) {
+    const json tools = json::array({{
+        {"type", "function"},
+        {"function", {{"name", "lookup"}}},
+    }});
+    const json request = {
+        {"call", {
+            {"name", "lookup"},
+            {"arguments", {{"a", 1}, {"b", 2}}},
+        }},
+        {"confidence", 1.0},
+    };
+    ToolSpeculationPrediction parsed;
+    std::string error;
+    CHECK(parse_tool_speculation_prediction(request, tools, parsed, error));
+    CHECK(!parsed.authoritative);
+
+    ToolSpeculationConfig config;
+    config.executor_path = "/unused/executor";
+    config.allowed_tools = {"lookup"};
+    auto attempt = ToolSpeculationAttempt::create(
+        config, parsed, "request_untrusted_confidence");
+    CHECK(!attempt->admitted());
+    attempt->start();
+    const json metadata = attempt->resolve({
+        ToolCall{"call_1", "lookup", R"({"a":1,"b":2})"},
+    });
+    CHECK(metadata["status"] == "deferred");
+    CHECK(metadata["reason"] == "profile_unavailable");
+}
+
+TEST_CASE(ToolSpeculationFixture,
+          model_emitted_call_is_authoritative_without_profile) {
+    ToolSpeculationConfig config;
+    config.executor_path = "/unused/executor";
+    config.allowed_tools = {"lookup"};
+    ToolSpeculationPrediction emitted = prediction(1.0);
+    emitted.authoritative = true;
+    auto attempt = ToolSpeculationAttempt::create(
+        config, emitted, "request_model_emitted");
+    CHECK(attempt->admitted());
+    const json metadata = attempt->cancel("test_complete");
+    CHECK(metadata["authoritative"].get<bool>());
 }
 
 TEST_CASE(ToolSpeculationFixture, cpu_affinity_parser_canonicalizes_ranges) {
@@ -300,6 +347,7 @@ TEST_CASE(ToolSpeculationFixture, non_allowlisted_tool_is_deferred) {
     auto attempt = ToolSpeculationAttempt::create(
         config, prediction(), "request_allowlist");
     attempt->start();
+    CHECK(dflash::common::tool_speculation_running_executors() == 0);
     const json metadata = attempt->resolve({
         ToolCall{"call_1", "lookup", R"({"a":1,"b":2})"},
     });
@@ -428,12 +476,14 @@ TEST_CASE(ToolSpeculationFixture, executor_failure_is_private) {
     auto attempt = ToolSpeculationAttempt::create(
         config, prediction(), "request_executor_failure");
     attempt->start();
+    CHECK(dflash::common::tool_speculation_running_executors() == 0);
     const json metadata = attempt->resolve({
         ToolCall{"call_1", "lookup", R"({"a":1,"b":2})"},
     });
     CHECK(metadata["status"] == "failed");
     CHECK(metadata["reason"] == "executor_launch_failed");
     CHECK(!metadata.contains("result"));
+    CHECK(dflash::common::tool_speculation_running_executors() == 0);
 }
 
 TEST_CASE(ToolSpeculationFixture, finished_result_survives_long_generation) {
@@ -455,6 +505,26 @@ TEST_CASE(ToolSpeculationFixture, finished_result_survives_long_generation) {
 
     CHECK(metadata["status"] == "hit");
     CHECK(metadata["result"]["value"] == 42);
+}
+
+TEST_CASE(ToolSpeculationFixture, expired_live_result_is_never_committed) {
+    const std::string path = make_executor_script(
+        "IFS= read -r control\n"
+        "printf '{\"ok\":true,\"result\":{\"value\":42,"
+        "\"_speculation_fresh_until_unix_ms\":0}}\\n'\n");
+    ToolSpeculationConfig config = test_config(path);
+    auto attempt = ToolSpeculationAttempt::create(
+        config, prediction(), "request_expired_result");
+    attempt->start();
+    const json metadata = attempt->resolve({
+        ToolCall{"call_1", "lookup", R"({"a":1,"b":2})"},
+    });
+    ::unlink(path.c_str());
+
+    CHECK(metadata["status"] == "failed");
+    CHECK(metadata["reason"] == "speculative_executor_failure");
+    CHECK(metadata["detail"] == "executor_result_expired");
+    CHECK(!metadata.contains("result"));
 }
 
 TEST_CASE(ToolSpeculationFixture, closed_tool_blocks_are_found_as_they_stream) {
@@ -598,18 +668,15 @@ TEST_CASE(ToolSpeculationFixture, executor_timeout_terminates_process_group) {
 }
 
 TEST_CASE(ToolSpeculationFixture, executor_does_not_inherit_server_fds) {
-#if defined(__GLIBC__) && defined(__GLIBC_PREREQ)
-#  if __GLIBC_PREREQ(2, 34)
     const std::string marker_path = make_temp_path();
     const int marker_fd = ::open(marker_path.c_str(), O_RDONLY);
     CHECK(marker_fd >= 0);
     const std::string path = make_executor_script(
         "IFS= read -r control\n"
+        "target=$(readlink /dev/fd/" + std::to_string(marker_fd) +
+        " 2>/dev/null || true)\n"
         "leaked=false\n"
-        "for descriptor in /proc/self/fd/*; do\n"
-        "  target=$(readlink \"$descriptor\" 2>/dev/null || true)\n"
-        "  if [ \"$target\" = \"" + marker_path + "\" ]; then leaked=true; fi\n"
-        "done\n"
+        "if [ \"$target\" = \"" + marker_path + "\" ]; then leaked=true; fi\n"
         "printf '{\"ok\":true,\"result\":{\"leaked\":%s}}\\n' \"$leaked\"\n");
     ToolSpeculationConfig config = test_config(path);
     auto attempt = ToolSpeculationAttempt::create(
@@ -624,12 +691,6 @@ TEST_CASE(ToolSpeculationFixture, executor_does_not_inherit_server_fds) {
 
     CHECK(metadata["status"] == "hit");
     CHECK(!metadata["result"]["leaked"].get<bool>());
-#  else
-    CHECK(true);
-#  endif
-#else
-    CHECK(true);
-#endif
 }
 
 TEST_CASE(ToolSpeculationFixture, executor_environment_is_minimal) {
@@ -714,7 +775,13 @@ TEST_CASE(ToolSpeculationFixture, mismatch_cancels_and_never_exposes_result) {
     CHECK(metadata["reason"] == "invocation_mismatch");
     CHECK(!metadata.contains("result"));
     CHECK(elapsed_ms < 1000.0);
+#if defined(__linux__)
+    // Linux executors start within the configured grace period and observe
+    // the cooperative cancel record. Slower POSIX script startup can instead
+    // reach the process-group termination fallback, which is equally private.
     CHECK(control.find("\"op\":\"cancel\"") != std::string::npos);
+#endif
+    CHECK(dflash::common::tool_speculation_running_executors() == 0);
 }
 #endif
 

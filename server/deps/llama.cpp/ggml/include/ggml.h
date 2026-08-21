@@ -2741,6 +2741,26 @@ extern "C" {
             struct ggml_tensor  * c,
             struct ggml_tensor  * parent_ids);
 
+    // SpecLA heavy-light convolution. Applies compact accepted inputs to the
+    // durable conv state, then verifies the current tree without committing
+    // speculative inputs. Current input factors are written directly to the
+    // persistent double-buffer selected by factor_ptrs/layer/bank; the result
+    // packs [conv output | boundary windows] and already includes SiLU.
+    GGML_API struct ggml_tensor * ggml_ssm_conv_specla(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * c,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * hld,
+            struct ggml_tensor  * factor_ptrs,
+            int                   n_layers,
+            int                   layer,
+            int                   pending_bank,
+            int                   n_boundaries,
+            int                   n_chains,
+            int                   n_waves,
+            int                   max_parallel_chains);
+
     GGML_API struct ggml_tensor * ggml_ssm_scan(
             struct ggml_context * ctx,
             struct ggml_tensor  * s,
@@ -2923,6 +2943,28 @@ extern "C" {
             struct ggml_tensor  * state,
             struct ggml_tensor  * parent_ids,
             struct ggml_tensor  * persist_inter);
+
+    // SpecLA state-resident heavy-light verify. The kernel applies the compact
+    // factors accepted in the preceding step, writes only that committed base
+    // state, then verifies the current HLD chains while writing raw
+    // (k, delta, log-gate) factors directly to the opposite persistent bank.
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_specla(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * hld,
+            struct ggml_tensor  * factor_ptrs,
+            int                   n_layers,
+            int                   layer,
+            int                   pending_bank,
+            int                   n_boundaries,
+            int                   n_chains,
+            int                   n_waves,
+            int                   max_parallel_chains);
 
     // custom operators
 

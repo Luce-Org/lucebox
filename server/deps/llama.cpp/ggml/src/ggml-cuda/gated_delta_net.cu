@@ -587,7 +587,226 @@ static void launch_gated_delta_net(
     }
 }
 
+template <int S_v>
+__global__ void gated_delta_net_specla_hld_cuda(
+        const float * __restrict__ q,
+        const float * __restrict__ k,
+        const float * __restrict__ v,
+        const float * __restrict__ g,
+        const float * __restrict__ beta,
+        float * __restrict__ durable_state,
+        const int * __restrict__ meta,
+        const int64_t * __restrict__ factor_ptrs,
+        float * __restrict__ packed,
+        int64_t H,
+        int64_t n_tokens,
+        int n_layers,
+        int layer,
+        int pending_bank,
+        int64_t sq1,
+        int64_t sq2,
+        int64_t sv1,
+        int64_t sv2,
+        int64_t sb1,
+        int64_t sb2,
+        int n_chains,
+        int wave,
+        float scale) {
+    const int h_idx = blockIdx.x;
+    const int wave_chain = blockIdx.y;
+    constexpr int warp_size =
+        ggml_cuda_get_physical_warp_size() < S_v ?
+        ggml_cuda_get_physical_warp_size() : S_v;
+    constexpr int rows_per_lane = (S_v + warp_size - 1) / warp_size;
+    const int lane = threadIdx.x;
+    const int col = blockIdx.z * blockDim.y + threadIdx.y;
+    if (col >= S_v) return;
+
+    const int order_off    = meta[6];
+    const int offsets_off  = meta[7];
+    const int parent_off   = meta[8];
+    const int boundary_off = meta[9];
+    const int wave_off     = meta[10];
+    int chain = 0;
+    while (chain < n_chains && meta[wave_off + chain] < wave) ++chain;
+    chain += wave_chain;
+    if (chain >= n_chains || meta[wave_off + chain] != wave) return;
+
+    const int64_t plane_offset = (int64_t)h_idx*S_v*S_v;
+    float * state_plane = durable_state + plane_offset;
+    const int pbase = pending_bank*4;
+    const int cbase = (1 - pending_bank)*4;
+    const float * pending_k = (const float *)(uintptr_t)factor_ptrs[pbase + 0];
+    const float * pending_v = (const float *)(uintptr_t)factor_ptrs[pbase + 1];
+    const float * pending_g = (const float *)(uintptr_t)factor_ptrs[pbase + 2];
+    float * current_k = (float *)(uintptr_t)factor_ptrs[cbase + 0];
+    float * current_v = (float *)(uintptr_t)factor_ptrs[cbase + 1];
+    float * current_g = (float *)(uintptr_t)factor_ptrs[cbase + 2];
+    float state_shard[rows_per_lane];
+    const int parent_boundary = meta[parent_off + chain];
+    const int64_t attn_elems = (int64_t)S_v*H*n_tokens;
+    const int64_t boundary_base = attn_elems;
+
+    if (parent_boundary < 0) {
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; ++r) {
+            const int row = r*warp_size + lane;
+            state_shard[r] = state_plane[(int64_t)col*S_v + row];
+        }
+
+        // Delayed commit of the preceding accepted path. Factors have already
+        // been compacted into path order, so this is the exact serial
+        // recurrence and does not touch any rejected branch.
+        const int pending_count = meta[5];
+        for (int t = 0; t < pending_count; ++t) {
+            const int64_t th = ((int64_t)t*n_layers + layer)*H + h_idx;
+            const float g_val = expf(pending_g[th]);
+            const float delta = pending_v[th*S_v + col];
+#pragma unroll
+            for (int r = 0; r < rows_per_lane; ++r) {
+                const int row = r*warp_size + lane;
+                const float k_val = pending_k[th*S_v + row];
+                state_shard[r] = fmaf(k_val, delta, g_val*state_shard[r]);
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; ++r) {
+            const int row = r*warp_size + lane;
+            state_plane[(int64_t)col*S_v + row] = state_shard[r];
+        }
+    } else {
+        const float * boundary = packed + boundary_base +
+            ((int64_t)parent_boundary*H + h_idx)*S_v*S_v +
+            (int64_t)col*S_v;
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; ++r) {
+            const int row = r*warp_size + lane;
+            state_shard[r] = boundary[row];
+        }
+    }
+
+    const int begin = meta[offsets_off + chain];
+    const int end   = meta[offsets_off + chain + 1];
+    for (int p = begin; p < end; ++p) {
+        const int node = meta[order_off + p];
+        const float * q_t = q + (int64_t)node*sq2 + (int64_t)h_idx*sq1;
+        const float * k_t = k + (int64_t)node*sq2 + (int64_t)h_idx*sq1;
+        const float * v_t = v + (int64_t)node*sv2 + (int64_t)h_idx*sv1;
+        const int64_t gb = (int64_t)node*sb2 + (int64_t)h_idx*sb1;
+        const float g_log = g[gb];
+        const float g_val = expf(g_log);
+        const float beta_val = beta[gb];
+
+        float kv_partial = 0.0f;
+        float k_reg[rows_per_lane];
+        float q_reg[rows_per_lane];
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; ++r) {
+            const int row = r*warp_size + lane;
+            k_reg[r] = k_t[row];
+            q_reg[r] = q_t[row];
+            kv_partial += state_shard[r]*k_reg[r];
+        }
+        const float kv_col = warp_reduce_sum<warp_size>(kv_partial);
+        const float delta = (v_t[col] - g_val*kv_col)*beta_val;
+
+        float attn_partial = 0.0f;
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; ++r) {
+            state_shard[r] = fmaf(k_reg[r], delta, g_val*state_shard[r]);
+            attn_partial += state_shard[r]*q_reg[r];
+        }
+        const float attn_col = warp_reduce_sum<warp_size>(attn_partial);
+        if (lane == 0) {
+            packed[((int64_t)node*H + h_idx)*S_v + col] =
+                attn_col*scale;
+            const int64_t nh = ((int64_t)node*n_layers + layer)*H + h_idx;
+            current_v[nh*S_v + col] = delta;
+            if (col == 0) current_g[nh] = g_log;
+        }
+        if (col == 0) {
+            const int64_t nh = ((int64_t)node*n_layers + layer)*H + h_idx;
+#pragma unroll
+            for (int r = 0; r < rows_per_lane; ++r) {
+                const int row = r*warp_size + lane;
+                current_k[nh*S_v + row] = k_reg[r];
+            }
+        }
+
+        const int boundary_slot = meta[boundary_off + node];
+        if (boundary_slot >= 0) {
+            float * boundary = packed + boundary_base +
+                ((int64_t)boundary_slot*H + h_idx)*S_v*S_v +
+                (int64_t)col*S_v;
+#pragma unroll
+            for (int r = 0; r < rows_per_lane; ++r) {
+                const int row = r*warp_size + lane;
+                boundary[row] = state_shard[r];
+            }
+        }
+    }
+}
+
+static void launch_gated_delta_net_specla(
+        ggml_backend_cuda_context & ctx,
+        ggml_tensor * dst) {
+    ggml_tensor * q = dst->src[0];
+    ggml_tensor * k = dst->src[1];
+    ggml_tensor * v = dst->src[2];
+    ggml_tensor * g = dst->src[3];
+    ggml_tensor * beta = dst->src[4];
+    ggml_tensor * state = dst->src[5];
+    ggml_tensor * hld = dst->src[6];
+    ggml_tensor * factor_ptrs = dst->src[7];
+    const int S_v = (int)v->ne[0];
+    const int H = (int)v->ne[1];
+    const int n_tokens = (int)v->ne[2];
+    const int n_chains = ggml_get_op_params_i32(dst, 4);
+    const int n_waves = ggml_get_op_params_i32(dst, 5);
+    const int n_layers = ggml_get_op_params_i32(dst, 6);
+    const int layer = ggml_get_op_params_i32(dst, 7);
+    const int pending_bank = ggml_get_op_params_i32(dst, 8);
+    const int max_parallel_chains = ggml_get_op_params_i32(dst, 9);
+    GGML_ASSERT(v->ne[3] == 1 && g->ne[0] == 1);
+    GGML_ASSERT(hld->type == GGML_TYPE_I32 && n_chains > 0 && n_waves > 0);
+    GGML_ASSERT(ggml_is_contiguous(state));
+
+    const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+    constexpr int num_warps = 4;
+    const dim3 block(warp_size <= S_v ? warp_size : S_v, num_warps, 1);
+    const dim3 grid((unsigned)H, (unsigned)max_parallel_chains,
+                    (unsigned)((S_v + num_warps - 1)/num_warps));
+    const float scale = 1.0f/sqrtf((float)S_v);
+    auto launch = [&](auto SV, int wave) {
+        constexpr int kSV = decltype(SV)::value;
+        gated_delta_net_specla_hld_cuda<kSV><<<grid, block, 0, ctx.stream()>>>(
+            (const float *)q->data, (const float *)k->data,
+            (const float *)v->data, (const float *)g->data,
+            (const float *)beta->data, (float *)state->data,
+            (const int *)hld->data,
+            (const int64_t *)factor_ptrs->data,
+            (float *)dst->data, H, n_tokens, n_layers, layer, pending_bank,
+            q->nb[1]/sizeof(float), q->nb[2]/sizeof(float),
+            v->nb[1]/sizeof(float), v->nb[2]/sizeof(float),
+            beta->nb[1]/sizeof(float), beta->nb[2]/sizeof(float),
+            n_chains, wave, scale);
+    };
+    for (int wave = 0; wave < n_waves; ++wave) {
+        switch (S_v) {
+            case 16:  launch(std::integral_constant<int, 16>{}, wave); break;
+            case 32:  launch(std::integral_constant<int, 32>{}, wave); break;
+            case 64:  launch(std::integral_constant<int, 64>{}, wave); break;
+            case 128: launch(std::integral_constant<int, 128>{}, wave); break;
+            default: GGML_ABORT("Unsupported SpecLA GDN state size");
+        }
+    }
+}
+
 void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (ggml_get_op_params_i32(dst, 2) == 1) {
+        launch_gated_delta_net_specla(ctx, dst);
+        return;
+    }
     ggml_tensor * src_q     = dst->src[0];
     ggml_tensor * src_k     = dst->src[1];
     ggml_tensor * src_v     = dst->src[2];

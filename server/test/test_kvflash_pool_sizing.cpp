@@ -20,6 +20,11 @@ struct KvflashPoolSizingFixture {};
 }
 
 TEST_CASE(KvflashPoolSizingFixture, kvflash_pool_sizing_suite) {
+    REQUIRE(!kvflash_pool_requested(nullptr));
+    REQUIRE(!kvflash_pool_requested("0"));
+    REQUIRE(kvflash_pool_requested("auto"));
+    REQUIRE(kvflash_pool_requested("4096"));
+
     REQUIRE(!kvflash_fixed_pool_requested(nullptr));
     REQUIRE(!kvflash_fixed_pool_requested("0"));
     REQUIRE(!kvflash_fixed_pool_requested("auto"));

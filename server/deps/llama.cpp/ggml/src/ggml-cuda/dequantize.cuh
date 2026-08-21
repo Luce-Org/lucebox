@@ -168,11 +168,23 @@ static __device__ __forceinline__ void dequantize_rocmfpx_fp2(const void * vx, c
 
     const int i0 = iqs + 0;
     const int i1 = iqs + 1;
+
+#ifdef ROCMFP2_AFFINE
+    // Affine qtype-107 stores one (scale, offset) pair per 32-weight block:
+    // value = code*scale - offset, with code in [0, 3]. This wire format is
+    // incompatible with the default two-scale ROCmFP2 layout.
+    const float scale  = rocmfpx_ue4m3_to_fp32_finite(x[ib].e[0]);
+    const float offset = rocmfpx_ue4m3_to_fp32_finite(x[ib].e[1]);
+
+    v.x = (float) (rocmfpx_get_fp2_code_cuda(x[ib].qs, i0) & 3u) * scale - offset;
+    v.y = (float) (rocmfpx_get_fp2_code_cuda(x[ib].qs, i1) & 3u) * scale - offset;
+#else
     const float d0 = rocmfpx_ue4m3_to_fp32_finite(x[ib].e[i0 >= QK_ROCMFP2/2]);
     const float d1 = rocmfpx_ue4m3_to_fp32_finite(x[ib].e[i1 >= QK_ROCMFP2/2]);
 
     v.x = d0 * rocmfpx_decode_fp2_code_cuda(rocmfpx_get_fp2_code_cuda(x[ib].qs, i0));
     v.y = d1 * rocmfpx_decode_fp2_code_cuda(rocmfpx_get_fp2_code_cuda(x[ib].qs, i1));
+#endif
 }
 
 static __device__ __forceinline__ void dequantize_rocmfpx_fp6(const void * vx, const int64_t ib, const int iqs, float2 & v) {

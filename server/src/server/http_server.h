@@ -458,6 +458,7 @@ private:
         std::vector<int> dependencies;                    // call indices referenced by $k.path
         nlohmann::json resolved_arguments;                // after substitution (dependent calls)
         nlohmann::json result;                            // executor result on hit
+        bool has_result = false;                          // JSON null is a valid result
         bool done = false;
         int wave = 0;
     };
@@ -469,6 +470,7 @@ private:
         bool early_dispatch = false;
         std::string early_text;
         size_t early_scan_pos = 0;
+        int early_call_count = 0;
         std::vector<EarlyDispatchEntry> early_entries;
     };
 
@@ -663,7 +665,6 @@ struct ServerJob {
     // so their bytes can never interleave.
     std::mutex    write_mu;
     bool          stream_ready = false;
-    bool          read_close_probe_sent = false;
     size_t        heartbeat_offset = 0;
     std::chrono::steady_clock::time_point last_stream_write{};
     std::atomic<bool> client_disconnected{false};

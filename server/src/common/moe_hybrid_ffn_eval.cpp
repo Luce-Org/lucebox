@@ -151,6 +151,19 @@ int moe_balanced_main_slots_x4(int top_k, double main_to_peer_rate) {
     return total - peer;
 }
 
+MoeHybridOwnerMapView moe_hybrid_owner_maps(
+        const MoeHybridLayerStorage & storage,
+        bool dynamic_route_balance) {
+    return {
+        dynamic_route_balance || storage.decode_hot_local_by_global.empty()
+            ? &storage.hot_local_by_global
+            : &storage.decode_hot_local_by_global,
+        dynamic_route_balance || storage.decode_cold_local_by_global.empty()
+            ? &storage.cold_local_by_global
+            : &storage.decode_cold_local_by_global,
+    };
+}
+
 // The serial balanced-owner assignment is qualified for the q=5 DSpark
 // verifier. Wider batches retain the ordinary parallel owner remap.
 constexpr int kDynamicRouteBalanceMaxTokens = 5;
@@ -1176,19 +1189,6 @@ bool build_moe_hybrid_ffn_graph(
     // Expose the canonical tensor so the scheduler can keep it on the primary
     // backend rather than discovering it late through the secondary branch.
     out.router_weights = router_weights;
-    MoeOwnerGraphSpec primary_owner{
-        &storage.hot_local_by_global,
-        storage.gate_hot, storage.up_hot, storage.down_hot,
-        storage.gate_up_hot,
-        &out.hot_local_lut, &out.hot_valid_lut,
-        &out.hot_remap_nodes, &out.hot_nodes};
-    MoeOwnerGraphSpec secondary_owner{
-        &storage.cold_local_by_global,
-        storage.gate_cold, storage.up_cold, storage.down_cold,
-        storage.gate_up_cold,
-        &out.cold_local_lut, &out.cold_valid_lut,
-        &out.cold_remap_nodes, &out.cold_nodes};
-
     double derived_main_to_peer_rate = 0.0;
     int dynamic_main_slots_x4 =
         route_balance == MoeHybridRouteBalance::Allowed
@@ -1196,17 +1196,35 @@ bool build_moe_hybrid_ffn_graph(
                   n_used, &derived_main_to_peer_rate)
             : 0;
 
+    // Dynamic balancing routes by physical residency, not by the optional
+    // phase-specific decode placement. In particular, the decode peer map may
+    // intentionally omit experts assigned to the main owner, while the
+    // physical peer map still contains the complete fallback copy required by
+    // the dynamic complement.
+    const MoeHybridOwnerMapView physical_maps =
+        moe_hybrid_owner_maps(storage, true);
     const bool complete_secondary_map =
-        secondary_owner.local_by_global &&
-        (int) secondary_owner.local_by_global->size() == cfg.n_expert &&
+        physical_maps.peer &&
+        (int) physical_maps.peer->size() == cfg.n_expert &&
         std::none_of(
-            secondary_owner.local_by_global->begin(),
-            secondary_owner.local_by_global->end(),
+            physical_maps.peer->begin(), physical_maps.peer->end(),
             [](int32_t local) { return local < 0; });
+    const bool physical_primary_map_available =
+        physical_maps.main &&
+        (int) physical_maps.main->size() == cfg.n_expert &&
+        std::any_of(
+            physical_maps.main->begin(), physical_maps.main->end(),
+            [](int32_t local) { return local >= 0; });
+    const bool physical_primary_available = physical_primary_map_available &&
+        (storage.gate_up_hot || (storage.gate_hot && storage.up_hot)) &&
+        storage.down_hot;
+    const bool physical_secondary_available =
+        (storage.gate_up_cold || (storage.gate_cold && storage.up_cold)) &&
+        storage.down_cold;
     if (dynamic_main_slots_x4 > 0 &&
         (n_tokens > kDynamicRouteBalanceMaxTokens ||
-         !primary_owner.available() ||
-         !secondary_owner.available() || !complete_secondary_map)) {
+         !physical_primary_available ||
+         !physical_secondary_available || !complete_secondary_map)) {
         static std::once_flag fallback_log;
         std::call_once(fallback_log, [n_tokens] {
             std::fprintf(stderr,
@@ -1217,6 +1235,27 @@ bool build_moe_hybrid_ffn_graph(
         dynamic_main_slots_x4 = 0;
     }
     out.dynamic_route_balance = dynamic_main_slots_x4 > 0;
+
+    const MoeHybridOwnerMapView owner_maps =
+        moe_hybrid_owner_maps(storage, out.dynamic_route_balance);
+    const bool main_has_experts = owner_maps.main && std::any_of(
+        owner_maps.main->begin(), owner_maps.main->end(),
+        [](int32_t local) { return local >= 0; });
+    MoeOwnerGraphSpec primary_owner{
+        owner_maps.main,
+        main_has_experts ? storage.gate_hot : nullptr,
+        main_has_experts ? storage.up_hot : nullptr,
+        main_has_experts ? storage.down_hot : nullptr,
+        main_has_experts ? storage.gate_up_hot : nullptr,
+        &out.hot_local_lut, &out.hot_valid_lut,
+        &out.hot_remap_nodes, &out.hot_nodes};
+    MoeOwnerGraphSpec secondary_owner{
+        owner_maps.peer,
+        storage.gate_cold, storage.up_cold, storage.down_cold,
+        storage.gate_up_cold,
+        &out.cold_local_lut, &out.cold_valid_lut,
+        &out.cold_remap_nodes, &out.cold_nodes};
+
     if (dynamic_main_slots_x4 > 0) {
         static std::once_flag active_log;
         std::call_once(
@@ -2614,7 +2653,7 @@ static bool eval_moe_hybrid_remote_cold_batched(
 // reduced-stack MUL_MAT_ID stream-k path (which is both slow for a 24-expert
 // stack and unstable for very large batches) and lets each expert's weights be
 // reused across all of its prompt rows.
-static bool expert_major_prefill_enabled(int n_tokens) {
+bool moe_expert_major_prefill_enabled(int n_tokens) {
     static const bool enabled = []() {
         const char * raw = std::getenv("DFLASH_MOE_EXPERT_MAJOR_PREFILL");
         return !raw || !*raw || std::strcmp(raw, "0") != 0;
@@ -2637,6 +2676,17 @@ static bool expert_major_gpu_reduce_enabled() {
     }();
     return enabled;
 }
+
+
+static bool expert_major_pinned_output_enabled() {
+    static const bool enabled = []() {
+        const char * raw =
+            std::getenv("DFLASH_MOE_EXPERT_MAJOR_PINNED_OUTPUT");
+        return raw && *raw && std::strcmp(raw, "0") != 0;
+    }();
+    return enabled;
+}
+
 
 static bool full_cold_parallel_enabled() {
     static const bool enabled = []() {
@@ -2762,7 +2812,8 @@ static bool eval_moe_owner_expert_major_batched(
         }
     }
 
-    const bool gpu_reduce = expert_major_gpu_reduce_enabled() && n_pairs > 0;
+    const bool gpu_reduce =
+        expert_major_gpu_reduce_enabled() && n_pairs > 0;
 
     ggml_init_params ip{};
     ip.mem_size = 128 * 1024 * 1024;
@@ -2981,8 +3032,34 @@ static bool eval_moe_owner_expert_major_batched(
             backend, device_output_owner, combined_out, device_output);
         ggml_backend_synchronize(device_output_owner);
     } else if (gpu_reduce) {
-        ggml_backend_tensor_get(combined_out, out.data(), 0,
-                                sizeof(float) * out.size());
+        const size_t output_bytes = sizeof(float) * out.size();
+        if (expert_major_pinned_output_enabled()) {
+            ggml_backend_dev_t owner_device =
+                ggml_backend_get_device(backend);
+            ggml_backend_buffer_type_t host_buft = owner_device
+                ? ggml_backend_dev_host_buffer_type(owner_device)
+                : nullptr;
+            ggml_backend_buffer_t staging = host_buft
+                ? ggml_backend_buft_alloc_buffer(host_buft, output_bytes)
+                : nullptr;
+            if (!staging ||
+                ggml_backend_buffer_get_size(staging) < output_bytes) {
+                if (staging) ggml_backend_buffer_free(staging);
+                if (!p_alloc) ggml_gallocr_free(alloc);
+                ggml_free(ctx);
+                if (err) *err =
+                    "expert-major pinned output allocation failed";
+                return false;
+            }
+            void * staging_ptr = ggml_backend_buffer_get_base(staging);
+            ggml_backend_tensor_get(
+                combined_out, staging_ptr, 0, output_bytes);
+            std::memcpy(out.data(), staging_ptr, output_bytes);
+            ggml_backend_buffer_free(staging);
+        } else {
+            ggml_backend_tensor_get(combined_out, out.data(), 0,
+                                    output_bytes);
+        }
     } else {
         std::vector<float> packed_result(n_pairs * (size_t)n_embd);
         if (packed_out) {
@@ -3250,7 +3327,7 @@ bool eval_moe_hybrid_ffn_batched(
                             : 0;
     const bool cold_on_gpu = storage.cold_backend_kind == MoeHybridColdBackend::Gpu;
     const bool inprocess_expert_major =
-        !expert_compute && expert_major_prefill_enabled(n_tokens) &&
+        !expert_compute && moe_expert_major_prefill_enabled(n_tokens) &&
         cold_on_gpu && storage.cold_backend &&
         storage.cold_backend != gpu_backend &&
         n_hot_stack > 0 && n_cold_stack > 0 &&
@@ -3320,7 +3397,7 @@ bool eval_moe_hybrid_ffn_batched(
     // instead. The primary-local map takes priority in the core evaluator, so
     // skip_hot makes the duplicated secondary stack evaluate its routes only.
     const bool inprocess_full_cold_hot_expert_major =
-        !expert_compute && expert_major_prefill_enabled(n_tokens) &&
+        !expert_compute && moe_expert_major_prefill_enabled(n_tokens) &&
         cold_on_gpu && storage.cold_backend &&
         storage.cold_backend != gpu_backend &&
         n_hot_stack > 0 && n_cold_stack == cfg.n_expert;

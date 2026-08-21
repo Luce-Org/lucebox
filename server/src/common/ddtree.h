@@ -9,6 +9,8 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
+#include <limits>
 #include <queue>
 #include <unordered_map>
 #include <vector>
@@ -48,10 +50,35 @@ void extract_draft_topk(const float * logits,
 // K:             top-K per position
 // budget:        maximum number of non-root tree nodes
 // chain_seed:    pre-seed full top-1 chain (defensive) vs pure best-first
+// tau_tree:      SpecLA confidence margin (arXiv:2607.16673 §6.1): only
+//                candidates with cumulative path log-probability
+//                q(v) >= q* - tau_tree are expanded, where q* is the best
+//                candidate score. Because best-first pops in descending q,
+//                one comparison prunes width and depth jointly, and the
+//                retained set is ancestor-closed by construction. The node
+//                budget still applies on top. Non-finite (default) = off.
+//                The chain seed is pruned at the first out-of-window depth,
+//                preserving ancestor closure.
 DDTree build_ddtree(const float * top_log_probs,
                     const int32_t * top_token_ids,
                     int L, int K, int budget,
-                    bool chain_seed = true);
+                    bool chain_seed = true,
+                    float tau_tree = std::numeric_limits<float>::infinity());
+
+// Branch-conditioned variant used by SpecLA. The callback receives the token
+// prefix of a tree node and the 1-based depth to predict next, and returns K
+// sorted log-probabilities/token ids for that exact prefix.
+using DDTreeConditionalTopK = std::function<bool(
+    const std::vector<int32_t> & prefix,
+    int next_depth,
+    std::vector<float> & log_probs,
+    std::vector<int32_t> & token_ids)>;
+
+DDTree build_ddtree_conditional(const DDTreeConditionalTopK & next_topk,
+                                int L, int K, int budget,
+                                bool chain_seed = true,
+                                float tau_tree =
+                                    std::numeric_limits<float>::infinity());
 
 // Walk the verified tree following the target's argmax (posterior) at each
 // node. Returns the list of flat-tree indices that make up the accepted path

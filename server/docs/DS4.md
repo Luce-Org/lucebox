@@ -22,6 +22,15 @@ DeepSeek V4 Flash is a 43-layer MoE model with:
 | Indexer | Top-k scorer on ratio-4 layers for compressed KV selection |
 | HC (Hierarchical Controller) | 4 parallel residual streams, Sinkhorn-normalized combine |
 
+## Tool-call compatibility
+
+The native DeepSeek V4 renderer requests `<function_call>` output. The parser
+also accepts named bare-JSON fallbacks emitted by compatible checkpoints:
+`{"function":"name","parameters":{...}}` and the legacy OpenAI
+`{"function_call":{"name":"name","arguments":{...}}}` envelope. Named JSON
+calls remain unambiguous when a request supplies more than one tool; ordinary
+JSON that does not resolve to an allowed tool is preserved as assistant text.
+
 ## Code Layout
 
 | Area | Files |
@@ -144,6 +153,94 @@ qualification used a fixed q=4 local drafter, two discarded warm-ups, R9700
 decode and 415.52 tok/s median sparse prefill. Those numbers require the full
 qualified manifest, including the burn-in kernel switches; they are not a
 claim for the minimal activation example above.
+
+#### Radeon RX 7900 XT + Strix Halo, true top-k-6
+
+The portable `scripts/serve_ds4_dual_rocm_128k.sh` profile captures the
+qualified fixed-codebook ROCmFPx configuration for a 20 GiB gfx1100 discrete
+GPU plus a 128 GiB gfx1151 Strix Halo. It keeps the model-default six routed
+experts, places dense work and calibrated hot experts on gfx1100, and runs the
+remaining experts and DSpark drafter on gfx1151. This profile is for uniform
+or fixed-codebook expert tensors. Adaptive qtype-105/106 expert tensors remain
+monolithic-only because their codebook registrations cannot follow a sliced
+expert allocation.
+
+Build for both targets with affine qtype-107 support enabled:
+
+```bash
+cmake -S server -B server/build-hip-dual \
+  -DDFLASH27B_GPU_BACKEND=hip \
+  -DDFLASH27B_HIP_ARCHITECTURES='gfx1100;gfx1151' \
+  -DDFLASH27B_ROCMFP2_AFFINE=ON \
+  -DGGML_HIP_GRAPHS=ON \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build server/build-hip-dual -j
+```
+
+Placement depends on the workload's routing distribution. Capture a profile
+with representative requests, stop the server so it flushes the CSV, then use
+that CSV for serving:
+
+```bash
+DFLASH_DS4_ROUTING_STATS_OUT=/tmp/ds4-routing.csv \
+  server/scripts/serve_ds4_dual_rocm_128k.sh \
+  /path/to/target.gguf /path/to/dspark.gguf
+
+DFLASH_DS4_HOTNESS_CSV=/tmp/ds4-routing.csv \
+  server/scripts/serve_ds4_dual_rocm_128k.sh \
+  /path/to/target.gguf /path/to/dspark.gguf
+```
+
+The script defaults to `hip:0` for gfx1100, peer and draft device `1` for
+gfx1151, a 10,200 MiB discrete-GPU expert budget, 135,168 context slots
+(128 KiB prompt plus 4 KiB generation headroom), sparse prefill, and disabled
+prefix/prefill caches. Every device, budget, context, build, host, and port
+setting is environment-overridable at the top of the script.
+
+The controlled decode workload is deliberately predictable: temperature zero,
+true top-k-6, fixed DSpark q=4, one warm-up, three fresh 512-token `BETA`
+sequence requests, and no prefix or prefill cache. It measures the upper-bound
+speculative path, not typical conversational or agent throughput. Run the
+checked-in harness against the qualified profile:
+
+```bash
+python3 server/scripts/bench_ds4_decode.py \
+  --url http://127.0.0.1:8016 \
+  --model dflash \
+  --warmups 1 \
+  --runs 3 \
+  --max-tokens 512
+```
+
+The harness rejects partial generations, cache hits, and autoregressive
+fallbacks, requires the measured outputs to be byte-identical, and records
+server-reported decode timing, acceptance, and output SHA-256 values as JSON.
+On a Radeon RX 7900 XT plus
+Ryzen AI Max+ 395, a clean rebase onto upstream `main` using the script's
+default 10,200 MiB expert budget and 135,168-token context produced 100%
+speculative acceptance and one byte-identical output digest:
+
+| Run | Decode time | Throughput |
+|---:|---:|---:|
+| 1 | 11.3772 s | 45.0 tok/s |
+| 2 | 10.9023 s | 47.0 tok/s |
+| 3 | 10.7302 s | 47.7 tok/s |
+
+Retain that JSON with the target and draft GGUF SHA-256 values, build revision,
+ROCm version, GPU identifiers, launch environment, and context length. An
+earlier qualified build produced three 46.8 tok/s runs; its previous
+same-hardware route/dispatch baseline was 37.7 tok/s, a 24.1% improvement.
+The checked-in kernel test verifies actual affine MMQ dispatch on gfx1151 and
+gfx12xx. gfx1100 uses the supported non-MMQ fallback and is not claimed as an
+MMQ qualification.
+
+Sparse-prefill records used several explicitly different approximation
+profiles and must not be compared as if the launch settings were identical.
+A true top-k-6 128 KiB sweep measured 111.2 tok/s at 132,981 tokens. Older
+top-k-4 profiles measured 194.51 tok/s at 12,281 tokens, 158.9-164.3 tok/s
+around 2K tokens, and 53.1 tok/s at 257,965 tokens. Sparse prefill is an
+explicit approximation; applications that require reference-exact prompt
+ingestion must use `--ds4-prefill exact` and remeasure.
 
 #### CUDA 3090 + Strix Halo in one process
 
@@ -343,8 +440,17 @@ export DFLASH_DS4_SPEC_Q=4
 
 ./server/build-hip/dflash_server /path/to/deepseek4-target.gguf \
   --target-device hip:0 \
+  --ds4-fused-verify-f16-kv \
   --ds4-fused-decode
 ```
+
+`--ds4-fused-verify-f16-kv` feeds the persistent F16 MLA cache directly to
+batched explicit verifier attention instead of converting the full cache to
+F32 on every speculative step. Key-side accumulation remains F32 through 512
+attention rows to preserve the short-context quality baseline. The option is
+currently qualified only for a single HIP target and remains off by default.
+It changes verifier floating-point inputs and can change generated tokens, so
+re-run workload quality checks before enabling it for another checkpoint.
 
 `DFLASH_DS4_FUSED_VERIFY=1` is the opt-in throughput profile. Its persistent
 whole-model GPU graph uses stable padded reduction shapes, so near-tied greedy
@@ -362,6 +468,44 @@ reported and falls back to normal autoregressive decode. The target cache and
 sampler stay on the main backend while routed target experts execute on their
 configured owners. `--ds4-expert-top-k 4` remains a separate approximate
 policy; omit it to retain the model's default six routed experts.
+
+### Silent AR fallback (check this before calling spec decode broken)
+
+The DSpark verifier is greedy-only, so the server routes a request to plain
+autoregressive decode — with the drafter loaded and `DSpark spec-decode
+ENABLED` already printed at startup — whenever any of these hold:
+
+- the effective sampler is non-greedy (`temperature > 0`, repetition or
+  presence/frequency penalties),
+- the request carries budget stop tokens,
+- the request forces AR explicitly.
+
+The sampler trap is the subtle one: when a request **omits** `temperature`,
+the HTTP layer falls back to the model card's sampling defaults, and
+`share/model_cards/deepseek-v4-flash-0731-rocmfpx.json` sets
+`temperature: 1.0`. A temperature-less benchmark request therefore decodes
+pure AR on any build that ships the card, while the same request engages
+speculation on a tree without it — which looks exactly like a spec-decode
+regression between the two binaries. It is not one; send
+`"temperature": 0.0` explicitly. The tell in the log is `decode tokens=N
+steps=N-1` (one step per token) instead of `[ds4-spec] gen=... steps=...`
+lines; the server also now logs one `DSpark spec loaded but this request
+decodes AR: ...` line naming the condition the first time it happens.
+
+Speculative throughput is acceptance-bound, and acceptance is workload-bound:
+on the gfx1151 host, code/math prompts (accept 0.83–0.90, ~2.4 committed
+tokens per verify step) measured 24–27 tok/s where open-ended prose (accept
+0.64–0.69, ~1.1 committed per step) measured 16–18 tok/s from the same server
+under the same flags. Judge a spec-decode number against the acceptance it
+was measured at, not against the headline figure from a different prompt mix
+(see the gfx1151 numbers below for the measured governor/top-k envelope).
+
+Measure on an otherwise idle box. Strix Halo decode is unified-memory
+bandwidth bound, so an unrelated co-tenant compile on the same host dropped
+the identical request from 18.2 to 3.8 tok/s — a 5x swing with no change to
+the acceptance rate or the step count, which is what makes it easy to misread
+as a model or kernel regression. Record `/proc/loadavg` alongside any tok/s
+figure, and re-run anything anomalous before believing it.
 
 ### Verifier graph-cache safety
 

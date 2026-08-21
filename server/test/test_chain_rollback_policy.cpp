@@ -53,6 +53,9 @@ TEST_CASE(ChainRollbackPolicyFixture, policy_defaults_and_env_parsing) {
     policy = resolve_chain_rollback_policy(true);
     CHECK(!policy.checkpoint_f32);
     CHECK(policy.fast_rollback_threshold == 1);
+    policy = resolve_chain_rollback_policy(false, true);
+    CHECK(!policy.checkpoint_f32);
+    CHECK(policy.fast_rollback_threshold == 1);
     setenv("DFLASH_SINGLE_CHAIN_CHECKPOINT_F32", "1", 1);
 
     // Boolean flags follow the project's non-empty, non-"0" convention.

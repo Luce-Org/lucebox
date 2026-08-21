@@ -39,5 +39,5 @@ if [[ -n "${PREFIX_CACHE_SLOTS_OVERRIDE}" ]]; then
   extra_args+=(--prefix-cache-slots "${PREFIX_CACHE_SLOTS_OVERRIDE}")
 fi
 export LD_LIBRARY_PATH="${CANDIDATE_BUILD}/deps/llama.cpp/ggml/src:${CANDIDATE_BUILD}/deps/llama.cpp/ggml/src/ggml-hip:${LD_LIBRARY_PATH:-}"
-export LUCE_MMVQ_MAX_NCOLS=5
+export LUCE_MMVQ_MAX_NCOLS="${LUCE_MMVQ_MAX_NCOLS:-5}"
 exec "${CANDIDATE_BUILD}/dflash_server" "$@" "${extra_args[@]}"

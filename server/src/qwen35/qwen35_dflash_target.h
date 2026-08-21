@@ -44,7 +44,10 @@ public:
     bool snapshot_kv() override;
     bool restore_kv() override;
     bool supports_fast_rollback() const override;
+    bool exact_fast_rollback() const override { return specla_active(); }
+    bool rollback_failure_is_recoverable() const override { return !specla_active(); }
     bool rollback_to(int base_pos, int commit_n) override;
+    bool finish_speculative_state() override;
 
     bool supports_tree_verify() const override;
     bool verify_tree(int committed,
@@ -98,6 +101,19 @@ private:
     int fa_window_;
     KvFlashPager * pager_ = nullptr;
     bool fast_rollback_ = false;
+
+    // SpecLA (DFLASH_SPECLA=1, docs/SPECLA.md): true when the cache was
+    // migrated with factor buffers. Capture-verify then runs the
+    // topology-masked factor path, never mutates durable SSM/conv state
+    // (snapshot/restore become no-ops), and rollback commits via
+    // DeltaConstruct instead of dense checkpoint copies.
+    bool specla_active() const {
+        return fast_rollback_ && pager_ == nullptr && !cache_.factor_k.empty();
+    }
+
+    // SpecLA chain commit: DeltaConstruct over the accepted prefix plus a
+    // fused shift/append of raw convolution factors.
+    bool rollback_to_specla(int base_pos, int commit_n);
 
     // Cached vector form of capture layer IDs (built once in constructor).
     std::vector<int> capture_ids_;

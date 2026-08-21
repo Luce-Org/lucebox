@@ -32,10 +32,15 @@
 
 #include "internal.h"
 #include "delta_net_chunked.h"
+#include "delta_net_specla.h"
 #include "kv_quant.h"
 #include "qwen35_ops.h"
 #include "qwen35moe_ffn.h"
 #include "common/chain_rollback_policy.h"
+#include "common/specla_commit_cuda.h"
+#include "common/specla_mode.h"
+
+#include "ggml-alloc.h"
 
 #include <cmath>
 #include <cstdio>
@@ -371,6 +376,47 @@ bool create_target_cache_partial(const TargetWeights & w,
     return true;
 }
 
+static void refresh_specla_state_ptrs(TargetCache & c) {
+    if (!c.specla_state_ptrs) return;
+    const int n_delta = (int)c.ssm_state.size();
+    if (c.specla_state_ptrs->ne[0] != n_delta) return;
+    std::vector<int64_t> ptrs((size_t)n_delta, 0);
+    for (int dn = 0; dn < n_delta; dn++) {
+        if (!c.ssm_state[dn]) return;
+        ptrs[(size_t)dn] = (int64_t)(intptr_t)c.ssm_state[dn]->data;
+    }
+    ggml_backend_tensor_set(c.specla_state_ptrs, ptrs.data(), 0,
+                            sizeof(int64_t) * ptrs.size());
+    if (c.specla_conv_state_ptrs &&
+        c.specla_conv_state_ptrs->ne[0] == n_delta &&
+        (int)c.conv_state.size() == n_delta) {
+        for (int dn = 0; dn < n_delta; ++dn) {
+            if (!c.conv_state[dn]) return;
+            ptrs[(size_t)dn] = (int64_t)(intptr_t)c.conv_state[dn]->data;
+        }
+        ggml_backend_tensor_set(c.specla_conv_state_ptrs, ptrs.data(), 0,
+                                sizeof(int64_t) * ptrs.size());
+    }
+    if (c.specla_factor_ptrs && c.specla_factor_ptrs->ne[0] == 8 &&
+        c.factor_k_all && c.factor_v_new_all && c.factor_g_ps_all &&
+        c.conv_factor_all && c.factor_k_all_alt &&
+        c.factor_v_new_all_alt && c.factor_g_ps_all_alt &&
+        c.conv_factor_all_alt) {
+        const int64_t factor_ptrs[8] = {
+            (int64_t)(intptr_t)c.factor_k_all->data,
+            (int64_t)(intptr_t)c.factor_v_new_all->data,
+            (int64_t)(intptr_t)c.factor_g_ps_all->data,
+            (int64_t)(intptr_t)c.conv_factor_all->data,
+            (int64_t)(intptr_t)c.factor_k_all_alt->data,
+            (int64_t)(intptr_t)c.factor_v_new_all_alt->data,
+            (int64_t)(intptr_t)c.factor_g_ps_all_alt->data,
+            (int64_t)(intptr_t)c.conv_factor_all_alt->data,
+        };
+        ggml_backend_tensor_set(c.specla_factor_ptrs, factor_ptrs, 0,
+                                sizeof(factor_ptrs));
+    }
+}
+
 void free_target_cache(TargetCache & c) {
     if (c.base_buf)     { ggml_backend_buffer_free(c.base_buf);     c.base_buf     = nullptr; }
     if (c.base_ctx)     { ggml_free(c.base_ctx);                   c.base_ctx     = nullptr; }
@@ -384,6 +430,27 @@ void free_target_cache(TargetCache & c) {
     c.conv_state_snap.clear();
     c.ssm_intermediate.clear();
     c.conv_input_cache.clear();
+    c.conv_input_cache_alt.clear();
+    c.factor_k.clear();
+    c.factor_v_new.clear();
+    c.factor_g_ps.clear();
+    c.factor_k_alt.clear();
+    c.factor_v_new_alt.clear();
+    c.factor_g_ps_alt.clear();
+    c.factor_k_all = nullptr;
+    c.factor_v_new_all = nullptr;
+    c.factor_g_ps_all = nullptr;
+    c.factor_k_all_alt = nullptr;
+    c.factor_v_new_all_alt = nullptr;
+    c.factor_g_ps_all_alt = nullptr;
+    c.conv_factor_all = nullptr;
+    c.conv_factor_all_alt = nullptr;
+    c.specla_idx = nullptr;
+    c.specla_state_ptrs = nullptr;
+    c.specla_conv_state_ptrs = nullptr;
+    c.specla_factor_ptrs = nullptr;
+    c.specla_pending_bank = 0;
+    c.specla_pending_count = 0;
     c.target_feat = nullptr;
     c.q_cap = nullptr;
     c.cur_pos = 0;
@@ -391,10 +458,13 @@ void free_target_cache(TargetCache & c) {
 
 void reset_target_cache(TargetCache & c) {
     c.cur_pos = 0;
+    c.specla_pending_bank = 0;
+    c.specla_pending_count = 0;
     if (c.backend && ggml_backend_buft_is_meta(
             ggml_backend_get_default_buffer_type(c.backend))) {
         if (c.base_buf) ggml_backend_buffer_clear(c.base_buf, 0);
         if (c.rollback_buf) ggml_backend_buffer_clear(c.rollback_buf, 0);
+        refresh_specla_state_ptrs(c);
         return;
     }
     std::vector<uint8_t> zeros(1 * 1024 * 1024, 0);
@@ -413,9 +483,14 @@ void reset_target_cache(TargetCache & c) {
             }
         }
     }
+    // reset_target_cache clears the whole rollback buffer, including this
+    // persistent device pointer table. Re-upload it for daemon request 2+.
+    refresh_specla_state_ptrs(c);
 }
 
 void reset_recurrent_state(TargetCache & c) {
+    c.specla_pending_bank = 0;
+    c.specla_pending_count = 0;
     // Device-side clear of the whole base buffer (KV + SSM + conv): with the
     // step-invariant decode the FA span is 256-padded and mask-less, so stale
     // K/V rows from the PREVIOUS request inside the padded tail would be
@@ -459,7 +534,8 @@ bool migrate_prefill_cache(const TargetWeights & w,
                            int max_ctx,
                            int max_verify_tokens,
                            ggml_backend_t backend,
-                           TargetCache & cache) {
+                           TargetCache & cache,
+                           bool enable_specla) {
     // Already migrated (e.g. daemon mode second+ request after reset_target_cache).
     if (cache.rollback_ctx) return true;
 
@@ -474,8 +550,22 @@ bool migrate_prefill_cache(const TargetWeights & w,
     cache.conv_state_snap.assign(n_delta, nullptr);
     cache.ssm_intermediate.assign(n_delta, nullptr);
     cache.conv_input_cache.assign(n_delta, nullptr);
+    cache.conv_input_cache_alt.assign(n_delta, nullptr);
 
-    const int rb_tensors = 4 * n_delta;
+    // SpecLA replaces the dense per-token state checkpoints with compact
+    // per-token factor buffers (~(S_k+S_v+1)·H_v·max_q·4B per layer vs
+    // state_size·max_q per layer) — the paper's §5.1 memory trade.
+    const bool specla = enable_specla && specla_enabled();
+    if (specla) {
+        cache.factor_k.assign(n_delta, nullptr);
+        cache.factor_v_new.assign(n_delta, nullptr);
+        cache.factor_g_ps.assign(n_delta, nullptr);
+        cache.factor_k_alt.assign(n_delta, nullptr);
+        cache.factor_v_new_alt.assign(n_delta, nullptr);
+        cache.factor_g_ps_alt.assign(n_delta, nullptr);
+    }
+
+    const int rb_tensors = (specla ? 12 : 4) * n_delta + (specla ? 1 : 0);
     ggml_init_params ip{};
     ip.mem_size   = (size_t)(rb_tensors + 16) * ggml_tensor_overhead();
     ip.mem_buffer = nullptr;
@@ -489,6 +579,47 @@ bool migrate_prefill_cache(const TargetWeights & w,
     const ggml_type checkpoint_type = rollback_policy.checkpoint_f32
         ? GGML_TYPE_F32 : GGML_TYPE_F16;
 
+    const int head_k_dim = w.ssm_d_state;
+    if (specla) {
+        // Consolidated double-buffered factors. Token-major layout lets one
+        // compaction kernel gather an arbitrary accepted tree path.
+        cache.factor_k_all = ggml_new_tensor_4d(cache.rollback_ctx, GGML_TYPE_F32,
+            head_k_dim, w.ssm_dt_rank, n_delta, max_verify_tokens);
+        cache.factor_v_new_all = ggml_new_tensor_4d(cache.rollback_ctx, GGML_TYPE_F32,
+            head_v_dim, w.ssm_dt_rank, n_delta, max_verify_tokens);
+        cache.factor_g_ps_all = ggml_new_tensor_3d(cache.rollback_ctx, GGML_TYPE_F32,
+            w.ssm_dt_rank, n_delta, max_verify_tokens);
+        cache.factor_k_all_alt = ggml_new_tensor_4d(cache.rollback_ctx, GGML_TYPE_F32,
+            head_k_dim, w.ssm_dt_rank, n_delta, max_verify_tokens);
+        cache.factor_v_new_all_alt = ggml_new_tensor_4d(cache.rollback_ctx, GGML_TYPE_F32,
+            head_v_dim, w.ssm_dt_rank, n_delta, max_verify_tokens);
+        cache.factor_g_ps_all_alt = ggml_new_tensor_3d(cache.rollback_ctx, GGML_TYPE_F32,
+            w.ssm_dt_rank, n_delta, max_verify_tokens);
+        cache.conv_factor_all = ggml_new_tensor_3d(cache.rollback_ctx, GGML_TYPE_F32,
+            conv_ch, n_delta, max_verify_tokens);
+        cache.conv_factor_all_alt = ggml_new_tensor_3d(cache.rollback_ctx, GGML_TYPE_F32,
+            conv_ch, n_delta, max_verify_tokens);
+        ggml_set_name(cache.factor_k_all,     "specla_factor_k_all");
+        ggml_set_name(cache.factor_v_new_all, "specla_factor_v_all");
+        ggml_set_name(cache.factor_g_ps_all,  "specla_factor_g_all");
+        ggml_set_name(cache.factor_k_all_alt,     "specla_factor_k_all_alt");
+        ggml_set_name(cache.factor_v_new_all_alt, "specla_factor_v_all_alt");
+        ggml_set_name(cache.factor_g_ps_all_alt,  "specla_factor_g_all_alt");
+        ggml_set_name(cache.conv_factor_all,      "specla_conv_factor_all");
+        ggml_set_name(cache.conv_factor_all_alt,  "specla_conv_factor_all_alt");
+        cache.specla_idx = ggml_new_tensor_1d(cache.rollback_ctx, GGML_TYPE_I32,
+                                              max_verify_tokens);
+        cache.specla_state_ptrs = ggml_new_tensor_1d(cache.rollback_ctx, GGML_TYPE_I64,
+                                                     n_delta);
+        cache.specla_conv_state_ptrs = ggml_new_tensor_1d(
+            cache.rollback_ctx, GGML_TYPE_I64, n_delta);
+        cache.specla_factor_ptrs = ggml_new_tensor_1d(
+            cache.rollback_ctx, GGML_TYPE_I64, 8);
+        ggml_set_name(cache.specla_idx,        "specla_idx");
+        ggml_set_name(cache.specla_state_ptrs, "specla_state_ptrs");
+        ggml_set_name(cache.specla_conv_state_ptrs, "specla_conv_state_ptrs");
+        ggml_set_name(cache.specla_factor_ptrs, "specla_factor_ptrs");
+    }
     int dn_idx = 0;
     for (int il = 0; il < w.n_layer; il++) {
         if (((il + 1) % w.full_attention_interval) != 0) {
@@ -496,21 +627,33 @@ bool migrate_prefill_cache(const TargetWeights & w,
                                                    head_v_dim, head_v_dim, w.ssm_dt_rank);
             ggml_tensor * Cn = ggml_new_tensor_2d(cache.rollback_ctx, GGML_TYPE_F32,
                                                    w.ssm_d_conv - 1, conv_ch);
-            ggml_tensor * Si = ggml_new_tensor_4d(cache.rollback_ctx, checkpoint_type,
-                                                   head_v_dim, head_v_dim,
-                                                   w.ssm_dt_rank, max_verify_tokens);
-            ggml_tensor * Ci = ggml_new_tensor_3d(cache.rollback_ctx, GGML_TYPE_F32,
-                                                   (w.ssm_d_conv - 1) + max_verify_tokens,
-                                                   conv_ch, 1);
+            ggml_tensor * Ci = specla ? nullptr
+                : ggml_new_tensor_3d(cache.rollback_ctx, GGML_TYPE_F32,
+                                     (w.ssm_d_conv - 1) + max_verify_tokens,
+                                     conv_ch, 1);
+            ggml_tensor * Ci_alt = nullptr;
             char name[64];
             std::snprintf(name, sizeof(name), "ssm_state_snap_%d", il);  ggml_set_name(Sn, name);
             std::snprintf(name, sizeof(name), "conv_state_snap_%d", il); ggml_set_name(Cn, name);
-            std::snprintf(name, sizeof(name), "ssm_intermediate_%d", il); ggml_set_name(Si, name);
-            std::snprintf(name, sizeof(name), "conv_input_cache_%d", il); ggml_set_name(Ci, name);
+            if (Ci) {
+                std::snprintf(name, sizeof(name), "conv_input_cache_%d", il);
+                ggml_set_name(Ci, name);
+            }
             cache.ssm_state_snap[dn_idx]  = Sn;
             cache.conv_state_snap[dn_idx] = Cn;
-            cache.ssm_intermediate[dn_idx] = Si;
             cache.conv_input_cache[dn_idx] = Ci;
+            cache.conv_input_cache_alt[dn_idx] = Ci_alt;
+            if (Ci_alt) {
+                std::snprintf(name, sizeof(name), "conv_input_cache_alt_%d", il);
+                ggml_set_name(Ci_alt, name);
+            }
+            if (!specla) {
+                ggml_tensor * Si = ggml_new_tensor_4d(cache.rollback_ctx, checkpoint_type,
+                                                       head_v_dim, head_v_dim,
+                                                       w.ssm_dt_rank, max_verify_tokens);
+                std::snprintf(name, sizeof(name), "ssm_intermediate_%d", il); ggml_set_name(Si, name);
+                cache.ssm_intermediate[dn_idx] = Si;
+            }
             dn_idx++;
         }
     }
@@ -553,6 +696,235 @@ bool migrate_prefill_cache(const TargetWeights & w,
         }
     }
 
+    // SpecLA: per-layer factor views into the consolidated buffers, created
+    // after allocation so they carry live data/buffer pointers. Shaped like
+    // stand-alone per-layer tensors ([.., max_q] with a cross-layer token
+    // stride) so the capture path treats them like any other cache tensor.
+    if (specla) {
+        ggml_tensor * Fk = cache.factor_k_all;
+        ggml_tensor * Fv = cache.factor_v_new_all;
+        ggml_tensor * Fg = cache.factor_g_ps_all;
+        ggml_tensor * Fk_alt = cache.factor_k_all_alt;
+        ggml_tensor * Fv_alt = cache.factor_v_new_all_alt;
+        ggml_tensor * Fg_alt = cache.factor_g_ps_all_alt;
+        for (int dn = 0; dn < n_delta; dn++) {
+            cache.factor_k[dn] = ggml_view_3d(cache.rollback_ctx, Fk,
+                Fk->ne[0], Fk->ne[1], max_verify_tokens,
+                Fk->nb[1], Fk->nb[3], (size_t)dn * Fk->nb[2]);
+            cache.factor_v_new[dn] = ggml_view_3d(cache.rollback_ctx, Fv,
+                Fv->ne[0], Fv->ne[1], max_verify_tokens,
+                Fv->nb[1], Fv->nb[3], (size_t)dn * Fv->nb[2]);
+            cache.factor_g_ps[dn] = ggml_view_2d(cache.rollback_ctx, Fg,
+                Fg->ne[0], max_verify_tokens,
+                Fg->nb[2], (size_t)dn * Fg->nb[1]);
+            cache.factor_k_alt[dn] = ggml_view_3d(cache.rollback_ctx, Fk_alt,
+                Fk_alt->ne[0], Fk_alt->ne[1], max_verify_tokens,
+                Fk_alt->nb[1], Fk_alt->nb[3], (size_t)dn * Fk_alt->nb[2]);
+            cache.factor_v_new_alt[dn] = ggml_view_3d(cache.rollback_ctx, Fv_alt,
+                Fv_alt->ne[0], Fv_alt->ne[1], max_verify_tokens,
+                Fv_alt->nb[1], Fv_alt->nb[3], (size_t)dn * Fv_alt->nb[2]);
+            cache.factor_g_ps_alt[dn] = ggml_view_2d(cache.rollback_ctx, Fg_alt,
+                Fg_alt->ne[0], max_verify_tokens,
+                Fg_alt->nb[2], (size_t)dn * Fg_alt->nb[1]);
+            cache.conv_input_cache[dn] = ggml_view_3d(cache.rollback_ctx,
+                cache.conv_factor_all, cache.conv_factor_all->ne[0],
+                max_verify_tokens, 1, cache.conv_factor_all->nb[2],
+                cache.conv_factor_all->nb[2]*max_verify_tokens,
+                (size_t)dn*cache.conv_factor_all->nb[1]);
+            cache.conv_input_cache_alt[dn] = ggml_view_3d(cache.rollback_ctx,
+                cache.conv_factor_all_alt, cache.conv_factor_all_alt->ne[0],
+                max_verify_tokens, 1, cache.conv_factor_all_alt->nb[2],
+                cache.conv_factor_all_alt->nb[2]*max_verify_tokens,
+                (size_t)dn*cache.conv_factor_all_alt->nb[1]);
+        }
+        // State addresses are stable for the cache's lifetime. The same helper
+        // is also called after reset_target_cache clears rollback scratch.
+        refresh_specla_state_ptrs(cache);
+    }
+
+    return true;
+}
+
+// SpecLA DeltaConstruct commit (docs/SPECLA.md): one small graph advancing all
+// delta-net layers' durable SSM states along the accepted path,
+//   S_A = exp(g⁺_A) S0 + Σ_{t∈path} exp(g⁺_A − g⁺_t) k_t ⊗ ṽ_t,
+// from the factor buffers the last verify captured. The verify graph never
+// wrote the speculative state back, so cache.ssm_state still holds S0 here.
+bool specla_commit_accepted(TargetCache & cache,
+                            ggml_backend_t backend,
+                            const int32_t * accepted_idx,
+                            int A) {
+    const int n_delta = (int)cache.factor_k.size();
+    if (n_delta == 0 || A <= 0 || !accepted_idx || !backend) return false;
+
+    // The just-run factorized verify wrote the bank opposite the one its
+    // capture setup treated as pending (the capture views point at
+    // factor_k_alt when specla_pending_bank == 0). This function is called
+    // BEFORE the host-side bank rotation, so commit that opposite bank;
+    // committing bank 0 unconditionally replays stale factors on the first
+    // verify.
+    const int selected_bank = 1 - cache.specla_pending_bank;
+    const bool alt = selected_bank != 0;
+    ggml_tensor * Fk = alt ? cache.factor_k_all_alt : cache.factor_k_all;
+    ggml_tensor * Fv = alt ? cache.factor_v_new_all_alt : cache.factor_v_new_all;
+    ggml_tensor * Fg = alt ? cache.factor_g_ps_all_alt : cache.factor_g_ps_all;
+    ggml_tensor * Fc = alt ? cache.conv_factor_all_alt : cache.conv_factor_all;
+    if (!Fk || !Fv || !Fg || !Fc || !cache.specla_conv_state_ptrs ||
+        !cache.specla_conv_state_ptrs->data) {
+        return false;
+    }
+
+    for (int i = 0; i < A; i++) {
+        if (accepted_idx[i] < 0 || accepted_idx[i] >= Fk->ne[3]) return false;
+        // The factorized fallback's convolution capture is in flat-token
+        // order. Tree factorized verify is built with an HLD schedule in
+        // production; fail closed rather than commit a scattered DFS path.
+        if (accepted_idx[i] != i) return false;
+    }
+
+    // Pre-validate the convolution commit targets before mutating SSM state.
+    // The selected consolidated bank is [channels, layers, tokens]. Commit
+    // shifts each durable K-1 window and appends raw inputs [0, A).
+    if (Fc->type != GGML_TYPE_F32 || !ggml_is_contiguous(Fc) ||
+        Fc->ne[1] != n_delta || A > Fc->ne[2]) {
+        return false;
+    }
+    int d_conv = 0;
+    for (int il = 0; il < n_delta; il++) {
+        ggml_tensor * dst = (il < (int)cache.conv_state.size())
+            ? cache.conv_state[il] : nullptr;
+        if (!dst || dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) ||
+            dst->ne[1] != Fc->ne[0]) {
+            return false;
+        }
+        const int layer_d_conv = (int)dst->ne[0] + 1;
+        if (layer_d_conv < 2 || (d_conv != 0 && d_conv != layer_d_conv)) {
+            return false;
+        }
+        d_conv = layer_d_conv;
+    }
+
+    const int64_t S_k = Fk->ne[0];
+    const int64_t H   = Fk->ne[1];
+    const int64_t S_v = Fv->ne[0];
+    const int64_t HL  = H * n_delta;
+
+    // Fast path: one fused kernel updates every layer's state in place.
+    // Escape hatch DFLASH_SPECLA_FUSED_COMMIT=0 falls back to the ggml-graph
+    // implementation below (also the fallback on any launch failure).
+    static const bool kFusedCommit = []() {
+        const char * v = std::getenv("DFLASH_SPECLA_FUSED_COMMIT");
+        return v == nullptr || v[0] != '0';
+    }();
+    bool ok = false;
+    if (kFusedCommit && cache.specla_idx && cache.specla_state_ptrs) {
+        ggml_backend_tensor_set(cache.specla_idx, accepted_idx, 0,
+                                sizeof(int32_t) * (size_t)A);
+        bool launched = false;
+        if (specla_commit_fused(
+                (float * const *)cache.specla_state_ptrs->data,
+                (const float *)Fk->data,
+                (const float *)Fv->data,
+                (const float *)Fg->data,
+                (const int32_t *)cache.specla_idx->data,
+                A, (int)S_k, (int)S_v, (int)H, n_delta,
+                /*stream=*/nullptr, &launched)) {
+            ok = true;
+        } else if (launched) {
+            std::fprintf(stderr,
+                "specla_commit_accepted: fused kernel execution failed\n");
+            return false;
+        } else {
+            std::fprintf(stderr,
+                "specla_commit_accepted: fused launch rejected; using graph path\n");
+        }
+    }
+
+    if (!ok) {
+        // Persistent metadata arena + allocator, reused across steps like the
+        // verify step graph — avoids per-commit gallocr churn.
+        static thread_local std::vector<uint8_t> s_arena;
+        static thread_local ggml_gallocr_t s_galloc = nullptr;
+        const size_t graph_nodes = (size_t)n_delta * 8 + 64;
+        ggml_init_params ip{};
+        ip.mem_size = graph_nodes * 4 * ggml_tensor_overhead() +
+                      ggml_graph_overhead_custom(graph_nodes, false);
+        if (s_arena.size() < ip.mem_size) s_arena.resize(ip.mem_size);
+        ip.mem_buffer = s_arena.data();
+        ip.no_alloc = true;
+        ggml_context * ctx = ggml_init(ip);
+        if (!ctx) return false;
+        ggml_cgraph * gf = ggml_new_graph_custom(ctx, graph_nodes, false);
+
+        ggml_tensor * idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, A);
+        ggml_set_input(idx);
+
+        // Gather the accepted token slices across ALL layers at once (the token
+        // axis is outermost in the consolidated buffers).
+        ggml_tensor * k_sel = ggml_get_rows(ctx,
+            ggml_reshape_2d(ctx, Fk, S_k * HL, Fk->ne[3]), idx);           // [S_k*HL, A]
+        ggml_tensor * v_sel = ggml_get_rows(ctx,
+            ggml_reshape_2d(ctx, Fv, S_v * HL, Fv->ne[3]), idx);           // [S_v*HL, A]
+        ggml_tensor * g_sel = ggml_get_rows(ctx,
+            ggml_reshape_2d(ctx, Fg, HL, Fg->ne[2]), idx);                 // [HL, A]
+        k_sel = ggml_reshape_3d(ctx, k_sel, S_k, HL, A);
+        v_sel = ggml_reshape_3d(ctx, v_sel, S_v, HL, A);
+
+        // w[hl, t] = exp(g⁺_A − g⁺_t); the deepest accepted node is last.
+        ggml_tensor * gA = ggml_view_2d(ctx, g_sel, HL, 1, g_sel->nb[1],
+                                        (size_t)(A - 1) * g_sel->nb[1]);
+        ggml_tensor * w_dec = ggml_exp(ctx, ggml_neg(ctx, ggml_sub(ctx, g_sel, gA)));
+
+        // Σ_t (k_t · w_t) ⊗ ṽ_t for every (layer, head) in one batched matmul.
+        ggml_tensor * kg = ggml_mul(ctx, k_sel, ggml_reshape_3d(ctx, w_dec, 1, HL, A));
+        ggml_tensor * kg_t = ggml_cont(ctx, ggml_permute(ctx, kg,    1, 2, 0, 3)); // [A, S_k, HL]
+        ggml_tensor * v_t  = ggml_cont(ctx, ggml_permute(ctx, v_sel, 1, 2, 0, 3)); // [A, S_v, HL]
+        ggml_tensor * upd  = ggml_mul_mat(ctx, kg_t, v_t);                         // [S_k, S_v, HL]
+        ggml_tensor * gA_exp = ggml_exp(ctx, ggml_cont(ctx, gA));                  // [HL, 1]
+
+        // Per-layer tail: S ← exp(g⁺_A)·S + upd (states are separate tensors).
+        for (int il = 0; il < n_delta; il++) {
+            ggml_tensor * S = cache.ssm_state[il];
+            if (!S) { ggml_free(ctx); return false; }
+            ggml_tensor * upd_l = ggml_view_3d(ctx, upd, S_k, S_v, H,
+                upd->nb[1], upd->nb[2], (size_t)il * H * upd->nb[2]);
+            ggml_tensor * gA_l = ggml_reshape_3d(ctx,
+                ggml_cont(ctx, ggml_view_1d(ctx, gA_exp, H, (size_t)il * H * gA_exp->nb[0])),
+                1, 1, H);
+            ggml_tensor * s_new = ggml_add(ctx, ggml_mul(ctx, S, gA_l), upd_l);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, s_new, S));
+        }
+
+        if (!s_galloc) {
+            s_galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        }
+        ok = s_galloc != nullptr && ggml_gallocr_alloc_graph(s_galloc, gf);
+        if (ok) {
+            ggml_backend_tensor_set(idx, accepted_idx, 0, sizeof(int32_t) * A);
+            ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
+        }
+        ggml_free(ctx);
+        if (ok) ggml_backend_synchronize(backend);
+    }
+    if (!ok) return false;
+
+    // Apply the accepted raw convolution factors across all layers. The
+    // token-major kernel handles partial and full acceptance without needing
+    // a synthetic K-1 prefix in the factor bank.
+    if (!specla_commit_conv_raw_fused(
+            (float * const *)cache.specla_conv_state_ptrs->data,
+            (const float *)Fc->data, A, (int)Fc->ne[2], n_delta,
+            (int)Fc->ne[0], d_conv, /*stream=*/nullptr)) {
+        std::fprintf(stderr,
+            "specla_commit_accepted: raw conv factor commit failed\n");
+        return false;
+    }
+
+    // The selected bank has been consumed into durable state. Mark it as the
+    // pending role with nothing outstanding so the next verify writes the
+    // opposite bank and the final flush is a no-op.
+    cache.specla_pending_bank = selected_bank;
+    cache.specla_pending_count = 0;
     return true;
 }
 
@@ -1015,7 +1387,19 @@ static ggml_tensor * build_delta_net_block(
     int n_prefill_segments = 0,
     ggml_tensor * active_slot_ids = nullptr,
     ggml_tensor * state_slot_ids = nullptr,
-    bool allow_inplace_state = false
+    bool allow_inplace_state = false,
+    // SpecLA topology masks (all three non-null together): route the
+    // recurrence through the topology-masked factor-capture verify.
+    // parent_ids then only steers the tree conv; the recurrence gets its
+    // topology from the masks. See docs/SPECLA.md.
+    ggml_tensor * specla_m_strict = nullptr,
+    ggml_tensor * specla_m_incl   = nullptr,
+    ggml_tensor * specla_m_eye    = nullptr,
+    ggml_tensor * specla_hld      = nullptr,
+    int specla_n_boundaries       = 0,
+    int specla_n_chains           = 0,
+    int specla_n_waves            = 0,
+    int specla_max_parallel_chains = 0
 ) {
     const int head_k_dim   = w.ssm_d_state;
     const int num_k_heads  = w.ssm_n_group;
@@ -1040,6 +1424,18 @@ static ggml_tensor * build_delta_net_block(
     }
     GGML_ASSERT(!ragged || (!cap && !parent_ids));
     const bool can_skip_gdn_intermediate = skip_gdn_intermediate && !parent_ids && !cap;
+    // Fully factorized SpecLA fallback: the current candidates do not mutate
+    // durable state. The HLD route below may materialize the *previously*
+    // accepted pending path while keeping current candidates speculative.
+    const bool use_specla_factorized = cap && cap->factor_k && cap->factor_v_new &&
+        cap->factor_g_ps && specla_m_strict && specla_m_incl && specla_m_eye;
+    const bool use_specla_hld = cap && cap->factor_ptrs &&
+        cap->factor_n_layers > 0 && cap->factor_layer >= 0 &&
+        cap->factor_layer < cap->factor_n_layers && specla_hld &&
+        specla_n_chains > 0 && specla_n_waves > 0 &&
+        specla_max_parallel_chains > 0;
+    GGML_ASSERT(!(use_specla_factorized || use_specla_hld) ||
+                (n_seqs == 1 && !ragged && !active_slot_ids));
 
     // ── Whole-batch projections ─────────────────────────────────────
     // qkv_mixed = wqkv @ cur           [10240, n_tokens]
@@ -1129,6 +1525,22 @@ static ggml_tensor * build_delta_net_block(
         seg_cols(g_2d, seg.off, seg_tokens),
         1, num_v_heads, n_seq_tokens, seg_seqs);
 
+    ggml_tensor * conv_out = nullptr;
+    if (use_specla_hld) {
+        // Delayed convolution commit + HLD verify. The result is already
+        // SiLU'd; raw inputs are written directly to the persistent bank.
+        ggml_tensor * packed = ggml_ssm_conv_specla(
+            ctx, qkv_mixed, L.ssm_conv1d, seg.conv_st,
+            specla_hld, cap->factor_ptrs, cap->factor_n_layers,
+            cap->factor_layer, cap->pending_bank,
+            specla_n_boundaries, specla_n_chains, specla_n_waves,
+            specla_max_parallel_chains);
+        const size_t f32 = sizeof(float);
+        conv_out = ggml_view_3d(ctx, packed,
+            conv_channels, n_seq_tokens, 1,
+            (size_t)conv_channels*f32,
+            (size_t)conv_channels*n_seq_tokens*f32, 0);
+    } else {
     // ── Fetch conv state [kernel-1, conv_channels] and prepend to qkv_mixed
     //    along the token axis to form the convolution input.
     ggml_tensor * conv_states_r = nullptr;
@@ -1162,39 +1574,56 @@ static ggml_tensor * build_delta_net_block(
     // past graph_compute). After graph_compute, the cache buffer's data is
     // always valid; the rollback code slices it at commit_n.
     if (cap && cap->conv_input) {
-        // conv_input may be shorter than the pre-allocated cache
-        // (e.g. during prefill when n_tokens < max_verify_tokens).
-        // Copy into a matching-sized view of the cache destination.
-        const int64_t ci_len = conv_input->ne[0];
-        ggml_tensor * dst;
-        if (ci_len == cap->conv_input->ne[0]) {
-            dst = cap->conv_input;
-        } else {
-            dst = ggml_view_3d(ctx, cap->conv_input,
-                ci_len, cap->conv_input->ne[1], cap->conv_input->ne[2],
+        if (use_specla_factorized) {
+            // The consolidated SpecLA bank is [channels, layers, tokens].
+            // Capture only the raw current inputs; the compatibility commit
+            // shifts the durable K-1 window and appends accepted tokens.
+            GGML_ASSERT(qkv_mixed->ne[0] == cap->conv_input->ne[0]);
+            GGML_ASSERT(n_seq_tokens <= cap->conv_input->ne[1]);
+            ggml_tensor * dst = ggml_view_3d(ctx, cap->conv_input,
+                cap->conv_input->ne[0], n_seq_tokens, 1,
                 cap->conv_input->nb[1], cap->conv_input->nb[2], 0);
+            GGML_ASSERT(ggml_nelements(qkv_mixed) == ggml_nelements(dst));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, qkv_mixed, dst));
+        } else {
+            // conv_input may be shorter than the pre-allocated cache
+            // (e.g. during prefill when n_tokens < max_verify_tokens).
+            // Copy into a matching-sized view of the cache destination.
+            const int64_t ci_len = conv_input->ne[0];
+            ggml_tensor * dst;
+            if (ci_len == cap->conv_input->ne[0]) {
+                dst = cap->conv_input;
+            } else {
+                dst = ggml_view_3d(ctx, cap->conv_input,
+                    ci_len, cap->conv_input->ne[1], cap->conv_input->ne[2],
+                    cap->conv_input->nb[1], cap->conv_input->nb[2], 0);
+            }
+            GGML_ASSERT(ggml_nelements(conv_input) == ggml_nelements(dst));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, conv_input, dst));
         }
-        GGML_ASSERT(ggml_nelements(conv_input) == ggml_nelements(dst));
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, conv_input, dst));
     }
 
     // ── Save the last (kernel-1) steps back to the conv state
-    ggml_tensor * last_conv = ggml_view_3d(ctx, conv_input,
-        w.ssm_d_conv - 1, conv_channels, seg_seqs,
-        conv_input->nb[1], conv_input->nb[2],
-        (conv_input->ne[0] - (w.ssm_d_conv - 1)) * ggml_element_size(conv_input));
-    if (seg_active) {
-        const int64_t slab =
-            (int64_t)(w.ssm_d_conv - 1) * conv_channels;
-        ggml_tensor * compact_last = ggml_reshape_2d(
-            ctx, ggml_cont(ctx, last_conv), slab, seg_seqs);
-        ggml_tensor * all_conv = ggml_reshape_2d(
-            ctx, seg.conv_st, slab, seg.conv_st->ne[2]);
-        ggml_build_forward_expand(
-            gf, ggml_set_rows_masked(
-                    ctx, all_conv, compact_last, active_slot_ids));
-    } else {
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, last_conv, seg.conv_st));
+    //    SpecLA: skipped — the window is speculative; the commit path
+    //    shifts conv_state and appends the accepted raw inputs at commit time.
+    if (!use_specla_factorized) {
+        ggml_tensor * last_conv = ggml_view_3d(ctx, conv_input,
+            w.ssm_d_conv - 1, conv_channels, seg_seqs,
+            conv_input->nb[1], conv_input->nb[2],
+            (conv_input->ne[0] - (w.ssm_d_conv - 1)) * ggml_element_size(conv_input));
+        if (seg_active) {
+            const int64_t slab =
+                (int64_t)(w.ssm_d_conv - 1) * conv_channels;
+            ggml_tensor * compact_last = ggml_reshape_2d(
+                ctx, ggml_cont(ctx, last_conv), slab, seg_seqs);
+            ggml_tensor * all_conv = ggml_reshape_2d(
+                ctx, seg.conv_st, slab, seg.conv_st->ne[2]);
+            ggml_build_forward_expand(
+                gf, ggml_set_rows_masked(
+                        ctx, all_conv, compact_last, active_slot_ids));
+        } else {
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, last_conv, seg.conv_st));
+        }
     }
 
     // ── 1D conv + silu
@@ -1202,10 +1631,11 @@ static ggml_tensor * build_delta_net_block(
     //    their conv window from their actual tree parent instead of the DFS
     //    predecessor. Without this, siblings get garbage logits (the conv
     //    output would mix unrelated branches).
-    ggml_tensor * conv_out = parent_ids
+    conv_out = parent_ids
         ? ggml_ssm_conv_tree(ctx, conv_input, L.ssm_conv1d, parent_ids)
         : ggml_ssm_conv     (ctx, conv_input, L.ssm_conv1d);
     conv_out = ggml_silu(ctx, conv_out);
+    }
 
     // conv_out: [conv_channels, n_tokens, n_seqs]
     const int64_t q_offset = 0;
@@ -1293,6 +1723,54 @@ static ggml_tensor * build_delta_net_block(
 
     ggml_tensor * output = nullptr;
 
+    if (use_specla_hld) {
+        ggml_tensor * result = ggml_gated_delta_net_specla(
+            ctx, q_c, k_c, v_c, g_tensor, beta, s, specla_hld,
+            cap->factor_ptrs, cap->factor_n_layers, cap->factor_layer,
+            cap->pending_bank, specla_n_boundaries,
+            specla_n_chains, specla_n_waves, specla_max_parallel_chains);
+        const int64_t S = head_v_dim;
+        const int64_t H = num_v_heads;
+        const int64_t T = n_seq_tokens;
+        const size_t f32 = sizeof(float);
+        const size_t factor_bytes = (size_t)S*H*T*f32;
+        output = ggml_view_4d(ctx, result, S, H, T, 1,
+            S*f32, (size_t)S*H*f32, factor_bytes, 0);
+        goto after_delta_net;
+    }
+
+    if (use_specla_factorized) {
+        auto r = build_delta_net_specla(ctx, q_c, k_c, v_c, g_tensor, beta, s,
+                                        specla_m_strict, specla_m_incl, specla_m_eye);
+        output = r.output;
+
+        // Factor capture: prefix views of the persistent per-layer buffers.
+        // k as fed to the recurrence (post l2-norm, post head repeat).
+        {
+            ggml_tensor * dst_k = ggml_view_4d(ctx, cap->factor_k,
+                cap->factor_k->ne[0], cap->factor_k->ne[1], n_seq_tokens, 1,
+                cap->factor_k->nb[1], cap->factor_k->nb[2], cap->factor_k->nb[2] * n_seq_tokens, 0);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, k_c, dst_k));
+
+            // ṽ [n, S_v, 1, H] → logical [S_v, H, n, 1] to match the buffer.
+            ggml_tensor * src_v = ggml_cont(ctx, ggml_permute(ctx, r.v_new, 2, 0, 3, 1));
+            ggml_tensor * dst_v = ggml_view_4d(ctx, cap->factor_v_new,
+                cap->factor_v_new->ne[0], cap->factor_v_new->ne[1], n_seq_tokens, 1,
+                cap->factor_v_new->nb[1], cap->factor_v_new->nb[2], cap->factor_v_new->nb[2] * n_seq_tokens, 0);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, src_v, dst_v));
+
+            // g⁺ [n, 1, 1, H] → logical [H, n].
+            ggml_tensor * src_g = ggml_cont(ctx, ggml_permute(ctx, r.g_ps, 1, 2, 3, 0));
+            ggml_tensor * dst_g = ggml_view_2d(ctx, cap->factor_g_ps,
+                cap->factor_g_ps->ne[0], n_seq_tokens, cap->factor_g_ps->nb[1], 0);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, src_g, dst_g));
+        }
+        // Compatibility fallback for callers without an HLD schedule. No
+        // new_state and no state writeback: verification is read-only on
+        // the durable state; specla_commit_accepted() advances it.
+        goto after_delta_net;
+    }
+
     if (use_chunked) {
         auto r = build_delta_net_chunked(ctx, q_c, k_c, v_c, g_tensor, beta, s);
         output = r.output;
@@ -1377,6 +1855,7 @@ static ggml_tensor * build_delta_net_block(
     }
     }
 
+after_delta_net:
     // ── Gated output norm: rms_norm(output) * silu(z_4d)
     ggml_tensor * z_4d = ggml_reshape_4d(ctx,
         seg_cols(z, seg.off, seg_tokens),
@@ -1612,6 +2091,29 @@ QwenGraphOutputs build_qwen35_graph(
                 // valid because they're cache-resident, not gallocr-managed.
                 cap_ptr->ssm_intermediate_states = cache.ssm_intermediate[dn_idx];
                 cap_ptr->conv_input              = cache.conv_input_cache[dn_idx];
+                if (!cache.factor_k.empty()) {
+                    const bool pending_alt = cache.specla_pending_bank != 0;
+                    cap_ptr->pending_factor_k = pending_alt
+                        ? cache.factor_k_alt[dn_idx] : cache.factor_k[dn_idx];
+                    cap_ptr->pending_factor_v_new = pending_alt
+                        ? cache.factor_v_new_alt[dn_idx] : cache.factor_v_new[dn_idx];
+                    cap_ptr->pending_factor_g = pending_alt
+                        ? cache.factor_g_ps_alt[dn_idx] : cache.factor_g_ps[dn_idx];
+                    cap_ptr->pending_conv_input = pending_alt
+                        ? cache.conv_input_cache_alt[dn_idx] : cache.conv_input_cache[dn_idx];
+                    cap_ptr->factor_k = pending_alt
+                        ? cache.factor_k[dn_idx] : cache.factor_k_alt[dn_idx];
+                    cap_ptr->factor_v_new = pending_alt
+                        ? cache.factor_v_new[dn_idx] : cache.factor_v_new_alt[dn_idx];
+                    cap_ptr->factor_g_ps = pending_alt
+                        ? cache.factor_g_ps[dn_idx] : cache.factor_g_ps_alt[dn_idx];
+                    cap_ptr->conv_input = pending_alt
+                        ? cache.conv_input_cache[dn_idx] : cache.conv_input_cache_alt[dn_idx];
+                    cap_ptr->factor_ptrs = cache.specla_factor_ptrs;
+                    cap_ptr->factor_n_layers = (int)cache.factor_k.size();
+                    cap_ptr->factor_layer = dn_idx;
+                    cap_ptr->pending_bank = cache.specla_pending_bank;
+                }
             }
             ggml_tensor * conv_st = cache.conv_state[dn_idx];
             ggml_tensor * ssm_st  = cache.ssm_state[dn_idx];
@@ -1643,7 +2145,13 @@ QwenGraphOutputs build_qwen35_graph(
                                         in.active_slot_ids,
                                         in.state_slot_ids,
                                         /*allow_inplace_state=*/
-                                            in.n_prefill_tokens == 0);
+                                            in.n_prefill_tokens == 0,
+                                        in.specla_m_strict, in.specla_m_incl,
+                                        in.specla_m_eye, in.specla_hld,
+                                        in.specla_n_boundaries,
+                                        in.specla_n_chains,
+                                        in.specla_n_waves,
+                                        in.specla_max_parallel_chains);
             dn_idx++;
         }
 

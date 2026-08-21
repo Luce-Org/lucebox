@@ -280,6 +280,12 @@ std::string check_feature_compatibility(
                "DeepSeek4";
     }
 
+    // ── --ds4-fused-verify-f16-kv × placement
+    if (args.ds4_fused_verify_f16_kv && !monolithic_ds4) {
+        return "--ds4-fused-verify-f16-kv currently requires single-device "
+               "HIP DeepSeek4";
+    }
+
     // ── --ds4-expert-top-k × architecture/adapter
     if (args.ds4_expert_top_k != 0 && !local_ds4) {
         return "--ds4-expert-top-k currently requires a single local "

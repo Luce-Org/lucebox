@@ -26,7 +26,8 @@ inline bool split_chain_fast_rollback_enabled() {
 }
 
 inline ChainRollbackPolicy resolve_chain_rollback_policy(
-        bool tensor_parallel = false) {
+        bool tensor_parallel = false,
+        bool exact_fast_rollback = false) {
     ChainRollbackPolicy policy;
     policy.checkpoint_f32 = env_flag_enabled("DFLASH_SINGLE_CHAIN_CHECKPOINT_F32");
     policy.diagnostics = env_flag_enabled("DFLASH_SINGLE_CHAIN_ROLLBACK_DIAG");
@@ -46,6 +47,13 @@ inline ChainRollbackPolicy resolve_chain_rollback_policy(
     // state directly, so it is cheaper than replay even for one accepted
     // token and does not depend on the host checkpoint precision.
     if (tensor_parallel) {
+        policy.fast_rollback_threshold = 1;
+    }
+    // Exact device-side rollback (SpecLA factor commit, or an equivalent
+    // implementation) is profitable from the first accepted token. This is
+    // an actual target capability, not an environment flag: the requested
+    // mode may be unavailable for the active cache/backend.
+    if (exact_fast_rollback) {
         policy.fast_rollback_threshold = 1;
     }
     return policy;
