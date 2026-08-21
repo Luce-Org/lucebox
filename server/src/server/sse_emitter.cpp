@@ -236,7 +236,31 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
     emit_token_count_++;
 
     // Sanitize input to prevent json::dump() from throwing on invalid UTF-8.
-    std::string piece = utf8_sanitize(raw_piece);
+    // First re-join any incomplete multi-byte tail held back from the previous
+    // piece, then hold back a new incomplete tail (if any) so codepoints split
+    // across tokens are emitted intact instead of as U+FFFD pairs.
+    std::string joined = utf8_tail_ + raw_piece;
+    utf8_tail_.clear();
+    {
+        size_t i = joined.size();
+        int cont = 0;
+        while (i > 0 && cont < 3 &&
+               (static_cast<unsigned char>(joined[i - 1]) & 0xC0) == 0x80) {
+            --i; ++cont;
+        }
+        if (i > 0) {
+            const unsigned char lead = static_cast<unsigned char>(joined[i - 1]);
+            int need = 0;
+            if ((lead & 0xE0) == 0xC0) need = 2;
+            else if ((lead & 0xF0) == 0xE0) need = 3;
+            else if ((lead & 0xF8) == 0xF0) need = 4;
+            if (need > 0 && joined.size() - (i - 1) < static_cast<size_t>(need)) {
+                utf8_tail_ = joined.substr(i - 1);
+                joined.resize(i - 1);
+            }
+        }
+    }
+    std::string piece = utf8_sanitize(joined);
     std::vector<std::string> out;
     accumulated_raw_ += piece;
     window_ += piece;
@@ -557,6 +581,15 @@ void SseEmitter::emit_content_delta(std::vector<std::string> & out,
 std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
                                                  const GenTimings * timings) {
     std::vector<std::string> out;
+
+    // A tail still pending at end-of-stream is a genuinely truncated
+    // codepoint; sanitize it into the window so nothing is silently lost.
+    if (!utf8_tail_.empty()) {
+        const std::string flushed = utf8_sanitize(utf8_tail_);
+        utf8_tail_.clear();
+        accumulated_raw_ += flushed;
+        window_ += flushed;
+    }
 
     // Flush remaining window
     if (mode_ == StreamMode::REASONING && !window_.empty()) {

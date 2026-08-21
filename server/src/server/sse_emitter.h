@@ -155,6 +155,11 @@ private:
     StreamMode   mode_;
     bool         tool_from_reasoning_ = false;
     std::string  window_;           // holdback buffer
+    // Incomplete trailing UTF-8 bytes from the previous token piece.
+    // BPE tokens can split a multi-byte codepoint (emoji arrive as two
+    // 2-byte halves); sanitizing halves independently turned every such
+    // codepoint into two U+FFFD. The tail is carried into the next piece.
+    std::string  utf8_tail_;
     std::string  tool_buffer_;      // accumulated tool text
     bool         tool_buffer_fallback_to_content_ = false;
     std::string  accumulated_content_;
