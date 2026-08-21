@@ -2561,9 +2561,9 @@ TEST_CASE(ServerUnitFixture, test_pflash_raw_body_preserved) {
     TEST_ASSERT(req.raw_body["temperature"].get<float>() > 0.6f);
 }
 
-TEST_CASE(ServerUnitFixture, test_tool_speculation_defaults_to_automatic_prediction) {
+TEST_CASE(ServerUnitFixture, test_automatic_tool_speculation_defaults_off) {
     ParsedRequest req;
-    TEST_ASSERT(req.automatic_tool_speculation_enabled);
+    TEST_ASSERT(!req.automatic_tool_speculation_enabled);
 }
 
 TEST_CASE(ServerUnitFixture, test_tool_choice_none_disables_speculation) {

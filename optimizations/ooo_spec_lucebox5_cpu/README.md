@@ -26,11 +26,16 @@ Three engine flags, designed to be enabled together:
   decode speed. Any mismatch silently takes the normal path.
 
 Clients can also supply a concrete prediction up front via the
-`tool_speculation` request extension (unchanged), and opt out per request
-with `"automatic_tool_speculation": false`.
+`tool_speculation` request extension (unchanged). Automatic early dispatch is
+off by default and requires an explicit per-request opt-in with
+`"automatic_tool_speculation": true`.
 
 ## Safety
 
+- Automatic early dispatch is fail-closed per request: omitting
+  `automatic_tool_speculation` leaves it disabled. The server never infers
+  whether a tool is safe; the operator supplies exact names with
+  `--tool-spec-allow`.
 - Only tools named by `--tool-spec-allow` ever run speculatively; the
   executor is spawned without a shell, with a minimal environment, closed
   descriptors, an optional pinned CPU lane disjoint from the model
@@ -38,6 +43,10 @@ with `"automatic_tool_speculation": false`.
   commit-based result deadline (`--tool-spec-timeout-ms`). Executors can also
   attach `_speculation_fresh_until_unix_ms`; expired live-data results are
   rejected immediately before commit and run again through the normal path.
+- Allow immediate execution only for read-only tools. A side-effecting
+  executor must stage the change until the engine sends `commit`, or provide
+  transactional rollback; idempotency alone does not make wrong arguments
+  safe.
 - `--tool-spec-profile` (a measured interference profile) is required for
   every client-supplied prediction. Only calls already emitted by the model
   and launched through early dispatch are authoritative without a profile;

@@ -249,8 +249,8 @@ struct ServerConfig {
     std::string collect_routing_path;
 
     // Lossless external-tool speculation. Off unless the operator configures
-    // an executor, an empirical interference profile, and an explicit
-    // read-only/idempotent tool allowlist.
+    // an executor and an explicit, operator-reviewed tool allowlist. A profile
+    // is additionally required for predictions made before model emission.
     ToolSpeculationConfig tool_speculation;
     // Model-agnostic tool-call prediction. Predictors run before the target;
     // only the allowlisted external tool overlaps target generation. This is
@@ -299,9 +299,9 @@ struct ParsedRequest {
     std::optional<ToolSpeculationPrediction> tool_speculation;
     // Engine-side prediction may start a private external tool before target
     // generation. The model's eventual canonical call remains authoritative.
-    // Request opt-out ("automatic_tool_speculation": false disables early
-    // dispatch for this request).
-    bool                      automatic_tool_speculation_enabled = true;
+    // Fail closed: automatic early dispatch requires an explicit request
+    // opt-in ("automatic_tool_speculation": true).
+    bool                      automatic_tool_speculation_enabled = false;
     // Response ID
     std::string               response_id;
     // Thinking/reasoning state

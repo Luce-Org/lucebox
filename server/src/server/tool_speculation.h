@@ -1,8 +1,10 @@
 // Lossless, confidence-gated speculative tool execution.
 //
-// The model remains authoritative. A predicted read-only invocation may run
+// The model remains authoritative. A predicted allowlisted invocation may run
 // while inference is in flight, but its result is returned only when the
-// emitted tool name and canonical JSON arguments match exactly.
+// emitted tool name and canonical JSON arguments match exactly. Operators
+// must not allow immediate external side effects unless the executor provides
+// staging or transactional rollback.
 
 #pragma once
 

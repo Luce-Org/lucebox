@@ -219,7 +219,7 @@ static void print_usage(const char * prog) {
         "                               dflash.tool-speculation.v1 JSON request\n"
         "                               on stdin; no shell is used.\n"
         "  --tool-spec-profile <path>   Measured resource-lane frontier JSON.\n"
-        "  --tool-spec-allow <name>     Allow one read-only/idempotent tool; repeatable.\n"
+        "  --tool-spec-allow <name>     Allow one operator-reviewed tool; repeatable.\n"
         "  --tool-spec-cpu-affinity <LIST>\n"
         "                               Pin child tools to Linux CPUs/ranges, e.g.\n"
         "                               14-15,30-31. The model process affinity\n"
