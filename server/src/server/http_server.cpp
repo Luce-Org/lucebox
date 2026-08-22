@@ -962,6 +962,18 @@ std::vector<ChatMessage> normalize_chat_messages(
     ToolMemory & tool_memory) {
     std::vector<ChatMessage> chat_msgs;
     std::vector<std::string> system_parts;
+    std::vector<std::string> response_call_ids;
+    std::string response_call_fallback;
+
+    auto flush_response_calls = [&]() {
+        if (response_call_fallback.empty()) return;
+        std::string raw = response_call_ids.empty()
+            ? std::string() : tool_memory.lookup(response_call_ids);
+        chat_msgs.push_back({"assistant",
+                             raw.empty() ? response_call_fallback : raw});
+        response_call_ids.clear();
+        response_call_fallback.clear();
+    };
 
     if (messages.is_array()) {
         for (const auto & m : messages) {
@@ -969,17 +981,12 @@ std::vector<ChatMessage> normalize_chat_messages(
                 std::string item_type = m.value("type", "message");
                 if (item_type == "function_call") {
                     std::string call_id = m.value("call_id", m.value("id", ""));
-                    std::string raw;
-                    if (!call_id.empty()) {
-                        raw = tool_memory.lookup({call_id});
-                    }
-                    if (raw.empty()) {
-                        raw = render_tool_call_xml(m.value("name", ""),
-                                                   parse_responses_arguments(m));
-                    }
-                    chat_msgs.push_back({"assistant", raw});
+                    if (!call_id.empty()) response_call_ids.push_back(call_id);
+                    response_call_fallback += render_tool_call_xml(
+                        m.value("name", ""), parse_responses_arguments(m));
                     continue;
                 }
+                flush_response_calls();
                 if (item_type == "function_call_output") {
                     std::string output;
                     if (m.contains("output") && m["output"].is_string()) {
@@ -992,6 +999,7 @@ std::vector<ChatMessage> normalize_chat_messages(
                     continue;
                 }
             }
+            if (format == ApiFormat::RESPONSES) flush_response_calls();
 
             ChatMessage cm;
             cm.role = m.value("role", "user");
@@ -1032,6 +1040,7 @@ std::vector<ChatMessage> normalize_chat_messages(
                 chat_msgs.push_back(std::move(cm));
             }
         }
+        flush_response_calls();
     } else if (messages.is_string()) {
         chat_msgs.push_back({"user", messages.get<std::string>()});
     }

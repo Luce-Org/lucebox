@@ -31,7 +31,11 @@ This is a server-wide optimization; request bodies do not change. It requires
 templates whose completed turn is not an exact token extension safely fall
 back to ordinary prefix caching.
 
-Responses expose the measured result under `usage.timings`:
+The exact full-prompt cache may remain enabled for identical-request hits.
+Disable it only when benchmarking the incremental Agent Turn Cache benefit.
+
+Successful Chat Completions and Responses requests expose the measured result
+under `usage.timings`:
 
 - `agent_turn_cache_hit`: the restored prefix includes a generated agent turn.
 - `cached_prefix_tokens`: backend-confirmed tokens restored from KV state.

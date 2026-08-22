@@ -2959,13 +2959,19 @@ TEST_CASE(ServerUnitFixture, test_jinja_render_bad_tools_json_throws) {
 TEST_CASE(ServerUnitFixture, test_normalize_responses_tool_followup_messages) {
     ToolMemory tool_memory;
     const std::string call_id = "call_exec_001";
+    const std::string second_call_id = "call_read_002";
     const std::string raw_tool_call =
         "\n\n<function=exec_command>\n"
         "<parameter=cmd>\n"
         "git fetch origin && git status\n"
         "</parameter>\n"
+        "</function>\n"
+        "<function=read_file>\n"
+        "<parameter=path>\n"
+        "src/main.cpp\n"
+        "</parameter>\n"
         "</function>\n";
-    tool_memory.remember({call_id}, raw_tool_call);
+    tool_memory.remember({call_id, second_call_id}, raw_tool_call);
 
     json messages = json::array({
         {
@@ -2989,15 +2995,26 @@ TEST_CASE(ServerUnitFixture, test_normalize_responses_tool_followup_messages) {
             {"arguments", R"({"cmd":"git fetch origin && git status"})"}
         },
         {
+            {"type", "function_call"},
+            {"call_id", second_call_id},
+            {"name", "read_file"},
+            {"arguments", R"({"path":"src/main.cpp"})"}
+        },
+        {
             {"type", "function_call_output"},
             {"call_id", call_id},
             {"output", "Process exited with code 0"}
+        },
+        {
+            {"type", "function_call_output"},
+            {"call_id", second_call_id},
+            {"output", "int main() {}"}
         }
     });
 
     auto chat_msgs = normalize_chat_messages(messages, ApiFormat::RESPONSES, tool_memory);
-    TEST_ASSERT(chat_msgs.size() == 4);
-    if (chat_msgs.size() == 4) {
+    TEST_ASSERT(chat_msgs.size() == 5);
+    if (chat_msgs.size() == 5) {
         TEST_ASSERT(chat_msgs[0].role == "system");
         TEST_ASSERT(chat_msgs[0].content == "Developer rules");
         TEST_ASSERT(chat_msgs[1].role == "user");
@@ -3007,6 +3024,9 @@ TEST_CASE(ServerUnitFixture, test_normalize_responses_tool_followup_messages) {
         TEST_ASSERT(chat_msgs[3].role == "tool");
         TEST_ASSERT(chat_msgs[3].tool_call_id == call_id);
         TEST_ASSERT(chat_msgs[3].content == "Process exited with code 0");
+        TEST_ASSERT(chat_msgs[4].role == "tool");
+        TEST_ASSERT(chat_msgs[4].tool_call_id == second_call_id);
+        TEST_ASSERT(chat_msgs[4].content == "int main() {}");
     }
 }
 
