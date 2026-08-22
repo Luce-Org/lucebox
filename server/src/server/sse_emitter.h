@@ -206,4 +206,6 @@ private:
     static constexpr size_t BASE_HOLDBACK = 15;  // len("<parameter name=") - 1
 };
 
+std::string escape_for_logging(const std::string & s);
+
 }  // namespace dflash::common
