@@ -252,11 +252,14 @@ bool should_clamp_flowkv_disk_cache(
     return flowkv && policy.compress;
 }
 
-bool canonical_turn_extends_prompt(
+bool canonical_turn_matches_checkpoint(
         const std::vector<int32_t> & prompt,
-        const std::vector<int32_t> & completed_turn) {
-    return !prompt.empty() && completed_turn.size() > prompt.size() &&
-           std::equal(prompt.begin(), prompt.end(), completed_turn.begin());
+        const std::vector<int32_t> & completed_turn,
+        int checkpoint) {
+    return checkpoint > 0 && checkpoint <= (int) prompt.size() &&
+           checkpoint < (int) completed_turn.size() &&
+           std::equal(prompt.begin(), prompt.begin() + checkpoint,
+                      completed_turn.begin());
 }
 
 bool canonical_assistant_content(
@@ -1108,8 +1111,7 @@ HttpServer::HttpServer(ModelBackend & backend,
     , tokenizer_(tokenizer)
     , config_(config)
     , chat_format_(ChatFormat::QWEN3)  // default, overridden by arch
-    , prefix_cache_(config.prefix_cache_cap, tokenizer,
-                    config.agent_turn_cache ? 2 : 1)
+    , prefix_cache_(config.prefix_cache_cap, tokenizer)
     , disk_cache_({config.disk_cache_dir,
                    config.disk_cache_budget_mb * (size_t)(1024 * 1024),
                    config.disk_cache_min_tokens,
@@ -2135,8 +2137,7 @@ bool HttpServer::route_request(SocketHandle fd, const HttpRequest & hr) {
 
 namespace {
 
-// Staging slots live above both PrefixCache pools.
-constexpr int kAgentTurnStagingSlot = ModelBackend::kMaxSlots - 2;
+// Disk-cache staging lives above both PrefixCache pools.
 constexpr int kDiskStagingSlot = ModelBackend::kMaxSlots - 1;
 
 struct CompletionTokenCounts {
@@ -3323,15 +3324,9 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
         }
     }
 
-    // A generation can save one snapshot during prefill. For supported tool
-    // APIs, reserve it at the exact prompt end so the generated tool call can
-    // later deepen the existing prefix cache without replaying the prompt.
-    const bool stage_agent_prompt = config_.agent_turn_cache &&
-        !req.tools.empty() && !prepared.compressed && !ppp_rewrote &&
-        !effective_prompt.empty() &&
-        (req.format == ApiFormat::OPENAI_CHAT ||
-         req.format == ApiFormat::RESPONSES);
-
+    // A generation can save only one snapshot during prefill. Tool-heavy
+    // requests prefer the reusable system/tool boundary; otherwise an
+    // enabled exact full-prompt cache retains its existing priority.
     auto prepare_inline = [&]() {
         const auto prepared_snapshot = prefix_cache_.prepare_inline_snap(
             effective_prompt,
@@ -3353,16 +3348,17 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
         }
     };
 
-    if (stage_agent_prompt) {
-        cache.agent_prompt_snap_pos = (int) effective_prompt.size();
-        cache.agent_prompt_snap_prepared = true;
-        backend_.snapshot_free(kAgentTurnStagingSlot);
-        generate_request.snap_slot = kAgentTurnStagingSlot;
-        generate_request.snap_pos = cache.agent_prompt_snap_pos;
-    } else {
-        if (prefer_inline_snap || cache.using_restore) prepare_inline();
-        if (!cache.using_restore && cache.snap_slot < 0) prepare_full();
-        if (!cache.full_snap_prepared && cache.snap_slot < 0) prepare_inline();
+    if (prefer_inline_snap || cache.using_restore) {
+        prepare_inline();
+    }
+    if (!cache.using_restore && cache.snap_slot < 0) {
+        prepare_full();
+    }
+
+    // Full cache may be disabled or already contain this exact key. Fall
+    // back to an inline snapshot when no target has been selected yet.
+    if (!cache.full_snap_prepared && cache.snap_slot < 0) {
+        prepare_inline();
     }
 
     // Never destroy the snapshot needed by this request's restore. With a
@@ -3388,8 +3384,7 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
     std::fprintf(stderr,
         "[server] chat CACHE %s restore=%s slot=%d prefix_len=%d "
         "effective_prompt=%zu pflash=%s disk_policy=%s disk_hit=%s "
-        "snap_slot=%d snap_pos=%d full_snap_slot=%d full_snap_pos=%d "
-        "agent_prompt_snap=%d\n",
+        "snap_slot=%d snap_pos=%d full_snap_slot=%d full_snap_pos=%d\n",
         req.response_id.c_str(),
         cache.using_restore ? "true" : "false",
         cache.cache_slot, cache.prefix_len, effective_prompt.size(),
@@ -3397,8 +3392,7 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
         disk_prefix_cache_policy_name(cache.disk_policy).c_str(),
         cache.disk_hit ? "true" : "false",
         cache.snap_slot, cache.snap_cut,
-        cache.full_snap_slot, cache.full_snap_pos,
-        cache.agent_prompt_snap_prepared ? cache.agent_prompt_snap_pos : 0);
+        cache.full_snap_slot, cache.full_snap_pos);
 
     status_.set_flags(
         cache.using_restore, prepared.compressed,
@@ -3519,17 +3513,14 @@ void HttpServer::remember_agent_turn(
         const ParsedRequest & req, const PreparedPrompt & prepared,
         const GenerationCacheState & cache, const GenerateResult & result,
         const SseEmitter & emitter, int completion_tokens,
-        bool visible_output_seen, bool client_disconnected) {
+        bool visible_output_seen, bool client_disconnected,
+        bool replay_cache) {
+    const bool supported_format = req.format == ApiFormat::OPENAI_CHAT ||
+        req.format == ApiFormat::RESPONSES;
     const bool valid_tool_turn = result.ok() && completion_tokens > 0 &&
         visible_output_seen && !client_disconnected && !req.tools.empty() &&
         !emitter.tool_calls().empty() && !emitter.accumulated_raw().empty();
-    if (!config_.agent_turn_cache || !valid_tool_turn ||
-        !cache.agent_prompt_snap_prepared || prefix_cache_.disabled()) {
-        return;
-    }
-    // Cache only stateless-equivalent prompts. Compression and token rewrites
-    // need a separate replay contract.
-    if (prepared.compressed || prepared.tokens != req.prompt_tokens) return;
+    if (!supported_format || !valid_tool_turn) return;
 
     std::vector<ChatMessage> messages =
         normalize_chat_messages(req.messages, req.format, tool_memory_);
@@ -3557,6 +3548,19 @@ void HttpServer::remember_agent_turn(
     }
     messages.back().content = assistant_content;
 
+    // Stateless tool APIs send structured calls back on the next request.
+    // Retain the exact generated text so normalization recreates the same
+    // assistant turn, even when no compatible KV checkpoint is available.
+    std::vector<std::string> call_ids;
+    for (const auto & call : emitter.tool_calls()) call_ids.push_back(call.id);
+    tool_memory_.remember(call_ids, assistant_content);
+
+    if (!replay_cache) return;
+    if (!config_.agent_turn_cache || prefix_cache_.disabled()) return;
+    // Cache only stateless-equivalent prompts. Compression and token rewrites
+    // need a separate replay contract.
+    if (prepared.compressed || prepared.tokens != req.prompt_tokens) return;
+
     std::string canonical_rendered;
     if (!render_messages_to_text(
             messages, req, /*add_generation_prompt=*/false,
@@ -3564,26 +3568,42 @@ void HttpServer::remember_agent_turn(
         return;
     }
     std::vector<int32_t> canonical_tokens = tokenizer_.encode(canonical_rendered);
-    if (!http_detail::canonical_turn_extends_prompt(
-            prepared.tokens, canonical_tokens)) {
-        std::fprintf(stderr,
-            "[agent-turn-cache] completed turn is not a token extension; skipped\n");
-        return;
-    }
     if (has_pending_jobs()) return;
 
-    const int staged_pos = backend_.snapshot_cur_pos(kAgentTurnStagingSlot);
-    if (!backend_.snapshot_used(kAgentTurnStagingSlot) || staged_pos <= 0 ||
-        staged_pos > (int) prepared.tokens.size()) {
+    // Reuse the deepest checkpoint ordinary prefix caching already produced.
+    // Matching at the checkpoint, instead of at the prompt end, tolerates the
+    // BPE boundary change caused by appending the generated assistant turn.
+    int source_slot = -1;
+    int source_pos = 0;
+    auto consider_source = [&](int slot) {
+        if (slot < 0 || !backend_.snapshot_used(slot)) return;
+        const int pos = backend_.snapshot_cur_pos(slot);
+        if (pos <= source_pos ||
+            !http_detail::canonical_turn_matches_checkpoint(
+                prepared.tokens, canonical_tokens, pos)) {
+            return;
+        }
+        source_slot = slot;
+        source_pos = pos;
+    };
+    if (cache.using_restore) consider_source(cache.cache_slot);
+    if (cache.snap_prepared) consider_source(cache.snap_slot);
+    if (source_slot < 0) {
+        std::fprintf(stderr,
+            "[agent-turn-cache] no compatible prefix checkpoint; skipped\n");
         return;
     }
 
     const int canonical_end = (int) canonical_tokens.size();
     const auto pending = prefix_cache_.prepare_inline_snap(
-        canonical_tokens, 0, false, canonical_end);
+        canonical_tokens, source_pos, false, canonical_end);
     if (pending.first < 0 || pending.second != canonical_end) return;
 
     const int slot = pending.first;
+    if (slot == source_slot) {
+        prefix_cache_.cancel_inline_snap(slot);
+        return;
+    }
     forget_inline_slot_metadata(slot);
     backend_.snapshot_free(slot);
 
@@ -3595,20 +3615,20 @@ void HttpServer::remember_agent_turn(
     DaemonIO replay_io;
     replay_io.should_cancel = [this]() { return has_pending_jobs(); };
     const GenerateResult replay_result = backend_.restore_and_generate(
-        kAgentTurnStagingSlot, replay, replay_io);
+        source_slot, replay, replay_io);
+    backend_.release_scratch();
     const int saved_pos = replay_result.ok() && backend_.snapshot_used(slot)
         ? backend_.snapshot_cur_pos(slot) : 0;
-    if (saved_pos > staged_pos && saved_pos <= canonical_end) {
+    if (saved_pos > source_pos && saved_pos <= canonical_end) {
         prefix_cache_.confirm_inline_snap(slot, saved_pos, canonical_tokens);
         canonical_tokens.resize((size_t) saved_pos);
         slot_tokens_[slot] = std::move(canonical_tokens);
         agent_turn_cache_slots_.insert(slot);
-        std::vector<std::string> call_ids;
-        for (const auto & call : emitter.tool_calls()) call_ids.push_back(call.id);
-        tool_memory_.remember(call_ids, assistant_content);
         std::fprintf(stderr,
-            "[agent-turn-cache] saved slot=%d prefix=%d prompt=%zu\n",
-            slot, saved_pos, prepared.tokens.size());
+            "[agent-turn-cache] saved slot=%d prefix=%d source=%d:%d "
+            "replayed=%d\n",
+            slot, saved_pos, source_slot, source_pos,
+            canonical_end - source_pos);
     } else {
         backend_.snapshot_free(slot);
         prefix_cache_.abort_inline_snap(slot);
@@ -4063,6 +4083,10 @@ void HttpServer::process_job(ServerJob * job) {
     }
     if (req.stream && !client_disconnected) {
         auto final_chunks = emitter.emit_finish(completion_tokens, &gen_timings);
+        remember_agent_turn(
+            req, prepared, cache, result, emitter, completion_tokens,
+            visible_output_seen, client_disconnected,
+            /*replay_cache=*/false);
         for (const auto & chunk : final_chunks) {
             if (!send_job_bytes(job, chunk.data(), chunk.size())) {
                 client_disconnected = true;
@@ -4072,6 +4096,10 @@ void HttpServer::process_job(ServerJob * job) {
     } else if (!req.stream && !client_disconnected) {
         const json response = build_non_streaming_response(
             req, result, n_gen_cap, gen_timings, tokenizer_, emitter);
+        remember_agent_turn(
+            req, prepared, cache, result, emitter, completion_tokens,
+            visible_output_seen, client_disconnected,
+            /*replay_cache=*/false);
         // Streaming uses non-blocking sends; restore blocking mode before
         // writing a complete JSON response on this shared socket path.
         sock_set_block(fd);
@@ -4081,11 +4109,8 @@ void HttpServer::process_job(ServerJob * job) {
 
     remember_agent_turn(
         req, prepared, cache, result, emitter, completion_tokens,
-        visible_output_seen, client_disconnected);
-    if (cache.agent_prompt_snap_prepared) {
-        backend_.snapshot_free(kAgentTurnStagingSlot);
-        backend_.release_scratch();
-    }
+        visible_output_seen, client_disconnected,
+        /*replay_cache=*/true);
 
     if (client_disconnected) {
         std::fprintf(stderr, "[server] client disconnected — generation aborted "

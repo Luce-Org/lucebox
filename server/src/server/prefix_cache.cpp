@@ -220,10 +220,8 @@ int select_inline_snapshot_boundary(const std::vector<int> & boundaries,
 
 // ─── PrefixCache ────────────────────────────────────────────────────────
 
-PrefixCache::PrefixCache(int cap, const Tokenizer & tokenizer,
-                         int reserved_slots)
-    : cap_(std::min(cap, MAX_SLOTS - std::clamp(reserved_slots, 0, MAX_SLOTS)))
-    , reserved_slots_(std::clamp(reserved_slots, 0, MAX_SLOTS))
+PrefixCache::PrefixCache(int cap, const Tokenizer & tokenizer)
+    : cap_(std::min(cap, MAX_SLOTS))
 {
     if (cap_ <= 0) {
         disabled_ = true;
@@ -475,8 +473,11 @@ void PrefixCache::init_full_cache(int full_cap) {
         full_cap_ = 0;
         return;
     }
-    // Keep server staging slots above both in-memory cache pools.
-    int remaining = MAX_SLOTS - cap_ - reserved_slots_;
+    // Reserve the last slot (MAX_SLOTS-1) for the disk-prefix-cache staging
+    // slot (http_server DISK_STAGING_SLOT = kMaxSlots-1). Without this the full
+    // cache can claim slot 63 and disk-cache traffic silently clobbers a
+    // committed full-cache snapshot -> empty/corrupt responses on a later hit.
+    int remaining = MAX_SLOTS - cap_ - 1;
     if (full_cap > remaining) full_cap = remaining;
     if (full_cap <= 0) {
         full_disabled_ = true;

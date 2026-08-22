@@ -2077,30 +2077,17 @@ TEST_CASE(ServerUnitFixture, test_resolve_deepseek_chat_markers) {
     unlink(path.c_str());
 }
 
-TEST_CASE(ServerUnitFixture, test_prefix_cache_reserves_server_staging_slots) {
-    const std::string path = write_deepseek_marker_tokenizer_fixture();
-    Tokenizer tokenizer;
-    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
-
-    PrefixCache inline_cache(64, tokenizer, /*reserved_slots=*/2);
-    TEST_ASSERT(inline_cache.stats().capacity == 62);
-
-    PrefixCache split_cache(60, tokenizer, /*reserved_slots=*/2);
-    split_cache.init_full_cache(10);
-    TEST_ASSERT(split_cache.stats().capacity == 60);
-    TEST_ASSERT(split_cache.full_stats().capacity == 2);
-    unlink(path.c_str());
-}
-
-TEST_CASE(ServerUnitFixture, test_canonical_turn_must_extend_checkpointed_prompt) {
-    TEST_ASSERT(http_detail::canonical_turn_extends_prompt(
-        {1, 2, 3}, {1, 2, 3, 4}));
-    TEST_ASSERT(!http_detail::canonical_turn_extends_prompt(
-        {1, 2, 3}, {1, 9, 3, 4}));
-    TEST_ASSERT(!http_detail::canonical_turn_extends_prompt(
-        {1, 2, 3}, {1, 2, 3}));
-    TEST_ASSERT(!http_detail::canonical_turn_extends_prompt(
-        {}, {1}));
+TEST_CASE(ServerUnitFixture, test_canonical_turn_matches_replay_checkpoint) {
+    TEST_ASSERT(http_detail::canonical_turn_matches_checkpoint(
+        {1, 2, 3}, {1, 2, 9, 4}, 2));
+    TEST_ASSERT(!http_detail::canonical_turn_matches_checkpoint(
+        {1, 2, 3}, {1, 9, 3, 4}, 2));
+    TEST_ASSERT(!http_detail::canonical_turn_matches_checkpoint(
+        {1, 2, 3}, {1, 2}, 2));
+    TEST_ASSERT(!http_detail::canonical_turn_matches_checkpoint(
+        {1, 2, 3}, {1, 2, 3, 4}, 0));
+    TEST_ASSERT(!http_detail::canonical_turn_matches_checkpoint(
+        {1, 2, 3}, {1, 2, 3, 4}, 4));
 }
 
 TEST_CASE(ServerUnitFixture, test_qwen_completed_tool_turn_preserves_generation_prefix) {

@@ -251,9 +251,10 @@ float resolve_pflash_keep_ratio(float configured_ratio,
                                 const HttpServerSessions & sessions);
 bool should_clamp_flowkv_disk_cache(
     bool flowkv, const DiskPrefixCachePolicy & policy);
-bool canonical_turn_extends_prompt(
+bool canonical_turn_matches_checkpoint(
     const std::vector<int32_t> & prompt,
-    const std::vector<int32_t> & completed_turn);
+    const std::vector<int32_t> & completed_turn,
+    int checkpoint);
 bool canonical_assistant_content(
     const std::string & generation_prompt,
     const std::string & sentinel_rendered,
@@ -408,8 +409,6 @@ private:
         int snap_slot = -1;
         int snap_cut = 0;
         bool snap_prepared = false;
-        int agent_prompt_snap_pos = 0;
-        bool agent_prompt_snap_prepared = false;
     };
 
     GenerationCacheState prepare_generation_cache(
@@ -424,7 +423,8 @@ private:
         const ParsedRequest & req, const PreparedPrompt & prepared,
         const GenerationCacheState & cache, const GenerateResult & result,
         const SseEmitter & emitter, int completion_tokens,
-        bool visible_output_seen, bool client_disconnected);
+        bool visible_output_seen, bool client_disconnected,
+        bool replay_cache);
     void forget_inline_slot_metadata(int slot);
 
     struct GenerationInputs {

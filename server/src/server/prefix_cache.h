@@ -91,10 +91,8 @@ class PrefixCache {
 public:
     static constexpr int MAX_SLOTS = 64;
 
-    // cap = number of prefix-cache slots (0 disables). The highest
-    // `reserved_slots` backend slots remain available to server staging.
-    PrefixCache(int cap, const Tokenizer & tokenizer,
-                int reserved_slots = 1);
+    // cap = number of prefix-cache slots (0 disables).
+    PrefixCache(int cap, const Tokenizer & tokenizer);
 
     bool disabled() const { return disabled_; }
 
@@ -181,7 +179,6 @@ public:
 private:
     bool disabled_ = true;
     int cap_ = 0;
-    int reserved_slots_ = 1;
     ChatMarkers markers_;
 
     // LRU for inline prefix cache: ordered map of hash → slot.

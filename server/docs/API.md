@@ -22,14 +22,15 @@ backend (qwen35, qwen3, gemma4, laguna).
 
 Start the server with `--agent-turn-cache` to extend the existing in-memory
 prefix cache through generated tool calls. After the model emits a valid tool
-call, the server checkpoints the canonical completed turn. On the next OpenAI
+call, the server reuses its deepest compatible prefix checkpoint, replays the
+uncached tail once, and saves the canonical completed turn. On the next OpenAI
 Chat Completions or Responses request, only the appended tool result and new
 suffix need prefill.
 
 This is a server-wide optimization; request bodies do not change. It requires
 `--prefix-cache-slots` to be nonzero. Compressed or token-rewritten prompts and
-templates whose completed turn is not an exact token extension safely fall
-back to ordinary prefix caching.
+requests without a compatible checkpoint safely fall back to ordinary prefix
+caching.
 
 The exact full-prompt cache may remain enabled for identical-request hits.
 Disable it only when benchmarking the incremental Agent Turn Cache benefit.
