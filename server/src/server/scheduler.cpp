@@ -283,7 +283,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             }
         } else if (req.stream && !s.client_disconnected) {
             auto final_chunks =
-                s.emitter->emit_finish(s.completion_tokens, &gen_timings);
+                s.emitter->emit_finish(s.completion_tokens, &gen_timings, s.n_gen_cap);
             for (const auto & chunk : final_chunks) {
                 s.send_buffer.append(chunk);
             }
@@ -390,7 +390,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                         if (!send_job_bytes(job, c.data(), c.size())) { ok = false; break; }
                     }
                     if (ok) {
-                        for (const auto & c : emitter.emit_finish(0, &t)) {
+                        for (const auto & c : emitter.emit_finish(0, &t, n_gen_cap)) {
                             if (!send_job_bytes(job, c.data(), c.size())) break;
                         }
                     }

@@ -88,7 +88,8 @@ public:
     // the pre-timings API for unit tests that don't exercise that
     // shape.
     std::vector<std::string> emit_finish(int completion_tokens,
-                                         const GenTimings * timings = nullptr);
+                                         const GenTimings * timings = nullptr,
+                                         int generation_cap = -1);
 
     // Get the finish_reason for non-streaming responses.
     std::string finish_reason() const;
@@ -192,6 +193,7 @@ private:
     bool         stop_hit_ = false;
 
     int64_t      created_at_;
+    std::string  finish_reason_ = "stop";
 
     // Responses API IDs
     std::string  msg_item_id_;

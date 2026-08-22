@@ -6010,3 +6010,74 @@ TEST_CASE(ServerUnitFixture, test_emitter_function_calls_param_with_literal_thin
     TEST_ASSERT(em.emit_token_count() == 3);
     TEST_ASSERT(em.emit_token_count() - em.first_content_token_index() == 1);
 }
+
+TEST_CASE(ServerUnitFixture, test_emitter_streaming_length_finish_reason_at_cap) {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, json::array(), false);
+    em.emit_start();
+    em.emit_token("hello world");
+    auto chunks = em.emit_finish(10, nullptr, 10);
+    TEST_ASSERT(em.finish_reason() == "length");
+    bool found_length = false;
+    for (const auto & chunk : chunks) {
+        if (chunk.find("\"finish_reason\":\"length\"") != std::string::npos) {
+            found_length = true;
+            break;
+        }
+    }
+    TEST_ASSERT(found_length);
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_streaming_length_finish_reason_at_zero_cap) {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, json::array(), false);
+    em.emit_start();
+    auto chunks = em.emit_finish(0, nullptr, 0);
+    TEST_ASSERT(em.finish_reason() == "length");
+    bool found_length = false;
+    for (const auto & chunk : chunks) {
+        if (chunk.find("\"finish_reason\":\"length\"") != std::string::npos) {
+            found_length = true;
+            break;
+        }
+    }
+    TEST_ASSERT(found_length);
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_streaming_stop_sequence_beats_length_at_cap) {
+    std::vector<std::string> stops = {"END"};
+    auto em = make_emitter_with_stops(ApiFormat::OPENAI_CHAT, stops);
+    em.emit_start();
+    em.emit_token("finished END");
+    auto chunks = em.emit_finish(10, nullptr, 10);
+    TEST_ASSERT(em.stop_hit());
+    TEST_ASSERT(em.finish_reason() == "stop");
+    bool found_stop = false;
+    for (const auto & chunk : chunks) {
+        if (chunk.find("\"finish_reason\":\"stop\"") != std::string::npos) {
+            found_stop = true;
+            break;
+        }
+    }
+    TEST_ASSERT(found_stop);
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_streaming_anthropic_length_finish_reason_at_cap) {
+    auto em = make_emitter(ApiFormat::ANTHROPIC, json::array(), false);
+    em.emit_start();
+    em.emit_token("hello world");
+    auto chunks = em.emit_finish(10, nullptr, 10);
+    TEST_ASSERT(em.finish_reason() == "length");
+    std::string text = concat(chunks);
+    TEST_ASSERT(text.find("\"stop_reason\":\"max_tokens\"") != std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_streaming_anthropic_stop_sequence_beats_length_at_cap) {
+    std::vector<std::string> stops = {"END"};
+    auto em = make_emitter_with_stops(ApiFormat::ANTHROPIC, stops);
+    em.emit_start();
+    em.emit_token("finished END");
+    auto chunks = em.emit_finish(10, nullptr, 10);
+    TEST_ASSERT(em.stop_hit());
+    TEST_ASSERT(em.finish_reason() == "stop");
+    std::string text = concat(chunks);
+    TEST_ASSERT(text.find("\"stop_reason\":\"end_turn\"") != std::string::npos);
+}

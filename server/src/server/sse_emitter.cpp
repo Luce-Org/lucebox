@@ -580,7 +580,8 @@ void SseEmitter::emit_content_delta(std::vector<std::string> & out,
 // ─── emit_finish ────────────────────────────────────────────────────────
 
 std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
-                                                 const GenTimings * timings) {
+                                                 const GenTimings * timings,
+                                                 int generation_cap) {
     std::vector<std::string> out;
 
     // A tail still pending at end-of-stream is a genuinely truncated
@@ -814,6 +815,11 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
         }
     }
 
+    if (fr == "stop" && !stop_hit_ && generation_cap >= 0 && completion_tokens >= generation_cap) {
+        fr = "length";
+    }
+    finish_reason_ = fr;
+
     // Format-specific final events
     switch (format_) {
     case ApiFormat::OPENAI_CHAT: {
@@ -854,9 +860,10 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
         }
         // stop_reason reflects the model's actual finish: "tool_use" when
         // any tool calls were emitted (downstream SDKs pivot on this to feed
-        // tool_result back), else "end_turn". Stop-sequence hits also report
-        // "end_turn" (Anthropic has no dedicated reason for that case).
-        const char * stop_reason = tool_calls_.empty() ? "end_turn" : "tool_use";
+        // tool_result back), else "end_turn" or "max_tokens".
+        const char * stop_reason = tool_calls_.empty()
+            ? (fr == "length" ? "max_tokens" : "end_turn")
+            : "tool_use";
         json anth_usage = {{"output_tokens", completion_tokens}};
         if (timings) {
             anth_usage["timings"] = build_timings_json(*timings, completion_tokens);
@@ -946,8 +953,7 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
 }
 
 std::string SseEmitter::finish_reason() const {
-    if (!tool_calls_.empty()) return "tool_calls";
-    return "stop";
+    return finish_reason_;
 }
 
 }  // namespace dflash::common
