@@ -32,6 +32,11 @@ This is a server-wide optimization; request bodies do not change. It requires
 requests without a compatible checkpoint safely fall back to ordinary prefix
 caching.
 
+The replay moves prefill work out of the follow-up request when tool execution
+is long enough to overlap it; it does not eliminate that work. Paged attention
+and `--max-concurrency` do not yet support shared prefix blocks, so they cannot
+be combined with Agent Turn Cache.
+
 The exact full-prompt cache may remain enabled for identical-request hits.
 Disable it only when benchmarking the incremental Agent Turn Cache benefit.
 

@@ -90,6 +90,8 @@ struct FullCacheEntry {
 class PrefixCache {
 public:
     static constexpr int MAX_SLOTS = 64;
+    // The HTTP server owns the final backend slot for disk-cache staging.
+    static constexpr int MAX_CACHE_SLOTS = MAX_SLOTS - 1;
 
     // cap = number of prefix-cache slots (0 disables).
     PrefixCache(int cap, const Tokenizer & tokenizer);

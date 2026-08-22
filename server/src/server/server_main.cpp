@@ -811,6 +811,12 @@ int main(int argc, char ** argv) {
         sconfig.disk_cache_dir.clear();
         sconfig.disk_cache_policy.mode = DiskPrefixCacheMode::Off;
     }
+    if (sconfig.agent_turn_cache && bargs.paged_attention) {
+        std::fprintf(stderr,
+            "[server] --agent-turn-cache is not yet supported with "
+            "--paged-attention or --max-concurrency\n");
+        return 2;
+    }
     if (sconfig.agent_turn_cache && sconfig.prefix_cache_cap <= 0) {
         std::fprintf(stderr,
             "[server] --agent-turn-cache requires an enabled inline prefix cache\n");

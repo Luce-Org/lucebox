@@ -2077,6 +2077,18 @@ TEST_CASE(ServerUnitFixture, test_resolve_deepseek_chat_markers) {
     unlink(path.c_str());
 }
 
+TEST_CASE(ServerUnitFixture, test_prefix_cache_reserves_disk_staging_slot) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    PrefixCache cache(PrefixCache::MAX_SLOTS, tokenizer);
+    TEST_ASSERT(cache.stats().capacity == PrefixCache::MAX_CACHE_SLOTS);
+    TEST_ASSERT(PrefixCache::MAX_CACHE_SLOTS == ModelBackend::kMaxSlots - 1);
+
+    unlink(path.c_str());
+}
+
 TEST_CASE(ServerUnitFixture, test_canonical_turn_matches_replay_checkpoint) {
     TEST_ASSERT(http_detail::canonical_turn_matches_checkpoint(
         {1, 2, 3}, {1, 2, 9, 4}, 2));

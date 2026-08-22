@@ -208,11 +208,11 @@ on most workstations.
 | Scenario | Typical prefix length | Recommended cap |
 |----------|----------------------|-----------------|
 | Single-user chat | 200–2000 tokens | 16–32 |
-| Multi-session agent | 500–5000 tokens | 32–64 |
+| Multi-session agent | 500–5000 tokens | 32–63 |
 | Batch / benchmark | N/A (cold starts) | 4 |
 
-The hard limit is `MAX_SLOTS = 64`. Beyond that, increase the constant in
-`prefix_cache.h` and `model_backend.h`.
+The in-memory cache limit is 63 slots. Backend slot 63 is reserved for disk
+cache staging, preventing disk loads from overwriting a live in-memory entry.
 
 ## File Map
 
