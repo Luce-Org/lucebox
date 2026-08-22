@@ -1559,7 +1559,6 @@ if(DFLASH27B_TESTS)
         set(_server_unit_sources
             test/test_unit_main.cpp
             test/test_server_unit.cpp
-            test/test_tool_speculation.cpp
             test/test_anchor_params.cpp
             test/test_derived_scalars.cpp
             test/test_adaptive_keep_ratio.cpp
@@ -1593,7 +1592,6 @@ if(DFLASH27B_TESTS)
         add_executable(test_server_unit ${_server_unit_sources})
         target_sources(test_server_unit PRIVATE
             src/server/http_server.cpp
-            src/server/tool_speculation.cpp
             src/server/scheduler.cpp
             src/server/model_card.cpp
             src/server/prompt_normalize.cpp
@@ -1965,7 +1963,6 @@ if(DFLASH27B_SERVER)
         add_executable(dflash_server
             src/server/server_main.cpp
             src/server/http_server.cpp
-            src/server/tool_speculation.cpp
             src/server/scheduler.cpp
             src/server/model_card.cpp
             src/server/prompt_normalize.cpp

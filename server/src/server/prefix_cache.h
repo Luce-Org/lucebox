@@ -20,7 +20,6 @@
 #include <functional>
 #include <map>
 #include <string>
-#include <unordered_set>
 #include <vector>
 
 namespace dflash::common {
@@ -92,8 +91,8 @@ class PrefixCache {
 public:
     static constexpr int MAX_SLOTS = 64;
 
-    // cap = number of prefix-cache slots (0 disables). `reserved_slots`
-    // keeps backend-only staging slots above the inline/full pools.
+    // cap = number of prefix-cache slots (0 disables). The highest
+    // `reserved_slots` backend slots remain available to server staging.
     PrefixCache(int cap, const Tokenizer & tokenizer,
                 int reserved_slots = 1);
 
@@ -105,11 +104,7 @@ public:
     // ── Inline prefix cache ─────────────────────────────────────────
 
     // Look up the longest cached prefix. Returns (slot, prefix_len) or (-1, 0).
-    // `excluded_slots` lets request-scoped features opt out of their own
-    // snapshots without hiding a shorter ordinary prefix-cache match.
-    std::pair<int, int> lookup(
-        const std::vector<int32_t> & prompt_ids,
-        const std::unordered_set<int> * excluded_slots = nullptr);
+    std::pair<int, int> lookup(const std::vector<int32_t> & prompt_ids);
 
     // Prepare an inline snapshot. `restored_prefix_len` prevents reserving a
     // slot for a boundary already covered by the restored snapshot.
@@ -186,6 +181,7 @@ public:
 private:
     bool disabled_ = true;
     int cap_ = 0;
+    int reserved_slots_ = 1;
     ChatMarkers markers_;
 
     // LRU for inline prefix cache: ordered map of hash → slot.
@@ -207,7 +203,6 @@ private:
     bool full_disabled_ = true;
     int  full_cap_ = 0;
     int  full_slot_base_ = 0;
-    int  reserved_slots_ = 1;
     int  full_next_slot_ = 0;
 
     struct FullLruEntry {

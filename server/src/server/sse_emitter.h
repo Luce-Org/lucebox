@@ -59,8 +59,6 @@ struct GenTimings {
 //   cached_prefix_tokens    = effective-prompt tokens supplied by that snapshot
 //   prefilled_tokens        = effective-prompt tokens computed for this request
 //   effective_prompt_tokens = total prompt tokens seen by the backend
-//   agent_turn_cache_hit     = whether the restored snapshot included the
-//                              preceding generated agent turn
 nlohmann::json build_timings_json(const GenTimings & t, int completion_tokens);
 
 // Manages SSE streaming for a single request.
@@ -101,8 +99,7 @@ public:
     // Get accumulated content (for non-streaming).
     const std::string & accumulated_text() const { return accumulated_content_; }
 
-    // Exact visible model text before tool-call normalization. This is the
-    // text ToolMemory replays when clients return structured tool calls.
+    // Exact model text before structured tool-call normalization.
     const std::string & accumulated_raw() const { return accumulated_raw_; }
 
     // Get the parsed tool calls (after emit_finish).
@@ -162,6 +159,11 @@ private:
     StreamMode   mode_;
     bool         tool_from_reasoning_ = false;
     std::string  window_;           // holdback buffer
+    // Incomplete trailing UTF-8 bytes from the previous token piece.
+    // BPE tokens can split a multi-byte codepoint (emoji arrive as two
+    // 2-byte halves); sanitizing halves independently turned every such
+    // codepoint into two U+FFFD. The tail is carried into the next piece.
+    std::string  utf8_tail_;
     std::string  tool_buffer_;      // accumulated tool text
     bool         tool_buffer_fallback_to_content_ = false;
     std::string  accumulated_content_;

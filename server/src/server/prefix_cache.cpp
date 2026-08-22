@@ -272,9 +272,7 @@ void PrefixCache::move_full_to_end(int idx) {
 
 // ── Inline prefix cache ─────────────────────────────────────────────────
 
-std::pair<int, int> PrefixCache::lookup(
-        const std::vector<int32_t> & prompt_ids,
-        const std::unordered_set<int> * excluded_slots) {
+std::pair<int, int> PrefixCache::lookup(const std::vector<int32_t> & prompt_ids) {
     if (disabled_) return {-1, 0};
 
     auto boundaries = find_all_boundaries(prompt_ids, markers_);
@@ -296,9 +294,6 @@ std::pair<int, int> PrefixCache::lookup(
                 entries_size_count_.fetch_sub(1, std::memory_order_relaxed);
                 continue;
             }
-            if (excluded_slots && excluded_slots->count(entries_[idx].slot)) {
-                continue;
-            }
             if (cut > best_len) {
                 best_slot = entries_[idx].slot;
                 best_len = cut;
@@ -311,7 +306,6 @@ std::pair<int, int> PrefixCache::lookup(
     // pin_end cuts that are not chat-template boundaries.
     for (int i = 0; i < (int)entries_.size(); ++i) {
         const auto & e = entries_[(size_t)i];
-        if (excluded_slots && excluded_slots->count(e.slot)) continue;
         const int len = (int)e.ids.size();
         if (len <= best_len || len > (int)prompt_ids.size()) continue;
         if (!std::equal(e.ids.begin(), e.ids.end(), prompt_ids.begin())) {
@@ -481,9 +475,7 @@ void PrefixCache::init_full_cache(int full_cap) {
         full_cap_ = 0;
         return;
     }
-    // Keep backend-only staging slots above both cache pools. The HTTP server
-    // normally reserves the disk staging slot and, with Agent Turn Cache,
-    // another slot used to canonicalize generated tool-call continuations.
+    // Keep server staging slots above both in-memory cache pools.
     int remaining = MAX_SLOTS - cap_ - reserved_slots_;
     if (full_cap > remaining) full_cap = remaining;
     if (full_cap <= 0) {

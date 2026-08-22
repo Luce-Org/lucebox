@@ -1,6 +1,0 @@
-[repository]
-max_parallel_reads = 3
-search_result_limit = 40
-
-[safety]
-allow_writes = false

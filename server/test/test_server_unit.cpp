@@ -610,9 +610,7 @@ TEST_CASE(ServerUnitFixture, test_tool_syntax_scanner_declared_name_guards) {
 
     json invalid = edit_tools();
     invalid[0]["function"]["name"] = std::string(65, 'x');
-    // Retain all but the final byte of the longest fixed opener so a native
-    // DeepSeek DSML wrapper can be recognized across token boundaries.
-    TEST_ASSERT(tool_syntax_holdback(invalid) == 16);
+    TEST_ASSERT(tool_syntax_holdback(invalid) == 15);
     pos = std::string::npos;
     TEST_ASSERT(!find_tool_syntax_start("<" + std::string(65, 'x') + ">",
                                         invalid, pos));
@@ -1464,41 +1462,6 @@ TEST_CASE(ServerUnitFixture, test_emitter_function_call_tool_buffer_detection) {
     TEST_ASSERT(em.accumulated_text().find("bash") == std::string::npos);
 }
 
-TEST_CASE(ServerUnitFixture, test_emitter_deepseek_dsml_tool_buffer_detection) {
-    auto em = make_emitter(ApiFormat::OPENAI_CHAT, read_tools());
-    em.emit_start();
-    em.emit_token("\n\n<?DSML?to");
-    em.emit_token("ol>\n{\"name\":\"read\",\"arguments\":");
-    em.emit_token("{\"path\":\"src/cache.py\"}}\n</?DSML?tool>");
-    em.emit_finish(20);
-
-    TEST_ASSERT(em.tool_calls().size() == 1);
-    if (em.tool_calls().size() == 1) {
-        TEST_ASSERT(em.tool_calls()[0].name == "read");
-        TEST_ASSERT(em.tool_calls()[0].arguments ==
-                    R"({"path":"src/cache.py"})");
-    }
-    TEST_ASSERT(em.accumulated_text().find("DSML") == std::string::npos);
-    TEST_ASSERT(em.accumulated_text().find("src/cache.py") ==
-                std::string::npos);
-}
-
-TEST_CASE(ServerUnitFixture, test_parse_deepseek_dsml_tool_call_wrapper) {
-    const std::string text =
-        "Before\n<?DSML?tool_call>\n"
-        "{\"name\":\"read\",\"arguments\":{\"path\":\"README.md\"}}\n"
-        "</?DSML?tool_call>\nAfter";
-    const auto result = parse_tool_calls(text, read_tools());
-
-    TEST_ASSERT(result.tool_calls.size() == 1);
-    if (result.tool_calls.size() == 1) {
-        TEST_ASSERT(result.tool_calls[0].name == "read");
-        TEST_ASSERT(result.tool_calls[0].arguments ==
-                    R"({"path":"README.md"})");
-    }
-    TEST_ASSERT(result.cleaned_text == "Before\n\nAfter");
-}
-
 TEST_CASE(ServerUnitFixture, test_emitter_bare_function_json_tool_buffer_detection) {
     // When the emitter sees <function>, it should buffer and parse tools.
     auto em = make_emitter(ApiFormat::OPENAI_CHAT, bash_tools());
@@ -2114,72 +2077,50 @@ TEST_CASE(ServerUnitFixture, test_resolve_deepseek_chat_markers) {
     unlink(path.c_str());
 }
 
-TEST_CASE(ServerUnitFixture, test_prefix_cache_exclusion_falls_back_to_shorter_match) {
-    const std::string path = write_deepseek_marker_tokenizer_fixture();
-    Tokenizer tokenizer;
-    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
-    PrefixCache cache(4, tokenizer);
-
-    const std::vector<int32_t> ordinary = {1, 10};
-    auto [ordinary_slot, ordinary_cut] =
-        cache.prepare_inline_snap(ordinary, 0, false, ordinary.size());
-    TEST_ASSERT(ordinary_slot >= 0);
-    cache.confirm_inline_snap(ordinary_slot, ordinary_cut, ordinary);
-
-    const std::vector<int32_t> agent_turn = {1, 10, 20, 30};
-    auto [agent_slot, agent_cut] =
-        cache.prepare_inline_snap(agent_turn, 0, false, agent_turn.size());
-    TEST_ASSERT(agent_slot >= 0 && agent_slot != ordinary_slot);
-    cache.confirm_inline_snap(agent_slot, agent_cut, agent_turn);
-
-    const std::vector<int32_t> next_turn = {1, 10, 20, 30, 40};
-    TEST_ASSERT(cache.lookup(next_turn) == std::make_pair(agent_slot, 4));
-
-    const std::unordered_set<int> excluded = {agent_slot};
-    TEST_ASSERT(cache.lookup(next_turn, &excluded) ==
-                std::make_pair(ordinary_slot, 2));
-    unlink(path.c_str());
-}
-
-TEST_CASE(ServerUnitFixture, test_prefix_cache_reserves_backend_staging_slots) {
+TEST_CASE(ServerUnitFixture, test_prefix_cache_reserves_server_staging_slots) {
     const std::string path = write_deepseek_marker_tokenizer_fixture();
     Tokenizer tokenizer;
     TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
 
-    PrefixCache inline_only(64, tokenizer, /*reserved_slots=*/2);
-    TEST_ASSERT(inline_only.stats().capacity == 62);
+    PrefixCache inline_cache(64, tokenizer, /*reserved_slots=*/2);
+    TEST_ASSERT(inline_cache.stats().capacity == 62);
 
-    PrefixCache split(60, tokenizer, /*reserved_slots=*/2);
-    split.init_full_cache(10);
-    TEST_ASSERT(split.stats().capacity == 60);
-    TEST_ASSERT(split.full_stats().capacity == 2);
-
-    const std::vector<int32_t> first = {1, 11};
-    const int first_slot = split.prepare_full_snap(first);
-    TEST_ASSERT(first_slot == 60);
-    split.confirm_full_snap(first_slot, first, (int) first.size());
-
-    const std::vector<int32_t> second = {1, 12};
-    const int second_slot = split.prepare_full_snap(second);
-    TEST_ASSERT(second_slot == 61);
-    split.confirm_full_snap(second_slot, second, (int) second.size());
-
-    // LRU reuse remains below slots 62 and 63, which belong to Agent Turn
-    // Cache canonicalization and the disk cache respectively.
-    const std::vector<int32_t> third = {1, 13};
-    TEST_ASSERT(split.prepare_full_snap(third) == 60);
+    PrefixCache split_cache(60, tokenizer, /*reserved_slots=*/2);
+    split_cache.init_full_cache(10);
+    TEST_ASSERT(split_cache.stats().capacity == 60);
+    TEST_ASSERT(split_cache.full_stats().capacity == 2);
     unlink(path.c_str());
 }
 
 TEST_CASE(ServerUnitFixture, test_canonical_turn_must_extend_checkpointed_prompt) {
     TEST_ASSERT(http_detail::canonical_turn_extends_prompt(
-        {1, 2, 3}, {1, 2, 3, 40, 50}));
+        {1, 2, 3}, {1, 2, 3, 4}));
     TEST_ASSERT(!http_detail::canonical_turn_extends_prompt(
-        {1, 2, 3}, {1, 2, 30, 40, 50}));
+        {1, 2, 3}, {1, 9, 3, 4}));
     TEST_ASSERT(!http_detail::canonical_turn_extends_prompt(
         {1, 2, 3}, {1, 2, 3}));
     TEST_ASSERT(!http_detail::canonical_turn_extends_prompt(
-        {}, {1, 2, 3}));
+        {}, {1}));
+}
+
+TEST_CASE(ServerUnitFixture, test_qwen_completed_tool_turn_preserves_generation_prefix) {
+    const std::string sentinel = "__AGENT_TURN_SENTINEL__";
+    for (bool thinking : {false, true}) {
+        std::vector<ChatMessage> messages = {{"user", "inspect the repo"}};
+        const std::string generation = render_chat_template(
+            messages, ChatFormat::QWEN3, true, thinking);
+        messages.push_back({"assistant", sentinel});
+        const std::string probe = render_chat_template(
+            messages, ChatFormat::QWEN3, false, thinking);
+
+        std::string content;
+        TEST_ASSERT(http_detail::canonical_assistant_content(
+            generation, probe, sentinel, "<tool_call>x</tool_call>", content));
+        messages.back().content = content;
+        const std::string completed = render_chat_template(
+            messages, ChatFormat::QWEN3, false, thinking);
+        TEST_ASSERT(completed.compare(0, generation.size(), generation) == 0);
+    }
 }
 
 TEST_CASE(ServerUnitFixture, test_hash_prefix_deterministic) {
@@ -2666,243 +2607,6 @@ TEST_CASE(ServerUnitFixture, test_pflash_raw_body_preserved) {
     TEST_ASSERT(req.raw_body["temperature"].get<float>() > 0.6f);
 }
 
-TEST_CASE(ServerUnitFixture, test_automatic_tool_speculation_defaults_off) {
-    ParsedRequest req;
-    TEST_ASSERT(!req.automatic_tool_speculation_enabled);
-    TEST_ASSERT(!req.agent_turn_cache_enabled);
-}
-
-TEST_CASE(ServerUnitFixture, test_speculation_entry_points_are_mutually_exclusive) {
-    const json prediction = {
-        {"call", {{"name", "read_file"},
-                  {"arguments", {{"path", "README.md"}}}}},
-        {"confidence", 0.9},
-    };
-    TEST_ASSERT(http_detail::tool_speculation_modes_conflict({
-        {"automatic_tool_speculation", true},
-        {"tool_speculation", prediction},
-    }));
-    TEST_ASSERT(!http_detail::tool_speculation_modes_conflict({
-        {"automatic_tool_speculation", false},
-        {"tool_speculation", prediction},
-    }));
-    TEST_ASSERT(!http_detail::tool_speculation_modes_conflict({
-        {"automatic_tool_speculation", true},
-    }));
-}
-
-TEST_CASE(ServerUnitFixture, test_upstream_body_drops_engine_tool_extensions) {
-    json body = {
-        {"model", "upstream-model"},
-        {"automatic_tool_speculation", true},
-        {"agent_turn_cache", true},
-        {"tool_speculation", {{"confidence", 0.9}}},
-        {"messages", json::array()},
-    };
-    http_detail::strip_engine_request_fields_for_upstream(body);
-    TEST_ASSERT(!body.contains("automatic_tool_speculation"));
-    TEST_ASSERT(!body.contains("agent_turn_cache"));
-    TEST_ASSERT(!body.contains("tool_speculation"));
-    TEST_ASSERT(body["model"] == "upstream-model");
-    TEST_ASSERT(body.contains("messages"));
-}
-
-TEST_CASE(ServerUnitFixture, test_tool_message_content_preserves_strings) {
-    TEST_ASSERT(http_detail::tool_message_content_for_result({
-        {"value", "plain tool output"},
-    }) == "plain tool output");
-    TEST_ASSERT(http_detail::tool_message_content_for_result({
-        {"value", {{"matches", json::array({"a.cpp", "b.cpp"})}}},
-    }) == R"({"matches":["a.cpp","b.cpp"]})");
-    TEST_ASSERT(http_detail::tool_message_content_for_result("raw output") ==
-                "raw output");
-}
-
-TEST_CASE(ServerUnitFixture, test_tool_choice_none_disables_speculation) {
-    TEST_ASSERT(http_detail::tool_choice_disables_tool_calls("none"));
-    TEST_ASSERT(http_detail::tool_choice_disables_tool_calls(
-        json{{"type", "none"}}));
-    TEST_ASSERT(!http_detail::tool_choice_disables_tool_calls(nullptr));
-    TEST_ASSERT(!http_detail::tool_choice_disables_tool_calls("auto"));
-    TEST_ASSERT(!http_detail::tool_choice_disables_tool_calls("required"));
-    TEST_ASSERT(!http_detail::tool_choice_disables_tool_calls(
-        json{{"type", "function"},
-             {"function", {{"name", "lookup"}}}}));
-}
-
-TEST_CASE(ServerUnitFixture, test_normalize_responses_tool_followup_messages) {
-    ToolMemory tool_memory;
-    const std::string call_id = "call_read_001";
-    const std::string raw_tool_call =
-        "\n\n<function=read_file>\n"
-        "<parameter=path>\nserver/src/server/http_server.cpp\n"
-        "</parameter>\n"
-        "</function>\n";
-    tool_memory.remember({call_id}, raw_tool_call);
-
-    const json messages = json::array({
-        {
-            {"role", "developer"},
-            {"content", json::array({{
-                {"type", "input_text"},
-                {"text", "Inspect the code before answering."},
-            }})},
-        },
-        {
-            {"role", "user"},
-            {"content", json::array({{
-                {"type", "input_text"},
-                {"text", "Where is request parsing implemented?"},
-            }})},
-        },
-        {
-            {"type", "function_call"},
-            {"call_id", call_id},
-            {"name", "read_file"},
-            {"arguments", R"({"path":"server/src/server/http_server.cpp"})"},
-        },
-        {
-            {"type", "function_call_output"},
-            {"call_id", call_id},
-            {"output", "parse_common_request_fields starts near line 1760"},
-        },
-    });
-
-    const auto normalized = normalize_chat_messages(
-        messages, ApiFormat::RESPONSES, tool_memory);
-    TEST_ASSERT(normalized.size() == 4);
-    TEST_ASSERT(normalized[0].role == "system");
-    TEST_ASSERT(normalized[0].content == "Inspect the code before answering.");
-    TEST_ASSERT(normalized[1].role == "user");
-    TEST_ASSERT(normalized[2].role == "assistant");
-    TEST_ASSERT(normalized[2].content == raw_tool_call);
-    TEST_ASSERT(normalized[3].role == "tool");
-    TEST_ASSERT(normalized[3].tool_call_id == call_id);
-    TEST_ASSERT(normalized[3].content ==
-                "parse_common_request_fields starts near line 1760");
-}
-
-TEST_CASE(ServerUnitFixture, test_normalize_responses_parallel_calls_once) {
-    ToolMemory tool_memory;
-    const std::string first_id = "call_read_parallel_1";
-    const std::string second_id = "call_read_parallel_2";
-    const std::string raw_tool_turn =
-        "<function=read_file><parameter=path>README.md</parameter></function>"
-        "<function=read_file><parameter=path>API.md</parameter></function>";
-    tool_memory.remember({first_id, second_id}, raw_tool_turn);
-
-    const json messages = json::array({
-        {
-            {"type", "function_call"},
-            {"call_id", first_id},
-            {"name", "read_file"},
-            {"arguments", R"({"path":"README.md"})"},
-        },
-        {
-            {"type", "function_call"},
-            {"call_id", second_id},
-            {"name", "read_file"},
-            {"arguments", R"({"path":"API.md"})"},
-        },
-        {
-            {"type", "function_call_output"},
-            {"call_id", first_id},
-            {"output", "README result"},
-        },
-        {
-            {"type", "function_call_output"},
-            {"call_id", second_id},
-            {"output", "API result"},
-        },
-    });
-
-    const auto normalized = normalize_chat_messages(
-        messages, ApiFormat::RESPONSES, tool_memory);
-    TEST_ASSERT(normalized.size() == 3);
-    TEST_ASSERT(normalized[0].role == "assistant");
-    TEST_ASSERT(normalized[0].content == raw_tool_turn);
-    TEST_ASSERT(normalized[1].role == "tool");
-    TEST_ASSERT(normalized[1].tool_call_id == first_id);
-    TEST_ASSERT(normalized[2].role == "tool");
-    TEST_ASSERT(normalized[2].tool_call_id == second_id);
-
-    ToolMemory empty_memory;
-    const auto reconstructed = normalize_chat_messages(
-        messages, ApiFormat::RESPONSES, empty_memory);
-    TEST_ASSERT(reconstructed.size() == 3);
-    TEST_ASSERT(reconstructed[0].role == "assistant");
-    TEST_ASSERT(reconstructed[0].content.find("README.md") !=
-                std::string::npos);
-    TEST_ASSERT(reconstructed[0].content.find("API.md") !=
-                std::string::npos);
-}
-
-TEST_CASE(ServerUnitFixture, test_normalize_anthropic_tool_followup_messages) {
-    ToolMemory tool_memory;
-    const std::string call_id = "toolu_read_001";
-    const std::string raw_tool_call =
-        "I'll inspect the implementation.\n"
-        "<function=read_file>\n"
-        "<parameter=path>\nserver/src/server/http_server.cpp\n"
-        "</parameter>\n"
-        "</function>\n";
-    tool_memory.remember({call_id}, raw_tool_call);
-
-    const json messages = json::array({
-        {
-            {"role", "user"},
-            {"content", "Where is request parsing implemented?"},
-        },
-        {
-            {"role", "assistant"},
-            {"content", json::array({
-                {
-                    {"type", "text"},
-                    {"text", "I'll inspect the implementation."},
-                },
-                {
-                    {"type", "tool_use"},
-                    {"id", call_id},
-                    {"name", "read_file"},
-                    {"input", {{"path", "server/src/server/http_server.cpp"}}},
-                },
-            })},
-        },
-        {
-            {"role", "user"},
-            {"content", json::array({{
-                {"type", "tool_result"},
-                {"tool_use_id", call_id},
-                {"content", json::array({{
-                    {"type", "text"},
-                    {"text", "parse_common_request_fields starts near line 1760"},
-                }})},
-            }})},
-        },
-    });
-
-    const auto normalized = normalize_chat_messages(
-        messages, ApiFormat::ANTHROPIC, tool_memory);
-    TEST_ASSERT(normalized.size() == 3);
-    TEST_ASSERT(normalized[0].role == "user");
-    TEST_ASSERT(normalized[1].role == "assistant");
-    TEST_ASSERT(normalized[1].content == raw_tool_call);
-    TEST_ASSERT(normalized[2].role == "tool");
-    TEST_ASSERT(normalized[2].tool_call_id == call_id);
-    TEST_ASSERT(normalized[2].content ==
-                "parse_common_request_fields starts near line 1760");
-
-    ToolMemory empty_memory;
-    const auto reconstructed = normalize_chat_messages(
-        messages, ApiFormat::ANTHROPIC, empty_memory);
-    TEST_ASSERT(reconstructed.size() == 3);
-    TEST_ASSERT(reconstructed[1].content.find("<function=read_file>") !=
-                std::string::npos);
-    TEST_ASSERT(reconstructed[1].content.find(
-                    "server/src/server/http_server.cpp") !=
-                std::string::npos);
-}
-
 TEST_CASE(ServerUnitFixture, test_parse_request_sampler_applies_defaults_and_overrides) {
     SamplingDefaults defaults;
     defaults.has_temperature = true;
@@ -3251,6 +2955,64 @@ TEST_CASE(ServerUnitFixture, test_jinja_render_bad_tools_json_throws) {
     }
     TEST_ASSERT(threw);
 }
+
+TEST_CASE(ServerUnitFixture, test_normalize_responses_tool_followup_messages) {
+    ToolMemory tool_memory;
+    const std::string call_id = "call_exec_001";
+    const std::string raw_tool_call =
+        "\n\n<function=exec_command>\n"
+        "<parameter=cmd>\n"
+        "git fetch origin && git status\n"
+        "</parameter>\n"
+        "</function>\n";
+    tool_memory.remember({call_id}, raw_tool_call);
+
+    json messages = json::array({
+        {
+            {"role", "developer"},
+            {"content", json::array({{
+                {"type", "input_text"},
+                {"text", "Developer rules"}
+            }})}
+        },
+        {
+            {"role", "user"},
+            {"content", json::array({{
+                {"type", "input_text"},
+                {"text", "fetch latest code"}
+            }})}
+        },
+        {
+            {"type", "function_call"},
+            {"call_id", call_id},
+            {"name", "exec_command"},
+            {"arguments", R"({"cmd":"git fetch origin && git status"})"}
+        },
+        {
+            {"type", "function_call_output"},
+            {"call_id", call_id},
+            {"output", "Process exited with code 0"}
+        }
+    });
+
+    auto chat_msgs = normalize_chat_messages(messages, ApiFormat::RESPONSES, tool_memory);
+    TEST_ASSERT(chat_msgs.size() == 4);
+    if (chat_msgs.size() == 4) {
+        TEST_ASSERT(chat_msgs[0].role == "system");
+        TEST_ASSERT(chat_msgs[0].content == "Developer rules");
+        TEST_ASSERT(chat_msgs[1].role == "user");
+        TEST_ASSERT(chat_msgs[1].content == "fetch latest code");
+        TEST_ASSERT(chat_msgs[2].role == "assistant");
+        TEST_ASSERT(chat_msgs[2].content == raw_tool_call);
+        TEST_ASSERT(chat_msgs[3].role == "tool");
+        TEST_ASSERT(chat_msgs[3].tool_call_id == call_id);
+        TEST_ASSERT(chat_msgs[3].content == "Process exited with code 0");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Placement config tests
+// ═══════════════════════════════════════════════════════════════════════
 
 TEST_CASE(ServerUnitFixture, test_parse_target_device_list_same_backend) {
     DevicePlacement placement;
@@ -5006,7 +4768,6 @@ TEST_CASE(ServerUnitFixture, test_server_config_cache_defaults) {
     ServerConfig cfg;
     TEST_ASSERT(cfg.prefix_cache_cap == 32);
     TEST_ASSERT(cfg.prefill_cache_cap == 0);
-    TEST_ASSERT(!cfg.agent_turn_cache);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -5409,7 +5170,7 @@ struct EmptySpecRetryBackend : MockBackend {
         restore_calls++;
         GenerateResult result;
         result.succeed();
-        result.restored_prefix_tokens = 3;
+        result.restored_prefix_tokens = req.force_ar_decode ? 2 : 3;
         if (req.force_ar_decode) {
             restore_saw_force_ar = true;
             result.tokens = {84};
@@ -5504,7 +5265,6 @@ TEST_CASE(ServerUnitFixture, test_model_backend_retries_empty_visible_spec_resto
 TEST_CASE(ServerUnitFixture, test_generate_result_accept_rate_defaults_to_zero) {
     GenerateResult r;
     TEST_ASSERT(r.accept_rate == 0.0f);
-    TEST_ASSERT(r.restored_prefix_tokens == 0);
 }
 
 TEST_CASE(ServerUnitFixture, test_generate_result_accept_rate_can_be_set) {

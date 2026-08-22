@@ -245,11 +245,7 @@ struct GenerateResult {
     std::vector<int32_t>       tokens;
     double                     prefill_s   = 0.0;
     double                     decode_s    = 0.0;
-    // Number of leading request-prompt tokens actually supplied by a
-    // restored KV snapshot. This stays zero when restore_and_generate_impl
-    // rejects a selected snapshot and performs a fresh prefill instead.
-    // The HTTP layer uses the backend-confirmed value for cache telemetry;
-    // selecting a cache entry is not itself a cache hit.
+    // Backend-confirmed prompt tokens supplied by a restored KV snapshot.
     int                        restored_prefix_tokens = 0;
     // True when the backend's Level 2 hook injected the </think> close
     // sequence during this generation (vs. the model self-closing). The

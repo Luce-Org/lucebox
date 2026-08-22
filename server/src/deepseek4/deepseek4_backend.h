@@ -98,7 +98,6 @@ private:
     struct SnapshotAux {
         std::vector<float> last_logits;
         std::vector<float> spec_feat_window;
-        bool stale_logits = false;  // continuation-only snapshot (no final logits)
         bool used = false;
     };
     DeepSeek4Snapshot      snapshots_[PREFIX_SLOTS];

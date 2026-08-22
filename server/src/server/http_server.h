@@ -19,7 +19,6 @@
 #include "tokenizer.h"
 #include "chat_template.h"
 #include "tool_memory.h"
-#include "tool_speculation.h"
 #include "prefix_cache.h"
 #include "disk_prefix_cache.h"
 #include "freeze_history.h"
@@ -41,7 +40,6 @@
 #include <functional>
 #include <memory>
 #include <mutex>
-#include <optional>
 #include <string>
 #include <thread>
 #if !defined(_WIN32)
@@ -95,18 +93,8 @@ struct ServerConfig {
     std::string model_name  = "dflash";
     int         prefix_cache_cap = 32;  // prefix cache slots (0 disables)
     int         prefill_cache_cap = 0;  // full-prompt/prefill cache slots (0 disables)
-    // Build canonical prompt+tool-call KV from a pre-decode checkpoint after
-    // the response is complete. The next request restores that stateless-
-    // equivalent prefix and prefills only the appended tool result.
+    // Extend the existing prefix cache through generated tool-call turns.
     bool        agent_turn_cache = false;
-    // Launch every operator-declared read-only tool call through the
-    // tool-speculation executor lane the moment its call block closes in the
-    // token stream (no predictor needed, N calls per response, exact commit).
-    bool        early_dispatch = false;
-    // After a tool turn whose early-dispatched results all committed,
-    // prefill the deterministic next-turn prompt into the prefix cache
-    // before the client's next request arrives.
-    bool        prefetch_prefill = false;
 
     // Pin-Friendly Prompt Processor (PPP): LCP pin_end + optional rearrange.
     // See docs/PIN_FRIENDLY_PROMPT.md. Env: DFLASH_PPP=0|1,
@@ -247,12 +235,6 @@ struct ServerConfig {
     // Routing data collection (--collect-routing <path>): write binary per-token
     // routing data (hidden states + expert selections) for predictor training.
     std::string collect_routing_path;
-
-    // Verified read-only tool speculation. Off unless the operator configures
-    // an executor and an explicit operator-declared read-only tool set. A
-    // profile is additionally required for predictions made before model
-    // emission.
-    ToolSpeculationConfig tool_speculation;
 };
 
 namespace http_detail {
@@ -269,26 +251,16 @@ float resolve_pflash_keep_ratio(float configured_ratio,
                                 const HttpServerSessions & sessions);
 bool should_clamp_flowkv_disk_cache(
     bool flowkv, const DiskPrefixCachePolicy & policy);
-// True for API dialects that explicitly prohibit a tool call. Used before
-// either caller-supplied or automatic speculative execution can start.
-bool tool_choice_disables_tool_calls(const json & tool_choice);
-// Caller-supplied predictions and stream-based automatic dispatch are two
-// alternative execution paths. Accepting both would execute one call twice.
-bool tool_speculation_modes_conflict(const json & body);
-// Engine-only request extensions must not leak into an upstream provider's
-// API body when Lucebox is running as a compression proxy.
-void strip_engine_request_fields_for_upstream(json & body);
-// Render the exact tool-role content used by both clients and prefetch. String
-// values stay unquoted; structured JSON remains compact JSON.
-std::string tool_message_content_for_result(const json & result);
-
-// A continuation snapshot is valid for a later stateless API request only
-// when the completed-turn rendering begins with the exact prompt tokens that
-// were checkpointed before decode. Re-tokenization may change a BPE boundary;
-// that case must miss rather than rewrite the caller's prompt.
 bool canonical_turn_extends_prompt(
     const std::vector<int32_t> & prompt,
     const std::vector<int32_t> & completed_turn);
+bool canonical_assistant_content(
+    const std::string & generation_prompt,
+    const std::string & sentinel_rendered,
+    const std::string & sentinel,
+    const std::string & generated_text,
+    std::string & content);
+
 }  // namespace http_detail
 
 // ─── Parsed request ─────────────────────────────────────────────────────
@@ -296,6 +268,7 @@ bool canonical_turn_extends_prompt(
 struct ParsedRequest {
     ApiFormat                  format;
     std::vector<int32_t>      prompt_tokens;  // tokenized prompt
+    std::string               rendered_prompt;
     int                       max_output   = 4096;
     bool                      stream       = true;
     SamplerCfg                sampler;
@@ -304,22 +277,10 @@ struct ParsedRequest {
     json                      tools;
     // Tool choice constraint (stored for hint generation)
     json                      tool_choice;
-    // Original messages (for response formatting).
+    // Original messages (for response formatting)
     json                      messages;
-    // Original request body (for upstream proxy forwarding).
+    // Original request body (for upstream proxy forwarding)
     json                      raw_body;
-    // Concrete invocation supplied by a caller before generation.
-    // The engine may execute it privately, but never exposes its result until
-    // the model emits the exact canonical invocation.
-    std::optional<ToolSpeculationPrediction> tool_speculation;
-    // Stream-based automatic dispatch starts only after the model emits a
-    // complete call. Fail closed: it requires an explicit request opt-in
-    // ("automatic_tool_speculation": true).
-    bool                      automatic_tool_speculation_enabled = false;
-    // Resolved server/request policy for caching the end of a tool-call turn.
-    // The operator enables the capability; a request may explicitly disable
-    // it for isolation or measurement.
-    bool                      agent_turn_cache_enabled = false;
     // Response ID
     std::string               response_id;
     // Thinking/reasoning state
@@ -461,13 +422,9 @@ private:
         bool client_disconnected);
     void remember_agent_turn(
         const ParsedRequest & req, const PreparedPrompt & prepared,
-        const GenerationCacheState & cache,
-        const GenerateResult & result, const SseEmitter & emitter,
-        int completion_tokens, bool visible_output_seen,
-        bool client_disconnected);
-    // A backend slot can move between ordinary, control-arm, and generated
-    // agent-turn ownership. Clear every side table before freeing or
-    // overwriting the slot so failed snapshots cannot leave stale telemetry.
+        const GenerationCacheState & cache, const GenerateResult & result,
+        const SseEmitter & emitter, int completion_tokens,
+        bool visible_output_seen, bool client_disconnected);
     void forget_inline_slot_metadata(int slot);
 
     struct GenerationInputs {
@@ -479,23 +436,10 @@ private:
         std::vector<int32_t> stall_skip_tokens;
     };
 
-    struct EarlyDispatchEntry {
-        CanonicalToolInvocation call;
-        std::unique_ptr<ToolSpeculationAttempt> attempt;  // null when skipped
-        int token_index = 0;
-        int call_index = 0;  // 1-based position in this response
-        std::string skip_reason;
-    };
     struct GenerationOutputState {
         int completion_tokens = 0;
         bool visible_output_seen = false;
         bool client_disconnected = false;
-        // Early dispatch (stream-based tool launch).
-        bool early_dispatch = false;
-        std::string early_text;
-        size_t early_scan_pos = 0;
-        int early_call_count = 0;
-        std::vector<EarlyDispatchEntry> early_entries;
     };
 
     void prepare_generation_inputs(
@@ -504,26 +448,6 @@ private:
     void configure_generation_io(
         ServerJob * job, const ParsedRequest & req, SseEmitter & emitter,
         GenerationOutputState & output, DaemonIO & io);
-    // Early dispatch: scan newly streamed text for closed tool-call blocks and
-    // launch declared read-only calls; resolve them against authoritative calls.
-    void scan_early_dispatch(const ParsedRequest & req,
-                             GenerationOutputState & output);
-    nlohmann::json resolve_early_dispatch(
-        GenerationOutputState & output,
-        const std::vector<ToolCall> & authoritative_calls,
-        const char * cancel_reason);
-    bool render_messages_to_tokens(
-        const std::vector<ChatMessage> & chat_messages,
-        const ParsedRequest & req, bool & started_in_thinking,
-        std::vector<int32_t> & tokens, std::string & error);
-    void prefetch_next_turn(
-        const ParsedRequest & req, SseEmitter & emitter,
-        const GenerationOutputState & output,
-        const nlohmann::json & early_items);
-    // True when a client request is waiting for the worker. Prefetch work
-    // yields to real traffic: it is skipped when a request is queued and
-    // cancelled at the next chunk boundary when one arrives mid-prefill.
-    bool has_pending_jobs();
 
     // Worker thread, concurrent mode (the backend exposes a SeqEngine):
     // iteration-level scheduler. Admission is claim-only; this baseline
@@ -578,6 +502,10 @@ private:
     bool render_and_tokenize_request(
         SocketHandle fd, const std::vector<ChatMessage> & chat_messages,
         ParsedRequest & req);
+    bool render_messages_to_text(
+        const std::vector<ChatMessage> & chat_messages,
+        const ParsedRequest & req, bool add_generation_prompt,
+        std::string & rendered, std::string & error);
     bool validate_request_context(SocketHandle fd, const ParsedRequest & req);
     void log_parsed_request(const ParsedRequest & req) const;
     void enqueue_request_and_wait(SocketHandle fd, ParsedRequest req);
@@ -599,6 +527,7 @@ private:
     // Job queue.
     void enqueue(ServerJob * job);
     ServerJob * dequeue();
+    bool has_pending_jobs();
 
     // Members.
     ModelBackend &   backend_;
@@ -636,15 +565,7 @@ private:
 
     // Track prompt tokens for each snapshot slot (for shutdown save).
     std::unordered_map<int, std::vector<int32_t>> slot_tokens_;
-    // Inline slots holding agent-turn continuation snapshots. Some backends
-    // cannot retain final logits there, so these are not restored at full
-    // prompt length.
     std::unordered_set<int> agent_turn_cache_slots_;
-    // Ordinary snapshots produced by an explicit request-scoped control arm.
-    // Treatment requests exclude these entries so an A/B cannot report work
-    // warmed by its control. Control requests may still use ordinary treatment
-    // entries, which makes the comparison conservative.
-    std::unordered_set<int> agent_turn_control_slots_;
     std::vector<std::vector<int32_t>> recent_disk_prompts_;
     // Recent tool-bearing prompt prefixes for PPP LCP annotate.
     std::vector<std::vector<int32_t>> recent_tool_prefixes_;

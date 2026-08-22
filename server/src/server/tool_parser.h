@@ -1,7 +1,6 @@
 // Tool call parser — extracts structured tool calls from generated text.
 //
-// Supports the common XML/JSON compatibility patterns plus DeepSeek's native
-// `<?DSML?tool>` / `<?DSML?tool_call>` JSON wrappers:
+// Supports 11 detection patterns:
 //   1. <tool_call><function=name>...</function></tool_call>  (Qwen XML)
 //   2. <function=name>...</function>                          (bare function XML)
 //   3. <function=name(k="v")></function>                      (function signature)
