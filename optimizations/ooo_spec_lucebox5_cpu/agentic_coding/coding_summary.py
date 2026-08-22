@@ -84,6 +84,24 @@ def eligible_prompt_shape(result: dict[str, Any]) -> list[int] | None:
     return shape
 
 
+def eligible_backend_cache_hit_count(result: dict[str, Any]) -> int | None:
+    explicit = result.get("eligible_backend_cache_hits")
+    if isinstance(explicit, int) and not isinstance(explicit, bool) and explicit >= 0:
+        return explicit
+    turns = result.get("turn_log")
+    if not isinstance(turns, list):
+        return None
+    hits = 0
+    for turn in turns:
+        if not isinstance(turn, dict) or turn.get("cache_eligible") is not True:
+            continue
+        timings = turn.get("timings")
+        if not isinstance(timings, dict) or not isinstance(timings.get("cache_hit"), bool):
+            return None
+        hits += int(timings["cache_hit"])
+    return hits
+
+
 def main() -> int:
     args = parse_args()
     path = artifact_path(args.artifact)
@@ -119,7 +137,8 @@ def main() -> int:
 
     print(
         f"{'task':18} {'rep':>3} {'ctrl_pf':>8} {'cache_pf':>8} "
-        f"{'pf_gain':>8} {'turn_gain':>9} {'hits':>7} {'trace':>7} {'correct':>9}"
+        f"{'pf_gain':>8} {'turn_gain':>9} {'agent_hits':>10} "
+        f"{'trace':>7} {'correct':>9}"
     )
     complete_pairs = []
     incomplete_pairs = 0
@@ -153,6 +172,8 @@ def main() -> int:
                 raise SystemExit(f"{task} has no measurable follow-up turn")
             if result.get("timing_records_complete") is not True:
                 raise SystemExit(f"{task} has incomplete server timing telemetry")
+            if eligible_backend_cache_hit_count(result) is None:
+                raise SystemExit(f"{task} has incomplete backend cache-hit telemetry")
             if not isinstance(result.get("trace_sha256"), str) or not re.fullmatch(
                 r"[0-9a-f]{64}", result["trace_sha256"]
             ):
@@ -174,7 +195,7 @@ def main() -> int:
         print(
             f"{task:18} {repetition:3d} {control['eligible_prefill_ms']/1000:8.2f} "
             f"{cached['eligible_prefill_ms']/1000:8.2f} {prefill_gain:8.3f} "
-            f"{turn_gain:9.3f} {cached['agent_turn_cache_hits']:>2}/"
+            f"{turn_gain:9.3f} {cached['agent_turn_cache_hits']:>5}/"
             f"{cached['eligible_followup_turns']:<4} {str(trace_match):>7} "
             f"{str(both_correct):>9}"
         )
@@ -263,6 +284,27 @@ def main() -> int:
     )
     control_loop = sum(pair["control"]["wall_ms"] for pair in complete_pairs)
     cache_loop = sum(pair["cache"]["wall_ms"] for pair in complete_pairs)
+    eligible_followups = sum(
+        pair["control"]["eligible_followup_turns"] for pair in complete_pairs
+    )
+    control_backend_hits = sum(
+        eligible_backend_cache_hit_count(pair["control"]) or 0
+        for pair in complete_pairs
+    )
+    cache_backend_hits = sum(
+        eligible_backend_cache_hit_count(pair["cache"]) or 0
+        for pair in complete_pairs
+    )
+    control_prefilled_tokens = sum(
+        pair["control"]["eligible_prefilled_tokens"] for pair in complete_pairs
+    )
+    cache_prefilled_tokens = sum(
+        pair["cache"]["eligible_prefilled_tokens"] for pair in complete_pairs
+    )
+    eligible_prompt_tokens = sum(
+        pair["control"]["eligible_effective_prompt_tokens"]
+        for pair in complete_pairs
+    )
     prefill_interval = bootstrap_aggregate_ci(
         complete_pairs, args.bootstrap_samples, "eligible_prefill_ms"
     )
@@ -295,6 +337,12 @@ def main() -> int:
         "agent-turn cache hits="
         f"{sum(pair['cache']['agent_turn_cache_hits'] for pair in complete_pairs)}/"
         f"{sum(pair['cache']['eligible_followup_turns'] for pair in complete_pairs)}"
+    )
+    print(
+        "backend cache baseline: control/cache hits="
+        f"{control_backend_hits}/{cache_backend_hits} of {eligible_followups}; "
+        f"prefilled tokens={control_prefilled_tokens}/{cache_prefilled_tokens} "
+        f"of {eligible_prompt_tokens}"
     )
     runtime = artifact.get("runtime") if isinstance(artifact.get("runtime"), dict) else {}
     run_id = artifact.get("run_id")
@@ -357,6 +405,11 @@ def main() -> int:
         "server_capability_snapshot_recorded": bool(server_props),
         "agent_turn_cache_enabled_on_server": (
             prefix_cache_props.get("agent_turn_cache_enabled") is True
+        ),
+        "inline_prefix_cache_enabled_for_baseline": (
+            isinstance(prefix_cache_props.get("capacity"), int) and
+            not isinstance(prefix_cache_props.get("capacity"), bool) and
+            prefix_cache_props["capacity"] > 0
         ),
         "full_prompt_cache_disabled_for_pair_isolation": (
             isinstance(full_cache_props.get("capacity"), int) and

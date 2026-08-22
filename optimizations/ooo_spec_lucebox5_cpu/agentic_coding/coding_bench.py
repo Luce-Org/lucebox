@@ -313,6 +313,7 @@ def run_task(
     tool_wait_ms = 0.0
     calls = 0
     eligible_followup_turns = 0
+    eligible_backend_cache_hits = 0
     agent_turn_cache_hits = 0
     unexpected_agent_turn_cache_hits = 0
     eligible_prefill_ms = 0.0
@@ -344,13 +345,16 @@ def run_task(
         prefill_ms = _number(timings.get("prefill_ms"))
         prefilled_tokens = _number(timings.get("prefilled_tokens"))
         effective_prompt_tokens = _number(timings.get("effective_prompt_tokens"))
-        cache_hit_value = timings.get("agent_turn_cache_hit")
-        cache_hit = cache_hit_value is True
+        backend_cache_hit_value = timings.get("cache_hit")
+        backend_cache_hit = backend_cache_hit_value is True
+        agent_turn_cache_hit_value = timings.get("agent_turn_cache_hit")
+        agent_turn_cache_hit = agent_turn_cache_hit_value is True
         timing_complete = (
             prefill_ms is not None
             and prefilled_tokens is not None
             and effective_prompt_tokens is not None
-            and isinstance(cache_hit_value, bool)
+            and isinstance(backend_cache_hit_value, bool)
+            and isinstance(agent_turn_cache_hit_value, bool)
         )
         timing_records_complete = timing_records_complete and timing_complete
         cache_eligible = expect_agent_turn_cache
@@ -361,9 +365,11 @@ def run_task(
                 eligible_prefill_ms += prefill_ms
                 eligible_prefilled_tokens += int(prefilled_tokens)
                 eligible_effective_prompt_tokens += int(effective_prompt_tokens)
-            if cache_hit:
+            if backend_cache_hit:
+                eligible_backend_cache_hits += 1
+            if agent_turn_cache_hit:
                 agent_turn_cache_hits += 1
-        elif cache_hit:
+        elif agent_turn_cache_hit:
             unexpected_agent_turn_cache_hits += 1
         choices = response.get("choices")
         message = (
@@ -495,6 +501,7 @@ def run_task(
         "tool_wait_ms": tool_wait_ms,
         "calls": calls,
         "eligible_followup_turns": eligible_followup_turns,
+        "eligible_backend_cache_hits": eligible_backend_cache_hits,
         "agent_turn_cache_hits": agent_turn_cache_hits,
         "unexpected_agent_turn_cache_hits": unexpected_agent_turn_cache_hits,
         "eligible_prefill_ms": eligible_prefill_ms,
@@ -529,6 +536,12 @@ def print_completion_summary(results: list[dict[str, Any]]) -> None:
     cache_hits = sum(
         pair["cache"]["agent_turn_cache_hits"] for pair in complete_pairs
     )
+    control_backend_hits = sum(
+        pair["control"]["eligible_backend_cache_hits"] for pair in complete_pairs
+    )
+    cache_backend_hits = sum(
+        pair["cache"]["eligible_backend_cache_hits"] for pair in complete_pairs
+    )
     tool_trace_matches = sum(
         pair["control"]["trace_sha256"] == pair["cache"]["trace_sha256"]
         for pair in complete_pairs
@@ -544,6 +557,8 @@ def print_completion_summary(results: list[dict[str, Any]]) -> None:
         f"correct_pairs={correct_pairs}/{len(complete_pairs)} "
         f"tool_trace_matches={tool_trace_matches}/{len(complete_pairs)} "
         f"transcript_matches={transcript_matches}/{len(complete_pairs)} "
+        f"backend_cache_hits(control/cache)={control_backend_hits}/"
+        f"{cache_backend_hits} of {cache_eligible} "
         f"agent_turn_cache_hits={cache_hits}/{cache_eligible}"
     )
     print("Run coding_summary.py to evaluate every pair and the publication gates.")
@@ -642,7 +657,9 @@ def main() -> int:
                 print(
                     f"{task['id']:18} rep={repetition} {arm:7} "
                     f"wall={result['wall_ms']/1000:7.2f}s calls={result['calls']:2} "
-                    f"cache_hits={result['agent_turn_cache_hits']:2}/"
+                    f"backend_hits={result['eligible_backend_cache_hits']:2}/"
+                    f"{result['eligible_followup_turns']:<2} "
+                    f"agent_turn_hits={result['agent_turn_cache_hits']:2}/"
                     f"{result['eligible_followup_turns']:<2} "
                     f"correct={result['correct']}"
                 )

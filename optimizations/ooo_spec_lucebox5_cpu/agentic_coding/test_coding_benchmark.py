@@ -66,6 +66,7 @@ class CodingBenchmarkTests(unittest.TestCase):
                     "choices": [{"message": message}],
                     "usage": {
                         "timings": {
+                            "cache_hit": turn == 1,
                             "agent_turn_cache_hit": hit,
                             "prefill_ms": 2.0 if hit else 10.0,
                             "prefilled_tokens": 4 if hit else 100,
@@ -94,6 +95,8 @@ class CodingBenchmarkTests(unittest.TestCase):
             control["assistant_trace_sha256"], cached["assistant_trace_sha256"]
         )
         self.assertEqual(control["eligible_followup_turns"], 1)
+        self.assertEqual(control["eligible_backend_cache_hits"], 1)
+        self.assertEqual(cached["eligible_backend_cache_hits"], 1)
         self.assertEqual(control["agent_turn_cache_hits"], 0)
         self.assertEqual(cached["agent_turn_cache_hits"], 1)
         self.assertGreater(
@@ -194,6 +197,25 @@ class CodingBenchmarkTests(unittest.TestCase):
             ]
         }
         self.assertEqual(coding_summary.eligible_prompt_shape(result), [25])
+
+    def test_backend_cache_hits_are_distinct_from_agent_turn_hits(self) -> None:
+        result = {
+            "eligible_backend_cache_hits": 2,
+            "agent_turn_cache_hits": 0,
+            "turn_log": [],
+        }
+        self.assertEqual(coding_summary.eligible_backend_cache_hit_count(result), 2)
+
+        legacy_result = {
+            "turn_log": [
+                {"cache_eligible": False, "timings": {"cache_hit": False}},
+                {"cache_eligible": True, "timings": {"cache_hit": True}},
+                {"cache_eligible": True, "timings": {"cache_hit": False}},
+            ]
+        }
+        self.assertEqual(
+            coding_summary.eligible_backend_cache_hit_count(legacy_result), 1
+        )
 
     def test_tool_trace_ignores_equivalent_final_answer_wording(self) -> None:
         call = {

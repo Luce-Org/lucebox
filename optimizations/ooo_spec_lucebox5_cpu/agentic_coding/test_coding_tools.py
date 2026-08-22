@@ -146,6 +146,7 @@ class CodingToolsTest(unittest.TestCase):
             "calls": 1,
             "wall_ms": 100.0,
             "eligible_followup_turns": 1,
+            "eligible_backend_cache_hits": 0,
             "agent_turn_cache_hits": 0,
             "unexpected_agent_turn_cache_hits": 0,
             "eligible_prefill_ms": 10.0,
@@ -158,7 +159,10 @@ class CodingToolsTest(unittest.TestCase):
             "turn_log": [
                 {
                     "cache_eligible": True,
-                    "timings": {"effective_prompt_tokens": 100},
+                    "timings": {
+                        "cache_hit": False,
+                        "effective_prompt_tokens": 100,
+                    },
                 }
             ],
         }

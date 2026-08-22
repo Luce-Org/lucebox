@@ -121,8 +121,11 @@ Radeon AI PRO R9700 plus Ryzen AI Max 395/8060S with ROCm 7.2.4. It measured
 the clean engine commit `da8850f94d21ce713f07cdabc8694abec9bfe83f` and the
 immutable server binary
 `sha256:b04f77e78266301768d5faa43a42674c7ba68bea1aa0ee70c643466cbdcd639c`.
-The server capability snapshot records Agent Turn Cache enabled and the
-separate full-prompt cache disabled.
+The server capability snapshot records the existing 32-slot inline prefix
+cache enabled in both arms, Agent Turn Cache available, and the separate
+exact-match full-prompt cache disabled. The comparison is therefore ordinary
+prefix caching versus ordinary prefix caching extended through the generated
+assistant tool-call turn, not caching versus no caching.
 
 | Metric | Aggregate speedup | Paired bootstrap 95% interval |
 |---|---:|---:|
@@ -131,12 +134,16 @@ separate full-prompt cache disabled.
 | Whole coding-agent loop | 1.32x | 1.13-1.59x |
 
 All 6/6 pairs were correct with identical normalized assistant/tool
-transcripts, including reasoning and final answers. All 13/13 eligible cache
-turns were backend-confirmed hits; control had none. The five-turn
-`path_callers` task shows the intended long-loop behavior: eligible prefill
-fell from 108.4 s to 32.1 s (3.38x), and the whole loop fell from 141.8 s to
-73.2 s (1.94x). The short `parallel_reads` task cut prefill from 7.86 s to
-6.15 s but had no measurable whole-loop gain, because generation dominated.
+transcripts, including reasoning and final answers. Agent Turn Cache restored
+all 13/13 eligible follow-ups. The control arm still used the existing inline
+prefix cache and restored 11/13 follow-ups, but its snapshots stopped earlier
+in the transcript: across eligible turns it evaluated 8,939 of 16,287 prompt
+tokens, versus 3,565 with Agent Turn Cache (60.1% fewer tokens evaluated).
+The five-turn `path_callers` task shows the intended long-loop behavior:
+eligible prefill fell from 108.4 s to 32.1 s (3.38x), and the whole loop fell
+from 141.8 s to 73.2 s (1.94x). The short `parallel_reads` task cut prefill
+from 7.86 s to 6.15 s but had no measurable whole-loop gain, because
+generation dominated.
 
 The raw artifact is
 [`results/coding_deterministic-six-task-final.json`](agentic_coding/results/coding_deterministic-six-task-final.json)
