@@ -6238,3 +6238,76 @@ TEST_CASE(ServerUnitFixture, test_emitter_streaming_long_tool_name_split_in_reas
     TEST_ASSERT(em.reasoning_text().find("fetch_authenticated") == std::string::npos);
     TEST_ASSERT(em.finish_reason() == "tool_calls");
 }
+
+TEST_CASE(ServerUnitFixture, test_escape_for_logging) {
+    // Standard escapes
+    TEST_ASSERT(escape_for_logging("hello\nworld\r\t'\\") == "hello\\nworld\\r\\t\\'\\\\");
+    // NUL byte (escaped as fixed-width \u0000 for consistency)
+    TEST_ASSERT(escape_for_logging(std::string("null\0byte", 9)) == "null\\u0000byte");
+    // Control byte followed by hex digit must be unambiguous (\u0001f)
+    TEST_ASSERT(escape_for_logging(std::string("\x01", 1) + "f") == "\\u0001f");
+    TEST_ASSERT(escape_for_logging(std::string("\x1f", 1) + "abc") == "\\u001fabc");
+    TEST_ASSERT(escape_for_logging(std::string("\x7f", 1) + "xyz") == "\\u007fxyz");
+}
+
+namespace {
+struct StderrCapture {
+    int old_stderr = -1;
+    int pipefd[2] = {-1, -1};
+
+    StderrCapture() {
+        if (pipe(pipefd) == 0) {
+            old_stderr = dup(STDERR_FILENO);
+            dup2(pipefd[1], STDERR_FILENO);
+            close(pipefd[1]);
+            pipefd[1] = -1;
+        }
+    }
+
+    std::string str() {
+        restore();
+        if (pipefd[0] == -1) return "";
+        std::string out;
+        char buf[1024];
+        ssize_t n = 0;
+        while ((n = read(pipefd[0], buf, sizeof(buf))) > 0) {
+            out.append(buf, n);
+            if (n < (ssize_t)sizeof(buf)) break;
+        }
+        close(pipefd[0]);
+        pipefd[0] = -1;
+        return out;
+    }
+
+    void restore() {
+        if (old_stderr != -1) {
+            std::fflush(stderr);
+            dup2(old_stderr, STDERR_FILENO);
+            close(old_stderr);
+            old_stderr = -1;
+        }
+    }
+
+    ~StderrCapture() {
+        restore();
+        if (pipefd[0] != -1) close(pipefd[0]);
+        if (pipefd[1] != -1) close(pipefd[1]);
+    }
+};
+}  // namespace
+
+TEST_CASE(ServerUnitFixture, test_emitter_suppresses_malformed_multiline_tool_buffer) {
+    StderrCapture capture;
+
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, read_tools(), false);
+    em.emit_start();
+    em.emit_token("<function_call>\n  <invoke name=\"read\">\n    malformed prose body with\nnew lines and \t tabs\n");
+    em.emit_finish(10);
+
+    std::string captured = capture.str();
+
+    TEST_ASSERT(em.tool_calls().empty());
+    TEST_ASSERT(em.accumulated_text().empty());
+    TEST_ASSERT(captured.find("[server] tool_call parse failed; suppressing buffered tool text") != std::string::npos);
+    TEST_ASSERT(captured.find("text='<function_call>\\n  <invoke name=\"read\">\\n    malformed prose body with\\nnew lines and \\t tabs\\n'") != std::string::npos);
+}

@@ -39,6 +39,30 @@ static int64_t unix_timestamp() {
         std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
+std::string escape_for_logging(const std::string & s) {
+    std::string out;
+    out.reserve(s.size() + 16);
+    for (unsigned char c : s) {
+        switch (c) {
+        case '\n': out += "\\n"; break;
+        case '\r': out += "\\r"; break;
+        case '\t': out += "\\t"; break;
+        case '\\': out += "\\\\"; break;
+        case '\'': out += "\\'"; break;
+        default:
+            if (c < 0x20 || c == 0x7f) {
+                char hex[8];
+                std::snprintf(hex, sizeof(hex), "\\u00%02x", (unsigned int) c);
+                out += hex;
+            } else {
+                out += (char) c;
+            }
+            break;
+        }
+    }
+    return out;
+}
+
 // Round `x` to 1 decimal place. JSON serialization of doubles can emit
 // 17 significant digits which is noisy in client logs and bench output;
 // caller-side rounding keeps the wire format stable across runs.
@@ -812,10 +836,12 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
         } else {
             // Tool syntax was detected but no valid call parsed. Do not leak
             // malformed/incomplete XML back to the user or reasoning channel.
+            std::string escaped = escape_for_logging(tool_buffer_);
             std::fprintf(stderr,
                 "[server] tool_call parse failed; suppressing buffered tool text "
-                "request_id=%s format=%d bytes=%zu\n",
-                request_id_.c_str(), (int)format_, tool_buffer_.size());
+                "request_id=%s format=%d bytes=%zu text='%s'\n",
+                request_id_.c_str(), (int)format_, tool_buffer_.size(),
+                escaped.c_str());
 
             if (tool_from_reasoning_) {
                 size_t think_close = find_top_level_think_close(tool_buffer_, tools_);
