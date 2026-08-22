@@ -2347,21 +2347,20 @@ json build_anthropic_response(
         });
     }
     for (const auto & tool_call : emitter.tool_calls()) {
-        // Anthropic expects `input` as an object; arguments arrive as a
-        // JSON-encoded string. Fall back to an empty object on bad JSON.
-        json input;
-        try {
-            input = tool_call.arguments.empty()
-                ? json::object()
-                : json::parse(tool_call.arguments);
-        } catch (const std::exception &) {
-            input = json::object();
+        json input = json::object();
+        if (!tool_call.arguments.empty()) {
+            json parsed = json::parse(tool_call.arguments, nullptr, false);
+            if (!parsed.is_discarded() && parsed.is_object()) {
+                input = std::move(parsed);
+            } else {
+                input = {{"_raw", tool_call.arguments}};
+            }
         }
         content.push_back({
             {"type", "tool_use"},
             {"id", tool_call.id},
             {"name", tool_call.name},
-            {"input", input},
+            {"input", std::move(input)},
         });
     }
 

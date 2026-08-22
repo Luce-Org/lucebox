@@ -6081,3 +6081,160 @@ TEST_CASE(ServerUnitFixture, test_emitter_streaming_anthropic_stop_sequence_beat
     std::string text = concat(chunks);
     TEST_ASSERT(text.find("\"stop_reason\":\"end_turn\"") != std::string::npos);
 }
+
+TEST_CASE(ServerUnitFixture, test_parse_function_calls_json_lines) {
+    std::string text =
+        "Let me read the files:\n"
+        "<function_calls>\n"
+        "{\"name\": \"read\", \"arguments\": {\"path\": \"file1.txt\"}}\n"
+        "{\"name\": \"read\", \"arguments\": {\"path\": \"file2.txt\"}}\n"
+        "</function_calls>";
+
+    auto result = parse_tool_calls(text, read_tools());
+    TEST_ASSERT(result.tool_calls.size() == 2);
+    if (result.tool_calls.size() == 2) {
+        TEST_ASSERT(result.tool_calls[0].name == "read");
+        TEST_ASSERT(result.tool_calls[1].name == "read");
+        auto a1 = json::parse(result.tool_calls[0].arguments);
+        auto a2 = json::parse(result.tool_calls[1].arguments);
+        TEST_ASSERT(a1["path"] == "file1.txt");
+        TEST_ASSERT(a2["path"] == "file2.txt");
+    }
+    TEST_ASSERT(result.cleaned_text == "Let me read the files:");
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_function_calls_sibling_invokes_partial_failure) {
+    std::string text =
+        "<function_calls>\n"
+        "<invoke name=\"read\">\n"
+        "  <param name=\"path\">valid.txt</param>\n"
+        "</invoke>\n"
+        "<invoke name=\"read\">\n"
+        "  malformed parameter text\n"
+        "</invoke>\n"
+        "</function_calls>";
+
+    auto result = parse_tool_calls(text, read_tools());
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "read");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["path"] == "valid.txt");
+    }
+    TEST_ASSERT(result.cleaned_text.find("malformed parameter text") != std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_json_syntax_error_forwarding) {
+    std::string text = "<function_call>{\"name\": \"read\", \"arguments\": {\"offset\": 5o1}}</function_call>";
+    auto result = parse_tool_calls(text, read_tools());
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "read");
+        TEST_ASSERT(result.tool_calls[0].arguments == "{\"offset\": 5o1}");
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_streaming_json_syntax_error_openai_delta) {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, read_tools(), false);
+    em.emit_start();
+    em.emit_token("<function_call>{\"name\": \"read\", \"arguments\": {\"offset\": 5o1}}</function_call>");
+    auto chunks = em.emit_finish(10, nullptr, -1);
+    TEST_ASSERT(em.tool_calls().size() == 1);
+    if (!em.tool_calls().empty()) {
+        TEST_ASSERT(em.tool_calls()[0].name == "read");
+        TEST_ASSERT(em.tool_calls()[0].arguments == "{\"offset\": 5o1}");
+    }
+    TEST_ASSERT(em.finish_reason() == "tool_calls");
+    std::string text = concat(chunks);
+    TEST_ASSERT(text.find("5o1") != std::string::npos);
+    TEST_ASSERT(text.find("\"finish_reason\":\"tool_calls\"") != std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_streaming_json_syntax_error_anthropic) {
+    auto em = make_emitter(ApiFormat::ANTHROPIC, read_tools(), false);
+    em.emit_start();
+    em.emit_token("<function_call>{\"name\": \"read\", \"arguments\": {\"offset\": 5o1}}</function_call>");
+    auto chunks = em.emit_finish(10, nullptr, -1);
+    TEST_ASSERT(em.tool_calls().size() == 1);
+    if (!em.tool_calls().empty()) {
+        TEST_ASSERT(em.tool_calls()[0].name == "read");
+        TEST_ASSERT(em.tool_calls()[0].arguments == "{\"offset\": 5o1}");
+    }
+    std::string text = concat(chunks);
+    TEST_ASSERT(text.find("\"type\":\"tool_use\"") != std::string::npos);
+    TEST_ASSERT(text.find("5o1") != std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_streaming_malformed_tool_in_think_recovers_answer) {
+    auto em = make_emitter(ApiFormat::ANTHROPIC, read_tools(), true);
+    em.emit_start();
+    auto c1 = em.emit_token("<think>Let me see <tool_call><bad_tool></tool_call></think>Here is the final answer.");
+    auto c2 = em.emit_finish(10, nullptr, -1);
+    std::string text = concat(c1) + concat(c2);
+    TEST_ASSERT(em.tool_calls().empty());
+    TEST_ASSERT(em.reasoning_text().find("<bad_tool>") == std::string::npos);
+    TEST_ASSERT(em.reasoning_text().find("Let me see ") != std::string::npos);
+    TEST_ASSERT(em.accumulated_text() == "Here is the final answer.");
+    TEST_ASSERT(text.find("\"type\":\"thinking_delta\"") != std::string::npos);
+    TEST_ASSERT(text.find("\"type\":\"text_delta\"") != std::string::npos);
+    TEST_ASSERT(text.find("Here is the final answer.") != std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_streaming_malformed_tool_in_think_without_think_close_suppressed) {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, read_tools(), true);
+    em.emit_start();
+    em.emit_token("<think>Let me see <tool_call><bad_tool>");
+    auto chunks = em.emit_finish(10, nullptr, -1);
+    TEST_ASSERT(em.tool_calls().empty());
+    TEST_ASSERT(em.accumulated_text().empty());
+    TEST_ASSERT(em.reasoning_text().find("<bad_tool>") == std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_streaming_malformed_tool_in_think_literal_think_close_in_args_does_not_leak) {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, read_tools(), true);
+    em.emit_start();
+    em.emit_token("<think>Let me see <tool_call><function=bash><parameter=cmd>grep '</think>' file.txt");
+    auto chunks = em.emit_finish(10, nullptr, -1);
+    TEST_ASSERT(em.tool_calls().empty());
+    TEST_ASSERT(em.accumulated_text().empty());
+    TEST_ASSERT(em.reasoning_text().find("grep") == std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_streaming_malformed_tool_in_think_envelope_with_internal_think_close_recovers_answer) {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, read_tools(), true);
+    em.emit_start();
+    em.emit_token("<think>Let me see <tool_call><function=bash><parameter=cmd>grep '</think>' file.txt</parameter></function></tool_call></think>Real answer here.");
+    auto chunks = em.emit_finish(10, nullptr, -1);
+    TEST_ASSERT(em.tool_calls().empty());
+    TEST_ASSERT(em.accumulated_text() == "Real answer here.");
+    TEST_ASSERT(em.reasoning_text().find("grep") == std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_streaming_long_tool_name_split_in_reasoning_holds_back) {
+    json tools = json::array({
+        {
+            {"type", "function"},
+            {"function", {
+                {"name", "fetch_authenticated_user_profile_data"},
+                {"description", "fetch user profile"},
+                {"parameters", {{"type", "object"}, {"properties", {{"id", {{"type", "string"}}}}}}}
+            }}
+        }
+    });
+
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, tools, true);
+    em.emit_start();
+    em.emit_token("<think>I should fetch the user data. ");
+    em.emit_token("<fetch_authenticated_");
+    em.emit_token("user_profile_data>\n<parameter=id>\n123\n</parameter>\n</fetch_authenticated_user_profile_data></think>");
+    auto chunks = em.emit_finish(10, nullptr, -1);
+
+    TEST_ASSERT(em.tool_calls().size() == 1);
+    if (!em.tool_calls().empty()) {
+        TEST_ASSERT(em.tool_calls()[0].name == "fetch_authenticated_user_profile_data");
+        auto args = json::parse(em.tool_calls()[0].arguments);
+        TEST_ASSERT(args["id"] == "123");
+    }
+    TEST_ASSERT(em.reasoning_text().find("fetch_authenticated") == std::string::npos);
+    TEST_ASSERT(em.finish_reason() == "tool_calls");
+}
