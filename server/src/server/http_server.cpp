@@ -2228,7 +2228,8 @@ CompletionTokenCounts feed_non_streaming_tokens(
 json build_openai_completion_response(
         const ParsedRequest & req, const GenerateResult & result,
         int generation_cap, const GenTimings & timings,
-        const CompletionTokenCounts & counts, const SseEmitter & emitter) {
+        const CompletionTokenCounts & counts, const SseEmitter & emitter,
+        const Tokenizer * tokenizer = nullptr) {
     json message = {
         {"role", "assistant"},
         {"content", emitter.accumulated_text()},
@@ -2261,13 +2262,15 @@ json build_openai_completion_response(
         }
         message["tool_calls"] = tool_calls;
     }
-
     // The emitter only knows "stop" / "tool_calls"; it cannot see that the
     // daemon hit the n_gen cap. Derive "length" from the committed-token
     // count — OpenAI-compatible clients (open-webui, Cline) gate retry
     // logic on finish_reason == "length".
+    const bool is_eos = tokenizer && !result.tokens.empty() &&
+        (result.tokens.back() == tokenizer->eos_id() ||
+         result.tokens.back() == tokenizer->eos_chat_id());
     std::string finish_reason = emitter.finish_reason();
-    if (finish_reason == "stop" && counts.total >= generation_cap) {
+    if (finish_reason == "stop" && !is_eos && counts.total >= generation_cap) {
         finish_reason = "length";
     }
     // Degenerate decode (post-close repetition-loop watchdog) also reports
@@ -2330,7 +2333,8 @@ json build_openai_completion_response(
 json build_anthropic_response(
         const ParsedRequest & req, const GenerateResult & result,
         int generation_cap, const GenTimings & timings,
-        const CompletionTokenCounts & counts, const SseEmitter & emitter) {
+        const CompletionTokenCounts & counts, const SseEmitter & emitter,
+        const Tokenizer * tokenizer = nullptr) {
     json content = json::array();
     if (!emitter.reasoning_text().empty()) {
         content.push_back({
@@ -2367,10 +2371,13 @@ json build_anthropic_response(
     // stop_reason is Anthropic's analog of finish_reason, with the same
     // length-vs-EOS distinction — Cline / Anthropic SDK clients gate
     // retry logic on stop_reason == "max_tokens".
+    const bool is_eos = tokenizer && !result.tokens.empty() &&
+        (result.tokens.back() == tokenizer->eos_id() ||
+         result.tokens.back() == tokenizer->eos_chat_id());
     std::string stop_reason;
     if (emitter.finish_reason() == "tool_calls") {
         stop_reason = "tool_use";
-    } else if (counts.total >= generation_cap) {
+    } else if (!is_eos && counts.total >= generation_cap) {
         stop_reason = "max_tokens";
     } else {
         stop_reason = "end_turn";
@@ -2446,14 +2453,15 @@ json build_responses_api_response(
 json build_non_streaming_response(
         const ParsedRequest & req, const GenerateResult & result,
         int generation_cap, const GenTimings & timings,
-        const CompletionTokenCounts & counts, SseEmitter & emitter) {
+        const CompletionTokenCounts & counts, SseEmitter & emitter,
+        const Tokenizer * tokenizer = nullptr) {
     switch (req.format) {
     case ApiFormat::OPENAI_CHAT:
         return build_openai_completion_response(
-            req, result, generation_cap, timings, counts, emitter);
+            req, result, generation_cap, timings, counts, emitter, tokenizer);
     case ApiFormat::ANTHROPIC:
         return build_anthropic_response(
-            req, result, generation_cap, timings, counts, emitter);
+            req, result, generation_cap, timings, counts, emitter, tokenizer);
     case ApiFormat::RESPONSES:
         return build_responses_api_response(
             req, result, timings, counts, emitter);
@@ -2469,7 +2477,7 @@ json build_non_streaming_response(
     const CompletionTokenCounts counts = feed_non_streaming_tokens(
         result.tokens, tokenizer, emitter);
     return build_non_streaming_response(
-        req, result, generation_cap, timings, counts, emitter);
+        req, result, generation_cap, timings, counts, emitter, &tokenizer);
 }
 
 // Prompt preparation applies exactly one compression policy: FlowKV for
@@ -4080,8 +4088,12 @@ void HttpServer::process_job(ServerJob * job) {
     if (job->client_disconnected.load(std::memory_order_acquire)) {
         client_disconnected = true;
     }
+    const bool is_eos = !result.tokens.empty() &&
+        (result.tokens.back() == tokenizer_.eos_id() ||
+         result.tokens.back() == tokenizer_.eos_chat_id());
     if (req.stream && !client_disconnected) {
-        auto final_chunks = emitter.emit_finish(completion_tokens, &gen_timings, n_gen_cap);
+        auto final_chunks = emitter.emit_finish(
+            completion_tokens, &gen_timings, is_eos ? -1 : n_gen_cap);
         remember_agent_turn(
             req, prepared, cache, result, emitter, completion_tokens,
             visible_output_seen, client_disconnected,

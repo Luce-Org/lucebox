@@ -6238,3 +6238,99 @@ TEST_CASE(ServerUnitFixture, test_emitter_streaming_long_tool_name_split_in_reas
     TEST_ASSERT(em.reasoning_text().find("fetch_authenticated") == std::string::npos);
     TEST_ASSERT(em.finish_reason() == "tool_calls");
 }
+
+TEST_CASE(ServerUnitFixture, test_parse_tool_call_rejects_empty_name_and_scalar_arguments) {
+    // Empty tool name must be rejected
+    const std::string empty_name =
+        "<function_call>\n{\"name\": \"\", \"arguments\": {\"path\": \"/tmp/test\"}}\n</function_call>";
+    auto res_empty = parse_tool_calls(empty_name, read_tools());
+    TEST_ASSERT(res_empty.tool_calls.empty());
+
+    // Valid scalar string argument must be rejected (not an object)
+    const std::string scalar_arg =
+        "<function_call>\n{\"name\": \"read\", \"arguments\": \"just a string\"}\n</function_call>";
+    auto res_scalar = parse_tool_calls(scalar_arg, read_tools());
+    TEST_ASSERT(res_scalar.tool_calls.empty());
+
+    // Valid array argument must be rejected (not an object)
+    const std::string array_arg =
+        "<function_call>\n{\"name\": \"read\", \"arguments\": [1, 2, 3]}\n</function_call>";
+    auto res_array = parse_tool_calls(array_arg, read_tools());
+    TEST_ASSERT(res_array.tool_calls.empty());
+
+    // Malformed JSON object syntax (e.g. 5o1) is forwarded as raw args
+    const std::string bad_obj =
+        "<function_call>\n{\"name\": \"read\", \"arguments\": {\"path\": \"/tmp/test\", \"offset\": 5o1}}\n</function_call>";
+    auto res_bad = parse_tool_calls(bad_obj, read_tools());
+    TEST_ASSERT(res_bad.tool_calls.size() == 1);
+    if (!res_bad.tool_calls.empty()) {
+        TEST_ASSERT(res_bad.tool_calls[0].name == "read");
+        TEST_ASSERT(res_bad.tool_calls[0].arguments.find("5o1") != std::string::npos);
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_extract_raw_json_tool_fallback_with_nested_name_argument) {
+    // Malformed arguments containing a "name" key before top-level "name"
+    const std::string text_reversed =
+        "<function_call>\n"
+        "{\"arguments\": {\"name\": \"evil_command\", \"offset\": 5o1}, \"name\": \"read\"}\n"
+        "</function_call>";
+    auto res_rev = parse_tool_calls(text_reversed, read_tools());
+    TEST_ASSERT(res_rev.tool_calls.size() == 1);
+    if (!res_rev.tool_calls.empty()) {
+        TEST_ASSERT(res_rev.tool_calls[0].name == "read");
+        TEST_ASSERT(res_rev.tool_calls[0].arguments.find("evil_command") != std::string::npos);
+    }
+
+    // Nested function object with "name" inside arguments
+    const std::string text_nested =
+        "<function_call>\n"
+        "{\"function\": {\"name\": \"read\", \"arguments\": {\"name\": \"evil_nested\", \"offset\": 5o1}}}\n"
+        "</function_call>";
+    auto res_nest = parse_tool_calls(text_nested, read_tools());
+    TEST_ASSERT(res_nest.tool_calls.size() == 1);
+    if (!res_nest.tool_calls.empty()) {
+        TEST_ASSERT(res_nest.tool_calls[0].name == "read");
+        TEST_ASSERT(res_nest.tool_calls[0].arguments.find("evil_nested") != std::string::npos);
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_function_calls_mixed_invoke_and_json_line_siblings) {
+    const std::string text =
+        "Processing files:\n"
+        "<function_calls>\n"
+        "  <invoke name=\"read\">\n"
+        "    <param name=\"path\">first.go</param>\n"
+        "  </invoke>\n"
+        "  {\"name\": \"read\", \"arguments\": {\"path\": \"second.go\"}}\n"
+        "</function_calls>";
+
+    auto res = parse_tool_calls(text, read_tools());
+    TEST_ASSERT(res.tool_calls.size() == 2);
+    if (res.tool_calls.size() == 2) {
+        TEST_ASSERT(res.tool_calls[0].name == "read");
+        auto args0 = json::parse(res.tool_calls[0].arguments);
+        TEST_ASSERT(args0["path"] == "first.go");
+
+        TEST_ASSERT(res.tool_calls[1].name == "read");
+        auto args1 = json::parse(res.tool_calls[1].arguments);
+        TEST_ASSERT(args1["path"] == "second.go");
+    }
+    TEST_ASSERT(res.cleaned_text == "Processing files:");
+}
+
+TEST_CASE(ServerUnitFixture, test_build_response_suppresses_length_finish_reason_on_eos) {
+    // When generation finishes on EOS, emitter finish_reason is called with generation_cap=-1 (suppressed cap)
+    auto em_openai = make_emitter(ApiFormat::OPENAI_CHAT);
+    em_openai.emit_start();
+    em_openai.emit_token("Hello world");
+    auto chunks_openai = em_openai.emit_finish(3, nullptr, -1);
+    TEST_ASSERT(em_openai.finish_reason() == "stop");
+
+    auto em_anthropic = make_emitter(ApiFormat::ANTHROPIC);
+    em_anthropic.emit_start();
+    em_anthropic.emit_token("Hello world");
+    auto chunks_anthropic = em_anthropic.emit_finish(3, nullptr, -1);
+    TEST_ASSERT(em_anthropic.finish_reason() == "stop");
+}
+

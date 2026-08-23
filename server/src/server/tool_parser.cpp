@@ -578,13 +578,21 @@ static bool parse_arg_string_or_obj(const json & val, json & out_args,
     }
     if (val.is_string()) {
         out_raw_args = val.get<std::string>();
+        std::string trimmed = trim_ws(out_raw_args);
         json parsed = json::parse(out_raw_args, nullptr, false);
-        if (!parsed.is_discarded() && parsed.is_object()) {
-            out_args = std::move(parsed);
-        } else {
-            out_args = json::object();
+        if (!parsed.is_discarded()) {
+            if (parsed.is_object()) {
+                out_args = std::move(parsed);
+                return true;
+            }
+            return false;  // reject valid scalar, array, or boolean arguments string
         }
-        return true;
+        // Discarded JSON: check if it has { ... } shape for syntax error tolerance (e.g. {"offset": 5o1})
+        if (!trimmed.empty() && trimmed.front() == '{' && trimmed.back() == '}') {
+            out_args = json::object();
+            return true;
+        }
+        return false;
     }
     return false;
 }
@@ -596,6 +604,7 @@ static bool parse_json_tool_call(const json & obj, std::string & out_name,
 
     if (obj.contains("name") && obj["name"].is_string()) {
         out_name = obj["name"].get<std::string>();
+        if (out_name.empty()) return false;
         for (const char * k : {"arguments", "parameters", "args", "params", "input"}) {
             if (obj.contains(k)) return parse_arg_string_or_obj(obj[k], out_args, out_raw_args);
         }
@@ -604,6 +613,7 @@ static bool parse_json_tool_call(const json & obj, std::string & out_name,
 
     if (obj.contains("function") && obj["function"].is_string()) {
         out_name = obj["function"].get<std::string>();
+        if (out_name.empty()) return false;
         for (const char * k : {"parameters", "arguments", "args", "params", "input"}) {
             if (obj.contains(k)) return parse_arg_string_or_obj(obj[k], out_args, out_raw_args);
         }
@@ -817,15 +827,35 @@ static bool extract_raw_json_tool_fallback(const std::string & text,
     static const std::regex re_name(R"re("(?:name|function|tool)"\s*:\s*"([A-Za-z_][\w.\-]*)")re");
     static const std::regex re_args_open(R"re("(?:arguments|parameters|args|params|input)"\s*:\s*\{)re");
 
-    std::smatch mn, ma;
-    if (std::regex_search(text, mn, re_name) && std::regex_search(text, ma, re_args_open)) {
-        out_name = mn[1].str();
-        size_t brace_open = ma.position() + ma.length() - 1;
-        size_t brace_close = balanced_braces_end(text, brace_open);
-        if (brace_close != std::string::npos) {
-            out_raw_args = text.substr(brace_open, brace_close - brace_open);
-            return true;
+    std::smatch ma;
+    if (!std::regex_search(text, ma, re_args_open)) return false;
+
+    size_t brace_open = ma.position() + ma.length() - 1;
+    size_t brace_close = balanced_braces_end(text, brace_open);
+    if (brace_close == std::string::npos) return false;
+
+    // Isolate text outside the arguments object span so nested property "name" inside arguments is ignored
+    std::string prefix = text.substr(0, ma.position());
+    std::string suffix = text.substr(brace_close);
+
+    bool found_name = false;
+    auto pbegin = std::sregex_iterator(prefix.begin(), prefix.end(), re_name);
+    auto pend = std::sregex_iterator();
+    for (auto it = pbegin; it != pend; ++it) {
+        out_name = (*it)[1].str();
+        found_name = true;
+    }
+    if (!found_name) {
+        std::smatch mn;
+        if (std::regex_search(suffix, mn, re_name)) {
+            out_name = mn[1].str();
+            found_name = true;
         }
+    }
+
+    if (found_name && !out_name.empty()) {
+        out_raw_args = text.substr(brace_open, brace_close - brace_open);
+        return true;
     }
     return false;
 }
@@ -1262,27 +1292,41 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
                 block_calls.push_back({fn_name, std::move(args), raw_args, istart, iend});
             }
 
-            // 2. If no <invoke> tags matched, try JSON lines
-            if (block_calls.empty()) {
-                size_t cursor = 0;
-                while (cursor < block_content.size()) {
-                    size_t s = block_content.find('{', cursor);
-                    if (s == std::string::npos) break;
-                    size_t e = balanced_braces_end(block_content, s);
-                    if (e == std::string::npos) { cursor = s + 1; continue; }
-                    std::string jstr = block_content.substr(s, e - s);
-                    json obj = json::parse(jstr, nullptr, false);
-                    std::string name;
-                    json args;
-                    std::string raw;
-                    if (!obj.is_discarded() && parse_json_tool_call(obj, name, args, raw) && tool_allowed(tools, name)) {
-                        block_calls.push_back({name, std::move(args), raw, inner_start + s, inner_start + e});
+            // 2. Also scan for JSON objects in spans not covered by <invoke> calls
+            size_t cursor = 0;
+            while (cursor < block_content.size()) {
+                size_t s = block_content.find('{', cursor);
+                if (s == std::string::npos) break;
+                size_t abs_s = inner_start + s;
+                bool inside_invoke = false;
+                for (const auto & bc : block_calls) {
+                    if (abs_s >= bc.start && abs_s < bc.end) {
+                        inside_invoke = true;
+                        cursor = bc.end - inner_start;
+                        break;
                     }
-                    cursor = e;
                 }
+                if (inside_invoke) continue;
+
+                size_t e = balanced_braces_end(block_content, s);
+                if (e == std::string::npos) { cursor = s + 1; continue; }
+                std::string jstr = block_content.substr(s, e - s);
+                json obj = json::parse(jstr, nullptr, false);
+                std::string name;
+                json args;
+                std::string raw;
+                if (!obj.is_discarded() && parse_json_tool_call(obj, name, args, raw) && tool_allowed(tools, name)) {
+                    block_calls.push_back({name, std::move(args), raw, inner_start + s, inner_start + e});
+                } else if (extract_raw_json_tool_fallback(jstr, name, raw) && tool_allowed(tools, name)) {
+                    block_calls.push_back({name, json::object(), raw, inner_start + s, inner_start + e});
+                }
+                cursor = e;
             }
 
             if (!block_calls.empty()) {
+                std::sort(block_calls.begin(), block_calls.end(),
+                          [](const CallMatch & a, const CallMatch & b) { return a.start < b.start; });
+
                 // If the block contains only whitespace around the calls, remove the whole block
                 bool clean_block = true;
                 size_t last_end = 0;
