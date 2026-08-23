@@ -1624,6 +1624,24 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
                                const DaemonIO & io,
                                int snap_pos, int snap_slot,
                                int kv_offset) {
+    // A finite --fa-window caps the full-attention layers to a sliding
+    // window, so anything earlier than the window is invisible to them. That
+    // is silent: the model still answers, it just cannot see the head of a
+    // long prompt, which reads as a model quality problem rather than a
+    // configuration one. Say so once, the first time a prompt actually
+    // outgrows the window.
+    if (cfg_.fa_window > 0 &&
+        (int)tokens.size() + kv_offset > cfg_.fa_window) {
+        static std::atomic<bool> s_fa_window_warned{false};
+        if (!s_fa_window_warned.exchange(true)) {
+            std::fprintf(stderr,
+                "[qwen35] WARNING: prompt is %d tokens but --fa-window is %d: "
+                "full-attention layers see only the last %d tokens, so content "
+                "before that cannot be retrieved. Drop --fa-window for "
+                "long-context work.\n",
+                (int)tokens.size() + kv_offset, cfg_.fa_window, cfg_.fa_window);
+        }
+    }
     const int hidden = w_.n_embd;
     const int vocab  = w_.n_vocab;
     int prefill_ubatch = qwen35_prefill_ubatch(512);
