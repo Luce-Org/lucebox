@@ -3818,7 +3818,7 @@ void HttpServer::send_nonstream_response(
     result.degenerate_decode_close = degenerate_decode_close;
 
     const json response = build_non_streaming_response(
-        req, result, n_gen_cap, gen_timings, counts, emitter);
+        req, result, n_gen_cap, gen_timings, counts, emitter, &tokenizer_);
 
     const std::string body = response.dump() + "\n";
     if (send_buffer) {

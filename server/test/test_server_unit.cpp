@@ -6334,3 +6334,38 @@ TEST_CASE(ServerUnitFixture, test_build_response_suppresses_length_finish_reason
     TEST_ASSERT(em_anthropic.finish_reason() == "stop");
 }
 
+TEST_CASE(ServerUnitFixture, test_parse_function_calls_empty_invoke_zero_args) {
+    json tools = json::array({
+        {
+            {"type", "function"},
+            {"function", {
+                {"name", "get_version"},
+                {"description", "get version"},
+                {"parameters", {{"type", "object"}, {"properties", json::object()}}}
+            }}
+        }
+    });
+
+    const std::string text =
+        "<function_calls>\n"
+        "  <invoke name=\"get_version\"></invoke>\n"
+        "</function_calls>";
+
+    auto res = parse_tool_calls(text, tools);
+    TEST_ASSERT(res.tool_calls.size() == 1);
+    if (!res.tool_calls.empty()) {
+        TEST_ASSERT(res.tool_calls[0].name == "get_version");
+        TEST_ASSERT(res.tool_calls[0].arguments == "{}");
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_streaming_malformed_tool_in_think_answer_containing_close_tag_recovers_answer) {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, read_tools(), true);
+    em.emit_start();
+    em.emit_token("<think><tool_call><bad_param></tool_call></think>The output is </parameter> end.");
+    auto chunks = em.emit_finish(10, nullptr, -1);
+    TEST_ASSERT(em.tool_calls().empty());
+    TEST_ASSERT(em.accumulated_text() == "The output is </parameter> end.");
+}
+
+

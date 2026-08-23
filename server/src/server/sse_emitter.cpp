@@ -547,77 +547,89 @@ void SseEmitter::emit_reasoning_delta(std::vector<std::string> & out,
 // ─── find_top_level_think_close ─────────────────────────────────────────
 
 static size_t find_top_level_think_close(const std::string & buf, const json & tools) {
-    static const char * const STANDARD_TOOL_CLOSES[] = {
-        "</tool_call>", "</function_call>", "</function_calls>", "</function calls>",
-        "</function>", "</funcname>", "</parameter>", "</parameters>", "</tool_code>",
-        "</invoke>", "</arguments>", "</params>"
-    };
+    bool in_single_quote = false;
+    bool in_double_quote = false;
+    std::vector<std::string> open_tags;
 
-    std::vector<std::string> close_tags;
-    for (const char * tag : STANDARD_TOOL_CLOSES) {
-        close_tags.push_back(tag);
-    }
-    if (tools.is_array()) {
-        for (const auto & t : tools) {
-            const auto & fn = t.contains("function") ? t["function"] : t;
-            if (fn.is_object()) {
-                std::string name = fn.value("name", "");
-                if (!name.empty()) {
-                    close_tags.push_back("</" + name + ">");
+    auto is_tool_tag = [&](const std::string & name) {
+        if (name == "tool_call" || name == "function_call" ||
+            name == "function_calls" || name == "function" ||
+            name == "invoke" || name == "parameter" || name == "param" ||
+            name == "arguments" || name == "params" || name == "tool_code" ||
+            name == "funcname") {
+            return true;
+        }
+        if (tools.is_array()) {
+            for (const auto & t : tools) {
+                const auto & fn = t.contains("function") ? t["function"] : t;
+                if (fn.is_object() && fn.value("name", "") == name) {
+                    return true;
                 }
             }
         }
-    }
+        return false;
+    };
 
-    // Find the end of the last verified tool envelope closing tag
-    size_t last_tool_close_end = 0;
-    for (const auto & tag : close_tags) {
-        size_t pos = buf.find(tag);
-        while (pos != std::string::npos) {
-            last_tool_close_end = std::max(last_tool_close_end, pos + tag.size());
-            pos = buf.find(tag, pos + tag.size());
+    for (size_t i = 0; i < buf.size(); ) {
+        if (buf[i] == '\\' && i + 1 < buf.size()) {
+            i += 2;
+            continue;
         }
-    }
+        if (buf[i] == '\'' && !in_double_quote) {
+            in_single_quote = !in_single_quote;
+            i++;
+            continue;
+        }
+        if (buf[i] == '"' && !in_single_quote) {
+            in_double_quote = !in_double_quote;
+            i++;
+            continue;
+        }
 
-    if (last_tool_close_end > 0) {
-        return buf.find(THINK_CLOSE, last_tool_close_end);
-    }
+        if (!in_single_quote && !in_double_quote && buf[i] == '<') {
+            // Check for </think>
+            if (buf.compare(i, THINK_CLOSE_LEN, THINK_CLOSE) == 0) {
+                // If not inside any active unclosed tool tags, this is top-level
+                if (open_tags.empty()) {
+                    return i;
+                }
+            }
 
-    // No tool closing tag was found. Check each </think> candidate to ensure
-    // it is not inside an unclosed quote, XML attribute, or parameter body.
-    size_t cursor = 0;
-    while ((cursor = buf.find(THINK_CLOSE, cursor)) != std::string::npos) {
-        // Check quotes before cursor
-        bool in_single_quote = false;
-        bool in_double_quote = false;
-        for (size_t i = 0; i < cursor; i++) {
-            if (buf[i] == '\\' && i + 1 < cursor) {
-                i++;
+            // Check for closing tag </tag_name>
+            if (i + 1 < buf.size() && buf[i + 1] == '/') {
+                size_t close_bracket = buf.find('>', i + 2);
+                if (close_bracket != std::string::npos) {
+                    std::string raw_name = buf.substr(i + 2, close_bracket - (i + 2));
+                    size_t first = raw_name.find_first_not_of(" \t\r\n");
+                    size_t last = raw_name.find_last_not_of(" \t\r\n");
+                    std::string tag_name = (first == std::string::npos) ? "" : raw_name.substr(first, last - first + 1);
+                    for (int idx = (int)open_tags.size() - 1; idx >= 0; --idx) {
+                        if (open_tags[idx] == tag_name) {
+                            open_tags.resize(idx);
+                            break;
+                        }
+                    }
+                    i = close_bracket + 1;
+                    continue;
+                }
+            }
+
+            // Check for opening tag <tag_name ...>
+            size_t close_bracket = buf.find('>', i + 1);
+            if (close_bracket != std::string::npos) {
+                std::string tag_content = buf.substr(i + 1, close_bracket - (i + 1));
+                size_t ws_pos = tag_content.find_first_of(" \t\r\n=");
+                std::string tag_name = (ws_pos == std::string::npos) ? tag_content : tag_content.substr(0, ws_pos);
+                if (is_tool_tag(tag_name)) {
+                    if (!tag_content.empty() && tag_content.back() != '/') {
+                        open_tags.push_back(tag_name);
+                    }
+                }
+                i = close_bracket + 1;
                 continue;
             }
-            if (buf[i] == '\'' && !in_double_quote) in_single_quote = !in_single_quote;
-            else if (buf[i] == '"' && !in_single_quote) in_double_quote = !in_double_quote;
         }
-        if (in_single_quote || in_double_quote) {
-            cursor += THINK_CLOSE_LEN;
-            continue;
-        }
-
-        // Check if remaining suffix contains leftover XML closing tags
-        std::string suffix = buf.substr(cursor + THINK_CLOSE_LEN);
-        bool has_leftover_close = false;
-        for (const auto & tag : close_tags) {
-            if (suffix.find(tag) != std::string::npos) {
-                has_leftover_close = true;
-                break;
-            }
-        }
-        if (has_leftover_close) {
-            cursor += THINK_CLOSE_LEN;
-            continue;
-        }
-
-        return cursor;
+        i++;
     }
 
     return std::string::npos;

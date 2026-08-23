@@ -1285,7 +1285,9 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
                         found_param = true;
                         cursor = ppos + pit->length();
                     }
-                    if (!valid_body || !found_param || !trim_ws(body.substr(cursor)).empty()) continue;
+                    if (!valid_body) continue;
+                    if (!found_param && !trim_ws(body).empty()) continue;
+                    if (!trim_ws(body.substr(cursor)).empty()) continue;
                 }
                 size_t istart = inner_start + it->position();
                 size_t iend = istart + it->length();
