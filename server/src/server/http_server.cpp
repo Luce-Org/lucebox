@@ -3263,6 +3263,14 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
 
     // Edited or summarized histories can be shorter than the stored KV.
     // Such snapshots cannot be diff-prefilled safely.
+    // The logical entry length (what the PrefixCache believes is cached, e.g.
+    // the tools-head pin at 3620) can exceed the chunk-aligned KV position the
+    // backend actually restored (e.g. 3584). Deepen decisions must compare
+    // against the logical length; otherwise that chunk gap keeps
+    // `forced_cut > restored` true on every tool-heavy turn, the pin branch
+    // keeps targeting the already-cached head, and the cache never deepens
+    // past the head pin (full conversation re-prefilled each turn).
+    const int logical_prefix_len = cache.prefix_len;
     if (cache.using_restore) {
         const int snapshot_length =
             backend_.snapshot_cur_pos(cache.cache_slot);
@@ -3342,7 +3350,7 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
     auto prepare_inline = [&]() {
         const auto prepared_snapshot = prefix_cache_.prepare_inline_snap(
             effective_prompt,
-            cache.using_restore ? cache.prefix_len : 0,
+            cache.using_restore ? logical_prefix_len : 0,
             prefer_tools_boundary,
             forced_cut);
         cache.snap_slot = prepared_snapshot.first;
