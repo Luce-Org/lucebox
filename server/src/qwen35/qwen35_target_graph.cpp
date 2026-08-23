@@ -1330,6 +1330,18 @@ static ggml_tensor * build_full_attn_block(
             // Never view past the read tensor (its rows may not be 256-aligned).
             win_len_padded = std::min(win_len_padded, (int)cache_k->ne[1]);
         }
+        // kvflash: KV lives at pool SLOTS, and the caller's mask is built in
+        // slot space over the whole pool. Slot indices are not bounded by the
+        // logical context length, so a view sized from kv_start can end below
+        // slots the mask still marks visible: those rows fall outside the
+        // view and the softmax row degenerates, which surfaces as an argmax
+        // of -1 for every verify row past the first. Span the whole pool
+        // instead; the mask, sized from that same pool, is what decides which
+        // slots are readable. Detect the mode by the pair only slot-mapped
+        // verify sets: a set_rows KV write together with an explicit mask.
+        if (kv_write_rows != nullptr && attn_mask != nullptr) {
+            win_len_padded = (int)cache_k->ne[1];
+        }
 
         // K and V from cache: a windowed view starting at win_start.
         ggml_tensor * Kfa = ggml_view_3d(ctx, cache_k,
