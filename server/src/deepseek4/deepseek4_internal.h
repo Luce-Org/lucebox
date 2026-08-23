@@ -383,7 +383,8 @@ bool deepseek4_step(
     DeepSeek4StepTelemetry *    telemetry = nullptr,
     MoeHybridRoutingStats *     routing_stats = nullptr,
     Ds4VerifyHooks *            verify_hooks = nullptr,
-    MoeExpertComputeRuntime *   expert_runtime = nullptr);
+    MoeExpertComputeRuntime *   expert_runtime = nullptr,
+    bool                        need_logits = true);
 
 // Optional hooks for the DSpark spec-decode batched verify (deepseek4_dspark).
 // When set on a multi-token deepseek4_step_layer_range call they add: per-layer
