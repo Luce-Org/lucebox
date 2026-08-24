@@ -261,16 +261,18 @@ bool test_cpu_rejects_gpu_only_extensions(ggml_backend_t backend) {
         ctx, q, k, v, g, beta, state);
     const bool plain_gdn_supported =
         ggml_backend_supports_op(backend, plain_gdn);
+    ggml_tensor * raw_gdn = ggml_gated_delta_net(
+        ctx, q, k, v, g, beta, state);
     ggml_tensor * gate_ba = ggml_new_tensor_1d(
         ctx, GGML_TYPE_F32, 2 * N_HEAD);
-    ggml_gated_delta_net_set_raw_gates(plain_gdn, gate_ba);
+    ggml_gated_delta_net_set_raw_gates(raw_gdn, gate_ba);
 
     const bool ok =
         ggml_backend_supports_op(backend, plain_conv) &&
         !ggml_backend_supports_op(backend, fused_step) &&
         !ggml_backend_supports_op(backend, fused_dyn) &&
         plain_gdn_supported &&
-        !ggml_backend_supports_op(backend, plain_gdn);
+        !ggml_backend_supports_op(backend, raw_gdn);
     std::printf("batched gdn CPU capability guards       %s\n",
                 ok ? "PASS" : "FAIL");
     ggml_free(ctx);

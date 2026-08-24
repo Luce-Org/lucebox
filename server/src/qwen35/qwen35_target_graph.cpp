@@ -41,6 +41,7 @@
 #include "common/specla_mode.h"
 
 #include "ggml-alloc.h"
+#include "ggml-backend-impl.h"
 #include "ggml-cuda.h"
 
 #include <cmath>
@@ -75,6 +76,24 @@ constexpr int CONV_CHANNELS = SSM_D_INNER + 2 * SSM_N_GROUP * SSM_D_STATE; // 61
 constexpr float EPS         = 1e-6f;
 constexpr float ROPE_THETA  = 10000000.0f;
 }  // namespace q35
+
+// CUDA and ROCm share ggml's CUDA backend interface. Tensor-parallel caches
+// use a meta backend, so inspect every rank-local backend before enabling ops
+// that have no CPU/Metal/Vulkan implementation.
+static bool supports_qwen35_fused_kernels(ggml_backend_t backend) {
+    if (ggml_backend_is_cuda(backend)) return true;
+    if (!ggml_backend_is_meta(backend)) return false;
+
+    const size_t n_backends = ggml_backend_meta_n_backends(backend);
+    if (n_backends == 0) return false;
+    for (size_t i = 0; i < n_backends; ++i) {
+        if (!ggml_backend_is_cuda(
+                ggml_backend_meta_simple_backend(backend, i))) {
+            return false;
+        }
+    }
+    return true;
+}
 
 // ─── TargetCache allocation ─────────────────────────────────────────
 
@@ -2092,7 +2111,7 @@ static ggml_tensor * build_single_layer(
                                     cache.conv_state[dn_idx], cache.ssm_state[dn_idx],
                                     n_tokens, cap_ptr, parent_ids,
                                     /*skip_gdn_intermediate=*/true,
-                                    ggml_backend_is_cuda(cache.backend));
+                                    supports_qwen35_fused_kernels(cache.backend));
     }
 
     cur = ggml_add(ctx, cur, inpSA);
@@ -2286,7 +2305,7 @@ QwenGraphOutputs build_qwen35_graph(
                                         conv_st, ssm_st,
                                         n_tokens, cap_ptr, in.parent_ids,
                                         /*skip_gdn_intermediate=*/true,
-                                        ggml_backend_is_cuda(cache.backend),
+                                        supports_qwen35_fused_kernels(cache.backend),
                                         in.n_seqs,
                                         in.prefill_segments,
                                         in.n_prefill_segments,
@@ -2495,7 +2514,7 @@ QwenLayerPrefnOutputs build_qwen35_layer_prefn(
                                     cache.conv_state[dn_idx], cache.ssm_state[dn_idx],
                                     n_tokens, nullptr, nullptr,
                                     skip_gdn_intermediate,
-                                    ggml_backend_is_cuda(cache.backend));
+                                    supports_qwen35_fused_kernels(cache.backend));
     }
 
     cur = ggml_add(ctx, cur, inpSA);
