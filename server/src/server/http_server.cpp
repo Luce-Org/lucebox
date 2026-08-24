@@ -3270,7 +3270,9 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
     // `forced_cut > restored` true on every tool-heavy turn, the pin branch
     // keeps targeting the already-cached head, and the cache never deepens
     // past the head pin (full conversation re-prefilled each turn).
-    const int logical_prefix_len = cache.prefix_len;
+    const int pre_overwrite_prefix_len = cache.prefix_len;
+    int logical_prefix_len =
+        cache.using_restore ? pre_overwrite_prefix_len : 0;
     if (cache.using_restore) {
         const int snapshot_length =
             backend_.snapshot_cur_pos(cache.cache_slot);
@@ -3335,6 +3337,8 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
                 cache.prefix_len = cold_boundary;
                 cache.using_restore = true;
                 cache.disk_hit = true;
+                // This restore was created after the pre-overwrite capture.
+                logical_prefix_len = cold_boundary;
                 std::fprintf(stderr,
                     "[disk-cache] cold prefix saved, restoring from %d\n",
                     cold_boundary);

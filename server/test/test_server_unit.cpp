@@ -2220,6 +2220,29 @@ TEST_CASE(ServerUnitFixture, test_inline_snapshot_prefers_tools_boundary_until_r
     TEST_ASSERT(select_inline_snapshot_boundary({100}, 100, true) == 0);
 }
 
+TEST_CASE(ServerUnitFixture, test_forced_tools_pin_yields_to_deepen_after_restore) {
+    const std::vector<int> boundaries = {100, 240, 380, 520};
+
+    // Cold request: the PPP cut pins the tools/identity head.
+    TEST_ASSERT(should_force_inline_snapshot_boundary(
+        boundaries, 600, 0, true, 110));
+
+    // Once the tools boundary is restored, normal selection must deepen to a
+    // later conversation boundary instead of forcing the nearby pin again.
+    TEST_ASSERT(!should_force_inline_snapshot_boundary(
+        boundaries, 600, 100, true, 110));
+    TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 100, true) == 380);
+
+    // Without tools preference, a still-unrestored forced cut retains its
+    // original behavior.
+    TEST_ASSERT(should_force_inline_snapshot_boundary(
+        boundaries, 600, 100, false, 110));
+    TEST_ASSERT(!should_force_inline_snapshot_boundary(
+        boundaries, 600, 110, false, 110));
+    TEST_ASSERT(!should_force_inline_snapshot_boundary(
+        boundaries, 100, 0, false, 110));
+}
+
 TEST_CASE(ServerUnitFixture, test_ppp_master_toggle_gates_tools_boundary_pinning) {
     TEST_ASSERT(ppp_prefers_tools_boundary(true, true));
     TEST_ASSERT(!ppp_prefers_tools_boundary(false, true));

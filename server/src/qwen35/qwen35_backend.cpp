@@ -2466,10 +2466,29 @@ static float qwen35_dspark_confidence_threshold() {
 static ggml_tensor * resolve_fused_lm_head(ggml_tensor * lm_head,
                                            const DevicePlacement & device,
                                            int draft_gpu) {
-    if (!lm_head) return nullptr;
-    if (!lm_head->buffer ||
-        !ggml_backend_buft_is_meta(ggml_backend_buffer_get_type(lm_head->buffer))) {
-        return lm_head;  // simple tensor: data pointer is real, use as-is
+    if (!lm_head || !lm_head->buffer) return nullptr;
+    const ggml_backend_buffer_type_t lm_head_buft =
+        ggml_backend_buffer_get_type(lm_head->buffer);
+    if (!ggml_backend_buft_is_meta(lm_head_buft)) {
+        // A simple tensor is safe only when it is local to the draft backend,
+        // or when peer access was successfully enabled for the actual target
+        // and draft GPU pair. The configuration flag alone is not proof that
+        // the hardware/driver accepted peer access.
+        const ggml_backend_dev_t tensor_dev =
+            ggml_backend_buft_get_device(lm_head_buft);
+        const ggml_backend_dev_t draft_dev =
+            ggml_backend_buft_get_device(
+                ggml_backend_cuda_buffer_type(draft_gpu));
+        if (tensor_dev != draft_dev) {
+            const ggml_backend_dev_t target_dev =
+                ggml_backend_buft_get_device(
+                    ggml_backend_cuda_buffer_type(device.gpu));
+            if (tensor_dev != target_dev ||
+                !cross_device_peer_memcpy_ok(device.gpu, draft_gpu)) {
+                return nullptr;
+            }
+        }
+        return lm_head;
     }
     // Meta tensor: the lm_head is mirrored (full copy) on every rank. Read
     // it from the rank that matches the draft GPU so the fused graph does a
@@ -2477,7 +2496,9 @@ static ggml_tensor * resolve_fused_lm_head(ggml_tensor * lm_head,
     for (size_t j = 0; j < device.layer_split_gpus.size(); ++j) {
         if (device.layer_split_gpus[j] == draft_gpu) {
             ggml_tensor * simple = ggml_backend_meta_simple_tensor(lm_head, j);
-            return (simple && simple->data) ? simple : nullptr;
+            if (!simple || !simple->data) return nullptr;
+            GGML_ASSERT(ggml_are_same_shape(simple, lm_head));
+            return simple;
         }
     }
     // Draft GPU is not a target rank; fall back to the host chain.

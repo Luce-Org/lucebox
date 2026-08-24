@@ -74,6 +74,16 @@ int select_inline_snapshot_boundary(const std::vector<int> & boundaries,
                                     int restored_prefix_len = 0,
                                     bool prefer_tools_boundary = false);
 
+// Return true when a PPP forced cut should override normal boundary
+// selection. Once the tools head is already restored, forcing the pin again
+// prevents the cache from deepening into the conversation.
+bool should_force_inline_snapshot_boundary(
+    const std::vector<int> & boundaries,
+    int prompt_len,
+    int restored_prefix_len,
+    bool prefer_tools_boundary,
+    int forced_cut);
+
 // ─── Prefix cache entry ─────────────────────────────────────────────────
 
 struct FullCacheEntry {

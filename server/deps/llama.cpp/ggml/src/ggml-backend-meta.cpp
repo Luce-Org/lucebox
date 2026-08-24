@@ -830,11 +830,16 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         // weight [K,C] and conv_state [K-1,C,S] carry the same channel
         // partition on axis 1. The axis layout (not the op_params flag, whose
         // encoding differs between the step and SpecLA variants) determines
-        // the split.
+        // the split. The mode is asserted after the layout match so a future
+        // tree/dynamic-conv layout collision fails loudly instead of being
+        // silently treated as Step/SpecLA.
         if (tensor->src[2] != nullptr &&
             src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 &&
             src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_1 &&
             src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_1) {
+            const int mode = ggml_get_op_params_i32(tensor, 0);
+            GGML_ASSERT(mode == 1 || mode == 2);
+            GGML_ASSERT(tensor->src[2]->type == GGML_TYPE_F32);
             return {GGML_BACKEND_SPLIT_AXIS_0, {0}, 1, {1}};
         }
         if (src_ss[0].axis == src_ss[1].axis) {
