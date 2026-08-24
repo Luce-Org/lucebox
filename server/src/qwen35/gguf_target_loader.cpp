@@ -718,9 +718,16 @@ bool load_target_gguf_partial(const std::string & path,
             if (name.rfind("blk.", 0) == 0) {
                 for (const auto & pr : kPairs) {
                     for (int m = 0; m < 2; m++) {
-                        const size_t pos = name.find(pr[m]);
-                        if (pos == std::string::npos) continue;
-                        const std::string prefix = name.substr(0, pos);
+                        // Exact-suffix match only: a suffix-superset name
+                        // (e.g. ".attn_qkv.weight.scale") must not trigger
+                        // the pair path, or the tensor would be dropped from
+                        // the ordering below.
+                        const size_t slen = std::strlen(pr[m]);
+                        if (name.size() <= slen ||
+                            name.compare(name.size() - slen, slen, pr[m]) != 0) {
+                            continue;
+                        }
+                        const std::string prefix = name.substr(0, name.size() - slen);
                         first  = find_alloc(prefix + pr[0]);
                         second = find_alloc(prefix + pr[1]);
                         break;
@@ -728,7 +735,8 @@ bool load_target_gguf_partial(const std::string & path,
                     if (first >= 0 || second >= 0) break;
                 }
             }
-            if (first >= 0 && second >= 0 && !taken[(size_t)first] && !taken[(size_t)second]) {
+            if (first >= 0 && second >= 0 && !taken[(size_t)first] && !taken[(size_t)second] &&
+                ((size_t)first == i || (size_t)second == i)) {
                 taken[(size_t)first] = taken[(size_t)second] = true;
                 ordered.push_back(allocs[(size_t)first]);
                 ordered.push_back(allocs[(size_t)second]);

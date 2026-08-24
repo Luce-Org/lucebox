@@ -97,7 +97,7 @@ struct RollbackDiag {
         if (!out || !policy.diagnostics) return;
         std::fprintf(out,
             "[chain-rollback-policy] checkpoint=%s threshold=%d fast_low=%d fast_high=%d legacy_replay=%d failed_fallback=%d accept_hist=1:%d,2:%d,3:%d,4:%d,5:%d,6:%d,7:%d,8:%d,9:%d,10:%d,11:%d,12:%d,13:%d,14:%d,15:%d,16+:%d\n",
-            policy.checkpoint_f32 ? "F32" : "default",
+            policy.checkpoint_f32 ? "F32" : "F16",
             policy.fast_rollback_threshold,
             fast_low, fast_high, legacy_replay, failed_fallback,
             accept_hist[1], accept_hist[2], accept_hist[3],

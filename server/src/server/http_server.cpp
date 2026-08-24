@@ -22,6 +22,7 @@
 #include "prompt_normalize.h"
 #include "tool_hint.h"
 #include "pin_friendly_prompt.h"
+#include "common/kv_rotation.h"
 #include "common/sha1.h"
 #include "freeze_history.h"
 
@@ -1024,7 +1025,9 @@ std::vector<ChatMessage> normalize_chat_messages(
 // ─── Disk-cache identity salt ───────────────────────────────────────────
 // Compute a 16-byte salt from inputs that affect KV cache validity:
 //   model path + stat(size + mtime)  [covers rope/yarn — GGUF-derived],
-//   max_ctx, and sha1(chat_template_src).
+//   max_ctx, sha1(chat_template_src), and the effective K-rotation basis
+//   (DFLASH_KV_ROTATE resolves against the K-cache type; a cache written
+//   rotated must never be adopted by an un-rotated session or vice versa).
 // Returns all-zeroes if model_path is empty (back-compat / disk disabled).
 static std::array<uint8_t, 16> compute_disk_cache_salt(const ServerConfig & cfg) {
     std::array<uint8_t, 16> salt{};
@@ -1046,7 +1049,7 @@ static std::array<uint8_t, 16> compute_disk_cache_salt(const ServerConfig & cfg)
     uint8_t tmpl_digest[20] = {};
     sha1_hash(cfg.chat_template_src.data(), cfg.chat_template_src.size(), tmpl_digest);
 
-    // Serialization: path_len(4) + path + file_size(8) + file_mtime(8) + max_ctx(4) + tmpl_digest(20).
+    // Serialization: path_len(4) + path + file_size(8) + file_mtime(8) + max_ctx(4) + tmpl_digest(20) + k_rotated(1).
     std::vector<uint8_t> buf;
     uint32_t plen = (uint32_t)path.size();
     buf.insert(buf.end(), (uint8_t *)&plen,        (uint8_t *)&plen        + 4);
@@ -1056,6 +1059,8 @@ static std::array<uint8_t, 16> compute_disk_cache_salt(const ServerConfig & cfg)
     int32_t mc = (int32_t)cfg.max_ctx;
     buf.insert(buf.end(), (uint8_t *)&mc,          (uint8_t *)&mc          + 4);
     buf.insert(buf.end(), tmpl_digest, tmpl_digest + 20);
+    uint8_t k_rotated = dflash_kv_k_rotation_enabled(cfg.kv_cache_k) ? 1 : 0;
+    buf.push_back(k_rotated);
 
     uint8_t digest[20];
     sha1_hash(buf.data(), buf.size(), digest);

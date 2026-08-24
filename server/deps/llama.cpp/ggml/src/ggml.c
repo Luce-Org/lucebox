@@ -5891,8 +5891,9 @@ struct ggml_tensor * ggml_ssm_conv_tree(
     return result;
 }
 
-// dflash: fused conv step. Same op id as ggml_ssm_conv; op_params[0] = 1
-// marks step mode, srcs are (x, c, conv_state, conv_input_out).
+// dflash: fused conv step. Same op id as ggml_ssm_conv; op_params[0] = 2
+// marks step mode (1 is the SpecLA layout), srcs are
+// (x, c, conv_state, conv_input_out).
 struct ggml_tensor * ggml_ssm_conv_step(
         struct ggml_context * ctx,
         struct ggml_tensor  * x,

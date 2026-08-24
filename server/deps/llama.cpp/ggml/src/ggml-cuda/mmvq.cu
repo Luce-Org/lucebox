@@ -2709,7 +2709,13 @@ void ggml_cuda_mul_mat_vec_q(
     // Synthetic tensors used inside a coarse fused operator do not own a
     // persistent graph allocation. Never retain their stack address as a
     // cross-node memo key.
-    const bool use_q8_memo = luce_q8_memo_on && src1->buffer != nullptr;
+    // The multi-stream graph optimizer runs sibling matmuls that share one
+    // src1 on different streams with events only at fork and join: a memo
+    // entry filled on one stream could be read on another while the
+    // quantize kernel is still in flight. Skip the memo whenever concurrent
+    // streams are active for this evaluation.
+    const bool use_q8_memo = luce_q8_memo_on && src1->buffer != nullptr &&
+                             ctx.stream_context().concurrent_events.empty();
     if (use_q8_memo) {
         for (const auto & e : ctx.luce_q8_memo) {
             if (e.src1_node == (const void *) src1 && e.src1_data == (const void *) src1_d &&

@@ -87,7 +87,8 @@ static void print_usage(const char * prog) {
         "  --draft-ipc-work-dir <path>    Remote draft IPC scratch directory\n"
         "  --draft-ipc-ring-cap <N>       Remote draft feature ring capacity\n"
         "  --draft-block-size <N>         Dense Qwen DFlash proposal/verify width\n"
-        "                                 (2..checkpoint metadata; default: metadata)\n"
+        "                                 (2..2x checkpoint metadata, max 32; default:\n"
+        "                                 metadata. e.g. 16 on the block-8 DFlash2)\n"
         "  --draft-swa <N>                Draft sliding-window attention size (0=off; e.g.\n"
         "                                 2048 for unsloth Qwen3.6 targets, per server/README.md.\n"
         "                                 Env: DFLASH27B_DRAFT_SWA)\n"
@@ -314,7 +315,7 @@ int main(int argc, char ** argv) {
                 bargs.draft_block_size < 2 || bargs.draft_block_size > 32) {
                 std::fprintf(stderr,
                     "--draft-block-size expects an integer in [2, 32] and no "
-                    "larger than the drafter metadata, got '%s'\n",
+                    "larger than 2x the drafter's checkpoint metadata, got '%s'\n",
                     value);
                 return 2;
             }

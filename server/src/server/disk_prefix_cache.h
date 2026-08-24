@@ -76,7 +76,7 @@ int disk_prefix_cache_auto_boundary(
 
 struct DiskCacheHeader {
     char     magic[4];          // "DKVC"
-    uint32_t version;           // 1
+    uint32_t version;           // DISK_CACHE_VERSION
     uint8_t  layout_id[16];    // SHA-1 truncated: tensor structure fingerprint
     uint32_t cur_pos;
     uint32_t n_tensors;

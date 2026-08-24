@@ -230,7 +230,14 @@ bool load_draft_gguf(const std::string & path,
     // embedding silently destroys acceptance.
     {
         const uint32_t mask_meta = read_u32("dflash.mask_token_id", 0);
-        if (mask_meta != 0) out.mask_token_id = (int32_t)mask_meta;
+        if (mask_meta != 0) {
+            if (target && target->n_vocab > 0 && mask_meta >= (uint32_t)target->n_vocab) {
+                set_last_error("draft GGUF: dflash.mask_token_id outside the target vocab");
+                ggml_free(meta_ctx); out.ctx = nullptr; gguf_free(gctx);
+                return false;
+            }
+            out.mask_token_id = (int32_t)mask_meta;
+        }
     }
 
     // Upper bounds on hparams. Guards against malformed/hostile GGUFs that
@@ -576,12 +583,27 @@ bool load_draft_gguf(const std::string & path,
             }
             out.selector.rank  = sel_rank ? (int)sel_rank : (int)out.selector.hproj->ne[1];
             out.selector.top_k = (int)read_u32("dflash.dflash2.selector_top_k", 16);
+            if (out.selector.top_k <= 0 || out.selector.top_k > 256) {
+                set_last_error("draft GGUF: dflash.dflash2.selector_top_k out of range (1..256)");
+                ggml_free(meta_ctx); out.ctx = nullptr; gguf_free(gctx);
+                return false;
+            }
             char shape_err[192];
             const int64_t R = out.selector.rank;
             if (!check_shape_2d(out.selector.hproj, out.n_embd, R, "selector.hproj", shape_err, sizeof(shape_err)) ||
                 !check_shape_2d(out.selector.pred_cb, R, out.selector.pred_cb->ne[1], "selector.pred_cb", shape_err, sizeof(shape_err)) ||
                 !check_shape_2d(out.selector.succ_cb, R, out.selector.pred_cb->ne[1], "selector.succ_cb", shape_err, sizeof(shape_err))) {
                 set_last_error(shape_err);
+                ggml_free(meta_ctx); out.ctx = nullptr; gguf_free(gctx);
+                return false;
+            }
+            // Codebook rows are indexed by token ids from the TARGET lm_head
+            // top-k; a codebook narrower than the target vocab reads out of
+            // bounds on device (no GPU-side bounds check).
+            if (target && target->n_vocab > 0 &&
+                out.selector.pred_cb->ne[1] < (int64_t)target->n_vocab) {
+                set_last_error("draft GGUF: DFlash 2 selector codebook vocab is "
+                               "smaller than the target vocab");
                 ggml_free(meta_ctx); out.ctx = nullptr; gguf_free(gctx);
                 return false;
             }

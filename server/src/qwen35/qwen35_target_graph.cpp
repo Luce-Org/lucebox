@@ -37,6 +37,7 @@
 #include "qwen35_ops.h"
 #include "qwen35moe_ffn.h"
 #include "common/chain_rollback_policy.h"
+#include "common/kv_rotation.h"
 #include "common/specla_commit_cuda.h"
 #include "common/specla_mode.h"
 
@@ -172,23 +173,11 @@ bool create_target_cache_partial(const TargetWeights & w,
 
     // Graph-level FWHT K-rotation (TurboQuant-style outlier spreading with
     // standard quant types that keep fast FA kernel paths on all arches).
-    // Skip for TQ3_0 K cache — that type already applies WHT during quantization.
-    // DFLASH_KV_ROTATE=0 turns it off (two fewer launches per attention layer;
-    // with q8_0/f16 caches the rotation is precision-neutral).
-    // The rotation costs two extra launches per attention layer and is
-    // precision-neutral for the f16/q8_0 caches we serve with, so it is off by
-    // default for those and kept for the narrower types where spreading
-    // outliers actually buys accuracy. DFLASH_KV_ROTATE=1 forces it on.
-    static const int kv_rotate_env = []() {
-        const char * e = std::getenv("DFLASH_KV_ROTATE");
-        if (!e || e[0] == '\0') return -1;                  // unset: by type
-        return (e[0] == '0' && e[1] == '\0') ? 0 : 1;
-    }();
-    const bool kv_rotate_neutral =
-        kv_k_type == GGML_TYPE_F16 || kv_k_type == GGML_TYPE_Q8_0;
-    const bool kv_rotate_on = kv_rotate_env < 0 ? !kv_rotate_neutral
-                                                : kv_rotate_env != 0;
-    out.kv_k_rotated = (kv_k_type != GGML_TYPE_TQ3_0) && kv_rotate_on;
+    // The rotation costs two extra launches per attention layer. Decision
+    // logic lives in common/kv_rotation.h and is shared with the disk
+    // prefix cache identity salt: a cache written under one rotation basis
+    // must never be adopted by a session using the other.
+    out.kv_k_rotated = dflash_kv_k_rotation_enabled(ggml_type_name(kv_k_type));
 
     const bool needs_256_stride =
         kv_k_type == GGML_TYPE_TQ3_0 || kv_v_type == GGML_TYPE_TQ3_0;

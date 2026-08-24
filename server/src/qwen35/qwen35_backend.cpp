@@ -2595,6 +2595,17 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
     const int _min_floor = dflash_min_tokens_floor();
 
+    // A mid-emit override (stall-floor tool injection or budget force-close)
+    // restores the pre-step snapshot and replays the overridden prefix. When
+    // either hook is armed, plain-decode burst steps must take the snapshot
+    // too: their rollback-free fast path otherwise skips it, and the restore
+    // would copy back state up to a whole burst stale.
+    const bool replay_hooks_armed =
+        (budget_hook && !budget_hook->close_token_ids.empty()) ||
+        (_min_floor > 0 &&
+         stall_tool_prefix_tokens && !stall_tool_prefix_tokens->empty() &&
+         stall_action_suffix_tokens && !stall_action_suffix_tokens->empty());
+
     // ── DFlash spec-decode: draft → verify → accept → replay ──────────
 
     DFlashTarget * target = dflash_target();
@@ -2631,7 +2642,8 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     // this engine is tuned for, so high-acceptance completion workloads, where
     // the wide block earns its keep, are untouched.
     constexpr int kLongCtxNarrowTokens = 8192;
-    // Floor at the DFlash2 checkpoint's own published block size.
+    // Narrowing floor, chosen to match the shipped DFlash2 checkpoint's
+    // published block of 8 (clamped to q_len below for narrower checkpoints).
     constexpr int kLongCtxMinVerify = 8;
     const int q_len = dw_.block_size > 0 ? dw_.block_size : DFLASH27B_DRAFT_BLOCK_SIZE;
     // This caps the VERIFY batch only; the drafter still proposes a full q_len
@@ -2639,8 +2651,12 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     // drafter's non-causal block unwritten while its mask still makes them
     // visible to the rows we keep, and would break the fixed block_size
     // contract the IPC drafter validates against.
+    // Clamped to q_len: a checkpoint whose published block is below the
+    // narrowing floor never widens past its own block, and the accept-rate
+    // denominator (n_spec_steps * verify_cap) stays equal to the positions
+    // actually drafted.
     const int verify_cap = committed >= kLongCtxNarrowTokens
-                               ? std::max(kLongCtxMinVerify, q_len / 2)
+                               ? std::min(q_len, std::max(kLongCtxMinVerify, q_len / 2))
                                : q_len;
     if (verify_cap != q_len) {
         static std::atomic<bool> s_narrowed_logged{false};
@@ -3518,9 +3534,11 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
         // 4. Verify: snapshot KV, run target forward over draft tokens.
         //    A plain-decode step verifies only the (always accepted) seed, so
-        //    it never rolls back: skip the snapshot copy.
+        //    it never rolls back: skip the snapshot copy — unless an armed
+        //    emit-phase hook could still force a restore+replay this step.
+        const bool step_has_snapshot = !ar_step || replay_hooks_armed;
         const auto profile_snapshot_start = profile_start();
-        if (!ar_step && !target->snapshot_kv()) {
+        if (step_has_snapshot && !target->snapshot_kv()) {
             step_graph_destroy(draft_sg);
             return false;
         }
@@ -3531,9 +3549,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         if (!target->verify_batch(draft_tok, committed, verify_last_tok, &target_tok,
                                    /*capture_ssm_intermediates=*/true)) {
             std::fprintf(stderr, "spec-decode: verify failed\n");
-            // Plain-decode steps skipped the snapshot; restoring would copy
-            // back state up to a whole burst stale.
-            if (!ar_step) target->restore_kv();
+            // Only restore when this step actually took the snapshot;
+            // otherwise the copy-back would be up to a whole burst stale.
+            if (step_has_snapshot) target->restore_kv();
             step_graph_destroy(draft_sg);
             return false;
         }
@@ -3550,7 +3568,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         if (sampled_verify) {
             if (!target->read_verify_logits(v_len, verify_logits)) {
                 std::fprintf(stderr, "spec-decode: verify logits read failed\n");
-                if (!ar_step) target->restore_kv();
+                if (step_has_snapshot) target->restore_kv();
                 step_graph_destroy(draft_sg);
                 return false;
             }

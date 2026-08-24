@@ -535,8 +535,9 @@ from 143.6 tok/s (block 8) to 204.1 average with per-request peaks above 230,
 and a five-prompt math set from 129.2 to 152.6. Prose stays on block 8 (low
 acceptance pays the wider draft without commit gains). Widths past 16 measured
 a step-time cliff with no commit gain and stay rejected. The block-8
-`--specla --ddtree-budget 8` configuration remains the quality-validated
-default: 163.9 versus 159.0 aggregate decode tok/s across repeated ten-prompt
+`--specla --ddtree-budget 8` configuration is a quality-validated alternative
+(the out-of-the-box default is the plain chain at the checkpoint's block 8):
+163.9 versus 159.0 aggregate decode tok/s across repeated ten-prompt
 HumanEval runs (+3.1%), HumanEval+ pass@1 145/164 versus 143/164, with all ten
 short A/B replies and 133/164 full-suite replies byte-identical.
 
