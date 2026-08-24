@@ -420,6 +420,56 @@ static size_t balanced_braces_end(const std::string & text, size_t open) {
     return std::string::npos;
 }
 
+// Preserve syntax-error forwarding only for bodies that still have the
+// structure of a JSON object. A pair of braces around prose is not enough to
+// identify tool arguments.
+static bool looks_like_malformed_json_object(const std::string & text) {
+    if (text.size() < 2 || text.front() != '{' || text.back() != '}' ||
+        balanced_braces_end(text, 0) != text.size()) {
+        return false;
+    }
+
+    auto is_object_ws = [](char c) {
+        return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+    };
+
+    size_t i = 1;
+    while (i < text.size() && is_object_ws(text[i])) i++;
+    if (i >= text.size() - 1) return false;
+
+    const char first = text[i];
+    if (first == '"' || first == '\'' || first == '`') {
+        const char quote = first;
+        bool closed = false;
+        for (i++; i < text.size() - 1; i++) {
+            if (text[i] == '\\' && i + 1 < text.size() - 1) {
+                i++;
+                continue;
+            }
+            if (text[i] == quote) {
+                i++;
+                closed = true;
+                break;
+            }
+        }
+        if (!closed) return false;
+    } else {
+        auto is_ident_start = [](char c) {
+            return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                   c == '_';
+        };
+        auto is_ident_continue = [&](char c) {
+            return is_ident_start(c) || (c >= '0' && c <= '9') ||
+                   c == '.' || c == '-';
+        };
+        if (!is_ident_start(first)) return false;
+        while (i < text.size() - 1 && is_ident_continue(text[i])) i++;
+    }
+
+    while (i < text.size() - 1 && is_object_ws(text[i])) i++;
+    return i < text.size() - 1 && text[i] == ':';
+}
+
 // Try strict json::parse first; on failure rewrite single- and
 // backtick-quoted strings to double-quoted, wrap bare identifier keys
 // in double quotes, and retry. Returns true and populates `out` on
@@ -587,8 +637,9 @@ static bool parse_arg_string_or_obj(const json & val, json & out_args,
             }
             return false;  // reject valid scalar, array, or boolean arguments string
         }
-        // Discarded JSON: check if it has { ... } shape for syntax error tolerance (e.g. {"offset": 5o1})
-        if (!trimmed.empty() && trimmed.front() == '{' && trimmed.back() == '}') {
+        // Preserve object-shaped syntax errors (for example 5o1), but do not
+        // promote an arbitrary scalar string merely because it has braces.
+        if (looks_like_malformed_json_object(trimmed)) {
             out_args = json::object();
             return true;
         }
@@ -622,7 +673,10 @@ static bool parse_json_tool_call(const json & obj, std::string & out_name,
 
     for (const char * sub : {"function", "function_call", "tool_call"}) {
         if (obj.contains(sub) && obj[sub].is_object()) {
-            return parse_json_tool_call(obj[sub], out_name, out_args, out_raw_args);
+            if (parse_json_tool_call(
+                    obj[sub], out_name, out_args, out_raw_args)) {
+                return true;
+            }
         }
     }
 
@@ -824,37 +878,43 @@ static bool parse_function_sig_args(const std::string & arg_text, json & out_arg
 static bool extract_raw_json_tool_fallback(const std::string & text,
                                            std::string & out_name,
                                            std::string & out_raw_args) {
-    static const std::regex re_name(R"re("(?:name|function|tool)"\s*:\s*"([A-Za-z_][\w.\-]*)")re");
-    static const std::regex re_args_open(R"re("(?:arguments|parameters|args|params|input)"\s*:\s*\{)re");
+    static const std::regex re_args_open(
+        R"re("(?:arguments|parameters|args|params|input)"\s*:\s*\{)re");
+    static const char marker_key[] = "__lucebox_raw_args_marker__";
+    static const std::string marker_object =
+        std::string("{\"") + marker_key + "\":true}";
 
-    std::smatch ma;
-    if (!std::regex_search(text, ma, re_args_open)) return false;
+    // The compatibility case is malformed JSON *inside* an otherwise valid
+    // arguments object (for example 5o1 instead of 501). Replace each
+    // candidate with a marker object and let the normal structural parser
+    // select the envelope and tool name. Requiring that same marker in the
+    // selected call prevents pairing arguments from one object with the name
+    // from another, while preserving the exact malformed arguments for the
+    // client to report back to the model.
+    auto begin = std::sregex_iterator(text.begin(), text.end(), re_args_open);
+    auto end = std::sregex_iterator();
+    for (auto it = begin; it != end; ++it) {
+        const size_t brace_open = it->position() + it->length() - 1;
+        const size_t brace_close = balanced_braces_end(text, brace_open);
+        if (brace_close == std::string::npos) continue;
 
-    size_t brace_open = ma.position() + ma.length() - 1;
-    size_t brace_close = balanced_braces_end(text, brace_open);
-    if (brace_close == std::string::npos) return false;
+        std::string repaired = text;
+        repaired.replace(
+            brace_open, brace_close - brace_open, marker_object);
+        json obj = json::parse(repaired, nullptr, false);
+        if (obj.is_discarded()) continue;
 
-    // Isolate text outside the arguments object span so nested property "name" inside arguments is ignored
-    std::string prefix = text.substr(0, ma.position());
-    std::string suffix = text.substr(brace_close);
-
-    bool found_name = false;
-    auto pbegin = std::sregex_iterator(prefix.begin(), prefix.end(), re_name);
-    auto pend = std::sregex_iterator();
-    for (auto it = pbegin; it != pend; ++it) {
-        out_name = (*it)[1].str();
-        found_name = true;
-    }
-    if (!found_name) {
-        std::smatch mn;
-        if (std::regex_search(suffix, mn, re_name)) {
-            out_name = mn[1].str();
-            found_name = true;
+        std::string name;
+        json args;
+        if (!parse_json_tool_call(obj, name, args)) continue;
+        if (!args.is_object() || args.size() != 1 ||
+            !args.value(marker_key, false)) {
+            continue;
         }
-    }
 
-    if (found_name && !out_name.empty()) {
-        out_raw_args = text.substr(brace_open, brace_close - brace_open);
+        out_name = std::move(name);
+        out_raw_args = text.substr(
+            brace_open, brace_close - brace_open);
         return true;
     }
     return false;
@@ -866,6 +926,21 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
     ToolParseResult result;
     std::vector<Span> removals;
     std::vector<std::pair<size_t, ToolCall>> positioned_calls;
+
+    // JSON lines may be siblings of invoke envelopes, but JSON nested inside
+    // an invoke always belongs to that envelope. Track all invoke spans,
+    // including malformed or disallowed ones, so no later JSON sweep can
+    // reinterpret their bodies as independent calls.
+    static const std::regex re_invoke_span(
+        R"(<invoke(?:\s[^>]*)?>[\s\S]*?</invoke\s*>)");
+    std::vector<Span> invoke_spans;
+    auto invoke_begin = std::sregex_iterator(
+        text.begin(), text.end(), re_invoke_span);
+    auto invoke_end = std::sregex_iterator();
+    for (auto it = invoke_begin; it != invoke_end; ++it) {
+        const size_t start = it->position();
+        invoke_spans.push_back({start, start + it->length()});
+    }
 
     auto add_call = [&](const std::string & fn_name, const json & args,
                         size_t start, size_t end,
@@ -1264,7 +1339,7 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
                             }
                         }
                         raw_args = args.dump();
-                    } else if (body.back() == '}') {
+                    } else if (looks_like_malformed_json_object(body)) {
                         raw_args = body;
                     } else {
                         continue;
@@ -1285,7 +1360,9 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
                         found_param = true;
                         cursor = ppos + pit->length();
                     }
-                    if (!valid_body || !found_param || !trim_ws(body.substr(cursor)).empty()) continue;
+                    if (!valid_body) continue;
+                    if (!found_param && !trim_ws(body).empty()) continue;
+                    if (!trim_ws(body.substr(cursor)).empty()) continue;
                 }
                 size_t istart = inner_start + it->position();
                 size_t iend = istart + it->length();
@@ -1297,12 +1374,12 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
             while (cursor < block_content.size()) {
                 size_t s = block_content.find('{', cursor);
                 if (s == std::string::npos) break;
-                size_t abs_s = inner_start + s;
+                const size_t abs_s = inner_start + s;
                 bool inside_invoke = false;
-                for (const auto & bc : block_calls) {
-                    if (abs_s >= bc.start && abs_s < bc.end) {
+                for (const auto & span : invoke_spans) {
+                    if (abs_s >= span.start && abs_s < span.end) {
                         inside_invoke = true;
-                        cursor = bc.end - inner_start;
+                        cursor = span.end - inner_start;
                         break;
                     }
                 }
@@ -1397,7 +1474,7 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
         while (cursor < text.size()) {
             size_t start = text.find('{', cursor);
             if (start == std::string::npos) break;
-            if (overlaps(removals, start)) {
+            if (overlaps(removals, start) || overlaps(invoke_spans, start)) {
                 cursor = start + 1;
                 continue;
             }

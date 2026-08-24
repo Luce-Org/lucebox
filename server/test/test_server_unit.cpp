@@ -6124,6 +6124,53 @@ TEST_CASE(ServerUnitFixture, test_parse_function_calls_sibling_invokes_partial_f
     TEST_ASSERT(result.cleaned_text.find("malformed parameter text") != std::string::npos);
 }
 
+TEST_CASE(ServerUnitFixture, test_parse_function_calls_rejected_invokes_do_not_expose_nested_json) {
+    const std::string disallowed =
+        "<function_calls>"
+        "<invoke name=\"forbidden\">"
+        "{\"name\":\"read\",\"arguments\":{\"path\":\"secret\"}}"
+        "</invoke>"
+        "</function_calls>";
+    auto disallowed_result = parse_tool_calls(disallowed, read_tools());
+    TEST_ASSERT(disallowed_result.tool_calls.empty());
+    TEST_ASSERT(disallowed_result.cleaned_text == disallowed);
+
+    const std::string malformed =
+        "<function_calls>"
+        "<invoke>"
+        "{\"name\":\"read\",\"arguments\":{\"path\":\"secret\"}}"
+        "</invoke>"
+        "</function_calls>";
+    auto malformed_result = parse_tool_calls(malformed, read_tools());
+    TEST_ASSERT(malformed_result.tool_calls.empty());
+    TEST_ASSERT(malformed_result.cleaned_text == malformed);
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_function_calls_invoke_rejects_braced_prose) {
+    const std::string text =
+        "<function_calls>"
+        "<invoke name=\"read\">{this is prose}</invoke>"
+        "</function_calls>";
+
+    auto result = parse_tool_calls(text, read_tools());
+    TEST_ASSERT(result.tool_calls.empty());
+    TEST_ASSERT(result.cleaned_text == text);
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_function_calls_invoke_keeps_structured_json_syntax_errors) {
+    const std::string text =
+        "<function_calls>"
+        "<invoke name=\"read\">{\"offset\":5o1}</invoke>"
+        "</function_calls>";
+
+    auto result = parse_tool_calls(text, read_tools());
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "read");
+        TEST_ASSERT(result.tool_calls[0].arguments == "{\"offset\":5o1}");
+    }
+}
+
 TEST_CASE(ServerUnitFixture, test_parse_json_syntax_error_forwarding) {
     std::string text = "<function_call>{\"name\": \"read\", \"arguments\": {\"offset\": 5o1}}</function_call>";
     auto result = parse_tool_calls(text, read_tools());
@@ -6178,6 +6225,18 @@ TEST_CASE(ServerUnitFixture, test_emitter_streaming_malformed_tool_in_think_reco
     TEST_ASSERT(text.find("\"type\":\"thinking_delta\"") != std::string::npos);
     TEST_ASSERT(text.find("\"type\":\"text_delta\"") != std::string::npos);
     TEST_ASSERT(text.find("Here is the final answer.") != std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_streaming_malformed_tool_apostrophe_recovers_answer) {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, read_tools(), true);
+    em.emit_start();
+    em.emit_token(
+        "<think>Inspect <tool_call>it's malformed</tool_call></think>Recovered answer.");
+    em.emit_finish(10, nullptr, -1);
+
+    TEST_ASSERT(em.tool_calls().empty());
+    TEST_ASSERT(em.reasoning_text().find("it's malformed") == std::string::npos);
+    TEST_ASSERT(em.accumulated_text() == "Recovered answer.");
 }
 
 TEST_CASE(ServerUnitFixture, test_emitter_streaming_malformed_tool_in_think_without_think_close_suppressed) {
@@ -6258,6 +6317,26 @@ TEST_CASE(ServerUnitFixture, test_parse_tool_call_rejects_empty_name_and_scalar_
     auto res_array = parse_tool_calls(array_arg, read_tools());
     TEST_ASSERT(res_array.tool_calls.empty());
 
+    // A scalar string wrapped in braces is still prose, not object arguments.
+    const std::string braced_prose =
+        "<function_call>\n"
+        "{\"name\": \"read\", \"arguments\": \"{this is prose}\"}\n"
+        "</function_call>";
+    auto res_braced_prose = parse_tool_calls(braced_prose, read_tools());
+    TEST_ASSERT(res_braced_prose.tool_calls.empty());
+
+    // Keep forwarding a structurally object-like string with a JSON syntax
+    // error so the client can report the exact bad arguments to the model.
+    const std::string bad_obj_string =
+        "<function_call>\n"
+        "{\"name\": \"read\", \"arguments\": \"{\\\"offset\\\": 5o1}\"}\n"
+        "</function_call>";
+    auto res_bad_obj_string = parse_tool_calls(bad_obj_string, read_tools());
+    TEST_ASSERT(res_bad_obj_string.tool_calls.size() == 1);
+    if (!res_bad_obj_string.tool_calls.empty()) {
+        TEST_ASSERT(res_bad_obj_string.tool_calls[0].arguments == "{\"offset\": 5o1}");
+    }
+
     // Malformed JSON object syntax (e.g. 5o1) is forwarded as raw args
     const std::string bad_obj =
         "<function_call>\n{\"name\": \"read\", \"arguments\": {\"path\": \"/tmp/test\", \"offset\": 5o1}}\n</function_call>";
@@ -6295,6 +6374,82 @@ TEST_CASE(ServerUnitFixture, test_extract_raw_json_tool_fallback_with_nested_nam
     }
 }
 
+TEST_CASE(ServerUnitFixture, test_extract_raw_json_tool_fallback_ignores_nested_metadata_name) {
+    const std::string text =
+        "<function_call>"
+        "{\"function\":{\"name\":\"bash\",\"metadata\":{\"name\":\"read\"},"
+        "\"arguments\":{\"command\":\"pwd\",\"offset\":5o1}}}"
+        "</function_call>";
+
+    auto res = parse_tool_calls(text, read_and_bash_tools());
+    TEST_ASSERT(res.tool_calls.size() == 1);
+    if (!res.tool_calls.empty()) {
+        TEST_ASSERT(res.tool_calls[0].name == "bash");
+        TEST_ASSERT(res.tool_calls[0].arguments.find("5o1") != std::string::npos);
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_raw_json_fallback_does_not_cross_tool_envelopes) {
+    const std::string text =
+        "{\"metadata\":{\"arguments\":{\"offset\":5o1}},"
+        "\"tool_call\":{\"name\":\"read\",\"arguments\":{\"path\":\"x\"}}}";
+
+    auto res = parse_tool_calls(text, read_and_bash_tools());
+    TEST_ASSERT(res.tool_calls.size() == 1);
+    if (!res.tool_calls.empty()) {
+        TEST_ASSERT(res.tool_calls[0].name == "read");
+        const json args = json::parse(res.tool_calls[0].arguments);
+        TEST_ASSERT(args["path"] == "x");
+        TEST_ASSERT(!args.contains("offset"));
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_json_tool_call_checks_later_envelope_siblings) {
+    const std::string text =
+        "{\"function\":{\"metadata\":true},"
+        "\"tool_call\":{\"name\":\"read\",\"arguments\":{\"path\":\"x\"}}}";
+
+    auto res = parse_tool_calls(text, read_and_bash_tools());
+    TEST_ASSERT(res.tool_calls.size() == 1);
+    if (!res.tool_calls.empty()) {
+        TEST_ASSERT(res.tool_calls[0].name == "read");
+        TEST_ASSERT(json::parse(res.tool_calls[0].arguments)["path"] == "x");
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_prose_ending_in_tool_name_stays_content) {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, read_tools());
+    em.emit_start();
+    em.emit_token("I cannot read");
+    em.emit_finish(3);
+
+    TEST_ASSERT(em.tool_calls().empty());
+    TEST_ASSERT(em.accumulated_text() == "I cannot read");
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_tool_only_bare_name_remains_zero_arg_call) {
+    json tools = json::array({
+        {
+            {"type", "function"},
+            {"function", {
+                {"name", "ping"},
+                {"parameters", {{"type", "object"}, {"properties", json::object()}}}
+            }}
+        }
+    });
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, tools);
+    em.emit_start();
+    em.emit_token("ping");
+    em.emit_finish(1);
+
+    TEST_ASSERT(em.tool_calls().size() == 1);
+    if (!em.tool_calls().empty()) {
+        TEST_ASSERT(em.tool_calls()[0].name == "ping");
+        TEST_ASSERT(em.tool_calls()[0].arguments == "{}");
+    }
+    TEST_ASSERT(em.accumulated_text().empty());
+}
+
 TEST_CASE(ServerUnitFixture, test_parse_function_calls_mixed_invoke_and_json_line_siblings) {
     const std::string text =
         "Processing files:\n"
@@ -6320,18 +6475,52 @@ TEST_CASE(ServerUnitFixture, test_parse_function_calls_mixed_invoke_and_json_lin
 }
 
 TEST_CASE(ServerUnitFixture, test_build_response_suppresses_length_finish_reason_on_eos) {
-    // When generation finishes on EOS, emitter finish_reason is called with generation_cap=-1 (suppressed cap)
+    // EOS wins even when it lands exactly on the configured token cap.
     auto em_openai = make_emitter(ApiFormat::OPENAI_CHAT);
     em_openai.emit_start();
     em_openai.emit_token("Hello world");
-    auto chunks_openai = em_openai.emit_finish(3, nullptr, -1);
+    auto chunks_openai = em_openai.emit_finish(3, nullptr, 3, true);
     TEST_ASSERT(em_openai.finish_reason() == "stop");
 
     auto em_anthropic = make_emitter(ApiFormat::ANTHROPIC);
     em_anthropic.emit_start();
     em_anthropic.emit_token("Hello world");
-    auto chunks_anthropic = em_anthropic.emit_finish(3, nullptr, -1);
+    auto chunks_anthropic = em_anthropic.emit_finish(3, nullptr, 3, true);
     TEST_ASSERT(em_anthropic.finish_reason() == "stop");
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_function_calls_empty_invoke_zero_args) {
+    json tools = json::array({
+        {
+            {"type", "function"},
+            {"function", {
+                {"name", "get_version"},
+                {"description", "get version"},
+                {"parameters", {{"type", "object"}, {"properties", json::object()}}}
+            }}
+        }
+    });
+
+    const std::string text =
+        "<function_calls>\n"
+        "  <invoke name=\"get_version\"></invoke>\n"
+        "</function_calls>";
+
+    auto res = parse_tool_calls(text, tools);
+    TEST_ASSERT(res.tool_calls.size() == 1);
+    if (!res.tool_calls.empty()) {
+        TEST_ASSERT(res.tool_calls[0].name == "get_version");
+        TEST_ASSERT(res.tool_calls[0].arguments == "{}");
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_streaming_malformed_tool_in_think_answer_containing_close_tag_recovers_answer) {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, read_tools(), true);
+    em.emit_start();
+    em.emit_token("<think><tool_call><bad_param></tool_call></think>The output is </parameter> end.");
+    auto chunks = em.emit_finish(10, nullptr, -1);
+    TEST_ASSERT(em.tool_calls().empty());
+    TEST_ASSERT(em.accumulated_text() == "The output is </parameter> end.");
 }
 
 TEST_CASE(ServerUnitFixture, test_escape_for_logging) {
@@ -6348,29 +6537,35 @@ TEST_CASE(ServerUnitFixture, test_escape_for_logging) {
 namespace {
 struct StderrCapture {
     int old_stderr = -1;
-    int pipefd[2] = {-1, -1};
+    std::FILE * file = nullptr;
 
     StderrCapture() {
-        if (pipe(pipefd) == 0) {
-            old_stderr = dup(STDERR_FILENO);
-            dup2(pipefd[1], STDERR_FILENO);
-            close(pipefd[1]);
-            pipefd[1] = -1;
+        std::fflush(stderr);
+        file = std::tmpfile();
+        if (file == nullptr) return;
+
+        old_stderr = dup(STDERR_FILENO);
+        if (old_stderr == -1 || dup2(fileno(file), STDERR_FILENO) == -1) {
+            if (old_stderr != -1) close(old_stderr);
+            old_stderr = -1;
+            std::fclose(file);
+            file = nullptr;
         }
     }
 
     std::string str() {
         restore();
-        if (pipefd[0] == -1) return "";
+        if (file == nullptr) return "";
+
+        std::rewind(file);
         std::string out;
         char buf[1024];
-        ssize_t n = 0;
-        while ((n = read(pipefd[0], buf, sizeof(buf))) > 0) {
+        size_t n = 0;
+        while ((n = std::fread(buf, 1, sizeof(buf), file)) > 0) {
             out.append(buf, n);
-            if (n < (ssize_t)sizeof(buf)) break;
         }
-        close(pipefd[0]);
-        pipefd[0] = -1;
+        std::fclose(file);
+        file = nullptr;
         return out;
     }
 
@@ -6385,8 +6580,7 @@ struct StderrCapture {
 
     ~StderrCapture() {
         restore();
-        if (pipefd[0] != -1) close(pipefd[0]);
-        if (pipefd[1] != -1) close(pipefd[1]);
+        if (file != nullptr) std::fclose(file);
     }
 };
 }  // namespace

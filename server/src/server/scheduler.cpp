@@ -282,8 +282,12 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 }
             }
         } else if (req.stream && !s.client_disconnected) {
+            const bool is_eos = !s.gen_tokens.empty() &&
+                engine.token_is_eos(s.gen_tokens.back());
             auto final_chunks =
-                s.emitter->emit_finish(s.completion_tokens, &gen_timings, s.n_gen_cap);
+                s.emitter->emit_finish(
+                    s.completion_tokens, &gen_timings,
+                    s.n_gen_cap, is_eos);
             for (const auto & chunk : final_chunks) {
                 s.send_buffer.append(chunk);
             }
