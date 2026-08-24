@@ -4,6 +4,7 @@
 #include "delta_net_specla.h"
 
 #include "ggml-alloc.h"
+#include "graph_sizing.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -495,7 +496,9 @@ bool build_target_step(
         ggml_set_input(sg.logits_row_indices);
     }
 
-    sg.gf = ggml_new_graph_custom(sg.ctx, 16384, false);
+    const size_t graph_capacity = qwen35_target_graph_capacity(
+        n_prefill_segments, compact_slots);
+    sg.gf = ggml_new_graph_custom(sg.ctx, graph_capacity, false);
 
     // Step-invariant KV write: only when topology can't vary per step.
     // DFLASH_QWEN35_NO_KVPAD=1 restores the legacy cpy append + exact-length

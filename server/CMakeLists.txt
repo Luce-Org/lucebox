@@ -1117,6 +1117,13 @@ if(DFLASH27B_TESTS)
         target_link_libraries(test_qwen35_roctx PRIVATE ${CMAKE_DL_LIBS})
         list(APPEND _raw_unit_test_targets test_qwen35_roctx)
     endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_qwen35_graph_sizing.cpp")
+        add_executable(test_qwen35_graph_sizing
+            test/test_qwen35_graph_sizing.cpp)
+        target_include_directories(test_qwen35_graph_sizing PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        list(APPEND _raw_unit_test_targets test_qwen35_graph_sizing)
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ggml_rmsnorm_batch.cpp")
         add_executable(test_ggml_rmsnorm_batch test/test_ggml_rmsnorm_batch.cpp)
         target_include_directories(test_ggml_rmsnorm_batch PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
