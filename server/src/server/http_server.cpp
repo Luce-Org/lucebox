@@ -3806,7 +3806,10 @@ void HttpServer::send_nonstream_response(
         ClientSendBuffer * send_buffer) {
     CompletionTokenCounts counts;
     counts.total = (int) gen_tokens.size();
-    emitter.emit_finish(counts.total, nullptr, n_gen_cap);
+    const bool is_eos = !gen_tokens.empty() &&
+        (gen_tokens.back() == tokenizer_.eos_id() ||
+         gen_tokens.back() == tokenizer_.eos_chat_id());
+    emitter.emit_finish(counts.total, nullptr, n_gen_cap, is_eos);
     const int first_content = emitter.first_content_token_index();
     const int emitted = emitter.emit_token_count();
     counts.reasoning = first_content < 0 ? emitted : first_content;
@@ -4093,7 +4096,7 @@ void HttpServer::process_job(ServerJob * job) {
          result.tokens.back() == tokenizer_.eos_chat_id());
     if (req.stream && !client_disconnected) {
         auto final_chunks = emitter.emit_finish(
-            completion_tokens, &gen_timings, is_eos ? -1 : n_gen_cap);
+            completion_tokens, &gen_timings, n_gen_cap, is_eos);
         remember_agent_turn(
             req, prepared, cache, result, emitter, completion_tokens,
             visible_output_seen, client_disconnected,

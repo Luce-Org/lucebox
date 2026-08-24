@@ -6295,6 +6295,82 @@ TEST_CASE(ServerUnitFixture, test_extract_raw_json_tool_fallback_with_nested_nam
     }
 }
 
+TEST_CASE(ServerUnitFixture, test_extract_raw_json_tool_fallback_ignores_nested_metadata_name) {
+    const std::string text =
+        "<function_call>"
+        "{\"function\":{\"name\":\"bash\",\"metadata\":{\"name\":\"read\"},"
+        "\"arguments\":{\"command\":\"pwd\",\"offset\":5o1}}}"
+        "</function_call>";
+
+    auto res = parse_tool_calls(text, read_and_bash_tools());
+    TEST_ASSERT(res.tool_calls.size() == 1);
+    if (!res.tool_calls.empty()) {
+        TEST_ASSERT(res.tool_calls[0].name == "bash");
+        TEST_ASSERT(res.tool_calls[0].arguments.find("5o1") != std::string::npos);
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_raw_json_fallback_does_not_cross_tool_envelopes) {
+    const std::string text =
+        "{\"metadata\":{\"arguments\":{\"offset\":5o1}},"
+        "\"tool_call\":{\"name\":\"read\",\"arguments\":{\"path\":\"x\"}}}";
+
+    auto res = parse_tool_calls(text, read_and_bash_tools());
+    TEST_ASSERT(res.tool_calls.size() == 1);
+    if (!res.tool_calls.empty()) {
+        TEST_ASSERT(res.tool_calls[0].name == "read");
+        const json args = json::parse(res.tool_calls[0].arguments);
+        TEST_ASSERT(args["path"] == "x");
+        TEST_ASSERT(!args.contains("offset"));
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_json_tool_call_checks_later_envelope_siblings) {
+    const std::string text =
+        "{\"function\":{\"metadata\":true},"
+        "\"tool_call\":{\"name\":\"read\",\"arguments\":{\"path\":\"x\"}}}";
+
+    auto res = parse_tool_calls(text, read_and_bash_tools());
+    TEST_ASSERT(res.tool_calls.size() == 1);
+    if (!res.tool_calls.empty()) {
+        TEST_ASSERT(res.tool_calls[0].name == "read");
+        TEST_ASSERT(json::parse(res.tool_calls[0].arguments)["path"] == "x");
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_prose_ending_in_tool_name_stays_content) {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, read_tools());
+    em.emit_start();
+    em.emit_token("I cannot read");
+    em.emit_finish(3);
+
+    TEST_ASSERT(em.tool_calls().empty());
+    TEST_ASSERT(em.accumulated_text() == "I cannot read");
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_tool_only_bare_name_remains_zero_arg_call) {
+    json tools = json::array({
+        {
+            {"type", "function"},
+            {"function", {
+                {"name", "ping"},
+                {"parameters", {{"type", "object"}, {"properties", json::object()}}}
+            }}
+        }
+    });
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, tools);
+    em.emit_start();
+    em.emit_token("ping");
+    em.emit_finish(1);
+
+    TEST_ASSERT(em.tool_calls().size() == 1);
+    if (!em.tool_calls().empty()) {
+        TEST_ASSERT(em.tool_calls()[0].name == "ping");
+        TEST_ASSERT(em.tool_calls()[0].arguments == "{}");
+    }
+    TEST_ASSERT(em.accumulated_text().empty());
+}
+
 TEST_CASE(ServerUnitFixture, test_parse_function_calls_mixed_invoke_and_json_line_siblings) {
     const std::string text =
         "Processing files:\n"
@@ -6320,17 +6396,17 @@ TEST_CASE(ServerUnitFixture, test_parse_function_calls_mixed_invoke_and_json_lin
 }
 
 TEST_CASE(ServerUnitFixture, test_build_response_suppresses_length_finish_reason_on_eos) {
-    // When generation finishes on EOS, emitter finish_reason is called with generation_cap=-1 (suppressed cap)
+    // EOS wins even when it lands exactly on the configured token cap.
     auto em_openai = make_emitter(ApiFormat::OPENAI_CHAT);
     em_openai.emit_start();
     em_openai.emit_token("Hello world");
-    auto chunks_openai = em_openai.emit_finish(3, nullptr, -1);
+    auto chunks_openai = em_openai.emit_finish(3, nullptr, 3, true);
     TEST_ASSERT(em_openai.finish_reason() == "stop");
 
     auto em_anthropic = make_emitter(ApiFormat::ANTHROPIC);
     em_anthropic.emit_start();
     em_anthropic.emit_token("Hello world");
-    auto chunks_anthropic = em_anthropic.emit_finish(3, nullptr, -1);
+    auto chunks_anthropic = em_anthropic.emit_finish(3, nullptr, 3, true);
     TEST_ASSERT(em_anthropic.finish_reason() == "stop");
 }
 
@@ -6367,5 +6443,3 @@ TEST_CASE(ServerUnitFixture, test_emitter_streaming_malformed_tool_in_think_answ
     TEST_ASSERT(em.tool_calls().empty());
     TEST_ASSERT(em.accumulated_text() == "The output is </parameter> end.");
 }
-
-

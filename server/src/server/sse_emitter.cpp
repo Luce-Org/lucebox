@@ -639,7 +639,8 @@ static size_t find_top_level_think_close(const std::string & buf, const json & t
 
 std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
                                                  const GenTimings * timings,
-                                                 int generation_cap) {
+                                                 int generation_cap,
+                                                 bool ended_on_eos) {
     std::vector<std::string> out;
 
     // A tail still pending at end-of-stream is a genuinely truncated
@@ -657,31 +658,31 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
         emit_reasoning_delta(out, window_);
     } else if (mode_ == StreamMode::CONTENT && !window_.empty()) {
         // Zero-argument Laguna calls in the stripped form are just the bare
-        // declared tool name at end of output (the <tool_call> wrapper is
-        // special tokens the detokenizer removed, and with no <arg_key> there
-        // is no trigger). If the output ENDS on exactly a declared tool name,
-        // treat it as a zero-arg call instead of trailing prose.
+        // declared tool name (the <tool_call> wrapper is special tokens the
+        // detokenizer removed, and with no <arg_key> there is no trigger).
+        // Only accept a tool-only content section: matching the final word of
+        // ordinary prose would turn text such as "I cannot read" into a call.
         bool zero_arg_call = false;
-        if (has_request_tools(tools_)) {
-            auto is_ident = [](char c) {
-                return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                       (c >= '0' && c <= '9') || c == '_' || c == '-';
-            };
-            size_t name_start = window_.size();
-            while (name_start > 0 && is_ident(window_[name_start - 1])) name_start--;
-            const std::string tail = window_.substr(name_start);
-            if (!tail.empty()) {
+        const char * ws = " \t\r\n";
+        const bool prior_content_is_whitespace =
+            accumulated_content_.find_first_not_of(ws) == std::string::npos;
+        const size_t name_start = window_.find_first_not_of(ws);
+        if (has_request_tools(tools_) && prior_content_is_whitespace &&
+            name_start != std::string::npos) {
+            const size_t name_end = window_.find_last_not_of(ws);
+            const std::string candidate =
+                window_.substr(name_start, name_end - name_start + 1);
+            if (!candidate.empty()) {
                 for (const auto & t : tools_) {
-                    if (t.contains("function") && t["function"].value("name", "") == tail) {
-                        std::string pre = window_.substr(0, name_start);
-                        if (!pre.empty()) {
-                            accumulated_content_ += pre;
-                            emit_content_delta(out, pre);
-                        }
+                    const auto & fn = t.contains("function")
+                        ? t["function"] : t;
+                    if (fn.is_object() &&
+                        fn.value("name", "") == candidate) {
                         // Re-wrap in the canonical form the parser's wrapped
                         // path accepts (it emits name-only bodies as
                         // zero-argument calls).
-                        tool_buffer_ = "<tool_call>" + tail + "</tool_call>";
+                        tool_buffer_ =
+                            "<tool_call>" + candidate + "</tool_call>";
                         mode_ = StreamMode::TOOL_BUFFER;
                         zero_arg_call = true;
                         break;
@@ -845,7 +846,8 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
         }
     }
 
-    if (fr == "stop" && !stop_hit_ && generation_cap >= 0 && completion_tokens >= generation_cap) {
+    if (fr == "stop" && !stop_hit_ && !ended_on_eos &&
+        generation_cap >= 0 && completion_tokens >= generation_cap) {
         fr = "length";
     }
     finish_reason_ = fr;
