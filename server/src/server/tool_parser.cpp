@@ -420,6 +420,56 @@ static size_t balanced_braces_end(const std::string & text, size_t open) {
     return std::string::npos;
 }
 
+// Preserve syntax-error forwarding only for bodies that still have the
+// structure of a JSON object. A pair of braces around prose is not enough to
+// identify tool arguments.
+static bool looks_like_malformed_json_object(const std::string & text) {
+    if (text.size() < 2 || text.front() != '{' || text.back() != '}' ||
+        balanced_braces_end(text, 0) != text.size()) {
+        return false;
+    }
+
+    auto is_object_ws = [](char c) {
+        return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+    };
+
+    size_t i = 1;
+    while (i < text.size() && is_object_ws(text[i])) i++;
+    if (i >= text.size() - 1) return false;
+
+    const char first = text[i];
+    if (first == '"' || first == '\'' || first == '`') {
+        const char quote = first;
+        bool closed = false;
+        for (i++; i < text.size() - 1; i++) {
+            if (text[i] == '\\' && i + 1 < text.size() - 1) {
+                i++;
+                continue;
+            }
+            if (text[i] == quote) {
+                i++;
+                closed = true;
+                break;
+            }
+        }
+        if (!closed) return false;
+    } else {
+        auto is_ident_start = [](char c) {
+            return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                   c == '_';
+        };
+        auto is_ident_continue = [&](char c) {
+            return is_ident_start(c) || (c >= '0' && c <= '9') ||
+                   c == '.' || c == '-';
+        };
+        if (!is_ident_start(first)) return false;
+        while (i < text.size() - 1 && is_ident_continue(text[i])) i++;
+    }
+
+    while (i < text.size() - 1 && is_object_ws(text[i])) i++;
+    return i < text.size() - 1 && text[i] == ':';
+}
+
 // Try strict json::parse first; on failure rewrite single- and
 // backtick-quoted strings to double-quoted, wrap bare identifier keys
 // in double quotes, and retry. Returns true and populates `out` on
@@ -876,6 +926,21 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
     std::vector<Span> removals;
     std::vector<std::pair<size_t, ToolCall>> positioned_calls;
 
+    // JSON lines may be siblings of invoke envelopes, but JSON nested inside
+    // an invoke always belongs to that envelope. Track all invoke spans,
+    // including malformed or disallowed ones, so no later JSON sweep can
+    // reinterpret their bodies as independent calls.
+    static const std::regex re_invoke_span(
+        R"(<invoke(?:\s[^>]*)?>[\s\S]*?</invoke\s*>)");
+    std::vector<Span> invoke_spans;
+    auto invoke_begin = std::sregex_iterator(
+        text.begin(), text.end(), re_invoke_span);
+    auto invoke_end = std::sregex_iterator();
+    for (auto it = invoke_begin; it != invoke_end; ++it) {
+        const size_t start = it->position();
+        invoke_spans.push_back({start, start + it->length()});
+    }
+
     auto add_call = [&](const std::string & fn_name, const json & args,
                         size_t start, size_t end,
                         const std::string & raw_args = "") {
@@ -1273,7 +1338,7 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
                             }
                         }
                         raw_args = args.dump();
-                    } else if (body.back() == '}') {
+                    } else if (looks_like_malformed_json_object(body)) {
                         raw_args = body;
                     } else {
                         continue;
@@ -1308,12 +1373,12 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
             while (cursor < block_content.size()) {
                 size_t s = block_content.find('{', cursor);
                 if (s == std::string::npos) break;
-                size_t abs_s = inner_start + s;
+                const size_t abs_s = inner_start + s;
                 bool inside_invoke = false;
-                for (const auto & bc : block_calls) {
-                    if (abs_s >= bc.start && abs_s < bc.end) {
+                for (const auto & span : invoke_spans) {
+                    if (abs_s >= span.start && abs_s < span.end) {
                         inside_invoke = true;
-                        cursor = bc.end - inner_start;
+                        cursor = span.end - inner_start;
                         break;
                     }
                 }
@@ -1408,7 +1473,7 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
         while (cursor < text.size()) {
             size_t start = text.find('{', cursor);
             if (start == std::string::npos) break;
-            if (overlaps(removals, start)) {
+            if (overlaps(removals, start) || overlaps(invoke_spans, start)) {
                 cursor = start + 1;
                 continue;
             }

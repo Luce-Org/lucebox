@@ -551,6 +551,11 @@ static size_t find_top_level_think_close(const std::string & buf, const json & t
     bool in_double_quote = false;
     std::vector<std::string> open_tags;
 
+    auto is_word_char = [](char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+               (c >= '0' && c <= '9') || c == '_';
+    };
+
     auto is_tool_tag = [&](const std::string & name) {
         if (name == "tool_call" || name == "function_call" ||
             name == "function_calls" || name == "function" ||
@@ -576,7 +581,12 @@ static size_t find_top_level_think_close(const std::string & buf, const json & t
             continue;
         }
         if (buf[i] == '\'' && !in_double_quote) {
-            in_single_quote = !in_single_quote;
+            const bool apostrophe_in_word =
+                i > 0 && i + 1 < buf.size() &&
+                is_word_char(buf[i - 1]) && is_word_char(buf[i + 1]);
+            if (!apostrophe_in_word) {
+                in_single_quote = !in_single_quote;
+            }
             i++;
             continue;
         }

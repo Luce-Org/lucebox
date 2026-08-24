@@ -6124,6 +6124,53 @@ TEST_CASE(ServerUnitFixture, test_parse_function_calls_sibling_invokes_partial_f
     TEST_ASSERT(result.cleaned_text.find("malformed parameter text") != std::string::npos);
 }
 
+TEST_CASE(ServerUnitFixture, test_parse_function_calls_rejected_invokes_do_not_expose_nested_json) {
+    const std::string disallowed =
+        "<function_calls>"
+        "<invoke name=\"forbidden\">"
+        "{\"name\":\"read\",\"arguments\":{\"path\":\"secret\"}}"
+        "</invoke>"
+        "</function_calls>";
+    auto disallowed_result = parse_tool_calls(disallowed, read_tools());
+    TEST_ASSERT(disallowed_result.tool_calls.empty());
+    TEST_ASSERT(disallowed_result.cleaned_text == disallowed);
+
+    const std::string malformed =
+        "<function_calls>"
+        "<invoke>"
+        "{\"name\":\"read\",\"arguments\":{\"path\":\"secret\"}}"
+        "</invoke>"
+        "</function_calls>";
+    auto malformed_result = parse_tool_calls(malformed, read_tools());
+    TEST_ASSERT(malformed_result.tool_calls.empty());
+    TEST_ASSERT(malformed_result.cleaned_text == malformed);
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_function_calls_invoke_rejects_braced_prose) {
+    const std::string text =
+        "<function_calls>"
+        "<invoke name=\"read\">{this is prose}</invoke>"
+        "</function_calls>";
+
+    auto result = parse_tool_calls(text, read_tools());
+    TEST_ASSERT(result.tool_calls.empty());
+    TEST_ASSERT(result.cleaned_text == text);
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_function_calls_invoke_keeps_structured_json_syntax_errors) {
+    const std::string text =
+        "<function_calls>"
+        "<invoke name=\"read\">{\"offset\":5o1}</invoke>"
+        "</function_calls>";
+
+    auto result = parse_tool_calls(text, read_tools());
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "read");
+        TEST_ASSERT(result.tool_calls[0].arguments == "{\"offset\":5o1}");
+    }
+}
+
 TEST_CASE(ServerUnitFixture, test_parse_json_syntax_error_forwarding) {
     std::string text = "<function_call>{\"name\": \"read\", \"arguments\": {\"offset\": 5o1}}</function_call>";
     auto result = parse_tool_calls(text, read_tools());
@@ -6178,6 +6225,18 @@ TEST_CASE(ServerUnitFixture, test_emitter_streaming_malformed_tool_in_think_reco
     TEST_ASSERT(text.find("\"type\":\"thinking_delta\"") != std::string::npos);
     TEST_ASSERT(text.find("\"type\":\"text_delta\"") != std::string::npos);
     TEST_ASSERT(text.find("Here is the final answer.") != std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_streaming_malformed_tool_apostrophe_recovers_answer) {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, read_tools(), true);
+    em.emit_start();
+    em.emit_token(
+        "<think>Inspect <tool_call>it's malformed</tool_call></think>Recovered answer.");
+    em.emit_finish(10, nullptr, -1);
+
+    TEST_ASSERT(em.tool_calls().empty());
+    TEST_ASSERT(em.reasoning_text().find("it's malformed") == std::string::npos);
+    TEST_ASSERT(em.accumulated_text() == "Recovered answer.");
 }
 
 TEST_CASE(ServerUnitFixture, test_emitter_streaming_malformed_tool_in_think_without_think_close_suppressed) {
