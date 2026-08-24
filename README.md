@@ -70,7 +70,7 @@ All speedups measured vs vendored llama.cpp (`-fa 1`, matching KV quant). Combin
 
 | Drafter | Phase |
 |---------|:-----:|
-| [`Qwen3.8 27B DFlash2`](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2-GGUF) | decode |
+| [`Qwen3.8 27B DFlash2`](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2) | decode |
 | [`gemma 4 26B A4B`](https://huggingface.co/Lucebox/gemma-4-26B-A4B-it-DFlash-GGUF) | decode |
 | [`gemma 4 31B`](https://huggingface.co/Lucebox/gemma-4-31B-it-DFlash-GGUF) | decode |
 | [`Laguna XS 2.1 33B`](https://huggingface.co/Lucebox/Laguna-XS-2.1-DFlash-GGUF) | decode |
@@ -151,8 +151,8 @@ All launchers spawn the native C++ HTTP server (`dflash_server`). Override defau
 
 ```bash
 DFLASH_SERVER_BIN=server/build/dflash_server \
-DFLASH_TARGET=server/models/Qwen3.8-27B-IQ4_XS.gguf \
-DFLASH_DRAFT=server/models/draft/Qwen3.8-27B-DFlash2-Q8_0.gguf \
+DFLASH_TARGET=server/models/Qwen3.8-27B-UD-IQ4_XS.gguf \
+DFLASH_DRAFT=server/models/draft/qwen38-dflash2-q8_0.gguf \
 MAX_CTX=32768 \
 harness/clients/run_codex.sh
 ```
@@ -213,10 +213,13 @@ docker pull ghcr.io/luce-org/lucebox-hub:rocm     # AMD
 # 2. Download a target model into server/models/ and the DFlash draft
 #    into server/models/draft/ (the entrypoint only auto-discovers the
 #    draft there; without it the server runs slower, target-only)
-hf download bartowski/Qwen3.8-27B-GGUF Qwen3.8-27B-IQ4_XS.gguf \
+hf download unsloth/Qwen3.8-27B-GGUF Qwen3.8-27B-UD-IQ4_XS.gguf \
   --local-dir server/models/
-hf download incoai/Qwen3.8-27B-DFlash2-GGUF Qwen3.8-27B-DFlash2-Q8_0.gguf \
-  --local-dir server/models/draft/
+#    Drafter: convert the z-lab checkpoint once with the two converter
+#    commands from the source-build quickstart below and place the q8_0
+#    GGUF in server/models/draft/. (The pre-made incoai GGUF is for
+#    llama.cpp PR#27342 and uses a different layout this server does not
+#    load yet.)
 
 # 3a. NVIDIA (CUDA 12+)
 docker run --rm --gpus all -p 8000:8080 \
@@ -243,12 +246,16 @@ cmake -B server/build -S server -DCMAKE_BUILD_TYPE=Release
 cmake --build server/build --target dflash_server -j
 
 # default weights (~16 GB)
-hf download bartowski/Qwen3.8-27B-GGUF Qwen3.8-27B-IQ4_XS.gguf --local-dir server/models/
-hf download incoai/Qwen3.8-27B-DFlash2-GGUF Qwen3.8-27B-DFlash2-Q8_0.gguf --local-dir server/models/draft/
+hf download unsloth/Qwen3.8-27B-GGUF Qwen3.8-27B-UD-IQ4_XS.gguf --local-dir server/models/
+hf download incoai/Qwen3.8-27B-DFlash2 --local-dir server/models/dflash2-hf
+python server/scripts/convert_dflash_to_gguf.py \
+  server/models/dflash2-hf/model.safetensors server/models/draft/qwen38-dflash2-f16.gguf
+python server/scripts/quantize_dflash_draft.py \
+  server/models/draft/qwen38-dflash2-f16.gguf server/models/draft/qwen38-dflash2-q8_0.gguf --scheme q8_0
 
 # run
-./server/build/dflash_server server/models/Qwen3.8-27B-IQ4_XS.gguf \
-  --draft server/models/draft/Qwen3.8-27B-DFlash2-Q8_0.gguf \
+./server/build/dflash_server server/models/Qwen3.8-27B-UD-IQ4_XS.gguf \
+  --draft server/models/draft/qwen38-dflash2-q8_0.gguf \
   --draft-block-size 16 \
   --max-ctx 131072 \
   --cache-type-k q8_0 --cache-type-v q8_0 \
