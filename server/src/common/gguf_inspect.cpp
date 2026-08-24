@@ -26,9 +26,10 @@ bool derive_effective_target_layer_count(const std::string & arch,
         return false;
     }
 
-    // Embedded NextN blocks are currently defined by the Qwen3.5/3.6 GGUF
-    // layout. Do not reinterpret similarly named metadata on other arches.
-    if (arch != "qwen35" && arch != "qwen35moe") {
+    // Embedded NextN blocks are defined by the Qwen3.5/3.6 and BailingMoE3
+    // GGUF layouts. Do not reinterpret similarly named metadata elsewhere.
+    if (arch != "qwen35" && arch != "qwen35moe" &&
+        arch != "bailingmoe3") {
         return true;
     }
     if (nextn_predict_layers == 0) {

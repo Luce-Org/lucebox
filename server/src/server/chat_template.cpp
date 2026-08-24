@@ -67,6 +67,7 @@ ChatFormat chat_format_for_arch(const std::string & arch) {
     if (arch == "deepseek4") return ChatFormat::DEEPSEEK4;
     if (arch == "laguna") return ChatFormat::LAGUNA;
     if (arch == "gemma4") return ChatFormat::GEMMA4;
+    if (arch == "bailingmoe3") return ChatFormat::BAILINGMOE3;
     // qwen35, qwen3 use the Qwen3/ChatML format
     return ChatFormat::QWEN3;
 }
@@ -82,6 +83,111 @@ std::string render_chat_template(
     bool has_tools = !tools_json.empty() && tools_json != "[]" && tools_json != "null";
 
     switch (format) {
+    case ChatFormat::BAILINGMOE3: {
+        // AntLing's shipped Bailing V3 template. The system turn is always
+        // present because it carries the model's thinking-mode directive.
+        const bool has_system =
+            !messages.empty() && messages[0].role == "system";
+        const std::string system_content = has_system
+            ? messages[0].content : std::string();
+        const bool system_sets_thinking =
+            system_content.find("detailed thinking on") != std::string::npos ||
+            system_content.find("detailed thinking off") != std::string::npos;
+        const char * thinking_option = enable_thinking ? "on" : "off";
+
+        result += "<role>SYSTEM</role>";
+        if (has_tools) {
+            if (!system_content.empty()) {
+                result += system_content;
+                result += '\n';
+            }
+            result +=
+                "# Tools\n\n"
+                "You may call one or more functions to assist with the user query.\n\n"
+                "You are provided with function signatures within <tools></tools> XML tags:\n"
+                "<tools>";
+            try {
+                const nlohmann::json tools = nlohmann::json::parse(tools_json);
+                for (const auto & tool : tools) {
+                    result += '\n';
+                    result += tool.dump();
+                }
+            } catch (const std::exception &) {
+                result += '\n';
+                result += tools_json;
+            }
+            result +=
+                "\n</tools>\n\n"
+                "If none of the functions can be used, point it out. If the given question lacks the parameters required by the function, also point it out.\n"
+                "If you need to use a function, for each function call, output the function name and arguments within the following XML format:\n"
+                "<tool_call>{function-name}\n"
+                "<arg_key>{arg-key-1}</arg_key>\n"
+                "<arg_value>{arg-value-1}</arg_value>\n"
+                "<arg_key>{arg-key-2}</arg_key>\n"
+                "<arg_value>{arg-value-2}</arg_value>\n"
+                "...\n"
+                "</tool_call>\n";
+            if (!system_sets_thinking) {
+                result += "detailed thinking ";
+                result += thinking_option;
+            }
+            result += "<|role_end|>";
+        } else if (has_system) {
+            result += system_content;
+            if (!system_sets_thinking) {
+                result += '\n';
+                result += "detailed thinking ";
+                result += thinking_option;
+            }
+            result += "<|role_end|>";
+        } else {
+            result += "detailed thinking ";
+            result += thinking_option;
+            result += "<|role_end|>";
+        }
+
+        bool in_tool_response = false;
+        for (size_t i = has_system ? 1 : 0; i < messages.size(); ++i) {
+            const ChatMessage & msg = messages[i];
+            if (msg.role == "user") {
+                result += "<role>HUMAN</role>";
+                result += msg.content;
+                result += "<|role_end|>";
+            } else if (msg.role == "system") {
+                result += "<role>SYSTEM</role>";
+                result += msg.content;
+                result += "<|role_end|>";
+            } else if (msg.role == "assistant") {
+                result += "<role>ASSISTANT</role>\n";
+                if (msg.content.find("<think>") == std::string::npos) {
+                    result += "<think></think>";
+                }
+                result += msg.content;
+                result += "<|role_end|>";
+            } else if (msg.role == "tool") {
+                if (!in_tool_response) {
+                    result += "<role>OBSERVATION</role>";
+                    in_tool_response = true;
+                }
+                result += "\n<tool_response>\n";
+                result += msg.content;
+                result += "\n</tool_response>";
+                const bool next_is_tool =
+                    i + 1 < messages.size() && messages[i + 1].role == "tool";
+                if (!next_is_tool) {
+                    result += "<|role_end|>";
+                    in_tool_response = false;
+                }
+            }
+        }
+
+        if (add_generation_prompt) {
+            result += "<role>ASSISTANT</role>\n<think>";
+            if (!enable_thinking) result += "</think>";
+        }
+        break;
+    }
+
     case ChatFormat::QWEN3: {
         // Qwen3/3.5 ChatML format:
         //   <|im_start|>system\n[tool preamble +] content<|im_end|>\n

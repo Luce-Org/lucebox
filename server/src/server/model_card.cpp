@@ -278,6 +278,20 @@ static bool family_fallback(const std::string & arch, ModelCard & out) {
         out.source_label = "family:" + arch;
         return true;
     }
+    if (arch == "bailingmoe3") {
+        out.max_tokens                 = 32768;
+        out.complex_problem_max_tokens = 0;
+        out.hard_limit_reply_budget    = 4096;
+        // Official Ling 3.0 Flash sampling defaults.
+        out.sampling.temperature = 0.6f;
+        out.sampling.top_p = 0.95f;
+        out.sampling.top_k = 20;
+        out.sampling.has_temperature = true;
+        out.sampling.has_top_p = true;
+        out.sampling.has_top_k = true;
+        out.source_label = "family:bailingmoe3";
+        return true;
+    }
     if (arch == "gemma4") {
         // Gemma4 verified value: see Gemma model card; conservative
         // 16384 keeps us inside published recommendations.

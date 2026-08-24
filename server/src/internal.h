@@ -77,11 +77,31 @@ struct TargetLayer {
     ggml_tensor * ssm_norm       = nullptr;  // [head_v_dim]
     ggml_tensor * ssm_out        = nullptr;  // output projection after delta-net
 
+    // BailingMoE3 / Ling 3 KDA. Unlike Qwen3.5's fused projection and
+    // convolution, Ling projects and convolves Q, K, and V independently and
+    // uses a vector-valued decay gate (KDA) per head dimension.
+    ggml_tensor * ssm_conv1d_q   = nullptr;  // [conv, 1, d_inner, 1]
+    ggml_tensor * ssm_conv1d_k   = nullptr;  // [conv, 1, d_inner, 1]
+    ggml_tensor * ssm_conv1d_v   = nullptr;  // [conv, 1, d_inner, 1]
+    ggml_tensor * ssm_f_a        = nullptr;  // [hidden, d_inner]
+    ggml_tensor * ssm_g_a        = nullptr;  // [hidden, d_inner]
+
+    // BailingMoE3 / Ling 3 MLA. The latent K/V cache stores
+    // [kv_lora_rank + rope_dim] for K and [kv_lora_rank] for V.
+    ggml_tensor * attn_q_a       = nullptr;
+    ggml_tensor * attn_q_a_norm  = nullptr;
+    ggml_tensor * attn_q_b       = nullptr;
+    ggml_tensor * attn_kv_a_mqa  = nullptr;
+    ggml_tensor * attn_kv_a_norm = nullptr;
+    ggml_tensor * attn_k_b       = nullptr;
+    ggml_tensor * attn_v_b       = nullptr;
+
     // MoE FFN (qwen35moe only; nullptr on dense qwen35)
     ggml_tensor * ffn_gate_inp       = nullptr;  // [hidden, n_expert] router
     ggml_tensor * ffn_gate_exps      = nullptr;  // [hidden, n_ff_exp, n_expert]
     ggml_tensor * ffn_up_exps        = nullptr;  // [hidden, n_ff_exp, n_expert]
     ggml_tensor * ffn_down_exps      = nullptr;  // [n_ff_exp, hidden, n_expert]
+    ggml_tensor * ffn_exp_probs_b    = nullptr;  // [n_expert] router correction bias
     ggml_tensor * ffn_gate_up_exps   = nullptr;  // [hidden, 2*n_ff_exp, n_expert] optional fused gate/up
     ggml_tensor * ffn_gate_inp_shexp = nullptr;  // [hidden] shared-expert scalar gate
     ggml_tensor * ffn_gate_shexp     = nullptr;  // [hidden, n_ff_shexp]
@@ -116,6 +136,11 @@ struct TargetLayer {
     float ffn_gate_shexp_s     = 1.0f;
     float ffn_up_shexp_s       = 1.0f;
     float ffn_down_shexp_s     = 1.0f;
+
+    // Optional per-layer activation limits used by late Ling 3 blocks.
+    // Zero means ordinary SwiGLU.
+    float ffn_swiglu_clamp_exp   = 0.0f;
+    float ffn_swiglu_clamp_shexp = 0.0f;
 };
 
 // CPU-side embedder: keeps a mmap of the GGUF alive and knows how to
@@ -173,6 +198,8 @@ struct TargetWeights {
     int n_ff_shexp              = 0;
     int n_expert                = 0;
     int n_expert_used           = 0;
+    int n_expert_groups         = 1;
+    int n_expert_groups_used    = 1;
     int n_vocab                 = DFLASH27B_TARGET_VOCAB;
     int rope_dimension_count    = 64;
     float rope_theta            = 10000000.0f;
@@ -180,6 +207,17 @@ struct TargetWeights {
     float expert_weights_scale  = 1.0f;
     int expert_gating_func      = 1;    // 1=softmax, 2=sigmoid (llama.cpp enum values)
     bool is_moe                 = false;
+    bool is_bailingmoe3         = false;
+    bool expert_weights_norm    = true;
+    int n_layer_dense_lead      = 0;
+
+    // BailingMoE3 / Ling 3 architecture parameters.
+    int kda_head_dim            = 0;
+    int mla_qk_head_dim         = 0;
+    int mla_v_head_dim          = 0;
+    int kv_lora_rank            = 0;
+    int q_lora_rank             = 0;
+    float kda_gate_lower_bound  = 0.0f;
     int ssm_d_conv              = 4;
     int ssm_d_inner             = 6144;
     int ssm_d_state             = 128;
@@ -229,6 +267,12 @@ bool load_target_gguf_partial(const std::string & path,
                               ggml_backend_t backend,
                               const TargetLoadPlan & plan,
                               TargetWeights & out);
+
+// Load the autoregressive trunk of a BailingMoE3 GGUF (Ling 3.x). Embedded
+// NextN/MTP blocks are intentionally ignored by this baseline backend.
+bool load_bailingmoe3_gguf(const std::string & path,
+                           ggml_backend_t backend,
+                           TargetWeights & out);
 
 void free_target_weights(TargetWeights & w);
 

@@ -1477,7 +1477,8 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
         const bool pool = kvflash_active();
         if (!build_target_step(sg_, w_, cache_, target_backend_,
                                /*kv_start=*/cache_.cur_pos, /*n_tokens=*/1,
-                               /*with_mask=*/pool, /*capture=*/false,
+                               /*with_mask=*/pool || w_.is_bailingmoe3,
+                               /*capture=*/false,
                                /*capture_delta_intermediate=*/false,
                                /*fa_window=*/0,
                                /*logits_tail_rows=*/0,
@@ -2086,7 +2087,8 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
         const bool paged = cfg_.paged_attention;
         if (!build_target_step(sg_, w_, cache_, target_backend_,
                                /*kv_start=*/committed, /*n_tokens=*/1,
-                               /*with_mask=*/pool, /*capture=*/false,
+                               /*with_mask=*/pool || w_.is_bailingmoe3,
+                               /*capture=*/false,
                                /*capture_delta_intermediate=*/false,
                                /*fa_window=*/0,
                                /*logits_tail_rows=*/0,
@@ -2122,7 +2124,12 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
             ggml_backend_tensor_set(sg_.kv_write_rows, row_vals.data(), 0,
                                     sizeof(int64_t) * n_head_kv);
         }
-        if (pool) kvflash_upload_mask();
+        if (pool) {
+            kvflash_upload_mask();
+        } else if (w_.is_bailingmoe3) {
+            upload_qwen35_causal_mask(
+                sg_.attn_mask, committed, 1, cfg_.kq_stride_pad);
+        }
 
         auto st = ggml_backend_graph_compute(target_backend_, sg_.gf);
         if (st != GGML_STATUS_SUCCESS) return false;

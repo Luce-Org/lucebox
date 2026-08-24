@@ -82,6 +82,14 @@ All speedups measured vs vendored llama.cpp (`-fa 1`, matching KV quant). Combin
 </tr>
 </table>
 
+Experimental native `BailingMoE3` support is available for
+[`Ling 3.0 Flash`](https://huggingface.co/inclusionAI/Ling-3.0-flash). On a
+single DGX Spark, LuceBox serves the Q4_K_M GGUF at **34.6 tok/s** median
+autoregressive decode with Q4_0 KV cache. See the
+[DGX Spark integration and benchmark](server/docs/LING3_FLASH_DGX_SPARK.md)
+for the exact configuration, context sweep, tool-call test, and current
+limitations.
+
 ## Tested Machines (GPU/APU)
 
 Reference target: **RTX 3090 (Ampere sm_86)** — all headline numbers. Other NVIDIA archs auto-detected by CMake / `setup.py`; AMD HIP backend separate ([Strix Halo section](#amd-strix-halo-hip-backend)).

@@ -36,6 +36,7 @@
 #include "common/gguf_bounds.h"
 #include "common/gguf_inspect.h"
 #include "qwen35/prefill_helpers.h"
+#include "qwen35moe/qwen35moe_ffn.h"
 #include "ggml-cpu.h"
 #include "server/prompt_normalize.h"
 #include "qwen3_drafter_model.h"
@@ -52,6 +53,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <vector>
 #include <limits>
 #include <fcntl.h>
@@ -2875,6 +2877,85 @@ TEST_CASE(ServerUnitFixture, test_deepseek4_render_empty_chat_gen_prompt) {
     TEST_ASSERT(out == expected);
 }
 
+TEST_CASE(ServerUnitFixture, test_bailingmoe3_render_official_role_format) {
+    TEST_ASSERT(chat_format_for_arch("bailingmoe3") == ChatFormat::BAILINGMOE3);
+    const std::vector<ChatMessage> msgs = {{"user", "Hello", ""}};
+    const std::string out = render_chat_template(
+        msgs, ChatFormat::BAILINGMOE3,
+        /*add_generation_prompt=*/true,
+        /*enable_thinking=*/false,
+        /*tools_json=*/"");
+    TEST_ASSERT(out ==
+        "<role>SYSTEM</role>detailed thinking off<|role_end|>"
+        "<role>HUMAN</role>Hello<|role_end|>"
+        "<role>ASSISTANT</role>\n<think></think>");
+}
+
+TEST_CASE(ServerUnitFixture, test_bailingmoe3_render_thinking_and_tools) {
+    const std::vector<ChatMessage> msgs = {
+        {"system", "Be concise.", ""},
+        {"user", "Check Rome", ""},
+    };
+    const std::string tools =
+        R"([{"type":"function","function":{"name":"weather","parameters":{"type":"object"}}}])";
+    const std::string out = render_chat_template(
+        msgs, ChatFormat::BAILINGMOE3,
+        /*add_generation_prompt=*/true,
+        /*enable_thinking=*/true,
+        tools);
+    TEST_ASSERT(out.find("<role>SYSTEM</role>Be concise.\n# Tools") == 0);
+    TEST_ASSERT(out.find("<tools>\n{\"function\":") != std::string::npos);
+    TEST_ASSERT(out.find("detailed thinking on<|role_end|>") != std::string::npos);
+    TEST_ASSERT(out.find("<role>HUMAN</role>Check Rome<|role_end|>") != std::string::npos);
+    const std::string suffix = "<role>ASSISTANT</role>\n<think>";
+    TEST_ASSERT(out.size() >= suffix.size());
+    TEST_ASSERT(out.compare(out.size() - suffix.size(), suffix.size(), suffix) == 0);
+}
+
+TEST_CASE(ServerUnitFixture, test_bailingmoe3_router_builds_group_mask) {
+    ggml_init_params params{};
+    params.mem_size = 2 * 1024 * 1024;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    TEST_ASSERT(ctx != nullptr);
+
+    TargetWeights weights;
+    weights.n_expert = 512;
+    weights.n_expert_used = 8;
+    weights.n_expert_groups = 8;
+    weights.n_expert_groups_used = 4;
+    weights.expert_gating_func = 2;
+    weights.expert_weights_norm = true;
+    weights.expert_weights_scale = 2.5f;
+
+    TargetLayer layer;
+    layer.ffn_gate_inp = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F32, 16, weights.n_expert);
+    layer.ffn_exp_probs_b = ggml_new_tensor_1d(
+        ctx, GGML_TYPE_F32, weights.n_expert);
+    ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 16, 2);
+
+    const Qwen35MoeRouterOutputs router = build_qwen35moe_router(
+        ctx, input, weights, layer);
+    TEST_ASSERT(router.selected != nullptr);
+    TEST_ASSERT(router.weights != nullptr);
+
+    std::unordered_set<const ggml_tensor *> visited;
+    const auto contains_op = [&](const auto & self,
+                                 const ggml_tensor * tensor,
+                                 ggml_op op) -> bool {
+        if (!tensor || !visited.insert(tensor).second) return false;
+        if (tensor->op == op) return true;
+        for (const ggml_tensor * source : tensor->src) {
+            if (self(self, source, op)) return true;
+        }
+        return false;
+    };
+    TEST_ASSERT(contains_op(contains_op, router.selected, GGML_OP_SET_ROWS));
+
+    ggml_free(ctx);
+}
+
 TEST_CASE(ServerUnitFixture, test_jinja_render_basic) {
     std::vector<ChatMessage> msgs = {
         {"system", "you are helpful", ""},
@@ -4868,6 +4949,18 @@ TEST_CASE(ServerUnitFixture, test_model_card_family_fallback_deepseek4) {
     TEST_ASSERT(unknown.source_label != "family:not-a-real-arch");
 }
 
+TEST_CASE(ServerUnitFixture, test_model_card_family_fallback_bailingmoe3) {
+    auto card = dflash::common::resolve_model_card("", "", "bailingmoe3", "");
+    TEST_ASSERT(card.source_label == "family:bailingmoe3");
+    TEST_ASSERT(card.max_tokens == 32768);
+    TEST_ASSERT(card.sampling.has_temperature);
+    TEST_ASSERT(std::abs(card.sampling.temperature - 0.6f) < 1.0e-6f);
+    TEST_ASSERT(card.sampling.has_top_p);
+    TEST_ASSERT(std::abs(card.sampling.top_p - 0.95f) < 1.0e-6f);
+    TEST_ASSERT(card.sampling.has_top_k);
+    TEST_ASSERT(card.sampling.top_k == 20);
+}
+
 TEST_CASE(ServerUnitFixture, test_props_model_card_wholesale_sidecar) {
     // When a sidecar was loaded, /props.model_card should be the parsed
     // sidecar JSON verbatim — *all* fields from the file, not just the
@@ -5863,6 +5956,10 @@ TEST_CASE(ServerUnitFixture, test_qwen35_embedded_mtp_target_layer_count) {
     TEST_ASSERT(derive_effective_target_layer_count(
         "qwen35moe", 81, 1, target_layers, error));
     TEST_ASSERT(target_layers == 80);
+
+    TEST_ASSERT(derive_effective_target_layer_count(
+        "bailingmoe3", 43, 1, target_layers, error));
+    TEST_ASSERT(target_layers == 42);
 
     TEST_ASSERT(!derive_effective_target_layer_count(
         "qwen35", 1, 1, target_layers, error));

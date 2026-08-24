@@ -2181,6 +2181,18 @@ TokenDelivery classify_generated_token(
         return TokenDelivery::kThinkTag;
     }
 
+    // Bailing V3 stores its tool-call XML delimiters as added special
+    // tokens. They are part of the model's public output protocol, not chat
+    // control markers: keep them so the shared parser can reconstruct an
+    // OpenAI `tool_calls` object. Stripping them leaves only three unrelated
+    // text lines (function name, argument name, value).
+    if (raw == "<tool_call>" || raw == "</tool_call>" ||
+        raw == "<arg_key>" || raw == "</arg_key>" ||
+        raw == "<arg_value>" || raw == "</arg_value>") {
+        text = raw;
+        return TokenDelivery::kText;
+    }
+
     // Other special tokens are internal control markers. Byte-fallback
     // tokens such as <0xAB> are text and must still reach the emitter.
     if (raw.size() >= 2 && raw[0] == '<' && raw[1] == '|') {
