@@ -6317,6 +6317,26 @@ TEST_CASE(ServerUnitFixture, test_parse_tool_call_rejects_empty_name_and_scalar_
     auto res_array = parse_tool_calls(array_arg, read_tools());
     TEST_ASSERT(res_array.tool_calls.empty());
 
+    // A scalar string wrapped in braces is still prose, not object arguments.
+    const std::string braced_prose =
+        "<function_call>\n"
+        "{\"name\": \"read\", \"arguments\": \"{this is prose}\"}\n"
+        "</function_call>";
+    auto res_braced_prose = parse_tool_calls(braced_prose, read_tools());
+    TEST_ASSERT(res_braced_prose.tool_calls.empty());
+
+    // Keep forwarding a structurally object-like string with a JSON syntax
+    // error so the client can report the exact bad arguments to the model.
+    const std::string bad_obj_string =
+        "<function_call>\n"
+        "{\"name\": \"read\", \"arguments\": \"{\\\"offset\\\": 5o1}\"}\n"
+        "</function_call>";
+    auto res_bad_obj_string = parse_tool_calls(bad_obj_string, read_tools());
+    TEST_ASSERT(res_bad_obj_string.tool_calls.size() == 1);
+    if (!res_bad_obj_string.tool_calls.empty()) {
+        TEST_ASSERT(res_bad_obj_string.tool_calls[0].arguments == "{\"offset\": 5o1}");
+    }
+
     // Malformed JSON object syntax (e.g. 5o1) is forwarded as raw args
     const std::string bad_obj =
         "<function_call>\n{\"name\": \"read\", \"arguments\": {\"path\": \"/tmp/test\", \"offset\": 5o1}}\n</function_call>";

@@ -637,8 +637,9 @@ static bool parse_arg_string_or_obj(const json & val, json & out_args,
             }
             return false;  // reject valid scalar, array, or boolean arguments string
         }
-        // Discarded JSON: check if it has { ... } shape for syntax error tolerance (e.g. {"offset": 5o1})
-        if (!trimmed.empty() && trimmed.front() == '{' && trimmed.back() == '}') {
+        // Preserve object-shaped syntax errors (for example 5o1), but do not
+        // promote an arbitrary scalar string merely because it has braces.
+        if (looks_like_malformed_json_object(trimmed)) {
             out_args = json::object();
             return true;
         }
