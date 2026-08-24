@@ -41,6 +41,7 @@
 #include "common/specla_mode.h"
 
 #include "ggml-alloc.h"
+#include "ggml-cuda.h"
 
 #include <cmath>
 #include <cstdio>
@@ -1410,6 +1411,7 @@ static ggml_tensor * build_delta_net_block(
     DeltaNetCapture * cap,        // optional: populated on capture_delta_intermediate
     ggml_tensor * parent_ids,     // optional [n_tokens] i32; tree mode when non-null
     bool skip_gdn_intermediate,
+    bool fused_kernel_backend,    // CUDA/HIP backend implements fused conv/raw gates
     // Supported shapes are one sequence with any number of timesteps
     // (prefill/verify), or compact decode with one timestep per mapped row.
     int n_seqs = 1,
@@ -1537,7 +1539,8 @@ static ggml_tensor * build_delta_net_block(
     }();
     const bool chunked_call = chunked_env_on && can_skip_gdn_intermediate && !ragged &&
         !active_slot_ids && !use_specla_factorized && !use_specla_hld && n_tokens > 1;
-    const bool fused_plain = fused_kernels_env && !parent_ids && !ragged && !active_slot_ids &&
+    const bool fused_plain = fused_kernels_env && fused_kernel_backend &&
+                             !parent_ids && !ragged && !active_slot_ids &&
                              !use_specla_factorized && !use_specla_hld;
     const bool fused_conv  = fused_plain;
     const bool raw_gates   = fused_plain && !chunked_call && L.ssm_gate_ba != nullptr;
@@ -2088,7 +2091,8 @@ static ggml_tensor * build_single_layer(
         cur = build_delta_net_block(ctx, gf, w, L, cur,
                                     cache.conv_state[dn_idx], cache.ssm_state[dn_idx],
                                     n_tokens, cap_ptr, parent_ids,
-                                    /*skip_gdn_intermediate=*/true);
+                                    /*skip_gdn_intermediate=*/true,
+                                    ggml_backend_is_cuda(cache.backend));
     }
 
     cur = ggml_add(ctx, cur, inpSA);
@@ -2282,6 +2286,7 @@ QwenGraphOutputs build_qwen35_graph(
                                         conv_st, ssm_st,
                                         n_tokens, cap_ptr, in.parent_ids,
                                         /*skip_gdn_intermediate=*/true,
+                                        ggml_backend_is_cuda(cache.backend),
                                         in.n_seqs,
                                         in.prefill_segments,
                                         in.n_prefill_segments,
@@ -2489,7 +2494,8 @@ QwenLayerPrefnOutputs build_qwen35_layer_prefn(
         cur = build_delta_net_block(ctx, gf, w, L, cur,
                                     cache.conv_state[dn_idx], cache.ssm_state[dn_idx],
                                     n_tokens, nullptr, nullptr,
-                                    skip_gdn_intermediate);
+                                    skip_gdn_intermediate,
+                                    ggml_backend_is_cuda(cache.backend));
     }
 
     cur = ggml_add(ctx, cur, inpSA);

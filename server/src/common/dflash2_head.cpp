@@ -115,8 +115,17 @@ bool dflash2_score_candidates(const DraftWeights & dw,
         ggml_set_input(g.inp_succ);
         ggml_set_input(g.inp_pred);
         g.hproj = ggml_mul_mat(g.ctx, sel.hproj, g.inp_hidden);      // [rank, n_cand]
-        g.succ  = ggml_get_rows(g.ctx, sel.succ_cb, g.inp_succ);      // [rank, n_cand*K] f32
-        g.pred  = ggml_get_rows(g.ctx, sel.pred_cb, g.inp_pred);      // [rank, 1+n_cand*K] f32
+        // Current ggml_get_rows dequantizes floating-point/quantized sources
+        // to F32. Keep the explicit fallback so float readback remains safe
+        // if that API later starts preserving F16/BF16 source types.
+        auto get_rows_f32 = [&](ggml_tensor * codebook, ggml_tensor * ids) {
+            ggml_tensor * rows = ggml_get_rows(g.ctx, codebook, ids);
+            return rows->type == GGML_TYPE_F32
+                ? rows : ggml_cast(g.ctx, rows, GGML_TYPE_F32);
+        };
+        g.succ  = get_rows_f32(sel.succ_cb, g.inp_succ);      // [rank, n_cand*K] f32
+        g.pred  = get_rows_f32(sel.pred_cb, g.inp_pred);      // [rank, 1+n_cand*K] f32
+        GGML_ASSERT(g.succ->type == GGML_TYPE_F32 && g.pred->type == GGML_TYPE_F32);
         ggml_set_output(g.hproj);
         ggml_set_output(g.succ);
         ggml_set_output(g.pred);

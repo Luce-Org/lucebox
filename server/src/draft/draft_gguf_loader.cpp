@@ -522,11 +522,39 @@ bool load_draft_gguf(const std::string & path,
             }
             out.conv_kernel_size = conv_k;
             out.conv_group_size  = (int)read_u32("dflash.dflash2.conv_group_size", 16);
-            const DraftLayer & L0 = out.layers[0];
+            if (out.conv_group_size <= 0 || out.n_embd % out.conv_group_size != 0) {
+                char b[192];
+                std::snprintf(b, sizeof(b),
+                              "draft GGUF: dflash.dflash2.conv_group_size=%d "
+                              "must be positive and divide embedding_length=%d",
+                              out.conv_group_size, out.n_embd);
+                set_last_error(b);
+                ggml_free(meta_ctx); out.ctx = nullptr; gguf_free(gctx);
+                return false;
+            }
             const int64_t groups = out.n_embd / out.conv_group_size;
             char shape_err[192];
-            if (!check_shape_3d(L0.attn_conv.base, out.n_embd, conv_k, 2, "attn_conv.base", shape_err, sizeof(shape_err)) ||
-                !check_shape_2d(L0.attn_conv.proj, out.n_embd, 2 * conv_k * groups, "attn_conv.proj", shape_err, sizeof(shape_err))) {
+            bool shapes_ok = true;
+            for (int il = 0; il < out.n_layer && shapes_ok; ++il) {
+                const DraftLayer & L = out.layers[(size_t)il];
+                const DraftConvWeights * convs[] = {&L.attn_conv, &L.mlp_conv};
+                const char * kinds[] = {"attn_conv", "ffn_conv"};
+                for (int ci = 0; ci < 2 && shapes_ok; ++ci) {
+                    char base_name[64];
+                    char proj_name[64];
+                    std::snprintf(base_name, sizeof(base_name),
+                                  "blk.%d.%s.base", il, kinds[ci]);
+                    std::snprintf(proj_name, sizeof(proj_name),
+                                  "blk.%d.%s.proj", il, kinds[ci]);
+                    shapes_ok =
+                        check_shape_3d(convs[ci]->base, out.n_embd, conv_k, 2,
+                                       base_name, shape_err, sizeof(shape_err)) &&
+                        check_shape_2d(convs[ci]->proj, out.n_embd,
+                                       2 * conv_k * groups, proj_name,
+                                       shape_err, sizeof(shape_err));
+                }
+            }
+            if (!shapes_ok) {
                 set_last_error(shape_err);
                 ggml_free(meta_ctx); out.ctx = nullptr; gguf_free(gctx);
                 return false;
