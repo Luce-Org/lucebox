@@ -29,12 +29,22 @@ TEST_CASE(ChainRollbackPolicyFixture, policy_defaults_and_env_parsing) {
     const luce_test::ScopedEnvVar threshold("DFLASH_FAST_ROLLBACK_THRESHOLD", nullptr);
     const luce_test::ScopedEnvVar diagnostics("DFLASH_SINGLE_CHAIN_ROLLBACK_DIAG", nullptr);
     clear_policy_env();
+    // Exact F32 checkpoints and rollback from the first accepted token are the
+    // default: the tuned decode path should not need an opt-in.
     auto policy = resolve_chain_rollback_policy();
-    CHECK(!policy.checkpoint_f32);
-    CHECK(policy.fast_rollback_threshold == 5);
+    CHECK(policy.checkpoint_f32);
+    CHECK(policy.fast_rollback_threshold == 1);
     CHECK(!policy.diagnostics);
 
+    // The threshold env is honoured on the default path, because the F32
+    // checkpoints it depends on are now present without an opt-in.
     setenv("DFLASH_FAST_ROLLBACK_THRESHOLD", "2", 1);
+    policy = resolve_chain_rollback_policy();
+    CHECK(policy.checkpoint_f32);
+    CHECK(policy.fast_rollback_threshold == 2);
+
+    // Opting out restores the legacy F16 replay path and its threshold.
+    setenv("DFLASH_SINGLE_CHAIN_CHECKPOINT_F32", "0", 1);
     policy = resolve_chain_rollback_policy();
     CHECK(!policy.checkpoint_f32);
     CHECK(policy.fast_rollback_threshold == 5);
@@ -50,6 +60,15 @@ TEST_CASE(ChainRollbackPolicyFixture, policy_defaults_and_env_parsing) {
     CHECK(policy.checkpoint_f32);
     CHECK(policy.fast_rollback_threshold == 1);
     unsetenv("DFLASH_SINGLE_CHAIN_CHECKPOINT_F32");
+    policy = resolve_chain_rollback_policy(true);
+    CHECK(policy.checkpoint_f32);
+    CHECK(policy.fast_rollback_threshold == 1);
+    policy = resolve_chain_rollback_policy(false, true);
+    CHECK(policy.checkpoint_f32);
+    CHECK(policy.fast_rollback_threshold == 1);
+    // Opted out, TP and exact device-side rollback still roll back from the
+    // first accepted token: neither depends on host checkpoint precision.
+    setenv("DFLASH_SINGLE_CHAIN_CHECKPOINT_F32", "0", 1);
     policy = resolve_chain_rollback_policy(true);
     CHECK(!policy.checkpoint_f32);
     CHECK(policy.fast_rollback_threshold == 1);
@@ -69,12 +88,13 @@ TEST_CASE(ChainRollbackPolicyFixture, policy_defaults_and_env_parsing) {
     CHECK(!resolve_chain_rollback_policy().checkpoint_f32);
     setenv("DFLASH_SINGLE_CHAIN_CHECKPOINT_F32", "1", 1);
 
+    // Out-of-range or unparseable values leave the default in place.
     setenv("DFLASH_FAST_ROLLBACK_THRESHOLD", "0", 1);
-    CHECK(resolve_chain_rollback_policy().fast_rollback_threshold == 5);
+    CHECK(resolve_chain_rollback_policy().fast_rollback_threshold == 1);
     setenv("DFLASH_FAST_ROLLBACK_THRESHOLD", "6", 1);
-    CHECK(resolve_chain_rollback_policy().fast_rollback_threshold == 5);
+    CHECK(resolve_chain_rollback_policy().fast_rollback_threshold == 1);
     setenv("DFLASH_FAST_ROLLBACK_THRESHOLD", "garbage", 1);
-    CHECK(resolve_chain_rollback_policy().fast_rollback_threshold == 5);
+    CHECK(resolve_chain_rollback_policy().fast_rollback_threshold == 1);
 
     setenv("DFLASH_SINGLE_CHAIN_ROLLBACK_DIAG", "1", 1);
     CHECK(resolve_chain_rollback_policy().diagnostics);

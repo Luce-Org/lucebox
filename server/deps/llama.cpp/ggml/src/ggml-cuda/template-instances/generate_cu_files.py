@@ -112,6 +112,14 @@ for type in TYPES_MMQ:
             "GGML_TYPE_Q8_0",
         }:
             guard = "#define GGML_CUDA_MMQ_SMALL_TILE 1\n"
+            # Dense hybrid targets take the small tile on RDNA4 only: the
+            # measurement is gfx1201 and the big-tile twin dispatch that
+            # covers wide N is RDNA4-only. ROCmFPX keeps it on RDNA3 too.
+            if type in {
+                "GGML_TYPE_IQ4_XS", "GGML_TYPE_Q5_K",
+                "GGML_TYPE_Q6_K", "GGML_TYPE_Q8_0",
+            }:
+                guard += "#define GGML_CUDA_MMQ_SMALL_TILE_RDNA4_ONLY 1\n"
         if type == "GGML_TYPE_Q4_K":
             guard = "#define LUCEBOX_RDNA_MMQ_Y 64\n"
         f.write(SOURCE_MMQ.format(type=type, guard=guard))

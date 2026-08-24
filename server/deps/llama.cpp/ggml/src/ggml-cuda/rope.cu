@@ -31,6 +31,13 @@ static __device__ __forceinline__ double rope_theta_fp64(int32_t p, float theta_
     // rope kernel on RDNA4 (692 us vs 76 us per launch at n_tokens=512). Seven
     // double multiplies keep the large-freq_base precision (the entire point
     // of the fp64 path) to within 1 ulp of pow().
+    if (exp_int < 0) {
+        // `e >>= 1` on a negative int is an arithmetic shift and never
+        // reaches 0, so the loop below would hang the GPU. No current caller
+        // passes a negative exponent, but pow() was total over the domain and
+        // this helper takes a plain int, so stay total too.
+        return (double)p * pow((double)theta_scale, (double)exp_int);
+    }
     double base = (double)theta_scale;
     double r    = 1.0;
     int    e    = exp_int;

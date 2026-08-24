@@ -1624,6 +1624,24 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
                                const DaemonIO & io,
                                int snap_pos, int snap_slot,
                                int kv_offset) {
+    // A finite --fa-window caps the full-attention layers to a sliding
+    // window, so anything earlier than the window is invisible to them. That
+    // is silent: the model still answers, it just cannot see the head of a
+    // long prompt, which reads as a model quality problem rather than a
+    // configuration one. Say so once, the first time a prompt actually
+    // outgrows the window.
+    if (cfg_.fa_window > 0 &&
+        (int)tokens.size() + kv_offset > cfg_.fa_window) {
+        static std::atomic<bool> s_fa_window_warned{false};
+        if (!s_fa_window_warned.exchange(true)) {
+            std::fprintf(stderr,
+                "[qwen35] WARNING: prompt is %d tokens but --fa-window is %d: "
+                "full-attention layers see only the last %d tokens, so content "
+                "before that cannot be retrieved. Drop --fa-window for "
+                "long-context work.\n",
+                (int)tokens.size() + kv_offset, cfg_.fa_window, cfg_.fa_window);
+        }
+    }
     const int hidden = w_.n_embd;
     const int vocab  = w_.n_vocab;
     int prefill_ubatch = qwen35_prefill_ubatch(512);
@@ -2586,7 +2604,53 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         return false;
     };
     const bool use_remote_draft = cfg_.remote_draft.enabled() && remote_draft_.active();
+    // Long-context draft width. Verify attention runs through ggml's tile
+    // kernel (the vector kernel only covers a single query row), and that
+    // kernel's cost scales with the number of query rows AND with KV length.
+    // So a wide draft block, which is a clear win on short prompts, turns
+    // into a liability once the KV is large: the extra rows multiply a term
+    // that is itself growing.
+    //
+    // Measured on one R9700 with Qwen3.8-27B IQ4_XS + DFlash2 (decode tok/s):
+    //     prompt   verify 16   verify 8
+    //      6,208         63.2           71.1
+    //     13,148         51.9           54.9
+    //     26,728         43.4           46.9
+    //     39,861         32.7           45.5
+    // Narrowing inside a block-16 drafter also holds acceptance better than
+    // configuring the drafter at block 8 outright (0.414 vs 0.375 at 27K).
+    // Below the crossover the wide block still wins by a lot (HumanEval-10
+    // 204 vs 143.6 decode), so narrow only past it. Halving also raises
+    // commit depth there (0.462*8+1 = 4.70 vs 0.200*16+1 = 4.20): fewer rows
+    // and deeper commits at the same time.
+    //
+    // The rule is a function of context length only. It deliberately does not
+    // look at the observed acceptance rate, so the width for a given prompt
+    // is reproducible and does not chase a moving target.
+    // 8192 is deliberately above every prompt in the short-context benchmarks
+    // this engine is tuned for, so high-acceptance completion workloads, where
+    // the wide block earns its keep, are untouched.
+    constexpr int kLongCtxNarrowTokens = 8192;
+    // Floor at the DFlash2 checkpoint's own published block size.
+    constexpr int kLongCtxMinVerify = 8;
     const int q_len = dw_.block_size > 0 ? dw_.block_size : DFLASH27B_DRAFT_BLOCK_SIZE;
+    // This caps the VERIFY batch only; the drafter still proposes a full q_len
+    // block. Narrowing the draft instead would leave the tail rows of the
+    // drafter's non-causal block unwritten while its mask still makes them
+    // visible to the rows we keep, and would break the fixed block_size
+    // contract the IPC drafter validates against.
+    const int verify_cap = committed >= kLongCtxNarrowTokens
+                               ? std::max(kLongCtxMinVerify, q_len / 2)
+                               : q_len;
+    if (verify_cap != q_len) {
+        static std::atomic<bool> s_narrowed_logged{false};
+        if (!s_narrowed_logged.exchange(true)) {
+            std::fprintf(stderr,
+                "[qwen35-spec] context %d >= %d: capping verify width %d -> %d "
+                "(wide blocks lose to verify-attention cost at long context)\n",
+                committed, kLongCtxNarrowTokens, q_len, verify_cap);
+        }
+    }
     const int max_verify_tokens = cfg_.ddtree_mode
         ? std::max<int>(dw_.block_size, cfg_.ddtree_budget + 1)
         : dw_.block_size;
@@ -3426,6 +3490,16 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             continue;
         }
 
+        // 3a-ter. Long-context verify cap. Drafting is done; trim the block
+        // we actually check. Hint injection below fills draft_tok[1..v_len-1],
+        // so it sees the capped width and stays consistent.
+        if (!ar_step && v_len > verify_cap) {
+            v_len = verify_cap;
+            if ((int)draft_tok.size() > verify_cap) {
+                draft_tok.resize((size_t)verify_cap);
+            }
+        }
+
         // 3b. Tool call hint injection: override draft tokens with pre-known
         // structural tokens for near-100% acceptance.
         int hint_fill = 0;
@@ -3826,7 +3900,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         if (floor_to_ar) {
             step_graph_destroy(draft_sg);
             cache_.last_tok = out_tokens.empty() ? last_tok : out_tokens.back();
-            const int total_draft_pos = std::max(1, n_spec_steps * q_len);
+            const int total_draft_pos = std::max(1, n_spec_steps * verify_cap);
             out_accept_rate =
                 (float)((double)n_accept_sum / (double)total_draft_pos);
             const int ar_n_gen = n_gen - n_generated;
@@ -3871,7 +3945,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             cache_.cur_pos = committed;
             step_graph_destroy(draft_sg);
             cache_.last_tok = out_tokens.empty() ? last_tok : out_tokens.back();
-            const int total_draft_pos = std::max(1, n_spec_steps * q_len);
+            const int total_draft_pos = std::max(1, n_spec_steps * verify_cap);
             out_accept_rate =
                 (float)((double)n_accept_sum / (double)total_draft_pos);
             const int ar_n_gen = n_gen - n_generated;
@@ -3902,7 +3976,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
     auto t_dec1 = std::chrono::steady_clock::now();
     const double decode_s = std::chrono::duration<double>(t_dec1 - t_dec0).count();
-    const int total_draft_pos = std::max(1, n_spec_steps * q_len);
+    const int total_draft_pos = std::max(1, n_spec_steps * verify_cap);
     const double accept_pct = 100.0 * (double)n_accept_sum / (double)total_draft_pos;
     out_accept_rate = (float)((double)n_accept_sum / (double)total_draft_pos);
     std::fprintf(stderr, "[spec-decode] tokens=%d time=%.3f s speed=%.2f tok/s "

@@ -92,7 +92,7 @@ struct DiskCacheHeader {
 // to avoid alignment/packing issues. The on-disk size is exactly 80 bytes.
 
 static constexpr size_t DISK_CACHE_HEADER_SIZE = 80;
-static constexpr uint32_t DISK_CACHE_VERSION = 1;
+static constexpr uint32_t DISK_CACHE_VERSION = 2;
 
 // ─── Tensor table entry (on-disk) ──────────────────────────────────────
 

@@ -57,11 +57,10 @@ All speedups measured vs vendored llama.cpp (`-fa 1`, matching KV quant). Combin
 | Model | Speedup |
 |-------|:-------:|
 | Qwen 3.5 0.8B (Megakernel) | **~2×** |
-| Qwen 3.6 27B + PFlash | **~5.6×** |
-| Qwen 3.6 27B + DDTree | **4.84×** |
+| Qwen 3.8 27B + DFlash2 (R9700) | **6.1×** decode |
+| Qwen 3.8 27B + DFlash2 vs llama.cpp speculating with the same drafter | **3.5×** decode |
 | Laguna XS 2.1 33B + PFlash | **8.2×** @256K |
 | Laguna XS 2.1 33B + DFlash | **1.7×** @256K |
-| Qwen 3.6 27B HIP | **~2.6×** |
 | Gemma 4 26B-A4B | **1.31×** |
 | Gemma 4 31B IT | **3.2×** |
 | [`DeepSeek V4 Flash ROCMFPX HIP`](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-ROCmFP3) | **2×** |
@@ -71,7 +70,7 @@ All speedups measured vs vendored llama.cpp (`-fa 1`, matching KV quant). Combin
 
 | Drafter | Phase |
 |---------|:-----:|
-| [`Qwen3.6 27B`](https://huggingface.co/Lucebox/Qwen3.6-27B-DFlash-GGUF) | decode |
+| [`Qwen3.8 27B DFlash2`](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2-GGUF) | decode |
 | [`gemma 4 26B A4B`](https://huggingface.co/Lucebox/gemma-4-26B-A4B-it-DFlash-GGUF) | decode |
 | [`gemma 4 31B`](https://huggingface.co/Lucebox/gemma-4-31B-it-DFlash-GGUF) | decode |
 | [`Laguna XS 2.1 33B`](https://huggingface.co/Lucebox/Laguna-XS-2.1-DFlash-GGUF) | decode |
@@ -110,7 +109,7 @@ Entries are `dflash_server` settings unless the cell shows another command.
 
 | Model | RTX 3090 (24 GB) | Strix Halo `gfx1151` | Strix Halo + R9700 `gfx1201` |
 |---|---|---|---|
-| **Qwen 3.5/3.6 27B Q4_K_M** | `DFLASH27B_KV_TQ3=1`<br>`--target-device cuda:0`<br>`--draft-device cuda:0`<br>`--ddtree`<br>`--ddtree-budget 22`<br>`--draft-residency auto`<br>`--prefill-compression auto`<br>`--prefill-drafter <path>`<br>`--kvflash auto` | `--target-device hip:0`<br>`--draft-device hip:0`<br>`--ddtree`<br>`--ddtree-budget 22`<br>`--draft-residency persistent`<br>`--prefill-compression auto`<br>`--prefill-drafter <path>`<br>`--kvflash auto` | `HIP_VISIBLE_DEVICES=<r9700-index>`<br>`--target-device hip:0`<br>`--draft-device hip:0`<br>`--ddtree`<br>`--ddtree-budget 22`<br>`--draft-residency persistent`<br>`--prefill-compression auto`<br>`--prefill-drafter <path>`<br>`--kvflash auto` |
+| **Qwen 3.8 27B IQ4_XS** | `--target-device cuda:0`<br>`--draft-device cuda:0`<br>`--draft-block-size 16`<br>`--cache-type-k q8_0`<br>`--cache-type-v q8_0` | `--target-device hip:0`<br>`--draft-device hip:0`<br>`--draft-block-size 16`<br>`--cache-type-k q8_0`<br>`--cache-type-v q8_0` | `HIP_VISIBLE_DEVICES=<r9700-index>`<br>`--target-device hip:0`<br>`--draft-device hip:0`<br>`--draft-block-size 16`<br>`--max-ctx 131072`<br>`--cache-type-k q8_0`<br>`--cache-type-v q8_0` |
 | **Qwen 3.6 35B-A3B Q4_K_M** | `--target-device cuda:0`<br>`--spark`<br>`--kvflash auto` | `--target-device hip:0`<br>`--kvflash auto` | `HIP_VISIBLE_DEVICES=<r9700-index>`<br>`--target-device hip:0`<br>`--kvflash auto` |
 | **Laguna XS 2.1 33B Q4_K_M** | `--target-device cuda:0`<br>`--draft <path>`<br>`--prefill-drafter <path>`<br>`--max-ctx 262144`<br>`--kvflash 8192`<br>`--chunk 1024` | `--target-device hip:0`<br>`--kvflash auto` | `HIP_VISIBLE_DEVICES=<r9700-index>`<br>`--target-device hip:0`<br>`--kvflash auto` |
 | **Gemma 4 26B-A4B / 31B** | `--target-device cuda:0`<br>`--draft-device cuda:0`<br>`--kvflash auto` | `--target-device hip:0`<br>`--draft-device hip:0`<br>`--kvflash auto` | `HIP_VISIBLE_DEVICES=<r9700-index>`<br>`--target-device hip:0`<br>`--draft-device hip:0`<br>`--kvflash auto` |
@@ -152,7 +151,7 @@ All launchers spawn the native C++ HTTP server (`dflash_server`). Override defau
 
 ```bash
 DFLASH_SERVER_BIN=server/build/dflash_server \
-DFLASH_TARGET=server/models/Qwen3.6-27B-Q4_K_M.gguf \
+DFLASH_TARGET=server/models/Qwen3.8-27B-IQ4_XS.gguf \
 DFLASH_DRAFT=server/models/draft/dflash-draft-3.6-q4_k_m.gguf \
 MAX_CTX=32768 BUDGET=22 VERIFY_MODE=ddtree \
 harness/clients/run_codex.sh
@@ -214,9 +213,9 @@ docker pull ghcr.io/luce-org/lucebox-hub:rocm     # AMD
 # 2. Download a target model into server/models/ and the DFlash draft
 #    into server/models/draft/ (the entrypoint only auto-discovers the
 #    draft there; without it the server runs slower, target-only)
-hf download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf \
+hf download bartowski/Qwen3.8-27B-GGUF Qwen3.8-27B-IQ4_XS.gguf \
   --local-dir server/models/
-hf download Lucebox/Qwen3.6-27B-DFlash-GGUF dflash-draft-3.6-q4_k_m.gguf \
+hf download incoai/Qwen3.8-27B-DFlash2-GGUF Qwen3.8-27B-DFlash2-Q8_0.gguf \
   --local-dir server/models/draft/
 
 # 3a. NVIDIA (CUDA 12+)
@@ -235,7 +234,7 @@ Then hit `:8000/v1/chat/completions` (OpenAI-compatible).
 
 ## Run the Server
 
-Default: Qwen 3.6-27B Q4_K_M target + Lucebox Q4_K_M DFlash drafter on RTX 3090. DDTree budget=22, TQ3_0 KV cache, full attention. OpenAI-compatible HTTP on `:8000`.
+Default: Qwen 3.8-27B IQ4_XS target + the DFlash2 block-diffusion drafter. Full attention, q8_0 KV cache, OpenAI-compatible HTTP on `:8000`. The tuned decode path is the default, so no environment variables are needed.
 
 ```bash
 # build (CUDA 12+, CMake 3.18+)
@@ -243,15 +242,17 @@ git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd luc
 cmake -B server/build -S server -DCMAKE_BUILD_TYPE=Release
 cmake --build server/build --target dflash_server -j
 
-# default weights (~18 GB)
-hf download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf --local-dir server/models/
-hf download Lucebox/Qwen3.6-27B-DFlash-GGUF dflash-draft-3.6-q4_k_m.gguf --local-dir server/models/draft/
+# default weights (~16 GB)
+hf download bartowski/Qwen3.8-27B-GGUF Qwen3.8-27B-IQ4_XS.gguf --local-dir server/models/
+hf download incoai/Qwen3.8-27B-DFlash2-GGUF Qwen3.8-27B-DFlash2-Q8_0.gguf --local-dir server/models/draft/
 
-# run (TQ3_0 KV auto-enabled; set =0 to disable)
-DFLASH27B_KV_TQ3=1 \
-./server/build/dflash_server server/models/Qwen3.6-27B-Q4_K_M.gguf \
-  --draft server/models/draft/dflash-draft-3.6-q4_k_m.gguf \
-  --ddtree --ddtree-budget 22 --port 8000
+# run
+./server/build/dflash_server server/models/Qwen3.8-27B-IQ4_XS.gguf \
+  --draft server/models/draft/Qwen3.8-27B-DFlash2-Q8_0.gguf \
+  --draft-block-size 16 \
+  --max-ctx 131072 \
+  --cache-type-k q8_0 --cache-type-v q8_0 \
+  --port 8000
 ```
 
 ### Making requests
@@ -267,7 +268,7 @@ curl :8000/v1/chat/completions -H 'Content-Type: application/json' -d '{
 }'
 ```
 
-Requests that omit `temperature` use the model card's sampling (Qwen3.6: `temperature: 1.0`,
+Requests that omit `temperature` use the model card's sampling (Qwen3.8: `temperature: 1.0`,
 `top_p: 0.95`, `top_k: 20`).
 
 ### Server flags
@@ -415,7 +416,7 @@ Pages the attention KV cache through a fixed pool of GPU slots; cold 64-token ch
 
 Tensor parallelism uses NCCL collectives between the selected devices and does
 not include other visible GPUs in its communicator. For example, this runs the
-Qwen3.6 target on GPU 1 and GPU 2 while leaving GPU 0 available:
+Qwen3.8 target on GPU 1 and GPU 2 while leaving GPU 0 available:
 
 ```bash
 dflash_server model.gguf \

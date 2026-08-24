@@ -33,6 +33,15 @@ struct SelectorGraph {
     ggml_tensor * hproj = nullptr;
     ggml_tensor * succ = nullptr;
     ggml_tensor * pred = nullptr;
+
+    // The graph is thread_local, so a worker thread that drafts and then
+    // exits must return its ggml context and the gallocr's device buffer.
+    // Without this each thread that ever drafted leaks one GPU allocation for
+    // the lifetime of the process.
+    ~SelectorGraph() {
+        if (galloc) { ggml_gallocr_free(galloc); galloc = nullptr; }
+        if (ctx)    { ggml_free(ctx); ctx = nullptr; }
+    }
 };
 
 SelectorGraph & selector_graph() {

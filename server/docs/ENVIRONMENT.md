@@ -126,6 +126,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_EXPERT_BUDGET_PCT` - laguna_backend.cpp
 - `DFLASH_FAST_ROLLBACK_THRESHOLD` - chain_rollback_policy.h
 - `DFLASH_FEATURE_DTYPE` - dflash_feature_ring.cpp
+- `DFLASH_KV_ROTATE` - qwen35_target_graph.cpp (set to 1 to force FWHT K rotation on; off by default for f16/q8_0 caches, on for narrower types)
 - `DFLASH_FP_ALPHA` - http_server.cpp, qwen3_graph.cpp, server_main.cpp
 - `DFLASH_FP_CHUNK_S` - qwen3_graph.cpp
 - `DFLASH_FP_DEBUG_LAYER0` - qwen3_graph.cpp
@@ -245,6 +246,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_VERIFY_WIDTH` - qwen35moe_backend.cpp
 - `FAST_ROLLBACK_DIAG` - qwen35_dflash_target.cpp
 - `HOME` - spark_corpus.cpp
+- `LUCE_Q8_MEMO` - mmvq.cu (set to 0 to disable q8_1 activation memoisation; on by default)
 - `LUCE_MMVQ_MAX_NCOLS` - deepseek4_backend.cpp
 - `LUCE_QK_FUSE_LAYERS` - laguna_target_graph.cpp
 - `LUCE_QK_FUSE_MODE` - laguna_target_graph.cpp

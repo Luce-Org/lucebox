@@ -87,7 +87,10 @@ bool build_layer_step(
         ggml_set_input(sg.parent_ids);
     }
 
-    sg.gf = ggml_new_graph_custom(sg.ctx, 16384, false);
+    // 32k nodes: the chunked delta-net graph (CS = 32) reaches ~17k nodes at
+    // a 512-token ubatch, and these per-layer builders construct the same
+    // blocks for layer-split / tensor-parallel placements.
+    sg.gf = ggml_new_graph_custom(sg.ctx, 32768, false);
 
     ggml_tensor * layer_out = build_qwen35_layer(
         sg.ctx, sg.gf, w, cache, layer_idx,
@@ -163,7 +166,10 @@ bool build_layer_prefn_step(
         }
     }
 
-    sg.gf = ggml_new_graph_custom(sg.ctx, 16384, false);
+    // 32k nodes: the chunked delta-net graph (CS = 32) reaches ~17k nodes at
+    // a 512-token ubatch, and these per-layer builders construct the same
+    // blocks for layer-split / tensor-parallel placements.
+    sg.gf = ggml_new_graph_custom(sg.ctx, 32768, false);
     QwenLayerPrefnOutputs go = build_qwen35_layer_prefn(
         sg.ctx, sg.gf, w, cache, layer_idx,
         sg.inp_embed, sg.positions, sg.attn_mask,
@@ -239,7 +245,10 @@ bool build_hybrid_full_layer_step(
         }
     }
 
-    sg.gf = ggml_new_graph_custom(sg.ctx, 16384, false);
+    // 32k nodes: the chunked delta-net graph (CS = 32) reaches ~17k nodes at
+    // a 512-token ubatch, and these per-layer builders construct the same
+    // blocks for layer-split / tensor-parallel placements.
+    sg.gf = ggml_new_graph_custom(sg.ctx, 32768, false);
 
     ggml_tensor * moe_selected = nullptr;
     ggml_tensor * layer_out = build_qwen35_layer(

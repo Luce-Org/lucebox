@@ -155,11 +155,20 @@ bool create_target_cache_partial(const TargetWeights & w,
     // Skip for TQ3_0 K cache — that type already applies WHT during quantization.
     // DFLASH_KV_ROTATE=0 turns it off (two fewer launches per attention layer;
     // with q8_0/f16 caches the rotation is precision-neutral).
-    static const bool kv_rotate_env = []() {
+    // The rotation costs two extra launches per attention layer and is
+    // precision-neutral for the f16/q8_0 caches we serve with, so it is off by
+    // default for those and kept for the narrower types where spreading
+    // outliers actually buys accuracy. DFLASH_KV_ROTATE=1 forces it on.
+    static const int kv_rotate_env = []() {
         const char * e = std::getenv("DFLASH_KV_ROTATE");
-        return !(e && e[0] == '0' && e[1] == '\0');
+        if (!e || e[0] == '\0') return -1;                  // unset: by type
+        return (e[0] == '0' && e[1] == '\0') ? 0 : 1;
     }();
-    out.kv_k_rotated = (kv_k_type != GGML_TYPE_TQ3_0) && kv_rotate_env;
+    const bool kv_rotate_neutral =
+        kv_k_type == GGML_TYPE_F16 || kv_k_type == GGML_TYPE_Q8_0;
+    const bool kv_rotate_on = kv_rotate_env < 0 ? !kv_rotate_neutral
+                                                : kv_rotate_env != 0;
+    out.kv_k_rotated = (kv_k_type != GGML_TYPE_TQ3_0) && kv_rotate_on;
 
     const bool needs_256_stride =
         kv_k_type == GGML_TYPE_TQ3_0 || kv_v_type == GGML_TYPE_TQ3_0;
@@ -579,8 +588,10 @@ bool migrate_prefill_cache(const TargetWeights & w,
     cache.rollback_ctx = ggml_init(ip);
     if (!cache.rollback_ctx) { set_last_error("rollback cache ggml_init failed"); return false; }
 
-    // Preserve the established F16 default. Opt in to PR #506's F32 checkpoint
-    // representation for single-GPU validation with an explicit environment flag.
+    // F32 checkpoints are the default: the rollback-from-first-accepted-token
+    // path depends on them and is the tuned decode path. They cost VRAM
+    // (+1.11 GiB on Qwen3.8-27B at 128K), so DFLASH_SINGLE_CHAIN_CHECKPOINT_F32=0
+    // restores the F16 representation and its rollback threshold of 5.
     const ChainRollbackPolicy rollback_policy = resolve_chain_rollback_policy();
     const ggml_type checkpoint_type = rollback_policy.checkpoint_f32
         ? GGML_TYPE_F32 : GGML_TYPE_F16;

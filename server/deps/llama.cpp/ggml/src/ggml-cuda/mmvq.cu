@@ -2691,9 +2691,13 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+    // On by default: memoising the q8_1-quantized activations across the
+    // matmuls of one token is a straight win on every backend measured, and
+    // requiring an env var to get the tuned path invites running the slow one
+    // by accident. LUCE_Q8_MEMO=0 opts out.
     static const bool luce_q8_memo_on = []() {
         const char * e = getenv("LUCE_Q8_MEMO");
-        return e && e[0] == '1' && e[1] == '\0';
+        return !(e && e[0] == '0' && e[1] == '\0');
     }();
     const size_t q8_bytes = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
