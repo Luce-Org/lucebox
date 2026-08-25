@@ -167,22 +167,21 @@ static void ds4_fused_verify_refresh_hybrid_luts(
         const MoeHybridLayerStorage & layer = hybrid->layers[(size_t) il];
         const MoeHybridGraphInputs & inputs = fg.hybrid_inputs[hi];
         const bool dynamic_route_balance = inputs.dynamic_route_balance;
-        const std::vector<int32_t> & preferred_hot =
-            dynamic_route_balance ||
-                    layer.decode_hot_local_by_global.empty()
-                ? layer.hot_local_by_global
-                : layer.decode_hot_local_by_global;
+        const MoeHybridOwnerMapView owner_maps =
+            moe_hybrid_owner_maps(layer, dynamic_route_balance);
+        const std::vector<int32_t> & decode_hot = *owner_maps.main;
+        const std::vector<int32_t> & decode_cold = *owner_maps.peer;
         std::vector<int32_t> hot_lut((size_t) w.n_expert, invalid_route);
         std::vector<int32_t> cold_lut((size_t) w.n_expert, invalid_route);
         std::vector<float> hot_valid((size_t) w.n_expert, 0.0f);
         std::vector<float> cold_valid((size_t) w.n_expert, 0.0f);
         for (int ie = 0; ie < w.n_expert; ++ie) {
-            const int32_t cold = layer.cold_local_by_global[(size_t) ie];
-            int32_t hot = preferred_hot[(size_t) ie];
+            int32_t hot = decode_hot[(size_t) ie];
+            const int32_t cold = decode_cold[(size_t) ie];
             // A phase-specific placement may move a resident expert to the
             // peer only when the peer owns a copy. Otherwise retain its
             // physical main-owner route so no selected expert is dropped.
-            if (hot < 0 && cold < 0) {
+            if (!dynamic_route_balance && hot < 0 && cold < 0) {
                 hot = layer.hot_local_by_global[(size_t) ie];
             }
             if (hot >= 0) {

@@ -1508,6 +1508,7 @@ GenerateResult Qwen35MoeBackend::restore_and_generate_impl(int slot,
     const int snap_pos = snapshot_cur_pos(slot);
     int committed = snap_pos;
     target_cache().cur_pos = committed;
+    result.restored_prefix_tokens = snap_pos;
 
     const int prompt_len = (int)req.prompt.size();
     if (prompt_len > 0 && prompt_len < snap_pos) {

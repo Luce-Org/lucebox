@@ -20,8 +20,8 @@
 //
 // qwen35 and qwen35moe share Qwen35Config, so their rows can differ on a
 // column the config carries — the moe backend simply never reads the field.
-// paged_attn is the one such column today; see the cross-check comment in
-// backend_factory.cpp for what that costs.
+// paged_attn and draft_block_size are such columns today; see the cross-check
+// comment in backend_factory.cpp for what that costs.
 //
 // Note on "qwen36": it is not a dispatchable architecture. model_card.cpp's
 // family fallback has a branch for it, but there is no factory case, so a
@@ -59,6 +59,7 @@ struct ArchCapabilities {
     FeatureSupport decode_draft;  // --draft
     FeatureSupport ddtree;        // --ddtree, --ddtree-budget, --ddtree-temp
     FeatureSupport verify_width;  // --verify-width
+    FeatureSupport draft_block_size; // --draft-block-size
     FeatureSupport fa_window;     // --fa-window
     FeatureSupport draft_swa;     // --draft-swa
     FeatureSupport paged_attn;    // --paged-attention
@@ -69,13 +70,13 @@ inline constexpr FeatureSupport kMono  = FeatureSupport::Monolithic;
 inline constexpr FeatureSupport kBoth  = FeatureSupport::Both;
 
 inline constexpr ArchCapabilities kArchCapabilities[] = {
-//   arch          split  rdraft pflash offload  draft  ddtree vwidth fa_win dswa    paged
-    {"qwen35",     true,  true,  true,  false,   kBoth, kBoth, kNever, kBoth, kBoth,  kMono},
-    {"qwen35moe",  false, false, false, true,    kMono, kMono, kNever, kMono, kMono,  kNever},
-    {"laguna",     true,  false, false, true,    kMono, kMono, kMono,  kNever, kNever, kNever},
-    {"qwen3",      false, false, true,  false,   kNever, kNever, kNever, kNever, kNever, kNever},
-    {"gemma4",     true,  false, false, false,   kMono, kNever, kNever, kBoth, kNever, kNever},
-    {"deepseek4",  true,  false, false, false,   kNever, kNever, kNever, kNever, kNever, kNever},
+//   arch          split  rdraft pflash offload  draft  ddtree vwidth dblock fa_win dswa    paged
+    {"qwen35",     true,  true,  true,  false,   kBoth, kBoth, kNever, kMono,  kBoth, kBoth,  kMono},
+    {"qwen35moe",  false, false, false, true,    kMono, kMono, kNever, kNever, kMono, kMono,  kNever},
+    {"laguna",     true,  false, false, true,    kMono, kMono, kMono,  kNever, kNever, kNever, kNever},
+    {"qwen3",      false, false, true,  false,   kNever, kNever, kNever, kNever, kNever, kNever, kNever},
+    {"gemma4",     true,  false, false, false,   kMono, kNever, kNever, kNever, kBoth, kNever, kNever},
+    {"deepseek4",  true,  false, false, false,   kNever, kNever, kNever, kNever, kNever, kNever, kNever},
 };
 
 inline constexpr std::size_t kArchCount =
@@ -112,6 +113,7 @@ constexpr bool row_has_both(const ArchCapabilities & c) {
     return c.decode_draft == FeatureSupport::Both ||
            c.ddtree       == FeatureSupport::Both ||
            c.verify_width == FeatureSupport::Both ||
+           c.draft_block_size == FeatureSupport::Both ||
            c.fa_window    == FeatureSupport::Both ||
            c.draft_swa    == FeatureSupport::Both ||
            c.paged_attn   == FeatureSupport::Both;
@@ -231,6 +233,12 @@ inline bool arch_supports_ddtree(const std::string & arch,
 inline bool arch_supports_verify_width(const std::string & arch,
                                        bool is_layer_split) {
     return detail::arch_has(arch, &ArchCapabilities::verify_width, is_layer_split);
+}
+
+inline bool arch_supports_draft_block_size(const std::string & arch,
+                                           bool is_layer_split) {
+    return detail::arch_has(
+        arch, &ArchCapabilities::draft_block_size, is_layer_split);
 }
 
 inline bool arch_supports_fa_window(const std::string & arch,

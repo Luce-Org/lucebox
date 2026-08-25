@@ -18,6 +18,37 @@ backend (qwen35, qwen3, gemma4, laguna).
 
 ---
 
+## Agent Turn Cache
+
+Start the server with `--agent-turn-cache` to extend the existing in-memory
+prefix cache through generated tool calls. After the model emits a valid tool
+call, the server reuses its deepest compatible prefix checkpoint, replays the
+uncached tail once, and saves the canonical completed turn. On the next OpenAI
+Chat Completions or Responses request, only the appended tool result and new
+suffix need prefill.
+
+This is a server-wide optimization; request bodies do not change. It requires
+`--prefix-cache-slots` to be nonzero. Compressed or token-rewritten prompts and
+requests without a compatible checkpoint safely fall back to ordinary prefix
+caching.
+
+The replay moves prefill work out of the follow-up request when tool execution
+is long enough to overlap it; it does not eliminate that work. Paged attention
+and `--max-concurrency` do not yet support shared prefix blocks, so they cannot
+be combined with Agent Turn Cache.
+
+The exact full-prompt cache may remain enabled for identical-request hits.
+Disable it only when benchmarking the incremental Agent Turn Cache benefit.
+
+Successful Chat Completions and Responses requests expose the measured result
+under `usage.timings`:
+
+- `agent_turn_cache_hit`: the restored prefix includes a generated agent turn.
+- `cached_prefix_tokens`: backend-confirmed tokens restored from KV state.
+- `prefilled_tokens`: prompt tokens computed for this request.
+
+---
+
 ## POST `/v1/chat/completions` (OpenAI-compatible)
 
 ### Supported Request Parameters

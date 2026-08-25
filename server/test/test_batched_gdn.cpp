@@ -212,6 +212,73 @@ bool run_conv(ggml_backend_t backend, int n_seqs,
     return ok;
 }
 
+bool test_cpu_rejects_gpu_only_extensions(ggml_backend_t backend) {
+    ggml_init_params params{};
+    params.mem_size = 2 * 1024 * 1024;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) return false;
+
+    ggml_tensor * sx = ggml_new_tensor_3d(
+        ctx, GGML_TYPE_F32, D_CONV, CONV_CHANNELS, 1);
+    ggml_tensor * conv_w = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F32, D_CONV, CONV_CHANNELS);
+    ggml_tensor * plain_conv = ggml_ssm_conv(ctx, sx, conv_w);
+
+    ggml_tensor * step_x = ggml_new_tensor_3d(
+        ctx, GGML_TYPE_F32, CONV_CHANNELS, 1, 1);
+    ggml_tensor * step_state = ggml_new_tensor_3d(
+        ctx, GGML_TYPE_F32, D_CONV - 1, CONV_CHANNELS, 1);
+    ggml_tensor * fused_step = ggml_ssm_conv_step(
+        ctx, step_x, conv_w, step_state, nullptr);
+
+    constexpr int DYN_HIDDEN = 32;
+    constexpr int DYN_GROUP = 16;
+    constexpr int DYN_TOKENS = 2;
+    ggml_tensor * dyn_x = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F32, DYN_HIDDEN, DYN_TOKENS);
+    ggml_tensor * dyn_base = ggml_new_tensor_3d(
+        ctx, GGML_TYPE_F32, DYN_HIDDEN, D_CONV, 2);
+    ggml_tensor * dyn_weights = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F32,
+        2 * D_CONV * (DYN_HIDDEN / DYN_GROUP), DYN_TOKENS);
+    ggml_tensor * fused_dyn = ggml_dflash_dyn_conv(
+        ctx, dyn_x, dyn_base, dyn_weights, 0, D_CONV, DYN_GROUP);
+
+    ggml_tensor * q = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, S_V, N_HEAD, 1, 1);
+    ggml_tensor * k = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, S_V, N_HEAD, 1, 1);
+    ggml_tensor * v = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, S_V, N_HEAD, 1, 1);
+    ggml_tensor * g = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, 1, N_HEAD, 1, 1);
+    ggml_tensor * beta = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, 1, N_HEAD, 1, 1);
+    ggml_tensor * state = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, S_V, S_V, N_HEAD, 1);
+    ggml_tensor * plain_gdn = ggml_gated_delta_net(
+        ctx, q, k, v, g, beta, state);
+    const bool plain_gdn_supported =
+        ggml_backend_supports_op(backend, plain_gdn);
+    ggml_tensor * raw_gdn = ggml_gated_delta_net(
+        ctx, q, k, v, g, beta, state);
+    ggml_tensor * gate_ba = ggml_new_tensor_1d(
+        ctx, GGML_TYPE_F32, 2 * N_HEAD);
+    ggml_gated_delta_net_set_raw_gates(raw_gdn, gate_ba);
+
+    const bool ok =
+        ggml_backend_supports_op(backend, plain_conv) &&
+        !ggml_backend_supports_op(backend, fused_step) &&
+        !ggml_backend_supports_op(backend, fused_dyn) &&
+        plain_gdn_supported &&
+        !ggml_backend_supports_op(backend, raw_gdn);
+    std::printf("batched gdn CPU capability guards       %s\n",
+                ok ? "PASS" : "FAIL");
+    ggml_free(ctx);
+    return ok;
+}
+
 bool test_masked_set_rows(ggml_backend_t backend) {
     constexpr int ROW_WIDTH = 4;
     constexpr int DEST_ROWS = 4;
@@ -530,6 +597,9 @@ int main(int argc, char ** argv) {
     ok = test_gdn_active_slots(backend, rng) && ok;
     ok = test_conv(backend, rng) && ok;
     ok = test_masked_set_rows(backend) && ok;
+    if (cpu) {
+        ok = test_cpu_rejects_gpu_only_extensions(backend) && ok;
+    }
 
     ggml_backend_free(backend);
     return ok ? 0 : 1;

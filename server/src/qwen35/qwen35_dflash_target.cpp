@@ -1,11 +1,13 @@
 // Qwen35DFlashTarget — DFlashTarget adapter for qwen35 hybrid models.
 
 #include "qwen35_dflash_target.h"
+#include "delta_net_specla.h"
 #include "graph_builders.h"
 #include "step_graph.h"
 #include "attn_masks.h"
 #include "prefill_helpers.h"
 #include "common/geometric_draft_topk_cuda.h"
+#include "common/specla_commit_cuda.h"
 #include "ggml-backend-impl.h"
 // gpu_runtime_compat.h maps the raw cudaStream_t / cudaMemcpy* symbols used
 // below (rollback_to / rollback_to_tree) onto their HIP equivalents. Without
@@ -414,11 +416,26 @@ bool Qwen35DFlashTarget::verify_tree(
     }
     const int hidden = w_.n_embd;
 
+    // Root-inclusive topology. Padding nodes are independent root children;
+    // their outputs are masked, but scheduling them keeps every downstream
+    // activation initialized without contaminating a real branch.
+    std::vector<int32_t> parent_ids(N, 0);
+    parent_ids[0] = -1;
+    for (int i = 1; i < N_actual; i++) parent_ids[i] = (int32_t)tree.parents[i];
+    SpecLAHLDSchedule hld;
+    const SpecLAHLDSchedule * hld_ptr = nullptr;
+    if (specla_active()) {
+        hld = make_specla_hld_schedule(
+            parent_ids.data(), N, cache_.specla_pending_count);
+        if (hld.packed.empty()) return false;
+        hld_ptr = &hld;
+    }
+
     // Tree-verify graph: ancestor-masked batched forward over DFS-ordered nodes.
     // Capture per-node SSM intermediates so rollback_to_tree() can restore.
     if (!build_target_step_tree(sg_, w_, cache_, backend_,
                                 /*kv_start=*/committed, /*n_tokens=*/N,
-                                fa_window_, kq_stride_pad_)) {
+                                fa_window_, kq_stride_pad_, hld_ptr)) {
         std::fprintf(stderr, "verify_tree: build_target_step_tree failed\n");
         return false;
     }
@@ -470,10 +487,28 @@ bool Qwen35DFlashTarget::verify_tree(
         std::fprintf(stderr, "verify_tree: step graph has no parent_ids tensor\n");
         return false;
     }
-    std::vector<int32_t> parent_ids(N, 0);
-    parent_ids[0] = -1;
-    for (int i = 1; i < N_actual; i++) parent_ids[i] = (int32_t)tree.parents[i];
-    ggml_backend_tensor_set(sg_.parent_ids, parent_ids.data(), 0, sizeof(int32_t) * N);
+    // HLD carries the topology for both DeltaNet and convolution, so the
+    // legacy parent tensor is intentionally disconnected and unallocated.
+    if (sg_.parent_ids->buffer) {
+        ggml_backend_tensor_set(sg_.parent_ids, parent_ids.data(), 0,
+                                sizeof(int32_t) * N);
+    } else if (!sg_.specla_hld) {
+        std::fprintf(stderr, "verify_tree: parent_ids tensor is unallocated\n");
+        return false;
+    }
+
+    // SpecLA tree verify: ancestor masks over the same root-inclusive flat
+    // node order. Padding nodes hang off the root; their outputs/factors are
+    // never read.
+    if (sg_.specla_m_strict) {
+        std::vector<float> ms((size_t)N * N);
+        std::vector<float> mi((size_t)N * N);
+        std::vector<float> me((size_t)N * N);
+        fill_specla_masks(parent_ids.data(), N, ms.data(), mi.data(), me.data());
+        ggml_backend_tensor_set(sg_.specla_m_strict, ms.data(), 0, sizeof(float) * ms.size());
+        ggml_backend_tensor_set(sg_.specla_m_incl,   mi.data(), 0, sizeof(float) * mi.size());
+        ggml_backend_tensor_set(sg_.specla_m_eye,    me.data(), 0, sizeof(float) * me.size());
+    }
 
     auto st = ggml_backend_graph_compute(backend_, sg_.gf);
     if (st != GGML_STATUS_SUCCESS) {
@@ -544,12 +579,74 @@ bool Qwen35DFlashTarget::rollback_to_tree(
     const int n_delta = (int)sg_.delta_captures.size();
     GGML_ASSERT(!cache_.ssm_state.empty());
     const bool meta_backend = is_meta_tensor(cache_.ssm_state.front());
+    const bool specla = specla_active();
+    if (specla && meta_backend) return false;  // TP meta is outside SpecLA scope
+    if (specla && !sg_.specla_hld) {
+        // The fully factorized tree fallback would need per-ancestry conv
+        // commit from the accepted DFS path; production tree verify always
+        // builds an HLD schedule, so fail closed instead of committing a
+        // chain-window conv state.
+        std::fprintf(stderr,
+            "rollback_to_tree: factorized SpecLA tree fallback is unsupported\n");
+        return false;
+    }
+
+    if (specla) {
+        if (!cache_.factor_k_all || !cache_.factor_v_new_all ||
+            !cache_.factor_g_ps_all || !cache_.conv_factor_all ||
+            !cache_.factor_k_all_alt || !cache_.factor_v_new_all_alt ||
+            !cache_.factor_g_ps_all_alt || !cache_.conv_factor_all_alt) {
+            return false;
+        }
+        for (int il = 0; il < n_delta; il++) {
+            const DeltaNetCapture & cap = sg_.delta_captures[il];
+            if (!cap.factor_k || !cap.factor_v_new || !cap.factor_g_ps ||
+                !cap.conv_input || rollback_dfs >= cap.factor_k->ne[2]) return false;
+        }
+
+        SpeclaFactorBanks banks;
+        banks.k[0]    = (float *)cache_.factor_k_all->data;
+        banks.v[0]    = (float *)cache_.factor_v_new_all->data;
+        banks.g[0]    = (float *)cache_.factor_g_ps_all->data;
+        banks.conv[0] = (float *)cache_.conv_factor_all->data;
+        banks.k[1]    = (float *)cache_.factor_k_all_alt->data;
+        banks.v[1]    = (float *)cache_.factor_v_new_all_alt->data;
+        banks.g[1]    = (float *)cache_.factor_g_ps_all_alt->data;
+        banks.conv[1] = (float *)cache_.conv_factor_all_alt->data;
+
+        const int old_pending_bank = cache_.specla_pending_bank;
+        if (walked_sibling) {
+            if (!cache_.specla_idx || !cache_.specla_idx->data) return false;
+            std::vector<int32_t> idx(accepted_dfs.begin(), accepted_dfs.end());
+            ggml_backend_tensor_set(cache_.specla_idx, idx.data(), 0,
+                                    idx.size()*sizeof(int32_t));
+        }
+        int new_pending_bank = old_pending_bank;
+        if (!specla_rotate_pending_factors(
+                banks,
+                walked_sibling ? (const int32_t *)cache_.specla_idx->data : nullptr,
+                old_pending_bank, walked_sibling, commit_n,
+                (int)cache_.factor_k_all->ne[0],
+                (int)cache_.factor_v_new_all->ne[0],
+                (int)cache_.factor_k_all->ne[1],
+                n_delta, (int)cache_.conv_factor_all->ne[0],
+                /*stream=*/nullptr, &new_pending_bank)) {
+            std::fprintf(stderr, "rollback_to_tree: SpecLA factor rotation failed\n");
+            return false;
+        }
+        cache_.specla_pending_bank = new_pending_bank;
+        cache_.specla_pending_count = commit_n;
+    }
+
     cudaStream_t stream = nullptr;
     for (int il = 0; il < n_delta; il++) {
         const DeltaNetCapture & cap = sg_.delta_captures[il];
-        if (!cap.ssm_intermediate_states || !cap.conv_input) {
+        if ((!specla && !cap.ssm_intermediate_states) || !cap.conv_input) {
             std::fprintf(stderr, "rollback_to_tree: missing capture at layer %d\n", il);
             return false;
+        }
+        if (specla) {
+            continue;
         }
         if (rollback_dfs >= (int)cap.ssm_intermediate_states->ne[3]) {
             std::fprintf(stderr, "rollback_to_tree: rollback_dfs %d >= captured slots %d (layer %d)\n",
@@ -557,6 +654,7 @@ bool Qwen35DFlashTarget::rollback_to_tree(
             return false;
         }
         // SSM state ← intermediate[rollback_dfs] (dequantize Q8_0/F16 → f32).
+        {
         const size_t ssm_elems =
             (size_t)cache_.ssm_state[il]->ne[0] *
             (size_t)cache_.ssm_state[il]->ne[1] *
@@ -598,6 +696,7 @@ bool Qwen35DFlashTarget::rollback_to_tree(
                          (int64_t)ssm_elems, stream);
             }
         }
+        }  // end non-SpecLA SSM restore
 
         // Conv state ← the K-1 most recent inputs along rollback_dfs's ancestry.
         const int K_conv = 4;
@@ -752,6 +851,10 @@ bool Qwen35DFlashTarget::rollback_to_tree(
 }
 
 bool Qwen35DFlashTarget::snapshot_kv() {
+    // SpecLA applies only the already-committed pending path to durable state
+    // during verify; current candidates remain in the factor bank. There is
+    // therefore no speculative durable mutation to snapshot or undo.
+    if (specla_active()) return true;
     if (!cache_.ssm_state.empty() && is_meta_tensor(cache_.ssm_state.front())) {
         return copy_meta_recurrent_state(
             cache_.ssm_state, cache_.conv_state,
@@ -761,6 +864,16 @@ bool Qwen35DFlashTarget::snapshot_kv() {
 }
 
 bool Qwen35DFlashTarget::restore_kv() {
+    if (specla_active()) {
+        // A successful SpecLA verify has already folded the *previous*
+        // accepted factors into the durable state, while the factors produced
+        // by that verify are still only candidates.  Restoring therefore means
+        // dropping the pending candidate selection, not copying a full state
+        // snapshot.  Leaving the old count live would apply it a second time
+        // when a replay graph starts.
+        cache_.specla_pending_count = 0;
+        return true;
+    }
     if (!cache_.ssm_state.empty() && is_meta_tensor(cache_.ssm_state.front())) {
         return copy_meta_recurrent_state(
             cache_.ssm_state_snap, cache_.conv_state_snap,
@@ -770,11 +883,11 @@ bool Qwen35DFlashTarget::restore_kv() {
 }
 
 bool Qwen35DFlashTarget::supports_fast_rollback() const {
-    // Pure capability. Fast-rollback only restores recurrent SSM/conv state and
-    // defers the bonus token, so it is pager-safe even while paging: committed
-    // KV rows are written slot-mapped by verify_batch(), and the deferred bonus
-    // is re-fed at the next committed position on the following step.
-    return fast_rollback_;
+    // KVFlash requires the set-rows write path, which is mutually exclusive
+    // with recurrent capture. Report the runtime capability, not just the
+    // requested mode, so callers snapshot and replay instead of attempting a
+    // rollback from missing/stale captures.
+    return fast_rollback_ && pager_ == nullptr;
 }
 
 bool Qwen35DFlashTarget::rollback_to(int base_pos, int commit_n) {
@@ -809,6 +922,12 @@ bool Qwen35DFlashTarget::rollback_to(int base_pos, int commit_n) {
             std::fprintf(stderr, "rollback_to: no delta_captures\n");
         }
         return false;
+    }
+
+    // SpecLA kept the current candidates out of durable state, so acceptance
+    // must rotate their factor bank even when the whole window matched.
+    if (specla_active()) {
+        return rollback_to_specla(base_pos, commit_n);
     }
 
     // If all tokens accepted, the SSM state after processing all q_len tokens
@@ -953,6 +1072,117 @@ bool Qwen35DFlashTarget::rollback_to(int base_pos, int commit_n) {
     }
 
     cache_.cur_pos = base_pos + commit_n;
+    return true;
+}
+
+bool Qwen35DFlashTarget::rollback_to_specla(int base_pos, int commit_n) {
+    const int n_delta = (int)sg_.delta_captures.size();
+    const int q_len = cache_.cur_pos - base_pos;
+    if (n_delta == 0 || commit_n <= 0 || commit_n > q_len) return false;
+    if (!cache_.ssm_state.empty() && is_meta_tensor(cache_.ssm_state.front())) {
+        // Tensor-parallel meta backends are outside SpecLA's scope; fail so
+        // the caller degrades to restore+replay (which stays correct: the
+        // capture verify did not mutate state and replay runs writeback-on).
+        return false;
+    }
+
+    // The just-computed verify wrote the bank opposite the one it consumed.
+    // A chain acceptance is already compact and in path order, so rollback is
+    // only a host-side bank rotation. The next verify applies these factors
+    // inside its state-resident kernels.
+    if (!cache_.factor_k_all || !cache_.factor_v_new_all ||
+        !cache_.factor_g_ps_all || !cache_.conv_factor_all ||
+        !cache_.factor_k_all_alt || !cache_.factor_v_new_all_alt ||
+        !cache_.factor_g_ps_all_alt || !cache_.conv_factor_all_alt) {
+        return false;
+    }
+    for (int il = 0; il < n_delta; il++) {
+        const DeltaNetCapture & cap = sg_.delta_captures[il];
+        if (!cap.factor_k || !cap.factor_v_new || !cap.factor_g_ps ||
+            !cap.conv_input || commit_n > cap.factor_k->ne[2] ||
+            commit_n > cap.conv_input->ne[1]) {
+            std::fprintf(stderr, "rollback_to_specla: factor capture bad layer=%d\n", il);
+            return false;
+        }
+    }
+
+    if (!sg_.specla_hld) {
+        // Fully factorized fallback: no next HLD kernel will consume the
+        // pending factors, so commit the just-verified bank to durable state
+        // (and its accepted conv window) immediately.
+        std::vector<int32_t> idx((size_t)commit_n);
+        for (int i = 0; i < commit_n; i++) idx[(size_t)i] = i;
+        if (!specla_commit_accepted(cache_, backend_, idx.data(), commit_n)) {
+            std::fprintf(stderr, "rollback_to_specla: factorized commit failed\n");
+            return false;
+        }
+        cache_.cur_pos = base_pos + commit_n;
+        return true;
+    }
+
+    SpeclaFactorBanks banks;
+    banks.k[0]    = (float *)cache_.factor_k_all->data;
+    banks.v[0]    = (float *)cache_.factor_v_new_all->data;
+    banks.g[0]    = (float *)cache_.factor_g_ps_all->data;
+    banks.conv[0] = (float *)cache_.conv_factor_all->data;
+    banks.k[1]    = (float *)cache_.factor_k_all_alt->data;
+    banks.v[1]    = (float *)cache_.factor_v_new_all_alt->data;
+    banks.g[1]    = (float *)cache_.factor_g_ps_all_alt->data;
+    banks.conv[1] = (float *)cache_.conv_factor_all_alt->data;
+
+    int new_pending_bank = cache_.specla_pending_bank;
+    if (!specla_rotate_pending_factors(
+            banks, /*idx_dev=*/nullptr, cache_.specla_pending_bank,
+            /*walked_sibling=*/false, commit_n,
+            (int)cache_.factor_k_all->ne[0],
+            (int)cache_.factor_v_new_all->ne[0],
+            (int)cache_.factor_k_all->ne[1],
+            n_delta, (int)cache_.conv_factor_all->ne[0],
+            /*stream=*/nullptr, &new_pending_bank)) {
+        std::fprintf(stderr, "rollback_to_specla: factor bank rotation failed\n");
+        return false;
+    }
+    cache_.specla_pending_bank = new_pending_bank;
+    cache_.specla_pending_count = commit_n;
+    cache_.cur_pos = base_pos + commit_n;
+    return true;
+}
+
+bool Qwen35DFlashTarget::finish_speculative_state() {
+    if (!specla_active() || cache_.specla_pending_count == 0) return true;
+    if (!cache_.factor_k_all || !cache_.factor_v_new_all ||
+        !cache_.factor_g_ps_all || !cache_.conv_factor_all ||
+        !cache_.factor_k_all_alt || !cache_.factor_v_new_all_alt ||
+        !cache_.factor_g_ps_all_alt || !cache_.conv_factor_all_alt ||
+        !cache_.specla_state_ptrs || !cache_.specla_conv_state_ptrs) {
+        return false;
+    }
+
+    SpeclaFactorBanks banks;
+    banks.k[0]    = (float *)cache_.factor_k_all->data;
+    banks.v[0]    = (float *)cache_.factor_v_new_all->data;
+    banks.g[0]    = (float *)cache_.factor_g_ps_all->data;
+    banks.conv[0] = (float *)cache_.conv_factor_all->data;
+    banks.k[1]    = (float *)cache_.factor_k_all_alt->data;
+    banks.v[1]    = (float *)cache_.factor_v_new_all_alt->data;
+    banks.g[1]    = (float *)cache_.factor_g_ps_all_alt->data;
+    banks.conv[1] = (float *)cache_.conv_factor_all_alt->data;
+
+    const int n_delta = (int)cache_.ssm_state.size();
+    const int conv_channels = (int)cache_.conv_factor_all->ne[0];
+    if (!specla_flush_pending_factors(
+            banks,
+            (float * const *)cache_.specla_state_ptrs->data,
+            (float * const *)cache_.specla_conv_state_ptrs->data,
+            cache_.specla_pending_bank, cache_.specla_pending_count,
+            (int)cache_.factor_k_all->ne[0],
+            (int)cache_.factor_v_new_all->ne[0],
+            (int)cache_.factor_k_all->ne[1],
+            n_delta, conv_channels, w_.ssm_d_conv,
+            /*stream=*/nullptr)) {
+        return false;
+    }
+    cache_.specla_pending_count = 0;
     return true;
 }
 

@@ -35,6 +35,14 @@ int deepseek4_hybrid_prefill_chunk_tokens(
 
 bool deepseek4_prefill_allows_decode_graph_reuse(bool save_snapshot);
 
+// Selects the next sparse heterogeneous prefill batch. Large batches retain
+// their throughput through the memory-light part of the prompt, then shrink
+// at the late-context boundary where one attention arena would otherwise
+// exhaust a tightly packed discrete GPU.
+int deepseek4_hybrid_prefill_step_tokens(
+    int configured_chunk,
+    int position,
+    int remaining_tokens);
 class DeepSeek4Backend : public ModelBackend {
 public:
     explicit DeepSeek4Backend(const DeepSeek4BackendConfig & cfg);

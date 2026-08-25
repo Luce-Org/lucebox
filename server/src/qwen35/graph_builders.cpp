@@ -1,10 +1,14 @@
 #include "graph_builders.h"
 
+#include "common/specla_mode.h"
+#include "delta_net_specla.h"
+
 #include "ggml-alloc.h"
 
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 namespace dflash::common {
@@ -83,7 +87,10 @@ bool build_layer_step(
         ggml_set_input(sg.parent_ids);
     }
 
-    sg.gf = ggml_new_graph_custom(sg.ctx, 16384, false);
+    // 32k nodes: the chunked delta-net graph (CS = 32) reaches ~17k nodes at
+    // a 512-token ubatch, and these per-layer builders construct the same
+    // blocks for layer-split / tensor-parallel placements.
+    sg.gf = ggml_new_graph_custom(sg.ctx, 32768, false);
 
     ggml_tensor * layer_out = build_qwen35_layer(
         sg.ctx, sg.gf, w, cache, layer_idx,
@@ -159,7 +166,10 @@ bool build_layer_prefn_step(
         }
     }
 
-    sg.gf = ggml_new_graph_custom(sg.ctx, 16384, false);
+    // 32k nodes: the chunked delta-net graph (CS = 32) reaches ~17k nodes at
+    // a 512-token ubatch, and these per-layer builders construct the same
+    // blocks for layer-split / tensor-parallel placements.
+    sg.gf = ggml_new_graph_custom(sg.ctx, 32768, false);
     QwenLayerPrefnOutputs go = build_qwen35_layer_prefn(
         sg.ctx, sg.gf, w, cache, layer_idx,
         sg.inp_embed, sg.positions, sg.attn_mask,
@@ -235,7 +245,10 @@ bool build_hybrid_full_layer_step(
         }
     }
 
-    sg.gf = ggml_new_graph_custom(sg.ctx, 16384, false);
+    // 32k nodes: the chunked delta-net graph (CS = 32) reaches ~17k nodes at
+    // a 512-token ubatch, and these per-layer builders construct the same
+    // blocks for layer-split / tensor-parallel placements.
+    sg.gf = ggml_new_graph_custom(sg.ctx, 32768, false);
 
     ggml_tensor * moe_selected = nullptr;
     ggml_tensor * layer_out = build_qwen35_layer(
@@ -491,7 +504,9 @@ bool build_target_step(
         ggml_set_input(sg.logits_row_indices);
     }
 
-    sg.gf = ggml_new_graph_custom(sg.ctx, 16384, false);
+    // 32k nodes: the chunked delta-net prefill graph (CS = 32) reaches ~17k
+    // nodes at a 512-token ubatch.
+    sg.gf = ggml_new_graph_custom(sg.ctx, 32768, false);
 
     // Step-invariant KV write: only when topology can't vary per step.
     // DFLASH_QWEN35_NO_KVPAD=1 restores the legacy cpy append + exact-length
@@ -513,6 +528,19 @@ bool build_target_step(
                                               n_tokens, w.n_head_kv);
         ggml_set_name(sg.kv_write_rows, "kv_write_rows");
         ggml_set_input(sg.kv_write_rows);
+    }
+
+    SpecLAHLDSchedule hld_schedule;
+    if (capture_delta_intermediate && specla_enabled() && !cache.factor_k.empty()) {
+        std::vector<int32_t> parents((size_t)n_tokens);
+        for (int t = 0; t < n_tokens; ++t) parents[(size_t)t] = t - 1;
+        hld_schedule = make_specla_hld_schedule(
+            parents.data(), n_tokens, cache.specla_pending_count);
+        if (hld_schedule.packed.empty()) return false;
+        sg.specla_hld = ggml_new_tensor_1d(
+            sg.ctx, GGML_TYPE_I32, hld_schedule.packed.size());
+        ggml_set_name(sg.specla_hld, "specla_hld");
+        ggml_set_input(sg.specla_hld);
     }
 
     QwenGraphInputs gi{};
@@ -541,6 +569,14 @@ bool build_target_step(
     gi.logits_row_indices         = sg.logits_row_indices;
     gi.prefill_segments           = prefill_segments;
     gi.n_prefill_segments         = n_prefill_segments;
+    gi.specla_m_strict            = sg.specla_m_strict;
+    gi.specla_m_incl              = sg.specla_m_incl;
+    gi.specla_m_eye               = sg.specla_m_eye;
+    gi.specla_hld                 = sg.specla_hld;
+    gi.specla_n_chains            = hld_schedule.n_chains;
+    gi.specla_n_waves             = hld_schedule.n_waves;
+    gi.specla_n_boundaries        = hld_schedule.n_boundaries;
+    gi.specla_max_parallel_chains = hld_schedule.max_parallel_chains;
 
     QwenGraphOutputs go = build_qwen35_graph(sg.ctx, sg.gf, w, cache, gi);
     if (!go.logits) return false;
@@ -557,7 +593,12 @@ bool build_target_step(
     if (!sg.alloc) {
         sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     }
-    return ggml_gallocr_alloc_graph(sg.alloc, sg.gf);
+    if (!ggml_gallocr_alloc_graph(sg.alloc, sg.gf)) return false;
+    if (sg.specla_hld) {
+        ggml_backend_tensor_set(sg.specla_hld, hld_schedule.packed.data(), 0,
+            hld_schedule.packed.size()*sizeof(int32_t));
+    }
+    return true;
 }
 
 // ── build_target_step_tree ──────────────────────────────────────
@@ -570,7 +611,8 @@ bool build_target_step_tree(
     int kv_start,
     int n_tokens,
     int fa_window,
-    int kq_stride_pad) {
+    int kq_stride_pad,
+    const SpecLAHLDSchedule * hld_schedule) {
     step_graph_free(sg);
 
     ggml_init_params ip{};
@@ -600,6 +642,29 @@ bool build_target_step_tree(
     ggml_set_name(sg.parent_ids, "parent_ids");
     ggml_set_input(sg.parent_ids);
 
+    // SpecLA tree verify: ancestor masks over the DFS-ordered nodes replace
+    // the sequential kernel's parent_ids state fanout (parent_ids still
+    // steers the tree conv). Host-filled by verify_tree from tree.parents.
+    if (specla_enabled() && !cache.factor_k.empty() && hld_schedule) {
+        if (hld_schedule->n_nodes != n_tokens || hld_schedule->packed.empty()) {
+            return false;
+        }
+        sg.specla_hld = ggml_new_tensor_1d(
+            sg.ctx, GGML_TYPE_I32, hld_schedule->packed.size());
+        ggml_set_name(sg.specla_hld, "specla_hld");
+        ggml_set_input(sg.specla_hld);
+    } else if (specla_enabled() && !cache.factor_k.empty()) {
+        sg.specla_m_strict = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F32, n_tokens, n_tokens);
+        sg.specla_m_incl   = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F32, n_tokens, n_tokens);
+        sg.specla_m_eye    = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F32, n_tokens, n_tokens);
+        ggml_set_name(sg.specla_m_strict, "specla_m_strict");
+        ggml_set_name(sg.specla_m_incl,   "specla_m_incl");
+        ggml_set_name(sg.specla_m_eye,    "specla_m_eye");
+        ggml_set_input(sg.specla_m_strict);
+        ggml_set_input(sg.specla_m_incl);
+        ggml_set_input(sg.specla_m_eye);
+    }
+
     sg.gf = ggml_new_graph_custom(sg.ctx, 16384, false);
 
     QwenGraphInputs gi{};
@@ -612,6 +677,14 @@ bool build_target_step_tree(
     gi.capture_layers             = true;
     gi.capture_delta_intermediate = true;
     gi.parent_ids                 = sg.parent_ids;
+    gi.specla_m_strict            = sg.specla_m_strict;
+    gi.specla_m_incl              = sg.specla_m_incl;
+    gi.specla_m_eye               = sg.specla_m_eye;
+    gi.specla_hld                 = sg.specla_hld;
+    gi.specla_n_chains            = hld_schedule ? hld_schedule->n_chains : 0;
+    gi.specla_n_waves             = hld_schedule ? hld_schedule->n_waves : 0;
+    gi.specla_n_boundaries        = hld_schedule ? hld_schedule->n_boundaries : 0;
+    gi.specla_max_parallel_chains = hld_schedule ? hld_schedule->max_parallel_chains : 0;
 
     QwenGraphOutputs go = build_qwen35_graph(sg.ctx, sg.gf, w, cache, gi);
     if (!go.logits) return false;
@@ -627,7 +700,12 @@ bool build_target_step_tree(
     if (!sg.alloc) {
         sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     }
-    return ggml_gallocr_alloc_graph(sg.alloc, sg.gf);
+    if (!ggml_gallocr_alloc_graph(sg.alloc, sg.gf)) return false;
+    if (sg.specla_hld) {
+        ggml_backend_tensor_set(sg.specla_hld, hld_schedule->packed.data(), 0,
+            hld_schedule->packed.size()*sizeof(int32_t));
+    }
+    return true;
 }
 
 

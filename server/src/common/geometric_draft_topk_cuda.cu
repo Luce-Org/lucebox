@@ -13,7 +13,7 @@ namespace dflash::common {
 
 namespace {
 
-constexpr int kMaxK    = 8;     // ddtree_K is 8 in practice; K>kMaxK → CPU fallback
+constexpr int kMaxK    = 16;    // ddtree_K is 8, the DFlash 2 selector uses 16; K>kMaxK → CPU fallback
 constexpr int kBlock   = 256;   // threads per block (power of two for the reduction)
 constexpr int kMaxSplit = 128;  // max vocab splits per position (combine-block cap)
 
@@ -377,16 +377,21 @@ bool geometric_extract_draft_topk_cuda(const void * d_logits,
                 if (use_vec) { DFLASH_TOPK_LAUNCH(KV, true) }                                   \
                 else         { DFLASH_TOPK_LAUNCH(KV, false) }                                  \
                 break;
+        // K values without an instantiated kernel must fail loud so the
+        // caller falls back to the CPU path; the old silent default returned
+        // success with uninitialized scratch as token ids.
+        bool launched = true;
         switch (K) {
             DFLASH_TOPK_CASE(1) DFLASH_TOPK_CASE(2) DFLASH_TOPK_CASE(3) DFLASH_TOPK_CASE(4)
             DFLASH_TOPK_CASE(5) DFLASH_TOPK_CASE(6) DFLASH_TOPK_CASE(7) DFLASH_TOPK_CASE(8)
-            default: break;
+            DFLASH_TOPK_CASE(12) DFLASH_TOPK_CASE(16)
+            default: launched = false; break;
         }
 #undef DFLASH_TOPK_CASE
 #undef DFLASH_TOPK_LAUNCH
 
         if (kProfile) cudaEventRecord(e_k1);
-        if (cudaGetLastError() == cudaSuccess && cudaDeviceSynchronize() == cudaSuccess) {
+        if (launched && cudaGetLastError() == cudaSuccess && cudaDeviceSynchronize() == cudaSuccess) {
             const cudaError_t e1 = cudaMemcpy(out_log_probs, g_scratch.d_lp,
                                               n * sizeof(float), cudaMemcpyDeviceToHost);
             const cudaError_t e2 = cudaMemcpy(out_token_ids, g_scratch.d_ids,

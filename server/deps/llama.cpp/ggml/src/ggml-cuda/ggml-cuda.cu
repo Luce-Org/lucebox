@@ -473,7 +473,11 @@ const ggml_cuda_device_info & ggml_cuda_info() {
 
 // buffer pool for cuda (legacy)
 struct ggml_cuda_pool_leg : public ggml_cuda_pool {
-    static const int MAX_BUFFERS = 256;
+    // 1024 (upstream 256): LUCE_Q8_MEMO keeps one pooled q8_1 activation
+    // buffer per quantized matmul alive across a whole graph evaluation
+    // (~300 on a 64-layer hybrid), and a full pool falls back to freeing
+    // in-flight buffers with cudaFree.
+    static const int MAX_BUFFERS = 1024;
 
     int device;
     struct ggml_cuda_buffer {
@@ -2582,6 +2586,14 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
                              dst->type == GGML_TYPE_F32 &&
                              ncols_dst <= (is_mul_mat_id ? MMVQ_MAX_MOE_BATCH_SIZE : MMVQ_MAX_BATCH_SIZE);
+#ifdef ROCMFP2_AFFINE
+    // The affine MMVQ dot includes the offset correction in vecdotq.cuh.
+    // Keep the conservative dequantize fallback unless explicitly enabled.
+    if (src0->type == GGML_TYPE_Q2_0_ROCMFP2 &&
+        std::getenv("DFLASH_CUDA_MMVQ_FP2_AFFINE") == nullptr) {
+        use_mul_mat_vec_q = false;
+    }
+#endif // ROCMFP2_AFFINE
 
     // fusion is not universally faster on Pascal
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -2773,7 +2785,9 @@ static bool ggml_cuda_try_fuse_mul_mat_glu(
         }
 
         const int64_t ncols = ids ? src1->ne[2] : src1->ne[1];
-        if (ggml_cuda_should_use_mmq(src0->type, cc, ncols, src0->ne[2])) {
+        if (ggml_cuda_should_use_mmq(
+                src0->type, cc, ncols,
+                ids ? src0->ne[2] : /*n_experts=*/0)) {
             ggml_cuda_mul_mat_q_pair(
                 ctx, up->src[0], gate->src[0], src1, ids, up, gate);
             ggml_cuda_op_swiglu_ds4(ctx, glu);
@@ -2824,6 +2838,23 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         && src1->ne[1] <= luce_mmvq_max_ncols;
     bool use_mul_mat_q     = ggml_is_quantized(src0->type) && !bad_padding_clear
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
+
+#ifdef ROCMFP2_AFFINE
+    // Both MMVQ and MMQ carry the affine offset correction. Keep ordinary
+    // (non-fused) MMQ behind a second A/B switch: it is numerically correct on
+    // gfx1100, but the small per-expert down projections regress model prefill
+    // throughput. The phase-scoped master switch still enables the qualified
+    // paired gate/up fusion independently.
+    if (src0->type == GGML_TYPE_Q2_0_ROCMFP2) {
+        if (std::getenv("DFLASH_CUDA_MMVQ_FP2_AFFINE") == nullptr) {
+            use_mul_mat_vec_q = false;
+        }
+        if (std::getenv("DFLASH_CUDA_MMQ_FP2_AFFINE") == nullptr ||
+            std::getenv("DFLASH_CUDA_MMQ_FP2_AFFINE_GENERAL") == nullptr) {
+            use_mul_mat_q = false;
+        }
+    }
+#endif // ROCMFP2_AFFINE
 
     bool any_gpus_with_slow_fp16 = false;
 
@@ -3091,8 +3122,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int64_t ne_get_rows = ne12 * n_expert_used;
 
     std::vector<int32_t> ids_to_sorted_host;
-    ids_to_sorted_host.reserve(2*ne_get_rows);
-    std::vector<int32_t> ids_from_sorted_host(ne_get_rows);
+    ids_to_sorted_host.reserve(ne_get_rows);
+    std::vector<int32_t> ids_from_sorted_host(ne_get_rows, -1);
 
     ggml_cuda_pool_alloc<int32_t> ids_buf_dev(ctx.pool(), 2*ne_get_rows);
 
@@ -3108,32 +3139,54 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     for (int64_t i02 = 0; i02 < ne02; ++i02) { // expert matrices
         for (int64_t i12 = 0; i12 < ne12; ++i12) { // tokens
             for (int64_t iex = 0; iex < n_expert_used; ++iex) {
-                const int32_t expert_to_use = *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
-                assert(expert_to_use >= 0 && expert_to_use < ne02);
+                const int32_t expert_to_use = *(const int32_t *)(
+                    ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
+                if (expert_to_use < 0) {
+                    continue;
+                }
+                assert(expert_to_use < ne02);
                 if (expert_to_use == i02) {
-                    ids_from_sorted_host[i12*n_expert_used + iex] = ids_to_sorted_host.size();
+                    ids_from_sorted_host[i12*n_expert_used + iex] =
+                        (int32_t) ids_to_sorted_host.size();
                     ids_to_sorted_host.push_back(i12*ne11 + iex % ne11);
                     tokens_per_expert[i02]++;
-                    break;
+                    // Do not break: one token may route several slots to the
+                    // same expert.
                 }
             }
         }
     }
-    GGML_ASSERT(ids_to_sorted_host.size() == size_t(ne_get_rows));
+    const size_t n_valid_rows = ids_to_sorted_host.size();
+    const bool has_masked_rows = n_valid_rows < (size_t) ne_get_rows;
+    GGML_ASSERT(n_valid_rows + (has_masked_rows ? 1 : 0) <=
+                (size_t) ne_get_rows);
+    if (has_masked_rows) {
+        const int32_t zero_row = (int32_t) n_valid_rows;
+        for (int32_t & row : ids_from_sorted_host) {
+            if (row < 0) row = zero_row;
+        }
+    }
 
-    ids_to_sorted_host.insert(ids_to_sorted_host.end(), ids_from_sorted_host.begin(), ids_from_sorted_host.end());
-
-    CUDA_CHECK(cudaMemcpyAsync(ids_buf_dev.ptr, ids_to_sorted_host.data(), 2*ne_get_rows*sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    std::vector<int32_t> sorted_ids_host(2*ne_get_rows, 0);
+    std::copy(ids_to_sorted_host.begin(), ids_to_sorted_host.end(),
+              sorted_ids_host.begin());
+    std::copy(ids_from_sorted_host.begin(), ids_from_sorted_host.end(),
+              sorted_ids_host.begin() + ne_get_rows);
+    CUDA_CHECK(cudaMemcpyAsync(ids_buf_dev.ptr, sorted_ids_host.data(),
+                               2*ne_get_rows*sizeof(int32_t),
+                               cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    const int32_t * ids_to_sorted   = ids_buf_dev.ptr + 0*ne_get_rows;
-    const int32_t * ids_from_sorted = ids_buf_dev.ptr + 1*ne_get_rows;
+    const int32_t * ids_to_sorted   = ids_buf_dev.ptr;
+    const int32_t * ids_from_sorted = ids_buf_dev.ptr + ne_get_rows;
 
-    get_rows_cuda(src1->data, src1->type, ids_to_sorted, src1_sorted.ptr, type_src1_sorted,
-        ne10, nb11, nb12, nb13,
-        ne_get_rows, 1, 1, sizeof(int32_t), ne_get_rows*sizeof(int32_t), ne_get_rows*sizeof(int32_t),
-        ne10*ts_src1_sorted, ne_get_rows*ne10*ts_src1_sorted, ne_get_rows*ne10*ts_src1_sorted, stream);
-    CUDA_CHECK(cudaGetLastError());
+    if (n_valid_rows > 0) {
+        get_rows_cuda(src1->data, src1->type, ids_to_sorted, src1_sorted.ptr, type_src1_sorted,
+            ne10, nb11, nb12, nb13,
+            n_valid_rows, 1, 1, sizeof(int32_t), n_valid_rows*sizeof(int32_t), n_valid_rows*sizeof(int32_t),
+            ne10*ts_src1_sorted, n_valid_rows*ne10*ts_src1_sorted, n_valid_rows*ne10*ts_src1_sorted, stream);
+        CUDA_CHECK(cudaGetLastError());
+    }
 
     char * src1_data_cur = (char *) src1_sorted.ptr;
     char *  dst_data_cur = (char *)  dst_sorted.ptr;
@@ -3182,6 +3235,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
         src1_data_cur += src1_slice.nb[2];
         dst_data_cur  +=  dst_slice.nb[2];
+    }
+    if (has_masked_rows) {
+        CUDA_CHECK(cudaMemsetAsync(
+            dst_sorted.ptr + n_valid_rows*ne0*ts_dst_sorted, 0,
+            ne0*ts_dst_sorted, stream));
     }
 
     get_rows_cuda(dst_sorted.ptr, type_dst_sorted, ids_from_sorted, dst->data, dst->type,
@@ -4311,6 +4369,49 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         }
     }
 
+    // dflash: residual ADD + RMS_NORM + MUL. The add output stays live (it is
+    // the next residual), so this is a subgraph fusion with two outputs.
+    if (ops.size() == 3 && ops.begin()[0] == GGML_OP_ADD && ops.begin()[1] == GGML_OP_RMS_NORM &&
+        ops.begin()[2] == GGML_OP_MUL) {
+        if (!ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx, node_idx + 2 })) {
+            return false;
+        }
+        const ggml_tensor * add = cgraph->nodes[node_idx];
+        const ggml_tensor * rms = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * mul = cgraph->nodes[node_idx + 2];
+        if (rms->src[0] != add) {
+            return false;
+        }
+        const ggml_tensor * w = nullptr;
+        if (mul->src[0] == rms) {
+            w = mul->src[1];
+        } else if (mul->src[1] == rms) {
+            w = mul->src[0];
+        } else {
+            return false;
+        }
+        const ggml_tensor * a = add->src[0];
+        const ggml_tensor * b = add->src[1];
+        if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 ||
+            add->type != GGML_TYPE_F32 || rms->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32) {
+            return false;
+        }
+        if (!ggml_is_contiguous(a) || !ggml_is_contiguous(b) || !ggml_is_contiguous(w) ||
+            !ggml_is_contiguous(add) || !ggml_is_contiguous(mul)) {
+            return false;
+        }
+        if (!ggml_are_same_shape(a, b) || !ggml_are_same_shape(a, add) || !ggml_are_same_shape(a, mul)) {
+            return false;
+        }
+        if (w->ne[0] != a->ne[0] || ggml_nelements(w) != a->ne[0]) {
+            return false;
+        }
+        if (ggml_backend_buft_is_cuda_split(a->buffer->buft) || ggml_backend_buft_is_cuda_split(b->buffer->buft)) {
+            return false;
+        }
+        return true;
+    }
+
     if (!ggml_can_fuse(cgraph, node_idx, ops)) {
         return false;
     }
@@ -4361,6 +4462,11 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
      && unary_ops.size() == 1 && unary_ops.begin()[0] == GGML_UNARY_OP_SILU) {
         const ggml_tensor * ssm_conv = cgraph->nodes[node_idx];
         const ggml_tensor * silu     = cgraph->nodes[node_idx+1];
+
+        if (ggml_get_op_params_i32(ssm_conv, 0) != 0) {
+            // the Specla (1) and dflash step (2) ssm_conv kernels apply SiLU themselves
+            return false;
+        }
 
         if (ssm_conv->type != GGML_TYPE_F32 || silu->type != GGML_TYPE_F32) {
             return false;
@@ -4907,6 +5013,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                     if (fused_mul_mat_vec) {
                         i += fused_node_count - 1;
+                        continue;
+                    }
+
+                    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
+                        ggml_cuda_op_add_rms_norm_mul_fused(*cuda_ctx, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
+                        i += 2;
                         continue;
                     }
 
@@ -6157,6 +6269,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             }
         }
         case GGML_OP_SSM_CONV: {
+            // op_params[0]: 1 = SpecLA heavy-light conv (x is [d_inner, n_tokens],
+            // kernel guards the final partial 128-channel block), 2 = dflash fused
+            // step mode (any channel count).
+            if (ggml_get_op_params_i32(op, 0) == 1 || ggml_get_op_params_i32(op, 0) == 2 ||
+                ggml_get_op_params_i32(op, 0) == 3) {
+                return true;
+            }
             // assumes d_inner % threads == 0
             return op->src[0]->ne[1] % 128 == 0;
         }

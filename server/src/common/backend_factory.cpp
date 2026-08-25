@@ -43,6 +43,7 @@ namespace {
         : std::true_type {}
 
 DFLASH_ARCH_FIELD_TRAIT(has_draft_path,        draft_path);
+DFLASH_ARCH_FIELD_TRAIT(has_draft_block_size,  draft_block_size);
 DFLASH_ARCH_FIELD_TRAIT(has_fa_window,         fa_window);
 DFLASH_ARCH_FIELD_TRAIT(has_verify_width,      verify_width);
 DFLASH_ARCH_FIELD_TRAIT(has_draft_swa,         draft_swa_window);
@@ -96,14 +97,14 @@ DFLASH_CHECK_ARCH("qwen3",     Qwen3BackendConfig,    NoLayerSplitConfig);
 DFLASH_CHECK_ARCH("gemma4",    Gemma4BackendConfig,   Gemma4LayerSplitAdapterConfig);
 DFLASH_CHECK_ARCH("deepseek4", DeepSeek4BackendConfig, DeepSeek4LayerSplitAdapterConfig);
 
-// paged_attn sits outside the bundle because the field-presence trait cannot
-// separate qwen35 from qwen35moe: they share Qwen35Config, so the moe row
-// carries a field its backend never reads, and pairing its Never row with
-// that struct would fail a check that is really about qwen35's dispatch.
-// (The moe decode path ignores paged_attention — its pipelined AR decode
-// never reads a block table — which is why its capability row is Never.)
+// These sit outside the bundle because the field-presence trait cannot
+// separate qwen35 from qwen35moe: they share Qwen35Config, while the factory
+// forwards both fields only for dense qwen35. Pairing the MoE Never rows with
+// that shared struct would fail a check that is really about dispatch.
 DFLASH_CHECK_ARCH_OPTION("qwen35", Qwen35Config, Qwen35LayerSplitAdapterConfig,
                          has_paged_attention, paged_attn);
+DFLASH_CHECK_ARCH_OPTION("qwen35", Qwen35Config, Qwen35LayerSplitAdapterConfig,
+                         has_draft_block_size, draft_block_size);
 
 #undef DFLASH_CHECK_ARCH
 #undef DFLASH_CHECK_ARCH_OPTION
@@ -274,6 +275,7 @@ std::unique_ptr<ModelBackend> create_backend(
         cfg.max_concurrency    = args.max_concurrency;
         cfg.kv_pool_tokens     = args.kv_pool_tokens;
         cfg.kq_stride_pad      = args.kq_stride_pad;
+        cfg.draft_block_size   = args.draft_block_size;
         cfg.draft_swa_window   = args.draft_swa_window;
         cfg.draft_ctx_max      = args.draft_ctx_max;
         cfg.fast_rollback      = args.fast_rollback;
@@ -282,6 +284,7 @@ std::unique_ptr<ModelBackend> create_backend(
         cfg.ddtree_budget      = args.ddtree_budget;
         cfg.ddtree_temp        = args.ddtree_temp;
         cfg.ddtree_chain_seed  = args.ddtree_chain_seed;
+        cfg.ddtree_tau         = args.ddtree_tau;
         cfg.use_feature_mirror = args.use_feature_mirror;
 
         auto backend = std::make_unique<Qwen35Backend>(cfg);
@@ -308,6 +311,7 @@ std::unique_ptr<ModelBackend> create_backend(
         cfg.ddtree_budget      = args.ddtree_budget;
         cfg.ddtree_temp        = args.ddtree_temp;
         cfg.ddtree_chain_seed  = args.ddtree_chain_seed;
+        cfg.ddtree_tau         = args.ddtree_tau;
         cfg.use_feature_mirror = args.use_feature_mirror;
 
         auto backend = std::make_unique<Qwen35MoeBackend>(cfg);
@@ -424,6 +428,7 @@ std::unique_ptr<ModelBackend> create_backend(
             cfg.chunk      = args.chunk;
             cfg.expert_top_k = args.ds4_expert_top_k;
             cfg.fused_decode = args.ds4_fused_decode;
+            cfg.fused_verify_f16_kv = args.ds4_fused_verify_f16_kv;
             cfg.prefill_mode = args.ds4_prefill_mode;
 
             auto backend = std::make_unique<DeepSeek4Backend>(cfg);

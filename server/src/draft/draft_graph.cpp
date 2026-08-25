@@ -40,6 +40,19 @@
 
 namespace dflash::common {
 
+// RoPE with the drafter's scaling config. YaRN-trained drafters (e.g. the
+// Qwen3.8 DSpark release: factor 32, orig ctx 8192) apply the scaled rotary
+// at every position, so plain-RoPE inference silently degrades acceptance.
+static ggml_tensor * draft_rope(ggml_context * ctx, ggml_tensor * t,
+                                ggml_tensor * positions,
+                                const DraftWeights & w) {
+    return ggml_rope_ext(ctx, t, positions, /*freq_factors=*/nullptr,
+                         w.head_dim, GGML_ROPE_TYPE_NEOX, w.rope_n_ctx_orig,
+                         w.rope_theta, w.rope_freq_scale,
+                         w.rope_ext_factor, w.rope_attn_factor,
+                         w.rope_beta_fast, w.rope_beta_slow);
+}
+
 // Feature fusion shared by the legacy one-shot graph and the cached-KV
 // builders: optional per-capture RMSNorm slices, fc projection, hidden_norm.
 // Row-independent, so it is bit-identical whether run over the full window
@@ -72,6 +85,81 @@ static ggml_tensor * draft_fuse_features(
     return target_feat;
 }
 
+// ── DFlash 2 grouped dynamic causal conv ────────────────────────────
+//
+// Two taps over the draft block (positions within the block; the block's
+// first slot has no predecessor). For each tap k the coefficient is a
+// per-element base kernel plus a per-group dynamic kernel projected from
+// the block's normalized hidden state:
+//   dyn      = proj @ x_norm                          [2*K*groups, q_len]
+//   coef_s_k = base[s][k] (per element) + dyn[s][k] (per group, broadcast)
+//   out      = sum_k coef_s_k * shift_k(x)
+// s = 0 ("prepare", applied to the sub-block input) or 1 ("finish", applied
+// to the sub-block output); both use the dyn computed from the input.
+struct DraftDynConv {
+    ggml_tensor * dyn = nullptr;   // [2*K*groups, q_len]
+};
+
+static DraftDynConv draft_dyn_conv_kernel(ggml_context * ctx,
+                                          const DraftConvWeights & cw,
+                                          ggml_tensor * x_norm) {
+    DraftDynConv dc;
+    dc.dyn = ggml_mul_mat(ctx, cw.proj, x_norm);   // [2*K*groups, q_len]
+    return dc;
+}
+
+static ggml_tensor * draft_dyn_conv_apply(ggml_context *           ctx,
+                                          const DraftWeights &     w,
+                                          const DraftConvWeights & cw,
+                                          const DraftDynConv &     dc,
+                                          int                      s,      // 0 = prepare, 1 = finish
+                                          ggml_tensor *            x) {    // [hidden, q_len]
+    const int64_t hidden = x->ne[0];
+    const int64_t q_len  = x->ne[1];
+    const int     K      = w.conv_kernel_size;
+    const int64_t gs     = w.conv_group_size;
+    const int64_t groups = hidden / gs;
+    const size_t  e      = ggml_element_size(dc.dyn);
+
+    // Fused single-node path (bit-identical to the expansion below);
+    // DFLASH_DYN_CONV_FUSED=0 restores the unfused graph.
+    static const bool dyn_conv_fused = []() {
+        const char * env = std::getenv("DFLASH_DYN_CONV_FUSED");
+        return !(env && env[0] == '0' && env[1] == '\0');
+    }();
+    if (dyn_conv_fused && x->ne[2] <= 1 && x->ne[3] <= 1 &&
+        ggml_is_contiguous(dc.dyn) && ggml_is_contiguous(cw.base)) {
+        ggml_tensor * xc = ggml_is_contiguous(x) ? x : ggml_cont(ctx, x);
+        return ggml_dflash_dyn_conv(ctx, xc, cw.base, dc.dyn, s, K, (int)gs);
+    }
+
+    ggml_tensor * out = nullptr;
+    for (int k = 0; k < K; ++k) {
+        // shift_k(x): column l takes x[:, l-k], zero for l < k
+        ggml_tensor * xs = x;
+        if (k > 0) {
+            if (q_len <= k) break;
+            ggml_tensor * head = ggml_view_2d(ctx, x, hidden, q_len - k, x->nb[1], 0);
+            xs = ggml_pad_ext(ctx, head, 0, 0, k, 0, 0, 0, 0, 0);   // [hidden, q_len]
+        }
+        // per-group dynamic coefficient for (s, k): rows [(s*K+k)*groups, +groups)
+        ggml_tensor * dyn_sk = ggml_view_3d(ctx, dc.dyn, 1, groups, q_len,
+                                            e, dc.dyn->nb[1],
+                                            (size_t)((s * K + k) * groups) * e);
+        ggml_tensor * xs3   = ggml_reshape_3d(ctx, xs, gs, groups, q_len);
+        ggml_tensor * dyn3  = ggml_repeat(ctx, dyn_sk, xs3);                // [gs, groups, q_len]
+        // per-element base coefficient base[s][k]: [hidden] at offset (s*K+k)*hidden
+        ggml_tensor * base_sk = ggml_view_3d(ctx, cw.base, gs, groups, 1,
+                                             cw.base->nb[0] * gs, cw.base->nb[0] * hidden,
+                                             (size_t)(s * K + k) * cw.base->nb[1]);
+        ggml_tensor * coef  = ggml_add(ctx, dyn3, base_sk);                 // broadcast over q_len
+        ggml_tensor * term  = ggml_mul(ctx, xs3, coef);
+        term = ggml_reshape_2d(ctx, term, hidden, q_len);
+        out = out ? ggml_add(ctx, out, term) : term;
+    }
+    return out;
+}
+
 DraftGraphOutputs build_draft_graph(
     ggml_context *            ctx,
     const DraftWeights &      w,
@@ -83,7 +171,6 @@ DraftGraphOutputs build_draft_graph(
     const int n_kv     = w.n_head_kv;
     const int head_dim = w.head_dim;
     const float eps    = DFLASH27B_RMS_EPS;
-    const float rope_base = w.rope_theta;
 
     // ── 1. Feature fusion: target_feat = rms_norm(fc @ target_hidden_cat, hidden_norm)
     //    fc:                [5*hidden, hidden]  (ggml: ne[0]=5*hidden, ne[1]=hidden)
@@ -118,10 +205,18 @@ DraftGraphOutputs build_draft_graph(
         const int eff_total_k = eff_ctx + q_len;
         const int ctx_offset  = use_swa ? (ctx_len - w.swa_window) : 0;
 
+        const bool dyn_conv = w.conv_kernel_size > 0 && L.attn_conv.present() && L.mlp_conv.present();
+
         if (!disable_attn) {
             // ── 2a. Attention pre-norm
             ggml_tensor * hn = ggml_rms_norm(ctx, h, eps);
             hn = ggml_mul(ctx, hn, L.attn_norm);
+            // DFlash 2: dynamic conv "prepare" on the attention input
+            DraftDynConv attn_dc;
+            if (dyn_conv) {
+                attn_dc = draft_dyn_conv_kernel(ctx, L.attn_conv, hn);
+                hn = draft_dyn_conv_apply(ctx, w, L.attn_conv, attn_dc, 0, hn);
+            }
             std::snprintf(probe_name, sizeof(probe_name), "draft_l%d_hn", il);
             ggml_set_name(hn, probe_name);
 
@@ -185,14 +280,8 @@ DraftGraphOutputs build_draft_graph(
                 pk = ggml_view_1d(ctx, in.positions_k, eff_total_k,
                                   ctx_offset * ggml_element_size(in.positions_k));
             }
-            Q = ggml_rope_ext(ctx, Q, in.positions_q, /*freq_factors=*/nullptr,
-                              head_dim, GGML_ROPE_TYPE_NEOX, /*n_ctx_orig=*/0,
-                              rope_base, /*freq_scale=*/1.0f,
-                              /*ext_factor=*/0.0f, /*attn_factor=*/1.0f,
-                              /*beta_fast=*/0.0f, /*beta_slow=*/0.0f);
-            K = ggml_rope_ext(ctx, K, pk, nullptr,
-                              head_dim, GGML_ROPE_TYPE_NEOX, 0,
-                              rope_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+            Q = draft_rope(ctx, Q, in.positions_q, w);
+            K = draft_rope(ctx, K, pk, w);
 
             // ── 2e. Permute into the layout flash_attn_ext wants
             //   q: [n_embd_k=head_dim, n_batch=q_len, n_head,   ne3]
@@ -235,6 +324,9 @@ DraftGraphOutputs build_draft_graph(
             // ── 2g. Output projection + residual
             //     wo: [q_dim, hidden]  (ne[0]=q_dim, ne[1]=hidden)
             ggml_tensor * attn_out = ggml_mul_mat(ctx, L.wo, attn);  // [hidden, q_len]
+            if (dyn_conv) {
+                attn_out = draft_dyn_conv_apply(ctx, w, L.attn_conv, attn_dc, 1, attn_out);
+            }
             std::snprintf(probe_name, sizeof(probe_name), "draft_l%d_attn_out", il);
             ggml_set_name(attn_out, probe_name);
             h = ggml_add(ctx, h, attn_out);
@@ -246,6 +338,11 @@ DraftGraphOutputs build_draft_graph(
             // ── 2h. FFN pre-norm
             ggml_tensor * hf = ggml_rms_norm(ctx, h, eps);
             hf = ggml_mul(ctx, hf, L.ffn_norm);
+            DraftDynConv mlp_dc;
+            if (dyn_conv) {
+                mlp_dc = draft_dyn_conv_kernel(ctx, L.mlp_conv, hf);
+                hf = draft_dyn_conv_apply(ctx, w, L.mlp_conv, mlp_dc, 0, hf);
+            }
 
             // ── 2i. SwiGLU: down(silu(gate(x)) * up(x))
             //     w_gate, w_up: [hidden, intermediate]
@@ -255,6 +352,9 @@ DraftGraphOutputs build_draft_graph(
             ggml_tensor * u  = ggml_mul_mat(ctx, L.w_up,   hf);  // [inter, q_len]
             ggml_tensor * gu = ggml_mul(ctx, g, u);
             ggml_tensor * ffn_out = ggml_mul_mat(ctx, L.w_down, gu);  // [hidden, q_len]
+            if (dyn_conv) {
+                ffn_out = draft_dyn_conv_apply(ctx, w, L.mlp_conv, mlp_dc, 1, ffn_out);
+            }
 
             h = ggml_add(ctx, h, ffn_out);
             std::snprintf(probe_name, sizeof(probe_name), "draft_l%d_h_after_ffn", il);
@@ -309,11 +409,7 @@ static void draft_ctx_kv_rows(
     K = ggml_reshape_3d(ctx, K, w.head_dim, w.n_head_kv, n);
     K = ggml_rms_norm(ctx, K, eps);
     K = ggml_mul     (ctx, K, L.k_norm);
-    K = ggml_rope_ext(ctx, K, positions, /*freq_factors=*/nullptr,
-                      w.head_dim, GGML_ROPE_TYPE_NEOX, /*n_ctx_orig=*/0,
-                      w.rope_theta, /*freq_scale=*/1.0f,
-                      /*ext_factor=*/0.0f, /*attn_factor=*/1.0f,
-                      /*beta_fast=*/0.0f, /*beta_slow=*/0.0f);
+    K = draft_rope(ctx, K, positions, w);
     // rope output is contiguous [head_dim, n_kv, n] → head-major rows view
     *k_rows_out = ggml_view_2d(ctx, K, (int64_t)w.head_dim * w.n_head_kv, n,
                                K->nb[2], 0);
@@ -356,7 +452,6 @@ DraftGraphOutputs build_draft_kv_step(
     const int n_kv     = w.n_head_kv;
     const int head_dim = w.head_dim;
     const float eps    = DFLASH27B_RMS_EPS;
-    const float rope_base = w.rope_theta;
     const int kv_total = cache.kv_total;
 
     static const bool disable_attn_gate =
@@ -370,28 +465,30 @@ DraftGraphOutputs build_draft_kv_step(
     for (int il = 0; il < w.n_layer; il++) {
         const DraftLayer & L = w.layers[il];
         const bool layer_is_swa = L.is_swa && !disable_swa;
+        const bool dyn_conv = w.conv_kernel_size > 0 && L.attn_conv.present() && L.mlp_conv.present();
 
-        // ── attention pre-norm
+        // ── attention pre-norm (+ DFlash 2 dynamic conv "prepare")
         ggml_tensor * hn = ggml_rms_norm(ctx, h, eps);
         hn = ggml_mul(ctx, hn, L.attn_norm);
+        DraftDynConv attn_dc;
+        if (dyn_conv) {
+            attn_dc = draft_dyn_conv_kernel(ctx, L.attn_conv, hn);
+            hn = draft_dyn_conv_apply(ctx, w, L.attn_conv, attn_dc, 0, hn);
+        }
 
         // ── Q from noise, per-head RMSNorm, RoPE at absolute positions
         ggml_tensor * Q = ggml_mul_mat(ctx, L.wq, hn);
         Q = ggml_reshape_3d(ctx, Q, head_dim, n_head, q_len);
         Q = ggml_rms_norm(ctx, Q, eps);
         Q = ggml_mul     (ctx, Q, L.q_norm);
-        Q = ggml_rope_ext(ctx, Q, in.positions_q, nullptr,
-                          head_dim, GGML_ROPE_TYPE_NEOX, 0,
-                          rope_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        Q = draft_rope(ctx, Q, in.positions_q, w);
 
         // ── noise K/V into the scratch cache slots
         ggml_tensor * Kn = ggml_mul_mat(ctx, L.wk, hn);
         Kn = ggml_reshape_3d(ctx, Kn, head_dim, n_kv, q_len);
         Kn = ggml_rms_norm(ctx, Kn, eps);
         Kn = ggml_mul     (ctx, Kn, L.k_norm);
-        Kn = ggml_rope_ext(ctx, Kn, in.positions_q, nullptr,
-                           head_dim, GGML_ROPE_TYPE_NEOX, 0,
-                           rope_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        Kn = draft_rope(ctx, Kn, in.positions_q, w);
         ggml_tensor * Kn_rows = ggml_view_2d(ctx, Kn,
             (int64_t)head_dim * n_kv, q_len, Kn->nb[2], 0);
         ggml_tensor * Vn_rows = ggml_mul_mat(ctx, L.wv, hn);  // [kv_dim, q_len]
@@ -436,16 +533,27 @@ DraftGraphOutputs build_draft_kv_step(
         attn = ggml_reshape_2d(ctx, attn, head_dim * n_head, q_len);
 
         ggml_tensor * attn_out = ggml_mul_mat(ctx, L.wo, attn);
+        if (dyn_conv) {
+            attn_out = draft_dyn_conv_apply(ctx, w, L.attn_conv, attn_dc, 1, attn_out);
+        }
         h = ggml_add(ctx, h, attn_out);
 
-        // ── FFN
+        // ── FFN (+ DFlash 2 dynamic conv prepare/finish)
         ggml_tensor * hf = ggml_rms_norm(ctx, h, eps);
         hf = ggml_mul(ctx, hf, L.ffn_norm);
+        DraftDynConv mlp_dc;
+        if (dyn_conv) {
+            mlp_dc = draft_dyn_conv_kernel(ctx, L.mlp_conv, hf);
+            hf = draft_dyn_conv_apply(ctx, w, L.mlp_conv, mlp_dc, 0, hf);
+        }
         ggml_tensor * g  = ggml_mul_mat(ctx, L.w_gate, hf);
         g = ggml_silu(ctx, g);
         ggml_tensor * u  = ggml_mul_mat(ctx, L.w_up,   hf);
         ggml_tensor * gu = ggml_mul(ctx, g, u);
         ggml_tensor * ffn_out = ggml_mul_mat(ctx, L.w_down, gu);
+        if (dyn_conv) {
+            ffn_out = draft_dyn_conv_apply(ctx, w, L.mlp_conv, mlp_dc, 1, ffn_out);
+        }
         h = ggml_add(ctx, h, ffn_out);
     }
 

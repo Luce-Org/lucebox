@@ -5891,6 +5891,155 @@ struct ggml_tensor * ggml_ssm_conv_tree(
     return result;
 }
 
+// dflash: fused conv step. Same op id as ggml_ssm_conv; op_params[0] = 2
+// marks step mode (1 is the SpecLA layout), srcs are
+// (x, c, conv_state, conv_input_out).
+struct ggml_tensor * ggml_ssm_conv_step(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * c,
+        struct ggml_tensor  * conv_state,
+        struct ggml_tensor  * conv_input_out) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(c->type == GGML_TYPE_F32);
+    GGML_ASSERT(conv_state->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_matrix(c));
+    GGML_ASSERT(ggml_is_contiguous(c));
+    GGML_ASSERT(x->nb[0] == sizeof(float));
+    GGML_ASSERT(x->ne[3] == 1);
+
+    const int64_t d_conv  = c->ne[0];
+    const int64_t d_inner = c->ne[1];
+    const int64_t n_t     = x->ne[1];
+    const int64_t n_s     = x->ne[2];
+
+    GGML_ASSERT(x->ne[0] == d_inner);
+    // The CUDA/HIP step kernel instantiates K in {3, 4, 5, 9}; other tap
+    // counts would load fine and abort on the first decode.
+    GGML_ASSERT(d_conv == 3 || d_conv == 4 || d_conv == 5 || d_conv == 9);
+    GGML_ASSERT(conv_state->ne[0] == d_conv - 1);
+    GGML_ASSERT(conv_state->ne[1] == d_inner);
+    GGML_ASSERT(conv_state->ne[2] == n_s);
+    GGML_ASSERT(conv_state->nb[0] == sizeof(float));
+    GGML_ASSERT(conv_state->nb[1] == (size_t)(d_conv - 1) * sizeof(float));
+    if (conv_input_out) {
+        GGML_ASSERT(conv_input_out->type == GGML_TYPE_F32);
+        GGML_ASSERT(conv_input_out->ne[0] >= d_conv - 1 + n_t);
+        GGML_ASSERT(conv_input_out->ne[1] == d_inner);
+        GGML_ASSERT(conv_input_out->ne[2] == n_s);
+        GGML_ASSERT(conv_input_out->nb[0] == sizeof(float));
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_inner, n_t, n_s);
+    ggml_set_op_params_i32(result, 0, 2);   // step mode (1 = SpecLA heavy-light conv)
+
+    result->op     = GGML_OP_SSM_CONV;
+    result->src[0] = x;
+    result->src[1] = c;
+    result->src[2] = conv_state;
+    result->src[3] = conv_input_out;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_dflash_dyn_conv(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * base,
+        struct ggml_tensor  * dyn,
+        int                   site,
+        int                   kernel,
+        int                   group_size) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(base->type == GGML_TYPE_F32);
+    GGML_ASSERT(dyn->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(x));
+    GGML_ASSERT(ggml_is_contiguous(dyn));
+    GGML_ASSERT(x->ne[2] == 1 && x->ne[3] == 1);
+    GGML_ASSERT(group_size > 0 && x->ne[0] % group_size == 0);
+    GGML_ASSERT(kernel > 0 && site >= 0);
+    GGML_ASSERT(dyn->ne[1] == x->ne[1]);
+    GGML_ASSERT(dyn->ne[0] >= (int64_t)(site + 1) * kernel * (x->ne[0] / group_size));
+    // base is [hidden, K, 2] (per-tap rows, then site planes); contiguity
+    // makes flat row (site*K + k) valid with stride nb[1].
+    GGML_ASSERT(ggml_is_contiguous(base));
+    GGML_ASSERT(base->ne[0] == x->ne[0]);
+    GGML_ASSERT(base->ne[1] * base->ne[2] >= (int64_t)(site + 1) * kernel);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, x->ne[0], x->ne[1]);
+    ggml_set_op_params_i32(result, 0, 3);   // dflash2 grouped dyn-conv mode
+    ggml_set_op_params_i32(result, 1, site);
+    ggml_set_op_params_i32(result, 2, kernel);
+    ggml_set_op_params_i32(result, 3, group_size);
+
+    result->op     = GGML_OP_SSM_CONV;
+    result->src[0] = x;
+    result->src[1] = base;
+    result->src[2] = dyn;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_ssm_conv_specla(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * c,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * hld,
+        struct ggml_tensor  * factor_ptrs,
+        int                   n_layers,
+        int                   layer,
+        int                   pending_bank,
+        int                   n_boundaries,
+        int                   n_chains,
+        int                   n_waves,
+        int                   max_parallel_chains) {
+    GGML_ASSERT(ggml_is_3d(x));
+    GGML_ASSERT(ggml_is_matrix(c));
+    GGML_ASSERT(ggml_is_matrix(state));
+    GGML_ASSERT(hld->type == GGML_TYPE_I32 && ggml_is_contiguous(hld));
+    GGML_ASSERT(factor_ptrs->type == GGML_TYPE_I64 &&
+                ggml_nelements(factor_ptrs) == 8 &&
+                ggml_is_contiguous(factor_ptrs));
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && c->type == GGML_TYPE_F32 &&
+                state->type == GGML_TYPE_F32);
+    // The CUDA kernel raw-indexes these tensors and does not consume strides.
+    GGML_ASSERT(ggml_is_contiguous(x));
+    GGML_ASSERT(ggml_is_contiguous(c));
+    GGML_ASSERT(ggml_is_contiguous(state));
+    GGML_ASSERT(x->ne[0] == c->ne[1]);
+    GGML_ASSERT(state->ne[0] == c->ne[0] - 1 && state->ne[1] == c->ne[1]);
+    GGML_ASSERT(x->ne[2] == 1 && state->ne[2] == 1);
+
+    const int64_t d_inner = x->ne[0];
+    const int64_t n_t = x->ne[1];
+    GGML_ASSERT(c->ne[0] == 3 || c->ne[0] == 4 ||
+                c->ne[0] == 5 || c->ne[0] == 9);
+    GGML_ASSERT(n_layers > 0 && layer >= 0 && layer < n_layers);
+    GGML_ASSERT(pending_bank == 0 || pending_bank == 1);
+    GGML_ASSERT(n_boundaries >= 0 && n_chains > 0 && n_waves > 0);
+    GGML_ASSERT(max_parallel_chains > 0 && max_parallel_chains <= n_chains);
+    // n_boundaries is used only for output sizing below; the runtime boundary
+    // layout is packed in the HLD meta tensor.
+    const int64_t packed_rows = n_t + (c->ne[0] - 1)*n_boundaries;
+    struct ggml_tensor * result =
+        ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_inner, packed_rows);
+    ggml_set_op_params_i32(result, 0, 1);
+    ggml_set_op_params_i32(result, 2, n_chains);
+    ggml_set_op_params_i32(result, 3, n_waves);
+    ggml_set_op_params_i32(result, 4, n_layers);
+    ggml_set_op_params_i32(result, 5, layer);
+    ggml_set_op_params_i32(result, 6, pending_bank);
+    ggml_set_op_params_i32(result, 7, max_parallel_chains);
+    result->op = GGML_OP_SSM_CONV;
+    result->src[0] = x;
+    result->src[1] = c;
+    result->src[2] = state;
+    result->src[3] = hld;
+    result->src[4] = factor_ptrs;
+    return result;
+}
+
 // ggml_ssm_scan
 
 struct ggml_tensor * ggml_ssm_scan(
@@ -6704,6 +6853,28 @@ void ggml_gated_delta_net_set_skip_intermediate(
     tensor->nb[3] = tensor->nb[2]*tensor->ne[2];
 }
 
+// dflash: raw-gate mode (see ggml.h). [dt_bias | A] -> src[9],
+// op_params[10] = 1. (src[8] / op_params[2] belong to the compact-decode and
+// SpecLA variants.)
+void ggml_gated_delta_net_set_raw_gates(
+        struct ggml_tensor * tensor,
+        struct ggml_tensor * gate_ba) {
+    GGML_ASSERT(tensor != NULL);
+    GGML_ASSERT(tensor->op == GGML_OP_GATED_DELTA_NET);
+    GGML_ASSERT(gate_ba != NULL);
+    GGML_ASSERT(gate_ba->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(gate_ba));
+    const struct ggml_tensor * v = tensor->src[2];
+    GGML_ASSERT(ggml_nelements(gate_ba) == 2*v->ne[1]);
+    // scalar gate only (no KDA), no tree mode, no SpecLA / compact decode
+    GGML_ASSERT(tensor->src[3]->ne[0] == 1);
+    GGML_ASSERT(tensor->src[6] == NULL);
+    GGML_ASSERT(tensor->src[8] == NULL);
+    GGML_ASSERT(ggml_get_op_params_i32(tensor, 2) == 0);
+    tensor->src[9] = gate_ba;
+    ggml_set_op_params_i32(tensor, 10, 1);
+}
+
 // dflash: tree-mode variant. Same op, with parent_ids plumbed into
 // src[6] so the CUDA kernel can branch-reload state at DFS transitions.
 struct ggml_tensor * ggml_gated_delta_net_tree(
@@ -6760,6 +6931,79 @@ struct ggml_tensor * ggml_gated_delta_net_tree_persist(
 
     result->src[7] = persist_inter;
 
+    return result;
+}
+
+struct ggml_tensor * ggml_gated_delta_net_specla(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * hld,
+        struct ggml_tensor  * factor_ptrs,
+        int                   n_layers,
+        int                   layer,
+        int                   pending_bank,
+        int                   n_boundaries,
+        int                   n_chains,
+        int                   n_waves,
+        int                   max_parallel_chains) {
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32);
+    GGML_ASSERT(v->type == GGML_TYPE_F32 && g->type == GGML_TYPE_F32);
+    GGML_ASSERT(beta->type == GGML_TYPE_F32 && state->type == GGML_TYPE_F32);
+    GGML_ASSERT(hld->type == GGML_TYPE_I32 && ggml_is_contiguous(hld));
+    GGML_ASSERT(factor_ptrs->type == GGML_TYPE_I64 &&
+                ggml_nelements(factor_ptrs) == 8 &&
+                ggml_is_contiguous(factor_ptrs));
+    GGML_ASSERT(ggml_is_contiguous_rows(q));
+    GGML_ASSERT(ggml_is_contiguous_rows(k));
+    GGML_ASSERT(ggml_is_contiguous_rows(v));
+    GGML_ASSERT(ggml_are_same_shape(q, k) && ggml_are_same_shape(q, v));
+    // The CUDA launcher passes q strides for both q and k.
+    GGML_ASSERT(ggml_are_same_stride(q, k));
+    GGML_ASSERT(ggml_is_contiguous(g) && ggml_is_contiguous(beta));
+    GGML_ASSERT(ggml_is_contiguous(state));
+
+    const int64_t S = v->ne[0];
+    const int64_t H = v->ne[1];
+    const int64_t T = v->ne[2];
+    GGML_ASSERT(S == 16 || S == 32 || S == 64 || S == 128);
+    GGML_ASSERT(v->ne[3] == 1);
+    GGML_ASSERT(ggml_are_same_shape(g, beta));
+    GGML_ASSERT(g->ne[0] == 1 && g->ne[1] == H &&
+                g->ne[2] == T && g->ne[3] == 1);
+    GGML_ASSERT(state->ne[0] == S && state->ne[1] == S &&
+                state->ne[2] == H && state->ne[3] == 1);
+    GGML_ASSERT(ggml_nelements(state) == S*S*H);
+    GGML_ASSERT(n_layers > 0 && layer >= 0 && layer < n_layers);
+    GGML_ASSERT(pending_bank == 0 || pending_bank == 1);
+    GGML_ASSERT(n_boundaries >= 0 && n_chains > 0 && n_waves > 0);
+    GGML_ASSERT(max_parallel_chains > 0 && max_parallel_chains <= n_chains);
+    // n_boundaries is used only for output sizing below; the runtime boundary
+    // layout is packed in the HLD meta tensor.
+    const int64_t packed = S*H*T + (int64_t)n_boundaries*S*S*H;
+    struct ggml_tensor * result =
+        ggml_new_tensor_1d(ctx, GGML_TYPE_F32, packed);
+    ggml_set_op_params_i32(result, 1, 1);
+    ggml_set_op_params_i32(result, 2, 1);
+    ggml_set_op_params_i32(result, 4, n_chains);
+    ggml_set_op_params_i32(result, 5, n_waves);
+    ggml_set_op_params_i32(result, 6, n_layers);
+    ggml_set_op_params_i32(result, 7, layer);
+    ggml_set_op_params_i32(result, 8, pending_bank);
+    ggml_set_op_params_i32(result, 9, max_parallel_chains);
+    result->op = GGML_OP_GATED_DELTA_NET;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = g;
+    result->src[4] = beta;
+    result->src[5] = state;
+    result->src[6] = hld;
+    result->src[7] = factor_ptrs;
     return result;
 }
 

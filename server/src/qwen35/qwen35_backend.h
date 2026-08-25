@@ -18,6 +18,8 @@
 #include "placement/remote_draft_config.h"
 #include "step_graph.h"
 #include "ddtree.h"
+
+#include <limits>
 #include "dflash_feature_ring.h"
 #include "common/dflash_draft_kv.h"
 #include "common/concurrency/paged_kv_pool.h"
@@ -67,6 +69,7 @@ struct Qwen35Config {
     int64_t      kv_pool_tokens  = 0;
 
     // Draft
+    int          draft_block_size = 0;  // 0 = use drafter metadata
     int          draft_swa_window = 0;
     int          draft_ctx_max    = 4096;
 
@@ -83,6 +86,8 @@ struct Qwen35Config {
     int          ddtree_budget   = 22;
     float        ddtree_temp     = 1.0f;
     bool         ddtree_chain_seed = true;
+    // SpecLA confidence margin on cumulative path log-prob (off when inf).
+    float        ddtree_tau      = std::numeric_limits<float>::infinity();
     bool         use_feature_mirror = false;
 };
 

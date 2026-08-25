@@ -10,6 +10,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <functional>
@@ -244,6 +245,8 @@ struct GenerateResult {
     std::vector<int32_t>       tokens;
     double                     prefill_s   = 0.0;
     double                     decode_s    = 0.0;
+    // Backend-confirmed prompt tokens supplied by a restored KV snapshot.
+    int                        restored_prefix_tokens = 0;
     // True when the backend's Level 2 hook injected the </think> close
     // sequence during this generation (vs. the model self-closing). The
     // server uses this to attribute close_kind correctly: if the model
@@ -381,6 +384,8 @@ struct ModelBackend {
         retry.decode_s += first.decode_s;
         retry.accept_rate = first.accept_rate;
         retry.spec_decode_ran = first.spec_decode_ran || retry.spec_decode_ran;
+        retry.restored_prefix_tokens = (std::max)(
+            first.restored_prefix_tokens, retry.restored_prefix_tokens);
         retry.budget_forced_close =
             first.budget_forced_close || retry.budget_forced_close;
         retry.degenerate_decode_close =

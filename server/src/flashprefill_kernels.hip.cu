@@ -29,12 +29,15 @@
 // which is a 32-lane instruction. A wave64 target would need a different WMMA
 // instruction and fragment layout, not a warp-width tweak, so we fail the build
 // loudly rather than emit silently-wrong results. All currently declared AMD
-// targets (gfx1100 / gfx1151, RDNA3) are wave32. __AMDGCN_WAVEFRONT_SIZE(__) is
-// defined only in the device compile pass.
-#if defined(__AMDGCN_WAVEFRONT_SIZE__) && (__AMDGCN_WAVEFRONT_SIZE__ != 32)
+// targets (gfx1100 / gfx1151, RDNA3) are wave32. Check the compiler-provided
+// wavefront macros only in the device pass: some ROCm versions expose a
+// host-side definition that is not an integer constant expression.
+#if defined(__HIP_DEVICE_COMPILE__) && __HIP_DEVICE_COMPILE__
+#  if defined(__AMDGCN_WAVEFRONT_SIZE__) && (__AMDGCN_WAVEFRONT_SIZE__ != 32)
 #  error "flashprefill_kernels.hip.cu requires a 32-lane wavefront (RDNA v_wmma_f32_16x16x16 fragment layout). Build for a wave32 target (gfx10/gfx11) or provide a wave64 WMMA rewrite."
-#elif !defined(__AMDGCN_WAVEFRONT_SIZE__) && defined(__AMDGCN_WAVEFRONT_SIZE) && (__AMDGCN_WAVEFRONT_SIZE != 32)
+#  elif !defined(__AMDGCN_WAVEFRONT_SIZE__) && defined(__AMDGCN_WAVEFRONT_SIZE) && (__AMDGCN_WAVEFRONT_SIZE != 32)
 #  error "flashprefill_kernels.hip.cu requires a 32-lane wavefront (RDNA v_wmma_f32_16x16x16 fragment layout). Build for a wave32 target (gfx10/gfx11) or provide a wave64 WMMA rewrite."
+#  endif
 #endif
 
 namespace dflash::common {

@@ -76,7 +76,7 @@ int disk_prefix_cache_auto_boundary(
 
 struct DiskCacheHeader {
     char     magic[4];          // "DKVC"
-    uint32_t version;           // 1
+    uint32_t version;           // DISK_CACHE_VERSION
     uint8_t  layout_id[16];    // SHA-1 truncated: tensor structure fingerprint
     uint32_t cur_pos;
     uint32_t n_tensors;
@@ -92,7 +92,7 @@ struct DiskCacheHeader {
 // to avoid alignment/packing issues. The on-disk size is exactly 80 bytes.
 
 static constexpr size_t DISK_CACHE_HEADER_SIZE = 80;
-static constexpr uint32_t DISK_CACHE_VERSION = 1;
+static constexpr uint32_t DISK_CACHE_VERSION = 2;
 
 // ─── Tensor table entry (on-disk) ──────────────────────────────────────
 

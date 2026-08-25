@@ -2741,6 +2741,57 @@ extern "C" {
             struct ggml_tensor  * c,
             struct ggml_tensor  * parent_ids);
 
+    // dflash extension: fused causal-conv step for recurrent decode/verify.
+    // Replaces transpose + concat(state, x) + ssm_conv + silu + state
+    // write-back with one kernel.
+    //   x:              [C, T, S] f32, rows contiguous (token stride may be
+    //                   larger than C, e.g. a row-slice of a stacked GEMV)
+    //   c:              [K, C]    f32 depthwise conv weights
+    //   conv_state:     [K-1, C, S] f32 history; READ, then OVERWRITTEN in
+    //                   place with the last K-1 conv inputs
+    //   conv_input_out: optional [>= K-1+T, C, S] f32; receives the full
+    //                   conv window (history rows then x rows) per channel,
+    //                   for speculative-decode rollback. May be a view.
+    // Returns silu(conv(x)) as [C, T, S]. CUDA/HIP only.
+    GGML_API struct ggml_tensor * ggml_ssm_conv_step(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * c,
+            struct ggml_tensor  * conv_state,
+            struct ggml_tensor  * conv_input_out);
+
+    // dflash2 grouped dynamic block conv (draft graph), one fused node for
+    //   out[c,l] = sum_k (dyn[(site*K+k)*G + c/gs, l] + base[c, site*K+k]) * x[c, l-k]
+    // x [C, T] f32 contiguous, base [C, >= (site+1)*K] f32, dyn [>= 2K*G, T]
+    // f32 contiguous; x is zero-padded below l < k. CUDA/HIP only.
+    GGML_API struct ggml_tensor * ggml_dflash_dyn_conv(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * base,
+            struct ggml_tensor  * dyn,
+            int                   site,
+            int                   kernel,
+            int                   group_size);
+    // SpecLA heavy-light convolution. Applies compact accepted inputs to the
+    // durable conv state, then verifies the current tree without committing
+    // speculative inputs. Current input factors are written directly to the
+    // persistent double-buffer selected by factor_ptrs/layer/bank; the result
+    // packs [conv output | boundary windows] and already includes SiLU.
+    GGML_API struct ggml_tensor * ggml_ssm_conv_specla(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * c,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * hld,
+            struct ggml_tensor  * factor_ptrs,
+            int                   n_layers,
+            int                   layer,
+            int                   pending_bank,
+            int                   n_boundaries,
+            int                   n_chains,
+            int                   n_waves,
+            int                   max_parallel_chains);
+
     GGML_API struct ggml_tensor * ggml_ssm_scan(
             struct ggml_context * ctx,
             struct ggml_tensor  * s,
@@ -2887,6 +2938,18 @@ extern "C" {
             struct ggml_tensor * tensor,
             bool                 skip_intermediate);
 
+    // dflash extension: let the kernel derive the gates from the raw
+    // projections instead of graph-side sigmoid/softplus ops:
+    //   beta_val = sigmoid(beta_raw)
+    //   g_val    = exp(softplus(alpha_raw + dt_bias[h]) * A[h])
+    // `g` then carries alpha_raw and `beta` carries beta_raw (both [1,H,T,S]);
+    // gate_ba is a contiguous f32 [2*H] tensor holding [dt_bias | A]
+    // (src[9], op_params[10] = 1). Only for the non-tree, non-KDA,
+    // non-SpecLA CUDA/HIP path.
+    GGML_API void ggml_gated_delta_net_set_raw_gates(
+            struct ggml_tensor * tensor,
+            struct ggml_tensor * gate_ba);
+
     // dflash extension: tree-mode gated delta net for DDTree-style
     // speculative decoding verify. `parent_ids` is an int32 tensor of shape
     // [n_tokens, n_seqs] where entry [t, s] is the index within sequence s of
@@ -2923,6 +2986,28 @@ extern "C" {
             struct ggml_tensor  * state,
             struct ggml_tensor  * parent_ids,
             struct ggml_tensor  * persist_inter);
+
+    // SpecLA state-resident heavy-light verify. The kernel applies the compact
+    // factors accepted in the preceding step, writes only that committed base
+    // state, then verifies the current HLD chains while writing raw
+    // (k, delta, log-gate) factors directly to the opposite persistent bank.
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_specla(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * hld,
+            struct ggml_tensor  * factor_ptrs,
+            int                   n_layers,
+            int                   layer,
+            int                   pending_bank,
+            int                   n_boundaries,
+            int                   n_chains,
+            int                   n_waves,
+            int                   max_parallel_chains);
 
     // custom operators
 

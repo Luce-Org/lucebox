@@ -163,6 +163,17 @@ std::string check_feature_compatibility(
                "' does not support PFlash compression";
     }
 
+    // A block-size override changes the local draft graph itself. Remote
+    // drafters own that shape in the IPC process and cannot be resized here.
+    if (args.draft_block_size != 0) {
+        if (args.draft_path == nullptr) {
+            return "--draft-block-size requires --draft";
+        }
+        if (args.remote_draft.enabled()) {
+            return "--draft-block-size requires an in-process draft";
+        }
+    }
+
     // ── --paged-attention × architecture, placement, and decode features
     // Paged decode swaps the contiguous K/V cache for a block table owned by
     // the monolithic qwen35 backend, so every rule below is about reaching
@@ -280,6 +291,12 @@ std::string check_feature_compatibility(
                "DeepSeek4";
     }
 
+    // ── --ds4-fused-verify-f16-kv × placement
+    if (args.ds4_fused_verify_f16_kv && !monolithic_ds4) {
+        return "--ds4-fused-verify-f16-kv currently requires single-device "
+               "HIP DeepSeek4";
+    }
+
     // ── --ds4-expert-top-k × architecture/adapter
     if (args.ds4_expert_top_k != 0 && !local_ds4) {
         return "--ds4-expert-top-k currently requires a single local "
@@ -340,6 +357,11 @@ std::vector<std::string> collect_feature_warnings(
                arch_supports_verify_width(arch, split),
                arch_supports_verify_width(arch, false),
                split, arch, "--verify-width", "chain-spec verify width");
+
+    warn_inert(out, args.draft_block_size != 0,
+               arch_supports_draft_block_size(arch, split),
+               arch_supports_draft_block_size(arch, false),
+               split, arch, "--draft-block-size", "draft block-size override");
 
     warn_inert(out, args.fa_window != 0,
                arch_supports_fa_window(arch, split),

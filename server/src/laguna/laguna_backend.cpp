@@ -1569,6 +1569,7 @@ GenerateResult LagunaBackend::restore_and_generate_impl(int slot,
     }
 
     const int prefix_len = cache_.cur_pos;
+    result.restored_prefix_tokens = prefix_len;
     const int N = (int)req.prompt.size();
     if (N < prefix_len) {
         std::fprintf(stderr, "[snap] RESTORE prompt shorter than cached prefix (%d < %d)\n",

@@ -361,10 +361,9 @@ bool dspark_markov_correct_greedy_chain_fused(const DraftWeights & dw,
     draft_tok.assign((size_t)q_len, 0);
     draft_tok[0] = last_tok;
     // One synchronize instead of n_cand blocking readbacks.
-    int32_t t_out[16];
-    float c_out[16] = {};
-    const int n_get = n_cand < 16 ? n_cand : 16;
-    for (int i = 0; i < n_get; ++i) {
+    std::vector<int32_t> t_out((size_t)n_cand);
+    std::vector<float> c_out(want_confidence ? (size_t)n_cand : 0);
+    for (int i = 0; i < n_cand; ++i) {
         ggml_backend_tensor_get_async(backend, g.toks[(size_t)i], &t_out[i], 0, sizeof(int32_t));
         if (want_confidence && g.confidence[(size_t)i]) {
             ggml_backend_tensor_get_async(
@@ -372,11 +371,11 @@ bool dspark_markov_correct_greedy_chain_fused(const DraftWeights & dw,
         }
     }
     ggml_backend_synchronize(backend);
-    for (int i = 0; i < n_get; ++i) {
+    for (int i = 0; i < n_cand; ++i) {
         draft_tok[(size_t)i + 1] = t_out[i];
     }
     if (want_confidence && !g.confidence.empty() && g.confidence[0]) {
-        confidence_out->assign(c_out, c_out + n_get);
+        *confidence_out = std::move(c_out);
     }
     ggml_free(g.ctx);
     return true;

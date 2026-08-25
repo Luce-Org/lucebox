@@ -677,12 +677,19 @@ GenerateResult Qwen3Backend::restore_and_generate_impl(int slot,
 
     // Restore KV cache from snapshot
     const auto & snap = snapshots_[slot];
+    if (snap.cur_pos > (int) req.prompt.size()) {
+        std::fprintf(stderr,
+            "[pc] Qwen3 snapshot longer than prompt (%d > %zu); fresh prefill\n",
+            snap.cur_pos, req.prompt.size());
+        return generate_impl(req, io);
+    }
     for (int il = 0; il < cache_.n_layer; ++il) {
         ggml_backend_tensor_copy(snap.k_snap[il], cache_.k[il]);
         ggml_backend_tensor_copy(snap.v_snap[il], cache_.v[il]);
     }
     cache_.cur_pos = snap.cur_pos;
     const int prefix_len = snap.cur_pos;
+    result.restored_prefix_tokens = prefix_len;
 
     // Set up sampler
     sampler_ = req.sampler;

@@ -76,6 +76,16 @@ struct TargetLayer {
     ggml_tensor * ssm_dt_bias    = nullptr;  // [dt_rank] per-head alpha bias
     ggml_tensor * ssm_norm       = nullptr;  // [head_v_dim]
     ggml_tensor * ssm_out        = nullptr;  // output projection after delta-net
+    // Zero-copy stacked projections (set by the loader when the two source
+    // tensors share a type and were placed back to back in the weight buffer):
+    //   wqkv_z: rows [0, n_z) = wqkv_gate (z), rows [n_z, ...) = wqkv
+    //   ssm_ba: rows [0, dt_rank) = ssm_beta, rows [dt_rank, ...) = ssm_alpha
+    // One GEMV each instead of two; nullptr when stacking was not possible.
+    ggml_tensor * wqkv_z         = nullptr;
+    ggml_tensor * ssm_ba         = nullptr;
+    // Fused raw-gate GDN kernel parameters: f32 [2 * dt_rank] = [dt_bias | A],
+    // one small GPU tensor per DeltaNet layer (src[9] of the GDN op).
+    ggml_tensor * ssm_gate_ba    = nullptr;
 
     // MoE FFN (qwen35moe only; nullptr on dense qwen35)
     ggml_tensor * ffn_gate_inp       = nullptr;  // [hidden, n_expert] router
@@ -147,6 +157,9 @@ struct CpuEmbedder {
 
 struct TargetWeights {
     ggml_context *        ctx     = nullptr;
+    ggml_context *        stack_ctx = nullptr;  // owns the stacked alias tensors
+    ggml_context *        gate_ctx  = nullptr;  // owns the [dt_bias | A] gate tensors
+    ggml_backend_buffer_t gate_buf  = nullptr;
     ggml_backend_t        backend = nullptr;
     ggml_backend_buffer_t buf     = nullptr;
 
@@ -234,6 +247,18 @@ void free_target_weights(TargetWeights & w);
 
 // ─── Draft weights (z-lab DFlash, bf16) ───────────────────────────
 
+// DFlash 2 grouped dynamic causal conv (two taps over the draft block, one
+// instance before/after attention and one before/after the MLP):
+//   dyn      = proj @ x_norm                      [2*K*groups, q_len]
+//   prepare  = sum_k (base[0][k] + dyn[0][k]) * shift_k(x_norm)
+//   finish   = sum_k (base[1][k] + dyn[1][k]) * shift_k(sub_block_out)
+// base is per element, dyn per group of conv_group_size elements.
+struct DraftConvWeights {
+    ggml_tensor * base = nullptr;   // [hidden, K, 2] f32
+    ggml_tensor * proj = nullptr;   // [hidden, 2*K*groups]
+    bool present() const { return base != nullptr && proj != nullptr; }
+};
+
 struct DraftLayer {
     ggml_tensor * attn_norm;
     ggml_tensor * ffn_norm;
@@ -247,6 +272,8 @@ struct DraftLayer {
     ggml_tensor * w_gate;
     ggml_tensor * w_up;
     ggml_tensor * w_down;
+    DraftConvWeights attn_conv;         // optional DFlash 2 conv around attention
+    DraftConvWeights mlp_conv;          // optional DFlash 2 conv around the MLP
     bool is_swa = false;  // true for SWA layers (Qwen3.6 pattern)
     bool attn_gate_per_head = false;
 };
@@ -278,6 +305,18 @@ struct DraftDSparkWeights {
     ggml_tensor * markov_w2    = nullptr;  // [markov_rank, vocab_size]
     ggml_tensor * confidence_w = nullptr;  // [confidence_dim, 1]
     ggml_tensor * confidence_b = nullptr;  // [1] f32
+};
+
+// DFlash 2 candidate selector: top-k candidates per block position from the
+// target lm_head logits, then one path through them scored by a low-rank
+// bigram form  unary[c] + <pred[prev] * hproj(h), succ[c]>.
+struct DraftSelectorWeights {
+    bool enabled = false;
+    int  rank    = 0;
+    int  top_k   = 0;
+    ggml_tensor * hproj   = nullptr;   // [hidden, rank]
+    ggml_tensor * pred_cb = nullptr;   // [rank, vocab]  predecessor codebook
+    ggml_tensor * succ_cb = nullptr;   // [rank, vocab]  successor codebook
 };
 
 struct DraftWeights {
@@ -324,6 +363,12 @@ struct DraftWeights {
     // Optional DSpark/DeepSpec-style Markov correction head. When present,
     // greedy chain decode adds a low-rank previous-token bias before argmax.
     DraftDSparkWeights dspark;
+
+    // Optional DFlash 2 pieces: dynamic convs live in the layers, the
+    // selector replaces argmax/markov projection for the drafted chain.
+    int conv_kernel_size = 0;   // 0 = no dynamic convs
+    int conv_group_size  = 0;
+    DraftSelectorWeights selector;
 };
 
 bool load_draft_safetensors(const std::string & path,
@@ -406,12 +451,51 @@ struct TargetCache {
     //     F32 for opt-in exact rollback), one per delta layer.
     //     Element t on axis 3 holds the DeltaNet recurrent state after
     //     processing verify token t. Spec decode commits t = commit_n - 1.
-    //   conv_input_cache: [(kernel-1) + max_q_len, conv_channels] f32, one per
-    //     delta layer. Holds the full concat(old_conv_state, qkv_new_tokens)
-    //     that was fed to ggml_ssm_conv. Spec decode slices
-    //     [commit_n..commit_n+kernel-2] along dim 0 for conv state rollback.
+    //   conv_input_cache: normally [(kernel-1) + max_q_len, conv_channels]
+    //     f32, one per delta layer, holding the full concat fed to
+    //     ggml_ssm_conv. In SpecLA mode these are [conv_channels, max_q_len]
+    //     strided views into conv_factor_all and hold raw current inputs.
     std::vector<ggml_tensor *> ssm_intermediate;    // size = n_delta (48)
     std::vector<ggml_tensor *> conv_input_cache;    // size = n_delta (48)
+    std::vector<ggml_tensor *> conv_input_cache_alt;// SpecLA factor bank 1
+    ggml_tensor * conv_factor_all = nullptr;
+    ggml_tensor * conv_factor_all_alt = nullptr;
+
+    // SpecLA factor buffers (allocated instead of ssm_intermediate when
+    // DFLASH_SPECLA=1 on the single-target path). Two token-major banks let a
+    // verify consume the preceding accepted path while writing its own raw
+    // factors without aliasing:
+    //   factor_k_all:     [S_k, H_v, n_delta, max_q_len] f32
+    //   factor_v_new_all: [S_v, H_v, n_delta, max_q_len] f32
+    //   factor_g_ps_all:  [H_v, n_delta, max_q_len] f32
+    //   conv_factor_all:  [conv_channels, n_delta, max_q_len] f32
+    // The per-layer vectors below are persistent VIEWS into these (created
+    // after buffer allocation), shaped like independent per-layer buffers so
+    // the capture path treats them exactly like other cache tensors.
+    ggml_tensor * factor_k_all = nullptr;
+    ggml_tensor * factor_v_new_all = nullptr;
+    ggml_tensor * factor_g_ps_all = nullptr;
+    ggml_tensor * factor_k_all_alt = nullptr;
+    ggml_tensor * factor_v_new_all_alt = nullptr;
+    ggml_tensor * factor_g_ps_all_alt = nullptr;
+    std::vector<ggml_tensor *> factor_k;            // view [S_k, H_v, max_q_len]
+    std::vector<ggml_tensor *> factor_v_new;        // view [S_v, H_v, max_q_len]
+    std::vector<ggml_tensor *> factor_g_ps;         // view [H_v, max_q_len]
+    std::vector<ggml_tensor *> factor_k_alt;
+    std::vector<ggml_tensor *> factor_v_new_alt;
+    std::vector<ggml_tensor *> factor_g_ps_alt;
+    // Host-side bank state. pending_bank is read by the next verify; the
+    // opposite bank receives that verify's factors.
+    int specla_pending_bank = 0;
+    int specla_pending_count = 0;
+    // Device-side accepted-index scratch and uploaded pointer tables.
+    ggml_tensor * specla_idx = nullptr;             // i32 [max_q_len]
+    ggml_tensor * specla_state_ptrs = nullptr;      // i64 [n_delta]
+    ggml_tensor * specla_conv_state_ptrs = nullptr; // i64 [n_delta]
+    // i64 [8]: base pointers for bank0 {k,v,g,conv}, then bank1. HLD kernels
+    // write their compact factors here directly, avoiding four cpy nodes per
+    // delta layer. Consolidated layout is token-major [t, layer, head, dim].
+    ggml_tensor * specla_factor_ptrs = nullptr;
 
     // Rolling target layer features captured during target forward passes.
     // Shape [5 * hidden, target_feat_cap] bf16. target_feat_cap is typically
@@ -611,7 +695,19 @@ bool migrate_prefill_cache(const TargetWeights & w,
                            int max_ctx,
                            int max_verify_tokens,
                            ggml_backend_t backend,
-                           TargetCache & cache);
+                           TargetCache & cache,
+                           bool enable_specla = true);
+
+// Compatibility commit for the fully factorized §4.2 fallback. The production
+// HLD route instead keeps raw accepted factors pending and consumes them in
+// the next state-resident verify (§5.2). Commits the bank the just-run verify
+// wrote (1 - specla_pending_bank) into durable SSM and conv state, so it must
+// be called before the host-side bank rotation. accepted_idx is in path order.
+bool specla_commit_accepted(TargetCache & cache,
+                            ggml_backend_t backend,
+                            const int32_t * accepted_idx,
+                            int A);
+
 
 // ─── Target forward graph ─────────────────────────────────────────
 
@@ -627,12 +723,32 @@ bool migrate_prefill_cache(const TargetWeights & w,
 //   ssm_intermediate_states: [S_v, S_v, H_v, q_len] f32
 //       Element t on axis 3 holds the DeltaNet state after processing verify
 //       token t. Rollback reads offset (commit_n-1) * S_v*S_v*H*elt.
-//   conv_input: [(kernel-1) + q_len, conv_channels, 1] f32
-//       Full concat(old_conv_state, qkv_new_tokens) fed to ggml_ssm_conv.
-//       Rollback reads slice [commit_n..commit_n+kernel-2] along dim 0.
+//   conv_input: normally [(kernel-1) + q_len, conv_channels, 1] f32 with the
+//       full concat fed to ggml_ssm_conv. In SpecLA mode it is a strided
+//       [conv_channels, q_len, 1] view receiving raw current inputs.
 struct DeltaNetCapture {
     ggml_tensor * ssm_intermediate_states = nullptr;
     ggml_tensor * conv_input              = nullptr;
+
+    // SpecLA factor capture (DFLASH_SPECLA=1, docs/SPECLA.md). Persistent F32
+    // aliases into the bank written by this verify. In the HLD path the
+    // historical field names hold raw serial-recurrence terms:
+    //   factor_k:     [S_k, H_v, max_verify_tokens] — post-l2norm keys
+    //   factor_v_new: [S_v, H_v, max_verify_tokens] — raw Delta-rule delta
+    //   factor_g_ps:  [H_v, max_verify_tokens]      — raw log-decay g
+    // The factorized compatibility route uses corrected ṽ and cumulative g⁺
+    // in the same slots. ssm_intermediate_states stays null in SpecLA mode.
+    ggml_tensor * factor_k     = nullptr;
+    ggml_tensor * factor_v_new = nullptr;
+    ggml_tensor * factor_g_ps  = nullptr;
+    ggml_tensor * pending_factor_k     = nullptr;
+    ggml_tensor * pending_factor_v_new = nullptr;
+    ggml_tensor * pending_factor_g     = nullptr;
+    ggml_tensor * pending_conv_input   = nullptr;
+    ggml_tensor * factor_ptrs           = nullptr;
+    int factor_n_layers = 0;
+    int factor_layer = -1;
+    int pending_bank = 0;
 };
 
 // One contiguous prompt chunk on the flattened token axis of a concurrent
@@ -721,6 +837,17 @@ struct QwenGraphInputs {
     // layer into cache.q_cap (KVFlash target-QK scorer). Step-invariant:
     // node properties depend only on n_tokens and the layer index.
     bool q_capture = false;
+
+    // SpecLA topology masks for the fully factorized compatibility route.
+    ggml_tensor * specla_m_strict = nullptr;
+    ggml_tensor * specla_m_incl   = nullptr;
+    ggml_tensor * specla_m_eye    = nullptr;
+    // Packed heavy-light schedule for the state-resident SpecLA kernels.
+    ggml_tensor * specla_hld = nullptr;
+    int specla_n_chains = 0;
+    int specla_n_waves = 0;
+    int specla_n_boundaries = 0;
+    int specla_max_parallel_chains = 0;
 };
 
 struct QwenGraphOutputs {

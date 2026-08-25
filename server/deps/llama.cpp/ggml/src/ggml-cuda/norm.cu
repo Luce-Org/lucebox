@@ -150,6 +150,57 @@ static __global__ void rms_norm_f32(const float * x,
     }
 }
 
+// dflash: residual add fused into the following rms_norm * weight.
+//   sum = a + b            (written to sum_out; it is the next residual)
+//   dst = rms_norm(sum) * w
+// All of a, b, sum_out, dst are contiguous [ncols, R]; w is [ncols].
+template <int block_size>
+static __global__ void add_rms_norm_mul_f32(const float * __restrict__ a,
+                                            const float * __restrict__ b,
+                                            float *       __restrict__ sum_out,
+                                            float *       __restrict__ dst,
+                                            const float * __restrict__ w,
+                                            const int     ncols,
+                                            const float   eps) {
+    const int64_t row = blockIdx.x;
+    const int     tid = threadIdx.x;
+
+    a       += row * ncols;
+    b       += row * ncols;
+    sum_out += row * ncols;
+    dst     += row * ncols;
+
+    float tmp = 0.0f;
+    for (int col = tid; col < ncols; col += block_size) {
+        const float s = a[col] + b[col];
+        sum_out[col] = s;
+        tmp += s * s;
+    }
+
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+    const float mean  = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+    for (int col = tid; col < ncols; col += block_size) {
+        dst[col] = scale * sum_out[col] * w[col];
+    }
+}
+
+static void add_rms_norm_mul_f32_cuda(const float * a, const float * b, float * sum_out, float * dst,
+                                      const float * w, const int ncols, const int64_t nrows,
+                                      const float eps, cudaStream_t stream) {
+    const dim3 blocks_num(nrows, 1, 1);
+    if (ncols < 1024) {
+        const dim3 block_dims(256, 1, 1);
+        add_rms_norm_mul_f32<256><<<blocks_num, block_dims, 32 * sizeof(float), stream>>>(a, b, sum_out, dst, w, ncols, eps);
+    } else {
+        const dim3 block_dims(1024, 1, 1);
+        add_rms_norm_mul_f32<1024><<<blocks_num, block_dims, 32 * sizeof(float), stream>>>(a, b, sum_out, dst, w, ncols, eps);
+    }
+}
+
 template <int block_size>
 static __global__ void rms_norm_back_f32(
         const float * grad, const float * xf, float * dst, const int ncols, const float eps) {
@@ -531,6 +582,36 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
                           /*add_s00*/ 0, 0, 0,
                           0, 0, 0, 0,
                           eps, stream);
+}
+
+// dflash: ADD (residual) + RMS_NORM + MUL in one launch. `add_tensor` is the
+// residual add node (its output is materialized), `rms_tensor` is elided,
+// `mul_tensor` receives the normalized * weight result.
+void ggml_cuda_op_add_rms_norm_mul_fused(ggml_backend_cuda_context & ctx,
+                                         ggml_tensor *               add_tensor,
+                                         ggml_tensor *               rms_tensor,
+                                         ggml_tensor *               mul_tensor) {
+    const ggml_tensor * a = add_tensor->src[0];
+    const ggml_tensor * b = add_tensor->src[1];
+    const ggml_tensor * w = (mul_tensor->src[0] == rms_tensor) ? mul_tensor->src[1] : mul_tensor->src[0];
+
+    float eps = 0.0f;
+    memcpy(&eps, rms_tensor->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32);
+    GGML_ASSERT(add_tensor->type == GGML_TYPE_F32 && mul_tensor->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(a) && ggml_is_contiguous(b) && ggml_is_contiguous(w));
+    GGML_ASSERT(ggml_is_contiguous(add_tensor) && ggml_is_contiguous(mul_tensor));
+    GGML_ASSERT(ggml_are_same_shape(a, b) && ggml_are_same_shape(a, add_tensor) && ggml_are_same_shape(a, mul_tensor));
+    GGML_ASSERT(w->ne[0] == a->ne[0] && ggml_nelements(w) == a->ne[0]);
+
+    const int     ncols = (int) a->ne[0];
+    const int64_t nrows = ggml_nrows(a);
+
+    add_rms_norm_mul_f32_cuda((const float *) a->data, (const float *) b->data,
+                              (float *) add_tensor->data, (float *) mul_tensor->data,
+                              (const float *) w->data, ncols, nrows, eps, ctx.stream());
 }
 
 void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,

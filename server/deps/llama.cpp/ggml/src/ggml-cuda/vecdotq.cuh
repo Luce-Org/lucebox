@@ -29,6 +29,17 @@ static __device__ __forceinline__ int get_int_b4(const void * x, const int & i32
     return ((const int *) x)[i32]; // assume at least 4 byte alignment
 }
 
+// Non-temporal variant for weight streams: decode reads every weight byte
+// exactly once per token, so caching them evicts the activations/KV that
+// other kernels reuse. HIP lowers this to sc0/sc1 (bypass) load hints.
+static __device__ __forceinline__ int get_int_b4_nt(const void * x, const int & i32) {
+#if defined(GGML_USE_HIP)
+    return __builtin_nontemporal_load(((const int *) x) + i32);
+#else
+    return ((const int *) x)[i32];
+#endif
+}
+
 // q4 contains 8 indices with 4 bit each.
 // This function selects those bytes from table that are at those indices and returns them as int2.
 // The first int contains the bytes with even indices in q4, the second int contains the bytes with odd indices in q4.
@@ -509,6 +520,28 @@ static __device__ __forceinline__ float vec_dot_rocmfp4_fast_q8_1(
     return __low2float(bq8_1->ds) * rocmfp4_ue4m3_to_fp32_half_finite(bq4->e) * sumi;
 }
 
+#ifdef ROCMFP2_AFFINE
+static __device__ __forceinline__ float rocmfpx_fp2_affine_dot(
+        const block_rocmfp2 * __restrict__ weights,
+        const block_q8_1 * __restrict__ activations,
+        const int sumi, const int iqs, const float activation_scale) {
+    int sumq = 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int q = get_int_b4(activations->qs, 4*iqs + j);
+        sumq += (int8_t)(q & 0xFF) + (int8_t)((q >> 8) & 0xFF)
+              + (int8_t)((q >> 16) & 0xFF)
+              + (int8_t)((q >> 24) & 0xFF);
+    }
+    const float scale =
+        rocmfpx_ue4m3_to_fp32_finite(weights->e[0]);
+    const float offset =
+        rocmfpx_ue4m3_to_fp32_finite(weights->e[1]);
+    return activation_scale *
+        (scale * sumi + (scale - offset) * sumq);
+}
+#endif
+
 static __device__ __forceinline__ float vec_dot_rocmfpx_fp2_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
     // int32-consistent MMVQ layout: QI_ROCMFP2=2 (8B qs = 2 int32), VDR=1.
@@ -525,7 +558,11 @@ static __device__ __forceinline__ float vec_dot_rocmfpx_fp2_q8_1(
     }
 
     const float db = __low2float(bq8_1->ds);
+#ifdef ROCMFP2_AFFINE
+    return rocmfpx_fp2_affine_dot(bq2, bq8_1, sumi, iqs, db);
+#else
     return db * rocmfpx_ue4m3_to_fp32_finite(bq2->e[iqs]) * sumi;
+#endif
 }
 
 static __device__ __forceinline__ float vec_dot_rocmfpx_fp3_q8_1(
@@ -1582,7 +1619,7 @@ static __device__ __forceinline__ float vec_dot_iq4_xs_q8_1(
     int sumi = 0;
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
-        const int aux_q4 = get_int_b4(bq4->qs, iqs + j);
+        const int aux_q4 = get_int_b4_nt(bq4->qs, iqs + j);
         const int2 v = get_int_from_table_16(aux_q4, kvalues_iq4nl);
 
         const int u0 = get_int_b4(bq8_1[iqs/4].qs, j + 0);

@@ -29,6 +29,7 @@ Usage:
 
 import argparse
 import json
+import math
 import struct
 import sys
 from pathlib import Path
@@ -110,6 +111,49 @@ def load_arch(safetensors: Path, header: dict) -> dict:
                 or c.get("aux_hidden_state_layer_ids"))
         if _tli:
             a["capture_layer_ids"] = [int(x) for x in _tli]
+        # Newer HF configs (transformers >= 5.x, e.g. the Qwen3.8 DSpark
+        # drafter) nest rope_theta / YaRN under rope_parameters and
+        # mask_token_id under dflash_config instead of top-level.
+        rp = c.get("rope_parameters") or c.get("rope_scaling") or {}
+        if isinstance(rp, dict):
+            if rp.get("rope_theta") is not None:
+                a["rope_theta"] = float(rp["rope_theta"])
+            if str(rp.get("rope_type") or rp.get("type") or "").lower() == "yarn":
+                a["yarn_factor"]    = float(rp.get("factor", 0.0))
+                a["yarn_orig_ctx"]  = int(rp.get("original_max_position_embeddings")
+                                          or c.get("original_max_position_embeddings")
+                                          or 0)
+                attn_factor = rp.get("attention_factor")
+                # GGML applies YaRN's standard 1 + 0.1*log(factor) magnitude
+                # internally. HF attention_factor is the final magnitude, so
+                # normalize only an explicit override; 1.0 retains GGML's
+                # standard default when the config omits it.
+                ggml_mscale = (1.0 + 0.1 * math.log(a["yarn_factor"])
+                               if a["yarn_factor"] > 1.0 else 1.0)
+                a["yarn_attn_factor"] = (
+                    float(attn_factor) / ggml_mscale
+                    if attn_factor is not None else 1.0)
+                a["yarn_beta_fast"] = float(rp.get("beta_fast", 32.0))
+                a["yarn_beta_slow"] = float(rp.get("beta_slow", 1.0))
+        if dfc.get("mask_token_id") is not None:
+            a["mask_token_id"] = int(dfc["mask_token_id"])
+        if dfc.get("block_size") is not None:
+            a["block_size"] = int(dfc["block_size"])
+        # DFlash 2 (z-lab/inco): grouped dynamic convs + candidate selector.
+        if dfc.get("conv_kernel_size") is not None:
+            a["conv_kernel_size"] = int(dfc["conv_kernel_size"])
+            a["conv_group_size"]  = int(dfc.get("conv_group_size", 16))
+        if dfc.get("selector_rank") is not None:
+            a["selector_rank"]  = int(dfc["selector_rank"])
+            a["selector_top_k"] = int(dfc.get("selector_top_k", 16))
+        # Per-layer sliding-window / causal attention (Qwen3.6-style drafters
+        # and DFlash 2). HF: layer_types + sliding_window; a top-level
+        # is_causal=false (DFlash 2) makes every layer bidirectional, which is
+        # our default (no SWA pattern emitted).
+        lt = c.get("layer_types")
+        if lt and c.get("sliding_window") and c.get("is_causal", None) is not False:
+            a["swa_window"]  = int(c["sliding_window"])
+            a["swa_pattern"] = [str(x) == "sliding_attention" for x in lt]
         print(f"[info] read arch from {cfg_path}")
     else:
         print(f"[warn] no config.json next to safetensors; using 27B defaults")
@@ -182,8 +226,17 @@ def map_name(name: str) -> str | None:
             "mlp.gate_proj.weight":            f"blk.{i}.ffn_gate.weight",
             "mlp.up_proj.weight":              f"blk.{i}.ffn_up.weight",
             "mlp.down_proj.weight":            f"blk.{i}.ffn_down.weight",
+            # DFlash 2 grouped dynamic convs
+            "attention_conv.base_kernel":            f"blk.{i}.attn_conv.base",
+            "attention_conv.kernel_projection.weight": f"blk.{i}.attn_conv.proj.weight",
+            "mlp_conv.base_kernel":                  f"blk.{i}.ffn_conv.base",
+            "mlp_conv.kernel_projection.weight":     f"blk.{i}.ffn_conv.proj.weight",
         }
         return layer_map.get(rest)
+    # DFlash 2 candidate selector
+    if name == "candidate_selector.hidden_projection.weight": return "dflash.selector.hproj.weight"
+    if name == "candidate_selector.predecessor_codebook":     return "dflash.selector.pred_cb"
+    if name == "candidate_selector.successor_codebook":       return "dflash.selector.succ_cb"
     return None
 
 
@@ -248,18 +301,30 @@ DOMINO_TENSOR_MAP = {
 }
 
 
+# Alias sets per head tensor: SpecForge sidecar names, DS4 MTP-shard names,
+# and single-file releases (e.g. RadixArk Qwen3.8-27B-DSpark) that carry the
+# heads inline in the main model.safetensors.
+DSPARK_MARKOV_W1_KEYS = ("dspark_markov_head.markov_w1.weight",
+                         "mtp.2.markov_head.markov_w1.weight",
+                         "markov_head.markov_w1.weight")
+DSPARK_MARKOV_W2_KEYS = ("dspark_markov_head.markov_w2.weight",
+                         "mtp.2.markov_head.markov_w2.weight",
+                         "markov_head.markov_w2.weight")
+DSPARK_CONF_W_KEYS    = ("dspark_confidence_head.weight",
+                         "mtp.2.confidence_head.proj.weight",
+                         "confidence_head.proj.weight")
+DSPARK_CONF_B_KEYS    = ("dspark_confidence_head.bias",
+                         "mtp.2.confidence_head.proj.bias",
+                         "confidence_head.proj.bias")
+
 DSPARK_TENSOR_MAP = {
-    ("dspark_markov_head.markov_w1.weight",
-     "mtp.2.markov_head.markov_w1.weight"): ("dflash.dspark.markov.w1", gguf.GGMLQuantizationType.F16),
-    ("dspark_markov_head.markov_w2.weight",
-     "mtp.2.markov_head.markov_w2.weight"): ("dflash.dspark.markov.w2", gguf.GGMLQuantizationType.F16),
+    DSPARK_MARKOV_W1_KEYS: ("dflash.dspark.markov.w1", gguf.GGMLQuantizationType.F16),
+    DSPARK_MARKOV_W2_KEYS: ("dflash.dspark.markov.w2", gguf.GGMLQuantizationType.F16),
 }
 
 DSPARK_CONFIDENCE_TENSOR_MAP = {
-    ("dspark_confidence_head.weight",
-     "mtp.2.confidence_head.proj.weight"): ("dflash.dspark.confidence.weight", gguf.GGMLQuantizationType.F16),
-    ("dspark_confidence_head.bias",
-     "mtp.2.confidence_head.proj.bias"): ("dflash.dspark.confidence.bias", gguf.GGMLQuantizationType.F32),
+    DSPARK_CONF_W_KEYS: ("dflash.dspark.confidence.weight", gguf.GGMLQuantizationType.F16),
+    DSPARK_CONF_B_KEYS: ("dflash.dspark.confidence.bias", gguf.GGMLQuantizationType.F32),
 }
 
 
@@ -372,8 +437,8 @@ def add_dspark_aux_heads(writer, arch: str, aux_path: Path | None):
         return
 
     print(f"[info] reading DSpark aux heads from {aux_path}")
-    w1 = resolved[("dspark_markov_head.markov_w1.weight", "mtp.2.markov_head.markov_w1.weight")][1]
-    w2 = resolved[("dspark_markov_head.markov_w2.weight", "mtp.2.markov_head.markov_w2.weight")][1]
+    w1 = resolved[DSPARK_MARKOV_W1_KEYS][1]
+    w2 = resolved[DSPARK_MARKOV_W2_KEYS][1]
     vocab = int(w1.shape[0])
     rank = int(w1.shape[1])
     if tuple(w2.shape) != (vocab, rank):
@@ -397,8 +462,8 @@ def add_dspark_aux_heads(writer, arch: str, aux_path: Path | None):
             conf_missing.append(names)
             continue
         conf_resolved[names] = (found_name, tensor, spec)
-    weight_names = ("dspark_confidence_head.weight", "mtp.2.confidence_head.proj.weight")
-    bias_names = ("dspark_confidence_head.bias", "mtp.2.confidence_head.proj.bias")
+    weight_names = DSPARK_CONF_W_KEYS
+    bias_names = DSPARK_CONF_B_KEYS
     if weight_names not in conf_resolved:
         if conf_missing:
             print("[warn] incomplete DSpark confidence head; Markov head will still load")
@@ -470,6 +535,13 @@ def main():
     writer.add_uint32(f"{ARCH}.vocab_size",              a["vocab"])
     writer.add_float32(f"{ARCH}.attention.layer_norm_rms_epsilon", a["rms_eps"])
     writer.add_float32(f"{ARCH}.rope.freq_base",         a["rope_theta"])
+    if a.get("yarn_factor", 0.0) > 1.0:
+        writer.add_string(f"{ARCH}.rope.scaling.type", "yarn")
+        writer.add_float32(f"{ARCH}.rope.scaling.factor", a["yarn_factor"])
+        writer.add_uint32(f"{ARCH}.rope.scaling.original_context_length", a["yarn_orig_ctx"])
+        writer.add_float32(f"{ARCH}.rope.scaling.attn_factor", a["yarn_attn_factor"])
+        writer.add_float32(f"{ARCH}.rope.scaling.beta_fast", a["yarn_beta_fast"])
+        writer.add_float32(f"{ARCH}.rope.scaling.beta_slow", a["yarn_beta_slow"])
 
     # DFlash-specific hyperparameters
     writer.add_uint32(f"{ARCH}.dflash.n_target_layers", a["n_target_layers"])
@@ -484,6 +556,15 @@ def main():
     elif _cap_ids:
         print(f"[warn] capture_layer_ids len {len(_cap_ids)} != n_target_layers "
               f"{a['n_target_layers']}; not embedding ids", file=sys.stderr)
+    if a.get("swa_pattern"):
+        writer.add_uint32(f"{ARCH}.attention.sliding_window", a["swa_window"])
+        writer.add_array(f"{ARCH}.attention.sliding_window_pattern", [bool(x) for x in a["swa_pattern"]])
+    if a.get("conv_kernel_size"):
+        writer.add_uint32(f"{ARCH}.dflash.dflash2.conv_kernel_size", a["conv_kernel_size"])
+        writer.add_uint32(f"{ARCH}.dflash.dflash2.conv_group_size",  a["conv_group_size"])
+    if a.get("selector_rank"):
+        writer.add_uint32(f"{ARCH}.dflash.dflash2.selector_rank",  a["selector_rank"])
+        writer.add_uint32(f"{ARCH}.dflash.dflash2.selector_top_k", a["selector_top_k"])
 
     # Walk + add tensors. Sort: dflash.* singletons first, then output_*,
     # then per-layer in numeric order — keeps the on-disk layout stable.
@@ -522,7 +603,8 @@ def main():
         is_norm = (
             gguf_name.endswith("_norm.weight") or
             gguf_name == "output_norm.weight" or
-            gguf_name == "dflash.hidden_norm.weight"
+            gguf_name == "dflash.hidden_norm.weight" or
+            gguf_name.endswith("_conv.base")   # DFlash 2 conv base kernels [2, K, hidden]
         )
         if is_norm:
             arr = arr.astype("<f4")
@@ -534,7 +616,13 @@ def main():
     if not args.no_aux_heads:
         aux_path = args.aux_heads if args.aux_heads is not None else args.safetensors.parent / "dflash_aux_heads.pt"
     add_domino_aux_heads(writer, ARCH, aux_path)
-    add_dspark_aux_heads(writer, ARCH, aux_path)
+    # DSpark heads may live in a sidecar (.pt / .safetensors) or inline in
+    # the main safetensors (single-file releases like RadixArk
+    # Qwen3.8-27B-DSpark). Fall back to the main file when no sidecar exists.
+    dspark_aux = aux_path
+    if dspark_aux is not None and not dspark_aux.exists():
+        dspark_aux = args.safetensors
+    add_dspark_aux_heads(writer, ARCH, dspark_aux)
 
     print(f"[info] writing {args.out_gguf}")
     writer.write_header_to_file()

@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include <limits>
+
 #include "placement/placement_config.h"
 #include "placement/remote_draft_config.h"
 #include "placement/remote_target_shard_config.h"
@@ -59,6 +61,7 @@ struct BackendArgs {
     // deepseek4-specific decode options
     int             ds4_expert_top_k = 0;  // 0 = model default
     bool            ds4_fused_decode = false;
+    bool            ds4_fused_verify_f16_kv = false;
 
     // Attention and speculative-decode options. Individual backends consume
     // only the fields they support.
@@ -71,14 +74,17 @@ struct BackendArgs {
     // block-rounded). 0 = derive capacity from available device memory.
     long long       kv_pool_tokens   = 0;
     int             kq_stride_pad    = 32;
+    int             draft_block_size = 0;  // 0 = drafter metadata
     int             draft_swa_window = 0;
     int             draft_ctx_max    = 4096;
     bool            fast_rollback    = true;
     bool            seq_verify       = false;
+    bool            specla_mode      = false;
     bool            ddtree_mode      = false;
     int             ddtree_budget    = 22;
     float           ddtree_temp      = 1.0f;
     bool            ddtree_chain_seed = true;
+    float           ddtree_tau       = std::numeric_limits<float>::infinity();
     int             verify_width     = 0;  // chain spec verify width; 0 = adaptive
     bool            use_feature_mirror = false;
 };

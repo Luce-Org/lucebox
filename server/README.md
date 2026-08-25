@@ -170,6 +170,12 @@ Run it directly:
   --model-name luce-dflash
 ```
 
+Use `--specla` to enable speculative linear-attention verification when the
+target supports it. The runtime chooses a compatible proposal adapter; the
+current monolithic Qwen3.5/Qwen3.6 path uses DDTree with tested defaults.
+Hardware- or checkpoint-specific overrides remain available through
+`--ddtree-budget`, `--ddtree-tau`, `--specla-top-k`, and `--draft-swa`.
+
 ### Compression proxy mode
 
 `dflash_server` can run as a **PFlash compression proxy** in front of any
@@ -514,6 +520,26 @@ cmake --build build --target test_dflash dflash_server -j
 Same DFlash + PFlash stack on AMD GPUs. PR #119 ports the Phase 2 rocWMMA flashprefill kernels to HIP. End-to-end on a Ryzen AI MAX+ 395 box (Radeon 8060S iGPU, `gfx1151`, 128 GiB LPDDR5X-8000 unified): **37.0 tok/s DFlash decode** on Qwen3.5-27B Q4_K_M, **27.6 s TTFT @ 16K** with NIAH retrieval intact. **3.08× decode and 2.24× prefill over llama.cpp HIP AR** on the same iGPU. End-to-end wall clock at a 16K prompt + 1K generation workload: **2.66× faster** than vanilla llama.cpp.
 
 **RDNA4 — Radeon AI PRO R9700 (`gfx1201`, 32 GB).** First-class RDNA4 target as of this build. Qwen3.6-27B Q4_K_M + DFlash draft (`dflash-draft-3.6-q4_k_m.gguf`), `--ddtree-budget=22`: **54.65 tok/s mean DFlash decode** across the 10-prompt HumanEval suite (`bench_he.py --n-gen 256`, AL 7.14, range 36.9–93.0 tok/s) on ROCm 7.1.1. The rocWMMA Phase 2 flashprefill kernels are numerically correct on RDNA4 — ROCm 7.1's rocWMMA handles the gfx12 WMMA operand-format change internally, so no kernel changes are needed (`test_flashprefill_kernels` PASS on `gfx1201`: max diff 5e-4, e2e `flash_prefill_forward_bf16` at S=8192 in 10.7 ms/iter). Note `gfx1200` (RX 9060) and `gfx1201` (RX 9070 / R9700) are **not** code-object compatible — build for `gfx1201` explicitly for the R9700.
+
+For Qwen3.8-27B IQ4_XS with the Q8_0 DFlash2 drafter, the checkpoint declares
+a block size of 8: one seed token plus seven speculative tokens. Greedy chain
+verification keeps the output byte-identical to plain decode at any width, so
+`--draft-block-size` accepts values from 2 up to 2x the checkpoint metadata;
+widening only risks acceptance depth, and on this checkpoint it extrapolates:
+completions stayed byte-identical across widths 8/10/12/16 while per-step
+commits grew.
+
+On the R9700 (`gfx1201`), chain verification with `--draft-block-size 16` is
+the fastest measured code/math configuration: HumanEval ten-prompt decode went
+from 143.6 tok/s (block 8) to 204.1 average with per-request peaks above 230,
+and a five-prompt math set from 129.2 to 152.6. Prose stays on block 8 (low
+acceptance pays the wider draft without commit gains). Widths past 16 measured
+a step-time cliff with no commit gain and stay rejected. The block-8
+`--specla --ddtree-budget 8` configuration is a quality-validated alternative
+(the out-of-the-box default is the plain chain at the checkpoint's block 8):
+163.9 versus 159.0 aggregate decode tok/s across repeated ten-prompt
+HumanEval runs (+3.1%), HumanEval+ pass@1 145/164 versus 143/164, with all ten
+short A/B replies and 133/164 full-suite replies byte-identical.
 
 ```bash
 git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/server

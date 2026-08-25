@@ -892,6 +892,7 @@ GenerateResult Gemma4Backend::restore_and_generate_impl(int slot,
     const int snap_pos = snap.cur_pos;
     cache_.cur_pos = snap_pos;
     cache_.last_tok = snap.last_tok;
+    result.restored_prefix_tokens = snap_pos;
 
     // kvflash: the restored prefix is identity-mapped; rebuild the pager
     // mapping over [0, snap_pos) before the delta prefill extends it.
@@ -938,6 +939,7 @@ GenerateResult Gemma4Backend::restore_and_generate_impl(int slot,
             "[pc] snapshot longer than prompt (snap=%d > prompt=%d) — "
             "fresh prefill fallback\n", snap_pos, prompt_len);
         cache_.cur_pos = 0;
+        result.restored_prefix_tokens = 0;
         committed = do_prefill(req.prompt, out_io, /*kv_offset=*/0);
         if (committed < 0) {
             result.fail(GenerateErrorCode::PrefillFailed);

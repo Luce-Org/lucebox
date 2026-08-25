@@ -74,6 +74,16 @@ int select_inline_snapshot_boundary(const std::vector<int> & boundaries,
                                     int restored_prefix_len = 0,
                                     bool prefer_tools_boundary = false);
 
+// Return true when a PPP forced cut should override normal boundary
+// selection. Once the tools head is already restored, forcing the pin again
+// prevents the cache from deepening into the conversation.
+bool should_force_inline_snapshot_boundary(
+    const std::vector<int> & boundaries,
+    int prompt_len,
+    int restored_prefix_len,
+    bool prefer_tools_boundary,
+    int forced_cut);
+
 // ─── Prefix cache entry ─────────────────────────────────────────────────
 
 struct FullCacheEntry {
@@ -90,6 +100,8 @@ struct FullCacheEntry {
 class PrefixCache {
 public:
     static constexpr int MAX_SLOTS = 64;
+    // The HTTP server owns the final backend slot for disk-cache staging.
+    static constexpr int MAX_CACHE_SLOTS = MAX_SLOTS - 1;
 
     // cap = number of prefix-cache slots (0 disables).
     PrefixCache(int cap, const Tokenizer & tokenizer);

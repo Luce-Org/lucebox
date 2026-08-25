@@ -472,6 +472,17 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
             return !ggml_flash_attn_ext_is_ds4(op);
         case GGML_OP_PAGED_ATTN:
             return false;
+        case GGML_OP_SSM_CONV:
+            // Every nonzero mode is a dflash CUDA/HIP extension (SpecLA,
+            // fused step, or dynamic conv). The generic CPU kernel only
+            // implements the original mode and asserts if one reaches it.
+            return ggml_get_op_params_i32(op, 0) == 0;
+        case GGML_OP_GATED_DELTA_NET:
+            // The Specla GDN variant (op param 2 == 1) is stateful via HLD and is
+            // only supported by CUDA/HIP. Raw-gate mode is also CUDA/HIP-only:
+            // the CPU kernel expects beta/g to have already been transformed.
+            return ggml_get_op_params_i32(op, 2) != 1 &&
+                   ggml_get_op_params_i32(op, 10) == 0 && op->src[9] == nullptr;
         case GGML_OP_OUT_PROD:
             return (src0->type == GGML_TYPE_F32 || (ggml_is_quantized(src0->type) && src0->ne[2] == src1->ne[2] && src0->ne[3] == src1->ne[3])) &&
                 src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;

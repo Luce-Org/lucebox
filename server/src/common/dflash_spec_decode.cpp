@@ -86,7 +86,8 @@ bool run_dflash_spec_decode(
     int n_accept_sum    = 0;
     int n_hint_proposed = 0;
     int n_hint_accepted = 0;
-    const ChainRollbackPolicy rollback_policy = resolve_chain_rollback_policy();
+    const ChainRollbackPolicy rollback_policy =
+        resolve_chain_rollback_policy(false, target.exact_fast_rollback());
     RollbackDiag rollback_diag;
 
     auto t_dec0 = std::chrono::steady_clock::now();
@@ -243,9 +244,13 @@ bool run_dflash_spec_decode(
                 fast_rolled_back = true;
                 rollback_diag.record_fast_rollback(accept_n);
             } else {
-                // Rollback failed (e.g. CUDA error / unsupported state type).
+                if (!target.rollback_failure_is_recoverable()) {
+                    std::fprintf(stderr, "dflash-spec rollback_to failed after "
+                                         "an in-place commit attempt; aborting\n");
+                    return false;
+                }
                 // The pre-verify snapshot is still valid, so degrade to the
-                // legacy restore+replay path below instead of aborting.
+                // legacy restore+replay path below.
                 std::fprintf(stderr, "dflash-spec rollback_to failed; "
                                      "falling back to restore+replay\n");
                 rollback_diag.record_failed_fallback();
@@ -289,6 +294,10 @@ bool run_dflash_spec_decode(
 
         if (io.is_cancelled()) break;
         if (hit_eos) break;
+    }
+    if (!target.finish_speculative_state()) {
+        std::fprintf(stderr, "dflash-spec final recurrent-state flush failed\n");
+        return false;
     }
     if (!use_remote_draft && draft_backend) ggml_backend_synchronize(draft_backend);
     auto t_dec1 = std::chrono::steady_clock::now();

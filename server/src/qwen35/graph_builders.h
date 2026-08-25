@@ -17,6 +17,7 @@
 #include "step_graph.h"
 #include "attn_masks.h"       // align_up, KQ_MASK_PAD
 #include "internal.h"         // TargetWeights, TargetCache
+#include "delta_net_specla.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -144,7 +145,8 @@ bool build_target_step_tree(
     int kv_start,
     int n_tokens,
     int fa_window = 0,
-    int kq_stride_pad = KQ_MASK_PAD);
+    int kq_stride_pad = KQ_MASK_PAD,
+    const SpecLAHLDSchedule * specla_hld = nullptr);
 
 // LM-head projection: project draft hidden states through the target output matrix.
 bool build_lm_head_projection_step(

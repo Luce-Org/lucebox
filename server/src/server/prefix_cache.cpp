@@ -218,10 +218,24 @@ int select_inline_snapshot_boundary(const std::vector<int> & boundaries,
     return target > restored_prefix_len ? target : 0;
 }
 
+bool should_force_inline_snapshot_boundary(
+        const std::vector<int> & boundaries,
+        int prompt_len,
+        int restored_prefix_len,
+        bool prefer_tools_boundary,
+        int forced_cut) {
+    const bool tools_pin_restored =
+        prefer_tools_boundary && !boundaries.empty() &&
+        restored_prefix_len >= boundaries.front();
+    return !tools_pin_restored &&
+           forced_cut > restored_prefix_len &&
+           forced_cut <= prompt_len;
+}
+
 // ─── PrefixCache ────────────────────────────────────────────────────────
 
 PrefixCache::PrefixCache(int cap, const Tokenizer & tokenizer)
-    : cap_(std::min(cap, MAX_SLOTS))
+    : cap_(std::min(cap, MAX_CACHE_SLOTS))
 {
     if (cap_ <= 0) {
         disabled_ = true;
@@ -333,8 +347,9 @@ std::pair<int, int> PrefixCache::prepare_inline_snap(
     auto candidates = find_all_boundaries(prompt_ids, markers_);
     int target_cut = 0;
     bool forced = false;
-    if (forced_cut > restored_prefix_len &&
-        forced_cut <= (int)prompt_ids.size()) {
+    if (should_force_inline_snapshot_boundary(
+            candidates, (int)prompt_ids.size(), restored_prefix_len,
+            prefer_tools_boundary, forced_cut)) {
         target_cut = forced_cut;
         forced = true;
     } else {
@@ -477,7 +492,7 @@ void PrefixCache::init_full_cache(int full_cap) {
     // slot (http_server DISK_STAGING_SLOT = kMaxSlots-1). Without this the full
     // cache can claim slot 63 and disk-cache traffic silently clobbers a
     // committed full-cache snapshot -> empty/corrupt responses on a later hit.
-    int remaining = MAX_SLOTS - cap_ - 1;
+    int remaining = MAX_CACHE_SLOTS - cap_;
     if (full_cap > remaining) full_cap = remaining;
     if (full_cap <= 0) {
         full_disabled_ = true;
