@@ -5755,13 +5755,31 @@ static bool eval_ds4_layer_range_hybrid_ffn(
         layer_storage.cold_backend && layer_storage.cold_backend != backend &&
         hot_stack_ref && hot_stack_ref->ne[2] > 0 &&
         cold_stack_ref && cold_stack_ref->ne[2] > 0;
+    const int owner_sub_batch =
+        deepseek4_exact_prefill_hybrid_ffn_sub_batch(
+            exact_prefill_q1_ffn_order, n_tokens);
+    const bool split_owner_batch =
+        owner_sub_batch > 0 && owner_sub_batch < n_tokens;
+    // The device-resident activation tensor describes the complete batch.
+    // Exact q4 deliberately evaluates its owner rows as q3+q1 to retain the
+    // q1 reduction order, so those slices require a host activation buffer.
+    // Keep the device route for unsplit batches and fall back to one readback
+    // before the split instead of passing an empty host vector.
+    const bool use_device_ffn_input =
+        device_ffn_input && !split_owner_batch;
+    if (trace_prefill && device_ffn_input && split_owner_batch) {
+        std::fprintf(stderr,
+                     "[deepseek4-prefill-trace] layer=%d exact owner split "
+                     "uses one host activation readback\n",
+                     layer);
+    }
     const char * persistent_owner_env =
         std::getenv("DFLASH_MOE_PREFILL_PERSISTENT_OWNER_ALLOC");
     const bool persistent_owner_requested =
         !persistent_owner_env || !*persistent_owner_env ||
         std::strcmp(persistent_owner_env, "0") != 0;
     const bool persistent_owner_alloc =
-        n_tokens >= 512 && device_ffn_input && persistent_owner_requested;
+        n_tokens >= 512 && use_device_ffn_input && persistent_owner_requested;
     if (persistent_owner_alloc) {
         static bool logged_persistent_owner_alloc = false;
         if (!logged_persistent_owner_alloc) {
@@ -5863,13 +5881,13 @@ static bool eval_ds4_layer_range_hybrid_ffn(
     }
 
     std::vector<float> normed_host;
-    if (!device_ffn_input) {
+    if (!use_device_ffn_input) {
         normed_host.resize((size_t)n_embd * (size_t)n_tokens);
     }
     std::vector<float> probs_host((size_t)w.n_expert * (size_t)n_tokens);
     if (route_ok) {
         const auto route_read_t0 = Ds4TimingClock::now();
-        if (!device_ffn_input) {
+        if (!use_device_ffn_input) {
             ggml_backend_tensor_get(normed, normed_host.data(), 0,
                                     sizeof(float) * normed_host.size());
         }
@@ -5880,7 +5898,7 @@ static bool eval_ds4_layer_range_hybrid_ffn(
                 ds4_elapsed_us(route_read_t0, Ds4TimingClock::now());
         }
     }
-    if (!device_ffn_input) {
+    if (!use_device_ffn_input) {
         route_graph.reset();
     } else {
         static bool logged_device_input = false;
@@ -5974,11 +5992,8 @@ static bool eval_ds4_layer_range_hybrid_ffn(
                      layer);
     }
     const auto owners_t0 = Ds4TimingClock::now();
-    const int owner_sub_batch =
-        deepseek4_exact_prefill_hybrid_ffn_sub_batch(
-            exact_prefill_q1_ffn_order, n_tokens);
     bool ok = true;
-    if (owner_sub_batch > 0 && owner_sub_batch < n_tokens) {
+    if (split_owner_batch) {
         out.resize((size_t)n_embd * (size_t)n_tokens);
         std::vector<float> sub_out;
         for (int token_begin = 0; token_begin < n_tokens;
@@ -6009,12 +6024,12 @@ static bool eval_ds4_layer_range_hybrid_ffn(
             backend, hybrid.cpu_backend, cfg, desc, &hybrid,
             hybrid.layers[(size_t)layer], nullptr,
             layer, n_embd, route_width,
-            device_ffn_input ? nullptr : normed_host.data(),
+            use_device_ffn_input ? nullptr : normed_host.data(),
             selected.data(), weights.data(),
             n_tokens, out, hot_alloc, cold_alloc,
             expert_compute, expert_layer, telemetry,
-            device_ffn_input ? normed : nullptr,
-            device_ffn_input ? device_outputs : nullptr);
+            use_device_ffn_input ? normed : nullptr,
+            use_device_ffn_input ? device_outputs : nullptr);
     }
     if (trace_prefill) {
         std::fprintf(stderr,
