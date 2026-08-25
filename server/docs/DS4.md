@@ -348,7 +348,7 @@ The runtime logs the chosen split with a `[deepseek4-split] auto-split:` banner.
 |----------|---------|
 | `DFLASH_DS4_CUDA_LAYERS` | Override the auto-split heuristic and pin the first `N` DeepSeek4 layers to CUDA. The remaining `43 - N` layers run on the Halo shard. |
 | `DFLASH_DS4_TIMING` | Enable DS4 timing logs for the layer-split parent and target-shard daemon. Useful for profiling prefill/decode breakdowns; leave unset for normal runs. |
-| `DFLASH_DS4_EXACT_PREFILL_BANDS` | Opt in to compressor-safe exact prefill bands up to four tokens on supported layer-range paths. Exact attention remains tokenwise. Leave unset for the default single-token path; `--chunk 1` is the hard fallback. |
+| `DFLASH_DS4_EXACT_PREFILL_BANDS` | Opt in to compressor-safe exact prefill bands up to four tokens on supported layer-range paths. `--chunk` caps the requested band width; compressor boundaries and prompt tails can downshift it. Exact attention remains tokenwise. Leave unset for the default single-token path; `--chunk 1` is the hard fallback. |
 | `DFLASH_DS4_ROCTX` | HIP-only, default-off semantic ROCTX ranges for an external rocprof trace. The library is loaded dynamically only when set to `1`, `true`, `yes`, or `on`. |
 | `DFLASH_DS4_SPEC` / `DFLASH_DS4_DRAFT` | Enable DSpark and select its GGUF. |
 | `DFLASH_DS4_DRAFT_BACKEND` / `DFLASH_DS4_DRAFT_GPU` | Backend and device for the in-process drafter. |
