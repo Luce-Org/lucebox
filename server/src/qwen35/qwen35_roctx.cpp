@@ -117,6 +117,25 @@ void append(char * message, size_t capacity, size_t & used, const char * name, i
     const int n = std::snprintf(message + used, capacity - used, " %s=%d", name, value);
     if (n > 0) used += std::min((size_t)n, capacity - used - 1);
 }
+
+void append_u64(
+        char * message, size_t capacity, size_t & used,
+        const char * name, uint64_t value) {
+    if (value == 0 || used >= capacity) return;
+    const int n = std::snprintf(
+        message + used, capacity - used, " %s=%llu", name,
+        static_cast<unsigned long long>(value));
+    if (n > 0) used += std::min((size_t)n, capacity - used - 1);
+}
+
+void append_text(
+        char * message, size_t capacity, size_t & used,
+        const char * name, const char * value) {
+    if (!value || !value[0] || used >= capacity) return;
+    const int n = std::snprintf(
+        message + used, capacity - used, " %s=%s", name, value);
+    if (n > 0) used += std::min((size_t)n, capacity - used - 1);
+}
 } // namespace
 
 bool qwen35_roctx_env_enabled(const char * value) {
@@ -139,6 +158,8 @@ Qwen35RoctxRange::Qwen35RoctxRange(const char * scope, const Qwen35RoctxMetadata
     append(message, sizeof(message), used, "prefill_segments", metadata.prefill_segments);
     append(message, sizeof(message), used, "total_rows", metadata.total_rows);
     append(message, sizeof(message), used, "max_kv_len", metadata.max_kv_len);
+    append_u64(message, sizeof(message), used, "round_id", metadata.round_id);
+    append_text(message, sizeof(message), used, "path", metadata.path);
     if (callbacks.push(message) >= 0) { pop_ = callbacks.pop; pushed_ = true; }
 }
 

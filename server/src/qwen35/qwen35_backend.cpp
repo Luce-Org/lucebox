@@ -9,6 +9,7 @@
 #include "dflash_capture.h"
 #include "common/dflash_draft_graph.h"
 #include "common/dspark_head.h"
+#include "common/observability/inference_profile.h"
 #include "peer_access.h"
 #include "attn_masks.h"
 #include "prefill_helpers.h"
@@ -48,6 +49,111 @@
 namespace dflash::common {
 
 namespace {
+using observability::LaneKind;
+using observability::LaneProfile;
+using observability::Phase;
+using observability::ProfileSink;
+using observability::SpecDecision;
+using observability::StepPath;
+using observability::StepProfile;
+
+class ProfileStepCommit final {
+public:
+    ProfileStepCommit(ProfileSink * sink, StepProfile * profile) noexcept
+        : sink_(sink), profile_(profile) {}
+    ~ProfileStepCommit() {
+        if (sink_ && profile_) sink_->commit_step(profile_);
+    }
+
+    ProfileStepCommit(const ProfileStepCommit &) = delete;
+    ProfileStepCommit & operator=(const ProfileStepCommit &) = delete;
+
+private:
+    ProfileSink * sink_ = nullptr;
+    StepProfile * profile_ = nullptr;
+};
+
+class SpecProfileStepCommit final {
+public:
+    SpecProfileStepCommit(
+            ProfileSink * sink, StepProfile * profile,
+            const int & generated, const int & accepted,
+            const int & target_forwards,
+            const bool & acceptance_includes_root,
+            int verify_width) noexcept
+        : sink_(sink), profile_(profile), generated_(generated),
+          accepted_(accepted), target_forwards_(target_forwards),
+          acceptance_includes_root_(acceptance_includes_root),
+          generated_before_(generated), accepted_before_(accepted),
+          target_forwards_before_(target_forwards),
+          verify_width_(verify_width) {}
+
+    ~SpecProfileStepCommit() {
+        if (!sink_ || !profile_) return;
+        const uint32_t generated = static_cast<uint32_t>(
+            std::max(0, generated_ - generated_before_));
+        const uint32_t raw_accepted = static_cast<uint32_t>(
+            std::max(0, accepted_ - accepted_before_));
+        // The direct chain counter includes the always-committed root token;
+        // LuceGraph's speculation funnel counts draft tokens only. DDTree's
+        // counter already excludes its root, so preserve it unchanged.
+        const uint32_t accepted =
+            acceptance_includes_root_ && raw_accepted > 0
+                ? raw_accepted - 1 : raw_accepted;
+        profile_->spec_accepted_draft_tokens = accepted;
+        profile_->spec_durable_draft_tokens = accepted;
+        profile_->spec_scheduler_consumed_tokens = accepted;
+        const bool pending_consumed = generated > raw_accepted;
+        profile_->spec_pending_tokens = 1;
+        profile_->target_forwards = static_cast<uint32_t>(
+            std::max(0, target_forwards_ - target_forwards_before_));
+        if (auto * lane = profile_->find_lane(0, LaneKind::Decode)) {
+            lane->accepted_draft_tokens = accepted;
+            lane->durable_draft_tokens = accepted;
+            lane->scheduler_consumed_tokens = generated;
+            lane->pending_token_sampled = true;
+            lane->pending_token_consumed = pending_consumed;
+        }
+        const uint32_t accepted_positions = std::min<uint32_t>(
+            accepted, static_cast<uint32_t>(std::max(0, verify_width_ - 1)));
+        for (uint32_t position = 1; position <= accepted_positions; ++position) {
+            ++profile_->accepted_by_position[position];
+        }
+        sink_->commit_step(profile_);
+    }
+
+    SpecProfileStepCommit(const SpecProfileStepCommit &) = delete;
+    SpecProfileStepCommit & operator=(const SpecProfileStepCommit &) = delete;
+
+private:
+    ProfileSink * sink_ = nullptr;
+    StepProfile * profile_ = nullptr;
+    const int & generated_;
+    const int & accepted_;
+    const int & target_forwards_;
+    const bool & acceptance_includes_root_;
+    int generated_before_ = 0;
+    int accepted_before_ = 0;
+    int target_forwards_before_ = 0;
+    int verify_width_ = 0;
+};
+
+void add_profile_phase(
+        StepProfile * profile, Phase phase,
+        std::chrono::steady_clock::time_point started) noexcept {
+    if (!profile || started == std::chrono::steady_clock::time_point{}) return;
+    const uint64_t finished_ns = observability::steady_time_ns();
+    const uint64_t started_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            started.time_since_epoch()).count());
+    profile->add_phase({
+        phase,
+        started_ns >= profile->started_ns
+            ? started_ns - profile->started_ns : 0,
+        finished_ns >= started_ns ? finished_ns - started_ns : 0,
+    });
+}
+
 static float bf16_bits_to_f32(uint16_t bits) {
     union {
         uint32_t u;
@@ -1657,6 +1763,8 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
     const int vocab  = w_.n_vocab;
     int prefill_ubatch = qwen35_prefill_ubatch(512);
     const int prompt_len = (int)tokens.size();
+    ProfileSink * const direct_profile_sink =
+        observability::active_profile_sink();
     const Qwen35RoctxRange profile_prefill(
         "qwen35.prefill",
         {/*live=*/1, /*bucket=*/-1,
@@ -1751,6 +1859,43 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         }
         const bool with_mask = kvf_paged ||
             (cfg_.kq_stride_pad > KQ_MASK_PAD) || (n_tokens > 1);
+        StepProfile * const step_profile = direct_profile_sink
+            ? direct_profile_sink->begin_step(1) : nullptr;
+        if (step_profile) {
+            step_profile->path = StepPath::Packed;
+            step_profile->planned_prefill_lanes = 1;
+            step_profile->planned_prefill_tokens =
+                static_cast<uint32_t>(n_tokens);
+            step_profile->executed_prefill_lanes = 1;
+            step_profile->executed_prefill_tokens =
+                static_cast<uint32_t>(n_tokens);
+            step_profile->target_rows = static_cast<uint32_t>(n_tokens);
+            step_profile->max_kv_len =
+                static_cast<uint32_t>(kv_pos + n_tokens);
+            step_profile->active_sequences = 1;
+            step_profile->target_forwards = 1;
+            LaneProfile lane;
+            lane.request_id = 1;
+            lane.slot = 0;
+            lane.kind = LaneKind::Prefill;
+            lane.context_tokens = static_cast<uint32_t>(kv_pos);
+            lane.requested_prefill_tokens =
+                static_cast<uint32_t>(n_tokens);
+            lane.executed_prefill_tokens =
+                static_cast<uint32_t>(n_tokens);
+            step_profile->add_lane(lane);
+        }
+        ProfileStepCommit step_commit(direct_profile_sink, step_profile);
+        Qwen35RoctxMetadata prefill_step_roctx{
+            /*live=*/1, /*bucket=*/n_tokens,
+            /*prefill_tokens=*/n_tokens, /*prefill_segments=*/1,
+            /*total_rows=*/n_tokens,
+            /*max_kv_len=*/kv_pos + n_tokens};
+        prefill_step_roctx.round_id = step_profile
+            ? step_profile->round_id : 0;
+        prefill_step_roctx.path = "prefill";
+        const Qwen35RoctxRange profile_prefill_step(
+            "qwen35.prefill.step", prefill_step_roctx);
 
         // kvflash pooled prefill: allocate this chunk's slots up front
         // (evicting the lowest-priority resident chunk once the pool fills).
@@ -1773,19 +1918,26 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         // positions encode the complete context — critical for tool
         // definitions at prompt start to propagate into KV values that
         // decode-time windowed attention will later read.
-        if (!build_target_step(sg_, w_, cache_, target_backend_,
-                               /*kv_start=*/kv_pos, /*n_tokens=*/n_tokens,
-                               with_mask, /*capture=*/true,
-                               /*capture_delta_intermediate=*/false,
-                               /*fa_window=*/0,
-                               /*logits_tail_rows=*/
-                                   (start + n_tokens < prompt_len ? 1 : 0),
-                               cfg_.kq_stride_pad,
-                               should_capture_moe_router(),
-                               /*kvflash_mask=*/kvf_paged)) {
-            std::fprintf(stderr, "prefill build @%d\n", kv_pos);
-            return -1;
+        {
+            observability::PhaseScope phase(
+                step_profile, Phase::TargetGraphBuild);
+            if (!build_target_step(sg_, w_, cache_, target_backend_,
+                                   /*kv_start=*/kv_pos, /*n_tokens=*/n_tokens,
+                                   with_mask, /*capture=*/true,
+                                   /*capture_delta_intermediate=*/false,
+                                   /*fa_window=*/0,
+                                   /*logits_tail_rows=*/
+                                       (start + n_tokens < prompt_len ? 1 : 0),
+                                   cfg_.kq_stride_pad,
+                                   should_capture_moe_router(),
+                                   /*kvflash_mask=*/kvf_paged)) {
+                std::fprintf(stderr, "prefill build @%d\n", kv_pos);
+                return -1;
+            }
         }
+        {
+        observability::PhaseScope metadata_phase(
+            step_profile, Phase::MetadataUpload);
         if (kvf_paged) {
             if (!sg_.kv_write_rows) {
                 std::fprintf(stderr, "[kvflash] pooled prefill requires the set_rows path\n");
@@ -1847,16 +1999,15 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
             upload_qwen35_causal_mask(
                 sg_.attn_mask, kv_pos, n_tokens, cfg_.kq_stride_pad);
         }
+        }
 
         // Compute
         ggml_status st = GGML_STATUS_FAILED;
         {
+            observability::PhaseScope phase(
+                step_profile, Phase::TargetCompute);
             const Qwen35RoctxRange profile_compute(
-                "qwen35.graph_compute",
-                {/*live=*/1, /*bucket=*/-1,
-                 /*prefill_tokens=*/n_tokens, /*prefill_segments=*/1,
-                 /*total_rows=*/n_tokens,
-                 /*max_kv_len=*/kv_pos + n_tokens});
+                "qwen35.graph_compute", prefill_step_roctx);
             st = ggml_backend_graph_compute(target_backend_, sg_.gf);
         }
         if (st != GGML_STATUS_SUCCESS) {
@@ -1865,6 +2016,9 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         }
 
         int32_t last_tok = -1;
+        {
+        observability::PhaseScope phase(
+            step_profile, Phase::ReadbackSync);
         const bool is_final_chunk = (start + n_tokens >= prompt_len);
         const size_t argmax_off =
             is_final_chunk ? sizeof(int32_t) * (size_t)(n_tokens - 1) : 0;
@@ -1887,6 +2041,8 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
             std::fprintf(stderr, "post-prefill follower @%d failed\n", kv_pos);
             return -1;
         }
+        }
+        const bool is_final_chunk = (start + n_tokens >= prompt_len);
         if (is_final_chunk) {
             prefill_last_logits_offset_ =
                 (size_t)(n_tokens - 1) * (size_t)vocab * sizeof(float);
@@ -1901,10 +2057,14 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         if (kvflash_active() && kvflash_qk_policy_) kvflash_qk_pool_to(committed);
 
         // Sync draft-side features if active.
+        {
+        observability::PhaseScope phase(
+            step_profile, Phase::StatePromotion);
         if (remote_draft_.active() && !draft_parked_) {
             if (!sync_remote_draft_features(kv_pos, n_tokens)) return -1;
         } else if (feature_mirror_.target_feat && !draft_parked_) {
             if (!sync_local_draft_features(kv_pos, n_tokens)) return -1;
+        }
         }
 
         start += n_tokens;
@@ -2165,6 +2325,8 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
         }
     };
     if (n_gen <= 0) return true;
+    ProfileSink * const direct_profile_sink =
+        observability::active_profile_sink();
 
     auto t_dec0_ar = std::chrono::steady_clock::now();
     static const int _repeat_guard = []{
@@ -2231,6 +2393,36 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
     // AR decode loop for remaining tokens
     for (int i = initial_emitted; i < n_gen; i++) {
         int32_t tok = out_tokens.back();
+        StepProfile * const step_profile = direct_profile_sink
+            ? direct_profile_sink->begin_step(1) : nullptr;
+        if (step_profile) {
+            step_profile->path = StepPath::Packed;
+            step_profile->planned_decode_lanes = 1;
+            step_profile->executed_decode_lanes = 1;
+            step_profile->target_rows = 1;
+            step_profile->decode_bucket = 1;
+            step_profile->max_kv_len = static_cast<uint32_t>(committed + 1);
+            step_profile->active_sequences = 1;
+            step_profile->target_forwards = 1;
+            LaneProfile lane;
+            lane.request_id = 1;
+            lane.slot = 0;
+            lane.kind = LaneKind::Decode;
+            lane.context_tokens = static_cast<uint32_t>(committed);
+            lane.scheduler_consumed_tokens = 1;
+            lane.pending_token_sampled = true;
+            lane.pending_token_consumed = true;
+            step_profile->add_lane(lane);
+        }
+        ProfileStepCommit step_commit(direct_profile_sink, step_profile);
+        Qwen35RoctxMetadata ar_step_roctx{
+            /*live=*/1, /*bucket=*/1, /*prefill_tokens=*/0,
+            /*prefill_segments=*/0, /*total_rows=*/1,
+            /*max_kv_len=*/committed + 1};
+        ar_step_roctx.round_id = step_profile ? step_profile->round_id : 0;
+        ar_step_roctx.path = "ar";
+        const Qwen35RoctxRange profile_ar_step(
+            "qwen35.ar.step", ar_step_roctx);
 
         auto phase_at = std::chrono::steady_clock::time_point{};
         if (ar_phase_telemetry) phase_at = std::chrono::steady_clock::now();
@@ -2242,36 +2434,49 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
             phase_at = now;
         };
 
-        if (!w_.embedder.embed(&tok, 1, embed_buf)) return false;
-        mark_phase(ar_embed_ns);
-        ggml_backend_tensor_set(sg_.inp_embed, embed_buf, 0, sizeof(float) * hidden);
-        int32_t pos4[4] = {committed, committed, committed, 0};
-        ggml_backend_tensor_set(sg_.positions, pos4, 0, sizeof(int32_t) * 4);
-        mark_phase(ar_input_ns);
+        {
+            observability::PhaseScope phase(
+                step_profile, Phase::InputStaging);
+            if (!w_.embedder.embed(&tok, 1, embed_buf)) return false;
+            mark_phase(ar_embed_ns);
+            ggml_backend_tensor_set(
+                sg_.inp_embed, embed_buf, 0, sizeof(float) * hidden);
+            int32_t pos4[4] = {committed, committed, committed, 0};
+            ggml_backend_tensor_set(
+                sg_.positions, pos4, 0, sizeof(int32_t) * 4);
+            mark_phase(ar_input_ns);
+        }
 
         // kvflash: graph carries a slot-validity mask alongside the
         // step-invariant set_rows write; the FA span clamps to the pool.
         const bool pool = kvflash_active();
         const bool paged = cfg_.paged_attention;
-        if (!build_target_step(sg_, w_, cache_, target_backend_,
-                               /*kv_start=*/committed, /*n_tokens=*/1,
-                               /*with_mask=*/pool || w_.is_bailingmoe3,
-                               /*capture=*/false,
-                               /*capture_delta_intermediate=*/false,
-                               /*fa_window=*/0,
-                               /*logits_tail_rows=*/0,
-                               cfg_.kq_stride_pad,
-                               should_capture_moe_router(),
-                               /*kvflash_mask=*/pool,
-                               /*capture_qk=*/pool && kvflash_qk_policy_,
-                               /*paged_attention=*/paged)) {
-            return false;
+        {
+            observability::PhaseScope phase(
+                step_profile, Phase::TargetGraphBuild);
+            if (!build_target_step(sg_, w_, cache_, target_backend_,
+                                   /*kv_start=*/committed, /*n_tokens=*/1,
+                                   /*with_mask=*/pool || w_.is_bailingmoe3,
+                                   /*capture=*/false,
+                                   /*capture_delta_intermediate=*/false,
+                                   /*fa_window=*/0,
+                                   /*logits_tail_rows=*/0,
+                                   cfg_.kq_stride_pad,
+                                   should_capture_moe_router(),
+                                   /*kvflash_mask=*/pool,
+                                   /*capture_qk=*/pool && kvflash_qk_policy_,
+                                   /*paged_attention=*/paged)) {
+                return false;
+            }
         }
         mark_phase(ar_build_ns);
 
         // Fill kv_write_rows with this step's cache slot for set_rows: the
         // paged append row, its pool slot in kvflash mode, or the logical
         // position directly.
+        {
+        observability::PhaseScope phase(
+            step_profile, Phase::MetadataUpload);
         if (sg_.kv_write_rows) {
             int64_t slot = committed;
             if (paged) {
@@ -2299,21 +2504,25 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
             upload_qwen35_causal_mask(
                 sg_.attn_mask, committed, 1, cfg_.kq_stride_pad);
         }
+        }
         mark_phase(ar_prepare_ns);
 
         ggml_status st = GGML_STATUS_FAILED;
         {
+            observability::PhaseScope phase(
+                step_profile, Phase::TargetCompute);
             const Qwen35RoctxRange profile_compute(
-                "qwen35.graph_compute",
-                {/*live=*/1, /*bucket=*/-1, /*prefill_tokens=*/0,
-                 /*prefill_segments=*/0, /*total_rows=*/1,
-                 /*max_kv_len=*/committed + 1});
+                "qwen35.graph_compute", ar_step_roctx);
             st = ggml_backend_graph_compute(target_backend_, sg_.gf);
         }
         if (st != GGML_STATUS_SUCCESS) return false;
         mark_phase(ar_launch_ns);
 
-        after_target_compute(sg_, committed, 1);
+        {
+            observability::PhaseScope phase(
+                step_profile, Phase::StatePromotion);
+            after_target_compute(sg_, committed, 1);
+        }
         mark_phase(ar_after_ns);
 
         // GPU argmax: read 4 bytes, skip the 970 KB logit D2H. Escape: DFLASH_GPU_ARGMAX=0.
@@ -2322,6 +2531,9 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
             return v == nullptr || v[0] != '0';
         }();
         int32_t next_tok;
+        {
+        observability::PhaseScope phase(
+            step_profile, Phase::ReadbackSync);
         if (sampler_.needs_logit_processing()) {
 #ifdef DFLASH27B_HAVE_GPU_SAMPLER
             // GPU sample straight from the device logits tensor, skipping the
@@ -2376,8 +2588,12 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
                 if (logits_buf[j] > best) { best = logits_buf[j]; next_tok = j; }
             }
         }
+        }
         mark_phase(ar_sample_ns);
 
+        {
+        observability::PhaseScope phase(
+            step_profile, Phase::SamplingCommit);
         next_tok = apply_min_tokens_floor(
             next_tok, (int)out_tokens.size(), /*logits_row_offset=*/0);
 
@@ -2391,6 +2607,7 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
             kvflash_history_.push_back(next_tok);
             if (kvflash_qk_policy_) kvflash_qk_pool_to(committed);
             kvflash_maybe_reselect((int)(out_tokens.size() - out_tokens_at_entry));
+        }
         }
         if (io.is_cancelled()) break;
 
@@ -2762,6 +2979,10 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
     const char * tp_profile_env = std::getenv("DFLASH_TP_PROFILE");
     const bool tp_profile = tp_profile_env && std::strcmp(tp_profile_env, "0") != 0;
+    ProfileSink * const direct_profile_sink =
+        observability::active_profile_sink();
+    StepProfile * current_step_profile = nullptr;
+    bool profile_acceptance_includes_root = true;
     double profile_draft_s = 0.0;
     double profile_noise_s = 0.0;
     double profile_draft_prepare_s = 0.0;
@@ -2774,7 +2995,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     double profile_replay_s = 0.0;
     double profile_feature_s = 0.0;
     auto profile_start = [&]() {
-        return tp_profile
+        return (tp_profile || current_step_profile)
             ? std::chrono::steady_clock::now()
             : std::chrono::steady_clock::time_point{};
     };
@@ -2806,12 +3027,65 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     auto t_dec0 = std::chrono::steady_clock::now();
 
     while (n_generated < n_gen) {
+        current_step_profile = direct_profile_sink
+            ? direct_profile_sink->begin_step(1) : nullptr;
+        if (current_step_profile) {
+            current_step_profile->path = StepPath::Speculative;
+            current_step_profile->planned_decode_lanes = 1;
+            current_step_profile->executed_decode_lanes = 1;
+            current_step_profile->spec_eligible_lanes = 1;
+            current_step_profile->spec_reserved_lanes = 1;
+            current_step_profile->spec_attempted_lanes = 1;
+            current_step_profile->spec_proposed_draft_tokens =
+                static_cast<uint32_t>(std::max(0, verify_len - 1));
+            current_step_profile->spec_verified_draft_tokens =
+                static_cast<uint32_t>(std::max(0, verify_len - 1));
+            current_step_profile->target_rows =
+                static_cast<uint32_t>(verify_len);
+            current_step_profile->draft_rows =
+                static_cast<uint32_t>(q_len);
+            current_step_profile->decode_bucket =
+                static_cast<uint32_t>(verify_len);
+            current_step_profile->draft_bucket =
+                static_cast<uint32_t>(q_len);
+            current_step_profile->spec_tree_width =
+                static_cast<uint32_t>(verify_len);
+            current_step_profile->max_kv_len =
+                static_cast<uint32_t>(committed + verify_len);
+            current_step_profile->active_sequences = 1;
+            current_step_profile->draft_forwards = 1;
+            LaneProfile lane;
+            lane.request_id = 1;
+            lane.slot = 0;
+            lane.kind = LaneKind::Decode;
+            lane.spec = SpecDecision::Selected;
+            lane.context_tokens = static_cast<uint32_t>(committed);
+            lane.proposed_draft_tokens =
+                static_cast<uint32_t>(std::max(0, verify_len - 1));
+            lane.verified_draft_tokens = lane.proposed_draft_tokens;
+            current_step_profile->add_lane(lane);
+            for (int position = 1; position < verify_len &&
+                 position < static_cast<int>(
+                     observability::kMaxSpecPositions); ++position) {
+                ++current_step_profile->proposed_by_position[
+                    static_cast<size_t>(position)];
+            }
+        }
+        SpecProfileStepCommit step_commit(
+            direct_profile_sink, current_step_profile,
+            n_generated, n_accept_sum, target_forwards,
+            profile_acceptance_includes_root, verify_len);
         const int need_commit_budget = n_gen - n_generated;
-        const Qwen35RoctxMetadata spec_roctx{
+        Qwen35RoctxMetadata spec_roctx{
             /*live=*/1, /*bucket=*/verify_len,
             /*prefill_tokens=*/0, /*prefill_segments=*/0,
             /*total_rows=*/verify_len,
             /*max_kv_len=*/committed + verify_len};
+        spec_roctx.round_id = current_step_profile
+            ? current_step_profile->round_id : 0;
+        spec_roctx.path = "speculative";
+        const Qwen35RoctxRange profile_spec_step(
+            "qwen35.spec.step", spec_roctx);
 
         // Budget hook: no tail-off here. The close-token injection fires
         // during the emit phase (step 8) after acceptance+replay, mirroring
@@ -2857,6 +3131,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             return false;
         }
         profile_add(profile_noise_s, profile_noise_start);
+        add_profile_phase(
+            current_step_profile, Phase::InputStaging,
+            profile_noise_start);
 
         // 2. Draft compute
         constexpr int DRAFT_CTX_MAX_DEFAULT = 2048;
@@ -2975,6 +3252,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 }
                 profile_add(
                     profile_draft_prepare_s, profile_draft_prepare_start);
+                add_profile_phase(
+                    current_step_profile, Phase::DraftPrepare,
+                    profile_draft_prepare_start);
                 const auto profile_draft_compute_start = profile_start();
                 ggml_status draft_status = GGML_STATUS_FAILED;
                 {
@@ -2990,6 +3270,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 }
                 profile_add(
                     profile_draft_compute_s, profile_draft_compute_start);
+                add_profile_phase(
+                    current_step_profile, Phase::DraftCompute,
+                    profile_draft_compute_start);
                 if (!draft_kv_.dspark_tokens.empty()) {
                     // The same graph already ran the target LM head and
                     // chained Markov correction. Read the tiny token vector
@@ -3004,6 +3287,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                         sizeof(float) * local_hidden.size());
                     profile_add(
                         profile_draft_readback_s,
+                        profile_draft_readback_start);
+                    add_profile_phase(
+                        current_step_profile, Phase::ReadbackSync,
                         profile_draft_readback_start);
                 }
             } else {
@@ -3053,6 +3339,11 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             }
         }
         profile_add(profile_draft_s, profile_draft_start);
+        if (!used_draft_kv) {
+            add_profile_phase(
+                current_step_profile, Phase::DraftCompute,
+                profile_draft_start);
+        }
 
         // ── DDTree tree-structured verify ────────────────────────────────
         // When --ddtree is on and the target supports tree verify, build a
@@ -3085,6 +3376,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         const bool use_tree_verify =
             cfg_.ddtree_mode && target->supports_tree_verify() && kvflash_tree_ok &&
             !use_remote_draft && !dw_.dspark.enabled && q_len > 1 && tree_special_inactive;
+        profile_acceptance_includes_root = !use_tree_verify;
 
         // DDTree consumes top-K rows directly. Avoid projecting the same
         // hidden block once for argmax and again for top-K on every step.
@@ -3155,6 +3447,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 }
             }
             profile_add(profile_project_s, profile_project_start);
+            add_profile_phase(
+                current_step_profile, Phase::ProposalSelect,
+                profile_project_start);
             if (projected && anchor_dspark &&
                 (int)draft_tok.size() == full_verify_len &&
                 verify_len < full_verify_len) {
@@ -3238,6 +3533,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                             (size_t)next_depth * hidden * sizeof(float),
                             sizeof(float) * (size_t)hidden);
                         profile_add(profile_draft_s, branch_draft_start);
+                        add_profile_phase(
+                            current_step_profile, Phase::DraftCompute,
+                            branch_draft_start);
                     }
 
                     const auto branch_project_start = profile_start();
@@ -3245,6 +3543,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                         row_hidden.data(), 1, K, cfg_.ddtree_temp,
                         top_lp, top_ids);
                     profile_add(profile_project_s, branch_project_start);
+                    add_profile_phase(
+                        current_step_profile, Phase::ProposalSelect,
+                        branch_project_start);
                     conditional_ok = conditional_ok && ok;
                     return ok;
                 };
@@ -3270,6 +3571,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                     return false;
                 }
                 profile_add(profile_project_s, profile_project_start);
+                add_profile_phase(
+                    current_step_profile, Phase::ProposalSelect,
+                    profile_project_start);
                 tree = build_ddtree(
                     top_lp.data() + (size_t)K,
                     top_ids.data() + (size_t)K,
@@ -3296,6 +3600,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                     return false;
                 }
                 profile_add(profile_snapshot_s, profile_snapshot_start);
+                add_profile_phase(
+                    current_step_profile, Phase::StatePromotion,
+                    profile_snapshot_start);
             }
 
             std::vector<int32_t> posterior;
@@ -3308,6 +3615,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 return false;
             }
             profile_add(profile_verify_s, profile_verify_start);
+            add_profile_phase(
+                current_step_profile, Phase::TargetCompute,
+                profile_verify_start);
             target_forwards++;
 
             int next_token = -1, bonus_node = 0;
@@ -3377,6 +3687,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                         return false;
                     }
                     profile_add(profile_rollback_s, profile_rollback_start);
+                    add_profile_phase(
+                        current_step_profile, Phase::StatePromotion,
+                        profile_rollback_start);
                     last_tok = next_token;
 
                     if (feature_mirror_.target_feat && !draft_parked_) {
@@ -3386,6 +3699,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                             return false;
                         }
                         profile_add(profile_feature_s, profile_feature_start);
+                        add_profile_phase(
+                            current_step_profile, Phase::StatePromotion,
+                            profile_feature_start);
                     }
 
                     committed   += accepted_emitted;
@@ -3427,6 +3743,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                     return false;
                 }
                 profile_add(profile_replay_s, profile_replay_start);
+                add_profile_phase(
+                    current_step_profile, Phase::TargetCompute,
+                    profile_replay_start);
                 target_forwards++;
 
                 if (can_commit_bonus) {
@@ -3566,6 +3885,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             snapshot_ok = target->snapshot_kv();
         }
         profile_add(profile_snapshot_s, profile_snapshot_start);
+        add_profile_phase(
+            current_step_profile, Phase::StatePromotion,
+            profile_snapshot_start);
         if (!snapshot_ok) {
             step_graph_destroy(draft_sg);
             return false;
@@ -3583,6 +3905,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                     !optimistic_bailing_verify);
         }
         profile_add(profile_verify_s, profile_verify_start);
+        add_profile_phase(
+            current_step_profile, Phase::TargetCompute,
+            profile_verify_start);
         if (!verify_ok) {
             std::fprintf(stderr, "spec-decode: verify failed\n");
             target->restore_kv();
@@ -3596,6 +3921,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         // token from the target's sampler chain; accept while the draft
         // guessed the drawn token, and the first mismatch becomes the bonus
         // token (it is already a valid target sample at that position).
+        const auto profile_acceptance_start = profile_start();
         int accept_n = 1;
         int bonus_tok = -1;
         if (sampled_verify) {
@@ -3676,6 +4002,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             commit_n = need_commit_budget;
             if (commit_n <= accept_n) bonus_tok = -1;
         }
+        add_profile_phase(
+            current_step_profile, Phase::Acceptance,
+            profile_acceptance_start);
 
         // 6. Fix state: adaptive fast-rollback vs legacy replay.
         //    Fast-rollback (implicit bonus, skip replay) is profitable when
@@ -3711,6 +4040,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 rollback_ok = target->rollback_to(committed, commit_n);
             }
             profile_add(profile_rollback_s, profile_rollback_start);
+            add_profile_phase(
+                current_step_profile, Phase::StatePromotion,
+                profile_rollback_start);
             if (rollback_ok) {
                 replay_last_tok = target_tok[commit_n - 1];
                 fast_rolled_back = true;
@@ -3757,6 +4089,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                     replay_batch, committed, replay_last_tok, nullptr);
             }
             profile_add(profile_replay_s, profile_replay_start);
+            add_profile_phase(
+                current_step_profile, Phase::TargetCompute,
+                profile_replay_start);
             if (!replay_ok) {
                 std::fprintf(stderr, "spec-decode: replay failed\n");
                 step_graph_destroy(draft_sg);
@@ -3789,8 +4124,12 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             }
         }
         profile_add(profile_feature_s, profile_feature_start);
+        add_profile_phase(
+            current_step_profile, Phase::StatePromotion,
+            profile_feature_start);
 
         // 8. Emit committed tokens (stop at EOS)
+        const auto profile_commit_start = profile_start();
         bool hit_eos = false;
         bool floor_to_ar = false;
         bool inject_tool_prefix = false;
@@ -3930,6 +4269,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         n_generated += emitted + injected;
         n_accept_sum += std::min(accept_n, emitted);
         n_draft_steps++;
+        add_profile_phase(
+            current_step_profile, Phase::SamplingCommit,
+            profile_commit_start);
 
         // Notify observer with accepted tokens for this step.
         if (io.observer) {

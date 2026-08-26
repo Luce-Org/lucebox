@@ -37,6 +37,20 @@ int main() {
     CHECK(events.size() == 2 && events[1] == "pop");
 
     events.clear();
+    {
+        Qwen35RoctxMetadata metadata{1, 5, 0, 0, 5, 1024};
+        metadata.round_id = 17;
+        metadata.path = "speculative";
+        Qwen35RoctxRange range(
+            "qwen35.spec.step", metadata, true, {push, pop});
+        CHECK(events.size() == 1);
+        CHECK(events[0] == "qwen35.spec.step live=1 bucket=5 "
+                           "prefill_tokens=0 prefill_segments=0 total_rows=5 "
+                           "max_kv_len=1024 round_id=17 path=speculative");
+    }
+    CHECK(events.size() == 2 && events[1] == "pop");
+
+    events.clear();
     { Qwen35RoctxRange disabled("qwen35.graph_compute", {}, false, {push, pop}); }
     CHECK(events.empty());
     return failures == 0 ? 0 : 1;

@@ -1281,6 +1281,8 @@ int main(int argc, char ** argv) {
     sconfig.draft_path   = bargs.draft_path ? bargs.draft_path : "";
     sconfig.fa_window    = bargs.fa_window;
     sconfig.ddtree_budget = bargs.ddtree_budget;
+    sconfig.draft_block_size = bargs.verify_width;
+    sconfig.max_concurrency = bargs.max_concurrency;
     sconfig.speculative_enabled = bargs.ddtree_mode;
     sconfig.target_sharding     = bargs.device.is_layer_split();
     // KV type: report the operator's choice if set, else the family default
