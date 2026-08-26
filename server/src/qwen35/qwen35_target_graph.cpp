@@ -2398,7 +2398,9 @@ static ggml_tensor * build_single_layer(
     ggml_tensor * post = rms_norm_mul(ctx, cur, L.attn_post_norm, eps);
     ggml_tensor * moe_selected = nullptr;
     ggml_tensor * ffn  = L.ffn_gate_inp
-        ? build_qwen35moe_ffn(ctx, post, w, L, &moe_selected)
+        ? build_qwen35moe_ffn(
+            ctx, post, w, L, &moe_selected,
+            /*allow_grouped_router=*/false, layer_idx)
         : build_swiglu_ffn(ctx, post, L);
     if (moe_selected_out) {
         *moe_selected_out = moe_selected;
@@ -2643,7 +2645,7 @@ QwenGraphOutputs build_qwen35_graph(
         ggml_tensor * ffn = L.ffn_gate_inp
             ? build_qwen35moe_ffn(ctx, post, w, L,
                                   in.capture_moe_router ? &moe_selected : nullptr,
-                                  in.bailing_fuse_grouped_router)
+                                  in.bailing_fuse_grouped_router, il)
             : build_swiglu_ffn(ctx, post, L);
         if (in.capture_moe_router && moe_selected) {
             ggml_set_output(moe_selected);
@@ -2948,7 +2950,8 @@ QwenLayerPrefnOutputs build_qwen35_layer_prefn(
         // in expert dispatch on the first multi-token prefill); top_k is
         // contiguous, and cheaper than a full argsort here.
         Qwen35MoeRouterOutputs router = build_qwen35moe_router(
-            ctx, out.post, w, L, /*allow_fused_router=*/false);
+            ctx, out.post, w, L, /*allow_fused_router=*/false,
+            /*allow_grouped_router=*/false, layer_idx);
         out.moe_selected = router.selected;
         out.moe_weights = router.weights;
     }

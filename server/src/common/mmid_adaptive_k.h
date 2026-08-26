@@ -1,8 +1,8 @@
 #pragma once
 // [TAG_MMID_ADAPTIVE_K] per-token expert-count gating for small MUL_MAT_ID
-// batches (speculative-verify sized, 2..16 tokens). Contract with the grouped
-// MUL_MAT_ID path in ggml-cuda mmvq.cu (DFLASH_MMID_GROUPED=1): when a router
-// ids tensor's ->extra points at an mmid_gate_extra, the grouped prep kernel
+// batches (decode/speculative-verify sized, 1..16 tokens). Contract with the
+// MUL_MAT_ID paths in ggml-cuda mmvq.cu: when a router
+// ids tensor's ->extra points at an mmid_gate_extra, the CUDA prep path
 // keeps each token's leading experts until their cumulative combine weight
 // reaches tau, sentinels the rest of the token's ids to -1 (skipped, exact
 // zero contribution) and renormalizes the kept weights in place.
@@ -28,7 +28,8 @@ struct mmid_gate_extra {
 // il < 0 = layer index unknown for this family: the dense-layer list cannot
 // be applied, every MoE layer is gated.
 inline void mmid_adaptive_k_attach(ggml_tensor * ids, const ggml_tensor * weights,
-                                   int n_tokens, int il, const char * dense_default) {
+                                   int n_tokens, int il, const char * dense_default,
+                                   bool force_dense = false) {
     static const float tau = []() {
         const char * e = std::getenv("DFLASH_ADAPTIVE_K_TAU");
         if (!e) return 0.0f;
@@ -41,7 +42,8 @@ inline void mmid_adaptive_k_attach(ggml_tensor * ids, const ggml_tensor * weight
         }
         return v;
     }();
-    if (tau <= 0.0f || n_tokens < 2 || n_tokens > 16 || ids == nullptr || weights == nullptr) {
+    if (tau <= 0.0f || force_dense || n_tokens < 1 || n_tokens > 16 ||
+        ids == nullptr || weights == nullptr) {
         return;
     }
     if (il < 0) {

@@ -8,13 +8,26 @@
 
 namespace dflash::common {
 
+namespace {
+
+bool is_dflash_capture_layer(const TargetWeights & weights, int layer_index) {
+    if (layer_index < 0) return false;
+    for (int i = 0; i < weights.n_capture_layers; ++i) {
+        if (weights.capture_layer_ids[i] == layer_index) return true;
+    }
+    return false;
+}
+
+}  // namespace
+
 Qwen35MoeRouterOutputs build_qwen35moe_router(
     ggml_context *        ctx,
     ggml_tensor *         cur,
     const TargetWeights & w,
     const TargetLayer &   L,
     bool                  allow_fused_router,
-    bool                  allow_grouped_router) {
+    bool                  allow_grouped_router,
+    int                   layer_index) {
     const int n_tokens = (int)cur->ne[1];
     const int n_expert = w.n_expert;
     const int n_used   = w.n_expert_used;
@@ -38,7 +51,9 @@ Qwen35MoeRouterOutputs build_qwen35moe_router(
             ctx, logits, L.ffn_exp_probs_b, weights,
             w.n_expert_groups, w.n_expert_groups_used,
             /*n_group_score_used=*/2, weights_scale);
-        mmid_adaptive_k_attach(selected, weights, n_tokens, -1, nullptr);
+        mmid_adaptive_k_attach(
+            selected, weights, n_tokens, layer_index, nullptr,
+            is_dflash_capture_layer(w, layer_index));
         return {selected, weights};
     }
 
@@ -124,7 +139,9 @@ Qwen35MoeRouterOutputs build_qwen35moe_router(
         weights = ggml_scale(ctx, weights, w.expert_weights_scale);
     }
 
-    mmid_adaptive_k_attach(selected, weights, n_tokens, -1, nullptr);  // [TAG_MMID_ADAPTIVE_K]
+    mmid_adaptive_k_attach(
+        selected, weights, n_tokens, layer_index, nullptr,
+        is_dflash_capture_layer(w, layer_index));  // [TAG_MMID_ADAPTIVE_K]
 
     Qwen35MoeRouterOutputs out;
     out.selected = selected;
@@ -138,7 +155,8 @@ ggml_tensor * build_qwen35moe_ffn(
     const TargetWeights & w,
     const TargetLayer &   L,
     ggml_tensor **        selected_out,
-    bool                  allow_grouped_router) {
+    bool                  allow_grouped_router,
+    int                   layer_index) {
     const int n_tokens = (int)cur->ne[1];
     const int n_used   = w.n_expert_used;
     const int n_embd   = w.n_embd;
@@ -146,7 +164,7 @@ ggml_tensor * build_qwen35moe_ffn(
 
     Qwen35MoeRouterOutputs router = build_qwen35moe_router(
         ctx, cur, w, L, /*allow_fused_router=*/true,
-        allow_grouped_router);
+        allow_grouped_router, layer_index);
     ggml_tensor * selected = router.selected;
     ggml_tensor * weights = router.weights;
     if (selected_out) {

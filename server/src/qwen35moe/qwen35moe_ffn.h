@@ -25,7 +25,8 @@ Qwen35MoeRouterOutputs build_qwen35moe_router(
     // construction, and cheaper than a full argsort where the fusion
     // cannot apply anyway.
     bool                  allow_fused_router = true,
-    bool                  allow_grouped_router = false);
+    bool                  allow_grouped_router = false,
+    int                   layer_index = -1);
 
 ggml_tensor * build_qwen35moe_ffn(
     ggml_context *        ctx,
@@ -33,6 +34,7 @@ ggml_tensor * build_qwen35moe_ffn(
     const TargetWeights & w,
     const TargetLayer &   L,
     ggml_tensor **        selected_out = nullptr,
-    bool                  allow_grouped_router = false);
+    bool                  allow_grouped_router = false,
+    int                   layer_index = -1);
 
 }  // namespace dflash::common

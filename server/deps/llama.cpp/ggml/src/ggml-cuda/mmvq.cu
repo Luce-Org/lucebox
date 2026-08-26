@@ -1474,8 +1474,8 @@ static __global__ void mmid_group_prep(
     // [TAG_MMID_ADAPTIVE_K] one thread per token: keep slots until cumulative
     // combine weight >= tau, sentinel the rest, renormalize kept in place.
     // A row is "already gated" (second/third mmid of the layer) when a slot
-    // weight is exactly 0.0f: `ids` is now a per-op scratch copy, so the
-    // shared zeroed weights are the only marker that survives across ops.
+    // weight is exactly 0.0f. `ids` is a fresh per-op scratch copy, so replay
+    // the drop sentinels from the shared zeroed weights on every sibling op.
     if (gate_w != nullptr && i < n_tok) {
         int32_t * idrow = ids + i*ids_stride;
         float   * wrow  = gate_w + i*gate_w_stride;
@@ -1483,7 +1483,14 @@ static __global__ void mmid_group_prep(
         for (int j = 0; j < n_slots; ++j) {
             gated = gated || (idrow[j] < 0) || (wrow[j] == 0.0f);
         }
-        if (!gated) {
+        if (gated) {
+            for (int j = 0; j < n_slots; ++j) {
+                if (idrow[j] < 0 || wrow[j] == 0.0f) {
+                    idrow[j] = -1;
+                    wrow[j] = 0.0f;
+                }
+            }
+        } else {
             float cum = 0.0f;
             int   cut = n_slots;
             float total = 0.0f;
@@ -1524,6 +1531,45 @@ static __global__ void mmid_group_prep(
         meta[MMID_META_GE + r] = e == 0x7FFFFFFF ? -1 : e;
         meta[MMID_META_PT + r] = i / n_slots;
         meta[MMID_META_PS + r] = i % n_slots;
+    }
+}
+
+// Ordinary one-token AR does not need the expert-sorted metadata produced by
+// mmid_group_prep.  Gate the shared router IDs and combine weights in place;
+// every sibling expert projection then observes the same signed sentinels.
+static __global__ void mmid_adaptive_gate_inplace(
+        int32_t * __restrict__ ids, const int n_slots, const int n_tok,
+        const int ids_stride, float * __restrict__ gate_w,
+        const int gate_w_stride, const float gate_tau) {
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n_tok) return;
+
+    int32_t * idrow = ids + i*ids_stride;
+    float   * wrow  = gate_w + i*gate_w_stride;
+    float total = 0.0f;
+    for (int j = 0; j < n_slots; ++j) {
+        total += wrow[j];
+    }
+
+    float cum = 0.0f;
+    int cut = n_slots;
+    for (int j = 0; j < n_slots; ++j) {
+        cum += wrow[j];
+        if (cum >= gate_tau*total) {
+            cut = j + 1;
+            break;
+        }
+    }
+    if (cut >= n_slots) return;
+
+    const float inv = total/cum;
+    for (int j = 0; j < n_slots; ++j) {
+        if (j < cut) {
+            wrow[j] *= inv;
+        } else {
+            idrow[j] = -1;
+            wrow[j] = 0.0f;
+        }
     }
 }
 
@@ -2943,30 +2989,59 @@ void ggml_cuda_mul_mat_vec_q(
         return value != nullptr && std::strcmp(value, "0") != 0;
     }();
 
+    const bool grouped_eligible = ids && ggml_cuda_mmvq_mmid_grouped_enabled(
+        src0->type, cc, ncols_dst, nchannels_dst*ncols_dst);
+    float * adaptive_gate_w = nullptr;
+    int adaptive_gate_w_stride = 0;
+    float adaptive_gate_tau = 0.0f;
+    if (ids) {
+        const mmid_gate_extra * gx =
+            (const mmid_gate_extra *) ids->extra;  // [TAG_MMID_ADAPTIVE_K]
+        if (gx != nullptr && gx->magic == MMID_GATE_MAGIC &&
+            gx->weights != nullptr && gx->weights->data != nullptr) {
+            adaptive_gate_w = (float *) gx->weights->data;
+            adaptive_gate_w_stride =
+                (int) (gx->weights->nb[1]/sizeof(float));
+            adaptive_gate_tau = gx->tau;
+        }
+    }
+
+    // The grouped path below already gates its scratch IDs. Give the ordinary
+    // single-token/fallback MMVQ path the same signed-sentinel contract so AR
+    // can skip low-mass experts too.
+    const int adaptive_np = ids
+        ? (int) (nchannels_dst*ncols_dst) : 0;
+    if (ids && !grouped_eligible && adaptive_gate_w != nullptr &&
+        adaptive_np > 0 && adaptive_np <= MMID_GROUPED_MAX_PAIRS) {
+        const auto prepared = std::find(
+            ctx.luce_adaptive_ids_prepared.begin(),
+            ctx.luce_adaptive_ids_prepared.end(), ids);
+        if (prepared == ctx.luce_adaptive_ids_prepared.end()) {
+            ctx.luce_adaptive_ids_prepared.push_back(ids);
+            const int gate_threads = 32;
+            const int gate_blocks =
+                ((int) ncols_dst + gate_threads - 1)/gate_threads;
+            mmid_adaptive_gate_inplace<<<gate_blocks, gate_threads, 0, stream>>>(
+                const_cast<int32_t *>(ids_d), (int) nchannels_dst,
+                (int) ncols_dst, (int) ids_stride, adaptive_gate_w,
+                adaptive_gate_w_stride, adaptive_gate_tau);
+            CUDA_CHECK(cudaGetLastError());
+        }
+    }
+
     // [TAG_MMID_GROUPED] grouped-expert path for small MUL_MAT_ID batches.
-    if (ids && ggml_cuda_mmvq_mmid_grouped_enabled(
-            src0->type, cc, ncols_dst, nchannels_dst*ncols_dst)) {
+    if (grouped_eligible) {
         // Batches above MMID_GROUPED_MAX_PAIRS fall through to the legacy
         // per-expert kernel instead of aborting the request.
         const int np = (int) (nchannels_dst*ncols_dst);
         ggml_cuda_pool_alloc<int32_t> mmid_meta(ctx.pool(), MMID_META_INTS);
-        float * gate_w = nullptr;
-        int gate_w_stride = 0;
-        float gate_tau = 0.0f;
-        const mmid_gate_extra * gx = (const mmid_gate_extra *) ids->extra;  // [TAG_MMID_ADAPTIVE_K]
-        if (gx != nullptr && gx->magic == MMID_GATE_MAGIC && gx->weights != nullptr && gx->weights->data != nullptr) {
-            gate_w        = (float *) gx->weights->data;
-            gate_w_stride = (int) (gx->weights->nb[1]/sizeof(float));
-            gate_tau      = gx->tau;
-        }
-        // Adaptive-k writes -1 drop sentinels, so it must gate a scratch copy:
-        // sibling weights can still take the legacy kernel, which interprets
-        // ids as unsigned. Fixed top-k only reads ids and avoids both the
-        // allocation and the tiny device-to-device copy on every expert op.
+        // Adaptive-k writes -1 drop sentinels, so gate a scratch copy and
+        // preserve the router IDs for sibling graph consumers. Fixed top-k
+        // only reads IDs and avoids this tiny device-to-device copy.
         ggml_cuda_pool_alloc<int32_t> ids_gated(ctx.pool());
         int32_t * prep_ids = const_cast<int32_t *>(ids_d);
         int prep_ids_stride = (int) ids_stride;
-        if (gate_w != nullptr) {
+        if (adaptive_gate_w != nullptr) {
             prep_ids = ids_gated.alloc((size_t) np);
             prep_ids_stride = (int) nchannels_dst;
             CUDA_CHECK(cudaMemcpy2DAsync(prep_ids, nchannels_dst*sizeof(int32_t),
@@ -2980,7 +3055,7 @@ void ggml_cuda_mul_mat_vec_q(
         const int prep_threads = ((np + prep_warp - 1)/prep_warp)*prep_warp;
         mmid_group_prep<<<1, prep_threads, 0, stream>>>(
             prep_ids, mmid_meta.ptr, (int) nchannels_dst, (int) ncols_dst, prep_ids_stride,
-            gate_w, gate_w_stride, gate_tau);
+            adaptive_gate_w, adaptive_gate_w_stride, adaptive_gate_tau);
         CUDA_CHECK(cudaGetLastError());
         if (mul_mat_vec_q_grouped_dispatch(
                 src0->type, src0->data, src1_q8_d, mmid_meta.ptr, fusion_local, dst_d,

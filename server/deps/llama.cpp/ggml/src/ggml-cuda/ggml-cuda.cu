@@ -5148,6 +5148,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     while (!cuda_ctx->luce_q8_memo.empty()) {
         cuda_ctx->luce_q8_memo.pop_back();
     }
+    cuda_ctx->luce_adaptive_ids_prepared.clear();
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;

@@ -1456,6 +1456,12 @@ struct ggml_backend_cuda_context {
     };
     std::vector<luce_q8_memo_entry> luce_q8_memo;
 
+    // Per-evaluation set of adaptive-MoE router ID tensors already gated in
+    // place.  Gate/up/down share one ID tensor, so ordinary AR needs one
+    // gating launch per layer rather than repeating copy+gate for every
+    // expert projection.  Cleared at the start of each graph evaluation.
+    std::vector<const ggml_tensor *> luce_adaptive_ids_prepared;
+
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
 
