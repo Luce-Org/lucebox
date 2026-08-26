@@ -35,6 +35,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
@@ -125,6 +126,9 @@ static void print_usage(const char * prog) {
         "                       (default: sized from available device memory)\n"
         "  --model-name <name>  Model name for /v1/models (default: dflash)\n"
         "  --prefix-cache-slots <N>  Prefix cache slots (default: 32, 0 disables)\n"
+        "  --concurrent-prefix-cache-max-mib <MiB>\n"
+        "                       Resident RAM limit for copied concurrent paged\n"
+        "                       checkpoints (default: 4096; 0 unlimited)\n"
         "  --agent-turn-cache         Extend prefix caching through generated tool calls\n"
         "  --prefill-cache-slots <N> Full prompt/prefill cache slots (default: 0)\n"
         "  --fast-rollback     Enable speculative fast rollback (default: on)\n"
@@ -435,6 +439,30 @@ int main(int argc, char ** argv) {
             sconfig.model_name = argv[++i];
         } else if (std::strcmp(argv[i], "--prefix-cache-slots") == 0 && i + 1 < argc) {
             sconfig.prefix_cache_cap = std::atoi(argv[++i]);
+        } else if (std::strcmp(
+                       argv[i], "--concurrent-prefix-cache-max-mib") == 0) {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr,
+                    "[server] --concurrent-prefix-cache-max-mib requires "
+                    "a value\n");
+                return 2;
+            }
+            const char * value = argv[++i];
+            const char * end = value + std::strlen(value);
+            uint64_t mib = 0;
+            const auto parsed = std::from_chars(value, end, mib);
+            constexpr uint64_t bytes_per_mib = 1024ull * 1024ull;
+            if (parsed.ec != std::errc{} || parsed.ptr != end ||
+                mib > (uint64_t)std::numeric_limits<size_t>::max() /
+                    bytes_per_mib) {
+                std::fprintf(stderr,
+                    "[server] --concurrent-prefix-cache-max-mib must be a "
+                    "non-negative "
+                    "integer that fits in addressable memory\n");
+                return 2;
+            }
+            sconfig.concurrent_prefix_cache_max_bytes =
+                (size_t)(mib * bytes_per_mib);
         } else if (std::strcmp(argv[i], "--agent-turn-cache") == 0) {
             sconfig.agent_turn_cache = true;
         } else if (std::strcmp(argv[i], "--prefill-cache-slots") == 0 && i + 1 < argc) {
@@ -814,19 +842,35 @@ int main(int argc, char ** argv) {
         }
     }
 
-    // Paged decode owns its K/V through a block table that the snapshot format
-    // cannot describe yet, so the caches it would restore into are turned off.
-    // This rewrites ServerConfig rather than rejecting the launch, which is why
-    // it lives here and not in the gate.
+    // Continuous Qwen serving supports copied in-memory prefix checkpoints:
+    // restore allocates fresh pages and scatters logical K/V through the new
+    // sequence's block table. Exact-prefill and disk snapshots still use the
+    // classic single-sequence format and remain disabled in paged mode.
     if (bargs.paged_attention) {
-        std::fprintf(stderr,
-            "[server] --paged-attention disables prefix/prefill snapshots "
-            "until their format stores page tables\n");
-        sconfig.prefix_cache_cap = 0;
+        if (bargs.max_concurrency > 1) {
+            if (sconfig.prefix_cache_cap > 0) {
+                std::fprintf(stderr,
+                    "[server] concurrent paged serving enables copied in-memory "
+                    "prefix checkpoints; full-prefill and disk caches remain disabled\n");
+            } else {
+                std::fprintf(stderr,
+                    "[server] concurrent paged serving: prefix checkpoints are "
+                    "disabled; full-prefill and disk caches remain disabled\n");
+            }
+        } else {
+            std::fprintf(stderr,
+                "[server] single-sequence --paged-attention still disables "
+                "prefix snapshots\n");
+            sconfig.prefix_cache_cap = 0;
+        }
         sconfig.prefill_cache_cap = 0;
         sconfig.disk_cache_dir.clear();
         sconfig.disk_cache_policy.mode = DiskPrefixCacheMode::Off;
     }
+    sconfig.concurrent_paged_prefix_cache =
+        bargs.paged_attention && bargs.max_concurrency > 1 &&
+        sconfig.prefix_cache_cap > 0;
+
     if (sconfig.agent_turn_cache && bargs.paged_attention) {
         std::fprintf(stderr,
             "[server] --agent-turn-cache is not yet supported with "
@@ -1252,6 +1296,17 @@ int main(int argc, char ** argv) {
     }
     std::fprintf(stderr, "[server] │  ddtree_budget   = %d\n", bargs.ddtree_budget);
     std::fprintf(stderr, "[server] │  prefix_cache    = %d slots\n", sconfig.prefix_cache_cap);
+    if (sconfig.concurrent_paged_prefix_cache) {
+        if (sconfig.concurrent_prefix_cache_max_bytes == 0) {
+            std::fprintf(stderr,
+                "[server] │  prefix_cache_ram= unlimited\n");
+        } else {
+            std::fprintf(stderr,
+                "[server] │  prefix_cache_ram= %zu MiB resident limit\n",
+                sconfig.concurrent_prefix_cache_max_bytes /
+                    (1024 * 1024));
+        }
+    }
     std::fprintf(stderr, "[server] │  agent_turn_cache= %s\n",
                  sconfig.agent_turn_cache ? "ON" : "off");
     std::fprintf(stderr, "[server] │  prefill_cache   = %d slots\n", sconfig.prefill_cache_cap);

@@ -10,6 +10,7 @@
 
 #include "http_server.h"
 #include "common/concurrency/seq_engine.h"
+#include "parallel_prefix_txn.h"
 
 #include <algorithm>
 #include <chrono>
@@ -25,6 +26,9 @@ namespace {
 // engine slot id returned from admit(), so scheduler and engine agree on
 // which engine-owned state record a request owns. This remains the one
 // external phase: sockets stay here, prompt/KV/sampler/progress stay in Qwen.
+using PrefixCaptureTxn = BasicPrefixCaptureTxn<
+    PrefixCache::InlineReservation, SeqEngine>;
+
 struct SchedSlot {
     ServerJob * job = nullptr;
     SocketHandle fd = kInvalidSocket;
@@ -34,6 +38,8 @@ struct SchedSlot {
     std::chrono::steady_clock::time_point started_at{};
     std::chrono::steady_clock::time_point decode_started_at{};
     double prefill_s = 0.0;
+    int cached_prefix_tokens = 0;
+    PrefixCaptureTxn cache_capture;
     int n_gen_cap = 0;
     int completion_tokens = 0;
     bool client_disconnected = false;
@@ -91,6 +97,9 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
     // Cached live-slot count — incremented on admit, decremented on retire.
     // Replaces the O(n_slots) scan that was called 2-3× per iteration.
     int live_slots = 0;
+
+    // Capture tickets are never reused during this scheduler run.
+    uint64_t next_prefix_capture_id = 1;
 
     int published_live_count = -1;
     int published_prefill_count = -1;
@@ -240,6 +249,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         SchedSlot & s = slots[(size_t)idx];
         if (!s.job) return;
         const ParsedRequest & req = s.job->req;
+        s.cache_capture.cancel();
         // Stop monitor-thread heartbeats before queuing terminal frames.
         stop_job_stream(s.job, &s.send_buffer);
         const double decode_s = std::chrono::duration<double>(
@@ -248,9 +258,9 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         GenTimings gen_timings{
             s.prefill_s,
             decode_s,
-            /*cache_hit=*/false,
-            /*cached_prefix_tokens=*/0,
-            /*prefilled_tokens=*/prompt_tokens,
+            /*cache_hit=*/s.cached_prefix_tokens > 0,
+            /*cached_prefix_tokens=*/s.cached_prefix_tokens,
+            /*prefilled_tokens=*/prompt_tokens - s.cached_prefix_tokens,
             /*effective_prompt_tokens=*/prompt_tokens,
         };
 
@@ -258,8 +268,10 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             PerfRecord perf;
             perf.prompt_tokens = (int)req.prompt_tokens.size();
             perf.completion_tokens = s.completion_tokens;
+            const int computed_prompt_tokens =
+                prompt_tokens - s.cached_prefix_tokens;
             perf.prefill_tok_s = s.prefill_s > 0.0
-                ? (double)req.prompt_tokens.size() / s.prefill_s : 0.0;
+                ? (double)computed_prompt_tokens / s.prefill_s : 0.0;
             perf.decode_tok_s = decode_s > 0.0
                 ? (double)s.completion_tokens / decode_s : 0.0;
             status_.record_perf(perf);
@@ -446,12 +458,133 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             start_job_stream(job);
         }
 
-        // Admission only claims the slot and queues the prompt. Prefill
-        // advances one chunk per engine step alongside live decode.
-        auto ar = engine.admit(next_request_id, req.prompt_tokens,
-                               req.sampler);
-        if (ar.status == SeqEngine::AdmitResult::Status::busy)
+        // PrefixCache owns token policy; SeqEngine owns checkpoint payloads.
+        // Unsupported engines never receive a plan, so cold fallback cannot
+        // invalidate a valid entry.
+        PrefixStorePlan prefix_plan;
+        PrefixCaptureTxn prepared_capture;
+        PrefixCache::InlineReservation capture_reservation;
+        int restore_policy_slot = -1;
+        const bool prefix_supported =
+            engine.supports_prefix_store() && !prefix_cache_.disabled();
+        if (prefix_supported) {
+            const auto hit = prefix_cache_.lookup_candidate(
+                req.prompt_tokens,
+                (int)req.prompt_tokens.size() - 1);
+            if (hit.first >= 0 && hit.second > 0 &&
+                hit.second < (int)req.prompt_tokens.size()) {
+                restore_policy_slot = hit.first;
+                prefix_plan.restore = {
+                    (uint64_t)hit.first + 1, hit.second};
+            }
+
+            capture_reservation = prefix_cache_.reserve_inline_snap(
+                req.prompt_tokens,
+                prefix_plan.restore.valid()
+                    ? prefix_plan.restore.tokens : 0,
+                /*prefer_tools_boundary=*/!req.tools.empty(),
+                req.pin_end_token,
+                [&engine](int target_cut) {
+                    return engine.estimate_prefix_store_bytes(target_cut);
+                });
+            if (capture_reservation.active()) {
+                const uint64_t capture_id = next_prefix_capture_id++;
+                if (next_prefix_capture_id == 0)
+                    next_prefix_capture_id = 1;
+                prefix_plan.capture.id = capture_id;
+                prefix_plan.capture.checkpoint = {
+                    (uint64_t)capture_reservation.slot() + 1,
+                    capture_reservation.target_cut()};
+                if (prefix_plan.restore.valid() &&
+                    prefix_plan.capture.checkpoint == prefix_plan.restore) {
+                    capture_reservation.cancel();
+                    prefix_plan.capture = {};
+                }
+            }
+        }
+        if (prefix_plan.capture.valid()) {
+            prepared_capture = PrefixCaptureTxn(
+                std::move(capture_reservation), engine,
+                prefix_plan.capture);
+        }
+
+        const PrefixStorePlan requested_plan = prefix_plan;
+        auto ar = prefix_supported
+            ? engine.admit_with_prefix(
+                  next_request_id, req.prompt_tokens, req.sampler,
+                  requested_plan)
+            : engine.admit(
+                  next_request_id, req.prompt_tokens, req.sampler);
+
+        std::string prefix_protocol_error;
+        const PrefixStoreAdmission & prefix = ar.prefix_store;
+        if (prefix.restore_attempted) {
+            prefix_cache_.record_restore_attempt(
+                prefix.restore_elapsed_us, prefix.restored.valid());
+        }
+        if (prefix.malformed_restore_state()) {
+            prefix_protocol_error =
+                "engine returned malformed prefix restore state";
+            // A malformed outcome does not tell us whether the engine-owned
+            // payload is still usable. Drop both sides of the requested
+            // checkpoint so a later lookup cannot retry stale metadata.
+            prepared_capture.cancel();
+            if (requested_plan.restore.valid() && restore_policy_slot >= 0) {
+                engine.discard_prefix_store(requested_plan.restore);
+                prefix_cache_.invalidate_inline_snap(restore_policy_slot);
+            }
+        }
+        if (prefix.invalidated.valid()) {
+            if (prefix.invalidated != requested_plan.restore ||
+                restore_policy_slot < 0) {
+                prefix_protocol_error =
+                    "engine invalidated an unrequested prefix checkpoint";
+            } else {
+                // Cancel this admission's reservation before removing the
+                // stale restore metadata. The invalidation itself must not
+                // clear a capture reservation owned by another live request.
+                // Qwen already discarded the engine-owned payload.
+                prepared_capture.cancel();
+                prefix_cache_.invalidate_inline_snap(restore_policy_slot);
+            }
+        }
+        if (prefix.restored.valid() &&
+            prefix.restored != requested_plan.restore) {
+            engine.discard_prefix_store(prefix.restored);
+            prefix_protocol_error =
+                "engine restored an unrequested prefix checkpoint";
+        }
+        if (prefix.restored.valid() && prefix.invalidated.valid()) {
+            prefix_protocol_error =
+                "engine both restored and invalidated one checkpoint";
+        }
+        if (prefix.capture.valid() &&
+            prefix.capture != requested_plan.capture) {
+            prefix_protocol_error =
+                "engine accepted an unrequested prefix capture";
+        }
+        if (ar.status != SeqEngine::AdmitResult::Status::admitted &&
+            (prefix.restored.valid() || prefix.capture.valid())) {
+            prefix_protocol_error =
+                "failed admission returned accepted prefix state";
+        }
+        if (!prefix_protocol_error.empty()) {
+            prepared_capture.cancel();
+            if (ar.status == SeqEngine::AdmitResult::Status::admitted)
+                engine.retire(ar.slot);
+            ar.status = SeqEngine::AdmitResult::Status::failed;
+            ar.error = "prefix admission protocol violation: " +
+                prefix_protocol_error;
+        } else if (prefix.capture != requested_plan.capture) {
+            // Rejected capture: no payload was touched, so preserve any
+            // incumbent selected by the cache's transactional eviction.
+            prepared_capture.cancel();
+        }
+
+        // Invalid restore cleanup deliberately precedes both branches below.
+        if (ar.status == SeqEngine::AdmitResult::Status::busy) {
             return AdmissionDisposition::Deferred;
+        }
         if (ar.status != SeqEngine::AdmitResult::Status::admitted) {
             std::fprintf(stderr, "[server] admit failed: %s\n",
                          ar.error.c_str());
@@ -470,6 +603,11 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             return AdmissionDisposition::Retired;
         }
         next_request_id++;
+        if (prefix.restored.valid() && restore_policy_slot >= 0) {
+            prefix_cache_.record_inline_hit(
+                restore_policy_slot, prefix.restored.tokens,
+                req.prompt_tokens.size());
+        }
 
         SchedSlot & s = slots[(size_t)ar.slot];
         s = SchedSlot{};
@@ -479,6 +617,8 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         s.admission_order = next_admission_order++;
         s.started_at = started_at;
         s.decode_started_at = started_at;  // sane on prefill failure
+        s.cached_prefix_tokens = prefix.restored.tokens;
+        s.cache_capture = std::move(prepared_capture);
         s.n_gen_cap = std::min(
             n_gen_cap,
             engine.max_context() - (int)req.prompt_tokens.size() + 1);
@@ -677,6 +817,32 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             if (out.slot < 0 || out.slot >= n_slots) continue;
             SchedSlot & s = slots[(size_t)out.slot];
             if (!s.job) continue;
+            if (out.prefix_store.attempted()) {
+                prefix_cache_.record_capture_attempt(
+                    out.prefix_store.elapsed_us,
+                    out.prefix_store.status ==
+                        PrefixStoreEvent::Status::saved);
+                using Resolution = PrefixCaptureTxn::Resolution;
+                const Resolution resolution = s.cache_capture.resolve(
+                    out.prefix_store, s.job->req.prompt_tokens);
+                if (resolution == Resolution::failed) {
+                    std::fprintf(stderr,
+                        "[parallel-pc] capture failed checkpoint=%llu: %s\n",
+                        (unsigned long long)
+                            out.prefix_store.ticket.checkpoint.id,
+                        out.prefix_store.error.c_str());
+                } else if (resolution == Resolution::mismatched ||
+                           resolution == Resolution::inactive) {
+                    // The transaction has already aborted only its own
+                    // destination. Never act on an event-supplied checkpoint.
+                    std::fprintf(stderr,
+                        "[parallel-pc] capture ticket mismatch id=%llu "
+                        "checkpoint=%llu\n",
+                        (unsigned long long)out.prefix_store.ticket.id,
+                        (unsigned long long)
+                            out.prefix_store.ticket.checkpoint.id);
+                }
+            }
             if (out.status == PrefillStatus::failed) {
                 s.failed = true;
                 s.error = out.error;

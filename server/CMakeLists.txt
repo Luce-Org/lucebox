@@ -1435,6 +1435,15 @@ if(DFLASH27B_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/test)
         list(APPEND _raw_unit_test_targets test_seq_engine_contract)
     endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_parallel_prefix_txn.cpp")
+        # Host-only ownership tests for the scheduler/cache capture ticket.
+        add_executable(test_parallel_prefix_txn
+            test/test_parallel_prefix_txn.cpp)
+        target_include_directories(test_parallel_prefix_txn PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/test)
+        list(APPEND _raw_unit_test_targets test_parallel_prefix_txn)
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_seq_batch_plan.cpp")
         # Pure-host tests for model-neutral token-budget/FIFO planning.
         add_executable(test_seq_batch_plan test/test_seq_batch_plan.cpp)

@@ -223,6 +223,16 @@ Qwen35SlotManager::PrefillChunk Qwen35SlotManager::append_prefill(
     return out;
 }
 
+Qwen35SlotManager::PrefillChunk Qwen35SlotManager::seed_restored_prefix(
+        int slot, int restored_tokens) {
+    if (!is_prefilling(slot) || slots_[(size_t)slot].cur_pos != 0 ||
+        restored_tokens <= 0 ||
+        restored_tokens >= slots_[(size_t)slot].prompt_len) {
+        return {};
+    }
+    return append_prefill(slot, restored_tokens);
+}
+
 void Qwen35SlotManager::commit_prefill(int slot) {
     if (!is_prefilling(slot)) return;
     Qwen35Slot & s = slots_[(size_t)slot];

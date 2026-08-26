@@ -2574,7 +2574,8 @@ int main(int argc, char ** argv) {
                 if (thick_slot_local != -1
                     && (thick_slot_local < 0 || thick_slot_local >= PREFIX_CACHE_SLOTS
                         || prefix_snapshots[thick_slot_local].ctx == nullptr
-                        || prefix_snapshots[thick_slot_local].is_thin)) {
+                        || prefix_snapshots[thick_slot_local].layout ==
+                            PrefixSnapshot::Layout::thin)) {
                     std::fprintf(stderr, "[snap] RESTORE_CHAIN bad thick slot=%d\n", thick_slot_local);
                     stream_emit(-1);
                     continue;
@@ -2597,7 +2598,8 @@ int main(int argc, char ** argv) {
                         int id = (int)id_l;
                         if (id < 0 || id >= PREFIX_CACHE_SLOTS
                             || prefix_snapshots[id].ctx == nullptr
-                            || !prefix_snapshots[id].is_thin) {
+                            || prefix_snapshots[id].layout !=
+                                PrefixSnapshot::Layout::thin) {
                             std::fprintf(stderr, "[snap] RESTORE_CHAIN bad thin slot=%d\n", id);
                             thin_parse_ok = false; break;
                         }

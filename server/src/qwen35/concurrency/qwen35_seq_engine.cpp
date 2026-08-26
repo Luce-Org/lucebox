@@ -15,6 +15,7 @@
 #include "internal.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <utility>
@@ -48,6 +49,158 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit(
         reset_recurrent_slot(b_.cache_, result.slot);
     }
     return result;
+}
+
+size_t Qwen35SeqEngine::estimate_prefix_store_bytes(int tokens) const {
+    return estimate_paged_target_cache_snapshot_bytes(b_.cache_, tokens);
+}
+
+int Qwen35SeqEngine::checkpoint_index(PrefixStoreRef checkpoint) const {
+    if (!checkpoint.valid() ||
+        checkpoint.id > (uint64_t)Qwen35Backend::PREFIX_SLOTS) return -1;
+    return (int)checkpoint.id - 1;
+}
+
+void Qwen35SeqEngine::discard_prefix_store(PrefixStoreRef checkpoint) {
+    const int index = checkpoint_index(checkpoint);
+    if (index >= 0 &&
+        b_.prefix_snapshots_[index].cur_pos == checkpoint.tokens) {
+        free_prefix_snapshot(b_.prefix_snapshots_[index]);
+    }
+}
+
+bool Qwen35SeqEngine::arm_capture(
+        int slot, PrefixCaptureTicket ticket, int restored_tokens) {
+    if (slot < 0 || slot >= slots_.slot_count()) return false;
+    const Qwen35Slot & sequence = slots_.slot(slot);
+    if (!ticket.valid() || checkpoint_index(ticket.checkpoint) < 0 ||
+        ticket.checkpoint.tokens <= restored_tokens ||
+        ticket.checkpoint.tokens > sequence.prompt_len) return false;
+    slots_.slot(slot).pending_capture = ticket;
+    return true;
+}
+
+SeqEngine::AdmitResult Qwen35SeqEngine::admit_with_prefix(
+        uint64_t request_id,
+        const std::vector<int32_t> & prompt,
+        const SamplerCfg & sampler,
+        const PrefixStorePlan & plan) {
+    AdmitResult result = slots_.admit(request_id, prompt, sampler);
+    if (result.status != AdmitResult::Status::admitted) return result;
+
+    const int slot = result.slot;
+    slots_.slot(slot).pending_capture = {};
+    bool restored = false;
+    if (plan.restore.valid()) {
+        const int restore_index = checkpoint_index(plan.restore);
+        const bool metadata_valid =
+            restore_index >= 0 &&
+            plan.restore.tokens < (int)prompt.size();
+        PrefixSnapshot * snap = metadata_valid
+            ? &b_.prefix_snapshots_[restore_index] : nullptr;
+        const auto restore_started = std::chrono::steady_clock::now();
+        if (snap && snap->ctx &&
+            snap->layout == PrefixSnapshot::Layout::paged &&
+            snap->cur_pos == plan.restore.tokens) {
+            Qwen35SlotManager::PrefillChunk seeded =
+                slots_.seed_restored_prefix(slot, plan.restore.tokens);
+            PagedKvSequenceSnapshot sequence;
+            const bool pool_ok = seeded.ok &&
+                pool_.sequence(slots_.slot(slot).handle, sequence) ==
+                    PagedKvStatus::Ok;
+            const bool table_ok = pool_ok && upload_block_table_delta(
+                slot, seeded.first_new_block, seeded.new_blocks.data(),
+                seeded.new_blocks.size());
+            restored = table_ok && restore_paged_target_cache(
+                *snap, b_.cache_, slot, sequence.block_table,
+                (int)pool_.block_size());
+        }
+        const uint64_t restore_elapsed_us =
+            (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - restore_started).count();
+
+        if (!restored) {
+            discard_prefix_store(plan.restore);
+            slots_.retire(slot);
+            result = slots_.admit(request_id, prompt, sampler);
+            result.prefix_store.invalidated = plan.restore;
+            if (result.status == AdmitResult::Status::admitted) {
+                reset_recurrent_slot(b_.cache_, result.slot);
+            } else {
+                result.error =
+                    "cold admission failed after stale prefix restore";
+            }
+        } else {
+            result.prefix_store.restored = plan.restore;
+            std::fprintf(stderr,
+                "[parallel-pc] restored checkpoint=%llu seq_slot=%d "
+                "tokens=%d time_ms=%.1f\n",
+                (unsigned long long)plan.restore.id, slot,
+                plan.restore.tokens, (double)restore_elapsed_us / 1000.0);
+        }
+        result.prefix_store.restore_attempted = true;
+        result.prefix_store.restore_elapsed_us = restore_elapsed_us;
+        if (result.status != AdmitResult::Status::admitted) return result;
+    } else {
+        reset_recurrent_slot(b_.cache_, slot);
+    }
+
+    const int admitted_slot = result.slot;
+    if (!result.prefix_store.invalidated.valid() &&
+        arm_capture(
+            admitted_slot, plan.capture,
+            result.prefix_store.restored.tokens)) {
+        result.prefix_store.capture = plan.capture;
+    }
+    return result;
+}
+
+PrefixStoreEvent Qwen35SeqEngine::capture_prefix(
+        int slot, PrefixCaptureTicket ticket) {
+    PrefixStoreEvent event;
+    event.ticket = ticket;
+    event.status = PrefixStoreEvent::Status::failed;
+    const int checkpoint = checkpoint_index(ticket.checkpoint);
+    if (!ticket.valid() || checkpoint < 0 ||
+        !slots_.is_prefilling(slot) ||
+        slots_.slot(slot).cur_pos != ticket.checkpoint.tokens) {
+        event.error = "invalid prefix capture boundary";
+        return event;
+    }
+    PagedKvSequenceSnapshot sequence;
+    if (pool_.sequence(slots_.slot(slot).handle, sequence) !=
+            PagedKvStatus::Ok ||
+        sequence.kv_seq_len != (uint32_t)ticket.checkpoint.tokens) {
+        event.error = "prefix capture page table is incomplete";
+        return event;
+    }
+    const auto capture_started = std::chrono::steady_clock::now();
+    PrefixSnapshot & snapshot = b_.prefix_snapshots_[checkpoint];
+    if (!replace_paged_target_cache(
+            b_.cache_, slot, sequence.block_table,
+            (int)pool_.block_size(), ticket.checkpoint.tokens, snapshot)) {
+        event.elapsed_us =
+            (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - capture_started).count();
+        event.error = dflash27b_last_error();
+        if (event.error.empty()) {
+            event.error = "paged prefix capture failed";
+        }
+        return event;
+    }
+    event.status = PrefixStoreEvent::Status::saved;
+    event.elapsed_us =
+        (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - capture_started).count();
+    event.bytes = snapshot.buf
+        ? ggml_backend_buffer_get_size(snapshot.buf) : 0;
+    std::fprintf(stderr,
+        "[parallel-pc] saved checkpoint=%llu seq_slot=%d tokens=%d "
+        "bytes=%zu time_ms=%.1f\n",
+        (unsigned long long)ticket.checkpoint.id, slot,
+        ticket.checkpoint.tokens, event.bytes,
+        (double)event.elapsed_us / 1000.0);
+    return event;
 }
 
 int32_t Qwen35SeqEngine::sample_graph_row(
@@ -125,6 +278,14 @@ Qwen35SeqEngine::PrefillStage Qwen35SeqEngine::stage_prefill_chunk(
     stage.kv_pos = seq.cur_pos;
     stage.chunk = std::min(
         max_tokens, seq.prompt_len - stage.kv_pos);
+    const PrefixCaptureTicket capture = slots_.slot(slot).pending_capture;
+    if (capture.valid() &&
+        stage.kv_pos < capture.checkpoint.tokens) {
+        // Recurrent state is only checkpoint-consistent after compute, so a
+        // selected capture boundary must be the exact end of this graph slice.
+        stage.chunk = std::min(
+            stage.chunk, capture.checkpoint.tokens - stage.kv_pos);
+    }
     if (stage.chunk <= 0) return PrefillStage{};
     stage.commit = stage.kv_pos + stage.chunk >= seq.prompt_len;
 
@@ -522,6 +683,12 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
         const int slot = plan.prefills[i].slot;
         PrefillOutput out;
         out.slot = slot;
+        const PrefixCaptureTicket capture = slots_.slot(slot).pending_capture;
+        if (capture.valid() &&
+            slots_.slot(slot).cur_pos == capture.checkpoint.tokens) {
+            out.prefix_store = capture_prefix(slot, capture);
+            slots_.slot(slot).pending_capture = {};
+        }
         if (prefills[i].commit) {
             out.status = PrefillOutput::Status::completed;
             out.token = sample_graph_row(

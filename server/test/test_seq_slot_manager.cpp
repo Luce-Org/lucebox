@@ -8,6 +8,7 @@
 #include "qwen35/concurrency/qwen35_slot_manager.h"
 #include "host_check.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 
@@ -39,6 +40,43 @@ static bool is_busy(const SeqEngine::AdmitResult & result) {
 }
 
 int main() {
+    // A copied prefix checkpoint resumes into freshly-owned pages. The
+    // checkpoint never lends its original physical blocks to the new request:
+    // the slot consumes its own admission reservation, exposes the resulting
+    // block-table delta, and starts the remaining prefill at the restored
+    // logical position.
+    {
+        PagedKvPool pool(/*physical_block_count=*/8, /*max_sequences=*/2,
+                         /*block_size=*/16);
+        Qwen35SlotManager mgr(pool, /*max_ctx=*/64);
+        const std::vector<int32_t> prompt = prompt_tokens(40);
+
+        auto first = admit(mgr, 1, prompt, greedy_sampler());
+        CHECK(is_admitted(first));
+        auto original = mgr.append_prefill(first.slot, 24);
+        CHECK(original.ok && original.rows.front() == 0 &&
+              original.rows.back() == 23);
+
+        auto restored = admit(mgr, 2, prompt, greedy_sampler());
+        CHECK(is_admitted(restored));
+        auto seeded = mgr.seed_restored_prefix(restored.slot, 24);
+        CHECK(seeded.ok && seeded.rows.size() == 24);
+        for (int64_t row : seeded.rows) {
+            CHECK(std::find(original.rows.begin(), original.rows.end(), row) ==
+                  original.rows.end());
+        }
+        CHECK(mgr.slot(restored.slot).cur_pos == 24);
+        CHECK(mgr.slot(restored.slot).prefilling());
+        CHECK(seeded.first_new_block == 0 && seeded.new_blocks.size() == 2);
+        mgr.retire(first.slot);
+
+        auto suffix = mgr.append_prefill(restored.slot, 16);
+        CHECK(suffix.ok && suffix.rows.size() == 16);
+        CHECK(mgr.slot(restored.slot).cur_pos == 40);
+        mgr.commit_prefill(restored.slot);
+        CHECK(mgr.slot(restored.slot).decoding());
+    }
+
     // 8 blocks x 16 tokens = 128 pool tokens, 2 slots, per-seq max_ctx 64.
     {
         PagedKvPool pool(/*physical_block_count=*/8, /*max_sequences=*/2,

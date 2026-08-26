@@ -104,7 +104,8 @@ public:
     static constexpr int MAX_CACHE_SLOTS = MAX_SLOTS - 1;
 
     // cap = number of prefix-cache slots (0 disables).
-    PrefixCache(int cap, const Tokenizer & tokenizer);
+    PrefixCache(int cap, const Tokenizer & tokenizer,
+                size_t max_resident_bytes = 0);
 
     bool disabled() const { return disabled_; }
 
@@ -115,32 +116,82 @@ public:
 
     // Look up the longest cached prefix. Returns (slot, prefix_len) or (-1, 0).
     std::pair<int, int> lookup(const std::vector<int32_t> & prompt_ids);
+    // Side-effect-free candidate for engines that must validate payloads.
+    std::pair<int, int> lookup_candidate(
+        const std::vector<int32_t> & prompt_ids,
+        int max_prefix_tokens);
 
-    // Prepare an inline snapshot. `restored_prefix_len` prevents reserving a
-    // slot for a boundary already covered by the restored snapshot.
-    // `prefer_tools_boundary` selects the system/tools head first (see
-    // select_inline_snapshot_boundary). When `forced_cut` > restored, that
-    // cut is used instead (PPP pin_end, including mid-message LCP cuts).
-    // Returns (slot, target_cut) or (-1, 0).
-    std::pair<int, int> prepare_inline_snap(
+    // Promote and count only after an engine restored this checkpoint.
+    void record_inline_hit(
+        int slot, int prefix_len, size_t prompt_len);
+
+
+    class InlineReservation {
+    public:
+        InlineReservation() = default;
+        ~InlineReservation();
+
+        InlineReservation(const InlineReservation &) = delete;
+        InlineReservation & operator=(const InlineReservation &) = delete;
+        InlineReservation(InlineReservation && other) noexcept;
+        InlineReservation & operator=(InlineReservation && other) noexcept;
+
+        bool active() const;
+        int slot() const { return slot_; }
+        int target_cut() const { return target_cut_; }
+
+        // Commit after the engine saved the payload, cancel before the target
+        // slot was touched, or abort after a failed write invalidated it.
+        bool commit(const std::vector<int32_t> & prompt_ids,
+                    size_t resident_bytes = 0, bool protect = false);
+        bool commit_at(const std::vector<int32_t> & prompt_ids,
+                       int committed_cut, size_t resident_bytes = 0,
+                       bool protect = false);
+        void cancel();
+        void abort();
+
+    private:
+        friend class PrefixCache;
+        InlineReservation(PrefixCache * cache, uint64_t id, int slot,
+                          int target_cut, PrefixHash victim, bool has_victim,
+                          bool protect);
+        void clear();
+        void take(InlineReservation && other);
+
+        PrefixCache * cache_ = nullptr;
+        uint64_t id_ = 0;
+        int slot_ = -1;
+        int target_cut_ = 0;
+        PrefixHash victim_{};
+        bool has_victim_ = false;
+        bool protect_ = false;
+    };
+
+    using InlineSnapshotSize = std::function<size_t(int target_cut)>;
+
+    // Select a boundary, destination, and optional budget victim as one owned
+    // operation. At most one reservation can be live; destroying it cancels
+    // without changing committed metadata.
+    InlineReservation reserve_inline_snap(
         const std::vector<int32_t> & prompt_ids,
         int restored_prefix_len = 0,
         bool prefer_tools_boundary = false,
-        int forced_cut = 0);
+        int forced_cut = 0,
+        InlineSnapshotSize estimate_bytes = {});
 
-    // Confirm after daemon successfully saved the snapshot.
-    // `protect` marks the entry non-evictable by unprotected traffic (tool pin).
+    // Commit an already-materialized snapshot without a reservation. Used by
+    // cache import/bootstrap paths and tests.
     void confirm_inline_snap(int slot, int target_cut,
                              const std::vector<int32_t> & prompt_ids,
-                             bool protect = false);
+                             bool protect = false,
+                             size_t resident_bytes = 0);
 
-    // Abort if the snapshot failed.
-    void abort_inline_snap(int slot);
+    // Remove committed metadata for an engine-invalidated checkpoint.
+    void invalidate_inline_snap(int slot);
 
-    // Cancel before the backend slot is touched (for example when the selected
-    // destination is also the snapshot being restored). Unlike abort, this
-    // preserves the existing entry and only drops the pending reservation.
-    void cancel_inline_snap(int slot);
+    // Record synchronous scheduler stalls caused by copied checkpoints.
+    void record_capture_attempt(uint64_t elapsed_us, bool success);
+    void record_restore_attempt(uint64_t elapsed_us, bool restored);
 
     // Drop all entries (e.g., after OOM recovery).
     void mark_all_cleared();
@@ -169,6 +220,17 @@ public:
         int capacity;
         int in_use;
         int64_t lifetime_hits;
+        uint64_t max_resident_bytes;
+        uint64_t resident_bytes;
+        uint64_t budget_skips;
+        uint64_t capture_attempts;
+        uint64_t capture_failures;
+        uint64_t capture_stall_us_total;
+        uint64_t capture_stall_us_max;
+        uint64_t restore_attempts;
+        uint64_t restore_invalidations;
+        uint64_t restore_stall_us_total;
+        uint64_t restore_stall_us_max;
     };
     struct FullStats {
         bool enabled;
@@ -200,13 +262,14 @@ private:
         int                  slot;
         std::vector<int32_t> ids;  // prefix tokens [0, target_cut) for prefix-aware eviction
         bool                 protect = false;  // sticky tools-boundary pin
+        size_t               resident_bytes = 0;
     };
-    // Pending protect flag for the in-flight reservation (applied on confirm).
-    bool pending_protect_ = false;
     std::vector<LruEntry> entries_;
     int next_slot_ = 0;
-    PrefixHash pending_evict_key_{};
-    bool has_pending_evict_ = false;
+    uint64_t active_inline_reservation_ = 0;
+    uint64_t next_inline_reservation_ = 1;
+    size_t max_resident_bytes_ = 0;
+    size_t resident_bytes_ = 0;
 
     // Full-cache state
     bool full_disabled_ = true;
@@ -225,6 +288,16 @@ private:
     // tearing across the daemon thread's increments. Relaxed ordering
     // is sufficient — no synchronization with other state required.
     std::atomic<int64_t> lifetime_hits_{0};       // inline cache hits
+    std::atomic<uint64_t> resident_bytes_count_{0};
+    std::atomic<uint64_t> budget_skips_{0};
+    std::atomic<uint64_t> capture_attempts_{0};
+    std::atomic<uint64_t> capture_failures_{0};
+    std::atomic<uint64_t> capture_stall_us_total_{0};
+    std::atomic<uint64_t> capture_stall_us_max_{0};
+    std::atomic<uint64_t> restore_attempts_{0};
+    std::atomic<uint64_t> restore_invalidations_{0};
+    std::atomic<uint64_t> restore_stall_us_total_{0};
+    std::atomic<uint64_t> restore_stall_us_max_{0};
     std::atomic<int64_t> full_lifetime_hits_{0};  // full-compress cache hits
     std::atomic<int64_t> full_disk_bytes_{0};     // best-effort snapshot of disk usage
     // Atomic mirrors of `entries_.size()` and `full_entries_.size()`.
@@ -239,7 +312,24 @@ private:
 
     // Helpers
     int find_entry(const PrefixHash & h) const;
+    int find_slot_entry(int slot) const;
+    void erase_inline_entry(int idx);
     void move_to_end(int idx);
+    std::pair<int, int> lookup_impl(
+        const std::vector<int32_t> & prompt_ids,
+        int max_prefix_tokens,
+        bool record_hit);
+    bool inline_reservation_active(uint64_t id) const;
+    void release_inline_reservation(uint64_t id);
+    bool commit_inline_reservation(InlineReservation & reservation,
+                                   const std::vector<int32_t> & prompt_ids,
+                                   int committed_cut, size_t resident_bytes,
+                                   bool protect);
+    void abort_inline_reservation(InlineReservation & reservation);
+    void replace_inline_entry(int slot, int target_cut,
+                              const std::vector<int32_t> & prompt_ids,
+                              bool protect, size_t resident_bytes);
+
     int find_full_entry(const PrefixHash & h) const;
     void move_full_to_end(int idx);
 };

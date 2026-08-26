@@ -92,6 +92,11 @@ struct ServerConfig {
     bool        enable_cors = true;
     std::string model_name  = "dflash";
     int         prefix_cache_cap = 32;  // prefix cache slots (0 disables)
+    // Resident system-memory budget for copied paged checkpoints. The
+    // scheduler enforces it only when concurrent paged prefix storage is
+    // active. Zero means unlimited.
+    size_t      concurrent_prefix_cache_max_bytes = (size_t)4 * 1024 * 1024 * 1024;
+    bool        concurrent_paged_prefix_cache = false;
     int         prefill_cache_cap = 0;  // full-prompt/prefill cache slots (0 disables)
     // Extend the existing prefix cache through generated tool-call turns.
     bool        agent_turn_cache = false;
@@ -376,6 +381,8 @@ public:
     }
 
 private:
+    friend struct SchedulerTestHarness;
+
     // Client thread: read HTTP request, parse, enqueue job, wait.
     void handle_client(SocketHandle fd);
 
@@ -417,6 +424,7 @@ private:
         // When DiffPin rewrote tokens, full-cache keys must use
         // prepared.tokens (effective), not req.prompt_tokens.
         bool full_snap_key_effective = false;
+        PrefixCache::InlineReservation snap_reservation;
         int snap_slot = -1;
         int snap_cut = 0;
         bool snap_prepared = false;
@@ -427,7 +435,7 @@ private:
         GenerateRequest & generate_request);
     void finalize_generation_cache(
         const ParsedRequest & req, const PreparedPrompt & prepared,
-        const GenerationCacheState & cache, const GenerateResult & result,
+        GenerationCacheState & cache, const GenerateResult & result,
         int completion_tokens, bool visible_output_seen,
         bool client_disconnected);
     void remember_agent_turn(

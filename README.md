@@ -371,6 +371,7 @@ When compression is on, multi-turn continuations automatically use **FlowKV**: a
 | `DFLASH27B_KV_TQ3=1` | (default) | Preset TQ3_0 K+V (3.5 bpv, fits 256K @ 24 GB) |
 | `DFLASH27B_KV_Q4=1` | off | Q4_0 K+V (4.5 bpv, legacy, ~128K ceiling) |
 | `--prefix-cache-slots N` | — | Live prefix-cache slot count |
+| `--concurrent-prefix-cache-max-mib N` | `4096` | Resident RAM limit for copied concurrent paged checkpoints; `0` is unlimited. |
 | `DFLASH_PREFIX_CACHE_SLOTS=N` | `32` | Container-entrypoint equivalent of `--prefix-cache-slots`; the native binary itself uses the CLI flag. |
 | `DFLASH_PREFILL_CACHE_SLOTS=N` | `0` | Container-entrypoint equivalent of `--prefill-cache-slots`; the native binary itself uses the CLI flag. |
 | `--kv-cache-dir <path>` | — | Persist prefix cache to disk |

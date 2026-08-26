@@ -924,8 +924,9 @@ bool Qwen35Backend::snapshot_save(int slot) {
         static bool warned = false;
         if (!warned) {
             std::fprintf(stderr,
-                "[paged-attention] prefix snapshots are disabled until the "
-                "snapshot format stores block tables\n");
+                "[paged-attention] the classic single-sequence snapshot API "
+                "is unavailable; continuous batching uses copied paged "
+                "checkpoints\n");
             warned = true;
         }
         return false;
