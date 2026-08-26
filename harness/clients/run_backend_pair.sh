@@ -18,6 +18,7 @@ case "$CLIENT" in
   openclaw) CLIENT_SCRIPT="$SCRIPT_DIR/run_openclaw.sh" ;;
   openwebui) CLIENT_SCRIPT="$SCRIPT_DIR/run_openwebui.sh" ;;
   openwebui_tools) CLIENT_SCRIPT="$SCRIPT_DIR/run_openwebui_tools.sh" ;;
+  omp) CLIENT_SCRIPT="$SCRIPT_DIR/run_omp.sh" ;;
   pi) CLIENT_SCRIPT="$SCRIPT_DIR/run_pi.sh" ;;
   *)
     echo "unknown CLIENT=$CLIENT" >&2

@@ -20,7 +20,7 @@ If a client CLI is missing, the launcher installs it automatically. Set
 To preinstall real-client CLIs yourself:
 
 ```bash
-python3 harness/client_test_runner.py install --clients codex,hermes,openwebui
+python3 harness/client_test_runner.py install --clients codex,hermes,omp,openwebui
 ```
 
 The launcher will start `server/build/dflash_server` by default, or the path in
@@ -52,7 +52,8 @@ harness/clients/run_codex.sh
 
 The C++ server is expected to handle the same client protocol shapes covered by
 these launchers and probes: OpenAI Chat Completions, streaming chunks, tool
-metadata, OpenAI Responses for Codex, Anthropic Messages for Claude Code, and
+metadata, OpenAI Responses for Codex and OMP, Anthropic Messages for Claude
+Code, and
 Open WebUI model metadata.
 
 ## Defaults
@@ -66,6 +67,7 @@ The defaults below are the current RTX 3090 starting points for
 | Codex | `run_codex.sh` | `MAX_CTX=32768 BUDGET=22 VERIFY_MODE=ddtree EXTRA_SERVER_ARGS=--lazy-draft` |
 | OpenCode | `run_opencode.sh` | `MAX_CTX=86016 BUDGET=22 VERIFY_MODE=ddtree EXTRA_SERVER_ARGS=--lazy-draft` |
 | Hermes Agent | `run_hermes.sh` | `MAX_CTX=98304 BUDGET=22 VERIFY_MODE=ddtree EXTRA_SERVER_ARGS=--lazy-draft` |
+| OMP | `run_omp.sh` | `MAX_CTX=65536 BUDGET=22 VERIFY_MODE=ddtree EXTRA_SERVER_ARGS=--lazy-draft OMP_TIMEOUT=3600` |
 | Pi | `run_pi.sh` | `MAX_CTX=65536 BUDGET=22 VERIFY_MODE=ddtree EXTRA_SERVER_ARGS=--lazy-draft PI_TIMEOUT=3600` |
 | OpenClaw | `run_openclaw.sh` | `MAX_CTX=204800 BUDGET=22 VERIFY_MODE=ddtree EXTRA_SERVER_ARGS=--lazy-draft` |
 | Open WebUI chat | `run_openwebui.sh` | `MAX_CTX=262144 BUDGET=22 VERIFY_MODE=ddtree EXTRA_SERVER_ARGS=--lazy-draft` |
@@ -77,6 +79,17 @@ Override any setting inline:
 MAX_CTX=32768 harness/clients/run_claude_code.sh
 PROMPT='Explain the repo and end with lucebox-client-ok' harness/clients/run_opencode.sh
 PROMPT_FILE=harness/clients/prompts/repo_inspection.txt harness/clients/run_hermes.sh
+```
+
+OMP uses a generated `models.yml` with Lucebox as a keyless custom
+`openai-responses` provider. `OMP_TIMEOUT` controls the launcher's wall-clock
+deadline, while `OMP_STREAM_IDLE_TIMEOUT_MS` defaults to one hour so long
+prefills are not interrupted by OMP's stream watchdog; set it to `0` to
+disable that watchdog. Override either when needed:
+
+```bash
+OMP_TIMEOUT=0 OMP_STREAM_IDLE_TIMEOUT_MS=7200000 \
+  harness/clients/run_omp.sh
 ```
 
 `PI_TIMEOUT` is Pi's total wall-clock limit in seconds. Its one-hour default
@@ -92,8 +105,8 @@ put the same setting in `~/.pi/agent/settings.json`:
 
 The other real-client launchers also allow one hour by default. Override their
 deadlines with `CLAUDE_TIMEOUT`, `CODEX_TIMEOUT`, `OPENCODE_TIMEOUT`,
-`HERMES_TIMEOUT`, `OPENCLAW_TIMEOUT`, or (for Open WebUI's curl probe)
-`CURL_MAX_TIME`. The CLI launcher timeouts accept `0` to disable the outer
+`OMP_TIMEOUT`, `HERMES_TIMEOUT`, `OPENCLAW_TIMEOUT`, or (for Open WebUI's
+curl probe) `CURL_MAX_TIME`. The CLI launcher timeouts accept `0` to disable the outer
 deadline. OpenCode's provider-level request and chunk deadlines default to one
 hour too and can be changed with `OPENCODE_REQUEST_TIMEOUT_MS` and
 `OPENCODE_CHUNK_TIMEOUT_MS`. The server independently sends SSE heartbeat
@@ -119,9 +132,9 @@ CLIENT=opencode PROMPT_FILE=harness/clients/prompts/repo_inspection.txt \
   harness/clients/run_backend_pair.sh
 ```
 
-OpenAI Chat Completions clients can call llama.cpp directly. Claude Code and
-Codex use `llamacpp_compat_proxy.py` so their real Anthropic Messages and
-Responses requests can be compared too.
+OpenAI Chat Completions clients and OMP's Responses client can call llama.cpp
+directly. Claude Code and Codex use `llamacpp_compat_proxy.py` so their real
+Anthropic Messages and Responses requests can be compared too.
 
 ## Notes
 

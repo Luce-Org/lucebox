@@ -1529,6 +1529,28 @@ if(DFLASH27B_TESTS)
     unset(_pi_timeout_test)
     unset(_pi_launcher)
 
+    set(_omp_config_test
+        "${CMAKE_CURRENT_SOURCE_DIR}/../harness/tests/test_run_omp_config.sh")
+    set(_omp_launcher "${CMAKE_CURRENT_SOURCE_DIR}/../harness/clients/run_omp.sh")
+    if(UNIX AND EXISTS "${_omp_config_test}" AND EXISTS "${_omp_launcher}")
+        add_test(
+            NAME server_unit_omp_harness_config
+            COMMAND bash "${_omp_config_test}" "${_omp_launcher}")
+    endif()
+    unset(_omp_config_test)
+    unset(_omp_launcher)
+
+    set(_backend_pair_summary_test
+        "${CMAKE_CURRENT_SOURCE_DIR}/../harness/tests/test_summarize_backend_pair.py")
+    find_program(_harness_python3 python3)
+    if(_harness_python3 AND EXISTS "${_backend_pair_summary_test}")
+        add_test(
+            NAME server_unit_backend_pair_summary
+            COMMAND "${_harness_python3}" "${_backend_pair_summary_test}")
+    endif()
+    unset(_backend_pair_summary_test)
+    unset(_harness_python3 CACHE)
+
     set(_client_timeout_test
         "${CMAKE_CURRENT_SOURCE_DIR}/../harness/tests/test_client_launcher_timeouts.sh")
     if(UNIX AND EXISTS "${_client_timeout_test}")

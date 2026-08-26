@@ -117,6 +117,7 @@ launcher_cases=(
   'run_hermes.sh|HERMES_BIN|HERMES_TIMEOUT|1'
   'run_openclaw.sh|OPENCLAW_BIN|OPENCLAW_TIMEOUT|2'
   'run_opencode.sh|OPENCODE_BIN|OPENCODE_TIMEOUT|1'
+  'run_omp.sh|OMP_BIN|OMP_TIMEOUT|1'
 )
 for launcher_case in "${launcher_cases[@]}"; do
   IFS='|' read -r script client_var timeout_var expected_calls <<<"$launcher_case"
@@ -159,6 +160,8 @@ grep -Fq ': "${HERMES_TIMEOUT:=3600}"' "$CLIENTS/run_hermes.sh"
 grep -Fq 'run_with_timeout "$HERMES_TIMEOUT"' "$CLIENTS/run_hermes.sh"
 grep -Fq ': "${CLAUDE_TIMEOUT:=3600}"' "$CLIENTS/run_claude_code.sh"
 grep -Fq 'run_with_timeout "$CLAUDE_TIMEOUT"' "$CLIENTS/run_claude_code.sh"
+grep -Fq ': "${OMP_TIMEOUT:=3600}"' "$CLIENTS/run_omp.sh"
+grep -Fq 'run_with_timeout "$OMP_TIMEOUT"' "$CLIENTS/run_omp.sh"
 grep -Fq ': "${OPENCLAW_TIMEOUT:=3600}"' "$CLIENTS/run_openclaw.sh"
 grep -Fq 'run_with_timeout "$OPENCLAW_TIMEOUT"' "$CLIENTS/run_openclaw.sh"
 grep -Fq 'openclaw_cmd+=(--timeout "$OPENCLAW_TIMEOUT")' "$CLIENTS/run_openclaw.sh"

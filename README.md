@@ -121,7 +121,7 @@ Entries are `dflash_server` settings unless the cell shows another command.
 
 [`harness/`](harness/) contains RTX 3090 client launchers and regression tests
 for Lucebox server compatibility. Run Lucebox inside Claude Code, Codex,
-OpenCode, Hermes, Pi, OpenClaw, or Open WebUI, or check if a server change
+OpenCode, Hermes, OMP, Pi, OpenClaw, or Open WebUI, or check if a server change
 still works with those clients.
 
 <table>
@@ -139,6 +139,7 @@ still works with those clients.
 | Codex | [`run_codex.sh`](harness/clients/run_codex.sh) |
 | OpenCode | [`run_opencode.sh`](harness/clients/run_opencode.sh) |
 | Hermes | [`run_hermes.sh`](harness/clients/run_hermes.sh) |
+| [OMP](https://omp.sh/) | [`run_omp.sh`](harness/clients/run_omp.sh) |
 | Pi | [`run_pi.sh`](harness/clients/run_pi.sh) |
 | OpenClaw | [`run_openclaw.sh`](harness/clients/run_openclaw.sh) |
 | Open WebUI | [`run_openwebui.sh`](harness/clients/run_openwebui.sh) |
@@ -165,7 +166,7 @@ Launcher scripts install missing real-client CLIs automatically under
 `.harness-work/`. To preinstall them yourself:
 
 ```bash
-python3 harness/client_test_runner.py install --clients codex,hermes,openwebui
+python3 harness/client_test_runner.py install --clients codex,hermes,omp,openwebui
 ```
 
 For direct TPS/TTFT numbers against a running server:

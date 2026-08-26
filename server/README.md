@@ -148,8 +148,8 @@ The default draft path is discovered under `models/draft/`. Scripts prefer `dfla
 `dflash_server` serves the same client-facing local API surface used by the
 harnesses. It supports `/health`,
 `/v1/models`, OpenAI Chat Completions including streaming and tool metadata,
-OpenAI Responses for Codex, Anthropic Messages for Claude Code, and Open WebUI
-model metadata.
+OpenAI Responses for Codex and OMP, Anthropic Messages for Claude Code, and
+Open WebUI model metadata.
 
 Build it with the rest of the CUDA runtime:
 

@@ -10,7 +10,7 @@
 
 <p align="center">
   <strong>Client launchers and regression tests for Lucebox server compatibility.</strong><br/>
-  Run Lucebox from Claude Code, Codex, OpenCode, Hermes, Pi, OpenClaw, or Open WebUI.<br/>
+  Run Lucebox from Claude Code, Codex, OpenCode, Hermes, OMP, Pi, OpenClaw, or Open WebUI.<br/>
   RTX 3090 / 24 GB defaults are included for each client.
 </p>
 
@@ -31,6 +31,7 @@ cd lucebox-hub
 harness/clients/run_codex.sh
 harness/clients/run_claude_code.sh
 harness/clients/run_opencode.sh
+harness/clients/run_omp.sh
 ```
 
 The launchers default to the current repo, install/use client packages under
@@ -93,7 +94,7 @@ If you already have `dflash_server` running, use `probe`:
 ```bash
 python3 harness/client_test_runner.py probe \
   --url http://127.0.0.1:8000 \
-  --clients claude_code,codex,opencode,openwebui,pi \
+  --clients claude_code,codex,opencode,omp,openwebui,pi \
   --json-out /tmp/lucebox_harness_probe.json
 ```
 
@@ -103,7 +104,7 @@ client packages. Without it, the HTTP protocol probes still run.
 To preinstall real-client CLIs yourself:
 
 ```bash
-python3 harness/client_test_runner.py install --clients codex,hermes,openwebui
+python3 harness/client_test_runner.py install --clients codex,hermes,omp,openwebui
 ```
 
 For a GPU sweep, let the runner start Lucebox for each profile:
