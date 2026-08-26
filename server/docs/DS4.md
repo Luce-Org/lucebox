@@ -455,6 +455,7 @@ Run the converted drafter against a DeepSeek4 target with:
 ```bash
 export DFLASH_DS4_SPEC=1
 export DFLASH_DS4_FUSED_VERIFY=1
+export DFLASH_DS4_SPARSE_DECODE_FLASH=1
 export DFLASH_DS4_DRAFT=/path/to/dflash-draft.gguf
 export DFLASH_DS4_SPEC_Q=4
 
@@ -465,12 +466,43 @@ export DFLASH_DS4_SPEC_Q=4
 ```
 
 `--ds4-fused-verify-f16-kv` feeds the persistent F16 MLA cache directly to
-batched explicit verifier attention instead of converting the full cache to
-F32 on every speculative step. Key-side accumulation remains F32 through 512
-attention rows to preserve the short-context quality baseline. The option is
-currently qualified only for a single HIP target and remains off by default.
-It changes verifier floating-point inputs and can change generated tokens, so
-re-run workload quality checks before enabling it for another checkpoint.
+batched explicit or sparse verifier attention instead of converting the full
+cache to F32 on every speculative step. With
+`DFLASH_DS4_SPARSE_DECODE_FLASH=1`, the verifier keeps explicit attention for
+short histories and switches each layer to the model's sparse top-k attention
+once it removes at least half of the compressed rows. Key-side accumulation
+remains F32 through 512 attention rows to preserve the short-context quality
+baseline. The option is currently qualified only for a single HIP target and
+remains off by default. It changes verifier floating-point inputs and can
+change generated tokens, so re-run workload quality checks before enabling it
+for another checkpoint.
+
+On RDNA3.5 and RDNA4, speculative widths 2–5 use the packed small-CM rocWMMA
+indexer by default. It is bit-identical to the generic indexer in the GPU unit
+test and can be disabled with `GGML_DS4_INDEXER_PACK_SMALL=0` for diagnosis.
+The legacy `GGML_DS4_INDEXER_PACK_Q4` variable remains an alias.
+
+### PFlash prompt compression
+
+DeepSeek4 supports the shared in-process Qwen3-0.6B PFlash scorer:
+
+```bash
+./server/build-hip/dflash_server /path/to/deepseek4-target.gguf \
+  --target-device hip:0 \
+  --prefill-compression auto \
+  --prefill-drafter /path/to/Qwen3-0.6B-BF16.gguf \
+  --prefill-skip-park
+```
+
+The HTTP path converts target tokens to text, scores Qwen tokens, decodes the
+kept Qwen spans, and tokenizes that text for DeepSeek4. This cross-tokenizer
+round trip is required; drafter token IDs are never passed directly to the
+target. Omit `--prefill-skip-park` when the target, DSpark drafter, and PFlash
+drafter do not fit together.
+
+PFlash reduces TTFT and the effective context used during generation, but it
+is lossy prompt compression. Disable it for matched true-context throughput
+or exact-retrieval comparisons.
 
 `DFLASH_DS4_FUSED_VERIFY=1` is the opt-in throughput profile. Its persistent
 whole-model GPU graph uses stable padded reduction shapes, so near-tied greedy

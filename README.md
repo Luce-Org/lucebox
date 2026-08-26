@@ -93,6 +93,10 @@ These runs use different prompts, quantizations, and inference policies. They sh
 
 See [Recommended server setups](server/docs/RECOMMENDED_SETUPS.md) for the model and hardware matrix, including single-GPU and mixed-GPU profiles.
 
+The DS4 guide also documents the Strix long-context sparse-verifier profile and
+Qwen3-0.6B PFlash integration. PFlash is lossy prompt compression; keep it off
+for exact-retrieval and matched true-context benchmarks.
+
 ## Client Harnesses
 
 [`harness/`](harness/) runs Lucebox through popular coding clients and checks server compatibility.

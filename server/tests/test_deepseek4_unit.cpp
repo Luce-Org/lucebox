@@ -1726,18 +1726,43 @@ static void test_dspark_park_all_releases_drafter() {
     backend.spec_draft_path_ = "/tmp/ds4-dspark-fixture.gguf";
     backend.spec_drafter_ = std::make_unique<DSparkDrafter>();
     backend.spec_enabled_ = true;
+    backend.pflash_drafter_loaded_ = true;
+    backend.pflash_drafter_path_ = "/tmp/ds4-pflash-fixture.gguf";
+    backend.pflash_drafter_gpu_ = 1;
 
     TEST_ASSERT(backend.park(ParkTarget::All));
     TEST_ASSERT(backend.parked_);
     TEST_ASSERT(backend.spec_drafter_ == nullptr);
     TEST_ASSERT(!backend.spec_enabled_);
     TEST_ASSERT(backend.spec_drafter_parked_);
+    TEST_ASSERT(!backend.pflash_drafter_loaded_);
+    TEST_ASSERT(backend.pflash_drafter_path_.empty());
+    TEST_ASSERT(backend.pflash_drafter_gpu_ == -1);
 
     backend.free_drafter();
     TEST_ASSERT(backend.spec_drafter_ == nullptr);
     TEST_ASSERT(!backend.spec_enabled_);
     TEST_ASSERT(backend.spec_drafter_parked_);
     TEST_ASSERT(backend.spec_draft_path_ == "/tmp/ds4-dspark-fixture.gguf");
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+static void test_pflash_rejects_invalid_requests() {
+    std::fprintf(stderr, "  test_pflash_rejects_invalid_requests ...");
+    DeepSeek4BackendConfig cfg;
+    DeepSeek4Backend backend(cfg);
+
+    ModelBackend::CompressRequest empty;
+    TEST_ASSERT(!backend.compress(empty).ok);
+
+    ModelBackend::CompressRequest invalid_ratio;
+    invalid_ratio.input_ids = {1, 2, 3};
+    invalid_ratio.keep_ratio = 0.0f;
+    invalid_ratio.drafter_path = "/nonexistent/drafter.gguf";
+    const auto results = backend.compress_batch({empty, invalid_ratio});
+    TEST_ASSERT(results.size() == 2);
+    TEST_ASSERT(!results[0].ok);
+    TEST_ASSERT(!results[1].ok);
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
@@ -2831,28 +2856,16 @@ static void test_ds4_flash_attention_parallel_index_scan_gpu() {
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
-static void test_ds4_indexer_score_packed_q4_gpu() {
-    std::fprintf(stderr, "  test_ds4_indexer_score_packed_q4_gpu ...");
-#if !defined(GGML_USE_HIP)
-    std::fprintf(stderr, " skipped (HIP-only candidate)\n");
-    return;
-#endif
-    ggml_backend_t backend = ggml_backend_cuda_init(0);
-    if (!backend) {
-        std::fprintf(stderr, " skipped (no GPU backend)\n");
-        return;
-    }
-
+static void run_ds4_indexer_score_packed_small_case(
+        ggml_backend_t backend, int n_tokens) {
     constexpr int dim = 128;
     constexpr int n_heads = 64;
-    constexpr int n_tokens = 4;
     constexpr int n_comp = 4160;
     constexpr int kv_start = 16384;
     constexpr int ratio = 4;
     ggml_context * ctx = make_test_context(4u << 20);
     TEST_ASSERT_MSG(ctx != nullptr, "ggml_init failed");
     if (!ctx) {
-        ggml_backend_free(backend);
         std::fprintf(stderr, " FAIL\n");
         return;
     }
@@ -2867,14 +2880,14 @@ static void test_ds4_indexer_score_packed_q4_gpu() {
         ctx, q, weights, comp, kv_start, ratio);
     ggml_set_output(scores);
     TEST_ASSERT_MSG(ggml_backend_supports_op(backend, scores),
-                    "GPU rejected packed-q4 indexer fixture");
+                    "GPU rejected packed-small indexer fixture");
 
     ggml_cgraph * graph = ggml_new_graph_custom(ctx, 16, false);
     ggml_build_forward_expand(graph, scores);
     ggml_gallocr_t alloc = ggml_gallocr_new(
         ggml_backend_get_default_buffer_type(backend));
     const bool allocated = ggml_gallocr_alloc_graph(alloc, graph);
-    TEST_ASSERT_MSG(allocated, "packed-q4 indexer graph allocation failed");
+    TEST_ASSERT_MSG(allocated, "packed-small indexer graph allocation failed");
     if (allocated) {
         std::vector<float> q_data((size_t) dim * n_heads * n_tokens);
         std::vector<float> weight_data((size_t) n_heads * n_tokens);
@@ -2896,37 +2909,35 @@ static void test_ds4_indexer_score_packed_q4_gpu() {
         ggml_backend_tensor_set(comp, comp_data.data(), 0,
                                 comp_data.size() * sizeof(ggml_fp16_t));
 
-        const char * previous = std::getenv("GGML_DS4_INDEXER_PACK_Q4");
-        const std::string previous_value = previous ? previous : "";
         std::vector<float> reference((size_t) n_comp * n_tokens);
         std::vector<float> candidate(reference.size());
         ScopedCudaGraphOverrides eager(
             /*disable_graphs=*/true,
             /*mmvq_max_ncols=*/0,
             /*skip_property_check=*/false);
-        unsetenv("GGML_DS4_INDEXER_PACK_Q4");
+        setenv("GGML_DS4_INDEXER_PACK_SMALL", "0", 1);
         TEST_ASSERT_MSG(
             ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS,
-            "reference q4 indexer score failed");
+            "reference small-CM indexer score failed");
         ggml_backend_tensor_get(scores, reference.data(), 0,
                                 reference.size() * sizeof(float));
 
-        setenv("GGML_DS4_INDEXER_PACK_Q4", "1", 1);
+        setenv("GGML_DS4_INDEXER_PACK_SMALL", "1", 1);
         TEST_ASSERT_MSG(
             ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS,
-            "packed q4 indexer score failed");
+            "packed small-CM indexer score failed");
         ggml_backend_tensor_get(scores, candidate.data(), 0,
                                 candidate.size() * sizeof(float));
         TEST_ASSERT_MSG(
             std::memcmp(reference.data(), candidate.data(),
                         reference.size() * sizeof(float)) == 0,
-            "packed q4 indexer changed score bits");
+            "packed small-CM indexer changed score bits");
 
         auto measure_us = [&](bool packed) {
             if (packed) {
-                setenv("GGML_DS4_INDEXER_PACK_Q4", "1", 1);
+                setenv("GGML_DS4_INDEXER_PACK_SMALL", "1", 1);
             } else {
-                unsetenv("GGML_DS4_INDEXER_PACK_Q4");
+                setenv("GGML_DS4_INDEXER_PACK_SMALL", "0", 1);
             }
             constexpr int warmups = 3;
             constexpr int iterations = 30;
@@ -2945,18 +2956,29 @@ static void test_ds4_indexer_score_packed_q4_gpu() {
         };
         const double reference_us = measure_us(false);
         const double packed_us = measure_us(true);
-        std::fprintf(stderr, " reference=%.1fus packed=%.1fus",
+        std::fprintf(stderr, " q%d=%.1f->%.1fus", n_tokens,
                      reference_us, packed_us);
-
-        if (previous) {
-            setenv("GGML_DS4_INDEXER_PACK_Q4", previous_value.c_str(), 1);
-        } else {
-            unsetenv("GGML_DS4_INDEXER_PACK_Q4");
-        }
     }
 
     ggml_gallocr_free(alloc);
     ggml_free(ctx);
+}
+
+static void test_ds4_indexer_score_packed_small_gpu() {
+    std::fprintf(stderr, "  test_ds4_indexer_score_packed_small_gpu ...");
+#if !defined(GGML_USE_HIP)
+    std::fprintf(stderr, " skipped (HIP-only candidate)\n");
+    return;
+#endif
+    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    if (!backend) {
+        std::fprintf(stderr, " skipped (no GPU backend)\n");
+        return;
+    }
+    ScopedEnvVar packed_small_guard("GGML_DS4_INDEXER_PACK_SMALL");
+    for (int n_tokens = 2; n_tokens <= 5; ++n_tokens) {
+        run_ds4_indexer_score_packed_small_case(backend, n_tokens);
+    }
     ggml_backend_free(backend);
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
@@ -4153,6 +4175,7 @@ int main() {
     test_safe_compressor_batch_tokens();
     test_hybrid_prefill_chunk_tokens();
     test_dspark_park_all_releases_drafter();
+    test_pflash_rejects_invalid_requests();
     test_dspark_raw_ring_rollback_after_wrap(backend);
     test_snapshot_save_restore();
     test_monolithic_snapshot_preserves_decode_state();
@@ -4168,7 +4191,7 @@ int main() {
 #if defined(GGML_USE_CUDA) || defined(GGML_USE_HIP)
     test_ds4_flash_attention_keep_cap_gpu();
     test_ds4_flash_attention_parallel_index_scan_gpu();
-    test_ds4_indexer_score_packed_q4_gpu();
+    test_ds4_indexer_score_packed_small_gpu();
     test_ds4_topk_block_radix_gpu();
     test_ds4_flash_attention_inverse_rope_fallback_gpu();
     test_hc_post_strided_split_gpu();
