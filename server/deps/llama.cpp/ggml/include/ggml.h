@@ -2386,6 +2386,19 @@ extern "C" {
             struct ggml_tensor  * a,
             int                   k);
 
+    // LuceBox CUDA path for Ling's hierarchical MoE router (strict AR and
+    // fixed-width speculative verification). Returns selected expert ids and
+    // writes normalized sigmoid weights in the same kernel.
+    GGML_API struct ggml_tensor * ggml_grouped_top_k_moe(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * logits,
+            struct ggml_tensor  * selection_bias,
+            struct ggml_tensor  * weights,
+            int                   n_groups,
+            int                   n_groups_used,
+            int                   n_group_score_used,
+            float                 weights_scale);
+
     GGML_API struct ggml_tensor * ggml_arange(
             struct ggml_context * ctx,
             float                 start,
@@ -2726,6 +2739,15 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * sx,
             struct ggml_tensor  * c);
+
+    // LuceBox strict-AR CUDA path. Computes a one-token causal convolution
+    // directly from x and the persistent K-1 state, then advances that state
+    // in the same kernel. Other backends retain ggml_ssm_conv + explicit copy.
+    GGML_API struct ggml_tensor * ggml_ssm_conv_state(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * c,
+            struct ggml_tensor  * state);
 
     // dflash extension: tree-mode ssm_conv for DDTree-style spec
     // decoding. parent_ids is an int32 tensor of shape [n_tokens, n_seqs]

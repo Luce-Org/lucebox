@@ -44,7 +44,9 @@ public:
     bool snapshot_kv() override;
     bool restore_kv() override;
     bool supports_fast_rollback() const override;
-    bool exact_fast_rollback() const override { return specla_active(); }
+    bool exact_fast_rollback() const override {
+        return specla_active() || kda_replayssm_active();
+    }
     bool rollback_failure_is_recoverable() const override { return !specla_active(); }
     bool rollback_to(int base_pos, int commit_n) override;
     bool finish_speculative_state() override;
@@ -64,6 +66,9 @@ public:
 
     bool embed_tokens(const int32_t * tokens, int n,
                       float * out) const override;
+
+    ggml_tensor * lm_head_tensor() override { return w_.output; }
+    ggml_backend * fused_head_backend() override { return backend_; }
 
     bool project_hidden_to_tokens(const float * hidden,
                                   int n_tokens,
@@ -111,9 +116,16 @@ private:
         return fast_rollback_ && pager_ == nullptr && !cache_.factor_k.empty();
     }
 
+    bool kda_replayssm_active() const {
+        return fast_rollback_ && pager_ == nullptr && w_.is_bailingmoe3 &&
+               cache_.kda_replay_state_ptrs != nullptr &&
+               !cache_.kda_replay_k.empty();
+    }
+
     // SpecLA chain commit: DeltaConstruct over the accepted prefix plus a
     // fused shift/append of raw convolution factors.
     bool rollback_to_specla(int base_pos, int commit_n);
+    bool rollback_to_kda_replayssm(int base_pos, int commit_n);
 
     // Cached vector form of capture layer IDs (built once in constructor).
     std::vector<int> capture_ids_;

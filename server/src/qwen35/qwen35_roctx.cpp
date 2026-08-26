@@ -6,6 +6,10 @@
 #include <cstdlib>
 #include <cstring>
 
+#if defined(DFLASH27B_BACKEND_CUDA)
+#  include <nvtx3/nvToolsExt.h>
+#endif
+
 #if defined(DFLASH27B_BACKEND_HIP)
 #  if defined(_WIN32)
 #    define WIN32_LEAN_AND_MEAN
@@ -13,6 +17,20 @@
 #  else
 #    include <dlfcn.h>
 #  endif
+#endif
+
+#if defined(DFLASH27B_BACKEND_CUDA)
+static int nvtx_push(const char * message) {
+    // NVTX tools may return a negative nesting level even while recording the
+    // push. Qwen35RoctxRange uses a non-negative result to decide whether it
+    // owes a pop, so normalize a submitted NVTX push to success.
+    (void)nvtxRangePushA(message);
+    return 0;
+}
+
+static int nvtx_pop() {
+    return nvtxRangePop();
+}
 #endif
 
 namespace dflash::common {
@@ -68,9 +86,14 @@ void roctx_close(void * handle) {
 #endif
 
 Qwen35RoctxCallbacks configured_callbacks() {
+    static const bool enabled = [] {
+        return
+            qwen35_roctx_env_enabled(std::getenv("DFLASH_QWEN35_MARKERS")) ||
+            qwen35_roctx_env_enabled(std::getenv("DFLASH_QWEN35_ROCTX"));
+    }();
+    if (!enabled) return {};
 #if defined(DFLASH27B_BACKEND_HIP)
     static const Qwen35RoctxCallbacks callbacks = [] {
-        if (!qwen35_roctx_env_enabled(std::getenv("DFLASH_QWEN35_ROCTX"))) return Qwen35RoctxCallbacks{};
         void * handle = roctx_open();
         auto push = handle ? roctx_find_push(handle) : nullptr;
         auto pop = handle ? roctx_find_pop(handle) : nullptr;
@@ -82,6 +105,8 @@ Qwen35RoctxCallbacks configured_callbacks() {
         return Qwen35RoctxCallbacks{push, pop};
     }();
     return callbacks;
+#elif defined(DFLASH27B_BACKEND_CUDA)
+    return Qwen35RoctxCallbacks{nvtx_push, nvtx_pop};
 #else
     return {};
 #endif

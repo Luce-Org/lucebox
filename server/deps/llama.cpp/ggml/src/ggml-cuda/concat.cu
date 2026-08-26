@@ -147,101 +147,70 @@ static bool concat_dim0_dense_transpose_f32_cuda(
     return true;
 }
 
-// contiguous kernels
-template <typename T>
-static __global__ void concat_dim0(const T * x, const T * y, T * dst, const int ne0, const int ne00) {
-    int nidx = threadIdx.x + blockIdx.x * blockDim.x;
-    if (nidx >= ne0) {
-        return;
-    }
+// Flatten contiguous concatenations into a one-dimensional launch. The old
+// geometry launched one mostly idle block for every higher-dimensional row
+// when ne0 was tiny (the Ling decode path has 120 such concats per token).
+template <typename T, int dim>
+static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE) concat_cont(
+        const T * x, const T * y, T * dst,
+        int64_t ne00, int64_t ne01, int64_t ne02,
+        int64_t ne0, int64_t ne1, int64_t ne2) {
+    static_assert(dim >= 0 && dim <= 2, "dim must be in [0, 2]");
+    const int64_t n = ne0 * ne1 * ne2;
 
-    int offset_dst =
-        nidx +
-        blockIdx.y * ne0 +
-        blockIdx.z * ne0 * gridDim.y;
-
-    if (nidx < ne00) { // src0
-        int offset_src =
-            nidx +
-            blockIdx.y * ne00 +
-            blockIdx.z * ne00 * gridDim.y;
-        dst[offset_dst] = x[offset_src];
-    } else {
-        int offset_src =
-            (nidx - ne00) +
-            blockIdx.y * (ne0 - ne00) +
-            blockIdx.z * (ne0 - ne00) * gridDim.y;
-        dst[offset_dst] = y[offset_src];
-    }
-}
-
-template <typename T>
-static __global__ void concat_dim1(const T * x, const T * y, T * dst, const int ne0, const int ne01) {
-    int nidx = threadIdx.x + blockIdx.x * blockDim.x;
-    if (nidx >= ne0) {
-        return;
-    }
-
-    int offset_dst =
-        nidx +
-        blockIdx.y * ne0 +
-        blockIdx.z * ne0 * gridDim.y;
-
-    if (blockIdx.y < (unsigned)ne01) { // src0
-        int offset_src =
-            nidx +
-            blockIdx.y * ne0 +
-            blockIdx.z * ne0 * ne01;
-        dst[offset_dst] = x[offset_src];
-    } else {
-        int offset_src =
-            nidx +
-            (blockIdx.y - ne01) * ne0 +
-            blockIdx.z * ne0 * (gridDim.y - ne01);
-        dst[offset_dst] = y[offset_src];
+    ggml_cuda_pdl_sync();
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+         i < n; i += (int64_t) blockDim.x * gridDim.x) {
+        if constexpr (dim == 0) {
+            const int64_t row = i / ne0;
+            const int64_t i0 = i - row * ne0;
+            dst[i] = i0 < ne00
+                ? x[row * ne00 + i0]
+                : y[row * (ne0 - ne00) + i0 - ne00];
+        } else if constexpr (dim == 1) {
+            const int64_t dst_plane = ne0 * ne1;
+            const int64_t src0_plane = ne0 * ne01;
+            const int64_t src1_plane = dst_plane - src0_plane;
+            const int64_t i2 = i / dst_plane;
+            const int64_t i01 = i - i2 * dst_plane;
+            dst[i] = i01 < src0_plane
+                ? x[i2 * src0_plane + i01]
+                : y[i2 * src1_plane + i01 - src0_plane];
+        } else {
+            const int64_t src0_size = ne0 * ne1 * ne02;
+            dst[i] = i < src0_size ? x[i] : y[i - src0_size];
+        }
     }
 }
 
 template <typename T>
-static __global__ void concat_dim2(const T * x, const T * y, T * dst, const int ne0, const int ne02) {
-    int nidx = threadIdx.x + blockIdx.x * blockDim.x;
-    if (nidx >= ne0) {
-        return;
-    }
+static void concat_cont_cuda(
+        const T * x, const T * y, T * dst,
+        int64_t ne00, int64_t ne01, int64_t ne02,
+        int64_t ne0, int64_t ne1, int64_t ne2,
+        int dim, cudaStream_t stream) {
+    const int64_t n = ne0 * ne1 * ne2;
+    const int num_blocks = (int) ((n + CUDA_CONCAT_BLOCK_SIZE - 1) /
+                                  CUDA_CONCAT_BLOCK_SIZE);
+    const ggml_cuda_kernel_launch_params launch_params(
+        (dim3) num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream);
 
-    int offset_dst =
-        nidx +
-        blockIdx.y * ne0 +
-        blockIdx.z * ne0 * gridDim.y;
-
-    if (blockIdx.z < (unsigned)ne02) { // src0
-        int offset_src =
-            nidx +
-            blockIdx.y * ne0 +
-            blockIdx.z * ne0 * gridDim.y;
-        dst[offset_dst] = x[offset_src];
-    } else {
-        int offset_src =
-            nidx +
-            blockIdx.y * ne0 +
-            (blockIdx.z - ne02) * ne0 *  gridDim.y;
-        dst[offset_dst] = y[offset_src];
+    switch (dim) {
+        case 0:
+            ggml_cuda_kernel_launch(concat_cont<T, 0>, launch_params,
+                x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2);
+            break;
+        case 1:
+            ggml_cuda_kernel_launch(concat_cont<T, 1>, launch_params,
+                x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2);
+            break;
+        case 2:
+            ggml_cuda_kernel_launch(concat_cont<T, 2>, launch_params,
+                x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2);
+            break;
+        default:
+            GGML_ABORT("Invalid contiguous concat dim: %d", dim);
     }
-}
-
-template <typename T>
-static void concat_cuda(const T * x, const T * y, T * dst, int ne00, int ne01, int ne02, int ne0, int ne1, int ne2, int dim, cudaStream_t stream) {
-    int num_blocks = (ne0 + CUDA_CONCAT_BLOCK_SIZE - 1) / CUDA_CONCAT_BLOCK_SIZE;
-    dim3 gridDim(num_blocks, ne1, ne2);
-    if (dim == 0) {
-        concat_dim0<<<gridDim, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(x, y, dst, ne0, ne00);
-        return;
-    }
-    if (dim == 1) {
-        concat_dim1<<<gridDim, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(x, y, dst, ne0, ne01);
-        return;
-    }
-    concat_dim2<<<gridDim, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(x, y, dst, ne0, ne02);
 }
 
 // non-contiguous kernel (slow)
@@ -315,7 +284,7 @@ static void concat_cuda_typed(ggml_backend_cuda_context & ctx, const ggml_tensor
 
         if (dim != 3) {
             for (int i3 = 0; i3 < dst->ne[3]; i3++) {
-                concat_cuda(
+                concat_cont_cuda(
                         src0_d + i3 * (src0->nb[3] / sizeof(T)),
                         src1_d + i3 * (src1->nb[3] / sizeof(T)),
                         dst_d + i3 * ( dst->nb[3] / sizeof(T)),

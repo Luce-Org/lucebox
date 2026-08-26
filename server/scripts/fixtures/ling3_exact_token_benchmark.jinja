@@ -1,0 +1,6 @@
+{#-
+Benchmark-only Ling template. It reproduces the exact long-running Bailing
+prompt used for matched kernel throughput tests. Do not use it for serving:
+the model's embedded Bailing V3 template is the correct production template.
+-#}
+{{- bos_token + '<role>HUMAN</role>' + messages[0].content + '<role>ASSISTANT</role>' -}}

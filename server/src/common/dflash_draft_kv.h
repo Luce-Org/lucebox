@@ -44,6 +44,12 @@ struct DraftKvState {
     int a_step = 0;      // fold-in append capacity per step
     int trash_slot = 0;  // destination for padded append rows
     int fc_in = 0;
+    ggml_type feature_type = GGML_TYPE_F32;
+    // Optional stable, non-owning feature ring on `backend`. When present,
+    // the append graph gathers rows directly from it instead of copying them
+    // through ap_feat before every speculative block.
+    ggml_tensor * feature_source = nullptr;
+    int feature_source_cap = 0;
     bool any_full = false, any_swa = false;
 
     // persistent device memory: caches + every graph input.
@@ -55,9 +61,11 @@ struct DraftKvState {
     ggml_tensor * noise_rows = nullptr;  // [q_len] i32 (static)
     ggml_tensor * mask_full  = nullptr;  // [kv_total, q_len] f16
     ggml_tensor * mask_swa   = nullptr;  // [kv_total, q_len] f16
-    ggml_tensor * ap_feat    = nullptr;  // [fc_in, a_step] f32
+    ggml_tensor * ap_feat    = nullptr;  // [fc_in, a_step], copy-path only
+    ggml_tensor * ap_source_rows = nullptr; // [a_step] i32, gather-path only
     ggml_tensor * ap_pos     = nullptr;  // [a_step] i32
     ggml_tensor * ap_rows    = nullptr;  // [a_step] i32
+    ggml_tensor * dspark_seed = nullptr; // [1] i32, integrated Markov chain
 
     // the once-built step graph (fold-in append + noise forward)
     std::vector<uint8_t> meta_arena;
@@ -66,10 +74,12 @@ struct DraftKvState {
     ggml_gallocr_t  galloc = nullptr;
     ggml_tensor *   hidden_states = nullptr;
     ggml_tensor *   logits        = nullptr;  // iff lm_head passed at init
+    std::vector<ggml_tensor *> dspark_tokens; // corrected ids, one per noise row
 
     // host bookkeeping
     const void *          built_for = nullptr;  // DraftWeights the graph was built against
     int64_t               next_pos = 0;  // first ctx position not yet appended
+    bool                  noise_tail_initialized = false;
     std::vector<int32_t>  slot_pos;      // absolute position per ring slot, -1 empty
     std::vector<uint16_t> mask_hbuf;
     std::vector<int32_t>  i32_hbuf;
@@ -81,7 +91,11 @@ bool draft_kv_init(DraftKvState & st,
                    const DraftWeights & dw,
                    ggml_backend_t backend,
                    int cap,
-                   ggml_tensor * lm_head);
+                   ggml_tensor * lm_head,
+                   ggml_type feature_type = GGML_TYPE_F32,
+                   ggml_tensor * feature_source = nullptr,
+                   int feature_source_cap = 0,
+                   int dspark_output_rows = 0);
 
 // Invalidate all cached rows (new/rewound request). Cheap; the next
 // begin_step bulk-appends the live window from the feature ring.

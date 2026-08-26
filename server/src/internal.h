@@ -143,6 +143,23 @@ struct TargetLayer {
     float ffn_swiglu_clamp_shexp = 0.0f;
 };
 
+// Ling 3 checkpoints append one native multi-token-prediction (MTP) block
+// after the autoregressive trunk.  It consumes the target's final hidden
+// state together with the embedding of the exact next token, then runs one
+// ordinary MLA + MoE block and the shared LM head to propose the following
+// token.  The block tensors live in TargetWeights' normal GGUF context and
+// weight buffer; this struct is only a set of non-owning handles.
+struct BailingMtpWeights {
+    bool enabled = false;
+    int layer_index = -1;
+
+    TargetLayer layer;
+    ggml_tensor * eh_proj    = nullptr;  // [2 * hidden, hidden]
+    ggml_tensor * enorm      = nullptr;  // token-embedding RMS norm
+    ggml_tensor * hnorm      = nullptr;  // target-hidden RMS norm
+    ggml_tensor * final_norm = nullptr;  // post-block RMS norm
+};
+
 // CPU-side embedder: keeps a mmap of the GGUF alive and knows how to
 // dequantize individual rows of the quantized tok_embd tensor on demand.
 // This matches llama.cpp's behavior of running embedding get_rows on CPU
@@ -183,6 +200,7 @@ struct TargetWeights {
     ggml_tensor * out_norm = nullptr;        // [hidden]
     ggml_tensor * output   = nullptr;        // [hidden, vocab]  (lm_head)
     std::shared_ptr<MoeHybridStorage> moe_hybrid; // optional hybrid storage (hot/cold expert split)
+    BailingMtpWeights mtp;                    // optional embedded Ling NextN block
 
     // Metadata from GGUF (validated at load time)
     int full_attention_interval = 4;
@@ -359,6 +377,10 @@ struct DraftWeights {
     int n_target_layers = DFLASH27B_DRAFT_N_TARGET_LAYERS;  // captured target layers (5)
     std::vector<int> capture_layer_ids;                     // explicit captured target-layer ids (GGUF dflash.target_layer_ids); empty = derive from count
     int mask_token_id   = DFLASH27B_DRAFT_MASK_TOKEN_ID;    // noise mask token
+    // DSpark checkpoints normally predict from every masked/anchor slot.  The
+    // older DFlash layout reserves slot 0 for the already-known seed instead.
+    // This changes the target verify width from block_size to block_size + 1.
+    bool sample_from_anchor = false;
 
     // Optional Domino causal correction head. When present, greedy chain
     // speculative decode corrects each draft token with a lightweight GRU
@@ -459,6 +481,24 @@ struct TargetCache {
     std::vector<ggml_tensor *> conv_input_cache_alt;// SpecLA factor bank 1
     ggml_tensor * conv_factor_all = nullptr;
     ggml_tensor * conv_factor_all_alt = nullptr;
+
+    // Ling/Bailing KDA ReplaySSM factors. A verify captures the raw recurrence
+    // inputs instead of materializing one dense SxS state per candidate token:
+    //   kda_replay_{k,v,g}_all: [S, H, n_delta, max_q_len] f32
+    //   kda_replay_beta_all:    [H, n_delta, max_q_len] f32
+    // The token axis is outermost, so one fused commit kernel can replay an
+    // accepted prefix across every recurrent layer. Per-layer vectors are
+    // strided views used by graph-side capture copies.
+    ggml_tensor * kda_replay_k_all = nullptr;
+    ggml_tensor * kda_replay_v_all = nullptr;
+    ggml_tensor * kda_replay_g_all = nullptr;
+    ggml_tensor * kda_replay_beta_all = nullptr;
+    std::vector<ggml_tensor *> kda_replay_k;
+    std::vector<ggml_tensor *> kda_replay_v;
+    std::vector<ggml_tensor *> kda_replay_g;
+    std::vector<ggml_tensor *> kda_replay_beta;
+    // Device array of n_delta pointers to the durable [S,S,H] state tensors.
+    ggml_tensor * kda_replay_state_ptrs = nullptr;
 
     // SpecLA factor buffers (allocated instead of ssm_intermediate when
     // DFLASH_SPECLA=1 on the single-target path). Two token-major banks let a
@@ -729,6 +769,15 @@ struct DeltaNetCapture {
     ggml_tensor * ssm_intermediate_states = nullptr;
     ggml_tensor * conv_input              = nullptr;
 
+    // Ling/Bailing KDA ReplaySSM capture. These hold post-L2-normalized K,
+    // raw V, vector log-decay G, and scalar-per-head beta exactly as consumed
+    // by the fused KDA recurrence. They remain null for ordinary Gated
+    // DeltaNet models.
+    ggml_tensor * kda_replay_k    = nullptr;
+    ggml_tensor * kda_replay_v    = nullptr;
+    ggml_tensor * kda_replay_g    = nullptr;
+    ggml_tensor * kda_replay_beta = nullptr;
+
     // SpecLA factor capture (DFLASH_SPECLA=1, docs/SPECLA.md). Persistent F32
     // aliases into the bank written by this verify. In the HLD path the
     // historical field names hold raw serial-recurrence terms:
@@ -770,12 +819,22 @@ struct QwenGraphInputs {
     bool          capture_layers; // if true, write captured layer features into cache.target_feat
     bool          capture_delta_intermediate = false; // if true, populate out_delta_captures
     bool          capture_moe_router = false; // if true, expose selected expert ids for MoE layers
+    // CUDA-only Ling AR fast path: the SSM-conv kernel writes the next
+    // persistent convolution state while those values are already resident.
+    bool          bailing_fuse_conv_state = false;
+    // CUDA-only Ling AR fast path: one kernel performs hierarchical group
+    // scoring, expert selection, and selected-weight normalization.
+    bool          bailing_fuse_grouped_router = false;
     int           fa_window = 0;  // sliding window for FA layers: 0 = full attention
     int           logits_tail_rows = 0; // compute logits only for last n rows; 0 = all
     ggml_tensor * parent_ids = nullptr; // [n_tokens] i32; tree mode when non-null
     // [n_tokens,n_head_kv] i64 physical destination rows for the
     // ggml_set_rows KV write; step-invariant.
     ggml_tensor * kv_write_rows = nullptr;
+    // Optional [n_tokens] i32 target-feature ring destinations. When present,
+    // capture slices are concatenated and written with set_rows so the graph
+    // topology is independent of kv_start.
+    ggml_tensor * target_feat_rows = nullptr;
     ggml_tensor * paged_block_table = nullptr; // [max_blocks,n_seqs] i32
     // [n_seqs] i32; valid cached K/V tokens per sequence.
     ggml_tensor * paged_kv_seq_lens = nullptr;
@@ -853,6 +912,9 @@ struct QwenGraphOutputs {
     // [vocab, n_logits_rows] f32; row count is selected by the logits
     // projection controls in QwenGraphInputs.
     ggml_tensor * logits;
+    // Full final-normalized trunk states, before any LM-head row gather/view.
+    // Ling's embedded MTP block consumes these directly on the same backend.
+    ggml_tensor * hidden_states = nullptr;
     // One entry per delta-net layer (48 for qwen35-27b). Only populated when
     // QwenGraphInputs::capture_delta_intermediate is true. Tensors are graph
     // views marked as ggml_set_output() so their data persists after
@@ -876,6 +938,23 @@ QwenGraphOutputs build_qwen35_graph(
     const TargetWeights &  w,
     TargetCache &          cache,
     const QwenGraphInputs & in);
+
+// Build Ling's embedded MTP fusion + one-layer MLA/MoE predictor.  The MTP
+// tensor handles are owned by the main TargetWeights allocation; `cache` is
+// the predictor's independent one-layer MLA cache.
+QwenGraphOutputs build_bailingmoe3_mtp_graph(
+    ggml_context *         ctx,
+    ggml_cgraph *          gf,
+    const TargetWeights &  w,
+    TargetCache &          cache,
+    ggml_tensor *          input_embed,
+    ggml_tensor *          target_hidden,
+    ggml_tensor *          positions,
+    ggml_tensor *          attn_mask,
+    ggml_tensor *          kv_write_rows,
+    int                    kv_start,
+    int                    n_tokens,
+    int                    logits_tail_rows);
 
 // Build a single-layer forward graph. Mirrors build_qwen35_graph but processes
 // only one layer, taking `inp` as the input activation and returning the output.

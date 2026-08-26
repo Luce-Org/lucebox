@@ -3552,7 +3552,11 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_ssm_scan(ctx, dst);
             break;
         case GGML_OP_TOP_K:
-            ggml_cuda_op_top_k(ctx, dst);
+            if (ggml_get_op_params_i32(dst, 0) == 1) {
+                ggml_cuda_op_grouped_topk_moe(ctx, dst);
+            } else {
+                ggml_cuda_op_top_k(ctx, dst);
+            }
             break;
         case GGML_OP_ARGSORT:
             ggml_cuda_op_argsort(ctx, dst);
@@ -6216,10 +6220,15 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             }
         }
         case GGML_OP_SSM_CONV: {
-            if (ggml_get_op_params_i32(op, 0) == 1) {
+            const int mode = ggml_get_op_params_i32(op, 0);
+            if (mode == 1) {
                 // Specla layout: x is [d_inner, n_tokens], so d_inner = ne[0]
                 // and the kernel guards the final partial 128-channel block.
                 return true;
+            }
+            if (mode == 2) {
+                // Direct-state AR layout: x is [d_inner, 1, n_sequences].
+                return op->src[0]->ne[0] % 128 == 0;
             }
             // assumes d_inner % threads == 0
             return op->src[0]->ne[1] % 128 == 0;

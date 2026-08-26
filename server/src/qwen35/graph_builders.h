@@ -134,7 +134,22 @@ bool build_target_step(
     const QwenPrefillSegment * prefill_segments = nullptr,
     int n_prefill_segments = 0,
     int n_logits_rows = 0,
-    bool compact_slots = false);
+    bool compact_slots = false,
+    // Single-request chain verify whose position-dependent destinations are
+    // supplied as inputs, allowing Ling's live graph/CUDA graph to replay.
+    bool stable_chain_verify = false);
+
+// Ling embedded-MTP step.  Runs the trained fusion projection plus the
+// checkpoint's one MLA/MoE predictor layer against its independent cache.
+bool build_bailingmoe3_mtp_step(
+    StepGraph & sg,
+    const TargetWeights & w,
+    TargetCache & mtp_cache,
+    ggml_backend_t backend,
+    int kv_start,
+    int n_tokens,
+    int logits_tail_rows,
+    int kq_stride_pad = 256);
 
 // Full target forward: DDTree tree-verify mode.
 bool build_target_step_tree(

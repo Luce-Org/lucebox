@@ -5,7 +5,9 @@
 #include "ggml-cuda.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
+#include <mutex>
 
 #if defined(GGML_USE_HIP)
 #define GGML_COMMON_DECL_HIP
@@ -29,6 +31,7 @@
 #include <cstdio>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #if defined(GGML_USE_HIP)
@@ -52,6 +55,7 @@
 #define GGML_CUDA_CC_TURING          750
 #define GGML_CUDA_CC_AMPERE          800
 #define GGML_CUDA_CC_ADA_LOVELACE    890
+#define GGML_CUDA_CC_HOPPER          900
 // While BW spans CC 1000, 1100 & 1200, we are integrating Tensor Core instructions available to 1200 family, see
 // https://docs.nvidia.com/cutlass/media/docs/cpp/blackwell_functionality.html#blackwell-sm120-gemms
 #define GGML_CUDA_CC_BLACKWELL       1200
@@ -108,6 +112,27 @@
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11070
 #    define GGML_CUDA_USE_CUB
 #endif  // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11070
+
+// Programmatic Dependent Launch lets a dependent kernel begin its prologue
+// before its predecessor has fully retired. CUDA 12.3 fixed the remaining
+// MSVC host-side issue; Linux toolkits have supported the launch API since
+// CUDA 11.8. The device-side helpers compile to no-ops below Hopper.
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && \
+    (CUDART_VERSION >= 12030 || (!(defined(_MSC_VER) && !defined(__clang__)) && CUDART_VERSION >= 11080))
+#    define GGML_CUDA_USE_PDL
+#endif
+
+static __device__ __forceinline__ void ggml_cuda_pdl_sync() {
+#if defined(GGML_CUDA_USE_PDL) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
+    cudaGridDependencySynchronize();
+#endif
+}
+
+static __device__ __forceinline__ void ggml_cuda_pdl_lc() {
+#if defined(GGML_CUDA_USE_PDL) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
 
 // rocPRIM ships hipCUB, a CUB-compatible device-sort API. Enable it so argsort
 // and top-k support ncols > 1024, including DS4's long-context indexer; the
@@ -1552,3 +1577,128 @@ struct ggml_cuda_mm_fusion_args_device {
     float gate_value_scale = 1.0f;
     float x_value_scale = 1.0f;
 };
+
+struct ggml_cuda_kernel_launch_params {
+    dim3 block_nums;
+    dim3 block_dims;
+    size_t shmem;
+    cudaStream_t stream;
+
+    ggml_cuda_kernel_launch_params(
+            const dim3 & block_nums_, const dim3 & block_dims_,
+            const size_t shmem_, const cudaStream_t stream_) :
+        block_nums(block_nums_), block_dims(block_dims_),
+        shmem(shmem_), stream(stream_) {}
+
+    ggml_cuda_kernel_launch_params(
+            const dim3 & block_nums_, const dim3 & block_dims_,
+            const int shmem_, const cudaStream_t stream_) :
+        block_nums(block_nums_), block_dims(block_dims_),
+        shmem((size_t) shmem_), stream(stream_) {}
+};
+
+#if defined(GGML_CUDA_USE_PDL)
+struct ggml_cuda_pdl_config {
+    cudaLaunchAttribute attr;
+    cudaLaunchConfig_t cfg;
+
+    explicit ggml_cuda_pdl_config(
+            const ggml_cuda_kernel_launch_params & params) {
+        attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attr.val.programmaticStreamSerializationAllowed = 1;
+
+        cfg = {};
+        cfg.gridDim = params.block_nums;
+        cfg.blockDim = params.block_dims;
+        cfg.dynamicSmemBytes = params.shmem;
+        cfg.stream = params.stream;
+        cfg.attrs = &attr;
+        cfg.numAttrs = 1;
+    }
+
+    ggml_cuda_pdl_config(const ggml_cuda_pdl_config &) = delete;
+    ggml_cuda_pdl_config & operator=(const ggml_cuda_pdl_config &) = delete;
+    ggml_cuda_pdl_config & operator=(ggml_cuda_pdl_config &&) = delete;
+};
+
+static bool ggml_cuda_kernel_can_use_pdl(const void * kernel) {
+    const int device = ggml_cuda_get_device();
+
+    struct cache_key {
+        int device;
+        const void * kernel;
+
+        bool operator==(const cache_key & other) const {
+            return device == other.device && kernel == other.kernel;
+        }
+    };
+    struct cache_key_hash {
+        static size_t mix(size_t x) {
+            std::uint64_t y = x;
+            constexpr std::uint64_t m = 0xe9846af9b1a615dULL;
+            y ^= y >> 32;
+            y *= m;
+            y ^= y >> 32;
+            y *= m;
+            y ^= y >> 28;
+            return static_cast<size_t>(y);
+        }
+        size_t operator()(const cache_key & key) const {
+            size_t h = 42;
+            h = mix(h + key.device);
+            return mix(h + reinterpret_cast<size_t>(key.kernel));
+        }
+    };
+
+    static std::mutex cache_mutex;
+    static std::unordered_map<cache_key, bool, cache_key_hash> cache;
+    const cache_key key{device, kernel};
+
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    const auto it = cache.find(key);
+    if (it != cache.end()) {
+        return it->second;
+    }
+
+    cudaFuncAttributes attr = {};
+    CUDA_CHECK(cudaFuncGetAttributes(&attr, kernel));
+    // PDL device primitives are emitted only in Hopper-or-newer PTX. Do not
+    // enable the launch attribute for older PTX forward-JITed to a new GPU.
+    const bool enabled = attr.ptxVersion >= 90;
+    cache.emplace(key, enabled);
+    return enabled;
+}
+#endif
+
+// CUDA's compiler may legally hoist restricted loads across a PDL dependency
+// barrier. Enrolled kernels use this alias so the barrier remains effective.
+#if defined(GGML_CUDA_USE_PDL) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
+#    define GGML_CUDA_RESTRICT
+#else
+#    define GGML_CUDA_RESTRICT __restrict__
+#endif
+
+template<typename Kernel, typename... Args>
+static __inline__ void ggml_cuda_kernel_launch(
+        Kernel kernel, const ggml_cuda_kernel_launch_params & launch_params,
+        Args && ... args) {
+#if defined(GGML_CUDA_USE_PDL)
+    static const bool pdl_enabled = []() {
+        const char * value = std::getenv("GGML_CUDA_PDL");
+        return value == nullptr || std::atoi(value) != 0;
+    }();
+
+    if (pdl_enabled && ggml_cuda_kernel_can_use_pdl(
+            reinterpret_cast<const void *>(kernel))) {
+        ggml_cuda_pdl_config pdl(launch_params);
+        CUDA_CHECK(cudaLaunchKernelEx(
+            &pdl.cfg, kernel, std::forward<Args>(args)...));
+        return;
+    }
+#endif
+
+    kernel<<<launch_params.block_nums, launch_params.block_dims,
+             launch_params.shmem, launch_params.stream>>>(
+        std::forward<Args>(args)...);
+    CUDA_CHECK(cudaGetLastError());
+}

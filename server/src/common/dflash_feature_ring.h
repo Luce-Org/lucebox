@@ -45,7 +45,8 @@ bool draft_feature_mirror_init(DraftFeatureMirror & mirror,
                                int target_device,
                                int cap,
                                int n_target_layers,
-                               int hidden_size);
+                               int hidden_size,
+                               ggml_type preferred_storage_type = GGML_TYPE_COUNT);
 
 // Check whether the mirror ring buffer can provide a contiguous view of
 // ctx_len slots ending at committed. Returns true and writes slot0 (the

@@ -964,6 +964,7 @@ void free_target_weights(TargetWeights & w) {
     w.tok_embd = nullptr;
     w.out_norm = nullptr;
     w.output   = nullptr;
+    w.mtp      = BailingMtpWeights{};
 }
 
 } // namespace dflash::common

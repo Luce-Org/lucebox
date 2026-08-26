@@ -611,8 +611,12 @@ if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
     set_source_files_properties(src/common/geometric_draft_topk_cuda.cu
         PROPERTIES LANGUAGE HIP)
     # Fused SpecLA accepted-state commit (one launch for all delta layers).
-    target_sources(dflash_common PRIVATE src/common/specla_commit_cuda.cu)
+    target_sources(dflash_common PRIVATE
+        src/common/specla_commit_cuda.cu
+        src/common/kda_replayssm_cuda.cu)
     set_source_files_properties(src/common/specla_commit_cuda.cu
+        PROPERTIES LANGUAGE HIP)
+    set_source_files_properties(src/common/kda_replayssm_cuda.cu
         PROPERTIES LANGUAGE HIP)
     # PUBLIC so test consumers (test_dflash / test_draft_topk_cuda) also take the
     # GPU draft top-K path instead of the CPU fallback.
@@ -649,7 +653,8 @@ elseif(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
         src/flashprefill_select.cpp
         src/flashprefill.cpp
         src/common/geometric_draft_topk_cuda.cu
-        src/common/specla_commit_cuda.cu)
+        src/common/specla_commit_cuda.cu
+        src/common/kda_replayssm_cuda.cu)
     # PUBLIC so consumers (e.g. the test_dflash executable) also see the macro
     # and take the GPU draft top-K path instead of the CPU fallback. Same macro
     # name as the HIP branch above (backend-neutral).
@@ -1575,6 +1580,7 @@ if(DFLASH27B_TESTS)
             test/test_drafter_early_exit_score_range.cpp
             test/test_drafter_tail_capture_guard.cpp
             test/test_drafter_warm_path_regression.cpp
+            test/test_dspark_markov_chain.cpp
             test/test_qwen3_buffer_plan.cpp
             test/test_model_test_paths.cpp
             test/test_gguf_mmap.cpp
@@ -1935,6 +1941,15 @@ if(DFLASH27B_TESTS)
         add_test(NAME batched_gdn_cpu COMMAND test_batched_gdn --cpu)
         if(TARGET check)
             add_dependencies(check test_batched_gdn)
+        endif()
+    endif()
+    if(DFLASH27B_GPU_BACKEND STREQUAL "cuda"
+       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_grouped_topk_moe.cpp")
+        dflash_add_ggml_gpu_executable(
+            test_grouped_topk_moe test/test_grouped_topk_moe.cpp)
+        add_test(NAME grouped_topk_moe COMMAND test_grouped_topk_moe)
+        if(TARGET check)
+            add_dependencies(check test_grouped_topk_moe)
         endif()
     endif()
     if((DFLASH27B_GPU_BACKEND STREQUAL "cuda" OR

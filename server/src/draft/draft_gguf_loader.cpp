@@ -127,9 +127,10 @@ bool load_draft_gguf(const std::string & path,
         arch_s = arch;
         if (arch_s != "qwen35-dflash-draft" &&
             arch_s != "dflash-draft" &&
+            arch_s != "dflash" &&
             arch_s != "gemma4-dflash-draft") {
             set_last_error(std::string("unexpected draft arch: ") + arch +
-                           " (expected qwen35-dflash-draft, dflash-draft, or gemma4-dflash-draft)");
+                           " (expected qwen35-dflash-draft, dflash-draft, dflash, or gemma4-dflash-draft)");
             gguf_free(gctx);
             return false;
         }
@@ -149,6 +150,12 @@ bool load_draft_gguf(const std::string & path,
         if (id < 0) return fallback;
         return gguf_get_val_f32(gctx, id);
     };
+    auto read_bool = [&](const char * suffix, bool fallback) -> bool {
+        std::snprintf(key, sizeof(key), "%s.%s", A, suffix);
+        const int64_t id = gguf_find_key(gctx, key);
+        if (id < 0 || gguf_get_kv_type(gctx, id) != GGUF_TYPE_BOOL) return fallback;
+        return gguf_get_val_bool(gctx, id);
+    };
 
     const uint32_t n_embd    = read_u32("embedding_length",        0);
     const uint32_t n_layer   = read_u32("block_count",             0);
@@ -156,7 +163,11 @@ bool load_draft_gguf(const std::string & path,
     const uint32_t n_head    = read_u32("attention.head_count",    0);
     const uint32_t n_head_kv = read_u32("attention.head_count_kv", 0);
     const uint32_t head_dim  = read_u32("attention.key_length",    0);
-    const uint32_t block_sz  = read_u32("dflash.block_size",       0);
+    // Upstream llama.cpp uses the standard DFlash architecture and therefore
+    // writes `dflash.block_size`.  LuceBox's older private converters wrote
+    // `<arch>.dflash.block_size`; accept both without weakening validation.
+    const uint32_t block_sz  = read_u32("dflash.block_size",
+                                        read_u32("block_size", 0));
     uint32_t n_tgt_lay       = read_u32("dflash.n_target_layers",  0);
     const uint32_t domino_meta_enabled = read_u32("dflash.domino.enabled", 0);
     const uint32_t domino_meta_gru     = read_u32("dflash.domino.gru_hidden_dim", 0);
@@ -166,20 +177,33 @@ bool load_draft_gguf(const std::string & path,
     const uint32_t dspark_meta_rank    = read_u32("dflash.dspark.markov_rank", 0);
     const uint32_t dspark_meta_vocab   = read_u32("dflash.dspark.vocab_size", 0);
     const uint32_t dspark_meta_conf    = read_u32("dflash.dspark.confidence_dim", 0);
-    // Explicit captured target-layer ids (data-driven). Lets any DFlash drafter
-    // load without a hardcoded per-arch set; the array length also backstops
-    // n_target_layers when the scalar KV is absent.
+    // Explicit captured target-layer ids (data-driven).  Upstream's
+    // `dflash.target_layers` names target *layer inputs*, while LuceBox stores
+    // post-layer hidden states, hence the -1 conversion for that standard key.
+    // Legacy `dflash.target_layer_ids` already contains post-layer indices.
     {
         std::snprintf(key, sizeof(key), "%s.%s", A, "dflash.target_layer_ids");
-        const int64_t target_ids_id = gguf_find_key(gctx, key);
-        if (target_ids_id >= 0 &&
-            gguf_get_kv_type(gctx, target_ids_id) == GGUF_TYPE_ARRAY &&
-            gguf_get_arr_type(gctx, target_ids_id) == GGUF_TYPE_INT32) {
-            const uint32_t n = (uint32_t)gguf_get_arr_n(gctx, target_ids_id);
-            const int32_t * vals =
-                (const int32_t *)gguf_get_arr_data(gctx, target_ids_id);
-            out.capture_layer_ids.assign(vals, vals + n);
-            if (n_tgt_lay == 0) n_tgt_lay = n;
+        int64_t target_ids_id = gguf_find_key(gctx, key);
+        bool standard_layer_inputs = false;
+        if (target_ids_id < 0) {
+            std::snprintf(key, sizeof(key), "%s.%s", A, "target_layers");
+            target_ids_id = gguf_find_key(gctx, key);
+            standard_layer_inputs = target_ids_id >= 0;
+        }
+        if (target_ids_id >= 0 && gguf_get_kv_type(gctx, target_ids_id) == GGUF_TYPE_ARRAY) {
+            const enum gguf_type elem_type = gguf_get_arr_type(gctx, target_ids_id);
+            if (elem_type == GGUF_TYPE_INT32 || elem_type == GGUF_TYPE_UINT32) {
+                const uint32_t n = (uint32_t)gguf_get_arr_n(gctx, target_ids_id);
+                const void * vals = gguf_get_arr_data(gctx, target_ids_id);
+                out.capture_layer_ids.resize(n);
+                for (uint32_t i = 0; i < n; ++i) {
+                    const int64_t raw = elem_type == GGUF_TYPE_INT32
+                        ? (int64_t)((const int32_t *)vals)[i]
+                        : (int64_t)((const uint32_t *)vals)[i];
+                    out.capture_layer_ids[i] = (int)(raw - (standard_layer_inputs ? 1 : 0));
+                }
+                if (n_tgt_lay == 0) n_tgt_lay = n;
+            }
         }
     }
     if (n_tgt_lay == 0 && n_embd != 0) {
@@ -204,11 +228,42 @@ bool load_draft_gguf(const std::string & path,
     // Store GGUF-declared config into DraftWeights (replaces hardcoded defaults).
     out.block_size = (int)block_sz;
     out.n_target_layers = (int)n_tgt_lay;
+    out.sample_from_anchor = read_bool(
+        "dflash.sample_from_anchor", read_bool("sample_from_anchor", false));
 
-    // Propagate target model properties if available.
-    if (target) {
-        out.mask_token_id = target->mask_token_id;
+    // The mask token belongs to the draft checkpoint's tokenizer contract.
+    // Prefer the architecture-specific DFlash metadata emitted by both our
+    // converters and upstream llama.cpp.  Older files may only expose a
+    // generic tokenizer key or rely on the target-model value.
+    uint32_t inherited_mask = out.mask_token_id >= 0
+        ? (uint32_t)out.mask_token_id
+        : UINT32_MAX;
+    if (target && target->mask_token_id >= 0) {
+        inherited_mask = (uint32_t)target->mask_token_id;
     }
+    uint32_t draft_mask = get_u32_or(
+        gctx, "tokenizer.ggml.mask_token_id", inherited_mask);
+    draft_mask = get_u32_or(gctx, "dflash.mask_token_id", draft_mask);
+    draft_mask = read_u32("mask_token_id", draft_mask);
+    draft_mask = read_u32("dflash.mask_token_id", draft_mask);
+
+    const uint32_t mask_vocab = target && target->n_vocab > 0
+        ? (uint32_t)target->n_vocab
+        : dspark_meta_vocab;
+    if (draft_mask > (uint32_t)INT32_MAX ||
+        (mask_vocab != 0 && draft_mask >= mask_vocab)) {
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+            "draft GGUF: mask_token_id=%u is outside vocabulary size %u",
+            draft_mask, mask_vocab);
+        set_last_error(buf);
+        ggml_free(meta_ctx);
+        gguf_free(gctx);
+        return false;
+    }
+    out.mask_token_id = (int32_t)draft_mask;
+    std::fprintf(stderr, "[draft GGUF] mask token id: %d\n",
+                 out.mask_token_id);
 
     // Upper bounds on hparams. Guards against malformed/hostile GGUFs that
     // would otherwise trigger huge allocations or signed-int overflow when
@@ -256,7 +311,9 @@ bool load_draft_gguf(const std::string & path,
     };
 
     out.fc          = g_any("dflash.fc.weight", "dflash_fc.weight");
+    if (!out.fc) out.fc = g("fc.weight");
     out.hidden_norm = g_any("dflash.hidden_norm.weight", "dflash_hidden_norm.weight");
+    if (!out.hidden_norm) out.hidden_norm = g("enc.output_norm.weight");
     out.out_norm    = g("output_norm.weight");
     if (!out.fc || !out.hidden_norm || !out.out_norm) {
         set_last_error("draft GGUF: missing top-level tensors "
@@ -389,10 +446,10 @@ bool load_draft_gguf(const std::string & path,
     }
 
     out.dspark = DraftDSparkWeights{};
-    out.dspark.markov_w1    = g("dflash.dspark.markov.w1");
-    out.dspark.markov_w2    = g("dflash.dspark.markov.w2");
-    out.dspark.confidence_w = g("dflash.dspark.confidence.weight");
-    out.dspark.confidence_b = g("dflash.dspark.confidence.bias");
+    out.dspark.markov_w1    = g_any("dflash.dspark.markov.w1", "markov_w1.weight");
+    out.dspark.markov_w2    = g_any("dflash.dspark.markov.w2", "markov_w2.weight");
+    out.dspark.confidence_w = g_any("dflash.dspark.confidence.weight", "conf_proj.weight");
+    out.dspark.confidence_b = g_any("dflash.dspark.confidence.bias", "conf_proj.bias");
 
     const bool dspark_any =
         out.dspark.markov_w1 || out.dspark.markov_w2 ||
@@ -446,9 +503,10 @@ bool load_draft_gguf(const std::string & path,
         }
 
         out.dspark.enabled = true;
-        std::fprintf(stderr, "[draft GGUF] DSpark Markov head enabled: rank=%d vocab=%d confidence_dim=%d\n",
+        std::fprintf(stderr, "[draft GGUF] DSpark Markov head enabled: rank=%d vocab=%d confidence_dim=%d anchor_first=%s\n",
                      out.dspark.markov_rank, out.dspark.vocab_size,
-                     out.dspark.confidence_dim);
+                     out.dspark.confidence_dim,
+                     out.sample_from_anchor ? "true" : "false");
     }
 
     // GGUF Qwen3.6 drafters carry SWA metadata emitted by the converter:

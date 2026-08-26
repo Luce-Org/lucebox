@@ -84,6 +84,7 @@ struct DraftKvStepInputs {
     ggml_tensor * mask_full = nullptr;   // [kv_total, q_len] f16 (non-SWA layers)
     ggml_tensor * mask_swa = nullptr;    // [kv_total, q_len] f16 (SWA layers)
     ggml_tensor * lm_head = nullptr;     // optional fused projection
+    int           logits_rows = 0;       // 0 = all q_len rows
 };
 DraftGraphOutputs build_draft_kv_step(
     ggml_context *            ctx,

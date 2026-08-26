@@ -5498,6 +5498,41 @@ struct ggml_tensor * ggml_top_k(
     return result;
 }
 
+struct ggml_tensor * ggml_grouped_top_k_moe(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * logits,
+        struct ggml_tensor  * selection_bias,
+        struct ggml_tensor  * weights,
+        int                   n_groups,
+        int                   n_groups_used,
+        int                   n_group_score_used,
+        float                 weights_scale) {
+    GGML_ASSERT(logits->type == GGML_TYPE_F32);
+    GGML_ASSERT(selection_bias->type == GGML_TYPE_F32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_matrix(logits));
+    GGML_ASSERT(selection_bias->ne[0] == logits->ne[0]);
+    GGML_ASSERT(ggml_nelements(selection_bias) == logits->ne[0]);
+    GGML_ASSERT(weights->ne[1] == logits->ne[1]);
+    GGML_ASSERT(logits->ne[0] % n_groups == 0);
+    GGML_ASSERT(n_groups_used > 0 && n_groups_used <= n_groups);
+    GGML_ASSERT(n_group_score_used > 0 &&
+                n_group_score_used <= logits->ne[0] / n_groups);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_I32, weights->ne[0], weights->ne[1]);
+    ggml_set_op_params_i32(result, 0, 1); // grouped MoE TOP_K mode
+    ggml_set_op_params_i32(result, 1, n_groups);
+    ggml_set_op_params_i32(result, 2, n_groups_used);
+    ggml_set_op_params_i32(result, 3, n_group_score_used);
+    ggml_set_op_params_f32(result, 4, weights_scale);
+    result->op     = GGML_OP_TOP_K;
+    result->src[0] = logits;
+    result->src[1] = selection_bias;
+    result->src[2] = weights;
+    return result;
+}
+
 // ggml_arange
 
 struct ggml_tensor * ggml_arange(
@@ -5865,6 +5900,35 @@ struct ggml_tensor * ggml_ssm_conv(
     result->src[0] = sx;
     result->src[1] = c;
 
+    return result;
+}
+
+struct ggml_tensor * ggml_ssm_conv_state(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * c,
+        struct ggml_tensor  * state) {
+    GGML_ASSERT(ggml_is_3d(x));
+    GGML_ASSERT(ggml_is_matrix(c));
+    GGML_ASSERT(ggml_is_3d(state));
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(c->type == GGML_TYPE_F32);
+    GGML_ASSERT(state->type == GGML_TYPE_F32);
+
+    const int64_t d_conv  = c->ne[0];
+    const int64_t d_inner = c->ne[1];
+    const int64_t n_s     = x->ne[2];
+    GGML_ASSERT(x->ne[0] == d_inner && x->ne[1] == 1);
+    GGML_ASSERT(state->ne[0] == d_conv - 1);
+    GGML_ASSERT(state->ne[1] == d_inner && state->ne[2] == n_s);
+
+    struct ggml_tensor * result =
+        ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_inner, 1, n_s);
+    ggml_set_op_params_i32(result, 0, 2); // direct persistent-state mode
+    result->op     = GGML_OP_SSM_CONV;
+    result->src[0] = x;
+    result->src[1] = c;
+    result->src[3] = state;
     return result;
 }
 

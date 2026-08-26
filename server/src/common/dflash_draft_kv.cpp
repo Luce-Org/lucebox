@@ -1,4 +1,5 @@
 #include "dflash_draft_kv.h"
+#include "dspark_head.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -17,17 +18,49 @@ bool draft_kv_init(DraftKvState & st,
                    const DraftWeights & dw,
                    ggml_backend_t backend,
                    int cap,
-                   ggml_tensor * lm_head) {
+                   ggml_tensor * lm_head,
+                   ggml_type feature_type,
+                   ggml_tensor * feature_source,
+                   int feature_source_cap,
+                   int dspark_output_rows) {
     if (cap <= 0 || dw.block_size <= 0) return false;
+    if (feature_type != GGML_TYPE_F32 && feature_type != GGML_TYPE_BF16) {
+        std::fprintf(stderr, "[draft-kv] unsupported feature type %s\n",
+                     ggml_type_name(feature_type));
+        return false;
+    }
+    const int fc_in = dw.n_target_layers * dw.n_embd;
+    if (feature_source &&
+        (feature_source_cap <= 0 || feature_source->ne[0] != fc_in ||
+         feature_source->ne[1] < feature_source_cap ||
+         feature_source->type != feature_type)) {
+        std::fprintf(stderr,
+            "[draft-kv] invalid direct feature source: type=%s width=%lld "
+            "rows=%lld cap=%d expected_type=%s expected_width=%d\n",
+            ggml_type_name(feature_source->type),
+            (long long)feature_source->ne[0],
+            (long long)feature_source->ne[1], feature_source_cap,
+            ggml_type_name(feature_type), fc_in);
+        return false;
+    }
     static const bool disable_swa =
         std::getenv("DFLASH_DISABLE_DRAFT_SWA") != nullptr;
 
     st.cap        = cap;
     st.q_len      = dw.block_size;
-    st.a_step     = 2 * dw.block_size + 2;
+    // Anchor-first DSpark verifies [root + block] and can therefore commit at
+    // most block+1 rows. The wider legacy allocation exists for DDTree paths;
+    // DSpark does not enter DDTree, so evaluating twice as many padded feature
+    // rows only wastes FC and K/V projection work every speculative step.
+    st.a_step     = dw.dspark.enabled && dw.sample_from_anchor
+        ? dw.block_size + 1
+        : 2 * dw.block_size + 2;
     st.trash_slot = cap + dw.block_size;
     st.kv_total   = mask_align_up(cap + dw.block_size + 1, MASK_KV_PAD);
-    st.fc_in      = dw.n_target_layers * dw.n_embd;
+    st.fc_in      = fc_in;
+    st.feature_type = feature_type;
+    st.feature_source = feature_source;
+    st.feature_source_cap = feature_source ? feature_source_cap : 0;
     st.any_full = st.any_swa = false;
     for (int i = 0; i < dw.n_layer; i++) {
         if (dw.layers[i].is_swa && !disable_swa) st.any_swa = true;
@@ -57,9 +90,28 @@ bool draft_kv_init(DraftKvState & st,
         st.mask_full = ggml_new_tensor_2d(st.mem_ctx, GGML_TYPE_F16, st.kv_total, st.q_len);
     if (st.any_swa)
         st.mask_swa  = ggml_new_tensor_2d(st.mem_ctx, GGML_TYPE_F16, st.kv_total, st.q_len);
-    st.ap_feat = ggml_new_tensor_2d(st.mem_ctx, GGML_TYPE_F32, st.fc_in, st.a_step);
+    if (st.feature_source) {
+        st.ap_source_rows = ggml_new_tensor_1d(
+            st.mem_ctx, GGML_TYPE_I32, st.a_step);
+    } else {
+        st.ap_feat = ggml_new_tensor_2d(
+            st.mem_ctx, st.feature_type, st.fc_in, st.a_step);
+    }
     st.ap_pos  = ggml_new_tensor_1d(st.mem_ctx, GGML_TYPE_I32, st.a_step);
     st.ap_rows = ggml_new_tensor_1d(st.mem_ctx, GGML_TYPE_I32, st.a_step);
+    const bool integrated_dspark =
+        lm_head && dw.dspark.enabled && dw.sample_from_anchor;
+    if (integrated_dspark &&
+        (dspark_output_rows < 0 || dspark_output_rows > st.q_len)) {
+        std::fprintf(stderr,
+            "[draft-kv] invalid DSpark output rows %d (draft width %d)\n",
+            dspark_output_rows, st.q_len);
+        return false;
+    }
+    if (integrated_dspark) {
+        st.dspark_seed =
+            ggml_new_tensor_1d(st.mem_ctx, GGML_TYPE_I32, 1);
+    }
 
     st.mem_buf = ggml_backend_alloc_ctx_tensors(st.mem_ctx, backend);
     if (!st.mem_buf) {
@@ -83,7 +135,9 @@ bool draft_kv_init(DraftKvState & st,
 
     DraftKvAppendInputs ai{};
     ai.n_rows    = st.a_step;
-    ai.feat      = st.ap_feat;
+    ai.feat      = st.feature_source
+        ? ggml_get_rows(st.g_ctx, st.feature_source, st.ap_source_rows)
+        : st.ap_feat;
     ai.positions = st.ap_pos;
     ai.rows      = st.ap_rows;
     if (!build_draft_kv_append(st.g_ctx, st.gf, dw, st.cache, ai)) return false;
@@ -95,10 +149,21 @@ bool draft_kv_init(DraftKvState & st,
     si.mask_full   = st.mask_full;
     si.mask_swa    = st.mask_swa;
     si.lm_head     = lm_head;
+    si.logits_rows = integrated_dspark && dspark_output_rows > 0
+        ? dspark_output_rows
+        : st.q_len;
     DraftGraphOutputs go = build_draft_kv_step(st.g_ctx, st.gf, dw, st.cache, si);
     if (!go.hidden_states) return false;
     st.hidden_states = go.hidden_states;
     st.logits        = go.logits;
+    if (integrated_dspark &&
+        !dspark_build_greedy_markov_chain(
+            st.g_ctx, st.gf, dw, st.logits, st.dspark_seed,
+            st.dspark_tokens)) {
+        std::fprintf(stderr,
+            "[draft-kv] integrated DSpark Markov graph build failed\n");
+        return false;
+    }
     ggml_set_output(st.hidden_states);
     ggml_build_forward_expand(st.gf, st.hidden_states);
     if (st.logits) {
@@ -119,12 +184,17 @@ bool draft_kv_init(DraftKvState & st,
                             sizeof(int32_t) * nrows.size());
 
     st.built_for = &dw;
+    st.noise_tail_initialized = false;
     st.slot_pos.assign((size_t)st.cap, -1);
     st.next_pos = 0;
     std::fprintf(stderr,
         "[draft-kv] ctx-KV ring active: cap=%d kv_total=%d a_step=%d "
-        "layers=%d f16 cache %.1f MiB\n",
+        "layers=%d feature=%s source=%s dspark_head=%s rows=%zu f16 cache %.1f MiB\n",
         st.cap, st.kv_total, st.a_step, dw.n_layer,
+        ggml_type_name(st.feature_type),
+        st.feature_source ? "direct" : "copy",
+        st.dspark_tokens.empty() ? "separate" : "integrated",
+        st.dspark_tokens.size(),
         (double)(2ull * dw.n_layer * (size_t)kv_row * st.kv_total * 2) / (1024.0 * 1024.0));
     return true;
 }
@@ -143,11 +213,17 @@ void draft_kv_free(DraftKvState & st) {
     st.meta_arena.clear();
     st.meta_arena.shrink_to_fit();
     st.hidden_states = st.logits = nullptr;
+    st.ap_feat = st.ap_source_rows = st.ap_pos = st.ap_rows = nullptr;
+    st.dspark_seed = nullptr;
+    st.dspark_tokens.clear();
+    st.feature_source = nullptr;
+    st.feature_source_cap = 0;
     st.cache.k.clear();
     st.cache.v.clear();
     st.slot_pos.clear();
     st.next_pos = 0;
     st.built_for = nullptr;
+    st.noise_tail_initialized = false;
 }
 
 // One-shot append of [start, start+n) via temporary exact-size graphs
@@ -166,7 +242,13 @@ static bool draft_kv_bulk_append(DraftKvState & st,
         tp.no_alloc = true;
         ggml_context * tctx = ggml_init(tp);
         if (!tctx) return false;
-        ggml_tensor * feat = ggml_new_tensor_2d(tctx, GGML_TYPE_F32, st.fc_in, c);
+        ggml_tensor * feat = nullptr;
+        ggml_tensor * source_rows = nullptr;
+        if (st.feature_source) {
+            source_rows = ggml_new_tensor_1d(tctx, GGML_TYPE_I32, c);
+        } else {
+            feat = ggml_new_tensor_2d(tctx, st.feature_type, st.fc_in, c);
+        }
         ggml_tensor * tpos = ggml_new_tensor_1d(tctx, GGML_TYPE_I32, c);
         ggml_tensor * trow = ggml_new_tensor_1d(tctx, GGML_TYPE_I32, c);
         ggml_backend_buffer_t tbuf = ggml_backend_alloc_ctx_tensors(tctx, backend);
@@ -176,20 +258,32 @@ static bool draft_kv_bulk_append(DraftKvState & st,
             return false;
         }
 
-        bool ok = copy_feature_ring_range_to_tensor(ring, feat, start, c);
-        if (!ok) std::fprintf(stderr, "[draft-kv] bulk: ring copy failed (start=%d n=%d ring_cap=%d fc_in=%d ring_type=%d)\n",
-                              start, c, ring.cap, st.fc_in, (int)ring.storage_type);
+        bool ok = true;
+        if (!st.feature_source) {
+            ok = copy_feature_ring_range_to_tensor(ring, feat, start, c);
+            if (!ok) std::fprintf(stderr, "[draft-kv] bulk: ring copy failed (start=%d n=%d ring_cap=%d fc_in=%d ring_type=%d)\n",
+                                  start, c, ring.cap, st.fc_in, (int)ring.storage_type);
+        }
         if (ok) {
             pos.resize((size_t)c);
             rows.resize((size_t)c);
+            std::vector<int32_t> source_idx;
+            if (st.feature_source) source_idx.resize((size_t)c);
             for (int i = 0; i < c; i++) {
                 const int p = start + i;
                 pos[(size_t)i]  = p;
                 rows[(size_t)i] = p % st.cap;
+                if (st.feature_source) {
+                    source_idx[(size_t)i] = p % st.feature_source_cap;
+                }
                 st.slot_pos[(size_t)(p % st.cap)] = p;
             }
             ggml_backend_tensor_set(tpos, pos.data(), 0, sizeof(int32_t) * pos.size());
             ggml_backend_tensor_set(trow, rows.data(), 0, sizeof(int32_t) * rows.size());
+            if (source_rows) {
+                ggml_backend_tensor_set(source_rows, source_idx.data(), 0,
+                                        sizeof(int32_t) * source_idx.size());
+            }
 
             std::vector<uint8_t> arena(16u * 1024 * 1024);
             ggml_init_params gp{};
@@ -200,6 +294,9 @@ static bool draft_kv_bulk_append(DraftKvState & st,
             ok = gctx != nullptr;
             if (ok) {
                 ggml_cgraph * g = ggml_new_graph_custom(gctx, 4096, false);
+                if (st.feature_source) {
+                    feat = ggml_get_rows(gctx, st.feature_source, source_rows);
+                }
                 DraftKvAppendInputs ai{c, feat, tpos, trow};
                 ok = build_draft_kv_append(gctx, g, dw, st.cache, ai);
                 if (!ok) std::fprintf(stderr, "[draft-kv] bulk: append build failed\n");
@@ -247,24 +344,40 @@ bool draft_kv_begin_step(DraftKvState & st,
     }
 
     // fold-in append inputs: real rows then trash-slot pads
-    st.i32_hbuf.assign((size_t)st.a_step * 2, 0);
+    st.i32_hbuf.assign(
+        (size_t)st.a_step * (st.feature_source ? 3u : 2u), 0);
     int32_t * ap_pos  = st.i32_hbuf.data();
     int32_t * ap_rows = st.i32_hbuf.data() + st.a_step;
+    int32_t * source_rows = st.feature_source
+        ? st.i32_hbuf.data() + 2 * st.a_step : nullptr;
     for (int i = 0; i < st.a_step; i++) {
         if (i < n_new) {
             const int p = (int)start + i;
             ap_pos[i]  = p;
             ap_rows[i] = p % st.cap;
+            if (st.feature_source) {
+                source_rows[i] = p % st.feature_source_cap;
+            }
             st.slot_pos[(size_t)(p % st.cap)] = p;
         } else {
             ap_pos[i]  = 0;
             ap_rows[i] = st.trash_slot;
         }
     }
-    if (n_new > 0 &&
+    if (st.feature_source &&
+        (ring.target_feat != st.feature_source ||
+         ring.cap != st.feature_source_cap)) {
+        std::fprintf(stderr, "[draft-kv] direct feature source changed\n");
+        return false;
+    }
+    if (!st.feature_source && n_new > 0 &&
         !copy_feature_ring_range_to_tensor(ring, st.ap_feat, (int)start, n_new)) {
         std::fprintf(stderr, "[draft-kv] feature copy failed\n");
         return false;
+    }
+    if (st.ap_source_rows) {
+        ggml_backend_tensor_set(st.ap_source_rows, source_rows, 0,
+                                sizeof(int32_t) * (size_t)st.a_step);
     }
     ggml_backend_tensor_set(st.ap_pos, ap_pos, 0, sizeof(int32_t) * (size_t)st.a_step);
     ggml_backend_tensor_set(st.ap_rows, ap_rows, 0, sizeof(int32_t) * (size_t)st.a_step);

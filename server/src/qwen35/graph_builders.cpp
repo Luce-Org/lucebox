@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
 namespace dflash::common {
@@ -294,7 +295,107 @@ bool build_target_step(
     const QwenPrefillSegment * prefill_segments,
     int n_prefill_segments,
     int n_logits_rows,
-    bool compact_slots) {
+    bool compact_slots,
+    bool stable_chain_verify) {
+    // A strict Ling AR graph has no position baked into its operations: the
+    // token embedding, RoPE position, causal mask, and KV destination row are
+    // all inputs. Its MLA read span changes only at 256-token boundaries, so
+    // retain the live graph inside that bucket instead of rebuilding the same
+    // thousands of tensor descriptors on every token.
+    static const bool g_bailing_ar_graph_reuse = []() {
+        const char * value = std::getenv("DFLASH_BAILING_AR_GRAPH_REUSE");
+        return value == nullptr || value[0] != '0';
+    }();
+    static const bool g_bailing_verify_graph_reuse = []() {
+        const char * value = std::getenv("DFLASH_BAILING_VERIFY_GRAPH_REUSE");
+        return value == nullptr || value[0] != '0';
+    }();
+    const bool reusable_bailing_ar =
+        g_bailing_ar_graph_reuse &&
+        w.is_bailingmoe3 &&
+        kv_start >= 0 &&
+        n_tokens == 1 &&
+        with_mask &&
+        !capture &&
+        !capture_delta_intermediate &&
+        fa_window == 0 &&
+        logits_tail_rows == 0 &&
+        kq_stride_pad == 256 &&
+        !capture_moe_router &&
+        !kvflash_mask &&
+        !capture_qk &&
+        !paged_attention &&
+        n_seqs == 1 &&
+        seq_slot == 0 &&
+        paged_max_kv_len == 0 &&
+        n_prefill_tokens == 0 &&
+        prefill_segments == nullptr &&
+        n_prefill_segments == 0 &&
+        n_logits_rows == 0 &&
+        !compact_slots;
+    const int bailing_ar_kv_bucket = reusable_bailing_ar
+        ? align_up(kv_start + n_tokens, 256)
+        : 0;
+    if (reusable_bailing_ar && sg.ctx && sg.gf &&
+        sg.bailing_ar_kv_bucket == bailing_ar_kv_bucket) {
+        return true;
+    }
+
+    // Ling's root-inclusive DSpark verify has a fixed width. KV rows, RoPE
+    // positions, mask contents, embeddings, and feature-ring destinations are
+    // all inputs, while MLA's read span changes only at 256-token boundaries.
+    // Retain the live graph inside a bucket: this avoids rebuilding thousands
+    // of descriptors and lets ggml-cuda replay the already captured graph.
+    // Both rollback strategies are reusable. The checkpoint path captures
+    // per-token recurrent intermediates, while optimistic exact verification
+    // keeps only the durable pre-verify snapshot and restores/replays on a
+    // mismatch; neither bakes kv_start into the graph inside an MLA bucket.
+    // SpecLA's schedule and factor bank are included in the key below. Its
+    // alternating banks rebuild host metadata, but separate salted CUDA-graph
+    // keys retain both captured executions.
+    const bool reusable_bailing_verify =
+        g_bailing_verify_graph_reuse &&
+        stable_chain_verify &&
+        w.is_bailingmoe3 &&
+        cache.target_feat != nullptr &&
+        kv_start >= 0 &&
+        n_tokens > 1 &&
+        with_mask &&
+        capture &&
+        fa_window == 0 &&
+        logits_tail_rows == 0 &&
+        kq_stride_pad == 256 &&
+        !capture_moe_router &&
+        !kvflash_mask &&
+        !capture_qk &&
+        !paged_attention &&
+        n_seqs == 1 &&
+        seq_slot == 0 &&
+        paged_max_kv_len == 0 &&
+        n_prefill_tokens == 0 &&
+        prefill_segments == nullptr &&
+        n_prefill_segments == 0 &&
+        n_logits_rows == 0 &&
+        !compact_slots;
+    const int bailing_verify_kv_bucket = reusable_bailing_verify
+        ? align_up(kv_start + n_tokens, 256)
+        : 0;
+    const bool bailing_verify_specla =
+        reusable_bailing_verify && specla_enabled() &&
+        !cache.factor_k.empty();
+    const int bailing_verify_pending_count = bailing_verify_specla
+        ? cache.specla_pending_count : -1;
+    const int bailing_verify_pending_bank = bailing_verify_specla
+        ? cache.specla_pending_bank : -1;
+    if (reusable_bailing_verify && sg.ctx && sg.gf &&
+        sg.bailing_verify_kv_bucket == bailing_verify_kv_bucket &&
+        sg.bailing_verify_width == n_tokens &&
+        sg.bailing_verify_pending_count == bailing_verify_pending_count &&
+        sg.bailing_verify_pending_bank == bailing_verify_pending_bank &&
+        sg.bailing_verify_capture_delta == capture_delta_intermediate) {
+        return true;
+    }
+
     step_graph_free(sg);
 
     // Compact n_seqs is a decode graph bucket width, not the physical
@@ -372,6 +473,18 @@ bool build_target_step(
         if (!found) return false;
     }
     int graph_key_slot = decode_key;
+    if (reusable_bailing_verify) {
+        // Keep chain-verify captures distinct from AR/paged shapes. Hash the
+        // 256-token MLA bucket plus SpecLA's alternating bank and pending
+        // width into bounded metadata slots; ggml-cuda still validates node
+        // properties on a collision.
+        uint32_t key = (uint32_t)(bailing_verify_kv_bucket / 256);
+        key = key * 33u + (uint32_t)n_tokens;
+        key = key * 33u + (uint32_t)(bailing_verify_pending_count + 1);
+        key = key * 3u + (uint32_t)(bailing_verify_pending_bank + 1);
+        key = key * 2u + (capture_delta_intermediate ? 1u : 0u);
+        graph_key_slot = 128 + (int)(key % 128u);
+    }
     if (paged_attention && paged_max_kv_len > 0) {
         // Paged graphs differ by their padded launch bound. Packed recurrent
         // graphs also differ by total width and every ragged segment length.
@@ -418,16 +531,20 @@ bool build_target_step(
     ggml_set_input(sg.positions);
 
     if (with_mask) {
-        // Use max_ctx for mask allocation so the gallocr buffer never needs to
-        // grow as kv_start increases during generation.  The actual mask is
-        // filled only up to kv_start + n_tokens; the excess is don't-care.
+        // Most Qwen paths retain a max-context mask so the gallocr buffer
+        // never grows during generation. Ling's compressed MLA already
+        // changes its K/V view at each 256-token bucket, however, so a 32K
+        // mask buys no extra CUDA-graph reuse and uploads ~2 MiB per AR step.
+        // Match Ling's mask to its active cache bucket instead.
         // kvflash mode: the physical span is the (smaller) pool capacity of
         // the attention tensors, so size the mask from those instead.
         int phys_ctx = cache.max_ctx;
         for (auto * t : cache.attn_k) {
             if (t) { phys_ctx = std::min(phys_ctx, (int)t->ne[1]); break; }
         }
-        const int max_win_len = phys_ctx + n_tokens;
+        const int max_win_len = w.is_bailingmoe3 && !kvflash_mask
+            ? kv_start + n_tokens
+            : phys_ctx + n_tokens;
         const int kv_pad = align_up(max_win_len, kq_stride_pad);
         const int q_pad  = align_up(n_tokens, KQ_MASK_PAD);
         sg.attn_mask = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, kv_pad, q_pad);
@@ -506,17 +623,28 @@ bool build_target_step(
     // region is reused by graph execution) and set_rows carries per-token
     // physical slots, so the slot-mapped write stays active for masked,
     // multi-token, and feature-capturing forwards (decode AND spec verify).
+    const bool bailing_verify_rows =
+        w.is_bailingmoe3 && stable_chain_verify && capture && with_mask &&
+        n_tokens > 1 && fa_window == 0;
     const bool use_kv_write_rows =
         paged_attention ||
+        bailing_verify_rows ||
         (!g_no_kvpad && !capture_delta_intermediate &&
          (kvflash_mask
               ? (fa_window == 0)
-              : (n_tokens == 1 && fa_window == 0 && !with_mask && !capture)));
+              : (n_tokens == 1 && fa_window == 0 && !capture &&
+                 (!with_mask || w.is_bailingmoe3))));
     if (use_kv_write_rows) {
         sg.kv_write_rows = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_I64,
                                               n_tokens, w.n_head_kv);
         ggml_set_name(sg.kv_write_rows, "kv_write_rows");
         ggml_set_input(sg.kv_write_rows);
+    }
+    if (reusable_bailing_verify) {
+        sg.target_feat_rows =
+            ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_tokens);
+        ggml_set_name(sg.target_feat_rows, "target_feat_rows");
+        ggml_set_input(sg.target_feat_rows);
     }
 
     SpecLAHLDSchedule hld_schedule;
@@ -541,9 +669,43 @@ bool build_target_step(
     gi.capture_layers             = capture;
     gi.capture_delta_intermediate = capture_delta_intermediate;
     gi.capture_moe_router         = capture_moe_router;
+    static const bool g_bailing_fused_conv_state = []() {
+        const char * value =
+            std::getenv("DFLASH_BAILING_FUSED_CONV_STATE");
+        return value == nullptr || value[0] != '0';
+    }();
+    static const bool g_bailing_fused_grouped_router = []() {
+        const char * value =
+            std::getenv("DFLASH_BAILING_FUSED_GROUPED_ROUTER");
+        return value == nullptr || value[0] != '0';
+    }();
+    static const bool g_bailing_fused_grouped_verify_router = []() {
+        const char * value =
+            std::getenv("DFLASH_BAILING_FUSED_GROUPED_VERIFY_ROUTER");
+        // The multi-row kernel is mathematically equivalent on direct CUDA
+        // tests, but BF16 Ling routing contains model-real ties that can alter
+        // the greedy trajectory. Keep verification opt-in until those tie
+        // semantics match the generic segmented sort exactly.
+        return value != nullptr && value[0] != '0';
+    }();
+    const char * backend_name = ggml_backend_name(backend);
+    const bool reusable_bailing_ar_cuda =
+        reusable_bailing_ar && backend_name &&
+        std::strstr(backend_name, "CUDA") != nullptr;
+    const bool reusable_bailing_verify_cuda =
+        reusable_bailing_verify && backend_name &&
+        std::strstr(backend_name, "CUDA") != nullptr;
+    gi.bailing_fuse_conv_state =
+        reusable_bailing_ar_cuda && g_bailing_fused_conv_state;
+    gi.bailing_fuse_grouped_router =
+        g_bailing_fused_grouped_router &&
+        (reusable_bailing_ar_cuda ||
+         (reusable_bailing_verify_cuda &&
+          g_bailing_fused_grouped_verify_router));
     gi.fa_window                  = fa_window;
     gi.logits_tail_rows           = logits_tail_rows;
     gi.kv_write_rows              = sg.kv_write_rows;
+    gi.target_feat_rows           = sg.target_feat_rows;
     gi.paged_block_table          = paged_block_table;
     gi.paged_kv_seq_lens          = paged_kv_seq_lens;
     gi.active_slot_ids            = sg.active_slot_ids;
@@ -570,9 +732,15 @@ bool build_target_step(
     QwenGraphOutputs go = build_qwen35_graph(sg.ctx, sg.gf, w, cache, gi);
     if (!go.logits) return false;
     sg.logits = go.logits;
+    sg.hidden_states = go.hidden_states;
     sg.delta_captures = std::move(go.delta_captures);
     sg.moe_selected = std::move(go.moe_selected);
     ggml_set_output(sg.logits);
+    if (w.mtp.enabled && sg.hidden_states) {
+        ggml_set_name(sg.hidden_states, "target_final_hidden");
+        ggml_set_output(sg.hidden_states);
+        ggml_build_forward_expand(sg.gf, sg.hidden_states);
+    }
 
     sg.argmax_tokens = ggml_argmax(sg.ctx, sg.logits);
     ggml_set_name(sg.argmax_tokens, "chain_verify_argmax");
@@ -587,7 +755,109 @@ bool build_target_step(
         ggml_backend_tensor_set(sg.specla_hld, hld_schedule.packed.data(), 0,
             hld_schedule.packed.size()*sizeof(int32_t));
     }
+    sg.bailing_ar_kv_bucket = bailing_ar_kv_bucket;
+    sg.bailing_verify_kv_bucket = bailing_verify_kv_bucket;
+    sg.bailing_verify_width = reusable_bailing_verify ? n_tokens : 0;
+    sg.bailing_verify_pending_count = bailing_verify_pending_count;
+    sg.bailing_verify_pending_bank = bailing_verify_pending_bank;
+    sg.bailing_verify_capture_delta =
+        reusable_bailing_verify && capture_delta_intermediate;
     return true;
+}
+
+bool build_bailingmoe3_mtp_step(
+        StepGraph & sg,
+        const TargetWeights & w,
+        TargetCache & mtp_cache,
+        ggml_backend_t backend,
+        int kv_start,
+        int n_tokens,
+        int logits_tail_rows,
+        int kq_stride_pad) {
+    if (!w.is_bailingmoe3 || !w.mtp.enabled || n_tokens <= 0 ||
+        kv_start < 0 || kv_start + n_tokens > mtp_cache.max_ctx) {
+        return false;
+    }
+    step_graph_free(sg);
+
+    // This predictor graph lives alongside the target graph, so it needs its
+    // own stable metadata arena rather than build_target_step's thread-local
+    // arena.  Stable tensor addresses let ggml-cuda replay the two-token graph.
+    constexpr size_t kMtpMetaBytes = 64 * 1024 * 1024;
+    if (sg.meta_arena.size() < kMtpMetaBytes) {
+        sg.meta_arena.resize(kMtpMetaBytes);
+    }
+    ggml_init_params ip{};
+    ip.mem_size = sg.meta_arena.size();
+    ip.mem_buffer = sg.meta_arena.data();
+    ip.no_alloc = true;
+    sg.ctx = ggml_init(ip);
+    if (!sg.ctx) return false;
+
+    const int hidden = w.n_embd;
+    sg.inp_embed = ggml_new_tensor_3d(
+        sg.ctx, GGML_TYPE_F32, hidden, n_tokens, 1);
+    sg.hidden_input = ggml_new_tensor_3d(
+        sg.ctx, GGML_TYPE_F32, hidden, n_tokens, 1);
+    sg.positions = ggml_new_tensor_1d(
+        sg.ctx, GGML_TYPE_I32, 4 * n_tokens);
+    // Match the predictor mask to the same 256-token cache bucket consumed
+    // by compressed MLA. A max-context mask uploaded ~2 MiB on every decode
+    // step even when only a short prefix was visible, and did not improve
+    // graph reuse because the K/V view already changes at bucket boundaries.
+    const int kv_pad = align_up(kv_start + n_tokens, kq_stride_pad);
+    const int query_rows = logits_tail_rows > 0
+        ? std::min(logits_tail_rows, n_tokens)
+        : n_tokens;
+    const int q_pad = align_up(query_rows, KQ_MASK_PAD);
+    sg.attn_mask = ggml_new_tensor_2d(
+        sg.ctx, GGML_TYPE_F16, kv_pad, q_pad);
+    sg.kv_write_rows = ggml_new_tensor_2d(
+        sg.ctx, GGML_TYPE_I64, n_tokens, 1);
+
+    ggml_set_name(sg.inp_embed, "bailing_mtp_embed");
+    ggml_set_name(sg.hidden_input, "bailing_mtp_target_hidden");
+    ggml_set_name(sg.positions, "bailing_mtp_positions");
+    ggml_set_name(sg.attn_mask, "bailing_mtp_mask");
+    ggml_set_name(sg.kv_write_rows, "bailing_mtp_kv_rows");
+    ggml_set_input(sg.inp_embed);
+    ggml_set_input(sg.hidden_input);
+    ggml_set_input(sg.positions);
+    ggml_set_input(sg.attn_mask);
+    ggml_set_input(sg.kv_write_rows);
+
+    sg.gf = ggml_new_graph_custom(sg.ctx, 4096, false);
+    QwenGraphOutputs out = build_bailingmoe3_mtp_graph(
+        sg.ctx, sg.gf, w, mtp_cache, sg.inp_embed, sg.hidden_input,
+        sg.positions, sg.attn_mask, sg.kv_write_rows,
+        kv_start, n_tokens, logits_tail_rows);
+    if (!out.logits) return false;
+    sg.logits = out.logits;
+    sg.hidden_states = out.hidden_states;
+    ggml_set_output(sg.logits);
+
+    // Multi-step MTP feeds the predictor's final hidden row back into the
+    // same layer for the next draft token.  Preserve only that row across
+    // graph execution; the full batch remains transient.
+    const int hidden_rows = static_cast<int>(out.hidden_states->ne[1]);
+    sg.hidden_tail = ggml_view_2d(
+        sg.ctx, out.hidden_states, hidden, 1,
+        out.hidden_states->nb[1],
+        static_cast<size_t>(hidden_rows - 1) * out.hidden_states->nb[1]);
+    ggml_set_name(sg.hidden_tail, "bailing_mtp_hidden_tail");
+    ggml_set_output(sg.hidden_tail);
+    ggml_build_forward_expand(sg.gf, sg.hidden_tail);
+
+    sg.argmax_tokens = ggml_argmax(sg.ctx, sg.logits);
+    ggml_set_name(sg.argmax_tokens, "bailing_mtp_argmax");
+    ggml_set_output(sg.argmax_tokens);
+    ggml_build_forward_expand(sg.gf, sg.argmax_tokens);
+
+    if (!sg.alloc) {
+        sg.alloc = ggml_gallocr_new(
+            ggml_backend_get_default_buffer_type(backend));
+    }
+    return ggml_gallocr_alloc_graph(sg.alloc, sg.gf);
 }
 
 // ── build_target_step_tree ──────────────────────────────────────

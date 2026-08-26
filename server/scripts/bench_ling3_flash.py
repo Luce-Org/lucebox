@@ -24,6 +24,21 @@ DECODE_PROMPT = (
     "BETA separated by single spaces: BETA BETA BETA BETA BETA BETA BETA BETA"
 )
 
+LONGFORM_DECODE_PROMPT = (
+    "Write a self-contained technical guide of at least 1,000 words explaining "
+    "speculative decoding for large language models. Cover autoregressive "
+    "baselines, draft-and-verify, acceptance, exactness, memory bandwidth, "
+    "batching, and failure modes. Use clear prose and do not conclude before "
+    "all sections are complete."
+)
+
+DECODE_WORKLOADS = {
+    "beta": DECODE_PROMPT,
+    "longform": LONGFORM_DECODE_PROMPT,
+}
+
+BENCHMARK_SECTIONS = frozenset({"decode", "context", "concurrency", "tool"})
+
 
 def post_json(url: str, payload: dict, timeout: float) -> dict:
     request = urllib.request.Request(
@@ -43,6 +58,10 @@ def chat(base_url: str, model: str, messages: list[dict], max_tokens: int,
         "temperature": 0,
         "max_tokens": max_tokens,
         "stream": False,
+        "chat_template_kwargs": {"enable_thinking": False},
+        # llama.cpp enables per-slot prompt reuse by default. Disable it here
+        # so both runtimes evaluate every prompt token on every measured run.
+        "cache_prompt": False,
     }
     if tools is not None:
         payload["tools"] = tools
@@ -55,18 +74,25 @@ def chat(base_url: str, model: str, messages: list[dict], max_tokens: int,
 
 def measurement(result: dict) -> dict:
     usage = result["usage"]
-    timings = usage.get("timings", {})
+    # LuceBox exposes timings inside usage; llama.cpp exposes the equivalent
+    # counters at the response root. Accept both so one benchmark client can
+    # make a matched cross-runtime comparison.
+    timings = usage.get("timings") or result.get("timings") or {}
     content = result["choices"][0]["message"].get("content") or ""
     return {
         "prompt_tokens": usage["prompt_tokens"],
         "completion_tokens": usage["completion_tokens"],
-        "prefill_ms": timings.get("prefill_ms"),
+        "prefill_ms": timings.get("prefill_ms", timings.get("prompt_ms")),
         "prefill_tokens": timings.get(
-            "effective_prompt_tokens", usage["prompt_tokens"]),
-        "decode_ms": timings.get("decode_ms"),
-        "decode_tokens_per_second": timings.get("decode_tokens_per_sec"),
+            "effective_prompt_tokens", timings.get(
+                "prompt_n", usage["prompt_tokens"])),
+        "decode_ms": timings.get("decode_ms", timings.get("predicted_ms")),
+        "decode_tokens_per_second": timings.get(
+            "decode_tokens_per_sec", timings.get("predicted_per_second")),
         "cache_hit": timings.get("cache_hit"),
         "cached_prefix_tokens": timings.get("cached_prefix_tokens", 0),
+        "accept_rate": usage.get("accept_rate"),
+        "spec_decode_ran": usage.get("spec_decode_ran"),
         "wall_seconds": result["_wall_seconds"],
         "finish_reason": result["choices"][0].get("finish_reason"),
         "output_sha256": hashlib.sha256(content.encode()).hexdigest(),
@@ -79,25 +105,58 @@ def median(values: list[float | int | None]) -> float | None:
     return statistics.median(present) if present else None
 
 
+def decode_prompt(workload: str) -> str:
+    # The wrappers disable server-side prompt caching and every request also
+    # sends cache_prompt=false. Keep the prompt byte-identical so output hashes
+    # compare model execution rather than semantically different inputs.
+    return workload
+
+
 def run_decode(args: argparse.Namespace) -> dict:
-    for _ in range(args.warmups):
+    workload = DECODE_WORKLOADS[args.decode_workload]
+    for warmup in range(args.warmups):
         chat(args.url, args.model,
-             [{"role": "user", "content": DECODE_PROMPT}],
+             [{"role": "user",
+               "content": decode_prompt(workload)}],
              args.decode_tokens, args.timeout)
 
     runs = [
         measurement(chat(
             args.url, args.model,
-            [{"role": "user", "content": DECODE_PROMPT}],
+            [{"role": "user",
+              "content": decode_prompt(workload)}],
             args.decode_tokens, args.timeout))
-        for _ in range(args.decode_runs)
+        for run in range(args.decode_runs)
     ]
+    output_hashes = sorted({run["output_sha256"] for run in runs})
+    if len(output_hashes) != 1:
+        raise RuntimeError(
+            f"decode output was not deterministic: {output_hashes}")
+    if (args.expected_output_sha256 and
+            output_hashes[0] != args.expected_output_sha256):
+        observed = [
+            {
+                "completion_tokens": run["completion_tokens"],
+                "finish_reason": run["finish_reason"],
+                "output_excerpt": run["output_excerpt"],
+            }
+            for run in runs
+        ]
+        raise RuntimeError(
+            "decode output hash mismatch: "
+            f"got {output_hashes[0]}, expected {args.expected_output_sha256}; "
+            f"observed={observed!r}")
     return {
-        "prompt": DECODE_PROMPT,
+        "workload": args.decode_workload,
+        "prompt": workload,
+        "cache_busting_nonce": None,
+        "prompt_cache_disabled": True,
         "temperature": 0,
         "max_tokens": args.decode_tokens,
         "warmups": args.warmups,
         "runs": runs,
+        "output_sha256": output_hashes[0],
+        "deterministic": True,
         "median_decode_tokens_per_second": median(
             [run["decode_tokens_per_second"] for run in runs]),
         "median_prefill_ms": median([run["prefill_ms"] for run in runs]),
@@ -109,8 +168,9 @@ def synthetic_context(target_tokens: int, run: int) -> str:
     # instruction account for the small difference between target and actual.
     body = "alpha " * max(1, target_tokens - 32)
     return (
+        f"Benchmark nonce context-{target_tokens}-run-{run}. "
         "Read this synthetic context, then reply with only OK.\n"
-        f"{body}\nBenchmark run {run}; reply OK."
+        f"{body}\nReply OK."
     )
 
 
@@ -144,6 +204,7 @@ def run_context_sweep(args: argparse.Namespace) -> list[dict]:
 
 
 def run_concurrency(args: argparse.Namespace) -> list[dict]:
+    workload = DECODE_WORKLOADS[args.decode_workload]
     rows = []
     for level in args.concurrency_levels:
         started = time.monotonic()
@@ -152,7 +213,7 @@ def run_concurrency(args: argparse.Namespace) -> list[dict]:
                 pool.submit(
                     chat, args.url, args.model,
                     [{"role": "user", "content":
-                      f"{DECODE_PROMPT}\nConcurrent request {index}."}],
+                      f"{workload}\nConcurrent request {index}."}],
                     args.concurrency_tokens, args.timeout)
                 for index in range(level)
             ]
@@ -238,14 +299,33 @@ def csv_ints(value: str) -> list[int]:
     return values
 
 
+def csv_sections(value: str) -> tuple[str, ...]:
+    sections = tuple(dict.fromkeys(
+        item.strip().lower() for item in value.split(",") if item.strip()))
+    unknown = set(sections) - BENCHMARK_SECTIONS
+    if not sections or unknown:
+        choices = ",".join(sorted(BENCHMARK_SECTIONS))
+        detail = f"; unknown: {','.join(sorted(unknown))}" if unknown else ""
+        raise argparse.ArgumentTypeError(
+            f"expected one or more of {choices}{detail}")
+    return sections
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", default="http://127.0.0.1:18081")
     parser.add_argument("--model", default="ling-3.0-flash-lucebox")
+    parser.add_argument("--engine", default="LuceBox dflash_server")
     parser.add_argument("--weights-quant", default="Q4_K_M")
     parser.add_argument("--kv-quant", default="Q4_0")
     parser.add_argument("--server-max-context", type=int, default=32768)
+    parser.add_argument(
+        "--prompt-profile", default="official-chat",
+        help="label recorded for the server-side template/prompt profile")
     parser.add_argument("--decode-tokens", type=int, default=128)
+    parser.add_argument(
+        "--decode-workload", choices=tuple(DECODE_WORKLOADS), default="beta",
+        help="deterministic decode prompt to run")
     parser.add_argument("--decode-runs", type=int, default=3)
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--context-tokens", type=csv_ints,
@@ -255,6 +335,15 @@ def main() -> int:
                         default=csv_ints("1,2"))
     parser.add_argument("--concurrency-tokens", type=int, default=64)
     parser.add_argument("--timeout", type=float, default=900.0)
+    parser.add_argument(
+        "--expected-output-sha256",
+        help="fail unless every measured decode has this exact content hash")
+    parser.add_argument("--skip-tool", action="store_true")
+    parser.add_argument(
+        "--sections", type=csv_sections,
+        default=csv_sections("decode,context,concurrency,tool"),
+        help=("comma-separated benchmark sections; use 'decode' for a "
+              "profiler capture that excludes unrelated work"))
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
 
@@ -263,16 +352,22 @@ def main() -> int:
                 f"{args.url.rstrip('/')}/health", timeout=10) as response:
             health = response.read().decode()
         report = {
-            "engine": "LuceBox dflash_server",
+            "engine": args.engine,
             "model": args.model,
             "weights_quant": args.weights_quant,
             "kv_quant": args.kv_quant,
             "server_max_context": args.server_max_context,
+            "prompt_profile": args.prompt_profile,
             "health": health,
-            "decode": run_decode(args),
-            "context_sweep": run_context_sweep(args),
-            "concurrency": run_concurrency(args),
-            "tool_round_trip": run_tool_round_trip(args),
+            "decode": run_decode(args) if "decode" in args.sections else None,
+            "context_sweep": (
+                run_context_sweep(args) if "context" in args.sections else None),
+            "concurrency": (
+                run_concurrency(args)
+                if "concurrency" in args.sections else None),
+            "tool_round_trip": (
+                run_tool_round_trip(args)
+                if "tool" in args.sections and not args.skip_tool else None),
         }
     except (KeyError, TypeError, ValueError, RuntimeError,
             urllib.error.URLError) as error:

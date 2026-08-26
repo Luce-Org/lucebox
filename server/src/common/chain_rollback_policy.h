@@ -59,6 +59,22 @@ inline ChainRollbackPolicy resolve_chain_rollback_policy(
     return policy;
 }
 
+// A full-window accept needs no checkpoint: the verify graph already left the
+// recurrent state at exactly the committed position. Partial rollback does
+// need the per-token capture. Keeping this decision explicit prevents an
+// optimistic (capture-free) verify from discarding its bonus token before a
+// rollback attempt that cannot succeed.
+inline bool should_attempt_chain_fast_rollback(
+        bool target_supports_fast_rollback,
+        bool captured_intermediates,
+        bool full_window_accept,
+        int accept_n,
+        int threshold) {
+    return target_supports_fast_rollback &&
+        (full_window_accept ||
+         (captured_intermediates && accept_n >= threshold));
+}
+
 // Rollback diagnostics shared by the two spec-decode loops
 // (Qwen35Backend::do_spec_decode and run_dflash_spec_decode). Keeping the
 // counters and the print format in one place prevents the loops from

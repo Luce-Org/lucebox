@@ -52,13 +52,16 @@ static ggml_tensor * draft_fuse_features(
     bool                 disable_aux_hidden_norms) {
     const float eps = DFLASH27B_RMS_EPS;
     ggml_tensor * thc = target_hidden_cat;
+    if (thc->type != GGML_TYPE_F32) {
+        thc = ggml_cast(ctx, thc, GGML_TYPE_F32);
+    }
     if (!disable_aux_hidden_norms && !w.aux_hidden_norms.empty()) {
         ggml_tensor * aux_cat = nullptr;
-        const size_t elem_sz = ggml_element_size(target_hidden_cat);
+        const size_t elem_sz = ggml_element_size(thc);
         for (size_t i = 0; i < w.aux_hidden_norms.size(); i++) {
-            ggml_tensor * slice = ggml_view_3d(ctx, target_hidden_cat,
+            ggml_tensor * slice = ggml_view_3d(ctx, thc,
                 w.n_embd, n_rows, 1,
-                target_hidden_cat->nb[1], target_hidden_cat->nb[2],
+                thc->nb[1], thc->nb[2],
                 i * (size_t)w.n_embd * elem_sz);
             slice = ggml_rms_norm(ctx, slice, eps);
             slice = ggml_mul(ctx, slice, w.aux_hidden_norms[i]);
@@ -457,7 +460,16 @@ DraftGraphOutputs build_draft_kv_step(
     og.hidden_states = out;
     og.logits = nullptr;
     if (in.lm_head) {
-        ggml_tensor * logits = ggml_mul_mat(ctx, in.lm_head, out);
+        const int logits_rows = in.logits_rows > 0
+            ? std::min(in.logits_rows, q_len)
+            : q_len;
+        ggml_tensor * projection_input = out;
+        if (logits_rows < q_len) {
+            projection_input = ggml_view_2d(
+                ctx, out, out->ne[0], logits_rows, out->nb[1], 0);
+        }
+        ggml_tensor * logits =
+            ggml_mul_mat(ctx, in.lm_head, projection_input);
         ggml_set_name(logits, "draft_kv_logits");
         og.logits = logits;
     }

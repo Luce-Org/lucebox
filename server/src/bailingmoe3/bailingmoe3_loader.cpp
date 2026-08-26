@@ -1,8 +1,8 @@
 // Native GGUF loader for BailingMoE3 (Ling 3.x).
 //
 // Ling GGUFs contain one embedded NextN/MTP block after the 42-layer
-// autoregressive trunk. This loader deliberately loads only the trunk; MTP is
-// a decode optimization and is not required for a correctness-first backend.
+// autoregressive trunk.  The native backend loads it alongside the trunk so
+// deterministic decode can use the model's trained next-token predictor.
 
 #include "internal.h"
 
@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <unordered_set>
@@ -113,7 +114,18 @@ struct TensorAllocation {
     size_t file_offset = 0;
     size_t file_size = 0;
     size_t buffer_offset = 0;
+    bool bf16_from_f32 = false;
 };
+
+void set_contiguous_tensor_type(ggml_tensor * tensor, ggml_type type) {
+    tensor->type = type;
+    tensor->nb[0] = ggml_type_size(type);
+    tensor->nb[1] = tensor->nb[0] *
+        (tensor->ne[0] / ggml_blck_size(type));
+    for (int dim = 2; dim < GGML_MAX_DIMS; ++dim) {
+        tensor->nb[dim] = tensor->nb[dim - 1] * tensor->ne[dim - 1];
+    }
+}
 
 }  // namespace
 
@@ -153,6 +165,9 @@ bool load_bailingmoe3_gguf(const std::string & path,
     const uint32_t nextn = get_u32_or(gctx, prefix + "nextn_predict_layers", 0);
     if (block_count == 0 || nextn >= block_count) {
         return fail("invalid block_count/nextn_predict_layers");
+    }
+    if (nextn > 1) {
+        return fail("only one embedded MTP block is currently supported");
     }
     const uint32_t n_layer = block_count - nextn;
     const uint32_t n_embd = get_u32_or(gctx, prefix + "embedding_length", 0);
@@ -276,9 +291,9 @@ bool load_bailingmoe3_gguf(const std::string & path,
 
     out.layers.assign(n_layer, TargetLayer{});
     const std::vector<float> clamp_exp =
-        get_f32_array(gctx, prefix + "swiglu_clamp_exp", n_layer);
+        get_f32_array(gctx, prefix + "swiglu_clamp_exp", block_count);
     const std::vector<float> clamp_shexp =
-        get_f32_array(gctx, prefix + "swiglu_clamp_shexp", n_layer);
+        get_f32_array(gctx, prefix + "swiglu_clamp_shexp", block_count);
 
     auto tensor = [&](const char * name) { return ggml_get_tensor(meta_ctx, name); };
     auto layer_tensor = [&](uint32_t il, const char * suffix) {
@@ -371,8 +386,142 @@ bool load_bailingmoe3_gguf(const std::string & path,
         }
     }
 
-    // Allocate exactly the tensors referenced by the trunk. Prefix-based
-    // selection would also upload the 124B model's embedded MTP block.
+    if (nextn == 1) {
+        const uint32_t il = n_layer;
+        BailingMtpWeights & mtp = out.mtp;
+        TargetLayer & layer = mtp.layer;
+        mtp.enabled = true;
+        mtp.layer_index = static_cast<int>(il);
+        mtp.eh_proj = layer_tensor(il, "nextn.eh_proj.weight");
+        mtp.enorm = layer_tensor(il, "nextn.enorm.weight");
+        mtp.hnorm = layer_tensor(il, "nextn.hnorm.weight");
+        mtp.final_norm = layer_tensor(il, "layer_output_norm.weight");
+
+        layer.attn_norm = layer_tensor(il, "attn_norm.weight");
+        layer.ffn_norm = layer_tensor(il, "ffn_norm.weight");
+        layer.attn_post_norm = layer.ffn_norm;
+        layer.ffn_swiglu_clamp_exp = clamp_exp[il];
+        layer.ffn_swiglu_clamp_shexp = clamp_shexp[il];
+
+        layer.wq = layer_tensor(il, "attn_q.weight");
+        layer.attn_kv_a_mqa = layer_tensor(il, "attn_kv_a_mqa.weight");
+        layer.attn_kv_a_norm = layer_tensor(il, "attn_kv_a_norm.weight");
+        layer.attn_k_b = layer_tensor(il, "attn_k_b.weight");
+        layer.attn_v_b = layer_tensor(il, "attn_v_b.weight");
+        layer.wqkv_gate = layer_tensor(il, "attn_gate.weight");
+        layer.wo = layer_tensor(il, "attn_output.weight");
+
+        layer.ffn_gate_inp = layer_tensor(il, "ffn_gate_inp.weight");
+        layer.ffn_exp_probs_b = layer_tensor(il, "exp_probs_b.bias");
+        layer.ffn_gate_exps = layer_tensor(il, "ffn_gate_exps.weight");
+        layer.ffn_up_exps = layer_tensor(il, "ffn_up_exps.weight");
+        layer.ffn_down_exps = layer_tensor(il, "ffn_down_exps.weight");
+        layer.ffn_gate_shexp = layer_tensor(il, "ffn_gate_shexp.weight");
+        layer.ffn_up_shexp = layer_tensor(il, "ffn_up_shexp.weight");
+        layer.ffn_down_shexp = layer_tensor(il, "ffn_down_shexp.weight");
+
+        if (!mtp.eh_proj || !mtp.enorm || !mtp.hnorm || !mtp.final_norm ||
+            !layer.attn_norm || !layer.ffn_norm || !layer.wq ||
+            !layer.attn_kv_a_mqa || !layer.attn_kv_a_norm ||
+            !layer.attn_k_b || !layer.attn_v_b || !layer.wqkv_gate ||
+            !layer.wo || !layer.ffn_gate_inp || !layer.ffn_exp_probs_b ||
+            !layer.ffn_gate_exps || !layer.ffn_up_exps ||
+            !layer.ffn_down_exps || !layer.ffn_gate_shexp ||
+            !layer.ffn_up_shexp || !layer.ffn_down_shexp) {
+            return fail("embedded MTP block is incomplete");
+        }
+    }
+
+    GgufMmap mmap;
+    std::string mmap_error;
+    if (!mmap.open(path, mmap_error)) return fail(mmap_error);
+    const uint8_t * bytes = static_cast<const uint8_t *>(mmap.data());
+    const size_t file_size = mmap.size();
+
+    // Ling's official checkpoint stores every router matrix as F32 even
+    // though every value is exactly representable as BF16. On bandwidth-bound
+    // token decode this doubles router traffic for no information gain. In
+    // auto mode (the default), scan every source value before changing any
+    // tensor metadata and fall back to F32 if even one value is not exact.
+    // Explicit `=1` requires the optimization; `=0` disables it for A/B tests.
+    std::unordered_set<ggml_tensor *> bf16_router_tensors;
+    const char * router_bf16_setting =
+        std::getenv("DFLASH_BAILING_ROUTER_BF16");
+    if (router_bf16_setting &&
+        !((router_bf16_setting[0] == '0' || router_bf16_setting[0] == '1') &&
+          router_bf16_setting[1] == '\0')) {
+        return fail("DFLASH_BAILING_ROUTER_BF16 must be 0 or 1");
+    }
+    const bool router_bf16_disabled =
+        router_bf16_setting && router_bf16_setting[0] == '0';
+    const bool router_bf16_required =
+        router_bf16_setting && router_bf16_setting[0] == '1';
+
+    if (!router_bf16_disabled) {
+        std::vector<ggml_tensor *> routers;
+        routers.reserve((n_layer - dense_lead) + (out.mtp.enabled ? 1 : 0));
+        for (uint32_t il = dense_lead; il < n_layer; ++il) {
+            routers.push_back(out.layers[il].ffn_gate_inp);
+        }
+        if (out.mtp.enabled) routers.push_back(out.mtp.layer.ffn_gate_inp);
+
+        std::string incompatibility;
+        for (ggml_tensor * router : routers) {
+            if (!router || router->type != GGML_TYPE_F32 ||
+                router->ne[0] != static_cast<int64_t>(n_embd) ||
+                router->ne[1] != static_cast<int64_t>(n_expert) ||
+                !ggml_is_contiguous(router)) {
+                incompatibility = "incompatible router metadata";
+                break;
+            }
+
+            const int64_t tid = gguf_find_tensor(gctx, router->name);
+            if (tid < 0 || gguf_get_tensor_type(gctx, tid) != GGML_TYPE_F32) {
+                incompatibility = "router source is not F32";
+                break;
+            }
+            const size_t relative_offset = gguf_get_tensor_offset(gctx, tid);
+            const size_t source_size = gguf_get_tensor_size(gctx, tid);
+            const size_t data_offset = gguf_get_data_offset(gctx);
+            const size_t elements = static_cast<size_t>(ggml_nelements(router));
+            if (source_size != elements * sizeof(uint32_t) ||
+                !gguf_tensor_in_file(data_offset, relative_offset, source_size,
+                                     file_size)) {
+                incompatibility = "invalid router source range";
+                break;
+            }
+
+            const uint8_t * source = bytes + data_offset + relative_offset;
+            for (size_t i = 0; i < elements; ++i) {
+                uint32_t bits = 0;
+                std::memcpy(&bits, source + i * sizeof(bits), sizeof(bits));
+                if ((bits & 0xFFFFu) != 0) {
+                    incompatibility = "router has non-BF16 F32 values";
+                    break;
+                }
+            }
+            if (!incompatibility.empty()) break;
+        }
+
+        if (!incompatibility.empty()) {
+            if (router_bf16_required) {
+                return fail("router BF16 repack required but " +
+                            incompatibility);
+            }
+            std::fprintf(stderr,
+                "[bailingmoe3] router BF16 auto-repack skipped: %s\n",
+                incompatibility.c_str());
+        } else {
+            for (ggml_tensor * router : routers) {
+                set_contiguous_tensor_type(router, GGML_TYPE_BF16);
+                bf16_router_tensors.insert(router);
+            }
+        }
+    }
+
+    // Allocate exactly the tensors referenced by the trunk and embedded MTP
+    // block. Prefix-based selection would accidentally pull unrelated GGUF
+    // tensors into the device allocation.
     std::unordered_set<ggml_tensor *> wanted;
     auto add = [&](ggml_tensor * value) { if (value) wanted.insert(value); };
     add(out.out_norm);
@@ -390,6 +539,19 @@ bool load_bailingmoe3_gguf(const std::string & path,
         add(layer.ffn_gate_inp); add(layer.ffn_exp_probs_b);
         add(layer.ffn_gate_exps); add(layer.ffn_up_exps); add(layer.ffn_down_exps);
         add(layer.ffn_gate_shexp); add(layer.ffn_up_shexp); add(layer.ffn_down_shexp);
+    }
+    if (out.mtp.enabled) {
+        TargetLayer & layer = out.mtp.layer;
+        add(out.mtp.eh_proj); add(out.mtp.enorm); add(out.mtp.hnorm);
+        add(out.mtp.final_norm);
+        add(layer.attn_norm); add(layer.ffn_norm);
+        add(layer.wq); add(layer.wo); add(layer.attn_kv_a_mqa);
+        add(layer.attn_kv_a_norm); add(layer.attn_k_b); add(layer.attn_v_b);
+        add(layer.wqkv_gate);
+        add(layer.ffn_gate_inp); add(layer.ffn_exp_probs_b);
+        add(layer.ffn_gate_exps); add(layer.ffn_up_exps);
+        add(layer.ffn_down_exps); add(layer.ffn_gate_shexp);
+        add(layer.ffn_up_shexp); add(layer.ffn_down_shexp);
     }
 
     const int64_t n_tensors = gguf_get_n_tensors(gctx);
@@ -410,11 +572,13 @@ bool load_bailingmoe3_gguf(const std::string & path,
             gguf_get_data_offset(gctx) + gguf_get_tensor_offset(gctx, tid);
         allocation.file_size = gguf_get_tensor_size(gctx, tid);
         allocation.buffer_offset = allocation_size;
+        allocation.bf16_from_f32 =
+            bf16_router_tensors.find(value) != bf16_router_tensors.end();
         allocation_size += ggml_backend_buft_get_alloc_size(buffer_type, value);
         allocations.push_back(allocation);
     }
     if (allocations.size() != wanted.size()) {
-        return fail("failed to resolve every trunk tensor in the GGUF table");
+        return fail("failed to resolve every required tensor in the GGUF table");
     }
 
     out.buf = ggml_backend_alloc_buffer(backend, allocation_size);
@@ -430,15 +594,8 @@ bool load_bailingmoe3_gguf(const std::string & path,
         }
     }
 
-    GgufMmap mmap;
-    std::string mmap_error;
-    if (!mmap.open(path, mmap_error)) {
-        ggml_backend_buffer_free(out.buf);
-        out.buf = nullptr;
-        return fail(mmap_error);
-    }
-    const uint8_t * bytes = static_cast<const uint8_t *>(mmap.data());
-    const size_t file_size = mmap.size();
+    size_t routers_repacked = 0;
+    size_t router_source_bytes = 0;
     for (const TensorAllocation & allocation : allocations) {
         if (allocation.file_offset + allocation.file_size < allocation.file_offset ||
             allocation.file_offset + allocation.file_size > file_size) {
@@ -447,8 +604,38 @@ bool load_bailingmoe3_gguf(const std::string & path,
             return fail("truncated tensor data for " +
                         std::string(allocation.tensor->name));
         }
-        ggml_backend_tensor_set(allocation.tensor,
-            bytes + allocation.file_offset, 0, allocation.file_size);
+        if (allocation.bf16_from_f32) {
+            const size_t elements =
+                static_cast<size_t>(ggml_nelements(allocation.tensor));
+            if (allocation.file_size != elements * sizeof(uint32_t) ||
+                ggml_nbytes(allocation.tensor) != elements * sizeof(uint16_t)) {
+                ggml_backend_buffer_free(out.buf);
+                out.buf = nullptr;
+                return fail("router BF16 repack size mismatch for " +
+                            std::string(allocation.tensor->name));
+            }
+
+            std::vector<uint16_t> packed(elements);
+            const uint8_t * source = bytes + allocation.file_offset;
+            for (size_t i = 0; i < elements; ++i) {
+                uint32_t bits = 0;
+                std::memcpy(&bits, source + i * sizeof(bits), sizeof(bits));
+                if ((bits & 0xFFFFu) != 0) {
+                    ggml_backend_buffer_free(out.buf);
+                    out.buf = nullptr;
+                    return fail("router BF16 repack would change value in " +
+                                std::string(allocation.tensor->name));
+                }
+                packed[i] = static_cast<uint16_t>(bits >> 16);
+            }
+            ggml_backend_tensor_set(allocation.tensor, packed.data(), 0,
+                                    packed.size() * sizeof(packed[0]));
+            ++routers_repacked;
+            router_source_bytes += allocation.file_size;
+        } else {
+            ggml_backend_tensor_set(allocation.tensor,
+                bytes + allocation.file_offset, 0, allocation.file_size);
+        }
     }
 
     const int64_t token_tid = gguf_find_tensor(gctx, "token_embd.weight");
@@ -478,17 +665,18 @@ bool load_bailingmoe3_gguf(const std::string & path,
     gctx = nullptr;
     meta_ctx = nullptr;  // owned by out.ctx from here on
 
-    char summary[384];
+    char summary[448];
     std::snprintf(summary, sizeof(summary),
-        "bailingmoe3 trunk loaded: %d layers (%d KDA + %d MLA), "
+        "bailingmoe3 loaded: %d trunk layers (%d KDA + %d MLA), "
         "%zu tensors %.2f GiB, experts=%d/%d groups=%d/%d, "
-        "MTP blocks ignored=%u, eos=%d",
+        "MTP blocks loaded=%u, router_bf16=%zu (saved %.1f MiB), eos=%d",
         out.n_layer, out.n_layer - out.n_layer / out.full_attention_interval,
         out.n_layer / out.full_attention_interval, allocations.size(),
         allocation_size / (1024.0 * 1024.0 * 1024.0),
         out.n_expert_used, out.n_expert,
         out.n_expert_groups_used, out.n_expert_groups,
-        nextn, out.eos_id);
+        nextn, routers_repacked,
+        router_source_bytes / (2.0 * 1024.0 * 1024.0), out.eos_id);
     set_last_error(summary);
     std::fprintf(stderr, "[bailingmoe3] %s\n", summary);
     return true;

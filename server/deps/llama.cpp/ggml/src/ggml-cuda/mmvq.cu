@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <type_traits>
 
 static thread_local size_t g_mmvq_launch_count = 0;
 
@@ -218,7 +219,8 @@ enum mmvq_parameter_table_id {
     MMVQ_PARAMETERS_GCN,
     MMVQ_PARAMETERS_RDNA2,
     MMVQ_PARAMETERS_RDNA3_0,
-    MMVQ_PARAMETERS_RDNA4
+    MMVQ_PARAMETERS_RDNA4,
+    MMVQ_PARAMETERS_GB10
 };
 
 static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
@@ -230,6 +232,8 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
     return MMVQ_PARAMETERS_RDNA2;
 #elif defined(GCN) || defined(CDNA)
     return MMVQ_PARAMETERS_GCN;
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
+    return MMVQ_PARAMETERS_GB10;
 #else
     return MMVQ_PARAMETERS_GENERIC;
 #endif
@@ -247,6 +251,10 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
     }
     if (GGML_CUDA_CC_IS_GCN(cc) || GGML_CUDA_CC_IS_CDNA(cc)) {
         return MMVQ_PARAMETERS_GCN;
+    }
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) &&
+        ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_DGX_SPARK) {
+        return MMVQ_PARAMETERS_GB10;
     }
     return MMVQ_PARAMETERS_GENERIC;
 }
@@ -419,7 +427,7 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
 //                               tokens unless enabled. The ROCmFP formats are
 //                               opt-in until qualified on each AMD target.
 #define MMID_GROUPED_MAX_PAIRS 256
-#define MMID_GROUPED_MAX_TPG   2
+#define MMID_GROUPED_MAX_TPG   8
 #define MMID_META_NG 0
 #define MMID_META_GE 1
 #define MMID_META_GS (MMID_META_GE + MMID_GROUPED_MAX_PAIRS)
@@ -594,7 +602,9 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 #endif
 }
 
-static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id) {
+static constexpr __host__ __device__ int calc_nwarps(
+        ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id,
+        bool small_k = false, bool halve_iters = false) {
     if (table_id == MMVQ_PARAMETERS_GENERIC) {
         switch (ncols_dst) {
             case 1:
@@ -669,11 +679,37 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
         }
         return 1;
     }
+    if (table_id == MMVQ_PARAMETERS_GB10) {
+        const int generic =
+            calc_nwarps(type, ncols_dst, MMVQ_PARAMETERS_GENERIC);
+        // GB10 benefits from an eight-warp dense decode block only when the
+        // extra warps halve the K-loop trip count without a costly idle tail.
+        // Expert rows deliberately stay at the generic width.
+        if (ncols_dst == 1 && !small_k && halve_iters) {
+            switch (type) {
+                case GGML_TYPE_Q4_0:
+                case GGML_TYPE_Q4_1:
+                case GGML_TYPE_Q5_0:
+                case GGML_TYPE_Q5_1:
+                case GGML_TYPE_Q8_0:
+                case GGML_TYPE_Q4_K:
+                case GGML_TYPE_Q5_K:
+                case GGML_TYPE_Q6_K:
+                case GGML_TYPE_IQ4_NL:
+                    return 2 * generic;
+                default:
+                    break;
+            }
+        }
+        return generic;
+    }
     return 1;
 }
 
 static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
-    if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN) {
+    if (table_id == MMVQ_PARAMETERS_GENERIC ||
+        table_id == MMVQ_PARAMETERS_GCN ||
+        table_id == MMVQ_PARAMETERS_GB10) {
         switch (ncols_dst) {
             case 1:
                 return small_k ? nwarps : 1;
@@ -754,8 +790,10 @@ static bool rocmfp4_q5_x4_plus1_enabled() {
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false,
           int fixed_ncols_x = 0, bool unroll_k_loop_2 = false,
           bool reuse_rocmfp4_weights = false,
-          bool c_fp3_packed24 = false, bool c_fp4_x4 = false>
-__launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id())*ggml_cuda_get_physical_warp_size(), 1)
+          bool c_fp3_packed24 = false, bool c_fp4_x4 = false,
+          bool c_dense_no_ids = false, bool c_halve_iters = false>
+__launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(),
+                              small_k, c_halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * __restrict__ vx, const void * __restrict__ vy, const int32_t * __restrict__ ids, const ggml_cuda_mm_fusion_args_device fusion, float * __restrict__ dst,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
@@ -768,7 +806,8 @@ static __global__ void mul_mat_vec_q(
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
     constexpr int vdr = get_vdr_mmvq(type);
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
-    constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id);
+    constexpr int nwarps =
+        calc_nwarps(type, ncols_dst, table_id, small_k, c_halve_iters);
     constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
@@ -793,10 +832,14 @@ static __global__ void mul_mat_vec_q(
                       (type == GGML_TYPE_Q4_0_ROCMFP4_FAST &&
                        (ncols_dst == 4 || ncols_dst == 5)),
                   "FP4 x4 MMVQ specialization requires ROCmFP4-fast q4/q5");
-
+    static_assert(!c_dense_no_ids ||
+                      ((type == GGML_TYPE_Q4_K ||
+                        type == GGML_TYPE_Q6_K) &&
+                       ncols_dst == 1 && !small_k),
+                  "dense no-ID MMVQ specialization requires Q4_K/Q6_K decode");
     const uint32_t channel_dst = blockIdx.y;
 
-    const bool has_ids = ids != nullptr;
+    const bool has_ids = c_dense_no_ids ? false : ids != nullptr;
     const bool ids_multi_col = has_ids && ncols_dst > 1;
 
     const uint32_t sample_dst = blockIdx.z;
@@ -1485,18 +1528,19 @@ static __global__ void mmid_group_prep(
 }
 
 // [TAG_MMID_GROUPED] grouped MoE kernel. Identical launch shape and per-warp
-// structure to mul_mat_vec_q_moe (block (warp_size, MMID_GROUPED_MAX_TPG),
+// structure to mul_mat_vec_q_moe (block (warp_size, c_tokens_per_group),
 // c_rows_per_block rows per warp, same vec_dot sequence and warp reduction),
 // so results are bit-exact vs that kernel. The only difference: warp w
-// handles the expert-SORTED pair blockIdx.y*MMID_GROUPED_MAX_TPG + w instead
+// handles the expert-SORTED pair blockIdx.y*c_tokens_per_group + w instead
 // of (slot = blockIdx.y, token = w). Pairs routed to the same expert are
 // adjacent after sorting, so the warps of a block mostly share one expert and
 // their concurrent weight reads are served once from DRAM, then from L1/L2.
 // Weight traffic approaches (union of routed experts) instead of
 // (n_expert_used x n_tokens) expert-matrix reads.
-template <ggml_type type, int c_rows_per_block, bool has_fusion,
+template <ggml_type type, int c_rows_per_block, int c_tokens_per_group,
+          bool has_fusion,
           bool fp3_packed24 = false, bool fp2_packed32 = false>
-__launch_bounds__(MMID_GROUPED_MAX_TPG*ggml_cuda_get_physical_warp_size(), 1)
+__launch_bounds__(c_tokens_per_group*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_moe_grouped(
         const void * __restrict__ vx, const void * __restrict__ vy, const int32_t * __restrict__ meta,
         const ggml_cuda_mm_fusion_args_device fusion,
@@ -1516,7 +1560,10 @@ static __global__ void mul_mat_vec_q_moe_grouped(
     static_assert(!fp2_packed32 || type == GGML_TYPE_Q2_0_ROCMFP2,
                   "packed FP2 grouped dispatch requires ROCmFP2 weights");
 
-    const uint32_t p = blockIdx.y*MMID_GROUPED_MAX_TPG + threadIdx.y;
+    static_assert(c_tokens_per_group == 1 || c_tokens_per_group == 2 ||
+                  c_tokens_per_group == 4 || c_tokens_per_group == 8,
+                  "unsupported grouped MoE token count");
+    const uint32_t p = blockIdx.y*c_tokens_per_group + threadIdx.y;
     if (p >= np) {
         return;
     }
@@ -1668,9 +1715,10 @@ static __global__ void mul_mat_vec_q_moe_grouped(
     }
 }
 
-template <ggml_type type, bool fp3_packed24 = false,
+template <ggml_type type, int c_tokens_per_group,
+          bool fp3_packed24 = false,
           bool fp2_packed32 = false>
-static void mul_mat_vec_q_moe_grouped_launch(
+static void mul_mat_vec_q_moe_grouped_launch_tpg(
         const void * vx, const void * vy, const int32_t * meta, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
         const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
@@ -1679,13 +1727,16 @@ static void mul_mat_vec_q_moe_grouped_launch(
 
     constexpr int rows_per_block = 4;
     const int64_t nblocks_rows = (nrows_x + rows_per_block - 1)/rows_per_block;
-    const dim3 block_nums(nblocks_rows, (np + MMID_GROUPED_MAX_TPG - 1)/MMID_GROUPED_MAX_TPG);
-    const dim3 block_dims(warp_size, MMID_GROUPED_MAX_TPG);
+    const dim3 block_nums(
+        nblocks_rows,
+        (np + c_tokens_per_group - 1)/c_tokens_per_group);
+    const dim3 block_dims(warp_size, c_tokens_per_group);
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
     if (has_fusion) {
         mul_mat_vec_q_moe_grouped<
-            type, rows_per_block, true, fp3_packed24, fp2_packed32>
+            type, rows_per_block, c_tokens_per_group, true,
+            fp3_packed24, fp2_packed32>
             <<<block_nums, block_dims, 0, stream>>>(
                 vx, vy, meta, fusion, dst, (uint32_t) np, ncols_x,
                 nchannels_y, nrows_x, stride_row_x, stride_col_y,
@@ -1693,13 +1744,50 @@ static void mul_mat_vec_q_moe_grouped_launch(
                 stride_channel_dst);
     } else {
         mul_mat_vec_q_moe_grouped<
-            type, rows_per_block, false, fp3_packed24, fp2_packed32>
+            type, rows_per_block, c_tokens_per_group, false,
+            fp3_packed24, fp2_packed32>
             <<<block_nums, block_dims, 0, stream>>>(
                 vx, vy, meta, fusion, dst, (uint32_t) np, ncols_x,
                 nchannels_y, nrows_x, stride_row_x, stride_col_y,
                 stride_col_dst, stride_channel_x, stride_channel_y,
                 stride_channel_dst);
     }
+}
+
+template <ggml_type type, bool fp3_packed24 = false,
+          bool fp2_packed32 = false>
+static void mul_mat_vec_q_moe_grouped_launch(
+        const void * vx, const void * vy, const int32_t * meta,
+        const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
+        const uint32_t ncols_x, const uint3 nchannels_y,
+        const uint32_t nrows_x, const uint32_t stride_row_x,
+        const uint32_t stride_col_y, const uint32_t stride_col_dst,
+        const uint32_t stride_channel_x, const uint32_t stride_channel_y,
+        const uint32_t stride_channel_dst, const int np,
+        const int warp_size, cudaStream_t stream) {
+    static const int tokens_per_group = []() {
+        const char * value =
+            std::getenv("DFLASH_CUDA_MMVQ_GROUPED_TPG");
+        if (!value || !value[0]) return 2;
+        const int parsed = std::atoi(value);
+        return parsed == 1 || parsed == 2 || parsed == 4 || parsed == 8
+            ? parsed : 2;
+    }();
+
+#define GGML_GROUPED_LAUNCH_TPG(TPG) \
+    mul_mat_vec_q_moe_grouped_launch_tpg< \
+        type, TPG, fp3_packed24, fp2_packed32>( \
+            vx, vy, meta, fusion, dst, ncols_x, nchannels_y, nrows_x, \
+            stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, \
+            stride_channel_y, stride_channel_dst, np, warp_size, stream)
+
+    switch (tokens_per_group) {
+        case 1: GGML_GROUPED_LAUNCH_TPG(1); break;
+        case 4: GGML_GROUPED_LAUNCH_TPG(4); break;
+        case 8: GGML_GROUPED_LAUNCH_TPG(8); break;
+        default: GGML_GROUPED_LAUNCH_TPG(2); break;
+    }
+#undef GGML_GROUPED_LAUNCH_TPG
 }
 
 static bool mul_mat_vec_q_grouped_dispatch(
@@ -1782,8 +1870,10 @@ static bool mul_mat_vec_q_grouped_dispatch(
 template<ggml_type type>
 static std::pair<dim3, dim3> calc_launch_params(
         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
-        const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false) {
-    const int nwarps = calc_nwarps(type, ncols_dst, table_id);
+        const int warp_size, const mmvq_parameter_table_id table_id,
+        const bool small_k = false, const bool halve_iters = false) {
+    const int nwarps =
+        calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
     const int rpb = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
     const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
     const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
@@ -1794,7 +1884,8 @@ static std::pair<dim3, dim3> calc_launch_params(
 template<ggml_type type, int c_ncols_dst, bool small_k = false,
          int fixed_ncols_x = 0, bool unroll_k_loop_2 = false,
          bool reuse_rocmfp4_weights = false,
-         bool fp3_packed24 = false, bool fp4_x4 = false>
+         bool fp3_packed24 = false, bool fp4_x4 = false,
+         bool dense_no_ids = false, bool halve_iters = false>
 static void mul_mat_vec_q_switch_fusion(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
@@ -1808,7 +1899,7 @@ static void mul_mat_vec_q_switch_fusion(
     if (has_fusion) {
         mul_mat_vec_q<type, c_ncols_dst, true, small_k, fixed_ncols_x,
                       unroll_k_loop_2, reuse_rocmfp4_weights, fp3_packed24,
-                      fp4_x4><<<block_nums, block_dims, nbytes_shared, stream>>>
+                      fp4_x4, dense_no_ids, halve_iters><<<block_nums, block_dims, nbytes_shared, stream>>>
             (vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
              channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
              sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, ids_tokenwise_samples);
@@ -1817,7 +1908,7 @@ static void mul_mat_vec_q_switch_fusion(
 
     mul_mat_vec_q<type, c_ncols_dst, false, small_k, fixed_ncols_x,
                   unroll_k_loop_2, reuse_rocmfp4_weights, fp3_packed24,
-                  fp4_x4><<<block_nums, block_dims, nbytes_shared, stream>>>
+                  fp4_x4, dense_no_ids, halve_iters><<<block_nums, block_dims, nbytes_shared, stream>>>
         (vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, ids_tokenwise_samples);
@@ -2123,14 +2214,17 @@ static void mul_mat_vec_q_switch_ncols_dst(
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
     const bool has_ids = ids != nullptr;
 
+    // K-loop geometry at the generic block width. Both the small-K and GB10
+    // decisions below use the same per-warp coverage.
+    constexpr int qk                    = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi                    = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr                   = get_vdr_mmvq(type);
+    const int     blocks_per_row_x      = ncols_x / qk;
+    const int     blocks_per_iter_1warp = vdr * warp_size / qi;
+
     const auto should_use_small_k = [&](int c_ncols_dst) {
         // When K is small, increase rows_per_block to match nwarps so each warp has more work to do
         // Trigger when the full thread block covers all K blocks in a single loop iteration and few threads remain idle.
-        constexpr int qk                    = ggml_cuda_type_traits<type>::qk;
-        constexpr int qi                    = ggml_cuda_type_traits<type>::qi;
-        constexpr int vdr                   = get_vdr_mmvq(type);
-        const int     blocks_per_row_x      = ncols_x / qk;
-        const int     blocks_per_iter_1warp = vdr * warp_size / qi;
         const int     nwarps                = calc_nwarps(type, c_ncols_dst, table_id);
         bool          use                   = nwarps > 1 && blocks_per_row_x < nwarps * blocks_per_iter_1warp;
 
@@ -2163,6 +2257,30 @@ static void mul_mat_vec_q_switch_ncols_dst(
         }
 
         return use;
+    };
+
+    const auto should_halve_iters = [&]() {
+        static const bool enabled = []() {
+            const char * value =
+                std::getenv("DFLASH_CUDA_MMVQ_GB10_WIDE");
+            return value == nullptr || value[0] != '0';
+        }();
+        if (!enabled || table_id != MMVQ_PARAMETERS_GB10 || has_ids) {
+            return false;
+        }
+
+        const int blocks_per_iter =
+            calc_nwarps(type, 1, table_id) * blocks_per_iter_1warp;
+        const int iters =
+            (blocks_per_row_x + blocks_per_iter - 1) / blocks_per_iter;
+        const int iters_wide =
+            (blocks_per_row_x + 2 * blocks_per_iter - 1) /
+            (2 * blocks_per_iter);
+
+        // Reject a wider block when its idle tail is more than one eighth of
+        // the scheduled warp work. This is the tuned upstream GB10 rule.
+        const int idle = iters_wide * 2 - iters;
+        return idle * 8 <= iters_wide * 2;
     };
 
     static const bool use_tokenwise_mmid = []() {
@@ -2359,26 +2477,89 @@ static void mul_mat_vec_q_switch_ncols_dst(
 
     switch (ncols_dst) {
         case 1: {
-            constexpr int c_ncols_dst = 1;
+            static constexpr int c_ncols_dst = 1;
+            constexpr bool c_gb10_promoted =
+                calc_nwarps(type, c_ncols_dst, MMVQ_PARAMETERS_GB10,
+                            false, true) !=
+                calc_nwarps(type, c_ncols_dst, MMVQ_PARAMETERS_GB10,
+                            false, false);
+            static const bool dense_no_ids_enabled = []() {
+                if constexpr (type == GGML_TYPE_Q4_K) {
+                    return true;
+                } else if constexpr (type == GGML_TYPE_Q6_K) {
+                    const char * value =
+                        std::getenv("DFLASH_CUDA_MMVQ_Q6_DENSE");
+                    return value == nullptr || value[0] != '0';
+                } else {
+                    return false;
+                }
+            }();
 
-            bool use_small_k = should_use_small_k(c_ncols_dst);
-
-            if (use_small_k) {
-                std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst,
-                                                                        nsamples_dst, warp_size, table_id, true);
-                mul_mat_vec_q_switch_fusion<type, c_ncols_dst, true>(
+            // Compile the topology flags into both launch bounds and the K
+            // stride. Q4_K also keeps the branch-free dense/no-ID variant.
+            const auto launch = [&](auto small_k_tag, auto halve_iters_tag,
+                                    auto dense_no_ids_tag) {
+                constexpr bool c_small_k = decltype(small_k_tag)::value;
+                constexpr bool c_halve_iters =
+                    decltype(halve_iters_tag)::value && c_gb10_promoted;
+                constexpr bool c_dense_no_ids =
+                    decltype(dense_no_ids_tag)::value;
+                const std::pair<dim3, dim3> dims = calc_launch_params<type>(
+                    c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst,
+                    warp_size, table_id, c_small_k, c_halve_iters);
+                mul_mat_vec_q_switch_fusion<
+                    type, c_ncols_dst, c_small_k, 0, false, false, false,
+                    false, c_dense_no_ids, c_halve_iters>(
                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                     channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
                     stride_sample_x, stride_sample_y, stride_sample_dst, dims.first, dims.second, 0, ids_stride,
                     stream);
+            };
+
+            if (should_use_small_k(c_ncols_dst)) {
+                launch(std::true_type{}, std::false_type{},
+                       std::false_type{});
+            } else if constexpr (type == GGML_TYPE_Q4_K) {
+                if (!has_ids && dense_no_ids_enabled) {
+                    if (should_halve_iters()) {
+                        launch(std::false_type{}, std::true_type{},
+                               std::true_type{});
+                    } else {
+                        launch(std::false_type{}, std::false_type{},
+                               std::true_type{});
+                    }
+                } else if (should_halve_iters()) {
+                    launch(std::false_type{}, std::true_type{},
+                           std::false_type{});
+                } else {
+                    launch(std::false_type{}, std::false_type{},
+                           std::false_type{});
+                }
+            } else if constexpr (type == GGML_TYPE_Q4_K ||
+                                 type == GGML_TYPE_Q6_K) {
+                if (!has_ids && dense_no_ids_enabled) {
+                    if (should_halve_iters()) {
+                        launch(std::false_type{}, std::true_type{},
+                               std::true_type{});
+                    } else {
+                        launch(std::false_type{}, std::false_type{},
+                               std::true_type{});
+                    }
+                } else if (should_halve_iters()) {
+                    launch(std::false_type{}, std::true_type{},
+                           std::false_type{});
+                } else {
+                    launch(std::false_type{}, std::false_type{},
+                           std::false_type{});
+                }
             } else {
-                std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst,
-                                                                        nsamples_dst, warp_size, table_id);
-                mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(
-                    vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
-                    channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
-                    stride_sample_x, stride_sample_y, stride_sample_dst, dims.first, dims.second, 0, ids_stride,
-                    stream);
+                if (should_halve_iters()) {
+                    launch(std::false_type{}, std::true_type{},
+                           std::false_type{});
+                } else {
+                    launch(std::false_type{}, std::false_type{},
+                           std::false_type{});
+                }
             }
         } break;
         case 2: {

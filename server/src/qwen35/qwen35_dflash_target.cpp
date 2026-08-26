@@ -1,12 +1,14 @@
 // Qwen35DFlashTarget — DFlashTarget adapter for qwen35 hybrid models.
 
 #include "qwen35_dflash_target.h"
+#include "qwen35_roctx.h"
 #include "delta_net_specla.h"
 #include "graph_builders.h"
 #include "step_graph.h"
 #include "attn_masks.h"
 #include "prefill_helpers.h"
 #include "common/geometric_draft_topk_cuda.h"
+#include "common/kda_replayssm_cuda.h"
 #include "common/specla_commit_cuda.h"
 #include "ggml-backend-impl.h"
 // gpu_runtime_compat.h maps the raw cudaStream_t / cudaMemcpy* symbols used
@@ -265,15 +267,30 @@ bool Qwen35DFlashTarget::verify_batch(
     // skip capture under the pager so --ddtree + --kvflash doesn't fail verify.
     const bool do_capture = fast_rollback_ && capture_ssm_intermediates && pager_ == nullptr;
 
+    // Embedded Ling MTP has no feature ring; an external DSpark does. Use the
+    // allocated cache as the source of truth so Ling+DSpark captures its five
+    // trained target layers even though the checkpoint also carries MTP.
+    const bool capture_features = cache_.target_feat != nullptr;
     if (!build_target_step(sg_, w_, cache_, backend_,
                            /*kv_start=*/base_pos, n_tokens,
-                           need_mask, /*capture=*/true,
+                           need_mask, /*capture=*/capture_features,
                            /*capture_delta_intermediate=*/do_capture,
                            pool ? 0 : fa_window_,
                            /*logits_tail_rows=*/0,
                            kq_stride_pad_,
                            /*capture_moe_router=*/false,
-                           /*kvflash_mask=*/pool)) {
+                           /*kvflash_mask=*/pool,
+                           /*capture_qk=*/false,
+                           /*paged_attention=*/false,
+                           /*n_seqs=*/1,
+                           /*seq_slot=*/0,
+                           /*paged_max_kv_len=*/0,
+                           /*n_prefill_tokens=*/0,
+                           /*prefill_segments=*/nullptr,
+                           /*n_prefill_segments=*/0,
+                           /*n_logits_rows=*/0,
+                           /*compact_slots=*/false,
+                           /*stable_chain_verify=*/true)) {
         std::fprintf(stderr, "verify_batch: build_target_step failed (base=%d n=%d)\n", base_pos, n_tokens);
         return false;
     }
@@ -281,7 +298,7 @@ bool Qwen35DFlashTarget::verify_batch(
         std::fprintf(stderr, "verify_batch: kvflash requires set_rows path\n");
         return false;
     }
-    if (pool) {
+    if (sg_.kv_write_rows) {
         // kv_write_rows is [n_tokens, n_head_kv] ne0-major: element
         // (token i, head h) lives at i + h*n_tokens (set_rows asserts
         // b->ne[1] == c->ne[0]). Getting this transposed scrambles
@@ -289,11 +306,22 @@ bool Qwen35DFlashTarget::verify_batch(
         std::vector<int64_t> rows((size_t)n_tokens * w_.n_head_kv);
         for (int h = 0; h < w_.n_head_kv; h++) {
             for (int i = 0; i < n_tokens; i++) {
-                rows[(size_t)h * n_tokens + i] = slots[i];
+                rows[(size_t)h * n_tokens + i] =
+                    pool ? slots[i] : base_pos + i;
             }
         }
         ggml_backend_tensor_set(sg_.kv_write_rows, rows.data(), 0,
                                 sizeof(int64_t) * rows.size());
+    }
+    if (sg_.target_feat_rows) {
+        std::vector<int32_t> feature_rows((size_t)n_tokens);
+        for (int i = 0; i < n_tokens; ++i) {
+            feature_rows[(size_t)i] =
+                (base_pos + i) % cache_.target_feat_cap;
+        }
+        ggml_backend_tensor_set(
+            sg_.target_feat_rows, feature_rows.data(), 0,
+            sizeof(int32_t) * feature_rows.size());
     }
 
     // Embed input tokens and fill positions.
@@ -351,7 +379,16 @@ bool Qwen35DFlashTarget::verify_batch(
                                 sizeof(uint16_t) * mask_buf.size());
     }
 
-    auto st = ggml_backend_graph_compute(backend_, sg_.gf);
+    ggml_status st = GGML_STATUS_FAILED;
+    {
+        const Qwen35RoctxRange roctx_compute(
+            "qwen35.graph_compute",
+            {/*live=*/1, /*bucket=*/n_tokens,
+             /*prefill_tokens=*/0, /*prefill_segments=*/0,
+             /*total_rows=*/n_tokens,
+             /*max_kv_len=*/base_pos + n_tokens});
+        st = ggml_backend_graph_compute(backend_, sg_.gf);
+    }
     if (st != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "verify_batch: compute failed (status=%d)\n", (int)st);
         return false;
@@ -510,7 +547,16 @@ bool Qwen35DFlashTarget::verify_tree(
         ggml_backend_tensor_set(sg_.specla_m_eye,    me.data(), 0, sizeof(float) * me.size());
     }
 
-    auto st = ggml_backend_graph_compute(backend_, sg_.gf);
+    ggml_status st = GGML_STATUS_FAILED;
+    {
+        const Qwen35RoctxRange roctx_compute(
+            "qwen35.graph_compute",
+            {/*live=*/1, /*bucket=*/N,
+             /*prefill_tokens=*/0, /*prefill_segments=*/0,
+             /*total_rows=*/N,
+             /*max_kv_len=*/committed + N});
+        st = ggml_backend_graph_compute(backend_, sg_.gf);
+    }
     if (st != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "verify_tree: compute failed (status=%d)\n", (int)st);
         return false;
@@ -916,14 +962,6 @@ bool Qwen35DFlashTarget::rollback_to(int base_pos, int commit_n) {
         return false;
     }
 
-    const int n_delta = (int)sg_.delta_captures.size();
-    if (n_delta == 0) {
-        if (kFastRollbackDiag) {
-            std::fprintf(stderr, "rollback_to: no delta_captures\n");
-        }
-        return false;
-    }
-
     // SpecLA kept the current candidates out of durable state, so acceptance
     // must rotate their factor bank even when the whole window matched.
     if (specla_active()) {
@@ -936,6 +974,18 @@ bool Qwen35DFlashTarget::rollback_to(int base_pos, int commit_n) {
     if (commit_n >= q_len) {
         cache_.cur_pos = base_pos + commit_n;
         return true;
+    }
+
+    if (kda_replayssm_active()) {
+        return rollback_to_kda_replayssm(base_pos, commit_n);
+    }
+
+    const int n_delta = (int)sg_.delta_captures.size();
+    if (n_delta == 0) {
+        if (kFastRollbackDiag) {
+            std::fprintf(stderr, "rollback_to: no delta_captures\n");
+        }
+        return false;
     }
     const int rollback_idx = commit_n - 1;  // index into per-step intermediates
     GGML_ASSERT(!cache_.ssm_state.empty());
@@ -1070,6 +1120,95 @@ bool Qwen35DFlashTarget::rollback_to(int base_pos, int commit_n) {
     } else {
         cudaStreamSynchronize(stream);
     }
+
+    cache_.cur_pos = base_pos + commit_n;
+    return true;
+}
+
+bool Qwen35DFlashTarget::rollback_to_kda_replayssm(int base_pos,
+                                                   int commit_n) {
+    const int n_delta = (int)sg_.delta_captures.size();
+    const int q_len = cache_.cur_pos - base_pos;
+    if (n_delta <= 0 || commit_n <= 0 || commit_n >= q_len ||
+        n_delta != (int)cache_.ssm_state.size() ||
+        n_delta != (int)cache_.conv_state.size() ||
+        !cache_.kda_replay_k_all || !cache_.kda_replay_v_all ||
+        !cache_.kda_replay_g_all || !cache_.kda_replay_beta_all ||
+        !cache_.kda_replay_state_ptrs ||
+        !cache_.kda_replay_state_ptrs->data) {
+        return false;
+    }
+
+    ggml_tensor * K = cache_.kda_replay_k_all;
+    ggml_tensor * V = cache_.kda_replay_v_all;
+    ggml_tensor * G = cache_.kda_replay_g_all;
+    ggml_tensor * B = cache_.kda_replay_beta_all;
+    const int state_dim = w_.kda_head_dim;
+    const int n_heads = w_.n_head;
+    const int max_tokens = (int)K->ne[3];
+    if (state_dim != 128 || commit_n > max_tokens ||
+        K->type != GGML_TYPE_F32 || V->type != GGML_TYPE_F32 ||
+        G->type != GGML_TYPE_F32 || B->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(K) || !ggml_is_contiguous(V) ||
+        !ggml_is_contiguous(G) || !ggml_is_contiguous(B) ||
+        K->ne[0] != state_dim || K->ne[1] != n_heads ||
+        K->ne[2] != n_delta ||
+        !ggml_are_same_shape(K, V) || !ggml_are_same_shape(K, G) ||
+        B->ne[0] != n_heads || B->ne[1] != n_delta ||
+        B->ne[2] != max_tokens) {
+        return false;
+    }
+
+    const int conv_kernel = w_.ssm_d_conv;
+    for (int il = 0; il < n_delta; ++il) {
+        const DeltaNetCapture & cap = sg_.delta_captures[il];
+        ggml_tensor * state = cache_.ssm_state[il];
+        ggml_tensor * conv = cache_.conv_state[il];
+        if (!cap.kda_replay_k || !cap.kda_replay_v ||
+            !cap.kda_replay_g || !cap.kda_replay_beta ||
+            !cap.conv_input || !state || !conv ||
+            cap.kda_replay_k->ne[2] < commit_n ||
+            cap.kda_replay_beta->ne[1] < commit_n ||
+            cap.conv_input->type != GGML_TYPE_F32 ||
+            conv->type != GGML_TYPE_F32 || state->type != GGML_TYPE_F32 ||
+            commit_n + conv_kernel - 1 > cap.conv_input->ne[0] ||
+            conv->ne[0] != conv_kernel - 1 ||
+            conv->ne[1] != cap.conv_input->ne[1]) {
+            return false;
+        }
+    }
+
+    // The verify ran in place from the pre-step snapshot. Restore that exact
+    // committed state, then replay only the accepted KDA recurrence inputs.
+    if (!restore_ssm_state(cache_, backend_)) return false;
+
+    cudaStream_t stream = nullptr;
+    bool launched = false;
+    if (!kda_replayssm_commit_async(
+            (float * const *)cache_.kda_replay_state_ptrs->data,
+            (const float *)K->data, (const float *)V->data,
+            (const float *)G->data, (const float *)B->data,
+            commit_n, state_dim, n_heads, n_delta, max_tokens,
+            stream, &launched)) {
+        return false;
+    }
+
+    // Conv windows are already captured as [old K-1 | verify tokens]. The
+    // window beginning at accepted is the exact state after that prefix.
+    for (int il = 0; il < n_delta; ++il) {
+        const ggml_tensor * input = sg_.delta_captures[il].conv_input;
+        const size_t element = ggml_element_size(input);
+        const size_t width = (size_t)(conv_kernel - 1) * element;
+        const void * source =
+            (const char *)input->data + (size_t)commit_n * element;
+        if (cudaMemcpy2DAsync(cache_.conv_state[il]->data, width,
+                              source, input->nb[1], width,
+                              (size_t)input->ne[1],
+                              cudaMemcpyDeviceToDevice, stream) != cudaSuccess) {
+            return false;
+        }
+    }
+    if (cudaStreamSynchronize(stream) != cudaSuccess) return false;
 
     cache_.cur_pos = base_pos + commit_n;
     return true;

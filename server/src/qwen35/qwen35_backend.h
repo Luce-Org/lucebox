@@ -22,6 +22,7 @@
 #include <limits>
 #include "dflash_feature_ring.h"
 #include "common/dflash_draft_kv.h"
+#include "common/dspark_head.h"
 #include "common/concurrency/paged_kv_pool.h"
 #include "concurrency/qwen35_seq_engine.h"
 #include "internal.h"         // TargetWeights, TargetCache, DraftWeights, PrefixSnapshot
@@ -169,9 +170,52 @@ protected:
     // Hook after kvflash pool sizing, before create_target_cache: a subclass
     // may disable the pool (kvflash_tokens_=0) when it is redundant. Default no-op.
     virtual bool post_kvflash_init_gate() { return true; }
+    virtual void reset_arch_request_state() {}
     virtual void after_target_compute(StepGraph &,
                                       int /*kv_start*/,
                                       int /*n_tokens*/) {}
+    virtual bool after_prefill_compute(
+        StepGraph & sg,
+        int kv_start,
+        int n_tokens,
+        const int32_t * next_tokens,
+        bool is_final_chunk) {
+        (void)next_tokens;
+        (void)is_final_chunk;
+        after_target_compute(sg, kv_start, n_tokens);
+        return true;
+    }
+    virtual bool has_embedded_spec_decode() const { return false; }
+    virtual bool run_embedded_spec_decode(
+        int committed,
+        int n_gen,
+        std::vector<int32_t> & out_tokens,
+        const DaemonIO & io,
+        float & out_accept_rate,
+        bool & out_spec_ran,
+        const BudgetHook * budget_hook,
+        bool * forced_close_out,
+        bool * degenerate_close_out) {
+        (void)committed;
+        (void)n_gen;
+        (void)out_tokens;
+        (void)io;
+        (void)out_accept_rate;
+        (void)out_spec_ran;
+        (void)budget_hook;
+        (void)forced_close_out;
+        (void)degenerate_close_out;
+        return false;
+    }
+
+    bool run_standard_ar_decode(
+        int committed,
+        int n_gen,
+        std::vector<int32_t> & out_tokens,
+        const DaemonIO & io,
+        const BudgetHook & budget_hook = {},
+        bool * forced_close_out = nullptr,
+        bool * degenerate_close_out = nullptr);
 
     TargetWeights & target_weights() { return w_; }
     const TargetWeights & target_weights() const { return w_; }
@@ -270,6 +314,7 @@ private:
     // [TAG_DRAFT_KV] drafter context-KV ring cache (lazy-init; kill with
     // DFLASH_DRAFT_KV=0). Shared module: common/dflash_draft_kv.h.
     DraftKvState draft_kv_;
+    DsparkMarkovChainCache dspark_chain_cache_;
     DFlashDraftIpcClient remote_draft_;
 
     // ── Prefix cache (snapshots) ─────────────────────────────────────

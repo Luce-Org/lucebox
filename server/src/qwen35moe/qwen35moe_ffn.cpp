@@ -13,12 +13,35 @@ Qwen35MoeRouterOutputs build_qwen35moe_router(
     ggml_tensor *         cur,
     const TargetWeights & w,
     const TargetLayer &   L,
-    bool                  allow_fused_router) {
+    bool                  allow_fused_router,
+    bool                  allow_grouped_router) {
     const int n_tokens = (int)cur->ne[1];
     const int n_expert = w.n_expert;
     const int n_used   = w.n_expert_used;
 
     ggml_tensor * logits = apply_scale2(ctx, ggml_mul_mat(ctx, L.ffn_gate_inp, cur), L.ffn_gate_inp_s);
+
+    // Ling decode and fixed-width verification: perform sigmoid,
+    // correction-bias grouped selection, final top-k, and selected-weight
+    // normalization in one CUDA kernel. The generic graph remains the fallback
+    // for prefill and other MoE layouts/backends.
+    if (allow_grouped_router && allow_fused_router && n_tokens > 0 &&
+        w.expert_gating_func == 2 && n_expert == 512 &&
+        w.n_expert_groups == 8 && w.n_expert_groups_used == 4 &&
+        n_used == 8 && w.expert_weights_norm && L.ffn_exp_probs_b) {
+        ggml_tensor * weights = ggml_new_tensor_2d(
+            ctx, GGML_TYPE_F32, n_used, n_tokens);
+        const float weights_scale = w.expert_weights_scale == 0.0f
+            ? 1.0f
+            : w.expert_weights_scale;
+        ggml_tensor * selected = ggml_grouped_top_k_moe(
+            ctx, logits, L.ffn_exp_probs_b, weights,
+            w.n_expert_groups, w.n_expert_groups_used,
+            /*n_group_score_used=*/2, weights_scale);
+        mmid_adaptive_k_attach(selected, weights, n_tokens, -1, nullptr);
+        return {selected, weights};
+    }
+
     ggml_tensor * probs = nullptr;
     switch (w.expert_gating_func) {
         case 2:
@@ -114,13 +137,16 @@ ggml_tensor * build_qwen35moe_ffn(
     ggml_tensor *         cur,
     const TargetWeights & w,
     const TargetLayer &   L,
-    ggml_tensor **        selected_out) {
+    ggml_tensor **        selected_out,
+    bool                  allow_grouped_router) {
     const int n_tokens = (int)cur->ne[1];
     const int n_used   = w.n_expert_used;
     const int n_embd   = w.n_embd;
     const int n_ff_exp = w.n_ff_exp;
 
-    Qwen35MoeRouterOutputs router = build_qwen35moe_router(ctx, cur, w, L);
+    Qwen35MoeRouterOutputs router = build_qwen35moe_router(
+        ctx, cur, w, L, /*allow_fused_router=*/true,
+        allow_grouped_router);
     ggml_tensor * selected = router.selected;
     ggml_tensor * weights = router.weights;
     if (selected_out) {

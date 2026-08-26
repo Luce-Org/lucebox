@@ -53,9 +53,12 @@ static bool ensure_staging(DraftFeatureMirror & mirror, size_t bytes) {
     return true;
 }
 
-static ggml_type parse_feature_dtype() {
+static ggml_type parse_feature_dtype(ggml_type preferred) {
     const char * s = std::getenv("DFLASH_FEATURE_DTYPE");
-    if (!s || !s[0] || std::strcmp(s, "f32") == 0 || std::strcmp(s, "F32") == 0) {
+    if (!s || !s[0]) {
+        return preferred == GGML_TYPE_COUNT ? GGML_TYPE_F32 : preferred;
+    }
+    if (std::strcmp(s, "f32") == 0 || std::strcmp(s, "F32") == 0) {
         return GGML_TYPE_F32;
     }
     if (std::strcmp(s, "f16") == 0 || std::strcmp(s, "F16") == 0) {
@@ -274,14 +277,15 @@ bool draft_feature_mirror_init(DraftFeatureMirror & mirror,
                                int target_device,
                                int cap,
                                int n_target_layers,
-                               int hidden_size) {
+                               int hidden_size,
+                               ggml_type preferred_storage_type) {
     draft_feature_mirror_free(mirror);
     if (cap <= 0 || n_target_layers <= 0 || hidden_size <= 0) return false;
     mirror.device = device;
     mirror.target_device = target_device;
     mirror.n_target_layers = n_target_layers;
     mirror.hidden_size = hidden_size;
-    mirror.storage_type = parse_feature_dtype();
+    mirror.storage_type = parse_feature_dtype(preferred_storage_type);
     if (!check_feature_width_compatible(mirror.storage_type, hidden_size) ||
         !check_feature_width_compatible(mirror.storage_type, n_target_layers * hidden_size)) {
         std::fprintf(stderr,
@@ -541,7 +545,7 @@ bool copy_feature_ring_range_to_tensor(
     if (n_tokens <= 0 || n_tokens > feature_ring.cap) return false;
 
     const int fc_in = feature_ring.n_target_layers * feature_ring.hidden_size;
-    const size_t row_bytes = (size_t)fc_in * sizeof(float);
+    const size_t dst_row_bytes = ggml_row_size(dst->type, fc_in);
     const size_t src_stride = feature_ring.target_feat->nb[1];
     const size_t dst_stride = dst->nb[1];
     int done = 0;
@@ -551,14 +555,14 @@ bool copy_feature_ring_range_to_tensor(
         const char * src_base =
             (const char *)feature_ring.target_feat->data + (size_t)slot * src_stride;
         char * dst_base = (char *)dst->data + (size_t)done * dst_stride;
-        if (feature_ring.storage_type == GGML_TYPE_F32 &&
-            src_stride == row_bytes && dst_stride == row_bytes) {
+        if (feature_ring.storage_type == dst->type &&
+            src_stride == dst_row_bytes && dst_stride == dst_row_bytes) {
             if (!copy_peer_async(dst_base, feature_ring.device,
                                  src_base, feature_ring.device,
-                                 row_bytes * (size_t)run)) {
+                                 dst_row_bytes * (size_t)run)) {
                 return false;
             }
-        } else {
+        } else if (dst->type == GGML_TYPE_F32) {
             for (int i = 0; i < run; i++) {
                 if (!copy_feature_to_f32(
                         const_cast<DraftFeatureMirror &>(feature_ring),
@@ -569,6 +573,12 @@ bool copy_feature_ring_range_to_tensor(
                     return false;
                 }
             }
+        } else {
+            std::fprintf(stderr,
+                "[dflash-feature] unsupported ring copy %s -> %s\n",
+                ggml_type_name(feature_ring.storage_type),
+                ggml_type_name(dst->type));
+            return false;
         }
         done += run;
     }

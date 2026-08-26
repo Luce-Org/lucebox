@@ -31,6 +31,20 @@ struct StepGraph {
     // When the real ctx_len fits within this, alloc_graph is a no-op.
     int alloc_reserved_ctx = 0;
 
+    // Ling AR graphs are position-invariant within one 256-token MLA cache
+    // bucket: positions, mask contents, embeddings, and KV destination rows
+    // are all graph inputs. A positive value records the bucket represented
+    // by this live graph so consecutive decode steps can execute it directly.
+    int bailing_ar_kv_bucket = 0;
+    // Ling chain verification has the same invariant once both KV and target
+    // feature destinations are graph inputs. Width distinguishes DSpark's
+    // root-inclusive block from other external drafters.
+    int bailing_verify_kv_bucket = 0;
+    int bailing_verify_width = 0;
+    int bailing_verify_pending_count = -1;
+    int bailing_verify_pending_bank = -1;
+    bool bailing_verify_capture_delta = false;
+
     // Named inputs
     ggml_tensor *   inp_embed = nullptr;
     ggml_tensor *   positions = nullptr;
@@ -57,6 +71,9 @@ struct StepGraph {
     // Used by contiguous replay, KVFlash, and paged attention; null when the
     // graph uses the legacy contiguous ggml_cpy write.
     ggml_tensor *   kv_write_rows = nullptr;
+    // [n_tokens] i32 feature-ring destination rows. Ling verify uses this to
+    // keep feature capture position-independent and CUDA-graph replayable.
+    ggml_tensor *   target_feat_rows = nullptr;
     // Compact decode row -> physical sequence slot. Padding rows carry -1.
     // state_slot_ids has the same shape but maps padding to a safe readable
     // slot for graph-level conv-state gathers.
@@ -73,6 +90,7 @@ struct StepGraph {
     // Output
     ggml_tensor *   logits = nullptr;
     ggml_tensor *   hidden_states = nullptr;       // draft hidden-only output
+    ggml_tensor *   hidden_tail = nullptr;         // final hidden row, kept for MTP feedback
     ggml_tensor *   argmax_tokens = nullptr; // [n_tokens] i32, GPU-side argmax of logits
     ggml_tensor *   topk_indices = nullptr;  // [K, n_tokens] i32, GPU-side top-K indices
     ggml_tensor *   ffn_residual = nullptr;  // [hidden, n_tokens] pre-FFN residual
@@ -95,12 +113,19 @@ inline void step_graph_free(StepGraph & sg) {
     sg.target_hidden_cat = sg.positions_k = nullptr;
     sg.pad_mask_full = nullptr;
     sg.ctx_alloc = 0;
+    sg.bailing_ar_kv_bucket = 0;
+    sg.bailing_verify_kv_bucket = 0;
+    sg.bailing_verify_width = 0;
+    sg.bailing_verify_pending_count = -1;
+    sg.bailing_verify_pending_bank = -1;
+    sg.bailing_verify_capture_delta = false;
     sg.built_view = false;
     sg.hidden_input = nullptr;
     sg.parent_ids = nullptr;
     sg.specla_m_strict = sg.specla_m_incl = sg.specla_m_eye = nullptr;
     sg.specla_hld = nullptr;
     sg.kv_write_rows = nullptr;
+    sg.target_feat_rows = nullptr;
     sg.active_slot_ids = nullptr;
     sg.state_slot_ids = nullptr;
     sg.paged_query_seq_ids = nullptr;
@@ -108,6 +133,7 @@ inline void step_graph_free(StepGraph & sg) {
     sg.logits_row_indices = nullptr;
     sg.logits = nullptr;
     sg.hidden_states = nullptr;
+    sg.hidden_tail = nullptr;
     sg.argmax_tokens = nullptr;
     sg.topk_indices = nullptr;
     sg.ffn_residual = nullptr;

@@ -24,13 +24,15 @@ Qwen35MoeRouterOutputs build_qwen35moe_router(
     // reads one row and is unaffected). ggml_top_k is contiguous by
     // construction, and cheaper than a full argsort where the fusion
     // cannot apply anyway.
-    bool                  allow_fused_router = true);
+    bool                  allow_fused_router = true,
+    bool                  allow_grouped_router = false);
 
 ggml_tensor * build_qwen35moe_ffn(
     ggml_context *        ctx,
     ggml_tensor *         cur,   // [hidden, n_tokens], post-attention normed
     const TargetWeights & w,
     const TargetLayer &   L,
-    ggml_tensor **        selected_out = nullptr);
+    ggml_tensor **        selected_out = nullptr,
+    bool                  allow_grouped_router = false);
 
 }  // namespace dflash::common

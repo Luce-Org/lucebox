@@ -605,7 +605,7 @@ void test_model_capability_tables() {
     }
 
     // arch_is_supported() must match create_backend()'s dispatch chain.
-    for (const char * arch : {"qwen35", "qwen35moe", "laguna",
+    for (const char * arch : {"qwen35", "qwen35moe", "bailingmoe3", "laguna",
                               "qwen3", "gemma4", "deepseek4"}) {
         CHECK(arch_is_supported(arch));
     }
@@ -635,6 +635,8 @@ void test_model_capability_tables() {
     CHECK(arch_supports_paged_attention("qwen35", false));
     CHECK(!arch_supports_paged_attention("qwen35", true));
     CHECK(!arch_supports_paged_attention("qwen35moe", false));
+    CHECK(arch_supports_decode_draft("bailingmoe3", false));
+    CHECK(!arch_supports_decode_draft("bailingmoe3", true));
 }
 
 };

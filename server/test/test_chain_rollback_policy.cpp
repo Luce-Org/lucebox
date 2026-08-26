@@ -12,6 +12,7 @@
 
 using dflash::common::resolve_chain_rollback_policy;
 using dflash::common::RollbackDiag;
+using dflash::common::should_attempt_chain_fast_rollback;
 using dflash::common::split_chain_fast_rollback_enabled;
 
 namespace {
@@ -95,6 +96,19 @@ TEST_CASE(ChainRollbackPolicyFixture, split_fast_rollback_is_explicitly_opt_in) 
     setenv("DFLASH_SPLIT_FAST_ROLLBACK", "", 1);
     CHECK(!split_chain_fast_rollback_enabled());
     unsetenv("DFLASH_SPLIT_FAST_ROLLBACK");
+}
+
+TEST_CASE(ChainRollbackPolicyFixture, capture_free_verify_only_rolls_back_full_accepts) {
+    CHECK(!should_attempt_chain_fast_rollback(
+        /*supported=*/false, /*captured=*/true, /*full=*/true, 9, 5));
+    CHECK(!should_attempt_chain_fast_rollback(
+        /*supported=*/true, /*captured=*/false, /*full=*/false, 8, 5));
+    CHECK(should_attempt_chain_fast_rollback(
+        /*supported=*/true, /*captured=*/false, /*full=*/true, 9, 5));
+    CHECK(!should_attempt_chain_fast_rollback(
+        /*supported=*/true, /*captured=*/true, /*full=*/false, 4, 5));
+    CHECK(should_attempt_chain_fast_rollback(
+        /*supported=*/true, /*captured=*/true, /*full=*/false, 5, 5));
 }
 
 TEST_CASE(ChainRollbackPolicyFixture, split_checkpoint_dtype_is_gated_at_allocation) {

@@ -378,17 +378,22 @@ bool create_target_cache_partial(const TargetWeights & w,
     return true;
 }
 
-static void refresh_specla_state_ptrs(TargetCache & c) {
-    if (!c.specla_state_ptrs) return;
+static void refresh_recurrent_pointer_tables(TargetCache & c) {
     const int n_delta = (int)c.ssm_state.size();
-    if (c.specla_state_ptrs->ne[0] != n_delta) return;
     std::vector<int64_t> ptrs((size_t)n_delta, 0);
     for (int dn = 0; dn < n_delta; dn++) {
         if (!c.ssm_state[dn]) return;
         ptrs[(size_t)dn] = (int64_t)(intptr_t)c.ssm_state[dn]->data;
     }
-    ggml_backend_tensor_set(c.specla_state_ptrs, ptrs.data(), 0,
-                            sizeof(int64_t) * ptrs.size());
+    if (c.specla_state_ptrs && c.specla_state_ptrs->ne[0] == n_delta) {
+        ggml_backend_tensor_set(c.specla_state_ptrs, ptrs.data(), 0,
+                                sizeof(int64_t) * ptrs.size());
+    }
+    if (c.kda_replay_state_ptrs &&
+        c.kda_replay_state_ptrs->ne[0] == n_delta) {
+        ggml_backend_tensor_set(c.kda_replay_state_ptrs, ptrs.data(), 0,
+                                sizeof(int64_t) * ptrs.size());
+    }
     if (c.specla_conv_state_ptrs &&
         c.specla_conv_state_ptrs->ne[0] == n_delta &&
         (int)c.conv_state.size() == n_delta) {
@@ -433,6 +438,15 @@ void free_target_cache(TargetCache & c) {
     c.ssm_intermediate.clear();
     c.conv_input_cache.clear();
     c.conv_input_cache_alt.clear();
+    c.kda_replay_k.clear();
+    c.kda_replay_v.clear();
+    c.kda_replay_g.clear();
+    c.kda_replay_beta.clear();
+    c.kda_replay_k_all = nullptr;
+    c.kda_replay_v_all = nullptr;
+    c.kda_replay_g_all = nullptr;
+    c.kda_replay_beta_all = nullptr;
+    c.kda_replay_state_ptrs = nullptr;
     c.factor_k.clear();
     c.factor_v_new.clear();
     c.factor_g_ps.clear();
@@ -466,7 +480,7 @@ void reset_target_cache(TargetCache & c) {
             ggml_backend_get_default_buffer_type(c.backend))) {
         if (c.base_buf) ggml_backend_buffer_clear(c.base_buf, 0);
         if (c.rollback_buf) ggml_backend_buffer_clear(c.rollback_buf, 0);
-        refresh_specla_state_ptrs(c);
+        refresh_recurrent_pointer_tables(c);
         return;
     }
     std::vector<uint8_t> zeros(1 * 1024 * 1024, 0);
@@ -487,7 +501,7 @@ void reset_target_cache(TargetCache & c) {
     }
     // reset_target_cache clears the whole rollback buffer, including this
     // persistent device pointer table. Re-upload it for daemon request 2+.
-    refresh_specla_state_ptrs(c);
+    refresh_recurrent_pointer_tables(c);
 }
 
 void reset_recurrent_state(TargetCache & c) {
@@ -527,6 +541,14 @@ void reset_recurrent_slot(TargetCache & c, int slot) {
     for (ggml_tensor * t : c.conv_state) clear_slot(t);
 }
 
+static bool bailing_replayssm_enabled() {
+    static const bool enabled = []() {
+        const char * value = std::getenv("DFLASH_BAILING_REPLAYSSM");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
 // Attach rollback tensors to an existing prefill cache without touching the
 // base tensors (KV, SSM, conv, target_feat) that prefill already populated.
 // No D2D copies — the base tensors stay right where the graph wrote them.
@@ -557,7 +579,11 @@ bool migrate_prefill_cache(const TargetWeights & w,
     // SpecLA replaces the dense per-token state checkpoints with compact
     // per-token factor buffers (~(S_k+S_v+1)·H_v·max_q·4B per layer vs
     // state_size·max_q per layer) — the paper's §5.1 memory trade.
-    const bool specla = enable_specla && specla_enabled();
+    const bool meta_backend = ggml_backend_buft_is_meta(
+        ggml_backend_get_default_buffer_type(backend));
+    const bool specla = enable_specla && !w.is_bailingmoe3 && specla_enabled();
+    const bool kda_replayssm = w.is_bailingmoe3 && !meta_backend &&
+        bailing_replayssm_enabled();
     if (specla) {
         cache.factor_k.assign(n_delta, nullptr);
         cache.factor_v_new.assign(n_delta, nullptr);
@@ -566,8 +592,16 @@ bool migrate_prefill_cache(const TargetWeights & w,
         cache.factor_v_new_alt.assign(n_delta, nullptr);
         cache.factor_g_ps_alt.assign(n_delta, nullptr);
     }
+    if (kda_replayssm) {
+        cache.kda_replay_k.assign(n_delta, nullptr);
+        cache.kda_replay_v.assign(n_delta, nullptr);
+        cache.kda_replay_g.assign(n_delta, nullptr);
+        cache.kda_replay_beta.assign(n_delta, nullptr);
+    }
 
-    const int rb_tensors = (specla ? 12 : 4) * n_delta + (specla ? 1 : 0);
+    const int rb_tensors = specla
+        ? 12 * n_delta + 8
+        : (kda_replayssm ? 7 * n_delta + 8 : 4 * n_delta);
     ggml_init_params ip{};
     ip.mem_size   = (size_t)(rb_tensors + 16) * ggml_tensor_overhead();
     ip.mem_buffer = nullptr;
@@ -622,6 +656,29 @@ bool migrate_prefill_cache(const TargetWeights & w,
         ggml_set_name(cache.specla_conv_state_ptrs, "specla_conv_state_ptrs");
         ggml_set_name(cache.specla_factor_ptrs, "specla_factor_ptrs");
     }
+    if (kda_replayssm) {
+        const int state_dim = w.kda_head_dim;
+        cache.kda_replay_k_all = ggml_new_tensor_4d(
+            cache.rollback_ctx, GGML_TYPE_F32, state_dim, w.n_head,
+            n_delta, max_verify_tokens);
+        cache.kda_replay_v_all = ggml_new_tensor_4d(
+            cache.rollback_ctx, GGML_TYPE_F32, state_dim, w.n_head,
+            n_delta, max_verify_tokens);
+        cache.kda_replay_g_all = ggml_new_tensor_4d(
+            cache.rollback_ctx, GGML_TYPE_F32, state_dim, w.n_head,
+            n_delta, max_verify_tokens);
+        cache.kda_replay_beta_all = ggml_new_tensor_3d(
+            cache.rollback_ctx, GGML_TYPE_F32, w.n_head,
+            n_delta, max_verify_tokens);
+        cache.kda_replay_state_ptrs = ggml_new_tensor_1d(
+            cache.rollback_ctx, GGML_TYPE_I64, n_delta);
+        ggml_set_name(cache.kda_replay_k_all, "kda_replay_k_all");
+        ggml_set_name(cache.kda_replay_v_all, "kda_replay_v_all");
+        ggml_set_name(cache.kda_replay_g_all, "kda_replay_g_all");
+        ggml_set_name(cache.kda_replay_beta_all, "kda_replay_beta_all");
+        ggml_set_name(cache.kda_replay_state_ptrs,
+                      "kda_replay_state_ptrs");
+    }
     int dn_idx = 0;
     for (int il = 0; il < w.n_layer; il++) {
         if (((il + 1) % w.full_attention_interval) != 0) {
@@ -649,7 +706,7 @@ bool migrate_prefill_cache(const TargetWeights & w,
                 std::snprintf(name, sizeof(name), "conv_input_cache_alt_%d", il);
                 ggml_set_name(Ci_alt, name);
             }
-            if (!specla) {
+            if (!specla && !kda_replayssm) {
                 ggml_tensor * Si = ggml_new_tensor_4d(cache.rollback_ctx, checkpoint_type,
                                                        head_v_dim, head_v_dim,
                                                        w.ssm_dt_rank, max_verify_tokens);
@@ -672,6 +729,16 @@ bool migrate_prefill_cache(const TargetWeights & w,
             "[target-single][chain-rollback] checkpoint_dtype=%s delta_layers=%d max_verify_tokens=%d checkpoint_bytes=%zu\n",
             allocated_checkpoint_type == GGML_TYPE_COUNT ? "missing" : ggml_type_name(allocated_checkpoint_type),
             n_delta, max_verify_tokens, checkpoint_bytes);
+        if (kda_replayssm) {
+            const size_t replay_bytes =
+                ggml_nbytes(cache.kda_replay_k_all) +
+                ggml_nbytes(cache.kda_replay_v_all) +
+                ggml_nbytes(cache.kda_replay_g_all) +
+                ggml_nbytes(cache.kda_replay_beta_all);
+            std::fprintf(stderr,
+                "[target-single][kda-replayssm] enabled=1 factor_bytes=%zu state_dim=%d heads=%d layers=%d\n",
+                replay_bytes, w.kda_head_dim, w.n_head, n_delta);
+        }
     }
     if (!cache.rollback_buf) {
         set_last_error("ggml_backend_alloc_ctx_tensors failed for rollback cache");
@@ -739,10 +806,32 @@ bool migrate_prefill_cache(const TargetWeights & w,
                 cache.conv_factor_all_alt->nb[2]*max_verify_tokens,
                 (size_t)dn*cache.conv_factor_all_alt->nb[1]);
         }
-        // State addresses are stable for the cache's lifetime. The same helper
-        // is also called after reset_target_cache clears rollback scratch.
-        refresh_specla_state_ptrs(cache);
     }
+
+    if (kda_replayssm) {
+        ggml_tensor * K = cache.kda_replay_k_all;
+        ggml_tensor * V = cache.kda_replay_v_all;
+        ggml_tensor * G = cache.kda_replay_g_all;
+        ggml_tensor * B = cache.kda_replay_beta_all;
+        for (int dn = 0; dn < n_delta; ++dn) {
+            cache.kda_replay_k[dn] = ggml_view_3d(
+                cache.rollback_ctx, K, K->ne[0], K->ne[1], max_verify_tokens,
+                K->nb[1], K->nb[3], (size_t)dn * K->nb[2]);
+            cache.kda_replay_v[dn] = ggml_view_3d(
+                cache.rollback_ctx, V, V->ne[0], V->ne[1], max_verify_tokens,
+                V->nb[1], V->nb[3], (size_t)dn * V->nb[2]);
+            cache.kda_replay_g[dn] = ggml_view_3d(
+                cache.rollback_ctx, G, G->ne[0], G->ne[1], max_verify_tokens,
+                G->nb[1], G->nb[3], (size_t)dn * G->nb[2]);
+            cache.kda_replay_beta[dn] = ggml_view_2d(
+                cache.rollback_ctx, B, B->ne[0], max_verify_tokens,
+                B->nb[2], (size_t)dn * B->nb[1]);
+        }
+    }
+
+    // State addresses are stable for the cache's lifetime. The same helper is
+    // called after reset_target_cache clears rollback scratch.
+    refresh_recurrent_pointer_tables(cache);
 
     return true;
 }
@@ -1367,30 +1456,46 @@ static ggml_tensor * build_bailingmoe3_mla_block(
     ggml_tensor * cache_k,
     ggml_tensor * cache_v,
     ggml_tensor * attn_mask,
+    ggml_tensor * kv_write_rows,
     int kv_start,
-    int n_tokens) {
+    int n_tokens,
+    int query_tail_rows = 0) {
     const int n_head = w.n_head;
     const int qk_dim = w.mla_qk_head_dim;
     const int rope_dim = w.rope_dimension_count;
     const int nope_dim = qk_dim - rope_dim;
     const int kv_rank = w.kv_lora_rank;
     const int v_dim = w.mla_v_head_dim;
+    const int n_queries = query_tail_rows > 0
+        ? std::min(query_tail_rows, n_tokens)
+        : n_tokens;
+    const int query_begin = n_tokens - n_queries;
     GGML_ASSERT(attn_mask != nullptr);
+
+    // Predictor prefill needs K/V for every prompt row, but only the final
+    // row's attention, MoE, and logits. Keep the full normalized input for
+    // the latent-cache projection and slice the query path independently.
+    ggml_tensor * query_cur = cur;
+    if (n_queries < n_tokens) {
+        query_cur = ggml_view_2d(
+            ctx, cur, cur->ne[0], n_queries, cur->nb[1],
+            static_cast<size_t>(query_begin) * cur->nb[1]);
+    }
 
     ggml_tensor * q_all = nullptr;
     if (L.attn_q_a) {
-        q_all = ggml_mul_mat(ctx, L.attn_q_a, cur);
+        q_all = ggml_mul_mat(ctx, L.attn_q_a, query_cur);
         q_all = rms_norm_mul(ctx, q_all, L.attn_q_a_norm, w.rms_eps);
         q_all = ggml_mul_mat(ctx, L.attn_q_b, q_all);
     } else {
-        q_all = ggml_mul_mat(ctx, L.wq, cur);
+        q_all = ggml_mul_mat(ctx, L.wq, query_cur);
     }
-    q_all = ggml_reshape_3d(ctx, q_all, qk_dim, n_head, n_tokens);
+    q_all = ggml_reshape_3d(ctx, q_all, qk_dim, n_head, n_queries);
     ggml_tensor * q_nope = ggml_view_3d(
-        ctx, q_all, nope_dim, n_head, n_tokens,
+        ctx, q_all, nope_dim, n_head, n_queries,
         q_all->nb[1], q_all->nb[2], 0);
     ggml_tensor * q_pe = ggml_view_3d(
-        ctx, q_all, rope_dim, n_head, n_tokens,
+        ctx, q_all, rope_dim, n_head, n_queries,
         q_all->nb[1], q_all->nb[2],
         static_cast<size_t>(nope_dim) * ggml_element_size(q_all));
 
@@ -1409,11 +1514,17 @@ static ggml_tensor * build_bailingmoe3_mla_block(
         GGML_ASSERT(positions->ne[0] >= n_tokens);
         rope_positions = ggml_view_1d(ctx, positions, n_tokens, 0);
     }
+    ggml_tensor * query_positions = rope_positions;
+    if (n_queries < n_tokens) {
+        query_positions = ggml_view_1d(
+            ctx, rope_positions, n_queries,
+            static_cast<size_t>(query_begin) * rope_positions->nb[0]);
+    }
 
     // Bailing V3 uses interleaved rotary pairs, i.e. GGML's NORMAL layout.
     q_pe = ggml_cont(ctx, q_pe);
     k_pe = ggml_cont(ctx, k_pe);
-    q_pe = ggml_rope_ext(ctx, q_pe, rope_positions, nullptr,
+    q_pe = ggml_rope_ext(ctx, q_pe, query_positions, nullptr,
                           rope_dim, GGML_ROPE_TYPE_NORMAL, 0,
                           w.rope_theta, 1.0f,
                           0.0f, 1.0f, 0.0f, 0.0f);
@@ -1436,16 +1547,29 @@ static ggml_tensor * build_bailingmoe3_mla_block(
     // Persistent latent cache: [D,T,1].
     ggml_tensor * k_write = ggml_permute(ctx, k_cur, 0, 2, 1, 3);
     ggml_tensor * v_write = ggml_permute(ctx, v_cur, 0, 2, 1, 3);
-    ggml_tensor * k_slot = ggml_view_3d(
-        ctx, cache_k, kv_rank + rope_dim, n_tokens, 1,
-        cache_k->nb[1], cache_k->nb[2],
-        static_cast<size_t>(kv_start) * cache_k->nb[1]);
-    ggml_tensor * v_slot = ggml_view_3d(
-        ctx, cache_v, kv_rank, n_tokens, 1,
-        cache_v->nb[1], cache_v->nb[2],
-        static_cast<size_t>(kv_start) * cache_v->nb[1]);
-    ggml_build_forward_expand(gf, ggml_cpy(ctx, k_write, k_slot));
-    ggml_build_forward_expand(gf, ggml_cpy(ctx, v_write, v_slot));
+    if (kv_write_rows) {
+        // Decode keeps the destination tensor fixed and uploads the row index
+        // separately. That makes every node property stable within a
+        // 256-token attention bucket, allowing ggml-cuda to replay its
+        // captured graph instead of relaunching thousands of kernels.
+        k_write = ggml_is_contiguous(k_write) ? k_write : ggml_cont(ctx, k_write);
+        v_write = ggml_is_contiguous(v_write) ? v_write : ggml_cont(ctx, v_write);
+        ggml_build_forward_expand(
+            gf, ggml_set_rows(ctx, cache_k, k_write, kv_write_rows));
+        ggml_build_forward_expand(
+            gf, ggml_set_rows(ctx, cache_v, v_write, kv_write_rows));
+    } else {
+        ggml_tensor * k_slot = ggml_view_3d(
+            ctx, cache_k, kv_rank + rope_dim, n_tokens, 1,
+            cache_k->nb[1], cache_k->nb[2],
+            static_cast<size_t>(kv_start) * cache_k->nb[1]);
+        ggml_tensor * v_slot = ggml_view_3d(
+            ctx, cache_v, kv_rank, n_tokens, 1,
+            cache_v->nb[1], cache_v->nb[2],
+            static_cast<size_t>(kv_start) * cache_v->nb[1]);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, k_write, k_slot));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, v_write, v_slot));
+    }
 
     const int kv_len = kv_start + n_tokens;
     // The 576x512 CUDA flash-attention specialization requires the compressed
@@ -1472,11 +1596,11 @@ static ggml_tensor * build_bailingmoe3_mla_block(
     attn = ggml_mul_mat(ctx, L.attn_v_b, attn);
     attn = ggml_cont(ctx, ggml_permute(ctx, attn, 0, 2, 1, 3));
 
-    ggml_tensor * gate = ggml_mul_mat(ctx, L.wqkv_gate, cur);
+    ggml_tensor * gate = ggml_mul_mat(ctx, L.wqkv_gate, query_cur);
     gate = ggml_sigmoid(ctx,
-        ggml_reshape_3d(ctx, gate, 1, n_head, n_tokens));
+        ggml_reshape_3d(ctx, gate, 1, n_head, n_queries));
     attn = ggml_mul(ctx, attn, gate);
-    attn = ggml_cont_2d(ctx, attn, v_dim * n_head, n_tokens);
+    attn = ggml_cont_2d(ctx, attn, v_dim * n_head, n_queries);
     return ggml_mul_mat(ctx, L.wo, attn);
 }
 
@@ -1492,7 +1616,9 @@ static ggml_tensor * build_bailingmoe3_causal_conv1d(
     int d_inner,
     int head_dim,
     int n_head,
-    int n_tokens) {
+    int n_tokens,
+    ggml_tensor * capture_conv_input,
+    bool fuse_state_update) {
     const size_t state_element = ggml_element_size(all_conv_state);
     const size_t channel_stride = all_conv_state->nb[1];
     ggml_tensor * conv_state = ggml_view_3d(
@@ -1502,17 +1628,39 @@ static ggml_tensor * build_bailingmoe3_causal_conv1d(
 
     ggml_tensor * projected = ggml_mul_mat(ctx, projection, cur);
     projected = ggml_reshape_3d(ctx, projected, d_inner, n_tokens, 1);
-    ggml_tensor * conv_input =
-        ggml_concat(ctx, conv_state, ggml_transpose(ctx, projected), 0);
+    GGML_ASSERT(!fuse_state_update ||
+                (n_tokens == 1 && capture_conv_input == nullptr));
+    ggml_tensor * conv_input = nullptr;
+    if (!fuse_state_update) {
+        conv_input =
+            ggml_concat(ctx, conv_state, ggml_transpose(ctx, projected), 0);
+    }
 
-    ggml_tensor * last = ggml_view_3d(
-        ctx, conv_input, d_conv - 1, d_inner, 1,
-        conv_input->nb[1], conv_input->nb[2],
-        static_cast<size_t>(n_tokens) * state_element);
-    ggml_build_forward_expand(gf, ggml_cpy(ctx, last, conv_state));
+    if (capture_conv_input) {
+        const int64_t rows = conv_input->ne[0];
+        GGML_ASSERT(rows <= capture_conv_input->ne[0]);
+        GGML_ASSERT(capture_conv_input->ne[1] == 3 * d_inner);
+        ggml_tensor * dst = ggml_view_3d(
+            ctx, capture_conv_input, rows, d_inner, 1,
+            capture_conv_input->nb[1], capture_conv_input->nb[2],
+            static_cast<size_t>(qkv_index) * d_inner *
+                capture_conv_input->nb[1]);
+        GGML_ASSERT(ggml_nelements(dst) == ggml_nelements(conv_input));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, conv_input, dst));
+    }
+
+    if (!fuse_state_update) {
+        ggml_tensor * last = ggml_view_3d(
+            ctx, conv_input, d_conv - 1, d_inner, 1,
+            conv_input->nb[1], conv_input->nb[2],
+            static_cast<size_t>(n_tokens) * state_element);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, last, conv_state));
+    }
 
     ggml_tensor * conv_2d = ggml_reshape_2d(ctx, conv_weight, d_conv, d_inner);
-    ggml_tensor * result = ggml_ssm_conv(ctx, conv_input, conv_2d);
+    ggml_tensor * result = fuse_state_update
+        ? ggml_ssm_conv_state(ctx, projected, conv_2d, conv_state)
+        : ggml_ssm_conv(ctx, conv_input, conv_2d);
     result = ggml_silu(ctx, ggml_reshape_2d(ctx, result, d_inner, n_tokens));
     return ggml_reshape_4d(ctx, result, head_dim, n_head, n_tokens, 1);
 }
@@ -1527,20 +1675,25 @@ static ggml_tensor * build_bailingmoe3_kda_block(
     ggml_tensor * cur,
     ggml_tensor * conv_state,
     ggml_tensor * ssm_state,
-    int n_tokens) {
+    int n_tokens,
+    DeltaNetCapture * cap,
+    bool fuse_conv_state = false) {
     const int head_dim = w.kda_head_dim;
     const int n_head = w.n_head;
     const int d_inner = head_dim * n_head;
 
     ggml_tensor * q = build_bailingmoe3_causal_conv1d(
         ctx, gf, conv_state, 0, cur, L.wq, L.ssm_conv1d_q,
-        w.ssm_d_conv, d_inner, head_dim, n_head, n_tokens);
+        w.ssm_d_conv, d_inner, head_dim, n_head, n_tokens,
+        cap ? cap->conv_input : nullptr, fuse_conv_state);
     ggml_tensor * k = build_bailingmoe3_causal_conv1d(
         ctx, gf, conv_state, 1, cur, L.wk, L.ssm_conv1d_k,
-        w.ssm_d_conv, d_inner, head_dim, n_head, n_tokens);
+        w.ssm_d_conv, d_inner, head_dim, n_head, n_tokens,
+        cap ? cap->conv_input : nullptr, fuse_conv_state);
     ggml_tensor * v = build_bailingmoe3_causal_conv1d(
         ctx, gf, conv_state, 2, cur, L.wv, L.ssm_conv1d_v,
-        w.ssm_d_conv, d_inner, head_dim, n_head, n_tokens);
+        w.ssm_d_conv, d_inner, head_dim, n_head, n_tokens,
+        cap ? cap->conv_input : nullptr, fuse_conv_state);
 
     ggml_tensor * gate = ggml_mul_mat(ctx, L.ssm_f_a, cur);
     gate = ggml_add(ctx, gate, L.ssm_dt_bias);
@@ -1555,10 +1708,58 @@ static ggml_tensor * build_bailingmoe3_kda_block(
     q = ggml_l2_norm(ctx, q, w.rms_eps);
     k = ggml_l2_norm(ctx, k, w.rms_eps);
 
+    // ReplaySSM captures compact raw recurrence inputs instead of writing an
+    // SxS checkpoint for every candidate token. K is captured after L2 norm,
+    // matching the exact value consumed by the KDA CUDA recurrence.
+    if (cap && (cap->kda_replay_k || cap->kda_replay_v ||
+                cap->kda_replay_g || cap->kda_replay_beta)) {
+        GGML_ASSERT(cap->kda_replay_k && cap->kda_replay_v &&
+                    cap->kda_replay_g && cap->kda_replay_beta);
+        GGML_ASSERT(cap->kda_replay_k->type == GGML_TYPE_F32 &&
+                    cap->kda_replay_v->type == GGML_TYPE_F32 &&
+                    cap->kda_replay_g->type == GGML_TYPE_F32 &&
+                    cap->kda_replay_beta->type == GGML_TYPE_F32);
+        GGML_ASSERT(cap->kda_replay_k->ne[0] == head_dim &&
+                    cap->kda_replay_k->ne[1] == n_head &&
+                    cap->kda_replay_k->ne[2] >= n_tokens);
+        GGML_ASSERT(ggml_are_same_shape(cap->kda_replay_k,
+                                        cap->kda_replay_v) &&
+                    ggml_are_same_shape(cap->kda_replay_k,
+                                        cap->kda_replay_g));
+        GGML_ASSERT(cap->kda_replay_beta->ne[0] == n_head &&
+                    cap->kda_replay_beta->ne[1] >= n_tokens);
+
+        auto capture_vector_factor = [&](ggml_tensor * src,
+                                         ggml_tensor * persistent) {
+            ggml_tensor * dst = ggml_view_4d(
+                ctx, persistent, head_dim, n_head, n_tokens, 1,
+                persistent->nb[1], persistent->nb[2],
+                persistent->nb[2] * (size_t)n_tokens, 0);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, src, dst));
+        };
+        capture_vector_factor(k, cap->kda_replay_k);
+        capture_vector_factor(v, cap->kda_replay_v);
+        capture_vector_factor(gate, cap->kda_replay_g);
+
+        ggml_tensor * beta_2d = ggml_reshape_2d(ctx, beta, n_head, n_tokens);
+        ggml_tensor * beta_dst = ggml_view_2d(
+            ctx, cap->kda_replay_beta, n_head, n_tokens,
+            cap->kda_replay_beta->nb[1], 0);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, beta_2d, beta_dst));
+    }
+
     ggml_tensor * state = ggml_reshape_4d(
         ctx, ssm_state, head_dim, head_dim, n_head, 1);
+    // The single-sequence Bailing path owns this state tensor, so the fused
+    // recurrence can persist its final state directly. This avoids one
+    // full-state copy per recurrent layer on every autoregressive step.
     ggml_tensor * packed =
-        ggml_gated_delta_net(ctx, q, k, v, gate, beta, state);
+        ggml_gated_delta_net_inplace(ctx, q, k, v, gate, beta, state);
+    if (cap && cap->ssm_intermediate_states) {
+        GGML_ASSERT(cap->ssm_intermediate_states->type == GGML_TYPE_F16 ||
+                    cap->ssm_intermediate_states->type == GGML_TYPE_F32);
+        packed->src[7] = cap->ssm_intermediate_states;
+    }
     ggml_gated_delta_net_set_skip_intermediate(packed, true);
 
     const size_t element = ggml_element_size(packed);
@@ -1568,14 +1769,6 @@ static ggml_tensor * build_bailingmoe3_kda_block(
         static_cast<size_t>(head_dim) * n_head * element,
         static_cast<size_t>(head_dim) * n_head * n_tokens * element,
         0);
-    ggml_tensor * new_state = ggml_view_4d(
-        ctx, packed, head_dim, head_dim, n_head, 1,
-        static_cast<size_t>(head_dim) * element,
-        static_cast<size_t>(head_dim) * head_dim * element,
-        static_cast<size_t>(head_dim) * head_dim * n_head * element,
-        static_cast<size_t>(head_dim) * n_head * n_tokens * element);
-    ggml_build_forward_expand(gf, ggml_cpy(ctx, new_state, state));
-
     ggml_tensor * output_gate = ggml_mul_mat(ctx, L.ssm_g_a, cur);
     output_gate = ggml_reshape_3d(
         ctx, output_gate, head_dim, n_head, n_tokens);
@@ -2162,7 +2355,7 @@ static ggml_tensor * build_single_layer(
             ? build_bailingmoe3_mla_block(
                 ctx, gf, w, L, cur, positions,
                 cache.attn_k[fa_idx], cache.attn_v[fa_idx],
-                attn_mask, kv_start, n_tokens)
+                attn_mask, kv_write_rows, kv_start, n_tokens)
             : build_full_attn_block(
                 ctx, gf, w, L, cur, positions, w.rope_sections,
                 cache.attn_k[fa_idx], cache.attn_v[fa_idx],
@@ -2181,11 +2374,17 @@ static ggml_tensor * build_single_layer(
             cap_ptr = &cap;
             cap_ptr->ssm_intermediate_states = cache.ssm_intermediate[dn_idx];
             cap_ptr->conv_input              = cache.conv_input_cache[dn_idx];
+            if (!cache.kda_replay_k.empty()) {
+                cap_ptr->kda_replay_k = cache.kda_replay_k[dn_idx];
+                cap_ptr->kda_replay_v = cache.kda_replay_v[dn_idx];
+                cap_ptr->kda_replay_g = cache.kda_replay_g[dn_idx];
+                cap_ptr->kda_replay_beta = cache.kda_replay_beta[dn_idx];
+            }
         }
         cur = w.is_bailingmoe3
             ? build_bailingmoe3_kda_block(
                 ctx, gf, w, L, cur, cache.conv_state[dn_idx],
-                cache.ssm_state[dn_idx], n_tokens)
+                cache.ssm_state[dn_idx], n_tokens, cap_ptr)
             : build_delta_net_block(
                 ctx, gf, w, L, cur,
                 cache.conv_state[dn_idx], cache.ssm_state[dn_idx],
@@ -2256,6 +2455,13 @@ QwenGraphOutputs build_qwen35_graph(
 
     const int n_tokens = in.n_tokens;
 
+    const bool capture_with_rows =
+        in.capture_layers && cache.target_feat && in.target_feat_rows;
+    std::vector<ggml_tensor *> capture_slices;
+    if (capture_with_rows) {
+        capture_slices.assign((size_t)w.n_capture_layers, nullptr);
+    }
+
     // 1. Caller supplies pre-embedded inputs via in.inp_embed (CPU lookup done
     //    ahead of time, zero GPU cost for the embedding table).
     ggml_tensor * inpL = in.inp_embed;
@@ -2295,12 +2501,13 @@ QwenGraphOutputs build_qwen35_graph(
             const bool want_q_cap = in.q_capture && cache.q_cap;
             ggml_tensor * q_fa = nullptr;
             if (w.is_bailingmoe3) {
-                GGML_ASSERT(!in.kv_write_rows && !in.paged_block_table &&
+                GGML_ASSERT(!in.paged_block_table &&
                             !in.paged_query_seq_ids && in.n_seqs == 1);
                 cur = build_bailingmoe3_mla_block(
                     ctx, gf, w, L, cur, in.positions,
                     cache.attn_k[fa_idx], cache.attn_v[fa_idx],
-                    in.attn_mask, in.kv_start, n_tokens);
+                    in.attn_mask, in.kv_write_rows,
+                    in.kv_start, n_tokens);
             } else {
                 cur = build_full_attn_block(ctx, gf, w, L, cur, in.positions, w.rope_sections,
                                             cache.attn_k[fa_idx], cache.attn_v[fa_idx],
@@ -2346,6 +2553,12 @@ QwenGraphOutputs build_qwen35_graph(
                 // valid because they're cache-resident, not gallocr-managed.
                 cap_ptr->ssm_intermediate_states = cache.ssm_intermediate[dn_idx];
                 cap_ptr->conv_input              = cache.conv_input_cache[dn_idx];
+                if (!cache.kda_replay_k.empty()) {
+                    cap_ptr->kda_replay_k = cache.kda_replay_k[dn_idx];
+                    cap_ptr->kda_replay_v = cache.kda_replay_v[dn_idx];
+                    cap_ptr->kda_replay_g = cache.kda_replay_g[dn_idx];
+                    cap_ptr->kda_replay_beta = cache.kda_replay_beta[dn_idx];
+                }
                 if (!cache.factor_k.empty()) {
                     const bool pending_alt = cache.specla_pending_bank != 0;
                     cap_ptr->pending_factor_k = pending_alt
@@ -2391,10 +2604,11 @@ QwenGraphOutputs build_qwen35_graph(
                     (size_t)in.seq_slot * ssm_st->nb[3]);
             }
             if (w.is_bailingmoe3) {
-                GGML_ASSERT(!cap_ptr && !in.parent_ids && in.n_seqs == 1 &&
+                GGML_ASSERT(!in.parent_ids && in.n_seqs == 1 &&
                             in.n_prefill_segments == 0 && !in.active_slot_ids);
                 cur = build_bailingmoe3_kda_block(
-                    ctx, gf, w, L, cur, conv_st, ssm_st, n_tokens);
+                    ctx, gf, w, L, cur, conv_st, ssm_st, n_tokens, cap_ptr,
+                    in.bailing_fuse_conv_state);
             } else {
                 cur = build_delta_net_block(ctx, gf, w, L, cur,
                                             conv_st, ssm_st,
@@ -2428,7 +2642,8 @@ QwenGraphOutputs build_qwen35_graph(
         ggml_tensor * moe_selected = nullptr;
         ggml_tensor * ffn = L.ffn_gate_inp
             ? build_qwen35moe_ffn(ctx, post, w, L,
-                                  in.capture_moe_router ? &moe_selected : nullptr)
+                                  in.capture_moe_router ? &moe_selected : nullptr,
+                                  in.bailing_fuse_grouped_router)
             : build_swiglu_ffn(ctx, post, L);
         if (in.capture_moe_router && moe_selected) {
             ggml_set_output(moe_selected);
@@ -2447,14 +2662,19 @@ QwenGraphOutputs build_qwen35_graph(
                 if (CAPTURE_LAYERS[k] == il) { capture_idx = k; break; }
             }
             if (capture_idx >= 0) {
+                ggml_tensor * cur_2d =
+                    ggml_reshape_2d(ctx, cur, hidden, n_tokens);
+                if (capture_with_rows) {
+                    capture_slices[(size_t)capture_idx] = cur_2d;
+                    inpL = cur;
+                    continue;
+                }
                 const size_t elt        = ggml_element_size(cache.target_feat);
                 const size_t col_stride = cache.target_feat->nb[1];
                 const int    cap        = cache.target_feat_cap;
                 const int    slot_start = in.kv_start % cap;
                 const int    pre_n      = std::min(n_tokens, cap - slot_start);
                 const int    post_n    = n_tokens - pre_n;
-
-                ggml_tensor * cur_2d = ggml_reshape_2d(ctx, cur, hidden, n_tokens);
 
                 // First slice: [slot_start..slot_start+pre_n) in the ring.
                 {
@@ -2485,8 +2705,30 @@ QwenGraphOutputs build_qwen35_graph(
         inpL = cur;
     }
 
+    if (capture_with_rows && !capture_slices.empty()) {
+        bool have_all = true;
+        for (ggml_tensor * tensor : capture_slices) {
+            if (!tensor) {
+                have_all = false;
+                break;
+            }
+        }
+        if (have_all) {
+            ggml_tensor * feat_cat = capture_slices[0];
+            for (int k = 1; k < (int)capture_slices.size(); ++k) {
+                feat_cat = ggml_concat(
+                    ctx, feat_cat, capture_slices[(size_t)k], 0);
+            }
+            feat_cat = ggml_cont(ctx, feat_cat);
+            ggml_build_forward_expand(
+                gf, ggml_set_rows(
+                    ctx, cache.target_feat, feat_cat, in.target_feat_rows));
+        }
+    }
+
     // 2. Final norm
     ggml_tensor * out = rms_norm_mul(ctx, inpL, w.out_norm, w.rms_eps);
+    ggml_tensor * final_hidden = out;
 
     // 3. LM head — optionally only for sampled rows (prefill computes just
     //    the last row; fused steps the decode rows plus committing prompts'
@@ -2513,7 +2755,82 @@ QwenGraphOutputs build_qwen35_graph(
 
     QwenGraphOutputs og = std::move(og_early);
     og.logits = logits;
+    og.hidden_states = final_hidden;
     return og;
+}
+
+QwenGraphOutputs build_bailingmoe3_mtp_graph(
+        ggml_context *        ctx,
+        ggml_cgraph *         gf,
+        const TargetWeights & w,
+        TargetCache &         cache,
+        ggml_tensor *         input_embed,
+        ggml_tensor *         target_hidden,
+        ggml_tensor *         positions,
+        ggml_tensor *         attn_mask,
+        ggml_tensor *         kv_write_rows,
+        int                   kv_start,
+        int                   n_tokens,
+        int                   logits_tail_rows) {
+    GGML_ASSERT(w.is_bailingmoe3 && w.mtp.enabled);
+    GGML_ASSERT(input_embed && target_hidden && positions && attn_mask);
+    GGML_ASSERT(cache.attn_k.size() == 1 && cache.attn_v.size() == 1);
+
+    const BailingMtpWeights & mtp = w.mtp;
+    const TargetLayer & layer = mtp.layer;
+    const int hidden = w.n_embd;
+
+    // NEXTN conditions the predictor on the exact next-token embedding and
+    // the target trunk's final-normalized hidden state at the same position.
+    ggml_tensor * embed_n = rms_norm_mul(
+        ctx, graph_tensor_f32(ctx, input_embed), mtp.enorm, w.rms_eps);
+    ggml_tensor * hidden_n = rms_norm_mul(
+        ctx, graph_tensor_f32(ctx, target_hidden), mtp.hnorm, w.rms_eps);
+    ggml_tensor * fused = ggml_concat(ctx, embed_n, hidden_n, 0);
+    ggml_tensor * cur = ggml_mul_mat(ctx, mtp.eh_proj, fused);
+
+    const int query_rows = logits_tail_rows > 0
+        ? std::min(logits_tail_rows, n_tokens)
+        : n_tokens;
+    ggml_tensor * residual = cur;
+    if (query_rows < n_tokens) {
+        residual = ggml_view_2d(
+            ctx, cur, hidden, query_rows, cur->nb[1],
+            static_cast<size_t>(n_tokens - query_rows) * cur->nb[1]);
+    }
+    ggml_tensor * attn_input = rms_norm_mul(
+        ctx, cur, layer.attn_norm, w.rms_eps);
+    cur = build_bailingmoe3_mla_block(
+        ctx, gf, w, layer, attn_input, positions,
+        cache.attn_k[0], cache.attn_v[0],
+        attn_mask, kv_write_rows, kv_start, n_tokens, query_rows);
+    cur = ggml_add(ctx, cur, residual);
+
+    residual = cur;
+    ggml_tensor * post = rms_norm_mul(
+        ctx, cur, layer.attn_post_norm, w.rms_eps);
+    ggml_tensor * ffn = build_qwen35moe_ffn(ctx, post, w, layer, nullptr);
+    cur = ggml_add(ctx, ffn, residual);
+
+    ggml_tensor * final_hidden = rms_norm_mul(
+        ctx, cur, mtp.final_norm, w.rms_eps);
+    ggml_tensor * logits_input = final_hidden;
+    const int hidden_rows = static_cast<int>(final_hidden->ne[1]);
+    if (logits_tail_rows > 0 && logits_tail_rows < hidden_rows) {
+        logits_input = ggml_view_2d(
+            ctx, final_hidden, hidden, logits_tail_rows,
+            final_hidden->nb[1],
+            static_cast<size_t>(hidden_rows - logits_tail_rows) *
+                final_hidden->nb[1]);
+    }
+    ggml_tensor * logits = ggml_mul_mat(ctx, w.output, logits_input);
+    ggml_set_name(logits, "bailing_mtp_logits");
+    ggml_build_forward_expand(gf, logits);
+
+    QwenGraphOutputs out{};
+    out.logits = logits;
+    out.hidden_states = final_hidden;
+    return out;
 }
 
 ggml_tensor * build_qwen35_layer(
@@ -2597,7 +2914,7 @@ QwenLayerPrefnOutputs build_qwen35_layer_prefn(
             ? build_bailingmoe3_mla_block(
                 ctx, gf, w, L, cur, positions,
                 cache.attn_k[fa_idx], cache.attn_v[fa_idx],
-                attn_mask, kv_start, n_tokens)
+                attn_mask, kv_write_rows, kv_start, n_tokens)
             : build_full_attn_block(
                 ctx, gf, w, L, cur, positions, w.rope_sections,
                 cache.attn_k[fa_idx], cache.attn_v[fa_idx],
@@ -2614,7 +2931,7 @@ QwenLayerPrefnOutputs build_qwen35_layer_prefn(
         cur = w.is_bailingmoe3
             ? build_bailingmoe3_kda_block(
                 ctx, gf, w, L, cur, cache.conv_state[dn_idx],
-                cache.ssm_state[dn_idx], n_tokens)
+                cache.ssm_state[dn_idx], n_tokens, nullptr)
             : build_delta_net_block(
                 ctx, gf, w, L, cur,
                 cache.conv_state[dn_idx], cache.ssm_state[dn_idx],

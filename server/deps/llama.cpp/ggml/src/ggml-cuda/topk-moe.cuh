@@ -21,6 +21,9 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
                            const ggml_tensor *             bias,
                            const ggml_cuda_topk_moe_args & args);
 
+void ggml_cuda_op_grouped_topk_moe(
+    ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
 bool ggml_cuda_should_use_topk_moe(const ggml_tensor * gating_op,
                                    const ggml_tensor * weights,
                                    const ggml_tensor * logits,

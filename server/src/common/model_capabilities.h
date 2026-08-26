@@ -72,7 +72,7 @@ inline constexpr ArchCapabilities kArchCapabilities[] = {
 //   arch          split  rdraft pflash offload  draft  ddtree vwidth fa_win dswa    paged
     {"qwen35",     true,  true,  true,  false,   kBoth, kBoth, kNever, kBoth, kBoth,  kMono},
     {"qwen35moe",  false, false, false, true,    kMono, kMono, kNever, kMono, kMono,  kNever},
-    {"bailingmoe3",false, false, false, false,   kNever,kNever,kNever, kNever,kNever, kNever},
+    {"bailingmoe3",false, false, false, false,   kMono, kNever,kNever, kNever,kNever, kNever},
     {"laguna",     true,  false, false, true,    kMono, kMono, kMono,  kNever, kNever, kNever},
     {"qwen3",      false, false, true,  false,   kNever, kNever, kNever, kNever, kNever, kNever},
     {"gemma4",     true,  false, false, false,   kMono, kNever, kNever, kBoth, kNever, kNever},
