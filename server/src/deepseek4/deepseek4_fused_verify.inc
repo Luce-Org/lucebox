@@ -534,13 +534,30 @@ static bool ds4_build_fused_verify_graph(
         std::vector<DeepSeek4I32InputBinding> i32b;
         std::vector<DeepSeek4I32ArrayBinding> i32ab;
         std::vector<DeepSeek4I64ArrayBinding> i64ab;
+        std::vector<DeepSeek4F32ArrayBinding> f32ab;
+        // Sparse attention pays a fixed indexer/compaction cost. Keep the
+        // established explicit kernel while history is small, then switch per
+        // layer once sparse work can remove at least half of the compressed
+        // rows. This also avoids a transient identity binding at the exact
+        // top-k boundary, preserving fused-graph replay.
+        const bool sparse_attention =
+            ds4_env_flag("DFLASH_DS4_SPARSE_DECODE_FLASH") && ratio > 0 &&
+            padded > 2 * w.n_indexer_top_k;
+        const DeepSeek4AttentionImpl attention_impl = sparse_attention
+            ? DeepSeek4AttentionImpl::SparseFlash
+            : DeepSeek4AttentionImpl::Explicit;
         ggml_tensor * normed = build_rms_norm(ctx, attn_in, L.attn_norm, w.rms_eps);
         ggml_tensor * attn_out = build_mla_attention(ctx, gf, normed, w, L, lc, il,
                                                      lane_kv_start, lane_q, &ain,
-                                                     i32b, i32ab, i64ab);
+                                                     i32b, i32ab, i64ab,
+                                                     &f32ab, attention_impl);
         if (!attn_out) return false;
-        if (!i32b.empty() || !i32ab.empty() || !i64ab.empty()) {
-            std::fprintf(stderr, "[ds4-fused-verify] layer %d dynamic bindings; cannot fuse\n", il);
+        if (!i32b.empty() || !i32ab.empty() || !i64ab.empty() ||
+            !f32ab.empty()) {
+            std::fprintf(stderr,
+                "[ds4-fused-verify] layer %d dynamic bindings "
+                "(%zu/%zu/%zu/%zu); cannot fuse\n",
+                il, i32b.size(), i32ab.size(), i64ab.size(), f32ab.size());
             return false;
         }
 

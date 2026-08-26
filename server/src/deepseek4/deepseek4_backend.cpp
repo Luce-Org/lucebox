@@ -4,7 +4,9 @@
 #include "deepseek4_backend.h"
 #include "deepseek4_budget_hook.h"
 #include "deepseek4_internal.h"
+#include "dflash27b.h"
 #include "common/dynamic_backend.h"
+#include "common/io_utils.h"
 #include "common/peer_access.h"
 #include "common/platform_env.h"
 #include "common/sampler.h"
@@ -27,6 +29,7 @@
 #include <cinttypes>
 #include <limits>
 #include <new>
+#include <sstream>
 
 namespace dflash::common {
 
@@ -1683,6 +1686,11 @@ bool DeepSeek4Backend::park(ParkTarget target) {
         std::printf("[deepseek4] DSpark drafter parked (VRAM released)\n");
         std::fflush(stdout);
     }
+    if (want_draft && pflash_drafter_loaded_) {
+        release_pflash_drafter();
+        std::printf("[deepseek4] PFlash drafter parked (VRAM released)\n");
+        std::fflush(stdout);
+    }
     if (!want_target_model || parked_) return true;
 
     maybe_save_routing_stats();
@@ -2599,17 +2607,150 @@ GenerateResult DeepSeek4Backend::restore_and_generate_impl(
     return result;
 }
 
+ModelBackend::CompressResult DeepSeek4Backend::compress(
+        const CompressRequest & req) {
+    const auto results = compress_batch({req});
+    return results.empty() ? CompressResult{} : results.front();
+}
+
+std::vector<ModelBackend::CompressResult> DeepSeek4Backend::compress_batch(
+        const std::vector<CompressRequest> & requests) {
+    std::vector<CompressResult> results(requests.size());
+    if (requests.empty()) return results;
+
+    const CompressRequest * load_request = nullptr;
+    for (const CompressRequest & request : requests) {
+        if (request.input_ids.empty() || request.drafter_path.empty() ||
+            request.keep_ratio <= 0.0f || request.keep_ratio > 1.0f) {
+            continue;
+        }
+        if (load_request == nullptr) {
+            load_request = &request;
+        } else if (request.drafter_path != load_request->drafter_path ||
+                   request.drafter_gpu != load_request->drafter_gpu ||
+                   request.skip_park != load_request->skip_park ||
+                   request.residency_action != load_request->residency_action) {
+            // A residency window can host only one drafter configuration.
+            // Process heterogeneous batches as independent windows instead of
+            // calling the virtual base fallback, which would recurse through
+            // DeepSeek4Backend::compress().
+            std::vector<CompressResult> independent(requests.size());
+            for (size_t index = 0; index < requests.size(); ++index) {
+                const auto one = compress_batch({requests[index]});
+                if (!one.empty()) independent[index] = one.front();
+            }
+            return independent;
+        }
+    }
+    if (load_request == nullptr) return results;
+
+    const bool was_parked = parked_;
+    if (!load_request->skip_park && !parked_ &&
+        !park(ParkTarget::TargetModel)) {
+        return results;
+    }
+    if (backend_) ggml_backend_synchronize(backend_);
+    if (spec_backend_) ggml_backend_synchronize(spec_backend_);
+
+    if (pflash_drafter_loaded_ &&
+        (pflash_drafter_path_ != load_request->drafter_path ||
+         pflash_drafter_gpu_ != load_request->drafter_gpu)) {
+        release_pflash_drafter();
+    }
+    if (!pflash_drafter_loaded_) {
+        if (!load_drafter(load_request->drafter_path, 999,
+                          load_request->drafter_gpu,
+                          pflash_drafter_ctx_)) {
+            std::fprintf(stderr, "[deepseek4-pflash] load failed: %s\n",
+                         dflash27b_last_error());
+            if (!load_request->skip_park && !was_parked) {
+                unpark(ParkTarget::TargetModel);
+            }
+            return results;
+        }
+        pflash_drafter_loaded_ = true;
+        pflash_drafter_path_ = load_request->drafter_path;
+        pflash_drafter_gpu_ = load_request->drafter_gpu;
+    }
+
+    for (size_t index = 0; index < requests.size(); ++index) {
+        const CompressRequest & request = requests[index];
+        if (request.input_ids.empty() || request.drafter_path.empty() ||
+            request.keep_ratio <= 0.0f || request.keep_ratio > 1.0f) {
+            continue;
+        }
+        CompressResult & result = results[index];
+        result.compressed_ids = drafter_score_and_compress(
+            pflash_drafter_ctx_, request.input_ids, request.keep_ratio);
+        result.ok = !result.compressed_ids.empty();
+    }
+
+    if (load_request->residency_action ==
+        DraftResidencyAction::ReleaseAfterUse) {
+        release_pflash_drafter();
+    }
+    if (!load_request->skip_park && !was_parked &&
+        !unpark(ParkTarget::TargetModel)) {
+        std::fill(results.begin(), results.end(), CompressResult{});
+    }
+    return results;
+}
+
 bool DeepSeek4Backend::handle_compress(const std::string & line,
-                                        const DaemonIO & io) {
-    (void)line; (void)io;
-    std::fprintf(stderr, "[deepseek4] compress not yet supported\n");
-    return false;
+                                       const DaemonIO & io) {
+    std::istringstream iss(line.size() > 9 ? line.substr(9) : std::string{});
+    std::string prompt_path;
+    std::string drafter_path;
+    int keep_x1000 = 0;
+    if (!(iss >> prompt_path >> keep_x1000)) {
+        std::fprintf(stderr, "[deepseek4-pflash] bad compress arguments\n");
+        io.emit(-1);
+        return false;
+    }
+
+    std::getline(iss >> std::ws, drafter_path);
+    bool skip_park = false;
+    const std::string suffix = " nopark";
+    if (drafter_path.size() > suffix.size() &&
+        drafter_path.compare(drafter_path.size() - suffix.size(),
+                             suffix.size(), suffix) == 0) {
+        skip_park = true;
+        drafter_path.resize(drafter_path.size() - suffix.size());
+    }
+
+    CompressRequest req;
+    req.input_ids = read_int32_file(prompt_path);
+    req.keep_ratio = (float) keep_x1000 / 1000.0f;
+    req.drafter_path = std::move(drafter_path);
+    req.skip_park = skip_park;
+    CompressResult result = compress(req);
+    if (!result.ok) {
+        std::fprintf(stderr, "[deepseek4-pflash] compression failed\n");
+        io.emit(-1);
+        return false;
+    }
+
+    std::printf("[deepseek4-pflash] %zu -> %zu tokens\n",
+                req.input_ids.size(), result.compressed_ids.size());
+    std::fflush(stdout);
+    for (int32_t token : result.compressed_ids) io.emit(token);
+    io.emit(-1);
+    return true;
+}
+
+void DeepSeek4Backend::release_pflash_drafter() {
+    if (!pflash_drafter_loaded_) return;
+    dflash::common::free_drafter(pflash_drafter_ctx_);
+    pflash_drafter_loaded_ = false;
+    pflash_drafter_path_.clear();
+    pflash_drafter_gpu_ = -1;
 }
 
 void DeepSeek4Backend::free_drafter() {
     // Keep the configured path so request-scoped residency and an explicit
     // later `unpark draft` can restore the DSpark model.
     release_spec_drafter(/*mark_parked=*/true);
+    release_pflash_drafter();
 }
 
 void DeepSeek4Backend::maybe_save_routing_stats() {
