@@ -249,6 +249,43 @@ static void ggml_compute_forward_ds4_indexer_mask(
     }
 }
 
+static void ggml_compute_forward_ds4_moe_combine(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    const struct ggml_tensor * down_e     = dst->src[0];
+    const struct ggml_tensor * weights    = dst->src[1];
+    const struct ggml_tensor * shared_out = dst->src[2];
+
+    GGML_ASSERT(down_e && weights);
+    GGML_ASSERT(down_e->type == GGML_TYPE_F32 && weights->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+
+    const int n_embd   = (int) down_e->ne[0];
+    const int n_used   = (int) down_e->ne[1];
+    const int n_tokens = (int) down_e->ne[2];
+
+    for (int t = params->ith; t < n_tokens; t += params->nth) {
+        const float * w_row = (const float *) ((const char *) weights->data + (size_t) t * weights->nb[1]);
+        const float * sh_row = shared_out ? (const float *) ((const char *) shared_out->data + (size_t) t * shared_out->nb[1]) : NULL;
+        float * dst_row = (float *) ((char *) dst->data + (size_t) t * dst->nb[1]);
+
+        for (int i = 0; i < n_embd; ++i) {
+            float sum = 0.0f;
+            for (int e = 0; e < n_used; ++e) {
+                if (w_row[e] == 0.0f) {
+                    continue;
+                }
+                const float * exp_row = (const float *) ((const char *) down_e->data + (size_t) t * down_e->nb[2] + (size_t) e * down_e->nb[1]);
+                const float prod = exp_row[i] * w_row[e];
+                sum += prod;
+            }
+            if (sh_row) {
+                sum += sh_row[i];
+            }
+            dst_row[i] = sum;
+        }
+    }
+}
+
 #if defined(__ARM_ARCH)
 struct ggml_arm_arch_features_type {
     int sve_cnt;
@@ -2036,6 +2073,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_ds4_indexer_mask(params, tensor);
             } break;
+        case GGML_OP_DS4_MOE_COMBINE:
+            {
+                ggml_compute_forward_ds4_moe_combine(params, tensor);
+            } break;
         case GGML_OP_OUT_PROD:
             {
                 ggml_compute_forward_out_prod(params, tensor);
@@ -2588,6 +2629,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DS4_INDEXER_QAT:
         case GGML_OP_DS4_INDEXER_SCORE:
         case GGML_OP_DS4_INDEXER_MASK:
+        case GGML_OP_DS4_MOE_COMBINE:
         case GGML_OP_FLASH_ATTN_EXT:
         case GGML_OP_FLASH_ATTN_SPARSE:
         case GGML_OP_PAGED_ATTN:

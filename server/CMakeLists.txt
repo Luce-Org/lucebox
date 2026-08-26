@@ -1061,6 +1061,16 @@ if(DFLASH27B_TESTS)
             ggml ${DFLASH27B_GGML_BACKEND_TARGET})
         list(APPEND _raw_unit_test_targets test_deepseek4_mmid_grouped_cuda)
     endif()
+    if(DFLASH27B_GPU_BACKEND STREQUAL "hip" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ds4_moe_combine_cuda.cpp")
+        add_executable(test_ds4_moe_combine_cuda test/test_ds4_moe_combine_cuda.cpp)
+        set_source_files_properties(test/test_ds4_moe_combine_cuda.cpp PROPERTIES LANGUAGE HIP)
+        set_target_properties(test_ds4_moe_combine_cuda PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
+        target_include_directories(test_ds4_moe_combine_cuda PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
+        target_link_libraries(test_ds4_moe_combine_cuda PRIVATE
+            ggml-cpu ggml ${DFLASH27B_GGML_BACKEND_TARGET})
+        list(APPEND _raw_unit_test_targets test_ds4_moe_combine_cuda)
+    endif()
     # HIP-only standalone build; CUDA backend is covered by aggregated test_server_unit.
     if(DFLASH27B_GPU_BACKEND STREQUAL "hip" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_draft_topk_cuda.cpp")
         # HIP build of the same GPU-vs-CPU parity test. The test source uses CUDA
