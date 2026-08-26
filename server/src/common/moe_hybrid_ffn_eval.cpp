@@ -2877,18 +2877,31 @@ static bool eval_moe_owner_expert_major_batched(
         ggml_tensor * down_e = apply_scale2(ctx,
             ggml_mul_mat_id(ctx, down_tensor, gu, local_ids_tensor), desc.ffn_down_exps_s);
 
-        ggml_tensor * weights_3d = ggml_reshape_3d(ctx, owner_weights_tensor, 1, n_used, n_tokens);
-        ggml_tensor * routed_out = ggml_mul(ctx, down_e, weights_3d);
-        routed_out = ggml_cont(ctx, ggml_permute(ctx, routed_out, 1, 0, 2, 3));
-        routed_out = ggml_sum_rows(ctx, routed_out);
-        routed_out = ggml_reshape_2d(ctx, routed_out, n_embd, n_tokens);
-
-        ggml_tensor * combined_out = routed_out;
+        ggml_tensor * shared_out = nullptr;
         if (has_shared) {
-            ggml_tensor * shared_out = build_shared_expert_subgraph(ctx, desc, inp, cfg.swiglu_clamp);
-            if (shared_out) {
-                combined_out = ggml_add(ctx, combined_out, shared_out);
-            }
+            shared_out = build_shared_expert_subgraph(ctx, desc, inp, cfg.swiglu_clamp);
+        }
+
+        ggml_tensor * combined_out = nullptr;
+        if (moe_hybrid_graph_policy().fused_combine) {
+            // The production expert-major MMID path used to materialize the
+            // weighted route tensor, transpose it, reduce it, and finally add
+            // the shared expert. Reduce the owner-local routes directly from
+            // down_e instead. The same operation handles the cold owner with a
+            // null shared tensor, so both GPU owners avoid the legacy chain.
+            combined_out = ggml_ds4_moe_fused_combine_shared(
+                ctx, down_e, owner_weights_tensor, shared_out);
+        } else {
+            ggml_tensor * weights_3d = ggml_reshape_3d(
+                ctx, owner_weights_tensor, 1, n_used, n_tokens);
+            ggml_tensor * routed_out = ggml_mul(ctx, down_e, weights_3d);
+            routed_out = ggml_cont(
+                ctx, ggml_permute(ctx, routed_out, 1, 0, 2, 3));
+            routed_out = ggml_sum_rows(ctx, routed_out);
+            routed_out = ggml_reshape_2d(ctx, routed_out, n_embd, n_tokens);
+            combined_out = shared_out
+                ? ggml_add(ctx, routed_out, shared_out)
+                : routed_out;
         }
 
         ggml_cgraph * gf = ggml_new_graph_custom(ctx, 256, false);
