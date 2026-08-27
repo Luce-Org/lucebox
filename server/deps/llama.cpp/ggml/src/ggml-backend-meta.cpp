@@ -887,6 +887,13 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
             GGML_ASSERT(tensor->src[2] == nullptr ||
                         split_states_equal(src_ss[0], src_ss[2]));
+            // Each local embedding slice must preserve the float4 layout
+            // required by the GPU combine kernel.
+            for (size_t s = 0; s < src_ss[0].n_segments; ++s) {
+                for (size_t j = 0; j < n_bufs; ++j) {
+                    GGML_ASSERT(src_ss[0].ne[s*n_bufs + j] % 4 == 0);
+                }
+            }
             return src_ss[0];
         }
 
