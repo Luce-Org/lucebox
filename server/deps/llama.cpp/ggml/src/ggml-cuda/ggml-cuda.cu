@@ -5976,6 +5976,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                    op->src[0]->ne[0] % 4 == 0 &&
                    op->src[0]->nb[1] % sizeof(float4) == 0 &&
                    op->src[0]->nb[2] % sizeof(float4) == 0 &&
+                   op->src[1]->nb[1] % sizeof(float) == 0 &&
                    op->nb[1] % sizeof(float4) == 0 &&
                    (op->src[2] == nullptr || (op->src[2]->type == GGML_TYPE_F32 && op->src[2]->nb[1] % sizeof(float4) == 0));
         case GGML_OP_MUL_MAT:

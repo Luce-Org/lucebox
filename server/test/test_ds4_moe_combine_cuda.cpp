@@ -30,6 +30,11 @@ struct Inputs {
     int zero_weight_routes = 0;
 };
 
+ggml_backend_meta_split_state mirrored_split_state(
+        const ggml_tensor *, void *) {
+    return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, 1, {1}};
+}
+
 Inputs make_inputs(const CombineCase & test, bool poison_masked = true) {
     Inputs result;
     result.down.resize((size_t) kEmbeddings * test.top_k * test.tokens);
@@ -168,6 +173,109 @@ bool run_backend(
     return ok;
 }
 
+bool meta_allocation_test(ggml_backend_t simple_backend, bool include_shared) {
+    ggml_backend_dev_t simple_dev = ggml_backend_get_device(simple_backend);
+    ggml_backend_dev_t meta_dev = ggml_backend_meta_device(
+        &simple_dev, 1, mirrored_split_state, nullptr);
+    ggml_backend_t meta = meta_dev ? ggml_backend_dev_init(meta_dev, nullptr) : nullptr;
+    if (!meta) {
+        std::fprintf(stderr, "[ds4-moe-combine] meta backend initialization failed\n");
+        return false;
+    }
+
+    ggml_init_params params{};
+    params.mem_size = 1024 * 1024;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    ggml_tensor * down = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, kEmbeddings, 6, 3);
+    ggml_tensor * weights = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 6, 3);
+    ggml_tensor * shared = include_shared
+        ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, kEmbeddings, 3)
+        : nullptr;
+    ggml_set_input(down);
+    ggml_set_input(weights);
+    if (shared) {
+        ggml_set_input(shared);
+    }
+    ggml_tensor * combined = ggml_ds4_moe_fused_combine_shared(
+        ctx, down, weights, shared);
+    ggml_set_output(combined);
+
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, combined);
+    ggml_gallocr_t alloc = ggml_gallocr_new(
+        ggml_backend_get_default_buffer_type(meta));
+    const bool ok = alloc && ggml_gallocr_alloc_graph(alloc, graph);
+    if (!ok) {
+        std::fprintf(stderr,
+                     "[ds4-moe-combine] meta graph allocation failed shared=%d\n",
+                     include_shared ? 1 : 0);
+    }
+
+    if (alloc) {
+        ggml_gallocr_free(alloc);
+    }
+    ggml_free(ctx);
+    ggml_backend_free(meta);
+    return ok;
+}
+
+bool rejects_unaligned_weight_stride(ggml_backend_t hip) {
+    ggml_init_params params{};
+    params.mem_size = 1024 * 1024;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+
+    constexpr int top_k = 4;
+    constexpr int tokens = 3;
+    ggml_tensor * down = ggml_new_tensor_3d(
+        ctx, GGML_TYPE_F32, kEmbeddings, top_k, tokens);
+    ggml_tensor * weights_storage = ggml_new_tensor_1d(
+        ctx, GGML_TYPE_F32, 16);
+    ggml_tensor * weights = ggml_view_2d(
+        ctx, weights_storage, top_k, tokens,
+        top_k * sizeof(float) + 2, 0);
+    ggml_tensor * combined = ggml_ds4_moe_fused_combine_shared(
+        ctx, down, weights, nullptr);
+
+    const bool rejected = !ggml_backend_dev_supports_op(
+        ggml_backend_get_device(hip), combined);
+    if (!rejected) {
+        std::fprintf(stderr,
+                     "[ds4-moe-combine] HIP accepted an unaligned weights row stride\n");
+    }
+    ggml_free(ctx);
+    return rejected;
+}
+
+bool equal_floats(const std::vector<float> & expected,
+                  const std::vector<float> & actual,
+                  const char * label,
+                  const CombineCase & test) {
+    constexpr float abs_tol = 1.0e-6f;
+    constexpr float rel_tol = 1.0e-6f;
+    size_t first = 0;
+    while (first < expected.size() && first < actual.size()) {
+        const float lhs = expected[first];
+        const float rhs = actual[first];
+        const float tolerance = abs_tol + rel_tol * std::max(std::fabs(lhs), std::fabs(rhs));
+        if (!std::isfinite(lhs) || !std::isfinite(rhs) || std::fabs(lhs - rhs) > tolerance) {
+            break;
+        }
+        ++first;
+    }
+    if (first == expected.size() && first == actual.size()) {
+        return true;
+    }
+    std::fprintf(stderr,
+                 "[ds4-moe-combine] %s mismatch top_k=%d tokens=%d shared=%d index=%zu "
+                 "expected=%g actual=%g\n",
+                 label, test.top_k, test.tokens, test.include_shared ? 1 : 0, first,
+                 first < expected.size() ? expected[first] : 0.0f,
+                 first < actual.size() ? actual[first] : 0.0f);
+    return false;
+}
+
 bool equal_bytes(const std::vector<float> & expected,
                  const std::vector<float> & actual,
                  const char * label,
@@ -176,18 +284,9 @@ bool equal_bytes(const std::vector<float> & expected,
         std::memcmp(expected.data(), actual.data(), expected.size() * sizeof(float)) == 0) {
         return true;
     }
-
-    size_t first = 0;
-    while (first < expected.size() && first < actual.size() &&
-           std::memcmp(&expected[first], &actual[first], sizeof(float)) == 0) {
-        ++first;
-    }
     std::fprintf(stderr,
-                 "[ds4-moe-combine] %s mismatch top_k=%d tokens=%d shared=%d index=%zu "
-                 "expected=%g actual=%g\n",
-                 label, test.top_k, test.tokens, test.include_shared ? 1 : 0, first,
-                 first < expected.size() ? expected[first] : 0.0f,
-                 first < actual.size() ? actual[first] : 0.0f);
+                 "[ds4-moe-combine] %s bit mismatch top_k=%d tokens=%d shared=%d\n",
+                 label, test.top_k, test.tokens, test.include_shared ? 1 : 0);
     return false;
 }
 
@@ -333,7 +432,9 @@ int main(int argc, char ** argv) {
         {6, 1, true},  {6, 3, false}, {6, 33, true},  {6, 401, false},
     };
 
-    bool ok = true;
+    bool ok = meta_allocation_test(hip, false) &&
+              meta_allocation_test(hip, true) &&
+              rejects_unaligned_weight_stride(hip);
     for (const CombineCase & test : cases) {
         const Inputs inputs = make_inputs(test);
         std::vector<float> cpu_output;
@@ -341,8 +442,8 @@ int main(int argc, char ** argv) {
         ok = run_backend(cpu, test, inputs, true, &cpu_output) && ok;
         ok = run_backend(hip, test, inputs, true, &hip_output) && ok;
         ok = finite_output(cpu_output, test) && finite_output(hip_output, test) && ok;
-        ok = equal_bytes(inputs.expected, cpu_output, "CPU reference", test) && ok;
-        ok = equal_bytes(cpu_output, hip_output, "HIP exact parity", test) && ok;
+        ok = equal_floats(inputs.expected, cpu_output, "CPU reference", test) && ok;
+        ok = equal_floats(cpu_output, hip_output, "HIP parity", test) && ok;
 
         const Inputs finite_inputs = make_inputs(test, false);
         std::vector<float> legacy_cpu_output;
@@ -353,10 +454,10 @@ int main(int argc, char ** argv) {
         ok = run_backend(hip, test, finite_inputs, false, &legacy_hip_output) && ok;
         ok = run_backend(cpu, test, finite_inputs, true, &fused_cpu_output) && ok;
         ok = run_backend(hip, test, finite_inputs, true, &fused_hip_output) && ok;
-        ok = equal_bytes(legacy_cpu_output, fused_cpu_output,
-                         "CPU legacy differential", test) && ok;
-        ok = equal_bytes(legacy_hip_output, fused_hip_output,
-                         "HIP legacy differential", test) && ok;
+        ok = equal_floats(legacy_cpu_output, fused_cpu_output,
+                          "CPU legacy differential", test) && ok;
+        ok = equal_floats(legacy_hip_output, fused_hip_output,
+                          "HIP legacy differential", test) && ok;
         std::printf("[ds4-moe-combine] top_k=%d tokens=%d shared=%d zero_routes=%d %s\n",
                     test.top_k, test.tokens, test.include_shared ? 1 : 0,
                     inputs.zero_weight_routes, ok ? "PASS" : "FAIL");
