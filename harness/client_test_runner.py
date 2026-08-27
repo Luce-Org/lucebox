@@ -1453,7 +1453,12 @@ def _score_gsm_response(text: str, gold_answer: str) -> tuple[bool, str]:
     return correct, detail
 
 
-def _score_he_response(text: str, entry_point: str, gold_test: str) -> tuple[bool, str]:
+def _score_he_response(
+    text: str,
+    entry_point: str,
+    gold_test: str,
+    prompt_text: str = "",
+) -> tuple[bool, str]:
     """Score a HumanEval response by executing the generated code against test cases.
 
     Extracts code from model output, appends the test harness, and runs via subprocess.
@@ -1464,7 +1469,7 @@ def _score_he_response(text: str, entry_point: str, gold_test: str) -> tuple[boo
     think_end = text.rfind("</think>")
     answer_text = text[think_end + len("</think>"):] if think_end >= 0 else text
 
-    # Extract code block (```python ... ``` or ``` ... ```)
+    # Extract code block (```python ... ``` or ``` ... ```).
     code = None
     m = re.search(r'```(?:python)?\s*\n(.*?)```', answer_text, re.DOTALL)
     if m:
@@ -1476,6 +1481,36 @@ def _score_he_response(text: str, entry_point: str, gold_test: str) -> tuple[boo
         if m:
             prefix = m.group(1) or ""
             code = prefix + m.group(2)
+
+    # HumanEval prompts end at the function docstring, and many instruction-
+    # tuned models correctly return only the indented body. Reconstruct the
+    # supplied function prefix before scoring those completions. A bare body
+    # outside a Markdown fence is also valid model output.
+    if code is None and answer_text.strip():
+        code = answer_text.strip("\n")
+
+    has_function = bool(
+        code and re.search(
+            r'(?m)^\s*def\s+' + re.escape(entry_point) + r'\b', code))
+    if code and not has_function and prompt_text:
+        function_match = re.search(
+            r'(?m)^def\s+' + re.escape(entry_point) + r'\b', prompt_text)
+        if function_match:
+            import_matches = list(re.finditer(
+                r'(?m)^(?:from\s+\S+\s+import\s+|import\s+)',
+                prompt_text[:function_match.start()]))
+            prefix_start = (
+                import_matches[0].start() if import_matches
+                else function_match.start())
+            function_prefix = prompt_text[prefix_start:].rstrip()
+            body = code.rstrip()
+            first_body_line = next(
+                (line for line in body.splitlines() if line.strip()), "")
+            if first_body_line and not first_body_line[0].isspace():
+                body = "\n".join(
+                    ("    " + line) if line else line
+                    for line in body.splitlines())
+            code = function_prefix + "\n" + body
 
     if not code:
         return False, "no code extracted"
@@ -1664,8 +1699,13 @@ def _run_bench_suite(
         # Correctness scoring
         score_detail = ""
         if suite == "he" and "gold_test" in case and result.get("text"):
+            prompt_text = "\n".join(
+                message.get("content", "")
+                for message in case.get("messages", [])
+                if message.get("role") == "user")
             correct, detail = _score_he_response(
-                result["text"], case["entry_point"], case["gold_test"])
+                result["text"], case["entry_point"], case["gold_test"],
+                prompt_text)
             result["correct"] = correct
             result["score_detail"] = detail
             n_scored += 1

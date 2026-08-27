@@ -1,5 +1,6 @@
 #include "qwen35_backend.h"
 #include "concurrency/qwen35_seq_engine.h"
+#include "common/adaptive_spec_width.h"
 #include "common/chain_rollback_policy.h"
 #include "placement/skip_park_guard.h"
 #include "qwen35_dflash_target.h"
@@ -241,7 +242,9 @@ static int draft_chain_verify_width(const DraftWeights & draft) {
     return block + (draft.dspark.enabled && draft.sample_from_anchor ? 1 : 0);
 }
 
-static int dspark_chain_verify_width(const DraftWeights & draft) {
+static int dspark_chain_verify_width(
+        const DraftWeights & draft, bool * explicitly_overridden = nullptr) {
+    if (explicitly_overridden) *explicitly_overridden = false;
     const int full_width = draft_chain_verify_width(draft);
     if (!draft.dspark.enabled || !draft.sample_from_anchor) {
         return full_width;
@@ -259,6 +262,27 @@ static int dspark_chain_verify_width(const DraftWeights & draft) {
             "(valid range 2..%d)\n",
             value, full_width);
         return full_width;
+    }
+    if (explicitly_overridden) *explicitly_overridden = true;
+    return static_cast<int>(requested);
+}
+
+static int dspark_adaptive_max_verify_width(
+        int full_width, int default_width) {
+    if (full_width <= 1) return std::max(1, full_width);
+    const int fallback = std::clamp(default_width, 2, full_width);
+    const char * value = std::getenv("DFLASH_DSPARK_ADAPTIVE_MAX_WIDTH");
+    if (value == nullptr || value[0] == '\0') return fallback;
+
+    char * end = nullptr;
+    const long requested = std::strtol(value, &end, 10);
+    if (end == value || *end != '\0' || requested < 2 ||
+        requested > full_width) {
+        std::fprintf(stderr,
+            "[spec-decode] ignoring invalid "
+            "DFLASH_DSPARK_ADAPTIVE_MAX_WIDTH=%s (valid range 2..%d)\n",
+            value, full_width);
+        return fallback;
     }
     return static_cast<int>(requested);
 }
@@ -2899,7 +2923,32 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     const int q_len = dw_.block_size > 0 ? dw_.block_size : DFLASH27B_DRAFT_BLOCK_SIZE;
     const bool anchor_dspark = dw_.dspark.enabled && dw_.sample_from_anchor;
     const int full_verify_len = q_len + (anchor_dspark ? 1 : 0);
-    const int verify_len = dspark_chain_verify_width(dw_);
+    bool verify_width_overridden = false;
+    const int configured_verify_len =
+        dspark_chain_verify_width(dw_, &verify_width_overridden);
+    const bool adaptive_verify_width =
+        anchor_dspark && !verify_width_overridden &&
+        adaptive_spec_width_globally_enabled();
+    // Ling begins at its measured root + four-candidate baseline, while the
+    // controller may open the full parallel DSpark block after a stable run.
+    // The cap remains available for qualification and operational rollback.
+    const int adaptive_verify_cap = adaptive_verify_width
+        ? dspark_adaptive_max_verify_width(full_verify_len, full_verify_len)
+        : configured_verify_len;
+    // Ling's fixed-width calibration peaks at root + four candidates. Start
+    // there, jump across the parallel block only after sustained acceptance,
+    // and back off when the accepted prefix shortens.
+    AdaptiveSpecWidth verify_width_controller(
+        adaptive_verify_cap, /*min_width=*/2, adaptive_verify_width,
+        /*initial_accepted_candidates=*/
+            static_cast<float>(std::min(4, adaptive_verify_cap - 1)),
+        /*backoff_alpha=*/0.25f,
+        /*full_accept_probe=*/w_.is_bailingmoe3
+            ? static_cast<float>(std::max(1, adaptive_verify_cap - 5))
+            : 1.0f,
+        /*full_accepts_per_probe=*/w_.is_bailingmoe3 ? 2 : 1);
+    const int draft_verify_len =
+        adaptive_verify_width ? adaptive_verify_cap : configured_verify_len;
     const int chain_verify_width = draft_chain_verify_width(dw_);
     const int max_verify_tokens = cfg_.ddtree_mode
         ? std::max<int>(chain_verify_width, cfg_.ddtree_budget + 1)
@@ -2934,18 +2983,24 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
     std::vector<float>   noise_embed((size_t)hidden * q_len);
     std::vector<int32_t> noise_ids(q_len);
-    std::vector<int32_t> draft_tok(verify_len);
-    std::vector<int32_t> target_tok(verify_len);
+    std::vector<int32_t> draft_tok(full_verify_len);
+    std::vector<int32_t> target_tok(full_verify_len);
     std::vector<float>   verify_logits;   // sampled-verify: [verify_len x vocab]
     std::vector<int32_t> verify_history;  // sampled-verify: penalty history
     std::vector<int32_t> pos_q(q_len);
     std::vector<int32_t> pos_k;
     std::vector<float>   local_hidden;
 
-    if (verify_len != full_verify_len) {
+    if (adaptive_verify_width) {
+        std::fprintf(stderr,
+            "[spec-decode] DSpark adaptive target verify width=%d..%d "
+            "(draft width=%d)\n",
+            verify_width_controller.min_width(), adaptive_verify_cap,
+            draft_verify_len);
+    } else if (configured_verify_len != full_verify_len) {
         std::fprintf(stderr,
             "[spec-decode] DSpark target verify width=%d (draft width=%d)\n",
-            verify_len, full_verify_len);
+            configured_verify_len, draft_verify_len);
     }
 
     // Only the first noise row changes between steps. Expand the trained mask
@@ -2967,6 +3022,8 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     int n_generated     = 0;
     int n_draft_steps   = 0;
     int n_accept_sum    = 0;
+    int n_offered_sum   = 0;
+    std::vector<int> verify_width_hist((size_t)full_verify_len + 1, 0);
     int n_hint_proposed = 0;
     int n_hint_accepted = 0;
     int target_forwards = 0;
@@ -2976,6 +3033,14 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     const int fast_rollback_threshold =
         rollback_policy.fast_rollback_threshold;
     RollbackDiag rollback_diag;
+    auto total_draft_positions = [&]() {
+        // Chain verification records its exact dynamic width. The DDTree path
+        // branches before that record point, so retain its historical fixed-
+        // width denominator rather than reporting a synthetic 1-token total.
+        const int offered = n_offered_sum > 0
+            ? n_offered_sum : n_draft_steps * configured_verify_len;
+        return std::max(1, offered);
+    };
 
     const char * tp_profile_env = std::getenv("DFLASH_TP_PROFILE");
     const bool tp_profile = tp_profile_env && std::strcmp(tp_profile_env, "0") != 0;
@@ -3012,6 +3077,22 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                      target_forwards,
                      n_generated > 0 ? (double)target_forwards / n_generated : 0.0,
                      n_draft_steps > 0 ? (double)target_forwards / n_draft_steps : 0.0);
+        if (anchor_dspark) {
+            std::fprintf(stderr,
+                "[spec-width] mode=%s average=%.2f offered=%d histogram=",
+                adaptive_verify_width ? "adaptive" : "fixed",
+                n_draft_steps > 0
+                    ? (double)n_offered_sum / (double)n_draft_steps : 0.0,
+                n_offered_sum);
+            for (size_t width = 0; width < verify_width_hist.size(); ++width) {
+                if (verify_width_hist[width] > 0) {
+                    std::fprintf(stderr, "%s%zu:%d",
+                        width == 0 ? "" : " ", width,
+                        verify_width_hist[width]);
+                }
+            }
+            std::fprintf(stderr, "\n");
+        }
         rollback_diag.print(rollback_policy, stderr);
     };
 
@@ -3027,6 +3108,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     auto t_dec0 = std::chrono::steady_clock::now();
 
     while (n_generated < n_gen) {
+        const int verify_len = adaptive_verify_width
+            ? verify_width_controller.next_width(adaptive_verify_cap)
+            : configured_verify_len;
         current_step_profile = direct_profile_sink
             ? direct_profile_sink->begin_step(1) : nullptr;
         if (current_step_profile) {
@@ -3205,7 +3289,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                         local_feature_source->storage_type,
                         desired_feature_source,
                         desired_feature_source_cap,
-                        anchor_dspark ? verify_len - 1 : 0)) {
+                        anchor_dspark ? draft_verify_len - 1 : 0)) {
                     draft_kv_free(draft_kv_);
                     use_draft_kv = false;
                     std::fprintf(stderr,
@@ -3451,8 +3535,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 current_step_profile, Phase::ProposalSelect,
                 profile_project_start);
             if (projected && anchor_dspark &&
-                (int)draft_tok.size() == full_verify_len &&
-                verify_len < full_verify_len) {
+                (int)draft_tok.size() >= verify_len &&
+                (int)draft_tok.size() <= full_verify_len &&
+                verify_len < (int)draft_tok.size()) {
                 draft_tok.resize((size_t)verify_len);
             }
             if (!projected || (int)draft_tok.size() != verify_len) {
@@ -3992,6 +4077,11 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             }
             bonus_tok = (accept_n < verify_len) ? target_tok[accept_n - 1] : -1;
         }
+        n_offered_sum += verify_len;
+        if ((size_t)verify_len < verify_width_hist.size()) {
+            ++verify_width_hist[(size_t)verify_len];
+        }
+        verify_width_controller.observe(accept_n, verify_len);
         // Track hint acceptance telemetry.
         if (hint_fill > 0) {
             n_hint_proposed += hint_fill;
@@ -4282,7 +4372,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         if (floor_to_ar) {
             step_graph_destroy(draft_sg);
             cache_.last_tok = out_tokens.empty() ? last_tok : out_tokens.back();
-            const int total_draft_pos = std::max(1, n_draft_steps * verify_len);
+            const int total_draft_pos = total_draft_positions();
             out_accept_rate =
                 (float)((double)n_accept_sum / (double)total_draft_pos);
             const int ar_n_gen = n_gen - n_generated;
@@ -4327,7 +4417,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             cache_.cur_pos = committed;
             step_graph_destroy(draft_sg);
             cache_.last_tok = out_tokens.empty() ? last_tok : out_tokens.back();
-            const int total_draft_pos = std::max(1, n_draft_steps * verify_len);
+            const int total_draft_pos = total_draft_positions();
             out_accept_rate =
                 (float)((double)n_accept_sum / (double)total_draft_pos);
             const int ar_n_gen = n_gen - n_generated;
@@ -4358,7 +4448,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
     auto t_dec1 = std::chrono::steady_clock::now();
     const double decode_s = std::chrono::duration<double>(t_dec1 - t_dec0).count();
-    const int total_draft_pos = std::max(1, n_draft_steps * verify_len);
+    const int total_draft_pos = total_draft_positions();
     const double accept_pct = 100.0 * (double)n_accept_sum / (double)total_draft_pos;
     out_accept_rate = (float)((double)n_accept_sum / (double)total_draft_pos);
     std::fprintf(stderr, "[spec-decode] tokens=%d time=%.3f s speed=%.2f tok/s "

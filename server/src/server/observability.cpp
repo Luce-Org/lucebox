@@ -203,6 +203,9 @@ ObservabilityConfig ObservabilityConfig::from_env() {
         "DFLASH_KVFLASH",
         "DFLASH_ADAPTIVE_K_TAU",
         "DFLASH_ADAPTIVE_K_DENSE",
+        "DFLASH_ADAPTIVE_SPEC_WIDTH",
+        "DFLASH_DSPARK_ADAPTIVE_MAX_WIDTH",
+        "DFLASH_DSPARK_VERIFY_WIDTH",
         "DFLASH_CUDA_MMVQ_GROUPED_TPG",
         "DFLASH_CUDA_MMVQ_GROUPED_GLU",
     });

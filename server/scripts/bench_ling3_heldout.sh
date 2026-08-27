@@ -116,12 +116,24 @@ case "$mode" in
         ;;
     luce-dspark)
         [[ -x "$luce_bin" ]] || { printf 'Missing LuceBox server.\n' >&2; exit 2; }
-        ling3_start_guarded_server env \
-            DFLASH_BAILING_MTP=0 \
-            DFLASH_BAILING_ROUTER_BF16=1 \
-            DFLASH_DSPARK_VERIFY_WIDTH="${LING_DSPARK_VERIFY_WIDTH:-5}" \
-            DFLASH_CUDA_MMVQ_GROUPED_TPG="${LING_GROUPED_TPG:-4}" \
-            GGML_CUDA_PDL="${LING_GGML_CUDA_PDL:-0}" \
+        dspark_env=(
+            DFLASH_BAILING_MTP=0
+            DFLASH_BAILING_ROUTER_BF16=1
+            DFLASH_CUDA_MMVQ_GROUPED_TPG="${LING_GROUPED_TPG:-4}"
+            GGML_CUDA_PDL="${LING_GGML_CUDA_PDL:-0}"
+        )
+        if [[ "${LING_DSPARK_ADAPTIVE_WIDTH:-1}" == 1 ]]; then
+            dspark_env+=(
+                DFLASH_ADAPTIVE_SPEC_WIDTH=1
+                DFLASH_DSPARK_ADAPTIVE_MAX_WIDTH="${LING_DSPARK_ADAPTIVE_MAX_WIDTH:-9}"
+            )
+        else
+            dspark_env+=(
+                DFLASH_ADAPTIVE_SPEC_WIDTH=0
+                DFLASH_DSPARK_VERIFY_WIDTH="${LING_DSPARK_VERIFY_WIDTH:-5}"
+            )
+        fi
+        ling3_start_guarded_server env "${dspark_env[@]}" \
             "$luce_bin" "$model_path" --draft "$draft_path" \
             "${common_luce_args[@]}" >"$server_log" 2>&1
         ;;

@@ -17,6 +17,9 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | Variable | Default | Purpose |
 |---|---|---|
 | `DFLASH_DRAFT_KV` | 1 | KILL SWITCH (remove after burn-in): =0 restores the legacy per-step drafter window recompute instead of the ring cache. |
+| `DFLASH_ADAPTIVE_SPEC_WIDTH` | 1 | KILL SWITCH (remove after burn-in): =0 restores each speculative backend's fixed verification width. |
+| `DFLASH_DSPARK_ADAPTIVE_MAX_WIDTH` | full DSpark block (9 on Ling) | BURN-IN: cap the seed-inclusive adaptive DSpark verification width. Valid Ling range: 2..9. |
+| `DFLASH_DSPARK_VERIFY_WIDTH` | unset | DEBUG/A-B: force one seed-inclusive DSpark verification width and disable adaptive width for that process. Valid Ling range: 2..9. |
 | `DFLASH_LAGUNA_SWA_RING` | 1 | KILL SWITCH (remove after burn-in): =0 keeps SWA layers on pool-sized caches under KVFlash. |
 | `DFLASH_PROF` | unset | DEBUG: comma list of profilers (step,verify,prefill). Replaces DFLASH_LAGUNA_{STEP,VERIFY,PREFILL}_PROF. |
 | `GGML_CUDA_GRAPH_STATS` | unset | DEBUG: per-graph CUDA-graph replay/capture/eager counters. |
@@ -72,6 +75,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH27B_PREFILL_UBATCH` - layer_split_daemon.cpp, qwen35_backend.cpp, qwen35_layer_split_adapter.cpp
 - `DFLASH_ADAPTIVE_K_DENSE` - mmid_adaptive_k.h
 - `DFLASH_ADAPTIVE_K_TAU` - mmid_adaptive_k.h
+- `DFLASH_ADAPTIVE_SPEC_WIDTH` - adaptive_spec_width.h
 - `DFLASH_ADAPTIVE_WIDTH_MIN` - adaptive_verify_width.h
 - `DFLASH_ADAPTIVE_WIDTH_THETA` - adaptive_verify_width.h
 - `DFLASH_COLD_THREADS` - moe_expert_compute_cpu.cpp
@@ -88,6 +92,8 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_DRAFT_IPC_TRANSPORT` - dflash_draft_ipc.cpp
 - `DFLASH_DRAFT_KV` - laguna_backend.cpp, qwen35_backend.cpp
 - `DFLASH_DRAFT_PERSIST` - laguna_backend.cpp
+- `DFLASH_DSPARK_ADAPTIVE_MAX_WIDTH` - qwen35_backend.cpp
+- `DFLASH_DSPARK_VERIFY_WIDTH` - qwen35_backend.cpp
 - `DFLASH_DROP_COLD` - qwen35moe_backend.cpp, qwen35moe_pipelined_decode.cpp
 - `DFLASH_DS4_ADAPTIVE_WIDTH` - deepseek4_dspark_spec.cpp
 - `DFLASH_DS4_COMP_PAD_STRIDE` - deepseek4_graph.cpp
