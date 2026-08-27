@@ -301,6 +301,16 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         const double elapsed_s = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - s.started_at).count();
         const int out_tokens = (int)s.gen_tokens.size();
+        if (backend_ok && !s.failed && !s.client_disconnected) {
+            GenerateResult trace_result;
+            trace_result.succeed();
+            trace_result.tokens = s.gen_tokens;
+            trace_result.prefill_s = s.prefill_s;
+            trace_result.decode_s = decode_s;
+            enqueue_luce_odistill_trace(
+                req, trace_result, gen_timings, *s.emitter,
+                s.completion_tokens, elapsed_s);
+        }
         std::fprintf(stderr,
             "[server] chat DONE %s ok=%s in=%zu out=%d %.1fs %.1f tok/s "
             "finish=%s slot=%d prefill=%.1fs decode=%.1fs(%.1ftok/s) parallel\n",

@@ -516,6 +516,7 @@ add_library(dflash_common STATIC
     src/server/reasoning.cpp
     src/server/tool_memory.cpp
     src/server/sse_emitter.cpp
+    src/server/luce_odistill_bridge.cpp
     src/server/prefix_cache.cpp
     src/server/pin_friendly_prompt.cpp
     src/server/disk_prefix_cache.cpp

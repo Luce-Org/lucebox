@@ -30,6 +30,7 @@
 #include "adaptive_keep_ratio.h"
 #include "server_status.h"
 #include "sse_emitter.h"
+#include "luce_odistill_bridge.h"
 #include <nlohmann/json.hpp>
 
 #include <atomic>
@@ -235,6 +236,11 @@ struct ServerConfig {
     // Routing data collection (--collect-routing <path>): write binary per-token
     // routing data (hidden states + expert selections) for predictor training.
     std::string collect_routing_path;
+
+    // Experimental local luce_odistill bridge. The selection is verified once
+    // before backend construction; trace emission is optional and best-effort.
+    LuceODistillSelection luce_odistill_selection;
+    std::string luce_odistill_capture_socket;
 };
 
 namespace http_detail {
@@ -310,6 +316,7 @@ struct ParsedRequest {
     DiskPrefixCachePolicy     disk_cache_policy;
     // PPP: stable pin cut for tool-heavy requests (0 = use default boundary).
     int                       pin_end_token = 0;
+    LuceODistillConsent       luce_odistill_capture;
 };
 
 // Parse request sampler fields, applying model-card defaults where present.
@@ -459,6 +466,10 @@ private:
     void configure_generation_io(
         ServerJob * job, const ParsedRequest & req, SseEmitter & emitter,
         GenerationOutputState & output, DaemonIO & io);
+    void enqueue_luce_odistill_trace(
+        const ParsedRequest & req, const GenerateResult & result,
+        const GenTimings & timings, const SseEmitter & emitter,
+        int completion_tokens, double latency_seconds);
 
     // Worker thread, concurrent mode (the backend exposes a SeqEngine):
     // iteration-level scheduler. Admission is claim-only; this baseline
@@ -496,6 +507,7 @@ private:
         std::string path;
         std::string query;  // raw query string (after '?')
         std::string body;
+        LuceODistillConsent luce_odistill_capture;
     };
     bool read_http_request(SocketHandle fd, HttpRequest & out);
 
@@ -549,6 +561,7 @@ private:
     ToolMemory       tool_memory_;
     PrefixCache      prefix_cache_;
     DiskPrefixCache  disk_cache_;
+    std::unique_ptr<LuceODistillTraceSink> luce_odistill_trace_sink_;
 
     // Per-session adaptive keep_ratio bandit state.
     HttpServerSessions sessions_;

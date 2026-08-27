@@ -794,6 +794,26 @@ json build_props_body(const ServerConfig & config,
     // benchmarks to silently run at temp=0 (degenerate-decode collapse)
     // when the model card specifies temp=1.0/top_p=0.95/top_k=64.
     const auto & smp = config.sampler_defaults;
+    const auto & selection = config.luce_odistill_selection;
+    const json odistill = {
+        {"enabled", selection.configured},
+        {"capture_enabled", !config.luce_odistill_capture_socket.empty()},
+        {"status", selection.configured ? json("experimental") : json(nullptr)},
+        {"selection_state", selection.configured
+            ? json(selection.selection_state) : json(nullptr)},
+        {"release_id", selection.release_id.empty()
+            ? json(nullptr) : json(selection.release_id)},
+        {"source_artifact_sha256", selection.source_artifact_sha256.empty()
+            ? json(nullptr) : json(selection.source_artifact_sha256)},
+        {"runtime_artifact_sha256", selection.runtime_artifact_sha256.empty()
+            ? json(nullptr) : json(selection.runtime_artifact_sha256)},
+        {"target_profile_sha256", selection.target_profile_sha256.empty()
+            ? json(nullptr) : json(selection.target_profile_sha256)},
+        {"drafter_profile_sha256", selection.drafter_profile_sha256.empty()
+            ? json(nullptr) : json(selection.drafter_profile_sha256)},
+        {"evaluation_report_sha256", selection.evaluation_report_sha256.empty()
+            ? json(nullptr) : json(selection.evaluation_report_sha256)},
+    };
     json body = {
         {"default_generation_settings", {
             {"n_ctx",          config.max_ctx},
@@ -804,6 +824,7 @@ json build_props_body(const ServerConfig & config,
             {"repeat_penalty", smp.has_repetition_penalty ? smp.repetition_penalty : 1.0f},
         }},
         {"model_alias", config.model_name},
+        {"experimental", {{"luce_odistill", odistill}}},
         {"model_path",  config.model_path},
         {"build_info",  std::string(kServerName) + " v" DFLASH_SERVER_VERSION
                         " props_schema=" + std::to_string(kPropsSchema)},
@@ -1141,6 +1162,10 @@ HttpServer::HttpServer(ModelBackend & backend,
     }
     disk_cache_.init();
     status_html_path_ = resolve_status_html();
+    if (!config_.luce_odistill_capture_socket.empty()) {
+        luce_odistill_trace_sink_ = std::make_unique<LuceODistillTraceSink>(
+            config_.luce_odistill_capture_socket);
+    }
 
     // PPP env overrides (operator-facing; no CLI flags required).
     auto env_truthy = [](const char * v) -> bool {
@@ -2131,6 +2156,7 @@ bool HttpServer::route_request(SocketHandle fd, const HttpRequest & hr) {
                  hr.path.c_str(), hr.body.size());
 
     ParsedRequest req;
+    req.luce_odistill_capture = hr.luce_odistill_capture;
     bool count_tokens_only = false;
     try {
         const json body = json::parse(hr.body);
@@ -2573,6 +2599,65 @@ bool is_continuation_request(const json & messages) {
 }
 
 }  // namespace
+
+void HttpServer::enqueue_luce_odistill_trace(
+        const ParsedRequest & req, const GenerateResult & result,
+        const GenTimings & timings, const SseEmitter & emitter,
+        int completion_tokens, double latency_seconds) {
+    if (!luce_odistill_trace_sink_ ||
+        !config_.luce_odistill_selection.configured ||
+        !req.luce_odistill_capture.granted ||
+        req.model != config_.model_name ||
+        !result.ok()) {
+        return;
+    }
+
+    json request = req.raw_body;
+    request["model"] = req.model;
+    request["messages"] = req.messages;
+    if (!req.tools.is_null()) request["tools"] = req.tools;
+    if (!req.tool_choice.is_null()) request["tool_choice"] = req.tool_choice;
+
+    json message = {
+        {"role", "assistant"},
+        {"content", emitter.accumulated_text()},
+    };
+    if (!emitter.reasoning_text().empty()) {
+        message["reasoning_content"] = emitter.reasoning_text();
+    }
+    if (!emitter.tool_calls().empty()) {
+        json tool_calls = json::array();
+        for (const auto & tool_call : emitter.tool_calls()) {
+            tool_calls.push_back({
+                {"id", tool_call.id},
+                {"type", "function"},
+                {"function", {
+                    {"name", tool_call.name},
+                    {"arguments", tool_call.arguments},
+                }},
+            });
+        }
+        message["tool_calls"] = std::move(tool_calls);
+    }
+    const json choice = {
+        {"message", message},
+        {"finish_reason", emitter.finish_reason()},
+    };
+    const json response = {
+        {"id", req.response_id},
+        {"model", req.model},
+        {"choices", json::array({choice})},
+        {"usage", {
+            {"completion_tokens", completion_tokens},
+            {"timings", build_timings_json(timings, completion_tokens)},
+            {"accept_rate", result.accept_rate},
+            {"spec_decode_ran", result.spec_decode_ran},
+        }},
+    };
+    luce_odistill_trace_sink_->enqueue(build_luce_odistill_native_event(
+        config_.model_name, request, response, req.luce_odistill_capture,
+        config_.luce_odistill_selection, latency_seconds));
+}
 
 void HttpServer::apply_flowkv_compression(
         const ParsedRequest & req, PreparedPrompt & prepared) {
@@ -4200,6 +4285,10 @@ void HttpServer::process_job(ServerJob * job) {
     const std::string finish = client_disconnected
         ? "client_disconnect"
         : (result.ok() ? emitter.finish_reason() : "error");
+    if (!client_disconnected) {
+        enqueue_luce_odistill_trace(
+            req, result, gen_timings, emitter, completion_tokens, elapsed_s);
+    }
 
     std::fprintf(stderr,
         "[server] chat DONE %s ok=%s in=%zu effective_in=%zu out=%d "
@@ -4362,6 +4451,28 @@ bool HttpServer::read_http_request(SocketHandle fd, HttpRequest & out) {
         out.path = out.path.substr(0, q);
     }
     out.query = std::move(query_string);
+
+    // Preserve only the four internal opt-in headers. They never enter the
+    // prompt or access logs; duplicate values fail closed in the bridge parser.
+    std::vector<std::pair<std::string, std::string>> request_headers;
+    size_t header_cursor = line_end + 1;
+    while (header_cursor < (size_t)hend) {
+        size_t next = buf.find("\n", header_cursor);
+        if (next == std::string::npos || next > (size_t)hend) break;
+        std::string header_line = buf.substr(header_cursor, next - header_cursor);
+        if (!header_line.empty() && header_line.back() == '\r') {
+            header_line.pop_back();
+        }
+        if (header_line.empty()) break;
+        const size_t colon = header_line.find(':');
+        if (colon != std::string::npos) {
+            request_headers.emplace_back(
+                header_line.substr(0, colon), header_line.substr(colon + 1));
+        }
+        header_cursor = next + 1;
+    }
+    out.luce_odistill_capture =
+        parse_luce_odistill_capture_headers(request_headers);
 
     // Find Content-Length.
     long content_length = 0;

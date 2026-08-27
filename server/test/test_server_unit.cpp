@@ -6907,3 +6907,92 @@ TEST_CASE(ServerUnitFixture, test_emitter_suppresses_malformed_multiline_tool_bu
     TEST_ASSERT(captured.find("[server] tool_call parse failed; suppressing buffered tool text") != std::string::npos);
     TEST_ASSERT(captured.find("text='<function_call>\\n  <invoke name=\"read\">\\n    malformed prose body with\\nnew lines and \\t tabs\\n'") != std::string::npos);
 }
+
+TEST_CASE(ServerUnitFixture, test_luce_odistill_selection_schema_is_exact) {
+    json selection = {
+        {"schema_version", 1},
+        {"kind", "luce_odistill_lucebox_selection"},
+        {"experimental", true},
+        {"selection_state", "baseline"},
+        {"release_id", nullptr},
+        {"source_artifact_sha256", std::string(64, 'a')},
+        {"runtime_artifact", {
+            {"format", "gguf"},
+            {"path", "/models/stock.gguf"},
+            {"sha256", std::string(64, 'b')},
+        }},
+        {"target_profile_sha256", std::string(64, 'c')},
+        {"drafter_profile_sha256", std::string(64, 'd')},
+        {"evaluation_report_sha256", nullptr},
+    };
+    LuceODistillSelection parsed;
+    std::string error;
+    TEST_ASSERT(parse_luce_odistill_selection(selection, parsed, error));
+    TEST_ASSERT(parsed.configured);
+    TEST_ASSERT(parsed.selection_state == "baseline");
+    TEST_ASSERT(parsed.runtime_artifact_path == "/models/stock.gguf");
+
+    selection["unexpected"] = true;
+    TEST_ASSERT(!parse_luce_odistill_selection(selection, parsed, error));
+    selection.erase("unexpected");
+    selection["runtime_artifact"]["path"] = "relative.gguf";
+    TEST_ASSERT(!parse_luce_odistill_selection(selection, parsed, error));
+}
+
+TEST_CASE(ServerUnitFixture, test_luce_odistill_capture_headers_fail_closed) {
+    auto consent = parse_luce_odistill_capture_headers({
+        {"X-Luce-ODistill-Consent", "true"},
+        {"X-Luce-ODistill-Subject", "local-user-7"},
+        {"X-Luce-ODistill-Conversation", "conversation-4"},
+        {"X-Luce-ODistill-Profile", "coding"},
+    });
+    TEST_ASSERT(consent.requested);
+    TEST_ASSERT(consent.granted);
+    TEST_ASSERT(consent.subject == "local-user-7");
+    TEST_ASSERT(consent.profile == "coding");
+
+    consent = parse_luce_odistill_capture_headers({
+        {"X-Luce-ODistill-Consent", "true"},
+        {"x-luce-odistill-consent", "true"},
+        {"X-Luce-ODistill-Subject", "local-user-7"},
+    });
+    TEST_ASSERT(consent.requested);
+    TEST_ASSERT(!consent.granted);
+
+    consent = parse_luce_odistill_capture_headers({
+        {"X-Luce-ODistill-Consent", "true"},
+    });
+    TEST_ASSERT(consent.requested);
+    TEST_ASSERT(!consent.granted);
+}
+
+TEST_CASE(ServerUnitFixture, test_luce_odistill_event_binds_runtime_identity) {
+    LuceODistillSelection selection;
+    selection.configured = true;
+    selection.selection_state = "promoted";
+    selection.release_id = "release-20260826-test";
+    selection.source_artifact_sha256 = std::string(64, 'a');
+    selection.runtime_artifact_sha256 = std::string(64, 'b');
+    selection.evaluation_report_sha256 = std::string(64, 'e');
+    selection.target_profile_sha256 = std::string(64, 'c');
+    selection.drafter_profile_sha256 = std::string(64, 'd');
+    LuceODistillConsent consent;
+    consent.requested = true;
+    consent.granted = true;
+    consent.subject = "local-user-7";
+    consent.profile = "default";
+
+    const json event = build_luce_odistill_native_event(
+        "Qwen3.8-27B",
+        {{"model", "Qwen3.8-27B"}, {"messages", json::array()}},
+        {{"model", "Qwen3.8-27B"}, {"choices", json::array()}},
+        consent, selection, 0.25);
+    TEST_ASSERT(event["kind"] == "luce_odistill_native_capture");
+    TEST_ASSERT(event["consent"]["granted"] == true);
+    TEST_ASSERT(event["runtime_drafter"]["release_id"] ==
+                "release-20260826-test");
+    TEST_ASSERT(event["runtime_drafter"]["runtime_artifact_sha256"] ==
+                std::string(64, 'b'));
+    TEST_ASSERT(event["runtime_drafter"]["evaluation_report_sha256"] ==
+                std::string(64, 'e'));
+}

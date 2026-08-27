@@ -35,6 +35,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <utility>
@@ -75,6 +76,10 @@ static void print_usage(const char * prog) {
         "\n"
         "Options:\n"
         "  --draft <path>       Draft model for speculative decode\n"
+        "  --luce-odistill-selection <current.json>\n"
+        "                       Experimental verified drafter selection; conflicts with --draft\n"
+        "  --luce-odistill-capture-socket <path>\n"
+        "                       Experimental local consented trace sink\n"
         "  --port <N>           Listen port (default: 8080)\n"
         "  --host <addr>        Bind address (default: 0.0.0.0)\n"
         "  --max-ctx <N>        Max context length (default: 131072)\n"
@@ -253,6 +258,8 @@ int main(int argc, char ** argv) {
     bool ddtree_tau_set = false;
     bool specla_top_k_set = false;
     int  specla_top_k = 4;
+    std::string luce_odistill_selection_path;
+    std::string luce_odistill_selected_draft_path;
 
     // Track which thinking-budget tunables the operator set via CLI.
     // Those values win over the model card (spec §3.1: "Explicit CLI
@@ -280,6 +287,12 @@ int main(int argc, char ** argv) {
     for (int i = 2; i < argc; i++) {
         if (std::strcmp(argv[i], "--draft") == 0 && i + 1 < argc) {
             bargs.draft_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--luce-odistill-selection") == 0 &&
+                   i + 1 < argc) {
+            luce_odistill_selection_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--luce-odistill-capture-socket") == 0 &&
+                   i + 1 < argc) {
+            sconfig.luce_odistill_capture_socket = argv[++i];
         } else if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
             sconfig.port = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--host") == 0 && i + 1 < argc) {
@@ -711,6 +724,39 @@ int main(int argc, char ** argv) {
             return 2;
         }
         set_environment_variable("DFLASH_SPLIT_FAST_ROLLBACK", "1", true);
+    }
+
+    if (!luce_odistill_selection_path.empty()) {
+        if (bargs.draft_path) {
+            std::fprintf(stderr,
+                "[server] --luce-odistill-selection conflicts with --draft\n");
+            return 2;
+        }
+        std::string selection_error;
+        if (!load_luce_odistill_selection(
+                luce_odistill_selection_path,
+                sconfig.luce_odistill_selection, selection_error)) {
+            std::fprintf(stderr,
+                "[server] invalid luce_odistill selection: %s\n",
+                selection_error.c_str());
+            return 2;
+        }
+        luce_odistill_selected_draft_path =
+            sconfig.luce_odistill_selection.runtime_artifact_path;
+        bargs.draft_path = luce_odistill_selected_draft_path.c_str();
+    }
+    if (!sconfig.luce_odistill_capture_socket.empty() &&
+        !sconfig.luce_odistill_selection.configured) {
+        std::fprintf(stderr,
+            "[server] --luce-odistill-capture-socket requires "
+            "--luce-odistill-selection for exact runtime provenance\n");
+        return 2;
+    }
+    if (!sconfig.luce_odistill_capture_socket.empty() &&
+        !std::filesystem::path(sconfig.luce_odistill_capture_socket).is_absolute()) {
+        std::fprintf(stderr,
+            "[server] --luce-odistill-capture-socket must be an absolute path\n");
+        return 2;
     }
 
     // Resolve documented environment defaults before factory preparation so
@@ -1151,6 +1197,20 @@ int main(int argc, char ** argv) {
     std::fprintf(stderr, "[server] │  port            = %d\n", sconfig.port);
     std::fprintf(stderr, "[server] │  model           = %s\n", bargs.model_path);
     std::fprintf(stderr, "[server] │  draft           = %s\n", bargs.draft_path ? bargs.draft_path : "(none)");
+    std::fprintf(stderr, "[server] │  luce_odistill   = %s\n",
+                 sconfig.luce_odistill_selection.configured
+                     ? "experimental" : "off");
+    if (sconfig.luce_odistill_selection.configured) {
+        const auto & selection = sconfig.luce_odistill_selection;
+        std::fprintf(stderr, "[server] │  odistill_state = %s\n",
+                     selection.selection_state.c_str());
+        std::fprintf(stderr, "[server] │  odistill_release= %s\n",
+                     selection.release_id.empty()
+                         ? "(baseline)" : selection.release_id.c_str());
+        std::fprintf(stderr, "[server] │  odistill_capture= %s\n",
+                     sconfig.luce_odistill_capture_socket.empty()
+                         ? "off" : "local Unix socket");
+    }
     std::fprintf(stderr, "[server] │  model_name      = %s\n", sconfig.model_name.c_str());
     std::fprintf(stderr, "[server] │  max_ctx         = %d\n", sconfig.max_ctx);
     // max_tokens default for requests that omit the field. The request
