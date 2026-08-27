@@ -1548,6 +1548,12 @@ if(DFLASH27B_TESTS)
     endif()
     unset(_client_timeout_test)
 
+    add_executable(test_ggml_meta_split_layout test/test_ggml_meta_split_layout.cpp)
+    target_include_directories(test_ggml_meta_split_layout PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src)
+    list(APPEND _raw_unit_test_targets test_ggml_meta_split_layout)
+
     # CPU-only contract test for the fail-closed layer-split tree boundary.
     add_executable(test_qwen35_split_tree_guard
         test/test_qwen35_split_tree_guard.cpp)

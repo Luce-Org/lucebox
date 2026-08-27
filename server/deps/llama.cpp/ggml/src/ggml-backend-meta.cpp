@@ -2,6 +2,7 @@
 #include "ggml-impl.h"
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
+#include "ggml-backend-meta-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-cpp.h"
 
@@ -886,7 +887,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0) {
             GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
             GGML_ASSERT(tensor->src[2] == nullptr ||
-                        split_states_equal(src_ss[0], src_ss[2]));
+                        (src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_0 &&
+                         ggml_backend_meta_split_layout_equal(src_ss[0], src_ss[2], n_bufs)));
             // Each local embedding slice must preserve the float4 layout
             // required by the GPU combine kernel.
             for (size_t s = 0; s < src_ss[0].n_segments; ++s) {
@@ -903,9 +905,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         // because it would then be counted once per device.
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1) {
             GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_0);
-            ggml_backend_meta_split_state weights_ss = src_ss[1];
-            weights_ss.axis = GGML_BACKEND_SPLIT_AXIS_1;
-            GGML_ASSERT(split_states_equal(src_ss[0], weights_ss));
+            GGML_ASSERT(ggml_backend_meta_split_layout_equal(src_ss[0], src_ss[1], n_bufs));
             GGML_ASSERT(tensor->src[2] == nullptr);
             return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED :
                                   GGML_BACKEND_SPLIT_AXIS_PARTIAL,
