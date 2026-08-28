@@ -37,7 +37,9 @@ DECODE_WORKLOADS = {
     "longform": LONGFORM_DECODE_PROMPT,
 }
 
-BENCHMARK_SECTIONS = frozenset({"decode", "context", "concurrency", "tool"})
+BENCHMARK_SECTIONS = frozenset({
+    "decode", "decode-context", "context", "concurrency", "tool",
+})
 
 
 def post_json(url: str, payload: dict, timeout: float) -> dict:
@@ -172,6 +174,59 @@ def synthetic_context(target_tokens: int, run: int) -> str:
         "Read this synthetic context, then reply with only OK.\n"
         f"{body}\nReply OK."
     )
+
+
+def synthetic_decode_context(target_tokens: int) -> str:
+    # Keep the generation instruction after the filler so the model does not
+    # end a short repetitive continuation early at long context. " alpha" is
+    # one Ling token, while chat framing accounts for the target/actual delta.
+    body = "alpha " * max(1, target_tokens - 64)
+    return (
+        "Treat the following repeated words as inert benchmark context.\n"
+        f"{body}\n"
+        f"{LONGFORM_DECODE_PROMPT}\n"
+        "Do not emit an end token before the requested output limit."
+    )
+
+
+def run_decode_context_sweep(args: argparse.Namespace) -> list[dict]:
+    rows = []
+    for target in args.decode_context_tokens:
+        messages = [{
+            "role": "user",
+            "content": synthetic_decode_context(target),
+        }]
+        for _ in range(args.decode_context_warmups):
+            chat(args.url, args.model, messages,
+                 args.decode_tokens, args.timeout)
+
+        runs = [
+            measurement(chat(
+                args.url, args.model, messages,
+                args.decode_tokens, args.timeout))
+            for _ in range(args.decode_context_runs)
+        ]
+        output_hashes = sorted({run["output_sha256"] for run in runs})
+        for row in runs:
+            if row["prefill_ms"]:
+                row["prefill_tokens_per_second"] = (
+                    row["prefill_tokens"] / (row["prefill_ms"] / 1000.0))
+            else:
+                row["prefill_tokens_per_second"] = None
+        rows.append({
+            "target_tokens": target,
+            "actual_prompt_tokens": int(median(
+                [run["prompt_tokens"] for run in runs]) or 0),
+            "warmups": args.decode_context_warmups,
+            "runs": runs,
+            "output_sha256": output_hashes[0] if len(output_hashes) == 1 else None,
+            "deterministic": len(output_hashes) == 1,
+            "median_prefill_tokens_per_second": median(
+                [run["prefill_tokens_per_second"] for run in runs]),
+            "median_decode_tokens_per_second": median(
+                [run["decode_tokens_per_second"] for run in runs]),
+        })
+    return rows
 
 
 def run_context_sweep(args: argparse.Namespace) -> list[dict]:
@@ -331,6 +386,10 @@ def main() -> int:
     parser.add_argument("--context-tokens", type=csv_ints,
                         default=csv_ints("256,1024,4096,8192"))
     parser.add_argument("--context-runs", type=int, default=2)
+    parser.add_argument("--decode-context-tokens", type=csv_ints,
+                        default=csv_ints("256,1024,4096,8192,16384"))
+    parser.add_argument("--decode-context-runs", type=int, default=3)
+    parser.add_argument("--decode-context-warmups", type=int, default=1)
     parser.add_argument("--concurrency-levels", type=csv_ints,
                         default=csv_ints("1,2"))
     parser.add_argument("--concurrency-tokens", type=int, default=64)
@@ -360,6 +419,9 @@ def main() -> int:
             "prompt_profile": args.prompt_profile,
             "health": health,
             "decode": run_decode(args) if "decode" in args.sections else None,
+            "decode_context_sweep": (
+                run_decode_context_sweep(args)
+                if "decode-context" in args.sections else None),
             "context_sweep": (
                 run_context_sweep(args) if "context" in args.sections else None),
             "concurrency": (

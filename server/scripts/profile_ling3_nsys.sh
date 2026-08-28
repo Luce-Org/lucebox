@@ -139,8 +139,18 @@ case "$profile_sections" in
             --warmups 0
         )
         ;;
+    decode-context)
+        bench_args=(
+            --sections decode-context
+            --decode-context-tokens "${LING_PROFILE_CONTEXT_TOKENS:-16384}"
+            --decode-context-runs 1
+            --decode-context-warmups 0
+            --decode-tokens "${LING_PROFILE_DECODE_TOKENS:-128}"
+            --warmups 0
+        )
+        ;;
     *)
-        printf 'LING_PROFILE_SECTIONS must be decode or context.\n' >&2
+        printf 'LING_PROFILE_SECTIONS must be decode, context, or decode-context.\n' >&2
         exit 2
         ;;
 esac
@@ -161,10 +171,20 @@ if [[ "$profile_sections" == decode ]]; then
         "${expected_hash_args[@]}" \
         --output "${output_base}.warmup.json" \
         >/dev/null
-else
+elif [[ "$profile_sections" == context ]]; then
     python3 scripts/bench_ling3_flash.py \
         --url "http://127.0.0.1:${port}" \
         "${bench_args[@]}" \
+        --output "${output_base}.warmup.json" \
+        >/dev/null
+else
+    python3 scripts/bench_ling3_flash.py \
+        --url "http://127.0.0.1:${port}" \
+        --sections decode-context \
+        --decode-context-tokens "${LING_PROFILE_CONTEXT_TOKENS:-16384}" \
+        --decode-context-runs 1 \
+        --decode-context-warmups 1 \
+        --decode-tokens "${LING_PROFILE_DECODE_TOKENS:-128}" \
         --output "${output_base}.warmup.json" \
         >/dev/null
 fi

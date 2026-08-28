@@ -137,6 +137,9 @@ python3 scripts/bench_ling3_flash.py \
     --expected-output-sha256 "${LING_EXPECTED_SHA256:-}" \
     --context-tokens "${LING_BENCH_CONTEXT_TOKENS:-256,1024,4096,8192}" \
     --context-runs "${LING_BENCH_CONTEXT_RUNS:-2}" \
+    --decode-context-tokens "${LING_BENCH_DECODE_CONTEXT_TOKENS:-256,1024,4096,8192,16384}" \
+    --decode-context-runs "${LING_BENCH_DECODE_CONTEXT_RUNS:-3}" \
+    --decode-context-warmups "${LING_BENCH_DECODE_CONTEXT_WARMUPS:-1}" \
     --output "$output_json"
 
 printf 'Engine: %s\nResult: %s\n' "$engine_name" "$output_json"
