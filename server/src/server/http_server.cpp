@@ -46,10 +46,6 @@
 
 using dflash::common::SocketHandle;
 
-#ifndef DFLASH_GIT_SHA
-#define DFLASH_GIT_SHA "unknown"
-#endif
-
 #if defined(_WIN32)
 #include <io.h>
 #include <sys/stat.h>
@@ -522,8 +518,6 @@ static const std::vector<std::string> kApiEndpoints = {
     "GET /status",
     "GET /status/events",
     "GET /status/json",
-    "GET /observability",
-    "GET /observability/snapshot",
     "GET /v1/models",
     "POST /v1/chat/completions",
     "POST /v1/messages",
@@ -1110,26 +1104,6 @@ static std::array<uint8_t, 16> compute_disk_cache_salt(const ServerConfig & cfg)
 
 // ─── HttpServer ─────────────────────────────────────────────────────────
 
-namespace {
-
-observability::ObservabilityConfig make_observability_config(
-        const ServerConfig & server) {
-    observability::ObservabilityConfig config =
-        observability::ObservabilityConfig::from_env();
-    config.git_sha = DFLASH_GIT_SHA;
-    config.model_name = server.model_name;
-    config.model_path = server.model_path;
-    config.draft_path = server.draft_path;
-    config.arch = server.arch;
-    config.runtime_backend = server.runtime_backend;
-    config.max_concurrency = server.max_concurrency;
-    config.ddtree_budget = server.ddtree_budget;
-    config.draft_block_size = server.draft_block_size;
-    return config;
-}
-
-}
-
 HttpServer::HttpServer(ModelBackend & backend,
                        Tokenizer & tokenizer,
                        const ServerConfig & config)
@@ -1143,7 +1117,6 @@ HttpServer::HttpServer(ModelBackend & backend,
                    config.disk_cache_min_tokens,
                    config.disk_cache_continued_interval,
                    config.disk_cache_cold_max_tokens}, backend)
-    , observability_(make_observability_config(config))
 {
     #ifdef DFLASH_HAS_CURL
     curl_global_init(CURL_GLOBAL_DEFAULT);
@@ -1158,7 +1131,6 @@ HttpServer::HttpServer(ModelBackend & backend,
     }
     disk_cache_.init();
     status_html_path_ = resolve_status_html();
-    observability_html_path_ = resolve_share_html("observability.html");
 
     // PPP env overrides (operator-facing; no CLI flags required).
     auto env_truthy = [](const char * v) -> bool {
@@ -1191,17 +1163,16 @@ HttpServer::HttpServer(ModelBackend & backend,
         config_.ppp_max_ephemeral_tokens);
 }
 
+// Resolve path to share/status.html at startup.
 std::string HttpServer::resolve_status_html() {
-    return resolve_share_html("status.html");
-}
-
-std::string HttpServer::resolve_share_html(const char * filename) {
-    if (!filename || !*filename) return {};
+    // 1. DFLASH_SHARE_DIR env var
     if (const char * dir = std::getenv("DFLASH_SHARE_DIR")) {
-        std::string path = std::string(dir) + "/" + filename;
+        std::string path = std::string(dir) + "/status.html";
         struct stat st;
         if (::stat(path.c_str(), &st) == 0) return path;
     }
+    // 2. share/ relative to exe path (build dir or installed prefix)
+    {
     std::string exe_dir;
 #if defined(_WIN32)
     char exe_buf[MAX_PATH] = {};
@@ -1222,16 +1193,24 @@ std::string HttpServer::resolve_share_html(const char * filename) {
     }
 #endif
     if (!exe_dir.empty()) {
-        struct stat st;
-        std::string path = exe_dir + "/share/" + filename;
-        if (::stat(path.c_str(), &st) == 0) return path;
-        path = exe_dir + "/../share/" + filename;
-        if (::stat(path.c_str(), &st) == 0) return path;
+            // 2a. <exe_dir>/share/status.html  (build directory layout)
+            {
+                std::string path = exe_dir + "/share/status.html";
+                struct stat st;
+                if (::stat(path.c_str(), &st) == 0) return path;
+            }
+            // 2b. <exe_dir>/../share/status.html  (installed prefix layout)
+            {
+                std::string path = exe_dir + "/../share/status.html";
+                struct stat st;
+                if (::stat(path.c_str(), &st) == 0) return path;
+            }
+        }
     }
+    // 3. ./share/status.html (development)
     {
         struct stat st;
-        std::string path = std::string("share/") + filename;
-        if (::stat(path.c_str(), &st) == 0) return path;
+        if (::stat("share/status.html", &st) == 0) return "share/status.html";
     }
     return {};
 }
@@ -1603,33 +1582,6 @@ void HttpServer::handle_client(SocketHandle fd) {
     if (hr.method == "GET" && hr.path == "/status/json") {
         send_response(fd, 200, "application/json",
             status_.to_json().dump(-1, ' ', false, json::error_handler_t::replace) + "\n");
-        socket_close(fd);
-        return;
-    }
-
-    if (hr.method == "GET" && hr.path == "/observability") {
-        if (observability_html_path_.empty()) {
-            send_error(fd, 404,
-                "observability.html not found. Set DFLASH_SHARE_DIR or place it in share/observability.html");
-            socket_close(fd);
-            return;
-        }
-        std::ifstream ifs(observability_html_path_);
-        if (!ifs.is_open()) {
-            send_error(fd, 500, "failed to open observability.html");
-            socket_close(fd);
-            return;
-        }
-        std::ostringstream oss;
-        oss << ifs.rdbuf();
-        send_response(fd, 200, "text/html; charset=utf-8", oss.str());
-        socket_close(fd);
-        return;
-    }
-
-    if (hr.method == "GET" && hr.path == "/observability/snapshot") {
-        send_response(fd, 200, "application/json",
-            observability_.snapshot_json());
         socket_close(fd);
         return;
     }
@@ -4062,14 +4014,10 @@ void HttpServer::process_job(ServerJob * job) {
     broadcast_status();
 
     GenerateResult result;
-    {
-        observability::ActiveProfileSinkScope profile_scope(
-            observability_.enabled() ? &observability_ : nullptr);
-        if (using_restore) {
-            result = backend_.restore_and_generate(cache_slot, gen_req, io);
-        } else {
-            result = backend_.generate(gen_req, io);
-        }
+    if (using_restore) {
+        result = backend_.restore_and_generate(cache_slot, gen_req, io);
+    } else {
+        result = backend_.generate(gen_req, io);
     }
 
     if (dflash_residency == DraftResidencyAction::ReleaseAfterUse &&
@@ -4248,7 +4196,6 @@ void HttpServer::enqueue(ServerJob * job) {
     if (queue_tail_) queue_tail_->next = job;
     else queue_head_ = job;
     queue_tail_ = job;
-    job->profile_queued_ns = observability_.job_queued();
     queue_cv_.notify_one();
 }
 
@@ -4273,7 +4220,6 @@ ServerJob * HttpServer::dequeue() {
     queue_head_ = j->next;
     if (!queue_head_) queue_tail_ = nullptr;
     j->next = nullptr;
-    observability_.job_dequeued();
     return j;
 }
 
@@ -4284,7 +4230,6 @@ ServerJob * HttpServer::try_dequeue() {
     queue_head_ = job->next;
     if (!queue_head_) queue_tail_ = nullptr;
     job->next = nullptr;
-    observability_.job_dequeued();
     return job;
 }
 
@@ -4302,7 +4247,6 @@ ServerJob * HttpServer::dequeue_for(
     queue_head_ = job->next;
     if (!queue_head_) queue_tail_ = nullptr;
     job->next = nullptr;
-    observability_.job_dequeued();
     return job;
 }
 

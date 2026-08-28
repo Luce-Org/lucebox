@@ -1,7 +1,5 @@
 #pragma once
 
-#include <cstdint>
-
 namespace dflash::common {
 
 struct Qwen35RoctxMetadata {
@@ -11,8 +9,6 @@ struct Qwen35RoctxMetadata {
     int prefill_segments = -1;
     int total_rows = -1;
     int max_kv_len = -1;
-    uint64_t round_id = 0;
-    const char * path = nullptr;
 };
 
 struct Qwen35RoctxCallbacks {

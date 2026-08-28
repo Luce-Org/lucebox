@@ -409,7 +409,6 @@ set(DFLASH27B_SRC_INCLUDE_DIRS
 )
 
 add_library(dflash_common STATIC
-    src/common/observability/inference_profile.cpp
     src/errors.cpp
     src/qwen35/gguf_target_loader.cpp
     src/qwen35/qwen35_target_graph.cpp
@@ -1443,23 +1442,6 @@ if(DFLASH27B_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/test)
         list(APPEND _raw_unit_test_targets test_seq_engine_contract)
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_inference_profile.cpp")
-        add_executable(test_inference_profile
-            test/test_inference_profile.cpp
-            src/common/observability/inference_profile.cpp)
-        target_include_directories(test_inference_profile PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/src)
-        list(APPEND _raw_unit_test_targets test_inference_profile)
-    endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_observability.cpp")
-        add_executable(test_observability
-            test/test_observability.cpp
-            src/server/observability.cpp
-            src/common/observability/inference_profile.cpp)
-        target_include_directories(test_observability PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/src)
-        list(APPEND _raw_unit_test_targets test_observability)
-    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_seq_batch_plan.cpp")
         # Pure-host tests for model-neutral token-budget/FIFO planning.
         add_executable(test_seq_batch_plan test/test_seq_batch_plan.cpp)
@@ -1621,7 +1603,6 @@ if(DFLASH27B_TESTS)
         target_sources(test_server_unit PRIVATE
             src/server/http_server.cpp
             src/server/scheduler.cpp
-            src/server/observability.cpp
             src/server/model_card.cpp
             src/server/prompt_normalize.cpp
             src/qwen3/anchor_scan.cpp)
@@ -2002,42 +1983,9 @@ if(DFLASH27B_SERVER)
             src/server/server_main.cpp
             src/server/http_server.cpp
             src/server/scheduler.cpp
-            src/server/observability.cpp
             src/server/model_card.cpp
             src/server/prompt_normalize.cpp
         )
-        get_filename_component(
-            _dflash_git_root "${CMAKE_CURRENT_SOURCE_DIR}/.." REALPATH)
-        execute_process(
-            COMMAND git -c "safe.directory=${_dflash_git_root}"
-                    rev-parse --verify HEAD
-            WORKING_DIRECTORY "${_dflash_git_root}"
-            RESULT_VARIABLE _dflash_git_result
-            OUTPUT_VARIABLE _dflash_git_sha
-            OUTPUT_STRIP_TRAILING_WHITESPACE
-            ERROR_QUIET)
-        if(NOT _dflash_git_result EQUAL 0 OR NOT _dflash_git_sha)
-            set(_dflash_git_sha "unknown")
-        else()
-            execute_process(
-                COMMAND git -c "safe.directory=${_dflash_git_root}"
-                        status --porcelain --untracked-files=normal
-                WORKING_DIRECTORY "${_dflash_git_root}"
-                RESULT_VARIABLE _dflash_git_dirty
-                OUTPUT_VARIABLE _dflash_git_status
-                OUTPUT_STRIP_TRAILING_WHITESPACE
-                ERROR_QUIET)
-            if(_dflash_git_dirty EQUAL 0 AND _dflash_git_status)
-                string(APPEND _dflash_git_sha "-dirty")
-            endif()
-        endif()
-        target_compile_definitions(dflash_server PRIVATE
-            DFLASH_GIT_SHA="${_dflash_git_sha}")
-        unset(_dflash_git_result)
-        unset(_dflash_git_dirty)
-        unset(_dflash_git_status)
-        unset(_dflash_git_root)
-        unset(_dflash_git_sha)
         target_include_directories(dflash_server PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
             target_compile_definitions(dflash_server PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
@@ -2078,13 +2026,9 @@ if(DFLASH27B_SERVER)
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different
                     "${CMAKE_CURRENT_SOURCE_DIR}/share/status.html"
                     "$<TARGET_FILE_DIR:dflash_server>/share/status.html"
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    "${CMAKE_CURRENT_SOURCE_DIR}/share/observability.html"
-                    "$<TARGET_FILE_DIR:dflash_server>/share/observability.html"
                 COMMENT "Copying status.html to build/share/"
             )
             install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/share/status.html"
-                          "${CMAKE_CURRENT_SOURCE_DIR}/share/observability.html"
                     DESTINATION share)
         endif()
     endif()
