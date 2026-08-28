@@ -48,7 +48,12 @@ Each one is self-contained with setup instructions and benchmark notes.
 
 ## Supported Models & Drafters
 
-All speedups measured vs vendored llama.cpp (`-fa 1`, matching KV quant). Combined = geometric mean √(TTFT × decode) where both phases benched; otherwise the single-phase speedup. Drafters published on [huggingface.co/Lucebox](https://huggingface.co/Lucebox).
+Speedups use matched llama.cpp runs (`-fa 1`, matching KV quant). The Ling
+comparison uses the BailingMoE3-capable llama.cpp commit recorded in the
+[full report](https://www.lucebox.com/blog/ling3-flash-dgx-spark); the other
+rows use the vendored baseline. Combined = geometric mean √(TTFT × decode)
+where both phases were benchmarked; otherwise the single-phase speedup.
+Drafters are linked to their published weights.
 
 <table>
 <tr>
@@ -65,6 +70,7 @@ All speedups measured vs vendored llama.cpp (`-fa 1`, matching KV quant). Combin
 | Gemma 4 26B-A4B | **1.31×** |
 | Gemma 4 31B IT | **3.2×** |
 | [`DeepSeek V4 Flash ROCMFPX HIP`](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-ROCmFP3) | **2×** |
+| [`Ling 3.0 Flash + DSpark (DGX Spark)`](https://huggingface.co/inclusionAI/Ling-3.0-flash) | **1.06–1.36×** prefill through 64K · **1.03×** best-case spec |
 
 </td>
 <td valign="top">
@@ -77,6 +83,7 @@ All speedups measured vs vendored llama.cpp (`-fa 1`, matching KV quant). Combin
 | [`Laguna XS 2.1 33B`](https://huggingface.co/Lucebox/Laguna-XS-2.1-DFlash-GGUF) | decode |
 | [`Qwen3 0.6B`](https://huggingface.co/Qwen/Qwen3-0.6B) | prefill |
 | [`DeepSeek V4 Flash DSpark Drafter`](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-DSpark-GGUF) | decode |
+| [`Ling 3.0 Flash DSpark`](https://huggingface.co/inclusionAI/Ling-3.0-flash-dspark) | decode |
 
 </td>
 </tr>
@@ -84,11 +91,15 @@ All speedups measured vs vendored llama.cpp (`-fa 1`, matching KV quant). Combin
 
 Experimental native `BailingMoE3` support is available for
 [`Ling 3.0 Flash`](https://huggingface.co/inclusionAI/Ling-3.0-flash). On a
-single DGX Spark, LuceBox serves the Q4_K_M GGUF at **34.6 tok/s** median
-autoregressive decode with Q4_0 KV cache. See the
-[DGX Spark integration and benchmark](server/docs/LING3_FLASH_DGX_SPARK.md)
-for the exact configuration, context sweep, tool-call test, and current
-limitations.
+single DGX Spark, matched Q4_K_M/Q4_0 tests reached **46.0 tok/s** strict
+autoregressive decode (effectively tied with llama.cpp), up to **1.36×**
+faster short-prompt prefill while remaining **1.06×** faster at 64K, and
+**141.9 tok/s** in a favorable exact-output adaptive DSpark run (**1.03×**).
+See the
+[DGX Spark integration guide](server/docs/LING3_FLASH_DGX_SPARK.md) for the
+build and serve configuration, and the [full performance
+report](https://www.lucebox.com/blog/ling3-flash-dgx-spark) for the matched
+prefill, decode, long-context, and tool-call results.
 
 ## Tested Machines (GPU/APU)
 
@@ -98,7 +109,7 @@ Reference target: **RTX 3090 (Ampere sm_86)** — all headline numbers. Other NV
 |:---:|------|-----|:---------------:|--------|:-----:|
 | <img src="assets/gpus/3090.png" width="750" /> | Ampere `sm_86` | RTX 3090, A-series | CUDA 12.0 | ✅ reference | [megakernel](optimizations/megakernel/RESULTS.md#rtx-3090-pp520-tg128) · [dflash](server/RESULTS.md) |
 | <img src="assets/gpus/5090.png" width="750" /> | Blackwell `sm_120` | RTX 5090 | CUDA 12.8 | ✅ 205 tok/s, 4.84× | [↗](server/RESULTS.md#rtx-5090-blackwell-sm_120sm_120a-32-gb) |
-| <img src="assets/gpus/gb10.png" width="750" /> | Blackwell `sm_121` | DGX Spark / GB10 | CUDA 12.9 | ✅ megakernel NVFP4 | [↗](optimizations/megakernel/RESULTS.md#nvidia-dgx-spark-gb10-sm_121a) |
+| <img src="assets/gpus/gb10.png" width="750" /> | Blackwell `sm_121` | DGX Spark / GB10 | CUDA 12.9 | ✅ Ling 3.0 Flash · megakernel NVFP4 | [Ling](server/docs/LING3_FLASH_DGX_SPARK.md) · [megakernel](optimizations/megakernel/RESULTS.md#nvidia-dgx-spark-gb10-sm_121a) |
 | <img src="assets/gpus/2080ti.png" width="750" /> | Turing `sm_75` | RTX 2080 Ti | CUDA 12.0 | ✅ 53 tok/s DFlash | [↗](server/RESULTS.md#rtx-2080-ti-turing-sm_75-22-gb) |
 | <img src="assets/gpus/4090.png" width="750" /> | Ada `sm_89` | RTX 40xx | CUDA 12.0 | 🟡 community Linux + WSL2 benches | [Linux](server/RESULTS.md#rtx-4090-ada-sm_89-24-gb--cachyos-bare-metal-community) · [WSL2](server/RESULTS.md#rtx-4090-ada-sm_89-24-gb--wsl2-community) |
 | — | Blackwell `sm_110` | Jetson AGX Thor | CUDA 13.0 | 🟡 builds, unbenched | — |
