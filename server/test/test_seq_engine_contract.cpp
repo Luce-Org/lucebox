@@ -318,6 +318,18 @@ int main() {
         CHECK(mentions(violations, test.expected));
     }
 
+    {
+        SeqEngine::StepPlan plan;
+        plan.decode.push_back({0, 7, false});
+        SeqEngine::StepResult result;
+        SeqEngine::DecodeOutput output;
+        output.slot = 0;
+        output.token = 8;
+        output.committed_tokens = {9};
+        result.decode.push_back(output);
+        CHECK(!validate_step_result(plan, result, 1).empty());
+    }
+
     std::printf("test_seq_engine_contract: %d checks passed\n", g_checks);
     return 0;
 }

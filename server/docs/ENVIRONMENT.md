@@ -128,10 +128,12 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_DS4_TP_TARGETED_JOIN_SPLIT` - moe_hybrid_ffn_eval.cpp
 - `DFLASH_DS4_VERIFY_FORCE_GRAPH_REPLAY` - deepseek4_fused_verify.inc
 - `DFLASH_DS4_TOPK` - deepseek4_graph.cpp
+- `DFLASH_DYN_CONV_FUSED` - draft_graph.cpp (=0 expands the DFlash2 dynamic convs instead of the fused kernel)
 - `DFLASH_EXPERT_BUDGET_MB` - deepseek4_backend.cpp, laguna_backend.cpp, qwen35moe_backend.cpp
 - `DFLASH_EXPERT_BUDGET_PCT` - laguna_backend.cpp
 - `DFLASH_FAST_ROLLBACK_THRESHOLD` - chain_rollback_policy.h
 - `DFLASH_FEATURE_DTYPE` - dflash_feature_ring.cpp
+- `DFLASH_KV_ROTATE` - qwen35_target_graph.cpp (set to 1 to force FWHT K rotation on; off by default for f16/q8_0 caches, on for narrower types)
 - `DFLASH_FP_ALPHA` - http_server.cpp, qwen3_graph.cpp, server_main.cpp
 - `DFLASH_FP_CHUNK_S` - qwen3_graph.cpp
 - `DFLASH_FP_DEBUG_LAYER0` - qwen3_graph.cpp
@@ -222,6 +224,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_NO_PREAD` - deepseek4_loader.cpp
 - `DFLASH_PROF` - prof_env.h
 - `DFLASH_PREFILL_CACHE_SLOTS` - scripts/entrypoint.sh (maps to `--prefill-cache-slots`)
+- `DFLASH_PREFILL_TIMING` - qwen35_backend.cpp (DEBUG: per-ubatch prefill build/alloc/compute timing)
 - `DFLASH_PREFIX_CACHE_SLOTS` - scripts/entrypoint.sh (maps to `--prefix-cache-slots`)
 - `DFLASH_QWEN35MOE_CACHE_SLOTS` - qwen35moe_backend.cpp
 - `DFLASH_QWEN35MOE_HOTNESS` - qwen35moe_backend.cpp
@@ -233,6 +236,16 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_QWEN35MOE_SWAP_MIN_GAIN` - qwen35moe_backend.cpp
 - `DFLASH_QWEN35MOE_TELEMETRY` - qwen35moe_backend.cpp
 - `DFLASH_QWEN35_NO_KVPAD` - graph_builders.cpp
+- `DFLASH_QWEN35_AR_BURST` - qwen35_backend.cpp (adaptive plain-decode burst length; default 40)
+- `DFLASH_QWEN35_DFLASH2_TREE` - qwen35_backend.cpp (=0 uses raw top-k tree scoring instead of the selector under --ddtree)
+- `DFLASH_QWEN35_DSPARK` - qwen35_backend.cpp (=0 disables the DSpark drafter head path)
+- `DFLASH_QWEN35_DSPARK_CONF_DEBUG` - qwen35_backend.cpp (DEBUG: print confidence-gate scores)
+- `DFLASH_QWEN35_DSPARK_CONFIDENCE_THRESHOLD` - qwen35_backend.cpp (adaptive block-length confidence gate)
+- `DFLASH_QWEN35_DSPARK_TREE` - qwen35_backend.cpp (DSpark tree drafting toggle)
+- `DFLASH_QWEN35_FUSED_DSPARK` - qwen35_backend.cpp (=0 keeps the DSpark heads off the fused graph)
+- `DFLASH_QWEN35_NO_FUSED_KERNELS` - qwen35_target_graph.cpp (KILL SWITCH: =1 rebuilds the pre-fusion decode graph)
+- `DFLASH_QWEN35_NO_STACK` - gguf_target_loader.cpp (KILL SWITCH: =1 disables zero-copy stacked weight aliases)
+- `DFLASH_QWEN35_SPEC_STEP_RATIO` - qwen35_backend.cpp (adaptive policy spec/plain step-time ratio override)
 - `DFLASH_SAMPLED_VERIFY` - laguna_backend.cpp, qwen35_backend.cpp
 - `DFLASH_SHARE_DIR` - http_server.cpp
 - `DFLASH_SINGLE_CHAIN_CHECKPOINT_F32` - chain_rollback_policy.h
@@ -251,6 +264,8 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_VERIFY_WIDTH` - qwen35moe_backend.cpp
 - `FAST_ROLLBACK_DIAG` - qwen35_dflash_target.cpp
 - `HOME` - spark_corpus.cpp
+- `LUCE_Q8_MEMO` - mmvq.cu (set to 0 to disable q8_1 activation memoisation; on by default)
+- `LUCE_MMQ_BIG_PREFILL` - mmq.cu (=0 disables the RDNA4 128-wide MMQ tiles for large prefill batches)
 - `LUCE_MMVQ_MAX_NCOLS` - deepseek4_backend.cpp
 - `LUCE_QK_FUSE_LAYERS` - laguna_target_graph.cpp
 - `LUCE_QK_FUSE_MODE` - laguna_target_graph.cpp

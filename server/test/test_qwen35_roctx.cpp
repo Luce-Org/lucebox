@@ -37,6 +37,26 @@ int main() {
     CHECK(events.size() == 2 && events[1] == "pop");
 
     events.clear();
+    {
+        Qwen35RoctxRange service_round(
+            "qwen35.service_round", {4, -1, 0, 0, -1, -1}, true,
+            {push, pop});
+        {
+            Qwen35RoctxRange target_step(
+                "qwen35.concurrent_step", {4, 4, 0, 0, 32, 128}, true,
+                {push, pop});
+        }
+    }
+    CHECK(events.size() == 4);
+    CHECK(events[0] == "qwen35.service_round live=4 "
+                       "prefill_tokens=0 prefill_segments=0");
+    CHECK(events[1] == "qwen35.concurrent_step live=4 bucket=4 "
+                       "prefill_tokens=0 prefill_segments=0 total_rows=32 "
+                       "max_kv_len=128");
+    CHECK(events[2] == "pop");
+    CHECK(events[3] == "pop");
+
+    events.clear();
     { Qwen35RoctxRange disabled("qwen35.graph_compute", {}, false, {push, pop}); }
     CHECK(events.empty());
     return failures == 0 ? 0 : 1;

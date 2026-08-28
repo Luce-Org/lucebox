@@ -8,8 +8,16 @@
 namespace dflash::common {
 
 struct ChainRollbackPolicy {
-    bool checkpoint_f32 = false;
-    int fast_rollback_threshold = 5;
+    // Exact F32 per-token checkpoints, and the rollback-from-one-accepted-token
+    // they enable, are the tuned decode path: measured faster than the legacy
+    // F16 replay on every target we ship, with byte-identical output. They are
+    // therefore the default rather than something a launch script has to opt
+    // into. It costs VRAM: the per-token SSM checkpoints move from F16 to F32,
+    // measured at +1.11 GiB on Qwen3.8-27B at a 128K context (22.47 vs 21.36
+    // GiB total). DFLASH_SINGLE_CHAIN_CHECKPOINT_F32=0 restores the legacy
+    // F16 path and its rollback threshold of 5 when that headroom matters.
+    bool checkpoint_f32 = true;
+    int fast_rollback_threshold = 1;
     bool diagnostics = false;
 };
 
@@ -29,7 +37,12 @@ inline ChainRollbackPolicy resolve_chain_rollback_policy(
         bool tensor_parallel = false,
         bool exact_fast_rollback = false) {
     ChainRollbackPolicy policy;
-    policy.checkpoint_f32 = env_flag_enabled("DFLASH_SINGLE_CHAIN_CHECKPOINT_F32");
+    if (const char * e = std::getenv("DFLASH_SINGLE_CHAIN_CHECKPOINT_F32")) {
+        policy.checkpoint_f32 = (e[0] != '\0' && std::strcmp(e, "0") != 0);
+    }
+    if (!policy.checkpoint_f32) {
+        policy.fast_rollback_threshold = 5;   // legacy F16 replay behaviour
+    }
     policy.diagnostics = env_flag_enabled("DFLASH_SINGLE_CHAIN_ROLLBACK_DIAG");
 
     // Lower thresholds are valid only with exact F32 checkpoints. This keeps
@@ -100,7 +113,7 @@ struct RollbackDiag {
         if (!out || !policy.diagnostics) return;
         std::fprintf(out,
             "[chain-rollback-policy] checkpoint=%s threshold=%d fast_low=%d fast_high=%d legacy_replay=%d failed_fallback=%d accept_hist=1:%d,2:%d,3:%d,4:%d,5:%d,6:%d,7:%d,8:%d,9:%d,10:%d,11:%d,12:%d,13:%d,14:%d,15:%d,16+:%d\n",
-            policy.checkpoint_f32 ? "F32" : "default",
+            policy.checkpoint_f32 ? "F32" : "F16",
             policy.fast_rollback_threshold,
             fast_low, fast_high, legacy_replay, failed_fallback,
             accept_hist[1], accept_hist[2], accept_hist[3],

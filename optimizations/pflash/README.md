@@ -1,5 +1,5 @@
 <p align="left">
-  <a href="../README.md">← lucebox-hub</a>
+  <a href="../../README.md">← lucebox</a>
 </p>
 
 <p align="center">
@@ -57,7 +57,7 @@ Decode after prefill: ~74 tok/s (dflash spec decode + DDTree). The pipeline is t
 
 ## Quick start
 
-PFlash is the algorithm. The implementation lives in [`../server/`](../server/) as part of the dflash daemon. The `optimizations/pflash/` directory in this repo only contains the Python tooling for **benchmarking** (NIAH case generation, bench harness around the daemon stdin protocol). Production deploys hit the dflash daemon directly.
+PFlash is the algorithm. The implementation lives in [`../../server/`](../../server/) as part of the dflash daemon. The `optimizations/pflash/` directory in this repo only contains the Python tooling for **benchmarking** (NIAH case generation, bench harness around the daemon stdin protocol). Production deploys hit the dflash daemon directly.
 
 ```bash
 # 1. from the repo root, install Python deps and build dflash with the BSA
@@ -136,7 +136,7 @@ Typical flow at 128K on a 24 GB card: `park target` → `compress` → `free dra
 
 ## Runtime tunables
 
-Everything is configured via env vars on the daemon process. Full list in [`../server/src/flashprefill.h`](../server/src/flashprefill.h).
+Everything is configured via env vars on the daemon process. Full list in [`../../server/src/flashprefill.h`](../../server/src/flashprefill.h).
 
 | Env var | Default | Purpose |
 |---|:---:|---|

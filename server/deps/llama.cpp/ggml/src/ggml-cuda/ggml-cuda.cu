@@ -473,7 +473,11 @@ const ggml_cuda_device_info & ggml_cuda_info() {
 
 // buffer pool for cuda (legacy)
 struct ggml_cuda_pool_leg : public ggml_cuda_pool {
-    static const int MAX_BUFFERS = 256;
+    // 1024 (upstream 256): LUCE_Q8_MEMO keeps one pooled q8_1 activation
+    // buffer per quantized matmul alive across a whole graph evaluation
+    // (~300 on a 64-layer hybrid), and a full pool falls back to freeing
+    // in-flight buffers with cudaFree.
+    static const int MAX_BUFFERS = 1024;
 
     int device;
     struct ggml_cuda_buffer {
@@ -565,6 +569,27 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         ggml_cuda_set_device(device);
         CUDA_CHECK(cudaFree(ptr));
         pool_size -= size;
+    }
+
+    bool is_legacy() const override {
+        return true;
+    }
+
+    size_t trim() override {
+        ggml_cuda_set_device(device);
+        size_t freed = 0;
+        for (int i = 0; i < MAX_BUFFERS; ++i) {
+            ggml_cuda_buffer & b = buffer_pool[i];
+            if (b.ptr == nullptr) {
+                continue;
+            }
+            CUDA_CHECK(cudaFree(b.ptr));
+            freed += b.size;
+            pool_size -= b.size;
+            b.ptr = nullptr;
+            b.size = 0;
+        }
+        return freed;
     }
 };
 
@@ -699,6 +724,16 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 
         // all deallocations must be in reverse order of the allocations
         GGML_ASSERT(ptr == (void *) ((char *)(pool_addr) + pool_used));
+    }
+
+    bool is_legacy() const override {
+        return false;
+    }
+
+    // VMM mappings form a contiguous reusable arena and do not suffer from
+    // the fragmented legacy-pool failure this hook addresses.
+    size_t trim() override {
+        return 0;
     }
 };
 #endif // defined(GGML_USE_VMM)
@@ -2781,7 +2816,19 @@ static bool ggml_cuda_try_fuse_mul_mat_glu(
         }
 
         const int64_t ncols = ids ? src1->ne[2] : src1->ne[1];
-        if (ggml_cuda_should_use_mmq(
+#ifdef GGML_CUDA_FORCE_CUBLAS
+        // The global force-cuBLAS policy is authoritative over this RDNA 3.5 default.
+        constexpr bool default_ds4_mix_gate_up_mmq = false;
+#else
+        const char * mix_mmq = std::getenv("DFLASH_DS4_MIX_MMQ_PREFILL");
+        const bool default_ds4_mix_gate_up_mmq =
+            src0->type == GGML_TYPE_Q2_1_ROCMFP2_MIX &&
+            ids != nullptr &&
+            GGML_CUDA_CC_IS_RDNA3_5(cc) &&
+            (!mix_mmq || !(mix_mmq[0] == '0' && mix_mmq[1] == '\0'));
+#endif
+        if (default_ds4_mix_gate_up_mmq ||
+            ggml_cuda_should_use_mmq(
                 src0->type, cc, ncols,
                 ids ? src0->ne[2] : /*n_experts=*/0)) {
             ggml_cuda_mul_mat_q_pair(
@@ -4369,6 +4416,49 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         }
     }
 
+    // dflash: residual ADD + RMS_NORM + MUL. The add output stays live (it is
+    // the next residual), so this is a subgraph fusion with two outputs.
+    if (ops.size() == 3 && ops.begin()[0] == GGML_OP_ADD && ops.begin()[1] == GGML_OP_RMS_NORM &&
+        ops.begin()[2] == GGML_OP_MUL) {
+        if (!ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx, node_idx + 2 })) {
+            return false;
+        }
+        const ggml_tensor * add = cgraph->nodes[node_idx];
+        const ggml_tensor * rms = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * mul = cgraph->nodes[node_idx + 2];
+        if (rms->src[0] != add) {
+            return false;
+        }
+        const ggml_tensor * w = nullptr;
+        if (mul->src[0] == rms) {
+            w = mul->src[1];
+        } else if (mul->src[1] == rms) {
+            w = mul->src[0];
+        } else {
+            return false;
+        }
+        const ggml_tensor * a = add->src[0];
+        const ggml_tensor * b = add->src[1];
+        if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 ||
+            add->type != GGML_TYPE_F32 || rms->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32) {
+            return false;
+        }
+        if (!ggml_is_contiguous(a) || !ggml_is_contiguous(b) || !ggml_is_contiguous(w) ||
+            !ggml_is_contiguous(add) || !ggml_is_contiguous(mul)) {
+            return false;
+        }
+        if (!ggml_are_same_shape(a, b) || !ggml_are_same_shape(a, add) || !ggml_are_same_shape(a, mul)) {
+            return false;
+        }
+        if (w->ne[0] != a->ne[0] || ggml_nelements(w) != a->ne[0]) {
+            return false;
+        }
+        if (ggml_backend_buft_is_cuda_split(a->buffer->buft) || ggml_backend_buft_is_cuda_split(b->buffer->buft)) {
+            return false;
+        }
+        return true;
+    }
+
     if (!ggml_can_fuse(cgraph, node_idx, ops)) {
         return false;
     }
@@ -4420,8 +4510,8 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         const ggml_tensor * ssm_conv = cgraph->nodes[node_idx];
         const ggml_tensor * silu     = cgraph->nodes[node_idx+1];
 
-        if (ggml_get_op_params_i32(ssm_conv, 0) == 1) {
-            // the Specla ssm_conv kernel applies SiLU itself
+        if (ggml_get_op_params_i32(ssm_conv, 0) != 0) {
+            // the Specla (1) and dflash step (2) ssm_conv kernels apply SiLU themselves
             return false;
         }
 
@@ -4973,6 +5063,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         continue;
                     }
 
+                    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
+                        ggml_cuda_op_add_rms_norm_mul_fused(*cuda_ctx, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
+                        i += 2;
+                        continue;
+                    }
+
                     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD}, {})) {
                         ggml_cuda_op_rms_norm_fused_add(*cuda_ctx, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
                         i += 2;
@@ -5131,6 +5227,63 @@ extern "C" size_t ggml_backend_cuda_graph_invalidate_range(
     GGML_UNUSED(size);
     return 0;
 #endif
+}
+
+static bool ggml_cuda_has_legacy_pool(const ggml_backend_cuda_context * cuda_ctx) {
+    for (int device = 0; device < GGML_CUDA_MAX_DEVICES; ++device) {
+        for (int stream = 0; stream < GGML_CUDA_MAX_STREAMS; ++stream) {
+            const auto & pool = cuda_ctx->pools[device][stream];
+            if (pool != nullptr && pool->is_legacy()) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+extern "C" bool ggml_backend_cuda_has_legacy_pool(ggml_backend_t backend) {
+    if (backend == nullptr || !ggml_backend_is_cuda(backend)) {
+        return false;
+    }
+
+    const auto * cuda_ctx = static_cast<const ggml_backend_cuda_context *>(backend->context);
+    return ggml_cuda_has_legacy_pool(cuda_ctx);
+}
+
+extern "C" size_t ggml_backend_cuda_trim_pool(ggml_backend_t backend) {
+    if (backend == nullptr || !ggml_backend_is_cuda(backend)) {
+        return 0;
+    }
+
+    ggml_backend_synchronize(backend);
+    auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+    const bool has_legacy_pool = ggml_cuda_has_legacy_pool(cuda_ctx);
+
+#ifdef USE_CUDA_GRAPH
+    if (has_legacy_pool) {
+        // Captured kernels retain internal temporary addresses that are not
+        // represented in node_props. Retire every executable before any of
+        // those cached blocks can be returned to the driver.
+        ggml_cuda_set_device(cuda_ctx->device);
+        cuda_ctx->cuda_graphs.clear();
+    }
+#endif
+
+    // Per-evaluation activation memos own allocations from these pools.
+    // Release them before destroying cached free blocks.
+    while (!cuda_ctx->luce_q8_memo.empty()) {
+        cuda_ctx->luce_q8_memo.pop_back();
+    }
+
+    size_t freed = 0;
+    for (int device = 0; device < GGML_CUDA_MAX_DEVICES; ++device) {
+        for (int stream = 0; stream < GGML_CUDA_MAX_STREAMS; ++stream) {
+            if (cuda_ctx->pools[device][stream] != nullptr) {
+                freed += cuda_ctx->pools[device][stream]->trim();
+            }
+        }
+    }
+    return freed;
 }
 
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
@@ -6222,12 +6375,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         }
         case GGML_OP_SSM_CONV: {
             const int mode = ggml_get_op_params_i32(op, 0);
-            if (mode == 1) {
-                // Specla layout: x is [d_inner, n_tokens], so d_inner = ne[0]
-                // and the kernel guards the final partial 128-channel block.
+            // op_params[0]: 1 = SpecLA heavy-light conv (x is [d_inner, n_tokens],
+            // kernel guards the final partial 128-channel block), 2 = dflash fused
+            // step mode, 3 = dflash2 dynamic conv (all accept any channel count).
+            if (mode == 1 || mode == 2 || mode == 3) {
                 return true;
             }
-            if (mode == 2) {
+            if (mode == 4) {
                 // Direct-state AR layout: x is [d_inner, 1, n_sequences].
                 return op->src[0]->ne[0] % 128 == 0;
             }

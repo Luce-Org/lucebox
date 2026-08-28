@@ -15780,9 +15780,17 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             return true; // all inputs are contiguous, see ggml.c
         case GGML_OP_GATED_DELTA_NET:
             {
-                // The Vulkan kernel addresses state by compact sequence row
-                // and does not consume the physical-slot mapping in src[8].
-                if (op->src[8] != nullptr) {
+                // The Vulkan kernel consumes only src[0..5] and writes final
+                // state into the result tensor. Reject tree, persistent,
+                // active-slot, raw-gate, in-place, intermediate-output, and
+                // journal variants.
+                if (op->src[6] != nullptr || op->src[7] != nullptr ||
+                    op->src[8] != nullptr || op->src[9] != nullptr ||
+                    ggml_get_op_params_i32(op, 0) != 1 ||
+                    ggml_get_op_params_i32(op, 1) != 0 ||
+                    ggml_get_op_params_i32(op, 2) == 1 ||
+                    ggml_get_op_params_i32(op, 3) != 0 ||
+                    ggml_get_op_params_i32(op, 10) == 1) {
                     return false;
                 }
                 const uint32_t S_v = op->src[2]->ne[0];
@@ -15835,7 +15843,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 return true;
             }
         case GGML_OP_SSM_CONV:
-            return op->src[0]->type == GGML_TYPE_F32;
+            // Fused step/SpecLA/dyn-conv variants are CUDA/HIP only.
+            return op->op_params[0] == 0 && op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_CONV_TRANSPOSE_1D:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
         case GGML_OP_CONV_2D:

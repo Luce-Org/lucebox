@@ -230,37 +230,92 @@ void Qwen35SlotManager::commit_prefill(int slot) {
     s.phase = Qwen35SlotPhase::decode;
 }
 
-Qwen35SlotManager::StepAppend Qwen35SlotManager::append_token(int slot,
-                                                        int32_t fed_token) {
+Qwen35SlotManager::StepAppend Qwen35SlotManager::append_tokens(
+        int slot, const int32_t * fed_tokens, int n_tokens) {
     StepAppend out;
-    if (!is_active(slot) || !slots_[(size_t)slot].decoding()) return out;
+    if (!is_active(slot) || !slots_[(size_t)slot].decoding() ||
+        !fed_tokens || n_tokens < 1) return out;
     Qwen35Slot & s = slots_[(size_t)slot];
-    if (s.cur_pos >= max_ctx_) {
-        // No context left; the scheduler should have stopped this slot.
+    if (!s.staged_tokens.empty() || s.cur_pos > max_ctx_ ||
+        n_tokens > max_ctx_ - s.cur_pos) {
         return out;
     }
     PagedKvAppendResult app = pool_.append(
-        s.handle, 1, /*only_first_last_slots=*/true);
-    if (!app || app.token_count != 1 ||
-        app.last.logical_position != (uint32_t)s.cur_pos) {
+        s.handle, static_cast<uint32_t>(n_tokens));
+    if (!app || app.token_count != static_cast<uint32_t>(n_tokens)) {
         out.busy = app.status == PagedKvStatus::BlocksExhausted;
         return out;
     }
-    s.sample_history.push_back(fed_token);
+    if (app.write_slots.size() != static_cast<size_t>(n_tokens) ||
+        app.write_slots.front().logical_position !=
+            static_cast<uint32_t>(s.cur_pos) ||
+        app.write_slots.back().logical_position !=
+            static_cast<uint32_t>(s.cur_pos + n_tokens - 1)) {
+        const PagedKvStatus rollback =
+            pool_.rollback_append(s.handle, static_cast<uint32_t>(n_tokens));
+        if (rollback != PagedKvStatus::Ok) {
+            std::fprintf(stderr,
+                "[parallel] slot %d failed to roll back invalid append: %s\n",
+                slot, paged_kv_status_string(rollback));
+        }
+        return out;
+    }
 
+    out.physical_rows.reserve(app.write_slots.size());
+    for (const PagedKvWriteSlot & write : app.write_slots) {
+        out.physical_rows.push_back(
+            static_cast<int64_t>(write.physical_token_index));
+        if (write.block_offset == 0) {
+            if (out.first_new_block < 0) {
+                out.first_new_block = static_cast<int>(
+                    write.logical_position / pool_.block_size());
+            }
+            out.new_blocks.push_back(
+                static_cast<int32_t>(write.physical_block));
+        }
+    }
+    s.staged_tokens.assign(fed_tokens, fed_tokens + n_tokens);
     out.ok = true;
-    out.physical_row = (int64_t)app.last.physical_token_index;
+    out.count = n_tokens;
+    out.physical_row = out.physical_rows.front();
     out.position = s.cur_pos;
-    if ((uint32_t)s.cur_pos % pool_.block_size() == 0) {
-        out.new_block = (int32_t)app.last.physical_block;
-        out.new_block_index = s.cur_pos / (int)pool_.block_size();
+    if (!out.new_blocks.empty()) {
+        out.new_block = out.new_blocks.front();
+        out.new_block_index = out.first_new_block;
     }
     return out;
 }
 
+Qwen35SlotManager::StepAppend Qwen35SlotManager::append_token(
+        int slot, int32_t fed_token) {
+    return append_tokens(slot, &fed_token, 1);
+}
+
 void Qwen35SlotManager::commit_step(int slot) {
     if (!is_active(slot)) return;
-    slots_[(size_t)slot].cur_pos += 1;
+    Qwen35Slot & s = slots_[(size_t)slot];
+    if (s.staged_tokens.empty()) return;
+    s.sample_history.insert(
+        s.sample_history.end(), s.staged_tokens.begin(),
+        s.staged_tokens.end());
+    s.cur_pos += static_cast<int>(s.staged_tokens.size());
+    s.staged_tokens.clear();
+}
+
+bool Qwen35SlotManager::rollback_step(int slot) {
+    if (!is_active(slot)) return false;
+    Qwen35Slot & s = slots_[(size_t)slot];
+    if (s.staged_tokens.empty()) return false;
+    const PagedKvStatus status = pool_.rollback_append(
+        s.handle, static_cast<uint32_t>(s.staged_tokens.size()));
+    if (status != PagedKvStatus::Ok) {
+        std::fprintf(stderr,
+            "[parallel] slot %d staged append rollback failed: %s\n",
+            slot, paged_kv_status_string(status));
+        return false;
+    }
+    s.staged_tokens.clear();
+    return true;
 }
 
 void Qwen35SlotManager::retire(int slot) {

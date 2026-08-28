@@ -264,6 +264,15 @@ bool eval_moe_batched_prefill_ffn(
     std::vector<float> &            out,
     std::string *                   err = nullptr);
 // Shared policy gate for paths that consume expert-major prefill outputs.
+inline constexpr int kMoeExpertMajorPrefillMinTokens = 64;
+inline constexpr bool moe_expert_major_prefill_policy_enabled(
+        int n_tokens, bool enabled, int min_tokens) {
+    return enabled && n_tokens >= min_tokens;
+}
+inline constexpr bool moe_cold_input_first_policy_enabled(
+        bool has_backend_input, bool enabled, bool batched_peer_copies) {
+    return has_backend_input && enabled && !batched_peer_copies;
+}
 bool moe_expert_major_prefill_enabled(int n_tokens);
 
 // Optional device-resident owner destinations for long heterogeneous prefill.

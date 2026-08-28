@@ -1,5 +1,6 @@
 #include "moe_hybrid_ffn_eval.h"
 #include "cuda_graph_overrides.h"
+#include "moe_input_ready.h"
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -11,8 +12,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <future>
 #include <limits>
+#include <memory>
 #include <mutex>
 
 namespace dflash::common {
@@ -2659,8 +2662,10 @@ bool moe_expert_major_prefill_enabled(int n_tokens) {
         return !raw || !*raw || std::strcmp(raw, "0") != 0;
     }();
     static const int min_tokens =
-        env_int_or_default("DFLASH_MOE_EXPERT_MAJOR_MIN_TOKENS", 512);
-    return enabled && n_tokens >= min_tokens;
+        env_int_or_default("DFLASH_MOE_EXPERT_MAJOR_MIN_TOKENS",
+                           kMoeExpertMajorPrefillMinTokens);
+    return moe_expert_major_prefill_policy_enabled(
+        n_tokens, enabled, min_tokens);
 }
 
 // Expert-major prefill groups prompt rows by expert so the quantized GEMMs can
@@ -2697,6 +2702,25 @@ static bool full_cold_parallel_enabled() {
     return enabled;
 }
 
+static bool cold_input_first_enabled() {
+    static const bool enabled = []() {
+        const char * raw = std::getenv("DFLASH_MOE_COLD_INPUT_FIRST");
+        return raw && *raw && std::strcmp(raw, "0") != 0;
+    }();
+    return enabled;
+}
+
+static bool batched_peer_copies_enabled() {
+    static const bool enabled = []() {
+        const char * raw = std::getenv("GGML_BATCH_PEER_COPIES");
+        if (!raw || !*raw) {
+            raw = std::getenv("GGML_CUDA_BATCH_PEER_COPIES");
+        }
+        return raw && *raw && std::strcmp(raw, "0") != 0;
+    }();
+    return enabled;
+}
+
 static bool eval_moe_owner_expert_major_batched(
     ggml_backend_t                  backend,
     const MoeHybridConfig &         cfg,
@@ -2717,7 +2741,8 @@ static bool eval_moe_owner_expert_major_batched(
     ggml_backend_t                  cur_backend_owner = nullptr,
     ggml_tensor *                   device_output = nullptr,
     ggml_backend_t                  device_output_owner = nullptr,
-    ggml_gallocr_t *                p_alloc = nullptr) {
+    ggml_gallocr_t *                p_alloc = nullptr,
+    const std::function<void()> &   input_ready = {}) {
     const int n_embd = cfg.n_embd;
     const int n_used = cfg.n_expert_used;
     const int n_ff = cfg.n_ff_exp;
@@ -2766,6 +2791,187 @@ static bool eval_moe_owner_expert_major_batched(
             ggml_backend_tensor_memset(
                 device_output, 0, 0, ggml_nbytes(device_output));
         }
+        return true;
+    }
+
+    const bool grouped_mmid_types =
+        ((gate_tensor && up_tensor &&
+          gate_tensor->type == GGML_TYPE_Q2_0_ROCMFP2 &&
+          up_tensor->type == GGML_TYPE_Q2_0_ROCMFP2) ||
+         (gate_up_tensor &&
+          gate_up_tensor->type == GGML_TYPE_Q2_0_ROCMFP2)) &&
+        down_tensor->type == GGML_TYPE_Q3_0_ROCMFPX;
+    const bool use_grouped_mmid = grouped_mmid_types && []() {
+        const char * raw = std::getenv("DFLASH_MOE_GROUPED_MMID_PREFILL");
+        return !raw || !*raw || std::strcmp(raw, "0") != 0;
+    }() && n_tokens >= 32 && backend_is_gpu(backend);
+
+    if (use_grouped_mmid) {
+        std::vector<int32_t> local_ids_vec((size_t)n_tokens * (size_t)n_used, -1);
+        std::vector<float> owner_weights_vec((size_t)n_tokens * (size_t)n_used, 0.0f);
+        bool any_local = false;
+        for (int t = 0; t < n_tokens; ++t) {
+            for (int slot = 0; slot < n_used; ++slot) {
+                const size_t route = (size_t)t * (size_t)n_used + (size_t)slot;
+                const int32_t global = selected_ids[route];
+                if (global >= 0 && (size_t)global < local_by_global.size()) {
+                    const int32_t local = local_by_global[(size_t)global];
+                    if (local >= 0 && local < n_stack && selected_weights[route] > 0.0f) {
+                        local_ids_vec[route] = local;
+                        owner_weights_vec[route] = selected_weights[route];
+                        any_local = true;
+                    }
+                }
+            }
+        }
+
+        if (!any_local && !has_shared) {
+            if (device_output) {
+                ggml_backend_tensor_memset(
+                    device_output, 0, 0, ggml_nbytes(device_output));
+            }
+            return true;
+        }
+
+        ggml_init_params ip{};
+        ip.mem_size = 16 * 1024 * 1024;
+        ip.mem_buffer = nullptr;
+        ip.no_alloc = true;
+        ggml_context * ctx = ggml_init(ip);
+        if (!ctx) {
+            if (err) *err = "expert-major grouped mmid ggml_init failed";
+            return false;
+        }
+
+        ggml_tensor * inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_input(inp);
+
+        ggml_tensor * local_ids_tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n_tokens);
+        ggml_set_input(local_ids_tensor);
+        ggml_tensor * owner_weights_tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_used, n_tokens);
+        ggml_set_input(owner_weights_tensor);
+
+        ggml_tensor * cur_3d = ggml_reshape_3d(ctx, inp, n_embd, 1, n_tokens);
+        ggml_tensor * gu = nullptr;
+        if (gate_up_tensor) {
+            ggml_tensor * gate_up_e = apply_scale2(ctx,
+                ggml_mul_mat_id(ctx, gate_up_tensor, cur_3d, local_ids_tensor), desc.ffn_gate_up_exps_s);
+            ggml_tensor * gate_e = ggml_view_3d(ctx, gate_up_e,
+                n_ff, gate_up_e->ne[1], gate_up_e->ne[2],
+                gate_up_e->nb[1], gate_up_e->nb[2], 0);
+            ggml_tensor * up_e = ggml_view_3d(ctx, gate_up_e,
+                n_ff, gate_up_e->ne[1], gate_up_e->ne[2],
+                gate_up_e->nb[1], gate_up_e->nb[2],
+                (size_t)n_ff * ggml_element_size(gate_up_e));
+            gate_e = ggml_cont(ctx, gate_e);
+            up_e   = ggml_cont(ctx, up_e);
+            gu = swiglu_maybe_clamped(ctx, gate_e, up_e, cfg.swiglu_clamp);
+        } else {
+            ggml_tensor * gate_e = apply_scale2(ctx,
+                ggml_mul_mat_id(ctx, gate_tensor, cur_3d, local_ids_tensor), desc.ffn_gate_exps_s);
+            ggml_tensor * up_e = apply_scale2(ctx,
+                ggml_mul_mat_id(ctx, up_tensor, cur_3d, local_ids_tensor), desc.ffn_up_exps_s);
+            gu = swiglu_maybe_clamped(ctx, gate_e, up_e, cfg.swiglu_clamp);
+        }
+
+        ggml_tensor * down_e = apply_scale2(ctx,
+            ggml_mul_mat_id(ctx, down_tensor, gu, local_ids_tensor), desc.ffn_down_exps_s);
+
+        ggml_tensor * weights_3d = ggml_reshape_3d(ctx, owner_weights_tensor, 1, n_used, n_tokens);
+        ggml_tensor * routed_out = ggml_mul(ctx, down_e, weights_3d);
+        routed_out = ggml_cont(ctx, ggml_permute(ctx, routed_out, 1, 0, 2, 3));
+        routed_out = ggml_sum_rows(ctx, routed_out);
+        routed_out = ggml_reshape_2d(ctx, routed_out, n_embd, n_tokens);
+
+        ggml_tensor * combined_out = routed_out;
+        if (has_shared) {
+            ggml_tensor * shared_out = build_shared_expert_subgraph(ctx, desc, inp, cfg.swiglu_clamp);
+            if (shared_out) {
+                combined_out = ggml_add(ctx, combined_out, shared_out);
+            }
+        }
+
+        ggml_cgraph * gf = ggml_new_graph_custom(ctx, 256, false);
+        if (device_output) {
+            ggml_tensor * copy = ggml_cpy(ctx, combined_out, device_output);
+            ggml_set_output(copy);
+            ggml_build_forward_expand(gf, copy);
+        } else {
+            ggml_set_output(combined_out);
+            ggml_build_forward_expand(gf, combined_out);
+        }
+
+        ggml_gallocr_t alloc = nullptr;
+        bool created_alloc = false;
+        if (p_alloc) {
+            if (!*p_alloc) {
+                *p_alloc = ggml_gallocr_new(
+                    ggml_backend_get_default_buffer_type(backend));
+                created_alloc = *p_alloc != nullptr;
+            }
+            alloc = *p_alloc;
+        } else {
+            alloc = ggml_gallocr_new(
+                ggml_backend_get_default_buffer_type(backend));
+        }
+
+        if (!alloc || !ggml_gallocr_alloc_graph(alloc, gf)) {
+            if (created_alloc) {
+                ggml_gallocr_free(*p_alloc);
+                *p_alloc = nullptr;
+            } else if (!p_alloc && alloc) {
+                ggml_gallocr_free(alloc);
+            }
+            ggml_free(ctx);
+            if (err) *err = "expert-major grouped mmid scratch allocation failed";
+            return false;
+        }
+
+        if (cur_backend) {
+            if (cur_backend_owner) {
+                ggml_backend_tensor_copy_async(
+                    cur_backend_owner, backend, cur_backend, inp);
+            } else {
+                ggml_backend_tensor_copy(cur_backend, inp);
+            }
+        } else {
+            ggml_backend_tensor_set(inp, cur_host, 0,
+                                    sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
+        }
+        if (input_ready) {
+            // The async peer copy records a source event and queues a destination
+            // wait, so later cold work is ordered without blocking the host.
+            input_ready();
+        }
+
+        ggml_backend_tensor_set(local_ids_tensor, local_ids_vec.data(), 0,
+                                sizeof(int32_t) * local_ids_vec.size());
+        ggml_backend_tensor_set(owner_weights_tensor, owner_weights_vec.data(), 0,
+                                sizeof(float) * owner_weights_vec.size());
+
+        auto status = ggml_backend_graph_compute(backend, gf);
+        if (status != GGML_STATUS_SUCCESS) {
+            if (err) *err = "expert-major grouped mmid graph compute failed";
+            if (created_alloc) {
+                ggml_gallocr_free(*p_alloc);
+                *p_alloc = nullptr;
+            } else if (!p_alloc && alloc) {
+                ggml_gallocr_free(alloc);
+            }
+            ggml_free(ctx);
+            return false;
+        }
+
+        if (!device_output) {
+            out.resize((size_t)n_embd * (size_t)n_tokens);
+            ggml_backend_tensor_get(combined_out, out.data(), 0,
+                                    sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
+        }
+
+        if (!p_alloc && alloc) {
+            ggml_gallocr_free(alloc);
+        }
+        ggml_free(ctx);
         return true;
     }
 
@@ -2988,6 +3194,11 @@ static bool eval_moe_owner_expert_major_batched(
         } else {
             ggml_backend_tensor_copy(cur_backend, owner_input);
         }
+    }
+    if (input_ready) {
+        // The async peer copy records a source event and queues a destination
+        // wait, so later cold work is ordered without blocking the host.
+        input_ready();
     }
     if (packed_token_ids) {
         ggml_backend_tensor_set(packed_token_ids, packed_tokens.data(), 0,
@@ -3347,19 +3558,46 @@ bool eval_moe_hybrid_ffn_batched(
         std::string hot_err;
         std::string cold_err;
         const auto cold_t0 = HybridClock::now();
-        auto cold_future = std::async(std::launch::async, [&]() {
-            ScopedCudaGraphOverrides graph_scope(
-                heterogeneous_prefill_eager_enabled(
-                    p_cold_alloc != nullptr));
-            return eval_moe_owner_expert_major_batched(
-                storage.cold_backend, cfg, desc,
-                storage.gate_cold, storage.up_cold, storage.down_cold,
-                storage.gate_up_cold, storage.cold_local_by_global,
-                cur_host, selected_ids, selected_weights, n_tokens,
-                /*include_shared=*/false, cold_partial, &cold_err,
-                cur_backend, gpu_backend, nullptr, nullptr,
-                p_cold_alloc);
-        });
+        const bool wait_for_cold_input = moe_cold_input_first_policy_enabled(
+            cur_backend != nullptr, cold_input_first_enabled(),
+            batched_peer_copies_enabled());
+        std::unique_ptr<MoeInputReady> cold_input_ready;
+        std::function<void()> signal_cold_input;
+        std::future<bool> cold_future;
+        if (wait_for_cold_input) {
+            cold_input_ready = std::make_unique<MoeInputReady>(true);
+            signal_cold_input = [&]() { cold_input_ready->signal(); };
+            cold_future = launch_moe_input_ready_worker(*cold_input_ready, [&]() {
+                ScopedCudaGraphOverrides graph_scope(
+                    heterogeneous_prefill_eager_enabled(
+                        p_cold_alloc != nullptr));
+                return eval_moe_owner_expert_major_batched(
+                    storage.cold_backend, cfg, desc,
+                    storage.gate_cold, storage.up_cold, storage.down_cold,
+                    storage.gate_up_cold, storage.cold_local_by_global,
+                    cur_host, selected_ids, selected_weights, n_tokens,
+                    /*include_shared=*/false, cold_partial, &cold_err,
+                    cur_backend, gpu_backend, nullptr, nullptr,
+                    p_cold_alloc, signal_cold_input);
+            });
+            cold_input_ready->wait();
+        } else {
+            // Preserve the parent worker and call shape when the scheduling
+            // optimization is disabled.
+            cold_future = std::async(std::launch::async, [&]() {
+                ScopedCudaGraphOverrides graph_scope(
+                    heterogeneous_prefill_eager_enabled(
+                        p_cold_alloc != nullptr));
+                return eval_moe_owner_expert_major_batched(
+                    storage.cold_backend, cfg, desc,
+                    storage.gate_cold, storage.up_cold, storage.down_cold,
+                    storage.gate_up_cold, storage.cold_local_by_global,
+                    cur_host, selected_ids, selected_weights, n_tokens,
+                    /*include_shared=*/false, cold_partial, &cold_err,
+                    cur_backend, gpu_backend, nullptr, nullptr,
+                    p_cold_alloc);
+            });
+        }
         const auto hot_t0 = HybridClock::now();
         const bool hot_ok = eval_moe_owner_expert_major_batched(
             gpu_backend, cfg, desc,

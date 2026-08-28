@@ -22,37 +22,48 @@
 #pragma once
 
 #include "common/concurrency/seq_engine.h"
+#include "common/dflash_draft_kv.h"
+#include "common/dflash_feature_ring.h"
 #include "qwen35_slot_manager.h"
 
 #include <algorithm>
 #include <cstdint>
+#include <memory>
+#include <optional>
 #include <vector>
 
 namespace dflash::common {
 
 class Qwen35Backend;
 
+struct FixedChainConfig {
+    bool enabled = false;
+    int width = 0;
+    int scratch_base = 0;
+    int scratch_stride = 0;
+};
+
 class Qwen35SeqEngine final : public SeqEngine {
 public:
-    // `pool` and `backend` must outlive the engine. `scratch_row` is the
-    // first row of the block appended past the pool's index space, used as
-    // the K/V write destination of graph-bucket padding rows.
+    // `pool` and `backend` must outlive the engine. `scratch_row` is outside
+    // the pool and any per-slot tree slabs; it is the K/V destination of
+    // graph-bucket padding rows.
     // `max_prefills` bounds scheduler-selected prompt slices per traversal.
     Qwen35SeqEngine(Qwen35Backend & backend, PagedKvPool & pool,
                     int max_ctx, int64_t scratch_row,
+                    FixedChainConfig fixed_chain,
                     int max_prefills = 8,
                     int mixed_prefill_tokens = 2048,
                     int long_mixed_prefill_tokens = 4096,
                     int long_prefill_threshold = 768,
                     int idle_prefill_tokens = 4096,
-                    int prefill_quantum = 512)
-        : max_prefills_(std::max(1, max_prefills)),
-          mixed_prefill_tokens_(std::max(1, mixed_prefill_tokens)),
-          long_mixed_prefill_tokens_(std::max(1, long_mixed_prefill_tokens)),
-          long_prefill_threshold_(std::max(1, long_prefill_threshold)),
-          idle_prefill_tokens_(std::max(1, idle_prefill_tokens)),
-          prefill_quantum_(std::max(1, prefill_quantum)), b_(backend),
-          slots_(pool, max_ctx), scratch_row_(scratch_row) {}
+                    int prefill_quantum = 512);
+    ~Qwen35SeqEngine() override;
+
+    // Destroy every graph that captures draft-weight tensors. Qwen35Backend
+    // calls this before freeing draft weights during park; states rebuild
+    // lazily after unpark.
+    void release_draft_graphs();
 
     int slot_count() const override { return slots_.slot_count(); }
     int max_context() const override { return slots_.max_context(); }
@@ -95,6 +106,13 @@ private:
         std::vector<float> embeddings;
     };
 
+    struct PreparedChainDraft {
+        std::vector<int32_t> tokens;
+    };
+    struct PreparedChainRound {
+        std::vector<PreparedChainDraft> drafts;
+    };
+
     int max_prefills_;
     int mixed_prefill_tokens_;
     int long_mixed_prefill_tokens_;
@@ -112,10 +130,28 @@ private:
     int32_t sample_graph_row(int slot, int logits_row,
                              const int32_t * cached_argmax = nullptr,
                              std::vector<float> * logits_scratch = nullptr);
+    std::vector<uint8_t> select_chain_lanes(
+        const StepPlan & plan) const;
+    bool chain_spec_input_capable(const StepInput & input) const;
+    DraftFeatureMirror * slot_feature_mirror(int slot);
+    DraftKvState * ensure_slot_draft_kv(int slot);
+    std::optional<PreparedChainRound> prepare_chain_drafts(
+        const std::vector<StepInput> & inputs,
+        const std::vector<uint8_t> & selected);
+    StepResult step_chain_spec(
+        const StepPlan & plan, const std::vector<uint8_t> & selected,
+        PreparedChainRound && prepared);
 
     Qwen35Backend & b_;
     Qwen35SlotManager  slots_;
     int64_t         scratch_row_ = 0;
+    FixedChainConfig fixed_chain_;
+    bool            fixed_chain_ready_ = false;
+    ggml_context *  feature_view_ctx_ = nullptr;
+    std::vector<DraftFeatureMirror> slot_feature_mirrors_;
+    std::vector<std::unique_ptr<DraftKvState>> slot_draft_kv_;
+    std::vector<std::unique_ptr<DraftKvState>> dummy_draft_kv_;
+    DraftKvBatchGraph batch_draft_graph_;
 
     // Hoisted per-step buffers (reused across step() calls).
     std::vector<int>         output_rows_;
@@ -131,6 +167,7 @@ private:
     std::vector<int32_t>     query_slot_ids_;
     std::vector<int32_t>     query_positions_;
     std::vector<int32_t>     logits_rows_;
+    std::vector<int32_t>     feature_rows_;
     std::vector<float>       embed_buf_;
     std::vector<int32_t>     pos_buf_;
     std::vector<int64_t>     rows_buf_;

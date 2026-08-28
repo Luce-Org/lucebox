@@ -6,8 +6,9 @@
 //   cos( q_post_rope[layer, q_head], mean-pooled K_post_rope[chunk, layer, kv_head] )
 // Pooled keys are L2-normalized at pool time; the query is normalized here.
 //
-// Basis note: when the K cache is FWHT-rotated (kv_k_rotated, default for
-// Q8_0), both the pooled keys (read from the cache) and the captured query
+// Basis note: when the K cache is FWHT-rotated (kv_k_rotated, which is on for
+// the narrower cache types and off for f16/q8_0 where it is
+// precision-neutral), both the pooled keys (read from the cache) and the captured query
 // (taken AFTER the graph's turbo_wht) live in the rotated basis. The shared
 // orthogonal transform preserves dot products and norms, so cosine here
 // equals cosine in the unrotated basis — the Phase-0 domain.

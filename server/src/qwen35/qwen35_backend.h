@@ -70,6 +70,7 @@ struct Qwen35Config {
     int64_t      kv_pool_tokens  = 0;
 
     // Draft
+    int          draft_block_size = 0;  // 0 = use drafter metadata
     int          draft_swa_window = 0;
     int          draft_ctx_max    = 4096;
 

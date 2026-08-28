@@ -22,6 +22,7 @@
 #include "prompt_normalize.h"
 #include "tool_hint.h"
 #include "pin_friendly_prompt.h"
+#include "common/kv_rotation.h"
 #include "common/sha1.h"
 #include "freeze_history.h"
 
@@ -700,7 +701,8 @@ json build_props_body(const ServerConfig & config,
                       const ToolMemory & tool_memory) {
     // arch-gated capabilities (mirrors Python _capabilities()).
     const bool is_qwen = (config.arch.rfind("qwen", 0) == 0);
-    const bool reasoning_supported = is_qwen;
+    const bool is_deepseek4 = (config.arch == "deepseek4");
+    const bool reasoning_supported = is_qwen || is_deepseek4;
     const bool speculative_supported = is_qwen;
     const bool tools_supported = is_qwen || config.arch == "deepseek4";
 
@@ -724,11 +726,15 @@ json build_props_body(const ServerConfig & config,
     // all activate the phase-1 envelope. Advertise the full set when the
     // arch supports reasoning so clients can negotiate the higher tiers.
     json reasoning_efforts = json::array();
-    if (reasoning_supported) {
+    if (is_qwen) {
         reasoning_efforts.push_back("low");
         reasoning_efforts.push_back("medium");
         reasoning_efforts.push_back("high");
         reasoning_efforts.push_back("x-high");
+        reasoning_efforts.push_back("max");
+    } else if (is_deepseek4) {
+        reasoning_efforts.push_back("low");
+        reasoning_efforts.push_back("high");
         reasoning_efforts.push_back("max");
     }
 
@@ -1063,7 +1069,9 @@ std::vector<ChatMessage> normalize_chat_messages(
 // ─── Disk-cache identity salt ───────────────────────────────────────────
 // Compute a 16-byte salt from inputs that affect KV cache validity:
 //   model path + stat(size + mtime)  [covers rope/yarn — GGUF-derived],
-//   max_ctx, and sha1(chat_template_src).
+//   max_ctx, sha1(chat_template_src), and the effective K-rotation basis
+//   (DFLASH_KV_ROTATE resolves against the K-cache type; a cache written
+//   rotated must never be adopted by an un-rotated session or vice versa).
 // Returns all-zeroes if model_path is empty (back-compat / disk disabled).
 static std::array<uint8_t, 16> compute_disk_cache_salt(const ServerConfig & cfg) {
     std::array<uint8_t, 16> salt{};
@@ -1085,7 +1093,7 @@ static std::array<uint8_t, 16> compute_disk_cache_salt(const ServerConfig & cfg)
     uint8_t tmpl_digest[20] = {};
     sha1_hash(cfg.chat_template_src.data(), cfg.chat_template_src.size(), tmpl_digest);
 
-    // Serialization: path_len(4) + path + file_size(8) + file_mtime(8) + max_ctx(4) + tmpl_digest(20).
+    // Serialization: path_len(4) + path + file_size(8) + file_mtime(8) + max_ctx(4) + tmpl_digest(20) + k_rotated(1).
     std::vector<uint8_t> buf;
     uint32_t plen = (uint32_t)path.size();
     buf.insert(buf.end(), (uint8_t *)&plen,        (uint8_t *)&plen        + 4);
@@ -1095,6 +1103,8 @@ static std::array<uint8_t, 16> compute_disk_cache_salt(const ServerConfig & cfg)
     int32_t mc = (int32_t)cfg.max_ctx;
     buf.insert(buf.end(), (uint8_t *)&mc,          (uint8_t *)&mc          + 4);
     buf.insert(buf.end(), tmpl_digest, tmpl_digest + 20);
+    uint8_t k_rotated = dflash_kv_k_rotation_enabled(cfg.kv_cache_k) ? 1 : 0;
+    buf.push_back(k_rotated);
 
     uint8_t digest[20];
     sha1_hash(buf.data(), buf.size(), digest);
@@ -1822,8 +1832,8 @@ bool HttpServer::parse_endpoint_request(
     return false;
 }
 
-void HttpServer::apply_request_reasoning(
-        const json & body, ParsedRequest & req) {
+void apply_request_reasoning(
+        const json & body, const ServerConfig & config, ParsedRequest & req) {
     // Explicit thinking budgets override reasoning-effort tiers. Template
     // kwargs can still override whether the rendered prompt enables thinking.
     // Default: thinking OFF (Qwen3.6 thinking wrecks DFlash acceptance
@@ -1833,23 +1843,47 @@ void HttpServer::apply_request_reasoning(
     int request_reply_budget = -1;
     int effort_phase1_cap = -1;
     bool effort_set = false;
+    std::string normalized_effort;
+
+    req.thinking_opt_in = false;
+    req.per_req_phase1_cap = -1;
+    req.per_req_reply_budget = -1;
 
     auto apply_reasoning_effort = [&](const std::string & effort) {
         if (effort == "none") {
             enable_thinking = false;
+            normalized_effort.clear();
+            effort_set = true;
             return;
         }
 
         // Five-tier vocabulary (spec §4.2). Unknown tier → high.
-        int tier_value = config_.effort_tiers.high;
+        int tier_value = config.effort_tiers.high;
         if (effort == "minimal" || effort == "low") {
-            tier_value = config_.effort_tiers.low;
+            tier_value = config.effort_tiers.low;
+            normalized_effort = "low";
         } else if (effort == "medium") {
-            tier_value = config_.effort_tiers.medium;
+            tier_value = config.effort_tiers.medium;
+            normalized_effort = config.arch == "deepseek4" ? "high" : "medium";
+        } else if (effort == "xhigh") {
+            // DeepSeek V4 Flash's OpenAI-compatible APIs map xhigh to high.
+            // Other architectures retain Lucebox's x-high tier alias.
+            if (config.arch == "deepseek4") {
+                tier_value = config.effort_tiers.high;
+                normalized_effort = "high";
+            } else {
+                tier_value = config.effort_tiers.x_high;
+                normalized_effort = "x-high";
+            }
         } else if (effort == "x-high") {
-            tier_value = config_.effort_tiers.x_high;
+            // Hyphenated x-high is Lucebox's explicit five-tier extension.
+            tier_value = config.effort_tiers.x_high;
+            normalized_effort = config.arch == "deepseek4" ? "max" : "x-high";
         } else if (effort == "max") {
-            tier_value = config_.effort_tiers.max;
+            tier_value = config.effort_tiers.max;
+            normalized_effort = "max";
+        } else {
+            normalized_effort = "high";
         }
 
         effort_phase1_cap = tier_value;
@@ -1859,7 +1893,7 @@ void HttpServer::apply_request_reasoning(
         req.thinking_opt_in = true;
     };
 
-    if (body.contains("reasoning")) {
+    if (body.contains("reasoning") && body["reasoning"].is_object()) {
         const auto & reasoning = body["reasoning"];
         if (reasoning.contains("effort")) {
             apply_reasoning_effort(reasoning.value("effort", "high"));
@@ -1871,7 +1905,7 @@ void HttpServer::apply_request_reasoning(
         body["reasoning_effort"].is_string()) {
         apply_reasoning_effort(body["reasoning_effort"].get<std::string>());
     }
-    if (body.contains("thinking")) {
+    if (body.contains("thinking") && body["thinking"].is_object()) {
         const auto & thinking = body["thinking"];
         if (thinking.contains("type")) {
             const bool enabled = thinking.value("type", "") == "enabled";
@@ -1887,33 +1921,58 @@ void HttpServer::apply_request_reasoning(
             request_reply_budget = thinking["reply_budget"].get<int>();
         }
     }
-    if (body.contains("chat_template_kwargs")) {
+    if (body.contains("chat_template_kwargs") &&
+        body["chat_template_kwargs"].is_object()) {
         const auto & kwargs = body["chat_template_kwargs"];
+        if (!effort_set && kwargs.contains("reasoning_effort") &&
+            kwargs["reasoning_effort"].is_string()) {
+            apply_reasoning_effort(
+                kwargs["reasoning_effort"].get<std::string>());
+        }
+        if (kwargs.contains("thinking") && kwargs["thinking"].is_boolean()) {
+            enable_thinking = kwargs["thinking"].get<bool>();
+        }
         if (kwargs.contains("enable_thinking")) {
             enable_thinking = kwargs["enable_thinking"].get<bool>();
         }
     }
+    // DeepSeek uses high whenever thinking is enabled without an explicit
+    // model-facing effort. Only API-style thinking.type="enabled" also selects
+    // the high budget tier; bare template toggles affect rendering alone.
+    if (enable_thinking && config.arch == "deepseek4" &&
+        normalized_effort.empty()) {
+        normalized_effort = "high";
+        if (req.thinking_opt_in) {
+            effort_phase1_cap = config.effort_tiers.high;
+            effort_set = true;
+        }
+    }
+    if (!enable_thinking) {
+        normalized_effort.clear();
+        req.thinking_opt_in = false;
+    }
     req.thinking_enabled = enable_thinking;
+    req.reasoning_effort = normalized_effort;
 
     // Spec §4.3 combined precedence + §4.4 clamping: thinking.budget_tokens
     // (if set) wins over reasoning.effort for the phase-1 cap; either is
     // clamped to the server ceilings.
-    if (request_budget_tokens >= 0) {
+    if (req.thinking_opt_in && request_budget_tokens >= 0) {
         req.per_req_phase1_cap =
-            (std::min)(request_budget_tokens, config_.think_max_tokens);
-        if (request_budget_tokens > config_.think_max_tokens) {
+            (std::min)(request_budget_tokens, config.think_max_tokens);
+        if (request_budget_tokens > config.think_max_tokens) {
             std::fprintf(stderr,
                 "[server] thinking.budget_tokens=%d clamped to "
                 "think_max_tokens=%d\n",
-                request_budget_tokens, config_.think_max_tokens);
+                request_budget_tokens, config.think_max_tokens);
         }
-    } else if (effort_set) {
+    } else if (req.thinking_opt_in && effort_set) {
         // Spec §4.4: effective cap is min(tier value, max_tokens -
         // hard_limit_reply_budget). Tier values can legitimately exceed
         // default_max_tokens; clients that want the full tier budget must
         // pass an explicit max_tokens. Otherwise we narrow silently to fit.
         const int max_output_phase1_room = (std::max)(
-            0, req.max_output - config_.hard_limit_reply_budget);
+            0, req.max_output - config.hard_limit_reply_budget);
         req.per_req_phase1_cap =
             (std::min)(effort_phase1_cap, max_output_phase1_room);
         if (effort_phase1_cap > max_output_phase1_room) {
@@ -1922,17 +1981,17 @@ void HttpServer::apply_request_reasoning(
                 "(max_tokens=%d - hard_limit_reply_budget=%d); "
                 "pass a larger max_tokens to use the full tier budget\n",
                 effort_phase1_cap, req.per_req_phase1_cap,
-                req.max_output, config_.hard_limit_reply_budget);
+                req.max_output, config.hard_limit_reply_budget);
         }
     }
-    if (request_reply_budget >= 0) {
+    if (req.thinking_opt_in && request_reply_budget >= 0) {
         req.per_req_reply_budget =
-            (std::min)(request_reply_budget, config_.hard_limit_reply_budget);
-        if (request_reply_budget > config_.hard_limit_reply_budget) {
+            (std::min)(request_reply_budget, config.hard_limit_reply_budget);
+        if (request_reply_budget > config.hard_limit_reply_budget) {
             std::fprintf(stderr,
                 "[server] thinking.reply_budget=%d clamped to "
                 "hard_limit_reply_budget=%d\n",
-                request_reply_budget, config_.hard_limit_reply_budget);
+                request_reply_budget, config.hard_limit_reply_budget);
         }
     }
     // (The effort tier doesn't influence reply_budget — spec §4.2: the
@@ -1974,7 +2033,7 @@ bool HttpServer::render_messages_to_text(
     } else {
         rendered = render_chat_template(
             chat_messages, chat_format_, add_generation_prompt,
-            req.thinking_enabled, tools_json);
+            req.thinking_enabled, tools_json, req.reasoning_effort);
     }
 
     return true;
@@ -2019,12 +2078,16 @@ bool HttpServer::validate_request_context(
 void HttpServer::log_parsed_request(const ParsedRequest & req) const {
     std::fprintf(stderr,
         "[server] chat %s format=%s stream=%s msgs=%zu tools=%zu prompt_tokens=%zu "
-        "max_tokens=%d max_ctx=%d thinking=%s started_in_thinking=%s stops=%zu model=%s\n",
+        "max_tokens=%d max_ctx=%d thinking=%s reasoning_effort=%s "
+        "started_in_thinking=%s stops=%zu model=%s\n",
         req.response_id.c_str(), api_format_name(req.format),
         req.stream ? "true" : "false",
         json_array_size(req.messages), json_array_size(req.tools),
         req.prompt_tokens.size(), req.max_output, config_.max_ctx,
         req.thinking_enabled ? "true" : "false",
+        !req.thinking_enabled ? "none" :
+            (req.reasoning_effort.empty() ? "default" :
+                req.reasoning_effort.c_str()),
         req.started_in_thinking ? "true" : "false",
         req.stop_sequences.size(), req.model.c_str());
 }
@@ -2080,7 +2143,7 @@ bool HttpServer::route_request(SocketHandle fd, const HttpRequest & hr) {
             normalize_chat_messages(req.messages, req.format, tool_memory_);
         // Reasoning must be applied BEFORE rendering: the template injects
         // the empty <think>\n\n</think>\n\n block when thinking is disabled.
-        apply_request_reasoning(body, req);
+        apply_request_reasoning(body, config_, req);
         // Bandit: parse session_id from extra_body (opt-in adaptive keep_ratio).
         req.session_id = parse_session_id_from_body(body);
 
@@ -2724,36 +2787,18 @@ void HttpServer::apply_flowkv_compression(
         return;
     }
 
-    std::string tools_json;
-    if (req.tools.is_array() && !req.tools.empty()) {
-        tools_json = req.tools.dump();
-    }
     const std::vector<ChatMessage> chat_messages = normalize_chat_messages(
         modified_messages, req.format, tool_memory_);
 
     std::string rendered;
-    if (!config_.chat_template_src.empty()) {
-        const std::string & bos = tokenizer_.bos_id() >= 0
-            ? tokenizer_.raw_token(tokenizer_.bos_id())
-            : std::string();
-        const std::string & eos = tokenizer_.eos_id() >= 0
-            ? tokenizer_.raw_token(tokenizer_.eos_id())
-            : std::string();
-        try {
-            rendered = render_chat_template_jinja(
-                config_.chat_template_src, chat_messages, bos, eos,
-                /*add_generation_prompt=*/true,
-                req.thinking_enabled, tools_json);
-        } catch (const std::exception & error) {
-            std::fprintf(stderr,
-                "[flowkv] jinja re-render failed (%s) — skipping\n",
-                error.what());
-            return;
-        }
-    } else {
-        rendered = render_chat_template(
-            chat_messages, chat_format_, /*add_generation_prompt=*/true,
-            req.thinking_enabled, tools_json);
+    std::string render_error;
+    if (!render_messages_to_text(
+            chat_messages, req, /*add_generation_prompt=*/true,
+            rendered, render_error)) {
+        std::fprintf(stderr,
+            "[flowkv] re-render failed (%s) — skipping\n",
+            render_error.c_str());
+        return;
     }
 
     const int tokens_before = (int) prepared.tokens.size();
@@ -3270,6 +3315,16 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
 
     // Edited or summarized histories can be shorter than the stored KV.
     // Such snapshots cannot be diff-prefilled safely.
+    // The logical entry length (what the PrefixCache believes is cached, e.g.
+    // the tools-head pin at 3620) can exceed the chunk-aligned KV position the
+    // backend actually restored (e.g. 3584). Deepen decisions must compare
+    // against the logical length; otherwise that chunk gap keeps
+    // `forced_cut > restored` true on every tool-heavy turn, the pin branch
+    // keeps targeting the already-cached head, and the cache never deepens
+    // past the head pin (full conversation re-prefilled each turn).
+    const int pre_overwrite_prefix_len = cache.prefix_len;
+    int logical_prefix_len =
+        cache.using_restore ? pre_overwrite_prefix_len : 0;
     if (cache.using_restore) {
         const int snapshot_length =
             backend_.snapshot_cur_pos(cache.cache_slot);
@@ -3334,6 +3389,8 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
                 cache.prefix_len = cold_boundary;
                 cache.using_restore = true;
                 cache.disk_hit = true;
+                // This restore was created after the pre-overwrite capture.
+                logical_prefix_len = cold_boundary;
                 std::fprintf(stderr,
                     "[disk-cache] cold prefix saved, restoring from %d\n",
                     cold_boundary);
@@ -3349,7 +3406,7 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
     auto prepare_inline = [&]() {
         const auto prepared_snapshot = prefix_cache_.prepare_inline_snap(
             effective_prompt,
-            cache.using_restore ? cache.prefix_len : 0,
+            cache.using_restore ? logical_prefix_len : 0,
             prefer_tools_boundary,
             forced_cut);
         cache.snap_slot = prepared_snapshot.first;

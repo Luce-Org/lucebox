@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 
 namespace dflash::common {
 
@@ -14,15 +15,16 @@ static inline int mask_align_up(int x, int a) { return ((x + a - 1) / a) * a; }
 static constexpr uint16_t F16_ZERO    = 0x0000;
 static constexpr uint16_t F16_NEG_INF = 0xFC00;
 
-bool draft_kv_init(DraftKvState & st,
-                   const DraftWeights & dw,
-                   ggml_backend_t backend,
-                   int cap,
-                   ggml_tensor * lm_head,
-                   ggml_type feature_type,
-                   ggml_tensor * feature_source,
-                   int feature_source_cap,
-                   int dspark_output_rows) {
+static bool draft_kv_init_impl(DraftKvState & st,
+                               const DraftWeights & dw,
+                               ggml_backend_t backend,
+                               int cap,
+                               ggml_tensor * lm_head,
+                               ggml_type feature_type,
+                               ggml_tensor * feature_source,
+                               int feature_source_cap,
+                               int dspark_output_rows,
+                               bool batched) {
     if (cap <= 0 || dw.block_size <= 0) return false;
     if (feature_type != GGML_TYPE_F32 && feature_type != GGML_TYPE_BF16) {
         std::fprintf(stderr, "[draft-kv] unsupported feature type %s\n",
@@ -48,10 +50,6 @@ bool draft_kv_init(DraftKvState & st,
 
     st.cap        = cap;
     st.q_len      = dw.block_size;
-    // Anchor-first DSpark verifies [root + block] and can therefore commit at
-    // most block+1 rows. The wider legacy allocation exists for DDTree paths;
-    // DSpark does not enter DDTree, so evaluating twice as many padded feature
-    // rows only wastes FC and K/V projection work every speculative step.
     st.a_step     = dw.dspark.enabled && dw.sample_from_anchor
         ? dw.block_size + 1
         : 2 * dw.block_size + 2;
@@ -100,7 +98,7 @@ bool draft_kv_init(DraftKvState & st,
     st.ap_pos  = ggml_new_tensor_1d(st.mem_ctx, GGML_TYPE_I32, st.a_step);
     st.ap_rows = ggml_new_tensor_1d(st.mem_ctx, GGML_TYPE_I32, st.a_step);
     const bool integrated_dspark =
-        lm_head && dw.dspark.enabled && dw.sample_from_anchor;
+        !batched && lm_head && dw.dspark.enabled && dw.sample_from_anchor;
     if (integrated_dspark &&
         (dspark_output_rows < 0 || dspark_output_rows > st.q_len)) {
         std::fprintf(stderr,
@@ -109,8 +107,7 @@ bool draft_kv_init(DraftKvState & st,
         return false;
     }
     if (integrated_dspark) {
-        st.dspark_seed =
-            ggml_new_tensor_1d(st.mem_ctx, GGML_TYPE_I32, 1);
+        st.dspark_seed = ggml_new_tensor_1d(st.mem_ctx, GGML_TYPE_I32, 1);
     }
 
     st.mem_buf = ggml_backend_alloc_ctx_tensors(st.mem_ctx, backend);
@@ -121,6 +118,25 @@ bool draft_kv_init(DraftKvState & st,
     // Zero everything: empty/pad cache slots are read by FA (masked -inf) and
     // must be finite; pad feature rows must be finite for the trash-slot rows.
     ggml_backend_buffer_clear(st.mem_buf, 0);
+
+    // Static lane state used by both single-lane and batched graphs.
+    std::vector<int32_t> nrows((size_t)st.q_len);
+    for (int i = 0; i < st.q_len; i++) nrows[(size_t)i] = st.cap + i;
+    ggml_backend_tensor_set(st.noise_rows, nrows.data(), 0,
+                            sizeof(int32_t) * nrows.size());
+
+    st.built_for = &dw;
+    st.noise_tail_initialized = false;
+    st.slot_pos.assign((size_t)st.cap, -1);
+    st.next_pos = 0;
+    std::fprintf(stderr,
+        "[draft-kv] ctx-KV ring active: cap=%d kv_total=%d a_step=%d "
+        "layers=%d feature=%s source=%s f16 cache %.1f MiB\n",
+        st.cap, st.kv_total, st.a_step, dw.n_layer,
+        ggml_type_name(st.feature_type),
+        st.feature_source ? "direct" : "copy",
+        (double)(2ull * dw.n_layer * (size_t)kv_row * st.kv_total * 2) / (1024.0 * 1024.0));
+    if (batched) return true;
 
     // ── build the fixed-topology step graph once
     const size_t arena_sz = 16u * 1024 * 1024;
@@ -133,14 +149,13 @@ bool draft_kv_init(DraftKvState & st,
     if (!st.g_ctx) return false;
     st.gf = ggml_new_graph_custom(st.g_ctx, 4096, false);
 
-    DraftKvAppendInputs ai{};
-    ai.n_rows    = st.a_step;
-    ai.feat      = st.feature_source
+    ggml_tensor * append_feat = st.feature_source
         ? ggml_get_rows(st.g_ctx, st.feature_source, st.ap_source_rows)
         : st.ap_feat;
-    ai.positions = st.ap_pos;
-    ai.rows      = st.ap_rows;
-    if (!build_draft_kv_append(st.g_ctx, st.gf, dw, st.cache, ai)) return false;
+    const std::vector<DraftKvAppendLane> append_lanes{
+        {&st.cache, append_feat, st.ap_pos, st.ap_rows},
+    };
+    if (!build_draft_kv_appends(st.g_ctx, st.gf, dw, append_lanes)) return false;
 
     DraftKvStepInputs si{};
     si.noise_embed = st.inp_embed;
@@ -152,10 +167,12 @@ bool draft_kv_init(DraftKvState & st,
     si.logits_rows = integrated_dspark && dspark_output_rows > 0
         ? dspark_output_rows
         : st.q_len;
-    DraftGraphOutputs go = build_draft_kv_step(st.g_ctx, st.gf, dw, st.cache, si);
-    if (!go.hidden_states) return false;
-    st.hidden_states = go.hidden_states;
-    st.logits        = go.logits;
+    const std::vector<DraftKvLaneInputs> lanes{{&st.cache, si}};
+    const std::vector<DraftGraphOutputs> outputs =
+        build_draft_kv_steps(st.g_ctx, st.gf, dw, lanes);
+    if (outputs.size() != 1 || !outputs.front().hidden_states) return false;
+    st.hidden_states = outputs.front().hidden_states;
+    st.logits        = outputs.front().logits;
     if (integrated_dspark &&
         !dspark_build_greedy_markov_chain(
             st.g_ctx, st.gf, dw, st.logits, st.dspark_seed,
@@ -177,26 +194,29 @@ bool draft_kv_init(DraftKvState & st,
         return false;
     }
 
-    // static noise scratch slots
-    std::vector<int32_t> nrows((size_t)st.q_len);
-    for (int i = 0; i < st.q_len; i++) nrows[(size_t)i] = st.cap + i;
-    ggml_backend_tensor_set(st.noise_rows, nrows.data(), 0,
-                            sizeof(int32_t) * nrows.size());
-
-    st.built_for = &dw;
-    st.noise_tail_initialized = false;
-    st.slot_pos.assign((size_t)st.cap, -1);
-    st.next_pos = 0;
-    std::fprintf(stderr,
-        "[draft-kv] ctx-KV ring active: cap=%d kv_total=%d a_step=%d "
-        "layers=%d feature=%s source=%s dspark_head=%s rows=%zu f16 cache %.1f MiB\n",
-        st.cap, st.kv_total, st.a_step, dw.n_layer,
-        ggml_type_name(st.feature_type),
-        st.feature_source ? "direct" : "copy",
-        st.dspark_tokens.empty() ? "separate" : "integrated",
-        st.dspark_tokens.size(),
-        (double)(2ull * dw.n_layer * (size_t)kv_row * st.kv_total * 2) / (1024.0 * 1024.0));
     return true;
+}
+
+bool draft_kv_init(DraftKvState & st,
+                   const DraftWeights & dw,
+                   ggml_backend_t backend,
+                   int cap,
+                   ggml_tensor * lm_head,
+                   ggml_type feature_type,
+                   ggml_tensor * feature_source,
+                   int feature_source_cap,
+                   int dspark_output_rows) {
+    return draft_kv_init_impl(
+        st, dw, backend, cap, lm_head, feature_type, feature_source,
+        feature_source_cap, dspark_output_rows, false);
+}
+
+bool draft_kv_init_batched(DraftKvState & st,
+                           const DraftWeights & dw,
+                           ggml_backend_t backend,
+                           int cap) {
+    return draft_kv_init_impl(
+        st, dw, backend, cap, nullptr, GGML_TYPE_F32, nullptr, 0, 0, true);
 }
 
 void draft_kv_reset(DraftKvState & st) {
@@ -297,8 +317,10 @@ static bool draft_kv_bulk_append(DraftKvState & st,
                 if (st.feature_source) {
                     feat = ggml_get_rows(gctx, st.feature_source, source_rows);
                 }
-                DraftKvAppendInputs ai{c, feat, tpos, trow};
-                ok = build_draft_kv_append(gctx, g, dw, st.cache, ai);
+                const std::vector<DraftKvAppendLane> append_lanes{
+                    {&st.cache, feat, tpos, trow},
+                };
+                ok = build_draft_kv_appends(gctx, g, dw, append_lanes);
                 if (!ok) std::fprintf(stderr, "[draft-kv] bulk: append build failed\n");
                 if (ok) {
                     ggml_gallocr_t ga =
@@ -325,7 +347,8 @@ bool draft_kv_begin_step(DraftKvState & st,
                          ggml_backend_t backend,
                          const DraftFeatureMirror & ring,
                          int committed) {
-    if (!st.gf || committed <= 0) return false;
+    if (!st.mem_buf || st.built_for != static_cast<const void *>(&dw) ||
+        committed <= 0) return false;
     // Rewind (prefix-cache restore / new shorter request): stale slots would
     // shadow live window positions, so rebuild from scratch.
     if (st.next_pos > committed) draft_kv_reset(st);
@@ -428,6 +451,187 @@ bool draft_kv_begin_step(DraftKvState & st,
         ggml_backend_tensor_set(st.mask_swa, st.mask_hbuf.data(), 0,
                                 sizeof(uint16_t) * mask_elems);
     }
+    return true;
+}
+
+void draft_kv_batch_free(DraftKvBatchGraph & batch) {
+    if (batch.galloc) {
+        ggml_gallocr_free(batch.galloc);
+        batch.galloc = nullptr;
+    }
+    if (batch.g_ctx) {
+        ggml_free(batch.g_ctx);
+        batch.g_ctx = nullptr;
+    }
+    batch.gf = nullptr;
+    batch.hidden_by_lane.clear();
+    batch.lane_states.clear();
+    batch.meta_arena.clear();
+    batch.n_lanes = 0;
+    batch.q_len = 0;
+    batch.backend = nullptr;
+    batch.built_for = nullptr;
+}
+
+static bool draft_kv_batch_build(
+        DraftKvBatchGraph & batch,
+        const DraftWeights & dw,
+        ggml_backend_t backend,
+        const std::vector<DraftKvState *> & lane_states) {
+    if (!backend || lane_states.empty() || dw.block_size <= 1) {
+        return false;
+    }
+    for (DraftKvState * state : lane_states) {
+        if (!state || !state->mem_buf || state->q_len != dw.block_size ||
+            state->built_for != static_cast<const void *>(&dw)) {
+            return false;
+        }
+    }
+
+    draft_kv_batch_free(batch);
+    constexpr size_t graph_nodes_per_lane = 4096;
+    constexpr size_t shared_graph_nodes = 2048;
+    const size_t n_lanes_size = lane_states.size();
+    if (n_lanes_size >
+        (static_cast<size_t>(std::numeric_limits<int>::max()) -
+            shared_graph_nodes) /
+            graph_nodes_per_lane) {
+        return false;
+    }
+    const int n_lanes = static_cast<int>(n_lanes_size);
+    const size_t graph_capacity =
+        graph_nodes_per_lane * n_lanes_size + shared_graph_nodes;
+    if (graph_capacity > std::numeric_limits<size_t>::max() / 2) {
+        return false;
+    }
+    const size_t tensor_capacity = 2 * graph_capacity;
+    const size_t tensor_overhead = ggml_tensor_overhead();
+    if (tensor_overhead != 0 &&
+        tensor_capacity >
+            std::numeric_limits<size_t>::max() / tensor_overhead) {
+        return false;
+    }
+    const size_t tensor_bytes = tensor_capacity * tensor_overhead;
+    const size_t graph_bytes =
+        ggml_graph_overhead_custom(graph_capacity, false);
+    if (tensor_bytes >
+        std::numeric_limits<size_t>::max() - graph_bytes) {
+        return false;
+    }
+    const size_t arena_size = graph_bytes + tensor_bytes;
+    batch.meta_arena.resize(arena_size);
+    ggml_init_params params{};
+    params.mem_size = batch.meta_arena.size();
+    params.mem_buffer = batch.meta_arena.data();
+    params.no_alloc = true;
+    batch.g_ctx = ggml_init(params);
+    if (!batch.g_ctx) {
+        draft_kv_batch_free(batch);
+        return false;
+    }
+    batch.gf = ggml_new_graph_custom(
+        batch.g_ctx, graph_capacity, false);
+
+    batch.hidden_by_lane.reserve(static_cast<size_t>(n_lanes));
+    std::vector<DraftKvAppendLane> append_lanes;
+    append_lanes.reserve(n_lanes_size);
+    std::vector<DraftKvLaneInputs> lanes;
+    lanes.reserve(n_lanes_size);
+    for (DraftKvState * state : lane_states) {
+        append_lanes.push_back(
+            {&state->cache, state->ap_feat, state->ap_pos, state->ap_rows});
+
+        DraftKvStepInputs step{};
+        step.noise_embed = state->inp_embed;
+        step.positions_q = state->pos_q;
+        step.noise_rows = state->noise_rows;
+        step.mask_full = state->mask_full;
+        step.mask_swa = state->mask_swa;
+        lanes.push_back({&state->cache, step});
+    }
+
+    if (!build_draft_kv_appends(
+            batch.g_ctx, batch.gf, dw, append_lanes)) {
+        draft_kv_batch_free(batch);
+        return false;
+    }
+    const std::vector<DraftGraphOutputs> outputs = build_draft_kv_steps(
+        batch.g_ctx, batch.gf, dw, lanes);
+    if (outputs.size() != lane_states.size()) {
+        draft_kv_batch_free(batch);
+        return false;
+    }
+    for (const DraftGraphOutputs & output : outputs) {
+        if (!output.hidden_states) {
+            draft_kv_batch_free(batch);
+            return false;
+        }
+        ggml_set_output(output.hidden_states);
+        ggml_build_forward_expand(batch.gf, output.hidden_states);
+        batch.hidden_by_lane.push_back(output.hidden_states);
+    }
+
+    batch.galloc =
+        ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (!batch.galloc ||
+        !ggml_gallocr_alloc_graph(batch.galloc, batch.gf)) {
+        std::fprintf(stderr,
+            "[draft-kv-batch] graph alloc failed lanes=%d\n", n_lanes);
+        draft_kv_batch_free(batch);
+        return false;
+    }
+
+    batch.n_lanes = n_lanes;
+    batch.q_len = dw.block_size;
+    batch.built_for = &dw;
+    batch.backend = backend;
+    batch.lane_states = lane_states;
+    std::fprintf(stderr,
+        "[draft-kv-batch] packed backbone ready lanes=%d q_len=%d "
+        "metadata=%.1f MiB\n",
+        n_lanes, dw.block_size,
+        static_cast<double>(batch.meta_arena.size()) /
+            (1024.0 * 1024.0));
+    return true;
+}
+
+bool draft_kv_batch_compute(
+        DraftKvBatchGraph & batch,
+        const DraftWeights & dw,
+        ggml_backend_t backend,
+        const std::vector<DraftKvState *> & lane_states,
+        std::vector<std::vector<float>> & hidden_by_lane) {
+    hidden_by_lane.clear();
+    if (lane_states.empty()) return false;
+
+    const bool reusable =
+        batch.gf && batch.built_for == static_cast<const void *>(&dw) &&
+        batch.backend == backend && batch.lane_states == lane_states;
+    if (!reusable &&
+        !draft_kv_batch_build(
+            batch, dw, backend, lane_states)) {
+        return false;
+    }
+    if (ggml_backend_graph_compute(backend, batch.gf) !=
+        GGML_STATUS_SUCCESS) {
+        std::fprintf(stderr,
+            "[draft-kv-batch] graph compute failed lanes=%d\n",
+            batch.n_lanes);
+        return false;
+    }
+
+    const size_t elements =
+        static_cast<size_t>(dw.n_embd) * static_cast<size_t>(batch.q_len);
+    hidden_by_lane.assign(
+        static_cast<size_t>(batch.n_lanes),
+        std::vector<float>(elements));
+    for (int lane = 0; lane < batch.n_lanes; ++lane) {
+        ggml_backend_tensor_get_async(
+            backend, batch.hidden_by_lane[static_cast<size_t>(lane)],
+            hidden_by_lane[static_cast<size_t>(lane)].data(), 0,
+            sizeof(float) * elements);
+    }
+    ggml_backend_synchronize(backend);
     return true;
 }
 

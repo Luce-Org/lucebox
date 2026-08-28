@@ -60,19 +60,18 @@ struct DraftKvCacheRefs {
     std::vector<ggml_tensor *> v; // per layer [head_dim*n_head_kv, kv_total] f16
 };
 
-// Fuse `n_rows` feature rows and set_rows their per-layer K/V into the caches.
-struct DraftKvAppendInputs {
-    int           n_rows = 0;
-    ggml_tensor * feat = nullptr;      // [n_target_layers*hidden, n_rows] f32
-    ggml_tensor * positions = nullptr; // [n_rows] i32, absolute
-    ggml_tensor * rows = nullptr;      // [n_rows] i32, destination cache slots
+struct DraftKvAppendLane {
+    const DraftKvCacheRefs * cache = nullptr;
+    ggml_tensor * feat = nullptr;
+    ggml_tensor * positions = nullptr;
+    ggml_tensor * rows = nullptr;
 };
-bool build_draft_kv_append(
-    ggml_context *             ctx,
-    ggml_cgraph *              gf,
-    const DraftWeights &       w,
-    const DraftKvCacheRefs &   cache,
-    const DraftKvAppendInputs & in);
+
+bool build_draft_kv_appends(
+    ggml_context *                         ctx,
+    ggml_cgraph *                          gf,
+    const DraftWeights &                   w,
+    const std::vector<DraftKvAppendLane> & lanes);
 
 // One draft step over the cached context KV. Noise K/V are written into the
 // scratch slots and the flash attention reads the full kv_total span; the
@@ -86,11 +85,18 @@ struct DraftKvStepInputs {
     ggml_tensor * lm_head = nullptr;     // optional fused projection
     int           logits_rows = 0;       // 0 = all q_len rows
 };
-DraftGraphOutputs build_draft_kv_step(
-    ggml_context *            ctx,
-    ggml_cgraph *             gf,
-    const DraftWeights &      w,
-    const DraftKvCacheRefs &  cache,
-    const DraftKvStepInputs & in);
+
+struct DraftKvLaneInputs {
+    const DraftKvCacheRefs * cache = nullptr;
+    DraftKvStepInputs inputs;
+};
+
+// Build one cached draft step for all lanes. Dense weight projections share
+// the packed column axis; positions, cache writes and attention stay per lane.
+std::vector<DraftGraphOutputs> build_draft_kv_steps(
+    ggml_context *                         ctx,
+    ggml_cgraph *                          gf,
+    const DraftWeights &                   w,
+    const std::vector<DraftKvLaneInputs> & lanes);
 
 } // namespace dflash::common

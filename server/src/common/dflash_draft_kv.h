@@ -97,6 +97,13 @@ bool draft_kv_init(DraftKvState & st,
                    int feature_source_cap = 0,
                    int dspark_output_rows = 0);
 
+// Allocate persistent lane state without the single-lane graph. Concurrent
+// decoding binds these states to DraftKvBatchGraph instead.
+bool draft_kv_init_batched(DraftKvState & st,
+                           const DraftWeights & dw,
+                           ggml_backend_t backend,
+                           int cap);
+
 // Invalidate all cached rows (new/rewound request). Cheap; the next
 // begin_step bulk-appends the live window from the feature ring.
 void draft_kv_reset(DraftKvState & st);
@@ -112,5 +119,35 @@ bool draft_kv_begin_step(DraftKvState & st,
                          ggml_backend_t backend,
                          const DraftFeatureMirror & ring,
                          int committed);
+
+struct DraftKvBatchGraph {
+    DraftKvBatchGraph() = default;
+    DraftKvBatchGraph(const DraftKvBatchGraph &) = delete;
+    DraftKvBatchGraph & operator=(const DraftKvBatchGraph &) = delete;
+
+    int n_lanes = 0;
+    int q_len = 0;
+    const void * built_for = nullptr;
+    ggml_backend_t backend = nullptr;
+    std::vector<DraftKvState *> lane_states;
+
+    std::vector<uint8_t> meta_arena;
+    ggml_context * g_ctx = nullptr;
+    ggml_cgraph * gf = nullptr;
+    ggml_gallocr_t galloc = nullptr;
+    std::vector<ggml_tensor *> hidden_by_lane;
+};
+
+void draft_kv_batch_free(DraftKvBatchGraph & batch);
+
+// All lane states must already have draft_kv_begin_step() inputs and
+// inp_embed uploaded. The packed graph computes the shared backbone and
+// returns one host-visible hidden-state block per lane.
+bool draft_kv_batch_compute(
+    DraftKvBatchGraph & batch,
+    const DraftWeights & dw,
+    ggml_backend_t backend,
+    const std::vector<DraftKvState *> & lane_states,
+    std::vector<std::vector<float>> & hidden_by_lane);
 
 }  // namespace dflash::common

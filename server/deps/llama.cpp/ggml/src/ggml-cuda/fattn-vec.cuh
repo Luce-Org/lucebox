@@ -534,7 +534,10 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
     const bool need_f16_K = type_K == GGML_TYPE_F16;
     const bool need_f16_V = type_V == GGML_TYPE_F16;
     constexpr size_t nbytes_shared = 0;
-    launch_fattn<D, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false);
+    // The kernel walks the KV sequence in steps of nthreads (not D); telling
+    // launch_fattn so lets it split a short KV span (e.g. a 256-token window
+    // at head_dim 256) across two blocks per head instead of one.
+    launch_fattn<D, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, nthreads, need_f16_K, need_f16_V, false);
 }
 
 template <int D, ggml_type type_K, ggml_type type_V>

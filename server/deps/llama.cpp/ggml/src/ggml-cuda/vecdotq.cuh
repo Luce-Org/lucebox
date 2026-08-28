@@ -29,6 +29,17 @@ static __device__ __forceinline__ int get_int_b4(const void * x, const int & i32
     return ((const int *) x)[i32]; // assume at least 4 byte alignment
 }
 
+// Non-temporal variant for weight streams: decode reads every weight byte
+// exactly once per token, so caching them evicts the activations/KV that
+// other kernels reuse. HIP lowers this to sc0/sc1 (bypass) load hints.
+static __device__ __forceinline__ int get_int_b4_nt(const void * x, const int & i32) {
+#if defined(GGML_USE_HIP)
+    return __builtin_nontemporal_load(((const int *) x) + i32);
+#else
+    return ((const int *) x)[i32];
+#endif
+}
+
 // q4 contains 8 indices with 4 bit each.
 // This function selects those bytes from table that are at those indices and returns them as int2.
 // The first int contains the bytes with even indices in q4, the second int contains the bytes with odd indices in q4.
@@ -1608,7 +1619,7 @@ static __device__ __forceinline__ float vec_dot_iq4_xs_q8_1(
     int sumi = 0;
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
-        const int aux_q4 = get_int_b4(bq4->qs, iqs + j);
+        const int aux_q4 = get_int_b4_nt(bq4->qs, iqs + j);
         const int2 v = get_int_from_table_16(aux_q4, kvalues_iq4nl);
 
         const int u0 = get_int_b4(bq8_1[iqs/4].qs, j + 0);

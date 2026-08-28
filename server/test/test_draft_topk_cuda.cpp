@@ -30,6 +30,7 @@
 
 using dflash::common::extract_draft_topk;
 using dflash::common::geometric_extract_draft_topk_cuda;
+using dflash::common::geometric_draft_topk_cuda_supports_k;
 
 namespace {
 
@@ -124,6 +125,33 @@ namespace {
 struct DraftTopkCudaFixture {};
 }
 
+TEST_CASE(DraftTopkCudaFixture, draft_topk_cuda_dispatch_contract_host_only) {
+    for (int K = -1; K <= 18; ++K) {
+        const bool expected = (K >= 1 && K <= 8) || K == 12 || K == 16;
+        CHECK(geometric_draft_topk_cuda_supports_k(K) == expected);
+    }
+
+    const void * invalid_device_pointer =
+        reinterpret_cast<const void *>(uintptr_t{1});
+    std::vector<float> log_probs(64, 123.0f);
+    std::vector<int32_t> token_ids(64, 456);
+    for (int K : {0, 9, 10, 11, 13, 14, 15, 17, 64}) {
+        CHECK(!geometric_extract_draft_topk_cuda(
+            invalid_device_pointer, 1, 128, K,
+            log_probs.data(), token_ids.data(), 1.0f));
+        CHECK(log_probs[0] == 123.0f);
+        CHECK(token_ids[0] == 456);
+    }
+    CHECK(!geometric_extract_draft_topk_cuda(
+        invalid_device_pointer, 1, 8, 16,
+        log_probs.data(), token_ids.data(), 1.0f));
+    CHECK(!geometric_extract_draft_topk_cuda(
+        invalid_device_pointer, 1, 128, 8,
+        log_probs.data(), token_ids.data(), 1.0f));
+    CHECK(log_probs[0] == 123.0f);
+    CHECK(token_ids[0] == 456);
+}
+
 TEST_CASE(DraftTopkCudaFixture, draft_topk_cuda_suite) {
     int dev_count = 0;
     if (cudaGetDeviceCount(&dev_count) != cudaSuccess || dev_count == 0) {
@@ -131,8 +159,6 @@ TEST_CASE(DraftTopkCudaFixture, draft_topk_cuda_suite) {
         return;
     }
 
-    // The kernel supports K up to kMaxK (=8 in geometric_draft_topk_cuda.cu); larger K is
-    // handled by a documented CPU fallback (returns false), checked separately.
     const Case cases[] = {
         // Realistic decode shape: Qwen3.5 vocab, small position batch.
         {15,  151936, 8,  1.0f},
@@ -145,6 +171,8 @@ TEST_CASE(DraftTopkCudaFixture, draft_topk_cuda_suite) {
         {3,   257,    8,  1.0f},    // vocab barely above K, non-power-of-two
         {1,   151936, 1,  1.0f},    // K=1 (argmax + log_z)
         {15,  151936, 4,  1.0f},
+        {3,   4096,   12, 1.0f},
+        {3,   4096,   16, 1.0f},
     };
 
     int failures = 0;
@@ -154,24 +182,25 @@ TEST_CASE(DraftTopkCudaFixture, draft_topk_cuda_suite) {
         idx++;
     }
 
-    // Fallback contract: K beyond the kernel's supported range must return false
-    // (not silently produce wrong output) so the caller can use the CPU path.
     {
-        const int n = 4, vocab = 4096, big_K = 64;
+        const int n = 4, vocab = 4096;
         std::vector<float> h(n * vocab, 0.f);
         float * d = nullptr;
         if (cudaMalloc(&d, h.size() * sizeof(float)) == cudaSuccess) {
             cudaMemcpy(d, h.data(), h.size() * sizeof(float), cudaMemcpyHostToDevice);
-            std::vector<float>   lp(n * big_K);
-            std::vector<int32_t> ids(n * big_K);
-            bool ret = geometric_extract_draft_topk_cuda(d, n, vocab, big_K,
-                                               lp.data(), ids.data(), 1.0f);
+            for (int K : {9, 10, 11, 13, 14, 15, 64}) {
+                std::vector<float>   lp((size_t)n * K);
+                std::vector<int32_t> ids((size_t)n * K);
+                bool ret = geometric_extract_draft_topk_cuda(
+                    d, n, vocab, K, lp.data(), ids.data(), 1.0f);
+                const bool pass = !ret;
+                printf("  [%s] unsupported K contract: K=%d returned %s\n",
+                       pass ? "PASS" : "FAIL", K,
+                       ret ? "true" : "false");
+                if (!pass) failures++;
+                idx++;
+            }
             cudaFree(d);
-            const bool pass = !ret;  // expect false
-            printf("  [%s] fallback contract: K=%d (>kMaxK) returned %s\n",
-                   pass ? "PASS" : "FAIL", big_K, ret ? "true" : "false");
-            if (!pass) failures++;
-            idx++;
         }
     }
 

@@ -21,6 +21,7 @@
 #include "server/http_server.h"
 #include "server/chat_template.h"
 #include "common/sampler.h"
+#include "common/concurrency/seq_engine.h"
 #include "common/backend_precision.h"
 #include "common/backend_ipc.h"
 #include "common/moe_hybrid_ffn_eval.h"
@@ -924,6 +925,241 @@ TEST_CASE(ServerUnitFixture, test_parse_bare_function_json_with_parameters) {
         auto args = json::parse(result.tool_calls[0].arguments);
         TEST_ASSERT(args["command"] == "ls -la \"/home/dpavlin/aimax project\"");
     }
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_function_call_xml_invoke_name_parameters) {
+    const std::string text =
+        "Let me read the file.\n\n"
+        "<function_call>\n"
+        "<invoke_name>read</invoke_name>\n"
+        "<parameters>\n"
+        "<path>/home/dpavlin/koha-rfid-go/internal/rfidops/ops.go</path>\n"
+        "</parameters>\n"
+        "</function_call>";
+    json tools = json::array({
+        {{"type", "function"}, {"function", {
+             {"name", "read"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"path", {{"type", "string"}}}
+                 }}
+             }}
+         }}}
+    });
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "read");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["path"] == "/home/dpavlin/koha-rfid-go/internal/rfidops/ops.go");
+    }
+    TEST_ASSERT(result.cleaned_text == "Let me read the file.");
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_function_call_xml_multiple_parameters) {
+    const std::string text =
+        "<function_call>\n"
+        "<invoke_name>bash</invoke_name>\n"
+        "<parameters>\n"
+        "<command>ls -la /tmp</command>\n"
+        "<timeout>10</timeout>\n"
+        "</parameters>\n"
+        "</function_call>";
+    json tools = json::array({
+        {{"type", "function"}, {"function", {
+             {"name", "bash"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"command", {{"type", "string"}}},
+                     {"timeout", {{"type", "integer"}}}
+                 }}
+             }}
+         }}}
+    });
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "bash");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["command"] == "ls -la /tmp");
+        TEST_ASSERT(args["timeout"] == 10);
+    }
+    TEST_ASSERT(result.cleaned_text.empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_tool_call_xml_invoke_name_parameters) {
+    const std::string text =
+        "<tool_call>\n"
+        "<invoke_name>read</invoke_name>\n"
+        "<parameters>\n"
+        "<path>/home/dpavlin/test.go</path>\n"
+        "</parameters>\n"
+        "</tool_call>";
+    json tools = json::array({
+        {{"type", "function"}, {"function", {
+             {"name", "read"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"path", {{"type", "string"}}}
+                 }}
+             }}
+         }}}
+    });
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "read");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["path"] == "/home/dpavlin/test.go");
+    }
+    TEST_ASSERT(result.cleaned_text.empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_legacy_tool_call_with_nested_name_tag) {
+    // Regression test for Violation 1:
+    // A legacy <tool_call><function=...> envelope whose parameter contains a nested <name> tag
+    // must NOT be hijacked by parse_xml_tool_call_body as envelope name.
+    const std::string text =
+        "<tool_call>\n"
+        "<function=edit_file>\n"
+        "<parameter=content>\n"
+        "function getTool() { return \"<name>other_tool</name>\"; }\n"
+        "</parameter>\n"
+        "</function>\n"
+        "</tool_call>";
+    json tools = json::array({
+        {{"type", "function"}, {"function", {
+             {"name", "edit_file"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"content", {{"type", "string"}}}
+                 }}
+             }}
+         }}},
+        {{"type", "function"}, {"function", {
+             {"name", "other_tool"},
+             {"parameters", {{"type", "object"}, {"properties", {}}}}
+         }}}
+    });
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "edit_file");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["content"] == "function getTool() { return \"<name>other_tool</name>\"; }");
+    }
+    TEST_ASSERT(result.cleaned_text.empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_xml_tool_call_malformed_parameters_rejected) {
+    // Regression test for Violation 2:
+    // When the parameter section is non-empty but malformed (unsupported/invalid syntax),
+    // parse_xml_tool_call_body must NOT emit an empty {} tool call.
+    const std::string text =
+        "<function_call>\n"
+        "<invoke_name>edit_file</invoke_name>\n"
+        "<parameters>\n"
+        "random unparseable garbage text\n"
+        "</parameters>\n"
+        "</function_call>";
+    json tools = json::array({
+        {{"type", "function"}, {"function", {
+             {"name", "edit_file"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"content", {{"type", "string"}}}
+                 }}
+             }}
+         }}}
+    });
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.empty());
+    TEST_ASSERT(!result.cleaned_text.empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_xml_tool_call_zero_arguments_accepted) {
+    // Genuinely zero-argument calls should be accepted.
+    const std::string text =
+        "<function_call>\n"
+        "<invoke_name>get_status</invoke_name>\n"
+        "</function_call>";
+    json tools = json::array({
+        {{"type", "function"}, {"function", {
+             {"name", "get_status"},
+             {"parameters", {{"type", "object"}, {"properties", {}}}}
+         }}}
+    });
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "get_status");
+        TEST_ASSERT(result.tool_calls[0].arguments == "{}");
+    }
+    TEST_ASSERT(result.cleaned_text.empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_xml_tool_call_invoke_envelope_attribute_style) {
+    const std::string text =
+        "<function_call>\n"
+        "<invoke name=\"read\">\n"
+        "<parameter name=\"path\">/tmp/test.txt</parameter>\n"
+        "</invoke>\n"
+        "</function_call>";
+    json tools = json::array({
+        {{"type", "function"}, {"function", {
+             {"name", "read"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"path", {{"type", "string"}}}
+                 }}
+             }}
+         }}}
+    });
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "read");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["path"] == "/tmp/test.txt");
+    }
+    TEST_ASSERT(result.cleaned_text.empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_tool_call_xml_function_name_tag) {
+    // Regression test for Violation:
+    // <tool_call> envelopes using <function_name> must be parsed cleanly by parse_xml_tool_call_body()
+    const std::string text =
+        "<tool_call>\n"
+        "<function_name>read</function_name>\n"
+        "<parameters>\n"
+        "<path>/tmp/test.txt</path>\n"
+        "</parameters>\n"
+        "</tool_call>";
+    json tools = json::array({
+        {{"type", "function"}, {"function", {
+             {"name", "read"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"path", {{"type", "string"}}}
+                 }}
+             }}
+         }}}
+    });
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "read");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["path"] == "/tmp/test.txt");
+    }
+    TEST_ASSERT(result.cleaned_text.empty());
 }
 
 
@@ -2222,6 +2458,29 @@ TEST_CASE(ServerUnitFixture, test_inline_snapshot_prefers_tools_boundary_until_r
     TEST_ASSERT(select_inline_snapshot_boundary({100}, 100, true) == 0);
 }
 
+TEST_CASE(ServerUnitFixture, test_forced_tools_pin_yields_to_deepen_after_restore) {
+    const std::vector<int> boundaries = {100, 240, 380, 520};
+
+    // Cold request: the PPP cut pins the tools/identity head.
+    TEST_ASSERT(should_force_inline_snapshot_boundary(
+        boundaries, 600, 0, true, 110));
+
+    // Once the tools boundary is restored, normal selection must deepen to a
+    // later conversation boundary instead of forcing the nearby pin again.
+    TEST_ASSERT(!should_force_inline_snapshot_boundary(
+        boundaries, 600, 100, true, 110));
+    TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 100, true) == 380);
+
+    // Without tools preference, a still-unrestored forced cut retains its
+    // original behavior.
+    TEST_ASSERT(should_force_inline_snapshot_boundary(
+        boundaries, 600, 100, false, 110));
+    TEST_ASSERT(!should_force_inline_snapshot_boundary(
+        boundaries, 600, 110, false, 110));
+    TEST_ASSERT(!should_force_inline_snapshot_boundary(
+        boundaries, 100, 0, false, 110));
+}
+
 TEST_CASE(ServerUnitFixture, test_ppp_master_toggle_gates_tools_boundary_pinning) {
     TEST_ASSERT(ppp_prefers_tools_boundary(true, true));
     TEST_ASSERT(!ppp_prefers_tools_boundary(false, true));
@@ -2680,6 +2939,213 @@ TEST_CASE(ServerUnitFixture, test_max_output_alias_precedence_ignores_shadowed_i
         resolve_max_output_tokens({{"max_completion_tokens", 8}}, 400) == 8);
 }
 
+static ServerConfig deepseek_reasoning_test_config() {
+    ServerConfig config;
+    config.arch = "deepseek4";
+    config.think_max_tokens = 900;
+    config.hard_limit_reply_budget = 100;
+    config.effort_tiers.low = 100;
+    config.effort_tiers.medium = 200;
+    config.effort_tiers.high = 300;
+    config.effort_tiers.x_high = 400;
+    config.effort_tiers.max = 500;
+    return config;
+}
+
+static ParsedRequest resolve_deepseek_reasoning(const json & body) {
+    ParsedRequest req;
+    req.max_output = 1000;
+    apply_request_reasoning(body, deepseek_reasoning_test_config(), req);
+    return req;
+}
+
+static ParsedRequest resolve_qwen_reasoning(const json & body) {
+    ServerConfig config = deepseek_reasoning_test_config();
+    config.arch = "qwen35";
+    ParsedRequest req;
+    req.max_output = 1000;
+    apply_request_reasoning(body, config, req);
+    return req;
+}
+
+TEST_CASE(ServerUnitFixture, test_deepseek_reasoning_effort_aliases_and_budgets) {
+    struct Case {
+        const char * requested;
+        const char * model_effort;
+        int phase1_cap;
+        bool enabled;
+    };
+    const Case cases[] = {
+        {"none",    "",     -1,  false},
+        {"minimal", "low",  100, true},
+        {"low",     "low",  100, true},
+        {"medium",  "high", 200, true},
+        {"high",    "high", 300, true},
+        // DeepSeek V4 Flash's API-compatible spelling maps to high.
+        {"xhigh",   "high", 300, true},
+        // Lucebox's hyphenated extension retains its separate budget tier.
+        {"x-high",  "max",  400, true},
+        {"max",     "max",  500, true},
+        {"future",  "high", 300, true},
+    };
+
+    for (const auto & test : cases) {
+        const ParsedRequest req = resolve_deepseek_reasoning({
+            {"reasoning", {{"effort", test.requested}}},
+        });
+        TEST_ASSERT(req.thinking_enabled == test.enabled);
+        TEST_ASSERT(req.reasoning_effort == test.model_effort);
+        TEST_ASSERT(req.per_req_phase1_cap == test.phase1_cap);
+        TEST_ASSERT(req.thinking_opt_in == test.enabled);
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_deepseek_reasoning_request_precedence_and_toggles) {
+    const json effort_locations[] = {
+        {{"reasoning", {{"effort", "max"}}}},
+        {{"reasoning_effort", "max"}},
+        {{"chat_template_kwargs", {{"reasoning_effort", "max"}}}},
+    };
+    for (const auto & body : effort_locations) {
+        const ParsedRequest req = resolve_deepseek_reasoning(body);
+        TEST_ASSERT(req.thinking_enabled);
+        TEST_ASSERT(req.reasoning_effort == "max");
+        TEST_ASSERT(req.per_req_phase1_cap == 500);
+    }
+
+    // reasoning.effort wins over both lower-priority spellings.
+    const ParsedRequest first_wins = resolve_deepseek_reasoning({
+        {"reasoning", {{"effort", "low"}}},
+        {"reasoning_effort", "max"},
+        {"chat_template_kwargs", {{"reasoning_effort", "max"}}},
+    });
+    TEST_ASSERT(first_wins.reasoning_effort == "low");
+    TEST_ASSERT(first_wins.per_req_phase1_cap == 100);
+
+    // The API-style thinking control opts into the budget envelope and uses
+    // DeepSeek's high default when no explicit effort is present.
+    const ParsedRequest api_default_high = resolve_deepseek_reasoning({
+        {"thinking", {{"type", "enabled"}}},
+    });
+    TEST_ASSERT(api_default_high.thinking_enabled);
+    TEST_ASSERT(api_default_high.reasoning_effort == "high");
+    TEST_ASSERT(api_default_high.per_req_phase1_cap == 300);
+    TEST_ASSERT(api_default_high.thinking_opt_in);
+
+    // Renderer-only controls may select DeepSeek's default model-facing
+    // effort, but must not activate Lucebox's force-close budget envelope.
+    const json renderer_only_controls[] = {
+        {{"reasoning", json::object()}},
+        {{"chat_template_kwargs", {{"thinking", true}}}},
+        {{"chat_template_kwargs", {{"enable_thinking", true}}}},
+        {
+            {"thinking", {
+                {"budget_tokens", 250},
+                {"reply_budget", 50},
+            }},
+            {"chat_template_kwargs", {{"thinking", true}}},
+        },
+        {
+            {"thinking", {{"type", "disabled"}}},
+            {"chat_template_kwargs", {{"thinking", true}}},
+        },
+    };
+    for (const auto & body : renderer_only_controls) {
+        const ParsedRequest req = resolve_deepseek_reasoning(body);
+        TEST_ASSERT(req.thinking_enabled);
+        TEST_ASSERT(req.reasoning_effort == "high");
+        TEST_ASSERT(req.per_req_phase1_cap == -1);
+        TEST_ASSERT(req.per_req_reply_budget == -1);
+        TEST_ASSERT(!req.thinking_opt_in);
+    }
+
+    // A later explicit toggle overrides an effort, including effort=none.
+    const ParsedRequest api_disabled = resolve_deepseek_reasoning({
+        {"reasoning_effort", "max"},
+        {"thinking", {{"type", "disabled"}}},
+    });
+    TEST_ASSERT(!api_disabled.thinking_enabled);
+    TEST_ASSERT(api_disabled.reasoning_effort.empty());
+    TEST_ASSERT(api_disabled.per_req_phase1_cap == -1);
+    TEST_ASSERT(!api_disabled.thinking_opt_in);
+
+    const json renderer_disabled_controls[] = {
+        {{"chat_template_kwargs", {{"thinking", false}}}},
+        {{"chat_template_kwargs", {{"enable_thinking", false}}}},
+    };
+    for (const auto & renderer_control : renderer_disabled_controls) {
+        json body = {
+            {"reasoning_effort", "max"},
+            {"thinking", {
+                {"type", "enabled"},
+                {"budget_tokens", 250},
+                {"reply_budget", 50},
+            }},
+        };
+        body.update(renderer_control);
+        const ParsedRequest disabled = resolve_deepseek_reasoning(body);
+        TEST_ASSERT(!disabled.thinking_enabled);
+        TEST_ASSERT(disabled.reasoning_effort.empty());
+        TEST_ASSERT(disabled.per_req_phase1_cap == -1);
+        TEST_ASSERT(disabled.per_req_reply_budget == -1);
+        TEST_ASSERT(!disabled.thinking_opt_in);
+    }
+
+    const ParsedRequest reenabled = resolve_deepseek_reasoning({
+        {"reasoning", {{"effort", "none"}}},
+        {"thinking", {{"type", "enabled"}}},
+    });
+    TEST_ASSERT(reenabled.thinking_enabled);
+    TEST_ASSERT(reenabled.reasoning_effort == "high");
+    TEST_ASSERT(reenabled.per_req_phase1_cap == 300);
+
+    const ParsedRequest budget_override = resolve_deepseek_reasoning({
+        {"reasoning_effort", "max"},
+        {"thinking", {
+            {"type", "enabled"},
+            {"budget_tokens", 250},
+            {"reply_budget", 50},
+        }},
+    });
+    TEST_ASSERT(budget_override.reasoning_effort == "max");
+    TEST_ASSERT(budget_override.per_req_phase1_cap == 250);
+    TEST_ASSERT(budget_override.per_req_reply_budget == 50);
+
+    const ParsedRequest no_control =
+        resolve_deepseek_reasoning(json::object());
+    TEST_ASSERT(!no_control.thinking_enabled);
+    TEST_ASSERT(no_control.reasoning_effort.empty());
+    TEST_ASSERT(no_control.per_req_phase1_cap == -1);
+}
+
+TEST_CASE(ServerUnitFixture, test_qwen_template_toggles_remain_renderer_only) {
+    const json renderer_only_controls[] = {
+        {{"chat_template_kwargs", {{"thinking", true}}}},
+        {{"chat_template_kwargs", {{"enable_thinking", true}}}},
+    };
+    for (const auto & body : renderer_only_controls) {
+        const ParsedRequest req = resolve_qwen_reasoning(body);
+        TEST_ASSERT(req.thinking_enabled);
+        TEST_ASSERT(req.reasoning_effort.empty());
+        TEST_ASSERT(req.per_req_phase1_cap == -1);
+        TEST_ASSERT(req.per_req_reply_budget == -1);
+        TEST_ASSERT(!req.thinking_opt_in);
+    }
+
+    // An explicit effort remains a budget opt-in even when transported in
+    // chat_template_kwargs; only the bare boolean toggles are renderer-only.
+    const ParsedRequest explicit_effort = resolve_qwen_reasoning({
+        {"chat_template_kwargs", {
+            {"thinking", true},
+            {"reasoning_effort", "max"},
+        }},
+    });
+    TEST_ASSERT(explicit_effort.thinking_enabled);
+    TEST_ASSERT(explicit_effort.reasoning_effort == "max");
+    TEST_ASSERT(explicit_effort.per_req_phase1_cap == 500);
+    TEST_ASSERT(explicit_effort.thinking_opt_in);
+}
+
 TEST_CASE(ServerUnitFixture, test_pflash_placement_same_backend_local) {
     DevicePlacement target;
     target.backend = compiled_placement_backend();
@@ -2954,6 +3420,66 @@ TEST_CASE(ServerUnitFixture, test_bailingmoe3_router_builds_group_mask) {
     TEST_ASSERT(contains_op(contains_op, router.selected, GGML_OP_SET_ROWS));
 
     ggml_free(ctx);
+}
+
+TEST_CASE(ServerUnitFixture, test_deepseek4_render_reasoning_effort_prefixes) {
+    std::vector<ChatMessage> msgs = {
+        {"system", "system message", ""},
+        {"user", "hard problem", ""},
+    };
+    const std::string bos = "<｜begin▁of▁sentence｜>";
+    const std::string high_prefix =
+        "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n"
+        "You MUST be very thorough in your thinking and comprehensively "
+        "decompose the problem to resolve the root cause, rigorously "
+        "stress-testing your logic against all potential paths, edge cases, "
+        "and adversarial scenarios.\n"
+        "Explicitly write out your entire deliberation process, documenting "
+        "every intermediate step, considered alternative, and rejected "
+        "hypothesis to ensure absolutely no assumption is left unchecked.\n\n";
+    const std::string max_prefix =
+        "Reasoning Effort: Beyond maximum — exhaustive, relentless, and "
+        "uncompromising.\n"
+        "You MUST reason with the utmost depth and rigor, leaving absolutely "
+        "nothing to chance: exhaustively decompose the problem into its most "
+        "fundamental components, trace every causal chain to its root, and "
+        "resolve the underlying cause rather than any surface symptom.\n"
+        "Do not stop reasoning until you have independently verified the "
+        "solution from multiple angles and are certain that no assumption "
+        "remains unchecked and no error remains undiscovered.\n\n";
+    const auto ends_with = [](const std::string & text,
+                              const std::string & suffix) {
+        return text.size() >= suffix.size() &&
+            text.compare(text.size() - suffix.size(), suffix.size(), suffix) == 0;
+    };
+
+    const std::string high = render_chat_template(
+        msgs, ChatFormat::DEEPSEEK4, true, true, "", "high");
+    TEST_ASSERT(high.rfind(bos + high_prefix + "system message", 0) == 0);
+    TEST_ASSERT(high.find(max_prefix) == std::string::npos);
+    TEST_ASSERT(ends_with(high, "<｜Assistant｜><think>"));
+
+    const std::string max = render_chat_template(
+        msgs, ChatFormat::DEEPSEEK4, true, true, "", "max");
+    TEST_ASSERT(max.rfind(bos + max_prefix + "system message", 0) == 0);
+    TEST_ASSERT(max.find(high_prefix) == std::string::npos);
+    TEST_ASSERT(ends_with(max, "<｜Assistant｜><think>"));
+
+    const std::string low = render_chat_template(
+        msgs, ChatFormat::DEEPSEEK4, true, true, "", "low");
+    TEST_ASSERT(low.find(high_prefix) == std::string::npos);
+    TEST_ASSERT(low.find(max_prefix) == std::string::npos);
+    TEST_ASSERT(low.rfind(bos + "system message", 0) == 0);
+
+    const std::string disabled = render_chat_template(
+        msgs, ChatFormat::DEEPSEEK4, true, false, "", "max");
+    TEST_ASSERT(disabled.find(max_prefix) == std::string::npos);
+    TEST_ASSERT(ends_with(disabled, "<｜Assistant｜></think>"));
+
+    const std::string completed_turn = render_chat_template(
+        msgs, ChatFormat::DEEPSEEK4, false, true, "", "high");
+    TEST_ASSERT(completed_turn.rfind(bos + high_prefix, 0) == 0);
+    TEST_ASSERT(!ends_with(completed_turn, "<｜Assistant｜><think>"));
 }
 
 TEST_CASE(ServerUnitFixture, test_jinja_render_basic) {
@@ -3903,7 +4429,10 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_init_creates_directory) {
 TEST_CASE(ServerUnitFixture, test_disk_cache_header_size) {
     // The header should be exactly 80 bytes.
     TEST_ASSERT(DISK_CACHE_HEADER_SIZE == 80);
-    TEST_ASSERT(DISK_CACHE_VERSION == 1);
+    // Bumped to 2 when the K-rotation default changed: a cache written by an
+    // older binary stores K in the rotated basis, and the layout id does not
+    // cover that, so the version is what rejects it.
+    TEST_ASSERT(DISK_CACHE_VERSION == 2);
 }
 
 TEST_CASE(ServerUnitFixture, test_disk_cache_header_round_trip) {
@@ -5041,6 +5570,20 @@ TEST_CASE(ServerUnitFixture, test_props_deepseek4_tool_capability) {
     const json body = build_props_body(cfg, pc, tm);
 
     TEST_ASSERT(body["capabilities"]["tools_supported"].get<bool>());
+}
+
+TEST_CASE(ServerUnitFixture, test_props_deepseek4_reasoning_capability) {
+    ServerConfig cfg;
+    cfg.arch = "deepseek4";
+    Tokenizer tok;
+    PrefixCache pc(0, tok);
+    ToolMemory tm;
+    const json body = build_props_body(cfg, pc, tm);
+
+    TEST_ASSERT(body["reasoning"]["supported"].get<bool>());
+    TEST_ASSERT(body["reasoning"]["supported_efforts"] ==
+                json::array({"low", "high", "max"}));
+    TEST_ASSERT(body["capabilities"]["reasoning_supported"].get<bool>());
 }
 
 TEST_CASE(ServerUnitFixture, test_props_budget_envelope_shape) {
@@ -6696,4 +7239,22 @@ TEST_CASE(ServerUnitFixture, test_emitter_suppresses_malformed_multiline_tool_bu
     TEST_ASSERT(em.accumulated_text().empty());
     TEST_ASSERT(captured.find("[server] tool_call parse failed; suppressing buffered tool text") != std::string::npos);
     TEST_ASSERT(captured.find("text='<function_call>\\n  <invoke name=\"read\">\\n    malformed prose body with\\nnew lines and \\t tabs\\n'") != std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture,
+          test_concurrent_scheduler_burst_stops_at_eos) {
+    SeqEngine::DecodeOutput burst;
+    burst.slot = 0;
+    burst.committed_tokens = {101, 2, 103};
+    burst.token = 104;
+
+    std::vector<int32_t> emitted;
+    const bool consumed_all = consume_decode_output_tokens(
+        burst, [&](int32_t token) {
+            emitted.push_back(token);
+            return token != 2;
+        });
+
+    TEST_ASSERT(!consumed_all);
+    TEST_ASSERT((emitted == std::vector<int32_t>{101, 2}));
 }

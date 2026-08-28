@@ -181,14 +181,20 @@ public:
     struct StepInput {
         int     slot  = -1;
         int32_t token = -1;   // token to commit at this slot's next position
+        // Scheduler-side hooks may replace the next token before it is fed
+        // back. A speculative burst is unsafe while that authority is live.
+        bool allow_speculation = true;
     };
     struct DecodeOutput {
         int     slot   = -1;
-        int32_t token  = -1;  // newly sampled token (pending until next step)
+        // Final newly sampled token, pending until the scheduler feeds it
+        // into the next step. Durable speculative children precede it.
+        int32_t token  = -1;
         bool    failed = false;
         // Present when failed=true so the scheduler can report an honest
         // per-request error instead of silently truncating generation.
         std::string error;
+        std::vector<int32_t> committed_tokens;
     };
 
     struct PrefillOutput {
@@ -250,6 +256,16 @@ public:
     virtual bool token_is_eos(int32_t token) const = 0;
 };
 
+template <typename Advance>
+inline bool consume_decode_output_tokens(
+        const SeqEngine::DecodeOutput & output, Advance advance) {
+    if (output.failed) return false;
+    for (int32_t token : output.committed_tokens) {
+        if (!advance(token)) return false;
+    }
+    return advance(output.token);
+}
+
 // Validate the model-neutral step protocol before the scheduler consumes any
 // output. Malformed row ownership is fatal because re-feeding a token after an
 // omitted output would silently corrupt that sequence.
@@ -265,6 +281,7 @@ inline std::string validate_step_result(
     }
 
     std::vector<uint8_t> decode_planned((size_t)slot_count, 0);
+    std::vector<uint8_t> speculation_allowed((size_t)slot_count, 0);
     std::vector<uint8_t> prefill_planned((size_t)slot_count, 0);
     for (const SeqEngine::StepInput & input : plan.decode) {
         if (input.slot < 0 || input.slot >= slot_count || input.token < 0)
@@ -272,6 +289,8 @@ inline std::string validate_step_result(
         if (decode_planned[(size_t)input.slot])
             return "decode plan contains a duplicate slot";
         decode_planned[(size_t)input.slot] = 1;
+        speculation_allowed[(size_t)input.slot] =
+            input.allow_speculation ? 1 : 0;
     }
     for (const PrefillSlice & slice : plan.prefills) {
         if (slice.slot < 0 || slice.slot >= slot_count ||
@@ -290,10 +309,22 @@ inline std::string validate_step_result(
             return "decode output names an unplanned slot";
         if (decode_seen[(size_t)output.slot])
             return "step returned duplicate decode outputs";
-        if (output.failed && (output.token >= 0 || output.error.empty()))
-            return "failed decode has invalid payload";
-        if (!output.failed && (output.token < 0 || !output.error.empty()))
-            return "successful decode has invalid payload";
+        if (output.failed) {
+            if (output.token >= 0 || !output.committed_tokens.empty() ||
+                output.error.empty())
+                return "failed decode has invalid payload";
+        } else {
+            if (output.token < 0 || !output.error.empty())
+                return "successful decode has invalid payload";
+            if (!speculation_allowed[(size_t)output.slot] &&
+                !output.committed_tokens.empty())
+                return "decode output burst violates disabled speculation";
+            if (std::any_of(
+                    output.committed_tokens.begin(),
+                    output.committed_tokens.end(),
+                    [](int32_t token) { return token < 0; }))
+                return "decode output burst contains an invalid token";
+        }
         decode_seen[(size_t)output.slot] = 1;
     }
 

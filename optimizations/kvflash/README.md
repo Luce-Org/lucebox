@@ -1,5 +1,5 @@
 <p align="left">
-  <a href="../README.md">← lucebox-hub</a>
+  <a href="../../README.md">← lucebox</a>
 </p>
 
 <p align="center">

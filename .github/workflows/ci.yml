@@ -205,6 +205,7 @@ jobs:
             grep -q '^DFLASH27B_EFFECTIVE_BLACKWELL_CONSUMER:INTERNAL=OFF$' build/CMakeCache.txt
           fi
           targets=(
+            test_cuda_pool_shutdown
             test_deepseek4_mmid_grouped_cuda
             test_deepseek4_unit
             test_rocmfp3_mix_registry
@@ -213,6 +214,7 @@ jobs:
             test_ds4_mix_registry_teardown
             test_model_smoke
             test_batched_gdn
+            test_gdn_replay_log
             test_concat_transpose
           )
           if [[ "$RUN_SPARSE_ATTENTION_TEST" == "true" ]]; then
@@ -228,12 +230,12 @@ jobs:
           ./server/build/test_deepseek4_mmid_grouped_cuda
           ./server/build/test_deepseek4_unit
           ctest --test-dir server/build --output-on-failure \
-            -R 'rocmfp3_mix_registry|rocmfp_mix_slice_matvec|rocmfp_mix_gateup_glu|ds4_mix_registry_teardown'
+            -R 'cuda_pool_shutdown|rocmfp3_mix_registry|rocmfp_mix_slice_matvec|rocmfp_mix_gateup_glu|ds4_mix_registry_teardown'
 
       - name: Run concurrent-serving kernel tests
         run: |
           ctest --test-dir server/build --output-on-failure \
-            -R '^(test_model_smoke\.PagedAttention\.|batched_gdn$|concat_transpose$)' --no-tests=error
+            -R '^(test_model_smoke\.PagedAttention\.|batched_gdn$|gdn_replay_log_preflight$|concat_transpose$)' --no-tests=error
 
       # Optional model-backed end-to-end smoke (real spec-decode on the 3090),
       # disabled by default because it builds dflash_server and lazy-loads the
@@ -351,11 +353,11 @@ jobs:
               test_recurrent_snapshot test_server_unit test_rocmfp3_mix_registry \
               test_rocmfp_mix_slice_matvec test_rocmfp_mix_gateup_glu \
               test_ds4_mix_registry_teardown test_model_smoke test_batched_gdn \
-              test_concat_transpose \
+              test_concat_transpose test_cuda_pool_shutdown \
             --parallel 8
           ctest --test-dir "$RUNNER_TEMP/rocmfp-build" \
             --output-on-failure \
-            -R 'rocmfp4_reference|rocmfpx_reference|rocmfp4_hip_tail|rocmfpx_mmq|deepseek4_mmid_grouped_cuda|deepseek4_unit|recurrent_snapshot|ChainRollbackPolicy|rocmfp3_mix_registry|rocmfp_mix_slice_matvec|rocmfp_mix_gateup_glu|ds4_mix_registry_teardown|test_model_smoke\.PagedAttention\.|batched_gdn$|concat_transpose$'
+            -R 'cuda_pool_shutdown|rocmfp4_reference|rocmfpx_reference|rocmfp4_hip_tail|rocmfpx_mmq|deepseek4_mmid_grouped_cuda|deepseek4_unit|recurrent_snapshot|ChainRollbackPolicy|rocmfp3_mix_registry|rocmfp_mix_slice_matvec|rocmfp_mix_gateup_glu|ds4_mix_registry_teardown|test_model_smoke\.PagedAttention\.|batched_gdn$|concat_transpose$'
 
       - name: Build + test affine ROCmFP2 GPU paths
         # Keep the default wire-format build above and compile the affine layout

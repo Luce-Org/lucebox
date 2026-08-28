@@ -5732,7 +5732,7 @@ struct ggml_tensor * ggml_flash_attn_sparse(
 
 // ggml_paged_attn
 
-struct ggml_tensor * ggml_paged_attn_ext(
+static struct ggml_tensor * ggml_paged_attn_ext_impl(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
         struct ggml_tensor  * k,
@@ -5743,7 +5743,12 @@ struct ggml_tensor * ggml_paged_attn_ext(
         struct ggml_tensor  * query_positions,
         float                 scale,
         int                   block_size,
-        int                   max_kv_seq_len) {
+        int                   max_kv_seq_len,
+        struct ggml_tensor  * parent_ids,
+        struct ggml_tensor  * tree_sizes,
+        int                   tree_width,
+        int                   tree_scratch_base,
+        int                   tree_scratch_stride) {
     GGML_ASSERT(q->type == GGML_TYPE_F32);
     GGML_ASSERT(k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q4_0 || k->type == GGML_TYPE_Q8_0);
     GGML_ASSERT(v->type == GGML_TYPE_F16 || v->type == GGML_TYPE_Q4_0 || v->type == GGML_TYPE_Q8_0);
@@ -5754,6 +5759,16 @@ struct ggml_tensor * ggml_paged_attn_ext(
     // an explicit row -> block-table-column mapping.
     GGML_ASSERT(query_positions == NULL || active_slot_ids != NULL);
     GGML_ASSERT(query_positions == NULL || query_positions->type == GGML_TYPE_I32);
+
+    const bool tree_mode = parent_ids != NULL || tree_sizes != NULL;
+    GGML_ASSERT((parent_ids == NULL) == (tree_sizes == NULL));
+    GGML_ASSERT(!tree_mode || active_slot_ids != NULL);
+    // Mixed direct-commit batches use causal positions for a compact AR
+    // prefix and -1 for the fixed-width tree tail. Pure trees keep this null.
+    GGML_ASSERT(!tree_mode || query_positions == NULL ||
+                query_positions->ne[0] == q->ne[1]);
+    GGML_ASSERT(!tree_mode || parent_ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(!tree_mode || tree_sizes->type == GGML_TYPE_I32);
 
     GGML_ASSERT(q->ne[0] == k->ne[0] && q->ne[0] == v->ne[0]);
     GGML_ASSERT(k->ne[1] == v->ne[1]);
@@ -5784,13 +5799,50 @@ struct ggml_tensor * ggml_paged_attn_ext(
     GGML_ASSERT(block_size > 0);
     GGML_ASSERT(k->ne[1] % block_size == 0);
     GGML_ASSERT(max_kv_seq_len > 0);
-    GGML_ASSERT(max_kv_seq_len <= k->ne[1]);
+    // This is a padded logical launch bound, not a physical-cache extent.
+    // Each row clamps its actual sequence length to the block-table capacity
+    // and validates every resolved physical block before dereferencing K/V.
+    GGML_ASSERT((int64_t) max_kv_seq_len + tree_width <= INT32_MAX);
+
+    if (tree_mode) {
+        GGML_ASSERT(tree_width > 0);
+        GGML_ASSERT(tree_scratch_base > 0);
+        GGML_ASSERT(tree_scratch_base % block_size == 0);
+        GGML_ASSERT(tree_scratch_stride >= tree_width);
+        GGML_ASSERT(ggml_is_contiguous(parent_ids));
+        GGML_ASSERT(ggml_is_contiguous(tree_sizes));
+        GGML_ASSERT(parent_ids->ne[0] == tree_width);
+        GGML_ASSERT(parent_ids->ne[1] == tree_sizes->ne[0]);
+        GGML_ASSERT(parent_ids->ne[2] == 1 && parent_ids->ne[3] == 1);
+        GGML_ASSERT(tree_sizes->ne[1] == 1 && tree_sizes->ne[2] == 1 && tree_sizes->ne[3] == 1);
+        GGML_ASSERT(parent_ids->ne[1] > 0);
+        GGML_ASSERT(parent_ids->ne[1] <= INT64_MAX / tree_width);
+        const int64_t tree_rows = parent_ids->ne[1] * tree_width;
+        GGML_ASSERT(q->ne[1] >= tree_rows);
+        GGML_ASSERT(query_positions || q->ne[1] == tree_rows);
+
+        // Every physical sequence slot owns one non-overlapping scratch slab.
+        // Bound the largest address with int64 arithmetic before the GPU sees
+        // the int32 op parameters.
+        const int64_t scratch_end =
+            (int64_t) tree_scratch_base +
+            (block_table->ne[1] - 1) * (int64_t) tree_scratch_stride +
+            tree_width;
+        GGML_ASSERT(scratch_end <= k->ne[1]);
+    } else {
+        GGML_ASSERT(tree_width == 0);
+        GGML_ASSERT(tree_scratch_base == 0);
+        GGML_ASSERT(tree_scratch_stride == 0);
+    }
 
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, q->ne);
 
     ggml_set_op_params_f32(result, 0, scale);
     ggml_set_op_params_i32(result, 1, block_size);
     ggml_set_op_params_i32(result, 2, max_kv_seq_len);
+    ggml_set_op_params_i32(result, 3, tree_width);
+    ggml_set_op_params_i32(result, 4, tree_scratch_base);
+    ggml_set_op_params_i32(result, 5, tree_scratch_stride);
 
     result->op     = GGML_OP_PAGED_ATTN;
     result->src[0] = q;
@@ -5800,8 +5852,54 @@ struct ggml_tensor * ggml_paged_attn_ext(
     result->src[4] = kv_seq_lens;
     result->src[5] = active_slot_ids;
     result->src[6] = query_positions;
+    result->src[7] = parent_ids;
+    result->src[8] = tree_sizes;
 
     return result;
+}
+
+struct ggml_tensor * ggml_paged_attn_ext(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * block_table,
+        struct ggml_tensor  * kv_seq_lens,
+        struct ggml_tensor  * active_slot_ids,
+        struct ggml_tensor  * query_positions,
+        float                 scale,
+        int                   block_size,
+        int                   max_kv_seq_len) {
+    return ggml_paged_attn_ext_impl(
+        ctx, q, k, v, block_table, kv_seq_lens,
+        active_slot_ids, query_positions, scale, block_size,
+        max_kv_seq_len, NULL, NULL, 0, 0, 0);
+}
+
+struct ggml_tensor * ggml_paged_attn_ext_tree(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * block_table,
+        struct ggml_tensor  * kv_seq_lens,
+        struct ggml_tensor  * active_slot_ids,
+        struct ggml_tensor  * query_positions,
+        float                 scale,
+        int                   block_size,
+        int                   max_kv_seq_len,
+        struct ggml_tensor  * parent_ids,
+        struct ggml_tensor  * tree_sizes,
+        int                   tree_scratch_base,
+        int                   tree_scratch_stride) {
+    GGML_ASSERT(parent_ids != NULL);
+    GGML_ASSERT(parent_ids->ne[0] > 0 && parent_ids->ne[0] <= INT_MAX);
+    const int tree_width = (int) parent_ids->ne[0];
+    return ggml_paged_attn_ext_impl(
+        ctx, q, k, v, block_table, kv_seq_lens,
+        active_slot_ids, query_positions, scale, block_size,
+        max_kv_seq_len, parent_ids, tree_sizes, tree_width,
+        tree_scratch_base, tree_scratch_stride);
 }
 
 // ggml_flash_attn_back
@@ -5924,7 +6022,7 @@ struct ggml_tensor * ggml_ssm_conv_state(
 
     struct ggml_tensor * result =
         ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_inner, 1, n_s);
-    ggml_set_op_params_i32(result, 0, 2); // direct persistent-state mode
+    ggml_set_op_params_i32(result, 0, 4); // direct persistent-state mode
     result->op     = GGML_OP_SSM_CONV;
     result->src[0] = x;
     result->src[1] = c;
@@ -5951,6 +6049,95 @@ struct ggml_tensor * ggml_ssm_conv_tree(
     GGML_ASSERT(ggml_nelements(parent_ids) == n_t * n_s);
 
     result->src[2] = parent_ids;
+
+    return result;
+}
+
+// dflash: fused conv step. Same op id as ggml_ssm_conv; op_params[0] = 2
+// marks step mode (1 is the SpecLA layout), srcs are
+// (x, c, conv_state, conv_input_out).
+struct ggml_tensor * ggml_ssm_conv_step(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * c,
+        struct ggml_tensor  * conv_state,
+        struct ggml_tensor  * conv_input_out) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(c->type == GGML_TYPE_F32);
+    GGML_ASSERT(conv_state->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_matrix(c));
+    GGML_ASSERT(ggml_is_contiguous(c));
+    GGML_ASSERT(x->nb[0] == sizeof(float));
+    GGML_ASSERT(x->ne[3] == 1);
+
+    const int64_t d_conv  = c->ne[0];
+    const int64_t d_inner = c->ne[1];
+    const int64_t n_t     = x->ne[1];
+    const int64_t n_s     = x->ne[2];
+
+    GGML_ASSERT(x->ne[0] == d_inner);
+    // The CUDA/HIP step kernel instantiates K in {3, 4, 5, 9}; other tap
+    // counts would load fine and abort on the first decode.
+    GGML_ASSERT(d_conv == 3 || d_conv == 4 || d_conv == 5 || d_conv == 9);
+    GGML_ASSERT(conv_state->ne[0] == d_conv - 1);
+    GGML_ASSERT(conv_state->ne[1] == d_inner);
+    GGML_ASSERT(conv_state->ne[2] == n_s);
+    GGML_ASSERT(conv_state->nb[0] == sizeof(float));
+    GGML_ASSERT(conv_state->nb[1] == (size_t)(d_conv - 1) * sizeof(float));
+    if (conv_input_out) {
+        GGML_ASSERT(conv_input_out->type == GGML_TYPE_F32);
+        GGML_ASSERT(conv_input_out->ne[0] >= d_conv - 1 + n_t);
+        GGML_ASSERT(conv_input_out->ne[1] == d_inner);
+        GGML_ASSERT(conv_input_out->ne[2] == n_s);
+        GGML_ASSERT(conv_input_out->nb[0] == sizeof(float));
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_inner, n_t, n_s);
+    ggml_set_op_params_i32(result, 0, 2);   // step mode (1 = SpecLA heavy-light conv)
+
+    result->op     = GGML_OP_SSM_CONV;
+    result->src[0] = x;
+    result->src[1] = c;
+    result->src[2] = conv_state;
+    result->src[3] = conv_input_out;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_dflash_dyn_conv(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * base,
+        struct ggml_tensor  * dyn,
+        int                   site,
+        int                   kernel,
+        int                   group_size) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(base->type == GGML_TYPE_F32);
+    GGML_ASSERT(dyn->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(x));
+    GGML_ASSERT(ggml_is_contiguous(dyn));
+    GGML_ASSERT(x->ne[2] == 1 && x->ne[3] == 1);
+    GGML_ASSERT(group_size > 0 && x->ne[0] % group_size == 0);
+    GGML_ASSERT(kernel > 0 && site >= 0);
+    GGML_ASSERT(dyn->ne[1] == x->ne[1]);
+    GGML_ASSERT(dyn->ne[0] >= (int64_t)(site + 1) * kernel * (x->ne[0] / group_size));
+    // base is [hidden, K, 2] (per-tap rows, then site planes); contiguity
+    // makes flat row (site*K + k) valid with stride nb[1].
+    GGML_ASSERT(ggml_is_contiguous(base));
+    GGML_ASSERT(base->ne[0] == x->ne[0]);
+    GGML_ASSERT(base->ne[1] * base->ne[2] >= (int64_t)(site + 1) * kernel);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, x->ne[0], x->ne[1]);
+    ggml_set_op_params_i32(result, 0, 3);   // dflash2 grouped dyn-conv mode
+    ggml_set_op_params_i32(result, 1, site);
+    ggml_set_op_params_i32(result, 2, kernel);
+    ggml_set_op_params_i32(result, 3, group_size);
+
+    result->op     = GGML_OP_SSM_CONV;
+    result->src[0] = x;
+    result->src[1] = base;
+    result->src[2] = dyn;
 
     return result;
 }
@@ -6801,6 +6988,7 @@ void ggml_gated_delta_net_set_skip_intermediate(
         bool                 skip_intermediate) {
     GGML_ASSERT(tensor != NULL);
     GGML_ASSERT(tensor->op == GGML_OP_GATED_DELTA_NET);
+    GGML_ASSERT(ggml_get_op_params_i32(tensor, 3) == 0);
     ggml_set_op_params_i32(tensor, 0, skip_intermediate ? 1 : 0);
 
     const struct ggml_tensor * v = tensor->src[2];
@@ -6826,6 +7014,79 @@ void ggml_gated_delta_net_set_skip_intermediate(
     }
     tensor->nb[2] = tensor->nb[1]*tensor->ne[1];
     tensor->nb[3] = tensor->nb[2]*tensor->ne[2];
+}
+
+struct ggml_tensor * ggml_gated_delta_net_capture_replay_log(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * tensor) {
+    GGML_ASSERT(ctx != NULL && tensor != NULL);
+    GGML_ASSERT(tensor->op == GGML_OP_GATED_DELTA_NET);
+    GGML_ASSERT(tensor->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(tensor));
+    GGML_ASSERT(ggml_get_op_params_i32(tensor, 3) == 0);
+    GGML_ASSERT(ggml_get_op_params_i32(tensor, 2) == 0);
+    GGML_ASSERT(tensor->src[6] == NULL);
+
+    const struct ggml_tensor * v = tensor->src[2];
+    const struct ggml_tensor * g = tensor->src[3];
+    GGML_ASSERT(v != NULL && g != NULL);
+    const int64_t S_v = v->ne[0];
+    const int64_t H = v->ne[1];
+    const int64_t n_tokens = v->ne[2];
+    const int64_t n_seqs = v->ne[3];
+    const bool kda = g->ne[0] == S_v;
+    const int64_t replay_log_width = kda ? 3*S_v : 2*S_v + 1;
+    GGML_ASSERT(replay_log_width > 0 && H > 0 && n_tokens > 0 && n_seqs > 0);
+    GGML_ASSERT(replay_log_width <= INT64_MAX/H);
+    const int64_t replay_log_head = replay_log_width*H;
+    GGML_ASSERT(replay_log_head <= INT64_MAX/n_tokens);
+    const int64_t replay_log_token = replay_log_head*n_tokens;
+    GGML_ASSERT(replay_log_token <= INT64_MAX/n_seqs);
+    const int64_t replay_log_elements = replay_log_token*n_seqs;
+    GGML_ASSERT(tensor->ne[0] > 0);
+    GGML_ASSERT(replay_log_elements <= INT64_MAX - (tensor->ne[0] - 1));
+    const int64_t replay_log_rows =
+        (replay_log_elements + tensor->ne[0] - 1)/tensor->ne[0];
+    GGML_ASSERT(tensor->ne[1] > 0 && tensor->ne[1] <= INT32_MAX);
+    GGML_ASSERT(replay_log_rows <= INT64_MAX - tensor->ne[1]);
+    const int32_t replay_log_row_offset = (int32_t) tensor->ne[1];
+    GGML_ASSERT((size_t) replay_log_row_offset <= SIZE_MAX/tensor->nb[1]);
+    const size_t replay_log_byte_offset =
+        (size_t) replay_log_row_offset*tensor->nb[1];
+
+    tensor->ne[1] += replay_log_rows;
+    tensor->nb[2] = tensor->nb[1]*tensor->ne[1];
+    tensor->nb[3] = tensor->nb[2]*tensor->ne[2];
+    ggml_set_op_params_i32(tensor, 3, replay_log_row_offset);
+
+    return ggml_dup(ctx, ggml_view_4d(
+        ctx, tensor, replay_log_width, H, n_tokens, n_seqs,
+        (size_t) replay_log_width*sizeof(float),
+        (size_t) replay_log_head*sizeof(float),
+        (size_t) replay_log_token*sizeof(float),
+        replay_log_byte_offset));
+}
+
+// dflash: raw-gate mode (see ggml.h). [dt_bias | A] -> src[9],
+// op_params[10] = 1. (src[8] / op_params[2] belong to the compact-decode and
+// SpecLA variants.)
+void ggml_gated_delta_net_set_raw_gates(
+        struct ggml_tensor * tensor,
+        struct ggml_tensor * gate_ba) {
+    GGML_ASSERT(tensor != NULL);
+    GGML_ASSERT(tensor->op == GGML_OP_GATED_DELTA_NET);
+    GGML_ASSERT(gate_ba != NULL);
+    GGML_ASSERT(gate_ba->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(gate_ba));
+    const struct ggml_tensor * v = tensor->src[2];
+    GGML_ASSERT(ggml_nelements(gate_ba) == 2*v->ne[1]);
+    // scalar gate only (no KDA), no tree mode, no SpecLA / compact decode
+    GGML_ASSERT(tensor->src[3]->ne[0] == 1);
+    GGML_ASSERT(tensor->src[6] == NULL);
+    GGML_ASSERT(tensor->src[8] == NULL);
+    GGML_ASSERT(ggml_get_op_params_i32(tensor, 2) == 0);
+    tensor->src[9] = gate_ba;
+    ggml_set_op_params_i32(tensor, 10, 1);
 }
 
 // dflash: tree-mode variant. Same op, with parent_ids plumbed into

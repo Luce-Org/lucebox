@@ -4,6 +4,7 @@
 
 #include "common/backend_precision.h"
 #include "common/chain_rollback_policy.h"
+#include "common/draft_swa.h"
 #include "common/dflash_spec_decode.h"
 #include "common/gguf_inspect.h"
 #include "common/layer_split_utils.h"
@@ -480,7 +481,11 @@ bool Qwen35LayerSplitAdapter::load_draft() {
         return false;
     }
     if (cfg_.draft_swa_window > 0) {
-        draft_weights_.swa_window = cfg_.draft_swa_window;
+        const DraftSwaOverrideResult swa =
+            apply_draft_swa_window_override(
+                draft_weights_, cfg_.draft_swa_window);
+        std::fprintf(stderr, "[target-split] draft SWA layers: %d/%d (window=%d)\n",
+                     swa.swa_layers, swa.total_layers, swa.effective_window);
     }
 
     const int cap = std::min(cfg_.device.max_ctx, cfg_.draft_ctx_max);

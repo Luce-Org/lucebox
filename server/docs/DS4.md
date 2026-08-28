@@ -31,6 +31,26 @@ also accepts named bare-JSON fallbacks emitted by compatible checkpoints:
 calls remain unambiguous when a request supplies more than one tool; ordinary
 JSON that does not resolve to an allowed tool is preserved as assistant text.
 
+## Reasoning effort
+
+The native DeepSeek V4 renderer supports the official `low`, `high`, and `max`
+reasoning encodings. `low` adds no prefix; `high` and `max` prepend their
+official model-facing instruction before the system message. The server accepts
+`reasoning.effort`, top-level `reasoning_effort`, and the official
+`chat_template_kwargs` form:
+
+```json
+{"chat_template_kwargs":{"thinking":true,"reasoning_effort":"max"}}
+```
+
+For DeepSeek V4 Flash API compatibility, `medium` and `xhigh` map to `high`.
+Lucebox's hyphenated `x-high` extension retains its own phase-1 budget tier
+and uses the `max` model-facing encoding. Explicitly enabling thinking without
+an effort uses DeepSeek's `high` default. Bare `chat_template_kwargs.thinking`
+and `chat_template_kwargs.enable_thinking` toggles only control prompt rendering;
+they do not activate the force-close budget envelope unless the request also
+sets an explicit effort. Disabling thinking suppresses every effort prefix.
+
 ## Code Layout
 
 | Area | Files |

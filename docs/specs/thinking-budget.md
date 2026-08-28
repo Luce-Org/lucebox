@@ -205,6 +205,10 @@ ceiling (e.g. `effort: "max"` on a model whose card has no
 There are two equivalent ways a client opts into the budget envelope.
 Both unlock Level 1, Level 2, and `finish_details` emission.
 
+By themselves, `chat_template_kwargs.thinking` and
+`chat_template_kwargs.enable_thinking` only control prompt rendering. They do
+not activate the budget envelope or `finish_details` emission.
+
 ### 4.1 Anthropic-style `thinking`
 
 ```json

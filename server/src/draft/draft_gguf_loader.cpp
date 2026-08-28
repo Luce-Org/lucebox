@@ -25,6 +25,8 @@
 //   blk.<i>.ffn_down.weight                 [hidden, intermediate]  Q8_0 / F16
 
 #include "internal.h"
+#include "common/dflash2_selector_validation.h"
+#include "common/draft_swa.h"
 #include "common/derived_scalars.h"
 #include "common/gguf_mmap.h"
 #include "common/gguf_bounds.h"
@@ -57,14 +59,6 @@ uint32_t get_u32_or(const gguf_context * g, const char * key, uint32_t fallback)
     return gguf_get_val_u32(g, id);
 }
 
-int count_swa_layers(const DraftWeights & w) {
-    int n_swa = 0;
-    for (const DraftLayer & layer : w.layers) {
-        if (layer.is_swa) n_swa++;
-    }
-    return n_swa;
-}
-
 int count_attn_gate_layers(const DraftWeights & w) {
     int n_gate = 0;
     for (const DraftLayer & layer : w.layers) {
@@ -75,7 +69,7 @@ int count_attn_gate_layers(const DraftWeights & w) {
 
 bool check_shape_1d(const ggml_tensor * t, int64_t ne0, const char * name, char * buf, size_t buf_sz) {
     if (!t || t->ne[0] != ne0) {
-        std::snprintf(buf, buf_sz, "draft GGUF: Domino tensor %s shape mismatch: got [%lld], expected [%lld]",
+        std::snprintf(buf, buf_sz, "draft GGUF: tensor %s shape mismatch: got [%lld], expected [%lld]",
                       name, t ? (long long)t->ne[0] : -1LL, (long long)ne0);
         return false;
     }
@@ -86,11 +80,26 @@ bool check_shape_2d(const ggml_tensor * t, int64_t ne0, int64_t ne1,
                     const char * name, char * buf, size_t buf_sz) {
     if (!t || t->ne[0] != ne0 || t->ne[1] != ne1) {
         std::snprintf(buf, buf_sz,
-                      "draft GGUF: Domino tensor %s shape mismatch: got [%lld,%lld], expected [%lld,%lld]",
+                      "draft GGUF: tensor %s shape mismatch: got [%lld,%lld], expected [%lld,%lld]",
                       name,
                       t ? (long long)t->ne[0] : -1LL,
                       t ? (long long)t->ne[1] : -1LL,
                       (long long)ne0, (long long)ne1);
+        return false;
+    }
+    return true;
+}
+
+bool check_shape_3d(const ggml_tensor * t, int64_t ne0, int64_t ne1, int64_t ne2,
+                    const char * name, char * buf, size_t buf_sz) {
+    if (!t || t->ne[0] != ne0 || t->ne[1] != ne1 || t->ne[2] != ne2) {
+        std::snprintf(buf, buf_sz,
+                      "draft GGUF: tensor %s shape mismatch: got [%lld,%lld,%lld], expected [%lld,%lld,%lld]",
+                      name,
+                      t ? (long long)t->ne[0] : -1LL,
+                      t ? (long long)t->ne[1] : -1LL,
+                      t ? (long long)t->ne[2] : -1LL,
+                      (long long)ne0, (long long)ne1, (long long)ne2);
         return false;
     }
     return true;
@@ -300,6 +309,32 @@ bool load_draft_gguf(const std::string & path,
     if (out.rope_theta == 0.0f) {
         fprintf(stderr, "[draft-gguf] WARNING: rope.freq_base not found in GGUF, draft RoPE will be wrong\n");
     }
+    // YaRN rope scaling (optional). Drafters trained with YaRN (e.g. Qwen3.8
+    // DSpark: factor 32, orig ctx 8192) apply it at every position; plain
+    // RoPE at inference silently degrades acceptance.
+    {
+        const float yarn_factor = read_f32("rope.scaling.factor", 0.0f);
+        const int   yarn_orig   = (int)read_u32("rope.scaling.original_context_length", 0);
+        if (yarn_factor > 1.0f && yarn_orig <= 0) {
+            // ggml_rope_yarn_corr_dims takes log(n_ctx_orig): 0 would
+            // collapse the correction dims while the mscale still applies.
+            fprintf(stderr,
+                "[draft-gguf] WARNING: YaRN factor %.1f without "
+                "original_context_length; ignoring YaRN (plain RoPE)\n",
+                yarn_factor);
+        } else if (yarn_factor > 1.0f) {
+            out.rope_freq_scale  = 1.0f / yarn_factor;
+            out.rope_ext_factor  = 1.0f;
+            out.rope_attn_factor = read_f32("rope.scaling.attn_factor", 1.0f);
+            out.rope_beta_fast   = read_f32("rope.scaling.beta_fast", 32.0f);
+            out.rope_beta_slow   = read_f32("rope.scaling.beta_slow", 1.0f);
+            out.rope_n_ctx_orig  = yarn_orig;
+            fprintf(stderr,
+                "[draft-gguf] YaRN rope: factor=%.1f orig_ctx=%d beta=%.1f/%.1f\n",
+                yarn_factor, out.rope_n_ctx_orig,
+                out.rope_beta_fast, out.rope_beta_slow);
+        }
+    }
     out.layers.assign((size_t)n_layer, DraftLayer{});
 
     auto g = [&](const char * name) -> ggml_tensor * {
@@ -358,6 +393,11 @@ bool load_draft_gguf(const std::string & path,
         L.w_gate    = fnd("ffn_gate.weight");
         L.w_up      = fnd("ffn_up.weight");
         L.w_down    = fnd("ffn_down.weight");
+        // DFlash 2 grouped dynamic convs (optional)
+        L.attn_conv.base = fnd("attn_conv.base");
+        L.attn_conv.proj = fnd("attn_conv.proj.weight");
+        L.mlp_conv.base  = fnd("ffn_conv.base");
+        L.mlp_conv.proj  = fnd("ffn_conv.proj.weight");
         if (!L.attn_norm || !L.ffn_norm || !L.wq || !L.wk || !L.wv || !L.wo ||
             !L.q_norm || !L.k_norm || !L.w_gate || !L.w_up || !L.w_down) {
             char b[128];
@@ -509,24 +549,150 @@ bool load_draft_gguf(const std::string & path,
                      out.sample_from_anchor ? "true" : "false");
     }
 
+    // DFlash 2: dynamic convs in every layer + candidate selector head.
+    {
+        const int conv_k = (int)read_u32("dflash.dflash2.conv_kernel_size", 0);
+        int n_conv = 0;
+        for (const DraftLayer & L : out.layers) {
+            if (L.attn_conv.present() && L.mlp_conv.present()) n_conv++;
+        }
+        if (n_conv > 0 || conv_k > 0) {
+            if (n_conv != out.n_layer || conv_k <= 0) {
+                set_last_error("draft GGUF: DFlash 2 conv tensors/metadata incomplete "
+                               "(need attn_conv/ffn_conv base+proj in every layer and "
+                               "dflash.dflash2.conv_kernel_size)");
+                ggml_free(meta_ctx); out.ctx = nullptr; gguf_free(gctx);
+                return false;
+            }
+            out.conv_kernel_size = conv_k;
+            out.conv_group_size  = (int)read_u32("dflash.dflash2.conv_group_size", 16);
+            if (out.conv_group_size <= 0 || out.n_embd % out.conv_group_size != 0) {
+                char b[192];
+                std::snprintf(b, sizeof(b),
+                              "draft GGUF: dflash.dflash2.conv_group_size=%d "
+                              "must be positive and divide embedding_length=%d",
+                              out.conv_group_size, out.n_embd);
+                set_last_error(b);
+                ggml_free(meta_ctx); out.ctx = nullptr; gguf_free(gctx);
+                return false;
+            }
+            const int64_t groups = out.n_embd / out.conv_group_size;
+            char shape_err[192];
+            bool shapes_ok = true;
+            for (int il = 0; il < out.n_layer && shapes_ok; ++il) {
+                const DraftLayer & L = out.layers[(size_t)il];
+                const DraftConvWeights * convs[] = {&L.attn_conv, &L.mlp_conv};
+                const char * kinds[] = {"attn_conv", "ffn_conv"};
+                for (int ci = 0; ci < 2 && shapes_ok; ++ci) {
+                    char base_name[64];
+                    char proj_name[64];
+                    std::snprintf(base_name, sizeof(base_name),
+                                  "blk.%d.%s.base", il, kinds[ci]);
+                    std::snprintf(proj_name, sizeof(proj_name),
+                                  "blk.%d.%s.proj", il, kinds[ci]);
+                    shapes_ok =
+                        check_shape_3d(convs[ci]->base, out.n_embd, conv_k, 2,
+                                       base_name, shape_err, sizeof(shape_err)) &&
+                        check_shape_2d(convs[ci]->proj, out.n_embd,
+                                       2 * conv_k * groups, proj_name,
+                                       shape_err, sizeof(shape_err));
+                }
+            }
+            if (!shapes_ok) {
+                set_last_error(shape_err);
+                ggml_free(meta_ctx); out.ctx = nullptr; gguf_free(gctx);
+                return false;
+            }
+            std::fprintf(stderr, "[draft GGUF] DFlash 2 dynamic convs: kernel=%d group=%d\n",
+                         out.conv_kernel_size, out.conv_group_size);
+        }
+        out.selector = DraftSelectorWeights{};
+        out.selector.hproj   = g("dflash.selector.hproj.weight");
+        out.selector.pred_cb = g("dflash.selector.pred_cb");
+        out.selector.succ_cb = g("dflash.selector.succ_cb");
+        const uint32_t sel_rank = read_u32("dflash.dflash2.selector_rank", 0);
+        if (out.selector.hproj || out.selector.pred_cb || out.selector.succ_cb || sel_rank) {
+            if (!out.selector.hproj || !out.selector.pred_cb || !out.selector.succ_cb) {
+                set_last_error("draft GGUF: DFlash 2 selector tensors incomplete "
+                               "(hproj.weight, pred_cb, succ_cb)");
+                ggml_free(meta_ctx); out.ctx = nullptr; gguf_free(gctx);
+                return false;
+            }
+            out.selector.rank  = sel_rank ? (int)sel_rank : (int)out.selector.hproj->ne[1];
+            out.selector.top_k = (int)read_u32("dflash.dflash2.selector_top_k", 16);
+            if (out.selector.top_k <= 0 || out.selector.top_k > 256) {
+                set_last_error("draft GGUF: dflash.dflash2.selector_top_k out of range (1..256)");
+                ggml_free(meta_ctx); out.ctx = nullptr; gguf_free(gctx);
+                return false;
+            }
+            char shape_err[192];
+            const int64_t R = out.selector.rank;
+            if (!check_shape_2d(out.selector.hproj, out.n_embd, R, "selector.hproj", shape_err, sizeof(shape_err)) ||
+                !check_shape_2d(out.selector.pred_cb, R, out.selector.pred_cb->ne[1], "selector.pred_cb", shape_err, sizeof(shape_err)) ||
+                !check_shape_2d(out.selector.succ_cb, R, out.selector.pred_cb->ne[1], "selector.succ_cb", shape_err, sizeof(shape_err))) {
+                set_last_error(shape_err);
+                ggml_free(meta_ctx); out.ctx = nullptr; gguf_free(gctx);
+                return false;
+            }
+            DFlash2SelectorLayout selector_layout;
+            selector_layout.rank = out.selector.rank;
+            selector_layout.top_k = out.selector.top_k;
+            selector_layout.hproj_rank = out.selector.hproj->ne[1];
+            selector_layout.pred_rank = out.selector.pred_cb->ne[0];
+            selector_layout.pred_vocab = out.selector.pred_cb->ne[1];
+            selector_layout.succ_rank = out.selector.succ_cb->ne[0];
+            selector_layout.succ_vocab = out.selector.succ_cb->ne[1];
+            if (target && target->output) {
+                selector_layout.target_output_vocab = target->output->ne[1];
+            }
+            if (target) {
+                selector_layout.target_declared_vocab = target->n_vocab;
+            }
+            std::string selector_error;
+            if (!validate_dflash2_selector_layout(
+                    selector_layout, selector_error)) {
+                set_last_error("draft GGUF: " + selector_error);
+                ggml_free(meta_ctx); out.ctx = nullptr; gguf_free(gctx);
+                return false;
+            }
+            out.selector.enabled = true;
+            std::fprintf(stderr, "[draft GGUF] DFlash 2 selector enabled: rank=%d top_k=%d vocab=%lld\n",
+                         out.selector.rank, out.selector.top_k, (long long)out.selector.pred_cb->ne[1]);
+        }
+    }
+
     // GGUF Qwen3.6 drafters carry SWA metadata emitted by the converter:
     //   dflash-draft.attention.sliding_window = 2048
     //   dflash-draft.attention.sliding_window_pattern = [true,true,true,true,false]
+    out.swa_pattern_loaded = false;
     out.swa_window = (int)read_u32("attention.sliding_window", 0);
     std::snprintf(key, sizeof(key), "%s.%s", A, "attention.sliding_window_pattern");
     int64_t swp_id = gguf_find_key(gctx, key);
     if (swp_id >= 0 && gguf_get_kv_type(gctx, swp_id) == GGUF_TYPE_ARRAY &&
         gguf_get_arr_type(gctx, swp_id) == GGUF_TYPE_BOOL) {
         const size_t n = gguf_get_arr_n(gctx, swp_id);
+        if (n != out.layers.size()) {
+            char message[192];
+            std::snprintf(
+                message, sizeof(message),
+                "draft GGUF: attention.sliding_window_pattern has %zu entries "
+                "for %zu layers",
+                n, out.layers.size());
+            set_last_error(message);
+            ggml_free(meta_ctx); out.ctx = nullptr; gguf_free(gctx);
+            return false;
+        }
         const bool * pattern = static_cast<const bool *>(gguf_get_arr_data(gctx, swp_id));
-        for (size_t il = 0; il < n && il < out.layers.size(); il++) {
+        out.swa_pattern_loaded = true;
+        for (size_t il = 0; il < n; il++) {
             out.layers[il].is_swa = pattern[il];
         }
     }
-    const int n_swa = count_swa_layers(out);
-    if (n_swa > 0) {
+    const DraftSwaOverrideResult swa =
+        apply_draft_swa_window_override(out, 0);
+    if (swa.swa_layers > 0) {
         std::fprintf(stderr, "[draft GGUF] SWA layers: %d/%d (window=%d)\n",
-                     n_swa, out.n_layer, out.swa_window);
+                     swa.swa_layers, swa.total_layers, swa.effective_window);
     }
     const bool meta_context_kv_layer_norm =
         read_u32("dflash.context_kv_layer_norm", 0) != 0;

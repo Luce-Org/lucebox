@@ -45,6 +45,9 @@ struct Qwen35Slot {
     // Penalty history is recorded as fed rather than sampled: the scheduler
     // may override a sample before the model consumes it.
     std::vector<int32_t> sample_history;
+    // Decode rows reserved by the current target graph. They become durable
+    // only after the graph and any speculative promotion succeed.
+    std::vector<int32_t> staged_tokens;
 
     int generated_tokens() const {
         return sample_history.size() > (size_t)prompt_len
@@ -94,17 +97,26 @@ public:
         bool ok = false;
         bool busy = false;    // no physical block available right now
         int64_t physical_row = -1;
+        std::vector<int64_t> physical_rows;
+        int count = 0;
         int position = -1;   // logical position the fed token is written at
         int32_t new_block = -1;
         int new_block_index = -1;
+        std::vector<int32_t> new_blocks;
+        int first_new_block = -1;
     };
 
-    // Allocate the next decode token's cache row, report any new block-table
-    // entry, and log it to sample_history. cur_pos waits for commit_step().
+    StepAppend append_tokens(int slot, const int32_t * fed_tokens,
+                             int n_tokens);
+
+    // Allocate decode cache rows and stage the fed tokens. Both history and
+    // cur_pos wait for commit_step().
     StepAppend append_token(int slot, int32_t fed_token);
 
     // The batched step's compute succeeded: cur_pos++.
     void commit_step(int slot);
+
+    bool rollback_step(int slot);
 
     // Release the slot's blocks and clear its state. Safe on inactive slots
     // and after a failed admission/prefill.

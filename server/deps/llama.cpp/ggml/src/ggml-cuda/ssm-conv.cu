@@ -357,6 +357,105 @@ static void ssm_conv_f32_cuda(const float * src0, const float * src1, const int 
     }
 }
 
+// dflash: fused conv step (see ggml_ssm_conv_step). One thread per channel
+// walks the token loop with the K-1 history in registers, writes silu(conv),
+// the optional rollback window and the new history in place.
+template <int K>
+static __global__ void ssm_conv_step_f32(const float * __restrict__ x, const int x_nb1, const int x_nb2,
+                                         const float * __restrict__ w, const int w_nb1,
+                                         float * state, const int st_nb1, const int st_nb2,
+                                         float * __restrict__ y, const int y_nb1, const int y_nb2,
+                                         float * ci, const int ci_nb1, const int ci_nb2,
+                                         const int C, const int T) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    const int s = blockIdx.y;
+    if (c >= C) return;
+
+    const float * xs = (const float *) ((const char *) x + (size_t) s * x_nb2) + c;
+    float *       st = (float *) ((char *) state + (size_t) s * st_nb2 + (size_t) c * st_nb1);
+    float *       ys = (float *) ((char *) y + (size_t) s * y_nb2) + c;
+    float *       cs = ci ? (float *) ((char *) ci + (size_t) s * ci_nb2 + (size_t) c * ci_nb1) : nullptr;
+    const float * wc = (const float *) ((const char *) w + (size_t) c * w_nb1);
+
+    const int xs_stride = x_nb1 / sizeof(float);
+    const int ys_stride = y_nb1 / sizeof(float);
+
+    float wt[K];
+    float win[K];   // oldest first; win[K-1] is the current input
+#pragma unroll
+    for (int k = 0; k < K; k++) {
+        wt[k] = wc[k];
+    }
+#pragma unroll
+    for (int j = 0; j < K - 1; j++) {
+        win[j] = st[j];
+        if (cs) cs[j] = win[j];
+    }
+    for (int t = 0; t < T; t++) {
+        const float xt = xs[(size_t) t * xs_stride];
+        win[K - 1] = xt;
+        float acc = 0.0f;
+#pragma unroll
+        for (int k = 0; k < K; k++) {
+            acc += win[k] * wt[k];
+        }
+        ys[(size_t) t * ys_stride] = ggml_cuda_op_silu_single(acc);
+        if (cs) cs[K - 1 + t] = xt;
+#pragma unroll
+        for (int j = 0; j < K - 1; j++) {
+            win[j] = win[j + 1];
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < K - 1; j++) {
+        st[j] = win[j];
+    }
+}
+
+static void ggml_cuda_op_ssm_conv_step(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * x  = dst->src[0];
+    const ggml_tensor * w  = dst->src[1];
+    ggml_tensor *       st = dst->src[2];
+    ggml_tensor *       ci = dst->src[3];
+
+    const int K = (int) w->ne[0];
+    const int C = (int) w->ne[1];
+    const int T = (int) dst->ne[1];
+    const int S = (int) dst->ne[2];
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 && st->type == GGML_TYPE_F32);
+    GGML_ASSERT(x->nb[0] == sizeof(float));
+    GGML_ASSERT(w->nb[0] == sizeof(float));
+    GGML_ASSERT(st->nb[0] == sizeof(float) && st->nb[1] == (size_t) (K - 1) * sizeof(float));
+    GGML_ASSERT(dst->nb[0] == sizeof(float));
+    if (ci) {
+        GGML_ASSERT(ci->type == GGML_TYPE_F32 && ci->nb[0] == sizeof(float));
+        GGML_ASSERT(ci->ne[0] >= K - 1 + T);
+    }
+
+    const int threads = 256;
+    const dim3 blocks((C + threads - 1) / threads, S, 1);
+    cudaStream_t stream = ctx.stream();
+
+    auto launch = [&](auto KK) {
+        constexpr int kK = decltype(KK)::value;
+        ssm_conv_step_f32<kK><<<blocks, threads, 0, stream>>>(
+            (const float *) x->data, (int) x->nb[1], (int) x->nb[2],
+            (const float *) w->data, (int) w->nb[1],
+            (float *) st->data, (int) st->nb[1], (int) st->nb[2],
+            (float *) dst->data, (int) dst->nb[1], (int) dst->nb[2],
+            ci ? (float *) ci->data : nullptr, ci ? (int) ci->nb[1] : 0, ci ? (int) ci->nb[2] : 0,
+            C, T);
+    };
+    switch (K) {
+        case 3: launch(std::integral_constant<int, 3>{}); break;
+        case 4: launch(std::integral_constant<int, 4>{}); break;
+        case 5: launch(std::integral_constant<int, 5>{}); break;
+        case 9: launch(std::integral_constant<int, 9>{}); break;
+        default: GGML_ABORT("ssm_conv_step only supports kernel sizes 3, 4, 5, 9.");
+    }
+}
+
 template <int d_conv>
 static __global__ void ssm_conv_specla_hld_f32(
         const float * __restrict__ x,          // [d_inner, n_t]
@@ -493,8 +592,70 @@ static void ssm_conv_specla_hld_cuda(ggml_backend_cuda_context & ctx,
     }
 }
 
+// dflash2 grouped dynamic block conv (op_params[0] == 3): one node replacing
+// the ~19-op per-site ggml expansion in the draft graph. rn intrinsics keep
+// the result bit-identical to the unfused mul/add node chain (mirrors the
+// zero-padded shift including signed-zero terms; no FMA contraction).
+static __global__ void dflash_dyn_conv_f32(
+        const float * __restrict__ x, const float * __restrict__ base,
+        const float * __restrict__ dyn, float * __restrict__ out,
+        const int C, const int T, const int G, const int gs,
+        const int site, const int K,
+        const int64_t base_ld, const int64_t dyn_ld) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    const int l = blockIdx.y;
+    if (c >= C || l >= T) return;
+    const int g = c / gs;
+    float acc;
+    {
+        const float cf = __fadd_rn(dyn[(int64_t)l * dyn_ld + (int64_t)(site * K) * G + g],
+                                   base[(int64_t)(site * K) * base_ld + c]);
+        acc = __fmul_rn(x[(int64_t)l * C + c], cf);
+    }
+    for (int k = 1; k < K; ++k) {
+        if (T <= k) break;   // matches the unfused builder-level break
+        const int   row = site * K + k;
+        const float xv  = (l >= k) ? x[(int64_t)(l - k) * C + c] : 0.0f;
+        const float cf  = __fadd_rn(dyn[(int64_t)l * dyn_ld + (int64_t)row * G + g],
+                                    base[(int64_t)row * base_ld + c]);
+        acc = __fadd_rn(acc, __fmul_rn(xv, cf));
+    }
+    out[(int64_t)l * C + c] = acc;
+}
+
+static void ggml_cuda_op_dflash_dyn_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * x    = dst->src[0];
+    const ggml_tensor * base = dst->src[1];
+    const ggml_tensor * dyn  = dst->src[2];
+    const int C    = (int)x->ne[0];
+    const int T    = (int)x->ne[1];
+    const int site = ggml_get_op_params_i32(dst, 1);
+    const int K    = ggml_get_op_params_i32(dst, 2);
+    const int gs   = ggml_get_op_params_i32(dst, 3);
+    GGML_ASSERT(gs > 0 && C % gs == 0);
+    const dim3 block(256);
+    const dim3 grid((unsigned)((C + 255) / 256), (unsigned)T, 1);
+    dflash_dyn_conv_f32<<<grid, block, 0, ctx.stream()>>>(
+        (const float *)x->data, (const float *)base->data, (const float *)dyn->data,
+        (float *)dst->data, C, T, C / gs, gs, site, K,
+        (int64_t)(base->nb[1] / sizeof(float)), (int64_t)(dyn->nb[1] / sizeof(float)));
+}
+
 void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * silu_dst) {
     const int mode = ggml_get_op_params_i32(dst, 0);
+    // dflash2 grouped dynamic block conv; op_params[0] == 3
+    if (mode == 3) {
+        GGML_ASSERT(silu_dst == nullptr);
+        ggml_cuda_op_dflash_dyn_conv(ctx, dst);
+        return;
+    }
+    // dflash: fused step mode (silu already applied by the kernel); op_params[0] == 2
+    if (mode == 2) {
+        GGML_ASSERT(silu_dst == nullptr);
+        ggml_cuda_op_ssm_conv_step(ctx, dst);
+        return;
+    }
+    // SpecLA heavy-light conv; op_params[0] == 1
     if (mode == 1) {
         GGML_ASSERT(silu_dst == nullptr);
         ssm_conv_specla_hld_cuda(ctx, dst);
@@ -512,7 +673,9 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
     // When fusing, write to silu_dst (the node downstream references).
     const struct ggml_tensor * out = fuse_silu ? silu_dst : dst;
 
-    if (mode == 2) {
+    // Ling direct persistent-state AR uses a distinct mode so it cannot be
+    // mistaken for the generic fused-step operation above.
+    if (mode == 4) {
         GGML_ASSERT(parent_ids == nullptr);
         GGML_ASSERT(conv_state != nullptr);
         GGML_ASSERT(src0->type == GGML_TYPE_F32);

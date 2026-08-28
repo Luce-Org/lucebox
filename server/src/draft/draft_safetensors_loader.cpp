@@ -55,6 +55,7 @@
 
 #include <unordered_map>
 #include <vector>
+namespace dflash { namespace common { void dflash2_selector_graph_invalidate(); } }
 
 namespace dflash::common {
 
@@ -513,6 +514,9 @@ bool load_draft_safetensors(const std::string & path,
                             ggml_backend_t       backend,
                             DraftWeights &       out,
                             const TargetWeights * target) {
+    out.swa_window = 0;
+    out.swa_pattern_loaded = false;
+
     // ── 1. Open + mmap ────────────────────────────────────────────
     Mmap mm;
     std::string err;
@@ -692,6 +696,11 @@ bool load_draft_safetensors(const std::string & path,
 }
 
 void free_draft_weights(DraftWeights & w) {
+    // The dflash2 selector graph caches tensor pointers keyed on the
+    // DraftWeights address; a reload lands at the same address, so the
+    // cache must be invalidated when the weights go away.
+    dflash2_selector_graph_invalidate();
+
     if (w.buf) { ggml_backend_buffer_free(w.buf); w.buf = nullptr; }
     if (w.ctx) { ggml_free(w.ctx);                w.ctx = nullptr; }
     w.layers.clear();

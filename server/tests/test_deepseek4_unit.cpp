@@ -13,6 +13,7 @@
 #include "common/layer_split_backend.h"
 #include "common/layer_split_runtime.h"
 #include "common/layer_split_utils.h"
+#include "common/moe_hybrid_ffn_eval.h"
 #include "deepseek4/deepseek4_dspark.h"
 
 #include <memory>
@@ -78,6 +79,18 @@ using TestClock = std::chrono::steady_clock;
 
 static double elapsed_ms(TestClock::time_point t0, TestClock::time_point t1) {
     return std::chrono::duration<double, std::milli>(t1 - t0).count();
+}
+
+static void test_moe_expert_major_default_threshold() {
+    TEST_ASSERT(kMoeExpertMajorPrefillMinTokens == 64);
+    TEST_ASSERT(!moe_expert_major_prefill_policy_enabled(
+        63, true, kMoeExpertMajorPrefillMinTokens));
+    TEST_ASSERT(moe_expert_major_prefill_policy_enabled(
+        64, true, kMoeExpertMajorPrefillMinTokens));
+    TEST_ASSERT(!moe_expert_major_prefill_policy_enabled(
+        64, false, kMoeExpertMajorPrefillMinTokens));
+    TEST_ASSERT(moe_cold_input_first_policy_enabled(true, true, false));
+    TEST_ASSERT(!moe_cold_input_first_policy_enabled(true, true, true));
 }
 
 struct DeepSeek4FixtureOptions {
@@ -4109,6 +4122,7 @@ int main() {
     }
 
     test_compressor_pooling_correctness(backend);
+    test_moe_expert_major_default_threshold();
     test_chunked_graph_allocator(backend);
     test_swiglu_ds4_cpu_correctness(backend);
     test_moe_routing_correctness(backend);

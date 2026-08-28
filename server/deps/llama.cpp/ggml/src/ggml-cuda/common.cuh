@@ -1194,6 +1194,8 @@ struct ggml_cuda_pool {
 
     virtual void * alloc(size_t size, size_t * actual_size) = 0;
     virtual void free(void * ptr, size_t size) = 0;
+    virtual bool is_legacy() const = 0;
+    virtual size_t trim() = 0;
 };
 
 template<typename T>
@@ -1443,7 +1445,7 @@ struct ggml_backend_cuda_context {
     std::string name;
     cudaEvent_t copy_event = nullptr;
 
-    // LUCE_Q8_MEMO=1: memoize q8_1-quantized src1 activations across the
+    // Memoize q8_1-quantized src1 activations across the
     // quantized matmuls of ONE graph evaluation (Q/K/V/gate/router/shexp all
     // re-quantize the same hidden state otherwise). Entries are freed in LIFO
     // order at the start of the next evaluation to keep the pool discipline.

@@ -12,6 +12,11 @@ static constexpr int PAGED_ATTN_BLOCKS_PER_PARTITION = 64;
 static constexpr int PAGED_ATTN_HEAD_DIM = 256;
 static constexpr int PAGED_ATTN_MAX_PACKED_WARPS = 8;
 
+static __host__ __device__ __forceinline__ int32_t paged_attn_ceil_div(
+        int64_t dividend, int32_t divisor) {
+    return (int32_t) (dividend / divisor + (dividend % divisor != 0));
+}
+
 // Partition count for n_blocks of context: enough partitions to cover the
 // blocks and to reach min_partitions for occupancy, but never more than the
 // blocks themselves or the cap. Host and device must agree on this so the
@@ -19,14 +24,51 @@ static constexpr int PAGED_ATTN_MAX_PACKED_WARPS = 8;
 static __host__ __device__ __forceinline__ int32_t paged_attn_partitions(
         int32_t n_blocks, int32_t min_partitions, int32_t cap) {
     const int32_t context_partitions =
-        (n_blocks + PAGED_ATTN_BLOCKS_PER_PARTITION - 1) /
-        PAGED_ATTN_BLOCKS_PER_PARTITION;
+        paged_attn_ceil_div(n_blocks, PAGED_ATTN_BLOCKS_PER_PARTITION);
     const int32_t requested =
         context_partitions > min_partitions
             ? context_partitions
             : min_partitions;
     const int32_t available = n_blocks < cap ? n_blocks : cap;
     return requested < available ? requested : available;
+}
+
+// parent_ids is a sequence-major [tree_width, n_tree_seq] table. Parents
+// precede children in the flat tree, and the root parent is -1.
+static __device__ __forceinline__ bool paged_attn_tree_visible(
+        const char * __restrict__ parent_ids,
+        int64_t parent_nb0,
+        int64_t parent_nb1,
+        int32_t tree_seq,
+        int32_t query_node,
+        int32_t candidate,
+        int32_t tree_size) {
+    if (candidate < 0 || candidate >= tree_size ||
+        query_node < 0 || query_node >= tree_size) {
+        return false;
+    }
+
+    bool visible = false;
+    int32_t current = query_node;
+    for (int32_t depth = 0; depth < tree_size; ++depth) {
+        if (current == candidate) {
+            visible = true;
+        }
+        if (current < 0 || current >= tree_size) {
+            return false;
+        }
+        const int32_t parent = *(const int32_t *) (
+            parent_ids + (int64_t) current * parent_nb0 +
+            (int64_t) tree_seq * parent_nb1);
+        if (parent == -1) {
+            return visible;
+        }
+        if (parent < 0 || parent >= current) {
+            return false;
+        }
+        current = parent;
+    }
+    return false;
 }
 
 // All scores are computed in the log2 domain: log2(e) is folded into the same
@@ -180,6 +222,8 @@ static __global__ void paged_attn_decode(
         const char    * __restrict__ kv_seq_lens,
         const char    * __restrict__ active_slot_ids,
         const char    * __restrict__ query_positions,
+        const char    * __restrict__ parent_ids,
+        const char    * __restrict__ tree_sizes,
         char          * __restrict__ dst,
         half          * __restrict__ partial_acc,
         float2        * __restrict__ partial_meta,
@@ -189,6 +233,7 @@ static __global__ void paged_attn_decode(
         int64_t bt_nb0,  int64_t bt_nb1,
         int64_t ksl_nb0,
         int64_t asi_nb0, int64_t qpos_nb0,
+        int64_t parent_nb0, int64_t parent_nb1, int64_t tree_size_nb0,
         int64_t dst_nb1, int64_t dst_nb2,
         int32_t n_table_seq,
         int32_t n_head,
@@ -197,6 +242,10 @@ static __global__ void paged_attn_decode(
         int32_t max_blocks,
         int32_t block_size,
         int32_t min_partitions,
+        int32_t tree_width,
+        int32_t tree_row_offset,
+        int32_t tree_scratch_base,
+        int32_t tree_scratch_stride,
         float scale) {
     constexpr int nthreads = WARP_SIZE;
     constexpr int values_per_load = 4;
@@ -222,29 +271,40 @@ static __global__ void paged_attn_decode(
     const int n_seq        = gridDim.y;
     const int n_partitions = gridDim.z;
 
+    const bool tree_mode = parent_ids != nullptr;
     const int32_t physical_seq_raw = active_slot_ids
         ? *(const int32_t *) (active_slot_ids + (int64_t) seq * asi_nb0)
         : seq;
     const int32_t query_pos = query_positions
         ? *(const int32_t *) (query_positions + (int64_t) seq * qpos_nb0)
         : -1;
+    const bool tree_query = tree_mode && seq >= tree_row_offset;
+    const int32_t tree_seq = tree_query
+        ? (seq - tree_row_offset) / tree_width : 0;
+    const int32_t query_node = tree_query
+        ? seq - tree_row_offset - tree_seq * tree_width : -1;
+    const int32_t tree_size = tree_query
+        ? *(const int32_t *) (
+            tree_sizes + (int64_t) tree_seq * tree_size_nb0)
+        : 0;
     // A row is live when its slot id selects a real block-table column and,
-    // for ragged batches, its causal position is non-negative. Dead rows are
-    // pinned to column 0 with kv_seq_len forced to 0, which routes every
-    // partition through the existing zero-output early path; the block table
-    // is then never read for them.
+    // for ragged batches, its causal position is non-negative. Tree padding
+    // rows are validated by tree_sizes. Dead rows are pinned to column 0 with
+    // an empty virtual context, so the block table and scratch are never read.
     const bool valid_query =
         physical_seq_raw >= 0 && physical_seq_raw < n_table_seq &&
-        (!query_positions || query_pos >= 0);
+        (!query_positions || tree_query || query_pos >= 0) &&
+        (!tree_query ||
+         (tree_size >= 0 && tree_size <= tree_width &&
+          query_node < tree_size));
     const int32_t physical_seq = valid_query ? physical_seq_raw : 0;
     int32_t kv_seq_len_raw = valid_query
         ? *(const int32_t *) (kv_seq_lens +
                               (int64_t) physical_seq * ksl_nb0)
         : 0;
-    // The inclusive clamp IS the causal mask: this row attends tokens
-    // [0, pos] only, and every downstream bound (partition count, token loop
-    // extents) already derives from kv_seq_len.
-    if (query_positions && query_pos < kv_seq_len_raw) {
+    // The inclusive clamp IS the causal mask for non-tree ragged rows. Tree
+    // rows always read the whole committed prefix carried by kv_seq_lens.
+    if (query_positions && !tree_query && query_pos < kv_seq_len_raw) {
         kv_seq_len_raw = query_pos + 1;
     }
     const int64_t table_capacity =
@@ -254,8 +314,14 @@ static __global__ void paged_attn_decode(
         : (kv_seq_len_raw < table_capacity
             ? kv_seq_len_raw
             : (int32_t) table_capacity);
+    // Treat the candidate slab as a virtual tail of tree_width tokens. The
+    // normal partition split then covers prefix and tree candidates in one
+    // stable softmax; invisible siblings/padding resolve to no physical row.
+    const int64_t virtual_tokens = valid_query
+        ? (int64_t) kv_seq_len + (tree_query ? tree_width : 0)
+        : 0;
     const int32_t n_logical_blocks =
-        (kv_seq_len + block_size - 1) / block_size;
+        paged_attn_ceil_div(virtual_tokens, block_size);
     const int32_t active_partitions =
         paged_attn_partitions(n_logical_blocks, min_partitions, n_partitions);
 
@@ -289,7 +355,7 @@ static __global__ void paged_attn_decode(
     const int32_t token_begin = logical_block_begin * block_size;
     const int32_t token_end_blocks = logical_block_end * block_size;
     const int32_t token_end =
-        kv_seq_len < token_end_blocks ? kv_seq_len : token_end_blocks;
+        virtual_tokens < token_end_blocks ? virtual_tokens : token_end_blocks;
 
     constexpr bool quantize_q = type_K != GGML_TYPE_F16;
     constexpr int q_registers   = (D / 2) / nthreads;
@@ -363,7 +429,12 @@ static __global__ void paged_attn_decode(
         qk_sum[h] = 0.0f;
     }
 
-    const int32_t n_physical_blocks = pool_tokens / block_size;
+    // In tree mode the committed block table may address only the prefix
+    // pool before tree_scratch_base. Candidate rows are addressed directly
+    // below, keeping uncommitted nodes out of every sequence block table.
+    const int32_t prefix_pool_tokens =
+        tree_mode ? tree_scratch_base : pool_tokens;
+    const int32_t n_physical_blocks = prefix_pool_tokens / block_size;
 
     for (int32_t tile_begin = token_begin;
          tile_begin < token_end;
@@ -380,7 +451,7 @@ static __global__ void paged_attn_decode(
         // read; their tokens contribute nothing, mirroring the CPU reference.
         int32_t phys_mine = -1;
         const int32_t my_token = tile_begin + lane;
-        if (my_token < token_end) {
+        if (my_token < token_end && my_token < kv_seq_len) {
             const int32_t logical_block = my_token / block_size;
             const int32_t physical_block =
                 *(const int32_t *) (block_table +
@@ -389,6 +460,19 @@ static __global__ void paged_attn_decode(
             if (physical_block >= 0 && physical_block < n_physical_blocks) {
                 phys_mine =
                     physical_block * block_size + my_token % block_size;
+            }
+        } else if (tree_query && my_token < token_end) {
+            const int32_t candidate = my_token - kv_seq_len;
+            if (paged_attn_tree_visible(
+                    parent_ids, parent_nb0, parent_nb1,
+                    tree_seq, query_node, candidate, tree_size)) {
+                const int64_t physical =
+                    (int64_t) tree_scratch_base +
+                    (int64_t) physical_seq * tree_scratch_stride +
+                    candidate;
+                if (physical >= 0 && physical < pool_tokens) {
+                    phys_mine = (int32_t) physical;
+                }
             }
         }
 
@@ -619,6 +703,8 @@ bool ggml_cuda_paged_attn_supported(const ggml_tensor * dst) {
     const ggml_tensor * kv_seq_lens   = dst->src[4];
     const ggml_tensor * active_slot_ids = dst->src[5];
     const ggml_tensor * query_positions = dst->src[6];
+    const ggml_tensor * parent_ids      = dst->src[7];
+    const ggml_tensor * tree_sizes      = dst->src[8];
 
     if (!q || !k || !v || !block_table || !kv_seq_lens) {
         return false;
@@ -626,6 +712,11 @@ bool ggml_cuda_paged_attn_supported(const ggml_tensor * dst) {
 
     // Ragged causal positions require the explicit row -> column mapping.
     if (query_positions && !active_slot_ids) {
+        return false;
+    }
+    const bool tree_mode = parent_ids || tree_sizes;
+    if ((parent_ids == nullptr) != (tree_sizes == nullptr) ||
+        (tree_mode && !active_slot_ids)) {
         return false;
     }
 
@@ -636,7 +727,9 @@ bool ggml_cuda_paged_attn_supported(const ggml_tensor * dst) {
         block_table->type != GGML_TYPE_I32 ||
         kv_seq_lens->type != GGML_TYPE_I32 ||
         (active_slot_ids && active_slot_ids->type != GGML_TYPE_I32) ||
-        (query_positions && query_positions->type != GGML_TYPE_I32)) {
+        (query_positions && query_positions->type != GGML_TYPE_I32) ||
+        (parent_ids && parent_ids->type != GGML_TYPE_I32) ||
+        (tree_sizes && tree_sizes->type != GGML_TYPE_I32)) {
         return false;
     }
 
@@ -647,6 +740,8 @@ bool ggml_cuda_paged_attn_supported(const ggml_tensor * dst) {
         kv_seq_lens->nb[0] != sizeof(int32_t) ||
         (active_slot_ids && active_slot_ids->nb[0] != sizeof(int32_t)) ||
         (query_positions && query_positions->nb[0] != sizeof(int32_t)) ||
+        (parent_ids && parent_ids->nb[0] != sizeof(int32_t)) ||
+        (tree_sizes && tree_sizes->nb[0] != sizeof(int32_t)) ||
         dst->nb[0] != sizeof(float)) {
         return false;
     }
@@ -701,10 +796,49 @@ bool ggml_cuda_paged_attn_supported(const ggml_tensor * dst) {
 
     const int32_t block_size = ggml_get_op_params_i32(dst, 1);
     const int32_t max_kv_seq_len = ggml_get_op_params_i32(dst, 2);
-    return block_size > 0 &&
-           max_kv_seq_len > 0 &&
-           max_kv_seq_len <= k->ne[1] &&
-           k->ne[1] % block_size == 0;
+    const int32_t tree_width = ggml_get_op_params_i32(dst, 3);
+    const int32_t tree_scratch_base = ggml_get_op_params_i32(dst, 4);
+    const int32_t tree_scratch_stride = ggml_get_op_params_i32(dst, 5);
+    if (block_size <= 0 ||
+        max_kv_seq_len <= 0 ||
+        (int64_t) max_kv_seq_len + tree_width > INT32_MAX ||
+        k->ne[1] % block_size != 0) {
+        return false;
+    }
+
+    if (!tree_mode) {
+        return tree_width == 0 &&
+               tree_scratch_base == 0 &&
+               tree_scratch_stride == 0;
+    }
+
+    if (tree_width <= 0 ||
+        tree_scratch_base <= 0 ||
+        tree_scratch_base % block_size != 0 ||
+        tree_scratch_stride < tree_width ||
+        !ggml_is_contiguous(parent_ids) ||
+        !ggml_is_contiguous(tree_sizes) ||
+        parent_ids->ne[0] != tree_width ||
+        parent_ids->ne[1] <= 0 ||
+        parent_ids->ne[1] != tree_sizes->ne[0] ||
+        parent_ids->ne[2] != 1 ||
+        parent_ids->ne[3] != 1 ||
+        tree_sizes->ne[1] != 1 ||
+        tree_sizes->ne[2] != 1 ||
+        tree_sizes->ne[3] != 1 ||
+        parent_ids->ne[1] > INT64_MAX / tree_width ||
+        q->ne[1] < parent_ids->ne[1] * tree_width ||
+        (!query_positions &&
+         q->ne[1] != parent_ids->ne[1] * tree_width) ||
+        (int64_t) max_kv_seq_len + tree_width > INT32_MAX) {
+        return false;
+    }
+
+    const int64_t scratch_end =
+        (int64_t) tree_scratch_base +
+        (block_table->ne[1] - 1) * (int64_t) tree_scratch_stride +
+        tree_width;
+    return scratch_end <= k->ne[1];
 }
 
 // Cached max resident blocks/SM for this instantiation at the given block
@@ -764,6 +898,12 @@ static bool try_launch_paged_attn(
     const ggml_tensor * kv_seq_lens = dst->src[4];
     const ggml_tensor * active_slot_ids = dst->src[5];
     const ggml_tensor * query_positions = dst->src[6];
+    const ggml_tensor * parent_ids      = dst->src[7];
+    const ggml_tensor * tree_sizes      = dst->src[8];
+
+    const int32_t tree_width = ggml_get_op_params_i32(dst, 3);
+    const int32_t tree_scratch_base = ggml_get_op_params_i32(dst, 4);
+    const int32_t tree_scratch_stride = ggml_get_op_params_i32(dst, 5);
 
     const int32_t n_head    = (int32_t) q->ne[2];
     const int32_t n_head_kv = (int32_t) k->ne[2];
@@ -837,15 +977,20 @@ static bool try_launch_paged_attn(
     if (min_partitions > partition_limit) {
         min_partitions = partition_limit;
     }
-    if (min_partitions > block_table->ne[0]) {
-        min_partitions = (int32_t) block_table->ne[0];
+    const int32_t tree_blocks = paged_attn_ceil_div(tree_width, block_size);
+    const int64_t partitionable_blocks =
+        block_table->ne[0] + (parent_ids ? tree_blocks : 0);
+    if (min_partitions > partitionable_blocks) {
+        min_partitions = (int32_t) partitionable_blocks;
     }
 
-    // Size the launch from the live maximum sequence length carried in the
-    // graph op, not the block-table capacity. Ragged sequences still clamp
-    // their own active partition count from kv_seq_lens on device.
+    // Size the launch from the live maximum committed prefix plus the virtual
+    // tree tail. Ragged/tree rows still clamp their own active partition count
+    // from device metadata.
+    const int64_t live_tokens =
+        (int64_t) max_kv_seq_len + (parent_ids ? tree_width : 0);
     const int32_t live_blocks =
-        (max_kv_seq_len + block_size - 1) / block_size;
+        paged_attn_ceil_div(live_tokens, block_size);
     int32_t n_partitions = paged_attn_partitions(
         live_blocks, min_partitions, PAGED_ATTN_MAX_PARTITIONS);
 
@@ -861,7 +1006,7 @@ static bool try_launch_paged_attn(
     }();
     if (forced_partitions >= 1 &&
         forced_partitions <= PAGED_ATTN_MAX_PARTITIONS &&
-        forced_partitions <= block_table->ne[0]) {
+        forced_partitions <= partitionable_blocks) {
         min_partitions = forced_partitions;
         n_partitions = forced_partitions;
     }
@@ -914,6 +1059,8 @@ static bool try_launch_paged_attn(
         (const char *) kv_seq_lens->data,
         active_slot_ids ? (const char *) active_slot_ids->data : nullptr,
         query_positions ? (const char *) query_positions->data : nullptr,
+        parent_ids ? (const char *) parent_ids->data : nullptr,
+        tree_sizes ? (const char *) tree_sizes->data : nullptr,
         (char *) dst->data,
         partial_acc,
         partial_meta,
@@ -924,6 +1071,9 @@ static bool try_launch_paged_attn(
         kv_seq_lens->nb[0],
         active_slot_ids ? active_slot_ids->nb[0] : 0,
         query_positions ? query_positions->nb[0] : 0,
+        parent_ids ? parent_ids->nb[0] : 0,
+        parent_ids ? parent_ids->nb[1] : 0,
+        tree_sizes ? tree_sizes->nb[0] : 0,
         dst->nb[1], dst->nb[2],
         (int32_t) block_table->ne[1],
         n_head,
@@ -932,6 +1082,12 @@ static bool try_launch_paged_attn(
         (int32_t) block_table->ne[0],
         block_size,
         min_partitions,
+        tree_width,
+        parent_ids
+            ? (int32_t)(q->ne[1] - parent_ids->ne[1] * tree_width)
+            : 0,
+        tree_scratch_base,
+        tree_scratch_stride,
         scale);
 
     if (n_partitions > 1) {

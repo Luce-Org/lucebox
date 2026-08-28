@@ -617,6 +617,150 @@ static bool parse_complete_parameter_body(const std::string & body,
     return found_param && trim_ws(body.substr(cursor)).empty();
 }
 
+// ─── XML tool call parser (<function_call> / <tool_call> with tags) ────
+
+static bool parse_xml_tool_call_body(const std::string & body, const json & tools,
+                                     std::string & name, json & args, std::string & raw_args) {
+    std::string trimmed = trim_ws(body);
+    if (trimmed.empty() || trimmed.front() == '{' || trimmed.find('<') == std::string::npos) {
+        return false;
+    }
+
+    // Skip legacy Qwen function bodies (<function=...>, <function>, <function >)
+    if (trimmed.find("<function=") != std::string::npos ||
+        trimmed.find("<function>") != std::string::npos ||
+        trimmed.find("<function ") != std::string::npos) {
+        return false;
+    }
+
+    // 1. Look for function name in top-level XML envelope:
+    // a. <invoke name="...">...</invoke> or <invoke tool="...">...</invoke>
+    std::string param_section;
+    static const std::regex re_invoke_envelope(
+        R"(^\s*<invoke\s+(?:name|tool)\s*=\s*["']?([A-Za-z_][\w.\-]*)["']?\s*>([\s\S]*?)</invoke>\s*$)");
+    std::smatch m_inv;
+    if (std::regex_match(trimmed, m_inv, re_invoke_envelope)) {
+        name = m_inv[1].str();
+        param_section = m_inv[2].str();
+    } else {
+        // b. <invoke_name>NAME</invoke_name>, <tool_name>NAME</tool_name>, <function_name>NAME</function_name>, or leading <name>NAME</name>
+        static const std::regex re_tag_name(
+            R"(^\s*<(invoke_name|name|tool_name|function_name)>\s*([A-Za-z_][\w.\-]*)\s*</\1>([\s\S]*)$)");
+        std::smatch m_tag;
+        if (std::regex_match(trimmed, m_tag, re_tag_name)) {
+            name = m_tag[2].str();
+            param_section = m_tag[3].str();
+        }
+    }
+
+    if (name.empty() || !tool_allowed(tools, name)) {
+        return false;
+    }
+
+    const json props = find_tool_properties(tools, name);
+    args = json::object();
+
+    // 2. Look for parameters section in <parameters>...</parameters> or <arguments>...</arguments>
+    static const std::regex re_section(R"(^\s*<(parameters|arguments)>([\s\S]*?)</\1>\s*$)");
+    std::smatch m_sec;
+    std::string trimmed_params_sec = trim_ws(param_section);
+    if (std::regex_match(trimmed_params_sec, m_sec, re_section)) {
+        param_section = m_sec[2].str();
+    }
+
+    std::string trimmed_params = trim_ws(param_section);
+    if (trimmed_params.empty()) {
+        // Genuinely zero-argument call
+        raw_args = "{}";
+        return true;
+    }
+
+    // Check if param_section is a JSON object
+    if (trimmed_params.front() == '{') {
+        json j = json::parse(trimmed_params, nullptr, false);
+        if (!j.is_discarded() && j.is_object()) {
+            for (auto & [k, v] : j.items()) {
+                if (v.is_string()) {
+                    args[k] = convert_param_value(v.get<std::string>(), k, props);
+                } else {
+                    args[k] = v;
+                }
+            }
+            raw_args = args.dump();
+            return true;
+        }
+        return false;
+    }
+
+    // 3. Extract parameter key-value pairs:
+    // a. Attribute style: <(param|parameter) name="key">value</...> or <parameter=key>value</parameter>
+    static const std::regex re_attr_param(
+        R"(<(?:param|parameter)\s+name\s*=\s*["']?([A-Za-z_][\w.\-]*)["']?\s*>([\s\S]*?)</(?:param|parameter)>|<parameter=([A-Za-z_][\w.\-]*)>([\s\S]*?)</parameter>)");
+    auto pbegin = std::sregex_iterator(trimmed_params.begin(), trimmed_params.end(), re_attr_param);
+    auto pend = std::sregex_iterator();
+    if (pbegin != pend) {
+        size_t cursor = 0;
+        bool valid = true;
+        for (auto it = pbegin; it != pend; ++it) {
+            size_t pos = it->position();
+            if (!trim_ws(trimmed_params.substr(cursor, pos - cursor)).empty()) {
+                valid = false;
+                break;
+            }
+            std::string k = (*it)[1].matched ? (*it)[1].str() : (*it)[3].str();
+            if (args.contains(k)) {
+                valid = false;
+                break;
+            }
+            std::string v = trim_ws((*it)[2].matched ? (*it)[2].str() : (*it)[4].str());
+            args[k] = convert_param_value(v, k, props);
+            cursor = pos + it->length();
+        }
+        if (valid && trim_ws(trimmed_params.substr(cursor)).empty()) {
+            raw_args = args.dump();
+            return true;
+        }
+        return false;
+    }
+
+    // b. Element tag style: <key>value</key>
+    static const std::regex re_elem_param(R"(<([A-Za-z_][\w.\-]*)>([\s\S]*?)</\1>)");
+    auto ebegin = std::sregex_iterator(trimmed_params.begin(), trimmed_params.end(), re_elem_param);
+    auto eend = std::sregex_iterator();
+    if (ebegin != eend) {
+        size_t cursor = 0;
+        bool valid = true;
+        for (auto it = ebegin; it != eend; ++it) {
+            size_t pos = it->position();
+            if (!trim_ws(trimmed_params.substr(cursor, pos - cursor)).empty()) {
+                valid = false;
+                break;
+            }
+            std::string tag = (*it)[1].str();
+            if (tag == "invoke_name" || tag == "name" || tag == "tool_name" ||
+                tag == "function_name" || tag == "parameters" || tag == "arguments" ||
+                tag == "function_call" || tag == "tool_call" || tag == "invoke") {
+                valid = false;
+                break;
+            }
+            if (args.contains(tag)) {
+                valid = false;
+                break;
+            }
+            std::string v = trim_ws((*it)[2].str());
+            args[tag] = convert_param_value(v, tag, props);
+            cursor = pos + it->length();
+        }
+        if (valid && trim_ws(trimmed_params.substr(cursor)).empty() && !args.empty()) {
+            raw_args = args.dump();
+            return true;
+        }
+        return false;
+    }
+
+    return false;
+}
+
 // ─── JSON tool call parser ──────────────────────────────────────────────
 
 static bool parse_arg_string_or_obj(const json & val, json & out_args,
@@ -967,6 +1111,23 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
             const size_t close = text.find("</tool_call>", body_start);
             if (close == std::string::npos) break;
             const std::string body = text.substr(body_start, close - body_start);
+            const bool is_legacy_qwen =
+                body.find("<function=") != std::string::npos ||
+                body.find("<function>") != std::string::npos ||
+                body.find("<function ") != std::string::npos;
+            if (is_legacy_qwen) {
+                pos = close + 12;
+                continue;
+            }
+            std::string xml_name;
+            json xml_args;
+            std::string xml_raw;
+            if (parse_xml_tool_call_body(body, tools, xml_name, xml_args, xml_raw)) {
+                add_call(xml_name, xml_args, pos, close + 12, xml_raw);
+                pos = close + 12;
+                continue;
+            }
+
             const size_t first_key = body.find("<arg_key>");
             // Only claim bodies in the Laguna shape: bare name then arg tags
             // (or a bare name alone for zero-arg calls); leave <function=...>
@@ -974,7 +1135,7 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
             // Laguna bodies are `NAME<arg_key>...` (values may contain JSON —
             // the template serializes non-string args via tojson). Only leave
             // <function=...> and pure-JSON bodies to the Qwen patterns.
-            if (body.find("<function") == std::string::npos &&
+            if (!is_legacy_qwen &&
                 (first_key != std::string::npos ||
                  body.find('{') == std::string::npos)) {
                 std::string name = trim_ws(
@@ -1269,6 +1430,8 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
             json args;
             std::string raw_args;
             if (!obj.is_discarded() && parse_json_tool_call(obj, name, args, raw_args)) {
+                add_call(name, args, pos, pos + it->length(), raw_args);
+            } else if (parse_xml_tool_call_body(inner, tools, name, args, raw_args)) {
                 add_call(name, args, pos, pos + it->length(), raw_args);
             } else if (extract_raw_json_tool_fallback(inner, name, raw_args)) {
                 add_call(name, json::object(), pos, pos + it->length(), raw_args);

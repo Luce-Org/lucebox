@@ -139,6 +139,13 @@ public:
                               uint32_t token_count,
                               bool only_first_last_slots = false);
 
+    // Reverse the most recent `token_count` appended rows. Pages made
+    // invisible by the rewind stay owned as private reservations, so the
+    // same append receives the same physical rows on retry. On failure the
+    // sequence is unchanged.
+    PagedKvStatus rollback_append(PagedKvSequenceHandle handle,
+                                  uint32_t token_count);
+
     // Return the sequence's blocks and slot to the pool; the handle (and
     // any copy of it) becomes stale.
     PagedKvStatus release(PagedKvSequenceHandle handle);
@@ -164,6 +171,10 @@ private:
         uint32_t kv_seq_len = 0;
         bool active = false;
         std::vector<uint32_t> block_table;
+        // LIFO stack of blocks removed by rollback_append(). Blocks are pushed
+        // in reverse logical order, so append() pops the original allocation
+        // order and reproduces the same physical rows on retry.
+        std::vector<uint32_t> retry_blocks;
         // Min-heap of blocks promised to this sequence but not yet made
         // visible by append(). Reserved blocks are excluded from the global
         // free list and returned by release()/reset().

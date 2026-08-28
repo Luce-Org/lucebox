@@ -2515,6 +2515,7 @@ extern "C" {
     // prefill chunks can attend the paged pool causally. A negative position
     // marks a padding row. NULL keeps the decode semantics (full cached
     // length per row).
+    //
     GGML_API struct ggml_tensor * ggml_paged_attn_ext(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,
@@ -2527,6 +2528,39 @@ extern "C" {
             float                 scale,
             int                   block_size,
             int                   max_kv_seq_len);
+
+    // Packed tree verification over the same paged K/V pool.
+    // In a pure-tree batch, queries are flattened sequence-major and tree
+    // sequence s occupies rows [s*tree_width, (s+1)*tree_width). In a mixed
+    // AR/tree batch, the compact AR rows come first. Tree sequence s starts at
+    // ar_rows + s*tree_width, where
+    // ar_rows = q_rows - n_tree_seq*tree_width. parent_ids is tree-local,
+    // contiguous I32 [tree_width, n_tree_seq] (root parent -1), and tree_sizes
+    // is contiguous I32 [n_tree_seq]. active_slot_ids is required per query row;
+    // it selects the physical block-table column and scratch slab. Each live
+    // query attends its complete committed prefix from the block table plus
+    // its own candidate node and ancestors from physical K/V rows
+    // tree_scratch_base + slot*tree_scratch_stride + node. Siblings and rows
+    // at or beyond tree_sizes[s] are excluded. query_positions may describe
+    // compact autoregressive rows in a mixed AR/tree batch; tree rows ignore
+    // it and read the full committed prefix. Pure tree batches pass NULL.
+    // tree_width is derived from parent_ids.
+    GGML_API struct ggml_tensor * ggml_paged_attn_ext_tree(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * block_table,
+            struct ggml_tensor  * kv_seq_lens,
+            struct ggml_tensor  * active_slot_ids,
+            struct ggml_tensor  * query_positions,
+            float                 scale,
+            int                   block_size,
+            int                   max_kv_seq_len,
+            struct ggml_tensor  * parent_ids,
+            struct ggml_tensor  * tree_sizes,
+            int                   tree_scratch_base,
+            int                   tree_scratch_stride);
 
     // TurboQuant FWHT rotation. direction: 0 = forward, 1 = inverse.
     // Applies signs1 -> FWHT -> signs2 (forward) or signs2 -> FWHT -> signs1 (inverse).
@@ -2763,6 +2797,37 @@ extern "C" {
             struct ggml_tensor  * c,
             struct ggml_tensor  * parent_ids);
 
+    // dflash extension: fused causal-conv step for recurrent decode/verify.
+    // Replaces transpose + concat(state, x) + ssm_conv + silu + state
+    // write-back with one kernel.
+    //   x:              [C, T, S] f32, rows contiguous (token stride may be
+    //                   larger than C, e.g. a row-slice of a stacked GEMV)
+    //   c:              [K, C]    f32 depthwise conv weights
+    //   conv_state:     [K-1, C, S] f32 history; READ, then OVERWRITTEN in
+    //                   place with the last K-1 conv inputs
+    //   conv_input_out: optional [>= K-1+T, C, S] f32; receives the full
+    //                   conv window (history rows then x rows) per channel,
+    //                   for speculative-decode rollback. May be a view.
+    // Returns silu(conv(x)) as [C, T, S]. CUDA/HIP only.
+    GGML_API struct ggml_tensor * ggml_ssm_conv_step(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * c,
+            struct ggml_tensor  * conv_state,
+            struct ggml_tensor  * conv_input_out);
+
+    // dflash2 grouped dynamic block conv (draft graph), one fused node for
+    //   out[c,l] = sum_k (dyn[(site*K+k)*G + c/gs, l] + base[c, site*K+k]) * x[c, l-k]
+    // x [C, T] f32 contiguous, base [C, >= (site+1)*K] f32, dyn [>= 2K*G, T]
+    // f32 contiguous; x is zero-padded below l < k. CUDA/HIP only.
+    GGML_API struct ggml_tensor * ggml_dflash_dyn_conv(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * base,
+            struct ggml_tensor  * dyn,
+            int                   site,
+            int                   kernel,
+            int                   group_size);
     // SpecLA heavy-light convolution. Applies compact accepted inputs to the
     // durable conv state, then verifies the current tree without committing
     // speculative inputs. Current input factors are written directly to the
@@ -2928,6 +2993,27 @@ extern "C" {
     GGML_API void ggml_gated_delta_net_set_skip_intermediate(
             struct ggml_tensor * tensor,
             bool                 skip_intermediate);
+
+    // CUDA/HIP fixed-chain replay log in compact F32 [J,H,T,B] layout:
+    // scalar gate J=2*S_v+1 stores [g | k | delta], while KDA J=3*S_v
+    // stores [g[S_v] | k | delta]. Delta is captured after the
+    // state-dependent reduction. The returned tensor owns a compact copy so
+    // graph allocation can release the much larger GDN result after capture.
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_capture_replay_log(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * tensor);
+
+    // dflash extension: let the kernel derive the gates from the raw
+    // projections instead of graph-side sigmoid/softplus ops:
+    //   beta_val = sigmoid(beta_raw)
+    //   g_val    = exp(softplus(alpha_raw + dt_bias[h]) * A[h])
+    // `g` then carries alpha_raw and `beta` carries beta_raw (both [1,H,T,S]);
+    // gate_ba is a contiguous f32 [2*H] tensor holding [dt_bias | A]
+    // (src[9], op_params[10] = 1). Only for the non-tree, non-KDA,
+    // non-SpecLA CUDA/HIP path.
+    GGML_API void ggml_gated_delta_net_set_raw_gates(
+            struct ggml_tensor * tensor,
+            struct ggml_tensor * gate_ba);
 
     // dflash extension: tree-mode gated delta net for DDTree-style
     // speculative decoding verify. `parent_ids` is an int32 tensor of shape

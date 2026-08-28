@@ -48,6 +48,52 @@ constexpr size_t CONV_WEIGHT_ELEMS = static_cast<size_t>(D_CONV) * CONV_CHANNELS
 bool check(const char * name, const float * batched, const float * reference,
            size_t count);
 
+bool test_cpu_gdn_support_matrix(ggml_backend_t backend) {
+    ggml_init_params params{};
+    params.mem_size = 2 * 1024 * 1024;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) return false;
+
+    constexpr int n_tokens = 2;
+    ggml_tensor * q = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, S_V, N_HEAD, n_tokens, 1);
+    ggml_tensor * k = ggml_dup_tensor(ctx, q);
+    ggml_tensor * v = ggml_dup_tensor(ctx, q);
+    ggml_tensor * g = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, 1, N_HEAD, n_tokens, 1);
+    ggml_tensor * beta = ggml_dup_tensor(ctx, g);
+    ggml_tensor * state = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, S_V, S_V, N_HEAD, 1);
+    ggml_tensor * parents = ggml_new_tensor_1d(
+        ctx, GGML_TYPE_I32, n_tokens);
+    ggml_tensor * persistent = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, S_V, S_V, N_HEAD, n_tokens);
+    ggml_tensor * active_slots = ggml_new_tensor_1d(
+        ctx, GGML_TYPE_I32, 1);
+
+    ggml_tensor * base = ggml_gated_delta_net(
+        ctx, q, k, v, g, beta, state);
+    ggml_tensor * inplace = ggml_gated_delta_net_inplace(
+        ctx, q, k, v, g, beta, state);
+    ggml_tensor * active = ggml_gated_delta_net_active_inplace(
+        ctx, q, k, v, g, beta, state, active_slots);
+    ggml_tensor * tree = ggml_gated_delta_net_tree(
+        ctx, q, k, v, g, beta, state, parents);
+    ggml_tensor * tree_persistent = ggml_gated_delta_net_tree_persist(
+        ctx, q, k, v, g, beta, state, parents, persistent);
+
+    const bool ok =
+        ggml_backend_supports_op(backend, base) &&
+        ggml_backend_supports_op(backend, inplace) &&
+        ggml_backend_supports_op(backend, active) &&
+        !ggml_backend_supports_op(backend, tree) &&
+        !ggml_backend_supports_op(backend, tree_persistent);
+    std::printf("batched gdn CPU support matrix %s\n", ok ? "PASS" : "FAIL");
+    ggml_free(ctx);
+    return ok;
+}
+
 void fill_uniform(std::mt19937 & rng, float lo, float hi,
                   std::vector<float> & values) {
     std::uniform_real_distribution<float> dist(lo, hi);
@@ -208,6 +254,73 @@ bool run_conv(ggml_backend_t backend, int n_seqs,
         }
     }
     ggml_gallocr_free(allocator);
+    ggml_free(ctx);
+    return ok;
+}
+
+bool test_cpu_rejects_gpu_only_extensions(ggml_backend_t backend) {
+    ggml_init_params params{};
+    params.mem_size = 2 * 1024 * 1024;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) return false;
+
+    ggml_tensor * sx = ggml_new_tensor_3d(
+        ctx, GGML_TYPE_F32, D_CONV, CONV_CHANNELS, 1);
+    ggml_tensor * conv_w = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F32, D_CONV, CONV_CHANNELS);
+    ggml_tensor * plain_conv = ggml_ssm_conv(ctx, sx, conv_w);
+
+    ggml_tensor * step_x = ggml_new_tensor_3d(
+        ctx, GGML_TYPE_F32, CONV_CHANNELS, 1, 1);
+    ggml_tensor * step_state = ggml_new_tensor_3d(
+        ctx, GGML_TYPE_F32, D_CONV - 1, CONV_CHANNELS, 1);
+    ggml_tensor * fused_step = ggml_ssm_conv_step(
+        ctx, step_x, conv_w, step_state, nullptr);
+
+    constexpr int DYN_HIDDEN = 32;
+    constexpr int DYN_GROUP = 16;
+    constexpr int DYN_TOKENS = 2;
+    ggml_tensor * dyn_x = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F32, DYN_HIDDEN, DYN_TOKENS);
+    ggml_tensor * dyn_base = ggml_new_tensor_3d(
+        ctx, GGML_TYPE_F32, DYN_HIDDEN, D_CONV, 2);
+    ggml_tensor * dyn_weights = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F32,
+        2 * D_CONV * (DYN_HIDDEN / DYN_GROUP), DYN_TOKENS);
+    ggml_tensor * fused_dyn = ggml_dflash_dyn_conv(
+        ctx, dyn_x, dyn_base, dyn_weights, 0, D_CONV, DYN_GROUP);
+
+    ggml_tensor * q = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, S_V, N_HEAD, 1, 1);
+    ggml_tensor * k = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, S_V, N_HEAD, 1, 1);
+    ggml_tensor * v = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, S_V, N_HEAD, 1, 1);
+    ggml_tensor * g = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, 1, N_HEAD, 1, 1);
+    ggml_tensor * beta = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, 1, N_HEAD, 1, 1);
+    ggml_tensor * state = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, S_V, S_V, N_HEAD, 1);
+    ggml_tensor * plain_gdn = ggml_gated_delta_net(
+        ctx, q, k, v, g, beta, state);
+    const bool plain_gdn_supported =
+        ggml_backend_supports_op(backend, plain_gdn);
+    ggml_tensor * raw_gdn = ggml_gated_delta_net(
+        ctx, q, k, v, g, beta, state);
+    ggml_tensor * gate_ba = ggml_new_tensor_1d(
+        ctx, GGML_TYPE_F32, 2 * N_HEAD);
+    ggml_gated_delta_net_set_raw_gates(raw_gdn, gate_ba);
+
+    const bool ok =
+        ggml_backend_supports_op(backend, plain_conv) &&
+        !ggml_backend_supports_op(backend, fused_step) &&
+        !ggml_backend_supports_op(backend, fused_dyn) &&
+        plain_gdn_supported &&
+        !ggml_backend_supports_op(backend, raw_gdn);
+    std::printf("batched gdn CPU capability guards       %s\n",
+                ok ? "PASS" : "FAIL");
     ggml_free(ctx);
     return ok;
 }
@@ -525,11 +638,15 @@ int main(int argc, char ** argv) {
     }
 
     std::mt19937 rng(20260728);
-    bool ok = test_gdn_sequential(backend, rng, /*inplace_batched=*/false);
+    bool ok = !cpu || test_cpu_gdn_support_matrix(backend);
+    ok = test_gdn_sequential(backend, rng, /*inplace_batched=*/false) && ok;
     ok = test_gdn_sequential(backend, rng, /*inplace_batched=*/true) && ok;
     ok = test_gdn_active_slots(backend, rng) && ok;
     ok = test_conv(backend, rng) && ok;
     ok = test_masked_set_rows(backend) && ok;
+    if (cpu) {
+        ok = test_cpu_rejects_gpu_only_extensions(backend) && ok;
+    }
 
     ggml_backend_free(backend);
     return ok ? 0 : 1;

@@ -68,7 +68,12 @@ DeltaNetChunkedResult build_delta_net_chunked(
     g = ggml_permute(ctx0, g, 0, 2, 1, 3);
     b = ggml_permute(ctx0, b, 0, 2, 1, 3);
 
-    const int CS = kda ? 16 : 64; // chunk size
+    // Chunk size. Upstream uses 64, but the [CS, CS] triangular solve with
+    // k = CS only takes ggml-cuda's fast warp kernel for k <= 32; at CS = 64
+    // it falls into cublasStrsmBatched, which on ROCm host-loops per batch
+    // (measured ~365 ms per solve node on gfx1201, 35 s per 512-token
+    // prefill). CS = 32 keeps every op on the fast path.
+    const int CS = kda ? 16 : 32; // chunk size
 
     const int pad = (CS - n_tokens % CS) % CS;
     const int n_chunks = (int)((n_tokens + pad) / CS);
@@ -193,11 +198,17 @@ DeltaNetChunkedResult build_delta_net_chunked(
     ggml_tensor * v_t = ggml_cont(ctx0, ggml_transpose(ctx0, v));
 
     for (int64_t chunk = 0; chunk < n_chunks; chunk++) {
-        ggml_tensor * ch_k_cd    = get_slice_2d(ctx0, k_cd,    chunk);
+        // The chunk slices are strided views (chunk is dim 2 of 4D tensors),
+        // which pushes their matmuls into cublasGemmBatchedEx; on ROCm that
+        // API stages its device pointer arrays through per-call pinned host
+        // allocations (~1 ms of hipHostMalloc/hipFree/hipMemcpy per node,
+        // measured 13 s per 512-token prefill). ggml_cont restores dim-2/3
+        // contiguity so every matmul takes the strided-batched fast path.
+        ggml_tensor * ch_k_cd    = ggml_cont(ctx0, get_slice_2d(ctx0, k_cd,    chunk));
         ggml_tensor * ch_v_t     = get_slice_2d(ctx0, v_t,     chunk);
-        ggml_tensor * ch_kq      = get_slice_2d(ctx0, kq,      chunk);
-        ggml_tensor * ch_q_g_exp = get_slice_2d(ctx0, q_g_exp, chunk);
-        ggml_tensor * ch_kg_t    = get_slice_2d(ctx0, kg_t,    chunk);
+        ggml_tensor * ch_kq      = ggml_cont(ctx0, get_slice_2d(ctx0, kq,      chunk));
+        ggml_tensor * ch_q_g_exp = ggml_cont(ctx0, get_slice_2d(ctx0, q_g_exp, chunk));
+        ggml_tensor * ch_kg_t    = ggml_cont(ctx0, get_slice_2d(ctx0, kg_t,    chunk));
 
         ggml_tensor * v_t_p = ggml_mul_mat(ctx0, ch_k_cd, s);
 

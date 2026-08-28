@@ -82,6 +82,7 @@ gated_delta_net_cuda(const float * q,
                                      float *       state_out,
                                      const int *   parent_ids,    // TREE_MODE only; else ignored
                                      InterT *      persist_inter, // optional external buffer for per-token intermediates
+                                     float *       replay_log,
                                      int64_t       H,
                                      int64_t       n_tokens,
                                      int64_t       n_seqs,
@@ -97,7 +98,9 @@ gated_delta_net_cuda(const float * q,
                                      int64_t       sb3,
                                      const uint3   neqk1_magic,
                                      const uint3   rq3_magic,
-                                     float         scale) {
+                                     float         scale,
+                                     const float * gate_bias,   // raw-gate mode: dt_bias[H], else nullptr
+                                     const float * gate_A) {    // raw-gate mode: A[H]
     const uint32_t h_idx    = blockIdx.x;
     const uint32_t sequence = blockIdx.y;
     // each warp owns one column, using warp-level primitives to reduce across rows
@@ -211,7 +214,16 @@ gated_delta_net_cuda(const float * q,
         const float * beta_t = beta + gb_offset;
         const float * g_t    = g    + gb_offset * (KDA ? S_v : 1);
 
-        const float beta_val = *beta_t;
+        constexpr int replay_log_gate_values = KDA ? S_v : 1;
+        constexpr int replay_log_width = replay_log_gate_values + 2*S_v;
+        float * replay_log_t = replay_log
+            ? replay_log +
+                ((sequence * n_tokens + t) * H + h_idx) * replay_log_width
+            : nullptr;
+
+        // raw-gate mode: beta = sigmoid(beta_raw); g = softplus(alpha_raw + bias) * A
+        const bool  raw_gates = gate_bias != nullptr;
+        const float beta_val  = raw_gates ? 1.0f / (1.0f + expf(-(*beta_t))) : *beta_t;
 
         // Cache k and q in registers
         float k_reg[rows_per_lane];
@@ -223,8 +235,27 @@ gated_delta_net_cuda(const float * q,
             q_reg[r] = q_t[i];
         }
 
+        if (replay_log_t && blockIdx.z == 0 && threadIdx.y == 0) {
+#pragma unroll
+            for (int r = 0; r < rows_per_lane; ++r) {
+                const int i = r * warp_size + lane;
+                replay_log_t[replay_log_gate_values + i] = k_reg[r];
+                if constexpr (KDA) {
+                    replay_log_t[i] = expf(g_t[i]);
+                }
+            }
+        }
+
         if constexpr (!KDA) {
-            const float g_val = expf(*g_t);
+            float g_log = *g_t;
+            if (raw_gates) {
+                const float a = g_log + gate_bias[h_idx];
+                g_log = ((a > 20.0f) ? a : logf(1.0f + expf(a))) * gate_A[h_idx];
+            }
+            const float g_val = expf(g_log);
+            if (replay_log_t && lane == 0 && col == 0) {
+                replay_log_t[0] = g_val;
+            }
 
             // kv[col] = (S^T @ k)[col] = sum_i S[i][col] * k[i]
             float kv_shard = 0.0f;
@@ -236,6 +267,9 @@ gated_delta_net_cuda(const float * q,
 
             // delta[col] = (v[col] - g * kv[col]) * beta
             float delta_col = (v_t[col] - g_val * kv_col) * beta_val;
+            if (replay_log_t && lane == 0) {
+                replay_log_t[replay_log_gate_values + S_v + col] = delta_col;
+            }
 
             // fused: S[i][col] = g * S[i][col] + k[i] * delta[col]
             // attn[col] = (S^T @ q)[col] = sum_i S[i][col] * q[i]
@@ -264,6 +298,9 @@ gated_delta_net_cuda(const float * q,
 
             // delta[col] = (v[col] - kv[col]) * beta
             float delta_col = (v_t[col] - kv_col) * beta_val;
+            if (replay_log_t && lane == 0) {
+                replay_log_t[replay_log_gate_values + S_v + col] = delta_col;
+            }
 
             // fused: S[i][col] = g[i] * S[i][col] + k[i] * delta[col]
             // attn[col] = (S^T @ q)[col] = sum_i S[i][col] * q[i]
@@ -441,7 +478,7 @@ gated_delta_net_cuda_direct(const float * q,
     }
 }
 
-template <int S_v, int COLS, int WIDTH, int WARP_THREADS, bool WRITE_INTER, typename InterT = float>
+template <int S_v, int COLS, int WIDTH, int WARP_THREADS, bool TREE_MODE, bool WRITE_INTER, typename InterT = float>
 __global__ void __launch_bounds__(WARP_THREADS * 8, 2)
 gated_delta_net_cuda_grouped_cols(const float * q,
                                   const float * k,
@@ -452,7 +489,9 @@ gated_delta_net_cuda_grouped_cols(const float * q,
                                   const int *   active_slot_ids,
                                   float *       dst,
                                   float *       state_out,
+                                  const int *   parent_ids,    // TREE_MODE only; else ignored
                                   InterT *      persist_inter,
+                                  float *       replay_log,
                                   int64_t       H,
                                   int64_t       n_tokens,
                                   int64_t       n_seqs,
@@ -468,7 +507,9 @@ gated_delta_net_cuda_grouped_cols(const float * q,
                                   int64_t       sb3,
                                   const uint3   neqk1_magic,
                                   const uint3   rq3_magic,
-                                  float         scale) {
+                                  float         scale,
+                                  const float * gate_bias,   // raw-gate mode: dt_bias[H], else nullptr
+                                  const float * gate_A) {    // raw-gate mode: A[H]
     static_assert(S_v == 128, "grouped GDN kernel is specialized for S_v=128");
     static_assert(WIDTH == 16, "grouped GDN kernel expects 16-lane subgroups");
     static_assert(COLS == 4, "grouped GDN kernel expects 4 columns per subgroup");
@@ -502,11 +543,15 @@ gated_delta_net_cuda_grouped_cols(const float * q,
         n_seqs, n_state_slots, physical_sequence, physical_state_offset);
     InterT * inter_states = nullptr;
     InterT * inter_base   = nullptr;
-    if constexpr (WRITE_INTER) {
+    if constexpr (WRITE_INTER || TREE_MODE) {
         inter_states = persist_inter
             ? persist_inter
             : (InterT *)(dst + attn_score_elems + final_state_elems);
         inter_base = inter_states + (sequence * n_tokens * H + h_idx) * S_v * S_v;
+    }
+    const int * parent_ids_seq = nullptr;
+    if constexpr (TREE_MODE) {
+        parent_ids_seq = parent_ids + sequence * n_tokens;
     }
 
     const float * curr_state_seq = physical_sequence >= 0
@@ -529,6 +574,41 @@ gated_delta_net_cuda_grouped_cols(const float * q,
     }
 
     for (int t = 0; t < n_tokens; ++t) {
+        if constexpr (TREE_MODE) {
+            // DFS branch transition: this token continues from a state other
+            // than the previous token's. Reload the register shard from the
+            // parent's stored intermediate state (same-thread read-after-write
+            // on global memory, no barrier needed) or reset to the pre-block
+            // state for root-level siblings.
+            if (t > 0) {
+                const int parent_t = parent_ids_seq[t];
+                if (parent_t == GGML_GDN_TREE_ROOT_PARENT) {
+#pragma unroll
+                    for (int c = 0; c < COLS; ++c) {
+                        const int col = col_base + c;
+#pragma unroll
+                        for (int r = 0; r < rows_per_lane; ++r) {
+                            const int row = r * WIDTH + lane;
+                            state_shard[c][r] = curr_state_seq
+                                ? curr_state_seq[col * S_v + row]
+                                : 0.0f;
+                        }
+                    }
+                } else if (parent_t != t - 1) {
+                    const InterT * parent_base = inter_states
+                        + ((sequence * n_tokens + parent_t) * H + h_idx) * S_v * S_v;
+#pragma unroll
+                    for (int c = 0; c < COLS; ++c) {
+                        const int col = col_base + c;
+#pragma unroll
+                        for (int r = 0; r < rows_per_lane; ++r) {
+                            const int row = r * WIDTH + lane;
+                            state_shard[c][r] = load_inter_state(parent_base, col * S_v + row);
+                        }
+                    }
+                }
+            }
+        }
         const float * q_t = q + iq3 * sq3 + t * sq2 + iq1 * sq1;
         const float * k_t = k + iq3 * sq3 + t * sq2 + iq1 * sq1;
         const float * v_t = v + sequence * sv3 + t * sv2 + h_idx * sv1;
@@ -538,11 +618,25 @@ gated_delta_net_cuda_grouped_cols(const float * q,
         float g_val = 0.0f;
         float beta_val = 0.0f;
         if (threadIdx.x == 0) {
-            g_val = expf(g[gb_offset]);
-            beta_val = beta[gb_offset];
+            if (gate_bias != nullptr) {
+                // raw-gate mode: g = exp(softplus(alpha_raw + bias) * A), beta = sigmoid(beta_raw)
+                const float a  = g[gb_offset] + gate_bias[h_idx];
+                const float sp = (a > 20.0f) ? a : logf(1.0f + expf(a));
+                g_val    = expf(sp * gate_A[h_idx]);
+                beta_val = 1.0f / (1.0f + expf(-beta[gb_offset]));
+            } else {
+                g_val = expf(g[gb_offset]);
+                beta_val = beta[gb_offset];
+            }
         }
         g_val = __shfl_sync(0xffffffffU, g_val, 0);
         beta_val = __shfl_sync(0xffffffffU, beta_val, 0);
+
+        constexpr int replay_log_width = 2*S_v + 1;
+        float * replay_log_t = replay_log
+            ? replay_log +
+                ((sequence * n_tokens + t) * H + h_idx) * replay_log_width
+            : nullptr;
 
         float k_reg[rows_per_lane];
         float q_reg[rows_per_lane];
@@ -560,11 +654,19 @@ gated_delta_net_cuda_grouped_cols(const float * q,
             const float k_val = k_t[row];
             q_reg[r] = q_val;
             k_reg[r] = k_val;
+            if (replay_log_t && blockIdx.z == 0 && threadIdx.y == 0 &&
+                subgroup == 0) {
+                replay_log_t[1 + row] = k_val;
+            }
 
 #pragma unroll
             for (int c = 0; c < COLS; ++c) {
                 kv_partial[c] += state_shard[c][r] * k_val;
             }
+        }
+        if (replay_log_t && blockIdx.z == 0 && threadIdx.y == 0 &&
+            subgroup == 0 && lane == 0) {
+            replay_log_t[0] = g_val;
         }
 
         float delta[COLS];
@@ -574,6 +676,9 @@ gated_delta_net_cuda_grouped_cols(const float * q,
             float delta_val = 0.0f;
             if (lane == 0) {
                 delta_val = (v_t[col_base + c] - g_val * kv_col) * beta_val;
+                if (replay_log_t) {
+                    replay_log_t[1 + S_v + col_base + c] = delta_val;
+                }
             }
             delta[c] = gdn_subgroup_broadcast_lane0(delta_val, WIDTH);
         }
@@ -606,7 +711,7 @@ gated_delta_net_cuda_grouped_cols(const float * q,
             }
         }
 
-        if constexpr (WRITE_INTER) {
+        if constexpr (WRITE_INTER || TREE_MODE) {
 #pragma unroll
             for (int c = 0; c < COLS; ++c) {
                 const int col = col_base + c;
@@ -648,7 +753,9 @@ static void launch_gated_delta_net(
         int64_t sv1,   int64_t sv2, int64_t sv3,
         int64_t sb1,   int64_t sb2, int64_t sb3,
         int64_t neqk1, int64_t rq3,
-        float scale, cudaStream_t stream) {
+        float scale, cudaStream_t stream,
+        const float * gate_bias = nullptr, const float * gate_A = nullptr,
+        float * replay_log_d = nullptr) {
     //TODO: Add chunked kernel for even faster pre-fill
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const int num_warps = 4;
@@ -673,7 +780,8 @@ static void launch_gated_delta_net(
     if constexpr (DIRECT_STATE) {
         static_assert(!TREE_MODE && !WRITE_INTER,
                       "direct GDN fast path is chain mode without snapshots");
-        if (direct_fast_enabled) {
+        if (direct_fast_enabled && gate_bias == nullptr &&
+            replay_log_d == nullptr) {
             switch (S_v) {
                 case 16:
                     gated_delta_net_cuda_direct<16, KDA><<<
@@ -720,25 +828,25 @@ static void launch_gated_delta_net(
     switch (S_v) {
         case 16:
             gated_delta_net_cuda<16, KDA, TREE_MODE, WRITE_INTER, InterT, DIRECT_STATE><<<grid_dims, block_dims, 0, stream>>>(
-                q_d, k_d, v_d, g_d, b_d, s_d, active_slot_ids_d, dst_d, state_out_d, parent_ids_d, persist_inter_d, H,
+                q_d, k_d, v_d, g_d, b_d, s_d, active_slot_ids_d, dst_d, state_out_d, parent_ids_d, persist_inter_d, replay_log_d, H,
                 n_tokens, n_seqs, n_state_slots, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, gate_bias, gate_A);
             break;
         case 32:
             gated_delta_net_cuda<32, KDA, TREE_MODE, WRITE_INTER, InterT, DIRECT_STATE><<<grid_dims, block_dims, 0, stream>>>(
-                q_d, k_d, v_d, g_d, b_d, s_d, active_slot_ids_d, dst_d, state_out_d, parent_ids_d, persist_inter_d, H,
+                q_d, k_d, v_d, g_d, b_d, s_d, active_slot_ids_d, dst_d, state_out_d, parent_ids_d, persist_inter_d, replay_log_d, H,
                 n_tokens, n_seqs, n_state_slots, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, gate_bias, gate_A);
             break;
         case 64: {
             gated_delta_net_cuda<64, KDA, TREE_MODE, WRITE_INTER, InterT, DIRECT_STATE><<<grid_dims, block_dims, 0, stream>>>(
-                q_d, k_d, v_d, g_d, b_d, s_d, active_slot_ids_d, dst_d, state_out_d, parent_ids_d, persist_inter_d, H,
+                q_d, k_d, v_d, g_d, b_d, s_d, active_slot_ids_d, dst_d, state_out_d, parent_ids_d, persist_inter_d, replay_log_d, H,
                 n_tokens, n_seqs, n_state_slots, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, gate_bias, gate_A);
             break;
         }
         case 128: {
-            if constexpr (!KDA && !TREE_MODE) {
+            if constexpr (!KDA) {
                 if (use_grouped_cols &&
                     ((GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE) ||
                      GGML_CUDA_CC_IS_AMD(cc))) {
@@ -753,36 +861,36 @@ static void launch_gated_delta_net(
                         const ggml_cuda_kernel_launch_params launch_params(
                             grouped_grid_dims, grouped_block_dims, 0, stream);
                         ggml_cuda_kernel_launch(
-                            gated_delta_net_cuda_grouped_cols<128, cols, width, 32, WRITE_INTER, InterT>,
+                            gated_delta_net_cuda_grouped_cols<128, cols, width, 32, TREE_MODE, WRITE_INTER, InterT>,
                             launch_params,
-                            q_d, k_d, v_d, g_d, b_d, s_d, active_slot_ids_d, dst_d, state_out_d, persist_inter_d, H,
+                            q_d, k_d, v_d, g_d, b_d, s_d, active_slot_ids_d, dst_d, state_out_d, parent_ids_d, persist_inter_d, replay_log_d, H,
                             n_tokens, n_seqs, n_state_slots, sq1, sq2, sq3, sv1, sv2, sv3,
-                            sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+                            sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, gate_bias, gate_A);
                     } else if (warp_size == 64) {
                         constexpr int groups_per_warp = 64 / width;
                         dim3 grouped_grid_dims(H, n_seqs, (groups + column_groups_per_block * groups_per_warp - 1) / (column_groups_per_block * groups_per_warp));
                         dim3 grouped_block_dims(64, column_groups_per_block, 1);
-                        gated_delta_net_cuda_grouped_cols<128, cols, width, 64, WRITE_INTER, InterT><<<grouped_grid_dims, grouped_block_dims, 0, stream>>>(
-                            q_d, k_d, v_d, g_d, b_d, s_d, active_slot_ids_d, dst_d, state_out_d, persist_inter_d, H,
+                        gated_delta_net_cuda_grouped_cols<128, cols, width, 64, TREE_MODE, WRITE_INTER, InterT><<<grouped_grid_dims, grouped_block_dims, 0, stream>>>(
+                            q_d, k_d, v_d, g_d, b_d, s_d, active_slot_ids_d, dst_d, state_out_d, parent_ids_d, persist_inter_d, replay_log_d, H,
                             n_tokens, n_seqs, n_state_slots, sq1, sq2, sq3, sv1, sv2, sv3,
-                            sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+                            sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, gate_bias, gate_A);
                     } else {
                         gated_delta_net_cuda<128, KDA, TREE_MODE, WRITE_INTER, InterT, DIRECT_STATE><<<grid_dims, block_dims, 0, stream>>>(
-                            q_d, k_d, v_d, g_d, b_d, s_d, active_slot_ids_d, dst_d, state_out_d, parent_ids_d, persist_inter_d, H,
+                            q_d, k_d, v_d, g_d, b_d, s_d, active_slot_ids_d, dst_d, state_out_d, parent_ids_d, persist_inter_d, replay_log_d, H,
                             n_tokens, n_seqs, n_state_slots, sq1, sq2, sq3, sv1, sv2, sv3,
-                            sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+                            sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, gate_bias, gate_A);
                     }
                 } else {
                     gated_delta_net_cuda<128, KDA, TREE_MODE, WRITE_INTER, InterT, DIRECT_STATE><<<grid_dims, block_dims, 0, stream>>>(
-                        q_d, k_d, v_d, g_d, b_d, s_d, active_slot_ids_d, dst_d, state_out_d, parent_ids_d, persist_inter_d, H,
+                        q_d, k_d, v_d, g_d, b_d, s_d, active_slot_ids_d, dst_d, state_out_d, parent_ids_d, persist_inter_d, replay_log_d, H,
                         n_tokens, n_seqs, n_state_slots, sq1, sq2, sq3, sv1, sv2, sv3,
-                        sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+                        sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, gate_bias, gate_A);
                 }
             } else {
                 gated_delta_net_cuda<128, KDA, TREE_MODE, WRITE_INTER, InterT, DIRECT_STATE><<<grid_dims, block_dims, 0, stream>>>(
-                    q_d, k_d, v_d, g_d, b_d, s_d, active_slot_ids_d, dst_d, state_out_d, parent_ids_d, persist_inter_d, H,
+                    q_d, k_d, v_d, g_d, b_d, s_d, active_slot_ids_d, dst_d, state_out_d, parent_ids_d, persist_inter_d, replay_log_d, H,
                     n_tokens, n_seqs, n_state_slots, sq1, sq2, sq3, sv1, sv2, sv3,
-                    sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+                    sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, gate_bias, gate_A);
             }
             break;
         }
@@ -1029,7 +1137,6 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
     // Optional 9th source maps compact sequence rows to physical recurrent
     // state slabs. Negative ids are graph-bucket padding rows.
     ggml_tensor * src_active_slots = dst->src[8];
-
     GGML_TENSOR_LOCALS(int64_t, neq, src_q, ne);
     GGML_TENSOR_LOCALS(size_t , nbq, src_q, nb);
     GGML_TENSOR_LOCALS(int64_t, nek, src_k, ne);
@@ -1071,6 +1178,10 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
     void *        persist_inter_d = src_persist_inter
         ? src_persist_inter->data
         : nullptr;
+    const int replay_log_row_offset = ggml_get_op_params_i32(dst, 3);
+    float * replay_log_d = replay_log_row_offset > 0
+        ? dst_d + (int64_t) replay_log_row_offset*dst->ne[0]
+        : nullptr;
     const bool    persist_is_f16 =
         src_persist_inter && src_persist_inter->type == GGML_TYPE_F16;
     if (src_persist_inter) {
@@ -1099,6 +1210,14 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
         GGML_ASSERT(ggml_is_contiguous(src_active_slots));
         GGML_ASSERT(ggml_nelements(src_active_slots) == n_seqs);
     }
+    if (replay_log_d) {
+        const int64_t replay_log_width = kda ? 3*S_v : 2*S_v + 1;
+        const int64_t replay_log_elements =
+            replay_log_width*H*n_tokens*n_seqs;
+        GGML_ASSERT(
+            (int64_t) replay_log_row_offset*dst->ne[0] +
+                replay_log_elements <= ggml_nelements(dst));
+    }
 
     // strides in floats (beta strides used for both g and beta offset computation)
     const int64_t sq1 = nbq1 / sizeof(float);
@@ -1117,6 +1236,18 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
 
     const bool tree_mode = (parent_ids_d != nullptr);
     const bool skip_intermediate = ggml_get_op_params_i32(dst, 0) != 0;
+    // dflash raw-gate mode: src[9] = [dt_bias | A] (f32 [2H]); the kernel
+    // applies sigmoid / softplus+bias / A itself (see ggml_gated_delta_net_set_raw_gates).
+    const bool raw_gates = ggml_get_op_params_i32(dst, 10) != 0;
+    const float * gate_bias_d = nullptr;
+    const float * gate_A_d    = nullptr;
+    if (raw_gates) {
+        GGML_ASSERT(dst->src[9] && dst->src[9]->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_nelements(dst->src[9]) == 2*H);
+        GGML_ASSERT(!kda && !tree_mode && active_slot_ids_d == nullptr);
+        gate_bias_d = (const float *) dst->src[9]->data;
+        gate_A_d    = gate_bias_d + H;
+    }
     const bool write_intermediate = tree_mode || !skip_intermediate || persist_inter_d != nullptr;
 
     // Macro to expand KDA × TREE_MODE × WRITE_INTER for a given InterT.
@@ -1128,48 +1259,48 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
                 if (tree_mode) {                                                                \
                     launch_gated_delta_net<true, true, true, INTER_T>(                          \
                         q_d, k_d, v_d, g_d, b_d, s_d, active_slot_ids_d, dst_d, state_out_d, parent_ids_d, persist_typed, \
-                        S_v, H, n_tokens, n_seqs, n_state_slots, sq1, sq2, sq3, sv1, sv2, sv3,                 \
-                        sb1, sb2, sb3, neqk1, rq3, scale, stream);                              \
+                        S_v, H, n_tokens, n_seqs, n_state_slots, sq1, sq2, sq3, sv1, sv2, sv3,  \
+                        sb1, sb2, sb3, neqk1, rq3, scale, stream, gate_bias_d, gate_A_d, replay_log_d); \
                 } else if (write_intermediate) {                                                \
                     launch_gated_delta_net<true, false, true, INTER_T>(                         \
                         q_d, k_d, v_d, g_d, b_d, s_d, active_slot_ids_d, dst_d, state_out_d, nullptr, persist_typed, \
-                        S_v, H, n_tokens, n_seqs, n_state_slots, sq1, sq2, sq3, sv1, sv2, sv3,                 \
-                        sb1, sb2, sb3, neqk1, rq3, scale, stream);                              \
+                        S_v, H, n_tokens, n_seqs, n_state_slots, sq1, sq2, sq3, sv1, sv2, sv3,  \
+                        sb1, sb2, sb3, neqk1, rq3, scale, stream, gate_bias_d, gate_A_d, replay_log_d); \
                 } else {                                                                        \
                     if (active_slot_ids_d == nullptr) {                                         \
                         launch_gated_delta_net<true, false, false, INTER_T, true>(              \
                             q_d, k_d, v_d, g_d, b_d, s_d, nullptr, dst_d, state_out_d, nullptr, persist_typed, \
                             S_v, H, n_tokens, n_seqs, n_state_slots, sq1, sq2, sq3, sv1, sv2, sv3,             \
-                            sb1, sb2, sb3, neqk1, rq3, scale, stream);                          \
+                            sb1, sb2, sb3, neqk1, rq3, scale, stream, gate_bias_d, gate_A_d, replay_log_d); \
                     } else {                                                                    \
                         launch_gated_delta_net<true, false, false, INTER_T>(                    \
                             q_d, k_d, v_d, g_d, b_d, s_d, active_slot_ids_d, dst_d, state_out_d, nullptr, persist_typed, \
                             S_v, H, n_tokens, n_seqs, n_state_slots, sq1, sq2, sq3, sv1, sv2, sv3,             \
-                            sb1, sb2, sb3, neqk1, rq3, scale, stream);                          \
+                            sb1, sb2, sb3, neqk1, rq3, scale, stream, gate_bias_d, gate_A_d, replay_log_d); \
                     }                                                                           \
                 }                                                                               \
             } else {                                                                            \
                 if (tree_mode) {                                                                \
                     launch_gated_delta_net<false, true, true, INTER_T>(                         \
                         q_d, k_d, v_d, g_d, b_d, s_d, active_slot_ids_d, dst_d, state_out_d, parent_ids_d, persist_typed, \
-                        S_v, H, n_tokens, n_seqs, n_state_slots, sq1, sq2, sq3, sv1, sv2, sv3,                 \
-                        sb1, sb2, sb3, neqk1, rq3, scale, stream);                              \
+                        S_v, H, n_tokens, n_seqs, n_state_slots, sq1, sq2, sq3, sv1, sv2, sv3,  \
+                        sb1, sb2, sb3, neqk1, rq3, scale, stream, gate_bias_d, gate_A_d, replay_log_d); \
                 } else if (write_intermediate) {                                                \
                     launch_gated_delta_net<false, false, true, INTER_T>(                        \
                         q_d, k_d, v_d, g_d, b_d, s_d, active_slot_ids_d, dst_d, state_out_d, nullptr, persist_typed, \
-                        S_v, H, n_tokens, n_seqs, n_state_slots, sq1, sq2, sq3, sv1, sv2, sv3,                 \
-                        sb1, sb2, sb3, neqk1, rq3, scale, stream);                              \
+                        S_v, H, n_tokens, n_seqs, n_state_slots, sq1, sq2, sq3, sv1, sv2, sv3,  \
+                        sb1, sb2, sb3, neqk1, rq3, scale, stream, gate_bias_d, gate_A_d, replay_log_d); \
                 } else {                                                                        \
                     if (active_slot_ids_d == nullptr) {                                         \
                         launch_gated_delta_net<false, false, false, INTER_T, true>(             \
                             q_d, k_d, v_d, g_d, b_d, s_d, nullptr, dst_d, state_out_d, nullptr, persist_typed, \
                             S_v, H, n_tokens, n_seqs, n_state_slots, sq1, sq2, sq3, sv1, sv2, sv3,             \
-                            sb1, sb2, sb3, neqk1, rq3, scale, stream);                          \
+                            sb1, sb2, sb3, neqk1, rq3, scale, stream, gate_bias_d, gate_A_d, replay_log_d); \
                     } else {                                                                    \
                         launch_gated_delta_net<false, false, false, INTER_T>(                   \
                             q_d, k_d, v_d, g_d, b_d, s_d, active_slot_ids_d, dst_d, state_out_d, nullptr, persist_typed, \
                             S_v, H, n_tokens, n_seqs, n_state_slots, sq1, sq2, sq3, sv1, sv2, sv3,             \
-                            sb1, sb2, sb3, neqk1, rq3, scale, stream);                          \
+                            sb1, sb2, sb3, neqk1, rq3, scale, stream, gate_bias_d, gate_A_d, replay_log_d); \
                     }                                                                           \
                 }                                                                               \
             }                                                                                   \

@@ -2,6 +2,8 @@
 #include "concurrency/qwen35_seq_engine.h"
 #include "common/adaptive_spec_width.h"
 #include "common/chain_rollback_policy.h"
+#include "common/draft_block_size.h"
+#include "common/draft_swa.h"
 #include "placement/skip_park_guard.h"
 #include "qwen35_dflash_target.h"
 #include "graph_builders.h"
@@ -18,6 +20,8 @@
 #include "common/geometric_sampler_cuda.h"
 #include <random>
 #endif
+#include "common/dspark_head.h"
+#include "common/dflash2_head.h"
 #include "common/io_utils.h"
 #include "common/restore_delta.h"
 #include "common/specla_mode.h"
@@ -26,11 +30,13 @@
 #include "qwen3/qwen3_kvflash_scorer.h"
 
 #include "ggml-cuda.h"
+#include "ggml-backend-impl.h"
 #include "common/snapshot_backend.h"
 #include "pflash_ggml_adapter.h"
 #include "flashprefill.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -264,7 +270,8 @@ static FILE * open_dflash_floor_log() {
 // staging K/V or staging recurrent slab to reserve.
 static int64_t concurrent_fixed_cache_bytes(
         const TargetWeights & w, int max_ctx, int n_slots,
-        int64_t kv_bytes_per_token) {
+        int64_t kv_bytes_per_token, int64_t scratch_tokens,
+        bool fixed_chain) {
     const int64_t n_full_attn =
         w.n_layer / w.full_attention_interval;
     const int64_t n_delta = w.n_layer - n_full_attn;
@@ -279,7 +286,10 @@ static int64_t concurrent_fixed_cache_bytes(
         state_per_layer * n_delta * (int64_t)n_slots;
     const int64_t target_feat =
         (int64_t)w.n_capture_layers * w.n_embd *
-        std::min(max_ctx, 4096) * (int64_t)sizeof(uint16_t);
+        (fixed_chain
+             ? (int64_t)std::min(max_ctx, 4096) * n_slots + 1
+             : (int64_t)std::min(max_ctx, 4096)) *
+        (int64_t)sizeof(uint16_t);
     const int64_t q_capture =
         (int64_t)w.n_embd_head_k * w.n_head * n_full_attn *
         (int64_t)sizeof(float);
@@ -287,7 +297,7 @@ static int64_t concurrent_fixed_cache_bytes(
         ((int64_t)paged_block_count(max_ctx) * n_slots + n_slots) *
         (int64_t)sizeof(int32_t);
     const int64_t scratch =
-        kv_bytes_per_token * PAGED_BLOCK_SIZE;
+        kv_bytes_per_token * scratch_tokens;
     return recurrent + target_feat + q_capture +
            paged_metadata + scratch;
 }
@@ -304,6 +314,33 @@ static bool qwen35_empty_visible_output(const std::vector<int32_t> & tokens,
         if (!IS_EOS_TOK(tok, w)) return false;
     }
     return true;
+}
+
+// Drafters trained on explicit target layers (GGUF dflash.target_layer_ids)
+// override the evenly-spaced derivation: capturing different layers than the
+// drafter was trained on silently destroys acceptance.
+static void apply_drafter_capture_layer_ids(const DraftWeights & dw, TargetWeights & w) {
+    if (dw.capture_layer_ids.empty()) return;
+    const int n = (int)dw.capture_layer_ids.size();
+    bool ok = (n == w.n_capture_layers);
+    for (int k = 0; ok && k < n; k++)
+        ok = dw.capture_layer_ids[k] >= 0 && dw.capture_layer_ids[k] < w.n_layer;
+    if (!ok) {
+        std::fprintf(stderr,
+            "[draft]  drafter target_layer_ids invalid (n=%d, slots=%d); "
+            "keeping derived capture layers\n", n, w.n_capture_layers);
+        return;
+    }
+    bool changed = false;
+    for (int k = 0; k < n; k++) {
+        changed |= w.capture_layer_ids[k] != dw.capture_layer_ids[k];
+        w.capture_layer_ids[k] = dw.capture_layer_ids[k];
+    }
+    if (changed) {
+        std::printf("[draft]  target capture layers from drafter GGUF:");
+        for (int k = 0; k < n; k++) std::printf(" %d", w.capture_layer_ids[k]);
+        std::printf("\n");
+    }
 }
 
 // ── Construction / destruction ──────────────────────────────────────────
@@ -416,13 +453,49 @@ bool Qwen35Backend::init() {
             return false;
         }
         std::printf("[draft]  loaded\n");
+        apply_drafter_capture_layer_ids(dw_, w_);
 
         if (cfg_.draft_swa_window > 0) {
-            dw_.swa_window = cfg_.draft_swa_window;
-            for (int il = 0; il < dw_.n_layer - 1; il++)
-                dw_.layers[il].is_swa = true;
+            const DraftSwaOverrideResult swa =
+                apply_draft_swa_window_override(dw_, cfg_.draft_swa_window);
             std::printf("[draft]  SWA layers: %d/%d (window=%d)\n",
-                        dw_.n_layer - 1, dw_.n_layer, dw_.swa_window);
+                        swa.swa_layers, swa.total_layers, swa.effective_window);
+        }
+
+        // Legacy 8-layer drafter YaRN from config flags. Applied here AND in
+        // unpark() so the rotary encoding cannot flip mid-process (it used
+        // to switch from plain RoPE to YaRN on the first park/unpark).
+        if (dw_.rope_ext_factor == 0.0f && dw_.n_layer == 8 && dw_.n_embd == 2048) {
+            float yf = cfg_.draft_yarn_factor > 1.0f ? cfg_.draft_yarn_factor : 64.0f;
+            dw_.rope_freq_scale = 1.0f / yf;
+            dw_.rope_ext_factor = 1.0f; dw_.rope_attn_factor = 1.0f;
+            dw_.rope_beta_fast = cfg_.draft_yarn_beta_fast;
+            dw_.rope_beta_slow = cfg_.draft_yarn_beta_slow;
+            dw_.rope_n_ctx_orig = cfg_.draft_yarn_orig_ctx;
+        }
+
+        // The checkpoint metadata is the drafter's published proposal
+        // horizon. Greedy chain verification keeps output byte-identical to
+        // plain decode at any width, so widening only risks acceptance
+        // depth; it is allowed up to 2x the horizon (measured on Qwen3.8
+        // DFlash2: byte-identical completions across widths 8-24, commits
+        // grow through 16, step time cliffs past 16 with no commit gain).
+        if (cfg_.draft_block_size != 0) {
+            const int checkpoint_block_size = dw_.block_size;
+            if (!draft_block_size_override_supported(
+                    cfg_.draft_block_size, checkpoint_block_size)) {
+                std::fprintf(stderr,
+                    "[draft] --draft-block-size must be in [2, %d] for this "
+                    "drafter (up to 2x the checkpoint horizon); got %d\n",
+                    2 * checkpoint_block_size, cfg_.draft_block_size);
+                return false;
+            }
+            std::printf("[draft]  block size override: %d -> %d%s\n",
+                        checkpoint_block_size, cfg_.draft_block_size,
+                        cfg_.draft_block_size > checkpoint_block_size
+                            ? " (beyond the published horizon; exact greedy verify)"
+                            : "");
+            dw_.block_size = cfg_.draft_block_size;
         }
     }
 
@@ -491,6 +564,28 @@ bool Qwen35Backend::init() {
         set_last_error("--max-concurrency requires --paged-attention");
         return false;
     }
+    FixedChainConfig fixed_chain;
+    fixed_chain.enabled =
+        n_slots > 1 && cfg_.paged_attention && cfg_.fa_window == 0 &&
+        cfg_.draft_path && !cfg_.ddtree_mode && !use_remote_draft &&
+        !tensor_parallel && !split_gpus_ &&
+        target_backend_ == draft_backend_ &&
+        cfg_.device.gpu == cfg_.draft_gpu &&
+        dw_.selector.enabled && dw_.block_size > 1 &&
+        dw_.block_size <= 16 && w_.output;
+    if (fixed_chain.enabled) {
+        fixed_chain.width = dw_.block_size;
+        fixed_chain.scratch_stride = paged_token_capacity(fixed_chain.width);
+    }
+    if (n_slots > 1 && cfg_.draft_path && !fixed_chain.enabled) {
+        set_last_error(
+            "concurrent paged DFlash2 requires a selector-enabled local "
+            "same-device draft with block size in [2, 16] and a target "
+            "lm_head");
+        return false;
+    }
+    const int64_t scratch_tokens = PAGED_BLOCK_SIZE +
+        (int64_t)n_slots * fixed_chain.scratch_stride;
     // Concurrent slots share one physical pool. An explicit
     // --kv-pool-tokens is rounded up to a whole block; otherwise capacity is
     // derived from device-free memory after subtracting fixed concurrent cache
@@ -501,9 +596,12 @@ bool Qwen35Backend::init() {
     int64_t pool_tokens = 0;
     if (n_slots > 1) {
         if (cfg_.kv_pool_tokens > 0) {
+            const int64_t max_pool_tokens =
+                ((int64_t)INT32_MAX - scratch_tokens) /
+                PAGED_BLOCK_SIZE * PAGED_BLOCK_SIZE;
             pool_tokens = (int64_t)paged_token_capacity(
                 (int)std::min<int64_t>(
-                    cfg_.kv_pool_tokens, INT32_MAX - PAGED_BLOCK_SIZE));
+                    cfg_.kv_pool_tokens, max_pool_tokens));
         } else {
             PagedKvAutoBudget budget;
             // TODO: Size tensor-parallel pools from each device's free memory
@@ -512,7 +610,8 @@ bool Qwen35Backend::init() {
             budget.bytes_per_token = kvf_budget.bytes_per_token;
             budget.reserve_bytes = kvf_budget.reserve_bytes;
             budget.fixed_cache_bytes = concurrent_fixed_cache_bytes(
-                w_, cfg_.device.max_ctx, n_slots, budget.bytes_per_token);
+                w_, cfg_.device.max_ctx, n_slots, budget.bytes_per_token,
+                scratch_tokens, fixed_chain.enabled);
             pool_tokens = paged_kv_auto_pool_tokens(
                 cfg_.device.max_ctx, n_slots, budget);
             const int64_t one_context =
@@ -534,19 +633,20 @@ bool Qwen35Backend::init() {
                 return false;
             }
         }
-        if (pool_tokens + PAGED_BLOCK_SIZE > INT32_MAX) {
+        if (pool_tokens + scratch_tokens > INT32_MAX) {
             set_last_error("paged KV pool exceeds INT32_MAX tokens");
             return false;
         }
     }
     const int ctx_alloc = n_slots > 1
-        ? (int)(pool_tokens + PAGED_BLOCK_SIZE)
+        ? (int)(pool_tokens + scratch_tokens)
         : (cfg_.paged_attention
                ? paged_token_capacity(cfg_.device.max_ctx)
                : kvflash_tokens_);
     if (!create_target_cache(w_, cfg_.device.max_ctx, max_verify_tokens, target_backend_, cache_,
                              /*prefill_only=*/true, ctx_alloc,
-                             cfg_.paged_attention, n_slots)) {
+                             cfg_.paged_attention, n_slots,
+                             fixed_chain.enabled)) {
         std::fprintf(stderr, "cache: %s\n", dflash27b_last_error());
         return false;
     }
@@ -578,12 +678,21 @@ bool Qwen35Backend::init() {
             return false;
         }
         if (n_slots > 1) {
+            fixed_chain.scratch_base = (int)pool_tokens;
+            const int64_t dead_scratch_row = pool_tokens +
+                (int64_t)n_slots * fixed_chain.scratch_stride;
             seq_engine_ = std::make_unique<Qwen35SeqEngine>(
                 *this, *paged_kv_pool_, cfg_.device.max_ctx,
-                /*scratch_row=*/pool_tokens,
+                dead_scratch_row, fixed_chain,
                 max_concurrent_prefills, mixed_prefill_tokens,
                 long_mixed_prefill_tokens, long_prefill_threshold,
                 idle_prefill_tokens, prefill_quantum);
+            if (fixed_chain.enabled) {
+                std::fprintf(stderr,
+                    "[parallel-chain] fixed DFlash2 width=%d, "
+                    "same-device paged full-attention greedy lanes\n",
+                    fixed_chain.width);
+            }
             std::printf("[parallel] %d decode slots, up to %d packed prefills "
                         "(mixed short/long %d/%d at >=%d tokens, "
                         "idle %d, quantum %d), "
@@ -636,7 +745,8 @@ bool Qwen35Backend::init() {
 
     // Init feature mirror when draft model is available (needed for spec decode).
     // On single-GPU, this is an F32 conversion buffer; on split-GPU, a cross-device mirror.
-    if (cfg_.draft_path && !use_remote_draft) {
+    if (cfg_.draft_path && !use_remote_draft &&
+        !fixed_chain.enabled) {
         const int mirror_cap = std::min({cfg_.draft_ctx_max, cfg_.device.max_ctx,
                                          cache_.target_feat_cap > 0 ? cache_.target_feat_cap : cfg_.device.max_ctx});
         if (!draft_feature_mirror_init(feature_mirror_, draft_backend_,
@@ -878,6 +988,8 @@ bool Qwen35Backend::park(ParkTarget target) {
             remote_draft_.close();
         } else {
             step_graph_destroy(draft_sg_);
+            if (seq_engine_) seq_engine_->release_draft_graphs();
+            draft_kv_free(draft_kv_);
             free_draft_weights(dw_);
         }
         draft_parked_ = true;
@@ -887,7 +999,9 @@ bool Qwen35Backend::park(ParkTarget target) {
         dspark_chain_cache_.reset();
         // A cached drafter graph may gather directly from target_feat.
         draft_kv_free(draft_kv_);
+        step_graph_destroy(sg_);
         step_graph_destroy(proj_sg_);
+        dflash2_selector_graph_invalidate();
         free_target_weights(w_);
         target_parked_ = true;
         std::printf("[park] target released\n"); std::fflush(stdout);
@@ -945,11 +1059,24 @@ bool Qwen35Backend::unpark(ParkTarget target) {
                 dw_.rope_n_ctx_orig = cfg_.draft_yarn_orig_ctx;
             }
             if (cfg_.draft_swa_window > 0) {
-                dw_.swa_window = cfg_.draft_swa_window;
-                for (int il = 0; il < dw_.n_layer - 1; il++)
-                    dw_.layers[il].is_swa = true;
+                const DraftSwaOverrideResult swa =
+                    apply_draft_swa_window_override(dw_, cfg_.draft_swa_window);
+                std::printf("[unpark] draft SWA layers: %d/%d (window=%d)\n",
+                            swa.swa_layers, swa.total_layers, swa.effective_window);
+            }
+            // Re-apply the runtime block-size override: without this a
+            // park/unpark cycle silently reverts to checkpoint metadata
+            // (out-of-bounds rollback windows when narrowing, a silent
+            // no-op when widening).
+            if (cfg_.draft_block_size != 0 &&
+                draft_block_size_override_supported(cfg_.draft_block_size,
+                                                    dw_.block_size)) {
+                dw_.block_size = cfg_.draft_block_size;
             }
         }
+        // A reloaded drafter can select different target capture layers.
+        // Rebuild any retained target graph against the refreshed mapping.
+        step_graph_free(sg_);
         draft_parked_ = false;
         std::printf("[unpark] draft restored\n"); std::fflush(stdout);
     }
@@ -1304,6 +1431,7 @@ DFlashTarget * Qwen35Backend::dflash_target() {
 
 void Qwen35Backend::shutdown() {
     const bool use_remote_draft = cfg_.remote_draft.enabled();
+    seq_engine_.reset();
     end_paged_sequence();
     free_drafter();
     step_graph_destroy(sg_);
@@ -1357,7 +1485,17 @@ void Qwen35Backend::release_scratch() {
     flashprefill::dflash_bsa_free_persistent();
 #endif
 
-    std::fprintf(stderr, "[vram] released scratch buffers\n");
+    // Gallocr teardown does not release operator temporaries cached by the
+    // legacy CUDA/HIP pools. On non-VMM devices a long prefill can otherwise
+    // leave nearly all VRAM reserved and make the next differently shaped
+    // request fail despite having no live scratch tensors.
+    size_t trimmed = ggml_backend_cuda_trim_pool(target_backend_);
+    if (draft_backend_ && draft_backend_ != target_backend_) {
+        trimmed += ggml_backend_cuda_trim_pool(draft_backend_);
+    }
+
+    std::fprintf(stderr, "[vram] released scratch buffers; trimmed %.1f MiB from device pools\n",
+                 trimmed / (1024.0 * 1024.0));
 }
 
 // ── Generate (speculative decode) ───────────────────────────────────────
@@ -1677,6 +1815,24 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
                                const DaemonIO & io,
                                int snap_pos, int snap_slot,
                                int kv_offset) {
+    // A finite --fa-window caps the full-attention layers to a sliding
+    // window, so anything earlier than the window is invisible to them. That
+    // is silent: the model still answers, it just cannot see the head of a
+    // long prompt, which reads as a model quality problem rather than a
+    // configuration one. Say so once, the first time a prompt actually
+    // outgrows the window.
+    if (cfg_.fa_window > 0 &&
+        (int)tokens.size() + kv_offset > cfg_.fa_window) {
+        static std::atomic<bool> s_fa_window_warned{false};
+        if (!s_fa_window_warned.exchange(true)) {
+            std::fprintf(stderr,
+                "[qwen35] WARNING: prompt is %d tokens but --fa-window is %d: "
+                "full-attention layers see only the last %d tokens, so content "
+                "before that cannot be retrieved. Drop --fa-window for "
+                "long-context work.\n",
+                (int)tokens.size() + kv_offset, cfg_.fa_window, cfg_.fa_window);
+        }
+    }
     const int hidden = w_.n_embd;
     const int vocab  = w_.n_vocab;
     int prefill_ubatch = qwen35_prefill_ubatch(512);
@@ -1797,6 +1953,8 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         // positions encode the complete context — critical for tool
         // definitions at prompt start to propagate into KV values that
         // decode-time windowed attention will later read.
+        static const bool prefill_timing = std::getenv("DFLASH_PREFILL_TIMING") != nullptr;
+        const auto t_build0 = std::chrono::steady_clock::now();
         if (!build_target_step(sg_, w_, cache_, target_backend_,
                                /*kv_start=*/kv_pos, /*n_tokens=*/n_tokens,
                                with_mask, /*capture=*/true,
@@ -1873,6 +2031,7 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         }
 
         // Compute
+        const auto t_comp0 = std::chrono::steady_clock::now();
         ggml_status st = GGML_STATUS_FAILED;
         {
             const Qwen35RoctxRange profile_compute(
@@ -1882,6 +2041,15 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
                  /*total_rows=*/n_tokens,
                  /*max_kv_len=*/kv_pos + n_tokens});
             st = ggml_backend_graph_compute(target_backend_, sg_.gf);
+        }
+        if (prefill_timing) {
+            ggml_backend_synchronize(target_backend_);
+            const auto t_comp1 = std::chrono::steady_clock::now();
+            std::fprintf(stderr,
+                "[prefill-timing] tokens=%d nodes=%d build+alloc=%.1fms compute=%.1fms\n",
+                n_tokens, ggml_graph_n_nodes(sg_.gf),
+                std::chrono::duration<double, std::milli>(t_comp0 - t_build0).count(),
+                std::chrono::duration<double, std::milli>(t_comp1 - t_comp0).count());
         }
         if (st != GGML_STATUS_SUCCESS) {
             std::fprintf(stderr, "prefill compute @%d failed\n", kv_pos);
@@ -2554,6 +2722,112 @@ bool Qwen35Backend::sync_local_draft_features(int start_pos, int n_tokens) {
 
 // ── DFlash speculative decode loop ─────────────────────────────────────
 
+static bool qwen35_dspark_enabled() {
+    static const bool kEnabled = []() {
+        const char * e = std::getenv("DFLASH_QWEN35_DSPARK");
+        return e == nullptr || std::string(e) != "0";
+    }();
+    return kEnabled;
+}
+
+// Confidence-gate threshold for adaptive block length (0 = gate off, verify
+// the full drafted block). The drafter's AcceptRatePredictor scores each
+// draft position; the chain is truncated at the first position below the
+// threshold and only the confident prefix is verified.
+static float qwen35_dspark_confidence_threshold() {
+    static const float kThreshold = []() {
+        const char * e = std::getenv("DFLASH_QWEN35_DSPARK_CONFIDENCE_THRESHOLD");
+        if (!e) return 0.0f;
+        float threshold = (float)std::atof(e);
+        if (threshold < 0.0f) threshold = 0.0f;
+        if (threshold > 1.0f) threshold = 1.0f;
+        return threshold;
+    }();
+    return kThreshold;
+}
+
+// Resolve the target lm_head to a tensor whose data is readable on the
+// draft backend. In tensor-parallel mode the lm_head is a meta tensor whose
+// data pointer is a placeholder; the real data is mirrored (a full copy) on
+// every rank. Return the simple tensor of the rank that matches the draft
+// GPU (a local read on the draft backend), else nullptr so the caller falls
+// back to the host chain.
+static ggml_tensor * resolve_fused_lm_head(ggml_tensor * lm_head,
+                                           const DevicePlacement & device,
+                                           int draft_gpu) {
+    if (!lm_head || !lm_head->buffer) return nullptr;
+    const ggml_backend_buffer_type_t lm_head_buft =
+        ggml_backend_buffer_get_type(lm_head->buffer);
+    if (!ggml_backend_buft_is_meta(lm_head_buft)) {
+        // A simple tensor is safe only when it is local to the draft backend,
+        // or when peer access was successfully enabled for the actual target
+        // and draft GPU pair. The configuration flag alone is not proof that
+        // the hardware/driver accepted peer access.
+        const ggml_backend_dev_t tensor_dev =
+            ggml_backend_buft_get_device(lm_head_buft);
+        const ggml_backend_dev_t draft_dev =
+            ggml_backend_buft_get_device(
+                ggml_backend_cuda_buffer_type(draft_gpu));
+        if (tensor_dev != draft_dev) {
+            const ggml_backend_dev_t target_dev =
+                ggml_backend_buft_get_device(
+                    ggml_backend_cuda_buffer_type(device.gpu));
+            if (tensor_dev != target_dev ||
+                !cross_device_peer_memcpy_ok(device.gpu, draft_gpu)) {
+                return nullptr;
+            }
+        }
+        return lm_head;
+    }
+    // Meta tensor: the lm_head is mirrored (full copy) on every rank. Read
+    // it from the rank that matches the draft GPU so the fused graph does a
+    // local read on the draft backend.
+    for (size_t j = 0; j < device.layer_split_gpus.size(); ++j) {
+        if (device.layer_split_gpus[j] == draft_gpu) {
+            ggml_tensor * simple = ggml_backend_meta_simple_tensor(lm_head, j);
+            if (!simple || !simple->data) return nullptr;
+            GGML_ASSERT(ggml_are_same_shape(simple, lm_head));
+            return simple;
+        }
+    }
+    // Draft GPU is not a target rank; fall back to the host chain.
+    return nullptr;
+}
+
+// Adaptive speculation policy: a spec step (draft + heads + width-q verify)
+// costs about DFLASH_QWEN35_SPEC_STEP_RATIO plain-decode steps, so it only
+// pays off while the drafter gets more than (ratio - 1) of its tokens
+// accepted per step. Below that (low-acceptance prose) the loop runs
+// DFLASH_QWEN35_AR_BURST plain-decode steps inside the spec loop (target
+// forward on the seed token only, features still captured for the drafter),
+// then probes with one spec step. Set DFLASH_QWEN35_SPEC_STEP_RATIO=0 to
+// disable the policy.
+struct Qwen35AdaptiveSpecPolicy {
+    float step_ratio = 1.9f;   // spec/plain step cost used until both step kinds have been timed
+                               // (measured 54-55 vs 28.6 ms on gfx1201 for width-8 and width-16 verify)
+    int   burst      = 40;     // plain-decode steps per burst (each burst ends with one spec probe step)
+    float ema_alpha  = 0.1f;   // slow EMA: ~10-step memory so bursty acceptance does not flap
+    bool  enabled() const { return step_ratio > 1.0f && burst > 0; }
+    // Enter a burst only clearly below break-even (hysteresis against noise).
+    // `ratio` is the live spec/plain step-time ratio once measured.
+    float accept_threshold(float ratio) const { return 0.8f * (ratio - 1.0f); }
+    float accept_threshold() const { return accept_threshold(step_ratio); }
+};
+
+static Qwen35AdaptiveSpecPolicy qwen35_adaptive_spec_policy() {
+    static const Qwen35AdaptiveSpecPolicy kPolicy = []() {
+        Qwen35AdaptiveSpecPolicy p;
+        if (const char * e = std::getenv("DFLASH_QWEN35_SPEC_STEP_RATIO")) {
+            p.step_ratio = (float)std::atof(e);
+        }
+        if (const char * e = std::getenv("DFLASH_QWEN35_AR_BURST")) {
+            p.burst = std::atoi(e);
+        }
+        return p;
+    }();
+    return kPolicy;
+}
+
 bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                                     std::vector<int32_t> & out_tokens,
                                     const DaemonIO & io,
@@ -2680,6 +2954,17 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
     const int _min_floor = dflash_min_tokens_floor();
 
+    // A mid-emit override (stall-floor tool injection or budget force-close)
+    // restores the pre-step snapshot and replays the overridden prefix. When
+    // either hook is armed, plain-decode burst steps must take the snapshot
+    // too: their rollback-free fast path otherwise skips it, and the restore
+    // would copy back state up to a whole burst stale.
+    const bool replay_hooks_armed =
+        (budget_hook && !budget_hook->close_token_ids.empty()) ||
+        (_min_floor > 0 &&
+         stall_tool_prefix_tokens && !stall_tool_prefix_tokens->empty() &&
+         stall_action_suffix_tokens && !stall_action_suffix_tokens->empty());
+
     // ── DFlash spec-decode: draft → verify → accept → replay ──────────
 
     DFlashTarget * target = dflash_target();
@@ -2706,9 +2991,28 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     const int q_len = dw_.block_size > 0 ? dw_.block_size : DFLASH27B_DRAFT_BLOCK_SIZE;
     const bool anchor_dspark = dw_.dspark.enabled && dw_.sample_from_anchor;
     const int full_verify_len = q_len + (anchor_dspark ? 1 : 0);
+    constexpr int kLongCtxNarrowTokens = 8192;
+    constexpr int kLongCtxMinVerify = 8;
+    // The 8K crossover was measured for the Qwen DFlash2 attention path.
+    // Ling uses a different KDA/MLA target, so keep its full adaptive range
+    // until it has its own matched long-context calibration.
+    const int verify_cap = !w_.is_bailingmoe3 &&
+            committed >= kLongCtxNarrowTokens
+        ? std::min(full_verify_len,
+                   std::max(kLongCtxMinVerify, q_len / 2))
+        : full_verify_len;
+    if (verify_cap != full_verify_len) {
+        static std::atomic<bool> s_narrowed_logged{false};
+        if (!s_narrowed_logged.exchange(true)) {
+            std::fprintf(stderr,
+                "[qwen35-spec] context %d >= %d: capping verify width %d -> %d\n",
+                committed, kLongCtxNarrowTokens, full_verify_len, verify_cap);
+        }
+    }
     bool verify_width_overridden = false;
-    const int configured_verify_len =
-        dspark_chain_verify_width(dw_, &verify_width_overridden);
+    const int configured_verify_len = std::min(
+        dspark_chain_verify_width(dw_, &verify_width_overridden),
+        verify_cap);
     const bool adaptive_verify_width =
         anchor_dspark && !verify_width_overridden &&
         adaptive_spec_width_globally_enabled();
@@ -2716,7 +3020,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     // controller may open the full parallel DSpark block after a stable run.
     // The cap remains available for qualification and operational rollback.
     const int adaptive_verify_cap = adaptive_verify_width
-        ? dspark_adaptive_max_verify_width(full_verify_len, full_verify_len)
+        ? std::min(
+            dspark_adaptive_max_verify_width(full_verify_len, full_verify_len),
+            verify_cap)
         : configured_verify_len;
     // Ling's fixed-width calibration peaks at root + four candidates. Start
     // there, jump across the parallel block only after sustained acceptance,
@@ -2793,7 +3099,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     // The draft checkpoint owns the noise-token contract.  This can differ
     // from a target-family default (Ling DSpark is one such case), so use the
     // value parsed and vocabulary-checked by the draft loader.
-    const int32_t mask_token = dw_.mask_token_id;
+    const int32_t mask_token =
+        (!use_remote_draft && dw_.mask_token_id >= 0)
+            ? dw_.mask_token_id : target->mask_token_id();
     std::vector<float> mask_embed((size_t)hidden);
     if (!target->embed_tokens(&mask_token, 1, mask_embed.data())) {
         std::fprintf(stderr,
@@ -2804,6 +3112,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
     int n_generated     = 0;
     int n_draft_steps   = 0;
+    int n_spec_steps    = 0;
     int n_accept_sum    = 0;
     int n_offered_sum   = 0;
     std::vector<int> verify_width_hist((size_t)full_verify_len + 1, 0);
@@ -2821,7 +3130,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         // branches before that record point, so retain its historical fixed-
         // width denominator rather than reporting a synthetic 1-token total.
         const int offered = n_offered_sum > 0
-            ? n_offered_sum : n_draft_steps * configured_verify_len;
+            ? n_offered_sum : n_spec_steps * configured_verify_len;
         return std::max(1, offered);
     };
 
@@ -2886,16 +3195,51 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
     auto t_dec0 = std::chrono::steady_clock::now();
 
+    // Adaptive speculation state (see Qwen35AdaptiveSpecPolicy).
+    const Qwen35AdaptiveSpecPolicy adaptive = qwen35_adaptive_spec_policy();
+    // Start well above the burst threshold so an unlucky opening does not
+    // park a predictable stream in plain decode. The probe step that ends a
+    // burst updates the EMA with a fast alpha (see below) so a stream that
+    // turned predictable leaves plain decode quickly.
+    float accepted_ema = 2.0f * adaptive.accept_threshold();
+    int   ar_burst_left = 0;
+    int   n_ar_burst_steps = 0;
+    bool  probe_step = false;   // first spec step after a burst
+    // Live step-time EMAs (seconds) for the break-even ratio; 0 = not yet measured.
+    double t_spec_step_ema = 0.0;
+    double t_ar_step_ema   = 0.0;
+    auto live_step_ratio = [&]() {
+        return (t_spec_step_ema > 0.0 && t_ar_step_ema > 0.0)
+            ? (float)(t_spec_step_ema / t_ar_step_ema) : adaptive.step_ratio;
+    };
+
     while (n_generated < n_gen) {
         const int verify_len = adaptive_verify_width
             ? verify_width_controller.next_width(adaptive_verify_cap)
             : configured_verify_len;
         const int need_commit_budget = n_gen - n_generated;
+        // Plain-decode step inside the spec loop: no drafter forward, verify
+        // the seed token only. Features are still captured, so the drafter
+        // resumes cleanly on the next probe step.
+        bool ar_step = adaptive.enabled() && ar_burst_left > 0;
+        // Pending tool-call hints verify at near-100% acceptance; a plain
+        // decode burst would ignore them for up to `burst` tokens, so end
+        // the burst as soon as hints are available.
+        if (ar_step && hint_tokens && n_generated < (int)hint_tokens->size()) {
+            ar_burst_left = 0;
+            ar_step = false;
+        }
+        if (ar_step) {
+            ar_burst_left--;
+            n_ar_burst_steps++;
+            probe_step = (ar_burst_left == 0);
+        }
+        const auto t_step_start = std::chrono::steady_clock::now();
         const Qwen35RoctxMetadata spec_roctx{
-            /*live=*/1, /*bucket=*/verify_len,
+            /*live=*/1, /*bucket=*/ar_step ? 1 : verify_len,
             /*prefill_tokens=*/0, /*prefill_segments=*/0,
-            /*total_rows=*/verify_len,
-            /*max_kv_len=*/committed + verify_len};
+            /*total_rows=*/ar_step ? 1 : verify_len,
+            /*max_kv_len=*/committed + (ar_step ? 1 : verify_len)};
 
         // Budget hook: no tail-off here. The close-token injection fires
         // during the emit phase (step 8) after acceptance+replay, mirroring
@@ -2926,24 +3270,31 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             return ok;
         }
 
-        // 1. Build noise input for draft
-        const auto profile_noise_start = profile_start();
-        noise_ids[0] = last_tok;
-        for (int i = 1; i < q_len; ++i) {
-            noise_ids[(size_t)i] = mask_token;
-            std::memcpy(noise_embed.data() + (size_t)i * (size_t)hidden,
-                        mask_embed.data(), sizeof(float) * (size_t)hidden);
+        // 1. Build noise input for draft. Only the seed changes; the mask
+        // embedding tail was expanded once above and remains stable.
+        if (!ar_step) {
+            const auto profile_noise_start = profile_start();
+            noise_ids[0] = last_tok;
+            for (int i = 1; i < q_len; ++i) {
+                noise_ids[(size_t)i] = mask_token;
+                std::memcpy(noise_embed.data() + (size_t)i * (size_t)hidden,
+                            mask_embed.data(), sizeof(float) * (size_t)hidden);
+            }
+            if (!target->embed_tokens(noise_ids.data(), 1, noise_embed.data())) {
+                std::fprintf(stderr,
+                    "spec-decode: noise embed failed (last_tok=%d mask=%d q_len=%d)\n",
+                    last_tok, mask_token, q_len);
+                step_graph_destroy(draft_sg);
+                return false;
+            }
+            profile_add(profile_noise_s, profile_noise_start);
         }
-        if (!target->embed_tokens(noise_ids.data(), 1, noise_embed.data())) {
-            std::fprintf(stderr, "spec-decode: noise embed failed (last_tok=%d mask=%d q_len=%d)\n",
-                         last_tok, mask_token, q_len);
-            step_graph_destroy(draft_sg);
-            return false;
-        }
-        profile_add(profile_noise_s, profile_noise_start);
 
-        // 2. Draft compute
+        // 2. Draft compute (skipped on plain-decode burst steps)
         constexpr int DRAFT_CTX_MAX_DEFAULT = 2048;
+        bool used_draft_kv = false;
+        ggml_tensor * resident_draft_hidden = nullptr;
+        if (!ar_step) {
         const int ring_cap = use_remote_draft
             ? remote_draft_.ring_cap() : local_feature_source->cap;
         const int draft_ctx = std::min(committed,
@@ -2955,8 +3306,6 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             draft_feature_mirror_can_view(
                 *local_feature_source, committed, draft_ctx, mirror_slot0);
 
-        bool used_draft_kv = false;
-        ggml_tensor * resident_draft_hidden = nullptr;
         const bool can_project_resident_dspark =
             !use_remote_draft && dw_.dspark.enabled &&
             target->lm_head_tensor() != nullptr &&
@@ -3108,22 +3457,22 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                     step_graph_destroy(draft_sg);
                     return false;
                 }
-                ggml_backend_tensor_set(draft_sg.inp_embed, noise_embed.data(), 0,
-                                        sizeof(float) * noise_embed.size());
-                pos_k.resize((size_t)draft_ctx + q_len);
-                for (int i = 0; i < q_len; i++) pos_q[i] = draft_ctx + i;
-                for (int i = 0; i < draft_ctx + q_len; i++) pos_k[i] = i;
-                ggml_backend_tensor_set(draft_sg.positions, pos_q.data(), 0,
-                                        sizeof(int32_t) * pos_q.size());
-                ggml_backend_tensor_set(draft_sg.positions_k, pos_k.data(), 0,
-                                        sizeof(int32_t) * pos_k.size());
+                    ggml_backend_tensor_set(draft_sg.inp_embed, noise_embed.data(), 0,
+                                            sizeof(float) * noise_embed.size());
+                    pos_k.resize((size_t)draft_ctx + q_len);
+                    for (int i = 0; i < q_len; i++) pos_q[i] = draft_ctx + i;
+                    for (int i = 0; i < draft_ctx + q_len; i++) pos_k[i] = i;
+                    ggml_backend_tensor_set(draft_sg.positions, pos_q.data(), 0,
+                                            sizeof(int32_t) * pos_q.size());
+                    ggml_backend_tensor_set(draft_sg.positions_k, pos_k.data(), 0,
+                                            sizeof(int32_t) * pos_k.size());
 
-                auto st = ggml_backend_graph_compute(draft_backend_, draft_sg.gf);
-                if (st != GGML_STATUS_SUCCESS) {
-                    std::fprintf(stderr, "spec-decode: draft compute failed\n");
-                    step_graph_destroy(draft_sg);
-                    return false;
-                }
+                    auto st = ggml_backend_graph_compute(draft_backend_, draft_sg.gf);
+                    if (st != GGML_STATUS_SUCCESS) {
+                        std::fprintf(stderr, "spec-decode: draft compute failed\n");
+                        step_graph_destroy(draft_sg);
+                        return false;
+                    }
 
                 if (can_project_resident_dspark) {
                     resident_draft_hidden = draft_sg.hidden_states;
@@ -3135,8 +3484,8 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                         sizeof(float) * local_hidden.size());
                 }
             }
-        }
-        profile_add(profile_draft_s, profile_draft_start);
+            profile_add(profile_draft_s, profile_draft_start);
+        }  // !ar_step
 
         // ── DDTree tree-structured verify ────────────────────────────────
         // When --ddtree is on and the target supports tree verify, build a
@@ -3168,91 +3517,198 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
              kvflash_pager_.identity_prefix_covers(committed));
         const bool use_tree_verify =
             cfg_.ddtree_mode && target->supports_tree_verify() && kvflash_tree_ok &&
-            !use_remote_draft && !dw_.dspark.enabled && q_len > 1 && tree_special_inactive;
+            !use_remote_draft && !dw_.dspark.enabled && q_len > 1 &&
+            tree_special_inactive && !ar_step;
 
+        // Chain-verify length for this step. The DSpark confidence gate may
+        // truncate the drafted block (adaptive block length); q_len stays the
+        // buffer-sizing upper bound.
+        int v_len = q_len;
         // DDTree consumes top-K rows directly. Avoid projecting the same
         // hidden block once for argmax and again for top-K on every step.
-        if (!use_tree_verify) {
+        if (ar_step) {
+            draft_tok.assign(1, last_tok);
+            v_len = 1;
+        } else if (!use_tree_verify) {
             const auto profile_project_start = profile_start();
-            bool projected = false;
-            {
-                const Qwen35RoctxRange roctx_project(
-                    dw_.dspark.enabled
-                        ? "qwen35.spec.dspark_project"
-                        : "qwen35.spec.project",
-                    spec_roctx);
-                if (dw_.dspark.enabled) {
-                    if (used_draft_kv &&
-                        !draft_kv_.dspark_tokens.empty()) {
-                        const int n_tokens =
-                            (int)draft_kv_.dspark_tokens.size();
+            bool used_dspark = false;
+
+            // Ling's DSpark drafter can keep hidden states and the target head
+            // resident on the draft GPU, or emit the corrected token chain
+            // directly from the cached draft graph. Avoid a host round trip
+            // on this path.
+            if (anchor_dspark) {
+                bool projected = false;
+                if (used_draft_kv && !draft_kv_.dspark_tokens.empty()) {
+                    const int n_tokens = (int)draft_kv_.dspark_tokens.size();
+                    if (n_tokens <= 16) {
                         int32_t token_ids[16] = {};
-                        if (n_tokens > 16) {
-                            projected = false;
-                        } else {
-                            for (int i = 0; i < n_tokens; ++i) {
-                                ggml_backend_tensor_get_async(
-                                    draft_backend_,
-                                    draft_kv_.dspark_tokens[(size_t)i],
-                                    &token_ids[i], 0, sizeof(int32_t));
-                            }
-                            ggml_backend_synchronize(draft_backend_);
-                            draft_tok.assign((size_t)n_tokens + 1, 0);
-                            draft_tok[0] = last_tok;
-                            for (int i = 0; i < n_tokens; ++i) {
-                                draft_tok[(size_t)i + 1] = token_ids[i];
-                            }
-                            projected = true;
+                        for (int i = 0; i < n_tokens; ++i) {
+                            ggml_backend_tensor_get_async(
+                                draft_backend_,
+                                draft_kv_.dspark_tokens[(size_t)i],
+                                &token_ids[i], 0, sizeof(int32_t));
                         }
-                    } else if (resident_draft_hidden) {
-                        projected =
-                            dspark_markov_correct_greedy_chain_fused_tensor(
-                                dw_, draft_backend_, target->lm_head_tensor(),
-                                resident_draft_hidden, q_len, last_tok, draft_tok,
-                                dspark_chain_cache_);
-                        if (!projected) {
-                            // Keep the established host-input graph as a safe
-                            // fallback for backends that cannot consume an
-                            // externally allocated tensor view.
-                            local_hidden.resize((size_t)hidden * q_len);
-                            ggml_backend_tensor_get(
-                                resident_draft_hidden, local_hidden.data(), 0,
-                                sizeof(float) * local_hidden.size());
-                            projected = dspark_markov_correct_greedy_chain_fused(
-                                dw_, draft_backend_, target->lm_head_tensor(),
-                                local_hidden.data(), q_len, last_tok, draft_tok);
+                        ggml_backend_synchronize(draft_backend_);
+                        draft_tok.assign((size_t)n_tokens + 1, 0);
+                        draft_tok[0] = last_tok;
+                        for (int i = 0; i < n_tokens; ++i) {
+                            draft_tok[(size_t)i + 1] = token_ids[i];
                         }
-                    } else if (target->lm_head_tensor() &&
-                               target->fused_head_backend() == draft_backend_) {
+                        projected = true;
+                    }
+                } else if (resident_draft_hidden) {
+                    projected = dspark_markov_correct_greedy_chain_fused_tensor(
+                        dw_, draft_backend_, target->lm_head_tensor(),
+                        resident_draft_hidden, q_len, last_tok, draft_tok,
+                        dspark_chain_cache_);
+                    if (!projected) {
+                        local_hidden.resize((size_t)hidden * q_len);
+                        ggml_backend_tensor_get(
+                            resident_draft_hidden, local_hidden.data(), 0,
+                            sizeof(float) * local_hidden.size());
                         projected = dspark_markov_correct_greedy_chain_fused(
                             dw_, draft_backend_, target->lm_head_tensor(),
                             local_hidden.data(), q_len, last_tok, draft_tok);
-                    } else {
-                        projected = dspark_markov_correct_greedy_chain(
-                            dw_, draft_backend_, *target, local_hidden.data(), q_len,
-                            last_tok, /*confidence_threshold=*/0.0f, draft_tok);
                     }
+                } else if (target->lm_head_tensor() &&
+                           target->fused_head_backend() == draft_backend_) {
+                    projected = dspark_markov_correct_greedy_chain_fused(
+                        dw_, draft_backend_, target->lm_head_tensor(),
+                        local_hidden.data(), q_len, last_tok, draft_tok);
                 } else {
-                    projected = target->project_hidden_to_tokens(
-                        local_hidden.data(), q_len, draft_tok);
-                    if (projected) draft_tok[0] = last_tok;
+                    projected = dspark_markov_correct_greedy_chain(
+                        dw_, draft_backend_, *target, local_hidden.data(), q_len,
+                        last_tok, /*confidence_threshold=*/0.0f, draft_tok);
+                }
+
+                if (projected &&
+                    (int)draft_tok.size() >= verify_len &&
+                    (int)draft_tok.size() <= full_verify_len &&
+                    verify_len < (int)draft_tok.size()) {
+                    draft_tok.resize((size_t)verify_len);
+                }
+                if (!projected || (int)draft_tok.size() != verify_len) {
+                    std::fprintf(
+                        stderr,
+                        "spec-decode: DSpark projection failed "
+                        "(got=%zu expected=%d)\n",
+                        draft_tok.size(), verify_len);
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
+                used_dspark = true;
+                v_len = verify_len;
+            }
+
+            // DFlash 2 selector (top-k candidates + low-rank path score) when
+            // the drafter ships it.
+            if (!used_dspark && dw_.selector.enabled && q_len > 1 &&\n                !sampled_verify && !use_remote_draft) {
+                static std::atomic<bool> s_sel_logged{false};
+                if (!s_sel_logged.exchange(true)) {
+                    std::fprintf(stderr,
+                        "[qwen35-spec] DFlash 2 selector active for greedy chain decode "
+                        "(rank=%d top_k=%d)\n", dw_.selector.rank, dw_.selector.top_k);
+                }
+                if (dflash2_select_chain(dw_, draft_backend_, *target,
+                                         local_hidden.data(), q_len, last_tok, draft_tok)) {
+                    used_dspark = true;
+                    v_len = std::max(1, (int)draft_tok.size());
+                } else {
+                    static std::atomic<bool> s_sel_warned{false};
+                    if (!s_sel_warned.exchange(true)) {
+                        std::fprintf(stderr,
+                            "[qwen35-spec] DFlash 2 selector failed; falling back to "
+                            "base DFlash projection\n");
+                    }
                 }
             }
+            // DSpark heads (markov bigram correction + optional confidence
+            // gate) when the drafter ships them; mirrors the laguna hook.
+            if (!used_dspark && qwen35_dspark_enabled() && dw_.dspark.enabled &&
+                q_len > 1 && !sampled_verify && !use_remote_draft) {
+                static std::atomic<bool> s_dspark_logged{false};
+                if (!s_dspark_logged.exchange(true)) {
+                    std::fprintf(stderr,
+                        "[qwen35-spec] DSpark Markov head active for greedy chain decode "
+                        "(rank=%d vocab=%d confidence_dim=%d)\n",
+                        dw_.dspark.markov_rank, dw_.dspark.vocab_size,
+                        dw_.dspark.confidence_dim);
+                }
+                static const bool fused_dspark = []() {
+                    const char * e = std::getenv("DFLASH_QWEN35_FUSED_DSPARK");
+                    return !(e && e[0] == '0' && e[1] == '\0');
+                }();
+                bool ds_ok = false;
+                const float conf_threshold = qwen35_dspark_confidence_threshold();
+                if (fused_dspark) {
+                    // One graph for every candidate: markov-corrected tokens
+                    // plus (when gated) the confidence score per position.
+                    // The lm_head must be readable on the draft backend; in
+                    // tensor-parallel mode that is the simple tensor of the
+                    // rank matching the draft GPU (lm_head is mirrored on
+                    // every rank).
+                    std::vector<float> conf_scores;
+                    ggml_tensor * fused_lm_head =
+                        resolve_fused_lm_head(target->lm_head_tensor(),
+                                              cfg_.device, cfg_.draft_gpu);
+                    if (fused_lm_head) {
+                        ds_ok = dspark_markov_correct_greedy_chain_fused(
+                            dw_, draft_backend_, fused_lm_head,
+                            local_hidden.data(), q_len, last_tok, draft_tok,
+                            conf_threshold > 0.0f ? &conf_scores : nullptr);
+                    }
+                    if (ds_ok && conf_threshold > 0.0f) {
+                        // Truncate the chain at the first low-confidence
+                        // position: draft_tok[0] is the seed, candidate i
+                        // scores conf_scores[i-1].
+                        size_t keep = 1;
+                        while (keep < draft_tok.size() &&
+                               keep - 1 < conf_scores.size() &&
+                               conf_scores[keep - 1] >= conf_threshold) {
+                            ++keep;
+                        }
+                        static const bool conf_debug = []() {
+                            const char * e = std::getenv("DFLASH_QWEN35_DSPARK_CONF_DEBUG");
+                            return e && e[0] == '1';
+                        }();
+                        if (conf_debug) {
+                            std::fprintf(stderr, "[dspark-conf] keep=%zu/%zu:", keep, draft_tok.size());
+                            for (float c : conf_scores) std::fprintf(stderr, " %.3f", c);
+                            std::fprintf(stderr, "\n");
+                        }
+                        draft_tok.resize(keep);
+                    }
+                }
+                if (!ds_ok) {
+                    ds_ok = dspark_markov_correct_greedy_chain(dw_, draft_backend_, *target,
+                                                       local_hidden.data(), q_len,
+                                                       last_tok, conf_threshold,
+                                                       draft_tok);
+                }
+                if (ds_ok) {
+                    used_dspark = true;
+                    // Confidence gate truncates the drafted chain: verify
+                    // only the confident prefix this step.
+                    v_len = std::max(1, (int)draft_tok.size());
+                } else {
+                    static std::atomic<bool> s_dspark_warned{false};
+                    if (!s_dspark_warned.exchange(true)) {
+                        std::fprintf(stderr,
+                            "[qwen35-spec] DSpark Markov head failed; falling back to "
+                            "base DFlash projection\n");
+                    }
+                }
+            }
+            if (!used_dspark) {
+                if (!target->project_hidden_to_tokens(local_hidden.data(), q_len, draft_tok)) {
+                    std::fprintf(stderr, "spec-decode: projection failed\n");
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
+                draft_tok[0] = last_tok;
+            }
             profile_add(profile_project_s, profile_project_start);
-            if (projected && anchor_dspark &&
-                (int)draft_tok.size() >= verify_len &&
-                (int)draft_tok.size() <= full_verify_len &&
-                verify_len < (int)draft_tok.size()) {
-                draft_tok.resize((size_t)verify_len);
-            }
-            if (!projected || (int)draft_tok.size() != verify_len) {
-                std::fprintf(stderr,
-                    "spec-decode: %s projection failed (got=%zu expected=%d)\n",
-                    dw_.dspark.enabled ? "DSpark" : "draft",
-                    draft_tok.size(), verify_len);
-                step_graph_destroy(draft_sg);
-                return false;
-            }
         }
 
         if (use_tree_verify) {
@@ -3343,10 +3799,68 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                     return false;
                 }
             } else {
-                std::vector<float> top_lp;
+                // DFlash2 selector-scored tree (DARTree-style): branch scores
+                // are logp + selector compatibility with the branch's actual
+                // parent, so the tree at worst degenerates to the selector
+                // chain. DFLASH_QWEN35_DFLASH2_TREE=0 falls back to raw top-k.
+                static const bool dflash2_tree = []() {
+                    const char * e = std::getenv("DFLASH_QWEN35_DFLASH2_TREE");
+                    return !(e && e[0] == '0' && e[1] == '\0');
+                }();
+                bool selector_tree_ok = false;
+                if (dflash2_tree && dw_.selector.enabled && !use_remote_draft) {
+                    Dflash2TreeScores sc;
+                    const auto profile_project_start = profile_start();
+                    if (dflash2_score_candidates(dw_, draft_backend_, *target,
+                                                 local_hidden.data(), q_len, last_tok,
+                                                 cfg_.ddtree_temp, sc)) {
+                        static std::atomic<bool> s_seltree_logged{false};
+                        if (!s_seltree_logged.exchange(true)) {
+                            std::fprintf(stderr,
+                                "[qwen35-spec] DFlash2 selector scores active for DDTree candidates\n");
+                        }
+                        DDTreeConditionalTopK selector_topk =
+                            [&](const std::vector<int32_t> & prefix, int next_depth,
+                                std::vector<float> & lp, std::vector<int32_t> & ids) -> bool {
+                            if (!sc.topk(prefix, next_depth, lp, ids)) return false;
+                            if ((int)lp.size() > K) { lp.resize((size_t)K); ids.resize((size_t)K); }
+                            return true;
+                        };
+                        tree = build_ddtree_conditional(
+                            selector_topk, L, K, cfg_.ddtree_budget,
+                            cfg_.ddtree_chain_seed, cfg_.ddtree_tau);
+                        selector_tree_ok = tree.n_nodes > 0;
+                    }
+                    profile_add(profile_project_s, profile_project_start);
+                }
+                if (!selector_tree_ok) {
+                std::vector<float>   top_lp;
                 std::vector<int32_t> top_ids;
                 const auto profile_project_start = profile_start();
-                if (!target->project_hidden_to_topk(local_hidden.data(), q_len, K,
+                static const bool dspark_tree = []() {
+                    const char * e = std::getenv("DFLASH_QWEN35_DSPARK_TREE");
+                    return !(e && e[0] == '0' && e[1] == '\0');
+                }();
+                bool topk_ok = false;
+                if (dspark_tree && qwen35_dspark_enabled() && dw_.dspark.enabled) {
+                    static std::atomic<bool> s_dstree_logged{false};
+                    if (!s_dstree_logged.exchange(true)) {
+                        std::fprintf(stderr,
+                            "[qwen35-spec] DSpark Markov head active for DDTree candidates\n");
+                    }
+                    ggml_tensor * fused_lm_head =
+                        resolve_fused_lm_head(target->lm_head_tensor(),
+                                              cfg_.device, cfg_.draft_gpu);
+                    if (fused_lm_head) {
+                        topk_ok = dspark_markov_project_topk(dw_, draft_backend_,
+                                                             fused_lm_head,
+                                                             local_hidden.data(), q_len, K,
+                                                             cfg_.ddtree_temp, last_tok,
+                                                             top_lp, top_ids);
+                    }
+                }
+                if (!topk_ok &&
+                    !target->project_hidden_to_topk(local_hidden.data(), q_len, K,
                                                     cfg_.ddtree_temp,
                                                     top_lp, top_ids)) {
                     std::fprintf(stderr,
@@ -3360,6 +3874,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                     top_ids.data() + (size_t)K,
                     L, K, cfg_.ddtree_budget, cfg_.ddtree_chain_seed,
                     cfg_.ddtree_tau);
+                }
             }
             // SpecLA schedules the retained topology directly. Never execute
             // fake padding nodes: confidence pruning must reduce target work,
@@ -3626,12 +4141,22 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             continue;
         }
 
+        // 3a-ter. Long-context verify cap. Drafting is done; trim the block
+        // we actually check. Hint injection below fills draft_tok[1..v_len-1],
+        // so it sees the capped width and stays consistent.
+        if (!ar_step && v_len > verify_cap) {
+            v_len = verify_cap;
+            if ((int)draft_tok.size() > verify_cap) {
+                draft_tok.resize((size_t)verify_cap);
+            }
+        }
+
         // 3b. Tool call hint injection: override draft tokens with pre-known
         // structural tokens for near-100% acceptance.
         int hint_fill = 0;
         if (hint_tokens && n_generated < (int)hint_tokens->size()) {
             const int hint_avail = (int)hint_tokens->size() - n_generated;
-            hint_fill = std::min(hint_avail, verify_len - 1);
+            hint_fill = std::min(hint_avail, v_len - 1);
             for (int i = 0; i < hint_fill; i++) {
                 draft_tok[1 + i] = (*hint_tokens)[n_generated + i];
             }
@@ -3642,10 +4167,13 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             io.observer("draft", draft_tok);
         }
 
-        // 4. Verify: snapshot KV, run target forward over draft tokens
+        // 4. Verify: snapshot KV, run target forward over draft tokens.
+        // A plain-decode step cannot roll back unless an emit-phase hook is
+        // armed, so avoid the snapshot copy on the ordinary AR burst path.
+        const bool step_has_snapshot = !ar_step || replay_hooks_armed;
         const auto profile_snapshot_start = profile_start();
-        bool snapshot_ok = false;
-        {
+        bool snapshot_ok = true;
+        if (step_has_snapshot) {
             const Qwen35RoctxRange roctx_snapshot(
                 "qwen35.spec.snapshot", spec_roctx);
             snapshot_ok = target->snapshot_kv();
@@ -3670,7 +4198,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         profile_add(profile_verify_s, profile_verify_start);
         if (!verify_ok) {
             std::fprintf(stderr, "spec-decode: verify failed\n");
-            target->restore_kv();
+            // Only restore when this step actually took the snapshot;
+            // otherwise the copy-back would be up to a whole burst stale.
+            if (step_has_snapshot) target->restore_kv();
             step_graph_destroy(draft_sg);
             return false;
         }
@@ -3684,13 +4214,13 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         int accept_n = 1;
         int bonus_tok = -1;
         if (sampled_verify) {
-            if (!target->read_verify_logits(verify_len, verify_logits)) {
+            if (!target->read_verify_logits(v_len, verify_logits)) {
                 std::fprintf(stderr, "spec-decode: verify logits read failed\n");
-                target->restore_kv();
+                if (step_has_snapshot) target->restore_kv();
                 step_graph_destroy(draft_sg);
                 return false;
             }
-            const int vocab_v = (int)(verify_logits.size() / (size_t)verify_len);
+            const int vocab_v = (int)(verify_logits.size() / (size_t)v_len);
             static const bool kSvDebug = []() {
                 const char * e = std::getenv("DFLASH_SV_DEBUG");
                 return e != nullptr && std::string(e) == "1";
@@ -3699,7 +4229,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 // Row-alignment check: CPU argmax over each bulk-read row must
                 // equal the GPU argmax (target_tok). Divergence = misaligned
                 // or stale bulk read.
-                for (int i = 0; i < verify_len; i++) {
+                for (int i = 0; i < v_len; i++) {
                     const float * row = verify_logits.data() + (size_t)i * vocab_v;
                     int am = 0; float best = row[0];
                     for (int v = 1; v < vocab_v; v++)
@@ -3724,7 +4254,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             verify_history = out_tokens;
             verify_history.push_back(draft_tok[0]);
             bool mismatched = false;
-            for (int i = 0; i < verify_len - 1; i++) {
+            for (int i = 0; i < v_len - 1; i++) {
                 const int s = sample_logits(
                     verify_logits.data() + (size_t)i * vocab_v, vocab_v,
                     sampler_, verify_history, sampler_rng_);
@@ -3745,17 +4275,19 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             }
             (void)mismatched;
         } else {
-            for (int i = 0; i < verify_len - 1; i++) {
+            for (int i = 0; i < v_len - 1; i++) {
                 if (draft_tok[i + 1] == target_tok[i]) accept_n++;
                 else break;
             }
-            bonus_tok = (accept_n < verify_len) ? target_tok[accept_n - 1] : -1;
+            bonus_tok = (accept_n < v_len) ? target_tok[accept_n - 1] : -1;
         }
-        n_offered_sum += verify_len;
-        if ((size_t)verify_len < verify_width_hist.size()) {
-            ++verify_width_hist[(size_t)verify_len];
+        if (!ar_step) {
+            n_offered_sum += v_len;
+            if ((size_t)v_len < verify_width_hist.size()) {
+                ++verify_width_hist[(size_t)v_len];
+            }
+            verify_width_controller.observe(accept_n, v_len);
         }
-        verify_width_controller.observe(accept_n, verify_len);
         // Track hint acceptance telemetry.
         if (hint_fill > 0) {
             n_hint_proposed += hint_fill;
@@ -3784,7 +4316,14 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
         int replay_last_tok = -1;
         bool fast_rolled_back = false;
-        if (use_fast_rollback) {
+        if (ar_step) {
+            // Seed-only verify: the recurrent state already sits after the
+            // one committed token; nothing to restore.
+            bonus_tok = -1;
+            commit_n = std::min(accept_n, need_commit_budget);
+            replay_last_tok = target_tok[commit_n - 1];
+            fast_rolled_back = true;
+        } else if (use_fast_rollback) {
             // Fast rollback: restore SSM from captured intermediates, skip replay.
             // Implicit bonus: target_tok[commit_n-1] seeds next draft as draft_tok[0],
             // always accepted on next step.
@@ -4018,8 +4557,39 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         }
         cache_.cur_pos = committed;
         n_generated += emitted + injected;
-        n_accept_sum += std::min(accept_n, emitted);
+        // Only steps that proposed a full draft block enter the accept-rate
+        // accounting; 1-token burst steps would otherwise dilute the rate
+        // that steers the PFlash residency bandit.
+        if (!ar_step) {
+            n_accept_sum += std::min(accept_n, emitted);
+            n_spec_steps++;
+        }
         n_draft_steps++;
+
+        // Adaptive policy update on real spec steps: EMA of accepted draft
+        // tokens (the seed is always accepted); a low EMA schedules a burst
+        // of plain-decode steps, the step after the burst is a spec probe.
+        if (adaptive.enabled()) {
+            const double t_step = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - t_step_start).count();
+            double & t_ema = ar_step ? t_ar_step_ema : t_spec_step_ema;
+            t_ema = (t_ema > 0.0) ? 0.9 * t_ema + 0.1 * t_step : t_step;
+        }
+        if (adaptive.enabled() && !ar_step) {
+            const float accepted_drafts = (float)std::max(0, accept_n - 1);
+            // A probe (first spec step after a burst) weighs its result
+            // heavily: it is the only evidence about the current text.
+            const float alpha = probe_step ? 0.5f : adaptive.ema_alpha;
+            accepted_ema = (1.0f - alpha) * accepted_ema + alpha * accepted_drafts;
+            probe_step = false;
+            // A plain-decode burst commits greedy argmax tokens without
+            // passing through the sampler chain, so bursts stay off under
+            // sampled-verify to keep its output-distribution guarantee.
+            if (!sampled_verify &&
+                accepted_ema < adaptive.accept_threshold(live_step_ratio())) {
+                ar_burst_left = adaptive.burst;
+            }
+        }
 
         // Notify observer with accepted tokens for this step.
         if (io.observer) {
@@ -4115,6 +4685,12 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                  n_generated > 0 ? n_generated / decode_s : 0.0,
                  n_draft_steps, n_accept_sum, total_draft_pos, accept_pct,
                  n_draft_steps > 0 ? (double)n_generated / (double)n_draft_steps : 0.0);
+    if (n_ar_burst_steps > 0) {
+        std::fprintf(stderr, "[spec-decode] adaptive: %d of %d steps ran as plain decode "
+                             "(step ratio %.2f, accept threshold %.2f drafts/step, burst %d)\n",
+                     n_ar_burst_steps, n_draft_steps, live_step_ratio(),
+                     adaptive.accept_threshold(live_step_ratio()), adaptive.burst);
+    }
     if (tp_profile) {
         std::fprintf(stderr,
             "[spec-profile] draft=%.3fs project=%.3fs snapshot=%.3fs "

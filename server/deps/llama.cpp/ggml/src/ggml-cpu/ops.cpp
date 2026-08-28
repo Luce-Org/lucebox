@@ -9332,6 +9332,8 @@ void ggml_compute_forward_flash_attn_back(
 static void ggml_compute_forward_ssm_conv_f32(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
+    // dflash: the fused step mode (ggml_ssm_conv_step) is CUDA/HIP only
+    GGML_ASSERT(ggml_get_op_params_i32(dst, 0) == 0 && "ggml_ssm_conv_step is not supported on CPU");
     const ggml_tensor * src0 = dst->src[0]; // conv_x
     const ggml_tensor * src1 = dst->src[1]; // conv1d.weight
 
@@ -10716,6 +10718,12 @@ static void ggml_compute_forward_gated_delta_net_f32(
 void ggml_compute_forward_gated_delta_net(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
+    // Raw-gate mode (loader-built [dt_bias|A] in src[9], op_params[10])
+    // is CUDA/HIP only; the CPU path would silently use the raw values
+    // as final gates.
+    GGML_ASSERT(dst->op_params[10] == 0 && dst->src[9] == NULL &&
+                "raw-gate gated_delta_net is CUDA/HIP only");
+
     const ggml_tensor * src0 = dst->src[0];
 
     switch (src0->type) {

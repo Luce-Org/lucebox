@@ -622,7 +622,8 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         for (int i = 0; i < n_slots; i++) {
             if (slots[(size_t)i].job && !slots[(size_t)i].prefilling) {
                 step_plan.decode.push_back(
-                    {i, slots[(size_t)i].pending_tok});
+                    {i, slots[(size_t)i].pending_tok,
+                     slots[(size_t)i].hook.close_token_ids.empty()});
             } else if (slots[(size_t)i].job) {
                 prefill_candidates.push_back(
                     {i, slots[(size_t)i].admission_order});
@@ -670,7 +671,11 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 s.finished = true;
                 continue;
             }
-            advance_slot(s, out.token);
+            consume_decode_output_tokens(out, [&](int32_t token) {
+                if (s.finished) return false;
+                advance_slot(s, token);
+                return !s.finished;
+            });
         }
         using PrefillStatus = SeqEngine::PrefillOutput::Status;
         for (const auto & out : step_result.prefills) {
