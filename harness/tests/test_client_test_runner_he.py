@@ -5,7 +5,6 @@ import sys
 import unittest
 from pathlib import Path
 
-
 HARNESS_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HARNESS_DIR))
 SPEC = importlib.util.spec_from_file_location(
