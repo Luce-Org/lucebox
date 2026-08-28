@@ -84,9 +84,6 @@ struct StepGraph {
     // Used by contiguous replay, KVFlash, and paged attention; null when the
     // graph uses the legacy contiguous ggml_cpy write.
     ggml_tensor *   kv_write_rows = nullptr;
-    // [n_tokens] i32 feature-ring destination rows. Ling verify uses this to
-    // keep feature capture position-independent and CUDA-graph replayable.
-    ggml_tensor *   target_feat_rows = nullptr;
     // Compact decode row -> physical sequence slot. Padding rows carry -1.
     // state_slot_ids has the same shape but maps padding to a safe readable
     // slot for graph-level conv-state gathers.
@@ -155,7 +152,6 @@ inline void step_graph_free(StepGraph & sg) {
     sg.specla_m_strict = sg.specla_m_incl = sg.specla_m_eye = nullptr;
     sg.specla_hld = nullptr;
     sg.kv_write_rows = nullptr;
-    sg.target_feat_rows = nullptr;
     sg.active_slot_ids = nullptr;
     sg.state_slot_ids = nullptr;
     sg.paged_query_seq_ids = nullptr;

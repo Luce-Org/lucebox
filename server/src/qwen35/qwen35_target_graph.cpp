@@ -2771,13 +2771,6 @@ QwenGraphOutputs build_qwen35_graph(
 
     const int n_tokens = in.n_tokens;
 
-    const bool capture_with_rows =
-        in.capture_layers && cache.target_feat && in.target_feat_rows;
-    std::vector<ggml_tensor *> capture_slices;
-    if (capture_with_rows) {
-        capture_slices.assign((size_t)w.n_capture_layers, nullptr);
-    }
-
     // 1. Caller supplies pre-embedded inputs via in.inp_embed (CPU lookup done
     //    ahead of time, zero GPU cost for the embedding table).
     ggml_tensor * inpL = in.inp_embed;
@@ -2833,23 +2826,6 @@ QwenGraphOutputs build_qwen35_graph(
                     cache.attn_k[fa_idx], cache.attn_v[fa_idx],
                     in.attn_mask, in.kv_write_rows,
                     in.kv_start, n_tokens);
-            } else {
-                cur = build_full_attn_block(ctx, gf, w, L, cur, in.positions, w.rope_sections,
-                                            cache.attn_k[fa_idx], cache.attn_v[fa_idx],
-                                            in.attn_mask, in.kv_start, n_tokens,
-                                            cache.kv_k_type, cache.kv_v_type,
-                                            cache.kv_k_rotated,
-                                            in.fa_window,
-                                            /*q_tail_capture=*/nullptr,
-                                            /*q_tail_start=*/0,
-                                            in.kv_write_rows,
-                                            want_q_cap ? &q_fa : nullptr,
-                                            in.paged_block_table,
-                                            in.paged_kv_seq_lens,
-                                            in.paged_query_seq_ids,
-                                            in.paged_query_positions,
-                                            in.paged_max_kv_len,
-                                            in.active_slot_ids);
             } else {
                 cur = build_full_attn_block(ctx, gf, w, L, cur, in.positions, w.rope_sections,
                                             cache.attn_k[fa_idx], cache.attn_v[fa_idx],
