@@ -885,10 +885,6 @@ struct QwenGraphInputs {
     // [n_tokens,n_head_kv] i64 physical destination rows for the
     // ggml_set_rows KV write; step-invariant.
     ggml_tensor * kv_write_rows = nullptr;
-    // Optional [n_tokens] i32 target-feature ring destinations. When present,
-    // capture slices are concatenated and written with set_rows so the graph
-    // topology is independent of kv_start.
-    ggml_tensor * target_feat_rows = nullptr;
     ggml_tensor * paged_block_table = nullptr; // [max_blocks,n_seqs] i32
     // [n_seqs] i32; valid cached K/V tokens per sequence.
     ggml_tensor * paged_kv_seq_lens = nullptr;
