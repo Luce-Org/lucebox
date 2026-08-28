@@ -3484,6 +3484,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                         sizeof(float) * local_hidden.size());
                 }
             }
+        }
             profile_add(profile_draft_s, profile_draft_start);
         }  // !ar_step
 
@@ -3603,7 +3604,8 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
             // DFlash 2 selector (top-k candidates + low-rank path score) when
             // the drafter ships it.
-            if (!used_dspark && dw_.selector.enabled && q_len > 1 &&\n                !sampled_verify && !use_remote_draft) {
+            if (!used_dspark && dw_.selector.enabled && q_len > 1 &&
+                !sampled_verify && !use_remote_draft) {
                 static std::atomic<bool> s_sel_logged{false};
                 if (!s_sel_logged.exchange(true)) {
                     std::fprintf(stderr,

@@ -83,7 +83,6 @@ public:
 
     int hidden_size() const override { return w_.n_embd; }
     int mask_token_id() const override;
-    ggml_tensor *  lm_head_tensor() override { return w_.output; }
     const std::vector<int> & capture_layer_ids() const override;
 
     // kvflash mode: verify writes are slot-mapped via the pager and the
