@@ -1878,11 +1878,14 @@ static ggml_tensor * build_mla_attention(
             : n_index_comp_live;
         ggml_tensor * index_visibility_mask = nullptr;
         if (masked_kv && n_index_comp > 0) {
-            index_visibility_mask = ggml_view_2d(
+            // The fused verifier stores one full attention-mask column per
+            // proposed token. Extract the compressed section for every token,
+            // then compact the strided view for the indexer scorer.
+            index_visibility_mask = ggml_cont(ctx, ggml_view_2d(
                 ctx, cached_inputs->attn_row_mask,
-                n_index_comp, 1,
-                (size_t) n_index_comp * sizeof(float),
-                (size_t) w.n_swa * sizeof(float));
+                n_index_comp, n_tokens,
+                cached_inputs->attn_row_mask->nb[1],
+                (size_t) w.n_swa * sizeof(float)));
         }
         indexer_topk = build_indexer_topk(
             ctx, qr, cur, w, L, index_comp_kv_source,
@@ -1954,18 +1957,21 @@ static ggml_tensor * build_mla_attention(
     } else {
         kv_attn = raw_kv_view(0, n_raw);
     }
-    const bool fused_explicit_f16_kv = w.fused_verify_f16_kv &&
+    const bool fused_verify_f16_kv = w.fused_verify_f16_kv &&
         masked_kv && n_tokens > 1 &&
-        attention_impl == DeepSeek4AttentionImpl::Explicit &&
         kv_attn->type == GGML_TYPE_F32 &&
         raw_kv_source->type == GGML_TYPE_F16 &&
         (!comp_kv_source || comp_kv_source->type == GGML_TYPE_F16) &&
         (!old_rows_scratch_f16 ||
          old_rows_scratch_f16->type == GGML_TYPE_F16);
-    if (fused_explicit_f16_kv) {
+    const bool fused_explicit_f16_kv = fused_verify_f16_kv &&
+        attention_impl == DeepSeek4AttentionImpl::Explicit;
+    const bool fused_sparse_f16_kv = fused_verify_f16_kv &&
+        attention_impl == DeepSeek4AttentionImpl::SparseFlash;
+    if (fused_explicit_f16_kv || fused_sparse_f16_kv) {
         // DS4's persistent MLA caches are already F16. Feed those tensors
-        // directly to the established explicit attention matmuls instead of
-        // casting the entire long-context cache to F32 on every verifier step.
+        // directly to the attention implementation instead of casting the
+        // entire long-context cache to F32 on every verifier step.
         // Current writes are consumed through their set_rows results, while
         // preserved overwritten rows retain the same cached F16 values.
         kv_attn = ggml_view_2d(
@@ -1981,12 +1987,15 @@ static ggml_tensor * build_mla_attention(
                 ctx, kv_attn, old_rows_scratch_f16, 1);
         }
         static std::atomic<bool> explicit_f16_kv_logged{false};
-        if (!explicit_f16_kv_logged.exchange(true)) {
+        static std::atomic<bool> sparse_f16_kv_logged{false};
+        std::atomic<bool> & logged = fused_sparse_f16_kv
+            ? sparse_f16_kv_logged : explicit_f16_kv_logged;
+        if (!logged.exchange(true)) {
             std::fprintf(stderr,
-                "[deepseek4] fused explicit F16 K/V active: tokens=%d "
+                "[deepseek4] fused %s F16 K/V active: tokens=%d "
                 "compressed=%d\n",
+                fused_sparse_f16_kv ? "sparse" : "explicit",
                 n_tokens, n_comp_attn);
-            explicit_f16_kv_logged = true;
         }
     } else {
         if (n_comp_attn > 0 && comp_kv_source) {
@@ -2240,7 +2249,12 @@ static ggml_tensor * build_mla_attention(
             // The DS4 D=512 kernel consumes Q strides directly, avoiding a full
             // [D,H,T] -> [D,T,H] materialization for every layer.
             ggml_tensor * q_fa = ggml_permute(ctx, q, 0, 2, 1, 3);
-            ggml_tensor * kv_fa = ds4_cast_if_needed(ctx, kv_attn, GGML_TYPE_F32);
+            // The DS4 D=512 kernel has native F16 K/V specializations. Keep
+            // fused verifier caches in their persistent representation and
+            // avoid a full long-context F16 -> F32 conversion every step.
+            ggml_tensor * kv_fa = fused_sparse_f16_kv
+                ? kv_attn
+                : ds4_cast_if_needed(ctx, kv_attn, GGML_TYPE_F32);
             ggml_tensor * k_fa = ggml_reshape_3d(ctx, kv_fa, head_dim, n_attn, 1);
             ggml_tensor * v_fa = k_fa;
             ggml_tensor * mask_fa = score_mask
