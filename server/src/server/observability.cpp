@@ -199,6 +199,8 @@ ObservabilityConfig ObservabilityConfig::from_env() {
         "DFLASH_DRAFT_KV",
         "DFLASH_DISABLE_DRAFT_SWA",
         "DFLASH_QWEN35_NO_KVPAD",
+        "DFLASH_BAILING_K_AS_V",
+        "DFLASH_GDN_DIRECT_FAST",
         "DFLASH27B_PREFILL_UBATCH",
         "DFLASH_KVFLASH",
         "DFLASH_ADAPTIVE_K_TAU",

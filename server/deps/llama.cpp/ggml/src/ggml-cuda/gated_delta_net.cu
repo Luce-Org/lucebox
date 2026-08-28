@@ -658,10 +658,18 @@ static void launch_gated_delta_net(
     const uint3 neqk1_magic = init_fastdiv_values(neqk1);
     const uint3 rq3_magic   = init_fastdiv_values(rq3);
 
-    static const bool direct_fast_enabled = []() {
+    static const int direct_fast_override = []() {
         const char * value = std::getenv("DFLASH_GDN_DIRECT_FAST");
-        return value && value[0] == '1' && value[1] == '\0';
+        return value ? (std::atoi(value) != 0 ? 1 : 0) : -1;
     }();
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    // The compact contiguous-state kernel is the fastest exact KDA path on
+    // DGX Spark. Keep generalized slot/tree/snapshot kernels unchanged, and
+    // retain an explicit override while other architectures are validated.
+    const bool direct_fast_enabled = direct_fast_override >= 0
+        ? direct_fast_override != 0
+        : KDA && GGML_CUDA_CC_IS_NVIDIA(cc) &&
+              cc == GGML_CUDA_CC_DGX_SPARK;
     if constexpr (DIRECT_STATE) {
         static_assert(!TREE_MODE && !WRITE_INTER,
                       "direct GDN fast path is chain mode without snapshots");
@@ -701,7 +709,6 @@ static void launch_gated_delta_net(
         }
     }
 
-    int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const bool ampere_nvidia = GGML_CUDA_CC_IS_NVIDIA(cc)
                             && cc >= GGML_CUDA_CC_AMPERE
                             && cc <  GGML_CUDA_CC_ADA_LOVELACE;

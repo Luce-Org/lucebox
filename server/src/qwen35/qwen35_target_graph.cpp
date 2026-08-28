@@ -1470,6 +1470,11 @@ static ggml_tensor * build_bailingmoe3_mla_block(
         ? std::min(query_tail_rows, n_tokens)
         : n_tokens;
     const int query_begin = n_tokens - n_queries;
+    // Mixed K/V quantization keeps its independently selected V precision.
+    const bool reuse_k_as_v = cache_k->type == cache_v->type && []() {
+        const char * value = std::getenv("DFLASH_BAILING_K_AS_V");
+        return value == nullptr || std::atoi(value) != 0;
+    }();
     GGML_ASSERT(attn_mask != nullptr);
 
     // Predictor prefill needs K/V for every prompt row, but only the final
@@ -1542,33 +1547,40 @@ static ggml_tensor * build_bailingmoe3_mla_block(
 
     ggml_tensor * kv_3d = ggml_reshape_3d(ctx, kv, kv_rank, 1, n_tokens);
     ggml_tensor * k_cur = ggml_concat(ctx, kv_3d, k_pe, 0);
-    ggml_tensor * v_cur = kv_3d;
 
     // Persistent latent cache: [D,T,1].
     ggml_tensor * k_write = ggml_permute(ctx, k_cur, 0, 2, 1, 3);
-    ggml_tensor * v_write = ggml_permute(ctx, v_cur, 0, 2, 1, 3);
+    ggml_tensor * v_write = reuse_k_as_v
+        ? nullptr
+        : ggml_permute(ctx, kv_3d, 0, 2, 1, 3);
     if (kv_write_rows) {
         // Decode keeps the destination tensor fixed and uploads the row index
         // separately. That makes every node property stable within a
         // 256-token attention bucket, allowing ggml-cuda to replay its
         // captured graph instead of relaunching thousands of kernels.
         k_write = ggml_is_contiguous(k_write) ? k_write : ggml_cont(ctx, k_write);
-        v_write = ggml_is_contiguous(v_write) ? v_write : ggml_cont(ctx, v_write);
         ggml_build_forward_expand(
             gf, ggml_set_rows(ctx, cache_k, k_write, kv_write_rows));
-        ggml_build_forward_expand(
-            gf, ggml_set_rows(ctx, cache_v, v_write, kv_write_rows));
+        if (v_write) {
+            v_write = ggml_is_contiguous(v_write)
+                ? v_write
+                : ggml_cont(ctx, v_write);
+            ggml_build_forward_expand(
+                gf, ggml_set_rows(ctx, cache_v, v_write, kv_write_rows));
+        }
     } else {
         ggml_tensor * k_slot = ggml_view_3d(
             ctx, cache_k, kv_rank + rope_dim, n_tokens, 1,
             cache_k->nb[1], cache_k->nb[2],
             static_cast<size_t>(kv_start) * cache_k->nb[1]);
-        ggml_tensor * v_slot = ggml_view_3d(
-            ctx, cache_v, kv_rank, n_tokens, 1,
-            cache_v->nb[1], cache_v->nb[2],
-            static_cast<size_t>(kv_start) * cache_v->nb[1]);
         ggml_build_forward_expand(gf, ggml_cpy(ctx, k_write, k_slot));
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, v_write, v_slot));
+        if (v_write) {
+            ggml_tensor * v_slot = ggml_view_3d(
+                ctx, cache_v, kv_rank, n_tokens, 1,
+                cache_v->nb[1], cache_v->nb[2],
+                static_cast<size_t>(kv_start) * cache_v->nb[1]);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, v_write, v_slot));
+        }
     }
 
     const int kv_len = kv_start + n_tokens;
@@ -1581,9 +1593,16 @@ static ggml_tensor * build_bailingmoe3_mla_block(
     ggml_tensor * k_read = ggml_view_3d(
         ctx, cache_k, kv_rank + rope_dim, kv_len_padded, 1,
         cache_k->nb[1], cache_k->nb[2], 0);
-    ggml_tensor * v_read = ggml_view_3d(
-        ctx, cache_v, kv_rank, kv_len_padded, 1,
-        cache_v->nb[1], cache_v->nb[2], 0);
+    // For Ling MLA, V is exactly the first 512 values of the 576-wide K row.
+    // Expressing that alias lets ggml-cuda dequantize K once and reuse it as V;
+    // otherwise the 576x512 kernel ignores a redundantly dequantized V buffer.
+    ggml_tensor * v_read = reuse_k_as_v
+        ? ggml_view_3d(
+            ctx, k_read, kv_rank, kv_len_padded, 1,
+            k_read->nb[1], k_read->nb[2], 0)
+        : ggml_view_3d(
+            ctx, cache_v, kv_rank, kv_len_padded, 1,
+            cache_v->nb[1], cache_v->nb[2], 0);
     ggml_tensor * q_fa = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));
     ggml_tensor * attn = ggml_flash_attn_ext(
         ctx, q_fa, k_read, v_read, attn_mask,
