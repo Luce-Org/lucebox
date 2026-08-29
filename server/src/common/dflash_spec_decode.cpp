@@ -6,6 +6,7 @@
 #include "io_utils.h"
 #include "dflash_draft_graph.h"  // build_draft_step
 #include "step_graph.h"
+#include "adaptive_spec_width.h"
 
 #include <algorithm>
 #include <chrono>
@@ -66,6 +67,8 @@ bool run_dflash_spec_decode(
 
     const int hidden = draft_weights.n_embd;
     const int q_len  = draft_weights.block_size;
+    AdaptiveSpecWidth width_controller(
+        q_len, 2, adaptive_spec_width_globally_enabled());
 
     StepGraph draft_sg;
     StepGraphGuard draft_sg_guard{draft_sg};
@@ -84,6 +87,7 @@ bool run_dflash_spec_decode(
     int n_generated     = 0;
     int n_draft_steps   = 0;
     int n_accept_sum    = 0;
+    int n_offered_sum   = 0;
     int n_hint_proposed = 0;
     int n_hint_accepted = 0;
     const ChainRollbackPolicy rollback_policy =
@@ -162,6 +166,10 @@ bool run_dflash_spec_decode(
             return false;
         }
         draft_tok[0] = last_tok;
+        const int verify_width = width_controller.next_width(q_len);
+        if ((int)draft_tok.size() > verify_width) {
+            draft_tok.resize((size_t)verify_width);
+        }
 
         // ── Tool call hint injection ──────────────────────────────────────
         // Override draft tokens with pre-known hint tokens for near-100%
@@ -169,7 +177,7 @@ bool run_dflash_spec_decode(
         int hint_filled = 0;
         if (hint_tokens && n_generated < (int)hint_tokens->size()) {
             const int hint_avail = (int)hint_tokens->size() - n_generated;
-            hint_filled = std::min(hint_avail, q_len - 1);
+            hint_filled = std::min(hint_avail, verify_width - 1);
             for (int i = 0; i < hint_filled; i++) {
                 draft_tok[1 + i] = (*hint_tokens)[n_generated + i];
             }
@@ -200,16 +208,18 @@ bool run_dflash_spec_decode(
 
         // Acceptance: longest matching prefix between draft and target argmax.
         int accept_n = 1;
-        for (int i = 0; i < q_len - 1; i++) {
+        for (int i = 0; i < verify_width - 1; i++) {
             if (draft_tok[i + 1] == target_tok[i]) accept_n++;
             else break;
         }
+        width_controller.observe(accept_n, verify_width);
+        n_offered_sum += verify_width;
         // Track hint acceptance telemetry.
         if (hint_filled > 0) {
             n_hint_proposed += hint_filled;
             n_hint_accepted += std::min(hint_filled, accept_n - 1);
         }
-        int bonus_tok = (accept_n < q_len) ? target_tok[accept_n - 1] : -1;
+        int bonus_tok = (accept_n < verify_width) ? target_tok[accept_n - 1] : -1;
         int commit_n  = accept_n + (bonus_tok >= 0 ? 1 : 0);
         if (commit_n > need_commit_budget) {
             commit_n = need_commit_budget;
@@ -302,7 +312,7 @@ bool run_dflash_spec_decode(
     if (!use_remote_draft && draft_backend) ggml_backend_synchronize(draft_backend);
     auto t_dec1 = std::chrono::steady_clock::now();
     const double decode_s = std::chrono::duration<double>(t_dec1 - t_dec0).count();
-    const int total_draft_pos = std::max(1, n_draft_steps * q_len);
+    const int total_draft_pos = std::max(1, n_offered_sum);
     const double accept_pct = 100.0 * (double)n_accept_sum / (double)total_draft_pos;
     if (accept_rate_out) {
         *accept_rate_out = total_draft_pos > 0

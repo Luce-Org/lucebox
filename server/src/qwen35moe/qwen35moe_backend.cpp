@@ -7,6 +7,7 @@
 #include "../common/kvflash_placement.h"
 #include "common/ggml_graph_precision.h"
 #include "common/sampler.h"
+#include "common/adaptive_spec_width.h"
 #include "common/dflash_spec_decode.h"
 #include "dflash_draft_graph.h"
 #include "dflash_feature_ring.h"
@@ -1995,6 +1996,10 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
         const char * e = std::getenv("DFLASH_VERIFY_WIDTH");
         return e ? std::max(1, std::min(q_len, std::atoi(e))) : 0;
     }();
+    const bool shared_feedback_width =
+        forced_verify_width == 0 && adaptive_spec_width_globally_enabled();
+    AdaptiveSpecWidth width_controller(
+        q_len, std::min(6, q_len), shared_feedback_width);
     int observed_max_accept = 1;
 
     int32_t last_tok = target_cache().last_tok;
@@ -2012,6 +2017,7 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
     int n_generated = 0;
     int n_draft_steps = 0;
     int n_accept_sum = 0;
+    int n_offered_sum = 0;
 
     // Allocate DeltaNet rollback snapshot tensors (no-op if already present).
     // Without these, snapshot_ssm_state/restore_ssm_state silently do nothing
@@ -2028,7 +2034,9 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
         const int need_commit_budget = n_gen - n_generated;
         const int verify_width = forced_verify_width > 0
             ? forced_verify_width
-            : std::min(q_len, std::max(6, observed_max_accept + 2));
+            : shared_feedback_width
+                  ? width_controller.next_width(q_len)
+                  : std::min(q_len, std::max(6, observed_max_accept + 2));
 
         // 1. Build noise input for draft
         noise_ids[0] = last_tok;
@@ -2137,8 +2145,13 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
             if (draft_tok[i + 1] == target_tok[i]) accept_n++;
             else break;
         }
+        if (shared_feedback_width) {
+            width_controller.observe(accept_n, verify_width);
+        } else {
+            observed_max_accept = std::max(observed_max_accept, accept_n);
+        }
+        n_offered_sum += verify_width;
         int bonus_tok = (accept_n < verify_width) ? target_tok[accept_n - 1] : -1;
-        observed_max_accept = std::max(observed_max_accept, accept_n);
         int commit_n = accept_n + (bonus_tok >= 0 ? 1 : 0);
         if (commit_n > need_commit_budget) {
             commit_n = need_commit_budget;
@@ -2199,7 +2212,9 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
         const int fallback_steps = hybrid_spec_min_steps_before_ar();
         if (!io.is_cancelled() && !hit_eos && fallback_steps > 0 &&
             n_draft_steps >= fallback_steps && n_generated < n_gen) {
-            const int total_draft_pos_so_far = std::max(1, n_draft_steps * q_len);
+            const int total_draft_pos_so_far = shared_feedback_width
+                ? std::max(1, n_offered_sum)
+                : std::max(1, n_draft_steps * q_len);
             const float accept_rate_value =
                 (float)((double)n_accept_sum / (double)total_draft_pos_so_far);
             const float min_accept = hybrid_spec_min_accept_rate();
@@ -2225,7 +2240,9 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
 
     auto t_dec1 = std::chrono::steady_clock::now();
     const double decode_s = std::chrono::duration<double>(t_dec1 - t_dec0).count();
-    const int total_draft_pos = std::max(1, n_draft_steps * q_len);
+    const int total_draft_pos = shared_feedback_width
+        ? std::max(1, n_offered_sum)
+        : std::max(1, n_draft_steps * q_len);
     const double accept_pct = 100.0 * (double)n_accept_sum / (double)total_draft_pos;
     if (accept_rate_out) {
         *accept_rate_out = total_draft_pos > 0
