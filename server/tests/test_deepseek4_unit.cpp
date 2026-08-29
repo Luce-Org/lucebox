@@ -3041,7 +3041,7 @@ static void test_ds4_topk_block_radix_gpu() {
             /*disable_graphs=*/true,
             /*mmvq_max_ncols=*/0,
             /*skip_property_check=*/false);
-        unsetenv("GGML_DS4_TOPK_BLOCK_RADIX");
+        setenv("GGML_DS4_TOPK_BLOCK_RADIX", "0", 1);
         TEST_ASSERT_MSG(
             ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS,
             "reference long-context top-k failed");
@@ -3095,7 +3095,7 @@ static void test_ds4_topk_block_radix_gpu() {
             if (block_radix) {
                 setenv("GGML_DS4_TOPK_BLOCK_RADIX", "1", 1);
             } else {
-                unsetenv("GGML_DS4_TOPK_BLOCK_RADIX");
+                setenv("GGML_DS4_TOPK_BLOCK_RADIX", "0", 1);
             }
             constexpr int warmups = 5;
             constexpr int iterations = 100;

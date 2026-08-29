@@ -122,7 +122,9 @@ TEST_CASE(RocmfpMixGateupGluFixture, fused_gateup_glu) {
 
     // in must be a multiple of 128: the wide block load reads 128 weights at a time and would
     // read past the tensor on the final block (register_host enforces this).
-    const int in = 256, out = 64, n_experts = 6, n_used = 3, ntok = 2;
+    // Three tokens exercises the low-register two-pass GLU finalizer. q <= 2
+    // uses the one-pass kernel and is checked separately below.
+    const int in = 256, out = 64, n_experts = 6, n_used = 3, ntok = 3;
     const int nb = in / QK;
     const size_t rows_bytes = (size_t) out * nb * BLOCK_BYTES;
 
@@ -223,6 +225,41 @@ TEST_CASE(RocmfpMixGateupGluFixture, fused_gateup_glu) {
     }
     std::fprintf(stderr, "worst relative deviation from the host reference: %.3e\n", worst);
     CHECK(worst < 1e-5);
+
+    // q <= 2 selects the one-pass dual-projection kernel. Exercise that branch
+    // separately while the main ntok=3 case above covers the two-pass finalizer.
+    {
+        const int one_tok = 1;
+        const size_t one_yn = (size_t) out * n_used;
+        CHECK(ggml_cuda_rocmfp2_mix_mul_mat_id(d_up, d_x, d_ids, d_up_out,
+                                               in, out, n_used, one_tok, 1,
+                                               ids_s0, ids_s1, src1_s1, src1_s2,
+                                               dst_s1, dst_s2, nullptr));
+        CHECK(ggml_cuda_rocmfp2_mix_mul_mat_id(d_gate, d_x, d_ids, d_gate_out,
+                                               in, out, n_used, one_tok, 1,
+                                               ids_s0, ids_s1, src1_s1, src1_s2,
+                                               dst_s1, dst_s2, nullptr));
+        CHECK(ggml_cuda_rocmfp2_mix_mul_mat_id_glu(d_up, d_gate, d_x, d_ids, d_fused,
+                                                   in, out, n_used, one_tok, 1,
+                                                   ids_s0, ids_s1, src1_s1, src1_s2,
+                                                   dst_s1, dst_s2, limit, nullptr));
+        HIP_OK(cudaDeviceSynchronize());
+        std::vector<float> one_u(one_yn), one_g(one_yn), one_f(one_yn);
+        HIP_OK(cudaMemcpy(one_u.data(), d_up_out, sizeof(float) * one_yn,
+                          cudaMemcpyDeviceToHost));
+        HIP_OK(cudaMemcpy(one_g.data(), d_gate_out, sizeof(float) * one_yn,
+                          cudaMemcpyDeviceToHost));
+        HIP_OK(cudaMemcpy(one_f.data(), d_fused, sizeof(float) * one_yn,
+                          cudaMemcpyDeviceToHost));
+        double one_worst = 0.0;
+        for (size_t i = 0; i < one_yn; ++i) {
+            const float ref = host_swiglu_ds4(one_g[i], one_u[i], limit);
+            const double denom = std::fmax(1e-6, std::fabs((double) ref));
+            one_worst = std::fmax(one_worst,
+                std::fabs((double) one_f[i] - (double) ref) / denom);
+        }
+        CHECK(one_worst < 1e-5);
+    }
 
     // ---- operand ORDER: swiglu_ds4 applies silu to GATE, so the two are not symmetric ----
     float * d_swapped = nullptr;

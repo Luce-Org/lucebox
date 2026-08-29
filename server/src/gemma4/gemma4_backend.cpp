@@ -11,6 +11,7 @@
 #include "common/io_utils.h"
 #include "common/dflash_feature_ring.h"
 #include "common/dflash_draft_graph.h"
+#include "common/adaptive_spec_width.h"
 #include "common/step_graph.h"
 
 #include "ggml-cuda.h"
@@ -485,6 +486,8 @@ bool Gemma4Backend::do_spec_decode(int committed, int n_gen,
 
     DFlashTarget * target = dflash_target_;
     const int q_len = dw_.block_size;
+    AdaptiveSpecWidth width_controller(
+        q_len, 2, adaptive_spec_width_globally_enabled());
 
     StepGraph draft_sg;
 
@@ -499,6 +502,7 @@ bool Gemma4Backend::do_spec_decode(int committed, int n_gen,
     int n_generated     = 0;
     int n_draft_steps   = 0;
     int n_accept_sum    = 0;
+    int n_offered_sum   = 0;
 
     auto t_dec0 = std::chrono::steady_clock::now();
 
@@ -545,7 +549,7 @@ bool Gemma4Backend::do_spec_decode(int committed, int n_gen,
                                     tail_hook, forced_close_out);
                 auto t_dec1 = std::chrono::steady_clock::now();
                 const double decode_s = std::chrono::duration<double>(t_dec1 - t_dec0).count();
-                const int total_draft_pos = std::max(1, n_draft_steps * q_len);
+                const int total_draft_pos = std::max(1, n_offered_sum);
                 const double accept_pct = 100.0 * (double)n_accept_sum / (double)total_draft_pos;
                 std::fprintf(stderr,
                     "[gemma4-spec] tail-off-stats tokens=%d time=%.3f s "
@@ -623,6 +627,10 @@ bool Gemma4Backend::do_spec_decode(int committed, int n_gen,
             return false;
         }
         draft_tok[0] = last_tok;
+        const int verify_width = width_controller.next_width(q_len);
+        if ((int)draft_tok.size() > verify_width) {
+            draft_tok.resize((size_t)verify_width);
+        }
 
         // 4. Verify: run target forward over all draft tokens.
         // Gemma4 is a pure transformer — after verify, KV entries at accepted
@@ -638,11 +646,13 @@ bool Gemma4Backend::do_spec_decode(int committed, int n_gen,
 
         // 5. Acceptance: longest matching prefix
         int accept_n = 1;
-        for (int i = 0; i < q_len - 1; i++) {
+        for (int i = 0; i < verify_width - 1; i++) {
             if (draft_tok[i + 1] == target_tok[i]) accept_n++;
             else break;
         }
-        int bonus_tok = (accept_n < q_len) ? target_tok[accept_n - 1] : -1;
+        width_controller.observe(accept_n, verify_width);
+        n_offered_sum += verify_width;
+        int bonus_tok = (accept_n < verify_width) ? target_tok[accept_n - 1] : -1;
         int commit_n  = accept_n + (bonus_tok >= 0 ? 1 : 0);
         if (commit_n > need_commit_budget) {
             commit_n = need_commit_budget;
@@ -700,7 +710,7 @@ bool Gemma4Backend::do_spec_decode(int committed, int n_gen,
 
     auto t_dec1 = std::chrono::steady_clock::now();
     const double decode_s = std::chrono::duration<double>(t_dec1 - t_dec0).count();
-    const int total_draft_pos = std::max(1, n_draft_steps * q_len);
+    const int total_draft_pos = std::max(1, n_offered_sum);
     const double accept_pct = 100.0 * (double)n_accept_sum / (double)total_draft_pos;
     std::fprintf(stderr, "[gemma4-spec] tokens=%d time=%.3f s speed=%.2f tok/s "
                  "steps=%d accepted=%d/%d (%.1f%%) avg_commit=%.2f\n",

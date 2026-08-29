@@ -39,6 +39,7 @@
 #include <mutex>
 #include <functional>
 #include <limits>
+#include <utility>
 #include <vector>
 
 #if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
@@ -4834,7 +4835,8 @@ struct Ds4FusedVerifyCache {
         ggml_tensor * capture = nullptr;  // f32 [n_embd*ncap,q], token-major
         ggml_tensor * argmax = nullptr;   // i32 [q], optional greedy output
         // Reused host staging for the context-sized additive attention mask.
-        // Keeping it per slot removes one allocation from every verify step.
+        // Keeping it per slot removes allocation churn in both full and
+        // sparse-range mask update modes.
         std::vector<float> mask_values;
         int q = 0;
 
