@@ -171,35 +171,63 @@ static bool is_strict_prefix(const std::vector<int32_t> & a,
 }
 
 int select_inline_evict_victim(const std::vector<const std::vector<int32_t> *> & ids_lru,
-                               const std::vector<bool> * protected_lru) {
+                               const std::vector<bool> * protected_lru,
+                               int skip_index) {
     const int n = (int)ids_lru.size();
     if (n <= 0) return 0;
     auto is_protected = [&](int i) {
         return protected_lru && i >= 0 && i < (int)protected_lru->size() &&
                (*protected_lru)[(size_t)i];
     };
-    // Oldest-first scan: prefer an unprotected leaf so sticky tools pins survive.
-    int oldest_protected_leaf = -1;
-    for (int i = 0; i < n; i++) {
-        bool is_ancestor = false;
+    auto is_ancestor = [&](int i) {
         for (int j = 0; j < n; j++) {
             if (j == i) continue;
-            if (is_strict_prefix(*ids_lru[i], *ids_lru[j])) { is_ancestor = true; break; }
+            if (is_strict_prefix(*ids_lru[i], *ids_lru[j])) return true;
         }
-        if (is_ancestor) continue;
+        return false;
+    };
+    // Oldest-first scan: prefer an unprotected leaf so sticky tools pins
+    // survive. skip_index (the in-flight restore source) is never a victim.
+    int oldest_protected_leaf = -1;
+    for (int i = 0; i < n; i++) {
+        if (i == skip_index) continue;
+        if (is_ancestor(i)) continue;
         if (!is_protected(i)) return i;  // oldest unprotected leaf
         if (oldest_protected_leaf < 0) oldest_protected_leaf = i;
+    }
+    if (skip_index >= 0) {
+        // No unprotected leaf outside the restore source — e.g. a linearly
+        // growing conversation whose only leaf is the restore source itself.
+        // Evict the shallowest non-protected ancestor (its KV is subsumed by
+        // every deeper entry) so the new snapshot lands in a different slot
+        // and the restore point can slide forward. Never the protected tools
+        // pin, never the restore source.
+        int shallowest_ancestor = -1;
+        for (int i = 0; i < n; i++) {
+            if (i == skip_index || is_protected(i)) continue;
+            if (!is_ancestor(i)) continue;
+            if (shallowest_ancestor < 0 ||
+                ids_lru[i]->size() < ids_lru[(size_t)shallowest_ancestor]->size()) {
+                shallowest_ancestor = i;
+            }
+        }
+        if (shallowest_ancestor >= 0) return shallowest_ancestor;
+        // Only the restore source and/or protected pins remain: destroying
+        // either would throw away the stable tools head or the in-flight
+        // restore, so there is no safe victim.
+        return -1;
     }
     if (oldest_protected_leaf >= 0) return oldest_protected_leaf;
     return 0;  // unreachable (the longest entry is always a leaf); pure-LRU fallback
 }
 
 int select_inline_evict_victim(const std::vector<std::vector<int32_t>> & ids_lru,
-                               const std::vector<bool> * protected_lru) {
+                               const std::vector<bool> * protected_lru,
+                               int skip_index) {
     std::vector<const std::vector<int32_t> *> ptrs;
     ptrs.reserve(ids_lru.size());
     for (const auto & v : ids_lru) ptrs.push_back(&v);
-    return select_inline_evict_victim(ptrs, protected_lru);
+    return select_inline_evict_victim(ptrs, protected_lru, skip_index);
 }
 
 int select_inline_snapshot_boundary(const std::vector<int> & boundaries,
@@ -341,7 +369,8 @@ std::pair<int, int> PrefixCache::prepare_inline_snap(
         const std::vector<int32_t> & prompt_ids,
         int restored_prefix_len,
         bool prefer_tools_boundary,
-        int forced_cut) {
+        int forced_cut,
+        int restore_source_slot) {
     if (disabled_) return {-1, 0};
 
     auto candidates = find_all_boundaries(prompt_ids, markers_);
@@ -372,7 +401,10 @@ std::pair<int, int> PrefixCache::prepare_inline_snap(
     if ((int)entries_.size() >= cap_) {
         // At capacity — reserve a slot without evicting yet. Prefix-aware: prefer
         // the oldest leaf so shared ancestor prefixes (reused by later branches)
-        // stay resident. Skip protected tools pins when an unprotected leaf exists.
+        // stay resident. Skip protected tools pins when an unprotected leaf
+        // exists. The in-flight restore source is never a victim, so the new
+        // snapshot lands in a different slot and the restore point can slide
+        // forward past the deepest slot.
         std::vector<const std::vector<int32_t> *> ids_lru;
         std::vector<bool> protected_lru;
         ids_lru.reserve(entries_.size());
@@ -381,7 +413,23 @@ std::pair<int, int> PrefixCache::prepare_inline_snap(
             ids_lru.push_back(&e.ids);
             protected_lru.push_back(e.protect);
         }
-        int victim = select_inline_evict_victim(ids_lru, &protected_lru);
+        int skip_index = -1;
+        if (restore_source_slot >= 0) {
+            for (int i = 0; i < (int)entries_.size(); i++) {
+                if (entries_[i].slot == restore_source_slot) {
+                    skip_index = i;
+                    break;
+                }
+            }
+        }
+        int victim = select_inline_evict_victim(ids_lru, &protected_lru, skip_index);
+        if (victim < 0) {
+            // Nothing safe to evict (only the restore source and/or protected
+            // pins remain). Skip this snapshot; the restore point stays put
+            // rather than being destroyed.
+            pending_protect_ = false;
+            return {-1, 0};
+        }
         pending_evict_key_ = entries_[victim].hash;
         has_pending_evict_ = true;
         slot = entries_[victim].slot;
@@ -393,8 +441,16 @@ std::pair<int, int> PrefixCache::prepare_inline_snap(
                 entries_[victim].ids.size(), entries_.front().ids.size());
         }
     } else {
+        // Skip the in-flight restore source so the new snapshot lands in a
+        // different slot (the http_server/agent-replay guards would cancel
+        // an unlucky collision, leaving the restore point pinned). With a
+        // vacancy and cap >= 2 there is always a non-restore slot to take;
+        // cap == 1 keeps the old guard behavior.
         slot = next_slot_;
-        next_slot_ = (next_slot_ + 1) % cap_;
+        if (slot == restore_source_slot && cap_ > 1) {
+            slot = (slot + 1) % cap_;
+        }
+        next_slot_ = (slot + 1) % cap_;
         has_pending_evict_ = false;
     }
 
