@@ -955,6 +955,17 @@ if(DFLASH27B_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
         target_link_libraries(bench_rocmfp_mix_gateup_glu PRIVATE
             ggml ggml-base ${DFLASH27B_GGML_BACKEND_TARGET} hip::host)
+
+        # Benchmark, not a test: compares the generic segmented full sort with
+        # the exact two-stage block-radix TOP_K used by the DS4 long-context
+        # indexer. It also checks selected-index set parity at every tile count.
+        add_executable(bench_ds4_topk test/bench_ds4_topk.cpp)
+        set_source_files_properties(test/bench_ds4_topk.cpp PROPERTIES LANGUAGE HIP)
+        set_target_properties(bench_ds4_topk PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
+        target_include_directories(bench_ds4_topk PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
+        target_link_libraries(bench_ds4_topk PRIVATE
+            ggml ggml-base ${DFLASH27B_GGML_BACKEND_TARGET} hip::host)
     endif()
     add_executable(test_qwen35_tensor_parallel test/test_qwen35_tensor_parallel.cpp)
     target_include_directories(test_qwen35_tensor_parallel PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})

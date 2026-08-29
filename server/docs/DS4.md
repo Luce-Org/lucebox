@@ -455,7 +455,6 @@ Run the converted drafter against a DeepSeek4 target with:
 ```bash
 export DFLASH_DS4_SPEC=1
 export DFLASH_DS4_FUSED_VERIFY=1
-export DFLASH_DS4_SPARSE_DECODE_FLASH=1
 export DFLASH_DS4_DRAFT=/path/to/dflash-draft.gguf
 export DFLASH_DS4_SPEC_Q=4
 
@@ -467,20 +466,37 @@ export DFLASH_DS4_SPEC_Q=4
 
 `--ds4-fused-verify-f16-kv` feeds the persistent F16 MLA cache directly to
 batched explicit or sparse verifier attention instead of converting the full
-cache to F32 on every speculative step. With
-`DFLASH_DS4_SPARSE_DECODE_FLASH=1`, the verifier keeps explicit attention for
-short histories and switches each layer to the model's sparse top-k attention
-once it removes at least half of the compressed rows. Key-side accumulation
-remains F32 through 512 attention rows to preserve the short-context quality
-baseline. The option is currently qualified only for a single HIP target and
-remains off by default. It changes verifier floating-point inputs and can
-change generated tokens, so re-run workload quality checks before enabling it
-for another checkpoint.
+cache to F32 on every speculative step. On gfx1151 DSpark targets, adaptive
+sparse decode flash attention is enabled by default. The verifier keeps
+explicit attention for short histories and switches each layer to the model's
+sparse top-k attention once it removes at least half of the compressed rows.
+Key-side accumulation remains F32 through 512 attention rows to preserve the
+short-context quality baseline. Set `DFLASH_DS4_SPARSE_DECODE_FLASH=0` to use
+explicit attention throughout; other targets can opt in with value `1`.
+Sparse attention changes verifier floating-point inputs and can change
+generated tokens, so re-run workload quality checks before enabling it for
+another checkpoint.
 
 On RDNA3.5 and RDNA4, speculative widths 2–5 use the packed small-CM rocWMMA
 indexer by default. It is bit-identical to the generic indexer in the GPU unit
 test and can be disabled with `GGML_DS4_INDEXER_PACK_SMALL=0` for diagnosis.
 The legacy `GGML_DS4_INDEXER_PACK_Q4` variable remains an alias.
+
+On gfx1151, the exact block-radix selector is also the default for the DS4
+512-row long-context top-k. Set `GGML_DS4_TOPK_BLOCK_RADIX=0` to restore the
+hipCUB full-sort path. The qualification benchmark checks selected-set parity
+before reporting selector timing.
+
+Indexed verifier attention with at most eight query rows also uses a two-way
+split-KV schedule on gfx1151. Set `GGML_CUDA_MLA_NO_SPLIT_KV=1` to restore the
+single-block schedule. For fused-verifier masks of at least 4 MiB, the runtime
+zeros the existing device tensor and transfers only its negative ranges; set
+`DFLASH_DS4_INCREMENTAL_VERIFY_MASK=0` to restore the full host transfer.
+
+Two narrow verifier projections have gfx1151 defaults as well: q4 uses MMVF
+for the `[16384,24]` hyper-connection matrix, and q3/q4 ROCmFP2 matvecs reuse
+each activation across four output rows. Their diagnostic kill switches are
+`DFLASH_GFX1151_HC_MMVF_Q4=0` and `DFLASH_ROCMFP2_ROW4=0`.
 
 ### PFlash prompt compression
 
@@ -707,18 +723,14 @@ DSpark alone therefore does not guarantee 30 tok/s. Set
 `LUCE_MMVQ_MAX_NCOLS` explicitly to override the platform default. AR, NVIDIA,
 and other HIP architectures retain the shared dispatch default.
 
-Adaptive width is automatic. When the draft artifact has a compatible
-confidence projection, the runtime selects q=2, q=3, or q=4 from the cumulative
-confidence of the proposed prefix. It adds the projection to the same fused
-Markov graph and reads its scores in the existing token-id synchronization; no
-additional host round trip is introduced. Artifacts without a compatible
-confidence head transparently retain the existing acceptance-EWMA policy.
-
-On the gfx1151 validation host, confidence-adaptive width retained 10/10
-GSM+Math accuracy and measured 31.94 tok/s weighted, within 0.6% of fixed q=4
-at 32.12 tok/s. These numbers are workload-specific; the confidence policy is
-enabled only when DSpark is explicitly enabled and the draft artifact contains
-a compatible confidence head.
+Adaptive width is available but opt-in. Set
+`DFLASH_ADAPTIVE_SPEC_WIDTH=1`, or `DFLASH_DS4_ADAPTIVE_WIDTH=1` to enable it
+only for DS4. A compatible confidence projection selects q=2, q=3, or q=4
+from cumulative proposal confidence; artifacts without one use target
+acceptance feedback. Fixed width remains the production default because
+switching q=3/q=4 did not reduce verifier time on the qualified gfx1151
+kernels. Re-run workload-level speed and quality checks before enabling it on
+another target or drafter.
 
 ## Example: CUDA + Halo Layer Split
 

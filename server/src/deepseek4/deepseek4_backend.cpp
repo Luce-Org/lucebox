@@ -230,6 +230,32 @@ static bool configure_dspark_mmvq_defaults(int gpu) {
     return true;
 }
 
+static void configure_gfx1151_sparse_decode_default(int gpu) {
+#if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
+    // Only the DSpark verifier configuration has completed model-level
+    // qualification. Preserve an explicit user choice, including the burn-in
+    // kill switch value 0.
+    if (!env_flag_enabled("DFLASH_DS4_SPEC") ||
+        std::getenv("DFLASH_DS4_SPARSE_DECODE_FLASH") != nullptr) {
+        return;
+    }
+
+    cudaDeviceProp prop{};
+    if (cudaGetDeviceProperties(&prop, gpu) != cudaSuccess ||
+        std::strncmp(prop.gcnArchName, "gfx1151", 7) != 0) {
+        return;
+    }
+
+    if (::setenv("DFLASH_DS4_SPARSE_DECODE_FLASH", "1", 0) == 0) {
+        std::fprintf(stderr,
+                     "[deepseek4] gfx1151 DSpark: defaulting adaptive sparse "
+                     "decode flash attention on\n");
+    }
+#else
+    (void) gpu;
+#endif
+}
+
 static void configure_gfx1201_hybrid_sub_batch_default(int gpu) {
 #if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
     if (std::getenv("DFLASH_MMQ_SUB_BATCH") != nullptr) {
@@ -1037,6 +1063,7 @@ bool DeepSeek4Backend::init() {
     if (!configure_dspark_mmvq_defaults(cfg_.device.gpu)) {
         return false;
     }
+    configure_gfx1151_sparse_decode_default(cfg_.device.gpu);
     configure_gfx1201_hybrid_sub_batch_default(cfg_.device.gpu);
 
     backend_ = ggml_backend_cuda_init(cfg_.device.gpu);
