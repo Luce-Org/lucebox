@@ -7,6 +7,7 @@
 
 #include <climits>
 #include <cstdint>
+#include <cstdlib>
 
 using namespace ggml_cuda_mma;
 
@@ -4922,7 +4923,52 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
     int mmq_x_best  = 0;
     int ntiles_x_best = INT_MAX;
 
-    for (int mmq_x = 8; mmq_x <= mmq_x_max && ntiles_x_best > 1; mmq_x += 8) {
+    static const int forced_mmq_x = []() {
+        const char * raw = std::getenv("GGML_CUDA_MMQ_X");
+        if (!raw || !*raw) return 0;
+        char * end = nullptr;
+        const long parsed = std::strtol(raw, &end, 10);
+        return end && end != raw && *end == '\0' && parsed >= 8 &&
+                parsed <= 128 && parsed % 8 == 0
+            ? (int)parsed : 0;
+    }();
+    static const bool adaptive_moe_x_enabled = []() {
+        const char * raw = std::getenv("GGML_CUDA_MMQ_MOE_ADAPTIVE_X");
+        return raw && *raw && !(raw[0] == '0' && raw[1] == '\0');
+    }();
+    int requested_mmq_x = forced_mmq_x;
+    if (requested_mmq_x == 0 && adaptive_moe_x_enabled &&
+        cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151 &&
+        args.expert_bounds != nullptr && args.nchannels_x > 0) {
+        // Grouped MoE routes are sparse across experts. Sizing the X tile from
+        // the full token width makes almost every workgroup carry padding. Use
+        // the mean live-route density as a model-neutral trigger, then select
+        // the measured gfx1151 tile for each unpack format. The grid still
+        // spans ncols_max, so skewed experts remain fully covered.
+        const int64_t routes_per_expert =
+            (args.ncols_y + args.nchannels_x - 1) / args.nchannels_x;
+        if (routes_per_expert <= 16) {
+            switch (type) {
+                case GGML_TYPE_Q2_0_ROCMFP2:      requested_mmq_x = 32; break;
+                case GGML_TYPE_Q3_0_ROCMFPX:      requested_mmq_x = 48; break;
+                case GGML_TYPE_Q4_0_ROCMFP4_FAST: requested_mmq_x = 16; break;
+                default: break;
+            }
+        }
+    }
+    if (requested_mmq_x > 0 && requested_mmq_x <= mmq_x_max) {
+        const int granularity = mmq_get_granularity_host(requested_mmq_x, cc);
+        if (requested_mmq_x % granularity == 0 &&
+            mmq_get_nbytes_shared<type>(
+                requested_mmq_x, mmq_y, cc, warp_size, nwarps) <= smpbo) {
+            mmq_x_best = requested_mmq_x;
+            ntiles_x_best = 1;
+        }
+    }
+
+    for (int mmq_x = 8;
+         mmq_x_best == 0 && mmq_x <= mmq_x_max && ntiles_x_best > 1;
+         mmq_x += 8) {
         const int granularity = mmq_get_granularity_host(mmq_x, cc);
 
         if (mmq_x % granularity != 0 || mmq_get_nbytes_shared<type>(mmq_x, mmq_y, cc, warp_size, nwarps) > smpbo) {

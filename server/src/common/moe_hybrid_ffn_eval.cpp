@@ -2877,11 +2877,23 @@ static bool eval_moe_owner_expert_major_batched(
         ggml_tensor * down_e = apply_scale2(ctx,
             ggml_mul_mat_id(ctx, down_tensor, gu, local_ids_tensor), desc.ffn_down_exps_s);
 
-        ggml_tensor * weights_3d = ggml_reshape_3d(ctx, owner_weights_tensor, 1, n_used, n_tokens);
-        ggml_tensor * routed_out = ggml_mul(ctx, down_e, weights_3d);
-        routed_out = ggml_cont(ctx, ggml_permute(ctx, routed_out, 1, 0, 2, 3));
-        routed_out = ggml_sum_rows(ctx, routed_out);
-        routed_out = ggml_reshape_2d(ctx, routed_out, n_embd, n_tokens);
+        ggml_tensor * routed_out = nullptr;
+        if (moe_hybrid_graph_policy().fused_combine) {
+            // Keep the grouped-MMID result in route-major form and combine it
+            // directly. This replaces the materialized weight multiply,
+            // permutation/copy, and row reduction with one reusable kernel.
+            routed_out = ggml_laguna_moe_combine(
+                ctx, down_e, owner_weights_tensor);
+        } else {
+            ggml_tensor * weights_3d = ggml_reshape_3d(
+                ctx, owner_weights_tensor, 1, n_used, n_tokens);
+            routed_out = ggml_mul(ctx, down_e, weights_3d);
+            routed_out = ggml_cont(
+                ctx, ggml_permute(ctx, routed_out, 1, 0, 2, 3));
+            routed_out = ggml_sum_rows(ctx, routed_out);
+            routed_out = ggml_reshape_2d(
+                ctx, routed_out, n_embd, n_tokens);
+        }
 
         ggml_tensor * combined_out = routed_out;
         if (has_shared) {
