@@ -2082,8 +2082,9 @@ static ggml_tensor * build_mla_attention(
             score_mask = ggml_reshape_2d(ctx, cmask, n_attn, n_tokens);
         }
     }
-    const bool direct_indexer_topk = indexer_topk &&
-        ds4_env_flag("DFLASH_DS4_DIRECT_INDEXER_TOPK");
+    // Long sparse prefill already has the authoritative selected rows. Pass
+    // them through directly instead of materializing and rescanning a mask.
+    const bool direct_indexer_topk = indexer_topk && n_tokens > w.n_swa;
     if (indexer_topk) {
         if (!score_mask) {
             score_mask = ggml_new_tensor_2d(
