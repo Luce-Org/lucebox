@@ -2873,6 +2873,157 @@ static void test_ds4_flash_attention_parallel_index_scan_gpu() {
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
+static void test_ds4_flash_attention_streaming_topk_gpu() {
+    std::fprintf(stderr,
+                 "  test_ds4_flash_attention_streaming_topk_gpu ...");
+#if !defined(GGML_USE_HIP)
+    std::fprintf(stderr, " skipped (HIP-only candidate)\n");
+    return;
+#endif
+    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    if (!backend) {
+        std::fprintf(stderr, " skipped (no GPU backend)\n");
+        return;
+    }
+
+    constexpr int head_dim = 512;
+    constexpr int n_heads = 64;
+    constexpr int n_tokens = 64;
+    constexpr int raw_rows = 128;
+    constexpr int raw_window = 128;
+    constexpr int selected_rows = 512;
+    constexpr int n_comp_rows = 1920;
+    constexpr int n_kv = raw_rows + n_comp_rows;
+
+    ggml_context * ctx = make_test_context(4u << 20);
+    TEST_ASSERT_MSG(ctx != nullptr, "ggml_init failed");
+    if (!ctx) {
+        ggml_backend_free(backend);
+        std::fprintf(stderr, " FAIL\n");
+        return;
+    }
+
+    ggml_tensor * q = ggml_new_tensor_3d(
+        ctx, GGML_TYPE_F32, head_dim, n_tokens, n_heads);
+    ggml_tensor * kv = ggml_new_tensor_3d(
+        ctx, GGML_TYPE_F16, head_dim, n_kv, 1);
+    ggml_tensor * mask = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F16, n_kv, n_tokens);
+    ggml_tensor * topk = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_I32, selected_rows, n_tokens);
+    ggml_tensor * output = ggml_flash_attn_ext(
+        ctx, q, kv, kv, mask, 1.0f / std::sqrt((float) head_dim),
+        0.0f, 0.0f);
+    ggml_flash_attn_ext_set_ds4_sparse(
+        output, raw_rows, raw_window, -selected_rows, 1);
+    ggml_flash_attn_ext_set_ds4_indexer_topk(output, topk);
+    ggml_set_output(output);
+    TEST_ASSERT_MSG(ggml_backend_supports_op(backend, output),
+                    "GPU rejected streaming top-k attention fixture");
+
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 32, false);
+    ggml_build_forward_expand(graph, output);
+    ggml_gallocr_t alloc = ggml_gallocr_new(
+        ggml_backend_get_default_buffer_type(backend));
+    const bool allocated = ggml_gallocr_alloc_graph(alloc, graph);
+    TEST_ASSERT_MSG(allocated, "streaming top-k graph allocation failed");
+    if (allocated) {
+        std::vector<float> q_data(
+            (size_t) head_dim * n_tokens * n_heads);
+        std::vector<ggml_fp16_t> kv_data((size_t) head_dim * n_kv);
+        std::vector<ggml_fp16_t> mask_data(
+            (size_t) n_kv * n_tokens, ggml_fp32_to_fp16(-1.0e30f));
+        std::vector<int32_t> topk_data(
+            (size_t) selected_rows * n_tokens);
+        for (size_t i = 0; i < q_data.size(); ++i) {
+            q_data[i] = ((int) (i % 43) - 21) * 0.001f;
+        }
+        for (size_t i = 0; i < kv_data.size(); ++i) {
+            kv_data[i] = ggml_fp32_to_fp16(
+                ((int) (i % 47) - 23) * 0.001f);
+        }
+        for (int token = 0; token < n_tokens; ++token) {
+            ggml_fp16_t * token_mask =
+                mask_data.data() + (size_t) token * n_kv;
+            for (int row = 0; row < raw_rows; ++row) {
+                token_mask[row] = ggml_fp32_to_fp16(0.0f);
+            }
+            for (int row = 0; row < n_comp_rows; ++row) {
+                token_mask[raw_rows + row] = ggml_fp32_to_fp16(0.0f);
+            }
+            for (int rank = 0; rank < selected_rows; ++rank) {
+                topk_data[(size_t) token * selected_rows + rank] =
+                    (token * 17 + selected_rows - 1 - rank) % n_comp_rows;
+            }
+        }
+        ggml_backend_tensor_set(q, q_data.data(), 0,
+                                q_data.size() * sizeof(float));
+        ggml_backend_tensor_set(kv, kv_data.data(), 0,
+                                kv_data.size() * sizeof(ggml_fp16_t));
+        ggml_backend_tensor_set(mask, mask_data.data(), 0,
+                                mask_data.size() * sizeof(ggml_fp16_t));
+        ggml_backend_tensor_set(topk, topk_data.data(), 0,
+                                topk_data.size() * sizeof(int32_t));
+
+        ScopedEnvVar streaming_guard("GGML_CUDA_MLA_STREAM_TOPK");
+        ScopedCudaGraphOverrides eager(
+            /*disable_graphs=*/true,
+            /*mmvq_max_ncols=*/0,
+            /*skip_property_check=*/false);
+        std::vector<float> reference((size_t) ggml_nelements(output));
+        std::vector<float> candidate(reference.size());
+        setenv("GGML_CUDA_MLA_STREAM_TOPK", "0", 1);
+        TEST_ASSERT_MSG(
+            ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS,
+            "grouped compact attention reference failed");
+        ggml_backend_tensor_get(output, reference.data(), 0,
+                                reference.size() * sizeof(float));
+
+        setenv("GGML_CUDA_MLA_STREAM_TOPK", "1", 1);
+        TEST_ASSERT_MSG(
+            ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS,
+            "streaming top-k attention failed");
+        ggml_backend_tensor_get(output, candidate.data(), 0,
+                                candidate.size() * sizeof(float));
+
+        for (size_t i = 0; i < reference.size(); ++i) {
+            TEST_ASSERT_MSG(
+                std::isfinite(candidate[i]),
+                "streaming top-k attention output must be finite");
+            TEST_ASSERT_MSG(
+                nearly_equal(reference[i], candidate[i], 5.0e-4f, 5.0e-4f),
+                "streaming top-k attention exceeded numeric tolerance");
+        }
+
+        auto measure_us = [&](bool streaming) {
+            setenv("GGML_CUDA_MLA_STREAM_TOPK", streaming ? "1" : "0", 1);
+            constexpr int warmups = 3;
+            constexpr int iterations = 20;
+            for (int i = 0; i < warmups; ++i) {
+                ggml_backend_graph_compute(backend, graph);
+            }
+            ggml_backend_synchronize(backend);
+            const auto begin = std::chrono::steady_clock::now();
+            for (int i = 0; i < iterations; ++i) {
+                ggml_backend_graph_compute(backend, graph);
+            }
+            ggml_backend_synchronize(backend);
+            const auto end = std::chrono::steady_clock::now();
+            return std::chrono::duration<double, std::micro>(end - begin).count() /
+                iterations;
+        };
+        const double grouped_us = measure_us(false);
+        const double streaming_us = measure_us(true);
+        std::fprintf(stderr, " grouped=%.1fus streaming=%.1fus speedup=%.2fx",
+                     grouped_us, streaming_us, grouped_us / streaming_us);
+    }
+
+    ggml_gallocr_free(alloc);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
 static void run_ds4_indexer_score_packed_small_case(
         ggml_backend_t backend, int n_tokens) {
     constexpr int dim = 128;
@@ -4209,6 +4360,7 @@ int main() {
 #if defined(GGML_USE_CUDA) || defined(GGML_USE_HIP)
     test_ds4_flash_attention_keep_cap_gpu();
     test_ds4_flash_attention_parallel_index_scan_gpu();
+    test_ds4_flash_attention_streaming_topk_gpu();
     test_ds4_indexer_score_packed_small_gpu();
     test_ds4_topk_block_radix_gpu();
     test_ds4_flash_attention_inverse_rope_fallback_gpu();

@@ -1554,6 +1554,202 @@ __global__ static void ds4_flash_attn_d512_shared_kv_grouped_compact_kernel(
     }
 }
 
+// Streaming indexed MLA for long prefill.  The compact grouped kernel above
+// stores every score and then reloads V.  Once the trained indexer has reduced
+// the compressed history to a bounded top-k set, that extra traffic is no
+// longer necessary: stage one latent row in LDS, share it across the heads in
+// a block, and update online-softmax state while the row is resident. Sixteen
+// wave32 heads amortize each LDS load best on gfx1151. The contract is
+// backend-generic (D512 MQA with K == V and direct indexed rows); model policy
+// remains in the graph/backend layer.
+template <typename KV, typename Mask, int HEADS_PER_BLOCK = 16,
+          int KEYS_PER_STAGE = 16>
+__global__ static void ds4_flash_attn_d512_streaming_topk_kernel(
+        float       * dst,
+        const float * q,
+        size_t        q_stride_token,
+        size_t        q_stride_head,
+        const KV    * kv,
+        const Mask  * mask,
+        const float * sinks,
+        int           n_tokens,
+        int           n_heads,
+        int           n_kv,
+        float         scale,
+        const int   * visibility_bounds,
+        const int   * indexed_rows,
+        const int   * indexed_counts,
+        int           indexed_capacity,
+        ds4_inverse_rope_params inverse_rope,
+        const float * inverse_rope_coefficients,
+        const float * forward_rope_coefficients) {
+    constexpr int D = 512;
+    constexpr int WAVE = 32;
+    constexpr int N_THREADS = HEADS_PER_BLOCK * WAVE;
+    constexpr int VALUES_PER_LANE = D / WAVE;
+    static_assert(HEADS_PER_BLOCK == 16);
+    static_assert(KEYS_PER_STAGE == 16);
+    static_assert(N_THREADS == 512);
+
+    const int token = (int) blockIdx.x;
+    const int head_begin = (int) blockIdx.y * HEADS_PER_BLOCK;
+    const int tid = (int) threadIdx.x;
+    const int wave = tid / WAVE;
+    const int lane = tid & (WAVE - 1);
+    const int head = head_begin + wave;
+
+    // The launch gate makes the grid exact.  Keeping every thread live is
+    // required because each stage has workgroup-wide barriers.
+    if (token >= n_tokens || head_begin + HEADS_PER_BLOCK > n_heads) return;
+
+    __shared__ KV staged_kv[KEYS_PER_STAGE * D];
+    __shared__ int staged_rows[KEYS_PER_STAGE];
+    __shared__ float staged_masks[KEYS_PER_STAGE];
+
+    const int * token_visibility = visibility_bounds + (size_t) token * 4;
+    const int raw_first = token_visibility[0];
+    const int raw_last = token_visibility[1];
+    const int raw_count = raw_last >= raw_first
+        ? raw_last - raw_first + 1 : 0;
+    const int indexed_count = indexed_counts[token];
+    const int total_rows = raw_count + indexed_count;
+    const int * token_rows = indexed_rows +
+        (size_t) token * indexed_capacity;
+    const Mask * token_mask = mask + (size_t) token * n_kv;
+
+    const float * qh = q + (size_t) token * q_stride_token +
+        (size_t) head * q_stride_head;
+    float q_values[VALUES_PER_LANE];
+    float accum[VALUES_PER_LANE] = {};
+#pragma unroll
+    for (int i = 0; i < VALUES_PER_LANE; ++i) {
+        const int dim = lane + i * WAVE;
+        float qv = qh[dim];
+        if (inverse_rope.forward_q_enabled && dim >= D - 64) {
+            const int pair = (dim - (D - 64)) / 2;
+            const float x0 = qh[D - 64 + 2 * pair + 0];
+            const float x1 = qh[D - 64 + 2 * pair + 1];
+            const size_t coefficient_index =
+                ((size_t) token * 32 + (size_t) pair) * 2;
+            float y0;
+            float y1;
+            ds4_apply_inverse_rope_pair(
+                x0, x1,
+                forward_rope_coefficients[coefficient_index + 0],
+                forward_rope_coefficients[coefficient_index + 1],
+                y0, y1);
+            qv = (dim & 1) == 0 ? y0 : y1;
+        }
+        q_values[i] = qv;
+    }
+
+    float row_max = -3.402823466e38f;
+    float row_sum = 0.0f;
+    for (int row_base = 0; row_base < total_rows;
+         row_base += KEYS_PER_STAGE) {
+        if (tid < KEYS_PER_STAGE) {
+            const int selected = row_base + tid;
+            int row = -1;
+            if (selected < raw_count) {
+                row = raw_first + selected;
+            } else if (selected < total_rows) {
+                row = token_rows[selected - raw_count];
+            }
+            staged_rows[tid] = row;
+            staged_masks[tid] = row >= 0 && row < n_kv
+                ? ds4_fa_load<Mask, Mask>(token_mask + row)
+                : -3.402823466e38f;
+        }
+        __syncthreads();
+
+        for (int index = tid; index < KEYS_PER_STAGE * D;
+             index += N_THREADS) {
+            const int slot = index / D;
+            const int dim = index - slot * D;
+            const int row = staged_rows[slot];
+            staged_kv[index] = row >= 0 && row < n_kv
+                ? kv[(size_t) row * D + dim] : KV{};
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int slot = 0; slot < KEYS_PER_STAGE; ++slot) {
+            const int selected = row_base + slot;
+            if (selected >= total_rows) continue;
+            const float mask_value = staged_masks[slot];
+            if (mask_value <= -1.0e20f) continue;
+
+            float partial = 0.0f;
+#pragma unroll
+            for (int i = 0; i < VALUES_PER_LANE; ++i) {
+                const int dim = lane + i * WAVE;
+                partial += q_values[i] *
+                    ds4_fa_load<KV, Mask>(staged_kv + slot * D + dim);
+            }
+            partial = warp_reduce_sum<WAVE>(partial);
+            // XOR reduction can associate operands differently in each lane.
+            // Broadcast lane zero so every output dimension advances one
+            // identical softmax state.
+            partial = __shfl_sync(0xffffffffu, partial, 0, WAVE);
+
+            const float score = partial * scale + mask_value;
+            const float next_max = fmaxf(row_max, score);
+            const float old_scale = row_sum == 0.0f
+                ? 0.0f : expf(row_max - next_max);
+            const float value_scale = expf(score - next_max);
+            row_sum = row_sum * old_scale + value_scale;
+            row_max = next_max;
+#pragma unroll
+            for (int i = 0; i < VALUES_PER_LANE; ++i) {
+                const int dim = lane + i * WAVE;
+                const float value = ds4_fa_load<KV, Mask>(
+                    staged_kv + slot * D + dim);
+                accum[i] = accum[i] * old_scale + value_scale * value;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (sinks) {
+        const float sink = sinks[head];
+        const float next_max = fmaxf(row_max, sink);
+        const float old_scale = row_sum == 0.0f
+            ? 0.0f : expf(row_max - next_max);
+        row_sum = row_sum * old_scale + expf(sink - next_max);
+#pragma unroll
+        for (int i = 0; i < VALUES_PER_LANE; ++i) {
+            accum[i] *= old_scale;
+        }
+    }
+
+    const float inv_sum = row_sum == 0.0f ? 0.0f : 1.0f / row_sum;
+    float * out = dst +
+        ((size_t) token * (size_t) n_heads + (size_t) head) * D;
+#pragma unroll
+    for (int i = 0; i < VALUES_PER_LANE; ++i) {
+        const int dim = lane + i * WAVE;
+        float value = accum[i] * inv_sum;
+        if (inverse_rope.enabled && dim >= D - 64) {
+            const float partner = __shfl_xor_sync(
+                0xffffffffu, value, 1, WAVE);
+            const float x0 = (dim & 1) == 0 ? value : partner;
+            const float x1 = (dim & 1) == 0 ? partner : value;
+            const int pair = (dim - (D - 64)) / 2;
+            const size_t coefficient_index =
+                ((size_t) token * 32 + (size_t) pair) * 2;
+            float y0;
+            float y1;
+            ds4_apply_inverse_rope_pair(
+                x0, x1,
+                inverse_rope_coefficients[coefficient_index + 0],
+                inverse_rope_coefficients[coefficient_index + 1],
+                y0, y1);
+            value = (dim & 1) == 0 ? y0 : y1;
+        }
+        out[dim] = value;
+    }
+}
+
 // Split-KV decode for indexed MLA.  A single grouped block leaves most of a
 // wide RDNA GPU idle when q is small: DS4 has 64 heads, so the four-head
 // kernel exposes only 16 blocks per layer.  Split the bounded raw+top-k row
@@ -2383,6 +2579,50 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
                 n_tokens, n_kv, raw_rows);
         }
         CUDA_CHECK(cudaGetLastError());
+        // Vulkan shares each selected latent row across eight subgroup64
+        // heads. HIP tuning selected sixteen wave32 heads for the same K == V
+        // reuse. Keep the native HIP path opt-in until a model-backed A/B
+        // qualifies its online-softmax association. The shape gate is
+        // expressed in terms of the D512 indexed-attention
+        // contract so another model can reuse the kernel without DS4 policy
+        // leaking into it.
+        const char * streaming_topk_env =
+            getenv("GGML_CUDA_MLA_STREAM_TOPK");
+        if (!streaming_topk_env) {
+            streaming_topk_env = getenv("GGML_DS4_FA_STREAM_TOPK");
+        }
+        const bool streaming_topk_enabled = streaming_topk_env &&
+            streaming_topk_env[0] != '\0' &&
+            strcmp(streaming_topk_env, "0") != 0;
+        constexpr int streaming_min_tokens = 64;
+        const int active_row_upper_bound = raw_window + indexed_capacity;
+        const int device_warp_size =
+            ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+        if (streaming_topk_enabled && indexed_mask && indexer_topk &&
+            kv_f16 && mask->type == GGML_TYPE_F16 &&
+            K->data == V->data && n_heads % 16 == 0 &&
+            device_warp_size == 32 && n_tokens >= streaming_min_tokens &&
+            active_row_upper_bound > 0 &&
+            n_kv >= 3 * active_row_upper_bound) {
+            constexpr int streaming_heads = 16;
+            const dim3 streaming_grid(
+                (unsigned) n_tokens,
+                (unsigned) (n_heads / streaming_heads), 1);
+            ds4_flash_attn_d512_streaming_topk_kernel<half, half>
+                <<<streaming_grid, streaming_heads * 32, 0, stream>>>(
+                    (float *) dst->data, (const float *) Q->data,
+                    q_stride_token, q_stride_head,
+                    (const half *) K->data,
+                    (const half *) mask->data,
+                    sinks ? (const float *) sinks->data : nullptr,
+                    n_tokens, n_heads, n_kv, scale,
+                    visibility_bounds, indexed_rows, indexed_counts,
+                    indexed_capacity, inverse_rope,
+                    inverse_rope_coefficients,
+                    forward_rope_coefficients);
+            CUDA_CHECK(cudaGetLastError());
+            return true;
+        }
         // AITER-style split-KV schedule, implemented directly in the native HIP
         // backend. Matched Strix Halo profiling showed a bit-identical output,
         // about -58% attention time and +2-3% decode throughput, so make it the

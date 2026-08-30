@@ -487,6 +487,15 @@ On gfx1151, the exact block-radix selector is also the default for the DS4
 hipCUB full-sort path. The qualification benchmark checks selected-set parity
 before reporting selector timing.
 
+For experimental long sparse prefill, set both
+`DFLASH_DS4_DIRECT_INDEXER_TOPK=1` and `GGML_CUDA_MLA_STREAM_TOPK=1`. This
+enables a reusable D512 K-equals-V streaming attention path that shares each
+selected latent row across wave32 heads and avoids materializing scores. It is
+currently limited to F16 caches on native wave32 devices and otherwise falls
+back to the existing path. Because its online softmax changes floating-point
+association, keep it opt-in until the target model passes a matched output and
+throughput A/B. `GGML_DS4_FA_STREAM_TOPK` remains a compatibility alias.
+
 Indexed verifier attention with at most eight query rows also uses a two-way
 split-KV schedule on gfx1151. Set `GGML_CUDA_MLA_NO_SPLIT_KV=1` to restore the
 single-block schedule. For fused-verifier masks of at least 4 MiB, the runtime
