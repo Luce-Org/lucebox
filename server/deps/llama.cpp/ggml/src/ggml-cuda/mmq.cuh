@@ -1102,8 +1102,9 @@ static __device__ __forceinline__ void load_tiles_rocmfpx_dual(
 // qtype-107, but each expert supplies two learned four-level codebooks.  MMQ
 // needs int8 tiles, so quantize those tiny codebooks once per K tile, then fold
 // the codebook scale into the block's ordinary UE4M3 scale.  The additional
-// error is bounded to half an int8 step (measured below 0.4% of codebook range)
-// and this path is opt-in because sparse prefill is already approximate.
+// error is bounded to half an int8 step (measured below 0.4% of codebook range).
+// Backend policy selects this path only for prefill modes that are already
+// approximate; exact prefill retains the dequantize-to-F16 fallback.
 struct rocmfp2_mix_mmq_lut {
     int   packed[2];
     float scale[2];

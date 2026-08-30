@@ -256,6 +256,35 @@ static void configure_gfx1151_sparse_decode_default(int gpu) {
 #endif
 }
 
+static bool configure_gfx1151_mix_mmq_prefill_default(
+        int gpu, PrefillAttentionMode mode) {
+#if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
+    // Preserve explicit user policy, including the value 0 kill switch.
+    if (std::getenv("DFLASH_DS4_MIX_MMQ_PREFILL") != nullptr) {
+        return true;
+    }
+
+    cudaDeviceProp prop{};
+    if (cudaGetDeviceProperties(&prop, gpu) != cudaSuccess ||
+        !deepseek4_mix_mmq_prefill_default(mode, prop.gcnArchName)) {
+        return true;
+    }
+
+    if (::setenv("DFLASH_DS4_MIX_MMQ_PREFILL", "1", 0) != 0) {
+        std::fprintf(stderr,
+                     "[deepseek4] failed to enable mixed ROCmFP MMQ prefill\n");
+        return false;
+    }
+    std::fprintf(stderr,
+                 "[deepseek4] gfx1151 approximate prefill: defaulting mixed "
+                 "ROCmFP MMQ on\n");
+#else
+    (void) gpu;
+    (void) mode;
+#endif
+    return true;
+}
+
 static void configure_gfx1201_hybrid_sub_batch_default(int gpu) {
 #if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
     if (std::getenv("DFLASH_MMQ_SUB_BATCH") != nullptr) {
@@ -769,6 +798,15 @@ static MoeLayerDesc make_ds4_expert_layer_desc(const DeepSeek4Layer & layer) {
 
 }  // namespace
 
+bool deepseek4_mix_mmq_prefill_default(
+        PrefillAttentionMode mode, const char * gcn_arch) {
+    if (!prefill_attention_mode_is_approximate(mode) || gcn_arch == nullptr ||
+        std::strncmp(gcn_arch, "gfx1151", 7) != 0) {
+        return false;
+    }
+    return gcn_arch[7] == '\0' || gcn_arch[7] == ':';
+}
+
 DeepSeek4Backend::DeepSeek4Backend(const DeepSeek4BackendConfig & cfg)
     : cfg_(cfg) {}
 
@@ -1064,6 +1102,10 @@ bool DeepSeek4Backend::init() {
         return false;
     }
     configure_gfx1151_sparse_decode_default(cfg_.device.gpu);
+    if (!configure_gfx1151_mix_mmq_prefill_default(
+            cfg_.device.gpu, cfg_.prefill_mode)) {
+        return false;
+    }
     configure_gfx1201_hybrid_sub_batch_default(cfg_.device.gpu);
 
     backend_ = ggml_backend_cuda_init(cfg_.device.gpu);

@@ -1718,6 +1718,23 @@ static void test_hybrid_prefill_chunk_tokens() {
                     2048, 32768, 0) == 0);
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
+
+static void test_mix_mmq_prefill_default() {
+    std::fprintf(stderr, "  test_mix_mmq_prefill_default ...");
+    TEST_ASSERT(!deepseek4_mix_mmq_prefill_default(
+        PrefillAttentionMode::Exact, "gfx1151"));
+    TEST_ASSERT(deepseek4_mix_mmq_prefill_default(
+        PrefillAttentionMode::Dense, "gfx1151"));
+    TEST_ASSERT(deepseek4_mix_mmq_prefill_default(
+        PrefillAttentionMode::Sparse, "gfx1151:sramecc+:xnack-"));
+    TEST_ASSERT(!deepseek4_mix_mmq_prefill_default(
+        PrefillAttentionMode::Sparse, "gfx1201"));
+    TEST_ASSERT(!deepseek4_mix_mmq_prefill_default(
+        PrefillAttentionMode::Sparse, "gfx11510"));
+    TEST_ASSERT(!deepseek4_mix_mmq_prefill_default(
+        PrefillAttentionMode::Sparse, nullptr));
+    std::fprintf(stderr, " OK\n");
+}
 static void test_dspark_park_all_releases_drafter() {
     std::fprintf(stderr, "  test_dspark_park_all_releases_drafter ...");
 
@@ -4174,6 +4191,7 @@ int main() {
     test_dspark_confidence_uses_separate_hidden(backend);
     test_safe_compressor_batch_tokens();
     test_hybrid_prefill_chunk_tokens();
+    test_mix_mmq_prefill_default();
     test_dspark_park_all_releases_drafter();
     test_pflash_rejects_invalid_requests();
     test_dspark_raw_ring_rollback_after_wrap(backend);
