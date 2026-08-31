@@ -2019,6 +2019,7 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                 save_snapshot && !snapshot_saved,
                 spec_snap_from, spec_snap_to);
         }
+        const auto chunk_t0 = Clock::now();
 
         // Bulk prompt graphs and the final DSpark feature-capture graph have
         // different HC/owner arena shapes. Once all earlier chunks are
@@ -2131,6 +2132,8 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         if (timing) {
             add_step_tel(tel_acc, step_tel);
             steps++;
+            log_step_tel("prefill-chunk", n_tok, 1,
+                         elapsed_s(chunk_t0), step_tel);
         }
         last_logits_ = std::move(logits);
         pos += n_tok;
