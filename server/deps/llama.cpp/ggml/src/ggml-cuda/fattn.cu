@@ -1565,7 +1565,8 @@ __global__ static void ds4_flash_attn_d512_shared_kv_grouped_compact_kernel(
 // backend-generic (D512 MQA with K == V and direct indexed rows); model policy
 // remains in the graph/backend layer.
 template <typename KV, typename Mask, int HEADS_PER_BLOCK = 16,
-          int KEYS_PER_STAGE = 16, bool STAGE_F32 = false>
+          int KEYS_PER_STAGE = 16, bool STAGE_F32 = false,
+          bool FAST_EXP = false>
 __global__ static void ds4_flash_attn_d512_streaming_topk_kernel(
         float       * dst,
         const float * q,
@@ -1721,8 +1722,13 @@ __global__ static void ds4_flash_attn_d512_streaming_topk_kernel(
             const float score = partial * scale + mask_value;
             const float next_max = fmaxf(row_max, score);
             const float old_scale = row_sum == 0.0f
-                ? 0.0f : expf(row_max - next_max);
-            const float value_scale = expf(score - next_max);
+                ? 0.0f
+                : (FAST_EXP
+                    ? __expf(row_max - next_max)
+                    : expf(row_max - next_max));
+            const float value_scale = FAST_EXP
+                ? __expf(score - next_max)
+                : expf(score - next_max);
             row_sum = row_sum * old_scale + value_scale;
             row_max = next_max;
 #pragma unroll
@@ -1740,8 +1746,12 @@ __global__ static void ds4_flash_attn_d512_streaming_topk_kernel(
         const float sink = sinks[head];
         const float next_max = fmaxf(row_max, sink);
         const float old_scale = row_sum == 0.0f
-            ? 0.0f : expf(row_max - next_max);
-        row_sum = row_sum * old_scale + expf(sink - next_max);
+            ? 0.0f
+            : (FAST_EXP
+                ? __expf(row_max - next_max)
+                : expf(row_max - next_max));
+        row_sum = row_sum * old_scale +
+            (FAST_EXP ? __expf(sink - next_max) : expf(sink - next_max));
 #pragma unroll
         for (int i = 0; i < VALUES_PER_LANE; ++i) {
             accum[i] *= old_scale;
@@ -2634,11 +2644,29 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
                 getenv("GGML_CUDA_MLA_STREAM_F32_STAGE");
             const bool f32_stage = f32_stage_env && f32_stage_env[0] != '\0' &&
                 strcmp(f32_stage_env, "0") != 0;
+            const char * fast_exp_env =
+                getenv("GGML_CUDA_MLA_STREAM_FAST_EXP");
+            const bool fast_exp = fast_exp_env && fast_exp_env[0] != '\0' &&
+                strcmp(fast_exp_env, "0") != 0;
             constexpr int streaming_heads = 16;
             const dim3 streaming_grid(
                 (unsigned) n_tokens,
                 (unsigned) (n_heads / streaming_heads), 1);
-            if (f32_stage) {
+            if (f32_stage && fast_exp) {
+                ds4_flash_attn_d512_streaming_topk_kernel<
+                    half, half, streaming_heads, 16, true, true>
+                    <<<streaming_grid, streaming_heads * 32, 0, stream>>>(
+                        (float *) dst->data, (const float *) Q->data,
+                        q_stride_token, q_stride_head,
+                        (const half *) K->data,
+                        (const half *) mask->data,
+                        sinks ? (const float *) sinks->data : nullptr,
+                        n_tokens, n_heads, n_kv, scale,
+                        visibility_bounds, indexed_rows, indexed_counts,
+                        indexed_capacity, inverse_rope,
+                        inverse_rope_coefficients,
+                        forward_rope_coefficients);
+            } else if (f32_stage) {
                 ds4_flash_attn_d512_streaming_topk_kernel<
                     half, half, streaming_heads, 16, true>
                     <<<streaming_grid, streaming_heads * 32, 0, stream>>>(

@@ -498,7 +498,11 @@ throughput A/B. `GGML_DS4_FA_STREAM_TOPK` remains a compatibility alias. Add
 `GGML_CUDA_MLA_STREAM_F32_STAGE=1` to convert each selected F16 latent once
 while staging aligned pairs in shared memory instead of repeating conversion
 for every head. The isolated gfx1151 qualification is byte-identical to F16
-staging and reduced alternating-run kernel time by about 9%.
+staging and reduced alternating-run kernel time by about 9%. Add
+`GGML_CUDA_MLA_STREAM_FAST_EXP=1` to use the HIP hardware exponential in that
+FP32-staged online softmax. It reduced the remaining kernel time by another
+7–9% in isolation; keep it opt-in with the streaming path because it uses an
+approximate hardware exponential instead of the default implementation.
 
 Indexed verifier attention with at most eight query rows also uses a two-way
 split-KV schedule on gfx1151. Set `GGML_CUDA_MLA_NO_SPLIT_KV=1` to restore the

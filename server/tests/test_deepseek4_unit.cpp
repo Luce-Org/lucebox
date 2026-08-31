@@ -2936,11 +2936,11 @@ static void test_ds4_flash_attention_streaming_topk_gpu() {
         std::vector<int32_t> topk_data(
             (size_t) selected_rows * n_tokens);
         for (size_t i = 0; i < q_data.size(); ++i) {
-            q_data[i] = ((int) (i % 43) - 21) * 0.001f;
+            q_data[i] = ((int) (i % 43) - 21) * 0.05f;
         }
         for (size_t i = 0; i < kv_data.size(); ++i) {
             kv_data[i] = ggml_fp32_to_fp16(
-                ((int) (i % 47) - 23) * 0.001f);
+                ((int) (i % 47) - 23) * 0.05f);
         }
         for (int token = 0; token < n_tokens; ++token) {
             ggml_fp16_t * token_mask =
@@ -2967,6 +2967,7 @@ static void test_ds4_flash_attention_streaming_topk_gpu() {
 
         ScopedEnvVar streaming_guard("GGML_CUDA_MLA_STREAM_TOPK");
         ScopedEnvVar f32_stage_guard("GGML_CUDA_MLA_STREAM_F32_STAGE");
+        ScopedEnvVar fast_exp_guard("GGML_CUDA_MLA_STREAM_FAST_EXP");
         ScopedCudaGraphOverrides eager(
             /*disable_graphs=*/true,
             /*mmvq_max_ncols=*/0,
@@ -2974,7 +2975,9 @@ static void test_ds4_flash_attention_streaming_topk_gpu() {
         std::vector<float> reference((size_t) ggml_nelements(output));
         std::vector<float> candidate_f16_stage(reference.size());
         std::vector<float> candidate_f32_stage(reference.size());
+        std::vector<float> candidate_fast_exp(reference.size());
         setenv("GGML_CUDA_MLA_STREAM_TOPK", "0", 1);
+        setenv("GGML_CUDA_MLA_STREAM_FAST_EXP", "0", 1);
         TEST_ASSERT_MSG(
             ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS,
             "grouped compact attention reference failed");
@@ -2996,6 +2999,16 @@ static void test_ds4_flash_attention_streaming_topk_gpu() {
         ggml_backend_tensor_get(output, candidate_f32_stage.data(), 0,
                                 candidate_f32_stage.size() * sizeof(float));
 
+        setenv("GGML_CUDA_MLA_STREAM_FAST_EXP", "1", 1);
+        TEST_ASSERT_MSG(
+            ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS,
+            "fast-exp streaming top-k attention failed");
+        ggml_backend_tensor_get(output, candidate_fast_exp.data(), 0,
+                                candidate_fast_exp.size() * sizeof(float));
+
+        double fast_exp_squared_error = 0.0;
+        double f32_stage_power = 0.0;
+        float fast_exp_max_abs = 0.0f;
         for (size_t i = 0; i < reference.size(); ++i) {
             TEST_ASSERT_MSG(
                 std::isfinite(candidate_f32_stage[i]),
@@ -3007,11 +3020,29 @@ static void test_ds4_flash_attention_streaming_topk_gpu() {
             TEST_ASSERT_MSG(
                 candidate_f16_stage[i] == candidate_f32_stage[i],
                 "F32 staging changed streaming top-k attention output");
+            TEST_ASSERT_MSG(
+                std::isfinite(candidate_fast_exp[i]),
+                "fast-exp streaming output must be finite");
+            TEST_ASSERT_MSG(
+                nearly_equal(reference[i], candidate_fast_exp[i],
+                             5.0e-4f, 5.0e-4f),
+                "fast-exp streaming attention exceeded numeric tolerance");
+            const double fast_exp_error =
+                (double) candidate_fast_exp[i] - candidate_f32_stage[i];
+            fast_exp_squared_error += fast_exp_error * fast_exp_error;
+            f32_stage_power +=
+                (double) candidate_f32_stage[i] * candidate_f32_stage[i];
+            fast_exp_max_abs = std::max(
+                fast_exp_max_abs,
+                std::fabs(candidate_fast_exp[i] - candidate_f32_stage[i]));
         }
+        const double fast_exp_nmse = fast_exp_squared_error /
+            std::max(f32_stage_power, 1.0e-30);
 
-        auto measure_us = [&](bool streaming, bool f32_stage) {
+        auto measure_us = [&](bool streaming, bool f32_stage, bool fast_exp) {
             setenv("GGML_CUDA_MLA_STREAM_TOPK", streaming ? "1" : "0", 1);
             setenv("GGML_CUDA_MLA_STREAM_F32_STAGE", f32_stage ? "1" : "0", 1);
+            setenv("GGML_CUDA_MLA_STREAM_FAST_EXP", fast_exp ? "1" : "0", 1);
             constexpr int warmups = 3;
             constexpr int iterations = 20;
             for (int i = 0; i < warmups; ++i) {
@@ -3027,26 +3058,32 @@ static void test_ds4_flash_attention_streaming_topk_gpu() {
             return std::chrono::duration<double, std::micro>(end - begin).count() /
                 iterations;
         };
-        const double grouped_us = measure_us(false, false);
+        const double grouped_us = measure_us(false, false, false);
         constexpr int timing_rounds = 4;
         double streaming_f16_us = 0.0;
         double streaming_f32_us = 0.0;
+        double fast_exp_us = 0.0;
         for (int round = 0; round < timing_rounds; ++round) {
             if ((round & 1) == 0) {
-                streaming_f16_us += measure_us(true, false);
-                streaming_f32_us += measure_us(true, true);
+                streaming_f16_us += measure_us(true, false, false);
+                streaming_f32_us += measure_us(true, true, false);
+                fast_exp_us += measure_us(true, true, true);
             } else {
-                streaming_f32_us += measure_us(true, true);
-                streaming_f16_us += measure_us(true, false);
+                fast_exp_us += measure_us(true, true, true);
+                streaming_f32_us += measure_us(true, true, false);
+                streaming_f16_us += measure_us(true, false, false);
             }
         }
         streaming_f16_us /= timing_rounds;
         streaming_f32_us /= timing_rounds;
+        fast_exp_us /= timing_rounds;
         std::fprintf(stderr,
                      " grouped=%.1fus streaming_f16=%.1fus"
-                     " streaming_f32=%.1fus speedup=%.2fx",
+                     " streaming_f32=%.1fus fast_exp=%.1fus speedup=%.2fx"
+                     " fast_nmse=%.3g fast_max_abs=%.3g",
                      grouped_us, streaming_f16_us, streaming_f32_us,
-                     grouped_us / streaming_f32_us);
+                     fast_exp_us, grouped_us / fast_exp_us,
+                     fast_exp_nmse, fast_exp_max_abs);
     }
 
     ggml_gallocr_free(alloc);
