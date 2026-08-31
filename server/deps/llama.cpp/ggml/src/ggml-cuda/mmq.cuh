@@ -1086,11 +1086,21 @@ static __device__ __forceinline__ void load_tiles_rocmfpx_dual(
             q1 = rocmfpx_pack4_fp3_bits12_vec_cuda((bits24 >> 12) & 0x0fffu);
             q1_offset = 1;
         } else {
-            k0 = kbx*groups_per_block + group;
-            q0 = traits::pack4(block, 4*group);
-            q1 = traits::pack4(
-                block, 4*(group + groups_per_block/2));
-            q1_offset = groups_per_block/2;
+            // FP2 stores each four-value group in one byte. Pair adjacent
+            // groups so HIP can issue one aligned 16-bit load per lane.
+            const int byte = 2*group;
+#if defined(GGML_USE_HIP)
+            uint16_t bits16;
+            __builtin_memcpy(&bits16, block->qs + byte, sizeof(bits16));
+#else
+            const uint16_t bits16 =
+                (uint16_t) block->qs[byte + 0] |
+                ((uint16_t) block->qs[byte + 1] << 8);
+#endif
+            k0 = kbx*groups_per_block + 2*group;
+            q0 = rocmfpx_pack4_fp2_bits8_vec_cuda(bits16 & 0x00ffu);
+            q1 = rocmfpx_pack4_fp2_bits8_vec_cuda((bits16 >> 8) & 0x00ffu);
+            q1_offset = 1;
         }
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
