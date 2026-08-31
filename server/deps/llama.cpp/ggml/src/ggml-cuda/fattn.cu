@@ -7,6 +7,8 @@
 #include "fattn-chunked.cuh"
 #include "fattn.cuh"
 
+#include <type_traits>
+
 #if defined(GGML_USE_HIP)
 
 __device__ static float ds4_fa_block_sum(float v) {
@@ -1563,7 +1565,7 @@ __global__ static void ds4_flash_attn_d512_shared_kv_grouped_compact_kernel(
 // backend-generic (D512 MQA with K == V and direct indexed rows); model policy
 // remains in the graph/backend layer.
 template <typename KV, typename Mask, int HEADS_PER_BLOCK = 16,
-          int KEYS_PER_STAGE = 16>
+          int KEYS_PER_STAGE = 16, bool STAGE_F32 = false>
 __global__ static void ds4_flash_attn_d512_streaming_topk_kernel(
         float       * dst,
         const float * q,
@@ -1602,7 +1604,8 @@ __global__ static void ds4_flash_attn_d512_streaming_topk_kernel(
     // required because each stage has workgroup-wide barriers.
     if (token >= n_tokens || head_begin + HEADS_PER_BLOCK > n_heads) return;
 
-    __shared__ KV staged_kv[KEYS_PER_STAGE * D];
+    using stage_type = std::conditional_t<STAGE_F32, float, KV>;
+    __shared__ __align__(16) stage_type staged_kv[KEYS_PER_STAGE * D];
     __shared__ int staged_rows[KEYS_PER_STAGE];
     __shared__ float staged_masks[KEYS_PER_STAGE];
 
@@ -1662,13 +1665,35 @@ __global__ static void ds4_flash_attn_d512_streaming_topk_kernel(
         }
         __syncthreads();
 
-        for (int index = tid; index < KEYS_PER_STAGE * D;
-             index += N_THREADS) {
-            const int slot = index / D;
-            const int dim = index - slot * D;
-            const int row = staged_rows[slot];
-            staged_kv[index] = row >= 0 && row < n_kv
-                ? kv[(size_t) row * D + dim] : KV{};
+        // Convert aligned half2 pairs once while loading them. Every head in
+        // the block then consumes the same F32 LDS values without repeating
+        // half conversion in both the score and value passes.
+        if constexpr (STAGE_F32 && std::is_same_v<KV, half>) {
+            constexpr int PAIRS_PER_ROW = D / 2;
+            for (int pair_index = tid;
+                 pair_index < KEYS_PER_STAGE * PAIRS_PER_ROW;
+                 pair_index += N_THREADS) {
+                const int slot = pair_index / PAIRS_PER_ROW;
+                const int pair = pair_index - slot * PAIRS_PER_ROW;
+                const int row = staged_rows[slot];
+                float2 unpacked = make_float2(0.0f, 0.0f);
+                if (row >= 0 && row < n_kv) {
+                    ds4_fa_load_pair(
+                        kv + (size_t) row * D + 2 * pair,
+                        unpacked.x, unpacked.y);
+                }
+                reinterpret_cast<float2 *>(staged_kv)[pair_index] = unpacked;
+            }
+        } else {
+            for (int index = tid; index < KEYS_PER_STAGE * D;
+                 index += N_THREADS) {
+                const int slot = index / D;
+                const int dim = index - slot * D;
+                const int row = staged_rows[slot];
+                staged_kv[index] = row >= 0 && row < n_kv
+                    ? static_cast<stage_type>(kv[(size_t) row * D + dim])
+                    : stage_type{};
+            }
         }
         __syncthreads();
 
@@ -1684,7 +1709,8 @@ __global__ static void ds4_flash_attn_d512_streaming_topk_kernel(
             for (int i = 0; i < VALUES_PER_LANE; ++i) {
                 const int dim = lane + i * WAVE;
                 partial += q_values[i] *
-                    ds4_fa_load<KV, Mask>(staged_kv + slot * D + dim);
+                    ds4_fa_load<stage_type, stage_type>(
+                        staged_kv + slot * D + dim);
             }
             partial = warp_reduce_sum<WAVE>(partial);
             // XOR reduction can associate operands differently in each lane.
@@ -1702,7 +1728,7 @@ __global__ static void ds4_flash_attn_d512_streaming_topk_kernel(
 #pragma unroll
             for (int i = 0; i < VALUES_PER_LANE; ++i) {
                 const int dim = lane + i * WAVE;
-                const float value = ds4_fa_load<KV, Mask>(
+                const float value = ds4_fa_load<stage_type, stage_type>(
                     staged_kv + slot * D + dim);
                 accum[i] = accum[i] * old_scale + value_scale * value;
             }
@@ -2604,22 +2630,42 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
             device_warp_size == 32 && n_tokens >= streaming_min_tokens &&
             active_row_upper_bound > 0 &&
             n_kv >= 3 * active_row_upper_bound) {
+            const char * f32_stage_env =
+                getenv("GGML_CUDA_MLA_STREAM_F32_STAGE");
+            const bool f32_stage = f32_stage_env && f32_stage_env[0] != '\0' &&
+                strcmp(f32_stage_env, "0") != 0;
             constexpr int streaming_heads = 16;
             const dim3 streaming_grid(
                 (unsigned) n_tokens,
                 (unsigned) (n_heads / streaming_heads), 1);
-            ds4_flash_attn_d512_streaming_topk_kernel<half, half>
-                <<<streaming_grid, streaming_heads * 32, 0, stream>>>(
-                    (float *) dst->data, (const float *) Q->data,
-                    q_stride_token, q_stride_head,
-                    (const half *) K->data,
-                    (const half *) mask->data,
-                    sinks ? (const float *) sinks->data : nullptr,
-                    n_tokens, n_heads, n_kv, scale,
-                    visibility_bounds, indexed_rows, indexed_counts,
-                    indexed_capacity, inverse_rope,
-                    inverse_rope_coefficients,
-                    forward_rope_coefficients);
+            if (f32_stage) {
+                ds4_flash_attn_d512_streaming_topk_kernel<
+                    half, half, streaming_heads, 16, true>
+                    <<<streaming_grid, streaming_heads * 32, 0, stream>>>(
+                        (float *) dst->data, (const float *) Q->data,
+                        q_stride_token, q_stride_head,
+                        (const half *) K->data,
+                        (const half *) mask->data,
+                        sinks ? (const float *) sinks->data : nullptr,
+                        n_tokens, n_heads, n_kv, scale,
+                        visibility_bounds, indexed_rows, indexed_counts,
+                        indexed_capacity, inverse_rope,
+                        inverse_rope_coefficients,
+                        forward_rope_coefficients);
+            } else {
+                ds4_flash_attn_d512_streaming_topk_kernel<half, half>
+                    <<<streaming_grid, streaming_heads * 32, 0, stream>>>(
+                        (float *) dst->data, (const float *) Q->data,
+                        q_stride_token, q_stride_head,
+                        (const half *) K->data,
+                        (const half *) mask->data,
+                        sinks ? (const float *) sinks->data : nullptr,
+                        n_tokens, n_heads, n_kv, scale,
+                        visibility_bounds, indexed_rows, indexed_counts,
+                        indexed_capacity, inverse_rope,
+                        inverse_rope_coefficients,
+                        forward_rope_coefficients);
+            }
             CUDA_CHECK(cudaGetLastError());
             return true;
         }

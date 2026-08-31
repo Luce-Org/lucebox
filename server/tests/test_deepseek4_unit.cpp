@@ -2966,12 +2966,14 @@ static void test_ds4_flash_attention_streaming_topk_gpu() {
                                 topk_data.size() * sizeof(int32_t));
 
         ScopedEnvVar streaming_guard("GGML_CUDA_MLA_STREAM_TOPK");
+        ScopedEnvVar f32_stage_guard("GGML_CUDA_MLA_STREAM_F32_STAGE");
         ScopedCudaGraphOverrides eager(
             /*disable_graphs=*/true,
             /*mmvq_max_ncols=*/0,
             /*skip_property_check=*/false);
         std::vector<float> reference((size_t) ggml_nelements(output));
-        std::vector<float> candidate(reference.size());
+        std::vector<float> candidate_f16_stage(reference.size());
+        std::vector<float> candidate_f32_stage(reference.size());
         setenv("GGML_CUDA_MLA_STREAM_TOPK", "0", 1);
         TEST_ASSERT_MSG(
             ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS,
@@ -2980,23 +2982,36 @@ static void test_ds4_flash_attention_streaming_topk_gpu() {
                                 reference.size() * sizeof(float));
 
         setenv("GGML_CUDA_MLA_STREAM_TOPK", "1", 1);
+        setenv("GGML_CUDA_MLA_STREAM_F32_STAGE", "0", 1);
         TEST_ASSERT_MSG(
             ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS,
-            "streaming top-k attention failed");
-        ggml_backend_tensor_get(output, candidate.data(), 0,
-                                candidate.size() * sizeof(float));
+            "F16-staged streaming top-k attention failed");
+        ggml_backend_tensor_get(output, candidate_f16_stage.data(), 0,
+                                candidate_f16_stage.size() * sizeof(float));
+
+        setenv("GGML_CUDA_MLA_STREAM_F32_STAGE", "1", 1);
+        TEST_ASSERT_MSG(
+            ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS,
+            "F32-staged streaming top-k attention failed");
+        ggml_backend_tensor_get(output, candidate_f32_stage.data(), 0,
+                                candidate_f32_stage.size() * sizeof(float));
 
         for (size_t i = 0; i < reference.size(); ++i) {
             TEST_ASSERT_MSG(
-                std::isfinite(candidate[i]),
+                std::isfinite(candidate_f32_stage[i]),
                 "streaming top-k attention output must be finite");
             TEST_ASSERT_MSG(
-                nearly_equal(reference[i], candidate[i], 5.0e-4f, 5.0e-4f),
+                nearly_equal(reference[i], candidate_f32_stage[i],
+                             5.0e-4f, 5.0e-4f),
                 "streaming top-k attention exceeded numeric tolerance");
+            TEST_ASSERT_MSG(
+                candidate_f16_stage[i] == candidate_f32_stage[i],
+                "F32 staging changed streaming top-k attention output");
         }
 
-        auto measure_us = [&](bool streaming) {
+        auto measure_us = [&](bool streaming, bool f32_stage) {
             setenv("GGML_CUDA_MLA_STREAM_TOPK", streaming ? "1" : "0", 1);
+            setenv("GGML_CUDA_MLA_STREAM_F32_STAGE", f32_stage ? "1" : "0", 1);
             constexpr int warmups = 3;
             constexpr int iterations = 20;
             for (int i = 0; i < warmups; ++i) {
@@ -3012,10 +3027,26 @@ static void test_ds4_flash_attention_streaming_topk_gpu() {
             return std::chrono::duration<double, std::micro>(end - begin).count() /
                 iterations;
         };
-        const double grouped_us = measure_us(false);
-        const double streaming_us = measure_us(true);
-        std::fprintf(stderr, " grouped=%.1fus streaming=%.1fus speedup=%.2fx",
-                     grouped_us, streaming_us, grouped_us / streaming_us);
+        const double grouped_us = measure_us(false, false);
+        constexpr int timing_rounds = 4;
+        double streaming_f16_us = 0.0;
+        double streaming_f32_us = 0.0;
+        for (int round = 0; round < timing_rounds; ++round) {
+            if ((round & 1) == 0) {
+                streaming_f16_us += measure_us(true, false);
+                streaming_f32_us += measure_us(true, true);
+            } else {
+                streaming_f32_us += measure_us(true, true);
+                streaming_f16_us += measure_us(true, false);
+            }
+        }
+        streaming_f16_us /= timing_rounds;
+        streaming_f32_us /= timing_rounds;
+        std::fprintf(stderr,
+                     " grouped=%.1fus streaming_f16=%.1fus"
+                     " streaming_f32=%.1fus speedup=%.2fx",
+                     grouped_us, streaming_f16_us, streaming_f32_us,
+                     grouped_us / streaming_f32_us);
     }
 
     ggml_gallocr_free(alloc);

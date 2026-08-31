@@ -494,7 +494,11 @@ selected latent row across wave32 heads and avoids materializing scores. It is
 currently limited to F16 caches on native wave32 devices and otherwise falls
 back to the existing path. Because its online softmax changes floating-point
 association, keep it opt-in until the target model passes a matched output and
-throughput A/B. `GGML_DS4_FA_STREAM_TOPK` remains a compatibility alias.
+throughput A/B. `GGML_DS4_FA_STREAM_TOPK` remains a compatibility alias. Add
+`GGML_CUDA_MLA_STREAM_F32_STAGE=1` to convert each selected F16 latent once
+while staging aligned pairs in shared memory instead of repeating conversion
+for every head. The isolated gfx1151 qualification is byte-identical to F16
+staging and reduced alternating-run kernel time by about 9%.
 
 Indexed verifier attention with at most eight query rows also uses a two-way
 split-KV schedule on gfx1151. Set `GGML_CUDA_MLA_NO_SPLIT_KV=1` to restore the
