@@ -1722,14 +1722,20 @@ __global__ static void ds4_flash_attn_d512_streaming_topk_kernel(
 
             const float score = partial * scale + mask_value;
             const float next_max = fmaxf(row_max, score);
-            const float old_scale = row_sum == 0.0f
-                ? 0.0f
-                : (FAST_EXP
-                    ? __expf(row_max - next_max)
-                    : expf(row_max - next_max));
-            const float value_scale = FAST_EXP
-                ? __expf(score - next_max)
-                : expf(score - next_max);
+            float old_scale = 0.0f;
+            float value_scale = 0.0f;
+            if (lane == 0) {
+                old_scale = row_sum == 0.0f
+                    ? 0.0f
+                    : (FAST_EXP
+                        ? __expf(row_max - next_max)
+                        : expf(row_max - next_max));
+                value_scale = FAST_EXP
+                    ? __expf(score - next_max)
+                    : expf(score - next_max);
+            }
+            old_scale = __shfl_sync(0xffffffffu, old_scale, 0, WAVE);
+            value_scale = __shfl_sync(0xffffffffu, value_scale, 0, WAVE);
             row_sum = row_sum * old_scale + value_scale;
             row_max = next_max;
 #pragma unroll
@@ -1746,13 +1752,21 @@ __global__ static void ds4_flash_attn_d512_streaming_topk_kernel(
     if (sinks) {
         const float sink = sinks[head];
         const float next_max = fmaxf(row_max, sink);
-        const float old_scale = row_sum == 0.0f
-            ? 0.0f
-            : (FAST_EXP
-                ? __expf(row_max - next_max)
-                : expf(row_max - next_max));
-        row_sum = row_sum * old_scale +
-            (FAST_EXP ? __expf(sink - next_max) : expf(sink - next_max));
+        float old_scale = 0.0f;
+        float sink_scale = 0.0f;
+        if (lane == 0) {
+            old_scale = row_sum == 0.0f
+                ? 0.0f
+                : (FAST_EXP
+                    ? __expf(row_max - next_max)
+                    : expf(row_max - next_max));
+            sink_scale = FAST_EXP
+                ? __expf(sink - next_max)
+                : expf(sink - next_max);
+        }
+        old_scale = __shfl_sync(0xffffffffu, old_scale, 0, WAVE);
+        sink_scale = __shfl_sync(0xffffffffu, sink_scale, 0, WAVE);
+        row_sum = row_sum * old_scale + sink_scale;
 #pragma unroll
         for (int i = 0; i < VALUES_PER_LANE; ++i) {
             accum[i] *= old_scale;
@@ -2279,85 +2293,36 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
                 n_tokens, n_kv, raw_rows);
         }
         CUDA_CHECK(cudaGetLastError());
-        // Vulkan shares each selected latent row across eight subgroup64
-        // heads. HIP tuning selected sixteen wave32 heads for the same K == V
-        // reuse. Keep the native HIP path opt-in until a model-backed A/B
-        // qualifies its online-softmax association. The shape gate is
-        // expressed in terms of the D512 indexed-attention
-        // contract so another model can reuse the kernel without DS4 policy
-        // leaking into it.
-        const char * streaming_topk_env =
-            getenv("GGML_CUDA_MLA_STREAM_TOPK");
-        if (!streaming_topk_env) {
-            streaming_topk_env = getenv("GGML_DS4_FA_STREAM_TOPK");
-        }
-        const bool streaming_topk_enabled = streaming_topk_env &&
-            streaming_topk_env[0] != '\0' &&
-            strcmp(streaming_topk_env, "0") != 0;
+        // Long sparse F16 K == V attention shares each selected latent row
+        // across sixteen wave32 heads. The shape gate is expressed in terms
+        // of the reusable D512 indexed-attention contract.
         constexpr int streaming_min_tokens = 64;
         const int active_row_upper_bound = raw_window + indexed_capacity;
         const int device_warp_size =
             ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
-        if (streaming_topk_enabled && indexed_mask && indexer_topk &&
+        if (indexed_mask && indexer_topk &&
             kv_f16 && mask->type == GGML_TYPE_F16 &&
             K->data == V->data && n_heads % 16 == 0 &&
             device_warp_size == 32 && n_tokens >= streaming_min_tokens &&
             active_row_upper_bound > 0 &&
             n_kv >= 3 * active_row_upper_bound) {
-            const char * f32_stage_env =
-                getenv("GGML_CUDA_MLA_STREAM_F32_STAGE");
-            const bool f32_stage = f32_stage_env && f32_stage_env[0] != '\0' &&
-                strcmp(f32_stage_env, "0") != 0;
-            const char * fast_exp_env =
-                getenv("GGML_CUDA_MLA_STREAM_FAST_EXP");
-            const bool fast_exp = fast_exp_env && fast_exp_env[0] != '\0' &&
-                strcmp(fast_exp_env, "0") != 0;
             constexpr int streaming_heads = 16;
             const dim3 streaming_grid(
                 (unsigned) n_tokens,
                 (unsigned) (n_heads / streaming_heads), 1);
-            if (f32_stage && fast_exp) {
-                ds4_flash_attn_d512_streaming_topk_kernel<
-                    half, half, streaming_heads, 16, true, true>
-                    <<<streaming_grid, streaming_heads * 32, 0, stream>>>(
-                        (float *) dst->data, (const float *) Q->data,
-                        q_stride_token, q_stride_head,
-                        (const half *) K->data,
-                        (const half *) mask->data,
-                        sinks ? (const float *) sinks->data : nullptr,
-                        n_tokens, n_heads, n_kv, scale,
-                        visibility_bounds, indexed_rows, indexed_counts,
-                        indexed_capacity, inverse_rope,
-                        inverse_rope_coefficients,
-                        forward_rope_coefficients);
-            } else if (f32_stage) {
-                ds4_flash_attn_d512_streaming_topk_kernel<
-                    half, half, streaming_heads, 16, true>
-                    <<<streaming_grid, streaming_heads * 32, 0, stream>>>(
-                        (float *) dst->data, (const float *) Q->data,
-                        q_stride_token, q_stride_head,
-                        (const half *) K->data,
-                        (const half *) mask->data,
-                        sinks ? (const float *) sinks->data : nullptr,
-                        n_tokens, n_heads, n_kv, scale,
-                        visibility_bounds, indexed_rows, indexed_counts,
-                        indexed_capacity, inverse_rope,
-                        inverse_rope_coefficients,
-                        forward_rope_coefficients);
-            } else {
-                ds4_flash_attn_d512_streaming_topk_kernel<half, half>
-                    <<<streaming_grid, streaming_heads * 32, 0, stream>>>(
-                        (float *) dst->data, (const float *) Q->data,
-                        q_stride_token, q_stride_head,
-                        (const half *) K->data,
-                        (const half *) mask->data,
-                        sinks ? (const float *) sinks->data : nullptr,
-                        n_tokens, n_heads, n_kv, scale,
-                        visibility_bounds, indexed_rows, indexed_counts,
-                        indexed_capacity, inverse_rope,
-                        inverse_rope_coefficients,
-                        forward_rope_coefficients);
-            }
+            ds4_flash_attn_d512_streaming_topk_kernel<
+                half, half, streaming_heads, 16, true, true>
+                <<<streaming_grid, streaming_heads * 32, 0, stream>>>(
+                    (float *) dst->data, (const float *) Q->data,
+                    q_stride_token, q_stride_head,
+                    (const half *) K->data,
+                    (const half *) mask->data,
+                    sinks ? (const float *) sinks->data : nullptr,
+                    n_tokens, n_heads, n_kv, scale,
+                    visibility_bounds, indexed_rows, indexed_counts,
+                    indexed_capacity, inverse_rope,
+                    inverse_rope_coefficients,
+                    forward_rope_coefficients);
             CUDA_CHECK(cudaGetLastError());
             return true;
         }
