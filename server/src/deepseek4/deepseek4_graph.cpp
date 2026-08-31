@@ -2061,7 +2061,7 @@ static ggml_tensor * build_mla_attention(
             }
             f32_array_inputs->push_back({cmask, std::move(mvals)});
             score_mask = ggml_reshape_2d(ctx, cmask, n_attn, n_tokens);
-        } else if (causal_batch) {
+        } else if (causal_batch && !layer_major_batch) {
             // Speculative verification keeps the physical ring order and
             // appends snapshots of rows overwritten by later batch tokens.
             ggml_tensor * cmask = ggml_new_tensor_3d(
