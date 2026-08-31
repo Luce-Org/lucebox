@@ -1709,6 +1709,7 @@ static ggml_tensor * build_mla_attention(
     ggml_tensor * old_rows_scratch_f16 = nullptr;
     int n_old_rows = 0;
     ggml_tensor * prior_rows_scratch = nullptr;
+    ggml_tensor * prior_rows_scratch_f16 = nullptr;
     int n_prior_rows = 0;
     const bool fused_causal = cached_inputs && cached_inputs->attn_row_mask && n_tokens > 1;
     if (fused_causal) {
@@ -1765,6 +1766,7 @@ static ggml_tensor * build_mla_attention(
                 prior_rows_scratch = ggml_cont(ctx, prior_rows_scratch);
             }
             ggml_build_forward_expand(gf, prior_rows_scratch);
+            prior_rows_scratch_f16 = prior_rows_scratch;
             prior_rows_scratch = ds4_cast_if_needed(
                 ctx, prior_rows_scratch, GGML_TYPE_F32);
         }
@@ -1890,6 +1892,9 @@ static ggml_tensor * build_mla_attention(
             index_visibility_mask,
             i32_array_inputs);
     }
+    const bool f16_sparse_prefill =
+        attention_impl == DeepSeek4AttentionImpl::SparseFlash &&
+        indexer_topk && n_tokens > w.n_swa;
     // Stable path reads the full physical ring (masking not-yet-written slots)
     // and a padded compressed-row span; the plain path reads only valid rows.
     const int n_raw = masked_kv ? w.n_swa
@@ -1920,9 +1925,13 @@ static ggml_tensor * build_mla_attention(
             ctx, raw_kv_source, head_dim, w.n_swa, raw_kv_source->nb[1], 0);
         kv_attn = ds4_cast_if_needed(ctx, ring, GGML_TYPE_F32);
     } else if (layer_major_batch) {
-        ggml_tensor * current = ds4_cast_if_needed(ctx, kv, GGML_TYPE_F32);
-        kv_attn = prior_rows_scratch
-            ? ggml_concat(ctx, prior_rows_scratch, current, 1)
+        ggml_tensor * current = ds4_cast_if_needed(
+            ctx, kv,
+            f16_sparse_prefill ? GGML_TYPE_F16 : GGML_TYPE_F32);
+        ggml_tensor * prior = f16_sparse_prefill
+            ? prior_rows_scratch_f16 : prior_rows_scratch;
+        kv_attn = prior
+            ? ggml_concat(ctx, prior, current, 1)
             : current;
     } else if (n_tokens == 1) {
         ggml_tensor * cur_kv = ds4_cast_if_needed(ctx, kv, GGML_TYPE_F32);
@@ -1993,7 +2002,9 @@ static ggml_tensor * build_mla_attention(
             ggml_tensor * comp = ggml_view_2d(
                 ctx, comp_kv_source, head_dim, n_comp_attn,
                 comp_kv_source->nb[1], 0);
-            comp = ds4_cast_if_needed(ctx, comp, GGML_TYPE_F32);
+            comp = ds4_cast_if_needed(
+                ctx, comp,
+                f16_sparse_prefill ? GGML_TYPE_F16 : GGML_TYPE_F32);
             kv_attn = ggml_concat(ctx, kv_attn, comp, 1);
         }
         if (old_rows_scratch) {
@@ -2249,7 +2260,9 @@ static ggml_tensor * build_mla_attention(
             // The DS4 D=512 kernel consumes Q strides directly, avoiding a full
             // [D,H,T] -> [D,T,H] materialization for every layer.
             ggml_tensor * q_fa = ggml_permute(ctx, q, 0, 2, 1, 3);
-            ggml_tensor * kv_fa = ds4_cast_if_needed(ctx, kv_attn, GGML_TYPE_F32);
+            ggml_tensor * kv_fa = f16_sparse_prefill
+                ? kv_attn
+                : ds4_cast_if_needed(ctx, kv_attn, GGML_TYPE_F32);
             ggml_tensor * k_fa = ggml_reshape_3d(ctx, kv_fa, head_dim, n_attn, 1);
             ggml_tensor * v_fa = k_fa;
             ggml_tensor * mask_fa = score_mask
