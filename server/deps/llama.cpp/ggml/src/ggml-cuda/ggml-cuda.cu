@@ -2785,11 +2785,14 @@ static bool ggml_cuda_try_fuse_mul_mat_glu(
         }
 
         const int64_t ncols = ids ? src1->ne[2] : src1->ne[1];
+        const bool override_selects_mmvq =
+            ggml_cuda_mmvq_max_ncols_override > 0 &&
+            ncols <= ggml_cuda_mmvq_max_ncols_override &&
+            (!ids || ncols <= get_mmvq_mmid_max_batch(src0->type, cc));
         if (ggml_cuda_should_use_mmq(
                 src0->type, cc, ncols,
                 ids ? src0->ne[2] : /*n_experts=*/0) &&
-            !(ggml_cuda_mmvq_max_ncols_override > 0 &&
-              ncols <= ggml_cuda_mmvq_max_ncols_override)) {
+            !override_selects_mmvq) {
             ggml_cuda_mul_mat_q_pair(
                 ctx, up->src[0], gate->src[0], src1, ids, up, gate);
             ggml_cuda_op_swiglu_ds4(ctx, glu);

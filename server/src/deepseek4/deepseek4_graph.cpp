@@ -60,6 +60,15 @@ static bool ds4_env_flag(const char * name) {
     return value && value[0] && std::strcmp(value, "0") != 0;
 }
 
+static int ds4_exact_prefill_mmvq_max_ncols(bool exact_multi_token_band) {
+    if (!exact_multi_token_band) {
+        return 0;
+    }
+    const char * value = std::getenv("LUCE_MMVQ_MAX_NCOLS");
+    const int configured = value && value[0] ? std::atoi(value) : 4;
+    return configured > 0 ? std::min(configured, 4) : 4;
+}
+
 // F32 key/value-side accumulation protects the short-context quality baseline
 // while still avoiding a full-cache F16 -> F32 conversion once attention is
 // large enough for that conversion to dominate verifier time.
@@ -7188,7 +7197,8 @@ bool deepseek4_step_layer_range(
         exact_prefill_band && n_tokens > 1 && n_tokens <= 4;
     ScopedCudaGraphOverrides exact_mmvq_scope(
         /*disable_graphs=*/false,
-        /*mmvq_max_ncols=*/exact_multi_token_band ? 4 : 0);
+        /*mmvq_max_ncols=*/ds4_exact_prefill_mmvq_max_ncols(
+            exact_multi_token_band));
     if (first_chunk > 0 && first_chunk < n_tokens &&
         !fused_verify_candidate && !heterogeneous_sparse_prefill &&
         !standard_layer_major_prefill) {
