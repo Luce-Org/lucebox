@@ -247,11 +247,13 @@ static int run_child(const char * mode, const char * output_path) {
         GGML_TYPE_Q5_K, GGML_TYPE_Q2_0_ROCMFP2, GGML_TYPE_Q3_0_ROCMFPX,
         GGML_TYPE_Q4_0_ROCMFP4_FAST,
     };
-    const int widths[] = {2, 4, 8, 9, 16, 32, 48, 64};
     int width_filter = 0;
     if (const char * raw = std::getenv("DFLASH_MMID_TEST_WIDTH")) {
         width_filter = std::max(0, std::atoi(raw));
     }
+    const std::vector<int> widths = width_filter > 0
+        ? std::vector<int>{width_filter}
+        : std::vector<int>{2, 4, 8, 9, 16, 32, 48, 64};
     bool ok = output.good();
     for (ggml_type type : types) {
         if (type == GGML_TYPE_Q4_0_ROCMFP4_FAST && width_filter == 0) {

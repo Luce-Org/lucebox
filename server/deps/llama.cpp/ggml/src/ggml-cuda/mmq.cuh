@@ -4659,6 +4659,112 @@ static __global__ void mul_mat_q(
          mix_codebooks, mix_modes, fastdiv(zt, channel_ratio));
 }
 
+#if defined(GGML_USE_HIP)
+template <int mmq_x>
+static __global__ void mul_mat_q_moe_build_tasks(
+        const int32_t * __restrict__ expert_bounds,
+        int2 * __restrict__ tasks,
+        int * __restrict__ task_count,
+        int n_experts) {
+    const int expert = blockIdx.x*blockDim.x + threadIdx.x;
+    if (expert >= n_experts) {
+        return;
+    }
+    const int route_count =
+        expert_bounds[expert + 1] - expert_bounds[expert];
+    const int tile_count = (route_count + mmq_x - 1)/mmq_x;
+    if (tile_count == 0) {
+        return;
+    }
+    const int task_begin = atomicAdd(task_count, tile_count);
+    for (int tile = 0; tile < tile_count; ++tile) {
+        tasks[task_begin + tile] = make_int2(tile, expert);
+    }
+}
+
+// Sparse grouped MoE has a deliberately wide upper-bound grid: every expert
+// receives enough Y tiles for the full token batch even though only top-k
+// routes are live. Build a compact device-side task list, then keep a bounded
+// set of workgroups resident to consume only non-empty expert tiles. No host
+// count readback or synchronization is required.
+template <ggml_type type, int mmq_x, bool need_check>
+__launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), 1)
+static __global__ void mul_mat_q_moe_persistent(
+        const char * __restrict__ x,
+        const int * __restrict__ y,
+        const int32_t * __restrict__ ids_dst,
+        const int32_t * __restrict__ expert_bounds,
+        const nv_bfloat16 * __restrict__ mix_codebooks,
+        const uint8_t * __restrict__ mix_modes,
+        float * __restrict__ dst,
+        const int2 * __restrict__ tasks,
+        const int * __restrict__ task_count,
+        const uint3 blocks_per_ne00,
+        const int nrows_x,
+        const int stride_row_x,
+        const int ncols_y,
+        const int stride_col_dst,
+        const uint3 channel_ratio,
+        const int stride_channel_x) {
+    if (mmq_x > get_mmq_x_max_device() ||
+        mmq_x % mmq_get_granularity_device(mmq_x) != 0) {
+        NO_DEVICE_CODE;
+        return;
+    }
+
+    constexpr int nwarps = mmq_get_nwarps_device();
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int mmq_y = get_mmq_y_device();
+
+    extern __shared__ int ids_dst_shared[];
+    const int it = blockIdx.x;
+    const int total_tasks = *task_count;
+
+    for (int task_index = blockIdx.y; task_index < total_tasks;
+         task_index += gridDim.y) {
+        const int2 task = tasks[task_index];
+        const int jt = task.x;
+        const int zt = task.y;
+
+        const int col_low = expert_bounds[zt + 0];
+        const int col_high = expert_bounds[zt + 1];
+        const int col_diff = col_high - col_low;
+        if (jt*mmq_x >= col_diff) {
+            continue;
+        }
+
+        __syncthreads();
+#pragma unroll
+        for (int j0 = 0; j0 < mmq_x; j0 += nwarps*warp_size) {
+            const int j = j0 + threadIdx.y*warp_size + threadIdx.x;
+            if (j0 + nwarps*warp_size > mmq_x && j >= mmq_x) {
+                break;
+            }
+            ids_dst_shared[j] = ids_dst[col_low + jt*mmq_x + j];
+        }
+        __syncthreads();
+
+        const int offset_y =
+            (col_low + jt*mmq_x)*(sizeof(block_q8_1_mmq)/sizeof(int));
+        const int offset_dst = it*mmq_y;
+        const int offset_x =
+            fastdiv(zt, channel_ratio)*stride_channel_x +
+            it*mmq_y*stride_row_x;
+        const int tile_x_max_i = nrows_x - it*mmq_y - 1;
+        const int tile_y_max_j = col_diff - jt*mmq_x - 1;
+
+        constexpr bool fixup = false;
+        mul_mat_q_process_tile<type, mmq_x, need_check, fixup>(
+            x, offset_x, y + offset_y, ids_dst_shared,
+            dst + offset_dst, nullptr, stride_row_x, ncols_y,
+            stride_col_dst, tile_x_max_i, tile_y_max_j,
+            0, blocks_per_ne00.z, mix_codebooks, mix_modes,
+            fastdiv(zt, channel_ratio));
+        __syncthreads();
+    }
+}
+#endif
+
 template <ggml_type type, int mmq_x, bool need_check>
 __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device()/2, 1)
 static __global__ void mul_mat_q_stream_k_fixup(
@@ -4855,6 +4961,76 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const uint3 nsamples_y_fd      = init_fastdiv_values(args.nsamples_y);
     const uint3 channel_ratio_fd   = init_fastdiv_values(channel_ratio);
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
+
+#if defined(GGML_USE_HIP)
+    if constexpr (type == GGML_TYPE_Q2_0_ROCMFP2 ||
+                  type == GGML_TYPE_Q3_0_ROCMFPX ||
+                  type == GGML_TYPE_Q4_0_ROCMFP4_FAST) {
+        const char * persistent_env =
+            std::getenv("GGML_CUDA_MMQ_MOE_PERSISTENT");
+        const bool persistent_enabled = persistent_env && *persistent_env &&
+            !(persistent_env[0] == '0' && persistent_env[1] == '\0');
+        // The compact queue amortizes its builder and bounded-worker launch at
+        // prefill widths. Below 256 source columns the ordinary grouped grid is
+        // already efficient, and is marginally faster for some formats.
+        if (persistent_enabled && args.ncols_max >= 256 && !args.use_stream_k &&
+            args.ids_dst != nullptr && args.expert_bounds != nullptr &&
+            args.nsamples_y == 1 &&
+            cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151) {
+            int blocks_per_cu = 32;
+            if (const char * raw =
+                    std::getenv("GGML_CUDA_MMQ_MOE_PERSISTENT_BLOCKS_PER_CU")) {
+                const int parsed = std::atoi(raw);
+                if (parsed >= 1 && parsed <= 32) {
+                    blocks_per_cu = parsed;
+                }
+            }
+            ggml_cuda_pool_alloc<int2> tasks(ctx.pool(), args.ncols_y);
+            ggml_cuda_pool_alloc<int> task_count(ctx.pool(), 1);
+            CUDA_CHECK(cudaMemsetAsync(
+                task_count.get(), 0, sizeof(int), stream));
+            constexpr int task_builder_threads = 256;
+            const int task_builder_blocks =
+                (args.nchannels_y + task_builder_threads - 1)/
+                task_builder_threads;
+            mul_mat_q_moe_build_tasks<mmq_x>
+                <<<task_builder_blocks, task_builder_threads, 0, stream>>>(
+                    args.expert_bounds, tasks.get(), task_count.get(),
+                    args.nchannels_y);
+
+            const int workers = std::max(
+                1, std::min((int) args.ncols_y, nsm*blocks_per_cu));
+            const dim3 persistent_grid(nty, workers, 1);
+            CUDA_SET_SHARED_MEMORY_LIMIT(
+                (mul_mat_q_moe_persistent<type, mmq_x, false>),
+                nbytes_shared);
+            CUDA_SET_SHARED_MEMORY_LIMIT(
+                (mul_mat_q_moe_persistent<type, mmq_x, true>),
+                nbytes_shared);
+            if (args.nrows_x % mmq_y == 0) {
+                mul_mat_q_moe_persistent<type, mmq_x, false>
+                    <<<persistent_grid, block_dims, nbytes_shared, stream>>>(
+                        args.x, args.y, args.ids_dst, args.expert_bounds,
+                        args.mix_codebooks, args.mix_modes, args.dst,
+                        tasks.get(), task_count.get(),
+                        blocks_per_ne00_fd, args.nrows_x, args.stride_row_x,
+                        args.ncols_y, args.nrows_dst, channel_ratio_fd,
+                        args.stride_channel_x);
+            } else {
+                mul_mat_q_moe_persistent<type, mmq_x, true>
+                    <<<persistent_grid, block_dims, nbytes_shared, stream>>>(
+                        args.x, args.y, args.ids_dst, args.expert_bounds,
+                        args.mix_codebooks, args.mix_modes, args.dst,
+                        tasks.get(), task_count.get(),
+                        blocks_per_ne00_fd, args.nrows_x, args.stride_row_x,
+                        args.ncols_y, args.nrows_dst, channel_ratio_fd,
+                        args.stride_channel_x);
+            }
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+    }
+#endif
 
     if (!args.use_stream_k) {
         if (args.nrows_x % mmq_y == 0) {

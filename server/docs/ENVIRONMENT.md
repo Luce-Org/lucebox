@@ -51,6 +51,8 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `DFLASH_GFX1151_HC_MMVF_Q4` | 1 on gfx1151 for the DS4 `[16384,24]` q4 projection | BURN-IN KILL SWITCH: =0 restores the generic hipBLAS dispatch decision. |
 | `GGML_CUDA_MMQ_X` | unset | DEBUG: force a supported MMQ output-column tile width (8–128) for architecture tuning; invalid or over-budget values fall back to automatic selection. |
 | `GGML_CUDA_MMQ_MOE_ADAPTIVE_X` | unset | BURN-IN: on sparse-route gfx1151 grouped MoE MMQ, choose the measured ROCmFP2/3/4 output tile from routed rows per expert; ordinary matmuls, unmeasured formats, and other devices are unchanged. |
+| `GGML_CUDA_MMQ_MOE_PERSISTENT` | unset | EXPERIMENTAL: on prefill-sized (at least 256-token) sparse grouped ROCmFP2/3/4 MMQ on gfx1151, build a compact device-side expert-tile queue and consume it with bounded persistent workers. Short batches, ordinary matmuls, unmeasured formats, and other devices are unchanged. |
+| `GGML_CUDA_MMQ_MOE_PERSISTENT_BLOCKS_PER_CU` | 32 | DEBUG: set the compact grouped-MoE worker budget per gfx1151 CU from 1–32. Invalid values use 32. |
 | `GGML_CUDA_MLA_STREAM_F32_STAGE` | unset | EXPERIMENTAL: with streaming D512 indexed attention, convert aligned F16 pairs once while staging them in shared memory instead of repeating conversion for every head. |
 | `GGML_CUDA_MLA_SPLIT_KV` / `GGML_DS4_FA_SPLIT_KV` | 1 on gfx1151 indexed decode; unset elsewhere | BURN-IN: force the reusable split-KV MLA schedule. Set `GGML_CUDA_MLA_NO_SPLIT_KV=1` (or legacy `GGML_DS4_FA_NO_SPLIT_KV=1`) to disable it. |
 | `GGML_DS4_TOPK_BLOCK_RADIX` | 1 on gfx1151 | BURN-IN KILL SWITCH: =0 restores hipCUB full sort for DS4-shaped 512-row top-k selection. |
