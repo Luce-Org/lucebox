@@ -2827,9 +2827,9 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         : luce_mmvq_max_ncols_env;
     // The mix qtypes have no generic MMVQ path because their per-expert
     // codebooks live in an out-of-band registry. Decode uses the dedicated
-    // fused kernels below. Sparse prefill can opt into their registry-aware
-    // MMQ loaders; otherwise should_use_mmq rejects them and they retain the
-    // exact dequantize->cuBLAS fallback.
+    // fused kernels below. Approximate prefill modes can select their
+    // registry-aware MMQ loaders; otherwise should_use_mmq rejects them and
+    // they retain the exact dequantize->cuBLAS fallback.
     const bool is_rocmfp3_mix = src0->type == GGML_TYPE_Q3_1_ROCMFP3_MIX;
     const bool is_rocmfp2_mix = src0->type == GGML_TYPE_Q2_1_ROCMFP2_MIX;
     const bool is_mix_qtype    = is_rocmfp3_mix || is_rocmfp2_mix;
