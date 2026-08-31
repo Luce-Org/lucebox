@@ -41,12 +41,16 @@ enum class ChatFormat {
 // `tools_json` is an optional JSON string containing the tool definitions
 // array. When non-empty, the Qwen3/3.5 template injects a tool preamble
 // into the system message instructing the model how to emit <tool_call> tags.
+//
+// `reasoning_effort` is the normalized model-facing effort. DeepSeek V4 uses
+// low, high, and max; high and max prepend the official encoding prefixes.
 std::string render_chat_template(
     const std::vector<ChatMessage> & messages,
     ChatFormat format,
     bool add_generation_prompt = true,
     bool enable_thinking = false,
-    const std::string & tools_json = "");
+    const std::string & tools_json = "",
+    const std::string & reasoning_effort = "");
 
 // Detect the appropriate chat format for an architecture.
 ChatFormat chat_format_for_arch(const std::string & arch);

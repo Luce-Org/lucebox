@@ -7178,7 +7178,17 @@ bool deepseek4_step_layer_range(
     // each sub-forward then writes at most one window and, if present, its
     // boundary is the final token. This preserves the same pool/rotate order
     // as sequential execution while retaining safe batched prefixes.
-    const int first_chunk = deepseek4_safe_compressor_batch_tokens(w, kv_start, n_tokens);
+    const bool exact_prefill_band =
+        cache.prefill_mode == PrefillAttentionMode::Exact &&
+        allow_decode_graph_reuse && !fused_verify_candidate;
+    const int first_chunk = std::min(
+        deepseek4_safe_compressor_batch_tokens(w, kv_start, n_tokens),
+        exact_prefill_band ? 4 : n_tokens);
+    const bool exact_multi_token_band =
+        exact_prefill_band && n_tokens > 1 && n_tokens <= 4;
+    ScopedCudaGraphOverrides exact_mmvq_scope(
+        /*disable_graphs=*/false,
+        /*mmvq_max_ncols=*/exact_multi_token_band ? 4 : 0);
     if (first_chunk > 0 && first_chunk < n_tokens &&
         !fused_verify_candidate && !heterogeneous_sparse_prefill &&
         !standard_layer_major_prefill) {
@@ -7202,8 +7212,10 @@ bool deepseek4_step_layer_range(
         }
 
         for (int off = 0; off < n_tokens;) {
-            const int chunk = deepseek4_safe_compressor_batch_tokens(
-                w, kv_start + off, n_tokens - off);
+            const int remaining = n_tokens - off;
+            const int chunk = std::min(
+                deepseek4_safe_compressor_batch_tokens(w, kv_start + off, remaining),
+                exact_prefill_band ? 4 : remaining);
             std::vector<float> chunk_hc;
             std::vector<float> chunk_out;
             std::vector<float> chunk_capture;

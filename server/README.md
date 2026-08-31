@@ -219,6 +219,131 @@ python3 ../harness/client_test_runner.py probe \
 On fragile external RTX links, use the same conservative NVIDIA profile as the
 RTX mixed-hardware notes before running long prompts.
 
+## Server parameter reference
+
+The command shape is `dflash_server <model.gguf> [options]`. The first positional argument selects the target weights. `--model-name` only changes the name reported by the API; it does not select a model file.
+
+### Core server
+
+| Option | Default | Purpose |
+|---|---|---|
+| `--draft <path>` | none | Draft model for speculative decode. |
+| `--host <addr>` | `0.0.0.0` | Bind address. |
+| `--port <N>` | `8080` | Listen port. |
+| `--max-ctx <N>` | `131072` | Maximum context length. |
+| `--max-tokens <N>` | model card | Legacy alias for `--default-max-tokens`. |
+| `--default-max-tokens <N>` | model card or `16000` | Output cap when a request omits a token limit. |
+| `--model-name <name>` | `dflash` | API alias returned by `/v1/models` and responses. It does not change the loaded weights. |
+| `--chat-template-file <path>` | model default | Jinja chat-template override. |
+| `--no-cors` | CORS enabled | Disable CORS headers. |
+
+### Speculative decode
+
+| Option | Default | Purpose |
+|---|---|---|
+| `--draft-block-size <N>` | checkpoint metadata | Dense Qwen proposal width, from 2 through 32 and no more than twice the trained block size. |
+| `--draft-swa <N>` | `0` | Draft sliding-attention window. |
+| `--draft-residency auto\|persistent\|request-scoped` | `auto` | Control when draft weights remain resident. |
+| `--lazy-draft` | off | Alias for request-scoped draft residency. |
+| `--fast-rollback` | on | Enable speculative fast rollback. |
+| `--no-fast-rollback` | off | Disable fast rollback. |
+| `--specla` | off | Enable SpecLA when the target supports it. |
+| `--specla-top-k <K>` | `4` | SpecLA draft-tree width. |
+| `--ddtree` | off | Enable DDTree verification. |
+| `--ddtree-budget <N>` | `22` | DDTree candidate budget. |
+| `--ddtree-tau <T>` | off | Confidence margin; SpecLA defaults to 6. |
+| `--verify-width <N>` | adaptive base 8 | Laguna chain-verification width. |
+| `--adaptive-experts [tau]` | off | Enable expert-count gating with a default threshold of 0.80. |
+| `--fa-window <N>` | `0` | Target attention window. Keep `0` for full attention and tool use at long context. |
+
+### Device placement
+
+| Option | Default | Purpose |
+|---|---|---|
+| `--target-device <backend:gpu>` | `auto:0` | Place the target on a CUDA or HIP device. |
+| `--draft-device <backend:gpu>` | `auto:0` | Place the draft on a CUDA or HIP device. |
+| `--target-devices <list>` | one device | Select multiple target devices, such as `cuda:0,cuda:1`. |
+| `--target-split-mode layer\|tensor` | `layer` | Select the multi-GPU target strategy. |
+| `--target-layer-split <weights>` | none | Optional layer-split weights. |
+| `--target-split-fast-rollback` | off | Use exact F32 checkpoints for supported local Qwen layer splits. |
+| `--peer-access` | off | Enable peer access between target GPUs. |
+| `--chunk <N>` | `512` | Chunked-prefill batch size. |
+| `--draft-ipc-bin <path>` | none | Remote draft daemon for mixed backends. |
+| `--draft-ipc-work-dir <path>` | none | Remote draft scratch directory. |
+| `--draft-ipc-ring-cap <N>` | runtime default | Remote draft feature-ring capacity. |
+| `--target-shard-ipc-bin <path>` | none | Remote target-shard daemon. |
+| `--target-shard-ipc-work-dir <path>` | none | Remote target-shard scratch directory. |
+
+See [recommended setups](docs/RECOMMENDED_SETUPS.md) for tested combinations and [mixed-backend placement](docs/MIXED_BACKEND.md) for build requirements.
+
+### DeepSeek V4
+
+| Option | Default | Purpose |
+|---|---|---|
+| `--ds4-fused-decode` | off | Enable single-graph GPU decode. |
+| `--ds4-fused-verify-f16-kv` | off | Reuse the F16 MLA cache during batched verification. |
+| `--ds4-expert-top-k <N>` | `0`, model default | Set routed experts per token. The current DeepSeek V4 profile uses `6`. |
+| `--ds4-prefill exact\|dense\|sparse` | `exact` | Select prefill mode. Dense and sparse modes can change generated tokens. |
+
+See the [current six-expert Strix Halo profile](https://www.lucebox.com/blog/deepseek-v4-flash-0731) and the [DeepSeek V4 implementation guide](docs/DS4.md).
+
+### KV cache, paging, and concurrency
+
+| Option | Default | Purpose |
+|---|---|---|
+| `--cache-type-k <type>` | model and backend default | K-cache type: `f16`, `bf16`, `q4_0`, `q4_1`, `q5_0`, `q5_1`, `q8_0`, or `tq3_0`. |
+| `--cache-type-v <type>` | model and backend default | V-cache type using the same choices. |
+| `--kvflash <tokens\|auto>` | off | Enable bounded KV residency. |
+| `--kvflash-policy drafter\|lru\|qk` | `drafter` | Choose the KVFlash residency policy. |
+| `--kvflash-tau <N>` | `64` | Drafter-policy reselect interval. |
+| `--prefix-cache-slots <N>` | `32` | In-memory prefix-cache slots; `0` disables. |
+| `--agent-turn-cache` | off | Extend prefix caching through generated tool calls. |
+| `--prefill-cache-slots <N>` | `0` | Full-prompt cache slots. |
+| `--paged-attention` | off | Enable 16-token paged KV blocks for supported Qwen targets. |
+| `--max-concurrency <N>` | `1` | Maximum concurrent decode sequences; values above 1 enable paged attention. |
+| `--admission-coalesce-ms <N>` | `20` | Idle-to-busy batching window from 0 through 1000 ms. |
+| `--kv-pool-tokens <N>` | auto | Shared physical K/V capacity for concurrent serving. |
+| `--kv-cache-dir <path>` | none | Enable persistent disk KV cache in this directory. |
+| `--kv-cache-budget <MB>` | `4096` | Disk KV-cache size cap. |
+| `--kv-cache-min-tokens <N>` | `512` | Minimum prefix length to persist. |
+| `--kv-cache-interval <N>` | `10240` | Continued-checkpoint interval. |
+| `--kv-cache-cold-max <N>` | `10240` | Cold-prefix limit for long prompts. |
+| `--disk-prefix-cache off\|full\|auto\|auto:N\|N` | `full` | Default disk prefix policy. |
+| `--disk-prefix-cache-compress` | off | Clamp FlowKV snapshots to the stable system prefix. Requires a prefill drafter. |
+
+### PFlash
+
+| Option | Default | Purpose |
+|---|---|---|
+| `--prefill-compression off\|auto\|always` | `off` | Select when PFlash compresses a prompt. |
+| `--prefill-threshold <N>` | `32000` | Token threshold used by auto mode. |
+| `--prefill-keep-ratio <F>` | `0.05` | Fraction of source tokens kept. |
+| `--prefill-curve T:R [T:R ...]` | none | Piecewise keep-ratio curve; overrides the flat ratio. |
+| `--prefill-drafter <path>` | none | PFlash drafter GGUF. |
+| `--prefill-skip-park` | off | Keep target and decode draft resident while PFlash runs. |
+| `--prefill-upstream-base <URL>` | none | Enable compression-proxy mode. |
+| `--prefill-upstream-key <KEY>` | none | Bearer token for the upstream. |
+| `--prefill-upstream-model <NAME>` | none | Model name forwarded upstream. |
+
+### Reasoning and MoE controls
+
+| Option | Default | Purpose |
+|---|---|---|
+| `--think-max-tokens <N>` | model card | Reasoning-phase cap. |
+| `--hard-limit-reply-budget <N>` | `4096` | Reserve output space by closing the reasoning phase near the limit; `0` disables. |
+| `--reasoning-effort-low <N>` | model card | Token budget for low effort. |
+| `--reasoning-effort-medium <N>` | model card | Token budget for medium effort. |
+| `--reasoning-effort-high <N>` | model card | Token budget for high effort. |
+| `--reasoning-effort-x-high <N>` | model card | Token budget for x-high effort. |
+| `--reasoning-effort-max <N>` | model card | Token budget for max effort. |
+| `--spark` | off | Enable self-tuning MoE expert placement. |
+| `--spark-slots <N>` | auto | Set expert-cache slots per layer. |
+| `--spark-vram <GiB>` | whole card | Cap total VRAM used by Spark. |
+| `--freq` | off | Print expert-frequency analysis at shutdown. |
+| `--collect-routing <path>` | none | Write binary routing data for predictor training. |
+
+Burn-in switches, profiling controls, and compatibility environment variables are listed in the [environment reference](docs/ENVIRONMENT.md). The executable's usage text and `server_main.cpp` remain the source of truth for the current CLI.
+
 Reference measurements from the Qwen3.6 bring-up on RTX 3090:
 
 | Target | Draft | Bench | AL | Accept | Mean tok/s |
@@ -355,7 +480,7 @@ hf download poolside/Laguna-XS.2 --local-dir models/Laguna-XS-2 \
     --max-ctx 16384 --port 8000
 
 curl -sN http://localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \
-  -d '{"model":"luce-dflash","messages":[{"role":"user","content":"Hi"}],"max_tokens":32}'
+  -d '{"messages":[{"role":"user","content":"Hi"}],"max_tokens":32}'
 
 # Smoke (loader only, no forward)
 ./build/smoke_load_target_laguna models/laguna-xs2-Q4_K_M.gguf

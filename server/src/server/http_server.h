@@ -287,10 +287,14 @@ struct ParsedRequest {
     // Thinking/reasoning state
     bool                      thinking_enabled = true;
     bool                      started_in_thinking = false;
+    // Normalized model-facing effort. DeepSeek V4 officially defines low,
+    // high, and max; high and max select distinct prompt prefixes.
+    std::string               reasoning_effort;
     // True when the request opted in to the thinking-budget envelope via
-    // `thinking: {type: "enabled"}`. Distinct from thinking_enabled (which
-    // can be set via the chat template kwarg alone). When true, the response
-    // includes a `finish_details` block when thinking was opted in.
+    // thinking.type="enabled" or an explicit reasoning effort. Distinct from
+    // thinking_enabled, which is the final template-rendering state after
+    // overrides. Bare chat-template toggles remain renderer-only. When true,
+    // the response includes a `finish_details` block.
     bool                      thinking_opt_in = false;
     // Per-request thinking-budget envelope (spec §4). Populated from
     // `thinking.budget_tokens` and `thinking.reply_budget`, or selected
@@ -320,6 +324,13 @@ json require_messages_array(const json & body);
 // Resolve the supported output-token aliases in precedence order. Only the
 // selected field is parsed, so malformed lower-priority aliases are ignored.
 int resolve_max_output_tokens(const json & body, int default_max_tokens);
+
+// Apply request-level thinking controls and resolve the model-facing effort
+// plus the server's phase-1 budget. Kept independent of HttpServer so the
+// wire-format precedence and compatibility aliases can be unit-tested.
+void apply_request_reasoning(const json & body,
+                             const ServerConfig & config,
+                             ParsedRequest & req);
 
 // Sticky tools-boundary pinning is part of PPP and must follow its master
 // toggle. Kept as a small policy helper so the disabled path is testable.
@@ -498,7 +509,6 @@ private:
                                      ParsedRequest & req);
     bool parse_endpoint_request(const std::string & path, const json & body,
                                 ParsedRequest & req, bool & count_tokens_only);
-    void apply_request_reasoning(const json & body, ParsedRequest & req);
     bool render_and_tokenize_request(
         SocketHandle fd, const std::vector<ChatMessage> & chat_messages,
         ParsedRequest & req);

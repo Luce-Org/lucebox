@@ -76,7 +76,8 @@ std::string render_chat_template(
     ChatFormat format,
     bool add_generation_prompt,
     bool enable_thinking,
-    const std::string & tools_json)
+    const std::string & tools_json,
+    const std::string & reasoning_effort)
 {
     std::string result;
     bool has_tools = !tools_json.empty() && tools_json != "[]" && tools_json != "null";
@@ -375,6 +376,15 @@ std::string render_chat_template(
         }
 
         result = "<｜begin▁of▁sentence｜>";
+        if (enable_thinking && reasoning_effort == "high") {
+            result += "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n";
+            result += "You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\n";
+            result += "Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n";
+        } else if (enable_thinking && reasoning_effort == "max") {
+            result += "Reasoning Effort: Beyond maximum — exhaustive, relentless, and uncompromising.\n";
+            result += "You MUST reason with the utmost depth and rigor, leaving absolutely nothing to chance: exhaustively decompose the problem into its most fundamental components, trace every causal chain to its root, and resolve the underlying cause rather than any surface symptom.\n";
+            result += "Do not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n";
+        }
         if (has_tools) {
             result += "### Tools\n\n"
                       "You may call functions to assist with the user query. "
