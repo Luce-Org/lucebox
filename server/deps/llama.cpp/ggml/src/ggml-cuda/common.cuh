@@ -1169,6 +1169,8 @@ struct ggml_cuda_pool {
 
     virtual void * alloc(size_t size, size_t * actual_size) = 0;
     virtual void free(void * ptr, size_t size) = 0;
+    virtual bool is_legacy() const = 0;
+    virtual size_t trim() = 0;
 };
 
 template<typename T>

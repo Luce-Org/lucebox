@@ -24,6 +24,60 @@
 
 namespace dflash::common {
 
+namespace detail {
+
+// Qwen's recurrent graph duplicates one small subgraph per ragged sequence.
+// Return a graph capacity that covers every supported concurrent bucket while
+// keeping the legacy allocation for the common <= 8-sequence case.
+bool target_graph_capacity_for_parallel_segments(
+    int n_parallel_segments,
+    size_t & capacity);
+
+// Checked fixed-chain shape/capacity contract. DFlash2 uses widths 2..16, and
+// concurrent serving supports at most 64 slots.
+bool target_paged_tree_graph_capacity(
+    int tree_width,
+    int n_tree_seqs,
+    size_t & capacity);
+
+// Model-free validation shared by the packed-tree builder and its shape
+// tests. paged_max_kv_len is a logical launch bound and may exceed the
+// bounded physical K/V pool; only the per-slot scratch slabs must fit in the
+// physical tensor rows.
+bool validate_target_paged_tree_layout(
+    const TargetCache & cache,
+    int tree_width,
+    int n_tree_seqs,
+    int paged_max_kv_len,
+    int tree_scratch_base,
+    int tree_scratch_stride);
+
+// `active_slot_ids` is a topology marker in mapped-tree graphs. It may be
+// optimized out by gallocr because the actual recurrent and attention row
+// mappings are carried by state_slot_ids and paged_query_seq_ids. Every other
+// tensor listed here is read by a graph node and must have backend storage
+// before the engine uploads metadata.
+inline bool target_paged_tree_uploads_ready(const StepGraph & sg) {
+    const auto allocated = [](const ggml_tensor * tensor) {
+        return tensor && tensor->buffer;
+    };
+    return sg.active_slot_ids &&
+           allocated(sg.inp_embed) && allocated(sg.positions) &&
+           allocated(sg.parent_ids) && allocated(sg.tree_sizes) &&
+           allocated(sg.state_slot_ids) &&
+           allocated(sg.paged_query_seq_ids) &&
+           (!sg.paged_query_positions ||
+            allocated(sg.paged_query_positions)) &&
+           allocated(sg.kv_write_rows);
+}
+
+inline bool target_paged_tree_active_slots_need_upload(
+        const StepGraph & sg) {
+    return sg.active_slot_ids && sg.active_slot_ids->buffer;
+}
+
+}  // namespace detail
+
 // Layer-segmented prefill: process one target layer for chunk_start..chunk_start+n_tokens.
 bool build_layer_step(
     StepGraph & sg,
@@ -110,6 +164,10 @@ bool build_hybrid_full_layer_step(
 //     overrides logits_tail_rows. Multi-prompt steps need it because
 //     committing rows are scattered. 0 keeps the tail-view behavior.
 //   `logits_tail_rows` — logits/argmax only for the last n rows (0 = all).
+// When `capture && paged_attention`, sg.target_feat_rows is an I32 graph
+// input mapping every token to its slot-local feature-ring destination. This
+// keeps accepted-path replay graph-stable and leaves legacy offset capture
+// unchanged for callers that do not use paged serving.
 bool build_target_step(
     StepGraph & sg,
     const TargetWeights & w,
@@ -147,6 +205,27 @@ bool build_target_step_tree(
     int fa_window = 0,
     int kq_stride_pad = KQ_MASK_PAD,
     const SpecLAHLDSchedule * specla_hld = nullptr);
+
+// Packed fixed-chain verify over a paged multi-slot cache. Tokens are
+// flattened after an optional compact one-token AR prefix as
+// [mapped_ar_seqs + tree_width*n_tree_seqs]. n_tree_seqs is a stable graph-
+// bucket width; inactive trees use tree_size=0 and dead/safe row mappings. In
+// particular, state_slot_ids padding must map to a valid harmless slot
+// (normally 0), while active/paged sequence IDs may use -1. Speculative K/V is
+// written into per-slot scratch slabs; recurrent transitions and target
+// features are exposed for post-verification promotion.
+bool build_target_step_paged_tree(
+    StepGraph & sg,
+    const TargetWeights & w,
+    TargetCache & cache,
+    ggml_backend_t backend,
+    int tree_width,
+    int n_tree_seqs,
+    int paged_max_kv_len,
+    int tree_scratch_base,
+    int tree_scratch_stride,
+    int kq_stride_pad = KQ_MASK_PAD,
+    int mapped_ar_seqs = 0);
 
 // LM-head projection: project draft hidden states through the target output matrix.
 bool build_lm_head_projection_step(

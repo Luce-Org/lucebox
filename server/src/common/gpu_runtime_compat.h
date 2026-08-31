@@ -60,6 +60,7 @@
 #define cudaPointerAttributes hipPointerAttribute_t
 #define cudaPointerGetAttributes hipPointerGetAttributes
 #define cudaStreamCreate hipStreamCreate
+#define cudaStreamCreateWithFlags hipStreamCreateWithFlags
 #define cudaStreamDefault hipStreamDefault
 #define cudaStreamDestroy hipStreamDestroy
 #define cudaStreamNonBlocking hipStreamNonBlocking

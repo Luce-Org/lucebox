@@ -30,6 +30,51 @@ Qwen35MoeRouterOutputs build_qwen35moe_router(
             break;
     }
 
+    // Bailing/DeepSeek correction bias changes expert selection only. The
+    // selected experts retain their unbiased sigmoid weights.
+    ggml_tensor * selection_probs = probs;
+    if (L.ffn_exp_probs_b) {
+        selection_probs = ggml_add(ctx, probs, L.ffn_exp_probs_b);
+    }
+
+    // Ling 3 routes hierarchically: rank each group by the sum of its two
+    // strongest experts, keep the configured top groups, then select the
+    // final experts from that masked set. This is the DeepSeek-V3 grouping
+    // rule used by llama.cpp's generic MoE builder.
+    if (w.n_expert_groups > 1) {
+        GGML_ASSERT(n_expert % w.n_expert_groups == 0);
+        GGML_ASSERT(w.n_expert_groups_used > 0 &&
+                    w.n_expert_groups_used <= w.n_expert_groups);
+        const int n_expert_per_group = n_expert / w.n_expert_groups;
+        ggml_tensor * selection_groups = ggml_reshape_3d(
+            ctx, selection_probs, n_expert_per_group,
+            w.n_expert_groups, n_tokens);
+
+        ggml_tensor * group_scores = ggml_argsort_top_k(
+            ctx, selection_groups, 2);
+        group_scores = ggml_get_rows(
+            ctx,
+            ggml_reshape_4d(ctx, selection_groups, 1,
+                            n_expert_per_group, w.n_expert_groups,
+                            n_tokens),
+            group_scores);
+        group_scores = ggml_sum_rows(
+            ctx, ggml_reshape_3d(ctx, group_scores, 2,
+                                 w.n_expert_groups, n_tokens));
+        group_scores = ggml_reshape_2d(
+            ctx, group_scores, w.n_expert_groups, n_tokens);
+
+        ggml_tensor * selected_groups = ggml_argsort_top_k(
+            ctx, group_scores, w.n_expert_groups_used);
+        ggml_tensor * kept_groups = ggml_get_rows(
+            ctx, selection_groups, selected_groups);
+        selection_groups = ggml_set_rows(
+            ctx, ggml_fill(ctx, selection_groups, -INFINITY),
+            kept_groups, selected_groups);
+        selection_probs = ggml_reshape_2d(
+            ctx, selection_groups, n_expert, n_tokens);
+    }
+
     // ggml_argsort_top_k emits GGML_OP_ARGSORT (+view), which ggml-cuda's
     // topk-moe fusion (ggml_cuda_topk_moe_fusion) recognizes and fuses the whole
     // softmax->topk->get_rows->norm router into ~1 kernel. ggml_top_k emits
@@ -38,18 +83,16 @@ Qwen35MoeRouterOutputs build_qwen35moe_router(
     // Same top-k selection -> bit-identical. DFLASH_NO_MOE_ROUTER_FUSE=1 = old path.
     static const bool router_fuse = (std::getenv("DFLASH_NO_MOE_ROUTER_FUSE") == nullptr);
     ggml_tensor * selected = (router_fuse && allow_fused_router)
-        ? ggml_argsort_top_k(ctx, probs, n_used)
-        : ggml_top_k(ctx, probs, n_used);
+        ? ggml_argsort_top_k(ctx, selection_probs, n_used)
+        : ggml_top_k(ctx, selection_probs, n_used);
 
     ggml_tensor * probs_3d = ggml_reshape_3d(ctx, probs, 1, n_expert, n_tokens);
     ggml_tensor * weights  = ggml_get_rows(ctx, probs_3d, selected);
     weights = ggml_reshape_2d(ctx, weights, n_used, n_tokens);
 
-    // Always normalize selected expert weights by their sum (matches
-    // llama.cpp's norm_w=true for qwen35moe). Without this, top-k softmax
-    // weights sum to much less than 1.0, causing systematically underscaled
-    // FFN output.
-    {
+    // Qwen3.5 MoE and Ling 3 both ship norm_w=true. Keep the metadata switch
+    // explicit because Bailing-family checkpoints can legally disable it.
+    if (w.expert_weights_norm) {
         ggml_tensor * w_sum = ggml_sum_rows(ctx, weights);
         w_sum = ggml_clamp(ctx, w_sum, 6.103515625e-5f, INFINITY);
         weights = ggml_div(ctx, weights, w_sum);
@@ -95,7 +138,7 @@ ggml_tensor * build_qwen35moe_ffn(
     if (L.ffn_gate_up_exps) {
         ggml_tensor * gate_up_e = apply_scale2(
             ctx, ggml_mul_mat_id(ctx, L.ffn_gate_up_exps, cur_3d, selected), L.ffn_gate_up_exps_s);
-        if (moe_swiglu_fuse) {
+        if (moe_swiglu_fuse && L.ffn_swiglu_clamp_exp <= 0.0f) {
             gu = ggml_swiglu(ctx, gate_up_e);   // silu(gate) * up, no views/conts
         } else {
             ggml_tensor * gate_e = ggml_view_3d(ctx, gate_up_e,
@@ -107,14 +150,30 @@ ggml_tensor * build_qwen35moe_ffn(
                 (size_t)n_ff_exp * ggml_element_size(gate_up_e));
             gate_e = ggml_cont(ctx, gate_e);
             up_e   = ggml_cont(ctx, up_e);
-            gu = ggml_swiglu_split(ctx, gate_e, up_e);
+            if (L.ffn_swiglu_clamp_exp > 0.0f) {
+                const float limit = L.ffn_swiglu_clamp_exp;
+                up_e = ggml_clamp(ctx, up_e, -limit, limit);
+                gate_e = ggml_clamp(
+                    ctx, ggml_silu(ctx, gate_e), -INFINITY, limit);
+                gu = ggml_mul(ctx, gate_e, up_e);
+            } else {
+                gu = ggml_swiglu_split(ctx, gate_e, up_e);
+            }
         }
     } else {
         ggml_tensor * gate_e = apply_scale2(
             ctx, ggml_mul_mat_id(ctx, L.ffn_gate_exps, cur_3d, selected), L.ffn_gate_exps_s);
         ggml_tensor * up_e   = apply_scale2(
             ctx, ggml_mul_mat_id(ctx, L.ffn_up_exps,   cur_3d, selected), L.ffn_up_exps_s);
-        gu = ggml_swiglu_split(ctx, gate_e, up_e);
+        if (L.ffn_swiglu_clamp_exp > 0.0f) {
+            const float limit = L.ffn_swiglu_clamp_exp;
+            up_e = ggml_clamp(ctx, up_e, -limit, limit);
+            gate_e = ggml_clamp(
+                ctx, ggml_silu(ctx, gate_e), -INFINITY, limit);
+            gu = ggml_mul(ctx, gate_e, up_e);
+        } else {
+            gu = ggml_swiglu_split(ctx, gate_e, up_e);
+        }
     }
 
     ggml_tensor * experts = apply_scale2(
@@ -132,7 +191,16 @@ ggml_tensor * build_qwen35moe_ffn(
             ctx, ggml_mul_mat(ctx, L.ffn_gate_shexp, cur), L.ffn_gate_shexp_s);
         ggml_tensor * sh_up = apply_scale2(
             ctx, ggml_mul_mat(ctx, L.ffn_up_shexp, cur), L.ffn_up_shexp_s);
-        ggml_tensor * sh_gu = ggml_swiglu_split(ctx, sh_gate, sh_up);
+        ggml_tensor * sh_gu = nullptr;
+        if (L.ffn_swiglu_clamp_shexp > 0.0f) {
+            const float limit = L.ffn_swiglu_clamp_shexp;
+            sh_up = ggml_clamp(ctx, sh_up, -limit, limit);
+            sh_gate = ggml_clamp(
+                ctx, ggml_silu(ctx, sh_gate), -INFINITY, limit);
+            sh_gu = ggml_mul(ctx, sh_gate, sh_up);
+        } else {
+            sh_gu = ggml_swiglu_split(ctx, sh_gate, sh_up);
+        }
         ggml_tensor * shared = apply_scale2(
             ctx, ggml_mul_mat(ctx, L.ffn_down_shexp, sh_gu), L.ffn_down_shexp_s);
 

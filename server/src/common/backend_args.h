@@ -7,6 +7,7 @@
 
 #include <limits>
 
+#include "placement/draft_residency.h"
 #include "placement/placement_config.h"
 #include "placement/remote_draft_config.h"
 #include "placement/remote_target_shard_config.h"
@@ -21,6 +22,7 @@ namespace dflash::common {
 struct BackendFeatureConfig {
     bool pflash_enabled = false;
     bool pflash_drafter_configured = false;
+    DraftResidencyPolicy draft_residency = DraftResidencyPolicy::Auto;
 
     // MoE-only server features. Recorded here so the gate can report them as
     // inert on a dense architecture; both are applied via env vars at parse

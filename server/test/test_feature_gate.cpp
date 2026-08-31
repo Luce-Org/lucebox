@@ -411,7 +411,7 @@ void test_feature_gate_paged_attention_requires_qwen35_monolithic() {
     }
 }
 
-void test_feature_gate_paged_attention_requires_plain_ar_decode() {
+void test_feature_gate_paged_attention_allows_fixed_local_chains() {
     BackendArgs base;
     base.model_path = "/nonexistent/model.gguf";
     base.paged_attention = true;
@@ -419,6 +419,30 @@ void test_feature_gate_paged_attention_requires_plain_ar_decode() {
     BackendArgs draft = base;
     draft.draft_path = "/nonexistent/draft.gguf";
     CHECK(!gate_result(draft, "qwen35", PlacementBackend::Cuda).empty());
+
+    BackendArgs concurrent_chain = draft;
+    concurrent_chain.max_concurrency = 16;
+    CHECK(gate_result(
+        concurrent_chain, "qwen35", PlacementBackend::Cuda).empty());
+    CHECK(gate_result(
+        concurrent_chain, "qwen35", PlacementBackend::Hip).empty());
+
+    BackendFeatureConfig request_scoped;
+    request_scoped.draft_residency = DraftResidencyPolicy::RequestScoped;
+    CHECK(!gate_result(
+        concurrent_chain, "qwen35", PlacementBackend::Cuda,
+        request_scoped).empty());
+
+    BackendFeatureConfig persistent;
+    persistent.draft_residency = DraftResidencyPolicy::Persistent;
+    CHECK(gate_result(
+        concurrent_chain, "qwen35", PlacementBackend::Cuda,
+        persistent).empty());
+
+    BackendArgs remote_chain = concurrent_chain;
+    remote_chain.remote_draft.ipc_bin = "/usr/bin/draft-ipc";
+    CHECK(!gate_result(
+        remote_chain, "qwen35", PlacementBackend::Cuda).empty());
 
     BackendArgs ddtree = base;
     ddtree.ddtree_mode = true;
@@ -523,6 +547,21 @@ void test_feature_gate_parallel_and_kv_pool_rules() {
     CHECK(!gate_result(pool, "qwen35", PlacementBackend::Cuda).empty());
     pool.kv_pool_tokens = max_pool_tokens;
     CHECK(gate_result(pool, "qwen35", PlacementBackend::Cuda).empty());
+
+    BackendArgs chain_pool = paged;
+    chain_pool.max_concurrency = 16;
+    chain_pool.draft_path = "/nonexistent/draft.gguf";
+    const long long chain_scratch =
+        (long long)chain_pool.max_concurrency * paged_token_capacity(16);
+    const long long max_chain_pool_tokens =
+        ((long long)INT_MAX - PAGED_BLOCK_SIZE - chain_scratch) /
+        PAGED_BLOCK_SIZE * PAGED_BLOCK_SIZE;
+    chain_pool.kv_pool_tokens = max_chain_pool_tokens;
+    CHECK(gate_result(
+        chain_pool, "qwen35", PlacementBackend::Hip).empty());
+    chain_pool.kv_pool_tokens = max_chain_pool_tokens + PAGED_BLOCK_SIZE;
+    CHECK(!gate_result(
+        chain_pool, "qwen35", PlacementBackend::Hip).empty());
 
     // The automatic pool is memory-derived, so a logical slot/context product
     // larger than the physical tensor address space is legal.
@@ -703,7 +742,7 @@ TEST_CASE(FeatureGateFixture, feature_gate_suite) {
     test_feature_gate_remote_draft_requires_supported_arch();
     test_feature_gate_layer_split_requires_supported_arch();
     test_feature_gate_paged_attention_requires_qwen35_monolithic();
-    test_feature_gate_paged_attention_requires_plain_ar_decode();
+    test_feature_gate_paged_attention_allows_fixed_local_chains();
     test_feature_gate_parallel_and_kv_pool_rules();
     test_feature_warnings_silent_when_supported();
     test_feature_warnings_report_inert_draft();

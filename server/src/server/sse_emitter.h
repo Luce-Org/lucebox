@@ -139,6 +139,12 @@ public:
     // counter; the difference is the natural-close content suffix.
     int emit_token_count() const { return emit_token_count_; }
 
+    // Discard a model-emitted Bailing tool block when the request did not
+    // declare tools. Returns true for every token from <tool_call> through
+    // </tool_call>, including the delimiters.
+    bool suppress_undeclared_tool_protocol_token(
+        const std::string & raw_token);
+
 private:
     // Format helpers
     std::string format_openai_delta(const json & delta, const char * finish = nullptr);
@@ -164,6 +170,7 @@ private:
 
     StreamMode   mode_;
     bool         tool_from_reasoning_ = false;
+    bool         suppress_undeclared_tool_protocol_ = false;
     std::string  window_;           // holdback buffer
     // Incomplete trailing UTF-8 bytes from the previous token piece.
     // BPE tokens can split a multi-byte codepoint (emoji arrive as two

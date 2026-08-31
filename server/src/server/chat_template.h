@@ -3,7 +3,8 @@
 // Renders chat messages (system/user/assistant/tool) into the model-specific
 // token format. Hard-coded for supported architectures:
 //   - Qwen3/3.5: <|im_start|>role\ncontent<|im_end|>\n
-//   - Laguna: XML-style <|begin_of_sentence|><|User|>...<|Assistant|>
+//   - BailingMoE3: <role>SYSTEM/HUMAN/ASSISTANT</role>...<|role_end|>
+//   - Laguna: XML-style role blocks
 
 #pragma once
 
@@ -23,6 +24,7 @@ struct ChatMessage {
 // Chat template format.
 enum class ChatFormat {
     QWEN3,     // <|im_start|>role\n...<|im_end|>\n
+    BAILINGMOE3, // <role>SYSTEM/HUMAN/ASSISTANT</role>...<|role_end|>
     LAGUNA,    // <|begin_of_sentence|><|User|>...<|Assistant|>
     GEMMA4,    // <bos><|turn>role\n...<turn|>\n
     DEEPSEEK4, // <｜begin▁of▁sentence｜>...<｜User｜>...<｜Assistant｜>

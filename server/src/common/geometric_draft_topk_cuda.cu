@@ -331,7 +331,10 @@ bool geometric_extract_draft_topk_cuda(const void * d_logits,
                              float * out_log_probs,
                              int32_t * out_token_ids,
                              float temperature) {
-    if (!d_logits || n_positions <= 0 || vocab <= 0 || K <= 0 || K > kMaxK) return false;
+    if (!d_logits || !out_log_probs || !out_token_ids || n_positions <= 0 ||
+        vocab <= 0 || K > vocab || !geometric_draft_topk_cuda_supports_k(K)) {
+        return false;
+    }
 
     cudaPointerAttributes attr{};
     if (cudaPointerGetAttributes(&attr, d_logits) != cudaSuccess) {
@@ -362,9 +365,6 @@ bool geometric_extract_draft_topk_cuda(const void * d_logits,
         // the tensor base aligned and a vocab stride that is a multiple of 4.
         const bool use_vec = (vocab % 4 == 0) &&
                              (reinterpret_cast<uintptr_t>(lp_in) % 16 == 0);
-        // K (and the vectorization flag) are compile-time template parameters
-        // so the per-thread/per-partial top-K stays register-resident; dispatch
-        // the runtime K to its instantiation. K>kMaxK is already rejected above.
 #define DFLASH_TOPK_LAUNCH(KV, VEC)                                                             \
             geometric_draft_topk_partial<KV, VEC><<<grid1, kBlock>>>(                                     \
                 lp_in, vocab, inv_t, split,                                                     \

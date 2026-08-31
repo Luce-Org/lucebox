@@ -54,16 +54,35 @@ TEST_CASE(CudaPoolShutdownFixture, backend_pool_shutdown) {
     ggml_backend_tensor_set(weights, weights_data.data(), 0, weights_data.size());
     ggml_backend_tensor_set(input, input_data.data(), 0, input_data.size() * sizeof(float));
 
-    const ggml_status status = ggml_backend_graph_compute(backend, graph);
-    ggml_backend_buffer_free(buffer);
-    ggml_free(ctx);
-    if (status != GGML_STATUS_SUCCESS) {
-        ggml_backend_free(backend);
-        REQUIRE_TRUE(false);
+    auto compute = [&]() {
+        const ggml_status status = ggml_backend_graph_compute(backend, graph);
+        ggml_backend_synchronize(backend);
+        return status;
+    };
+
+    // Two stable evaluations warm and capture graph replay when enabled.
+    REQUIRE(compute() == GGML_STATUS_SUCCESS);
+    REQUIRE(compute() == GGML_STATUS_SUCCESS);
+
+    // LUCE_Q8_MEMO intentionally retains a pool allocation after compute.
+    // Request-boundary trimming must first release that memo, then return its
+    // cached block to the driver rather than retaining VRAM indefinitely.
+    const bool has_legacy_pool = ggml_backend_cuda_has_legacy_pool(backend);
+    const size_t trimmed = ggml_backend_cuda_trim_pool(backend);
+    if (has_legacy_pool) {
+        REQUIRE(trimmed > 0);
+    } else {
+        REQUIRE(trimmed == 0);
     }
 
-    // LUCE_Q8_MEMO intentionally retains the pool allocation after compute.
-    // Backend teardown must release that allocation before destroying its pool.
+    // A legacy trim must retire graph executables that captured the released
+    // memo address. Recomputing the same graph must recapture rather than
+    // replaying a stale pointer. VMM pools safely keep the existing replay.
+    REQUIRE(compute() == GGML_STATUS_SUCCESS);
+
+    // Backend teardown must remain safe after an explicit trim.
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
     ggml_backend_free(backend);
     REQUIRE_TRUE(true);
 }

@@ -2502,6 +2502,7 @@ extern "C" {
     // prefill chunks can attend the paged pool causally. A negative position
     // marks a padding row. NULL keeps the decode semantics (full cached
     // length per row).
+    //
     GGML_API struct ggml_tensor * ggml_paged_attn_ext(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,
@@ -2514,6 +2515,39 @@ extern "C" {
             float                 scale,
             int                   block_size,
             int                   max_kv_seq_len);
+
+    // Packed tree verification over the same paged K/V pool.
+    // In a pure-tree batch, queries are flattened sequence-major and tree
+    // sequence s occupies rows [s*tree_width, (s+1)*tree_width). In a mixed
+    // AR/tree batch, the compact AR rows come first. Tree sequence s starts at
+    // ar_rows + s*tree_width, where
+    // ar_rows = q_rows - n_tree_seq*tree_width. parent_ids is tree-local,
+    // contiguous I32 [tree_width, n_tree_seq] (root parent -1), and tree_sizes
+    // is contiguous I32 [n_tree_seq]. active_slot_ids is required per query row;
+    // it selects the physical block-table column and scratch slab. Each live
+    // query attends its complete committed prefix from the block table plus
+    // its own candidate node and ancestors from physical K/V rows
+    // tree_scratch_base + slot*tree_scratch_stride + node. Siblings and rows
+    // at or beyond tree_sizes[s] are excluded. query_positions may describe
+    // compact autoregressive rows in a mixed AR/tree batch; tree rows ignore
+    // it and read the full committed prefix. Pure tree batches pass NULL.
+    // tree_width is derived from parent_ids.
+    GGML_API struct ggml_tensor * ggml_paged_attn_ext_tree(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * block_table,
+            struct ggml_tensor  * kv_seq_lens,
+            struct ggml_tensor  * active_slot_ids,
+            struct ggml_tensor  * query_positions,
+            float                 scale,
+            int                   block_size,
+            int                   max_kv_seq_len,
+            struct ggml_tensor  * parent_ids,
+            struct ggml_tensor  * tree_sizes,
+            int                   tree_scratch_base,
+            int                   tree_scratch_stride);
 
     // TurboQuant FWHT rotation. direction: 0 = forward, 1 = inverse.
     // Applies signs1 -> FWHT -> signs2 (forward) or signs2 -> FWHT -> signs1 (inverse).
@@ -2937,6 +2971,15 @@ extern "C" {
     GGML_API void ggml_gated_delta_net_set_skip_intermediate(
             struct ggml_tensor * tensor,
             bool                 skip_intermediate);
+
+    // CUDA/HIP fixed-chain replay log in compact F32 [J,H,T,B] layout:
+    // scalar gate J=2*S_v+1 stores [g | k | delta], while KDA J=3*S_v
+    // stores [g[S_v] | k | delta]. Delta is captured after the
+    // state-dependent reduction. The returned tensor owns a compact copy so
+    // graph allocation can release the much larger GDN result after capture.
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_capture_replay_log(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * tensor);
 
     // dflash extension: let the kernel derive the gates from the raw
     // projections instead of graph-side sigmoid/softplus ops:

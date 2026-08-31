@@ -1190,9 +1190,10 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_RWKV_WKV7:
             return true;
         case GGML_OP_GATED_DELTA_NET:
-            // src[9]/raw-gate mode is CUDA/HIP only.
+            // Active-slot and raw-gate variants are CUDA/HIP only.
             return has_simdgroup_reduction && op->src[2]->ne[0] % 32 == 0 &&
-                   op->src[8] == NULL && op->src[9] == NULL;
+                   op->src[8] == NULL && op->src[9] == NULL &&
+                   ggml_get_op_params_i32(op, 10) != 1;
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:

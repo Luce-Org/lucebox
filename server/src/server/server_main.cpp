@@ -737,6 +737,7 @@ int main(int argc, char ** argv) {
         sconfig.pflash_mode != ServerConfig::PflashMode::OFF;
     backend_features.pflash_drafter_configured =
         !sconfig.pflash_drafter_path.empty();
+    backend_features.draft_residency = sconfig.draft_residency;
     backend_features.routing_stats_requested =
         sconfig.freq_tracking || !sconfig.collect_routing_path.empty();
     backend_features.adaptive_experts_requested = adaptive_experts_set;

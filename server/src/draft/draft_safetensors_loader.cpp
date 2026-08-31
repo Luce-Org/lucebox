@@ -514,6 +514,9 @@ bool load_draft_safetensors(const std::string & path,
                             ggml_backend_t       backend,
                             DraftWeights &       out,
                             const TargetWeights * target) {
+    out.swa_window = 0;
+    out.swa_pattern_loaded = false;
+
     // ── 1. Open + mmap ────────────────────────────────────────────
     Mmap mm;
     std::string err;

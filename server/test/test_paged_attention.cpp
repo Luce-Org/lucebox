@@ -30,6 +30,14 @@ struct TestCase {
     bool corrupt_blocks;
 };
 
+struct TreeMetadata {
+    int width;
+    int scratch_stride;
+    std::vector<int32_t> parent_ids;
+    std::vector<int32_t> tree_sizes;
+    int ar_rows = 0;
+};
+
 int clamped_seq_len(const TestCase & test_case, int seq) {
     return std::max(
         0, std::min(
@@ -49,6 +57,40 @@ int count_physical_blocks(const TestCase & test_case) {
 
 bool block_is_valid(int32_t block, int physical_blocks) {
     return block >= 0 && block < physical_blocks;
+}
+
+bool tree_visible(
+        const TreeMetadata & tree,
+        int tree_seq,
+        int query_node,
+        int candidate) {
+    const int tree_size = tree.tree_sizes[tree_seq];
+    if (tree_size < 0 || tree_size > tree.width ||
+        query_node < 0 || query_node >= tree_size ||
+        candidate < 0 || candidate >= tree_size) {
+        return false;
+    }
+
+    bool visible = false;
+    int current = query_node;
+    for (int depth = 0; depth < tree_size; ++depth) {
+        if (current == candidate) {
+            visible = true;
+        }
+        if (current < 0 || current >= tree_size) {
+            return false;
+        }
+        const int parent =
+            tree.parent_ids[tree_seq * tree.width + current];
+        if (parent == -1) {
+            return visible;
+        }
+        if (parent < 0 || parent >= current) {
+            return false;
+        }
+        current = parent;
+    }
+    return false;
 }
 
 std::vector<int32_t> make_block_table(
@@ -127,7 +169,9 @@ std::vector<float> reference_attention(
         const std::vector<float> & k,
         const std::vector<float> & v,
         const std::vector<int32_t> * active_slot_ids = nullptr,
-        const std::vector<int32_t> * query_positions = nullptr) {
+        const std::vector<int32_t> * query_positions = nullptr,
+        const TreeMetadata * tree = nullptr,
+        int tree_scratch_base = 0) {
     std::vector<float> output(q.size(), 0.0f);
     const float scale = 1.0f / std::sqrt(static_cast<float>(D));
     const int q_per_kv = N_HEAD / N_HEAD_KV;
@@ -141,56 +185,88 @@ std::vector<float> reference_attention(
         // Mirrors the kernel: out-of-range slot ids and negative positions
         // are padding rows and leave zero output.
         if (physical_seq < 0 || physical_seq >= physical_n_seq) continue;
+        const bool tree_query = tree && seq >= tree->ar_rows;
+        const int tree_seq = tree_query
+            ? (seq - tree->ar_rows) / tree->width : 0;
+        const int query_node = tree_query
+            ? (seq - tree->ar_rows) % tree->width : -1;
         int kv_seq_len = clamped_seq_len(test_case, physical_seq);
-        if (query_positions && (*query_positions)[seq] < kv_seq_len) {
+        if (query_positions && !tree_query) {
+            const int32_t query_position = (*query_positions)[seq];
+            if (query_position < 0) continue;
             // The inclusive causal clamp: row seq attends its sequence's
             // cached tokens [0, position].
-            kv_seq_len = (*query_positions)[seq] + 1;
+            if (query_position < kv_seq_len) {
+                kv_seq_len = query_position + 1;
+            }
+        }
+        const int tree_size = tree_query ? tree->tree_sizes[tree_seq] : 0;
+        if (tree_query &&
+            (tree_size < 0 || tree_size > tree->width ||
+             query_node >= tree_size)) {
+            continue;
+        }
+
+        std::vector<int32_t> physical_rows;
+        physical_rows.reserve(
+            kv_seq_len + (tree_query ? tree->width : 0));
+        for (int token = 0; token < kv_seq_len; ++token) {
+            const int block =
+                block_table[
+                    physical_seq * test_case.max_blocks +
+                    token / BLOCK_SIZE];
+            physical_rows.push_back(
+                block_is_valid(block, physical_blocks)
+                    ? block * BLOCK_SIZE + token % BLOCK_SIZE
+                    : -1);
+        }
+        if (tree_query) {
+            for (int candidate = 0; candidate < tree->width; ++candidate) {
+                physical_rows.push_back(
+                    tree_visible(*tree, tree_seq, query_node, candidate)
+                        ? tree_scratch_base +
+                              physical_seq * tree->scratch_stride + candidate
+                        : -1);
+            }
         }
         for (int head = 0; head < N_HEAD; ++head) {
             const int kv_head = head / q_per_kv;
             const float * q_row =
                 q.data() + (static_cast<size_t>(head) * n_seq + seq) * D;
 
-            std::vector<float> scores(kv_seq_len);
+            std::vector<float> scores(physical_rows.size(), -INFINITY);
             float max_score = -INFINITY;
-            for (int token = 0; token < kv_seq_len; ++token) {
-                const int block =
-                    block_table[
-                        physical_seq * test_case.max_blocks + token / BLOCK_SIZE];
-                if (!block_is_valid(block, physical_blocks)) {
-                    // Mirrors the kernel: invalid blocks contribute nothing.
-                    scores[token] = -INFINITY;
-                    continue;
-                }
-                const int physical = block * BLOCK_SIZE + token % BLOCK_SIZE;
+            for (size_t row = 0; row < physical_rows.size(); ++row) {
+                const int physical = physical_rows[row];
+                if (physical < 0) continue;
                 const float * k_row =
                     k.data() +
                     (static_cast<size_t>(kv_head) * pool_tokens + physical) * D;
                 float dot = 0.0f;
                 for (int d = 0; d < D; ++d) dot += q_row[d] * k_row[d];
-                scores[token] = dot * scale;
-                max_score = std::max(max_score, scores[token]);
+                scores[row] = dot * scale;
+                max_score = std::max(max_score, scores[row]);
             }
 
             float denominator = 0.0f;
             for (float & score : scores) {
+                if (!std::isfinite(score)) {
+                    score = 0.0f;
+                    continue;
+                }
                 score = std::exp(score - max_score);
                 denominator += score;
             }
 
             float * out_row =
                 output.data() + (static_cast<size_t>(head) * n_seq + seq) * D;
-            for (int token = 0; token < kv_seq_len; ++token) {
-                const int block =
-                    block_table[
-                        physical_seq * test_case.max_blocks + token / BLOCK_SIZE];
-                if (!block_is_valid(block, physical_blocks)) continue;
-                const int physical = block * BLOCK_SIZE + token % BLOCK_SIZE;
+            for (size_t row = 0; row < physical_rows.size(); ++row) {
+                const int physical = physical_rows[row];
+                if (physical < 0 || denominator == 0.0f) continue;
                 const float * v_row =
                     v.data() +
                     (static_cast<size_t>(kv_head) * pool_tokens + physical) * D;
-                const float probability = scores[token] / denominator;
+                const float probability = scores[row] / denominator;
                 for (int d = 0; d < D; ++d) {
                     out_row[d] += probability * v_row[d];
                 }
@@ -205,7 +281,8 @@ bool run_case(ggml_backend_t backend,
               ggml_type k_type,
               ggml_type v_type,
               const std::vector<int32_t> * active_slot_ids = nullptr,
-              const std::vector<int32_t> * query_positions = nullptr) {
+              const std::vector<int32_t> * query_positions = nullptr,
+              const TreeMetadata * tree = nullptr) {
     const int physical_n_seq = static_cast<int>(test_case.kv_seq_lens.size());
     const int n_seq = active_slot_ids
         ? static_cast<int>(active_slot_ids->size())
@@ -214,8 +291,25 @@ bool run_case(ggml_backend_t backend,
     GGML_ASSERT(!query_positions ||
                 (active_slot_ids &&
                  query_positions->size() == active_slot_ids->size()));
+    GGML_ASSERT(!tree || active_slot_ids);
+    if (tree) {
+        GGML_ASSERT(tree->width > 0);
+        GGML_ASSERT(tree->scratch_stride >= tree->width);
+        GGML_ASSERT(tree->ar_rows >= 0);
+        GGML_ASSERT(tree->ar_rows == 0 || query_positions);
+        GGML_ASSERT(
+            tree->parent_ids.size() ==
+            static_cast<size_t>(tree->width) * tree->tree_sizes.size());
+        GGML_ASSERT(
+            n_seq == tree->ar_rows +
+            tree->width * static_cast<int>(tree->tree_sizes.size()));
+    }
     const int physical_blocks = count_physical_blocks(test_case);
-    const int pool_tokens = physical_blocks * BLOCK_SIZE;
+    const int tree_scratch_base = physical_blocks * BLOCK_SIZE;
+    const int pool_tokens = tree
+        ? tree_scratch_base + physical_n_seq * tree->scratch_stride
+        : tree_scratch_base;
+    GGML_ASSERT(pool_tokens % BLOCK_SIZE == 0);
     const std::vector<int32_t> block_table =
         make_block_table(test_case, physical_blocks);
 
@@ -250,13 +344,28 @@ bool run_case(ggml_backend_t backend,
         positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seq);
         ggml_set_input(positions);
     }
+    ggml_tensor * parents = nullptr;
+    ggml_tensor * sizes = nullptr;
+    if (tree) {
+        parents = ggml_new_tensor_2d(
+            ctx, GGML_TYPE_I32, tree->width, tree->tree_sizes.size());
+        sizes = ggml_new_tensor_1d(
+            ctx, GGML_TYPE_I32, tree->tree_sizes.size());
+        ggml_set_input(parents);
+        ggml_set_input(sizes);
+    }
 
     const float scale = 1.0f / std::sqrt(static_cast<float>(D));
     const int max_kv_seq_len = *std::max_element(
         test_case.kv_seq_lens.begin(), test_case.kv_seq_lens.end());
-    ggml_tensor * output = ggml_paged_attn_ext(
-        ctx, q, k, v, table, kv_seq_lens, active, positions,
-        scale, BLOCK_SIZE, max_kv_seq_len);
+    ggml_tensor * output = tree
+        ? ggml_paged_attn_ext_tree(
+            ctx, q, k, v, table, kv_seq_lens, active,
+            positions, scale, BLOCK_SIZE, max_kv_seq_len, parents, sizes,
+            tree_scratch_base, tree->scratch_stride)
+        : ggml_paged_attn_ext(
+            ctx, q, k, v, table, kv_seq_lens, active, positions,
+            scale, BLOCK_SIZE, max_kv_seq_len);
     ggml_set_output(output);
     ggml_cgraph * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, output);
@@ -315,6 +424,14 @@ bool run_case(ggml_backend_t backend,
                 positions, query_positions->data(), 0,
                 query_positions->size() * sizeof((*query_positions)[0]));
         }
+        if (tree) {
+            ggml_backend_tensor_set(
+                parents, tree->parent_ids.data(), 0,
+                tree->parent_ids.size() * sizeof(tree->parent_ids[0]));
+            ggml_backend_tensor_set(
+                sizes, tree->tree_sizes.data(), 0,
+                tree->tree_sizes.size() * sizeof(tree->tree_sizes[0]));
+        }
         ok = ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
     }
 
@@ -327,7 +444,7 @@ bool run_case(ggml_backend_t backend,
             reference_attention(
                 test_case, block_table, pool_tokens, physical_blocks,
                 q_data, k_reference, v_reference, active_slot_ids,
-                query_positions);
+                query_positions, tree, tree ? tree_scratch_base : 0);
         max_abs_error = 0.0f;
         for (size_t i = 0; i < actual.size(); ++i) {
             if (!std::isfinite(actual[i])) {
@@ -340,10 +457,11 @@ bool run_case(ggml_backend_t backend,
         ok = ok && max_abs_error < MAX_ABS_ERROR;
     }
 
-    std::printf("paged attention %-11s K=%-4s V=%-4s active=%s pos=%s max_abs=%.6g %s\n",
+    std::printf("paged attention %-11s K=%-4s V=%-4s active=%s pos=%s tree=%s max_abs=%.6g %s\n",
                 test_case.name, ggml_type_name(k_type), ggml_type_name(v_type),
                 active_slot_ids ? "yes" : "no",
                 query_positions ? "yes" : "no",
+                tree ? "yes" : "no",
                 max_abs_error, ok ? "PASS" : "FAIL");
     ggml_gallocr_free(allocator);
     ggml_free(ctx);
@@ -401,6 +519,72 @@ void run_paged_attention_case(const TestCase & test_case) {
         }
     }
 
+    ggml_backend_free(backend);
+}
+
+void run_tree_case() {
+    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    REQUIRE_NOT_NULL(backend);
+    const TestCase tree_case{"tree", 65, {1025, 17, 257}, false};
+    const TreeMetadata tree_metadata{
+        16, 16,
+        {
+            -1, 0, 1, 2, 3, 4, 5, 6,
+            7, 8, 9, 10, 11, 12, 13, 14,
+            -1, 0, 1, 2, 3, 4, 5, 6,
+            7, -1, -1, -1, -1, -1, -1, -1,
+        },
+        {16, 9},
+    };
+    const std::vector<int32_t> tree_slot_ids{
+        0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0,
+        2, 2, 2, 2, 2, 2, 2, 2,
+        2, 2, 2, 2, 2, 2, 2, 2,
+    };
+    CHECK(run_case(backend, tree_case, GGML_TYPE_F16, GGML_TYPE_F16,
+                   &tree_slot_ids, nullptr, &tree_metadata));
+    CHECK(run_case(backend, tree_case, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0,
+                   &tree_slot_ids, nullptr, &tree_metadata));
+    CHECK(run_case(backend, tree_case, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0,
+                   &tree_slot_ids, nullptr, &tree_metadata));
+    ggml_backend_free(backend);
+}
+
+void run_mixed_tree_case() {
+    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    REQUIRE_NOT_NULL(backend);
+    const TestCase mixed_case{"mixed-tree", 8, {33, 65, 17}, false};
+    const TreeMetadata tree_metadata{
+        16, 16,
+        {
+            -1, 0, 1, 2, 3, 4, 5, 6,
+            7, 8, 9, 10, 11, 12, 13, 14,
+        },
+        {16},
+        2,
+    };
+    std::vector<int32_t> query_slots{1, 0};
+    query_slots.insert(query_slots.end(), 16, 2);
+    std::vector<int32_t> query_positions{7, 15};
+    query_positions.insert(query_positions.end(), 16, -1);
+    CHECK(run_case(backend, mixed_case, GGML_TYPE_F16, GGML_TYPE_F16,
+                   &query_slots, &query_positions, &tree_metadata));
+    ggml_backend_free(backend);
+}
+
+void run_cyclic_tree_case() {
+    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    REQUIRE_NOT_NULL(backend);
+    const TestCase tree_case{"cyclic-tree", 4, {17}, false};
+    const TreeMetadata tree_metadata{
+        4, 16,
+        {-1, 2, 1, -1},
+        {3},
+    };
+    const std::vector<int32_t> tree_slot_ids{0, 0, 0, 0};
+    CHECK(run_case(backend, tree_case, GGML_TYPE_F16, GGML_TYPE_F16,
+                   &tree_slot_ids, nullptr, &tree_metadata));
     ggml_backend_free(backend);
 }
 
@@ -464,6 +648,18 @@ TEST_CASE(PagedAttention, CompactThreeSlotBucketMatchesReference) {
         {1, 17, 31},
         false,
     }, {2, 1, 0, -1});
+}
+
+TEST_CASE(PagedAttention, PackedTreesMatchReference) {
+    run_tree_case();
+}
+
+TEST_CASE(PagedAttention, CompactArAndFixedChainMatchReference) {
+    run_mixed_tree_case();
+}
+
+TEST_CASE(PagedAttention, CyclicParentMetadataIsMasked) {
+    run_cyclic_tree_case();
 }
 
 TEST_CASE(PagedAttention, RaggedCausalPositionsMatchReference) {

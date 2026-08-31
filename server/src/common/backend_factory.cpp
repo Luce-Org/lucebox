@@ -6,6 +6,7 @@
 
 #include "qwen35_backend.h"
 #include "qwen35moe_backend.h"
+#include "bailingmoe3_backend.h"
 #include "laguna_backend.h"
 #include "laguna_layer_split_adapter.h"
 #include "qwen3_backend.h"
@@ -92,6 +93,7 @@ constexpr bool layer_split_carries(FeatureSupport support) {
 
 DFLASH_CHECK_ARCH("qwen35",    Qwen35Config,          Qwen35LayerSplitAdapterConfig);
 DFLASH_CHECK_ARCH("qwen35moe", Qwen35Config,          NoLayerSplitConfig);
+DFLASH_CHECK_ARCH("bailingmoe3", BailingMoe3Config,   NoLayerSplitConfig);
 DFLASH_CHECK_ARCH("laguna",    LagunaBackendArgs,     LagunaLayerSplitAdapterConfig);
 DFLASH_CHECK_ARCH("qwen3",     Qwen3BackendConfig,    NoLayerSplitConfig);
 DFLASH_CHECK_ARCH("gemma4",    Gemma4BackendConfig,   Gemma4LayerSplitAdapterConfig);
@@ -317,6 +319,19 @@ std::unique_ptr<ModelBackend> create_backend(
         auto backend = std::make_unique<Qwen35MoeBackend>(cfg);
         if (!backend->init()) {
             std::fprintf(stderr, "[backend_factory] Qwen35MoeBackend init failed\n");
+            return nullptr;
+        }
+        return backend;
+
+    } else if (arch == "bailingmoe3") {
+        BailingMoe3Config cfg;
+        cfg.model_path = args.model_path;
+        cfg.device = args.device;
+        cfg.stream_fd = args.stream_fd;
+
+        auto backend = std::make_unique<BailingMoe3Backend>(cfg);
+        if (!backend->init()) {
+            std::fprintf(stderr, "[backend_factory] BailingMoe3Backend init failed\n");
             return nullptr;
         }
         return backend;

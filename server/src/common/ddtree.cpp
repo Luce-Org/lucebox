@@ -376,4 +376,14 @@ std::vector<int> follow_verified_tree(const DDTree & tree,
     return accepted;
 }
 
+bool truncate_verified_path(std::vector<int> & accepted,
+                            std::size_t max_committed,
+                            const int32_t * posterior,
+                            int & out_next_token) {
+    if (accepted.size() <= max_committed) return false;
+    accepted.resize(max_committed);
+    out_next_token = accepted.empty() ? -1 : posterior[accepted.back()];
+    return true;
+}
+
 }  // namespace dflash::common

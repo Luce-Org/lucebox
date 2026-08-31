@@ -174,6 +174,23 @@ std::string check_feature_compatibility(
         }
     }
 
+    const bool concurrent_local_chain =
+        arch == "qwen35" && args.paged_attention &&
+        args.max_concurrency > 1 && args.draft_path != nullptr &&
+        !args.ddtree_mode && !args.remote_draft.enabled() &&
+        !args.device.is_layer_split() &&
+        !args.device.is_tensor_parallel() &&
+        !args.remote_target_shard.enabled() &&
+        target_backend == draft_backend &&
+        args.device.gpu == args.draft_device.gpu &&
+        args.fa_window == 0;
+
+    if (concurrent_local_chain &&
+        features.draft_residency == DraftResidencyPolicy::RequestScoped) {
+        return "concurrent DFlash2 does not support "
+               "--draft-residency=request-scoped";
+    }
+
     // ── --paged-attention × architecture, placement, and decode features
     // Paged decode swaps the contiguous K/V cache for a block table owned by
     // the monolithic qwen35 backend, so every rule below is about reaching
@@ -191,10 +208,13 @@ std::string check_feature_compatibility(
             args.remote_target_shard.enabled()) {
             return "--paged-attention requires one local target device";
         }
-        if (args.draft_path != nullptr || args.remote_draft.enabled() ||
-            args.ddtree_mode) {
+        if ((args.draft_path != nullptr || args.remote_draft.enabled()) &&
+            !concurrent_local_chain) {
             return "--paged-attention requires autoregressive decode without a "
-                   "draft or DDTree";
+                   "draft, or concurrent local same-device DFlash2 chains";
+        }
+        if (args.ddtree_mode) {
+            return "--paged-attention does not support DDTree";
         }
         if (args.fa_window != 0) {
             return "--paged-attention requires full attention (--fa-window 0)";
@@ -243,10 +263,12 @@ std::string check_feature_compatibility(
         if (args.max_concurrency <= 1) {
             return "--kv-pool-tokens requires --max-concurrency greater than 1";
         }
-        // The cache appends one scratch block after the physical pool, and
-        // the requested pool itself is rounded up to a whole block. Cap the
-        // request at the largest aligned pool that leaves room for scratch.
-        const int64_t max_pool_tokens = paged_kv_address_cap();
+        const int64_t chain_scratch = concurrent_local_chain
+            ? (int64_t)args.max_concurrency * paged_token_capacity(16)
+            : 0;
+        const int64_t max_pool_tokens =
+            ((int64_t)INT32_MAX - PAGED_BLOCK_SIZE - chain_scratch) /
+            PAGED_BLOCK_SIZE * PAGED_BLOCK_SIZE;
         if (args.kv_pool_tokens < PAGED_BLOCK_SIZE ||
             args.kv_pool_tokens > max_pool_tokens) {
             return "--kv-pool-tokens must be in [" +

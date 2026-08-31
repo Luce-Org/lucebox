@@ -166,6 +166,50 @@ TEST_CASE(ChainRollbackPolicyFixture, split_checkpoint_dtype_is_gated_at_allocat
     ggml_backend_free(backend);
 }
 
+TEST_CASE(ChainRollbackPolicyFixture, asymmetric_v_cache_is_ling_only) {
+    const luce_test::ScopedEnvVar kv_f16("DFLASH27B_KV_F16", "1");
+    const luce_test::ScopedEnvVar kv_q4("DFLASH27B_KV_Q4", nullptr);
+    const luce_test::ScopedEnvVar kv_tq3("DFLASH27B_KV_TQ3", nullptr);
+    const luce_test::ScopedEnvVar kv_k("DFLASH27B_KV_K", nullptr);
+    const luce_test::ScopedEnvVar kv_v("DFLASH27B_KV_V", nullptr);
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    CHECK(backend != nullptr);
+    if (!backend) return;
+
+    dflash::common::TargetWeights weights;
+    weights.n_layer = 1;
+    weights.full_attention_interval = 1;
+    weights.n_embd_head_k = 32;
+    weights.n_embd_head_v = 24;
+    weights.n_head = 1;
+    weights.n_head_kv = 1;
+    weights.n_embd = 32;
+    weights.n_capture_layers = 0;
+
+    const auto check_width = [&](bool is_bailingmoe3, int expected) {
+        weights.is_bailingmoe3 = is_bailingmoe3;
+        dflash::common::TargetCache cache;
+        // This fixture has no recurrent layers, so no rollback cache is needed.
+        const bool ok = dflash::common::create_target_cache_partial(
+            weights, /*max_ctx=*/1, /*max_verify_tokens=*/1, backend, cache,
+            /*prefill_only=*/true, /*layer_begin=*/0, /*layer_end=*/1,
+            /*allocate_target_feat=*/false, /*ctx_alloc=*/0,
+            /*f32_ssm_intermediates=*/false);
+        CHECK(ok);
+        if (ok) {
+            CHECK(cache.attn_v.size() == 1);
+            CHECK(cache.attn_v[0] != nullptr);
+            if (cache.attn_v[0]) CHECK(cache.attn_v[0]->ne[0] == expected);
+        }
+        dflash::common::free_target_cache(cache);
+    };
+
+    check_width(/*is_bailingmoe3=*/false, /*expected=*/32);
+    check_width(/*is_bailingmoe3=*/true, /*expected=*/24);
+    ggml_backend_free(backend);
+}
+
 TEST_CASE(ChainRollbackPolicyFixture, diagnostics_accumulator_and_print_contract) {
     const luce_test::ScopedEnvVar checkpoint("DFLASH_SINGLE_CHAIN_CHECKPOINT_F32", nullptr);
     const luce_test::ScopedEnvVar threshold("DFLASH_FAST_ROLLBACK_THRESHOLD", nullptr);

@@ -275,6 +275,54 @@ TEST_CASE(PagedKvPoolFixture, first_last_slots_append) {
     CHECK(sequence(pool, handle).kv_seq_len == 34);
 }
 
+TEST_CASE(PagedKvPoolFixture, rollback_append_restores_visible_sequence) {
+    PagedKvPool pool(4, 1, 4);
+    PagedKvSequenceHandle handle;
+    CHECK(pool.acquire_reserved(123, 8, handle) == PagedKvStatus::Ok);
+    CHECK(pool.append(handle, 3));
+    const PagedKvSequenceSnapshot before = sequence(pool, handle);
+    const uint32_t free_before = pool.free_block_count();
+
+    CHECK(pool.append(handle, 5));
+    CHECK(sequence(pool, handle).kv_seq_len == 8);
+    CHECK(pool.rollback_append(handle, 5) == PagedKvStatus::Ok);
+
+    const PagedKvSequenceSnapshot after = sequence(pool, handle);
+    CHECK(after.kv_seq_len == before.kv_seq_len);
+    CHECK(after.block_table == before.block_table);
+    CHECK(after.reserved_block_count == before.reserved_block_count);
+    CHECK(pool.free_block_count() == free_before);
+    CHECK(state_unchanged(pool, handle, [&] {
+        CHECK(pool.rollback_append(handle, 4) ==
+              PagedKvStatus::InvalidArgument);
+    }));
+}
+
+TEST_CASE(PagedKvPoolFixture, rollback_retry_preserves_mixed_allocation_order) {
+    PagedKvPool pool(/*physical_block_count=*/5,
+                     /*max_sequences=*/2, /*block_size=*/1);
+    PagedKvSequenceHandle first;
+    CHECK(pool.acquire_reserved(1, 2, first) == PagedKvStatus::Ok);
+    CHECK(pool.append(first, 2));
+
+    PagedKvSequenceHandle victim;
+    CHECK(pool.acquire_reserved(2, 2, victim) == PagedKvStatus::Ok);
+    CHECK(pool.release(first) == PagedKvStatus::Ok);
+
+    const auto initial = pool.append(victim, 3);
+    CHECK(initial.status == PagedKvStatus::Ok);
+    CHECK(equals(sequence(pool, victim).block_table, {2, 3, 0}));
+
+    CHECK(pool.rollback_append(victim, 3) == PagedKvStatus::Ok);
+    const auto rolled_back = sequence(pool, victim);
+    CHECK(rolled_back.block_table.empty());
+    CHECK(rolled_back.reserved_block_count == 3);
+    CHECK(pool.free_block_count() == 2);
+    const auto retry = pool.append(victim, 3);
+    CHECK(retry.status == PagedKvStatus::Ok);
+    CHECK(equals(sequence(pool, victim).block_table, {2, 3, 0}));
+}
+
 TEST_CASE(PagedKvPoolFixture, noncontiguous_reuse_and_isolation) {
     PagedKvPool pool(6, 3, 16);
     const auto first = acquire(pool, 101);

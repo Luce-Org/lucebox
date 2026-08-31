@@ -14,6 +14,7 @@ namespace dflash::common {
 // member, so without this the cached graph would keep pointers to freed
 // selector weight tensors.
 void dflash2_selector_graph_invalidate();
+uint64_t dflash2_selector_graph_generation();
 
 // DFlash 2 candidate selector for greedy chain drafting.
 //
@@ -32,6 +33,19 @@ bool dflash2_select_chain(const DraftWeights & dw,
                           int q_len,
                           int32_t last_tok,
                           std::vector<int32_t> & draft_tok);
+
+// Same selector, batched over host-resident drafter hidden blocks and using a
+// local target lm_head tensor. The expensive lm_head projection covers every
+// (lane, depth) in one graph, GPU top-K is invoked once, and selector
+// projections/readback are shared across the cohort.
+bool dflash2_select_chains_batched(
+    const DraftWeights & dw,
+    ggml_backend_t backend,
+    ggml_tensor * lm_head,
+    const std::vector<const float *> & hidden_by_lane,
+    int q_len,
+    const std::vector<int32_t> & last_tokens,
+    std::vector<std::vector<int32_t>> & draft_tokens);
 
 // Selector-scored candidates for DDTree construction (DARTree-style): the
 // same per-position top-k + selector projections as the chain path, kept on

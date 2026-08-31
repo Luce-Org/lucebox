@@ -478,11 +478,13 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
             // implements the original mode and asserts if one reaches it.
             return ggml_get_op_params_i32(op, 0) == 0;
         case GGML_OP_GATED_DELTA_NET:
-            // The Specla GDN variant (op param 2 == 1) is stateful via HLD and is
-            // only supported by CUDA/HIP. Raw-gate mode is also CUDA/HIP-only:
-            // the CPU kernel expects beta/g to have already been transformed.
+            // The CPU kernel supports in-place and active-slot recurrence,
+            // but not tree parents, persistent intermediate storage, raw
+            // gates or SpecLA state.
             return ggml_get_op_params_i32(op, 2) != 1 &&
-                   ggml_get_op_params_i32(op, 10) == 0 && op->src[9] == nullptr;
+                   ggml_get_op_params_i32(op, 10) == 0 &&
+                   op->src[6] == nullptr && op->src[7] == nullptr &&
+                   op->src[9] == nullptr;
         case GGML_OP_OUT_PROD:
             return (src0->type == GGML_TYPE_F32 || (ggml_is_quantized(src0->type) && src0->ne[2] == src1->ne[2] && src0->ne[3] == src1->ne[3])) &&
                 src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;

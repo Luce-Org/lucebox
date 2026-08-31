@@ -28,6 +28,7 @@
 #include "qwen3_drafter.h"
 #include "gpu_runtime_compat.h"
 #include "chain_rollback_policy.h"
+#include "draft_swa.h"
 #include "platform_env.h"
 #include "laguna_daemon.h"  // arch dispatch - laguna targets are served by
                             // dflash::common::run_laguna_daemon() instead of the
@@ -442,13 +443,10 @@ static int run_target_layer_split_harness(
                         (dp.size() >= 5 && dp.substr(dp.size() - 5) == ".gguf")
                             ? "gguf" : "safetensors");
             if (g_draft_swa_window > 0) {
-                draft_weights.swa_window = g_draft_swa_window;
-                for (int il = 0; il < draft_weights.n_layer - 1; il++) {
-                    draft_weights.layers[il].is_swa = true;
-                }
+                const DraftSwaOverrideResult swa =
+                    apply_draft_swa_window_override(draft_weights, g_draft_swa_window);
                 std::printf("[target-split] draft SWA layers: %d/%d (window=%d)\n",
-                            draft_weights.n_layer - 1, draft_weights.n_layer,
-                            draft_weights.swa_window);
+                            swa.swa_layers, swa.total_layers, swa.effective_window);
             }
             if (!draft_feature_mirror_init(feature_ring, draft_backend,
                                            draft_gpu, draft_gpu, cap,
@@ -1282,14 +1280,12 @@ int main(int argc, char ** argv) {
         return 2;
     }
 
-    // Apply --draft-swa=N: mark layers 0..n-2 as SWA, last layer stays full.
+    // Apply the runtime window while preserving checkpoint layer metadata.
     if (g_draft_swa_window > 0) {
-        dw.swa_window = g_draft_swa_window;
-        for (int il = 0; il < dw.n_layer - 1; il++) {
-            dw.layers[il].is_swa = true;
-        }
+        const DraftSwaOverrideResult swa =
+            apply_draft_swa_window_override(dw, g_draft_swa_window);
         std::printf("[draft]  SWA layers: %d/%d (window=%d)\n",
-                    dw.n_layer - 1, dw.n_layer, dw.swa_window);
+                    swa.swa_layers, swa.total_layers, swa.effective_window);
     }
 
     const int max_ctx = g_max_ctx_override > 0
@@ -2375,9 +2371,7 @@ int main(int argc, char ** argv) {
                         stream_emit(-1); continue;
                     }
                     if (g_draft_swa_window > 0) {
-                        dw.swa_window = g_draft_swa_window;
-                        for (int il = 0; il < dw.n_layer - 1; il++)
-                            dw.layers[il].is_swa = true;
+                        apply_draft_swa_window_override(dw, g_draft_swa_window);
                     }
                     draft_parked = false;
                     std::printf("[unpark] draft restored\n"); std::fflush(stdout);
@@ -2487,9 +2481,7 @@ int main(int argc, char ** argv) {
                         stream_emit(-1); continue;
                     }
                     if (g_draft_swa_window > 0) {
-                        dw.swa_window = g_draft_swa_window;
-                        for (int il = 0; il < dw.n_layer - 1; il++)
-                            dw.layers[il].is_swa = true;
+                        apply_draft_swa_window_override(dw, g_draft_swa_window);
                     }
                     draft_parked = false;
                     std::printf("[compress] draft restored\n"); std::fflush(stdout);

@@ -138,10 +138,10 @@ static bool is_newline(uint32_t cp) {
 }
 
 // ─── Pre-tokenizer ─────────────────────────────────────────────────────
-// Matches the Qwen3.5 pattern:
+// Matches the Qwen/DeepSeek pattern:
 //   (?:'[sStTmMdD]|...) |
 //   [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+ |
-//   \p{N} |
+//   \p{N}{1,3} |
 //   ' '?[^\s\p{L}\p{M}\p{N}]+[\r\n]* |
 //   \s*[\r\n]+ |
 //   \s+(?!\S) |
@@ -213,9 +213,14 @@ std::vector<std::string> Tokenizer::pre_tokenize(const std::string & text) const
             }
         }
 
-        // Pattern 3: \p{N}  (single digit)
+        // Pattern 3: \p{N}{1,3}  (up to 3 digits)
         if (is_digit(cp)) {
-            pos += cplen;
+            int digit_count = 0;
+            while (digit_count < 3 && is_digit(cp)) {
+                pos += cplen;
+                digit_count++;
+                cp = peek_cp(pos, &cplen);
+            }
             pieces.push_back(text.substr(start, pos - start));
             continue;
         }
@@ -310,6 +315,17 @@ std::vector<std::string> Tokenizer::pre_tokenize(const std::string & text) const
 
 // ─── BPE encoding ──────────────────────────────────────────────────────
 
+// GPT-2 byte-level BPE maps printable byte ranges directly to codepoints,
+// and all other 68 non-printable bytes into U+0100..U+0143 (256..256+68).
+static constexpr uint32_t GPT2_BPE_OFFSET = 256;
+static constexpr uint32_t GPT2_BPE_NUM_RESERVED = 68;
+
+static inline bool is_gpt2_printable_byte(uint32_t b) {
+    return (b >= 33 && b <= 126) ||
+           (b >= 161 && b <= 172) ||
+           (b >= 174 && b <= 255);
+}
+
 // Forward GPT-2 byte encoding: raw byte → Unicode codepoint (UTF-8 string).
 // This is the inverse of gpt2_unicode_to_byte (defined later, near decode).
 // Bytes in {33-126, 161-172, 174-255} map to themselves as a codepoint;
@@ -320,12 +336,10 @@ static std::string byte_to_gpt2_unicode(uint8_t b) {
         std::array<uint32_t, 256> t{};
         int n = 0;
         for (int i = 0; i < 256; i++) {
-            if ((i >= 33  && i <= 126) ||
-                (i >= 161 && i <= 172) ||
-                (i >= 174 && i <= 255)) {
+            if (is_gpt2_printable_byte(i)) {
                 t[i] = (uint32_t)i;
             } else {
-                t[i] = 256 + n;
+                t[i] = GPT2_BPE_OFFSET + n;
                 n++;
             }
         }
@@ -478,13 +492,13 @@ std::vector<int32_t> Tokenizer::bpe_encode_piece(const std::string & piece) cons
             // back to the original byte before emitting <0xNN>.
             static const auto gpt2_rev = []() {
                 // Build reverse table: codepoint → original byte.
-                std::array<uint8_t, 324> t{};  // covers U+0000..U+0143
+                std::array<uint8_t, GPT2_BPE_OFFSET + GPT2_BPE_NUM_RESERVED> t{};  // covers U+0000..U+0143
                 int n = 0;
                 for (int b = 0; b < 256; b++) {
-                    if ((b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174 && b <= 255)) {
+                    if (is_gpt2_printable_byte(b)) {
                         t[b] = (uint8_t)b;
                     } else {
-                        t[256 + n] = (uint8_t)b;
+                        t[GPT2_BPE_OFFSET + n] = (uint8_t)b;
                         n++;
                     }
                 }
@@ -496,9 +510,9 @@ std::vector<int32_t> Tokenizer::bpe_encode_piece(const std::string & piece) cons
                 int cplen;
                 uint32_t cp = utf8_decode(p, (size_t)(end - p), &cplen);
                 uint8_t orig_byte;
-                if ((cp >= 33 && cp <= 126) || (cp >= 161 && cp <= 172) || (cp >= 174 && cp <= 255)) {
+                if (is_gpt2_printable_byte(cp)) {
                     orig_byte = (uint8_t)cp;
-                } else if (cp >= 256 && cp < 256 + 68) {
+                } else if (cp >= GPT2_BPE_OFFSET && cp < GPT2_BPE_OFFSET + GPT2_BPE_NUM_RESERVED) {
                     orig_byte = gpt2_rev[cp];
                 } else {
                     orig_byte = '?';
@@ -693,27 +707,23 @@ std::vector<int32_t> Tokenizer::encode(const std::string & text) const {
 
 static uint8_t gpt2_unicode_to_byte(uint32_t cp) {
     // Direct-mapped ranges: the codepoint IS the byte.
-    if ((cp >= 33  && cp <= 126) ||
-        (cp >= 161 && cp <= 172) ||
-        (cp >= 174 && cp <= 255)) {
+    if (is_gpt2_printable_byte(cp)) {
         return (uint8_t)cp;
     }
     // Offset-mapped range: U+0100..U+0143 → non-printable bytes.
     // Build the reverse table once (thread-safe via C++11 static init).
     static const auto table = []() {
-        std::array<uint8_t, 68> t{};
+        std::array<uint8_t, GPT2_BPE_NUM_RESERVED> t{};
         int n = 0;
         for (int b = 0; b < 256; b++) {
-            if ((b >= 33  && b <= 126) ||
-                (b >= 161 && b <= 172) ||
-                (b >= 174 && b <= 255)) continue;
+            if (is_gpt2_printable_byte(b)) continue;
             t[n] = (uint8_t)b;
             n++;
         }
         return t;
     }();
-    if (cp >= 256 && cp < 256 + 68) {
-        return table[cp - 256];
+    if (cp >= GPT2_BPE_OFFSET && cp < GPT2_BPE_OFFSET + GPT2_BPE_NUM_RESERVED) {
+        return table[cp - GPT2_BPE_OFFSET];
     }
     // Shouldn't happen for valid BPE tokens — return replacement.
     return '?';
@@ -727,7 +737,14 @@ static std::string decode_gpt2_bpe(const std::string & tok) {
     while (p < end) {
         int cplen;
         uint32_t cp = utf8_decode(p, (size_t)(end - p), &cplen);
-        out.push_back((char)gpt2_unicode_to_byte(cp));
+        if (is_gpt2_printable_byte(cp)) {
+            out.push_back((char)cp);
+        } else if (cp >= GPT2_BPE_OFFSET && cp < GPT2_BPE_OFFSET + GPT2_BPE_NUM_RESERVED) {
+            out.push_back((char)gpt2_unicode_to_byte(cp));
+        } else {
+            // Raw Unicode codepoint (e.g. U+FF5C '｜', U+2581 '▁') — emit raw bytes
+            out.append(p, cplen);
+        }
         p += cplen;
     }
     return out;

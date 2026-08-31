@@ -2,6 +2,7 @@
 #include "concurrency/qwen35_seq_engine.h"
 #include "common/chain_rollback_policy.h"
 #include "common/draft_block_size.h"
+#include "common/draft_swa.h"
 #include "placement/skip_park_guard.h"
 #include "qwen35_dflash_target.h"
 #include "graph_builders.h"
@@ -180,7 +181,8 @@ static FILE * open_dflash_floor_log() {
 // staging K/V or staging recurrent slab to reserve.
 static int64_t concurrent_fixed_cache_bytes(
         const TargetWeights & w, int max_ctx, int n_slots,
-        int64_t kv_bytes_per_token) {
+        int64_t kv_bytes_per_token, int64_t scratch_tokens,
+        bool fixed_chain) {
     const int64_t n_full_attn =
         w.n_layer / w.full_attention_interval;
     const int64_t n_delta = w.n_layer - n_full_attn;
@@ -195,7 +197,10 @@ static int64_t concurrent_fixed_cache_bytes(
         state_per_layer * n_delta * (int64_t)n_slots;
     const int64_t target_feat =
         (int64_t)w.n_capture_layers * w.n_embd *
-        std::min(max_ctx, 4096) * (int64_t)sizeof(uint16_t);
+        (fixed_chain
+             ? (int64_t)std::min(max_ctx, 4096) * n_slots + 1
+             : (int64_t)std::min(max_ctx, 4096)) *
+        (int64_t)sizeof(uint16_t);
     const int64_t q_capture =
         (int64_t)w.n_embd_head_k * w.n_head * n_full_attn *
         (int64_t)sizeof(float);
@@ -203,7 +208,7 @@ static int64_t concurrent_fixed_cache_bytes(
         ((int64_t)paged_block_count(max_ctx) * n_slots + n_slots) *
         (int64_t)sizeof(int32_t);
     const int64_t scratch =
-        kv_bytes_per_token * PAGED_BLOCK_SIZE;
+        kv_bytes_per_token * scratch_tokens;
     return recurrent + target_feat + q_capture +
            paged_metadata + scratch;
 }
@@ -358,11 +363,10 @@ bool Qwen35Backend::init() {
         apply_drafter_capture_layer_ids(dw_, w_);
 
         if (cfg_.draft_swa_window > 0) {
-            dw_.swa_window = cfg_.draft_swa_window;
-            for (int il = 0; il < dw_.n_layer - 1; il++)
-                dw_.layers[il].is_swa = true;
+            const DraftSwaOverrideResult swa =
+                apply_draft_swa_window_override(dw_, cfg_.draft_swa_window);
             std::printf("[draft]  SWA layers: %d/%d (window=%d)\n",
-                        dw_.n_layer - 1, dw_.n_layer, dw_.swa_window);
+                        swa.swa_layers, swa.total_layers, swa.effective_window);
         }
 
         // Legacy 8-layer drafter YaRN from config flags. Applied here AND in
@@ -466,6 +470,28 @@ bool Qwen35Backend::init() {
         set_last_error("--max-concurrency requires --paged-attention");
         return false;
     }
+    FixedChainConfig fixed_chain;
+    fixed_chain.enabled =
+        n_slots > 1 && cfg_.paged_attention && cfg_.fa_window == 0 &&
+        cfg_.draft_path && !cfg_.ddtree_mode && !use_remote_draft &&
+        !tensor_parallel && !split_gpus_ &&
+        target_backend_ == draft_backend_ &&
+        cfg_.device.gpu == cfg_.draft_gpu &&
+        dw_.selector.enabled && dw_.block_size > 1 &&
+        dw_.block_size <= 16 && w_.output;
+    if (fixed_chain.enabled) {
+        fixed_chain.width = dw_.block_size;
+        fixed_chain.scratch_stride = paged_token_capacity(fixed_chain.width);
+    }
+    if (n_slots > 1 && cfg_.draft_path && !fixed_chain.enabled) {
+        set_last_error(
+            "concurrent paged DFlash2 requires a selector-enabled local "
+            "same-device draft with block size in [2, 16] and a target "
+            "lm_head");
+        return false;
+    }
+    const int64_t scratch_tokens = PAGED_BLOCK_SIZE +
+        (int64_t)n_slots * fixed_chain.scratch_stride;
     // Concurrent slots share one physical pool. An explicit
     // --kv-pool-tokens is rounded up to a whole block; otherwise capacity is
     // derived from device-free memory after subtracting fixed concurrent cache
@@ -476,9 +502,12 @@ bool Qwen35Backend::init() {
     int64_t pool_tokens = 0;
     if (n_slots > 1) {
         if (cfg_.kv_pool_tokens > 0) {
+            const int64_t max_pool_tokens =
+                ((int64_t)INT32_MAX - scratch_tokens) /
+                PAGED_BLOCK_SIZE * PAGED_BLOCK_SIZE;
             pool_tokens = (int64_t)paged_token_capacity(
                 (int)std::min<int64_t>(
-                    cfg_.kv_pool_tokens, INT32_MAX - PAGED_BLOCK_SIZE));
+                    cfg_.kv_pool_tokens, max_pool_tokens));
         } else {
             PagedKvAutoBudget budget;
             // TODO: Size tensor-parallel pools from each device's free memory
@@ -487,7 +516,8 @@ bool Qwen35Backend::init() {
             budget.bytes_per_token = kvf_budget.bytes_per_token;
             budget.reserve_bytes = kvf_budget.reserve_bytes;
             budget.fixed_cache_bytes = concurrent_fixed_cache_bytes(
-                w_, cfg_.device.max_ctx, n_slots, budget.bytes_per_token);
+                w_, cfg_.device.max_ctx, n_slots, budget.bytes_per_token,
+                scratch_tokens, fixed_chain.enabled);
             pool_tokens = paged_kv_auto_pool_tokens(
                 cfg_.device.max_ctx, n_slots, budget);
             const int64_t one_context =
@@ -509,19 +539,20 @@ bool Qwen35Backend::init() {
                 return false;
             }
         }
-        if (pool_tokens + PAGED_BLOCK_SIZE > INT32_MAX) {
+        if (pool_tokens + scratch_tokens > INT32_MAX) {
             set_last_error("paged KV pool exceeds INT32_MAX tokens");
             return false;
         }
     }
     const int ctx_alloc = n_slots > 1
-        ? (int)(pool_tokens + PAGED_BLOCK_SIZE)
+        ? (int)(pool_tokens + scratch_tokens)
         : (cfg_.paged_attention
                ? paged_token_capacity(cfg_.device.max_ctx)
                : kvflash_tokens_);
     if (!create_target_cache(w_, cfg_.device.max_ctx, max_verify_tokens, target_backend_, cache_,
                              /*prefill_only=*/true, ctx_alloc,
-                             cfg_.paged_attention, n_slots)) {
+                             cfg_.paged_attention, n_slots,
+                             fixed_chain.enabled)) {
         std::fprintf(stderr, "cache: %s\n", dflash27b_last_error());
         return false;
     }
@@ -553,12 +584,21 @@ bool Qwen35Backend::init() {
             return false;
         }
         if (n_slots > 1) {
+            fixed_chain.scratch_base = (int)pool_tokens;
+            const int64_t dead_scratch_row = pool_tokens +
+                (int64_t)n_slots * fixed_chain.scratch_stride;
             seq_engine_ = std::make_unique<Qwen35SeqEngine>(
                 *this, *paged_kv_pool_, cfg_.device.max_ctx,
-                /*scratch_row=*/pool_tokens,
+                dead_scratch_row, fixed_chain,
                 max_concurrent_prefills, mixed_prefill_tokens,
                 long_mixed_prefill_tokens, long_prefill_threshold,
                 idle_prefill_tokens, prefill_quantum);
+            if (fixed_chain.enabled) {
+                std::fprintf(stderr,
+                    "[parallel-chain] fixed DFlash2 width=%d, "
+                    "same-device paged full-attention greedy lanes\n",
+                    fixed_chain.width);
+            }
             std::printf("[parallel] %d decode slots, up to %d packed prefills "
                         "(mixed short/long %d/%d at >=%d tokens, "
                         "idle %d, quantum %d), "
@@ -611,7 +651,8 @@ bool Qwen35Backend::init() {
 
     // Init feature mirror when draft model is available (needed for spec decode).
     // On single-GPU, this is an F32 conversion buffer; on split-GPU, a cross-device mirror.
-    if (cfg_.draft_path && !use_remote_draft) {
+    if (cfg_.draft_path && !use_remote_draft &&
+        !fixed_chain.enabled) {
         const int mirror_cap = std::min({cfg_.draft_ctx_max, cfg_.device.max_ctx,
                                          cache_.target_feat_cap > 0 ? cache_.target_feat_cap : cfg_.device.max_ctx});
         if (!draft_feature_mirror_init(feature_mirror_, draft_backend_,
@@ -836,13 +877,17 @@ bool Qwen35Backend::park(ParkTarget target) {
             remote_draft_.close();
         } else {
             step_graph_destroy(draft_sg_);
+            if (seq_engine_) seq_engine_->release_draft_graphs();
+            draft_kv_free(draft_kv_);
             free_draft_weights(dw_);
         }
         draft_parked_ = true;
         std::printf("[park] draft released\n"); std::fflush(stdout);
     }
     if (want_target_model && !target_parked_) {
+        step_graph_destroy(sg_);
         step_graph_destroy(proj_sg_);
+        dflash2_selector_graph_invalidate();
         free_target_weights(w_);
         target_parked_ = true;
         std::printf("[park] target released\n"); std::fflush(stdout);
@@ -897,9 +942,10 @@ bool Qwen35Backend::unpark(ParkTarget target) {
                 dw_.rope_n_ctx_orig = cfg_.draft_yarn_orig_ctx;
             }
             if (cfg_.draft_swa_window > 0) {
-                dw_.swa_window = cfg_.draft_swa_window;
-                for (int il = 0; il < dw_.n_layer - 1; il++)
-                    dw_.layers[il].is_swa = true;
+                const DraftSwaOverrideResult swa =
+                    apply_draft_swa_window_override(dw_, cfg_.draft_swa_window);
+                std::printf("[unpark] draft SWA layers: %d/%d (window=%d)\n",
+                            swa.swa_layers, swa.total_layers, swa.effective_window);
             }
             // Re-apply the runtime block-size override: without this a
             // park/unpark cycle silently reverts to checkpoint metadata
@@ -911,6 +957,9 @@ bool Qwen35Backend::unpark(ParkTarget target) {
                 dw_.block_size = cfg_.draft_block_size;
             }
         }
+        // A reloaded drafter can select different target capture layers.
+        // Rebuild any retained target graph against the refreshed mapping.
+        step_graph_free(sg_);
         draft_parked_ = false;
         std::printf("[unpark] draft restored\n"); std::fflush(stdout);
     }
@@ -1265,6 +1314,7 @@ DFlashTarget * Qwen35Backend::dflash_target() {
 
 void Qwen35Backend::shutdown() {
     const bool use_remote_draft = cfg_.remote_draft.enabled();
+    seq_engine_.reset();
     end_paged_sequence();
     free_drafter();
     step_graph_destroy(sg_);
@@ -1317,7 +1367,17 @@ void Qwen35Backend::release_scratch() {
     flashprefill::dflash_bsa_free_persistent();
 #endif
 
-    std::fprintf(stderr, "[vram] released scratch buffers\n");
+    // Gallocr teardown does not release operator temporaries cached by the
+    // legacy CUDA/HIP pools. On non-VMM devices a long prefill can otherwise
+    // leave nearly all VRAM reserved and make the next differently shaped
+    // request fail despite having no live scratch tensors.
+    size_t trimmed = ggml_backend_cuda_trim_pool(target_backend_);
+    if (draft_backend_ && draft_backend_ != target_backend_) {
+        trimmed += ggml_backend_cuda_trim_pool(draft_backend_);
+    }
+
+    std::fprintf(stderr, "[vram] released scratch buffers; trimmed %.1f MiB from device pools\n",
+                 trimmed / (1024.0 * 1024.0));
 }
 
 // ── Generate (speculative decode) ───────────────────────────────────────
@@ -1556,7 +1616,8 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
         const bool pool = kvflash_active();
         if (!build_target_step(sg_, w_, cache_, target_backend_,
                                /*kv_start=*/cache_.cur_pos, /*n_tokens=*/1,
-                               /*with_mask=*/pool, /*capture=*/false,
+                               /*with_mask=*/pool || w_.is_bailingmoe3,
+                               /*capture=*/false,
                                /*capture_delta_intermediate=*/false,
                                /*fa_window=*/0,
                                /*logits_tail_rows=*/0,
@@ -2195,7 +2256,8 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
         const bool paged = cfg_.paged_attention;
         if (!build_target_step(sg_, w_, cache_, target_backend_,
                                /*kv_start=*/committed, /*n_tokens=*/1,
-                               /*with_mask=*/pool, /*capture=*/false,
+                               /*with_mask=*/pool || w_.is_bailingmoe3,
+                               /*capture=*/false,
                                /*capture_delta_intermediate=*/false,
                                /*fa_window=*/0,
                                /*logits_tail_rows=*/0,
@@ -2231,7 +2293,12 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
             ggml_backend_tensor_set(sg_.kv_write_rows, row_vals.data(), 0,
                                     sizeof(int64_t) * n_head_kv);
         }
-        if (pool) kvflash_upload_mask();
+        if (pool) {
+            kvflash_upload_mask();
+        } else if (w_.is_bailingmoe3) {
+            upload_qwen35_causal_mask(
+                sg_.attn_mask, committed, 1, cfg_.kq_stride_pad);
+        }
 
         auto st = ggml_backend_graph_compute(target_backend_, sg_.gf);
         if (st != GGML_STATUS_SUCCESS) return false;

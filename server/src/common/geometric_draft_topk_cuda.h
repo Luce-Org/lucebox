@@ -25,6 +25,10 @@
 
 namespace dflash::common {
 
+inline constexpr bool geometric_draft_topk_cuda_supports_k(int K) noexcept {
+    return (K >= 1 && K <= 8) || K == 12 || K == 16;
+}
+
 // d_logits: device pointer to row-major [n_positions][vocab] f32 logits (the
 //           position stride is `vocab` floats — pass an offset pointer to skip
 //           leading positions). out_* are HOST buffers of size n_positions*K.

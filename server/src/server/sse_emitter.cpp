@@ -115,6 +115,27 @@ SseEmitter::SseEmitter(ApiFormat format,
     }
 }
 
+bool SseEmitter::suppress_undeclared_tool_protocol_token(
+        const std::string & raw_token) {
+    if (has_request_tools(tools_)) return false;
+
+    if (raw_token == "<tool_call>") {
+        suppress_undeclared_tool_protocol_ = true;
+        return true;
+    }
+    if (suppress_undeclared_tool_protocol_) {
+        if (raw_token == "</tool_call>") {
+            suppress_undeclared_tool_protocol_ = false;
+        }
+        return true;
+    }
+
+    // Stray protocol delimiters are control tokens, not assistant content.
+    return raw_token == "</tool_call>" ||
+           raw_token == "<arg_key>" || raw_token == "</arg_key>" ||
+           raw_token == "<arg_value>" || raw_token == "</arg_value>";
+}
+
 // ─── SSE formatting helpers ─────────────────────────────────────────────
 
 std::string SseEmitter::sse_data(const std::string & json_str) {
@@ -581,11 +602,13 @@ static size_t find_top_level_think_close(const std::string & buf, const json & t
     };
 
     auto is_tool_tag = [&](const std::string & name) {
-        if (name == "tool_call" || name == "function_call" ||
-            name == "function_calls" || name == "function" ||
-            name == "invoke" || name == "parameter" || name == "param" ||
-            name == "arguments" || name == "params" || name == "tool_code" ||
-            name == "funcname") {
+        if (name.rfind("｜DSML｜", 0) == 0) return true;
+        if (name == "tool_call" || name == "tool_calls" ||
+            name == "function_call" || name == "function_calls" ||
+            name == "function" || name == "invoke" ||
+            name == "parameter" || name == "param" ||
+            name == "arguments" || name == "params" ||
+            name == "tool_code" || name == "funcname") {
             return true;
         }
         if (tools.is_array()) {
@@ -740,6 +763,29 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
         tool_calls_ = std::move(parsed.tool_calls);
 
         if (!tool_calls_.empty()) {
+            static const bool log_tools = []() {
+                const char * e = std::getenv("DFLASH_LOG_TOOL_CALLS");
+                if (!e || !*e) return false;
+                std::string v(e);
+                std::transform(v.begin(), v.end(), v.begin(),
+                               [](unsigned char c) { return (char)std::tolower(c); });
+                return v != "0" && v != "false" && v != "no" && v != "off";
+            }();
+            if (log_tools) {
+                std::string escaped_buf = escape_for_logging(tool_buffer_);
+                std::fprintf(stderr,
+                    "[server] [tool_call] request_id=%s count=%zu bytes=%zu raw='%s'\n",
+                    request_id_.c_str(), tool_calls_.size(), tool_buffer_.size(),
+                    escaped_buf.c_str());
+                for (size_t i = 0; i < tool_calls_.size(); ++i) {
+                    const auto & tc = tool_calls_[i];
+                    std::string escaped_args = escape_for_logging(tc.arguments);
+                    std::fprintf(stderr,
+                        "[server] [tool_call]   [%zu] name='%s' id='%s' args='%s'\n",
+                        i, tc.name.c_str(), tc.id.c_str(), escaped_args.c_str());
+                }
+            }
+
             // Remember for tool memory
             if (tool_memory_) {
                 std::vector<std::string> ids;
