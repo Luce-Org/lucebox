@@ -4,6 +4,7 @@
 #include "common/sha1.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <chrono>
@@ -119,6 +120,7 @@ std::vector<int> find_all_boundaries(const std::vector<int32_t> & ids,
     if (sys_idx < 0) return out;
 
     int cursor = sys_idx + (int)markers.sys_role_prefix.size();
+    int stray_skips = 0;
     while (true) {
         auto [end_idx, end_len] = find_first_seq_any(ids, markers.end_msg_seqs, cursor);
         if (end_idx < 0) break;
@@ -136,10 +138,24 @@ std::vector<int> find_all_boundaries(const std::vector<int32_t> & ids,
             }
         }
         found:
-        if (next_match < 0) break;
+        if (next_match < 0) {
+            // Stray end-of-message marker with no following role start — chatml
+            // tokens embedded in message content (file dumps, terminal output,
+            // model-echoed markers). Skip this marker and keep scanning instead
+            // of truncating the whole boundary list. A lone stray previously cut
+            // the walk off here, hiding every real boundary after it; that pinned
+            // the inline-snapshot deepen target (second-to-last boundary) at the
+            // already-restored prefix length, so no snapshot was ever deepened and
+            // every turn re-prefilled the entire tail. Guard against pathological
+            // input (or a marker-family mismatch) by capping consecutive strays.
+            if (++stray_skips > 8192) break;
+            cursor = after_end;
+            continue;
+        }
         int boundary = next_match + next_len;
         out.push_back(boundary);
         cursor = boundary;
+        stray_skips = 0;
     }
     return out;
 }
@@ -385,7 +401,22 @@ std::pair<int, int> PrefixCache::prepare_inline_snap(
         target_cut = select_inline_snapshot_boundary(
             candidates, restored_prefix_len, prefer_tools_boundary);
     }
-    if (target_cut <= 0) return {-1, 0};
+    if (target_cut <= 0) {
+        // An expected no-op when the restored prefix already covers the next
+        // boundary (single-turn prompts, or a cache-primed conversation): log
+        // once only, so the diagnostic — a truncated boundary list from stray
+        // chatml in content — stays visible without flooding long runs. The
+        // HTTP layer may retry within a request, so this can otherwise fire
+        // twice per turn.
+        static std::atomic<bool> s_snap_blocked_logged{false};
+        if (!s_snap_blocked_logged.exchange(true)) {
+            std::fprintf(stderr,
+                "[pc] inline snap blocked: boundaries=%zu restored=%d target<=0 "
+                "(deepen target not past restored prefix; logged once)\n",
+                candidates.size(), restored_prefix_len);
+        }
+        return {-1, 0};
+    }
 
     auto key = hash_prefix(prompt_ids.data(), target_cut);
     if (find_entry(key) >= 0) return {-1, 0};  // already cached

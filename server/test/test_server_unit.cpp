@@ -2197,6 +2197,58 @@ TEST_CASE(ServerUnitFixture, test_tool_schema_is_part_of_stable_system_boundary)
                 hash_prefix(prompt_new_tools.data(), system_end));
 }
 
+TEST_CASE(ServerUnitFixture, test_find_boundaries_stray_end_msg_does_not_truncate) {
+    // A lone end-of-message marker embedded in message content (file dumps,
+    // terminal output, model-echoed chatml) must not truncate the boundary
+    // walk. Before the fix, the first stray \n with no role start within 5
+    // tokens cut the scan off, hiding every real boundary after it and pinning
+    // the inline-snapshot deepen target at the already-restored prefix length.
+    //
+    // Layout (qwen-shaped synthetic markers):
+    //   10=<|im_start|>  11="system"  12=<|im_end|>
+    //   idx: 0:10 1:11 2:100 3:12 4:10 5:20 6:200 7:12(stray) 8:600 9:601
+    //         10:602 11:603 12:604 13:12 14:10 15:30 16:300 17:12 18:10 19:40 20:400
+    // The stray 12 at idx 7 has five content tokens before the next real <|im_end|>
+    // (idx 13), so its 5-token window holds no <|im_start|>.
+    ChatMarkers markers;
+    markers.family = "qwen";
+    markers.sys_role_prefix = {10, 11};
+    markers.end_msg_seqs = {{12}};
+    markers.next_role_starts = {{10}};
+
+    const std::vector<int32_t> prompt = {
+        10, 11, 100, 12, 10, 20, 200,
+        12,             // stray <|im_end|> in user content
+        600, 601, 602, 603, 604,
+        12,             // real end of the user message
+        10, 30, 300, 12, 10, 40, 400,
+    };
+
+    const auto bounds = find_all_boundaries(prompt, markers);
+    // Real boundaries after the stray (assistant start = 15, final user start =
+    // 19) must be found; the stable system head (5) is unchanged.
+    TEST_ASSERT(bounds == (std::vector<int>{5, 15, 19}));
+    TEST_ASSERT(bounds.front() == 5);
+}
+
+TEST_CASE(ServerUnitFixture, test_find_boundaries_clean_prompt_unchanged) {
+    // A clean prompt (no stray markers) must produce the identical boundary
+    // list as before the fix — the stray-skip path must never alter correct
+    // prompts.
+    ChatMarkers markers;
+    markers.family = "qwen";
+    markers.sys_role_prefix = {10, 11};
+    markers.end_msg_seqs = {{12}};
+    markers.next_role_starts = {{10}};
+
+    //  system content  user content  assistant content  user2
+    const std::vector<int32_t> prompt = {
+        10, 11, 100, 101, 12, 10, 20, 200, 12, 10, 30, 300, 12, 10, 40,
+    };
+    const auto bounds = find_all_boundaries(prompt, markers);
+    TEST_ASSERT(bounds == (std::vector<int>{6, 10, 14}));
+}
+
 TEST_CASE(ServerUnitFixture, test_inline_snapshot_boundary_advances_past_restore) {
     const std::vector<int> boundaries = {100, 240, 380, 520};
     // Second-to-last is the boundary before the current user turn.
