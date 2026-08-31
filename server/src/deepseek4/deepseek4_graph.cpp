@@ -6301,9 +6301,6 @@ static int ds4_try_layer_major_prefill(
     const int64_t hc_dim = (int64_t) n_embd * n_hc;
     const int64_t mix_dim = 2 * (int64_t) n_hc + (int64_t) n_hc * n_hc;
     const int next_pos = kv_start + n_tokens;
-    size_t retained_f32_bytes = 0;
-    size_t scratch_bytes = 0;
-
     const std::vector<int> * capture_layer_ids =
         verify_hooks ? verify_hooks->capture_layer_ids : nullptr;
     std::vector<float> * capture_out =
@@ -6487,8 +6484,6 @@ static int ds4_try_layer_major_prefill(
                 !ggml_gallocr_alloc_graph(alloc, layer.gf)) {
                 return fail("cached scratch allocation failed", il);
             }
-            scratch_bytes = std::max(
-                scratch_bytes, ggml_gallocr_get_buffer_size(alloc, 0));
             if (telemetry) {
                 telemetry->full_graph_build_us += ds4_elapsed_us(
                     alloc_t0, Ds4TimingClock::now());
@@ -6506,7 +6501,6 @@ static int ds4_try_layer_major_prefill(
                                         sizeof(int64_t) * b.values.size());
             }
             for (const auto & b : layer.f32_array_inputs) {
-                retained_f32_bytes += sizeof(float) * b.values.size();
                 ggml_backend_tensor_set(b.tensor, b.values.data(), 0,
                                         sizeof(float) * b.values.size());
             }
@@ -6553,13 +6547,6 @@ static int ds4_try_layer_major_prefill(
             }
         }
         cache.cur_pos = next_pos;
-        if (telemetry) {
-            std::fprintf(stderr,
-                         "[deepseek4-timing] layer-major kv_start=%d "
-                         "tokens=%d f32_bindings=%zu scratch=%zu cache=hit\n",
-                         kv_start, n_tokens, retained_f32_bytes,
-                         scratch_bytes);
-        }
         return out_logits.empty() ? -1 : 1;
     }
 
@@ -6726,8 +6713,6 @@ static int ds4_try_layer_major_prefill(
             if (!cached_layer) ggml_free(ctx);
             return fail("scratch allocation failed", il);
         }
-        scratch_bytes = std::max(
-            scratch_bytes, ggml_gallocr_get_buffer_size(alloc, 0));
         for (const auto & b : i32_inputs) {
             ggml_backend_tensor_set(b.tensor, &b.value, 0, sizeof(b.value));
         }
@@ -6740,7 +6725,6 @@ static int ds4_try_layer_major_prefill(
                                     sizeof(int64_t) * b.values.size());
         }
         for (const auto & b : f32_array_inputs) {
-            retained_f32_bytes += sizeof(float) * b.values.size();
             ggml_backend_tensor_set(b.tensor, b.values.data(), 0,
                                     sizeof(float) * b.values.size());
         }
@@ -6800,13 +6784,6 @@ static int ds4_try_layer_major_prefill(
         std::swap(state_in, state_out);
     }
 
-    if (telemetry) {
-        std::fprintf(stderr,
-                     "[deepseek4-timing] layer-major kv_start=%d tokens=%d "
-                     "f32_bindings=%zu scratch=%zu cache=%s\n",
-                     kv_start, n_tokens, retained_f32_bytes, scratch_bytes,
-                     cache_build ? "built" : "uncached");
-    }
     if (cache_build) {
         graph_cache->ready = true;
     } else {
