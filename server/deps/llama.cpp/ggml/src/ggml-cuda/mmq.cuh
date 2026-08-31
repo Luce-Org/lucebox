@@ -1062,17 +1062,43 @@ static __device__ __forceinline__ void load_tiles_rocmfpx_dual(
         }
 
         const block_t * block = (const block_t *) x + kbx0 + i*stride + kbx;
-        const int k0 = kbx*groups_per_block + group;
-        const int q0 = traits::pack4(block, 4*group);
-        const int q1 = traits::pack4(
-            block, 4*(group + groups_per_block/2));
+        int k0;
+        int q0;
+        int q1;
+        int q1_offset;
+        if constexpr (type == GGML_TYPE_Q3_0_ROCMFPX) {
+            // Eight FP3 weights occupy exactly three bytes. Assign adjacent
+            // four-value groups to one lane so the wave reads every packed
+            // byte once instead of overlapping the two-byte group windows.
+            const int byte = 3*group;
+#if defined(GGML_USE_HIP)
+            uint32_t packed32;
+            __builtin_memcpy(&packed32, block->qs + byte, sizeof(packed32));
+            const uint32_t bits24 = packed32 & 0x00ffffffu;
+#else
+            const uint32_t bits24 =
+                (uint32_t) block->qs[byte + 0] |
+                ((uint32_t) block->qs[byte + 1] << 8) |
+                ((uint32_t) block->qs[byte + 2] << 16);
+#endif
+            k0 = kbx*groups_per_block + 2*group;
+            q0 = rocmfpx_pack4_fp3_bits12_vec_cuda(bits24 & 0x0fffu);
+            q1 = rocmfpx_pack4_fp3_bits12_vec_cuda((bits24 >> 12) & 0x0fffu);
+            q1_offset = 1;
+        } else {
+            k0 = kbx*groups_per_block + group;
+            q0 = traits::pack4(block, 4*group);
+            q1 = traits::pack4(
+                block, 4*(group + groups_per_block/2));
+            q1_offset = groups_per_block/2;
+        }
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
         x_qs[i*MMQ_MMA_TILE_X_K_Q3_K + k0]                      = q0;
-        x_qs[i*MMQ_MMA_TILE_X_K_Q3_K + k0 + groups_per_block/2] = q1;
+        x_qs[i*MMQ_MMA_TILE_X_K_Q3_K + k0 + q1_offset]          = q1;
 #else
         x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0]                      = q0;
-        x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0 + groups_per_block/2] = q1;
+        x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0 + q1_offset]          = q1;
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
 
     }
