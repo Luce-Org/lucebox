@@ -22,8 +22,8 @@ jobs:
     name: uv workspace (lock + sync + import smoke)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           version: "0.11.x"
       - name: Verify uv lockfile and workspace sync
@@ -41,12 +41,12 @@ jobs:
     name: Build (cmake + uv sync --extra megakernel)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
           token: ${{ secrets.SUBMODULE_PAT || secrets.GITHUB_TOKEN }}
 
-      - uses: Jimver/cuda-toolkit@3d45d157f327c09c04b50ee6ccdea2d9d017ec76 # v0.2.35
+      - uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
         with:
           # Keep the existing upstream CUDA toolkit version; the uv workspace
           # only replaces Python environment setup.
@@ -66,7 +66,7 @@ jobs:
             echo "LD_LIBRARY_PATH=$RUNNER_TEMP/cuda-stubs:/usr/local/cuda-12.8/targets/x86_64-linux/lib/stubs:/usr/local/cuda-12.8/lib64"
           } >> "$GITHUB_ENV"
 
-      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           version: "0.11.x"
           # uv reads .python-version (3.12, matching the previous CI) and downloads the matching
@@ -180,7 +180,7 @@ jobs:
       group: ${{ matrix.concurrency_group }}
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
           token: ${{ secrets.SUBMODULE_PAT || secrets.GITHUB_TOKEN }}
@@ -291,7 +291,7 @@ jobs:
       group: lucebox3-${{ matrix.concurrency_key }}-runner
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: KFD health (diagnose instead of hanging)
         # rocminfo on a wedged KFD blocks in uninterruptible sleep and eats
@@ -386,18 +386,18 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
           token: ${{ secrets.SUBMODULE_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Set up MSVC Developer Command Prompt
-        uses: ilammy/msvc-dev-cmd@a102174a2b586eec2ea151a69e6fd14404a8ce7c # v1.13.0
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
         with:
           arch: x64
 
       - name: Set up CUDA Toolkit 12.8
-        uses: Jimver/cuda-toolkit@3d45d157f327c09c04b50ee6ccdea2d9d017ec76 # v0.2.35
+        uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
         with:
           cuda: '12.8.0'
           method: network
