@@ -2816,6 +2816,10 @@ static bool ggml_cuda_try_fuse_mul_mat_glu(
         }
 
         const int64_t ncols = ids ? src1->ne[2] : src1->ne[1];
+        const bool override_selects_mmvq =
+            ggml_cuda_mmvq_max_ncols_override > 0 &&
+            ncols <= ggml_cuda_mmvq_max_ncols_override &&
+            (!ids || ncols <= get_mmvq_mmid_max_batch(src0->type, cc));
 #ifdef GGML_CUDA_FORCE_CUBLAS
         // The global force-cuBLAS policy is authoritative over this RDNA 3.5 default.
         constexpr bool default_ds4_mix_gate_up_mmq = false;
@@ -2823,14 +2827,15 @@ static bool ggml_cuda_try_fuse_mul_mat_glu(
         const char * mix_mmq = std::getenv("DFLASH_DS4_MIX_MMQ_PREFILL");
         const bool default_ds4_mix_gate_up_mmq =
             src0->type == GGML_TYPE_Q2_1_ROCMFP2_MIX &&
-            ids != nullptr &&
-            GGML_CUDA_CC_IS_RDNA3_5(cc) &&
-            (!mix_mmq || !(mix_mmq[0] == '0' && mix_mmq[1] == '\0'));
+             ids != nullptr &&
+             GGML_CUDA_CC_IS_RDNA3_5(cc) &&
+             (!mix_mmq || !(mix_mmq[0] == '0' && mix_mmq[1] == '\0'));
 #endif
-        if (default_ds4_mix_gate_up_mmq ||
+        if ((default_ds4_mix_gate_up_mmq ||
             ggml_cuda_should_use_mmq(
                 src0->type, cc, ncols,
-                ids ? src0->ne[2] : /*n_experts=*/0)) {
+                ids ? src0->ne[2] : /*n_experts=*/0)) &&
+            !override_selects_mmvq) {
             ggml_cuda_mul_mat_q_pair(
                 ctx, up->src[0], gate->src[0], src1, ids, up, gate);
             ggml_cuda_op_swiglu_ds4(ctx, glu);

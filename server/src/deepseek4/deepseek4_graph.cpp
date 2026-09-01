@@ -60,6 +60,15 @@ static bool ds4_env_flag(const char * name) {
     return value && value[0] && std::strcmp(value, "0") != 0;
 }
 
+static int ds4_exact_prefill_mmvq_max_ncols(bool exact_multi_token_band) {
+    if (!exact_multi_token_band) {
+        return 0;
+    }
+    const char * value = std::getenv("LUCE_MMVQ_MAX_NCOLS");
+    const int configured = value && value[0] ? std::atoi(value) : 4;
+    return configured > 0 ? std::min(configured, 4) : 4;
+}
+
 // F32 key/value-side accumulation protects the short-context quality baseline
 // while still avoiding a full-cache F16 -> F32 conversion once attention is
 // large enough for that conversion to dominate verifier time.
@@ -200,6 +209,28 @@ int deepseek4_previous_raw_ring_spans(
         spans[count++] = {0, current_row};
     }
     return count;
+}
+
+bool deepseek4_exact_tokenwise_uses_runtime_raw_row(
+        bool exact_prefill_stable_raw_order,
+        int token_position,
+        int n_swa) {
+    return exact_prefill_stable_raw_order && n_swa > 0 &&
+           token_position >= n_swa - 1;
+}
+
+int deepseek4_exact_prefill_hybrid_ffn_sub_batch(
+        bool exact_prefill_q1_ffn_order,
+        int n_tokens) {
+    // q=1..3 use the same reduced-stack MMVQ reduction order on gfx1151.
+    // Exactly four rows select a different kernel topology, so retain q=4
+    // prompt geometry while evaluating its independent FFN rows as q=3+q=1.
+    return exact_prefill_q1_ffn_order && n_tokens == 4 ? 3 : n_tokens;
+}
+
+bool deepseek4_exact_prefill_route_graph_requires_eager(
+        bool exact_prefill_q1_ffn_order) {
+    return exact_prefill_q1_ffn_order;
 }
 
 struct DeepSeek4I32InputBinding {
@@ -3904,12 +3935,13 @@ static void hc_pre_auto_into(float * working,
                     n_embd, n_hc, sinkhorn_iters, hc_eps, flat, mix_scratch, serial_fn);
 }
 
-static void hc_pre_batch(std::vector<float> & working,
+static bool hc_pre_batch(std::vector<float> & working,
                          std::vector<float> & post,
                          std::vector<float> & comb,
                          const float * hc_state,
                          const HcWeightsCpu & weights,
                          ggml_tensor * fn_tensor,
+                         int device,
                          int n_tokens,
                          int n_embd,
                          int n_hc,
@@ -3920,7 +3952,20 @@ static void hc_pre_batch(std::vector<float> & working,
     post.resize((size_t)n_tokens * (size_t)n_hc);
     comb.resize((size_t)n_tokens * (size_t)n_hc * (size_t)n_hc);
 
+    std::atomic<bool> device_ready{true};
     ds4_pool_for_tokens(n_tokens, [&](int t0, int t1) {
+#if defined(DFLASH27B_BACKEND_CUDA)
+        thread_local int selected_device = -1;
+        if (selected_device != device) {
+            if (!deepseek4_cuda_hc_set_device(device)) {
+                device_ready.store(false, std::memory_order_relaxed);
+                return;
+            }
+            selected_device = device;
+        }
+#else
+        (void) device;
+#endif
         std::vector<float> flat(hc_dim);
         float mix[24];
         for (int t = t0; t < t1; ++t) {
@@ -3939,6 +3984,7 @@ static void hc_pre_batch(std::vector<float> & working,
                              /*serial_fn=*/n_tokens > 1);
         }
     });
+    return device_ready.load(std::memory_order_relaxed);
 }
 
 static void cpu_hc_post(float * out_hc, const float * block_out,
@@ -5470,8 +5516,9 @@ static bool ds4_build_fused_decode_graph(
 
 #include "deepseek4_fused_verify.inc"
 
-// Returns 1 on success (out_logits filled), 0 to fall back to the per-layer
-// path, -1 on a hard failure after cache state may have been touched.
+// Returns 1 on success, 0 to fall back to the per-layer path, or -1 on a hard
+// failure after cache state may have been touched. The output graph always
+// executes; a null out_logits suppresses only the host vocabulary readback.
 static int ds4_try_fused_decode_step(
         DeepSeek4FusedDecodeCache & fc,
         ggml_backend_t backend,
@@ -5483,7 +5530,7 @@ static int ds4_try_fused_decode_step(
         std::vector<int32_t> & hash_scratch,
         const float * embed,
         int kv_start,
-        std::vector<float> & out_logits,
+        std::vector<float> * out_logits,
         const int32_t * token_ids,
         DeepSeek4StepTelemetry * telemetry) {
     if (fc.disabled) return 0;
@@ -5660,11 +5707,16 @@ static int ds4_try_fused_decode_step(
     if (telemetry) telemetry->full_graph_compute_us += ds4_elapsed_us(compute_t0, Ds4TimingClock::now());
 
     // ── Read logits ─────────────────────────────────────────────────
-    const auto read_t0 = Ds4TimingClock::now();
-    out_logits.resize((size_t) w.n_vocab);
-    ggml_backend_tensor_get(fg->logits, out_logits.data(), 0,
-                            sizeof(float) * (size_t) w.n_vocab);
-    if (telemetry) telemetry->full_graph_read_us += ds4_elapsed_us(read_t0, Ds4TimingClock::now());
+    if (out_logits) {
+        const auto read_t0 = Ds4TimingClock::now();
+        out_logits->resize((size_t) w.n_vocab);
+        ggml_backend_tensor_get(fg->logits, out_logits->data(), 0,
+                                sizeof(float) * (size_t) w.n_vocab);
+        if (telemetry) {
+            telemetry->full_graph_read_us +=
+                ds4_elapsed_us(read_t0, Ds4TimingClock::now());
+        }
+    }
     return 1;
 }
 
@@ -5683,6 +5735,7 @@ static bool eval_ds4_layer_range_hybrid_ffn(
         MoeHybridRoutingStats * routing_stats,
         std::vector<float> & out,
         DeepSeek4StepTelemetry * telemetry,
+        bool exact_prefill_q1_ffn_order,
         const MoeHybridDeviceOutputs * device_outputs = nullptr) {
     const bool trace_prefill = ds4_env_flag("DFLASH_DS4_PREFILL_TRACE");
     if (trace_prefill) {
@@ -5717,13 +5770,31 @@ static bool eval_ds4_layer_range_hybrid_ffn(
         layer_storage.cold_backend && layer_storage.cold_backend != backend &&
         hot_stack_ref && hot_stack_ref->ne[2] > 0 &&
         cold_stack_ref && cold_stack_ref->ne[2] > 0;
+    const int owner_sub_batch =
+        deepseek4_exact_prefill_hybrid_ffn_sub_batch(
+            exact_prefill_q1_ffn_order, n_tokens);
+    const bool split_owner_batch =
+        owner_sub_batch > 0 && owner_sub_batch < n_tokens;
+    // The device-resident activation tensor describes the complete batch.
+    // Exact q4 deliberately evaluates its owner rows as q3+q1 to retain the
+    // q1 reduction order, so those slices require a host activation buffer.
+    // Keep the device route for unsplit batches and fall back to one readback
+    // before the split instead of passing an empty host vector.
+    const bool use_device_ffn_input =
+        device_ffn_input && !split_owner_batch;
+    if (trace_prefill && device_ffn_input && split_owner_batch) {
+        std::fprintf(stderr,
+                     "[deepseek4-prefill-trace] layer=%d exact owner split "
+                     "uses one host activation readback\n",
+                     layer);
+    }
     const char * persistent_owner_env =
         std::getenv("DFLASH_MOE_PREFILL_PERSISTENT_OWNER_ALLOC");
     const bool persistent_owner_requested =
         !persistent_owner_env || !*persistent_owner_env ||
         std::strcmp(persistent_owner_env, "0") != 0;
     const bool persistent_owner_alloc =
-        n_tokens >= 512 && device_ffn_input && persistent_owner_requested;
+        n_tokens >= 512 && use_device_ffn_input && persistent_owner_requested;
     if (persistent_owner_alloc) {
         static bool logged_persistent_owner_alloc = false;
         if (!logged_persistent_owner_alloc) {
@@ -5801,8 +5872,19 @@ static bool eval_ds4_layer_range_hybrid_ffn(
                                 sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
     }
     const auto route_compute_t0 = Ds4TimingClock::now();
-    const bool route_ok =
-        ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
+    bool route_ok = false;
+    {
+        // This graph is rebuilt in temporary metadata for every exact-band
+        // step. Do not leave a native executable keyed to metadata that is
+        // immediately freed and may be recycled by a persistent owner graph.
+        // The scope ends before owner evaluation, so its stable graphs retain
+        // their normal replay behavior.
+        ScopedCudaGraphOverrides route_graph_scope(
+            deepseek4_exact_prefill_route_graph_requires_eager(
+                exact_prefill_q1_ffn_order));
+        route_ok =
+            ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
+    }
     if (trace_prefill) {
         std::fprintf(stderr,
                      "[deepseek4-prefill-trace] layer=%d ffn route compute=%s\n",
@@ -5814,13 +5896,13 @@ static bool eval_ds4_layer_range_hybrid_ffn(
     }
 
     std::vector<float> normed_host;
-    if (!device_ffn_input) {
+    if (!use_device_ffn_input) {
         normed_host.resize((size_t)n_embd * (size_t)n_tokens);
     }
     std::vector<float> probs_host((size_t)w.n_expert * (size_t)n_tokens);
     if (route_ok) {
         const auto route_read_t0 = Ds4TimingClock::now();
-        if (!device_ffn_input) {
+        if (!use_device_ffn_input) {
             ggml_backend_tensor_get(normed, normed_host.data(), 0,
                                     sizeof(float) * normed_host.size());
         }
@@ -5831,7 +5913,7 @@ static bool eval_ds4_layer_range_hybrid_ffn(
                 ds4_elapsed_us(route_read_t0, Ds4TimingClock::now());
         }
     }
-    if (!device_ffn_input) {
+    if (!use_device_ffn_input) {
         route_graph.reset();
     } else {
         static bool logged_device_input = false;
@@ -5925,16 +6007,45 @@ static bool eval_ds4_layer_range_hybrid_ffn(
                      layer);
     }
     const auto owners_t0 = Ds4TimingClock::now();
-    const bool ok = eval_ds4_hybrid(
-        backend, hybrid.cpu_backend, cfg, desc, &hybrid,
-        hybrid.layers[(size_t)layer], nullptr,
-        layer, n_embd, route_width,
-        device_ffn_input ? nullptr : normed_host.data(),
-        selected.data(), weights.data(),
-        n_tokens, out, hot_alloc, cold_alloc,
-        expert_compute, expert_layer, telemetry,
-        device_ffn_input ? normed : nullptr,
-        device_ffn_input ? device_outputs : nullptr);
+    bool ok = true;
+    if (split_owner_batch) {
+        out.resize((size_t)n_embd * (size_t)n_tokens);
+        std::vector<float> sub_out;
+        for (int token_begin = 0; token_begin < n_tokens;
+             token_begin += owner_sub_batch) {
+            const int token_count =
+                std::min(owner_sub_batch, n_tokens - token_begin);
+            ok = eval_ds4_hybrid(
+                backend, hybrid.cpu_backend, cfg, desc, &hybrid,
+                hybrid.layers[(size_t)layer], nullptr,
+                layer, n_embd, route_width,
+                normed_host.data() + (size_t)token_begin * (size_t)n_embd,
+                selected.data() + (size_t)token_begin * (size_t)route_width,
+                weights.data() + (size_t)token_begin * (size_t)route_width,
+                token_count, sub_out, /*hot_alloc=*/nullptr,
+                /*cold_alloc=*/nullptr, expert_compute, expert_layer,
+                telemetry);
+            if (!ok || sub_out.size() !=
+                    (size_t)n_embd * (size_t)token_count) {
+                ok = false;
+                break;
+            }
+            std::memcpy(
+                out.data() + (size_t)token_begin * (size_t)n_embd,
+                sub_out.data(), sizeof(float) * sub_out.size());
+        }
+    } else {
+        ok = eval_ds4_hybrid(
+            backend, hybrid.cpu_backend, cfg, desc, &hybrid,
+            hybrid.layers[(size_t)layer], nullptr,
+            layer, n_embd, route_width,
+            use_device_ffn_input ? nullptr : normed_host.data(),
+            selected.data(), weights.data(),
+            n_tokens, out, hot_alloc, cold_alloc,
+            expert_compute, expert_layer, telemetry,
+            use_device_ffn_input ? normed : nullptr,
+            use_device_ffn_input ? device_outputs : nullptr);
+    }
     if (trace_prefill) {
         std::fprintf(stderr,
                      "[deepseek4-prefill-trace] layer=%d expert owners=%s "
@@ -5959,6 +6070,7 @@ static bool ds4_run_exact_tokenwise_prefill_attention(
         int n_tokens,
         int kv_start,
         DeepSeek4AttentionImpl attention_impl,
+        bool exact_prefill_stable_raw_order,
         std::vector<float> & attn_out_host,
         DeepSeek4CachedLayerAlloc & attn_alloc,
         DeepSeek4StepTelemetry * telemetry) {
@@ -5980,11 +6092,25 @@ static bool ds4_run_exact_tokenwise_prefill_attention(
         std::vector<DeepSeek4I32ArrayBinding> i32_array_inputs;
         std::vector<DeepSeek4I64ArrayBinding> i64_array_inputs;
         std::vector<DeepSeek4F32ArrayBinding> f32_array_inputs;
+        // q=1 switches to a stable physical-ring reduction once the SWA
+        // window fills. Exact q=2..4 must use the same runtime row topology;
+        // reconstructing chronological spans changes the F32 reduction order
+        // after wrap and can move learned routing weights past the oracle
+        // tolerance even though the raw/compressed cache contents are equal.
+        DeepSeek4AttentionGraphInputs stable_inputs{};
+        const int token_position = kv_start + ti;
+        if (deepseek4_exact_tokenwise_uses_runtime_raw_row(
+                exact_prefill_stable_raw_order, token_position, w.n_swa)) {
+            stable_inputs.raw_kv_rows =
+                ggml_new_tensor_2d(ctx, GGML_TYPE_I64, 1, 1);
+            ggml_set_input(stable_inputs.raw_kv_rows);
+        }
         ggml_cgraph * gf = ggml_new_graph_custom(
             ctx, ds4_attn_step_graph_size(1), false);
         ggml_tensor * normed = build_rms_norm(ctx, inp, L.attn_norm, w.rms_eps);
         ggml_tensor * attn_out = build_mla_attention(
-            ctx, gf, normed, w, L, lc, il, kv_start + ti, 1, nullptr,
+            ctx, gf, normed, w, L, lc, il, token_position, 1,
+            stable_inputs.raw_kv_rows ? &stable_inputs : nullptr,
             i32_inputs, i32_array_inputs, i64_array_inputs, &f32_array_inputs,
             attention_impl);
         ggml_set_output(attn_out);
@@ -6011,6 +6137,11 @@ static bool ds4_run_exact_tokenwise_prefill_attention(
 
         ggml_backend_tensor_set(inp, cur + (size_t) ti * n_embd, 0,
                                 sizeof(float) * (size_t) n_embd);
+        if (stable_inputs.raw_kv_rows) {
+            const int64_t raw_row = token_position % w.n_swa;
+            ggml_backend_tensor_set(
+                stable_inputs.raw_kv_rows, &raw_row, 0, sizeof(raw_row));
+        }
         for (const auto & b : i32_inputs) {
             ggml_backend_tensor_set(b.tensor, &b.value, 0, sizeof(b.value));
         }
@@ -6860,6 +6991,77 @@ static bool initialize_layer_range_cache(
     runtime.owns_output = owns_output;
     return true;
 }
+
+bool deepseek4_should_attempt_fused_verify(
+        int n_tokens,
+        const Ds4VerifyHooks * verify_hooks,
+        bool owner_topology_supported,
+        bool full_layer_range,
+        bool execute_output_path,
+        bool gpu_backend,
+        bool fused_verify_enabled) {
+    return owner_topology_supported && n_tokens >= 2 &&
+           n_tokens <= DS4_CONSERVATIVE_VERIFY_MAX_TOKENS &&
+           verify_hooks && verify_hooks->allow_fused_verify &&
+           full_layer_range && execute_output_path && gpu_backend &&
+           fused_verify_enabled;
+}
+
+bool deepseek4_should_attempt_wide_fused_verify(
+        int n_tokens,
+        const Ds4VerifyHooks * verify_hooks,
+        bool q5_enabled,
+        bool owner_topology_supported,
+        bool full_layer_range,
+        bool has_output_storage,
+        bool gpu_backend,
+        bool fused_verify_enabled) {
+    return n_tokens == DS4_Q5_VERIFY_TOKENS && q5_enabled &&
+           verify_hooks && verify_hooks->allow_fused_verify &&
+           owner_topology_supported && full_layer_range &&
+           has_output_storage && gpu_backend && fused_verify_enabled;
+}
+
+bool deepseek4_should_warn_fused_verify_inactive(
+        int n_tokens,
+        const Ds4VerifyHooks * verify_hooks,
+        bool full_layer_range,
+        bool fused_verify_enabled,
+        bool fused_verify_candidate) {
+    return fused_verify_enabled && !fused_verify_candidate &&
+           n_tokens >= 2 && full_layer_range && verify_hooks &&
+           verify_hooks->allow_fused_verify;
+}
+
+DeepSeek4RecursiveOutputIntent deepseek4_recursive_output_intent(
+        PrefillAttentionMode mode,
+        bool parent_execute_output_path,
+        bool parent_has_output_storage,
+        bool is_last_shard,
+        int chunk_tokens,
+        bool is_final_chunk) {
+    const bool exact = mode == PrefillAttentionMode::Exact;
+    return {
+        /*execute_output_path=*/exact
+            ? chunk_tokens == 1 ||
+                  (is_final_chunk && parent_execute_output_path)
+            : parent_execute_output_path,
+        /*pass_output_storage=*/
+            parent_has_output_storage &&
+            (!is_last_shard || !exact || is_final_chunk),
+    };
+}
+
+bool deepseek4_should_attempt_fused_hybrid_decode(
+        bool fused_hybrid_decode,
+        bool full_layer_range,
+        bool execute_output_path,
+        bool gpu_backend,
+        bool fused_verify_enabled) {
+    return fused_hybrid_decode && full_layer_range && execute_output_path &&
+           gpu_backend && fused_verify_enabled;
+}
+
 bool deepseek4_step_layer_range(
         ggml_backend_t backend,
         int device,
@@ -6878,7 +7080,10 @@ bool deepseek4_step_layer_range(
         Ds4VerifyHooks * verify_hooks,
         MoeHybridStorage * moe_hybrid,
         MoeExpertComputeRuntime * expert_runtime,
-        MoeHybridRoutingStats * routing_stats) {
+        MoeHybridRoutingStats * routing_stats,
+        bool execute_output_path,
+        bool exact_prefill_stable_raw_order,
+        bool exact_prefill_q1_ffn_order) {
     const auto step_t0 = Ds4TimingClock::now();
 
     if (!deepseek4_cuda_hc_set_device(device)) {
@@ -6893,41 +7098,58 @@ bool deepseek4_step_layer_range(
     const int n_hc = w.n_hc;
     const int hc_dim = n_hc * n_embd;
     const bool is_last_shard = (layer_end >= w.n_layer);
+    const bool readback_logits = out_logits != nullptr;
+    const bool external_output_consumer =
+        verify_hooks &&
+        (verify_hooks->all_logits_out || verify_hooks->argmax_out);
+    execute_output_path =
+        execute_output_path || readback_logits || external_output_consumer;
     const bool fused_hybrid_ready =
         moe_hybrid && !expert_runtime &&
         moe_hybrid->materialized_cold_experts &&
         moe_hybrid->cold_backend_kind == MoeHybridColdBackend::Gpu &&
         moe_hybrid->cold_backend && moe_hybrid->cold_backend != backend;
-    const bool wide_verify_candidate =
-        n_tokens == DS4_Q5_VERIFY_TOKENS &&
-        ds4_env_flag("DFLASH_DS4_Q5_VERIFY");
+    const bool conservative_verify_candidate =
+        deepseek4_should_attempt_fused_verify(
+        n_tokens, verify_hooks,
+        !moe_hybrid || fused_hybrid_ready,
+        layer_begin == 0 && is_last_shard,
+        execute_output_path,
+        ds4_backend_is_gpu(backend), ds4_fused_verify_enabled());
+    const bool q5_verify_enabled = ds4_env_flag("DFLASH_DS4_Q5_VERIFY");
     const bool fused_verify_candidate =
-        (!moe_hybrid || fused_hybrid_ready) &&
-        n_tokens >= 2 &&
-        (n_tokens <= DS4_CONSERVATIVE_VERIFY_MAX_TOKENS ||
-         wide_verify_candidate) && verify_hooks &&
-        layer_begin == 0 && is_last_shard && out_logits &&
-        ds4_backend_is_gpu(backend) && ds4_fused_verify_enabled();
+        conservative_verify_candidate ||
+        deepseek4_should_attempt_wide_fused_verify(
+            n_tokens, verify_hooks,
+            q5_verify_enabled,
+            !moe_hybrid || fused_hybrid_ready,
+            layer_begin == 0 && is_last_shard, out_logits != nullptr,
+            ds4_backend_is_gpu(backend), ds4_fused_verify_enabled());
     // Fused verify has many preconditions and declining any of them is
     // invisible: the request still decodes, still reports a healthy acceptance
     // rate, and only the throughput differs. Name the failed condition once so
     // a slow DSpark run can be attributed from the log instead of guessed at.
     // (No run has yet tripped this on gfx1151 — it is here so that the next
     // "spec decode is slow" report starts from evidence.)
-    if (ds4_fused_verify_enabled() && !fused_verify_candidate &&
-        n_tokens >= 2 && layer_begin == 0 && is_last_shard) {
+    if (deepseek4_should_warn_fused_verify_inactive(
+            n_tokens, verify_hooks, layer_begin == 0 && is_last_shard,
+            ds4_fused_verify_enabled(), fused_verify_candidate)) {
         static bool warned = false;
         if (!warned) {
             warned = true;
             std::fprintf(stderr,
                 "[deepseek4] DFLASH_DS4_FUSED_VERIFY=1 but fused verify is "
-                "inactive: n_tokens=%d (cap %d) verify_hooks=%d out_logits=%d "
-                "backend_gpu=%d moe_hybrid=%d expert_runtime=%d "
+                "inactive: n_tokens=%d (cap %d) verify_hooks=%d "
+                "allow_fused_verify=%d execute_output_path=%d out_logits=%d "
+                "q5_enabled=%d backend_gpu=%d moe_hybrid=%d expert_runtime=%d "
                 "materialized_cold=%d cold_backend_kind_gpu=%d "
                 "cold_backend_distinct=%d; verify falls back to the dense "
                 "full-expert path\n",
                 n_tokens, GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS,
-                verify_hooks ? 1 : 0, out_logits ? 1 : 0,
+                verify_hooks ? 1 : 0,
+                verify_hooks && verify_hooks->allow_fused_verify ? 1 : 0,
+                execute_output_path ? 1 : 0, out_logits ? 1 : 0,
+                q5_verify_enabled ? 1 : 0,
                 ds4_backend_is_gpu(backend) ? 1 : 0,
                 moe_hybrid ? 1 : 0, expert_runtime ? 1 : 0,
                 moe_hybrid && moe_hybrid->materialized_cold_experts ? 1 : 0,
@@ -6971,7 +7193,18 @@ bool deepseek4_step_layer_range(
     // each sub-forward then writes at most one window and, if present, its
     // boundary is the final token. This preserves the same pool/rotate order
     // as sequential execution while retaining safe batched prefixes.
-    const int first_chunk = deepseek4_safe_compressor_batch_tokens(w, kv_start, n_tokens);
+    const bool exact_prefill_band =
+        cache.prefill_mode == PrefillAttentionMode::Exact &&
+        allow_decode_graph_reuse && !fused_verify_candidate;
+    const int first_chunk = std::min(
+        deepseek4_safe_compressor_batch_tokens(w, kv_start, n_tokens),
+        exact_prefill_band ? 4 : n_tokens);
+    const bool exact_multi_token_band =
+        exact_prefill_band && n_tokens > 1 && n_tokens <= 4;
+    ScopedCudaGraphOverrides exact_mmvq_scope(
+        /*disable_graphs=*/false,
+        /*mmvq_max_ncols=*/ds4_exact_prefill_mmvq_max_ncols(
+            exact_multi_token_band));
     if (first_chunk > 0 && first_chunk < n_tokens &&
         !fused_verify_candidate && !heterogeneous_sparse_prefill &&
         !standard_layer_major_prefill) {
@@ -6995,8 +7228,10 @@ bool deepseek4_step_layer_range(
         }
 
         for (int off = 0; off < n_tokens;) {
-            const int chunk = deepseek4_safe_compressor_batch_tokens(
-                w, kv_start + off, n_tokens - off);
+            const int remaining = n_tokens - off;
+            const int chunk = std::min(
+                deepseek4_safe_compressor_batch_tokens(w, kv_start + off, remaining),
+                exact_prefill_band ? 4 : remaining);
             std::vector<float> chunk_hc;
             std::vector<float> chunk_out;
             std::vector<float> chunk_capture;
@@ -7007,20 +7242,33 @@ bool deepseek4_step_layer_range(
                 chunk_hooks.capture_layer_ids = verify_hooks->capture_layer_ids;
                 chunk_hooks.capture_out = verify_hooks->capture_out ? &chunk_capture : nullptr;
                 chunk_hooks.all_logits_out = verify_hooks->all_logits_out ? &chunk_logits : nullptr;
+                chunk_hooks.allow_fused_verify = verify_hooks->allow_fused_verify;
                 chunk_hooks_ptr = &chunk_hooks;
+            }
+            const bool final_chunk = off + chunk == n_tokens;
+            const DeepSeek4RecursiveOutputIntent chunk_intent =
+                deepseek4_recursive_output_intent(
+                    cache.prefill_mode, execute_output_path,
+                    out_logits != nullptr, is_last_shard, chunk, final_chunk);
+            std::vector<float> * chunk_output = nullptr;
+            if (chunk_intent.pass_output_storage) {
+                chunk_output = &chunk_out;
             }
             if (!deepseek4_step_layer_range(
                     backend, device, w, cache, chunk_hc,
                     embed + (size_t) off * input_width,
                     chunk, kv_start + off, layer_begin, layer_end,
-                    out_logits ? &chunk_out : nullptr,
+                    chunk_output,
                     token_ids ? token_ids + off : nullptr,
                     telemetry, allow_decode_graph_reuse, chunk_hooks_ptr,
-                    moe_hybrid, expert_runtime, routing_stats)) {
+                    moe_hybrid, expert_runtime, routing_stats,
+                    chunk_intent.execute_output_path,
+                    exact_prefill_stable_raw_order,
+                    exact_prefill_q1_ffn_order)) {
                 return false;
             }
             hc_all.insert(hc_all.end(), chunk_hc.begin(), chunk_hc.end());
-            if (out_logits) {
+            if (chunk_output) {
                 if (is_last_shard) {
                     last_out = std::move(chunk_out);
                 } else {
@@ -7217,13 +7465,12 @@ bool deepseek4_step_layer_range(
     Ds4VerifyHooks * fused_graph_hooks =
         (fused_hybrid_decode && !verify_hooks)
             ? &fused_hybrid_decode_hooks : verify_hooks;
-    if ((!moe_hybrid || fused_hybrid_ready) &&
-        ((n_tokens >= 2 &&
-          (n_tokens <= DS4_CONSERVATIVE_VERIFY_MAX_TOKENS ||
-           wide_verify_candidate) && verify_hooks) ||
-         fused_hybrid_decode) &&
-        layer_begin == 0 && is_last_shard &&
-        out_logits && ds4_backend_is_gpu(backend) && ds4_fused_verify_enabled()) {
+    const bool fused_hybrid_decode_candidate =
+        deepseek4_should_attempt_fused_hybrid_decode(
+            fused_hybrid_decode, layer_begin == 0 && is_last_shard,
+            execute_output_path, ds4_backend_is_gpu(backend),
+            ds4_fused_verify_enabled());
+    if (fused_verify_candidate || fused_hybrid_decode_candidate) {
         const bool q1_feature_capture =
             n_tokens == 1 && verify_hooks && verify_hooks->capture_out;
         // q=1 target-feature capture walks many prompt-position shapes. Keep
@@ -7236,7 +7483,7 @@ bool deepseek4_step_layer_range(
             graph_cache, q1_feature_capture, fused_decode_graph_cache,
             backend, w, cache,
             hc_layer_weights_range, hc_output_weights_range, hash_routing_tables_range,
-            scratch.hash_expert_ids, embed, n_tokens, kv_start, *out_logits, token_ids,
+            scratch.hash_expert_ids, embed, n_tokens, kv_start, out_logits, token_ids,
             fused_graph_hooks, telemetry, fused_hybrid_ready ? moe_hybrid : nullptr,
             routing_stats);
         if (vrc < 0) return false;
@@ -7269,12 +7516,12 @@ bool deepseek4_step_layer_range(
     if (!moe_hybrid && n_tokens == 1 && allow_decode_graph_reuse && layer_begin == 0 && is_last_shard &&
         !(verify_hooks && verify_hooks->capture_layer_ids &&
           verify_hooks->capture_out) &&
-        out_logits && ds4_backend_is_gpu(backend) &&
+        execute_output_path && ds4_backend_is_gpu(backend) &&
         ds4_fused_decode_enabled(w)) {
         const int rc = ds4_try_fused_decode_step(
             fused_decode_graph_cache, backend, w, cache, hc_layer_weights_range,
             hc_output_weights_range, hash_routing_tables_range, scratch.hash_expert_ids,
-            embed, kv_start, *out_logits, token_ids, telemetry);
+            embed, kv_start, out_logits, token_ids, telemetry);
         if (rc < 0) return false;
         if (rc > 0) {
             const int np = kv_start + 1;
@@ -7507,9 +7754,15 @@ bool deepseek4_step_layer_range(
             attn_post_backend = cached.post;
             attn_comb_backend = cached.comb;
         } else {
-            hc_pre_batch(cur, hc_post, hc_comb,
-                         hc_state.data(), hc_lw.attn, L.hc_attn_fn,
-                         n_tokens, n_embd, n_hc, w.n_hc_sinkhorn_iter, w.hc_eps);
+            if (!hc_pre_batch(cur, hc_post, hc_comb,
+                              hc_state.data(), hc_lw.attn, L.hc_attn_fn,
+                              device, n_tokens, n_embd, n_hc,
+                              w.n_hc_sinkhorn_iter, w.hc_eps)) {
+                std::fprintf(stderr,
+                             "[deepseek4] HC-pre device selection failed "
+                             "layer %d attn\n", il);
+                return false;
+            }
         }
         if (telemetry) telemetry->hc_pre_attn_us += ds4_elapsed_us(hc_pre_attn_t0, Ds4TimingClock::now());
 
@@ -7532,7 +7785,8 @@ bool deepseek4_step_layer_range(
                         : DeepSeek4AttentionImpl::Explicit;
                 if (!ds4_run_exact_tokenwise_prefill_attention(
                         backend, w, L, lc, il, cur.data(), n_tokens, kv_start,
-                        attention_impl, attn_out_host,
+                        attention_impl, exact_prefill_stable_raw_order,
+                        attn_out_host,
                         cached_attn_allocs[(size_t) il], telemetry)) {
                     return false;
                 }
@@ -8083,9 +8337,15 @@ bool deepseek4_step_layer_range(
             ffn_post_backend = cached.post;
             ffn_comb_backend = cached.comb;
         } else {
-            hc_pre_batch(ffn_working, hc_post, hc_comb,
-                         hc_state.data(), hc_lw.ffn, L.hc_ffn_fn,
-                         n_tokens, n_embd, n_hc, w.n_hc_sinkhorn_iter, w.hc_eps);
+            if (!hc_pre_batch(ffn_working, hc_post, hc_comb,
+                              hc_state.data(), hc_lw.ffn, L.hc_ffn_fn,
+                              device, n_tokens, n_embd, n_hc,
+                              w.n_hc_sinkhorn_iter, w.hc_eps)) {
+                std::fprintf(stderr,
+                             "[deepseek4] HC-pre device selection failed "
+                             "layer %d ffn\n", il);
+                return false;
+            }
         }
         if (telemetry) telemetry->hc_pre_ffn_us += ds4_elapsed_us(hc_pre_ffn_t0, Ds4TimingClock::now());
 
@@ -8159,6 +8419,7 @@ bool deepseek4_step_layer_range(
                         token_ids, hash_routing_tables_range[(size_t)il],
                         *moe_hybrid, expert_runtime, routing_stats,
                         ffn_out_host, telemetry,
+                        exact_prefill_q1_ffn_order,
                         ffn_device_join ? &owner_outputs : nullptr)) {
                     std::fprintf(stderr,
                                  "[deepseek4-moe-tp] layer-range FFN failed layer %d\n",
@@ -8325,7 +8586,7 @@ bool deepseek4_step_layer_range(
     }
 
     // ── Output: HC pre → norm → lm_head (or return hidden state) ────────
-    if (is_last_shard && out_logits) {
+    if (is_last_shard && execute_output_path) {
         // Final HC pre for output
         const auto output_t0 = Ds4TimingClock::now();
         std::vector<float> & final_embd = scratch.final_embd;
@@ -8351,9 +8612,13 @@ bool deepseek4_step_layer_range(
             if (ggml_backend_graph_compute(backend, cached_decode_output_graph.sg.gf) != GGML_STATUS_SUCCESS) {
                 return false;
             }
-            out_logits->resize((size_t)w.n_vocab);
-            ggml_backend_tensor_get(cached_decode_output_graph.sg.logits,
-                                    out_logits->data(), 0, sizeof(float) * (size_t)w.n_vocab);
+            if (readback_logits) {
+                out_logits->resize((size_t)w.n_vocab);
+                ggml_backend_tensor_get(
+                    cached_decode_output_graph.sg.logits,
+                    out_logits->data(), 0,
+                    sizeof(float) * (size_t)w.n_vocab);
+            }
         } else {
             const size_t ctx_size = 16 * 1024 * 1024;
             ggml_init_params params{};
@@ -8399,11 +8664,14 @@ bool deepseek4_step_layer_range(
                 return false;
             }
 
-            out_logits->resize((size_t)w.n_vocab);
-            const size_t logits_offset = last_only ? 0 :
-                (size_t)(n_tokens - 1) * (size_t)w.n_vocab * sizeof(float);
-            ggml_backend_tensor_get(logits, out_logits->data(), logits_offset,
-                                    sizeof(float) * (size_t)w.n_vocab);
+            if (readback_logits) {
+                out_logits->resize((size_t)w.n_vocab);
+                const size_t logits_offset = last_only ? 0 :
+                    (size_t)(n_tokens - 1) * (size_t)w.n_vocab * sizeof(float);
+                ggml_backend_tensor_get(
+                    logits, out_logits->data(), logits_offset,
+                    sizeof(float) * (size_t)w.n_vocab);
+            }
             if (verify_hooks && verify_hooks->all_logits_out) {
                 verify_hooks->all_logits_out->resize((size_t) w.n_vocab * n_tokens);
                 ggml_backend_tensor_get(logits, verify_hooks->all_logits_out->data(), 0,
