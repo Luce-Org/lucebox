@@ -359,15 +359,6 @@ struct DeepSeek4CachedDecodeAttnGraph {
     }
 };
 
-static bool ds4_moe_fused_combine_enabled() {
-    static const bool enabled = []() {
-        const char * val = getenv("DFLASH_MOE_FUSED_COMBINE");
-        if (!val) return true; // Default ON in production
-        return atoi(val) != 0;
-    }();
-    return enabled;
-}
-
 struct DeepSeek4CachedLayerAlloc {
     const ggml_context * owner_ctx = nullptr;
     ggml_backend_t backend = nullptr;
@@ -486,18 +477,8 @@ static bool build_cached_decode_ffn_graph(
             weights = ggml_scale(out.sg.ctx, weights, w.expert_weight_scale);
         }
 
-        if (ds4_moe_fused_combine_enabled()) {
-            ffn_out = ggml_ds4_moe_fused_combine_shared(out.sg.ctx, down_e, weights, shared_out);
-        } else {
-            ggml_tensor * weights_3d = ggml_reshape_3d(out.sg.ctx, weights, 1, n_used, n_tokens);
-            ggml_tensor * routed_out = ggml_mul(out.sg.ctx, down_e, weights_3d);
-            routed_out = ggml_cont(
-                out.sg.ctx, ggml_permute(out.sg.ctx, routed_out, 1, 0, 2, 3));
-            routed_out = ggml_sum_rows(out.sg.ctx, routed_out);
-            routed_out = ggml_reshape_2d(out.sg.ctx, routed_out, w.n_embd, n_tokens);
-
-            ffn_out = ggml_add(out.sg.ctx, shared_out, routed_out);
-        }
+        ffn_out = ggml_ds4_moe_fused_combine_shared(
+            out.sg.ctx, down_e, weights, shared_out);
     } else {
         ffn_out = build_moe_ffn(out.sg.ctx, ffn_normed, w, L, layer_idx, n_tokens);
     }
@@ -3361,16 +3342,8 @@ static ggml_tensor * build_moe_ffn(
         ggml_tensor * down_e = ggml_mul_mat_id(ctx, L.ffn_down_exps, mid_e, routing.selected);
         down_e = ggml_reshape_3d(ctx, down_e, n_embd, n_used, n_tokens);
 
-        if (ds4_moe_fused_combine_enabled()) {
-            return ggml_ds4_moe_fused_combine_shared(ctx, down_e, routing.weights, shared_out);
-        } else {
-            ggml_tensor * weights_3d = ggml_reshape_3d(ctx, routing.weights, 1, n_used, n_tokens);
-            routed_out = ggml_mul(ctx, down_e, weights_3d);
-            routed_out = ggml_cont(ctx, ggml_permute(ctx, routed_out, 1, 0, 2, 3));
-            routed_out = ggml_sum_rows(ctx, routed_out);
-            routed_out = ggml_reshape_2d(ctx, routed_out, n_embd, n_tokens);
-            return ggml_add(ctx, shared_out, routed_out);
-        }
+        return ggml_ds4_moe_fused_combine_shared(
+            ctx, down_e, routing.weights, shared_out);
     }
 
     return ggml_add(ctx, shared_out, routed_out);
@@ -5101,26 +5074,8 @@ static ggml_tensor * ds4_build_hash_routed_ffn(
         weights = ggml_scale(ctx, weights, w.expert_weight_scale);
     }
 
-    if (ds4_moe_fused_combine_enabled()) {
-        return ggml_ds4_moe_fused_combine_shared(ctx, down_e, weights, shared_out);
-    }
-
-    ggml_tensor * weights_3d = ggml_reshape_3d(
-        ctx, weights, 1, n_used, n_tokens);
-    ggml_tensor * routed_out = ggml_mul(ctx, down_e, weights_3d);
-    if (n_tokens == 1) {
-        // Preserve the established q=1 graph and reduction order.
-        routed_out = ggml_cont(ctx, ggml_permute(ctx, routed_out, 1, 0, 2, 3));
-        routed_out = ggml_sum_rows(ctx, routed_out);
-        routed_out = ggml_reshape_2d(ctx, routed_out, w.n_embd, 1);
-    } else {
-        ggml_tensor * sum_shape = ggml_new_tensor_3d(
-            ctx, GGML_TYPE_F32, w.n_embd, 1, n_tokens);
-        routed_out = ggml_repeat_back(ctx, routed_out, sum_shape);
-        routed_out = ggml_reshape_2d(
-            ctx, routed_out, w.n_embd, n_tokens);
-    }
-    return ggml_add(ctx, shared_out, routed_out);
+    return ggml_ds4_moe_fused_combine_shared(
+        ctx, down_e, weights, shared_out);
 }
 
 static bool ds4_fused_ensure_fn_mirrors(

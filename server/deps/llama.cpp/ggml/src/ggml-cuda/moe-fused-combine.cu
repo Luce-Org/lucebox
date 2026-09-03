@@ -1,11 +1,6 @@
 #include "common.cuh"
 #include "moe-fused-combine.cuh"
 
-#include <atomic>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-
 // Fused post-MMID route reduction and shared-expert add. The down projection
 // remains a separate operation and materializes down_e before this kernel.
 // Computes dst[t, d] = (shared_out ? shared_out[t, d] : 0) + sum_{e=0}^{n_used-1} (down_e[t, e, d] * weights[t, e])
@@ -85,21 +80,6 @@ void ggml_cuda_op_ds4_moe_combine(ggml_backend_cuda_context & ctx, ggml_tensor *
     const int n_embd   = (int) down_e->ne[0];
     const int n_used   = (int) down_e->ne[1];
     const int n_tokens = (int) down_e->ne[2];
-
-    static const bool trace_enabled = []() {
-        const char * raw = std::getenv("DFLASH_MOE_FUSED_COMBINE_TRACE");
-        return raw && *raw && std::strcmp(raw, "0") != 0;
-    }();
-    if (trace_enabled) {
-        static std::atomic<unsigned long long> launch_count{0};
-        int device = -1;
-        CUDA_CHECK(cudaGetDevice(&device));
-        const unsigned long long launch =
-            launch_count.fetch_add(1, std::memory_order_relaxed) + 1;
-        std::fprintf(stderr,
-            "[moe-fused-combine] launch=%llu device=%d tokens=%d routes=%d shared=%d\n",
-            launch, device, n_tokens, n_used, shared_out != nullptr ? 1 : 0);
-    }
 
     GGML_ASSERT(n_embd % 4 == 0 && "n_embd must be a multiple of 4 for float4 vectorization");
     GGML_ASSERT(reinterpret_cast<uintptr_t>(down_e->data) % 16 == 0 && "down_e->data must be 16-byte aligned");
