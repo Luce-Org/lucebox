@@ -287,6 +287,10 @@ jobs:
     env:
       HIP_VISIBLE_DEVICES: ${{ matrix.device_index }}
       EXPECTED_HIP_ARCH: ${{ matrix.arch }}
+      LUCE_TEST_MODEL_QWEN35: /opt/models/Qwen3.6-27B-Q4_K_M.gguf
+      LUCE_TEST_MODEL_QWEN3: /opt/models/Qwen3-0.6B-BF16.gguf
+      LUCE_TEST_MODEL_DEEPSEEK4: /opt/models/DeepSeek-V4-Flash-0731-ROCMFPX-MIX-STRIX.gguf
+      DS4_TEST_MODEL: /opt/models/DeepSeek-V4-Flash-0731-ROCMFPX-MIX-STRIX.gguf
     concurrency:
       group: lucebox3-${{ matrix.concurrency_key }}-runner
       cancel-in-progress: false
@@ -352,12 +356,19 @@ jobs:
               test_deepseek4_mmid_grouped_cuda test_deepseek4_unit \
               test_recurrent_snapshot test_server_unit test_rocmfp3_mix_registry \
               test_rocmfp_mix_slice_matvec test_rocmfp_mix_gateup_glu \
-              test_ds4_mix_registry_teardown test_model_smoke test_batched_gdn \
-              test_concat_transpose test_cuda_pool_shutdown \
+              test_ds4_mix_registry_teardown test_ds4_load_transactional \
+              test_model_smoke test_batched_gdn test_concat_transpose \
+              test_cuda_pool_shutdown \
             --parallel 8
           ctest --test-dir "$RUNNER_TEMP/rocmfp-build" \
             --output-on-failure \
             -R 'cuda_pool_shutdown|rocmfp4_reference|rocmfpx_reference|rocmfp4_hip_tail|rocmfpx_mmq|deepseek4_mmid_grouped_cuda|deepseek4_unit|recurrent_snapshot|ChainRollbackPolicy|rocmfp3_mix_registry|rocmfp_mix_slice_matvec|rocmfp_mix_gateup_glu|ds4_mix_registry_teardown|test_model_smoke\.PagedAttention\.|batched_gdn$|concat_transpose$'
+          if [[ "$EXPECTED_HIP_ARCH" == "gfx1151" ]]; then
+            ctest --test-dir "$RUNNER_TEMP/rocmfp-build" \
+              --output-on-failure \
+              -R '^(ds4_load_transactional|test_model_smoke\.SmokeLoadTarget\.LoadsConfiguredModel)$' \
+              --no-tests=error
+          fi
 
       - name: Build + test affine ROCmFP2 GPU paths
         # Keep the default wire-format build above and compile the affine layout
