@@ -311,10 +311,19 @@ static size_t ds4_fused_verify_hybrid_slot_limit() {
         // q=5 advances through four ratio-4 phases and crosses a ratio-128
         // boundary in the 128-token qualification request. With two slots the
         // nine recurring shapes rebuild on every step. Nine slots were
-        // model-qualified at 28.5 GiB peak on the 31.9 GiB R9700. q<=4 keeps
-        // the conservative two-slot default.
+        // model-qualified at 28.5 GiB peak on the 31.9 GiB R9700.
+        //
+        // q<=4 held a two-slot default, which misses just as reliably: its
+        // shape set needs four, and an adaptive width moving between q=2, 3
+        // and 4 needs more than that. Every miss is a full rebuild of the
+        // whole-model graph, and that is 5.4 ms of a 88.9 ms step doing no
+        // arithmetic. The slots themselves are nearly free -- the graphs share
+        // their scratch through the allocator, so the whole cache measured
+        // 303 MiB at two slots and 351 MiB at 64, about 0.8 MiB per slot --
+        // and eight of them stay under the nine already qualified at the wider
+        // q=5. See the pull request for the measurement.
         const long default_slots =
-            ds4_env_flag("DFLASH_DS4_Q5_VERIFY") ? 9 : 2;
+            ds4_env_flag("DFLASH_DS4_Q5_VERIFY") ? 9 : 8;
         const long requested = raw ? std::strtol(raw, nullptr, 10)
                                    : default_slots;
         return (size_t) std::max<long>(
