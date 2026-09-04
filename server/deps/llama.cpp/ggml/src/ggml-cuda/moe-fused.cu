@@ -710,6 +710,33 @@ void ggml_cuda_op_moe_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
             (int) (dst->nb[1] / sizeof(int32_t)));
         return;
     }
+    if (mode == GGML_MOE_FUSED_CLUSTER_ALLREDUCE) {
+        // The collective runs as an ordinary graph node on this backend's
+        // stream, so partial sums are combined between the kernels that
+        // produce and consume them without a host round trip. ggml stays free
+        // of any collective library: the caller registered a callback.
+        const ggml_tensor * src = dst->src[0];
+        GGML_ASSERT(src && src->type == GGML_TYPE_F32);
+        GGML_ASSERT(dst->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_is_contiguous(src) && ggml_is_contiguous(dst));
+        GGML_ASSERT(ggml_nelements(src) == ggml_nelements(dst));
+
+        ggml_cluster_allreduce_fn fn = nullptr;
+        memcpy(&fn, &dst->op_params[GGML_MOE_FUSED_CLUSTER_ALLREDUCE_FN_WORD],
+               sizeof(fn));
+        GGML_ASSERT(fn);
+        void * user = nullptr;
+        memcpy(&user, &dst->op_params[GGML_MOE_FUSED_CLUSTER_ALLREDUCE_USER_WORD],
+               sizeof(user));
+
+        const size_t n = (size_t) ggml_nelements(dst);
+        if (dst->data != src->data) {
+            CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, n * sizeof(float),
+                                       cudaMemcpyDeviceToDevice, ctx.stream()));
+        }
+        fn(user, dst->data, n, (void *) ctx.stream());
+        return;
+    }
     if (mode == GGML_MOE_FUSED_DEFERRED_PEER_COPY) {
         GGML_ASSERT(ggml_is_contiguous(dst));
 

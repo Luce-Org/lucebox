@@ -2568,7 +2568,23 @@ extern "C" {
         GGML_MOE_FUSED_OWNER_SPLIT        = -4,
         GGML_MOE_FUSED_ALIGN_IDS          = -5,
         GGML_MOE_FUSED_BALANCED_OWNER_IDS = -6,
+        GGML_MOE_FUSED_CLUSTER_ALLREDUCE  = -7,
     };
+
+    // Word offsets in ggml_tensor::op_params for the in-graph collective.
+    // Both pointers start at naturally aligned 64-bit boundaries.
+    enum ggml_moe_fused_cluster_allreduce_param {
+        GGML_MOE_FUSED_CLUSTER_ALLREDUCE_FN_WORD   = 2,
+        GGML_MOE_FUSED_CLUSTER_ALLREDUCE_USER_WORD = 4,
+    };
+
+    // Sums `n` float elements at `data` element-wise across the caller's
+    // process group, in place, enqueued on `stream` (cudaStream_t /
+    // hipStream_t as an opaque pointer). ggml deliberately does not know how
+    // the sum is produced: the caller registers this callback, so no
+    // collective library becomes a ggml dependency.
+    typedef void (*ggml_cluster_allreduce_fn)(void * user, void * data,
+                                              size_t n, void * stream);
 
     // Word offsets in ggml_tensor::op_params for the deferred peer-copy op.
     // Both pointers start at naturally aligned 64-bit boundaries.
@@ -2593,6 +2609,18 @@ extern "C" {
             int64_t               n_embd,
             int64_t               ff_dim,
             int64_t               n_expert_used);
+
+    // In-graph collective: `a` is summed element-wise across the process
+    // group and the sum becomes this node's value. The collective is enqueued
+    // on the executing backend's own stream, so it is ordered after the
+    // kernels that produced `a` and before the kernels that consume the
+    // result, without a host synchronization. GPU backends only; `a` must be
+    // contiguous F32.
+    GGML_API struct ggml_tensor * ggml_cluster_allreduce(
+            struct ggml_context     * ctx,
+            struct ggml_tensor      * a,
+            ggml_cluster_allreduce_fn fn,
+            void                    * user);
 
     GGML_API struct ggml_tensor * ggml_laguna_moe_combine(
             struct ggml_context * ctx,
