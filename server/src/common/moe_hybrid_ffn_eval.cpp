@@ -1648,6 +1648,11 @@ bool eval_moe_hybrid_ffn_single(
     std::vector<float> cold_weights;
     for (int i = 0; i < n_selected; ++i) {
         const int32_t gid = selected_ids[i];
+        // Cold owner None: routes masked to -1 by the cluster runtime are
+        // evaluated elsewhere and contribute zero here.
+        if (gid < 0 && storage.cold_backend_kind == MoeHybridColdBackend::None) {
+            continue;
+        }
         if (gid < 0 || gid >= (int32_t)storage.hot_local_by_global.size()) {
             if (err) *err = "selected id out of range";
             return false;
@@ -3982,6 +3987,7 @@ bool eval_moe_hybrid_ffn_gpu_resident(
 
     for (int i = 0; i < n_selected; ++i) {
         const int32_t gid = selected_ids[i];
+        if (gid < 0 && storage.cold_backend_kind == MoeHybridColdBackend::None) continue;
         if (gid < 0 || gid >= (int32_t)storage.hot_local_by_global.size()) return false;
         const int32_t hot_local = storage.hot_local_by_global[(size_t)gid];
         if (hot_local >= 0) {
@@ -4229,6 +4235,75 @@ bool eval_moe_hybrid_ffn_gpu_resident(
     // ── Copy combine output to persistent act_cur (GPU→GPU) ──
     ggml_backend_tensor_copy(gpu_state.combine.output, gpu_state.act_cur);
 
+    return true;
+}
+
+// ── Shared expert only ──
+// Cluster expert-parallel evaluates the routed partial without the shared
+// expert (the MoeLayerDesc handed to the routed path has the shexp tensors
+// cleared), all-reduces it, and adds this locally computed term afterwards.
+// The graph is cached per n_tokens in storage.shared_batched_graph, which
+// release_graph_caches() already frees.
+bool eval_moe_shared_expert_batched(
+    ggml_backend_t                  gpu_backend,
+    const MoeHybridConfig &         cfg,
+    const MoeLayerDesc &            desc,
+    MoeHybridLayerStorage &         storage,
+    const float *                   cur_host,
+    int                             n_tokens,
+    std::vector<float> &            out,
+    std::string *                   err) {
+    const int n_embd = cfg.n_embd;
+    out.assign((size_t)n_embd * (size_t)n_tokens, 0.0f);
+    if (n_tokens <= 0) return true;
+    if (!desc.ffn_up_shexp || !desc.ffn_gate_shexp || !desc.ffn_down_shexp) {
+        return true;
+    }
+    if (!cur_host) {
+        if (err) *err = "shared expert requires a host activation";
+        return false;
+    }
+
+    CachedHotBatchedGraph & g = storage.shared_batched_graph;
+    if (!g.valid() || g.n_tokens != n_tokens) {
+        g.free();
+        g.n_tokens = n_tokens;
+        ggml_init_params ip{};
+        ip.mem_size = 4 * 1024 * 1024;
+        ip.mem_buffer = nullptr;
+        ip.no_alloc = true;
+        g.ctx = ggml_init(ip);
+        if (!g.ctx) {
+            if (err) *err = "shared expert ggml_init failed";
+            return false;
+        }
+        g.inp = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_input(g.inp);
+        g.output = build_shared_expert_subgraph(g.ctx, desc, g.inp, cfg.swiglu_clamp);
+        if (!g.output) {
+            g.free();
+            if (err) *err = "shared expert subgraph build failed";
+            return false;
+        }
+        g.gf = ggml_new_graph_custom(g.ctx, 512, false);
+        ggml_set_output(g.output);
+        ggml_build_forward_expand(g.gf, g.output);
+        g.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(gpu_backend));
+        if (!g.alloc || !ggml_gallocr_alloc_graph(g.alloc, g.gf)) {
+            g.free();
+            if (err) *err = "shared expert gallocr failed";
+            return false;
+        }
+    }
+
+    ggml_backend_tensor_set(g.inp, cur_host, 0,
+                            sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
+    if (ggml_backend_graph_compute(gpu_backend, g.gf) != GGML_STATUS_SUCCESS) {
+        if (err) *err = "shared expert compute failed";
+        return false;
+    }
+    ggml_backend_tensor_get(g.output, out.data(), 0,
+                            sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
     return true;
 }
 

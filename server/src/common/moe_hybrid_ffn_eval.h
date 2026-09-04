@@ -386,6 +386,22 @@ bool build_cached_cold_graph(
     int n_cold,
     float swiglu_clamp = 0.0f);
 
+// Shared expert only, batched [n_embd, n_tokens] on the GPU backend. Used by
+// the cluster expert-parallel path, which evaluates routed experts without
+// the shared term (MoeLayerDesc with shexp tensors cleared), all-reduces the
+// routed partial across ranks and adds this local result afterwards. Cached
+// per n_tokens in storage.shared_batched_graph. `out` is zero-filled when the
+// layer has no shared expert.
+bool eval_moe_shared_expert_batched(
+    ggml_backend_t                  gpu_backend,
+    const MoeHybridConfig &         cfg,
+    const MoeLayerDesc &            desc,
+    MoeHybridLayerStorage &         storage,
+    const float *                   cur_host,
+    int                             n_tokens,
+    std::vector<float> &            out,
+    std::string *                   err = nullptr);
+
 // Build cached hot-only batched graph for prefill (n_tokens=MMQ_SAFE_SUB_BATCH).
 bool build_cached_hot_batched_graph(
     CachedHotBatchedGraph & out,
