@@ -1,0 +1,36 @@
+{
+  "model": "DeepSeek-V4-Flash-Vision-Uncensored-GGUF",
+  "base_model": "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp",
+  "source_repo": "orcarouter/DeepSeek-V4-Flash-Vision-Uncensored",
+  "rung": {
+    "default": "IQ2_XXS",
+    "options": ["IQ1_M", "IQ2_XXS", "IQ2_S", "IQ3_XXS"],
+    "source": "prometheusAIR rung table, see docs/ds4v-quant.md"
+  },
+  "budget_per_device_mib": {
+    "strix_halo_mib": 122880,
+    "discrete_mib": 24576
+  },
+  "placement": {
+    "scheme": "asymmetric expert parallel per PR 604",
+    "discrete": ["dense", "hot experts"],
+    "strix_halo": ["tail experts"],
+    "join": "discrete"
+  },
+  "draft": {
+    "model": "DeepSeek-V4-Flash-DSpark-draft-Q4RMFP4-denseF16.gguf",
+    "gib": 11.3,
+    "top_k": 4,
+    "top_k_reference": 6,
+    "note": "headline profile is top_k 4. top_k 6 is the reference profile from docs/ds4v-baseline.md"
+  },
+  "context_slots": 135168,
+  "vision": {
+    "mmproj_required": true,
+    "mmproj_type": "F16",
+    "mmproj_gib": 0.9,
+    "bias_vl_layers": 43
+  },
+  "uncensored": true,
+  "warning": "Uncensored model. Local only. Do not expose it to the network."
+}
