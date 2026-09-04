@@ -3542,6 +3542,51 @@ bool eval_moe_hybrid_ffn_batched(
                             : storage.gate_cold    ? (int)storage.gate_cold->ne[2]
                             : 0;
     const bool cold_on_gpu = storage.cold_backend_kind == MoeHybridColdBackend::Gpu;
+    // Cold owner None (a cluster rank): every route that survived masking is
+    // resident here and there is no second owner, so the whole batch can be
+    // packed by expert into ONE graph per layer. Without this a reduced hot
+    // stack falls into the sub-batch loop far below, whose size is
+    // min(mmq_safe_sub_batch(), prefill limit) = 1 on gfx1151 - one graph per
+    // token per layer. Measured on a 1517-token prompt: 25.9 s of FFN against
+    // 7.6 s for a single node's whole prefill graph. Expert-major packing is
+    // also what keeps the reduced stack off the MMQ full-batch path that
+    // mmq_safe_full_batch=false exists to avoid.
+    const bool hot_only_expert_major =
+        !expert_compute &&
+        storage.cold_backend_kind == MoeHybridColdBackend::None &&
+        !storage.gate_cold && !storage.gate_up_cold && !storage.down_cold &&
+        n_hot_stack > 0 &&
+        moe_expert_major_prefill_enabled(n_tokens);
+    if (hot_only_expert_major) {
+        static std::once_flag logged;
+        std::call_once(logged, [n_tokens, n_hot_stack] {
+            std::fprintf(stderr,
+                         "[hybrid-ffn] hot-only expert-major batch active tokens=%d "
+                         "stack=%d (no cold owner)\n",
+                         n_tokens, n_hot_stack);
+        });
+        const auto wall_t0 = HybridClock::now();
+        std::string owner_err;
+        const bool ok = eval_moe_owner_expert_major_batched(
+            gpu_backend, cfg, desc,
+            storage.gate_hot, storage.up_hot, storage.down_hot,
+            storage.gate_up_hot, storage.hot_local_by_global,
+            cur_host, selected_ids, selected_weights, n_tokens,
+            desc.has_shared_expert(), out, &owner_err,
+            cur_backend, gpu_backend,
+            /*device_output=*/nullptr, /*device_output_owner=*/nullptr,
+            p_hot_alloc);
+        if (!ok) {
+            if (err) *err = owner_err;
+            return false;
+        }
+        if (telemetry) {
+            const auto done = HybridClock::now();
+            telemetry->hot_us += elapsed_us(wall_t0, done);
+            telemetry->ffn_wall_us += elapsed_us(wall_t0, done);
+        }
+        return true;
+    }
     const bool inprocess_expert_major =
         !expert_compute && moe_expert_major_prefill_enabled(n_tokens) &&
         cold_on_gpu && storage.cold_backend &&
