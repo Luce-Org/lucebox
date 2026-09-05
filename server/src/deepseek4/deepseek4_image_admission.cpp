@@ -4,9 +4,6 @@
 #include "common/moe_hybrid_placement.h"
 #include "common/moe_hybrid_types.h"
 #include "ggml-backend.h"
-#if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
-#include "ggml-cuda.h"
-#endif
 
 #include <algorithm>
 #include <array>
@@ -15,9 +12,6 @@
 #include <fstream>
 #include <limits>
 #include <sstream>
-#if defined(__linux__)
-#include <sys/utsname.h>
-#endif
 
 namespace dflash::vision {
 namespace {
@@ -145,74 +139,6 @@ bool device_free(ggml_backend_t backend, uint64_t & available, std::string & err
     return true;
 }
 } // namespace
-
-bool prepare_deepseek4_image_startup_snapshot(
-    const std::string & meminfo, const std::string & kernel_release,
-    const ImageAdmissionReserves & reserves, ImageMemorySnapshot & snapshot,
-    std::string & error) {
-    error.clear();
-    const bool qualified = kernel_release == "7.1.3-070103-generic";
-    // Read the entire stream: GPU counters can occur past the backend helper's
-    // historical 2 KiB buffer. Reject signs, duplicate keys, units and overflow.
-    const std::array<const char *, 5> names{
-        "MemAvailable:", "MemTotal:", "GPUActive:", "GPUReclaim:", "HugePages_Total:"};
-    std::array<uint64_t, 5> values{};
-    std::array<bool, 5> found{};
-    std::istringstream input(meminfo);
-    std::string line;
-    while (std::getline(input, line)) {
-        std::istringstream fields(line);
-        std::string key;
-        fields >> key;
-        for (size_t i = 0; i < names.size(); ++i) {
-            if (key != names[i] || (i && !qualified)) continue;
-            std::string digits, unit, extra;
-            if (found[i] || !(fields >> digits) || digits.empty()) {
-                return fail(error, "duplicate or invalid startup memory field: " + key);
-            }
-            uint64_t value = 0;
-            for (char digit : digits) {
-                if (digit < '0' || digit > '9' || !mul(value, 10, value) ||
-                    !add(value, uint64_t(digit - '0'))) {
-                    return fail(error, "invalid or overflowing startup memory field: " + key);
-                }
-            }
-            if (i != 4 && (!(fields >> unit) || unit != "kB" || !mul(value, 1024, value))) {
-                return fail(error, "invalid startup memory units or overflow: " + key);
-            }
-            if (fields >> extra) return fail(error, "extra startup memory field data: " + key);
-            values[i] = value;
-            found[i] = true;
-        }
-    }
-    if (!found[0]) return fail(error, "startup MemAvailable is missing");
-    ImageMemorySnapshot next = snapshot;
-    next.host_available_bytes = values[0];
-    next.host_gpu_reclaim_credit_bytes = 0;
-    next.host_capacity_policy = "raw-unqualified-kernel";
-    if (qualified) {
-        uint64_t accounted = values[0];
-        if ((found[2] && !add(accounted, values[2])) ||
-            (found[3] && !add(accounted, values[3])) ||
-            (found[1] && (!values[1] || accounted > values[1]))) {
-            return fail(error, "startup host/GPU memory counters exceed physical capacity");
-        }
-        next.host_capacity_policy = "raw-missing-gpu-pool-fields";
-        if (std::all_of(found.begin(), found.end(), [](bool value) { return value; })) {
-            next.host_capacity_policy = "raw-reserved-huge-pages";
-            if (!values[4]) {
-                const uint64_t capacity = values[0] + values[3]; // checked in accounted above
-                next.host_available_bytes = capacity;
-                next.host_gpu_reclaim_credit_bytes = values[3];
-                next.host_capacity_policy = "startup-linux-7.1.3-gpu-reclaim";
-                if (reserves.primary_domain == ImageMemoryDomain::HostShared) next.primary_free_bytes = capacity;
-                if (reserves.cold_domain == ImageMemoryDomain::HostShared) next.cold_free_bytes = capacity;
-            }
-        }
-    }
-    snapshot = next;
-    return true;
-}
 
 bool estimate_deepseek4_image_storage(
     const common::DeepSeek4Weights & w, const common::MoeHybridPlacement & placement,
@@ -346,30 +272,12 @@ bool check_deepseek4_image_admission(
         reserves.cold_domain == ImageMemoryDomain::Unknown) {
         return fail(error, "actual owner host-memory sharing must be classified before admission");
     }
-    ImageMemorySnapshot snapshot;
-    if (!device_free(primary, snapshot.primary_free_bytes, error) ||
-        !device_free(cold, snapshot.cold_free_bytes, error)) return false;
-#if defined(__linux__)
-    std::ifstream input("/proc/meminfo");
-    if (!input) return fail(error, "cannot read startup host memory");
-    std::ostringstream contents;
-    contents << input.rdbuf();
-    if (!contents || input.bad()) return fail(error, "cannot finish reading startup host memory");
-    std::string kernel_release;
-#if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
-    struct utsname kernel{};
-    // Only real HIP owners use the qualified kernel pool accounting. Other
-    // backends retain their own free-memory limits, including exhausted ones.
-    if (ggml_backend_is_cuda(primary) && ggml_backend_is_cuda(cold) &&
-        uname(&kernel) == 0) kernel_release = kernel.release;
-#endif
-    if (!prepare_deepseek4_image_startup_snapshot(contents.str(), kernel_release,
-            reserves, snapshot, error)) return false;
-#else
-    if (!host_available(snapshot.host_available_bytes, error)) return false;
-#endif
+    if (!device_free(primary, out.primary_free_bytes, error) ||
+        !device_free(cold, out.cold_free_bytes, error) ||
+        !host_available(out.host_available_bytes, error)) return false;
     const ImageStorageEstimate storage = out.storage;
     const uint64_t activation_bytes = out.cold_activation_estimate_bytes;
+    const ImageMemorySnapshot snapshot{out.primary_free_bytes, out.cold_free_bytes, out.host_available_bytes};
     return assess_deepseek4_image_admission(storage, activation_bytes, reserves, snapshot, out, error);
 }
 
@@ -421,8 +329,6 @@ bool assess_deepseek4_image_admission(
     out.primary_free_bytes = snapshot.primary_free_bytes;
     out.cold_free_bytes = snapshot.cold_free_bytes;
     out.host_available_bytes = snapshot.host_available_bytes;
-    out.host_gpu_reclaim_credit_bytes = snapshot.host_gpu_reclaim_credit_bytes;
-    out.host_capacity_policy = snapshot.host_capacity_policy;
     const auto known_domain = [](ImageMemoryDomain domain) {
         return domain == ImageMemoryDomain::Dedicated || domain == ImageMemoryDomain::HostShared;
     };

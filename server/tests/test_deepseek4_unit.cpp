@@ -1248,7 +1248,6 @@ struct ImageAdmissionFakeOwner {
     ggml_backend_buffer_type buft{};
     ggml_backend_device device{};
     ggml_backend backend{};
-    ggml_guid guid{};
     size_t alignment = 128;
     size_t padding = 64;
     size_t maximum = SIZE_MAX;
@@ -1289,7 +1288,6 @@ struct ImageAdmissionFakeOwner {
             *free = owner.free_bytes;
             *total = owner.total_bytes;
         };
-        backend.guid = &guid;
         backend.device = &device;
         backend.context = this;
         backend.iface.graph_compute = [](ggml_backend_t b, ggml_cgraph *) {
@@ -1437,7 +1435,6 @@ static void test_image_storage_admission_metadata() {
         &hot.backend, &cold.backend, reserves, report, error));
     TEST_ASSERT(report.storage_estimated && !report.known_charges_fit);
     TEST_ASSERT(report.cold_free_bytes == 0);
-    TEST_ASSERT(report.host_gpu_reclaim_credit_bytes == 0);
     TEST_ASSERT(!check_deepseek4_image_runtime_admission(config,
         &hot.backend, &cold.backend, reserves, report, error));
     TEST_ASSERT(report.storage.hot_allocation_bytes == 0 && report.storage.cold_allocation_bytes == 0);
@@ -1558,107 +1555,6 @@ static void test_image_admission_resource_snapshots() {
     TEST_ASSERT(assess_deepseek4_image_admission(report.storage, 150, reserves,
         snapshot, report, error)); // report may safely be reused without losing its estimate
     TEST_ASSERT(report.primary_required_bytes == 130);
-    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
-}
-
-static void test_image_startup_reclaim_accounting() {
-    std::fprintf(stderr, "test_image_startup_reclaim_accounting...\n");
-    using namespace dflash::vision;
-    constexpr uint64_t kib = 1024;
-    constexpr uint64_t gib = 1024 * 1024 * kib;
-    const std::string kernel = "7.1.3-070103-generic";
-    const auto meminfo = [](uint64_t available, uint64_t reclaim) {
-        return "MemAvailable: " + std::to_string(available) + " kB\nMemTotal: 130023424 kB\n"
-            "GPUActive: 1024 kB\nGPUReclaim: " + std::to_string(reclaim) +
-            " kB\nHugePages_Total: 0\n";
-    };
-    ImageAdmissionReserves reserves;
-    reserves.primary_domain = ImageMemoryDomain::Dedicated;
-    reserves.cold_domain = ImageMemoryDomain::HostShared;
-    reserves.host_request_bytes = 4 * gib;
-    reserves.host_loader_overhead_bytes = gib;
-    reserves.cold_runtime_reservation_bytes = 2 * gib;
-    ImageStorageEstimate storage;
-    storage.cold_allocation_bytes = 89163 * gib / 1000;
-    ImageMemorySnapshot raw{8 * gib, 73470 * gib / 1000, 73470 * gib / 1000};
-    ImageMemorySnapshot startup = raw;
-    ImageAdmissionReport report;
-    std::string error;
-    const auto fields = meminfo(raw.host_available_bytes / kib, (49200 * gib / 1000) / kib);
-    TEST_ASSERT(prepare_deepseek4_image_startup_snapshot(fields, kernel, reserves, startup, error));
-    TEST_ASSERT(startup.primary_free_bytes == raw.primary_free_bytes);
-    TEST_ASSERT(startup.cold_free_bytes == startup.host_available_bytes);
-    TEST_ASSERT(startup.host_available_bytes == raw.host_available_bytes / kib * kib +
-        (49200 * gib / 1000) / kib * kib);
-    TEST_ASSERT(assess_deepseek4_image_admission(storage, gib, reserves, startup, report, error));
-    TEST_ASSERT(report.host_required_bytes == storage.cold_allocation_bytes + 6 * gib);
-    TEST_ASSERT(report.host_gpu_reclaim_credit_bytes == startup.host_gpu_reclaim_credit_bytes);
-    TEST_ASSERT(!assess_deepseek4_image_admission(storage, gib, reserves, raw, report, error));
-    for (const std::string release : {std::string("7.1.4"), std::string(""), std::string("7.1.3-other")}) {
-        ImageMemorySnapshot other = raw;
-        TEST_ASSERT(prepare_deepseek4_image_startup_snapshot(fields, release, reserves, other, error));
-        TEST_ASSERT(other.host_gpu_reclaim_credit_bytes == 0 && other.cold_free_bytes == raw.cold_free_bytes);
-        TEST_ASSERT(!assess_deepseek4_image_admission(storage, gib, reserves, other, report, error));
-    }
-    // Even with qualified credit, dedicated physical limits remain binding.
-    storage.hot_allocation_bytes = raw.primary_free_bytes + 1;
-    TEST_ASSERT(!assess_deepseek4_image_admission(storage, gib, reserves, startup, report, error));
-    storage.hot_allocation_bytes = 0;
-    // Two UMA owners spend a single physical pool. Exact combined fit succeeds;
-    // adding one byte fails although both individual owner limits still fit.
-    reserves.primary_domain = ImageMemoryDomain::HostShared;
-    TEST_ASSERT(prepare_deepseek4_image_startup_snapshot(fields, kernel, reserves, startup, error));
-    storage.hot_allocation_bytes = startup.host_available_bytes - storage.cold_allocation_bytes - 6 * gib;
-    TEST_ASSERT(assess_deepseek4_image_admission(storage, gib, reserves, startup, report, error));
-    ++storage.hot_allocation_bytes;
-    TEST_ASSERT(!assess_deepseek4_image_admission(storage, gib, reserves, startup, report, error));
-    TEST_ASSERT(report.primary_required_bytes < startup.primary_free_bytes &&
-        report.cold_required_bytes < startup.cold_free_bytes);
-    // An ordinary runtime snapshot has no credit; fresh graphs cannot inherit
-    // a startup pool balance that may have been consumed by resident weights.
-    ImageMemorySnapshot runtime{gib, gib, gib};
-    TEST_ASSERT(!assess_deepseek4_image_admission({}, gib, reserves, runtime, report, error));
-    TEST_ASSERT(report.host_gpu_reclaim_credit_bytes == 0 && report.host_capacity_policy == "raw");
-    for (const std::string optional : {std::string(""), std::string("GPUReclaim: 8 kB\n")}) {
-        ImageMemorySnapshot missing = raw;
-        TEST_ASSERT(prepare_deepseek4_image_startup_snapshot("MemAvailable: 32 kB\n" + optional,
-            kernel, reserves, missing, error));
-        TEST_ASSERT(missing.host_available_bytes == 32 * kib && missing.host_gpu_reclaim_credit_bytes == 0);
-        TEST_ASSERT(missing.primary_free_bytes == raw.primary_free_bytes);
-    }
-    ImageMemorySnapshot huge = raw;
-    TEST_ASSERT(prepare_deepseek4_image_startup_snapshot(fields + "Unrelated: 1\n", kernel, reserves, huge, error));
-    std::string huge_fields = fields;
-    huge_fields.replace(huge_fields.find("HugePages_Total: 0"), 18, "HugePages_Total: 1");
-    huge = raw;
-    TEST_ASSERT(prepare_deepseek4_image_startup_snapshot(huge_fields, kernel, reserves, huge, error));
-    TEST_ASSERT(huge.host_gpu_reclaim_credit_bytes == 0 && huge.cold_free_bytes == raw.cold_free_bytes);
-    const std::string prefix = "MemAvailable: 32 kB\nMemTotal: 128 kB\nHugePages_Total: 0\n";
-    for (const std::string counters : {
-            "GPUActive: 1 kB\nGPUReclaim: -1 kB\n", "GPUActive: 1 kB\nGPUReclaim: +1 kB\n",
-            "GPUActive: 1 kB\nGPUReclaim: 1 MB\n", "GPUActive: 1 kB\nGPUReclaim: 1 kB extra\n",
-            "GPUActive: 1 kB\nGPUReclaim: 1 kB\nGPUReclaim: 1 kB\n",
-            "GPUActive: 97 kB\nGPUReclaim: 0 kB\n", "GPUActive: 0 kB\nGPUReclaim: 97 kB\n",
-            "GPUActive: 0 kB\nGPUReclaim: 18446744073709551615 kB\n",
-            "GPUActive: 0 kB\nGPUReclaim: 18446744073709551616 kB\n"}) {
-        ImageMemorySnapshot invalid = raw;
-        TEST_ASSERT(!prepare_deepseek4_image_startup_snapshot(prefix + counters, kernel, reserves, invalid, error));
-        TEST_ASSERT(invalid.host_available_bytes == raw.host_available_bytes && invalid.host_gpu_reclaim_credit_bytes == 0);
-    }
-    for (const std::string bad_raw : {"MemAvailable: -1 kB\n", "MemAvailable: 1 kB\nMemAvailable: 2 kB\n",
-            "MemAvailable: 1 MB\n", "GPUReclaim: 1 kB\n"}) {
-        ImageMemorySnapshot invalid = raw;
-        TEST_ASSERT(!prepare_deepseek4_image_startup_snapshot(bad_raw, "unknown", reserves, invalid, error));
-    }
-    ImageMemorySnapshot active = raw;
-    TEST_ASSERT(prepare_deepseek4_image_startup_snapshot(prefix + "GPUActive: 80 kB\nGPUReclaim: 16 kB\n",
-        kernel, reserves, active, error));
-    TEST_ASSERT(active.host_available_bytes == 48 * kib); // active pages never count as capacity
-    // GPU fields beyond 2 KiB must still be parsed, not silently truncated.
-    ImageMemorySnapshot long_input = raw;
-    TEST_ASSERT(prepare_deepseek4_image_startup_snapshot(std::string(4096, ' ') + "\n" + fields,
-        kernel, reserves, long_input, error));
-    TEST_ASSERT(long_input.host_gpu_reclaim_credit_bytes == startup.host_gpu_reclaim_credit_bytes);
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
@@ -4801,7 +4697,6 @@ int main() {
     test_image_batch_admission_before_execution(backend);
     test_image_storage_admission_metadata();
     test_image_admission_resource_snapshots();
-    test_image_startup_reclaim_accounting();
     test_dspark_loader_contract_and_bounds(backend);
     test_dspark_confidence_uses_separate_hidden(backend);
     test_safe_compressor_batch_tokens();

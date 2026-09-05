@@ -62,8 +62,6 @@ struct ImageAdmissionReport {
     uint64_t primary_free_bytes = 0;
     uint64_t cold_free_bytes = 0;
     uint64_t host_available_bytes = 0;
-    uint64_t host_gpu_reclaim_credit_bytes = 0;
-    std::string host_capacity_policy = "raw";
     uint64_t primary_required_bytes = 0;
     uint64_t cold_required_bytes = 0;
     uint64_t host_required_bytes = 0;
@@ -77,25 +75,7 @@ struct ImageMemorySnapshot {
     uint64_t primary_free_bytes = 0;
     uint64_t cold_free_bytes = 0;
     uint64_t host_available_bytes = 0;
-    uint64_t host_gpu_reclaim_credit_bytes = 0;
-    std::string host_capacity_policy = "raw";
 };
-
-// Pure startup-only snapshot transform. The live caller supplies one complete
-// /proc/meminfo read and a Linux/HIP kernel release. Credit is qualified only for
-// 7.1.3-070103-generic: upstream v7.1.3 mm/show_mem.c si_mem_available excludes
-// NR_GPU_RECLAIM, while Documentation/filesystems/proc.rst defines reclaimable
-// GPU pools separately from GPUActive. Kernel build provenance must be retained
-// during qualification; neither newer versions nor field presence imply support.
-// Unknown kernels/missing optional fields retain raw accounting. Malformed
-// provided fields on a qualified kernel fail closed. No reserved huge pages are
-// supported for credit. This is capacity accounting, not a zero-swap guarantee.
-// Shared owners use the same capacity as the combined host gate, never separate
-// additive credits. Runtime and preparation deliberately do not call this helper.
-bool prepare_deepseek4_image_startup_snapshot(
-    const std::string & meminfo, const std::string & kernel_release,
-    const ImageAdmissionReserves & reserves, ImageMemorySnapshot & snapshot,
-    std::string & error);
 
 // Pure assessment shared by live admission and deterministic CPU tests. All
 // figures describe allocations still to come relative to this one snapshot.

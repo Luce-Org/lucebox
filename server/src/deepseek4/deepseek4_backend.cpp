@@ -1835,12 +1835,6 @@ bool DeepSeek4Backend::init_hybrid_model() {
             gib(report.host_required_bytes), gib(report.host_available_bytes),
             gib(report.cold_activation_estimate_bytes), gib(report.cold_runtime_reservation_bytes),
             admitted ? "admitted" : err.c_str());
-        std::fprintf(stderr,
-            "[deepseek4] image startup host capacity: raw=%.3f GiB gpu_reclaim_credit=%.3f GiB "
-            "effective=%.3f GiB policy=%s (capacity estimate, not a zero-swap guarantee)\n",
-            gib(report.host_available_bytes - report.host_gpu_reclaim_credit_bytes),
-            gib(report.host_gpu_reclaim_credit_bytes), gib(report.host_available_bytes),
-            report.host_capacity_policy.c_str());
         if (!admitted) return fail_hybrid_init();
         image_reserves_ = reserves;
 #else
