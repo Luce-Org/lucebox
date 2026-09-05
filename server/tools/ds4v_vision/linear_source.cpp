@@ -85,7 +85,9 @@ int main(int argc,char**argv) {
             check(ggml_backend_graph_compute(backend,g)==GGML_STATUS_SUCCESS,"compute failed");
             const size_t launches=dflash::vision::detail::hip_bias_launches(backend)-before;
             check(launches==ops,"actual Lt launch count differs from explicit op count");
-            std::cout<<"fused_graph_ops="<<ops<<" actual_lt_launches="<<launches<<" retained_workspace_bytes="<<external<<'\n';
+            const size_t norm_launches=dflash::vision::detail::hip_norm_launches(backend);
+            check(norm_launches==0,"linear graph unexpectedly submitted vision normalization");
+            std::cout<<"fused_graph_ops="<<ops<<" actual_lt_launches="<<launches<<" actual_norm_launches="<<norm_launches<<" retained_workspace_bytes="<<external<<'\n';
             std::vector<float> actual(ref.size()),unbiased(ref.size()),expected(ref.size());
             ggml_backend_tensor_get(y,actual.data(),0,actual.size()*4); ggml_backend_tensor_get(u,unbiased.data(),0,unbiased.size()*4); if(expected_u) ggml_backend_tensor_get(expected_u,expected.data(),0,expected.size()*4);
             size_t bad=0,ubad=0; float maxabs=0;

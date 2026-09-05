@@ -92,7 +92,8 @@ int main(int argc,char **argv) {
         ggml_backend_synchronize(owner.backend);
         const size_t after=dflash::vision::detail::hip_norm_launches(owner.backend);
         check(after>=before && after-before==1,"actual source normalization dispatch mismatch");
-        check(dflash::vision::detail::hip_bias_launches(owner.backend)==0,"normalization unexpectedly submitted Lt");
+        const size_t lt_launches=dflash::vision::detail::hip_bias_launches(owner.backend);
+        check(lt_launches==0,"normalization unexpectedly submitted Lt");
         fs::create_directory(out); size_t total=0;
         const char *names[]={"scaled","weighted","output"};
         for(int field=0;field<3;++field) {
@@ -107,7 +108,7 @@ int main(int argc,char **argv) {
             file.write(reinterpret_cast<const char *>(actual.data()),actual.size()*4); check(bool(file),"output write failed");
             std::cout<<names[field]<<"_source_mismatches="<<mismatches<<'\n'; total+=mismatches;
         }
-        std::cout<<"explicit_norm_ops=1 actual_norm_launches=1 graph_arena_bytes="<<arena<<'\n';
+        std::cout<<"explicit_norm_ops=1 actual_norm_launches=1 actual_lt_launches="<<lt_launches<<" graph_arena_bytes="<<arena<<'\n';
         std::cout<<"source_bitwise_mismatches="<<total<<" reference_layout="<<(rows==source_rows?"original":"rowwise-tiled-original")<<'\n';
         if(total) return 3;
         std::cout<<"PASS: production normalization matches original source intermediates\n";

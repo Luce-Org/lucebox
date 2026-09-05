@@ -123,6 +123,8 @@ int main(int argc,char **argv) {
         ggml_backend_synchronize(owner.backend);
         const size_t after=dflash::vision::detail::hip_bias_launches(owner.backend);
         check(after>=before && after-before==explicit_ops,"wrong actual Lt submission count");
+        const size_t norm_launches=dflash::vision::detail::hip_norm_launches(owner.backend);
+        check(norm_launches==0,"linear graph unexpectedly submitted vision normalization");
         std::vector<float> actual(elements);
         ggml_backend_tensor_get(y,actual.data(),0,output_bytes);
         size_t mismatches=0; double max_abs=0;
@@ -136,6 +138,7 @@ int main(int argc,char **argv) {
         file.write(reinterpret_cast<const char *>(actual.data()),std::streamsize(output_bytes));
         file.close(); check(bool(file),"output write failed");
         std::cout<<"explicit_unbiased_ops="<<explicit_ops<<" actual_lt_launches="<<after-before
+                 <<" actual_norm_launches="<<norm_launches
                  <<" retained_workspace_bytes="<<external<<" graph_arena_bytes="<<arena
                  <<" accounted_scratch_bytes="<<arena+external<<'\n';
         std::cout<<"elements="<<elements<<" source_bitwise_mismatches="<<mismatches<<" max_abs="<<max_abs<<'\n';
