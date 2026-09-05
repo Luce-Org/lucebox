@@ -59,20 +59,25 @@ int main(int argc,char**argv) {
             auto device=ggml_backend_get_device(backend);
             bool preserve=device&&(ggml_backend_dev_type(device)==GGML_BACKEND_DEVICE_TYPE_GPU||ggml_backend_dev_type(device)==GGML_BACKEND_DEVICE_TYPE_IGPU);
             auto y=dflash::vision::detail::linear(c,w,x,b,preserve,backend);
-            // Bias-free graph must retain its existing raw-dot plus final BF16 cast.
+            // CPU retains its raw-dot/final-cast contract. HIP unbiased output is diagnostic here;
+            // original-source MLP fixtures are checked by ds4v_linear_unbiased_source.
             auto u=dflash::vision::detail::linear(c,w,x,nullptr,preserve,backend);
-            auto raw=ggml_mul_mat(c,w,x); ggml_mul_mat_set_prec(raw,GGML_PREC_F32);
-            auto expected_u=ggml_cast(c,ggml_cast(c,raw,GGML_TYPE_BF16),GGML_TYPE_F32);
+            ggml_tensor * expected_u=nullptr;
+            if(dev=="cpu") {
+                auto raw=ggml_mul_mat(c,w,x); ggml_mul_mat_set_prec(raw,GGML_PREC_F32);
+                expected_u=ggml_cast(c,ggml_cast(c,raw,GGML_TYPE_BF16),GGML_TYPE_F32);
+            }
             auto g=ggml_new_graph(c);
-            for(auto t:{y,u,expected_u}) { ggml_set_output(t); ggml_build_forward_expand(g,t); }
+            for(auto t:{y,u,expected_u}) if(t) { ggml_set_output(t); ggml_build_forward_expand(g,t); }
             const size_t external=dflash::vision::detail::hip_bias_workspace(backend);
             size_t ops=0;
             for(int i=0;i<ggml_graph_n_nodes(g);++i) ops+=ggml_graph_node(g,i)->op==GGML_OP_MUL_MAT_BIAS_BF16;
-            check(ops==(dev=="hip:0"?1u:0u),"wrong actual fused-op graph dispatch");
+            check(ops==(dev=="hip:0"?2u:0u),"wrong actual fused-op graph dispatch");
             check((external!=0)==(dev=="hip:0"),"wrong HIP-only capability");
             const size_t before=dflash::vision::detail::hip_bias_launches(backend);
             size_t scratch=0; ggml_gallocr_reserve_n_size(owner.a,g,nullptr,nullptr,&scratch);
-            check(scratch<128ULL*1024*1024,"graph scratch exceeds fixed bound");
+            constexpr size_t limit=128ULL*1024*1024;
+            check(external<=limit && scratch<=limit-external,"graph arena plus workspace exceeds fixed bound");
             for(int i=0;i<ggml_graph_n_nodes(g);++i) check(ggml_backend_supports_op(backend,ggml_graph_node(g,i)),"unsupported node");
             check(ggml_gallocr_reserve(owner.a,g),"graph reservation failed");
             check(ggml_gallocr_alloc_graph(owner.a,g),"graph allocation failed");
@@ -82,12 +87,13 @@ int main(int argc,char**argv) {
             check(launches==ops,"actual Lt launch count differs from explicit op count");
             std::cout<<"fused_graph_ops="<<ops<<" actual_lt_launches="<<launches<<" retained_workspace_bytes="<<external<<'\n';
             std::vector<float> actual(ref.size()),unbiased(ref.size()),expected(ref.size());
-            ggml_backend_tensor_get(y,actual.data(),0,actual.size()*4); ggml_backend_tensor_get(u,unbiased.data(),0,unbiased.size()*4); ggml_backend_tensor_get(expected_u,expected.data(),0,expected.size()*4);
+            ggml_backend_tensor_get(y,actual.data(),0,actual.size()*4); ggml_backend_tensor_get(u,unbiased.data(),0,unbiased.size()*4); if(expected_u) ggml_backend_tensor_get(expected_u,expected.data(),0,expected.size()*4);
             size_t bad=0,ubad=0; float maxabs=0;
-            for(size_t i=0;i<actual.size();++i) { check(std::isfinite(actual[i])&&std::isfinite(unbiased[i]),"nonfinite output"); bad+=bits(actual[i])!=bits(ref[i]); ubad+=bits(unbiased[i])!=bits(expected[i]); maxabs=std::max(maxabs,std::abs(actual[i]-ref[i])); }
+            for(size_t i=0;i<actual.size();++i) { check(std::isfinite(actual[i])&&std::isfinite(unbiased[i]),"nonfinite output"); bad+=bits(actual[i])!=bits(ref[i]); if(expected_u) ubad+=bits(unbiased[i])!=bits(expected[i]); maxabs=std::max(maxabs,std::abs(actual[i]-ref[i])); }
             std::filesystem::create_directories(out);
             for(auto item:{std::make_pair("biased.f32",&actual),std::make_pair("unbiased.f32",&unbiased)}) { std::ofstream f(out/item.first,std::ios::binary); f.write((char*)item.second->data(),item.second->size()*4); check(bool(f),"output write failed"); }
-            std::cout<<"elements="<<actual.size()<<" source_bitwise_mismatches="<<bad<<" maxabs="<<maxabs<<" unbiased_contract_mismatches="<<ubad<<" graph_scratch_bytes="<<scratch<<'\n';
+            std::cout<<"elements="<<actual.size()<<" source_bitwise_mismatches="<<bad<<" maxabs="<<maxabs<<" unbiased_validation="<<(expected_u?"CPU-generic-preservation":"HIP-diagnostic-only")
+                     <<" unbiased_contract_mismatches="<<(expected_u?std::to_string(ubad):"not_applicable")<<" graph_scratch_bytes="<<scratch<<'\n';
             status=(bad||ubad)?3:0;
         }
         ggml_backend_free(backend); return status;

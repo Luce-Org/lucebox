@@ -5,11 +5,12 @@
 bool ggml_hip_vision_bias_supported(const ggml_tensor * d) {
     if (!d || d->type != GGML_TYPE_BF16 || !ggml_is_contiguous(d)) return false;
     const auto w=d->src[0],x=d->src[1],b=d->src[2];
-    if (!w || !x || !b) return false;
-    for (auto t : {w,x,b}) if (t->type != GGML_TYPE_BF16 || !ggml_is_contiguous(t) || t->ne[2]!=1 || t->ne[3]!=1) return false;
+    if (!w || !x) return false;
+    for (auto t : {w,x}) if (t->type != GGML_TYPE_BF16 || !ggml_is_contiguous(t) || t->ne[2]!=1 || t->ne[3]!=1) return false;
+    if (b && (b->type!=GGML_TYPE_BF16 || !ggml_is_contiguous(b) || !ggml_is_vector(b) || b->ne[0]!=w->ne[1])) return false;
     return w->ne[0]>0 && w->ne[0]<=INT_MAX && w->ne[1]>0 && w->ne[1]<=INT_MAX &&
            x->ne[1]>0 && x->ne[1]<=INT_MAX && x->ne[0]==w->ne[0] &&
-           b->ne[0]==w->ne[1] && b->ne[1]==1 && d->ne[0]==w->ne[1] && d->ne[1]==x->ne[1] && d->ne[2]==1 && d->ne[3]==1;
+           d->ne[0]==w->ne[1] && d->ne[1]==x->ne[1] && d->ne[2]==1 && d->ne[3]==1;
 }
 
 void ggml_hip_vision_bias(ggml_backend_cuda_context &ctx, ggml_tensor *dst) {
@@ -32,11 +33,11 @@ void ggml_hip_vision_bias(ggml_backend_cuda_context &ctx, ggml_tensor *dst) {
     hipblasLtMatmulPreference_t pref=nullptr;
     CUBLAS_CHECK(hipblasLtMatmulDescCreate(&op,HIPBLAS_COMPUTE_32F,HIP_R_32F));
     const hipblasOperation_t ta=HIPBLAS_OP_T,tb=HIPBLAS_OP_N;
-    const hipblasLtEpilogue_t epilogue=HIPBLASLT_EPILOGUE_BIAS;
+    const hipblasLtEpilogue_t epilogue=b ? HIPBLASLT_EPILOGUE_BIAS : HIPBLASLT_EPILOGUE_DEFAULT;
     CUBLAS_CHECK(hipblasLtMatmulDescSetAttribute(op,HIPBLASLT_MATMUL_DESC_TRANSA,&ta,sizeof(ta)));
     CUBLAS_CHECK(hipblasLtMatmulDescSetAttribute(op,HIPBLASLT_MATMUL_DESC_TRANSB,&tb,sizeof(tb)));
     CUBLAS_CHECK(hipblasLtMatmulDescSetAttribute(op,HIPBLASLT_MATMUL_DESC_EPILOGUE,&epilogue,sizeof(epilogue)));
-    CUBLAS_CHECK(hipblasLtMatmulDescSetAttribute(op,HIPBLASLT_MATMUL_DESC_BIAS_POINTER,&b->data,sizeof(b->data)));
+    if (b) CUBLAS_CHECK(hipblasLtMatmulDescSetAttribute(op,HIPBLASLT_MATMUL_DESC_BIAS_POINTER,&b->data,sizeof(b->data)));
     CUBLAS_CHECK(hipblasLtMatrixLayoutCreate(&a,HIP_R_16BF,k,m,k));
     CUBLAS_CHECK(hipblasLtMatrixLayoutCreate(&bl,HIP_R_16BF,k,n,k));
     CUBLAS_CHECK(hipblasLtMatrixLayoutCreate(&c,HIP_R_16BF,m,n,m));

@@ -122,10 +122,10 @@ size_t hip_bias_workspace(ggml_backend_t b) { return hip_bias_query(b,"ggml_back
 size_t hip_bias_launches(ggml_backend_t b) { return hip_bias_query(b,"ggml_backend_hip_vision_bias_bf16_launches"); }
 Tensor * linear(ggml_context * c,Tensor * weight,Tensor * input,Tensor * bias,bool preserve_biased_product,ggml_backend_t backend) {
     // HIP's explicit capability is required: generic supports_op defaults on
-    // other backends are not evidence of this source-specific fused operation.
-    if(bias && hip_bias_workspace(backend)) {
+    // other backends are not evidence of this source-specific operation.
+    if(hip_bias_workspace(backend)) {
         auto y=ggml_mul_mat_bias_bf16(c,weight,ggml_cast(c,input,GGML_TYPE_BF16),bias);
-        require(ggml_backend_supports_op(backend,y),"HIP fused BF16 vision linear unsupported; fallback forbidden");
+        require(ggml_backend_supports_op(backend,y),"HIP BF16 vision linear unsupported; fallback forbidden");
         return ggml_cast(c,y,GGML_TYPE_F32);
     }
     // Source biased linears round after the bias. The HIP BF16 BLAS path can
