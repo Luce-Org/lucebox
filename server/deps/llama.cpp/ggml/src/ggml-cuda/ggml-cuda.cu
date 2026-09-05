@@ -4,6 +4,7 @@
 
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/vision-bias.cuh"
+#include "ggml-cuda/vision-rotary.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/arange.cuh"
@@ -6680,6 +6681,20 @@ static size_t ggml_backend_hip_vision_norm_f32_launches(ggml_backend_t backend) 
     return backend && ggml_backend_is_cuda(backend) ?
         static_cast<ggml_backend_cuda_context *>(backend->context)->vision_norm_launches : 0;
 }
+static bool ggml_backend_hip_vision_rotary_f32_capable(ggml_backend_t backend) {
+    return ggml_backend_hip_vision_norm_f32_capable(backend);
+}
+static bool ggml_backend_hip_vision_rotary_f32(ggml_backend_t backend, int64_t height, int64_t width,
+                                            float * cosine, float * sine) {
+    return ggml_backend_hip_vision_rotary_f32_capable(backend) &&
+        ggml_hip_vision_rotary(*static_cast<ggml_backend_cuda_context *>(backend->context),
+                              height, width, cosine, sine);
+}
+static size_t ggml_backend_hip_vision_rotary_f32_launches(ggml_backend_t backend) {
+    return backend && ggml_backend_is_cuda(backend) ?
+        static_cast<ggml_backend_cuda_context *>(backend->context)->vision_rotary_launches : 0;
+}
+
 #endif
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
@@ -6688,6 +6703,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name,"ggml_backend_hip_vision_bias_bf16_launches")==0) return (void *)ggml_backend_hip_vision_bias_bf16_launches;
     if (strcmp(name,"ggml_backend_hip_vision_norm_f32_capable")==0) return (void *)ggml_backend_hip_vision_norm_f32_capable;
     if (strcmp(name,"ggml_backend_hip_vision_norm_f32_launches")==0) return (void *)ggml_backend_hip_vision_norm_f32_launches;
+    if (strcmp(name,"ggml_backend_hip_vision_rotary_f32_capable")==0) return (void *)ggml_backend_hip_vision_rotary_f32_capable;
+    if (strcmp(name,"ggml_backend_hip_vision_rotary_f32")==0) return (void *)ggml_backend_hip_vision_rotary_f32;
+    if (strcmp(name,"ggml_backend_hip_vision_rotary_f32_launches")==0) return (void *)ggml_backend_hip_vision_rotary_f32_launches;
 #endif
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {

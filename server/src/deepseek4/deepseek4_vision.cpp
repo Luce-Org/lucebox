@@ -121,6 +121,17 @@ static size_t hip_size_query(ggml_backend_t backend,const char * name) {
 size_t hip_bias_workspace(ggml_backend_t b) { return hip_size_query(b,"ggml_backend_hip_vision_bias_bf16_workspace"); }
 size_t hip_bias_launches(ggml_backend_t b) { return hip_size_query(b,"ggml_backend_hip_vision_bias_bf16_launches"); }
 size_t hip_norm_launches(ggml_backend_t b) { return hip_size_query(b,"ggml_backend_hip_vision_norm_f32_launches"); }
+size_t hip_rotary_launches(ggml_backend_t b) { return hip_size_query(b,"ggml_backend_hip_vision_rotary_f32_launches"); }
+bool hip_rotary_capable(ggml_backend_t backend) {
+    if(!backend) return false;
+    auto device=ggml_backend_get_device(backend);
+    if(!device) return false;
+    auto reg=ggml_backend_dev_backend_reg(device);
+    if(!reg) return false;
+    using Query=bool (*)(ggml_backend_t);
+    auto query=reinterpret_cast<Query>(ggml_backend_reg_get_proc_address(reg,"ggml_backend_hip_vision_rotary_f32_capable"));
+    return query && query(backend);
+}
 bool hip_norm_capable(ggml_backend_t backend) {
     if(!backend) return false;
     auto device=ggml_backend_get_device(backend);
@@ -156,8 +167,23 @@ Tensor * linear(ggml_context * c,Tensor * weight,Tensor * input,Tensor * bias,bo
     if(bias) y=ggml_add(c,y,ggml_cast(c,bias,GGML_TYPE_F32));
     return rounded(c,y);
 }
-void rotary_tables(PatchGrid grid,std::vector<float> & cosine,std::vector<float> & sine) {
+void rotary_tables(PatchGrid grid,std::vector<float> & cosine,std::vector<float> & sine,ggml_backend_t backend) {
+    require(grid.height>0 && grid.width>0 && grid.height<=1152 && grid.width<=1152,"invalid rotary grid");
     const int n=grid.height*grid.width;
+    if(hip_bias_workspace(backend)) {
+        const size_t temporary=(32+size_t(n)*32*3)*sizeof(float);
+        constexpr size_t limit=128ULL*1024*1024;
+        const size_t external=hip_bias_workspace(backend);
+        require(external<=limit && temporary<=limit-external,"HIP rotary temporary storage exceeds 128 MiB bound");
+        require(hip_rotary_capable(backend),"HIP source-order vision rotary tables unavailable; fallback forbidden");
+        using Fill=bool (*)(ggml_backend_t,int64_t,int64_t,float *,float *);
+        auto reg=ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        auto fill=reinterpret_cast<Fill>(ggml_backend_reg_get_proc_address(reg,"ggml_backend_hip_vision_rotary_f32"));
+        require(fill!=nullptr,"HIP source-order vision rotary table function unavailable");
+        cosine.resize(size_t(n)*32); sine.resize(size_t(n)*32);
+        require(fill(backend,grid.height,grid.width,cosine.data(),sine.data()),"HIP source-order vision rotary table preparation failed");
+        return;
+    }
     cosine.resize(size_t(n)*32); sine.resize(size_t(n)*32);
     for(int i=0;i<n;++i) for(int j=0;j<32;++j) {
         // Source uses pow then reciprocal in float32, height half before width.
@@ -259,6 +285,8 @@ bool VisionRuntime::load(const std::string & path,ggml_backend_t backend,int dim
         require(backend!=nullptr,"null vision backend");
         require(!detail::hip_bias_workspace(backend) || detail::hip_norm_capable(backend),
                 "HIP source-order vision normalization unavailable");
+        require(!detail::hip_bias_workspace(backend) || detail::hip_rotary_capable(backend),
+                "HIP source-order vision rotary tables unavailable");
         Meta meta;
         meta.g=gguf_init_from_file(path.c_str(),{true,&meta.c});
         require(meta.g && meta.c,"could not parse vision GGUF");
@@ -325,7 +353,10 @@ bool VisionRuntime::encode(const std::vector<float> & patches,PatchGrid grid,Vis
             x=impl_->execute(g,input,patches,y,observer);
         }
         std::vector<float> cos_values,sin_values;
-        detail::rotary_tables(grid,cos_values,sin_values);
+        // Patch output is already on the host. Release its reusable device arena
+        // before the independently bounded rotary temporary allocation.
+        if(detail::hip_bias_workspace(impl_->backend)) release_scratch();
+        detail::rotary_tables(grid,cos_values,sin_values,impl_->backend);
         for(int i=0;i<32;++i) {
             Graph g;
             const auto p="vision.blocks."+std::to_string(i);

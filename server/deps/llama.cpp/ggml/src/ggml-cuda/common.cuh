@@ -1443,6 +1443,7 @@ struct ggml_backend_cuda_context {
     cudaEvent_t vision_bias_event = nullptr;
     size_t vision_bias_launches = 0;
     size_t vision_norm_launches = 0;
+    size_t vision_rotary_launches = 0; // successful synchronous table calls (five kernels each)
 #endif
     int curr_stream_no = 0;
     bool low_priority_streams = false;
