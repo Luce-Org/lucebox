@@ -2196,6 +2196,13 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 GGML_ABORT("GGML_OP_FLASH_ATTN_SPARSE is only supported on the CUDA backend");
             }
+        case GGML_OP_MUL_MAT_BIAS_BF16:
+            { GGML_ABORT("GGML_OP_MUL_MAT_BIAS_BF16 requires the HIP Lt backend"); }
+        case GGML_OP_RMS_NORM_VISION_F32:
+            { GGML_ABORT("GGML_OP_RMS_NORM_VISION_F32 requires the HIP wave32 backend"); }
+        case GGML_OP_SOFT_MAX_VISION_F32:
+        case GGML_OP_MUL_MAT_VISION_AV_F32:
+            { GGML_ABORT("explicit vision attention requires the HIP wave32 backend"); }
         case GGML_OP_PAGED_ATTN:
             {
                 GGML_ABORT("GGML_OP_PAGED_ATTN is only supported on the CUDA backend");
@@ -2591,12 +2598,18 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_FLASH_ATTN_EXT:
         case GGML_OP_FLASH_ATTN_SPARSE:
         case GGML_OP_PAGED_ATTN:
+        case GGML_OP_MUL_MAT_BIAS_BF16:
         case GGML_OP_FLASH_ATTN_BACK:
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
             {
                 n_tasks = n_threads;
             } break;
+        case GGML_OP_RMS_NORM_VISION_F32:
+            GGML_ABORT("GGML_OP_RMS_NORM_VISION_F32 cannot be planned on CPU");
+        case GGML_OP_SOFT_MAX_VISION_F32:
+        case GGML_OP_MUL_MAT_VISION_AV_F32:
+            GGML_ABORT("explicit vision attention cannot be planned on CPU");
         case GGML_OP_RWKV_WKV6:
         case GGML_OP_GATED_LINEAR_ATTN:
         case GGML_OP_RWKV_WKV7:

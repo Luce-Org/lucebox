@@ -1200,9 +1200,13 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "MUL_MAT_GROUPED_SRC",
 
     "PAGED_ATTN",
+    "MUL_MAT_BIAS_BF16",
+    "RMS_NORM_VISION_F32",
+    "SOFT_MAX_VISION_F32",
+    "MUL_MAT_VISION_AV_F32",
 };
 
-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+static_assert(GGML_OP_COUNT == 109, "GGML_OP_COUNT != 109");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1327,9 +1331,13 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "X*grouped(Y)",
 
     "paged_attn(q,k,v)",
+    "bf16(X*Y+bias)",
+    "rms_norm_vision_f32(x)",
+    "soft_max_vision_f32(x)",
+    "vision_av_f32(v,p)",
 };
 
-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+static_assert(GGML_OP_COUNT == 109, "GGML_OP_COUNT != 109");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3308,6 +3316,62 @@ struct ggml_tensor * ggml_rms_norm_inplace(
     return ggml_rms_norm_impl(ctx, a, eps, true);
 }
 
+// ggml_rms_norm_vision_f32
+
+struct ggml_tensor * ggml_rms_norm_vision_f32(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        float                 eps) {
+    GGML_ASSERT(a && a->type == GGML_TYPE_F32 && ggml_is_contiguous(a));
+    GGML_ASSERT(a->ne[0] == 1024 && a->ne[1] >= 16 && a->ne[1] <= INT_MAX/1024);
+    GGML_ASSERT(a->ne[2] == 1 && a->ne[3] == 1);
+    GGML_ASSERT(isfinite(eps) && eps >= 0.0f);
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
+    ggml_set_op_params(result, &eps, sizeof(eps));
+    result->op = GGML_OP_RMS_NORM_VISION_F32;
+    result->src[0] = a;
+    return result;
+}
+
+// ggml_soft_max_vision_f32
+
+struct ggml_tensor * ggml_soft_max_vision_f32(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * scores) {
+    GGML_ASSERT(scores && scores->type == GGML_TYPE_F32);
+    GGML_ASSERT(scores->ne[0] >= 16 && scores->ne[0] <= 4096);
+    int64_t elements = scores->ne[0];
+    for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+        GGML_ASSERT(scores->ne[i] > 0 && scores->ne[i] <= (INT_MAX/(int64_t)sizeof(float))/elements);
+        elements *= scores->ne[i];
+    }
+    GGML_ASSERT(ggml_is_contiguous(scores));
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, scores);
+    result->op = GGML_OP_SOFT_MAX_VISION_F32;
+    result->src[0] = scores;
+    return result;
+}
+
+// ggml_mul_mat_vision_av_f32
+
+struct ggml_tensor * ggml_mul_mat_vision_av_f32(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * probabilities) {
+    GGML_ASSERT(v && probabilities && v->type == GGML_TYPE_F32 && probabilities->type == GGML_TYPE_F32);
+    GGML_ASSERT(v->ne[0] == 64 && v->ne[1] == 16 && v->ne[3] == 1);
+    const int64_t n = v->ne[2];
+    GGML_ASSERT(n >= 16 && n <= 4096);
+    GGML_ASSERT(probabilities->ne[0] == n && probabilities->ne[1] == n &&
+                probabilities->ne[2] == 16 && probabilities->ne[3] == 1);
+    GGML_ASSERT(ggml_is_contiguous(v) && ggml_is_contiguous(probabilities));
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 64, n, 16);
+    result->op = GGML_OP_MUL_MAT_VISION_AV_F32;
+    result->src[0] = v;
+    result->src[1] = probabilities;
+    return result;
+}
+
 // ggml_rms_norm_back
 
 struct ggml_tensor * ggml_rms_norm_back(
@@ -3416,6 +3480,25 @@ struct ggml_tensor * ggml_mul_mat(
     result->src[0] = a;
     result->src[1] = b;
 
+    return result;
+}
+
+struct ggml_tensor * ggml_mul_mat_bias_bf16(
+        struct ggml_context * ctx, struct ggml_tensor * w,
+        struct ggml_tensor * x, struct ggml_tensor * b) {
+    GGML_ASSERT(w && x);
+    GGML_ASSERT(w->type == GGML_TYPE_BF16 && x->type == GGML_TYPE_BF16);
+    GGML_ASSERT(ggml_is_contiguous(w) && ggml_is_contiguous(x));
+    GGML_ASSERT(w->ne[2] == 1 && w->ne[3] == 1 && x->ne[2] == 1 && x->ne[3] == 1);
+    GGML_ASSERT(w->ne[0] > 0 && w->ne[0] <= INT_MAX && w->ne[1] > 0 && w->ne[1] <= INT_MAX);
+    GGML_ASSERT(x->ne[0] == w->ne[0] && x->ne[1] > 0 && x->ne[1] <= INT_MAX);
+    if (b) {
+        GGML_ASSERT(b->type == GGML_TYPE_BF16 && ggml_is_contiguous(b));
+        GGML_ASSERT(b->ne[0] == w->ne[1] && ggml_is_vector(b));
+    }
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, w->ne[1], x->ne[1]);
+    result->op = GGML_OP_MUL_MAT_BIAS_BF16;
+    result->src[0] = w; result->src[1] = x; result->src[2] = b;
     return result;
 }
 
@@ -7771,6 +7854,10 @@ static void ggml_compute_backward(
         case GGML_OP_NONE: {
             // noop
         } break;
+        case GGML_OP_MUL_MAT_BIAS_BF16: // inference-only, no backward kernel
+        case GGML_OP_RMS_NORM_VISION_F32:
+        case GGML_OP_SOFT_MAX_VISION_F32:
+        case GGML_OP_MUL_MAT_VISION_AV_F32:
         case GGML_OP_COUNT:
         default: {
             GGML_ABORT("%s: unsupported ggml op for backward pass: %s\n", __func__, ggml_op_name(tensor->op));
