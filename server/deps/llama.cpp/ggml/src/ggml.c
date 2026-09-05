@@ -1201,9 +1201,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "PAGED_ATTN",
     "MUL_MAT_BIAS_BF16",
+    "RMS_NORM_VISION_F32",
 };
 
-static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
+static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1329,9 +1330,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "paged_attn(q,k,v)",
     "bf16(X*Y+bias)",
+    "rms_norm_vision_f32(x)",
 };
 
-static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
+static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3308,6 +3310,23 @@ struct ggml_tensor * ggml_rms_norm_inplace(
         struct ggml_tensor  * a,
         float                 eps) {
     return ggml_rms_norm_impl(ctx, a, eps, true);
+}
+
+// ggml_rms_norm_vision_f32
+
+struct ggml_tensor * ggml_rms_norm_vision_f32(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        float                 eps) {
+    GGML_ASSERT(a && a->type == GGML_TYPE_F32 && ggml_is_contiguous(a));
+    GGML_ASSERT(a->ne[0] == 1024 && a->ne[1] >= 16 && a->ne[1] <= INT_MAX/1024);
+    GGML_ASSERT(a->ne[2] == 1 && a->ne[3] == 1);
+    GGML_ASSERT(isfinite(eps) && eps >= 0.0f);
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
+    ggml_set_op_params(result, &eps, sizeof(eps));
+    result->op = GGML_OP_RMS_NORM_VISION_F32;
+    result->src[0] = a;
+    return result;
 }
 
 // ggml_rms_norm_back
@@ -7793,6 +7812,7 @@ static void ggml_compute_backward(
             // noop
         } break;
         case GGML_OP_MUL_MAT_BIAS_BF16: // inference-only, no backward kernel
+        case GGML_OP_RMS_NORM_VISION_F32:
         case GGML_OP_COUNT:
         default: {
             GGML_ABORT("%s: unsupported ggml op for backward pass: %s\n", __func__, ggml_op_name(tensor->op));

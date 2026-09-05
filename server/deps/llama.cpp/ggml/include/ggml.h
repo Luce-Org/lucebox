@@ -618,6 +618,7 @@ extern "C" {
         GGML_OP_PAGED_ATTN,
 
         GGML_OP_MUL_MAT_BIAS_BF16, // explicit HIP-only DS4V fused bias
+        GGML_OP_RMS_NORM_VISION_F32, // inference-only HIP source-order DS4V normalization
 
         GGML_OP_COUNT,
     };
@@ -1416,6 +1417,14 @@ extern "C" {
             float                 eps);
 
     GGML_API struct ggml_tensor * ggml_rms_norm_inplace(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            float                 eps);
+
+    // HIP wave32 only: contiguous F32 [1024, rows], 16 <= rows <= INT_MAX/1024.
+    // Input values must be BF16-representable. Returns normalized F32 before
+    // weight multiplication and BF16 rounding; preserves the DS4V source order.
+    GGML_API struct ggml_tensor * ggml_rms_norm_vision_f32(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             float                 eps);

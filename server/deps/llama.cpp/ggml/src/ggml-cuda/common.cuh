@@ -1442,6 +1442,7 @@ struct ggml_backend_cuda_context {
     void * vision_bias_workspace = nullptr; // exactly 76 MiB, retained until context destruction
     cudaEvent_t vision_bias_event = nullptr;
     size_t vision_bias_launches = 0;
+    size_t vision_norm_launches = 0;
 #endif
     int curr_stream_no = 0;
     bool low_priority_streams = false;

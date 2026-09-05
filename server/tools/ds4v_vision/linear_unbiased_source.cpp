@@ -18,7 +18,7 @@
 #include <vector>
 #include <unistd.h>
 
-static_assert(GGML_OP_PAGED_ATTN==104 && GGML_OP_MUL_MAT_BIAS_BF16==105 && GGML_OP_COUNT==106,
+static_assert(GGML_OP_PAGED_ATTN==104 && GGML_OP_MUL_MAT_BIAS_BF16==105 && GGML_OP_RMS_NORM_VISION_F32==106 && GGML_OP_COUNT==107,
               "operation ABI changed unexpectedly");
 static void check(bool ok,const char *why) { if(!ok) throw std::runtime_error(why); }
 static size_t product(size_t a,size_t b) {

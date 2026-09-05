@@ -76,14 +76,18 @@ int main(int argc,char ** argv) {
             };
             VisionOutput output;
             const auto lt_before=detail::hip_bias_launches(backend);
+            const auto norm_before=detail::hip_norm_launches(backend);
             auto started=std::chrono::steady_clock::now();
             if(!runtime.encode(patches,grid,output,error,true,observer)) throw std::runtime_error(error);
             const auto lt_launches=detail::hip_bias_launches(backend)-lt_before;
+            const auto norm_launches=detail::hip_norm_launches(backend)-norm_before;
             const auto external=detail::hip_bias_workspace(backend);
             const bool hip_requested=device=="hip:0" || device=="hip:1";
             if((external!=0)!=hip_requested) throw std::runtime_error("requested HIP backend lacks BF16 linear capability");
             if(lt_launches!=(hip_requested ? 131u : 0u)) throw std::runtime_error("unexpected actual HIP BF16 linear dispatch count");
+            if(norm_launches!=(hip_requested ? 65u : 0u)) throw std::runtime_error("unexpected actual HIP vision normalization dispatch count");
             std::cout<<"hip_vision_linear_launches="<<lt_launches<<" retained_workspace_bytes="<<external<<"\n";
+            std::cout<<"hip_vision_norm_launches="<<norm_launches<<"\n";
             save(output_dir+"/"+label+"-features.f32",output.features);
             save(output_dir+"/"+label+"-embeddings.f32",output.embeddings);
             for(auto identity:{Sentinel::Start,Sentinel::Pad,Sentinel::Newline,Sentinel::End}) {

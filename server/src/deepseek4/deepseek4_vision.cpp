@@ -108,7 +108,7 @@ std::vector<float> read(Tensor * t) {
 }
 }
 namespace detail {
-static size_t hip_bias_query(ggml_backend_t backend,const char * name) {
+static size_t hip_size_query(ggml_backend_t backend,const char * name) {
     if(!backend) return 0;
     auto device=ggml_backend_get_device(backend);
     if(!device) return 0;
@@ -118,8 +118,26 @@ static size_t hip_bias_query(ggml_backend_t backend,const char * name) {
     auto query=reinterpret_cast<Query>(ggml_backend_reg_get_proc_address(reg,name));
     return query ? query(backend) : 0;
 }
-size_t hip_bias_workspace(ggml_backend_t b) { return hip_bias_query(b,"ggml_backend_hip_vision_bias_bf16_workspace"); }
-size_t hip_bias_launches(ggml_backend_t b) { return hip_bias_query(b,"ggml_backend_hip_vision_bias_bf16_launches"); }
+size_t hip_bias_workspace(ggml_backend_t b) { return hip_size_query(b,"ggml_backend_hip_vision_bias_bf16_workspace"); }
+size_t hip_bias_launches(ggml_backend_t b) { return hip_size_query(b,"ggml_backend_hip_vision_bias_bf16_launches"); }
+size_t hip_norm_launches(ggml_backend_t b) { return hip_size_query(b,"ggml_backend_hip_vision_norm_f32_launches"); }
+bool hip_norm_capable(ggml_backend_t backend) {
+    if(!backend) return false;
+    auto device=ggml_backend_get_device(backend);
+    if(!device) return false;
+    auto reg=ggml_backend_dev_backend_reg(device);
+    if(!reg) return false;
+    using Query=bool (*)(ggml_backend_t);
+    auto query=reinterpret_cast<Query>(ggml_backend_reg_get_proc_address(reg,"ggml_backend_hip_vision_norm_f32_capable"));
+    return query && query(backend);
+}
+Tensor * rms_norm(ggml_context * c,Tensor * input,float epsilon,ggml_backend_t backend) {
+    if(!hip_bias_workspace(backend)) return ggml_rms_norm(c,input,epsilon);
+    require(hip_norm_capable(backend),"HIP source-order vision normalization unavailable; fallback forbidden");
+    auto y=ggml_rms_norm_vision_f32(c,input,epsilon);
+    require(ggml_backend_supports_op(backend,y),"HIP source-order vision normalization unsupported; fallback forbidden");
+    return y;
+}
 Tensor * linear(ggml_context * c,Tensor * weight,Tensor * input,Tensor * bias,bool preserve_biased_product,ggml_backend_t backend) {
     // HIP's explicit capability is required: generic supports_op defaults on
     // other backends are not evidence of this source-specific operation.
@@ -200,7 +218,7 @@ struct VisionRuntime::Impl {
         return detail::linear(c,weight(name+".weight"),x,bias ? weight(name+".bias") : nullptr,preserve,backend);
     }
     Tensor * norm(ggml_context * c,Tensor * x,const std::string & name) {
-        return rounded(c,ggml_mul(c,ggml_rms_norm(c,x,config.rms_epsilon),
+        return rounded(c,ggml_mul(c,detail::rms_norm(c,x,config.rms_epsilon,backend),
                                     ggml_cast(c,weight(name+".weight"),GGML_TYPE_F32)));
     }
     std::vector<float> execute(Graph & g,Tensor * input,const std::vector<float> & values,Tensor * output,
@@ -239,6 +257,8 @@ bool VisionRuntime::load(const std::string & path,ggml_backend_t backend,int dim
     error.clear();
     try {
         require(backend!=nullptr,"null vision backend");
+        require(!detail::hip_bias_workspace(backend) || detail::hip_norm_capable(backend),
+                "HIP source-order vision normalization unavailable");
         Meta meta;
         meta.g=gguf_init_from_file(path.c_str(),{true,&meta.c});
         require(meta.g && meta.c,"could not parse vision GGUF");
@@ -293,6 +313,8 @@ bool VisionRuntime::encode(const std::vector<float> & patches,PatchGrid grid,Vis
         const int64_t block_tokens=padded_height*row_length+2+(padded_height/2*row_length%2)*2;
         require(block_tokens+3<=impl_->config.max_image_tokens,"patch grid exceeds image token budget");
         require(patches.size()==size_t(n)*588,"patch count/shape mismatch");
+        require(!detail::hip_bias_workspace(impl_->backend) || n>=16,
+                "HIP source-order vision normalization requires at least 16 patches");
         for(float value:patches) require(std::isfinite(value),"non-finite image patch");
         std::vector<float> x;
         {
