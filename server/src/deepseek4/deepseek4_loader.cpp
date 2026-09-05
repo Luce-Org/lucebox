@@ -18,6 +18,7 @@
 #include "dflash27b.h"
 #include "common/gguf_bounds.h"
 #include "../common/moe_hybrid_storage.h"
+#include "../common/copied_source_reclaim.h"
 #include "../common/moe_hybrid_types.h"
 #include "ggml-cuda.h"
 
@@ -1819,6 +1820,11 @@ bool load_deepseek4_gguf_partial(const std::string & path,
             if (!a.upload_to_backend || !a.dense_split) continue;
             const void * src_data = (const char *)mmap.addr + a.file_offset;
             ggml_backend_tensor_set(a.tensor, src_data, 0, a.file_size);
+#if defined(__linux__)
+            // set_tensor has completed its source copy, including split buffers.
+            reclaim_copied_file_source(mmap.addr, mmap.len, src_data, a.file_size,
+                                       mmap.fd, ggml_get_name(a.tensor));
+#endif
         }
         if (!read_ok) {
             set_last_error("parallel weight read failed");
@@ -1834,6 +1840,11 @@ bool load_deepseek4_gguf_partial(const std::string & path,
             if (!a.upload_to_backend) continue;
             const void * src_data = (const char *)mmap.addr + a.file_offset;
             ggml_backend_tensor_set(a.tensor, src_data, 0, a.file_size);
+#if defined(__linux__)
+            // set_tensor has completed its source copy, including split buffers.
+            reclaim_copied_file_source(mmap.addr, mmap.len, src_data, a.file_size,
+                                       mmap.fd, ggml_get_name(a.tensor));
+#endif
         }
     }
     mmap.close_map();
@@ -2138,7 +2149,9 @@ bool build_deepseek4_moe_hybrid_storage_from_file_with_mmap(
         if (err) *err = mmap_err;
         return false;
     }
+#if !defined(__linux__)
     mmap.close_fd();
+#endif
 
     const size_t data_start = gguf_get_data_offset(gctx);
     const auto * file_bytes = static_cast<const uint8_t *>(mmap.addr);
@@ -2185,7 +2198,13 @@ bool build_deepseek4_moe_hybrid_storage_from_file_with_mmap(
     const MoeHybridConfig cfg = cfg_override ? *cfg_override : make_ds4_moe_hybrid_config(w);
     const bool ok = build_moe_hybrid_storage_from_file_with_mmap(
         cfg, backend, placement, layer_descs, layer_file_data,
-        mmap.addr, mmap.len, out, err, 0, cold_gpu_backend);
+        mmap.addr, mmap.len, out, err, 0, cold_gpu_backend
+#if defined(__linux__)
+        , mmap.fd
+#endif
+    );
+    // Advice borrows the original fd only while construction is in progress.
+    mmap.close_fd();
 
     if (!ok) {
         mmap.close_map();

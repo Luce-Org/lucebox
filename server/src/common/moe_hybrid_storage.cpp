@@ -1,6 +1,7 @@
 #include "moe_hybrid_storage.h"
 #include "moe_hybrid_types.h"
 #include "moe_source_page_range.h"
+#include "copied_source_reclaim.h"
 
 #include "ggml-cpu.h"
 #include "ggml-backend.h"
@@ -37,7 +38,12 @@ namespace dflash::common {
 namespace {
 
 void advise_copied_source(const void * mapping, size_t mapping_size,
-                          const ExpertTensorFileData & tensor, int layer) {
+                          const ExpertTensorFileData & tensor, int layer, int source_fd) {
+    if (source_fd >= 0) {
+        reclaim_copied_file_source(mapping, mapping_size, tensor.data, tensor.size,
+                                   source_fd, "expert", layer);
+        return;
+    }
 #if defined(__linux__) && defined(MADV_PAGEOUT)
     if (!tensor.data || tensor.size == 0) return;
     const long page_size = ::sysconf(_SC_PAGESIZE);
@@ -514,7 +520,8 @@ bool build_moe_hybrid_storage_from_file(
     bool allocate_cold,
     ggml_backend_t cold_gpu_backend,
     const void * readonly_file_mmap,
-    size_t readonly_file_mmap_size) {
+    size_t readonly_file_mmap_size,
+    int readonly_file_fd) {
 
     if (!placement.matches(cfg)) {
         if (err) *err = "placement does not match config";
@@ -729,12 +736,12 @@ bool build_moe_hybrid_storage_from_file(
                 cfg.materialize_hot_experts, cfg.materialize_cold_experts,
                 allocate_cold && cold_count > 0 && dst.cold_buf != nullptr)) {
             if (dst.fused_gate_up) {
-                advise_copied_source(readonly_file_mmap, readonly_file_mmap_size, fd.gate_up_exps, il);
+                advise_copied_source(readonly_file_mmap, readonly_file_mmap_size, fd.gate_up_exps, il, readonly_file_fd);
             } else {
-                advise_copied_source(readonly_file_mmap, readonly_file_mmap_size, fd.gate_exps, il);
-                advise_copied_source(readonly_file_mmap, readonly_file_mmap_size, fd.up_exps, il);
+                advise_copied_source(readonly_file_mmap, readonly_file_mmap_size, fd.gate_exps, il, readonly_file_fd);
+                advise_copied_source(readonly_file_mmap, readonly_file_mmap_size, fd.up_exps, il, readonly_file_fd);
             }
-            advise_copied_source(readonly_file_mmap, readonly_file_mmap_size, fd.down_exps, il);
+            advise_copied_source(readonly_file_mmap, readonly_file_mmap_size, fd.down_exps, il, readonly_file_fd);
         }
     }
 
@@ -833,12 +840,13 @@ bool build_moe_hybrid_storage_from_file_with_mmap(
     MoeHybridStorage & out,
     std::string * err,
     int cache_slots,
-    ggml_backend_t cold_gpu_backend) {
+    ggml_backend_t cold_gpu_backend,
+    int readonly_file_fd) {
 
     // First build storage normally (hot GPU + cold CPU buffers).
     if (!build_moe_hybrid_storage_from_file(
             cfg, gpu_backend, placement, layer_descs, file_data,
-            out, err, cache_slots, true, cold_gpu_backend, mmap_base, mmap_total_size)) {
+            out, err, cache_slots, true, cold_gpu_backend, mmap_base, mmap_total_size, readonly_file_fd)) {
         return false;
     }
 

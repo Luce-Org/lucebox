@@ -1,4 +1,5 @@
 #include "../src/common/moe_source_page_range.h"
+#include "../src/common/copied_source_reclaim.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -41,7 +42,7 @@ int main() {
         check(moe_source_pageout_eligible(mask & 1, mask & 2, mask & 4, mask & 8) == (mask == 15),
               "CPU/unmaterialized/unallocated modes excluded");
     }
-#if defined(__linux__) && defined(MADV_PAGEOUT)
+#if defined(__linux__)
     const long raw_page = ::sysconf(_SC_PAGESIZE);
     check(raw_page > 0, "native page size");
     const size_t p = static_cast<size_t>(raw_page), size = 5 * p;
@@ -59,29 +60,37 @@ int main() {
     check(::munmap(writable, size) == 0, "close initialization mapping");
     void * mapped = ::mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
     check(mapped != MAP_FAILED, "read-only source mapping");
-    ::close(fd);  // Match the production lifetime: mapping remains, FD is closed.
+    // Keep the original descriptor until copied-source advice returns.
     const volatile uint8_t * bytes = static_cast<const volatile uint8_t *>(mapped);
     for (size_t i = 0; i < size; ++i) check(bytes[i] == expected[i], "source before advice");
     check(moe_source_page_range(reinterpret_cast<uintptr_t>(mapped), size,
           reinterpret_cast<uintptr_t>(mapped) + 17, 3 * p + 100, p, range), "native source range");
     std::vector<unsigned char> before(5), after(5);
     const int before_rc = ::mincore(mapped, size, before.data());
-    errno = 0;
-    const int rc = ::madvise(reinterpret_cast<void *>(range.address), range.size, MADV_PAGEOUT);
-    const int advice_errno = rc == 0 ? 0 : errno;
+    errno = EBUSY;  // Successful advice must not report a stale errno.
+    const auto advice = reclaim_copied_file_source(mapped, size,
+        static_cast<const uint8_t *>(mapped) + 17, 3 * p + 100, fd, "test");
     const int after_rc = ::mincore(mapped, size, after.data());
     unsigned before_count = 0, after_count = 0;
     for (size_t i = 0; i < 5; ++i) { before_count += before[i] & 1; after_count += after[i] & 1; }
-    std::printf("MADV_PAGEOUT requested=%zu rc=%d errno=%d mincore_before_rc=%d pages=%u after_rc=%d pages=%u\n",
-                range.size, rc, advice_errno, before_rc, before_count, after_rc, after_count);
-    check(rc == 0 || advice_errno == EINVAL || advice_errno == ENOSYS || advice_errno == EOPNOTSUPP,
-          "unexpected pageout failure");
-    if (rc != 0) std::puts("SKIP: kernel does not support this advisory; bounds checks still passed");
+    std::printf("copied source requested=%zu madvise_error=%d fadvise_error=%d mincore_before_rc=%d pages=%u after_rc=%d pages=%u\n",
+                advice.requested, advice.madvise_error, advice.fadvise_error,
+                before_rc, before_count, after_rc, after_count);
+    check(advice.range_error == 0 && advice.requested == 2 * p, "advice uses exact interior range");
+    check(advice.madvise_error == 0, "read-only file MADV_DONTNEED accepted");
+    check(advice.fadvise_error == 0 || advice.fadvise_error == ENOSYS || advice.fadvise_error == EOPNOTSUPP,
+          "unexpected file cache advice failure");
+    const auto partial = reclaim_copied_file_source(mapped, size,
+        static_cast<const uint8_t *>(mapped) + 1, p - 2, fd, "partial-test");
+    check(partial.requested == 0 && partial.range_error == 0, "empty interior causes no whole-file fadvise");
+    const auto invalid = reclaim_copied_file_source(mapped, size, mapped, size, -1, "invalid-fd-test");
+    check(invalid.requested == 0 && invalid.range_error == EINVAL, "invalid fd rejected before advice");
+    check(::close(fd) == 0, "close borrowed fd after advice");
     // Refault correctness is mandatory; eviction count is only diagnostic.
     for (size_t i = 0; i < size; ++i) check(bytes[i] == expected[i], "source/refault and edge bytes preserved");
     check(::munmap(mapped, size) == 0, "close source mapping");
 #else
-    std::puts("SKIP: Linux MADV_PAGEOUT unavailable; bounds and mode checks passed");
+    std::puts("SKIP: Linux copied-source advice unavailable; bounds and mode checks passed");
 #endif
     std::puts("PASS: source-page bounds, mode exclusions and supported file-refault checks");
     return 0;
