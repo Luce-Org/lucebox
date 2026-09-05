@@ -19,6 +19,7 @@
 #include "common/gguf_bounds.h"
 #include "../common/moe_hybrid_storage.h"
 #include "../common/copied_source_reclaim.h"
+#include "../common/copied_source_upload.h"
 #include "../common/moe_hybrid_types.h"
 #include "ggml-cuda.h"
 
@@ -1836,10 +1837,34 @@ bool load_deepseek4_gguf_partial(const std::string & path,
             return false;
         }
     } else {
+#if defined(__linux__) && (defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP))
+        std::vector<uint8_t> upload_scratch;
+#endif
         for (auto & a : allocs) {
             if (!a.upload_to_backend) continue;
             const void * src_data = (const char *)mmap.addr + a.file_offset;
-            ggml_backend_tensor_set(a.tensor, src_data, 0, a.file_size);
+#if defined(__linux__) && (defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP))
+            if (!a.dense_split && ggml_backend_is_cuda(backend) && !ggml_backend_cuda_buffer_is_managed(buf)) {
+                // HIP may pin pageable upload sources. Keep file-backed pages
+                // out of that path so completed-source cache advice can act.
+                if (!upload_copied_file_chunks(mmap.addr, mmap.len, a.file_offset,
+                        a.file_size, upload_scratch,
+                        [&](const uint8_t * bytes, size_t offset, size_t count) {
+                            ggml_backend_tensor_set(a.tensor, bytes, offset, count);
+                        })) {
+                    set_last_error("invalid dense staged-upload source range");
+                    mmap.close_map();
+                    if (split_buf) ggml_backend_buffer_free(split_buf);
+                    if (buf) ggml_backend_buffer_free(buf);
+                    gguf_free(gctx);
+                    ggml_free(meta_ctx);
+                    return false;
+                }
+            } else
+#endif
+            {
+                ggml_backend_tensor_set(a.tensor, src_data, 0, a.file_size);
+            }
 #if defined(__linux__)
             // set_tensor has completed its source copy, including split buffers.
             reclaim_copied_file_source(mmap.addr, mmap.len, src_data, a.file_size,
@@ -1862,6 +1887,11 @@ bool load_deepseek4_gguf_partial(const std::string & path,
         if (emb_mmap.open_ro(path, emb_err)) {
             std::memcpy(out.embedder.tok_embd_owned.data(),
                         (const char *)emb_mmap.addr + a.file_offset, a.file_size);
+#if defined(__linux__)
+            reclaim_copied_file_source(emb_mmap.addr, emb_mmap.len,
+                (const char *)emb_mmap.addr + a.file_offset, a.file_size,
+                emb_mmap.fd, "token_embd.weight");
+#endif
             emb_mmap.close_map();
         } else {
             set_last_error("embedder mmap: " + emb_err);
