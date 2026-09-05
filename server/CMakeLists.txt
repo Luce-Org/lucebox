@@ -1630,6 +1630,10 @@ if(DFLASH27B_TESTS)
     endif()
 
     # ─── Unit tests (no GPU, no model files) ────────────────────────────
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_moe_source_page_range.cpp")
+        add_executable(test_moe_source_page_range test/test_moe_source_page_range.cpp)
+        list(APPEND _raw_unit_test_targets test_moe_source_page_range)
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_moe_input_ready.cpp")
         add_executable(test_moe_input_ready test/test_moe_input_ready.cpp)
         target_include_directories(test_moe_input_ready PRIVATE
