@@ -23,6 +23,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "sampler.h"
+#include "image_prompt.h"
 #include "concurrency/seq_engine.h"
 #include "placement/draft_residency.h"
 
@@ -169,6 +170,7 @@ struct BudgetHook {
 
 struct GenerateRequest {
     std::vector<int32_t>       prompt;
+    ImagePromptHandle         images;
     int                        n_gen       = 0;
     SamplerCfg                 sampler;
     bool                       do_sample   = false;
@@ -295,6 +297,24 @@ struct GenerateResult {
 // ─── Backend interface ──────────────────────────────────────────────────
 struct ModelBackend {
     virtual ~ModelBackend() = default;
+
+    virtual bool supports_images() const { return false; }
+    virtual bool prepare_images(std::vector<int32_t> & tokens,
+                                std::vector<EncodedImage> images,
+                                uint64_t context_capacity,
+                                uint64_t output_reserve,
+                                ImagePromptHandle & payload,
+                                std::string & error) const {
+        (void) tokens;
+        (void) context_capacity;
+        (void) output_reserve;
+        if (!images.empty()) {
+            error = "this backend does not support image input";
+            return false;
+        }
+        payload.reset();
+        return true;
+    }
 
     // Print the "[<arch>-daemon] ready ..." banner on stdout.
     virtual void print_ready_banner() const = 0;

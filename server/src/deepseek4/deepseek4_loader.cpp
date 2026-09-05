@@ -234,6 +234,19 @@ static bool is_expert_tensor(const char * name) {
            std::strstr(name, "ffn_down_exps") != nullptr;
 }
 
+static int image_bias_layer(const char * name) {
+    constexpr const char * prefix = "layers.";
+    if (std::strncmp(name, prefix, 7) != 0) return -1;
+    const char * number = name + 7;
+    if (*number < '0' || *number > '9') return -1;
+    char * suffix = nullptr;
+    const long layer = std::strtol(number, &suffix, 10);
+    if (layer < 0 || layer >= 43 ||
+        std::strcmp(suffix, ".ffn.gate.bias_vl") != 0 ||
+        std::string(name) != "layers." + std::to_string(layer) + ".ffn.gate.bias_vl") return -1;
+    return int(layer);
+}
+
 static bool should_keep_ds4_tensor(const char * name,
                                    const TargetLoadPlan & plan) {
     int layer_id = -1;
@@ -242,6 +255,12 @@ static bool should_keep_ds4_tensor(const char * name,
                layer_id >= plan.layer_begin &&
                layer_id < plan.layer_end &&
                is_expert_tensor(name);
+    }
+
+    const int image_layer = image_bias_layer(name);
+    if (image_layer >= 0) {
+        return plan.load_ds4_image_bias && image_layer >= plan.layer_begin &&
+               image_layer < plan.layer_end;
     }
 
     // Global tensors
@@ -1574,6 +1593,29 @@ bool load_deepseek4_gguf_partial(const std::string & path,
 
     // ── Collect tensors for allocation ──────────────────────────────────
     const int n_tensors = gguf_get_n_tensors(gctx);
+    if (plan.load_ds4_image_bias && !plan.expert_metadata_only) {
+        bool valid = n_layer == 43 && n_embd == 4096 && n_vocab == 129280 &&
+                     n_expert == 256 && n_expert_used == 6 &&
+                     plan.layer_begin == 0 && plan.layer_end == 43;
+        std::array<int, 43> counts{};
+        for (int ti = 0; ti < n_tensors; ++ti) {
+            const char * name = gguf_get_tensor_name(gctx, ti);
+            const int layer = image_bias_layer(name);
+            if (layer < 0) continue;
+            ++counts[size_t(layer)];
+            const ggml_tensor * tensor = find_tensor(meta_ctx, name);
+            valid = valid && tensor && tensor->type == GGML_TYPE_F32 &&
+                    tensor->ne[0] == 256 && tensor->ne[1] == 1 &&
+                    tensor->ne[2] == 1 && tensor->ne[3] == 1;
+        }
+        valid = valid && std::all_of(counts.begin(), counts.end(), [](int count) { return count == 1; });
+        if (!valid) {
+            set_last_error("DS4V requires the supported decoder and exactly 43 F32[256] image router biases");
+            gguf_free(gctx);
+            if (meta_ctx) ggml_free(meta_ctx);
+            return false;
+        }
+    }
     const size_t data_offset = gguf_get_data_offset(gctx);
     ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
     const size_t alignment = ggml_backend_buft_get_alignment(buft);
@@ -1828,6 +1870,12 @@ bool load_deepseek4_gguf_partial(const std::string & path,
     // ── Bind tensors to weight struct fields ────────────────────────────
     for (auto & a : allocs) {
         const char * name = ggml_get_name(a.tensor);
+
+        const int image_layer = image_bias_layer(name);
+        if (plan.load_ds4_image_bias && image_layer >= 0 && image_layer < int(n_layer)) {
+            out.layers[size_t(image_layer)].ffn_gate_bias_vl = a.tensor;
+            continue;
+        }
 
         // Global tensors
         if (std::strcmp(name, "token_embd.weight") == 0) { out.tok_embd = a.tensor; continue; }

@@ -161,6 +161,59 @@ bool extract_chat_images(const nlohmann::json & messages, nlohmann::json & norma
     }
 }
 
+static bool contains_image_content(const nlohmann::json & value) {
+    std::vector<const nlohmann::json *> pending{&value};
+    while (!pending.empty()) {
+        const auto & current = *pending.back();
+        pending.pop_back();
+        if (current.is_object()) {
+            auto type = current.find("type");
+            if (type != current.end() && type->is_string() &&
+                (*type == "image" || *type == "input_image" || *type == "image_url")) return true;
+            for (const auto & item : current.items()) {
+                if (item.key() == "image_url") return true;
+                pending.push_back(&item.value());
+            }
+        } else if (current.is_array()) {
+            for (const auto & item : current) pending.push_back(&item);
+        }
+    }
+    return false;
+}
+
+bool prepare_request_images(const nlohmann::json & messages,
+                            const ImageRequestPolicy & policy,
+                            nlohmann::json & normalized,
+                            std::vector<EncodedImage> & images,
+                            std::string & error, const ImageInputLimits & limits) {
+    normalized = nullptr;
+    images.clear();
+    error.clear();
+    const bool has_images = contains_image_content(messages);
+    if (has_images && !policy.chat_completions) {
+        error = "image input is supported only through /v1/chat/completions image_url parts";
+        return false;
+    }
+    if (has_images && !policy.image_capable) {
+        error = "image input is unavailable for this backend or serving mode; configure a supported --mmproj projector";
+        return false;
+    }
+    if (policy.chat_completions && (has_images || policy.reserve_placeholder)) {
+        nlohmann::json prepared;
+        std::vector<EncodedImage> extracted;
+        if (!extract_chat_images(messages, prepared, extracted, error, limits)) return false;
+        if (contains_image_content(prepared)) {
+            error = "images must be user content-array image_url parts";
+            return false;
+        }
+        normalized = std::move(prepared);
+        images = std::move(extracted);
+    } else {
+        normalized = messages;
+    }
+    return true;
+}
+
 void redact_image_urls(nlohmann::json & value) {
     std::vector<nlohmann::json *> pending{&value};
     while (!pending.empty()) {

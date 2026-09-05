@@ -179,6 +179,7 @@ struct ServerConfig {
     int         fa_window           = 0;
     int         ddtree_budget       = 0;
     bool        speculative_enabled = false;
+    bool        image_input_enabled = false;
     bool        target_sharding     = false;
     // Prefill chunk size (bargs.chunk). Exposed at /props.runtime.chunk so
     // bench/snapshot tooling can capture the full server config — needed
@@ -269,6 +270,7 @@ bool canonical_assistant_content(
 struct ParsedRequest {
     ApiFormat                  format;
     std::vector<int32_t>      prompt_tokens;  // tokenized prompt
+    ImagePromptHandle         images;
     std::string               rendered_prompt;
     int                       max_output   = 4096;
     bool                      stream       = true;
@@ -386,6 +388,7 @@ private:
 
     struct PreparedPrompt {
         std::vector<int32_t> tokens;
+        ImagePromptHandle images;
         bool compressed = false;
         bool flowkv = false;
         int full_cache_served_tokens = -1;

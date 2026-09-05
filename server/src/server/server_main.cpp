@@ -75,6 +75,7 @@ static void print_usage(const char * prog) {
         "\n"
         "Options:\n"
         "  --draft <path>       Draft model for speculative decode\n"
+        "  --mmproj <path>      DS4V image projector GGUF (heterogeneous HIP sparse mode)\n"
         "  --port <N>           Listen port (default: 8080)\n"
         "  --host <addr>        Bind address (default: 0.0.0.0)\n"
         "  --max-ctx <N>        Max context length (default: 131072)\n"
@@ -280,6 +281,8 @@ int main(int argc, char ** argv) {
     for (int i = 2; i < argc; i++) {
         if (std::strcmp(argv[i], "--draft") == 0 && i + 1 < argc) {
             bargs.draft_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--mmproj") == 0 && i + 1 < argc) {
+            bargs.mmproj_path = argv[++i];
         } else if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
             sconfig.port = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--host") == 0 && i + 1 < argc) {

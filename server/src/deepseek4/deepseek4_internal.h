@@ -25,6 +25,7 @@
 #include "internal.h"
 #include "common/layer_split_utils.h"
 #include "common/prefill_attention_mode.h"
+#include "deepseek4_image_spans.h"
 
 namespace dflash::common {
 
@@ -134,6 +135,7 @@ struct DeepSeek4Layer {
     // Router
     ggml_tensor * ffn_gate_inp       = nullptr;  // [n_embd, n_expert] router weights F16
     ggml_tensor * ffn_exp_probs_b    = nullptr;  // [n_expert] optional routing bias
+    ggml_tensor * ffn_gate_bias_vl   = nullptr;
 
     // Hash routing table (first n_hash_layer layers only)
     ggml_tensor * ffn_gate_tid2eid   = nullptr;  // [n_expert_used, n_vocab] I32
@@ -307,6 +309,7 @@ struct DeepSeek4RawRingSpan {
 
 struct DeepSeek4BackendConfig {
     const char * model_path   = nullptr;
+    std::string mmproj_path;
     DevicePlacement device;
     int          stream_fd    = -1;
     int          chunk        = 512;   // prefill chunk size
@@ -345,6 +348,10 @@ void reset_deepseek4_cache(DeepSeek4Cache & c);
 // state and the DSpark feature tail remain live for the following decode.
 void deepseek4_release_prefill_scratch(DeepSeek4Cache & c,
                                        MoeHybridStorage * moe_hybrid);
+// Retire all disposable decoder/owner graphs before the vision tower uses the
+// shared scratch allowance. KV and saved snapshots are left intact.
+void deepseek4_release_image_scratch(DeepSeek4Cache & c,
+                                     MoeHybridStorage * moe_hybrid);
 int deepseek4_previous_raw_ring_spans(
     int kv_start,
     int n_swa,
@@ -419,7 +426,14 @@ bool deepseek4_step_layer_range(
     Ds4VerifyHooks *            verify_hooks = nullptr,
     MoeHybridStorage *          moe_hybrid = nullptr,
     MoeExpertComputeRuntime *   expert_runtime = nullptr,
-    MoeHybridRoutingStats *     routing_stats = nullptr);
+    MoeHybridRoutingStats *     routing_stats = nullptr,
+    vision::ImageSpanView       image_spans = {});
+
+bool deepseek4_validate_image_batch(
+    const DeepSeek4Weights & w, const DeepSeek4Cache & cache,
+    const MoeHybridStorage * hybrid, const int32_t * tokens,
+    int count, int position, vision::ImageSpanView spans,
+    bool & has_images, std::string & error);
 
 bool build_deepseek4_moe_hybrid_storage_from_file(
     const std::string &         path,

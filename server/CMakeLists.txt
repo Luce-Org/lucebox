@@ -491,6 +491,14 @@ add_library(dflash_common STATIC
     src/deepseek4/deepseek4_target_shard_ipc_daemon.cpp
     src/deepseek4/deepseek4_dspark.cpp
     src/deepseek4/deepseek4_dspark_spec.cpp
+    src/deepseek4/deepseek4_vision.cpp
+    src/deepseek4/deepseek4_vision_decode.cpp
+    src/deepseek4/deepseek4_vision_preprocess.cpp
+    src/deepseek4/deepseek4_image_prompt.cpp
+    src/deepseek4/deepseek4_image_assembly.cpp
+    src/deepseek4/deepseek4_image_admission.cpp
+    src/deepseek4/deepseek4_image_policy.cpp
+    src/server/image_input.cpp
     src/flashprefill_q8.cpp
     src/kv_cache.cpp
     src/kv_quant.cpp
@@ -858,6 +866,16 @@ if(DFLASH27B_ENABLE_BSA)
     endif()
 endif()
 
+# Production uses the same pinned decoder sources and options as the accepted
+# preprocessing probe. The decoder itself has no codec feature macro.
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/Ds4vImageCodecs.cmake")
+install(FILES tools/ds4v_preprocess_probe/THIRD_PARTY_NOTICES.md
+    DESTINATION share/licenses/ds4v
+    RENAME THIRD_PARTY_NOTICES.md)
+install(FILES "${DS4V_JPEG_SOURCE_DIR}/LICENSE.md"
+              "${DS4V_JPEG_SOURCE_DIR}/README.ijg"
+    DESTINATION share/licenses/ds4v/libjpeg-turbo)
+
 target_link_libraries(dflash_common
     PUBLIC
         ggml
@@ -865,6 +883,8 @@ target_link_libraries(dflash_common
         ggml-base
         nlohmann_json::nlohmann_json
     PRIVATE
+        ds4v_libjpeg
+        ds4v_lodepng
         ${CMAKE_DL_LIBS}
 )
 # OpenMP for parallel MoE expert compute kernel (saturate memory bandwidth).

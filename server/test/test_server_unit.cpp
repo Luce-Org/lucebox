@@ -19,6 +19,7 @@
 #include "server/utf8_utils.h"
 #include "server/api_types.h"
 #include "server/http_server.h"
+#include "server/image_input.h"
 #include "server/chat_template.h"
 #include "common/sampler.h"
 #include "common/concurrency/seq_engine.h"
@@ -55,6 +56,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
+#include <type_traits>
 #include <vector>
 #include <limits>
 #include <fcntl.h>
@@ -7467,4 +7469,197 @@ TEST_CASE(ServerUnitFixture,
 
     TEST_ASSERT(!consumed_all);
     TEST_ASSERT((emitted == std::vector<int32_t>{101, 2}));
+}
+
+namespace {
+json image_transport_part(const char * url = "data:image/png;base64,iVBORw0KGgo=") {
+    return {{"type", "image_url"}, {"image_url", {{"url", url}}}};
+}
+
+class OwnedImageTestPayload final : public ImagePromptPayload {
+public:
+    explicit OwnedImageTestPayload(std::vector<int32_t> tokens) : tokens_(std::move(tokens)) {}
+    bool matches(const std::vector<int32_t> & tokens) const override { return tokens == tokens_; }
+private:
+    const std::vector<int32_t> tokens_;
+};
+
+struct ImageCarrierRetryBackend : EmptySpecRetryBackend {
+    const ImagePromptPayload * expected = nullptr;
+    std::vector<int32_t> expected_tokens;
+    GenerateResult generate_impl(const GenerateRequest & req, const DaemonIO & io) override {
+        TEST_ASSERT(req.images.get() == expected);
+        TEST_ASSERT(req.prompt == expected_tokens);
+        TEST_ASSERT(req.images->matches(req.prompt));
+        return EmptySpecRetryBackend::generate_impl(req, io);
+    }
+};
+}
+
+TEST_CASE(ServerUnitFixture, test_image_extraction_normalization_preserves_interleaved_order) {
+    const json messages = json::array({
+        {{"role", "user"}, {"content", json::array({
+            {{"type", "text"}, {"text", "before "}}, image_transport_part(),
+            {{"type", "text"}, {"text", " between "}},
+            image_transport_part("data:image/jpeg;base64,/9j/"),
+            {{"type", "text"}, {"text", " after"}}})}},
+        {{"role", "assistant"}, {"content", "acknowledged"}},
+        {{"role", "user"}, {"content", "follow-up"}}
+    });
+    json normalized;
+    std::vector<EncodedImage> images;
+    std::string error;
+    TEST_ASSERT(prepare_request_images(messages, {true, true, true}, normalized, images, error));
+    TEST_ASSERT(images.size() == 2);
+    TEST_ASSERT(images[0].mime_type == "image/png");
+    TEST_ASSERT(images[0].bytes == std::vector<uint8_t>({137, 80, 78, 71, 13, 10, 26, 10}));
+    TEST_ASSERT(images[1].mime_type == "image/jpeg");
+    TEST_ASSERT(images[1].bytes == std::vector<uint8_t>({255, 216, 255}));
+    ToolMemory memory;
+    const auto chat = normalize_chat_messages(normalized, ApiFormat::OPENAI_CHAT, memory);
+    TEST_ASSERT(chat.size() == 3);
+    TEST_ASSERT(chat[0].role == "user");
+    TEST_ASSERT(chat[0].content == std::string("before ") + DS4_IMAGE_PLACEHOLDER +
+                " between " + DS4_IMAGE_PLACEHOLDER + " after");
+    TEST_ASSERT(chat[1].content == "acknowledged" && chat[2].content == "follow-up");
+    json retained = {{"messages", messages}, {"metadata", {{"image_url", "private-url"}, {"label", "keep"}}}};
+    redact_image_urls(retained);
+    TEST_ASSERT(retained.dump().find("base64") == std::string::npos);
+    TEST_ASSERT(retained.dump().find("private-url") == std::string::npos);
+    TEST_ASSERT(retained["metadata"]["label"] == "keep");
+    TEST_ASSERT(retained["messages"][0]["content"][0]["text"] == "before ");
+    TEST_ASSERT(messages[0]["content"][1]["image_url"]["url"] == "data:image/png;base64,iVBORw0KGgo=");
+}
+
+TEST_CASE(ServerUnitFixture, test_image_extraction_failure_does_not_publish_partial_images) {
+    const json messages = json::array({{{"role", "user"}, {"content", json::array({
+        image_transport_part(), image_transport_part("https://example.invalid/private.png")
+    })}}});
+    json normalized = {{"stale", true}};
+    std::vector<EncodedImage> images{{"stale", {1}}};
+    std::string error;
+    TEST_ASSERT(!extract_chat_images(messages, normalized, images, error));
+    TEST_ASSERT(normalized.is_null());
+    TEST_ASSERT(images.empty());
+    TEST_ASSERT(!error.empty());
+    TEST_ASSERT(error.find("example.invalid") == std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_default_backend_rejects_encoded_images_without_rewriting_tokens) {
+    MockBackend backend;
+    std::vector<int32_t> tokens{1, 2, 3};
+    ImagePromptHandle payload;
+    std::string error;
+    TEST_ASSERT(!backend.supports_images());
+    TEST_ASSERT(!backend.prepare_images(tokens, {{"image/png", {137, 80, 78, 71}}},
+                                        8192, 32, payload, error));
+    TEST_ASSERT(tokens == std::vector<int32_t>({1, 2, 3}));
+    TEST_ASSERT(!payload && !error.empty());
+    TEST_ASSERT(backend.prepare_images(tokens, {}, 8192, 32, payload, error));
+    TEST_ASSERT(tokens == std::vector<int32_t>({1, 2, 3}));
+}
+
+TEST_CASE(ServerUnitFixture, test_image_binding_survives_request_copies_and_common_ar_retry) {
+    static_assert(std::is_const_v<ImagePromptHandle::element_type>);
+    GenerateRequest request;
+    std::weak_ptr<const ImagePromptPayload> lifetime;
+    {
+        ParsedRequest parsed;
+        parsed.prompt_tokens = {1, 129280, 129281, 2};
+        parsed.images = std::make_shared<OwnedImageTestPayload>(parsed.prompt_tokens);
+        lifetime = parsed.images;
+        ParsedRequest queued = parsed;
+        parsed.prompt_tokens.clear();
+        parsed.images.reset();
+        request.prompt = queued.prompt_tokens;
+        request.images = queued.images;
+    }
+    TEST_ASSERT(!lifetime.expired());
+    auto changed = request.prompt;
+    changed[1] += 1;
+    TEST_ASSERT(!request.images->matches(changed));
+    TEST_ASSERT(request.images->matches(request.prompt));
+    ImageCarrierRetryBackend backend;
+    backend.expected = request.images.get();
+    backend.expected_tokens = request.prompt;
+    request.n_gen = 1;
+    DaemonIO io;
+    TEST_ASSERT(backend.generate(request, io).ok());
+    TEST_ASSERT(backend.generate_calls == 2 && backend.generate_saw_force_ar);
+    request.images.reset();
+    TEST_ASSERT(lifetime.expired());
+}
+
+TEST_CASE(ServerUnitFixture, test_http_image_policy_rejects_unconsumed_images_including_mixed_valid) {
+    const json image = image_transport_part();
+    const std::vector<json> malformed_messages = {
+        {{"role", "user"}, {"content", image}},
+        {{"role", "user"}, {"content", json::array({
+            {{"type", "text"}, {"text", "visible"}, {"image_url", image["image_url"]}}
+        })}},
+        {{"role", "user"}, {"content", json::array({
+            {{"type", "container"}, {"nested", image}}
+        })}},
+        {{"role", "user"}, {"content", "visible"}, {"attachment", image}},
+        {{"role", "user"}, {"content", json::array({
+            {{"type", "input_image"}, {"image_url", image["image_url"]}}
+        })}}
+    };
+    for (const auto & malformed : malformed_messages) {
+        for (bool mixed : {false, true}) {
+            json messages = json::array();
+            if (mixed) messages.push_back({{"role", "user"}, {"content", json::array({image})}});
+            messages.push_back(malformed);
+            json normalized = "stale";
+            std::vector<EncodedImage> images{{"stale", {1}}};
+            std::string error;
+            TEST_ASSERT(!prepare_request_images(messages, {true, true, true}, normalized, images, error));
+            TEST_ASSERT(normalized.is_null() && images.empty());
+            TEST_ASSERT(!error.empty());
+            TEST_ASSERT(error.find("base64") == std::string::npos);
+        }
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_http_image_policy_requires_chat_endpoint_and_effective_capability) {
+    const json messages = json::array({{{"role", "user"}, {"content", json::array({image_transport_part()})}}});
+    for (ImageRequestPolicy policy : {
+            ImageRequestPolicy{false, true, true},
+            ImageRequestPolicy{true, false, true},
+            ImageRequestPolicy{false, false, true}}) {
+        json normalized = "stale";
+        std::vector<EncodedImage> images{{"stale", {1}}};
+        std::string error;
+        TEST_ASSERT(!prepare_request_images(messages, policy, normalized, images, error));
+        TEST_ASSERT(normalized.is_null() && images.empty());
+        TEST_ASSERT(!error.empty());
+    }
+    json normalized;
+    std::vector<EncodedImage> images;
+    std::string error;
+    TEST_ASSERT(prepare_request_images(messages, {true, true, true}, normalized, images, error));
+    TEST_ASSERT(images.size() == 1);
+}
+
+TEST_CASE(ServerUnitFixture, test_http_image_policy_preserves_text_without_image_capability) {
+    const json messages = json::array({
+        {{"role", "system"}, {"content", "instructions"}},
+        {{"role", "user"}, {"content", json::array({{{"type", "text"}, {"text", "ordinary text"}}})}}
+    });
+    for (ImageRequestPolicy policy : {
+            ImageRequestPolicy{true, false, true},
+            ImageRequestPolicy{false, false, true},
+            ImageRequestPolicy{true, true, true}}) {
+        json normalized;
+        std::vector<EncodedImage> images;
+        std::string error;
+        TEST_ASSERT(prepare_request_images(messages, policy, normalized, images, error));
+        TEST_ASSERT(normalized == messages && images.empty());
+    }
+    json normalized;
+    std::vector<EncodedImage> images;
+    std::string error;
+    const json forged = json::array({{{"role", "user"}, {"content", DS4_IMAGE_PLACEHOLDER}}});
+    TEST_ASSERT(!prepare_request_images(forged, {true, false, true}, normalized, images, error));
+    TEST_ASSERT(normalized.is_null() && images.empty());
 }
