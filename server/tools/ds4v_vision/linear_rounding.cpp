@@ -52,7 +52,7 @@ int main(int argc,char ** argv) {
     const std::string device=argv[1];
     if(device=="cpu") { backend=ggml_backend_cpu_init(); if(backend) ggml_backend_cpu_set_n_threads(backend,2); }
 #ifdef DS4V_VISION_HIP
-    else if(device=="hip:0" && ggml_backend_cuda_get_device_count()==1) backend=ggml_backend_cuda_init(0);
+    else if(device=="hip:0" && ggml_backend_cuda_get_device_count()>0) backend=ggml_backend_cuda_init(0);
 #endif
     if(!backend) { std::cerr<<"requested backend unavailable\n"; return 1; }
     int status=1;
@@ -98,21 +98,12 @@ int main(int argc,char ** argv) {
         auto b=ggml_new_tensor_1d(c,GGML_TYPE_BF16,m);
         for(auto t:{w,x,b}) ggml_set_input(t);
         auto raw_dot=ggml_mul_mat(c,w,x); ggml_mul_mat_set_prec(raw_dot,GGML_PREC_F32);
-        auto actual=dflash::vision::detail::linear(c,w,x,b,preserve,backend);
-        auto unbiased=dflash::vision::detail::linear(c,w,x,nullptr,preserve,backend);
+        auto actual=dflash::vision::detail::linear(c,w,x,b,preserve);
+        auto unbiased=dflash::vision::detail::linear(c,w,x,nullptr,preserve);
         auto graph=ggml_new_graph(c);
         for(auto t:{raw_dot,actual,unbiased}) { ggml_set_output(t); ggml_build_forward_expand(graph,t); }
         size_t required=0; ggml_gallocr_reserve_n_size(owner.allocator,graph,nullptr,nullptr,&required);
         check(required<16*1024*1024,"tiny graph scratch unexpectedly large");
-        const size_t external=dflash::vision::detail::hip_bias_workspace(backend);
-        constexpr size_t limit=128ULL*1024*1024;
-        check(external<=limit && required<=limit-external,"graph arena plus workspace exceeds bound");
-        check((external!=0)==(device=="hip:0"),"wrong HIP capability");
-        size_t explicit_ops=0;
-        for(int i=0;i<ggml_graph_n_nodes(graph);++i)
-            explicit_ops+=ggml_graph_node(graph,i)->op==GGML_OP_MUL_MAT_BIAS_BF16;
-        check(explicit_ops==(device=="hip:0"?2u:0u),"wrong explicit linear graph dispatch");
-        const size_t launches_before=dflash::vision::detail::hip_bias_launches(backend);
         for(int i=0;i<ggml_graph_n_nodes(graph);++i) check(ggml_backend_supports_op(backend,ggml_graph_node(graph,i)),"unsupported test graph operation");
         check(ggml_gallocr_reserve(owner.allocator,graph),"graph reservation failed");
         check(ggml_gallocr_alloc_graph(owner.allocator,graph),"graph allocation failed");
@@ -120,10 +111,6 @@ int main(int argc,char ** argv) {
         ggml_backend_tensor_set(x,inputs.data(),0,inputs.size()*4);
         ggml_backend_tensor_set(b,bbits.data(),0,bbits.size()*sizeof(ggml_bf16_t));
         check(ggml_backend_graph_compute(backend,graph)==GGML_STATUS_SUCCESS,"graph execution failed");
-        const size_t launches=dflash::vision::detail::hip_bias_launches(backend)-launches_before;
-        check(launches==explicit_ops,"actual Lt launch count differs from explicit graph operations");
-        std::cout<<"explicit_linear_ops="<<explicit_ops<<" actual_lt_launches="<<launches
-                 <<" retained_workspace_bytes="<<external<<'\n';
         auto values=read(actual),dots=read(raw_dot),no_bias=read(unbiased);
         size_t mismatch=0,early_match=0,dot_exact=0,dot_rounded=0,no_bias_mismatch=0,no_bias_raw=0,no_bias_round_raw=0;
         float max_abs=0;
@@ -132,8 +119,8 @@ int main(int argc,char ** argv) {
             mismatch+=values[i]!=expected[i]; early_match+=values[i]==premature[i];
             dot_exact+=dots[i]==dot[i]; dot_rounded+=dots[i]==rounded_dot[i];
             no_bias_mismatch+=no_bias[i]!=rounded_dot[i]; no_bias_raw+=no_bias[i]!=dots[i];
-            // Generic-product preservation is a CPU contract. HIP diagnostics
-            // here do not replace comparison with frozen original MLP outputs.
+            // Original Torch HIP BF16 GEMM shares the native raw-product tie
+            // behavior. Gate the explicit final boundary, not universal GEMM RNE.
             no_bias_round_raw+=no_bias[i]!=round_bf16(double(dots[i]));
             max_abs=std::max(max_abs,std::abs(values[i]-expected[i]));
         }
@@ -145,10 +132,9 @@ int main(int argc,char ** argv) {
                  <<" mismatches="<<mismatch<<" max_abs="<<max_abs<<" premature_matches="<<early_match
                  <<" dot_exact_matches="<<dot_exact<<" dot_rounded_matches="<<dot_rounded
                  <<" unbiased_rne_mismatches="<<no_bias_mismatch<<" unbiased_raw_mismatches="<<no_bias_raw
-                 <<" unbiased_validation="<<(device=="cpu"?"CPU-generic-preservation":"HIP-diagnostic-only")
                  <<" unbiased_round_raw_mismatches="<<no_bias_round_raw<<" scratch_bytes="<<required<<'\n';
         std::cout<<"example expected="<<expected[m]<<" premature="<<premature[m]<<" actual="<<values[m]<<" raw_dot="<<dots[m]<<'\n';
-        status=(mismatch || (device=="cpu" && no_bias_round_raw)) ? 3 : 0;
+        status=(mismatch || no_bias_round_raw) ? 3 : 0;
         std::cout<<(status==0 ? "PASS" : "ISSUES")<<": biased linear must round only after bias\n";
     } catch(const std::exception & error) { std::cerr<<"ERROR: "<<error.what()<<'\n'; }
     ggml_backend_free(backend);
