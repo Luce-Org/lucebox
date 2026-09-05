@@ -9,6 +9,7 @@
 //   6. MoE FFN (hash routing + top-k + shared expert + clamped SwiGLU)
 
 #include "deepseek4_internal.h"
+#include "deepseek4_norm.h"
 #include "deepseek4_hc_cuda.h"
 #include "deepseek4_roctx.h"
 #include "internal.h"
@@ -554,8 +555,7 @@ static bool build_cached_decode_output_graph(
 
 static ggml_tensor * build_rms_norm(ggml_context * ctx, ggml_tensor * x,
                                      ggml_tensor * weight, float eps) {
-    ggml_tensor * normed = ggml_rms_norm(ctx, x, eps);
-    return ggml_mul(ctx, normed, weight);
+    return detail::build_rms_norm(ctx, x, weight, eps);
 }
 
 // ─── Helper: Clamped SwiGLU ─────────────────────────────────────────────
