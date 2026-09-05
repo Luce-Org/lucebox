@@ -74,6 +74,7 @@ int main(int argc,char**argv) {
             size_t scratch=0; ggml_gallocr_reserve_n_size(owner.a,g,nullptr,nullptr,&scratch);
             check(scratch<128ULL*1024*1024,"graph scratch exceeds fixed bound");
             for(int i=0;i<ggml_graph_n_nodes(g);++i) check(ggml_backend_supports_op(backend,ggml_graph_node(g,i)),"unsupported node");
+            check(ggml_gallocr_reserve(owner.a,g),"graph reservation failed");
             check(ggml_gallocr_alloc_graph(owner.a,g),"graph allocation failed");
             ggml_backend_tensor_set(w,wv.data(),0,wv.size()*2); ggml_backend_tensor_set(b,bv.data(),0,bv.size()*2); ggml_backend_tensor_set(x,xv.data(),0,xv.size()*4);
             check(ggml_backend_graph_compute(backend,g)==GGML_STATUS_SUCCESS,"compute failed");
