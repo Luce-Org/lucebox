@@ -422,7 +422,8 @@ static ggml_backend_buffer_t ggml_backend_cpu_device_buffer_from_host_ptr(ggml_b
 
 static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     // No extra-buffer handler may accidentally advertise this HIP-only op.
-    if (op->op == GGML_OP_MUL_MAT_BIAS_BF16 || op->op == GGML_OP_RMS_NORM_VISION_F32) return false;
+    if (op->op == GGML_OP_MUL_MAT_BIAS_BF16 || op->op == GGML_OP_RMS_NORM_VISION_F32 ||
+        op->op == GGML_OP_SOFT_MAX_VISION_F32 || op->op == GGML_OP_MUL_MAT_VISION_AV_F32) return false;
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
 
@@ -475,6 +476,8 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         case GGML_OP_PAGED_ATTN:
         case GGML_OP_MUL_MAT_BIAS_BF16:
         case GGML_OP_RMS_NORM_VISION_F32:
+        case GGML_OP_SOFT_MAX_VISION_F32:
+        case GGML_OP_MUL_MAT_VISION_AV_F32:
             return false;
         case GGML_OP_SSM_CONV:
             // Every nonzero mode is a dflash CUDA/HIP extension (SpecLA,

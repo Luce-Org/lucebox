@@ -619,6 +619,8 @@ extern "C" {
 
         GGML_OP_MUL_MAT_BIAS_BF16, // explicit HIP-only DS4V fused bias
         GGML_OP_RMS_NORM_VISION_F32, // inference-only HIP source-order DS4V normalization
+        GGML_OP_SOFT_MAX_VISION_F32, // inference-only HIP source-order DS4V softmax
+        GGML_OP_MUL_MAT_VISION_AV_F32, // inference-only HIP source-layout DS4V AV
 
         GGML_OP_COUNT,
     };
@@ -1428,6 +1430,20 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             float                 eps);
+
+    // Inference-only HIP wave32 operations; no CPU/RPC/backward implementation.
+    // scores: contiguous F32, width 16..4096, positive rows, total bytes <= INT_MAX.
+    GGML_API struct ggml_tensor * ggml_soft_max_vision_f32(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * scores);
+
+    // v: contiguous F32 [64,16,N,1], probabilities: contiguous F32 [N,N,16,1].
+    // N is 16..4096; result is F32 [64,N,16,1].
+    GGML_API struct ggml_tensor * ggml_mul_mat_vision_av_f32(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * probabilities);
+
 
     // group normalize along ne0*ne1*n_groups
     // used in stable-diffusion

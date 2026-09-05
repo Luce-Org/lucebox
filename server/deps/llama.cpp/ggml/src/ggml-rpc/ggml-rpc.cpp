@@ -1985,7 +1985,8 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
 
 static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     // This opt-in local HIP extension must not be sent to an older RPC peer.
-    if (op->op == GGML_OP_MUL_MAT_BIAS_BF16 || op->op == GGML_OP_RMS_NORM_VISION_F32) return false;
+    if (op->op == GGML_OP_MUL_MAT_BIAS_BF16 || op->op == GGML_OP_RMS_NORM_VISION_F32 ||
+        op->op == GGML_OP_SOFT_MAX_VISION_F32 || op->op == GGML_OP_MUL_MAT_VISION_AV_F32) return false;
     GGML_UNUSED(dev);
     GGML_UNUSED(op);
     //TODO: call the remote backend and cache the results

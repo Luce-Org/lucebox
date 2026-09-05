@@ -122,6 +122,28 @@ size_t hip_bias_workspace(ggml_backend_t b) { return hip_size_query(b,"ggml_back
 size_t hip_bias_launches(ggml_backend_t b) { return hip_size_query(b,"ggml_backend_hip_vision_bias_bf16_launches"); }
 size_t hip_norm_launches(ggml_backend_t b) { return hip_size_query(b,"ggml_backend_hip_vision_norm_f32_launches"); }
 size_t hip_rotary_launches(ggml_backend_t b) { return hip_size_query(b,"ggml_backend_hip_vision_rotary_f32_launches"); }
+size_t hip_softmax_launches(ggml_backend_t b) { return hip_size_query(b,"ggml_backend_hip_vision_softmax_f32_launches"); }
+size_t hip_av_launches(ggml_backend_t b) { return hip_size_query(b,"ggml_backend_hip_vision_av_f32_launches"); }
+bool hip_softmax_capable(ggml_backend_t backend) {
+    if(!backend) return false;
+    auto device=ggml_backend_get_device(backend);
+    if(!device) return false;
+    auto reg=ggml_backend_dev_backend_reg(device);
+    if(!reg) return false;
+    using Query=bool (*)(ggml_backend_t);
+    auto query=reinterpret_cast<Query>(ggml_backend_reg_get_proc_address(reg,"ggml_backend_hip_vision_softmax_f32_capable"));
+    return query && query(backend);
+}
+bool hip_av_capable(ggml_backend_t backend) {
+    if(!backend) return false;
+    auto device=ggml_backend_get_device(backend);
+    if(!device) return false;
+    auto reg=ggml_backend_dev_backend_reg(device);
+    if(!reg) return false;
+    using Query=bool (*)(ggml_backend_t);
+    auto query=reinterpret_cast<Query>(ggml_backend_reg_get_proc_address(reg,"ggml_backend_hip_vision_av_f32_capable"));
+    return query && query(backend);
+}
 bool hip_rotary_capable(ggml_backend_t backend) {
     if(!backend) return false;
     auto device=ggml_backend_get_device(backend);
@@ -200,7 +222,7 @@ Tensor * rotate(ggml_context * c,Tensor * x,Tensor * cosine,Tensor * sine) {
     auto second=ggml_add(c,ggml_mul(c,b,cosine),ggml_mul(c,a,sine));
     return rounded(c,ggml_concat(c,first,second,0));
 }
-Tensor * attention(ggml_context * c,Tensor * q,Tensor * k,Tensor * v) {
+Tensor * attention(ggml_context * c,Tensor * q,Tensor * k,Tensor * v,ggml_backend_t backend) {
     q=ggml_cont(c,ggml_permute(c,q,0,2,1,3));
     k=ggml_cont(c,ggml_permute(c,k,0,2,1,3));
     // PyTorch 2.10 Math SDPA (the source's 3D input dispatch) scales both
@@ -209,10 +231,21 @@ Tensor * attention(ggml_context * c,Tensor * q,Tensor * k,Tensor * v) {
     const float scale=float(std::sqrt(1.0/std::sqrt(double(q->ne[0]))));
     auto scores=ggml_mul_mat(c,ggml_scale(c,k,scale),ggml_scale(c,q,scale));
     ggml_mul_mat_set_prec(scores,GGML_PREC_F32);
-    auto probabilities=ggml_soft_max(c,scores);
-    v=ggml_cont(c,ggml_permute(c,v,1,2,0,3)); // [N, D, heads]
-    auto out=ggml_mul_mat(c,v,probabilities);
-    ggml_mul_mat_set_prec(out,GGML_PREC_F32);
+    Tensor * out;
+    if(hip_bias_workspace(backend)) {
+        require(hip_softmax_capable(backend) && hip_av_capable(backend),
+                "HIP source-order vision attention unavailable; fallback forbidden");
+        auto probabilities=ggml_soft_max_vision_f32(c,scores);
+        require(ggml_backend_supports_op(backend,probabilities),"HIP vision softmax unsupported");
+        // Retain V's token-major layout for the original batched Lt NN call.
+        out=ggml_mul_mat_vision_av_f32(c,v,probabilities);
+        require(ggml_backend_supports_op(backend,out),"HIP vision attention product unsupported");
+    } else {
+        auto probabilities=ggml_soft_max(c,scores);
+        v=ggml_cont(c,ggml_permute(c,v,1,2,0,3)); // [N, D, heads]
+        out=ggml_mul_mat(c,v,probabilities);
+        ggml_mul_mat_set_prec(out,GGML_PREC_F32);
+    }
     out=ggml_cont(c,ggml_permute(c,out,0,2,1,3));
     return rounded(c,ggml_reshape_2d(c,out,out->ne[0]*out->ne[1],out->ne[2]));
 }
@@ -287,6 +320,8 @@ bool VisionRuntime::load(const std::string & path,ggml_backend_t backend,int dim
                 "HIP source-order vision normalization unavailable");
         require(!detail::hip_bias_workspace(backend) || detail::hip_rotary_capable(backend),
                 "HIP source-order vision rotary tables unavailable");
+        require(!detail::hip_bias_workspace(backend) || (detail::hip_softmax_capable(backend) && detail::hip_av_capable(backend)),
+                "HIP source-order vision attention unavailable");
         Meta meta;
         meta.g=gguf_init_from_file(path.c_str(),{true,&meta.c});
         require(meta.g && meta.c,"could not parse vision GGUF");
@@ -371,7 +406,7 @@ bool VisionRuntime::encode(const std::vector<float> & patches,PatchGrid grid,Vis
             };
             auto q=detail::rotate(g.c,slice(0),cosine,sine);
             auto k=detail::rotate(g.c,slice(1),cosine,sine);
-            auto attention=detail::attention(g.c,q,k,slice(2));
+            auto attention=detail::attention(g.c,q,k,slice(2),impl_->backend);
             auto projected=impl_->linear(g.c,attention,p+".attn.wo");
             auto residual=rounded(g.c,ggml_add(g.c,input,projected));
             auto mlp=impl_->linear(g.c,impl_->norm(g.c,residual,p+".norm2"),p+".mlp.w1",false);

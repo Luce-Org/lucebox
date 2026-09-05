@@ -11,7 +11,7 @@
 
 static void check(bool ok,const char *why) { if(!ok) throw std::runtime_error(why); }
 static_assert(GGML_OP_PAGED_ATTN==104 && GGML_OP_MUL_MAT_BIAS_BF16==105 &&
-              GGML_OP_RMS_NORM_VISION_F32==106 && GGML_OP_COUNT==107,"operation ABI changed");
+              GGML_OP_RMS_NORM_VISION_F32==106 && GGML_OP_SOFT_MAX_VISION_F32==107 && GGML_OP_MUL_MAT_VISION_AV_F32==108 && GGML_OP_COUNT==109,"operation ABI changed");
 static void rejected(int mode) {
     const pid_t pid=fork(); check(pid>=0,"fork failed");
     if(pid==0) {

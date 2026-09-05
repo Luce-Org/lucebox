@@ -14,7 +14,7 @@
 #include <stdexcept>
 #include <vector>
 #include <unistd.h>
-static_assert(GGML_OP_PAGED_ATTN==104 && GGML_OP_MUL_MAT_BIAS_BF16==105 && GGML_OP_RMS_NORM_VISION_F32==106 && GGML_OP_COUNT==107,"operation ABI changed unexpectedly");
+static_assert(GGML_OP_PAGED_ATTN==104 && GGML_OP_MUL_MAT_BIAS_BF16==105 && GGML_OP_RMS_NORM_VISION_F32==106 && GGML_OP_SOFT_MAX_VISION_F32==107 && GGML_OP_MUL_MAT_VISION_AV_F32==108 && GGML_OP_COUNT==109,"operation ABI changed unexpectedly");
 static void check(bool b,const char *s) { if(!b) throw std::runtime_error(s); }
 static uint32_t bits(float v) { uint32_t b; std::memcpy(&b,&v,4); return b; }
 static std::vector<float> load(const std::filesystem::path&p,size_t n) {

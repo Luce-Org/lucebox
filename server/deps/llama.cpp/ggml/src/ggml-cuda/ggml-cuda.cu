@@ -5,6 +5,8 @@
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/vision-bias.cuh"
 #include "ggml-cuda/vision-rotary.cuh"
+#include "ggml-cuda/vision-softmax.cuh"
+#include "ggml-cuda/vision-av.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/arange.cuh"
@@ -772,7 +774,7 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (vision_bias_workspace) {
         ggml_cuda_set_device(device);
         // The latest event follows every use of the shared workspace.
-        if (vision_bias_launches) CUDA_CHECK(cudaEventSynchronize(vision_bias_event));
+        if (vision_bias_launches || vision_av_launches) CUDA_CHECK(cudaEventSynchronize(vision_bias_event));
         CUDA_CHECK(cudaFree(vision_bias_workspace));
         CUDA_CHECK(cudaEventDestroy(vision_bias_event));
     }
@@ -3636,6 +3638,20 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
 #else
             return false;
 #endif
+        case GGML_OP_SOFT_MAX_VISION_F32:
+#if defined(GGML_USE_HIP)
+            ggml_cuda_op_soft_max_vision_f32(ctx, dst);
+            break;
+#else
+            return false;
+#endif
+        case GGML_OP_MUL_MAT_VISION_AV_F32:
+#if defined(GGML_USE_HIP)
+            ggml_hip_vision_av_f32(ctx, dst);
+            break;
+#else
+            return false;
+#endif
         case GGML_OP_PAGED_ATTN:
             ggml_cuda_paged_attn(ctx, dst);
             break;
@@ -3927,7 +3943,8 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         ggml_tensor * node = cgraph->nodes[i];
         // These explicit vision operations are qualified through direct
         // execution only; the linear also retains a workspace and event.
-        if (node->op == GGML_OP_MUL_MAT_BIAS_BF16 || node->op == GGML_OP_RMS_NORM_VISION_F32) return false;
+        if (node->op == GGML_OP_MUL_MAT_BIAS_BF16 || node->op == GGML_OP_RMS_NORM_VISION_F32 ||
+            node->op == GGML_OP_SOFT_MAX_VISION_F32 || node->op == GGML_OP_MUL_MAT_VISION_AV_F32) return false;
 
         if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE) {
             continue;
@@ -6488,6 +6505,18 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 #else
             return false;
 #endif
+        case GGML_OP_SOFT_MAX_VISION_F32:
+#if defined(GGML_USE_HIP)
+            return ggml_hip_vision_softmax_f32_supported(dev_ctx->device, op);
+#else
+            return false;
+#endif
+        case GGML_OP_MUL_MAT_VISION_AV_F32:
+#if defined(GGML_USE_HIP)
+            return ggml_hip_vision_av_f32_supported(dev_ctx->device, op);
+#else
+            return false;
+#endif
         case GGML_OP_PAGED_ATTN:
             return ggml_cuda_paged_attn_supported(op);
         case GGML_OP_CROSS_ENTROPY_LOSS:
@@ -6681,6 +6710,20 @@ static size_t ggml_backend_hip_vision_norm_f32_launches(ggml_backend_t backend) 
     return backend && ggml_backend_is_cuda(backend) ?
         static_cast<ggml_backend_cuda_context *>(backend->context)->vision_norm_launches : 0;
 }
+static bool ggml_backend_hip_vision_softmax_f32_capable(ggml_backend_t backend) {
+    return ggml_backend_hip_vision_norm_f32_capable(backend);
+}
+static size_t ggml_backend_hip_vision_softmax_f32_launches(ggml_backend_t backend) {
+    return backend && ggml_backend_is_cuda(backend) ?
+        static_cast<ggml_backend_cuda_context *>(backend->context)->vision_softmax_launches : 0;
+}
+static bool ggml_backend_hip_vision_av_f32_capable(ggml_backend_t backend) {
+    return ggml_backend_hip_vision_norm_f32_capable(backend);
+}
+static size_t ggml_backend_hip_vision_av_f32_launches(ggml_backend_t backend) {
+    return backend && ggml_backend_is_cuda(backend) ?
+        static_cast<ggml_backend_cuda_context *>(backend->context)->vision_av_launches : 0;
+}
 static bool ggml_backend_hip_vision_rotary_f32_capable(ggml_backend_t backend) {
     return ggml_backend_hip_vision_norm_f32_capable(backend);
 }
@@ -6703,6 +6746,10 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name,"ggml_backend_hip_vision_bias_bf16_launches")==0) return (void *)ggml_backend_hip_vision_bias_bf16_launches;
     if (strcmp(name,"ggml_backend_hip_vision_norm_f32_capable")==0) return (void *)ggml_backend_hip_vision_norm_f32_capable;
     if (strcmp(name,"ggml_backend_hip_vision_norm_f32_launches")==0) return (void *)ggml_backend_hip_vision_norm_f32_launches;
+    if (strcmp(name,"ggml_backend_hip_vision_softmax_f32_capable")==0) return (void *)ggml_backend_hip_vision_softmax_f32_capable;
+    if (strcmp(name,"ggml_backend_hip_vision_softmax_f32_launches")==0) return (void *)ggml_backend_hip_vision_softmax_f32_launches;
+    if (strcmp(name,"ggml_backend_hip_vision_av_f32_capable")==0) return (void *)ggml_backend_hip_vision_av_f32_capable;
+    if (strcmp(name,"ggml_backend_hip_vision_av_f32_launches")==0) return (void *)ggml_backend_hip_vision_av_f32_launches;
     if (strcmp(name,"ggml_backend_hip_vision_rotary_f32_capable")==0) return (void *)ggml_backend_hip_vision_rotary_f32_capable;
     if (strcmp(name,"ggml_backend_hip_vision_rotary_f32")==0) return (void *)ggml_backend_hip_vision_rotary_f32;
     if (strcmp(name,"ggml_backend_hip_vision_rotary_f32_launches")==0) return (void *)ggml_backend_hip_vision_rotary_f32_launches;

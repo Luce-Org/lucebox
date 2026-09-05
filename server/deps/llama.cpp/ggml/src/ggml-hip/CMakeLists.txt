@@ -153,6 +153,11 @@ else()
     set_source_files_properties(${GGML_SOURCES_ROCM} PROPERTIES LANGUAGE HIP)
 endif()
 
+# Preserve source eager F32 softmax arithmetic; the kernel explicitly selects
+# its fast exponential calls and must not gain reciprocal/FMA substitutions.
+set_property(SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/../ggml-cuda/vision-softmax.cu"
+             APPEND PROPERTY COMPILE_OPTIONS -fno-fast-math -ffp-contract=off)
+
 if (GGML_STATIC)
     message(FATAL_ERROR "Static linking not supported for HIP/ROCm")
 endif()

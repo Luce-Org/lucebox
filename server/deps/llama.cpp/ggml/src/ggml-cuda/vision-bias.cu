@@ -13,19 +13,29 @@ bool ggml_hip_vision_bias_supported(const ggml_tensor * d) {
            d->ne[0]==w->ne[1] && d->ne[1]==x->ne[1] && d->ne[2]==1 && d->ne[3]==1;
 }
 
+void ggml_hip_vision_workspace_acquire(ggml_backend_cuda_context &ctx) {
+    ggml_cuda_set_device(ctx.device);
+    // A single event serializes shared workspace use across context streams.
+    if (!ctx.vision_bias_handle) CUBLAS_CHECK(hipblasLtCreate(&ctx.vision_bias_handle));
+    if (!ctx.vision_bias_workspace) {
+        CUDA_CHECK(cudaMalloc(&ctx.vision_bias_workspace,GGML_HIP_VISION_WORKSPACE_BYTES));
+        CUDA_CHECK(cudaEventCreateWithFlags(&ctx.vision_bias_event,cudaEventDisableTiming));
+    }
+    if (ctx.vision_bias_launches || ctx.vision_av_launches) {
+        CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(),ctx.vision_bias_event,0));
+    }
+}
+
+void ggml_hip_vision_workspace_record(ggml_backend_cuda_context &ctx) {
+    CUDA_CHECK(cudaEventRecord(ctx.vision_bias_event,ctx.stream()));
+}
+
 void ggml_hip_vision_bias(ggml_backend_cuda_context &ctx, ggml_tensor *dst) {
     GGML_ASSERT(ggml_hip_vision_bias_supported(dst));
     ggml_cuda_set_device(ctx.device);
     const auto stream=ctx.stream();
-    constexpr size_t bytes=76ULL*1024*1024;
-    // One retained workspace per context, not per layer or graph. An event
-    // serializes workspace use even if this context schedules other streams.
-    if (!ctx.vision_bias_handle) CUBLAS_CHECK(hipblasLtCreate(&ctx.vision_bias_handle));
-    if (!ctx.vision_bias_workspace) {
-        CUDA_CHECK(cudaMalloc(&ctx.vision_bias_workspace,bytes));
-        CUDA_CHECK(cudaEventCreateWithFlags(&ctx.vision_bias_event,cudaEventDisableTiming));
-    }
-    if (ctx.vision_bias_launches) CUDA_CHECK(cudaStreamWaitEvent(stream,ctx.vision_bias_event,0));
+    constexpr size_t bytes=GGML_HIP_VISION_WORKSPACE_BYTES;
+    ggml_hip_vision_workspace_acquire(ctx);
     const auto w=dst->src[0],x=dst->src[1],b=dst->src[2];
     const int64_t k=w->ne[0],m=w->ne[1],n=x->ne[1];
     hipblasLtMatmulDesc_t op=nullptr;
@@ -51,7 +61,7 @@ void ggml_hip_vision_bias(ggml_backend_cuda_context &ctx, ggml_tensor *dst) {
     const float alpha=1,beta=0;
     CUBLAS_CHECK(hipblasLtMatmul(ctx.vision_bias_handle,op,&alpha,w->data,a,x->data,bl,&beta,
         dst->data,c,dst->data,c,&heuristic.algo,ctx.vision_bias_workspace,bytes,stream));
-    CUDA_CHECK(cudaEventRecord(ctx.vision_bias_event,stream));
+    ggml_hip_vision_workspace_record(ctx);
     ++ctx.vision_bias_launches;
     CUBLAS_CHECK(hipblasLtMatmulPreferenceDestroy(pref));
     CUBLAS_CHECK(hipblasLtMatrixLayoutDestroy(c));
