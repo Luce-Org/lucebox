@@ -878,6 +878,22 @@ bool DeepSeek4Backend::materialize_images(const DeepSeek4ImagePrompt & images,
     if (spec_backend_) ggml_backend_synchronize(spec_backend_);
     deepseek4_release_image_scratch(cache_, moe_hybrid_.get());
     reset_deepseek4_dspark_runtime_cache();
+    // Gallocr teardown leaves operator temporaries in legacy CUDA/HIP pools.
+    // Retire their captured executables and activation memos through the
+    // backend API before measuring headroom for the next image request.
+    const auto trim_pool = [](ggml_backend_t owner, const char * name) {
+        const size_t released = ggml_backend_cuda_trim_pool(owner);
+        std::fprintf(stderr,
+                     "[deepseek4] image transition pool trim: owner=%s released=%zu bytes\n",
+                     name, released);
+    };
+    trim_pool(backend_, "primary");
+    if (expert_backend_ && expert_backend_ != backend_) {
+        trim_pool(expert_backend_, "expert");
+    }
+    if (spec_backend_ && spec_backend_ != backend_ && spec_backend_ != expert_backend_) {
+        trim_pool(spec_backend_, "spec");
+    }
     auto reserves = image_reserves_;
     const uint64_t resident_workspace =
         (vision::detail::hip_bias_launches(backend_) || vision::detail::hip_av_launches(backend_))
