@@ -326,7 +326,7 @@ static const std::regex & re_tool_call_function() {
 }
 
 static const std::regex & re_tool_call_parameter() {
-    static std::regex r(R"(<parameter=([\s\S]*?)(?:</parameter>|(?=<parameter=)|(?=</function>)|$))");
+    static std::regex r(R"(<parameter=([\s\S]*?)(?:</parameter>|(?=<parameter=)|(?=</function>)|(?![\s\S])))");
     return r;
 }
 
@@ -602,8 +602,13 @@ static json parse_xml_params(const std::string & region, const std::string & fn_
         while (!k.empty() && k.front() == ' ') k.erase(k.begin());
 
         std::string v = match_text.substr(eq + 1);
-        if (!v.empty() && v.front() == '\n') v.erase(v.begin());
-        if (!v.empty() && v.back() == '\n') v.pop_back();
+        if (v.rfind("\r\n", 0) == 0) v.erase(0, 2);
+        else if (!v.empty() && v.front() == '\n') v.erase(v.begin());
+        if (v.size() >= 2 && v.compare(v.size() - 2, 2, "\r\n") == 0) {
+            v.erase(v.size() - 2);
+        } else if (!v.empty() && v.back() == '\n') {
+            v.pop_back();
+        }
 
         args[k] = convert_param_value(v, k, props);
     }

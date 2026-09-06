@@ -57,12 +57,13 @@
 #include <unordered_set>
 #include <vector>
 #include <limits>
+#if !defined(_WIN32)
 #include <fcntl.h>
 #include <sys/stat.h>
-#include <dirent.h>
 #include <unistd.h>
-#if !defined(_WIN32)
 #include <sys/socket.h>
+#else
+#include <io.h>
 #endif
 
 #if defined(_WIN32)
@@ -75,6 +76,22 @@
 
 using json = nlohmann::json;
 using namespace dflash::common;
+namespace fs = std::filesystem;
+
+static fs::path test_tmp_path(const char * name) {
+    std::error_code ec;
+    fs::path root = fs::temp_directory_path(ec);
+    if (ec) {
+        throw std::runtime_error("failed to resolve temporary directory: " +
+                                 ec.message());
+    }
+    return root / name;
+}
+
+static void remove_test_path(const fs::path & path) {
+    std::error_code ec;
+    fs::remove(path, ec);
+}
 
 namespace dflash::common {
 std::vector<ChatMessage> normalize_chat_messages(
@@ -326,6 +343,37 @@ static json read_tools() {
     });
 }
 
+static json qwen_read_probe_tools() {
+    return json::array({
+        {{"type", "function"},
+         {"function", {
+             {"name", "read_probe"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"filePath", {{"type", "string"}}},
+                     {"limit", {{"type", "integer"}}},
+                     {"content", {{"type", "string"}}}
+                 }},
+                 {"required", json::array({"filePath"})}
+             }}
+         }}}
+    });
+}
+
+static std::string qwen_read_probe_call(const std::string & eol) {
+    return "<tool_call>" + eol
+        + "<function=read_probe>" + eol
+        + "<parameter=filePath>" + eol
+        + "README.md" + eol
+        + "</parameter>" + eol
+        + "<parameter=limit>" + eol
+        + "10" + eol
+        + "</parameter>" + eol
+        + "</function>" + eol
+        + "</tool_call>";
+}
+
 static json read_and_bash_tools() {
     json tools = read_tools();
     tools.push_back(bash_tools()[0]);
@@ -502,6 +550,69 @@ TEST_CASE(ServerUnitFixture, test_reasoning_disabled) {
 // ═══════════════════════════════════════════════════════════════════════
 // Tool parser tests
 // ═══════════════════════════════════════════════════════════════════════
+
+TEST_CASE(ServerUnitFixture, test_parse_qwen_multiline_xml_parameters_lf) {
+    auto result = parse_tool_calls(qwen_read_probe_call("\n"),
+                                   qwen_read_probe_tools());
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "read_probe");
+        const auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["filePath"] == "README.md");
+        TEST_ASSERT(args["filePath"].is_string());
+        TEST_ASSERT(args["limit"].is_number_integer());
+        TEST_ASSERT(args["limit"] == 10);
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_qwen_multiline_xml_parameters_crlf) {
+    auto result = parse_tool_calls(qwen_read_probe_call("\r\n"),
+                                   qwen_read_probe_tools());
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        const auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["filePath"] == "README.md");
+        TEST_ASSERT(args["filePath"].get<std::string>().find('\r') ==
+                    std::string::npos);
+        TEST_ASSERT(args["limit"].is_number_integer());
+        TEST_ASSERT(args["limit"] == 10);
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_qwen_multiline_xml_string_value) {
+    const std::string text =
+        "<tool_call>\n"
+        "<function=read_probe>\n"
+        "<parameter=filePath>\n"
+        "README.md\n"
+        "</parameter>\n"
+        "<parameter=content>\n"
+        "line1\n"
+        "line2\n"
+        "</parameter>\n"
+        "</function>\n"
+        "</tool_call>";
+    auto result = parse_tool_calls(text, qwen_read_probe_tools());
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        const auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["content"] == "line1\nline2");
+        TEST_ASSERT(args["content"].get<std::string>().find('\r') ==
+                    std::string::npos);
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_qwen_multiline_xml_parameter_at_true_eof) {
+    const std::string text =
+        "<tool_call><function=read_probe>"
+        "<parameter=filePath>README.md</tool_call>";
+    auto result = parse_tool_calls(text, qwen_read_probe_tools());
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        const auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["filePath"] == "README.md");
+    }
+}
 
 TEST_CASE(ServerUnitFixture, test_parse_tool_call_xml) {
     std::string text =
@@ -2436,7 +2547,7 @@ static std::string write_deepseek_marker_tokenizer_fixture() {
     gguf_set_val_u32(g, "tokenizer.ggml.bos_token_id", 1);
     gguf_set_val_u32(g, "tokenizer.ggml.eos_token_id", 2);
 
-    const std::string path = "/tmp/dflash_test_deepseek_markers.gguf";
+    const std::string path = test_tmp_path("dflash_test_deepseek_markers.gguf").string();
     gguf_write_to_file(g, path.c_str(), /*only_meta=*/false);
     gguf_free(g);
     return path;
@@ -2464,7 +2575,7 @@ TEST_CASE(ServerUnitFixture, test_resolve_deepseek_chat_markers) {
     };
     TEST_ASSERT(find_all_boundaries(prompt, markers) ==
                 std::vector<int>({8}));
-    unlink(path.c_str());
+    remove_test_path(path);
 }
 
 TEST_CASE(ServerUnitFixture, test_prefix_cache_reserves_disk_staging_slot) {
@@ -2476,7 +2587,7 @@ TEST_CASE(ServerUnitFixture, test_prefix_cache_reserves_disk_staging_slot) {
     TEST_ASSERT(cache.stats().capacity == PrefixCache::MAX_CACHE_SLOTS);
     TEST_ASSERT(PrefixCache::MAX_CACHE_SLOTS == ModelBackend::kMaxSlots - 1);
 
-    unlink(path.c_str());
+    remove_test_path(path);
 }
 
 TEST_CASE(ServerUnitFixture, test_canonical_turn_matches_replay_checkpoint) {
@@ -4291,8 +4402,9 @@ TEST_CASE(ServerUnitFixture, test_layer_split_backend_cancels_between_prefill_ch
 }
 
 TEST_CASE(ServerUnitFixture, test_layer_split_compress_nopark_uses_default_drafter_path) {
-    const std::string ids_path = "/tmp/dflash_test_layer_split_compress_ids.bin";
-    unlink(ids_path.c_str());
+    const std::string ids_path = test_tmp_path(
+        "dflash_test_layer_split_compress_ids.bin").string();
+    remove_test_path(ids_path);
     TEST_ASSERT(write_int32_file(ids_path, {1, 2, 3, 4}));
 
     auto * raw = new MockLayerSplitAdapter();
@@ -4307,12 +4419,13 @@ TEST_CASE(ServerUnitFixture, test_layer_split_compress_nopark_uses_default_draft
     TEST_ASSERT(raw->last_compress_req.drafter_path ==
                 "/tmp/default-layer-split-drafter.gguf");
 
-    unlink(ids_path.c_str());
+    remove_test_path(ids_path);
 }
 
 TEST_CASE(ServerUnitFixture, test_layer_split_compress_rejects_bad_keep_ratio) {
-    const std::string ids_path = "/tmp/dflash_test_layer_split_compress_bad.bin";
-    unlink(ids_path.c_str());
+    const std::string ids_path = test_tmp_path(
+        "dflash_test_layer_split_compress_bad.bin").string();
+    remove_test_path(ids_path);
     TEST_ASSERT(write_int32_file(ids_path, {1, 2, 3, 4}));
 
     auto * raw = new MockLayerSplitAdapter();
@@ -4323,7 +4436,7 @@ TEST_CASE(ServerUnitFixture, test_layer_split_compress_rejects_bad_keep_ratio) {
     TEST_ASSERT(!backend.handle_compress(cmd, io));
     TEST_ASSERT(raw->last_compress_req.input_ids.empty());
 
-    unlink(ids_path.c_str());
+    remove_test_path(ids_path);
 }
 
 TEST_CASE(ServerUnitFixture, test_layer_split_backend_shutdown_is_idempotent) {
@@ -4461,21 +4574,8 @@ struct MockBackendWithLayout : MockBackend {
 
 // Helper: recursively remove a directory.
 static void rm_rf(const std::string & path) {
-    DIR * dir = opendir(path.c_str());
-    if (!dir) { unlink(path.c_str()); return; }
-    struct dirent * ent;
-    while ((ent = readdir(dir)) != nullptr) {
-        if (std::strcmp(ent->d_name, ".") == 0 || std::strcmp(ent->d_name, "..") == 0) continue;
-        std::string child = path + "/" + ent->d_name;
-        struct stat st;
-        if (stat(child.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
-            rm_rf(child);
-        } else {
-            unlink(child.c_str());
-        }
-    }
-    closedir(dir);
-    rmdir(path.c_str());
+    std::error_code ec;
+    fs::remove_all(path, ec);
 }
 
 TEST_CASE(ServerUnitFixture, test_disk_cache_config_defaults) {
@@ -4620,7 +4720,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_disables_memory_only_backend) {
 
 TEST_CASE(ServerUnitFixture, test_disk_cache_init_creates_directory) {
     MockBackend backend;
-    std::string dir = "/tmp/dflash_test_disk_cache_init";
+    std::string dir = test_tmp_path("dflash_test_disk_cache_init").string();
     rm_rf(dir);
 
     DiskCacheConfig cfg;
@@ -4630,8 +4730,8 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_init_creates_directory) {
     TEST_ASSERT(cache.init());
 
     // Directory should exist.
-    struct stat st;
-    TEST_ASSERT(stat(dir.c_str(), &st) == 0 && S_ISDIR(st.st_mode));
+    std::error_code ec;
+    TEST_ASSERT(fs::is_directory(dir, ec) && !ec);
 
     rm_rf(dir);
 }
@@ -4647,8 +4747,9 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_header_size) {
 
 TEST_CASE(ServerUnitFixture, test_disk_cache_header_round_trip) {
     // Write and read a header to verify serialization.
-    std::string path = "/tmp/dflash_test_header_rt.dkv";
-    unlink(path.c_str());
+    std::string path = test_tmp_path("dflash_test_header_rt.dkv").string();
+    remove_test_path(path);
+    std::error_code ec;
 
     DiskCacheHeader hdr{};
     std::memcpy(hdr.magic, "DKVC", 4);
@@ -4683,9 +4784,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_header_round_trip) {
     std::fclose(f);
 
     // Verify file size is DISK_CACHE_HEADER_SIZE.
-    struct stat st;
-    stat(path.c_str(), &st);
-    TEST_ASSERT((size_t)st.st_size == DISK_CACHE_HEADER_SIZE);
+    TEST_ASSERT(fs::file_size(path, ec) == DISK_CACHE_HEADER_SIZE && !ec);
 
     // Read back and verify.
     f = std::fopen(path.c_str(), "rb");
@@ -4707,13 +4806,13 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_header_round_trip) {
     int32_t ri32; std::fread(&ri32, 4, 1, f); TEST_ASSERT(ri32 == 151643);  // last_tok
     std::fclose(f);
 
-    unlink(path.c_str());
+    remove_test_path(path);
 }
 
 TEST_CASE(ServerUnitFixture, test_disk_cache_continued_boundary) {
     // Test maybe_store_continued logic: saves at interval boundaries.
     MockBackend backend;
-    std::string dir = "/tmp/dflash_test_continued";
+    std::string dir = test_tmp_path("dflash_test_continued").string();
     rm_rf(dir);
 
     DiskCacheConfig cfg;
@@ -4775,7 +4874,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_continued_interval_logic) {
 TEST_CASE(ServerUnitFixture, test_disk_cache_cold_prefix_short_prompt) {
     // Cold prefix should not trigger for short prompts.
     MockBackend backend;
-    std::string dir = "/tmp/dflash_test_cold_short";
+    std::string dir = test_tmp_path("dflash_test_cold_short").string();
     rm_rf(dir);
 
     DiskCacheConfig cfg;
@@ -4796,7 +4895,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_cold_prefix_short_prompt) {
 TEST_CASE(ServerUnitFixture, test_disk_cache_cold_prefix_no_boundaries) {
     // Cold prefix should not trigger if no boundaries provided.
     MockBackend backend;
-    std::string dir = "/tmp/dflash_test_cold_nobound";
+    std::string dir = test_tmp_path("dflash_test_cold_nobound").string();
     rm_rf(dir);
 
     DiskCacheConfig cfg;
@@ -4816,7 +4915,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_cold_prefix_no_boundaries) {
 TEST_CASE(ServerUnitFixture, test_disk_cache_cold_prefix_finds_boundary) {
     // Cold prefix should find the last boundary <= cold_max_tokens.
     MockBackend backend;
-    std::string dir = "/tmp/dflash_test_cold_finds";
+    std::string dir = test_tmp_path("dflash_test_cold_finds").string();
     rm_rf(dir);
 
     DiskCacheConfig cfg;
@@ -4866,7 +4965,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_budget_enforcement_scoring) {
 TEST_CASE(ServerUnitFixture, test_disk_cache_lookup_miss_no_layout) {
     // Lookup with no layout known should return false.
     MockBackend backend;
-    std::string dir = "/tmp/dflash_test_lookup_miss";
+    std::string dir = test_tmp_path("dflash_test_lookup_miss").string();
     rm_rf(dir);
 
     DiskCacheConfig cfg;
@@ -4883,7 +4982,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_lookup_miss_no_layout) {
 TEST_CASE(ServerUnitFixture, test_disk_cache_save_below_min_tokens) {
     // Save with fewer tokens than min_tokens should be rejected.
     MockBackend backend;
-    std::string dir = "/tmp/dflash_test_save_below";
+    std::string dir = test_tmp_path("dflash_test_save_below").string();
     rm_rf(dir);
 
     DiskCacheConfig cfg;
@@ -4906,33 +5005,28 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_save_below_min_tokens) {
 // Helper: read layout_id from the first .dkv file found under base/.
 static std::array<uint8_t, 16> read_layout_id_from_cache_dir(const std::string & base) {
     std::array<uint8_t, 16> id{};
-    DIR * d = opendir(base.c_str());
-    if (!d) return id;
-    struct dirent * ent;
-    while ((ent = readdir(d)) != nullptr) {
-        if (ent->d_name[0] == '.') continue;
-        std::string sub = base + "/" + ent->d_name;
-        struct stat st{};
-        if (stat(sub.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) continue;
-        DIR * sd = opendir(sub.c_str());
-        if (!sd) continue;
-        struct dirent * sf;
-        while ((sf = readdir(sd)) != nullptr) {
-            size_t nl = std::strlen(sf->d_name);
-            if (nl < 4 || std::strcmp(sf->d_name + nl - 4, ".dkv") != 0) continue;
-            std::string fp = sub + "/" + sf->d_name;
-            FILE * f = std::fopen(fp.c_str(), "rb");
+    std::error_code ec;
+    for (const fs::directory_entry & entry : fs::directory_iterator(base, ec)) {
+        if (ec) break;
+        if (!entry.is_directory(ec)) {
+            ec.clear();
+            continue;
+        }
+        for (const fs::directory_entry & file_entry :
+             fs::directory_iterator(entry.path(), ec)) {
+            if (ec) break;
+            const std::string name = file_entry.path().filename().string();
+            if (name.size() < 4 || name.compare(name.size() - 4, 4, ".dkv") != 0) {
+                continue;
+            }
+            FILE * f = std::fopen(file_entry.path().string().c_str(), "rb");
             if (!f) continue;
             std::fseek(f, 8, SEEK_SET);  // skip magic(4) + version(4)
             std::fread(id.data(), 1, 16, f);
             std::fclose(f);
-            closedir(sd);
-            closedir(d);
             return id;
         }
-        closedir(sd);
     }
-    closedir(d);
     return id;
 }
 
@@ -4945,7 +5039,7 @@ TEST_CASE(ServerUnitFixture, test_disk_identity_salt_changes_layout_id) {
     std::array<uint8_t, 16> salt_a{};
     salt_a[0] = 0x01; salt_a[15] = 0xAB;
 
-    std::string dir_a = "/tmp/dflash_test_salt_a";
+    std::string dir_a = test_tmp_path("dflash_test_salt_a").string();
     rm_rf(dir_a);
     {
         DiskCacheConfig cfg; cfg.cache_dir = dir_a; cfg.min_tokens = 1;
@@ -4960,7 +5054,7 @@ TEST_CASE(ServerUnitFixture, test_disk_identity_salt_changes_layout_id) {
     std::array<uint8_t, 16> salt_b{};
     salt_b[0] = 0x02; salt_b[15] = 0xCD;
 
-    std::string dir_b = "/tmp/dflash_test_salt_b";
+    std::string dir_b = test_tmp_path("dflash_test_salt_b").string();
     rm_rf(dir_b);
     {
         DiskCacheConfig cfg; cfg.cache_dir = dir_b; cfg.min_tokens = 1;
@@ -4978,7 +5072,7 @@ TEST_CASE(ServerUnitFixture, test_disk_identity_salt_changes_layout_id) {
     TEST_ASSERT(id_a != id_b);
 
     // Same salt A applied again → identical layout_id.
-    std::string dir_a2 = "/tmp/dflash_test_salt_a2";
+    std::string dir_a2 = test_tmp_path("dflash_test_salt_a2").string();
     rm_rf(dir_a2);
     {
         DiskCacheConfig cfg; cfg.cache_dir = dir_a2; cfg.min_tokens = 1;
@@ -5003,7 +5097,7 @@ TEST_CASE(ServerUnitFixture, test_disk_identity_salt_zero_is_backcompat) {
     std::vector<int32_t> prompt;
     for (int i = 0; i < 10; ++i) prompt.push_back(i + 1);
 
-    std::string dir1 = "/tmp/dflash_test_salt_zero1";
+    std::string dir1 = test_tmp_path("dflash_test_salt_zero1").string();
     rm_rf(dir1);
     {
         DiskCacheConfig cfg; cfg.cache_dir = dir1; cfg.min_tokens = 1;
@@ -5014,7 +5108,7 @@ TEST_CASE(ServerUnitFixture, test_disk_identity_salt_zero_is_backcompat) {
         TEST_ASSERT(cache.save(0, prompt));
     }
 
-    std::string dir2 = "/tmp/dflash_test_salt_zero2";
+    std::string dir2 = test_tmp_path("dflash_test_salt_zero2").string();
     rm_rf(dir2);
     {
         DiskCacheConfig cfg; cfg.cache_dir = dir2; cfg.min_tokens = 1;
@@ -5035,14 +5129,15 @@ TEST_CASE(ServerUnitFixture, test_disk_identity_salt_zero_is_backcompat) {
 }
 
 TEST_CASE(ServerUnitFixture, test_backend_ipc_rejects_file_work_dir) {
-    const std::string file_path = "/tmp/dflash_test_backend_ipc_work_dir_file";
-    unlink(file_path.c_str());
-    int fd = open(file_path.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0600);
-    TEST_ASSERT(fd >= 0);
-    if (fd >= 0) {
+    const std::string file_path = test_tmp_path(
+        "dflash_test_backend_ipc_work_dir_file").string();
+    remove_test_path(file_path);
+    FILE * file = std::fopen(file_path.c_str(), "wb");
+    TEST_ASSERT(file != nullptr);
+    if (file != nullptr) {
         const char payload[] = "not a dir";
-        (void)write(fd, payload, sizeof(payload) - 1);
-        close(fd);
+        (void)std::fwrite(payload, 1, sizeof(payload) - 1, file);
+        std::fclose(file);
     }
 
     BackendIpcLaunchConfig cfg;
@@ -5053,9 +5148,10 @@ TEST_CASE(ServerUnitFixture, test_backend_ipc_rejects_file_work_dir) {
     BackendIpcProcess proc;
     TEST_ASSERT(!proc.start(cfg));
     TEST_ASSERT(!proc.active());
-    unlink(file_path.c_str());
+    remove_test_path(file_path);
 }
 
+#if !defined(_WIN32)
 TEST_CASE(ServerUnitFixture, test_backend_ipc_payload_pipe_round_trip) {
     int payload_pipe[2] = {-1, -1};
     int status_pipe[2] = {-1, -1};
@@ -5094,6 +5190,7 @@ TEST_CASE(ServerUnitFixture, test_backend_ipc_payload_pipe_round_trip) {
     TEST_ASSERT(status == 0);
     close(status_pipe[0]);
 }
+#endif
 
 TEST_CASE(ServerUnitFixture, test_backend_ipc_payload_transport_parse) {
     BackendIpcMode mode = BackendIpcMode::DFlashDraft;
@@ -5654,12 +5751,12 @@ TEST_CASE(ServerUnitFixture, test_model_card_env_override_beats_cwd) {
 
     const char * prev = std::getenv("DFLASH_MODEL_CARDS_DIR");
     const std::string saved = prev ? prev : "";
-    setenv("DFLASH_MODEL_CARDS_DIR", envdir.string().c_str(), 1);
+    dflash_setenv("DFLASH_MODEL_CARDS_DIR", envdir.string().c_str());
 
     auto card = dflash::common::resolve_model_card("", "env-probe-model", "deepseek4", "");
 
-    if (saved.empty()) unsetenv("DFLASH_MODEL_CARDS_DIR");
-    else setenv("DFLASH_MODEL_CARDS_DIR", saved.c_str(), 1);
+    if (saved.empty()) dflash_unsetenv("DFLASH_MODEL_CARDS_DIR");
+    else dflash_setenv("DFLASH_MODEL_CARDS_DIR", saved.c_str());
     fs::remove_all(root);
 
     // Resolved from the env dir, not the deepseek4 family fallback (which gives 32768).
@@ -6579,7 +6676,8 @@ static std::string write_qwen3_drafter_fixture_gguf() {
     add_tensor("blk.0.ffn_up.weight",      GGML_TYPE_BF16, 2, n_embd,   n_ff);
     add_tensor("blk.0.ffn_down.weight",    GGML_TYPE_BF16, 2, n_ff,     n_embd);
 
-    const std::string path = "/tmp/dflash_test_qwen3_drafter_438.gguf";
+    const std::string path = test_tmp_path(
+        "dflash_test_qwen3_drafter_438.gguf").string();
     gguf_write_to_file(g, path.c_str(), /*only_meta=*/false);
 
     gguf_free(g);
@@ -6604,11 +6702,13 @@ TEST_CASE(ServerUnitFixture, test_qwen3_drafter_rejects_truncated_gguf) {
     // Truncate inside the tensor-data section. The header, kv block, and tensor
     // info table all live before the data offset, so gguf_init_from_file still
     // succeeds and we reach the EOF guard rather than a parse failure.
-    struct stat st{};
-    TEST_ASSERT(stat(path.c_str(), &st) == 0);
-    const off_t truncated_size = (off_t)st.st_size - 4096;
+    std::error_code ec;
+    const uintmax_t file_size = fs::file_size(path, ec);
+    TEST_ASSERT(!ec);
+    const uintmax_t truncated_size = file_size - 4096;
     TEST_ASSERT(truncated_size > 0);
-    TEST_ASSERT(truncate(path.c_str(), truncated_size) == 0);
+    fs::resize_file(path, truncated_size, ec);
+    TEST_ASSERT(!ec);
 
     // The loader must fail cleanly (no SIGSEGV) with a descriptive error.
     {
@@ -6622,7 +6722,7 @@ TEST_CASE(ServerUnitFixture, test_qwen3_drafter_rejects_truncated_gguf) {
     }
 
     ggml_backend_free(backend);
-    unlink(path.c_str());
+    remove_test_path(path);
 }
 
 // ─── GGUF tensor bounds (gguf_tensor_in_file / gguf_bounds_error) ───────
@@ -7394,9 +7494,15 @@ struct StderrCapture {
         file = std::tmpfile();
         if (file == nullptr) return;
 
+#if defined(_WIN32)
+        old_stderr = _dup(_fileno(stderr));
+        if (old_stderr == -1 || _dup2(_fileno(file), _fileno(stderr)) == -1) {
+            if (old_stderr != -1) _close(old_stderr);
+#else
         old_stderr = dup(STDERR_FILENO);
         if (old_stderr == -1 || dup2(fileno(file), STDERR_FILENO) == -1) {
             if (old_stderr != -1) close(old_stderr);
+#endif
             old_stderr = -1;
             std::fclose(file);
             file = nullptr;
@@ -7422,8 +7528,13 @@ struct StderrCapture {
     void restore() {
         if (old_stderr != -1) {
             std::fflush(stderr);
+#if defined(_WIN32)
+            _dup2(old_stderr, _fileno(stderr));
+            _close(old_stderr);
+#else
             dup2(old_stderr, STDERR_FILENO);
             close(old_stderr);
+#endif
             old_stderr = -1;
         }
     }
