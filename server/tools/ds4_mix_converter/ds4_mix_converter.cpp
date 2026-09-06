@@ -1,6 +1,7 @@
 #include "ggml.h"
 #include "gguf.h"
 #include "rocmfpx.h"
+#include "expert_batches.h"
 
 #include <nlohmann/json.hpp>
 
@@ -551,6 +552,10 @@ struct LayerCalibration {
 };
 
 struct Options {
+    std::string recipe = "mix";
+    std::string imatrix_provenance;
+    bool plan_only = false;
+    unsigned encode_threads = 1;
     fs::path input;
     fs::path output;
     std::optional<fs::path> imatrix;
@@ -566,6 +571,9 @@ struct Options {
 void usage(const char * argv0) {
     std::cerr << "Usage: " << argv0 << " --input DIR --output FILE (--imatrix FILE | --absmax-only)\n"
               << "       [--layer-start N] [--layer-count N] [--expert-limit N] [--experts-only] [--validate-input-only] [--force]\n";
+    std::cerr << "IQ85: --recipe iq85 --imatrix FILE --imatrix-provenance "
+              << "uniform-unvalidated|activation-derived|transferred-text-calibration "
+              << "[--plan-only] [--encode-threads 1..16]; fresh output only\n";
 }
 
 int parse_nonnegative(const char * value, const std::string & option, bool allow_zero = true) {
@@ -587,6 +595,10 @@ Options parse_options(int argc, char ** argv) {
             return argv[i];
         };
         if (arg == "--input") out.input = value();
+        else if (arg == "--recipe") out.recipe = value();
+        else if (arg == "--imatrix-provenance") out.imatrix_provenance = value();
+        else if (arg == "--plan-only") out.plan_only = true;
+        else if (arg == "--encode-threads") out.encode_threads = parse_nonnegative(value(), arg, false);
         else if (arg == "--output") out.output = value();
         else if (arg == "--imatrix") out.imatrix = fs::path(value());
         else if (arg == "--absmax-only") out.absmax_only = true;
@@ -600,6 +612,17 @@ Options parse_options(int argc, char ** argv) {
         else fail("unknown option " + arg);
     }
     if (out.input.empty() || out.output.empty()) fail("--input and --output are required");
+    if (out.recipe != "mix" && out.recipe != "iq85") fail("--recipe must be mix or iq85");
+    if (out.encode_threads > 16) fail("--encode-threads must be in 1..16");
+    if (out.recipe == "iq85") {
+        if (out.force) fail("iq85 never overwrites artifacts; use a fresh output path");
+        if (out.absmax_only || !out.imatrix) fail("iq85 requires --imatrix; --absmax-only is unsupported");
+        if (out.imatrix_provenance != "uniform-unvalidated" && out.imatrix_provenance != "activation-derived" &&
+            out.imatrix_provenance != "transferred-text-calibration")
+            fail("iq85 requires --imatrix-provenance uniform-unvalidated|activation-derived|transferred-text-calibration");
+    } else if (out.plan_only || out.encode_threads != 1 || !out.imatrix_provenance.empty()) {
+        fail("--plan-only, --encode-threads and --imatrix-provenance require --recipe iq85");
+    }
     if (out.absmax_only == out.imatrix.has_value()) {
         fail("choose exactly one of --imatrix FILE or --absmax-only");
     }
@@ -1354,6 +1377,8 @@ void write_gguf(const Options & options, const SafeTensorSet & source,
     verify_artifact(options.output, gumix_path, plan, p4, gumix);
 }
 
+#include "iq85_converter.inc"
+
 } // namespace
 
 int main(int argc, char ** argv) {
@@ -1372,6 +1397,10 @@ int main(int argc, char ** argv) {
         }
         if (!options.experts_only && (layers != source_layers || experts != source_experts)) {
             fail("layer/expert limits are permitted only with --experts-only smoke artifacts");
+        }
+        if (options.recipe == "iq85") {
+            run_iq85(options, source, layers, experts);
+            return 0;
         }
         if (options.validate_input_only) {
             const auto layout = validate_input_layout(source, layers, experts);
