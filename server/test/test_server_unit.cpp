@@ -343,6 +343,37 @@ static json read_tools() {
     });
 }
 
+static json qwen_read_probe_tools() {
+    return json::array({
+        {{"type", "function"},
+         {"function", {
+             {"name", "read_probe"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"filePath", {{"type", "string"}}},
+                     {"limit", {{"type", "integer"}}},
+                     {"content", {{"type", "string"}}}
+                 }},
+                 {"required", json::array({"filePath"})}
+             }}
+         }}}
+    });
+}
+
+static std::string qwen_read_probe_call(const std::string & eol) {
+    return "<tool_call>" + eol
+        + "<function=read_probe>" + eol
+        + "<parameter=filePath>" + eol
+        + "README.md" + eol
+        + "</parameter>" + eol
+        + "<parameter=limit>" + eol
+        + "10" + eol
+        + "</parameter>" + eol
+        + "</function>" + eol
+        + "</tool_call>";
+}
+
 static json read_and_bash_tools() {
     json tools = read_tools();
     tools.push_back(bash_tools()[0]);
@@ -519,6 +550,69 @@ TEST_CASE(ServerUnitFixture, test_reasoning_disabled) {
 // ═══════════════════════════════════════════════════════════════════════
 // Tool parser tests
 // ═══════════════════════════════════════════════════════════════════════
+
+TEST_CASE(ServerUnitFixture, test_parse_qwen_multiline_xml_parameters_lf) {
+    auto result = parse_tool_calls(qwen_read_probe_call("\n"),
+                                   qwen_read_probe_tools());
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "read_probe");
+        const auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["filePath"] == "README.md");
+        TEST_ASSERT(args["filePath"].is_string());
+        TEST_ASSERT(args["limit"].is_number_integer());
+        TEST_ASSERT(args["limit"] == 10);
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_qwen_multiline_xml_parameters_crlf) {
+    auto result = parse_tool_calls(qwen_read_probe_call("\r\n"),
+                                   qwen_read_probe_tools());
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        const auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["filePath"] == "README.md");
+        TEST_ASSERT(args["filePath"].get<std::string>().find('\r') ==
+                    std::string::npos);
+        TEST_ASSERT(args["limit"].is_number_integer());
+        TEST_ASSERT(args["limit"] == 10);
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_qwen_multiline_xml_string_value) {
+    const std::string text =
+        "<tool_call>\n"
+        "<function=read_probe>\n"
+        "<parameter=filePath>\n"
+        "README.md\n"
+        "</parameter>\n"
+        "<parameter=content>\n"
+        "line1\n"
+        "line2\n"
+        "</parameter>\n"
+        "</function>\n"
+        "</tool_call>";
+    auto result = parse_tool_calls(text, qwen_read_probe_tools());
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        const auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["content"] == "line1\nline2");
+        TEST_ASSERT(args["content"].get<std::string>().find('\r') ==
+                    std::string::npos);
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_qwen_multiline_xml_parameter_at_true_eof) {
+    const std::string text =
+        "<tool_call><function=read_probe>"
+        "<parameter=filePath>README.md</tool_call>";
+    auto result = parse_tool_calls(text, qwen_read_probe_tools());
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        const auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["filePath"] == "README.md");
+    }
+}
 
 TEST_CASE(ServerUnitFixture, test_parse_tool_call_xml) {
     std::string text =
