@@ -17,7 +17,7 @@ source "$SCRIPT_DIR/common.sh"
 CLIENT_OUT="$LOG_DIR/pi.out"
 PI_BIN="${PI_BIN:-$CLIENT_WORK_DIR/clients/pi/npm/bin/pi}"
 require_client_binary "Pi" "$PI_BIN" "pi" "PI_BIN"
-HOME_DIR="$LOG_DIR/pi-home"
+HOME_DIR="$(client_home pi)"
 AGENT_DIR="$HOME_DIR/agent"
 PROVIDER_API="${PROVIDER_API:-openai-responses}"
 mkdir -p "$AGENT_DIR" "$HOME_DIR/sessions"
@@ -75,23 +75,24 @@ pi_cmd=(
   "$PI_BIN"
   --provider lucebox
   --model "$MODEL_ID"
-  --print
-  --mode json
   --tools "$PI_TOOLS"
-  --no-session
   --offline
-  "$PROMPT"
 )
+if [[ "$HARNESS_INTERACTIVE" == "0" ]]; then
+  pi_cmd+=(--print --mode json --no-session "$PROMPT")
+elif [[ -n "$INTERACTIVE_PROMPT" ]]; then
+  pi_cmd+=("$INTERACTIVE_PROMPT")
+fi
 
 set +e
-if [[ "$PI_TIMEOUT" == "0" ]]; then
-  env "${pi_env[@]}" "${pi_cmd[@]}" \
-    < /dev/null > "$CLIENT_OUT" 2>&1
+if [[ "$HARNESS_INTERACTIVE" == "1" ]]; then
+  run_interactive_client "Pi" "$CLIENT_OUT" env "${pi_env[@]}" "${pi_cmd[@]}"
+  RC=$?
 else
-  env "${pi_env[@]}" timeout "${PI_TIMEOUT}s" "${pi_cmd[@]}" \
+  run_with_timeout "$PI_TIMEOUT" env "${pi_env[@]}" "${pi_cmd[@]}" \
     < /dev/null > "$CLIENT_OUT" 2>&1
+  RC=$?
 fi
-RC=$?
 set -e
 
 finish_report "$CLIENT_OUT" "$RC"

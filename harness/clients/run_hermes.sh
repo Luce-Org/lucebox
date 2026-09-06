@@ -13,7 +13,7 @@ source "$SCRIPT_DIR/common.sh"
 CLIENT_OUT="$LOG_DIR/hermes.out"
 HERMES_BIN="${HERMES_BIN:-$CLIENT_WORK_DIR/clients/hermes/home/.local/bin/hermes}"
 require_client_binary "Hermes" "$HERMES_BIN" "hermes" "HERMES_BIN"
-HOME_DIR="$LOG_DIR/hermes-home"
+HOME_DIR="$(client_home hermes)"
 mkdir -p "$HOME_DIR"
 
 cat > "$HOME_DIR/config.yaml" <<YAML
@@ -59,26 +59,36 @@ wait_lucebox_server
 
 set +e
 cd "$REPO_DIR"
-run_with_timeout "$HERMES_TIMEOUT" env \
-  HOME="$HOME_DIR" \
-  HERMES_HOME="$HOME_DIR" \
-  OPENAI_API_KEY="$API_KEY" \
-  OPENAI_BASE_URL="$BASE_URL/v1" \
-  HERMES_INFERENCE_PROVIDER=lucebox \
-  HERMES_INFERENCE_MODEL="$MODEL_ID" \
-  HERMES_ACCEPT_HOOKS=1 \
-  NO_COLOR=1 \
-  "$HERMES_BIN" chat \
-  --quiet \
-  --provider lucebox \
-  --model "$MODEL_ID" \
-  --accept-hooks \
-  --yolo \
-  --max-turns "$HERMES_MAX_TURNS" \
-  --source lucebox-harness \
-  --query "$PROMPT" \
-  < /dev/null > "$CLIENT_OUT" 2>&1
-RC=$?
+hermes_env=(
+  "HOME=$HOME_DIR"
+  "HERMES_HOME=$HOME_DIR"
+  "OPENAI_API_KEY=$API_KEY"
+  "OPENAI_BASE_URL=$BASE_URL/v1"
+  "HERMES_INFERENCE_PROVIDER=lucebox"
+  "HERMES_INFERENCE_MODEL=$MODEL_ID"
+  "HERMES_ACCEPT_HOOKS=1"
+)
+if [[ "$HARNESS_INTERACTIVE" == "1" ]]; then
+  hermes_cmd=(
+    "$HERMES_BIN" chat --tui --provider lucebox --model "$MODEL_ID"
+    --accept-hooks --max-turns "$HERMES_MAX_TURNS" --source lucebox-harness
+  )
+  run_interactive_client "Hermes" "$CLIENT_OUT" env "${hermes_env[@]}" "${hermes_cmd[@]}"
+  RC=$?
+else
+  run_with_timeout "$HERMES_TIMEOUT" env "${hermes_env[@]}" NO_COLOR=1 \
+    "$HERMES_BIN" chat \
+    --quiet \
+    --provider lucebox \
+    --model "$MODEL_ID" \
+    --accept-hooks \
+    --yolo \
+    --max-turns "$HERMES_MAX_TURNS" \
+    --source lucebox-harness \
+    --query "$PROMPT" \
+    < /dev/null > "$CLIENT_OUT" 2>&1
+  RC=$?
+fi
 set -e
 
 finish_report "$CLIENT_OUT" "$RC"

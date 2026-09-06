@@ -16,7 +16,7 @@ source "$SCRIPT_DIR/common.sh"
 CLIENT_OUT="$LOG_DIR/claude-code.out"
 CLAUDE_BIN="${CLAUDE_BIN:-$CLIENT_WORK_DIR/clients/claude_code/npm/bin/claude}"
 require_client_binary "Claude Code" "$CLAUDE_BIN" "claude_code" "CLAUDE_BIN"
-HOME_DIR="$LOG_DIR/claude-home"
+HOME_DIR="$(client_home claude)"
 mkdir -p "$HOME_DIR"
 
 start_lucebox_server
@@ -57,25 +57,34 @@ if [[ -n "${PFLASH_SESSION_ID:-}" ]]; then
   echo "[run_claude_code] session-inject proxy up on $CLIENT_BASE_URL (session=$PFLASH_SESSION_ID)"
 fi
 
+claude_env=(
+  "HOME=$HOME_DIR"
+  "ANTHROPIC_API_KEY=$API_KEY"
+  "ANTHROPIC_BASE_URL=$CLIENT_BASE_URL"
+  "CLAUDE_CODE_API_BASE_URL=$CLIENT_BASE_URL"
+  "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1"
+  "CLAUDE_CODE_DISABLE_TELEMETRY=1"
+  "CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1"
+)
 set +e
-run_with_timeout "$CLAUDE_TIMEOUT" env \
-  HOME="$HOME_DIR" \
-  ANTHROPIC_API_KEY="$API_KEY" \
-  ANTHROPIC_BASE_URL="$CLIENT_BASE_URL" \
-  CLAUDE_CODE_API_BASE_URL="$CLIENT_BASE_URL" \
-  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
-  CLAUDE_CODE_DISABLE_TELEMETRY=1 \
-  CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
-  "$CLAUDE_BIN" \
-  --print \
-  --output-format json \
-  --model "$MODEL_ID" \
-  --tools "$CLAUDE_TOOLS" \
-  --permission-mode dontAsk \
-  --no-session-persistence \
-  "$PROMPT" \
-  < /dev/null > "$CLIENT_OUT" 2>&1
-RC=$?
+if [[ "$HARNESS_INTERACTIVE" == "1" ]]; then
+  claude_cmd=("$CLAUDE_BIN" --model "$MODEL_ID" --tools "$CLAUDE_TOOLS")
+  if [[ -n "$INTERACTIVE_PROMPT" ]]; then claude_cmd+=("$INTERACTIVE_PROMPT"); fi
+  run_interactive_client "Claude Code" "$CLIENT_OUT" env "${claude_env[@]}" "${claude_cmd[@]}"
+  RC=$?
+else
+  run_with_timeout "$CLAUDE_TIMEOUT" env "${claude_env[@]}" \
+    "$CLAUDE_BIN" \
+    --print \
+    --output-format json \
+    --model "$MODEL_ID" \
+    --tools "$CLAUDE_TOOLS" \
+    --permission-mode dontAsk \
+    --no-session-persistence \
+    "$PROMPT" \
+    < /dev/null > "$CLIENT_OUT" 2>&1
+  RC=$?
+fi
 set -e
 
 if [[ -n "$PROXY_PID" ]] && kill -0 "$PROXY_PID" 2>/dev/null; then
