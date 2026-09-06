@@ -989,7 +989,7 @@ if(DFLASH27B_TESTS)
         target_link_libraries(bench_rocmfp_mix_gateup_glu PRIVATE
             ggml ggml-base ${DFLASH27B_GGML_BACKEND_TARGET} hip::host)
     endif()
-    add_executable(test_qwen35_tensor_parallel test/test_qwen35_tensor_parallel.cpp)
+    add_executable(test_qwen35_tensor_parallel test/qwen35/test_qwen35_tensor_parallel.cpp)
     target_include_directories(test_qwen35_tensor_parallel PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
     target_link_libraries(test_qwen35_tensor_parallel PRIVATE dflash_common)
 
@@ -1031,9 +1031,9 @@ if(DFLASH27B_TESTS)
     # DS4 Hierarchical-Controller pre-mix kernels vs CPU reference. HIP only:
     # deepseek4_hc_cuda.cu is compiled into dflash_common on this backend. Validates
     # the HC mix matvec + NHC=4 Sinkhorn path against the device's actual wave width.
-    if(DFLASH27B_GPU_BACKEND STREQUAL "hip" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_deepseek4_hc_cuda.cpp")
-        add_executable(test_deepseek4_hc_cuda test/test_deepseek4_hc_cuda.cpp)
-        set_source_files_properties(test/test_deepseek4_hc_cuda.cpp PROPERTIES LANGUAGE HIP)
+    if(DFLASH27B_GPU_BACKEND STREQUAL "hip" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/deepseek4/test_deepseek4_hc_cuda.cpp")
+        add_executable(test_deepseek4_hc_cuda test/deepseek4/test_deepseek4_hc_cuda.cpp)
+        set_source_files_properties(test/deepseek4/test_deepseek4_hc_cuda.cpp PROPERTIES LANGUAGE HIP)
         set_target_properties(test_deepseek4_hc_cuda PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
         target_include_directories(test_deepseek4_hc_cuda PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -1041,10 +1041,10 @@ if(DFLASH27B_TESTS)
         target_link_libraries(test_deepseek4_hc_cuda PRIVATE dflash_common ${DFLASH27B_GGML_BACKEND_TARGET})
         list(APPEND _raw_unit_test_targets test_deepseek4_hc_cuda)
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_deepseek4_mmid_grouped_cuda.cpp")
-        add_executable(test_deepseek4_mmid_grouped_cuda test/test_deepseek4_mmid_grouped_cuda.cpp)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/deepseek4/test_deepseek4_mmid_grouped_cuda.cpp")
+        add_executable(test_deepseek4_mmid_grouped_cuda test/deepseek4/test_deepseek4_mmid_grouped_cuda.cpp)
         if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
-            set_source_files_properties(test/test_deepseek4_mmid_grouped_cuda.cpp PROPERTIES LANGUAGE HIP)
+            set_source_files_properties(test/deepseek4/test_deepseek4_mmid_grouped_cuda.cpp PROPERTIES LANGUAGE HIP)
             set_target_properties(test_deepseek4_mmid_grouped_cuda PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
             target_include_directories(test_deepseek4_mmid_grouped_cuda PRIVATE
                 ${CMAKE_CURRENT_SOURCE_DIR}/hip_compat)
@@ -1101,18 +1101,12 @@ if(DFLASH27B_TESTS)
         target_link_libraries(test_turbo_wht_warp PRIVATE CUDA::cudart)
         list(APPEND _raw_unit_test_targets test_turbo_wht_warp)
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_drafter_tail_capture_guard.cpp")
-        # RED phase binary: same source WITHOUT the fix flag — documents the bug.
-        add_executable(test_drafter_tail_capture_guard_red
-            test/test_unit_main.cpp
-            test/test_drafter_tail_capture_guard.cpp)
-    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_draft_vs_reference.cpp")
         add_executable(test_draft_vs_reference test/test_draft_vs_reference.cpp)
         target_link_libraries(test_draft_vs_reference PRIVATE dflash_common)
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_deepseek4_unit.cpp")
-        add_executable(test_deepseek4_unit test/test_deepseek4_unit.cpp)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/deepseek4/test_deepseek4_unit.cpp")
+        add_executable(test_deepseek4_unit test/deepseek4/test_deepseek4_unit.cpp)
         target_include_directories(test_deepseek4_unit PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/include)
         if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
             target_compile_definitions(test_deepseek4_unit PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
@@ -1130,9 +1124,9 @@ if(DFLASH27B_TESTS)
         endif()
         list(APPEND _raw_unit_test_targets test_deepseek4_unit)
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_deepseek4_roctx.cpp")
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/deepseek4/test_deepseek4_roctx.cpp")
         add_executable(test_deepseek4_roctx
-            test/test_deepseek4_roctx.cpp
+            test/deepseek4/test_deepseek4_roctx.cpp
             src/deepseek4/deepseek4_roctx.cpp
             src/common/target_shard_ipc_daemon.cpp)
         target_include_directories(test_deepseek4_roctx PRIVATE
@@ -1147,9 +1141,9 @@ if(DFLASH27B_TESTS)
         target_link_libraries(test_deepseek4_roctx PRIVATE ${CMAKE_DL_LIBS})
         list(APPEND _raw_unit_test_targets test_deepseek4_roctx)
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_qwen35_roctx.cpp")
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/qwen35/test_qwen35_roctx.cpp")
         add_executable(test_qwen35_roctx
-            test/test_qwen35_roctx.cpp
+            test/qwen35/test_qwen35_roctx.cpp
             src/qwen35/qwen35_roctx.cpp)
         target_include_directories(test_qwen35_roctx PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -1179,8 +1173,8 @@ if(DFLASH27B_TESTS)
     # gated on DS4_TEST_MODEL and skips without it -- disproportionate. Excluded on Windows so
     # a tests-enabled MSVC build compiles; the portable coverage lives in
     # test_ds4_mix_registry_teardown and test_ds4_dmix_entry_validation, which need no model.
-    if(NOT WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ds4_load_transactional.cpp")
-        add_executable(test_ds4_load_transactional test/test_ds4_load_transactional.cpp)
+    if(NOT WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/deepseek4/test_ds4_load_transactional.cpp")
+        add_executable(test_ds4_load_transactional test/deepseek4/test_ds4_load_transactional.cpp)
         target_include_directories(test_ds4_load_transactional PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/include)
         if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
             target_compile_definitions(test_ds4_load_transactional PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
@@ -1303,10 +1297,10 @@ if(DFLASH27B_TESTS)
         endif()
         list(APPEND _raw_unit_test_targets test_rocmfp_mix_glu_fusable)
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ds4_mix_registry_teardown.cpp")
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/deepseek4/test_ds4_mix_registry_teardown.cpp")
         # Synthetic fixture: exercises free_deepseek4_weights' registry teardown with a
         # hand-built weights object, so it needs no model and cannot pass vacuously.
-        add_executable(test_ds4_mix_registry_teardown test/test_ds4_mix_registry_teardown.cpp)
+        add_executable(test_ds4_mix_registry_teardown test/deepseek4/test_ds4_mix_registry_teardown.cpp)
         target_include_directories(test_ds4_mix_registry_teardown PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/include)
         if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
             target_compile_definitions(test_ds4_mix_registry_teardown PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
@@ -1321,16 +1315,16 @@ if(DFLASH27B_TESTS)
             target_link_libraries(test_ds4_mix_registry_teardown PRIVATE hip::host)
         endif()
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ds4_budget_hook.cpp")
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/deepseek4/test_ds4_budget_hook.cpp")
         # Thinking-budget force-close rule. Header-only logic, so unlike the other ds4 tests
         # this needs no backend, no ggml and no CUDA/HIP link at all.
-        add_executable(test_ds4_budget_hook test/test_ds4_budget_hook.cpp test/test_unit_main.cpp)
+        add_executable(test_ds4_budget_hook test/deepseek4/test_ds4_budget_hook.cpp test/test_unit_main.cpp)
         target_include_directories(test_ds4_budget_hook PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/include)
         add_test(NAME ds4_budget_hook COMMAND test_ds4_budget_hook)
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ds4_dmix_entry_validation.cpp")
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/deepseek4/test_ds4_dmix_entry_validation.cpp")
         # Pure validation logic against the loader's shared rule function: no model, no GPU.
-        add_executable(test_ds4_dmix_entry_validation test/test_ds4_dmix_entry_validation.cpp)
+        add_executable(test_ds4_dmix_entry_validation test/deepseek4/test_ds4_dmix_entry_validation.cpp)
         target_include_directories(test_ds4_dmix_entry_validation PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/include)
         if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
             target_compile_definitions(test_ds4_dmix_entry_validation PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
@@ -1345,8 +1339,8 @@ if(DFLASH27B_TESTS)
             target_link_libraries(test_ds4_dmix_entry_validation PRIVATE hip::host)
         endif()
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ds4_dspark_load.cpp")
-        add_executable(test_ds4_dspark_load test/test_ds4_dspark_load.cpp)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/deepseek4/test_ds4_dspark_load.cpp")
+        add_executable(test_ds4_dspark_load test/deepseek4/test_ds4_dspark_load.cpp)
         target_include_directories(test_ds4_dspark_load PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/include)
         if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
             target_compile_definitions(test_ds4_dspark_load PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
@@ -1409,11 +1403,11 @@ if(DFLASH27B_TESTS)
     # This synthetic stream benchmark touches a multi-gigabyte sparse file and
     # requires a real CUDA device. Keep it manually runnable instead of adding
     # it to the hosted server-unit suite.
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_moe_stream.cpp"
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/moe/test_moe_stream.cpp"
        AND DFLASH27B_GPU_BACKEND STREQUAL "cuda")
         add_executable(test_moe_stream
             test/test_unit_main.cpp
-            test/test_moe_stream.cpp)
+            test/moe/test_moe_stream.cpp)
         target_include_directories(test_moe_stream PRIVATE
             ${DFLASH27B_SRC_INCLUDE_DIRS}
             ${CUDAToolkit_INCLUDE_DIRS})
@@ -1584,8 +1578,8 @@ if(DFLASH27B_TESTS)
     endif()
 
     # ─── Unit tests (no GPU, no model files) ────────────────────────────
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_moe_input_ready.cpp")
-        add_executable(test_moe_input_ready test/test_moe_input_ready.cpp)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/moe/test_moe_input_ready.cpp")
+        add_executable(test_moe_input_ready test/moe/test_moe_input_ready.cpp)
         target_include_directories(test_moe_input_ready PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src)
         if(UNIX)
@@ -1627,7 +1621,7 @@ if(DFLASH27B_TESTS)
 
     # CPU-only contract test for the fail-closed layer-split tree boundary.
     add_executable(test_qwen35_split_tree_guard
-        test/test_qwen35_split_tree_guard.cpp)
+        test/qwen35/test_qwen35_split_tree_guard.cpp)
     target_include_directories(test_qwen35_split_tree_guard PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35)
     list(APPEND _raw_unit_test_targets test_qwen35_split_tree_guard)
@@ -1653,35 +1647,53 @@ if(DFLASH27B_TESTS)
         list(APPEND _raw_unit_test_targets test_delta_net_specla)
     endif()
 
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_server_unit.cpp")
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/server/test_http_request.cpp")
         set(_server_unit_sources
             test/test_unit_main.cpp
-            test/test_server_unit.cpp
-            test/test_anchor_params.cpp
-            test/test_derived_scalars.cpp
-            test/test_adaptive_keep_ratio.cpp
-            test/test_skip_park_guard.cpp
-            test/test_bandit_integration.cpp
-            test/test_admission.cpp
-            test/test_restore_delta.cpp
-            test/test_chain_rollback_policy.cpp
-            test/test_ddtree_tau.cpp
-            test/test_anchor_transitive.cpp
-            test/test_drafter_early_exit_score_range.cpp
-            test/test_drafter_tail_capture_guard.cpp
-            test/test_drafter_warm_path_regression.cpp
-            test/test_qwen3_buffer_plan.cpp
-            test/test_model_test_paths.cpp
-            test/test_gguf_mmap.cpp
-            test/test_kv_quant.cpp
-            test/test_kvflash_placement.cpp
-            test/test_kvflash_pool_sizing.cpp
-            test/test_kvflash_qk.cpp
-            test/test_qwen35moe_routing_stats.cpp
-            test/test_qwen35moe_expert_placement.cpp
-            test/test_qwen35moe_swap_manager.cpp
-            test/test_mmq_streamk_schedule.cpp
-            test/test_moe_hybrid_storage.cpp)
+            test/common/test_derived_scalars.cpp
+            test/common/test_gguf_mmap.cpp
+            test/common/test_kv_quant.cpp
+            test/common/test_model_backend.cpp
+            test/common/test_restore_delta.cpp
+            test/common/test_sampler.cpp
+            test/draft/test_ddtree_tau.cpp
+            test/kernels/test_mmq_streamk_schedule.cpp
+            test/kvflash/test_kvflash_placement.cpp
+            test/kvflash/test_kvflash_pool_sizing.cpp
+            test/kvflash/test_kvflash_qk.cpp
+            test/moe/test_moe_hybrid.cpp
+            test/moe/test_moe_hybrid_storage.cpp
+            test/moe/test_qwen35moe_expert_placement.cpp
+            test/moe/test_qwen35moe_routing_stats.cpp
+            test/moe/test_qwen35moe_swap_manager.cpp
+            test/placement/test_skip_park_guard.cpp
+            test/qwen3/test_anchor_params.cpp
+            test/qwen3/test_anchor_transitive.cpp
+            test/qwen3/test_query_capture.cpp
+            test/qwen3/test_qwen3_buffer_plan.cpp
+            test/qwen3/test_score_range.cpp
+            test/qwen35/test_chain_rollback_policy.cpp
+            test/qwen35/test_qwen35_positions.cpp
+            test/server/test_adaptive_keep_ratio.cpp
+            test/server/test_admission.cpp
+            test/server/test_http_sessions.cpp
+            test/support/test_model_test_paths.cpp)
+        # These fixtures use POSIX file descriptors, temporary files, or
+        # environment APIs and cannot be compiled by MSVC.
+        if(UNIX)
+            list(APPEND _server_unit_sources
+                test/common/test_backend_ipc.cpp
+                test/placement/test_placement.cpp
+                test/qwen3/test_gguf_loader.cpp
+                test/server/test_chat_template.cpp
+                test/server/test_disk_prefix_cache.cpp
+                test/server/test_http_request.cpp
+                test/server/test_model_card.cpp
+                test/server/test_prefix_cache.cpp
+                test/server/test_sse_emitter.cpp
+                test/server/test_text.cpp
+                test/server/test_tool_parser.cpp)
+        endif()
         if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
             list(APPEND _server_unit_sources
                 test/test_gpu_sampler_cuda.cpp
@@ -1695,11 +1707,8 @@ if(DFLASH27B_TESTS)
             src/server/model_card.cpp
             src/server/prompt_normalize.cpp
             src/qwen3/anchor_scan.cpp)
-        # Keep the GREEN formula target-local: the separate RED regression
-        # executable compiles the same source without this definition.
-        target_compile_definitions(test_server_unit PRIVATE
-            TAIL_GUARD_USE_NEW_FORMULA)
         target_include_directories(test_server_unit PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/test
             ${DFLASH27B_SRC_INCLUDE_DIRS}
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src/ggml-cuda
             ${CMAKE_CURRENT_SOURCE_DIR}/src/common)

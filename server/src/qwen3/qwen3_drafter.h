@@ -69,8 +69,10 @@ void free_drafter_weights(DrafterContext & ctx);
 //   ids          input token IDs of length S
 //   keep_ratio   fraction of `chunk_size`-token chunks to keep
 //   chunk_size   span granularity (default 32)
-//   n_lookahead  trailing Q tokens used for tail attention (default 8)
+//   n_lookahead  Q tokens used for scorer attention (default 8)
 //   pool_kernel  AvgPool kernel for score smoothing (default 13)
+//   score_query_end  exclusive end of Q window in ids; negative means tail
+//                    for Qwen3 and is rejected for Qwen3.5
 //
 // On failure returns empty vector + sets last_error.
 std::vector<int32_t> drafter_score_and_compress(
@@ -79,6 +81,7 @@ std::vector<int32_t> drafter_score_and_compress(
     float  keep_ratio,
     int    chunk_size  = 32,
     int    n_lookahead = 8,
-    int    pool_kernel = 13);
+    int    pool_kernel = 13,
+    int    score_query_end = -1);
 
 } // namespace dflash::common

@@ -33,6 +33,17 @@ namespace {
 struct FeatureGateFixture : CommonFixture {
     using CommonFixture::CommonFixture;
 
+std::vector<std::string> warn_result(
+    const BackendArgs & args,
+    const std::string & arch,
+    const BackendFeatureConfig & features = {}) {
+    CHECK(check_feature_compatibility(
+        args, features, arch, compiled_placement_backend(),
+        compiled_placement_backend()).empty());
+    return collect_feature_warnings(args, features, arch);
+}
+};
+
 static BackendArgs gate_args_hip_deepseek4() {
     BackendArgs args;
     args.model_path = "/nonexistent/model.gguf";
@@ -60,21 +71,21 @@ static std::string gate_result_for_binary(
         args, features, arch, target_backend, compiled_backend);
 }
 
-void test_feature_gate_accepts_plain_launch() {
+TEST_CASE(FeatureGateFixture, test_feature_gate_accepts_plain_launch) {
     BackendArgs args;
     args.model_path = "/nonexistent/model.gguf";
     CHECK(gate_result(
         args, "qwen35", PlacementBackend::Cuda).empty());
 }
 
-void test_feature_gate_rejects_undetected_arch() {
+TEST_CASE(FeatureGateFixture, test_feature_gate_rejects_undetected_arch) {
     BackendArgs args;
     args.model_path = "/nonexistent/model.gguf";
     CHECK(!gate_result(
         args, "", PlacementBackend::Cuda).empty());
 }
 
-void test_feature_gate_requires_compiled_target_backend() {
+TEST_CASE(FeatureGateFixture, test_feature_gate_requires_compiled_target_backend) {
     BackendArgs args;
     args.model_path = "/nonexistent/model.gguf";
     args.device.backend = PlacementBackend::Hip;
@@ -83,7 +94,7 @@ void test_feature_gate_requires_compiled_target_backend() {
         PlacementBackend::Cuda).empty());
 }
 
-void test_feature_gate_ipc_options_require_ipc_binary() {
+TEST_CASE(FeatureGateFixture, test_feature_gate_ipc_options_require_ipc_binary) {
     BackendArgs draft;
     draft.model_path = "/nonexistent/model.gguf";
     draft.remote_draft.work_dir = "/tmp/draft";
@@ -97,7 +108,7 @@ void test_feature_gate_ipc_options_require_ipc_binary() {
         target, "qwen35", PlacementBackend::Cuda).empty());
 }
 
-void test_feature_gate_mixed_draft_placement_requires_ipc() {
+TEST_CASE(FeatureGateFixture, test_feature_gate_mixed_draft_placement_requires_ipc) {
     BackendArgs args;
     args.model_path = "/nonexistent/model.gguf";
     args.draft_path = "/nonexistent/draft.gguf";
@@ -116,7 +127,7 @@ void test_feature_gate_mixed_draft_placement_requires_ipc() {
         args, "qwen35", PlacementBackend::Cuda).empty());
 }
 
-void test_feature_gate_draft_block_size_requires_local_draft() {
+TEST_CASE(FeatureGateFixture, test_feature_gate_draft_block_size_requires_local_draft) {
     BackendArgs args;
     args.model_path = "/nonexistent/model.gguf";
     args.draft_block_size = 8;
@@ -131,7 +142,7 @@ void test_feature_gate_draft_block_size_requires_local_draft() {
     CHECK(!gate_result(args, "qwen35", PlacementBackend::Cuda).empty());
 }
 
-void test_draft_block_size_override_respects_checkpoint_horizon() {
+TEST_CASE(FeatureGateFixture, test_draft_block_size_override_respects_checkpoint_horizon) {
     CHECK(draft_block_size_override_supported(0, 8));
     CHECK(draft_block_size_override_supported(2, 8));
     CHECK(draft_block_size_override_supported(7, 8));
@@ -146,7 +157,7 @@ void test_draft_block_size_override_respects_checkpoint_horizon() {
     CHECK(!draft_block_size_override_supported(32, 8));
 }
 
-void test_feature_gate_pflash_requires_drafter_and_supported_arch() {
+TEST_CASE(FeatureGateFixture, test_feature_gate_pflash_requires_drafter_and_supported_arch) {
     BackendArgs args;
     args.model_path = "/nonexistent/model.gguf";
 
@@ -168,7 +179,7 @@ void test_feature_gate_pflash_requires_drafter_and_supported_arch() {
         args, "qwen35", PlacementBackend::Cuda, features).empty());
 }
 
-void test_feature_gate_validates_target_split_topology() {
+TEST_CASE(FeatureGateFixture, test_feature_gate_validates_target_split_topology) {
     BackendArgs weights;
     weights.model_path = "/nonexistent/model.gguf";
     weights.device.layer_split_weights = {1.0, 1.0};
@@ -196,7 +207,7 @@ void test_feature_gate_validates_target_split_topology() {
         two_boundaries, "qwen35", PlacementBackend::Cuda).empty());
 }
 
-void test_feature_gate_tensor_parallel_requirements() {
+TEST_CASE(FeatureGateFixture, test_feature_gate_tensor_parallel_requirements) {
     BackendArgs valid;
     valid.model_path = "/nonexistent/model.gguf";
     CHECK(parse_placement_device_list(
@@ -250,7 +261,7 @@ void test_feature_gate_tensor_parallel_requirements() {
         draft, "qwen35", PlacementBackend::Cuda).empty());
 }
 
-void test_feature_gate_ds4_prefill_requires_deepseek4() {
+TEST_CASE(FeatureGateFixture, test_feature_gate_ds4_prefill_requires_deepseek4) {
     BackendArgs args = gate_args_hip_deepseek4();
     args.ds4_prefill_mode_set = true;
     args.ds4_prefill_mode = PrefillAttentionMode::Dense;
@@ -261,7 +272,7 @@ void test_feature_gate_ds4_prefill_requires_deepseek4() {
         args, "deepseek4", PlacementBackend::Hip).empty());
 }
 
-void test_feature_gate_approximate_ds4_prefill_requires_local_hip() {
+TEST_CASE(FeatureGateFixture, test_feature_gate_approximate_ds4_prefill_requires_local_hip) {
     BackendArgs args = gate_args_hip_deepseek4();
     args.ds4_prefill_mode_set = true;
     args.ds4_prefill_mode = PrefillAttentionMode::Sparse;
@@ -294,7 +305,7 @@ void test_feature_gate_approximate_ds4_prefill_requires_local_hip() {
         exact, "deepseek4", PlacementBackend::Cuda).empty());
 }
 
-void test_feature_gate_ds4_decode_options_require_monolithic_hip() {
+TEST_CASE(FeatureGateFixture, test_feature_gate_ds4_decode_options_require_monolithic_hip) {
     BackendArgs fused = gate_args_hip_deepseek4();
     fused.ds4_fused_decode = true;
     CHECK(!gate_result(
@@ -335,7 +346,7 @@ void test_feature_gate_ds4_decode_options_require_monolithic_hip() {
         split_topk, "deepseek4", PlacementBackend::Hip).empty());
 }
 
-void test_feature_gate_remote_draft_requires_supported_arch() {
+TEST_CASE(FeatureGateFixture, test_feature_gate_remote_draft_requires_supported_arch) {
     BackendArgs args;
     args.model_path = "/nonexistent/model.gguf";
     args.draft_path = "/nonexistent/draft.gguf";
@@ -355,7 +366,7 @@ void test_feature_gate_remote_draft_requires_supported_arch() {
         no_draft, "gemma4", PlacementBackend::Cuda).empty());
 }
 
-void test_feature_gate_layer_split_requires_supported_arch() {
+TEST_CASE(FeatureGateFixture, test_feature_gate_layer_split_requires_supported_arch) {
     BackendArgs args;
     args.model_path = "/nonexistent/model.gguf";
     CHECK(parse_placement_device_list("cuda:0,cuda:1", args.device));
@@ -377,7 +388,7 @@ void test_feature_gate_layer_split_requires_supported_arch() {
     CHECK(gate_result(single, "qwen3", PlacementBackend::Cuda).empty());
 }
 
-void test_feature_gate_paged_attention_requires_qwen35_monolithic() {
+TEST_CASE(FeatureGateFixture, test_feature_gate_paged_attention_requires_qwen35_monolithic) {
     BackendArgs args;
     args.model_path = "/nonexistent/model.gguf";
     args.paged_attention = true;
@@ -411,7 +422,7 @@ void test_feature_gate_paged_attention_requires_qwen35_monolithic() {
     }
 }
 
-void test_feature_gate_paged_attention_allows_fixed_local_chains() {
+TEST_CASE(FeatureGateFixture, test_feature_gate_paged_attention_allows_fixed_local_chains) {
     BackendArgs base;
     base.model_path = "/nonexistent/model.gguf";
     base.paged_attention = true;
@@ -490,7 +501,7 @@ void test_feature_gate_paged_attention_allows_fixed_local_chains() {
     }
 }
 
-void test_feature_gate_parallel_and_kv_pool_rules() {
+TEST_CASE(FeatureGateFixture, test_feature_gate_parallel_and_kv_pool_rules) {
     // A valid paged qwen35 monolithic launch is the baseline every rule
     // below perturbs.
     BackendArgs paged;
@@ -578,15 +589,7 @@ void test_feature_gate_parallel_and_kv_pool_rules() {
 // Warnings must never gate admission, so each case also asserts the same
 // configuration passes check_feature_compatibility().
 
-std::vector<std::string> warn_result(
-    const BackendArgs & args,
-    const std::string & arch,
-    const BackendFeatureConfig & features = {}) {
-    CHECK(check_feature_compatibility(
-        args, features, arch, compiled_placement_backend(),
-        compiled_placement_backend()).empty());
-    return collect_feature_warnings(args, features, arch);
-}
+
 
 static bool warns_about(const std::vector<std::string> & warnings,
                         const std::string & flag) {
@@ -596,7 +599,7 @@ static bool warns_about(const std::vector<std::string> & warnings,
     return false;
 }
 
-void test_feature_warnings_silent_when_supported() {
+TEST_CASE(FeatureGateFixture, test_feature_warnings_silent_when_supported) {
     BackendArgs args;
     args.model_path = "/nonexistent/model.gguf";
     args.draft_path = "/nonexistent/draft.gguf";
@@ -608,7 +611,7 @@ void test_feature_warnings_silent_when_supported() {
     CHECK(warn_result(args, "qwen35").empty());
 }
 
-void test_feature_warnings_report_inert_draft() {
+TEST_CASE(FeatureGateFixture, test_feature_warnings_report_inert_draft) {
     BackendArgs args;
     args.model_path = "/nonexistent/model.gguf";
     args.draft_path = "/nonexistent/draft.gguf";
@@ -627,7 +630,7 @@ void test_feature_warnings_report_inert_draft() {
     CHECK(w[0].find("single-device placement") != std::string::npos);
 }
 
-void test_feature_warnings_report_inert_decode_tunables() {
+TEST_CASE(FeatureGateFixture, test_feature_warnings_report_inert_decode_tunables) {
     BackendArgs ddtree;
     ddtree.model_path = "/nonexistent/model.gguf";
     ddtree.ddtree_mode = true;
@@ -662,7 +665,7 @@ void test_feature_warnings_report_inert_decode_tunables() {
     CHECK(warns_about(warn_result(swa, "gemma4"), "--draft-swa"));
 }
 
-void test_feature_warnings_report_inert_moe_options() {
+TEST_CASE(FeatureGateFixture, test_feature_warnings_report_inert_moe_options) {
     BackendArgs args;
     args.model_path = "/nonexistent/model.gguf";
 
@@ -676,7 +679,7 @@ void test_feature_warnings_report_inert_moe_options() {
     CHECK(warn_result(args, "deepseek4", moe_opts).size() == 2);
 }
 
-void test_model_capability_tables() {
+TEST_CASE(FeatureGateFixture, test_model_capability_tables) {
     // Table integrity: one row per architecture, no blanks, no duplicates.
     for (const ArchCapabilities & row : kArchCapabilities) {
         CHECK(row.arch != nullptr && row.arch[0] != '\0');
@@ -720,31 +723,4 @@ void test_model_capability_tables() {
     CHECK(!arch_supports_draft_block_size("qwen35moe", false));
 }
 
-};
 }  // namespace
-
-TEST_CASE(FeatureGateFixture, feature_gate_suite) {
-    test_feature_gate_accepts_plain_launch();
-    test_feature_gate_rejects_undetected_arch();
-    test_feature_gate_requires_compiled_target_backend();
-    test_feature_gate_ipc_options_require_ipc_binary();
-    test_feature_gate_mixed_draft_placement_requires_ipc();
-    test_feature_gate_draft_block_size_requires_local_draft();
-    test_draft_block_size_override_respects_checkpoint_horizon();
-    test_feature_gate_pflash_requires_drafter_and_supported_arch();
-    test_feature_gate_validates_target_split_topology();
-    test_feature_gate_tensor_parallel_requirements();
-    test_feature_gate_ds4_prefill_requires_deepseek4();
-    test_feature_gate_approximate_ds4_prefill_requires_local_hip();
-    test_feature_gate_ds4_decode_options_require_monolithic_hip();
-    test_feature_gate_remote_draft_requires_supported_arch();
-    test_feature_gate_layer_split_requires_supported_arch();
-    test_feature_gate_paged_attention_requires_qwen35_monolithic();
-    test_feature_gate_paged_attention_allows_fixed_local_chains();
-    test_feature_gate_parallel_and_kv_pool_rules();
-    test_feature_warnings_silent_when_supported();
-    test_feature_warnings_report_inert_draft();
-    test_feature_warnings_report_inert_decode_tunables();
-    test_feature_warnings_report_inert_moe_options();
-    test_model_capability_tables();
-}

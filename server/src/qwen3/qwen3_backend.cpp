@@ -968,8 +968,10 @@ ModelBackend::CompressResult Qwen3Backend::compress(const CompressRequest & req)
     }
 
     result.compressed_ids = drafter_score_and_compress(
-        drafter_ctx_, req.input_ids, req.keep_ratio);
-    result.ok = true;
+        drafter_ctx_, req.input_ids, req.keep_ratio,
+        /*chunk_size=*/32, req.score_query_tokens, /*pool_kernel=*/13,
+        req.score_query_end);
+    result.ok = !result.compressed_ids.empty();
 
     if (req.residency_action == DraftResidencyAction::ReleaseAfterUse) {
         free_drafter();

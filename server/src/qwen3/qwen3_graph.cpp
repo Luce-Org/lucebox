@@ -224,7 +224,8 @@ bool forward_qwen3_drafter_model(
     const Qwen3DrafterWeights & w,
     const std::vector<int32_t> & ids,
     int n_lookahead,
-    std::vector<float> & running_max)
+    std::vector<float> & running_max,
+    int score_query_end)
 {
     if (!w.backend || !w.tok_embd) {
         set_last_error("forward_qwen3_drafter_model: weights not loaded");
@@ -250,10 +251,17 @@ bool forward_qwen3_drafter_model(
         return e == nullptr || std::string(e) != "0";
     }();
 
-    if (S < n_lookahead + 1) {
+    if (n_lookahead < 1 || S < n_lookahead + 1) {
         set_last_error("forward_qwen3_drafter_model: S too small");
         return false;
     }
+    const int query_end = score_query_end < 0 ? S : score_query_end;
+    if (query_end < n_lookahead || query_end > S) {
+        set_last_error(
+            "forward_qwen3_drafter_model: scorer query window out of range");
+        return false;
+    }
+    const int query_start = query_end - n_lookahead;
     running_max.assign((size_t)n_lookahead * S, -INFINITY);
 
     // Read scoring/early-exit env vars once; compute alloc range before buffers are created.
@@ -353,7 +361,7 @@ bool forward_qwen3_drafter_model(
     {
         std::vector<float> m((size_t)n_lookahead * S, 0.0f);
         for (int t = 0; t < n_lookahead; ++t) {
-            int visible_end = S - n_lookahead + t + 1;
+            const int visible_end = query_start + t + 1;
             for (int j = 0; j < S; ++j) {
                 m[(size_t)t * S + j] = (j < visible_end) ? 0.0f : -INFINITY;
             }
@@ -463,15 +471,21 @@ bool forward_qwen3_drafter_model(
             // NoPE: capture pre-RoPE Q tail (only for layers that will be scored).
             if (nope_tail && il >= score_layer_start_pre) {
                 const int si = il - score_layer_start_pre;
-                const int tail_lo_nr = S - n_lookahead;
-                if (tail_lo_nr >= cs && tail_lo_nr + n_lookahead <= cs + cl) {
-                    const int local_lo_nr = tail_lo_nr - cs;
+                const auto capture = query_capture_slice(
+                    query_start, query_end, cs, cl);
+                if (capture.valid()) {
                     ggml_tensor * Q_prenrope_tail = ggml_view_3d(
-                        gA, Q, D, H, n_lookahead,
+                        gA, Q, D, H, capture.tokens,
                         Q->nb[1], Q->nb[2],
-                        (size_t)local_lo_nr * Q->nb[2]);
+                        (size_t)capture.chunk_offset * Q->nb[2]);
+                    Q_prenrope_tail = ggml_cont(gA, Q_prenrope_tail);
+                    Q_prenrope_tail = ggml_reshape_1d(
+                        gA, Q_prenrope_tail, D * H * capture.tokens);
+                    ggml_tensor * Q_prenrope_dst = ggml_view_1d(
+                        gA, Q_norope_v[si].t, D * H * capture.tokens,
+                        (size_t)capture.query_offset * Q_norope_v[si].t->nb[2]);
                     ggml_build_forward_expand(gfA,
-                        ggml_cpy(gA, Q_prenrope_tail, Q_norope_v[si].t));
+                        ggml_cpy(gA, Q_prenrope_tail, Q_prenrope_dst));
                 }
             }
             Q = ggml_rope_ext(gA, Q, pos_chunk, nullptr, D,
@@ -515,16 +529,22 @@ bool forward_qwen3_drafter_model(
             ggml_build_forward_expand(gfA, ggml_cpy(gA, K, K_dst));
             ggml_build_forward_expand(gfA, ggml_cpy(gA, V, V_dst));
 
-            // Copy Q tail to Q_last_v[il] in the chunk that contains the tail.
-            const int tail_lo = S - n_lookahead;
-            if (!nope_tail && tail_lo >= cs && tail_lo + n_lookahead <= cs + cl) {
-                int local_lo = tail_lo - cs;
+            // Copy the overlapping Q-query slice; a query can straddle chunks.
+            const auto capture = query_capture_slice(
+                query_start, query_end, cs, cl);
+            if (!nope_tail && capture.valid()) {
                 ggml_tensor * Q_tail_local = ggml_view_3d(
-                    gA, Q, D, H, n_lookahead,
+                    gA, Q, D, H, capture.tokens,
                     Q->nb[1], Q->nb[2],
-                    (size_t)local_lo * Q->nb[2]);
+                    (size_t)capture.chunk_offset * Q->nb[2]);
+                Q_tail_local = ggml_cont(gA, Q_tail_local);
+                Q_tail_local = ggml_reshape_1d(
+                    gA, Q_tail_local, D * H * capture.tokens);
+                ggml_tensor * Q_tail_dst = ggml_view_1d(
+                    gA, Q_last_v[layer_cache_idx].t, D * H * capture.tokens,
+                    (size_t)capture.query_offset * Q_last_v[layer_cache_idx].t->nb[2]);
                 ggml_build_forward_expand(gfA,
-                    ggml_cpy(gA, Q_tail_local, Q_last_v[layer_cache_idx].t));
+                    ggml_cpy(gA, Q_tail_local, Q_tail_dst));
             }
 
             auto tA_setup1 = std::chrono::steady_clock::now();
@@ -827,12 +847,33 @@ bool forward_qwen3_drafter_model(
             cleanup_all();
             return false;
         }
-        ggml_backend_graph_compute(w.backend, gf);
-        ggml_backend_tensor_get(probs, probs_h.data(), 0,
-                                probs_h.size() * sizeof(float));
+        const auto score_status = ggml_backend_graph_compute(w.backend, gf);
+        size_t nonfinite = 0;
+        if (score_status == GGML_STATUS_SUCCESS) {
+            ggml_backend_tensor_get(probs, probs_h.data(), 0,
+                                    probs_h.size() * sizeof(float));
+            nonfinite = count_nonfinite_scores(probs_h.data(), probs_h.size());
+        }
         ggml_gallocr_free(s_galloc);
         if (in_buf) ggml_backend_buffer_free(in_buf);
         ggml_free(gctx);
+        if (score_status != GGML_STATUS_SUCCESS) {
+            set_last_error("tail score graph compute failed at layer " +
+                           std::to_string(il));
+            cleanup_all();
+            return false;
+        }
+        if (nonfinite != 0) {
+            const std::string message =
+                "non-finite PFlash tail scores at layer " +
+                std::to_string(il) + ": " + std::to_string(nonfinite) +
+                "/" + std::to_string(probs_h.size());
+            std::fprintf(stderr, "[pflash] ERROR: %s\n", message.c_str());
+            std::fflush(stderr);
+            set_last_error(message);
+            cleanup_all();
+            return false;
+        }
 
         for (int t = 0; t < n_lookahead; ++t) {
             for (int j = 0; j < S; ++j) {
