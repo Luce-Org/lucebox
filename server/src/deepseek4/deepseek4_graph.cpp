@@ -7273,6 +7273,21 @@ bool deepseek4_step_layer_range(
                 moe_hybrid->prefill_cold_alloc = nullptr;
             }
         }
+        // Gallocr teardown does not return cached operator temporaries to
+        // the driver. Retire backend captures/memos and trim free pool blocks
+        // before allocating the new bulk-prefill scratch on either owner.
+        const size_t primary_released = ggml_backend_cuda_trim_pool(backend);
+        std::fprintf(stderr,
+                     "[deepseek4] bulk prefill pool trim: owner=primary released=%zu bytes\n",
+                     primary_released);
+        if (moe_hybrid && moe_hybrid->cold_backend &&
+            moe_hybrid->cold_backend != backend) {
+            const size_t cold_released =
+                ggml_backend_cuda_trim_pool(moe_hybrid->cold_backend);
+            std::fprintf(stderr,
+                         "[deepseek4] bulk prefill pool trim: owner=cold released=%zu bytes\n",
+                         cold_released);
+        }
         std::fprintf(stderr,
                      "[deepseek4] released prior decode/tail arenas before "
                      "new heterogeneous prefill\n");
