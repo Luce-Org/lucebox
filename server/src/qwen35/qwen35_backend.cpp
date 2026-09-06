@@ -41,6 +41,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <utility>
 #if !defined(_WIN32)
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -256,7 +257,7 @@ static void apply_drafter_capture_layer_ids(const DraftWeights & dw, TargetWeigh
 
 // ── Construction / destruction ──────────────────────────────────────────
 
-Qwen35Backend::Qwen35Backend(const Qwen35Config & cfg) : cfg_(cfg) {}
+Qwen35Backend::Qwen35Backend(Qwen35Config cfg) : cfg_(std::move(cfg)) {}
 
 Qwen35Backend::~Qwen35Backend() { shutdown(); }
 
@@ -339,7 +340,7 @@ bool Qwen35Backend::init() {
         const int cap = cfg_.remote_draft.ring_cap > 0
             ? std::min(cfg_.remote_draft.ring_cap, cfg_.device.max_ctx)
             : std::min(cfg_.device.max_ctx, cfg_.draft_ctx_max);
-        if (!remote_draft_.start(cfg_.remote_draft.ipc_bin, cfg_.draft_path,
+        if (!remote_draft_.start(cfg_.remote_draft.ipc_bin, *cfg_.draft_path,
                                  cfg_.draft_gpu, cap,
                                  cfg_.remote_draft.work_dir)) {
             std::fprintf(stderr, "remote draft start failed\n");
@@ -351,10 +352,10 @@ bool Qwen35Backend::init() {
         std::printf("[draft]  remote ipc ready gpu=%d cap=%d\n",
                     cfg_.draft_gpu, cap);
     } else if (cfg_.draft_path) {
-        std::string dp(cfg_.draft_path);
+        const std::string & dp = *cfg_.draft_path;
         bool draft_ok = (dp.size() >= 5 && dp.substr(dp.size() - 5) == ".gguf")
-            ? load_draft_gguf(cfg_.draft_path, draft_backend_, dw_, &w_)
-            : load_draft_safetensors(cfg_.draft_path, draft_backend_, dw_, &w_);
+            ? load_draft_gguf(*cfg_.draft_path, draft_backend_, dw_, &w_)
+            : load_draft_safetensors(*cfg_.draft_path, draft_backend_, dw_, &w_);
         if (!draft_ok) {
             std::fprintf(stderr, "draft load: %s\n", dflash27b_last_error());
             return false;
@@ -419,7 +420,8 @@ bool Qwen35Backend::init() {
     // (or the explicit choice via --kvflash-policy lru).
     kvflash_qk_policy_ = kvflash_policy_is_qk();
     if (std::getenv("DFLASH_KVFLASH") && !kvflash_qk_policy_) {
-        kvflash_drafter_path_ = kvflash_find_drafter(cfg_.target_path);
+        kvflash_drafter_path_ = kvflash_find_drafter(
+            cfg_.target_path.c_str());
     }
     // "auto" sizes the pool from the GPU: weights are resident at this
     // point and the cache is not yet allocated, so device-free minus a
@@ -914,17 +916,19 @@ bool Qwen35Backend::unpark(ParkTarget target) {
             const int cap = cfg_.remote_draft.ring_cap > 0
                 ? std::min(cfg_.remote_draft.ring_cap, cfg_.device.max_ctx)
                 : std::min(cfg_.device.max_ctx, cfg_.draft_ctx_max);
-            if (!remote_draft_.start(cfg_.remote_draft.ipc_bin, cfg_.draft_path,
+            if (!remote_draft_.start(
+                    cfg_.remote_draft.ipc_bin, *cfg_.draft_path,
                                      cfg_.draft_gpu, cap,
                                      cfg_.remote_draft.work_dir)) {
                 std::fprintf(stderr, "[unpark] remote draft failed\n");
                 return false;
             }
         } else {
-            std::string dp(cfg_.draft_path);
+            const std::string & dp = *cfg_.draft_path;
             bool draft_ok = (dp.size() >= 5 && dp.substr(dp.size() - 5) == ".gguf")
-                ? load_draft_gguf(cfg_.draft_path, draft_backend_, dw_, &w_)
-                : load_draft_safetensors(cfg_.draft_path, draft_backend_, dw_, &w_);
+                ? load_draft_gguf(*cfg_.draft_path, draft_backend_, dw_, &w_)
+                : load_draft_safetensors(
+                      *cfg_.draft_path, draft_backend_, dw_, &w_);
             if (!draft_ok) {
                 std::fprintf(stderr, "[unpark] draft: %s\n", dflash27b_last_error());
                 return false;

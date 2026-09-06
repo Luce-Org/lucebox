@@ -24,7 +24,7 @@
 namespace dflash::common {
 
 struct DeepSeek4LayerSplitAdapterConfig {
-    const char * target_path = nullptr;
+    std::string target_path;
     DevicePlacement device;
     RemoteTargetShardConfig remote_target_shard;
     int chunk = 512;
@@ -37,7 +37,7 @@ struct DeepSeek4LayerSplitShard : LayerSplitShardMeta {
 
 class DeepSeek4LayerSplitAdapter : public LayerSplitAdapter {
 public:
-    explicit DeepSeek4LayerSplitAdapter(const DeepSeek4LayerSplitAdapterConfig & cfg);
+    explicit DeepSeek4LayerSplitAdapter(DeepSeek4LayerSplitAdapterConfig cfg);
     ~DeepSeek4LayerSplitAdapter() override;
 
     DeepSeek4LayerSplitAdapter(const DeepSeek4LayerSplitAdapter &) = delete;

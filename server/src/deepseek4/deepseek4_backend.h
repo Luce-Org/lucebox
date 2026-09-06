@@ -43,7 +43,7 @@ int deepseek4_hybrid_prefill_step_tokens(
     int remaining_tokens);
 class DeepSeek4Backend : public ModelBackend {
 public:
-    explicit DeepSeek4Backend(const DeepSeek4BackendConfig & cfg);
+    explicit DeepSeek4Backend(DeepSeek4BackendConfig cfg);
     ~DeepSeek4Backend() override;
 
     DeepSeek4Backend(const DeepSeek4Backend &) = delete;

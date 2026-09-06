@@ -11,7 +11,7 @@ namespace dflash::common {
 
 std::string check_feature_compatibility(
     const BackendArgs & args,
-    const BackendFeatureConfig & features,
+    const BackendAdmissionContext & admission,
     const std::string & arch,
     PlacementBackend    target_backend,
     PlacementBackend    compiled_backend)
@@ -32,7 +32,7 @@ std::string check_feature_compatibility(
             ? target_backend
             : args.draft_device.backend;
     const bool draft_placement_used =
-        features.pflash_enabled || args.draft_path != nullptr;
+        admission.pflash_enabled || args.draft_path.has_value();
     const bool mixed_draft_placement =
         draft_placement_used && target_backend != draft_backend;
 
@@ -48,8 +48,8 @@ std::string check_feature_compatibility(
     }
 
     // ── PFlash enablement × drafter model
-    if (features.pflash_enabled &&
-        !features.pflash_drafter_configured) {
+    if (admission.pflash_enabled &&
+        !admission.pflash_drafter_configured) {
         return "--prefill-compression requires --prefill-drafter";
     }
 
@@ -98,7 +98,7 @@ std::string check_feature_compatibility(
         if (args.remote_target_shard.enabled()) {
             return "tensor parallelism is incompatible with --target-shard-ipc-bin";
         }
-        if (features.pflash_enabled) {
+        if (admission.pflash_enabled) {
             return "tensor parallelism does not yet support prefill compression";
         }
     }
@@ -150,14 +150,14 @@ std::string check_feature_compatibility(
     }
 
     // ── remote draft execution × architecture
-    if (args.remote_draft.enabled() && args.draft_path &&
+    if (args.remote_draft.enabled() && args.draft_path.has_value() &&
         !arch_supports_remote_draft(arch)) {
         return "model architecture '" + arch +
                "' does not support remote draft execution";
     }
 
     // ── mixed-backend PFlash × architecture
-    if (features.pflash_enabled && mixed_draft_placement &&
+    if (admission.pflash_enabled && mixed_draft_placement &&
         !arch_supports_pflash_compression(arch)) {
         return "model architecture '" + arch +
                "' does not support PFlash compression";
@@ -166,7 +166,7 @@ std::string check_feature_compatibility(
     // A block-size override changes the local draft graph itself. Remote
     // drafters own that shape in the IPC process and cannot be resized here.
     if (args.draft_block_size != 0) {
-        if (args.draft_path == nullptr) {
+        if (!args.draft_path.has_value()) {
             return "--draft-block-size requires --draft";
         }
         if (args.remote_draft.enabled()) {
@@ -176,7 +176,7 @@ std::string check_feature_compatibility(
 
     const bool concurrent_local_chain =
         arch == "qwen35" && args.paged_attention &&
-        args.max_concurrency > 1 && args.draft_path != nullptr &&
+        args.max_concurrency > 1 && args.draft_path.has_value() &&
         !args.ddtree_mode && !args.remote_draft.enabled() &&
         !args.device.is_layer_split() &&
         !args.device.is_tensor_parallel() &&
@@ -186,7 +186,7 @@ std::string check_feature_compatibility(
         args.fa_window == 0;
 
     if (concurrent_local_chain &&
-        features.draft_residency == DraftResidencyPolicy::RequestScoped) {
+        admission.draft_residency == DraftResidencyPolicy::RequestScoped) {
         return "concurrent DFlash2 does not support "
                "--draft-residency=request-scoped";
     }
@@ -208,7 +208,7 @@ std::string check_feature_compatibility(
             args.remote_target_shard.enabled()) {
             return "--paged-attention requires one local target device";
         }
-        if ((args.draft_path != nullptr || args.remote_draft.enabled()) &&
+        if ((args.draft_path.has_value() || args.remote_draft.enabled()) &&
             !concurrent_local_chain) {
             return "--paged-attention requires autoregressive decode without a "
                    "draft, or concurrent local same-device DFlash2 chains";
@@ -219,11 +219,11 @@ std::string check_feature_compatibility(
         if (args.fa_window != 0) {
             return "--paged-attention requires full attention (--fa-window 0)";
         }
-        if (features.pflash_enabled) {
+        if (admission.pflash_enabled) {
             return "--paged-attention cannot be combined with PFlash prefill "
                    "compression";
         }
-        if (features.kvflash_enabled) {
+        if (admission.fixed_kvflash_requested()) {
             return "--paged-attention cannot be combined with KVFlash";
         }
         // The pool rounds max_ctx up to a whole number of blocks, so the top
@@ -357,7 +357,6 @@ void warn_inert(std::vector<std::string> & out,
 
 std::vector<std::string> collect_feature_warnings(
     const BackendArgs & args,
-    const BackendFeatureConfig & features,
     const std::string & arch)
 {
     std::vector<std::string> out;
@@ -365,7 +364,7 @@ std::vector<std::string> collect_feature_warnings(
 
     // Each entry pairs a requested option with the capability predicate for
     // the field create_backend() would have to forward for it to take effect.
-    warn_inert(out, args.draft_path != nullptr,
+    warn_inert(out, args.draft_path.has_value(),
                arch_supports_decode_draft(arch, split),
                arch_supports_decode_draft(arch, false),
                split, arch, "--draft", "speculative decode");
@@ -395,13 +394,13 @@ std::vector<std::string> collect_feature_warnings(
                arch_supports_draft_swa(arch, false),
                split, arch, "--draft-swa", "draft sliding-window attention");
 
-    // MoE-only server features. These drive the DFLASH_QWEN35MOE_* /
+    // MoE-only backend requests. These drive the DFLASH_QWEN35MOE_* /
     // DFLASH_LAGUNA_* env vars, which a dense backend never reads.
-    if (features.routing_stats_requested && !arch_has_expert_offload(arch)) {
+    if (args.routing_stats_requested && !arch_has_expert_offload(arch)) {
         out.push_back("--freq/--collect-routing ignored: architecture '" +
                       arch + "' has no expert routing to record");
     }
-    if (features.adaptive_experts_requested && !arch_has_expert_offload(arch)) {
+    if (args.adaptive_experts_requested && !arch_has_expert_offload(arch)) {
         out.push_back("--adaptive-experts ignored: architecture '" + arch +
                       "' has no expert-count gating");
     }

@@ -541,6 +541,7 @@ add_library(dflash_common STATIC
     src/common/backend_precision.cpp
     src/common/daemon_loop.cpp
     src/common/gguf_inspect.cpp
+    src/common/backend_plan.cpp
     src/common/backend_factory.cpp
     src/common/feature_gate.cpp
     src/placement/placement_config.cpp
@@ -1833,16 +1834,18 @@ if(DFLASH27B_TESTS)
         list(APPEND _raw_unit_test_targets test_model_smoke)
     endif()
 
-    # Feature/architecture gate tests. check_feature_compatibility(),
-    # collect_feature_warnings() and the capability table are pure functions,
-    # so this target deliberately compiles only feature_gate.cpp and
-    # placement_config.cpp — no dflash_common, no ggml, no GPU toolkit. That
-    # keeps a gate rule testable in seconds instead of behind a full backend
-    # build, which is the whole reason these tests do not live in
+    # Backend planning and feature/architecture gate tests. The plan builder,
+    # check_feature_compatibility(), collect_feature_warnings(), and the
+    # capability table are pure policy, so this target compiles only their
+    # sources and placement_config.cpp. It needs no dflash_common, ggml, or GPU
+    # toolkit. This keeps policy rules testable in seconds instead of behind a
+    # full backend build, which is why these tests do not live in
     # test_server_unit.
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_feature_gate.cpp")
         add_executable(test_feature_gate test/test_feature_gate.cpp)
         target_sources(test_feature_gate PRIVATE
+            test/test_backend_plan.cpp
+            src/common/backend_plan.cpp
             src/common/feature_gate.cpp
             src/placement/placement_config.cpp)
         target_include_directories(test_feature_gate PRIVATE

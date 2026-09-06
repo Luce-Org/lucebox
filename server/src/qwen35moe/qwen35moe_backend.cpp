@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <utility>
 #include "common/gguf_mmap.h"
 
 namespace dflash::common {
@@ -74,8 +75,8 @@ static int qwen35moe_prefill_chunk_limit(int prompt_len) {
 
 } // namespace
 
-Qwen35MoeBackend::Qwen35MoeBackend(const Qwen35Config & cfg)
-    : Qwen35Backend(cfg) {}
+Qwen35MoeBackend::Qwen35MoeBackend(Qwen35Config cfg)
+    : Qwen35Backend(std::move(cfg)) {}
 
 bool Qwen35MoeBackend::init() {
     if (!Qwen35Backend::init()) {
@@ -153,7 +154,8 @@ bool Qwen35MoeBackend::load_target_model(ggml_backend_t backend, TargetWeights &
         gguf_init_params gip{};
         gip.no_alloc = true;
         gip.ctx = &expert_meta;
-        gguf_context * gctx = gguf_init_from_file(cfg_.target_path, gip);
+        gguf_context * gctx =
+            gguf_init_from_file(cfg_.target_path.c_str(), gip);
         if (!gctx) {
             set_last_error("failed to re-open GGUF for expert loading");
             return false;
@@ -320,7 +322,8 @@ bool Qwen35MoeBackend::rebuild_hybrid_from_placement(const MoeHybridPlacement & 
     ggml_backend_t backend = target_backend();
 
     gguf_init_params gip{};
-    gguf_context * gctx = gguf_init_from_file(cfg_.target_path, gip);
+    gguf_context * gctx =
+        gguf_init_from_file(cfg_.target_path.c_str(), gip);
     if (!gctx) { err = "gguf reinit failed"; return false; }
     GgufMmap _mf;
     std::string _mferr;

@@ -27,12 +27,13 @@
 #include <cstring>
 #include <limits>
 #include <string>
+#include <utility>
 
 namespace dflash::common {
 
 Qwen35LayerSplitAdapter::Qwen35LayerSplitAdapter(
-        const Qwen35LayerSplitAdapterConfig & cfg)
-    : cfg_(cfg) {}
+        Qwen35LayerSplitAdapterConfig cfg)
+    : cfg_(std::move(cfg)) {}
 
 Qwen35LayerSplitAdapter::~Qwen35LayerSplitAdapter() { shutdown(); }
 
@@ -42,7 +43,7 @@ bool Qwen35LayerSplitAdapter::init() {
     }
 
     const LayerSplitRuntimeInit runtime_cfg{
-        cfg_.target_path,
+        cfg_.target_path.c_str(),
         &cfg_.device,
         "target-split",
     };
@@ -132,7 +133,7 @@ void Qwen35LayerSplitAdapter::kvflash_read_config() {
         cfg_.device.is_layer_split() && cfg_.remote_target_shard.enabled();
     kvflash_drafter_path_ = target_shard_split
         ? std::string{}
-        : kvflash_find_drafter(cfg_.target_path);
+        : kvflash_find_drafter(cfg_.target_path.c_str());
 
     ggml_type kv_k = GGML_TYPE_Q8_0;
     ggml_type kv_v = GGML_TYPE_Q8_0;
@@ -297,7 +298,7 @@ bool Qwen35LayerSplitAdapter::init_mixed_target_split() {
     const size_t remote_begin = mixed_plan.remote_begin;
     const PlacementBackend remote_backend = mixed_plan.remote_backend;
 
-    const auto info = inspect_gguf_model_info(cfg_.target_path);
+    const auto info = inspect_gguf_model_info(cfg_.target_path.c_str());
     const int n_layer = info.n_layer;
     if (n_layer <= 0) {
         std::fprintf(stderr, "[target-split] failed to inspect target layer count\n");
@@ -431,7 +432,8 @@ bool Qwen35LayerSplitAdapter::load_draft() {
         const int cap = cfg_.remote_draft.ring_cap > 0
             ? std::min(cfg_.remote_draft.ring_cap, cfg_.device.max_ctx)
             : std::min(cfg_.device.max_ctx, cfg_.draft_ctx_max);
-        if (!remote_draft_.start(cfg_.remote_draft.ipc_bin, cfg_.draft_path,
+        if (!remote_draft_.start(
+                cfg_.remote_draft.ipc_bin, *cfg_.draft_path,
                                  cfg_.draft_gpu, cap,
                                  cfg_.remote_draft.work_dir)) {
             std::fprintf(stderr,
@@ -468,12 +470,12 @@ bool Qwen35LayerSplitAdapter::load_draft() {
         draft_backend_owned_ = true;
     }
 
-    std::string draft_path(cfg_.draft_path ? cfg_.draft_path : "");
+    const std::string & draft_path = *cfg_.draft_path;
     const bool draft_ok = draft_path.size() >= 5 &&
             draft_path.substr(draft_path.size() - 5) == ".gguf"
-        ? load_draft_gguf(cfg_.draft_path, draft_backend_, draft_weights_,
+        ? load_draft_gguf(*cfg_.draft_path, draft_backend_, draft_weights_,
                           &shards_.front().weights)
-        : load_draft_safetensors(cfg_.draft_path, draft_backend_,
+        : load_draft_safetensors(*cfg_.draft_path, draft_backend_,
                                  draft_weights_, &shards_.front().weights);
     if (!draft_ok) {
         std::fprintf(stderr, "[target-split] draft load gpu=%d: %s\n",
