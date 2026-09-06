@@ -8941,6 +8941,28 @@ struct ggml_tensor * ggml_ds4_deferred_peer_copy(
     return result;
 }
 
+struct ggml_tensor * ggml_cluster_allreduce(
+        struct ggml_context     * ctx,
+        struct ggml_tensor      * a,
+        ggml_cluster_allreduce_fn fn,
+        void                    * user) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(a));
+    GGML_ASSERT(fn != NULL);
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
+    result->op = GGML_OP_MOE_FUSED;
+    result->src[0] = a;
+
+    ggml_set_op_params_i32(result, 0, GGML_MOE_FUSED_CLUSTER_ALLREDUCE);
+    memcpy(&result->op_params[GGML_MOE_FUSED_CLUSTER_ALLREDUCE_FN_WORD],
+           &fn, sizeof(fn));
+    memcpy(&result->op_params[GGML_MOE_FUSED_CLUSTER_ALLREDUCE_USER_WORD],
+           &user, sizeof(user));
+
+    return result;
+}
+
 struct ggml_tensor * ggml_ds4_hc_pre(
         struct ggml_context * ctx,
         struct ggml_tensor  * mix,

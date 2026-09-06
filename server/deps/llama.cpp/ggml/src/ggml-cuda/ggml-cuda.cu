@@ -3888,6 +3888,18 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
 }
 
 #ifdef USE_CUDA_GRAPH
+
+// GGML_CUDA_COLLECTIVE_GRAPH_CAPTURE=1: allow graph capture of a graph that
+// contains a GGML_MOE_FUSED_CLUSTER_ALLREDUCE node. Off by default; see the
+// note at the call site for why.
+static bool ggml_cuda_cluster_capture_allowed() {
+    static const bool allowed = [] {
+        const char * v = getenv("GGML_CUDA_COLLECTIVE_GRAPH_CAPTURE");
+        return v && v[0] && strcmp(v, "0") != 0;
+    }();
+    return allowed;
+}
+
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
     bool use_cuda_graph = true;
@@ -3908,6 +3920,22 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             use_cuda_graph = false; // Split buffers are not supported by CUDA graph capture
 #ifndef NDEBUG
             GGML_LOG_DEBUG("%s: disabling CUDA graphs due to split buffer\n", __func__);
+#endif
+        }
+
+        // A collective node calls into a library on this stream. Whether such
+        // a collective may be captured and replayed is runtime- and
+        // library-specific, so a graph containing one is executed eagerly.
+        // Measured on gfx1151 with RCCL 2.30.4: capture IS bit-exact there,
+        // and replaying a 5.4k-node graph that holds 43 collectives is 11 %
+        // SLOWER than launching it eagerly, so allowing capture is opt-in.
+        // This costs nothing where no such node exists.
+        if (node->op == GGML_OP_MOE_FUSED &&
+            ggml_get_op_params_i32(node, 0) == GGML_MOE_FUSED_CLUSTER_ALLREDUCE &&
+            !ggml_cuda_cluster_capture_allowed()) {
+            use_cuda_graph = false;
+#ifndef NDEBUG
+            GGML_LOG_DEBUG("%s: disabling CUDA graphs due to a collective node\n", __func__);
 #endif
         }
 
