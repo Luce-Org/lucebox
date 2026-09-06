@@ -7683,7 +7683,13 @@ bool deepseek4_step_layer_range(
                                candidate.index_flush == index_flush;
                     });
                 if (it == per_layer.end()) {
-                    if (per_layer.size() >= 20) {
+                    // Compressed-row counts grow during AR decode. Retaining
+                    // historical shapes multiplies context-sized attention
+                    // arenas on a tightly packed paired-owner primary GPU.
+                    const size_t cache_limit = moe_hybrid &&
+                        moe_hybrid->cold_backend && moe_hybrid->cold_backend != backend
+                        ? 1 : 20;
+                    while (per_layer.size() >= cache_limit) {
                         per_layer.front().free();
                         per_layer.erase(per_layer.begin());
                     }
