@@ -423,6 +423,12 @@ struct ModelBackend {
     struct CompressRequest {
         std::vector<int32_t> input_ids;      // drafter-tokenized prompt
         float                keep_ratio;      // fraction to keep (0.0–1.0)
+        // Exclusive end and width of the user-query token window inside
+        // input_ids. Negative end preserves the legacy trailing-token window.
+        // Keeping this separate from DFLASH_COMPRESS_QUERY_TOKENS matters:
+        // that knob controls lexical anchors, not neural scorer Q rows.
+        int                  score_query_end = -1;
+        int                  score_query_tokens = 8;
         std::string          drafter_path;    // GGUF path (for lazy-load)
         int                  drafter_gpu = 0;  // backend-local GPU for PFlash drafter
         bool                 skip_park = false; // true on >=32GB GPUs

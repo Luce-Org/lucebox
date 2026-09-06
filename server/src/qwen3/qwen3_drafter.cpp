@@ -272,11 +272,18 @@ static std::vector<int32_t> qwen35_score_and_compress(
     float keep_ratio,
     int chunk_size,
     int n_lookahead,
-    int pool_kernel) {
+    int pool_kernel,
+    int score_query_end) {
 
     const int S = (int)ids.size();
     const int hidden = w.n_embd;
     if (S < n_lookahead + 1) return ids;
+    const int query_end = score_query_end;
+    if (n_lookahead < 1 || query_end < n_lookahead || query_end > S) {
+        set_last_error("qwen35 scorer query window out of range");
+        return {};
+    }
+    const int query_start = query_end - n_lookahead;
 
     auto t0 = std::chrono::steady_clock::now();
     std::vector<float> running_max((size_t)n_lookahead * S, -INFINITY);
@@ -441,7 +448,7 @@ static std::vector<int32_t> qwen35_score_and_compress(
             }
             const TargetLayer & L = w.layers[il];
             ggml_tensor * inp_tail = ggml_view_2d(sctx, act_in, hidden, n_lookahead,
-                act_in->nb[1], (size_t)(S - n_lookahead) * act_in->nb[1]);
+                act_in->nb[1], (size_t)query_start * act_in->nb[1]);
             ggml_tensor * q_cur = ggml_rms_norm(sctx, inp_tail, w.rms_eps);
             q_cur = ggml_mul(sctx, q_cur, L.attn_norm);
             ggml_tensor * QG = ggml_mul_mat(sctx, L.wq, q_cur);
@@ -473,7 +480,7 @@ static std::vector<int32_t> qwen35_score_and_compress(
             }
             std::vector<int32_t> pos4((size_t)4 * n_lookahead, 0);
             for (int i = 0; i < n_lookahead; ++i) {
-                int p = S - n_lookahead + i;
+                const int p = query_start + i;
                 pos4[(size_t)0 * n_lookahead + i] = p;
                 pos4[(size_t)1 * n_lookahead + i] = p;
                 pos4[(size_t)2 * n_lookahead + i] = p;
@@ -481,7 +488,7 @@ static std::vector<int32_t> qwen35_score_and_compress(
             ggml_backend_tensor_set(pos_tail, pos4.data(), 0, pos4.size() * sizeof(int32_t));
             std::vector<float> mask((size_t)n_lookahead * K_len, 0.0f);
             for (int t = 0; t < n_lookahead; ++t) {
-                const int visible_end = S - n_lookahead + t + 1;
+                const int visible_end = query_start + t + 1;
                 for (int j = 0; j < K_len; ++j) {
                     mask[(size_t)t * K_len + j] = (j < visible_end) ? 0.0f : -INFINITY;
                 }
@@ -495,6 +502,21 @@ static std::vector<int32_t> qwen35_score_and_compress(
             }
             std::vector<float> tmp((size_t)K_len * n_lookahead * w.n_head);
             ggml_backend_tensor_get(probs, tmp.data(), 0, tmp.size() * sizeof(float));
+            const size_t nonfinite =
+                count_nonfinite_scores(tmp.data(), tmp.size());
+            if (nonfinite != 0) {
+                const std::string message =
+                    "non-finite Qwen3.5 PFlash scores at layer " +
+                    std::to_string(il) + ": " + std::to_string(nonfinite) +
+                    "/" + std::to_string(tmp.size());
+                std::fprintf(stderr, "[pflash] ERROR: %s\n", message.c_str());
+                std::fflush(stderr);
+                ggml_gallocr_free(salloc); ggml_free(sctx);
+                ggml_gallocr_free(alloc); ggml_backend_buffer_free(act_buf);
+                ggml_free(act_ctx); free_target_cache(cache);
+                set_last_error(message);
+                return {};
+            }
             for (int h = 0; h < w.n_head; ++h) {
                 for (int t = 0; t < n_lookahead; ++t) {
                     for (int j = 0; j < S; ++j) {
@@ -684,18 +706,24 @@ std::vector<int32_t> drafter_score_and_compress(
     float keep_ratio,
     int chunk_size,
     int n_lookahead,
-    int pool_kernel) {
+    int pool_kernel,
+    int score_query_end) {
     if (!ctx.loaded) {
         set_last_error("drafter not loaded");
         return {};
     }
     if (ctx.arch == DrafterArch::Qwen35_0p8b) {
+        if (score_query_end < 0) {
+            set_last_error("qwen35 scorer query window out of range");
+            return {};
+        }
         if (!ctx.arch_state) {
             set_last_error("qwen35 drafter state missing");
             return {};
         }
         auto * st = static_cast<Qwen35DrafterState *>(ctx.arch_state);
-        return qwen35_score_and_compress(st->weights, ids, keep_ratio, chunk_size, n_lookahead, pool_kernel);
+        return qwen35_score_and_compress(st->weights, ids, keep_ratio, chunk_size,
+                                         n_lookahead, pool_kernel, score_query_end);
     }
     const int S = (int)ids.size();
     if (S < n_lookahead + 1) {
@@ -706,7 +734,8 @@ std::vector<int32_t> drafter_score_and_compress(
     // ── 1. Custom forward + GPU tail-attention scoring ────────────────
     auto t0 = std::chrono::steady_clock::now();
     std::vector<float> running_max;
-    if (!forward_qwen3_drafter_model(ctx.weights, ids, n_lookahead, running_max)) {
+    if (!forward_qwen3_drafter_model(
+            ctx.weights, ids, n_lookahead, running_max, score_query_end)) {
         return {};
     }
     auto t1 = std::chrono::steady_clock::now();

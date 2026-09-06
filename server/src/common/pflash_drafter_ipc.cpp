@@ -40,9 +40,12 @@ bool PFlashDrafterIpcClient::start(
 bool PFlashDrafterIpcClient::compress(
         const std::vector<int32_t> & input_ids,
         float keep_ratio,
-        std::vector<int32_t> & compressed_ids) {
+        std::vector<int32_t> & compressed_ids,
+        int score_query_end,
+        int score_query_tokens) {
 #if defined(_WIN32)
     (void)input_ids; (void)keep_ratio; (void)compressed_ids;
+    (void)score_query_end; (void)score_query_tokens;
     return false;
 #else
     compressed_ids.clear();
@@ -58,7 +61,9 @@ bool PFlashDrafterIpcClient::compress(
     int keep_x1000 = (int)std::lround(std::max(0.0f, keep_ratio) * 1000.0f);
     keep_x1000 = std::max(0, std::min(1000, keep_x1000));
 
-    std::fprintf(cmd, "compress %d %s\n", keep_x1000, path.c_str());
+    std::fprintf(cmd, "compress %d %d %d %s\n",
+                 keep_x1000, score_query_end, score_query_tokens,
+                 path.c_str());
     std::fflush(cmd);
 
     int32_t status = -1;

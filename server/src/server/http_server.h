@@ -262,6 +262,26 @@ bool canonical_assistant_content(
     const std::string & generated_text,
     std::string & content);
 
+struct PflashQueryWindow {
+    int end = -1;       // exclusive token offset in the rendered prompt
+    int tokens = 0;     // width of the matching query suffix
+
+    bool valid() const { return end >= tokens && tokens > 0; }
+};
+
+// Select the final normalized user message as the scorer query. Public for
+// model-free coverage of every request shape accepted by prompt rendering.
+std::string pflash_user_query_text(
+    const std::vector<ChatMessage> & messages);
+
+// Find the last sufficiently-specific suffix of the user query before the
+// assistant-generation suffix. Public for model-free regression tests.
+PflashQueryWindow find_pflash_query_window(
+    const std::vector<int32_t> & prompt,
+    const std::vector<int32_t> & query,
+    int search_end,
+    int max_tokens = 8);
+
 }  // namespace http_detail
 
 // ─── Parsed request ─────────────────────────────────────────────────────

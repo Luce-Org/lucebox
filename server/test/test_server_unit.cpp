@@ -24,6 +24,7 @@
 #include "common/concurrency/seq_engine.h"
 #include "common/backend_precision.h"
 #include "common/backend_ipc.h"
+#include "common/pflash_drafter_ipc.h"
 #include "common/moe_hybrid_ffn_eval.h"
 #include "common/moe_hybrid_placement.h"
 #include "placement/pflash_placement.h"
@@ -40,6 +41,7 @@
 #include "qwen35moe/qwen35moe_ffn.h"
 #include "ggml-cpu.h"
 #include "server/prompt_normalize.h"
+#include "qwen3_drafter.h"
 #include "qwen3_drafter_model.h"
 #include "dflash27b.h"
 #include "gguf.h"
@@ -108,6 +110,116 @@ TEST_CASE(ServerUnitFixture, test_api_format_names_are_total) {
     CHECK(std::string(api_format_name(ApiFormat::ANTHROPIC)) == "anthropic");
     CHECK(std::string(api_format_name(ApiFormat::RESPONSES)) == "responses");
     CHECK(std::string(api_format_name(ApiFormat::COMPLETIONS)) == "completions");
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_scorer_uses_user_query_before_chat_suffix) {
+    const std::vector<int32_t> query{
+        90, 91, 100, 101, 102, 103, 104, 105, 106, 107,
+    };
+    const std::vector<int32_t> rendered{
+        1, 2, 100, 101, 102, 103, 104, 105, 106, 107,
+        200, 201, 100, 101, 102, 103, 104, 105, 106, 107,
+    };
+
+    const auto window = http_detail::find_pflash_query_window(
+        rendered, query, /*search_end=*/12);
+
+    TEST_ASSERT(window.valid());
+    TEST_ASSERT(window.tokens == 8);
+    TEST_ASSERT(window.end == 10);
+    TEST_ASSERT((int)rendered.size() - window.end == 10);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_scorer_accepts_responses_string_input) {
+    ToolMemory tool_memory;
+    const auto messages = normalize_chat_messages(
+        json("Which token is the answer?"), ApiFormat::RESPONSES, tool_memory);
+
+    TEST_ASSERT(
+        http_detail::pflash_user_query_text(messages) ==
+        "Which token is the answer?");
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_query_mapping_tolerates_one_bpe_boundary_token) {
+    const std::vector<int32_t> query{10, 11, 12, 13, 14, 15, 16, 17};
+    const std::vector<int32_t> rendered{
+        1, 2, 999, 11, 12, 13, 14, 15, 16, 17, 200, 201,
+    };
+
+    const auto window = http_detail::find_pflash_query_window(
+        rendered, query, /*search_end=*/10);
+
+    TEST_ASSERT(window.valid());
+    TEST_ASSERT(window.tokens == 7);
+    TEST_ASSERT(window.end == 10);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_query_mapping_rejects_weak_punctuation_match) {
+    const std::vector<int32_t> query{10, 11, 12, 13, 14, 15, 16, 17};
+    const std::vector<int32_t> rendered{1, 2, 15, 16, 17, 200, 201};
+    TEST_ASSERT(!http_detail::find_pflash_query_window(
+        rendered, query, /*search_end=*/7).valid());
+
+    const std::vector<int32_t> short_query{30, 31, 32};
+    const std::vector<int32_t> short_rendered{1, 30, 31, 32, 200};
+    const auto short_window =
+        http_detail::find_pflash_query_window(
+            short_rendered, short_query, /*search_end=*/4);
+    TEST_ASSERT(short_window.valid());
+    TEST_ASSERT(short_window.tokens == 3);
+    TEST_ASSERT(short_window.end == 4);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_score_validation_counts_nan_and_inf) {
+    const float values[]{
+        0.0f,
+        std::numeric_limits<float>::quiet_NaN(),
+        std::numeric_limits<float>::infinity(),
+        -std::numeric_limits<float>::infinity(),
+        1.0f,
+    };
+    TEST_ASSERT(count_nonfinite_scores(values, 5) == 3);
+    TEST_ASSERT(count_nonfinite_scores(values, 1) == 0);
+}
+
+TEST_CASE(ServerUnitFixture, test_qwen35_pflash_rejects_missing_query_window) {
+    DrafterContext ctx;
+    ctx.loaded = true;
+    ctx.arch = DrafterArch::Qwen35_0p8b;
+    const std::vector<int32_t> ids(16, 1);
+
+    const auto compressed = drafter_score_and_compress(
+        ctx, ids, 0.5f, /*chunk_size=*/32, /*n_lookahead=*/8,
+        /*pool_kernel=*/13, /*score_query_end=*/-1);
+
+    TEST_ASSERT(compressed.empty());
+    TEST_ASSERT(std::string(dflash27b_last_error()) ==
+                "qwen35 scorer query window out of range");
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_ipc_rejects_unsupported_query_widths) {
+    TEST_ASSERT(valid_pflash_score_query_tokens(1));
+    TEST_ASSERT(valid_pflash_score_query_tokens(8));
+    TEST_ASSERT(!valid_pflash_score_query_tokens(0));
+    TEST_ASSERT(!valid_pflash_score_query_tokens(9));
+    TEST_ASSERT(!valid_pflash_score_query_tokens(
+        (std::numeric_limits<int>::max)()));
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_query_capture_splits_across_chunks) {
+    const auto first = query_capture_slice(4093, 4101, 0, 4096);
+    TEST_ASSERT(first.valid());
+    TEST_ASSERT(first.chunk_offset == 4093);
+    TEST_ASSERT(first.query_offset == 0);
+    TEST_ASSERT(first.tokens == 3);
+
+    const auto second = query_capture_slice(4093, 4101, 4096, 4096);
+    TEST_ASSERT(second.valid());
+    TEST_ASSERT(second.chunk_offset == 0);
+    TEST_ASSERT(second.query_offset == 3);
+    TEST_ASSERT(second.tokens == 5);
+
+    TEST_ASSERT(!query_capture_slice(4093, 4101, 8192, 4096).valid());
 }
 
 TEST_CASE(ServerUnitFixture, test_daemon_io_external_cancellation_latches) {
