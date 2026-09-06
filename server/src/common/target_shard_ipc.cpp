@@ -172,7 +172,26 @@ bool TargetShardIpcSession::start(const TargetShardIpcLaunchConfig & cfg) {
         layer_begin_list += std::to_string(cfg.layer_begins[i]);
         layer_end_list += std::to_string(cfg.layer_ends[i]);
     }
-    launch.args.push_back("--target-gpus=" + gpu_list);
+    // Optional GPU isolation for the target-shard daemon. By default the main
+    // process and the daemon both enumerate every GPU; for a cross-backend split
+    // (CUDA main + HIP daemon) that is harmless, but for a same-backend split
+    // (e.g. HIP main + HIP daemon across two AMD GPUs) two ROCr runtimes each
+    // initializing the *other* process's device can hard-fault the machine.
+    // When DFLASH_TARGET_SHARD_ISOLATE_GPUS is set, pin the daemon to see only
+    // its assigned GPUs via {CUDA,ROCR}_VISIBLE_DEVICES; under that pinned view
+    // the visible GPUs re-index from 0, so remap --target-gpus to match.
+    std::string target_gpu_list = gpu_list;
+    if (std::getenv("DFLASH_TARGET_SHARD_ISOLATE_GPUS") != nullptr) {
+        launch.child_env.emplace_back("ROCR_VISIBLE_DEVICES", gpu_list);
+        launch.child_env.emplace_back("CUDA_VISIBLE_DEVICES", gpu_list);
+        std::string remapped;
+        for (size_t i = 0; i < cfg.gpus.size(); ++i) {
+            if (i > 0) remapped += ",";
+            remapped += std::to_string(i);
+        }
+        target_gpu_list = remapped;
+    }
+    launch.args.push_back("--target-gpus=" + target_gpu_list);
     launch.args.push_back("--layer-begins=" + layer_begin_list);
     launch.args.push_back("--layer-ends=" + layer_end_list);
     launch.args.push_back("--max-ctx=" + std::to_string(cfg.max_ctx));
