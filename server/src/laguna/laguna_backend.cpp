@@ -1584,7 +1584,7 @@ GenerateResult LagunaBackend::restore_and_generate_impl(int slot,
         N > kvflash_tokens_ - kvflash_pager_.chunk_tokens()) {
         std::fprintf(stderr, "[kvflash] restore prompt (%d) exceeds pool %d; "
                              "raise --kvflash\n", N, kvflash_tokens_);
-        result.fail(GenerateErrorCode::ContextOverflow);
+        result.fail(GenerateErrorCode::ResourceExhausted);
         return result;
     }
     if (kvflash_active()) {
@@ -2743,7 +2743,7 @@ GenerateResult LagunaBackend::generate_hybrid(const GenerateRequest & req,
         N > kvflash_tokens_ - kvflash_pager_.chunk_tokens()) {
         std::fprintf(stderr, "[kvflash] hybrid prompt (%d) exceeds pool %d; "
                              "raise --kvflash\n", N, kvflash_tokens_);
-        result.fail(GenerateErrorCode::ContextOverflow);
+        result.fail(GenerateErrorCode::ResourceExhausted);
         return result;
     }
 

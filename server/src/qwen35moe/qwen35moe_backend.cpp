@@ -862,7 +862,7 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
         std::fprintf(stderr,
             "[kvflash] hybrid prompt (%d) exceeds pool %d; raise --kvflash "
             "or enable pflash compression\n", prompt_len, kvflash_tokens_);
-        result.fail(GenerateErrorCode::ContextOverflow);
+        result.fail(GenerateErrorCode::ResourceExhausted);
         cleanup_graphs();
         return result;
     }
@@ -1526,7 +1526,7 @@ GenerateResult Qwen35MoeBackend::restore_and_generate_impl(int slot,
         std::fprintf(stderr,
             "[kvflash] hybrid restore prompt (%d) exceeds pool %d; raise "
             "--kvflash\n", prompt_len, kvflash_tokens_);
-        result.fail(GenerateErrorCode::ContextOverflow);
+        result.fail(GenerateErrorCode::ResourceExhausted);
         out_io.emit(-1);
         return result;
     }

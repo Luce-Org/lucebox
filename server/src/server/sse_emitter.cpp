@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <utility>
 
 namespace dflash::common {
 
@@ -178,6 +179,7 @@ std::string SseEmitter::format_responses_event(const std::string & event_type,
 // ─── emit_start ─────────────────────────────────────────────────────────
 
 std::vector<std::string> SseEmitter::emit_start() {
+    if (terminal_) return {};
     std::vector<std::string> out;
 
     switch (format_) {
@@ -252,7 +254,7 @@ std::vector<std::string> SseEmitter::emit_start() {
 // ─── emit_token ─────────────────────────────────────────────────────────
 
 std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
-    if (stop_hit_) return {};  // already stopped
+    if (terminal_ || stop_hit_) return {};  // already stopped
 
     // Track the first emit_token call whose mode-on-entry is CONTENT —
     // that's the first token attributed to the visible reply. Mode-on-
@@ -698,6 +700,8 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
                                                  const GenTimings * timings,
                                                  int generation_cap,
                                                  bool ended_on_eos) {
+    if (terminal_) return {};
+    terminal_ = true;
     std::vector<std::string> out;
 
     // A tail still pending at end-of-stream is a genuinely truncated
@@ -1064,6 +1068,46 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
     }
 
     return out;
+}
+
+std::vector<std::string> SseEmitter::emit_error(
+        const ResponseError & error) {
+    if (terminal_) return {};
+    terminal_ = true;
+    finish_reason_ = "error";
+
+    switch (format_) {
+    case ApiFormat::OPENAI_CHAT:
+    case ApiFormat::COMPLETIONS:
+        return {
+            sse_data(build_error_response(format_, error, request_id_).dump()),
+            sse_data("[DONE]"),
+        };
+
+    case ApiFormat::ANTHROPIC:
+        return {sse_event(
+            "error",
+            build_error_response(format_, error, request_id_).dump())};
+
+    case ApiFormat::RESPONSES: {
+        json shell = {
+            {"id", request_id_},
+            {"object", "response"},
+            {"created_at", created_at_},
+            {"status", "failed"},
+            {"model", model_name_},
+            {"output", json::array()},
+            {"error", {
+                {"code", error.code},
+                {"message", error.message},
+            }},
+        };
+        return {format_responses_event(
+            "response.failed", {{"response", std::move(shell)}})};
+    }
+    }
+
+    return {};
 }
 
 std::string SseEmitter::finish_reason() const {

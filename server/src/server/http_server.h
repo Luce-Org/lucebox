@@ -487,9 +487,6 @@ private:
     std::string format_http_response(
         int status, const std::string & content_type,
         const std::string & body);
-    static std::array<std::string, 2> sse_error_close_chunks(
-        const std::string & message);
-
     // Parse HTTP request from socket.
     struct HttpRequest {
         std::string method;

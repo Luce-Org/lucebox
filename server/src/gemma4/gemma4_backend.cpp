@@ -900,7 +900,7 @@ GenerateResult Gemma4Backend::restore_and_generate_impl(int slot,
         if (snap_pos > kvflash_tokens_ - kvflash_pager_.chunk_tokens()) {
             std::fprintf(stderr, "[kvflash] restored prefix (%d) exceeds pool %d\n",
                          snap_pos, kvflash_tokens_);
-            result.fail(GenerateErrorCode::ContextOverflow);
+            result.fail(GenerateErrorCode::ResourceExhausted);
             return result;
         }
         kvflash_pager_.reset();

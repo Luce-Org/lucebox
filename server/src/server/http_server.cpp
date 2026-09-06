@@ -18,6 +18,7 @@
 
 #include "http_server.h"
 #include "admission.h"
+#include "response_error.h"
 #include "sse_emitter.h"
 #include "prompt_normalize.h"
 #include "tool_hint.h"
@@ -3566,7 +3567,7 @@ void HttpServer::finalize_generation_cache(
         }
     }
 
-    if (disk_cache_.disabled()) return;
+    if (disk_cache_.disabled() || !result.ok()) return;
 
     if (!prepared.compressed) {
         recent_disk_prompts_.insert(
@@ -3905,15 +3906,6 @@ void HttpServer::send_nonstream_response(
     }
 }
 
-std::array<std::string, 2> HttpServer::sse_error_close_chunks(
-        const std::string & message) {
-    const json err = {{"error", {
-        {"message", message},
-        {"type", "server_error"},
-    }}};
-    return {"data: " + err.dump() + "\n\n", "data: [DONE]\n\n"};
-}
-
 void HttpServer::worker_loop() {
     while (true) {
         ServerJob * job = dequeue();
@@ -3965,19 +3957,6 @@ void HttpServer::process_job(ServerJob * job) {
         job->done = true;
         job->cv.notify_one();
     };
-    auto fail_request = [&](int status, const std::string & message) {
-        std::fprintf(stderr, "[server] request failed: %s\n", message.c_str());
-        if (req.stream) {
-            stop_job_stream(job);
-            for (const std::string & chunk : sse_error_close_chunks(message)) {
-                send_job_bytes(job, chunk.data(), chunk.size());
-            }
-        } else {
-            send_error(fd, status, message);
-        }
-        finish_job();
-    };
-
     std::fprintf(stderr,
         "[server] chat START %s format=%s stream=%s prompt_tokens=%zu "
         "max_tokens=%d tools=%zu\n",
@@ -4020,6 +3999,31 @@ void HttpServer::process_job(ServerJob * job) {
         }
     }
     if (req.stream) start_job_stream(job);
+
+    auto fail_request = [&](int status, const std::string & message) {
+        std::fprintf(stderr, "[server] request failed: %s\n", message.c_str());
+        ResponseError error;
+        if (status == 400) {
+            error = ResponseError::invalid_request(
+                "invalid_request", message);
+        } else if (status == 503) {
+            error = ResponseError::unavailable("unavailable", message);
+        } else {
+            error = ResponseError::internal("server_error", message);
+        }
+        stop_job_stream(job);
+        if (req.stream) {
+            for (const std::string & chunk : emitter.emit_error(error)) {
+                send_job_bytes(job, chunk.data(), chunk.size());
+            }
+        } else {
+            const json body = build_error_response(
+                req.format, error, req.response_id);
+            send_response(fd, response_error_http_status(error),
+                          "application/json", body.dump() + "\n");
+        }
+        finish_job();
+    };
 
     PreparedPrompt prepared = prepare_prompt(req);
     if (prepared.error_status != 0) {
@@ -4096,7 +4100,7 @@ void HttpServer::process_job(ServerJob * job) {
 
     // Bandit: update when spec decode actually ran — including 0-accept case,
     // which signals the current keep_ratio is too low.
-    if (!req.session_id.empty() && result.spec_decode_ran) {
+    if (result.ok() && !req.session_id.empty() && result.spec_decode_ran) {
         float old_keep = sessions_.get_keep_ratio(req.session_id);
         int   old_turn = sessions_.turn_count(req.session_id);
         sessions_.update(req.session_id, result.accept_rate);
@@ -4112,16 +4116,77 @@ void HttpServer::process_job(ServerJob * job) {
         req, prepared, cache, result, completion_tokens,
         visible_output_seen, client_disconnected);
 
-    // Finalize.
+    auto log_done = [&]() {
+        const auto done_at = std::chrono::steady_clock::now();
+        const double elapsed_s =
+            std::chrono::duration<double>(done_at - started_at).count();
+        const int result_tokens = (int)result.tokens.size();
+        const int out_tokens = (std::max)(completion_tokens, result_tokens);
+        const double tok_s = elapsed_s > 0.0 ? out_tokens / elapsed_s : 0.0;
+        const double decode_tok_s =
+            result.decode_s > 0.0 ? out_tokens / result.decode_s : 0.0;
+        const std::string finish = client_disconnected
+            ? "client_disconnect"
+            : (result.ok() ? emitter.finish_reason() : "error");
+
+        std::fprintf(stderr,
+            "[server] chat DONE %s ok=%s in=%zu effective_in=%zu out=%d "
+            "%.1fs %.1f tok/s finish=%s restore=%s slot=%d prefix_len=%d "
+            "prefill=%.1fs decode=%.1fs(%.1ftok/s) error=%s detail=%s\n",
+            req.response_id.c_str(),
+            result.ok() ? "true" : "false",
+            req.prompt_tokens.size(),
+            effective_prompt.size(),
+            out_tokens,
+            elapsed_s,
+            tok_s,
+            finish.c_str(),
+            using_restore ? "true" : "false",
+            cache_slot,
+            prefix_len,
+            result.prefill_s,
+            result.decode_s,
+            decode_tok_s,
+            result.ok() ? "-" : result.error_code().data(),
+            result.error_detail().empty() ? "-" : result.error_detail().data());
+    };
+
+    // A backend failure terminates the request here. Everything below this
+    // branch records or frames a successful generation.
+    if (!result.ok()) {
+        stop_job_stream(job);
+        if (job->client_disconnected.load(std::memory_order_acquire)) {
+            client_disconnected = true;
+        }
+        if (!client_disconnected) {
+            const ResponseError error = to_response_error(*result.error);
+            if (req.stream) {
+                for (const std::string & chunk : emitter.emit_error(error)) {
+                    if (!send_job_bytes(job, chunk.data(), chunk.size())) {
+                        client_disconnected = true;
+                        break;
+                    }
+                }
+            } else {
+                const json body = build_error_response(
+                    req.format, error, req.response_id);
+                sock_set_block(fd);
+                send_response(fd, response_error_http_status(error),
+                              "application/json", body.dump() + "\n");
+            }
+        }
+        log_done();
+        finish_job();
+        return;
+    }
+
     // Per-request wall-clock timings forwarded to the response's
     // `usage.timings` (OpenAI Chat usage chunk, Anthropic
     // message_delta usage, Responses response.completed usage).
     // See docs/specs/thinking-budget.md §6.3.
     const int effective_prompt_tokens = (int) effective_prompt.size();
-    const int cached_prefix_tokens = result.ok()
-        ? (std::clamp)(result.restored_prefix_tokens, 0,
-                      effective_prompt_tokens)
-        : 0;
+    const int cached_prefix_tokens = (std::clamp)(
+        result.restored_prefix_tokens, 0, effective_prompt_tokens);
     const bool cache_hit = cached_prefix_tokens > 0;
     const bool agent_turn_cache_hit = cache_hit &&
         agent_turn_cache_slots_.count(cache_slot) != 0;
@@ -4136,28 +4201,26 @@ void HttpServer::process_job(ServerJob * job) {
     };
 
     // Record performance for /status page.
-    if (result.ok()) {
-        PerfRecord perf;
-        perf.prompt_tokens = (int)req.prompt_tokens.size();
-        perf.completion_tokens = completion_tokens;
-        // Use actual prefilled token count: on cache hit the backend only
-        // prefills the delta beyond the cached prefix, so dividing the full
-        // prompt size by delta time would be wrong.
-        const int prefill_tokens =
-            (std::max)(0, effective_prompt_tokens - cached_prefix_tokens);
-        perf.prefill_tok_s = (result.prefill_s > 0.0)
-            ? (double)prefill_tokens / result.prefill_s : 0.0;
-        perf.decode_tok_s = (result.decode_s > 0.0)
-            ? (double)completion_tokens / result.decode_s : 0.0;
-        perf.accept_rate = result.accept_rate;
-        perf.cache_hit = cache_hit;
-        perf.pflash = pflash_compressed;
-        perf.spec_decode = result.spec_decode_ran;
-        perf.timestamp = std::chrono::steady_clock::now();
-        status_.record_perf(perf);
-        status_.update_completion_tokens(completion_tokens);
-        broadcast_status();
-    }
+    PerfRecord perf;
+    perf.prompt_tokens = (int)req.prompt_tokens.size();
+    perf.completion_tokens = completion_tokens;
+    // Use actual prefilled token count: on cache hit the backend only
+    // prefills the delta beyond the cached prefix, so dividing the full
+    // prompt size by delta time would be wrong.
+    const int prefill_tokens =
+        (std::max)(0, effective_prompt_tokens - cached_prefix_tokens);
+    perf.prefill_tok_s = (result.prefill_s > 0.0)
+        ? (double)prefill_tokens / result.prefill_s : 0.0;
+    perf.decode_tok_s = (result.decode_s > 0.0)
+        ? (double)completion_tokens / result.decode_s : 0.0;
+    perf.accept_rate = result.accept_rate;
+    perf.cache_hit = cache_hit;
+    perf.pflash = pflash_compressed;
+    perf.spec_decode = result.spec_decode_ran;
+    perf.timestamp = std::chrono::steady_clock::now();
+    status_.record_perf(perf);
+    status_.update_completion_tokens(completion_tokens);
+    broadcast_status();
     // Serialize final frames after disabling heartbeat comments so no comment
     // can appear after the protocol's [DONE] marker.
     stop_job_stream(job);
@@ -4205,38 +4268,7 @@ void HttpServer::process_job(ServerJob * job) {
                      req.prompt_tokens.size(), completion_tokens);
     }
 
-    const auto done_at = std::chrono::steady_clock::now();
-    const double elapsed_s =
-        std::chrono::duration<double>(done_at - started_at).count();
-    const int result_tokens = (int)result.tokens.size();
-    const int out_tokens = (std::max)(completion_tokens, result_tokens);
-    const double tok_s = elapsed_s > 0.0 ? out_tokens / elapsed_s : 0.0;
-    const double decode_tok_s =
-        result.decode_s > 0.0 ? out_tokens / result.decode_s : 0.0;
-    const std::string finish = client_disconnected
-        ? "client_disconnect"
-        : (result.ok() ? emitter.finish_reason() : "error");
-
-    std::fprintf(stderr,
-        "[server] chat DONE %s ok=%s in=%zu effective_in=%zu out=%d "
-        "%.1fs %.1f tok/s finish=%s restore=%s slot=%d prefix_len=%d "
-        "prefill=%.1fs decode=%.1fs(%.1ftok/s) error=%s detail=%s\n",
-        req.response_id.c_str(),
-        result.ok() ? "true" : "false",
-        req.prompt_tokens.size(),
-        effective_prompt.size(),
-        out_tokens,
-        elapsed_s,
-        tok_s,
-        finish.c_str(),
-        using_restore ? "true" : "false",
-        cache_slot,
-        prefix_len,
-        result.prefill_s,
-        result.decode_s,
-        decode_tok_s,
-        result.ok() ? "-" : result.error_code().data(),
-        result.error_detail().empty() ? "-" : result.error_detail().data());
+    log_done();
 
     // Signal client thread that we're done.
     finish_job();

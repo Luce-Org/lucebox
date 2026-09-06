@@ -12,6 +12,7 @@
 #include "server/tool_parser.h"
 #include "server/model_card.h"
 #include "server/reasoning.h"
+#include "server/response_error.h"
 #include "server/prefix_cache.h"
 #include "server/pin_friendly_prompt.h"
 #include "server/disk_prefix_cache.h"
@@ -6222,6 +6223,114 @@ TEST_CASE(ServerUnitFixture, test_generate_result_error_state_is_consistent) {
     TEST_ASSERT(!result.error.has_value());
     TEST_ASSERT(result.error_code().empty());
     TEST_ASSERT(result.error_detail().empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_response_error_maps_every_generation_code) {
+    struct Case {
+        GenerateErrorCode code;
+        int status;
+    };
+    const Case cases[] = {
+        {GenerateErrorCode::Incomplete, 500},
+        {GenerateErrorCode::AdapterUnavailable, 503},
+        {GenerateErrorCode::ResourceExhausted, 503},
+        {GenerateErrorCode::ContextOverflow, 400},
+        {GenerateErrorCode::SamplingUnsupported, 400},
+        {GenerateErrorCode::PrefillFailed, 500},
+        {GenerateErrorCode::DecodeSeedMissing, 500},
+        {GenerateErrorCode::DecodeFailed, 500},
+        {GenerateErrorCode::InvalidSnapshotSlot, 500},
+        {GenerateErrorCode::ModelParked, 503},
+        {GenerateErrorCode::BackendSpecific, 500},
+    };
+
+    for (const Case & c : cases) {
+        const ResponseError error = to_response_error({c.code, {}});
+        TEST_ASSERT(!error.code.empty());
+        TEST_ASSERT(!error.message.empty());
+        TEST_ASSERT(error.code == generate_error_code(c.code));
+        TEST_ASSERT(response_error_http_status(error) == c.status);
+    }
+
+    const ResponseError detailed = to_response_error(
+        {GenerateErrorCode::DecodeFailed, "device execution failed"});
+    TEST_ASSERT(detailed.message == "device execution failed");
+}
+
+TEST_CASE(ServerUnitFixture, test_response_error_nonstream_formats) {
+    const ResponseError error = ResponseError::internal(
+        "decode_failed", "generation decode failed");
+
+    const json openai = build_error_response(
+        ApiFormat::OPENAI_CHAT, error, "chat_123");
+    TEST_ASSERT(openai["error"]["type"] == "server_error");
+    TEST_ASSERT(openai["error"]["code"] == "decode_failed");
+    TEST_ASSERT(openai["error"]["message"] == "generation decode failed");
+
+    const json anthropic = build_error_response(
+        ApiFormat::ANTHROPIC, error, "msg_123");
+    TEST_ASSERT(anthropic["type"] == "error");
+    TEST_ASSERT(anthropic["error"]["type"] == "api_error");
+    TEST_ASSERT(anthropic["request_id"] == "msg_123");
+
+    const json responses = build_error_response(
+        ApiFormat::RESPONSES, error, "resp_123");
+    TEST_ASSERT(responses["error"]["type"] == "server_error");
+    TEST_ASSERT(responses["error"]["code"] == "decode_failed");
+}
+
+TEST_CASE(ServerUnitFixture, test_response_error_factories_fill_empty_messages) {
+    TEST_ASSERT(ResponseError::invalid_request("invalid_request", {}).message ==
+                "invalid request");
+    TEST_ASSERT(ResponseError::unavailable("unavailable", {}).message ==
+                "service unavailable");
+    TEST_ASSERT(ResponseError::internal("engine_step_failed", {}).message ==
+                "generation failed");
+}
+
+TEST_CASE(ServerUnitFixture, test_sse_emitter_openai_error_is_terminal) {
+    auto emitter = make_emitter(ApiFormat::OPENAI_CHAT);
+    std::string wire = concat(emitter.emit_start());
+    wire += concat(emitter.emit_token("pending output that was already flushed"));
+
+    wire += concat(emitter.emit_error(
+        ResponseError::internal("decode_failed", "decode failed")));
+    TEST_ASSERT(wire.find("\"error\"") != std::string::npos);
+    TEST_ASSERT(wire.find("decode_failed") != std::string::npos);
+    TEST_ASSERT(wire.find("[DONE]") != std::string::npos);
+    TEST_ASSERT(wire.find("pending output") != std::string::npos);
+    TEST_ASSERT(emitter.finish_reason() == "error");
+    TEST_ASSERT(emitter.emit_finish(1).empty());
+    TEST_ASSERT(emitter.emit_token("late token").empty());
+    TEST_ASSERT(emitter.emit_error(ResponseError::internal(
+        "late_error", "late error")).empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_sse_emitter_anthropic_error_is_terminal) {
+    auto emitter = make_emitter(ApiFormat::ANTHROPIC);
+    emitter.emit_start();
+
+    const std::string wire = concat(emitter.emit_error(
+        ResponseError::unavailable("model_parked", "model unavailable")));
+    TEST_ASSERT(wire.find("event: error") != std::string::npos);
+    TEST_ASSERT(wire.find("overloaded_error") != std::string::npos);
+    TEST_ASSERT(wire.find("message_stop") == std::string::npos);
+    TEST_ASSERT(emitter.emit_finish(0).empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_sse_emitter_responses_error_is_terminal) {
+    auto emitter = make_emitter(ApiFormat::RESPONSES);
+    emitter.emit_start();
+
+    const std::string wire = concat(emitter.emit_error(
+        ResponseError::internal("prefill_failed", "prefill failed")));
+    TEST_ASSERT(wire.find("event: response.failed") != std::string::npos);
+    TEST_ASSERT(wire.find("\"status\":\"failed\"") !=
+                std::string::npos);
+    TEST_ASSERT(wire.find("prefill_failed") != std::string::npos);
+    TEST_ASSERT(wire.find("response.completed") == std::string::npos);
+    TEST_ASSERT(wire.find("[DONE]") == std::string::npos);
+    TEST_ASSERT(emitter.emit_finish(0).empty());
 }
 
 // ═══════════════════════════════════════════════════════════════════════

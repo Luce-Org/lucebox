@@ -554,6 +554,7 @@ add_library(dflash_common STATIC
     src/server/tool_hint.cpp
     src/server/reasoning.cpp
     src/server/tool_memory.cpp
+    src/server/response_error.cpp
     src/server/sse_emitter.cpp
     src/server/prefix_cache.cpp
     src/server/pin_friendly_prompt.cpp

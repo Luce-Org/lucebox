@@ -207,6 +207,7 @@ struct GenerateRequest {
 enum class GenerateErrorCode {
     Incomplete,
     AdapterUnavailable,
+    ResourceExhausted,
     ContextOverflow,
     SamplingUnsupported,
     PrefillFailed,
@@ -221,6 +222,7 @@ constexpr std::string_view generate_error_code(GenerateErrorCode error) {
     switch (error) {
     case GenerateErrorCode::Incomplete:          return "incomplete";
     case GenerateErrorCode::AdapterUnavailable:  return "adapter_unavailable";
+    case GenerateErrorCode::ResourceExhausted:   return "resource_exhausted";
     case GenerateErrorCode::ContextOverflow:     return "context_overflow";
     case GenerateErrorCode::SamplingUnsupported: return "sampling_unsupported";
     case GenerateErrorCode::PrefillFailed:       return "prefill_failed";
