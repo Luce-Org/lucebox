@@ -289,10 +289,20 @@ bool build_moe_hybrid_storage(const MoeHybridConfig & cfg,
     out.cold_backend_kind = cfg.cold_expert_backend;
     out.materialized_hot_experts = cfg.materialize_hot_experts;
     out.materialized_cold_experts = cfg.materialize_cold_experts;
-    out.cold_backend = cfg.cold_expert_backend == MoeHybridColdBackend::Gpu
-        ? (cold_gpu_backend ? cold_gpu_backend : gpu_backend)
-        : out.cpu_backend;
-    if (!out.cold_backend) {
+    // Cold owner None (cluster expert-parallel): non-resident routes are
+    // reduced by another process, so there is no cold backend, no cold
+    // buffer and no cold expert map on this side.
+    const bool no_cold_owner =
+        cfg.cold_expert_backend == MoeHybridColdBackend::None;
+    if (no_cold_owner && cfg.materialize_cold_experts) {
+        if (err) *err = "cold owner None cannot materialize cold experts";
+        return false;
+    }
+    out.cold_backend = no_cold_owner ? nullptr
+        : cfg.cold_expert_backend == MoeHybridColdBackend::Gpu
+            ? (cold_gpu_backend ? cold_gpu_backend : gpu_backend)
+            : out.cpu_backend;
+    if (!out.cold_backend && !no_cold_owner) {
         if (err) *err = "failed to select cold expert backend";
         return false;
     }
@@ -331,10 +341,12 @@ bool build_moe_hybrid_storage(const MoeHybridConfig & cfg,
             is_hot[(size_t)expert] = 1;
         }
         dst.decode_hot_local_by_global = dst.hot_local_by_global;
-        for (int expert = 0; expert < cfg.n_expert; ++expert) {
-            if (duplicate_hot_on_cold || !is_hot[(size_t)expert]) {
-                dst.cold_local_by_global[(size_t)expert] = (int32_t)dst.cold_expert_ids.size();
-                dst.cold_expert_ids.push_back((int32_t)expert);
+        if (!no_cold_owner) {
+            for (int expert = 0; expert < cfg.n_expert; ++expert) {
+                if (duplicate_hot_on_cold || !is_hot[(size_t)expert]) {
+                    dst.cold_local_by_global[(size_t)expert] = (int32_t)dst.cold_expert_ids.size();
+                    dst.cold_expert_ids.push_back((int32_t)expert);
+                }
             }
         }
         dst.decode_cold_local_by_global = dst.cold_local_by_global;
@@ -503,10 +515,20 @@ bool build_moe_hybrid_storage_from_file(
     out.cold_backend_kind = cfg.cold_expert_backend;
     out.materialized_hot_experts = cfg.materialize_hot_experts;
     out.materialized_cold_experts = cfg.materialize_cold_experts;
-    out.cold_backend = cfg.cold_expert_backend == MoeHybridColdBackend::Gpu
-        ? (cold_gpu_backend ? cold_gpu_backend : gpu_backend)
-        : out.cpu_backend;
-    if (!out.cold_backend) {
+    // Cold owner None (cluster expert-parallel): non-resident routes are
+    // reduced by another process, so there is no cold backend, no cold
+    // buffer and no cold expert map on this side.
+    const bool no_cold_owner =
+        cfg.cold_expert_backend == MoeHybridColdBackend::None;
+    if (no_cold_owner && cfg.materialize_cold_experts) {
+        if (err) *err = "cold owner None cannot materialize cold experts";
+        return false;
+    }
+    out.cold_backend = no_cold_owner ? nullptr
+        : cfg.cold_expert_backend == MoeHybridColdBackend::Gpu
+            ? (cold_gpu_backend ? cold_gpu_backend : gpu_backend)
+            : out.cpu_backend;
+    if (!out.cold_backend && !no_cold_owner) {
         if (err) *err = "failed to select cold expert backend";
         return false;
     }
@@ -546,7 +568,7 @@ bool build_moe_hybrid_storage_from_file(
             is_hot[(size_t)expert] = 1;
         }
         dst.decode_hot_local_by_global = dst.hot_local_by_global;
-        if (allocate_cold) {
+        if (allocate_cold && !no_cold_owner) {
             for (int expert = 0; expert < cfg.n_expert; ++expert) {
                 if (duplicate_hot_on_cold || !is_hot[(size_t)expert]) {
                     dst.cold_local_by_global[(size_t)expert] = (int32_t)dst.cold_expert_ids.size();

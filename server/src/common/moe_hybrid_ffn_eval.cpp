@@ -1648,6 +1648,11 @@ bool eval_moe_hybrid_ffn_single(
     std::vector<float> cold_weights;
     for (int i = 0; i < n_selected; ++i) {
         const int32_t gid = selected_ids[i];
+        // Cold owner None: routes masked to -1 by the cluster runtime are
+        // evaluated elsewhere and contribute zero here.
+        if (gid < 0 && storage.cold_backend_kind == MoeHybridColdBackend::None) {
+            continue;
+        }
         if (gid < 0 || gid >= (int32_t)storage.hot_local_by_global.size()) {
             if (err) *err = "selected id out of range";
             return false;
@@ -3537,6 +3542,51 @@ bool eval_moe_hybrid_ffn_batched(
                             : storage.gate_cold    ? (int)storage.gate_cold->ne[2]
                             : 0;
     const bool cold_on_gpu = storage.cold_backend_kind == MoeHybridColdBackend::Gpu;
+    // Cold owner None (a cluster rank): every route that survived masking is
+    // resident here and there is no second owner, so the whole batch can be
+    // packed by expert into ONE graph per layer. Without this a reduced hot
+    // stack falls into the sub-batch loop far below, whose size is
+    // min(mmq_safe_sub_batch(), prefill limit) = 1 on gfx1151 - one graph per
+    // token per layer. Measured on a 1517-token prompt: 25.9 s of FFN against
+    // 7.6 s for a single node's whole prefill graph. Expert-major packing is
+    // also what keeps the reduced stack off the MMQ full-batch path that
+    // mmq_safe_full_batch=false exists to avoid.
+    const bool hot_only_expert_major =
+        !expert_compute &&
+        storage.cold_backend_kind == MoeHybridColdBackend::None &&
+        !storage.gate_cold && !storage.gate_up_cold && !storage.down_cold &&
+        n_hot_stack > 0 &&
+        moe_expert_major_prefill_enabled(n_tokens);
+    if (hot_only_expert_major) {
+        static std::once_flag logged;
+        std::call_once(logged, [n_tokens, n_hot_stack] {
+            std::fprintf(stderr,
+                         "[hybrid-ffn] hot-only expert-major batch active tokens=%d "
+                         "stack=%d (no cold owner)\n",
+                         n_tokens, n_hot_stack);
+        });
+        const auto wall_t0 = HybridClock::now();
+        std::string owner_err;
+        const bool ok = eval_moe_owner_expert_major_batched(
+            gpu_backend, cfg, desc,
+            storage.gate_hot, storage.up_hot, storage.down_hot,
+            storage.gate_up_hot, storage.hot_local_by_global,
+            cur_host, selected_ids, selected_weights, n_tokens,
+            desc.has_shared_expert(), out, &owner_err,
+            cur_backend, gpu_backend,
+            /*device_output=*/nullptr, /*device_output_owner=*/nullptr,
+            p_hot_alloc);
+        if (!ok) {
+            if (err) *err = owner_err;
+            return false;
+        }
+        if (telemetry) {
+            const auto done = HybridClock::now();
+            telemetry->hot_us += elapsed_us(wall_t0, done);
+            telemetry->ffn_wall_us += elapsed_us(wall_t0, done);
+        }
+        return true;
+    }
     const bool inprocess_expert_major =
         !expert_compute && moe_expert_major_prefill_enabled(n_tokens) &&
         cold_on_gpu && storage.cold_backend &&
@@ -3982,6 +4032,7 @@ bool eval_moe_hybrid_ffn_gpu_resident(
 
     for (int i = 0; i < n_selected; ++i) {
         const int32_t gid = selected_ids[i];
+        if (gid < 0 && storage.cold_backend_kind == MoeHybridColdBackend::None) continue;
         if (gid < 0 || gid >= (int32_t)storage.hot_local_by_global.size()) return false;
         const int32_t hot_local = storage.hot_local_by_global[(size_t)gid];
         if (hot_local >= 0) {
@@ -4229,6 +4280,75 @@ bool eval_moe_hybrid_ffn_gpu_resident(
     // ── Copy combine output to persistent act_cur (GPU→GPU) ──
     ggml_backend_tensor_copy(gpu_state.combine.output, gpu_state.act_cur);
 
+    return true;
+}
+
+// ── Shared expert only ──
+// Cluster expert-parallel evaluates the routed partial without the shared
+// expert (the MoeLayerDesc handed to the routed path has the shexp tensors
+// cleared), all-reduces it, and adds this locally computed term afterwards.
+// The graph is cached per n_tokens in storage.shared_batched_graph, which
+// release_graph_caches() already frees.
+bool eval_moe_shared_expert_batched(
+    ggml_backend_t                  gpu_backend,
+    const MoeHybridConfig &         cfg,
+    const MoeLayerDesc &            desc,
+    MoeHybridLayerStorage &         storage,
+    const float *                   cur_host,
+    int                             n_tokens,
+    std::vector<float> &            out,
+    std::string *                   err) {
+    const int n_embd = cfg.n_embd;
+    out.assign((size_t)n_embd * (size_t)n_tokens, 0.0f);
+    if (n_tokens <= 0) return true;
+    if (!desc.ffn_up_shexp || !desc.ffn_gate_shexp || !desc.ffn_down_shexp) {
+        return true;
+    }
+    if (!cur_host) {
+        if (err) *err = "shared expert requires a host activation";
+        return false;
+    }
+
+    CachedHotBatchedGraph & g = storage.shared_batched_graph;
+    if (!g.valid() || g.n_tokens != n_tokens) {
+        g.free();
+        g.n_tokens = n_tokens;
+        ggml_init_params ip{};
+        ip.mem_size = 4 * 1024 * 1024;
+        ip.mem_buffer = nullptr;
+        ip.no_alloc = true;
+        g.ctx = ggml_init(ip);
+        if (!g.ctx) {
+            if (err) *err = "shared expert ggml_init failed";
+            return false;
+        }
+        g.inp = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_input(g.inp);
+        g.output = build_shared_expert_subgraph(g.ctx, desc, g.inp, cfg.swiglu_clamp);
+        if (!g.output) {
+            g.free();
+            if (err) *err = "shared expert subgraph build failed";
+            return false;
+        }
+        g.gf = ggml_new_graph_custom(g.ctx, 512, false);
+        ggml_set_output(g.output);
+        ggml_build_forward_expand(g.gf, g.output);
+        g.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(gpu_backend));
+        if (!g.alloc || !ggml_gallocr_alloc_graph(g.alloc, g.gf)) {
+            g.free();
+            if (err) *err = "shared expert gallocr failed";
+            return false;
+        }
+    }
+
+    ggml_backend_tensor_set(g.inp, cur_host, 0,
+                            sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
+    if (ggml_backend_graph_compute(gpu_backend, g.gf) != GGML_STATUS_SUCCESS) {
+        if (err) *err = "shared expert compute failed";
+        return false;
+    }
+    ggml_backend_tensor_get(g.output, out.data(), 0,
+                            sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
     return true;
 }
 
