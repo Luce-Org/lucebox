@@ -534,13 +534,30 @@ static bool ds4_build_fused_verify_graph(
         std::vector<DeepSeek4I32InputBinding> i32b;
         std::vector<DeepSeek4I32ArrayBinding> i32ab;
         std::vector<DeepSeek4I64ArrayBinding> i64ab;
+        std::vector<DeepSeek4F32ArrayBinding> f32ab;
+        // Sparse attention pays a fixed indexer/compaction cost. Keep the
+        // established explicit kernel while history is small, then switch per
+        // layer once sparse work can remove at least half of the compressed
+        // rows. This also avoids a transient identity binding at the exact
+        // top-k boundary, preserving fused-graph replay.
+        const bool sparse_attention =
+            ds4_env_flag("DFLASH_DS4_SPARSE_DECODE_FLASH") && ratio > 0 &&
+            padded > 2 * w.n_indexer_top_k;
+        const DeepSeek4AttentionImpl attention_impl = sparse_attention
+            ? DeepSeek4AttentionImpl::SparseFlash
+            : DeepSeek4AttentionImpl::Explicit;
         ggml_tensor * normed = build_rms_norm(ctx, attn_in, L.attn_norm, w.rms_eps);
         ggml_tensor * attn_out = build_mla_attention(ctx, gf, normed, w, L, lc, il,
                                                      lane_kv_start, lane_q, &ain,
-                                                     i32b, i32ab, i64ab);
+                                                     i32b, i32ab, i64ab,
+                                                     &f32ab, attention_impl);
         if (!attn_out) return false;
-        if (!i32b.empty() || !i32ab.empty() || !i64ab.empty()) {
-            std::fprintf(stderr, "[ds4-fused-verify] layer %d dynamic bindings; cannot fuse\n", il);
+        if (!i32b.empty() || !i32ab.empty() || !i64ab.empty() ||
+            !f32ab.empty()) {
+            std::fprintf(stderr,
+                "[ds4-fused-verify] layer %d dynamic bindings "
+                "(%zu/%zu/%zu/%zu); cannot fuse\n",
+                il, i32b.size(), i32ab.size(), i64ab.size(), f32ab.size());
             return false;
         }
 
@@ -1206,14 +1223,20 @@ static int ds4_try_fused_verify_step(
     ds4_fv_set(fg->i32_bundle, i32v.data(), sizeof(int32_t) * i32v.size());
     ds4_fv_set(fg->i64_bundle, i64v.data(), sizeof(int64_t) * i64v.size());
 
-    // causal mask values
+    // Causal mask values.  At long context this tensor is multi-megabyte,
+    // while only the ring slots overwritten by this q-wide batch and the
+    // padded compressed tail change between verifier steps.  Build those
+    // negative spans directly.  Large masks are zeroed on the GPU, then only
+    // those negative spans cross the host/backend boundary.
     {
+        using MaskRange = std::pair<size_t, size_t>; // [begin, end)
         const size_t mask_count = (size_t) ggml_nelements(fg->mask_bundle);
         std::vector<float> & maskv = ex->mask_values;
-        if (maskv.size() != mask_count) {
-            maskv.resize(mask_count);
-        }
-        std::fill(maskv.begin(), maskv.end(), 0.0f);
+        std::vector<MaskRange> next_negative;
+        next_negative.reserve((size_t) w.n_layer * (size_t) q * 4u);
+        const auto add_range = [&](size_t begin, size_t end) {
+            if (begin < end) next_negative.emplace_back(begin, end);
+        };
         size_t off = 0;
         for (int il = 0; il < w.n_layer; ++il) {
             const int ratio = (int) w.compress_ratios[il];
@@ -1232,34 +1255,97 @@ static int ds4_try_fused_verify_step(
             const size_t n_attn = (size_t) w.n_swa + padded +
                                   (lane_q > 1 ? (size_t) lane_q : 0u);
             for (int i = 0; i < lane_q; ++i) {
-                float * col = maskv.data() + off + (size_t) i * n_attn;
+                const size_t col = off + (size_t) i * n_attn;
                 const int pos_i = lane_kv_start + i;
-                for (int r = 0; r < w.n_swa; ++r) {
-                    // position held by slot r AFTER this batch's ring writes
-                    const int p_r = (e <= w.n_swa) ? (r < e ? r : -1)
-                                  : (e - 1) - ((e - 1 - r) % w.n_swa);
-                    if (p_r < 0 || p_r > pos_i) col[r] = -1.0e30f;
+
+                // Raw ring after this batch's writes.  Before the ring fills,
+                // every slot after pos_i is invalid or future.  Afterwards,
+                // only the q-1-i future writes are hidden; their ring slots
+                // form one range, or two when they wrap.
+                if (e <= w.n_swa) {
+                    add_range(col + (size_t) (pos_i + 1),
+                              col + (size_t) w.n_swa);
+                } else {
+                    const int future = e - 1 - pos_i;
+                    if (future > 0) {
+                        const int begin = (pos_i + 1) % w.n_swa;
+                        const int first = std::min(future, w.n_swa - begin);
+                        add_range(col + (size_t) begin,
+                                  col + (size_t) (begin + first));
+                        add_range(col,
+                                  col + (size_t) (future - first));
+                    }
                 }
+
                 const int vis = (ratio > 0 && lc.comp_kv)
                               ? ds4_comp_rows_used(lc.comp_kv, lc.n_comp, ratio, pos_i) : 0;
-                for (int c = 0; c < padded; ++c) {
-                    if (c >= vis) col[(size_t) w.n_swa + c] = -1.0e30f;
-                }
+                add_range(col + (size_t) w.n_swa + (size_t) vis,
+                          col + (size_t) w.n_swa + (size_t) padded);
+
                 if (lane_q > 1) {
-                    for (int j = 0; j < lane_q; ++j) {
-                        const bool visible =
-                            (j > i) &&
-                            (lane_kv_start + j >= w.n_swa);
-                        if (!visible) {
-                            col[(size_t) w.n_swa + padded + j] = -1.0e30f;
-                        }
-                    }
+                    const int first_visible = std::max(
+                        i + 1, w.n_swa - lane_kv_start);
+                    const int masked = std::clamp(first_visible, 0, lane_q);
+                    add_range(col + (size_t) w.n_swa + (size_t) padded,
+                              col + (size_t) w.n_swa + (size_t) padded +
+                                  (size_t) masked);
                 }
             }
             off += n_attn * lane_q;
         }
-        GGML_ASSERT(off == maskv.size());
-        ds4_fv_set(fg->mask_bundle, maskv.data(), sizeof(float) * maskv.size());
+        GGML_ASSERT(off == mask_count);
+
+        const auto normalize_ranges = [](std::vector<MaskRange> & ranges) {
+            std::sort(ranges.begin(), ranges.end());
+            size_t out = 0;
+            for (const MaskRange & range : ranges) {
+                if (out > 0 && range.first <= ranges[out - 1].second) {
+                    ranges[out - 1].second = std::max(
+                        ranges[out - 1].second, range.second);
+                } else {
+                    ranges[out++] = range;
+                }
+            }
+            ranges.resize(out);
+        };
+        normalize_ranges(next_negative);
+
+        static const bool sparse_mask_update = [] {
+            const char * value = std::getenv(
+                "DFLASH_DS4_INCREMENTAL_VERIFY_MASK");
+            return !value || std::atoi(value) != 0;
+        }();
+        static const size_t sparse_mask_min_bytes = [] {
+            constexpr size_t default_bytes = 4u * 1024u * 1024u;
+            const char * value = std::getenv(
+                "DFLASH_DS4_INCREMENTAL_VERIFY_MASK_MIN_BYTES");
+            if (!value || !*value) return default_bytes;
+            const unsigned long long parsed = std::strtoull(value, nullptr, 10);
+            return parsed > 0 ? (size_t) parsed : default_bytes;
+        }();
+        const bool use_sparse_mask_update = sparse_mask_update &&
+            mask_count * sizeof(float) >= sparse_mask_min_bytes;
+        if (!use_sparse_mask_update) {
+            maskv.assign(mask_count, 0.0f);
+            for (const MaskRange & range : next_negative) {
+                std::fill(maskv.begin() + range.first,
+                          maskv.begin() + range.second, -1.0e30f);
+            }
+            ds4_fv_set(fg->mask_bundle, maskv.data(),
+                       sizeof(float) * maskv.size());
+        } else {
+            if (maskv.size() != mask_count) maskv.resize(mask_count);
+            ggml_backend_tensor_memset(
+                fg->mask_bundle, 0, 0, mask_count * sizeof(float));
+            for (const MaskRange & range : next_negative) {
+                std::fill(maskv.begin() + range.first,
+                          maskv.begin() + range.second, -1.0e30f);
+                ggml_backend_tensor_set(
+                    fg->mask_bundle, maskv.data() + range.first,
+                    range.first * sizeof(float),
+                    (range.second - range.first) * sizeof(float));
+            }
+        }
     }
 
     if (token_ids) {

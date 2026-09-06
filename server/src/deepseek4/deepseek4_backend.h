@@ -15,6 +15,7 @@
 #include "../common/moe_hybrid_stream.h"
 #include "deepseek4_internal.h"
 #include "deepseek4_dspark.h"
+#include "qwen3/qwen3_drafter.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -41,6 +42,15 @@ int deepseek4_hybrid_prefill_step_tokens(
     int configured_chunk,
     int position,
     int remaining_tokens);
+
+// Mixed ROCmFP MMQ changes the reduction/quantization topology, so only the
+// already-approximate prefill modes may select it automatically. The policy is
+// kept separate from the qtype kernels so future model backends can reuse the
+// same generic MMQ path after device-level qualification.
+bool deepseek4_mix_mmq_prefill_default(
+    PrefillAttentionMode mode,
+    const char * gcn_arch);
+
 class DeepSeek4Backend : public ModelBackend {
 public:
     explicit DeepSeek4Backend(const DeepSeek4BackendConfig & cfg);
@@ -70,6 +80,9 @@ public:
                                              const GenerateRequest & req,
                                              const DaemonIO & io) override;
 
+    CompressResult compress(const CompressRequest & req) override;
+    std::vector<CompressResult> compress_batch(
+        const std::vector<CompressRequest> & requests) override;
     bool handle_compress(const std::string & line,
                          const DaemonIO & io) override;
     void free_drafter() override;
@@ -114,12 +127,17 @@ private:
     ggml_backend_t                 spec_backend_ = nullptr;
     std::unique_ptr<DSparkDrafter> spec_drafter_;
     std::vector<float>             spec_feat_window_;
+    DrafterContext                 pflash_drafter_ctx_;
+    bool                           pflash_drafter_loaded_ = false;
+    std::string                    pflash_drafter_path_;
+    int                            pflash_drafter_gpu_ = -1;
     // Once a long prompt selects the fragmentation-safe prefill shape, retain
     // it for later requests so the HIP arenas never switch back under load.
     int                            hybrid_prefill_chunk_cap_ = 0;
 
     bool load_spec_drafter();
     void release_spec_drafter(bool mark_parked);
+    void release_pflash_drafter();
     void keep_spec_feature_tail(std::vector<float> & features,
                                 size_t max_rows) const;
     // True when a wide prefill path returns per-token DSpark features and the

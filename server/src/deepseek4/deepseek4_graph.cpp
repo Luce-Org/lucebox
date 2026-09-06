@@ -39,6 +39,7 @@
 #include <mutex>
 #include <functional>
 #include <limits>
+#include <utility>
 #include <vector>
 
 #if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
@@ -1878,11 +1879,14 @@ static ggml_tensor * build_mla_attention(
             : n_index_comp_live;
         ggml_tensor * index_visibility_mask = nullptr;
         if (masked_kv && n_index_comp > 0) {
-            index_visibility_mask = ggml_view_2d(
+            // The fused verifier stores one full attention-mask column per
+            // proposed token. Extract the compressed section for every token,
+            // then compact the strided view for the indexer scorer.
+            index_visibility_mask = ggml_cont(ctx, ggml_view_2d(
                 ctx, cached_inputs->attn_row_mask,
-                n_index_comp, 1,
-                (size_t) n_index_comp * sizeof(float),
-                (size_t) w.n_swa * sizeof(float));
+                n_index_comp, n_tokens,
+                cached_inputs->attn_row_mask->nb[1],
+                (size_t) w.n_swa * sizeof(float)));
         }
         indexer_topk = build_indexer_topk(
             ctx, qr, cur, w, L, index_comp_kv_source,
@@ -1954,18 +1958,21 @@ static ggml_tensor * build_mla_attention(
     } else {
         kv_attn = raw_kv_view(0, n_raw);
     }
-    const bool fused_explicit_f16_kv = w.fused_verify_f16_kv &&
+    const bool fused_verify_f16_kv = w.fused_verify_f16_kv &&
         masked_kv && n_tokens > 1 &&
-        attention_impl == DeepSeek4AttentionImpl::Explicit &&
         kv_attn->type == GGML_TYPE_F32 &&
         raw_kv_source->type == GGML_TYPE_F16 &&
         (!comp_kv_source || comp_kv_source->type == GGML_TYPE_F16) &&
         (!old_rows_scratch_f16 ||
          old_rows_scratch_f16->type == GGML_TYPE_F16);
-    if (fused_explicit_f16_kv) {
+    const bool fused_explicit_f16_kv = fused_verify_f16_kv &&
+        attention_impl == DeepSeek4AttentionImpl::Explicit;
+    const bool fused_sparse_f16_kv = fused_verify_f16_kv &&
+        attention_impl == DeepSeek4AttentionImpl::SparseFlash;
+    if (fused_explicit_f16_kv || fused_sparse_f16_kv) {
         // DS4's persistent MLA caches are already F16. Feed those tensors
-        // directly to the established explicit attention matmuls instead of
-        // casting the entire long-context cache to F32 on every verifier step.
+        // directly to the attention implementation instead of casting the
+        // entire long-context cache to F32 on every verifier step.
         // Current writes are consumed through their set_rows results, while
         // preserved overwritten rows retain the same cached F16 values.
         kv_attn = ggml_view_2d(
@@ -1981,12 +1988,15 @@ static ggml_tensor * build_mla_attention(
                 ctx, kv_attn, old_rows_scratch_f16, 1);
         }
         static std::atomic<bool> explicit_f16_kv_logged{false};
-        if (!explicit_f16_kv_logged.exchange(true)) {
+        static std::atomic<bool> sparse_f16_kv_logged{false};
+        std::atomic<bool> & logged = fused_sparse_f16_kv
+            ? sparse_f16_kv_logged : explicit_f16_kv_logged;
+        if (!logged.exchange(true)) {
             std::fprintf(stderr,
-                "[deepseek4] fused explicit F16 K/V active: tokens=%d "
+                "[deepseek4] fused %s F16 K/V active: tokens=%d "
                 "compressed=%d\n",
+                fused_sparse_f16_kv ? "sparse" : "explicit",
                 n_tokens, n_comp_attn);
-            explicit_f16_kv_logged = true;
         }
     } else {
         if (n_comp_attn > 0 && comp_kv_source) {
@@ -2007,12 +2017,12 @@ static ggml_tensor * build_mla_attention(
     // [n_kv,n_query] F16; the explicit path broadcasts the same values over
     // heads in F32.
     ggml_tensor * score_mask = nullptr;
-    const bool exact_two_band =
+    const bool exact_numerical_bands =
         attention_impl == DeepSeek4AttentionImpl::DenseFlash &&
         causal_batch &&
         n_tokens > DS4_NUMERICAL_PREFILL_BAND &&
-        n_tokens <= 2 * DS4_NUMERICAL_PREFILL_BAND;
-    if (!exact_two_band) {
+        n_tokens <= DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS;
+    if (!exact_numerical_bands) {
         if (masked_kv && n_tokens > 1) {
             score_mask = ggml_reshape_2d(ctx, cached_inputs->attn_row_mask,
                                          n_attn, n_tokens);
@@ -2082,8 +2092,9 @@ static ggml_tensor * build_mla_attention(
             score_mask = ggml_reshape_2d(ctx, cmask, n_attn, n_tokens);
         }
     }
-    const bool direct_indexer_topk = indexer_topk &&
-        ds4_env_flag("DFLASH_DS4_DIRECT_INDEXER_TOPK");
+    // Long sparse prefill already has the authoritative selected rows. Pass
+    // them through directly instead of materializing and rescanning a mask.
+    const bool direct_indexer_topk = indexer_topk && n_tokens > w.n_swa;
     if (indexer_topk) {
         if (!score_mask) {
             score_mask = ggml_new_tensor_2d(
@@ -2107,21 +2118,12 @@ static ggml_tensor * build_mla_attention(
     const bool use_flash = attention_impl != DeepSeek4AttentionImpl::Explicit &&
                            (n_tokens > 1 || indexer_topk != nullptr);
     if (use_flash) {
-        if (exact_two_band) {
-            // A larger scheduling band must retain the numerical topology of
-            // two 2K requests. Prefix queries use the first band's F32 raw KV;
-            // suffix queries see its final SWA tail after the same F16 cache
-            // round-trip. HC, projections and MoE still run once over the full
-            // token batch, avoiding a second expert-weight sweep.
-            const int first_count = DS4_NUMERICAL_PREFILL_BAND;
-            const int second_count = n_tokens - first_count;
-            const int first_comp = ratio > 0
-                ? ds4_comp_rows_used(lc.comp_kv, lc.n_comp, ratio,
-                                     kv_start + first_count - 1)
-                : 0;
-            const int second_comp = n_comp_live;
-            const int second_prior_count = std::min(first_count, w.n_swa);
-
+        if (exact_numerical_bands) {
+            // A larger scheduling batch retains the numerical topology of
+            // sequential 2K requests. Each later band sees the previous
+            // band's final SWA tail after the same F16 cache round-trip. HC,
+            // projections and MoE still run once over the full token batch,
+            // avoiding another expert-weight sweep.
             auto view_kv = [&](int first, int count) {
                 return ggml_view_2d(
                     ctx, kv, head_dim, count, kv->nb[1],
@@ -2203,36 +2205,53 @@ static ggml_tensor * build_mla_attention(
                     (size_t) first * q_fa->nb[1]);
             };
 
-            ggml_tensor * first_raw = ds4_cast_if_needed(
-                ctx, view_kv(0, first_count), GGML_TYPE_F32);
-            if (prior_rows_scratch) {
-                first_raw = ggml_concat(
-                    ctx, prior_rows_scratch, first_raw, 1);
+            for (int band_start = 0; band_start < n_tokens;
+                 band_start += DS4_NUMERICAL_PREFILL_BAND) {
+                const int band_count = std::min(
+                    DS4_NUMERICAL_PREFILL_BAND, n_tokens - band_start);
+                const int band_pos = kv_start + band_start;
+                const int band_prior_count = band_start == 0
+                    ? n_prior_rows
+                    : std::min(band_start, w.n_swa);
+                const int band_comp_count = ratio > 0
+                    ? ds4_comp_rows_used(
+                          lc.comp_kv, lc.n_comp, ratio,
+                          band_pos + band_count - 1)
+                    : 0;
+
+                ggml_tensor * band_raw = nullptr;
+                if (band_start == 0) {
+                    band_raw = ds4_cast_if_needed(
+                        ctx, view_kv(0, band_count), GGML_TYPE_F32);
+                    if (prior_rows_scratch) {
+                        band_raw = ggml_concat(
+                            ctx, prior_rows_scratch, band_raw, 1);
+                    }
+                } else {
+                    ggml_tensor * rounded_prior = ggml_cast(
+                        ctx,
+                        view_kv(band_start - band_prior_count,
+                                band_prior_count),
+                        GGML_TYPE_F16);
+                    rounded_prior = ggml_cast(
+                        ctx, rounded_prior, GGML_TYPE_F32);
+                    band_raw = ggml_concat(
+                        ctx, rounded_prior,
+                        view_kv(band_start, band_count), 1);
+                }
+
+                ggml_tensor * band_kv = append_comp(
+                    band_raw, band_comp_count);
+                ggml_tensor * band_mask = make_band_mask(
+                    band_pos, band_count, band_prior_count,
+                    band_comp_count);
+                ggml_tensor * band_context = make_flash(
+                    view_q(band_start, band_count), band_kv, band_mask,
+                    band_prior_count + band_count, band_pos);
+                context = context
+                    ? ggml_concat(ctx, context, band_context, 2)
+                    : band_context;
             }
-            ggml_tensor * first_kv = append_comp(first_raw, first_comp);
-            ggml_tensor * first_mask = make_band_mask(
-                kv_start, first_count, n_prior_rows, first_comp);
-            ggml_tensor * first_context = make_flash(
-                view_q(0, first_count), first_kv, first_mask,
-                n_prior_rows + first_count, kv_start);
-
-            ggml_tensor * rounded_prior = ggml_cast(
-                ctx, view_kv(first_count - second_prior_count,
-                             second_prior_count),
-                GGML_TYPE_F16);
-            rounded_prior = ggml_cast(ctx, rounded_prior, GGML_TYPE_F32);
-            ggml_tensor * second_raw = ggml_concat(
-                ctx, rounded_prior, view_kv(first_count, second_count), 1);
-            ggml_tensor * second_kv = append_comp(second_raw, second_comp);
-            ggml_tensor * second_mask = make_band_mask(
-                kv_start + first_count, second_count,
-                second_prior_count, second_comp);
-            ggml_tensor * second_context = make_flash(
-                view_q(first_count, second_count), second_kv, second_mask,
-                second_prior_count + second_count,
-                kv_start + first_count);
-
-            context = ggml_concat(ctx, first_context, second_context, 2);
             inverse_rope_fused = true;
         } else {
             // ggml FA convention: Q[D,T,H], K/V[D,K,Hkv]. DS4 MLA has one shared
@@ -2240,7 +2259,12 @@ static ggml_tensor * build_mla_attention(
             // The DS4 D=512 kernel consumes Q strides directly, avoiding a full
             // [D,H,T] -> [D,T,H] materialization for every layer.
             ggml_tensor * q_fa = ggml_permute(ctx, q, 0, 2, 1, 3);
-            ggml_tensor * kv_fa = ds4_cast_if_needed(ctx, kv_attn, GGML_TYPE_F32);
+            // The DS4 D=512 kernel has native F16 K/V specializations. Keep
+            // fused verifier caches in their persistent representation and
+            // avoid a full long-context F16 -> F32 conversion every step.
+            ggml_tensor * kv_fa = fused_sparse_f16_kv
+                ? kv_attn
+                : ds4_cast_if_needed(ctx, kv_attn, GGML_TYPE_F32);
             ggml_tensor * k_fa = ggml_reshape_3d(ctx, kv_fa, head_dim, n_attn, 1);
             ggml_tensor * v_fa = k_fa;
             ggml_tensor * mask_fa = score_mask
@@ -4826,7 +4850,8 @@ struct Ds4FusedVerifyCache {
         ggml_tensor * capture = nullptr;  // f32 [n_embd*ncap,q], token-major
         ggml_tensor * argmax = nullptr;   // i32 [q], optional greedy output
         // Reused host staging for the context-sized additive attention mask.
-        // Keeping it per slot removes one allocation from every verify step.
+        // Keeping it per slot removes allocation churn in both full and
+        // sparse-range mask update modes.
         std::vector<float> mask_values;
         int q = 0;
 

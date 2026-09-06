@@ -7,6 +7,7 @@
 
 #include <climits>
 #include <cstdint>
+#include <cstdlib>
 
 using namespace ggml_cuda_mma;
 
@@ -1061,17 +1062,53 @@ static __device__ __forceinline__ void load_tiles_rocmfpx_dual(
         }
 
         const block_t * block = (const block_t *) x + kbx0 + i*stride + kbx;
-        const int k0 = kbx*groups_per_block + group;
-        const int q0 = traits::pack4(block, 4*group);
-        const int q1 = traits::pack4(
-            block, 4*(group + groups_per_block/2));
+        int k0;
+        int q0;
+        int q1;
+        int q1_offset;
+        if constexpr (type == GGML_TYPE_Q3_0_ROCMFPX) {
+            // Eight FP3 weights occupy exactly three bytes. Assign adjacent
+            // four-value groups to one lane so the wave reads every packed
+            // byte once instead of overlapping the two-byte group windows.
+            const int byte = 3*group;
+#if defined(GGML_USE_HIP)
+            uint32_t packed32;
+            __builtin_memcpy(&packed32, block->qs + byte, sizeof(packed32));
+            const uint32_t bits24 = packed32 & 0x00ffffffu;
+#else
+            const uint32_t bits24 =
+                (uint32_t) block->qs[byte + 0] |
+                ((uint32_t) block->qs[byte + 1] << 8) |
+                ((uint32_t) block->qs[byte + 2] << 16);
+#endif
+            k0 = kbx*groups_per_block + 2*group;
+            q0 = rocmfpx_pack4_fp3_bits12_vec_cuda(bits24 & 0x0fffu);
+            q1 = rocmfpx_pack4_fp3_bits12_vec_cuda((bits24 >> 12) & 0x0fffu);
+            q1_offset = 1;
+        } else {
+            // FP2 stores each four-value group in one byte. Pair adjacent
+            // groups so HIP can issue one aligned 16-bit load per lane.
+            const int byte = 2*group;
+#if defined(GGML_USE_HIP)
+            uint16_t bits16;
+            __builtin_memcpy(&bits16, block->qs + byte, sizeof(bits16));
+#else
+            const uint16_t bits16 =
+                (uint16_t) block->qs[byte + 0] |
+                ((uint16_t) block->qs[byte + 1] << 8);
+#endif
+            k0 = kbx*groups_per_block + 2*group;
+            q0 = rocmfpx_pack4_fp2_bits8_vec_cuda(bits16 & 0x00ffu);
+            q1 = rocmfpx_pack4_fp2_bits8_vec_cuda((bits16 >> 8) & 0x00ffu);
+            q1_offset = 1;
+        }
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
         x_qs[i*MMQ_MMA_TILE_X_K_Q3_K + k0]                      = q0;
-        x_qs[i*MMQ_MMA_TILE_X_K_Q3_K + k0 + groups_per_block/2] = q1;
+        x_qs[i*MMQ_MMA_TILE_X_K_Q3_K + k0 + q1_offset]          = q1;
 #else
         x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0]                      = q0;
-        x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0 + groups_per_block/2] = q1;
+        x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0 + q1_offset]          = q1;
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
 
     }
@@ -1102,8 +1139,9 @@ static __device__ __forceinline__ void load_tiles_rocmfpx_dual(
 // qtype-107, but each expert supplies two learned four-level codebooks.  MMQ
 // needs int8 tiles, so quantize those tiny codebooks once per K tile, then fold
 // the codebook scale into the block's ordinary UE4M3 scale.  The additional
-// error is bounded to half an int8 step (measured below 0.4% of codebook range)
-// and this path is opt-in because sparse prefill is already approximate.
+// error is bounded to half an int8 step (measured below 0.4% of codebook range).
+// Backend policy selects this path only for prefill modes that are already
+// approximate; exact prefill retains the dequantize-to-F16 fallback.
 struct rocmfp2_mix_mmq_lut {
     int   packed[2];
     float scale[2];
@@ -4621,6 +4659,112 @@ static __global__ void mul_mat_q(
          mix_codebooks, mix_modes, fastdiv(zt, channel_ratio));
 }
 
+#if defined(GGML_USE_HIP)
+template <int mmq_x>
+static __global__ void mul_mat_q_moe_build_tasks(
+        const int32_t * __restrict__ expert_bounds,
+        int2 * __restrict__ tasks,
+        int * __restrict__ task_count,
+        int n_experts) {
+    const int expert = blockIdx.x*blockDim.x + threadIdx.x;
+    if (expert >= n_experts) {
+        return;
+    }
+    const int route_count =
+        expert_bounds[expert + 1] - expert_bounds[expert];
+    const int tile_count = (route_count + mmq_x - 1)/mmq_x;
+    if (tile_count == 0) {
+        return;
+    }
+    const int task_begin = atomicAdd(task_count, tile_count);
+    for (int tile = 0; tile < tile_count; ++tile) {
+        tasks[task_begin + tile] = make_int2(tile, expert);
+    }
+}
+
+// Sparse grouped MoE has a deliberately wide upper-bound grid: every expert
+// receives enough Y tiles for the full token batch even though only top-k
+// routes are live. Build a compact device-side task list, then keep a bounded
+// set of workgroups resident to consume only non-empty expert tiles. No host
+// count readback or synchronization is required.
+template <ggml_type type, int mmq_x, bool need_check>
+__launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), 1)
+static __global__ void mul_mat_q_moe_persistent(
+        const char * __restrict__ x,
+        const int * __restrict__ y,
+        const int32_t * __restrict__ ids_dst,
+        const int32_t * __restrict__ expert_bounds,
+        const nv_bfloat16 * __restrict__ mix_codebooks,
+        const uint8_t * __restrict__ mix_modes,
+        float * __restrict__ dst,
+        const int2 * __restrict__ tasks,
+        const int * __restrict__ task_count,
+        const uint3 blocks_per_ne00,
+        const int nrows_x,
+        const int stride_row_x,
+        const int ncols_y,
+        const int stride_col_dst,
+        const uint3 channel_ratio,
+        const int stride_channel_x) {
+    if (mmq_x > get_mmq_x_max_device() ||
+        mmq_x % mmq_get_granularity_device(mmq_x) != 0) {
+        NO_DEVICE_CODE;
+        return;
+    }
+
+    constexpr int nwarps = mmq_get_nwarps_device();
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int mmq_y = get_mmq_y_device();
+
+    extern __shared__ int ids_dst_shared[];
+    const int it = blockIdx.x;
+    const int total_tasks = *task_count;
+
+    for (int task_index = blockIdx.y; task_index < total_tasks;
+         task_index += gridDim.y) {
+        const int2 task = tasks[task_index];
+        const int jt = task.x;
+        const int zt = task.y;
+
+        const int col_low = expert_bounds[zt + 0];
+        const int col_high = expert_bounds[zt + 1];
+        const int col_diff = col_high - col_low;
+        if (jt*mmq_x >= col_diff) {
+            continue;
+        }
+
+        __syncthreads();
+#pragma unroll
+        for (int j0 = 0; j0 < mmq_x; j0 += nwarps*warp_size) {
+            const int j = j0 + threadIdx.y*warp_size + threadIdx.x;
+            if (j0 + nwarps*warp_size > mmq_x && j >= mmq_x) {
+                break;
+            }
+            ids_dst_shared[j] = ids_dst[col_low + jt*mmq_x + j];
+        }
+        __syncthreads();
+
+        const int offset_y =
+            (col_low + jt*mmq_x)*(sizeof(block_q8_1_mmq)/sizeof(int));
+        const int offset_dst = it*mmq_y;
+        const int offset_x =
+            fastdiv(zt, channel_ratio)*stride_channel_x +
+            it*mmq_y*stride_row_x;
+        const int tile_x_max_i = nrows_x - it*mmq_y - 1;
+        const int tile_y_max_j = col_diff - jt*mmq_x - 1;
+
+        constexpr bool fixup = false;
+        mul_mat_q_process_tile<type, mmq_x, need_check, fixup>(
+            x, offset_x, y + offset_y, ids_dst_shared,
+            dst + offset_dst, nullptr, stride_row_x, ncols_y,
+            stride_col_dst, tile_x_max_i, tile_y_max_j,
+            0, blocks_per_ne00.z, mix_codebooks, mix_modes,
+            fastdiv(zt, channel_ratio));
+        __syncthreads();
+    }
+}
+#endif
+
 template <ggml_type type, int mmq_x, bool need_check>
 __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device()/2, 1)
 static __global__ void mul_mat_q_stream_k_fixup(
@@ -4818,6 +4962,76 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const uint3 channel_ratio_fd   = init_fastdiv_values(channel_ratio);
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
 
+#if defined(GGML_USE_HIP)
+    if constexpr (type == GGML_TYPE_Q2_0_ROCMFP2 ||
+                  type == GGML_TYPE_Q3_0_ROCMFPX ||
+                  type == GGML_TYPE_Q4_0_ROCMFP4_FAST) {
+        const char * persistent_env =
+            std::getenv("GGML_CUDA_MMQ_MOE_PERSISTENT");
+        const bool persistent_enabled = persistent_env && *persistent_env &&
+            !(persistent_env[0] == '0' && persistent_env[1] == '\0');
+        // The compact queue amortizes its builder and bounded-worker launch at
+        // prefill widths. Below 256 source columns the ordinary grouped grid is
+        // already efficient, and is marginally faster for some formats.
+        if (persistent_enabled && args.ncols_max >= 256 && !args.use_stream_k &&
+            args.ids_dst != nullptr && args.expert_bounds != nullptr &&
+            args.nsamples_y == 1 &&
+            cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151) {
+            int blocks_per_cu = 32;
+            if (const char * raw =
+                    std::getenv("GGML_CUDA_MMQ_MOE_PERSISTENT_BLOCKS_PER_CU")) {
+                const int parsed = std::atoi(raw);
+                if (parsed >= 1 && parsed <= 32) {
+                    blocks_per_cu = parsed;
+                }
+            }
+            ggml_cuda_pool_alloc<int2> tasks(ctx.pool(), args.ncols_y);
+            ggml_cuda_pool_alloc<int> task_count(ctx.pool(), 1);
+            CUDA_CHECK(cudaMemsetAsync(
+                task_count.get(), 0, sizeof(int), stream));
+            constexpr int task_builder_threads = 256;
+            const int task_builder_blocks =
+                (args.nchannels_y + task_builder_threads - 1)/
+                task_builder_threads;
+            mul_mat_q_moe_build_tasks<mmq_x>
+                <<<task_builder_blocks, task_builder_threads, 0, stream>>>(
+                    args.expert_bounds, tasks.get(), task_count.get(),
+                    args.nchannels_y);
+
+            const int workers = std::max(
+                1, std::min((int) args.ncols_y, nsm*blocks_per_cu));
+            const dim3 persistent_grid(nty, workers, 1);
+            CUDA_SET_SHARED_MEMORY_LIMIT(
+                (mul_mat_q_moe_persistent<type, mmq_x, false>),
+                nbytes_shared);
+            CUDA_SET_SHARED_MEMORY_LIMIT(
+                (mul_mat_q_moe_persistent<type, mmq_x, true>),
+                nbytes_shared);
+            if (args.nrows_x % mmq_y == 0) {
+                mul_mat_q_moe_persistent<type, mmq_x, false>
+                    <<<persistent_grid, block_dims, nbytes_shared, stream>>>(
+                        args.x, args.y, args.ids_dst, args.expert_bounds,
+                        args.mix_codebooks, args.mix_modes, args.dst,
+                        tasks.get(), task_count.get(),
+                        blocks_per_ne00_fd, args.nrows_x, args.stride_row_x,
+                        args.ncols_y, args.nrows_dst, channel_ratio_fd,
+                        args.stride_channel_x);
+            } else {
+                mul_mat_q_moe_persistent<type, mmq_x, true>
+                    <<<persistent_grid, block_dims, nbytes_shared, stream>>>(
+                        args.x, args.y, args.ids_dst, args.expert_bounds,
+                        args.mix_codebooks, args.mix_modes, args.dst,
+                        tasks.get(), task_count.get(),
+                        blocks_per_ne00_fd, args.nrows_x, args.stride_row_x,
+                        args.ncols_y, args.nrows_dst, channel_ratio_fd,
+                        args.stride_channel_x);
+            }
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+    }
+#endif
+
     if (!args.use_stream_k) {
         if (args.nrows_x % mmq_y == 0) {
             constexpr bool need_check = false;
@@ -4921,7 +5135,52 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
     int mmq_x_best  = 0;
     int ntiles_x_best = INT_MAX;
 
-    for (int mmq_x = 8; mmq_x <= mmq_x_max && ntiles_x_best > 1; mmq_x += 8) {
+    static const int forced_mmq_x = []() {
+        const char * raw = std::getenv("GGML_CUDA_MMQ_X");
+        if (!raw || !*raw) return 0;
+        char * end = nullptr;
+        const long parsed = std::strtol(raw, &end, 10);
+        return end && end != raw && *end == '\0' && parsed >= 8 &&
+                parsed <= 128 && parsed % 8 == 0
+            ? (int)parsed : 0;
+    }();
+    static const bool adaptive_moe_x_enabled = []() {
+        const char * raw = std::getenv("GGML_CUDA_MMQ_MOE_ADAPTIVE_X");
+        return raw && *raw && !(raw[0] == '0' && raw[1] == '\0');
+    }();
+    int requested_mmq_x = forced_mmq_x;
+    if (requested_mmq_x == 0 && adaptive_moe_x_enabled &&
+        cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151 &&
+        args.expert_bounds != nullptr && args.nchannels_x > 0) {
+        // Grouped MoE routes are sparse across experts. Sizing the X tile from
+        // the full token width makes almost every workgroup carry padding. Use
+        // the mean live-route density as a model-neutral trigger, then select
+        // the measured gfx1151 tile for each unpack format. The grid still
+        // spans ncols_max, so skewed experts remain fully covered.
+        const int64_t routes_per_expert =
+            (args.ncols_y + args.nchannels_x - 1) / args.nchannels_x;
+        if (routes_per_expert <= 16) {
+            switch (type) {
+                case GGML_TYPE_Q2_0_ROCMFP2:      requested_mmq_x = 32; break;
+                case GGML_TYPE_Q3_0_ROCMFPX:      requested_mmq_x = 48; break;
+                case GGML_TYPE_Q4_0_ROCMFP4_FAST: requested_mmq_x = 16; break;
+                default: break;
+            }
+        }
+    }
+    if (requested_mmq_x > 0 && requested_mmq_x <= mmq_x_max) {
+        const int granularity = mmq_get_granularity_host(requested_mmq_x, cc);
+        if (requested_mmq_x % granularity == 0 &&
+            mmq_get_nbytes_shared<type>(
+                requested_mmq_x, mmq_y, cc, warp_size, nwarps) <= smpbo) {
+            mmq_x_best = requested_mmq_x;
+            ntiles_x_best = 1;
+        }
+    }
+
+    for (int mmq_x = 8;
+         mmq_x_best == 0 && mmq_x <= mmq_x_max && ntiles_x_best > 1;
+         mmq_x += 8) {
         const int granularity = mmq_get_granularity_host(mmq_x, cc);
 
         if (mmq_x % granularity != 0 || mmq_get_nbytes_shared<type>(mmq_x, mmq_y, cc, warp_size, nwarps) > smpbo) {

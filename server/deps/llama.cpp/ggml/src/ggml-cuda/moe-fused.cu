@@ -4,6 +4,8 @@
 #include "ggml-cuda/mmvq.cuh"
 
 #include <climits>
+#include <cstdint>
+#include <cstdlib>
 #include <cstring>
 
 static __device__ __forceinline__ float silu_f32(float x) {
@@ -310,6 +312,115 @@ static __global__ void laguna_moe_combine_kernel(
         (size_t)t * output_nb1) = sum;
 }
 
+static __global__ void moe_combine_vec4_kernel(
+    const char * __restrict__ experts,
+    const char * __restrict__ weights,
+    char * __restrict__ output,
+    const int n_embd_vec4,
+    const int n_used,
+    const int n_tokens,
+    const size_t experts_nb1,
+    const size_t experts_nb2,
+    const size_t weights_nb0,
+    const size_t weights_nb1,
+    const size_t output_nb1,
+    const float value_scale) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = n_embd_vec4 * n_tokens;
+    if (idx >= total) return;
+
+    const int h4 = idx % n_embd_vec4;
+    const int t = idx / n_embd_vec4;
+    float4 sum = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    for (int e = 0; e < n_used; ++e) {
+        const float w = *(const float *)(weights +
+            (size_t)e * weights_nb0 +
+            (size_t)t * weights_nb1);
+        if (w == 0.0f) {
+            if (e == 0) sum = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            continue;
+        }
+        const float4 value = *(const float4 *)(experts +
+            (size_t)h4 * sizeof(float4) +
+            (size_t)e * experts_nb1 +
+            (size_t)t * experts_nb2);
+        const float4 scaled = value_scale == 1.0f
+            ? value
+            : make_float4(
+                __fmul_rn(value.x, value_scale),
+                __fmul_rn(value.y, value_scale),
+                __fmul_rn(value.z, value_scale),
+                __fmul_rn(value.w, value_scale));
+        const float4 product = make_float4(
+            __fmul_rn(scaled.x, w),
+            __fmul_rn(scaled.y, w),
+            __fmul_rn(scaled.z, w),
+            __fmul_rn(scaled.w, w));
+        if (e == 0) {
+            sum = product;
+        } else {
+            sum.x = __fadd_rn(sum.x, product.x);
+            sum.y = __fadd_rn(sum.y, product.y);
+            sum.z = __fadd_rn(sum.z, product.z);
+            sum.w = __fadd_rn(sum.w, product.w);
+        }
+    }
+    *(float4 *)(output +
+        (size_t)h4 * sizeof(float4) +
+        (size_t)t * output_nb1) = sum;
+}
+
+static void launch_moe_combine(
+        cudaStream_t stream,
+        const char * experts,
+        const char * weights,
+        char * output,
+        int n_embd,
+        int n_used,
+        int n_tokens,
+        size_t experts_nb0,
+        size_t experts_nb1,
+        size_t experts_nb2,
+        size_t weights_nb0,
+        size_t weights_nb1,
+        size_t output_nb0,
+        size_t output_nb1,
+        float value_scale) {
+    static const bool vec4_requested = []() {
+        const char * raw = std::getenv("DFLASH_MOE_COMBINE_VEC4");
+        return raw && *raw && std::strcmp(raw, "0") != 0;
+    }();
+    static_assert(sizeof(float4) == 4 * sizeof(float));
+    constexpr size_t vec4_alignment = sizeof(float4);
+    const bool aligned =
+        (reinterpret_cast<uintptr_t>(experts) % vec4_alignment) == 0 &&
+        (reinterpret_cast<uintptr_t>(output) % vec4_alignment) == 0 &&
+        experts_nb1 % vec4_alignment == 0 &&
+        experts_nb2 % vec4_alignment == 0 &&
+        output_nb1 % vec4_alignment == 0;
+    const bool use_vec4 = vec4_requested && n_embd % 4 == 0 && aligned &&
+        experts_nb0 == sizeof(float) && output_nb0 == sizeof(float);
+    constexpr int block = 256;
+    if (use_vec4) {
+        const int n_embd_vec4 = n_embd / 4;
+        const int total = n_embd_vec4 * n_tokens;
+        const int grid = (total + block - 1) / block;
+        moe_combine_vec4_kernel<<<grid, block, 0, stream>>>(
+            experts, weights, output, n_embd_vec4, n_used, n_tokens,
+            experts_nb1, experts_nb2, weights_nb0, weights_nb1,
+            output_nb1, value_scale);
+        return;
+    }
+
+    const int total = n_embd * n_tokens;
+    const int grid = (total + block - 1) / block;
+    laguna_moe_combine_kernel<<<grid, block, 0, stream>>>(
+        experts, weights, output, n_embd, n_used, n_tokens,
+        experts_nb0, experts_nb1, experts_nb2,
+        weights_nb0, weights_nb1, output_nb0, output_nb1,
+        value_scale);
+}
+
 static __global__ void ds4_peer_copy_f32_kernel(
         const float * __restrict__ src,
         float * __restrict__ dst,
@@ -561,10 +672,8 @@ static void ggml_cuda_op_ds4_moe_owner(
     ggml_cuda_mul_mat_vec_q(
         ctx, down_w, &gu, expert_ids, &experts, nullptr);
 
-    const int total = n_embd * n_tokens;
-    const int block = 256;
-    const int grid = (total + block - 1) / block;
-    laguna_moe_combine_kernel<<<grid, block, 0, ctx.stream()>>>(
+    launch_moe_combine(
+        ctx.stream(),
         (const char *) experts.data,
         (const char *) weights->data,
         (char *) dst->data,
@@ -634,10 +743,8 @@ static void ggml_cuda_op_ds4_moe_owner_split(
     ggml_cuda_mul_mat_vec_q(
         ctx, down_w, &gu, expert_ids, &experts, nullptr);
 
-    const int total = n_embd * n_tokens;
-    const int block = 256;
-    const int grid = (total + block - 1) / block;
-    laguna_moe_combine_kernel<<<grid, block, 0, ctx.stream()>>>(
+    launch_moe_combine(
+        ctx.stream(),
         (const char *) experts.data,
         (const char *) weights->data,
         (char *) dst->data,
@@ -760,11 +867,8 @@ void ggml_cuda_op_moe_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         const int n_embd   = (int) experts->ne[0];
         const int n_used   = (int) experts->ne[1];
         const int n_tokens = (int) experts->ne[2];
-        const int total = n_embd * n_tokens;
-
-        const int block = 256;
-        const int grid = (total + block - 1) / block;
-        laguna_moe_combine_kernel<<<grid, block, 0, ctx.stream()>>>(
+        launch_moe_combine(
+            ctx.stream(),
             (const char *) experts->data,
             (const char *) weights->data,
             (char *) dst->data,

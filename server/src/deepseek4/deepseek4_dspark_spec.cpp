@@ -25,6 +25,7 @@
 #include "deepseek4_internal.h"
 #include "deepseek4_roctx.h"
 #include "internal.h"
+#include "common/adaptive_spec_width.h"
 #include "common/dspark_head.h"
 
 #include "ggml.h"
@@ -704,27 +705,19 @@ bool run_deepseek4_dspark_spec_decode(
             "[ds4-spec] draft overlap probe requested without an independent "
             "in-process backend; probe disabled\n");
     }
-    // Laguna-style adaptive verify width: EWMA of accepted candidates, width =
-    // ewma + 2 (avg_commit << block means the wide tail is usually wasted).
-    // Keep this process-local: a shared filesystem control would let an
-    // unrelated user or benchmark change live inference behavior.
-    bool adaptive_width = true;
+    // Shared adaptive verify width is opt-in. The DS4-specific setting wins
+    // over the global setting so one backend can be qualified in isolation.
+    bool adaptive_width = adaptive_spec_width_globally_enabled();
     if (const char * raw = std::getenv("DFLASH_DS4_ADAPTIVE_WIDTH")) {
         adaptive_width = raw[0] && std::strcmp(raw, "0") != 0;
     }
-    // The adaptive policy was calibrated only through q=4. Q5 is an explicit
-    // fixed-width mode and must not be silently narrowed.
-    if (q5_verify) {
-        adaptive_width = false;
-    }
+    // The confidence artifact was calibrated through q=4. Q5 still adapts,
+    // but uses target acceptance feedback rather than extrapolating that head.
     const bool use_confidence_width = adaptive_width && !seq_verify_mode &&
+        !q5_verify &&
         drafter.confidence_w != nullptr && drafter.confidence_b != nullptr &&
         (drafter.confidence_dim == n_embd ||
          drafter.confidence_dim == n_embd + drafter.markov_rank);
-    if (timing && use_confidence_width) {
-        std::fprintf(stderr, "[ds4-spec] adaptive width policy=confidence\n");
-    }
-    double ewma_accept = 1.5;
 
     // The conservative fast path remains capped at the compression ratio.
     // The explicit wide path handles a second ratio-4 boundary in-graph and
@@ -749,6 +742,14 @@ bool run_deepseek4_dspark_spec_decode(
                      DS4_CONSERVATIVE_VERIFY_MAX_TOKENS, q_cap,
                      DS4_CONSERVATIVE_VERIFY_MAX_TOKENS);
         q_cap = DS4_CONSERVATIVE_VERIFY_MAX_TOKENS;
+    }
+    AdaptiveSpecWidth width_controller(
+        q_cap, 2, adaptive_width && !seq_verify_mode);
+    if (timing && width_controller.enabled()) {
+        std::fprintf(stderr, "[ds4-spec] adaptive width policy=%s\n",
+                     use_confidence_width
+                         ? "confidence (acceptance fallback)"
+                         : "acceptance");
     }
 
     // Snapshot backend for the legacy full-snapshot rollback path.
@@ -883,9 +884,12 @@ bool run_deepseek4_dspark_spec_decode(
                        : std::min(
                              q_cap,
                              DS4_CONSERVATIVE_VERIFY_MAX_TOKENS - (pos & 3));
-        if (adaptive_width && !use_confidence_width && !seq_verify_mode) {
-            const int w_cap = (int) ewma_accept + 2;
-            if (w_cap < q_step_cap) q_step_cap = w_cap;
+        // A calibrated confidence head already predicts this individual
+        // step. Do not stack the slower acceptance-regime cap on top of it;
+        // acceptance feedback remains the fallback and drives q5/artifacts
+        // without confidence metadata.
+        if (!use_confidence_width) {
+            q_step_cap = width_controller.next_width(q_step_cap);
         }
         if (q_step_cap >= 2) {
             std::memcpy(padded_hidden.data() + n_embd, local_hidden.data(),
@@ -938,10 +942,10 @@ bool run_deepseek4_dspark_spec_decode(
             }
             if ((int) draft_tok.size() > selected_q) draft_tok.resize((size_t) selected_q);
         } else if (use_confidence_width && !seq_verify_mode) {
-            // The fused head should always return confidence for a compatible
-            // artifact. Preserve the old policy if a backend cannot do so.
-            const int selected_q = (int) ewma_accept + 2;
-            if ((int) draft_tok.size() > selected_q) draft_tok.resize((size_t) selected_q);
+            const int selected_q = width_controller.next_width((int)draft_tok.size());
+            if ((int)draft_tok.size() > selected_q) {
+                draft_tok.resize((size_t)selected_q);
+            }
         }
         if ((int) draft_tok.size() > q_step_cap) draft_tok.resize(q_step_cap);
         const int q = (int) draft_tok.size();   // seed + candidates
@@ -1129,7 +1133,7 @@ bool run_deepseek4_dspark_spec_decode(
         lt = bonus;                    // deferred bonus becomes next seed
         accept_sum += matched;
         offered_sum += q - 1;
-        ewma_accept = 0.7 * ewma_accept + 0.3 * (double) matched;
+        width_controller.observe(accept, q);
         steps++;
         if (timing && (steps <= 4 || (steps & 31) == 0)) {
             std::fprintf(stderr,

@@ -1319,6 +1319,161 @@ static void topk_block_radix_cuda(
     CUDA_CHECK(cudaGetLastError());
 }
 
+// Long-context DS4 indexer shape: select 512 compressed KV rows from as many
+// as 32K scores. A full segmented sort materializes and orders every score even
+// though only 512 survive. Instead, select 512 candidates independently from
+// each 4K tile, then select the final 512 from the at-most-4K candidates. Any
+// global top-512 element must be in its tile's local top 512, so this is exact.
+//
+// Both stages retain the original global indices as values. TOP_K only requires
+// the selected set; ordering among equal scores is intentionally unspecified.
+// Keeping tiles and candidates in increasing source order nevertheless gives
+// BlockRadixSort the same natural tie order as the flat input.
+template <int ITEMS_PER_THREAD>
+static __global__ void k_topk_block_radix_tiles_f32_i32(
+        const float * x,
+        int         * candidates,
+        int           ncols,
+        int           ntiles,
+        int           k) {
+    constexpr int BLOCK_THREADS = 256;
+    constexpr int TILE_COLS = BLOCK_THREADS * ITEMS_PER_THREAD;
+    using block_sort = hipcub::BlockRadixSort<
+        uint32_t, BLOCK_THREADS, ITEMS_PER_THREAD, int>;
+    __shared__ typename block_sort::TempStorage storage;
+
+    const int tile_block = (int) blockIdx.x;
+    const int row = tile_block / ntiles;
+    const int tile = tile_block - row * ntiles;
+    const int tile_begin = tile * TILE_COLS;
+    const int first = tile_begin + (int) threadIdx.x * ITEMS_PER_THREAD;
+    const float * x_row = x + (size_t) row * ncols;
+    uint32_t keys[ITEMS_PER_THREAD];
+    int indices[ITEMS_PER_THREAD];
+#pragma unroll
+    for (int item = 0; item < ITEMS_PER_THREAD; ++item) {
+        const int col = first + item;
+        if (col < ncols) {
+            const uint32_t bits = (uint32_t) __float_as_int(x_row[col]);
+            const uint32_t ordered = (bits & 0x80000000u)
+                ? ~bits : (bits ^ 0x80000000u);
+            keys[item] = ordered == 0 ? 1 : ordered;
+        } else {
+            keys[item] = 0;
+        }
+        indices[item] = col;
+    }
+
+    block_sort(storage).SortDescending(keys, indices);
+
+#pragma unroll
+    for (int item = 0; item < ITEMS_PER_THREAD; ++item) {
+        const int rank = (int) threadIdx.x * ITEMS_PER_THREAD + item;
+        if (rank < k) {
+            candidates[((size_t) row * ntiles + tile) * k + rank] = indices[item];
+        }
+    }
+}
+
+template <int ITEMS_PER_THREAD>
+static __global__ void k_topk_block_radix_merge_f32_i32(
+        const float * x,
+        const int   * candidates,
+        int         * dst,
+        int           ncols,
+        int           ncandidates,
+        int           k) {
+    constexpr int BLOCK_THREADS = 256;
+    using block_sort = hipcub::BlockRadixSort<
+        uint32_t, BLOCK_THREADS, ITEMS_PER_THREAD, int>;
+    __shared__ typename block_sort::TempStorage storage;
+
+    const int row = (int) blockIdx.x;
+    const int first = (int) threadIdx.x * ITEMS_PER_THREAD;
+    const float * x_row = x + (size_t) row * ncols;
+    const int * candidate_row = candidates + (size_t) row * ncandidates;
+    uint32_t keys[ITEMS_PER_THREAD];
+    int indices[ITEMS_PER_THREAD];
+#pragma unroll
+    for (int item = 0; item < ITEMS_PER_THREAD; ++item) {
+        const int rank = first + item;
+        if (rank < ncandidates) {
+            const int col = candidate_row[rank];
+            if (col < ncols) {
+                const uint32_t bits = (uint32_t) __float_as_int(x_row[col]);
+                const uint32_t ordered = (bits & 0x80000000u)
+                    ? ~bits : (bits ^ 0x80000000u);
+                keys[item] = ordered == 0 ? 1 : ordered;
+                indices[item] = col;
+            } else {
+                // The final 4K tile may contain fewer than k real columns.
+                // Its local selection then contains padded indices; keep them
+                // below every real score and never dereference them.
+                keys[item] = 0;
+                indices[item] = ncols;
+            }
+        } else {
+            keys[item] = 0;
+            indices[item] = ncols;
+        }
+    }
+
+    block_sort(storage).SortDescending(keys, indices);
+
+#pragma unroll
+    for (int item = 0; item < ITEMS_PER_THREAD; ++item) {
+        const int rank = first + item;
+        if (rank < k) {
+            dst[(size_t) row * k + rank] = indices[item];
+        }
+    }
+}
+
+static void topk_hierarchical_block_radix_cuda(
+        ggml_cuda_pool & pool,
+        const float  * x,
+        int          * dst,
+        int            ncols,
+        int            nrows,
+        int            k,
+        cudaStream_t   stream) {
+    constexpr int TILE_COLS = 4096;
+    constexpr int TILE_ITEMS_PER_THREAD = 16;
+    const int ntiles = (ncols + TILE_COLS - 1) / TILE_COLS;
+    const int ncandidates = ntiles * k;
+
+    GGML_ASSERT(k == 512);
+    GGML_ASSERT(ntiles >= 2 && ntiles <= 8);
+    ggml_cuda_pool_alloc<int> candidates_alloc(
+        pool, (size_t) nrows * ncandidates);
+    int * candidates = candidates_alloc.get();
+
+    const dim3 tile_blocks((unsigned) (nrows * ntiles), 1, 1);
+    constexpr int threads = 256;
+    k_topk_block_radix_tiles_f32_i32<TILE_ITEMS_PER_THREAD>
+        <<<tile_blocks, threads, 0, stream>>>(
+            x, candidates, ncols, ntiles, k);
+
+    const dim3 merge_blocks((unsigned) nrows, 1, 1);
+    if (ntiles <= 2) {
+        k_topk_block_radix_merge_f32_i32<4><<<merge_blocks, threads, 0, stream>>>(
+            x, candidates, dst, ncols, ncandidates, k);
+    } else if (ntiles <= 3) {
+        k_topk_block_radix_merge_f32_i32<6><<<merge_blocks, threads, 0, stream>>>(
+            x, candidates, dst, ncols, ncandidates, k);
+    } else if (ntiles <= 4) {
+        k_topk_block_radix_merge_f32_i32<8><<<merge_blocks, threads, 0, stream>>>(
+            x, candidates, dst, ncols, ncandidates, k);
+    } else if (ntiles <= 6) {
+        k_topk_block_radix_merge_f32_i32<12><<<merge_blocks, threads, 0, stream>>>(
+            x, candidates, dst, ncols, ncandidates, k);
+    } else {
+        k_topk_block_radix_merge_f32_i32<16><<<merge_blocks, threads, 0, stream>>>(
+            x, candidates, dst, ncols, ncandidates, k);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 #endif  // GGML_CUDA_USE_HIPCUB
 
 void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -1345,10 +1500,23 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     }
 #elif defined(GGML_CUDA_USE_CUB) || defined(GGML_CUDA_USE_HIPCUB)  // CUB_TOP_K_AVAILABLE
 #ifdef GGML_CUDA_USE_HIPCUB
-    if (ds4_env_flag_enabled("GGML_DS4_TOPK_BLOCK_RADIX") &&
-        k == 512 && ncols > 1024 && ncols <= 5120) {
-        topk_block_radix_cuda(
-            src0_d, dst_d, (int) ncols, (int) nrows, (int) k, stream);
+    const char * block_radix_env = getenv("GGML_DS4_TOPK_BLOCK_RADIX");
+    const int block_radix_cc =
+        ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const bool block_radix_default =
+        block_radix_cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151;
+    const bool block_radix_enabled = block_radix_env
+        ? block_radix_env[0] != '\0' && strcmp(block_radix_env, "0") != 0
+        : block_radix_default;
+    if (block_radix_enabled &&
+        k == 512 && ncols > 1024 && ncols <= 32768) {
+        if (ncols <= 5120) {
+            topk_block_radix_cuda(
+                src0_d, dst_d, (int) ncols, (int) nrows, (int) k, stream);
+        } else {
+            topk_hierarchical_block_radix_cuda(
+                pool, src0_d, dst_d, (int) ncols, (int) nrows, (int) k, stream);
+        }
         return;
     }
 #endif

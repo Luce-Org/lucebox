@@ -697,6 +697,7 @@ void test_model_capability_tables() {
     CHECK(!arch_has_expert_offload("qwen35"));
     // deepseek4 is mixture-of-experts but has no hot/cold offload path.
     CHECK(!arch_has_expert_offload("deepseek4"));
+    CHECK(arch_supports_pflash_compression("deepseek4"));
 
     // Every capability predicate must be false for an architecture the
     // factory cannot build, so no rule can admit an unbuildable model.
