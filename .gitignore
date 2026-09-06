@@ -59,6 +59,8 @@ env/
 bench-out/
 dflash/bench/results/
 profile-out/
+context-gemma4-*.json
+verify-gemma4-*.json
 
 # Model weights and caches (pull fresh from HF)
 weights/
