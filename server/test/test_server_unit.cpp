@@ -2587,6 +2587,58 @@ TEST_CASE(ServerUnitFixture, test_tool_schema_is_part_of_stable_system_boundary)
                 hash_prefix(prompt_new_tools.data(), system_end));
 }
 
+TEST_CASE(ServerUnitFixture, test_find_boundaries_stray_end_msg_does_not_truncate) {
+    // A lone end-of-message marker embedded in message content (file dumps,
+    // terminal output, model-echoed chatml) must not truncate the boundary
+    // walk. Before the fix, the first stray \n with no role start within 5
+    // tokens cut the scan off, hiding every real boundary after it and pinning
+    // the inline-snapshot deepen target at the already-restored prefix length.
+    //
+    // Layout (qwen-shaped synthetic markers):
+    //   10=<|im_start|>  11="system"  12=<|im_end|>
+    //   idx: 0:10 1:11 2:100 3:12 4:10 5:20 6:200 7:12(stray) 8:600 9:601
+    //         10:602 11:603 12:604 13:12 14:10 15:30 16:300 17:12 18:10 19:40 20:400
+    // The stray 12 at idx 7 has five content tokens before the next real <|im_end|>
+    // (idx 13), so its 5-token window holds no <|im_start|>.
+    ChatMarkers markers;
+    markers.family = "qwen";
+    markers.sys_role_prefix = {10, 11};
+    markers.end_msg_seqs = {{12}};
+    markers.next_role_starts = {{10}};
+
+    const std::vector<int32_t> prompt = {
+        10, 11, 100, 12, 10, 20, 200,
+        12,             // stray <|im_end|> in user content
+        600, 601, 602, 603, 604,
+        12,             // real end of the user message
+        10, 30, 300, 12, 10, 40, 400,
+    };
+
+    const auto bounds = find_all_boundaries(prompt, markers);
+    // Real boundaries after the stray (assistant start = 15, final user start =
+    // 19) must be found; the stable system head (5) is unchanged.
+    TEST_ASSERT(bounds == (std::vector<int>{5, 15, 19}));
+    TEST_ASSERT(bounds.front() == 5);
+}
+
+TEST_CASE(ServerUnitFixture, test_find_boundaries_clean_prompt_unchanged) {
+    // A clean prompt (no stray markers) must produce the identical boundary
+    // list as before the fix — the stray-skip path must never alter correct
+    // prompts.
+    ChatMarkers markers;
+    markers.family = "qwen";
+    markers.sys_role_prefix = {10, 11};
+    markers.end_msg_seqs = {{12}};
+    markers.next_role_starts = {{10}};
+
+    //  system content  user content  assistant content  user2
+    const std::vector<int32_t> prompt = {
+        10, 11, 100, 101, 12, 10, 20, 200, 12, 10, 30, 300, 12, 10, 40,
+    };
+    const auto bounds = find_all_boundaries(prompt, markers);
+    TEST_ASSERT(bounds == (std::vector<int>{6, 10, 14}));
+}
+
 TEST_CASE(ServerUnitFixture, test_inline_snapshot_boundary_advances_past_restore) {
     const std::vector<int> boundaries = {100, 240, 380, 520};
     // Second-to-last is the boundary before the current user turn.
@@ -2844,6 +2896,203 @@ TEST_CASE(ServerUnitFixture, test_evict_all_protected_falls_back) {
     std::vector<std::vector<int32_t>> ids = {{1, 1}, {2, 2}};
     std::vector<bool> protect = {true, true};
     TEST_ASSERT(select_inline_evict_victim(ids, &protect) == 0);
+}
+
+// ── Restore-source-aware eviction (prefix-cache slide) ─────────────────
+
+// (a) Linear chain at capacity: the new snapshot must land in a different
+// slot than the restore source, so the restore point can slide forward past
+// the deepest slot.
+TEST_CASE(ServerUnitFixture, test_slide_evicts_ancestor_not_restore_source) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    PrefixCache cache(4, tokenizer);
+    TEST_ASSERT(!cache.disabled());
+
+    // Linear chain: each prompt strictly extends the previous one.
+    std::vector<int32_t> p1 = {1, 100, 4, 101};
+    std::vector<int32_t> p2 = p1;
+    p2.insert(p2.end(), {3, 102});
+    std::vector<int32_t> p3 = p2;
+    p3.insert(p3.end(), {4, 103});
+    std::vector<int32_t> p4 = p3;
+    p4.insert(p4.end(), {3, 104});
+
+    auto fill = [&](const std::vector<int32_t> & p) {
+        const auto prepared = cache.prepare_inline_snap(
+            p, 0, false, (int) p.size());
+        TEST_ASSERT(prepared.first >= 0);
+        TEST_ASSERT(prepared.second == (int) p.size());
+        cache.confirm_inline_snap(prepared.first, prepared.second, p);
+        return prepared.first;
+    };
+    const int s1 = fill(p1);
+    const int s2 = fill(p2);
+    const int s3 = fill(p3);
+    const int s4 = fill(p4);
+    TEST_ASSERT(s1 != s2 && s2 != s3 && s3 != s4 && s4 != s1);
+    TEST_ASSERT(s4 == 3);  // deepest slot, like the BUG.md repro
+
+    // Turn 5: restore from the deepest slot and extend the conversation.
+    std::vector<int32_t> p5 = p4;
+    p5.insert(p5.end(), {3, 105});
+    const auto hit = cache.lookup(p5);
+    TEST_ASSERT(hit.first == s4 && hit.second == (int) p4.size());
+
+    const auto snap = cache.prepare_inline_snap(
+        p5, hit.second, false, (int) p5.size(), hit.first);
+    TEST_ASSERT(snap.first >= 0);
+    TEST_ASSERT(snap.first != s4);  // different slot: the restore source
+                                    // was not the victim
+    TEST_ASSERT(snap.second == (int) p5.size());
+    cache.confirm_inline_snap(snap.first, snap.second, p5);
+
+    // The restore point slid forward: the new, deeper prefix now matches.
+    const auto after = cache.lookup(p5);
+    TEST_ASSERT(after.first == snap.first);
+    TEST_ASSERT(after.second == (int) p5.size());
+    // The old deepest entry survived the eviction.
+    std::vector<int32_t> p4b = p4;
+    p4b.insert(p4b.end(), {7, 7});
+    const auto kept = cache.lookup(p4b);
+    TEST_ASSERT(kept.first == s4 && kept.second == (int) p4.size());
+    TEST_ASSERT(cache.stats().in_use == 4);
+    unlink(path.c_str());
+}
+
+// (b) The in-flight restore source is never the eviction victim, at any LRU
+// position, whether it is the only leaf (linear chain) or not.
+TEST_CASE(ServerUnitFixture, test_slide_restore_source_never_evicted) {
+    std::vector<std::vector<int32_t>> ids = {
+        {9}, {9, 1}, {9, 1, 2}, {9, 1, 2, 3},
+    };
+    for (int skip = 0; skip < 4; ++skip) {
+        const int victim = select_inline_evict_victim(ids, nullptr, skip);
+        TEST_ASSERT(victim >= 0 && victim != skip);
+    }
+    // Linear chain whose only leaf is the restore source: evict the
+    // shallowest unprotected ancestor instead of cancelling everything.
+    TEST_ASSERT(select_inline_evict_victim(ids, nullptr, 3) == 0);
+    // With a free leaf the usual leaf preference still applies.
+    TEST_ASSERT(select_inline_evict_victim(ids, nullptr, 0) == 3);
+}
+
+// (c) The protected tools pin is never evicted, even when it is the
+// shallowest ancestor and the only other entry besides the restore source.
+TEST_CASE(ServerUnitFixture, test_slide_protected_pin_never_evicted) {
+    std::vector<std::vector<int32_t>> ids = {
+        {9}, {9, 1}, {9, 1, 2}, {9, 1, 2, 3},
+    };
+    std::vector<bool> protect = {true, false, false, false};
+    TEST_ASSERT(select_inline_evict_victim(ids, &protect, 3) == 1);
+
+    // Only the protected pin and the restore source remain: no safe victim,
+    // so no snapshot is reserved instead of destroying the pin.
+    std::vector<std::vector<int32_t>> two = {{9}, {9, 1}};
+    std::vector<bool> two_prot = {true, false};
+    TEST_ASSERT(select_inline_evict_victim(two, &two_prot, 1) == -1);
+
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    PrefixCache cache(2, tokenizer);
+    TEST_ASSERT(!cache.disabled());
+
+    std::vector<int32_t> pin = {1, 100, 4, 101};
+    std::vector<int32_t> deep = pin;
+    deep.insert(deep.end(), {3, 102});
+    auto prepared = cache.prepare_inline_snap(pin, 0, true, (int) pin.size());
+    TEST_ASSERT(prepared.first == 0);
+    cache.confirm_inline_snap(prepared.first, prepared.second, pin, true);
+    prepared = cache.prepare_inline_snap(deep, 0, false, (int) deep.size());
+    TEST_ASSERT(prepared.first == 1);
+    cache.confirm_inline_snap(prepared.first, prepared.second, deep);
+
+    std::vector<int32_t> deeper = deep;
+    deeper.insert(deeper.end(), {4, 103});
+    const auto hit = cache.lookup(deeper);
+    TEST_ASSERT(hit.first == 1 && hit.second == (int) deep.size());
+    // At capacity the only other entry is the protected pin: refuse rather
+    // than evict it.
+    const auto refused = cache.prepare_inline_snap(
+        deeper, hit.second, false, (int) deeper.size(), hit.first);
+    TEST_ASSERT(refused.first == -1 && refused.second == 0);
+    const auto kept = cache.lookup(deep);
+    TEST_ASSERT(kept.first == 1 && kept.second == (int) deep.size());
+    TEST_ASSERT(cache.stats().in_use == 2);
+    unlink(path.c_str());
+}
+
+// (d) Branching conversations are unchanged: with two leaves, the oldest
+// non-restore-source leaf is still the victim.
+TEST_CASE(ServerUnitFixture, test_slide_branching_oldest_leaf_unchanged) {
+    // [9] is a shared root; leaves are idx 1 ([9,1]) and idx 2 ([9,2]).
+    std::vector<std::vector<int32_t>> ids = {{9}, {9, 1}, {9, 2}};
+    TEST_ASSERT(select_inline_evict_victim(ids) == 1);  // original behavior
+    // Restore source is the newer leaf: the older leaf is still the victim.
+    TEST_ASSERT(select_inline_evict_victim(ids, nullptr, 2) == 1);
+    // Restore source is the older leaf: the remaining leaf is the victim.
+    TEST_ASSERT(select_inline_evict_victim(ids, nullptr, 1) == 2);
+    // A protected leaf is never evicted: with the restore source skipped and
+    // the only remaining leaf protected, the shallowest unprotected ancestor
+    // is the victim instead.
+    std::vector<bool> protect = {false, true, false};
+    TEST_ASSERT(select_inline_evict_victim(ids, &protect, 2) == 0);
+}
+
+// (e) Free-slot path (not at capacity) must skip the restore source too, so
+// the http_server / agent-replay guards do not cancel the reservation and the
+// restore point can advance.
+TEST_CASE(ServerUnitFixture, test_slide_free_slot_skips_restore_source) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    PrefixCache cache(4, tokenizer);
+    TEST_ASSERT(!cache.disabled());
+
+    // Two entries with cap 4: vacancy exists, so prepare_inline_snap takes
+    // the free-slot path. Round-robin has next_slot_ at 2.
+    std::vector<int32_t> p1 = {1, 100, 4, 101};
+    std::vector<int32_t> p2 = p1;
+    p2.insert(p2.end(), {3, 102});
+
+    auto fill = [&](const std::vector<int32_t> & p) {
+        const auto prepared = cache.prepare_inline_snap(
+            p, 0, false, (int) p.size());
+        TEST_ASSERT(prepared.first >= 0);
+        TEST_ASSERT(prepared.second == (int) p.size());
+        cache.confirm_inline_snap(prepared.first, prepared.second, p);
+        return prepared.first;
+    };
+    const int s1 = fill(p1);  // slot 0
+    const int s2 = fill(p2);  // slot 1
+    TEST_ASSERT(s1 == 0 && s2 == 1);
+
+    // Drive the round-robin so next_slot_ lands exactly on s2 (the restore
+    // source we will pass in). Three abort-burn steps from slot 2 → 3 → 0 → 1.
+    for (int i = 0; i < 3; ++i) {
+        std::vector<int32_t> scratch = p2;
+        scratch.push_back(7);
+        scratch.push_back(7 + i);
+        const auto prep = cache.prepare_inline_snap(
+            scratch, 0, false, (int) scratch.size());
+        TEST_ASSERT(prep.first >= 0);
+        // Burn the round-robin step without committing an entry.
+        cache.cancel_inline_snap(prep.first);
+    }
+
+    // Restore source is s2 = 1. Free slots are 2 and 3. The next free-slot
+    // allocation must skip s2 (== 1) and pick a non-restore slot.
+    std::vector<int32_t> p3 = p2;
+    p3.insert(p3.end(), {4, 103});
+    const auto hit = cache.lookup(p3);
+    TEST_ASSERT(hit.first == s2);
+    const auto snap = cache.prepare_inline_snap(
+        p3, hit.second, false, (int) p3.size(), hit.first);
+    TEST_ASSERT(snap.first >= 0);
+    TEST_ASSERT(snap.first != hit.first);
+    unlink(path.c_str());
 }
 
 // ═══════════════════════════════════════════════════════════════════════

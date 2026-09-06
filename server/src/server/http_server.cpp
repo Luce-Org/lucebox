@@ -3408,11 +3408,17 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
     // requests prefer the reusable system/tool boundary; otherwise an
     // enabled exact full-prompt cache retains its existing priority.
     auto prepare_inline = [&]() {
+        // Never let the new snapshot land in the slot this request restores
+        // from: the guard below would cancel it, pinning the restore point at
+        // the deepest slot on linearly-growing conversations.
+        const int restore_source_slot =
+            cache.using_restore ? cache.cache_slot : -1;
         const auto prepared_snapshot = prefix_cache_.prepare_inline_snap(
             effective_prompt,
             cache.using_restore ? logical_prefix_len : 0,
             prefer_tools_boundary,
-            forced_cut);
+            forced_cut,
+            restore_source_slot);
         cache.snap_slot = prepared_snapshot.first;
         cache.snap_cut = prepared_snapshot.second;
     };
@@ -3676,7 +3682,9 @@ void HttpServer::remember_agent_turn(
 
     const int canonical_end = (int) canonical_tokens.size();
     const auto pending = prefix_cache_.prepare_inline_snap(
-        canonical_tokens, source_pos, false, canonical_end);
+        canonical_tokens, source_pos, false, canonical_end, source_slot);
+    // No safe victim (only the restore source and/or protected pins remain)
+    // or no useful boundary: nothing to replay into.
     if (pending.first < 0 || pending.second != canonical_end) return;
 
     const int slot = pending.first;

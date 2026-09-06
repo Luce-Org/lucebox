@@ -45,23 +45,28 @@ std::vector<int> find_all_boundaries(const std::vector<int32_t> & ids,
 using PrefixHash = std::array<uint8_t, 16>;
 PrefixHash hash_prefix(const int32_t * ids, int count);
 
-// Prefix-aware inline eviction policy. Given the cached prefixes in LRU order
-// (index 0 = oldest), return the index of the eviction victim: the oldest entry
-// whose ids are NOT a strict prefix of any other entry's ids (a "leaf"). Keeping
-// shared ancestor prefixes resident avoids re-prefilling them for later branches.
-// Returns 0 (pure-LRU fallback) when ids_lru is empty or, impossibly, no leaf
-// is found. Pure and model-free so it can be unit-tested without a PrefixCache.
-// The pointer overload is the core (the caller passes pointers into its own
-// entries so no token vectors are copied); the value overload is a convenience
-// wrapper for tests.
+// Prefix-aware inline eviction: given cached prefixes in LRU order (0 = oldest),
+// return the index of the oldest "leaf" — an entry that is not a strict prefix
+// of any other — so shared ancestors stay resident. Pointer overload is the
+// core (no token copies); the value overload is for tests.
 //
-// When `protected_lru` is non-null and same-sized, entries with
-// `(*protected_lru)[i] == true` are skipped unless every leaf is protected
-// (then the oldest protected leaf is chosen as a last resort).
+// protected_lru (optional, same size): entries marked true are skipped.
+// Without skip_index, if every leaf is protected, the oldest protected leaf
+// is the last resort. With skip_index set, protected entries stay ineligible
+// and the function may return -1 instead (see skip_index below).
+// skip_index (default -1): the in-flight restore source, never a victim; if it
+// is the only unprotected leaf, evict the shallowest non-protected ancestor
+// instead so the restore point can slide. The protected pin is never evicted.
+//
+// Returns the victim index [0, n-1]; -1 if skip_index is set and only the
+// restore source and/or protected pins remain; 0 if ids_lru is empty or,
+// impossibly, no leaf exists.
 int select_inline_evict_victim(const std::vector<const std::vector<int32_t> *> & ids_lru,
-                               const std::vector<bool> * protected_lru = nullptr);
+                               const std::vector<bool> * protected_lru = nullptr,
+                               int skip_index = -1);
 int select_inline_evict_victim(const std::vector<std::vector<int32_t>> & ids_lru,
-                               const std::vector<bool> * protected_lru = nullptr);
+                               const std::vector<bool> * protected_lru = nullptr,
+                               int skip_index = -1);
 
 // Pick the inline snapshot boundary for a request.
 // Default: boundary before the current user turn (second-to-last marker),
@@ -121,12 +126,17 @@ public:
     // `prefer_tools_boundary` selects the system/tools head first (see
     // select_inline_snapshot_boundary). When `forced_cut` > restored, that
     // cut is used instead (PPP pin_end, including mid-message LCP cuts).
+    // `restore_source_slot` (default -1) is the slot this request restores
+    // from; at capacity it is never chosen as the eviction victim, so the new
+    // snapshot lands in a different slot and the restore point can slide
+    // forward past the deepest slot.
     // Returns (slot, target_cut) or (-1, 0).
     std::pair<int, int> prepare_inline_snap(
         const std::vector<int32_t> & prompt_ids,
         int restored_prefix_len = 0,
         bool prefer_tools_boundary = false,
-        int forced_cut = 0);
+        int forced_cut = 0,
+        int restore_source_slot = -1);
 
     // Confirm after daemon successfully saved the snapshot.
     // `protect` marks the entry non-evictable by unprotected traffic (tool pin).
