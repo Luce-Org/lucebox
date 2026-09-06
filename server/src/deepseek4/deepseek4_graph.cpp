@@ -477,14 +477,8 @@ static bool build_cached_decode_ffn_graph(
             weights = ggml_scale(out.sg.ctx, weights, w.expert_weight_scale);
         }
 
-        ggml_tensor * weights_3d = ggml_reshape_3d(out.sg.ctx, weights, 1, n_used, n_tokens);
-        ggml_tensor * routed_out = ggml_mul(out.sg.ctx, down_e, weights_3d);
-        routed_out = ggml_cont(
-            out.sg.ctx, ggml_permute(out.sg.ctx, routed_out, 1, 0, 2, 3));
-        routed_out = ggml_sum_rows(out.sg.ctx, routed_out);
-        routed_out = ggml_reshape_2d(out.sg.ctx, routed_out, w.n_embd, n_tokens);
-
-        ffn_out = ggml_add(out.sg.ctx, shared_out, routed_out);
+        ffn_out = ggml_ds4_moe_fused_combine_shared(
+            out.sg.ctx, down_e, weights, shared_out);
     } else {
         ffn_out = build_moe_ffn(out.sg.ctx, ffn_normed, w, L, layer_idx, n_tokens);
     }
@@ -1709,6 +1703,7 @@ static ggml_tensor * build_mla_attention(
     ggml_tensor * old_rows_scratch_f16 = nullptr;
     int n_old_rows = 0;
     ggml_tensor * prior_rows_scratch = nullptr;
+    ggml_tensor * prior_rows_scratch_f16 = nullptr;
     int n_prior_rows = 0;
     const bool fused_causal = cached_inputs && cached_inputs->attn_row_mask && n_tokens > 1;
     if (fused_causal) {
@@ -1765,6 +1760,7 @@ static ggml_tensor * build_mla_attention(
                 prior_rows_scratch = ggml_cont(ctx, prior_rows_scratch);
             }
             ggml_build_forward_expand(gf, prior_rows_scratch);
+            prior_rows_scratch_f16 = prior_rows_scratch;
             prior_rows_scratch = ds4_cast_if_needed(
                 ctx, prior_rows_scratch, GGML_TYPE_F32);
         }
@@ -1890,6 +1886,9 @@ static ggml_tensor * build_mla_attention(
             index_visibility_mask,
             i32_array_inputs);
     }
+    const bool f16_sparse_prefill =
+        attention_impl == DeepSeek4AttentionImpl::SparseFlash &&
+        indexer_topk && n_tokens > w.n_swa;
     // Stable path reads the full physical ring (masking not-yet-written slots)
     // and a padded compressed-row span; the plain path reads only valid rows.
     const int n_raw = masked_kv ? w.n_swa
@@ -1920,9 +1919,13 @@ static ggml_tensor * build_mla_attention(
             ctx, raw_kv_source, head_dim, w.n_swa, raw_kv_source->nb[1], 0);
         kv_attn = ds4_cast_if_needed(ctx, ring, GGML_TYPE_F32);
     } else if (layer_major_batch) {
-        ggml_tensor * current = ds4_cast_if_needed(ctx, kv, GGML_TYPE_F32);
-        kv_attn = prior_rows_scratch
-            ? ggml_concat(ctx, prior_rows_scratch, current, 1)
+        ggml_tensor * current = ds4_cast_if_needed(
+            ctx, kv,
+            f16_sparse_prefill ? GGML_TYPE_F16 : GGML_TYPE_F32);
+        ggml_tensor * prior = f16_sparse_prefill
+            ? prior_rows_scratch_f16 : prior_rows_scratch;
+        kv_attn = prior
+            ? ggml_concat(ctx, prior, current, 1)
             : current;
     } else if (n_tokens == 1) {
         ggml_tensor * cur_kv = ds4_cast_if_needed(ctx, kv, GGML_TYPE_F32);
@@ -1993,7 +1996,9 @@ static ggml_tensor * build_mla_attention(
             ggml_tensor * comp = ggml_view_2d(
                 ctx, comp_kv_source, head_dim, n_comp_attn,
                 comp_kv_source->nb[1], 0);
-            comp = ds4_cast_if_needed(ctx, comp, GGML_TYPE_F32);
+            comp = ds4_cast_if_needed(
+                ctx, comp,
+                f16_sparse_prefill ? GGML_TYPE_F16 : GGML_TYPE_F32);
             kv_attn = ggml_concat(ctx, kv_attn, comp, 1);
         }
         if (old_rows_scratch) {
@@ -2007,19 +2012,24 @@ static ggml_tensor * build_mla_attention(
     // [n_kv,n_query] F16; the explicit path broadcasts the same values over
     // heads in F32.
     ggml_tensor * score_mask = nullptr;
-    const bool exact_two_band =
+    // Ratio-4 sparse prefill already carries the authoritative compressed
+    // row IDs. The CUDA/HIP kernel can derive the raw causal window and the
+    // completed compressed-row frontier from kv_start and the query index.
+    // Keep every other attention shape on the explicit mask contract.
+    const bool direct_indexer_topk = indexer_topk && n_tokens > w.n_swa;
+    const bool exact_numerical_bands =
         attention_impl == DeepSeek4AttentionImpl::DenseFlash &&
         causal_batch &&
         n_tokens > DS4_NUMERICAL_PREFILL_BAND &&
-        n_tokens <= 2 * DS4_NUMERICAL_PREFILL_BAND;
-    if (!exact_two_band) {
+        n_tokens <= DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS;
+    if (!exact_numerical_bands) {
         if (masked_kv && n_tokens > 1) {
             score_mask = ggml_reshape_2d(ctx, cached_inputs->attn_row_mask,
                                          n_attn, n_tokens);
         } else if (masked_kv) {
             score_mask = ggml_reshape_2d(ctx, cached_inputs->attn_row_mask,
                                          n_attn, 1);
-        } else if (layer_major_batch) {
+        } else if (layer_major_batch && !direct_indexer_topk) {
             // Per-token causal mask over [prior rows | current rows | comp rows].
             ggml_tensor * cmask = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_attn, 1, n_tokens);
             ggml_set_input(cmask);
@@ -2045,7 +2055,7 @@ static ggml_tensor * build_mla_attention(
             }
             f32_array_inputs->push_back({cmask, std::move(mvals)});
             score_mask = ggml_reshape_2d(ctx, cmask, n_attn, n_tokens);
-        } else if (causal_batch) {
+        } else if (causal_batch && !layer_major_batch) {
             // Speculative verification keeps the physical ring order and
             // appends snapshots of rows overwritten by later batch tokens.
             ggml_tensor * cmask = ggml_new_tensor_3d(
@@ -2082,10 +2092,10 @@ static ggml_tensor * build_mla_attention(
             score_mask = ggml_reshape_2d(ctx, cmask, n_attn, n_tokens);
         }
     }
-    const bool direct_indexer_topk = indexer_topk &&
-        ds4_env_flag("DFLASH_DS4_DIRECT_INDEXER_TOPK");
+    // Long sparse prefill already has the authoritative selected rows. Pass
+    // them through directly instead of materializing and rescanning a mask.
     if (indexer_topk) {
-        if (!score_mask) {
+        if (!score_mask && !direct_indexer_topk) {
             score_mask = ggml_new_tensor_2d(
                 ctx, GGML_TYPE_F32, n_attn, n_tokens);
             ggml_set_input(score_mask);
@@ -2107,21 +2117,12 @@ static ggml_tensor * build_mla_attention(
     const bool use_flash = attention_impl != DeepSeek4AttentionImpl::Explicit &&
                            (n_tokens > 1 || indexer_topk != nullptr);
     if (use_flash) {
-        if (exact_two_band) {
-            // A larger scheduling band must retain the numerical topology of
-            // two 2K requests. Prefix queries use the first band's F32 raw KV;
-            // suffix queries see its final SWA tail after the same F16 cache
-            // round-trip. HC, projections and MoE still run once over the full
-            // token batch, avoiding a second expert-weight sweep.
-            const int first_count = DS4_NUMERICAL_PREFILL_BAND;
-            const int second_count = n_tokens - first_count;
-            const int first_comp = ratio > 0
-                ? ds4_comp_rows_used(lc.comp_kv, lc.n_comp, ratio,
-                                     kv_start + first_count - 1)
-                : 0;
-            const int second_comp = n_comp_live;
-            const int second_prior_count = std::min(first_count, w.n_swa);
-
+        if (exact_numerical_bands) {
+            // A larger scheduling batch retains the numerical topology of
+            // sequential 2K requests. Each later band sees the previous
+            // band's final SWA tail after the same F16 cache round-trip. HC,
+            // projections and MoE still run once over the full token batch,
+            // avoiding another expert-weight sweep.
             auto view_kv = [&](int first, int count) {
                 return ggml_view_2d(
                     ctx, kv, head_dim, count, kv->nb[1],
@@ -2203,36 +2204,53 @@ static ggml_tensor * build_mla_attention(
                     (size_t) first * q_fa->nb[1]);
             };
 
-            ggml_tensor * first_raw = ds4_cast_if_needed(
-                ctx, view_kv(0, first_count), GGML_TYPE_F32);
-            if (prior_rows_scratch) {
-                first_raw = ggml_concat(
-                    ctx, prior_rows_scratch, first_raw, 1);
+            for (int band_start = 0; band_start < n_tokens;
+                 band_start += DS4_NUMERICAL_PREFILL_BAND) {
+                const int band_count = std::min(
+                    DS4_NUMERICAL_PREFILL_BAND, n_tokens - band_start);
+                const int band_pos = kv_start + band_start;
+                const int band_prior_count = band_start == 0
+                    ? n_prior_rows
+                    : std::min(band_start, w.n_swa);
+                const int band_comp_count = ratio > 0
+                    ? ds4_comp_rows_used(
+                          lc.comp_kv, lc.n_comp, ratio,
+                          band_pos + band_count - 1)
+                    : 0;
+
+                ggml_tensor * band_raw = nullptr;
+                if (band_start == 0) {
+                    band_raw = ds4_cast_if_needed(
+                        ctx, view_kv(0, band_count), GGML_TYPE_F32);
+                    if (prior_rows_scratch) {
+                        band_raw = ggml_concat(
+                            ctx, prior_rows_scratch, band_raw, 1);
+                    }
+                } else {
+                    ggml_tensor * rounded_prior = ggml_cast(
+                        ctx,
+                        view_kv(band_start - band_prior_count,
+                                band_prior_count),
+                        GGML_TYPE_F16);
+                    rounded_prior = ggml_cast(
+                        ctx, rounded_prior, GGML_TYPE_F32);
+                    band_raw = ggml_concat(
+                        ctx, rounded_prior,
+                        view_kv(band_start, band_count), 1);
+                }
+
+                ggml_tensor * band_kv = append_comp(
+                    band_raw, band_comp_count);
+                ggml_tensor * band_mask = make_band_mask(
+                    band_pos, band_count, band_prior_count,
+                    band_comp_count);
+                ggml_tensor * band_context = make_flash(
+                    view_q(band_start, band_count), band_kv, band_mask,
+                    band_prior_count + band_count, band_pos);
+                context = context
+                    ? ggml_concat(ctx, context, band_context, 2)
+                    : band_context;
             }
-            ggml_tensor * first_kv = append_comp(first_raw, first_comp);
-            ggml_tensor * first_mask = make_band_mask(
-                kv_start, first_count, n_prior_rows, first_comp);
-            ggml_tensor * first_context = make_flash(
-                view_q(0, first_count), first_kv, first_mask,
-                n_prior_rows + first_count, kv_start);
-
-            ggml_tensor * rounded_prior = ggml_cast(
-                ctx, view_kv(first_count - second_prior_count,
-                             second_prior_count),
-                GGML_TYPE_F16);
-            rounded_prior = ggml_cast(ctx, rounded_prior, GGML_TYPE_F32);
-            ggml_tensor * second_raw = ggml_concat(
-                ctx, rounded_prior, view_kv(first_count, second_count), 1);
-            ggml_tensor * second_kv = append_comp(second_raw, second_comp);
-            ggml_tensor * second_mask = make_band_mask(
-                kv_start + first_count, second_count,
-                second_prior_count, second_comp);
-            ggml_tensor * second_context = make_flash(
-                view_q(first_count, second_count), second_kv, second_mask,
-                second_prior_count + second_count,
-                kv_start + first_count);
-
-            context = ggml_concat(ctx, first_context, second_context, 2);
             inverse_rope_fused = true;
         } else {
             // ggml FA convention: Q[D,T,H], K/V[D,K,Hkv]. DS4 MLA has one shared
@@ -2240,7 +2258,9 @@ static ggml_tensor * build_mla_attention(
             // The DS4 D=512 kernel consumes Q strides directly, avoiding a full
             // [D,H,T] -> [D,T,H] materialization for every layer.
             ggml_tensor * q_fa = ggml_permute(ctx, q, 0, 2, 1, 3);
-            ggml_tensor * kv_fa = ds4_cast_if_needed(ctx, kv_attn, GGML_TYPE_F32);
+            ggml_tensor * kv_fa = f16_sparse_prefill
+                ? kv_attn
+                : ds4_cast_if_needed(ctx, kv_attn, GGML_TYPE_F32);
             ggml_tensor * k_fa = ggml_reshape_3d(ctx, kv_fa, head_dim, n_attn, 1);
             ggml_tensor * v_fa = k_fa;
             ggml_tensor * mask_fa = score_mask
@@ -3322,11 +3342,8 @@ static ggml_tensor * build_moe_ffn(
         ggml_tensor * down_e = ggml_mul_mat_id(ctx, L.ffn_down_exps, mid_e, routing.selected);
         down_e = ggml_reshape_3d(ctx, down_e, n_embd, n_used, n_tokens);
 
-        ggml_tensor * weights_3d = ggml_reshape_3d(ctx, routing.weights, 1, n_used, n_tokens);
-        routed_out = ggml_mul(ctx, down_e, weights_3d);
-        routed_out = ggml_cont(ctx, ggml_permute(ctx, routed_out, 1, 0, 2, 3));
-        routed_out = ggml_sum_rows(ctx, routed_out);
-        routed_out = ggml_reshape_2d(ctx, routed_out, n_embd, n_tokens);
+        return ggml_ds4_moe_fused_combine_shared(
+            ctx, down_e, routing.weights, shared_out);
     }
 
     return ggml_add(ctx, shared_out, routed_out);
@@ -5057,22 +5074,8 @@ static ggml_tensor * ds4_build_hash_routed_ffn(
         weights = ggml_scale(ctx, weights, w.expert_weight_scale);
     }
 
-    ggml_tensor * weights_3d = ggml_reshape_3d(
-        ctx, weights, 1, n_used, n_tokens);
-    ggml_tensor * routed_out = ggml_mul(ctx, down_e, weights_3d);
-    if (n_tokens == 1) {
-        // Preserve the established q=1 graph and reduction order.
-        routed_out = ggml_cont(ctx, ggml_permute(ctx, routed_out, 1, 0, 2, 3));
-        routed_out = ggml_sum_rows(ctx, routed_out);
-        routed_out = ggml_reshape_2d(ctx, routed_out, w.n_embd, 1);
-    } else {
-        ggml_tensor * sum_shape = ggml_new_tensor_3d(
-            ctx, GGML_TYPE_F32, w.n_embd, 1, n_tokens);
-        routed_out = ggml_repeat_back(ctx, routed_out, sum_shape);
-        routed_out = ggml_reshape_2d(
-            ctx, routed_out, w.n_embd, n_tokens);
-    }
-    return ggml_add(ctx, shared_out, routed_out);
+    return ggml_ds4_moe_fused_combine_shared(
+        ctx, down_e, weights, shared_out);
 }
 
 static bool ds4_fused_ensure_fn_mirrors(
@@ -6275,7 +6278,6 @@ static int ds4_try_layer_major_prefill(
     const int64_t hc_dim = (int64_t) n_embd * n_hc;
     const int64_t mix_dim = 2 * (int64_t) n_hc + (int64_t) n_hc * n_hc;
     const int next_pos = kv_start + n_tokens;
-
     const std::vector<int> * capture_layer_ids =
         verify_hooks ? verify_hooks->capture_layer_ids : nullptr;
     std::vector<float> * capture_out =

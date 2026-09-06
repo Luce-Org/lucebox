@@ -617,6 +617,8 @@ extern "C" {
 
         GGML_OP_PAGED_ATTN,
 
+        GGML_OP_DS4_MOE_COMBINE,
+
         GGML_OP_COUNT,
     };
 
@@ -2746,6 +2748,14 @@ extern "C" {
             struct ggml_tensor  * base_mask,
             struct ggml_tensor  * selected,
             int                   raw_rows);
+
+    // Direct AST Fused MoE Combine Epilogue: down_e[n_embd, n_used, n_tokens] +
+    // weights[n_used, n_tokens] + shared_out[n_embd, n_tokens] -> dst[n_embd, n_tokens]
+    GGML_API struct ggml_tensor * ggml_ds4_moe_fused_combine_shared(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * down_e,
+            struct ggml_tensor  * weights,
+            struct ggml_tensor  * shared_out);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(

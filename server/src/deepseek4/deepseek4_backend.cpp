@@ -2019,7 +2019,6 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                 save_snapshot && !snapshot_saved,
                 spec_snap_from, spec_snap_to);
         }
-
         // Bulk prompt graphs and the final DSpark feature-capture graph have
         // different HC/owner arena shapes. Once all earlier chunks are
         // complete, retire their reusable prefill arenas before entering the
