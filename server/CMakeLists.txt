@@ -469,6 +469,8 @@ add_library(dflash_common STATIC
     src/deepseek4/deepseek4_loader.cpp
     src/deepseek4/deepseek4_graph.cpp
     src/deepseek4/deepseek4_roctx.cpp
+    src/deepseek4/deepseek4_paged_cache.cpp
+    src/deepseek4/deepseek4_seq_engine.cpp
     src/deepseek4/deepseek4_backend.cpp
     src/deepseek4/deepseek4_daemon.cpp
     src/deepseek4/deepseek4_layer_split_adapter.cpp
@@ -505,7 +507,7 @@ add_library(dflash_common STATIC
     src/common/draft_swa.cpp
     src/common/dflash_spec_decode.cpp
     src/common/concurrency/paged_kv_pool.cpp
-    src/qwen35/concurrency/qwen35_slot_manager.cpp
+    src/common/concurrency/seq_slot_manager.cpp
     src/common/layer_split_backend.cpp
     src/common/layer_split_runtime.cpp
     src/qwen35/graph_builders.cpp
@@ -975,8 +977,17 @@ if(DFLASH27B_TESTS)
             hip::host)
         list(APPEND _raw_unit_test_targets test_rocmfpx_mmq)
 
-
-
+        add_executable(test_gfx1151_width4_dispatch test/test_gfx1151_width4_dispatch.cpp)
+        set_source_files_properties(test/test_gfx1151_width4_dispatch.cpp PROPERTIES LANGUAGE HIP)
+        set_target_properties(test_gfx1151_width4_dispatch PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
+        target_include_directories(test_gfx1151_width4_dispatch PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
+        target_link_libraries(test_gfx1151_width4_dispatch PRIVATE
+            ggml
+            ggml-base
+            ${DFLASH27B_GGML_BACKEND_TARGET}
+            hip::host)
+        list(APPEND _raw_unit_test_targets test_gfx1151_width4_dispatch)
 
         # Benchmark, not a test: built with the tests but deliberately NOT added to
         # _raw_unit_test_targets, so ctest stays deterministic. Measures the launch-count
@@ -992,6 +1003,10 @@ if(DFLASH27B_TESTS)
     add_executable(test_qwen35_tensor_parallel test/test_qwen35_tensor_parallel.cpp)
     target_include_directories(test_qwen35_tensor_parallel PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
     target_link_libraries(test_qwen35_tensor_parallel PRIVATE dflash_common)
+
+    add_executable(test_rope_tail test/test_rope_tail.cpp)
+    target_compile_definitions(test_rope_tail PRIVATE DFLASH_ROPE_TEST_GPU=1)
+    target_link_libraries(test_rope_tail PRIVATE ggml ggml-base ggml-cpu ${DFLASH27B_GGML_BACKEND_TARGET})
 
     if(DFLASH27B_GPU_BACKEND STREQUAL "cuda" AND _dflash_cuda_min_sm GREATER_EQUAL 80 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_flashprefill_kernels.cpp")
         add_executable(test_flashprefill_kernels test/test_flashprefill_kernels.cpp)
@@ -1110,6 +1125,23 @@ if(DFLASH27B_TESTS)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_draft_vs_reference.cpp")
         add_executable(test_draft_vs_reference test/test_draft_vs_reference.cpp)
         target_link_libraries(test_draft_vs_reference PRIVATE dflash_common)
+    endif()
+    if((DFLASH27B_GPU_BACKEND STREQUAL "cuda" AND GGML_CUDA_GRAPHS) OR
+       (DFLASH27B_GPU_BACKEND STREQUAL "hip" AND GGML_HIP_GRAPHS))
+        add_executable(test_direct_zero_uid_graph_aba test/test_direct_zero_uid_graph_aba.cpp)
+        # This host-only test calls the GGML C API; the linked backend owns the
+        # device code and runtime dependencies. No HIP language or shim is needed.
+        target_include_directories(test_direct_zero_uid_graph_aba PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src)
+        target_link_libraries(test_direct_zero_uid_graph_aba PRIVATE
+            ggml ${DFLASH27B_GGML_BACKEND_TARGET} ggml-base)
+        target_compile_definitions(test_direct_zero_uid_graph_aba PRIVATE GGML_TEST_GRAPHS_ENABLED=1)
+        if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+            target_compile_definitions(test_direct_zero_uid_graph_aba PRIVATE GGML_USE_HIP=1)
+        else()
+            target_compile_definitions(test_direct_zero_uid_graph_aba PRIVATE GGML_USE_CUDA=1)
+        endif()
+        list(APPEND _raw_unit_test_targets test_direct_zero_uid_graph_aba)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_deepseek4_unit.cpp")
         add_executable(test_deepseek4_unit test/test_deepseek4_unit.cpp)
@@ -1454,7 +1486,11 @@ if(DFLASH27B_TESTS)
         # Pure host-side allocator test: no model, ggml, or GPU is required.
         add_executable(test_paged_kv_pool
             test/test_paged_kv_pool.cpp
+            test/test_deepseek4_page_layout.cpp
+            test/test_deepseek4_paged_cache.cpp
+            src/deepseek4/deepseek4_paged_cache.cpp
             src/common/concurrency/paged_kv_pool.cpp)
+        target_compile_definitions(test_paged_kv_pool PRIVATE DFLASH_DS4_PLAN_ONLY=1)
         target_include_directories(test_paged_kv_pool PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src)
         list(APPEND _raw_unit_test_targets test_paged_kv_pool)
@@ -1463,7 +1499,7 @@ if(DFLASH27B_TESTS)
         # Host-side slot bookkeeping test (concurrent serving): no GPU.
         add_executable(test_seq_slot_manager
             test/test_seq_slot_manager.cpp
-            src/qwen35/concurrency/qwen35_slot_manager.cpp
+            src/common/concurrency/seq_slot_manager.cpp
             src/common/concurrency/paged_kv_pool.cpp)
         target_include_directories(test_seq_slot_manager PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -1886,6 +1922,8 @@ if(DFLASH27B_TESTS)
         test_cuda_comm_api
         test_mmq_streamk_iq4_xs
         test_rms_norm_hip
+        test_rope_tail
+        test_paged_kv_pool
         test_rocmfp3_mix_registry
         test_rocmfp_mix_slice_matvec
         test_rocmfp_mix_gateup_glu
@@ -1933,6 +1971,9 @@ if(DFLASH27B_TESTS)
                 endif()
                 add_test(NAME "${_unit_ctest_name}" COMMAND ${_unit_target})
                 set_tests_properties("${_unit_ctest_name}" PROPERTIES SKIP_RETURN_CODE 77)
+                if(_unit_target STREQUAL "test_direct_zero_uid_graph_aba")
+                    set_tests_properties("${_unit_ctest_name}" PROPERTIES TIMEOUT 60)
+                endif()
                 if(_unit_target STREQUAL "test_rocmfp3_mix_registry")
                     # Its leak assertion reads GLOBAL free VRAM (cudaMemGetInfo) before and
                     # after 4000 register/unregister cycles, so any other test allocating on

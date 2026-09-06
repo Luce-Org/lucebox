@@ -39,6 +39,21 @@ static bool is_busy(const SeqEngine::AdmitResult & result) {
 }
 
 int main() {
+    // Destroying the manager retires any requests still active in its pool.
+    {
+        PagedKvPool pool(/*physical_block_count=*/4, /*max_sequences=*/2,
+                         /*block_size=*/16);
+        {
+            Qwen35SlotManager mgr(pool, /*max_ctx=*/64);
+            auto active = admit(mgr, 1, prompt_tokens(20), greedy_sampler());
+            CHECK(is_admitted(active));
+            CHECK(pool.active_sequence_count() == 1);
+            CHECK(pool.free_block_count() == 1);
+        }
+        CHECK(pool.active_sequence_count() == 0);
+        CHECK(pool.free_block_count() == 4);
+    }
+
     // 8 blocks x 16 tokens = 128 pool tokens, 2 slots, per-seq max_ctx 64.
     {
         PagedKvPool pool(/*physical_block_count=*/8, /*max_sequences=*/2,
@@ -483,6 +498,17 @@ int main() {
         auto c = admit(mgr, 3, prompt_tokens(4), cfg);
         CHECK(is_admitted(c));
         CHECK(mgr.slot(0).rng() != first);
+
+        // Zero is a valid deterministic seed, not a request for entropy.
+        mgr.retire(0);
+        cfg.seed = 0;
+        auto zero_a = admit(mgr, 4, prompt_tokens(4), cfg);
+        CHECK(is_admitted(zero_a));
+        const uint64_t zero_first = mgr.slot(0).rng();
+        mgr.retire(0);
+        auto zero_b = admit(mgr, 5, prompt_tokens(4), cfg);
+        CHECK(is_admitted(zero_b));
+        CHECK(mgr.slot(0).rng() == zero_first);
     }
 
     // A greedy sampler never draws, so its seed is irrelevant and admission

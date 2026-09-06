@@ -14,6 +14,13 @@
 namespace dflash::common {
 
 constexpr int PAGED_BLOCK_SIZE = 16;
+inline constexpr int DEEPSEEK4_MAX_PAGED_SEQUENCES = 6;
+// Monolithic exact serving packs chronological prompt rows into the gathered
+// graph: at most this many rows per step, and per prompt sequence per step.
+inline constexpr int DEEPSEEK4_MAX_GATHERED_ROWS = 16;
+inline constexpr int DEEPSEEK4_MAX_PROMPT_ROWS_PER_STEP = 4;
+// Routed-expert part width for packed steps: the RDNA3 MUL_MAT_ID MMVQ ceiling.
+inline constexpr int DEEPSEEK4_MAX_MOE_ROWS_PER_PART = 8;
 
 constexpr int paged_block_count(int max_ctx) {
     return (max_ctx + PAGED_BLOCK_SIZE - 1) / PAGED_BLOCK_SIZE;

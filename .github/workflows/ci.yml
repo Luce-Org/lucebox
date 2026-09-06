@@ -84,13 +84,14 @@ jobs:
             test_dflash test_generate test_flash_attn_sparse test_server_unit \
             test_deepseek4_unit test_feature_gate test_seq_slot_manager \
             test_seq_engine_contract test_seq_batch_plan test_client_send_buffer \
+            test_paged_kv_pool test_rope_tail \
             test_model_smoke test_batched_gdn test_concat_transpose -j$(nproc)
 
       - name: Run C++ server unit tests
         run: |
           cd server/build
           ctest --output-on-failure \
-            -R "server_unit|deepseek4_unit|feature_gate|seq_slot_manager|seq_engine_contract|seq_batch_plan|client_send_buffer|batched_gdn_cpu" \
+            -R "server_unit|deepseek4_unit|feature_gate|seq_slot_manager|seq_engine_contract|seq_batch_plan|client_send_buffer|paged_kv_pool|rope_tail|batched_gdn_cpu" \
             --no-tests=error
 
       - name: Populate venv with cu128 torch + setuptools

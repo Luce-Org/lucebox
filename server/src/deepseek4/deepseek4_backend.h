@@ -15,6 +15,7 @@
 #include "../common/moe_hybrid_stream.h"
 #include "deepseek4_internal.h"
 #include "deepseek4_dspark.h"
+#include "deepseek4_seq_engine.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -75,6 +76,7 @@ public:
     void free_drafter() override;
 
     void shutdown() override;
+    SeqEngine * seq_engine() override { return seq_engine_.get(); }
 
     const MoeHybridRoutingStats * get_routing_stats() const override {
         return routing_stats_.get();
@@ -87,6 +89,8 @@ private:
     ggml_backend_t         expert_backend_ = nullptr;
     DeepSeek4Weights       w_;
     DeepSeek4Cache         cache_;
+    DeepSeek4PagedCache    paged_cache_;
+    std::unique_ptr<DeepSeek4SeqEngine> seq_engine_;
     bool                   parked_       = false;
 
     // Sampler
@@ -178,6 +182,7 @@ private:
     MoeExpertComputeRuntime            expert_runtime_;
     std::shared_ptr<MoeHybridRoutingStats> routing_stats_;
     std::string                       routing_stats_out_path_;
+    friend class DeepSeek4SeqEngine;
 };
 
 }  // namespace dflash::common

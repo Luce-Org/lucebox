@@ -6186,6 +6186,11 @@ static ggml_backend_buffer_t ggml_backend_opencl_device_buffer_from_ptr(ggml_bac
 }
 
 static bool ggml_backend_opencl_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
+    if ((op->op == GGML_OP_ROPE || op->op == GGML_OP_ROPE_BACK) &&
+        (op->op_params[2] & GGML_ROPE_TYPE_TAIL)) {
+        return false;
+    }
+
     return ggml_opencl_supports_op(dev, op);
 }
 
@@ -12925,6 +12930,7 @@ static void ggml_cl_rope(ggml_backend_t backend, const ggml_tensor * src0, const
     const int n_past     = ((int *) dst->op_params)[0];
     const int n_dims     = ((int *) dst->op_params)[1];
     const int mode       = ((int *) dst->op_params)[2];
+    GGML_ASSERT((mode & GGML_ROPE_TYPE_TAIL) == 0);
     const int n_ctx_orig = ((int32_t *) dst->op_params)[4];
 
     float freq_base;

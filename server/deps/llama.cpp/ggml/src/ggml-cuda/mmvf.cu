@@ -4,6 +4,8 @@
 #include "mmvf.cuh"
 #include "convert.cuh"
 
+#include <cstdlib>
+
 template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false>
 static __global__ void mul_mat_vec_f(
         const T * __restrict__ x, const float * __restrict__ y, const int32_t * __restrict__ ids, const ggml_cuda_mm_fusion_args_device fusion, float * __restrict__ dst,
@@ -786,6 +788,14 @@ void ggml_cuda_op_mul_mat_vec_f(
     GGML_UNUSED_VARS(ctx, src1, dst, src1_ddq_i, src1_ncols, src1_padded_row_size);
 }
 
+static bool mmvf_narrow_f16_enabled() {
+    static const bool enabled = []() {
+        const char * value = std::getenv("DFLASH_CUDA_MMVF_NARROW_F16");
+        return value == nullptr || value[0] == '\0' || std::atoi(value) != 0;
+    }();
+    return enabled;
+}
+
 bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11) {
     if (src0_ne[0] % 2 != 0) {
         return false;
@@ -834,6 +844,20 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
                 }
                 return ne11 <= 8;
             } else if (GGML_CUDA_CC_IS_AMD(cc)) {
+                // rocBLAS ships a single 128x128 macro-tile and no split-K in
+                // its gfx1151 F16 Tensile library, so a narrow F16 weight
+                // (ne01 well below the tile) with more than three columns runs
+                // the whole K loop in one workgroup. The DeepSeek4
+                // hyper-connection mix projection [16384,24] x 4 measured
+                // 367 us there against 13 us on MMVF. MMVF instantiates up to
+                // eight columns and keeps the single-column accumulation
+                // order per column. DFLASH_CUDA_MMVF_NARROW_F16=0 restores
+                // the BLAS route.
+                if (GGML_CUDA_CC_IS_RDNA3_5(cc) && src0_ne[1] <= 32 &&
+                    src0_ne[2]*src0_ne[3] == 1 && ne11 <= 8 &&
+                    mmvf_narrow_f16_enabled()) {
+                    return true;
+                }
                 if (fp16_mma_hardware_available(cc)) {
                     if (GGML_CUDA_CC_IS_RDNA3(cc)) {
                         return ne11 <= 3;

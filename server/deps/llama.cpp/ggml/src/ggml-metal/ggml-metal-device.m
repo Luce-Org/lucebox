@@ -994,6 +994,11 @@ void ggml_metal_device_get_memory(ggml_metal_device_t dev, size_t * free, size_t
 }
 
 bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_tensor * op) {
+    if ((op->op == GGML_OP_ROPE || op->op == GGML_OP_ROPE_BACK) &&
+        (op->op_params[2] & GGML_ROPE_TYPE_TAIL)) {
+        return false;
+    }
+
     const bool has_simdgroup_mm        = dev->props.has_simdgroup_mm;
     const bool has_simdgroup_reduction = dev->props.has_simdgroup_reduction;
     const bool has_bfloat              = dev->props.has_bfloat;

@@ -2322,7 +2322,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
     size_t batch_staging_cursors[GGML_SCHED_MAX_BACKENDS] = {};
-    const bool copy_destinations_ready = sched->backends_synchronized;
+    const bool staging_arena_reusable = sched->backends_synchronized;
+    bool copy_destinations_ready[GGML_SCHED_MAX_BACKENDS] = {};
+    std::fill_n(copy_destinations_ready, sched->n_backends,
+                sched->backends_synchronized);
     // From this point onward an early return must remain conservative: a
     // backend may have accepted work even if a later split fails.
     sched->backends_synchronized = false;
@@ -2344,7 +2347,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         ggml_backend_sched_split_copy_state copy_state{
             sched, split_backend_id, split_backend,
-            copy_destinations_ready, copy_destinations_ready,
+            staging_arena_reusable,
+            copy_destinations_ready[split_backend_id],
             batch_staging_cursors};
 
         // copy the input tensors to the split backend
@@ -2537,6 +2541,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 j0 = j1;
             }
         }
+        copy_destinations_ready[split_backend_id] =
+            sched->callback_eval != nullptr;
 
         // Publish producer completion before a later consumer-backend graph
         // reaches its in-graph event wait. Recording is asynchronous and does

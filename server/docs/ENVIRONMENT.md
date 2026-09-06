@@ -38,7 +38,12 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `DFLASH_DS4_DISABLE_GROUPED_OUTPUT_PROJECTION` | unset | DEBUG: restore the materialized output projection when diagnosing grouped-view copies across unlike runtimes. |
 | `DFLASH_DS4_DRAFT_BACKEND` / `DFLASH_DS4_DRAFT_GPU` | compiled backend / target device | Select the in-process DSpark backend and device. |
 | `DFLASH_CUDA_BACKEND_PATH` / `DFLASH_HIP_BACKEND_PATH` | auto-discovered beside the executable | Explicit peer module file path for a mixed CUDA+HIP build. |
-| `GGML_BATCH_PEER_COPIES` | unset | BURN-IN: batch peer-runtime copies and unlike-runtime host staging with one source wait per split. `GGML_CUDA_BATCH_PEER_COPIES` remains a compatibility alias. |
+| `DFLASH_DS4_TP_GROUPED_MMVQ` / `DFLASH_MOE_TP_GROUPED_MMVQ` | unset | OPT-IN: grouped expert MMVQ for `n_tokens > 1` instead of tokenwise ROCmFP2 gate/up dispatch. Qualified for paged R9700 + Strix at concurrency 1–4; the flag itself does not enforce topology or lane limits. The model-neutral name takes precedence. |
+| `DFLASH_CUDA_MMVQ_FP4_X4` | 1 for monolithic DS4 `gfx1151` paged serving and opt-in HIP DS4 q=5 verification; unset otherwise | Enable dense ROCmFP4 x4 dispatch. Set `0` to restore generic four- and five-column kernels. |
+| `DFLASH_CUDA_MMVQ_FP4_Q5_X4_PLUS1` | 1 for monolithic DS4 `gfx1151` paged serving and opt-in DS4 q=5 verification on `gfx1201`; unset otherwise | Enable dense five-column x4+1 dispatch when `DFLASH_CUDA_MMVQ_FP4_X4=1`. Set `0` to restore the generic five-column kernel. |
+| `DFLASH_CUDA_MMVQ_MOE_FP3_PACKED24` | 1 for monolithic DS4 `gfx1151` paged serving; unset otherwise | Enable packed 24-bit ROCmFP3 expert dispatch. Set `0` to restore generic expert dispatch. |
+| `DFLASH_DS4_TP_BATCH_SPLIT_COPIES` | unset | OPT-IN: establish destination readiness once per DS4 scheduler split while retaining each backend copy's dependency publication. The qualified dual-ROCm launcher enables it. |
+| `GGML_BATCH_PEER_COPIES` | unset | BURN-IN: additionally combine HIP peer-copy dependency publication. `GGML_CUDA_BATCH_PEER_COPIES` remains a compatibility alias. Keep these event-batching variables unset for the exact qualified profile. |
 | `GGML_SCHED_PROFILE` / `GGML_SCHED_PROFILE_MIN_SPLITS` | unset / 1 | DEBUG: report scheduler splits, copy volume, submission time, and source/destination synchronization time. |
 | `DFLASH_DS4_TP_FUSED_CACHE_SLOTS` | 2 | BURN-IN: number of heterogeneous verifier schedulers retained; higher values retain substantially more scratch on both GPUs. |
 | `DFLASH_DS4_VERIFY_FORCE_GRAPH_REPLAY` | unset | OPT-IN: bypass graph property scans only after warmup; scheduler-generation checks remain mandatory. |

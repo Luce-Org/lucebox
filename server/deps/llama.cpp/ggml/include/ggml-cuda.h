@@ -38,7 +38,8 @@ GGML_BACKEND_API bool ggml_backend_cuda_set_low_priority_stream(
 // Skip the expensive per-node CUDA/HIP graph property comparison on the
 // calling thread once a stable graph has already been captured.  Callers must
 // bracket only immutable-topology graphs whose tensor addresses and shapes do
-// not change; input contents may still be updated in place.
+// not change; input contents may still be updated in place.  Bypass requires a
+// known matching non-zero graph generation UID.
 GGML_BACKEND_API bool ggml_backend_cuda_set_skip_props_check(bool skip);
 
 // Retire CUDA/HIP graph-cache entries whose graph key points into a metadata

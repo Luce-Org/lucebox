@@ -1306,7 +1306,8 @@ bool build_moe_hybrid_ffn_graph(
         primary_owner.output, secondary_owner.output, out);
     if (!combined) return false;
 
-    out.output = ggml_cont(ctx, combined);
+    out.output = ggml_is_contiguous(combined) ? combined
+                                               : ggml_cont(ctx, combined);
     return true;
 }
 

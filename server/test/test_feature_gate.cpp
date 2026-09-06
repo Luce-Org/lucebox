@@ -377,24 +377,25 @@ void test_feature_gate_layer_split_requires_supported_arch() {
     CHECK(gate_result(single, "qwen3", PlacementBackend::Cuda).empty());
 }
 
-void test_feature_gate_paged_attention_requires_qwen35_monolithic() {
+void test_feature_gate_paged_attention_requires_monolithic_backend() {
     BackendArgs args;
     args.model_path = "/nonexistent/model.gguf";
     args.paged_attention = true;
     CHECK(gate_result(args, "qwen35", PlacementBackend::Cuda).empty());
     CHECK(gate_result(args, "qwen35", PlacementBackend::Hip).empty());
 
-    // Only qwen35 has a paged decode path. qwen35moe shares Qwen35Config, so
-    // its rejection is this gate's job — the factory's field-presence
-    // cross-check cannot tell the two apart.
-    for (const char * arch : {"qwen35moe", "laguna", "qwen3",
-                              "gemma4", "deepseek4"}) {
+    BackendArgs ds4 = gate_args_hip_deepseek4();
+    ds4.paged_attention = true;
+    CHECK(gate_result(ds4, "deepseek4", PlacementBackend::Hip).empty());
+    CHECK(!gate_result(ds4, "deepseek4", PlacementBackend::Cuda).empty());
+
+    // qwen35moe shares Qwen35Config, so its rejection is this gate's job —
+    // the factory's field-presence cross-check cannot tell the two apart.
+    for (const char * arch : {"qwen35moe", "laguna", "qwen3", "gemma4"}) {
         CHECK(!gate_result(args, arch, PlacementBackend::Cuda).empty());
     }
 
-    // Only the monolithic qwen35 backend owns a paged K/V pool. Both
-    // placements are supported qwen35 launches without the flag, so the
-    // rejection has to come from the paged rule.
+    // Only monolithic Qwen and DeepSeek backends own paged K/V pools.
     BackendArgs split = args;
     CHECK(parse_placement_device_list("cuda:0,cuda:1", split.device));
     CHECK(!gate_result(split, "qwen35", PlacementBackend::Cuda).empty());
@@ -506,7 +507,7 @@ void test_feature_gate_parallel_and_kv_pool_rules() {
     plain.max_concurrency = 1;
     CHECK(gate_result(plain, "qwen35", PlacementBackend::Cuda).empty());
 
-    // More than one slot exists only in the paged qwen35 backend.
+    // More than one slot requires a model-specific paged backend.
     BackendArgs dense;
     dense.model_path = "/nonexistent/model.gguf";
     dense.max_concurrency = 2;
@@ -526,6 +527,22 @@ void test_feature_gate_parallel_and_kv_pool_rules() {
     CHECK(gate_result(parallel, "qwen35", PlacementBackend::Cuda).empty());
     parallel.max_concurrency = 65;
     CHECK(!gate_result(parallel, "qwen35", PlacementBackend::Cuda).empty());
+
+    BackendArgs ds4 = gate_args_hip_deepseek4();
+    ds4.paged_attention = true;
+    ds4.max_concurrency = DEEPSEEK4_MAX_PAGED_SEQUENCES;
+    CHECK(gate_result(ds4, "deepseek4", PlacementBackend::Hip).empty());
+    ds4.max_concurrency = DEEPSEEK4_MAX_PAGED_SEQUENCES + 1;
+    CHECK(!gate_result(ds4, "deepseek4", PlacementBackend::Hip).empty());
+    ds4.max_concurrency = 2;
+    ds4.ds4_prefill_mode = PrefillAttentionMode::Sparse;
+    CHECK(!gate_result(ds4, "deepseek4", PlacementBackend::Hip).empty());
+    ds4.ds4_prefill_mode = PrefillAttentionMode::Exact;
+    ds4.ds4_fused_decode = true;
+    CHECK(!gate_result(ds4, "deepseek4", PlacementBackend::Hip).empty());
+    ds4.ds4_fused_decode = false;
+    ds4.ds4_fused_verify_f16_kv = true;
+    CHECK(!gate_result(ds4, "deepseek4", PlacementBackend::Hip).empty());
 
     // --kv-pool-tokens sizes the shared pool, so it needs slots to share.
     BackendArgs pool = paged;
@@ -711,9 +728,11 @@ void test_model_capability_tables() {
     CHECK(!arch_supports_draft_swa("qwen36", false));
     CHECK(!arch_supports_paged_attention("qwen36", false));
 
-    // Paged decode lives in the monolithic qwen35 backend alone.
+    // Paged decode lives in the monolithic Qwen and DeepSeek backends.
     CHECK(arch_supports_paged_attention("qwen35", false));
     CHECK(!arch_supports_paged_attention("qwen35", true));
+    CHECK(arch_supports_paged_attention("deepseek4", false));
+    CHECK(!arch_supports_paged_attention("deepseek4", true));
     CHECK(!arch_supports_paged_attention("qwen35moe", false));
     CHECK(arch_supports_draft_block_size("qwen35", false));
     CHECK(!arch_supports_draft_block_size("qwen35", true));
@@ -739,7 +758,7 @@ TEST_CASE(FeatureGateFixture, feature_gate_suite) {
     test_feature_gate_ds4_decode_options_require_monolithic_hip();
     test_feature_gate_remote_draft_requires_supported_arch();
     test_feature_gate_layer_split_requires_supported_arch();
-    test_feature_gate_paged_attention_requires_qwen35_monolithic();
+    test_feature_gate_paged_attention_requires_monolithic_backend();
     test_feature_gate_paged_attention_allows_fixed_local_chains();
     test_feature_gate_parallel_and_kv_pool_rules();
     test_feature_warnings_silent_when_supported();

@@ -5871,9 +5871,13 @@ static void ggml_compute_forward_rope_flt(
     float corr_dims[2];
     ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_dims);
 
-    const bool is_imrope = mode == GGML_ROPE_TYPE_IMROPE; // qwen3vl apply interleaved mrope
-    const bool mrope_used = mode & GGML_ROPE_TYPE_MROPE;  // ggml_rope_multi, note: also true for vision (24 & 8 == true) and for imrope
-    const bool is_vision = mode == GGML_ROPE_TYPE_VISION;
+    const bool is_tail = mode & GGML_ROPE_TYPE_TAIL;      // rotate the last n_dims, pass the head through
+    const int  mode_base = mode & ~GGML_ROPE_TYPE_TAIL;
+    GGML_ASSERT(!is_tail || mode_base == GGML_ROPE_TYPE_NORMAL);
+    const int64_t rot_off = is_tail ? ne0 - n_dims : 0;
+    const bool is_imrope = mode_base == GGML_ROPE_TYPE_IMROPE; // qwen3vl apply interleaved mrope
+    const bool mrope_used = mode_base & GGML_ROPE_TYPE_MROPE;  // ggml_rope_multi, note: also true for vision (24 & 8 == true) and for imrope
+    const bool is_vision = mode_base == GGML_ROPE_TYPE_VISION;
 
     if (mrope_used) {
         GGML_ASSERT(sections[0] > 0 || sections[1] > 0 || sections[2] > 0);
@@ -5909,7 +5913,7 @@ static void ggml_compute_forward_rope_flt(
                 if (last_i2 != i2) {
                     if (!mrope_used) {
                         const int64_t p = pos[i2];
-                        ggml_rope_cache_init(p, freq_scale, freq_factors, corr_dims, ne0, ext_factor, attn_factor, cache, sin_sign, theta_scale);
+                        ggml_rope_cache_init(p, freq_scale, freq_factors, corr_dims, is_tail ? n_dims : ne0, ext_factor, attn_factor, cache, sin_sign, theta_scale);
                     }
                     else {
                         const int64_t p_t = pos[i2];
@@ -5927,9 +5931,12 @@ static void ggml_compute_forward_rope_flt(
                 T * src = (T *)((char *) src0->data + i3*nb03 + i2*nb02 + i1*nb01);
                 T * dst_data  = (T *)((char *)  dst->data + i3*nb3  + i2*nb2  + i1*nb1);
 
-                switch (mode) {
+                switch (mode_base) {
                     case GGML_ROPE_TYPE_NORMAL:
-                        rotate_pairs<T>(n_dims, 1, cache, src, dst_data, 1);
+                        // For the tail mode the cache entries [0, n_dims) hold
+                        // the angles of the rotated span, as they would for an
+                        // extracted n_dims-wide tail tensor.
+                        rotate_pairs<T>(n_dims, 1, cache, src + rot_off, dst_data + rot_off, 1);
                         break;
                     case GGML_ROPE_TYPE_NEOX:
                     case GGML_ROPE_TYPE_MROPE:
@@ -5945,7 +5952,11 @@ static void ggml_compute_forward_rope_flt(
 
                 if (!is_vision) {
                     // fill the remain channels with data from src tensor
-                    for (int64_t i0 = n_dims; i0 < ne0; i0 += 2) {
+                    // (the head [0, rot_off) for the tail mode, the tail
+                    // [n_dims, ne0) otherwise)
+                    const int64_t copy_begin = is_tail ? 0 : n_dims;
+                    const int64_t copy_end   = is_tail ? rot_off : ne0;
+                    for (int64_t i0 = copy_begin; i0 < copy_end; i0 += 2) {
                         const T * const src = (T *)((char *) src0->data + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00);
                         T * dst_data  = (T *)((char *)  dst->data + i3*nb3  + i2*nb2  + i1*nb1  + i0*nb0);
 

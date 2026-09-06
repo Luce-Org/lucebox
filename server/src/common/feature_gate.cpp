@@ -193,13 +193,14 @@ std::string check_feature_compatibility(
 
     // ── --paged-attention × architecture, placement, and decode features
     // Paged decode swaps the contiguous K/V cache for a block table owned by
-    // the monolithic qwen35 backend, so every rule below is about reaching
-    // that one code path. All are errors rather than warnings: running dense
+    // a monolithic Qwen or DeepSeek backend. All are errors rather than
+    // warnings: running dense
     // instead would hide the memory behavior the flag was chosen for.
     if (args.paged_attention) {
         if (!arch_supports_paged_attention(arch, /*is_layer_split=*/false)) {
-            return "--paged-attention requires a Qwen3.5/Qwen3.6 dense target "
-                   "(architecture '" + arch + "' has no paged decode path)";
+            return "--paged-attention requires a dense Qwen3.5/Qwen3.6 or "
+                   "DeepSeek4 target (architecture '" + arch +
+                   "' has no paged decode path)";
         }
         // No rule for "requires a CUDA or HIP build": those are the only two
         // backends this binary can be configured with, and GGML_OP_PAGED_ATTN
@@ -226,6 +227,18 @@ std::string check_feature_compatibility(
         if (features.kvflash_enabled) {
             return "--paged-attention cannot be combined with KVFlash";
         }
+        if (arch == "deepseek4") {
+            if (target_backend != PlacementBackend::Hip) {
+                return "DeepSeek4 paged attention requires a local HIP target";
+            }
+            if (args.ds4_prefill_mode != PrefillAttentionMode::Exact) {
+                return "DeepSeek4 paged attention requires --ds4-prefill exact";
+            }
+            if (args.ds4_fused_decode || args.ds4_fused_verify_f16_kv) {
+                return "DeepSeek4 paged attention requires non-fused "
+                       "autoregressive decode";
+            }
+        }
         // The pool rounds max_ctx up to a whole number of blocks, so the top
         // of the range is what can be rounded without overflowing int.
         if (args.device.max_ctx <= 0 ||
@@ -236,8 +249,8 @@ std::string check_feature_compatibility(
     }
 
     // ── --max-concurrency × paged attention
-    // Concurrent decode slots are currently implemented only by the paged
-    // qwen35 backend. The common scheduler does not require a particular
+    // Concurrent decode slots are implemented by model-specific paged
+    // backends. The common scheduler does not require a particular
     // model-state representation; each backend owns whatever per-slot state
     // its graph needs alongside one block-table column per sequence.
     // Everything the paged cluster above rejects is transitively rejected,
@@ -249,11 +262,13 @@ std::string check_feature_compatibility(
         if (!args.paged_attention) {
             return "--max-concurrency requires --paged-attention";
         }
-        // The paged pool addresses tokens with uint32; 64 slots is far above
-        // any batch the decode kernel has been sized for and keeps the
-        // fixed-width decode batch bounded.
-        if (args.max_concurrency > 64) {
-            return "--max-concurrency must be at most 64";
+        // Qwen's graph is qualified through 64 lanes. DeepSeek's gathered
+        // whole-model graph has a smaller, separately qualified ceiling.
+        const int max_slots = arch == "deepseek4"
+            ? DEEPSEEK4_MAX_PAGED_SEQUENCES : 64;
+        if (args.max_concurrency > max_slots) {
+            return "--max-concurrency must be at most " +
+                   std::to_string(max_slots) + " for " + arch;
         }
         // Physical capacity is memory-derived and capped independently of the
         // logical slot count, so max-concurrency no longer multiplies max_ctx
