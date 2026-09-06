@@ -474,6 +474,7 @@ dependencies = [
 dev = [
     { name = "mypy" },
     { name = "pytest" },
+    { name = "pyyaml" },
     { name = "ruff" },
 ]
 megakernel = [
@@ -486,6 +487,7 @@ requires-dist = [
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.10,<2" },
     { name = "pflash", editable = "optimizations/pflash" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
+    { name = "pyyaml", marker = "extra == 'dev'", specifier = ">=6,<7" },
     { name = "qwen35-megakernel-bf16", marker = "extra == 'megakernel'", editable = "optimizations/megakernel" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.14,<1" },
 ]
