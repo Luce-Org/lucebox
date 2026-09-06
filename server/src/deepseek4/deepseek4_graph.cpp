@@ -3598,7 +3598,14 @@ struct Ds4HcMatvecPool {
                     if (stop.load(std::memory_order_relaxed)) return;
                     last = s;
                     const Job j = job;
-                    if (i >= j.active_workers) continue;
+                    if (i >= j.active_workers) {
+                        // Every worker must acknowledge this generation before
+                        // the caller can overwrite job or row_fn. Otherwise an
+                        // inactive worker can pair an old seq with the next job
+                        // and execute/decrement that next generation twice.
+                        remaining.fetch_sub(1, std::memory_order_acq_rel);
+                        continue;
+                    }
                     const int chunk = (j.rows + j.active_workers - 1) / j.active_workers;
                     const int r0 = i * chunk;
                     const int r1 = j.rows < r0 + chunk ? j.rows : r0 + chunk;
@@ -3644,7 +3651,7 @@ struct Ds4HcMatvecPool {
         row_fn = nullptr;
         const int active_workers = std::min(nth, rows);
         job = {mat, x, out, rows, cols, active_workers};
-        remaining.store(active_workers, std::memory_order_release);
+        remaining.store(nth, std::memory_order_release);
         {
             // Publish the new generation while holding wait_mu so a worker
             // cannot miss the transition between its predicate check and
@@ -3669,7 +3676,7 @@ struct Ds4HcMatvecPool {
         row_fn = std::move(fn);
         const int active_workers = std::min(nth, rows);
         job = {nullptr, nullptr, nullptr, rows, 0, active_workers};
-        remaining.store(active_workers, std::memory_order_release);
+        remaining.store(nth, std::memory_order_release);
         {
             std::lock_guard<std::mutex> wake_lk(wait_mu);
             seq.fetch_add(1, std::memory_order_release);
