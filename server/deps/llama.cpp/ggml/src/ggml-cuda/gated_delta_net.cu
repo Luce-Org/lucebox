@@ -61,6 +61,9 @@ static __device__ __forceinline__ float * gdn_select_state(
     physical_state_offset = physical_sequence >= 0
         ? ((int64_t)physical_sequence * H + h_idx) * S_v * S_v
         : 0;
+    // Mapped verify: the base state is read through the slot map and no
+    // final state is written anywhere.
+    if (!state_out) return nullptr;
     if (!active_slot_ids) return state_out + compact_state_offset;
     if (physical_sequence >= 0) {
         return state_out + physical_state_offset;
@@ -320,11 +323,14 @@ gated_delta_net_cuda(const float * q,
         attn_data += S_v * H;
     }
 
-    // Write state back to global memory (transposed layout)
+    // Write state back to global memory (transposed layout); mapped verify
+    // keeps the base state read-only and selects no destination.
+    if (state != nullptr) {
 #pragma unroll
-    for (int r = 0; r < rows_per_lane; r++) {
-        const int i          = r * warp_size + lane;
-        state[col * S_v + i] = s_shard[r];
+        for (int r = 0; r < rows_per_lane; r++) {
+            const int i          = r * warp_size + lane;
+            state[col * S_v + i] = s_shard[r];
+        }
     }
 }
 
@@ -576,13 +582,15 @@ gated_delta_net_cuda_grouped_cols(const float * q,
         attn_data += S_v * H;
     }
 
+    if (state != nullptr) {
 #pragma unroll
-    for (int c = 0; c < COLS; ++c) {
-        const int col = col_base + c;
+        for (int c = 0; c < COLS; ++c) {
+            const int col = col_base + c;
 #pragma unroll
-        for (int r = 0; r < rows_per_lane; ++r) {
-            const int row = r * WIDTH + lane;
-            state[col * S_v + row] = state_shard[c][r];
+            for (int r = 0; r < rows_per_lane; ++r) {
+                const int row = r * WIDTH + lane;
+                state[col * S_v + row] = state_shard[c][r];
+            }
         }
     }
 }
@@ -962,7 +970,12 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
     float *       dst_d = (float *) dst->data;
     const int64_t attn_score_elems = S_v * H * n_tokens * n_seqs;
     const bool    inplace_state = ggml_get_op_params_i32(dst, 1) != 0;
-    float *       state_out_d = inplace_state ? (float *) src_state->data : dst_d + attn_score_elems;
+    // dflash mapped verify (ggml_gated_delta_net_mapped_verify): src[8] maps
+    // the compact sequences to the base slabs they read; no final state and
+    // no intermediates are written, and g/beta may share one strided layout.
+    const bool    verify_readonly = ggml_get_op_params_i32(dst, 11) != 0;
+    float *       state_out_d = verify_readonly ? nullptr
+                              : inplace_state ? (float *) src_state->data : dst_d + attn_score_elems;
     const int *   parent_ids_d = src_parent
         ? (const int *) src_parent->data
         : nullptr;
@@ -989,16 +1002,20 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
     GGML_ASSERT(ggml_is_contiguous_rows(src_v));
     GGML_ASSERT(ggml_are_same_stride(src_q, src_k));
     GGML_ASSERT(src_g->ne[0] == 1 || kda);
-    GGML_ASSERT(ggml_is_contiguous(src_g));
-    GGML_ASSERT(ggml_is_contiguous(src_beta));
+    GGML_ASSERT(ggml_is_contiguous(src_g) ||
+                (verify_readonly && ggml_is_contiguous_rows(src_g) && ggml_are_same_stride(src_g, src_beta)));
+    GGML_ASSERT(ggml_is_contiguous(src_beta) || (verify_readonly && ggml_is_contiguous_rows(src_beta)));
     GGML_ASSERT(ggml_is_contiguous(src_state));
     if (src_parent) {
         GGML_ASSERT(src_parent->type == GGML_TYPE_I32);
         GGML_ASSERT(ggml_is_contiguous(src_parent));
         GGML_ASSERT(ggml_nelements(src_parent) == n_tokens * n_seqs);
     }
+    if (verify_readonly) {
+        GGML_ASSERT(src_active_slots && !inplace_state && !src_parent && !src_persist_inter && !kda);
+    }
     if (src_active_slots) {
-        GGML_ASSERT(inplace_state);
+        GGML_ASSERT(inplace_state || verify_readonly);
         GGML_ASSERT(!src_parent);
         GGML_ASSERT(src_active_slots->type == GGML_TYPE_I32);
         GGML_ASSERT(ggml_is_contiguous(src_active_slots));
@@ -1038,11 +1055,12 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
     if (raw_gates) {
         GGML_ASSERT(dst->src[9] && dst->src[9]->type == GGML_TYPE_F32);
         GGML_ASSERT(ggml_nelements(dst->src[9]) == 2*H);
-        GGML_ASSERT(!kda && !tree_mode && active_slot_ids_d == nullptr);
+        GGML_ASSERT(!kda && !tree_mode && (active_slot_ids_d == nullptr || verify_readonly));
         gate_bias_d = (const float *) dst->src[9]->data;
         gate_A_d    = gate_bias_d + H;
     }
-    const bool write_intermediate = tree_mode || !skip_intermediate || persist_inter_d != nullptr;
+    const bool write_intermediate = tree_mode || (!skip_intermediate && !verify_readonly) ||
+                                    persist_inter_d != nullptr;
 
     // Macro to expand KDA × TREE_MODE × WRITE_INTER for a given InterT.
     // The persist_is_f16 branch picks between __half and float instantiations.

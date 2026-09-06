@@ -2794,6 +2794,27 @@ extern "C" {
             struct ggml_tensor  * conv_state,
             struct ggml_tensor  * conv_input_out);
 
+    // dflash extension: tree-window conv step for concurrent speculative
+    // verify. Replaces gather(conv_state) + transpose + concat + tree conv
+    // with one kernel that leaves the persistent history untouched.
+    //   x:              [C, T, S] f32, rows contiguous (strided token axis ok)
+    //   c:              [K, C]    f32 depthwise conv weights
+    //   conv_state:     [K-1, C, n_slots] f32 persistent history, READ ONLY
+    //   state_slot_ids: [S] i32, the slab each sequence starts from
+    //                   (negative ids read a zero history)
+    //   parent_ids:     [T, S] i32 tree parents, as ggml_ssm_conv_tree
+    // The packed f32 result holds silu(conv) as [C, T, S] at offset 0 and
+    // the assembled window [K-1+T, C, S] (history rows then x rows, the
+    // layout the replay-log commit reads) at element offset C*T*S; view both
+    // out of it. Bit-identical to the op-by-op form. CUDA/HIP only.
+    GGML_API struct ggml_tensor * ggml_ssm_conv_tree_step(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * c,
+            struct ggml_tensor  * conv_state,
+            struct ggml_tensor  * state_slot_ids,
+            struct ggml_tensor  * parent_ids);
+
     // dflash2 grouped dynamic block conv (draft graph), one fused node for
     //   out[c,l] = sum_k (dyn[(site*K+k)*G + c/gs, l] + base[c, site*K+k]) * x[c, l-k]
     // x [C, T] f32 contiguous, base [C, >= (site+1)*K] f32, dyn [>= 2K*G, T]
@@ -2968,6 +2989,26 @@ extern "C" {
             struct ggml_tensor  * state,
             struct ggml_tensor  * active_slot_ids);
 
+    // dflash extension: speculative verify against mapped base states.
+    // `state` is the full persistent [S_v, S_v, H, n_slots] tensor and
+    // `state_slot_ids` [n_seqs] names the slab each compact sequence starts
+    // from (negative ids start from zero). The kernel reads the base state in
+    // place and writes neither a final state nor per-token intermediates: the
+    // result holds only the attention output (plus the replay log once
+    // captured), and accepted prefixes are committed later from that log.
+    // g and beta may be strided [1, H, T, S] views sharing one layout, so raw
+    // gates (ggml_gated_delta_net_set_raw_gates) can read the stacked
+    // projection directly. Non-KDA, non-tree. CUDA/HIP only.
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_mapped_verify(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * state_slot_ids);
+
     GGML_API void ggml_gated_delta_net_set_skip_intermediate(
             struct ggml_tensor * tensor,
             bool                 skip_intermediate);
@@ -2988,7 +3029,8 @@ extern "C" {
     // `g` then carries alpha_raw and `beta` carries beta_raw (both [1,H,T,S]);
     // gate_ba is a contiguous f32 [2*H] tensor holding [dt_bias | A]
     // (src[9], op_params[10] = 1). Only for the non-tree, non-KDA,
-    // non-SpecLA CUDA/HIP path.
+    // non-SpecLA CUDA/HIP path; the compact-decode variant is excluded,
+    // the mapped-verify variant is allowed.
     GGML_API void ggml_gated_delta_net_set_raw_gates(
             struct ggml_tensor * tensor,
             struct ggml_tensor * gate_ba);

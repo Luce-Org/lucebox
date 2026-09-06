@@ -6040,6 +6040,56 @@ struct ggml_tensor * ggml_ssm_conv_step(
     return result;
 }
 
+// dflash: tree-window conv step (see ggml.h). op_params[0] = 4; srcs are
+// (x, c, conv_state, state_slot_ids, parent_ids). The packed result carries
+// silu(conv) [C, T, S] followed by the window [K-1+T, C, S].
+struct ggml_tensor * ggml_ssm_conv_tree_step(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * c,
+        struct ggml_tensor  * conv_state,
+        struct ggml_tensor  * state_slot_ids,
+        struct ggml_tensor  * parent_ids) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(c->type == GGML_TYPE_F32);
+    GGML_ASSERT(conv_state->type == GGML_TYPE_F32);
+    GGML_ASSERT(state_slot_ids != NULL && state_slot_ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(parent_ids != NULL && parent_ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_matrix(c));
+    GGML_ASSERT(ggml_is_contiguous(c));
+    GGML_ASSERT(ggml_is_contiguous(conv_state));
+    GGML_ASSERT(ggml_is_contiguous(state_slot_ids));
+    GGML_ASSERT(ggml_is_contiguous(parent_ids));
+    GGML_ASSERT(x->nb[0] == sizeof(float));
+    GGML_ASSERT(x->ne[3] == 1);
+
+    const int64_t d_conv  = c->ne[0];
+    const int64_t d_inner = c->ne[1];
+    const int64_t n_t     = x->ne[1];
+    const int64_t n_s     = x->ne[2];
+
+    GGML_ASSERT(x->ne[0] == d_inner);
+    GGML_ASSERT(d_conv == 3 || d_conv == 4 || d_conv == 5 || d_conv == 9);
+    GGML_ASSERT(conv_state->ne[0] == d_conv - 1);
+    GGML_ASSERT(conv_state->ne[1] == d_inner);
+    GGML_ASSERT(conv_state->ne[3] == 1);
+    GGML_ASSERT(ggml_nelements(state_slot_ids) == n_s);
+    GGML_ASSERT(ggml_nelements(parent_ids) == n_t * n_s);
+
+    const int64_t packed = d_inner * n_t * n_s + (d_conv - 1 + n_t) * d_inner * n_s;
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, packed);
+    ggml_set_op_params_i32(result, 0, 4);   // tree-window step mode
+
+    result->op     = GGML_OP_SSM_CONV;
+    result->src[0] = x;
+    result->src[1] = c;
+    result->src[2] = conv_state;
+    result->src[3] = state_slot_ids;
+    result->src[4] = parent_ids;
+
+    return result;
+}
+
 struct ggml_tensor * ggml_dflash_dyn_conv(
         struct ggml_context * ctx,
         struct ggml_tensor  * x,
@@ -6919,6 +6969,71 @@ struct ggml_tensor * ggml_gated_delta_net_active_inplace(
     return result;
 }
 
+// dflash: mapped verify (see ggml.h). op_params[11] = 1, src[8] maps the
+// compact sequences to the slabs they read, and the packed result holds only
+// the attention output. g/beta need contiguous rows and one shared layout.
+struct ggml_tensor * ggml_gated_delta_net_mapped_verify(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * state_slot_ids) {
+    GGML_ASSERT(ggml_is_contiguous_rows(q));
+    GGML_ASSERT(ggml_is_contiguous_rows(k));
+    GGML_ASSERT(ggml_are_same_stride(q, k));
+    GGML_ASSERT(ggml_is_contiguous_rows(v));
+    GGML_ASSERT(ggml_is_contiguous_rows(g));
+    GGML_ASSERT(ggml_is_contiguous_rows(beta));
+    GGML_ASSERT(ggml_are_same_stride(g, beta));
+    GGML_ASSERT(ggml_is_contiguous(state));
+    GGML_ASSERT(state_slot_ids != NULL);
+    GGML_ASSERT(ggml_is_contiguous(state_slot_ids));
+
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(k->type == GGML_TYPE_F32);
+    GGML_ASSERT(v->type == GGML_TYPE_F32);
+    GGML_ASSERT(g->type == GGML_TYPE_F32);
+    GGML_ASSERT(beta->type == GGML_TYPE_F32);
+    GGML_ASSERT(state->type == GGML_TYPE_F32);
+    GGML_ASSERT(state_slot_ids->type == GGML_TYPE_I32);
+
+    const int64_t S_v      = v->ne[0];
+    const int64_t H        = v->ne[1];
+    const int64_t n_tokens = v->ne[2];
+    const int64_t n_seqs   = v->ne[3];
+
+    // scalar gate only: [1, H, T, B]
+    GGML_ASSERT(g->ne[0] == 1);
+    GGML_ASSERT(beta->ne[0] == 1);
+    GGML_ASSERT(g->ne[1] == H && g->ne[2] == n_tokens && g->ne[3] == n_seqs);
+    GGML_ASSERT(beta->ne[1] == H && beta->ne[2] == n_tokens && beta->ne[3] == n_seqs);
+
+    GGML_ASSERT(state->ne[0] == S_v && state->ne[1] == S_v && state->ne[2] == H);
+    GGML_ASSERT(ggml_nelements(state_slot_ids) == n_seqs);
+
+    // Attention output only; the final state and the intermediates are
+    // neither written nor allocated. ggml_gated_delta_net_capture_replay_log
+    // appends its rows after these.
+    const int64_t ne[4] = { S_v * H, n_tokens * n_seqs, 1, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+    ggml_set_op_params_i32(result, 1, 0);
+    ggml_set_op_params_i32(result, 11, 1);
+
+    result->op     = GGML_OP_GATED_DELTA_NET;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = g;
+    result->src[4] = beta;
+    result->src[5] = state;
+    result->src[8] = state_slot_ids;
+
+    return result;
+}
+
 void ggml_gated_delta_net_set_skip_intermediate(
         struct ggml_tensor * tensor,
         bool                 skip_intermediate) {
@@ -7016,10 +7131,11 @@ void ggml_gated_delta_net_set_raw_gates(
     GGML_ASSERT(ggml_is_contiguous(gate_ba));
     const struct ggml_tensor * v = tensor->src[2];
     GGML_ASSERT(ggml_nelements(gate_ba) == 2*v->ne[1]);
-    // scalar gate only (no KDA), no tree mode, no SpecLA / compact decode
+    // scalar gate only (no KDA), no tree mode, no SpecLA / compact decode;
+    // the mapped-verify variant (op_params[11]) carries src[8] read-only.
     GGML_ASSERT(tensor->src[3]->ne[0] == 1);
     GGML_ASSERT(tensor->src[6] == NULL);
-    GGML_ASSERT(tensor->src[8] == NULL);
+    GGML_ASSERT(tensor->src[8] == NULL || ggml_get_op_params_i32(tensor, 11) != 0);
     GGML_ASSERT(ggml_get_op_params_i32(tensor, 2) == 0);
     tensor->src[9] = gate_ba;
     ggml_set_op_params_i32(tensor, 10, 1);

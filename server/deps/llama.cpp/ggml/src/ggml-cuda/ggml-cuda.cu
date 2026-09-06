@@ -4509,7 +4509,7 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         const ggml_tensor * silu     = cgraph->nodes[node_idx+1];
 
         if (ggml_get_op_params_i32(ssm_conv, 0) != 0) {
-            // the Specla (1) and dflash step (2) ssm_conv kernels apply SiLU themselves
+            // the Specla (1) and dflash step (2, 4) ssm_conv kernels apply SiLU themselves
             return false;
         }
 
@@ -6390,7 +6390,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             // kernel guards the final partial 128-channel block), 2 = dflash fused
             // step mode (any channel count).
             if (ggml_get_op_params_i32(op, 0) == 1 || ggml_get_op_params_i32(op, 0) == 2 ||
-                ggml_get_op_params_i32(op, 0) == 3) {
+                ggml_get_op_params_i32(op, 0) == 3 || ggml_get_op_params_i32(op, 0) == 4) {
                 return true;
             }
             // assumes d_inner % threads == 0
