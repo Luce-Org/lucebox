@@ -2508,6 +2508,27 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                     (size_t) final_new_rows);
             }
         }
+        // Completed chunks retain model/KV/HC state in backend buffers, not
+        // in the CUDA operator pool. Growing context-dependent temporaries
+        // can strand smaller legacy-pool blocks across successive chunks.
+        // Retire captured executables/memos and only returned pool blocks at
+        // this synchronized boundary; leave reusable gallocr arenas intact.
+        if (bound_hybrid_scratch && n_tok >= 512 &&
+            kv_offset + n_total > 4096 &&
+            moe_hybrid_->cold_backend &&
+            moe_hybrid_->cold_backend != backend_) {
+            ggml_backend_synchronize(backend_);
+            ggml_backend_synchronize(moe_hybrid_->cold_backend);
+            const size_t primary_released =
+                ggml_backend_cuda_trim_pool(backend_);
+            const size_t cold_released =
+                ggml_backend_cuda_trim_pool(moe_hybrid_->cold_backend);
+            std::fprintf(stderr,
+                         "[deepseek4] prefill chunk pool trim pos=%d "
+                         "primary=%.2f MiB cold=%.2f MiB\n",
+                         pos, primary_released / (1024.0 * 1024.0),
+                         cold_released / (1024.0 * 1024.0));
+        }
     }
     keep_spec_feature_tail(spec_feat_window_,
                            (size_t) std::max(0, w_.n_swa));
