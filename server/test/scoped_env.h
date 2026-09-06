@@ -3,6 +3,11 @@
 #include <cstdlib>
 #include <string>
 
+#if defined(_WIN32)
+#define setenv(name, value, overwrite) _putenv_s(name, value)
+#define unsetenv(name) _putenv_s(name, "")
+#endif
+
 namespace luce_test {
 
 // Temporarily set or unset an environment variable, then restore the exact

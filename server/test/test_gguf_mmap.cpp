@@ -17,6 +17,7 @@
 #include <string>
 
 #if defined(_WIN32)
+#include <fcntl.h>
 #include <io.h>
 #define MKSTEMP_FN(t) (_mktemp_s(t, sizeof(t)), _open(t, _O_CREAT | _O_WRONLY | _O_BINARY, 0600))
 #define CLOSE_FN _close
