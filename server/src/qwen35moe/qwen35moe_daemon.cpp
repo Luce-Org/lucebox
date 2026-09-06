@@ -7,8 +7,8 @@ namespace dflash::common {
 
 int run_qwen35moe_daemon(const Qwen35MoeDaemonArgs & args) {
     Qwen35Config cfg;
-    cfg.target_path        = args.target_path;
-    cfg.draft_path         = args.draft_path;
+    cfg.target_path        = args.target_path ? args.target_path : "";
+    if (args.draft_path) cfg.draft_path = args.draft_path;
     cfg.device             = args.device;
     cfg.draft_gpu          = args.draft_gpu;
     cfg.stream_fd          = args.stream_fd;

@@ -1,13 +1,14 @@
 #include "bailingmoe3_backend.h"
 
 #include <cstdio>
+#include <utility>
 
 namespace dflash::common {
 namespace {
 
-Qwen35Config make_qwen_runtime_config(const BailingMoe3Config & cfg) {
+Qwen35Config make_qwen_runtime_config(BailingMoe3Config cfg) {
     Qwen35Config runtime;
-    runtime.target_path = cfg.model_path;
+    runtime.target_path = std::move(cfg.model_path);
     runtime.device = cfg.device;
     runtime.stream_fd = cfg.stream_fd;
     // The Ling baseline uses the ordinary contiguous F16/Q4 KV cache and the
@@ -22,8 +23,8 @@ Qwen35Config make_qwen_runtime_config(const BailingMoe3Config & cfg) {
 
 }  // namespace
 
-BailingMoe3Backend::BailingMoe3Backend(const BailingMoe3Config & cfg)
-    : Qwen35Backend(make_qwen_runtime_config(cfg)) {}
+BailingMoe3Backend::BailingMoe3Backend(BailingMoe3Config cfg)
+    : Qwen35Backend(make_qwen_runtime_config(std::move(cfg))) {}
 
 bool BailingMoe3Backend::load_target_model(ggml_backend_t backend,
                                            TargetWeights & out) {

@@ -17,6 +17,7 @@
 #endif
 
 #include "http_server.h"
+#include "engine/luce_engine.h"
 #include "admission.h"
 #include "sse_emitter.h"
 #include "prompt_normalize.h"
@@ -1114,10 +1115,11 @@ static std::array<uint8_t, 16> compute_disk_cache_salt(const ServerConfig & cfg)
 
 // ─── HttpServer ─────────────────────────────────────────────────────────
 
-HttpServer::HttpServer(ModelBackend & backend,
+HttpServer::HttpServer(dflash::engine::LuceEngine & engine,
                        Tokenizer & tokenizer,
                        const ServerConfig & config)
-    : backend_(backend)
+    : engine_(engine)
+    , backend_(engine.backend())
     , tokenizer_(tokenizer)
     , config_(config)
     , chat_format_(ChatFormat::QWEN3)  // default, overridden by arch
@@ -1126,7 +1128,7 @@ HttpServer::HttpServer(ModelBackend & backend,
                    config.disk_cache_budget_mb * (size_t)(1024 * 1024),
                    config.disk_cache_min_tokens,
                    config.disk_cache_continued_interval,
-                   config.disk_cache_cold_max_tokens}, backend)
+                   config.disk_cache_cold_max_tokens}, backend_)
 {
     #ifdef DFLASH_HAS_CURL
     curl_global_init(CURL_GLOBAL_DEFAULT);
@@ -1330,9 +1332,7 @@ void HttpServer::shutdown() {
         socket_close(listen_fd_);
         listen_fd_ = kInvalidSocket;
     }
-    if (worker_thread_.joinable()) {
-        worker_thread_.join();
-    }
+    engine_.stop_serving();
 
     // Close SSE client connections.
     {
@@ -1437,15 +1437,18 @@ int HttpServer::run() {
     std::fprintf(stderr, "[server] listening on http://%s:%d\n",
                  config_.host.c_str(), config_.port);
 
-    // A backend-provided sequence engine replaces the one-request worker
-    // with the concurrent scheduler. Upstream forwarding stays on the
-    // classic path even when the local backend exposes an engine.
-    if (SeqEngine * engine = backend_.seq_engine();
-        engine && config_.pflash_upstream_base.empty()) {
-        worker_thread_ =
-            std::thread([this, engine]() { scheduler_loop(*engine); });
-    } else {
-        worker_thread_ = std::thread([this]() { worker_loop(); });
+    dflash::engine::LuceEngine::ServingLoops loops;
+    loops.serial = [this]() { worker_loop(); };
+    loops.concurrent =
+        [this](SeqEngine & engine) { scheduler_loop(engine); };
+    loops.request_stop = [this]() {
+        stopping_.store(true, std::memory_order_relaxed);
+        queue_cv_.notify_all();
+    };
+    if (!engine_.start_serving(
+            std::move(loops), config_.pflash_upstream_base.empty())) {
+        std::fprintf(stderr, "[server] failed to start LuceEngine\n");
+        return 1;
     }
 
     // Accept loop.
@@ -1505,10 +1508,8 @@ int HttpServer::run() {
         }
     }
 
-    // Wait for worker to finish.
-    if (worker_thread_.joinable()) {
-        worker_thread_.join();
-    }
+    // Wait for LuceEngine's serving loop to finish.
+    engine_.stop_serving();
 
     // Persist disk cache (worker joined — no race on slot_tokens_).
     if (!disk_cache_.disabled() && !slot_tokens_.empty()) {
@@ -3081,6 +3082,9 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
         const ParsedRequest & req, PreparedPrompt & prepared,
         GenerateRequest & generate_request) {
     auto & effective_prompt = prepared.tokens;
+    const auto server_stopping = [this]() {
+        return stopping_.load(std::memory_order_acquire);
+    };
     // Tool-heavy requests prefer the reusable system/tool boundary under eviction.
     const bool prefer_inline_snap = !req.tools.empty();
     const bool prefer_tools_boundary =
@@ -3298,6 +3302,7 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
         scoped_request.snap_pos = selected_boundary;
         DaemonIO scoped_io;
         scoped_io.stream_fd = -1;
+        scoped_io.should_cancel = server_stopping;
         const auto scoped_result =
             backend_.generate(scoped_request, scoped_io);
         if (scoped_result.ok() &&
@@ -3381,6 +3386,7 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
             cold_request.snap_pos = cold_boundary;
             DaemonIO cold_io;
             cold_io.stream_fd = -1;
+            cold_io.should_cancel = server_stopping;
             const auto cold_result = backend_.generate(cold_request, cold_io);
             if (cold_result.ok() &&
                 backend_.snapshot_used(kDiskStagingSlot)) {
@@ -3693,7 +3699,10 @@ void HttpServer::remember_agent_turn(
     replay.snap_slot = slot;
     replay.snap_pos = canonical_end;
     DaemonIO replay_io;
-    replay_io.should_cancel = [this]() { return has_pending_jobs(); };
+    replay_io.should_cancel = [this]() {
+        return stopping_.load(std::memory_order_acquire) ||
+               has_pending_jobs();
+    };
     const GenerateResult replay_result = backend_.restore_and_generate(
         source_slot, replay, replay_io);
     backend_.release_scratch();
@@ -3715,8 +3724,8 @@ void HttpServer::remember_agent_turn(
     }
 }
 
-// Generation setup owns backing storage for every pointer placed in
-// GenerateRequest, keeping those pointers valid through the decode call.
+// Populate model-ready input. GenerateRequest owns every retained token
+// sequence, eliminating pointer lifetime coupling to GenerationInputs.
 void HttpServer::prepare_generation_inputs(
         const ParsedRequest & req, const PreparedPrompt & prepared,
         GenerationInputs & inputs) {
@@ -3752,8 +3761,7 @@ void HttpServer::prepare_generation_inputs(
         ToolHintGenerator hint_generator(tokenizer_);
         auto hint = hint_generator.build_hint(req.tools, req.tool_choice);
         if (!hint.empty()) {
-            inputs.hint_tokens = std::move(hint.prefix_tokens);
-            inputs.request.hint_tokens = &inputs.hint_tokens;
+            inputs.request.hint_tokens = std::move(hint.prefix_tokens);
         }
     }
 
@@ -3761,9 +3769,9 @@ void HttpServer::prepare_generation_inputs(
         return;
     }
 
-    inputs.stall_tool_prefix_tokens = tokenizer_.encode(
+    inputs.request.stall_tool_prefix_tokens = tokenizer_.encode(
         build_stall_tool_prefix(req.tools, req.tool_choice));
-    inputs.stall_action_suffix_tokens = tokenizer_.encode(":");
+    inputs.request.stall_action_suffix_tokens = tokenizer_.encode(":");
 
     // The detector matches recent terminal tokens, not the full action
     // prefix. Collect the final token for common colon spellings.
@@ -3771,30 +3779,26 @@ void HttpServer::prepare_generation_inputs(
         const auto ids = tokenizer_.encode(text);
         if (ids.empty()) return;
         const int32_t token = ids.back();
-        if (std::find(inputs.stall_action_suffix_tokens.begin(),
-                      inputs.stall_action_suffix_tokens.end(), token) ==
-            inputs.stall_action_suffix_tokens.end()) {
-            inputs.stall_action_suffix_tokens.push_back(token);
+        if (std::find(inputs.request.stall_action_suffix_tokens.begin(),
+                      inputs.request.stall_action_suffix_tokens.end(), token) ==
+            inputs.request.stall_action_suffix_tokens.end()) {
+            inputs.request.stall_action_suffix_tokens.push_back(token);
         }
     };
     add_suffix_terminal("`:");
     add_suffix_terminal("):");
     add_suffix_terminal("\":");
 
-    inputs.stall_skip_tokens = tokenizer_.encode(" done");
-    inputs.request.stall_tool_prefix_tokens =
-        &inputs.stall_tool_prefix_tokens;
-    inputs.request.stall_action_suffix_tokens =
-        &inputs.stall_action_suffix_tokens;
-    inputs.request.stall_skip_tokens = &inputs.stall_skip_tokens;
+    inputs.request.stall_skip_tokens = tokenizer_.encode(" done");
 }
 
 void HttpServer::configure_generation_io(
         ServerJob * job, const ParsedRequest & req, SseEmitter & emitter,
         GenerationOutputState & output, DaemonIO & io) {
     io.stream_fd = -1;
-    io.should_cancel = [job]() {
-        return job->client_disconnected.load(std::memory_order_acquire);
+    io.should_cancel = [this, job]() {
+        return stopping_.load(std::memory_order_acquire) ||
+               job->client_disconnected.load(std::memory_order_acquire);
     };
     io.observer = [this](const char *, const std::vector<int32_t> & tokens) {
         std::vector<std::string> token_strings;

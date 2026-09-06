@@ -4,7 +4,7 @@
 // Architecture:
 //   - Main thread: listen + accept
 //   - Per-client thread: parse HTTP request, enqueue job, wait for completion
-//   - Single worker thread: dequeue jobs, call ModelBackend::generate()
+//   - LuceEngine execution thread: run the selected backend serving loop
 //
 // Client disconnect detection: the client thread watches the socket while the
 // worker generates, and streaming writes provide a second failure signal.
@@ -48,6 +48,10 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+namespace dflash::engine {
+class LuceEngine;
+}
 
 namespace dflash::common {
 
@@ -346,7 +350,7 @@ json build_props_body(const ServerConfig & config,
 // ─── HTTP server ────────────────────────────────────────────────────────
 class HttpServer {
 public:
-    HttpServer(ModelBackend & backend,
+    HttpServer(dflash::engine::LuceEngine & engine,
                Tokenizer & tokenizer,
                const ServerConfig & config);
     ~HttpServer();
@@ -441,10 +445,6 @@ private:
     struct GenerationInputs {
         GenerateRequest request;
         int generation_cap = 0;
-        std::vector<int32_t> hint_tokens;
-        std::vector<int32_t> stall_tool_prefix_tokens;
-        std::vector<int32_t> stall_action_suffix_tokens;
-        std::vector<int32_t> stall_skip_tokens;
     };
 
     struct GenerationOutputState {
@@ -540,6 +540,7 @@ private:
     bool has_pending_jobs();
 
     // Members.
+    dflash::engine::LuceEngine & engine_;
     ModelBackend &   backend_;
     Tokenizer &      tokenizer_;
     Tokenizer *      drafter_tokenizer_ = nullptr;  // pflash drafter (optional)
@@ -599,8 +600,7 @@ private:
     std::unordered_map<PrefixHash, std::string,
                        PrefixHashHasher, PrefixHashEqual> frozen_content_cache_;
 
-    // Worker thread.
-    std::thread                     worker_thread_;
+    // Request queue consumed by the serving loop owned by LuceEngine.
     std::mutex                      queue_mu_;
     std::condition_variable         queue_cv_;
     ServerJob *                     queue_head_ = nullptr;

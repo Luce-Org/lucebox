@@ -20,6 +20,7 @@
 #include "ggml-backend.h"
 
 #include <memory>
+#include <optional>
 #include <random>
 #include <string>
 #include <vector>
@@ -27,8 +28,8 @@
 namespace dflash::common {
 
 struct Qwen35LayerSplitAdapterConfig {
-    const char * target_path = nullptr;
-    const char * draft_path  = nullptr;
+    std::string target_path;
+    std::optional<std::string> draft_path;
     DevicePlacement device;
     int draft_gpu = 0;
     RemoteDraftConfig remote_draft;
@@ -45,7 +46,7 @@ struct Qwen35LayerSplitAdapterConfig {
 
 class Qwen35LayerSplitAdapter : public LayerSplitAdapter {
 public:
-    explicit Qwen35LayerSplitAdapter(const Qwen35LayerSplitAdapterConfig & cfg);
+    explicit Qwen35LayerSplitAdapter(Qwen35LayerSplitAdapterConfig cfg);
     ~Qwen35LayerSplitAdapter() override;
 
     Qwen35LayerSplitAdapter(const Qwen35LayerSplitAdapter &) = delete;

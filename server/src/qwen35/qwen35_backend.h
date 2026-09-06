@@ -46,8 +46,8 @@ class Qwen35TensorParallelContext;
 // ── Configuration passed at construction ────────────────────────────────
 
 struct Qwen35Config {
-    const char * target_path = nullptr;
-    const char * draft_path  = nullptr;
+    std::string target_path;
+    std::optional<std::string> draft_path;
     DevicePlacement device;                // target GPU placement
     int          draft_gpu   = 0;
     RemoteDraftConfig remote_draft;
@@ -95,7 +95,7 @@ struct Qwen35Config {
 
 class Qwen35Backend : public ModelBackend {
 public:
-    explicit Qwen35Backend(const Qwen35Config & cfg);
+    explicit Qwen35Backend(Qwen35Config cfg);
     ~Qwen35Backend() override;
 
     // Non-copyable, non-movable (owns GPU resources).

@@ -1,11 +1,9 @@
-// Unit tests for the backend feature/architecture gate.
+// Unit tests for lightweight backend planning policy.
 //
-// check_feature_compatibility(), collect_feature_warnings() and the
-// model_capabilities.h table are pure functions over resolved facts, so this
-// binary needs no model file, no GPU, and none of the backend stack — it
-// compiles against feature_gate.cpp and placement_config.cpp alone. Keeping
-// it separate from test_server_unit keeps that true: a gate rule stays
-// testable in seconds rather than behind a full CUDA build.
+// The plan builder, feature gate, and model_capabilities.h table operate on
+// resolved facts. This binary needs no model file, GPU, or backend stack.
+// Keeping it separate from test_server_unit keeps policy rules testable in
+// seconds rather than behind a full CUDA build.
 //
 // Build: cmake --build . --target test_feature_gate
 // Run:   ./test_feature_gate
@@ -45,7 +43,7 @@ static std::string gate_result(
     const BackendArgs & args,
     const std::string & arch,
     PlacementBackend backend,
-    const BackendFeatureConfig & features = {}) {
+    const BackendAdmissionContext & features = {}) {
     return check_feature_compatibility(
         args, features, arch, backend, backend);
 }
@@ -55,7 +53,7 @@ static std::string gate_result_for_binary(
     const std::string & arch,
     PlacementBackend target_backend,
     PlacementBackend compiled_backend,
-    const BackendFeatureConfig & features = {}) {
+    const BackendAdmissionContext & features = {}) {
     return check_feature_compatibility(
         args, features, arch, target_backend, compiled_backend);
 }
@@ -150,7 +148,7 @@ void test_feature_gate_pflash_requires_drafter_and_supported_arch() {
     BackendArgs args;
     args.model_path = "/nonexistent/model.gguf";
 
-    BackendFeatureConfig features;
+    BackendAdmissionContext features;
     features.pflash_enabled = true;
     CHECK(!gate_result(
         args, "qwen35", PlacementBackend::Cuda, features).empty());
@@ -238,7 +236,7 @@ void test_feature_gate_tensor_parallel_requirements() {
     CHECK(!gate_result(
         remote, "qwen35", PlacementBackend::Cuda).empty());
 
-    BackendFeatureConfig pflash;
+    BackendAdmissionContext pflash;
     pflash.pflash_enabled = true;
     pflash.pflash_drafter_configured = true;
     CHECK(!gate_result(
@@ -350,7 +348,7 @@ void test_feature_gate_remote_draft_requires_supported_arch() {
 
     // Without a draft model or PFlash, remote draft IPC is unnecessary.
     BackendArgs no_draft = args;
-    no_draft.draft_path = nullptr;
+    no_draft.draft_path.reset();
     CHECK(!gate_result(
         no_draft, "gemma4", PlacementBackend::Cuda).empty());
 }
@@ -427,13 +425,13 @@ void test_feature_gate_paged_attention_allows_fixed_local_chains() {
     CHECK(gate_result(
         concurrent_chain, "qwen35", PlacementBackend::Hip).empty());
 
-    BackendFeatureConfig request_scoped;
+    BackendAdmissionContext request_scoped;
     request_scoped.draft_residency = DraftResidencyPolicy::RequestScoped;
     CHECK(!gate_result(
         concurrent_chain, "qwen35", PlacementBackend::Cuda,
         request_scoped).empty());
 
-    BackendFeatureConfig persistent;
+    BackendAdmissionContext persistent;
     persistent.draft_residency = DraftResidencyPolicy::Persistent;
     CHECK(gate_result(
         concurrent_chain, "qwen35", PlacementBackend::Cuda,
@@ -453,14 +451,14 @@ void test_feature_gate_paged_attention_allows_fixed_local_chains() {
     CHECK(!gate_result(
         windowed, "qwen35", PlacementBackend::Cuda).empty());
 
-    BackendFeatureConfig pflash;
+    BackendAdmissionContext pflash;
     pflash.pflash_enabled = true;
     pflash.pflash_drafter_configured = true;
     CHECK(!gate_result(
         base, "qwen35", PlacementBackend::Cuda, pflash).empty());
 
-    BackendFeatureConfig kvflash;
-    kvflash.kvflash_enabled = true;
+    BackendAdmissionContext kvflash;
+    kvflash.kvflash = KvFlashRequest::Fixed;
     CHECK(!gate_result(
         base, "qwen35", PlacementBackend::Cuda, kvflash).empty());
 
@@ -581,11 +579,11 @@ void test_feature_gate_parallel_and_kv_pool_rules() {
 std::vector<std::string> warn_result(
     const BackendArgs & args,
     const std::string & arch,
-    const BackendFeatureConfig & features = {}) {
+    const BackendAdmissionContext & features = {}) {
     CHECK(check_feature_compatibility(
         args, features, arch, compiled_placement_backend(),
         compiled_placement_backend()).empty());
-    return collect_feature_warnings(args, features, arch);
+    return collect_feature_warnings(args, arch);
 }
 
 static bool warns_about(const std::vector<std::string> & warnings,
@@ -622,7 +620,7 @@ void test_feature_warnings_report_inert_draft() {
 
     BackendArgs split = args;
     CHECK(parse_placement_device_list("cuda:0,cuda:1", split.device));
-    const std::vector<std::string> w = collect_feature_warnings(split, {}, "laguna");
+    const std::vector<std::string> w = collect_feature_warnings(split, "laguna");
     CHECK(warns_about(w, "--draft"));
     CHECK(w[0].find("single-device placement") != std::string::npos);
 }
@@ -666,14 +664,13 @@ void test_feature_warnings_report_inert_moe_options() {
     BackendArgs args;
     args.model_path = "/nonexistent/model.gguf";
 
-    BackendFeatureConfig moe_opts;
-    moe_opts.routing_stats_requested = true;
-    moe_opts.adaptive_experts_requested = true;
+    args.routing_stats_requested = true;
+    args.adaptive_experts_requested = true;
 
-    CHECK(warn_result(args, "laguna", moe_opts).empty());
-    CHECK(warn_result(args, "qwen35moe", moe_opts).empty());
-    CHECK(warn_result(args, "qwen35", moe_opts).size() == 2);
-    CHECK(warn_result(args, "deepseek4", moe_opts).size() == 2);
+    CHECK(warn_result(args, "laguna").empty());
+    CHECK(warn_result(args, "qwen35moe").empty());
+    CHECK(warn_result(args, "qwen35").size() == 2);
+    CHECK(warn_result(args, "deepseek4").size() == 2);
 }
 
 void test_model_capability_tables() {

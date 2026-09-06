@@ -1,91 +1,147 @@
-// Backend factory — arch-detecting ModelBackend construction.
+// Backend planning and arch-detecting ModelBackend construction.
 //
-// Given a GGUF model path and placement options, inspects the file's
-// `general.architecture` key and constructs the appropriate ModelBackend
-// subclass (Qwen35Backend, LagunaBackend, Qwen3Backend, Gemma4Backend).
-//
-// This decouples backend creation from the daemon binary's argv parsing
-// and allows both the daemon (test_dflash) and the new native server to
-// share the same construction logic.
+// BackendArgs is mutable input. prepare_backend() consumes it, resolves model
+// and placement facts, normalizes backend policy, and returns an immutable
+// BackendPlan. create_backend() accepts only that plan.
 
 #pragma once
 
 #include "backend_args.h"
 #include "gguf_inspect.h"
-#include "model_capabilities.h"
-#include "model_backend.h"
 
+#include <limits>
 #include <memory>
+#include <optional>
 #include <string>
+#include <variant>
 #include <vector>
 
 namespace dflash::common {
 
-struct BackendPreparation;
+namespace detail {
+class BackendPlanBuilder;
+}
 
-// Runtime facts resolved once from BackendArgs and shared by server admission
-// and backend construction. Fields are private so callers cannot substitute
-// an architecture that disagrees with model_path.
-class ResolvedBackendPlan {
+class BackendPlan;
+struct ModelBackend;
+
+// The sole construction entry point. Architecture configs own any path data
+// retained by the returned backend, so the plan may have an independent
+// lifetime after construction.
+std::unique_ptr<ModelBackend> create_backend(const BackendPlan & plan);
+
+// The grouped field carriers are public so consumers can name their read-only
+// views. Only the private plan builder can populate the enclosing plan.
+class BackendPlan final {
 public:
-    const GgufModelInfo & model() const { return model_; }
-    const std::string & arch() const { return model_.arch; }
-    const std::string & model_path() const { return model_path_; }
-    PlacementBackend target_backend() const { return target_backend_; }
-    PlacementBackend compiled_backend() const { return compiled_backend_; }
-    const BackendFeatureConfig & features() const { return features_; }
+    struct Model {
+        std::string path;
+        GgufModelInfo metadata;
+    };
+
+    struct Placement {
+        DevicePlacement target;
+        DevicePlacement draft;
+        RemoteDraftConfig remote_draft;
+        RemoteTargetShardConfig remote_target_shard;
+    };
+
+    struct Cache {
+        int fa_window = 0;
+        bool paged_attention = false;
+        int max_concurrency = 1;
+        long long kv_pool_tokens = 0;
+        int kq_stride_pad = 32;
+        int draft_swa_window = 0;
+        int draft_ctx_max = 4096;
+    };
+
+    struct Speculation {
+        std::optional<std::string> draft_path;
+        int draft_block_size = 0;
+        bool fast_rollback = true;
+        bool seq_verify = false;
+        bool specla_mode = false;
+        int specla_top_k = 4;
+        bool specla_top_k_explicit = false;
+        bool ddtree_mode = false;
+        int ddtree_budget = 22;
+        float ddtree_temp = 1.0f;
+        bool ddtree_chain_seed = true;
+        float ddtree_tau = std::numeric_limits<float>::infinity();
+        int verify_width = 0;
+        bool use_feature_mirror = false;
+    };
+
+    struct Execution {
+        int stream_fd = -1;
+        int chunk = 512;
+    };
+
+    struct DeepSeek4 {
+        PrefillAttentionMode prefill_mode = PrefillAttentionMode::Exact;
+        int expert_top_k = 0;
+        bool fused_decode = false;
+        bool fused_verify_f16_kv = false;
+    };
+
+    BackendPlan(BackendPlan &&) noexcept = default;
+    BackendPlan & operator=(BackendPlan &&) = delete;
+    BackendPlan(const BackendPlan &) = delete;
+    BackendPlan & operator=(const BackendPlan &) = delete;
+
+    const Model & model() const { return model_; }
+    const Placement & placement() const { return placement_; }
+    const Cache & cache() const { return cache_; }
+    const Speculation & speculation() const { return speculation_; }
+    const Execution & execution() const { return execution_; }
+    const DeepSeek4 & deepseek4() const { return deepseek4_; }
+    const std::string & arch() const { return model_.metadata.arch; }
+    const std::vector<std::string> & warnings() const { return warnings_; }
 
 private:
-    std::string          model_path_;
-    GgufModelInfo        model_;
-    BackendFeatureConfig features_;
-    PlacementBackend    target_backend_ = PlacementBackend::Auto;
-    PlacementBackend    compiled_backend_ = PlacementBackend::Auto;
+    enum class SpeclaEnvironmentAction {
+        Preserve,
+        Enable,
+        Disable,
+    };
 
-    friend BackendPreparation prepare_backend(
-        const BackendArgs & args,
-        const BackendFeatureConfig & features);
+    BackendPlan() = default;
+
+    Model model_;
+    Placement placement_;
+    Cache cache_;
+    Speculation speculation_;
+    Execution execution_;
+    DeepSeek4 deepseek4_;
+    std::vector<std::string> warnings_;
+    SpeclaEnvironmentAction specla_environment_ =
+        SpeclaEnvironmentAction::Preserve;
+
+    friend class detail::BackendPlanBuilder;
+    friend std::unique_ptr<ModelBackend> create_backend(
+        const BackendPlan & plan);
 };
 
 enum class BackendPreparationError {
-    None,
     InvalidRequest,
     ModelInspection,
     FeatureCompatibility,
 };
 
-struct BackendPreparation {
-    ResolvedBackendPlan plan;
-    BackendPreparationError error = BackendPreparationError::None;
+struct BackendPreparationFailure {
+    BackendPreparationError error;
     std::string message;
-
-    // Accepted-but-inert options for the resolved architecture and placement.
-    // Populated only when ok(); the caller decides how to surface them.
     std::vector<std::string> warnings;
-
-    bool ok() const { return error == BackendPreparationError::None; }
 };
 
-// Resolve model metadata and compiled placement, then apply all cross-feature
-// compatibility policy. This is the server's fail-fast factory entry point:
-// server_main forwards the raw request and only handles the categorized result.
+using BackendPreparation =
+    std::variant<BackendPlan, BackendPreparationFailure>;
+
+// Consumes the mutable request. Successful preparation performs one GGUF
+// inspection and returns the only value accepted by backend construction.
 BackendPreparation prepare_backend(
-    const BackendArgs & args,
-    const BackendFeatureConfig & features = {});
-
-// ─── Factory function ───────────────────────────────────────────────────
-// Inspects model_path GGUF metadata, constructs the correct backend, and
-// calls init(). Returns nullptr on failure (diagnostic printed to stderr).
-std::unique_ptr<ModelBackend> create_backend(const BackendArgs & args);
-
-// Uses facts already resolved from the same BackendArgs. The factory verifies
-// that the plan belongs to args.model_path before dispatching.
-std::unique_ptr<ModelBackend> create_backend(
-    const BackendArgs & args,
-    const ResolvedBackendPlan & plan);
-
-// Returns the detected architecture string without creating a backend.
-// Useful for early dispatch (e.g. printing which backend will be used).
-std::string detect_arch(const char * model_path);
+    BackendArgs args,
+    BackendAdmissionContext admission = {});
 
 }  // namespace dflash::common

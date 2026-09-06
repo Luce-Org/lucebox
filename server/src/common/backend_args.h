@@ -1,11 +1,13 @@
 // Raw backend construction arguments.
 //
 // This contains only caller-requested configuration. Runtime facts derived
-// from the model or compiled binary belong in ResolvedBackendPlan instead.
+// from the model or compiled binary belong in BackendPlan instead.
 
 #pragma once
 
 #include <limits>
+#include <optional>
+#include <string>
 
 #include "placement/draft_residency.h"
 #include "placement/placement_config.h"
@@ -15,35 +17,40 @@
 
 namespace dflash::common {
 
-// Server-owned features that participate in backend admission even though
-// they are not consumed by ModelBackend construction itself. Keep these
-// separate from BackendArgs so the factory API remains usable by callers that
-// do not run the HTTP server.
-struct BackendFeatureConfig {
+enum class KvFlashRequest {
+    Off,
+    Auto,
+    Fixed,
+};
+
+// Server-owned facts that participate in backend admission without becoming
+// backend construction arguments. This is the only projection the HTTP server
+// may pass into backend preparation.
+struct BackendAdmissionContext {
     bool pflash_enabled = false;
     bool pflash_drafter_configured = false;
     DraftResidencyPolicy draft_residency = DraftResidencyPolicy::Auto;
 
-    // MoE-only server features. Recorded here so the gate can report them as
-    // inert on a dense architecture; both are applied via env vars at parse
-    // time rather than through BackendArgs.
-    bool routing_stats_requested = false;    // --freq / --collect-routing
-    bool adaptive_experts_requested = false; // --adaptive-experts
+    // Automatic sizing remains backend-owned because only the initialized
+    // backend has the VRAM budget. Fixed pools can participate in admission.
+    KvFlashRequest kvflash = KvFlashRequest::Off;
 
-    // A fixed KVFlash pool requested through DFLASH_KVFLASH. "auto" is
-    // resolved later by the backend because only it has the VRAM budget needed
-    // to know whether a pool will actually be active.
-    bool kvflash_enabled = false;
+    bool kvflash_requested() const {
+        return kvflash != KvFlashRequest::Off;
+    }
+    bool fixed_kvflash_requested() const {
+        return kvflash == KvFlashRequest::Fixed;
+    }
 };
 
-// A superset of all per-architecture config fields. The factory reads only
-// those relevant to the resolved architecture; unused fields are ignored.
+// A superset of all per-architecture config fields. Preparation projects only
+// the effective fields into BackendPlan's concern-specific snapshots.
 struct BackendArgs {
     // Required
-    const char *    model_path   = nullptr;   // target .gguf
+    std::string model_path;  // target .gguf
 
     // Optional: speculative decode draft model (qwen35 only)
-    const char *    draft_path   = nullptr;
+    std::optional<std::string> draft_path;
 
     // Device placement
     DevicePlacement device;
@@ -82,13 +89,22 @@ struct BackendArgs {
     bool            fast_rollback    = true;
     bool            seq_verify       = false;
     bool            specla_mode      = false;
+    int             specla_top_k     = 4;
+    bool            specla_top_k_explicit = false;
     bool            ddtree_mode      = false;
     int             ddtree_budget    = 22;
     float           ddtree_temp      = 1.0f;
     bool            ddtree_chain_seed = true;
     float           ddtree_tau       = std::numeric_limits<float>::infinity();
+    bool            ddtree_tau_explicit = false;
     int             verify_width     = 0;  // chain spec verify width; 0 = adaptive
     bool            use_feature_mirror = false;
+
+    // MoE backend requests. The server currently realizes these through
+    // environment variables, but admission still treats them as explicit
+    // operator input rather than server-owned context.
+    bool            routing_stats_requested = false;
+    bool            adaptive_experts_requested = false;
 };
 
 }  // namespace dflash::common

@@ -22,6 +22,7 @@
 
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "generation_types.h"
 #include "sampler.h"
 #include "concurrency/seq_engine.h"
 #include "placement/draft_residency.h"
@@ -78,10 +79,6 @@ constexpr bool park_target_includes_draft_model(ParkTarget target) {
            target == ParkTarget::DraftModel;
 }
 
-// Token callback for streaming generation. Called once per committed token.
-// Return true to continue generation, false to abort.
-using TokenCallback = std::function<bool(int32_t token)>;
-
 // Return true when an in-flight request should stop. Backends poll this at
 // their existing prefill/decode cancellation boundaries so cancellation does
 // not depend on filling the socket's send buffer first.
@@ -130,166 +127,6 @@ struct DaemonIO {
 
     // Return an IO handle that also invokes `cb` for emitted tokens.
     DaemonIO with_token_callback(const TokenCallback & cb) const;
-};
-
-// ─── Generate request/result ────────────────────────────────────────────
-
-// Thinking-budget force-close hook. Mirrors antirez/ds4 ds4_eval.c's
-// hard_limit_reply_budget semantics: when the budget remaining (n_gen
-// minus tokens committed so far) falls to hard_limit_remaining, the
-// next sampled tokens get overridden with close_token_ids in order,
-// giving the model the remaining budget to write a visible answer
-// after the injected close-tag sequence.
-//
-// Single vs multi-token close:
-//   Qwen3.6: </think> is one added_token (id 248069). close_token_ids
-//            has size 1. One override + budget_close_injected=true.
-//   DeepSeek/laguna: </think> tokenizes to 3 ordinary tokens
-//            ([1718, 37947, 32] for DS-V3). close_token_ids has
-//            size 3. Three consecutive overrides, then resume.
-//
-// This is "Level 2" of our thinking-budget migration: in-process
-// mid-stream force-close, KV-continuous. Beats Level 1's phase-2
-// reprompt because the model never sees a fresh prefill — its KV
-// state continues naturally after the injected close.
-//
-// Current implementation: AR-decode only. When budget_hook is set,
-// backends MAY route generation through their AR path (skipping spec
-// decode) — the perf trade-off is acceptable since this only kicks in
-// for thinking-enabled requests. Spec-decode integration is a follow-up.
-struct BudgetHook {
-    // Multi-token close sequence injected when `(n_gen - committed)`
-    // drops to `hard_limit_remaining`. For Qwen3.x this is the
-    // canonical "Considering the limited time..." summarize-and-stop
-    // lead-in (tokenized at server startup); for non-qwen arches it's
-    // a single close-tag token. Empty = hook disabled.
-    std::vector<int32_t> close_token_ids;
-    int                  hard_limit_remaining = 0;
-};
-
-struct GenerateRequest {
-    std::vector<int32_t>       prompt;
-    int                        n_gen       = 0;
-    SamplerCfg                 sampler;
-    bool                       do_sample   = false;
-    bool                       stream      = false;  // emit tokens to stream_fd
-    // Optional inline-snap: snapshot at this position after prefill.
-    int                        snap_pos    = -1;
-    int                        snap_slot   = -1;
-    // Optional token callback for streaming. When set, backends call this
-    // for each committed token. If it returns false, generation aborts
-    // immediately. This is the primary mechanism for client-disconnect
-    // cancellation in the native HTTP server.
-    TokenCallback              on_token;
-    // Tool call hint tokens: pre-tokenized structural tokens that are
-    // predictable with ~100% confidence (XML tags, function name, param names).
-    // When non-null, the spec decode loop uses these as draft overrides,
-    // bypassing draft model computation for covered positions.
-    const std::vector<int32_t> * hint_tokens = nullptr;
-    // Optional env-gated dflash stall recovery: when spec decode is about to
-    // emit early EOS after an action preamble, inject a bare tool-call XML
-    // prefix and continue in AR with KV state intact.
-    const std::vector<int32_t> * stall_tool_prefix_tokens = nullptr;
-    const std::vector<int32_t> * stall_action_suffix_tokens = nullptr;
-    const std::vector<int32_t> * stall_skip_tokens = nullptr;
-    // Optional thinking-budget hook — see BudgetHook docs above.
-    BudgetHook                 budget_hook;
-    // Common retry knob. Upper layers set this after a speculative decode
-    // path returns success but emits no tokens, so each backend can route the
-    // retry through its existing AR path without copying retry policy.
-    bool                       force_ar_decode = false;
-};
-
-// Stable, backend-independent generation failure categories. Backends should
-// use these for recurrent failures so callers do not need to understand
-// architecture-specific strings. `generate_error_code()` is the daemon/API
-// wire representation and must remain backward-compatible once published.
-enum class GenerateErrorCode {
-    Incomplete,
-    AdapterUnavailable,
-    ContextOverflow,
-    SamplingUnsupported,
-    PrefillFailed,
-    DecodeSeedMissing,
-    DecodeFailed,
-    InvalidSnapshotSlot,
-    ModelParked,
-    BackendSpecific,
-};
-
-constexpr std::string_view generate_error_code(GenerateErrorCode error) {
-    switch (error) {
-    case GenerateErrorCode::Incomplete:          return "incomplete";
-    case GenerateErrorCode::AdapterUnavailable:  return "adapter_unavailable";
-    case GenerateErrorCode::ContextOverflow:     return "context_overflow";
-    case GenerateErrorCode::SamplingUnsupported: return "sampling_unsupported";
-    case GenerateErrorCode::PrefillFailed:       return "prefill_failed";
-    case GenerateErrorCode::DecodeSeedMissing:   return "decode_seed_missing";
-    case GenerateErrorCode::DecodeFailed:        return "decode_failed";
-    case GenerateErrorCode::InvalidSnapshotSlot: return "invalid_snapshot_slot";
-    case GenerateErrorCode::ModelParked:         return "model_parked";
-    case GenerateErrorCode::BackendSpecific:     return "backend_specific";
-    }
-    return "unknown_error";
-}
-
-struct GenerateError {
-    GenerateErrorCode code = GenerateErrorCode::Incomplete;
-    std::string detail;
-};
-
-struct GenerateResult {
-    // Default to an incomplete failure so a backend must explicitly call
-    // succeed() before returning a successful result.
-    std::optional<GenerateError> error = GenerateError{};
-    std::vector<int32_t>       tokens;
-    double                     prefill_s   = 0.0;
-    double                     decode_s    = 0.0;
-    // Backend-confirmed prompt tokens supplied by a restored KV snapshot.
-    int                        restored_prefix_tokens = 0;
-    // True when the backend's Level 2 hook injected the </think> close
-    // sequence during this generation (vs. the model self-closing). The
-    // server uses this to attribute close_kind correctly: if the model
-    // produced </think> naturally we report "natural"; if the hook fired
-    // we report "hard". Without this flag, decoding the phase-1 token
-    // stream and grepping for "</think>" cannot distinguish the two
-    // (the injected close decodes identically).
-    bool                       budget_forced_close = false;
-    // True iff the AR decode loop's post-close watchdog detected an n-gram
-    // repetition loop and broke out early. Caller surfaces this so clients
-    // can mark the answer as unreliable rather than treating the
-    // (truncated) content as a clean response.
-    bool                       degenerate_decode_close = false;
-    // DFlash chain accept rate: accepted_draft_tokens / total_draft_positions.
-    // 0.0 when spec decode did not run (AR fallback or no draft model).
-    float                      accept_rate     = 0.0f;
-    // True when spec decode actually ran (accept_rate==0 still needs a bandit update).
-    bool                       spec_decode_ran = false;
-    // True when decode emitted only tokens that the API layer suppresses
-    // (for example an immediate EOS/EOT). This is semantically equivalent
-    // to zero output for clients and should take the same AR retry path as
-    // an empty token vector.
-    bool                       empty_visible_output = false;
-
-    bool ok() const {
-        return !error.has_value();
-    }
-
-    std::string_view error_code() const {
-        return error ? generate_error_code(error->code) : std::string_view{};
-    }
-
-    std::string_view error_detail() const {
-        return error ? std::string_view(error->detail) : std::string_view{};
-    }
-
-    void succeed() {
-        error.reset();
-    }
-
-    void fail(GenerateErrorCode code, std::string detail = {}) {
-        error = GenerateError{code, std::move(detail)};
-    }
 };
 
 // ─── Backend interface ──────────────────────────────────────────────────

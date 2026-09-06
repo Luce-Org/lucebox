@@ -41,18 +41,18 @@ namespace dflash::common {
 // Returns an empty string when the requested feature set is coherent, or a
 // description of the first violated rule.
 //
-// `features` carries launch features owned above the backend factory. `arch`,
+// `admission` carries launch facts owned above the backend factory. `arch`,
 // `target_backend`, and `compiled_backend` are resolved facts: the architecture
 // read from the GGUF, the requested target with PlacementBackend::Auto mapped
 // to the compiled default, and the binary's compiled placement. Passing these
 // in keeps the gate a pure function that unit tests can drive without a model
 // file or GPU.
 //
-// prepare_backend() owns the public admission decision, and create_backend()
-// checks the same function as a safety net before dispatch.
+// prepare_backend() owns the public admission decision. Construction trusts
+// the immutable BackendPlan produced by that boundary.
 std::string check_feature_compatibility(
     const BackendArgs & args,
-    const BackendFeatureConfig & features,
+    const BackendAdmissionContext & admission,
     const std::string & arch,
     PlacementBackend    target_backend,
     PlacementBackend    compiled_backend);
@@ -69,7 +69,6 @@ std::string check_feature_compatibility(
 // configuration has no useful warnings to report.
 std::vector<std::string> collect_feature_warnings(
     const BackendArgs & args,
-    const BackendFeatureConfig & features,
     const std::string & arch);
 
 }  // namespace dflash::common
