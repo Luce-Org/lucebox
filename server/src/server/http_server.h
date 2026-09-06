@@ -248,7 +248,7 @@ bool flowkv_should_activate(const ServerConfig & config,
                             int aged_token_estimate);
 float resolve_pflash_keep_ratio(float configured_ratio,
                                 const std::string & session_id,
-                                const HttpServerSessions & sessions);
+                                HttpServerSessions & sessions);
 bool should_clamp_flowkv_disk_cache(
     bool flowkv, const DiskPrefixCachePolicy & policy);
 bool canonical_turn_matches_checkpoint(

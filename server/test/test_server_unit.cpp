@@ -6510,6 +6510,18 @@ TEST_CASE(ServerUnitFixture, test_flowkv_session_keep_ratio_override) {
     TEST_ASSERT(std::fabs(adaptive_ratio - 0.09f) < 1e-6f);
 }
 
+TEST_CASE(ServerUnitFixture, test_fresh_session_uses_configured_keep_ratio) {
+    HttpServerSessions sessions;
+
+    const float configured_ratio = 0.05f;
+    const float resolved_ratio = http_detail::resolve_pflash_keep_ratio(
+        configured_ratio, "fresh", sessions);
+
+    TEST_ASSERT(std::fabs(resolved_ratio - configured_ratio) < 1e-6f);
+    TEST_ASSERT(std::fabs(sessions.get_keep_ratio("fresh") - configured_ratio) < 1e-6f);
+    TEST_ASSERT(sessions.size() == 1);
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Qwen3-0.6B drafter loader: truncated GGUF guard (bug #438)
 // ═══════════════════════════════════════════════════════════════════════

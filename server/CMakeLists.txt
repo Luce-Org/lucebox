@@ -220,13 +220,32 @@ if(DFLASH27B_ROCMFP2_AFFINE)
     add_compile_definitions(ROCMFP2_AFFINE=1)
 endif()
 
-# HIP Phase 2 — opt-in rocWMMA flashprefill kernels (Strix Halo / gfx1151).
-# Default OFF (Phase 1 = ggml q8 fallback). Set ON for the 1.7-2.7× compress
-# speedup at 8K-32K context. Requires rocwmma headers installed under
-# ${ROCM_PATH}/include (e.g. `sudo apt install rocwmma`).
+# HIP Phase 2 — rocWMMA flashprefill kernels (Strix Halo / gfx1151).
+# Fresh HIP builds enable these automatically when the headers are installed.
+# Preserve an explicit -DDFLASH27B_HIP_SM80_EQUIV=OFF opt-out.
+set(_dflash_hip_sm80_equiv_explicit OFF)
+if(DEFINED CACHE{DFLASH27B_HIP_SM80_EQUIV})
+    set(_dflash_hip_sm80_equiv_explicit ON)
+endif()
+
+set(_dflash_hip_sm80_equiv_default OFF)
+if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+    find_path(DFLASH27B_ROCWMMA_INCLUDE_DIR rocwmma/rocwmma.hpp
+        HINTS "${_dflash_rocm_root}/include" /opt/rocm/include
+        NO_DEFAULT_PATH)
+    if(DFLASH27B_ROCWMMA_INCLUDE_DIR)
+        set(_dflash_hip_sm80_equiv_default ON)
+    elseif(NOT _dflash_hip_sm80_equiv_explicit)
+        message(WARNING
+            "rocWMMA headers were not found; PFlash drafter will use the slow q8 "
+            "fallback. Install rocwmma to enable the HIP FlashPrefill kernels.")
+    endif()
+endif()
 option(DFLASH27B_HIP_SM80_EQUIV
     "HIP: build the rocWMMA flashprefill kernels (Phase 2). Requires rocwmma."
-    OFF)
+    "${_dflash_hip_sm80_equiv_default}")
+unset(_dflash_hip_sm80_equiv_default)
+unset(_dflash_hip_sm80_equiv_explicit)
 
 # Resolve the CUDA architecture list up-front so downstream logic (notably
 # the consumer-Blackwell ggml workaround below) can inspect the actual arches
@@ -655,9 +674,6 @@ if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
     # GPU draft top-K path instead of the CPU fallback.
     target_compile_definitions(dflash_common PUBLIC DFLASH27B_HAVE_DRAFT_TOPK=1)
     if(DFLASH27B_HIP_SM80_EQUIV)
-        find_path(DFLASH27B_ROCWMMA_INCLUDE_DIR rocwmma/rocwmma.hpp
-            HINTS "${_dflash_rocm_root}/include" /opt/rocm/include
-            NO_DEFAULT_PATH)
         if(NOT DFLASH27B_ROCWMMA_INCLUDE_DIR)
             message(FATAL_ERROR
                 "DFLASH27B_HIP_SM80_EQUIV=ON but rocwmma/rocwmma.hpp not found. "

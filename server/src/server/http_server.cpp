@@ -242,10 +242,10 @@ bool flowkv_should_activate(const ServerConfig & config,
 
 float resolve_pflash_keep_ratio(float configured_ratio,
                                 const std::string & session_id,
-                                const HttpServerSessions & sessions) {
+                                HttpServerSessions & sessions) {
     return session_id.empty()
         ? configured_ratio
-        : sessions.get_keep_ratio(session_id);
+        : sessions.get_or_create_keep_ratio(session_id, configured_ratio);
 }
 
 bool should_clamp_flowkv_disk_cache(

@@ -889,8 +889,15 @@ int main(int argc, char ** argv) {
     bool pflash_enabled = (sconfig.pflash_mode != ServerConfig::PflashMode::OFF);
     if (pflash_enabled) {
         set_environment_variable("DFLASH_FP_USE_BSA", "1", false);
-        set_environment_variable("DFLASH_FP_ALPHA", "0.85", false);
+#if defined(DFLASH27B_BACKEND_HIP)
+        constexpr const char * kPflashAlphaDefault = "0.95";
+#else
+        constexpr const char * kPflashAlphaDefault = "0.85";
+#endif
+        set_environment_variable("DFLASH_FP_ALPHA", kPflashAlphaDefault, false);
         set_environment_variable("DFLASH27B_FA_WINDOW", "0", false);
+        std::fprintf(stderr, "[server] PFlash sparse alpha: %s\n",
+            std::getenv("DFLASH_FP_ALPHA"));
     }
 
     if (sconfig.draft_residency == DraftResidencyPolicy::RequestScoped &&
