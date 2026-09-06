@@ -2538,7 +2538,11 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
     if (timing) {
         log_step_tel("prefill", n_total, steps, elapsed_s(phase_t0), tel_acc);
     }
-    if (capture_spec) {
+    // AR decode also needs the completed bulk-prefill arenas retired before
+    // constructing its per-layer decode graphs. Restrict the new cleanup to
+    // bulk sparse hybrid prompts; preserve existing small-prompt reuse and
+    // speculative feature-capture cleanup. KV, HC mirrors and logits survive.
+    if (capture_spec || (bound_hybrid_scratch && n_total >= 512)) {
         deepseek4_release_prefill_scratch(cache_, moe_hybrid_.get());
     }
     return pos;
