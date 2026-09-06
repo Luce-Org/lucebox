@@ -9,9 +9,14 @@
 #include <cstring>
 
 static thread_local size_t g_mmvq_launch_count = 0;
+static thread_local size_t g_mmvq_mmid_grouped_launch_count = 0;
 
 extern "C" size_t ggml_backend_cuda_get_mmvq_launch_count(void) {
     return g_mmvq_launch_count;
+}
+
+extern "C" size_t ggml_backend_cuda_get_mmvq_mmid_grouped_launch_count(void) {
+    return g_mmvq_mmid_grouped_launch_count;
 }
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
@@ -2820,6 +2825,7 @@ void ggml_cuda_mul_mat_vec_q(
                 (int) s01, (int) stride_col_y, (int) stride_col_dst,
                 (int) s02, (int) stride_channel_y, (int) stride_channel_dst,
                 np, stream)) {
+            ++g_mmvq_mmid_grouped_launch_count;
             if (mmid_telemetry) {
                 std::fprintf(stderr,
                     "[dflash-mmid] event=mmvq type=%s width=%lld pairs=%d variant=grouped\n",

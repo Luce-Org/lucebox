@@ -888,6 +888,13 @@ if(DFLASH27B_TESTS)
     set(_raw_unit_test_targets)
     enable_testing()
 
+    add_executable(
+        test_kernel_qualification_core
+        test/test_kernel_qualification_core.cpp)
+    target_include_directories(
+        test_kernel_qualification_core PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/test)
+
     # Header-only platform shims must remain independently buildable and
     # runnable on hosted Windows workers without a GPU.
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_platform_compat.cpp")
@@ -1889,6 +1896,7 @@ if(DFLASH27B_TESTS)
         test_server_unit
         test_model_smoke)
     set(_new_cppunit_test_targets
+        test_kernel_qualification_core
         test_platform_compat
         test_draft_swa
         test_feature_gate
@@ -2128,6 +2136,72 @@ if(DFLASH27B_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src)
     endfunction()
+
+    if((DFLASH27B_GPU_BACKEND STREQUAL "cuda" OR
+        DFLASH27B_GPU_BACKEND STREQUAL "hip")
+       AND EXISTS
+           "${CMAKE_CURRENT_SOURCE_DIR}/test/test_kernel_qualification_gdn.cpp")
+        dflash_add_ggml_gpu_executable(
+            test_kernel_qualification_gdn
+            test/test_kernel_qualification_gdn.cpp)
+        target_include_directories(
+            test_kernel_qualification_gdn PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/test)
+        add_test(
+            NAME kernel_qualification_gdn
+            COMMAND test_kernel_qualification_gdn)
+        set_tests_properties(
+            kernel_qualification_gdn PROPERTIES SKIP_RETURN_CODE 77)
+        if(TARGET check)
+            add_dependencies(check test_kernel_qualification_gdn)
+        endif()
+    endif()
+
+    if((DFLASH27B_GPU_BACKEND STREQUAL "cuda" OR
+        DFLASH27B_GPU_BACKEND STREQUAL "hip")
+       AND EXISTS
+           "${CMAKE_CURRENT_SOURCE_DIR}/test/test_kernel_qualification_moe_ds4.cpp")
+        add_executable(
+            test_kernel_qualification_moe_ds4
+            test/test_kernel_qualification_moe_ds4.cpp)
+        if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+            set_source_files_properties(
+                test/test_kernel_qualification_moe_ds4.cpp PROPERTIES LANGUAGE HIP)
+            set_target_properties(
+                test_kernel_qualification_moe_ds4 PROPERTIES
+                HIP_ARCHITECTURES "${_dflash_archs}")
+            target_compile_definitions(
+                test_kernel_qualification_moe_ds4 PRIVATE GGML_USE_HIP)
+            target_link_libraries(
+                test_kernel_qualification_moe_ds4 PRIVATE hip::host)
+        else()
+            set_source_files_properties(
+                test/test_kernel_qualification_moe_ds4.cpp PROPERTIES LANGUAGE CUDA)
+            set_target_properties(
+                test_kernel_qualification_moe_ds4 PROPERTIES
+                CUDA_ARCHITECTURES "${_dflash_archs}")
+            target_link_libraries(
+                test_kernel_qualification_moe_ds4 PRIVATE CUDA::cudart)
+        endif()
+        target_include_directories(
+            test_kernel_qualification_moe_ds4 PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/test
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src/ggml-cuda
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/rocmfpx)
+        target_link_libraries(
+            test_kernel_qualification_moe_ds4 PRIVATE
+            ggml ggml-base ${DFLASH27B_GGML_BACKEND_TARGET})
+        add_test(
+            NAME kernel_qualification_moe_ds4
+            COMMAND test_kernel_qualification_moe_ds4)
+        set_tests_properties(
+            kernel_qualification_moe_ds4 PROPERTIES SKIP_RETURN_CODE 77)
+        if(TARGET check)
+            add_dependencies(check test_kernel_qualification_moe_ds4)
+        endif()
+    endif()
 
     if((DFLASH27B_GPU_BACKEND STREQUAL "cuda" OR
         DFLASH27B_GPU_BACKEND STREQUAL "hip")

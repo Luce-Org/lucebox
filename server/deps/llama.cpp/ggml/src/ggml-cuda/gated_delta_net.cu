@@ -5,6 +5,33 @@
 #include <cstdlib>
 #include <type_traits>
 
+static thread_local size_t g_gdn_scalar_launch_count = 0;
+static thread_local size_t g_gdn_grouped_cols_launch_count = 0;
+
+extern "C" size_t ggml_backend_cuda_get_gdn_scalar_launch_count(void) {
+    return g_gdn_scalar_launch_count;
+}
+
+extern "C" size_t ggml_backend_cuda_get_gdn_grouped_cols_launch_count(void) {
+    return g_gdn_grouped_cols_launch_count;
+}
+
+static bool gdn_grouped_cols_supported(int device) {
+    const ggml_cuda_device_info & info = ggml_cuda_info();
+    if (device < 0 || device >= info.device_count) {
+        return false;
+    }
+    const int cc = info.devices[device].cc;
+    const int warp_size = info.devices[device].warp_size;
+    return ((GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE) ||
+            GGML_CUDA_CC_IS_AMD(cc)) &&
+        (warp_size == 32 || warp_size == 64);
+}
+
+extern "C" bool ggml_backend_cuda_supports_gdn_grouped_cols(int device) {
+    return gdn_grouped_cols_supported(device);
+}
+
 // Tree-mode parent index sentinel: a node whose parent is the pre-block state
 // (i.e. a "root" node in the DFS-flattened tree) uses this value in
 // parent_ids[]. Any value < 0 triggers a reload from curr_state.
@@ -622,6 +649,13 @@ static void launch_gated_delta_net(
     const bool disable_grouped_cols = getenv("DFLASH_GDN_NO_GROUPED_COLS") != nullptr;
     const bool use_grouped_cols = force_grouped_cols ||
         (!disable_grouped_cols && !ampere_nvidia);
+    const bool take_grouped_cols = S_v == 128 && !KDA && use_grouped_cols &&
+        gdn_grouped_cols_supported(ggml_cuda_get_device());
+    if (take_grouped_cols) {
+        ++g_gdn_grouped_cols_launch_count;
+    } else {
+        ++g_gdn_scalar_launch_count;
+    }
 
     switch (S_v) {
         case 16:
@@ -645,9 +679,7 @@ static void launch_gated_delta_net(
         }
         case 128: {
             if constexpr (!KDA) {
-                if (use_grouped_cols &&
-                    ((GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE) ||
-                     GGML_CUDA_CC_IS_AMD(cc))) {
+                if (take_grouped_cols) {
                     constexpr int cols = 4;
                     constexpr int width = 16;
                     constexpr int column_groups_per_block = 8;
@@ -665,11 +697,6 @@ static void launch_gated_delta_net(
                         dim3 grouped_grid_dims(H, n_seqs, (groups + column_groups_per_block * groups_per_warp - 1) / (column_groups_per_block * groups_per_warp));
                         dim3 grouped_block_dims(64, column_groups_per_block, 1);
                         gated_delta_net_cuda_grouped_cols<128, cols, width, 64, TREE_MODE, WRITE_INTER, InterT><<<grouped_grid_dims, grouped_block_dims, 0, stream>>>(
-                            q_d, k_d, v_d, g_d, b_d, s_d, active_slot_ids_d, dst_d, state_out_d, parent_ids_d, persist_inter_d, replay_log_d, H,
-                            n_tokens, n_seqs, n_state_slots, sq1, sq2, sq3, sv1, sv2, sv3,
-                            sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, gate_bias, gate_A);
-                    } else {
-                        gated_delta_net_cuda<128, KDA, TREE_MODE, WRITE_INTER, InterT><<<grid_dims, block_dims, 0, stream>>>(
                             q_d, k_d, v_d, g_d, b_d, s_d, active_slot_ids_d, dst_d, state_out_d, parent_ids_d, persist_inter_d, replay_log_d, H,
                             n_tokens, n_seqs, n_state_slots, sq1, sq2, sq3, sv1, sv2, sv3,
                             sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, gate_bias, gate_A);

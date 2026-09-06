@@ -84,13 +84,15 @@ jobs:
             test_dflash test_generate test_flash_attn_sparse test_server_unit \
             test_deepseek4_unit test_feature_gate test_seq_slot_manager \
             test_seq_engine_contract test_seq_batch_plan test_client_send_buffer \
-            test_model_smoke test_batched_gdn test_concat_transpose -j$(nproc)
+            test_model_smoke test_batched_gdn test_concat_transpose \
+            test_kernel_qualification_core test_kernel_qualification_gdn \
+            test_kernel_qualification_moe_ds4 -j$(nproc)
 
       - name: Run C++ server unit tests
         run: |
           cd server/build
           ctest --output-on-failure \
-            -R "server_unit|deepseek4_unit|feature_gate|seq_slot_manager|seq_engine_contract|seq_batch_plan|client_send_buffer|batched_gdn_cpu" \
+            -R "server_unit|deepseek4_unit|feature_gate|seq_slot_manager|seq_engine_contract|seq_batch_plan|client_send_buffer|batched_gdn_cpu|test_kernel_qualification_core" \
             --no-tests=error
 
       - name: Populate venv with cu128 torch + setuptools
@@ -215,6 +217,9 @@ jobs:
             test_model_smoke
             test_batched_gdn
             test_gdn_replay_log
+            test_kernel_qualification_core
+            test_kernel_qualification_gdn
+            test_kernel_qualification_moe_ds4
             test_concat_transpose
           )
           if [[ "$RUN_SPARSE_ATTENTION_TEST" == "true" ]]; then
@@ -235,7 +240,7 @@ jobs:
       - name: Run concurrent-serving kernel tests
         run: |
           ctest --test-dir server/build --output-on-failure \
-            -R '^(test_model_smoke\.PagedAttention\.|batched_gdn$|gdn_replay_log_preflight$|concat_transpose$)' --no-tests=error
+            -R '^(test_model_smoke\.PagedAttention\.|batched_gdn$|gdn_replay_log_preflight$|test_kernel_qualification_core\.|kernel_qualification_gdn$|kernel_qualification_moe_ds4$|concat_transpose$)' --no-tests=error
 
       # Optional model-backed end-to-end smoke (real spec-decode on the 3090),
       # disabled by default because it builds dflash_server and lazy-loads the
@@ -353,11 +358,13 @@ jobs:
               test_recurrent_snapshot test_server_unit test_rocmfp3_mix_registry \
               test_rocmfp_mix_slice_matvec test_rocmfp_mix_gateup_glu \
               test_ds4_mix_registry_teardown test_model_smoke test_batched_gdn \
+              test_kernel_qualification_core test_kernel_qualification_gdn \
+              test_kernel_qualification_moe_ds4 \
               test_concat_transpose test_cuda_pool_shutdown \
             --parallel 8
           ctest --test-dir "$RUNNER_TEMP/rocmfp-build" \
             --output-on-failure \
-            -R 'cuda_pool_shutdown|rocmfp4_reference|rocmfpx_reference|rocmfp4_hip_tail|rocmfpx_mmq|deepseek4_mmid_grouped_cuda|deepseek4_unit|recurrent_snapshot|ChainRollbackPolicy|rocmfp3_mix_registry|rocmfp_mix_slice_matvec|rocmfp_mix_gateup_glu|ds4_mix_registry_teardown|test_model_smoke\.PagedAttention\.|batched_gdn$|concat_transpose$'
+            -R 'cuda_pool_shutdown|rocmfp4_reference|rocmfpx_reference|rocmfp4_hip_tail|rocmfpx_mmq|deepseek4_mmid_grouped_cuda|deepseek4_unit|recurrent_snapshot|ChainRollbackPolicy|rocmfp3_mix_registry|rocmfp_mix_slice_matvec|rocmfp_mix_gateup_glu|ds4_mix_registry_teardown|test_model_smoke\.PagedAttention\.|batched_gdn$|test_kernel_qualification_core\.|kernel_qualification_gdn$|kernel_qualification_moe_ds4$|concat_transpose$'
 
       - name: Build + test affine ROCmFP2 GPU paths
         # Keep the default wire-format build above and compile the affine layout
