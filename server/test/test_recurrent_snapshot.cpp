@@ -54,6 +54,8 @@ TEST_CASE(RecurrentSnapshotFixture, validates_paged_tree_capacity_and_uploads) {
                    65, graph_capacity));
     CHECK(dflash::common::detail::target_paged_tree_graph_capacity(
               16, 16, graph_capacity) && graph_capacity == 32768);
+    CHECK(dflash::common::detail::target_paged_tree_graph_capacity(
+              8, 1, graph_capacity, 10) && graph_capacity == 32768);
     CHECK(!dflash::common::detail::target_paged_tree_graph_capacity(
                17, 16, graph_capacity));
 
@@ -139,6 +141,23 @@ TEST_CASE(RecurrentSnapshotFixture, validates_paged_tree_layout) {
                 shape_cache, 8, 2, 4096, 48, 16));
             CHECK(!dflash::common::detail::validate_target_paged_tree_layout(
                 shape_cache, 8, 5, 4096, 32, 16));
+
+            const dflash::common::QwenPrefillSegment segments[] = {
+                {0, 3, 1},
+                {3, 2, 0},
+            };
+            int direct_rows = -1;
+            CHECK(dflash::common::detail::validate_target_paged_tree_prefix(
+                shape_cache, 5, segments, 2, 1, direct_rows));
+            CHECK(direct_rows == 6);
+            const dflash::common::QwenPrefillSegment gap[] = {
+                {0, 3, 1},
+                {4, 2, 0},
+            };
+            CHECK(!dflash::common::detail::validate_target_paged_tree_prefix(
+                shape_cache, 5, gap, 2, 1, direct_rows));
+            CHECK(!dflash::common::detail::validate_target_paged_tree_prefix(
+                shape_cache, 5, segments, 2, 3, direct_rows));
             ggml_free(shape_ctx);
         }
     }
@@ -150,7 +169,16 @@ TEST_CASE(RecurrentSnapshotFixture, invalidates_paged_tree_graph_cache_key) {
     graph.paged_tree_meta_arena.reset(
         new uint8_t[1], std::default_delete<uint8_t[]>());
     graph.paged_tree_key = TargetPagedTreeGraphKey{
-        nullptr, nullptr, nullptr, 8, 4, 256, 4096, 16, 0};
+        nullptr, nullptr, nullptr, 8, 4, 256, 4096, 16, 0, 18,
+        {1, 3, 0, 2}};
+    const TargetPagedTreeGraphKey other_slot{
+        nullptr, nullptr, nullptr, 8, 4, 256, 4096, 16, 0, 18,
+        {0, 3, 1, 2}};
+    const TargetPagedTreeGraphKey other_logits{
+        nullptr, nullptr, nullptr, 8, 4, 256, 4096, 16, 0, 19,
+        {1, 3, 0, 2}};
+    CHECK(*graph.paged_tree_key != other_slot);
+    CHECK(*graph.paged_tree_key != other_logits);
     step_graph_free(graph);
     CHECK(!graph.paged_tree_key);
     CHECK(graph.paged_tree_meta_arena);

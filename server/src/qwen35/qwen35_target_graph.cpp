@@ -1319,6 +1319,7 @@ static ggml_tensor * build_full_attn_block(
     auto paged_read = [&](ggml_tensor * q, int launch_kv_len,
                           ggml_tensor * row_seq_ids,
                           ggml_tensor * row_positions,
+                          bool tree_read,
                           bool dense_token_layout) {
         // max_kv_seq_len sizes the logical partition grid. Paged serving can
         // map that logical range onto a much smaller physical K/V pool, so
@@ -1339,7 +1340,7 @@ static ggml_tensor * build_full_attn_block(
         const int64_t padded = ((requested + 255) / 256) * 256;
         const int launch_len =
             (int)std::min<int64_t>(padded, logical_capacity);
-        ggml_tensor * out = paged_tree
+        ggml_tensor * out = tree_read
             ? ggml_paged_attn_ext_tree(
                 ctx, q, cache_k, cache_v, paged_block_table,
                 paged_kv_seq_lens, row_seq_ids, row_positions, kq_scale,
@@ -1361,15 +1362,53 @@ static ggml_tensor * build_full_attn_block(
         // ── Packed concurrent tree verify. Every query row selects its
         // physical sequence/scratch slab. The paged kernel combines the
         // committed block-table prefix with only this node's ancestor chain.
-        // A mixed graph uses causal positions for the compact AR prefix and
-        // -1 for the tree tail; a pure tree keeps positions absent.
-        ggml_tensor * Qfa = q_segment(0, n_tokens);
-        if (q_fa_out) *q_fa_out = Qfa;
         const int launch_kv_len = paged_max_kv_len > 0
             ? paged_max_kv_len : kv_start + n_tokens;
-        attn = paged_read(Qfa, launch_kv_len,
-                          paged_query_seq_ids, paged_query_positions,
-                          /*dense_token_layout=*/n_tokens > 1);
+        const int64_t tree_rows64 =
+            paged_tree_parent_ids->ne[0] * paged_tree_parent_ids->ne[1];
+        GGML_ASSERT(tree_rows64 > 0 && tree_rows64 <= n_tokens);
+        const int tree_rows = static_cast<int>(tree_rows64);
+        const int direct_rows = n_tokens - tree_rows;
+
+        if (direct_rows > 0) {
+            // Keep durable prefill/AR rows on the ordinary positioned-row
+            // operator. Folding them into the tree op lets the virtual tree
+            // tail change its partition topology at context boundaries, which
+            // changes the durable forward before any tree transaction runs.
+            GGML_ASSERT(paged_query_positions);
+            ggml_tensor * direct_seq_ids = ggml_view_1d(
+                ctx, paged_query_seq_ids, direct_rows, 0);
+            ggml_tensor * direct_positions = ggml_view_1d(
+                ctx, paged_query_positions, direct_rows, 0);
+            ggml_tensor * Qdirect = q_segment(0, direct_rows);
+            ggml_tensor * direct_attn = paged_read(
+                Qdirect, launch_kv_len, direct_seq_ids, direct_positions,
+                /*tree_read=*/false, /*dense_token_layout=*/true);
+
+            const size_t tree_row_offset =
+                static_cast<size_t>(direct_rows) *
+                paged_query_seq_ids->nb[0];
+            ggml_tensor * tree_seq_ids = ggml_view_1d(
+                ctx, paged_query_seq_ids, tree_rows, tree_row_offset);
+            ggml_tensor * Qtree = q_segment(direct_rows, tree_rows);
+            ggml_tensor * tree_attn = paged_read(
+                Qtree, launch_kv_len, tree_seq_ids,
+                /*row_positions=*/nullptr,
+                /*tree_read=*/true, /*dense_token_layout=*/true);
+
+            attn = ggml_concat(ctx, direct_attn, tree_attn, 2);
+            if (q_fa_out) {
+                *q_fa_out = ggml_concat(ctx, Qdirect, Qtree, 1);
+            }
+        } else {
+            ggml_tensor * Qfa = q_segment(0, n_tokens);
+            if (q_fa_out) *q_fa_out = Qfa;
+            attn = paged_read(
+                Qfa, launch_kv_len, paged_query_seq_ids,
+                /*row_positions=*/nullptr,
+                /*tree_read=*/true,
+                /*dense_token_layout=*/n_tokens > 1);
+        }
     } else if (ragged) {
         // ── Ragged concurrent step: prefill chunk rows and decode rows all
         // read the pool through one call, each row clamped to its own
@@ -1383,6 +1422,7 @@ static ggml_tensor * build_full_attn_block(
                                                        : kv_start + n_tokens;
         attn = paged_read(Qfa, launch_kv_len,
                           paged_query_seq_ids, paged_query_positions,
+                          /*tree_read=*/false,
                           /*dense_token_layout=*/n_tokens > 1);
     } else if (paged_block_table) {
         ggml_tensor * Qfa = q_segment(0, n_tokens);
@@ -1405,6 +1445,7 @@ static ggml_tensor * build_full_attn_block(
         const int launch_kv_len = paged_max_kv_len > 0 ? paged_max_kv_len : kv_len;
         attn = paged_read(
             Qfa, launch_kv_len, active_slot_ids, /*row_positions=*/nullptr,
+            /*tree_read=*/false,
             /*dense_token_layout=*/active_slot_ids && n_tokens > 1);
         if (!active_slot_ids) {
             // The only non-mapped paged caller is classic single-token AR.
@@ -1545,9 +1586,9 @@ static ggml_tensor * build_delta_net_block(
                 (!cap->ssm_intermediate_states && !cap->conv_input));
     GGML_ASSERT(!active_slot_ids ||
                 (mapped_tree
-                     ? (!ragged && prefill_total == 0 &&
-                        n_tokens >= mapped_ar_seqs &&
-                        (n_tokens - mapped_ar_seqs) % n_seqs == 0 &&
+                     ? (n_tokens > prefill_total + mapped_ar_seqs &&
+                        (n_tokens - prefill_total - mapped_ar_seqs) %
+                                n_seqs == 0 &&
                         active_slot_ids->ne[0] ==
                             mapped_ar_seqs + n_seqs &&
                         state_slot_ids->ne[0] ==
@@ -1558,7 +1599,8 @@ static ggml_tensor * build_delta_net_block(
         GGML_ASSERT(n_seqs == 1);
         GGML_ASSERT(prefill_total == 0 || prefill_total == n_tokens);
     }
-    GGML_ASSERT(!ragged || (!cap && !parent_ids));
+    GGML_ASSERT(!ragged || !cap || mapped_tree);
+    GGML_ASSERT(!ragged || !parent_ids || mapped_tree);
 
     // Row slices of stacked projections are strided for multi-token inputs.
     // Materialize only the small beta/alpha slices; qkv keeps its explicit
@@ -1647,7 +1689,7 @@ static ggml_tensor * build_delta_net_block(
         ggml_tensor * state_ids;
     };
     std::vector<DeltaSeg> segs;
-    segs.reserve((size_t)n_prefill_segments + 1);
+    segs.reserve((size_t)n_prefill_segments + 2);
     for (int i = 0; i < n_prefill_segments; ++i) {
         const QwenPrefillSegment & pf = prefill_segments[i];
         GGML_ASSERT(pf.seq_slot >= 0 &&
@@ -1669,11 +1711,11 @@ static ggml_tensor * build_delta_net_block(
                 ctx, active_slot_ids, mapped_ar_seqs, 0);
             ggml_tensor * ar_state = ggml_view_1d(
                 ctx, state_slot_ids, mapped_ar_seqs, 0);
-            segs.push_back({0, 1, mapped_ar_seqs, true, false,
+            segs.push_back({prefill_total, 1, mapped_ar_seqs, true, false,
                             conv_state, ssm_state, ar_active, ar_state});
         }
         const int tree_tokens = mapped_tree
-            ? (n_tokens - mapped_ar_seqs) / n_seqs : 1;
+            ? (n_tokens - prefill_total - mapped_ar_seqs) / n_seqs : 1;
         const size_t slot_offset =
             (size_t)mapped_ar_seqs * active_slot_ids->nb[0];
         ggml_tensor * segment_active = mapped_ar_seqs > 0
@@ -2584,14 +2626,35 @@ QwenGraphOutputs build_qwen35_graph(
                 ctx, feat_cat, capture_slices[(size_t)k], 0);
         }
         feat_cat = ggml_cont(ctx, feat_cat);
+        int direct_feature_rows = n_tokens;
+        int tree_feature_rows = 0;
         if (capture_tree_features) {
-            og_early.tree_features = ggml_cast(ctx, feat_cat, GGML_TYPE_BF16);
+            tree_feature_rows = in.tree_width * in.n_seqs;
+            GGML_ASSERT(tree_feature_rows > 0 &&
+                        tree_feature_rows <= n_tokens);
+            direct_feature_rows = n_tokens - tree_feature_rows;
+            ggml_tensor * tree_source = direct_feature_rows == 0
+                ? feat_cat
+                : ggml_view_2d(
+                      ctx, feat_cat, feat_cat->ne[0], tree_feature_rows,
+                      feat_cat->nb[1],
+                      (size_t)direct_feature_rows * feat_cat->nb[1]);
+            og_early.tree_features =
+                ggml_cast(ctx, tree_source, GGML_TYPE_BF16);
             ggml_set_output(og_early.tree_features);
             ggml_build_forward_expand(gf, og_early.tree_features);
-        } else {
+        }
+        if (capture_with_rows) {
+            GGML_ASSERT(direct_feature_rows > 0 &&
+                        in.target_feat_rows->ne[0] == direct_feature_rows);
+            ggml_tensor * direct_source = direct_feature_rows == n_tokens
+                ? feat_cat
+                : ggml_view_2d(
+                      ctx, feat_cat, feat_cat->ne[0], direct_feature_rows,
+                      feat_cat->nb[1], 0);
             ggml_build_forward_expand(
                 gf, ggml_set_rows(
-                        ctx, cache.target_feat, feat_cat,
+                        ctx, cache.target_feat, direct_source,
                         in.target_feat_rows));
         }
     }

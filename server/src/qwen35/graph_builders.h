@@ -38,7 +38,20 @@ bool target_graph_capacity_for_parallel_segments(
 bool target_paged_tree_graph_capacity(
     int tree_width,
     int n_tree_seqs,
-    size_t & capacity);
+    size_t & capacity,
+    int n_recurrent_segments = 1);
+
+// Validate the positioned durable prefix of a packed-tree graph. Prefill
+// segments are dense and ordered; mapped AR rows follow them and the tree is
+// the fixed-width suffix. The returned direct row count is useful to callers
+// that allocate positioned-row metadata.
+bool validate_target_paged_tree_prefix(
+    const TargetCache & cache,
+    int n_prefill_tokens,
+    const QwenPrefillSegment * prefill_segments,
+    int n_prefill_segments,
+    int mapped_ar_seqs,
+    int & n_direct_rows);
 
 // Model-free validation shared by the packed-tree builder and its shape
 // tests. paged_max_kv_len is a logical launch bound and may exceed the
@@ -68,6 +81,8 @@ inline bool target_paged_tree_uploads_ready(const StepGraph & sg) {
            allocated(sg.paged_query_seq_ids) &&
            (!sg.paged_query_positions ||
             allocated(sg.paged_query_positions)) &&
+           (!sg.logits_row_indices || allocated(sg.logits_row_indices)) &&
+           (!sg.target_feat_rows || allocated(sg.target_feat_rows)) &&
            allocated(sg.kv_write_rows);
 }
 
@@ -207,13 +222,12 @@ bool build_target_step_tree(
     const SpecLAHLDSchedule * specla_hld = nullptr);
 
 // Packed fixed-chain verify over a paged multi-slot cache. Tokens are
-// flattened after an optional compact one-token AR prefix as
-// [mapped_ar_seqs + tree_width*n_tree_seqs]. n_tree_seqs is a stable graph-
-// bucket width; inactive trees use tree_size=0 and dead/safe row mappings. In
-// particular, state_slot_ids padding must map to a valid harmless slot
-// (normally 0), while active/paged sequence IDs may use -1. Speculative K/V is
-// written into per-slot scratch slabs; recurrent transitions and target
-// features are exposed for post-verification promotion.
+// flattened as [prefill segments][mapped AR rows][tree rows]. n_tree_seqs is
+// a stable graph-bucket width; inactive trees use tree_size=0 and dead/safe
+// row mappings. state_slot_ids padding must map to a valid harmless slot
+// (normally 0), while active/paged sequence IDs may use -1. Prefill/AR rows
+// update durable state directly. Tree K/V, recurrence, and target features
+// remain scratch until accepted-prefix promotion.
 bool build_target_step_paged_tree(
     StepGraph & sg,
     const TargetWeights & w,
@@ -225,7 +239,11 @@ bool build_target_step_paged_tree(
     int tree_scratch_base,
     int tree_scratch_stride,
     int kq_stride_pad = KQ_MASK_PAD,
-    int mapped_ar_seqs = 0);
+    int mapped_ar_seqs = 0,
+    int n_prefill_tokens = 0,
+    const QwenPrefillSegment * prefill_segments = nullptr,
+    int n_prefill_segments = 0,
+    int n_logits_rows = 0);
 
 // LM-head projection: project draft hidden states through the target output matrix.
 bool build_lm_head_projection_step(

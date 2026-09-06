@@ -840,12 +840,12 @@ struct QwenGraphInputs {
     // for reading the much smaller conv-state slabs; writes use active ids.
     ggml_tensor * state_slot_ids = nullptr;
     // [n_tokens] i32 per-row block-table column for the ragged paged
-    // attention read (prefill rows carry their slot, decode rows theirs,
-    // padding -1). Non-null exactly when n_prefill_tokens > 0.
+    // attention read (prefill rows carry their slot, direct decode/tree rows
+    // theirs, padding -1). A packed tree also uses this map for every row.
     ggml_tensor * paged_query_seq_ids = nullptr;
     // [n_tokens] i32 per-row inclusive logical position; the kernel clamps
-    // each row's KV extent to position+1, which IS the causal mask. -1 on
-    // padding rows.
+    // each direct row's KV extent to position+1, which IS the causal mask.
+    // Packed-tree and padding rows carry -1.
     ggml_tensor * paged_query_positions = nullptr;
     // Optional [n_rows] i32 gather of final-norm rows before the LM head:
     // multi-prompt steps sample scattered rows (each committing segment's
@@ -854,8 +854,9 @@ struct QwenGraphInputs {
     ggml_tensor * logits_row_indices = nullptr;
     // Optional replay-stable DFlash capture destinations. When present, all
     // captured layers are concatenated once and written with ggml_set_rows.
-    // Multi-slot callers provide per-slot ring rows (padding uses dead row).
-    ggml_tensor * target_feat_rows = nullptr; // [n_tokens] i32
+    // In a packed-tree graph this covers only the durable prefill/AR prefix;
+    // the fixed-width tree suffix is returned separately for promotion.
+    ggml_tensor * target_feat_rows = nullptr; // [n_direct_tokens] i32
     // Prefill segments on the leading token axis (see QwenPrefillSegment).
     // n_prefill_tokens is their total row count. seq_slot is ignored when
     // segments are present.
@@ -888,8 +889,9 @@ struct QwenGraphInputs {
     // compact decode rows; logits_tail_rows remains the dense-path fallback.
     int  n_seqs = 1;
     // Mixed direct-commit tree graphs place this many one-token mapped AR
-    // sequences before the fixed-width speculative tree segment. Their slot
-    // IDs share active_slot_ids/state_slot_ids with the tree lanes.
+    // sequences after any prefill segments and before the fixed-width
+    // speculative tree suffix. Their slot IDs share active_slot_ids/
+    // state_slot_ids with the tree lanes; prefills own direct slab views.
     int  mapped_ar_seqs = 0;
     int  seq_slot = 0;
     int  paged_max_kv_len = 0;
@@ -926,7 +928,7 @@ struct QwenGraphOutputs {
     // views marked as ggml_set_output() so their data persists after
     // graph_compute; the spec-decode loop reads them host-side for rollback.
     std::vector<DeltaNetCapture> delta_captures;
-    // BF16 [n_capture_layers*n_embd, n_tokens], packed-tree only.
+    // BF16 [n_capture_layers*n_embd, tree_width*n_tree_seqs], packed-tree only.
     ggml_tensor * tree_features = nullptr;
     // One entry per target layer. Populated only when capture_moe_router is
     // true; qwen35 dense layers and non-MoE models leave entries null.
