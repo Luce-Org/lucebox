@@ -20,6 +20,7 @@
 #include "admission.h"
 #include "common/concurrency/seq_engine.h"
 #include "response_error.h"
+#include "common/memory_admission.h"
 #include "sse_emitter.h"
 #include "prompt_normalize.h"
 #include "tool_hint.h"
@@ -46,6 +47,9 @@
 #include <sstream>
 #include <stdexcept>
 #include <utility>
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 
 using dflash::common::SocketHandle;
 
@@ -1781,6 +1785,19 @@ void HttpServer::handle_client(SocketHandle fd) {
     }
 
     // Models endpoint (including the existing Codex discovery schema).
+    if (hr.method=="GET" && hr.path=="/memory") {
+        const auto headroom=dflash_memory::available();
+        json report={{"available_bytes",headroom==dflash_memory::unknown?json(nullptr):json(headroom)},
+            {"reserve_bytes",dflash_memory::reserve()},
+            {"evictions",memory_evictions_.load(std::memory_order_relaxed)},
+            {"uncached_requests",memory_uncached_.load(std::memory_order_relaxed)},
+            {"rejections",memory_rejections_.load(std::memory_order_relaxed)}};
+        send_response(fd,200,"application/json",report.dump()+"\n");
+        socket_close(fd);
+        return;
+    }
+
+    // Models endpoint.
     if (hr.method == "GET" && hr.path == "/v1/models") {
         const bool codex_schema = hr.query.find("client_version") != std::string::npos;
         json response = model_list(config_, codex_schema);
@@ -3356,6 +3373,7 @@ bool HttpServer::forward_upstream(
 HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
         const ParsedRequest & req, PreparedPrompt & prepared,
         GenerateRequest & generate_request) {
+    if (req.memory_no_cache) return {};
     auto & effective_prompt = prepared.tokens;
     // Tool-heavy requests prefer the reusable system/tool boundary under eviction.
     const bool prefer_inline_snap = !req.tools.empty();
@@ -3768,6 +3786,7 @@ void HttpServer::finalize_generation_cache(
         GenerationCacheState & cache, const GenerateResult & result,
         int completion_tokens, bool visible_output_seen,
         bool client_disconnected) {
+    if (req.memory_no_cache) return;
     const auto & effective_prompt = prepared.tokens;
     const bool generation_produced_output = result.ok() &&
         completion_tokens > 0 && visible_output_seen && !client_disconnected;
@@ -3918,7 +3937,7 @@ void HttpServer::remember_agent_turn(
     for (const auto & call : emitter.tool_calls()) call_ids.push_back(call.id);
     tool_memory_.remember(call_ids, assistant_content);
 
-    if (!replay_cache) return;
+    if (!replay_cache || req.memory_no_cache) return;
     if (!config_.agent_turn_cache || prefix_cache_.disabled()) return;
     // Cache only stateless-equivalent prompts. Compression and token rewrites
     // need a separate replay contract.
@@ -4202,7 +4221,7 @@ void HttpServer::worker_loop() {
 
 void HttpServer::process_job(ServerJob * job) {
     SocketHandle fd = job->fd;
-    const auto & req = job->req;
+    auto & req = job->req;
     auto started_at = std::chrono::steady_clock::now();
 
     // Track live status for /status page. RAII guard ensures idle on all paths.
@@ -4251,6 +4270,40 @@ void HttpServer::process_job(ServerJob * job) {
         req.prompt_tokens.size(),
         req.max_output,
         json_array_size(req.tools));
+
+    // Reclaim idle state on the sole generation worker, before SSE or restore.
+    // The HTTP parser must not reject memory pressure: prior caches may be freed.
+    auto admission = dflash_memory::admit(
+        dflash_memory::add(req.prompt_tokens.size(), std::max(0, req.max_output)),
+        [] { return dflash_memory::available(); },
+        [&] {
+            int slot=prefix_cache_.evict_idle_lru();
+            if (slot<0) {
+                // Include disk staging and uncommitted snapshots without metadata.
+                for (int i=0;i<ModelBackend::kMaxSlots;++i)
+                    if (backend_.snapshot_used(i)) { slot=i; break; }
+            }
+            if (slot<0) return false;
+            backend_.snapshot_free(slot);
+            forget_inline_slot_metadata(slot);
+            memory_evictions_.fetch_add(1,std::memory_order_relaxed);
+#if defined(__GLIBC__)
+            malloc_trim(0);
+#endif
+            std::fprintf(stderr,"[memory] evicted idle snapshot slot=%d\n",slot);
+            return true;
+        });
+    req.memory_no_cache=admission.without_cache;
+    if (!admission.error.empty()) {
+        memory_rejections_.fetch_add(1,std::memory_order_relaxed);
+        send_error(fd,503,admission.error);
+        finish_job();
+        return;
+    }
+    if (req.memory_no_cache) {
+        memory_uncached_.fetch_add(1,std::memory_order_relaxed);
+        std::fprintf(stderr,"[memory] admitted without optional snapshots\n");
+    }
 
     // The server owns the downstream SSE transport for local and proxied
     // generation so both paths share heartbeat and disconnect handling.
@@ -4882,6 +4935,11 @@ bool HttpServer::send_response(
 bool HttpServer::send_error(
         SocketHandle fd, int status, const std::string & message) {
     json err = {{"error", {{"message", message}, {"type", "invalid_request_error"}}}};
+    if (message.rfind("context_length_exceeded:", 0)==0) err["error"]["code"]="context_length_exceeded";
+    if (message.rfind("memory_unavailable:", 0)==0) {
+        err["error"]["code"]="insufficient_memory";
+        err["error"]["type"]="server_error";
+    }
     return send_response(fd, status, "application/json", err.dump() + "\n");
 }
 

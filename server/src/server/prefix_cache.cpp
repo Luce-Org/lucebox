@@ -825,6 +825,27 @@ void PrefixCache::record_restore_attempt(uint64_t elapsed_us, bool restored) {
     update_atomic_max(restore_stall_us_max_, elapsed_us);
 }
 
+int PrefixCache::evict_idle_lru() {
+    // There must be no pending snapshot reservation / active restore here.
+    // Any reservation left by an earlier failed job is stale now.
+    has_pending_evict_ = false;
+    full_has_pending_evict_ = false;
+    pending_protect_ = false;
+    if (!entries_.empty()) {
+        int slot=entries_.front().slot;
+        entries_.erase(entries_.begin());
+        entries_size_count_.fetch_sub(1, std::memory_order_relaxed);
+        return slot;
+    }
+    if (!full_entries_.empty()) {
+        int slot=full_entries_.front().entry.slot;
+        full_entries_.erase(full_entries_.begin());
+        full_entries_size_count_.fetch_sub(1, std::memory_order_relaxed);
+        return slot;
+    }
+    return -1;
+}
+
 void PrefixCache::mark_all_cleared() {
     if (disabled_) return;
     int n = (int)entries_.size();
@@ -890,15 +911,22 @@ int PrefixCache::prepare_full_snap(const std::vector<int32_t> & prompt_ids) {
     auto key = hash_prefix(prompt_ids.data(), (int)prompt_ids.size());
     if (find_full_entry(key) >= 0) return -1;  // already cached
 
-    int abs_slot;
+    int abs_slot = -1;
     if ((int)full_entries_.size() >= full_cap_) {
         // Evict LRU
         full_pending_evict_key_ = full_entries_.front().hash;
         full_has_pending_evict_ = true;
         abs_slot = full_entries_.front().entry.slot;
     } else {
-        abs_slot = full_slot_base_ + full_next_slot_;
-        full_next_slot_ = (full_next_slot_ + 1) % full_cap_;
+        // Pressure eviction leaves holes that round-robin alone can miss.
+        // Never overwrite a still-indexed snapshot when a free slot exists.
+        for (int offset=0; offset<full_cap_; ++offset) {
+            const int candidate=full_slot_base_+(full_next_slot_+offset)%full_cap_;
+            const bool used=std::any_of(full_entries_.begin(),full_entries_.end(),
+                [candidate](const FullLruEntry &entry) { return entry.entry.slot==candidate; });
+            if (!used) { abs_slot=candidate; break; }
+        }
+        full_next_slot_ = (abs_slot-full_slot_base_+1) % full_cap_;
         full_has_pending_evict_ = false;
     }
 

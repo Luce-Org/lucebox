@@ -8938,3 +8938,45 @@ TEST_CASE(ServerUnitFixture,
     TEST_ASSERT(!consumed_all);
     TEST_ASSERT((emitted == std::vector<int32_t>{101, 2}));
 }
+
+TEST_CASE(ServerUnitFixture, test_memory_pressure_evicts_idle_prefix_and_full_slots) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    PrefixCache cache(2, tokenizer);
+    cache.init_full_cache(1);
+    cache.confirm_inline_snap(0, 2, {1,2}, true);
+    cache.confirm_inline_snap(1, 3, {1,2,3}, false);
+    const int full = cache.prepare_full_snap({4,5,6});
+    TEST_ASSERT(full >= 2);
+    cache.confirm_full_snap(full, {4,5,6}, 3);
+    TEST_ASSERT(cache.evict_idle_lru() == 0);
+    TEST_ASSERT(cache.evict_idle_lru() == 1);
+    TEST_ASSERT(cache.evict_idle_lru() == full);
+    TEST_ASSERT(cache.evict_idle_lru() == -1);
+    TEST_ASSERT(cache.stats().in_use == 0);
+    TEST_ASSERT(cache.full_stats().in_use == 0);
+    TEST_ASSERT(cache.lookup_full({4,5,6}).first == -1);
+    std::remove(path.c_str());
+}
+
+TEST_CASE(ServerUnitFixture, test_memory_eviction_reuses_full_cache_hole) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    PrefixCache cache(1, tokenizer);
+    cache.init_full_cache(3);
+    const std::vector<int32_t> a{1,2}, b{3,4}, c{5,6}, d{7,8};
+    int sa=cache.prepare_full_snap(a); cache.confirm_full_snap(sa,a,2);
+    int sb=cache.prepare_full_snap(b); cache.confirm_full_snap(sb,b,2);
+    int sc=cache.prepare_full_snap(c); cache.confirm_full_snap(sc,c,2);
+    TEST_ASSERT(cache.lookup_full(a).first==sa); // A is newest; evict B.
+    TEST_ASSERT(cache.evict_idle_lru()==sb);
+    int sd=cache.prepare_full_snap(d);
+    TEST_ASSERT(sd==sb);
+    cache.confirm_full_snap(sd,d,2);
+    TEST_ASSERT(cache.lookup_full(a).first==sa);
+    TEST_ASSERT(cache.lookup_full(c).first==sc);
+    TEST_ASSERT(cache.lookup_full(b).first==-1);
+    std::remove(path.c_str());
+}

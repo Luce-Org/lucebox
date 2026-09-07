@@ -39,6 +39,7 @@
 #include "qwen35moe_ffn.h"
 #include "common/chain_rollback_policy.h"
 #include "common/kv_rotation.h"
+#include "common/memory_admission.h"
 #include "common/specla_commit_cuda.h"
 #include "common/specla_mode.h"
 
@@ -2886,6 +2887,27 @@ bool snapshot_target_cache(const TargetWeights & w,
             snap.target_feat_snap = nullptr;
         }
 
+        // CPU snapshots are optional: never swap the host to death to save one.
+        // Use actual tensor allocation sizes, independently of HTTP estimates.
+        auto buft = ggml_backend_get_default_buffer_type(backend);
+        if (ggml_backend_buft_is_host(buft)) {
+            uint64_t bytes = 0;
+            for (auto *t = ggml_get_first_tensor(snap.ctx); t; t = ggml_get_next_tensor(snap.ctx, t)) {
+                bytes = dflash_memory::add(bytes, dflash_memory::add(
+                    ggml_backend_buft_get_alloc_size(buft, t), ggml_backend_buft_get_alignment(buft)));
+            }
+            auto headroom = dflash_memory::available();
+            const auto cap=dflash_memory::env_bytes("LUCEBOX_SNAPSHOT_MAX_BYTES",dflash_memory::unknown);
+            if (bytes>cap || (headroom != dflash_memory::unknown &&
+                !dflash_memory::fits(headroom, bytes, dflash_memory::reserve()))) {
+                std::fprintf(stderr, "[snap] skipped: host RAM budget requires %llu MiB, available %llu MiB\n",
+                    (unsigned long long)(bytes/dflash_memory::MiB),
+                    (unsigned long long)(headroom/dflash_memory::MiB));
+                free_prefix_snapshot(snap);
+                set_last_error("PrefixSnapshot skipped: insufficient host RAM");
+                return false;
+            }
+        }
         snap.buf = ggml_backend_alloc_ctx_tensors(snap.ctx, backend);
         if (!snap.buf) {
             set_last_error("ggml_backend_alloc_ctx_tensors failed for PrefixSnapshot");
@@ -3479,6 +3501,27 @@ bool snapshot_target_cache_thin(const TargetWeights & w,
             ggml_set_name(snap.attn_k_snap[i], name);
             std::snprintf(name, sizeof(name), "snap_thin_v_%d", i);
             ggml_set_name(snap.attn_v_snap[i], name);
+        }
+        // CPU snapshots are optional: never swap the host to death to save one.
+        // Use actual tensor allocation sizes, independently of HTTP estimates.
+        auto buft = ggml_backend_get_default_buffer_type(backend);
+        if (ggml_backend_buft_is_host(buft)) {
+            uint64_t bytes = 0;
+            for (auto *t = ggml_get_first_tensor(snap.ctx); t; t = ggml_get_next_tensor(snap.ctx, t)) {
+                bytes = dflash_memory::add(bytes, dflash_memory::add(
+                    ggml_backend_buft_get_alloc_size(buft, t), ggml_backend_buft_get_alignment(buft)));
+            }
+            auto headroom = dflash_memory::available();
+            const auto cap=dflash_memory::env_bytes("LUCEBOX_SNAPSHOT_MAX_BYTES",dflash_memory::unknown);
+            if (bytes>cap || (headroom != dflash_memory::unknown &&
+                !dflash_memory::fits(headroom, bytes, dflash_memory::reserve()))) {
+                std::fprintf(stderr, "[snap] skipped: host RAM budget requires %llu MiB, available %llu MiB\n",
+                    (unsigned long long)(bytes/dflash_memory::MiB),
+                    (unsigned long long)(headroom/dflash_memory::MiB));
+                free_prefix_snapshot(snap);
+                set_last_error("PrefixSnapshot skipped: insufficient host RAM");
+                return false;
+            }
         }
         snap.buf = ggml_backend_alloc_ctx_tensors(snap.ctx, backend);
         if (!snap.buf) {
