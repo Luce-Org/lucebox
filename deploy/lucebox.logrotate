@@ -1,0 +1,11 @@
+/var/log/lucebox/model-backend.log {
+    daily
+    maxsize 20M
+    rotate 5
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su lucebox lucebox
+}

@@ -1,0 +1,22 @@
+[Unit]
+Description=Lucebox model-serving gateway
+Wants=network.target
+After=network.target
+StartLimitIntervalSec=120
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=lucebox
+Group=lucebox
+WorkingDirectory=/opt/lucebox
+Environment=LUCEBOX_CONFIG=/opt/lucebox/models.json
+Environment=LUCEBOX_LOG_DIR=/var/log/lucebox
+ExecStart=/opt/lucebox/.venv-serving/bin/python /opt/lucebox/model_router.py
+LogsDirectory=lucebox
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=45
+
+[Install]
+WantedBy=multi-user.target
