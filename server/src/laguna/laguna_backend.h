@@ -56,7 +56,7 @@ struct LagunaDraftVariant {
 
 class LagunaBackend : public ModelBackend {
 public:
-    explicit LagunaBackend(const LagunaBackendArgs & args);
+    explicit LagunaBackend(LagunaBackendArgs args);
     ~LagunaBackend() override;
 
     // Initialise CUDA backend, load weights, create cache.

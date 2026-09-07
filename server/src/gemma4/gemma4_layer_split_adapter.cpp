@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <utility>
 
 namespace dflash::common {
 
@@ -29,15 +30,15 @@ static bool tensor_ready(const ggml_tensor * t) {
 }
 
 static bool gemma4_align_split_for_kv_sharing(
-        const char * target_path,
+        const std::string & target_path,
         std::vector<Gemma4LayerSplitShard> & shards) {
-    if (shards.size() <= 1 || !target_path) return true;
+    if (shards.size() <= 1 || target_path.empty()) return true;
 
     ggml_context * meta_ctx = nullptr;
     gguf_init_params gip{};
     gip.no_alloc = true;
     gip.ctx      = &meta_ctx;
-    gguf_context * gctx = gguf_init_from_file(target_path, gip);
+    gguf_context * gctx = gguf_init_from_file(target_path.c_str(), gip);
     if (!gctx) return true;
 
     int64_t arch_id = gguf_find_key(gctx, "general.architecture");
@@ -89,8 +90,8 @@ static bool gemma4_align_split_for_kv_sharing(
 }  // namespace
 
 Gemma4LayerSplitAdapter::Gemma4LayerSplitAdapter(
-        const Gemma4LayerSplitAdapterConfig & cfg)
-    : cfg_(cfg) {}
+        Gemma4LayerSplitAdapterConfig cfg)
+    : cfg_(std::move(cfg)) {}
 
 Gemma4LayerSplitAdapter::~Gemma4LayerSplitAdapter() noexcept {
     try {
@@ -106,7 +107,7 @@ bool Gemma4LayerSplitAdapter::init() {
     }
 
     const LayerSplitRuntimeInit runtime_cfg{
-        cfg_.target_path,
+        cfg_.target_path.c_str(),
         &cfg_.device,
         "gemma4-target-split",
     };
@@ -196,7 +197,7 @@ bool Gemma4LayerSplitAdapter::init_mixed_target_split() {
         return false;
     }
 
-    const auto info = inspect_gguf_model_info(cfg_.target_path);
+    const auto info = inspect_gguf_model_info(cfg_.target_path.c_str());
     const int n_layer = info.n_layer;
     if (n_layer <= 0) {
         std::fprintf(stderr,
@@ -298,7 +299,7 @@ bool Gemma4LayerSplitAdapter::init_mixed_target_split() {
     TargetShardIpcLaunchConfig launch;
     launch.mode = BackendIpcMode::Gemma4TargetShard;
     launch.bin = cfg_.remote_target_shard.ipc_bin;
-    launch.target_path = cfg_.target_path ? cfg_.target_path : "";
+    launch.target_path = cfg_.target_path;
     launch.gpus = remote_gpus;
     launch.layer_begins = remote_layer_begins;
     launch.layer_ends = remote_layer_ends;
@@ -332,7 +333,7 @@ bool Gemma4LayerSplitAdapter::init_mixed_target_split() {
 
 void Gemma4LayerSplitAdapter::kvflash_read_config() {
     if (!std::getenv("DFLASH_KVFLASH") || shards_.empty()) return;
-    kvflash_drafter_path_ = kvflash_find_drafter(cfg_.target_path);
+    kvflash_drafter_path_ = kvflash_find_drafter(cfg_.target_path.c_str());
 
     int64_t min_free = std::numeric_limits<int64_t>::max();
     int64_t max_bytes_per_token = 0;

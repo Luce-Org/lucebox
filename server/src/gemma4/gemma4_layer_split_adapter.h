@@ -22,7 +22,7 @@
 namespace dflash::common {
 
 struct Gemma4LayerSplitAdapterConfig {
-    const char * target_path = nullptr;
+    std::string target_path;
     DevicePlacement device;
     RemoteTargetShardConfig remote_target_shard;
     int chunk = 512;
@@ -44,7 +44,7 @@ struct Gemma4LayerSplitSnapshot {
 
 class Gemma4LayerSplitAdapter : public LayerSplitAdapter {
 public:
-    explicit Gemma4LayerSplitAdapter(const Gemma4LayerSplitAdapterConfig & cfg);
+    explicit Gemma4LayerSplitAdapter(Gemma4LayerSplitAdapterConfig cfg);
     ~Gemma4LayerSplitAdapter() noexcept override;
 
     Gemma4LayerSplitAdapter(const Gemma4LayerSplitAdapter &) = delete;

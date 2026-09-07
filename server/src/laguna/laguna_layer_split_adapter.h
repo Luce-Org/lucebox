@@ -23,7 +23,7 @@
 namespace dflash::common {
 
 struct LagunaLayerSplitAdapterConfig {
-    const char * target_path = nullptr;
+    std::string target_path;
     DevicePlacement device;
     RemoteTargetShardConfig remote_target_shard;
     int chunk = 2048;
@@ -44,7 +44,7 @@ struct LagunaLayerSplitSnapshot {
 
 class LagunaLayerSplitAdapter : public LayerSplitAdapter {
 public:
-    explicit LagunaLayerSplitAdapter(const LagunaLayerSplitAdapterConfig & cfg);
+    explicit LagunaLayerSplitAdapter(LagunaLayerSplitAdapterConfig cfg);
     ~LagunaLayerSplitAdapter() override;
 
     LagunaLayerSplitAdapter(const LagunaLayerSplitAdapter &) = delete;

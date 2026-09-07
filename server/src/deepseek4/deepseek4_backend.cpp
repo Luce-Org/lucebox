@@ -27,6 +27,7 @@
 #include <cinttypes>
 #include <limits>
 #include <new>
+#include <utility>
 
 namespace dflash::common {
 
@@ -740,8 +741,8 @@ static MoeLayerDesc make_ds4_expert_layer_desc(const DeepSeek4Layer & layer) {
 
 }  // namespace
 
-DeepSeek4Backend::DeepSeek4Backend(const DeepSeek4BackendConfig & cfg)
-    : cfg_(cfg) {}
+DeepSeek4Backend::DeepSeek4Backend(DeepSeek4BackendConfig cfg)
+    : cfg_(std::move(cfg)) {}
 
 DeepSeek4Backend::~DeepSeek4Backend() {
     shutdown();
@@ -808,20 +809,24 @@ bool DeepSeek4Backend::load_model() {
             }
             std::fprintf(stderr,
                          "[deepseek4] explicit HIP full-model load failed: %s\n",
-                         cfg_.model_path);
+                         cfg_.model_path.c_str());
             return false;
         }
     } else if (target_backend == PlacementBackend::Hip || heterogeneous_tp) {
         std::fprintf(stderr,
                      "[deepseek4] heterogeneous target detected; using hybrid expert load path\n");
         if (!init_hybrid_model()) {
-            std::fprintf(stderr, "[deepseek4] hybrid mode failed: %s\n", cfg_.model_path);
+            std::fprintf(
+                stderr, "[deepseek4] hybrid mode failed: %s\n",
+                cfg_.model_path.c_str());
             return false;
         }
     } else if (!load_deepseek4_gguf(cfg_.model_path, backend_, w_)) {
         std::fprintf(stderr, "[deepseek4] full model load failed, trying hybrid mode...\n");
         if (!init_hybrid_model()) {
-            std::fprintf(stderr, "[deepseek4] hybrid mode also failed: %s\n", cfg_.model_path);
+            std::fprintf(
+                stderr, "[deepseek4] hybrid mode also failed: %s\n",
+                cfg_.model_path.c_str());
             return false;
         }
     }
@@ -1410,7 +1415,7 @@ bool DeepSeek4Backend::init_hybrid_model() {
     plan.skip_expert_tensors = true;
     if (!load_deepseek4_gguf_partial(cfg_.model_path, backend_, plan, w_)) {
         std::fprintf(stderr, "[deepseek4] failed to partially load model for hybrid mode: %s\n",
-                     cfg_.model_path);
+                     cfg_.model_path.c_str());
         return false;
     }
 
@@ -1426,7 +1431,7 @@ bool DeepSeek4Backend::init_hybrid_model() {
         free_deepseek4_weights(w_);
         if (!load_deepseek4_gguf(cfg_.model_path, backend_, w_)) {
             std::fprintf(stderr, "[deepseek4] failed to reload full model after placement: %s\n",
-                         cfg_.model_path);
+                         cfg_.model_path.c_str());
             return false;
         }
         return true;
@@ -1474,7 +1479,7 @@ bool DeepSeek4Backend::init_hybrid_model() {
             if (!load_deepseek4_gguf(cfg_.model_path, backend_, w_)) {
                 std::fprintf(stderr,
                     "[deepseek4] monolithic fallback failed (model does not "
-                    "fit resident): %s\n", cfg_.model_path);
+                    "fit resident): %s\n", cfg_.model_path.c_str());
                 return false;
             }
             return true;

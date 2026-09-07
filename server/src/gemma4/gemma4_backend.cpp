@@ -20,13 +20,14 @@
 #include <chrono>
 #include <cstdio>
 #include <cmath>
+#include <utility>
 
 namespace dflash::common {
 
 // ── Ctor / dtor ────────────────────────────────────────────────────────
 
-Gemma4Backend::Gemma4Backend(const Gemma4BackendConfig & cfg)
-    : cfg_(cfg) {}
+Gemma4Backend::Gemma4Backend(Gemma4BackendConfig cfg)
+    : cfg_(std::move(cfg)) {}
 
 Gemma4Backend::~Gemma4Backend() { shutdown(); }
 
@@ -155,7 +156,8 @@ bool Gemma4Backend::unpark(ParkTarget target) {
 
 void Gemma4Backend::kvflash_read_config() {
     if (std::getenv("DFLASH_KVFLASH")) {
-        kvflash_drafter_path_ = kvflash_find_drafter(cfg_.model_path);
+        kvflash_drafter_path_ = kvflash_find_drafter(
+            cfg_.model_path.c_str());
     }
     // "auto" sizes from the GPU (weights resident, cache not yet allocated):
     // gemma4 pools the FULL-attention layers only (F16 cache); SWA rings are
@@ -1264,7 +1266,7 @@ bool Gemma4Backend::load_decode_draft() {
         std::fprintf(stderr, "[gemma4] draft CUDA init failed (gpu=%d)\n", draft_gpu);
         return false;
     }
-    if (!load_draft_gguf(cfg_.draft_path, draft_backend_, dw_, nullptr)) {
+    if (!load_draft_gguf(*cfg_.draft_path, draft_backend_, dw_, nullptr)) {
         std::fprintf(stderr, "[gemma4] draft load failed: %s\n", dflash27b_last_error());
         ggml_backend_free(draft_backend_);
         draft_backend_ = nullptr;
