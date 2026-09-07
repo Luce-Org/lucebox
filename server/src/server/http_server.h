@@ -310,6 +310,7 @@ struct ParsedRequest {
     DiskPrefixCachePolicy     disk_cache_policy;
     // PPP: stable pin cut for tool-heavy requests (0 = use default boundary).
     int                       pin_end_token = 0;
+    bool                      memory_no_cache = false; // worker admission only
 };
 
 // Parse request sampler fields, applying model-card defaults where present.
@@ -548,6 +549,7 @@ private:
     PFlashDrafterIpcClient pflash_remote_;
     ToolMemory       tool_memory_;
     PrefixCache      prefix_cache_;
+    std::atomic<uint64_t> memory_evictions_{0}, memory_uncached_{0}, memory_rejections_{0};
     DiskPrefixCache  disk_cache_;
 
     // Per-session adaptive keep_ratio bandit state.

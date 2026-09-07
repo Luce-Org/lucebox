@@ -145,6 +145,9 @@ public:
     // Drop all entries (e.g., after OOM recovery).
     void mark_all_cleared();
 
+    // Worker-only pressure eviction; pins are reuse hints, not active leases.
+    int evict_idle_lru();
+
     // ── Full-compress cache ─────────────────────────────────────────
 
     // Initialize the full-cache pool. full_cap slots start at cap.
