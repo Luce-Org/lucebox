@@ -1,0 +1,2 @@
+2026-09-04T06:27:03Z	created	decisions log for DS4V-2 owner pass, kept uncommitted by design
+2026-09-04T06:29:42Z	manifest-auth	 HF token absent and parent repo is gated, supervisor picked optional HF_TOKEN bearer plus public API shard listing and counts pending on operator machine
