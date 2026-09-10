@@ -45,25 +45,27 @@ int run_pflash_drafter_ipc_daemon(const char * drafter_path,
         std::string cmd;
         iss >> cmd;
         if (cmd == "quit" || cmd == "exit") break;
-        if (cmd == "compress") {
-            int keep_x1000 = 0;
-            iss >> keep_x1000;
-            std::string path = read_line_tail(iss);
-            if (keep_x1000 < 0 || keep_x1000 > 1000 || path.empty()) {
-                std::fprintf(stderr, "[pflash-ipc-daemon] bad compress: %s\n",
-                             line.c_str());
+        if (cmd == "compress" || cmd == "compress2" || cmd == "compress3") {
+            PFlashDrafterIpcCompressCommand request;
+            std::string parse_error;
+            if (!parse_pflash_drafter_ipc_compress_command(line, request, parse_error)) {
+                std::fprintf(stderr, "[pflash-ipc-daemon] bad compress: %s (%s)\n",
+                             line.c_str(), parse_error.c_str());
                 stream_status(stream_fd, -1);
                 continue;
             }
-            auto input_ids = read_int32_file(path);
+            auto input_ids = read_int32_file(request.path);
             if (input_ids.empty()) {
                 std::fprintf(stderr, "[pflash-ipc-daemon] read tokens failed: %s\n",
-                             path.c_str());
+                             request.path.c_str());
                 stream_status(stream_fd, -1);
                 continue;
             }
-            const float keep = (float)keep_x1000 / 1000.0f;
-            auto compressed = drafter_score_and_compress(ctx, input_ids, keep);
+            auto compressed = drafter_score_and_compress(
+                ctx, input_ids, request.keep_ratio, /*chunk_size=*/32,
+                request.score_query_tokens, /*pool_kernel=*/13,
+                request.score_query_end,
+                request.required_instruction_spans);
             if (compressed.empty()) {
                 std::fprintf(stderr, "[pflash-ipc-daemon] compress returned empty\n");
                 stream_status(stream_fd, -1);

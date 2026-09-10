@@ -322,11 +322,35 @@ See the [current six-expert Strix Halo profile](https://www.lucebox.com/blog/dee
 | `--prefill-threshold <N>` | `32000` | Token threshold used by auto mode. |
 | `--prefill-keep-ratio <F>` | `0.05` | Fraction of source tokens kept. |
 | `--prefill-curve T:R [T:R ...]` | none | Piecewise keep-ratio curve; overrides the flat ratio. |
-| `--prefill-drafter <path>` | none | PFlash drafter GGUF. |
+| `--prefill-drafter <path>` | none | PFlash drafter GGUF: Qwen3-0.6B, or Qwen3.5-0.8B when the file name contains `qwen3.5`/`qwen35`. |
 | `--prefill-skip-park` | off | Keep target and decode draft resident while PFlash runs. |
 | `--prefill-upstream-base <URL>` | none | Enable compression-proxy mode. |
 | `--prefill-upstream-key <KEY>` | none | Bearer token for the upstream. |
 | `--prefill-upstream-model <NAME>` | none | Model name forwarded upstream. |
+
+With a Qwen3.5-0.8B drafter and strict LongAttnComp selection
+(`PFLASH_LONGATTNCOMP_MODE=budget_only`, `PFLASH_LONGATTNCOMP_CHUNK_SIZE`,
+`PFLASH_LONGATTNCOMP_QUERY_TOKENS`), the drafter runs only its first fifteen
+blocks and scores the context with block 15's NoPE Q/K projections, the same
+attention-mass scorer the Qwen3-0.6B block-13 head uses. Its 262K native
+context covers inputs the Qwen3-0.6B drafter cannot score within its 32K
+window. `PFLASH_LONGATTNCOMP_HEAD_GGUF` accepts a trained block-15 head
+(schema `qwen3_5_0_8b_nope_qk_mass_v1`); `PFLASH_QWEN35_LEGACY_SCORER=1`
+restores the previous all-layer running-max scorer. The Qwen3.5 attention
+runs dense (`ggml_flash_attn_ext`); the block-sparse FlashPrefill kernels
+still dispatch head dimension 128 only.
+
+The per-session adaptive keep ratio applies to this path unchanged: a request
+carrying a `session_id` retains the session's ratio, the strict selector fills
+its token budget from it, and the ratio is updated from the smoothed DFlash
+acceptance rate after every turn where speculative decoding ran (below 75%
+acceptance retain more, above 85% retain less, 0.5-1 point per turn, bounded
+to 2.5-20%; `server/src/server/adaptive_keep_ratio.h`). A new session starts
+from the configured ratio for its prompt length (`--prefill-keep-ratio` or
+`--prefill-curve`), so the controller adapts around the real-use budget
+instead of a fixed 10%. Acceptance is a proxy for compression quality: it
+does not detect a dropped answer document directly, so the ratio curve and
+the retention benchmarks remain the quality reference.
 
 ### Reasoning and MoE controls
 

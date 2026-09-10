@@ -24,6 +24,7 @@
 
 #include "qwen3_drafter_model.h"
 #include "common/backend_precision.h"
+#include "common/gguf_inspect.h"
 #include "common/gguf_mmap.h"
 #include "internal.h"
 
@@ -91,6 +92,20 @@ bool copy_tensor_from_file(gguf_context * gctx, const char * name,
         return true;
     }
 
+    if (src_type == GGML_TYPE_F32 && dst_type == GGML_TYPE_BF16) {
+        std::vector<ggml_bf16_t> tmp_bf16((size_t)n);
+        ggml_fp32_to_bf16_row((const float *)src, tmp_bf16.data(), n);
+        ggml_backend_tensor_set(dst, tmp_bf16.data(), 0, ggml_nbytes(dst));
+        return true;
+    }
+
+    if (src_type == GGML_TYPE_F32 && dst_type == GGML_TYPE_F16) {
+        std::vector<ggml_fp16_t> tmp_f16((size_t)n);
+        ggml_fp32_to_fp16_row((const float *)src, tmp_f16.data(), n);
+        ggml_backend_tensor_set(dst, tmp_f16.data(), 0, ggml_nbytes(dst));
+        return true;
+    }
+
     std::fprintf(stderr, "[qwen3-0.6b] unsupported tensor conversion for %s: %s -> %s\n",
                  name, ggml_type_name(src_type), ggml_type_name(dst_type));
     return false;
@@ -106,6 +121,89 @@ float get_f32(gguf_context * g, const char * key, float def) {
     int k = gguf_find_key(g, key);
     if (k < 0) return def;
     return gguf_get_val_f32(g, k);
+}
+
+bool metadata_equals(gguf_context * g, const char * key, const char * expected) {
+    const int id = gguf_find_key(g, key);
+    return id >= 0 && std::string(gguf_get_val_str(g, id)) == expected;
+}
+
+bool load_longattncomp_head(
+        const std::string & path,
+        const std::string & drafter_sha256,
+        Qwen3DrafterWeights & out) {
+    ggml_context * tensor_ctx = nullptr;
+    gguf_init_params iparams{ /*no_alloc=*/ true, /*ctx=*/ &tensor_ctx };
+    gguf_context * gctx = gguf_init_from_file(path.c_str(), iparams);
+    if (!gctx) {
+        set_last_error("LongAttnComp head GGUF could not be opened: " + path);
+        return false;
+    }
+    auto fail = [&](const std::string & message) {
+        gguf_free(gctx);
+        if (tensor_ctx) ggml_free(tensor_ctx);
+        set_last_error(message);
+        return false;
+    };
+    const bool metadata_ok =
+        metadata_equals(gctx, "general.architecture", "longattncomp") &&
+        metadata_equals(gctx, "longattncomp.schema", "qwen3_0_6b_nope_qk_mass_v1") &&
+        metadata_equals(gctx, "longattncomp.base_model", "Qwen/Qwen3-0.6B") &&
+        metadata_equals(
+            gctx,
+            "longattncomp.runtime_gguf_sha256",
+            drafter_sha256.c_str()) &&
+        metadata_equals(
+            gctx,
+            "longattncomp.feature_tap",
+            "post_block12_residual_before_block13");
+    if (!metadata_ok) {
+        return fail("LongAttnComp head metadata does not match the loaded Qwen3-0.6B drafter");
+    }
+    struct TensorContract {
+        const char * name;
+        ggml_tensor * destination;
+    };
+    const TensorContract contracts[] = {
+        {"longattncomp.attn_q.weight", out.layers[13].wq},
+        {"longattncomp.attn_k.weight", out.layers[13].wk},
+    };
+    for (const auto & contract : contracts) {
+        const int64_t id = gguf_find_tensor(gctx, contract.name);
+        ggml_tensor * source = tensor_ctx
+            ? ggml_get_tensor(tensor_ctx, contract.name)
+            : nullptr;
+        if (id < 0 || gguf_get_tensor_type(gctx, id) != GGML_TYPE_F32 ||
+            !source || !ggml_are_same_shape(source, contract.destination) ||
+            gguf_get_tensor_size(gctx, id) !=
+                (size_t)ggml_nelements(contract.destination) * sizeof(float)) {
+            return fail(std::string("LongAttnComp head tensor contract mismatch: ") +
+                        contract.name);
+        }
+    }
+    const size_t data_offset = gguf_get_data_offset(gctx);
+    GgufMmap mmap;
+    std::string mmap_error;
+    if (!mmap.open(path, mmap_error)) {
+        return fail(mmap_error);
+    }
+    for (const auto & contract : contracts) {
+        const int64_t id = gguf_find_tensor(gctx, contract.name);
+        const size_t offset = gguf_get_tensor_offset(gctx, id);
+        const size_t size = gguf_get_tensor_size(gctx, id);
+        if (data_offset > mmap.size() || offset > mmap.size() - data_offset ||
+            size > mmap.size() - data_offset - offset ||
+            !copy_tensor_from_file(
+                gctx, contract.name, mmap.data(), data_offset, contract.destination)) {
+            return fail(std::string("LongAttnComp head tensor load failed: ") +
+                        contract.name);
+        }
+    }
+    gguf_free(gctx);
+    if (tensor_ctx) ggml_free(tensor_ctx);
+    out.longattncomp_head_loaded = true;
+    std::fprintf(stderr, "[qwen3-0.6b] loaded LongAttnComp head: %s\n", path.c_str());
+    return true;
 }
 
 } // namespace
@@ -287,6 +385,23 @@ bool load_qwen3_drafter_model(const std::string & path,
         out.ctx = nullptr;
         return false;
     }
+    if (const char * head_path = std::getenv("PFLASH_LONGATTNCOMP_HEAD_GGUF")) {
+        constexpr const char * expected_drafter_sha256 =
+            "f9c9f1d3c1e21755b82d4e165f88dbbbd4355646d632fb5d6cef7c66ed4ee04e";
+        const auto drafter_identity = read_gguf_metadata(path, true);
+        if (!*head_path || out.n_layer < 14 || !drafter_identity.ok ||
+            drafter_identity.sha256 != expected_drafter_sha256 ||
+            !load_longattncomp_head(head_path, drafter_identity.sha256, out)) {
+            if (drafter_identity.sha256 != expected_drafter_sha256) {
+                set_last_error("LongAttnComp head requires the pinned Qwen3-0.6B drafter GGUF");
+            }
+            ggml_backend_buffer_free(out.buf);
+            ggml_free(out.ctx);
+            out.buf = nullptr;
+            out.ctx = nullptr;
+            return false;
+        }
+    }
     return true;
 }
 
@@ -294,6 +409,7 @@ void free_qwen3_drafter_model(Qwen3DrafterWeights & w) {
     if (w.buf) { ggml_backend_buffer_free(w.buf); w.buf = nullptr; }
     if (w.ctx) { ggml_free(w.ctx); w.ctx = nullptr; }
     w.layers.clear();
+    w.longattncomp_head_loaded = false;
     w.tok_embd = w.out_norm = w.output = nullptr;
     w.backend = nullptr;
 }
