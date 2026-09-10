@@ -1,0 +1,4 @@
+torch==2.10.0+rocm7.2.4.lw.git3d3aa833
+numpy==2.5.2
+Pillow==12.3.0
+safetensors==0.7.0

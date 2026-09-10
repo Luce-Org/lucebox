@@ -1,0 +1,83 @@
+{
+  "diagnostic_only": true,
+  "native_acceptance": "NOT_QUALIFIED",
+  "device": {
+    "kind": "cpu",
+    "gpu_api_called": false
+  },
+  "torch": "2.10.0+rocm7.2.4.git3d3aa833",
+  "torch_git": "3d3aa833db84eed6b7f5595cb5f162c2f78300a4",
+  "torch_hip": "7.2.53211",
+  "numpy": "2.5.2",
+  "private_library_path": "/home/marcelorm/ds4v-work/source-rocm210-reference/private-miopen/opt/rocm-7.2.4/lib",
+  "threads": [
+    2,
+    2
+  ],
+  "script_sha256": "17ba9d66260d25c056ecc56a35192748a662b040605bb0bf8864bd704a66267b",
+  "reference_manifest_sha256": "38d12f30b9a10ed2f0e99bf4d40a07357ab5e8c4880151c58cb90414e4a53f4f",
+  "source_hashes": {
+    "config.json": "6cd841bdd6702f5e2ac34671bc78047ed80817102465525ae2a41c502abbcd75",
+    "inference/vision.py": "a4f089069310398d42ca17fd4496cec82da64cbbfde9b0230679ce1537cc0bb1",
+    "inference/image_processor.py": "cac2ff6af15207ce53d0319dc52c6ed1fa5f4fed21f75795fe0fc014632e9086"
+  },
+  "index_sha256": "507977e3d3818865264e68c0fdab139aa7f3929d0d0cf693dacc47428da56395",
+  "weight_inventory_sha256": "b0556c40a8bff3f4c2c262d57137a97123cbdbf7444a7fae495ef17cd28469ee",
+  "image": "corn",
+  "patch_sha256": "6ef206f7dbe317c0d456de4e9501dc5e734b05d91d7a5341d463187a28233d3a",
+  "outputs": {
+    "features": {
+      "file": "corn-features.f32",
+      "shape": [
+        782,
+        1024
+      ],
+      "sha256": "aa7c43be7182759f83881cf823661bf52c14b73222645d1ec37b14c6502bc982"
+    },
+    "embeddings": {
+      "file": "corn-embeddings.f32",
+      "shape": [
+        96,
+        4096
+      ],
+      "sha256": "c96d59ae722ad8ac31299aabb4e758b788a1ee4be30ea94b833c753721229040"
+    }
+  },
+  "comparisons": {
+    "features": {
+      "finite": true,
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "cosine": 1.0,
+      "exact_fraction": 1.0,
+      "byte_identical": true,
+      "gate": {
+        "max_abs": 0.25,
+        "rmse": 0.03,
+        "cosine": 0.9995
+      },
+      "pass": true
+    },
+    "embeddings": {
+      "finite": true,
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "cosine": 0.9999999999999998,
+      "exact_fraction": 1.0,
+      "byte_identical": true,
+      "gate": {
+        "max_abs": 0.75,
+        "rmse": 0.08,
+        "cosine": 0.999
+      },
+      "pass": true
+    }
+  },
+  "forward_seconds": 1.8079554990399629,
+  "attention": "Unchanged original SDPA call, default dispatch; no backend forcing/autocast/compile/patch",
+  "rotary_context": "cpu",
+  "default_dtype": "torch.bfloat16",
+  "source_portability_gate": "PASS",
+  "elapsed_seconds_after_imports": 4.954526190995239,
+  "max_rss_kib": 2418408
+}

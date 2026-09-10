@@ -1,0 +1,19 @@
+3.12.3 (main, Jun 19 2026, 12:46:00) [GCC 13.3.0]
+/home/marcelorm/ds4v-work/source-rocm210-reference/.venv
+/usr
+https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.4/torch-2.10.0%2Brocm7.2.4.lw.git3d3aa833-cp312-cp312-linux_x86_64.whl
+wheel bytes 1647409999 sha256 e3a4b7f11eacc4037bc405fbf8beacf2ce19cc135ad283bb653b93a127f379d0
+Name: torch
+Version: 2.10.0+rocm7.2.4.lw.git3d3aa833
+Requires-Python: >=3.10
+Requires-Dist: filelock
+Requires-Dist: typing-extensions>=4.10.0
+Requires-Dist: setuptools; python_version >= "3.12"
+Requires-Dist: sympy>=1.13.3
+Requires-Dist: networkx>=2.5.1
+Requires-Dist: jinja2
+Requires-Dist: fsspec>=0.8.5
+Requires-Dist: triton==3.6.0+rocm7.2.4.git4ed88892; platform_system == "Linux" and platform_machine == "x86_64"
+Requires-Dist: optree>=0.13.0; extra == "optree"
+Requires-Dist: opt-einsum>=3.3; extra == "opt-einsum"
+Requires-Dist: pyyaml; extra == "pyyaml"

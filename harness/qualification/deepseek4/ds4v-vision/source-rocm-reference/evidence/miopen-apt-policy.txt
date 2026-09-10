@@ -1,0 +1,6 @@
+miopen-hip:
+  Installed: (none)
+  Candidate: 3.5.1.70204-93~24.04
+  Version table:
+     3.5.1.70204-93~24.04 600
+        600 https://repo.radeon.com/rocm/apt/7.2.4 noble/main amd64 Packages

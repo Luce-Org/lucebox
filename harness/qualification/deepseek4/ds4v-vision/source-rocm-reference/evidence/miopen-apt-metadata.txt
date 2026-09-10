@@ -1,0 +1,18 @@
+Package: miopen-hip
+Architecture: amd64
+Conflicts: miopen-opencl
+Depends: hip-runtime-amd, comgr, roctracer, rocblas, hipblaslt, rocm-core, rocrand, rocm-core
+Priority: optional
+Section: devel
+Filename: pool/main/m/miopen-hip/miopen-hip_3.5.1.70204-93~24.04_amd64.deb
+Size: 307969764
+SHA256: b5759989f8d95b367d83309f4d9da3c55c1e5868703aaede1647434df375b6c2
+SHA1: d86fc79231d175df7f833b022487e72d9a0d2a98
+MD5sum: 0109619cddbabe2347e757d157ea9540
+Description: AMD DNN Library
+Description-md5: 
+Maintainer: MIOpen Maintainer <miopen-lib.support@amd.com>
+Recommends: miopen-hip-dev (>=3.5.1.70204)
+Version: 3.5.1.70204-93~24.04
+Installed-Size: 2931663
+

@@ -1,0 +1,85 @@
+Looking in links: /home/marcelorm/ds4v-work/source-rocm210-reference/wheels, https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.4/
+Collecting torch==2.10.0+rocm7.2.4.lw.git3d3aa833
+  File was already downloaded /home/marcelorm/ds4v-work/source-rocm210-reference/wheels/torch-2.10.0+rocm7.2.4.lw.git3d3aa833-cp312-cp312-linux_x86_64.whl
+Collecting numpy==2.5.2
+  Downloading numpy-2.5.2-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl.metadata (6.6 kB)
+Collecting Pillow==12.3.0
+  Downloading pillow-12.3.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl.metadata (9.1 kB)
+Collecting safetensors==0.7.0
+  Downloading safetensors-0.7.0-cp38-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl.metadata (4.1 kB)
+Collecting filelock (from torch==2.10.0+rocm7.2.4.lw.git3d3aa833)
+  Downloading filelock-3.32.5-py3-none-any.whl.metadata (2.0 kB)
+Collecting typing-extensions>=4.10.0 (from torch==2.10.0+rocm7.2.4.lw.git3d3aa833)
+  Downloading typing_extensions-4.16.0-py3-none-any.whl.metadata (3.3 kB)
+Collecting setuptools (from torch==2.10.0+rocm7.2.4.lw.git3d3aa833)
+  Downloading setuptools-84.0.0-py3-none-any.whl.metadata (6.6 kB)
+Collecting sympy>=1.13.3 (from torch==2.10.0+rocm7.2.4.lw.git3d3aa833)
+  Downloading sympy-1.14.0-py3-none-any.whl.metadata (12 kB)
+Collecting networkx>=2.5.1 (from torch==2.10.0+rocm7.2.4.lw.git3d3aa833)
+  Downloading networkx-3.6.1-py3-none-any.whl.metadata (6.8 kB)
+Collecting jinja2 (from torch==2.10.0+rocm7.2.4.lw.git3d3aa833)
+  Downloading jinja2-3.1.6-py3-none-any.whl.metadata (2.9 kB)
+Collecting fsspec>=0.8.5 (from torch==2.10.0+rocm7.2.4.lw.git3d3aa833)
+  Downloading fsspec-2026.7.0-py3-none-any.whl.metadata (10 kB)
+Collecting triton==3.6.0+rocm7.2.4.git4ed88892 (from torch==2.10.0+rocm7.2.4.lw.git3d3aa833)
+  Downloading https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.4/triton-3.6.0%2Brocm7.2.4.git4ed88892-cp312-cp312-linux_x86_64.whl (298.5 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 298.5/298.5 MB 27.4 MB/s eta 0:00:00
+Collecting mpmath<1.4,>=1.1.0 (from sympy>=1.13.3->torch==2.10.0+rocm7.2.4.lw.git3d3aa833)
+  Downloading mpmath-1.3.0-py3-none-any.whl.metadata (8.6 kB)
+Collecting MarkupSafe>=2.0 (from jinja2->torch==2.10.0+rocm7.2.4.lw.git3d3aa833)
+  Downloading markupsafe-3.0.3-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl.metadata (2.7 kB)
+Downloading numpy-2.5.2-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl (16.7 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 16.7/16.7 MB 75.3 MB/s eta 0:00:00
+Downloading pillow-12.3.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl (6.9 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 6.9/6.9 MB 98.9 MB/s eta 0:00:00
+Downloading safetensors-0.7.0-cp38-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl (507 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 507.2/507.2 kB 71.1 MB/s eta 0:00:00
+Downloading fsspec-2026.7.0-py3-none-any.whl (206 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 206.6/206.6 kB 44.7 MB/s eta 0:00:00
+Downloading networkx-3.6.1-py3-none-any.whl (2.1 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2.1/2.1 MB 60.6 MB/s eta 0:00:00
+Downloading sympy-1.14.0-py3-none-any.whl (6.3 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 6.3/6.3 MB 97.5 MB/s eta 0:00:00
+Downloading typing_extensions-4.16.0-py3-none-any.whl (45 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 45.6/45.6 kB 12.7 MB/s eta 0:00:00
+Downloading filelock-3.32.5-py3-none-any.whl (100 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 100.0/100.0 kB 24.4 MB/s eta 0:00:00
+Downloading jinja2-3.1.6-py3-none-any.whl (134 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 134.9/134.9 kB 35.8 MB/s eta 0:00:00
+Downloading setuptools-84.0.0-py3-none-any.whl (818 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 818.2/818.2 kB 81.4 MB/s eta 0:00:00
+Downloading markupsafe-3.0.3-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl (22 kB)
+Downloading mpmath-1.3.0-py3-none-any.whl (536 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 536.2/536.2 kB 67.2 MB/s eta 0:00:00
+Saved ./ds4v-work/source-rocm210-reference/wheels/numpy-2.5.2-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
+Saved ./ds4v-work/source-rocm210-reference/wheels/pillow-12.3.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
+Saved ./ds4v-work/source-rocm210-reference/wheels/safetensors-0.7.0-cp38-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+Saved ./ds4v-work/source-rocm210-reference/wheels/triton-3.6.0+rocm7.2.4.git4ed88892-cp312-cp312-linux_x86_64.whl
+Saved ./ds4v-work/source-rocm210-reference/wheels/fsspec-2026.7.0-py3-none-any.whl
+Saved ./ds4v-work/source-rocm210-reference/wheels/networkx-3.6.1-py3-none-any.whl
+Saved ./ds4v-work/source-rocm210-reference/wheels/sympy-1.14.0-py3-none-any.whl
+Saved ./ds4v-work/source-rocm210-reference/wheels/typing_extensions-4.16.0-py3-none-any.whl
+Saved ./ds4v-work/source-rocm210-reference/wheels/filelock-3.32.5-py3-none-any.whl
+Saved ./ds4v-work/source-rocm210-reference/wheels/jinja2-3.1.6-py3-none-any.whl
+Saved ./ds4v-work/source-rocm210-reference/wheels/setuptools-84.0.0-py3-none-any.whl
+Saved ./ds4v-work/source-rocm210-reference/wheels/markupsafe-3.0.3-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
+Saved ./ds4v-work/source-rocm210-reference/wheels/mpmath-1.3.0-py3-none-any.whl
+Successfully downloaded torch numpy Pillow safetensors triton fsspec networkx sympy typing-extensions filelock jinja2 setuptools MarkupSafe mpmath
+Looking in links: /home/marcelorm/ds4v-work/source-rocm210-reference/wheels
+Processing ./ds4v-work/source-rocm210-reference/wheels/filelock-3.32.5-py3-none-any.whl (from -r /home/marcelorm/ds4v-work/source-rocm210-reference/requirements.lock (line 1))
+Processing ./ds4v-work/source-rocm210-reference/wheels/fsspec-2026.7.0-py3-none-any.whl (from -r /home/marcelorm/ds4v-work/source-rocm210-reference/requirements.lock (line 2))
+Processing ./ds4v-work/source-rocm210-reference/wheels/jinja2-3.1.6-py3-none-any.whl (from -r /home/marcelorm/ds4v-work/source-rocm210-reference/requirements.lock (line 3))
+Processing ./ds4v-work/source-rocm210-reference/wheels/markupsafe-3.0.3-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl (from -r /home/marcelorm/ds4v-work/source-rocm210-reference/requirements.lock (line 4))
+Processing ./ds4v-work/source-rocm210-reference/wheels/mpmath-1.3.0-py3-none-any.whl (from -r /home/marcelorm/ds4v-work/source-rocm210-reference/requirements.lock (line 5))
+Processing ./ds4v-work/source-rocm210-reference/wheels/networkx-3.6.1-py3-none-any.whl (from -r /home/marcelorm/ds4v-work/source-rocm210-reference/requirements.lock (line 6))
+Processing ./ds4v-work/source-rocm210-reference/wheels/numpy-2.5.2-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl (from -r /home/marcelorm/ds4v-work/source-rocm210-reference/requirements.lock (line 7))
+Processing ./ds4v-work/source-rocm210-reference/wheels/pillow-12.3.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl (from -r /home/marcelorm/ds4v-work/source-rocm210-reference/requirements.lock (line 8))
+Processing ./ds4v-work/source-rocm210-reference/wheels/safetensors-0.7.0-cp38-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl (from -r /home/marcelorm/ds4v-work/source-rocm210-reference/requirements.lock (line 9))
+Processing ./ds4v-work/source-rocm210-reference/wheels/setuptools-84.0.0-py3-none-any.whl (from -r /home/marcelorm/ds4v-work/source-rocm210-reference/requirements.lock (line 10))
+Processing ./ds4v-work/source-rocm210-reference/wheels/sympy-1.14.0-py3-none-any.whl (from -r /home/marcelorm/ds4v-work/source-rocm210-reference/requirements.lock (line 11))
+Processing ./ds4v-work/source-rocm210-reference/wheels/torch-2.10.0+rocm7.2.4.lw.git3d3aa833-cp312-cp312-linux_x86_64.whl (from -r /home/marcelorm/ds4v-work/source-rocm210-reference/requirements.lock (line 12))
+Processing ./ds4v-work/source-rocm210-reference/wheels/triton-3.6.0+rocm7.2.4.git4ed88892-cp312-cp312-linux_x86_64.whl (from -r /home/marcelorm/ds4v-work/source-rocm210-reference/requirements.lock (line 13))
+Processing ./ds4v-work/source-rocm210-reference/wheels/typing_extensions-4.16.0-py3-none-any.whl (from -r /home/marcelorm/ds4v-work/source-rocm210-reference/requirements.lock (line 14))
+Installing collected packages: mpmath, typing_extensions, triton, sympy, setuptools, safetensors, pillow, numpy, networkx, MarkupSafe, fsspec, filelock, Jinja2, torch
+Successfully installed Jinja2-3.1.6 MarkupSafe-3.0.3 filelock-3.32.5 fsspec-2026.7.0 mpmath-1.3.0 networkx-3.6.1 numpy-2.5.2 pillow-12.3.0 safetensors-0.7.0 setuptools-84.0.0 sympy-1.14.0 torch-2.10.0+rocm7.2.4.lw.git3d3aa833 triton-3.6.0+rocm7.2.4.git4ed88892 typing_extensions-4.16.0
+No broken requirements found.

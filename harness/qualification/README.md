@@ -7,3 +7,5 @@ device settings and require machine-specific inputs.
 - `deepseek4/qualify_ds4_q5_amd.sh`: R9700 plus Strix Halo q=5 qualification
 - `deepseek4/rocprof_server_wrapper.sh`: delayed ROCm profiler launcher
 - `deepseek4/analyze_rocprof_overlap.py`: profiler overlap summary
+- `deepseek4/ds4v-vision/`: DS4V vision numerical gate reproduction kit (harness,
+  reference environment receipts, frozen same-GPU reference tooling and run summaries)

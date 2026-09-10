@@ -1,0 +1,8 @@
+{
+  "canonical_directory": "/home/marcelorm/ds4v-work/source-rocm210-reference/source-hip-reference",
+  "manifest_sha256": "677b5ef033d009a4c44f9fcf7207276e55c4ec8968044ed237f709a108cb3f86",
+  "freeze_manifest": "/home/marcelorm/ds4v-work/source-rocm210-reference/source-hip-reference-freeze.json",
+  "freeze_manifest_sha256": "8ab35a8a7adc8c66678af7f50b6de610777f0cf03077e108d1d381957cbe8ce0",
+  "status": "SOURCE_REFERENCE_STABILITY_PASS",
+  "frozen_utc": "2026-09-05T01:40:51.838089+00:00"
+}

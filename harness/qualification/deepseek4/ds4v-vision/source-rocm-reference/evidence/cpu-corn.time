@@ -1,0 +1,23 @@
+	Command being timed: "/home/marcelorm/ds4v-work/source-rocm210-reference/.venv/bin/python -I -B /home/marcelorm/ds4v-work/source-rocm210-reference/source-forward.py --device cpu --image corn --source /home/marcelorm/lucebox-ds4v-2/models/DeepSeek-V4-Flash-Vision-Uncensored --reference /home/marcelorm/lucebox-ds4v-mix-fix/artifacts/vision-reference --output /home/marcelorm/ds4v-work/source-rocm210-reference/cpu-corn"
+	User time (seconds): 6.40
+	System time (seconds): 1.03
+	Percent of CPU this job got: 113%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:06.58
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 2418408
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 380
+	Minor (reclaiming a frame) page faults: 1013278
+	Voluntary context switches: 3482
+	Involuntary context switches: 108
+	Swaps: 0
+	File system inputs: 1848888
+	File system outputs: 9496
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
