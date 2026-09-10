@@ -34,7 +34,7 @@
 | [Luce Spark](optimizations/spark/README.md) | Laguna XS.2 33B on RTX 3090 | **~100 tok/s** in **14.6 GiB** |
 | [KVFlash](https://www.lucebox.com/blog/laguna-xs21) | Laguna XS 2.1 33B at 256K on RTX 3090 | **152.3 tok/s** with an 8K pool |
 | [Heterogeneous execution](https://www.lucebox.com/#benchmark) | DeepSeek V4 on R9700 + Strix Halo | **86 tok/s** decode; **788 tok/s** prefill at 2K |
-| [Paged attention](optimizations/paged_attention/README.md) | Qwen 3.6 27B concurrent serving | **1.35×** attention step; **82%** less KV memory |
+| [Paged attention + continuous batching](https://www.lucebox.com/blog/continuous-batching/) | Qwen 3.8 27B + DFlash2 on R9700; DeepSeek V4 Flash AR on Strix Halo | **300.9 tok/s** total at 5 clients (Qwen); **48.4 tok/s** output-window at 4 clients (DeepSeek) |
 | [Megakernel](optimizations/megakernel/RESULTS.md#rtx-3090-pp520-tg128) | Qwen 3.5 0.8B on RTX 3090 | **413 tok/s**, **1.87 tok/J** |
 
 ---
@@ -92,6 +92,10 @@ These runs use different prompts, quantizations, and inference policies. They sh
 ## Recommended Setups
 
 See [Recommended server setups](server/docs/RECOMMENDED_SETUPS.md) for the model and hardware matrix, including single-GPU and mixed-GPU profiles.
+
+The DS4 guide also documents the Strix long-context sparse-verifier profile and
+Qwen3-0.6B PFlash integration. PFlash is lossy prompt compression; keep it off
+for exact-retrieval and matched true-context benchmarks.
 
 ## Client Harnesses
 
@@ -210,6 +214,20 @@ curl -s http://127.0.0.1:8216/v1/chat/completions \
   -d '{"messages":[{"role":"user","content":"Write a Python LRU cache."}],
        "max_tokens":256,"temperature":0}'
 ```
+
+To serve up to `N` concurrent requests, use this launch command with the same Qwen target and DFlash2 drafter. Set `N` to the desired concurrency (5 below). Qwen automatically sizes the shared KV pool from available GPU memory.
+
+```bash
+N=5
+./server/build-hip/dflash_server models/Qwen3.8-27B-UD-IQ4_XS.gguf \
+  --draft models/qwen38-dflash2-q8_0.gguf \
+  --draft-block-size 16 --max-ctx 16384 \
+  --paged-attention --max-concurrency "$N" \
+  --cache-type-k q8_0 --cache-type-v q8_0 \
+  --port 8216
+```
+
+See [Continuous batching in Lucebox](https://www.lucebox.com/blog/continuous-batching/) for Qwen and DeepSeek V4 Flash results, latency measurements, and launch settings.
 
 ## Documentation
 

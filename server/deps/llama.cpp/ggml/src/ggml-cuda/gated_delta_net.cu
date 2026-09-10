@@ -5,6 +5,33 @@
 #include <cstdlib>
 #include <type_traits>
 
+static thread_local size_t g_gdn_scalar_launch_count = 0;
+static thread_local size_t g_gdn_grouped_cols_launch_count = 0;
+
+extern "C" size_t ggml_backend_cuda_get_gdn_scalar_launch_count(void) {
+    return g_gdn_scalar_launch_count;
+}
+
+extern "C" size_t ggml_backend_cuda_get_gdn_grouped_cols_launch_count(void) {
+    return g_gdn_grouped_cols_launch_count;
+}
+
+static bool gdn_grouped_cols_supported(int device) {
+    const ggml_cuda_device_info & info = ggml_cuda_info();
+    if (device < 0 || device >= info.device_count) {
+        return false;
+    }
+    const int cc = info.devices[device].cc;
+    const int warp_size = info.devices[device].warp_size;
+    return ((GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE) ||
+            GGML_CUDA_CC_IS_AMD(cc)) &&
+        (warp_size == 32 || warp_size == 64);
+}
+
+extern "C" bool ggml_backend_cuda_supports_gdn_grouped_cols(int device) {
+    return gdn_grouped_cols_supported(device);
+}
+
 // Tree-mode parent index sentinel: a node whose parent is the pre-block state
 // (i.e. a "root" node in the DFS-flattened tree) uses this value in
 // parent_ids[]. Any value < 0 triggers a reload from curr_state.
@@ -61,6 +88,9 @@ static __device__ __forceinline__ float * gdn_select_state(
     physical_state_offset = physical_sequence >= 0
         ? ((int64_t)physical_sequence * H + h_idx) * S_v * S_v
         : 0;
+    // Mapped verify: the base state is read through the slot map and no
+    // final state is written anywhere.
+    if (!state_out) return nullptr;
     if (!active_slot_ids) return state_out + compact_state_offset;
     if (physical_sequence >= 0) {
         return state_out + physical_state_offset;
@@ -320,11 +350,14 @@ gated_delta_net_cuda(const float * q,
         attn_data += S_v * H;
     }
 
-    // Write state back to global memory (transposed layout)
+    // Write state back to global memory (transposed layout); mapped verify
+    // keeps the base state read-only and selects no destination.
+    if (state != nullptr) {
 #pragma unroll
-    for (int r = 0; r < rows_per_lane; r++) {
-        const int i          = r * warp_size + lane;
-        state[col * S_v + i] = s_shard[r];
+        for (int r = 0; r < rows_per_lane; r++) {
+            const int i          = r * warp_size + lane;
+            state[col * S_v + i] = s_shard[r];
+        }
     }
 }
 
@@ -576,13 +609,15 @@ gated_delta_net_cuda_grouped_cols(const float * q,
         attn_data += S_v * H;
     }
 
+    if (state != nullptr) {
 #pragma unroll
-    for (int c = 0; c < COLS; ++c) {
-        const int col = col_base + c;
+        for (int c = 0; c < COLS; ++c) {
+            const int col = col_base + c;
 #pragma unroll
-        for (int r = 0; r < rows_per_lane; ++r) {
-            const int row = r * WIDTH + lane;
-            state[col * S_v + row] = state_shard[c][r];
+            for (int r = 0; r < rows_per_lane; ++r) {
+                const int row = r * WIDTH + lane;
+                state[col * S_v + row] = state_shard[c][r];
+            }
         }
     }
 }
@@ -622,6 +657,13 @@ static void launch_gated_delta_net(
     const bool disable_grouped_cols = getenv("DFLASH_GDN_NO_GROUPED_COLS") != nullptr;
     const bool use_grouped_cols = force_grouped_cols ||
         (!disable_grouped_cols && !ampere_nvidia);
+    const bool take_grouped_cols = S_v == 128 && !KDA && use_grouped_cols &&
+        gdn_grouped_cols_supported(ggml_cuda_get_device());
+    if (take_grouped_cols) {
+        ++g_gdn_grouped_cols_launch_count;
+    } else {
+        ++g_gdn_scalar_launch_count;
+    }
 
     switch (S_v) {
         case 16:
@@ -645,9 +687,7 @@ static void launch_gated_delta_net(
         }
         case 128: {
             if constexpr (!KDA) {
-                if (use_grouped_cols &&
-                    ((GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE) ||
-                     GGML_CUDA_CC_IS_AMD(cc))) {
+                if (take_grouped_cols) {
                     constexpr int cols = 4;
                     constexpr int width = 16;
                     constexpr int column_groups_per_block = 8;
@@ -665,11 +705,6 @@ static void launch_gated_delta_net(
                         dim3 grouped_grid_dims(H, n_seqs, (groups + column_groups_per_block * groups_per_warp - 1) / (column_groups_per_block * groups_per_warp));
                         dim3 grouped_block_dims(64, column_groups_per_block, 1);
                         gated_delta_net_cuda_grouped_cols<128, cols, width, 64, TREE_MODE, WRITE_INTER, InterT><<<grouped_grid_dims, grouped_block_dims, 0, stream>>>(
-                            q_d, k_d, v_d, g_d, b_d, s_d, active_slot_ids_d, dst_d, state_out_d, parent_ids_d, persist_inter_d, replay_log_d, H,
-                            n_tokens, n_seqs, n_state_slots, sq1, sq2, sq3, sv1, sv2, sv3,
-                            sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, gate_bias, gate_A);
-                    } else {
-                        gated_delta_net_cuda<128, KDA, TREE_MODE, WRITE_INTER, InterT><<<grid_dims, block_dims, 0, stream>>>(
                             q_d, k_d, v_d, g_d, b_d, s_d, active_slot_ids_d, dst_d, state_out_d, parent_ids_d, persist_inter_d, replay_log_d, H,
                             n_tokens, n_seqs, n_state_slots, sq1, sq2, sq3, sv1, sv2, sv3,
                             sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, gate_bias, gate_A);
@@ -962,7 +997,12 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
     float *       dst_d = (float *) dst->data;
     const int64_t attn_score_elems = S_v * H * n_tokens * n_seqs;
     const bool    inplace_state = ggml_get_op_params_i32(dst, 1) != 0;
-    float *       state_out_d = inplace_state ? (float *) src_state->data : dst_d + attn_score_elems;
+    // dflash mapped verify (ggml_gated_delta_net_mapped_verify): src[8] maps
+    // the compact sequences to the base slabs they read; no final state and
+    // no intermediates are written, and g/beta may share one strided layout.
+    const bool    verify_readonly = ggml_get_op_params_i32(dst, 11) != 0;
+    float *       state_out_d = verify_readonly ? nullptr
+                              : inplace_state ? (float *) src_state->data : dst_d + attn_score_elems;
     const int *   parent_ids_d = src_parent
         ? (const int *) src_parent->data
         : nullptr;
@@ -989,16 +1029,20 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
     GGML_ASSERT(ggml_is_contiguous_rows(src_v));
     GGML_ASSERT(ggml_are_same_stride(src_q, src_k));
     GGML_ASSERT(src_g->ne[0] == 1 || kda);
-    GGML_ASSERT(ggml_is_contiguous(src_g));
-    GGML_ASSERT(ggml_is_contiguous(src_beta));
+    GGML_ASSERT(ggml_is_contiguous(src_g) ||
+                (verify_readonly && ggml_is_contiguous_rows(src_g) && ggml_are_same_stride(src_g, src_beta)));
+    GGML_ASSERT(ggml_is_contiguous(src_beta) || (verify_readonly && ggml_is_contiguous_rows(src_beta)));
     GGML_ASSERT(ggml_is_contiguous(src_state));
     if (src_parent) {
         GGML_ASSERT(src_parent->type == GGML_TYPE_I32);
         GGML_ASSERT(ggml_is_contiguous(src_parent));
         GGML_ASSERT(ggml_nelements(src_parent) == n_tokens * n_seqs);
     }
+    if (verify_readonly) {
+        GGML_ASSERT(src_active_slots && !inplace_state && !src_parent && !src_persist_inter && !kda);
+    }
     if (src_active_slots) {
-        GGML_ASSERT(inplace_state);
+        GGML_ASSERT(inplace_state || verify_readonly);
         GGML_ASSERT(!src_parent);
         GGML_ASSERT(src_active_slots->type == GGML_TYPE_I32);
         GGML_ASSERT(ggml_is_contiguous(src_active_slots));
@@ -1038,11 +1082,12 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
     if (raw_gates) {
         GGML_ASSERT(dst->src[9] && dst->src[9]->type == GGML_TYPE_F32);
         GGML_ASSERT(ggml_nelements(dst->src[9]) == 2*H);
-        GGML_ASSERT(!kda && !tree_mode && active_slot_ids_d == nullptr);
+        GGML_ASSERT(!kda && !tree_mode && (active_slot_ids_d == nullptr || verify_readonly));
         gate_bias_d = (const float *) dst->src[9]->data;
         gate_A_d    = gate_bias_d + H;
     }
-    const bool write_intermediate = tree_mode || !skip_intermediate || persist_inter_d != nullptr;
+    const bool write_intermediate = tree_mode || (!skip_intermediate && !verify_readonly) ||
+                                    persist_inter_d != nullptr;
 
     // Macro to expand KDA × TREE_MODE × WRITE_INTER for a given InterT.
     // The persist_is_f16 branch picks between __half and float instantiations.

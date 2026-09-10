@@ -1,6 +1,5 @@
 // Unit tests for PagedKvPool (paged_kv_pool.h). No ggml, no GPU.
 
-#define GENERATE_UNIT_TEST_MAIN
 #include "CppUnitTestFramework.hpp"
 #include "common/concurrency/paged_kv_pool.h"
 #include "../src/common/paged_attention_config.h"

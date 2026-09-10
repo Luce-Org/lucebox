@@ -188,6 +188,7 @@ struct RemoteMoeRuntime {
 
 MoeHybridConfig make_moe_hybrid_config(const DeepSeek4Weights & weights) {
     MoeHybridConfig cfg;
+    cfg.mixed_mmq_policy = weights.mixed_mmq_policy;
     cfg.n_embd = weights.n_embd;
     cfg.n_expert = weights.n_expert;
     cfg.n_expert_used = weights.n_expert_used;

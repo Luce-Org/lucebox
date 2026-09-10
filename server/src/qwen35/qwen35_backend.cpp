@@ -1,6 +1,8 @@
 #include "qwen35_backend.h"
 #include "concurrency/qwen35_seq_engine.h"
 #include "common/chain_rollback_policy.h"
+#include "common/adaptive_spec_width.h"
+#include "common/spec_acceptance.h"
 #include "common/draft_block_size.h"
 #include "common/draft_swa.h"
 #include "placement/skip_park_guard.h"
@@ -35,6 +37,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -1712,6 +1715,29 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
     const int prompt_len = (int)tokens.size();
     prefill_last_logits_valid_ = false;
 
+    // The HIP legacy pool retains freed graph temporaries. During a long,
+    // shape-changing prefill those cached blocks can fragment VRAM until the
+    // next allocation fails even though a large part of the pool is idle.
+    // Trimming is deliberately opt-in and performed only between completed
+    // chunks: ggml_backend_cuda_trim_pool() synchronizes the backend and
+    // retires captured graphs before returning cached blocks to the driver.
+    static const int prefill_pool_trim_tokens = []() {
+        const char * value = std::getenv("DFLASH_PREFILL_POOL_TRIM_TOKENS");
+        if (value == nullptr || value[0] == '\0') return 0;
+        char * end = nullptr;
+        const long parsed = std::strtol(value, &end, 10);
+        if (end == value || *end != '\0' || parsed <= 0 || parsed > INT_MAX) {
+            std::fprintf(stderr,
+                "[vram] ignoring invalid DFLASH_PREFILL_POOL_TRIM_TOKENS=%s\n",
+                value);
+            return 0;
+        }
+        return (int)parsed;
+    }();
+    int64_t next_prefill_pool_trim = prefill_pool_trim_tokens > 0
+        ? ((int64_t)kv_offset / prefill_pool_trim_tokens + 1) * prefill_pool_trim_tokens
+        : INT64_MAX;
+
     // kvflash: a prompt that fits the pool prefills contiguously (identity
     // mapping, normal chunking). A LARGER prompt switches to POOLED CHUNKED
     // PREFILL: pager-chunk-sized batches whose KV rows are slot-mapped via
@@ -1940,6 +1966,22 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         }
 
         start += n_tokens;
+
+        if (prefill_pool_trim_tokens > 0 && start < prompt_len &&
+            (int64_t)committed >= next_prefill_pool_trim &&
+            ggml_backend_cuda_has_legacy_pool(target_backend_)) {
+            const size_t freed = ggml_backend_cuda_trim_pool(target_backend_);
+            std::fprintf(stderr,
+                "[vram] prefill pool trim at token %d: freed %.1f MiB\n",
+                committed, (double)freed / (1024.0 * 1024.0));
+            while (next_prefill_pool_trim <= (int64_t)committed) {
+                if (next_prefill_pool_trim > INT64_MAX - prefill_pool_trim_tokens) {
+                    next_prefill_pool_trim = INT64_MAX;
+                    break;
+                }
+                next_prefill_pool_trim += prefill_pool_trim_tokens;
+            }
+        }
     }
 
     if (kvflash_active()) {
@@ -2770,12 +2812,14 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     // visible to the rows we keep, and would break the fixed block_size
     // contract the IPC drafter validates against.
     // Clamped to q_len: a checkpoint whose published block is below the
-    // narrowing floor never widens past its own block, and the accept-rate
-    // denominator (n_spec_steps * verify_cap) stays equal to the positions
-    // actually drafted.
+    // narrowing floor never widens past its own block. Acceptance accounting
+    // uses the actual offered width, including confidence-trimmed drafts.
     const int verify_cap = committed >= kLongCtxNarrowTokens
                                ? std::min(q_len, std::max(kLongCtxMinVerify, q_len / 2))
                                : q_len;
+    const bool shared_feedback_width =
+        !cfg_.ddtree_mode && adaptive_spec_width_globally_enabled();
+    AdaptiveSpecWidth width_controller(q_len, 2, shared_feedback_width);
     if (verify_cap != q_len) {
         static std::atomic<bool> s_narrowed_logged{false};
         if (!s_narrowed_logged.exchange(true)) {
@@ -2814,7 +2858,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
     int n_generated     = 0;
     int n_draft_steps   = 0;
-    int n_accept_sum    = 0;
+    SpecAcceptanceStats acceptance;
     int n_hint_proposed = 0;
     int n_hint_accepted = 0;
     int target_forwards = 0;
@@ -2875,7 +2919,6 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     float accepted_ema = 2.0f * adaptive.accept_threshold();
     int   ar_burst_left = 0;
     int   n_ar_burst_steps = 0;
-    int   n_spec_steps = 0;      // steps that actually proposed q_len drafts
     bool  probe_step = false;   // first spec step after a burst
     // Live step-time EMAs (seconds) for the break-even ratio; 0 = not yet measured.
     double t_spec_step_ema = 0.0;
@@ -3451,8 +3494,8 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 if (target->is_eos(tok)) { hit_eos = true; break; }
             }
 
-            // Telemetry: accepted children (exclude the always-committed root).
-            n_accept_sum += std::max(0, accepted_emitted - 1);
+            // Seed-inclusive, like chain telemetry; exclude graph padding.
+            acceptance.record_tree(accepted_emitted, tree.n_nodes, need_commit_budget);
 
             if (accepted_emitted <= 0) { step_graph_destroy(draft_sg); break; }
 
@@ -3647,6 +3690,13 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 draft_tok.resize((size_t)verify_cap);
             }
         }
+        if (!ar_step) {
+            const int feedback_width = width_controller.next_width(v_len);
+            if (feedback_width < v_len) {
+                v_len = feedback_width;
+                draft_tok.resize((size_t)v_len);
+            }
+        }
 
         // 3b. Tool call hint injection: override draft tokens with pre-known
         // structural tokens for near-100% acceptance.
@@ -3764,6 +3814,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 else break;
             }
             bonus_tok = (accept_n < v_len) ? target_tok[accept_n - 1] : -1;
+        }
+        if (!ar_step) {
+            width_controller.observe(accept_n, v_len);
         }
         // Track hint acceptance telemetry.
         if (hint_fill > 0) {
@@ -4007,12 +4060,11 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         }
         cache_.cur_pos = committed;
         n_generated += emitted + injected;
-        // Only steps that proposed a full draft block enter the accept-rate
+        // Only speculative steps enter the accept-rate
         // accounting; 1-token burst steps would otherwise dilute the rate
         // that steers the PFlash residency bandit.
         if (!ar_step) {
-            n_accept_sum += std::min(accept_n, emitted);
-            n_spec_steps++;
+            acceptance.record_chain(accept_n, v_len, emitted, need_commit_budget);
         }
         n_draft_steps++;
 
@@ -4050,9 +4102,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         if (floor_to_ar) {
             step_graph_destroy(draft_sg);
             cache_.last_tok = out_tokens.empty() ? last_tok : out_tokens.back();
-            const int total_draft_pos = std::max(1, n_spec_steps * verify_cap);
-            out_accept_rate =
-                (float)((double)n_accept_sum / (double)total_draft_pos);
+            out_accept_rate = acceptance.rate();
             const int ar_n_gen = n_gen - n_generated;
             if (ar_n_gen <= 0) {
                 if (!finish_speculative_state()) return false;
@@ -4095,9 +4145,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             cache_.cur_pos = committed;
             step_graph_destroy(draft_sg);
             cache_.last_tok = out_tokens.empty() ? last_tok : out_tokens.back();
-            const int total_draft_pos = std::max(1, n_spec_steps * verify_cap);
-            out_accept_rate =
-                (float)((double)n_accept_sum / (double)total_draft_pos);
+            out_accept_rate = acceptance.rate();
             const int ar_n_gen = n_gen - n_generated;
             if (ar_n_gen <= 0) {
                 if (!finish_speculative_state()) return false;
@@ -4126,14 +4174,13 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
     auto t_dec1 = std::chrono::steady_clock::now();
     const double decode_s = std::chrono::duration<double>(t_dec1 - t_dec0).count();
-    const int total_draft_pos = std::max(1, n_spec_steps * verify_cap);
-    const double accept_pct = 100.0 * (double)n_accept_sum / (double)total_draft_pos;
-    out_accept_rate = (float)((double)n_accept_sum / (double)total_draft_pos);
+    const double accept_pct = 100.0 * acceptance.rate();
+    out_accept_rate = acceptance.rate();
     std::fprintf(stderr, "[spec-decode] tokens=%d time=%.3f s speed=%.2f tok/s "
                  "steps=%d accepted=%d/%d (%.1f%%) avg_commit=%.2f\n",
                  n_generated, decode_s,
                  n_generated > 0 ? n_generated / decode_s : 0.0,
-                 n_draft_steps, n_accept_sum, total_draft_pos, accept_pct,
+                 n_draft_steps, acceptance.accepted(), acceptance.offered(), accept_pct,
                  n_draft_steps > 0 ? (double)n_generated / (double)n_draft_steps : 0.0);
     if (n_ar_burst_steps > 0) {
         std::fprintf(stderr, "[spec-decode] adaptive: %d of %d steps ran as plain decode "

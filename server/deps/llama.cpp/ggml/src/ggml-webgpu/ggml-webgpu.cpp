@@ -3838,7 +3838,8 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
             supports_op = op->type == GGML_TYPE_F32;
             break;
         case GGML_OP_SOFT_MAX:
-            supports_op = op->type == GGML_TYPE_F32;
+            // Sink-column mode is handled by a supporting backend.
+            supports_op = ggml_get_op_params_i32(op, 2) == 0 && op->type == GGML_TYPE_F32;
             break;
         case GGML_OP_UNARY:
             {

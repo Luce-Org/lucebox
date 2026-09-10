@@ -1,15 +1,80 @@
 #include "CppUnitTestFramework.hpp"
 #include "../src/common/moe_hybrid_ffn_eval.h"
 #include "../src/common/moe_hybrid_storage.h"
+#include "ggml-cpu.h"
+#include "ggml-alloc.h"
 
 #include <algorithm>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 using namespace dflash::common;
 
 namespace {
 struct MoeHybridStorageFixture {};
+struct ScopedFfnGraph : CachedFfnGraph {
+    ~ScopedFfnGraph() { free(); }
+};
+}
+
+TEST_CASE(MoeHybridStorageFixture, single_token_cached_graphs_keep_mixed_mmq_policy) {
+    auto backend = std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)>(
+        ggml_backend_cpu_init(), ggml_backend_free);
+    auto ctx = std::unique_ptr<ggml_context, decltype(&ggml_free)>(
+        ggml_init({1u << 20, nullptr, true}), ggml_free);
+    REQUIRE(backend && ctx);
+    auto * gate = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 4, 8, 2);
+    auto * up = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 4, 8, 2);
+    auto * down = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 8, 4, 2);
+    MoeLayerDesc desc;
+    desc.ffn_gate_shexp = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 4, 8);
+    desc.ffn_up_shexp = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 4, 8);
+    desc.ffn_down_shexp = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 8, 4);
+    auto weights = std::unique_ptr<ggml_backend_buffer, decltype(&ggml_backend_buffer_free)>(
+        ggml_backend_alloc_ctx_tensors(ctx.get(), backend.get()), ggml_backend_buffer_free);
+    REQUIRE(weights != nullptr);
+    for (auto policy : {GGML_MIXED_MMQ_DEFAULT, GGML_MIXED_MMQ_ENABLED, GGML_MIXED_MMQ_DISABLED}) {
+        ScopedFfnGraph hot, cold;
+        REQUIRE(build_cached_hot_graph(hot, backend.get(), gate, up, down, nullptr,
+            1, 1, 1, 1, desc, 4, 8, 1, CachedHotGraphOptions{0, false, 0, policy}));
+        REQUIRE(build_cached_cold_graph(cold, backend.get(), gate, up, down, nullptr,
+            1, 1, 1, 1, 4, 8, 1, 0, policy));
+        for (auto * graph : {hot.gf, cold.gf}) {
+            int routed = 0;
+            int shared = 0;
+            for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+                auto * op = ggml_graph_node(graph, i);
+                if (op->op == GGML_OP_MUL_MAT_ID) {
+                    CHECK(ggml_mul_mat_get_mixed_mmq(op) == policy);
+                    ++routed;
+                } else if (op->op == GGML_OP_MUL_MAT) {
+                    CHECK(ggml_mul_mat_get_mixed_mmq(op) == GGML_MIXED_MMQ_DEFAULT);
+                    ++shared;
+                }
+            }
+            CHECK(routed == 3);
+            CHECK(shared == (graph == hot.gf ? 3 : 0));
+        }
+    }
+}
+
+TEST_CASE(MoeHybridStorageFixture, storage_identity_includes_mixed_mmq_policy) {
+    MoeHybridConfig cfg;
+    MoeHybridStorage storage;
+    cfg.n_layer = storage.placement.n_layer = 1;
+    cfg.n_expert = storage.placement.n_expert = 2;
+    cfg.n_expert_used = storage.placement.n_expert_used = 1;
+    storage.placement.hot_counts = {0};
+    storage.placement.hot_expert_ids = {{}};
+    storage.layers.resize(1);
+    REQUIRE(storage.matches(cfg));
+    cfg.mixed_mmq_policy = GGML_MIXED_MMQ_ENABLED;
+    REQUIRE(!storage.matches(cfg));
+    storage.mixed_mmq_policy = cfg.mixed_mmq_policy;
+    REQUIRE(storage.matches(cfg));
+    cfg.mixed_mmq_policy = GGML_MIXED_MMQ_DISABLED;
+    REQUIRE(!storage.matches(cfg));
 }
 
 TEST_CASE(MoeHybridStorageFixture, expert_residency_tracks_model_sized_expert_sets) {

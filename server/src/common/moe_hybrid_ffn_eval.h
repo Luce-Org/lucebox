@@ -349,6 +349,7 @@ struct CachedHotGraphOptions {
     float swiglu_clamp = 0.0f;
     bool gpu_remap = false;
     int n_expert = 0;
+    ggml_mixed_mmq_policy mixed_mmq_policy = GGML_MIXED_MMQ_DEFAULT;
 };
 
 // Build/rebuild cached hot FFN graph.
@@ -384,7 +385,8 @@ bool build_cached_cold_graph(
     int n_embd,
     int n_ff_exp,
     int n_cold,
-    float swiglu_clamp = 0.0f);
+    float swiglu_clamp = 0.0f,
+    ggml_mixed_mmq_policy mixed_mmq_policy = GGML_MIXED_MMQ_DEFAULT);
 
 // Build cached hot-only batched graph for prefill (n_tokens=MMQ_SAFE_SUB_BATCH).
 bool build_cached_hot_batched_graph(

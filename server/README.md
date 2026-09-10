@@ -299,10 +299,10 @@ See the [current six-expert Strix Halo profile](https://www.lucebox.com/blog/dee
 | `--prefix-cache-slots <N>` | `32` | In-memory prefix-cache slots; `0` disables. |
 | `--agent-turn-cache` | off | Extend prefix caching through generated tool calls. |
 | `--prefill-cache-slots <N>` | `0` | Full-prompt cache slots. |
-| `--paged-attention` | off | Enable 16-token paged KV blocks for supported Qwen targets. |
-| `--max-concurrency <N>` | `1` | Maximum concurrent decode sequences; values above 1 enable paged attention. |
+| `--paged-attention` | off | Enable paged KV for supported Qwen targets (16-token blocks) or DeepSeek4 on Strix Halo and R9700 plus Strix Halo (128-token pages). DeepSeek4 paged serving is AR-only. |
+| `--max-concurrency <N>` | `1` | Maximum concurrent decode sequences. Qwen supports up to 64; DeepSeek4 supports up to 6. Values above 1 enable paged attention. |
 | `--admission-coalesce-ms <N>` | `20` | Idle-to-busy batching window from 0 through 1000 ms. |
-| `--kv-pool-tokens <N>` | auto | Shared physical K/V capacity for concurrent serving. |
+| `--kv-pool-tokens <N>` | auto | Shared physical K/V capacity for concurrent serving, rounded to the backend page size. |
 | `--kv-cache-dir <path>` | none | Enable persistent disk KV cache in this directory. |
 | `--kv-cache-budget <MB>` | `4096` | Disk KV-cache size cap. |
 | `--kv-cache-min-tokens <N>` | `512` | Minimum prefix length to persist. |

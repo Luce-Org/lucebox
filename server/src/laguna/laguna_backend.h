@@ -116,8 +116,8 @@ private:
     DraftKvState                                draft_kv_{};
     LagunaDFlashTarget *                        dflash_target_ = nullptr;
     bool                                        draft_parked_ = false;
-    // [TAG_LAGUNA_VERIFY_WIDTH] EWMA of the accepted block length, persisted
-    // across requests. Drives the AUTO chain verify width (seeded for width 3).
+    // [TAG_LAGUNA_VERIFY_WIDTH] Legacy accepted-length EWMA. Keep this as the
+    // default AUTO policy; the shared per-step controller is explicitly opt-in.
     double                                      spec_ewma_accept_ = 1.5;
 
     // PFlash drafter (lazy-loaded on first compress command).

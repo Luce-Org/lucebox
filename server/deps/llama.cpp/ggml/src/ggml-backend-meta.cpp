@@ -2,6 +2,7 @@
 #include "ggml-impl.h"
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
+#include "ggml-backend-meta-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-cpp.h"
 
@@ -873,6 +874,47 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         return {GGML_BACKEND_SPLIT_AXIS_0, {0}, 1, {1}};
     };
 
+    auto handle_ds4_moe_combine = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            GGML_ASSERT(tensor->src[2] == nullptr ||
+                        src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            return src_ss[0];
+        }
+
+        // Splitting embeddings is safe when the optional shared branch uses
+        // the identical embedding partition. Route weights remain mirrored.
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0) {
+            GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            GGML_ASSERT(tensor->src[2] == nullptr ||
+                        (src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_0 &&
+                         ggml_backend_meta_split_layout_equal(src_ss[0], src_ss[2], n_bufs)));
+            // Each local embedding slice must preserve the float4 layout
+            // required by the GPU combine kernel.
+            for (size_t s = 0; s < src_ss[0].n_segments; ++s) {
+                for (size_t j = 0; j < n_bufs; ++j) {
+                    GGML_ASSERT(src_ss[0].ne[s*n_bufs + j] % 4 == 0);
+                }
+            }
+            return src_ss[0];
+        }
+
+        // Splitting experts partitions the reduced dimension. Each device
+        // produces a partial sum, so a following meta-backend synchronization
+        // must reduce those sums. A shared result cannot be added locally here
+        // because it would then be counted once per device.
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1) {
+            GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_0);
+            GGML_ASSERT(ggml_backend_meta_split_layout_equal(src_ss[0], src_ss[1], n_bufs));
+            GGML_ASSERT(tensor->src[2] == nullptr);
+            return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED :
+                                  GGML_BACKEND_SPLIT_AXIS_PARTIAL,
+                    {0}, 1, {1}};
+        }
+
+        GGML_ABORT("unsupported DS4 MoE combine split");
+    };
+
     auto calculate_split_state = [&]() -> ggml_backend_meta_split_state {
         if (ggml_nelements(tensor) == 0) {
             return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, 1, {1}};
@@ -1111,6 +1153,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 // SCORE includes ReLU, and MASK consumes its nonlinear result;
                 // neither may run on unreduced dot-product shards.
                 split_state = handle_mirrored(src_ss);
+            } break;
+            case GGML_OP_DS4_MOE_COMBINE: {
+                split_state = handle_ds4_moe_combine(src_ss);
             } break;
             case GGML_OP_UNARY: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);

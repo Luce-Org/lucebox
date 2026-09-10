@@ -562,7 +562,17 @@ void ggml_cuda_op_mul_mat_q(
     GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_padded_row_size);
 }
 
-bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
+bool ggml_cuda_mixed_mmq_enabled(const ggml_tensor * op, bool default_enabled) {
+    const auto policy = ggml_mul_mat_get_mixed_mmq(op);
+    if (policy != GGML_MIXED_MMQ_DEFAULT) {
+        return policy == GGML_MIXED_MMQ_ENABLED;
+    }
+    const char * value = std::getenv("DFLASH_DS4_MIX_MMQ_PREFILL");
+    return value ? std::strcmp(value, "0") != 0 : default_enabled;
+}
+
+bool ggml_cuda_should_use_mmq(const ggml_tensor * op, int cc, int64_t ne11, int64_t n_experts) {
+    const ggml_type type = op->src[0]->type;
 #ifdef GGML_CUDA_FORCE_CUBLAS
     return false;
 #endif // GGML_CUDA_FORCE_CUBLAS
@@ -663,21 +673,9 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
             mmq_supported = GGML_CUDA_CC_IS_RDNA3_5(cc) ||
                             GGML_CUDA_CC_IS_RDNA4(cc);
             break;
-        case GGML_TYPE_Q2_1_ROCMFP2_MIX: {
-            static const bool mix_mmq_enabled = []() {
-                const char * value = getenv("DFLASH_DS4_MIX_MMQ_PREFILL");
-                return value != nullptr && !(value[0] == '0' && value[1] == '\0');
-            }();
-            mmq_supported = mix_mmq_enabled &&
-                (GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc));
-            break;
-        }
+        case GGML_TYPE_Q2_1_ROCMFP2_MIX:
         case GGML_TYPE_Q3_1_ROCMFP3_MIX: {
-            static const bool mix_mmq_enabled = []() {
-                const char * value = getenv("DFLASH_DS4_MIX_MMQ_PREFILL");
-                return value != nullptr && !(value[0] == '0' && value[1] == '\0');
-            }();
-            mmq_supported = mix_mmq_enabled &&
+            mmq_supported = ggml_cuda_mixed_mmq_enabled(op) &&
                 (GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc));
             break;
         }

@@ -45,17 +45,20 @@ and they stay fixed so every run is comparable over time:
   variance (thermals, clock boosting, scheduler jitter), then reports mean and
   stddev for the headline metrics. Use `--reps 3` for a faster smoke profile when
   needed, but PR comparisons should prefer 5+.
-- **`--noise-rsd-pct 0.05`** — report-only noise threshold. If any tracked
+- **`--noise-rsd-pct 0.05`** — noise threshold. If any tracked
   headline metric has relative stddev above 5%, the markdown calls the profile
   **NOISY** and tells reviewers to treat small deltas as below the profiler
-  detection threshold.
+  detection threshold. Automatic PR profiles report this as a warning; a manual
+  promotion profile fails because noisy measurements are not valid release evidence.
 
 **Rule:** keep these consistent. A delta vs the baseline is only a valid regression
 signal if both runs used the same config — if you ever change a parameter, re-seed the
 baseline (you cannot compare across configs). When baseline and current 1σ intervals
 overlap and the delta is smaller than `--regress-pct`, the report marks that row as
-**noisy / overlap** instead of inviting reviewers to chase a ghost regression. All of
-these states are warnings only; the profiler remains report-only.
+**noisy / overlap** instead of inviting reviewers to chase a ghost regression. These
+states are warnings on automatic PR profiles. A manual dispatch is the promotion check:
+it fails on a missing runner model, missing baseline/report, noisy result, or a
+performance regression outside the configured threshold.
 
 ## Losslessness gate (and why a bit-exact compare is too strict on its own)
 
@@ -88,7 +91,9 @@ path genuinely changed the output — but that is still not proven a logic bug: 
 the batched-verify FP effect above (verify scores draft tokens as a batch vs AR
 one-at-a-time). Classifying a FAIL as bug-vs-FP needs the **logit gap** at the first
 mismatch (near-tie = FP, clear gap = bug) — a follow-up the binaries don't emit yet. CI
-surfaces a FAIL as a non-blocking `::warning::` for triage; it stays report-only.
+surfaces a FAIL as a non-blocking `::warning::` for triage, including on manual
+promotion profiles. It cannot safely become a blocking signal until the binaries expose
+the logit gap at the first mismatch and the profiler can classify FP near-ties.
 
 ## CI settings
 
@@ -97,6 +102,13 @@ The `Speed Profile` workflow uses the same profiler defaults as the local recipe
 temporarily override those values with repo variables `LUCEBOX_SPEED_N_GEN`,
 `LUCEBOX_SPEED_REPS`, and `LUCEBOX_SPEED_NOISE_RSD_PCT`, but PR-to-PR comparisons
 should keep them fixed.
+
+Automatic pull-request runs are advisory and never block a merge. A manual dispatch is
+strict enough to use as promotion evidence: it requires the staged target/draft models,
+an existing baseline at `LUCEBOX_SPEED_BASELINE`, a complete JSON report, stable
+measurements, and no regression beyond `LUCEBOX_SPEED_REGRESS_PCT` (10% by default).
+Correctness divergences remain explicit warnings for the reason described above; use the
+normal GPU correctness suite as the blocking correctness gate.
 
 ## Run it locally
 
@@ -114,8 +126,9 @@ python3 scripts/profile.py \
 
 ## Comparing against a baseline
 
-The profiler is **report-only**, but it can diff the current run against a saved
-profile so reviewers see a single regression table instead of two separate reports.
+The profiler can diff the current run against a saved profile so reviewers see a single
+regression table instead of two separate reports. The delta is advisory on PR events and
+blocking on manual promotion runs.
 The comparison is a JSON round-trip:
 
 1. **Capture a baseline.** Run the profiler on the reference commit and keep its
@@ -125,9 +138,12 @@ The comparison is a JSON round-trip:
    python3 scripts/profile.py ... --out-json scripts/speed-baseline.json
    ```
 
-   Commit `scripts/speed-baseline.json` so every later run compares against the same
-   reference. Re-seed it whenever you change a profiler parameter (`--budget`,
-   `--n-gen`, `--reps`, …): you cannot compare across configs.
+   For CI, stage that file outside the checkout on the self-hosted runner and set the
+   repository variable `LUCEBOX_SPEED_BASELINE` to its absolute path. Keeping the
+   promotion baseline outside the PR checkout prevents a candidate from weakening its
+   own comparison. `scripts/speed-baseline.json` remains the local fallback. Re-seed the
+   runner baseline from a reviewed `main` run whenever you intentionally change a
+   profiler parameter (`--budget`, `--n-gen`, `--reps`, …): configs cannot be compared.
 
 2. **Compare a later run.** Point `--baseline` at that file and set the regression
    threshold:

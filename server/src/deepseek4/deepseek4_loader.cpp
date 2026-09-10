@@ -2047,6 +2047,7 @@ static MoeHybridColdBackend ds4_cold_backend_from_env() {
 
 static MoeHybridConfig make_ds4_moe_hybrid_config(const DeepSeek4Weights & w) {
     MoeHybridConfig cfg;
+    cfg.mixed_mmq_policy = w.mixed_mmq_policy;
     cfg.n_embd = w.n_embd;
     cfg.n_expert = w.n_expert;
     cfg.n_expert_used = w.n_expert_used;

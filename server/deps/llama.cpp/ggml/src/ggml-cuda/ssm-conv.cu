@@ -343,6 +343,125 @@ static void ggml_cuda_op_ssm_conv_step(ggml_backend_cuda_context & ctx, ggml_ten
     }
 }
 
+// dflash: tree-window conv step (ggml_ssm_conv_tree_step). One thread per
+// channel writes its window [history slab | x tokens] into the packed
+// result, then convolves every token along its parent chain exactly as
+// ssm_conv_tree_f32 does over a concatenated input (same taps, same
+// accumulation order), so the output is bit-identical to gather + concat +
+// tree conv. The persistent history is read only; the replay-log commit
+// advances it from the window later.
+template <int K>
+static __global__ void ssm_conv_tree_step_f32(const float * __restrict__ x, const int x_nb1, const int x_nb2,
+                                              const float * __restrict__ w, const int w_nb1,
+                                              const float * __restrict__ state, const int st_nb1, const int st_nb2,
+                                              const int * __restrict__ state_slot_ids, const int n_slots,
+                                              const int * __restrict__ parent_ids,
+                                              float * __restrict__ y, const int y_nb1, const int y_nb2,
+                                              float * ci, const int ci_nb1, const int ci_nb2,
+                                              const int C, const int T) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    const int s = blockIdx.y;
+    if (c >= C) return;
+
+    const int slot = state_slot_ids[s];
+    const float * st = (slot >= 0 && slot < n_slots)
+        ? (const float *) ((const char *) state + (size_t) slot * st_nb2 + (size_t) c * st_nb1)
+        : nullptr;
+    const float * xs = (const float *) ((const char *) x + (size_t) s * x_nb2) + c;
+    float *       ys = (float *) ((char *) y + (size_t) s * y_nb2) + c;
+    float *       win = (float *) ((char *) ci + (size_t) s * ci_nb2 + (size_t) c * ci_nb1);
+    const float * wc = (const float *) ((const char *) w + (size_t) c * w_nb1);
+
+    const int xs_stride = x_nb1 / sizeof(float);
+    const int ys_stride = y_nb1 / sizeof(float);
+
+    float wt[K];
+#pragma unroll
+    for (int k = 0; k < K; k++) {
+        wt[k] = wc[k];
+    }
+#pragma unroll
+    for (int j = 0; j < K - 1; j++) {
+        win[j] = st ? st[j] : 0.0f;
+    }
+    for (int t = 0; t < T; t++) {
+        win[K - 1 + t] = xs[(size_t) t * xs_stride];
+    }
+
+    const int * parent_ids_seq = parent_ids + s * T;
+    for (int i = 0; i < T; i++) {
+        int ancestors[K];
+        ancestors[K - 1] = i;
+#pragma unroll
+        for (int k = K - 2; k >= 0; k--) {
+            const int prev = ancestors[k + 1];
+            ancestors[k] = prev >= 0 ? parent_ids_seq[prev] : prev - 1;
+        }
+        float sumf = 0.0f;
+#pragma unroll
+        for (int k = 0; k < K; k++) {
+            const int sx_slot = (K - 1) + ancestors[k];
+            const float x_val = win[sx_slot];
+            sumf += x_val * wt[k];
+        }
+        ys[(size_t) i * ys_stride] = ggml_cuda_op_silu_single(sumf);
+    }
+}
+
+static void ggml_cuda_op_ssm_conv_tree_step(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * x   = dst->src[0];
+    const ggml_tensor * w   = dst->src[1];
+    const ggml_tensor * st  = dst->src[2];
+    const ggml_tensor * ids = dst->src[3];
+    const ggml_tensor * par = dst->src[4];
+
+    const int K = (int) w->ne[0];
+    const int C = (int) w->ne[1];
+    const int T = (int) x->ne[1];
+    const int S = (int) x->ne[2];
+    const int n_slots = (int) st->ne[2];
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 && st->type == GGML_TYPE_F32);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && par->type == GGML_TYPE_I32);
+    GGML_ASSERT(x->nb[0] == sizeof(float) && x->ne[0] == C);
+    GGML_ASSERT(w->nb[0] == sizeof(float));
+    GGML_ASSERT(ggml_is_contiguous(st) && st->ne[0] == K - 1 && st->ne[1] == C);
+    GGML_ASSERT(ggml_is_contiguous(ids) && ggml_nelements(ids) == S);
+    GGML_ASSERT(ggml_is_contiguous(par) && ggml_nelements(par) == (int64_t) T * S);
+    GGML_ASSERT(ggml_nelements(dst) == (int64_t) C * T * S + (int64_t) (K - 1 + T) * C * S);
+
+    float * y_d  = (float *) dst->data;
+    float * ci_d = y_d + (size_t) C * T * S;
+    const int y_nb1  = C * sizeof(float);
+    const int y_nb2  = C * T * sizeof(float);
+    const int ci_nb1 = (K - 1 + T) * sizeof(float);
+    const int ci_nb2 = (K - 1 + T) * C * sizeof(float);
+
+    const int threads = 256;
+    const dim3 blocks((C + threads - 1) / threads, S, 1);
+    cudaStream_t stream = ctx.stream();
+
+    auto launch = [&](auto KK) {
+        constexpr int kK = decltype(KK)::value;
+        ssm_conv_tree_step_f32<kK><<<blocks, threads, 0, stream>>>(
+            (const float *) x->data, (int) x->nb[1], (int) x->nb[2],
+            (const float *) w->data, (int) w->nb[1],
+            (const float *) st->data, (int) st->nb[1], (int) st->nb[2],
+            (const int *) ids->data, n_slots,
+            (const int *) par->data,
+            y_d, y_nb1, y_nb2,
+            ci_d, ci_nb1, ci_nb2,
+            C, T);
+    };
+    switch (K) {
+        case 3: launch(std::integral_constant<int, 3>{}); break;
+        case 4: launch(std::integral_constant<int, 4>{}); break;
+        case 5: launch(std::integral_constant<int, 5>{}); break;
+        case 9: launch(std::integral_constant<int, 9>{}); break;
+        default: GGML_ABORT("ssm_conv_tree_step only supports kernel sizes 3, 4, 5, 9.");
+    }
+}
+
 template <int d_conv>
 static __global__ void ssm_conv_specla_hld_f32(
         const float * __restrict__ x,          // [d_inner, n_t]
@@ -533,6 +652,12 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
     if (ggml_get_op_params_i32(dst, 0) == 3) {
         GGML_ASSERT(silu_dst == nullptr);
         ggml_cuda_op_dflash_dyn_conv(ctx, dst);
+        return;
+    }
+    // dflash: tree-window step mode (silu applied by the kernel); op_params[0] == 4
+    if (ggml_get_op_params_i32(dst, 0) == 4) {
+        GGML_ASSERT(silu_dst == nullptr);
+        ggml_cuda_op_ssm_conv_tree_step(ctx, dst);
         return;
     }
     // dflash: fused step mode (silu already applied by the kernel); op_params[0] == 2

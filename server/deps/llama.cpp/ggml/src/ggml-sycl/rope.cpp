@@ -496,6 +496,7 @@ void ggml_sycl_op_rope_impl(ggml_backend_sycl_context &ctx, ggml_tensor *dst,
 
     const int n_dims = ((int32_t *)dst->op_params)[1];
     const int mode = ((int32_t *)dst->op_params)[2];
+    GGML_ASSERT((mode & GGML_ROPE_TYPE_TAIL) == 0);
     const int n_ctx_orig = ((int32_t *)dst->op_params)[4];
     mrope_sections sections;
 

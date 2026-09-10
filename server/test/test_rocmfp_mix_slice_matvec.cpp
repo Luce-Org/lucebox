@@ -117,6 +117,7 @@ TEST_CASE(RocmfpMixSliceMatvecFixture, slice_matvec_matches_reference) {
         books[i] = (uint16_t) (bits >> 16);   // fp32 -> bf16 (truncate)
     }
     std::vector<uint8_t> modes(nslices, 1);   // 1 = adaptive: exercises the codebook path
+    modes[0] = 0;  // Also compare paired/unpaired accumulation for fixed levels.
 
     uint8_t * d_w = nullptr;
     float   * d_x = nullptr;

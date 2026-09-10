@@ -16,6 +16,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 
 | Variable | Default | Purpose |
 |---|---|---|
+| `DFLASH_ADAPTIVE_SPEC_WIDTH` | unset | BURN-IN: =1 enables the shared acceptance-feedback verify-width controller. Fixed width is the production default; backend-specific overrides take precedence. |
 | `DFLASH_DRAFT_KV` | 1 | KILL SWITCH (remove after burn-in): =0 restores the legacy per-step drafter window recompute instead of the ring cache. |
 | `DFLASH_LAGUNA_SWA_RING` | 1 | KILL SWITCH (remove after burn-in): =0 keeps SWA layers on pool-sized caches under KVFlash. |
 | `DFLASH_PROF` | unset | DEBUG: comma list of profilers (step,verify,prefill). Replaces DFLASH_LAGUNA_{STEP,VERIFY,PREFILL}_PROF. |
@@ -35,15 +36,33 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `DFLASH_DS4_TP_SCHEDULE_BRANCHES` | unset | BURN-IN: expose independent mixed-vendor expert branches to the common multi-backend scheduler. |
 | `DFLASH_DS4_TP_TARGETED_JOIN_SPLIT` / `DFLASH_MOE_TP_TARGETED_JOIN_SPLIT` | unset | BURN-IN: start a main-GPU split only at each peer-result join, avoiding an extra peer fence per MoE layer. |
 | `DFLASH_DS4_COMP_PAD_STRIDE` | 16 | BURN-IN: compressed-KV padding bucket (`16`, `32`, `64`, or `128`); wider exact-masked buckets reduce verifier graph recapture churn. |
+| `DFLASH_DS4_MIX_MMQ_PREFILL` | enabled for DS4 approximate prefill on gfx1151 | BURN-IN KILL SWITCH: =0 disables registry-aware mixed ROCmFP MMQ; =1 explicitly enables it on supported HIP devices. Automatic selection is model/graph-local and never writes the process environment. Exact prefill retains its existing dispatch defaults, including the specialized paired FP2 path. |
+| `DFLASH_DS4_INCREMENTAL_VERIFY_MASK` | 1 for masks at least 4 MiB | BURN-IN KILL SWITCH: =0 rebuilds and transfers the complete fused-verifier attention mask from the host on every step. |
+| `DFLASH_DS4_INCREMENTAL_VERIFY_MASK_MIN_BYTES` | 4194304 | DEBUG/A-B: minimum fused-verifier mask size for GPU zeroing plus negative-range updates. |
+| `DFLASH_DS4_SPARSE_DECODE_FLASH` | 0 | Experimental single-HIP-target verifier attention. Opt in with =1; may change generated tokens. Uses model sparse top-k only when it removes more than half of the compressed rows. |
 | `DFLASH_DS4_DISABLE_GROUPED_OUTPUT_PROJECTION` | unset | DEBUG: restore the materialized output projection when diagnosing grouped-view copies across unlike runtimes. |
 | `DFLASH_DS4_DRAFT_BACKEND` / `DFLASH_DS4_DRAFT_GPU` | compiled backend / target device | Select the in-process DSpark backend and device. |
 | `DFLASH_CUDA_BACKEND_PATH` / `DFLASH_HIP_BACKEND_PATH` | auto-discovered beside the executable | Explicit peer module file path for a mixed CUDA+HIP build. |
-| `GGML_BATCH_PEER_COPIES` | unset | BURN-IN: batch peer-runtime copies and unlike-runtime host staging with one source wait per split. `GGML_CUDA_BATCH_PEER_COPIES` remains a compatibility alias. |
+| `DFLASH_DS4_TP_GROUPED_MMVQ` / `DFLASH_MOE_TP_GROUPED_MMVQ` | unset | OPT-IN: grouped expert MMVQ for `n_tokens > 1` instead of tokenwise ROCmFP2 gate/up dispatch. Qualified for paged R9700 + Strix at concurrency 1–4; the flag itself does not enforce topology or lane limits. The model-neutral name takes precedence. |
+| `DFLASH_CUDA_MMVQ_FP4_X4` | 1 for monolithic DS4 `gfx1151` paged serving and opt-in HIP DS4 q=5 verification; unset otherwise | Enable dense ROCmFP4 x4 dispatch. Set `0` to restore generic four- and five-column kernels. |
+| `DFLASH_CUDA_MMVQ_FP4_Q5_X4_PLUS1` | 1 for monolithic DS4 `gfx1151` paged serving and opt-in DS4 q=5 verification on `gfx1201`; unset otherwise | Enable dense five-column x4+1 dispatch when `DFLASH_CUDA_MMVQ_FP4_X4=1`. Set `0` to restore the generic five-column kernel. |
+| `DFLASH_CUDA_MMVQ_MOE_FP3_PACKED24` | 1 for monolithic DS4 `gfx1151` paged serving; unset otherwise | Enable packed 24-bit ROCmFP3 expert dispatch. Set `0` to restore generic expert dispatch. |
+| `DFLASH_DS4_TP_BATCH_SPLIT_COPIES` | unset | OPT-IN: establish destination readiness once per DS4 scheduler split while retaining each backend copy's dependency publication. The qualified dual-ROCm launcher enables it. |
+| `GGML_BATCH_PEER_COPIES` | unset | BURN-IN: additionally combine HIP peer-copy dependency publication. `GGML_CUDA_BATCH_PEER_COPIES` remains a compatibility alias. Keep these event-batching variables unset for the exact qualified profile. |
 | `GGML_SCHED_PROFILE` / `GGML_SCHED_PROFILE_MIN_SPLITS` | unset / 1 | DEBUG: report scheduler splits, copy volume, submission time, and source/destination synchronization time. |
 | `DFLASH_DS4_TP_FUSED_CACHE_SLOTS` | 2 | BURN-IN: number of heterogeneous verifier schedulers retained; higher values retain substantially more scratch on both GPUs. |
 | `DFLASH_DS4_VERIFY_FORCE_GRAPH_REPLAY` | unset | OPT-IN: bypass graph property scans only after warmup; scheduler-generation checks remain mandatory. |
 | `DFLASH_DS4_ROCTX` | unset | DEBUG: on HIP builds, dynamically load ROCTX and emit semantic DS4 prefill, speculative-decode, and layer-range markers for external rocprof traces. No events, timing, or device synchronization are added. |
 | `DFLASH_QWEN35_ROCTX` | unset | DEBUG: on HIP builds, dynamically load ROCTX and mark Qwen concurrent steps, graph compute, and argmax readback with live, padded, and packed-prefill shape metadata. |
+| `DFLASH_CUDA_MMVF_NARROW_F16` | enabled on qualified gfx1151 narrow F16 matmuls | BURN-IN KILL SWITCH: =0 restores the generic dispatch decision for the narrow F16 projection optimization, unless an explicit `LUCE_MMVF_MAX_NCOLS_F16` ceiling overrides it. |
+| `GGML_CUDA_MMQ_X` | unset | DEBUG: force a supported MMQ output-column tile width (8–128) for architecture tuning; invalid or over-budget values fall back to automatic selection. |
+| `GGML_CUDA_MMQ_MOE_ADAPTIVE_X` | unset | BURN-IN: on sparse-route gfx1151 grouped MoE MMQ, choose the measured ROCmFP2/3/4 output tile from routed rows per expert; ordinary matmuls, unmeasured formats, and other devices are unchanged. |
+| `GGML_CUDA_MMQ_MOE_PERSISTENT` | unset | EXPERIMENTAL: on prefill-sized (at least 256-token) sparse grouped ROCmFP2/3/4 MMQ on gfx1151, build a compact device-side expert-tile queue and consume it with bounded persistent workers. Short batches, ordinary matmuls, unmeasured formats, and other devices are unchanged. |
+| `GGML_CUDA_MMQ_MOE_PERSISTENT_BLOCKS_PER_CU` | 32 | DEBUG: set the compact grouped-MoE worker budget per gfx1151 CU from 1–32. Invalid values use 32. |
+| `GGML_CUDA_MLA_STREAM_F32_STAGE` | unset | EXPERIMENTAL: with streaming D512 indexed attention, convert aligned F16 pairs once while staging them in shared memory instead of repeating conversion for every head. |
+| `GGML_CUDA_MLA_STREAM_FAST_EXP` | unset | EXPERIMENTAL: with FP32-staged streaming D512 indexed attention, use the HIP hardware exponential intrinsic for online softmax. Other attention paths are unchanged. |
+| `GGML_CUDA_MLA_SPLIT_KV` / `GGML_DS4_FA_SPLIT_KV` | 1 on gfx1151 indexed decode; unset elsewhere | BURN-IN: =1 forces the reusable split-KV MLA schedule. Unset, empty, or =0 does not force it (the device default still applies). Set `GGML_CUDA_MLA_NO_SPLIT_KV=1` (or legacy `GGML_DS4_FA_NO_SPLIT_KV=1`) to disable it; either kill switch overrides either force flag, while empty/=0 kill switches have no effect. |
+| `GGML_DS4_TOPK_BLOCK_RADIX` | 1 on gfx1151 | BURN-IN KILL SWITCH: =0 restores hipCUB full sort for DS4-shaped 512-row top-k selection. |
 | `GGML_DS4_FA_SERIAL_INDEX_SCAN` | unset | DEBUG/A-B: restore the serial indexed-attention mask scan instead of the long-context HIP parallel scan. |
 | `DFLASH_MOE_PREFILL_PERSISTENT_OWNER_ALLOC` | 1 for qualified long heterogeneous prefill | KILL SWITCH: =0 restores per-layer route/owner scratch allocation. |
 | `DFLASH_MOE_TP_*` / `DFLASH_MOE_HYBRID_PREFILL_EAGER` | unset | BURN-IN: model-neutral names for common heterogeneous-MoE scheduling and kernel policy. Existing `DFLASH_DS4_*` names remain compatibility aliases. |
@@ -51,14 +70,16 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `DFLASH_KVFLASH` | unset | Prefer the CLI: `--kvflash` (token count or `auto`). |
 | `DFLASH_PREFIX_CACHE_SLOTS` | 32 | Container-entrypoint equivalent of `--prefix-cache-slots`; not read directly by the native binary. |
 | `DFLASH_PREFILL_CACHE_SLOTS` | 0 | Container-entrypoint equivalent of `--prefill-cache-slots`; not read directly by the native binary. |
+| `DFLASH_PREFILL_POOL_TRIM_TOKENS` | unset | OPT-IN: trim cached allocations from legacy CUDA/HIP device pools at completed Qwen3.5 prefill chunk boundaries after each configured token interval. Intended for long, shape-changing prefills on non-VMM devices; each trim synchronizes the target backend and retires captured graphs. |
 | `DFLASH_SPLIT_FAST_ROLLBACK` | unset | OPT-IN: exact F32 checkpoints and replay-free rollback for local qwen35 target layer splits. Prefer `--target-split-fast-rollback`; adds checkpoint VRAM (~1.65 GiB for the measured Qwen3.6-27B q=16 split). |
 | `DFLASH_STALL_TOOL_PREFIX` | unset | OPT-IN: recover a stalled tool call by injecting the prepared tool prefix when generation stops after an action suffix. |
 | `DFLASH_DS4_SPEC` / `DFLASH_DS4_DRAFT` / `DFLASH_DS4_DRAFT_BACKEND` / `DFLASH_DS4_DRAFT_GPU` | unset | OPT-IN: enable DeepSeek4 DSpark, select its draft GGUF, and optionally select the local drafter backend/device. See `DS4.md`. |
 | `DFLASH_DS4_CUDA_LAYERS` | auto | Override the DeepSeek4 heterogeneous layer-split heuristic. See `DS4.md`. |
+| `DFLASH_ROCMFP2_ROW4` | 1 on gfx1151 for q>2; legacy two-row kernel elsewhere | BURN-IN KILL SWITCH: =0 restores two-row-per-wave ROCmFP2 verification kernels. |
 
 ## Full inventory (generated)
 
-`grep -rE 'getenv\("[A-Z0-9_]+"\)' server/src` - regenerate when adding or removing variables.
+`grep -rE 'getenv\("[A-Z0-9_]+"\)' server/src` - regenerate when adding or removing variables. Also include backend variables and helper-based reads (such as `ds4_env_flag_enabled`) under `server/deps/llama.cpp/ggml/src`.
 
 - `DFLASH27B_CHUNKED` - qwen35_target_graph.cpp
 - `DFLASH27B_DRAFT_FP16` - draft_safetensors_loader.cpp
@@ -72,10 +93,12 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH27B_PREFILL_UBATCH` - layer_split_daemon.cpp, qwen35_backend.cpp, qwen35_layer_split_adapter.cpp
 - `DFLASH_ADAPTIVE_K_DENSE` - mmid_adaptive_k.h
 - `DFLASH_ADAPTIVE_K_TAU` - mmid_adaptive_k.h
+- `DFLASH_ADAPTIVE_SPEC_WIDTH` - adaptive_spec_width.h
 - `DFLASH_ADAPTIVE_WIDTH_MIN` - adaptive_verify_width.h
 - `DFLASH_ADAPTIVE_WIDTH_THETA` - adaptive_verify_width.h
 - `DFLASH_COLD_THREADS` - moe_expert_compute_cpu.cpp
 - `DFLASH_CUDA_BACKEND_PATH` - dynamic_backend.cpp
+- `DFLASH_CUDA_MMVF_NARROW_F16` - ggml-cuda/mmvf.cu
 - `DFLASH_CUDA_MMVQ_MOE_ALIGN_SHARED_IDS` - moe_hybrid_ffn_eval.cpp
 - `DFLASH_CUDA_MMVQ_MOE_KERNEL` - moe_hybrid_ffn_eval.cpp
 - `DFLASH_DISABLE_DRAFT_ATTN` - draft_graph.cpp
@@ -96,12 +119,16 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_DS4_DENSE_TP_MASK` - deepseek4_loader.cpp
 - `DFLASH_DS4_DENSE_TP_STRIX_FRACTION` - deepseek4_loader.cpp
 - `DFLASH_DS4_DISABLE_GROUPED_OUTPUT_PROJECTION` - deepseek4_graph.cpp
+- `DFLASH_DS4_DIRECT_INDEXER_TOPK` - deepseek4_graph.cpp
 - `DFLASH_DS4_DRAFT` - deepseek4_backend.cpp
 - `DFLASH_DS4_DRAFT_BACKEND` - deepseek4_backend.cpp
 - `DFLASH_DS4_DRAFT_GPU` - deepseek4_backend.cpp
 - `DFLASH_DS4_DSPARK_DEBUG` - deepseek4_graph.cpp
 - `DFLASH_DS4_FUSED_VERIFY` - deepseek4_dspark_spec.cpp, deepseek4_loader.cpp
 - `DFLASH_DS4_HOTNESS_CSV` - deepseek4_backend.cpp
+- `DFLASH_DS4_INCREMENTAL_VERIFY_MASK` - deepseek4_fused_verify.inc
+- `DFLASH_DS4_INCREMENTAL_VERIFY_MASK_MIN_BYTES` - deepseek4_fused_verify.inc
+- `DFLASH_DS4_MIX_MMQ_PREFILL` - deepseek4_backend.cpp, ggml-cuda/mmq.cu
 - `DFLASH_DS4_MOE_TP` - deepseek4_backend.cpp
 - `DFLASH_DS4_MOE_TP_BACKEND` - deepseek4_backend.cpp
 - `DFLASH_DS4_MOE_TP_CONCENTRATE_COLD` - deepseek4_backend.cpp
@@ -112,9 +139,11 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_DS4_ROCTX` - deepseek4_roctx.cpp
 - `DFLASH_QWEN35_ROCTX` - qwen35_roctx.cpp
 - `DFLASH_DS4_SEQ_VERIFY` - deepseek4_dspark_spec.cpp
+- `DFLASH_ROCMFP2_ROW4` - rocmfp2_mix.cu
 - `DFLASH_DS4_SPEC` - deepseek4_backend.cpp
 - `DFLASH_DS4_SPEC_REFERENCE_EXACT` - deepseek4_dspark_spec.cpp
 - `DFLASH_DS4_SPEC_Q` - deepseek4_dspark_spec.cpp
+- `DFLASH_DS4_SPARSE_DECODE_FLASH` - deepseek4_fused_verify.inc, deepseek4_graph.cpp
 - `DFLASH_DS4_TIMING` - deepseek4_backend.cpp, deepseek4_target_shard_ipc_daemon.cpp
 - `DFLASH_DS4_TP_CAPTURE_CACHE_SLOTS` - deepseek4_fused_verify.inc
 - `DFLASH_DS4_TP_FUSED_CACHE_SLOTS` - deepseek4_fused_verify.inc
@@ -190,6 +219,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_MMQ_SUB_BATCH` - moe_hybrid_ffn_eval.cpp
 - `DFLASH_MODEL_CARDS_DIR` - model_card.cpp
 - `DFLASH_MOE_COLD_BACKEND` - deepseek4_loader.cpp
+- `DFLASH_MOE_COMBINE_VEC4` - ggml-cuda/moe-fused.cu
 - `DFLASH_MOE_COMPACT_MATERIALIZED` - moe_hybrid_ffn_eval.cpp
 - `DFLASH_MOE_DUPLICATE_HOT_ON_COLD` - moe_hybrid_storage.cpp
 - `DFLASH_MOE_EXPERT_COMPUTE_DAEMON_TOKEN_LOOP` - moe_expert_compute_ipc.cpp
@@ -218,6 +248,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_NO_PREAD` - deepseek4_loader.cpp
 - `DFLASH_PROF` - prof_env.h
 - `DFLASH_PREFILL_CACHE_SLOTS` - scripts/entrypoint.sh (maps to `--prefill-cache-slots`)
+- `DFLASH_PREFILL_POOL_TRIM_TOKENS` - qwen35_backend.cpp (OPT-IN: trim legacy device pools during long prefills)
 - `DFLASH_PREFILL_TIMING` - qwen35_backend.cpp (DEBUG: per-ubatch prefill build/alloc/compute timing)
 - `DFLASH_PREFIX_CACHE_SLOTS` - scripts/entrypoint.sh (maps to `--prefix-cache-slots`)
 - `DFLASH_QWEN35MOE_CACHE_SLOTS` - qwen35moe_backend.cpp
@@ -257,6 +288,19 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_TOPK_SPLIT` - geometric_draft_topk_cuda.cu
 - `DFLASH_VERIFY_WIDTH` - qwen35moe_backend.cpp
 - `FAST_ROLLBACK_DIAG` - qwen35_dflash_target.cpp
+- `GGML_CUDA_MLA_NO_SPLIT_KV` - ds4-env.cuh (fattn.cu)
+- `GGML_CUDA_MMQ_X` - ggml-cuda/mmq.cuh
+- `GGML_CUDA_MMQ_MOE_ADAPTIVE_X` - ggml-cuda/mmq.cuh
+- `GGML_CUDA_MMQ_MOE_PERSISTENT` - ggml-cuda/mmq.cuh
+- `GGML_CUDA_MMQ_MOE_PERSISTENT_BLOCKS_PER_CU` - ggml-cuda/mmq.cuh
+- `GGML_CUDA_MLA_STREAM_TOPK` - ggml-cuda/fattn.cu
+- `GGML_DS4_FA_STREAM_TOPK` - ggml-cuda/fattn.cu (compatibility alias)
+- `GGML_CUDA_MLA_STREAM_F32_STAGE` - ggml-cuda/fattn.cu
+- `GGML_CUDA_MLA_STREAM_FAST_EXP` - ggml-cuda/fattn.cu
+- `GGML_CUDA_MLA_SPLIT_KV` - ds4-env.cuh (fattn.cu)
+- `GGML_DS4_FA_NO_SPLIT_KV` - ds4-env.cuh (fattn.cu)
+- `GGML_DS4_FA_SPLIT_KV` - ds4-env.cuh (fattn.cu)
+- `GGML_DS4_TOPK_BLOCK_RADIX` - top-k.cu
 - `HOME` - spark_corpus.cpp
 - `LUCE_Q8_MEMO` - mmvq.cu (set to 0 to disable q8_1 activation memoisation; on by default)
 - `LUCE_MMQ_BIG_PREFILL` - mmq.cu (=0 disables the RDNA4 128-wide MMQ tiles for large prefill batches)

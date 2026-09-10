@@ -1603,9 +1603,10 @@ static ggml_tensor * build_delta_net_block(
     // One GEMV over the stacked (beta | alpha) alias when available.
     ggml_tensor * beta_2d = nullptr;
     ggml_tensor * alpha_2d = nullptr;
+    ggml_tensor * ba = nullptr;
     const bool stacked_ba = L.ssm_ba && L.ssm_beta_s == 1.0f && L.ssm_alpha_s == 1.0f;
     if (stacked_ba) {
-        ggml_tensor * ba = ggml_mul_mat(ctx, L.ssm_ba, cur);     // [2 * dt_rank, n_tokens]
+        ba = ggml_mul_mat(ctx, L.ssm_ba, cur);     // [2 * dt_rank, n_tokens]
         const size_t e = ggml_element_size(ba);
         beta_2d = contig(ggml_view_2d(ctx, ba, num_v_heads, n_tokens, ba->nb[1], 0));
         alpha_2d = contig(ggml_view_2d(ctx, ba, num_v_heads, n_tokens, ba->nb[1], (size_t)num_v_heads * e));
@@ -1747,26 +1748,53 @@ static ggml_tensor * build_delta_net_block(
         !parent_ids && !seg_parent_ids && !use_specla_factorized &&
         !use_specla_hld;
     const bool fused_conv = fused_plain;
-    const bool raw_gates = fused_plain && !use_chunked && L.ssm_gate_ba;
+    // Concurrent verify (mapped tree segment committed from the replay log):
+    // the dense chain's fusions on kernels that read the mapped base state
+    // in place. One tree-window conv step replaces the history gather,
+    // transpose and concat; the recurrence reads its base slab through the
+    // slot map instead of a gathered copy and writes neither the final
+    // state nor per-token intermediates (the commit replays the log); the
+    // gates are derived in the kernel from strided views of the stacked
+    // projection. Every kernel keeps the op-by-op arithmetic, so the outputs
+    // are bit-identical. DFLASH_QWEN35_NO_FUSED_KERNELS=1 restores the
+    // op-by-op graph.
+    const bool verify_fused = fused_kernels_env && fused_kernel_backend &&
+        seg_active && seg_tree && capture_chain_commit && seg_parent_ids &&
+        !use_chunked && !use_specla_factorized && !use_specla_hld;
+    const bool raw_gates = (fused_plain || verify_fused) && !use_chunked && L.ssm_gate_ba;
 
-    ggml_tensor * beta = ggml_reshape_4d(ctx,
-        seg_cols(beta_2d, seg.off, seg_tokens),
-        1, num_v_heads, n_seq_tokens, seg_seqs);
-    ggml_tensor * alpha = ggml_reshape_3d(ctx,
-        seg_cols(alpha_2d, seg.off, seg_tokens),
-        num_v_heads, n_seq_tokens, seg_seqs);
+    ggml_tensor * beta = nullptr;
     ggml_tensor * g_tensor = nullptr;
-    if (raw_gates) {
-        // The kernel applies sigmoid(beta) and softplus(alpha + dt_bias) * A.
-        g_tensor = ggml_reshape_4d(
-            ctx, alpha, 1, num_v_heads, n_seq_tokens, seg_seqs);
+    if (raw_gates && verify_fused && ba) {
+        // Strided [1, H, T, S] views of the stacked (beta | alpha) projection:
+        // the mapped-verify kernel reads both through one layout, so the two
+        // contiguity copies go away together with the gate ops.
+        const size_t e = ggml_element_size(ba);
+        beta = ggml_view_4d(ctx, ba, 1, num_v_heads, n_seq_tokens, seg_seqs,
+                            e, ba->nb[1], ba->nb[1] * n_seq_tokens,
+                            (size_t)seg.off * ba->nb[1]);
+        g_tensor = ggml_view_4d(ctx, ba, 1, num_v_heads, n_seq_tokens, seg_seqs,
+                                e, ba->nb[1], ba->nb[1] * n_seq_tokens,
+                                (size_t)seg.off * ba->nb[1] + (size_t)num_v_heads * e);
     } else {
-        beta = ggml_sigmoid(ctx, beta);
-        alpha = ggml_add(ctx, alpha, L.ssm_dt_bias);
-        alpha = ggml_softplus(ctx, alpha);
-        g_tensor = ggml_mul(ctx, alpha, L.ssm_a);
-        g_tensor = ggml_reshape_4d(
-            ctx, g_tensor, 1, num_v_heads, n_seq_tokens, seg_seqs);
+        beta = ggml_reshape_4d(ctx,
+            seg_cols(beta_2d, seg.off, seg_tokens),
+            1, num_v_heads, n_seq_tokens, seg_seqs);
+        ggml_tensor * alpha = ggml_reshape_3d(ctx,
+            seg_cols(alpha_2d, seg.off, seg_tokens),
+            num_v_heads, n_seq_tokens, seg_seqs);
+        if (raw_gates) {
+            // The kernel applies sigmoid(beta) and softplus(alpha + dt_bias) * A.
+            g_tensor = ggml_reshape_4d(
+                ctx, alpha, 1, num_v_heads, n_seq_tokens, seg_seqs);
+        } else {
+            beta = ggml_sigmoid(ctx, beta);
+            alpha = ggml_add(ctx, alpha, L.ssm_dt_bias);
+            alpha = ggml_softplus(ctx, alpha);
+            g_tensor = ggml_mul(ctx, alpha, L.ssm_a);
+            g_tensor = ggml_reshape_4d(
+                ctx, g_tensor, 1, num_v_heads, n_seq_tokens, seg_seqs);
+        }
     }
 
     ggml_tensor * conv_out = nullptr;
@@ -1784,6 +1812,25 @@ static ggml_tensor * build_delta_net_block(
             conv_channels, n_seq_tokens, 1,
             (size_t)conv_channels*f32,
             (size_t)conv_channels*n_seq_tokens*f32, 0);
+    } else if (verify_fused) {
+        // One kernel assembles [history | x] per mapped slot along the tree
+        // parents and applies silu; the window it writes is the replay-log
+        // commit's input. The persistent history stays read-only.
+        ggml_tensor * packed = ggml_ssm_conv_tree_step(
+            ctx, qkv_mixed, L.ssm_conv1d, seg.conv_st, seg.state_ids, seg_parent_ids);
+        const size_t f32 = sizeof(float);
+        const int64_t window = (int64_t)(w.ssm_d_conv - 1) + n_seq_tokens;
+        conv_out = ggml_view_3d(ctx, packed, conv_channels, n_seq_tokens, seg_seqs,
+                                (size_t)conv_channels * f32,
+                                (size_t)conv_channels * n_seq_tokens * f32, 0);
+        ggml_tensor * conv_input = ggml_view_3d(ctx, packed, window, conv_channels, seg_seqs,
+                                (size_t)window * f32,
+                                (size_t)window * conv_channels * f32,
+                                (size_t)conv_channels * n_seq_tokens * seg_seqs * f32);
+        GGML_ASSERT(!seg_cap->conv_input);
+        seg_cap->conv_input = conv_input;
+        ggml_set_output(seg_cap->conv_input);
+        ggml_build_forward_expand(gf, seg_cap->conv_input);
     } else {
     // ── Fetch conv state [kernel-1, conv_channels] and prepend to qkv_mixed
     //    along the token axis to form the convolution input.
@@ -1957,7 +2004,11 @@ static ggml_tensor * build_delta_net_block(
 
     // ── SSM state (recurrent): reshape to [S_v, S_v, H_v, n_seqs]
     ggml_tensor * s = nullptr;
-    if (seg_tree) {
+    if (seg_tree && verify_fused) {
+        // The mapped-verify kernel reads each sequence's base slab through
+        // seg.state_ids and never writes the persistent tensor.
+        s = seg.ssm_st;
+    } else if (seg_tree) {
         // Packed tree verification starts each tree from the owning slot's
         // base state. Gather compact slabs, then leave the persistent tensor
         // untouched; accepted paths are committed by later direct promotion.
@@ -2085,9 +2136,12 @@ static ggml_tensor * build_delta_net_block(
         // In-place final state: the kernel writes the new recurrent state
         // straight into `s` (a view of the persistent ssm_state), so no
         // separate 3 MB copy per layer is needed. Tree mode keeps the copy.
-        result = inplace_state
-            ? ggml_gated_delta_net_inplace(ctx, q_c, k_c, v_c, g_tensor, beta, s)
-            : ggml_gated_delta_net(ctx, q_c, k_c, v_c, g_tensor, beta, s);
+        GGML_ASSERT(!verify_fused || !persist_inter);
+        result = verify_fused
+            ? ggml_gated_delta_net_mapped_verify(ctx, q_c, k_c, v_c, g_tensor, beta, s, seg.state_ids)
+            : inplace_state
+                ? ggml_gated_delta_net_inplace(ctx, q_c, k_c, v_c, g_tensor, beta, s)
+                : ggml_gated_delta_net(ctx, q_c, k_c, v_c, g_tensor, beta, s);
         if (persist_inter) {
             result->src[7] = persist_inter;
         }

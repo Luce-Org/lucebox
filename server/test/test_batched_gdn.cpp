@@ -78,6 +78,8 @@ bool test_cpu_gdn_support_matrix(ggml_backend_t backend) {
         ctx, q, k, v, g, beta, state);
     ggml_tensor * active = ggml_gated_delta_net_active_inplace(
         ctx, q, k, v, g, beta, state, active_slots);
+    ggml_tensor * mapped_verify = ggml_gated_delta_net_mapped_verify(
+        ctx, q, k, v, g, beta, state, active_slots);
     ggml_tensor * tree = ggml_gated_delta_net_tree(
         ctx, q, k, v, g, beta, state, parents);
     ggml_tensor * tree_persistent = ggml_gated_delta_net_tree_persist(
@@ -87,6 +89,7 @@ bool test_cpu_gdn_support_matrix(ggml_backend_t backend) {
         ggml_backend_supports_op(backend, base) &&
         ggml_backend_supports_op(backend, inplace) &&
         ggml_backend_supports_op(backend, active) &&
+        !ggml_backend_supports_op(backend, mapped_verify) &&
         !ggml_backend_supports_op(backend, tree) &&
         !ggml_backend_supports_op(backend, tree_persistent);
     std::printf("batched gdn CPU support matrix %s\n", ok ? "PASS" : "FAIL");

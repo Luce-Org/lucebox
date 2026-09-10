@@ -10999,6 +10999,7 @@ static uint32_t ggml_vk_rms_partials_size(ggml_backend_vk_context * ctx, const g
 static vk_op_rope_push_constants ggml_vk_make_rope_constants(const ggml_tensor *dst, const ggml_tensor *src0, const bool has_ff, bool backprop, const uint32_t set_rows_stride) {
     const int n_dims        = ((const int32_t *) dst->op_params)[1];
     const int mode          = ((const int32_t *) dst->op_params)[2];
+    GGML_ASSERT((mode & GGML_ROPE_TYPE_TAIL) == 0);
     // const int n_ctx         = ((const int32_t *) dst->op_params)[3];
     const int n_ctx_orig    = ((const int32_t *) dst->op_params)[4];
     const float freq_base   = ((const float *)   dst->op_params)[5];
@@ -15304,6 +15305,11 @@ static ggml_backend_t ggml_backend_vk_device_init(ggml_backend_dev_t dev, const 
 }
 
 static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    if ((op->op == GGML_OP_ROPE || op->op == GGML_OP_ROPE_BACK) &&
+        (op->op_params[2] & GGML_ROPE_TYPE_TAIL)) {
+        return false;
+    }
+
     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
     const vk_device& device = ggml_vk_get_device(ctx->device);
 
@@ -15722,7 +15728,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_DIAG_MASK_INF:
             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_SOFT_MAX:
-            return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32
+            // Sink-column mode requires per-row sinks and an unscaled sink logit.
+            return ggml_get_op_params_i32(op, 2) == 0 && ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32
                 && (!op->src[1] || (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16));
         case GGML_OP_SOFT_MAX_BACK:
             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32

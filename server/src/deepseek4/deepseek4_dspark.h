@@ -179,7 +179,8 @@ bool deepseek4_dspark_verify_forward(ggml_backend_t backend,
 // the physical SWA rows they overwrote after the ring wraps; otherwise a later
 // causal verify reads rejected-token KV as if it were older committed history.
 // This remains much smaller than a full target-cache snapshot because the
-// verifier width is bounded by the DSpark block (currently q <= 5).
+// verifier width is bounded by the DSpark block (currently q <= 5). Compressor
+// staging holds both ratio-4 windows and the touched ratio-128 ring rows.
 struct DeepSeek4SpecRollback {
     int raw_pos = 0;
     int raw_count = 0;
@@ -200,6 +201,7 @@ struct DeepSeek4SpecRollback {
     ggml_backend_buffer_t pinned_buf = nullptr;
     uint8_t * pinned_base = nullptr;
     ggml_backend_t async_backend = nullptr;
+    bool uses_pinned_copy = false;
 
     DeepSeek4SpecRollback() = default;
     ~DeepSeek4SpecRollback();
@@ -207,10 +209,16 @@ struct DeepSeek4SpecRollback {
     DeepSeek4SpecRollback & operator=(const DeepSeek4SpecRollback &) = delete;
 };
 
+// Supplying backend selects stream-ordered copies; pinned_copy requests the
+// same pinned-host staging used by the speculative loop. The saved copy mode
+// is also used by apply. Backend must outlive rollback. For q>4 rejection,
+// restore to raw_pos and replay the accepted prefix.
 void deepseek4_spec_rollback_save(const DeepSeek4Cache & cache,
                                   DeepSeek4SpecRollback & rollback,
                                   int raw_pos,
-                                  int raw_count);
+                                  int raw_count,
+                                  ggml_backend_t backend = nullptr,
+                                  bool pinned_copy = false);
 
 void deepseek4_spec_rollback_apply(const DeepSeek4SpecRollback & rollback,
                                    const DeepSeek4Weights & weights,
