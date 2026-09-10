@@ -86,10 +86,19 @@ GGML_API void   rocmfpx_dequantize_row_fp2(const block_rocmfp2 * GGML_RESTRICT x
 GGML_API void   rocmfpx_quantize_row_fp2(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
 GGML_API size_t rocmfpx_quantize_fp2(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
 
+// Adaptive MIX block codecs. `codebooks_bf16` contains two sorted codebooks
+// (2*4 or 2*8 levels). The high bit of each half-block metadata byte selects
+// the codebook; the low seven bits retain the unsigned E4M3 scale.
+GGML_API bool rocmfpx_quantize_row_fp2_mix_ref(const float * GGML_RESTRICT x, block_rocmfp2 * GGML_RESTRICT y, int64_t k, const uint16_t codebooks_bf16[8], const float * GGML_RESTRICT imatrix);
+GGML_API void rocmfpx_dequantize_row_fp2_mix(const block_rocmfp2 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k, const uint16_t codebooks_bf16[8]);
+
 GGML_API void   rocmfpx_quantize_row_fp3_ref(const float * GGML_RESTRICT x, block_rocmfp3 * GGML_RESTRICT y, int64_t k);
 GGML_API void   rocmfpx_dequantize_row_fp3(const block_rocmfp3 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void   rocmfpx_quantize_row_fp3(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
 GGML_API size_t rocmfpx_quantize_fp3(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
+
+GGML_API bool rocmfpx_quantize_row_fp3_mix_ref(const float * GGML_RESTRICT x, block_rocmfp3 * GGML_RESTRICT y, int64_t k, const uint16_t codebooks_bf16[16], const float * GGML_RESTRICT imatrix);
+GGML_API void rocmfpx_dequantize_row_fp3_mix(const block_rocmfp3 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k, const uint16_t codebooks_bf16[16]);
 
 GGML_API void   rocmfpx_quantize_row_fp6_ref(const float * GGML_RESTRICT x, block_rocmfp6 * GGML_RESTRICT y, int64_t k);
 GGML_API void   rocmfpx_dequantize_row_fp6(const block_rocmfp6 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);

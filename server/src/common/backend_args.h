@@ -41,6 +41,7 @@ struct BackendFeatureConfig {
 struct BackendArgs {
     // Required
     const char *    model_path   = nullptr;   // target .gguf
+    const char *    mmproj_path  = nullptr;
 
     // Optional: speculative decode draft model (qwen35 only)
     const char *    draft_path   = nullptr;

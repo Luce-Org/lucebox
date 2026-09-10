@@ -1,0 +1,11 @@
+cmake_minimum_required(VERSION 3.21)
+project(ds4v_image_integration LANGUAGES CXX)
+
+add_executable(ds4v_image_integration_test test.cpp)
+target_include_directories(ds4v_image_integration_test PRIVATE ../../src/deepseek4)
+target_compile_features(ds4v_image_integration_test PRIVATE cxx_std_17)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(ds4v_image_integration_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
+endif()
+enable_testing()
+add_test(NAME ds4v_image_integration COMMAND ds4v_image_integration_test)

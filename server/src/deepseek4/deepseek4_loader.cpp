@@ -18,6 +18,8 @@
 #include "dflash27b.h"
 #include "common/gguf_bounds.h"
 #include "../common/moe_hybrid_storage.h"
+#include "../common/copied_source_reclaim.h"
+#include "../common/copied_source_upload.h"
 #include "../common/moe_hybrid_types.h"
 #include "ggml-cuda.h"
 
@@ -234,6 +236,19 @@ static bool is_expert_tensor(const char * name) {
            std::strstr(name, "ffn_down_exps") != nullptr;
 }
 
+static int image_bias_layer(const char * name) {
+    constexpr const char * prefix = "layers.";
+    if (std::strncmp(name, prefix, 7) != 0) return -1;
+    const char * number = name + 7;
+    if (*number < '0' || *number > '9') return -1;
+    char * suffix = nullptr;
+    const long layer = std::strtol(number, &suffix, 10);
+    if (layer < 0 || layer >= 43 ||
+        std::strcmp(suffix, ".ffn.gate.bias_vl") != 0 ||
+        std::string(name) != "layers." + std::to_string(layer) + ".ffn.gate.bias_vl") return -1;
+    return int(layer);
+}
+
 static bool should_keep_ds4_tensor(const char * name,
                                    const TargetLoadPlan & plan) {
     int layer_id = -1;
@@ -242,6 +257,12 @@ static bool should_keep_ds4_tensor(const char * name,
                layer_id >= plan.layer_begin &&
                layer_id < plan.layer_end &&
                is_expert_tensor(name);
+    }
+
+    const int image_layer = image_bias_layer(name);
+    if (image_layer >= 0) {
+        return plan.load_ds4_image_bias && image_layer >= plan.layer_begin &&
+               image_layer < plan.layer_end;
     }
 
     // Global tensors
@@ -1574,6 +1595,29 @@ bool load_deepseek4_gguf_partial(const std::string & path,
 
     // ── Collect tensors for allocation ──────────────────────────────────
     const int n_tensors = gguf_get_n_tensors(gctx);
+    if (plan.load_ds4_image_bias && !plan.expert_metadata_only) {
+        bool valid = n_layer == 43 && n_embd == 4096 && n_vocab == 129280 &&
+                     n_expert == 256 && n_expert_used == 6 &&
+                     plan.layer_begin == 0 && plan.layer_end == 43;
+        std::array<int, 43> counts{};
+        for (int ti = 0; ti < n_tensors; ++ti) {
+            const char * name = gguf_get_tensor_name(gctx, ti);
+            const int layer = image_bias_layer(name);
+            if (layer < 0) continue;
+            ++counts[size_t(layer)];
+            const ggml_tensor * tensor = find_tensor(meta_ctx, name);
+            valid = valid && tensor && tensor->type == GGML_TYPE_F32 &&
+                    tensor->ne[0] == 256 && tensor->ne[1] == 1 &&
+                    tensor->ne[2] == 1 && tensor->ne[3] == 1;
+        }
+        valid = valid && std::all_of(counts.begin(), counts.end(), [](int count) { return count == 1; });
+        if (!valid) {
+            set_last_error("DS4V requires the supported decoder and exactly 43 F32[256] image router biases");
+            gguf_free(gctx);
+            if (meta_ctx) ggml_free(meta_ctx);
+            return false;
+        }
+    }
     const size_t data_offset = gguf_get_data_offset(gctx);
     ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
     const size_t alignment = ggml_backend_buft_get_alignment(buft);
@@ -1777,6 +1821,11 @@ bool load_deepseek4_gguf_partial(const std::string & path,
             if (!a.upload_to_backend || !a.dense_split) continue;
             const void * src_data = (const char *)mmap.addr + a.file_offset;
             ggml_backend_tensor_set(a.tensor, src_data, 0, a.file_size);
+#if defined(__linux__)
+            // set_tensor has completed its source copy, including split buffers.
+            reclaim_copied_file_source(mmap.addr, mmap.len, src_data, a.file_size,
+                                       mmap.fd, ggml_get_name(a.tensor));
+#endif
         }
         if (!read_ok) {
             set_last_error("parallel weight read failed");
@@ -1788,10 +1837,39 @@ bool load_deepseek4_gguf_partial(const std::string & path,
             return false;
         }
     } else {
+#if defined(__linux__) && (defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP))
+        std::vector<uint8_t> upload_scratch;
+#endif
         for (auto & a : allocs) {
             if (!a.upload_to_backend) continue;
             const void * src_data = (const char *)mmap.addr + a.file_offset;
-            ggml_backend_tensor_set(a.tensor, src_data, 0, a.file_size);
+#if defined(__linux__) && (defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP))
+            if (!a.dense_split && ggml_backend_is_cuda(backend) && !ggml_backend_cuda_buffer_is_managed(buf)) {
+                // HIP may pin pageable upload sources. Keep file-backed pages
+                // out of that path so completed-source cache advice can act.
+                if (!upload_copied_file_chunks(mmap.addr, mmap.len, a.file_offset,
+                        a.file_size, upload_scratch,
+                        [&](const uint8_t * bytes, size_t offset, size_t count) {
+                            ggml_backend_tensor_set(a.tensor, bytes, offset, count);
+                        })) {
+                    set_last_error("invalid dense staged-upload source range");
+                    mmap.close_map();
+                    if (split_buf) ggml_backend_buffer_free(split_buf);
+                    if (buf) ggml_backend_buffer_free(buf);
+                    gguf_free(gctx);
+                    ggml_free(meta_ctx);
+                    return false;
+                }
+            } else
+#endif
+            {
+                ggml_backend_tensor_set(a.tensor, src_data, 0, a.file_size);
+            }
+#if defined(__linux__)
+            // set_tensor has completed its source copy, including split buffers.
+            reclaim_copied_file_source(mmap.addr, mmap.len, src_data, a.file_size,
+                                       mmap.fd, ggml_get_name(a.tensor));
+#endif
         }
     }
     mmap.close_map();
@@ -1809,6 +1887,11 @@ bool load_deepseek4_gguf_partial(const std::string & path,
         if (emb_mmap.open_ro(path, emb_err)) {
             std::memcpy(out.embedder.tok_embd_owned.data(),
                         (const char *)emb_mmap.addr + a.file_offset, a.file_size);
+#if defined(__linux__)
+            reclaim_copied_file_source(emb_mmap.addr, emb_mmap.len,
+                (const char *)emb_mmap.addr + a.file_offset, a.file_size,
+                emb_mmap.fd, "token_embd.weight");
+#endif
             emb_mmap.close_map();
         } else {
             set_last_error("embedder mmap: " + emb_err);
@@ -1828,6 +1911,12 @@ bool load_deepseek4_gguf_partial(const std::string & path,
     // ── Bind tensors to weight struct fields ────────────────────────────
     for (auto & a : allocs) {
         const char * name = ggml_get_name(a.tensor);
+
+        const int image_layer = image_bias_layer(name);
+        if (plan.load_ds4_image_bias && image_layer >= 0 && image_layer < int(n_layer)) {
+            out.layers[size_t(image_layer)].ffn_gate_bias_vl = a.tensor;
+            continue;
+        }
 
         // Global tensors
         if (std::strcmp(name, "token_embd.weight") == 0) { out.tok_embd = a.tensor; continue; }
@@ -2091,7 +2180,9 @@ bool build_deepseek4_moe_hybrid_storage_from_file_with_mmap(
         if (err) *err = mmap_err;
         return false;
     }
+#if !defined(__linux__)
     mmap.close_fd();
+#endif
 
     const size_t data_start = gguf_get_data_offset(gctx);
     const auto * file_bytes = static_cast<const uint8_t *>(mmap.addr);
@@ -2138,7 +2229,13 @@ bool build_deepseek4_moe_hybrid_storage_from_file_with_mmap(
     const MoeHybridConfig cfg = cfg_override ? *cfg_override : make_ds4_moe_hybrid_config(w);
     const bool ok = build_moe_hybrid_storage_from_file_with_mmap(
         cfg, backend, placement, layer_descs, layer_file_data,
-        mmap.addr, mmap.len, out, err, 0, cold_gpu_backend);
+        mmap.addr, mmap.len, out, err, 0, cold_gpu_backend
+#if defined(__linux__)
+        , mmap.fd
+#endif
+    );
+    // Advice borrows the original fd only while construction is in progress.
+    mmap.close_fd();
 
     if (!ok) {
         mmap.close_map();

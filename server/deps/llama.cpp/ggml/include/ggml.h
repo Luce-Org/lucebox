@@ -621,6 +621,10 @@ extern "C" {
 
         GGML_OP_PAGED_ATTN,
 
+        GGML_OP_MUL_MAT_BIAS_BF16, // explicit HIP-only DS4V fused bias
+        GGML_OP_RMS_NORM_VISION_F32, // inference-only HIP source-order DS4V normalization
+        GGML_OP_SOFT_MAX_VISION_F32, // inference-only HIP source-order DS4V softmax
+        GGML_OP_MUL_MAT_VISION_AV_F32, // inference-only HIP source-layout DS4V AV
         GGML_OP_DS4_MOE_COMBINE,
 
         GGML_OP_COUNT,
@@ -1424,6 +1428,28 @@ extern "C" {
             struct ggml_tensor  * a,
             float                 eps);
 
+    // HIP wave32 only: contiguous F32 [1024, rows], 16 <= rows <= INT_MAX/1024.
+    // Input values must be BF16-representable. Returns normalized F32 before
+    // weight multiplication and BF16 rounding; preserves the DS4V source order.
+    GGML_API struct ggml_tensor * ggml_rms_norm_vision_f32(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            float                 eps);
+
+    // Inference-only HIP wave32 operations; no CPU/RPC/backward implementation.
+    // scores: contiguous F32, width 16..4096, positive rows, total bytes <= INT_MAX.
+    GGML_API struct ggml_tensor * ggml_soft_max_vision_f32(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * scores);
+
+    // v: contiguous F32 [64,16,N,1], probabilities: contiguous F32 [N,N,16,1].
+    // N is 16..4096; result is F32 [64,N,16,1].
+    GGML_API struct ggml_tensor * ggml_mul_mat_vision_av_f32(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * probabilities);
+
+
     // group normalize along ne0*ne1*n_groups
     // used in stable-diffusion
     GGML_API struct ggml_tensor * ggml_group_norm(
@@ -1461,6 +1487,14 @@ extern "C" {
     // A: k columns, n rows => [ne03, ne02, n, k]
     // B: k columns, m rows  (i.e. we transpose it internally) => [ne03 * x, ne02 * y, m, k]
     // result is n columns, m rows => [ne03 * x, ne02 * y, m, n]
+    // Explicit inference-only BF16 W[k,m], X[k,n], optional bias[m] -> BF16 Y[m,n].
+    // Null bias selects the default Lt epilogue without a bias pointer. A present
+    // bias, including an all-zero vector, selects the fused bias epilogue.
+    // Contiguous 2D operands only; HIP Lt capability required, no fallback.
+    GGML_API struct ggml_tensor * ggml_mul_mat_bias_bf16(
+            struct ggml_context * ctx, struct ggml_tensor * weight,
+            struct ggml_tensor * input, struct ggml_tensor * bias);
+
     GGML_API struct ggml_tensor * ggml_mul_mat(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,

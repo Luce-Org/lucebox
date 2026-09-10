@@ -264,6 +264,9 @@ int moe_hybrid_cache_swap_in(MoeHybridLayerStorage & st, int global_expert,
                              ggml_backend_t gpu_backend);
 
 // Build hybrid storage by loading expert data directly from file (mmap).
+// Optional readonly_file_mmap metadata is supplied only by the mmap-retaining
+// wrapper for a read-only file-backed mapping. It permits advisory reclamation
+// of completed materialized GPU layers without invalidating source pointers.
 bool build_moe_hybrid_storage_from_file(
     const MoeHybridConfig & cfg,
     ggml_backend_t gpu_backend,
@@ -274,7 +277,10 @@ bool build_moe_hybrid_storage_from_file(
     std::string * err = nullptr,
     int cache_slots = 0,
     bool allocate_cold = true,
-    ggml_backend_t cold_gpu_backend = nullptr);
+    ggml_backend_t cold_gpu_backend = nullptr,
+    const void * readonly_file_mmap = nullptr,
+    size_t readonly_file_mmap_size = 0,
+    int readonly_file_fd = -1);
 
 // Spark: split a VRAM budget into a pinned-hot tier + an auto-sized expert
 // cache ring. target_bytes==0 keeps the current budget (use the card);
@@ -289,6 +295,8 @@ MoeSparkBudget spark_budget_split(uint64_t expert_budget, uint64_t total_expert_
 // mmap_base: pointer to start of mmap'd file.
 // mmap_total_size: total file size.
 // This variant populates out.layer_regions for use by MoeHybridStreamEngine.
+// Optional fd is borrowed only during construction and must identify this
+// offset-zero read-only mapping. The caller closes it after this call returns.
 bool build_moe_hybrid_storage_from_file_with_mmap(
     const MoeHybridConfig & cfg,
     ggml_backend_t gpu_backend,
@@ -300,6 +308,7 @@ bool build_moe_hybrid_storage_from_file_with_mmap(
     MoeHybridStorage & out,
     std::string * err = nullptr,
     int cache_slots = 0,
-    ggml_backend_t cold_gpu_backend = nullptr);
+    ggml_backend_t cold_gpu_backend = nullptr,
+    int readonly_file_fd = -1);
 
 }  // namespace dflash::common

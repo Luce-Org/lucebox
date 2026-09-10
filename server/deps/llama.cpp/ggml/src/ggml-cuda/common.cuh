@@ -33,6 +33,7 @@
 
 #if defined(GGML_USE_HIP)
 #include "vendors/hip.h"
+#include <hipblaslt/hipblaslt.h>
 #elif defined(GGML_USE_MUSA)
 #include "vendors/musa.h"
 #else
@@ -1436,6 +1437,16 @@ struct ggml_backend_cuda_context {
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
 
+#if defined(GGML_USE_HIP)
+    hipblasLtHandle_t vision_bias_handle = nullptr;
+    void * vision_bias_workspace = nullptr; // shared linear/AV 76 MiB, retained until context destruction
+    cudaEvent_t vision_bias_event = nullptr;
+    size_t vision_bias_launches = 0;
+    size_t vision_norm_launches = 0;
+    size_t vision_softmax_launches = 0;
+    size_t vision_av_launches = 0;
+    size_t vision_rotary_launches = 0; // successful synchronous table calls (five kernels each)
+#endif
     int curr_stream_no = 0;
     bool low_priority_streams = false;
     int stream_priority = 0;

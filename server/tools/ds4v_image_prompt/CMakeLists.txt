@@ -1,0 +1,16 @@
+cmake_minimum_required(VERSION 3.20)
+project(ds4v_image_prompt LANGUAGES CXX)
+add_library(ds4v_image_prompt STATIC
+    ../../src/deepseek4/deepseek4_image_prompt.cpp
+    ../../src/deepseek4/deepseek4_vision_preprocess.cpp)
+target_include_directories(ds4v_image_prompt PUBLIC ../../src/deepseek4)
+target_compile_features(ds4v_image_prompt PUBLIC cxx_std_17)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(ds4v_image_prompt PRIVATE -Wall -Wextra -Wpedantic -Werror)
+endif()
+add_executable(test_ds4v_image_prompt test.cpp)
+target_link_libraries(test_ds4v_image_prompt PRIVATE ds4v_image_prompt)
+add_executable(ds4v_image_prompt_fixtures fixtures.cpp)
+target_link_libraries(ds4v_image_prompt_fixtures PRIVATE ds4v_image_prompt)
+enable_testing()
+add_test(NAME ds4v_image_prompt COMMAND test_ds4v_image_prompt)

@@ -377,6 +377,22 @@ if(DFLASH27B_MIXED_GGML_SHARED)
     set(BUILD_SHARED_LIBS ON)
 endif()
 add_subdirectory(deps/llama.cpp/ggml EXCLUDE_FROM_ALL)
+
+option(DFLASH27B_DS4_MIX_CONVERTER
+    "Build the CPU-only DeepSeek-V4 safetensors to MIX GGUF converter" ON)
+if(DFLASH27B_DS4_MIX_CONVERTER)
+    add_executable(ds4_mix_converter
+        tools/ds4_mix_converter/ds4_mix_converter.cpp)
+    target_include_directories(ds4_mix_converter PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/rocmfpx)
+    target_link_libraries(ds4_mix_converter PRIVATE
+        ggml-base nlohmann_json::nlohmann_json)
+    if(UNIX)
+        target_link_libraries(ds4_mix_converter PRIVATE m)
+    endif()
+endif()
+
 if(DFLASH27B_MIXED_GGML_SHARED)
     if(_dflash_build_shared_libs_was_defined)
         set(BUILD_SHARED_LIBS "${_dflash_saved_build_shared_libs}")
@@ -478,6 +494,14 @@ add_library(dflash_common STATIC
     src/deepseek4/deepseek4_target_shard_ipc_daemon.cpp
     src/deepseek4/deepseek4_dspark.cpp
     src/deepseek4/deepseek4_dspark_spec.cpp
+    src/deepseek4/deepseek4_vision.cpp
+    src/deepseek4/deepseek4_vision_decode.cpp
+    src/deepseek4/deepseek4_vision_preprocess.cpp
+    src/deepseek4/deepseek4_image_prompt.cpp
+    src/deepseek4/deepseek4_image_assembly.cpp
+    src/deepseek4/deepseek4_image_admission.cpp
+    src/deepseek4/deepseek4_image_policy.cpp
+    src/server/image_input.cpp
     src/flashprefill_q8.cpp
     src/kv_cache.cpp
     src/kv_quant.cpp
@@ -848,6 +872,16 @@ if(DFLASH27B_ENABLE_BSA)
     endif()
 endif()
 
+# Production uses the same pinned decoder sources and options as the accepted
+# preprocessing probe. The decoder itself has no codec feature macro.
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/Ds4vImageCodecs.cmake")
+install(FILES tools/ds4v_preprocess_probe/THIRD_PARTY_NOTICES.md
+    DESTINATION share/licenses/ds4v
+    RENAME THIRD_PARTY_NOTICES.md)
+install(FILES "${DS4V_JPEG_SOURCE_DIR}/LICENSE.md"
+              "${DS4V_JPEG_SOURCE_DIR}/README.ijg"
+    DESTINATION share/licenses/ds4v/libjpeg-turbo)
+
 target_link_libraries(dflash_common
     PUBLIC
         ggml
@@ -855,6 +889,8 @@ target_link_libraries(dflash_common
         ggml-base
         nlohmann_json::nlohmann_json
     PRIVATE
+        ds4v_libjpeg
+        ds4v_lodepng
         ${CMAKE_DL_LIBS}
 )
 # OpenMP for parallel MoE expert compute kernel (saturate memory bandwidth).
@@ -960,6 +996,16 @@ if(DFLASH27B_TESTS)
         target_link_libraries(test_rocmfpx PRIVATE m)
     endif()
     list(APPEND _raw_unit_test_targets test_rocmfpx)
+
+    add_executable(test_ds4_mix_converter test/test_ds4v_mix_converter.cpp test/test_unit_main.cpp)
+    target_include_directories(test_ds4_mix_converter PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/rocmfpx)
+    target_link_libraries(test_ds4_mix_converter PRIVATE ggml-base)
+    if(UNIX)
+        target_link_libraries(test_ds4_mix_converter PRIVATE m)
+    endif()
+    list(APPEND _raw_unit_test_targets test_ds4_mix_converter)
 
     if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
         add_executable(test_rocmfp4_hip_tail test/test_rocmfp4_hip_tail.cpp)
@@ -1703,6 +1749,10 @@ if(DFLASH27B_TESTS)
     endif()
 
     # ─── Unit tests (no GPU, no model files) ────────────────────────────
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_moe_source_page_range.cpp")
+        add_executable(test_moe_source_page_range test/test_moe_source_page_range.cpp)
+        list(APPEND _raw_unit_test_targets test_moe_source_page_range)
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_moe_input_ready.cpp")
         add_executable(test_moe_input_ready test/test_moe_input_ready.cpp)
         target_include_directories(test_moe_input_ready PRIVATE

@@ -1,0 +1,53 @@
+
+Dynamic section at offset 0x15edae48 contains 50 entries:
+  Tag        Type                         Name/Value
+ 0x0000000000000001 (NEEDED)             Shared library: [libc10_hip.so]
+ 0x0000000000000001 (NEEDED)             Shared library: [libMIOpen.so.1]
+ 0x0000000000000001 (NEEDED)             Shared library: [libhiprtc.so.7]
+ 0x0000000000000001 (NEEDED)             Shared library: [libhipblas.so.3]
+ 0x0000000000000001 (NEEDED)             Shared library: [libhipfft.so.0]
+ 0x0000000000000001 (NEEDED)             Shared library: [libhiprand.so.1]
+ 0x0000000000000001 (NEEDED)             Shared library: [libhipsparse.so.4]
+ 0x0000000000000001 (NEEDED)             Shared library: [libhipsolver.so.1]
+ 0x0000000000000001 (NEEDED)             Shared library: [librocsolver.so.0]
+ 0x0000000000000001 (NEEDED)             Shared library: [libhipsparselt.so.0]
+ 0x0000000000000001 (NEEDED)             Shared library: [libaotriton_v2.so.0.11.1]
+ 0x0000000000000001 (NEEDED)             Shared library: [librccl.so.1]
+ 0x0000000000000001 (NEEDED)             Shared library: [librocm_smi64.so.1]
+ 0x0000000000000001 (NEEDED)             Shared library: [libc10.so]
+ 0x0000000000000001 (NEEDED)             Shared library: [libtorch_cpu.so]
+ 0x0000000000000001 (NEEDED)             Shared library: [libpthread.so.0]
+ 0x0000000000000001 (NEEDED)             Shared library: [librocblas.so.5]
+ 0x0000000000000001 (NEEDED)             Shared library: [libhipblaslt.so.1]
+ 0x0000000000000001 (NEEDED)             Shared library: [libamdhip64.so.7]
+ 0x0000000000000001 (NEEDED)             Shared library: [libmagma.so]
+ 0x0000000000000001 (NEEDED)             Shared library: [libstdc++.so.6]
+ 0x0000000000000001 (NEEDED)             Shared library: [libm.so.6]
+ 0x0000000000000001 (NEEDED)             Shared library: [libgcc_s.so.1]
+ 0x0000000000000001 (NEEDED)             Shared library: [libc.so.6]
+ 0x0000000000000001 (NEEDED)             Shared library: [ld-linux-x86-64.so.2]
+ 0x000000000000000e (SONAME)             Library soname: [libtorch_hip.so]
+ 0x000000000000000f (RPATH)              Library rpath: [$ORIGIN]
+ 0x000000000000000c (INIT)               0xcf8000
+ 0x000000000000000d (FINI)               0x394f674
+ 0x0000000000000019 (INIT_ARRAY)         0x15e0d948
+ 0x000000000000001b (INIT_ARRAYSZ)       5744 (bytes)
+ 0x000000000000001a (FINI_ARRAY)         0x15e0efb8
+ 0x000000000000001c (FINI_ARRAYSZ)       8 (bytes)
+ 0x000000006ffffef5 (GNU_HASH)           0x298
+ 0x0000000000000005 (STRTAB)             0x11e5b0
+ 0x0000000000000006 (SYMTAB)             0x48818
+ 0x000000000000000a (STRSZ)              9342546 (bytes)
+ 0x000000000000000b (SYMENT)             24 (bytes)
+ 0x0000000000000003 (PLTGOT)             0x15eed000
+ 0x0000000000000002 (PLTRELSZ)           365472 (bytes)
+ 0x0000000000000014 (PLTREL)             RELA
+ 0x0000000000000017 (JMPREL)             0xc9dcc0
+ 0x0000000000000007 (RELA)               0xa193f8
+ 0x0000000000000008 (RELASZ)             2640072 (bytes)
+ 0x0000000000000009 (RELAENT)            24 (bytes)
+ 0x000000006ffffffe (VERNEED)            0xa19128
+ 0x000000006fffffff (VERNEEDNUM)         8
+ 0x000000006ffffff0 (VERSYM)             0xa07402
+ 0x000000006ffffff9 (RELACOUNT)          81085
+ 0x0000000000000000 (NULL)               0x0

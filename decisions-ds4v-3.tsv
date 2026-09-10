@@ -1,0 +1,5 @@
+2026-09-04T07:05Z	branch	created ds4v/quant from origin/main 298031aa4222ec61c971ed834ec8f8829ce37a5c via git branch plus symbolic-ref, sparse checkout staged deletions left in index untouched
+2026-09-04T07:20Z	verified-tool-surface	read master llama-quantize usage and src/llama-quant.cpp from github, confirmed --tensor-type takes regex tensor name plus ggml type, so the recipe uses per class overrides instead of multi pass requant
+2026-09-04T07:45Z	proof	bash -n clean, help and plan exit 0 printing pin 9400c894, verify --help exit 0, jq empty clean, python budget recompute shows IQ2_XXS at 104.0 GiB with 48.0 margin against 152 and 92.7 on one 96 GiB card at 1M context, dash grep clean on all three files	Task step 6
+2026-09-04T07:52Z	stub-tests	stub llama.cpp proved b10763 refusal exit 1, pinned 9400c894 run executes the exact quantize command, verify passes at 43 bias_vl and fails at 42	Task step 6
+2026-09-04T07:55Z	commit	committing only docs/ds4v-quant.md, scripts/ds4v-quant.sh, share/model_cards/ds4v-vision.json via pathspec, sparse checkout staged deletions and DS4V-1 plus DS4V-2 staged files must stay out	Task step 7

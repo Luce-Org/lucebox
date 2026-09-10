@@ -1,0 +1,4 @@
+Get:1 https://repo.radeon.com/rocm/apt/7.2.4 noble/main amd64 miopen-hip amd64 3.5.1.70204-93~24.04 [308 MB]
+Fetched 308 MB in 3s (90.3 MB/s)
+verified miopen-hip_3.5.1.70204-93~24.04_amd64.deb b5759989f8d95b367d83309f4d9da3c55c1e5868703aaede1647434df375b6c2
+private library /home/marcelorm/ds4v-work/source-rocm210-reference/private-miopen/opt/rocm-7.2.4/lib/libMIOpen.so.1.0.70204 sha256 bad776611dcee04ec70ca17674999e1af606ab9bfa0c6c6309ccf933ab1cdbbd

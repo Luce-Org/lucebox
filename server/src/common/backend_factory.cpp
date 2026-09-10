@@ -218,6 +218,13 @@ std::unique_ptr<ModelBackend> create_backend(
     }
 
     const std::string & arch = plan.arch();
+    if (args.mmproj_path && *args.mmproj_path &&
+        (arch != "deepseek4" || args.device.is_layer_split() ||
+         args.remote_target_shard.enabled() || args.max_concurrency != 1 ||
+         plan.target_backend() != PlacementBackend::Hip)) {
+        std::fprintf(stderr, "[backend_factory] --mmproj requires a local single-request DeepSeek4 HIP backend\n");
+        return nullptr;
+    }
     if (arch.empty()) {
         std::fprintf(stderr,
             "[backend_factory] failed to detect architecture from %s\n",
@@ -440,6 +447,7 @@ std::unique_ptr<ModelBackend> create_backend(
             !args.remote_target_shard.enabled()) {
             DeepSeek4BackendConfig cfg;
             cfg.model_path = args.model_path;
+            cfg.mmproj_path = args.mmproj_path ? args.mmproj_path : "";
             cfg.device     = args.device;
             cfg.stream_fd  = args.stream_fd;
             cfg.max_ctx    = args.device.max_ctx;

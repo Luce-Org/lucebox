@@ -1,0 +1,5 @@
+Traceback (most recent call last):
+  File "/home/marcelorm/ds4v-work/source-rocm210-reference/freeze-source-reference.py", line 27, in <module>
+    assert digest(path) == expected
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError

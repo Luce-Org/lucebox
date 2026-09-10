@@ -1,0 +1,7 @@
+Traceback (most recent call last):
+  File "/home/marcelorm/ds4v-work/source-rocm210-reference/cpu-runtime-info.py", line 15, in <module>
+    import torch
+  File "/home/marcelorm/ds4v-work/source-rocm210-reference/.venv/lib/python3.12/site-packages/torch/__init__.py", line 431, in <module>
+    from torch._C import *  # noqa: F403
+    ^^^^^^^^^^^^^^^^^^^^^^
+ImportError: libMIOpen.so.1: cannot open shared object file: No such file or directory

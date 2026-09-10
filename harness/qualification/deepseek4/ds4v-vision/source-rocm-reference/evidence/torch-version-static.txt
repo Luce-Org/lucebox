@@ -1,0 +1,10 @@
+from typing import Optional
+
+__all__ = ['__version__', 'debug', 'cuda', 'git_version', 'hip', 'rocm', 'xpu']
+__version__ = '2.10.0+rocm7.2.4.git3d3aa833'
+debug = False
+cuda: Optional[str] = None
+git_version = '3d3aa833db84eed6b7f5595cb5f162c2f78300a4'
+hip: Optional[str] = '7.2.53211'
+rocm: Optional[str] = '7.2.4'
+xpu: Optional[str] = None

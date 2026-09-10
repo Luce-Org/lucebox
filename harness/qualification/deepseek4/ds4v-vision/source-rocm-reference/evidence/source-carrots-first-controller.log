@@ -1,0 +1,68 @@
+{
+  "command": [
+    "/home/marcelorm/ds4v-work/source-rocm210-reference/.venv/bin/python",
+    "-I",
+    "-B",
+    "/home/marcelorm/ds4v-work/source-rocm210-reference/source-forward-radeon-name.py",
+    "--device",
+    "hip",
+    "--image",
+    "carrots",
+    "--gpu-window-released",
+    "--rocr-visible-device",
+    "GPU-93a97448a27aeff3",
+    "--source",
+    "/home/marcelorm/lucebox-ds4v-2/models/DeepSeek-V4-Flash-Vision-Uncensored",
+    "--reference",
+    "/home/marcelorm/lucebox-ds4v-mix-fix/artifacts/vision-reference",
+    "--output",
+    "/home/marcelorm/ds4v-work/source-rocm210-reference/source-carrots-first"
+  ],
+  "environment": {
+    "HOME": "/home/marcelorm",
+    "PATH": "/usr/bin:/bin",
+    "LANG": "C.UTF-8",
+    "OMP_NUM_THREADS": "2",
+    "MKL_NUM_THREADS": "2",
+    "OPENBLAS_NUM_THREADS": "2",
+    "LD_LIBRARY_PATH": "/home/marcelorm/ds4v-work/source-rocm210-reference/private-miopen/opt/rocm-7.2.4/lib",
+    "TORCH_HOME": "/home/marcelorm/ds4v-work/source-rocm210-reference/torch-cache",
+    "TRITON_CACHE_DIR": "/home/marcelorm/ds4v-work/source-rocm210-reference/triton-cache",
+    "XDG_CACHE_HOME": "/home/marcelorm/ds4v-work/source-rocm210-reference/cache"
+  },
+  "timeout_seconds": 300,
+  "before": {
+    "operator": {
+      "MainPID": "0",
+      "ActiveState": "inactive"
+    },
+    "ports": [],
+    "kfd_processes": [],
+    "host_available_bytes": 36105768960,
+    "discrete_free_vram_bytes": 21430087680,
+    "discrete_sysfs": "/sys/devices/pci0000:00/0000:00:02.5/0000:c4:00.0/0000:c5:00.0/0000:c6:00.0"
+  },
+  "script_sha256": "cd34fd3df07963bea9014ccc6f405ec95400a7b8b70e4233fe5d3ead7dc9468c",
+  "miopen_sha256": "bad776611dcee04ec70ca17674999e1af606ab9bfa0c6c6309ccf933ab1cdbbd",
+  "wrapper_sha256": "b4b2d7f69a7d4c9aa50f18beffb75da5076192f758b7c701ed64fad2bc8bc6cd",
+  "gpu_release": "parent explicitly released fixed source stability lane",
+  "prospective_command_equivalence": "same frozen Python argv/environment; os.wait4 supplies timing in place of GNU time",
+  "python_pid": 3367102,
+  "exit": 0,
+  "elapsed_seconds": 5.763090842985548,
+  "user_seconds": 4.771837,
+  "system_seconds": 0.783909,
+  "max_rss_kib": 2517764,
+  "timed_out": false,
+  "after": {
+    "operator": {
+      "MainPID": "0",
+      "ActiveState": "inactive"
+    },
+    "ports": [],
+    "kfd_processes": [],
+    "host_available_bytes": 36018761728,
+    "discrete_free_vram_bytes": 21430087680,
+    "discrete_sysfs": "/sys/devices/pci0000:00/0000:00:02.5/0000:c4:00.0/0000:c5:00.0/0000:c6:00.0"
+  }
+}

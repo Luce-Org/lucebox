@@ -15,6 +15,10 @@
 #include "../common/moe_hybrid_stream.h"
 #include "deepseek4_internal.h"
 #include "deepseek4_dspark.h"
+#include "deepseek4_vision.h"
+#include "deepseek4_image_prompt.h"
+#include "deepseek4_image_assembly.h"
+#include "deepseek4_image_admission.h"
 #include "qwen3/qwen3_drafter.h"
 #include "deepseek4_seq_engine.h"
 
@@ -27,6 +31,8 @@
 #include <vector>
 
 namespace dflash::common {
+
+class DeepSeek4ImagePrompt;
 
 // Bounds the sparse heterogeneous prefill arena once accumulated attention
 // context dominates its memory footprint. Decode batching is unaffected.
@@ -66,6 +72,13 @@ public:
 
     // ModelBackend interface
     void print_ready_banner() const override;
+    bool supports_images() const override { return image_capable_; }
+    bool prepare_images(std::vector<int32_t> & tokens,
+                        std::vector<EncodedImage> images,
+                        uint64_t context_capacity,
+                        uint64_t output_reserve,
+                        ImagePromptHandle & payload,
+                        std::string & error) const override;
 
     bool park(ParkTarget target) override;
     bool unpark(ParkTarget target) override;
@@ -114,6 +127,11 @@ private:
     DeepSeek4PagedCache    paged_cache_;
     std::unique_ptr<DeepSeek4SeqEngine> seq_engine_;
     bool                   parked_       = false;
+    bool                   image_capable_ = false;
+    bool                   cache_has_images_ = false;
+    std::unique_ptr<vision::VisionRuntime> vision_;
+    vision::ImageRequestGate image_request_gate_;
+    vision::ImageAdmissionReserves image_reserves_;
 
     // Sampler
     SamplerCfg             sampler_;
@@ -172,7 +190,11 @@ private:
 
     // Prefill prompt tokens in chunks, return absolute committed position.
     int do_prefill(const std::vector<int32_t> & tokens, const DaemonIO & io,
-                   int kv_offset = 0, int snap_slot = -1, int snap_pos = -1);
+                   int kv_offset = 0, int snap_slot = -1, int snap_pos = -1,
+                   const DeepSeek4ImagePrompt * images = nullptr);
+    bool load_vision();
+    bool materialize_images(const DeepSeek4ImagePrompt & images,
+                            const DaemonIO & io, std::string & error);
 
     // Generate after either a fresh prefill or a restored prefix. kv_offset is
     // the number of prompt tokens already represented by cache_ and the
