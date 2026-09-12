@@ -186,6 +186,56 @@ struct MarkovChainGraph {
     std::vector<ggml_tensor *> confidence;        // optional sigmoid score per depth
 };
 
+// The chain graph is a pure function of its shape: the candidate count,
+// whether the confidence head is wanted, and the weights it closes over --
+// all fixed for the life of a loaded model. It was nevertheless rebuilt on
+// every call and freed again, which on DeepSeek V4 cost 1.1 ms of a 4.5 ms
+// head phase constructing tensors rather than computing anything. Keep the
+// last graph and reuse it; the shape key rebuilds when anything it depends
+// on changes, and the weights are compared by identity so a second model in
+// the same process cannot silently reuse the first one's graph.
+struct MarkovChainGraphCache {
+    MarkovChainGraph g;
+    std::vector<uint8_t> arena;
+    ggml_gallocr_t galloc = nullptr;
+    bool           built = false;
+    const void *   lm_head = nullptr;
+    const void *   markov_w1 = nullptr;
+    const void *   markov_w2 = nullptr;
+    const void *   confidence_w = nullptr;
+    ggml_backend_t backend = nullptr;
+    int            n_cand = -1;
+    bool           want_confidence = false;
+
+    bool matches(const DraftWeights & dw, ggml_tensor * head, ggml_backend_t be,
+                 int cand, bool conf) const {
+        return built && lm_head == head && backend == be && n_cand == cand &&
+               want_confidence == conf &&
+               markov_w1 == dw.dspark.markov_w1 &&
+               markov_w2 == dw.dspark.markov_w2 &&
+               confidence_w == dw.dspark.confidence_w;
+    }
+
+    // Drop the graph but keep the arena and the allocator: the arena is what
+    // the next graph is built into, and freeing the context must happen
+    // before build_markov_chain_graph() may resize that arena underneath it.
+    void invalidate() {
+        if (g.ctx) ggml_free(g.ctx);
+        g = MarkovChainGraph{};
+        built = false;
+    }
+};
+
+// DFLASH_DSPARK_NO_CHAIN_GRAPH_CACHE=1 restores the rebuild-every-call
+// behaviour, for isolating a suspected stale-graph problem.
+bool dspark_chain_graph_cache_disabled() {
+    static const bool off = []() {
+        const char * e = getenv("DFLASH_DSPARK_NO_CHAIN_GRAPH_CACHE");
+        return e && e[0] && std::strcmp(e, "0") != 0;
+    }();
+    return off;
+}
+
 // Guards shared by the fused Markov paths: head present, usable inputs, and
 // the target lm_head vocab matching the head's training vocab.
 bool dspark_fused_usable(const DraftWeights & dw, ggml_backend_t backend,
@@ -321,26 +371,39 @@ bool dspark_markov_correct_greedy_chain_fused(const DraftWeights & dw,
     const int hdim   = dw.n_embd;
     const int n_cand = q_len - 1;
 
-    static thread_local std::vector<uint8_t> g_arena_chain;
-    MarkovChainGraph g;
+    static thread_local MarkovChainGraphCache cache;
     const bool want_confidence = confidence_out != nullptr;
     if (confidence_out) confidence_out->clear();
-    if (!build_markov_chain_graph(dw, lm_head, n_cand, /*first_corrected=*/0,
-                                  /*corrected_are_outputs=*/false,
-                                  /*confidence_are_outputs=*/want_confidence,
-                                  g_arena_chain, g)) {
-        return false;
-    }
 
-    static thread_local ggml_gallocr_t galloc_chain = nullptr;
-    if (!galloc_chain) {
-        galloc_chain = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    const bool reuse = !dspark_chain_graph_cache_disabled() &&
+        cache.matches(dw, lm_head, backend, n_cand, want_confidence);
+    if (!reuse) {
+        cache.invalidate();
+        if (!build_markov_chain_graph(dw, lm_head, n_cand, /*first_corrected=*/0,
+                                      /*corrected_are_outputs=*/false,
+                                      /*confidence_are_outputs=*/want_confidence,
+                                      cache.arena, cache.g)) {
+            return false;
+        }
+        if (!cache.galloc) {
+            cache.galloc =
+                ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        }
+        if (!cache.galloc || !ggml_gallocr_alloc_graph(cache.galloc, cache.g.gf)) {
+            std::fprintf(stderr, "dspark_fused: gallocr_alloc_graph failed\n");
+            cache.invalidate();
+            return false;
+        }
+        cache.lm_head = lm_head;
+        cache.markov_w1 = dw.dspark.markov_w1;
+        cache.markov_w2 = dw.dspark.markov_w2;
+        cache.confidence_w = dw.dspark.confidence_w;
+        cache.backend = backend;
+        cache.n_cand = n_cand;
+        cache.want_confidence = want_confidence;
+        cache.built = true;
     }
-    if (!ggml_gallocr_alloc_graph(galloc_chain, g.gf)) {
-        std::fprintf(stderr, "dspark_fused: gallocr_alloc_graph failed\n");
-        ggml_free(g.ctx);
-        return false;
-    }
+    MarkovChainGraph & g = cache.g;
 
     // Candidate hidden states start at position 1 (position 0 is the seed).
     ggml_backend_tensor_set(g.inp_hidden, local_hidden + (size_t)hdim, 0,
@@ -354,7 +417,7 @@ bool dspark_markov_correct_greedy_chain_fused(const DraftWeights & dw,
 
     if (ggml_backend_graph_compute(backend, g.gf) != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "dspark_fused: graph_compute failed\n");
-        ggml_free(g.ctx);
+        cache.invalidate();
         return false;
     }
 
@@ -377,8 +440,7 @@ bool dspark_markov_correct_greedy_chain_fused(const DraftWeights & dw,
     if (want_confidence && !g.confidence.empty() && g.confidence[0]) {
         *confidence_out = std::move(c_out);
     }
-    ggml_free(g.ctx);
-    return true;
+    return true;   // the graph stays in `cache` for the next call
 }
 
 bool dspark_markov_project_topk(const DraftWeights & dw,
