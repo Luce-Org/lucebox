@@ -4,18 +4,20 @@
 // Split from http_server.cpp: this TU owns non-blocking admission (one
 // prefill chunk per engine step, fused with the live decode batch), FIFO
 // pool-full deferrals, per-slot streaming through ClientSendBuffer, and
-// retirement. SSE emission, error-close chunks, and HTTP response
+// retirement. SSE emission, terminal errors, and HTTP response
 // formatting are shared with the classic worker so both paths emit
 // matching wire formats.
 
 #include "http_server.h"
 #include "common/concurrency/seq_engine.h"
 #include "parallel_prefix_txn.h"
+#include "response_error.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <optional>
 #include <thread>
 
 namespace dflash::common {
@@ -43,8 +45,7 @@ struct SchedSlot {
     int n_gen_cap = 0;
     int completion_tokens = 0;
     bool client_disconnected = false;
-    bool failed = false;
-    std::string error;
+    std::optional<ResponseError> error;
     bool finished = false;
     std::vector<int32_t> gen_tokens;   // committed + pending, in order
     int32_t pending_tok = -1;          // sampled, fed back next step
@@ -245,7 +246,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         }
     };
 
-    auto retire_slot = [&](int idx, bool backend_ok) {
+    auto retire_slot = [&](int idx) {
         SchedSlot & s = slots[(size_t)idx];
         if (!s.job) return;
         const ParsedRequest & req = s.job->req;
@@ -264,7 +265,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             /*effective_prompt_tokens=*/prompt_tokens,
         };
 
-        if (backend_ok && !s.failed) {
+        if (!s.error) {
             PerfRecord perf;
             perf.prompt_tokens = (int)req.prompt_tokens.size();
             perf.completion_tokens = s.completion_tokens;
@@ -277,20 +278,19 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             status_.record_perf(perf);
         }
 
-        if (s.failed || !backend_ok) {
-            const std::string message =
-                s.error.empty() ? "generation failed" : s.error;
+        if (s.error) {
             if (!s.client_disconnected) {
                 if (req.stream) {
                     for (const std::string & chunk :
-                         sse_error_close_chunks(message)) {
+                         s.emitter->emit_error(*s.error)) {
                         s.send_buffer.append(chunk);
                     }
                 } else {
-                    json err = {{"error", {{"message", message},
-                                           {"type", "invalid_request_error"}}}};
+                    const json body = build_error_response(
+                        req.format, *s.error, req.response_id);
                     s.send_buffer.append(format_http_response(
-                        500, "application/json", err.dump() + "\n"));
+                        response_error_http_status(*s.error),
+                        "application/json", body.dump() + "\n"));
                 }
             }
         } else if (req.stream && !s.client_disconnected) {
@@ -317,7 +317,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             "[server] chat DONE %s ok=%s in=%zu out=%d %.1fs %.1f tok/s "
             "finish=%s slot=%d prefill=%.1fs decode=%.1fs(%.1ftok/s) parallel\n",
             req.response_id.c_str(),
-            (!s.failed && backend_ok) ? "true" : "false",
+            s.error ? "false" : "true",
             req.prompt_tokens.size(), out_tokens, elapsed_s,
             elapsed_s > 0.0 ? out_tokens / elapsed_s : 0.0,
             s.client_disconnected ? "client_disconnect"
@@ -568,7 +568,12 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             if (job->report_admission) {
                 job->admission = RoutingAdmission::unfit;
             } else {
-                send_error(job->fd, 400, "admission failed: " + ar.error);
+                const ResponseError error = ResponseError::invalid_request(
+                    "admission_failed", "admission failed: " + ar.error);
+                const json body = build_error_response(
+                    req.format, error, req.response_id);
+                send_response(job->fd, response_error_http_status(error),
+                              "application/json", body.dump() + "\n");
             }
             finish_job(job);
             return AdmissionDisposition::Retired;
@@ -586,7 +591,12 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             prepared_capture.cancel();
             std::fprintf(stderr, "[server] admit failed: %s\n",
                          ar.error.c_str());
-            send_error(job->fd, 500, "admission failed: " + ar.error);
+            const ResponseError error = ResponseError::internal(
+                "admission_failed", "admission failed: " + ar.error);
+            const json body = build_error_response(
+                req.format, error, req.response_id);
+            send_response(job->fd, response_error_http_status(error),
+                          "application/json", body.dump() + "\n");
             finish_job(job);
             return AdmissionDisposition::Retired;
         }
@@ -763,7 +773,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                     std::memory_order_acquire)) {
                 s.client_disconnected = true;
                 s.finished = true;
-                retire_slot(i, true);
+                retire_slot(i);
             }
         }
         if (live_slots == 0) continue;
@@ -808,9 +818,9 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 "failing all live requests\n", error.c_str());
             for (int i = 0; i < n_slots; i++) {
                 if (slots[(size_t)i].job) {
-                    slots[(size_t)i].failed = true;
-                    slots[(size_t)i].error = error;
-                    retire_slot(i, false);
+                    slots[(size_t)i].error = ResponseError::internal(
+                        "engine_step_failed", error);
+                    retire_slot(i);
                 }
             }
             continue;
@@ -820,8 +830,8 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             SchedSlot & s = slots[(size_t)out.slot];
             if (!s.job) continue;
             if (out.failed) {
-                s.failed = true;
-                s.error = out.error;
+                s.error = to_response_error(
+                    {GenerateErrorCode::DecodeFailed, out.error});
                 s.finished = true;
                 continue;
             }
@@ -863,8 +873,8 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 }
             }
             if (out.status == PrefillStatus::failed) {
-                s.failed = true;
-                s.error = out.error;
+                s.error = to_response_error(
+                    {GenerateErrorCode::PrefillFailed, out.error});
                 s.finished = true;
                 continue;
             }
@@ -913,7 +923,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         service_drains();
         for (int i = 0; i < n_slots; i++) {
             if (slots[(size_t)i].job && slots[(size_t)i].finished) {
-                retire_slot(i, true);
+                retire_slot(i);
             }
         }
     }
@@ -921,8 +931,9 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
     // Shutdown: unblock every parked client thread.
     for (int i = 0; i < n_slots; i++) {
         if (slots[(size_t)i].job) {
-            slots[(size_t)i].failed = true;
-            retire_slot(i, false);
+            slots[(size_t)i].error = ResponseError::unavailable(
+                "server_shutting_down", "server shutting down");
+            retire_slot(i);
         }
     }
     service_drains();
@@ -930,7 +941,13 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
     drains.clear();
     if (deferred) {
         // No response has been committed for a deferred admission.
-        send_error(deferred->fd, 503, "server shutting down");
+        const ParsedRequest & req = deferred->req;
+        const ResponseError error = ResponseError::unavailable(
+            "server_shutting_down", "server shutting down");
+        const json body = build_error_response(
+            req.format, error, req.response_id);
+        send_response(deferred->fd, response_error_http_status(error),
+                      "application/json", body.dump() + "\n");
         finish_job(deferred);
     }
     // Jobs that never reached admission are still parked in their client
@@ -938,7 +955,13 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
     // its client-shutdown timeout and the destructor never has to wake threads
     // after the server/backend teardown has already started.
     while (ServerJob * queued = try_dequeue()) {
-        send_error(queued->fd, 503, "server shutting down");
+        const ParsedRequest & req = queued->req;
+        const ResponseError error = ResponseError::unavailable(
+            "server_shutting_down", "server shutting down");
+        const json body = build_error_response(
+            req.format, error, req.response_id);
+        send_response(queued->fd, response_error_http_status(error),
+                      "application/json", body.dump() + "\n");
         finish_job(queued);
     }
 }

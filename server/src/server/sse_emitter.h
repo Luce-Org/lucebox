@@ -9,6 +9,7 @@
 #include "tool_memory.h"
 #include "reasoning.h"
 #include "api_types.h"
+#include "response_error.h"
 #include <nlohmann/json.hpp>
 
 #include <cstdint>
@@ -92,6 +93,10 @@ public:
                                          const GenTimings * timings = nullptr,
                                          int generation_cap = -1,
                                          bool ended_on_eos = false);
+
+    // Emit the selected API's terminal failure sequence. Error and success
+    // terminals are mutually exclusive; repeated terminal calls are no-ops.
+    std::vector<std::string> emit_error(const ResponseError & error);
 
     // Get the finish_reason for non-streaming responses.
     std::string finish_reason() const;
@@ -206,6 +211,7 @@ private:
 
     int64_t      created_at_;
     std::string  finish_reason_ = "stop";
+    bool         terminal_ = false;
 
     // Responses API IDs
     std::string  msg_item_id_;
