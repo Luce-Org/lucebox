@@ -812,6 +812,7 @@ bool test_tree_commit_preflight_is_non_mutating(ggml_backend_t backend) {
     constexpr int state_slots = 1;
     constexpr int conv_window = 2;
     constexpr int conv_channels = 3;
+    constexpr int feature_rows_count = tokens * sequences;
 
     ggml_init_params params{};
     params.mem_size = 256*1024;
@@ -822,15 +823,15 @@ bool test_tree_commit_preflight_is_non_mutating(ggml_backend_t backend) {
     ggml_tensor * cache =
         ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 4, 8, 1, 1);
     ggml_tensor * commit_rows =
-        ggml_new_tensor_2d(ctx, GGML_TYPE_I64, 1, sequences);
+        ggml_new_tensor_2d(ctx, GGML_TYPE_I64, tokens, sequences);
     ggml_tensor * active_slots =
         ggml_new_tensor_1d(ctx, GGML_TYPE_I32, sequences);
     ggml_tensor * feature_source =
-        ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, 4, sequences);
+        ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, 4, feature_rows_count);
     ggml_tensor * feature_destination =
         ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, 4, 4);
     ggml_tensor * feature_rows =
-        ggml_new_tensor_1d(ctx, GGML_TYPE_I32, sequences);
+        ggml_new_tensor_1d(ctx, GGML_TYPE_I32, feature_rows_count);
     ggml_tensor * replay_log = ggml_new_tensor_4d(
         ctx, GGML_TYPE_F32, 2*state_size + 1,
         heads, tokens, sequences);
@@ -856,6 +857,9 @@ bool test_tree_commit_preflight_is_non_mutating(ggml_backend_t backend) {
         (size_t) ggml_nelements(cache), 1.25f);
     std::vector<uint16_t> feature_before(
         (size_t) ggml_nelements(feature_destination), 0x3f80);
+    // Model an already-durable direct-row feature. Tree promotion must leave
+    // it alone while copying only the accepted tree suffix into row zero.
+    std::fill(feature_before.begin() + 4, feature_before.begin() + 8, 0x4100);
     std::vector<float> state_before(
         (size_t) ggml_nelements(state), -2.5f);
     std::vector<float> conv_before(
@@ -866,9 +870,13 @@ bool test_tree_commit_preflight_is_non_mutating(ggml_backend_t backend) {
         0.0f);
     std::vector<uint16_t> feature_source_values(
         (size_t) ggml_nelements(feature_source), 0x4000);
-    const int64_t destination_row = 0;
+    std::fill(
+        feature_source_values.begin(),
+        feature_source_values.begin() + 4,
+        0x4200);
+    const int64_t destination_rows[] = {0, -1};
     const int32_t active_slot = 0;
-    const int32_t feature_row = 0;
+    const int32_t feature_row_map[] = {0, -1};
     const int32_t valid_accepted = 1;
     const int32_t invalid_accepted = tokens + 1;
 
@@ -894,11 +902,11 @@ bool test_tree_commit_preflight_is_non_mutating(ggml_backend_t backend) {
         conv_input, zeros.data(), 0,
         (size_t) ggml_nelements(conv_input)*sizeof(float));
     ggml_backend_tensor_set(
-        commit_rows, &destination_row, 0, sizeof(destination_row));
+        commit_rows, destination_rows, 0, sizeof(destination_rows));
     ggml_backend_tensor_set(
         active_slots, &active_slot, 0, sizeof(active_slot));
     ggml_backend_tensor_set(
-        feature_rows, &feature_row, 0, sizeof(feature_row));
+        feature_rows, feature_row_map, 0, sizeof(feature_row_map));
     ggml_backend_tensor_set(
         accepted, &valid_accepted, 0, sizeof(valid_accepted));
 
@@ -911,7 +919,7 @@ bool test_tree_commit_preflight_is_non_mutating(ggml_backend_t backend) {
     const bool committed = ggml_backend_cuda_tree_commit_transaction(
         caches, 1, feature_source, feature_destination, feature_rows,
         replay_logs, states, conv_inputs, conv_states, 1,
-        commit_rows, accepted, active_slots, 4, 1);
+        commit_rows, accepted, active_slots, 4, 2);
     std::vector<uint16_t> committed_feature(feature_before.size());
     std::vector<float> committed_state(state_before.size());
     std::vector<float> committed_conv(conv_before.size());
@@ -927,7 +935,13 @@ bool test_tree_commit_preflight_is_non_mutating(ggml_backend_t backend) {
     const bool success_path_ok = committed &&
         std::all_of(
             committed_feature.begin(), committed_feature.begin() + 4,
-            [](uint16_t value) { return value == 0x4000; }) &&
+            [](uint16_t value) { return value == 0x4200; }) &&
+        std::all_of(
+            committed_feature.begin() + 4, committed_feature.begin() + 8,
+            [](uint16_t value) { return value == 0x4100; }) &&
+        std::all_of(
+            committed_feature.begin() + 8, committed_feature.end(),
+            [](uint16_t value) { return value == 0x3f80; }) &&
         std::all_of(
             committed_state.begin(), committed_state.end(),
             [](float value) { return value == 0.0f; }) &&
@@ -952,7 +966,7 @@ bool test_tree_commit_preflight_is_non_mutating(ggml_backend_t backend) {
     const bool rejected = !ggml_backend_cuda_tree_commit_transaction(
         caches, 1, feature_source, feature_destination, feature_rows,
         replay_logs, states, conv_inputs, conv_states, 1,
-        commit_rows, accepted, active_slots, 4, 1);
+        commit_rows, accepted, active_slots, 4, 2);
 
     std::vector<float> cache_after(cache_before.size());
     std::vector<uint16_t> feature_after(feature_before.size());

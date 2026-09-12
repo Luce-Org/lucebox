@@ -46,18 +46,56 @@ bool detail::target_graph_capacity_for_parallel_segments(
 bool detail::target_paged_tree_graph_capacity(
         int tree_width,
         int n_tree_seqs,
-        size_t & capacity) {
+        size_t & capacity,
+        int n_recurrent_segments) {
     static constexpr int tree_buckets[] = {
         1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64,
     };
     if (tree_width < 2 || tree_width > 16 ||
         std::find(std::begin(tree_buckets), std::end(tree_buckets),
                   n_tree_seqs) == std::end(tree_buckets) ||
+        n_recurrent_segments < 1 || n_recurrent_segments > 64 ||
         (int64_t)tree_width * n_tree_seqs > INT32_MAX) {
         return false;
     }
     return target_graph_capacity_for_parallel_segments(
-        n_tree_seqs, capacity);
+        std::max(n_tree_seqs, n_recurrent_segments), capacity);
+}
+
+bool detail::validate_target_paged_tree_prefix(
+        const TargetCache & cache,
+        int n_prefill_tokens,
+        const QwenPrefillSegment * prefill_segments,
+        int n_prefill_segments,
+        int mapped_ar_seqs,
+        int & n_direct_rows) {
+    n_direct_rows = 0;
+    if (n_prefill_tokens < 0 || n_prefill_segments < 0 ||
+        n_prefill_segments > 64 ||
+        mapped_ar_seqs < 0 || mapped_ar_seqs > cache.n_seq_slots ||
+        (n_prefill_tokens > 0) !=
+            (prefill_segments != nullptr && n_prefill_segments > 0)) {
+        return false;
+    }
+
+    int64_t prefill_total = 0;
+    for (int i = 0; i < n_prefill_segments; ++i) {
+        const QwenPrefillSegment & segment = prefill_segments[i];
+        if (segment.n_tokens < 1 ||
+            segment.token_offset != prefill_total ||
+            segment.seq_slot < 0 ||
+            segment.seq_slot >= cache.n_seq_slots) {
+            return false;
+        }
+        prefill_total += segment.n_tokens;
+        if (prefill_total > INT32_MAX) return false;
+    }
+    if (prefill_total != n_prefill_tokens ||
+        prefill_total + mapped_ar_seqs > INT32_MAX) {
+        return false;
+    }
+    n_direct_rows = static_cast<int>(prefill_total) + mapped_ar_seqs;
+    return true;
 }
 
 bool detail::validate_target_paged_tree_layout(
@@ -816,10 +854,17 @@ bool build_target_step_paged_tree(
     int tree_scratch_base,
     int tree_scratch_stride,
     int kq_stride_pad,
-    int mapped_ar_seqs) {
+    int mapped_ar_seqs,
+    int n_prefill_tokens,
+    const QwenPrefillSegment * prefill_segments,
+    int n_prefill_segments,
+    int n_logits_rows) {
     (void)kq_stride_pad;
 
-    if (mapped_ar_seqs < 0 || mapped_ar_seqs > cache.n_seq_slots) {
+    int n_direct_rows = 0;
+    if (!detail::validate_target_paged_tree_prefix(
+            cache, n_prefill_tokens, prefill_segments,
+            n_prefill_segments, mapped_ar_seqs, n_direct_rows)) {
         step_graph_free(sg);
         return false;
     }
@@ -842,10 +887,32 @@ bool build_target_step_paged_tree(
     const int paged_launch_kv_len = static_cast<int>(
         std::min<int64_t>(((requested + 255) / 256) * 256,
                           logical_capacity));
+    const int64_t tree_rows64 = (int64_t)tree_width * n_tree_seqs;
+    if (tree_rows64 > INT32_MAX - n_direct_rows) {
+        step_graph_free(sg);
+        return false;
+    }
+    const int tree_rows = static_cast<int>(tree_rows64);
+    const int n_tokens = n_direct_rows + tree_rows;
+    const int fixed_logits_rows = mapped_ar_seqs + tree_rows;
+    if (n_logits_rows < 0 || n_logits_rows > n_tokens ||
+        (n_logits_rows > 0 &&
+         (n_logits_rows < fixed_logits_rows ||
+          n_logits_rows > fixed_logits_rows + n_prefill_segments))) {
+        step_graph_free(sg);
+        return false;
+    }
+
+    std::vector<int> prefill_shape;
+    prefill_shape.reserve(static_cast<size_t>(2 * n_prefill_segments));
+    for (int i = 0; i < n_prefill_segments; ++i) {
+        prefill_shape.push_back(prefill_segments[i].seq_slot);
+        prefill_shape.push_back(prefill_segments[i].n_tokens);
+    }
     const TargetPagedTreeGraphKey graph_key{
         &w, &cache, backend, tree_width, n_tree_seqs,
         paged_launch_kv_len, tree_scratch_base, tree_scratch_stride,
-        mapped_ar_seqs,
+        mapped_ar_seqs, n_logits_rows, prefill_shape,
     };
     if (sg.paged_tree_key && *sg.paged_tree_key == graph_key) {
         return true;
@@ -853,11 +920,16 @@ bool build_target_step_paged_tree(
     step_graph_free(sg);
 
     size_t graph_capacity = 0;
+    const int n_recurrent_segments =
+        n_prefill_segments + (mapped_ar_seqs > 0 ? 1 : 0) + 1;
     if (!detail::target_paged_tree_graph_capacity(
-            tree_width, n_tree_seqs, graph_capacity)) {
+            tree_width, n_tree_seqs, graph_capacity,
+            n_recurrent_segments)) {
         return false;
     }
-    const int n_tokens = mapped_ar_seqs + tree_width * n_tree_seqs;
+    if (n_prefill_segments > 0) {
+        graph_capacity = std::max<size_t>(graph_capacity, 32768);
+    }
     const int n_mapped_seqs = mapped_ar_seqs + n_tree_seqs;
 
     ggml_init_params ip{};
@@ -873,8 +945,19 @@ bool build_target_step_paged_tree(
 
     // Salt graph addresses by the stable bucket shape so captured graphs for
     // different T/S buckets never alias in ggml-cuda's topology cache.
+    int shape_salt = 0;
+    if (!prefill_shape.empty() || n_logits_rows > 0) {
+        uint64_t shape_hash = 1469598103934665603ull;
+        const auto hash_shape = [&](int value) {
+            shape_hash ^= static_cast<uint32_t>(value);
+            shape_hash *= 1099511628211ull;
+        };
+        hash_shape(n_logits_rows);
+        for (int value : prefill_shape) hash_shape(value);
+        shape_salt = static_cast<int>(shape_hash % 64);
+    }
     for (int i = 0; i < tree_width + n_tree_seqs +
-                        mapped_ar_seqs + n_tokens; ++i) {
+                        mapped_ar_seqs + n_tokens + shape_salt; ++i) {
         (void)ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, 1);
     }
 
@@ -892,12 +975,20 @@ bool build_target_step_paged_tree(
         ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_mapped_seqs);
     sg.paged_query_seq_ids =
         ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_tokens);
-    if (mapped_ar_seqs > 0) {
+    if (n_direct_rows > 0) {
         sg.paged_query_positions =
             ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_tokens);
     }
     sg.kv_write_rows = ggml_new_tensor_2d(
         sg.ctx, GGML_TYPE_I64, n_tokens, w.n_head_kv);
+    if (n_logits_rows > 0) {
+        sg.logits_row_indices =
+            ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_logits_rows);
+    }
+    if (n_direct_rows > 0 && cache.target_feat) {
+        sg.target_feat_rows =
+            ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_direct_rows);
+    }
 
     const struct NamedInput {
         ggml_tensor * tensor;
@@ -912,6 +1003,8 @@ bool build_target_step_paged_tree(
         {sg.paged_query_seq_ids, "paged_query_seq_ids"},
         {sg.paged_query_positions, "paged_query_positions"},
         {sg.kv_write_rows, "kv_write_rows"},
+        {sg.logits_row_indices, "logits_row_indices"},
+        {sg.target_feat_rows, "target_feat_rows"},
     };
     for (const NamedInput & input : inputs) {
         if (!input.tensor) continue;
@@ -937,6 +1030,11 @@ bool build_target_step_paged_tree(
     gi.state_slot_ids = sg.state_slot_ids;
     gi.paged_query_seq_ids = sg.paged_query_seq_ids;
     gi.paged_query_positions = sg.paged_query_positions;
+    gi.logits_row_indices = sg.logits_row_indices;
+    gi.target_feat_rows = sg.target_feat_rows;
+    gi.prefill_segments = prefill_segments;
+    gi.n_prefill_segments = n_prefill_segments;
+    gi.n_prefill_tokens = n_prefill_tokens;
     gi.n_seqs = n_tree_seqs;
     gi.mapped_ar_seqs = mapped_ar_seqs;
     gi.paged_max_kv_len = paged_launch_kv_len;
@@ -949,7 +1047,8 @@ bool build_target_step_paged_tree(
     sg.logits = go.logits;
     sg.delta_captures = std::move(go.delta_captures);
     sg.tree_features = go.tree_features;
-    if (!sg.tree_features || sg.delta_captures.empty()) {
+    if (!sg.tree_features || sg.tree_features->ne[1] != tree_rows ||
+        sg.delta_captures.empty()) {
         return false;
     }
     ggml_set_output(sg.logits);
@@ -978,7 +1077,7 @@ bool build_target_step_paged_tree(
     sg.commit_rows = ggml_new_tensor_2d(
         sg.commit_ctx, GGML_TYPE_I64, tree_width, n_tree_seqs);
     sg.feature_commit_rows = ggml_new_tensor_1d(
-        sg.commit_ctx, GGML_TYPE_I32, n_tokens);
+        sg.commit_ctx, GGML_TYPE_I32, tree_rows);
     ggml_set_name(sg.accepted_prefixes, "accepted_prefixes");
     ggml_set_name(sg.commit_slot_ids, "commit_slot_ids");
     ggml_set_name(sg.commit_rows, "commit_rows");

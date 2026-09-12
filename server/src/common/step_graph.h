@@ -21,7 +21,7 @@ namespace dflash::common {
 
 using TargetPagedTreeGraphKey = std::tuple<
     const TargetWeights *, const TargetCache *, ggml_backend_t,
-    int, int, int, int, int, int>;
+    int, int, int, int, int, int, int, std::vector<int>>;
 
 struct StepGraph {
     ggml_context *  ctx = nullptr;
@@ -81,14 +81,14 @@ struct StepGraph {
     // inclusive causal position, [n_tokens] i32 each. Padding rows carry -1.
     ggml_tensor *   paged_query_seq_ids = nullptr;
     ggml_tensor *   paged_query_positions = nullptr;
-    // DFlash target-feature destination rows. Multi-slot replay maps each
-    // token to its slot-local ring; padding maps to the cache's dead row.
+    // DFlash target-feature destination rows. In packed-tree graphs this maps
+    // only the durable prefill/AR prefix; tree features remain scratch.
     ggml_tensor *   target_feat_rows = nullptr;
     // Packed-tree direct-commit metadata uploaded after posterior selection.
     ggml_tensor *   accepted_prefixes = nullptr;   // [n_tree_seqs] i32
     ggml_tensor *   commit_slot_ids = nullptr;      // [n_tree_seqs] i32
     ggml_tensor *   commit_rows = nullptr;         // [tree_width,n_tree_seqs] i64
-    ggml_tensor *   feature_commit_rows = nullptr; // [n_tokens] i32
+    ggml_tensor *   feature_commit_rows = nullptr; // [tree_width*n_tree_seqs] i32
     // Multi-prompt steps: i32 row indices gathered from the final norm
     // before the LM head (committing rows + decode rows).
     ggml_tensor *   logits_row_indices = nullptr;
