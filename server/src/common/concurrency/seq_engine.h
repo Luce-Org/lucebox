@@ -250,6 +250,56 @@ public:
     // backend mutation, but expose no consumable payload.
     virtual StepResult step(const StepPlan & plan) = 0;
 
+    // Optional decode-growth protection. Reserve the whole next decode step
+    // before any model computation or sampling. False means there is not
+    // enough capacity; no partial reservation may be taken on that path.
+    virtual bool reserve_decode(const StepPlan &) { return true; }
+
+    // Maximum useful payload for up to slot_count()-1 suspended contexts.
+    virtual size_t kv_offload_capacity() const { return 0; }
+
+    struct KvOffloadState {
+        bool suspended = false;  // parked: no paged KV, request state retained
+        bool recompute = false;  // parked without a checkpoint; resume re-prefills
+        size_t bytes = 0;        // checkpoint payload bytes (0 when recompute)
+    };
+    virtual KvOffloadState kv_offload_state(int) const { return {}; }
+
+    // Suspend in place: retain the slot, sampler, recurrent/draft state and
+    // request identity, but save paged KV to bounded host RAM and release its
+    // physical blocks. Failure leaves the resident request unchanged.
+    virtual bool offload_kv(int, size_t, std::string & error) {
+        error = "engine does not support decode KV offload";
+        return false;
+    }
+    // Restore into the same slot, possibly with different physical blocks.
+    // False with an empty error means insufficient pool capacity. The host
+    // checkpoint must survive a failed restore until retirement or retry.
+    // A slot parked for recompute resumes through chunked prefill instead of
+    // a copy; its retained history is replayed as the new prompt.
+    virtual bool restore_kv(int, std::string & error) {
+        error = "engine does not support decode KV restore";
+        return false;
+    }
+
+    // Park a resident or suspended slot without a RAM checkpoint: release its
+    // paged KV, fold pending_token into the retained history, and wait for
+    // capacity like a suspension. restore_kv() resumes it through ordinary
+    // chunked prefill, which rebuilds every layer of model state including
+    // slot-local recurrent and draft tensors — implementations must reset
+    // that state the way admit() does. False means the caller must retire
+    // the slot; it may be left detached.
+    virtual bool evict_kv(int, int32_t, std::string & error) {
+        error = "engine does not support KV eviction";
+        return false;
+    }
+
+    // True when a parked slot's resume reservation fits current free pool
+    // capacity with headroom for the resident cohort's next step — the
+    // scheduler's early-resume probe ahead of a full drain. A conservative
+    // false simply restores on drain only.
+    virtual bool kv_restore_feasible(int) const { return false; }
+
     // Release a slot's KV blocks and mark it free. Safe on failed slots.
     virtual void retire(int slot) = 0;
 

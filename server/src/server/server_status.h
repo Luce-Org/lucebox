@@ -71,6 +71,8 @@ public:
         std::lock_guard<std::mutex> lk(mu_);
         phase_ = InferencePhase::PREFILL;
         active_requests_ = 0;
+        suspended_requests_ = 0;
+        offloaded_kv_bytes_ = 0;
         prompt_excerpt_ = prompt_excerpt;
         prompt_tokens_ = prompt_tokens;
         completion_tokens_ = 0;
@@ -114,6 +116,8 @@ public:
         std::lock_guard<std::mutex> lk(mu_);
         phase_ = InferencePhase::IDLE;
         active_requests_ = 0;
+        suspended_requests_ = 0;
+        offloaded_kv_bytes_ = 0;
         prompt_excerpt_.clear();
         draft_tokens_.clear();
     }
@@ -121,17 +125,22 @@ public:
     // Concurrent serving intentionally exposes only aggregate live state.
     // A single request record/token feed cannot represent multiple slots
     // without mixing unrelated requests.
-    void set_concurrent_requests(int n, int prefilling) {
+    void set_concurrent_requests(int n, int prefilling, int suspended = 0,
+                                  size_t offloaded_bytes = 0) {
         std::lock_guard<std::mutex> lk(mu_);
-        if (n < 0 || prefilling < 0 || prefilling > n) {
+        if (n < 0 || suspended < 0 || suspended > n ||
+            prefilling < 0 || prefilling > n - suspended) {
             throw std::invalid_argument("invalid concurrent request counts");
         }
         if (active_requests_ == 0 && n > 0) {
             started_at_ = std::chrono::steady_clock::now();
         }
         active_requests_ = n;
-        phase_ = n == 0 ? InferencePhase::IDLE
-               : prefilling == n ? InferencePhase::PREFILL
+        suspended_requests_ = suspended;
+        offloaded_kv_bytes_ = offloaded_bytes;
+        const int resident = n - suspended;
+        phase_ = resident == 0 ? InferencePhase::IDLE
+               : prefilling == resident ? InferencePhase::PREFILL
                : prefilling == 0 ? InferencePhase::DECODE
                                  : InferencePhase::MIXED;
         prompt_excerpt_.clear();
@@ -161,7 +170,8 @@ public:
         RequestInfo info;
         bool cache_hit = false, pflash = false, spec_decode = false;
         std::string messages_json;
-        int active_requests = 0;
+        int active_requests = 0, suspended_requests = 0;
+        size_t offloaded_kv_bytes = 0;
 
         {
             std::lock_guard<std::mutex> lk(mu_);
@@ -179,6 +189,8 @@ public:
             spec_decode = spec_decode_;
             messages_json = messages_json_;
             active_requests = active_requests_;
+            suspended_requests = suspended_requests_;
+            offloaded_kv_bytes = offloaded_kv_bytes_;
             if (phase != InferencePhase::IDLE) {
                 elapsed_s = std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - started_at_).count();
@@ -189,6 +201,8 @@ public:
         j["phase"] = phase_name(phase);
         j["total_requests"] = total_requests;
         j["active_requests"] = active_requests;
+        j["suspended_requests"] = suspended_requests;
+        j["offloaded_kv_bytes"] = offloaded_kv_bytes;
 
         if (phase != InferencePhase::IDLE && active_requests == 0) {
             j["current"] = {
@@ -255,6 +269,8 @@ private:
     bool spec_decode_ = false;
     std::string messages_json_;
     int active_requests_ = 0;
+    int suspended_requests_ = 0;
+    size_t offloaded_kv_bytes_ = 0;
 
     // History.
     std::vector<PerfRecord> perf_history_;

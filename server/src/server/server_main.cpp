@@ -125,6 +125,8 @@ static void print_usage(const char * prog) {
         "                       Qwen3.6 targets with 16-token blocks, or DeepSeek4\n"
         "                       targets with 128-token blocks. This mode is experimental.\n"
         "  --routing-queue-limit <N> Maximum waiting auto requests (default: 32)\n"
+        "  --decode-kv-offload-mb <auto|N> RAM budget for active KV suspension (default: auto)\n"
+        "                              N is MiB; 0 disables.\n"
         "  --max-concurrency <N>  Maximum concurrent decode sequences\n"
         "                         (N > 1 enables paged attention; default: 1)\n"
         "  --admission-coalesce-ms <N>  Idle-to-busy batching window\n"
@@ -477,6 +479,21 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
                 std::fprintf(stderr, "[server] --routing-queue-limit must be a nonnegative integer\n");
                 return 2;
             }
+        } else if (std::strcmp(argv[i], "--decode-kv-offload-mb") == 0 && i + 1 < argc) {
+            const char * value = argv[++i];
+            if (std::strcmp(value, "auto") == 0) {
+                sconfig.decode_kv_offload_bytes = kAutoKvOffloadBytes;
+                continue;
+            }
+            const char * end = value + std::strlen(value);
+            size_t mib = 0;
+            const auto parsed = std::from_chars(value, end, mib);
+            if (parsed.ec != std::errc{} || parsed.ptr != end ||
+                mib > (std::numeric_limits<size_t>::max)() / (1024 * 1024)) {
+                std::fprintf(stderr, "[server] --decode-kv-offload-mb requires a nonnegative integer within byte range\n");
+                return 2;
+            }
+            sconfig.decode_kv_offload_bytes = mib * 1024 * 1024;
         } else if (std::strcmp(argv[i], "--max-concurrency") == 0 && i + 1 < argc) {
             const char * value = argv[++i];
             const char * end = value + std::strlen(value);
@@ -783,6 +800,11 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
         return 2;
     }
     if (bargs.max_concurrency > 1) bargs.paged_attention = true;
+    if (sconfig.decode_kv_offload_bytes &&
+        sconfig.decode_kv_offload_bytes != kAutoKvOffloadBytes && bargs.max_concurrency <= 1) {
+        std::fprintf(stderr, "[server] --decode-kv-offload-mb requires --max-concurrency greater than 1\n");
+        return 2;
+    }
     if (load_balancing && (bargs.device.is_multi_device() ||
             bargs.remote_draft.enabled() || bargs.remote_target_shard.enabled() ||
             sconfig.pflash_mode != ServerConfig::PflashMode::OFF ||

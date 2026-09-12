@@ -864,6 +864,7 @@ json build_props_body(const ServerConfig & config,
             {"chunk",           config.chunk},
             {"continuous_batching", {
                 {"admission_coalesce_ms", config.admission_coalesce_ms},
+                {"decode_kv_offload_bytes", config.decode_kv_offload_bytes},
             }},
             // Device placement strings (e.g. "auto:0", "cuda:0"). Empty
             // string when no draft model is loaded.
@@ -1505,6 +1506,34 @@ int HttpServer::run(const std::vector<HttpServer *> & models) {
             // CORS belongs to the one listener even when a peer formats output.
             model->config_.enable_cors = config_.enable_cors;
         }
+    }
+
+    // Every model is loaded and no worker has started: resolve one shared
+    // host-memory allowance without granting each model the whole machine.
+    const std::vector<HttpServer *> budget_models = models.empty()
+        ? std::vector<HttpServer *>{this} : models;
+    size_t explicit_bytes = 0, automatic_models = 0;
+    for (auto * model : budget_models) {
+        const size_t requested = model->config_.decode_kv_offload_bytes;
+        auto * engine = model->backend_.seq_engine();
+        if (requested == dflash::common::kAutoKvOffloadBytes) {
+            if (engine && engine->slot_count() > 1 && engine->kv_offload_capacity()) ++automatic_models;
+        } else {
+            explicit_bytes += std::min(requested,
+                dflash::common::kAutoKvOffloadBytes - explicit_bytes);
+        }
+    }
+    const size_t available = automatic_models
+        ? dflash::common::available_kv_offload_memory().value_or(0) : 0;
+    for (auto * model : budget_models) {
+        auto & budget = model->config_.decode_kv_offload_bytes;
+        if (budget != dflash::common::kAutoKvOffloadBytes) continue;
+        auto * engine = model->backend_.seq_engine();
+        budget = engine && engine->slot_count() > 1
+            ? dflash::common::auto_kv_offload_budget(engine->kv_offload_capacity(),
+                available, explicit_bytes, automatic_models) : 0;
+        std::fprintf(stderr, "[server] model %s automatic decode KV offload budget: %zu bytes\n",
+                     model->config_.model_name.c_str(), budget);
     }
 
 #if !defined(_WIN32)

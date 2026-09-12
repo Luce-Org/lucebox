@@ -1,6 +1,7 @@
 #include "deepseek4_seq_engine.h"
 
 #include "deepseek4_backend.h"
+#include "deepseek4_page_layout.h"
 #include "common/sampler.h"
 
 #include <algorithm>
@@ -11,10 +12,26 @@
 
 namespace dflash::common {
 
+namespace {
+std::vector<PagedKvTensor> ds4_paged_kv_planes(const DeepSeek4PagedCache & cache) {
+    std::vector<PagedKvTensor> planes;
+    for (const auto & layer : cache.layers) {
+        if (!layer.ratio) continue;
+        for (ggml_tensor * tensor : {layer.comp_kv, layer.index_comp_kv}) {
+            if (tensor) planes.push_back({tensor, 0,
+                (DS4_PAGE_TOKENS / layer.ratio) * tensor->nb[1]});
+        }
+    }
+    return planes;
+}
+} // namespace
+
 DeepSeek4SeqEngine::DeepSeek4SeqEngine(
         DeepSeek4Backend & backend, PagedKvPool & pool, int max_ctx,
         uint32_t table_stride)
-    : b_(backend), slots_(pool, max_ctx), stride_(table_stride),
+    : b_(backend), slots_(pool, max_ctx),
+      offload_(slots_, pool, backend.backend_, ds4_paged_kv_planes(backend.paged_cache_)),
+      stride_(table_stride),
       host_tables_((size_t)pool.max_sequences() * table_stride, -1) {}
 
 bool DeepSeek4SeqEngine::token_is_eos(int32_t token) const {
@@ -105,8 +122,7 @@ SeqEngine::StepResult DeepSeek4SeqEngine::step(const StepPlan & plan) {
     for (const StepInput & input : inputs) {
         if (input.slot < 0 || input.slot >= n_slots || input.token < 0 ||
             decode_seen[(size_t)input.slot] ||
-            !slots_.is_active(input.slot) ||
-            slots_.is_prefilling(input.slot)) {
+            !slots_.slot(input.slot).decoding()) {
             return fail_step("invalid or duplicate DeepSeek4 decode row");
         }
         decode_seen[(size_t)input.slot] = 1;
@@ -308,7 +324,50 @@ SeqEngine::StepResult DeepSeek4SeqEngine::step(const StepPlan & plan) {
     return result;
 }
 
+bool DeepSeek4SeqEngine::reserve_decode(const StepPlan & plan) {
+    std::vector<int> growth(static_cast<size_t>(slots_.slot_count()), 0);
+    for (const auto & input : plan.decode) {
+        if (input.slot < 0 || input.slot >= slots_.slot_count() || growth[(size_t)input.slot]) return false;
+        growth[(size_t)input.slot] = 1;
+    }
+    return slots_.reserve_decode(growth);
+}
+
+bool DeepSeek4SeqEngine::restore_kv(int slot, std::string & error) {
+    if (slots_.is_active(slot) && slots_.slot(slot).recomputing()) {
+        // Parked without a checkpoint: resume as an ordinary chunked prefill
+        // over the folded history, which rebuilds paged KV and slot-local
+        // state together — so it must be reset exactly as at admission.
+        if (!slots_.resume_recompute(slot)) return false;
+        reset_deepseek4_paged_slot(b_.paged_cache_, (uint32_t)slot);
+        std::fill_n(host_tables_.data() + (size_t)slot * stride_, stride_, -1);
+        return true;
+    }
+    std::vector<int32_t> blocks;
+    if (!offload_.restore(slot, blocks, error)) return false;
+    if (blocks.size() > stride_) {
+        error = "restored DeepSeek4 KV block table exceeds device capacity";
+        return false;
+    }
+    auto * table = host_tables_.data() + static_cast<size_t>(slot) * stride_;
+    std::fill_n(table, stride_, -1);
+    std::copy(blocks.begin(), blocks.end(), table);
+    return true;
+}
+
+bool DeepSeek4SeqEngine::evict_kv(int slot, int32_t pending_token,
+                                  std::string & error) {
+    if (slot < 0 || slot >= slots_.slot_count() ||
+        !slots_.evict_for_recompute(slot, pending_token)) {
+        error = "slot history cannot be re-prefilled within the paged KV pool";
+        return false;
+    }
+    offload_.discard(slot);
+    return true;
+}
+
 void DeepSeek4SeqEngine::retire(int slot) {
+    offload_.discard(slot);
     if (!slots_.is_active(slot)) return;
     slots_.retire(slot);
     reset_deepseek4_paged_slot(b_.paged_cache_, (uint32_t)slot);

@@ -25,6 +25,22 @@
 
 namespace dflash::common {
 
+namespace {
+std::vector<PagedKvTensor> qwen_paged_kv_planes(const TargetCache & cache,
+                                               uint32_t block_size) {
+    std::vector<PagedKvTensor> planes;
+    for (const auto * tensors : {&cache.attn_k, &cache.attn_v}) {
+        for (ggml_tensor * tensor : *tensors) {
+            for (int64_t head = 0; head < tensor->ne[2]; ++head) {
+                planes.push_back({tensor, static_cast<size_t>(head) * tensor->nb[2],
+                                   block_size * tensor->nb[1]});
+            }
+        }
+    }
+    return planes;
+}
+} // namespace
+
 Qwen35SeqEngine::Qwen35SeqEngine(
         Qwen35Backend & backend, PagedKvPool & pool, int max_ctx,
         int64_t scratch_row, FixedChainConfig fixed_chain,
@@ -38,7 +54,10 @@ Qwen35SeqEngine::Qwen35SeqEngine(
       long_prefill_threshold_(std::max(1, long_prefill_threshold)),
       idle_prefill_tokens_(std::max(1, idle_prefill_tokens)),
       prefill_quantum_(std::max(1, prefill_quantum)), b_(backend),
-      slots_(pool, max_ctx), scratch_row_(scratch_row),
+      slots_(pool, max_ctx),
+      offload_(slots_, pool, backend.target_backend_,
+               qwen_paged_kv_planes(backend.cache_, pool.block_size())),
+      scratch_row_(scratch_row),
       fixed_chain_(fixed_chain) {
     const int n_slots = slots_.slot_count();
     slot_draft_kv_.resize(static_cast<size_t>(n_slots));
@@ -1007,7 +1026,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
     for (const StepInput & in : inputs) {
         if (in.slot < 0 || in.slot >= n_slots || in.token < 0 ||
             decode_seen[(size_t)in.slot] ||
-            !slots_.is_active(in.slot) || slots_.is_prefilling(in.slot)) {
+            !slots_.slot(in.slot).decoding()) {
             return fail_step("invalid or duplicate decode row in step plan");
         }
         decode_seen[(size_t)in.slot] = 1;
@@ -1416,7 +1435,52 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
     return result;
 }
 
+bool Qwen35SeqEngine::reserve_decode(const StepPlan & plan) {
+    std::vector<int> growth(static_cast<size_t>(slots_.slot_count()), 0);
+    const auto chains = select_chain_lanes(plan);
+    for (size_t i = 0; i < plan.decode.size(); ++i) {
+        const int slot = plan.decode[i].slot;
+        if (slot < 0 || slot >= slots_.slot_count() || growth[(size_t)slot]) return false;
+        growth[(size_t)slot] = chains[i] ? fixed_chain_.width : 1;
+    }
+    return slots_.reserve_decode(growth);
+}
+
+bool Qwen35SeqEngine::restore_kv(int slot, std::string & error) {
+    if (slots_.is_active(slot) && slots_.slot(slot).recomputing()) {
+        // Parked without a checkpoint: resume as an ordinary chunked prefill
+        // over the folded history, which rebuilds paged KV and slot-local
+        // state together — so it must be reset exactly as at admission.
+        if (!slots_.resume_recompute(slot)) return false;
+        reset_recurrent_slot(b_.cache_, slot);
+        if (slot < static_cast<int>(slot_draft_kv_.size()) &&
+            slot_draft_kv_[static_cast<size_t>(slot)]) {
+            draft_kv_reset(*slot_draft_kv_[static_cast<size_t>(slot)]);
+        }
+        return true;
+    }
+    std::vector<int32_t> blocks;
+    if (!offload_.restore(slot, blocks, error)) return false;
+    if (!upload_block_table_delta(slot, 0, blocks.data(), blocks.size())) {
+        error = "restored Qwen KV block table exceeds device capacity";
+        return false;
+    }
+    // step() uploads current per-slot lengths from the preserved host state.
+    return true;
+}
+
+bool Qwen35SeqEngine::evict_kv(int slot, int32_t pending_token,
+                               std::string & error) {
+    if (!slots_.evict_for_recompute(slot, pending_token)) {
+        error = "slot history cannot be re-prefilled within the paged KV pool";
+        return false;
+    }
+    offload_.discard(slot);
+    return true;
+}
+
 void Qwen35SeqEngine::retire(int slot) {
+    offload_.discard(slot);
     if (!slots_.is_active(slot)) return;
     if (slot >= 0 && slot < static_cast<int>(slot_draft_kv_.size()) &&
         slot_draft_kv_[static_cast<size_t>(slot)]) {

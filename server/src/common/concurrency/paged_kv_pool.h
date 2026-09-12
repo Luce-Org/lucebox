@@ -146,6 +146,11 @@ public:
     PagedKvStatus rollback_append(PagedKvSequenceHandle handle,
                                   uint32_t token_count);
 
+    // Return every block and reset the stored length, retaining the sequence
+    // identity/slot. Used only after an engine has preserved the KV payload.
+    // The same handle may then reserve/append remapped pages for restoration.
+    PagedKvStatus clear(PagedKvSequenceHandle handle);
+
     // Return the sequence's blocks and slot to the pool; the handle (and
     // any copy of it) becomes stale.
     PagedKvStatus release(PagedKvSequenceHandle handle);

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <new>
 
 namespace dflash::common {
 
@@ -103,6 +104,14 @@ SeqEngine::AdmitResult SeqSlotManager::admit(
         const SamplerCfg & sampler) {
     using AdmitStatus = SeqEngine::AdmitResult::Status;
     SeqEngine::AdmitResult r;
+    // Suspended requests already own a response and must resume before new
+    // admissions may consume the blocks released by their peers.
+    if (std::any_of(slots_.begin(), slots_.end(),
+                    [](const SeqSlot & s) { return s.evicted(); })) {
+        r.status = AdmitStatus::busy;
+        r.error = "suspended requests have priority on KV capacity";
+        return r;
+    }
     if (prompt.empty()) {
         r.error = "empty prompt";
         return r;
@@ -324,6 +333,127 @@ bool SeqSlotManager::rollback_step(int slot) {
     }
     s.staged_tokens.clear();
     return true;
+}
+
+bool SeqSlotManager::reserve_decode(const std::vector<int> & growth) {
+    if (growth.size() != slots_.size()) return false;
+    uint64_t additional = 0;
+    for (size_t i = 0; i < slots_.size(); ++i) {
+        const SeqSlot & s = slots_[i];
+        const int tokens = growth[i];
+        if (!s.decoding()) {
+            if (tokens != 0) return false;
+            continue;
+        }
+        if (tokens < 1 || !s.staged_tokens.empty() ||
+            tokens > max_ctx_ - s.cur_pos) return false;
+        uint32_t owned = 0;
+        if (pool_.owned_block_count(s.handle, owned) != PagedKvStatus::Ok) return false;
+        const uint64_t extent = static_cast<uint64_t>(s.cur_pos) + tokens;
+        const uint64_t needed = (extent + pool_.block_size() - 1) / pool_.block_size();
+        if (needed > owned) additional += needed - owned;
+    }
+    if (additional > pool_.free_block_count()) return false;
+    for (size_t i = 0; i < slots_.size(); ++i) {
+        const SeqSlot & s = slots_[i];
+        if (growth[i] && pool_.reserve_capacity(s.handle,
+                static_cast<uint32_t>(s.cur_pos + growth[i])) != PagedKvStatus::Ok) {
+            return false; // preflight makes a capacity failure impossible
+        }
+    }
+    return true;
+}
+
+bool SeqSlotManager::detach_kv(int slot) {
+    if (!is_active(slot)) return false;
+    SeqSlot & s = slots_[(size_t)slot];
+    if (s.evicted() || !s.staged_tokens.empty()) return false;
+    if (pool_.clear(s.handle) != PagedKvStatus::Ok) return false;
+    s.phase = SeqSlotPhase::suspended;
+    return true;
+}
+
+uint32_t SeqSlotManager::resume_token_capacity(const SeqSlot & s) const {
+    if (s.recomputing()) {
+        // Re-prefill replays the folded history and then decodes, so reserve
+        // the same rolling headroom an admission would.
+        const uint32_t headroom = decode_headroom_capacity(s.prompt_len);
+        return capacity_fits_pool(headroom) ? headroom
+                                            : (uint32_t)s.prompt_len;
+    }
+    // A partial prefill must retain its entire prompt reservation. A decoder
+    // must have at least one next-token row, or restoring it cannot progress.
+    return static_cast<uint32_t>(
+        std::max(s.prompt_len, std::min(max_ctx_, s.cur_pos + 1)));
+}
+
+bool SeqSlotManager::attach_kv(int slot) {
+    if (!is_active(slot)) return false;
+    SeqSlot & s = slots_[(size_t)slot];
+    if (!s.suspended()) return false;
+    const uint32_t capacity = resume_token_capacity(s);
+    try {
+        if (pool_.reserve_capacity(s.handle, capacity) != PagedKvStatus::Ok) return false;
+        if (!pool_.append(s.handle, static_cast<uint32_t>(s.cur_pos), true)) {
+            pool_.clear(s.handle);
+            return false;
+        }
+    } catch (const std::bad_alloc &) {
+        // Restoring uses append's endpoint-only form: its only allocation is
+        // block-table growth before any rows move. Return staged reservations
+        // as well if metadata allocation fails, retaining the RAM checkpoint.
+        pool_.clear(s.handle);
+        throw;
+    }
+    s.phase = s.cur_pos < s.prompt_len ? SeqSlotPhase::prefill : SeqSlotPhase::decode;
+    return true;
+}
+
+bool SeqSlotManager::evict_for_recompute(int slot, int32_t pending_token) {
+    if (!is_active(slot)) return false;
+    SeqSlot & s = slots_[(size_t)slot];
+    if (s.recomputing() || !s.staged_tokens.empty()) return false;
+    // A request that cannot fit the pool even alone can never resume;
+    // refusing the eviction lets the caller terminate it honestly.
+    const int64_t history =
+        (int64_t)s.sample_history.size() + (pending_token >= 0 ? 1 : 0);
+    if (history < 1 || history > max_ctx_ ||
+        !capacity_fits_pool((uint32_t)history)) return false;
+    if (!s.suspended() &&
+        pool_.clear(s.handle) != PagedKvStatus::Ok) return false;
+    if (pending_token >= 0) s.sample_history.push_back(pending_token);
+    s.prompt_len = (int)s.sample_history.size();
+    s.cur_pos = 0;
+    s.phase = SeqSlotPhase::recompute;
+    return true;
+}
+
+bool SeqSlotManager::resume_recompute(int slot) {
+    if (!is_active(slot)) return false;
+    SeqSlot & s = slots_[(size_t)slot];
+    if (!s.recomputing()) return false;
+    if (pool_.reserve_capacity(s.handle, resume_token_capacity(s)) !=
+        PagedKvStatus::Ok) {
+        return false;
+    }
+    s.phase = SeqSlotPhase::prefill;
+    return true;
+}
+
+bool SeqSlotManager::kv_restore_feasible(int slot) const {
+    if (!is_active(slot)) return false;
+    const SeqSlot & s = slots_[(size_t)slot];
+    if (!s.evicted()) return false;
+    const uint64_t capacity = resume_token_capacity(s);
+    const uint64_t needed = capacity == 0 ? 0 :
+        1 + (capacity - 1) / pool_.block_size();
+    // Restoring into a tight pool would re-trigger eviction on the next
+    // step: keep one growth block per resident plus the resumed slot itself.
+    uint64_t margin = 1;
+    for (const SeqSlot & o : slots_) {
+        margin += o.active() && !o.evicted() ? 1 : 0;
+    }
+    return needed + margin <= pool_.free_block_count();
 }
 
 void SeqSlotManager::retire(int slot) {

@@ -306,6 +306,7 @@ See the [current six-expert Strix Halo profile](https://www.lucebox.com/blog/dee
 | `--max-concurrency <N>` | `1` | Maximum concurrent decode sequences. Qwen supports up to 64; DeepSeek4 supports up to 6. Values above 1 enable paged attention. |
 | `--admission-coalesce-ms <N>` | `20` | Idle-to-busy batching window from 0 through 1000 ms. |
 | `--kv-pool-tokens <N>` | auto | Shared physical K/V capacity for concurrent serving, rounded to the backend page size. |
+| `--decode-kv-offload-mb <auto\|N>` | `auto` | Automatically size the RAM budget for active KV suspension; `N` sets a per-model cap in MiB, `0` disables. Applies to concurrent serving. |
 | `--kv-cache-dir <path>` | none | Enable persistent disk KV cache in this directory. |
 | `--kv-cache-budget <MB>` | `4096` | Disk KV-cache size cap. |
 | `--kv-cache-min-tokens <N>` | `512` | Minimum prefix length to persist. |
@@ -313,6 +314,50 @@ See the [current six-expert Strix Halo profile](https://www.lucebox.com/blog/dee
 | `--kv-cache-cold-max <N>` | `10240` | Cold-prefix limit for long prompts. |
 | `--disk-prefix-cache off\|full\|auto\|auto:N\|N` | `full` | Default disk prefix policy. |
 | `--disk-prefix-cache-compress` | off | Clamp FlowKV snapshots to the stable system prefix. Requires a prefill drafter. |
+
+Decode-pressure suspension defaults to `auto`. After all models load, the
+server shares 25% of available host RAM across eligible models, subtracting
+explicit offload caps first. Each model's automatic cap is also bounded by
+the payload needed to preserve up to `max_concurrency - 1` contexts at their
+individual context/pool limit. Repeated suspensions may save more than one
+pool's payload as resident requests reuse pages and continue growing. These
+are allocation caps; no RAM is reserved until a request is suspended.
+
+Linux uses `MemAvailable`, bounded by the current cgroup v2 and its visible
+ancestors' remaining memory limits. Windows uses available physical RAM.
+Unknown memory reporting (including cgroup v1 memory control) disables
+automatic offload; an explicit MiB cap remains available. The resolved byte
+cap is logged at startup and exposed in `/props` under
+`runtime.continuous_batching.decode_kv_offload_bytes`. Available memory is
+checked again before each checkpoint allocation when reporting is available.
+This is conservative sizing, not a reservation against other processes.
+
+Use `--decode-kv-offload-mb 1024` to override the automatic value with a 1 GiB
+per-model cap, or `--decode-kv-offload-mb 0` to disable it. Explicit nonzero
+caps require concurrency greater than one. Automatic mode resolves to zero
+for single-request or unsupported engines.
+
+Before a decode step, the scheduler reserves its growth; if necessary it
+first reduces speculation to one token, then suspends a newer request.
+Copies finish before its blocks are released. The same slot retains
+recurrent/compressor/draft state, sampler, pending token, and response
+connection; existing SSE heartbeats continue during the pause. Suspended
+requests resume in admission order once resident requests drain, or earlier
+when the pool has room for the checkpoint plus the cohort's next step; new
+admissions wait while any request is suspended.
+
+A request that cannot be checkpointed within the RAM budget — or whose
+checkpoint cannot be copied back — is not terminated: it parks without a
+payload and resumes through ordinary chunked prefill over its retained
+token history, which rebuilds paged KV and slot-local state together. Only
+a request whose context cannot fit the pool even alone still produces an
+error.
+
+This is an in-process checkpoint: it neither survives a server restart nor
+moves a request between models. RAM avoids disk I/O and checkpoint files.
+Slot-local state remains on the device, so this recovers pool blocks, not
+the whole request's device footprint. `/status/json` reports
+`suspended_requests` and `offloaded_kv_bytes` per model.
 
 ### PFlash
 

@@ -509,6 +509,7 @@ add_library(dflash_common STATIC
     src/common/dflash_spec_decode.cpp
     src/common/concurrency/paged_kv_pool.cpp
     src/common/concurrency/seq_slot_manager.cpp
+    src/common/concurrency/paged_kv_offload.cpp
     src/common/layer_split_backend.cpp
     src/common/layer_split_runtime.cpp
     src/qwen35/graph_builders.cpp
@@ -1814,6 +1815,7 @@ if(DFLASH27B_TESTS)
             test/test_unit_main.cpp
             test/test_server_unit.cpp
             test/test_model_routing.cpp
+            test/test_paged_kv_offload.cpp
             test/test_anchor_params.cpp
             test/test_derived_scalars.cpp
             test/test_adaptive_spec_width.cpp
@@ -1931,7 +1933,8 @@ if(DFLASH27B_TESTS)
             test/smoke_load_draft.cpp
             test/smoke_load_target.cpp
             test/smoke_load_target_laguna.cpp
-            test/test_paged_attention.cpp)
+            test/test_paged_attention.cpp
+            test/test_decode_kv_offload_gpu.cpp)
         target_include_directories(test_model_smoke PRIVATE
             ${DFLASH27B_SRC_INCLUDE_DIRS}
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include

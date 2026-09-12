@@ -190,30 +190,31 @@ PagedKvStatus PagedKvPool::rollback_append(
     return PagedKvStatus::Ok;
 }
 
-PagedKvStatus PagedKvPool::release(PagedKvSequenceHandle handle) {
+PagedKvStatus PagedKvPool::clear(PagedKvSequenceHandle handle) {
     const PagedKvStatus status = validate(handle);
     if (status != PagedKvStatus::Ok) return status;
-
     SequenceState & sequence = sequences_[handle.slot];
-    request_to_slot_.erase(sequence.request_id);
-    for (uint32_t block : sequence.block_table) {
-        give_back(free_blocks_, block);
-    }
-    for (uint32_t block : sequence.reserved_blocks) {
-        give_back(free_blocks_, block);
-    }
-    for (uint32_t block : sequence.retry_blocks) {
-        give_back(free_blocks_, block);
-    }
-    sequence.request_id = 0;
+    for (uint32_t block : sequence.block_table) give_back(free_blocks_, block);
+    for (uint32_t block : sequence.reserved_blocks) give_back(free_blocks_, block);
+    for (uint32_t block : sequence.retry_blocks) give_back(free_blocks_, block);
     sequence.kv_seq_len = 0;
-    sequence.active = false;
     sequence.block_table.clear();
     sequence.reserved_blocks.clear();
     sequence.retry_blocks.clear();
+    return PagedKvStatus::Ok;
+}
+
+PagedKvStatus PagedKvPool::release(PagedKvSequenceHandle handle) {
+    const PagedKvStatus status = clear(handle);
+    if (status != PagedKvStatus::Ok) return status;
+    SequenceState & sequence = sequences_[handle.slot];
+    request_to_slot_.erase(sequence.request_id);
+    sequence.request_id = 0;
+    sequence.active = false;
     give_back(free_sequence_slots_, handle.slot);
     return PagedKvStatus::Ok;
 }
+
 
 void PagedKvPool::reset() {
     request_to_slot_.clear();

@@ -16,6 +16,7 @@
 #include "socket_handle.h"
 #include "client_send_buffer.h"
 #include "common/model_backend.h"
+#include "common/concurrency/paged_kv_offload.h"
 #include "tokenizer.h"
 #include "chat_template.h"
 #include "tool_memory.h"
@@ -198,6 +199,8 @@ struct ServerConfig {
     // Idle-to-busy batching window. It is ignored by single-slot engines and
     // never delays an already decoding request.
     int admission_coalesce_ms = 20;
+    // Auto resolves after all models load, before workers start. Zero disables.
+    size_t decode_kv_offload_bytes = dflash::common::kAutoKvOffloadBytes;
 
     // PFlash (speculative prefill compression)
     enum class PflashMode { OFF, AUTO, ALWAYS };
