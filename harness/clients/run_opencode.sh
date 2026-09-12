@@ -22,7 +22,7 @@ CLIENT_OUT="$LOG_DIR/opencode.out"
 EXPORT_OUT="$LOG_DIR/opencode-export.json"
 OPENCODE_BIN="${OPENCODE_BIN:-$CLIENT_WORK_DIR/clients/opencode/npm/bin/opencode}"
 require_client_binary "OpenCode" "$OPENCODE_BIN" "opencode" "OPENCODE_BIN"
-HOME_DIR="$LOG_DIR/opencode-home"
+HOME_DIR="$(client_home opencode)"
 PROJECT_DIR="$LOG_DIR/opencode-project"
 mkdir -p "$HOME_DIR/.config" "$HOME_DIR/.local/share" "$PROJECT_DIR"
 
@@ -73,25 +73,31 @@ wait_lucebox_server
 
 set +e
 cd "$PROJECT_DIR"
-run_with_timeout "$OPENCODE_TIMEOUT" env \
-  HOME="$HOME_DIR" \
-  XDG_CONFIG_HOME="$HOME_DIR/.config" \
-  XDG_DATA_HOME="$HOME_DIR/.local/share" \
-  OPENAI_API_KEY="$API_KEY" \
-  "$OPENCODE_BIN" run \
-  --pure \
-  --model "lucebox/$MODEL_ID" \
-  --format json \
-  "$PROMPT" \
-  < /dev/null > "$CLIENT_OUT" 2>&1
-RC=$?
-SESSION_ID="$(grep -m1 -o 'ses_[A-Za-z0-9]*' "$CLIENT_OUT" || true)"
-if [[ -n "$SESSION_ID" ]]; then
-  HOME="$HOME_DIR" \
-  XDG_CONFIG_HOME="$HOME_DIR/.config" \
-  XDG_DATA_HOME="$HOME_DIR/.local/share" \
-  "$OPENCODE_BIN" export "$SESSION_ID" > "$EXPORT_OUT" 2>&1 || true
-  cat "$EXPORT_OUT" >> "$CLIENT_OUT"
+opencode_env=(
+  "HOME=$HOME_DIR"
+  "XDG_CONFIG_HOME=$HOME_DIR/.config"
+  "XDG_DATA_HOME=$HOME_DIR/.local/share"
+  "OPENAI_API_KEY=$API_KEY"
+)
+if [[ "$HARNESS_INTERACTIVE" == "1" ]]; then
+  opencode_cmd=("$OPENCODE_BIN" "$PROJECT_DIR" --pure --model "lucebox/$MODEL_ID")
+  if [[ -n "$INTERACTIVE_PROMPT" ]]; then opencode_cmd+=(--prompt "$INTERACTIVE_PROMPT"); fi
+  run_interactive_client "OpenCode" "$CLIENT_OUT" env "${opencode_env[@]}" "${opencode_cmd[@]}"
+  RC=$?
+else
+  run_with_timeout "$OPENCODE_TIMEOUT" env "${opencode_env[@]}" \
+    "$OPENCODE_BIN" run \
+    --pure \
+    --model "lucebox/$MODEL_ID" \
+    --format json \
+    "$PROMPT" \
+    < /dev/null > "$CLIENT_OUT" 2>&1
+  RC=$?
+  SESSION_ID="$(grep -m1 -o 'ses_[A-Za-z0-9]*' "$CLIENT_OUT" || true)"
+  if [[ -n "$SESSION_ID" ]]; then
+    env "${opencode_env[@]}" "$OPENCODE_BIN" export "$SESSION_ID" > "$EXPORT_OUT" 2>&1 || true
+    cat "$EXPORT_OUT" >> "$CLIENT_OUT"
+  fi
 fi
 set -e
 
