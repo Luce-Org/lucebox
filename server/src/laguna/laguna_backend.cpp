@@ -451,6 +451,12 @@ bool LagunaBackend::ensure_slot(int slot) {
 }
 
 bool LagunaBackend::snapshot_save(int slot) {
+    // hybrid MoE-offload mode never loads expert tensors into w_ (see the
+    // hybrid_mode_ check in restore_and_generate_impl below), so a snapshot
+    // saved here could never be restored correctly. Skip the save instead of
+    // paying for a CPU-resident copy that restore_and_generate_impl will
+    // just refuse later.
+    if (hybrid_mode_) return false;
     // kvflash: snapshots copy rows assuming identity layout, which breaks
     // after the first page-out relocates a chunk. [TAG_SWA_RING] ring-cached
     // SWA layers hold only the trailing window, so prefix snapshots are
@@ -1572,6 +1578,22 @@ GenerateResult LagunaBackend::restore_and_generate_impl(int slot,
     DaemonIO out_io = io.with_token_callback(req.on_token);
     if (out_io.is_cancelled()) {
         result.succeed();
+        return result;
+    }
+    // Prefix-cache restore always decodes through laguna_step(), which builds
+    // its graph with gi.hybrid = nullptr and so reads expert weights straight
+    // out of `w_`. In hybrid MoE-offload mode w_ never has them: init_hybrid_mode()
+    // loads with skip_expert_tensors=true and keeps experts only in moe_hybrid_'s
+    // hot/cold storage (see laguna_target_loader.cpp). generate_impl() avoids this
+    // by routing hybrid-mode requests to generate_hybrid() instead, but the
+    // generic HTTP/prefix-cache path (finalize_generation_cache -> snapshot_save,
+    // later restore_and_generate -> here) has no knowledge of hybrid_mode_ and
+    // will call this path for any backend. Fail clearly instead of building a
+    // graph against missing expert tensors.
+    if (hybrid_mode_) {
+        result.fail(GenerateErrorCode::BackendSpecific,
+                    "snapshot restore is not supported for a Laguna model "
+                    "loaded in hybrid MoE-offload mode");
         return result;
     }
     sampler_ = req.sampler;
