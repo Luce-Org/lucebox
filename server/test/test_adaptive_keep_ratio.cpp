@@ -120,6 +120,22 @@ TEST_CASE(AdaptiveKeepRatioFixture, unknown_session_returns_default) {
     CHECK(mgr.turn_count("no-such-session") == 0);
 }
 
+TEST_CASE(AdaptiveKeepRatioFixture, session_seed_is_clamped_and_sticky) {
+    HttpServerSessions mgr;
+
+    CHECK(approx_eq(
+        mgr.get_or_create_keep_ratio("low", 0.0f), kBanditKeepMin));
+    CHECK(approx_eq(
+        mgr.get_or_create_keep_ratio("high", 1.0f), kBanditKeepMax));
+    CHECK(approx_eq(
+        mgr.get_or_create_keep_ratio("configured", 0.05f), 0.05f));
+
+    // Once created, a later request's curve/config value must not reset the bandit.
+    CHECK(approx_eq(
+        mgr.get_or_create_keep_ratio("configured", 0.15f), 0.05f));
+    CHECK(mgr.size() == 3);
+}
+
 TEST_CASE(AdaptiveKeepRatioFixture, get_ema_reflects_post_update_value) {
     HttpServerSessions mgr;
     CHECK(approx_eq(mgr.get_ema("s1"), 0.0f));
