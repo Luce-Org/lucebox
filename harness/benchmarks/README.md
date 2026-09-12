@@ -105,8 +105,8 @@ Each run writes:
 - `report.md`: speed and expected-output summary
 
 Prompt files are JSONL. Each line needs `id` and either `prompt` or `messages`.
-Optional `expect_contains` and `expect_regex` fields define lightweight accuracy
-checks.
+Optional `expect_contains`, `expect_regex`, `expect_exact`, and `expect_json`
+fields define lightweight accuracy checks.
 
 ---
 

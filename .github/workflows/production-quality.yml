@@ -1,0 +1,85 @@
+name: Production quality
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-quality-lucebox3
+  cancel-in-progress: false
+
+jobs:
+  qwen-ar-amd:
+    name: Qwen 3.6 27B AR qualification (${{ matrix.device_name }})
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - device_name: Radeon AI PRO R9700
+            profile: qwen36-27b-q4-r9700-ar-c4
+            artifact_name: qwen-ar-r9700-qualification
+          - device_name: Strix Halo Radeon 8060S
+            profile: qwen36-27b-q4-strix-halo-ar-c4
+            artifact_name: qwen-ar-strix-qualification
+    runs-on: [self-hosted, lucebox3]
+    timeout-minutes: 180
+    env:
+      MODELS: ${{ vars.LUCEBOX_MODELS_DIR || '/opt/models' }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          submodules: recursive
+          token: ${{ secrets.SUBMODULE_PAT || secrets.GITHUB_TOKEN }}
+
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          version: "0.11.x"
+
+      - name: Qualify active Qwen 3.6 AR production recipe
+        timeout-minutes: 165
+        run: |
+          harness/qualification/qwen36/qualify.sh "${{ matrix.profile }}" \
+            --output-dir "$RUNNER_TEMP/${{ matrix.artifact_name }}"
+
+      - name: Clean up qualification server
+        if: always()
+        run: |
+          pid_file="$RUNNER_TEMP/${{ matrix.artifact_name }}/server.pid"
+          if [[ -f "$pid_file" ]]; then
+            IFS=: read -r pid start_time < "$pid_file"
+            current_start="$(awk '{print $22}' "/proc/$pid/stat" 2>/dev/null || true)"
+            if [[ "$pid" =~ ^[0-9]+$ && "$start_time" =~ ^[0-9]+$ ]] \
+              && (( pid > 1 )) && [[ "$current_start" == "$start_time" ]]; then
+              kill -TERM -- "-$pid" 2>/dev/null || true
+              for _ in {1..50}; do
+                kill -0 "$pid" 2>/dev/null || break
+                sleep 0.1
+              done
+              kill -KILL -- "-$pid" 2>/dev/null || true
+            fi
+            rm -f -- "$pid_file"
+          fi
+
+      - name: Publish qualification summary
+        if: always()
+        run: |
+          report="$RUNNER_TEMP/${{ matrix.artifact_name }}/qualification.md"
+          if [[ -f "$report" ]]; then
+            cat "$report" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Qualification stopped before a report was produced." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Retain complete qualification evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.artifact_name }}-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/${{ matrix.artifact_name }}
+            !${{ runner.temp }}/${{ matrix.artifact_name }}/build/**
+          if-no-files-found: error
+          retention-days: 30
