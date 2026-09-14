@@ -283,8 +283,8 @@ struct PflashQueryWindow {
 std::string pflash_user_query_text(
     const std::vector<ChatMessage> & messages);
 
-// Find the last sufficiently-specific suffix of the user query before the
-// assistant-generation suffix. Public for model-free regression tests.
+// Find a sufficiently-specific query suffix ending within max_tokens of the
+// render divergence at search_end. Public for model-free regression tests.
 PflashQueryWindow find_pflash_query_window(
     const std::vector<int32_t> & prompt,
     const std::vector<int32_t> & query,

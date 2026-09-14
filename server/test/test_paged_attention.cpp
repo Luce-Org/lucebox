@@ -3,7 +3,7 @@
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
 #include "CppUnitTestFramework.hpp"
-#include "scoped_env.h"
+#include "support/scoped_env.h"
 
 #include <algorithm>
 #include <cmath>
