@@ -1,5 +1,5 @@
 #include "CppUnitTestFramework.hpp"
-#include "scoped_env.h"
+#include "support/scoped_env.h"
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cuda.h"
