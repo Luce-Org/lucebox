@@ -210,6 +210,10 @@ endif()
 option(DFLASH27B_FA_ALL_QUANTS "Compile ggml-cuda fattn kernels for all KV-quant pairs" ON)
 set(GGML_CUDA_FA_ALL_QUANTS ${DFLASH27B_FA_ALL_QUANTS} CACHE BOOL "" FORCE)
 
+# rocWMMA fattn kernel on HIP builds (RDNA3/RDNA4, requires rocWMMA >= 2.0
+# for RDNA4). Off by default: keeps the existing dispatch surface unchanged.
+option(GGML_HIP_ROCWMMA_FATTN "Build the rocWMMA flash-attention kernel for HIP" OFF)
+
 # Some third-party qtype-107 GGUFs encode one affine (scale, offset) pair per
 # 32-weight block instead of the original two-scale layout. This is a wire
 # format choice, so keep it explicit and build-wide.
@@ -404,6 +408,23 @@ if(DFLASH27B_GPU_BACKEND STREQUAL "hip" OR
     # configured ROCm runtime when it expands --hip-link.
     get_filename_component(_dflash_hip_runtime_dir "${hip_DIR}/../.." ABSOLUTE)
     add_link_options("-L${_dflash_hip_runtime_dir}")
+
+    if(GGML_HIP_ROCWMMA_FATTN)
+        # rocWMMA >= 2.0 makes the RDNA4 WMMA operand layouts usable through
+        # the library API. Off by default: the flag switches every fattn
+        # dispatch below head 256 on RDNA3/RDNA4, so it is a build-level
+        # numerical surface change, not a runtime toggle.
+        find_path(GGML_HIP_ROCWMMA_INCLUDE_DIR rocwmma/rocwmma.hpp
+            HINTS "${_dflash_rocm_root}/include" /opt/rocm/include
+            NO_DEFAULT_PATH)
+        if(NOT GGML_HIP_ROCWMMA_INCLUDE_DIR)
+            message(FATAL_ERROR
+                "GGML_HIP_ROCWMMA_FATTN=ON but rocwmma/rocwmma.hpp not found. "
+                "Install rocwmma (e.g. `sudo apt install rocwmma` on Debian/Ubuntu).")
+        endif()
+        target_compile_definitions(ggml-hip PRIVATE GGML_HIP_ROCWMMA_FATTN)
+        target_include_directories(ggml-hip PRIVATE ${GGML_HIP_ROCWMMA_INCLUDE_DIR})
+    endif()
 endif()
 
 if(DFLASH27B_ENABLE_MIXED_CUDA_HIP)
@@ -894,6 +915,20 @@ endif()
 option(DFLASH27B_TESTS "Build numerics tests" ON)
 option(DFLASH27B_SERVER "Build dflash_server + backend_ipc_daemon" ON)
 if(DFLASH27B_TESTS)
+    function(dflash_add_ggml_gpu_executable target source)
+        add_executable(${target} ${source})
+        target_link_libraries(${target} PRIVATE
+            ggml ${DFLASH27B_GGML_BACKEND_TARGET} ggml-base)
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            target_link_libraries(${target} PRIVATE CUDA::cudart)
+        else()
+            target_link_libraries(${target} PRIVATE hip::host)
+        endif()
+        target_include_directories(${target} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src)
+    endfunction()
+
     set(_raw_unit_test_targets)
     enable_testing()
 
@@ -1032,6 +1067,27 @@ if(DFLASH27B_TESTS)
         set_target_properties(test_softmax_sink_col PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
         target_link_libraries(test_softmax_sink_col PRIVATE ggml ggml-base ggml-cpu ${DFLASH27B_GGML_BACKEND_TARGET} hip::host)
         list(APPEND _raw_unit_test_targets test_softmax_sink_col)
+
+        dflash_add_ggml_gpu_executable(test_fattn_mma256 test/test_fattn_mma256.cpp)
+        target_compile_definitions(test_fattn_mma256 PRIVATE GGML_USE_HIP)
+        target_link_libraries(test_fattn_mma256 PRIVATE ggml-cpu)
+        list(APPEND _raw_unit_test_targets test_fattn_mma256)
+
+        # The rocWMMA fragment-layout probe requires the rocWMMA headers; it
+        # only builds when the rocWMMA fattn kernel is enabled so the
+        # default HIP build stays independent of the optional package.
+        if(GGML_HIP_ROCWMMA_FATTN)
+            dflash_add_ggml_gpu_executable(test_rocwmma_layout test/test_rocwmma_layout.cpp)
+            target_compile_definitions(test_rocwmma_layout PRIVATE GGML_USE_HIP)
+            target_include_directories(test_rocwmma_layout PRIVATE ${GGML_HIP_ROCWMMA_INCLUDE_DIR})
+            list(APPEND _raw_unit_test_targets test_rocwmma_layout)
+        endif()
+
+        # Benchmark, not a test: built with the tests but deliberately NOT added
+        # to _raw_unit_test_targets. A/B's the fattn kernel routes at
+        # chunked-prefill shapes.
+        dflash_add_ggml_gpu_executable(bench_fattn_mma256 test/bench_fattn_mma256.cpp)
+        target_compile_definitions(bench_fattn_mma256 PRIVATE GGML_USE_HIP)
 
         # Benchmark, not a test: built with the tests but deliberately NOT added to
         # _raw_unit_test_targets, so ctest stays deterministic. Measures the launch-count
@@ -2299,20 +2355,6 @@ if(DFLASH27B_TESTS)
             ${DFLASH27B_SRC_INCLUDE_DIRS})
     endif()
     endif()
-
-    function(dflash_add_ggml_gpu_executable target source)
-        add_executable(${target} ${source})
-        target_link_libraries(${target} PRIVATE
-            ggml ${DFLASH27B_GGML_BACKEND_TARGET} ggml-base)
-        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
-            target_link_libraries(${target} PRIVATE CUDA::cudart)
-        else()
-            target_link_libraries(${target} PRIVATE hip::host)
-        endif()
-        target_include_directories(${target} PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
-            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src)
-    endfunction()
 
     if((DFLASH27B_GPU_BACKEND STREQUAL "cuda" OR
         DFLASH27B_GPU_BACKEND STREQUAL "hip")

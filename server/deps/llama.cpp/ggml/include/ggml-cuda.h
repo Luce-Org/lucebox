@@ -87,6 +87,13 @@ GGML_BACKEND_API size_t ggml_backend_cuda_get_gdn_scalar_launch_count(void);
 GGML_BACKEND_API size_t ggml_backend_cuda_get_gdn_grouped_cols_launch_count(void);
 GGML_BACKEND_API bool ggml_backend_cuda_supports_gdn_grouped_cols(int device);
 
+// Calling-thread launch counter for the head-size-256 MMA fattn kernel.
+// Qualification tests use this to reject silent fallback to the tile kernel.
+GGML_BACKEND_API size_t ggml_backend_cuda_get_fattn_mma256_launch_count(void);
+
+// Calling-thread launch counter for the head-size-256 rocWMMA fattn kernel.
+GGML_BACKEND_API size_t ggml_backend_cuda_get_fattn_wmma256_launch_count(void);
+
 // device buffer
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device);
 

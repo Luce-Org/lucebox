@@ -2,6 +2,11 @@
 
 #include "common.cuh"
 
+// Bump the calling-thread head-size-256 WMMA launch counter, defined in
+// fattn.cu and exposed for qualification tests via
+// ggml_backend_cuda_get_fattn_wmma256_launch_count().
+extern "C" void ggml_backend_cuda_record_fattn_wmma256_launch(void);
+
 #if defined(GGML_USE_MUSA)
 #define GGML_USE_WMMA_FATTN
 #endif // defined(GGML_USE_MUSA)

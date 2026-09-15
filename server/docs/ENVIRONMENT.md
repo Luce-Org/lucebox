@@ -17,6 +17,9 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | Variable | Default | Purpose |
 |---|---|---|
 | `DFLASH_ADAPTIVE_SPEC_WIDTH` | unset | BURN-IN: =1 enables the shared acceptance-feedback verify-width controller. Fixed width is the production default; backend-specific overrides take precedence. |
+| `DFLASH27B_FA256_MMA` | 1 on RDNA4 | KILL SWITCH (burn-in): =0 restores the generic tile kernel for head-256 attention on RDNA4. With the default 1, prefill-sized head-256 batches take the rocWMMA kernel below ~32K KV and the raw-MMA kernel beyond (rocWMMA requires a `GGML_HIP_ROCWMMA_FATTN` build; without it the raw-MMA kernel covers all shapes). |
+| `DFLASH27B_FA256_WMMA` | unset | A/B: =1 forces the rocWMMA kernel on head-256 RDNA4 shapes whose KV length is a multiple of 256, bypassing the KV-length crossover (requires a `GGML_HIP_ROCWMMA_FATTN` build). |
+| `DFLASH27B_FA256_WMMA_MAX_KV` | 32768 | KV length above which the head-256 tensor-core route switches from the rocWMMA kernel to the raw-MMA kernel in `GGML_HIP_ROCWMMA_FATTN` builds (measured crossover on gfx1201). |
 | `DFLASH_DRAFT_KV` | 1 | KILL SWITCH (remove after burn-in): =0 restores the legacy per-step drafter window recompute instead of the ring cache. |
 | `DFLASH_LAGUNA_SWA_RING` | 1 | KILL SWITCH (remove after burn-in): =0 keeps SWA layers on pool-sized caches under KVFlash. |
 | `DFLASH_PROF` | unset | DEBUG: comma list of profilers (step,verify,prefill). Replaces DFLASH_LAGUNA_{STEP,VERIFY,PREFILL}_PROF. |
@@ -325,6 +328,10 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_TOPK_SPLIT` - geometric_draft_topk_cuda.cu
 - `DFLASH_VERIFY_WIDTH` - qwen35moe_backend.cpp
 - `FAST_ROLLBACK_DIAG` - qwen35_dflash_target.cpp
+- `DFLASH27B_FA256_MMA` - fattn.cu (ggml-cuda) (=0 restores the tile kernel for head-256 on RDNA4)
+- `DFLASH27B_FA256_WMMA` - fattn.cu (ggml-cuda) (=1 forces the rocWMMA kernel on every head-256 RDNA4 shape)
+- `DFLASH27B_FA256_WMMA_MAX_KV` - fattn.cu (ggml-cuda) (rocWMMA/raw-MMA crossover KV length in flag builds)
+- `GGML_HIP_ROCWMMA_FATTN` - server/CMakeLists.txt (BUILD OPTION, not an env var: compiles the rocWMMA fattn kernel; required by `DFLASH27B_FA256_WMMA` and the sub-32K head-256 prefill route)
 - `GGML_CUDA_BATCH_PEER_COPIES` - ggml-cuda.cu (ggml-cuda), deepseek4_fused_verify.inc, moe_hybrid_ffn_eval.cpp
 - `GGML_CUDA_GRAPH_MAX_KEYS` - common.cuh (ggml-cuda)
 - `GGML_CUDA_MLA_DENSE_HIGH_RATIO` - fattn.cu, deepseek4_backend.cpp, deepseek4_graph.cpp

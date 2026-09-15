@@ -17,6 +17,29 @@ extern "C" size_t ggml_backend_cuda_get_mla_stream_topk_launch_count(void) {
     return g_mla_stream_topk_launch_count;
 }
 
+// Bumped from the template instantiated in the fattn-mma-f16 instance TUs;
+// see the extern "C" declaration in fattn-mma-f16.cuh.
+static thread_local size_t g_fattn_mma256_launch_count = 0;
+
+extern "C" void ggml_backend_cuda_record_fattn_mma256_launch(void) {
+    ++g_fattn_mma256_launch_count;
+}
+
+extern "C" size_t ggml_backend_cuda_get_fattn_mma256_launch_count(void) {
+    return g_fattn_mma256_launch_count;
+}
+
+// Same pattern for the rocWMMA head-size-256 kernel (fattn-wmma-f16.cu).
+static thread_local size_t g_fattn_wmma256_launch_count = 0;
+
+extern "C" void ggml_backend_cuda_record_fattn_wmma256_launch(void) {
+    ++g_fattn_wmma256_launch_count;
+}
+
+extern "C" size_t ggml_backend_cuda_get_fattn_wmma256_launch_count(void) {
+    return g_fattn_wmma256_launch_count;
+}
+
 #if defined(GGML_USE_HIP)
 
 __device__ static float ds4_fa_block_sum(float v) {
@@ -4456,7 +4479,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     // Use the WMMA kernel if possible:
-    if (ggml_cuda_should_use_wmma_fattn(cc) && K->ne[1] % FATTN_KQ_STRIDE == 0 && Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[0] != 512 && Q->ne[0] != 576) {
+    // On RDNA4 the rocWMMA kernel is not qualified (fragment layouts do not
+    // match the hand-rolled softmax reductions), so it is reachable only
+    // through the env-gated head-256 block below.
+    if (ggml_cuda_should_use_wmma_fattn(cc) && !GGML_CUDA_CC_IS_RDNA4(cc) && K->ne[1] % FATTN_KQ_STRIDE == 0 && Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[0] != 512 && Q->ne[0] != 576) {
         if (can_use_vector_kernel && Q->ne[1] <= 2) {
             return BEST_FATTN_KERNEL_VEC;
         }
@@ -4486,6 +4512,53 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             return BEST_FATTN_KERNEL_TILE; // AMD WMMA is only faster if the full tile width of 16 can be utilized.
         }
         return BEST_FATTN_KERNEL_MMA_F16;
+    }
+
+    // Head-size-256 tensor-core FA on RDNA4. The gate above caps the MMA
+    // path at head 128 and the WMMA gate below skips head 256, so
+    // Qwen3.5/3.6/3.8 dense-hybrid targets (head_dim=256) fall to the
+    // generic tile kernel, which leaves the WMMA units idle and dominates
+    // long-context prefill wall time. The raw-MMA kernel is qualified by
+    // test_fattn_mma256 (max diff vs the CPU reference enforced at 1e-3
+    // f16 / 2e-3 q8_0 KV) and is the default; DFLASH27B_FA256_MMA=0 opts
+    // out. DFLASH27B_FA256_WMMA=1 additionally enables the unqualified
+    // rocWMMA kernel for A/B work.
+    static const auto env_int64 = [](const char * name, int64_t def) -> int64_t {
+        const char * e = getenv(name);
+        return e ? atoll(e) : def;
+    };
+    static const bool fa256_tc          = env_int64("DFLASH27B_FA256_MMA", 1) != 0;
+    static const bool fa256_wmma        = env_int64("DFLASH27B_FA256_WMMA", 0) != 0;
+    // KV length above which the raw-MMA kernel takes over from rocWMMA in
+    // flag builds. Measured on gfx1201 (q8_0 KV, nq=512): rocWMMA wins at
+    // 8K (4.24 vs 5.32 ms) and 16K (8.55 vs 10.17), raw-MMA wins at 32K
+    // (19.45 vs 19.77), 64K (37.87 vs 39.77) and 131K (74.80 vs 79.00).
+    // The crossover lies in the unmeasured 16-32K band; override with
+    // DFLASH27B_FA256_WMMA_MAX_KV for A/B.
+    static const int64_t fa256_wmma_max_kv = env_int64("DFLASH27B_FA256_WMMA_MAX_KV", 32768);
+    if ((fa256_tc || fa256_wmma) && amd_wmma_available(cc) && GGML_CUDA_CC_IS_RDNA4(cc) &&
+        gqa_opt_applies && Q->ne[0] == 256 && V->ne[0] == 256) {
+        // Same effective-GQA computation as the RDNA4 head<=128 gate above.
+        int gqa_ratio_eff = 1;
+        while (gqa_ratio % (2*gqa_ratio_eff) == 0 && gqa_ratio_eff < 8) {
+            gqa_ratio_eff *= 2;
+        }
+        if (fa256_wmma && ggml_cuda_should_use_wmma_fattn(cc) && K->ne[1] % FATTN_KQ_STRIDE == 0) {
+            return BEST_FATTN_KERNEL_WMMA_F16;
+        }
+        if (fa256_wmma && !ggml_cuda_should_use_wmma_fattn(cc)) {
+            static bool wmma_without_build_warned = false;
+            if (!wmma_without_build_warned) {
+                fprintf(stderr, "DFLASH27B_FA256_WMMA=1 set but this build has no rocWMMA kernel; using the raw-MMA kernel.\n");
+                wmma_without_build_warned = true;
+            }
+        }
+        if (fa256_tc && Q->ne[1] * gqa_ratio_eff > 32) {
+            if (ggml_cuda_should_use_wmma_fattn(cc) && K->ne[1] < fa256_wmma_max_kv) {
+                return BEST_FATTN_KERNEL_WMMA_F16;
+            }
+            return BEST_FATTN_KERNEL_MMA_F16;
+        }
     }
 
     // Use MFMA flash attention for CDNA (MI100+):

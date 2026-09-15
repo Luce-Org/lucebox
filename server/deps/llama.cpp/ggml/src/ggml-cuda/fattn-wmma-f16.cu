@@ -532,6 +532,9 @@ static_assert(get_VKQ_stride( 80, 4, 16) ==  16, "Test failed.");
 
 template <int D, int cols_per_block, typename KQ_acc_t>
 void ggml_cuda_flash_attn_ext_wmma_f16_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if constexpr (D == 256) {
+        ggml_backend_cuda_record_fattn_wmma256_launch();
+    }
     const ggml_tensor * KQV = dst;
 
     constexpr int nwarps = 4;
@@ -561,6 +564,17 @@ void ggml_cuda_flash_attn_ext_wmma_f16(ggml_backend_cuda_context & ctx, ggml_ten
 
     const enum ggml_prec prec = ggml_flash_attn_ext_get_prec(KQV);
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+    // RDNA4-only workaround: the f16-accumulator mma chain compiles to zero
+    // results on gfx1201 (probe-verified), so head-256 accumulates KQ in
+    // f32 there. Other architectures that reach this file (MUSA, RDNA3,
+    // CDNA flag builds) keep the historical f16 accumulation.
+    const bool rdna4 = GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ctx.device].cc);
+#define GGML_WMMA_256_ACC(cols)                                                     \
+    if (rdna4) {                                                                    \
+        ggml_cuda_flash_attn_ext_wmma_f16_case<256, (cols), float>(ctx, dst);       \
+    } else {                                                                        \
+        ggml_cuda_flash_attn_ext_wmma_f16_case<256, (cols), half>(ctx, dst);        \
+    }
 
     if (prec != GGML_PREC_DEFAULT) {
         if (Q->ne[1] <= 32 || Q->ne[0] > 128) {
@@ -606,9 +620,13 @@ void ggml_cuda_flash_attn_ext_wmma_f16(ggml_backend_cuda_context & ctx, ggml_ten
                 case 128:
                     ggml_cuda_flash_attn_ext_wmma_f16_case<128, cols_per_block, float>(ctx, dst);
                     break;
-                // case 256:
-                //     ggml_cuda_flash_attn_ext_wmma_f16_case<256, cols_per_block, float>(ctx, dst);
-                //     break;
+                case 256:
+                    // prec=F32 is an explicit f32-precision request: honor it
+                    // unconditionally like every other head size in this
+                    // switch (the RDNA4 f16-acc workaround gate below only
+                    // applies to the default-precision arms).
+                    ggml_cuda_flash_attn_ext_wmma_f16_case<256, cols_per_block, float>(ctx, dst);
+                    break;
                 default:
                     GGML_ABORT("fatal error");
                     break;
@@ -631,7 +649,7 @@ void ggml_cuda_flash_attn_ext_wmma_f16(ggml_backend_cuda_context & ctx, ggml_ten
                 ggml_cuda_flash_attn_ext_wmma_f16_case<128, cols_per_block, half>(ctx, dst);
                 break;
             case 256:
-                ggml_cuda_flash_attn_ext_wmma_f16_case<256, cols_per_block, half>(ctx, dst);
+                GGML_WMMA_256_ACC(cols_per_block);
                 break;
             default:
                 GGML_ABORT("fatal error");
@@ -660,7 +678,7 @@ void ggml_cuda_flash_attn_ext_wmma_f16(ggml_backend_cuda_context & ctx, ggml_ten
                 ggml_cuda_flash_attn_ext_wmma_f16_case<128, cols_per_block, half>(ctx, dst);
                 break;
             case 256:
-                ggml_cuda_flash_attn_ext_wmma_f16_case<256, cols_per_block, half>(ctx, dst);
+                GGML_WMMA_256_ACC(cols_per_block);
                 break;
             default:
                 GGML_ABORT("fatal error");
@@ -687,10 +705,11 @@ void ggml_cuda_flash_attn_ext_wmma_f16(ggml_backend_cuda_context & ctx, ggml_ten
             ggml_cuda_flash_attn_ext_wmma_f16_case<128, cols_per_block, half>(ctx, dst);
             break;
         case 256:
-            ggml_cuda_flash_attn_ext_wmma_f16_case<256, cols_per_block, half>(ctx, dst);
+            GGML_WMMA_256_ACC(cols_per_block);
             break;
         default:
             GGML_ABORT("fatal error");
             break;
     }
+#undef GGML_WMMA_256_ACC
 }
