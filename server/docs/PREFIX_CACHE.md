@@ -221,6 +221,25 @@ resident committed checkpoint buffers. During an atomic replacement, the new
 buffer and the selected victim can coexist briefly, so transient process memory
 can exceed the limit by up to one checkpoint.
 
+When the engine runs speculative continuous batching (a local same-device
+DFlash drafter under `--max-concurrency`), eligible checkpoints additionally
+carry the slot's drafter feature-ring slab so a restored prefix keeps the
+draft window warm — the resident estimate charges for it. AR-only engines
+keep the leaner KV + recurrent payload. A capture is ineligible while its
+slot is still floored by a featureless restore (below), and the bench/debug
+switch `DFLASH_PREFIX_NO_FEAT=1` drops the slab entirely (see
+ENVIRONMENT.md).
+
+A checkpoint without a feature payload still restores correctly under
+speculation. The engine then treats ring rows below the restore cut as
+untrusted: the drafter rebuilds its K/V window only from rows the
+occupying sequence wrote itself (the restore cut plus everything
+generated afterward), so proposals are never conditioned on a previous
+slot occupant's features. Such a slot also refrains from blessing those
+rows into later feature-bearing checkpoints — until it has written a full
+ring worth of positions past the restore cut, after which every row is
+self-written and the payload resumes.
+
 | Scenario | Typical prefix length | Recommended cap |
 |----------|----------------------|-----------------|
 | Single-user chat | 200–2000 tokens | 16–32 |
