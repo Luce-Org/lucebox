@@ -66,6 +66,24 @@ public:
         }
     }
 
+    float get_or_create_keep_ratio(
+            const std::string& session_id, float initial_keep) {
+        std::lock_guard<std::mutex> lock(mu_);
+        auto it = map_.find(session_id);
+        if (it == map_.end()) {
+            evict_if_full_locked();
+            AdaptiveKeepRatioState state;
+            state.last_keep = std::clamp(
+                initial_keep, kBanditKeepMin, kBanditKeepMax);
+            lru_.push_front(session_id);
+            it = map_.emplace(
+                session_id, Entry{state, lru_.begin()}).first;
+        } else {
+            lru_.splice(lru_.begin(), lru_, it->second.lru_it);
+        }
+        return it->second.state.last_keep;
+    }
+
     float get_keep_ratio(const std::string& session_id) const {
         std::lock_guard<std::mutex> lock(mu_);
         auto it = map_.find(session_id);
