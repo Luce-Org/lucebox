@@ -13,6 +13,8 @@
 
 #include "ggml.h"
 
+#include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -76,11 +78,12 @@ void free_qwen3_drafter_model(Qwen3DrafterWeights & w);
 // Inputs:
 //   w           — loaded weights (must be on the selected GPU backend)
 //   ids         — input token IDs of length S (drafter vocab)
-//   n_lookahead — number of trailing query tokens for tail attention (=8)
+//   n_lookahead — number of query tokens for scorer attention (=8)
+//   score_query_end — exclusive end of query window; negative selects the tail
 //
 // Outputs:
 //   running_max — flat [n_lookahead, S] f32, max-over-heads-and-layers of
-//                 softmax(Q_tail @ K^T / sqrt(D)) per (lookahead, key) pair.
+//                 softmax(Q_query @ K^T / sqrt(D)) per (lookahead, key) pair.
 //                 Caller does AvgPool + chunk-top-K + span merge.
 //
 // Returns true on success. On failure sets last_error and returns false.
@@ -88,6 +91,39 @@ bool forward_qwen3_drafter_model(
     const Qwen3DrafterWeights & w,
     const std::vector<int32_t> & ids,
     int n_lookahead,
-    std::vector<float> & running_max);
+    std::vector<float> & running_max,
+    int score_query_end = -1);
+
+struct QueryCaptureSlice {
+    int chunk_offset = 0;
+    int query_offset = 0;
+    int tokens = 0;
+
+    bool valid() const { return tokens > 0; }
+};
+
+inline QueryCaptureSlice query_capture_slice(
+        int query_start,
+        int query_end,
+        int chunk_start,
+        int chunk_tokens) {
+    const int chunk_end = chunk_start + chunk_tokens;
+    const int overlap_start = query_start > chunk_start ? query_start : chunk_start;
+    const int overlap_end = query_end < chunk_end ? query_end : chunk_end;
+    if (overlap_start >= overlap_end) return {};
+    return {
+        overlap_start - chunk_start,
+        overlap_start - query_start,
+        overlap_end - overlap_start,
+    };
+}
+
+inline size_t count_nonfinite_scores(const float * values, size_t count) {
+    size_t nonfinite = 0;
+    for (size_t index = 0; index < count; ++index) {
+        if (!std::isfinite(values[index])) ++nonfinite;
+    }
+    return nonfinite;
+}
 
 } // namespace dflash::common

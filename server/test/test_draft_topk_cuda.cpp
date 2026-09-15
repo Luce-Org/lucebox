@@ -22,6 +22,8 @@
 
 #include <cuda_runtime.h>
 
+#include <atomic>
+#include <thread>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -209,4 +211,41 @@ TEST_CASE(DraftTopkCudaFixture, draft_topk_cuda_suite) {
     }
     REQUIRE(failures == 0);
     printf("\nALL PASS: %d/%d cases\n", idx, idx);
+}
+
+// Workers overlap different logits and allocation sizes. With two devices,
+// alternate ownership as well, so replacement must free on the old device.
+TEST_CASE(DraftTopkCudaFixture, draft_topk_concurrent_workers_and_device_changes) {
+    int devices = 0;
+    if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {
+        printf("SKIP: no CUDA device available\n");
+        return;
+    }
+    const int used_devices = devices > 1 ? 2 : 1;
+    std::atomic<int> ready{0};
+    std::atomic<bool> go{false};
+    bool ok[2] = {true, true};
+    auto worker = [&](int id) {
+        ++ready;
+        while (!go.load()) std::this_thread::yield();
+        for (int i = 0; i < 8; ++i) {
+            const int device = (i + id) % used_devices;
+            if (cudaSetDevice(device) != cudaSuccess ||
+                !run_case({1 + (i % 3) * 7, 4096, 8, 0.7f},
+                          1000u + id * 100u + i)) {
+                ok[id] = false;
+                break;
+            }
+            int current = -1;
+            if (cudaGetDevice(&current) != cudaSuccess || current != device)
+                ok[id] = false;
+        }
+    };
+    std::thread a(worker, 0), b(worker, 1);
+    while (ready.load() != 2) std::this_thread::yield();
+    go = true;
+    a.join();
+    b.join(); // Worker-owned GPU scratch is destroyed here.
+    CHECK(ok[0]);
+    CHECK(ok[1]);
 }

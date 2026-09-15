@@ -12,6 +12,8 @@
 
 #include <cuda_runtime.h>
 
+#include <atomic>
+#include <thread>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -335,4 +337,44 @@ TEST_CASE(GpuSamplerCudaFixture, gpu_sampler_microbench_when_enabled) {
         gpu_sampler_microbench();
     }
     CHECK(true);
+}
+
+TEST_CASE(GpuSamplerCudaFixture, independent_workers_sample_distinct_logits) {
+    if (!gpu_sampler_test_available()) return;
+    int devices = 0;
+    CHECK(cudaGetDeviceCount(&devices) == cudaSuccess);
+    std::atomic<int> ready{0};
+    std::atomic<bool> go{false};
+    bool ok[2] = {true, true};
+    auto worker = [&](int id) {
+        ++ready;
+        while (!go.load()) std::this_thread::yield();
+        for (int i = 0; i < 32; ++i) {
+            const int device = (i + id) % (devices > 1 ? 2 : 1);
+            if (cudaSetDevice(device) != cudaSuccess) { ok[id] = false; break; }
+            const int vocab = 1024 + (i % 3) * 1024;
+            const int expected = id * 100 + i;
+            std::vector<float> logits(vocab, -100.0f);
+            logits[expected] = 100.0f;
+            SamplerCfg cfg;
+            cfg.temp = 0.0f;
+            cfg.top_k = 0;
+            cfg.top_p = 1.0f;
+            const int token = geometric_sample_logits_cuda(
+                logits.data(), vocab, cfg, {}, 0.5, false);
+            if (token != expected) ok[id] = false;
+            cfg.temp = 1.0f;
+            std::vector<float> probs(vocab);
+            if (!geometric_compute_probs_cuda(logits.data(), vocab, cfg, {},
+                                              probs.data(), false) || probs[expected] < 0.999f)
+                ok[id] = false;
+        }
+    };
+    std::thread a(worker, 0), b(worker, 1);
+    while (ready.load() != 2) std::this_thread::yield();
+    go = true;
+    a.join();
+    b.join();
+    CHECK(ok[0]);
+    CHECK(ok[1]);
 }

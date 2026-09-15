@@ -51,14 +51,16 @@ GGML_BACKEND_API size_t ggml_backend_cuda_graph_invalidate_range(
         const void *   begin,
         size_t         size);
 
-// Returns true when the backend has instantiated a legacy device pool. This
-// lets callers and tests distinguish a trimmable cache from a VMM arena.
+// Returns true when the CUDA/HIP backend has instantiated a legacy device
+// pool. Meta backends recursively inspect every rank-local backend. This lets
+// callers and tests distinguish a trimmable cache from a VMM arena.
 GGML_BACKEND_API bool ggml_backend_cuda_has_legacy_pool(ggml_backend_t backend);
 
-// Release cached temporary allocations held by a CUDA/HIP backend's legacy
-// device pools. The backend is synchronized first, and graph executables that
-// may reference released pool blocks are retired. VMM pools are already a
-// contiguous reusable arena and are left intact. Returns bytes released.
+// Release cached temporary allocations held by CUDA/HIP legacy device pools.
+// Meta backends recursively trim every rank-local backend. Each CUDA/HIP
+// backend is synchronized first, and graph executables that may reference
+// released pool blocks are retired. VMM pools are already a contiguous
+// reusable arena and are left intact. Returns total bytes released.
 GGML_BACKEND_API size_t ggml_backend_cuda_trim_pool(ggml_backend_t backend);
 
 // Disable CUDA/HIP graph capture and replay on the calling thread. Returns the
@@ -69,11 +71,20 @@ GGML_BACKEND_API bool ggml_backend_cuda_set_graphs_disabled_override(bool disabl
 // Intended for focused correctness tests of the dispatch guard.
 GGML_BACKEND_API size_t ggml_backend_cuda_get_concat_transpose_f32_count(void);
 
-// Calling-thread launch counters for quantized matrix-vector (MMVQ) and
-// matrix-matrix (MMQ) kernels. Intended for focused tests that must prove
-// which dispatch path executed rather than only checking numerical output.
+// Calling-thread launch counters for quantized matrix-vector (MMVQ), its
+// grouped-expert MMID specialization, and matrix-matrix (MMQ) kernels.
+// Intended for focused tests that must prove which dispatch path executed
+// rather than only checking numerical output.
 GGML_BACKEND_API size_t ggml_backend_cuda_get_mmvq_launch_count(void);
 GGML_BACKEND_API size_t ggml_backend_cuda_get_mmq_launch_count(void);
+GGML_BACKEND_API size_t ggml_backend_cuda_get_mla_stream_topk_launch_count(void);
+GGML_BACKEND_API size_t ggml_backend_cuda_get_mmvq_mmid_grouped_launch_count(void);
+
+// Calling-thread launch counters for the scalar and grouped-column GDN
+// kernels. Focused qualification tests use these to reject silent fallback.
+GGML_BACKEND_API size_t ggml_backend_cuda_get_gdn_scalar_launch_count(void);
+GGML_BACKEND_API size_t ggml_backend_cuda_get_gdn_grouped_cols_launch_count(void);
+GGML_BACKEND_API bool ggml_backend_cuda_supports_gdn_grouped_cols(int device);
 
 // device buffer
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device);

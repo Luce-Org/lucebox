@@ -66,6 +66,13 @@ public:
     bool snapshot_used(int slot) const override;
     int snapshot_cur_pos(int slot) const override;
     bool snapshot_restore(int slot) override;
+    // Ondisk prefix cache: per-shard snapshots are merged into one named CPU
+    // context (ls<shard>_ prefix + adapter-level meta/hc/logits tensors).
+    // Mixed (remote IPC) target splits stay memory-only.
+    ModelBackend::SnapshotRef snapshot_ref(int slot) const override;
+    bool snapshot_adopt(int slot, ggml_context * ctx,
+                        ggml_backend_buffer_t buf, int cur_pos,
+                        int32_t last_tok) override;
     int current_last_token() const override { return last_tok_; }
 
     void free_drafter() override {}
@@ -92,6 +99,8 @@ private:
     DeepSeek4LayerSplitAdapterConfig cfg_;
     std::vector<DeepSeek4LayerSplitShard> shards_;
     TargetShardIpcSession remote_target_shard_;
+    // Filled by the shared layer-split runtime helpers; DeepSeek snapshots
+    // do not use them (one merged host context per slot, see snapshot_save).
     std::vector<ggml_backend_t> snapshot_backends_;
 
     // HC state persists across all layers (shared between shards)
@@ -107,6 +116,11 @@ private:
         std::vector<float> prefill_last_logits;
         std::vector<DeepSeek4Snapshot> shards;
         bool used = false;
+        // One merged host context holds every shard snapshot (aliased with
+        // owns_storage=false) plus the adapter-level tensors; it is also what
+        // the ondisk prefix cache serializes. Owned by the slot.
+        ggml_context *        ctx = nullptr;
+        ggml_backend_buffer_t buf = nullptr;
     };
     std::vector<Snapshot> snapshots_;
 

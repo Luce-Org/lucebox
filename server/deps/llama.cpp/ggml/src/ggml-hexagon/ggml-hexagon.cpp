@@ -2629,7 +2629,9 @@ static htp_op_code op_remap_to_htp(const ggml_tensor * t) {
         case GGML_OP_SQRT:           return HTP_OP_SQRT;
         case GGML_OP_SOFT_MAX:       return HTP_OP_SOFTMAX;
         case GGML_OP_SSM_CONV:       return HTP_OP_SSM_CONV;
-        case GGML_OP_ROPE:           return HTP_OP_ROPE;
+        case GGML_OP_ROPE:
+            GGML_ASSERT((t->op_params[2] & GGML_ROPE_TYPE_TAIL) == 0);
+            return HTP_OP_ROPE;
         case GGML_OP_REPEAT:         return HTP_OP_REPEAT;
         case GGML_OP_CUMSUM:         return HTP_OP_CUMSUM;
 
@@ -3030,6 +3032,11 @@ static bool ggml_hexagon_supported_repeat(const struct ggml_hexagon_session * se
 }
 
 static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
+    if ((op->op == GGML_OP_ROPE || op->op == GGML_OP_ROPE_BACK) &&
+        (op->op_params[2] & GGML_ROPE_TYPE_TAIL)) {
+        return false;
+    }
+
     auto sess = static_cast<ggml_hexagon_session *>(dev->context);
 
     // reject ops that match the filter

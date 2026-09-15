@@ -105,6 +105,9 @@ DFLASH_CHECK_ARCH("deepseek4", DeepSeek4BackendConfig, DeepSeek4LayerSplitAdapte
 // that shared struct would fail a check that is really about dispatch.
 DFLASH_CHECK_ARCH_OPTION("qwen35", Qwen35Config, Qwen35LayerSplitAdapterConfig,
                          has_paged_attention, paged_attn);
+DFLASH_CHECK_ARCH_OPTION("deepseek4", DeepSeek4BackendConfig,
+                         DeepSeek4LayerSplitAdapterConfig,
+                         has_paged_attention, paged_attn);
 DFLASH_CHECK_ARCH_OPTION("qwen35", Qwen35Config, Qwen35LayerSplitAdapterConfig,
                          has_draft_block_size, draft_block_size);
 
@@ -273,6 +276,8 @@ std::unique_ptr<ModelBackend> create_backend(
         cfg.remote_draft       = args.remote_draft;
         cfg.stream_fd          = args.stream_fd;
         cfg.fa_window          = args.fa_window;
+        cfg.cache_type_k       = args.cache_type_k;
+        cfg.cache_type_v       = args.cache_type_v;
         cfg.paged_attention    = args.paged_attention;
         cfg.max_concurrency    = args.max_concurrency;
         cfg.kv_pool_tokens     = args.kv_pool_tokens;
@@ -445,6 +450,9 @@ std::unique_ptr<ModelBackend> create_backend(
             cfg.fused_decode = args.ds4_fused_decode;
             cfg.fused_verify_f16_kv = args.ds4_fused_verify_f16_kv;
             cfg.prefill_mode = args.ds4_prefill_mode;
+            cfg.paged_attention = args.paged_attention;
+            cfg.max_concurrency = args.max_concurrency;
+            cfg.kv_pool_tokens = args.kv_pool_tokens;
 
             auto backend = std::make_unique<DeepSeek4Backend>(cfg);
             if (!backend->init()) {

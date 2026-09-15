@@ -20,6 +20,7 @@
 #include "chat_template.h"
 #include "tool_memory.h"
 #include "prefix_cache.h"
+#include "hybrid_cache.h"
 #include "disk_prefix_cache.h"
 #include "freeze_history.h"
 #include "api_types.h"
@@ -56,6 +57,9 @@ using json = nlohmann::json;
 // ─── Forward declarations ───────────────────────────────────────────────
 struct ServerJob;
 
+// Admission feedback is returned before any response bytes or model compute.
+enum class RoutingAdmission { handled, busy, unfit };
+
 namespace http_detail {
 // Non-consuming peer-state probe used by the client-thread job monitor.
 // A read half-close is not a disconnect: HTTP clients may finish writing a
@@ -88,10 +92,17 @@ struct ServerConfig {
     std::string host        = "0.0.0.0";
     int         port        = 8080;
     int         max_tokens  = 4096;     // default max output tokens (legacy alias for default_max_tokens)
+    int         routing_queue_limit = 32; // waiting auto requests across the listener
     int         max_ctx     = 0;        // 0 = use backend's DevicePlacement default (8192)
     bool        enable_cors = true;
     std::string model_name  = "dflash";
     int         prefix_cache_cap = 32;  // prefix cache slots (0 disables)
+    // Resident system-memory budget for copied paged checkpoints. The
+    // scheduler enforces it only when concurrent paged prefix storage is
+    // active. Zero means unlimited.
+    size_t      concurrent_prefix_cache_max_bytes = (size_t)4 * 1024 * 1024 * 1024;
+    bool        concurrent_paged_prefix_cache = false;
+    int         session_prefix_cache_max_tokens = 0; // opt-in rolling session checkpoints
     int         prefill_cache_cap = 0;  // full-prompt/prefill cache slots (0 disables)
     // Extend the existing prefix cache through generated tool-call turns.
     bool        agent_turn_cache = false;
@@ -262,11 +273,32 @@ bool canonical_assistant_content(
     const std::string & generated_text,
     std::string & content);
 
+struct PflashQueryWindow {
+    int end = -1;       // exclusive token offset in the rendered prompt
+    int tokens = 0;     // width of the matching query suffix
+
+    bool valid() const { return end >= tokens && tokens > 0; }
+};
+
+// Select the final normalized user message as the scorer query. Public for
+// model-free coverage of every request shape accepted by prompt rendering.
+std::string pflash_user_query_text(
+    const std::vector<ChatMessage> & messages);
+
+// Find the last sufficiently-specific suffix of the user query before the
+// assistant-generation suffix. Public for model-free regression tests.
+PflashQueryWindow find_pflash_query_window(
+    const std::vector<int32_t> & prompt,
+    const std::vector<int32_t> & query,
+    int search_end,
+    int max_tokens = 8);
+
 }  // namespace http_detail
 
 // ─── Parsed request ─────────────────────────────────────────────────────
 
 struct ParsedRequest {
+    bool hybrid_release = false;
     ApiFormat                  format;
     std::vector<int32_t>      prompt_tokens;  // tokenized prompt
     std::string               rendered_prompt;
@@ -310,7 +342,6 @@ struct ParsedRequest {
     DiskPrefixCachePolicy     disk_cache_policy;
     // PPP: stable pin cut for tool-heavy requests (0 = use default boundary).
     int                       pin_end_token = 0;
-    bool                      memory_no_cache = false; // worker admission only
 };
 
 // Parse request sampler fields, applying model-card defaults where present.
@@ -361,10 +392,13 @@ public:
     // Set the chat template format (detected from model arch).
     void set_chat_format(ChatFormat fmt) { chat_format_ = fmt; }
 
-    // Start listening. Blocks until shutdown() is called.
-    int run();
+    // Start one listener. Optional model contexts are borrowed until run()
+    // returns and must include this first. Model names must be explicit and unique.
+    // Each context gets its existing scheduler or single-request worker, never another socket.
+    int run(const std::vector<HttpServer *> & models = {});
 
-    // Signal the server to stop accepting new connections and drain.
+    // Finalize after run() returns; also called by the destructor.
+    // Use request_stop() to stop a running listener from another thread.
     void shutdown();
 
     // Async-signal-safe: only sets the stopping flag. The accept loop polls
@@ -377,8 +411,17 @@ public:
     }
 
 private:
+    friend struct SchedulerTestHarness;
+
     // Client thread: read HTTP request, parse, enqueue job, wait.
     void handle_client(SocketHandle fd);
+
+    struct HttpRequest;
+    void start_worker();
+    bool route_model_request(SocketHandle fd, ParsedRequest & req, bool count_only);
+    bool handle_model_request(SocketHandle fd, ParsedRequest & req, bool count_only,
+                              RoutingAdmission * admission = nullptr);
+    json model_routing_status();
 
     // Worker thread: process jobs sequentially. process_job owns the
     // lifecycle of one dequeued request, including signaling completion.
@@ -386,6 +429,16 @@ private:
     void process_job(ServerJob * job);
 
     struct PreparedPrompt {
+        bool hybrid = false;
+        bool hybrid_recoverable = false;
+        int64_t hybrid_deadline_ms = 0;
+        int hybrid_source = -1;
+        std::string hybrid_owner;
+        bool hybrid_temporary = false;
+        hybrid::Path hybrid_path = hybrid::Path::Dense;
+        hybrid::Capture hybrid_capture;
+        std::shared_ptr<hybrid::Representation> representation;
+        json hybrid_trace;
         std::vector<int32_t> tokens;
         bool compressed = false;
         bool flowkv = false;
@@ -399,6 +452,8 @@ private:
     // Prompt preparation keeps the FlowKV and whole-prompt PFlash policies
     // out of the decode path while preserving their shared precedence rules.
     PreparedPrompt prepare_prompt(const ParsedRequest & req);
+    PreparedPrompt prepare_hybrid_prompt(const ParsedRequest & req, const std::function<bool()>& cancelled = {});
+    void publish_hybrid(const json & trace);
     void apply_flowkv_compression(const ParsedRequest & req,
                                   PreparedPrompt & prepared);
     std::string apply_pflash_compression(const ParsedRequest & req,
@@ -418,9 +473,11 @@ private:
         // When DiffPin rewrote tokens, full-cache keys must use
         // prepared.tokens (effective), not req.prompt_tokens.
         bool full_snap_key_effective = false;
+        PrefixCache::InlineReservation snap_reservation;
         int snap_slot = -1;
         int snap_cut = 0;
         bool snap_prepared = false;
+        bool hybrid_capture_primary = false;
     };
 
     GenerationCacheState prepare_generation_cache(
@@ -428,7 +485,7 @@ private:
         GenerateRequest & generate_request);
     void finalize_generation_cache(
         const ParsedRequest & req, const PreparedPrompt & prepared,
-        const GenerationCacheState & cache, const GenerateResult & result,
+        GenerationCacheState & cache, const GenerateResult & result,
         int completion_tokens, bool visible_output_seen,
         bool client_disconnected);
     void remember_agent_turn(
@@ -488,9 +545,6 @@ private:
     std::string format_http_response(
         int status, const std::string & content_type,
         const std::string & body);
-    static std::array<std::string, 2> sse_error_close_chunks(
-        const std::string & message);
-
     // Parse HTTP request from socket.
     struct HttpRequest {
         std::string method;
@@ -517,9 +571,11 @@ private:
         const std::vector<ChatMessage> & chat_messages,
         const ParsedRequest & req, bool add_generation_prompt,
         std::string & rendered, std::string & error);
-    bool validate_request_context(SocketHandle fd, const ParsedRequest & req);
+    bool validate_request_context(SocketHandle fd, const ParsedRequest & req,
+                                  bool send_failure = true);
     void log_parsed_request(const ParsedRequest & req) const;
-    void enqueue_request_and_wait(SocketHandle fd, ParsedRequest req);
+    RoutingAdmission enqueue_request_and_wait(SocketHandle fd, ParsedRequest req,
+                                  bool report_admission = false);
 
     // Send HTTP response helpers.
     bool send_response(SocketHandle fd, int status, const std::string & content_type,
@@ -549,11 +605,16 @@ private:
     PFlashDrafterIpcClient pflash_remote_;
     ToolMemory       tool_memory_;
     PrefixCache      prefix_cache_;
-    std::atomic<uint64_t> memory_evictions_{0}, memory_uncached_{0}, memory_rejections_{0};
     DiskPrefixCache  disk_cache_;
 
     // Per-session adaptive keep_ratio bandit state.
     HttpServerSessions sessions_;
+    bool hybrid_enabled_ = false;
+    bool hybrid_shadow_ = false;
+    hybrid::Cache hybrid_cache_;
+    std::mutex hybrid_stats_mutex_;
+    json hybrid_stats_;
+
 
     // Live status tracker (read by /status/json, written by worker thread).
     ServerStatus status_;
@@ -601,6 +662,19 @@ private:
     std::unordered_map<PrefixHash, std::string,
                        PrefixHashHasher, PrefixHashEqual> frozen_content_cache_;
 
+    // Immutable model table after run() starts; only reservations mutate under
+    // routing_mu_. A reservation spans parsing through job retirement/output
+    // draining, so disconnects never make still-running engine work invisible.
+    struct RoutedModel {
+        HttpServer * server;
+        int capacity;
+        int in_flight = 0;
+    };
+    std::vector<RoutedModel> models_;
+    std::mutex routing_mu_;
+    std::condition_variable routing_cv_;
+    int routing_waiters_ = 0;
+
     // Worker thread.
     std::thread                     worker_thread_;
     std::mutex                      queue_mu_;
@@ -637,12 +711,12 @@ struct ServerJob {
 
     // Concurrent-scheduler state that survives a pool-full admission retry.
     // The classic worker leaves these fields untouched.
+    bool          report_admission = false; // return busy before committing a response
+    RoutingAdmission admission = RoutingAdmission::handled; // published with done
     bool          announced = false;
-    bool          sse_started = false;
     // First concurrent-scheduler attempt; retained across busy deferrals so
     // server-side prefill/elapsed telemetry does not erase queueing delay.
     std::chrono::steady_clock::time_point parallel_started_at{};
-    std::unique_ptr<SseEmitter> emitter;
 };
 
 // ─── Parse session_id from a chat-completion JSON body ──────────────────

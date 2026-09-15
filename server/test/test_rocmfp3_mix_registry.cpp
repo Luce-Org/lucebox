@@ -139,25 +139,31 @@ TEST_CASE(Rocmfp3MixRegistryFixture, registry_lifecycle) {
     CHECK(!ggml_cuda_rocmfp3_mix_registered(b0),
           "dispatch lock test leaves no registry entry");
 
-    // 6. no device-memory leak across many register/unregister cycles. A missing
-    //    cudaFree in unregister (or on update) leaks ~E*(2*8*2 + 1) bytes per
-    //    cycle; 4000 cycles would produce a measurable free-VRAM drop.
+    // 6. no device-memory leak across many register/unregister cycles. Use a
+    //    real device allocation here: production registrations always receive
+    //    one, while repeatedly querying an invented address can make the HIP
+    //    runtime retain architecture-dependent pointer-tracking storage.
+    void * leak_base = nullptr;
+    REQUIRE_TRUE(cudaMalloc(&leak_base, (size_t) E * nb02) == cudaSuccess);
+
+    // A missing cudaFree in unregister (or on update) leaks the side-data
+    // allocations every cycle; 4000 cycles produce a measurable VRAM drop.
     cudaDeviceSynchronize();
     size_t free_warm = 0, total = 0;
     // warm the allocator first so pool growth isn't counted as a leak
     for (int i = 0; i < 64; ++i) {
         CHECK(ggml_cuda_rocmfp3_mix_register_host(
-                  b0, nb02, E, out, in, books.data(), modes.data()),
+                  leak_base, nb02, E, out, in, books.data(), modes.data()),
               "warmup registration succeeds");
-        ggml_cuda_rocmfp3_mix_unregister(b0);
+        ggml_cuda_rocmfp3_mix_unregister(leak_base);
     }
     cudaDeviceSynchronize();
     (void) cudaMemGetInfo(&free_warm, &total);
     for (int i = 0; i < 4000; ++i) {
         CHECK(ggml_cuda_rocmfp3_mix_register_host(
-                  b0, nb02, E, out, in, books.data(), modes.data()),
+                  leak_base, nb02, E, out, in, books.data(), modes.data()),
               "cycle registration succeeds");
-        ggml_cuda_rocmfp3_mix_unregister(b0);
+        ggml_cuda_rocmfp3_mix_unregister(leak_base);
     }
     cudaDeviceSynchronize();
     size_t free_end = 0;
@@ -165,6 +171,7 @@ TEST_CASE(Rocmfp3MixRegistryFixture, registry_lifecycle) {
     const long long delta = (long long) free_warm - (long long) free_end;
     std::fprintf(stderr, "[registry] free VRAM delta over 4000 cycles: %lld bytes\n", delta);
     CHECK(delta < 8 * 1024 * 1024, "no device leak across register/unregister cycles");
+    CHECK(cudaFree(leak_base) == cudaSuccess, "leak-test base allocation is released");
 
     std::fprintf(stderr, g_fails ? "REGISTRY TEST FAILED (%d)\n"
                                  : "REGISTRY TEST OK\n", g_fails);

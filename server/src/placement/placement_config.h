@@ -9,7 +9,9 @@
 
 #include "placement_backend.h"
 
+#include <cerrno>
 #include <cstdlib>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -93,8 +95,10 @@ inline bool parse_placement_device(const std::string & value,
 
     const std::string gpu_text = value.substr(sep + 1);
     char * end = nullptr;
+    errno = 0;
     long gpu = std::strtol(gpu_text.c_str(), &end, 10);
-    if (end == gpu_text.c_str() || *end != '\0' || gpu < 0) {
+    if (end == gpu_text.c_str() || *end != '\0' || errno == ERANGE ||
+        gpu < 0 || gpu > (std::numeric_limits<int>::max)()) {
         return false;
     }
 

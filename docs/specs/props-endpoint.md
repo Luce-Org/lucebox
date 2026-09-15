@@ -363,15 +363,36 @@ enabled, fields carry the runtime configuration:
 
 ```json
 "prefix_cache": {
-  "capacity":      0,
-  "in_use":        0,
-  "lifetime_hits": 0
+  "capacity":                       0,
+  "in_use":                         0,
+  "lifetime_hits":                  0,
+  "agent_turn_enabled":             false,
+  "max_resident_bytes":             4294967296,
+  "resident_bytes":                 0,
+  "budget_skips":                   0,
+  "capture_attempts":               0,
+  "capture_failures":               0,
+  "capture_stall_ms_total":         0.0,
+  "capture_stall_ms_max":           0.0,
+  "restore_attempts":               0,
+  "restore_invalidations":          0,
+  "restore_stall_ms_total":         0.0,
+  "restore_stall_ms_max":           0.0
 }
 ```
 
 The inline prefix cache (system-prompt KV reuse). Same atomic /
 non-strictly-consistent semantics as `full_cache` (§4.7).
-`capacity = 0` means the cache is disabled.
+`capacity = 0` means the cache is disabled. `max_resident_bytes` and
+`resident_bytes` cover committed copied checkpoints used by concurrent paged
+serving; a maximum of `0` means unlimited. `budget_skips` counts captures
+declined because no single eligible LRU entry could make enough room.
+
+The capture and restore counters expose synchronous time spent copying
+checkpoint state on the scheduler thread. `*_attempts` include successful and
+unsuccessful operations, totals are cumulative milliseconds, and maxima are
+the largest single measured operation. A failed capture increments
+`capture_failures`; an unusable restore increments `restore_invalidations`.
 
 ### 4.13 `reasoning`
 
@@ -609,9 +630,21 @@ version increments.
     "threshold":   null
   },
   "prefix_cache": {
-    "capacity":      0,
-    "in_use":        0,
-    "lifetime_hits": 0
+    "capacity":                       0,
+    "in_use":                         0,
+    "lifetime_hits":                  0,
+    "agent_turn_enabled":             false,
+    "max_resident_bytes":             4294967296,
+    "resident_bytes":                 0,
+    "budget_skips":                   0,
+    "capture_attempts":               0,
+    "capture_failures":               0,
+    "capture_stall_ms_total":         0.0,
+    "capture_stall_ms_max":           0.0,
+    "restore_attempts":               0,
+    "restore_invalidations":          0,
+    "restore_stall_ms_total":         0.0,
+    "restore_stall_ms_max":           0.0
   },
   "reasoning": {
     "default":           null,

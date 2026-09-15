@@ -12,6 +12,7 @@
 #include "server/tool_parser.h"
 #include "server/model_card.h"
 #include "server/reasoning.h"
+#include "server/response_error.h"
 #include "server/prefix_cache.h"
 #include "server/pin_friendly_prompt.h"
 #include "server/disk_prefix_cache.h"
@@ -19,11 +20,15 @@
 #include "server/utf8_utils.h"
 #include "server/api_types.h"
 #include "server/http_server.h"
+#include "server/hybrid_policy.h"
+#include "server/hybrid_regions.h"
 #include "server/chat_template.h"
+#include "common/concurrency/seq_engine.h"
 #include "common/sampler.h"
 #include "common/concurrency/seq_engine.h"
 #include "common/backend_precision.h"
 #include "common/backend_ipc.h"
+#include "common/pflash_drafter_ipc.h"
 #include "common/moe_hybrid_ffn_eval.h"
 #include "common/moe_hybrid_placement.h"
 #include "placement/pflash_placement.h"
@@ -40,6 +45,7 @@
 #include "qwen35moe/qwen35moe_ffn.h"
 #include "ggml-cpu.h"
 #include "server/prompt_normalize.h"
+#include "qwen3_drafter.h"
 #include "qwen3_drafter_model.h"
 #include "dflash27b.h"
 #include "gguf.h"
@@ -55,14 +61,16 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
+#include <thread>
 #include <vector>
 #include <limits>
+#if !defined(_WIN32)
 #include <fcntl.h>
 #include <sys/stat.h>
-#include <dirent.h>
 #include <unistd.h>
-#if !defined(_WIN32)
 #include <sys/socket.h>
+#else
+#include <io.h>
 #endif
 
 #if defined(_WIN32)
@@ -75,12 +83,92 @@
 
 using json = nlohmann::json;
 using namespace dflash::common;
+namespace fs = std::filesystem;
+
+static fs::path test_tmp_path(const char * name) {
+    std::error_code ec;
+    fs::path root = fs::temp_directory_path(ec);
+    if (ec) {
+        throw std::runtime_error("failed to resolve temporary directory: " +
+                                 ec.message());
+    }
+    return root / name;
+}
+
+static void remove_test_path(const fs::path & path) {
+    std::error_code ec;
+    fs::remove(path, ec);
+}
 
 namespace dflash::common {
 std::vector<ChatMessage> normalize_chat_messages(
     const json & messages,
     ApiFormat format,
     ToolMemory & tool_memory);
+
+struct SchedulerTestHarness {
+    static bool parse_common(HttpServer& server,SocketHandle fd,const json& body,ParsedRequest& req) {return server.parse_common_request_fields(fd,body,req);}
+    static void enable_hybrid(HttpServer& server) {server.hybrid_enabled_=true;}
+    static hybrid::Cache& hybrid_cache(HttpServer& server) {return server.hybrid_cache_;}
+    static void seed_hybrid(HttpServer& server,const ParsedRequest& req) {
+        auto prepared=server.prepare_hybrid_prompt(req);
+        hybrid::Entry entry;entry.slot=0;entry.position=2;entry.owner="owner";entry.primary=true;
+        entry.bytes=1024;entry.representation=prepared.representation;
+        server.hybrid_cache_.entries.push_back(entry);
+    }
+    static void process(HttpServer& server,ServerJob& job) {server.process_job(&job);}
+    static void finish_hybrid_capture(HttpServer& server,const ParsedRequest& req,bool cancelled) {
+        auto prepared=server.prepare_hybrid_prompt(req);
+        HttpServer::GenerationCacheState cache;cache.snap_slot=1;cache.snap_cut=1024;
+        cache.snap_prepared=true;cache.hybrid_capture_primary=true;
+        GenerateResult result;result.succeed();
+        server.finalize_generation_cache(req,prepared,cache,result,1,true,cancelled);
+    }
+
+    static PrefixCache & prefix_cache(HttpServer & server) {
+        return server.prefix_cache_;
+    }
+
+    static void enqueue(HttpServer & server, ServerJob * job) {
+        server.enqueue(job);
+    }
+
+    static void run(HttpServer & server, SeqEngine & engine) {
+        server.scheduler_loop(engine);
+    }
+
+    static void stop(HttpServer & server) {
+        server.stopping_.store(true, std::memory_order_relaxed);
+        server.queue_cv_.notify_all();
+    }
+
+    static void finalize_inline_snapshot(
+            HttpServer & server, const std::vector<int32_t> & prompt,
+            PrefixCache::InlineReservation reservation,
+            int slot, int requested_cut) {
+        ParsedRequest req;
+        req.prompt_tokens = prompt;
+        HttpServer::PreparedPrompt prepared;
+        prepared.tokens = prompt;
+        HttpServer::GenerationCacheState cache;
+        cache.snap_reservation = std::move(reservation);
+        cache.snap_slot = slot;
+        cache.snap_cut = requested_cut;
+        cache.snap_prepared = true;
+        GenerateResult result;
+        result.error.reset();
+        server.finalize_generation_cache(
+            req, prepared, cache, result,
+            /*completion_tokens=*/1,
+            /*visible_output_seen=*/true,
+            /*client_disconnected=*/false);
+    }
+
+    static const std::vector<int32_t> & slot_tokens(
+            const HttpServer & server, int slot) {
+        return server.slot_tokens_.at(slot);
+    }
+};
 }
 
 namespace {
@@ -103,11 +191,134 @@ struct ServerUnitFixture {};
     } \
 } while (0)
 
+// Device ordinals must not wrap when matching routing priority to placement.
+TEST_CASE(ServerUnitFixture, test_placement_device_rejects_gpu_index_overflow) {
+    DevicePlacement device;
+    TEST_ASSERT(parse_placement_device("hip:0", device));
+    TEST_ASSERT(parse_placement_device(
+        "hip:" + std::to_string(std::numeric_limits<int>::max()), device));
+    for (const char * value : {"hip:2147483648", "hip:4294967296",
+                              "hip:999999999999999999999999999999", "hip:-1"}) {
+        TEST_ASSERT(!parse_placement_device(value, device));
+    }
+    TEST_ASSERT(!parse_placement_device_list("hip:0,hip:4294967296", device));
+}
+
 TEST_CASE(ServerUnitFixture, test_api_format_names_are_total) {
     CHECK(std::string(api_format_name(ApiFormat::OPENAI_CHAT)) == "chat");
     CHECK(std::string(api_format_name(ApiFormat::ANTHROPIC)) == "anthropic");
     CHECK(std::string(api_format_name(ApiFormat::RESPONSES)) == "responses");
     CHECK(std::string(api_format_name(ApiFormat::COMPLETIONS)) == "completions");
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_scorer_uses_user_query_before_chat_suffix) {
+    const std::vector<int32_t> query{
+        90, 91, 100, 101, 102, 103, 104, 105, 106, 107,
+    };
+    const std::vector<int32_t> rendered{
+        1, 2, 100, 101, 102, 103, 104, 105, 106, 107,
+        200, 201, 100, 101, 102, 103, 104, 105, 106, 107,
+    };
+
+    const auto window = http_detail::find_pflash_query_window(
+        rendered, query, /*search_end=*/12);
+
+    TEST_ASSERT(window.valid());
+    TEST_ASSERT(window.tokens == 8);
+    TEST_ASSERT(window.end == 10);
+    TEST_ASSERT((int)rendered.size() - window.end == 10);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_scorer_accepts_responses_string_input) {
+    ToolMemory tool_memory;
+    const auto messages = normalize_chat_messages(
+        json("Which token is the answer?"), ApiFormat::RESPONSES, tool_memory);
+
+    TEST_ASSERT(
+        http_detail::pflash_user_query_text(messages) ==
+        "Which token is the answer?");
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_query_mapping_tolerates_one_bpe_boundary_token) {
+    const std::vector<int32_t> query{10, 11, 12, 13, 14, 15, 16, 17};
+    const std::vector<int32_t> rendered{
+        1, 2, 999, 11, 12, 13, 14, 15, 16, 17, 200, 201,
+    };
+
+    const auto window = http_detail::find_pflash_query_window(
+        rendered, query, /*search_end=*/10);
+
+    TEST_ASSERT(window.valid());
+    TEST_ASSERT(window.tokens == 7);
+    TEST_ASSERT(window.end == 10);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_query_mapping_rejects_weak_punctuation_match) {
+    const std::vector<int32_t> query{10, 11, 12, 13, 14, 15, 16, 17};
+    const std::vector<int32_t> rendered{1, 2, 15, 16, 17, 200, 201};
+    TEST_ASSERT(!http_detail::find_pflash_query_window(
+        rendered, query, /*search_end=*/7).valid());
+
+    const std::vector<int32_t> short_query{30, 31, 32};
+    const std::vector<int32_t> short_rendered{1, 30, 31, 32, 200};
+    const auto short_window =
+        http_detail::find_pflash_query_window(
+            short_rendered, short_query, /*search_end=*/4);
+    TEST_ASSERT(short_window.valid());
+    TEST_ASSERT(short_window.tokens == 3);
+    TEST_ASSERT(short_window.end == 4);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_score_validation_counts_nan_and_inf) {
+    const float values[]{
+        0.0f,
+        std::numeric_limits<float>::quiet_NaN(),
+        std::numeric_limits<float>::infinity(),
+        -std::numeric_limits<float>::infinity(),
+        1.0f,
+    };
+    TEST_ASSERT(count_nonfinite_scores(values, 5) == 3);
+    TEST_ASSERT(count_nonfinite_scores(values, 1) == 0);
+}
+
+TEST_CASE(ServerUnitFixture, test_qwen35_pflash_rejects_missing_query_window) {
+    DrafterContext ctx;
+    ctx.loaded = true;
+    ctx.arch = DrafterArch::Qwen35_0p8b;
+    const std::vector<int32_t> ids(16, 1);
+
+    const auto compressed = drafter_score_and_compress(
+        ctx, ids, 0.5f, /*chunk_size=*/32, /*n_lookahead=*/8,
+        /*pool_kernel=*/13, /*score_query_end=*/-1);
+
+    TEST_ASSERT(compressed.empty());
+    TEST_ASSERT(std::string(dflash27b_last_error()) ==
+                "qwen35 scorer query window out of range");
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_ipc_rejects_unsupported_query_widths) {
+    TEST_ASSERT(valid_pflash_score_query_tokens(1));
+    TEST_ASSERT(valid_pflash_score_query_tokens(8));
+    TEST_ASSERT(!valid_pflash_score_query_tokens(0));
+    TEST_ASSERT(!valid_pflash_score_query_tokens(9));
+    TEST_ASSERT(!valid_pflash_score_query_tokens(
+        (std::numeric_limits<int>::max)()));
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_query_capture_splits_across_chunks) {
+    const auto first = query_capture_slice(4093, 4101, 0, 4096);
+    TEST_ASSERT(first.valid());
+    TEST_ASSERT(first.chunk_offset == 4093);
+    TEST_ASSERT(first.query_offset == 0);
+    TEST_ASSERT(first.tokens == 3);
+
+    const auto second = query_capture_slice(4093, 4101, 4096, 4096);
+    TEST_ASSERT(second.valid());
+    TEST_ASSERT(second.chunk_offset == 0);
+    TEST_ASSERT(second.query_offset == 3);
+    TEST_ASSERT(second.tokens == 5);
+
+    TEST_ASSERT(!query_capture_slice(4093, 4101, 8192, 4096).valid());
 }
 
 TEST_CASE(ServerUnitFixture, test_daemon_io_external_cancellation_latches) {
@@ -326,6 +537,37 @@ static json read_tools() {
     });
 }
 
+static json qwen_read_probe_tools() {
+    return json::array({
+        {{"type", "function"},
+         {"function", {
+             {"name", "read_probe"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"filePath", {{"type", "string"}}},
+                     {"limit", {{"type", "integer"}}},
+                     {"content", {{"type", "string"}}}
+                 }},
+                 {"required", json::array({"filePath"})}
+             }}
+         }}}
+    });
+}
+
+static std::string qwen_read_probe_call(const std::string & eol) {
+    return "<tool_call>" + eol
+        + "<function=read_probe>" + eol
+        + "<parameter=filePath>" + eol
+        + "README.md" + eol
+        + "</parameter>" + eol
+        + "<parameter=limit>" + eol
+        + "10" + eol
+        + "</parameter>" + eol
+        + "</function>" + eol
+        + "</tool_call>";
+}
+
 static json read_and_bash_tools() {
     json tools = read_tools();
     tools.push_back(bash_tools()[0]);
@@ -502,6 +744,69 @@ TEST_CASE(ServerUnitFixture, test_reasoning_disabled) {
 // ═══════════════════════════════════════════════════════════════════════
 // Tool parser tests
 // ═══════════════════════════════════════════════════════════════════════
+
+TEST_CASE(ServerUnitFixture, test_parse_qwen_multiline_xml_parameters_lf) {
+    auto result = parse_tool_calls(qwen_read_probe_call("\n"),
+                                   qwen_read_probe_tools());
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "read_probe");
+        const auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["filePath"] == "README.md");
+        TEST_ASSERT(args["filePath"].is_string());
+        TEST_ASSERT(args["limit"].is_number_integer());
+        TEST_ASSERT(args["limit"] == 10);
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_qwen_multiline_xml_parameters_crlf) {
+    auto result = parse_tool_calls(qwen_read_probe_call("\r\n"),
+                                   qwen_read_probe_tools());
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        const auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["filePath"] == "README.md");
+        TEST_ASSERT(args["filePath"].get<std::string>().find('\r') ==
+                    std::string::npos);
+        TEST_ASSERT(args["limit"].is_number_integer());
+        TEST_ASSERT(args["limit"] == 10);
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_qwen_multiline_xml_string_value) {
+    const std::string text =
+        "<tool_call>\n"
+        "<function=read_probe>\n"
+        "<parameter=filePath>\n"
+        "README.md\n"
+        "</parameter>\n"
+        "<parameter=content>\n"
+        "line1\n"
+        "line2\n"
+        "</parameter>\n"
+        "</function>\n"
+        "</tool_call>";
+    auto result = parse_tool_calls(text, qwen_read_probe_tools());
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        const auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["content"] == "line1\nline2");
+        TEST_ASSERT(args["content"].get<std::string>().find('\r') ==
+                    std::string::npos);
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_qwen_multiline_xml_parameter_at_true_eof) {
+    const std::string text =
+        "<tool_call><function=read_probe>"
+        "<parameter=filePath>README.md</tool_call>";
+    auto result = parse_tool_calls(text, qwen_read_probe_tools());
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        const auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["filePath"] == "README.md");
+    }
+}
 
 TEST_CASE(ServerUnitFixture, test_parse_tool_call_xml) {
     std::string text =
@@ -2436,7 +2741,7 @@ static std::string write_deepseek_marker_tokenizer_fixture() {
     gguf_set_val_u32(g, "tokenizer.ggml.bos_token_id", 1);
     gguf_set_val_u32(g, "tokenizer.ggml.eos_token_id", 2);
 
-    const std::string path = "/tmp/dflash_test_deepseek_markers.gguf";
+    const std::string path = test_tmp_path("dflash_test_deepseek_markers.gguf").string();
     gguf_write_to_file(g, path.c_str(), /*only_meta=*/false);
     gguf_free(g);
     return path;
@@ -2464,7 +2769,129 @@ TEST_CASE(ServerUnitFixture, test_resolve_deepseek_chat_markers) {
     };
     TEST_ASSERT(find_all_boundaries(prompt, markers) ==
                 std::vector<int>({8}));
-    unlink(path.c_str());
+    remove_test_path(path);
+}
+
+
+TEST_CASE(ServerUnitFixture, test_session_cache_three_rolling_owners) {
+    const auto path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    PrefixCache cache(3, tokenizer, 1000, 80);
+    const std::vector<int32_t> prompt(30, 999);
+    const auto bytes = [](int n) { return (size_t)n; };
+    auto a = cache.reserve_inline_snap(prompt, 0, false, 0, -1, bytes, "a");
+    auto b = cache.reserve_inline_snap(prompt, 0, false, 0, -1, bytes, "b");
+    auto c = cache.reserve_inline_snap(prompt, 0, false, 0, -1, bytes, "c");
+    TEST_ASSERT(a.active() && b.active() && c.active());
+    const int sa = a.slot(), sb = b.slot(), sc = c.slot();
+    TEST_ASSERT(sa != sb && sa != sc && sb != sc);
+    TEST_ASSERT(!cache.reserve_inline_snap(prompt, 0, false, 0, -1, bytes, "a").active());
+    TEST_ASSERT(!cache.reserve_inline_snap(prompt, 0, false, 0, -1, bytes, "d").active());
+    TEST_ASSERT(c.commit(prompt, 29));
+    TEST_ASSERT(a.commit(prompt, 29));
+    TEST_ASSERT(b.commit(prompt, 29));
+    TEST_ASSERT(cache.lookup_candidate(prompt, 29, "a").first == sa);
+    TEST_ASSERT(cache.lookup_candidate(prompt, 29, "b").first == sb);
+    TEST_ASSERT(cache.lookup_candidate(prompt, 29, "c").first == sc);
+    TEST_ASSERT(cache.lookup_candidate(prompt, 29).first == -1);
+    TEST_ASSERT(cache.lookup_candidate(prompt, 29, "d").first == -1);
+    for (int n = 40; n <= 100; n += 10) {
+        const std::vector<int32_t> next(n, 999);
+        const int restored = cache.lookup_candidate(next, n - 1, "a").second;
+        auto r = cache.reserve_inline_snap(next, restored, false, 0, sa, bytes, "a");
+        if (restored == 80) { TEST_ASSERT(!r.active()); continue; }
+        TEST_ASSERT(r.active() && r.slot() == sa);
+        const int cut = r.target_cut();
+        TEST_ASSERT(cut == std::min(n - 1, 80));
+        TEST_ASSERT(r.commit(next, cut));
+        TEST_ASSERT(cache.stats().in_use == 3);
+        TEST_ASSERT(cache.stats().resident_bytes == (uint64_t)(cut + 58));
+        TEST_ASSERT(cache.lookup_candidate(prompt, 29, "b").first == sb);
+        TEST_ASSERT(cache.lookup_candidate(prompt, 29, "c").first == sc);
+    }
+    remove_test_path(path);
+}
+
+TEST_CASE(ServerUnitFixture, test_session_cache_cancel_abort_and_changed_history) {
+    const auto path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    PrefixCache cache(3, tokenizer, 1000, 80);
+    const auto bytes = [](int n) { return (size_t)n; };
+    const std::vector<int32_t> prompt(30, 999), changed(40, 998);
+    auto a = cache.reserve_inline_snap(prompt, 0, false, 0, -1, bytes, "a");
+    const int slot = a.slot();
+    TEST_ASSERT(a.commit(prompt, 29));
+    TEST_ASSERT(cache.lookup_candidate(changed, 39, "a").first == -1);
+    auto r = cache.reserve_inline_snap(changed, 0, false, 0, -1, bytes, "a");
+    TEST_ASSERT(r.active() && r.slot() == slot);
+    r.cancel();
+    TEST_ASSERT(cache.lookup_candidate(prompt, 29, "a").first == slot);
+    auto r2 = cache.reserve_inline_snap(changed, 0, false, 0, -1, bytes, "a");
+    TEST_ASSERT(r2.commit(changed, 39));
+    TEST_ASSERT(cache.lookup_candidate(prompt, 29, "a").first == -1);
+    TEST_ASSERT(cache.lookup_candidate(changed, 39, "a").first == slot);
+    auto b = cache.reserve_inline_snap(prompt, 0, false, 0, -1, bytes, "b");
+    auto r3 = cache.reserve_inline_snap(prompt, 0, false, 0, -1, bytes, "a");
+    r3.abort();
+    TEST_ASSERT(b.active());
+    TEST_ASSERT(cache.lookup_candidate(changed, 39, "a").first == -1);
+    TEST_ASSERT(b.commit(prompt, 29));
+    TEST_ASSERT(cache.stats().resident_bytes == 29);
+    TEST_ASSERT(!cache.reserve_inline_snap(prompt, 0, false, 0, -1, bytes).active());
+    remove_test_path(path);
+}
+
+TEST_CASE(ServerUnitFixture, test_session_cache_reserves_atomic_replacement_memory) {
+    const auto path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    PrefixCache cache(3, tokenizer, 130, 80);
+    const auto bytes = [](int n) { return (size_t)n; };
+    const std::vector<int32_t> prompt(31, 999), next(41, 999), larger(51, 999);
+    for (const auto & owner : {"a", "b", "c"}) {
+        auto r = cache.reserve_inline_snap(prompt, 0, false, 0, -1, bytes, owner);
+        TEST_ASSERT(r.commit(prompt, 30));
+    }
+    // 90 resident + 10 growth + 30 old retained during atomic swap = 130.
+    auto a = cache.reserve_inline_snap(next, 30, false, 0, 0, bytes, "a");
+    TEST_ASSERT(a.active());
+    // A second growing replacement would require 140, so only B is skipped.
+    TEST_ASSERT(!cache.reserve_inline_snap(next, 30, false, 0, 1, bytes, "b").active());
+    TEST_ASSERT(cache.lookup_candidate(prompt, 30, "b").second == 30);
+    a.cancel();
+    TEST_ASSERT(!cache.reserve_inline_snap(larger, 30, false, 0, 0, bytes, "a").active());
+    TEST_ASSERT(cache.stats().in_use == 3 && cache.stats().resident_bytes == 90);
+    auto b = cache.reserve_inline_snap(next, 30, false, 0, 1, bytes, "b");
+    TEST_ASSERT(b.commit(next, 40));
+    TEST_ASSERT(cache.stats().resident_bytes == 100);
+    remove_test_path(path);
+}
+
+TEST_CASE(ServerUnitFixture, test_session_cache_parallel_reservations_and_invalidation) {
+    const auto path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    PrefixCache cache(3, tokenizer, 150, 80);
+    const auto bytes = [](int n) { return (size_t)n; };
+    const std::vector<int32_t> prompt(31, 999), next(41, 999);
+    for (const auto & owner : {"a", "b", "c"}) {
+        auto r = cache.reserve_inline_snap(prompt, 0, false, 0, -1, bytes, owner);
+        TEST_ASSERT(r.commit(prompt, 30));
+    }
+    auto a = cache.reserve_inline_snap(next, 30, false, 0, 0, bytes, "a");
+    auto b = cache.reserve_inline_snap(next, 30, false, 0, 1, bytes, "b");
+    auto c = cache.reserve_inline_snap(next, 30, false, 0, 2, bytes, "c");
+    TEST_ASSERT(a.active() && b.active() && c.active());
+    cache.invalidate_inline_snap(a.slot());
+    TEST_ASSERT(a.active() && b.active() && c.active());
+    TEST_ASSERT(c.commit(next, 40));
+    TEST_ASSERT(a.commit(next, 40));
+    TEST_ASSERT(b.commit(next, 40));
+    TEST_ASSERT(cache.stats().resident_bytes == 120);
+    TEST_ASSERT(cache.stats().in_use == 3);
+    remove_test_path(path);
 }
 
 TEST_CASE(ServerUnitFixture, test_prefix_cache_reserves_disk_staging_slot) {
@@ -2475,6 +2902,144 @@ TEST_CASE(ServerUnitFixture, test_prefix_cache_reserves_disk_staging_slot) {
     PrefixCache cache(PrefixCache::MAX_SLOTS, tokenizer);
     TEST_ASSERT(cache.stats().capacity == PrefixCache::MAX_CACHE_SLOTS);
     TEST_ASSERT(PrefixCache::MAX_CACHE_SLOTS == ModelBackend::kMaxSlots - 1);
+
+    remove_test_path(path);
+}
+
+TEST_CASE(ServerUnitFixture, test_prefix_cache_records_only_validated_restore) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    PrefixCache cache(2, tokenizer);
+    const std::vector<int32_t> prompt = {
+        1, 100, 3, 101, 4, 102, 2, 3, 103, 4,
+    };
+    cache.confirm_inline_snap(0, 8, prompt);
+    cache.confirm_inline_snap(1, 10, prompt);
+
+    const auto candidate = cache.lookup_candidate(
+        prompt, (int)prompt.size() - 1);
+    TEST_ASSERT(candidate.first == 0);
+    TEST_ASSERT(candidate.second == 8);
+    TEST_ASSERT(cache.stats().lifetime_hits == 0);
+
+    cache.record_inline_hit(
+        candidate.first, candidate.second, prompt.size());
+    TEST_ASSERT(cache.stats().lifetime_hits == 1);
+
+    // The classic path still accepts/counts an exact snapshot. Concurrent
+    // admission requests a strict prefix because snapshots do not store the
+    // next-token logits required for an empty suffix.
+    const auto exact = cache.lookup(prompt);
+    TEST_ASSERT(exact.first == 1);
+    TEST_ASSERT(exact.second == 10);
+    TEST_ASSERT(cache.stats().lifetime_hits == 2);
+
+    unlink(path.c_str());
+}
+
+TEST_CASE(ServerUnitFixture, test_restore_invalidation_preserves_pending_pin) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    PrefixCache cache(2, tokenizer);
+    const std::vector<int32_t> first = {1, 100};
+    const std::vector<int32_t> stale = {1, 200};
+    const std::vector<int32_t> pinned = {1, 300};
+    const std::vector<int32_t> replacement = {1, 400};
+    const std::vector<int32_t> next = {1, 500};
+    cache.confirm_inline_snap(0, 2, first);
+    cache.confirm_inline_snap(1, 2, stale);
+
+    // Reserve the oldest slot for a protected tool-prefix capture, then
+    // invalidate an unrelated restore while that reservation is in flight.
+    auto prepared = cache.reserve_inline_snap(
+        pinned, /*restored_prefix_len=*/0,
+        /*prefer_tools_boundary=*/true, /*forced_cut=*/2);
+    TEST_ASSERT(prepared.slot() == 0);
+    TEST_ASSERT(prepared.target_cut() == 2);
+    auto blocked = cache.reserve_inline_snap(
+        next, /*restored_prefix_len=*/0,
+        /*prefer_tools_boundary=*/false, /*forced_cut=*/2);
+    TEST_ASSERT(!blocked.active());
+    cache.invalidate_inline_snap(/*slot=*/1);
+    TEST_ASSERT(prepared.commit(pinned));
+
+    // Refill the unrelated slot. The next eviction must choose this
+    // unprotected entry, proving invalidation did not clear the pending pin.
+    cache.confirm_inline_snap(1, 2, replacement);
+    auto victim = cache.reserve_inline_snap(
+        next, /*restored_prefix_len=*/0,
+        /*prefer_tools_boundary=*/false, /*forced_cut=*/2);
+    TEST_ASSERT(victim.slot() == 1);
+    TEST_ASSERT(victim.target_cut() == 2);
+    victim.cancel();
+
+    unlink(path.c_str());
+}
+
+TEST_CASE(ServerUnitFixture, test_prefix_cache_resident_budget_and_stall_stats) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    PrefixCache cache(3, tokenizer, /*max_resident_bytes=*/300);
+    const std::vector<int32_t> pinned = {1, 100};
+    const std::vector<int32_t> ordinary = {1, 200};
+    const std::vector<int32_t> replacement = {1, 300};
+    const std::vector<int32_t> oversized = {1, 400};
+
+    auto prepared = cache.reserve_inline_snap(
+        pinned, 0, /*prefer_tools_boundary=*/true, /*forced_cut=*/2,
+        /*restore_source_slot=*/-1,
+        [](int) { return 100; });
+    TEST_ASSERT(prepared.slot() == 0);
+    TEST_ASSERT(prepared.commit(pinned, /*resident_bytes=*/100));
+
+    prepared = cache.reserve_inline_snap(
+        ordinary, 0, /*prefer_tools_boundary=*/false, /*forced_cut=*/2,
+        /*restore_source_slot=*/-1,
+        [](int) { return 100; });
+    TEST_ASSERT(prepared.slot() == 1);
+    TEST_ASSERT(prepared.commit(ordinary, /*resident_bytes=*/100));
+
+    // A third slot exists, but its 150-byte checkpoint would exceed the
+    // resident ceiling. Replace the oldest unprotected leaf (slot 1) while
+    // preserving the protected tools pin in slot 0.
+    prepared = cache.reserve_inline_snap(
+        replacement, 0, /*prefer_tools_boundary=*/false, /*forced_cut=*/2,
+        /*restore_source_slot=*/-1,
+        [](int) { return 150; });
+    TEST_ASSERT(prepared.slot() == 1);
+    TEST_ASSERT(prepared.commit(replacement, /*resident_bytes=*/150));
+
+    auto stats = cache.stats();
+    TEST_ASSERT(stats.in_use == 2);
+    TEST_ASSERT(stats.max_resident_bytes == 300);
+    TEST_ASSERT(stats.resident_bytes == 250);
+    TEST_ASSERT(cache.lookup(pinned).first == 0);
+
+    prepared = cache.reserve_inline_snap(
+        oversized, 0, /*prefer_tools_boundary=*/false, /*forced_cut=*/2,
+        /*restore_source_slot=*/-1,
+        [](int) { return 301; });
+    TEST_ASSERT(!prepared.active());
+    cache.record_capture_attempt(/*elapsed_us=*/1500, /*success=*/false);
+    cache.record_restore_attempt(/*elapsed_us=*/2500, /*restored=*/false);
+    stats = cache.stats();
+    TEST_ASSERT(stats.in_use == 2);
+    TEST_ASSERT(stats.resident_bytes == 250);
+    TEST_ASSERT(stats.budget_skips == 1);
+    TEST_ASSERT(stats.capture_attempts == 1);
+    TEST_ASSERT(stats.capture_failures == 1);
+    TEST_ASSERT(stats.capture_stall_us_total == 1500);
+    TEST_ASSERT(stats.capture_stall_us_max == 1500);
+    TEST_ASSERT(stats.restore_attempts == 1);
+    TEST_ASSERT(stats.restore_invalidations == 1);
+    TEST_ASSERT(stats.restore_stall_us_total == 2500);
+    TEST_ASSERT(stats.restore_stall_us_max == 2500);
 
     unlink(path.c_str());
 }
@@ -2549,6 +3114,64 @@ TEST_CASE(ServerUnitFixture, test_find_boundaries_empty) {
     TEST_ASSERT(bounds.empty());
 }
 
+// Boundary detection with and without a system message. Qwen-shaped
+// synthetic markers: {100,200} = "<im_start>system", {101} = "<im_end>",
+// {100} = "<im_start>" as the next-role start.
+static ChatMarkers make_qwen_boundary_markers_for_test() {
+    ChatMarkers markers;
+    markers.family = "qwen";
+    markers.sys_role_prefix = {100, 200};
+    markers.end_msg_seqs = {{101}};
+    markers.next_role_starts = {{100}};
+    return markers;
+}
+
+TEST_CASE(ServerUnitFixture, test_find_boundaries_qwen_system_first) {
+    auto markers = make_qwen_boundary_markers_for_test();
+    // <im_start> system ... <im_end> <im_start> user ... <im_end> <im_start> assistant ...
+    std::vector<int32_t> ids = {
+        100, 200, 10, 11, 101,
+        100, 201, 12, 13, 101,
+        100, 202, 14,
+    };
+    auto bounds = find_all_boundaries(ids, markers);
+    TEST_ASSERT(bounds.size() == 2);
+    TEST_ASSERT(bounds[0] == 6);
+    TEST_ASSERT(bounds[1] == 11);
+}
+
+TEST_CASE(ServerUnitFixture, test_find_boundaries_qwen_user_first_quoted_system) {
+    auto markers = make_qwen_boundary_markers_for_test();
+    // User-first prompt whose second message quotes a literal system prefix
+    // ({100,200}) in its content. The leading user role must still anchor the
+    // boundaries; the quoted prefix is just content.
+    std::vector<int32_t> ids = {
+        100, 201, 10, 11, 101,
+        100, 202, 100, 200, 12, 101,
+        100, 201, 14,
+    };
+    auto bounds = find_all_boundaries(ids, markers);
+    TEST_ASSERT(bounds.size() == 2);
+    TEST_ASSERT(bounds[0] == 6);
+    TEST_ASSERT(bounds[1] == 12);
+}
+
+TEST_CASE(ServerUnitFixture, test_find_boundaries_qwen_user_first) {
+    auto markers = make_qwen_boundary_markers_for_test();
+    // No system message: <im_start> user ... <im_end> <im_start> assistant
+    // ... <im_end> <im_start> user ... must still yield the role boundaries
+    // instead of an empty list (which disabled the prefix cache entirely).
+    std::vector<int32_t> ids = {
+        100, 201, 10, 11, 101,
+        100, 202, 12, 13, 101,
+        100, 201, 14,
+    };
+    auto bounds = find_all_boundaries(ids, markers);
+    TEST_ASSERT(bounds.size() == 2);
+    TEST_ASSERT(bounds[0] == 6);
+    TEST_ASSERT(bounds[1] == 11);
+}
+
 TEST_CASE(ServerUnitFixture, test_tool_schema_is_part_of_stable_system_boundary) {
     // Synthetic Qwen-shaped prompt:
     //   <system> TOOL_SCHEMA </system> <user> question </user> <assistant>
@@ -2585,6 +3208,58 @@ TEST_CASE(ServerUnitFixture, test_tool_schema_is_part_of_stable_system_boundary)
                 hash_prefix(prompt_new_user.data(), system_end));
     TEST_ASSERT(hash_prefix(prompt_a.data(), system_end) !=
                 hash_prefix(prompt_new_tools.data(), system_end));
+}
+
+TEST_CASE(ServerUnitFixture, test_find_boundaries_stray_end_msg_does_not_truncate) {
+    // A lone end-of-message marker embedded in message content (file dumps,
+    // terminal output, model-echoed chatml) must not truncate the boundary
+    // walk. Before the fix, the first stray \n with no role start within 5
+    // tokens cut the scan off, hiding every real boundary after it and pinning
+    // the inline-snapshot deepen target at the already-restored prefix length.
+    //
+    // Layout (qwen-shaped synthetic markers):
+    //   10=<|im_start|>  11="system"  12=<|im_end|>
+    //   idx: 0:10 1:11 2:100 3:12 4:10 5:20 6:200 7:12(stray) 8:600 9:601
+    //         10:602 11:603 12:604 13:12 14:10 15:30 16:300 17:12 18:10 19:40 20:400
+    // The stray 12 at idx 7 has five content tokens before the next real <|im_end|>
+    // (idx 13), so its 5-token window holds no <|im_start|>.
+    ChatMarkers markers;
+    markers.family = "qwen";
+    markers.sys_role_prefix = {10, 11};
+    markers.end_msg_seqs = {{12}};
+    markers.next_role_starts = {{10}};
+
+    const std::vector<int32_t> prompt = {
+        10, 11, 100, 12, 10, 20, 200,
+        12,             // stray <|im_end|> in user content
+        600, 601, 602, 603, 604,
+        12,             // real end of the user message
+        10, 30, 300, 12, 10, 40, 400,
+    };
+
+    const auto bounds = find_all_boundaries(prompt, markers);
+    // Real boundaries after the stray (assistant start = 15, final user start =
+    // 19) must be found; the stable system head (5) is unchanged.
+    TEST_ASSERT(bounds == (std::vector<int>{5, 15, 19}));
+    TEST_ASSERT(bounds.front() == 5);
+}
+
+TEST_CASE(ServerUnitFixture, test_find_boundaries_clean_prompt_unchanged) {
+    // A clean prompt (no stray markers) must produce the identical boundary
+    // list as before the fix — the stray-skip path must never alter correct
+    // prompts.
+    ChatMarkers markers;
+    markers.family = "qwen";
+    markers.sys_role_prefix = {10, 11};
+    markers.end_msg_seqs = {{12}};
+    markers.next_role_starts = {{10}};
+
+    //  system content  user content  assistant content  user2
+    const std::vector<int32_t> prompt = {
+        10, 11, 100, 101, 12, 10, 20, 200, 12, 10, 30, 300, 12, 10, 40,
+    };
+    const auto bounds = find_all_boundaries(prompt, markers);
+    TEST_ASSERT(bounds == (std::vector<int>{6, 10, 14}));
 }
 
 TEST_CASE(ServerUnitFixture, test_inline_snapshot_boundary_advances_past_restore) {
@@ -2844,6 +3519,207 @@ TEST_CASE(ServerUnitFixture, test_evict_all_protected_falls_back) {
     std::vector<std::vector<int32_t>> ids = {{1, 1}, {2, 2}};
     std::vector<bool> protect = {true, true};
     TEST_ASSERT(select_inline_evict_victim(ids, &protect) == 0);
+}
+
+// ── Restore-source-aware eviction (prefix-cache slide) ─────────────────
+
+// (a) Linear chain at capacity: the new snapshot must land in a different
+// slot than the restore source, so the restore point can slide forward past
+// the deepest slot.
+TEST_CASE(ServerUnitFixture, test_slide_evicts_ancestor_not_restore_source) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    PrefixCache cache(4, tokenizer);
+    TEST_ASSERT(!cache.disabled());
+
+    // Linear chain: each prompt strictly extends the previous one.
+    std::vector<int32_t> p1 = {1, 100, 4, 101};
+    std::vector<int32_t> p2 = p1;
+    p2.insert(p2.end(), {3, 102});
+    std::vector<int32_t> p3 = p2;
+    p3.insert(p3.end(), {4, 103});
+    std::vector<int32_t> p4 = p3;
+    p4.insert(p4.end(), {3, 104});
+
+    auto fill = [&](const std::vector<int32_t> & p) {
+        auto prepared = cache.reserve_inline_snap(
+            p, 0, false, (int) p.size());
+        TEST_ASSERT(prepared.active());
+        TEST_ASSERT(prepared.target_cut() == (int) p.size());
+        const int slot = prepared.slot();
+        TEST_ASSERT(prepared.commit(p));
+        return slot;
+    };
+    const int s1 = fill(p1);
+    const int s2 = fill(p2);
+    const int s3 = fill(p3);
+    const int s4 = fill(p4);
+    TEST_ASSERT(s1 != s2 && s2 != s3 && s3 != s4 && s4 != s1);
+    TEST_ASSERT(s4 == 3);  // deepest slot, like the BUG.md repro
+
+    // Turn 5: restore from the deepest slot and extend the conversation.
+    std::vector<int32_t> p5 = p4;
+    p5.insert(p5.end(), {3, 105});
+    const auto hit = cache.lookup(p5);
+    TEST_ASSERT(hit.first == s4 && hit.second == (int) p4.size());
+
+    auto snap = cache.reserve_inline_snap(
+        p5, hit.second, false, (int) p5.size(), hit.first);
+    TEST_ASSERT(snap.active());
+    const int snap_slot = snap.slot();
+    TEST_ASSERT(snap_slot != s4);  // different slot: the restore source
+                                   // was not the victim
+    TEST_ASSERT(snap.target_cut() == (int) p5.size());
+    TEST_ASSERT(snap.commit(p5));
+
+    // The restore point slid forward: the new, deeper prefix now matches.
+    const auto after = cache.lookup(p5);
+    TEST_ASSERT(after.first == snap_slot);
+    TEST_ASSERT(after.second == (int) p5.size());
+    // The old deepest entry survived the eviction.
+    std::vector<int32_t> p4b = p4;
+    p4b.insert(p4b.end(), {7, 7});
+    const auto kept = cache.lookup(p4b);
+    TEST_ASSERT(kept.first == s4 && kept.second == (int) p4.size());
+    TEST_ASSERT(cache.stats().in_use == 4);
+    unlink(path.c_str());
+}
+
+// (b) The in-flight restore source is never the eviction victim, at any LRU
+// position, whether it is the only leaf (linear chain) or not.
+TEST_CASE(ServerUnitFixture, test_slide_restore_source_never_evicted) {
+    std::vector<std::vector<int32_t>> ids = {
+        {9}, {9, 1}, {9, 1, 2}, {9, 1, 2, 3},
+    };
+    for (int skip = 0; skip < 4; ++skip) {
+        const int victim = select_inline_evict_victim(ids, nullptr, skip);
+        TEST_ASSERT(victim >= 0 && victim != skip);
+    }
+    // Linear chain whose only leaf is the restore source: evict the
+    // shallowest unprotected ancestor instead of cancelling everything.
+    TEST_ASSERT(select_inline_evict_victim(ids, nullptr, 3) == 0);
+    // With a free leaf the usual leaf preference still applies.
+    TEST_ASSERT(select_inline_evict_victim(ids, nullptr, 0) == 3);
+}
+
+// (c) The protected tools pin is never evicted, even when it is the
+// shallowest ancestor and the only other entry besides the restore source.
+TEST_CASE(ServerUnitFixture, test_slide_protected_pin_never_evicted) {
+    std::vector<std::vector<int32_t>> ids = {
+        {9}, {9, 1}, {9, 1, 2}, {9, 1, 2, 3},
+    };
+    std::vector<bool> protect = {true, false, false, false};
+    TEST_ASSERT(select_inline_evict_victim(ids, &protect, 3) == 1);
+
+    // Only the protected pin and the restore source remain: no safe victim,
+    // so no snapshot is reserved instead of destroying the pin.
+    std::vector<std::vector<int32_t>> two = {{9}, {9, 1}};
+    std::vector<bool> two_prot = {true, false};
+    TEST_ASSERT(select_inline_evict_victim(two, &two_prot, 1) == -1);
+
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    PrefixCache cache(2, tokenizer);
+    TEST_ASSERT(!cache.disabled());
+
+    std::vector<int32_t> pin = {1, 100, 4, 101};
+    std::vector<int32_t> deep = pin;
+    deep.insert(deep.end(), {3, 102});
+    auto prepared = cache.reserve_inline_snap(pin, 0, true, (int) pin.size());
+    TEST_ASSERT(prepared.slot() == 0);
+    TEST_ASSERT(prepared.commit(pin, 0, true));
+    prepared = cache.reserve_inline_snap(deep, 0, false, (int) deep.size());
+    TEST_ASSERT(prepared.slot() == 1);
+    TEST_ASSERT(prepared.commit(deep));
+
+    std::vector<int32_t> deeper = deep;
+    deeper.insert(deeper.end(), {4, 103});
+    const auto hit = cache.lookup(deeper);
+    TEST_ASSERT(hit.first == 1 && hit.second == (int) deep.size());
+    // At capacity the only other entry is the protected pin: refuse rather
+    // than evict it.
+    auto refused = cache.reserve_inline_snap(
+        deeper, hit.second, false, (int) deeper.size(), hit.first);
+    TEST_ASSERT(!refused.active());
+    const auto kept = cache.lookup(deep);
+    TEST_ASSERT(kept.first == 1 && kept.second == (int) deep.size());
+    TEST_ASSERT(cache.stats().in_use == 2);
+    unlink(path.c_str());
+}
+
+// (d) Branching conversations are unchanged: with two leaves, the oldest
+// non-restore-source leaf is still the victim.
+TEST_CASE(ServerUnitFixture, test_slide_branching_oldest_leaf_unchanged) {
+    // [9] is a shared root; leaves are idx 1 ([9,1]) and idx 2 ([9,2]).
+    std::vector<std::vector<int32_t>> ids = {{9}, {9, 1}, {9, 2}};
+    TEST_ASSERT(select_inline_evict_victim(ids) == 1);  // original behavior
+    // Restore source is the newer leaf: the older leaf is still the victim.
+    TEST_ASSERT(select_inline_evict_victim(ids, nullptr, 2) == 1);
+    // Restore source is the older leaf: the remaining leaf is the victim.
+    TEST_ASSERT(select_inline_evict_victim(ids, nullptr, 1) == 2);
+    // A protected leaf is never evicted: with the restore source skipped and
+    // the only remaining leaf protected, the shallowest unprotected ancestor
+    // is the victim instead.
+    std::vector<bool> protect = {false, true, false};
+    TEST_ASSERT(select_inline_evict_victim(ids, &protect, 2) == 0);
+}
+
+// (e) Free-slot path (not at capacity) must skip the restore source too, so
+// the http_server / agent-replay guards do not cancel the reservation and the
+// restore point can advance.
+TEST_CASE(ServerUnitFixture, test_slide_free_slot_skips_restore_source) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    PrefixCache cache(4, tokenizer);
+    TEST_ASSERT(!cache.disabled());
+
+    // Two entries with cap 4: vacancy exists, so reserve_inline_snap takes
+    // the free-slot path. Round-robin has next_slot_ at 2.
+    std::vector<int32_t> p1 = {1, 100, 4, 101};
+    std::vector<int32_t> p2 = p1;
+    p2.insert(p2.end(), {3, 102});
+
+    auto fill = [&](const std::vector<int32_t> & p) {
+        auto prepared = cache.reserve_inline_snap(
+            p, 0, false, (int) p.size());
+        TEST_ASSERT(prepared.active());
+        TEST_ASSERT(prepared.target_cut() == (int) p.size());
+        const int slot = prepared.slot();
+        TEST_ASSERT(prepared.commit(p));
+        return slot;
+    };
+    const int s1 = fill(p1);  // slot 0
+    const int s2 = fill(p2);  // slot 1
+    TEST_ASSERT(s1 == 0 && s2 == 1);
+
+    // Drive the round-robin so next_slot_ lands exactly on s2 (the restore
+    // source we will pass in). Three abort-burn steps from slot 2 → 3 → 0 → 1.
+    for (int i = 0; i < 3; ++i) {
+        std::vector<int32_t> scratch = p2;
+        scratch.push_back(7);
+        scratch.push_back(7 + i);
+        auto prep = cache.reserve_inline_snap(
+            scratch, 0, false, (int) scratch.size());
+        TEST_ASSERT(prep.active());
+        // Burn the round-robin step without committing an entry.
+        prep.cancel();
+    }
+
+    // Restore source is s2 = 1. Free slots are 2 and 3. The next free-slot
+    // allocation must skip s2 (== 1) and pick a non-restore slot.
+    std::vector<int32_t> p3 = p2;
+    p3.insert(p3.end(), {4, 103});
+    const auto hit = cache.lookup(p3);
+    TEST_ASSERT(hit.first == s2);
+    auto snap = cache.reserve_inline_snap(
+        p3, hit.second, false, (int) p3.size(), hit.first);
+    TEST_ASSERT(snap.active());
+    TEST_ASSERT(snap.slot() != hit.first);
+    snap.cancel();
+    unlink(path.c_str());
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -4291,8 +5167,9 @@ TEST_CASE(ServerUnitFixture, test_layer_split_backend_cancels_between_prefill_ch
 }
 
 TEST_CASE(ServerUnitFixture, test_layer_split_compress_nopark_uses_default_drafter_path) {
-    const std::string ids_path = "/tmp/dflash_test_layer_split_compress_ids.bin";
-    unlink(ids_path.c_str());
+    const std::string ids_path = test_tmp_path(
+        "dflash_test_layer_split_compress_ids.bin").string();
+    remove_test_path(ids_path);
     TEST_ASSERT(write_int32_file(ids_path, {1, 2, 3, 4}));
 
     auto * raw = new MockLayerSplitAdapter();
@@ -4307,12 +5184,13 @@ TEST_CASE(ServerUnitFixture, test_layer_split_compress_nopark_uses_default_draft
     TEST_ASSERT(raw->last_compress_req.drafter_path ==
                 "/tmp/default-layer-split-drafter.gguf");
 
-    unlink(ids_path.c_str());
+    remove_test_path(ids_path);
 }
 
 TEST_CASE(ServerUnitFixture, test_layer_split_compress_rejects_bad_keep_ratio) {
-    const std::string ids_path = "/tmp/dflash_test_layer_split_compress_bad.bin";
-    unlink(ids_path.c_str());
+    const std::string ids_path = test_tmp_path(
+        "dflash_test_layer_split_compress_bad.bin").string();
+    remove_test_path(ids_path);
     TEST_ASSERT(write_int32_file(ids_path, {1, 2, 3, 4}));
 
     auto * raw = new MockLayerSplitAdapter();
@@ -4323,7 +5201,7 @@ TEST_CASE(ServerUnitFixture, test_layer_split_compress_rejects_bad_keep_ratio) {
     TEST_ASSERT(!backend.handle_compress(cmd, io));
     TEST_ASSERT(raw->last_compress_req.input_ids.empty());
 
-    unlink(ids_path.c_str());
+    remove_test_path(ids_path);
 }
 
 TEST_CASE(ServerUnitFixture, test_layer_split_backend_shutdown_is_idempotent) {
@@ -4366,6 +5244,486 @@ struct MockBackend : ModelBackend {
     void free_drafter() override {}
     void shutdown() override {}
 };
+
+struct ShortInlineSnapshotBackend : MockBackend {
+    int saved_slot = -1;
+    int saved_position = 0;
+
+    bool snapshot_used(int slot) const override {
+        return slot == saved_slot && saved_position > 0;
+    }
+    int snapshot_cur_pos(int slot) const override {
+        return snapshot_used(slot) ? saved_position : 0;
+    }
+};
+
+TEST_CASE(ServerUnitFixture,
+          test_inline_snapshot_finalization_uses_actual_saved_position) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    ShortInlineSnapshotBackend backend;
+    ServerConfig config;
+    config.prefix_cache_cap = 2;
+    HttpServer server(backend, tokenizer, config);
+    PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
+    const std::vector<int32_t> prompt = {1, 100, 3, 101};
+    auto reservation = cache.reserve_inline_snap(
+        prompt, /*restored_prefix_len=*/0,
+        /*prefer_tools_boundary=*/false, /*forced_cut=*/4);
+    TEST_ASSERT(reservation.active());
+    TEST_ASSERT(reservation.target_cut() == 4);
+
+    backend.saved_slot = reservation.slot();
+    backend.saved_position = 3;
+    SchedulerTestHarness::finalize_inline_snapshot(
+        server, prompt, std::move(reservation), backend.saved_slot,
+        /*requested_cut=*/4);
+
+    const auto hit = cache.lookup(prompt);
+    TEST_ASSERT(hit.first == backend.saved_slot);
+    TEST_ASSERT(hit.second == backend.saved_position);
+    TEST_ASSERT(SchedulerTestHarness::slot_tokens(
+                    server, backend.saved_slot) ==
+                std::vector<int32_t>(prompt.begin(), prompt.begin() + 3));
+
+    unlink(path.c_str());
+}
+
+#if !defined(_WIN32)
+class SchedulerPrefixEngine final : public SeqEngine {
+public:
+    SchedulerPrefixEngine() : slots_(2) {}
+
+    int slot_count() const override { return (int)slots_.size(); }
+    int max_context() const override { return 64; }
+    bool supports_prefix_store() const override { return true; }
+    size_t estimate_prefix_store_bytes(int) const override { return 256; }
+    bool token_is_eos(int32_t token) const override { return token == 2; }
+    StepPlanLimits step_plan_limits(int) const override {
+        return {/*max_prefill_sequences=*/2,
+                /*max_prefill_tokens_per_sequence=*/64,
+                /*max_prefill_tokens_total=*/128,
+                /*prefill_allocation_quantum=*/64};
+    }
+
+    AdmitResult admit(
+            uint64_t request_id,
+            const std::vector<int32_t> & prompt,
+            const SamplerCfg & sampler) override {
+        return admit_with_prefix(
+            request_id, prompt, sampler, PrefixStorePlan{});
+    }
+
+    AdmitResult admit_with_prefix(
+            uint64_t,
+            const std::vector<int32_t> & prompt,
+            const SamplerCfg &,
+            const PrefixStorePlan & plan) override {
+        AdmitResult result;
+        if (prompt.empty()) {
+            result.error = "empty prompt";
+            return result;
+        }
+        if (defer_restore.load(std::memory_order_relaxed) &&
+            plan.restore.valid()) {
+            returned_busy_before_restore.store(true, std::memory_order_relaxed);
+            result.status = AdmitResult::Status::busy;
+            result.error = "restore admission deferred";
+            return result;
+        }
+        int chosen = -1;
+        for (int i = 0; i < (int)slots_.size(); ++i) {
+            if (!slots_[(size_t)i].active) {
+                chosen = i;
+                break;
+            }
+        }
+        if (chosen < 0) {
+            result.status = AdmitResult::Status::busy;
+            result.error = "all slots live";
+            return result;
+        }
+
+        Slot & slot = slots_[(size_t)chosen];
+        slot.active = true;
+        slot.prefilling = true;
+        slot.capture = {};
+        result.status = AdmitResult::Status::admitted;
+        result.slot = chosen;
+
+        if (plan.restore.valid()) {
+            result.prefix_store.restore_attempted = true;
+            result.prefix_store.restore_elapsed_us = 2500;
+            if (unrequested_restore.load(std::memory_order_relaxed)) {
+                result.prefix_store.restored = {
+                    plan.restore.id + 1, plan.restore.tokens};
+            } else if (malformed_restore.load(std::memory_order_relaxed)) {
+                result.prefix_store.restored = {plan.restore.id, 0};
+            } else if (plan.restore == PrefixStoreRef{2, 2}) {
+                saw_stale_restore = true;
+                discarded.push_back(plan.restore);
+                result.prefix_store.invalidated = plan.restore;
+            } else {
+                result.prefix_store.restored = plan.restore;
+            }
+        }
+        if (!result.prefix_store.invalidated.valid() &&
+            plan.capture.valid()) {
+            saw_capture = true;
+            slot.capture = plan.capture;
+            result.prefix_store.capture = plan.capture;
+        }
+        return result;
+    }
+
+    StepResult step(const StepPlan & plan) override {
+        StepResult result;
+        for (const StepInput & input : plan.decode) {
+            result.decode.push_back({input.slot, 2, false, {}});
+        }
+        for (const PrefillSlice & slice : plan.prefills) {
+            if (slice.slot < 0 || slice.slot >= (int)slots_.size() ||
+                !slots_[(size_t)slice.slot].active ||
+                !slots_[(size_t)slice.slot].prefilling) {
+                result.error = "invalid prefill";
+                result.prefills.clear();
+                result.decode.clear();
+                return result;
+            }
+            Slot & slot = slots_[(size_t)slice.slot];
+            slot.prefilling = false;
+            PrefillOutput output;
+            output.slot = slice.slot;
+            output.status = PrefillOutput::Status::completed;
+            output.token = 2;
+            if (slot.capture.valid()) {
+                output.prefix_store.status = PrefixStoreEvent::Status::saved;
+                output.prefix_store.ticket = slot.capture;
+                output.prefix_store.bytes = 256;
+                output.prefix_store.elapsed_us = 1500;
+                slot.capture = {};
+            }
+            result.prefills.push_back(std::move(output));
+        }
+        return result;
+    }
+
+    void retire(int slot) override {
+        if (slot >= 0 && slot < (int)slots_.size()) {
+            slots_[(size_t)slot] = Slot{};
+        }
+    }
+
+    void discard_prefix_store(PrefixStoreRef checkpoint) override {
+        discarded.push_back(checkpoint);
+    }
+
+    bool saw_capture = false;
+    bool saw_stale_restore = false;
+    std::atomic<bool> defer_restore{false};
+    std::atomic<bool> returned_busy_before_restore{false};
+    std::atomic<bool> unrequested_restore{false};
+    std::atomic<bool> malformed_restore{false};
+    std::vector<PrefixStoreRef> discarded;
+
+private:
+    struct Slot {
+        bool active = false;
+        bool prefilling = false;
+        PrefixCaptureTicket capture;
+    };
+    std::vector<Slot> slots_;
+};
+
+struct SchedulerPrefixBackend : MockBackend {
+    SchedulerPrefixEngine engine;
+    SeqEngine * seq_engine() override { return &engine; }
+};
+
+TEST_CASE(ServerUnitFixture,
+          test_scheduler_counts_restore_only_after_engine_attempts_it) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    SchedulerPrefixBackend backend;
+    backend.engine.defer_restore.store(true, std::memory_order_relaxed);
+    ServerConfig config;
+    config.arch = "qwen35";
+    config.max_ctx = 64;
+    config.prefix_cache_cap = 2;
+    config.concurrent_prefix_cache_max_bytes = 1024;
+    config.concurrent_paged_prefix_cache = true;
+    config.admission_coalesce_ms = 0;
+    HttpServer server(backend, tokenizer, config);
+    PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
+    cache.confirm_inline_snap(
+        /*slot=*/0, /*target_cut=*/2, {1, 100}, false, 128);
+
+    int sockets[2] = {-1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+
+    ServerJob job;
+    job.fd = sockets[0];
+    job.req.format = ApiFormat::OPENAI_CHAT;
+    job.req.prompt_tokens = {1, 100, 999};
+    job.req.max_output = 1;
+    job.req.stream = false;
+    job.req.model = "scheduler-test";
+    job.req.response_id = "restore-after-busy";
+
+    SchedulerTestHarness::enqueue(server, &job);
+    std::thread scheduler([&] {
+        SchedulerTestHarness::run(server, backend.engine);
+    });
+
+    const auto busy_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!backend.engine.returned_busy_before_restore.load(
+               std::memory_order_relaxed) &&
+           std::chrono::steady_clock::now() < busy_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const bool returned_busy =
+        backend.engine.returned_busy_before_restore.load(
+            std::memory_order_relaxed);
+    const auto pre_attempt_stats = cache.stats();
+    backend.engine.defer_restore.store(false, std::memory_order_relaxed);
+
+    std::unique_lock<std::mutex> lock(job.mu);
+    const bool done = job.cv.wait_for(
+        lock, std::chrono::seconds(5), [&] { return job.done; });
+    lock.unlock();
+    SchedulerTestHarness::stop(server);
+    scheduler.join();
+
+    close(sockets[0]);
+    close(sockets[1]);
+    unlink(path.c_str());
+
+    TEST_ASSERT(done);
+    TEST_ASSERT(returned_busy);
+    TEST_ASSERT(pre_attempt_stats.restore_attempts == 0);
+    TEST_ASSERT(pre_attempt_stats.restore_invalidations == 0);
+    TEST_ASSERT(pre_attempt_stats.restore_stall_us_total == 0);
+    TEST_ASSERT(pre_attempt_stats.restore_stall_us_max == 0);
+
+    const auto stats = cache.stats();
+    TEST_ASSERT(stats.restore_attempts == 1);
+    TEST_ASSERT(stats.restore_invalidations == 0);
+    TEST_ASSERT(stats.restore_stall_us_total == 2500);
+}
+
+TEST_CASE(ServerUnitFixture,
+          test_scheduler_rejects_malformed_restore_and_drops_stale_entry) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    SchedulerPrefixBackend backend;
+    backend.engine.malformed_restore.store(true, std::memory_order_relaxed);
+    ServerConfig config;
+    config.arch = "qwen35";
+    config.max_ctx = 64;
+    config.prefix_cache_cap = 2;
+    config.concurrent_prefix_cache_max_bytes = 1024;
+    config.concurrent_paged_prefix_cache = true;
+    config.admission_coalesce_ms = 0;
+    HttpServer server(backend, tokenizer, config);
+    PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
+    cache.confirm_inline_snap(
+        /*slot=*/0, /*target_cut=*/2, {1, 100}, false, 128);
+
+    int sockets[2] = {-1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+
+    ServerJob job;
+    job.fd = sockets[0];
+    job.req.format = ApiFormat::OPENAI_CHAT;
+    job.req.prompt_tokens = {1, 100, 999};
+    job.req.max_output = 1;
+    job.req.stream = false;
+    job.req.model = "scheduler-test";
+    job.req.response_id = "malformed-restore";
+
+    SchedulerTestHarness::enqueue(server, &job);
+    std::thread scheduler([&] {
+        SchedulerTestHarness::run(server, backend.engine);
+    });
+
+    std::unique_lock<std::mutex> lock(job.mu);
+    const bool done = job.cv.wait_for(
+        lock, std::chrono::seconds(5), [&] { return job.done; });
+    lock.unlock();
+    SchedulerTestHarness::stop(server);
+    scheduler.join();
+
+    close(sockets[0]);
+    close(sockets[1]);
+    unlink(path.c_str());
+
+    TEST_ASSERT(done);
+    TEST_ASSERT(cache.lookup_candidate({1, 100, 999}, 2).first == -1);
+    TEST_ASSERT(backend.engine.discarded ==
+                std::vector<PrefixStoreRef>({{1, 2}}));
+    const auto stats = cache.stats();
+    TEST_ASSERT(stats.restore_attempts == 1);
+    TEST_ASSERT(stats.restore_invalidations == 1);
+    TEST_ASSERT(stats.restore_stall_us_total == 2500);
+}
+
+TEST_CASE(ServerUnitFixture,
+          test_scheduler_discards_unrequested_restored_checkpoint) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    SchedulerPrefixBackend backend;
+    backend.engine.unrequested_restore.store(true, std::memory_order_relaxed);
+    ServerConfig config;
+    config.arch = "qwen35";
+    config.max_ctx = 64;
+    config.prefix_cache_cap = 2;
+    config.concurrent_prefix_cache_max_bytes = 1024;
+    config.concurrent_paged_prefix_cache = true;
+    config.admission_coalesce_ms = 0;
+    HttpServer server(backend, tokenizer, config);
+    PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
+    cache.confirm_inline_snap(
+        /*slot=*/0, /*target_cut=*/2, {1, 100}, false, 128);
+
+    int sockets[2] = {-1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+
+    ServerJob job;
+    job.fd = sockets[0];
+    job.req.format = ApiFormat::OPENAI_CHAT;
+    job.req.prompt_tokens = {1, 100, 999};
+    job.req.max_output = 1;
+    job.req.stream = false;
+    job.req.model = "scheduler-test";
+    job.req.response_id = "unrequested-restore";
+
+    SchedulerTestHarness::enqueue(server, &job);
+    std::thread scheduler([&] {
+        SchedulerTestHarness::run(server, backend.engine);
+    });
+
+    std::unique_lock<std::mutex> lock(job.mu);
+    const bool done = job.cv.wait_for(
+        lock, std::chrono::seconds(5), [&] { return job.done; });
+    lock.unlock();
+    SchedulerTestHarness::stop(server);
+    scheduler.join();
+
+    close(sockets[0]);
+    close(sockets[1]);
+    unlink(path.c_str());
+
+    TEST_ASSERT(done);
+    TEST_ASSERT(backend.engine.discarded ==
+                std::vector<PrefixStoreRef>({{2, 2}}));
+    TEST_ASSERT(cache.lookup_candidate({1, 100, 999}, 2).first == 0);
+}
+
+TEST_CASE(ServerUnitFixture,
+          test_scheduler_stale_restore_preserves_other_protected_capture) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    SchedulerPrefixBackend backend;
+    ServerConfig config;
+    config.arch = "qwen35";
+    config.max_ctx = 64;
+    config.prefix_cache_cap = 2;
+    config.concurrent_prefix_cache_max_bytes = 1024;
+    config.concurrent_paged_prefix_cache = true;
+    config.admission_coalesce_ms = 0;
+    HttpServer server(backend, tokenizer, config);
+    PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
+    cache.confirm_inline_snap(
+        /*slot=*/0, /*target_cut=*/2, {1, 100}, false, 128);
+    cache.confirm_inline_snap(
+        /*slot=*/1, /*target_cut=*/2, {1, 200}, false, 128);
+
+    int capture_sockets[2] = {-1, -1};
+    int restore_sockets[2] = {-1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, capture_sockets) == 0);
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, restore_sockets) == 0);
+
+    ServerJob capture_job;
+    capture_job.fd = capture_sockets[0];
+    capture_job.req.format = ApiFormat::OPENAI_CHAT;
+    capture_job.req.prompt_tokens = {1, 300, 999};
+    capture_job.req.max_output = 1;
+    capture_job.req.stream = false;
+    capture_job.req.model = "scheduler-test";
+    capture_job.req.response_id = "capture";
+    capture_job.req.pin_end_token = 2;
+    capture_job.req.tools = json::array(
+        {{{"type", "function"},
+          {"function", {{"name", "probe"}, {"parameters", json::object()}}}}});
+
+    ServerJob restore_job;
+    restore_job.fd = restore_sockets[0];
+    restore_job.req.format = ApiFormat::OPENAI_CHAT;
+    restore_job.req.prompt_tokens = {1, 200, 999};
+    restore_job.req.max_output = 1;
+    restore_job.req.stream = false;
+    restore_job.req.model = "scheduler-test";
+    restore_job.req.response_id = "restore";
+
+    SchedulerTestHarness::enqueue(server, &capture_job);
+    SchedulerTestHarness::enqueue(server, &restore_job);
+    std::thread scheduler([&] {
+        SchedulerTestHarness::run(server, backend.engine);
+    });
+
+    const auto wait_done = [](ServerJob & job) {
+        std::unique_lock<std::mutex> lock(job.mu);
+        return job.cv.wait_for(lock, std::chrono::seconds(5),
+                               [&] { return job.done; });
+    };
+    const bool capture_done = wait_done(capture_job);
+    const bool restore_done = wait_done(restore_job);
+    SchedulerTestHarness::stop(server);
+    scheduler.join();
+
+    close(capture_sockets[0]);
+    close(capture_sockets[1]);
+    close(restore_sockets[0]);
+    close(restore_sockets[1]);
+    unlink(path.c_str());
+
+    TEST_ASSERT(capture_done);
+    TEST_ASSERT(restore_done);
+    TEST_ASSERT(backend.engine.saw_capture);
+    TEST_ASSERT(backend.engine.saw_stale_restore);
+    auto stats = cache.stats();
+    TEST_ASSERT(stats.in_use == 1);
+    TEST_ASSERT(stats.resident_bytes == 256);
+    TEST_ASSERT(stats.capture_attempts == 1);
+    TEST_ASSERT(stats.capture_failures == 0);
+    TEST_ASSERT(stats.capture_stall_us_total == 1500);
+    TEST_ASSERT(stats.restore_attempts == 1);
+    TEST_ASSERT(stats.restore_invalidations == 1);
+    TEST_ASSERT(stats.restore_stall_us_total == 2500);
+
+    // Refill the stale slot. The next capture must evict this unprotected
+    // entry, proving the real scheduler preserved the other request's pin.
+    cache.confirm_inline_snap(
+        /*slot=*/1, /*target_cut=*/2, {1, 400}, false, 128);
+    auto victim = cache.reserve_inline_snap(
+        {1, 500}, 0, /*prefer_tools_boundary=*/false, /*forced_cut=*/2,
+        /*restore_source_slot=*/-1,
+        [](int) { return 128; });
+    TEST_ASSERT(victim.slot() == 1);
+    victim.cancel();
+}
+#endif
 
 struct MockBatchCompressBackend : MockBackend {
     int compress_calls = 0;
@@ -4461,21 +5819,8 @@ struct MockBackendWithLayout : MockBackend {
 
 // Helper: recursively remove a directory.
 static void rm_rf(const std::string & path) {
-    DIR * dir = opendir(path.c_str());
-    if (!dir) { unlink(path.c_str()); return; }
-    struct dirent * ent;
-    while ((ent = readdir(dir)) != nullptr) {
-        if (std::strcmp(ent->d_name, ".") == 0 || std::strcmp(ent->d_name, "..") == 0) continue;
-        std::string child = path + "/" + ent->d_name;
-        struct stat st;
-        if (stat(child.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
-            rm_rf(child);
-        } else {
-            unlink(child.c_str());
-        }
-    }
-    closedir(dir);
-    rmdir(path.c_str());
+    std::error_code ec;
+    fs::remove_all(path, ec);
 }
 
 TEST_CASE(ServerUnitFixture, test_disk_cache_config_defaults) {
@@ -4620,7 +5965,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_disables_memory_only_backend) {
 
 TEST_CASE(ServerUnitFixture, test_disk_cache_init_creates_directory) {
     MockBackend backend;
-    std::string dir = "/tmp/dflash_test_disk_cache_init";
+    std::string dir = test_tmp_path("dflash_test_disk_cache_init").string();
     rm_rf(dir);
 
     DiskCacheConfig cfg;
@@ -4630,8 +5975,8 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_init_creates_directory) {
     TEST_ASSERT(cache.init());
 
     // Directory should exist.
-    struct stat st;
-    TEST_ASSERT(stat(dir.c_str(), &st) == 0 && S_ISDIR(st.st_mode));
+    std::error_code ec;
+    TEST_ASSERT(fs::is_directory(dir, ec) && !ec);
 
     rm_rf(dir);
 }
@@ -4647,8 +5992,9 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_header_size) {
 
 TEST_CASE(ServerUnitFixture, test_disk_cache_header_round_trip) {
     // Write and read a header to verify serialization.
-    std::string path = "/tmp/dflash_test_header_rt.dkv";
-    unlink(path.c_str());
+    std::string path = test_tmp_path("dflash_test_header_rt.dkv").string();
+    remove_test_path(path);
+    std::error_code ec;
 
     DiskCacheHeader hdr{};
     std::memcpy(hdr.magic, "DKVC", 4);
@@ -4683,9 +6029,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_header_round_trip) {
     std::fclose(f);
 
     // Verify file size is DISK_CACHE_HEADER_SIZE.
-    struct stat st;
-    stat(path.c_str(), &st);
-    TEST_ASSERT((size_t)st.st_size == DISK_CACHE_HEADER_SIZE);
+    TEST_ASSERT(fs::file_size(path, ec) == DISK_CACHE_HEADER_SIZE && !ec);
 
     // Read back and verify.
     f = std::fopen(path.c_str(), "rb");
@@ -4707,13 +6051,13 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_header_round_trip) {
     int32_t ri32; std::fread(&ri32, 4, 1, f); TEST_ASSERT(ri32 == 151643);  // last_tok
     std::fclose(f);
 
-    unlink(path.c_str());
+    remove_test_path(path);
 }
 
 TEST_CASE(ServerUnitFixture, test_disk_cache_continued_boundary) {
     // Test maybe_store_continued logic: saves at interval boundaries.
     MockBackend backend;
-    std::string dir = "/tmp/dflash_test_continued";
+    std::string dir = test_tmp_path("dflash_test_continued").string();
     rm_rf(dir);
 
     DiskCacheConfig cfg;
@@ -4775,7 +6119,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_continued_interval_logic) {
 TEST_CASE(ServerUnitFixture, test_disk_cache_cold_prefix_short_prompt) {
     // Cold prefix should not trigger for short prompts.
     MockBackend backend;
-    std::string dir = "/tmp/dflash_test_cold_short";
+    std::string dir = test_tmp_path("dflash_test_cold_short").string();
     rm_rf(dir);
 
     DiskCacheConfig cfg;
@@ -4796,7 +6140,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_cold_prefix_short_prompt) {
 TEST_CASE(ServerUnitFixture, test_disk_cache_cold_prefix_no_boundaries) {
     // Cold prefix should not trigger if no boundaries provided.
     MockBackend backend;
-    std::string dir = "/tmp/dflash_test_cold_nobound";
+    std::string dir = test_tmp_path("dflash_test_cold_nobound").string();
     rm_rf(dir);
 
     DiskCacheConfig cfg;
@@ -4816,7 +6160,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_cold_prefix_no_boundaries) {
 TEST_CASE(ServerUnitFixture, test_disk_cache_cold_prefix_finds_boundary) {
     // Cold prefix should find the last boundary <= cold_max_tokens.
     MockBackend backend;
-    std::string dir = "/tmp/dflash_test_cold_finds";
+    std::string dir = test_tmp_path("dflash_test_cold_finds").string();
     rm_rf(dir);
 
     DiskCacheConfig cfg;
@@ -4866,7 +6210,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_budget_enforcement_scoring) {
 TEST_CASE(ServerUnitFixture, test_disk_cache_lookup_miss_no_layout) {
     // Lookup with no layout known should return false.
     MockBackend backend;
-    std::string dir = "/tmp/dflash_test_lookup_miss";
+    std::string dir = test_tmp_path("dflash_test_lookup_miss").string();
     rm_rf(dir);
 
     DiskCacheConfig cfg;
@@ -4883,7 +6227,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_lookup_miss_no_layout) {
 TEST_CASE(ServerUnitFixture, test_disk_cache_save_below_min_tokens) {
     // Save with fewer tokens than min_tokens should be rejected.
     MockBackend backend;
-    std::string dir = "/tmp/dflash_test_save_below";
+    std::string dir = test_tmp_path("dflash_test_save_below").string();
     rm_rf(dir);
 
     DiskCacheConfig cfg;
@@ -4906,46 +6250,175 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_save_below_min_tokens) {
 // Helper: read layout_id from the first .dkv file found under base/.
 static std::array<uint8_t, 16> read_layout_id_from_cache_dir(const std::string & base) {
     std::array<uint8_t, 16> id{};
-    DIR * d = opendir(base.c_str());
-    if (!d) return id;
-    struct dirent * ent;
-    while ((ent = readdir(d)) != nullptr) {
-        if (ent->d_name[0] == '.') continue;
-        std::string sub = base + "/" + ent->d_name;
-        struct stat st{};
-        if (stat(sub.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) continue;
-        DIR * sd = opendir(sub.c_str());
-        if (!sd) continue;
-        struct dirent * sf;
-        while ((sf = readdir(sd)) != nullptr) {
-            size_t nl = std::strlen(sf->d_name);
-            if (nl < 4 || std::strcmp(sf->d_name + nl - 4, ".dkv") != 0) continue;
-            std::string fp = sub + "/" + sf->d_name;
-            FILE * f = std::fopen(fp.c_str(), "rb");
+    std::error_code ec;
+    for (const fs::directory_entry & entry : fs::directory_iterator(base, ec)) {
+        if (ec) break;
+        if (!entry.is_directory(ec)) {
+            ec.clear();
+            continue;
+        }
+        for (const fs::directory_entry & file_entry :
+             fs::directory_iterator(entry.path(), ec)) {
+            if (ec) break;
+            const std::string name = file_entry.path().filename().string();
+            if (name.size() < 4 || name.compare(name.size() - 4, 4, ".dkv") != 0) {
+                continue;
+            }
+            FILE * f = std::fopen(file_entry.path().string().c_str(), "rb");
             if (!f) continue;
             std::fseek(f, 8, SEEK_SET);  // skip magic(4) + version(4)
             std::fread(id.data(), 1, 16, f);
             std::fclose(f);
-            closedir(sd);
-            closedir(d);
             return id;
         }
-        closedir(sd);
     }
-    closedir(d);
     return id;
+}
+
+// Layout mock with a settable live position that can also adopt
+// deserialized snapshots (lookup path).
+struct MockBackendWithAdopt : MockBackendWithLayout {
+    std::vector<std::pair<ggml_context *, ggml_backend_buffer_t>> adopted_;
+    int adopted_cur_pos_ = 0;
+    int cur_pos_ = kMaxPos;
+    ~MockBackendWithAdopt() {
+        for (auto & p : adopted_) {
+            if (p.second) ggml_backend_buffer_free(p.second);
+            if (p.first) ggml_free(p.first);
+        }
+    }
+    SnapshotRef snapshot_ref(int slot) const override {
+        SnapshotRef ref = MockBackendWithLayout::snapshot_ref(slot);
+        ref.cur_pos = cur_pos_;
+        return ref;
+    }
+    int snapshot_cur_pos(int) const override { return cur_pos_; }
+    bool snapshot_adopt(int, ggml_context * ctx, ggml_backend_buffer_t buf,
+                        int cur_pos, int32_t) override {
+        adopted_.push_back({ctx, buf});
+        adopted_cur_pos_ = cur_pos;
+        return true;
+    }
+};
+
+TEST_CASE(ServerUnitFixture, test_disk_cache_rejects_snapshot_past_key) {
+    // A snapshot of kMaxPos positions may only be filed under a key that
+    // covers at least kMaxPos tokens; shorter keys are refused on save and,
+    // for files that already exist, on read.
+    MockBackendWithAdopt backend;
+    std::string dir = test_tmp_path("dflash_test_past_key").string();
+    rm_rf(dir);
+    DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1;
+    DiskPrefixCache cache(cfg, backend);
+    TEST_ASSERT(cache.init());
+    cache.learn_layout(0);
+
+    std::vector<int32_t> short_key;
+    for (int i = 0; i < MockBackendWithLayout::kMaxPos - 4; ++i) short_key.push_back(i + 1);
+    std::vector<int32_t> full_key;
+    for (int i = 0; i < MockBackendWithLayout::kMaxPos; ++i) full_key.push_back(i + 1);
+
+    TEST_ASSERT(!cache.save(0, short_key));
+    TEST_ASSERT(cache.total_bytes() == 0);
+    TEST_ASSERT(cache.save(0, full_key));
+    TEST_ASSERT(cache.total_bytes() > 0);
+    TEST_ASSERT(!cache.lookup(short_key, 1));
+    TEST_ASSERT(cache.lookup(full_key, 1));
+    TEST_ASSERT(backend.adopted_cur_pos_ == MockBackendWithLayout::kMaxPos);
+
+    // Forge the pre-fix shape on disk: key shorter than the snapshot. The
+    // scan keys entries by the header's token hash, so only the header
+    // fields need rewriting (token_count at byte 32, token_hash at byte 36
+    // of the 80-byte field-by-field header).
+    {
+        std::string forged;
+        for (auto & entry : fs::recursive_directory_iterator(dir)) {
+            if (entry.path().extension() == ".dkv") {
+                forged = (entry.path().parent_path() /
+                          (std::string(32, 'f') + ".dkv")).string();
+                fs::copy_file(entry.path(), forged, fs::copy_options::overwrite_existing);
+                break;
+            }
+        }
+        TEST_ASSERT(!forged.empty());
+        FILE * f = std::fopen(forged.c_str(), "r+b");
+        TEST_ASSERT(f != nullptr);
+        if (f) {
+            const uint32_t short_count = (uint32_t)short_key.size();
+            PrefixHash ph = hash_prefix(short_key.data(), (int)short_key.size());
+            std::fseek(f, 32, SEEK_SET);
+            TEST_ASSERT(std::fwrite(&short_count, 4, 1, f) == 1);
+            TEST_ASSERT(std::fwrite(ph.data(), 16, 1, f) == 1);
+            std::fclose(f);
+        }
+        DiskPrefixCache reopened(cfg, backend);
+        TEST_ASSERT(reopened.init());
+        reopened.learn_layout(0);
+        TEST_ASSERT(!reopened.lookup(short_key, 2));   // rejected + removed
+        TEST_ASSERT(!fs::exists(forged));
+        TEST_ASSERT(reopened.lookup(full_key, 2));     // consistent file survives
+    }
+    rm_rf(dir);
+}
+
+TEST_CASE(ServerUnitFixture, test_disk_cache_continued_keys_full_prefix) {
+    // Continued checkpoints are paced by the interval but keyed by the
+    // tokens the snapshot really covers, so only a prompt containing all of
+    // them can hit.
+    MockBackendWithAdopt backend;
+    std::string dir = test_tmp_path("dflash_test_continued_key").string();
+    rm_rf(dir);
+    DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1;
+    cfg.continued_interval = 10;   // 32 positions -> crosses at 30
+    DiskPrefixCache cache(cfg, backend);
+    TEST_ASSERT(cache.init());
+    cache.learn_layout(0);
+
+    std::vector<int32_t> tokens;
+    for (int i = 0; i < 60; ++i) tokens.push_back(100 + i);
+    const int cur_pos = MockBackendWithLayout::kMaxPos;  // 32 -> bucket 30
+    backend.cur_pos_ = cur_pos;
+    TEST_ASSERT(cache.maybe_store_continued(0, tokens, cur_pos));
+    std::vector<int32_t> aligned(tokens.begin(), tokens.begin() + 30);
+    std::vector<int32_t> covered(tokens.begin(), tokens.begin() + cur_pos);
+    TEST_ASSERT(!cache.lookup(aligned, 1));
+    TEST_ASSERT(cache.lookup(covered, 1));
+    TEST_ASSERT(backend.adopted_cur_pos_ == cur_pos);
+    const size_t bytes_after_first = cache.total_bytes();
+    TEST_ASSERT(bytes_after_first > 0);
+
+    // Same interval bucket: no second checkpoint.
+    TEST_ASSERT(!cache.maybe_store_continued(0, tokens, cur_pos));
+    backend.cur_pos_ = 38;  // still bucket 30
+    TEST_ASSERT(!cache.maybe_store_continued(0, tokens, 38));
+    TEST_ASSERT(cache.total_bytes() == bytes_after_first);
+
+    // Crossing into bucket 40 fires again, keyed by the 42 covered tokens.
+    backend.cur_pos_ = 42;
+    TEST_ASSERT(cache.maybe_store_continued(0, tokens, 42));
+    TEST_ASSERT(cache.total_bytes() > bytes_after_first);
+    std::vector<int32_t> bucket(tokens.begin(), tokens.begin() + 40);
+    std::vector<int32_t> covered2(tokens.begin(), tokens.begin() + 42);
+    TEST_ASSERT(!cache.lookup(bucket, 2));
+    TEST_ASSERT(cache.lookup(covered2, 2));
+    TEST_ASSERT(backend.adopted_cur_pos_ == 42);
+    // The earlier checkpoint is still there, and bucket 40 does not refire.
+    TEST_ASSERT(cache.lookup(covered, 3));
+    backend.cur_pos_ = 47;
+    TEST_ASSERT(!cache.maybe_store_continued(0, tokens, 47));
+    rm_rf(dir);
 }
 
 TEST_CASE(ServerUnitFixture, test_disk_identity_salt_changes_layout_id) {
     MockBackendWithLayout backend;
     std::vector<int32_t> prompt;
-    for (int i = 0; i < 10; ++i) prompt.push_back(i + 1);
+    for (int i = 0; i < MockBackendWithLayout::kMaxPos; ++i) prompt.push_back(i + 1);
 
     // Salt A: non-zero.
     std::array<uint8_t, 16> salt_a{};
     salt_a[0] = 0x01; salt_a[15] = 0xAB;
 
-    std::string dir_a = "/tmp/dflash_test_salt_a";
+    std::string dir_a = test_tmp_path("dflash_test_salt_a").string();
     rm_rf(dir_a);
     {
         DiskCacheConfig cfg; cfg.cache_dir = dir_a; cfg.min_tokens = 1;
@@ -4960,7 +6433,7 @@ TEST_CASE(ServerUnitFixture, test_disk_identity_salt_changes_layout_id) {
     std::array<uint8_t, 16> salt_b{};
     salt_b[0] = 0x02; salt_b[15] = 0xCD;
 
-    std::string dir_b = "/tmp/dflash_test_salt_b";
+    std::string dir_b = test_tmp_path("dflash_test_salt_b").string();
     rm_rf(dir_b);
     {
         DiskCacheConfig cfg; cfg.cache_dir = dir_b; cfg.min_tokens = 1;
@@ -4978,7 +6451,7 @@ TEST_CASE(ServerUnitFixture, test_disk_identity_salt_changes_layout_id) {
     TEST_ASSERT(id_a != id_b);
 
     // Same salt A applied again → identical layout_id.
-    std::string dir_a2 = "/tmp/dflash_test_salt_a2";
+    std::string dir_a2 = test_tmp_path("dflash_test_salt_a2").string();
     rm_rf(dir_a2);
     {
         DiskCacheConfig cfg; cfg.cache_dir = dir_a2; cfg.min_tokens = 1;
@@ -5001,9 +6474,9 @@ TEST_CASE(ServerUnitFixture, test_disk_identity_salt_zero_is_backcompat) {
     // (default-constructed identity_salt_ is already all-zero).
     MockBackendWithLayout backend;
     std::vector<int32_t> prompt;
-    for (int i = 0; i < 10; ++i) prompt.push_back(i + 1);
+    for (int i = 0; i < MockBackendWithLayout::kMaxPos; ++i) prompt.push_back(i + 1);
 
-    std::string dir1 = "/tmp/dflash_test_salt_zero1";
+    std::string dir1 = test_tmp_path("dflash_test_salt_zero1").string();
     rm_rf(dir1);
     {
         DiskCacheConfig cfg; cfg.cache_dir = dir1; cfg.min_tokens = 1;
@@ -5014,7 +6487,7 @@ TEST_CASE(ServerUnitFixture, test_disk_identity_salt_zero_is_backcompat) {
         TEST_ASSERT(cache.save(0, prompt));
     }
 
-    std::string dir2 = "/tmp/dflash_test_salt_zero2";
+    std::string dir2 = test_tmp_path("dflash_test_salt_zero2").string();
     rm_rf(dir2);
     {
         DiskCacheConfig cfg; cfg.cache_dir = dir2; cfg.min_tokens = 1;
@@ -5035,14 +6508,15 @@ TEST_CASE(ServerUnitFixture, test_disk_identity_salt_zero_is_backcompat) {
 }
 
 TEST_CASE(ServerUnitFixture, test_backend_ipc_rejects_file_work_dir) {
-    const std::string file_path = "/tmp/dflash_test_backend_ipc_work_dir_file";
-    unlink(file_path.c_str());
-    int fd = open(file_path.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0600);
-    TEST_ASSERT(fd >= 0);
-    if (fd >= 0) {
+    const std::string file_path = test_tmp_path(
+        "dflash_test_backend_ipc_work_dir_file").string();
+    remove_test_path(file_path);
+    FILE * file = std::fopen(file_path.c_str(), "wb");
+    TEST_ASSERT(file != nullptr);
+    if (file != nullptr) {
         const char payload[] = "not a dir";
-        (void)write(fd, payload, sizeof(payload) - 1);
-        close(fd);
+        (void)std::fwrite(payload, 1, sizeof(payload) - 1, file);
+        std::fclose(file);
     }
 
     BackendIpcLaunchConfig cfg;
@@ -5053,9 +6527,10 @@ TEST_CASE(ServerUnitFixture, test_backend_ipc_rejects_file_work_dir) {
     BackendIpcProcess proc;
     TEST_ASSERT(!proc.start(cfg));
     TEST_ASSERT(!proc.active());
-    unlink(file_path.c_str());
+    remove_test_path(file_path);
 }
 
+#if !defined(_WIN32)
 TEST_CASE(ServerUnitFixture, test_backend_ipc_payload_pipe_round_trip) {
     int payload_pipe[2] = {-1, -1};
     int status_pipe[2] = {-1, -1};
@@ -5094,6 +6569,7 @@ TEST_CASE(ServerUnitFixture, test_backend_ipc_payload_pipe_round_trip) {
     TEST_ASSERT(status == 0);
     close(status_pipe[0]);
 }
+#endif
 
 TEST_CASE(ServerUnitFixture, test_backend_ipc_payload_transport_parse) {
     BackendIpcMode mode = BackendIpcMode::DFlashDraft;
@@ -5606,6 +7082,8 @@ TEST_CASE(ServerUnitFixture, test_sampler_needs_logit_processing) {
 TEST_CASE(ServerUnitFixture, test_server_config_cache_defaults) {
     ServerConfig cfg;
     TEST_ASSERT(cfg.prefix_cache_cap == 32);
+    TEST_ASSERT(cfg.concurrent_prefix_cache_max_bytes == (size_t)4 * 1024 * 1024 * 1024);
+    TEST_ASSERT(!cfg.concurrent_paged_prefix_cache);
     TEST_ASSERT(cfg.prefill_cache_cap == 0);
 }
 
@@ -5654,12 +7132,12 @@ TEST_CASE(ServerUnitFixture, test_model_card_env_override_beats_cwd) {
 
     const char * prev = std::getenv("DFLASH_MODEL_CARDS_DIR");
     const std::string saved = prev ? prev : "";
-    setenv("DFLASH_MODEL_CARDS_DIR", envdir.string().c_str(), 1);
+    dflash_setenv("DFLASH_MODEL_CARDS_DIR", envdir.string().c_str());
 
     auto card = dflash::common::resolve_model_card("", "env-probe-model", "deepseek4", "");
 
-    if (saved.empty()) unsetenv("DFLASH_MODEL_CARDS_DIR");
-    else setenv("DFLASH_MODEL_CARDS_DIR", saved.c_str(), 1);
+    if (saved.empty()) dflash_unsetenv("DFLASH_MODEL_CARDS_DIR");
+    else dflash_setenv("DFLASH_MODEL_CARDS_DIR", saved.c_str());
     fs::remove_all(root);
 
     // Resolved from the env dir, not the deepseek4 family fallback (which gives 32768).
@@ -5885,6 +7363,18 @@ TEST_CASE(ServerUnitFixture, test_props_runtime_shape) {
     TEST_ASSERT(rt["chunk"].get<int>()                   == 512);
     TEST_ASSERT(rt["target_device"].get<std::string>()   == "auto:0");
     TEST_ASSERT(rt["draft_device"].get<std::string>()    == "auto:0");
+    const json & pc_props = body["prefix_cache"];
+    TEST_ASSERT(pc_props.contains("max_resident_bytes"));
+    TEST_ASSERT(pc_props.contains("resident_bytes"));
+    TEST_ASSERT(pc_props.contains("budget_skips"));
+    TEST_ASSERT(pc_props.contains("capture_attempts"));
+    TEST_ASSERT(pc_props.contains("capture_failures"));
+    TEST_ASSERT(pc_props.contains("capture_stall_ms_total"));
+    TEST_ASSERT(pc_props.contains("capture_stall_ms_max"));
+    TEST_ASSERT(pc_props.contains("restore_attempts"));
+    TEST_ASSERT(pc_props.contains("restore_invalidations"));
+    TEST_ASSERT(pc_props.contains("restore_stall_ms_total"));
+    TEST_ASSERT(pc_props.contains("restore_stall_ms_max"));
     TEST_ASSERT(rt["continuous_batching"]["admission_coalesce_ms"]
                     .get<int>() == 20);
     TEST_ASSERT(body["pflash"]["draft_residency"].get<std::string>() == "persistent");
@@ -6222,6 +7712,114 @@ TEST_CASE(ServerUnitFixture, test_generate_result_error_state_is_consistent) {
     TEST_ASSERT(!result.error.has_value());
     TEST_ASSERT(result.error_code().empty());
     TEST_ASSERT(result.error_detail().empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_response_error_maps_every_generation_code) {
+    struct Case {
+        GenerateErrorCode code;
+        int status;
+    };
+    const Case cases[] = {
+        {GenerateErrorCode::Incomplete, 500},
+        {GenerateErrorCode::AdapterUnavailable, 503},
+        {GenerateErrorCode::ResourceExhausted, 503},
+        {GenerateErrorCode::ContextOverflow, 400},
+        {GenerateErrorCode::SamplingUnsupported, 400},
+        {GenerateErrorCode::PrefillFailed, 500},
+        {GenerateErrorCode::DecodeSeedMissing, 500},
+        {GenerateErrorCode::DecodeFailed, 500},
+        {GenerateErrorCode::InvalidSnapshotSlot, 500},
+        {GenerateErrorCode::ModelParked, 503},
+        {GenerateErrorCode::BackendSpecific, 500},
+    };
+
+    for (const Case & c : cases) {
+        const ResponseError error = to_response_error({c.code, {}});
+        TEST_ASSERT(!error.code.empty());
+        TEST_ASSERT(!error.message.empty());
+        TEST_ASSERT(error.code == generate_error_code(c.code));
+        TEST_ASSERT(response_error_http_status(error) == c.status);
+    }
+
+    const ResponseError detailed = to_response_error(
+        {GenerateErrorCode::DecodeFailed, "device execution failed"});
+    TEST_ASSERT(detailed.message == "device execution failed");
+}
+
+TEST_CASE(ServerUnitFixture, test_response_error_nonstream_formats) {
+    const ResponseError error = ResponseError::internal(
+        "decode_failed", "generation decode failed");
+
+    const json openai = build_error_response(
+        ApiFormat::OPENAI_CHAT, error, "chat_123");
+    TEST_ASSERT(openai["error"]["type"] == "server_error");
+    TEST_ASSERT(openai["error"]["code"] == "decode_failed");
+    TEST_ASSERT(openai["error"]["message"] == "generation decode failed");
+
+    const json anthropic = build_error_response(
+        ApiFormat::ANTHROPIC, error, "msg_123");
+    TEST_ASSERT(anthropic["type"] == "error");
+    TEST_ASSERT(anthropic["error"]["type"] == "api_error");
+    TEST_ASSERT(anthropic["request_id"] == "msg_123");
+
+    const json responses = build_error_response(
+        ApiFormat::RESPONSES, error, "resp_123");
+    TEST_ASSERT(responses["error"]["type"] == "server_error");
+    TEST_ASSERT(responses["error"]["code"] == "decode_failed");
+}
+
+TEST_CASE(ServerUnitFixture, test_response_error_factories_fill_empty_messages) {
+    TEST_ASSERT(ResponseError::invalid_request("invalid_request", {}).message ==
+                "invalid request");
+    TEST_ASSERT(ResponseError::unavailable("unavailable", {}).message ==
+                "service unavailable");
+    TEST_ASSERT(ResponseError::internal("engine_step_failed", {}).message ==
+                "generation failed");
+}
+
+TEST_CASE(ServerUnitFixture, test_sse_emitter_openai_error_is_terminal) {
+    auto emitter = make_emitter(ApiFormat::OPENAI_CHAT);
+    std::string wire = concat(emitter.emit_start());
+    wire += concat(emitter.emit_token("pending output that was already flushed"));
+
+    wire += concat(emitter.emit_error(
+        ResponseError::internal("decode_failed", "decode failed")));
+    TEST_ASSERT(wire.find("\"error\"") != std::string::npos);
+    TEST_ASSERT(wire.find("decode_failed") != std::string::npos);
+    TEST_ASSERT(wire.find("[DONE]") != std::string::npos);
+    TEST_ASSERT(wire.find("pending output") != std::string::npos);
+    TEST_ASSERT(emitter.finish_reason() == "error");
+    TEST_ASSERT(emitter.emit_finish(1).empty());
+    TEST_ASSERT(emitter.emit_token("late token").empty());
+    TEST_ASSERT(emitter.emit_error(ResponseError::internal(
+        "late_error", "late error")).empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_sse_emitter_anthropic_error_is_terminal) {
+    auto emitter = make_emitter(ApiFormat::ANTHROPIC);
+    emitter.emit_start();
+
+    const std::string wire = concat(emitter.emit_error(
+        ResponseError::unavailable("model_parked", "model unavailable")));
+    TEST_ASSERT(wire.find("event: error") != std::string::npos);
+    TEST_ASSERT(wire.find("overloaded_error") != std::string::npos);
+    TEST_ASSERT(wire.find("message_stop") == std::string::npos);
+    TEST_ASSERT(emitter.emit_finish(0).empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_sse_emitter_responses_error_is_terminal) {
+    auto emitter = make_emitter(ApiFormat::RESPONSES);
+    emitter.emit_start();
+
+    const std::string wire = concat(emitter.emit_error(
+        ResponseError::internal("prefill_failed", "prefill failed")));
+    TEST_ASSERT(wire.find("event: response.failed") != std::string::npos);
+    TEST_ASSERT(wire.find("\"status\":\"failed\"") !=
+                std::string::npos);
+    TEST_ASSERT(wire.find("prefill_failed") != std::string::npos);
+    TEST_ASSERT(wire.find("response.completed") == std::string::npos);
+    TEST_ASSERT(wire.find("[DONE]") == std::string::npos);
+    TEST_ASSERT(emitter.emit_finish(0).empty());
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -6579,7 +8177,8 @@ static std::string write_qwen3_drafter_fixture_gguf() {
     add_tensor("blk.0.ffn_up.weight",      GGML_TYPE_BF16, 2, n_embd,   n_ff);
     add_tensor("blk.0.ffn_down.weight",    GGML_TYPE_BF16, 2, n_ff,     n_embd);
 
-    const std::string path = "/tmp/dflash_test_qwen3_drafter_438.gguf";
+    const std::string path = test_tmp_path(
+        "dflash_test_qwen3_drafter_438.gguf").string();
     gguf_write_to_file(g, path.c_str(), /*only_meta=*/false);
 
     gguf_free(g);
@@ -6604,11 +8203,13 @@ TEST_CASE(ServerUnitFixture, test_qwen3_drafter_rejects_truncated_gguf) {
     // Truncate inside the tensor-data section. The header, kv block, and tensor
     // info table all live before the data offset, so gguf_init_from_file still
     // succeeds and we reach the EOF guard rather than a parse failure.
-    struct stat st{};
-    TEST_ASSERT(stat(path.c_str(), &st) == 0);
-    const off_t truncated_size = (off_t)st.st_size - 4096;
+    std::error_code ec;
+    const uintmax_t file_size = fs::file_size(path, ec);
+    TEST_ASSERT(!ec);
+    const uintmax_t truncated_size = file_size - 4096;
     TEST_ASSERT(truncated_size > 0);
-    TEST_ASSERT(truncate(path.c_str(), truncated_size) == 0);
+    fs::resize_file(path, truncated_size, ec);
+    TEST_ASSERT(!ec);
 
     // The loader must fail cleanly (no SIGSEGV) with a descriptive error.
     {
@@ -6622,7 +8223,7 @@ TEST_CASE(ServerUnitFixture, test_qwen3_drafter_rejects_truncated_gguf) {
     }
 
     ggml_backend_free(backend);
-    unlink(path.c_str());
+    remove_test_path(path);
 }
 
 // ─── GGUF tensor bounds (gguf_tensor_in_file / gguf_bounds_error) ───────
@@ -7394,9 +8995,15 @@ struct StderrCapture {
         file = std::tmpfile();
         if (file == nullptr) return;
 
+#if defined(_WIN32)
+        old_stderr = _dup(_fileno(stderr));
+        if (old_stderr == -1 || _dup2(_fileno(file), _fileno(stderr)) == -1) {
+            if (old_stderr != -1) _close(old_stderr);
+#else
         old_stderr = dup(STDERR_FILENO);
         if (old_stderr == -1 || dup2(fileno(file), STDERR_FILENO) == -1) {
             if (old_stderr != -1) close(old_stderr);
+#endif
             old_stderr = -1;
             std::fclose(file);
             file = nullptr;
@@ -7422,8 +9029,13 @@ struct StderrCapture {
     void restore() {
         if (old_stderr != -1) {
             std::fflush(stderr);
+#if defined(_WIN32)
+            _dup2(old_stderr, _fileno(stderr));
+            _close(old_stderr);
+#else
             dup2(old_stderr, STDERR_FILENO);
             close(old_stderr);
+#endif
             old_stderr = -1;
         }
     }
@@ -7468,45 +9080,298 @@ TEST_CASE(ServerUnitFixture,
     TEST_ASSERT(!consumed_all);
     TEST_ASSERT((emitted == std::vector<int32_t>{101, 2}));
 }
-
-TEST_CASE(ServerUnitFixture, test_memory_pressure_evicts_idle_prefix_and_full_slots) {
-    const std::string path = write_deepseek_marker_tokenizer_fixture();
-    Tokenizer tokenizer;
-    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
-    PrefixCache cache(2, tokenizer);
-    cache.init_full_cache(1);
-    cache.confirm_inline_snap(0, 2, {1,2}, true);
-    cache.confirm_inline_snap(1, 3, {1,2,3}, false);
-    const int full = cache.prepare_full_snap({4,5,6});
-    TEST_ASSERT(full >= 2);
-    cache.confirm_full_snap(full, {4,5,6}, 3);
-    TEST_ASSERT(cache.evict_idle_lru() == 0);
-    TEST_ASSERT(cache.evict_idle_lru() == 1);
-    TEST_ASSERT(cache.evict_idle_lru() == full);
-    TEST_ASSERT(cache.evict_idle_lru() == -1);
-    TEST_ASSERT(cache.stats().in_use == 0);
-    TEST_ASSERT(cache.full_stats().in_use == 0);
-    TEST_ASSERT(cache.lookup_full({4,5,6}).first == -1);
-    std::remove(path.c_str());
+TEST_CASE(ServerUnitFixture, hybrid_selector_capacity_and_hysteresis) {
+    using namespace dflash::common::hybrid;
+    Candidate r{Path::Prefix,1,32000,false,true,true,true,2.0};
+    Candidate d{Path::Dense,2,0,false,true,true,true,49.0};
+    Candidate p{Path::Compress,3,0,true,true,true,true,21.0};
+    TEST_ASSERT(select({r,d,p},false).index==0);
+    r.seconds=50.; TEST_ASSERT(select({r,d,p},false).index==2);
+    r.seconds.reset(); TEST_ASSERT(select({r,d,p},false).index==0);
+    d.feasible=false; p.seconds.reset();
+    TEST_ASSERT(select({d,p},false).index==1);
+    TEST_ASSERT(select({d,p},true).index==-1);
+    p.seconds=1.5;r.seconds=2.; TEST_ASSERT(select({r,p},false).index==0);
+    p.seconds=1.; TEST_ASSERT(select({r,p},false).index==1);
+}
+TEST_CASE(ServerUnitFixture, hybrid_memory_simulation_protects_sources) {
+    using namespace dflash::common::hybrid;
+    Memory m; m.gpu_free=2*GiB;m.ram_available=12*GiB;m.new_gpu=2*GiB;
+    m.residents={{1,2*GiB,true,true,true,50,1},{2,2*GiB,true,true,false,50,2}};
+    auto p=plan_memory(m);
+    TEST_ASSERT(p.feasible && p.spill==std::vector<int>{2} && p.evict.empty());
+    TEST_ASSERT(m.residents[1].gpu); // Simulation did not mutate the input.
+    m.ram_available=3*GiB;p=plan_memory(m);TEST_ASSERT(!p.feasible);
+    m.residents.push_back({3,2*GiB,true,false,false,1,3});
+    p=plan_memory(m);TEST_ASSERT(p.feasible && p.evict==std::vector<int>{3} && p.spill.empty());
+}
+TEST_CASE(ServerUnitFixture, hybrid_calibration_rejects_missing_and_nonfinite) {
+    using namespace dflash::common::hybrid;
+    Estimate e;TEST_ASSERT(!e.calibrated());e.observe(10);e.observe(10);TEST_ASSERT(!e.calibrated());
+    e.observe(10);TEST_ASSERT(e.calibrated().value()==10);
+    e.observe(20);TEST_ASSERT(e.calibrated().value()==12);
+    e.observe(std::numeric_limits<double>::infinity());TEST_ASSERT(e.observations==4);
 }
 
-TEST_CASE(ServerUnitFixture, test_memory_eviction_reuses_full_cache_hole) {
-    const std::string path = write_deepseek_marker_tokenizer_fixture();
-    Tokenizer tokenizer;
+TEST_CASE(ServerUnitFixture, hybrid_regions_preserve_recent_exchanges) {
+    using namespace dflash::common::hybrid;
+    Json messages=Json::array();messages.push_back({{"role","system"},{"content","keep"}});
+    for(int i=0;i<4;++i){messages.push_back({{"role","user"},{"content","question "+std::to_string(i)}});messages.push_back({{"role","assistant"},{"content","answer"}});}
+    auto eligible=eligible_regions(messages,Json::object());
+    TEST_ASSERT(eligible.size()==2 && eligible[0].message==1 && eligible[1].message==2);
+    Region frozen=eligible[0];frozen.replacement="short";
+    auto original=apply_regions(messages,{frozen});
+    messages.push_back({{"role","user"},{"content","next"}});
+    auto appended=apply_regions(messages,{frozen});
+    TEST_ASSERT(appended[1]==original[1]);
+    messages[1]["content"]="edited";TEST_ASSERT(!applicable(frozen,messages));
+}
+TEST_CASE(ServerUnitFixture, hybrid_bulk_requires_exact_explicit_boundaries) {
+    using namespace dflash::common::hybrid;
+    Json messages={{{"role","user"},{"content","document text\nQuestion?"}}};
+    TEST_ASSERT(eligible_regions(messages,Json::object()).empty());
+    Json meta={{"bulk_regions",{{{"message",0},{"start",0},{"end",13},{"text","document text"}}}}};
+    auto regions=eligible_regions(messages,meta);TEST_ASSERT(regions.size()==1);
+    regions[0].replacement="short";TEST_ASSERT(apply_regions(messages,regions)[0]["content"]=="short\nQuestion?");
+    meta["bulk_regions"][0]["text"]="wrong";bool rejected=false;
+    try{eligible_regions(messages,meta);}catch(...){rejected=true;}TEST_ASSERT(rejected);
+}
+
+TEST_CASE(ServerUnitFixture, hybrid_shadow_never_executes_compression) {
+    using namespace dflash::common::hybrid;
+    Candidate d{Path::Dense,-1,0,false,true,false,true,std::nullopt};
+    Candidate c{Path::Compress,-1,0,true,true,true,true,std::nullopt};
+    TEST_ASSERT(select({d,c},false).index==1);
+    TEST_ASSERT(shadow_baseline({d,c}).index==-1);
+    d.valid=true;TEST_ASSERT(shadow_baseline({d,c}).index==0);
+}
+TEST_CASE(ServerUnitFixture, hybrid_frozen_revalidates_protection) {
+    using namespace dflash::common::hybrid;
+    Json messages=Json::array();
+    for(int i=0;i<4;++i){messages.push_back({{"role","user"},{"content","question "+std::to_string(i)}});if(i<3)messages.push_back({{"role","assistant"},{"content","answer"}});}
+    auto eligible=eligible_regions(messages,Json::object());
+    Region frozen=eligible.at(0);frozen.replacement="short";
+    TEST_ASSERT(permitted(frozen,messages,eligible));
+    auto summaries=eligible_regions(messages,Json{{"summary_messages",{0}}});
+    TEST_ASSERT(!permitted(frozen,messages,summaries));
+    messages.erase(messages.end()-2,messages.end());
+    TEST_ASSERT(applicable(frozen,messages));
+    TEST_ASSERT(!permitted(frozen,messages,eligible_regions(messages,Json::object())));
+}
+TEST_CASE(ServerUnitFixture, hybrid_pinned_transform_survives_optional_eviction) {
+    using namespace dflash::common::hybrid;
+    Json messages={{{"role","user"},{"content","bulk\nquestion"}}};
+    Json meta={{"bulk_regions",{{{"message",0},{"start",0},{"end",4},{"text","bulk"}}}}};
+    auto regions=eligible_regions(messages,meta);
+    auto rep=std::make_shared<Representation>();rep->fingerprint="identity";rep->regions=regions;
+    rep->regions[0].replacement="b";
+    Entry entry;entry.owner="chat";entry.representation=rep;
+    std::vector<Entry> entries{entry};
+    pin_replacements(regions,entries,"chat","identity");
+    entries.clear();entry.representation.reset();rep.reset();
+    TEST_ASSERT(regions[0].replacement=="b");
+    TEST_ASSERT(apply_regions(messages,regions)[0]["content"]=="b\nquestion");
+}
+TEST_CASE(ServerUnitFixture, hybrid_costs_distinguish_suffix_tier_policy_and_output) {
+    using namespace dflash::common::hybrid;
+    auto key=Cache::cost_key(Path::Prefix,80000,79800,128,true,false,"model");
+    TEST_ASSERT(key!=Cache::cost_key(Path::Prefix,80000,66000,128,true,false,"model"));
+    TEST_ASSERT(key!=Cache::cost_key(Path::Prefix,80000,79800,128,false,false,"model"));
+    TEST_ASSERT(key!=Cache::cost_key(Path::Prefix,80000,79800,128,true,true,"model"));
+    TEST_ASSERT(key!=Cache::cost_key(Path::Prefix,80000,79800,256,true,false,"model"));
+    TEST_ASSERT(key!=Cache::cost_key(Path::Prefix,80000,79800,128,true,false,"other"));
+    Estimate e;e.observe(1);e.observe(100);e.observe(2);
+    TEST_ASSERT(e.calibrated().value()==2);
+    e.observe(7);TEST_ASSERT(e.calibrated().value()==3);
+}
+
+struct HybridFailureBackend : MockBackend {
+    bool saved=true,healthy=true,emit_before_failure=false;
+    int generated=0,restored=0,resets=0;
+    uint64_t cache_gpu_free_bytes() const override {return 32*dflash::common::hybrid::GiB;}
+    bool snapshot_used(int slot) const override {return slot==0&&saved;}
+    int snapshot_cur_pos(int slot) const override {return snapshot_used(slot)?2:0;}
+    void snapshot_free(int slot) override {if(slot==0)saved=false;}
+    bool cache_reset_after_failure() override {++resets;return healthy;}
+    GenerateResult generate_impl(const GenerateRequest&,const DaemonIO& io) override {
+        ++generated;io.emit(0);GenerateResult r;r.tokens={0};r.succeed();return r;
+    }
+    GenerateResult restore_and_generate_impl(int,const GenerateRequest&,const DaemonIO& io) override {
+        ++restored;if(emit_before_failure)io.emit(0);
+        GenerateResult r;r.fail(GenerateErrorCode::DecodeSeedMissing);return r;
+    }
+};
+TEST_CASE(ServerUnitFixture, hybrid_restore_fallback_obeys_stream_and_health_boundary) {
+#if !defined(_WIN32)
+    for(int scenario=0;scenario<3;++scenario) {
+        const auto path=write_deepseek_marker_tokenizer_fixture();Tokenizer tokenizer;
+        TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+        HybridFailureBackend backend;backend.emit_before_failure=scenario==1;backend.healthy=scenario!=2;
+        ServerConfig config;config.max_ctx=4096;
+        HttpServer server(backend,tokenizer,config);SchedulerTestHarness::enable_hybrid(server);
+        int sockets[2];TEST_ASSERT(socketpair(AF_UNIX,SOCK_STREAM,0,sockets)==0);
+        ServerJob job;job.fd=sockets[0];job.req.format=ApiFormat::OPENAI_CHAT;
+        job.req.prompt_tokens=std::vector<int32_t>(1024,0);job.req.rendered_prompt="test";
+        job.req.max_output=8;job.req.stream=true;job.req.session_id="owner";job.req.response_id="test";
+        job.req.raw_body={{"extra_body",{{"lucebox_cache",{{"mode","exact"}}}}}};
+        SchedulerTestHarness::seed_hybrid(server,job.req);
+        SchedulerTestHarness::process(server,job);
+        TEST_ASSERT(job.done);TEST_ASSERT(backend.restored==1);
+        TEST_ASSERT(backend.generated==(scenario==0?1:0));
+        TEST_ASSERT(SchedulerTestHarness::hybrid_cache(server).costs.empty());
+        close(sockets[0]);close(sockets[1]);unlink(path.c_str());
+    }
+#endif
+}
+TEST_CASE(ServerUnitFixture, hybrid_expired_request_never_starts_backend) {
+#if !defined(_WIN32)
+    const auto path=write_deepseek_marker_tokenizer_fixture();Tokenizer tokenizer;
     TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
-    PrefixCache cache(1, tokenizer);
-    cache.init_full_cache(3);
-    const std::vector<int32_t> a{1,2}, b{3,4}, c{5,6}, d{7,8};
-    int sa=cache.prepare_full_snap(a); cache.confirm_full_snap(sa,a,2);
-    int sb=cache.prepare_full_snap(b); cache.confirm_full_snap(sb,b,2);
-    int sc=cache.prepare_full_snap(c); cache.confirm_full_snap(sc,c,2);
-    TEST_ASSERT(cache.lookup_full(a).first==sa); // A is newest; evict B.
-    TEST_ASSERT(cache.evict_idle_lru()==sb);
-    int sd=cache.prepare_full_snap(d);
-    TEST_ASSERT(sd==sb);
-    cache.confirm_full_snap(sd,d,2);
-    TEST_ASSERT(cache.lookup_full(a).first==sa);
-    TEST_ASSERT(cache.lookup_full(c).first==sc);
-    TEST_ASSERT(cache.lookup_full(b).first==-1);
-    std::remove(path.c_str());
+    HybridFailureBackend backend;ServerConfig config;config.max_ctx=4096;
+    HttpServer server(backend,tokenizer,config);SchedulerTestHarness::enable_hybrid(server);
+    int sockets[2];TEST_ASSERT(socketpair(AF_UNIX,SOCK_STREAM,0,sockets)==0);
+    ServerJob job;job.fd=sockets[0];job.req.format=ApiFormat::OPENAI_CHAT;
+    job.req.prompt_tokens=std::vector<int32_t>(1024,0);job.req.max_output=8;job.req.stream=true;
+    job.req.raw_body={{"extra_body",{{"lucebox_cache",{{"mode","exact"},{"deadline_unix_ms",1}}}}}};
+    SchedulerTestHarness::process(server,job);
+    TEST_ASSERT(job.done && backend.generated==0 && backend.restored==0);
+    TEST_ASSERT(SchedulerTestHarness::hybrid_cache(server).entries.empty());
+    close(sockets[0]);close(sockets[1]);unlink(path.c_str());
+#endif
+}
+TEST_CASE(ServerUnitFixture, hybrid_rebase_keeps_frozen_region_when_whole_message_ages) {
+    using namespace dflash::common::hybrid;
+    Json messages={{{"role","user"},{"content","before document after"}}};
+    auto env=envelope(messages[0]);
+    Region whole{0,0,21,"before document after",{},env};
+    auto rep=std::make_shared<Representation>();rep->fingerprint="id";
+    rep->regions={{0,7,15,"document","doc",env}};
+    Entry entry;entry.owner="owner";entry.last_used=1;entry.representation=rep;
+    auto regions=rebase_regions({whole},messages,{entry},"owner","id");
+    TEST_ASSERT(regions.size()==3);
+    TEST_ASSERT(regions[1].source=="document" && regions[1].replacement=="doc");
+    TEST_ASSERT(regions[0].source=="before " && regions[2].source==" after");
+    regions[0].replacement=regions[0].source;regions[2].replacement=regions[2].source;
+    TEST_ASSERT(apply_regions(messages,regions)[0]["content"]=="before doc after");
+}
+TEST_CASE(ServerUnitFixture, hybrid_failed_or_cancelled_capture_retains_primary_dependencies) {
+    const auto path=write_deepseek_marker_tokenizer_fixture();Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    HybridFailureBackend backend;ServerConfig config;config.max_ctx=4096;
+    HttpServer server(backend,tokenizer,config);SchedulerTestHarness::enable_hybrid(server);
+    ParsedRequest req;req.format=ApiFormat::OPENAI_CHAT;req.session_id="owner";
+    req.prompt_tokens=std::vector<int32_t>(1024,0);req.max_output=8;
+    req.raw_body={{"extra_body",{{"lucebox_cache",{{"mode","exact"}}}}}};
+    SchedulerTestHarness::seed_hybrid(server,req);
+    auto dependency=SchedulerTestHarness::hybrid_cache(server).entries[0].representation;
+    for(bool cancelled:{false,true}) {
+        SchedulerTestHarness::finish_hybrid_capture(server,req,cancelled);
+        const auto& cache=SchedulerTestHarness::hybrid_cache(server);
+        TEST_ASSERT(cache.entries.size()==1 && cache.entries[0].slot==0 && cache.entries[0].primary);
+        TEST_ASSERT(cache.entries[0].representation==dependency);
+        TEST_ASSERT(dependency->tokens.size()==1024); // Includes history beyond saved position 2.
+    }
+    unlink(path.c_str());
+}
+TEST_CASE(ServerUnitFixture, hybrid_failed_transfer_keeps_protected_source) {
+    using namespace dflash::common::hybrid;
+    HybridFailureBackend backend;Cache cache;Entry entry;entry.slot=0;entry.owner="one";entry.primary=true;
+    entry.representation=std::make_shared<Representation>();cache.entries.push_back(entry);
+    ResourcePlan plan;plan.feasible=true;plan.spill={0};
+    TEST_ASSERT(!cache.execute(backend,plan));
+    TEST_ASSERT(cache.entries.size()==1 && cache.entries[0].gpu && backend.saved);
+    ResourcePlan eviction;eviction.feasible=true;eviction.evict={0};
+    TEST_ASSERT(!cache.execute(backend,eviction));TEST_ASSERT(backend.saved);
+}
+TEST_CASE(ServerUnitFixture, hybrid_ties_do_not_chain_beyond_global_minimum) {
+    using namespace dflash::common::hybrid;
+    Candidate a{Path::Prefix,1,1000,true,false,true,true,1.0};
+    Candidate b{Path::Prefix,2,2000,true,true,true,true,1.2};
+    Candidate c{Path::Prefix,3,3000,false,true,true,true,1.4};
+    for(auto candidates:{std::vector<Candidate>{a,b,c},std::vector<Candidate>{c,b,a}})
+        TEST_ASSERT(candidates[select(candidates,false).index].id==2);
+}
+TEST_CASE(ServerUnitFixture, hybrid_reclaims_unused_scratch_before_snapshot_eviction) {
+    using namespace dflash::common::hybrid;
+    Memory m;m.gpu_free=2*GiB;m.ram_available=12*GiB;m.work_gpu=2*GiB;m.reclaimable_gpu=2*GiB;
+    m.residents={{1,GiB,true,false,false,1,1}};
+    const auto plan=plan_memory(m);
+    TEST_ASSERT(plan.feasible && plan.release_scratch && plan.evict.empty() && plan.spill.empty());
+    TEST_ASSERT(m.gpu_free==2*GiB);
+}
+TEST_CASE(ServerUnitFixture, hybrid_consecutive_user_messages_are_not_complete_exchanges) {
+    using namespace dflash::common::hybrid;
+    Json messages=Json::array();
+    for(int i=0;i<6;++i)messages.push_back({{"role","user"},{"content","unanswered question"}});
+    TEST_ASSERT(eligible_regions(messages,Json::object()).empty());
+}
+TEST_CASE(ServerUnitFixture, hybrid_capture_failure_does_not_deny_answer_and_smaller_capture_is_reconsidered) {
+    using namespace dflash::common::hybrid;
+    Memory memory;memory.gpu_free=5*GiB;memory.work_gpu=2*GiB;memory.ram_available=12*GiB;
+    auto preliminary=plan_with_optional_capture(memory,3*GiB);
+    TEST_ASSERT(preliminary.resource.feasible && !preliminary.capture);
+    auto actual=plan_with_optional_capture(memory,GiB/2);
+    TEST_ASSERT(actual.resource.feasible && actual.capture);
+    memory.gpu_free=4*GiB;
+    auto changed=plan_with_optional_capture(memory,GiB/2);
+    TEST_ASSERT(changed.resource.feasible && !changed.capture);
+}
+TEST_CASE(ServerUnitFixture, hybrid_pi_text_blocks_preserve_other_parts_and_summary) {
+    using namespace dflash::common::hybrid;
+    Json messages={{{"role","user"},{"content",{{{"type","text"},{"text","document text"}},{{"type","text"},{"text","Question?"}}}}}};
+    Json metadata={{"bulk_regions",{{{"message",0},{"part",0},{"start",0},{"end",13},{"text","document text"}}}}};
+    auto regions=eligible_regions(messages,metadata);
+    TEST_ASSERT(regions.size()==1 && regions[0].part==0);
+    regions[0].replacement="doc";
+    auto rendered=apply_regions(messages,regions);
+    TEST_ASSERT(rendered[0]["content"][0]["text"]=="doc");
+    TEST_ASSERT(rendered[0]["content"][1]==messages[0]["content"][1]);
+    TEST_ASSERT(messages[0]["content"][0]["text"]=="document text");
+    metadata["summary_messages"]={0};bool rejected=false;
+    try{eligible_regions(messages,metadata);}catch(...){rejected=true;}TEST_ASSERT(rejected);
+    messages[0]["content"][0]["text"]="changed";TEST_ASSERT(!applicable(regions[0],messages));
+}
+TEST_CASE(ServerUnitFixture, hybrid_bulk_markers_alone_are_not_a_question) {
+    using namespace dflash::common::hybrid;
+    Json messages={{{"role","user"},{"content","<lucebox_bulk>document</lucebox_bulk>"}}};
+    Json metadata={{"bulk_regions",{{{"message",0},{"start",14},{"end",22},{"text","document"}}}}};
+    bool rejected=false;try{eligible_regions(messages,metadata);}catch(...){rejected=true;}TEST_ASSERT(rejected);
+}
+TEST_CASE(ServerUnitFixture, hybrid_multiple_regions_in_one_part_replay_after_aging) {
+    using namespace dflash::common::hybrid;
+    Json messages={{{"role","user"},{"content",{{{"type","text"},{"text","alpha middle omega"}},{{"type","text"},{"text","Question?"}}}}}};
+    Json metadata={{"bulk_regions",{{{"message",0},{"part",0},{"start",0},{"end",5},{"text","alpha"}},{{"message",0},{"part",0},{"start",13},{"end",18},{"text","omega"}}}}};
+    auto regions=eligible_regions(messages,metadata);
+    TEST_ASSERT(regions.size()==2);
+    regions[0].replacement="A";regions[1].replacement="Z";
+    auto rendered=apply_regions(messages,regions);
+    TEST_ASSERT(rendered[0]["content"][0]["text"]=="A middle Z");
+    TEST_ASSERT(rendered[0]["content"][1]==messages[0]["content"][1]);
+    auto representation=std::make_shared<Representation>();representation->regions=regions;representation->fingerprint="model";
+    Entry entry;entry.owner="chat";entry.representation=representation;
+    for(int i=0;i<4;++i){messages.push_back({{"role","assistant"},{"content","Answer"}});messages.push_back({{"role","user"},{"content","Next question"}});}
+    auto rebased=rebase_regions(eligible_regions(messages,Json::object()),messages,{entry},"chat","model");
+    int frozen=0;
+    for(const auto& region:rebased)if(region.message==0 && region.part==0 && (region.replacement=="A" || region.replacement=="Z"))++frozen;
+    TEST_ASSERT(frozen==2);
+    for(auto& region:rebased)if(region.replacement.empty())region.replacement=region.source;
+    TEST_ASSERT(apply_regions(messages,rebased)[0]["content"]==rendered[0]["content"]);
+}
+
+TEST_CASE(ServerUnitFixture, hybrid_rejects_output_capacity_instead_of_silently_clamping) {
+#if !defined(_WIN32)
+    const auto path=write_deepseek_marker_tokenizer_fixture();Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    HybridFailureBackend backend;ServerConfig config;config.max_ctx=4096;config.default_max_tokens=32;
+    HttpServer server(backend,tokenizer,config);SchedulerTestHarness::enable_hybrid(server);
+    int sockets[2];TEST_ASSERT(socketpair(AF_UNIX,SOCK_STREAM,0,sockets)==0);
+    for(const char* field:{"max_tokens","max_output_tokens","max_completion_tokens"}) {
+        ParsedRequest req;
+        TEST_ASSERT(!SchedulerTestHarness::parse_common(server,sockets[0],{{field,33}},req));
+        TEST_ASSERT(SchedulerTestHarness::parse_common(server,sockets[0],{{field,32}},req));
+        TEST_ASSERT(req.max_output==32);
+    }
+    TEST_ASSERT(backend.generated==0 && backend.restored==0);
+    close(sockets[0]);close(sockets[1]);unlink(path.c_str());
+#endif
 }

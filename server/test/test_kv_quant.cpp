@@ -115,6 +115,25 @@ static void t2_resolve_kv_types() {
     assert(k == GGML_TYPE_TQ3_0 && v == GGML_TYPE_Q8_0);
     clear_kv_env();
 
+    // Two model overrides coexist; neither changes the shared default.
+    setenv("DFLASH27B_KV_K", "f16", 1);
+    setenv("DFLASH27B_KV_V", "f16", 1);
+    dflash::resolve_kv_types(k, v, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
+    assert(k == GGML_TYPE_Q8_0 && v == GGML_TYPE_Q8_0);
+    dflash::resolve_kv_types(k, v, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0);
+    assert(k == GGML_TYPE_Q4_0 && v == GGML_TYPE_Q4_0);
+    dflash::resolve_kv_types(k, v);
+    assert(k == GGML_TYPE_F16 && v == GGML_TYPE_F16);
+    assert(std::strcmp(std::getenv("DFLASH27B_KV_K"), "f16") == 0);
+    assert(std::strcmp(std::getenv("DFLASH27B_KV_V"), "f16") == 0);
+    // Explicit CLI values also supersede malformed inherited defaults, as
+    // the old CLI's environment overwrite did for single-model launches.
+    setenv("DFLASH27B_KV_K", "invalid", 1);
+    setenv("DFLASH27B_KV_V", "invalid", 1);
+    dflash::resolve_kv_types(k, v, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
+    assert(k == GGML_TYPE_Q8_0 && v == GGML_TYPE_Q8_0);
+    clear_kv_env();
+
     std::puts("T2 PASS");
 }
 

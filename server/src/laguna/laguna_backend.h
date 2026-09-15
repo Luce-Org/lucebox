@@ -116,8 +116,8 @@ private:
     DraftKvState                                draft_kv_{};
     LagunaDFlashTarget *                        dflash_target_ = nullptr;
     bool                                        draft_parked_ = false;
-    // [TAG_LAGUNA_VERIFY_WIDTH] EWMA of the accepted block length, persisted
-    // across requests. Drives the AUTO chain verify width (seeded for width 3).
+    // [TAG_LAGUNA_VERIFY_WIDTH] Legacy accepted-length EWMA. Keep this as the
+    // default AUTO policy; the shared per-step controller is explicitly opt-in.
     double                                      spec_ewma_accept_ = 1.5;
 
     // PFlash drafter (lazy-loaded on first compress command).
@@ -188,7 +188,8 @@ private:
     GenerateResult generate_hybrid(const GenerateRequest & req, const DaemonIO & io);
     bool hybrid_forward_one_token(int32_t tok, int kv_pos,
                                   std::vector<float> & act_cur,
-                                  int32_t & argmax_out);
+                                  int32_t & argmax_out,
+                                  std::vector<float> * out_logits = nullptr);
     void maybe_post_request_swap();
 
     bool load_decode_draft();

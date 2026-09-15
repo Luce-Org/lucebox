@@ -16,6 +16,47 @@ ROOT = pathlib.Path(os.environ.get('LUCEBOX_ROOT', pathlib.Path(__file__).resolv
 HOP = {'connection','keep-alive','proxy-authenticate','proxy-authorization','te','trailer','transfer-encoding','upgrade','host','content-length'}
 CORS = {'Access-Control-Allow-Origin':'*'}
 
+def normalize_session_id(body, headers):
+    extra = body.get('extra_body')
+    values = [body.get('session_id')]
+    if isinstance(extra, dict):
+        values.append(extra.get('session_id'))
+    for key in ('session_id', 'x-session-affinity', 'x-session-id'):
+        values.append(headers.get(key))
+    supplied = [v for v in values if v is not None and v != '']
+    if not supplied:
+        return
+    if any(not isinstance(v, str) or len(v.encode('utf-8')) > 256 or
+           any(ord(c) < 32 or ord(c) == 127 for c in v) for v in supplied):
+        raise ValueError('Session ID must be a string of at most 256 UTF-8 bytes without control characters')
+    if len(set(supplied)) != 1:
+        raise ValueError('Conflicting session identifiers')
+    body['session_id'] = supplied[0]
+
+def normalize_cache_metadata(body, headers):
+    supplied = {field: headers.get('x-lucebox-cache-' + field)
+                for field in ('owner', 'purpose', 'mode')}
+    if not any(value is not None for value in supplied.values()):
+        return
+    extra = body.setdefault('extra_body', {})
+    if not isinstance(extra, dict):
+        raise ValueError('extra_body must be an object')
+    meta = extra.setdefault('lucebox_cache', {})
+    if not isinstance(meta, dict):
+        raise ValueError('lucebox_cache must be an object')
+    for field, value in supplied.items():
+        if value is None:
+            continue
+        if field in meta and meta[field] != value:
+            raise ValueError('Conflicting cache metadata: ' + field)
+        if not isinstance(value, str) or len(value.encode('utf-8')) > 256 or any(ord(c)<32 or ord(c)==127 for c in value):
+            raise ValueError('Invalid cache metadata: ' + field)
+        if field == 'purpose' and value not in ('chat', 'compaction'):
+            raise ValueError('Invalid cache purpose')
+        if field == 'mode' and value not in ('auto', 'exact'):
+            raise ValueError('Invalid cache mode')
+        meta[field] = value
+
 class BackendFault(Exception):
     pass
 
@@ -30,7 +71,28 @@ class ForwardState:
 class Router:
     def __init__(self, config, root=ROOT):
         self.config, self.root = config, root
+        self.prefix_cache_device = config.get('backend', {}).get('prefix_cache_device')
+        if self.prefix_cache_device not in (None, 'cpu', 'gpu'):
+            raise ValueError('backend.prefix_cache_device must be cpu or gpu')
         self.models, self.default = config['models'], config['default']
+        for name, model in self.models.items():
+            args = model.get('extra_args', [])
+            if not isinstance(args, list) or any(not isinstance(arg, str) or '\0' in arg for arg in args):
+                raise ValueError(f'{name}.extra_args must be a list of strings without NUL')
+            canonical = model.get('canonical', name)
+            if canonical not in self.models or self.models[canonical].get('canonical', canonical) != canonical:
+                raise ValueError(f'{name}.canonical must name a non-alias model')
+            if self.models[canonical]['path'] != model['path']:
+                raise ValueError(f'{name}.canonical must use the same weights')
+            if model.get('cache_default_policy', 'exact') not in ('exact', 'auto'):
+                raise ValueError(f'{name}.cache_default_policy must be exact or auto')
+            if model.get('hybrid_cache', 'off') not in ('off', 'shadow', 'auto'):
+                raise ValueError(f'{name}.hybrid_cache must be off, shadow or auto')
+            if type(model.get('hybrid_projections', False)) is not bool:
+                raise ValueError(f'{name}.hybrid_projections must be boolean')
+            window = model.get('compression_score_window', 0)
+            if type(window) is not int or (window != 0 and not 512 <= window <= 65536):
+                raise ValueError(f'{name}.compression_score_window must be 0 or 512..65536')
         self.url = config.get('backend_url','http://127.0.0.1:18216')
         self.limits = {'max_queue':4,'queue_timeout':120,'request_timeout':3600,
                        'prefill_timeout':600,'token_timeout':120,'cancel_grace':5,
@@ -38,6 +100,11 @@ class Router:
         self.limits.update(config.get('serving',{}))
         self.active = self.process = self.log = self.client = None
         self.lock = asyncio.Lock()
+        self.capacity = max(1, int(self.limits.get('max_concurrency', 1)))
+        self.condition = asyncio.Condition()
+        self.waiters = deque()
+        self.inflight = 0
+        self.recycle_pending = False
         self.pending = 0
         self.closing = False
         self.loading = False
@@ -84,6 +151,7 @@ class Router:
             self.log = None
 
     async def load(self, name):
+        name = self.models[name].get('canonical', name)
         if self.closing:
             raise BackendFault('Server is shutting down')
         if self.active == name and self.process and self.process.returncode is None:
@@ -107,13 +175,34 @@ class Router:
             executable = pathlib.Path(backend.get('executable','server/build-hip/dflash_server'))
             if not executable.is_absolute():
                 executable = self.root/executable
-            args = [str(executable),conf['path'],
-                    '--draft',self.config['draft'],'--draft-block-size','16',
-                    '--prefix-cache-slots','2','--max-ctx',str(conf['context']),
+            prefix_slots = str(self.limits.get('prefix_cache_slots',4))
+            concurrency = int(conf.get('max_concurrency', self.capacity))
+            draft = conf.get('draft',self.config.get('draft'))
+            args = [str(executable),conf['path']]
+            if draft:
+                args += ['--draft',draft]
+                if conf.get('draft_block_size'):
+                    args += ['--draft-block-size',str(conf['draft_block_size'])]
+            args += ['--prefix-cache-slots',prefix_slots,'--max-ctx',str(conf['context']),
                     '--cache-type-k','q8_0','--cache-type-v','q8_0',
                     '--host',address.hostname,'--port',str(address.port or 80),'--model-name',name]
+            if concurrency > 1:
+                args += ['--max-concurrency',str(concurrency),
+                         '--concurrent-prefix-cache-max-mib',str(self.limits.get('prefix_cache_max_mib',4096))]
+                if conf.get('kv_pool_tokens'):
+                    args += ['--kv-pool-tokens',str(conf['kv_pool_tokens'])]
+                if self.limits.get('session_prefix_cache_max_tokens'):
+                    args += ['--session-prefix-cache-max-tokens',
+                             str(self.limits['session_prefix_cache_max_tokens'])]
             args.extend(backend.get('extra_args',[]))
+            args.extend(conf.get('extra_args', []))
             env = os.environ.copy()
+            env['DFLASH_COMPRESS_SCORE_WINDOW'] = str(conf.get('compression_score_window', 0))
+            env['DFLASH_HYBRID_PROJECTIONS'] = '1' if conf.get('hybrid_projections', False) else '0'
+            env['DFLASH_HYBRID_CACHE'] = conf.get('hybrid_cache', 'off')
+            env['DFLASH_HYBRID_CALIBRATION'] = conf.get('hybrid_calibration', '')
+            if self.prefix_cache_device is not None:
+                env['DFLASH_PREFIX_CACHE_DEVICE'] = self.prefix_cache_device
             library_path = backend.get('library_path')
             if library_path:
                 env['LD_LIBRARY_PATH'] = library_path+(':'+env['LD_LIBRARY_PATH'] if env.get('LD_LIBRARY_PATH') else '')
@@ -166,7 +255,7 @@ class Router:
                 status = 'ok' if ready else 'unavailable'
             except (ClientError,asyncio.TimeoutError):
                 ready, status = False, 'unresponsive'
-        return web.json_response({'status':status,'active_model':self.active,'busy':self.lock.locked(),
+        return web.json_response({'status':status,'active_model':self.active,'busy':bool(self.inflight or self.lock.locked()),'active_requests':self.inflight,'max_concurrency':self.capacity,
                                   'pending_requests':self.pending,'counters':dict(self.counts)},status=200 if ready else 503,headers=CORS)
 
     async def client_watch(self, request):
@@ -274,6 +363,18 @@ class Router:
         return out
 
     async def run_request(self, request, data):
+        model = self.models.get(data.get('model'), {})
+        if model.get('hybrid_cache', 'off') != 'off' and request.path != '/cache/release':
+            extra = data.setdefault('extra_body', {})
+            if not isinstance(extra, dict):return self.error(400,'invalid_request','extra_body must be an object')
+            meta = extra.setdefault('lucebox_cache', {})
+            if not isinstance(meta, dict):return self.error(400,'invalid_request','lucebox_cache must be an object')
+            meta.setdefault('mode', model.get('cache_default_policy', 'exact'))
+            deadline = int((time.time()+self.limits['request_timeout'])*1000)
+            supplied = meta.get('deadline_unix_ms', deadline)
+            if type(supplied) is not int or supplied < 0:
+                return self.error(400,'invalid_request','Invalid request deadline')
+            meta['deadline_unix_ms'] = min(supplied or deadline, deadline)
         state = ForwardState()
         operation = asyncio.create_task(self.forward(request,json.dumps(data).encode(),state))
         watch = asyncio.create_task(self.client_watch(request))
@@ -288,7 +389,7 @@ class Router:
             operation.cancel()
             with contextlib.suppress(asyncio.CancelledError,Exception):
                 await operation
-            await self.settle_cancelled_backend()
+            await self.recover_request(cancelled=True)
             return state.response or web.Response(status=499)
         except (asyncio.TimeoutError,ClientError,BackendFault) as e:
             self.counts['failed'] += 1
@@ -299,19 +400,62 @@ class Router:
             result = await self.fail_forward(state,504 if timed_out else 502,
                 'inference_timeout' if timed_out else 'backend_failure',
                 'Inference made no progress within its deadline; retry the request.' if timed_out else 'Backend connection failed; retry the request.')
-            self.counts['backend_recycles'] += 1
-            await self.stop()
+            await self.recover_request()
             return result
         except asyncio.CancelledError:
             operation.cancel()
             with contextlib.suppress(asyncio.CancelledError,Exception):
                 await operation
-            await self.settle_cancelled_backend()
+            await self.recover_request(cancelled=True)
             raise
         finally:
             watch.cancel()
             with contextlib.suppress(asyncio.CancelledError,Exception):
                 await watch
+
+    async def acquire_slot(self, name):
+        if self.warmup:
+            await asyncio.shield(self.warmup)
+        ticket = object()
+        async with self.condition:
+            self.waiters.append(ticket)
+            try:
+                while True:
+                    limit = int(self.models[name].get('max_concurrency',self.capacity))
+                    if (self.waiters[0] is ticket and not self.recycle_pending and
+                        self.inflight < limit and
+                        (self.inflight == 0 or self.active == name)):
+                        if self.inflight == 0:
+                            await self.load(name)
+                        self.inflight += 1
+                        return
+                    await self.condition.wait()
+            finally:
+                self.waiters.remove(ticket)
+                self.condition.notify_all()
+
+    async def release_slot(self):
+        async with self.condition:
+            self.inflight -= 1
+            if self.inflight == 0 and self.recycle_pending:
+                try:
+                    await self.stop()
+                finally:
+                    self.recycle_pending = False
+            self.condition.notify_all()
+
+    async def recover_request(self, cancelled=False):
+        if self.capacity == 1:
+            if cancelled:
+                await self.settle_cancelled_backend()
+            else:
+                self.counts['backend_recycles'] += 1
+                await self.stop()
+        elif not cancelled:
+            # A failing stream must not terminate peers sharing the model.
+            # Stop admitting work and recycle once the active cohort drains.
+            self.recycle_pending = True
+            self.counts['backend_recycles'] += 1
 
     async def handle(self, request):
         if request.method == 'OPTIONS':
@@ -329,7 +473,7 @@ class Router:
                 return await self.fail_forward(state,503,'backend_unavailable','Backend unavailable')
         if self.closing:
             return self.error(503,'shutting_down','Server is shutting down')
-        if self.pending >= self.limits['max_queue']+1:
+        if self.pending >= self.limits['max_queue']+self.capacity:
             self.counts['queue_rejected'] += 1
             return self.error(429,'server_busy','Inference queue is full; retry later')
         self.pending += 1
@@ -344,22 +488,35 @@ class Router:
                 return self.error(400,'invalid_request','Expected a JSON object within the upload deadline')
             if not isinstance(data,dict):
                 return self.error(400,'invalid_request','Expected a JSON object')
+            try:
+                normalize_session_id(data, request.headers)
+                normalize_cache_metadata(data, request.headers)
+            except ValueError as exc:
+                return self.error(400, 'invalid_session_id', str(exc))
             name = data.get('model',self.default)
             if name == 'dflash':
                 name = self.default
             if not isinstance(name,str) or name not in self.models:
                 return self.error(404,'model_not_found','Unknown model. Use /v1/models.')
+            name = self.models[name].get('canonical', name)
             data['model'] = name
             try:
-                await asyncio.wait_for(self.lock.acquire(),self.limits['queue_timeout'])
+                if self.capacity > 1:
+                    await asyncio.wait_for(self.acquire_slot(name),self.limits['queue_timeout'])
+                else:
+                    await asyncio.wait_for(self.lock.acquire(),self.limits['queue_timeout'])
                 acquired = True
             except asyncio.TimeoutError:
                 self.counts['queue_rejected'] += 1
                 return self.error(429,'queue_timeout','Inference queue wait expired; retry later')
+            except (BackendFault,ClientError,OSError):
+                logging.exception('Concurrent model load failed')
+                return self.error(503,'backend_unavailable','Model could not be loaded; retry later')
             if request.transport is None or request.transport.is_closing():
                 return web.Response(status=499)
             try:
-                await self.load(name)
+                if self.capacity == 1:
+                    await self.load(name)
             except (BackendFault,asyncio.TimeoutError,ClientError,OSError):
                 logging.exception('Model load failed')
                 return self.error(503,'backend_unavailable','Model could not be loaded; retry later')
@@ -367,7 +524,10 @@ class Router:
             return await self.run_request(request,data)
         finally:
             if acquired:
-                self.lock.release()
+                if self.capacity > 1:
+                    await self.release_slot()
+                else:
+                    self.lock.release()
             self.pending -= 1
 
 def create_app(config, router=None):

@@ -255,7 +255,8 @@ bool MoeHybridStorage::matches(const MoeHybridConfig & cfg) const {
            (int)layers.size() == cfg.n_layer &&
            cold_backend_kind == cfg.cold_expert_backend &&
            materialized_hot_experts == cfg.materialize_hot_experts &&
-           materialized_cold_experts == cfg.materialize_cold_experts;
+           materialized_cold_experts == cfg.materialize_cold_experts &&
+           mixed_mmq_policy == cfg.mixed_mmq_policy;
 }
 
 bool MoeHybridStorage::empty() const {
@@ -288,6 +289,7 @@ bool build_moe_hybrid_storage(const MoeHybridConfig & cfg,
     ggml_backend_cpu_set_n_threads(out.cpu_backend, std::max(1, std::min(cfg.n_expert_used, 8)));
     out.cold_backend_kind = cfg.cold_expert_backend;
     out.materialized_hot_experts = cfg.materialize_hot_experts;
+    out.mixed_mmq_policy = cfg.mixed_mmq_policy;
     out.materialized_cold_experts = cfg.materialize_cold_experts;
     out.cold_backend = cfg.cold_expert_backend == MoeHybridColdBackend::Gpu
         ? (cold_gpu_backend ? cold_gpu_backend : gpu_backend)
@@ -502,6 +504,7 @@ bool build_moe_hybrid_storage_from_file(
     ggml_backend_cpu_set_n_threads(out.cpu_backend, std::max(1, std::min(cfg.n_expert_used, 8)));
     out.cold_backend_kind = cfg.cold_expert_backend;
     out.materialized_hot_experts = cfg.materialize_hot_experts;
+    out.mixed_mmq_policy = cfg.mixed_mmq_policy;
     out.materialized_cold_experts = cfg.materialize_cold_experts;
     out.cold_backend = cfg.cold_expert_backend == MoeHybridColdBackend::Gpu
         ? (cold_gpu_backend ? cold_gpu_backend : gpu_backend)

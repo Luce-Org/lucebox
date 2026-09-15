@@ -6,6 +6,16 @@
 #include "fattn-wmma-f16.cuh"
 #include "fattn-chunked.cuh"
 #include "fattn.cuh"
+#include "ds4-env.cuh"
+#include "ds4-causal.h"
+
+#include <type_traits>
+
+static thread_local size_t g_mla_stream_topk_launch_count = 0;
+
+extern "C" size_t ggml_backend_cuda_get_mla_stream_topk_launch_count(void) {
+    return g_mla_stream_topk_launch_count;
+}
 
 #if defined(GGML_USE_HIP)
 
@@ -103,6 +113,7 @@ struct ds4_inverse_rope_params {
     int   enabled;
     int   forward_q_enabled;
     int   kv_start;
+    const int32_t * positions;
     float freq_scale;
     float ext_factor;
     float attn_factor;
@@ -157,7 +168,8 @@ __device__ static __forceinline__ void ds4_inverse_rope_coefficients(
         const ds4_inverse_rope_params & p,
         float & cos_theta, float & sin_theta) {
     ds4_rope_coefficients_at_position(
-        pair, -(p.kv_start + token), p, cos_theta, sin_theta);
+        pair, -(p.positions ? p.positions[token] : p.kv_start + token),
+        p, cos_theta, sin_theta);
 }
 
 // Forward counterpart of ds4_inverse_rope_coefficients. Keep the expressions
@@ -169,7 +181,8 @@ __device__ static __forceinline__ void ds4_forward_rope_coefficients(
         const ds4_inverse_rope_params & p,
         float & cos_theta, float & sin_theta) {
     ds4_rope_coefficients_at_position(
-        pair, p.kv_start + token, p, cos_theta, sin_theta);
+        pair, p.positions ? p.positions[token] : p.kv_start + token,
+        p, cos_theta, sin_theta);
 }
 
 __device__ static __forceinline__ void ds4_apply_inverse_rope_pair(
@@ -296,6 +309,29 @@ __global__ static void ds4_fa_visibility_bounds_kernel(
         token_bounds[2] = comp_first;
         token_bounds[3] = comp_last;
     }
+}
+
+// Exact DS4 ratio-4 layer-major visibility without a materialized mask.
+// Physical raw rows are [prior chronological SWA | current chunk]. A
+// compressed row becomes visible only after its four source tokens complete.
+__global__ static void ds4_fa_ratio4_causal_bounds_kernel(
+        int * bounds,
+        int   n_tokens,
+        int   n_kv,
+        int   raw_rows,
+        int   raw_window,
+        int   kv_start) {
+    const int t = (int) blockIdx.x * (int) blockDim.x +
+                  (int) threadIdx.x;
+    if (t >= n_tokens) return;
+
+    const auto visible = ds4_ratio4_causal_visibility(
+        t, n_tokens, raw_rows, n_kv - raw_rows, raw_window, kv_start);
+    int * token_bounds = bounds + (size_t) t * 4;
+    token_bounds[0] = visible.raw_first;
+    token_bounds[1] = visible.raw_last;
+    token_bounds[2] = visible.comp_first;
+    token_bounds[3] = visible.comp_last;
 }
 
 // Convert an externally selected compressed-row mask into exact lookup tables.
@@ -478,7 +514,7 @@ __global__ static void ds4_fa_indexed_rows_parallel_kernel(
 // A shared-memory bitonic sort restores ascending physical-row order, matching
 // the old top-k -> mask -> physical scan path and therefore preserving each
 // reduction lane's accumulation order exactly.
-template <typename Mask>
+template <typename Mask, int SORT_WIDTH, bool RATIO4_CAUSAL = false>
 __global__ static void ds4_fa_indexed_rows_topk_kernel(
         const Mask    * mask,
         const int32_t * topk,
@@ -489,12 +525,12 @@ __global__ static void ds4_fa_indexed_rows_topk_kernel(
         int             n_tokens,
         int             n_kv,
         int             raw_rows,
-        int             capacity) {
+        int             capacity,
+        int             kv_start = 0) {
     const int t = (int) blockIdx.x;
     const int tid = (int) threadIdx.x;
     if (t >= n_tokens) return;
 
-    constexpr int SORT_WIDTH = 512;
     constexpr int N_OWNERS = 256;
     constexpr int INVALID_ROW = 0x7fffffff;
     __shared__ int sorted_rows[SORT_WIDTH];
@@ -502,7 +538,8 @@ __global__ static void ds4_fa_indexed_rows_topk_kernel(
     __shared__ int count;
 
     const int n_comp_rows = n_kv - raw_rows;
-    const Mask * token_mask = mask + (size_t) t * n_kv;
+    const Mask * token_mask = RATIO4_CAUSAL
+        ? nullptr : mask + (size_t) t * n_kv;
     const int32_t * token_topk = topk + (size_t) t * capacity;
     int * token_rows = selected_rows + (size_t) t * capacity;
     int * token_owner_offsets = owner_offsets + (size_t) t * (N_OWNERS + 1);
@@ -512,8 +549,14 @@ __global__ static void ds4_fa_indexed_rows_topk_kernel(
     if (tid < capacity) {
         const int comp = token_topk[tid];
         const int physical = raw_rows + comp;
-        if (comp >= 0 && comp < n_comp_rows &&
-            ds4_fa_load<Mask, Mask>(token_mask + physical) > -1.0e20f) {
+        bool visible = comp >= 0 && comp < n_comp_rows;
+        if constexpr (RATIO4_CAUSAL) {
+            visible = visible && comp < (kv_start + t + 1) / 4;
+        } else {
+            visible = visible &&
+                ds4_fa_load<Mask, Mask>(token_mask + physical) > -1.0e20f;
+        }
+        if (visible) {
             row = physical;
         }
     }
@@ -570,6 +613,26 @@ __global__ static void ds4_fa_indexed_rows_topk_kernel(
                 token_owner_ranks[write++] = rank;
             }
         }
+    }
+}
+
+template <typename Mask>
+static void ds4_launch_indexed_rows_topk(
+        const Mask * mask, const int32_t * topk,
+        int * selected_rows, int * selected_counts,
+        int * owner_offsets, int * owner_ranks,
+        int n_tokens, int n_kv, int raw_rows, int capacity,
+        cudaStream_t stream) {
+    // The learned top-512 stays on its original launch. A batched verifier
+    // appends a small saved-raw suffix and needs the next sorting bucket.
+    if (capacity <= 512) {
+        ds4_fa_indexed_rows_topk_kernel<Mask, 512><<<n_tokens, 512, 0, stream>>>(
+            mask, topk, selected_rows, selected_counts, owner_offsets, owner_ranks,
+            n_tokens, n_kv, raw_rows, capacity);
+    } else {
+        ds4_fa_indexed_rows_topk_kernel<Mask, 1024><<<n_tokens, 1024, 0, stream>>>(
+            mask, topk, selected_rows, selected_counts, owner_offsets, owner_ranks,
+            n_tokens, n_kv, raw_rows, capacity);
     }
 }
 
@@ -929,6 +992,8 @@ __global__ static void ds4_flash_attn_d512_shared_kv_grouped_kernel(
     for (int j = 0; j < HEADS_PER_BLOCK; ++j) {
         max_score[j] = reduction[(size_t) j * N_THREADS];
     }
+    // Retire all reads of the maxima before reusing reduction for sums.
+    __syncthreads();
     for (int r = tid; r < n_kv; r += blockDim.x) {
 #pragma unroll
         for (int j = 0; j < HEADS_PER_BLOCK; ++j) {
@@ -1090,7 +1155,7 @@ __global__ static void ds4_flash_attn_d512_shared_kv_grouped_kernel(
 // every visible row keeps its original owner thread, dot-product order,
 // reduction tree, softmax order, and value-accumulation position.
 template <typename KV, typename Mask, int HEADS_PER_BLOCK, bool INDEXED_MASK,
-          int VALUES_PER_THREAD>
+          bool MASKLESS_CAUSAL, int VALUES_PER_THREAD, bool QUAD_DOT = false>
 __global__ static void ds4_flash_attn_d512_shared_kv_grouped_compact_kernel(
         float       * dst,
         const float * q,
@@ -1184,9 +1249,9 @@ __global__ static void ds4_flash_attn_d512_shared_kv_grouped_compact_kernel(
         local_max[j] = h < n_heads && sinks
             ? sinks[h] : -3.402823466e38f;
     }
-    // Build the full kernel's exact per-head non-zero envelope while the
-    // softmax weights are emitted. This avoids rescanning every context row
-    // after softmax without changing the subsequent V accumulation interval.
+    // Reserve the exact per-head nonzero envelopes. Scalar paths update them
+    // while emitting weights; the eight-head path scans bounded scores later.
+    // Both preserve the full kernel's value-accumulation interval and order.
     if (tid < HEADS_PER_BLOCK * 4) {
         const int slot = tid & 3;
         value_bounds[tid] = slot == 0
@@ -1244,22 +1309,46 @@ __global__ static void ds4_flash_attn_d512_shared_kv_grouped_compact_kernel(
             }
         }
 
-        const float mask_v = ds4_fa_load<Mask, Mask>(
-            mask + (size_t) t * n_kv + r);
+        float mask_v = 0.0f;
+        if constexpr (!MASKLESS_CAUSAL) {
+            mask_v = ds4_fa_load<Mask, Mask>(
+                mask + (size_t) t * n_kv + r);
+        }
         const bool visible = mask_v > -1.0e20f;
         float dot[HEADS_PER_BLOCK] = {};
         if (visible) {
             const KV * kr = k + (size_t) r * D;
+            if constexpr (QUAD_DOT) {
+                // Bound code expansion for the eight-head HIP path while
+                // preserving the original sequential FMAs in each head.
+#pragma unroll 4
+                for (int d = 0; d < D; d += 4) {
+                    float k0, k1, k2, k3;
+                    ds4_fa_load_quad<KV>(kr + d, k0, k1, k2, k3);
 #pragma unroll
-            for (int d = 0; d < D; ++d) {
-                const float kv = ds4_fa_load<KV, Mask>(kr + d);
+                    for (int j = 0; j < HEADS_PER_BLOCK; ++j) {
+                        const float * qr = inverse_rope.forward_q_enabled && d >= D - 64
+                            ? q_rope_tail + (size_t) j * 64 + d - (D - 64)
+                            : qh[j] + d;
+                        // Keep the four FMAs in the original dimension order.
+                        dot[j] += qr[0] * k0;
+                        dot[j] += qr[1] * k1;
+                        dot[j] += qr[2] * k2;
+                        dot[j] += qr[3] * k3;
+                    }
+                }
+            } else {
 #pragma unroll
-                for (int j = 0; j < HEADS_PER_BLOCK; ++j) {
-                    const float qv =
-                        inverse_rope.forward_q_enabled && d >= D - 64
-                            ? q_rope_tail[(size_t) j * 64 + d - (D - 64)]
-                            : qh[j][d];
-                    dot[j] += qv * kv;
+                for (int d = 0; d < D; ++d) {
+                    const float kv = ds4_fa_load<KV, Mask>(kr + d);
+#pragma unroll
+                    for (int j = 0; j < HEADS_PER_BLOCK; ++j) {
+                        const float qv =
+                            inverse_rope.forward_q_enabled && d >= D - 64
+                                ? q_rope_tail[(size_t) j * 64 + d - (D - 64)]
+                                : qh[j][d];
+                        dot[j] += qv * kv;
+                    }
                 }
             }
         }
@@ -1295,6 +1384,8 @@ __global__ static void ds4_flash_attn_d512_shared_kv_grouped_compact_kernel(
     for (int j = 0; j < HEADS_PER_BLOCK; ++j) {
         max_score[j] = reduction[(size_t) j * N_THREADS];
     }
+    // Retire all reads of the maxima before reusing reduction for sums.
+    __syncthreads();
     for (int iteration = 0; iteration < score_iteration_count; ++iteration) {
         int score_index;
         int bound_value;
@@ -1328,10 +1419,12 @@ __global__ static void ds4_flash_attn_d512_shared_kv_grouped_compact_kernel(
             const float weight = expf(*score - max_score[j]);
             *score = weight;
             local_sum[j] += weight;
-            if (weight != 0.0f) {
-                int * bounds = value_bounds + 4 * j + (raw_value ? 0 : 2);
-                atomicMin(bounds + 0, bound_value);
-                atomicMax(bounds + 1, bound_value);
+            if constexpr (!QUAD_DOT) {
+                if (weight != 0.0f) {
+                    int * bounds = value_bounds + 4 * j + (raw_value ? 0 : 2);
+                    atomicMin(bounds + 0, bound_value);
+                    atomicMax(bounds + 1, bound_value);
+                }
             }
         }
     }
@@ -1358,14 +1451,50 @@ __global__ static void ds4_flash_attn_d512_shared_kv_grouped_compact_kernel(
         __syncthreads();
     }
 
+    if constexpr (QUAD_DOT) {
+        static_assert(INDEXED_MASK && HEADS_PER_BLOCK == 8);
+        // One wave scans each head's completed weights. Integer min/max
+        // replaces contended per-weight atomics without touching the score,
+        // softmax, or value arithmetic. The sum reduction above has already
+        // made every weight visible to every wave in the block.
+        constexpr int WAVE = 32;
+        const int head = tid / WAVE;
+        const int lane = tid % WAVE;
+        const float * head_scores = scores + (size_t) head * score_stride;
+        int first_raw = raw_rows, last_raw = -1;
+        int first_comp = indexed_count, last_comp = -1;
+        for (int r = mask_raw_first + lane; r <= mask_raw_last; r += WAVE) {
+            if (head_scores[r - mask_raw_first] != 0.0f) {
+                first_raw = min(first_raw, r);
+                last_raw = max(last_raw, r);
+            }
+        }
+        for (int rank = lane; rank < indexed_count; rank += WAVE) {
+            if (head_scores[raw_score_capacity + rank] != 0.0f) {
+                first_comp = min(first_comp, rank);
+                last_comp = max(last_comp, rank);
+            }
+        }
+#pragma unroll
+        for (int delta = WAVE / 2; delta > 0; delta >>= 1) {
+            first_raw = min(first_raw, __shfl_xor_sync(0xffffffffu, first_raw, delta, WAVE));
+            last_raw = max(last_raw, __shfl_xor_sync(0xffffffffu, last_raw, delta, WAVE));
+            first_comp = min(first_comp, __shfl_xor_sync(0xffffffffu, first_comp, delta, WAVE));
+            last_comp = max(last_comp, __shfl_xor_sync(0xffffffffu, last_comp, delta, WAVE));
+        }
+        if (lane == 0) {
+            value_bounds[4 * head + 0] = first_raw;
+            value_bounds[4 * head + 1] = last_raw;
+            value_bounds[4 * head + 2] = first_comp;
+            value_bounds[4 * head + 3] = last_comp;
+        }
+    }
+
     float inv_denom[HEADS_PER_BLOCK];
 #pragma unroll
     for (int j = 0; j < HEADS_PER_BLOCK; ++j) {
         inv_denom[j] = 1.0f / reduction[(size_t) j * N_THREADS];
     }
-
-    // Finish the shared envelope before the value phase reads it.
-    __syncthreads();
 
     int raw_first = raw_rows;
     int raw_last = -1;
@@ -1375,6 +1504,8 @@ __global__ static void ds4_flash_attn_d512_shared_kv_grouped_compact_kernel(
     int head_raw_last[HEADS_PER_BLOCK];
     int head_comp_first[HEADS_PER_BLOCK];
     int head_comp_last[HEADS_PER_BLOCK];
+    // Finish the shared envelope before the value phase reads it.
+    __syncthreads();
 #pragma unroll
     for (int j = 0; j < HEADS_PER_BLOCK; ++j) {
         const int * bounds = value_bounds + 4 * j;
@@ -1555,6 +1686,596 @@ __global__ static void ds4_flash_attn_d512_shared_kv_grouped_compact_kernel(
     }
 }
 
+// Streaming indexed MLA for long prefill.  The compact grouped kernel above
+// stores every score and then reloads V.  Once the trained indexer has reduced
+// the compressed history to a bounded top-k set, that extra traffic is no
+// longer necessary: stage one latent row in LDS, share it across the heads in
+// a block, and update online-softmax state while the row is resident. Sixteen
+// wave32 heads amortize each LDS load best on gfx1151. The contract is
+// backend-generic (D512 MQA with K == V and direct indexed rows); model policy
+// remains in the graph/backend layer.
+template <typename KV, typename Mask, int HEADS_PER_BLOCK = 16,
+          int KEYS_PER_STAGE = 16, bool STAGE_F32 = false,
+          bool FAST_EXP = false, bool MASKLESS_CAUSAL = false>
+__global__ static void ds4_flash_attn_d512_streaming_topk_kernel(
+        float       * dst,
+        const float * q,
+        size_t        q_stride_token,
+        size_t        q_stride_head,
+        const KV    * kv,
+        const Mask  * mask,
+        const float * sinks,
+        int           n_tokens,
+        int           n_heads,
+        int           n_kv,
+        float         scale,
+        const int   * visibility_bounds,
+        const int   * indexed_rows,
+        const int   * indexed_counts,
+        int           indexed_capacity,
+        ds4_inverse_rope_params inverse_rope,
+        const float * inverse_rope_coefficients,
+        const float * forward_rope_coefficients) {
+    constexpr int D = 512;
+    constexpr int WAVE = 32;
+    constexpr int N_THREADS = HEADS_PER_BLOCK * WAVE;
+    constexpr int VALUES_PER_LANE = D / WAVE;
+    static_assert(HEADS_PER_BLOCK == 16);
+    static_assert(KEYS_PER_STAGE == 16);
+    static_assert(N_THREADS == 512);
+
+    const int token = (int) blockIdx.x;
+    const int head_begin = (int) blockIdx.y * HEADS_PER_BLOCK;
+    const int tid = (int) threadIdx.x;
+    const int wave = tid / WAVE;
+    const int lane = tid & (WAVE - 1);
+    const int head = head_begin + wave;
+
+    // The launch gate makes the grid exact.  Keeping every thread live is
+    // required because each stage has workgroup-wide barriers.
+    if (token >= n_tokens || head_begin + HEADS_PER_BLOCK > n_heads) return;
+
+    using stage_type = std::conditional_t<STAGE_F32, float, KV>;
+    __shared__ __align__(16) stage_type staged_kv[KEYS_PER_STAGE * D];
+    __shared__ int staged_rows[KEYS_PER_STAGE];
+    __shared__ float staged_masks[KEYS_PER_STAGE];
+
+    const int * token_visibility = visibility_bounds + (size_t) token * 4;
+    const int raw_first = token_visibility[0];
+    const int raw_last = token_visibility[1];
+    const int raw_count = raw_last >= raw_first
+        ? raw_last - raw_first + 1 : 0;
+    const int indexed_count = indexed_counts[token];
+    const int total_rows = raw_count + indexed_count;
+    const int * token_rows = indexed_rows +
+        (size_t) token * indexed_capacity;
+    const Mask * token_mask = MASKLESS_CAUSAL
+        ? nullptr : mask + (size_t) token * n_kv;
+
+    const float * qh = q + (size_t) token * q_stride_token +
+        (size_t) head * q_stride_head;
+    float q_values[VALUES_PER_LANE];
+    float accum[VALUES_PER_LANE] = {};
+#pragma unroll
+    for (int i = 0; i < VALUES_PER_LANE; ++i) {
+        const int dim = lane + i * WAVE;
+        float qv = qh[dim];
+        if (inverse_rope.forward_q_enabled && dim >= D - 64) {
+            const int pair = (dim - (D - 64)) / 2;
+            const float x0 = qh[D - 64 + 2 * pair + 0];
+            const float x1 = qh[D - 64 + 2 * pair + 1];
+            const size_t coefficient_index =
+                ((size_t) token * 32 + (size_t) pair) * 2;
+            float y0;
+            float y1;
+            ds4_apply_inverse_rope_pair(
+                x0, x1,
+                forward_rope_coefficients[coefficient_index + 0],
+                forward_rope_coefficients[coefficient_index + 1],
+                y0, y1);
+            qv = (dim & 1) == 0 ? y0 : y1;
+        }
+        q_values[i] = qv;
+    }
+
+    float row_max = -3.402823466e38f;
+    float row_sum = 0.0f;
+    for (int row_base = 0; row_base < total_rows;
+         row_base += KEYS_PER_STAGE) {
+        if (tid < KEYS_PER_STAGE) {
+            const int selected = row_base + tid;
+            int row = -1;
+            if (selected < raw_count) {
+                row = raw_first + selected;
+            } else if (selected < total_rows) {
+                row = token_rows[selected - raw_count];
+            }
+            staged_rows[tid] = row;
+            if constexpr (MASKLESS_CAUSAL) {
+                staged_masks[tid] = row >= 0 && row < n_kv
+                    ? 0.0f : -3.402823466e38f;
+            } else {
+                staged_masks[tid] = row >= 0 && row < n_kv
+                    ? ds4_fa_load<Mask, Mask>(token_mask + row)
+                    : -3.402823466e38f;
+            }
+        }
+        __syncthreads();
+
+        // Convert aligned half2 pairs once while loading them. Every head in
+        // the block then consumes the same F32 LDS values without repeating
+        // half conversion in both the score and value passes.
+        if constexpr (STAGE_F32 && std::is_same_v<KV, half>) {
+            constexpr int PAIRS_PER_ROW = D / 2;
+            for (int pair_index = tid;
+                 pair_index < KEYS_PER_STAGE * PAIRS_PER_ROW;
+                 pair_index += N_THREADS) {
+                const int slot = pair_index / PAIRS_PER_ROW;
+                const int pair = pair_index - slot * PAIRS_PER_ROW;
+                const int row = staged_rows[slot];
+                float2 unpacked = make_float2(0.0f, 0.0f);
+                if (row >= 0 && row < n_kv) {
+                    ds4_fa_load_pair(
+                        kv + (size_t) row * D + 2 * pair,
+                        unpacked.x, unpacked.y);
+                }
+                reinterpret_cast<float2 *>(staged_kv)[pair_index] = unpacked;
+            }
+        } else {
+            for (int index = tid; index < KEYS_PER_STAGE * D;
+                 index += N_THREADS) {
+                const int slot = index / D;
+                const int dim = index - slot * D;
+                const int row = staged_rows[slot];
+                staged_kv[index] = row >= 0 && row < n_kv
+                    ? static_cast<stage_type>(kv[(size_t) row * D + dim])
+                    : stage_type{};
+            }
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int slot = 0; slot < KEYS_PER_STAGE; ++slot) {
+            const int selected = row_base + slot;
+            if (selected >= total_rows) continue;
+            const float mask_value = staged_masks[slot];
+            if (mask_value <= -1.0e20f) continue;
+
+            float partial = 0.0f;
+#pragma unroll
+            for (int i = 0; i < VALUES_PER_LANE; ++i) {
+                const int dim = lane + i * WAVE;
+                partial += q_values[i] *
+                    ds4_fa_load<stage_type, stage_type>(
+                        staged_kv + slot * D + dim);
+            }
+            partial = warp_reduce_sum<WAVE>(partial);
+            // XOR reduction can associate operands differently in each lane.
+            // Broadcast lane zero so every output dimension advances one
+            // identical softmax state.
+            partial = __shfl_sync(0xffffffffu, partial, 0, WAVE);
+
+            const float score = partial * scale + mask_value;
+            const float next_max = fmaxf(row_max, score);
+            float old_scale = 0.0f;
+            float value_scale = 0.0f;
+            if (lane == 0) {
+                old_scale = row_sum == 0.0f
+                    ? 0.0f
+                    : (FAST_EXP
+                        ? __expf(row_max - next_max)
+                        : expf(row_max - next_max));
+                value_scale = FAST_EXP
+                    ? __expf(score - next_max)
+                    : expf(score - next_max);
+            }
+            old_scale = __shfl_sync(0xffffffffu, old_scale, 0, WAVE);
+            value_scale = __shfl_sync(0xffffffffu, value_scale, 0, WAVE);
+            row_sum = row_sum * old_scale + value_scale;
+            row_max = next_max;
+#pragma unroll
+            for (int i = 0; i < VALUES_PER_LANE; ++i) {
+                const int dim = lane + i * WAVE;
+                const float value = ds4_fa_load<stage_type, stage_type>(
+                    staged_kv + slot * D + dim);
+                accum[i] = accum[i] * old_scale + value_scale * value;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (sinks) {
+        const float sink = sinks[head];
+        const float next_max = fmaxf(row_max, sink);
+        float old_scale = 0.0f;
+        float sink_scale = 0.0f;
+        if (lane == 0) {
+            old_scale = row_sum == 0.0f
+                ? 0.0f
+                : (FAST_EXP
+                    ? __expf(row_max - next_max)
+                    : expf(row_max - next_max));
+            sink_scale = FAST_EXP
+                ? __expf(sink - next_max)
+                : expf(sink - next_max);
+        }
+        old_scale = __shfl_sync(0xffffffffu, old_scale, 0, WAVE);
+        sink_scale = __shfl_sync(0xffffffffu, sink_scale, 0, WAVE);
+        row_sum = row_sum * old_scale + sink_scale;
+#pragma unroll
+        for (int i = 0; i < VALUES_PER_LANE; ++i) {
+            accum[i] *= old_scale;
+        }
+    }
+
+    const float inv_sum = row_sum == 0.0f ? 0.0f : 1.0f / row_sum;
+    float * out = dst +
+        ((size_t) token * (size_t) n_heads + (size_t) head) * D;
+#pragma unroll
+    for (int i = 0; i < VALUES_PER_LANE; ++i) {
+        const int dim = lane + i * WAVE;
+        float value = accum[i] * inv_sum;
+        if (inverse_rope.enabled && dim >= D - 64) {
+            const float partner = __shfl_xor_sync(
+                0xffffffffu, value, 1, WAVE);
+            const float x0 = (dim & 1) == 0 ? value : partner;
+            const float x1 = (dim & 1) == 0 ? partner : value;
+            const int pair = (dim - (D - 64)) / 2;
+            const size_t coefficient_index =
+                ((size_t) token * 32 + (size_t) pair) * 2;
+            float y0;
+            float y1;
+            ds4_apply_inverse_rope_pair(
+                x0, x1,
+                inverse_rope_coefficients[coefficient_index + 0],
+                inverse_rope_coefficients[coefficient_index + 1],
+                y0, y1);
+            value = (dim & 1) == 0 ? y0 : y1;
+        }
+        out[dim] = value;
+    }
+}
+
+// Split-KV decode for indexed MLA.  A single grouped block leaves most of a
+// wide RDNA GPU idle when q is small: DS4 has 64 heads, so the four-head
+// kernel exposes only 16 blocks per layer.  Split the bounded raw+top-k row
+// set across four blocks, retain online-softmax state per split, then combine
+// the states in a second kernel.  The implementation is expressed in terms of
+// the D512 latent-attention contract rather than model weights, so future MLA
+// models using the same layout can reuse it.
+template <typename KV, typename Mask, int HEADS_PER_BLOCK, int N_SPLITS>
+__global__ static void ds4_flash_attn_d512_indexed_split_stage1_kernel(
+        float       * partial,
+        const float * q,
+        size_t        q_stride_token,
+        size_t        q_stride_head,
+        const KV    * k,
+        const KV    * v,
+        const Mask  * mask,
+        const float * sinks,
+        int           n_tokens,
+        int           n_heads,
+        int           n_kv,
+        float         scale,
+        int           raw_rows,
+        int           split_stride,
+        const int   * visibility_bounds,
+        const int   * indexed_rows,
+        const int   * indexed_counts,
+        int           indexed_capacity,
+        ds4_inverse_rope_params inverse_rope,
+        const float * forward_rope_coefficients) {
+    constexpr int D = 512;
+    constexpr int N_THREADS = 256;
+    constexpr int VALUES_PER_THREAD = 4;
+
+    const int token = (int) blockIdx.x;
+    const int head_begin = (int) blockIdx.y * HEADS_PER_BLOCK;
+    const int split = (int) blockIdx.z;
+    const int tid = (int) threadIdx.x;
+    if (token >= n_tokens || head_begin >= n_heads) return;
+
+    extern __shared__ float scratch[];
+    float * scores = scratch;
+    float * reduction = scores + (size_t) HEADS_PER_BLOCK * split_stride;
+    float * q_rope_tail = reduction + (size_t) HEADS_PER_BLOCK * N_THREADS;
+
+    const int raw_first = visibility_bounds
+        ? visibility_bounds[(size_t) token * 4 + 0] : 0;
+    const int raw_last = visibility_bounds
+        ? visibility_bounds[(size_t) token * 4 + 1] : raw_rows - 1;
+    const int raw_count = raw_last >= raw_first
+        ? raw_last - raw_first + 1 : 0;
+    const int indexed_count = indexed_counts[token];
+    const int total_rows = raw_count + indexed_count;
+    const int rows_per_split = (total_rows + N_SPLITS - 1) / N_SPLITS;
+    const int split_begin = split * rows_per_split;
+    const int split_end = min(total_rows, split_begin + rows_per_split);
+    const int * token_indexed_rows = indexed_rows +
+        (size_t) token * indexed_capacity;
+
+    const float * qh[HEADS_PER_BLOCK];
+#pragma unroll
+    for (int j = 0; j < HEADS_PER_BLOCK; ++j) {
+        qh[j] = q + (size_t) token * q_stride_token +
+                (size_t) (head_begin + j) * q_stride_head;
+    }
+
+    if (inverse_rope.forward_q_enabled) {
+        for (int index = tid; index < HEADS_PER_BLOCK * 64;
+             index += N_THREADS) {
+            const int j = index / 64;
+            const int tail_d = index % 64;
+            const int pair = tail_d >> 1;
+            const float x0 = qh[j][D - 64 + 2 * pair + 0];
+            const float x1 = qh[j][D - 64 + 2 * pair + 1];
+            const size_t coefficient =
+                ((size_t) token * 32 + (size_t) pair) * 2;
+            const float cos_theta = forward_rope_coefficients[coefficient + 0];
+            const float sin_theta = forward_rope_coefficients[coefficient + 1];
+            q_rope_tail[(size_t) j * 64 + tail_d] = (tail_d & 1)
+                ? x0 * sin_theta + x1 * cos_theta
+                : x0 * cos_theta - x1 * sin_theta;
+        }
+        __syncthreads();
+    }
+
+    float local_max[HEADS_PER_BLOCK];
+#pragma unroll
+    for (int j = 0; j < HEADS_PER_BLOCK; ++j) {
+        local_max[j] = split == 0 && sinks
+            ? sinks[head_begin + j] : -3.402823466e38f;
+    }
+
+    for (int slot = split_begin + tid; slot < split_end;
+         slot += N_THREADS) {
+        const int row = slot < raw_count
+            ? raw_first + slot
+            : token_indexed_rows[slot - raw_count];
+        const float mask_v = ds4_fa_load<Mask, Mask>(
+            mask + (size_t) token * n_kv + row);
+        const KV * kr = k + (size_t) row * D;
+        float dot[HEADS_PER_BLOCK] = {};
+#pragma unroll
+        for (int d = 0; d < D; ++d) {
+            const float kv = ds4_fa_load<KV, Mask>(kr + d);
+#pragma unroll
+            for (int j = 0; j < HEADS_PER_BLOCK; ++j) {
+                const float qv =
+                    inverse_rope.forward_q_enabled && d >= D - 64
+                        ? q_rope_tail[(size_t) j * 64 + d - (D - 64)]
+                        : qh[j][d];
+                dot[j] += qv * kv;
+            }
+        }
+        const int score_index = slot - split_begin;
+#pragma unroll
+        for (int j = 0; j < HEADS_PER_BLOCK; ++j) {
+            const float score = dot[j] * scale + mask_v;
+            scores[(size_t) j * split_stride + score_index] = score;
+            local_max[j] = fmaxf(local_max[j], score);
+        }
+    }
+
+#pragma unroll
+    for (int j = 0; j < HEADS_PER_BLOCK; ++j) {
+        reduction[(size_t) j * N_THREADS + tid] = local_max[j];
+    }
+    __syncthreads();
+    for (int stride = N_THREADS / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+#pragma unroll
+            for (int j = 0; j < HEADS_PER_BLOCK; ++j) {
+                float * row = reduction + (size_t) j * N_THREADS;
+                row[tid] = fmaxf(row[tid], row[tid + stride]);
+            }
+        }
+        __syncthreads();
+    }
+
+    float split_max[HEADS_PER_BLOCK];
+    float local_sum[HEADS_PER_BLOCK] = {};
+#pragma unroll
+    for (int j = 0; j < HEADS_PER_BLOCK; ++j) {
+        split_max[j] = reduction[(size_t) j * N_THREADS];
+    }
+    // Every wave must finish reading the maxima before the scratch rows are
+    // reused for sums. A faster wave can otherwise overwrite another's max.
+    __syncthreads();
+    for (int slot = split_begin + tid; slot < split_end;
+         slot += N_THREADS) {
+        const int score_index = slot - split_begin;
+#pragma unroll
+        for (int j = 0; j < HEADS_PER_BLOCK; ++j) {
+            float * score = scores + (size_t) j * split_stride + score_index;
+            const float weight = expf(*score - split_max[j]);
+            *score = weight;
+            local_sum[j] += weight;
+        }
+    }
+    if (tid == 0 && split == 0 && sinks) {
+#pragma unroll
+        for (int j = 0; j < HEADS_PER_BLOCK; ++j) {
+            local_sum[j] += expf(sinks[head_begin + j] - split_max[j]);
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < HEADS_PER_BLOCK; ++j) {
+        reduction[(size_t) j * N_THREADS + tid] = local_sum[j];
+    }
+    __syncthreads();
+    for (int stride = N_THREADS / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+#pragma unroll
+            for (int j = 0; j < HEADS_PER_BLOCK; ++j) {
+                float * row = reduction + (size_t) j * N_THREADS;
+                row[tid] += row[tid + stride];
+            }
+        }
+        __syncthreads();
+    }
+
+    const int d0 = VALUES_PER_THREAD * tid;
+    if (d0 < D) {
+        float acc0[HEADS_PER_BLOCK] = {};
+        float acc1[HEADS_PER_BLOCK] = {};
+        float acc2[HEADS_PER_BLOCK] = {};
+        float acc3[HEADS_PER_BLOCK] = {};
+        for (int slot = split_begin; slot < split_end; ++slot) {
+            const int row = slot < raw_count
+                ? raw_first + slot
+                : token_indexed_rows[slot - raw_count];
+            float vv0, vv1, vv2, vv3;
+            ds4_fa_load_quad<KV>(v + (size_t) row * D + d0,
+                                 vv0, vv1, vv2, vv3);
+            const int score_index = slot - split_begin;
+#pragma unroll
+            for (int j = 0; j < HEADS_PER_BLOCK; ++j) {
+                const float weight =
+                    scores[(size_t) j * split_stride + score_index];
+                acc0[j] += weight * vv0;
+                acc1[j] += weight * vv1;
+                acc2[j] += weight * vv2;
+                acc3[j] += weight * vv3;
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < HEADS_PER_BLOCK; ++j) {
+            float * out = partial +
+                (((size_t) token * n_heads + head_begin + j) * N_SPLITS +
+                 split) * (D + 2);
+            out[d0 + 0] = acc0[j];
+            out[d0 + 1] = acc1[j];
+            out[d0 + 2] = acc2[j];
+            out[d0 + 3] = acc3[j];
+        }
+    }
+    if (tid < HEADS_PER_BLOCK) {
+        float * out = partial +
+            (((size_t) token * n_heads + head_begin + tid) * N_SPLITS +
+             split) * (D + 2);
+        out[D + 0] = split_max[tid];
+        out[D + 1] = reduction[(size_t) tid * N_THREADS];
+    }
+}
+
+template <int N_SPLITS>
+__global__ static void ds4_flash_attn_d512_indexed_split_stage2_kernel(
+        float       * dst,
+        const float * partial,
+        int           n_tokens,
+        int           n_heads,
+        ds4_inverse_rope_params inverse_rope,
+        const float * inverse_rope_coefficients) {
+    constexpr int D = 512;
+    const int token = (int) blockIdx.x;
+    const int head = (int) blockIdx.y;
+    const int tid = (int) threadIdx.x;
+    if (token >= n_tokens || head >= n_heads) return;
+
+    __shared__ float global_max;
+    __shared__ float inverse_denom;
+    const float * head_partial = partial +
+        ((size_t) token * n_heads + head) * N_SPLITS * (D + 2);
+    if (tid == 0) {
+        float max_value = -3.402823466e38f;
+#pragma unroll
+        for (int split = 0; split < N_SPLITS; ++split) {
+            max_value = fmaxf(max_value,
+                head_partial[(size_t) split * (D + 2) + D]);
+        }
+        float denom = 0.0f;
+#pragma unroll
+        for (int split = 0; split < N_SPLITS; ++split) {
+            const float * state = head_partial + (size_t) split * (D + 2);
+            denom += state[D + 1] * expf(state[D] - max_value);
+        }
+        global_max = max_value;
+        inverse_denom = 1.0f / denom;
+    }
+    __syncthreads();
+
+    const int d0 = 2 * tid;
+    float x0 = 0.0f;
+    float x1 = 0.0f;
+#pragma unroll
+    for (int split = 0; split < N_SPLITS; ++split) {
+        const float * state = head_partial + (size_t) split * (D + 2);
+        const float rescale = expf(state[D] - global_max);
+        x0 += state[d0 + 0] * rescale;
+        x1 += state[d0 + 1] * rescale;
+    }
+    x0 *= inverse_denom;
+    x1 *= inverse_denom;
+
+    float * out = dst + ((size_t) token * n_heads + head) * D + d0;
+    if (inverse_rope.enabled && d0 >= D - 64) {
+        const int pair = (d0 - (D - 64)) / 2;
+        const size_t coefficient =
+            ((size_t) token * 32 + (size_t) pair) * 2;
+        const float cos_theta = inverse_rope_coefficients[coefficient + 0];
+        const float sin_theta = inverse_rope_coefficients[coefficient + 1];
+        float y0;
+        float y1;
+        ds4_apply_inverse_rope_pair(
+            x0, x1, cos_theta, sin_theta, y0, y1);
+        out[0] = y0;
+        out[1] = y1;
+    } else {
+        out[0] = x0;
+        out[1] = x1;
+    }
+}
+
+template <typename KV, typename Mask, int N_SPLITS>
+static void ds4_launch_flash_attn_d512_indexed_split(
+        float             * dst,
+        float             * partial,
+        const float       * q,
+        size_t              q_stride_token,
+        size_t              q_stride_head,
+        const KV          * k,
+        const KV          * v,
+        const Mask        * mask,
+        const float       * sinks,
+        int                 n_tokens,
+        int                 n_heads,
+        int                 n_kv,
+        float               scale,
+        int                 raw_rows,
+        int                 split_stride,
+        const int         * visibility_bounds,
+        const int         * indexed_rows,
+        const int         * indexed_counts,
+        int                 indexed_capacity,
+        ds4_inverse_rope_params inverse_rope,
+        const float       * inverse_rope_coefficients,
+        const float       * forward_rope_coefficients,
+        cudaStream_t        stream) {
+    constexpr int HEADS_PER_BLOCK = 4;
+    const size_t shmem =
+        ((size_t) HEADS_PER_BLOCK * split_stride +
+         (size_t) HEADS_PER_BLOCK * 256 +
+         (inverse_rope.forward_q_enabled
+             ? (size_t) HEADS_PER_BLOCK * 64 : 0)) * sizeof(float);
+    const dim3 stage1_grid(
+        (unsigned) n_tokens,
+        (unsigned) (n_heads / HEADS_PER_BLOCK),
+        (unsigned) N_SPLITS);
+    ds4_flash_attn_d512_indexed_split_stage1_kernel<
+        KV, Mask, HEADS_PER_BLOCK, N_SPLITS>
+        <<<stage1_grid, 256, shmem, stream>>>(
+            partial, q, q_stride_token, q_stride_head, k, v, mask, sinks,
+            n_tokens, n_heads, n_kv, scale, raw_rows, split_stride,
+            visibility_bounds, indexed_rows, indexed_counts,
+            indexed_capacity, inverse_rope, forward_rope_coefficients);
+    const dim3 stage2_grid((unsigned) n_tokens, (unsigned) n_heads, 1);
+    ds4_flash_attn_d512_indexed_split_stage2_kernel<N_SPLITS>
+        <<<stage2_grid, 256, 0, stream>>>(
+            dst, partial, n_tokens, n_heads, inverse_rope,
+            inverse_rope_coefficients);
+}
+
 template <int HEADS_PER_BLOCK>
 static bool ds4_launch_flash_attn_d512_grouped(
         ggml_tensor       * dst,
@@ -1619,7 +2340,8 @@ static bool ds4_launch_flash_attn_d512_grouped(
     return true;
 }
 
-template <int HEADS_PER_BLOCK, bool INDEXED_MASK, int VALUES_PER_THREAD>
+template <int HEADS_PER_BLOCK, bool INDEXED_MASK, bool MASKLESS_CAUSAL,
+          int VALUES_PER_THREAD>
 static bool ds4_launch_flash_attn_d512_grouped_compact(
         ggml_tensor       * dst,
         const ggml_tensor * Q,
@@ -1649,7 +2371,7 @@ static bool ds4_launch_flash_attn_d512_grouped_compact(
         const float        * forward_rope_coefficients,
         size_t              shmem,
         cudaStream_t        stream) {
-    GGML_ASSERT(mask && visibility_bounds);
+    GGML_ASSERT((MASKLESS_CAUSAL || mask) && visibility_bounds);
     if constexpr (INDEXED_MASK) {
         GGML_ASSERT(indexed_rows && indexed_counts &&
                     indexed_owner_offsets && indexed_owner_ranks);
@@ -1657,14 +2379,15 @@ static bool ds4_launch_flash_attn_d512_grouped_compact(
     dim3 grid(
         (unsigned) n_tokens,
         (unsigned) (n_heads / HEADS_PER_BLOCK), 1);
-    if (kv_f16 && mask->type == GGML_TYPE_F16) {
+    if (kv_f16 && (MASKLESS_CAUSAL || mask->type == GGML_TYPE_F16)) {
         ds4_flash_attn_d512_shared_kv_grouped_compact_kernel<
-            half, half, HEADS_PER_BLOCK, INDEXED_MASK, VALUES_PER_THREAD>
+            half, half, HEADS_PER_BLOCK, INDEXED_MASK, MASKLESS_CAUSAL,
+            VALUES_PER_THREAD>
             <<<grid, 256, shmem, stream>>>(
                 (float *) dst->data, (const float *) Q->data,
                 q_stride_token, q_stride_head,
                 (const half *) K->data, (const half *) V->data,
-                (const half *) mask->data,
+                mask ? (const half *) mask->data : nullptr,
                 sinks ? (const float *) sinks->data : nullptr,
                 n_tokens, n_heads, n_kv, scale, raw_rows,
                 raw_score_capacity, score_stride, visibility_bounds,
@@ -1672,14 +2395,16 @@ static bool ds4_launch_flash_attn_d512_grouped_compact(
                 indexed_owner_offsets, indexed_owner_ranks, indexed_capacity,
                 inverse_rope, inverse_rope_coefficients,
                 forward_rope_coefficients);
-    } else if (kv_f32 && mask->type == GGML_TYPE_F32) {
+    } else if (kv_f32 &&
+               (MASKLESS_CAUSAL || mask->type == GGML_TYPE_F32)) {
         ds4_flash_attn_d512_shared_kv_grouped_compact_kernel<
-            float, float, HEADS_PER_BLOCK, INDEXED_MASK, VALUES_PER_THREAD>
+            float, float, HEADS_PER_BLOCK, INDEXED_MASK, MASKLESS_CAUSAL,
+            VALUES_PER_THREAD>
             <<<grid, 256, shmem, stream>>>(
                 (float *) dst->data, (const float *) Q->data,
                 q_stride_token, q_stride_head,
                 (const float *) K->data, (const float *) V->data,
-                (const float *) mask->data,
+                mask ? (const float *) mask->data : nullptr,
                 sinks ? (const float *) sinks->data : nullptr,
                 n_tokens, n_heads, n_kv, scale, raw_rows,
                 raw_score_capacity, score_stride, visibility_bounds,
@@ -1687,9 +2412,11 @@ static bool ds4_launch_flash_attn_d512_grouped_compact(
                 indexed_owner_offsets, indexed_owner_ranks, indexed_capacity,
                 inverse_rope, inverse_rope_coefficients,
                 forward_rope_coefficients);
-    } else if (kv_f32 && mask->type == GGML_TYPE_F16) {
+    } else if (!MASKLESS_CAUSAL && kv_f32 &&
+               mask->type == GGML_TYPE_F16) {
         ds4_flash_attn_d512_shared_kv_grouped_compact_kernel<
-            float, half, HEADS_PER_BLOCK, INDEXED_MASK, VALUES_PER_THREAD>
+            float, half, HEADS_PER_BLOCK, INDEXED_MASK, MASKLESS_CAUSAL,
+            VALUES_PER_THREAD>
             <<<grid, 256, shmem, stream>>>(
                 (float *) dst->data, (const float *) Q->data,
                 q_stride_token, q_stride_head,
@@ -1719,6 +2446,7 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32_supported(const ggml_tensor * dst)
     const ggml_tensor * mask = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
     const ggml_tensor * indexer_topk = dst->src[5];
+    const bool ratio4_causal = indexer_topk && !mask;
     const bool kv_f32 = K && V && K->type == GGML_TYPE_F32 &&
                         V->type == GGML_TYPE_F32;
     const bool kv_f16 = K && V && K->type == GGML_TYPE_F16 &&
@@ -1777,19 +2505,27 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32_supported(const ggml_tensor * dst)
     const int raw_window = (int) (ds4_layout >> 16);
     const int sparse_block_size = (int) (ds4_layout & 0xffffu);
     const int rope_flags = ggml_get_op_params_i32(dst, 7);
+    const ggml_tensor * rope_positions = dst->src[6];
+    if (rope_positions &&
+        ((rope_flags & 1) == 0 || rope_positions->type != GGML_TYPE_I32 ||
+         rope_positions->ne[0] != n_tokens || rope_positions->ne[1] != 1 ||
+         rope_positions->ne[2] != 1 || rope_positions->ne[3] != 1 ||
+         !ggml_is_contiguous(rope_positions))) {
+        return false;
+    }
     if (sparse_keep_rows == INT_MIN) {
         return false;
     }
     if (raw_rows < 0 || raw_rows > n_kv ||
         (ds4_layout != 0 && (raw_window <= 0 || sparse_block_size <= 0)) ||
-        (sparse_keep_rows != 0 && !mask) ||
+        (sparse_keep_rows != 0 && !mask && !ratio4_causal) ||
         (rope_flags & ~3) != 0 ||
         ((rope_flags & 2) != 0 && (rope_flags & 1) == 0)) {
         return false;
     }
     const int n_comp_rows = n_kv - raw_rows;
     if (indexer_topk &&
-        (sparse_keep_rows >= 0 || -sparse_keep_rows > 512 ||
+        (sparse_keep_rows >= 0 || -sparse_keep_rows > 1024 ||
          -sparse_keep_rows > n_comp_rows ||
          indexer_topk->type != GGML_TYPE_I32 ||
          indexer_topk->ne[0] != -sparse_keep_rows ||
@@ -1813,9 +2549,20 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32_supported(const ggml_tensor * dst)
             (size_t) group4 * 4 * sizeof(int) +
             ((rope_flags & 2) != 0
                 ? (size_t) group4 * 64 * sizeof(float) : 0);
-        if (!mask || raw_rows <= 0 || n_comp_rows <= 0 ||
+        if (raw_rows <= 0 || n_comp_rows <= 0 ||
             n_heads % group4 != 0 || compact_group4_shmem > 24 * 1024) {
             return false;
+        }
+        if (ratio4_causal) {
+            const int kv_start = ggml_get_op_params_i32(dst, 8);
+            const int prior_rows = raw_rows - n_tokens;
+            if ((rope_flags & 1) == 0 || rope_positions ||
+                kv_start < 0 || raw_window <= 0 || indexed_capacity > 512 ||
+                n_tokens <= raw_window ||
+                prior_rows != std::min(kv_start, raw_window) ||
+                n_comp_rows != (kv_start + n_tokens) / 4) {
+                return false;
+            }
         }
     }
 
@@ -1834,6 +2581,7 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
     const ggml_tensor * mask = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
     const ggml_tensor * indexer_topk = dst->src[5];
+    const bool ratio4_causal = indexer_topk && !mask;
     const bool kv_f32 = K->type == GGML_TYPE_F32;
     const bool kv_f16 = K->type == GGML_TYPE_F16;
     const int n_tokens = (int) Q->ne[1];
@@ -1868,6 +2616,8 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
     inverse_rope.forward_q_enabled = (rope_flags & 2) != 0;
     if (rope_flags != 0) {
         inverse_rope.kv_start = ggml_get_op_params_i32(dst, 8);
+        inverse_rope.positions = dst->src[6]
+            ? static_cast<const int32_t *>(dst->src[6]->data) : nullptr;
         const float freq_base = ggml_get_op_params_f32(dst, 9);
         inverse_rope.freq_scale = ggml_get_op_params_f32(dst, 10);
         inverse_rope.ext_factor = ggml_get_op_params_f32(dst, 11);
@@ -1966,7 +2716,7 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
     // Compacting score storage lets both shapes keep the four-head kernel at
     // two-block occupancy. Ordinary dense shapes avoid the extra bounds scan.
     const bool compact_group4 =
-        !sparse && mask && n_heads % group4 == 0 &&
+        !sparse && (mask || ratio4_causal) && n_heads % group4 == 0 &&
         (raw_rows > raw_window || indexed_mask) &&
         (indexed_mask || group4_shmem > 24 * 1024) &&
         compact_group4_shmem <= 24 * 1024;
@@ -1992,14 +2742,22 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
                 (size_t) n_tokens * indexed_capacity);
             const bool parallel_index_scan = n_comp_rows > 512 &&
                 getenv("GGML_DS4_FA_SERIAL_INDEX_SCAN") == nullptr;
-            if (mask->type == GGML_TYPE_F16) {
+            if (ratio4_causal) {
+                ds4_fa_indexed_rows_topk_kernel<half, 512, true>
+                    <<<n_tokens, 512, 0, stream>>>(
+                        nullptr, (const int32_t *) indexer_topk->data,
+                        indexed_rows, indexed_counts,
+                        indexed_owner_offsets, indexed_owner_ranks,
+                        n_tokens, n_kv, raw_rows, indexed_capacity,
+                        inverse_rope.kv_start);
+            } else if (mask->type == GGML_TYPE_F16) {
                 if (indexer_topk) {
-                    ds4_fa_indexed_rows_topk_kernel<half><<<n_tokens, 512, 0, stream>>>(
+                    ds4_launch_indexed_rows_topk<half>(
                         (const half *) mask->data,
                         (const int32_t *) indexer_topk->data,
                         indexed_rows, indexed_counts,
                         indexed_owner_offsets, indexed_owner_ranks,
-                        n_tokens, n_kv, raw_rows, indexed_capacity);
+                        n_tokens, n_kv, raw_rows, indexed_capacity, stream);
                 } else if (parallel_index_scan) {
                     ds4_fa_indexed_rows_parallel_kernel<half><<<n_tokens, 256, 0, stream>>>(
                         (const half *) mask->data, indexed_rows, indexed_counts,
@@ -2015,12 +2773,12 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
                 }
             } else {
                 if (indexer_topk) {
-                    ds4_fa_indexed_rows_topk_kernel<float><<<n_tokens, 512, 0, stream>>>(
+                    ds4_launch_indexed_rows_topk<float>(
                         (const float *) mask->data,
                         (const int32_t *) indexer_topk->data,
                         indexed_rows, indexed_counts,
                         indexed_owner_offsets, indexed_owner_ranks,
-                        n_tokens, n_kv, raw_rows, indexed_capacity);
+                        n_tokens, n_kv, raw_rows, indexed_capacity, stream);
                 } else if (parallel_index_scan) {
                     ds4_fa_indexed_rows_parallel_kernel<float><<<n_tokens, 256, 0, stream>>>(
                         (const float *) mask->data, indexed_rows, indexed_counts,
@@ -2037,7 +2795,12 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
             }
             CUDA_CHECK(cudaGetLastError());
         }
-        if (mask->type == GGML_TYPE_F16) {
+        if (ratio4_causal) {
+            ds4_fa_ratio4_causal_bounds_kernel<<<
+                (n_tokens + 255) / 256, 256, 0, stream>>>(
+                    visibility_bounds, n_tokens, n_kv, raw_rows,
+                    raw_window, inverse_rope.kv_start);
+        } else if (mask->type == GGML_TYPE_F16) {
             ds4_fa_visibility_bounds_kernel<half><<<n_tokens, 64, 0, stream>>>(
                 (const half *) mask->data, visibility_bounds,
                 n_tokens, n_kv, raw_rows);
@@ -2047,9 +2810,190 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
                 n_tokens, n_kv, raw_rows);
         }
         CUDA_CHECK(cudaGetLastError());
+        // Long ratio-4 prefill selects this path structurally. Preserve the
+        // existing overrides and the opt-in policy for other indexed shapes.
+        // HIP F32 preserves compact arithmetic with eight-head grouping;
+        // F16 and CUDA keep the existing wave32 online-softmax policy.
+        const char * streaming_topk_env =
+            getenv("GGML_CUDA_MLA_STREAM_TOPK");
+        if (!streaming_topk_env) {
+            streaming_topk_env = getenv("GGML_DS4_FA_STREAM_TOPK");
+        }
+        const bool streaming_topk_enabled = streaming_topk_env
+            ? streaming_topk_env[0] != '\0' &&
+              strcmp(streaming_topk_env, "0") != 0
+            : ratio4_causal;
+        constexpr int streaming_min_tokens = 64;
+        const int active_row_upper_bound = raw_window + indexed_capacity;
+        const int device_warp_size =
+            ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+        if (streaming_topk_enabled && indexed_mask && indexer_topk &&
+            (ratio4_causal || mask->type == GGML_TYPE_F16) &&
+            K->data == V->data && n_heads % 16 == 0 &&
+            device_warp_size == 32 && n_tokens >= streaming_min_tokens &&
+            active_row_upper_bound > 0 &&
+            n_kv >= 3 * active_row_upper_bound) {
+#if defined(GGML_USE_HIP)
+            if (kv_f32) {
+                // Eight heads reuse each K/V load. Four adjacent values per
+                // thread share score loads and row-loop control while each
+                // dimension retains its original accumulation order.
+                const auto launch_group8 = [&](auto maskless) {
+                    ds4_flash_attn_d512_shared_kv_grouped_compact_kernel<
+                        float, half, 8, true, decltype(maskless)::value, 4, true>
+                        <<<dim3(n_tokens, n_heads / 8), 256,
+                           2 * compact_group4_shmem, stream>>>(
+                        (float *) dst->data, (const float *) Q->data,
+                        q_stride_token, q_stride_head, (const float *) K->data,
+                        (const float *) V->data,
+                        mask ? (const half *) mask->data : nullptr,
+                        sinks ? (const float *) sinks->data : nullptr,
+                        n_tokens, n_heads, n_kv, scale,
+                        raw_rows, raw_window, compact_score_stride,
+                        visibility_bounds, indexed_rows, indexed_counts,
+                        indexed_owner_offsets, indexed_owner_ranks,
+                        indexed_capacity, inverse_rope,
+                        inverse_rope_coefficients, forward_rope_coefficients);
+                };
+                if (ratio4_causal) launch_group8(std::true_type{});
+                else              launch_group8(std::false_type{});
+                CUDA_CHECK(cudaGetLastError());
+                ++g_mla_stream_topk_launch_count;
+                return true;
+            }
+#endif
+            const char * f32_stage_env =
+                getenv("GGML_CUDA_MLA_STREAM_F32_STAGE");
+            const bool f32_stage = f32_stage_env
+                ? f32_stage_env[0] != '\0' && strcmp(f32_stage_env, "0") != 0
+                : ratio4_causal;
+            const char * fast_exp_env =
+                getenv("GGML_CUDA_MLA_STREAM_FAST_EXP");
+            const bool fast_exp = fast_exp_env
+                ? fast_exp_env[0] != '\0' && strcmp(fast_exp_env, "0") != 0
+                : ratio4_causal;
+            constexpr int streaming_heads = 16;
+            const dim3 streaming_grid(
+                (unsigned) n_tokens,
+                (unsigned) (n_heads / streaming_heads), 1);
+            const auto launch_streaming = [&](auto kv_type, auto stage_f32, auto use_fast_exp,
+                                              auto maskless) {
+                using KV = decltype(kv_type);
+                ds4_flash_attn_d512_streaming_topk_kernel<
+                    KV, half, streaming_heads, 16,
+                    decltype(stage_f32)::value, decltype(use_fast_exp)::value,
+                    decltype(maskless)::value>
+                    <<<streaming_grid, streaming_heads * 32, 0, stream>>>(
+                        (float *) dst->data, (const float *) Q->data,
+                        q_stride_token, q_stride_head,
+                        (const KV *) K->data,
+                        mask ? (const half *) mask->data : nullptr,
+                        sinks ? (const float *) sinks->data : nullptr,
+                        n_tokens, n_heads, n_kv, scale,
+                        visibility_bounds, indexed_rows, indexed_counts,
+                        indexed_capacity, inverse_rope,
+                        inverse_rope_coefficients,
+                        forward_rope_coefficients);
+            };
+            const auto dispatch_streaming = [&](auto kv_type, auto maskless) {
+                if (f32_stage && fast_exp) {
+                    launch_streaming(kv_type, std::true_type{}, std::true_type{}, maskless);
+                } else if (f32_stage) {
+                    launch_streaming(kv_type, std::true_type{}, std::false_type{}, maskless);
+                } else {
+                    launch_streaming(kv_type, std::false_type{}, std::false_type{}, maskless);
+                }
+            };
+            if (ratio4_causal) {
+                if (kv_f16) dispatch_streaming(half{}, std::true_type{});
+                else        dispatch_streaming(float{}, std::true_type{});
+            } else {
+                if (kv_f16) dispatch_streaming(half{}, std::false_type{});
+                else        dispatch_streaming(float{}, std::false_type{});
+            }
+            CUDA_CHECK(cudaGetLastError());
+            ++g_mla_stream_topk_launch_count;
+            return true;
+        }
+        // AITER-style split-KV schedule, implemented directly in the native HIP
+        // backend. Matched Strix Halo profiling showed a bit-identical output,
+        // about -58% attention time and +2-3% decode throughput, so make it the
+        // gfx1151 default. Other devices remain opt-in until measured.
+        constexpr int split_kv_max_decode_tokens = 8;
+        const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+        const bool split_kv_default =
+            cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151;
+        if (indexed_mask && !ratio4_causal &&
+            n_tokens <= split_kv_max_decode_tokens &&
+            ds4_mla_split_kv_enabled(split_kv_default)) {
+            constexpr int split_count = 2;
+            const int split_stride =
+                (raw_window + indexed_capacity + split_count - 1) /
+                split_count;
+            ggml_cuda_pool_alloc<float> partial_alloc(ctx.pool());
+            float * partial = partial_alloc.alloc(
+                (size_t) n_tokens * n_heads * split_count * (512 + 2));
+            if (kv_f16 && mask->type == GGML_TYPE_F16) {
+                ds4_launch_flash_attn_d512_indexed_split<
+                    half, half, split_count>(
+                    (float *) dst->data, partial, (const float *) Q->data,
+                    q_stride_token, q_stride_head,
+                    (const half *) K->data, (const half *) V->data,
+                    (const half *) mask->data,
+                    sinks ? (const float *) sinks->data : nullptr,
+                    n_tokens, n_heads, n_kv, scale, raw_rows, split_stride,
+                    visibility_bounds, indexed_rows, indexed_counts,
+                    indexed_capacity, inverse_rope,
+                    inverse_rope_coefficients, forward_rope_coefficients,
+                    stream);
+            } else if (kv_f32 && mask->type == GGML_TYPE_F32) {
+                ds4_launch_flash_attn_d512_indexed_split<
+                    float, float, split_count>(
+                    (float *) dst->data, partial, (const float *) Q->data,
+                    q_stride_token, q_stride_head,
+                    (const float *) K->data, (const float *) V->data,
+                    (const float *) mask->data,
+                    sinks ? (const float *) sinks->data : nullptr,
+                    n_tokens, n_heads, n_kv, scale, raw_rows, split_stride,
+                    visibility_bounds, indexed_rows, indexed_counts,
+                    indexed_capacity, inverse_rope,
+                    inverse_rope_coefficients, forward_rope_coefficients,
+                    stream);
+            } else if (kv_f32 && mask->type == GGML_TYPE_F16) {
+                ds4_launch_flash_attn_d512_indexed_split<
+                    float, half, split_count>(
+                    (float *) dst->data, partial, (const float *) Q->data,
+                    q_stride_token, q_stride_head,
+                    (const float *) K->data, (const float *) V->data,
+                    (const half *) mask->data,
+                    sinks ? (const float *) sinks->data : nullptr,
+                    n_tokens, n_heads, n_kv, scale, raw_rows, split_stride,
+                    visibility_bounds, indexed_rows, indexed_counts,
+                    indexed_capacity, inverse_rope,
+                    inverse_rope_coefficients, forward_rope_coefficients,
+                    stream);
+            } else {
+                return false;
+            }
+            CUDA_CHECK(cudaGetLastError());
+            return true;
+        }
         if (indexed_mask) {
+            if (ratio4_causal) {
+                return ds4_launch_flash_attn_d512_grouped_compact<
+                    group4, true, true, 4>(
+                    dst, Q, K, V, mask, sinks, kv_f16, kv_f32,
+                    n_tokens, n_heads, n_kv, scale, raw_rows,
+                    raw_window, compact_score_stride, visibility_bounds,
+                    indexed_rows, indexed_counts,
+                    indexed_owner_offsets, indexed_owner_ranks,
+                    indexed_capacity, q_stride_token, q_stride_head,
+                    inverse_rope, inverse_rope_coefficients,
+                    forward_rope_coefficients,
+                    compact_group4_shmem, stream);
+            }
             return ds4_launch_flash_attn_d512_grouped_compact<
-                group4, true, 4>(
+                group4, true, false, 4>(
                 dst, Q, K, V, mask, sinks, kv_f16, kv_f32,
                 n_tokens, n_heads, n_kv, scale, raw_rows,
                 raw_window, compact_score_stride, visibility_bounds,
@@ -2062,7 +3006,7 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
                 compact_group4_shmem, stream);
         }
         return ds4_launch_flash_attn_d512_grouped_compact<
-            group4, false, 4>(
+            group4, false, false, 4>(
             dst, Q, K, V, mask, sinks, kv_f16, kv_f32,
             n_tokens, n_heads, n_kv, scale, raw_rows,
             raw_window, compact_score_stride, visibility_bounds,

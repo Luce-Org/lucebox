@@ -200,6 +200,7 @@ struct MoeHybridStorage {
     MoeHybridColdBackend cold_backend_kind = MoeHybridColdBackend::Cpu;
     bool materialized_hot_experts = true;
     bool materialized_cold_experts = true;
+    ggml_mixed_mmq_policy mixed_mmq_policy = GGML_MIXED_MMQ_DEFAULT;
     MoeHybridPlacement placement;
     std::vector<MoeHybridLayerStorage> layers;
 

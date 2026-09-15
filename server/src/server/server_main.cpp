@@ -26,6 +26,7 @@
 #include "placement/pflash_placement.h"
 #include "placement/draft_residency.h"
 #include "kvflash_pager.h"
+#include "kv_quant.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -35,7 +36,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -74,6 +77,11 @@ static void print_usage(const char * prog) {
         "Usage: %s <model.gguf> [options]\n"
         "\n"
         "Options:\n"
+        "  --model <path>      Begin a model block; set placement with --target-device.\n"
+        "  --load-balancing    Enable primary-first fallback (disabled by default).\n"
+        "  --load-balancing-primary-gpu <backend:gpu> Select the primary model by its target device.\n"
+        "                      Defaults to the first block; request model names\n"
+        "                      do not change generation routing.\n"
         "  --draft <path>       Draft model for speculative decode\n"
         "  --port <N>           Listen port (default: 8080)\n"
         "  --host <addr>        Bind address (default: 0.0.0.0)\n"
@@ -114,17 +122,27 @@ static void print_usage(const char * prog) {
         "  --fa-window <N>     Flash-attention sliding window (default: 0=full).\n"
         "                       WARNING: >0 drops system prompt / tool definitions\n"
         "                       from attention at long contexts. Use 0 for tools.\n"
-        "  --paged-attention   Use 16-token paged KV blocks for Qwen3.6-27B\n"
-        "                       autoregressive decode (experimental)\n"
+        "  --paged-attention   Use paged autoregressive decode for dense Qwen3.5 and\n"
+        "                       Qwen3.6 targets with 16-token blocks, or DeepSeek4\n"
+        "                       targets with 128-token blocks. This mode is experimental.\n"
+        "  --routing-queue-limit <N> Maximum waiting auto requests (default: 32)\n"
         "  --max-concurrency <N>  Maximum concurrent decode sequences\n"
-        "                         (enables paged attention; default: 1)\n"
+        "                         (N > 1 enables paged attention; default: 1)\n"
         "  --admission-coalesce-ms <N>  Idle-to-busy batching window\n"
         "                               (default: 20; 0 disables)\n"
         "  --kv-pool-tokens <N> Total paged K/V pool shared by all\n"
         "                       --max-concurrency slots, in tokens\n"
-        "                       (default: sized from available device memory)\n"
+        "                       By default, Qwen sizes the pool from available device\n"
+        "                       memory. DeepSeek4 reserves --max-ctx per slot.\n"
         "  --model-name <name>  Model name for /v1/models (default: dflash)\n"
         "  --prefix-cache-slots <N>  Prefix cache slots (default: 32, 0 disables)\n"
+        "  --concurrent-prefix-cache-max-mib <MiB>\n"
+        "                       Resident RAM limit for copied concurrent paged\n"
+        "                       checkpoints (default: 4096; 0 unlimited)\n"
+        "  --session-prefix-cache-max-tokens <N>\n"
+        "                       Opt-in concurrent rolling checkpoint per session;\n"
+        "                       N bounds cached prefix tokens (0 disables).\n"
+        "                       RAM budget includes atomic replacement scratch.\n"
         "  --agent-turn-cache         Extend prefix caching through generated tool calls\n"
         "  --prefill-cache-slots <N> Full prompt/prefill cache slots (default: 0)\n"
         "  --fast-rollback     Enable speculative fast rollback (default: on)\n"
@@ -230,23 +248,42 @@ static void print_usage(const char * prog) {
         "\n", prog);
 }
 
-int main(int argc, char ** argv) {
-    if (argc < 2 || argv[1][0] == '-') {
-        print_usage(argv[0]);
-        return 2;
-    }
+// Own everything borrowed by a model's HTTP/scheduler context. Shutdown must
+// join the worker and client users before releasing backend or tokenizer state.
+struct LoadedModel {
+    Tokenizer tokenizer;
+    Tokenizer drafter_tokenizer;
+    std::unique_ptr<ModelBackend> backend;
+    MoeRoutingCollector routing_collector;
+    std::unique_ptr<HttpServer> server;
+    bool freq_tracking = false;
 
-    // Parse arguments.
+    ~LoadedModel() {
+        server.reset();
+        if (!backend) return;
+        if (freq_tracking) {
+            if (const auto * stats = backend->get_routing_stats()) {
+                stats->print_freq_analysis();
+            } else {
+                std::fprintf(stderr, "[server] --freq: no routing stats available (model may not be MoE)\n");
+            }
+        }
+        if (routing_collector.is_open()) {
+            backend->set_routing_collector(nullptr);
+            routing_collector.close();
+        }
+        backend->shutdown();
+    }
+};
+
+struct ModelOptions {
     BackendArgs bargs;
     ServerConfig sconfig;
-    bargs.model_path = argv[1];
     bool   spark_autotune = false; // --spark: self-tuning hot/cold MoE residency
     int    spark_slots = -1;       // --spark-slots: explicit cache slots/layer (-1=auto)
     double spark_vram_gib = 0.0;   // --spark-vram: total VRAM target in GiB (0=use card)
     std::string cache_type_k;  // explicit --cache-type-k override
     std::string cache_type_v;  // explicit --cache-type-v override
-    bool target_device_seen = false;
-    bool target_devices_seen = false;
     bool fast_rollback_forced_off = false;
     bool target_split_fast_rollback_cli = false;
     bool adaptive_experts_set = false;  // --adaptive-experts (MoE architectures only)
@@ -269,6 +306,10 @@ int main(int argc, char ** argv) {
         bool effort_max              = false;
     } cli_set;
 
+    // Keep process-wide options inert until the selected model is loaded.
+    std::string adaptive_experts_tau;
+    std::string kvflash_pool, kvflash_policy, kvflash_tau;
+
     // Track whether the operator passed the legacy --max-tokens alias.
     // When set and --default-max-tokens is NOT also passed, --max-tokens
     // wins over the model card for default_max_tokens (it was a documented
@@ -277,7 +318,49 @@ int main(int argc, char ** argv) {
     bool legacy_max_tokens_set = false;
     int  legacy_max_tokens_val = 0;
 
+};
+
+static int parse_model_options(int argc, char ** argv, ModelOptions & model,
+                               bool load_balancing, bool first_model) {
+    if (argc < 2 || argv[1][0] == '-') {
+        print_usage(argv[0]);
+        return 2;
+    }
+    auto & bargs = model.bargs;
+    auto & sconfig = model.sconfig;
+    auto & spark_autotune = model.spark_autotune;
+    auto & spark_slots = model.spark_slots;
+    auto & spark_vram_gib = model.spark_vram_gib;
+    auto & cache_type_k = model.cache_type_k;
+    auto & cache_type_v = model.cache_type_v;
+    auto & fast_rollback_forced_off = model.fast_rollback_forced_off;
+    auto & target_split_fast_rollback_cli = model.target_split_fast_rollback_cli;
+    auto & adaptive_experts_set = model.adaptive_experts_set;
+    auto & ddtree_tau_set = model.ddtree_tau_set;
+    auto & specla_top_k_set = model.specla_top_k_set;
+    auto & specla_top_k = model.specla_top_k;
+    auto & cli_set = model.cli_set;
+    auto & legacy_max_tokens_set = model.legacy_max_tokens_set;
+    auto & legacy_max_tokens_val = model.legacy_max_tokens_val;
+    bool target_device_seen = false;
+    bool target_devices_seen = false;
+    bargs.model_path = argv[1];
+
     for (int i = 2; i < argc; i++) {
+        const std::string option = argv[i];
+        if (!first_model &&
+            (option == "--host" || option == "--port" || option == "--no-cors" || option == "--routing-queue-limit")) {
+            std::fprintf(stderr, "[server] %s belongs in the first model block: there is one listener\n", argv[i]);
+            return 2;
+        }
+        if (load_balancing && (option == "--peer-access" ||
+            option == "--no-fast-rollback" || option == "--target-split-fast-rollback" ||
+            option == "--adaptive-experts" || option == "--specla" ||
+            option == "--specla-top-k" || option.rfind("--kvflash", 0) == 0 ||
+            option.rfind("--spark", 0) == 0)) {
+            std::fprintf(stderr, "[server] %s changes process-wide policy and cannot be scoped to a model\n", argv[i]);
+            return 2;
+        }
         if (std::strcmp(argv[i], "--draft") == 0 && i + 1 < argc) {
             bargs.draft_path = argv[++i];
         } else if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
@@ -394,6 +477,14 @@ int main(int argc, char ** argv) {
             bargs.fa_window = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--paged-attention") == 0) {
             bargs.paged_attention = true;
+        } else if (std::strcmp(argv[i], "--routing-queue-limit") == 0 && i + 1 < argc) {
+            const char * value = argv[++i];
+            const char * end = value + std::strlen(value);
+            const auto parsed = std::from_chars(value, end, sconfig.routing_queue_limit);
+            if (parsed.ec != std::errc{} || parsed.ptr != end || sconfig.routing_queue_limit < 0) {
+                std::fprintf(stderr, "[server] --routing-queue-limit must be a nonnegative integer\n");
+                return 2;
+            }
         } else if (std::strcmp(argv[i], "--max-concurrency") == 0 && i + 1 < argc) {
             const char * value = argv[++i];
             const char * end = value + std::strlen(value);
@@ -435,6 +526,41 @@ int main(int argc, char ** argv) {
             sconfig.model_name = argv[++i];
         } else if (std::strcmp(argv[i], "--prefix-cache-slots") == 0 && i + 1 < argc) {
             sconfig.prefix_cache_cap = std::atoi(argv[++i]);
+        } else if (std::strcmp(
+                       argv[i], "--concurrent-prefix-cache-max-mib") == 0) {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr,
+                    "[server] --concurrent-prefix-cache-max-mib requires "
+                    "a value\n");
+                return 2;
+            }
+            const char * value = argv[++i];
+            const char * end = value + std::strlen(value);
+            uint64_t mib = 0;
+            const auto parsed = std::from_chars(value, end, mib);
+            constexpr uint64_t bytes_per_mib = 1024ull * 1024ull;
+            if (parsed.ec != std::errc{} || parsed.ptr != end ||
+                mib > (uint64_t)std::numeric_limits<size_t>::max() /
+                    bytes_per_mib) {
+                std::fprintf(stderr,
+                    "[server] --concurrent-prefix-cache-max-mib must be a "
+                    "non-negative "
+                    "integer that fits in addressable memory\n");
+                return 2;
+            }
+            sconfig.concurrent_prefix_cache_max_bytes =
+                (size_t)(mib * bytes_per_mib);
+        } else if (std::strcmp(argv[i], "--session-prefix-cache-max-tokens") == 0) {
+            if (i + 1 >= argc) return 2;
+            const char * value = argv[++i];
+            const char * end = value + std::strlen(value);
+            int tokens = 0;
+            const auto parsed = std::from_chars(value, end, tokens);
+            if (parsed.ec != std::errc{} || parsed.ptr != end || tokens < 0) {
+                std::fprintf(stderr, "[server] session cache tokens must be a non-negative integer\n");
+                return 2;
+            }
+            sconfig.session_prefix_cache_max_tokens = tokens;
         } else if (std::strcmp(argv[i], "--agent-turn-cache") == 0) {
             sconfig.agent_turn_cache = true;
         } else if (std::strcmp(argv[i], "--prefill-cache-slots") == 0 && i + 1 < argc) {
@@ -485,7 +611,7 @@ int main(int argc, char ** argv) {
                     "--adaptive-experts: tau must be a float in (0,1], got \"%s\"\n", tau);
                 return 1;
             }
-            set_environment_variable("DFLASH_ADAPTIVE_K_TAU", tau, false);  // explicit env still wins
+            if (model.adaptive_experts_tau.empty()) model.adaptive_experts_tau = tau;
             adaptive_experts_set = true;
         } else if (std::strcmp(argv[i], "--verify-width") == 0 && i + 1 < argc) {
             bargs.verify_width = std::atoi(argv[++i]);
@@ -503,7 +629,7 @@ int main(int argc, char ** argv) {
                                      "'auto', got '%s'\n", argv[i]);
                 return 1;
             }
-            set_environment_variable("DFLASH_KVFLASH", argv[i], true);
+            model.kvflash_pool = argv[i];
         } else if (std::strcmp(argv[i], "--kvflash-policy") == 0 && i + 1 < argc) {
             ++i;
             if (std::strcmp(argv[i], "drafter") != 0 && std::strcmp(argv[i], "lru") != 0 &&
@@ -512,14 +638,14 @@ int main(int argc, char ** argv) {
                              argv[i]);
                 return 1;
             }
-            set_environment_variable("DFLASH_KVFLASH_POLICY", argv[i], true);
+            model.kvflash_policy = argv[i];
         } else if (std::strcmp(argv[i], "--kvflash-tau") == 0 && i + 1 < argc) {
             if (std::atoi(argv[++i]) <= 0) {
                 std::fprintf(stderr, "--kvflash-tau expects a positive interval, got '%s'\n",
                              argv[i]);
                 return 1;
             }
-            set_environment_variable("DFLASH_KVFLASH_TAU", argv[i], true);
+            model.kvflash_tau = argv[i];
         } else if (std::strcmp(argv[i], "--spark") == 0) {
             spark_autotune = true;
         } else if (std::strcmp(argv[i], "--spark-slots") == 0 && i + 1 < argc) {
@@ -571,9 +697,6 @@ int main(int argc, char ** argv) {
             sconfig.pflash_keep_ratio = (float)std::atof(argv[++i]);
         } else if (std::strcmp(argv[i], "--prefill-drafter") == 0 && i + 1 < argc) {
             sconfig.pflash_drafter_path = argv[++i];
-            // kvflash reads this to lazy-attach the drafter as its
-            // residency scorer even when prefill compression is off.
-            set_environment_variable("DFLASH_KVFLASH_DRAFTER", argv[i], true);
         } else if (std::strcmp(argv[i], "--prefill-skip-park") == 0) {
             sconfig.pflash_skip_park = true;
         } else if (std::strcmp(argv[i], "--prefill-upstream-base") == 0 && i + 1 < argc) {
@@ -690,6 +813,58 @@ int main(int argc, char ** argv) {
         bargs.ddtree_tau = 6.0f;
     }
 
+    for (const auto * type : {&cache_type_k, &cache_type_v}) {
+        if (!type->empty() && dflash::parse_kv_type(type->c_str()) == GGML_TYPE_COUNT) {
+            std::fprintf(stderr, "[server] invalid KV cache type '%s' (use f16, bf16, q4_0, q4_1, q5_0, q5_1, q8_0 or tq3_0)\n", type->c_str());
+            return 2;
+        }
+    }
+    // Validate every block before model files or GPU resources are loaded.
+    if (load_balancing && bargs.max_concurrency < 1) {
+        std::fprintf(stderr, "[server] --max-concurrency must be positive for model '%s'\n",
+            sconfig.model_name.c_str());
+        return 2;
+    }
+    if (bargs.max_concurrency > 1) bargs.paged_attention = true;
+    if (load_balancing && (bargs.device.is_multi_device() ||
+            bargs.remote_draft.enabled() || bargs.remote_target_shard.enabled() ||
+            sconfig.pflash_mode != ServerConfig::PflashMode::OFF ||
+            !sconfig.pflash_upstream_base.empty() || sconfig.lazy_draft ||
+            sconfig.freq_tracking || !sconfig.collect_routing_path.empty())) {
+        std::fprintf(stderr, "[server] model '%s' requires local serving; compression, sharding, request-scoped drafts and routing collection are unsupported with load balancing\n", sconfig.model_name.c_str());
+        return 2;
+    }
+    return 0;
+}
+
+static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_model) {
+    if (!model.adaptive_experts_tau.empty())
+        set_environment_variable("DFLASH_ADAPTIVE_K_TAU", model.adaptive_experts_tau.c_str(), false);
+    if (!model.kvflash_pool.empty())
+        set_environment_variable("DFLASH_KVFLASH", model.kvflash_pool.c_str(), true);
+    if (!model.kvflash_policy.empty())
+        set_environment_variable("DFLASH_KVFLASH_POLICY", model.kvflash_policy.c_str(), true);
+    if (!model.kvflash_tau.empty())
+        set_environment_variable("DFLASH_KVFLASH_TAU", model.kvflash_tau.c_str(), true);
+    // KVFlash can use this drafter even when prefill compression is off.
+    if (!model.sconfig.pflash_drafter_path.empty())
+        set_environment_variable("DFLASH_KVFLASH_DRAFTER", model.sconfig.pflash_drafter_path.c_str(), true);
+    auto & bargs = model.bargs;
+    auto & sconfig = model.sconfig;
+    auto & spark_autotune = model.spark_autotune;
+    auto & spark_slots = model.spark_slots;
+    auto & spark_vram_gib = model.spark_vram_gib;
+    auto & cache_type_k = model.cache_type_k;
+    auto & cache_type_v = model.cache_type_v;
+    auto & fast_rollback_forced_off = model.fast_rollback_forced_off;
+    auto & target_split_fast_rollback_cli = model.target_split_fast_rollback_cli;
+    auto & adaptive_experts_set = model.adaptive_experts_set;
+    auto & ddtree_tau_set = model.ddtree_tau_set;
+    auto & specla_top_k_set = model.specla_top_k_set;
+    auto & specla_top_k = model.specla_top_k;
+    auto & cli_set = model.cli_set;
+    auto & legacy_max_tokens_set = model.legacy_max_tokens_set;
+    auto & legacy_max_tokens_val = model.legacy_max_tokens_val;
     if (fast_rollback_forced_off) {
         bargs.fast_rollback = false;
         target_split_fast_rollback_cli = false;
@@ -720,13 +895,6 @@ int main(int argc, char ** argv) {
         if (const char * e = std::getenv("DFLASH27B_DRAFT_SWA")) {
             bargs.draft_swa_window = std::atoi(e);
         }
-    }
-
-    // Concurrent serving is implemented by the paged engine, so one user-facing
-    // concurrency flag selects the complete serving mode. Keep the feature gate
-    // strict for non-CLI callers that construct BackendArgs directly.
-    if (bargs.max_concurrency > 1) {
-        bargs.paged_attention = true;
     }
 
     // Ask the factory to resolve model/placement facts and apply its feature
@@ -763,6 +931,12 @@ int main(int argc, char ** argv) {
     }
     const ResolvedBackendPlan & backend_plan = backend_preparation.plan;
     const std::string & arch = backend_plan.arch();
+    if (multi_model && !bargs.paged_attention && arch != "deepseek4" && arch != "qwen35") {
+        std::fprintf(stderr,
+            "[server] model '%s': single-request routing currently supports Qwen and DeepSeek4; "
+            "use --max-concurrency for a supported batched model\n", sconfig.model_name.c_str());
+        return 2;
+    }
     const bool kvflash_requested =
         kvflash_pool_requested(std::getenv("DFLASH_KVFLASH"));
     if (target_split_fast_rollback_cli && arch != "qwen35") {
@@ -815,19 +989,35 @@ int main(int argc, char ** argv) {
         }
     }
 
-    // Paged decode owns its K/V through a block table that the snapshot format
-    // cannot describe yet, so the caches it would restore into are turned off.
-    // This rewrites ServerConfig rather than rejecting the launch, which is why
-    // it lives here and not in the gate.
+    // Continuous Qwen serving supports copied in-memory prefix checkpoints:
+    // restore allocates fresh pages and scatters logical K/V through the new
+    // sequence's block table. Exact-prefill and disk snapshots still use the
+    // classic single-sequence format and remain disabled in paged mode.
     if (bargs.paged_attention) {
-        std::fprintf(stderr,
-            "[server] --paged-attention disables prefix/prefill snapshots "
-            "until their format stores page tables\n");
-        sconfig.prefix_cache_cap = 0;
+        if (bargs.max_concurrency > 1) {
+            if (sconfig.prefix_cache_cap > 0) {
+                std::fprintf(stderr,
+                    "[server] concurrent paged serving enables copied in-memory "
+                    "prefix checkpoints; full-prefill and disk caches remain disabled\n");
+            } else {
+                std::fprintf(stderr,
+                    "[server] concurrent paged serving: prefix checkpoints are "
+                    "disabled; full-prefill and disk caches remain disabled\n");
+            }
+        } else {
+            std::fprintf(stderr,
+                "[server] single-sequence --paged-attention still disables "
+                "prefix snapshots\n");
+            sconfig.prefix_cache_cap = 0;
+        }
         sconfig.prefill_cache_cap = 0;
         sconfig.disk_cache_dir.clear();
         sconfig.disk_cache_policy.mode = DiskPrefixCacheMode::Off;
     }
+    sconfig.concurrent_paged_prefix_cache =
+        bargs.paged_attention && bargs.max_concurrency > 1 &&
+        sconfig.prefix_cache_cap > 0;
+
     if (sconfig.agent_turn_cache && bargs.paged_attention) {
         std::fprintf(stderr,
             "[server] --agent-turn-cache is not yet supported with "
@@ -872,12 +1062,25 @@ int main(int argc, char ** argv) {
         ensure_stats_env("DFLASH_LAGUNA_NEXT_PLACEMENT_OUT", "/dev/null");
     }
 
-    // Explicit --cache-type-k/v override via env vars.
-    if (!cache_type_k.empty()) {
-        set_environment_variable("DFLASH27B_KV_K", cache_type_k.c_str(), true);
-    }
-    if (!cache_type_v.empty()) {
-        set_environment_variable("DFLASH27B_KV_V", cache_type_v.c_str(), true);
+    // Monolithic Qwen owns its KV overrides, including allocation/budgeting.
+    // DS4 has a family-specific cache layout and never consumed these flags.
+    if (arch == "qwen35" && !bargs.device.is_multi_device()) {
+        if (!cache_type_k.empty()) bargs.cache_type_k = dflash::parse_kv_type(cache_type_k.c_str());
+        if (!cache_type_v.empty()) bargs.cache_type_v = dflash::parse_kv_type(cache_type_v.c_str());
+        dflash::resolve_kv_types(bargs.cache_type_k, bargs.cache_type_v,
+                                bargs.cache_type_k, bargs.cache_type_v);
+        cache_type_k = dflash::kv_type_name(bargs.cache_type_k);
+        cache_type_v = dflash::kv_type_name(bargs.cache_type_v);
+    } else if (arch == "deepseek4") {
+        if (!cache_type_k.empty() || !cache_type_v.empty()) {
+            std::fprintf(stderr, "[server] model '%s': --cache-type-k/v are ignored by DeepSeek4's fixed cache layout\n", sconfig.model_name.c_str());
+        }
+        cache_type_k = cache_type_v = "fixed (deepseek4)";
+    } else {
+        // Preserve existing single-model architectures and remote-shard launches.
+        // These paths cannot participate in multi-model paged serving.
+        if (!cache_type_k.empty()) set_environment_variable("DFLASH27B_KV_K", cache_type_k.c_str(), true);
+        if (!cache_type_v.empty()) set_environment_variable("DFLASH27B_KV_V", cache_type_v.c_str(), true);
     }
 
     // TQ3_0 KV auto-selection was removed (2026-07): tq3_0 saved ~40% VRAM on
@@ -904,14 +1107,14 @@ int main(int argc, char ** argv) {
 
     // Load tokenizer.
     std::fprintf(stderr, "[server] loading tokenizer from %s\n", bargs.model_path);
-    Tokenizer tokenizer;
+    Tokenizer & tokenizer = loaded.tokenizer;
     if (!tokenizer.load_from_gguf(bargs.model_path)) {
         std::fprintf(stderr, "[server] tokenizer load failed\n");
         return 1;
     }
 
     // Load pflash drafter tokenizer (if pflash enabled).
-    Tokenizer drafter_tokenizer;
+    Tokenizer & drafter_tokenizer = loaded.drafter_tokenizer;
     if (pflash_enabled) {
         std::fprintf(stderr, "[server] loading pflash drafter tokenizer from %s\n",
                      sconfig.pflash_drafter_path.c_str());
@@ -989,7 +1192,8 @@ int main(int argc, char ** argv) {
                 arch.c_str());
         }
     }
-    auto backend = create_backend(bargs, backend_plan);
+    auto & backend = loaded.backend;
+    backend = create_backend(bargs, backend_plan);
     if (!backend) {
         std::fprintf(stderr, "[server] backend creation failed\n");
         return 1;
@@ -1253,22 +1457,25 @@ int main(int argc, char ** argv) {
     }
     std::fprintf(stderr, "[server] │  ddtree_budget   = %d\n", bargs.ddtree_budget);
     std::fprintf(stderr, "[server] │  prefix_cache    = %d slots\n", sconfig.prefix_cache_cap);
+    if (sconfig.concurrent_paged_prefix_cache) {
+        if (sconfig.concurrent_prefix_cache_max_bytes == 0) {
+            std::fprintf(stderr,
+                "[server] │  prefix_cache_ram= unlimited\n");
+        } else {
+            std::fprintf(stderr,
+                "[server] │  prefix_cache_ram= %zu MiB resident limit\n",
+                sconfig.concurrent_prefix_cache_max_bytes /
+                    (1024 * 1024));
+        }
+    }
     std::fprintf(stderr, "[server] │  agent_turn_cache= %s\n",
                  sconfig.agent_turn_cache ? "ON" : "off");
     std::fprintf(stderr, "[server] │  prefill_cache   = %d slots\n", sconfig.prefill_cache_cap);
     std::fprintf(stderr, "[server] │  cors            = %s\n", sconfig.enable_cors ? "ON" : "off");
     std::fprintf(stderr, "[server] │  cache_type_k    = %s\n",
-#ifdef GGML_USE_HIP
-        cache_type_k.empty() ? "q4_0 (default, HIP)" : cache_type_k.c_str());
-#else
         cache_type_k.empty() ? "family default" : cache_type_k.c_str());
-#endif
     std::fprintf(stderr, "[server] │  cache_type_v    = %s\n",
-#ifdef GGML_USE_HIP
-        cache_type_v.empty() ? "q4_0 (default, HIP)" : cache_type_v.c_str());
-#else
         cache_type_v.empty() ? "family default" : cache_type_v.c_str());
-#endif
     std::fprintf(stderr, "[server] │  pflash          = %s\n",
         sconfig.pflash_mode == ServerConfig::PflashMode::AUTO ? "auto" :
         sconfig.pflash_mode == ServerConfig::PflashMode::ALWAYS ? "always" : "off");
@@ -1371,11 +1578,10 @@ int main(int argc, char ** argv) {
         }
     }
 
-    HttpServer server(*backend, tokenizer, sconfig);
+    loaded.server = std::make_unique<HttpServer>(*backend, tokenizer, sconfig);
+    HttpServer & server = *loaded.server;
     server.set_chat_format(chat_format_for_arch(arch));
-    g_server = &server;
-    std::signal(SIGTERM, signal_handler);
-    std::signal(SIGINT, signal_handler);
+    loaded.freq_tracking = sconfig.freq_tracking;
     if (pflash_enabled) {
         server.set_drafter_tokenizer(&drafter_tokenizer);
     }
@@ -1386,7 +1592,7 @@ int main(int argc, char ** argv) {
     }
 
     // Set up routing data collector (--collect-routing)
-    MoeRoutingCollector routing_collector;
+    auto & routing_collector = loaded.routing_collector;
     if (!sconfig.collect_routing_path.empty()) {
         if (!routing_collector.open(sconfig.collect_routing_path)) {
             std::fprintf(stderr, "[server] failed to open routing collector output\n");
@@ -1400,26 +1606,122 @@ int main(int argc, char ** argv) {
         }
     }
 
-    int ret = server.run();
+    return 0;
+}
 
-    // Print frequency analysis at shutdown (--freq)
-    if (sconfig.freq_tracking) {
-        const auto * stats = backend->get_routing_stats();
-        if (stats) {
-            stats->print_freq_analysis();
+int main(int argc, char ** argv) {
+    // Reuse the existing per-model CLI and loader. Argument strings belong to
+    // main's argv and outlive every backend, including factories borrowing paths.
+    std::vector<std::vector<char *>> model_args(1, {argv[0]});
+    bool load_balancing = false;
+    std::string primary_gpu;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--load-balancing") == 0) {
+            load_balancing = true;
+        } else if (std::strcmp(argv[i], "--load-balancing-primary-gpu") == 0) {
+            DevicePlacement device;
+            if (!primary_gpu.empty() || i + 1 >= argc ||
+                !parse_placement_device(argv[i + 1], device) ||
+                device.backend == PlacementBackend::Auto) {
+                std::fprintf(stderr, "[server] --load-balancing-primary-gpu requires one explicit backend:gpu value\n");
+                return 2;
+            }
+            primary_gpu = placement_device_name(device);
+            ++i;
+        } else if (std::strcmp(argv[i], "--model") == 0) {
+            if (i + 1 >= argc || argv[i + 1][0] == '-') {
+                std::fprintf(stderr, "[server] --model requires a model path\n");
+                return 2;
+            }
+            if (model_args.back().size() > 1) model_args.push_back({argv[0]});
+            model_args.back().push_back(argv[++i]);
         } else {
-            std::fprintf(stderr, "[server] --freq: no routing stats available "
-                                 "(model may not be MoE)\n");
+            model_args.back().push_back(argv[i]);
+        }
+    }
+    const bool multi_model = model_args.size() > 1;
+    if (load_balancing && !multi_model) {
+        std::fprintf(stderr, "[server] --load-balancing requires at least two model blocks\n");
+        return 2;
+    }
+    std::vector<ModelOptions> options(model_args.size());
+    std::set<std::string> names;
+    for (size_t m = 0; m < model_args.size(); ++m) {
+        auto & args = model_args[m];
+        const int count = (int)args.size();
+        args.push_back(nullptr);
+        const int ret = parse_model_options(count, args.data(), options[m], load_balancing, m == 0);
+        if (ret != 0) {
+            std::fprintf(stderr, "[server] invalid model block %zu (%s)\n", m + 1,
+                options[m].sconfig.model_name.c_str());
+            return ret;
+        }
+        const auto & name = options[m].sconfig.model_name;
+        if (load_balancing && (name.empty() || name == "auto" || !names.insert(name).second)) {
+            std::fprintf(stderr, "[server] model block %zu: --model-name must be unique, nonempty and different from auto (got '%s')\n", m + 1, name.c_str());
+            return 2;
         }
     }
 
-    // Close routing collector (prints summary)
-    if (routing_collector.is_open()) {
-        backend->set_routing_collector(nullptr);
-        routing_collector.close();
+    // Listener policy belongs to the first CLI block, independently of priority.
+    const ServerConfig listener_config = options.front().sconfig;
+    if (!primary_gpu.empty()) {
+        size_t selected = options.size();
+        for (size_t m = 0; m < options.size(); ++m) {
+            if (placement_device_name(options[m].bargs.device) != primary_gpu) continue;
+            if (selected != options.size()) {
+                std::fprintf(stderr, "[server] --load-balancing-primary-gpu matches multiple model blocks\n");
+                return 2;
+            }
+            selected = m;
+        }
+        if (selected == options.size()) {
+            std::fprintf(stderr, "[server] --load-balancing-primary-gpu must match a configured --target-device\n");
+            return 2;
+        }
+        std::rotate(options.begin(), options.begin() + selected, options.begin() + selected + 1);
+    }
+    // Disabled balancing loads only the selected primary, regardless of how
+    // many placements were configured. No unused GPU worker is started.
+    if (!load_balancing) options.resize(1);
+    for (auto & option : options) {
+        option.sconfig.host = listener_config.host;
+        option.sconfig.port = listener_config.port;
+        option.sconfig.enable_cors = listener_config.enable_cors;
+        option.sconfig.routing_queue_limit = listener_config.routing_queue_limit;
+    }
+    std::fprintf(stderr, "[server] load balancing %s; primary=%s target=%s\n",
+        load_balancing ? "enabled" : "disabled", options.front().sconfig.model_name.c_str(),
+        placement_device_name(options.front().bargs.device).c_str());
+
+    if (load_balancing) {
+        const auto & listener = options.front().sconfig;
+        std::fprintf(stderr, "[server] one listener at %s:%d; %zu independent models (environment settings are shared)\n",
+            listener.host.c_str(), listener.port, options.size());
+        for (size_t m = 0; m < options.size(); ++m) {
+            auto & option = options[m];
+            std::fprintf(stderr, "[server] model %zu: %s target=%s slots=%d execution=%s\n",
+                m + 1, option.sconfig.model_name.c_str(),
+                placement_device_name(option.bargs.device).c_str(), option.bargs.max_concurrency,
+                option.bargs.paged_attention ? "batched" : "single-request");
+        }
     }
 
-    // Cleanup.
-    backend->shutdown();
+    std::vector<std::unique_ptr<LoadedModel>> loaded;
+    std::vector<HttpServer *> servers;
+    // All initialization (including backend environment defaults) finishes
+    // before starting any scheduler. No worker observes model-loading mutations.
+    for (auto & option : options) {
+        auto model = std::make_unique<LoadedModel>();
+        const int ret = load_model(option, *model, load_balancing);
+        if (ret != 0) return ret;
+        servers.push_back(model->server.get());
+        loaded.push_back(std::move(model));
+    }
+    g_server = servers.front();
+    std::signal(SIGTERM, signal_handler);
+    std::signal(SIGINT, signal_handler);
+    const int ret = load_balancing ? g_server->run(servers) : g_server->run();
+    g_server = nullptr;
     return ret;
 }

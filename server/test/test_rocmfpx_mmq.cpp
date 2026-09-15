@@ -3,6 +3,7 @@
 #include "ggml.h"
 #include "rocmfp4.h"
 #include "rocmfpx.h"
+#include "../src/common/platform_env.h"
 
 #include <hip/hip_runtime.h>
 
@@ -68,7 +69,8 @@ static bool run_backend(
         const std::vector<uint8_t> & weights_data,
         const std::vector<float> & input_data,
         std::vector<float> & output_data,
-        DispatchPath expected_path) {
+        DispatchPath expected_path,
+        int mmvq_ceiling = -1) {
     ggml_init_params params{};
     params.mem_size = 16 * 1024 * 1024;
     params.no_alloc = true;
@@ -113,6 +115,7 @@ static bool run_backend(
         const size_t mmq_before = ggml_backend_cuda_get_mmq_launch_count();
         const int previous_mmvq_max =
             ggml_backend_cuda_set_mmvq_max_ncols_override(
+                mmvq_ceiling >= 0 ? mmvq_ceiling :
                 expected_path == DispatchPath::MMVQ ? 8 : 1);
         const bool previous_graphs_disabled =
             ggml_backend_cuda_set_graphs_disabled_override(true);
@@ -218,7 +221,8 @@ static bool test_case(
         ggml_backend_t hip_backend,
         const QuantCase & quant,
         const Shape & shape,
-        DispatchPath expected_path) {
+        DispatchPath expected_path,
+        int mmvq_ceiling = -1) {
     const std::vector<float> weights_f32 =
         make_values((size_t) shape.k * shape.m, 37, 0.015625f);
     const std::vector<float> input_f32 =
@@ -248,7 +252,7 @@ static bool test_case(
     std::vector<float> actual;
     if (!run_backend(
             hip_backend, quant.type, shape, weights_quantized, input_f32, actual,
-            expected_path)) {
+            expected_path, mmvq_ceiling)) {
         std::fprintf(
             stderr,
             "%s/%s: HIP %s run failed\n",
@@ -261,9 +265,10 @@ static bool test_case(
 }
 
 int main() {
-    setenv("DFLASH_CUDA_MMVQ_FP2_AFFINE", "1", 1);
-    setenv("DFLASH_CUDA_MMQ_FP2_AFFINE", "1", 1);
-    setenv("DFLASH_CUDA_MMQ_FP2_AFFINE_GENERAL", "1", 1);
+    dflash::common::set_environment_variable("LUCE_MMVQ_MAX_NCOLS", "1", true);
+    dflash::common::set_environment_variable("DFLASH_CUDA_MMVQ_FP2_AFFINE", "1", true);
+    dflash::common::set_environment_variable("DFLASH_CUDA_MMQ_FP2_AFFINE", "1", true);
+    dflash::common::set_environment_variable("DFLASH_CUDA_MMQ_FP2_AFFINE_GENERAL", "1", true);
     hipDeviceProp_t properties{};
     if (hipGetDeviceProperties(&properties, 0) != hipSuccess) {
         std::fprintf(stderr, "failed to query HIP device 0\n");
@@ -319,6 +324,16 @@ int main() {
             const DispatchPath expected_path =
                 shape.n <= 8 ? DispatchPath::MMVQ : DispatchPath::MMQ;
             ok = test_case(hip_backend, quant, shape, expected_path) && ok;
+            if (quant.type == GGML_TYPE_Q4_0_ROCMFP4_FAST && shape.n == 16 &&
+                std::strncmp(properties.gcnArchName, "gfx1151", 7) == 0) {
+                // Zero restores the process ceiling; positive overrides win.
+                for (const int ceiling : {0, 8, 16}) {
+                    const DispatchPath path = ceiling == 16 ? DispatchPath::MMVQ : DispatchPath::MMQ;
+                    std::printf("ROCmFP4 n=16 ceiling=%d (environment=1): expect %s\n",
+                                ceiling, dispatch_path_name(path));
+                    ok = test_case(hip_backend, quant, shape, path, ceiling) && ok;
+                }
+            }
         }
     }
     if (shape_filter && !matched_shape) {

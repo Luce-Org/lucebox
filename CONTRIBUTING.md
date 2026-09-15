@@ -31,14 +31,14 @@ The script is idempotent and configures `nvcc` on PATH for both bash and zsh. Fo
 | Tool | Min version |
 |------|------------|
 | GCC / G++ | 11 |
-| CMake | 3.18 |
+| CMake | 3.21 |
 | Git | 2.x |
 | git-lfs | any |
 | CUDA Toolkit | 12.0+ |
 | huggingface-cli | any |
 | uv | 0.11+ (Python deps) |
 
-After setup:
+After setup, run these commands from the repository root:
 
 ```bash
 git submodule update --init --recursive
@@ -51,7 +51,7 @@ uv sync --extra megakernel    # also compile the megakernel CUDA extension
 bash scripts/check_uv_workspace.sh  # lockfile + frozen-sync import smoke
 
 # C++/CUDA decoder
-cmake -B server/build -S dflash -DCMAKE_BUILD_TYPE=Release
+cmake -B server/build -S server -DCMAKE_BUILD_TYPE=Release
 cmake --build server/build --target test_dflash -j
 ```
 
@@ -87,7 +87,7 @@ If you want to contribute benchmarks but don't have the hardware:
 ## Getting help
 
 - [Discord](https://discord.gg/yHfswqZmJQ) — fastest feedback
-- [Issues](https://github.com/Luce-Org/lucebox-hub/issues) — for bugs and proposals
+- [Issues](https://github.com/Luce-Org/lucebox/issues) — for bugs and proposals
 - Mention `@Luce-Org/maintainers` on a PR when it's ready for review
 
 ## Licensing

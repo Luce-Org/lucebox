@@ -1,4 +1,5 @@
 #include "common/concurrency/seq_engine.h"
+#include "common/concurrency/seq_round_policy.h"
 #include "host_check.h"
 
 #include <cstdio>
@@ -113,6 +114,67 @@ int main() {
     CHECK(large.size() == 1);
     CHECK(large[0].slot == 2);
     CHECK(large[0].max_tokens == std::numeric_limits<int>::max());
+
+    // Exercise the production policy over a changing request cohort. A 64
+    // token aggregate budget must rotate only on actual prompt service, or
+    // alternating decode rounds would repeatedly starve the same lane.
+    SeqRoundPolicy policy;
+    SeqEngine::StepPlan scheduled;
+    scheduled.decode = {{0, 71, true}};
+    std::vector<PrefillCandidate> queue{{1, 0}, {2, 1}};
+    const StepPlanLimits small{3, 512, 64, 512};
+    for (int round = 0; round < 8; ++round) {
+        policy.plan(scheduled, queue, small, true);
+        CHECK(scheduled.decode.size() == 1);
+        CHECK(scheduled.decode[0].slot == 0 && scheduled.decode[0].token == 71);
+        if (round % 2 == 0) {
+            CHECK(scheduled.prefills.empty());
+        } else {
+            CHECK(scheduled.prefills.size() == 1);
+            CHECK(scheduled.prefills[0].slot == 1 + ((round / 2) % 2));
+            CHECK(scheduled.prefills[0].max_tokens == 64);
+        }
+    }
+    // Completion changes a prefill lane to a decoder, including its pending
+    // token and speculation veto, without dropping it from either round.
+    queue.erase(queue.begin());
+    scheduled.decode.push_back({1, 99, false});
+    for (int round = 0; round < 2; ++round) {
+        policy.plan(scheduled, queue, small, true);
+        CHECK(scheduled.decode.size() == 2);
+        CHECK(scheduled.decode[1].token == 99 && !scheduled.decode[1].allow_speculation);
+        CHECK(scheduled.prefills.empty() == (round == 0));
+    }
+    // Losing eligibility resets the phase and immediately serves prompts.
+    policy.plan(scheduled, queue, small, true);
+    CHECK(scheduled.prefills.empty());
+    policy.plan(scheduled, queue, small, false);
+    CHECK(scheduled.prefills.size() == 1);
+    policy.plan(scheduled, queue, small, true);
+    CHECK(scheduled.prefills.empty());
+    // Cancelling the remaining prefill ends mixed work. A new arrival starts
+    // with speculation even though the old cohort owed a prefill round.
+    policy.plan(scheduled, {}, small, true);
+    CHECK(scheduled.prefills.empty());
+    policy.plan(scheduled, {{2, 2}}, small, true);
+    CHECK(scheduled.prefills.empty());
+    // Cancelling all decoders immediately restores idle prompt throughput.
+    scheduled.decode.clear();
+    const StepPlanLimits idle512{3, 2048, 512, 512};
+    policy.plan(scheduled, {{2, 2}}, idle512, false);
+    CHECK(scheduled.prefills.size() == 1 && scheduled.prefills[0].max_tokens == 512);
+    scheduled.decode = {{0, 72, true}};
+    policy.plan(scheduled, {{2, 2}}, small, true);
+    CHECK(scheduled.prefills.empty());
+    // An empty/cancelled cohort or engine failure explicitly resets phase.
+    policy.reset();
+    policy.plan(scheduled, {{2, 3}}, small, true);
+    CHECK(scheduled.prefills.empty());
+    // Unsupported engines keep ordinary mixed service on every iteration.
+    for (int round = 0; round < 3; ++round) {
+        policy.plan(scheduled, {{2, 3}}, small, false);
+        CHECK(scheduled.prefills.size() == 1);
+    }
 
     // The same model-neutral layer validates engine row ownership before the
     // scheduler mutates socket/request state.

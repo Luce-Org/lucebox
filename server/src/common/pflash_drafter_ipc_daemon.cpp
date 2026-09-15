@@ -47,9 +47,13 @@ int run_pflash_drafter_ipc_daemon(const char * drafter_path,
         if (cmd == "quit" || cmd == "exit") break;
         if (cmd == "compress") {
             int keep_x1000 = 0;
-            iss >> keep_x1000;
+            int score_query_end = -1;
+            int score_query_tokens = 8;
+            iss >> keep_x1000 >> score_query_end >> score_query_tokens;
             std::string path = read_line_tail(iss);
-            if (keep_x1000 < 0 || keep_x1000 > 1000 || path.empty()) {
+            if (keep_x1000 < 0 || keep_x1000 > 1000 ||
+                !valid_pflash_score_query_tokens(score_query_tokens) ||
+                path.empty()) {
                 std::fprintf(stderr, "[pflash-ipc-daemon] bad compress: %s\n",
                              line.c_str());
                 stream_status(stream_fd, -1);
@@ -63,7 +67,9 @@ int run_pflash_drafter_ipc_daemon(const char * drafter_path,
                 continue;
             }
             const float keep = (float)keep_x1000 / 1000.0f;
-            auto compressed = drafter_score_and_compress(ctx, input_ids, keep);
+            auto compressed = drafter_score_and_compress(
+                ctx, input_ids, keep, /*chunk_size=*/32, score_query_tokens,
+                /*pool_kernel=*/13, score_query_end);
             if (compressed.empty()) {
                 std::fprintf(stderr, "[pflash-ipc-daemon] compress returned empty\n");
                 stream_status(stream_fd, -1);

@@ -480,9 +480,10 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         case GGML_OP_GATED_DELTA_NET:
             // The CPU kernel supports in-place and active-slot recurrence,
             // but not tree parents, persistent intermediate storage, raw
-            // gates or SpecLA state.
+            // gates, read-only mapped verification or SpecLA state.
             return ggml_get_op_params_i32(op, 2) != 1 &&
                    ggml_get_op_params_i32(op, 10) == 0 &&
+                   ggml_get_op_params_i32(op, 11) == 0 &&
                    op->src[6] == nullptr && op->src[7] == nullptr &&
                    op->src[9] == nullptr;
         case GGML_OP_OUT_PROD:

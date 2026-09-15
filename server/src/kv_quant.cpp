@@ -170,7 +170,8 @@ void validate_kv_pair_or_abort(ggml_type k, ggml_type v, const char * who) {
     std::abort();
 }
 
-void resolve_kv_types(ggml_type & k_out, ggml_type & v_out) {
+void resolve_kv_types(ggml_type & k_out, ggml_type & v_out,
+                      ggml_type k_override, ggml_type v_override) {
     ggml_type k = GGML_TYPE_Q4_0;
     ggml_type v = GGML_TYPE_Q4_0;
 
@@ -186,7 +187,7 @@ void resolve_kv_types(ggml_type & k_out, ggml_type & v_out) {
     }
 
     // Layer 1: explicit per-axis override (highest precedence)
-    if (const char * s = std::getenv("DFLASH27B_KV_K")) {
+    if (const char * s = k_override == GGML_TYPE_COUNT ? std::getenv("DFLASH27B_KV_K") : nullptr) {
         const ggml_type parsed = parse_kv_type(s);
         if (parsed == GGML_TYPE_COUNT) {
             std::fprintf(stderr, "[dflash] Unknown KV K type: \"%s\"\n", s);
@@ -194,7 +195,7 @@ void resolve_kv_types(ggml_type & k_out, ggml_type & v_out) {
         }
         k = parsed;
     }
-    if (const char * s = std::getenv("DFLASH27B_KV_V")) {
+    if (const char * s = v_override == GGML_TYPE_COUNT ? std::getenv("DFLASH27B_KV_V") : nullptr) {
         const ggml_type parsed = parse_kv_type(s);
         if (parsed == GGML_TYPE_COUNT) {
             std::fprintf(stderr, "[dflash] Unknown KV V type: \"%s\"\n", s);
@@ -202,6 +203,9 @@ void resolve_kv_types(ggml_type & k_out, ggml_type & v_out) {
         }
         v = parsed;
     }
+
+    if (k_override != GGML_TYPE_COUNT) k = k_override;
+    if (v_override != GGML_TYPE_COUNT) v = v_override;
 
     // Validate the resolved (K, V) pair
     validate_kv_pair_or_abort(k, v, "[dflash]");

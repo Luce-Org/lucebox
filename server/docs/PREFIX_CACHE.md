@@ -195,6 +195,7 @@ free_snapshot_backend(snap_backend_, compute_backend_);  // then backend
 | Server flag | Default | Description |
 |-------------|---------|-------------|
 | `--prefix-cache-slots N` | 32 | Max turn-boundary prefix cache slots |
+| `--concurrent-prefix-cache-max-mib N` | 4096 | Resident RAM limit for copied concurrent paged checkpoints; `0` is unlimited |
 | `--prefill-cache-slots N` | 0 | Max exact full-prompt prefill cache slots |
 | `--skip-park` | false | Skip parking draft model during compress |
 
@@ -202,8 +203,16 @@ free_snapshot_backend(snap_backend_, compute_backend_);  // then backend
 
 With right-sized, CPU-resident snapshots the limiting resource is **system RAM**,
 not VRAM. Each slot costs approximately `cur_pos × 5 KB` (for Qwen3.5-27B Q8_0 KV),
-so 32 slots with an average prefix of 2000 tokens ≈ 320 MB of system RAM — negligible
-on most workstations.
+so 32 slots with an average prefix of 2000 tokens use about 320 MB of system RAM.
+
+Concurrent paged serving measures the exact backend allocation required for
+each checkpoint before copying it. The cache keeps committed checkpoints under
+`--concurrent-prefix-cache-max-mib`: when necessary it replaces one eligible least-recently-used
+entry, and if no single eligible entry can make enough room it skips the new
+checkpoint without disturbing the committed cache. The configured limit covers
+resident committed checkpoint buffers. During an atomic replacement, the new
+buffer and the selected victim can coexist briefly, so transient process memory
+can exceed the limit by up to one checkpoint.
 
 | Scenario | Typical prefix length | Recommended cap |
 |----------|----------------------|-----------------|

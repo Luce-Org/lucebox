@@ -248,10 +248,8 @@ __global__ void geometric_draft_topk_combine(const float * __restrict__ part_max
     }
 }
 
-// Per-device scratch for the [n_positions × K] outputs plus the
-// [n_positions × split × K] pass-1 partials, grown as needed. The decode loop
-// is single-threaded, so a plain static cache is safe and avoids a
-// cudaMalloc/cudaFree on every step.
+// Each worker owns its persistent scratch. Device changes and thread exit
+// release allocations on their owning device without touching another worker.
 struct Scratch {
     int       device   = -1;
     size_t    cap       = 0;       // output elements (n_positions*K)
@@ -262,39 +260,57 @@ struct Scratch {
     float *   d_psum    = nullptr; // [n_positions*split]
     float *   d_pv      = nullptr; // [n_positions*split*kMaxK]
     int32_t * d_pi      = nullptr; // [n_positions*split*kMaxK]
-};
-Scratch g_scratch;
 
-void free_scratch() {
-    if (g_scratch.d_lp)   cudaFree(g_scratch.d_lp);
-    if (g_scratch.d_ids)  cudaFree(g_scratch.d_ids);
-    if (g_scratch.d_pmax) cudaFree(g_scratch.d_pmax);
-    if (g_scratch.d_psum) cudaFree(g_scratch.d_psum);
-    if (g_scratch.d_pv)   cudaFree(g_scratch.d_pv);
-    if (g_scratch.d_pi)   cudaFree(g_scratch.d_pi);
-    g_scratch = Scratch{};
-}
+    Scratch() = default;
+    Scratch(const Scratch &) = delete;
+    Scratch & operator=(const Scratch &) = delete;
+    ~Scratch() { reset(); }
+
+    void reset() {
+        if (device < 0) return;
+        int previous = -1;
+        cudaGetDevice(&previous);
+        if (previous != device) cudaSetDevice(device);
+        if (d_lp) cudaFree(d_lp);
+        d_lp = nullptr;
+        if (d_ids) cudaFree(d_ids);
+        d_ids = nullptr;
+        if (d_pmax) cudaFree(d_pmax);
+        d_pmax = nullptr;
+        if (d_psum) cudaFree(d_psum);
+        d_psum = nullptr;
+        if (d_pv) cudaFree(d_pv);
+        d_pv = nullptr;
+        if (d_pi) cudaFree(d_pi);
+        d_pi = nullptr;
+        if (previous >= 0 && previous != device) cudaSetDevice(previous);
+        device = -1;
+        cap = 0;
+        part_cap = 0;
+    }
+};
+thread_local Scratch scratch;
 
 // Allocate output + partial buffers. n = n_positions*K outputs;
 // n_parts = n_positions*split partials (each carrying K entries).
 bool ensure_scratch(int device, size_t n, size_t n_parts) {
     const size_t n_part_lists = n_parts * (size_t)kMaxK;  // upper bound on K
-    if (g_scratch.device == device && g_scratch.cap >= n &&
-        g_scratch.part_cap >= n_part_lists)
+    if (scratch.device == device && scratch.cap >= n &&
+        scratch.part_cap >= n_part_lists)
         return true;
-    free_scratch();
-    if (cudaMalloc(&g_scratch.d_lp,   n            * sizeof(float))   != cudaSuccess) goto fail;
-    if (cudaMalloc(&g_scratch.d_ids,  n            * sizeof(int32_t)) != cudaSuccess) goto fail;
-    if (cudaMalloc(&g_scratch.d_pmax, n_parts      * sizeof(float))   != cudaSuccess) goto fail;
-    if (cudaMalloc(&g_scratch.d_psum, n_parts      * sizeof(float))   != cudaSuccess) goto fail;
-    if (cudaMalloc(&g_scratch.d_pv,   n_part_lists * sizeof(float))   != cudaSuccess) goto fail;
-    if (cudaMalloc(&g_scratch.d_pi,   n_part_lists * sizeof(int32_t)) != cudaSuccess) goto fail;
-    g_scratch.device   = device;
-    g_scratch.cap      = n;
-    g_scratch.part_cap = n_part_lists;
+    scratch.reset();
+    scratch.device = device; // Also owns partial allocations on failure.
+    if (cudaMalloc(&scratch.d_lp,   n            * sizeof(float))   != cudaSuccess) goto fail;
+    if (cudaMalloc(&scratch.d_ids,  n            * sizeof(int32_t)) != cudaSuccess) goto fail;
+    if (cudaMalloc(&scratch.d_pmax, n_parts      * sizeof(float))   != cudaSuccess) goto fail;
+    if (cudaMalloc(&scratch.d_psum, n_parts      * sizeof(float))   != cudaSuccess) goto fail;
+    if (cudaMalloc(&scratch.d_pv,   n_part_lists * sizeof(float))   != cudaSuccess) goto fail;
+    if (cudaMalloc(&scratch.d_pi,   n_part_lists * sizeof(int32_t)) != cudaSuccess) goto fail;
+    scratch.cap      = n;
+    scratch.part_cap = n_part_lists;
     return true;
 fail:
-    free_scratch();
+    scratch.reset();
     return false;
 }
 
@@ -368,10 +384,10 @@ bool geometric_extract_draft_topk_cuda(const void * d_logits,
 #define DFLASH_TOPK_LAUNCH(KV, VEC)                                                             \
             geometric_draft_topk_partial<KV, VEC><<<grid1, kBlock>>>(                                     \
                 lp_in, vocab, inv_t, split,                                                     \
-                g_scratch.d_pmax, g_scratch.d_psum, g_scratch.d_pv, g_scratch.d_pi);           \
+                scratch.d_pmax, scratch.d_psum, scratch.d_pv, scratch.d_pi);           \
             geometric_draft_topk_combine<KV><<<n_positions, comb_block>>>(                                \
-                g_scratch.d_pmax, g_scratch.d_psum, g_scratch.d_pv, g_scratch.d_pi,            \
-                split, g_scratch.d_lp, g_scratch.d_ids);
+                scratch.d_pmax, scratch.d_psum, scratch.d_pv, scratch.d_pi,            \
+                split, scratch.d_lp, scratch.d_ids);
 #define DFLASH_TOPK_CASE(KV)                                                                    \
             case KV:                                                                            \
                 if (use_vec) { DFLASH_TOPK_LAUNCH(KV, true) }                                   \
@@ -392,9 +408,9 @@ bool geometric_extract_draft_topk_cuda(const void * d_logits,
 
         if (kProfile) cudaEventRecord(e_k1);
         if (launched && cudaGetLastError() == cudaSuccess && cudaDeviceSynchronize() == cudaSuccess) {
-            const cudaError_t e1 = cudaMemcpy(out_log_probs, g_scratch.d_lp,
+            const cudaError_t e1 = cudaMemcpy(out_log_probs, scratch.d_lp,
                                               n * sizeof(float), cudaMemcpyDeviceToHost);
-            const cudaError_t e2 = cudaMemcpy(out_token_ids, g_scratch.d_ids,
+            const cudaError_t e2 = cudaMemcpy(out_token_ids, scratch.d_ids,
                                               n * sizeof(int32_t), cudaMemcpyDeviceToHost);
             ok = (e1 == cudaSuccess && e2 == cudaSuccess);
         }

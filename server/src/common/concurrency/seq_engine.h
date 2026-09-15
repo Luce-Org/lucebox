@@ -55,6 +55,7 @@
 #include <vector>
 
 #include "common/sampler.h"
+#include "prefix_store.h"
 
 namespace dflash::common {
 
@@ -155,12 +156,14 @@ public:
         enum class Status {
             admitted,
             busy,
+            capacity_exceeded, // prompt cannot fit even in an otherwise idle pool
             failed,
         };
 
         Status status = Status::failed;
         int slot = -1;
         std::string error;
+        PrefixStoreAdmission prefix_store;
     };
 
     // Admit one request into a free slot and queue its prompt for chunked
@@ -177,6 +180,23 @@ public:
     virtual AdmitResult admit(uint64_t request_id,
                               const std::vector<int32_t> & prompt,
                               const SamplerCfg & sampler) = 0;
+
+    // Optional prefix-checkpoint admission. Unsupported engines remain on
+    // cold admission and never receive a plan from the scheduler.
+    virtual bool supports_prefix_store() const { return false; }
+    // Conservative resident-byte estimate for one checkpoint. Returning zero
+    // means the engine cannot safely participate in a configured byte budget.
+    virtual size_t estimate_prefix_store_bytes(int) const { return 0; }
+    virtual AdmitResult admit_with_prefix(
+            uint64_t request_id,
+            const std::vector<int32_t> & prompt,
+            const SamplerCfg & sampler,
+            const PrefixStorePlan &) {
+        return admit(request_id, prompt, sampler);
+    }
+
+    // Release engine-owned payload without touching server policy metadata.
+    virtual void discard_prefix_store(PrefixStoreRef) {}
 
     struct StepInput {
         int     slot  = -1;
@@ -211,6 +231,10 @@ public:
         int32_t token = -1;
         // Present only for failed.
         std::string error;
+        // A capture ending on this successfully-computed prefill boundary.
+        // Capture failure does not fail generation: the scheduler invalidates
+        // the reserved cache entry and continues the request cold.
+        PrefixStoreEvent prefix_store;
     };
 
     // One scheduler iteration owns both kinds of logical work. `decode` must
@@ -233,6 +257,9 @@ public:
         // every live sequence before invoking step() again.
         std::string error;
 
+        // Successful speculative work, excluding the pending output token.
+        int speculative_lanes = 0;
+        int speculative_accepted_tokens = 0;
         bool ok() const { return error.empty(); }
     };
 
@@ -241,6 +268,12 @@ public:
     // advertise different sequence, per-sequence, and total-token limits for
     // idle, mixed, or larger decode buckets.
     virtual StepPlanLimits step_plan_limits(int decode_rows) const = 0;
+
+    // Read-only eligibility for a decode-only speculative round. Pending
+    // prefill does not make an otherwise eligible decoder incapable.
+    virtual bool has_speculative_decode(const std::vector<StepInput> &) const {
+        return false;
+    }
 
     // A successful result returns one decode output for every decode input and
     // one explicit advanced/completed/failed result for every selected
@@ -349,6 +382,35 @@ inline std::string validate_step_result(
         if (output.status == PrefillStatus::failed &&
             (output.token >= 0 || output.error.empty()))
             return "failed prefill has invalid payload";
+        const PrefixStoreEvent & store = output.prefix_store;
+        if (store.status == PrefixStoreEvent::Status::none) {
+            if (store.ticket.id != 0 ||
+                store.ticket.checkpoint.id != 0 ||
+                store.ticket.checkpoint.tokens != 0 ||
+                !store.error.empty() ||
+                store.bytes != 0 || store.elapsed_us != 0)
+                return "inactive prefix capture carries payload";
+        } else {
+            if (store.status != PrefixStoreEvent::Status::saved &&
+                store.status != PrefixStoreEvent::Status::failed)
+                return "prefix capture has an unknown status";
+            if (!store.ticket.valid())
+                return "prefix capture has an invalid ticket";
+            if (output.status == PrefillStatus::failed)
+                return "failed prefill carries a prefix capture";
+            if (store.status == PrefixStoreEvent::Status::saved &&
+                !store.error.empty())
+                return "saved prefix capture carries an error";
+            if (store.status == PrefixStoreEvent::Status::saved &&
+                store.bytes == 0)
+                return "saved prefix capture omits its byte size";
+            if (store.status == PrefixStoreEvent::Status::failed &&
+                store.error.empty())
+                return "failed prefix capture omits its error";
+            if (store.status == PrefixStoreEvent::Status::failed &&
+                store.bytes != 0)
+                return "failed prefix capture carries committed bytes";
+        }
         prefill_seen[(size_t)output.slot] = 1;
     }
 

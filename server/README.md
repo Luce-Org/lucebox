@@ -1,5 +1,5 @@
 <p align="left">
-  <a href="../README.md">← lucebox-hub</a>
+  <a href="../README.md">← lucebox</a>
 </p>
 
 <p align="center">
@@ -41,6 +41,9 @@ This repo provides the GGUF target path and runtime pieces needed to run that st
 - TQ3_0 and asymmetric K/V cache quantization for long context.
 
 The default setup fits on a 24 GB RTX 3090: ~16 GB Q4_K_M target, 1.84 GB GGUF draft, DDTree verify state, and KV cache.
+
+For one listener with Qwen on R9700 and DS4 on Strix Halo, see
+[model load balancing](docs/MODEL_LOAD_BALANCING.md).
 
 ## Results
 
@@ -297,12 +300,13 @@ See the [current six-expert Strix Halo profile](https://www.lucebox.com/blog/dee
 | `--kvflash-policy drafter\|lru\|qk` | `drafter` | Choose the KVFlash residency policy. |
 | `--kvflash-tau <N>` | `64` | Drafter-policy reselect interval. |
 | `--prefix-cache-slots <N>` | `32` | In-memory prefix-cache slots; `0` disables. |
+| `--concurrent-prefix-cache-max-mib <MiB>` | `4096` | Resident RAM limit for copied concurrent paged prefix checkpoints; `0` is unlimited. |
 | `--agent-turn-cache` | off | Extend prefix caching through generated tool calls. |
 | `--prefill-cache-slots <N>` | `0` | Full-prompt cache slots. |
-| `--paged-attention` | off | Enable 16-token paged KV blocks for supported Qwen targets. |
-| `--max-concurrency <N>` | `1` | Maximum concurrent decode sequences; values above 1 enable paged attention. |
+| `--paged-attention` | off | Enable paged KV for supported Qwen targets (16-token blocks) or DeepSeek4 on Strix Halo and R9700 plus Strix Halo (128-token pages). DeepSeek4 paged serving is AR-only. |
+| `--max-concurrency <N>` | `1` | Maximum concurrent decode sequences. Qwen supports up to 64; DeepSeek4 supports up to 6. Values above 1 enable paged attention. |
 | `--admission-coalesce-ms <N>` | `20` | Idle-to-busy batching window from 0 through 1000 ms. |
-| `--kv-pool-tokens <N>` | auto | Shared physical K/V capacity for concurrent serving. |
+| `--kv-pool-tokens <N>` | auto | Shared physical K/V capacity for concurrent serving, rounded to the backend page size. |
 | `--kv-cache-dir <path>` | none | Enable persistent disk KV cache in this directory. |
 | `--kv-cache-budget <MB>` | `4096` | Disk KV-cache size cap. |
 | `--kv-cache-min-tokens <N>` | `512` | Minimum prefix length to persist. |
@@ -555,10 +559,10 @@ tokens) is the path to bring code recall to the same ratio as prose.
 ## Quick start
 
 ```bash
-git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub
-cd lucebox-hub/dflash
+git clone --recurse-submodules https://github.com/Luce-Org/lucebox.git
+cd lucebox/server
 
-# Build (CUDA 12+, CMake 3.18+, sm_60+ GPU including Pascal; CUDA 13+ required for Jetson AGX Thor sm_110)
+# Build (CUDA 12+, CMake 3.21+, sm_60+ GPU including Pascal; CUDA 13+ required for Jetson AGX Thor sm_110)
 # Pass -DCMAKE_CUDA_ARCHITECTURES matching your GPU. Common values:
 #   60;61 = Pascal P100/P40 (scalar flashprefill fallback, no WMMA)
 #   70 = V100 (F16 WMMA kernels, BF16 draft → FP16 at load)
@@ -572,7 +576,7 @@ cd lucebox-hub/dflash
 # which compiles Pascal (scalar), Volta/Turing (F16 WMMA), and Ampere+ (BF16 WMMA)
 # flashprefill paths.
 cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=86
-cmake --build build --target test_dflash -j
+cmake --build build --target test_dflash dflash_server -j
 
 # Fetch models: ~16 GB target + 0.98 GB Lucebox Q4_K_M GGUF DFlash draft.
 # Quickstart pins to Qwen3.6-27B (latest release). For Qwen3.5-27B swap in
@@ -618,7 +622,7 @@ nvcc --version
 
 ```bash
 nvcc --version  # must show >= 12.9
-git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/server
+git clone --recurse-submodules https://github.com/Luce-Org/lucebox.git && cd lucebox/server
 cmake -B build -S . -DCMAKE_BUILD_TYPE=Release   # CMake auto-adds sm_121
 cmake --build build --target test_dflash dflash_server -j
 ```
@@ -629,7 +633,7 @@ On GB10 (128 GB unified), re-sweep `--ddtree-budget` (larger tree = more verify 
 
 ```bash
 nvcc --version  # must show >= 13.0
-git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/server
+git clone --recurse-submodules https://github.com/Luce-Org/lucebox.git && cd lucebox/server
 cmake -B build -S . -DCMAKE_BUILD_TYPE=Release   # CMake auto-adds Thor arch
 cmake --build build --target test_dflash dflash_server -j
 ```
@@ -667,7 +671,7 @@ HumanEval runs (+3.1%), HumanEval+ pass@1 145/164 versus 143/164, with all ten
 short A/B replies and 133/164 full-suite replies byte-identical.
 
 ```bash
-git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/server
+git clone --recurse-submodules https://github.com/Luce-Org/lucebox.git && cd lucebox/server
 
 # Ubuntu/ROCm build dependencies used by ggml's HIP backend.
 sudo apt-get update
@@ -740,7 +744,7 @@ Correctness: `test_vs_oracle` validates the draft graph at cos sim 0.999812 vs t
 
 ## Contributing
 
-Open an issue or PR against `Luce-Org/lucebox-hub`. Good first picks:
+Open an issue or PR against `Luce-Org/lucebox`. Good first picks:
 
 - **Leviathan-style rejection sampling** on each DDTree branch (the current implementation samples only the committed token; full prob-matching across the tree is the next step)
 - **Full llama.cpp integration**: new arch, `llama-speculative-dflash.cpp`, `llama-cli` / `llama-server` wiring
@@ -751,7 +755,7 @@ Open an issue or PR against `Luce-Org/lucebox-hub`. Good first picks:
 @software{luce_dflash_2026,
   title  = {Luce DFlash: GGUF port of block-diffusion speculative decoding for Qwen3.5-27B on consumer GPUs},
   author = {Lucebox},
-  url    = {https://github.com/Luce-Org/lucebox-hub/tree/main/dflash},
+  url    = {https://github.com/Luce-Org/lucebox/tree/main/server},
   year   = {2026}
 }
 

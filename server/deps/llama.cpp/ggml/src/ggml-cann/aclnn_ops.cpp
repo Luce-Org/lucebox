@@ -2669,6 +2669,7 @@ void ggml_cann_rope(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     // const int n_past     = ((int32_t *) dst->op_params)[0];
     const int n_dims     = ((int32_t *) dst->op_params)[1];
     const int mode       = ((int32_t *) dst->op_params)[2];
+    GGML_ASSERT((mode & GGML_ROPE_TYPE_TAIL) == 0);
     // const int n_ctx      = ((int32_t *) dst->op_params)[3];
     const int n_ctx_orig = ((int32_t *) dst->op_params)[4];
 
@@ -3028,6 +3029,7 @@ void ggml_cann_rope_cache_preload(ggml_backend_cann_context & ctx, ggml_tensor *
     int       sections[4];
     const int n_dims     = ((int32_t *) dst->op_params)[1];
     const int mode       = ((int32_t *) dst->op_params)[2];
+    GGML_ASSERT((mode & GGML_ROPE_TYPE_TAIL) == 0);
     const int n_ctx_orig = ((int32_t *) dst->op_params)[4];
 
     GGML_TENSOR_UNARY_OP_LOCALS

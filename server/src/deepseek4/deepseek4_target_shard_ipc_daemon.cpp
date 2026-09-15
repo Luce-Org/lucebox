@@ -6,6 +6,7 @@
 
 #include "deepseek4_layer_split_adapter.h"
 #include "deepseek4_internal.h"
+#include "deepseek4_snapshot.h"
 #include "deepseek4_roctx.h"
 #include "common/target_shard_ipc.h"
 #include "common/target_shard_ipc_daemon.h"

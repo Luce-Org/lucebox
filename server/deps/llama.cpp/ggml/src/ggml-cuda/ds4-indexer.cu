@@ -351,12 +351,14 @@ static __global__ void ds4_indexer_score_decode_wmma_kernel(
     }
 }
 
-// The speculative verifier scores exactly four query tokens. The general
-// WMMA kernel places those four tokens in a 16-row tile and executes twelve
-// zero rows for every head. Pack four consecutive heads into the tile instead:
-// row = 4*head_in_group + token. The post-WMMA loop still accumulates heads in
-// their original order, preserving the established F32 numerical topology.
-static __global__ void ds4_indexer_score_wmma_q4_kernel(
+// The speculative verifier scores only a few query tokens. The general WMMA
+// kernel places them in a 16-row tile and executes the unused rows for every
+// head. Pack consecutive heads into the tile instead:
+// row = N_TOKENS*head_in_group + token. The post-WMMA loop still accumulates
+// heads in their original order, preserving the established F32 numerical
+// topology. This is the HIP equivalent of the Vulkan small-CM dispatch.
+template<int N_TOKENS>
+static __global__ void ds4_indexer_score_wmma_small_kernel(
         float       * scores,
         const float * q,
         const float * weights,
@@ -375,7 +377,14 @@ static __global__ void ds4_indexer_score_wmma_q4_kernel(
     __shared__ float c_sh[8 * 16 * 16];
     __shared__ float weight_sh[16];
 
-    float acc[2] = {0.0f, 0.0f};
+    static_assert(N_TOKENS >= 2 && N_TOKENS <= 5,
+                  "small-CM kernel is specialized for verifier widths 2..5");
+    constexpr int HEADS_PER_TILE = 16 / N_TOKENS;
+    constexpr int USED_ROWS = HEADS_PER_TILE * N_TOKENS;
+    constexpr int ACC_SLOTS = (N_TOKENS + 1) / 2;
+    float acc[ACC_SLOTS];
+#pragma unroll
+    for (int slot = 0; slot < ACC_SLOTS; ++slot) acc[slot] = 0.0f;
 
     for (int i = tid; i < 128 * 128; i += 256) {
         const int c = i >> 7;
@@ -387,21 +396,30 @@ static __global__ void ds4_indexer_score_wmma_q4_kernel(
     }
     __syncthreads();
 
-    for (int head_base = 0; head_base < n_head; head_base += 4) {
+    for (int head_base = 0; head_base < n_head;
+         head_base += HEADS_PER_TILE) {
         for (int pair = tid; pair < 16 * 64; pair += 256) {
             const int row = pair >> 6;
             const int d = (pair & 63) * 2;
-            const int token = row & 3;
-            const int head = head_base + (row >> 2);
-            const float2 q_value = *reinterpret_cast<const float2 *>(
-                q + ((size_t) token * n_head + head) * 128 + d);
-            *reinterpret_cast<half2 *>(a_sh + row * 128 + d) =
-                __floats2half2_rn(q_value.x, q_value.y);
+            half2 value = __float2half2_rn(0.0f);
+            if (row < USED_ROWS) {
+                const int token = row % N_TOKENS;
+                const int head = head_base + row / N_TOKENS;
+                if (head < n_head) {
+                    const float2 q_value =
+                        *reinterpret_cast<const float2 *>(
+                            q + ((size_t) token * n_head + head) * 128 + d);
+                    value = __floats2half2_rn(q_value.x, q_value.y);
+                }
+            }
+            *reinterpret_cast<half2 *>(a_sh + row * 128 + d) = value;
         }
         if (tid < 16) {
-            const int token = tid & 3;
-            const int head = head_base + (tid >> 2);
-            weight_sh[tid] = weights[(size_t) token * n_head + head];
+            const int token = tid % N_TOKENS;
+            const int head = head_base + tid / N_TOKENS;
+            weight_sh[tid] = tid < USED_ROWS && head < n_head
+                ? weights[(size_t) token * n_head + head]
+                : 0.0f;
         }
         __syncthreads();
 
@@ -431,16 +449,17 @@ static __global__ void ds4_indexer_score_wmma_q4_kernel(
         __syncthreads();
 
         int slot = 0;
-        for (int output = tid; output < 4 * 128;
+        for (int output = tid; output < N_TOKENS * 128;
              output += 256, ++slot) {
             const int token = output >> 7;
             const int local_comp = output & 127;
             const int comp_tile = local_comp >> 4;
             const int comp_col = local_comp & 15;
 #pragma unroll
-            for (int head_in_group = 0; head_in_group < 4;
+            for (int head_in_group = 0;
+                 head_in_group < HEADS_PER_TILE;
                  ++head_in_group) {
-                const int row = 4 * head_in_group + token;
+                const int row = N_TOKENS * head_in_group + token;
                 const float dot = c_sh[
                     comp_tile * 16 * 16 + row * 16 + comp_col];
                 acc[slot] += fmaxf(dot, 0.0f) * weight_sh[row];
@@ -450,7 +469,7 @@ static __global__ void ds4_indexer_score_wmma_q4_kernel(
     }
 
     int slot = 0;
-    for (int output = tid; output < 4 * 128;
+    for (int output = tid; output < N_TOKENS * 128;
          output += 256, ++slot) {
         const int token = output >> 7;
         const int comp = tile_c + (output & 127);
@@ -553,6 +572,17 @@ void ggml_cuda_op_ds4_indexer_score(
         warp_size == 32 &&
         (!GGML_CUDA_CC_IS_NVIDIA(device_info.cc) ||
          device_info.cc >= GGML_CUDA_CC_VOLTA);
+    const char * packed_small_name = "GGML_DS4_INDEXER_PACK_SMALL";
+    const char * packed_small_env = std::getenv(packed_small_name);
+    if (!packed_small_env) {
+        // Backward-compatible alias for the original q=4-only prototype.
+        packed_small_name = "GGML_DS4_INDEXER_PACK_Q4";
+        packed_small_env = std::getenv(packed_small_name);
+    }
+    const bool use_packed_small = packed_small_env
+        ? ds4_env_flag_enabled(packed_small_name)
+        : GGML_CUDA_CC_IS_RDNA3_5(device_info.cc) ||
+          GGML_CUDA_CC_IS_RDNA4(device_info.cc);
 #if DS4_INDEXER_WMMA_AVAILABLE
     if (wmma_capable && n_tokens == 1) {
         const dim3 grid((unsigned) ((n_comp + 127) / 128), 1, 1);
@@ -564,10 +594,39 @@ void ggml_cuda_op_ds4_indexer_score(
             visibility_mask
                 ? static_cast<const float *>(visibility_mask->data) : nullptr,
             n_comp, kv_start, n_head, ratio);
-    } else if (wmma_capable && n_tokens == 4 && n_head % 4 == 0 &&
-               ds4_env_flag_enabled("GGML_DS4_INDEXER_PACK_Q4")) {
+    } else if (wmma_capable && n_tokens == 2 && use_packed_small) {
         const dim3 grid((unsigned) ((n_comp + 127) / 128), 1, 1);
-        ds4_indexer_score_wmma_q4_kernel<<<grid, 256, 0, stream>>>(
+        ds4_indexer_score_wmma_small_kernel<2><<<grid, 256, 0, stream>>>(
+            static_cast<float *>(dst->data),
+            static_cast<const float *>(q->data),
+            static_cast<const float *>(weights->data),
+            static_cast<const half *>(comp->data),
+            visibility_mask
+                ? static_cast<const float *>(visibility_mask->data) : nullptr,
+            n_comp, kv_start, n_head, ratio);
+    } else if (wmma_capable && n_tokens == 3 && use_packed_small) {
+        const dim3 grid((unsigned) ((n_comp + 127) / 128), 1, 1);
+        ds4_indexer_score_wmma_small_kernel<3><<<grid, 256, 0, stream>>>(
+            static_cast<float *>(dst->data),
+            static_cast<const float *>(q->data),
+            static_cast<const float *>(weights->data),
+            static_cast<const half *>(comp->data),
+            visibility_mask
+                ? static_cast<const float *>(visibility_mask->data) : nullptr,
+            n_comp, kv_start, n_head, ratio);
+    } else if (wmma_capable && n_tokens == 4 && use_packed_small) {
+        const dim3 grid((unsigned) ((n_comp + 127) / 128), 1, 1);
+        ds4_indexer_score_wmma_small_kernel<4><<<grid, 256, 0, stream>>>(
+            static_cast<float *>(dst->data),
+            static_cast<const float *>(q->data),
+            static_cast<const float *>(weights->data),
+            static_cast<const half *>(comp->data),
+            visibility_mask
+                ? static_cast<const float *>(visibility_mask->data) : nullptr,
+            n_comp, kv_start, n_head, ratio);
+    } else if (wmma_capable && n_tokens == 5 && use_packed_small) {
+        const dim3 grid((unsigned) ((n_comp + 127) / 128), 1, 1);
+        ds4_indexer_score_wmma_small_kernel<5><<<grid, 256, 0, stream>>>(
             static_cast<float *>(dst->data),
             static_cast<const float *>(q->data),
             static_cast<const float *>(weights->data),

@@ -43,6 +43,10 @@ struct soft_max_params {
     float max_bias;
     float m0;
     float m1;
+    // Lucebox sink-as-virtual-column mode: ncols counts one extra virtual
+    // column per row whose value is sinks[row]; x and dst rows are ncols - 1
+    // wide. Reductions then match scale -> concat(sink) -> soft_max exactly.
+    int sink_col;
 };
 
 // When ncols_template == 0 the bounds for the loops in this function are not known and can't be unrolled.
@@ -69,9 +73,11 @@ static __global__ void soft_max_f32(
     const int64_t i12 = i02 % p.ne12;
     const int64_t i13 = i03 % p.ne13;
 
-    x    += int64_t(rowx)*ncols;
+    const int ncols_x = p.sink_col ? ncols - 1 : ncols;   // width of the x and dst rows
+
+    x    += int64_t(rowx)*ncols_x;
     mask += (i11*p.nb11 + i12*p.nb12 + i13*p.nb13) / sizeof(T) * (mask != nullptr);
-    dst  += int64_t(rowx)*ncols;
+    dst  += int64_t(rowx)*ncols_x;
 
     const int block_size = block_size_template == 0 ? blockDim.x : block_size_template;
 
@@ -82,7 +88,7 @@ static __global__ void soft_max_f32(
     // shared memory buffer to cache values between iterations:
     float * vals = use_shared ? buf_iw + WARP_SIZE : dst;
 
-    float max_val = sinks ? sinks[i02] : -INFINITY;
+    float max_val = (sinks && !p.sink_col) ? sinks[i02] : -INFINITY;
 
 #pragma unroll
     for (int col0 = 0; col0 < ncols; col0 += block_size) {
@@ -92,9 +98,14 @@ static __global__ void soft_max_f32(
             break;
         }
 
-        const float val = x[col]*p.scale + (mask ? slope*t2f32(mask[col]) : 0.0f);
+        const float val = (p.sink_col && col == ncols_x)
+            ? sinks[rowx]
+            : x[col]*p.scale + (mask ? slope*t2f32(mask[col]) : 0.0f);
 
-        vals[col] = val;
+        // The global-memory cache is dst, which has no slot for the virtual sink.
+        if (use_shared || col < ncols_x) {
+            vals[col] = val;
+        }
         max_val = max(max_val, val);
     }
 
@@ -111,15 +122,18 @@ static __global__ void soft_max_f32(
             break;
         }
 
-        const float val = expf(vals[col] - max_val);
+        const float cached = (use_shared || col < ncols_x) ? vals[col] : sinks[rowx];
+        const float val = expf(cached - max_val);
         tmp += val;
-        vals[col] = val;
+        if (use_shared || col < ncols_x) {
+            vals[col] = val;
+        }
     }
 
     // find the sum of exps in the block
     tmp = block_reduce<block_reduce_method::SUM, block_size_template>(tmp, buf_iw);
 
-    if (sinks) {
+    if (sinks && !p.sink_col) {
         tmp += expf(sinks[i02] - max_val);
     }
 
@@ -133,6 +147,9 @@ static __global__ void soft_max_f32(
             return;
         }
 
+        if (p.sink_col && col == ncols_x) {
+            continue;   // the virtual sink column has no output
+        }
         dst[col] = vals[col] * inv_sum;
     }
 }
@@ -435,6 +452,14 @@ void ggml_cuda_op_soft_max(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     params.max_bias = max_bias;
     params.m0 = m0;
     params.m1 = m1;
+    int32_t sink_col = 0;
+    memcpy(&sink_col, (const int32_t *) dst->op_params + 2, sizeof(int32_t));
+    params.sink_col = sink_col;
+    if (sink_col) {
+        GGML_ASSERT(src1 == nullptr && src2 != nullptr);
+        GGML_ASSERT(ggml_nelements(src2) == nrows_x);
+        params.ncols = ne00 + 1;   // one virtual sink column per row
+    }
 
     if (use_f16) {
         soft_max_f32_cuda(src0_d, (const half *) src1_d, (const float *) src2_d, dst_d, params, stream, ctx);

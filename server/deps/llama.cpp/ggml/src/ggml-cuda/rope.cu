@@ -103,7 +103,8 @@ static __global__ void rope_norm(const T *            x,
                                  const float          theta_scale,
                                  const float *        freq_factors,
                                  const int64_t *      row_indices,
-                                 const int            set_rows_stride) {
+                                 const int            set_rows_stride,
+                                 const int            rot_offset) {
     const int i0 = 2*(blockDim.y*blockIdx.y + threadIdx.y);
 
     if (i0 >= ne00) {
@@ -134,19 +135,24 @@ static __global__ void rope_norm(const T *            x,
             ggml_cuda_memcpy_1<4>(dst + idst, &v);
         }
     };
-    if (i0 >= n_dims) {
+    // rot_offset is 0 for the standard head rotation and ne00 - n_dims for
+    // GGML_ROPE_TYPE_TAIL; j0 is the element's index inside the rotated span,
+    // so a tail element sees exactly the angle it would see in an extracted
+    // n_dims-wide tail tensor.
+    if (i0 < rot_offset || i0 >= rot_offset + n_dims) {
         store_coaelsced(x[ix + 0], x[ix + 1]);
         return;
     }
+    const int j0 = i0 - rot_offset;
 
-    const double theta_base = rope_theta_fp64(pos[i2], theta_scale, i0/2);
+    const double theta_base = rope_theta_fp64(pos[i2], theta_scale, j0/2);
 
-    const float freq_factor = has_ff ? freq_factors[i0/2] : 1.0f;
+    const float freq_factor = has_ff ? freq_factors[j0/2] : 1.0f;
 
     float cos_theta;
     float sin_theta;
 
-    rope_yarn<forward>(theta_base/freq_factor, freq_scale, corr_dims, i0, ext_factor, attn_factor, cos_theta, sin_theta);
+    rope_yarn<forward>(theta_base/freq_factor, freq_scale, corr_dims, j0, ext_factor, attn_factor, cos_theta, sin_theta);
 
     const float x0 = x[ix + 0];
     const float x1 = x[ix + 1];
@@ -392,6 +398,7 @@ static void rope_norm_cuda(const T *            x,
                            const float *        freq_factors,
                            const int64_t *      row_indices,
                            const int            set_rows_stride,
+                           const int            rot_offset,
                            cudaStream_t         stream) {
     GGML_ASSERT(ne00 % 2 == 0);
     const dim3 block_dims(1, CUDA_ROPE_BLOCK_SIZE, 1);
@@ -403,11 +410,11 @@ static void rope_norm_cuda(const T *            x,
     if (freq_factors == nullptr) {
         rope_norm<forward, false><<<block_nums, block_dims, 0, stream>>>(
             x, dst, ne00, ne01, ne02, s01, s02, s03, s1, s2, s3, n_dims, pos, freq_scale, ext_factor,
-            attn_factor, corr_dims, theta_scale, freq_factors, row_indices, set_rows_stride);
+            attn_factor, corr_dims, theta_scale, freq_factors, row_indices, set_rows_stride, rot_offset);
     } else {
         rope_norm<forward, true><<<block_nums, block_dims, 0, stream>>>(
             x, dst, ne00, ne01, ne02, s01, s02, s03, s1, s2, s3, n_dims, pos, freq_scale, ext_factor,
-            attn_factor, corr_dims, theta_scale, freq_factors, row_indices, set_rows_stride);
+            attn_factor, corr_dims, theta_scale, freq_factors, row_indices, set_rows_stride, rot_offset);
     }
 }
 
@@ -605,10 +612,14 @@ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
     memcpy(&beta_slow,   (int32_t *) dst->op_params + 10, sizeof(float));
     memcpy(&sections.v,  (int32_t *) dst->op_params + 11, sizeof(int)*4);
 
-    const bool is_neox = mode & GGML_ROPE_TYPE_NEOX;
-    const bool is_mrope = mode & GGML_ROPE_TYPE_MROPE;
-    const bool is_imrope = mode == GGML_ROPE_TYPE_IMROPE;
-    const bool is_vision = mode == GGML_ROPE_TYPE_VISION;
+    const bool is_tail = mode & GGML_ROPE_TYPE_TAIL;
+    const int  mode_base = mode & ~GGML_ROPE_TYPE_TAIL;
+    const bool is_neox = mode_base & GGML_ROPE_TYPE_NEOX;
+    const bool is_mrope = mode_base & GGML_ROPE_TYPE_MROPE;
+    const bool is_imrope = mode_base == GGML_ROPE_TYPE_IMROPE;
+    const bool is_vision = mode_base == GGML_ROPE_TYPE_VISION;
+    GGML_ASSERT(!is_tail || mode_base == GGML_ROPE_TYPE_NORMAL);
+    const int rot_offset = is_tail ? (int) ne00 - n_dims : 0;
 
     if (is_mrope) {
         GGML_ASSERT(sections.v[0] > 0 || sections.v[1] > 0 || sections.v[2] > 0);
@@ -677,17 +688,17 @@ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
             rope_norm_cuda<forward, float, float>((const float *) src0_d, (float *) dst_d, ne00, ne01, ne02, s01, s02,
                                                   s03, s1, s2, s3, n_dims, nr, pos, freq_scale, freq_base,
                                                   ext_factor, attn_factor, corr_dims, freq_factors, row_indices,
-                                                  set_rows_stride, stream);
+                                                  set_rows_stride, rot_offset, stream);
         } else if (src0->type == GGML_TYPE_F32 && dst_type == GGML_TYPE_F16) {
             rope_norm_cuda<forward, float, half>((const float *) src0_d, (half *) dst_d, ne00, ne01, ne02, s01, s02,
                                                  s03, s1, s2, s3, n_dims, nr, pos, freq_scale, freq_base,
                                                  ext_factor, attn_factor, corr_dims, freq_factors, row_indices,
-                                                 set_rows_stride, stream);
+                                                 set_rows_stride, rot_offset, stream);
         } else if (src0->type == GGML_TYPE_F16 && dst_type == GGML_TYPE_F16) {
             rope_norm_cuda<forward, half, half>((const half *) src0_d, (half *) dst_d, ne00, ne01, ne02, s01, s02,
                                                 s03, s1, s2, s3, n_dims, nr, pos, freq_scale, freq_base,
                                                 ext_factor, attn_factor, corr_dims, freq_factors, row_indices,
-                                                set_rows_stride, stream);
+                                                set_rows_stride, rot_offset, stream);
         } else {
             GGML_ABORT("fatal error");
         }

@@ -207,6 +207,7 @@ struct GenerateRequest {
 enum class GenerateErrorCode {
     Incomplete,
     AdapterUnavailable,
+    ResourceExhausted,
     ContextOverflow,
     SamplingUnsupported,
     PrefillFailed,
@@ -221,6 +222,7 @@ constexpr std::string_view generate_error_code(GenerateErrorCode error) {
     switch (error) {
     case GenerateErrorCode::Incomplete:          return "incomplete";
     case GenerateErrorCode::AdapterUnavailable:  return "adapter_unavailable";
+    case GenerateErrorCode::ResourceExhausted:   return "resource_exhausted";
     case GenerateErrorCode::ContextOverflow:     return "context_overflow";
     case GenerateErrorCode::SamplingUnsupported: return "sampling_unsupported";
     case GenerateErrorCode::PrefillFailed:       return "prefill_failed";
@@ -343,6 +345,19 @@ struct ModelBackend {
     // ~(cur_pos × 5 KB) of system RAM, so we can afford many slots.
     static constexpr int kMaxSlots = 64;
 
+    // Hybrid cache: zero means unsupported/unknown, never an admission promise.
+    virtual uint64_t snapshot_estimate_bytes(int position) const { (void)position; return 0; }
+    virtual uint64_t snapshot_bytes(int slot) const { (void)slot; return 0; }
+    virtual bool snapshot_on_gpu(int slot) const { (void)slot; return false; }
+    virtual bool snapshot_move(int slot, bool gpu) { (void)slot; (void)gpu; return false; }
+    virtual uint64_t cache_gpu_free_bytes() const { return 0; }
+    virtual uint64_t cache_reclaimable_scratch_bytes() const { return 0; }
+    // Unsupported by default. Implementations must synchronize successfully and reset live
+    // attention/recurrent state; unhealthy GPU synchronization follows fatal backend recovery.
+    virtual bool cache_reset_after_failure() { return false; }
+    virtual int snapshot_capture_position(int requested,int prompt_length,int restored) const {
+        (void)requested;(void)prompt_length;(void)restored;return -1;
+    }
     virtual bool snapshot_save(int slot) = 0;
     virtual void snapshot_free(int slot) = 0;
     virtual bool snapshot_used(int slot) const = 0;
@@ -421,8 +436,15 @@ struct ModelBackend {
     // Backend owns the DrafterContext lifecycle and park/unpark policy.
 
     struct CompressRequest {
+        std::function<bool()> should_cancel;
         std::vector<int32_t> input_ids;      // drafter-tokenized prompt
         float                keep_ratio;      // fraction to keep (0.0–1.0)
+        // Exclusive end and width of the user-query token window inside
+        // input_ids. Negative end preserves the legacy trailing-token window.
+        // Keeping this separate from DFLASH_COMPRESS_QUERY_TOKENS matters:
+        // that knob controls lexical anchors, not neural scorer Q rows.
+        int                  score_query_end = -1;
+        int                  score_query_tokens = 8;
         std::string          drafter_path;    // GGUF path (for lazy-load)
         int                  drafter_gpu = 0;  // backend-local GPU for PFlash drafter
         bool                 skip_park = false; // true on >=32GB GPUs

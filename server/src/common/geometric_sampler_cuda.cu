@@ -124,7 +124,7 @@ __device__ __forceinline__ void block_reduce_argmax(float & val, int & idx,
 constexpr size_t kSampleShmemPerThread = 2 * sizeof(float);
 
 // Per-device sample-kernel block size (threads per row), cached after the
-// first call — same single-threaded-decode-loop assumption as Scratch below.
+// first call on each worker thread, like Scratch below.
 // Queried rather than hardcoded because maxThreadsPerBlock and
 // sharedMemPerBlock vary across GPUs (e.g. older compute-capability parts cap
 // at 512 threads and/or less shared memory than the 1024-thread/8-byte-per-
@@ -133,7 +133,7 @@ struct BlockCfg {
     int device = -1;
     int block  = 0;
 };
-BlockCfg g_block_cfg;
+thread_local BlockCfg g_block_cfg;
 
 int pick_block_size(int device) {
     if (g_block_cfg.device == device) return g_block_cfg.block;
@@ -229,7 +229,7 @@ __global__ void geometric_sample_kernel(float * __restrict__ work, int vocab,
     // pass below walks `work` as float4: thread t reads groups v = t, t+nthreads,
     // ... so consecutive threads touch consecutive 16-byte groups (a coalesced
     // warp transaction).
-    // `work` is g_scratch.d_work, a cudaMalloc allocation (>=256-byte aligned),
+    // `work` is scratch.d_work, a cudaMalloc allocation (>=256-byte aligned),
     // so the float4 reinterpret is safe. `nvec` full groups cover [0, tail); the
     // <=3 leftover ids in [tail, vocab) are handled by a scalar grid-stride tail.
     // Within a thread, group ids ascend (v grows, and x<y<z<w within a group)
@@ -356,8 +356,8 @@ __global__ void geometric_sample_kernel(float * __restrict__ work, int vocab,
     }
 }
 
-// Per-device persistent scratch. The decode loop is single-threaded, so a plain
-// static cache avoids a cudaMalloc/cudaFree per token (mirrors geometric_draft_topk_cuda).
+// Each worker owns its persistent scratch. Device changes and thread exit
+// release allocations on their owning device without touching another worker.
 struct Scratch {
     int       device   = -1;
     int       vocab_cap = 0;
@@ -367,42 +367,59 @@ struct Scratch {
     int32_t * d_pen_id = nullptr;  // [pen_cap]
     float *   d_pen_add = nullptr; // [pen_cap]
     int32_t * d_out    = nullptr;  // [1]
-};
-Scratch g_scratch;
 
-void free_scratch() {
-    if (g_scratch.d_work)   cudaFree(g_scratch.d_work);
-    if (g_scratch.d_probs)  cudaFree(g_scratch.d_probs);
-    if (g_scratch.d_pen_id) cudaFree(g_scratch.d_pen_id);
-    if (g_scratch.d_pen_add) cudaFree(g_scratch.d_pen_add);
-    if (g_scratch.d_out)    cudaFree(g_scratch.d_out);
-    g_scratch = Scratch{};
-}
+    Scratch() = default;
+    Scratch(const Scratch &) = delete;
+    Scratch & operator=(const Scratch &) = delete;
+    ~Scratch() { reset(); }
+
+    void reset() {
+        if (device < 0) return;
+        int previous = -1;
+        cudaGetDevice(&previous);
+        if (previous != device) cudaSetDevice(device);
+        if (d_work) cudaFree(d_work);
+        d_work = nullptr;
+        if (d_probs) cudaFree(d_probs);
+        d_probs = nullptr;
+        if (d_pen_id) cudaFree(d_pen_id);
+        d_pen_id = nullptr;
+        if (d_pen_add) cudaFree(d_pen_add);
+        d_pen_add = nullptr;
+        if (d_out) cudaFree(d_out);
+        d_out = nullptr;
+        if (previous >= 0 && previous != device) cudaSetDevice(previous);
+        device = -1;
+        vocab_cap = 0;
+        pen_cap = 0;
+    }
+};
+thread_local Scratch scratch;
 
 bool ensure_scratch(int device, int vocab, int pen) {
-    const bool ok = g_scratch.device == device &&
-                    g_scratch.vocab_cap >= vocab &&
-                    g_scratch.pen_cap >= pen;
+    const bool ok = scratch.device == device &&
+                    scratch.vocab_cap >= vocab &&
+                    scratch.pen_cap >= pen;
     if (ok) return true;
-    free_scratch();
-    if (cudaMalloc(&g_scratch.d_out, sizeof(int32_t)) != cudaSuccess) goto fail;
-    if (cudaMalloc(&g_scratch.d_work, (size_t)vocab * sizeof(float)) != cudaSuccess) goto fail;
-    if (cudaMalloc(&g_scratch.d_probs, (size_t)vocab * sizeof(float)) != cudaSuccess) goto fail;
+    scratch.reset();
+    scratch.device = device; // Also owns partial allocations on failure.
+    if (cudaMalloc(&scratch.d_out, sizeof(int32_t)) != cudaSuccess) goto fail;
+    if (cudaMalloc(&scratch.d_work, (size_t)vocab * sizeof(float)) != cudaSuccess) goto fail;
+    if (cudaMalloc(&scratch.d_probs, (size_t)vocab * sizeof(float)) != cudaSuccess) goto fail;
     if (pen > 0) {
-        if (cudaMalloc(&g_scratch.d_pen_id, (size_t)pen * sizeof(int32_t)) != cudaSuccess) goto fail;
-        if (cudaMalloc(&g_scratch.d_pen_add, (size_t)pen * sizeof(float)) != cudaSuccess) goto fail;
+        if (cudaMalloc(&scratch.d_pen_id, (size_t)pen * sizeof(int32_t)) != cudaSuccess) goto fail;
+        if (cudaMalloc(&scratch.d_pen_add, (size_t)pen * sizeof(float)) != cudaSuccess) goto fail;
     }
-    g_scratch.device    = device;
-    g_scratch.vocab_cap = vocab;
-    g_scratch.pen_cap   = pen;
+    scratch.vocab_cap = vocab;
+    scratch.pen_cap   = pen;
     return true;
 fail:
-    free_scratch();
+    scratch.reset();
     return false;
 }
 
-// Uploads `logits` (host or device) into g_scratch.d_work and the sparse
-// penalty set into g_scratch.d_pen_id/d_pen_add — the shared prefix of
+// Uploads `logits` (host or device) into scratch.d_work and the sparse
+// penalty set into scratch.d_pen_id/d_pen_add — the shared prefix of
 // geometric_sample_logits_cuda and geometric_compute_probs_cuda. Penalty
 // *application* itself is no longer done here: it's fused into pass 0 of
 // geometric_sample_kernel (see apply_penalties_inplace), so this function
@@ -431,15 +448,15 @@ bool stage_and_penalize(int dev, const float * logits, int vocab, const SamplerC
     const int m = (int)pen_id.size();
 
     if (!ensure_scratch(dev, vocab, m)) return false;
-    if (cudaMemcpy(g_scratch.d_work, logits, (size_t)vocab * sizeof(float),
+    if (cudaMemcpy(scratch.d_work, logits, (size_t)vocab * sizeof(float),
                    logits_on_device ? cudaMemcpyDeviceToDevice
                                     : cudaMemcpyHostToDevice) != cudaSuccess) {
         return false;
     }
     if (m > 0) {
-        if (cudaMemcpy(g_scratch.d_pen_id, pen_id.data(), (size_t)m * sizeof(int32_t),
+        if (cudaMemcpy(scratch.d_pen_id, pen_id.data(), (size_t)m * sizeof(int32_t),
                        cudaMemcpyHostToDevice) != cudaSuccess) return false;
-        if (cudaMemcpy(g_scratch.d_pen_add, pen_add.data(), (size_t)m * sizeof(float),
+        if (cudaMemcpy(scratch.d_pen_add, pen_add.data(), (size_t)m * sizeof(float),
                        cudaMemcpyHostToDevice) != cudaSuccess) return false;
     }
     *out_m = m;
@@ -495,13 +512,13 @@ int geometric_sample_logits_cuda(const float * logits,
         // Only kModeSample's inverse-CDF draw touches geometric_smem; skip
         // sizing it for the (cheaper, no-shared-mem) greedy launch.
         const size_t shmem_bytes  = (mode == kModeSample) ? (size_t)block * kSampleShmemPerThread : 0;
-        geometric_sample_kernel<<<1, block, shmem_bytes>>>(g_scratch.d_work, vocab, inv_t, mode,
-                                     r_uniform, g_scratch.d_out, /*out_probs=*/nullptr,
-                                     g_scratch.d_pen_id, g_scratch.d_pen_add, m,
+        geometric_sample_kernel<<<1, block, shmem_bytes>>>(scratch.d_work, vocab, inv_t, mode,
+                                     r_uniform, scratch.d_out, /*out_probs=*/nullptr,
+                                     scratch.d_pen_id, scratch.d_pen_add, m,
                                      cfg.rep_pen, cfg.rep_pen > 1.0f ? 1 : 0);
         int32_t tok = -1;
         if (cudaGetLastError() == cudaSuccess &&
-            cudaMemcpy(&tok, g_scratch.d_out, sizeof(int32_t),
+            cudaMemcpy(&tok, scratch.d_out, sizeof(int32_t),
                        cudaMemcpyDeviceToHost) == cudaSuccess) {
             result = tok;
         }
@@ -539,12 +556,12 @@ bool geometric_compute_probs_cuda(const float * logits,
         const int   block = pick_block_size(dev);
         // kModeEmitProbs never touches geometric_smem (no inverse-CDF draw),
         // so no dynamic shared memory needed.
-        geometric_sample_kernel<<<1, block>>>(g_scratch.d_work, vocab, inv_t, kModeEmitProbs,
-                                     /*r_uniform=*/0.0, /*out_token=*/nullptr, g_scratch.d_probs,
-                                     g_scratch.d_pen_id, g_scratch.d_pen_add, m,
+        geometric_sample_kernel<<<1, block>>>(scratch.d_work, vocab, inv_t, kModeEmitProbs,
+                                     /*r_uniform=*/0.0, /*out_token=*/nullptr, scratch.d_probs,
+                                     scratch.d_pen_id, scratch.d_pen_add, m,
                                      cfg.rep_pen, cfg.rep_pen > 1.0f ? 1 : 0);
         if (cudaGetLastError() == cudaSuccess &&
-            cudaMemcpy(out_probs, g_scratch.d_probs, (size_t)vocab * sizeof(float),
+            cudaMemcpy(out_probs, scratch.d_probs, (size_t)vocab * sizeof(float),
                        cudaMemcpyDeviceToHost) == cudaSuccess) {
             ok = true;
         }
