@@ -562,11 +562,14 @@ void run_mixed_tree_case() {
             7, 8, 9, 10, 11, 12, 13, 14,
         },
         {16},
-        2,
+        5,
     };
-    std::vector<int32_t> query_slots{1, 0};
+    // Two positioned ragged segments precede the speculative tree suffix.
+    // The operator treats every leading positioned row as durable causal
+    // work, regardless of whether the row came from prefill or one-token AR.
+    std::vector<int32_t> query_slots{1, 1, 1, 0, 0};
     query_slots.insert(query_slots.end(), 16, 2);
-    std::vector<int32_t> query_positions{7, 15};
+    std::vector<int32_t> query_positions{5, 6, 7, 14, 15};
     query_positions.insert(query_positions.end(), 16, -1);
     CHECK(run_case(backend, mixed_case, GGML_TYPE_F16, GGML_TYPE_F16,
                    &query_slots, &query_positions, &tree_metadata));
@@ -654,7 +657,7 @@ TEST_CASE(PagedAttention, PackedTreesMatchReference) {
     run_tree_case();
 }
 
-TEST_CASE(PagedAttention, CompactArAndFixedChainMatchReference) {
+TEST_CASE(PagedAttention, RaggedDirectPrefixAndFixedChainMatchReference) {
     run_mixed_tree_case();
 }
 
