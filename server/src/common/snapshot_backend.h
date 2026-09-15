@@ -16,6 +16,8 @@
 #include "ggml-cpu.h"
 
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 namespace dflash::common {
 
@@ -30,7 +32,13 @@ namespace dflash::common {
 // RAM, freeing VRAM for model weights and KV cache.
 //
 // Returns nullptr on allocation failure (caller should treat as fatal).
-inline ggml_backend_t create_snapshot_backend(ggml_backend_t compute_backend) {
+inline ggml_backend_t create_snapshot_backend(ggml_backend_t compute_backend,
+                                               bool allow_gpu_override = false) {
+    // Explicit placement override, shared with the paged snapshot path.
+    const char * device = std::getenv("DFLASH_PREFIX_CACHE_DEVICE");
+    if (allow_gpu_override && device && std::strcmp(device, "gpu") == 0) {
+        return compute_backend;
+    }
     auto buft = ggml_backend_get_default_buffer_type(compute_backend);
     if (ggml_backend_buft_is_host(buft)) {
         // Unified memory — snapshots can stay on compute backend.

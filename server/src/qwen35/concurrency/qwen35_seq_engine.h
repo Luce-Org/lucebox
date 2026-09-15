@@ -83,6 +83,11 @@ public:
         const PrefixStorePlan & plan) override;
 
     StepResult step(const StepPlan & plan) override;
+    bool has_speculative_decode(const std::vector<StepInput> & inputs) const override {
+        return std::any_of(inputs.begin(), inputs.end(), [this](const StepInput & input) {
+            return chain_spec_input_capable(input);
+        });
+    }
     StepPlanLimits step_plan_limits(int decode_rows) const override {
         const bool mixed = decode_rows > 0;
         const int per_sequence = mixed ? 512 : 2048;

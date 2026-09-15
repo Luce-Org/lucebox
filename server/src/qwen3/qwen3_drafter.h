@@ -12,6 +12,7 @@
 // token IDs (drafter vocab).
 
 #pragma once
+#include <functional>
 
 #include <cstddef>
 #include <cstdint>
@@ -82,6 +83,7 @@ std::vector<int32_t> drafter_score_and_compress(
     int    chunk_size  = 32,
     int    n_lookahead = 8,
     int    pool_kernel = 13,
-    int    score_query_end = -1);
+    int    score_query_end = -1,
+    const std::function<bool()>& cancelled = {});
 
 } // namespace dflash::common

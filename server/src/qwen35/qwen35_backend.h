@@ -130,6 +130,15 @@ public:
                                              const DaemonIO & io) override;
 
     SnapshotRef snapshot_ref(int slot) const override;
+    uint64_t snapshot_estimate_bytes(int position) const override;
+    uint64_t snapshot_bytes(int slot) const override;
+    bool snapshot_on_gpu(int slot) const override;
+    bool snapshot_move(int slot, bool gpu) override;
+    uint64_t cache_gpu_free_bytes() const override;
+    uint64_t cache_reclaimable_scratch_bytes() const override;
+    bool cache_reset_after_failure() override;
+    int snapshot_capture_position(int requested,int prompt_length,int restored) const override;
+
     bool snapshot_adopt(int slot, ggml_context * ctx,
                         ggml_backend_buffer_t buf, int cur_pos,
                         int32_t last_tok = -1) override;

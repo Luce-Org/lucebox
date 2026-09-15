@@ -291,9 +291,10 @@ bool should_force_inline_snapshot_boundary(
 // ─── PrefixCache ────────────────────────────────────────────────────────
 
 PrefixCache::PrefixCache(int cap, const Tokenizer & tokenizer,
-                         size_t max_resident_bytes)
+                         size_t max_resident_bytes, int session_max_tokens)
     : cap_(std::min(cap, MAX_CACHE_SLOTS))
     , max_resident_bytes_(max_resident_bytes)
+    , session_max_tokens_(session_max_tokens)
 {
     if (cap_ <= 0) {
         disabled_ = true;
@@ -307,6 +308,12 @@ PrefixCache::PrefixCache(int cap, const Tokenizer & tokenizer,
         return;
     }
     disabled_ = false;
+    if (session_max_tokens_ > 0) {
+        std::fprintf(stderr,
+            "[session-pc] rolling checkpoints: one per session, max_tokens=%d; "
+            "unidentified requests uncached; budget includes replacement scratch\n",
+            session_max_tokens_);
+    }
     if (max_resident_bytes_ > 0) {
         std::fprintf(stderr, "[pc] enabled: cap=%d family=%s resident_budget=%zu MiB\n",
                      cap_, markers_.family.c_str(), max_resident_bytes_ / (1024 * 1024));
@@ -373,17 +380,21 @@ std::pair<int, int> PrefixCache::lookup(
 
 std::pair<int, int> PrefixCache::lookup_candidate(
         const std::vector<int32_t> & prompt_ids,
-        int max_prefix_tokens) {
-    return lookup_impl(prompt_ids, max_prefix_tokens, /*record_hit=*/false);
+        int max_prefix_tokens, const std::string & session_id) {
+    return lookup_impl(prompt_ids, max_prefix_tokens, /*record_hit=*/false, session_id);
 }
 
 std::pair<int, int> PrefixCache::lookup_impl(
         const std::vector<int32_t> & prompt_ids,
         int max_prefix_tokens,
-        bool record_hit) {
+        bool record_hit, const std::string & session_id) {
     if (disabled_ || max_prefix_tokens <= 0) return {-1, 0};
 
-    auto boundaries = find_all_boundaries(prompt_ids, markers_);
+    if (session_max_tokens_ > 0 && session_id.empty()) return {-1, 0};
+    // Session keys may have identical token hashes. Match ownership AND exact
+    // token content, never hash alone or request/worker slot identity.
+    auto boundaries = session_max_tokens_ > 0 ? std::vector<int>{}
+        : find_all_boundaries(prompt_ids, markers_);
     int best_slot = -1, best_len = 0;
     int best_idx = -1;
 
@@ -414,6 +425,7 @@ std::pair<int, int> PrefixCache::lookup_impl(
     // pin_end cuts that are not chat-template boundaries.
     for (int i = 0; i < (int)entries_.size(); ++i) {
         const auto & e = entries_[(size_t)i];
+        if (session_max_tokens_ > 0 && e.session_id != session_id) continue;
         const int len = (int)e.ids.size();
         if (len <= best_len || len > (int)prompt_ids.size() ||
             len > max_prefix_tokens) continue;
@@ -514,6 +526,7 @@ void PrefixCache::InlineReservation::clear() {
     victim_ = {};
     has_victim_ = false;
     protect_ = false;
+    session_id_.clear();
 }
 
 void PrefixCache::InlineReservation::take(InlineReservation && other) {
@@ -524,15 +537,98 @@ void PrefixCache::InlineReservation::take(InlineReservation && other) {
     victim_ = other.victim_;
     has_victim_ = other.has_victim_;
     protect_ = other.protect_;
+    session_id_ = std::move(other.session_id_);
     other.clear();
 }
 
 bool PrefixCache::inline_reservation_active(uint64_t id) const {
-    return id != 0 && active_inline_reservation_ == id;
+    return id != 0 && (active_inline_reservation_ == id || session_pending_.count(id));
 }
 
 void PrefixCache::release_inline_reservation(uint64_t id) {
-    if (inline_reservation_active(id)) active_inline_reservation_ = 0;
+    if (active_inline_reservation_ == id) active_inline_reservation_ = 0;
+    session_pending_.erase(id);
+}
+
+// One rolling checkpoint per explicit session. Engine admission restores into
+// independent live sequence storage synchronously; later capture can therefore
+// atomically replace that same host checkpoint slot. Other sessions never own
+// or evict this slot. All methods run on the scheduler thread.
+PrefixCache::InlineReservation PrefixCache::reserve_session_snap(
+        const std::vector<int32_t> & prompt_ids, int restored_prefix_len,
+        InlineSnapshotSize estimate_bytes, const std::string & session_id) {
+    if (disabled_ || session_id.empty() || session_id.size() > 256 ||
+        prompt_ids.size() < 2 || !estimate_bytes) return {};
+    for (const auto & p : session_pending_)
+        if (p.second.owner == session_id) return {};
+
+    // Take the deepest completed message boundary. At the token ceiling, an
+    // exact mid-message snapshot is also valid (attention AND recurrent state
+    // are captured); it remains a prefix, never a truncated sliding window.
+    const int limit = std::min(session_max_tokens_, (int)prompt_ids.size() - 1);
+    int target = 0;
+    for (int cut : find_all_boundaries(prompt_ids, markers_))
+        if (cut <= limit) target = std::max(target, cut);
+    if (limit == session_max_tokens_ || target == 0) target = limit;
+    if (target <= restored_prefix_len || target <= 0) return {};
+
+    int slot = -1;
+    size_t old_bytes = 0;
+    for (const auto & entry : entries_) {
+        if (entry.session_id == session_id) {
+            slot = entry.slot;
+            old_bytes = entry.resident_bytes;
+            break;
+        }
+    }
+    if (slot < 0) {
+        for (int candidate = 0; candidate < cap_; ++candidate) {
+            if (find_slot_entry(candidate) >= 0) continue;
+            bool reserved = false;
+            for (const auto & p : session_pending_)
+                reserved |= p.second.slot == candidate;
+            if (!reserved) { slot = candidate; break; }
+        }
+    }
+    if (slot < 0) return {}; // Never take another session's slot.
+    const size_t bytes = estimate_bytes(target);
+    if (bytes == 0) return {};
+
+    // Replacement allocates the candidate before freeing its incumbent.
+    // Captures execute serially on the engine thread, so reserve all positive
+    // growth plus the largest old allocation for one atomic replacement.
+    // Ignore potential shrinkage until committed: this is conservative even
+    // when pending captures finish out of order or are cancelled.
+    size_t needed = resident_bytes_;
+    size_t scratch = old_bytes;
+    auto add = [&](size_t amount) {
+        if (amount > SIZE_MAX - needed) return false;
+        needed += amount;
+        return true;
+    };
+    bool fits = add(bytes > old_bytes ? bytes - old_bytes : 0);
+    for (const auto & p : session_pending_) {
+        const int incumbent = find_slot_entry(p.second.slot);
+        const size_t pending_old = incumbent >= 0
+            ? entries_[(size_t)incumbent].resident_bytes : 0;
+        fits &= add(p.second.new_bytes > pending_old
+                    ? p.second.new_bytes - pending_old : 0);
+        scratch = std::max(scratch, pending_old);
+    }
+    fits &= add(scratch);
+    if (!fits || (max_resident_bytes_ > 0 && needed > max_resident_bytes_)) {
+        const auto skips = budget_skips_.fetch_add(1, std::memory_order_relaxed) + 1;
+        std::fprintf(stderr,
+            "[session-pc] capture skipped slot=%d target=%d needed=%zu budget=%zu skips=%llu\n",
+            slot, target, needed, max_resident_bytes_, (unsigned long long)skips);
+        return {};
+    }
+    uint64_t id = next_inline_reservation_++;
+    if (id == 0) id = next_inline_reservation_++;
+    session_pending_.emplace(id, SessionPending{session_id, slot, bytes, old_bytes});
+    InlineReservation result(this, id, slot, target, {}, false, false);
+    result.session_id_ = session_id;
+    return result;
 }
 
 PrefixCache::InlineReservation PrefixCache::reserve_inline_snap(
@@ -541,7 +637,10 @@ PrefixCache::InlineReservation PrefixCache::reserve_inline_snap(
         bool prefer_tools_boundary,
         int forced_cut,
         int restore_source_slot,
-        InlineSnapshotSize estimate_bytes) {
+        InlineSnapshotSize estimate_bytes, const std::string & session_id) {
+    if (session_max_tokens_ > 0)
+        return reserve_session_snap(prompt_ids, restored_prefix_len,
+                                    std::move(estimate_bytes), session_id);
     if (disabled_ || active_inline_reservation_ != 0) return {};
 
     const auto candidates = find_all_boundaries(prompt_ids, markers_);
@@ -715,7 +814,7 @@ PrefixCache::InlineReservation PrefixCache::reserve_inline_snap(
 void PrefixCache::replace_inline_entry(
         int slot, int target_cut,
         const std::vector<int32_t> & prompt_ids,
-        bool protect, size_t resident_bytes) {
+        bool protect, size_t resident_bytes, const std::string & session_id) {
     for (int i = (int)entries_.size() - 1; i >= 0; --i) {
         if (entries_[(size_t)i].slot == slot) {
             std::fprintf(stderr,
@@ -728,7 +827,7 @@ void PrefixCache::replace_inline_entry(
     std::vector<int32_t> ids(
         prompt_ids.begin(), prompt_ids.begin() + target_cut);
     entries_.push_back(
-        {key, slot, std::move(ids), protect, resident_bytes});
+        {key, slot, std::move(ids), protect, resident_bytes, session_id});
     entries_size_count_.fetch_add(1, std::memory_order_relaxed);
     resident_bytes_ += resident_bytes;
     resident_bytes_count_.store(
@@ -749,13 +848,20 @@ bool PrefixCache::commit_inline_reservation(
         reservation.abort();
         return false;
     }
+    // The engine has materialized the checkpoint. An unexpectedly oversized
+    // payload must not leave stale metadata or bypass the reserved budget.
+    const auto pending = session_pending_.find(reservation.id_);
+    if (pending != session_pending_.end() && resident_bytes > pending->second.new_bytes) {
+        reservation.abort();
+        return false;
+    }
     if (reservation.has_victim_) {
         const int victim = find_entry(reservation.victim_);
         if (victim >= 0) erase_inline_entry(victim);
     }
     replace_inline_entry(
         reservation.slot_, committed_cut, prompt_ids,
-        protect || reservation.protect_, resident_bytes);
+        protect || reservation.protect_, resident_bytes, reservation.session_id_);
     release_inline_reservation(reservation.id_);
     reservation.clear();
     return true;
@@ -782,7 +888,7 @@ void PrefixCache::confirm_inline_snap(
         bool protect, size_t resident_bytes) {
     if (disabled_ || slot < 0 || target_cut <= 0 ||
         target_cut > (int)prompt_ids.size()) return;
-    if (active_inline_reservation_ != 0) {
+    if (session_max_tokens_ > 0 || active_inline_reservation_ != 0) {
         std::fprintf(stderr,
             "[pc] direct commit refused while a reservation is active\n");
         return;
@@ -825,27 +931,6 @@ void PrefixCache::record_restore_attempt(uint64_t elapsed_us, bool restored) {
     update_atomic_max(restore_stall_us_max_, elapsed_us);
 }
 
-int PrefixCache::evict_idle_lru() {
-    // There must be no pending snapshot reservation / active restore here.
-    // Any reservation left by an earlier failed job is stale now.
-    has_pending_evict_ = false;
-    full_has_pending_evict_ = false;
-    pending_protect_ = false;
-    if (!entries_.empty()) {
-        int slot=entries_.front().slot;
-        entries_.erase(entries_.begin());
-        entries_size_count_.fetch_sub(1, std::memory_order_relaxed);
-        return slot;
-    }
-    if (!full_entries_.empty()) {
-        int slot=full_entries_.front().entry.slot;
-        full_entries_.erase(full_entries_.begin());
-        full_entries_size_count_.fetch_sub(1, std::memory_order_relaxed);
-        return slot;
-    }
-    return -1;
-}
-
 void PrefixCache::mark_all_cleared() {
     if (disabled_) return;
     int n = (int)entries_.size();
@@ -854,6 +939,7 @@ void PrefixCache::mark_all_cleared() {
     resident_bytes_ = 0;
     resident_bytes_count_.store(0, std::memory_order_relaxed);
     next_slot_ = 0;
+    session_pending_.clear();
     active_inline_reservation_ = 0;
     std::fprintf(stderr, "[pc] all-cleared — dropped %d LRU entries\n", n);
 }
@@ -911,22 +997,15 @@ int PrefixCache::prepare_full_snap(const std::vector<int32_t> & prompt_ids) {
     auto key = hash_prefix(prompt_ids.data(), (int)prompt_ids.size());
     if (find_full_entry(key) >= 0) return -1;  // already cached
 
-    int abs_slot = -1;
+    int abs_slot;
     if ((int)full_entries_.size() >= full_cap_) {
         // Evict LRU
         full_pending_evict_key_ = full_entries_.front().hash;
         full_has_pending_evict_ = true;
         abs_slot = full_entries_.front().entry.slot;
     } else {
-        // Pressure eviction leaves holes that round-robin alone can miss.
-        // Never overwrite a still-indexed snapshot when a free slot exists.
-        for (int offset=0; offset<full_cap_; ++offset) {
-            const int candidate=full_slot_base_+(full_next_slot_+offset)%full_cap_;
-            const bool used=std::any_of(full_entries_.begin(),full_entries_.end(),
-                [candidate](const FullLruEntry &entry) { return entry.entry.slot==candidate; });
-            if (!used) { abs_slot=candidate; break; }
-        }
-        full_next_slot_ = (abs_slot-full_slot_base_+1) % full_cap_;
+        abs_slot = full_slot_base_ + full_next_slot_;
+        full_next_slot_ = (full_next_slot_ + 1) % full_cap_;
         full_has_pending_evict_ = false;
     }
 

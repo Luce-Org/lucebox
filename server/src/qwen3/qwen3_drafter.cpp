@@ -707,7 +707,12 @@ std::vector<int32_t> drafter_score_and_compress(
     int chunk_size,
     int n_lookahead,
     int pool_kernel,
-    int score_query_end) {
+    int score_query_end, const std::function<bool()>& cancelled) {
+    auto interrupted=[&]() {
+        if(cancelled && cancelled()){set_last_error("compression cancelled");return true;}
+        return false;
+    };
+    if(interrupted())return {};
     if (!ctx.loaded) {
         set_last_error("drafter not loaded");
         return {};
@@ -734,10 +739,44 @@ std::vector<int32_t> drafter_score_and_compress(
     // ── 1. Custom forward + GPU tail-attention scoring ────────────────
     auto t0 = std::chrono::steady_clock::now();
     std::vector<float> running_max;
-    if (!forward_qwen3_drafter_model(
+    const int window = env_int("DFLASH_COMPRESS_SCORE_WINDOW", 0);
+    if (window >= 512 && window <= 65536 && S > window && n_lookahead > 0) {
+        const int query_end = score_query_end < 0 ? S : score_query_end;
+        if (query_end > S || query_end < n_lookahead) {
+            set_last_error("windowed scorer query out of range");
+            return {};
+        }
+        const int query_start = query_end - n_lookahead;
+        running_max.assign((size_t)n_lookahead * S, 0.0f);
+        int windows = 0;
+        for (int start = 0; start < S; start += window) {
+            if(interrupted())return {};
+            const int end = std::min(S, start + window);
+            const int context_start = std::max(0, start - 512);
+            std::vector<int32_t> local(ids.begin() + context_start, ids.begin() + end);
+            local.insert(local.end(), ids.begin() + query_start, ids.begin() + query_end);
+            std::vector<float> scores;
+            if (!forward_qwen3_drafter_model(ctx.weights, local, n_lookahead,
+                                             scores, (int)local.size())) return {};
+            if (scores.size() != (size_t)n_lookahead * local.size()) {
+                set_last_error("windowed scorer output shape mismatch");
+                return {};
+            }
+            for (int t = 0; t < n_lookahead; ++t) {
+                for (int j = start; j < end; ++j) {
+                    running_max[(size_t)t * S + j] =
+                        scores[(size_t)t * local.size() + j - context_start];
+                }
+            }
+            ++windows;
+        }
+        std::fprintf(stderr,"[windowed-score] tokens=%d window=%d overlap=512 windows=%d\n",
+                     S,window,windows);
+    } else if (!forward_qwen3_drafter_model(
             ctx.weights, ids, n_lookahead, running_max, score_query_end)) {
         return {};
     }
+    if(interrupted())return {};
     auto t1 = std::chrono::steady_clock::now();
     std::fprintf(stderr, "[drafter] forward+score in %.2fs S=%d\n",
         std::chrono::duration<double>(t1 - t0).count(), S);

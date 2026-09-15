@@ -139,6 +139,10 @@ static void print_usage(const char * prog) {
         "  --concurrent-prefix-cache-max-mib <MiB>\n"
         "                       Resident RAM limit for copied concurrent paged\n"
         "                       checkpoints (default: 4096; 0 unlimited)\n"
+        "  --session-prefix-cache-max-tokens <N>\n"
+        "                       Opt-in concurrent rolling checkpoint per session;\n"
+        "                       N bounds cached prefix tokens (0 disables).\n"
+        "                       RAM budget includes atomic replacement scratch.\n"
         "  --agent-turn-cache         Extend prefix caching through generated tool calls\n"
         "  --prefill-cache-slots <N> Full prompt/prefill cache slots (default: 0)\n"
         "  --fast-rollback     Enable speculative fast rollback (default: on)\n"
@@ -546,6 +550,17 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
             }
             sconfig.concurrent_prefix_cache_max_bytes =
                 (size_t)(mib * bytes_per_mib);
+        } else if (std::strcmp(argv[i], "--session-prefix-cache-max-tokens") == 0) {
+            if (i + 1 >= argc) return 2;
+            const char * value = argv[++i];
+            const char * end = value + std::strlen(value);
+            int tokens = 0;
+            const auto parsed = std::from_chars(value, end, tokens);
+            if (parsed.ec != std::errc{} || parsed.ptr != end || tokens < 0) {
+                std::fprintf(stderr, "[server] session cache tokens must be a non-negative integer\n");
+                return 2;
+            }
+            sconfig.session_prefix_cache_max_tokens = tokens;
         } else if (std::strcmp(argv[i], "--agent-turn-cache") == 0) {
             sconfig.agent_turn_cache = true;
         } else if (std::strcmp(argv[i], "--prefill-cache-slots") == 0 && i + 1 < argc) {
