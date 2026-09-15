@@ -20,11 +20,17 @@ touch "$FAKE_TARGET" "$FAKE_DRAFT"
 
 cat >"$FAKE_SERVER" <<'EOF'
 #!/usr/bin/env bash
+if [[ -n "${SERVER_ARGS_CAPTURE:-}" ]]; then
+  printf '%s\n' "$*" > "$SERVER_ARGS_CAPTURE"
+fi
 exec sleep 600
 EOF
 
 cat >"$FAKE_CLIENT" <<'EOF'
 #!/usr/bin/env bash
+if [[ -n "${CLIENT_ARGS_CAPTURE:-}" ]]; then
+  printf 'HOME=%s ARGS=%s\n' "$HOME" "$*" >> "$CLIENT_ARGS_CAPTURE"
+fi
 printf '%s\n' "$*"
 EOF
 
@@ -136,6 +142,40 @@ for launcher_case in "${launcher_cases[@]}"; do
   fi
 done
 
+# Interactive mode keeps each real TUI attached to the terminal, uses a
+# persistent client home, and omits the one-shot subcommand/flags. The fake
+# binaries return immediately, so this remains a CPU-only contract test.
+interactive_cases=(
+  'run_claude_code.sh|CLAUDE_BIN|CLAUDE_TIMEOUT|claude|--model luce-dflash --tools default interactive-policy-ok|--print'
+  'run_codex.sh|CODEX_BIN|CODEX_TIMEOUT|codex|--cd |ARGS=exec '
+  'run_opencode.sh|OPENCODE_BIN|OPENCODE_TIMEOUT|opencode|--prompt interactive-policy-ok|ARGS=run '
+  'run_hermes.sh|HERMES_BIN|HERMES_TIMEOUT|hermes|chat --tui|--query'
+  'run_pi.sh|PI_BIN|PI_TIMEOUT|pi|--offline interactive-policy-ok|--print'
+  'run_openclaw.sh|OPENCLAW_BIN|OPENCLAW_TIMEOUT|openclaw|tui --local --session lucebox-client-harness --message interactive-policy-ok|ARGS=agent '
+)
+for interactive_case in "${interactive_cases[@]}"; do
+  IFS='|' read -r script client_var timeout_var home_name required forbidden <<<"$interactive_case"
+  args_capture="$TMP_DIR/${script%.sh}-interactive-args"
+  server_args_capture="$TMP_DIR/${script%.sh}-server-args"
+  rm -f "$args_capture" "$server_args_capture" "$TIMEOUT_CAPTURE"
+  run_launcher "$script" "$client_var" "$timeout_var" 17 \
+    CLIENT_WORK_DIR="$TMP_DIR/work" \
+    HARNESS_INTERACTIVE=1 \
+    INTERACTIVE_PROMPT=interactive-policy-ok \
+    CLIENT_ARGS_CAPTURE="$args_capture" \
+    SERVER_ARGS_CAPTURE="$server_args_capture" \
+    TARGET_DEVICE=cuda:2 \
+    DRAFT_DEVICE=cuda:3 \
+    >/dev/null
+  grep -Fq -- "$required" "$args_capture"
+  grep -Fq "HOME=$TMP_DIR/work/interactive/$home_name" "$args_capture"
+  if grep -Fq -- "$forbidden" "$args_capture"; then
+    echo "$script retained non-interactive arguments in interactive mode" >&2
+    exit 1
+  fi
+  grep -Fq -- '--target-device cuda:2 --draft-device cuda:3' "$server_args_capture"
+done
+
 set +e
 opencode_invalid="$({
   run_launcher run_opencode.sh OPENCODE_BIN OPENCODE_TIMEOUT 17 \
@@ -146,6 +186,18 @@ set -e
 if [[ "$opencode_invalid_rc" -ne 2 ]] ||
    ! grep -Fq 'canonical non-negative integers' <<<"$opencode_invalid"; then
   echo "OpenCode must reject timeout values that would produce invalid JSON" >&2
+  exit 1
+fi
+
+set +e
+interactive_invalid="$({
+  run_launcher run_codex.sh CODEX_BIN CODEX_TIMEOUT 17 HARNESS_INTERACTIVE=invalid
+} 2>&1)"
+interactive_invalid_rc=$?
+set -e
+if [[ "$interactive_invalid_rc" -ne 2 ]] ||
+   ! grep -Fq 'HARNESS_INTERACTIVE must be 0 or 1' <<<"$interactive_invalid"; then
+  echo "invalid HARNESS_INTERACTIVE must fail before startup" >&2
   exit 1
 fi
 
