@@ -4,7 +4,7 @@ from model_router import Router
 
 class ConcurrentRouterTests(unittest.IsolatedAsyncioTestCase):
     def make_router(self):
-        r=Router({'models':{'a':{'context':131072},'b':{'context':131072}},'default':'a','serving':{'max_concurrency':3}})
+        r=Router({'models':{'a':{'context':131072,'path':'weights'},'b':{'context':131072,'path':'weights'}},'default':'a','serving':{'max_concurrency':3}})
         async def load(name):
             self.assertEqual(r.inflight,0)
             r.active=name

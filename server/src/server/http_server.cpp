@@ -4180,6 +4180,16 @@ void HttpServer::configure_generation_io(
             return false;
         }
         ++output.completion_tokens;
+        // Tool syntax can remain buffered for minutes. Report committed-token
+        // progress as an SSE comment, without exposing incomplete tool arguments.
+        if (req.stream && output.completion_tokens % 64 == 0) {
+            const std::string progress = ":lucebox-progress " + json({
+                {"id", req.response_id}, {"tokens", output.completion_tokens}}).dump() + "\n\n";
+            if (!send_job_bytes(job, progress.data(), progress.size())) {
+                output.client_disconnected = true;
+                return false;
+            }
+        }
 
         if (output.completion_tokens % 10 == 0) {
             status_.update_completion_tokens(output.completion_tokens);
@@ -4214,6 +4224,11 @@ bool HttpServer::deliver_generation_token(
         int32_t token, int & completion_tokens,
         ClientSendBuffer & send_buffer) {
     ++completion_tokens;
+    if (req.stream && completion_tokens % 64 == 0) {
+        stop_job_stream(job, &send_buffer);
+        send_buffer.append(":lucebox-progress " + json({
+            {"id", req.response_id}, {"tokens", completion_tokens}}).dump() + "\n\n");
+    }
 
     std::string text;
     const TokenDelivery delivery =

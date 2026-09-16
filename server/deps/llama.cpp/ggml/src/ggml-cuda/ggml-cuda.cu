@@ -514,7 +514,26 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         size_t look_ahead_size = (size_t) (1.05 * size);
         look_ahead_size = 256 * ((look_ahead_size + 255)/256);
         ggml_cuda_set_device(device);
-        CUDA_CHECK(ggml_cuda_device_malloc(&ptr, look_ahead_size, device));
+        cudaError_t allocation_error = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
+        if (allocation_error == cudaErrorMemoryAllocation) {
+            // Consume this recoverable runtime error before subsequent kernels.
+            (void) cudaGetLastError();
+            // Cached operator temporaries are not live tensors. A differently
+            // shaped graph can need a larger buffer while smaller cached blocks
+            // occupy the remaining device memory. Reclaim before failing.
+            const size_t reclaimed = trim();
+            GGML_LOG_WARN(GGML_CUDA_NAME " pool pressure: requested=%zu padded=%zu reclaimed=%zu device=%d\n",
+                          size, look_ahead_size, reclaimed, device);
+            allocation_error = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
+            if (allocation_error == cudaErrorMemoryAllocation && look_ahead_size > size) {
+                (void) cudaGetLastError();
+                // The speculative 5% growth allowance must not turn an allocation
+                // that fits into an OOM. Preserve the requested size on fallback.
+                look_ahead_size = size;
+                allocation_error = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
+            }
+        }
+        CUDA_CHECK(allocation_error);
         *actual_size = look_ahead_size;
         pool_size += look_ahead_size;
         return ptr;

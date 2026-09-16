@@ -243,6 +243,17 @@ HttpServer::PreparedPrompt HttpServer::prepare_hybrid_prompt(const ParsedRequest
             plan=resource_for(decision.index);
         }
         auto chosen=candidates[decision.index];
+        uint64_t checkpoint_gpu=0,checkpoint_ram=0;
+        for(const auto& entry:hybrid_cache_.entries)
+            (entry.gpu?checkpoint_gpu:checkpoint_ram)+=entry.bytes;
+        const json admission_trace={{"path",name(chosen.path)},
+            {"gpu_free",backend_.cache_gpu_free_bytes()},
+            {"reclaimable_graph",backend_.cache_reclaimable_scratch_bytes()},
+            {"checkpoint_gpu",checkpoint_gpu},{"checkpoint_ram",checkpoint_ram},
+            {"working_allowance",work},{"capture_bytes",captures[decision.index].bytes},
+            {"input_tokens",req.prompt_tokens.size()},{"output_capacity",req.max_output},
+            {"evict",plan.evict},{"spill",plan.spill},{"feasible",plan.feasible}};
+        std::fprintf(stderr,"[hybrid-admit] %s\n",admission_trace.dump().c_str());
         if(!plan.feasible||!hybrid_cache_.execute(backend_,plan))return fail(503,"Cache resource reservation changed or transfer failed");
         out.representation=representations[decision.index];out.hybrid_path=chosen.path;
         out.hybrid_capture=captures[decision.index];

@@ -57,6 +57,27 @@ def normalize_cache_metadata(body, headers):
             raise ValueError('Invalid cache mode')
         meta[field] = value
 
+class TokenProgress:
+    """Per-upstream-request committed progress; generic heartbeats never count."""
+    def __init__(self):
+        self.request_id = None
+        self.tokens = 0
+
+    def observe(self, line):
+        if not line.startswith(b':lucebox-progress '):
+            return False
+        try:
+            value = json.loads(line[len(b':lucebox-progress '):])
+            request_id, tokens = value['id'], value['tokens']
+            if not isinstance(request_id, str) or not request_id or type(tokens) is not int or tokens <= self.tokens:
+                return False
+            if self.request_id is not None and request_id != self.request_id:
+                return False
+            self.request_id, self.tokens = request_id, tokens
+            return True
+        except (ValueError, KeyError, TypeError):
+            return False
+
 class BackendFault(Exception):
     pass
 
@@ -135,6 +156,7 @@ class Router:
         await self.client.close()
 
     async def stop(self):
+        stopped_at = time.monotonic()
         process, self.process = self.process, None
         self.active = None
         if process and process.returncode is None:
@@ -146,6 +168,8 @@ class Router:
                 with contextlib.suppress(ProcessLookupError):
                     process.kill()
                 await process.wait()
+        if process:
+            logging.info('Backend stopped: elapsed=%.3fs exit=%s', time.monotonic()-stopped_at, process.returncode)
         if self.log:
             self.log.close()
             self.log = None
@@ -306,6 +330,9 @@ class Router:
             first = True
             progress = time.monotonic()
             pending = b''
+            committed = TokenProgress()
+            require_finish = request.path.endswith('/chat/completions') and upstream.status < 400
+            terminal = False
             while True:
                 if state.streaming:
                     limit = self.limits['prefill_timeout'] if first else self.limits['token_timeout']
@@ -314,6 +341,8 @@ class Router:
                     timeout = self.limits['request_timeout']
                 chunk = await asyncio.wait_for(upstream.content.readany(),timeout)
                 if not chunk:
+                    if require_finish and not terminal:
+                        raise BackendFault('Backend stream ended before finish_reason')
                     break
                 if state.streaming:
                     pending += chunk
@@ -321,8 +350,15 @@ class Router:
                         raise BackendFault('Backend SSE frame exceeds limit')
                     while b'\n' in pending:
                         line,pending = pending.split(b'\n',1)
+                        if committed.observe(line):
+                            first = False
+                            progress = time.monotonic()
                         if not line.startswith(b'data:'):
                             continue # Heartbeats must not hide a stalled worker.
+                        if line[5:].strip() == b'[DONE]':
+                            if require_finish and not terminal:
+                                raise BackendFault('Backend sent DONE before finish_reason')
+                            continue
                         try:
                             event = json.loads(line[5:])
                         except (ValueError,TypeError):
@@ -332,6 +368,7 @@ class Router:
                         choices = event.get('choices',[])
                         if not isinstance(choices,list):
                             raise BackendFault('Invalid backend SSE choices')
+                        terminal |= bool(event.get('error')) or any(isinstance(c,dict) and c.get('finish_reason') is not None for c in choices)
                         substantive = False
                         for choice in choices:
                             delta = choice.get('delta',{}) if isinstance(choice,dict) else {}
@@ -393,13 +430,14 @@ class Router:
             return state.response or web.Response(status=499)
         except (asyncio.TimeoutError,ClientError,BackendFault) as e:
             self.counts['failed'] += 1
+            logging.error('Inference failed: %s: %s; backend_returncode=%s', type(e).__name__, e, self.process.returncode if self.process else None)
             operation.cancel()
             with contextlib.suppress(asyncio.CancelledError,Exception):
                 await operation
             timed_out = isinstance(e,asyncio.TimeoutError)
             result = await self.fail_forward(state,504 if timed_out else 502,
                 'inference_timeout' if timed_out else 'backend_failure',
-                'Inference made no progress within its deadline; retry the request.' if timed_out else 'Backend connection failed; retry the request.')
+                'Inference made no progress within its deadline; retry the request.' if timed_out else 'Backend connection failed or stream was incomplete; retry the request.')
             await self.recover_request()
             return result
         except asyncio.CancelledError:
