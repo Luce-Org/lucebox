@@ -203,9 +203,6 @@ static void print_usage(const char * prog) {
         "                              10000:0.5 40000:0.2 100000:0.1\n"
         "  --prefill-drafter <path>    Drafter GGUF for compression (Qwen3-0.6B)\n"
         "  --prefill-skip-park         Skip park/unpark (for >=32GB GPUs)\n"
-        "  --draft-residency auto|persistent|request-scoped\n"
-        "                         Drafter lifetime policy (default: auto)\n"
-        "  --lazy-draft                Legacy alias for --draft-residency=request-scoped\n"
         "\n"
         "PFlash upstream proxy (forward compressed prompt to a backend):\n"
         "  --prefill-upstream-base <URL>   OpenAI-compatible upstream. Compressed\n"
@@ -723,19 +720,6 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
                 sconfig.pflash_curve.push_back({tok, ratio});
             }
             std::sort(sconfig.pflash_curve.begin(), sconfig.pflash_curve.end());
-        } else if (std::strcmp(argv[i], "--draft-residency") == 0 && i + 1 < argc) {
-            if (!parse_draft_residency_policy(argv[++i], sconfig.draft_residency)) {
-                std::fprintf(stderr,
-                    "[server] unknown --draft-residency policy: '%s' "
-                    "(expected: auto, persistent, request-scoped)\n", argv[i]);
-                print_usage(argv[0]);
-                return 1;
-            }
-            sconfig.lazy_draft =
-                (sconfig.draft_residency == DraftResidencyPolicy::RequestScoped);
-        } else if (std::strcmp(argv[i], "--lazy-draft") == 0) {
-            sconfig.lazy_draft = true;
-            sconfig.draft_residency = DraftResidencyPolicy::RequestScoped;
         } else if (std::strcmp(argv[i], "--chat-template-file") == 0 && i + 1 < argc) {
             const char * path = argv[++i];
             std::FILE * f = std::fopen(path, "rb");
@@ -829,9 +813,9 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
     if (load_balancing && (bargs.device.is_multi_device() ||
             bargs.remote_draft.enabled() || bargs.remote_target_shard.enabled() ||
             sconfig.pflash_mode != ServerConfig::PflashMode::OFF ||
-            !sconfig.pflash_upstream_base.empty() || sconfig.lazy_draft ||
+            !sconfig.pflash_upstream_base.empty() ||
             sconfig.freq_tracking || !sconfig.collect_routing_path.empty())) {
-        std::fprintf(stderr, "[server] model '%s' requires local serving; compression, sharding, request-scoped drafts and routing collection are unsupported with load balancing\n", sconfig.model_name.c_str());
+        std::fprintf(stderr, "[server] model '%s' requires local serving; compression, sharding and routing collection are unsupported with load balancing\n", sconfig.model_name.c_str());
         return 2;
     }
     return 0;
@@ -905,7 +889,6 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         sconfig.pflash_mode != ServerConfig::PflashMode::OFF;
     backend_features.pflash_drafter_configured =
         !sconfig.pflash_drafter_path.empty();
-    backend_features.draft_residency = sconfig.draft_residency;
     backend_features.routing_stats_requested =
         sconfig.freq_tracking || !sconfig.collect_routing_path.empty();
     backend_features.adaptive_experts_requested = adaptive_experts_set;
@@ -1096,14 +1079,6 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         set_environment_variable("DFLASH27B_FA_WINDOW", "0", false);
     }
 
-    if (sconfig.draft_residency == DraftResidencyPolicy::RequestScoped &&
-        !(pflash_enabled || bargs.draft_path)) {
-        std::fprintf(stderr,
-            "[server] --draft-residency=request-scoped ignored: requires "
-            "--prefill-compression or --draft\n");
-        sconfig.draft_residency = DraftResidencyPolicy::Auto;
-        sconfig.lazy_draft = false;
-    }
 
     // Load tokenizer.
     std::fprintf(stderr, "[server] loading tokenizer from %s\n", bargs.model_path);
@@ -1490,11 +1465,7 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         std::fprintf(stderr, "[server] │  fp_use_bsa      = %s\n", getenv("DFLASH_FP_USE_BSA") ? "ON" : "off");
         std::fprintf(stderr, "[server] │  fp_alpha        = %s\n", getenv("DFLASH_FP_ALPHA") ? getenv("DFLASH_FP_ALPHA") : "0.12 (default)");
     }
-    std::fprintf(stderr, "[server] │  draft_residency = %s\n",
-                 draft_residency_policy_name(sconfig.draft_residency));
-    if (bargs.draft_path) {
-        std::fprintf(stderr, "[server] │  lazy_draft      = %s\n", sconfig.lazy_draft ? "ON" : "off");
-    }
+    std::fprintf(stderr, "[server] │  decode draft    = persistent\n");
     std::fprintf(stderr, "[server] ╰─────────────────────────────────────────────────────╯\n\n");
 
     // Populate /props introspection fields. These are runtime config snaps
@@ -1586,10 +1557,6 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         server.set_drafter_tokenizer(&drafter_tokenizer);
     }
 
-    // Lazy-draft: park decode draft at startup to free VRAM (~3.3 GB).
-    if (sconfig.lazy_draft && bargs.draft_path) {
-        backend->park(ParkTarget::DraftModel);
-    }
 
     // Set up routing data collector (--collect-routing)
     auto & routing_collector = loaded.routing_collector;

@@ -793,7 +793,7 @@ json build_props_body(const ServerConfig & config,
             {"bsa_enabled",  nullptr},
             {"bsa_alpha",    nullptr},
             {"lm_head_fix",  nullptr},
-            {"draft_residency", draft_residency_policy_name(config.draft_residency)},
+            {"draft_residency", "release-after-use"},
         };
     } else {
         const char * bsa_env = std::getenv("DFLASH_FP_USE_BSA");
@@ -819,7 +819,7 @@ json build_props_body(const ServerConfig & config,
             {"bsa_enabled",  (bsa_env != nullptr && *bsa_env && std::strcmp(bsa_env, "0") != 0)},
             {"bsa_alpha",    bsa_alpha},
             {"lm_head_fix",  (lmfix_env != nullptr && *lmfix_env && std::strcmp(lmfix_env, "0") != 0)},
-            {"draft_residency", draft_residency_policy_name(config.draft_residency)},
+            {"draft_residency", "release-after-use"},
         };
     }
 
@@ -856,8 +856,7 @@ json build_props_body(const ServerConfig & config,
             {"fa_window",       config.fa_window},
             {"kv_cache_k",      config.kv_cache_k},
             {"kv_cache_v",      config.kv_cache_v},
-            {"lazy_draft",      config.lazy_draft},
-            {"draft_residency", draft_residency_policy_name(config.draft_residency)},
+            {"draft_residency", "persistent"},
             {"target_sharding", config.target_sharding},
             // Prefill chunk size (bargs.chunk). Surfaced so snapshot
             // tooling captures the full config — bench consumers
@@ -2981,13 +2980,7 @@ void HttpServer::apply_flowkv_compression(
     json modified_messages = req.messages;
     bool any_compressed = false;
     int cache_hits = 0;
-    const auto residency_action = resolve_draft_residency_action(
-        config_.draft_residency,
-        DraftResidencyContext{
-            DraftResidencyUse::PFlashCompress,
-            config_.lazy_draft,
-            !config_.draft_path.empty(),
-        });
+    const auto residency_action = DraftResidencyAction::ReleaseAfterUse;
 
     std::vector<ModelBackend::CompressRequest> compress_requests;
     std::vector<int> compress_message_indices;
@@ -3183,13 +3176,7 @@ std::string HttpServer::apply_pflash_compression(
     compress_request.drafter_path = config_.pflash_drafter_path;
     compress_request.drafter_gpu = config_.pflash_drafter_gpu;
     compress_request.skip_park = config_.pflash_skip_park;
-    const auto residency = resolve_draft_residency_action(
-        config_.draft_residency,
-        DraftResidencyContext{
-            DraftResidencyUse::PFlashCompress,
-            config_.lazy_draft,
-            !config_.draft_path.empty(),
-        });
+    const auto residency = DraftResidencyAction::ReleaseAfterUse;
     compress_request.residency_action = residency;
 
     ModelBackend::CompressResult result;
@@ -4479,27 +4466,13 @@ void HttpServer::process_job(ServerJob * job) {
     bool & visible_output_seen = output.visible_output_seen;
     bool & client_disconnected = output.client_disconnected;
 
-    const auto dflash_residency =
-        resolve_draft_residency_action(
-            config_.draft_residency,
-            DraftResidencyContext{
-                DraftResidencyUse::DFlashDecode,
-                config_.lazy_draft,
-                !config_.draft_path.empty(),
-            });
 
     if(prepared.hybrid && io.should_cancel && io.should_cancel()) {
         if(cache.snap_slot>=0)backend_.snapshot_free(cache.snap_slot);
         fail_request(408,"Request cancelled or deadline expired");return;
     }
     // Run generation (with or without restore).
-    // Request-scoped draft residency ensures decode draft is loaded only
-    // around the generation window, leaving room for PFlash/target state.
-    if (dflash_residency == DraftResidencyAction::ReleaseAfterUse &&
-        !config_.draft_path.empty()) {
-        backend_.free_drafter();    // free pflash drafter (~1.4 GB) if loaded
-        backend_.unpark(ParkTarget::DraftModel);   // reload decode draft (~3.3 GB)
-    }
+    // The decoding drafter stays resident across requests.
 
     // Transition status to decode phase.
     status_.set_decode();
@@ -4533,10 +4506,6 @@ void HttpServer::process_job(ServerJob * job) {
     }
     if(req.stream && !ensure_stream_started())output.client_disconnected=true;
 
-    if (dflash_residency == DraftResidencyAction::ReleaseAfterUse &&
-        !config_.draft_path.empty()) {
-        backend_.park(ParkTarget::DraftModel);
-    }
 
     if (job->client_disconnected.load(std::memory_order_acquire)) {
         client_disconnected = true;

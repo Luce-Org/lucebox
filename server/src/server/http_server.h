@@ -223,8 +223,6 @@ struct ServerConfig {
     // Piecewise keep-ratio curve: (token_threshold, keep_ratio) sorted ascending.
     // If empty, uses pflash_keep_ratio as flat value.
     std::vector<std::pair<int, float>> pflash_curve;
-    bool        lazy_draft      = false;   // legacy alias for request-scoped draft residency
-    DraftResidencyPolicy draft_residency = DraftResidencyPolicy::Auto;
 
     // Disk prefix cache
     std::string disk_cache_dir;             // empty = disabled

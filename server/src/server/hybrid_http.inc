@@ -104,7 +104,8 @@ HttpServer::PreparedPrompt HttpServer::prepare_hybrid_prompt(const ParsedRequest
         const char* projection_setting=std::getenv("DFLASH_HYBRID_PROJECTIONS");
         const bool projections_enabled=projection_setting && std::string(projection_setting)=="1";
         // Conservative transient allowance on top of already allocated live KV:
-        // fixed-window scorer plus decode-drafter loading, never active CPU KV.
+        // fixed-window scorer and execution scratch. Free GPU memory already
+        // excludes the resident decoding drafter; never reclaim it for admission.
         const uint64_t work=4*GiB;
         auto add=[&](Candidate c,std::shared_ptr<Representation> rep,uint64_t extra_work=0) {
             int uncached=0,regions_to_score=0;

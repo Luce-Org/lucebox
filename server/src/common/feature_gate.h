@@ -23,8 +23,7 @@
 // collect_feature_warnings() reports flags that are accepted but inert on the
 // resolved architecture and placement — the request still runs, just without
 // that feature, so it must not fail admission. Degradations that mutate config
-// on the way through ("--draft-residency=request-scoped ignored", "--spark
-// ignored") stay with the setting they rewrite; a pure function returning
+// on the way through ("--spark ignored") stay with the setting they rewrite; a pure function returning
 // strings cannot express those.
 
 #pragma once

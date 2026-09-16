@@ -3733,7 +3733,6 @@ TEST_CASE(ServerUnitFixture, test_pflash_config_defaults) {
     TEST_ASSERT(cfg.pflash_keep_ratio > 0.04f && cfg.pflash_keep_ratio < 0.06f);
     TEST_ASSERT(cfg.pflash_drafter_path.empty());
     TEST_ASSERT(!cfg.pflash_skip_park);
-    TEST_ASSERT(cfg.draft_residency == DraftResidencyPolicy::Auto);
 }
 
 TEST_CASE(ServerUnitFixture, test_concurrent_status_is_aggregate_only) {
@@ -4257,77 +4256,6 @@ TEST_CASE(ServerUnitFixture, test_pflash_placement_usage_gate) {
         /*pflash_enabled=*/true, /*has_decode_draft=*/false));
     TEST_ASSERT(pflash_drafter_placement_used(
         /*pflash_enabled=*/true, /*has_decode_draft=*/true));
-}
-
-TEST_CASE(ServerUnitFixture, test_draft_residency_parse) {
-    DraftResidencyPolicy policy = DraftResidencyPolicy::Auto;
-    TEST_ASSERT(parse_draft_residency_policy("auto", policy));
-    TEST_ASSERT(policy == DraftResidencyPolicy::Auto);
-    TEST_ASSERT(parse_draft_residency_policy("persistent", policy));
-    TEST_ASSERT(policy == DraftResidencyPolicy::Persistent);
-    TEST_ASSERT(parse_draft_residency_policy("request-scoped", policy));
-    TEST_ASSERT(policy == DraftResidencyPolicy::RequestScoped);
-    TEST_ASSERT(parse_draft_residency_policy("request_scoped", policy));
-    TEST_ASSERT(policy == DraftResidencyPolicy::RequestScoped);
-    TEST_ASSERT(!parse_draft_residency_policy("request", policy));
-}
-
-TEST_CASE(ServerUnitFixture, test_draft_residency_pflash_auto) {
-    auto action = resolve_draft_residency_action(
-        DraftResidencyPolicy::Auto,
-        DraftResidencyContext{
-            DraftResidencyUse::PFlashCompress,
-            /*low_vram_hint=*/false,
-            /*has_decode_draft=*/false,
-        });
-    TEST_ASSERT(action == DraftResidencyAction::ReleaseAfterUse);
-
-    action = resolve_draft_residency_action(
-        DraftResidencyPolicy::Auto,
-        DraftResidencyContext{
-            DraftResidencyUse::PFlashCompress,
-            /*low_vram_hint=*/true,
-            /*has_decode_draft=*/true,
-        });
-    TEST_ASSERT(action == DraftResidencyAction::ReleaseAfterUse);
-}
-
-TEST_CASE(ServerUnitFixture, test_draft_residency_dflash_auto_and_request_scoped) {
-    auto action = resolve_draft_residency_action(
-        DraftResidencyPolicy::Auto,
-        DraftResidencyContext{
-            DraftResidencyUse::DFlashDecode,
-            /*low_vram_hint=*/false,
-            /*has_decode_draft=*/true,
-        });
-    TEST_ASSERT(action == DraftResidencyAction::KeepLoaded);
-
-    action = resolve_draft_residency_action(
-        DraftResidencyPolicy::Auto,
-        DraftResidencyContext{
-            DraftResidencyUse::DFlashDecode,
-            /*low_vram_hint=*/true,
-            /*has_decode_draft=*/true,
-        });
-    TEST_ASSERT(action == DraftResidencyAction::ReleaseAfterUse);
-
-    action = resolve_draft_residency_action(
-        DraftResidencyPolicy::RequestScoped,
-        DraftResidencyContext{
-            DraftResidencyUse::DFlashDecode,
-            /*low_vram_hint=*/false,
-            /*has_decode_draft=*/true,
-        });
-    TEST_ASSERT(action == DraftResidencyAction::ReleaseAfterUse);
-
-    action = resolve_draft_residency_action(
-        DraftResidencyPolicy::Persistent,
-        DraftResidencyContext{
-            DraftResidencyUse::DFlashDecode,
-            /*low_vram_hint=*/true,
-            /*has_decode_draft=*/true,
-        });
-    TEST_ASSERT(action == DraftResidencyAction::KeepLoaded);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -7338,8 +7266,6 @@ TEST_CASE(ServerUnitFixture, test_props_runtime_shape) {
     cfg.fa_window       = 2048;
     cfg.kv_cache_k      = "tq3_0";
     cfg.kv_cache_v      = "tq3_0";
-    cfg.lazy_draft      = false;
-    cfg.draft_residency = DraftResidencyPolicy::Persistent;
     cfg.target_sharding = false;
     cfg.chunk           = 512;
     cfg.target_device   = "auto:0";
@@ -7357,7 +7283,6 @@ TEST_CASE(ServerUnitFixture, test_props_runtime_shape) {
     TEST_ASSERT(rt["fa_window"].get<int>()               == 2048);
     TEST_ASSERT(rt["kv_cache_k"].get<std::string>()      == "tq3_0");
     TEST_ASSERT(rt["kv_cache_v"].get<std::string>()      == "tq3_0");
-    TEST_ASSERT(rt["lazy_draft"].get<bool>()             == false);
     TEST_ASSERT(rt["draft_residency"].get<std::string>() == "persistent");
     TEST_ASSERT(rt["target_sharding"].get<bool>()        == false);
     TEST_ASSERT(rt["chunk"].get<int>()                   == 512);
@@ -7377,7 +7302,7 @@ TEST_CASE(ServerUnitFixture, test_props_runtime_shape) {
     TEST_ASSERT(pc_props.contains("restore_stall_ms_max"));
     TEST_ASSERT(rt["continuous_batching"]["admission_coalesce_ms"]
                     .get<int>() == 20);
-    TEST_ASSERT(body["pflash"]["draft_residency"].get<std::string>() == "persistent");
+    TEST_ASSERT(body["pflash"]["draft_residency"].get<std::string>() == "release-after-use");
 
     // draft_device is null when no draft model is loaded.
     cfg.draft_device.clear();

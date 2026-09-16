@@ -449,18 +449,6 @@ void test_feature_gate_paged_attention_allows_fixed_local_chains() {
     CHECK(gate_result(
         concurrent_chain, "qwen35", PlacementBackend::Hip).empty());
 
-    BackendFeatureConfig request_scoped;
-    request_scoped.draft_residency = DraftResidencyPolicy::RequestScoped;
-    CHECK(!gate_result(
-        concurrent_chain, "qwen35", PlacementBackend::Cuda,
-        request_scoped).empty());
-
-    BackendFeatureConfig persistent;
-    persistent.draft_residency = DraftResidencyPolicy::Persistent;
-    CHECK(gate_result(
-        concurrent_chain, "qwen35", PlacementBackend::Cuda,
-        persistent).empty());
-
     BackendArgs remote_chain = concurrent_chain;
     remote_chain.remote_draft.ipc_bin = "/usr/bin/draft-ipc";
     CHECK(!gate_result(

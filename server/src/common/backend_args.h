@@ -23,7 +23,6 @@ namespace dflash::common {
 struct BackendFeatureConfig {
     bool pflash_enabled = false;
     bool pflash_drafter_configured = false;
-    DraftResidencyPolicy draft_residency = DraftResidencyPolicy::Auto;
 
     // MoE-only server features. Recorded here so the gate can report them as
     // inert on a dense architecture; both are applied via env vars at parse
