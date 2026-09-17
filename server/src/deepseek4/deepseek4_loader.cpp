@@ -1346,11 +1346,24 @@ bool register_deepseek4_moe_hybrid_mix_tables(
     }
     if (!has_mix_experts) return true;
 
+    // Two storage shapes can be decoded. A GPU cold owner needs both halves
+    // materialized, because the primary and the secondary owner each get their
+    // own table. Cold owner None has no second owner at all: its resident set
+    // is exactly the hot experts, and ds4_register_compact_mix_tensor already
+    // returns success for a null tensor whose expert-id list is empty, which is
+    // precisely how an absent cold owner presents itself. Only this check stood
+    // in the way.
+    const bool hot_only =
+        storage.cold_backend_kind == MoeHybridColdBackend::None &&
+        !storage.materialized_cold_experts;
+    const bool gpu_owners =
+        storage.cold_backend_kind == MoeHybridColdBackend::Gpu &&
+        storage.materialized_cold_experts;
     if (storage.layers.size() != w.layers.size() ||
-        storage.cold_backend_kind != MoeHybridColdBackend::Gpu ||
         !storage.materialized_hot_experts ||
-        !storage.materialized_cold_experts) {
-        if (err) *err = "mixed expert qtypes require materialized GPU owners";
+        !(hot_only || gpu_owners)) {
+        if (err) *err = "mixed expert qtypes require materialized hot experts with "
+                        "either a materialized GPU cold owner or no cold owner";
         return false;
     }
 
