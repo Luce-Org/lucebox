@@ -199,11 +199,11 @@ static int64_t concurrent_fixed_cache_bytes(
         (int64_t)sizeof(float);
     const int64_t recurrent =
         state_per_layer * n_delta * (int64_t)n_slots;
+    // Must match the target ring allocated in create_target_cache_partial.
+    const int64_t target_feat_cap = dflash::common::dflash_drafter_window(max_ctx);
     const int64_t target_feat =
         (int64_t)w.n_capture_layers * w.n_embd *
-        (fixed_chain
-             ? (int64_t)std::min(max_ctx, 4096) * n_slots + 1
-             : (int64_t)std::min(max_ctx, 4096)) *
+        (fixed_chain ? target_feat_cap * n_slots + 1 : target_feat_cap) *
         (int64_t)sizeof(uint16_t);
     const int64_t q_capture =
         (int64_t)w.n_embd_head_k * w.n_head * n_full_attn *
