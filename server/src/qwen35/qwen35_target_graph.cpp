@@ -273,8 +273,7 @@ bool create_target_cache_partial(const TargetWeights & w,
         // the target ring is the source the mirror is synced from, so it must
         // span the same window. A 4096-slot target ring with a deeper mirror
         // feeds the drafter aliased features from older positions on restore.
-        constexpr int TARGET_FEAT_CAP_DEFAULT = dflash::common::DFLASH_DRAFTER_TRAINED_CTX;
-        out.target_feat_cap = std::min(max_ctx, TARGET_FEAT_CAP_DEFAULT);
+        out.target_feat_cap = dflash::common::dflash_drafter_window(max_ctx);
         if (allocate_target_feat) {
             const int fc_in = w.n_capture_layers * w.n_embd;
             // Concurrent slots own disjoint feature rings. The final row is

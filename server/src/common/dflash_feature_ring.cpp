@@ -582,6 +582,18 @@ bool copy_feature_ring_range_to_tensor(
                                  row_bytes * (size_t)run)) {
                 return false;
             }
+        } else if (dst_stride == row_bytes) {
+            // Quantised mirror, contiguous destination: dequantise the whole
+            // run in one call instead of one launch per row (the draft window
+            // can span 40960 rows).
+            auto to_f32 = ggml_get_to_fp32_cuda(feature_ring.storage_type);
+            if (!to_f32) return false;
+            cudaError_t err = cudaSetDevice(feature_ring.device);
+            if (feature_cuda_failed("cudaSetDevice", err)) return false;
+            to_f32(src_base, (float *)dst_base,
+                   (int64_t)run * (int64_t)fc_in, nullptr);
+            err = cudaGetLastError();
+            if (feature_cuda_failed("to_fp32_cuda", err)) return false;
         } else {
             for (int i = 0; i < run; i++) {
                 if (!copy_feature_to_f32(

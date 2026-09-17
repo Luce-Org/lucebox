@@ -661,7 +661,7 @@ bool Qwen35Backend::init() {
     // accept collapsed once committed exceeded it (8K+).
     if (cfg_.draft_path && !use_remote_draft &&
         !fixed_chain.enabled) {
-        const int mirror_cap = std::min(cfg_.device.max_ctx, dflash::common::DFLASH_DRAFTER_TRAINED_CTX);
+        const int mirror_cap = dflash::common::dflash_drafter_window(cfg_.device.max_ctx);
         if (!draft_feature_mirror_init(feature_mirror_, draft_backend_,
                                        cfg_.draft_gpu, cfg_.device.gpu, mirror_cap,
                                        w_.n_capture_layers,
