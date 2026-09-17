@@ -38,6 +38,7 @@
 #include "qwen35_ops.h"
 #include "qwen35moe_ffn.h"
 #include "common/chain_rollback_policy.h"
+#include "common/dflash_feature_ring.h"
 #include "common/kv_rotation.h"
 #include "common/specla_commit_cuda.h"
 
@@ -268,7 +269,11 @@ bool create_target_cache_partial(const TargetWeights & w,
             }
         }
 
-        constexpr int TARGET_FEAT_CAP_DEFAULT = 4096;
+        // Match the drafter's feature mirror window (common/dflash_feature_ring.h):
+        // the target ring is the source the mirror is synced from, so it must
+        // span the same window. A 4096-slot target ring with a deeper mirror
+        // feeds the drafter aliased features from older positions on restore.
+        constexpr int TARGET_FEAT_CAP_DEFAULT = dflash::common::DFLASH_DRAFTER_TRAINED_CTX;
         out.target_feat_cap = std::min(max_ctx, TARGET_FEAT_CAP_DEFAULT);
         if (allocate_target_feat) {
             const int fc_in = w.n_capture_layers * w.n_embd;
