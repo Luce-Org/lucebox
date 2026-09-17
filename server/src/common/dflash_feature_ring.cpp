@@ -55,7 +55,12 @@ static bool ensure_staging(DraftFeatureMirror & mirror, size_t bytes) {
 
 static ggml_type parse_feature_dtype() {
     const char * s = std::getenv("DFLASH_FEATURE_DTYPE");
-    if (!s || !s[0] || std::strcmp(s, "f32") == 0 || std::strcmp(s, "F32") == 0) {
+    if (!s || !s[0]) {
+        // ponytail: q4_0 default — accept-neutral, makes the deep (~40K) ring
+        // affordable. Set DFLASH_FEATURE_DTYPE=f32 to restore lossless features.
+        return GGML_TYPE_Q4_0;
+    }
+    if (std::strcmp(s, "f32") == 0 || std::strcmp(s, "F32") == 0) {
         return GGML_TYPE_F32;
     }
     if (std::strcmp(s, "f16") == 0 || std::strcmp(s, "F16") == 0) {
@@ -67,6 +72,10 @@ static ggml_type parse_feature_dtype() {
     if (std::strcmp(s, "q8_0") == 0 || std::strcmp(s, "Q8_0") == 0 ||
         std::strcmp(s, "q8") == 0 || std::strcmp(s, "Q8") == 0) {
         return GGML_TYPE_Q8_0;
+    }
+    if (std::strcmp(s, "q4_0") == 0 || std::strcmp(s, "Q4_0") == 0 ||
+        std::strcmp(s, "q4") == 0 || std::strcmp(s, "Q4") == 0) {
+        return GGML_TYPE_Q4_0;
     }
     std::fprintf(stderr, "[dflash-feature] ignoring unsupported DFLASH_FEATURE_DTYPE=%s\n", s);
     return GGML_TYPE_F32;
