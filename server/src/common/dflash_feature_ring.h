@@ -23,6 +23,13 @@
 
 namespace dflash::common {
 
+// Drafter's trained sliding-window (feature-mirror) context. The drafter's
+// feature ring must span at least this many tokens or it only sees a shallow
+// suffix of the context and spec-decode accept collapses once the committed
+// prefix exceeds it. Pending the converter injecting the real context_length
+// into the drafter GGUF (currently a 262144 placeholder).
+inline constexpr int DFLASH_DRAFTER_TRAINED_CTX = 40960;
+
 struct DraftFeatureMirror {
     ggml_context * ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;

@@ -2052,11 +2052,11 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
             return false;
         }
 
-        // 2. Draft compute
-        constexpr int DRAFT_CTX_MAX_DEFAULT = 2048;
+        // 2. Draft compute. The mirror cap IS the drafter's trained window;
+        // read the whole visible prefix (the old 2048/draft_ctx_max sub-floor
+        // starved the drafter and collapsed accept at 8K+).
         const int ring_cap = feature_mirror().cap;
-        const int draft_ctx = std::min(committed,
-            std::min(ring_cap, std::max(DRAFT_CTX_MAX_DEFAULT, cfg_.draft_ctx_max)));
+        const int draft_ctx = std::min(committed, ring_cap);
         const int draft_start = committed - draft_ctx;
         int mirror_slot0 = 0;
         const bool use_mirror_view =
@@ -2065,7 +2065,7 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
         if (!build_draft_step(draft_sg, draft_weights(), /*lm_head=*/nullptr, draft_backend(),
                               draft_ctx, use_mirror_view ? &feature_mirror() : nullptr,
                               committed,
-                              std::min(ring_cap, std::max(DRAFT_CTX_MAX_DEFAULT, cfg_.draft_ctx_max)))) {
+                              /*ctx_len_max=*/ring_cap)) {
             std::fprintf(stderr, "[hybrid-spec] draft build failed\n");
             step_graph_destroy(draft_sg);
             return false;
