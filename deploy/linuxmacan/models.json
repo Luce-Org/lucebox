@@ -1,0 +1,110 @@
+{
+  "default": "qwen3.8-27b",
+  "draft": "/code/models/qwen38/qwen38-dflash2-q8_0.gguf",
+  "models": {
+    "qwen3.8-27b": {
+      "path": "/code/models/qwen38/Qwen3.8-27B-UD-IQ4_XS.gguf",
+      "draft_block_size": 16,
+      "context": 131072,
+      "max_concurrency": 1,
+      "hybrid_cache": "auto",
+      "compression_score_window": 8192,
+      "extra_args": [
+        "--prefill-compression",
+        "auto",
+        "--prefill-keep-ratio",
+        "0.2",
+        "--prefill-drafter",
+        "/code/models/qwen38/Qwen3-0.6B-BF16.gguf",
+        "--prefill-skip-park"
+      ],
+      "cache_default_policy": "auto",
+      "hybrid_calibration": "/opt/lucebox/hybrid-calibration.json",
+      "hybrid_projections": false,
+      "draft": "/code/models/qwen38/qwen38-dflash2-q8_0.gguf"
+    },
+    "qwen3.8-27b-abliterated": {
+      "path": "/code/models/qwen38/Huihui-Qwen3.8-27B-abliterated-UD-IQ4_XS.gguf",
+      "draft_block_size": 16,
+      "context": 131072,
+      "max_concurrency": 1
+    },
+    "gemma-4-26b-a4b": {
+      "path": "/code/models/gemma4/gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf",
+      "draft": "/code/models/gemma4/gemma-4-26B-A4B-it-DFlash-q8_0.gguf",
+      "context": 131072,
+      "max_concurrency": 1
+    },
+    "qwen3.8-27b-pflash": {
+      "path": "/code/models/qwen38/Qwen3.8-27B-UD-IQ4_XS.gguf",
+      "draft_block_size": 16,
+      "context": 131072,
+      "max_concurrency": 1,
+      "hybrid_cache": "auto",
+      "compression_score_window": 8192,
+      "extra_args": [
+        "--prefill-compression",
+        "auto",
+        "--prefill-keep-ratio",
+        "0.2",
+        "--prefill-drafter",
+        "/code/models/qwen38/Qwen3-0.6B-BF16.gguf",
+        "--prefill-skip-park"
+      ],
+      "cache_default_policy": "auto",
+      "hybrid_calibration": "/opt/lucebox/hybrid-calibration.json",
+      "hybrid_projections": false,
+      "canonical": "qwen3.8-27b"
+    },
+    "qwen3.8-27b-swift": {
+      "path": "/code/models/swift-qwen/ukisai_Swift-Qwen3.8-27b-IQ4_XS.gguf",
+      "draft_block_size": 16,
+      "context": 131072,
+      "max_concurrency": 1,
+      "hybrid_cache": "auto",
+      "compression_score_window": 8192,
+      "extra_args": [
+        "--prefill-compression",
+        "auto",
+        "--prefill-keep-ratio",
+        "0.2",
+        "--prefill-drafter",
+        "/code/models/qwen38/Qwen3-0.6B-BF16.gguf",
+        "--prefill-skip-park",
+        "--chat-template-file",
+        "/opt/lucebox/templates/swift-qwen.jinja"
+      ],
+      "cache_default_policy": "auto",
+      "hybrid_projections": false,
+      "draft": "/code/models/qwen38/qwen38-dflash2-q8_0.gguf"
+    }
+  },
+  "memory": {
+    "bytes_per_token": 98304,
+    "fixed_bytes": 1073741824,
+    "reserve_bytes": 2147483648,
+    "work_bytes_per_token": 8192,
+    "snapshot_max_bytes": 4294967296
+  },
+  "serving": {
+    "max_queue": 4,
+    "queue_timeout": 120,
+    "prefill_timeout": 1800,
+    "token_timeout": 120,
+    "request_timeout": 3600,
+    "cancel_grace": 5,
+    "stop_grace": 5,
+    "load_timeout": 180,
+    "body_timeout": 15,
+    "prefix_cache_slots": 2,
+    "max_concurrency": 1
+  },
+  "listen_host": "0.0.0.0",
+  "listen_port": 8216,
+  "backend": {
+    "executable": "/opt/lucebox-concurrent/server/build-hip/dflash_server",
+    "library_path": "/opt/rocm/core-10.0/lib",
+    "extra_args": [],
+    "prefix_cache_device": "gpu"
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "old_identity": "d5574b99919f7e3f4204207f1b49b403",
+  "new_identity": "8efbddf010838f6b89f98420ae5e8fe8",
+  "reason": "Identical target and draft SHA256; target redownload changed mtime; copy timing observations only",
+  "entries": 4
+}

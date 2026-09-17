@@ -1,0 +1,486 @@
+[
+  {
+    "name": "arithmetic",
+    "wall_seconds": 0.7017355610150844,
+    "passed": false,
+    "expected": {
+      "parts": 527
+    },
+    "response": {
+      "choices": [
+        {
+          "finish_details": {
+            "close_kind": "hard",
+            "content_tokens": 9,
+            "thinking_tokens": 1,
+            "total_tokens": 11
+          },
+          "finish_reason": "stop",
+          "index": 0,
+          "message": {
+            "content": "\n\n\n{\"parts\": 306}",
+            "role": "assistant"
+          }
+        }
+      ],
+      "created": 1789575402,
+      "id": "chatcmpl_0000000000000014",
+      "model": "qwen3.8-27b",
+      "object": "chat.completion",
+      "usage": {
+        "accept_rate": 0.0625,
+        "completion_tokens": 11,
+        "completion_tokens_details": {
+          "reasoning_tokens": 1
+        },
+        "prompt_tokens": 76,
+        "spec_decode_ran": true,
+        "timings": {
+          "agent_turn_cache_hit": false,
+          "cache_hit": false,
+          "cached_prefix_tokens": 0,
+          "decode_ms": 512.6,
+          "decode_tokens_per_sec": 21.5,
+          "effective_prompt_tokens": 76,
+          "prefill_ms": 163.2,
+          "prefilled_tokens": 76
+        },
+        "total_tokens": 87
+      }
+    },
+    "request": {
+      "model": "qwen3.8-27b",
+      "messages": [
+        {
+          "role": "user",
+          "content": "A machine makes 17 parts every 6 minutes. It runs for 3 hours 24 minutes, but is stopped for 18 minutes during that interval. It starts a fresh cycle when restarted. Both active intervals are multiples of 6 minutes. How many parts? Return JSON only: {\"parts\": integer}."
+        }
+      ],
+      "max_tokens": 2048,
+      "temperature": 0,
+      "reasoning_effort": "medium",
+      "seed": 42,
+      "extra_body": {
+        "lucebox_cache": {
+          "mode": "exact"
+        }
+      }
+    }
+  },
+  {
+    "name": "constraints",
+    "wall_seconds": 0.643084864015691,
+    "passed": true,
+    "expected": {
+      "order": [
+        "B",
+        "D",
+        "A",
+        "C"
+      ]
+    },
+    "response": {
+      "choices": [
+        {
+          "finish_details": {
+            "close_kind": "hard",
+            "content_tokens": 12,
+            "thinking_tokens": 1,
+            "total_tokens": 14
+          },
+          "finish_reason": "stop",
+          "index": 0,
+          "message": {
+            "content": "\n\n\n{\"order\":[\"B\",\"D\",\"A\",\"C\"]}",
+            "role": "assistant"
+          }
+        }
+      ],
+      "created": 1789575403,
+      "id": "chatcmpl_0000000000000015",
+      "model": "qwen3.8-27b",
+      "object": "chat.completion",
+      "usage": {
+        "accept_rate": 0.0625,
+        "completion_tokens": 14,
+        "completion_tokens_details": {
+          "reasoning_tokens": 1
+        },
+        "prompt_tokens": 62,
+        "spec_decode_ran": true,
+        "timings": {
+          "agent_turn_cache_hit": false,
+          "cache_hit": false,
+          "cached_prefix_tokens": 0,
+          "decode_ms": 522.3,
+          "decode_tokens_per_sec": 26.8,
+          "effective_prompt_tokens": 62,
+          "prefill_ms": 107.7,
+          "prefilled_tokens": 62
+        },
+        "total_tokens": 76
+      }
+    },
+    "request": {
+      "model": "qwen3.8-27b",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Schedule tasks A,B,C,D, each one hour, on one machine starting at hour 0. A must precede C, B must precede D, and D must precede A. Return JSON only with the unique order: {\"order\":[...]}."
+        }
+      ],
+      "max_tokens": 2048,
+      "temperature": 0,
+      "reasoning_effort": "medium",
+      "seed": 42,
+      "extra_body": {
+        "lucebox_cache": {
+          "mode": "exact"
+        }
+      }
+    }
+  },
+  {
+    "name": "code_aliasing",
+    "wall_seconds": 0.9639233379857615,
+    "passed": false,
+    "expected": {
+      "result": [
+        [
+          9,
+          1
+        ],
+        [
+          2
+        ],
+        [
+          9,
+          1
+        ]
+      ]
+    },
+    "response": {
+      "choices": [
+        {
+          "finish_details": {
+            "close_kind": "hard",
+            "content_tokens": 23,
+            "thinking_tokens": 1,
+            "total_tokens": 25
+          },
+          "finish_reason": "stop",
+          "index": 0,
+          "message": {
+            "content": "\n\n\n```json\n{\"result\": \"[[0, 1], [2], [9]]\"}\n```",
+            "role": "assistant"
+          }
+        }
+      ],
+      "created": 1789575404,
+      "id": "chatcmpl_0000000000000016",
+      "model": "qwen3.8-27b",
+      "object": "chat.completion",
+      "usage": {
+        "accept_rate": 0.0625,
+        "completion_tokens": 25,
+        "completion_tokens_details": {
+          "reasoning_tokens": 1
+        },
+        "prompt_tokens": 66,
+        "spec_decode_ran": true,
+        "timings": {
+          "agent_turn_cache_hit": false,
+          "cache_hit": false,
+          "cached_prefix_tokens": 0,
+          "decode_ms": 841.4,
+          "decode_tokens_per_sec": 29.7,
+          "effective_prompt_tokens": 66,
+          "prefill_ms": 109.8,
+          "prefilled_tokens": 66
+        },
+        "total_tokens": 91
+      }
+    },
+    "request": {
+      "model": "qwen3.8-27b",
+      "messages": [
+        {
+          "role": "user",
+          "content": "What does Python print?\na = [[0]] * 3\na[0].append(1)\na[1] = [2]\na[2][0] = 9\nprint(a)\nReturn JSON only: {\"result\": value}."
+        }
+      ],
+      "max_tokens": 2048,
+      "temperature": 0,
+      "reasoning_effort": "medium",
+      "seed": 42,
+      "extra_body": {
+        "lucebox_cache": {
+          "mode": "exact"
+        }
+      }
+    }
+  },
+  {
+    "name": "code_intervals",
+    "wall_seconds": 1.2676203059963882,
+    "passed": true,
+    "expected": {
+      "intervals": [
+        [
+          1,
+          6
+        ],
+        [
+          7,
+          7
+        ],
+        [
+          8,
+          11
+        ],
+        [
+          12,
+          12
+        ]
+      ]
+    },
+    "response": {
+      "choices": [
+        {
+          "finish_details": {
+            "close_kind": "hard",
+            "content_tokens": 33,
+            "thinking_tokens": 1,
+            "total_tokens": 35
+          },
+          "finish_reason": "stop",
+          "index": 0,
+          "message": {
+            "content": "\n\n\n{\"intervals\": [[1, 6], [7, 7], [8, 11], [12, 12]]}",
+            "role": "assistant"
+          }
+        }
+      ],
+      "created": 1789575405,
+      "id": "chatcmpl_0000000000000017",
+      "model": "qwen3.8-27b",
+      "object": "chat.completion",
+      "usage": {
+        "accept_rate": 0.0625,
+        "completion_tokens": 35,
+        "completion_tokens_details": {
+          "reasoning_tokens": 1
+        },
+        "prompt_tokens": 72,
+        "spec_decode_ran": true,
+        "timings": {
+          "agent_turn_cache_hit": false,
+          "cache_hit": false,
+          "cached_prefix_tokens": 0,
+          "decode_ms": 1148.2,
+          "decode_tokens_per_sec": 30.5,
+          "effective_prompt_tokens": 72,
+          "prefill_ms": 105.1,
+          "prefilled_tokens": 72
+        },
+        "total_tokens": 107
+      }
+    },
+    "request": {
+      "model": "qwen3.8-27b",
+      "messages": [
+        {
+          "role": "user",
+          "content": "A function merges CLOSED integer intervals when they overlap, but NOT merely when adjacent. Given [[8,10],[1,3],[3,6],[7,7],[12,12],[10,11]], return the sorted merged list as JSON only: {\"intervals\":[...]}."
+        }
+      ],
+      "max_tokens": 2048,
+      "temperature": 0,
+      "reasoning_effort": "medium",
+      "seed": 42,
+      "extra_body": {
+        "lucebox_cache": {
+          "mode": "exact"
+        }
+      }
+    }
+  },
+  {
+    "name": "extraction",
+    "wall_seconds": 0.49989679700229317,
+    "passed": false,
+    "expected": {
+      "ids": [
+        "c",
+        "a"
+      ]
+    },
+    "response": {
+      "choices": [
+        {
+          "finish_details": {
+            "close_kind": "hard",
+            "content_tokens": 8,
+            "thinking_tokens": 1,
+            "total_tokens": 10
+          },
+          "finish_reason": "stop",
+          "index": 0,
+          "message": {
+            "content": "\n\n\n{\"ids\":[\"a\",\"c\"]}",
+            "role": "assistant"
+          }
+        }
+      ],
+      "created": 1789575406,
+      "id": "chatcmpl_0000000000000018",
+      "model": "qwen3.8-27b",
+      "object": "chat.completion",
+      "usage": {
+        "accept_rate": 0.0625,
+        "completion_tokens": 10,
+        "completion_tokens_details": {
+          "reasoning_tokens": 1
+        },
+        "prompt_tokens": 88,
+        "spec_decode_ran": true,
+        "timings": {
+          "agent_turn_cache_hit": false,
+          "cache_hit": false,
+          "cached_prefix_tokens": 0,
+          "decode_ms": 374.8,
+          "decode_tokens_per_sec": 26.7,
+          "effective_prompt_tokens": 88,
+          "prefill_ms": 111.2,
+          "prefilled_tokens": 88
+        },
+        "total_tokens": 98
+      }
+    },
+    "request": {
+      "model": "qwen3.8-27b",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Data: [{\"id\":\"a\",\"active\":true,\"score\":7},{\"id\":\"b\",\"active\":false,\"score\":99},{\"id\":\"c\",\"active\":true,\"score\":7},{\"id\":\"d\",\"active\":true,\"score\":4}]. Select active items, sort by score descending then id descending, take first two. Return JSON only: {\"ids\":[...]}."
+        }
+      ],
+      "max_tokens": 2048,
+      "temperature": 0,
+      "reasoning_effort": "medium",
+      "seed": 42,
+      "extra_body": {
+        "lucebox_cache": {
+          "mode": "exact"
+        }
+      }
+    }
+  },
+  {
+    "name": "tool_call",
+    "wall_seconds": 1.8146016609389335,
+    "passed": true,
+    "expected": {
+      "city": "Toronto",
+      "unit": "celsius"
+    },
+    "response": {
+      "choices": [
+        {
+          "finish_details": {
+            "close_kind": "hard",
+            "content_tokens": 40,
+            "thinking_tokens": 1,
+            "total_tokens": 42
+          },
+          "finish_reason": "tool_calls",
+          "index": 0,
+          "message": {
+            "content": "\n\n\n",
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "function": {
+                  "arguments": "{\"city\":\"Toronto\",\"unit\":\"celsius\"}",
+                  "name": "lookup_weather"
+                },
+                "id": "call_85203065407068c7343867f0",
+                "type": "function"
+              }
+            ]
+          }
+        }
+      ],
+      "created": 1789575407,
+      "id": "chatcmpl_0000000000000019",
+      "model": "qwen3.8-27b",
+      "object": "chat.completion",
+      "usage": {
+        "accept_rate": 0.0625,
+        "completion_tokens": 42,
+        "completion_tokens_details": {
+          "reasoning_tokens": 1
+        },
+        "prompt_tokens": 280,
+        "spec_decode_ran": true,
+        "timings": {
+          "agent_turn_cache_hit": false,
+          "cache_hit": false,
+          "cached_prefix_tokens": 0,
+          "decode_ms": 1368.5,
+          "decode_tokens_per_sec": 30.7,
+          "effective_prompt_tokens": 280,
+          "prefill_ms": 432.7,
+          "prefilled_tokens": 280
+        },
+        "total_tokens": 322
+      }
+    },
+    "request": {
+      "model": "qwen3.8-27b",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Use lookup_weather to check Toronto in Celsius."
+        }
+      ],
+      "max_tokens": 2048,
+      "temperature": 0,
+      "reasoning_effort": "medium",
+      "seed": 42,
+      "extra_body": {
+        "lucebox_cache": {
+          "mode": "exact"
+        }
+      },
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "lookup_weather",
+            "description": "Look up weather for a city",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                },
+                "unit": {
+                  "type": "string",
+                  "enum": [
+                    "celsius",
+                    "fahrenheit"
+                  ]
+                }
+              },
+              "required": [
+                "city",
+                "unit"
+              ]
+            }
+          }
+        }
+      ]
+    }
+  }
+]

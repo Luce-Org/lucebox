@@ -1,0 +1,156 @@
+[server] loaded chat template from /opt/lucebox/work/swift-mtp/frozen-template.jinja (8952 bytes)
+[server] load balancing disabled; primary=swift-qwen target=auto:0
+[server] loading tokenizer from /code/models/swift-qwen/ukisai_Swift-Qwen3.8-27b-IQ4_XS.gguf
+[tokenizer] added_tokens: 33 special tokens
+[tokenizer] loaded vocab=248320 merges=247587 bos=248044 eos=248046 eot=248046 pre=qwen35 sp=no
+[server] creating backend...
+[backend_factory] detected arch=qwen35
+ggml_cuda_init: found 1 ROCm devices (Total VRAM: 32624 MiB):
+  Device 0: AMD Radeon AI PRO R9700, gfx1201 (0x1201), VMM: no, Wave Size: 32, VRAM: 32624 MiB
+[loader] ignoring 1 embedded NextN/MTP block: target_layers=64 total_blocks=65
+[loader] stacked 95 projection pairs (zero-copy aliases)
+[draft GGUF] DFlash 2 dynamic convs: kernel=2 group=16
+[draft GGUF] DFlash 2 selector enabled: rank=256 top_k=16 vocab=248320
+[dflash-feature] mirror dtype=f32 cap=4096 fc_in=25600
+[server] gguf meta: general.name='Swift Qwen3.8 27b' general.architecture='qwen35'
+[model_card] using cards dir: /opt/lucebox-concurrent/server/build-hip/../../share/model_cards
+[model_card] probing sidecar: /opt/lucebox-concurrent/server/build-hip/../../share/model_cards/swift-qwen3.8-27b.json (from general.name='Swift Qwen3.8 27b')
+[model_card] sidecar not found at /opt/lucebox-concurrent/server/build-hip/../../share/model_cards/swift-qwen3.8-27b.json
+[model_card] using family fallback for arch='qwen35'
+[server] effort-tier ceiling = max_ctx(65536) - hard_limit_reply_budget(0) = 65536
+
+[server] ╭─── Configuration ───────────────────────────────────╮
+[server] │  host            = 127.0.0.1
+[server] │  port            = 18217
+[server] │  model           = /code/models/swift-qwen/ukisai_Swift-Qwen3.8-27b-IQ4_XS.gguf
+[server] │  draft           = /code/models/qwen38/qwen38-dflash2-q8_0.gguf
+[server] │  model_name      = swift-qwen
+[server] │  max_ctx         = 65536
+[server] │  model_card      = family:qwen35
+[server] │  max_tokens      = 32768 (family:qwen35)
+[server] │  think_max_tokens= 64000 (from CLI)
+[server] │  hard_limit_reply= 0 (from CLI)
+[server] │  effort tiers    = low=3584 (family:qwen35)
+[server] │                    medium=14336 (family:qwen35)
+[server] │                    high=28672 (family:qwen35)
+[server] │                    x-high=64000 (from CLI)
+[server] │                    max=64000 (from CLI)
+[server] │  target_device   = auto:0
+[server] │  target_split    = layer
+[server] │  draft_device    = auto:0
+[server] │  draft_exec      = local
+[server] │  peer_access     = off
+[server] │  chunk           = 512
+[server] │  admission_wait  = 20 ms
+[server] │  fa_window       = 0
+[server] │  ddtree          = off
+[server] │  specla          = off
+[server] │  fast_rollback   = ON
+[server] │  ddtree_budget   = 22
+[server] │  prefix_cache    = 0 slots
+[server] │  agent_turn_cache= off
+[server] │  prefill_cache   = 0 slots
+[server] │  cors            = ON
+[server] │  cache_type_k    = q8_0
+[server] │  cache_type_v    = q8_0
+[server] │  pflash          = off
+[server] │  decode draft    = persistent
+[server] ╰─────────────────────────────────────────────────────╯
+
+[ppp] enabled=1 rearrange=0 lcp_window=8 min_pin=512 max_ephemeral=256
+[server] listening on http://127.0.0.1:18217
+[server] request path=/v1/chat/completions body_bytes=174
+[server] chat chatcmpl_0000000000000000 format=chat stream=false msgs=1 tools=0 prompt_tokens=16 max_tokens=16 max_ctx=65536 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=swift-qwen
+[server] chat START chatcmpl_0000000000000000 format=chat stream=false prompt_tokens=16 max_tokens=16 tools=0
+[server] chat CACHE chatcmpl_0000000000000000 restore=false slot=-1 prefix_len=0 effective_prompt=16 pflash=false disk_policy=full disk_hit=false snap_slot=-1 snap_pos=0 full_snap_slot=-1 full_snap_pos=0
+[draft-kv] ctx-KV ring active: cap=4096 kv_total=4128 a_step=34 layers=5 f16 cache 80.6 MiB
+[qwen35-spec] DFlash 2 selector active for greedy chain decode (rank=256 top_k=16)
+[spec-decode] tokens=2 time=0.126 s speed=15.82 tok/s steps=1 accepted=2/16 (12.5%) avg_commit=2.00
+[spec-decode] target_forwards=1 forwards_per_token=0.500000 forwards_per_step=1.000
+[vram] released scratch buffers; trimmed 1.6 MiB from device pools
+[server] chat DONE chatcmpl_0000000000000000 ok=true in=16 effective_in=16 out=2 1.8s 1.1 tok/s finish=stop restore=false slot=-1 prefix_len=0 prefill=1.7s decode=0.1s(15.8tok/s) error=- detail=-
+[server] request path=/v1/chat/completions body_bytes=444
+[server] max_tokens=64000 clamped to default_max_tokens=32768
+[server] reasoning.effort tier=64000 narrowed to 32768 (max_tokens=32768 - hard_limit_reply_budget=0); pass a larger max_tokens to use the full tier budget
+[server] chat chatcmpl_0000000000000001 format=chat stream=false msgs=1 tools=0 prompt_tokens=118 max_tokens=32768 max_ctx=65536 thinking=true reasoning_effort=x-high started_in_thinking=true stops=0 model=swift-qwen
+[server] chat START chatcmpl_0000000000000001 format=chat stream=false prompt_tokens=118 max_tokens=32768 tools=0
+[server] chat CACHE chatcmpl_0000000000000001 restore=false slot=-1 prefix_len=0 effective_prompt=118 pflash=false disk_policy=full disk_hit=false snap_slot=-1 snap_pos=0 full_snap_slot=-1 full_snap_pos=0
+[spec-decode] tokens=534 time=6.256 s speed=85.36 tok/s steps=90 accepted=534/1440 (37.1%) avg_commit=5.93
+[spec-decode] target_forwards=90 forwards_per_token=0.168539 forwards_per_step=1.000
+[vram] released scratch buffers; trimmed 10.4 MiB from device pools
+[server] chat DONE chatcmpl_0000000000000001 ok=true in=118 effective_in=118 out=534 6.5s 82.6 tok/s finish=stop restore=false slot=-1 prefix_len=0 prefill=0.2s decode=6.3s(85.4tok/s) error=- detail=-
+[server] request path=/v1/chat/completions body_bytes=363
+[server] max_tokens=64000 clamped to default_max_tokens=32768
+[server] reasoning.effort tier=64000 narrowed to 32768 (max_tokens=32768 - hard_limit_reply_budget=0); pass a larger max_tokens to use the full tier budget
+[server] chat chatcmpl_0000000000000002 format=chat stream=false msgs=1 tools=0 prompt_tokens=104 max_tokens=32768 max_ctx=65536 thinking=true reasoning_effort=x-high started_in_thinking=true stops=0 model=swift-qwen
+[server] chat START chatcmpl_0000000000000002 format=chat stream=false prompt_tokens=104 max_tokens=32768 tools=0
+[server] chat CACHE chatcmpl_0000000000000002 restore=false slot=-1 prefix_len=0 effective_prompt=104 pflash=false disk_policy=full disk_hit=false snap_slot=-1 snap_pos=0 full_snap_slot=-1 full_snap_pos=0
+[spec-decode] tokens=130 time=1.603 s speed=81.08 tok/s steps=24 accepted=130/384 (33.9%) avg_commit=5.42
+[spec-decode] target_forwards=24 forwards_per_token=0.184615 forwards_per_step=1.000
+[vram] released scratch buffers; trimmed 6.4 MiB from device pools
+[server] chat DONE chatcmpl_0000000000000002 ok=true in=104 effective_in=104 out=130 1.7s 74.6 tok/s finish=stop restore=false slot=-1 prefix_len=0 prefill=0.1s decode=1.6s(81.1tok/s) error=- detail=-
+[server] request path=/v1/chat/completions body_bytes=369
+[server] max_tokens=64000 clamped to default_max_tokens=32768
+[server] reasoning.effort tier=64000 narrowed to 32768 (max_tokens=32768 - hard_limit_reply_budget=0); pass a larger max_tokens to use the full tier budget
+[server] chat chatcmpl_0000000000000003 format=chat stream=false msgs=1 tools=0 prompt_tokens=125 max_tokens=32768 max_ctx=65536 thinking=true reasoning_effort=x-high started_in_thinking=true stops=0 model=swift-qwen
+[server] chat START chatcmpl_0000000000000003 format=chat stream=false prompt_tokens=125 max_tokens=32768 tools=0
+[server] chat CACHE chatcmpl_0000000000000003 restore=false slot=-1 prefix_len=0 effective_prompt=125 pflash=false disk_policy=full disk_hit=false snap_slot=-1 snap_pos=0 full_snap_slot=-1 full_snap_pos=0
+[spec-decode] tokens=287 time=3.145 s speed=91.25 tok/s steps=47 accepted=287/752 (38.2%) avg_commit=6.11
+[spec-decode] target_forwards=47 forwards_per_token=0.163763 forwards_per_step=1.000
+[vram] released scratch buffers; trimmed 7.7 MiB from device pools
+[server] chat DONE chatcmpl_0000000000000003 ok=true in=125 effective_in=125 out=287 3.3s 87.2 tok/s finish=stop restore=false slot=-1 prefix_len=0 prefill=0.1s decode=3.1s(91.2tok/s) error=- detail=-
+[server] request path=/v1/chat/completions body_bytes=381
+[server] max_tokens=64000 clamped to default_max_tokens=32768
+[server] reasoning.effort tier=64000 narrowed to 32768 (max_tokens=32768 - hard_limit_reply_budget=0); pass a larger max_tokens to use the full tier budget
+[server] chat chatcmpl_0000000000000004 format=chat stream=false msgs=1 tools=0 prompt_tokens=114 max_tokens=32768 max_ctx=65536 thinking=true reasoning_effort=x-high started_in_thinking=true stops=0 model=swift-qwen
+[server] chat START chatcmpl_0000000000000004 format=chat stream=false prompt_tokens=114 max_tokens=32768 tools=0
+[server] chat CACHE chatcmpl_0000000000000004 restore=false slot=-1 prefix_len=0 effective_prompt=114 pflash=false disk_policy=full disk_hit=false snap_slot=-1 snap_pos=0 full_snap_slot=-1 full_snap_pos=0
+[spec-decode] tokens=573 time=6.042 s speed=94.84 tok/s steps=90 accepted=573/1440 (39.8%) avg_commit=6.37
+[spec-decode] target_forwards=90 forwards_per_token=0.157068 forwards_per_step=1.000
+[vram] released scratch buffers; trimmed 10.2 MiB from device pools
+[server] chat DONE chatcmpl_0000000000000004 ok=true in=114 effective_in=114 out=573 6.2s 92.7 tok/s finish=stop restore=false slot=-1 prefix_len=0 prefill=0.1s decode=6.0s(94.8tok/s) error=- detail=-
+[server] request path=/v1/chat/completions body_bytes=472
+[server] max_tokens=64000 clamped to default_max_tokens=32768
+[server] reasoning.effort tier=64000 narrowed to 32768 (max_tokens=32768 - hard_limit_reply_budget=0); pass a larger max_tokens to use the full tier budget
+[server] chat chatcmpl_0000000000000005 format=chat stream=false msgs=1 tools=0 prompt_tokens=130 max_tokens=32768 max_ctx=65536 thinking=true reasoning_effort=x-high started_in_thinking=true stops=0 model=swift-qwen
+[server] chat START chatcmpl_0000000000000005 format=chat stream=false prompt_tokens=130 max_tokens=32768 tools=0
+[server] chat CACHE chatcmpl_0000000000000005 restore=false slot=-1 prefix_len=0 effective_prompt=130 pflash=false disk_policy=full disk_hit=false snap_slot=-1 snap_pos=0 full_snap_slot=-1 full_snap_pos=0
+[spec-decode] tokens=118 time=1.345 s speed=87.71 tok/s steps=20 accepted=118/320 (36.9%) avg_commit=5.90
+[spec-decode] target_forwards=20 forwards_per_token=0.169492 forwards_per_step=1.000
+[vram] released scratch buffers; trimmed 8.0 MiB from device pools
+[server] chat DONE chatcmpl_0000000000000005 ok=true in=130 effective_in=130 out=118 1.5s 77.3 tok/s finish=stop restore=false slot=-1 prefix_len=0 prefill=0.2s decode=1.3s(87.7tok/s) error=- detail=-
+[server] request path=/v1/chat/completions body_bytes=509
+[server] max_tokens=64000 clamped to default_max_tokens=32768
+[server] reasoning.effort tier=64000 narrowed to 32768 (max_tokens=32768 - hard_limit_reply_budget=0); pass a larger max_tokens to use the full tier budget
+[server] chat chatcmpl_0000000000000006 format=chat stream=false msgs=1 tools=1 prompt_tokens=338 max_tokens=32768 max_ctx=65536 thinking=true reasoning_effort=x-high started_in_thinking=true stops=0 model=swift-qwen
+[server] chat START chatcmpl_0000000000000006 format=chat stream=false prompt_tokens=338 max_tokens=32768 tools=1
+[server] chat CACHE chatcmpl_0000000000000006 restore=false slot=-1 prefix_len=0 effective_prompt=338 pflash=false disk_policy=full disk_hit=false snap_slot=-1 snap_pos=0 full_snap_slot=-1 full_snap_pos=0
+[spec-decode] tokens=75 time=0.883 s speed=84.93 tok/s steps=13 accepted=75/208 (36.1%) avg_commit=5.77
+[spec-decode] target_forwards=13 forwards_per_token=0.173333 forwards_per_step=1.000
+[vram] released scratch buffers; trimmed 27.6 MiB from device pools
+[server] chat DONE chatcmpl_0000000000000006 ok=true in=338 effective_in=338 out=75 1.2s 60.3 tok/s finish=tool_calls restore=false slot=-1 prefix_len=0 prefill=0.4s decode=0.9s(84.9tok/s) error=- detail=-
+[server] request path=/v1/chat/completions body_bytes=542
+[server] max_tokens=64000 clamped to default_max_tokens=32768
+[server] reasoning.effort tier=64000 narrowed to 32768 (max_tokens=32768 - hard_limit_reply_budget=0); pass a larger max_tokens to use the full tier budget
+[server] chat chatcmpl_0000000000000007 format=chat stream=false msgs=1 tools=0 prompt_tokens=177 max_tokens=32768 max_ctx=65536 thinking=true reasoning_effort=x-high started_in_thinking=true stops=0 model=swift-qwen
+[server] chat START chatcmpl_0000000000000007 format=chat stream=false prompt_tokens=177 max_tokens=32768 tools=0
+[server] chat CACHE chatcmpl_0000000000000007 restore=false slot=-1 prefix_len=0 effective_prompt=177 pflash=false disk_policy=full disk_hit=false snap_slot=-1 snap_pos=0 full_snap_slot=-1 full_snap_pos=0
+[spec-decode] tokens=770 time=8.579 s speed=89.75 tok/s steps=127 accepted=770/2032 (37.9%) avg_commit=6.06
+[spec-decode] target_forwards=127 forwards_per_token=0.164935 forwards_per_step=1.000
+[vram] released scratch buffers; trimmed 17.6 MiB from device pools
+[server] chat DONE chatcmpl_0000000000000007 ok=true in=177 effective_in=177 out=770 8.8s 87.6 tok/s finish=stop restore=false slot=-1 prefix_len=0 prefill=0.2s decode=8.6s(89.8tok/s) error=- detail=-
+[server] request path=/v1/chat/completions body_bytes=766
+[server] max_tokens=64000 clamped to default_max_tokens=32768
+[server] reasoning.effort tier=64000 narrowed to 32768 (max_tokens=32768 - hard_limit_reply_budget=0); pass a larger max_tokens to use the full tier budget
+[server] chat chatcmpl_0000000000000008 format=chat stream=false msgs=1 tools=0 prompt_tokens=187 max_tokens=32768 max_ctx=65536 thinking=true reasoning_effort=x-high started_in_thinking=true stops=0 model=swift-qwen
+[server] chat START chatcmpl_0000000000000008 format=chat stream=false prompt_tokens=187 max_tokens=32768 tools=0
+[server] chat CACHE chatcmpl_0000000000000008 restore=false slot=-1 prefix_len=0 effective_prompt=187 pflash=false disk_policy=full disk_hit=false snap_slot=-1 snap_pos=0 full_snap_slot=-1 full_snap_pos=0
+[spec-decode] tokens=1233 time=15.995 s speed=77.09 tok/s steps=235 accepted=1233/3760 (32.8%) avg_commit=5.25
+[spec-decode] target_forwards=235 forwards_per_token=0.190592 forwards_per_step=1.000
+[vram] released scratch buffers; trimmed 18.5 MiB from device pools
+[server] chat DONE chatcmpl_0000000000000008 ok=true in=187 effective_in=187 out=1233 16.2s 76.1 tok/s finish=stop restore=false slot=-1 prefix_len=0 prefill=0.2s decode=16.0s(77.1tok/s) error=- detail=-
+[loader] eos_id=248046 eos_chat_id=-1
+[target] target loaded: layers [0,64) output=1, 850 tensors on GPU 13.55 GiB, tok_embd 644 MiB CPU-only (iq4_xs)
+[draft]  loaded
+[draft]  target capture layers from drafter GGUF: 5 19 33 47 61
+[draft]  block size override: 8 -> 16 (beyond the published horizon; exact greedy verify)

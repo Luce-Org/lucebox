@@ -1,0 +1,438 @@
+[
+  {
+    "name": "arithmetic",
+    "wall_seconds": 5.583825013018213,
+    "passed": true,
+    "expected": {
+      "parts": 527
+    },
+    "response": {
+      "choices": [
+        {
+          "finish_reason": "stop",
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "{\"parts\": 527}",
+            "reasoning_content": "Let me work through this problem step by step.\n\nThe machine makes 17 parts every 6 minutes.\n\nIt runs for 3 hours 24 minutes total, but is stopped for 18 minutes during that interval.\n\nSo active time = 3 hours 24 minutes - 18 minutes = 3 hours 6 minutes = 186 minutes.\n\nBoth active intervals are multiples of 6 minutes.\n\nLet me verify: 186 / 6 = 31. Yes, 186 is a multiple of 6.\n\nThe problem says \"It starts a fresh cycle when restarted.\" This means when it restarts after the 18-minute stop, it starts a new 6-minute cycle. Since both active intervals are multiples of 6 minutes, there's no partial cycle to worry about.\n\nSo total parts = (186 / 6) * 17 = 31 * 17 = 527.\n\nLet me verify: 31 * 17 = 31 * 10 + 31 * 7 = 310 + 217 = 527.\n\nThe answer is 527.\n"
+          }
+        }
+      ],
+      "created": 1789575526,
+      "model": "swift-qwen",
+      "system_fingerprint": "b1-fa67698",
+      "object": "chat.completion",
+      "usage": {
+        "completion_tokens": 271,
+        "prompt_tokens": 76,
+        "total_tokens": 347,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "id": "chatcmpl-mCovuQWIj8PXlOPLALwvgSdK6ESNBbXo",
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 76,
+        "prompt_ms": 1647.223,
+        "prompt_per_token_ms": 21.67398684210526,
+        "prompt_per_second": 46.13825814719683,
+        "predicted_n": 271,
+        "predicted_ms": 3926.844,
+        "predicted_per_token_ms": 14.543866666666666,
+        "predicted_per_second": 68.75750602774137,
+        "draft_n": 225,
+        "draft_n_accepted": 198
+      }
+    },
+    "request": {
+      "model": "swift-qwen",
+      "messages": [
+        {
+          "role": "user",
+          "content": "A machine makes 17 parts every 6 minutes. It runs for 3 hours 24 minutes, but is stopped for 18 minutes during that interval. It starts a fresh cycle when restarted. Both active intervals are multiples of 6 minutes. How many parts? Return JSON only: {\"parts\": integer}."
+        }
+      ],
+      "max_tokens": 2048,
+      "temperature": 0,
+      "reasoning_effort": "medium",
+      "seed": 42
+    }
+  },
+  {
+    "name": "constraints",
+    "wall_seconds": 3.7731580699328333,
+    "passed": true,
+    "expected": {
+      "order": [
+        "B",
+        "D",
+        "A",
+        "C"
+      ]
+    },
+    "response": {
+      "choices": [
+        {
+          "finish_reason": "stop",
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "{\"order\":[\"B\",\"D\",\"A\",\"C\"]}",
+            "reasoning_content": "Let me work through this scheduling problem.\n\nTasks: A, B, C, D - each one hour, on one machine starting at hour 0.\n\nConstraints:\n- A must precede C (A before C)\n- B must precede D (B before D)\n- D must precede A (D before A)\n\nSo the ordering constraints are:\n- A < C\n- B < D\n- D < A\n\nFrom these: B < D < A < C\n\nSo the unique order is: B, D, A, C\n\nLet me verify:\n- A precedes C: A is at position 3, C is at position 4. \u2713\n- B precedes D: B is at position 1, D is at position 2. \u2713\n- D precedes A: D is at position 2, A is at position 3. \u2713\n\nThis is the unique order.\n"
+          }
+        }
+      ],
+      "created": 1789575530,
+      "model": "swift-qwen",
+      "system_fingerprint": "b1-fa67698",
+      "object": "chat.completion",
+      "usage": {
+        "completion_tokens": 211,
+        "prompt_tokens": 62,
+        "total_tokens": 273,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "id": "chatcmpl-bmCfZSA1PActIATwgiQLlg2bN0gsA2WG",
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 62,
+        "prompt_ms": 263.101,
+        "prompt_per_token_ms": 4.243564516129032,
+        "prompt_per_second": 235.65094773490029,
+        "predicted_n": 211,
+        "predicted_ms": 3363.024,
+        "predicted_per_token_ms": 16.0144,
+        "predicted_per_second": 62.44380057947847,
+        "draft_n": 183,
+        "draft_n_accepted": 152
+      }
+    },
+    "request": {
+      "model": "swift-qwen",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Schedule tasks A,B,C,D, each one hour, on one machine starting at hour 0. A must precede C, B must precede D, and D must precede A. Return JSON only with the unique order: {\"order\":[...]}."
+        }
+      ],
+      "max_tokens": 2048,
+      "temperature": 0,
+      "reasoning_effort": "medium",
+      "seed": 42
+    }
+  },
+  {
+    "name": "code_aliasing",
+    "wall_seconds": 5.531071764067747,
+    "passed": false,
+    "expected": {
+      "result": [
+        [
+          9,
+          1
+        ],
+        [
+          2
+        ],
+        [
+          9,
+          1
+        ]
+      ]
+    },
+    "response": {
+      "choices": [
+        {
+          "finish_reason": "stop",
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "{\"result\": \"[[9, 1], [2], [9, 1]]\"}",
+            "reasoning_content": "Let me trace through this Python code step by step.\n\n1. `a = [[0]] * 3`\n   This creates a list with 3 references to the SAME list `[0]`.\n   So `a = [[0], [0], [0]]` but all three elements point to the same object in memory.\n\n2. `a[0].append(1)`\n   This appends 1 to the list that a[0] points to. Since all three elements point to the same list, this modifies ALL of them.\n   Now `a = [[0, 1], [0, 1], [0, 1]]` (all three are the same list object)\n\n3. `a[1] = [2]`\n   This reassigns a[1] to a NEW list `[2]`. Now a[1] no longer points to the shared list.\n   Now `a = [[0, 1], [2], [0, 1]]` (a[0] and a[2] still point to the same list)\n\n4. `a[2][0] = 9`\n   This modifies the first element of the list that a[2] points to. Since a[0] and a[2] point to the same list, this also affects a[0].\n   Now `a = [[9, 1], [2], [9, 1]]`\n\n5. `print(a)` outputs: `[[9, 1], [2], [9, 1]]`\n"
+          }
+        }
+      ],
+      "created": 1789575535,
+      "model": "swift-qwen",
+      "system_fingerprint": "b1-fa67698",
+      "object": "chat.completion",
+      "usage": {
+        "completion_tokens": 360,
+        "prompt_tokens": 66,
+        "total_tokens": 426,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "id": "chatcmpl-vl8jBViX6D440Prgj4QZeHMjoeerNDnM",
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 66,
+        "prompt_ms": 269.701,
+        "prompt_per_token_ms": 4.086378787878788,
+        "prompt_per_second": 244.71544413999203,
+        "predicted_n": 360,
+        "predicted_ms": 5119.714,
+        "predicted_per_token_ms": 14.261041782729805,
+        "predicted_per_second": 70.12110442106727,
+        "draft_n": 291,
+        "draft_n_accepted": 264
+      }
+    },
+    "request": {
+      "model": "swift-qwen",
+      "messages": [
+        {
+          "role": "user",
+          "content": "What does Python print?\na = [[0]] * 3\na[0].append(1)\na[1] = [2]\na[2][0] = 9\nprint(a)\nReturn JSON only: {\"result\": value}."
+        }
+      ],
+      "max_tokens": 2048,
+      "temperature": 0,
+      "reasoning_effort": "medium",
+      "seed": 42
+    }
+  },
+  {
+    "name": "code_intervals",
+    "wall_seconds": 8.921326423063874,
+    "passed": true,
+    "expected": {
+      "intervals": [
+        [
+          1,
+          6
+        ],
+        [
+          7,
+          7
+        ],
+        [
+          8,
+          11
+        ],
+        [
+          12,
+          12
+        ]
+      ]
+    },
+    "response": {
+      "choices": [
+        {
+          "finish_reason": "stop",
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "{\"intervals\":[[1,6],[7,7],[8,11],[12,12]]}",
+            "reasoning_content": "Let me work through this step by step.\n\nThe intervals are: [[8,10],[1,3],[3,6],[7,7],[12,12],[10,11]]\n\nFirst, let me sort them by start point:\n[1,3], [3,6], [7,7], [8,10], [10,11], [12,12]\n\nNow, merge overlapping intervals (NOT adjacent - so [1,3] and [3,6] DO overlap because they share the point 3, since these are CLOSED intervals).\n\nWait, let me reconsider. The problem says \"merges CLOSED integer intervals when they overlap, but NOT merely when adjacent.\"\n\nFor closed integer intervals, [1,3] and [3,6] share the point 3, so they overlap. They should be merged.\n\nWhat about [7,7] and [8,10]? These are adjacent (7 and 8 are consecutive integers) but do NOT overlap. So they should NOT be merged.\n\nWhat about [8,10] and [10,11]? They share the point 10, so they overlap. They should be merged.\n\nWhat about [10,11] and [12,12]? These are adjacent (11 and 12 are consecutive) but do NOT overlap. So they should NOT be merged.\n\nLet me go through the sorted list:\n1. [1,3] - start\n2. [3,6] - overlaps with [1,3] (share point 3) \u2192 merge to [1,6]\n3. [7,7] - does NOT overlap with [1,6] (6 and 7 are adjacent, not overlapping) \u2192 new interval [7,7]\n4. [8,10] - does NOT overlap with [7,7] (7 and 8 are adjacent, not overlapping) \u2192 new interval [8,10]\n5. [10,11] - overlaps with [8,10] (share point 10) \u2192 merge to [8,11]\n6. [12,12] - does NOT overlap with [8,11] (11 and 12 are adjacent, not overlapping) \u2192 new interval [12,12]\n\nFinal result: [[1,6],[7,7],[8,11],[12,12]]\n\nLet me format as JSON: {\"intervals\":[[1,6],[7,7],[8,11],[12,12]]}\n"
+          }
+        }
+      ],
+      "created": 1789575544,
+      "model": "swift-qwen",
+      "system_fingerprint": "b1-fa67698",
+      "object": "chat.completion",
+      "usage": {
+        "completion_tokens": 592,
+        "prompt_tokens": 72,
+        "total_tokens": 664,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "id": "chatcmpl-FiCSuUTLiKROY1bxg7hNDWJOPpbEwt9j",
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 72,
+        "prompt_ms": 286.932,
+        "prompt_per_token_ms": 3.9851666666666667,
+        "prompt_per_second": 250.93053406381998,
+        "predicted_n": 592,
+        "predicted_ms": 8487.183,
+        "predicted_per_token_ms": 14.36071573604061,
+        "predicted_per_second": 69.6344122661194,
+        "draft_n": 495,
+        "draft_n_accepted": 428
+      }
+    },
+    "request": {
+      "model": "swift-qwen",
+      "messages": [
+        {
+          "role": "user",
+          "content": "A function merges CLOSED integer intervals when they overlap, but NOT merely when adjacent. Given [[8,10],[1,3],[3,6],[7,7],[12,12],[10,11]], return the sorted merged list as JSON only: {\"intervals\":[...]}."
+        }
+      ],
+      "max_tokens": 2048,
+      "temperature": 0,
+      "reasoning_effort": "medium",
+      "seed": 42
+    }
+  },
+  {
+    "name": "extraction",
+    "wall_seconds": 4.554876019014046,
+    "passed": true,
+    "expected": {
+      "ids": [
+        "c",
+        "a"
+      ]
+    },
+    "response": {
+      "choices": [
+        {
+          "finish_reason": "stop",
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "{\"ids\":[\"c\",\"a\"]}",
+            "reasoning_content": "Let me work through this step by step.\n\nData: [{\"id\":\"a\",\"active\":true,\"score\":7},{\"id\":\"b\",\"active\":false,\"score\":99},{\"id\":\"c\",\"active\":true,\"score\":7},{\"id\":\"d\",\"active\":true,\"score\":4}]\n\nStep 1: Select active items (active === true)\n- a: active=true, score=7\n- b: active=false \u2192 excluded\n- c: active=true, score=7\n- d: active=true, score=4\n\nActive items: a(7), c(7), d(4)\n\nStep 2: Sort by score descending, then id descending\n- a: score 7, id \"a\"\n- c: score 7, id \"c\"\n- d: score 4, id \"d\"\n\nScore descending: a(7), c(7), d(4)\nFor ties (a and c both score 7), sort by id descending: \"c\" > \"a\", so c comes before a.\n\nSorted: c(7), a(7), d(4)\n\nStep 3: Take first two\n- c, a\n\nResult: {\"ids\":[\"c\",\"a\"]}\n"
+          }
+        }
+      ],
+      "created": 1789575549,
+      "model": "swift-qwen",
+      "system_fingerprint": "b1-fa67698",
+      "object": "chat.completion",
+      "usage": {
+        "completion_tokens": 273,
+        "prompt_tokens": 88,
+        "total_tokens": 361,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "id": "chatcmpl-1I3glzQkzXujt2jqVUt2Ia1IUHnVnCPC",
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 88,
+        "prompt_ms": 310.97,
+        "prompt_per_token_ms": 3.5337500000000004,
+        "prompt_per_second": 282.98549699327907,
+        "predicted_n": 273,
+        "predicted_ms": 4095.535,
+        "predicted_per_token_ms": 15.057113970588235,
+        "predicted_per_second": 66.41378965141307,
+        "draft_n": 228,
+        "draft_n_accepted": 196
+      }
+    },
+    "request": {
+      "model": "swift-qwen",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Data: [{\"id\":\"a\",\"active\":true,\"score\":7},{\"id\":\"b\",\"active\":false,\"score\":99},{\"id\":\"c\",\"active\":true,\"score\":7},{\"id\":\"d\",\"active\":true,\"score\":4}]. Select active items, sort by score descending then id descending, take first two. Return JSON only: {\"ids\":[...]}."
+        }
+      ],
+      "max_tokens": 2048,
+      "temperature": 0,
+      "reasoning_effort": "medium",
+      "seed": 42
+    }
+  },
+  {
+    "name": "tool_call",
+    "wall_seconds": 1.8463703750167042,
+    "passed": true,
+    "expected": {
+      "city": "Toronto",
+      "unit": "celsius"
+    },
+    "response": {
+      "choices": [
+        {
+          "finish_reason": "tool_calls",
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "The user wants me to look up the weather for Toronto in Celsius using the lookup_weather function.\n",
+            "tool_calls": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "lookup_weather",
+                  "arguments": "{\"city\":\"Toronto\",\"unit\":\"celsius\"}"
+                },
+                "id": "WfqG1lF54XAwUr7YbGKTNYMnwm4AZA0T"
+              }
+            ]
+          }
+        }
+      ],
+      "created": 1789575550,
+      "model": "swift-qwen",
+      "system_fingerprint": "b1-fa67698",
+      "object": "chat.completion",
+      "usage": {
+        "completion_tokens": 62,
+        "prompt_tokens": 300,
+        "total_tokens": 362,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "id": "chatcmpl-0nGYrR0eXAQu8up43tipSYsE3rY8l9lM",
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 300,
+        "prompt_ms": 657.364,
+        "prompt_per_token_ms": 2.1912133333333332,
+        "prompt_per_second": 456.3681613231026,
+        "predicted_n": 62,
+        "predicted_ms": 1037.066,
+        "predicted_per_token_ms": 17.001081967213114,
+        "predicted_per_second": 58.819785818838916,
+        "draft_n": 48,
+        "draft_n_accepted": 45
+      }
+    },
+    "request": {
+      "model": "swift-qwen",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Use lookup_weather to check Toronto in Celsius."
+        }
+      ],
+      "max_tokens": 2048,
+      "temperature": 0,
+      "reasoning_effort": "medium",
+      "seed": 42,
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "lookup_weather",
+            "description": "Look up weather for a city",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                },
+                "unit": {
+                  "type": "string",
+                  "enum": [
+                    "celsius",
+                    "fahrenheit"
+                  ]
+                }
+              },
+              "required": [
+                "city",
+                "unit"
+              ]
+            }
+          }
+        }
+      ]
+    }
+  }
+]

@@ -1,0 +1,20 @@
+{
+  "base-plain": {
+    "tokens": 1991,
+    "decode_tps": 30.59387396012329,
+    "wall_seconds": 67.41446618793998,
+    "strict_passes": 6
+  },
+  "swift-plain": {
+    "tokens": 1675,
+    "decode_tps": 31.818981566912544,
+    "wall_seconds": 56.44066715496592,
+    "strict_passes": 5
+  },
+  "swift-mtp": {
+    "tokens": 1769,
+    "decode_tps": 67.96170141062981,
+    "wall_seconds": 30.210627664113417,
+    "strict_passes": 5
+  }
+}
