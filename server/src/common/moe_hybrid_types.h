@@ -21,6 +21,12 @@ int query_gpu_compute_sm();
 enum class MoeHybridColdBackend {
     Cpu,
     Gpu,
+    // No cold owner: non-resident routes contribute zero and are never
+    // materialized; the reduction across owners happens outside this process
+    // (cluster all-reduce, see server/src/cluster/). Storage allocates no cold
+    // buffers, evaluators build no cold graph, never fall back to CPU or
+    // streamed evaluation for non-resident routes and never swap experts.
+    None,
 };
 
 // ─── MoE architecture config (model-agnostic) ──────────────────────────
