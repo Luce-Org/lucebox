@@ -33,7 +33,7 @@ profile and the requirements checked at startup.
 | `LUCE_QWEN35_MASK_FULL_WIDTH` | unset | KILL SWITCH (burn-in): =1 restores the full max_ctx-wide causal-mask upload on the Qwen3.5/3.6/3.8 prefill and verify paths. By default only the columns flash attention reads (the live window rounded up to 256, plus one 256 stride) are built and copied. |
 | `LUCE_PREFILL_UBATCH` | backend-dependent (512 in `qwen35_backend.cpp`; 16/384 in `layer_split_daemon.cpp`; `cfg_.chunk` in `qwen35_layer_split_adapter.cpp`) | Prefill ubatch. Under pooled kvflash prefill it is rounded down to a multiple of the pager chunk (never below one chunk) and clamped to the pool, instead of being forced to one chunk per ubatch. |
 | `LUCE_FEAT_RING_CAP` | unset (= drafter trained window, 40960) | Memory valve for the drafter feature window. Lowers the drafter's feature ring, mirror and layer-split mirror together; the value is additionally clamped by `--max-ctx`. Below the trained window the drafter only sees a shallow suffix, which collapses spec-decode accept once the committed prefix exceeds it. |
-| `LUCE_FEATURE_DTYPE` | q4_0 | Feature-mirror storage type (accept-neutral quantised default; `f32` restores the lossless zero-copy view at ~10x the memory). |
+| `LUCE_FEATURE_DTYPE` | f32 | Feature-mirror storage type. `q4_0` makes the deep (~40K) ring ~8x smaller but quantises the drafter's feature inputs and is only safe once the IPC draft ring is type-aware. |
 | `LUCE_DRAFT_KV` | 1 | KILL SWITCH (remove after burn-in): =0 restores the legacy per-step drafter window recompute instead of the ring cache. |
 | `LUCE_LAGUNA_SWA_RING` | 1 | KILL SWITCH (remove after burn-in): =0 keeps SWA layers on pool-sized caches under KVFlash. |
 | `LUCE_PROF` | unset | DEBUG: comma list of profilers (step,verify,prefill). Replaces LUCE_LAGUNA_{STEP,VERIFY,PREFILL}_PROF. |
@@ -256,6 +256,7 @@ profile and the requirements checked at startup.
 - `LUCE_EXPERT_BUDGET_MB` - deepseek4_backend.cpp, laguna_backend.cpp, qwen35moe_backend.cpp
 - `LUCE_EXPERT_BUDGET_PCT` - laguna_backend.cpp
 - `LUCE_FAST_ROLLBACK_THRESHOLD` - chain_rollback_policy.h
+- `LUCE_FEAT_RING_CAP` - dflash_feature_ring.h
 - `LUCE_FEATURE_DTYPE` - dflash_feature_ring.cpp
 - `LUCE_KV_ROTATE` - qwen35_target_graph.cpp (set to 1 to force FWHT K rotation on; off by default for f16/q8_0 caches, on for narrower types)
 - `LUCE_FP_ALPHA` - http_server.cpp, qwen3_graph.cpp, server_main.cpp
