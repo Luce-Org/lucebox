@@ -528,15 +528,30 @@ bool copy_host_capture_slice_to_draft_ring(
     const int hidden = feature_ring.hidden_size;
     const size_t expected = (size_t)n_tokens * (size_t)hidden;
     if (host_elems != expected) return false;
+    // The ring may store a quantised row (q4_0/q8_0/...), whose byte width is
+    // not 4*hidden. Convert each F32 host row to the ring's storage type and
+    // offset by the real row size, or we write past the row into neighbouring
+    // slots (and past the tensor for the last slot).
+    const size_t row_bytes = ggml_row_size(feature_ring.storage_type, hidden);
+    if (row_bytes == 0) return false;
     const size_t dst_stride = feature_ring.target_feat->nb[1];
-    const size_t row_bytes = (size_t)hidden * sizeof(float);
+    const size_t layer_off = (size_t)capture_idx * row_bytes;
+    std::vector<uint8_t> row(row_bytes);
     for (int i = 0; i < n_tokens; ++i) {
         const int slot = (start_pos + i) % feature_ring.cap;
         const float * src = host + (size_t)i * (size_t)hidden;
-        const size_t dst_offset =
-            (size_t)slot * dst_stride +
-            (size_t)capture_idx * (size_t)hidden * sizeof(float);
-        ggml_backend_tensor_set(feature_ring.target_feat, src, dst_offset, row_bytes);
+        const void * out = src;
+        size_t out_bytes = (size_t)hidden * sizeof(float);
+        if (feature_ring.storage_type != GGML_TYPE_F32) {
+            if (!host_f32_to_feature_row(feature_ring.storage_type, src,
+                                         row.data(), (size_t)hidden)) {
+                return false;
+            }
+            out = row.data();
+            out_bytes = row_bytes;
+        }
+        ggml_backend_tensor_set(feature_ring.target_feat, out,
+                                (size_t)slot * dst_stride + layer_off, out_bytes);
     }
     return true;
 }
