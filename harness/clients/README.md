@@ -50,6 +50,67 @@ MAX_CTX=32768 MAX_TOKENS=512 \
 harness/clients/run_codex.sh
 ```
 
+## GPU selection
+
+All launchers inherit `CUDA_VISIBLE_DEVICES` and `HIP_VISIBLE_DEVICES`. Native
+Lucebox runs also accept `TARGET_DEVICE` and `DRAFT_DEVICE`; when the latter is
+omitted it follows `TARGET_DEVICE`. Device numbers use the runtime-visible
+namespace, so exposing one physical GPU makes it device zero inside the server:
+
+```bash
+# NVIDIA GPU 0 with a CUDA build.
+CUDA_VISIBLE_DEVICES=0 \
+DFLASH_SERVER_BIN=server/build-cuda/dflash_server \
+TARGET_DEVICE=cuda:0 \
+harness/clients/run_codex.sh
+
+# Physical HIP GPU 1, exposed as hip:0 to a HIP build.
+HIP_VISIBLE_DEVICES=1 \
+DFLASH_SERVER_BIN=server/build-hip/dflash_server \
+TARGET_DEVICE=hip:0 \
+harness/clients/run_codex.sh
+```
+
+CUDA and HIP servers are separate build artifacts. A host with Strix Halo
+(`gfx1151`) and an R9700 (`gfx1201`) can use one dual-architecture HIP build:
+
+```bash
+cmake -S server -B server/build-hip \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DDFLASH27B_GPU_BACKEND=hip \
+  -DDFLASH27B_HIP_ARCHITECTURES='gfx1151;gfx1201' \
+  -DDFLASH27B_HIP_SM80_EQUIV=ON
+cmake --build server/build-hip --target dflash_server -j"$(nproc)"
+```
+
+Select a server binary and matching visibility variable together. The launcher
+prints resolved placement before startup and uses `nvidia-smi` or `rocm-smi`
+for the matching backend in its final report.
+
+## Interactive terminal clients
+
+The default launcher behavior remains a deterministic one-shot compatibility
+test. Set `HARNESS_INTERACTIVE=1` to attach the real client TUI to the terminal
+while the launcher manages the Lucebox server:
+
+```bash
+HARNESS_INTERACTIVE=1 harness/clients/run_claude_code.sh
+HARNESS_INTERACTIVE=1 harness/clients/run_codex.sh
+HARNESS_INTERACTIVE=1 harness/clients/run_opencode.sh
+HARNESS_INTERACTIVE=1 harness/clients/run_hermes.sh
+HARNESS_INTERACTIVE=1 harness/clients/run_pi.sh
+HARNESS_INTERACTIVE=1 harness/clients/run_openclaw.sh
+```
+
+`INTERACTIVE_PROMPT` supplies an optional first message where the client
+supports it. Interactive client state and sessions persist under
+`.harness-work/interactive/<client>`. Exit the client or press Ctrl+C to stop
+the launcher-managed server. One-shot client timeouts do not apply to a TUI.
+Set `HARNESS_PROGRESS=0` to suppress launcher progress and heartbeat messages.
+
+Open WebUI is already interactive through its browser UI; its harness scripts
+remain deterministic HTTP probes.
+
 The C++ server is expected to handle the same client protocol shapes covered by
 these launchers and probes: OpenAI Chat Completions, streaming chunks, tool
 metadata, OpenAI Responses for Codex, Anthropic Messages for Claude Code, and
@@ -128,5 +189,6 @@ Responses requests can be compared too.
 - `common.sh` contains the shared server startup logic.
 - `run_openwebui_tools.sh` supports `OPENWEBUI_FUNCTION_CALLING=default` and
   `OPENWEBUI_FUNCTION_CALLING=native`.
-- Every launcher redirects stdin from `/dev/null`; this prevents SSH input from
-  being accidentally treated as a user prompt by interactive clients.
+- One-shot launchers redirect stdin from `/dev/null`; this prevents SSH input
+  from being accidentally treated as a user prompt. `HARNESS_INTERACTIVE=1`
+  deliberately keeps the selected terminal client attached to the TTY.

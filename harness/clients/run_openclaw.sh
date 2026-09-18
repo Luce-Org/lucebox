@@ -13,7 +13,7 @@ source "$SCRIPT_DIR/common.sh"
 CLIENT_OUT="$LOG_DIR/openclaw.out"
 OPENCLAW_BIN="${OPENCLAW_BIN:-$CLIENT_WORK_DIR/clients/openclaw/npm/bin/openclaw}"
 require_client_binary "OpenClaw" "$OPENCLAW_BIN" "openclaw" "OPENCLAW_BIN"
-HOME_DIR="$LOG_DIR/openclaw-home"
+HOME_DIR="$(client_home openclaw)"
 CONFIG_PATCH="$LOG_DIR/openclaw.patch.json"
 PROVIDER_API="${PROVIDER_API:-openai-completions}"
 OPENCLAW_AGENT_ARGS="${OPENCLAW_AGENT_ARGS:-}"
@@ -91,29 +91,36 @@ start_lucebox_server
 trap stop_lucebox_server EXIT
 wait_lucebox_server
 
-openclaw_cmd=(
-  "$OPENCLAW_BIN" agent
-  --local
-  --json
-  --model "lucebox/$MODEL_ID"
-  --session-id "lucebox-client-harness"
-)
-if [[ "$OPENCLAW_TIMEOUT" != "0" ]]; then
-  openclaw_cmd+=(--timeout "$OPENCLAW_TIMEOUT")
-fi
-if [[ -n "$OPENCLAW_AGENT_ARGS" ]]; then
-  read -r -a agent_args <<< "$OPENCLAW_AGENT_ARGS"
-  openclaw_cmd+=("${agent_args[@]}")
-fi
-openclaw_cmd+=(--message "$PROMPT")
-
 set +e
-run_with_timeout "$OPENCLAW_TIMEOUT" env \
-  HOME="$HOME_DIR" \
-  OPENAI_API_KEY="$API_KEY" \
-  "${openclaw_cmd[@]}" \
-  < /dev/null > "$CLIENT_OUT" 2>&1
-RC=$?
+if [[ "$HARNESS_INTERACTIVE" == "1" ]]; then
+  openclaw_cmd=("$OPENCLAW_BIN" tui --local --session lucebox-client-harness)
+  if [[ -n "$INTERACTIVE_PROMPT" ]]; then openclaw_cmd+=(--message "$INTERACTIVE_PROMPT"); fi
+  run_interactive_client "OpenClaw" "$CLIENT_OUT" env \
+    HOME="$HOME_DIR" OPENAI_API_KEY="$API_KEY" "${openclaw_cmd[@]}"
+  RC=$?
+else
+  openclaw_cmd=(
+    "$OPENCLAW_BIN" agent
+    --local
+    --json
+    --model "lucebox/$MODEL_ID"
+    --session-id "lucebox-client-harness"
+  )
+  if [[ "$OPENCLAW_TIMEOUT" != "0" ]]; then
+    openclaw_cmd+=(--timeout "$OPENCLAW_TIMEOUT")
+  fi
+  if [[ -n "$OPENCLAW_AGENT_ARGS" ]]; then
+    read -r -a agent_args <<< "$OPENCLAW_AGENT_ARGS"
+    openclaw_cmd+=("${agent_args[@]}")
+  fi
+  openclaw_cmd+=(--message "$PROMPT")
+  run_with_timeout "$OPENCLAW_TIMEOUT" env \
+    HOME="$HOME_DIR" \
+    OPENAI_API_KEY="$API_KEY" \
+    "${openclaw_cmd[@]}" \
+    < /dev/null > "$CLIENT_OUT" 2>&1
+  RC=$?
+fi
 set -e
 
 finish_report "$CLIENT_OUT" "$RC"
