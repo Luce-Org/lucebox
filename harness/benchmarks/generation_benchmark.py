@@ -9,11 +9,13 @@ a llama.cpp baseline, and how fast is it on the same prompts?".
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import datetime as dt
 import json
 import re
 import statistics
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -59,10 +61,10 @@ def approx_token_count(text: str) -> int:
 def _extract_numeric_answer(text: str) -> str | None:
     """Extract a numeric answer from model output for GSM-style problems."""
     think_end = text.rfind("</think>")
-    answer_text = text[think_end + len("</think>"):] if think_end >= 0 else text
+    answer_text = text[think_end + len("</think>") :] if think_end >= 0 else text
 
     # #### <number>
-    m = re.search(r'####\s*([+-]?\d[\d,]*\.?\d*)', answer_text)
+    m = re.search(r"####\s*([+-]?\d[\d,]*\.?\d*)", answer_text)
     if m:
         return m.group(1).replace(",", "")
 
@@ -70,23 +72,25 @@ def _extract_numeric_answer(text: str) -> str | None:
     boxed = _extract_boxed(answer_text)
     if boxed:
         cleaned = boxed.replace(",", "").strip()
-        if re.match(r'^[+-]?\d+\.?\d*$', cleaned):
+        if re.match(r"^[+-]?\d+\.?\d*$", cleaned):
             return cleaned
 
     # "the answer is <number>"
     m = re.search(
-        r'(?:answer\s+is|result\s+is|equals?|there\s+are|we\s+get)\s*\$?\s*\\?(?:boxed\{)?([+-]?\d[\d,]*\.?\d*)',
-        answer_text, re.IGNORECASE)
+        r"(?:answer\s+is|result\s+is|equals?|there\s+are|we\s+get)\s*\$?\s*\\?(?:boxed\{)?([+-]?\d[\d,]*\.?\d*)",
+        answer_text,
+        re.IGNORECASE,
+    )
     if m:
         return m.group(1).replace(",", "")
 
     # **<number>**
-    m = re.search(r'\*\*([+-]?\d[\d,]*\.?\d*)\*\*', answer_text)
+    m = re.search(r"\*\*([+-]?\d[\d,]*\.?\d*)\*\*", answer_text)
     if m:
         return m.group(1).replace(",", "")
 
     # Last standalone number
-    nums = re.findall(r'(?<![.\d])([+-]?\d[\d,]*\.?\d*)(?![.\d])', answer_text)
+    nums = re.findall(r"(?<![.\d])([+-]?\d[\d,]*\.?\d*)(?![.\d])", answer_text)
     if nums:
         return nums[-1].replace(",", "")
 
@@ -104,7 +108,7 @@ def score_gold_answer(case: dict[str, Any], text: str) -> tuple[bool | None, str
 
     suite = case.get("suite", "")
     think_end = text.rfind("</think>")
-    answer_text = text[think_end + len("</think>"):] if think_end >= 0 else text
+    answer_text = text[think_end + len("</think>") :] if think_end >= 0 else text
 
     if suite == "gsm":
         pred = _extract_numeric_answer(text)
@@ -123,8 +127,8 @@ def score_gold_answer(case: dict[str, Any], text: str) -> tuple[bool | None, str
         if not pred:
             # Fallback: bold pattern
             m = re.search(
-                r'(?:answer\s+is|result\s+is|equals?)\s*\*\*(.+?)\*\*',
-                answer_text, re.IGNORECASE)
+                r"(?:answer\s+is|result\s+is|equals?)\s*\*\*(.+?)\*\*", answer_text, re.IGNORECASE
+            )
             if m:
                 pred = m.group(1).strip().rstrip(".")
         if not pred:
@@ -135,6 +139,23 @@ def score_gold_answer(case: dict[str, Any], text: str) -> tuple[bool | None, str
 
 def expected_pass(case: dict[str, Any], text: str) -> tuple[bool, list[str]]:
     failures: list[str] = []
+    expected_exact = case.get("expect_exact")
+    if expected_exact is not None:
+        if not isinstance(expected_exact, str):
+            raise ValueError("expect_exact must be a string")
+        if normalize_text(text) != normalize_text(expected_exact):
+            failures.append(f"normalized output differs from {expected_exact!r}")
+    expected_json = case.get("expect_json")
+    if expected_json is not None:
+        if not isinstance(expected_json, dict):
+            raise ValueError("expect_json must be an object")
+        try:
+            actual_json = json.loads(text)
+        except json.JSONDecodeError:
+            failures.append("output is not valid JSON")
+        else:
+            if actual_json != expected_json:
+                failures.append(f"JSON output differs from {expected_json!r}")
     for needle in case.get("expect_contains", []):
         if needle not in text:
             failures.append(f"missing {needle!r}")
@@ -200,19 +221,39 @@ def run_case(
     temperature: float,
     timeout: float,
     repeats: int,
+    warmups: int = 0,
+    concurrency: int = 1,
 ) -> dict[str, Any]:
-    runs: list[dict[str, Any]] = []
-    for _ in range(repeats):
+    def execute_request() -> dict[str, Any]:
         start = time.perf_counter()
-        response = post_chat(
-            base_url=base_url,
-            api_key=api_key,
-            model=model,
-            messages=messages_for_case(case),
-            max_tokens=max_tokens,
-            temperature=temperature,
-            timeout=timeout,
-        )
+        try:
+            response = post_chat(
+                base_url=base_url,
+                api_key=api_key,
+                model=model,
+                messages=messages_for_case(case),
+                max_tokens=max_tokens,
+                temperature=temperature,
+                timeout=timeout,
+            )
+        except Exception as error:
+            elapsed = time.perf_counter() - start
+            detail = f"{type(error).__name__}: {error}"
+            return {
+                "elapsed_s": elapsed,
+                "completion_tokens": 0,
+                "prompt_tokens": None,
+                "tok_s": 0.0,
+                "token_count_source": "unavailable",
+                "expected_pass": False,
+                "expected_failures": [detail],
+                "gold_correct": False if case.get("gold_answer") is not None else None,
+                "gold_detail": detail,
+                "text": "",
+                "usage": {},
+                "error": detail,
+            }
+
         elapsed = time.perf_counter() - start
         text = extract_text(response)
         usage = response.get("usage") or {}
@@ -221,41 +262,111 @@ def run_case(
         if not isinstance(completion_tokens, int) or completion_tokens <= 0:
             completion_tokens = approx_token_count(text)
             token_source = "approx_words"
-        prompt_tokens = usage.get("prompt_tokens")
         pass_expected, failures = expected_pass(case, text)
         gold_correct, gold_detail = score_gold_answer(case, text)
-        runs.append(
-            {
-                "elapsed_s": elapsed,
-                "completion_tokens": completion_tokens,
-                "prompt_tokens": prompt_tokens,
-                "tok_s": completion_tokens / elapsed if elapsed > 0 else 0.0,
-                "token_count_source": token_source,
-                "expected_pass": pass_expected,
-                "expected_failures": failures,
-                "gold_correct": gold_correct,
-                "gold_detail": gold_detail,
-                "text": text,
-                "usage": usage,
-            }
-        )
+        return {
+            "elapsed_s": elapsed,
+            "completion_tokens": completion_tokens,
+            "prompt_tokens": usage.get("prompt_tokens"),
+            "tok_s": completion_tokens / elapsed if elapsed > 0 else 0.0,
+            "token_count_source": token_source,
+            "expected_pass": pass_expected,
+            "expected_failures": failures,
+            "gold_correct": gold_correct,
+            "gold_detail": gold_detail,
+            "text": text,
+            "usage": usage,
+        }
 
-    tok_s_values = [r["tok_s"] for r in runs]
-    elapsed_values = [r["elapsed_s"] for r in runs]
-    gold_results = [r["gold_correct"] for r in runs if r["gold_correct"] is not None]
+    def execute_batch() -> dict[str, Any]:
+        if concurrency == 1:
+            requests = [execute_request()]
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
+                ready = threading.Barrier(concurrency + 1)
+
+                def synchronized_request() -> dict[str, Any]:
+                    ready.wait()
+                    return execute_request()
+
+                futures = [executor.submit(synchronized_request) for _ in range(concurrency)]
+                ready.wait()
+                requests = [future.result() for future in futures]
+
+        elapsed = max(request["elapsed_s"] for request in requests)
+        completion_tokens = sum(request["completion_tokens"] for request in requests)
+        prompt_values = [request["prompt_tokens"] for request in requests]
+        gold_results = [
+            request["gold_correct"] for request in requests if request["gold_correct"] is not None
+        ]
+        failures = sorted(
+            {failure for request in requests for failure in request["expected_failures"]}
+        )
+        token_sources = {request["token_count_source"] for request in requests}
+        gold_details = [
+            request["gold_detail"]
+            for request in requests
+            if request["gold_correct"] is False and request["gold_detail"]
+        ]
+        return {
+            "elapsed_s": elapsed,
+            "completion_tokens": completion_tokens,
+            "prompt_tokens": (
+                sum(prompt_values)
+                if all(isinstance(value, int) for value in prompt_values)
+                else None
+            ),
+            "tok_s": completion_tokens / elapsed if elapsed > 0 else 0.0,
+            "token_count_source": (
+                next(iter(token_sources)) if len(token_sources) == 1 else "mixed"
+            ),
+            "request_count": concurrency,
+            "expected_pass": all(request["expected_pass"] for request in requests),
+            "expected_failures": failures,
+            "gold_correct": all(gold_results) if gold_results else None,
+            "gold_detail": "; ".join(gold_details) or requests[-1]["gold_detail"],
+            "text": requests[-1]["text"],
+            "requests": requests,
+        }
+
+    for _ in range(warmups):
+        execute_batch()
+    runs = [execute_batch() for _ in range(repeats)]
+
+    tok_s_values = [run["tok_s"] for run in runs]
+    elapsed_values = [run["elapsed_s"] for run in runs]
+    gold_results = [run["gold_correct"] for run in runs if run["gold_correct"] is not None]
+    requests = [request for run in runs for request in run["requests"]]
+    successful_texts = [
+        request["text"]
+        for request in requests
+        if not request.get("error") and request["text"]
+    ]
+    failures = sorted({failure for run in runs for failure in run["expected_failures"]})
+    gold_details = [
+        run["gold_detail"] for run in runs if run["gold_correct"] is False and run["gold_detail"]
+    ]
     return {
         "id": case["id"],
         "description": case.get("description", ""),
         "expect_contains": case.get("expect_contains", []),
         "expect_regex": case.get("expect_regex", []),
+        "expect_exact": case.get("expect_exact"),
+        "expect_json": case.get("expect_json"),
         "gold_answer": case.get("gold_answer"),
         "runs": runs,
         "mean_tok_s": statistics.mean(tok_s_values),
         "median_tok_s": statistics.median(tok_s_values),
         "mean_elapsed_s": statistics.mean(elapsed_values),
-        "expected_pass": all(r["expected_pass"] for r in runs),
+        "deterministic": (
+            len(requests) >= 2
+            and len(successful_texts) == len(requests)
+            and len(set(successful_texts)) == 1
+        ),
+        "expected_pass": all(run["expected_pass"] for run in runs),
+        "expected_failures": failures,
         "gold_correct": all(gold_results) if gold_results else None,
-        "gold_detail": runs[-1].get("gold_detail", ""),
+        "gold_detail": "; ".join(gold_details) or runs[-1].get("gold_detail", ""),
         "text": runs[-1]["text"],
         "completion_tokens": runs[-1]["completion_tokens"],
         "prompt_tokens": runs[-1]["prompt_tokens"],
@@ -263,8 +374,50 @@ def run_case(
     }
 
 
+def generation_verdict(
+    results: list[dict[str, Any]],
+    min_gold_accuracy: float | None,
+    require_identical: bool = False,
+) -> dict[str, Any]:
+    if min_gold_accuracy is not None and not 0 <= min_gold_accuracy <= 1:
+        raise ValueError("min_gold_accuracy must be between 0 and 1")
+    scored = [result for result in results if result["gold_correct"] is not None]
+    if min_gold_accuracy is not None and not scored:
+        raise ValueError("minimum gold accuracy set but there are no gold-scored cases")
+    expected_pass = sum(1 for result in results if result["expected_pass"])
+    gold_correct = sum(1 for result in scored if result["gold_correct"])
+    gold_accuracy = gold_correct / len(scored) if scored else None
+    passed = expected_pass == len(results)
+    if min_gold_accuracy is not None:
+        passed = passed and gold_accuracy is not None and gold_accuracy >= min_gold_accuracy
+    deterministic_cases = sum(1 for result in results if result.get("deterministic"))
+    if require_identical:
+        passed = passed and deterministic_cases == len(results)
+    verdict = {
+        "status": "pass" if passed else "fail",
+        "expected_pass": expected_pass,
+        "expected_total": len(results),
+        "gold_correct": gold_correct,
+        "gold_scored": len(scored),
+        "gold_accuracy": gold_accuracy,
+        "min_gold_accuracy": min_gold_accuracy,
+    }
+    if require_identical:
+        verdict["deterministic_cases"] = deterministic_cases
+        verdict["require_identical"] = True
+    return verdict
+
+
 def cmd_run(args: argparse.Namespace) -> int:
+    if args.warmups < 0:
+        raise ValueError("warmups must be non-negative")
+    if args.repeats <= 0:
+        raise ValueError("repeats must be positive")
+    if args.concurrency <= 0:
+        raise ValueError("concurrency must be positive")
     cases = load_cases(Path(args.prompts))
+    if not cases:
+        raise ValueError("prompt corpus must contain at least one case")
     results = []
     for case in cases:
         print(f"[bench] {args.name}: {case['id']}", end="", flush=True)
@@ -277,6 +430,8 @@ def cmd_run(args: argparse.Namespace) -> int:
             temperature=args.temperature,
             timeout=args.timeout,
             repeats=args.repeats,
+            warmups=args.warmups,
+            concurrency=args.concurrency,
         )
         results.append(result)
         if result["gold_correct"] is not None:
@@ -285,8 +440,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         else:
             print(flush=True)
 
-    scored = [r for r in results if r["gold_correct"] is not None]
+    verdict = generation_verdict(results, args.min_gold_accuracy, args.require_identical)
     report = {
+        "schema_version": 2,
         "name": args.name,
         "url": args.url,
         "model": args.model,
@@ -294,13 +450,13 @@ def cmd_run(args: argparse.Namespace) -> int:
         "prompts": str(Path(args.prompts)),
         "max_tokens": args.max_tokens,
         "temperature": args.temperature,
+        "warmups": args.warmups,
         "repeats": args.repeats,
+        "concurrency": args.concurrency,
         "cases": results,
         "summary": {
+            **verdict,
             "cases": len(results),
-            "expected_pass": sum(1 for r in results if r["expected_pass"]),
-            "gold_correct": sum(1 for r in scored if r["gold_correct"]),
-            "gold_scored": len(scored),
             "mean_tok_s": statistics.mean([r["mean_tok_s"] for r in results]) if results else 0.0,
         },
     }
@@ -308,10 +464,13 @@ def cmd_run(args: argparse.Namespace) -> int:
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
     print(f"[bench] wrote {out}")
-    if scored:
-        print(f"[bench] correctness: {report['summary']['gold_correct']}/{len(scored)}"
-              f" ({report['summary']['gold_correct']/len(scored)*100:.0f}%)")
-    return 0 if report["summary"]["expected_pass"] == len(results) else 1
+    if verdict["gold_scored"]:
+        print(
+            f"[bench] correctness: {verdict['gold_correct']}/{verdict['gold_scored']} "
+            f"({verdict['gold_accuracy'] * 100:.0f}%)"
+        )
+    print(f"[bench] verdict: {verdict['status'].upper()}")
+    return 0 if verdict["status"] == "pass" else 1
 
 
 def load_report(path: Path) -> dict[str, Any]:
@@ -356,8 +515,12 @@ def cmd_compare(args: argparse.Namespace) -> int:
         "baseline_expected_pass": sum(1 for r in rows if r["baseline_expected_pass"]),
         "candidate_expected_pass": sum(1 for r in rows if r["candidate_expected_pass"]),
         "normalized_matches": sum(1 for r in rows if r["normalized_match"]),
-        "baseline_mean_tok_s": statistics.mean([r["baseline_tok_s"] for r in rows]) if rows else 0.0,
-        "candidate_mean_tok_s": statistics.mean([r["candidate_tok_s"] for r in rows]) if rows else 0.0,
+        "baseline_mean_tok_s": statistics.mean([r["baseline_tok_s"] for r in rows])
+        if rows
+        else 0.0,
+        "candidate_mean_tok_s": statistics.mean([r["candidate_tok_s"] for r in rows])
+        if rows
+        else 0.0,
     }
     if summary["baseline_mean_tok_s"] > 0:
         summary["mean_speedup"] = summary["candidate_mean_tok_s"] / summary["baseline_mean_tok_s"]
@@ -427,12 +590,18 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--url", required=True, help="Base URL ending in /v1")
     run.add_argument("--api-key", default="")
     run.add_argument("--model", required=True)
-    run.add_argument("--prompts", default=str(Path(__file__).with_name("prompts") / "generation_smoke.jsonl"))
+    run.add_argument(
+        "--prompts", default=str(Path(__file__).with_name("prompts") / "generation_smoke.jsonl")
+    )
     run.add_argument("--json-out", required=True)
     run.add_argument("--max-tokens", type=int, default=256)
     run.add_argument("--temperature", type=float, default=0.0)
     run.add_argument("--timeout", type=float, default=600.0)
+    run.add_argument("--warmups", type=int, default=0)
     run.add_argument("--repeats", type=int, default=1)
+    run.add_argument("--concurrency", type=int, default=1)
+    run.add_argument("--min-gold-accuracy", type=float)
+    run.add_argument("--require-identical", action="store_true")
     run.set_defaults(func=cmd_run)
 
     compare = sub.add_parser("compare", help="Compare two endpoint reports")
