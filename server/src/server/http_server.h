@@ -346,11 +346,24 @@ struct ParsedRequest {
     DiskPrefixCachePolicy     disk_cache_policy;
     // PPP: stable pin cut for tool-heavy requests (0 = use default boundary).
     int                       pin_end_token = 0;
+    // Opt-in per-token logprobs: -1 off, 0 = committed token only,
+    // K = committed token plus top-K alternatives. Set only for
+    // OpenAI-chat, non-streaming, single-slot AR requests; see
+    // parse_request_logprobs and docs/API.md "Logprobs".
+    int                       logprobs_top_k = -1;
 };
 
 // Parse request sampler fields, applying model-card defaults where present.
 SamplerCfg parse_request_sampler(const json & body,
                                  const SamplingDefaults & defaults);
+
+// Parse and validate the OpenAI `logprobs`/`top_logprobs` fields.
+// Returns false with `error` set when the field shapes or combination are
+// unsupported (caller maps it to a 400 invalid_request_error). On success
+// `logprobs_top_k` is -1 (not requested), 0 (chosen token only), or the
+// requested top-K in [0,20]. `stream` is the request's stream flag.
+bool parse_request_logprobs(const json & body, bool stream,
+                            int & logprobs_top_k, std::string & error);
 
 // Read the required `messages` field. Throws std::invalid_argument when
 // it is missing or not a non-empty array; route_request's catch turns
@@ -496,6 +509,9 @@ private:
         int completion_tokens = 0;
         bool visible_output_seen = false;
         bool client_disconnected = false;
+        // One record per committed token when the request opted in to
+        // logprobs; populated through DaemonIO::on_token_logprob.
+        std::vector<TokenLogprob> logprobs;
     };
 
     void prepare_generation_inputs(

@@ -28,6 +28,7 @@
 #include "common/kv_rotation.h"
 #include "common/sha1.h"
 #include "freeze_history.h"
+#include "utf8_utils.h"
 
 #ifdef DFLASH_HAS_CURL
 #include <curl/curl.h>
@@ -636,6 +637,51 @@ SamplerCfg parse_request_sampler(const json & body,
         sampler.rep_window = body["rep_window"].get<int>();
     }
     return sampler;
+}
+
+// OpenAI caps top_logprobs at 20; we match that bound.
+constexpr int kMaxTopLogprobs = 20;
+
+bool parse_request_logprobs(const json & body, bool stream,
+                            int & logprobs_top_k, std::string & error) {
+    logprobs_top_k = -1;
+    error.clear();
+
+    bool want = false;
+    if (body.contains("logprobs")) {
+        if (!body["logprobs"].is_boolean()) {
+            error = "logprobs must be a boolean";
+            return false;
+        }
+        want = body["logprobs"].get<bool>();
+    }
+
+    int top_k = 0;
+    const bool has_top = body.contains("top_logprobs");
+    if (has_top) {
+        if (!body["top_logprobs"].is_number_integer()) {
+            error = "top_logprobs must be an integer";
+            return false;
+        }
+        top_k = body["top_logprobs"].get<int>();
+        if (top_k < 0 || top_k > kMaxTopLogprobs) {
+            error = "top_logprobs must be between 0 and " +
+                    std::to_string(kMaxTopLogprobs);
+            return false;
+        }
+        if (!want) {
+            error = "top_logprobs requires logprobs: true";
+            return false;
+        }
+    }
+    if (!want) return true;
+
+    if (stream) {
+        error = "logprobs is not yet supported with stream=true";
+        return false;
+    }
+    logprobs_top_k = has_top ? top_k : 0;
+    return true;
 }
 
 json require_messages_array(const json & body) {
@@ -1994,6 +2040,32 @@ bool HttpServer::parse_common_request_fields(
     }
 
     req.sampler = parse_request_sampler(body, config_.sampler_defaults);
+
+    // Opt-in token logprobs: chat completions only; other dialects ignore
+    // the fields entirely. Field-shape rules live in parse_request_logprobs;
+    // the deployment gates (scheduler, backend support) are enforced here
+    // where the backend is in scope.
+    if (req.format == ApiFormat::OPENAI_CHAT) {
+        std::string lp_error;
+        if (!parse_request_logprobs(body, req.stream,
+                                    req.logprobs_top_k, lp_error)) {
+            send_error(fd, 400, lp_error);
+            return false;
+        }
+        if (req.logprobs_top_k >= 0) {
+            if (backend_.seq_engine()) {
+                send_error(fd, 400, "logprobs requires --max-concurrency 1");
+                return false;
+            }
+            if (!backend_.supports_logprobs()) {
+                send_error(fd, 400,
+                    "logprobs is not supported by the " + config_.arch +
+                    " backend yet");
+                return false;
+            }
+        }
+    }
+
     if (body.contains("tools")) req.tools = body["tools"];
     // Tool choice constraint for hint generation.
     if (body.contains("tool_choice")) req.tool_choice = body["tool_choice"];
@@ -2568,24 +2640,174 @@ TokenDelivery classify_generated_token(
     return TokenDelivery::kText;
 }
 
+// ─── Logprobs response assembly ─────────────────────────────────────────
+//
+// One backend TokenLogprob exists per committed token. During the replay
+// below, each non-skipped token's entry is bucketed by which message field
+// its delivered text actually appended to — tracked by diffing the
+// emitter's accumulators around emit_token/emit_finish, so the holdback
+// window, UTF-8 tail joins, stop-sequence truncation, and the finish-time
+// flush are all accounted for. A token that straddles the reasoning→content
+// boundary (text containing </think>) appears in both lists with the part
+// it contributed to each. The invariants this preserves:
+//   join(content[i].token)          == message.content
+//   join(reasoning_content[i].token) == message.reasoning_content
+
+json logprob_bytes_json(const std::string & text) {
+    json bytes = json::array();
+    for (unsigned char c : text) bytes.push_back((int) c);
+    return bytes;
+}
+
+json logprob_entry_json(const TokenLogprob & rec, Tokenizer & tokenizer) {
+    json top = json::array();
+    for (const auto & [tid, lp] : rec.top) {
+        const std::string piece = utf8_sanitize(tokenizer.raw_token(tid));
+        top.push_back({
+            {"token", piece},
+            {"token_id", tid},
+            {"logprob", lp},
+            {"bytes", logprob_bytes_json(piece)},
+        });
+    }
+    return {
+        {"token", ""},
+        {"token_id", rec.token},
+        {"logprob", rec.logprob},
+        {"bytes", json::array()},
+        {"top_logprobs", std::move(top)},
+    };
+}
+
+void logprob_set_token(json & entry, const std::string & text) {
+    entry["token"] = text;
+    entry["bytes"] = logprob_bytes_json(text);
+}
+
 CompletionTokenCounts feed_non_streaming_tokens(
         const std::vector<int32_t> & tokens, Tokenizer & tokenizer,
-        SseEmitter & emitter) {
-    for (int32_t token : tokens) {
+        SseEmitter & emitter,
+        const std::vector<TokenLogprob> * records = nullptr,
+        json * logprobs_out = nullptr) {
+    // Callers guarantee records->size() == tokens.size() when set (the
+    // request path fails earlier with a 500 otherwise).
+    json lp_content = json::array();
+    json lp_reasoning = json::array();
+    size_t last_lp_index = std::string::npos;  // last token with an entry
+    // Flush text that arrived while its bucket had no entry yet (e.g. the
+    // content side of a </think> transition); prepended to the bucket's
+    // first entry so concatenation order is preserved.
+    std::string pending_content, pending_reasoning;
+
+    // Merge flushed text into a bucket: append to the last entry when one
+    // exists (the flush is always tail text of that bucket), else stash.
+    auto merge_flush = [&](json & list, std::string & pending,
+                           const std::string & text) {
+        if (text.empty()) return;
+        if (!list.empty()) {
+            json & last = list.back();
+            logprob_set_token(
+                last, last["token"].get<std::string>() + text);
+        } else {
+            pending += text;
+        }
+    };
+
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        const int32_t token = tokens[i];
         std::string text;
         const TokenDelivery delivery =
             classify_generated_token(tokenizer, emitter, token, text);
         if (delivery == TokenDelivery::kSkip) continue;
 
+        const bool collect = records && delivery != TokenDelivery::kThinkTag;
+        const size_t content_before = emitter.accumulated_text().size();
+        const size_t reasoning_before = emitter.reasoning_text().size();
+        const StreamMode entry_mode = emitter.mode();
         emitter.emit_token(text);
-        // Matching the streaming path, only ordinary text is checked
-        // against stop sequences — think-tag markers never count.
-        if (delivery == TokenDelivery::kText && emitter.stop_hit()) break;
+
+        if (!records) {
+            // Matching the streaming path, only ordinary text is checked
+            // against stop sequences — think-tag markers never count.
+            if (delivery == TokenDelivery::kText && emitter.stop_hit()) break;
+            continue;
+        }
+
+        const std::string dc =
+            emitter.accumulated_text().substr(content_before);
+        const std::string dr =
+            emitter.reasoning_text().substr(reasoning_before);
+        if (!collect) {
+            // A think-boundary marker carries no text of its own, but its
+            // emit_token can flush held-back window text (the reasoning
+            // tail before </think>). Attribute that flush to the bucket it
+            // landed in; the tag itself gets no entry.
+            merge_flush(lp_reasoning, pending_reasoning, dr);
+            merge_flush(lp_content, pending_content, dc);
+            continue;
+        }
+
+        last_lp_index = i;
+        json entry = logprob_entry_json((*records)[i], tokenizer);
+        bool pushed = false;
+        if (!dr.empty() || !pending_reasoning.empty()) {
+            logprob_set_token(entry, pending_reasoning + dr);
+            pending_reasoning.clear();
+            lp_reasoning.push_back(entry);
+            pushed = true;
+        }
+        if (!dc.empty() || !pending_content.empty()) {
+            logprob_set_token(entry, pending_content + dc);
+            pending_content.clear();
+            lp_content.push_back(entry);
+            pushed = true;
+        }
+        if (!pushed) {
+            // Text still in the holdback window, went to the tool buffer,
+            // or the emitter stopped: the entry still carries the token's
+            // logprob, bucketed by the mode it entered in.
+            logprob_set_token(entry, "");
+            (entry_mode == StreamMode::REASONING ? lp_reasoning
+                                               : lp_content)
+                .push_back(entry);
+        }
+        // The replay covers every committed token even after stop_hit so
+        // late tokens keep their entries; their text is suppressed anyway.
     }
 
     CompletionTokenCounts counts;
     counts.total = (int) tokens.size();
+
+    const size_t finish_content_before = emitter.accumulated_text().size();
+    const size_t finish_reasoning_before = emitter.reasoning_text().size();
     emitter.emit_finish(counts.total);
+
+    if (records) {
+        // The finish-time flush (window tail, tool-fallback cleaned text)
+        // appends text that belongs to already-processed tokens; attach it
+        // to the last entry of the bucket it landed in. When that bucket
+        // never got an entry, synthesize one from the last committed
+        // token's record so delivered text is never dropped.
+        merge_flush(lp_content, pending_content,
+                    emitter.accumulated_text().substr(finish_content_before));
+        merge_flush(lp_reasoning, pending_reasoning,
+                    emitter.reasoning_text().substr(finish_reasoning_before));
+        auto flush_pending = [&](json & list, const std::string & pending) {
+            if (pending.empty() || last_lp_index == std::string::npos) return;
+            json entry =
+                logprob_entry_json((*records)[last_lp_index], tokenizer);
+            logprob_set_token(entry, pending);
+            list.push_back(entry);
+        };
+        flush_pending(lp_reasoning, pending_reasoning);
+        flush_pending(lp_content, pending_content);
+        if (logprobs_out) {
+            *logprobs_out = {
+                {"content", std::move(lp_content)},
+                {"reasoning_content", std::move(lp_reasoning)},
+            };
+        }
+    }
 
     // Split reasoning vs content at the emitter's REASONING→CONTENT
     // transition; see first_content_token_index() in sse_emitter.h.
@@ -2602,7 +2824,8 @@ json build_openai_completion_response(
         const ParsedRequest & req, const GenerateResult & result,
         int generation_cap, const GenTimings & timings,
         const CompletionTokenCounts & counts, const SseEmitter & emitter,
-        const Tokenizer * tokenizer = nullptr) {
+        const Tokenizer * tokenizer = nullptr,
+        const json * logprobs = nullptr) {
     json message = {
         {"role", "assistant"},
         {"content", emitter.accumulated_text()},
@@ -2656,6 +2879,7 @@ json build_openai_completion_response(
         {"message", message},
         {"finish_reason", finish_reason},
     };
+    if (logprobs) choice["logprobs"] = *logprobs;
     if (req.thinking_opt_in) {
         // finish_details mirrors ds4_eval.c's eval_think_close_info.
         // close_kind is "natural" when the model closed its own thinking
@@ -2827,11 +3051,13 @@ json build_non_streaming_response(
         const ParsedRequest & req, const GenerateResult & result,
         int generation_cap, const GenTimings & timings,
         const CompletionTokenCounts & counts, SseEmitter & emitter,
-        const Tokenizer * tokenizer = nullptr) {
+        const Tokenizer * tokenizer = nullptr,
+        const json * logprobs = nullptr) {
     switch (req.format) {
     case ApiFormat::OPENAI_CHAT:
         return build_openai_completion_response(
-            req, result, generation_cap, timings, counts, emitter, tokenizer);
+            req, result, generation_cap, timings, counts, emitter, tokenizer,
+            logprobs);
     case ApiFormat::ANTHROPIC:
         return build_anthropic_response(
             req, result, generation_cap, timings, counts, emitter, tokenizer);
@@ -2846,11 +3072,15 @@ json build_non_streaming_response(
 json build_non_streaming_response(
         const ParsedRequest & req, const GenerateResult & result,
         int generation_cap, const GenTimings & timings, Tokenizer & tokenizer,
-        SseEmitter & emitter) {
+        SseEmitter & emitter,
+        const std::vector<TokenLogprob> * records = nullptr) {
+    json logprobs;
     const CompletionTokenCounts counts = feed_non_streaming_tokens(
-        result.tokens, tokenizer, emitter);
+        result.tokens, tokenizer, emitter, records,
+        records ? &logprobs : nullptr);
     return build_non_streaming_response(
-        req, result, generation_cap, timings, counts, emitter, &tokenizer);
+        req, result, generation_cap, timings, counts, emitter, &tokenizer,
+        records ? &logprobs : nullptr);
 }
 
 // Prompt preparation applies exactly one compression policy: FlowKV for
@@ -3460,10 +3690,27 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
     }
 
     GenerationCacheState cache;
+    cache.disk_policy = req.disk_cache_policy;
+
+    if (generate_request.want_logprobs()) {
+        // Logprobs needs a real forward pass for every committed token. A
+        // full-prompt restore serves the first token straight from the
+        // snapshot's last_tok with no logits row, so these requests force a
+        // cold prefill and skip every snapshot save of their own.
+        cache.disk_policy.mode = DiskPrefixCacheMode::Off;
+        std::fprintf(stderr,
+            "[server] chat CACHE %s logprobs: prefix-cache restore/save "
+            "skipped (cold prefill required for logits)\n",
+            req.response_id.c_str());
+        status_.set_flags(false, prepared.compressed,
+                          !config_.draft_path.empty());
+        broadcast_status();
+        return cache;
+    }
+
     cache.cache_slot = prepared.full_cache_hit_slot;
     cache.prefix_len = prepared.full_cache_hit_len;
     cache.using_restore = cache.cache_slot >= 0;
-    cache.disk_policy = req.disk_cache_policy;
     cache.full_snap_key_effective = ppp_rewrote;
 
     // Exact full-prompt snapshots. After a DiffPin rewrite, key by the
@@ -4056,6 +4303,11 @@ void HttpServer::prepare_generation_inputs(
     // same disconnect and streaming state machine.
     inputs.request.stream = false;
 
+    // Logprobs are AR-only: force the autoregressive path so a full logits
+    // row exists at every committed position.
+    inputs.request.logprobs_top_k = req.logprobs_top_k;
+    if (req.logprobs_top_k >= 0) inputs.request.force_ar_decode = true;
+
     // The budget hook injects the close sequence while KV state is live,
     // leaving the remaining reserve for a visible answer.
     if (budget_active && !config_.think_close_token_ids.empty() &&
@@ -4161,6 +4413,16 @@ void HttpServer::configure_generation_io(
         // markers never terminate generation.
         return delivery == TokenDelivery::kThinkTag || !emitter.stop_hit();
     };
+
+    // Opt-in per-token logprob records; one per committed token, in
+    // commit order. The response builder asserts the count matches
+    // result.tokens.
+    io.logprobs_top_k = req.logprobs_top_k;
+    if (req.logprobs_top_k >= 0) {
+        io.on_token_logprob = [&output](const TokenLogprob & rec) {
+            output.logprobs.push_back(rec);
+        };
+    }
 }
 
 bool HttpServer::deliver_generation_token(
@@ -4563,8 +4825,18 @@ void HttpServer::process_job(ServerJob * job) {
             }
         }
     } else if (!req.stream && !client_disconnected) {
+        // Backend contract: one logprob record per committed token. A path
+        // that emits without logits (spec decode, a missed commit site)
+        // fails the request rather than serving shifted probabilities.
+        if (req.logprobs_top_k >= 0 &&
+            output.logprobs.size() != result.tokens.size()) {
+            log_done();
+            fail_request(500, "logprobs misaligned with committed tokens");
+            return;
+        }
         const json response = build_non_streaming_response(
-            req, result, n_gen_cap, gen_timings, tokenizer_, emitter);
+            req, result, n_gen_cap, gen_timings, tokenizer_, emitter,
+            req.logprobs_top_k >= 0 ? &output.logprobs : nullptr);
         remember_agent_turn(
             req, prepared, cache, result, emitter, completion_tokens,
             visible_output_seen, client_disconnected,

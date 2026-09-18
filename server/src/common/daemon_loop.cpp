@@ -51,6 +51,15 @@ void DaemonIO::emit(int32_t v) const {
 #endif
 }
 
+void DaemonIO::emit_with_logits(int32_t tok, const float * logits,
+                                int vocab) const {
+    if (on_token_logprob && logprobs_top_k >= 0 && tok >= 0) {
+        on_token_logprob(
+            compute_token_logprob(logits, vocab, tok, logprobs_top_k));
+    }
+    emit(tok);
+}
+
 DaemonIO DaemonIO::with_token_callback(const TokenCallback & cb) const {
     DaemonIO out = *this;
     if (!cb) return out;

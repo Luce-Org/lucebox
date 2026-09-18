@@ -151,6 +151,7 @@ public:
     bool try_handle_command(const std::string & line,
                             const DaemonIO & io) override;
 
+    bool supports_logprobs() const override { return true; }
     bool supports_dflash_spec_decode() const override { return !cfg_.paged_attention; }
     DFlashTarget * dflash_target() override;
     bool supports_remote_draft() const override { return true; }

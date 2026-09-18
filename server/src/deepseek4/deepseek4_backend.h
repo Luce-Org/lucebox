@@ -99,6 +99,7 @@ public:
 
     void shutdown() override;
     SeqEngine * seq_engine() override { return seq_engine_.get(); }
+    bool supports_logprobs() const override { return true; }
 
     const MoeHybridRoutingStats * get_routing_stats() const override {
         return routing_stats_.get();
