@@ -1602,6 +1602,296 @@ TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_string_attribute_semanti
     }
 }
 
+TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_unclosed_invoke) {
+    // When a model omits </｜DSML｜invoke> between consecutive calls,
+    // lookahead termination should cleanly partition the invocations.
+    const std::string text =
+        "<｜DSML｜tool_calls>\n"
+        "<｜DSML｜invoke name=\"bash\">\n"
+        "<｜DSML｜parameter name=\"command\" string=\"true\">pwd</｜DSML｜parameter>\n"
+        "<｜DSML｜invoke name=\"bash\">\n"
+        "<｜DSML｜parameter name=\"command\" string=\"true\">ls -la</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n"
+        "</｜DSML｜tool_calls>";
+    json tools = json::array({
+        {{"type", "function"}, {"function", {
+             {"name", "bash"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"command", {{"type", "string"}}}
+                 }}
+             }}
+         }}}
+    });
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 2);
+    if (result.tool_calls.size() == 2) {
+        TEST_ASSERT(result.tool_calls[0].name == "bash");
+        auto args0 = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args0["command"] == "pwd");
+
+        TEST_ASSERT(result.tool_calls[1].name == "bash");
+        auto args1 = json::parse(result.tool_calls[1].arguments);
+        TEST_ASSERT(args1["command"] == "ls -la");
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_deepseek_harness_exact_payload) {
+    // Regression test for the real DeepSeek Harness multi-tool call:
+    // Call 1: bash (unclosed invoke)
+    // Call 2: bash (closed invoke)
+    // Call 3: web_search with string="invalid"
+    const std::string text =
+        "<｜DSML｜tool_calls>\n"
+        "<｜DSML｜invoke name=\"bash\">\n"
+        "<｜DSML｜parameter name=\"command\" string=\"true\">find /home/dpavlin/aimax -name \"*.tar.gz\" -o -name \"*.tgz\" 2>/dev/null | head -20; ls -la /home/dpavlin/aimax 2>/dev/null | head -30</｜DSML｜parameter>\n"
+        "<｜DSML｜parameter name=\"description\" string=\"true\">List aimax dir for package artifacts</｜DSML｜parameter>\n"
+        "<｜DSML｜invoke name=\"bash\">\n"
+        "<｜DSML｜parameter name=\"command\" string=\"true\">ls -la /home/dpavlin/.npm/_npx/1e7f6d9597241db0/ 2>/dev/null; cat /home/dpavlin/.npm/_npx/1e7f6d9597241db0/package.json 2>/dev/null | head -50</｜DSML｜parameter>\n"
+        "<｜DSML｜parameter name=\"description\" string=\"true\">Check harness checkout package.json for version</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n"
+        "<｜DSML｜invoke name=\"web_search\">\n"
+        "<｜DSML｜parameter name=\"queries\" string=\"invalid\">\n"
+        "</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n"
+        "</｜DSML｜tool_calls>";
+
+    json tools = json::array({
+        {{"type", "function"}, {"function", {
+             {"name", "bash"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"command", {{"type", "string"}}},
+                     {"description", {{"type", "string"}}}
+                 }}
+             }}
+         }}},
+        {{"type", "function"}, {"function", {
+             {"name", "web_search"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"queries", {{"type", "array"}}}
+                 }}
+             }}
+         }}}
+    });
+
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 3);
+    if (result.tool_calls.size() == 3) {
+        TEST_ASSERT(result.tool_calls[0].name == "bash");
+        auto args0 = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args0["command"].get<std::string>().find("find /home/dpavlin/aimax") != std::string::npos);
+        TEST_ASSERT(args0["description"] == "List aimax dir for package artifacts");
+
+        TEST_ASSERT(result.tool_calls[1].name == "bash");
+        auto args1 = json::parse(result.tool_calls[1].arguments);
+        TEST_ASSERT(args1["command"].get<std::string>().find("cat /home/dpavlin/.npm") != std::string::npos);
+        TEST_ASSERT(args1["description"] == "Check harness checkout package.json for version");
+
+        TEST_ASSERT(result.tool_calls[2].name == "web_search");
+        auto args2 = json::parse(result.tool_calls[2].arguments);
+        TEST_ASSERT(args2.contains("queries"));
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_unclosed_final_invoke_before_block_end) {
+    // Regression test for real payload (chatcmpl_000000000000000a) where the model omits </｜DSML｜invoke>
+    // before the closing </｜DSML｜tool_calls>.
+    const std::string text =
+        "<｜DSML｜tool_calls>\n"
+        "<｜DSML｜invoke name=\"edit\">\n"
+        "<｜DSML｜parameter name=\"file_path\" string=\"true\">/home/dpavlin/aimax/LUCEBOX_STRIX_HALO_GUIDE.md</｜DSML｜parameter>\n"
+        "<｜DSML｜parameter name=\"new_string\" string=\"true\">### B. Paged Attention WMMA (head-256, RDNA4) — `DFLASH27B_PAGED_WMMA` (default off, BURN-IN)\n"
+        "- Env `DFLASH27B_PAGED_WMMA=1` routes paged full-attention layers (head 256, F16/Q8_0/Q4_0 KV, non-tree) to the WMMA kernel. Default (unset/0) keeps the V_DOT2 decode kernel.\n"
+        "- Differential: single-prompt TTFT −21% @12K, −42% @44K; batched 8K-pool prefill slightly ahead. Kernel-level 20.6–22.4 TFLOP/s vs 6.4–6.8 (3.1–3.3×); end-to-end bounded by attention's prefill share (~8% @44K, ~4% @12K).\n"
+        "- Two-mode CTest: `test_paged_attn_wmma` (V_DOT2, env=0) / `paged_attn_wmma_route` (env=1), diff via `server/test/compare_paged_attn.py --tol 6e-3`. Need `--reconfig` after the upstream pull for `CMakeLists.txt` to register targets.\n"
+        "- Source of truth: `server/docs/PAGED_ATTN_WMMA_HANDOFF.md`.</｜DSML｜parameter>\n"
+        "<｜DSML｜parameter name=\"old_string\" string=\"true\">### B. Prefill Mode: `--ds4-prefill sparse` (DO NOT use `exact` for multi-turn)</｜DSML｜parameter>\n"
+        "</｜DSML｜tool_calls>";
+
+    json tools = json::array({
+        {{"type", "function"}, {"function", {
+             {"name", "edit"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"file_path", {{"type", "string"}}},
+                     {"new_string", {{"type", "string"}}},
+                     {"old_string", {{"type", "string"}}}
+                 }}
+             }}
+         }}}
+    });
+
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (result.tool_calls.size() == 1) {
+        TEST_ASSERT(result.tool_calls[0].name == "edit");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["file_path"] == "/home/dpavlin/aimax/LUCEBOX_STRIX_HALO_GUIDE.md");
+        TEST_ASSERT(args["new_string"].get<std::string>().find("DFLASH27B_PAGED_WMMA") != std::string::npos);
+        TEST_ASSERT(args["old_string"].get<std::string>().find("Prefill Mode") != std::string::npos);
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_unclosed_invoke_with_nested_json) {
+    // When an unclosed invoke contains a parameter whose value is a JSON tool-call object,
+    // subsequent sweeps must not parse that JSON value as a duplicate tool call.
+    const std::string text =
+        "<｜DSML｜tool_calls>\n"
+        "<｜DSML｜invoke name=\"bash\">\n"
+        "<｜DSML｜parameter name=\"command\" string=\"true\">cat config.json</｜DSML｜parameter>\n"
+        "<｜DSML｜parameter name=\"metadata\" string=\"false\">{\"name\": \"bash\", \"arguments\": {\"command\": \"nested\"}}</｜DSML｜parameter>\n"
+        "</｜DSML｜tool_calls>";
+    json tools = json::array({
+        {{"type", "function"}, {"function", {
+             {"name", "bash"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"command", {{"type", "string"}}},
+                     {"metadata", {{"type", "object"}}}
+                 }}
+             }}
+         }}}
+    });
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (result.tool_calls.size() == 1) {
+        TEST_ASSERT(result.tool_calls[0].name == "bash");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["command"] == "cat config.json");
+        TEST_ASSERT(args["metadata"]["name"] == "bash");
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_tag_like_parameter_content) {
+    // Parameter values containing substrings like <invoke-not-a-tag> or <parameterized>
+    // must not trigger premature lookahead termination.
+    const std::string text =
+        "<｜DSML｜tool_calls>\n"
+        "<｜DSML｜invoke name=\"bash\">\n"
+        "<｜DSML｜parameter name=\"command\" string=\"true\">echo \"<invoke-not-a-tag>\"; cat <parameterized></｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n"
+        "</｜DSML｜tool_calls>";
+    json tools = json::array({
+        {{"type", "function"}, {"function", {
+             {"name", "bash"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"command", {{"type", "string"}}}
+                 }}
+             }}
+         }}}
+    });
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (result.tool_calls.size() == 1) {
+        TEST_ASSERT(result.tool_calls[0].name == "bash");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["command"] == "echo \"<invoke-not-a-tag>\"; cat <parameterized>");
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_tool_calls_prose_invoke_tag_does_not_mask_json_call) {
+    // A prose or non-call <invoke> tag (without name/tool attribute) must not cause
+    // invoke_spans to span until EOF and mask subsequent bare JSON tool calls.
+    const std::string text =
+        "You can invoke the command as follows:\n"
+        "Please look at <invoke> syntax.\n"
+        "{\"name\": \"bash\", \"arguments\": {\"command\": \"ls -l\"}}";
+    json tools = json::array({
+        {{"type", "function"}, {"function", {
+             {"name", "bash"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"command", {{"type", "string"}}}
+                 }}
+             }}
+         }}}
+    });
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "bash");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["command"] == "ls -l");
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_literal_invoke_in_string_parameter) {
+    // Parameter values with string="true" containing literal </invoke> or </parameter>
+    // inside their payload (e.g. grep commands, git diffs) must not be truncated prematurely.
+    const std::string text =
+        "<｜DSML｜tool_calls>\n"
+        "<｜DSML｜invoke name=\"bash\">\n"
+        "<｜DSML｜parameter name=\"command\" string=\"true\">grep -n \"</invoke>\" server/src/server/tool_parser.cpp</｜DSML｜parameter>\n"
+        "<｜DSML｜parameter name=\"description\" string=\"true\">Search for invoke close tags</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n"
+        "</｜DSML｜tool_calls>";
+    json tools = json::array({
+        {{"type", "function"}, {"function", {
+             {"name", "bash"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"command", {{"type", "string"}}},
+                     {"description", {{"type", "string"}}}
+                 }}
+             }}
+         }}}
+    });
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "bash");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["command"] == "grep -n \"</invoke>\" server/src/server/tool_parser.cpp");
+        TEST_ASSERT(args["description"] == "Search for invoke close tags");
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_unclosed_string_parameter_before_sibling_parameter) {
+    // When a string="true" parameter is unclosed before another parameter,
+    // lookahead termination on tag boundaries must cleanly partition them
+    // rather than consuming the sibling parameter into the first argument.
+    const std::string text =
+        "<｜DSML｜tool_calls>\n"
+        "<｜DSML｜invoke name=\"bash\">\n"
+        "<｜DSML｜parameter name=\"command\" string=\"true\">ls -la\n"
+        "<｜DSML｜parameter name=\"description\" string=\"true\">list directory files</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n"
+        "</｜DSML｜tool_calls>";
+    json tools = json::array({
+        {{"type", "function"}, {"function", {
+             {"name", "bash"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"command", {{"type", "string"}}},
+                     {"description", {{"type", "string"}}}
+                 }}
+             }}
+         }}}
+    });
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "bash");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["command"].get<std::string>().find("ls -la") != std::string::npos);
+        TEST_ASSERT(args["command"].get<std::string>().find("<｜DSML｜parameter") == std::string::npos);
+        TEST_ASSERT(args["description"] == "list directory files");
+    }
+}
+
+
 
 TEST_CASE(ServerUnitFixture, test_parse_tool_allowed_filter) {
     std::string text =
