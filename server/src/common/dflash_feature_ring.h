@@ -19,9 +19,31 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <vector>
 
 namespace dflash::common {
+
+// Drafter's trained sliding-window (feature-mirror) context. The drafter's
+// feature ring must span at least this many tokens or it only sees a shallow
+// suffix of the context and spec-decode accept collapses once the committed
+// prefix exceeds it. Pending the converter injecting the real context_length
+// into the drafter GGUF (currently a 262144 placeholder).
+inline constexpr int DFLASH_DRAFTER_TRAINED_CTX = 40960;
+
+// Effective drafter feature window. Every producer of drafter features (the
+// target feature ring, the feature mirror, the layer-split mirror) must use
+// this same value: the mirror is synced from the target ring, so mismatched
+// windows feed the drafter aliased features. `DFLASH_FEAT_RING_CAP` is the
+// memory valve (lower clamps both rings); unset/0 means the trained window.
+inline int dflash_drafter_window(int max_ctx) {
+    int cap = max_ctx < DFLASH_DRAFTER_TRAINED_CTX ? max_ctx : DFLASH_DRAFTER_TRAINED_CTX;
+    if (const char * s = std::getenv("DFLASH_FEAT_RING_CAP")) {
+        const int e = std::atoi(s);
+        if (e > 0 && e < cap) cap = e;
+    }
+    return cap;
+}
 
 struct DraftFeatureMirror {
     ggml_context * ctx = nullptr;

@@ -490,7 +490,9 @@ bool Qwen35LayerSplitAdapter::load_draft() {
                      swa.swa_layers, swa.total_layers, swa.effective_window);
     }
 
-    const int cap = std::min(cfg_.device.max_ctx, cfg_.draft_ctx_max);
+    // Same trained-window/memory-valve policy as the single-GPU path; keep the
+    // layer-split mirror coherent with the target feature ring.
+    const int cap = dflash::common::dflash_drafter_window(cfg_.device.max_ctx);
     if (!draft_feature_mirror_init(feature_ring_, draft_backend_,
                                    cfg_.draft_gpu, cfg_.draft_gpu, cap,
                                    draft_weights_.n_target_layers,

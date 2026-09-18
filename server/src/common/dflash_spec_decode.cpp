@@ -106,10 +106,14 @@ bool run_dflash_spec_decode(
             return false;
         }
 
-        constexpr int DRAFT_CTX_MAX_DEFAULT = 2048;
+        // The ring cap IS the drafter's trained window. A local draft reads the
+        // whole visible prefix; draft_ctx_max is a REMOTE-only cap (its 4096
+        // default must not starve the local deep window), and a non-positive
+        // remote cap means "no cap" rather than a zero-length draft.
         const int ring_cap = use_remote_draft ? remote_draft->ring_cap() : feature_ring.cap;
-        const int draft_ctx = std::min(committed, std::min(ring_cap,
-            std::max(DRAFT_CTX_MAX_DEFAULT, draft_ctx_max)));
+        const int draft_cap = (use_remote_draft && draft_ctx_max > 0)
+            ? std::min(ring_cap, draft_ctx_max) : ring_cap;
+        const int draft_ctx = std::min(committed, draft_cap);
         const int draft_start = committed - draft_ctx;
         int mirror_slot0 = 0;
         const bool use_mirror_view =
@@ -128,7 +132,7 @@ bool run_dflash_spec_decode(
             if (!build_draft_step(draft_sg, draft_weights, /*lm_head=*/nullptr, draft_backend,
                                   draft_ctx, use_mirror_view ? &feature_ring : nullptr,
                                   committed,
-                                  /*ctx_len_max=*/std::min(ring_cap, std::max(DRAFT_CTX_MAX_DEFAULT, draft_ctx_max)))) {
+                                  /*ctx_len_max=*/draft_cap)) {
                 std::fprintf(stderr, "dflash-spec draft build failed\n");
                 return false;
             }
