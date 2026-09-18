@@ -478,6 +478,165 @@ bool run_case(ggml_backend_t backend,
     return ok;
 }
 
+// A mixed round's tree root must use the ordinary attention reduction even
+// though its W8 verification graph has far fewer query rows. Keep the visible
+// Q/K/V identical and vary only their durable-versus-scratch representation.
+bool mixed_tree_roots_match_ordinary(ggml_backend_t backend, int prefix,
+                                    int max_kv_len, ggml_type type,
+                                    int ordinary_rows = 1026,
+                                    std::vector<float> * cohort_reference = nullptr) {
+    constexpr int width = 8;
+    constexpr int lanes = 2;
+    GGML_ASSERT(ordinary_rows >= lanes);
+    const int root_row = ordinary_rows - lanes;
+    constexpr int tree_rows = width * lanes;
+    const TestCase layout{"root-parity", max_kv_len / BLOCK_SIZE,
+                          {prefix + 1, prefix + 1}, false};
+    const int physical_blocks = count_physical_blocks(layout);
+    const int scratch_base = physical_blocks * BLOCK_SIZE;
+    const int pool_tokens = scratch_base + lanes * BLOCK_SIZE;
+    const auto block_table = make_block_table(layout, physical_blocks);
+    ggml_init_params params{};
+    params.mem_size = 2 * 1024 * 1024;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) return false;
+    ggml_tensor * ordinary_q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, ordinary_rows, N_HEAD);
+    ggml_tensor * tree_q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, tree_rows, N_HEAD);
+    ggml_tensor * k = ggml_new_tensor_3d(ctx, type, D, pool_tokens, N_HEAD_KV);
+    ggml_tensor * v = ggml_new_tensor_3d(ctx, type, D, pool_tokens, N_HEAD_KV);
+    ggml_tensor * table = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, layout.max_blocks, lanes);
+    ggml_tensor * ordinary_lens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, lanes);
+    ggml_tensor * tree_lens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, lanes);
+    ggml_tensor * ordinary_slots = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, ordinary_rows);
+    ggml_tensor * positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, ordinary_rows);
+    ggml_tensor * tree_slots = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, tree_rows);
+    ggml_tensor * parents = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, width, lanes);
+    ggml_tensor * sizes = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, lanes);
+    for (auto * input : {ordinary_q, tree_q, k, v, table, ordinary_lens,
+                         tree_lens, ordinary_slots, positions, tree_slots, parents, sizes}) {
+        ggml_set_input(input);
+    }
+    const float scale = 1.0f / std::sqrt(static_cast<float>(D));
+    ggml_tensor * ordinary = ggml_paged_attn_ext(
+        ctx, ordinary_q, k, v, table, ordinary_lens, ordinary_slots,
+        positions, scale, BLOCK_SIZE, max_kv_len);
+    ggml_tensor * tree = ggml_paged_attn_ext_tree(
+        ctx, tree_q, k, v, table, tree_lens, tree_slots, nullptr,
+        scale, BLOCK_SIZE, max_kv_len, parents, sizes, scratch_base,
+        BLOCK_SIZE);
+    ggml_set_output(ordinary);
+    ggml_set_output(tree);
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, ordinary);
+    ggml_build_forward_expand(graph, tree);
+    ggml_gallocr_t allocator = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (!ggml_gallocr_alloc_graph(allocator, graph)) {
+        ggml_gallocr_free(allocator);
+        ggml_free(ctx);
+        return false;
+    }
+    std::vector<float> ordinary_queries(static_cast<size_t>(D) * ordinary_rows * N_HEAD, 0.0f);
+    std::vector<float> tree_queries(static_cast<size_t>(D) * tree_rows * N_HEAD, 0.0f);
+    std::vector<int32_t> ordinary_ids(ordinary_rows, -1), ordinary_positions(ordinary_rows, -1);
+    std::vector<int32_t> tree_ids(tree_rows), parent_ids(tree_rows);
+    for (int lane = 0; lane < lanes; ++lane) {
+        ordinary_ids[root_row + lane] = lane;
+        ordinary_positions[root_row + lane] = prefix;
+        for (int node = 0; node < width; ++node) {
+            tree_ids[lane * width + node] = lane;
+            parent_ids[lane * width + node] = node - 1;
+        }
+        for (int head = 0; head < N_HEAD; ++head) {
+            for (int d = 0; d < D; ++d) {
+                const float value = std::sin(float((head * lanes + lane) * D + d) * 0.013f) * 0.25f;
+                ordinary_queries[(static_cast<size_t>(head) * ordinary_rows + root_row + lane) * D + d] = value;
+                tree_queries[(static_cast<size_t>(head) * tree_rows + lane * width) * D + d] = value;
+            }
+        }
+    }
+    const int32_t prefix_lens[] = {prefix, prefix};
+
+    std::vector<float> k_source(static_cast<size_t>(D) * pool_tokens * N_HEAD_KV);
+    std::vector<float> v_source(k_source.size());
+    for (size_t i = 0; i < k_source.size(); ++i) {
+        k_source[i] = std::cos(float(i) * 0.007f) * 0.2f;
+        v_source[i] = std::sin(float(i) * 0.011f + 0.3f) * 0.3f;
+    }
+    for (int lane = 0; lane < lanes; ++lane) {
+        const int root = block_table[lane * layout.max_blocks + prefix / BLOCK_SIZE] * BLOCK_SIZE + prefix % BLOCK_SIZE;
+        for (int head = 0; head < N_HEAD_KV; ++head) {
+            const size_t from = (static_cast<size_t>(head) * pool_tokens + root) * D;
+            const size_t to = (static_cast<size_t>(head) * pool_tokens + scratch_base + lane * BLOCK_SIZE) * D;
+            std::copy_n(k_source.data() + from, D, k_source.data() + to);
+            std::copy_n(v_source.data() + from, D, v_source.data() + to);
+        }
+    }
+    bool ok = true;
+    std::vector<float> reference_roots = cohort_reference
+        ? *cohort_reference : std::vector<float>{};
+    // Future children are invisible to node zero. Changing them into masked
+    // padding, with different payloads, must not change its reduction or output.
+    for (int live_nodes : {width, 1}) {
+        if (live_nodes == 1) {
+            for (int lane = 0; lane < lanes; ++lane) {
+                for (int head = 0; head < N_HEAD_KV; ++head) {
+                    const size_t begin = (static_cast<size_t>(head) * pool_tokens + scratch_base + lane * BLOCK_SIZE + 1) * D;
+                    std::fill_n(k_source.data() + begin, (width - 1) * D, 4.0f);
+                    std::fill_n(v_source.data() + begin, (width - 1) * D, -8.0f);
+                }
+            }
+        }
+        // Inputs may be reused after their last graph consumer: the tree
+        // output can overwrite ordinary_q. Restore every input for each run.
+        ggml_backend_tensor_set(ordinary_q, ordinary_queries.data(), 0, ggml_nbytes(ordinary_q));
+        ggml_backend_tensor_set(tree_q, tree_queries.data(), 0, ggml_nbytes(tree_q));
+        ggml_backend_tensor_set(table, block_table.data(), 0, ggml_nbytes(table));
+        ggml_backend_tensor_set(ordinary_lens, layout.kv_seq_lens.data(), 0, ggml_nbytes(ordinary_lens));
+        ggml_backend_tensor_set(tree_lens, prefix_lens, 0, sizeof(prefix_lens));
+        ggml_backend_tensor_set(ordinary_slots, ordinary_ids.data(), 0, ggml_nbytes(ordinary_slots));
+        ggml_backend_tensor_set(positions, ordinary_positions.data(), 0, ggml_nbytes(positions));
+        ggml_backend_tensor_set(tree_slots, tree_ids.data(), 0, ggml_nbytes(tree_slots));
+        ggml_backend_tensor_set(parents, parent_ids.data(), 0, ggml_nbytes(parents));
+        const auto k_data = quantize_rows(type, k_source, pool_tokens * N_HEAD_KV);
+        const auto v_data = quantize_rows(type, v_source, pool_tokens * N_HEAD_KV);
+        if (k_data.empty() || v_data.empty()) { ok = false; break; }
+        const int32_t tree_sizes[] = {live_nodes, live_nodes};
+        ggml_backend_tensor_set(k, k_data.data(), 0, k_data.size());
+        ggml_backend_tensor_set(v, v_data.data(), 0, v_data.size());
+        ggml_backend_tensor_set(sizes, tree_sizes, 0, sizeof(tree_sizes));
+        if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) { ok = false; break; }
+        std::vector<float> ordinary_result(ggml_nelements(ordinary)), tree_result(ggml_nelements(tree));
+        ggml_backend_tensor_get(ordinary, ordinary_result.data(), 0, ggml_nbytes(ordinary));
+        ggml_backend_tensor_get(tree, tree_result.data(), 0, ggml_nbytes(tree));
+        std::vector<float> actual_roots, expected_roots;
+        for (int head = 0; head < N_HEAD; ++head) {
+            for (int lane = 0; lane < lanes; ++lane) {
+                const float * expected = ordinary_result.data() + (static_cast<size_t>(head) * ordinary_rows + root_row + lane) * D;
+                const float * actual = tree_result.data() + (static_cast<size_t>(head) * tree_rows + lane * width) * D;
+                expected_roots.insert(expected_roots.end(), expected, expected + D);
+                actual_roots.insert(actual_roots.end(), actual, actual + D);
+            }
+        }
+        if (reference_roots.empty()) {
+            reference_roots = expected_roots;
+            if (cohort_reference) *cohort_reference = reference_roots;
+        }
+        const auto finite = [](float value) { return std::isfinite(value); };
+        const bool equal = std::all_of(actual_roots.begin(), actual_roots.end(), finite) &&
+            std::all_of(expected_roots.begin(), expected_roots.end(), finite) &&
+            std::memcmp(actual_roots.data(), reference_roots.data(), actual_roots.size() * sizeof(float)) == 0 &&
+            std::memcmp(expected_roots.data(), reference_roots.data(), expected_roots.size() * sizeof(float)) == 0;
+        std::printf("paged attention root parity prefix=%d bound=%d rows=%d type=%s nodes=%d %s\n",
+                    prefix, max_kv_len, ordinary_rows,
+                    ggml_type_name(type), live_nodes, equal ? "PASS" : "FAIL");
+        ok = ok && equal;
+    }
+    ggml_gallocr_free(allocator);
+    ggml_free(ctx);
+    return ok;
+}
+
 bool rejects_unlaunchable_gqa(ggml_backend_t backend) {
     ggml_init_params params{};
     params.mem_size = 2 * 1024 * 1024;
@@ -572,14 +731,51 @@ void run_mixed_tree_case() {
             7, 8, 9, 10, 11, 12, 13, 14,
         },
         {16},
-        2,
+        5,
     };
-    std::vector<int32_t> query_slots{1, 0};
+    // Two positioned ragged segments precede the speculative tree suffix.
+    // The operator treats every leading positioned row as durable causal
+    // work, regardless of whether the row came from prefill or one-token AR.
+    std::vector<int32_t> query_slots{1, 1, 1, 0, 0};
     query_slots.insert(query_slots.end(), 16, 2);
-    std::vector<int32_t> query_positions{7, 15};
+    std::vector<int32_t> query_positions{5, 6, 7, 14, 15};
     query_positions.insert(query_positions.end(), 16, -1);
     CHECK(run_case(backend, mixed_case, GGML_TYPE_F16, GGML_TYPE_F16,
                    &query_slots, &query_positions, &tree_metadata));
+    ggml_backend_free(backend);
+}
+
+void run_reference_tree_case() {
+    luce_test::ScopedEnvVar disable_wmma("DFLASH27B_PAGED_WMMA", "0");
+    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    REQUIRE_NOT_NULL(backend);
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        CHECK(mixed_tree_roots_match_ordinary(backend, 265, 512, type));
+        CHECK(mixed_tree_roots_match_ordinary(backend, 1016, 1024, type));
+        CHECK(mixed_tree_roots_match_ordinary(backend, 1024, 1280, type));
+    }
+    ggml_backend_free(backend);
+}
+
+void run_invariant_tree_case() {
+    luce_test::ScopedEnvVar disable_wmma("DFLASH27B_PAGED_WMMA", "0");
+    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    REQUIRE_NOT_NULL(backend);
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (int prefix : {265, 1309}) {
+            std::vector<float> reference;
+            const int short_bound = ((prefix + 1 + 255) / 256) * 256;
+            // A longer peer expands the host launch window while this row's
+            // visible Q/K/V stays identical. Also change the ordinary cohort
+            // width and compare against W8 roots.
+            for (int bound : {short_bound, 8192}) {
+                for (int rows : {2, 3, 4, 16, 24, 32, 1026}) {
+                    CHECK(mixed_tree_roots_match_ordinary(
+                        backend, prefix, bound, type, rows, &reference));
+                }
+            }
+        }
+    }
     ggml_backend_free(backend);
 }
 
@@ -664,8 +860,28 @@ TEST_CASE(PagedAttention, PackedTreesMatchReference) {
     run_tree_case();
 }
 
-TEST_CASE(PagedAttention, CompactArAndFixedChainMatchReference) {
+TEST_CASE(PagedAttention, RaggedDirectPrefixAndFixedChainMatchReference) {
     run_mixed_tree_case();
+}
+
+TEST_CASE(PagedAttention, MixedTreeRootsPreserveOrdinaryReduction) {
+    luce_test::ScopedEnvVar partitions("GGML_CUDA_PAGED_ATTN_FORCE_PARTITIONS", "0");
+    run_reference_tree_case();
+}
+
+TEST_CASE(PagedAttention, MixedTreeRootsPreserveSinglePartitionReduction) {
+    luce_test::ScopedEnvVar partitions("GGML_CUDA_PAGED_ATTN_FORCE_PARTITIONS", "1");
+    run_reference_tree_case();
+}
+
+TEST_CASE(PagedAttention, RootsIgnoreCohortAndLaunchBound) {
+    luce_test::ScopedEnvVar partitions("GGML_CUDA_PAGED_ATTN_FORCE_PARTITIONS", "0");
+    run_invariant_tree_case();
+}
+
+TEST_CASE(PagedAttention, TreeRootsPreserveForcedPartitionReduction) {
+    luce_test::ScopedEnvVar partitions("GGML_CUDA_PAGED_ATTN_FORCE_PARTITIONS", "9");
+    run_invariant_tree_case();
 }
 
 TEST_CASE(PagedAttention, CyclicParentMetadataIsMasked) {
