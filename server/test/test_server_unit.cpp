@@ -3777,6 +3777,16 @@ TEST_CASE(ServerUnitFixture, test_pflash_config_modes) {
     TEST_ASSERT(cfg.pflash_mode != ServerConfig::PflashMode::AUTO);
 }
 
+TEST_CASE(ServerUnitFixture, test_pflash_exact_request_bypasses_compression) {
+    const json exact = {
+        {"extra_body", {{"lucebox_cache", {{"mode", "exact"}}}}}};
+    const json automatic = {
+        {"extra_body", {{"lucebox_cache", {{"mode", "auto"}}}}}};
+    TEST_ASSERT(!http_detail::request_allows_pflash_compression(exact));
+    TEST_ASSERT(http_detail::request_allows_pflash_compression(automatic));
+    TEST_ASSERT(http_detail::request_allows_pflash_compression(json::object()));
+}
+
 TEST_CASE(ServerUnitFixture, test_pflash_compress_request_struct) {
     ModelBackend::CompressRequest req;
     req.input_ids = {1, 2, 3, 4, 5};

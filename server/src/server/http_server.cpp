@@ -266,6 +266,18 @@ static float pflash_keep_ratio(const ServerConfig & cfg, int n_tokens) {
 
 namespace http_detail {
 
+bool request_allows_pflash_compression(const json & body) {
+    if (!body.is_object() || !body.contains("extra_body")) return true;
+    const auto & extra = body["extra_body"];
+    if (!extra.is_object() || !extra.contains("lucebox_cache")) return true;
+    const auto & cache = extra["lucebox_cache"];
+    if (!cache.is_object() || !cache.contains("mode") ||
+        !cache["mode"].is_string()) {
+        return true;
+    }
+    return cache["mode"].get<std::string>() != "exact";
+}
+
 int flowkv_activation_threshold(const ServerConfig & config) {
     return config.pflash_mode == ServerConfig::PflashMode::ALWAYS
         ? kFlowKvInertMinTokens
@@ -2332,6 +2344,7 @@ bool HttpServer::validate_request_context(
     const bool pflash_will_run =
         config_.pflash_mode != ServerConfig::PflashMode::OFF &&
         drafter_tokenizer_ != nullptr &&
+        http_detail::request_allows_pflash_compression(req.raw_body) &&
         (config_.pflash_mode == ServerConfig::PflashMode::ALWAYS ||
          prompt_tokens >= config_.pflash_threshold);
     if (!should_reject_oversized(
@@ -3257,6 +3270,7 @@ HttpServer::PreparedPrompt HttpServer::prepare_prompt(
     prepared.tokens = req.prompt_tokens;
 
     if (config_.pflash_mode != ServerConfig::PflashMode::OFF &&
+        http_detail::request_allows_pflash_compression(req.raw_body) &&
         drafter_tokenizer_ != nullptr) {
         const int prompt_tokens = (int) req.prompt_tokens.size();
         bool should_compress =

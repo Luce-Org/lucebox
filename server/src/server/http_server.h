@@ -291,6 +291,10 @@ PflashQueryWindow find_pflash_query_window(
     int search_end,
     int max_tokens = 8);
 
+// Per-request exact mode bypasses every lossy PFlash representation. Missing
+// metadata and auto mode retain the server's configured compression policy.
+bool request_allows_pflash_compression(const json & body);
+
 }  // namespace http_detail
 
 // ─── Parsed request ─────────────────────────────────────────────────────

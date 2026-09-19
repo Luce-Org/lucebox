@@ -79,6 +79,7 @@ public:
             if (!load_drafter(request.drafter_path, 999, request.drafter_gpu,
                               drafter_)) {
                 std::fprintf(stderr, "[compress-proxy] drafter load failed\n");
+                dflash::common::free_drafter(drafter_);
                 return result;
             }
             drafter_loaded_ = true;
