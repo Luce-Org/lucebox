@@ -969,11 +969,10 @@ ModelBackend::CompressResult Qwen3Backend::compress(const CompressRequest & req)
         drafter_loaded_ = true;
     }
 
-    result.compressed_ids = drafter_score_and_compress(
+    result = CompressResult::from_compressed_ids(drafter_score_and_compress(
         drafter_ctx_, req.input_ids, req.keep_ratio,
         /*chunk_size=*/32, req.score_query_tokens, /*pool_kernel=*/13,
-        req.score_query_end);
-    result.ok = !result.compressed_ids.empty();
+        req.score_query_end, req.required_instruction_spans));
 
     if (req.residency_action == DraftResidencyAction::ReleaseAfterUse) {
         free_drafter();
@@ -1038,7 +1037,7 @@ bool Qwen3Backend::handle_compress(const std::string & line, const DaemonIO & io
 
     for (int32_t t : compressed) io.emit(t);
     io.emit(-1);
-    return true;
+    return !compressed.empty();
 }
 
 void Qwen3Backend::free_drafter() {

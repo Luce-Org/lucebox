@@ -562,7 +562,9 @@ bool load_target_gguf_partial(const std::string & path,
     out.tok_embd = g("token_embd.weight");
     out.out_norm = g("output_norm.weight");
     out.output   = g("output.weight");
-    if (!out.tok_embd || !out.out_norm || !out.output) {
+    // Tied-embedding exports omit output.weight; that is only fatal when the
+    // load plan needs the lm_head (the PFlash drafter never computes logits).
+    if (!out.tok_embd || !out.out_norm || (!out.output && plan.load_output)) {
         set_last_error("missing top-level tensors (token_embd/output_norm/output)");
         gguf_free(gctx);
         return false;

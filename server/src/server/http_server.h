@@ -281,22 +281,81 @@ bool canonical_assistant_content(
 struct PflashQueryWindow {
     int end = -1;       // exclusive token offset in the rendered prompt
     int tokens = 0;     // width of the matching query suffix
+    int trailing_trimmed = 0;  // query tokens dropped from its end to match
 
     bool valid() const { return end >= tokens && tokens > 0; }
 };
 
-// Select the final normalized user message as the scorer query. Public for
-// model-free coverage of every request shape accepted by prompt rendering.
-std::string pflash_user_query_text(
+struct PflashInstructionMessagePlan {
+    std::vector<size_t> instruction_messages;
+};
+
+PflashInstructionMessagePlan plan_pflash_instruction_messages(
     const std::vector<ChatMessage> & messages);
 
-// Find the last sufficiently-specific suffix of the user query before the
-// assistant-generation suffix. Public for model-free regression tests.
+// Return the conservative token interval in `original` changed by rendering
+// a request variant. Used to retain tool definitions independently of where
+// an arbitrary chat template places them.
+PFlashTokenSpan pflash_changed_token_span(
+    const std::vector<int32_t> & original,
+    const std::vector<int32_t> & variant) noexcept;
+
+// Sort and merge overlapping/adjacent mapped spans before selector validation.
+std::vector<PFlashTokenSpan> canonicalize_pflash_token_spans(
+    std::vector<PFlashTokenSpan> spans);
+
+// Find the last sufficiently-specific suffix of the user query inside the
+// rendered drafter-tokenized prompt. Public for model-free regression tests.
 PflashQueryWindow find_pflash_query_window(
     const std::vector<int32_t> & prompt,
     const std::vector<int32_t> & query,
-    int search_end,
-    int max_tokens = 8);
+    int max_tokens = 8,
+    int search_end = -1,
+    int search_begin = 0,
+    bool anchored = true);
+
+PflashQueryWindow pflash_tail_query_window(
+    const std::vector<int32_t> & prompt,
+    int max_tokens,
+    int query_end = -1,
+    int query_begin = 0) noexcept;
+
+// Map the last occurrence of `needle` inside the decoded token text of
+// `prompt[begin, end)` to the token span covering it. Searching the joined
+// per-token text (not a standalone encoding of `needle`) keeps the mapping
+// correct at BPE boundary merges: a token that spans the needle's first or
+// last character (e.g. " What" after "Question:") is included in the span.
+// Returns {-1, -1} when the needle is absent or the range is invalid.
+PFlashTokenSpan pflash_decoded_text_span(
+    const Tokenizer & tokenizer,
+    const std::vector<int32_t> & prompt,
+    int begin,
+    int end,
+    const std::string & needle);
+
+// Return the original prompt offset immediately before the stable trailing
+// suffix shared with a version whose latest user message carries a sentinel.
+// Invalid when no such bounded suffix can establish the semantic boundary.
+int pflash_query_search_end_from_sentinel(
+    const std::vector<int32_t> & original,
+    const std::vector<int32_t> & sentinel) noexcept;
+
+// Return the first token offset affected by a version whose selected message
+// content carries a leading sentinel. This is a conservative lower bound for
+// the selected content in the original rendered prompt.
+int pflash_query_search_begin_from_sentinel(
+    const std::vector<int32_t> & original,
+    const std::vector<int32_t> & sentinel) noexcept;
+
+std::string pflash_token_fingerprint(
+    const std::vector<int32_t> & ids);
+
+bool pflash_full_cache_restore_allowed(
+    bool selection_environment_present) noexcept;
+bool pflash_continuation_must_fail_closed(
+    bool selection_environment_present) noexcept;
+int pflash_target_token_ceiling(
+    int original_target_tokens, double keep_ratio) noexcept;
 
 }  // namespace http_detail
 
@@ -343,6 +402,11 @@ struct ParsedRequest {
     std::vector<std::string>  stop_sequences;
     // Bandit: per-session adaptive keep_ratio opt-in
     std::string               session_id;
+    std::string               pflash_query;   // explicit scorer query text (optional request field)
+    // Literal strings inside the boundary message that must survive
+    // compression (e.g. an answer-format directive embedded in a user
+    // message). Each occurrence is mapped and retained as a mandatory span.
+    std::vector<std::string>  pflash_required;
     DiskPrefixCachePolicy     disk_cache_policy;
     // PPP: stable pin cut for tool-heavy requests (0 = use default boundary).
     int                       pin_end_token = 0;
@@ -416,6 +480,7 @@ public:
 
 private:
     friend struct SchedulerTestHarness;
+    friend struct HttpServerTestAccess;
 
     // Client thread: read HTTP request, parse, enqueue job, wait.
     void handle_client(SocketHandle fd);
@@ -703,6 +768,46 @@ struct ServerJob {
 // ─── Parse session_id from a chat-completion JSON body ──────────────────
 // Returns empty string when session_id is absent or not a string (int/null/array).
 // Checks extra_body.session_id first, then top-level session_id.
+// PFlash: an explicit scorer query. The compressor scores context against
+// this text instead of the last user message's tail, so a caller that knows
+// its question (a benchmark, a RAG layer) can hand it over. Accepted at the top
+// level or under extra_body, like session_id.
+inline std::string parse_pflash_query_from_body(const json & body) {
+    if (body.contains("extra_body")) {
+        const auto & eb = body["extra_body"];
+        if (eb.is_object() && eb.contains("pflash_query") && eb["pflash_query"].is_string()) {
+            return eb["pflash_query"].get<std::string>();
+        }
+    }
+    if (body.contains("pflash_query") && body["pflash_query"].is_string()) {
+        return body["pflash_query"].get<std::string>();
+    }
+    return {};
+}
+
+// PFlash: literal strings that must survive compression. Each string must
+// occur inside the boundary message's content; the compressor marks its last
+// occurrence there as a mandatory retention span. Accepted at the top level
+// or under extra_body, like pflash_query.
+inline std::vector<std::string> parse_pflash_required_from_body(const json & body) {
+    const json * field = nullptr;
+    if (body.contains("extra_body")) {
+        const auto & eb = body["extra_body"];
+        if (eb.is_object() && eb.contains("pflash_required") && eb["pflash_required"].is_array()) {
+            field = &eb["pflash_required"];
+        }
+    }
+    if (!field && body.contains("pflash_required") && body["pflash_required"].is_array()) {
+        field = &body["pflash_required"];
+    }
+    std::vector<std::string> result;
+    if (!field) return result;
+    for (const auto & entry : *field) {
+        if (entry.is_string()) result.push_back(entry.get<std::string>());
+    }
+    return result;
+}
+
 inline std::string parse_session_id_from_body(const json & body) {
     if (body.contains("extra_body")) {
         const auto & eb = body["extra_body"];

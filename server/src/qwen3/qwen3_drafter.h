@@ -13,6 +13,8 @@
 
 #pragma once
 
+#include "common/pflash_types.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -82,6 +84,8 @@ std::vector<int32_t> drafter_score_and_compress(
     int    chunk_size  = 32,
     int    n_lookahead = 8,
     int    pool_kernel = 13,
-    int    score_query_end = -1);
+    int    score_query_end = -1,
+    const std::vector<PFlashTokenSpan> &
+        required_instruction_spans = {});
 
 } // namespace dflash::common

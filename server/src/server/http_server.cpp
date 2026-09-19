@@ -27,6 +27,7 @@
 #include "pin_friendly_prompt.h"
 #include "common/kv_rotation.h"
 #include "common/sha1.h"
+#include "qwen3/pflash_selection.h"
 #include "freeze_history.h"
 
 #ifdef DFLASH_HAS_CURL
@@ -37,6 +38,7 @@
 #include <array>
 #include <cerrno>
 #include <chrono>
+#include <climits>
 #include <cctype>
 #include <cmath>
 #include <cstdint>
@@ -189,38 +191,245 @@ HeartbeatSendResult try_send_sse_heartbeat(
     return HeartbeatSendResult::Complete;
 }
 
-std::string pflash_user_query_text(
-        const std::vector<ChatMessage> & messages) {
-    for (auto it = messages.rbegin(); it != messages.rend(); ++it) {
-        if (it->role == "user") return it->content;
-    }
-    return {};
-}
-
 PflashQueryWindow find_pflash_query_window(
         const std::vector<int32_t> & prompt,
         const std::vector<int32_t> & query,
+        int max_tokens,
         int search_end,
-        int max_tokens) {
-    if (prompt.empty() || query.empty() || search_end < 1 ||
-        search_end > (int) prompt.size() || max_tokens < 1) {
-        return {};
-    }
+        int search_begin,
+        bool anchored) {
+    PflashQueryWindow result;
+    if (prompt.empty() || query.empty() || max_tokens < 1) return result;
 
+    const int limit = search_end < 0
+        ? (int) prompt.size()
+        : (std::min)((int) prompt.size(), search_end);
+    if (limit < 1 || search_begin < 0 || search_begin >= limit) return result;
     const int widest = (std::min)(max_tokens, (int) query.size());
     // For a short query, require all available tokens. For a normal query,
     // four matching suffix tokens are enough to tolerate a BPE boundary
     // difference without accidentally selecting a lone punctuation token.
     const int narrowest = (std::min)(4, widest);
-    const auto prompt_end = prompt.begin() + search_end;
-    for (int width = widest; width >= narrowest; --width) {
-        const auto match = std::find_end(
-            prompt.begin(), prompt_end, query.end() - width, query.end());
-        if (match != prompt_end) {
-            return {(int) (match - prompt.begin()) + width, width};
+    // A configured semantic boundary is the exact content end. Shorten only
+    // the suffix width there; accepting an earlier occurrence would silently
+    // turn a failed latest-user mapping into preceding context.
+    if (search_end >= 0 && anchored) {
+        const int bounded_widest = (std::min)(widest, limit - search_begin);
+        for (int width = bounded_widest; width >= narrowest; --width) {
+            const auto query_begin = query.end() - width;
+            if (std::equal(query_begin, query.end(),
+                           prompt.begin() + limit - width)) {
+                result.end = limit;
+                result.tokens = width;
+                return result;
+            }
+        }
+        return result;
+    }
+    // Unanchored: the latest occurrence of the (suffix-trimmed) query inside
+    // [search_begin, limit). An explicit query may sit before trailing
+    // instructions, so it is not required to end at the content boundary.
+    // Its last token may also merge with what follows it in the prompt
+    // (trailing whitespace before a newline), so up to two trailing query
+    // tokens may be dropped; the untrimmed query is always preferred.
+    const int floor = (std::max)(0, search_begin);
+    const int max_trailing = (std::min)(2, (int) query.size() - narrowest);
+    for (int drop = 0; drop <= max_trailing; ++drop) {
+        const auto query_end = query.end() - drop;
+        const int available = (int) query.size() - drop;
+        const int drop_widest = (std::min)(max_tokens, available);
+        for (int width = drop_widest; width >= narrowest; --width) {
+            const auto query_begin = query_end - width;
+            for (int end = limit; end - width >= floor; --end) {
+                if (std::equal(query_begin, query_end,
+                               prompt.begin() + end - width)) {
+                    result.end = end;
+                    result.tokens = width;
+                    result.trailing_trimmed = drop;
+                    return result;
+                }
+            }
         }
     }
-    return {};
+    return result;
+}
+
+PflashQueryWindow pflash_tail_query_window(
+        const std::vector<int32_t> & prompt,
+        int max_tokens,
+        int query_end,
+        int query_begin) noexcept {
+    PflashQueryWindow result;
+    if (prompt.empty() || max_tokens < 1) return result;
+    result.end = query_end < 0
+        ? static_cast<int>(prompt.size())
+        : query_end;
+    if (result.end < 1 || result.end > static_cast<int>(prompt.size()) ||
+        query_begin < 0 || query_begin >= result.end) {
+        return {};
+    }
+    result.tokens = (std::min)(max_tokens, result.end - query_begin);
+    return result;
+}
+
+PFlashTokenSpan pflash_decoded_text_span(
+        const Tokenizer & tokenizer,
+        const std::vector<int32_t> & prompt,
+        int begin,
+        int end,
+        const std::string & needle) {
+    if (needle.empty() || begin < 0 || end <= begin ||
+        end > (int) prompt.size()) {
+        return {-1, -1};
+    }
+    std::string decoded;
+    std::vector<size_t> offsets;
+    offsets.reserve((size_t)(end - begin));
+    for (int index = begin; index < end; ++index) {
+        offsets.push_back(decoded.size());
+        decoded += tokenizer.token_text(prompt[(size_t) index]);
+    }
+    const size_t pos = decoded.rfind(needle);
+    if (pos == std::string::npos) {
+        return {-1, -1};
+    }
+    const size_t needle_end = pos + needle.size();
+    int first = begin;
+    while (first + 1 < end && offsets[(size_t)(first + 1 - begin)] <= pos) {
+        ++first;
+    }
+    int after = first;
+    while (after < end && offsets[(size_t)(after - begin)] < needle_end) {
+        ++after;
+    }
+    return {first, after};
+}
+
+int pflash_query_search_end_from_sentinel(
+        const std::vector<int32_t> & original,
+        const std::vector<int32_t> & sentinel) noexcept {
+    size_t common_suffix = 0;
+    while (common_suffix < original.size() &&
+           common_suffix < sentinel.size() &&
+           original[original.size() - common_suffix - 1] ==
+               sentinel[sentinel.size() - common_suffix - 1]) {
+        ++common_suffix;
+    }
+    if (common_suffix == 0 || common_suffix >= original.size()) {
+        return -1;
+    }
+    return static_cast<int>(original.size() - common_suffix);
+}
+int pflash_query_search_begin_from_sentinel(
+        const std::vector<int32_t> & original,
+        const std::vector<int32_t> & sentinel) noexcept {
+    size_t common_prefix = 0;
+    while (common_prefix < original.size() &&
+           common_prefix < sentinel.size() &&
+           original[common_prefix] == sentinel[common_prefix]) {
+        ++common_prefix;
+    }
+    if (common_prefix >= original.size()) return -1;
+    return static_cast<int>(common_prefix);
+}
+
+PflashInstructionMessagePlan plan_pflash_instruction_messages(
+        const std::vector<ChatMessage> & messages) {
+    PflashInstructionMessagePlan plan;
+    for (size_t index = 0; index < messages.size(); ++index) {
+        const auto & message = messages[index];
+        const bool instruction_role =
+            message.role == "system" || message.role == "developer";
+        if (instruction_role && !message.content.empty()) {
+            plan.instruction_messages.push_back(index);
+        }
+    }
+    return plan;
+}
+
+PFlashTokenSpan pflash_changed_token_span(
+        const std::vector<int32_t> & original,
+        const std::vector<int32_t> & variant) noexcept {
+    size_t common_prefix = 0;
+    while (common_prefix < original.size() &&
+           common_prefix < variant.size() &&
+           original[common_prefix] == variant[common_prefix]) {
+        ++common_prefix;
+    }
+
+    size_t common_suffix = 0;
+    while (common_suffix < original.size() - common_prefix &&
+           common_suffix < variant.size() - common_prefix &&
+           original[original.size() - common_suffix - 1] ==
+               variant[variant.size() - common_suffix - 1]) {
+        ++common_suffix;
+    }
+
+    const int begin = static_cast<int>(common_prefix);
+    const int end = static_cast<int>(original.size() - common_suffix);
+    return end > begin ? PFlashTokenSpan{begin, end}
+                       : PFlashTokenSpan{-1, -1};
+}
+
+std::vector<PFlashTokenSpan> canonicalize_pflash_token_spans(
+        std::vector<PFlashTokenSpan> spans) {
+    std::sort(spans.begin(), spans.end(), [] (
+            const PFlashTokenSpan & left,
+            const PFlashTokenSpan & right) {
+        return left.begin < right.begin ||
+            (left.begin == right.begin && left.end < right.end);
+    });
+    std::vector<PFlashTokenSpan> result;
+    for (const PFlashTokenSpan & span : spans) {
+        if (!result.empty() && span.begin <= result.back().end) {
+            result.back().end = std::max(result.back().end, span.end);
+        } else {
+            result.push_back(span);
+        }
+    }
+    return result;
+}
+
+std::string pflash_token_fingerprint(
+        const std::vector<int32_t> & ids) {
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (int32_t token : ids) {
+        const uint32_t value = static_cast<uint32_t>(token);
+        for (int shift = 0; shift < 32; shift += 8) {
+            hash ^= static_cast<uint8_t>(value >> shift);
+            hash *= UINT64_C(1099511628211);
+        }
+    }
+
+    char encoded[17];
+    std::snprintf(encoded, sizeof(encoded), "%016llx",
+                  static_cast<unsigned long long>(hash));
+    return encoded;
+}
+
+
+bool pflash_full_cache_restore_allowed(
+        bool selection_environment_present) noexcept {
+    return !selection_environment_present;
+}
+
+bool pflash_continuation_must_fail_closed(
+        bool selection_environment_present) noexcept {
+    return selection_environment_present;
+}
+
+int pflash_target_token_ceiling(
+        int original_target_tokens, double keep_ratio) noexcept {
+    if (original_target_tokens < 0 || !std::isfinite(keep_ratio) ||
+        keep_ratio <= 0.0) {
+        return -1;
+    }
+    const double ceiling = std::floor(
+        static_cast<double>(original_target_tokens) * keep_ratio);
+    if (!std::isfinite(ceiling) || ceiling < 0.0 || ceiling > INT_MAX) {
+        return -1;
+    }
+    return static_cast<int>(ceiling);
 }
 
 }  // namespace http_detail
@@ -280,9 +489,11 @@ bool flowkv_should_activate(const ServerConfig & config,
 float resolve_pflash_keep_ratio(float configured_ratio,
                                 const std::string & session_id,
                                 const HttpServerSessions & sessions) {
+    // A session adapts from the configured (curve) ratio: until its first
+    // acceptance feedback it keeps that ratio, afterwards the controller's.
     return session_id.empty()
         ? configured_ratio
-        : sessions.get_keep_ratio(session_id);
+        : sessions.get_keep_ratio(session_id, configured_ratio);
 }
 
 bool should_clamp_flowkv_disk_cache(
@@ -2436,6 +2647,8 @@ bool HttpServer::handle_model_request(SocketHandle fd, ParsedRequest & req,
         apply_request_reasoning(body, config_, req);
         // Bandit: parse session_id from extra_body (opt-in adaptive keep_ratio).
         req.session_id = parse_session_id_from_body(body);
+        req.pflash_query = parse_pflash_query_from_body(body);
+        req.pflash_required = parse_pflash_required_from_body(body);
 
         // PPP rearrange (optional): peel ephemeral system banners into a
         // following system message so the first chat boundary is stable.
@@ -3112,8 +3325,11 @@ void HttpServer::apply_flowkv_compression(
 
 std::string HttpServer::apply_pflash_compression(
         const ParsedRequest & req, PreparedPrompt & prepared) {
+    const bool selection_environment =
+        dflash::qwen3::has_pflash_selection_environment();
     auto [full_slot, full_len] = prefix_cache_.lookup_full(req.prompt_tokens);
-    if (full_slot >= 0) {
+    if (http_detail::pflash_full_cache_restore_allowed(
+            selection_environment) && full_slot >= 0) {
         std::fprintf(stderr,
             "[pflash] full-cache hit slot=%d — skipping compress\n",
             full_slot);
@@ -3130,45 +3346,368 @@ std::string HttpServer::apply_pflash_compression(
     const std::string prompt_text = tokenizer_.decode(req.prompt_tokens);
     auto drafter_ids = drafter_tokenizer_->encode(prompt_text);
 
-    const std::vector<ChatMessage> chat_messages = normalize_chat_messages(
-        req.messages, req.format, tool_memory_);
-    std::string rendered_messages;
-    std::string render_error;
-    if (!render_messages_to_text(
-            chat_messages, req, /*add_generation_prompt=*/false,
-            rendered_messages, render_error)) {
-        std::fprintf(stderr,
-            "[pflash] ERROR: scorer query boundary render failed; "
-            "refusing compression\n");
-        return "PFlash scorer query boundary render failed";
-    }
-    const std::string normalized_messages = tokenizer_.decode(
-        tokenizer_.encode(rendered_messages));
-    const auto rendered_message_ids = drafter_tokenizer_->encode(
-        normalized_messages);
-    const auto shared_end = std::mismatch(
-        drafter_ids.begin(), drafter_ids.end(),
-        rendered_message_ids.begin(), rendered_message_ids.end()).first;
-    const int query_search_end = (int) (shared_end - drafter_ids.begin());
-
-    const std::string last_user_text =
-        http_detail::pflash_user_query_text(chat_messages);
-    const auto query_ids = last_user_text.empty()
-        ? std::vector<int32_t>{}
-        : drafter_tokenizer_->encode(last_user_text);
-    const auto query_window = http_detail::find_pflash_query_window(
-        drafter_ids, query_ids, query_search_end);
     if (drafter_ids.empty()) {
         return "PFlash drafter tokenizer produced an empty prompt";
     }
 
+    dflash::qwen3::PFlashSelectionConfig experiment;
+    std::string experiment_error;
+    if (!dflash::qwen3::resolve_pflash_selection(
+            (int) drafter_ids.size(), 32, experiment, experiment_error)) {
+        return "invalid PFlash strict selection config: " + experiment_error;
+    }
+    if (!experiment.selection_active && !req.pflash_required.empty()) {
+        return "PFlash pflash_required needs strict budget selection";
+    }
+
+    const bool messages_input =
+        req.messages.is_array() && !req.messages.empty();
+    const bool raw_text_input = req.messages.is_string();
+    const char * parser_input_kind = messages_input
+        ? "messages" : (raw_text_input ? "raw_text" : "unsupported");
+    std::string parser_selection_rule;
+    std::string last_user_text;
+    int query_content_begin = -1;
+    int query_content_end = -1;
+    // Complete token span of an explicit pflash_query inside the boundary
+    // content, when it was mapped against the decoded token text. The strict
+    // selector keeps the whole span mandatory; the scorer window is its tail.
+    PFlashTokenSpan explicit_query_span{-1, -1};
+    std::vector<PFlashTokenSpan> required_instruction_spans;
+    if (experiment.configured) {
+        if (!messages_input && !raw_text_input) {
+            return "PFlash strict selection input has no parseable text";
+        }
+        try {
+            auto messages =
+                normalize_chat_messages(req.messages, req.format, tool_memory_);
+            if (messages.empty()) {
+                return "PFlash strict selection normalized messages are empty";
+            }
+
+            int last_user_index = -1;
+            for (int index = (int) messages.size() - 1; index >= 0; --index) {
+                if (messages[(size_t) index].role == "user") {
+                    last_user_index = index;
+                    break;
+                }
+            }
+            if (last_user_index >= 0) {
+                last_user_text = messages[(size_t) last_user_index].content;
+            }
+
+            int boundary_index = (int) messages.size() - 1;
+            if (!raw_text_input &&
+                experiment.query_parser ==
+                    dflash::qwen3::PFlashQueryParser::SemanticUser) {
+                boundary_index = last_user_index;
+            }
+            if (boundary_index < 0 ||
+                (experiment.query_parser ==
+                     dflash::qwen3::PFlashQueryParser::SemanticUser &&
+                 !raw_text_input && last_user_text.empty())) {
+                return "PFlash strict selection latest-user boundary is unavailable";
+            }
+
+            static constexpr const char * kContentBegin =
+                "__DFLASH_PFLASH_CONTENT_BEGIN_02C47F91__";
+            static constexpr const char * kContentEnd =
+                "__DFLASH_PFLASH_CONTENT_END_6E6B61A8__";
+            const auto map_message_content = [&] (
+                    size_t message_index,
+                    int & content_begin,
+                    int & content_end,
+                    std::string & boundary_error) -> bool {
+                auto begin_messages = messages;
+                begin_messages[message_index].content =
+                    std::string(kContentBegin) +
+                    begin_messages[message_index].content;
+                auto end_messages = messages;
+                end_messages[message_index].content += kContentEnd;
+
+                std::string begin_rendered;
+                std::string end_rendered;
+                if (!render_messages_to_text(
+                        begin_messages, req, /*add_generation_prompt=*/true,
+                        begin_rendered, boundary_error)) {
+                    boundary_error = "content-start render failed: " +
+                        boundary_error;
+                    return false;
+                }
+                boundary_error.clear();
+                if (!render_messages_to_text(
+                        end_messages, req, /*add_generation_prompt=*/true,
+                        end_rendered, boundary_error)) {
+                    boundary_error = "content-end render failed: " +
+                        boundary_error;
+                    return false;
+                }
+
+                const auto begin_ids = drafter_tokenizer_->encode(
+                    tokenizer_.decode(tokenizer_.encode(begin_rendered)));
+                const auto end_ids = drafter_tokenizer_->encode(
+                    tokenizer_.decode(tokenizer_.encode(end_rendered)));
+                content_begin =
+                    http_detail::pflash_query_search_begin_from_sentinel(
+                        drafter_ids, begin_ids);
+                content_end =
+                    http_detail::pflash_query_search_end_from_sentinel(
+                        drafter_ids, end_ids);
+                if (content_begin < 0 || content_end <= content_begin ||
+                    content_end >= (int) drafter_ids.size()) {
+                    boundary_error = "content boundary mapping failed";
+                    return false;
+                }
+                return true;
+            };
+            const auto map_rendered_message = [&] (
+                    size_t message_index,
+                    PFlashTokenSpan & message_span,
+                    std::string & boundary_error) -> bool {
+                auto without_message = messages;
+                without_message.erase(without_message.begin() + message_index);
+
+                std::string without_message_rendered;
+                if (!render_messages_to_text(
+                        without_message, req, /*add_generation_prompt=*/true,
+                        without_message_rendered, boundary_error)) {
+                    boundary_error = "message-removal render failed: " +
+                        boundary_error;
+                    return false;
+                }
+                const auto without_message_ids = drafter_tokenizer_->encode(
+                    tokenizer_.decode(tokenizer_.encode(
+                        without_message_rendered)));
+                message_span = http_detail::pflash_changed_token_span(
+                    drafter_ids, without_message_ids);
+                if (message_span.begin < 0) {
+                    boundary_error =
+                        "complete rendered message did not map to a prompt span";
+                    return false;
+                }
+                return true;
+            };
+
+            std::string boundary_error;
+            if (!map_message_content(
+                    (size_t) boundary_index,
+                    query_content_begin, query_content_end,
+                    boundary_error)) {
+                return "PFlash strict selection " + boundary_error;
+            }
+            if (query_content_begin < 0 ||
+                query_content_end <= query_content_begin ||
+                query_content_end >= (int) drafter_ids.size()) {
+                return "PFlash strict selection content boundary mapping failed";
+            }
+
+            if (experiment.selection_active) {
+                const auto instruction_plan =
+                    http_detail::plan_pflash_instruction_messages(messages);
+                for (size_t instruction_index :
+                        instruction_plan.instruction_messages) {
+                    PFlashTokenSpan instruction_span;
+                    boundary_error.clear();
+                    if (!map_rendered_message(
+                            instruction_index, instruction_span,
+                            boundary_error)) {
+                        return "PFlash strict selection instruction mapping failed: " +
+                            boundary_error;
+                    }
+                    required_instruction_spans.push_back(instruction_span);
+                }
+
+                if (!req.tools.is_null() && !req.tools.empty()) {
+                    ParsedRequest tool_free_req = req;
+                    tool_free_req.tools = json::array();
+                    std::string tool_free_rendered;
+                    boundary_error.clear();
+                    if (!render_messages_to_text(
+                            messages, tool_free_req,
+                            /*add_generation_prompt=*/true,
+                            tool_free_rendered, boundary_error)) {
+                        return "PFlash strict selection tool mapping failed: " +
+                            boundary_error;
+                    }
+                    const auto tool_free_ids = drafter_tokenizer_->encode(
+                        tokenizer_.decode(tokenizer_.encode(tool_free_rendered)));
+                    const PFlashTokenSpan tool_span =
+                        http_detail::pflash_changed_token_span(
+                            drafter_ids, tool_free_ids);
+                    if (tool_span.begin < 0) {
+                        return "PFlash strict selection tool mapping failed: "
+                            "tools did not produce a retained prompt span";
+                    }
+                    required_instruction_spans.push_back(tool_span);
+                }
+
+                // Client-declared literal text that must survive compression
+                // (e.g. an answer-format directive embedded in the user
+                // message). Each string maps to its last occurrence inside
+                // the boundary content; mapping failure fails the request
+                // rather than silently keeping a shorter span.
+                for (const auto & required : req.pflash_required) {
+                    if (required.empty()) continue;
+                    const PFlashTokenSpan required_span =
+                        http_detail::pflash_decoded_text_span(
+                            *drafter_tokenizer_, drafter_ids,
+                            query_content_begin, query_content_end, required);
+                    if (required_span.begin < 0) {
+                        return "PFlash strict selection required-text mapping "
+                            "failed: a pflash_required string does not occur "
+                            "in the latest user content";
+                    }
+                    required_instruction_spans.push_back(required_span);
+                }
+                // An explicit scorer query also pins its complete span: the
+                // whole question is mandatory even though the scorer only
+                // consumes its bounded tail. Mapping against the decoded
+                // content text (not a standalone encoding) keeps BPE boundary
+                // merges like " What" inside the span.
+                if (!req.pflash_query.empty() &&
+                    experiment.query_parser ==
+                        dflash::qwen3::PFlashQueryParser::SemanticUser) {
+                    explicit_query_span =
+                        http_detail::pflash_decoded_text_span(
+                            *drafter_tokenizer_, drafter_ids,
+                            query_content_begin, query_content_end,
+                            req.pflash_query);
+                    if (explicit_query_span.begin < 0) {
+                        return "PFlash strict selection explicit query mapping "
+                            "failed: pflash_query does not occur in the "
+                            "latest user content";
+                    }
+                    required_instruction_spans.push_back(explicit_query_span);
+                }
+                required_instruction_spans =
+                    http_detail::canonicalize_pflash_token_spans(
+                        std::move(required_instruction_spans));
+                std::string instruction_error;
+                if (!dflash::qwen3::validate_pflash_instruction_spans(
+                        required_instruction_spans,
+                        (int) drafter_ids.size(), instruction_error)) {
+                    return "PFlash strict selection instruction mapping failed: " +
+                        instruction_error;
+                }
+            }
+        } catch (const std::exception & error) {
+            return std::string("PFlash retention normalization failed: ") +
+                   error.what();
+        }
+    } else if (raw_text_input) {
+        last_user_text = req.messages.get<std::string>();
+    } else if (req.messages.is_array()) {
+        for (int index = (int) req.messages.size() - 1; index >= 0; --index) {
+            if (req.messages[index].value("role", "") != "user") continue;
+            const auto & content = req.messages[index]["content"];
+            if (content.is_string()) {
+                last_user_text = content.get<std::string>();
+            } else if (content.is_array()) {
+                for (const auto & part : content) {
+                    const std::string type = part.value("type", "");
+                    if (type == "text" || type == "input_text" ||
+                        type == "output_text") {
+                        last_user_text += part.value("text", "");
+                    }
+                }
+            }
+            break;
+        }
+    }
+
+    std::vector<int32_t> semantic_query_ids;
+    std::vector<int32_t> expected_query_ids;
+    http_detail::PflashQueryWindow query_window;
+    if (!req.pflash_query.empty()) {
+        // An explicit query replaces the message-tail heuristic; it must occur
+        // inside the latest user content so the window maps onto real tokens.
+        last_user_text = req.pflash_query;
+        parser_selection_rule = "explicit_query";
+    }
+    if (!last_user_text.empty()) {
+        semantic_query_ids = drafter_tokenizer_->encode(last_user_text);
+    }
+    if (experiment.configured && raw_text_input) {
+        parser_selection_rule = "content_tail";
+        query_window = http_detail::pflash_tail_query_window(
+            drafter_ids, experiment.query_tokens,
+            query_content_end, query_content_begin);
+    } else if (experiment.configured &&
+               experiment.query_parser ==
+                   dflash::qwen3::PFlashQueryParser::ArbitraryTail) {
+        parser_selection_rule = "prompt_tail";
+        query_window = http_detail::pflash_tail_query_window(
+            drafter_ids, experiment.query_tokens, query_content_end);
+    } else if (explicit_query_span.begin >= 0) {
+        // The explicit query was already mapped against the decoded content
+        // text and pinned as a mandatory span. The scorer consumes the span's
+        // bounded tail window; the complete span stays in the target prompt.
+        parser_selection_rule = "explicit_query_span";
+        query_window.end = explicit_query_span.end;
+        query_window.tokens = (std::min)(
+            experiment.query_tokens,
+            explicit_query_span.end - explicit_query_span.begin);
+        expected_query_ids.assign(
+            drafter_ids.begin() + (query_window.end - query_window.tokens),
+            drafter_ids.begin() + query_window.end);
+    } else if (!semantic_query_ids.empty()) {
+        if (experiment.configured) parser_selection_rule = "semantic_suffix";
+        query_window = http_detail::find_pflash_query_window(
+            drafter_ids, semantic_query_ids,
+            experiment.configured ? experiment.query_tokens : 8,
+            query_content_end,
+            experiment.configured ? query_content_begin : 0,
+            /*anchored=*/ req.pflash_query.empty());
+        if (experiment.configured && query_window.valid()) {
+            const auto matched_end =
+                semantic_query_ids.end() - query_window.trailing_trimmed;
+            expected_query_ids.assign(
+                matched_end - query_window.tokens, matched_end);
+        }
+    }
+
     ModelBackend::CompressRequest compress_request;
     compress_request.input_ids = std::move(drafter_ids);
+    compress_request.required_instruction_spans =
+        std::move(required_instruction_spans);
     compress_request.keep_ratio = http_detail::resolve_pflash_keep_ratio(
         pflash_keep_ratio(config_, prompt_tokens), req.session_id, sessions_);
     if (query_window.valid()) {
         compress_request.score_query_end = query_window.end;
         compress_request.score_query_tokens = query_window.tokens;
+        if (experiment.configured) {
+            const int query_begin = query_window.end - query_window.tokens;
+            json instruction_spans = json::array();
+            for (const auto & span :
+                    compress_request.required_instruction_spans) {
+                instruction_spans.push_back({span.begin, span.end});
+            }
+            const json provenance = {
+                {"schema_version", 1},
+                {"input_kind", parser_input_kind},
+                {"selection_rule", parser_selection_rule},
+                {"query_parser",
+                 dflash::qwen3::pflash_query_parser_name(
+                     experiment.query_parser)},
+                {"input_tokens", (int) compress_request.input_ids.size()},
+                {"input_fingerprint_fnv1a64",
+                 http_detail::pflash_token_fingerprint(
+                     compress_request.input_ids)},
+                {"content_begin", query_content_begin},
+                {"content_end", query_content_end},
+                {"query_begin", query_begin},
+                {"query_end", query_window.end},
+                {"query_span_begin", explicit_query_span.begin},
+                {"query_span_end", explicit_query_span.end},
+                {"requested_query_tokens", experiment.query_tokens},
+                {"required_text_count", req.pflash_required.size()},
+                {"expected_query_ids", expected_query_ids},
+                {"required_instruction_spans", instruction_spans},
+            };
+            std::fprintf(stderr, "[pflash-parser] %s\n",
+                         provenance.dump().c_str());
+            std::fflush(stderr);
+        }
         std::fprintf(stderr,
             "[pflash] scorer query mapped to drafter tokens [%d,%d); "
             "rendered suffix=%zu tokens\n",
@@ -3191,68 +3730,119 @@ std::string HttpServer::apply_pflash_compression(
         });
     compress_request.residency_action = residency;
 
+    // The selector budget is counted in drafter tokens, but the ceiling is
+    // enforced on the re-encoded target-token prompt. Vocabulary mismatches
+    // between the two tokenizers can inflate the re-encode past the ceiling,
+    // so retry with a tightened keep ratio; fail closed if it persists.
+    const int target_ceiling = experiment.selection_active
+        ? http_detail::pflash_target_token_ceiling(
+            prompt_tokens, compress_request.keep_ratio)
+        : -1;
+    if (experiment.selection_active && target_ceiling < 0) {
+        return "PFlash strict selection target-token ceiling is invalid";
+    }
+    const float requested_keep_ratio = compress_request.keep_ratio;
+
     ModelBackend::CompressResult result;
-    if (config_.pflash_remote_drafter) {
-        if (!pflash_remote_.active() &&
-            !pflash_remote_.start(config_.pflash_remote.ipc_bin,
-                                  config_.pflash_drafter_path,
-                                  config_.pflash_drafter_gpu,
-                                  config_.pflash_remote.work_dir)) {
-            return "remote PFlash drafter start failed";
+    std::vector<int32_t> final_tokens;
+    for (int attempt = 0; ; ++attempt) {
+        result = {};
+        if (config_.pflash_remote_drafter) {
+            if (!pflash_remote_.active() &&
+                !pflash_remote_.start(config_.pflash_remote.ipc_bin,
+                                      config_.pflash_drafter_path,
+                                      config_.pflash_drafter_gpu,
+                                      config_.pflash_remote.work_dir)) {
+                return "remote PFlash drafter start failed";
+            }
+            result.ok = pflash_remote_.compress(
+                compress_request.input_ids, compress_request.keep_ratio,
+                result.compressed_ids,
+                compress_request.score_query_end,
+                compress_request.score_query_tokens,
+                compress_request.required_instruction_spans);
+            if (residency == DraftResidencyAction::ReleaseAfterUse) {
+                pflash_remote_.close();
+            }
+        } else {
+            result = backend_.compress(compress_request);
         }
-        result.ok = pflash_remote_.compress(
-            compress_request.input_ids, compress_request.keep_ratio,
-            result.compressed_ids,
-            compress_request.score_query_end,
-            compress_request.score_query_tokens);
-        if (residency == DraftResidencyAction::ReleaseAfterUse) {
-            pflash_remote_.close();
+
+        if (!result.ok || result.compressed_ids.empty()) {
+            return config_.pflash_remote_drafter
+                ? "remote PFlash drafter compression failed"
+                : "PFlash compression failed";
         }
-    } else {
-        result = backend_.compress(compress_request);
-    }
 
-    if (!result.ok || result.compressed_ids.empty()) {
-        return config_.pflash_remote_drafter
-            ? "remote PFlash drafter compression failed"
-            : "PFlash compression failed";
-    }
+        std::string compressed_text =
+            drafter_tokenizer_->decode(result.compressed_ids);
 
-    std::string compressed_text =
-        drafter_tokenizer_->decode(result.compressed_ids);
-
-    // Compression is allowed to be lossy, but the active user query must
-    // survive. Re-append short queries when fewer than 80% of their tokens do.
-    if (!last_user_text.empty()) {
-        int query_kept = 0;
-        if (!query_ids.empty()) {
-            int query_index = (int) query_ids.size() - 1;
-            for (int kept_index = (int) result.compressed_ids.size() - 1;
-                 kept_index >= 0 && query_index >= 0; --kept_index) {
-                if (result.compressed_ids[kept_index] == query_ids[query_index]) {
-                    ++query_kept;
-                    --query_index;
+        // Compression is allowed to be lossy, but the active user query must
+        // survive. Re-append short queries when fewer than 80% of their tokens do.
+        if (!experiment.selection_active && !last_user_text.empty()) {
+            int query_kept = 0;
+            if (!semantic_query_ids.empty()) {
+                int query_index = (int) semantic_query_ids.size() - 1;
+                for (int kept_index = (int) result.compressed_ids.size() - 1;
+                     kept_index >= 0 && query_index >= 0; --kept_index) {
+                    if (result.compressed_ids[kept_index] == semantic_query_ids[query_index]) {
+                        ++query_kept;
+                        --query_index;
+                    }
                 }
             }
+            const float survival = (float) query_kept /
+                (std::max)(1, (int) semantic_query_ids.size());
+            std::fprintf(stderr,
+                "[pflash] query survival: %d/%d (%.0f%%)\n",
+                query_kept, (int) semantic_query_ids.size(), survival * 100.0f);
+            if (survival < 0.80f && (int) semantic_query_ids.size() < 1000) {
+                compressed_text += "\n" + last_user_text;
+                std::fprintf(stderr,
+                    "[pflash] query below 80%% — re-appended full query (%d tokens)\n",
+                    (int) semantic_query_ids.size());
+            } else if (survival < 0.80f) {
+                std::fprintf(stderr,
+                    "[pflash] query below 80%% but too large to re-append (%d tokens)\n",
+                    (int) semantic_query_ids.size());
+            }
         }
-        const float survival = (float) query_kept /
-            (std::max)(1, (int) query_ids.size());
+
+        final_tokens = tokenizer_.encode(compressed_text);
+        if (!experiment.selection_active ||
+            (int) final_tokens.size() <= target_ceiling) {
+            break;
+        }
+        const int overflow = (int) final_tokens.size() - target_ceiling;
+        const int tightened = target_ceiling - overflow - 1;
+        if (attempt >= 2 || tightened <= 0) {
+            break;
+        }
+        compress_request.keep_ratio =
+            requested_keep_ratio * (float) tightened /
+            (float) std::max(1, target_ceiling);
+        if (compress_request.keep_ratio <= 0.0f) {
+            break;
+        }
         std::fprintf(stderr,
-            "[pflash] query survival: %d/%d (%.0f%%)\n",
-            query_kept, (int) query_ids.size(), survival * 100.0f);
-        if (survival < 0.80f && (int) query_ids.size() < 1000) {
-            compressed_text += "\n" + last_user_text;
-            std::fprintf(stderr,
-                "[pflash] query below 80%% — re-appended full query (%d tokens)\n",
-                (int) query_ids.size());
-        } else if (survival < 0.80f) {
-            std::fprintf(stderr,
-                "[pflash] query below 80%% but too large to re-append (%d tokens)\n",
-                (int) query_ids.size());
+            "[pflash-select] final prompt %zu exceeds ceiling %d "
+            "(re-encode overshoot); retrying with keep_ratio %.6f\n",
+            final_tokens.size(), target_ceiling,
+            (double) compress_request.keep_ratio);
+        std::fflush(stderr);
+    }
+    if (experiment.selection_active) {
+        std::fprintf(stderr,
+            "[pflash-select] final target tokens=%zu ceiling=%d\n",
+            final_tokens.size(), target_ceiling);
+        std::fflush(stderr);
+        if ((int) final_tokens.size() > target_ceiling) {
+            return "PFlash strict selection final prompt exceeds target-token ceiling "
+                "(" + std::to_string(final_tokens.size()) + " > " +
+                std::to_string(target_ceiling) + ")";
         }
     }
-
-    prepared.tokens = tokenizer_.encode(compressed_text);
+    prepared.tokens = std::move(final_tokens);
     prepared.compressed = true;
     std::fprintf(stderr,
         "[pflash] %d -> %d -> %d tokens (%.1f%% kept)\n",
@@ -3276,6 +3866,27 @@ HttpServer::PreparedPrompt HttpServer::prepare_prompt(
              prompt_tokens >= config_.pflash_threshold);
         const bool continuation = should_compress &&
             is_continuation_request(req.messages);
+        const bool selection_environment =
+            dflash::qwen3::has_pflash_selection_environment();
+        if (should_compress && selection_environment) {
+            dflash::qwen3::PFlashSelectionConfig experiment;
+            std::string experiment_error;
+            if (!dflash::qwen3::resolve_pflash_selection(
+                    0, 32, experiment, experiment_error)) {
+                prepared.error_status = 500;
+                prepared.error = "invalid PFlash strict selection config: " +
+                    experiment_error;
+                return prepared;
+            }
+            if (http_detail::pflash_continuation_must_fail_closed(
+                    selection_environment) &&
+                (continuation || req.disk_cache_policy.compress)) {
+                prepared.error_status = 500;
+                prepared.error =
+                    "PFlash strict selection does not support continuation or FlowKV compression";
+                return prepared;
+            }
+        }
 
         if (should_compress && continuation && req.messages.is_array()) {
             // FlowKV owns continuation compression automatically. Falling
@@ -4420,9 +5031,11 @@ void HttpServer::process_job(ServerJob * job) {
     // Bandit: update when spec decode actually ran — including 0-accept case,
     // which signals the current keep_ratio is too low.
     if (result.ok() && !req.session_id.empty() && result.spec_decode_ran) {
-        float old_keep = sessions_.get_keep_ratio(req.session_id);
+        const float configured_keep =
+            pflash_keep_ratio(config_, (int) req.prompt_tokens.size());
+        float old_keep = sessions_.get_keep_ratio(req.session_id, configured_keep);
         int   old_turn = sessions_.turn_count(req.session_id);
-        sessions_.update(req.session_id, result.accept_rate);
+        sessions_.update(req.session_id, result.accept_rate, configured_keep);
         float new_keep = sessions_.get_keep_ratio(req.session_id);
         float ema      = sessions_.get_ema(req.session_id);
         std::fprintf(stderr,

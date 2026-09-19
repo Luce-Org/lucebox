@@ -1197,7 +1197,7 @@ std::vector<ModelBackend::CompressResult> Qwen35Backend::compress_batch(
         result.compressed_ids = drafter_score_and_compress(
             drafter_ctx_, request.input_ids, request.keep_ratio,
             /*chunk_size=*/32, request.score_query_tokens, /*pool_kernel=*/13,
-            request.score_query_end);
+            request.score_query_end, request.required_instruction_spans);
         result.ok = !result.compressed_ids.empty();
         if (result.ok) {
             std::fprintf(stderr, "[compress] %zu -> %zu tokens\n",
