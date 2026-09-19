@@ -1306,6 +1306,7 @@ bool Qwen35Backend::handle_compress(const std::string & line, const DaemonIO & i
     req.drafter_path = (n >= 3 && drafter_path[0])
         ? drafter_path
         : "/opt/lucebox/models/drafter/Qwen3-0.6B-BF16.gguf";
+    req.should_cancel = [&io]() { return io.is_cancelled(); };
     {
         size_t total_vram = 0;
         int dev = 0;

@@ -273,7 +273,8 @@ static std::vector<int32_t> qwen35_score_and_compress(
     int chunk_size,
     int n_lookahead,
     int pool_kernel,
-    int score_query_end) {
+    int score_query_end,
+    const std::function<bool()> & cancelled) {
 
     const int S = (int)ids.size();
     const int hidden = w.n_embd;
@@ -284,6 +285,14 @@ static std::vector<int32_t> qwen35_score_and_compress(
         return {};
     }
     const int query_start = query_end - n_lookahead;
+    auto interrupted = [&]() {
+        if (cancelled && cancelled()) {
+            set_last_error("compression cancelled");
+            return true;
+        }
+        return false;
+    };
+    if (interrupted()) return {};
 
     auto t0 = std::chrono::steady_clock::now();
     std::vector<float> running_max((size_t)n_lookahead * S, -INFINITY);
@@ -340,6 +349,10 @@ static std::vector<int32_t> qwen35_score_and_compress(
         const int batch = 2048;
         std::vector<float> emb((size_t)hidden * batch);
         for (int i = 0; i < S; i += batch) {
+            if (interrupted()) {
+                ggml_backend_buffer_free(act_buf); ggml_free(act_ctx); free_target_cache(cache);
+                return {};
+            }
             const int n = std::min(batch, S - i);
             if (!w.embedder.embed(ids.data() + i, n, emb.data())) {
                 ggml_backend_buffer_free(act_buf); ggml_free(act_ctx); free_target_cache(cache);
@@ -359,6 +372,10 @@ static std::vector<int32_t> qwen35_score_and_compress(
             for (int k = 0; k < il; ++k) if (((k + 1) % w.full_attention_interval) == 0) ++fa_idx;
         }
         for (int start = 0; start < S; start += ubatch) {
+            if (interrupted()) {
+                ggml_gallocr_free(alloc); ggml_backend_buffer_free(act_buf); ggml_free(act_ctx); free_target_cache(cache);
+                return {};
+            }
             const int n = std::min(ubatch, S - start);
             const int kv_len = start + n;
 
@@ -728,7 +745,8 @@ std::vector<int32_t> drafter_score_and_compress(
         }
         auto * st = static_cast<Qwen35DrafterState *>(ctx.arch_state);
         return qwen35_score_and_compress(st->weights, ids, keep_ratio, chunk_size,
-                                         n_lookahead, pool_kernel, score_query_end);
+                                         n_lookahead, pool_kernel, score_query_end,
+                                         cancelled);
     }
     const int S = (int)ids.size();
     if (S < n_lookahead + 1) {
@@ -749,9 +767,12 @@ std::vector<int32_t> drafter_score_and_compress(
         const int query_start = query_end - n_lookahead;
         running_max.assign((size_t)n_lookahead * S, 0.0f);
         int windows = 0;
-        for (int start = 0; start < S; start += window) {
+        // Tokens after query_end are a rendered suffix. The full scorer masks
+        // them from the query rows, so never place them before the duplicated
+        // query in a later window. Their initialized zero scores are retained.
+        for (int start = 0; start < query_end; start += window) {
             if(interrupted())return {};
-            const int end = std::min(S, start + window);
+            const int end = std::min(query_end, start + window);
             const int context_start = std::max(0, start - 512);
             std::vector<int32_t> local(ids.begin() + context_start, ids.begin() + end);
             local.insert(local.end(), ids.begin() + query_start, ids.begin() + query_end);

@@ -112,6 +112,7 @@ ModelBackend::CompressResult ModelBackend::compress(const CompressRequest & req)
     // Build collecting DaemonIO
     DaemonIO io;
     io.stream_fd = -1;
+    io.should_cancel = req.should_cancel;
     io.on_token = [&](int32_t tok) -> bool {
         result.compressed_ids.push_back(tok);
         return true;
