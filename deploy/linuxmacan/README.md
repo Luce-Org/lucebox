@@ -1,18 +1,21 @@
-# linuxmacan deployment snapshot
+# linuxmacan Lucebox deployment
 
-`models.json` exposes the production names `qwen3.8-27b-swift` and
-`qwen3.8-27b-abliterated`. The compatibility names `qwen3.8-27b` and
-`qwen3.8-27b-pflash` resolve to Swift. The model router starts the external
-vLLM/PFlash services for Swift and releases them before loading a local GGUF,
-so the two 27B targets never contend for the same GPU memory. Install the
-template at `/opt/lucebox/templates/swift-qwen.jinja` and config at
-`/opt/lucebox/models.json`; referenced model files must already exist.
+`models.json` serves every public model name through the native Lucebox
+GGUF/ROCm backend. The default is `qwen3.8-27b-swift`; the base,
+PFlash-compatible, abliterated and Gemma names remain available through the
+same automatic single-GPU model router.
 
-Install `lucebox-model-router.service` as the public service on port 8216.
-The PFlash proxy listens internally on 127.0.0.1:18217. Install
-`vllm-swift-int4-run.sh` at `/root/vllm-native-test/run-concurrent-server.sh`.
-The original `lucebox.service` is not used by this deployment.
+Install:
 
-The deployed executable SHA-256 is recorded with benchmark provenance. Source commits 2246420 and 3000d2a are preserved on this branch; the complete 2246420 memory/progress patch was not deployed by this registration. Do not treat this configuration snapshot as evidence that all branch source is running in production.
+- `models.json` at `/opt/lucebox/models.json`
+- `swift-qwen.jinja` at `/opt/lucebox/templates/swift-qwen.jinja`
+- `model_router.py` at `/opt/lucebox/model_router.py`
+- `deploy/lucebox.service` as the enabled public service on port 8216
 
-Pi configuration: merge `integrations/pi/lucebox-models.example.json` into the existing providers object, retaining local connection/auth settings. It uses model-level `thinkingLevelMap`; xhigh is exposed for all four Lucebox Qwen entries. The example key is a placeholder.
+The vLLM and vLLM PFlash services must remain stopped and disabled while this
+deployment is active. Model changes unload the current Lucebox target before
+loading the selected GGUF, so the 27B models never contend for GPU memory.
+
+Pi configuration: merge `integrations/pi/lucebox-models.example.json` into the
+existing providers object, retaining local connection/auth settings. It uses
+model-level `thinkingLevelMap`; xhigh is exposed for all Lucebox Qwen entries.

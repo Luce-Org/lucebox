@@ -3,28 +3,9 @@
   "draft": "/code/models/qwen38/qwen38-dflash2-q8_0.gguf",
   "models": {
     "qwen3.8-27b": {
-      "path": "ukisai/Swift-Qwen3.8-27b-int4-AMD",
-      "context": 80000,
-      "max_concurrency": 4,
-      "hybrid_cache": "auto",
-      "cache_default_policy": "auto",
-      "upstream_url": "http://127.0.0.1:18217",
-      "external_services": [
-        "vllm-swift-int4.service",
-        "vllm-pflash-proxy.service"
-      ],
-      "external_ready_urls": [
-        "http://192.168.2.191:18218/health",
-        "http://127.0.0.1:18217/health"
-      ],
-      "canonical": "qwen3.8-27b-swift"
-    },
-    "qwen3.8-27b-abliterated": {
-      "path": "/code/models/qwen38/Huihui-Qwen3.8-27B-abliterated-UD-IQ4_XS.gguf",
       "draft_block_size": 16,
       "context": 131072,
       "max_concurrency": 1,
-      "draft": "/code/models/qwen38/qwen38-dflash2-q8_0.gguf",
       "hybrid_cache": "auto",
       "compression_score_window": 8192,
       "extra_args": [
@@ -34,10 +15,37 @@
         "0.2",
         "--prefill-drafter",
         "/code/models/qwen38/Qwen3-0.6B-BF16.gguf",
-        "--prefill-skip-park"
+        "--prefill-skip-park",
+        "--chat-template-file",
+        "/opt/lucebox/templates/swift-qwen.jinja"
       ],
       "cache_default_policy": "auto",
-      "hybrid_projections": false
+      "hybrid_projections": false,
+      "draft": "/code/models/qwen38/qwen38-dflash2-q8_0.gguf",
+      "path": "/code/models/qwen38/Qwen3.8-27B-UD-IQ4_XS.gguf",
+      "hybrid_calibration": "/opt/lucebox/hybrid-calibration.json"
+    },
+    "qwen3.8-27b-abliterated": {
+      "draft_block_size": 16,
+      "context": 131072,
+      "max_concurrency": 1,
+      "hybrid_cache": "auto",
+      "compression_score_window": 8192,
+      "extra_args": [
+        "--prefill-compression",
+        "auto",
+        "--prefill-keep-ratio",
+        "0.2",
+        "--prefill-drafter",
+        "/code/models/qwen38/Qwen3-0.6B-BF16.gguf",
+        "--prefill-skip-park",
+        "--chat-template-file",
+        "/opt/lucebox/templates/swift-qwen.jinja"
+      ],
+      "cache_default_policy": "auto",
+      "hybrid_projections": false,
+      "draft": "/code/models/qwen38/qwen38-dflash2-q8_0.gguf",
+      "path": "/code/models/qwen38/Huihui-Qwen3.8-27B-abliterated-UD-IQ4_XS.gguf"
     },
     "gemma-4-26b-a4b": {
       "path": "/code/models/gemma4/gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf",
@@ -46,37 +54,50 @@
       "max_concurrency": 1
     },
     "qwen3.8-27b-pflash": {
-      "path": "ukisai/Swift-Qwen3.8-27b-int4-AMD",
-      "context": 80000,
-      "max_concurrency": 4,
+      "draft_block_size": 16,
+      "context": 131072,
+      "max_concurrency": 1,
       "hybrid_cache": "auto",
+      "compression_score_window": 8192,
+      "extra_args": [
+        "--prefill-compression",
+        "auto",
+        "--prefill-keep-ratio",
+        "0.2",
+        "--prefill-drafter",
+        "/code/models/qwen38/Qwen3-0.6B-BF16.gguf",
+        "--prefill-skip-park",
+        "--chat-template-file",
+        "/opt/lucebox/templates/swift-qwen.jinja"
+      ],
       "cache_default_policy": "auto",
-      "upstream_url": "http://127.0.0.1:18217",
-      "external_services": [
-        "vllm-swift-int4.service",
-        "vllm-pflash-proxy.service"
-      ],
-      "external_ready_urls": [
-        "http://192.168.2.191:18218/health",
-        "http://127.0.0.1:18217/health"
-      ],
-      "canonical": "qwen3.8-27b-swift"
+      "hybrid_projections": false,
+      "draft": "/code/models/qwen38/qwen38-dflash2-q8_0.gguf",
+      "path": "/code/models/qwen38/Qwen3.8-27B-UD-IQ4_XS.gguf",
+      "hybrid_calibration": "/opt/lucebox/hybrid-calibration.json",
+      "canonical": "qwen3.8-27b"
     },
     "qwen3.8-27b-swift": {
-      "path": "ukisai/Swift-Qwen3.8-27b-int4-AMD",
-      "context": 80000,
-      "max_concurrency": 4,
+      "draft_block_size": 16,
+      "context": 131072,
+      "max_concurrency": 1,
       "hybrid_cache": "auto",
-      "cache_default_policy": "auto",
-      "upstream_url": "http://127.0.0.1:18217",
-      "external_services": [
-        "vllm-swift-int4.service",
-        "vllm-pflash-proxy.service"
+      "compression_score_window": 8192,
+      "extra_args": [
+        "--prefill-compression",
+        "auto",
+        "--prefill-keep-ratio",
+        "0.2",
+        "--prefill-drafter",
+        "/code/models/qwen38/Qwen3-0.6B-BF16.gguf",
+        "--prefill-skip-park",
+        "--chat-template-file",
+        "/opt/lucebox/templates/swift-qwen.jinja"
       ],
-      "external_ready_urls": [
-        "http://192.168.2.191:18218/health",
-        "http://127.0.0.1:18217/health"
-      ]
+      "cache_default_policy": "auto",
+      "hybrid_projections": false,
+      "draft": "/code/models/qwen38/qwen38-dflash2-q8_0.gguf",
+      "path": "/code/models/swift-qwen/ukisai_Swift-Qwen3.8-27b-IQ4_XS.gguf"
     }
   },
   "memory": {
@@ -97,7 +118,7 @@
     "load_timeout": 180,
     "body_timeout": 15,
     "prefix_cache_slots": 2,
-    "max_concurrency": 4
+    "max_concurrency": 1
   },
   "listen_host": "0.0.0.0",
   "listen_port": 8216,
