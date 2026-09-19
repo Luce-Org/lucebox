@@ -397,3 +397,207 @@ TEST_CASE(RecurrentSnapshotFixture, copied_paged_prefix_uses_fresh_pages) {
     ggml_free(ctx);
     ggml_backend_free(backend);
 }
+
+TEST_CASE(RecurrentSnapshotFixture, copied_paged_prefix_carries_draft_features) {
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    CHECK(backend != nullptr);
+    if (!backend) SKIP("CPU backend is unavailable");
+
+    ggml_init_params params{};
+    params.mem_size = 16 * ggml_tensor_overhead();
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    CHECK(ctx != nullptr);
+    if (!ctx) {
+        ggml_backend_free(backend);
+        SKIP("could not initialize ggml context");
+    }
+
+    const int feat_cap = 8;  // per-slot ring width
+    ggml_tensor * key =
+        ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 64, 2);
+    ggml_tensor * value =
+        ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 64, 2);
+    ggml_tensor * ssm =
+        ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2, 2, 2, 2);
+    ggml_tensor * conv =
+        ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 3, 2, 2);
+    // Concurrent ring: [fc_in, cap * n_seq_slots + 1] — one slab per slot
+    // plus the dead padding row.
+    ggml_tensor * target_feat =
+        ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 6, feat_cap * 2 + 1);
+    ggml_backend_buffer_t buffer =
+        ggml_backend_alloc_ctx_tensors(ctx, backend);
+    CHECK(buffer != nullptr);
+    if (!buffer) {
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        SKIP("could not allocate CPU backend tensors");
+    }
+
+    TargetCache cache;
+    cache.backend = backend;
+    cache.max_ctx = 64;
+    cache.n_seq_slots = 2;
+    cache.kv_k_type = GGML_TYPE_F32;
+    cache.attn_k = {key};
+    cache.attn_v = {value};
+    cache.ssm_state = {ssm};
+    cache.conv_state = {conv};
+    cache.target_feat = target_feat;
+    cache.target_feat_cap = feat_cap;
+
+    // Slot 1's ring slab: each live column tagged by its ring slot.
+    const int64_t fc_in = target_feat->ne[0];
+    std::vector<float> feat((size_t)ggml_nelements(target_feat), -7.0f);
+    for (int64_t col = feat_cap; col < 2 * feat_cap; ++col) {
+        for (int64_t e = 0; e < fc_in; ++e) {
+            feat[(size_t)col * fc_in + e] = 4000.0f + (float)(col - feat_cap);
+        }
+    }
+    set_tensor(target_feat, feat);
+
+    const std::vector<uint32_t> source_blocks = {2, 0};
+
+    // The resident-byte estimate must charge for the feature payload so the
+    // scheduler budget covers what a speculating engine actually copies.
+    const size_t ar_bytes = estimate_paged_target_cache_snapshot_bytes(
+        cache, /*token_count=*/20, /*with_target_feat=*/false);
+    const size_t spec_bytes = estimate_paged_target_cache_snapshot_bytes(
+        cache, /*token_count=*/20, /*with_target_feat=*/true);
+    CHECK(ar_bytes > 0);
+    CHECK(spec_bytes > ar_bytes);
+
+    PrefixSnapshot snap;
+    CHECK(snapshot_paged_target_cache(
+        cache, /*seq_slot=*/1, source_blocks,
+        /*block_size=*/16, /*token_count=*/20, snap,
+        /*with_target_feat=*/true));
+    CHECK(snap.target_feat_snap != nullptr);
+    CHECK(snap.target_feat_cap == feat_cap);
+    CHECK(snap.target_feat_snap->ne[1] == feat_cap);
+    CHECK(ggml_backend_buffer_get_size(snap.buf) == spec_bytes);
+
+    const auto snap_feat = get_tensor(snap.target_feat_snap);
+    for (int64_t col = 0; col < feat_cap; ++col) {
+        for (int64_t e = 0; e < fc_in; ++e) {
+            CHECK(snap_feat[(size_t)col * fc_in + e] ==
+                  4000.0f + (float)col);
+        }
+    }
+
+    // Restore into slot 0 of a cleared cache: the slot's live ring slab
+    // returns verbatim, while untouched ring slots and the dead row stay
+    // zeroed.
+    set_tensor(target_feat, std::vector<float>(feat.size(), 0.0f));
+    const std::vector<uint32_t> destination_blocks = {1, 3};
+    CHECK(restore_paged_target_cache(
+        snap, cache, /*seq_slot=*/0, destination_blocks,
+        /*block_size=*/16));
+    const auto restored_feat = get_tensor(target_feat);
+    for (int64_t col = 0; col < feat_cap; ++col) {
+        for (int64_t e = 0; e < fc_in; ++e) {
+            CHECK(restored_feat[(size_t)col * fc_in + e] ==
+                  4000.0f + (float)col);
+        }
+    }
+    for (int64_t col = feat_cap; col < target_feat->ne[1]; ++col) {
+        for (int64_t e = 0; e < fc_in; ++e) {
+            CHECK(restored_feat[(size_t)col * fc_in + e] == 0.0f);
+        }
+    }
+    free_prefix_snapshot(snap);
+
+    // Short prefixes copy only live rows, including when restoring into a
+    // nonzero slot. Neither the unused tail nor the dead row is overwritten.
+    set_tensor(target_feat, feat);
+    CHECK(replace_paged_target_cache(
+        cache, /*seq_slot=*/1, source_blocks,
+        /*block_size=*/16, /*token_count=*/3, snap,
+        /*with_target_feat=*/true));
+    CHECK(snap.target_feat_snap->ne[1] == 3);
+    CHECK(ggml_backend_buffer_get_size(snap.buf) ==
+          estimate_paged_target_cache_snapshot_bytes(cache, 3, true));
+    set_tensor(target_feat, std::vector<float>(feat.size(), -9.0f));
+    CHECK(restore_paged_target_cache(
+        snap, cache, /*seq_slot=*/1, destination_blocks,
+        /*block_size=*/16));
+    const auto short_feat = get_tensor(target_feat);
+    for (int64_t col = 0; col < target_feat->ne[1]; ++col) {
+        const float expected = col >= feat_cap && col < feat_cap + 3
+            ? 4000.0f + (float)(col - feat_cap) : -9.0f;
+        for (int64_t e = 0; e < fc_in; ++e) {
+            CHECK(short_feat[(size_t)col * fc_in + e] == expected);
+        }
+    }
+
+    // Reject an extra payload plane before the slab copy: checking only
+    // width/rows/contiguity would allow ggml_nbytes() to cross slot boundaries.
+    ggml_tensor * saved_feat = snap.target_feat_snap;
+    ggml_tensor * extra_plane = ggml_new_tensor_3d(
+        ctx, GGML_TYPE_F32, fc_in, 3, 2);
+    snap.target_feat_snap = extra_plane;
+    CHECK(!restore_paged_target_cache(
+        snap, cache, /*seq_slot=*/0, destination_blocks,
+        /*block_size=*/16));
+    CHECK(get_tensor(target_feat) == short_feat);
+    snap.target_feat_snap = saved_feat;
+
+    // An incompatible ring cannot replace the incumbent checkpoint.
+    cache.target_feat_cap = feat_cap + 1;
+    CHECK(!replace_paged_target_cache(
+        cache, /*seq_slot=*/1, source_blocks,
+        /*block_size=*/16, /*token_count=*/3, snap,
+        /*with_target_feat=*/true));
+    CHECK(snap.target_feat_snap == saved_feat);
+    CHECK(snap.cur_pos == 3);
+    cache.target_feat_cap = feat_cap;
+    free_prefix_snapshot(snap);
+
+    // AR-only checkpoints keep the lean payload: no feature tensor, and a
+    // restore leaves the cache's ring untouched.
+    PrefixSnapshot ar_snap;
+    CHECK(snapshot_paged_target_cache(
+        cache, /*seq_slot=*/1, source_blocks,
+        /*block_size=*/16, /*token_count=*/20, ar_snap));
+    CHECK(ar_snap.target_feat_snap == nullptr);
+    CHECK(ar_snap.target_feat_cap == 0);
+    CHECK(ggml_backend_buffer_get_size(ar_snap.buf) == ar_bytes);
+    set_tensor(target_feat, std::vector<float>(feat.size(), -3.0f));
+    CHECK(restore_paged_target_cache(
+        ar_snap, cache, /*seq_slot=*/0, destination_blocks,
+        /*block_size=*/16));
+    const auto untouched_feat = get_tensor(target_feat);
+    for (float v : untouched_feat) {
+        CHECK(v == -3.0f);
+    }
+    free_prefix_snapshot(ar_snap);
+
+    // A checkpoint carrying features cannot restore into a cache that has no
+    // ring — the payload would be silently dropped otherwise.
+    CHECK(snapshot_paged_target_cache(
+        cache, /*seq_slot=*/1, source_blocks,
+        /*block_size=*/16, /*token_count=*/20, snap,
+        /*with_target_feat=*/true));
+    CHECK(snap.target_feat_snap != nullptr);
+    cache.target_feat = nullptr;
+    CHECK(!restore_paged_target_cache(
+        snap, cache, /*seq_slot=*/0, destination_blocks,
+        /*block_size=*/16));
+    free_prefix_snapshot(snap);
+    cache.target_feat = target_feat;
+
+    // Requesting the payload on a ring-less cache degrades to the lean
+    // layout rather than failing the capture.
+    cache.target_feat = nullptr;
+    CHECK(snapshot_paged_target_cache(
+        cache, /*seq_slot=*/1, source_blocks,
+        /*block_size=*/16, /*token_count=*/20, snap,
+        /*with_target_feat=*/true));
+    CHECK(snap.target_feat_snap == nullptr);
+    free_prefix_snapshot(snap);
+
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+}

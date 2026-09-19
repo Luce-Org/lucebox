@@ -3162,15 +3162,31 @@ bool paged_cache_pairs_complete(const TargetCache & cache) {
 }
 
 bool create_paged_snapshot_layout(
-        const TargetCache & cache, int token_count, PrefixSnapshot & snap) {
+        const TargetCache & cache, int token_count, int feat_rows,
+        PrefixSnapshot & snap) {
     const int total_tensors = 2 * (int)cache.attn_k.size() +
-        2 * (int)cache.ssm_state.size();
+        2 * (int)cache.ssm_state.size() + (feat_rows > 0 ? 1 : 0);
     ggml_init_params params{};
     params.mem_size =
         (size_t)(total_tensors + 16) * ggml_tensor_overhead();
     params.no_alloc = true;
     snap.ctx = ggml_init(params);
     if (!snap.ctx) return false;
+
+    // Live drafter feature-ring slab: verbatim ring slots [0, feat_rows).
+    // Ring position→slot mapping is absolute, so the same byte range
+    // round-trips through capture and restore for this token count.
+    snap.target_feat_snap = nullptr;
+    snap.target_feat_cap = 0;
+    if (feat_rows > 0 && cache.target_feat) {
+        snap.target_feat_snap = ggml_new_tensor_2d(
+            snap.ctx, cache.target_feat->type, cache.target_feat->ne[0],
+            feat_rows);
+        if (snap.target_feat_snap) {
+            ggml_set_name(snap.target_feat_snap, "snap_target_feat");
+            snap.target_feat_cap = cache.target_feat_cap;
+        }
+    }
 
     snap.attn_k_snap.assign(cache.attn_k.size(), nullptr);
     snap.attn_v_snap.assign(cache.attn_v.size(), nullptr);
@@ -3242,21 +3258,60 @@ bool paged_snapshot_matches(
                  snap.conv_state_snap[i], cache.conv_state[i],
                  cache.n_seq_slots, /*slot_axis=*/2))) return false;
     }
+    // Optional drafter feature payload: when a checkpoint carries the ring
+    // slab, it must describe this cache's per-slot ring exactly — the live
+    // window for `tokens` committed tokens is the first min(tokens, cap)
+    // slab columns of a [fc_in, cap * n_seq_slots (+ dead row)] ring.
+    if (snap.target_feat_snap) {
+        const ggml_tensor * feat = cache.target_feat;
+        if (!feat || cache.target_feat_cap <= 0 ||
+            !ggml_is_matrix(feat) ||
+            !ggml_is_matrix(snap.target_feat_snap) ||
+            snap.target_feat_cap != cache.target_feat_cap ||
+            feat->ne[1] < (int64_t)cache.target_feat_cap *
+                              cache.n_seq_slots ||
+            snap.target_feat_snap->type != feat->type ||
+            snap.target_feat_snap->ne[0] != feat->ne[0] ||
+            snap.target_feat_snap->ne[1] !=
+                std::min<int64_t>(tokens, cache.target_feat_cap) ||
+            !ggml_is_contiguous(snap.target_feat_snap) ||
+            !ggml_is_contiguous(feat)) {
+            return false;
+        }
+    }
     return true;
+}
+
+// Slab rows a speculating engine captures for `token_count` committed tokens:
+// the live ring window, bounded by the per-slot ring capacity. Zero when the
+// caller keeps the checkpoint AR-only or the cache has no feature ring.
+int paged_feat_rows(
+        const TargetCache & cache, int token_count, bool with_target_feat) {
+    if (!with_target_feat || !cache.target_feat ||
+        cache.target_feat_cap <= 0) {
+        return 0;
+    }
+    return std::min(token_count, cache.target_feat_cap);
 }
 
 }  // namespace
 
 size_t estimate_paged_target_cache_snapshot_bytes(
         const TargetCache & cache,
-        int token_count) {
+        int token_count,
+        bool with_target_feat) {
     if (cache.n_seq_slots < 1 || token_count <= 0 ||
         token_count > cache.max_ctx || !paged_cache_pairs_complete(cache)) {
         return 0;
     }
 
     PrefixSnapshot layout;
-    if (!create_paged_snapshot_layout(cache, token_count, layout)) return 0;
+    if (!create_paged_snapshot_layout(
+            cache, token_count, paged_feat_rows(cache, token_count,
+                                                with_target_feat),
+            layout)) {
+        return 0;
+    }
     const size_t bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(
         layout.ctx,
         paged_snapshot_buffer_type());
@@ -3270,7 +3325,8 @@ bool snapshot_paged_target_cache(
         const std::vector<uint32_t> & block_table,
         int block_size,
         int token_count,
-        PrefixSnapshot & snap) {
+        PrefixSnapshot & snap,
+        bool with_target_feat) {
     if (!cache.backend || cache.n_seq_slots < 1 || seq_slot < 0 ||
         seq_slot >= cache.n_seq_slots || token_count <= 0 ||
         token_count > cache.max_ctx || block_size <= 0 ||
@@ -3279,16 +3335,22 @@ bool snapshot_paged_target_cache(
         set_last_error("snapshot_paged_target_cache: invalid arguments");
         return false;
     }
+    const int feat_rows =
+        paged_feat_rows(cache, token_count, with_target_feat);
     const bool needs_alloc = !snap.ctx ||
         snap.layout != PrefixSnapshot::Layout::paged ||
         snap.cur_pos != token_count ||
         snap.attn_k_snap.size() != cache.attn_k.size() ||
         snap.attn_v_snap.size() != cache.attn_v.size() ||
         snap.ssm_state_snap.size() != cache.ssm_state.size() ||
-        snap.conv_state_snap.size() != cache.conv_state.size();
+        snap.conv_state_snap.size() != cache.conv_state.size() ||
+        (snap.target_feat_snap != nullptr) != (feat_rows > 0) ||
+        (snap.target_feat_snap &&
+         snap.target_feat_snap->ne[1] != feat_rows);
     if (needs_alloc) {
         free_prefix_snapshot(snap);
-        if (!create_paged_snapshot_layout(cache, token_count, snap)) {
+        if (!create_paged_snapshot_layout(
+                cache, token_count, feat_rows, snap)) {
             set_last_error("paged PrefixSnapshot ggml_init failed");
             return false;
         }
@@ -3335,13 +3397,20 @@ bool snapshot_paged_target_cache(
             cache.conv_state[i], snap.conv_state_snap[i]->data,
             (size_t)seq_slot * conv_bytes, conv_bytes);
     }
+    // The slot's live drafter feature ring is one contiguous slab of
+    // target_feat columns — a single range copy.
+    if (snap.target_feat_snap) {
+        ggml_backend_tensor_get_async(
+            cache.backend, cache.target_feat, snap.target_feat_snap->data,
+            (size_t)seq_slot * (size_t)cache.target_feat_cap *
+                cache.target_feat->nb[1],
+            ggml_nbytes(snap.target_feat_snap));
+    }
     ggml_backend_synchronize(cache.backend);
     snap.cur_pos = token_count;
     snap.last_tok = -1;
     snap.kv_k_type = cache.kv_k_type;
     snap.max_ctx = cache.max_ctx;
-    snap.target_feat_cap = 0;
-    snap.target_feat_snap = nullptr;
     snap.layout = PrefixSnapshot::Layout::paged;
     return true;
 }
@@ -3352,11 +3421,12 @@ bool replace_paged_target_cache(
         const std::vector<uint32_t> & block_table,
         int block_size,
         int token_count,
-        PrefixSnapshot & destination) {
+        PrefixSnapshot & destination,
+        bool with_target_feat) {
     PrefixSnapshot candidate;
     if (!snapshot_paged_target_cache(
             cache, seq_slot, block_table, block_size, token_count,
-            candidate)) {
+            candidate, with_target_feat)) {
         free_prefix_snapshot(candidate);
         return false;
     }
@@ -3407,6 +3477,15 @@ bool restore_paged_target_cache(
             cache.backend,
             cache.conv_state[i], snap.conv_state_snap[i]->data,
             (size_t)seq_slot * conv_bytes, conv_bytes);
+    }
+    // Restore the slot's drafter feature-ring slab when the checkpoint
+    // carries it; feat-less checkpoints keep the AR-only payload.
+    if (snap.target_feat_snap) {
+        ggml_backend_tensor_set_async(
+            cache.backend, cache.target_feat, snap.target_feat_snap->data,
+            (size_t)seq_slot * (size_t)cache.target_feat_cap *
+                cache.target_feat->nb[1],
+            ggml_nbytes(snap.target_feat_snap));
     }
     ggml_backend_synchronize(cache.backend);
     return true;

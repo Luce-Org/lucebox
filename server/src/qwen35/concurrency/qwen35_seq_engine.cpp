@@ -11,6 +11,7 @@
 #include "graph_builders.h"
 #include "attn_masks.h"
 #include "prefill_helpers.h"
+#include "common/chain_rollback_policy.h"
 #include "common/concurrency/chain_spec_shapes.h"
 #include "common/dflash2_head.h"
 #include "common/sampler.h"
@@ -64,6 +65,7 @@ Qwen35SeqEngine::Qwen35SeqEngine(
     slot_draft_kv_.resize(static_cast<size_t>(n_slots));
     seq_lens_.assign(static_cast<size_t>(n_slots), 0);
     reserve_growth_.assign(static_cast<size_t>(n_slots), 0);
+    slot_ring_valid_from_.assign(static_cast<size_t>(n_slots), 0);
 
     fixed_chain_ready_ = fixed_chain_.enabled && fixed_chain_.width > 1 &&
         fixed_chain_.width <= 16 &&
@@ -264,6 +266,13 @@ Qwen35SeqEngine::prepare_chain_drafts(
             return std::nullopt;
         }
         lanes.push_back({i, input.slot, input.token, state, mirror});
+        // Ring floor from a featureless restore: rows below it belong to a
+        // previous occupant, so seed the append cursor past them — they stay
+        // unappended (slot_pos -1) and masked out of the draft context.
+        const int32_t ring_floor =
+            input.slot < static_cast<int>(slot_ring_valid_from_.size())
+                ? slot_ring_valid_from_[static_cast<size_t>(input.slot)] : 0;
+        if (state->next_pos < ring_floor) state->next_pos = ring_floor;
         if (!draft_kv_begin_step(
                 *state, b_.dw_, b_.draft_backend_, *mirror,
                 slots_.slot(input.slot).cur_pos)) {
@@ -380,17 +389,37 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit(
     AdmitResult result = slots_.admit(request_id, prompt, sampler);
     if (result.status == AdmitResult::Status::admitted) {
         reset_recurrent_slot(b_.cache_, result.slot);
-        if (result.slot >= 0 &&
-            result.slot < static_cast<int>(slot_draft_kv_.size()) &&
-            slot_draft_kv_[static_cast<size_t>(result.slot)]) {
-            draft_kv_reset(*slot_draft_kv_[static_cast<size_t>(result.slot)]);
-        }
+        reset_slot_draft_state(result.slot);
     }
     return result;
 }
 
+void Qwen35SeqEngine::reset_slot_draft_state(int slot) {
+    if (slot >= 0 && slot < static_cast<int>(slot_draft_kv_.size()) &&
+        slot_draft_kv_[static_cast<size_t>(slot)]) {
+        draft_kv_reset(*slot_draft_kv_[static_cast<size_t>(slot)]);
+    }
+    if (slot >= 0 && slot < static_cast<int>(slot_ring_valid_from_.size())) {
+        slot_ring_valid_from_[static_cast<size_t>(slot)] = 0;
+    }
+}
+
+// DFLASH_PREFIX_NO_FEAT=1 drops the drafter feature slab from concurrent
+// prefix checkpoints — a bench/debug knob that measures the payload's
+// contribution and exercises the cold-ring restore path.
+static bool prefix_feat_payload_disabled() {
+    static const bool off = env_flag_enabled("DFLASH_PREFIX_NO_FEAT");
+    return off;
+}
+
 size_t Qwen35SeqEngine::estimate_prefix_store_bytes(int tokens) const {
-    return estimate_paged_target_cache_snapshot_bytes(b_.cache_, tokens);
+    // Speculating engines also carry the slot's drafter feature-ring slab in
+    // each checkpoint; the estimate must charge for it so the resident-byte
+    // budget stays honest.
+    const bool with_target_feat =
+        fixed_chain_ready_ && !prefix_feat_payload_disabled();
+    return estimate_paged_target_cache_snapshot_bytes(
+        b_.cache_, tokens, with_target_feat);
 }
 
 int Qwen35SeqEngine::checkpoint_index(PrefixStoreRef checkpoint) const {
@@ -428,6 +457,12 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit_with_prefix(
 
     const int slot = result.slot;
     slots_.slot(slot).pending_capture = {};
+    // A restored prefix repopulates the slot's target_feat slab below; a
+    // cold admission leaves whatever the prefill graph will write. Either
+    // way the previous occupant's drafter K/V window must not survive —
+    // its next_pos/slot_pos bookkeeping would otherwise feed stale rows to
+    // the new sequence's drafts.
+    reset_slot_draft_state(slot);
     bool restored = false;
     if (plan.restore.valid()) {
         const int restore_index = checkpoint_index(plan.restore);
@@ -464,17 +499,30 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit_with_prefix(
             result.prefix_store.invalidated = plan.restore;
             if (result.status == AdmitResult::Status::admitted) {
                 reset_recurrent_slot(b_.cache_, result.slot);
+                reset_slot_draft_state(result.slot);
             } else {
                 result.error =
                     "cold admission failed after stale prefix restore";
             }
         } else {
             result.prefix_store.restored = plan.restore;
+            // A checkpoint without the feature slab leaves ring rows below
+            // the restore cut holding a previous occupant's features. Floor
+            // them so the drafter never bulk-appends rows this sequence did
+            // not write (unpopulated slots stay masked out of the draft
+            // context) and a later capture does not bless them.
+            if (snap && !snap->target_feat_snap &&
+                slot < static_cast<int>(slot_ring_valid_from_.size())) {
+                slot_ring_valid_from_[static_cast<size_t>(slot)] =
+                    plan.restore.tokens;
+            }
             std::fprintf(stderr,
                 "[parallel-pc] restored checkpoint=%llu seq_slot=%d "
-                "tokens=%d time_ms=%.1f\n",
+                "tokens=%d feat=%d time_ms=%.1f\n",
                 (unsigned long long)plan.restore.id, slot,
-                plan.restore.tokens, (double)restore_elapsed_us / 1000.0);
+                plan.restore.tokens,
+                snap && snap->target_feat_snap ? 1 : 0,
+                (double)restore_elapsed_us / 1000.0);
         }
         result.prefix_store.restore_attempted = true;
         result.prefix_store.restore_elapsed_us = restore_elapsed_us;
@@ -514,9 +562,22 @@ PrefixStoreEvent Qwen35SeqEngine::capture_prefix(
     }
     const auto capture_started = std::chrono::steady_clock::now();
     PrefixSnapshot & snapshot = b_.prefix_snapshots_[checkpoint];
+    // A slot whose ring still holds foreign rows below a featureless restore
+    // must not bless them into a feature payload. Ring rows are keyed by
+    // position % cap, so the foreign region is fully overwritten once the
+    // sequence has written `cap` positions past the cut and the payload
+    // resumes.
+    const int32_t ring_floor =
+        slot < static_cast<int>(slot_ring_valid_from_.size())
+            ? slot_ring_valid_from_[static_cast<size_t>(slot)] : 0;
+    const bool with_target_feat =
+        fixed_chain_ready_ && !prefix_feat_payload_disabled() &&
+        (ring_floor == 0 ||
+         ticket.checkpoint.tokens >= ring_floor + b_.cache_.target_feat_cap);
     if (!replace_paged_target_cache(
             b_.cache_, slot, sequence.block_table,
-            (int)pool_.block_size(), ticket.checkpoint.tokens, snapshot)) {
+            (int)pool_.block_size(), ticket.checkpoint.tokens, snapshot,
+            with_target_feat)) {
         event.elapsed_us =
             (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - capture_started).count();
@@ -1622,10 +1683,7 @@ bool Qwen35SeqEngine::restore_kv(int slot, std::string & error) {
         // state together — so it must be reset exactly as at admission.
         if (!slots_.resume_recompute(slot)) return false;
         reset_recurrent_slot(b_.cache_, slot);
-        if (slot < static_cast<int>(slot_draft_kv_.size()) &&
-            slot_draft_kv_[static_cast<size_t>(slot)]) {
-            draft_kv_reset(*slot_draft_kv_[static_cast<size_t>(slot)]);
-        }
+        reset_slot_draft_state(slot);
         return true;
     }
     std::vector<int32_t> blocks;
@@ -1651,10 +1709,7 @@ bool Qwen35SeqEngine::evict_kv(int slot, int32_t pending_token,
 void Qwen35SeqEngine::retire(int slot) {
     offload_.discard(slot);
     if (!slots_.is_active(slot)) return;
-    if (slot >= 0 && slot < static_cast<int>(slot_draft_kv_.size()) &&
-        slot_draft_kv_[static_cast<size_t>(slot)]) {
-        draft_kv_reset(*slot_draft_kv_[static_cast<size_t>(slot)]);
-    }
+    reset_slot_draft_state(slot);
     slots_.retire(slot);
 }
 

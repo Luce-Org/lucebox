@@ -168,6 +168,19 @@ private:
     bool arm_capture(
         int slot, PrefixCaptureTicket ticket, int restored_tokens);
     int checkpoint_index(PrefixStoreRef checkpoint) const;
+    // Invalidate the slot's drafter K/V window so the next speculative step
+    // bulk-appends from the feature ring. No-op when speculation is off.
+    void reset_slot_draft_state(int slot);
+
+    // Per-slot lower bound on feature-ring rows the occupying sequence wrote
+    // itself. A featureless checkpoint restore leaves ring rows below the
+    // restored cut holding a previous occupant's features; the floor keeps
+    // the drafter from bulk-appending them (they stay masked out of the
+    // draft context) and keeps captures from claiming them as a feature
+    // payload until the sequence has written cap positions past the cut and
+    // every ring row is self-written again. Zero means the whole ring slab
+    // is self-written.
+    std::vector<int32_t> slot_ring_valid_from_;
 
     PagedKvPool & pool_;
     Qwen35Backend & b_;

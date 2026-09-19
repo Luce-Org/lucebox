@@ -78,6 +78,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `DFLASH_MMID_TELEMETRY` | unset | DEBUG: report MUL_MAT_ID dispatch, MMVQ variant, and per-node graph compatibility. |
 | `DFLASH_KVFLASH` | unset | Prefer the CLI: `--kvflash` (token count or `auto`). |
 | `DFLASH_PREFIX_CACHE_SLOTS` | 32 | Container-entrypoint equivalent of `--prefix-cache-slots`; not read directly by the native binary. |
+| `DFLASH_PREFIX_NO_FEAT` | unset | DEBUG/A-B: =1 drops the drafter feature-ring slab from concurrent prefix checkpoints (speculative `--max-concurrency` only) to measure the payload's cost and exercise the cold-ring restore path. |
 | `DFLASH_PREFILL_CACHE_SLOTS` | 0 | Container-entrypoint equivalent of `--prefill-cache-slots`; not read directly by the native binary. |
 | `DFLASH_PREFILL_POOL_TRIM_TOKENS` | unset | OPT-IN: trim cached allocations from legacy CUDA/HIP device pools at completed Qwen3.5 prefill chunk boundaries after each configured token interval. Intended for long, shape-changing prefills on non-VMM devices; each trim synchronizes the target backend and retires captured graphs. |
 | `DFLASH_SPLIT_FAST_ROLLBACK` | unset | OPT-IN: exact F32 checkpoints and replay-free rollback for local qwen35 target layer splits. Prefer `--target-split-fast-rollback`; adds checkpoint VRAM (~1.65 GiB for the measured Qwen3.6-27B q=16 split). |
@@ -293,6 +294,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_PREFILL_POOL_TRIM_TOKENS` - qwen35_backend.cpp (OPT-IN: trim legacy device pools during long prefills)
 - `DFLASH_PREFILL_TIMING` - qwen35_backend.cpp (DEBUG: per-ubatch prefill build/alloc/compute timing)
 - `DFLASH_PREFIX_CACHE_SLOTS` - scripts/entrypoint.sh (maps to `--prefix-cache-slots`)
+- `DFLASH_PREFIX_NO_FEAT` - qwen35_seq_engine.cpp (DEBUG/A-B: =1 drops the drafter feature-ring slab from concurrent prefix checkpoints)
 - `DFLASH_QWEN35MOE_CACHE_SLOTS` - qwen35moe_backend.cpp
 - `DFLASH_QWEN35MOE_HOTNESS` - qwen35moe_backend.cpp
 - `DFLASH_QWEN35MOE_NEXT_PLACEMENT_OUT` - qwen35moe_backend.cpp
