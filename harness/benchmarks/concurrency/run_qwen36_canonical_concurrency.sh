@@ -153,7 +153,7 @@ run_case() {
     local adaptive=0
     [[ "$variant" == adaptive-ddtree ]] && adaptive=1
     command+=(--draft "$DRAFT_MODEL" --draft-device hip:0 --ddtree
-      --ddtree-budget 22 --fast-rollback --draft-residency persistent)
+      --ddtree-budget 22 --fast-rollback)
     launch=(env ROCR_VISIBLE_DEVICES="$GPU_DEVICE" DFLASH_IGNORE_EOS=1 DFLASH27B_DRAFT_SWA=2048 DFLASH_DDTREE_ADAPTIVE="$adaptive"
       DFLASH_PREFILL_FIRST_BURST_STEPS="$PREFILL_FIRST_BURST_STEPS"
       DFLASH_IDLE_PREFILL_TOKENS="$IDLE_PREFILL_TOKENS"
