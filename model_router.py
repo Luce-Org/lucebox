@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import pathlib
+import re
 import time
 from collections import Counter, deque
 from dataclasses import dataclass
@@ -114,12 +115,27 @@ class Router:
             window = model.get('compression_score_window', 0)
             if type(window) is not int or (window != 0 and not 512 <= window <= 65536):
                 raise ValueError(f'{name}.compression_score_window must be 0 or 512..65536')
+            services = model.get('external_services', [])
+            if (not isinstance(services, list) or
+                any(not isinstance(service, str) or
+                    not re.fullmatch(r'[A-Za-z0-9_.@-]+\.service', service)
+                    for service in services)):
+                raise ValueError(f'{name}.external_services must contain systemd service names')
+            if services:
+                upstream = urlsplit(model.get('upstream_url', ''))
+                if upstream.scheme != 'http' or upstream.hostname not in ('127.0.0.1', 'localhost', '::1'):
+                    raise ValueError(f'{name}.upstream_url must use loopback HTTP')
+                ready_urls = model.get('external_ready_urls', [model['upstream_url'] + '/health'])
+                if (not isinstance(ready_urls, list) or not ready_urls or
+                    any(urlsplit(url).scheme not in ('http', 'https') for url in ready_urls)):
+                    raise ValueError(f'{name}.external_ready_urls must contain HTTP URLs')
         self.url = config.get('backend_url','http://127.0.0.1:18216')
         self.limits = {'max_queue':4,'queue_timeout':120,'request_timeout':3600,
                        'prefill_timeout':600,'token_timeout':120,'cancel_grace':5,
                        'stop_grace':5,'load_timeout':180,'body_timeout':15}
         self.limits.update(config.get('serving',{}))
         self.active = self.process = self.log = self.client = None
+        self.active_url = self.url
         self.lock = asyncio.Lock()
         self.capacity = max(1, int(self.limits.get('max_concurrency', 1)))
         self.condition = asyncio.Condition()
@@ -157,6 +173,7 @@ class Router:
 
     async def stop(self):
         stopped_at = time.monotonic()
+        active = self.active
         process, self.process = self.process, None
         self.active = None
         if process and process.returncode is None:
@@ -173,13 +190,48 @@ class Router:
         if self.log:
             self.log.close()
             self.log = None
+        if active:
+            services = self.models[active].get('external_services', [])
+            if services:
+                await self.control_external_services('stop', reversed(services))
+
+    async def control_external_services(self, action, services):
+        for service in services:
+            process = await asyncio.create_subprocess_exec(
+                '/usr/bin/systemctl', action, service,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE)
+            _, stderr = await process.communicate()
+            if process.returncode:
+                raise BackendFault(
+                    f'systemctl {action} {service} failed: '
+                    f'{stderr.decode(errors="replace").strip()}')
+
+    async def wait_for_urls(self, urls):
+        async with asyncio.timeout(self.limits['load_timeout']):
+            while True:
+                ready = True
+                for url in urls:
+                    try:
+                        async with self.client.get(
+                                url, timeout=ClientTimeout(total=2)) as response:
+                            if response.status != 200:
+                                ready = False
+                    except (ClientError, asyncio.TimeoutError):
+                        ready = False
+                if ready:
+                    return
+                await asyncio.sleep(0.25)
 
     async def load(self, name):
         name = self.models[name].get('canonical', name)
         if self.closing:
             raise BackendFault('Server is shutting down')
-        if self.active == name and self.process and self.process.returncode is None:
-            return
+        if self.active == name:
+            if self.models[name].get('external_services'):
+                return
+            if self.process and self.process.returncode is None:
+                return
         # Bound repeated failed launches without penalizing healthy model switches.
         now = time.monotonic()
         while self.starts and now-self.starts[0] > 60:
@@ -191,8 +243,20 @@ class Router:
         self.loading = True
         try:
             conf = self.models[name]
+            services = conf.get('external_services', [])
+            if services:
+                self.active_url = conf['upstream_url'].rstrip('/')
+                await self.control_external_services('start', services)
+                await self.wait_for_urls(conf.get(
+                    'external_ready_urls', [self.active_url + '/health']))
+                self.active = name
+                self.starts.clear()
+                self.counts['loads'] += 1
+                logging.info('Ready external backend: %s', name)
+                return
             backend = self.config.get('backend', {})
             address = urlsplit(self.url)
+            self.active_url = self.url
             if address.scheme != 'http' or address.hostname not in ('127.0.0.1','localhost','::1'):
                 self.loading = False
                 raise BackendFault('Managed backend_url must use loopback HTTP')
@@ -270,11 +334,13 @@ class Router:
     async def health(self, request):
         if request.path == '/livez':
             return web.json_response({'status':'alive' if not self.closing else 'stopping'},status=503 if self.closing else 200)
-        ready = bool(not self.closing and self.active and self.process and self.process.returncode is None)
+        external = bool(self.active and self.models[self.active].get('external_services'))
+        ready = bool(not self.closing and self.active and
+                     (external or (self.process and self.process.returncode is None)))
         status = 'loading' if self.loading else 'unloaded'
         if ready:
             try:
-                async with self.client.get(self.url+'/health',timeout=ClientTimeout(total=3)) as r:
+                async with self.client.get(self.active_url+'/health',timeout=ClientTimeout(total=3)) as r:
                     ready = r.status == 200
                 status = 'ok' if ready else 'unavailable'
             except (ClientError,asyncio.TimeoutError):
@@ -294,7 +360,7 @@ class Router:
         deadline = time.monotonic()+self.limits['cancel_grace']
         while time.monotonic() < deadline:
             try:
-                async with self.client.get(self.url+'/status/json',timeout=ClientTimeout(total=0.5)) as r:
+                async with self.client.get(self.active_url+'/status/json',timeout=ClientTimeout(total=0.5)) as r:
                     if r.status == 200 and (await r.json()).get('phase') == 'idle':
                         return
             except (ClientError,asyncio.TimeoutError):
@@ -305,7 +371,7 @@ class Router:
 
     async def forward(self, request, body, state):
         headers = {k:v for k,v in request.headers.items() if k.lower() not in HOP}
-        async with self.client.request(request.method,self.url+request.raw_path,data=body,headers=headers,allow_redirects=False) as upstream:
+        async with self.client.request(request.method,self.active_url+request.raw_path,data=body,headers=headers,allow_redirects=False) as upstream:
             state.streaming = upstream.headers.get('Content-Type','').startswith('text/event-stream')
             if not state.streaming:
                 # Hold nonstream headers until the complete body is available.

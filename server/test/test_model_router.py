@@ -146,4 +146,24 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
         r=await self.client.get('/readyz');self.assertEqual((await r.json())['status'],'ok')
         r=await self.client.get('/v1/models');self.assertEqual((await r.json())['data'][0]['context_length'],131072)
 
+    async def test_external_backend_services_and_url(self):
+        config={'default':'external','models':{'external':{
+                    'path':'external','context':80000,
+                    'upstream_url':str(self.backend_server.make_url('')).rstrip('/'),
+                    'external_services':['target.service','proxy.service'],
+                    'external_ready_urls':[str(self.backend_server.make_url('/health'))]}},
+                'serving':{'load_timeout':2}}
+        router=Router(config)
+        router.client=self.router.client
+        router.control_external_services=AsyncMock()
+        await router.load('external')
+        self.assertEqual(router.active,'external')
+        self.assertEqual(router.active_url,config['models']['external']['upstream_url'])
+        router.control_external_services.assert_awaited_once_with(
+            'start',['target.service','proxy.service'])
+        await router.stop()
+        action,services=router.control_external_services.await_args_list[-1].args
+        self.assertEqual(action,'stop')
+        self.assertEqual(list(services),['proxy.service','target.service'])
+
 if __name__=='__main__':unittest.main(verbosity=2)
