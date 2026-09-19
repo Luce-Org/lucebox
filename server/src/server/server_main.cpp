@@ -23,6 +23,7 @@
 #include "common/platform_env.h"
 #include "common/peer_access.h"
 #include "common/specla_mode.h"
+#include "qwen3/qwen3_drafter.h"
 #include "placement/pflash_placement.h"
 #include "placement/draft_residency.h"
 #include "kvflash_pager.h"
@@ -47,6 +48,65 @@ using namespace dflash::common;
 
 // Global server pointer for signal handling.
 static HttpServer * g_server = nullptr;
+
+class UpstreamCompressionBackend final : public ModelBackend {
+public:
+    void print_ready_banner() const override {}
+    bool park(ParkTarget) override { return true; }
+    bool unpark(ParkTarget) override { return true; }
+    bool is_target_parked() const override { return false; }
+    GenerateResult generate_impl(const GenerateRequest &, const DaemonIO &) override {
+        GenerateResult result;
+        result.fail(GenerateErrorCode::BackendSpecific,
+                    "upstream compression backend cannot generate locally");
+        return result;
+    }
+    bool snapshot_save(int) override { return false; }
+    void snapshot_free(int) override {}
+    bool snapshot_used(int) const override { return false; }
+    int snapshot_cur_pos(int) const override { return 0; }
+    GenerateResult restore_and_generate_impl(
+            int, const GenerateRequest &, const DaemonIO &) override {
+        GenerateResult result;
+        result.fail(GenerateErrorCode::BackendSpecific,
+                    "upstream compression backend has no snapshots");
+        return result;
+    }
+    CompressResult compress(const CompressRequest & request) override {
+        CompressResult result;
+        if (request.input_ids.empty()) return result;
+        if (!drafter_loaded_) {
+            if (!load_drafter(request.drafter_path, 999, request.drafter_gpu,
+                              drafter_)) {
+                std::fprintf(stderr, "[compress-proxy] drafter load failed\n");
+                return result;
+            }
+            drafter_loaded_ = true;
+        }
+        result.compressed_ids = drafter_score_and_compress(
+            drafter_, request.input_ids, request.keep_ratio,
+            /*chunk_size=*/32, request.score_query_tokens, /*pool_kernel=*/13,
+            request.score_query_end, request.should_cancel);
+        result.ok = !result.compressed_ids.empty();
+        if (request.residency_action == DraftResidencyAction::ReleaseAfterUse) {
+            free_drafter();
+        }
+        return result;
+    }
+    bool handle_compress(const std::string &, const DaemonIO &) override {
+        return false;
+    }
+    void free_drafter() override {
+        if (!drafter_loaded_) return;
+        dflash::common::free_drafter(drafter_);
+        drafter_loaded_ = false;
+    }
+    void shutdown() override { free_drafter(); }
+
+private:
+    DrafterContext drafter_;
+    bool drafter_loaded_ = false;
+};
 
 static void signal_handler(int sig) {
     (void)sig;
@@ -1168,7 +1228,13 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         }
     }
     auto & backend = loaded.backend;
-    backend = create_backend(bargs, backend_plan);
+    if (!sconfig.pflash_upstream_base.empty()) {
+        backend = std::make_unique<UpstreamCompressionBackend>();
+        std::fprintf(stderr,
+            "[server] upstream compression proxy: target weights stay unloaded\n");
+    } else {
+        backend = create_backend(bargs, backend_plan);
+    }
     if (!backend) {
         std::fprintf(stderr, "[server] backend creation failed\n");
         return 1;
