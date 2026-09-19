@@ -2796,6 +2796,9 @@ TEST_CASE(ServerUnitFixture, test_session_cache_three_rolling_owners) {
     TEST_ASSERT(cache.lookup_candidate(prompt, 29, "c").first == sc);
     TEST_ASSERT(cache.lookup_candidate(prompt, 29).first == -1);
     TEST_ASSERT(cache.lookup_candidate(prompt, 29, "d").first == -1);
+    TEST_ASSERT(cache.lookup(prompt, "a").first == sa);
+    TEST_ASSERT(cache.lookup(prompt, "b").first == sb);
+    TEST_ASSERT(cache.lookup(prompt).first == -1);
     for (int n = 40; n <= 100; n += 10) {
         const std::vector<int32_t> next(n, 999);
         const int restored = cache.lookup_candidate(next, n - 1, "a").second;

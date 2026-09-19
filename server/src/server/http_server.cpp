@@ -3511,7 +3511,7 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
     }
     if (!cache.using_restore) {
         auto [inline_slot, inline_len] =
-            prefix_cache_.lookup(effective_prompt);
+            prefix_cache_.lookup(effective_prompt, req.session_id);
         cache.cache_slot = inline_slot;
         cache.prefix_len = inline_len;
         cache.using_restore = cache.cache_slot >= 0;
@@ -3762,7 +3762,8 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
             cache.using_restore ? logical_prefix_len : 0,
             prefer_tools_boundary,
             forced_cut,
-            restore_source_slot);
+            restore_source_slot,
+            {}, req.session_id);
         cache.snap_slot = cache.snap_reservation.slot();
         cache.snap_cut = cache.snap_reservation.target_cut();
     };
@@ -4045,7 +4046,8 @@ void HttpServer::remember_agent_turn(
 
     const int canonical_end = (int) canonical_tokens.size();
     auto reservation = prefix_cache_.reserve_inline_snap(
-        canonical_tokens, source_pos, false, canonical_end, source_slot);
+        canonical_tokens, source_pos, false, canonical_end, source_slot,
+        {}, req.session_id);
     // No safe victim (only the restore source and/or protected pins remain)
     // or no useful boundary: nothing to replay into.
     if (!reservation.active() ||

@@ -120,7 +120,9 @@ public:
     // ── Inline prefix cache ─────────────────────────────────────────
 
     // Look up the longest cached prefix. Returns (slot, prefix_len) or (-1, 0).
-    std::pair<int, int> lookup(const std::vector<int32_t> & prompt_ids);
+    std::pair<int, int> lookup(
+        const std::vector<int32_t> & prompt_ids,
+        const std::string & session_id = {});
     // Side-effect-free candidate for engines that must validate payloads.
     std::pair<int, int> lookup_candidate(
         const std::vector<int32_t> & prompt_ids,

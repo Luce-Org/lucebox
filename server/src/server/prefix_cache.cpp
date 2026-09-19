@@ -373,9 +373,10 @@ void PrefixCache::move_full_to_end(int idx) {
 // ── Inline prefix cache ─────────────────────────────────────────────────
 
 std::pair<int, int> PrefixCache::lookup(
-        const std::vector<int32_t> & prompt_ids) {
+        const std::vector<int32_t> & prompt_ids,
+        const std::string & session_id) {
     return lookup_impl(
-        prompt_ids, (int)prompt_ids.size(), /*record_hit=*/true);
+        prompt_ids, (int)prompt_ids.size(), /*record_hit=*/true, session_id);
 }
 
 std::pair<int, int> PrefixCache::lookup_candidate(
