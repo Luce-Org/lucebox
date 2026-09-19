@@ -4545,6 +4545,18 @@ TEST_CASE(ServerUnitFixture, test_jinja_render_tools_injected) {
     TEST_ASSERT(out.find("TOOLS_PRESENT:my_tool") != std::string::npos);
 }
 
+TEST_CASE(ServerUnitFixture, test_jinja_preserves_tool_calls_and_reasoning_effort) {
+    static const char TPL[] =
+        "{{ reasoning_effort }}:{{ messages[0].tool_calls[0].function.name }}:"
+        "{{ messages[0].tool_calls[0].function.arguments.city }}";
+    ChatMessage assistant{"assistant", "", ""};
+    assistant.tool_calls_json =
+        R"([{"id":"call_1","type":"function","function":{"name":"weather","arguments":{"city":"Toronto"}}}])";
+    std::string out = render_chat_template_jinja(
+        TPL, {assistant}, "", "", false, true, "", "x-high");
+    TEST_ASSERT(out == "x-high:weather:Toronto");
+}
+
 TEST_CASE(ServerUnitFixture, test_jinja_render_empty_tools_skipped) {
     // tools_json == "[]" must NOT define `tools` in the template context.
     static const char TPL[] =

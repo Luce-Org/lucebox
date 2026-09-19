@@ -1087,6 +1087,7 @@ std::vector<ChatMessage> normalize_chat_messages(
             bool replayed = false;
             if (cm.role == "assistant" && m.contains("tool_calls") &&
                 m["tool_calls"].is_array() && !m["tool_calls"].empty()) {
+                cm.tool_calls_json = m["tool_calls"].dump();
                 std::vector<std::string> call_ids;
                 for (const auto & tc : m["tool_calls"]) {
                     std::string id = tc.value("id", "");
@@ -2306,7 +2307,7 @@ bool HttpServer::render_messages_to_text(
             rendered = render_chat_template_jinja(
                 config_.chat_template_src, chat_messages, bos, eos,
                 add_generation_prompt,
-                req.thinking_enabled, tools_json);
+                req.thinking_enabled, tools_json, req.reasoning_effort);
         } catch (const std::exception & e) {
             error = std::string("chat template (jinja) render failed: ") + e.what();
             return false;
