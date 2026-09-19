@@ -107,6 +107,7 @@ std::vector<ChatMessage> normalize_chat_messages(
     ToolMemory & tool_memory);
 
 struct SchedulerTestHarness {
+    static void handle_client(HttpServer& server,SocketHandle fd) {server.handle_client(fd);}
     static bool parse_common(HttpServer& server,SocketHandle fd,const json& body,ParsedRequest& req) {return server.parse_common_request_fields(fd,body,req);}
     static void enable_hybrid(HttpServer& server) {server.hybrid_enabled_=true;}
     static hybrid::Cache& hybrid_cache(HttpServer& server) {return server.hybrid_cache_;}
@@ -4555,6 +4556,16 @@ TEST_CASE(ServerUnitFixture, test_jinja_preserves_tool_calls_and_reasoning_effor
     std::string out = render_chat_template_jinja(
         TPL, {assistant}, "", "", false, true, "", "x-high");
     TEST_ASSERT(out == "x-high:weather:Toronto");
+}
+
+TEST_CASE(ServerUnitFixture, test_normalize_preserves_structured_assistant_tool_calls) {
+    ToolMemory memory;
+    json messages=json::array({{{"role","assistant"},{"content",nullptr},
+        {"tool_calls",json::array({{{"id","call_1"},{"type","function"},
+            {"function",{{"name","weather"},{"arguments","{\\\"city\\\":\\\"Toronto\\\"}"}}}}})}}});
+    auto normalized=normalize_chat_messages(messages,ApiFormat::OPENAI_CHAT,memory);
+    TEST_ASSERT(normalized.size()==1);
+    TEST_ASSERT(json::parse(normalized[0].tool_calls_json)==messages[0]["tool_calls"]);
 }
 
 TEST_CASE(ServerUnitFixture, test_jinja_render_empty_tools_skipped) {
@@ -9151,6 +9162,22 @@ struct HybridFailureBackend : MockBackend {
         GenerateResult r;r.fail(GenerateErrorCode::DecodeSeedMissing);return r;
     }
 };
+TEST_CASE(ServerUnitFixture, cache_status_response_closes_connection) {
+#if !defined(_WIN32)
+    const auto path=write_deepseek_marker_tokenizer_fixture();Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    MockBackend backend;ServerConfig config;HttpServer server(backend,tokenizer,config);
+    int sockets[2];TEST_ASSERT(socketpair(AF_UNIX,SOCK_STREAM,0,sockets)==0);
+    const char request[]="GET /cache/status HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n";
+    TEST_ASSERT(write(sockets[1],request,sizeof(request)-1)==(ssize_t)(sizeof(request)-1));
+    SchedulerTestHarness::handle_client(server,sockets[0]);
+    std::string response;char buf[1024];ssize_t n=0;
+    while((n=read(sockets[1],buf,sizeof(buf)))>0)response.append(buf,(size_t)n);
+    TEST_ASSERT(n==0);
+    TEST_ASSERT(response.find("200 OK")!=std::string::npos);
+    close(sockets[1]);unlink(path.c_str());
+#endif
+}
 TEST_CASE(ServerUnitFixture, hybrid_restore_fallback_obeys_stream_and_health_boundary) {
 #if !defined(_WIN32)
     for(int scenario=0;scenario<3;++scenario) {
