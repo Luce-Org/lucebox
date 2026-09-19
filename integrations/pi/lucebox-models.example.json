@@ -14,7 +14,7 @@
             "thinkingFormat": "openai",
             "sendSessionAffinityHeaders": true
           },
-          "contextWindow": 131072,
+          "contextWindow": 80000,
           "cost": {
             "cacheRead": 0,
             "cacheWrite": 0,
@@ -45,7 +45,7 @@
             "thinkingFormat": "openai",
             "sendSessionAffinityHeaders": true
           },
-          "contextWindow": 131072,
+          "contextWindow": 80000,
           "cost": {
             "cacheRead": 0,
             "cacheWrite": 0,
@@ -57,7 +57,7 @@
             "text"
           ],
           "maxTokens": 32768,
-          "name": "Qwen3.8-27B DFlash2",
+          "name": "Qwen3.8-27B Swift (compatibility alias)",
           "reasoning": true,
           "thinkingLevelMap": {
             "high": "high",
@@ -76,7 +76,7 @@
             "thinkingFormat": "openai",
             "sendSessionAffinityHeaders": true
           },
-          "contextWindow": 131072,
+          "contextWindow": 80000,
           "cost": {
             "cacheRead": 0,
             "cacheWrite": 0,
@@ -88,7 +88,7 @@
             "text"
           ],
           "maxTokens": 32768,
-          "name": "Qwen3.8-27B PFlash (lossy)",
+          "name": "Qwen3.8-27B Swift PFlash (compatibility alias)",
           "reasoning": true,
           "thinkingLevelMap": {
             "high": "high",
