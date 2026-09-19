@@ -9,9 +9,9 @@ WorkingDirectory=/opt/lucebox-concurrent/server
 Environment=LD_LIBRARY_PATH=/opt/rocm/core-10.0/lib:/opt/rocm/lib
 ExecStart=/opt/lucebox/work/concurrency-20260913/alternating-candidate/dflash_server \
   /code/models/swift-qwen/ukisai_Swift-Qwen3.8-27b-IQ4_XS.gguf \
-  --host 192.168.2.191 \
-  --port 8216 \
-  --model-name ukisai/Swift-Qwen3.8-27b-int4-AMD \
+  --host 127.0.0.1 \
+  --port 18217 \
+  --model-name qwen3.8-27b-swift \
   --max-ctx 80000 \
   --prefill-compression auto \
   --prefill-threshold 32000 \
@@ -19,7 +19,7 @@ ExecStart=/opt/lucebox/work/concurrency-20260913/alternating-candidate/dflash_se
   --prefill-drafter /code/models/qwen38/Qwen3-0.6B-BF16.gguf \
   --prefill-skip-park \
   --prefill-upstream-base http://192.168.2.191:18218/v1 \
-  --prefill-upstream-model ukisai/Swift-Qwen3.8-27b-int4-AMD
+  --prefill-upstream-model qwen3.8-27b-swift
 Restart=on-failure
 RestartSec=3
 TimeoutStopSec=45
