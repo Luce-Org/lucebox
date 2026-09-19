@@ -1,19 +1,13 @@
 [Unit]
-Description=Lucebox model-serving gateway
+Description=Lucebox two-model API with automatic GPU model switching
 Wants=network.target
-After=network.target
-StartLimitIntervalSec=120
-StartLimitBurst=3
+Requires=linuxmacan-gpu-render-link.service
+After=network.target linuxmacan-gpu-render-link.service
 
 [Service]
 Type=simple
-User=lucebox
-Group=lucebox
 WorkingDirectory=/opt/lucebox
-Environment=LUCEBOX_CONFIG=/opt/lucebox/models.json
-Environment=LUCEBOX_LOG_DIR=/var/log/lucebox
-ExecStart=/opt/lucebox/.venv-serving/bin/python /opt/lucebox/model_router.py
-LogsDirectory=lucebox
+ExecStart=/opt/lucebox-python/bin/python /opt/lucebox/model_router.py
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=45
