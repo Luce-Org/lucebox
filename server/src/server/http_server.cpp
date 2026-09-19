@@ -208,14 +208,18 @@ PflashQueryWindow find_pflash_query_window(
     }
 
     const int widest = (std::min)(max_tokens, (int) query.size());
-    // For a short query, require all available tokens. For a normal query,
-    // four matching suffix tokens are enough to tolerate a BPE boundary
-    // difference without accidentally selecting a lone punctuation token.
+    // Allow up to one scoring window of template tokens before divergence.
+    // Searching older turns can mistake a repeated phrase for the user query
+    // when tokenization diverges inside the actual query.
+    // Require four suffix tokens (or the whole short query) to tolerate a BPE
+    // boundary difference without selecting a lone punctuation token.
     const int narrowest = (std::min)(4, widest);
     const auto prompt_end = prompt.begin() + search_end;
     for (int width = widest; width >= narrowest; --width) {
+        const int search_begin = (std::max)(0, search_end - (std::min)(max_tokens, search_end) - width);
         const auto match = std::find_end(
-            prompt.begin(), prompt_end, query.end() - width, query.end());
+            prompt.begin() + search_begin, prompt_end,
+            query.end() - width, query.end());
         if (match != prompt_end) {
             return {(int) (match - prompt.begin()) + width, width};
         }
