@@ -2447,8 +2447,12 @@ bool HttpServer::handle_model_request(SocketHandle fd, ParsedRequest & req,
         // Reasoning must be applied BEFORE rendering: the template injects
         // the empty <think>\n\n</think>\n\n block when thinking is disabled.
         apply_request_reasoning(body, config_, req);
-        // Bandit: parse session_id from extra_body (opt-in adaptive keep_ratio).
-        req.session_id = parse_session_id_from_body(body);
+        // The upstream compression proxy is content-addressed and deliberately
+        // has no per-chat ownership or adaptive retention policy.  Keep the
+        // legacy session bandit available only for the self-hosted backend.
+        req.session_id = config_.pflash_upstream_base.empty()
+            ? parse_session_id_from_body(body)
+            : std::string{};
 
         // PPP rearrange (optional): peel ephemeral system banners into a
         // following system message so the first chat boundary is stable.
