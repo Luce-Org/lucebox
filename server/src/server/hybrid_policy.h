@@ -104,6 +104,12 @@ struct Memory {
     std::vector<Resident> residents;
 };
 struct ResourcePlan {bool feasible=false;bool release_scratch=false;std::vector<int> evict,spill;std::string reason;};
+// Scratch reclamation is request-local and repeatable. Eviction and migration
+// change committed cache state, so they must wait until scoring/rendering and
+// source promotion have been validated.
+inline bool safe_before_validation(const ResourcePlan & plan) {
+    return plan.feasible && plan.evict.empty() && plan.spill.empty();
+}
 inline ResourcePlan plan_memory(Memory m) {
     ResourcePlan out;
     uint64_t gpu=0,ram=m.metadata_bytes;

@@ -133,7 +133,9 @@ HttpServer::PreparedPrompt HttpServer::prepare_hybrid_prompt(const ParsedRequest
             scoring_counts.push_back(uncached);scoring_regions.push_back(regions_to_score);
             cost_keys.push_back(std::move(key));
             captures.push_back(capture);
-            c.feasible=plan.feasible;
+            c.feasible=plan.feasible &&
+                ((c.path!=Path::Compress && (c.id<0 || c.gpu)) ||
+                 safe_before_validation(plan));
             candidates.push_back(c);representations.push_back(std::move(rep));
         };
         if(!out.hybrid_owner.empty()&&!out.hybrid_temporary)for(auto&e:hybrid_cache_.entries) {
@@ -232,7 +234,10 @@ HttpServer::PreparedPrompt HttpServer::prepare_hybrid_prompt(const ParsedRequest
                 auto& key=cost_keys[index];key=key.substr(0,key.rfind(":capture"))+":capture0";
                 c.seconds=hybrid_cache_.estimate(key);c.projected=false;
             }
-            return admission.resource;
+            auto resource=std::move(admission.resource);
+            if((c.path==Path::Compress || (c.id>=0 && !c.gpu)) &&
+               !safe_before_validation(resource))resource.feasible=false;
+            return resource;
         };
         auto plan=resource_for(decision.index);
         if(!plan.feasible || capture_changed) {
@@ -255,7 +260,16 @@ HttpServer::PreparedPrompt HttpServer::prepare_hybrid_prompt(const ParsedRequest
             {"input_tokens",req.prompt_tokens.size()},{"output_capacity",req.max_output},
             {"evict",plan.evict},{"spill",plan.spill},{"feasible",plan.feasible}};
         std::fprintf(stderr,"[hybrid-admit] %s\n",admission_trace.dump().c_str());
-        if(!plan.feasible||!hybrid_cache_.execute(backend_,plan))return fail(503,"Cache resource reservation changed or transfer failed");
+        if(!plan.feasible)return fail(503,"Cache resource reservation changed");
+        // Compression and RAM-source promotion still have fallible validation
+        // ahead. Only reclaim scratch now; committed entries remain untouched.
+        const bool defer_resource_commit=chosen.path==Path::Compress ||
+            (chosen.id>=0 && !chosen.gpu);
+        if(defer_resource_commit) {
+            if(plan.release_scratch)backend_.release_scratch();
+        } else if(!hybrid_cache_.execute(backend_,plan)) {
+            return fail(503,"Cache resource transfer failed");
+        }
         out.representation=representations[decision.index];out.hybrid_path=chosen.path;
         out.hybrid_capture=captures[decision.index];
         out.hybrid_trace["cost_key"]=cost_keys[decision.index];
@@ -263,16 +277,7 @@ HttpServer::PreparedPrompt HttpServer::prepare_hybrid_prompt(const ParsedRequest
         out.hybrid_trace["projection_anchor"]=chosen.prefix==0 && (chosen.path==Path::Dense ||
             (chosen.path==Path::Compress && scoring_regions[decision.index]==1 && out.representation->regions.size()==1));
         out.hybrid_trace["selected_path"]=name(chosen.path);out.hybrid_trace["spills"]=plan.spill;out.hybrid_trace["evictions"]=plan.evict;
-        if(chosen.id>=0) {
-            if(!chosen.gpu) {
-                auto begin=std::chrono::steady_clock::now();
-                if(!backend_.snapshot_move(chosen.id,true)){out.hybrid_recoverable=true;return fail(503,"Checkpoint promotion failed; source retained");}
-                hybrid_cache_.find(chosen.id)->gpu=true;
-                hybrid_cache_.find(chosen.id)->bytes=backend_.snapshot_bytes(chosen.id);
-                out.hybrid_trace["promotion_seconds"]=std::chrono::duration<double>(std::chrono::steady_clock::now()-begin).count();
-            }
-            out.hybrid_source=chosen.id;
-        }
+        if(chosen.id>=0)out.hybrid_source=chosen.id;
         if(chosen.path==Path::Compress) {
             std::string query;
             for(int i=(int)req.messages.size()-1;i>=0;--i)if(req.messages[i].value("role","")=="user") {
@@ -326,6 +331,17 @@ HttpServer::PreparedPrompt HttpServer::prepare_hybrid_prompt(const ParsedRequest
         if(out.tokens.size()+(size_t)req.max_output>(size_t)config_.max_ctx) {
             out.hybrid_recoverable=chosen.path==Path::Compress;
             return fail(400,"Effective prompt plus output exceeds context");
+        }
+        // Promotion is itself fallible, so perform it only after compression,
+        // rendering, cancellation and context validation have all succeeded.
+        if(out.hybrid_source>=0)if(auto* source=hybrid_cache_.find(out.hybrid_source))if(!source->gpu) {
+            auto begin=std::chrono::steady_clock::now();
+            if(!backend_.snapshot_move(source->slot,true)) {
+                out.hybrid_recoverable=true;
+                return fail(503,"Checkpoint promotion failed; source retained");
+            }
+            source->gpu=true;source->bytes=backend_.snapshot_bytes(source->slot);
+            out.hybrid_trace["promotion_seconds"]=std::chrono::duration<double>(std::chrono::steady_clock::now()-begin).count();
         }
         // Scoring may change the required capture size; final admission uses the real
         // effective history, with replacement storage reserved separately from its source.

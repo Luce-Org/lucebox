@@ -9266,6 +9266,16 @@ TEST_CASE(ServerUnitFixture, hybrid_capture_failure_does_not_deny_answer_and_sma
     auto changed=plan_with_optional_capture(memory,GiB/2);
     TEST_ASSERT(changed.resource.feasible && !changed.capture);
 }
+TEST_CASE(ServerUnitFixture, hybrid_prevalidation_plan_rejects_cache_mutations) {
+    using namespace dflash::common::hybrid;
+    ResourcePlan scratch_only;
+    scratch_only.feasible=true;scratch_only.release_scratch=true;
+    TEST_ASSERT(safe_before_validation(scratch_only));
+    ResourcePlan evict=scratch_only;evict.evict.push_back(4);
+    TEST_ASSERT(!safe_before_validation(evict));
+    ResourcePlan spill=scratch_only;spill.spill.push_back(7);
+    TEST_ASSERT(!safe_before_validation(spill));
+}
 TEST_CASE(ServerUnitFixture, hybrid_pi_text_blocks_preserve_other_parts_and_summary) {
     using namespace dflash::common::hybrid;
     Json messages={{{"role","user"},{"content",{{{"type","text"},{"text","document text"}},{{"type","text"},{"text","Question?"}}}}}};
