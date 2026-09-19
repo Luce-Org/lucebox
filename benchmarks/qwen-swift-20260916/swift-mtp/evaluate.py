@@ -1,4 +1,5 @@
-import json,time,urllib.request,pathlib,sys,re
+import json,time,urllib.request,pathlib,sys
+from evaluation_helpers import score_message
 base,model,label,outdir=sys.argv[1:];out=pathlib.Path(outdir);out.mkdir(parents=True,exist_ok=True)
 cases=[
 ('arithmetic','A machine makes 17 parts every 6 minutes. It runs for 3 hours 24 minutes, but is stopped for 18 minutes during that interval. It starts a fresh cycle when restarted. Both active intervals are multiples of 6 minutes. How many parts? Return JSON only: {"parts": integer}.',{'parts':527}),
@@ -14,13 +15,7 @@ for name,prompt,expected in cases:
  if name=='tool_call':body['tools']=[{'type':'function','function':{'name':'lookup_weather','description':'Look up weather for a city','parameters':{'type':'object','properties':{'city':{'type':'string'},'unit':{'type':'string','enum':['celsius','fahrenheit']}},'required':['city','unit']}}}]
  t=time.monotonic();req=urllib.request.Request(base+'/v1/chat/completions',data=json.dumps(body).encode(),headers={'Content-Type':'application/json'})
  with urllib.request.urlopen(req,timeout=240) as r:response=json.load(r)
- elapsed=time.monotonic()-t;choice=response['choices'][0];msg=choice['message'];value=None
- try:
-  if name=='tool_call':
-   call=msg['tool_calls'][0]['function'];value=json.loads(call['arguments']) if call['name']=='lookup_weather' else None
-  else:
-   content=re.sub(r'<think>.*?</think>','',msg.get('content') or '',flags=re.S).strip();content=re.sub(r'^```(?:json)?\s*|\s*```$','',content);value=json.loads(content)
- except (ValueError,KeyError,IndexError):pass
- row={'name':name,'wall_seconds':elapsed,'passed':value==expected and choice['finish_reason']!='length','expected':expected,'response':response,'request':body};rows.append(row)
+ elapsed=time.monotonic()-t;choice=response['choices'][0];msg=choice['message']
+ row={'name':name,'wall_seconds':elapsed,'passed':score_message(name,msg,choice['finish_reason'],expected),'expected':expected,'response':response,'request':body};rows.append(row)
  (out/(label+'.json')).write_text(json.dumps(rows,indent=2));print(json.dumps({'name':name,'seconds':elapsed,'passed':row['passed'],'usage':response.get('usage'),'finish':choice['finish_reason']}),flush=True)
 print(json.dumps({'label':label,'passed':sum(x['passed'] for x in rows),'total':len(rows),'seconds':sum(x['wall_seconds'] for x in rows)}),flush=True)
