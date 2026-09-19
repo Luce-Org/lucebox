@@ -9,7 +9,9 @@ rows=[]
 try:
  for name in ['cold','repeat']:
   t=time.monotonic();response=call('/v1/chat/completions',body);wall=time.monotonic()-t
-  trace=call('/cache/status')['last_request'];row={'name':name,'wall_seconds':wall,'answer':response['choices'][0]['message']['content'],'usage':response['usage'],'trace':trace};rows.append(row);print(json.dumps(row),flush=True)
+  answer=response['choices'][0]['message']['content']
+  assert ''.join(answer.split())=='507831,926104,318762',answer
+  trace=call('/cache/status')['last_request'];row={'name':name,'wall_seconds':wall,'answer':answer,'usage':response['usage'],'trace':trace};rows.append(row);print(json.dumps(row),flush=True)
   (root/'eligible-compression-results.json').write_text(json.dumps(rows,indent=2))
   assert trace['selected_path'] in ('compress','frozen','full'),trace
   assert trace['scored_regions']==(1 if name=='cold' else 0),trace

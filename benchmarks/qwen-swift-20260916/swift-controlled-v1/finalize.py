@@ -6,7 +6,11 @@ for c in s['cases']:
  assert len({x['prompt_tokens'] for x in rows})==1
 assert all(x['score']['completed'] for x in a)
 assert all(x['reasoning_text'] and 'reasoning_text_tokens' in x for x in a)
-assert all(not x['response'].get('timings',{}).get('cache_n',0) and not x['response']['usage'].get('timings',{}).get('cached_prefix_tokens',0) for x in a)
+assert all(
+ (x['backend']=='dflash' and x['response']['usage']['timings']['cached_prefix_tokens']==0)
+ or (x['backend']=='mtp' and x['response']['timings']['cache_n']==0)
+ for x in a
+)
 assert hashlib.sha256((r/'suite.json').read_bytes()).hexdigest()==(r/'suite.sha256').read_text().split()[0]
 summary=analysis['summary'];pick=lambda b,g:next(x for x in summary if x['backend']==b and x['suite']==g)
 df=pick('Lucebox + DFlash2','speed');mtp=pick('llama.cpp + MTP','speed');saving=100*(1-df['median_wall']/mtp['median_wall']);passes={b:sum(x['score']['pass'] for x in a if x['suite']=='quality' and x['backend']==b) for b in ['dflash','mtp']}
