@@ -1758,6 +1758,7 @@ void HttpServer::handle_client(SocketHandle fd) {
     if (hr.method == "GET" && hr.path == "/cache/status") {
         std::lock_guard<std::mutex> lock(hybrid_stats_mutex_);
         send_response(fd,200,"application/json",hybrid_stats_.dump()+"\n");
+        socket_close(fd);
         return;
     }
     if (hr.method == "GET" && hr.path == "/props") {
