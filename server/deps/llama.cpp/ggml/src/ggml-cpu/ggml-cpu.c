@@ -156,7 +156,8 @@ static void ggml_compute_forward_ds4_indexer_score(
     const struct ggml_tensor * comp = dst->src[2];
     const struct ggml_tensor * visibility_mask = dst->src[3];
     GGML_ASSERT(q && weights && comp);
-    GGML_ASSERT(q->type == GGML_TYPE_F32 && q->ne[0] == 128);
+    GGML_ASSERT((q->type == GGML_TYPE_F32 || q->type == GGML_TYPE_F16) &&
+                q->ne[0] == 128);
     GGML_ASSERT(weights->type == GGML_TYPE_F32);
     GGML_ASSERT(comp->type == GGML_TYPE_F16 && comp->ne[0] == 128);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
@@ -175,7 +176,10 @@ static void ggml_compute_forward_ds4_indexer_score(
     GGML_ASSERT(dst->ne[0] == n_comp && dst->ne[1] == n_tokens);
     GGML_ASSERT(kv_start >= 0 && ratio > 0);
 
-    const float * q_data = (const float *) q->data;
+    const float * q_f32 = q->type == GGML_TYPE_F32
+        ? (const float *) q->data : NULL;
+    const ggml_fp16_t * q_f16 = q->type == GGML_TYPE_F16
+        ? (const ggml_fp16_t *) q->data : NULL;
     const float * weight_data = (const float *) weights->data;
     const ggml_fp16_t * comp_data = (const ggml_fp16_t *) comp->data;
     const float * mask_data = visibility_mask
@@ -194,11 +198,14 @@ static void ggml_compute_forward_ds4_indexer_score(
             const ggml_fp16_t * k = comp_data + (size_t) c * 128;
             float score = 0.0f;
             for (int h = 0; h < n_head; ++h) {
-                const float * qh = q_data +
+                const size_t q_offset =
                     ((size_t) token * n_head + h) * 128;
                 float dot = 0.0f;
                 for (int d = 0; d < 128; ++d) {
-                    dot += qh[d] * GGML_FP16_TO_FP32(k[d]);
+                    const float q_value = q_f32
+                        ? q_f32[q_offset + d]
+                        : GGML_FP16_TO_FP32(q_f16[q_offset + d]);
+                    dot += q_value * GGML_FP16_TO_FP32(k[d]);
                 }
                 score += fmaxf(dot, 0.0f) *
                          weight_data[(size_t) token * n_head + h];

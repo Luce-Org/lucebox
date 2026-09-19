@@ -19,6 +19,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include <optional>
 #include <random>
 #include <string>
 #include <vector>
@@ -26,8 +27,8 @@
 namespace dflash::common {
 
 struct Gemma4BackendConfig {
-    const char *    model_path = nullptr;
-    const char *    draft_path = nullptr;
+    std::string     model_path;
+    std::optional<std::string> draft_path;
     int             draft_gpu  = -1;       // GPU for draft model (-1 = same as target)
     int             draft_ctx_max = 2048;  // max context for draft feature mirror
     DevicePlacement device;
@@ -38,7 +39,7 @@ struct Gemma4BackendConfig {
 
 class Gemma4Backend : public ModelBackend {
 public:
-    explicit Gemma4Backend(const Gemma4BackendConfig & cfg);
+    explicit Gemma4Backend(Gemma4BackendConfig cfg);
     ~Gemma4Backend() override;
 
     Gemma4Backend(const Gemma4Backend &) = delete;

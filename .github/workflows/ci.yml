@@ -378,11 +378,12 @@ jobs:
               test_model_smoke test_batched_gdn \
               test_kernel_qualification_core test_kernel_qualification_gdn \
               test_kernel_qualification_moe_ds4 \
-              test_concat_transpose test_cuda_pool_shutdown \
+              test_concat_transpose test_cuda_pool_shutdown test_fattn_mma256 \
+              test_paged_attn_wmma \
             --parallel 8
           ctest --test-dir "$RUNNER_TEMP/rocmfp-build" \
             --output-on-failure \
-            -R 'cuda_pool_shutdown|rocmfp4_reference|rocmfpx_reference|rocmfp4_hip_tail|rocmfpx_mmq|deepseek4_mmid_grouped_cuda|deepseek4_unit|ds4_moe_combine_cuda|ds4_maskless_prefill|recurrent_snapshot|ChainRollbackPolicy|MmqTileSelection|MixedMmqPolicy|MoeHybridStorageFixture|rocmfp3_mix_registry|rocmfp_mix_slice_matvec|rocmfp_mix_gateup_glu|ds4_mix_registry_teardown|test_model_smoke\.PagedAttention\.|batched_gdn$|test_kernel_qualification_core\.|kernel_qualification_gdn$|kernel_qualification_moe_ds4$|concat_transpose$'
+            -R 'cuda_pool_shutdown|rocmfp4_reference|rocmfpx_reference|rocmfp4_hip_tail|rocmfpx_mmq|deepseek4_mmid_grouped_cuda|deepseek4_unit|ds4_moe_combine_cuda|ds4_maskless_prefill|recurrent_snapshot|ChainRollbackPolicy|MmqTileSelection|MixedMmqPolicy|MoeHybridStorageFixture|rocmfp3_mix_registry|rocmfp_mix_slice_matvec|rocmfp_mix_gateup_glu|ds4_mix_registry_teardown|test_model_smoke\.PagedAttention\.|batched_gdn$|test_kernel_qualification_core\.|kernel_qualification_gdn$|kernel_qualification_moe_ds4$|concat_transpose$|test_fattn_mma256$|test_paged_attn_wmma$|paged_attn_wmma_route$'
 
       - name: Run GPU draft top-K tests
         run: |

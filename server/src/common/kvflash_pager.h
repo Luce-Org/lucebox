@@ -184,6 +184,12 @@ public:
         cur_chunk_ = 0;
         epoch_++;
         has_pending_page_in_ = false;
+        // Drop any relevance scoring from the previous request: a stale
+        // score_hook could otherwise select an in-flight chunk of a multi-chunk
+        // prefill ubatch as an eviction victim. It is re-installed by the
+        // decode-time reselect path, so pooled prefill falls back to LRU, where
+        // the just-allocated (newest) chunks are never victims.
+        score_hook = nullptr;
     }
 
     // Zero every currently-free block. reset() drops mappings but leaves the

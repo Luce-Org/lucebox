@@ -107,6 +107,11 @@ static bool mix_gfx1151_row4_enabled() {
     }();
     return enabled;
 }
+
+// One wave per workgroup on gfx1151: the DS4 decode shapes (q=1..5) share no
+// data between waves, and larger blocks only add scheduling pressure.
+static constexpr int MIX_GFX1151_WARPS_PER_BLOCK = 1;
+
 // RAII device switch: restores the previous device even on the early-return error paths.
 struct MixDeviceGuard {
     int prev = -1;
@@ -1174,7 +1179,7 @@ bool ggml_cuda_rocmfp2_mix_mul_mat_id(
         return false;
     }
     const bool row4 = e.gfx1151 && n_tokens > 2 && mix_gfx1151_row4_enabled();
-    const int warps_per_block = row4 ? 2 : (e.gfx1151 ? (n_tokens <= 2 ? 8 : 4) : 2);
+    const int warps_per_block = e.gfx1151 ? MIX_GFX1151_WARPS_PER_BLOCK : 2;
     const int threads = warps_per_block * MIX_WARP;
     const int rows_per_block = (row4 ? 4 : 2) * warps_per_block;
     dim3 grid((out + rows_per_block - 1) / rows_per_block, n_expert_used, n_tokens);
@@ -1224,7 +1229,7 @@ bool ggml_cuda_rocmfp2_mix_mul_mat_id_glu(
     }
     const bool strix_tuned = eu.gfx1151 && eg.gfx1151;
     const bool row4 = strix_tuned && n_tokens > 2 && mix_gfx1151_row4_enabled();
-    const int warps_per_block = row4 ? 2 : (strix_tuned ? (n_tokens <= 2 ? 8 : 4) : 2);
+    const int warps_per_block = strix_tuned ? MIX_GFX1151_WARPS_PER_BLOCK : 2;
     const int threads = warps_per_block * MIX_WARP;
     const int rows_per_block = (row4 ? 4 : 2) * warps_per_block;
     dim3 grid((out + rows_per_block - 1) / rows_per_block, n_expert_used, n_tokens);

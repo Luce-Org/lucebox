@@ -260,6 +260,31 @@ struct DeepSeek4CompressorState {
     ggml_tensor * state_score = nullptr;  // [window_size, head_dim] rolling scores
 };
 
+// Device-resident snapshot of the ratio-4 previous-window rows immediately
+// after the first flush in a q5 verification step. A q5 batch that begins at
+// position 3 mod 4 can flush twice; retaining this intermediate state lets a
+// rejected prefix commit the first window without replaying the target.
+struct DeepSeek4SpecBoundaryCheckpointLayer {
+    ggml_tensor * attn_kv_src = nullptr;
+    ggml_tensor * attn_kv_dst = nullptr;
+    ggml_tensor * attn_score_src = nullptr;
+    ggml_tensor * attn_score_dst = nullptr;
+    ggml_tensor * index_kv_src = nullptr;
+    ggml_tensor * index_kv_dst = nullptr;
+    ggml_tensor * index_score_src = nullptr;
+    ggml_tensor * index_score_dst = nullptr;
+};
+
+struct DeepSeek4SpecBoundaryCheckpoint {
+    std::vector<DeepSeek4SpecBoundaryCheckpointLayer> layers;
+    bool available = false;
+
+    void clear() {
+        layers.clear();
+        available = false;
+    }
+};
+
 // Per-layer cache
 struct DeepSeek4LayerCache {
     // Raw SWA ring buffer
@@ -334,7 +359,7 @@ struct DeepSeek4Head4Tail2Routes {
 // ─── Configuration ──────────────────────────────────────────────────────
 
 struct DeepSeek4BackendConfig {
-    const char * model_path   = nullptr;
+    std::string  model_path;
     DevicePlacement device;
     int          stream_fd    = -1;
     int          chunk        = 512;   // prefill chunk size
@@ -485,7 +510,8 @@ bool deepseek4_step(
     DeepSeek4StepTelemetry *    telemetry = nullptr,
     MoeHybridRoutingStats *     routing_stats = nullptr,
     Ds4VerifyHooks *            verify_hooks = nullptr,
-    MoeExpertComputeRuntime *   expert_runtime = nullptr);
+    MoeExpertComputeRuntime *   expert_runtime = nullptr,
+    bool                        need_logits = true);
 
 // Optional hooks for the DSpark spec-decode batched verify (deepseek4_dspark).
 // When set on a multi-token deepseek4_step_layer_range call they add: per-layer
@@ -501,6 +527,7 @@ struct Ds4VerifyHooks {
     std::vector<float> *     all_logits_out = nullptr;      // [n_vocab * n_tokens]
     std::vector<int32_t> *   argmax_out = nullptr;          // [n_tokens], optional GPU result
     bool                     prefer_argmax_only = false;     // skip logits D2H when available
+    DeepSeek4SpecBoundaryCheckpoint * boundary_checkpoint_out = nullptr;
 };
 
 bool deepseek4_step_layer_range(

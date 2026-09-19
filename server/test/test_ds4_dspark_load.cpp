@@ -17,10 +17,22 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
 #include <string>
 #include <vector>
 
 namespace dflash::common { void deepseek4_dspark_dump(const DSparkDrafter &); }
+
+static uint64_t fnv1a64(const std::vector<float> & values) {
+    uint64_t hash = 1469598103934665603ull;
+    const auto * bytes = reinterpret_cast<const uint8_t *>(values.data());
+    for (size_t i = 0; i < values.size() * sizeof(float); ++i) {
+        hash = (hash ^ bytes[i]) * 1099511628211ull;
+    }
+    return hash;
+}
 
 int main(int argc, char ** argv) {
     using namespace dflash::common;
@@ -120,10 +132,13 @@ int main(int argc, char ** argv) {
         const int fc_in  = d.n_target_layers * n_embd;
         const char * cle = std::getenv("DS4_CTX_LEN");
         const int ctx_len = cle ? atoi(cle) : 8;
+        const char * variant_env = std::getenv("DS4_INPUT_VARIANT");
+        const int input_variant = variant_env ? atoi(variant_env) : 0;
+        const float phase = 0.73f * (float) input_variant;
         std::vector<float> noise((size_t) n_embd * block);
         std::vector<float> feats((size_t) fc_in * ctx_len);
-        for (size_t i = 0; i < noise.size(); i++) noise[i] = 0.06f * std::sin(0.31f * (float) i + 1.3f);
-        for (size_t i = 0; i < feats.size(); i++) feats[i] = 0.05f * std::cos(0.17f * (float) i + 0.4f);
+        for (size_t i = 0; i < noise.size(); i++) noise[i] = 0.06f * std::sin(0.31f * (float) i + 1.3f + phase);
+        for (size_t i = 0; i < feats.size(); i++) feats[i] = 0.05f * std::cos(0.17f * (float) i + 0.4f - phase);
         std::vector<float> hidden, confidence_hidden;
         const int committed = 64;  // arbitrary >= ctx_len
         std::fprintf(stderr, "\n── drafter forward (ctx_len=%d block=%d) ──\n", ctx_len, block);
@@ -135,9 +150,10 @@ int main(int argc, char ** argv) {
         } else {
             bool finite = true; double sumsq = 0.0;
             for (float v : hidden) { if (!std::isfinite(v)) finite = false; sumsq += (double) v * v; }
-            std::fprintf(stderr, "forward out: %zu floats, finite=%d, rms=%.4f, first=[%.4f %.4f %.4f]\n",
+            std::fprintf(stderr, "forward out: %zu floats, finite=%d, rms=%.4f, hash=%016llx, first=[%.4f %.4f %.4f]\n",
                          hidden.size(), (int) finite,
                          std::sqrt(sumsq / (double) hidden.size()),
+                         (unsigned long long) fnv1a64(hidden),
                          hidden.size() > 0 ? hidden[0] : 0.0f,
                          hidden.size() > 1 ? hidden[1] : 0.0f,
                          hidden.size() > 2 ? hidden[2] : 0.0f);
@@ -169,6 +185,36 @@ int main(int argc, char ** argv) {
                 need(async_hidden == hidden, "async normalized hidden identity");
                 need(async_confidence_hidden == confidence_hidden,
                      "async confidence hidden identity");
+            }
+
+            const char * bench_env = std::getenv("DS4_BENCH_ITERS");
+            const int bench_iters = bench_env ? std::max(0, std::atoi(bench_env)) : 0;
+            if (bench_iters > 0) {
+                constexpr int warmups = 5;
+                std::vector<double> timings;
+                timings.reserve((size_t) bench_iters);
+                for (int i = 0; i < warmups + bench_iters; ++i) {
+                    const auto start = std::chrono::steady_clock::now();
+                    const bool run_ok = deepseek4_dspark_draft_forward(
+                        backend, d, noise.data(), feats.data(), ctx_len,
+                        committed, hidden, &confidence_hidden);
+                    const auto end = std::chrono::steady_clock::now();
+                    need(run_ok, "successful benchmark draft forward");
+                    if (!run_ok) break;
+                    if (i >= warmups) {
+                        timings.push_back(
+                            std::chrono::duration<double, std::milli>(
+                                end - start).count());
+                    }
+                }
+                if (!timings.empty()) {
+                    std::sort(timings.begin(), timings.end());
+                    const double median_ms = timings[timings.size() / 2];
+                    std::fprintf(stderr,
+                                 "[bench] ctx_len=%d block=%d median=%.3f ms "
+                                 "(%zu samples)\n",
+                                 ctx_len, block, median_ms, timings.size());
+                }
             }
         }
     }

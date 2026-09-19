@@ -62,6 +62,14 @@ bool parse_disk_prefix_cache_policy(const std::string & value,
 bool apply_request_scope_override(DiskPrefixCachePolicy & server_policy,
                                   const std::string & scope_str);
 
+// Prefix lengths a "full" policy lookup probes: the whole prompt, then every
+// chat boundary deepest first. Those are the only lengths this policy ever
+// persists (exact prompts, inline snapshots, cold prefixes).
+std::vector<int> disk_prefix_cache_full_lookup_lengths(
+    int prompt_len,
+    const std::vector<int> & boundaries,
+    int min_tokens);
+
 int disk_prefix_cache_fixed_boundary(const DiskPrefixCachePolicy & policy,
                                      int full_len,
                                      int min_tokens = 1);

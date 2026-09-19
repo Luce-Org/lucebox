@@ -159,18 +159,69 @@ TEST_CASE(Rocmfp3MixRegistryFixture, registry_lifecycle) {
     }
     cudaDeviceSynchronize();
     (void) cudaMemGetInfo(&free_warm, &total);
-    for (int i = 0; i < 4000; ++i) {
-        CHECK(ggml_cuda_rocmfp3_mix_register_host(
-                  leak_base, nb02, E, out, in, books.data(), modes.data()),
-              "cycle registration succeeds");
-        ggml_cuda_rocmfp3_mix_unregister(leak_base);
+    // cudaMemGetInfo is device-wide: on a shared GPU another process can
+    // move free memory by hundreds of MB during the loop. A leak in this
+    // code path costs the same every cycle, so it shows in every chunk of
+    // the loop; an external allocation shows in one chunk and not the rest.
+    // Require the leak signature (every chunk over the threshold), and
+    // report a moving device as such instead of as a leak.
+    // A chunk of 1000 cycles requests about 264 KiB of side-data device
+    // memory in total, so a leak of those buffers shows as a drop of that
+    // order in every chunk; the threshold sits well below it. A device
+    // shared with another process can also lose free memory steadily, so
+    // each cycle chunk is paired with an idle chunk of the same wall time:
+    // a leak drops free memory only while cycling, an external consumer
+    // drops it in the idle chunks too.
+    constexpr int kChunks = 4;
+    constexpr int kCyclesPerChunk = 1000;
+    constexpr long long kLeakThreshold = 64 * 1024;   // per chunk
+    long long chunk_delta[kChunks] = {};
+    long long idle_delta[kChunks] = {};
+    size_t free_prev = free_warm;
+    for (int c = 0; c < kChunks; ++c) {
+        const auto cycle_t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < kCyclesPerChunk; ++i) {
+            CHECK(ggml_cuda_rocmfp3_mix_register_host(
+                      leak_base, nb02, E, out, in, books.data(), modes.data()),
+                  "cycle registration succeeds");
+            ggml_cuda_rocmfp3_mix_unregister(leak_base);
+        }
+        cudaDeviceSynchronize();
+        const auto cycle_wall = std::chrono::steady_clock::now() - cycle_t0;
+        size_t free_now = 0;
+        (void) cudaMemGetInfo(&free_now, &total);
+        chunk_delta[c] = (long long) free_prev - (long long) free_now;
+        free_prev = free_now;
+        // idle chunk: same wall time, no registry activity
+        std::this_thread::sleep_for(cycle_wall);
+        cudaDeviceSynchronize();
+        (void) cudaMemGetInfo(&free_now, &total);
+        idle_delta[c] = (long long) free_prev - (long long) free_now;
+        free_prev = free_now;
     }
-    cudaDeviceSynchronize();
-    size_t free_end = 0;
-    (void) cudaMemGetInfo(&free_end, &total);
-    const long long delta = (long long) free_warm - (long long) free_end;
-    std::fprintf(stderr, "[registry] free VRAM delta over 4000 cycles: %lld bytes\n", delta);
-    CHECK(delta < 8 * 1024 * 1024, "no device leak across register/unregister cycles");
+    const long long delta = (long long) free_warm - (long long) free_prev;
+    std::fprintf(stderr,
+                 "[registry] free VRAM delta over %d cycles: %lld bytes "
+                 "(per %d-cycle chunk: %lld, %lld, %lld, %lld; idle chunks: "
+                 "%lld, %lld, %lld, %lld)\n",
+                 kChunks * kCyclesPerChunk, delta, kCyclesPerChunk,
+                 chunk_delta[0], chunk_delta[1], chunk_delta[2], chunk_delta[3],
+                 idle_delta[0], idle_delta[1], idle_delta[2], idle_delta[3]);
+    bool every_chunk_leaks = true;
+    bool any_chunk_moved = false;
+    bool device_moves_when_idle = false;
+    for (int c = 0; c < kChunks; ++c) {
+        every_chunk_leaks = every_chunk_leaks && chunk_delta[c] >= kLeakThreshold;
+        any_chunk_moved = any_chunk_moved || chunk_delta[c] >= kLeakThreshold;
+        device_moves_when_idle = device_moves_when_idle || idle_delta[c] >= kLeakThreshold;
+    }
+    if (any_chunk_moved && (!every_chunk_leaks || device_moves_when_idle)) {
+        std::fprintf(stderr,
+                     "[registry] device-wide free memory moved outside the "
+                     "leak signature (shared device), not counted as a leak\n");
+    }
+    CHECK(!(every_chunk_leaks && !device_moves_when_idle),
+          "no device leak across register/unregister cycles");
     CHECK(cudaFree(leak_base) == cudaSuccess, "leak-test base allocation is released");
 
     std::fprintf(stderr, g_fails ? "REGISTRY TEST FAILED (%d)\n"

@@ -16,6 +16,11 @@ RAGGED_PROFILES = {
     "short": (250, 350, 450, 550),
     "medium": (650, 850, 1150, 1350),
     "long": (2000, 2600, 3400, 4000),
+    # Long-context prefill points. Words calibrate at roughly 1.13 tokens
+    # per word on the Qwen3.8 tokenizer, so these land near 16K and 32K
+    # prompt tokens.
+    "xl": (12500, 13500, 14500, 15500),
+    "xxl": (24500, 26500, 28500, 30500),
 }
 
 DEFAULT_CLIENT_LEVELS = (2, 4, 8, 16)

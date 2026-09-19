@@ -211,7 +211,11 @@ int main(int argc, char ** argv) {
     }
     ggml_backend_t backend = ggml_backend_cuda_init(0);
     if (!backend) return 1;
-    const int expected_launches = defaults ? 1 : disabled ? 0 : 2;
+    // gfx1151 streams every eligible indexed shape by default (explicit-mask
+    // and analytic requests alike), so the default mode dispatches twice
+    // there; other wave32 devices default to the analytic ratio-4 request only.
+    const bool gfx1151 = std::strstr(properties.gcnArchName, "gfx1151") != nullptr;
+    const int expected_launches = defaults ? (gfx1151 ? 2 : 1) : disabled ? 0 : 2;
     bool ok = true;
     if (short_maskless) {
         // This valid small-window contract reaches the decode-width selector.

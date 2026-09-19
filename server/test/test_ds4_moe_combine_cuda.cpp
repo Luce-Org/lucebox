@@ -577,7 +577,7 @@ int main(int argc, char ** argv) {
                      "HIP signed-zero +0 result", signed_zero_case) && ok;
 
     if (argc == 2 && std::strcmp(argv[1], "--benchmark") == 0) {
-        for (int tokens : {401, 2048}) {
+        for (int tokens : {1, 4, 8, 401, 2048}) {
             double legacy_ms = 0.0;
             double legacy_mad = 0.0;
             double fused_ms = 0.0;

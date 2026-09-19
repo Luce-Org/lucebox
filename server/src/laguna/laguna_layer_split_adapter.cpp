@@ -24,6 +24,7 @@
 #include <limits>
 #include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace dflash::common {
@@ -37,8 +38,8 @@ static bool tensor_ready(const ggml_tensor * t) {
 }  // namespace
 
 LagunaLayerSplitAdapter::LagunaLayerSplitAdapter(
-        const LagunaLayerSplitAdapterConfig & cfg)
-    : cfg_(cfg) {}
+        LagunaLayerSplitAdapterConfig cfg)
+    : cfg_(std::move(cfg)) {}
 
 LagunaLayerSplitAdapter::~LagunaLayerSplitAdapter() { shutdown(); }
 
@@ -48,7 +49,7 @@ bool LagunaLayerSplitAdapter::init() {
     }
 
     const LayerSplitRuntimeInit runtime_cfg{
-        cfg_.target_path,
+        cfg_.target_path.c_str(),
         &cfg_.device,
         "laguna-target-split",
     };
@@ -131,7 +132,7 @@ bool LagunaLayerSplitAdapter::init_mixed_target_split() {
         return false;
     }
 
-    const auto info = inspect_gguf_model_info(cfg_.target_path);
+    const auto info = inspect_gguf_model_info(cfg_.target_path.c_str());
     const int n_layer = info.n_layer;
     if (n_layer <= 0) {
         std::fprintf(stderr,
@@ -214,7 +215,7 @@ bool LagunaLayerSplitAdapter::init_mixed_target_split() {
     TargetShardIpcLaunchConfig launch;
     launch.mode = BackendIpcMode::LagunaTargetShard;
     launch.bin = cfg_.remote_target_shard.ipc_bin;
-    launch.target_path = cfg_.target_path ? cfg_.target_path : "";
+    launch.target_path = cfg_.target_path;
     launch.gpus = remote_gpus;
     launch.layer_begins = remote_layer_begins;
     launch.layer_ends = remote_layer_ends;
@@ -258,7 +259,7 @@ KvFlashConfig LagunaLayerSplitAdapter::kvflash_config() const {
 
 void LagunaLayerSplitAdapter::kvflash_read_config() {
     if (!std::getenv("DFLASH_KVFLASH") || shards_.empty()) return;
-    kvflash_drafter_path_ = kvflash_find_drafter(cfg_.target_path);
+    kvflash_drafter_path_ = kvflash_find_drafter(cfg_.target_path.c_str());
 
     int64_t min_free = std::numeric_limits<int64_t>::max();
     int64_t max_bytes_per_token = 0;

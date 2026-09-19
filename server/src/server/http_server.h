@@ -4,7 +4,7 @@
 // Architecture:
 //   - Main thread: listen + accept
 //   - Per-client thread: parse HTTP request, enqueue job, wait for completion
-//   - Single worker thread: dequeue jobs, call ModelBackend::generate()
+//   - LuceEngine execution thread: run the selected backend serving loop
 //
 // Client disconnect detection: the client thread watches the socket while the
 // worker generates, and streaming writes provide a second failure signal.
@@ -16,6 +16,7 @@
 #include "socket_handle.h"
 #include "client_send_buffer.h"
 #include "common/model_backend.h"
+#include "common/concurrency/paged_kv_offload.h"
 #include "tokenizer.h"
 #include "chat_template.h"
 #include "tool_memory.h"
@@ -49,6 +50,10 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+namespace dflash::engine {
+class LuceEngine;
+}
 
 namespace dflash::common {
 
@@ -205,6 +210,8 @@ struct ServerConfig {
     // Idle-to-busy batching window. It is ignored by single-slot engines and
     // never delays an already decoding request.
     int admission_coalesce_ms = 20;
+    // Auto resolves after all models load, before workers start. Zero disables.
+    size_t decode_kv_offload_bytes = dflash::common::kAutoKvOffloadBytes;
 
     // PFlash (speculative prefill compression)
     enum class PflashMode { OFF, AUTO, ALWAYS };
@@ -380,7 +387,7 @@ json build_props_body(const ServerConfig & config,
 // ─── HTTP server ────────────────────────────────────────────────────────
 class HttpServer {
 public:
-    HttpServer(ModelBackend & backend,
+    HttpServer(dflash::engine::LuceEngine & engine,
                Tokenizer & tokenizer,
                const ServerConfig & config);
     ~HttpServer();
@@ -419,7 +426,7 @@ private:
     void handle_client(SocketHandle fd);
 
     struct HttpRequest;
-    void start_worker();
+    bool start_worker();
     bool route_model_request(SocketHandle fd, ParsedRequest & req, bool count_only);
     bool handle_model_request(SocketHandle fd, ParsedRequest & req, bool count_only,
                               RoutingAdmission * admission = nullptr);
@@ -501,10 +508,6 @@ private:
     struct GenerationInputs {
         GenerateRequest request;
         int generation_cap = 0;
-        std::vector<int32_t> hint_tokens;
-        std::vector<int32_t> stall_tool_prefix_tokens;
-        std::vector<int32_t> stall_action_suffix_tokens;
-        std::vector<int32_t> stall_skip_tokens;
     };
 
     struct GenerationOutputState {
@@ -599,6 +602,7 @@ private:
     bool has_pending_jobs();
 
     // Members.
+    dflash::engine::LuceEngine & engine_;
     ModelBackend &   backend_;
     Tokenizer &      tokenizer_;
     Tokenizer *      drafter_tokenizer_ = nullptr;  // pflash drafter (optional)
@@ -677,8 +681,7 @@ private:
     std::condition_variable routing_cv_;
     int routing_waiters_ = 0;
 
-    // Worker thread.
-    std::thread                     worker_thread_;
+    // Request queue consumed by the serving loop owned by LuceEngine.
     std::mutex                      queue_mu_;
     std::condition_variable         queue_cv_;
     ServerJob *                     queue_head_ = nullptr;

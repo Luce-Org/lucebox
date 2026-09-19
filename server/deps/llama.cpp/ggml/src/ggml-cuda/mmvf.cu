@@ -446,6 +446,23 @@ void launch_mul_mat_vec_f_cuda(
             block_size_best = block_size;
         }
     }
+    if constexpr (std::is_same_v<T, half> && std::is_same_v<type_acc, half> &&
+                  ncols_dst == 5) {
+        // RDNA 3.5 has enough independent rows at the drafter's width-5 F16
+        // projections to favor more, smaller Wave32 workgroups. This is a
+        // measured shape table (gfx1151, K=4096: 256 rows -> 128 threads,
+        // 1K-4K rows -> 64 threads); every other shape keeps the generic
+        // choice. The block size sets the partial-sum order, so it is part
+        // of the validated numerics and deliberately not an env tunable.
+        const int cc = ggml_cuda_info().devices[device].cc;
+        if (GGML_CUDA_CC_IS_RDNA3_5(cc) && ncols == 4096) {
+            if (nrows == 256) {
+                block_size_best = 128;
+            } else if (nrows >= 1024 && nrows <= 4096) {
+                block_size_best = 64;
+            }
+        }
+    }
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
 
@@ -864,9 +881,15 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
                 }
                 return ne11 <= 8;
             } else if (GGML_CUDA_CC_IS_AMD(cc)) {
+                // LUCE_MMVF_MAX_NCOLS_F16 is a qualified admission floor: any
+                // width up to the ceiling takes MMVF unconditionally, and wider
+                // requests fall through to the measured shape rules below
+                // instead of being rejected. A hard cutoff here would send
+                // every width-5 F16 projection to rocWMMA whenever a narrower
+                // ceiling is configured, which is what the q5 verifier hit.
                 const int ceiling = luce_mmvf_f16_max_ncols();
-                if (ceiling > 0 && fp16_mma_hardware_available(cc)) {
-                    return ne11 <= ceiling;
+                if (ceiling > 0 && ne11 <= ceiling) {
+                    return true;
                 }
                 // rocBLAS ships a single 128x128 macro-tile and no split-K in
                 // its gfx1151 F16 Tensile library, so a narrow F16 weight
@@ -876,10 +899,20 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
                 // 367 us there against 13 us on MMVF. MMVF instantiates up to
                 // eight columns and keeps the single-column accumulation
                 // order per column. DFLASH_CUDA_MMVF_NARROW_F16=0 restores
-                // the BLAS route.
+                // the BLAS route. DS4's [16384,24] hyper-connection
+                // projection at q4 and q5 is covered by this rule.
                 if (GGML_CUDA_CC_IS_RDNA3_5(cc) && src0_ne[1] <= 32 &&
                     src0_ne[2]*src0_ne[3] == 1 && ne11 <= 8 &&
                     mmvf_narrow_f16_enabled()) {
+                    return true;
+                }
+                // gfx1151 (RDNA 3.5): the scalar row-split MMVF kernel beats
+                // rocWMMA/hipBLAS for F16 projections up to the widest
+                // speculative verify width. Measured on the DeepSeek V4 q=5
+                // verifier: 130 -> 100 ms/step with every F16 shape admitted
+                // at width five, identical output, so this is a device-class
+                // policy rather than a list of measured row counts.
+                if (GGML_CUDA_CC_IS_RDNA3_5(cc) && ne11 <= 5) {
                     return true;
                 }
                 if (fp16_mma_hardware_available(cc)) {

@@ -27,7 +27,7 @@
 namespace dflash::common {
 
 struct Qwen3BackendConfig {
-    const char *    model_path = nullptr;
+    std::string     model_path;
     DevicePlacement device;
     int             stream_fd  = -1;
     int             chunk      = 512;
@@ -65,7 +65,7 @@ void free_qwen3_snapshot(Qwen3Snapshot & s);
 
 class Qwen3Backend : public ModelBackend {
 public:
-    explicit Qwen3Backend(const Qwen3BackendConfig & cfg);
+    explicit Qwen3Backend(Qwen3BackendConfig cfg);
     ~Qwen3Backend() override;
 
     Qwen3Backend(const Qwen3Backend &) = delete;

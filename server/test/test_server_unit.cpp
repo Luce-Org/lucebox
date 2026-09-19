@@ -22,6 +22,7 @@
 #include "server/http_server.h"
 #include "server/hybrid_policy.h"
 #include "server/hybrid_regions.h"
+#include "engine/luce_engine.h"
 #include "server/chat_template.h"
 #include "common/concurrency/seq_engine.h"
 #include "common/sampler.h"
@@ -83,6 +84,7 @@
 
 using json = nlohmann::json;
 using namespace dflash::common;
+using dflash::engine::LuceEngine;
 namespace fs = std::filesystem;
 
 static fs::path test_tmp_path(const char * name) {
@@ -2761,15 +2763,32 @@ TEST_CASE(ServerUnitFixture, test_resolve_deepseek_chat_markers) {
                 std::vector<std::vector<int32_t>>({{2}}));
     TEST_ASSERT(markers.next_role_starts ==
                 std::vector<std::vector<int32_t>>({{3}, {4}}));
+    TEST_ASSERT(markers.role_starts_delimit);
 
-    // Completed assistant turn followed by the next user marker. The reusable
-    // boundary includes that role marker, matching the server's other chat
-    // families and leaving only the new user content for suffix prefill.
+    // Only assistant turns carry an end marker; the system text and user
+    // turns end where the next role starts. Every role marker therefore
+    // opens a reusable boundary: the system text, each completed turn, and
+    // the generation prompt. The marker itself belongs to the boundary,
+    // matching the server's other chat families.
     const std::vector<int32_t> prompt = {
         1, 100, 3, 101, 4, 102, 2, 3, 103, 4,
     };
     TEST_ASSERT(find_all_boundaries(prompt, markers) ==
-                std::vector<int>({8}));
+                std::vector<int>({3, 5, 8, 10}));
+    // The default snapshot cut stays before the current user turn.
+    TEST_ASSERT(select_inline_snapshot_boundary(
+                    find_all_boundaries(prompt, markers)) == 8);
+
+    // A first turn snapshots its system text, so a new session on the same
+    // system prompt restores it instead of prefilling it again.
+    const std::vector<int32_t> first_turn = {1, 100, 3, 101, 4};
+    TEST_ASSERT(find_all_boundaries(first_turn, markers) ==
+                std::vector<int>({3, 5}));
+    TEST_ASSERT(select_inline_snapshot_boundary(
+                    find_all_boundaries(first_turn, markers)) == 3);
+    // Tool-heavy requests pin the same system head.
+    TEST_ASSERT(select_inline_snapshot_boundary(
+                    find_all_boundaries(prompt, markers), 0, true) == 3);
     remove_test_path(path);
 }
 
@@ -5227,10 +5246,12 @@ TEST_CASE(ServerUnitFixture,
     Tokenizer tokenizer;
     TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
 
-    ShortInlineSnapshotBackend backend;
+    auto backend_owner = std::make_unique<ShortInlineSnapshotBackend>();
+    ShortInlineSnapshotBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
     ServerConfig config;
     config.prefix_cache_cap = 2;
-    HttpServer server(backend, tokenizer, config);
+    HttpServer server(engine, tokenizer, config);
     PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
     const std::vector<int32_t> prompt = {1, 100, 3, 101};
     auto reservation = cache.reserve_inline_snap(
@@ -5412,8 +5433,10 @@ TEST_CASE(ServerUnitFixture,
     Tokenizer tokenizer;
     TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
 
-    SchedulerPrefixBackend backend;
+    auto backend_owner = std::make_unique<SchedulerPrefixBackend>();
+    SchedulerPrefixBackend & backend = *backend_owner;
     backend.engine.defer_restore.store(true, std::memory_order_relaxed);
+    LuceEngine engine(std::move(backend_owner));
     ServerConfig config;
     config.arch = "qwen35";
     config.max_ctx = 64;
@@ -5421,7 +5444,7 @@ TEST_CASE(ServerUnitFixture,
     config.concurrent_prefix_cache_max_bytes = 1024;
     config.concurrent_paged_prefix_cache = true;
     config.admission_coalesce_ms = 0;
-    HttpServer server(backend, tokenizer, config);
+    HttpServer server(engine, tokenizer, config);
     PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
     cache.confirm_inline_snap(
         /*slot=*/0, /*target_cut=*/2, {1, 100}, false, 128);
@@ -5486,8 +5509,10 @@ TEST_CASE(ServerUnitFixture,
     Tokenizer tokenizer;
     TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
 
-    SchedulerPrefixBackend backend;
+    auto backend_owner = std::make_unique<SchedulerPrefixBackend>();
+    SchedulerPrefixBackend & backend = *backend_owner;
     backend.engine.malformed_restore.store(true, std::memory_order_relaxed);
+    LuceEngine engine(std::move(backend_owner));
     ServerConfig config;
     config.arch = "qwen35";
     config.max_ctx = 64;
@@ -5495,7 +5520,7 @@ TEST_CASE(ServerUnitFixture,
     config.concurrent_prefix_cache_max_bytes = 1024;
     config.concurrent_paged_prefix_cache = true;
     config.admission_coalesce_ms = 0;
-    HttpServer server(backend, tokenizer, config);
+    HttpServer server(engine, tokenizer, config);
     PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
     cache.confirm_inline_snap(
         /*slot=*/0, /*target_cut=*/2, {1, 100}, false, 128);
@@ -5544,8 +5569,10 @@ TEST_CASE(ServerUnitFixture,
     Tokenizer tokenizer;
     TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
 
-    SchedulerPrefixBackend backend;
+    auto backend_owner = std::make_unique<SchedulerPrefixBackend>();
+    SchedulerPrefixBackend & backend = *backend_owner;
     backend.engine.unrequested_restore.store(true, std::memory_order_relaxed);
+    LuceEngine engine(std::move(backend_owner));
     ServerConfig config;
     config.arch = "qwen35";
     config.max_ctx = 64;
@@ -5553,7 +5580,7 @@ TEST_CASE(ServerUnitFixture,
     config.concurrent_prefix_cache_max_bytes = 1024;
     config.concurrent_paged_prefix_cache = true;
     config.admission_coalesce_ms = 0;
-    HttpServer server(backend, tokenizer, config);
+    HttpServer server(engine, tokenizer, config);
     PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
     cache.confirm_inline_snap(
         /*slot=*/0, /*target_cut=*/2, {1, 100}, false, 128);
@@ -5598,7 +5625,9 @@ TEST_CASE(ServerUnitFixture,
     Tokenizer tokenizer;
     TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
 
-    SchedulerPrefixBackend backend;
+    auto backend_owner = std::make_unique<SchedulerPrefixBackend>();
+    SchedulerPrefixBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
     ServerConfig config;
     config.arch = "qwen35";
     config.max_ctx = 64;
@@ -5606,7 +5635,7 @@ TEST_CASE(ServerUnitFixture,
     config.concurrent_prefix_cache_max_bytes = 1024;
     config.concurrent_paged_prefix_cache = true;
     config.admission_coalesce_ms = 0;
-    HttpServer server(backend, tokenizer, config);
+    HttpServer server(engine, tokenizer, config);
     PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
     cache.confirm_inline_snap(
         /*slot=*/0, /*target_cut=*/2, {1, 100}, false, 128);
@@ -6078,6 +6107,19 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_continued_interval_logic) {
     // target=100 < min_tokens=512, so the continued save should NOT fire.
     TEST_ASSERT(target < min_tokens);
     (void)min_tokens;
+}
+
+TEST_CASE(ServerUnitFixture, test_disk_cache_full_lookup_lengths) {
+    // Whole prompt first, then every boundary deepest first, skipping cuts
+    // below the persistence minimum and the prompt end itself.
+    TEST_ASSERT(disk_prefix_cache_full_lookup_lengths(
+                    6000, {300, 2000, 4000, 6000}, 512) ==
+                std::vector<int>({6000, 4000, 2000}));
+    TEST_ASSERT(disk_prefix_cache_full_lookup_lengths(6000, {}, 512) ==
+                std::vector<int>({6000}));
+    TEST_ASSERT(disk_prefix_cache_full_lookup_lengths(0, {100}, 512).empty());
+    // Below the persistence minimum nothing was ever written: no probes.
+    TEST_ASSERT(disk_prefix_cache_full_lookup_lengths(300, {100}, 512).empty());
 }
 
 TEST_CASE(ServerUnitFixture, test_disk_cache_cold_prefix_short_prompt) {
@@ -9166,7 +9208,9 @@ TEST_CASE(ServerUnitFixture, cache_status_response_closes_connection) {
 #if !defined(_WIN32)
     const auto path=write_deepseek_marker_tokenizer_fixture();Tokenizer tokenizer;
     TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
-    MockBackend backend;ServerConfig config;HttpServer server(backend,tokenizer,config);
+    auto backend_owner=std::make_unique<MockBackend>();
+    dflash::engine::LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;HttpServer server(engine,tokenizer,config);
     int sockets[2];TEST_ASSERT(socketpair(AF_UNIX,SOCK_STREAM,0,sockets)==0);
     const char request[]="GET /cache/status HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n";
     TEST_ASSERT(write(sockets[1],request,sizeof(request)-1)==(ssize_t)(sizeof(request)-1));
@@ -9183,9 +9227,12 @@ TEST_CASE(ServerUnitFixture, hybrid_restore_fallback_obeys_stream_and_health_bou
     for(int scenario=0;scenario<3;++scenario) {
         const auto path=write_deepseek_marker_tokenizer_fixture();Tokenizer tokenizer;
         TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
-        HybridFailureBackend backend;backend.emit_before_failure=scenario==1;backend.healthy=scenario!=2;
+        auto backend_owner=std::make_unique<HybridFailureBackend>();
+        HybridFailureBackend& backend=*backend_owner;
+        backend.emit_before_failure=scenario==1;backend.healthy=scenario!=2;
+        dflash::engine::LuceEngine engine(std::move(backend_owner));
         ServerConfig config;config.max_ctx=4096;
-        HttpServer server(backend,tokenizer,config);SchedulerTestHarness::enable_hybrid(server);
+        HttpServer server(engine,tokenizer,config);SchedulerTestHarness::enable_hybrid(server);
         int sockets[2];TEST_ASSERT(socketpair(AF_UNIX,SOCK_STREAM,0,sockets)==0);
         ServerJob job;job.fd=sockets[0];job.req.format=ApiFormat::OPENAI_CHAT;
         job.req.prompt_tokens=std::vector<int32_t>(1024,0);job.req.rendered_prompt="test";
@@ -9204,8 +9251,11 @@ TEST_CASE(ServerUnitFixture, hybrid_expired_request_never_starts_backend) {
 #if !defined(_WIN32)
     const auto path=write_deepseek_marker_tokenizer_fixture();Tokenizer tokenizer;
     TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
-    HybridFailureBackend backend;ServerConfig config;config.max_ctx=4096;
-    HttpServer server(backend,tokenizer,config);SchedulerTestHarness::enable_hybrid(server);
+    auto backend_owner=std::make_unique<HybridFailureBackend>();
+    HybridFailureBackend& backend=*backend_owner;
+    dflash::engine::LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;config.max_ctx=4096;
+    HttpServer server(engine,tokenizer,config);SchedulerTestHarness::enable_hybrid(server);
     int sockets[2];TEST_ASSERT(socketpair(AF_UNIX,SOCK_STREAM,0,sockets)==0);
     ServerJob job;job.fd=sockets[0];job.req.format=ApiFormat::OPENAI_CHAT;
     job.req.prompt_tokens=std::vector<int32_t>(1024,0);job.req.max_output=8;job.req.stream=true;
@@ -9234,8 +9284,11 @@ TEST_CASE(ServerUnitFixture, hybrid_rebase_keeps_frozen_region_when_whole_messag
 TEST_CASE(ServerUnitFixture, hybrid_failed_or_cancelled_capture_retains_primary_dependencies) {
     const auto path=write_deepseek_marker_tokenizer_fixture();Tokenizer tokenizer;
     TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
-    HybridFailureBackend backend;ServerConfig config;config.max_ctx=4096;
-    HttpServer server(backend,tokenizer,config);SchedulerTestHarness::enable_hybrid(server);
+    auto backend_owner=std::make_unique<HybridFailureBackend>();
+    HybridFailureBackend& backend=*backend_owner;
+    dflash::engine::LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;config.max_ctx=4096;
+    HttpServer server(engine,tokenizer,config);SchedulerTestHarness::enable_hybrid(server);
     ParsedRequest req;req.format=ApiFormat::OPENAI_CHAT;req.session_id="owner";
     req.prompt_tokens=std::vector<int32_t>(1024,0);req.max_output=8;
     req.raw_body={{"extra_body",{{"lucebox_cache",{{"mode","exact"}}}}}};
@@ -9360,8 +9413,11 @@ TEST_CASE(ServerUnitFixture, hybrid_rejects_output_capacity_instead_of_silently_
 #if !defined(_WIN32)
     const auto path=write_deepseek_marker_tokenizer_fixture();Tokenizer tokenizer;
     TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
-    HybridFailureBackend backend;ServerConfig config;config.max_ctx=4096;config.default_max_tokens=32;
-    HttpServer server(backend,tokenizer,config);SchedulerTestHarness::enable_hybrid(server);
+    auto backend_owner=std::make_unique<HybridFailureBackend>();
+    HybridFailureBackend& backend=*backend_owner;
+    dflash::engine::LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;config.max_ctx=4096;config.default_max_tokens=32;
+    HttpServer server(engine,tokenizer,config);SchedulerTestHarness::enable_hybrid(server);
     int sockets[2];TEST_ASSERT(socketpair(AF_UNIX,SOCK_STREAM,0,sockets)==0);
     for(const char* field:{"max_tokens","max_output_tokens","max_completion_tokens"}) {
         ParsedRequest req;

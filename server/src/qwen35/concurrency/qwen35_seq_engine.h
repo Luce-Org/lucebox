@@ -22,6 +22,7 @@
 #pragma once
 
 #include "common/concurrency/seq_engine.h"
+#include "common/concurrency/paged_kv_offload.h"
 #include "common/dflash_draft_kv.h"
 #include "common/dflash_feature_ring.h"
 #include "qwen35_slot_manager.h"
@@ -106,6 +107,17 @@ public:
         };
     }
 
+    bool reserve_decode(const StepPlan & plan) override;
+    size_t kv_offload_capacity() const override { return offload_.capacity(); }
+    KvOffloadState kv_offload_state(int slot) const override { return offload_.state(slot); }
+    bool offload_kv(int slot, size_t bytes, std::string & error) override {
+        return offload_.suspend(slot, bytes, error);
+    }
+    bool restore_kv(int slot, std::string & error) override;
+    bool evict_kv(int slot, int32_t pending_token, std::string & error) override;
+    bool kv_restore_feasible(int slot) const override {
+        return slots_.kv_restore_feasible(slot);
+    }
     void retire(int slot) override;
 
     bool token_is_eos(int32_t token) const override;
@@ -165,6 +177,7 @@ private:
     PagedKvPool & pool_;
     Qwen35Backend & b_;
     Qwen35SlotManager  slots_;
+    PagedKvOffload offload_;
     int64_t         scratch_row_ = 0;
     FixedChainConfig fixed_chain_;
     bool            fixed_chain_ready_ = false;
@@ -175,6 +188,7 @@ private:
     DraftKvBatchGraph batch_draft_graph_;
 
     // Hoisted per-step buffers (reused across step() calls).
+    std::vector<int>         reserve_growth_;
     std::vector<int>         output_rows_;
     std::vector<int32_t>     live_tokens_;
     std::vector<int32_t>     live_positions_;

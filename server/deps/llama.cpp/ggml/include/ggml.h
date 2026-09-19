@@ -2469,6 +2469,28 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * selected);
 
+    // Present a logical DS4 KV sequence as three contiguous row segments
+    // without materializing their concatenation. Requires K and V to be the
+    // same tensor (MLA latent KV); only the split-KV decode kernel consumes it. `a` keeps the raw segment in
+    // src[1]/src[2]; `compressed` and `preserved_tail` (K's type and D,
+    // contiguous [D, rows]) are appended in that order and stored in
+    // src[7]/src[8]. Row indices, the mask width and the raw-row count in
+    // op_params address the concatenated sequence. Only the native D=512
+    // CUDA/HIP split-KV decode kernel (indexed mask, n_tokens <= 8) consumes
+    // the segments; no other backend or shape implements them.
+    GGML_API void ggml_flash_attn_ext_set_ds4_kv_segments(
+            struct ggml_tensor * a,
+            struct ggml_tensor * compressed,
+            struct ggml_tensor * preserved_tail);
+
+    // Mark a maskless DS4 layer-major attention op whose raw and compressed
+    // rows have monotonic causal frontiers. A value of 1 denotes raw-only
+    // sliding-window attention; values greater than 1 are the compression
+    // ratio of the contiguous compressed interval.
+    GGML_API void ggml_flash_attn_ext_set_ds4_causal_ratio(
+            struct ggml_tensor * a,
+            int                  ratio);
+
     // Fuse DS4's inverse 64-d tail RoPE into the D=512 flash-attention
     // writeback. q_unrotated additionally asks the kernel to apply the forward
     // tail RoPE to Q from shared F32. This is exact-only plumbing: both paths

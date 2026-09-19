@@ -306,31 +306,29 @@ static void ds4_fused_consume_route_diagnostics(
 }
 
 // Each hybrid cache slot owns a multi-backend scheduler, and each scheduler's
-// gallocr retains its per-backend scratch buffers until the slot is destroyed.
-// Keeping all 12 shape variants alive can therefore exhaust the 32 GiB target
-// GPU after only a few distinct speculative shapes.  Two variants fit on the
-// R9700 while preserving the common q=3/q=4 reuse; allow experiments to lower
-// this to one (or raise it deliberately) without affecting the single-backend
-// verifier cache.
+// gallocr retains its per-backend scratch buffers until the slot is destroyed,
+// so the hybrid profile caps how many of the kSlotCount verifier shapes stay
+// alive. DFLASH_DS4_TP_FUSED_CACHE_SLOTS lowers or raises that cap without
+// affecting the single-backend verifier cache.
 static size_t ds4_fused_verify_hybrid_slot_limit() {
     static const size_t limit = []() {
         const char * raw = std::getenv("DFLASH_DS4_TP_FUSED_CACHE_SLOTS");
-        // q=5 advances through four ratio-4 phases and crosses a ratio-128
-        // boundary in the 128-token qualification request. With two slots the
-        // nine recurring shapes rebuild on every step. Nine slots were
-        // model-qualified at 28.5 GiB peak on the 31.9 GiB R9700.
+        // Every miss is a full rebuild of the whole-model graph, 5.4 ms of an
+        // 88.9 ms step doing no arithmetic, while the slots themselves are
+        // nearly free: the graphs share their scratch through the allocator,
+        // so the whole cache measured 303 MiB at two slots and 351 MiB at
+        // 64, about 0.8 MiB per slot.
         //
-        // q<=4 held a two-slot default, which misses just as reliably: its
-        // shape set needs four, and an adaptive width moving between q=2, 3
-        // and 4 needs more than that. Every miss is a full rebuild of the
-        // whole-model graph, and that is 5.4 ms of a 88.9 ms step doing no
-        // arithmetic. The slots themselves are nearly free -- the graphs share
-        // their scratch through the allocator, so the whole cache measured
-        // 303 MiB at two slots and 351 MiB at 64, about 0.8 MiB per slot --
-        // and eight of them stay under the nine already qualified at the wider
-        // q=5. See the pull request for the measurement.
-        const long default_slots =
-            ds4_env_flag("DFLASH_DS4_Q5_VERIFY") ? 9 : 8;
+        // q<=4: the shape set needs four slots and an adaptive width moving
+        // between q=2, 3 and 4 needs more; eight stay under the nine that
+        // were model-qualified at 28.5 GiB peak on the 31.9 GiB R9700.
+        // q5 (adaptive q2..q5): four widths across four ratio-4 phases plus
+        // the boundary shapes, i.e. every one of the kSlotCount resident
+        // shapes stays warm. Device scratch is shared (about 0.8 MiB per
+        // slot); each built slot also keeps its 32 MiB host metadata arena,
+        // so a fully populated q5 cache holds up to 768 MiB of host memory.
+        const long default_slots = ds4_env_flag("DFLASH_DS4_Q5_VERIFY")
+            ? (long) Ds4FusedVerifyCache::kSlotCount : 8;
         const long requested = raw ? std::strtol(raw, nullptr, 10)
                                    : default_slots;
         return (size_t) std::max<long>(
@@ -393,6 +391,9 @@ static bool ds4_build_fused_verify_graph(
         DeepSeek4PagedCache * paged_cache = nullptr,
         const std::vector<std::vector<DeepSeek4GatheredLaneRows>> * paged_rows = nullptr,
         bool paged_history_buckets = false) {
+    const bool report_build_timing =
+        ds4_env_flag("DFLASH_DS4_VERIFY_BUILD_TIMING");
+    const auto build_t0 = Ds4TimingClock::now();
     const bool paged_mode = paged_cache && paged_rows;
     if (!paged_mode && !cache) return false;
     if (paged_mode) {
@@ -426,8 +427,9 @@ static bool ds4_build_fused_verify_graph(
             projection_columns = 4;
             // The multi-token expert kernel gives every token its own warp
             // with a fixed per-row K traversal, so a part's arithmetic does
-            // not depend on how many tokens share the launch; eight rows is
-            // the RDNA3 MUL_MAT_ID ceiling for the FP2/FP3 expert types. A
+            // not depend on how many tokens share the launch. The paged
+            // compute scope keeps these eight-row parts on FP2/FP3 MMV;
+            // the default five-row cutoff would instead select MMQ. A
             // single live sequence keeps one-row parts: its decode rounds use
             // the single-token expert kernel, whose arithmetic differs from
             // the multi-token kernel's.
@@ -452,6 +454,7 @@ static bool ds4_build_fused_verify_graph(
     fg.reset_nodes();
     ex.reset();
     fg.hash_ids.assign((size_t) w.n_layer, nullptr);
+    ex.boundary_checkpoint.layers.resize((size_t) w.n_layer);
     if (hybrid) {
         fg.hybrid_inputs.assign((size_t) w.n_layer, {});
     }
@@ -462,8 +465,13 @@ static bool ds4_build_fused_verify_graph(
         : BackendPairCapabilities{true, true};
     const bool same_gpu_runtime = pair_capabilities.same_runtime;
 
-    const size_t arena_size = 256u * 1024 * 1024;
+    // The 43-layer q<=5 verifier currently consumes at most ~6.5 MiB of
+    // metadata.  Keeping 32 MiB leaves nearly 5x headroom while avoiding the
+    // cost (and retained UMA footprint) of zero-filling 256 MiB for every
+    // compressor-boundary shape in the cache.
+    const size_t arena_size = 32u * 1024 * 1024;
     if (fg.sg.meta_arena.size() < arena_size) fg.sg.meta_arena.resize(arena_size);
+    const auto arena_t1 = Ds4TimingClock::now();
     ggml_init_params params{};
     params.mem_size = fg.sg.meta_arena.size();
     params.mem_buffer = fg.sg.meta_arena.data();
@@ -913,7 +921,9 @@ static bool ds4_build_fused_verify_graph(
         attn_out = build_mla_attention(ctx, gf, normed, w, L, *lc, il,
                                                      lane_kv_start, lane_q, &ain,
                                                      i32b, i32ab, i64ab,
-                                                     &f32ab, attention_impl);
+                                                     &f32ab, attention_impl,
+                                                     &ex.boundary_checkpoint.layers[
+                                                         (size_t) il]);
         if (!attn_out) return false;
         if (!i32b.empty() || !i32ab.empty() || !i64ab.empty() ||
             !f32ab.empty()) {
@@ -1179,6 +1189,13 @@ static bool ds4_build_fused_verify_graph(
         ggml_set_output(ex.capture);
         ggml_build_forward_expand(gf, ex.capture);
     }
+    ex.boundary_checkpoint.available = std::any_of(
+        ex.boundary_checkpoint.layers.begin(),
+        ex.boundary_checkpoint.layers.end(),
+        [](const DeepSeek4SpecBoundaryCheckpointLayer & layer) {
+            return layer.attn_kv_src || layer.index_kv_src;
+        });
+    const auto topology_t1 = Ds4TimingClock::now();
 
     // One-shot graph inventory for profiling residual single-token FP4 work.
     // This is deliberately build-time only: it does not install a scheduler
@@ -1365,6 +1382,17 @@ static bool ds4_build_fused_verify_graph(
         pin_main(fg.logits);
         pin_main(ex.argmax);
         pin_main(ex.capture);
+        for (const DeepSeek4SpecBoundaryCheckpointLayer & checkpoint :
+             ex.boundary_checkpoint.layers) {
+            pin_main(checkpoint.attn_kv_src);
+            pin_main(checkpoint.attn_kv_dst);
+            pin_main(checkpoint.attn_score_src);
+            pin_main(checkpoint.attn_score_dst);
+            pin_main(checkpoint.index_kv_src);
+            pin_main(checkpoint.index_kv_dst);
+            pin_main(checkpoint.index_score_src);
+            pin_main(checkpoint.index_score_dst);
+        }
 
         if (!ggml_backend_sched_alloc_graph(fg.sched, fg.sg.gf)) {
             std::fprintf(stderr,
@@ -1391,6 +1419,21 @@ static bool ds4_build_fused_verify_graph(
             std::fprintf(stderr, "[ds4-fused-verify] graph alloc failed\n");
             return false;
         }
+    }
+    const auto alloc_t1 = Ds4TimingClock::now();
+    if (report_build_timing) {
+        std::fprintf(
+            stderr,
+            "[ds4-fused-verify-build] q=%d kv_start=%d nodes=%d "
+            "meta_used=%.2fMiB meta_capacity=%.2fMiB arena=%.1fms "
+            "topology=%.1fms alloc=%.1fms total=%.1fms\n",
+            q, kv_start, ggml_graph_n_nodes(fg.sg.gf),
+            (double) ggml_used_mem(ctx) / (1024.0 * 1024.0),
+            (double) fg.sg.meta_arena.size() / (1024.0 * 1024.0),
+            (double) ds4_elapsed_us(build_t0, arena_t1) / 1000.0,
+            (double) ds4_elapsed_us(arena_t1, topology_t1) / 1000.0,
+            (double) ds4_elapsed_us(topology_t1, alloc_t1) / 1000.0,
+            (double) ds4_elapsed_us(build_t0, alloc_t1) / 1000.0);
     }
     fg.shape_key = std::move(shape_key);
     return true;
@@ -1801,6 +1844,9 @@ static int ds4_try_fused_verify_step(
         ggml_backend_tensor_get(
             ex->capture, hooks->capture_out->data(), 0,
             sizeof(float) * hooks->capture_out->size());
+    }
+    if (hooks->boundary_checkpoint_out) {
+        *hooks->boundary_checkpoint_out = ex->boundary_checkpoint;
     }
     if (telemetry) {
         telemetry->full_graph_read_us += ds4_elapsed_us(read_t0, Ds4TimingClock::now());

@@ -210,6 +210,10 @@ endif()
 option(DFLASH27B_FA_ALL_QUANTS "Compile ggml-cuda fattn kernels for all KV-quant pairs" ON)
 set(GGML_CUDA_FA_ALL_QUANTS ${DFLASH27B_FA_ALL_QUANTS} CACHE BOOL "" FORCE)
 
+# rocWMMA fattn kernel on HIP builds (RDNA3/RDNA4, requires rocWMMA >= 2.0
+# for RDNA4). Off by default: keeps the existing dispatch surface unchanged.
+option(GGML_HIP_ROCWMMA_FATTN "Build the rocWMMA flash-attention kernel for HIP" OFF)
+
 # Some third-party qtype-107 GGUFs encode one affine (scale, offset) pair per
 # 32-weight block instead of the original two-scale layout. This is a wire
 # format choice, so keep it explicit and build-wide.
@@ -404,6 +408,23 @@ if(DFLASH27B_GPU_BACKEND STREQUAL "hip" OR
     # configured ROCm runtime when it expands --hip-link.
     get_filename_component(_dflash_hip_runtime_dir "${hip_DIR}/../.." ABSOLUTE)
     add_link_options("-L${_dflash_hip_runtime_dir}")
+
+    if(GGML_HIP_ROCWMMA_FATTN)
+        # rocWMMA >= 2.0 makes the RDNA4 WMMA operand layouts usable through
+        # the library API. Off by default: the flag switches every fattn
+        # dispatch below head 256 on RDNA3/RDNA4, so it is a build-level
+        # numerical surface change, not a runtime toggle.
+        find_path(GGML_HIP_ROCWMMA_INCLUDE_DIR rocwmma/rocwmma.hpp
+            HINTS "${_dflash_rocm_root}/include" /opt/rocm/include
+            NO_DEFAULT_PATH)
+        if(NOT GGML_HIP_ROCWMMA_INCLUDE_DIR)
+            message(FATAL_ERROR
+                "GGML_HIP_ROCWMMA_FATTN=ON but rocwmma/rocwmma.hpp not found. "
+                "Install rocwmma (e.g. `sudo apt install rocwmma` on Debian/Ubuntu).")
+        endif()
+        target_compile_definitions(ggml-hip PRIVATE GGML_HIP_ROCWMMA_FATTN)
+        target_include_directories(ggml-hip PRIVATE ${GGML_HIP_ROCWMMA_INCLUDE_DIR})
+    endif()
 endif()
 
 if(DFLASH27B_ENABLE_MIXED_CUDA_HIP)
@@ -509,6 +530,7 @@ add_library(dflash_common STATIC
     src/common/dflash_spec_decode.cpp
     src/common/concurrency/paged_kv_pool.cpp
     src/common/concurrency/seq_slot_manager.cpp
+    src/common/concurrency/paged_kv_offload.cpp
     src/common/layer_split_backend.cpp
     src/common/layer_split_runtime.cpp
     src/qwen35/graph_builders.cpp
@@ -544,12 +566,14 @@ add_library(dflash_common STATIC
     src/common/backend_precision.cpp
     src/common/daemon_loop.cpp
     src/common/gguf_inspect.cpp
+    src/common/backend_plan.cpp
     src/common/backend_factory.cpp
     src/common/feature_gate.cpp
     src/placement/placement_config.cpp
     src/common/layer_split_utils.cpp
     src/common/ddtree.cpp
     src/common/peer_access.cpp
+    src/engine/luce_engine.cpp
     # ── Server components (tokenizer, chat template) ──
     src/server/tokenizer.cpp
     src/server/chat_template.cpp
@@ -892,6 +916,20 @@ endif()
 option(DFLASH27B_TESTS "Build numerics tests" ON)
 option(DFLASH27B_SERVER "Build dflash_server + backend_ipc_daemon" ON)
 if(DFLASH27B_TESTS)
+    function(dflash_add_ggml_gpu_executable target source)
+        add_executable(${target} ${source})
+        target_link_libraries(${target} PRIVATE
+            ggml ${DFLASH27B_GGML_BACKEND_TARGET} ggml-base)
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            target_link_libraries(${target} PRIVATE CUDA::cudart)
+        else()
+            target_link_libraries(${target} PRIVATE hip::host)
+        endif()
+        target_include_directories(${target} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src)
+    endfunction()
+
     set(_raw_unit_test_targets)
     enable_testing()
 
@@ -1030,6 +1068,53 @@ if(DFLASH27B_TESTS)
         set_target_properties(test_softmax_sink_col PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
         target_link_libraries(test_softmax_sink_col PRIVATE ggml ggml-base ggml-cpu ${DFLASH27B_GGML_BACKEND_TARGET} hip::host)
         list(APPEND _raw_unit_test_targets test_softmax_sink_col)
+
+        dflash_add_ggml_gpu_executable(test_fattn_mma256 test/test_fattn_mma256.cpp)
+        target_compile_definitions(test_fattn_mma256 PRIVATE GGML_USE_HIP)
+        target_link_libraries(test_fattn_mma256 PRIVATE ggml-cpu)
+        list(APPEND _raw_unit_test_targets test_fattn_mma256)
+
+        # The rocWMMA fragment-layout probe requires the rocWMMA headers; it
+        # only builds when the rocWMMA fattn kernel is enabled so the
+        # default HIP build stays independent of the optional package.
+        if(GGML_HIP_ROCWMMA_FATTN)
+            dflash_add_ggml_gpu_executable(test_rocwmma_layout test/test_rocwmma_layout.cpp)
+            set_source_files_properties(test/test_rocwmma_layout.cpp PROPERTIES LANGUAGE HIP)
+            set_target_properties(test_rocwmma_layout PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
+            target_compile_definitions(test_rocwmma_layout PRIVATE GGML_USE_HIP)
+            target_include_directories(test_rocwmma_layout PRIVATE ${GGML_HIP_ROCWMMA_INCLUDE_DIR})
+            list(APPEND _raw_unit_test_targets test_rocwmma_layout)
+        endif()
+
+        # Benchmark, not a test: built with the tests but deliberately NOT added
+        # to _raw_unit_test_targets. A/B's the fattn kernel routes at
+        # chunked-prefill shapes.
+        dflash_add_ggml_gpu_executable(bench_fattn_mma256 test/bench_fattn_mma256.cpp)
+        target_compile_definitions(bench_fattn_mma256 PRIVATE GGML_USE_HIP)
+
+        # Two-mode differential test for the stage-1 WMMA paged-attention
+        # kernel (RDNA4): runs the op through the WMMA route and the V_DOT2
+        # decode route, then tests/compare_paged_attn.py compares the dumps.
+        add_executable(test_paged_attn_wmma test/test_paged_attn_wmma.cpp)
+        set_source_files_properties(test/test_paged_attn_wmma.cpp PROPERTIES LANGUAGE HIP)
+        set_target_properties(test_paged_attn_wmma PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
+        target_compile_definitions(test_paged_attn_wmma PRIVATE GGML_USE_HIP)
+        target_include_directories(test_paged_attn_wmma PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src)
+        target_link_libraries(test_paged_attn_wmma PRIVATE ggml ggml-base ggml-cpu ${DFLASH27B_GGML_BACKEND_TARGET} hip::host)
+        list(APPEND _raw_unit_test_targets test_paged_attn_wmma)
+
+        # Benchmark, not a test: isolates the paged-attention op at
+        # chunked-prefill shapes and A/B's the V_DOT2 / WMMA routes.
+        add_executable(bench_paged_attn_wmma test/bench_paged_attn_wmma.cpp)
+        set_source_files_properties(test/bench_paged_attn_wmma.cpp PROPERTIES LANGUAGE HIP)
+        set_target_properties(bench_paged_attn_wmma PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
+        target_compile_definitions(bench_paged_attn_wmma PRIVATE GGML_USE_HIP)
+        target_include_directories(bench_paged_attn_wmma PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src)
+        target_link_libraries(bench_paged_attn_wmma PRIVATE ggml ggml-base ${DFLASH27B_GGML_BACKEND_TARGET} hip::host)
 
         # Benchmark, not a test: built with the tests but deliberately NOT added to
         # _raw_unit_test_targets, so ctest stays deterministic. Measures the launch-count
@@ -1412,6 +1497,7 @@ if(DFLASH27B_TESTS)
             set_target_properties(test_rocmfp_mix_gateup_glu PROPERTIES CUDA_ARCHITECTURES "${_dflash_archs}")
         endif()
         target_include_directories(test_rocmfp_mix_gateup_glu PRIVATE
+            ${DFLASH27B_SRC_INCLUDE_DIRS}
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src/ggml-cuda)
@@ -1491,6 +1577,16 @@ if(DFLASH27B_TESTS)
         else()
             target_link_libraries(test_ds4_dmix_entry_validation PRIVATE hip::host)
         endif()
+    endif()
+    # Optional Strix Halo regression; reuse the tokenizer in dflash_common.
+    if(DFLASH27B_GPU_BACKEND STREQUAL "hip" AND
+       EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ds4_paged_prefill_model.cpp")
+        add_executable(test_ds4_paged_prefill_model test/test_ds4_paged_prefill_model.cpp)
+        target_include_directories(test_ds4_paged_prefill_model PRIVATE
+            ${DFLASH27B_SRC_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        target_compile_definitions(test_ds4_paged_prefill_model PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
+        target_link_libraries(test_ds4_paged_prefill_model PRIVATE
+            dflash_common ggml ggml-cpu ${DFLASH27B_GGML_BACKEND_TARGET} ggml-base hip::host)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ds4_dspark_load.cpp")
         add_executable(test_ds4_dspark_load test/test_ds4_dspark_load.cpp)
@@ -1824,6 +1920,8 @@ if(DFLASH27B_TESTS)
             test/test_unit_main.cpp
             test/test_server_unit.cpp
             test/test_model_routing.cpp
+            test/test_luce_engine.cpp
+            test/test_paged_kv_offload.cpp
             test/test_anchor_params.cpp
             test/test_derived_scalars.cpp
             test/test_adaptive_spec_width.cpp
@@ -1832,6 +1930,7 @@ if(DFLASH27B_TESTS)
             test/test_mixed_mmq_policy.cpp
             test/test_spec_acceptance.cpp
             test/test_ds4_env.cpp
+            test/test_kvflash_ubatch.cpp
             test/test_adaptive_keep_ratio.cpp
             test/test_skip_park_guard.cpp
             test/test_bandit_integration.cpp
@@ -1894,6 +1993,9 @@ if(DFLASH27B_TESTS)
         if(WIN32)
             target_link_libraries(test_server_unit PRIVATE ws2_32)
         endif()
+        if(UNIX)
+            target_link_libraries(test_server_unit PRIVATE pthread)
+        endif()
         if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
             find_package(CUDAToolkit REQUIRED)
             target_link_libraries(test_server_unit PRIVATE CUDA::cudart)
@@ -1941,7 +2043,8 @@ if(DFLASH27B_TESTS)
             test/smoke_load_draft.cpp
             test/smoke_load_target.cpp
             test/smoke_load_target_laguna.cpp
-            test/test_paged_attention.cpp)
+            test/test_paged_attention.cpp
+            test/test_decode_kv_offload_gpu.cpp)
         target_include_directories(test_model_smoke PRIVATE
             ${DFLASH27B_SRC_INCLUDE_DIRS}
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
@@ -1993,17 +2096,20 @@ if(DFLASH27B_TESTS)
         list(APPEND _raw_unit_test_targets test_model_smoke)
     endif()
 
-    # Feature/architecture gate tests. check_feature_compatibility(),
-    # collect_feature_warnings() and the capability table are pure functions,
-    # so this target deliberately compiles only feature_gate.cpp and
-    # placement_config.cpp — no dflash_common, no ggml, no GPU toolkit. That
-    # keeps a gate rule testable in seconds instead of behind a full backend
-    # build, which is the whole reason these tests do not live in
+    # Backend planning and feature/architecture gate tests. The plan builder,
+    # check_feature_compatibility(), collect_feature_warnings(), and the
+    # capability table are pure policy, so this target compiles only their
+    # sources and placement_config.cpp. It needs no dflash_common, ggml, or GPU
+    # toolkit. This keeps policy rules testable in seconds instead of behind a
+    # full backend build, which is why these tests do not live in
     # test_server_unit.
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_feature_gate.cpp")
         add_executable(test_feature_gate test/test_feature_gate.cpp)
         target_sources(test_feature_gate PRIVATE
+            test/test_backend_plan.cpp
+            src/common/backend_plan.cpp
             src/common/feature_gate.cpp
+            src/kv_quant.cpp
             src/placement/placement_config.cpp)
         target_include_directories(test_feature_gate PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -2130,6 +2236,16 @@ if(DFLASH27B_TESTS)
                 endif()
             endif()
         endforeach()
+        # test_paged_attn_wmma runs one route per process (the env selects it
+        # and the launch counter pins it), so the auto-registered case above
+        # only ever exercises V_DOT2. Register the WMMA pass as a second case;
+        # the test fails on a route mismatch, so CI now gates both routes.
+        if(TARGET test_paged_attn_wmma)
+            add_test(NAME paged_attn_wmma_route COMMAND test_paged_attn_wmma)
+            set_tests_properties(paged_attn_wmma_route PROPERTIES
+                SKIP_RETURN_CODE 77
+                ENVIRONMENT "DFLASH27B_PAGED_WMMA=1")
+        endif()
         unset(_unit_ctest_name)
         unset(_cppunit_target_index)
     endif()
@@ -2279,20 +2395,6 @@ if(DFLASH27B_TESTS)
             ${DFLASH27B_SRC_INCLUDE_DIRS})
     endif()
     endif()
-
-    function(dflash_add_ggml_gpu_executable target source)
-        add_executable(${target} ${source})
-        target_link_libraries(${target} PRIVATE
-            ggml ${DFLASH27B_GGML_BACKEND_TARGET} ggml-base)
-        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
-            target_link_libraries(${target} PRIVATE CUDA::cudart)
-        else()
-            target_link_libraries(${target} PRIVATE hip::host)
-        endif()
-        target_include_directories(${target} PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
-            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src)
-    endfunction()
 
     if((DFLASH27B_GPU_BACKEND STREQUAL "cuda" OR
         DFLASH27B_GPU_BACKEND STREQUAL "hip")

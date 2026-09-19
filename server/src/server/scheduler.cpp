@@ -104,18 +104,33 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
     uint64_t next_prefix_capture_id = 1;
 
     int published_live_count = -1;
-    int published_prefill_count = -1;
+    int published_prefill_count = -1, published_parked_count = -1;
+    size_t published_offloaded_bytes = 0;
+    const size_t offload_budget = config_.decode_kv_offload_bytes;
+    auto parked = [&](int slot) {
+        return offload_budget && engine.kv_offload_state(slot).parked;
+    };
     auto publish_live_count = [&]() {
-        int prefilling = 0;
-        for (const SchedSlot & s : slots) {
-            if (s.job && s.prefilling) ++prefilling;
+        int prefilling = 0, parked_count = 0;
+        size_t bytes = 0;
+        for (int i = 0; i < n_slots; ++i) {
+            const SchedSlot & s = slots[(size_t)i];
+            if (!s.job) continue;
+            const auto state = offload_budget ? engine.kv_offload_state(i)
+                                             : SeqEngine::KvOffloadState{};
+            parked_count += state.parked;
+            bytes += state.bytes;
+            if (s.prefilling && !state.parked) ++prefilling;
         }
         if (live_slots == published_live_count &&
-            prefilling == published_prefill_count) return;
+            prefilling == published_prefill_count &&
+            parked_count == published_parked_count && bytes == published_offloaded_bytes) return;
         published_live_count = live_slots;
         published_prefill_count = prefilling;
+        published_parked_count = parked_count;
+        published_offloaded_bytes = bytes;
         if (live_slots > 0) {
-            status_.set_concurrent_requests(live_slots, prefilling);
+            status_.set_concurrent_requests(live_slots, prefilling, parked_count, bytes);
         } else status_.set_idle();
         broadcast_status();
     };
@@ -781,25 +796,145 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         }
         if (live_slots == 0) { round_policy.reset(); continue; }
 
-        // Phase 3 — Build one model-neutral batch plan: every decode row plus
-        // a FIFO, engine-bounded subset of pending prompt work. The engine
-        // lowers this plan into whatever graph/state representation it owns.
-        step_plan.decode.clear();
-        prefill_candidates.clear();
-        for (int i = 0; i < n_slots; i++) {
-            if (slots[(size_t)i].job && !slots[(size_t)i].prefilling) {
-                step_plan.decode.push_back(
-                    {i, slots[(size_t)i].pending_tok,
-                     slots[(size_t)i].hook.close_token_ids.empty()});
-            } else if (slots[(size_t)i].job) {
-                prefill_candidates.push_back(
-                    {i, slots[(size_t)i].admission_order});
+        if (offload_budget) {
+            int resident = 0, oldest = -1;
+            for (int i = 0; i < n_slots; ++i) {
+                if (!slots[(size_t)i].job) continue;
+                if (!parked(i)) { ++resident; continue; }
+                if (oldest < 0 || slots[(size_t)i].admission_order <
+                                  slots[(size_t)oldest].admission_order) oldest = i;
+            }
+            // Drain resident requests before restoring the oldest parked slot,
+            // unless the engine reports comfortable headroom — restoring then
+            // cannot re-trigger eviction on the next step, and a parked
+            // request behind one long resident would otherwise wait the whole
+            // generation. One resume per pass keeps the cadence bounded.
+            if (oldest >= 0 &&
+                (resident == 0 || engine.kv_restore_feasible(oldest))) {
+                const bool drained = resident == 0;
+                const auto oldest_state = engine.kv_offload_state(oldest);
+                std::string error;
+                if (engine.restore_kv(oldest, error)) {
+                    auto & s = slots[(size_t)oldest];
+                    if (oldest_state.recompute) {
+                        s.prefilling = true;
+                        s.pending_tok = -1;
+                        std::fprintf(stderr,
+                            "[parallel] slot %d resumed via re-prefill\n",
+                            oldest);
+                    } else {
+                        std::fprintf(stderr,
+                            "[parallel] slot %d resumed from RAM\n", oldest);
+                    }
+                    publish_live_count();
+                } else if (!error.empty() && !oldest_state.recompute &&
+                           engine.evict_kv(oldest,
+                               slots[(size_t)oldest].pending_tok, error)) {
+                    // A checkpoint copy that fails for a real reason does not
+                    // self-heal: drop the payload and park for recompute,
+                    // keeping the request alive through its retained history.
+                    std::fprintf(stderr,
+                        "[parallel] slot %d checkpoint lost; parked for recompute\n",
+                        oldest);
+                    publish_live_count();
+                } else if (drained || !error.empty()) {
+                    // Capacity failure (empty error) with an empty cohort
+                    // means the request cannot fit even alone; recompute
+                    // cannot help either, so this remains legitimately fatal.
+                    // A real restore error that evict_kv could not convert to
+                    // recompute leaves no recovery path — also fatal, rather
+                    // than retrying a broken checkpoint every pass.
+                    auto & s = slots[(size_t)oldest];
+                    s.error = to_response_error({GenerateErrorCode::DecodeFailed,
+                        error.empty()
+                            ? "parked request cannot fit its KV state and next token in the pool"
+                            : error});
+                    retire_slot(oldest);
+                }
+                // A feasibility hint is not a reservation. Even when restore
+                // cannot proceed, let residents advance and release capacity.
             }
         }
-        const StepPlanLimits step_limits =
-            engine.step_plan_limits((int)step_plan.decode.size());
-        round_policy.plan(step_plan, prefill_candidates, step_limits,
-                          engine.has_speculative_decode(step_plan.decode));
+        // Phase 3 — Build the resident cohort. Parked requests retain their
+        // socket/emitter and pending token, but never enter a device graph.
+        // The serving-resilience round policy selects a fair, bounded prefill
+        // subset; the upstream engine then reserves decode KV and may offload
+        // a resident sequence before the graph is submitted.
+        auto build_plan = [&]() {
+            step_plan.decode.clear();
+            prefill_candidates.clear();
+            for (int i = 0; i < n_slots; ++i) {
+                const auto & slot = slots[(size_t)i];
+                if (!slot.job || parked(i)) continue;
+                if (!slot.prefilling) {
+                    step_plan.decode.push_back(
+                        {i, slot.pending_tok, slot.hook.close_token_ids.empty()});
+                } else {
+                    prefill_candidates.push_back({i, slot.admission_order});
+                }
+            }
+            const StepPlanLimits limits =
+                engine.step_plan_limits((int)step_plan.decode.size());
+            round_policy.plan(step_plan, prefill_candidates, limits,
+                              engine.has_speculative_decode(step_plan.decode));
+        };
+        build_plan();
+        while (!engine.reserve_decode(step_plan)) {
+            // A speculative burst is optional. Try a one-token round before
+            // suspending a request to make room for a wider accepted chain.
+            for (auto & input : step_plan.decode) input.allow_speculation = false;
+            if (engine.reserve_decode(step_plan)) break;
+
+            std::vector<int> residents;
+            size_t used_bytes = 0;
+            for (int i = 0; i < n_slots; ++i) {
+                if (!slots[(size_t)i].job) continue;
+                const auto state = engine.kv_offload_state(i);
+                used_bytes += state.bytes;
+                if (!state.parked) residents.push_back(i);
+            }
+            std::sort(residents.begin(), residents.end(), [&](int a, int b) {
+                return slots[(size_t)a].admission_order > slots[(size_t)b].admission_order;
+            });
+            bool saved = false;
+            std::string error;
+            if (offload_budget && residents.size() > 1) {
+                const size_t available = offload_budget - std::min(offload_budget, used_bytes);
+                for (int victim : residents) {
+                    if (engine.offload_kv(victim, available, error)) {
+                        std::fprintf(stderr, "[parallel] slot %d suspended to RAM (%zu bytes)\n",
+                                     victim, engine.kv_offload_state(victim).bytes);
+                        saved = true;
+                        publish_live_count();
+                        break;
+                    }
+                }
+            }
+            if (!saved) {
+                // No checkpoint fit the RAM cap: park the newest decoder for
+                // recompute. With recovery disabled, fail only that request
+                // before compute, then retry the remaining cohort.
+                int victim = -1;
+                for (int candidate : residents) {
+                    if (!slots[(size_t)candidate].prefilling) { victim = candidate; break; }
+                }
+                if (victim < 0) break; // engines reserve prefills at admission
+                auto & slot = slots[(size_t)victim];
+                if (offload_budget && engine.evict_kv(victim, slot.pending_tok, error)) {
+                    std::fprintf(stderr,
+                        "[parallel] slot %d parked for KV recompute\n", victim);
+                    publish_live_count();
+                } else {
+                    slot.error = to_response_error({GenerateErrorCode::DecodeFailed,
+                        error.empty()
+                            ? "paged KV pool cannot fit the request's next decode token"
+                            : "paged KV growth could not be preserved: " + error});
+                    retire_slot(victim);
+                }
+            }
+            build_plan();
+        }
+        if (step_plan.decode.empty() && step_plan.prefills.empty()) continue;
 
         const auto round_started = std::chrono::steady_clock::now();
         SeqEngine::StepResult step_result = engine.step(step_plan);
@@ -898,9 +1033,14 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 // A prefill lane just became reusable, so the FIFO head may
                 // be admissible even though no KV blocks were retired.
                 deferred_retry_at = {};
-                s.decode_started_at = std::chrono::steady_clock::now();
-                s.prefill_s = std::chrono::duration<double>(
-                    s.decode_started_at - s.started_at).count();
+                // Recompute continues the same generation. Keep its original
+                // timing boundary so decode wall time includes parking and
+                // replay, matching the full response's completion-token count.
+                if (s.gen_tokens.empty()) {
+                    s.decode_started_at = std::chrono::steady_clock::now();
+                    s.prefill_s = std::chrono::duration<double>(
+                        s.decode_started_at - s.started_at).count();
+                }
                 advance_slot(s, out.token);
                 continue;
             }

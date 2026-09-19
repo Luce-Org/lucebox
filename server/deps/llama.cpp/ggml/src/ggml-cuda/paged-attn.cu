@@ -1,6 +1,7 @@
 #include "paged-attn.cuh"
 
 #include "fattn-common.cuh"
+#include "mma.cuh"
 
 #include <atomic>
 #include <cfloat>
@@ -1163,10 +1164,1102 @@ static void launch_paged_attn_v(
     }
 }
 
+// ─── WMMA head-256 paged attention (RDNA4, stage 1) ────────────────────
+// Tensor-core sibling of paged_attn_decode for the packed prefill path.
+// One block covers 4 query rows x 8 head slots of ONE context partition.
+// The 4 rows may belong to different sequences: the block loops over the
+// unique sequences (<= 4 passes) and stages the K/V tiles once per
+// sequence, masking other columns, so a packed prefill chunk (rows of one
+// sequence) pays one K/V read per token for 32 columns instead of one row
+// sweep per query row. Mirrors fattn-mma's fragment machinery (f16 WMMA,
+// f32 accumulators, 8 warps, np=4 K-split) with block-table gathers
+// replacing the contiguous KV loaders, in the log2 domain of the existing
+// paged kernels (scale*log2(e) prescale, exp2f softmax) so
+// paged_attn_combine and the partial convention are reused verbatim.
+
+static thread_local size_t g_paged_attn_wmma256_launch_count = 0;
+extern "C" void ggml_backend_cuda_record_paged_attn_wmma256_launch(void) {
+    ++g_paged_attn_wmma256_launch_count;
+}
+
+extern "C" size_t ggml_backend_cuda_get_paged_attn_wmma256_launch_count(void) {
+    return g_paged_attn_wmma256_launch_count;
+}
+
+// Vectorized paged K/V gather for one sequence and one KV head. Each thread
+// owns 16 contiguous half2s (64 B) of one token row, so the block-table entry
+// is resolved once per thread instead of once per (row, half2) element: F16
+// rows are read as four 16-byte chunks, Q8_0 rows (the engine config) as one
+// 32-dim block_q8_0 (34 B) with 4-byte qs loads. Writes the same
+// tile[i*stride_tile + kk] layout as the scalar version; tokens beyond
+// k_VKQ_sup or outside the validated block table yield zeros.
+// Write one thread's segment of `vec` half2s to the stage tile as vec/4
+// 16-byte stores (both quant branches produce the segment in registers first,
+// the zero path writes zeros the same way).
+template <int vec>
+static __device__ __forceinline__ void paged_attn_wmma_store_segment(
+        uint32_t * __restrict__ out, const uint32_t (&h)[vec]) {
+#pragma unroll
+    for (int m = 0; m < vec / 4; ++m) {
+        *reinterpret_cast<uint4 *>(out + 4 * m) =
+            make_uint4(h[4*m], h[4*m+1], h[4*m+2], h[4*m+3]);
+    }
+}
+
+template <ggml_type type, int stride_tile, int nbatch_h2>
+static __device__ __forceinline__ void paged_attn_wmma_stage_tile(
+        const char * __restrict__ kv,
+        const char * __restrict__ block_table,
+        int64_t bt_nb0, int64_t bt_nb1,
+        int64_t kv_nb1,
+        int32_t kv_head, int32_t seq_s, int32_t block_size, int32_t pool_tokens,
+        int64_t kv_nb2,
+        int32_t token0, int32_t k_VKQ_sup,
+        int32_t dim0,
+        half2 * __restrict__ tile) {
+    constexpr int vec = nbatch_h2 / 4;          // half2s owned by one thread
+    static_assert(nbatch_h2 % 4 == 0 && vec % 4 == 0, "bad stage width");
+    constexpr int qk = 32;                      // dims per Q8_0/Q4_0 block
+    static_assert(type == GGML_TYPE_F16 || 2 * vec == qk,
+                  "Q8_0/Q4_0 need one 32-dim block per thread");
+    // Bytes per quant block: qs plus the f16 scale (Q4_0 16+2, Q8_0 32+2).
+    constexpr int kblock_bytes = type == GGML_TYPE_Q4_0 ? qk/2 + 2 : qk + 2;
+
+    const int warp_size = 32;
+    const int tid = threadIdx.x + threadIdx.y * warp_size;
+    const int row = tid / 4;                    // token row within the chunk
+    const int sub = tid % 4;                    // 16-half2 segment of the row
+    const int32_t n_physical_blocks = pool_tokens / block_size;
+
+    const char * rowbase = nullptr;
+    const int32_t token = token0 + row;
+    if (row < k_VKQ_sup) {
+        const int32_t logical_block = token / block_size;
+        const int32_t physical_block = *(const int32_t *) (
+            block_table + (int64_t) logical_block * bt_nb0 +
+            (int64_t) seq_s * bt_nb1);
+        if (physical_block >= 0 && physical_block < n_physical_blocks) {
+            const int32_t phys = physical_block * block_size + token % block_size;
+            rowbase = kv + (int64_t) phys * kv_nb1 + (int64_t) kv_head * kv_nb2;
+        }
+    }
+
+    uint32_t * out = reinterpret_cast<uint32_t *>(tile + row * stride_tile + sub * vec);
+    if (rowbase == nullptr) {
+        const uint32_t zeros[vec] = {};
+        paged_attn_wmma_store_segment<vec>(out, zeros);
+        return;
+    }
+
+    if constexpr (type == GGML_TYPE_F16) {
+        const uint4 * src = reinterpret_cast<const uint4 *>(
+            rowbase + (size_t) (dim0 + sub * vec) * sizeof(half2));
+#pragma unroll
+        for (int m = 0; m < vec / 4; ++m) {
+            *reinterpret_cast<uint4 *>(out + 4 * m) = src[m];
+        }
+    } else if constexpr (type == GGML_TYPE_Q4_0) {
+        // Q4_0: this segment is exactly one block_q4_0 = {half d; uint8_t qs[16]}
+        // = 18 B. ggml layout: dims 0..15 are the low nibbles of qs[0..15],
+        // dims 16..31 the high nibbles, each offset by -8 and scaled by d.
+        const int blk_idx = (dim0 + sub * vec) / (qk / 2);
+        const char * blk = rowbase + (size_t) blk_idx * kblock_bytes;
+        const float d = __half2float(*(const half *) blk);
+        uint32_t w[qk / 8];
+#pragma unroll
+        for (int j = 0; j < qk / 8; ++j) {
+            memcpy(&w[j], blk + 2 + 4 * j, 4);
+        }
+        uint32_t h[vec];
+#pragma unroll
+        for (int m = 0; m < vec; ++m) {
+            const int t0 = 2 * m, t1 = t0 + 1;
+            const int b0 = t0 & (qk/2 - 1), b1 = t1 & (qk/2 - 1);
+            const int q0 = (w[b0 >> 2] >> ((b0 & 3) * 8 + (t0 >= qk/2 ? 4 : 0))) & 0x0F;
+            const int q1 = (w[b1 >> 2] >> ((b1 & 3) * 8 + (t1 >= qk/2 ? 4 : 0))) & 0x0F;
+            const half2 hv = make_half2(d * (float) (q0 - 8), d * (float) (q1 - 8));
+            h[m] = *reinterpret_cast<const uint32_t *>(&hv);
+        }
+        paged_attn_wmma_store_segment<vec>(out, h);
+    } else {
+        // Q8_0: this segment is exactly one block_q8_0 = {half d; int8 qs[32]}.
+        const int blk_idx = (dim0 + sub * vec) / (qk / 2);
+        const char * blk = rowbase + (size_t) blk_idx * kblock_bytes;
+        const float d = __half2float(*(const half *) blk);
+        uint32_t w[qk / 4];
+#pragma unroll
+        for (int j = 0; j < qk / 4; ++j) {
+            memcpy(&w[j], blk + 2 + 4 * j, 4);
+        }
+        uint32_t h[vec];
+#pragma unroll
+        for (int m = 0; m < qk / 2; ++m) {
+            const int e0 = 2 * m;
+            const int8_t v0 = (int8_t) ((w[e0 >> 2] >> ((e0 & 3) * 8)) & 0xff);
+            const int8_t v1 = (int8_t) ((w[(e0 + 1) >> 2] >> (((e0 + 1) & 3) * 8)) & 0xff);
+            const half2 hv = make_half2(d * (float) v0, d * (float) v1);
+            h[m] = *reinterpret_cast<const uint32_t *>(&hv);
+        }
+        paged_attn_wmma_store_segment<vec>(out, h);
+    }
+}
+
+template <ggml_type type_K, ggml_type type_V>
+static __device__ __forceinline__ void paged_attn_wmma_iter(
+        const char  * __restrict__ k,
+        const char  * __restrict__ v,
+        const char  * __restrict__ block_table,
+        int64_t bt_nb0, int64_t bt_nb1,
+        int64_t k_nb1, int64_t k_nb2,
+        int64_t v_nb1, int64_t v_nb2,
+        int32_t kv_head, int32_t seq_s, int32_t block_size, int32_t pool_tokens,
+        int32_t token_begin,
+        const int32_t (& row_seq)[4],
+        const int32_t (& row_extent)[4],
+        half2 * __restrict__ tile_K,
+        half2 * __restrict__ tile_V,
+        ggml_cuda_mma::tile<16, 8, half2> * __restrict__ Q_B,
+        ggml_cuda_mma::tile<16, 8, half2> * __restrict__ VKQ_C,
+        float * __restrict__ KQ_max,
+        float * __restrict__ KQ_rowsum,
+        const int32_t kb0,
+        const int32_t k_VKQ_sup) {
+    using namespace ggml_cuda_mma;
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int DKQ = 256, DV = 256;
+    constexpr int ncols1 = 4, ncols2 = 8, nwarps = 8;
+    constexpr int nbatch_fa = 64, nbatch_K2 = 64, nbatch_V2 = 64;
+    constexpr int cols_per_warp = 16, cols_per_thread = 1, np = 4;
+    static_assert(ncols1 == 4 && ncols2 == 8 && nwarps == 8 && np == 4 &&
+                  nbatch_fa == 64 && nbatch_K2 == 64 && nbatch_V2 == 64,
+                  "gfx1201 WMMA tile and mma operand order are hardcoded");
+    using T_A_KQ  = tile<16,  8, half2>;
+    using T_B_KQ  = tile<16,  8, half2>;
+    using T_C_KQ  = tile<16, 16, float>;
+    using T_A_VKQ = tile<16,  8, half2>;
+    using T_B_VKQ = tile<16,  8, half2>;
+    using T_C_VKQ = tile<16,  8, half2>;
+    constexpr int stride_tile_K = nbatch_K2 + 4;
+    constexpr int stride_tile_V = nbatch_V2 + 4;
+#if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || (defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)) || defined(AMD_MFMA_AVAILABLE)
+    T_C_KQ KQ_C[nbatch_fa/(np*T_C_KQ::J)];
+#pragma unroll
+    for (int i = 0; i < nbatch_fa/(np*T_C_KQ::J); ++i) {
+#pragma unroll
+        for (int l = 0; l < T_C_KQ::ne; ++l) {
+            KQ_C[i].x[l] = 0.0f;
+        }
+    }
+
+    // KQ phase: stage the K tile for this chunk and accumulate the
+    // score matrix with the Q fragments held in registers.
+#pragma unroll
+    for (int k0_start = (DKQ/2-1) - (DKQ/2-1) % nbatch_K2; k0_start >= 0; k0_start -= nbatch_K2) {
+        const int k0_stop = k0_start + nbatch_K2 < DKQ/2 ? k0_start + nbatch_K2 : DKQ/2;
+
+        {
+            paged_attn_wmma_stage_tile<type_K, stride_tile_K, nbatch_K2>(
+                k, block_table, bt_nb0, bt_nb1, k_nb1, kv_head, seq_s, block_size,
+                pool_tokens, k_nb2, token_begin + kb0*nbatch_fa, k_VKQ_sup, k0_start, tile_K);
+            __syncthreads();
+        }
+
+        {
+#pragma unroll
+            for (int i_KQ_00 = 0; i_KQ_00 < nbatch_fa; i_KQ_00 += np*T_A_KQ::I) {
+                const int i_KQ_0 = i_KQ_00 + (threadIdx.y % np)*T_A_KQ::I;
+#pragma unroll
+                for (int k_KQ_0 = k0_start; k_KQ_0 < k0_stop; k_KQ_0 += T_A_KQ::J) {
+                    T_A_KQ K_A;
+                    load_ldmatrix(K_A, tile_K + i_KQ_0*stride_tile_K + (k_KQ_0 - k0_start), stride_tile_K);
+                    mma(KQ_C[i_KQ_00/(np*T_A_KQ::I)], K_A, Q_B[k_KQ_0/T_A_KQ::J]);
+                }
+            }
+        }
+
+        {
+            __syncthreads(); // tile_V reuses the tile_K smem in the VKQ phase.
+        }
+    }
+
+    float KQ_max_new[cols_per_thread];
+#pragma unroll
+    for (int col = 0; col < cols_per_thread; ++col) {
+        KQ_max_new[col] = KQ_max[col];
+    }
+    float KQ_rowsum_add[cols_per_thread] = {0.0f};
+
+    {
+        // Per-row causal/sequence mask, computed inline (was a staged tile):
+        // token pair (2i, 2i+1) is visible iff its seq matches and both the
+        // row extent and the chunk bound cover the token.
+        const int32_t chunk_tok0 = token_begin + kb0*nbatch_fa;
+#pragma unroll
+        for (int i00 = 0; i00 < nbatch_fa; i00 += np*T_C_KQ::J) {
+            const int i0 = i00 + (threadIdx.y % np)*T_C_KQ::J;
+#pragma unroll
+            for (int l0 = 0; l0 < T_C_KQ::ne; l0 += 2) {
+                const int i = (i0 + T_C_KQ::get_j(l0)) / 2;
+                const int j = ((threadIdx.y / np)*cols_per_warp + T_C_KQ::get_i(l0)) / ncols2;
+
+                const int32_t e = (row_seq[j] == seq_s) ? row_extent[j] : -1;
+                const int32_t t0 = chunk_tok0 + 2*i;
+                const float2 tmp = make_float2(
+                    (t0     < e && t0     < chunk_tok0 + k_VKQ_sup) ? 0.0f : -FLT_MAX,
+                    (t0 + 1 < e && t0 + 1 < chunk_tok0 + k_VKQ_sup) ? 0.0f : -FLT_MAX);
+                KQ_C[i00/(np*T_C_KQ::J)].x[l0 + 0] += tmp.x;
+                KQ_C[i00/(np*T_C_KQ::J)].x[l0 + 1] += tmp.y;
+            }
+        }
+    }
+
+    // Softmax in the log2 domain: log2(e) is folded into the Q prescale.
+    static_assert(nbatch_fa % (np*T_C_KQ::J) == 0, "bad loop size");
+#pragma unroll
+    for (int k0 = 0; k0 < nbatch_fa; k0 += np*T_C_KQ::J) {
+#pragma unroll
+        for (int l = 0; l < T_C_KQ::ne; ++l) {
+            if (k0 + (threadIdx.y % np)*T_C_KQ::J + T_C_KQ::get_j(l) < k_VKQ_sup) {
+                KQ_max_new[0] = fmaxf(KQ_max_new[0], KQ_C[(k0/(np*T_C_KQ::J))].x[l]);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int col = 0; col < cols_per_thread; ++col) {
+        KQ_max_new[col] = fmaxf(KQ_max_new[col], __shfl_xor_sync(0xFFFFFFFF, KQ_max_new[col], 16, warp_size));
+    }
+
+    static_assert(nbatch_fa % (np*T_C_KQ::J) == 0, "bad loop size");
+#pragma unroll
+    for (int k0 = 0; k0 < nbatch_fa; k0 += np*T_C_KQ::J) {
+#pragma unroll
+        for (int l = 0; l < T_C_KQ::ne; ++l) {
+            if (k0 + (threadIdx.y % np)*T_C_KQ::J + T_C_KQ::get_j(l) < k_VKQ_sup) {
+                KQ_C[(k0/(np*T_C_KQ::J))].x[l] = exp2f(KQ_C[(k0/(np*T_C_KQ::J))].x[l] - KQ_max_new[0]);
+                KQ_rowsum_add[0] += KQ_C[(k0/(np*T_C_KQ::J))].x[l];
+            } else {
+                KQ_C[(k0/(np*T_C_KQ::J))].x[l] = 0.0f;
+            }
+        }
+    }
+
+    {
+        float KQ_max_scale[cols_per_thread];
+#pragma unroll
+        for (int col = 0; col < cols_per_thread; ++col) {
+            const float KQ_max_diff = KQ_max[col] - KQ_max_new[col];
+            KQ_max_scale[col] = exp2f(KQ_max_diff);
+            KQ_max[col] = KQ_max_new[col];
+
+            *((uint32_t *) &KQ_max_scale[col]) *= KQ_max_diff >= SOFTMAX_FTZ_THRESHOLD;
+
+            // Scale previous KQ_rowsum to account for a potential increase in KQ_max:
+            KQ_rowsum[col] = KQ_max_scale[col]*KQ_rowsum[col] + KQ_rowsum_add[col];
+        }
+
+        const half2 KQ_max_scale_h2 = make_half2(
+            KQ_max_scale[0], KQ_max_scale[0]);
+#pragma unroll
+        for (int i = 0; i < (DV/2)/T_C_VKQ::J; ++i) {
+#pragma unroll
+            for (int l = 0; l < T_C_VKQ::ne; ++l) {
+                VKQ_C[i].x[l] *= KQ_max_scale_h2;
+            }
+        }
+    }
+
+    // Convert KQ C tiles into B tiles for the VKQ calculation:
+    T_B_VKQ B[nbatch_fa/(np*2*T_B_VKQ::J)];
+    static_assert(nbatch_fa % (np*2*T_B_VKQ::J) == 0, "bad loop size");
+    {
+#pragma unroll
+        for (int k = 0; k < nbatch_fa/(np*2*T_B_VKQ::J); ++k) {
+            B[k] = get_half2(KQ_C[k]);
+        }
+    }
+
+#if defined(AMD_WMMA_AVAILABLE) && !defined(LDMATRIX_TRANS_AVAILABLE)
+    T_A_VKQ A_identity;
+    make_identity_mat(A_identity);
+#endif // defined(AMD_WMMA_AVAILABLE) && !defined(LDMATRIX_TRANS_AVAILABLE)
+
+    // VKQ phase: stage the V tile (reusing the K smem) and accumulate.
+#pragma unroll
+    for (int i0_start = 0; i0_start < DV; i0_start += 2*nbatch_V2) {
+        static_assert(DV % (2*nbatch_V2) == 0, "bad loop size");
+        const int i0_stop = i0_start + 2*nbatch_V2;
+
+        {
+            paged_attn_wmma_stage_tile<type_V, stride_tile_V, nbatch_V2>(
+                v, block_table, bt_nb0, bt_nb1, v_nb1, kv_head, seq_s, block_size,
+                pool_tokens, v_nb2, token_begin + kb0*nbatch_fa, k_VKQ_sup, i0_start/2, tile_V);
+            __syncthreads();
+        }
+        const half2 * tile_V_i = tile_V;
+
+        constexpr int i0_stride = 2*T_C_VKQ::J;
+#pragma unroll
+        for (int i_VKQ_0 = i0_start; i_VKQ_0 < i0_stop; i_VKQ_0 += i0_stride) {
+            static_assert((nbatch_fa/2) % (np*T_A_VKQ::J) == 0, "bad loop size");
+#pragma unroll
+            for (int k00 = 0; k00 < nbatch_fa/2; k00 += np*T_A_VKQ::J) {
+                const int k0 = k00 + (threadIdx.y % np)*T_A_VKQ::J;
+
+                T_A_VKQ A; // Transposed in SRAM but not in registers, gets transposed on load.
+#if defined(LDMATRIX_TRANS_AVAILABLE)
+                load_ldmatrix_trans(A, tile_V_i + 2*k0*stride_tile_V + (i_VKQ_0 - i0_start)/2, stride_tile_V);
+#else
+                // Use mma to transpose T_A_VKQ for RDNA.
+                T_A_VKQ A_trans;
+                load_ldmatrix(A_trans, tile_V_i + 2*k0*stride_tile_V + (i_VKQ_0 - i0_start)/2, stride_tile_V);
+                mma(A, A_trans, A_identity);
+#endif // defined(LDMATRIX_TRANS_AVAILABLE)
+
+                mma(VKQ_C[i_VKQ_0/i0_stride], A, B[k00/(np*T_A_VKQ::J)]);
+            }
+        }
+
+        {
+            __syncthreads();
+        }
+    }
+
+#else
+    GGML_UNUSED_VARS(k, v, block_table, bt_nb0, bt_nb1, k_nb1, k_nb2, v_nb1, v_nb2,
+        kv_head, seq_s, block_size, pool_tokens, token_begin, row_seq, row_extent,
+        tile_K, tile_V, Q_B, VKQ_C, KQ_max, KQ_rowsum, kb0, k_VKQ_sup);
+    NO_DEVICE_CODE;
+#endif // defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || (defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)) || defined(AMD_MFMA_AVAILABLE)
+}template <ggml_type type_K, ggml_type type_V>
+__launch_bounds__(256, 2)
+static __global__ void paged_attn_wmma(
+        const char * __restrict__ q,
+        const char * __restrict__ k,
+        const char * __restrict__ v,
+        const char * __restrict__ block_table,
+        const char * __restrict__ kv_seq_lens,
+        const char * __restrict__ active_slot_ids,
+        const char * __restrict__ query_positions,
+        char       * __restrict__ dst,
+        half       * __restrict__ partial_acc,
+        float2     * __restrict__ partial_meta,
+        int64_t q_nb1,   int64_t q_nb2,
+        int64_t k_nb1,   int64_t k_nb2,
+        int64_t v_nb1,   int64_t v_nb2,
+        int64_t bt_nb0,  int64_t bt_nb1,
+        int64_t ksl_nb0,
+        int64_t asi_nb0, int64_t qpos_nb0,
+        int64_t dst_nb1, int64_t dst_nb2,
+        int32_t n_table_seq,
+        int32_t n_head,
+        int32_t n_head_kv,
+        int32_t pool_tokens,
+        int32_t max_blocks,
+        int32_t block_size,
+        int32_t n_rows,
+        int32_t min_partitions,
+        int32_t n_partitions,
+        int32_t write_partials,
+        float scale) {
+    using namespace ggml_cuda_mma;
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int DKQ = 256, DV = 256;
+    constexpr int ncols1 = 4, ncols2 = 8, nwarps = 8;
+    constexpr int ncols = ncols1 * ncols2;
+    constexpr int nbatch_fa = 64, nbatch_K2 = 64, nbatch_V2 = 64, nbatch_combine = 32;
+    constexpr int cols_per_warp = 16, cols_per_thread = 1, np = 4;
+    static_assert(ncols1 == 4 && ncols2 == 8 && nwarps == 8 && np == 4 &&
+                  nbatch_fa == 64 && nbatch_K2 == 64 && nbatch_V2 == 64,
+                  "gfx1201 WMMA tile and mma operand order are hardcoded");
+    using T_B_KQ  = tile<16,  8, half2>;
+    using T_C_KQ  = tile<16, 16, float>;
+    using T_C_VKQ = tile<16,  8, half2>;
+    constexpr int stride_tile_Q = DKQ/2 + 4;
+
+    const int gqa_ratio = n_head / n_head_kv;
+    const int kv_head   = blockIdx.x;
+    const int partition = blockIdx.z;
+    const int group_row0 = ncols1 * (int) blockIdx.y;
+    const int group_rows = n_rows - group_row0 < ncols1 ? n_rows - group_row0 : ncols1;
+
+    // ── Per-row metadata (mirrors paged_attn_decode :275-330) ──
+    int32_t row_seq[4];
+    int32_t row_extent[4];
+    {
+        const bool has_pos = query_positions != nullptr;
+#pragma unroll
+        for (int j = 0; j < ncols1; ++j) {
+            const int row = group_row0 + j;
+            int32_t extent = -1;
+            if (row < group_row0 + group_rows && row < n_rows) {
+                // Dense batches pass no slot ids: the query row selects its own
+                // block-table column, exactly like paged_attn_decode :276-301.
+                const int32_t slot = active_slot_ids != nullptr
+                    ? *(const int32_t *) (active_slot_ids + (int64_t) row * asi_nb0)
+                    : row;
+                row_seq[j] = slot;
+                if (slot >= 0 && slot < n_table_seq) {
+                    int32_t kv_len = *(const int32_t *) (kv_seq_lens + (int64_t) slot * ksl_nb0);
+                    if (has_pos) {
+                        const int32_t pos = *(const int32_t *) (query_positions + (int64_t) row * qpos_nb0);
+                        if (pos < 0) {
+                            // Ragged rows without a causal position are invalid
+                            // outside tree mode (decode valid_query :295-300):
+                            // dead row, empty context, zero output.
+                            kv_len = 0;
+                        } else if (pos < kv_len) {
+                            kv_len = pos + 1;
+                        }
+                    }
+                    const int32_t cap = max_blocks * block_size;
+                    extent = kv_len > 0 ? (kv_len < cap ? kv_len : cap) : 0;
+                }
+            } else {
+                row_seq[j] = -1;
+            }
+            row_extent[j] = extent;
+        }
+    }
+
+    // Pin one (row, head) slot this block owns when it carries no work. The
+    // combine treats meta.y > 0 as live, so a dead slot must be written
+    // explicitly: (-FLT_MAX, 0) for the partials path, zeros for the direct
+    // path (mirrors paged_attn_decode :329-348).
+    auto pin_slot = [&](int j, int c) {
+        const int row  = group_row0 + j;
+        const int head = kv_head*gqa_ratio + c;
+        if (row >= n_rows || head >= n_head) {
+            return;
+        }
+        if (write_partials) {
+            if (threadIdx.x == 0 && threadIdx.y == 0) {
+                const int64_t output_row = (int64_t) head * n_rows + row;
+                partial_meta[output_row * n_partitions + partition] =
+                    make_float2(-FLT_MAX, 0.0f);
+            }
+        } else {
+            float * o_row = (float *) (dst + (int64_t) row * dst_nb1 + (int64_t) head * dst_nb2);
+#pragma unroll
+            for (int i = threadIdx.x; i < DKQ; i += nwarps * warp_size) {
+                o_row[i] = 0.0f;
+            }
+        }
+    };
+
+    // ── Dead rows (extent <= 0) are skipped by the write-back guard, so pin
+    //    them here for every partition this block covers ──
+#pragma unroll
+    for (int j = 0; j < ncols1; ++j) {
+        if (row_extent[j] > 0) {
+            continue;
+        }
+#pragma unroll
+        for (int c = 0; c < gqa_ratio; ++c) {
+            pin_slot(j, c);
+        }
+    }
+
+    // ── Partition token range (mirrors paged_attn_decode :324-348) ──
+    // The divisor is the ACTIVE partition count, not the grid size: small
+    // contexts have fewer live partitions, and dividing by the full count
+    // collapses the range to empty (every block then returned early and
+    // the combine read uninitialized partial meta).
+    int32_t max_extent = 0;
+#pragma unroll
+    for (int j = 0; j < ncols1; ++j) {
+        if (row_extent[j] > max_extent) {
+            max_extent = row_extent[j];
+        }
+    }
+    if (max_extent <= 0) {
+        return;
+    }
+    const int32_t n_logical_blocks = paged_attn_ceil_div(max_extent, block_size);
+    const int32_t active_partitions =
+        paged_attn_partitions(n_logical_blocks, min_partitions, n_partitions);
+
+    if (partition >= active_partitions) {
+        // Dead partition: pin the live rows' slots so the combine never
+        // reads uninitialized pool memory.
+#pragma unroll
+        for (int j = 0; j < ncols1; ++j) {
+            if (row_extent[j] <= 0) {
+                continue;
+            }
+#pragma unroll
+            for (int c = 0; c < gqa_ratio; ++c) {
+                pin_slot(j, c);
+            }
+        }
+        return;
+    }
+
+    const int32_t logical_block_begin =
+        ((int64_t) n_logical_blocks * partition) / active_partitions;
+    const int32_t logical_block_end =
+        ((int64_t) n_logical_blocks * (partition + 1)) / active_partitions;
+    const int32_t token_begin = logical_block_begin * block_size;
+    const int32_t token_end_blocks = logical_block_end * block_size;
+    const int32_t token_end =
+        max_extent < token_end_blocks ? max_extent : token_end_blocks;
+    const int32_t token_count = token_end - token_begin;
+    if (token_count <= 0) {
+        return;
+    }
+    const int32_t kb0_stop = (token_count + nbatch_fa - 1) / nbatch_fa;
+    const int32_t kb0_start = 0;
+    const float2 * Q_f2 = (const float2 *) (q + (int64_t) group_row0 * q_nb1 +
+                                            (int64_t) kv_head * gqa_ratio * q_nb2);
+
+    extern __shared__ half2 tile_Q[];
+    half2 * tile_K    = tile_Q;                 // K reuses the Q smem (Q lives in registers)
+    half2 * tile_V    = tile_K;                 // single stage: V reuses K smem
+
+    T_B_KQ    Q_B[DKQ/(2*T_B_KQ::J)];
+#if defined(TURING_MMA_AVAILABLE)
+    T_C_VKQ VKQ_C[cols_per_warp == 8 ? DV/T_C_VKQ::I : DV/(2*T_C_VKQ::J)];
+#elif defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
+    T_C_VKQ VKQ_C[                                     DV/(2*T_C_VKQ::J)];
+#else // Volta
+    T_C_VKQ VKQ_C[                                     DV/(2*T_C_VKQ::J)];
+#endif // defined(TURING_MMA_AVAILABLE)
+
+    {
+        constexpr int n_vkq = DV/(2*T_C_VKQ::J);
+        for (int i = 0; i < n_vkq; ++i) {
+            for (int l = 0; l < T_C_VKQ::ne; ++l) {
+                VKQ_C[i].x[l] = make_half2(0.0f, 0.0f);
+            }
+        }
+    }
+
+    float KQ_rowsum[cols_per_thread] = {0.0f};
+    float KQ_max[cols_per_thread];
+#pragma unroll
+    for (int col = 0; col < cols_per_thread; ++col) {
+        KQ_max[col] = -FLT_MAX/2.0f;
+    }
+
+    // Load Q data into tile_Q, either temporarily or permanently.
+    // Q in registers is faster, but register pressure is the biggest bottleneck.
+    // The loading is done with decreasing granularity for D for better memory bandwidth.
+    // Log2 domain: fold log2(e) into the prescale exactly like the
+    // decode kernel (scale * PAGED_ATTN_LOG2E), so the exp2f softmax
+    // matches the reference softmax.
+    const half2 scale_h2 = make_half2(scale * PAGED_ATTN_LOG2E, scale * PAGED_ATTN_LOG2E);
+#pragma unroll
+    for (int stride_k : {warp_size, warp_size/2, warp_size/4, warp_size/8}) {
+        const int k0_start  = stride_k == warp_size ? 0 : DKQ/2 - (DKQ/2) % (2*stride_k);
+        const int k0_stop   =                             DKQ/2 - (DKQ/2) % (1*stride_k);
+        const int stride_jc = warp_size / stride_k;
+
+        if (k0_start == k0_stop) {
+            continue;
+        }
+
+#pragma unroll
+        for (int jc0 = 0; jc0 < ncols; jc0 += nwarps*stride_jc) {
+            const int jc = jc0 + threadIdx.y*stride_jc + (stride_k == warp_size ? 0 : threadIdx.x / stride_k);
+
+            if (jc0 + nwarps*stride_jc > ncols && jc >= ncols) {
+                break;
+            }
+
+            const int j = jc / ncols2;
+            const int c = jc % ncols2;
+
+            if (j < group_rows && c < gqa_ratio) {
+#pragma unroll
+                for (int k0 = k0_start; k0 < k0_stop; k0 += stride_k) {
+                    const int k = k0 + (stride_k == warp_size ? threadIdx.x : threadIdx.x % stride_k);
+
+                    const float2 tmp = Q_f2[j*(q_nb1/8) + c*(q_nb2/8) + k];
+                    tile_Q[jc*stride_tile_Q + k] = scale_h2 * make_half2(tmp.x, tmp.y);
+                }
+            } else {
+#pragma unroll
+                for (int k0 = k0_start; k0 < k0_stop; k0 += stride_k) {
+                    const int k = k0 + (stride_k == warp_size ? threadIdx.x : threadIdx.x % stride_k);
+
+                    tile_Q[jc*stride_tile_Q + k] = make_half2(0.0f, 0.0f);
+                }
+            }
+        }
+    }
+
+    __syncthreads();
+
+    {
+        const int j0 = (threadIdx.y / np) * cols_per_warp;
+
+#pragma unroll
+        for (int k0 = 0; k0 < DKQ/2; k0 += T_B_KQ::J) {
+            load_ldmatrix(Q_B[k0/T_B_KQ::J], tile_Q + j0*stride_tile_Q + k0, stride_tile_Q);
+        }
+    }
+
+    __syncthreads();
+
+    // ── Per-sequence passes over the partition token range ──
+    for (int pass = 0; pass < ncols1; ++pass) {
+        const int32_t seq_s = row_seq[pass];
+        if (seq_s < 0) {
+            continue;
+        }
+        bool dup = false;
+        int32_t seq_max_extent = -1;
+#pragma unroll
+        for (int jj = 0; jj < ncols1; ++jj) {
+            if (row_seq[jj] == seq_s) {
+                if (jj < pass) {
+                    dup = true;
+                }
+                if (row_extent[jj] > seq_max_extent) {
+                    seq_max_extent = row_extent[jj];
+                }
+            }
+        }
+        if (dup || seq_max_extent < token_begin) {
+            continue;
+        }
+
+        for (int kb0 = kb0_start; kb0 < kb0_stop; ++kb0) {
+        // Live tokens in this chunk, clamped to the partition's own token
+        // range: without the clamp the extent mask alone lets a token inside
+        // the extent but outside the partition leak into the neighbouring
+        // partition's chunk (both stage it, the combine double-counts it).
+        const int32_t chunk_start = token_begin + kb0*nbatch_fa;
+        const int32_t k_VKQ_sup =
+            min(nbatch_fa, max(0, token_end - chunk_start));
+        paged_attn_wmma_iter<type_K, type_V>(
+            k, v, block_table, bt_nb0, bt_nb1, k_nb1, k_nb2, v_nb1, v_nb2, kv_head, seq_s,
+            block_size, pool_tokens, token_begin,
+            row_seq, row_extent,
+            tile_K, tile_V, Q_B, VKQ_C, KQ_max, KQ_rowsum,
+            kb0, k_VKQ_sup);
+    }
+
+    }
+
+    // Finally, sum up partial KQ rowsums.
+    {
+#if defined(TURING_MMA_AVAILABLE)
+        // The partial sums are spread across 8/4 threads.
+        constexpr int offset_first = cols_per_warp == 8 ? 16 : 2;
+        constexpr int offset_last  = cols_per_warp == 8 ?  4 : 1;
+#elif defined(AMD_MFMA_AVAILABLE)
+        // The partial sums are spread across 4 threads (wavefront64, 16 cols).
+        constexpr int offset_first = 32;
+        constexpr int offset_last  = 16;
+#elif defined(AMD_WMMA_AVAILABLE)
+        // The partial sums are spread across 2 threads.
+        constexpr int offset_first = 16;
+        constexpr int offset_last  = 16;
+#else // Volta
+        // The partial sums are spread across 2 threads.
+        constexpr int offset_first = 2;
+        constexpr int offset_last  = 2;
+#endif // defined(TURING_MMA_AVAILABLE)
+#pragma unroll
+        for (int col = 0; col < cols_per_thread; ++col) {
+#pragma unroll
+            for (int offset = offset_first; offset >= offset_last; offset >>= 1) {
+                KQ_rowsum[col] += __shfl_xor_sync(0xFFFFFFFF, KQ_rowsum[col], offset, warp_size);
+            }
+        }
+    }
+
+
+    // Combine VKQ accumulator values if np > 1.
+    // It's also faster to do small writes to shared memory, then large write to VRAM than to do small writes to VRAM.
+    // So also write VKQ accumulators to shared memory in column-major format if np == 1.
+
+    constexpr int tile_stride = nbatch_combine + 4;
+    static_assert((DV/2) % nbatch_combine == 0, "bad nbatch_combine");
+
+    {
+        // jc_cwm = jc combine write meta
+        // KQ_cmr = KQ combine max rowsum
+        // Use the 16 bytes of padding in each Q column to store the meta data: KQ max, KQ rowsum, KQ max scale.
+#if defined(TURING_MMA_AVAILABLE)
+        const int jc_cwm = threadIdx.y*cols_per_warp + T_C_VKQ::get_i(threadIdx.x % 4);
+        const float2 KQ_cmr = make_float2(KQ_max[threadIdx.x % cols_per_thread], KQ_rowsum[threadIdx.x % cols_per_thread]);
+        const bool thread_should_write = threadIdx.x % 4 < cols_per_thread;
+#elif defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
+        const int jc_cwm = threadIdx.y*cols_per_warp + T_C_VKQ::get_i(0);
+        const float2 KQ_cmr = make_float2(KQ_max[0], KQ_rowsum[0]);
+        const bool thread_should_write = threadIdx.x / 16 < cols_per_thread;
+#else // Volta
+        const int jc_cwm = threadIdx.y*cols_per_warp + T_C_KQ::get_i(threadIdx.x & 2);
+        const float2 KQ_cmr = make_float2(KQ_max[(threadIdx.x & 2) / 2], KQ_rowsum[(threadIdx.x & 2) / 2]);
+        const bool thread_should_write = T_C_KQ::J == 8 || T_C_KQ::get_j(threadIdx.x & 2) < 8;
+#endif // defined(TURING_MMA_AVAILABLE)
+
+        if (thread_should_write) {
+            ((float2 *) tile_Q)[jc_cwm*(tile_stride/2) + nbatch_combine/2] = KQ_cmr;
+        }
+
+        __syncthreads();
+
+    }
+
+    if (np > 1 && threadIdx.y % np == 0) {
+        // Combine the meta data for parallel warps via shared memory.
+        // Warps with threadIdx.y % np != 0 must NOT return early.
+        // All threads must return simultaneously to avoid race conditions with work on the next tile.
+
+        constexpr int nmeta = np*cols_per_warp >= warp_size ? np*cols_per_warp/warp_size : 1;
+
+        const int jc_meta = threadIdx.y*cols_per_warp + (np*cols_per_warp < warp_size ? threadIdx.x % (np*cols_per_warp) : threadIdx.x);
+        float2 * const meta_ptr = ((float2 *) tile_Q) + jc_meta*(tile_stride/2) + nbatch_combine/2;
+        float2 meta[nmeta];
+#pragma unroll
+        for (int imeta = 0; imeta < nmeta; ++imeta) {
+            meta[imeta] = meta_ptr[imeta * warp_size * tile_stride/2];
+        }
+
+        float KQ_cmn = meta[0].x; // KQ combine max new, max between all parallel warps.
+#pragma unroll
+        for (int imeta = 1; imeta < nmeta; ++imeta) {
+            KQ_cmn = fmaxf(KQ_cmn, meta[imeta].x);
+        }
+#pragma unroll
+        for (int offset = np*cols_per_warp/2; offset >= cols_per_warp; offset >>= 1) {
+            if (offset < warp_size) {
+                KQ_cmn = fmaxf(KQ_cmn, __shfl_xor_sync(0xFFFFFFFF, KQ_cmn, offset, warp_size));
+            }
+        }
+
+        float KQ_cms[nmeta]; // KQ combine max scale per warp.
+#pragma unroll
+        for (int imeta = 0; imeta < nmeta; ++imeta) {
+            KQ_cms[imeta] = exp2f(meta[imeta].x - KQ_cmn);
+        }
+
+        float KQ_crs = KQ_cms[0]*meta[0].y; // KQ combine rowsum, scaled sum of all parallel warps.
+#pragma unroll
+        for (int imeta = 1; imeta < nmeta; ++imeta) {
+            KQ_crs += KQ_cms[imeta]*meta[imeta].y;
+        }
+#pragma unroll
+        for (int offset = np*cols_per_warp/2; offset >= cols_per_warp; offset >>= 1) {
+            if (offset < warp_size) {
+                KQ_crs += __shfl_xor_sync(0xFFFFFFFF, KQ_crs, offset, warp_size);
+            }
+        }
+
+        __syncthreads();
+
+        // Write back combined meta data:
+#pragma unroll
+        for (int imeta = 0; imeta < nmeta; ++imeta) {
+            if (np*cols_per_warp >= warp_size || threadIdx.x < np*cols_per_warp) {
+                // Combined KQ max scale + rowsum.
+                meta_ptr[imeta * warp_size * tile_stride/2] = make_float2(KQ_cms[imeta], KQ_crs);
+            }
+        }
+
+        // Combined KQ max + rowsum for the partition merge (mirrors
+        // fattn's dstk_fixup_meta write and paged_attn_decode :601).
+        static_assert(cols_per_warp <= warp_size);
+        if (write_partials && (cols_per_warp == warp_size || threadIdx.x < cols_per_warp)) {
+            const int jc = (threadIdx.y / np)*cols_per_warp + threadIdx.x;
+            const int row  = group_row0 + jc / ncols2;
+            const int c    = jc % ncols2;
+            const int head = kv_head*gqa_ratio + c;
+            // c >= gqa_ratio columns are zero-Q padding; writing their stats
+            // would race with the next kv_head block's real meta for the
+            // aliased head slots ((kv_head+1)*gqa_ratio + {0,1}).
+            if (row < n_rows && c < gqa_ratio && head < n_head) {
+                const int64_t output_row = (int64_t) head * n_rows + row;
+                partial_meta[output_row * n_partitions + partition] =
+                    make_float2(KQ_cmn, KQ_crs);
+            }
+        }
+
+    } else if (np > 1) {
+        // Warps with threadIdx.y % np == 0 execute a __syncthreads() in the if branch.
+        // Therefore, all other warps also need to execute a __syncthreads().
+        // Otherwise the points at which warps synchronize with each other would become misaligned.
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int k00 = 0; k00 < DV/2; k00 += nbatch_combine) {
+        {
+            const int j0 = threadIdx.y*cols_per_warp;
+#pragma unroll
+            for (int k1 = 0; k1 < nbatch_combine; k1 += T_C_VKQ::J) {
+#pragma unroll
+                for (int l = 0; l < T_C_VKQ::ne; ++l) {
+                    const int j = j0 + T_C_VKQ::get_i(l);
+                    const int k = k1 + T_C_VKQ::get_j(l);
+
+                    tile_Q[j*tile_stride + k] = VKQ_C[(k00 + k1)/T_C_VKQ::J].x[l];
+                }
+            }
+        }
+
+        __syncthreads();
+
+        if (np == 1 || threadIdx.y % np == 0) {
+            // The combine strips hold one slice per warp: destination
+            // column jc_dst maps to strip (jc_dst/cols_per_warp)*(np*cols_per_warp)
+            // + jc_dst % cols_per_warp, with the np partner slices at
+            // ip*cols_per_warp strip offsets (fattn-mma-f16.cuh write-back).
+#pragma unroll
+            for (int stride_k : {warp_size, warp_size/2, warp_size/4, warp_size/8}) {
+                const int k0_start  = stride_k == warp_size ? 0 : nbatch_combine - nbatch_combine % (2*stride_k);
+                const int k0_stop   =                             nbatch_combine - nbatch_combine % (1*stride_k);
+                const int stride_jc = warp_size / stride_k;
+
+                if (k0_start == k0_stop) {
+                    continue;
+                }
+
+#pragma unroll
+                for (int jc0_dst = 0; jc0_dst < ncols; jc0_dst += (nwarps/np)*stride_jc) {
+                    const int jc_dst = jc0_dst + (threadIdx.y/np)*stride_jc + (stride_k == warp_size ? 0 : threadIdx.x / stride_k);
+
+                    if (jc0_dst + (nwarps/np)*stride_jc > ncols && jc_dst >= ncols) {
+                        break;
+                    }
+
+                    const int jc_tile_K = (jc_dst/cols_per_warp)*(np*cols_per_warp) + jc_dst % cols_per_warp;
+
+                    const int j = jc_dst / ncols2;
+                    const int c = jc_dst % ncols2;
+
+                    // Dead rows and out-of-range head slots were pinned by the
+                    // sentinel path before the pass loop; skip them here.
+                    if (j >= group_rows || c >= gqa_ratio || row_seq[j] < 0 || row_extent[j] < 0) {
+                        continue;
+                    }
+                    const int row  = group_row0 + j;
+                    const int head = kv_head*gqa_ratio + c;
+
+                    const float * meta_j = (const float *) tile_Q + jc_tile_K*tile_stride + nbatch_combine;
+                    const float qk_sum = meta_j[1];
+                    float * o_row = (float *) (dst + (int64_t) row * dst_nb1 + (int64_t) head * dst_nb2);
+                    half * pa_row = nullptr;
+                    if (write_partials) {
+                        const int64_t output_row = (int64_t) head * n_rows + row;
+                        pa_row = partial_acc + output_row * (int64_t) n_partitions * 256 + (int64_t) partition * 256;
+                    }
+                    const float inv_sum = qk_sum > 0.0f ? 1.0f/qk_sum : 0.0f;
+#pragma unroll
+                    for (int k0 = k0_start; k0 < k0_stop; k0 += stride_k) {
+                        const int k = k0 + (stride_k == warp_size ? threadIdx.x : threadIdx.x % stride_k);
+
+                        float2 dstk_val = make_float2(0.0f, 0.0f);
+#pragma unroll
+                        for (int ip = 0; ip < np; ++ip) {
+                            const float KQ_crs_ip = np == 1 ? 1.0f : meta_j[ip*cols_per_warp * tile_stride + 0];
+                            const float2 dstk_val_add = __half22float2(tile_Q[(jc_tile_K + ip*cols_per_warp) * tile_stride + k]);
+                            dstk_val.x += dstk_val_add.x*KQ_crs_ip;
+                            dstk_val.y += dstk_val_add.y*KQ_crs_ip;
+                        }
+                        // paged_attn_combine expects per-partition partials
+                        // normalized by the partition's own qk_sum (decode
+                        // kernel convention: numerator and denominator both
+                        // carry the qk_sum weight).
+                        dstk_val.x *= inv_sum;
+                        dstk_val.y *= inv_sum;
+                        const int dim0 = 2*(k00 + k);
+                        if (write_partials) {
+                            pa_row[dim0]     = __float2half(dstk_val.x);
+                            pa_row[dim0 + 1] = __float2half(dstk_val.y);
+                        } else {
+                            o_row[dim0]     = dstk_val.x;
+                            o_row[dim0 + 1] = dstk_val.y;
+                        }
+                    }
+                }
+            }
+        }
+        if (np > 1 || DV/2 > nbatch_combine) {
+            __syncthreads();
+        }
+    }
+}
+// Launcher for the stage-1 WMMA paged kernel. Env-gated (DFLASH27B_PAGED_WMMA,
+// default off); falls back to the V_DOT2 kernel when disabled or ineligible.
+static bool try_launch_paged_attn_wmma(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    static const bool enabled = []() {
+        const char * e = getenv("DFLASH27B_PAGED_WMMA");
+        return e && atoi(e) != 0;
+    }();
+    if (!enabled) {
+        return false;
+    }
+    // The iter's WMMA fragment layout and mma operand order are RDNA4-specific
+    // (RDNA4 is only defined in the device pass, so gate on the live device's
+    // capability here): on other tensor-core targets the kernel would compile
+    // and silently miscompute.
+    if (!GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ctx.device].cc)) {
+        return false;
+    }
+    const ggml_tensor * q  = dst->src[0];
+    const ggml_tensor * k  = dst->src[1];
+    const ggml_tensor * v  = dst->src[2];
+    const ggml_tensor * block_table = dst->src[3];
+    const ggml_tensor * kv_seq_lens = dst->src[4];
+    const ggml_tensor * active_slot_ids = dst->src[5];
+    const ggml_tensor * query_positions = dst->src[6];
+
+    // Stage-1 gates: RDNA4 only, non-tree, F16/Q8_0/Q4_0 KV, GQA ratio that
+    // fits the 8 head slots (ncols2), 16-token blocks.
+    if (dst->src[7] != nullptr || dst->src[8] != nullptr) {
+        return false;
+    }
+    if ((k->type != GGML_TYPE_F16 && k->type != GGML_TYPE_Q8_0 && k->type != GGML_TYPE_Q4_0) ||
+        (v->type != GGML_TYPE_F16 && v->type != GGML_TYPE_Q8_0 && v->type != GGML_TYPE_Q4_0)) {
+        return false;
+    }
+    const int32_t n_head    = (int32_t) q->ne[2];
+    const int32_t n_head_kv = (int32_t) k->ne[2];
+    if (n_head % n_head_kv != 0 || n_head / n_head_kv > 8) {
+        return false;
+    }
+    float scale;
+    memcpy(&scale, dst->op_params, sizeof(float));
+    int32_t block_size, max_kv_seq_len;
+    memcpy(&block_size, (const char *) dst->op_params + sizeof(float), sizeof(int32_t));
+    memcpy(&max_kv_seq_len, (const char *) dst->op_params + sizeof(float) + sizeof(int32_t), sizeof(int32_t));
+    if (block_size != 16) {
+        return false;
+    }
+
+    const int32_t n_rows = (int32_t) q->ne[1];
+    if (active_slot_ids == nullptr && (int32_t) block_table->ne[1] != n_rows) {
+        return false;
+    }
+    const int32_t n_logical_blocks = paged_attn_ceil_div(max_kv_seq_len, block_size);
+    const int32_t partitionable_blocks = (int32_t) block_table->ne[0];
+
+    static const int force_partitions = []() {
+        const char * e = getenv("GGML_CUDA_PAGED_ATTN_FORCE_PARTITIONS");
+        return e ? atoi(e) : 0;
+    }();
+    const int32_t work_groups = n_rows * n_head_kv;
+    const int32_t nsm = ggml_cuda_info().devices[ctx.device].nsm;
+    int32_t min_partitions = (nsm * 4 + work_groups - 1) / work_groups;
+    if (min_partitions < 1) {
+        min_partitions = 1;
+    }
+    // Small batches need more context partitions each to expose enough work;
+    // large batches already fill the device, where extra partitions mostly
+    // repeat the per-partition fixed costs (staging, barriers, partials,
+    // combine). Mirror the decode launcher's inversely batch-scaled cap: the
+    // WMMA kernel's per-partition overhead is higher still, so forcing 32
+    // partitions onto prefill-shaped calls measurably loses to the decode
+    // kernel at short contexts.
+    int32_t partition_limit = PAGED_ATTN_MAX_PARTITIONS / n_rows;
+    if (partition_limit < 32) {
+        partition_limit = 32;
+    }
+    if (min_partitions > partition_limit) {
+        min_partitions = partition_limit;
+    }
+    if (min_partitions > partitionable_blocks) {
+        min_partitions = partitionable_blocks;
+    }
+    int32_t n_partitions =
+        paged_attn_partitions(n_logical_blocks, min_partitions, PAGED_ATTN_MAX_PARTITIONS);
+    // Test/debug override, applied after the occupancy floor like the decode
+    // launcher: the floor above would otherwise silently raise any forced
+    // value <= 32 back to 32 and defeat partition bisection experiments.
+    if (force_partitions >= 1 &&
+        force_partitions <= PAGED_ATTN_MAX_PARTITIONS &&
+        force_partitions <= partitionable_blocks) {
+        min_partitions = force_partitions;
+        n_partitions = force_partitions;
+    }
+
+    const int32_t rows_per_block = 4;
+    const dim3 grid(n_head_kv, (n_rows + rows_per_block - 1) / rows_per_block, n_partitions);
+    const dim3 block(32, 8);
+    // Tiles alias sequentially at smem offset 0: Q staging (32x132),
+    // K/V staging (64x68), combine strips (128x36 half2s). Allocating the
+    // phase max (128 strips x 36 half2s = 18 KiB) fits two blocks per CU
+    // (64 KiB budget on gfx1201); mask is computed inline, no smem.
+    const size_t smem = (size_t) 128*36 * sizeof(half2);
+
+    const int64_t output_rows = (int64_t) n_rows * n_head;
+    ggml_cuda_pool_alloc<half>   acc_scratch(ctx.pool());
+    ggml_cuda_pool_alloc<float2> meta_scratch(ctx.pool());
+    half   * partial_acc  = nullptr;
+    float2 * partial_meta = nullptr;
+    if (n_partitions > 1) {
+        const size_t partial_rows = (size_t) output_rows * n_partitions;
+        partial_acc  = acc_scratch.alloc(partial_rows * 256);
+        partial_meta = meta_scratch.alloc(partial_rows);
+    }
+
+    const int write_partials = n_partitions > 1 ? 1 : 0;
+    // Dispatch on the KV types; the kernel is templated on both. Three KV
+    // types (F16, Q8_0, Q4_0) make nine instantiations, so the argument list
+    // lives in one place.
+#define PAGED_ATTN_WMMA_LAUNCH(KT, VT)                                              \
+    paged_attn_wmma<KT, VT><<<grid, block, smem, ctx.stream()>>>(                   \
+        (const char *) q->data, (const char *) k->data, (const char *) v->data,     \
+        (const char *) block_table->data, (const char *) kv_seq_lens->data,         \
+        active_slot_ids ? (const char *) active_slot_ids->data : nullptr,           \
+        query_positions ? (const char *) query_positions->data : nullptr,           \
+        (char *) dst->data, partial_acc, partial_meta,                              \
+        q->nb[1], q->nb[2], k->nb[1], k->nb[2], v->nb[1], v->nb[2],                 \
+        block_table->nb[0], block_table->nb[1], kv_seq_lens->nb[0],                 \
+        active_slot_ids ? active_slot_ids->nb[0] : 0,                               \
+        query_positions ? query_positions->nb[0] : 0,                               \
+        dst->nb[1], dst->nb[2],                                                     \
+        (int32_t) block_table->ne[1], n_head, n_head_kv,                            \
+        (int32_t) k->ne[1], (int32_t) block_table->ne[0], block_size,               \
+        n_rows, min_partitions, n_partitions, write_partials, scale)
+
+    if (k->type == GGML_TYPE_F16) {
+        if (v->type == GGML_TYPE_F16)       { PAGED_ATTN_WMMA_LAUNCH(GGML_TYPE_F16,  GGML_TYPE_F16);  }
+        else if (v->type == GGML_TYPE_Q8_0) { PAGED_ATTN_WMMA_LAUNCH(GGML_TYPE_F16,  GGML_TYPE_Q8_0); }
+        else                                { PAGED_ATTN_WMMA_LAUNCH(GGML_TYPE_F16,  GGML_TYPE_Q4_0); }
+    } else if (k->type == GGML_TYPE_Q8_0) {
+        if (v->type == GGML_TYPE_F16)       { PAGED_ATTN_WMMA_LAUNCH(GGML_TYPE_Q8_0, GGML_TYPE_F16);  }
+        else if (v->type == GGML_TYPE_Q8_0) { PAGED_ATTN_WMMA_LAUNCH(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0); }
+        else                                { PAGED_ATTN_WMMA_LAUNCH(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0); }
+    } else {
+        if (v->type == GGML_TYPE_F16)       { PAGED_ATTN_WMMA_LAUNCH(GGML_TYPE_Q4_0, GGML_TYPE_F16);  }
+        else if (v->type == GGML_TYPE_Q8_0) { PAGED_ATTN_WMMA_LAUNCH(GGML_TYPE_Q4_0, GGML_TYPE_Q8_0); }
+        else                                { PAGED_ATTN_WMMA_LAUNCH(GGML_TYPE_Q4_0, GGML_TYPE_Q4_0); }
+    }
+#undef PAGED_ATTN_WMMA_LAUNCH
+
+    if (n_partitions > 1) {
+        const dim3 combine_grid(
+            (unsigned int) q->ne[2],
+            (unsigned int) q->ne[1],
+            1);
+        paged_attn_combine<256>
+            <<<combine_grid, dim3(256, 1, 1), 0, ctx.stream()>>>(
+            partial_acc,
+            partial_meta,
+            (char *) dst->data,
+            dst->nb[1],
+            dst->nb[2],
+            n_partitions);
+    }
+    // Surface launch-configuration failures (grid/smem limits) instead of
+    // leaving a partially written dst to be read as if it were valid.
+    CUDA_CHECK(cudaGetLastError());
+    ggml_backend_cuda_record_paged_attn_wmma256_launch();
+    return true;
+}
+
 void ggml_cuda_paged_attn(
         ggml_backend_cuda_context & ctx,
         ggml_tensor * dst) {
     GGML_ASSERT(ggml_cuda_paged_attn_supported(dst));
+    if (try_launch_paged_attn_wmma(ctx, dst)) {
+        return;
+    }
 
     float scale;
     memcpy(&scale, dst->op_params, sizeof(scale));

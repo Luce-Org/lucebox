@@ -23,6 +23,7 @@
 #include <cstring>
 #include <limits>
 #include <string>
+#include <utility>
 
 namespace dflash::common {
 
@@ -98,8 +99,8 @@ static void log_split_tel(const char * phase,
 } // namespace
 
 DeepSeek4LayerSplitAdapter::DeepSeek4LayerSplitAdapter(
-        const DeepSeek4LayerSplitAdapterConfig & cfg)
-    : cfg_(cfg) {
+        DeepSeek4LayerSplitAdapterConfig cfg)
+    : cfg_(std::move(cfg)) {
     snapshots_.resize(PREFIX_SLOTS);
 }
 
@@ -190,8 +191,8 @@ int DeepSeek4LayerSplitAdapter::compute_auto_split_layers() const {
 }
 
 bool DeepSeek4LayerSplitAdapter::init() {
-    if (!cfg_.target_path) {
-        std::fprintf(stderr, "[deepseek4-split] target_path is null\n");
+    if (cfg_.target_path.empty()) {
+        std::fprintf(stderr, "[deepseek4-split] target_path is empty\n");
         return false;
     }
 
@@ -256,7 +257,7 @@ bool DeepSeek4LayerSplitAdapter::init() {
 
     // Multi-GPU local path (multiple CUDA GPUs available)
     LayerSplitRuntimeInit runtime_cfg;
-    runtime_cfg.target_path = cfg_.target_path;
+    runtime_cfg.target_path = cfg_.target_path.c_str();
     runtime_cfg.device = &device;
     runtime_cfg.log_prefix = "deepseek4-split";
 
@@ -307,7 +308,7 @@ bool DeepSeek4LayerSplitAdapter::init_mixed_target_split_full(const DevicePlacem
     // Mixed target split: local CUDA shard + remote Halo shard via IPC daemon.
     // Only the first shard runs locally; remaining layers handled by remote daemon.
 
-    const auto info = inspect_gguf_model_info(cfg_.target_path);
+    const auto info = inspect_gguf_model_info(cfg_.target_path.c_str());
     const int n_layer = info.n_layer;
     if (n_layer <= 0) {
         std::fprintf(stderr, "[deepseek4-split] failed to inspect target layer count\n");

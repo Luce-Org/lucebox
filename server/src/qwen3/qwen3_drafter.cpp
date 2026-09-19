@@ -14,6 +14,7 @@
 // mean-over-lookahead, smoothed with AvgPool, scored per chunk, top-K kept.
 
 #include "qwen3_drafter.h"
+#include "common/dspark_head.h"
 #include "qwen3_drafter_model.h"
 #include "qwen3/anchor_params.h"
 #include "common/backend_precision.h"
@@ -243,6 +244,7 @@ bool load_drafter(const std::string & gguf_path, int /*gpu_layers*/,
 }
 
 void free_drafter(DrafterContext & ctx) {
+    dspark_note_drafter_lifecycle();
     free_drafter_weights(ctx);
     if (ctx.backend) {
         ggml_backend_free(ctx.backend);

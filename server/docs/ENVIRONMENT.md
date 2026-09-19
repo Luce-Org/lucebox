@@ -17,6 +17,12 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | Variable | Default | Purpose |
 |---|---|---|
 | `DFLASH_ADAPTIVE_SPEC_WIDTH` | unset | BURN-IN: =1 enables the shared acceptance-feedback verify-width controller. Fixed width is the production default; backend-specific overrides take precedence. |
+| `DFLASH27B_FA256_MMA` | 1 on RDNA4 | KILL SWITCH (burn-in): =0 restores the generic tile kernel for head-256 attention on RDNA4. With the default 1, prefill-sized head-256 batches take the rocWMMA kernel below ~32K KV and the raw-MMA kernel beyond (rocWMMA requires a `GGML_HIP_ROCWMMA_FATTN` build; without it the raw-MMA kernel covers all shapes). |
+| `DFLASH27B_FA256_WMMA` | unset | A/B: =1 forces the rocWMMA kernel on head-256 RDNA4 shapes whose KV length is a multiple of 256, bypassing the KV-length crossover (requires a `GGML_HIP_ROCWMMA_FATTN` build). |
+| `DFLASH27B_FA256_WMMA_MAX_KV` | 32768 | KV length above which the head-256 tensor-core route switches from the rocWMMA kernel to the raw-MMA kernel in `GGML_HIP_ROCWMMA_FATTN` builds (measured crossover on gfx1201). |
+| `DFLASH27B_PAGED_WMMA` | unset (0) | BURN-IN: =1 routes paged full-attention layers (RDNA4, head 256, F16/Q8_0/Q4_0 KV, non-tree) to the WMMA kernel. Differential-tested against the decode kernel; single-prompt TTFT -21% at 12K and -42% at 44K, batched 8K-pool prefill slightly ahead. |
+| `GGML_CUDA_PAGED_ATTN_FORCE_PARTITIONS` | unset | DEBUG: force the paged-attention context partition count (both routes) to bisect partition-overlap and overhead behaviour. |
+| `DFLASH27B_PREFILL_UBATCH` | backend-dependent (512 in `qwen35_backend.cpp`; 16/384 in `layer_split_daemon.cpp`; `cfg_.chunk` in `qwen35_layer_split_adapter.cpp`) | Prefill ubatch. Under pooled kvflash prefill it is rounded down to a multiple of the pager chunk (never below one chunk) and clamped to the pool, instead of being forced to one chunk per ubatch. |
 | `DFLASH_DRAFT_KV` | 1 | KILL SWITCH (remove after burn-in): =0 restores the legacy per-step drafter window recompute instead of the ring cache. |
 | `DFLASH_LAGUNA_SWA_RING` | 1 | KILL SWITCH (remove after burn-in): =0 keeps SWA layers on pool-sized caches under KVFlash. |
 | `DFLASH_PROF` | unset | DEBUG: comma list of profilers (step,verify,prefill). Replaces DFLASH_LAGUNA_{STEP,VERIFY,PREFILL}_PROF. |
@@ -35,7 +41,9 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `DFLASH_DS4_CROSS_VENDOR_OWNER_SUMS` | unset | BURN-IN: reduce each mixed-vendor owner's routed outputs locally before the final owner add. This changes floating-point association and is not the byte-identity mode. |
 | `DFLASH_DS4_TP_SCHEDULE_BRANCHES` | unset | BURN-IN: expose independent mixed-vendor expert branches to the common multi-backend scheduler. |
 | `DFLASH_DS4_TP_TARGETED_JOIN_SPLIT` / `DFLASH_MOE_TP_TARGETED_JOIN_SPLIT` | unset | BURN-IN: start a main-GPU split only at each peer-result join, avoiding an extra peer fence per MoE layer. |
-| `DFLASH_DS4_COMP_PAD_STRIDE` | 16 | BURN-IN: compressed-KV padding bucket (`16`, `32`, `64`, or `128`); wider exact-masked buckets reduce verifier graph recapture churn. |
+| `DFLASH_DS4_COMP_PAD_STRIDE` | 16, 128 on `gfx1151` DSpark | BURN-IN: compressed-KV padding bucket (`16`, `32`, `64`, or `128`); wider exact-masked buckets reduce verifier graph recapture churn. |
+| `DFLASH_DS4_DECODE_ATTN_CACHE_MB` | a quarter of the target GPU's free memory when the first decode attention graph is cached, 256 MiB floor | Byte budget of the per-layer decode attention graph cache (heterogeneous and token-wise paths); least recently used shapes are evicted across layers before a new one is built. A positive value is used as given. |
+| `GGML_CUDA_GRAPH_MAX_KEYS` | 4096 | Cap on captured CUDA/HIP graph executables kept per backend context, keyed by graph node address; least recently used entries are retired in batches. It must exceed the number of live graphs (the heterogeneous DeepSeek4 verifier keeps up to 24 scheduler graphs of ~130 splits) or warm graphs stop replaying. `0` disables the cap. |
 | `DFLASH_DS4_MIX_MMQ_PREFILL` | enabled for DS4 approximate prefill on gfx1151 | BURN-IN KILL SWITCH: =0 disables registry-aware mixed ROCmFP MMQ; =1 explicitly enables it on supported HIP devices. Automatic selection is model/graph-local and never writes the process environment. Exact prefill retains its existing dispatch defaults, including the specialized paired FP2 path. |
 | `DFLASH_DS4_INCREMENTAL_VERIFY_MASK` | 1 for masks at least 4 MiB | BURN-IN KILL SWITCH: =0 rebuilds and transfers the complete fused-verifier attention mask from the host on every step. |
 | `DFLASH_DS4_INCREMENTAL_VERIFY_MASK_MIN_BYTES` | 4194304 | DEBUG/A-B: minimum fused-verifier mask size for GPU zeroing plus negative-range updates. |
@@ -50,7 +58,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `DFLASH_DS4_TP_BATCH_SPLIT_COPIES` | unset | OPT-IN: establish destination readiness once per DS4 scheduler split while retaining each backend copy's dependency publication. The qualified dual-ROCm launcher enables it. |
 | `GGML_BATCH_PEER_COPIES` | unset | BURN-IN: additionally combine HIP peer-copy dependency publication. `GGML_CUDA_BATCH_PEER_COPIES` remains a compatibility alias. Keep these event-batching variables unset for the exact qualified profile. |
 | `GGML_SCHED_PROFILE` / `GGML_SCHED_PROFILE_MIN_SPLITS` | unset / 1 | DEBUG: report scheduler splits, copy volume, submission time, and source/destination synchronization time. |
-| `DFLASH_DS4_TP_FUSED_CACHE_SLOTS` | 2 | BURN-IN: number of heterogeneous verifier schedulers retained; higher values retain substantially more scratch on both GPUs. |
+| `DFLASH_DS4_TP_FUSED_CACHE_SLOTS` | 8, 24 with `DFLASH_DS4_Q5_VERIFY` | BURN-IN: number of heterogeneous verifier schedulers retained; higher values retain substantially more scratch on both GPUs. |
 | `DFLASH_DS4_VERIFY_FORCE_GRAPH_REPLAY` | unset | OPT-IN: bypass graph property scans only after warmup; scheduler-generation checks remain mandatory. |
 | `DFLASH_DS4_ROCTX` | unset | DEBUG: on HIP builds, dynamically load ROCTX and emit semantic DS4 prefill, speculative-decode, and layer-range markers for external rocprof traces. No events, timing, or device synchronization are added. |
 | `DFLASH_QWEN35_ROCTX` | unset | DEBUG: on HIP builds, dynamically load ROCTX and mark Qwen concurrent steps, graph compute, and argmax readback with live, padded, and packed-prefill shape metadata. |
@@ -91,7 +99,8 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH27B_KV_TQ3` - kv_quant.cpp, qwen3_drafter.cpp
 - `DFLASH27B_KV_V` - kv_quant.cpp, laguna_backend.cpp
 - `DFLASH27B_LM_HEAD_FIX` - http_server.cpp
-- `DFLASH27B_PREFILL_UBATCH` - layer_split_daemon.cpp, qwen35_backend.cpp, qwen35_layer_split_adapter.cpp
+- `DFLASH27B_PAGED_WMMA` - paged-attn.cu (ggml-cuda) (=1 routes paged full-attention layers to the WMMA kernel; RDNA4 only, F16/Q8_0/Q4_0, non-tree)
+- `DFLASH27B_PREFILL_UBATCH` - qwen35/prefill_helpers.h
 - `DFLASH_ADAPTIVE_K_DENSE` - mmid_adaptive_k.h
 - `DFLASH_ADAPTIVE_K_TAU` - mmid_adaptive_k.h
 - `DFLASH_ADAPTIVE_SPEC_WIDTH` - adaptive_spec_width.h
@@ -100,8 +109,11 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_COLD_THREADS` - moe_expert_compute_cpu.cpp
 - `DFLASH_CUDA_BACKEND_PATH` - dynamic_backend.cpp
 - `DFLASH_CUDA_MMVF_NARROW_F16` - ggml-cuda/mmvf.cu
+- `DFLASH_CUDA_MMVQ_FP4_X4` - deepseek4_backend.cpp, mmvq.cu
 - `DFLASH_CUDA_MMVQ_MOE_ALIGN_SHARED_IDS` - moe_hybrid_ffn_eval.cpp
+- `DFLASH_CUDA_MMVQ_MOE_FP3_PACKED24` - deepseek4_backend.cpp, mmvq.cu
 - `DFLASH_CUDA_MMVQ_MOE_KERNEL` - moe_hybrid_ffn_eval.cpp
+- `DFLASH_CUDA_MMVQ_MOE_ROWS_PER_BLOCK` - mmvq.cu
 - `DFLASH_DISABLE_DRAFT_ATTN` - draft_graph.cpp
 - `DFLASH_DISABLE_DRAFT_ATTN_GATE` - draft_graph.cpp
 - `DFLASH_DISABLE_DRAFT_AUX_NORMS` - draft_graph.cpp
@@ -114,11 +126,22 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_DRAFT_PERSIST` - laguna_backend.cpp
 - `DFLASH_DROP_COLD` - qwen35moe_backend.cpp, qwen35moe_pipelined_decode.cpp
 - `DFLASH_DS4_ADAPTIVE_WIDTH` - deepseek4_dspark_spec.cpp
+- `DFLASH_DS4_CONFIDENCE_WIDTH` - deepseek4_dspark_spec.cpp (KILL SWITCH: =0 falls back from the drafter confidence head to the learned-acceptance width policy)
+- `DFLASH_DS4_DRAFT_CONTEXT_KV_CACHE` - deepseek4_dspark_spec.cpp (gfx1151 DSpark default =1: pinned drafter context window; =0 restores pageable copies)
+- `DFLASH_DS4_FUSED_HYBRID_DECODE` - deepseek4_graph.cpp
+- `DFLASH_DS4_GPU_ARGMAX_VERIFY` - deepseek4_dspark_spec.cpp, deepseek4_fused_verify.inc (gfx1151 DSpark default =1: on-device argmax of verifier logits; =0 copies the logits back)
+- `DFLASH_DS4_HYBRID_PREFILL_EAGER` - deepseek4_graph.cpp, moe_hybrid_ffn_eval.cpp
+- `DFLASH_DS4_HYBRID_PREFILL_GPU_HC` - deepseek4_graph.cpp
+- `DFLASH_DS4_Q5_VERIFY` - deepseek4_backend.cpp, deepseek4_dspark_spec.cpp, deepseek4_fused_verify.inc, deepseek4_graph.cpp (gfx1151 DSpark default =1: five-row fused verifier and the 24-slot cache; =0 restores the q<=4 verifier)
+- `DFLASH_DS4_PINNED_ROLLBACK` - deepseek4_dspark_spec.cpp (gfx1151 DSpark default =1: pinned host rollback state; =0 restores pageable copies)
 - `DFLASH_DS4_COMP_PAD_STRIDE` - deepseek4_graph.cpp
 - `DFLASH_DS4_CROSS_VENDOR_OWNER_SUMS` - deepseek4_fused_verify.inc
 - `DFLASH_DS4_CUDA_LAYERS` - deepseek4_layer_split_adapter.cpp
+- `DFLASH_DS4_DECODE_ATTN_CACHE_MB` - deepseek4_graph.cpp
 - `DFLASH_DS4_DENSE_TP_MASK` - deepseek4_loader.cpp
 - `DFLASH_DS4_DENSE_TP_STRIX_FRACTION` - deepseek4_loader.cpp
+- `DFLASH_DS4_DIRECT_CONTIGUOUS_CAUSAL` - deepseek4_backend.cpp, deepseek4_graph.cpp (gfx1151 sparse-prefill default; KILL SWITCH: =0 restores the explicit causal mask)
+- `DFLASH_DS4_DISABLE_BOUNDARY_CHECKPOINT` - deepseek4_dspark_spec.cpp (KILL SWITCH: =1 replays a two-boundary q5 rejection from a full snapshot instead of the boundary checkpoint)
 - `DFLASH_DS4_DISABLE_GROUPED_OUTPUT_PROJECTION` - deepseek4_graph.cpp
 - `DFLASH_DS4_DIRECT_INDEXER_TOPK` - deepseek4_graph.cpp
 - `DFLASH_DS4_DRAFT` - deepseek4_backend.cpp
@@ -129,6 +152,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_DS4_HOTNESS_CSV` - deepseek4_backend.cpp
 - `DFLASH_DS4_INCREMENTAL_VERIFY_MASK` - deepseek4_fused_verify.inc
 - `DFLASH_DS4_INCREMENTAL_VERIFY_MASK_MIN_BYTES` - deepseek4_fused_verify.inc
+- `DFLASH_DS4_INDEXER_F16_Q` - deepseek4_backend.cpp, deepseek4_graph.cpp (gfx1151 sparse-prefill default; KILL SWITCH: =0 restores F32 indexer queries)
 - `DFLASH_DS4_MIX_MMQ_PREFILL` - deepseek4_backend.cpp, ggml-cuda/mmq.cu
 - `DFLASH_DS4_MOE_TP` - deepseek4_backend.cpp
 - `DFLASH_DS4_MOE_TP_BACKEND` - deepseek4_backend.cpp
@@ -136,8 +160,25 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_DS4_MOE_TP_GPU` - deepseek4_backend.cpp
 - `DFLASH_DS4_MOE_TP_INPROC` - deepseek4_backend.cpp
 - `DFLASH_DS4_MOE_TP_PEER_HOT` - deepseek4_backend.cpp
+- `DFLASH_DS4_PREFILL_F16_KV_ALL` - deepseek4_backend.cpp, deepseek4_graph.cpp (gfx1151 sparse-prefill default; KILL SWITCH: =0 restores F32 selected-KV transport)
 - `DFLASH_DS4_ROUTING_STATS_OUT` - deepseek4_backend.cpp
 - `DFLASH_DS4_ROCTX` - deepseek4_roctx.cpp
+- `DFLASH_DS4_TOKEN_TRACE` - deepseek4_dspark_spec.cpp (DIAGNOSTIC: per-token speculative trace on stderr)
+- `DFLASH_DS4_TP_COARSE_OWNER` - moe_hybrid_ffn_eval.cpp
+- `DFLASH_DS4_TP_DEVICE_JOIN` - moe_hybrid_ffn_eval.cpp
+- `DFLASH_DS4_TP_DEVICE_JOIN_SPLIT` - deepseek4_fused_verify.inc
+- `DFLASH_DS4_TP_FUSED_HC_JOIN` - deepseek4_fused_verify.inc
+- `DFLASH_DS4_TP_MAIN_ROUTE_WEIGHTS` - deepseek4_fused_verify.inc
+- `DFLASH_DS4_TP_MASKED_ROUTES` - deepseek4_fused_verify.inc
+- `DFLASH_DS4_TP_NATIVE_ROUTE_WIDTH` - deepseek4_fused_verify.inc
+- `DFLASH_DS4_TP_ROUTE_PREFORK` - moe_hybrid_ffn_eval.cpp
+- `DFLASH_DS4_VERIFY_BUILD_TIMING` - deepseek4_fused_verify.inc (DIAGNOSTIC: fused-verify graph build timing)
+- `DFLASH_DSPARK_NO_CHAIN_GRAPH_CACHE` - dspark_head.cpp (KILL SWITCH: =1 rebuilds the DSpark Markov chain graph on every call)
+- `DFLASH_MMID_GROUPED` - deepseek4_backend.cpp, mmvq.cu
+- `DFLASH_MMID_GROUPED_DEVICE` - mmvq.cu
+- `DFLASH_MMID_GROUPED_TYPES` - deepseek4_backend.cpp, mmvq.cu
+- `DFLASH_MOE_TP_DYNAMIC_MAIN_SLOTS_X4` - moe_hybrid_ffn_eval.cpp
+- `DFLASH_MOE_TP_DYNAMIC_ROUTE_BALANCE` - moe_hybrid_ffn_eval.cpp
 - `DFLASH_QWEN35_ROCTX` - qwen35_roctx.cpp
 - `DFLASH_DS4_SEQ_VERIFY` - deepseek4_dspark_spec.cpp
 - `DFLASH_ROCMFP2_ROW4` - rocmfp2_mix.cu
@@ -272,6 +313,8 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_QWEN35_NO_FUSED_KERNELS` - qwen35_target_graph.cpp (KILL SWITCH: =1 rebuilds the pre-fusion decode graph)
 - `DFLASH_QWEN35_NO_STACK` - gguf_target_loader.cpp (KILL SWITCH: =1 disables zero-copy stacked weight aliases)
 - `DFLASH_QWEN35_SPEC_STEP_RATIO` - qwen35_backend.cpp (adaptive policy spec/plain step-time ratio override)
+- `DFLASH_ROCMFP3_WIDE_TWO_PASS` - rocmfp3_mix.cu
+- `DFLASH_ROCMFP3_ROW3` - rocmfp3_mix.cu (KILL SWITCH: =0 restores two-row tiles on gfx1151)
 - `DFLASH_SAMPLED_VERIFY` - laguna_backend.cpp, qwen35_backend.cpp
 - `DFLASH_SHARE_DIR` - http_server.cpp
 - `DFLASH_SINGLE_CHAIN_CHECKPOINT_F32` - chain_rollback_policy.h
@@ -289,7 +332,23 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_TOPK_SPLIT` - geometric_draft_topk_cuda.cu
 - `DFLASH_VERIFY_WIDTH` - qwen35moe_backend.cpp
 - `FAST_ROLLBACK_DIAG` - qwen35_dflash_target.cpp
+- `DFLASH27B_FA256_MMA` - fattn.cu (ggml-cuda) (=0 restores the tile kernel for head-256 on RDNA4)
+- `DFLASH27B_FA256_WMMA` - fattn.cu (ggml-cuda) (=1 forces the rocWMMA kernel on every head-256 RDNA4 shape)
+- `DFLASH27B_FA256_WMMA_MAX_KV` - fattn.cu (ggml-cuda) (rocWMMA/raw-MMA crossover KV length in flag builds)
+- `GGML_HIP_ROCWMMA_FATTN` - server/CMakeLists.txt (BUILD OPTION, not an env var: compiles the rocWMMA fattn kernel; required by `DFLASH27B_FA256_WMMA` and the sub-32K head-256 prefill route)
+- `GGML_CUDA_BATCH_PEER_COPIES` - ggml-cuda.cu (ggml-cuda), deepseek4_fused_verify.inc, moe_hybrid_ffn_eval.cpp
+- `GGML_CUDA_GRAPH_MAX_KEYS` - common.cuh (ggml-cuda)
+- `GGML_CUDA_MLA_DENSE_HIGH_RATIO` - fattn.cu, deepseek4_backend.cpp, deepseek4_graph.cpp
+- `GGML_CUDA_MLA_DENSE_WMMA` - fattn.cu, deepseek4_backend.cpp, deepseek4_graph.cpp
 - `GGML_CUDA_MLA_NO_SPLIT_KV` - ds4-env.cuh (fattn.cu)
+- `GGML_CUDA_MLA_SEGMENTED_KV` - deepseek4_graph.cpp
+- `GGML_CUDA_MLA_SPARSE_VALUE_SKIP` - fattn.cu
+- `GGML_CUDA_MLA_STREAM_WMMA` - fattn.cu, deepseek4_backend.cpp
+- `GGML_CUDA_MLA_STREAM_WMMA_HEAD_GROUPS` - fattn.cu, deepseek4_backend.cpp
+- `GGML_DS4_INDEXER_M32` - ds4-indexer.cu (KILL SWITCH: =0 disables the rocWMMA m32 indexer kernel on RDNA 3.5)
+- `GGML_DS4_INDEXER_M32_CACHE_B` - ds4-indexer.cu, deepseek4_backend.cpp (gfx1151 default: cached B operand)
+- `GGML_DS4_INDEXER_M32_PREFILL` - ds4-indexer.cu (DIAGNOSTIC: m32 prefill crossover override)
+- `GGML_DS4_INDEXER_M32_DIRECT_B` - ds4-indexer.cu (DIAGNOSTIC: m32 direct-B crossover override)
 - `GGML_CUDA_MMQ_X` - ggml-cuda/mmq.cuh
 - `GGML_CUDA_MMQ_MOE_ADAPTIVE_X` - ggml-cuda/mmq.cuh
 - `GGML_CUDA_MMQ_MOE_PERSISTENT` - ggml-cuda/mmq.cuh
@@ -297,12 +356,14 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `GGML_CUDA_MLA_STREAM_TOPK` - ggml-cuda/fattn.cu
 - `GGML_DS4_FA_STREAM_TOPK` - ggml-cuda/fattn.cu (compatibility alias)
 - `GGML_CUDA_MLA_STREAM_F32_STAGE` - ggml-cuda/fattn.cu
+- `GGML_CUDA_PAGED_ATTN_FORCE_PARTITIONS` - ggml-cuda/paged-attn.cu (DIAGNOSTIC: force the paged-attention partition count on both routes)
 - `GGML_CUDA_MLA_STREAM_FAST_EXP` - ggml-cuda/fattn.cu
 - `GGML_CUDA_MLA_SPLIT_KV` - ds4-env.cuh (fattn.cu)
 - `GGML_DS4_FA_NO_SPLIT_KV` - ds4-env.cuh (fattn.cu)
 - `GGML_DS4_FA_SPLIT_KV` - ds4-env.cuh (fattn.cu)
 - `GGML_DS4_TOPK_BLOCK_RADIX` - top-k.cu
 - `HOME` - spark_corpus.cpp
+- `LUCE_CUDA_I32_REPEAT` - ggml-cuda.cu (ggml-cuda)
 - `LUCE_Q8_MEMO` - mmvq.cu (set to 0 to disable q8_1 activation memoisation; on by default)
 - `LUCE_MMQ_BIG_PREFILL` - mmq.cu (=0 disables the RDNA4 128-wide MMQ tiles for large prefill batches)
 - `LUCE_MMVQ_MAX_NCOLS` - deepseek4_backend.cpp

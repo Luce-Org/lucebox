@@ -18,6 +18,7 @@
 
 #include "http_server.h"
 #include "hybrid_regions.h"
+#include "engine/luce_engine.h"
 #include "admission.h"
 #include "common/concurrency/seq_engine.h"
 #include "response_error.h"
@@ -877,6 +878,7 @@ json build_props_body(const ServerConfig & config,
             {"chunk",           config.chunk},
             {"continuous_batching", {
                 {"admission_coalesce_ms", config.admission_coalesce_ms},
+                {"decode_kv_offload_bytes", config.decode_kv_offload_bytes},
             }},
             // Device placement strings (e.g. "auto:0", "cuda:0"). Empty
             // string when no draft model is loaded.
@@ -1247,10 +1249,11 @@ static json model_list(const ServerConfig & config, bool codex_schema) {
 
 // ─── HttpServer ─────────────────────────────────────────────────────────
 
-HttpServer::HttpServer(ModelBackend & backend,
+HttpServer::HttpServer(dflash::engine::LuceEngine & engine,
                        Tokenizer & tokenizer,
                        const ServerConfig & config)
-    : backend_(backend)
+    : engine_(engine)
+    , backend_(engine.backend())
     , tokenizer_(tokenizer)
     , config_(config)
     , chat_format_(ChatFormat::QWEN3)  // default, overridden by arch
@@ -1262,7 +1265,7 @@ HttpServer::HttpServer(ModelBackend & backend,
                    config.disk_cache_budget_mb * (size_t)(1024 * 1024),
                    config.disk_cache_min_tokens,
                    config.disk_cache_continued_interval,
-                   config.disk_cache_cold_max_tokens}, backend)
+                   config.disk_cache_cold_max_tokens}, backend_)
 {
     #ifdef DFLASH_HAS_CURL
     curl_global_init(CURL_GLOBAL_DEFAULT);
@@ -1482,9 +1485,7 @@ void HttpServer::shutdown() {
         socket_close(listen_fd_);
         listen_fd_ = kInvalidSocket;
     }
-    if (worker_thread_.joinable()) {
-        worker_thread_.join();
-    }
+    engine_.stop_serving();
 
     // Close SSE client connections.
     {
@@ -1522,17 +1523,25 @@ void HttpServer::shutdown() {
     }
 }
 
-void HttpServer::start_worker() {
-    // A backend-provided sequence engine replaces the one-request worker
-    // with the concurrent scheduler. Upstream forwarding stays on the
-    // classic path even when the local backend exposes an engine.
-    if (SeqEngine * engine = backend_.seq_engine();
-        engine && config_.pflash_upstream_base.empty()) {
-        worker_thread_ =
-            std::thread([this, engine]() { scheduler_loop(*engine); });
-    } else {
-        worker_thread_ = std::thread([this]() { worker_loop(); });
+bool HttpServer::start_worker() {
+    // LuceEngine owns the serving thread: a backend-provided sequence engine
+    // replaces the one-request worker with the concurrent scheduler.
+    // Upstream forwarding stays on the classic path even when the local
+    // backend exposes an engine.
+    dflash::engine::LuceEngine::ServingLoops loops;
+    loops.serial = [this]() { worker_loop(); };
+    loops.concurrent =
+        [this](SeqEngine & engine) { scheduler_loop(engine); };
+    loops.request_stop = [this]() {
+        request_stop();
+        queue_cv_.notify_all();
+    };
+    if (!engine_.start_serving(
+            std::move(loops), config_.pflash_upstream_base.empty())) {
+        std::fprintf(stderr, "[server] failed to start LuceEngine\n");
+        return false;
     }
+    return true;
 }
 
 int HttpServer::run(const std::vector<HttpServer *> & models) {
@@ -1546,7 +1555,7 @@ int HttpServer::run(const std::vector<HttpServer *> & models) {
         for (HttpServer * model : models) {
             SeqEngine * engine = model ? model->backend_.seq_engine() : nullptr;
             if (!model || (engine && engine->slot_count() < 1) ||
-                model->worker_thread_.joinable() ||
+                model->engine_.is_serving() ||
                 !model->config_.pflash_upstream_base.empty() ||
                 model->config_.model_name.empty() || model->config_.model_name == "auto" ||
                 !names.insert(model->config_.model_name).second ||
@@ -1561,6 +1570,34 @@ int HttpServer::run(const std::vector<HttpServer *> & models) {
             // CORS belongs to the one listener even when a peer formats output.
             model->config_.enable_cors = config_.enable_cors;
         }
+    }
+
+    // Every model is loaded and no worker has started: resolve one shared
+    // host-memory allowance without granting each model the whole machine.
+    const std::vector<HttpServer *> budget_models = models.empty()
+        ? std::vector<HttpServer *>{this} : models;
+    size_t explicit_bytes = 0, automatic_models = 0;
+    for (auto * model : budget_models) {
+        const size_t requested = model->config_.decode_kv_offload_bytes;
+        auto * engine = model->backend_.seq_engine();
+        if (requested == dflash::common::kAutoKvOffloadBytes) {
+            if (engine && engine->slot_count() > 1 && engine->kv_offload_capacity()) ++automatic_models;
+        } else {
+            explicit_bytes += std::min(requested,
+                dflash::common::kAutoKvOffloadBytes - explicit_bytes);
+        }
+    }
+    const size_t available = automatic_models
+        ? dflash::common::available_kv_offload_memory().value_or(0) : 0;
+    for (auto * model : budget_models) {
+        auto & budget = model->config_.decode_kv_offload_bytes;
+        if (budget != dflash::common::kAutoKvOffloadBytes) continue;
+        auto * engine = model->backend_.seq_engine();
+        budget = engine && engine->slot_count() > 1
+            ? dflash::common::auto_kv_offload_budget(engine->kv_offload_capacity(),
+                available, explicit_bytes, automatic_models) : 0;
+        std::fprintf(stderr, "[server] model %s automatic decode KV offload budget: %zu bytes\n",
+                     model->config_.model_name.c_str(), budget);
     }
 
 #if !defined(_WIN32)
@@ -1630,9 +1667,15 @@ int HttpServer::run(const std::vector<HttpServer *> & models) {
                  config_.host.c_str(), config_.port);
 
     if (models_.empty()) {
-        start_worker();
+        if (!start_worker()) return 1;
     } else {
-        for (auto & model : models_) model.server->start_worker();
+        for (size_t i = 0; i < models_.size(); ++i) {
+            if (!models_[i].server->start_worker()) {
+                for (size_t j = 0; j < i; ++j)
+                    models_[j].server->engine_.stop_serving();
+                return 1;
+            }
+        }
     }
 
     // Accept loop.
@@ -1680,10 +1723,8 @@ int HttpServer::run(const std::vector<HttpServer *> & models) {
     routing_cv_.notify_all();
     stop_worker(this);
     for (auto & model : models_) stop_worker(model.server);
-    if (worker_thread_.joinable()) worker_thread_.join();
-    for (auto & model : models_) {
-        if (model.server->worker_thread_.joinable()) model.server->worker_thread_.join();
-    }
+    engine_.stop_serving();
+    for (auto & model : models_) model.server->engine_.stop_serving();
 
     // Every handler borrows a model context. Do not destroy those contexts
     // after an arbitrary grace period. Reads poll stopping_; workers have
@@ -3570,23 +3611,13 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
     std::vector<int> lookup_lengths;
     if (cache.disk_policy.mode == DiskPrefixCacheMode::Full &&
         !effective_prompt.empty()) {
-        lookup_lengths.push_back((int) effective_prompt.size());
-        if ((int) effective_prompt.size() >
-            config_.disk_cache_cold_max_tokens) {
-            const auto boundaries = find_all_boundaries(
-                effective_prompt, prefix_cache_.chat_markers());
-            int cold_boundary = 0;
-            for (int boundary : boundaries) {
-                if (boundary <= config_.disk_cache_cold_max_tokens &&
-                    boundary >= config_.disk_cache_min_tokens) {
-                    cold_boundary = boundary;
-                }
-            }
-            if (cold_boundary > 0 &&
-                cold_boundary != (int) effective_prompt.size()) {
-                lookup_lengths.push_back(cold_boundary);
-            }
-        }
+        // Probes are index lookups; only a hit reads a file. A restart then
+        // recovers any inline snapshot the previous process persisted, not
+        // just exact prompts and the short cold prefix.
+        lookup_lengths = disk_prefix_cache_full_lookup_lengths(
+            (int) effective_prompt.size(),
+            find_all_boundaries(effective_prompt, prefix_cache_.chat_markers()),
+            config_.disk_cache_min_tokens);
     } else if (selected_boundary > 0) {
         lookup_lengths.push_back(selected_boundary);
     } else if (cache.disk_policy.mode == DiskPrefixCacheMode::Auto) {
@@ -4090,8 +4121,8 @@ void HttpServer::remember_agent_turn(
     }
 }
 
-// Generation setup owns backing storage for every pointer placed in
-// GenerateRequest, keeping those pointers valid through the decode call.
+// Populate model-ready input. GenerateRequest owns every retained token
+// sequence, eliminating pointer lifetime coupling to GenerationInputs.
 void HttpServer::prepare_generation_inputs(
         const ParsedRequest & req, const PreparedPrompt & prepared,
         GenerationInputs & inputs) {
@@ -4127,8 +4158,7 @@ void HttpServer::prepare_generation_inputs(
         ToolHintGenerator hint_generator(tokenizer_);
         auto hint = hint_generator.build_hint(req.tools, req.tool_choice);
         if (!hint.empty()) {
-            inputs.hint_tokens = std::move(hint.prefix_tokens);
-            inputs.request.hint_tokens = &inputs.hint_tokens;
+            inputs.request.hint_tokens = std::move(hint.prefix_tokens);
         }
     }
 
@@ -4136,9 +4166,9 @@ void HttpServer::prepare_generation_inputs(
         return;
     }
 
-    inputs.stall_tool_prefix_tokens = tokenizer_.encode(
+    inputs.request.stall_tool_prefix_tokens = tokenizer_.encode(
         build_stall_tool_prefix(req.tools, req.tool_choice));
-    inputs.stall_action_suffix_tokens = tokenizer_.encode(":");
+    inputs.request.stall_action_suffix_tokens = tokenizer_.encode(":");
 
     // The detector matches recent terminal tokens, not the full action
     // prefix. Collect the final token for common colon spellings.
@@ -4146,22 +4176,17 @@ void HttpServer::prepare_generation_inputs(
         const auto ids = tokenizer_.encode(text);
         if (ids.empty()) return;
         const int32_t token = ids.back();
-        if (std::find(inputs.stall_action_suffix_tokens.begin(),
-                      inputs.stall_action_suffix_tokens.end(), token) ==
-            inputs.stall_action_suffix_tokens.end()) {
-            inputs.stall_action_suffix_tokens.push_back(token);
+        if (std::find(inputs.request.stall_action_suffix_tokens.begin(),
+                      inputs.request.stall_action_suffix_tokens.end(), token) ==
+            inputs.request.stall_action_suffix_tokens.end()) {
+            inputs.request.stall_action_suffix_tokens.push_back(token);
         }
     };
     add_suffix_terminal("`:");
     add_suffix_terminal("):");
     add_suffix_terminal("\":");
 
-    inputs.stall_skip_tokens = tokenizer_.encode(" done");
-    inputs.request.stall_tool_prefix_tokens =
-        &inputs.stall_tool_prefix_tokens;
-    inputs.request.stall_action_suffix_tokens =
-        &inputs.stall_action_suffix_tokens;
-    inputs.request.stall_skip_tokens = &inputs.stall_skip_tokens;
+    inputs.request.stall_skip_tokens = tokenizer_.encode(" done");
 }
 
 void HttpServer::configure_generation_io(
@@ -4200,6 +4225,15 @@ void HttpServer::configure_generation_io(
             }
         }
 
+        if (output.completion_tokens == 1) {
+            // Prefill is over: the first generated token marks the decode phase.
+            // The count goes with it, so the transition a client sees is not
+            // "decode with nothing generated" — the counter otherwise only
+            // moves on multiples of ten.
+            status_.set_decode();
+            status_.update_completion_tokens(output.completion_tokens);
+            broadcast_status();
+        }
         if (output.completion_tokens % 10 == 0) {
             status_.update_completion_tokens(output.completion_tokens);
             broadcast_status();
@@ -4496,9 +4530,9 @@ void HttpServer::process_job(ServerJob * job) {
     // Run generation (with or without restore).
     // The decoding drafter stays resident across requests.
 
-    // Transition status to decode phase.
-    status_.set_decode();
-    broadcast_status();
+    // The status stays in PREFILL until the first generated token (set in the
+    // token callback): generate() below prefills first, so flipping here makes
+    // a long prompt report decode for the whole time it is still prefilling.
 
     GenerateResult result;
     if (using_restore) {

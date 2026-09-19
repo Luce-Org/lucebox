@@ -26,6 +26,12 @@ HEALTH_TIMEOUT_SECONDS="${HEALTH_TIMEOUT_SECONDS:-600}"
 COOLDOWN_SECONDS="${COOLDOWN_SECONDS:-3}"
 PREFILL_FIRST_BURST_STEPS="${PREFILL_FIRST_BURST_STEPS:-0}"
 IDLE_PREFILL_TOKENS="${IDLE_PREFILL_TOKENS:-4096}"
+# KV quantisation for the paged pool. q4_0 is the canonical default;
+# q8_0 matches the published blog command and the WMMA route's types.
+KV_TYPE="${KV_TYPE:-q4_0}"
+# Optional A/B pass-through for the paged-attention kernel route
+# (DFLASH27B_PAGED_WMMA). Empty preserves the default kernel.
+PAGED_WMMA="${PAGED_WMMA:-}"
 
 usage() {
   cat <<'EOF'
@@ -42,6 +48,12 @@ Set VARIANTS=blog-ddtree with a readable DRAFT_MODEL to run the optional
 DDTree variant; it requires a server build that emits per-response
 [concurrency-metrics] telemetry. The server still uses paged attention
 because this script measures the concurrent implementation, including C=1.
+Set VARIANTS=dflash2 with a readable DRAFT_MODEL for the DFlash2 speculative
+variant (draft on the same device, no DDTree: --ddtree is rejected with
+--paged-attention, and the server requires exactly this shape for a
+same-device draft). KV_TYPE selects the paged pool K/V quantisation (q4_0
+default, q8_0 to match the blog command); PAGED_WMMA forwards
+DFLASH27B_PAGED_WMMA to A/B the paged-attention kernel route.
 GPU_DEVICE is the physical ROCr device exposed exclusively to the server and
 defaults to device 0. Pass GPU_DEVICE=1 for Strix Halo on this dual-GPU
 benchmark host. The resolved value is stored in each case's command and metadata.
@@ -93,10 +105,10 @@ for suite in "${suite_list[@]}"; do
   [[ "$suite" =~ ^(he-raw|he|gsm|math|agent)$ ]] || { echo "unknown suite $suite" >&2; exit 2; }
 done
 for variant in "${variant_list[@]}"; do
-  [[ "$variant" =~ ^(ar|blog-ddtree|adaptive-ddtree)$ ]] || { echo "unknown variant $variant" >&2; exit 2; }
+  [[ "$variant" =~ ^(ar|dflash2|blog-ddtree|adaptive-ddtree)$ ]] || { echo "unknown variant $variant" >&2; exit 2; }
 done
-if [[ "$VARIANTS" == *ddtree* ]]; then
-  [[ -r "$DRAFT_MODEL" ]] || { echo "blog-ddtree requires readable DRAFT_MODEL" >&2; exit 2; }
+if [[ "$VARIANTS" == *ddtree* || "$VARIANTS" == *dflash2* ]]; then
+  [[ -r "$DRAFT_MODEL" ]] || { echo "dflash2/blog-ddtree require a readable DRAFT_MODEL" >&2; exit 2; }
 fi
 
 mkdir -p "$OUT/prompts"
@@ -143,13 +155,27 @@ run_case() {
   local -a command launch client_common bench_options
   command=("$SERVER_BIN" "$MODEL" --target-device hip:0 --paged-attention
     --max-concurrency "$SLOTS" --kv-pool-tokens "$capacity" --max-ctx "$max_ctx"
-    --cache-type-k q4_0 --cache-type-v q4_0 --fa-window 0
+    --cache-type-k "$KV_TYPE" --cache-type-v "$KV_TYPE" --fa-window 0
     --prefix-cache-slots 0 --prefill-cache-slots 0
     --admission-coalesce-ms 5 --host 127.0.0.1 --port "$PORT" --model-name qwen36)
   if [[ "$suite" == he-raw ]]; then
     command+=(--chat-template-file "$SCRIPT_DIR/raw_prompt_identity.jinja")
   fi
-  if [[ "$variant" == *ddtree ]]; then
+  local -a route_env=()
+  [[ -n "$PAGED_WMMA" ]] && route_env=(DFLASH27B_PAGED_WMMA="$PAGED_WMMA")
+  if [[ "$variant" == dflash2 ]]; then
+    # Concurrent local same-device DFlash2 chains: a draft on the same device
+    # with paged attention and no DDTree (the server rejects --ddtree with
+    # --paged-attention and requires this exact shape otherwise).
+    command+=(--draft "$DRAFT_MODEL" --draft-device hip:0)
+    launch=(env ROCR_VISIBLE_DEVICES="$GPU_DEVICE" DFLASH_IGNORE_EOS=1
+      DFLASH_MIN_TOKENS="$WARMUP_TOKENS"
+      DFLASH_PREFILL_FIRST_BURST_STEPS="$PREFILL_FIRST_BURST_STEPS"
+      DFLASH_IDLE_PREFILL_TOKENS="$IDLE_PREFILL_TOKENS"
+      DFLASH_MAX_CONCURRENT_PREFILLS=8
+      "${route_env[@]}"
+      stdbuf -oL -eL "${command[@]}")
+  elif [[ "$variant" == *ddtree ]]; then
     local adaptive=0
     [[ "$variant" == adaptive-ddtree ]] && adaptive=1
     command+=(--draft "$DRAFT_MODEL" --draft-device hip:0 --ddtree
@@ -157,11 +183,13 @@ run_case() {
     launch=(env ROCR_VISIBLE_DEVICES="$GPU_DEVICE" DFLASH_IGNORE_EOS=1 DFLASH27B_DRAFT_SWA=2048 DFLASH_DDTREE_ADAPTIVE="$adaptive"
       DFLASH_PREFILL_FIRST_BURST_STEPS="$PREFILL_FIRST_BURST_STEPS"
       DFLASH_IDLE_PREFILL_TOKENS="$IDLE_PREFILL_TOKENS"
+      "${route_env[@]}"
       DFLASH_MIN_TOKENS="$WARMUP_TOKENS" stdbuf -oL -eL "${command[@]}")
   else
     launch=(env ROCR_VISIBLE_DEVICES="$GPU_DEVICE" DFLASH_IGNORE_EOS=1 DFLASH_MIN_TOKENS="$WARMUP_TOKENS"
       DFLASH_PREFILL_FIRST_BURST_STEPS="$PREFILL_FIRST_BURST_STEPS"
       DFLASH_IDLE_PREFILL_TOKENS="$IDLE_PREFILL_TOKENS"
+      "${route_env[@]}"
       stdbuf -oL -eL "${command[@]}")
   fi
   printf '%q ' "${launch[@]}" > "$case_dir/server-command.txt"
@@ -190,7 +218,7 @@ obj={"variant":variant,"suite":suite,"clients":int(c),"repeat":int(repeat),
 "fast_rollback":True,"adaptive":variant == "adaptive-ddtree","n_gen":int(n_gen)} if variant.endswith("ddtree") else None)}
 pathlib.Path(out).write_text(json.dumps(obj,indent=2,sort_keys=True)+"\n")' \
     "$case_dir/server-metadata.json" "$variant" "$suite" "$clients" "$repeat" \
-    "$SERVER_BIN" "$MODEL" "$([[ "$variant" == *ddtree ]] && echo "$DRAFT_MODEL")" \
+    "$SERVER_BIN" "$MODEL" "$([[ "$variant" == *ddtree || "$variant" == dflash2 ]] && echo "$DRAFT_MODEL")" \
     "$OUT/prompts/$suite.jsonl" "$case_dir/server-command.txt" "$MAX_TOKENS" "$REPO" \
     "$GPU_DEVICE" "$SLOTS" "$PREFILL_FIRST_BURST_STEPS" "$EXPECTED_GPU_ARCH" "$IDLE_PREFILL_TOKENS"
 

@@ -5,6 +5,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <atomic>
 #include <cstring>
 #include <vector>
 
@@ -172,6 +173,21 @@ bool dspark_markov_correct_greedy_chain(const DraftWeights & dw,
     return true;
 }
 
+static std::atomic<uint64_t> g_dspark_drafter_generation{1};
+static std::atomic<uint64_t> g_dspark_chain_graph_builds{0};
+
+void dspark_note_drafter_lifecycle() {
+    g_dspark_drafter_generation.fetch_add(1, std::memory_order_acq_rel);
+}
+
+uint64_t dspark_drafter_generation() {
+    return g_dspark_drafter_generation.load(std::memory_order_acquire);
+}
+
+uint64_t dspark_chain_graph_build_count() {
+    return g_dspark_chain_graph_builds.load(std::memory_order_acquire);
+}
+
 namespace {
 
 struct MarkovChainGraph {
@@ -184,7 +200,59 @@ struct MarkovChainGraph {
     std::vector<ggml_tensor *> toks;              // corrected argmax per depth
     std::vector<ggml_tensor *> corrected;         // corrected logits per depth
     std::vector<ggml_tensor *> confidence;        // optional sigmoid score per depth
+    std::vector<ggml_tensor *> logit_margin;      // optional |top1 - top2| per depth
 };
+
+// Compose PR 705's graph reuse with the optional confidence and logit-margin
+// outputs used by adaptive verification. The graph closes over tensor
+// identities, so all optional weights and output modes belong in the key.
+struct MarkovChainGraphCache {
+    MarkovChainGraph graph;
+    uint64_t generation = 0;
+    std::vector<uint8_t> arena;
+    ggml_gallocr_t allocator = nullptr;
+    bool built = false;
+    const void * lm_head = nullptr;
+    const void * markov_w1 = nullptr;
+    const void * markov_w2 = nullptr;
+    const void * confidence_w = nullptr;
+    const void * confidence_b = nullptr;
+    ggml_backend_t backend = nullptr;
+    int n_candidates = -1;
+    bool want_confidence = false;
+    bool want_logit_margin = false;
+
+    bool matches(const DraftWeights & dw, ggml_tensor * head,
+                 ggml_backend_t candidate_backend, int candidate_count,
+                 bool confidence, bool logit_margin,
+                 uint64_t current_generation) const {
+        return built && generation == current_generation &&
+               lm_head == head && backend == candidate_backend &&
+               n_candidates == candidate_count &&
+               want_confidence == confidence &&
+               want_logit_margin == logit_margin &&
+               markov_w1 == dw.dspark.markov_w1 &&
+               markov_w2 == dw.dspark.markov_w2 &&
+               confidence_w == dw.dspark.confidence_w &&
+               confidence_b == dw.dspark.confidence_b;
+    }
+
+    // Free the context before build_markov_chain_graph() may grow the arena
+    // that backs it. Keep the allocator so its backend buffer can be reused.
+    void invalidate() {
+        if (graph.ctx) ggml_free(graph.ctx);
+        graph = MarkovChainGraph{};
+        built = false;
+    }
+};
+
+bool dspark_chain_graph_cache_disabled() {
+    static const bool disabled = [] {
+        const char * value = std::getenv("DFLASH_DSPARK_NO_CHAIN_GRAPH_CACHE");
+        return value && value[0] && std::strcmp(value, "0") != 0;
+    }();
+    return disabled;
+}
 
 // Guards shared by the fused Markov paths: head present, usable inputs, and
 // the target lm_head vocab matching the head's training vocab.
@@ -221,6 +289,7 @@ bool build_markov_chain_graph(const DraftWeights & dw,
                               int n_positions, int first_corrected,
                               bool corrected_are_outputs,
                               bool confidence_are_outputs,
+                              bool logit_margin_are_outputs,
                               std::vector<uint8_t> & arena,
                               MarkovChainGraph & out) {
     const int hdim   = dw.n_embd;
@@ -266,6 +335,7 @@ bool build_markov_chain_graph(const DraftWeights & dw,
     out.toks.assign((size_t)n_corr, nullptr);
     out.corrected.assign((size_t)n_corr, nullptr);
     out.confidence.assign((size_t)n_corr, nullptr);
+    out.logit_margin.assign((size_t)n_corr, nullptr);
     for (int i = 0; i < n_corr; ++i) {
         const int row = first_corrected + i;
         ggml_tensor * prev_emb = ggml_get_rows(out.ctx, dw.dspark.markov_w1, prev_ids);
@@ -282,6 +352,22 @@ bool build_markov_chain_graph(const DraftWeights & dw,
         ggml_build_forward_expand(out.gf, tok);
         out.corrected[(size_t)i] = corrected;
         out.toks[(size_t)i] = tok;
+        if (logit_margin_are_outputs) {
+            ggml_tensor * top_ids = ggml_top_k(out.ctx, corrected, 2);
+            ggml_tensor * logits_rows = ggml_reshape_3d(
+                out.ctx, corrected, 1, vocab, 1);
+            ggml_tensor * top_values = ggml_get_rows(
+                out.ctx, logits_rows, top_ids);
+            ggml_tensor * first = ggml_view_1d(
+                out.ctx, top_values, 1, 0);
+            ggml_tensor * second = ggml_view_1d(
+                out.ctx, top_values, 1, top_values->nb[1]);
+            ggml_tensor * margin = ggml_abs(
+                out.ctx, ggml_sub(out.ctx, first, second));
+            ggml_set_output(margin);
+            ggml_build_forward_expand(out.gf, margin);
+            out.logit_margin[(size_t)i] = margin;
+        }
         if (have_confidence) {
             ggml_tensor * hidden_i = ggml_view_2d(
                 out.ctx, out.inp_confidence_hidden, hdim, 1,
@@ -315,32 +401,65 @@ bool dspark_markov_correct_greedy_chain_fused(const DraftWeights & dw,
                                               int32_t last_tok,
                                               std::vector<int32_t> & draft_tok,
                                               std::vector<float> * confidence_out,
-                                              const float * confidence_hidden) {
+                                              const float * confidence_hidden,
+                                              std::vector<float> * logit_margin_out) {
     if (q_len <= 1) return false;
     if (!dspark_fused_usable(dw, backend, lm_head, local_hidden, "dspark_fused")) return false;
     const int hdim   = dw.n_embd;
     const int n_cand = q_len - 1;
 
-    static thread_local std::vector<uint8_t> g_arena_chain;
-    MarkovChainGraph g;
+    static thread_local MarkovChainGraphCache cache;
     const bool want_confidence = confidence_out != nullptr;
+    const bool want_logit_margin = logit_margin_out != nullptr;
     if (confidence_out) confidence_out->clear();
-    if (!build_markov_chain_graph(dw, lm_head, n_cand, /*first_corrected=*/0,
-                                  /*corrected_are_outputs=*/false,
-                                  /*confidence_are_outputs=*/want_confidence,
-                                  g_arena_chain, g)) {
-        return false;
+    if (logit_margin_out) logit_margin_out->clear();
+    // Sample the generation once so a lifecycle bump racing this build is
+    // observed as a miss on the next call rather than lost.
+    const uint64_t generation = dspark_drafter_generation();
+    const bool reuse = !dspark_chain_graph_cache_disabled() &&
+        cache.matches(dw, lm_head, backend, n_cand, want_confidence,
+                      want_logit_margin, generation);
+    if (!reuse) {
+        cache.invalidate();
+        if (!build_markov_chain_graph(
+                dw, lm_head, n_cand, /*first_corrected=*/0,
+                /*corrected_are_outputs=*/false,
+                /*confidence_are_outputs=*/want_confidence,
+                /*logit_margin_are_outputs=*/want_logit_margin,
+                cache.arena, cache.graph)) {
+            cache.invalidate();
+            return false;
+        }
+        if (cache.allocator && cache.backend != backend) {
+            // The allocator is bound to a buffer type; a new backend needs
+            // its own or the graph lands in the previous device's buffers.
+            ggml_gallocr_free(cache.allocator);
+            cache.allocator = nullptr;
+        }
+        if (!cache.allocator) {
+            cache.allocator = ggml_gallocr_new(
+                ggml_backend_get_default_buffer_type(backend));
+        }
+        if (!cache.allocator ||
+            !ggml_gallocr_alloc_graph(cache.allocator, cache.graph.gf)) {
+            std::fprintf(stderr, "dspark_fused: gallocr_alloc_graph failed\n");
+            cache.invalidate();
+            return false;
+        }
+        cache.lm_head = lm_head;
+        cache.markov_w1 = dw.dspark.markov_w1;
+        cache.markov_w2 = dw.dspark.markov_w2;
+        cache.confidence_w = dw.dspark.confidence_w;
+        cache.confidence_b = dw.dspark.confidence_b;
+        cache.backend = backend;
+        cache.n_candidates = n_cand;
+        cache.want_confidence = want_confidence;
+        cache.want_logit_margin = want_logit_margin;
+        cache.generation = generation;
+        cache.built = true;
+        g_dspark_chain_graph_builds.fetch_add(1, std::memory_order_acq_rel);
     }
-
-    static thread_local ggml_gallocr_t galloc_chain = nullptr;
-    if (!galloc_chain) {
-        galloc_chain = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-    }
-    if (!ggml_gallocr_alloc_graph(galloc_chain, g.gf)) {
-        std::fprintf(stderr, "dspark_fused: gallocr_alloc_graph failed\n");
-        ggml_free(g.ctx);
-        return false;
-    }
+    MarkovChainGraph & g = cache.graph;
 
     // Candidate hidden states start at position 1 (position 0 is the seed).
     ggml_backend_tensor_set(g.inp_hidden, local_hidden + (size_t)hdim, 0,
@@ -354,7 +473,7 @@ bool dspark_markov_correct_greedy_chain_fused(const DraftWeights & dw,
 
     if (ggml_backend_graph_compute(backend, g.gf) != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "dspark_fused: graph_compute failed\n");
-        ggml_free(g.ctx);
+        cache.invalidate();
         return false;
     }
 
@@ -363,11 +482,17 @@ bool dspark_markov_correct_greedy_chain_fused(const DraftWeights & dw,
     // One synchronize instead of n_cand blocking readbacks.
     std::vector<int32_t> t_out((size_t)n_cand);
     std::vector<float> c_out(want_confidence ? (size_t)n_cand : 0);
+    std::vector<float> m_out(want_logit_margin ? (size_t)n_cand : 0);
     for (int i = 0; i < n_cand; ++i) {
         ggml_backend_tensor_get_async(backend, g.toks[(size_t)i], &t_out[i], 0, sizeof(int32_t));
         if (want_confidence && g.confidence[(size_t)i]) {
             ggml_backend_tensor_get_async(
                 backend, g.confidence[(size_t)i], &c_out[i], 0, sizeof(float));
+        }
+        if (want_logit_margin && g.logit_margin[(size_t)i]) {
+            ggml_backend_tensor_get_async(
+                backend, g.logit_margin[(size_t)i], &m_out[i], 0,
+                sizeof(float));
         }
     }
     ggml_backend_synchronize(backend);
@@ -377,7 +502,10 @@ bool dspark_markov_correct_greedy_chain_fused(const DraftWeights & dw,
     if (want_confidence && !g.confidence.empty() && g.confidence[0]) {
         *confidence_out = std::move(c_out);
     }
-    ggml_free(g.ctx);
+    if (want_logit_margin && !g.logit_margin.empty() &&
+        g.logit_margin[0]) {
+        *logit_margin_out = std::move(m_out);
+    }
     return true;
 }
 
@@ -399,6 +527,7 @@ bool dspark_markov_project_topk(const DraftWeights & dw,
     if (!build_markov_chain_graph(dw, lm_head, n_tokens, /*first_corrected=*/1,
                                   /*corrected_are_outputs=*/true,
                                   /*confidence_are_outputs=*/false,
+                                  /*logit_margin_are_outputs=*/false,
                                   g_arena_topk, g)) {
         return false;
     }

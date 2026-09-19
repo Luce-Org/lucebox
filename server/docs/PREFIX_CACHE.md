@@ -47,7 +47,11 @@ Request 2: [system + user1 + assistant1 + user2 + assistant2 + user3]
 
 Caches KV state at **turn boundaries** within a conversation. The boundary
 detector uses `ChatMarkers` to find end-of-message + start-of-next-role
-token sequences.
+token sequences. DeepSeek's template closes only assistant turns with an end
+marker (the system text and user turns end where the next role starts), so
+for that family every role marker is a boundary: the system text, each
+completed turn, and the generation prompt. A first turn therefore snapshots
+its system prompt, and a new session on the same system prompt restores it.
 
 For tool-using chat templates, tool definitions are rendered in the system
 prefix. The first safe boundary therefore includes the complete tool schema:
@@ -86,7 +90,10 @@ when the selected boundary advances beyond the restored prefix.
 The disk prefix cache is a separate persistence/overflow layer for token-keyed
 snapshots. Today it is integrated with the inline/effective-prompt path; exact
 prefill snapshots are kept in RAM unless a dedicated raw-prompt disk path is
-added.
+added. With the default `full` policy a lookup probes the whole prompt and
+then every chat boundary, deepest first, so a restart recovers the inline
+snapshots the previous process persisted (probes are index lookups; only a
+hit reads a file).
 
 ## Snapshot Memory Management
 

@@ -12,10 +12,12 @@ public:
     explicit ScopedCudaGraphOverrides(
             bool disable_graphs = false,
             int mmvq_max_ncols = 0,
-            bool skip_property_check = false)
+            bool skip_property_check = false,
+            int ds4_mix_mmv_max_tokens = 0)
         : disable_graphs_(disable_graphs),
           override_mmvq_(mmvq_max_ncols > 0),
-          skip_property_check_(skip_property_check) {
+          skip_property_check_(skip_property_check),
+          override_ds4_mix_(ds4_mix_mmv_max_tokens > 0) {
         if (disable_graphs_) {
             previous_graphs_disabled_ =
                 ggml_backend_cuda_set_graphs_disabled_override(true);
@@ -29,9 +31,16 @@ public:
             previous_skip_property_check_ =
                 ggml_backend_cuda_set_skip_props_check(true);
         }
+        if (override_ds4_mix_) {
+            previous_ds4_mix_max_tokens_ =
+                ggml_backend_cuda_set_ds4_mix_mmv_max_tokens_override(ds4_mix_mmv_max_tokens);
+        }
     }
 
     ~ScopedCudaGraphOverrides() {
+        if (override_ds4_mix_) {
+            ggml_backend_cuda_set_ds4_mix_mmv_max_tokens_override(previous_ds4_mix_max_tokens_);
+        }
         if (skip_property_check_) {
             ggml_backend_cuda_set_skip_props_check(
                 previous_skip_property_check_);
@@ -53,9 +62,11 @@ private:
     bool disable_graphs_ = false;
     bool override_mmvq_ = false;
     bool skip_property_check_ = false;
+    bool override_ds4_mix_ = false;
     bool previous_graphs_disabled_ = false;
     bool previous_skip_property_check_ = false;
     int previous_mmvq_max_ncols_ = 0;
+    int previous_ds4_mix_max_tokens_ = 0;
 };
 
 }  // namespace dflash::common

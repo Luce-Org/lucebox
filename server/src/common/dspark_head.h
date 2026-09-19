@@ -8,6 +8,16 @@
 
 namespace dflash::common {
 
+// Drafter lifecycle generation. Every drafter free/reload bumps it; the fused
+// chain-graph cache keys on it so a reloaded drafter that lands at the same
+// addresses can never reuse a graph built over freed weights. The counter is
+// process-wide, atomic, and monotonic.
+void dspark_note_drafter_lifecycle();
+uint64_t dspark_drafter_generation();
+// Number of fused chain graphs built so far (diagnostic; lets tests assert a
+// cache hit or miss without reaching into the cache).
+uint64_t dspark_chain_graph_build_count();
+
 bool dspark_markov_correct_greedy_chain(const DraftWeights & dw,
                                         ggml_backend_t backend,
                                         DFlashTarget & target,
@@ -34,7 +44,8 @@ bool dspark_markov_correct_greedy_chain_fused(const DraftWeights & dw,
                                               int32_t last_tok,
                                               std::vector<int32_t> & draft_tok,
                                               std::vector<float> * confidence_out = nullptr,
-                                              const float * confidence_hidden = nullptr);
+                                              const float * confidence_hidden = nullptr,
+                                              std::vector<float> * logit_margin_out = nullptr);
 
 // DDTree candidate generation with the Markov correction: base logits for
 // all n_tokens positions in ONE lm_head matmul; rows 1..n-1 get the low-rank

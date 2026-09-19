@@ -44,6 +44,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <utility>
 #include <sstream>
 #include "common/gguf_mmap.h"
 
@@ -138,8 +139,8 @@ static float laguna_dspark_confidence_threshold() {
 
 // ── Construction / initialisation ───────────────────────────────────────
 
-LagunaBackend::LagunaBackend(const LagunaBackendArgs & args)
-    : args_(args) {}
+LagunaBackend::LagunaBackend(LagunaBackendArgs args)
+    : args_(std::move(args)) {}
 
 LagunaBackend::~LagunaBackend() { shutdown(); }
 

@@ -506,8 +506,8 @@ struct TargetCache {
     ggml_tensor * conv_factor_all = nullptr;
     ggml_tensor * conv_factor_all_alt = nullptr;
 
-    // SpecLA factor buffers (allocated instead of ssm_intermediate when
-    // DFLASH_SPECLA=1 on the single-target path). Two token-major banks let a
+    // SpecLA factor buffers (allocated instead of ssm_intermediate on the
+    // single-target SpecLA path). Two token-major banks let a
     // verify consume the preceding accepted path while writing its own raw
     // factors without aliasing:
     //   factor_k_all:     [S_k, H_v, n_delta, max_q_len] f32
@@ -782,12 +782,15 @@ void reset_recurrent_slot(TargetCache & c, int slot);
 
 // Reallocate a prefill-only cache with full rollback tensors, copying all live
 // state (KV, SSM, conv, target_feat) device-to-device. Frees the old cache.
+// enable_specla is the caller's effective SpecLA decision (config-driven);
+// the factor buffers exist iff it is true, and downstream graph code keys
+// SpecLA off their presence.
 bool migrate_prefill_cache(const TargetWeights & w,
                            int max_ctx,
                            int max_verify_tokens,
                            ggml_backend_t backend,
                            TargetCache & cache,
-                           bool enable_specla = true);
+                           bool enable_specla);
 
 // Compatibility commit for the fully factorized §4.2 fallback. The production
 // HLD route instead keeps raw accepted factors pending and consumes them in
@@ -825,7 +828,7 @@ struct DeltaNetCapture {
     // second target-model forward. These are graph-owned outputs.
     ggml_tensor * replay_log              = nullptr;
 
-    // SpecLA factor capture (DFLASH_SPECLA=1, docs/SPECLA.md). Persistent F32
+    // SpecLA factor capture (docs/SPECLA.md). Persistent F32
     // aliases into the bank written by this verify. In the HLD path the
     // historical field names hold raw serial-recurrence terms:
     //   factor_k:     [S_k, H_v, max_verify_tokens] — post-l2norm keys

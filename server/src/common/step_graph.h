@@ -50,7 +50,7 @@ struct StepGraph {
     ggml_tensor *   parent_ids = nullptr;    // DDTree tree-mode; null for chain mode
     ggml_tensor *   tree_sizes = nullptr;    // DDTree [n_tree_seqs], 0 = padding
     // SpecLA topology masks ([n_tokens, n_tokens] f32, host-filled; see
-    // delta_net_specla.h). Created only when DFLASH_SPECLA capture is active.
+    // delta_net_specla.h). Created only when SpecLA capture is active.
     ggml_tensor *   specla_m_strict = nullptr;
     ggml_tensor *   specla_m_incl   = nullptr;
     ggml_tensor *   specla_m_eye    = nullptr;

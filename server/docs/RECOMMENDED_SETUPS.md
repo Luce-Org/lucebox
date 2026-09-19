@@ -18,20 +18,23 @@ If a machine has both Strix Halo and an R9700, set `HIP_VISIBLE_DEVICES=<r9700-i
 
 ## DeepSeek V4 on Strix Halo
 
-The current adaptive ROCmFPX artifact uses all six routed experts. This is the profile behind the [published Strix Halo results](https://www.lucebox.com/blog/deepseek-v4-flash-0731):
+The plain launch is the qualified one. The `gfx1151` device profile installs every kernel and policy default at start (fused five-row verifier, verify width from the DSpark confidence head, sparse prefill kernels), so there is nothing to tune. Use the adaptive ROCmFPX artifact with all six routed experts and `--chunk 8192` on the 128 GB part. Measured this way: 42 tok/s decode and 320 tok/s prefill at 8K, 36 tok/s at 123K, 39 tok/s on code and math, 25 tok/s on prose ([PR #729](https://github.com/Luce-Org/lucebox/pull/729); details in the [DeepSeek V4 guide](DS4.md#experimental-amd-q5-verifier)).
 
 ```bash
 DFLASH_DS4_SPEC=1 \
-DFLASH_DS4_SPEC_Q=4 \
-DFLASH_DS4_FUSED_VERIFY=1 \
-DFLASH_DS4_DRAFT=/path/to/dspark.gguf \
-DFLASH_DS4_DRAFT_GPU=0 \
+DFLASH_DS4_DRAFT=/path/to/DeepSeek-V4-Flash-0731-DSpark-draft-Q4RMFP4-denseF16.gguf \
+DFLASH_DS4_SPARSE_DECODE_FLASH=1 \
 dflash_server /path/to/DeepSeek-V4-Flash-0731-ROCMFPX-MIX-STRIX.gguf \
   --target-device hip:0 \
-  --ds4-fused-decode \
+  --max-ctx 131072 \
+  --chunk 8192 \
+  --cache-type-k q4_0 --cache-type-v q4_0 \
+  --ds4-fused-decode --ds4-fused-verify-f16-kv \
   --ds4-expert-top-k 6 \
-  --ds4-prefill exact
+  --ds4-prefill sparse
 ```
+
+The earlier fixed-width recipe behind the [blog post](https://www.lucebox.com/blog/deepseek-v4-flash-0731) still runs, but it pins verify width 4 and exact prefill and misses the fast path.
 
 ## Multi-GPU
 

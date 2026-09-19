@@ -5,6 +5,11 @@
 
 using namespace ggml_cuda_mma;
 
+// Bump the calling-thread head-size-256 MMA launch counter, defined in
+// fattn.cu and exposed for qualification tests via
+// ggml_backend_cuda_get_fattn_mma256_launch_count().
+extern "C" void ggml_backend_cuda_record_fattn_mma256_launch(void);
+
 // Config options for the MMA kernel.
 // Should not affect results, only speed/register pressure/shared memory use.
 struct fattn_mma_config {
@@ -115,7 +120,7 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
 
 static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config_rdna(const int DKQ, const int DV, const int ncols) {
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 16, 128, 2,  64, 128, 128, 128, 2, true);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 32, 128, 2,  64, 128, 128,  64, 2, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 32, 256, 2,  64, 128, 128,  64, 2, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 64, 128, 2,  64, 128, 128,  64, 2, true);
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 16,  64, 4,  32, 128, 128, 128, 1, false);
@@ -1531,7 +1536,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                 }
             }
         }
-        if (np > 1) {
+        // With DV/2 > nbatch_combine the next iteration overwrites the
+        // combine tile while warps from this one may still be reading it,
+        // even when np == 1. Only single-combine-iteration configurations
+        // (DV/2 <= nbatch_combine) can skip this barrier.
+        if (np > 1 || DV/2 > nbatch_combine) {
             __syncthreads();
         }
     }
@@ -1590,7 +1599,7 @@ static __global__ void flash_attn_ext_f16(
 #endif // __CUDA_ARCH__ == GGML_CUDA_CC_TURING
 
 #if defined(AMD_WMMA_AVAILABLE)
-    if (ncols1*ncols2 > 32 || ncols1*ncols2 < 16 || DKQ > 128 || ncols2 == 1) {
+    if (ncols1*ncols2 > 32 || ncols1*ncols2 < 16 || ncols2 == 1) {
         NO_DEVICE_CODE;
         return;
     }
@@ -1725,6 +1734,9 @@ static __global__ void flash_attn_ext_f16(
 
 template <int DKQ, int DV, int ncols1, int ncols2>
 void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if constexpr (DKQ == 256 && DV == 256) {
+        ggml_backend_cuda_record_fattn_mma256_launch();
+    }
     const ggml_tensor * KQV = dst;
     const int id = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[id].cc;

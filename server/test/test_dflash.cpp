@@ -762,7 +762,7 @@ int main(int argc, char ** argv) {
     bool  ddtree_tau_set = false;
     bool  specla_mode   = false;
     bool  specla_top_k_set = false;
-    int   specla_top_k  = 4;
+    int   specla_top_k  = dflash::common::specla_tree_topk();
     bool  profile_scaling = false;  // microbench: time target forward at varying N
     bool  time_breakdown  = false;  // one-token time breakdown: prefill/decode/verify × ctx size
     bool  hybrid_bench_only = false; // skip monolithic scenarios, run only hybrid/pipelined
@@ -1097,11 +1097,6 @@ int main(int argc, char ** argv) {
     }
     if (specla_mode) {
         if (!ddtree_tau_set) ddtree_tau = 6.0f;
-        set_environment_variable("DFLASH_SPECLA", "1", true);
-        if (specla_top_k_set) {
-            set_environment_variable(
-                "DFLASH_SPECLA_TOPK", std::to_string(specla_top_k).c_str(), true);
-        }
     } else if (specla_top_k_set) {
         std::fprintf(stderr, "--specla-top-k requires --specla\n");
         return 2;
@@ -2203,7 +2198,7 @@ int main(int argc, char ** argv) {
             // Need rollback tensors for snapshot/restore
             step_graph_free(psg2);
             psg2 = StepGraph{};
-            migrate_prefill_cache(w, max_ctx, max_verify_tokens, target_backend, cache);
+            migrate_prefill_cache(w, max_ctx, max_verify_tokens, target_backend, cache, specla_mode);
 
             check(snapshot_ssm_state(cache, target_backend),
                   "snapshot recurrent state succeeded");
@@ -2241,7 +2236,7 @@ int main(int argc, char ** argv) {
 
             step_graph_free(psg3);
             psg3 = StepGraph{};
-            migrate_prefill_cache(w, max_ctx, max_verify_tokens, target_backend, cache);
+            migrate_prefill_cache(w, max_ctx, max_verify_tokens, target_backend, cache, specla_mode);
 
             check(snapshot_ssm_state(cache, target_backend),
                   "snapshot recurrent state succeeded");
@@ -2881,7 +2876,7 @@ int main(int argc, char ** argv) {
         // Promote prefill-only cache to full decode cache
         auto t_mig0 = std::chrono::steady_clock::now();
         step_graph_destroy(sg);
-        if (!migrate_prefill_cache(w, max_ctx, max_verify_tokens, target_backend, cache)) {
+        if (!migrate_prefill_cache(w, max_ctx, max_verify_tokens, target_backend, cache, specla_mode)) {
             std::fprintf(stderr, "cache migration: %s\n", dflash27b_last_error());
             return 1;
         }
@@ -3084,7 +3079,7 @@ int main(int argc, char ** argv) {
     // Copies KV, SSM/conv state, and target_feat device→device (~1 ms).
     auto t_mig0 = std::chrono::steady_clock::now();
     step_graph_destroy(sg);
-    if (!migrate_prefill_cache(w, max_ctx, max_verify_tokens, target_backend, cache)) {
+    if (!migrate_prefill_cache(w, max_ctx, max_verify_tokens, target_backend, cache, specla_mode)) {
         std::fprintf(stderr, "cache migration: %s\n", dflash27b_last_error());
         return 1;
     }
@@ -3313,7 +3308,7 @@ int main(int argc, char ** argv) {
         // state is active; retain the historical top-8 baseline otherwise.
         const int ddtree_K = (ddtree_budget > q_len - 1)
             ? (!cache.factor_k.empty()
-                ? std::min(dflash::common::specla_tree_topk(), vocab)
+                ? std::min(specla_top_k, vocab)
                 : 8)
             : 1;
 
@@ -4103,7 +4098,7 @@ int main(int argc, char ** argv) {
             // Rollback SSM + conv state unless we fully accepted (in which case
             // state after processing all q_len tokens is exactly what we want).
             //
-            // SpecLA (DFLASH_SPECLA=1): current candidates remain outside the
+            // SpecLA: current candidates remain outside the
             // durable state, so their bank is rotated even on full acceptance.
             const bool specla_commit = !cache.factor_k.empty();
             if (specla_commit) {

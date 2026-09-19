@@ -4057,20 +4057,16 @@ struct ggml_tensor * ggml_transpose(
 
 // ggml_get_rows
 
-struct ggml_tensor * ggml_get_rows(
+static struct ggml_tensor * ggml_get_rows_impl(
         struct ggml_context * ctx,
         struct ggml_tensor  * a,
-        struct ggml_tensor  * b) {
+        struct ggml_tensor  * b,
+        enum ggml_type        type) {
     GGML_ASSERT(a->ne[2] == b->ne[1]);
     GGML_ASSERT(a->ne[3] == b->ne[2]);
     GGML_ASSERT(b->ne[3] == 1);
     GGML_ASSERT(b->type == GGML_TYPE_I32);
 
-    // TODO: implement non F32 return
-    enum ggml_type type = GGML_TYPE_F32;
-    if (a->type == GGML_TYPE_I32) {
-        type = a->type;
-    }
     struct ggml_tensor * result = ggml_new_tensor_4d(ctx, type, a->ne[0], b->ne[0], b->ne[1], b->ne[2]);
 
     result->op     = GGML_OP_GET_ROWS;
@@ -4078,6 +4074,16 @@ struct ggml_tensor * ggml_get_rows(
     result->src[1] = b;
 
     return result;
+}
+
+struct ggml_tensor * ggml_get_rows(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b) {
+    // TODO: implement other non-F32 return types where callers need them.
+    const enum ggml_type type = a->type == GGML_TYPE_I32
+        ? GGML_TYPE_I32 : GGML_TYPE_F32;
+    return ggml_get_rows_impl(ctx, a, b, type);
 }
 
 // ggml_get_rows_back
@@ -5659,6 +5665,39 @@ void ggml_flash_attn_ext_set_ds4_indexer_topk(
     a->src[5] = selected;
 }
 
+void ggml_flash_attn_ext_set_ds4_kv_segments(
+        struct ggml_tensor * a,
+        struct ggml_tensor * compressed,
+        struct ggml_tensor * preserved_tail) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    // src[6] carries optional RoPE positions (main); segments use src[7]/src[8].
+    GGML_ASSERT(a->src[7] == NULL && a->src[8] == NULL);
+    // The only segmented kernel reads one latent K/V tensor (MLA).
+    GGML_ASSERT(a->src[1] == a->src[2]);
+    GGML_ASSERT(compressed && preserved_tail);
+    GGML_ASSERT(compressed->type == a->src[1]->type);
+    GGML_ASSERT(preserved_tail->type == a->src[1]->type);
+    GGML_ASSERT(compressed->ne[0] == a->src[1]->ne[0]);
+    GGML_ASSERT(preserved_tail->ne[0] == a->src[1]->ne[0]);
+    GGML_ASSERT(compressed->ne[2] == 1 && compressed->ne[3] == 1);
+    GGML_ASSERT(preserved_tail->ne[2] == 1 && preserved_tail->ne[3] == 1);
+    GGML_ASSERT(ggml_is_contiguous(compressed));
+    GGML_ASSERT(ggml_is_contiguous(preserved_tail));
+    a->src[7] = compressed;
+    a->src[8] = preserved_tail;
+}
+
+void ggml_flash_attn_ext_set_ds4_causal_ratio(
+        struct ggml_tensor * a,
+        int                  ratio) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(ratio > 0 && ratio <= 0xffff);
+    const uint32_t flags =
+        (uint32_t) ggml_get_op_params_i32(a, 7) & 0x0000ffffu;
+    ggml_set_op_params_i32(
+        a, 7, (int32_t) (flags | ((uint32_t) ratio << 16)));
+}
+
 void ggml_flash_attn_ext_set_ds4_inverse_rope(
         struct ggml_tensor * a,
         int                  kv_start,
@@ -5674,7 +5713,12 @@ void ggml_flash_attn_ext_set_ds4_inverse_rope(
     GGML_ASSERT(kv_start >= 0);
     // Bit 0: inverse RoPE on attention output. Bit 1: Q still needs forward
     // RoPE. Both directions share the position and YaRN parameters below.
-    ggml_set_op_params_i32(a, 7, 1 | (q_unrotated ? 2 : 0));
+    // Preserve optional DS4 causal-layout metadata in the upper 16 bits so
+    // callers can configure these independent features in either order.
+    const uint32_t causal_ratio =
+        (uint32_t) ggml_get_op_params_i32(a, 7) & 0xffff0000u;
+    ggml_set_op_params_i32(
+        a, 7, (int32_t) (causal_ratio | 1u | (q_unrotated ? 2u : 0u)));
     ggml_set_op_params_i32(a, 8, kv_start);
     ggml_set_op_params_f32(a, 9, freq_base);
     ggml_set_op_params_f32(a, 10, freq_scale);
@@ -9310,7 +9354,8 @@ struct ggml_tensor * ggml_ds4_indexer_score_masked(
         struct ggml_tensor  * visibility_mask,
         int                   kv_start,
         int                   ratio) {
-    GGML_ASSERT(q->type == GGML_TYPE_F32 && q->ne[0] == 128);
+    GGML_ASSERT((q->type == GGML_TYPE_F32 || q->type == GGML_TYPE_F16) &&
+                q->ne[0] == 128);
     GGML_ASSERT(head_weights->type == GGML_TYPE_F32);
     GGML_ASSERT(index_comp->type == GGML_TYPE_F16 && index_comp->ne[0] == 128);
     GGML_ASSERT(ggml_is_contiguous(q));

@@ -32,13 +32,16 @@ enum class SeqSlotPhase {
     free,
     prefill,
     decode,
+    suspended, // slot state retained; paged KV is held by the engine in RAM
+    recompute, // like suspended, but no checkpoint: resume re-prefills history
 };
 
 struct SeqSlot {
     SeqSlotPhase phase = SeqSlotPhase::free;
     PagedKvSequenceHandle handle;
-    // Prompt tokens are the immutable prefix of sample_history. Decode tokens
-    // append to the same allocation, avoiding a second full prompt copy.
+    // The original prompt boundary stays fixed for generation accounting.
+    // prompt_len is the prefill endpoint and grows when history is replayed.
+    int original_prompt_len = 0;
     int prompt_len = 0;
     int cur_pos = 0;
     SamplerCfg sampler;
@@ -54,14 +57,19 @@ struct SeqSlot {
     std::vector<int32_t> staged_tokens;
 
     int generated_tokens() const {
-        return sample_history.size() > (size_t)prompt_len
-            ? (int)(sample_history.size() - (size_t)prompt_len)
+        return sample_history.size() > (size_t)original_prompt_len
+            ? (int)(sample_history.size() - (size_t)original_prompt_len)
             : 0;
     }
 
     bool active() const { return phase != SeqSlotPhase::free; }
     bool prefilling() const { return phase == SeqSlotPhase::prefill; }
     bool decoding() const { return phase == SeqSlotPhase::decode; }
+    bool suspended() const { return phase == SeqSlotPhase::suspended; }
+    bool recomputing() const { return phase == SeqSlotPhase::recompute; }
+    // Parked out of the paged pool, checkpointed or not. Parked slots are
+    // excluded from batch work and block new admissions identically.
+    bool parked() const { return suspended() || recomputing(); }
 };
 
 class SeqSlotManager {
@@ -133,6 +141,30 @@ public:
 
     bool rollback_step(int slot);
 
+    // Tokens per slot for one decode step (zero for non-decoders). Preflight
+    // the entire cohort before reserving anything; excludes parked slots.
+    bool reserve_decode(const std::vector<int> & growth);
+
+    // Engine copies the KV bytes before detach, and restores them after
+    // attach, on the same worker thread. All other slot state stays in place.
+    bool detach_kv(int slot);
+    bool attach_kv(int slot);
+
+    // Eviction without a checkpoint: release the slot's paged KV, fold the
+    // scheduler-held pending token into sample_history, and park the slot in
+    // the recompute phase. The folded history becomes the resume prompt, so
+    // nothing emitted to the client is dropped. False leaves the slot
+    // unchanged except possibly detached — the caller must retire it.
+    bool evict_for_recompute(int slot, int32_t pending_token);
+    // Reserve the folded history and re-enter the slot as an ordinary chunked
+    // prefill, which rebuilds paged KV and slot-local model state together.
+    // False means insufficient pool capacity; the slot stays parked.
+    bool resume_recompute(int slot);
+    // True when the parked slot's resume reservation fits free pool blocks
+    // with one growth block of headroom per resident sequence — the
+    // scheduler's early-resume probe ahead of a full drain.
+    bool kv_restore_feasible(int slot) const;
+
     // Release the slot's blocks and clear its state. Safe on inactive slots
     // and after a failed admission/prefill.
     void retire(int slot);
@@ -151,6 +183,8 @@ private:
     // plus one future page, capped at max_ctx.
     uint32_t decode_headroom_capacity(int logical_tokens) const;
     bool capacity_fits_pool(uint32_t token_capacity) const;
+    // Token capacity attach/resume must reserve for a parked slot.
+    uint32_t resume_token_capacity(const SeqSlot & slot) const;
 
     // Atomically preflight and top up every decoding slot as one cohort before
     // a younger sequence may reserve capacity.

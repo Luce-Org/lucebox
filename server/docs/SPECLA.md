@@ -127,7 +127,7 @@ width. `DFLASH_SPECLA_TOPK=<K>` remains available for non-CLI harnesses.
 build/test_dflash TARGET.gguf DRAFT.gguf prompt.bin 128 out.bin --specla
 
 # Expensive exact branch-conditioned drafting experiment.
-DFLASH_SPECLA=1 DFLASH_SPECLA_CONDITIONAL_DRAFT=1 build/dflash_server ...
+DFLASH_SPECLA_CONDITIONAL_DRAFT=1 build/dflash_server ... --specla
 ```
 
 Tau 6 was best in the current ten-prompt probe and is the `--specla` default.
@@ -136,7 +136,8 @@ tighter margin changed batching at numerically sensitive logits and was not
 consistently faster. `--ddtree-budget`, `--specla-top-k`, and `--draft-swa`
 remain explicit for the same setup-dependent reason.
 
-`DFLASH_SPECLA=1` remains a compatibility switch for non-CLI integrations.
+SpecLA is requested explicitly: `--specla` on the CLI, or
+`Qwen35Config::specla_mode` for programmatic integrations.
 `DFLASH_SPECLA_CONDITIONAL_DRAFT=1` and `DFLASH_SPECLA_FUSED_COMMIT=0` are
 advanced algorithm/debug controls, not required for normal use.
 

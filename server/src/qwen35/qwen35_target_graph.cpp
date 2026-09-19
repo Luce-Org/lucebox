@@ -40,7 +40,6 @@
 #include "common/chain_rollback_policy.h"
 #include "common/kv_rotation.h"
 #include "common/specla_commit_cuda.h"
-#include "common/specla_mode.h"
 
 #include "ggml-alloc.h"
 #include "ggml-backend-impl.h"
@@ -603,7 +602,7 @@ bool migrate_prefill_cache(const TargetWeights & w,
     // SpecLA replaces the dense per-token state checkpoints with compact
     // per-token factor buffers (~(S_k+S_v+1)·H_v·max_q·4B per layer vs
     // state_size·max_q per layer) — the paper's §5.1 memory trade.
-    const bool specla = enable_specla && specla_enabled();
+    const bool specla = enable_specla;
     if (specla) {
         cache.factor_k.assign(n_delta, nullptr);
         cache.factor_v_new.assign(n_delta, nullptr);

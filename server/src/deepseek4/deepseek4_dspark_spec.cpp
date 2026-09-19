@@ -85,6 +85,7 @@ public:
                    (sequential && *sequential && *sequential != '0');
         }();
         if (seq_verify) {
+            boundary_checkpoint_.clear();
             std::vector<int32_t> am_all;
             std::vector<float> feat_all;
             std::vector<float> logits_all;
@@ -100,7 +101,7 @@ public:
                                                      feat1, telemetry_,
                                                      /*allow_graph_reuse=*/true,
                                                      moe_hybrid_, expert_runtime_,
-                                                     routing_stats_)) {
+                                                     routing_stats_, nullptr)) {
                     return false;
                 }
                 if (am1.empty()) return false;
@@ -124,7 +125,8 @@ public:
                                              verify_features_, telemetry_,
                                              /*allow_graph_reuse=*/true,
                                              moe_hybrid_, expert_runtime_,
-                                             routing_stats_)) {
+                                             routing_stats_,
+                                             &boundary_checkpoint_)) {
             return false;
         }
         if (am.empty()) return false;
@@ -206,6 +208,41 @@ public:
     void set_telemetry(DeepSeek4StepTelemetry * t) { telemetry_ = t; }
     const std::vector<float> & last_features() const { return verify_features_; }
     int last_verify_n() const { return verify_n_; }
+    bool restore_first_boundary_checkpoint() {
+        if (!boundary_checkpoint_.available ||
+            boundary_checkpoint_.layers.size() != cache_.layers.size()) {
+            return false;
+        }
+        auto valid_pair = [](ggml_tensor * src, ggml_tensor * dst) {
+            if (!src && !dst) return true;
+            return src && dst && src->type == dst->type &&
+                ggml_nelements(src) == ggml_nelements(dst) &&
+                src->buffer && dst->buffer;
+        };
+        for (const DeepSeek4SpecBoundaryCheckpointLayer & layer :
+             boundary_checkpoint_.layers) {
+            if (!valid_pair(layer.attn_kv_src, layer.attn_kv_dst) ||
+                !valid_pair(layer.attn_score_src, layer.attn_score_dst) ||
+                !valid_pair(layer.index_kv_src, layer.index_kv_dst) ||
+                !valid_pair(layer.index_score_src, layer.index_score_dst)) {
+                return false;
+            }
+        }
+        bool copied = false;
+        auto copy_pair = [&](ggml_tensor * src, ggml_tensor * dst) {
+            if (!src) return;
+            ggml_backend_tensor_copy_async(backend_, backend_, src, dst);
+            copied = true;
+        };
+        for (const DeepSeek4SpecBoundaryCheckpointLayer & layer :
+             boundary_checkpoint_.layers) {
+            copy_pair(layer.attn_kv_src, layer.attn_kv_dst);
+            copy_pair(layer.attn_score_src, layer.attn_score_dst);
+            copy_pair(layer.index_kv_src, layer.index_kv_dst);
+            copy_pair(layer.index_score_src, layer.index_score_dst);
+        }
+        return copied;
+    }
     void clear_snapshot() { free_deepseek4_snapshot(snap_); }
 
 private:
@@ -223,6 +260,7 @@ private:
     std::vector<float> embed_buf_;
     std::vector<float> verify_logits_;
     std::vector<float> verify_features_;
+    DeepSeek4SpecBoundaryCheckpoint boundary_checkpoint_;
     MoeHybridStorage * moe_hybrid_ = nullptr;
     MoeExpertComputeRuntime * expert_runtime_ = nullptr;
     MoeHybridRoutingStats * routing_stats_ = nullptr;
@@ -251,11 +289,32 @@ bool spec_env_flag(const char * name) {
     return v && *v && *v != '0';
 }
 
-// Calibrated cumulative-confidence thresholds for widening the DS4 verify.
-// They are part of the policy, not deployment knobs: artifacts without a
-// compatible confidence head transparently retain the existing EWMA policy.
-constexpr float kConfidenceQ3Threshold = 0.40f;
-constexpr float kConfidenceQ4Threshold = 0.30f;
+// True unless the variable is set to an explicit "0": for switches whose
+// default is on.
+bool spec_env_default_on(const char * name) {
+    const char * value = std::getenv(name);
+    return value == nullptr || value[0] == '\0' || std::strcmp(value, "0") != 0;
+}
+
+// Adaptive verify width policy. The controller may pick any seed-inclusive
+// width from kDs4AdaptiveMinWidth up to the request cap (DS4_Q5_VERIFY_TOKENS
+// on the q5 path). kDs4VerifyWidthCostMs[q] is the total target-step cost of
+// width q measured with the six-expert gfx1151 fused verifier, including the
+// fixed drafter/head work (DSpark computes its whole proposal block whatever
+// the verify width). Only the ratios matter: q3 costs almost as much as q4,
+// so high-acceptance text settles on q4/q5 while low-acceptance prose drops
+// to q2/q3. observe() refines the table online, so other backends start from
+// this curve instead of importing a DS4 policy. The fused verify cache is
+// sized so every width stays resident across the ratio-4 phases.
+constexpr int kDs4AdaptiveMinWidth = 2;
+// Depths whose confidence-head score decides the width. The head was
+// calibrated on q<=4 traffic (three candidates); the fourth candidate of a q5
+// verify is decided by the learned conditional acceptance until its own
+// score is shown calibrated (see the per-depth calibration line under
+// DFLASH_DS4_TIMING).
+constexpr int kDs4ConfidenceDepths = 3;
+constexpr float kDs4VerifyWidthCostMs[DS4_Q5_VERIFY_TOKENS + 1] = {
+    0.0f, 0.0f, 75.0f, 100.0f, 122.0f, 123.0f};
 
 // ── Light rollback state ────────────────────────────────────────────────
 // Save the ratio-4 rolling state, HC state, and the ring rows a speculative
@@ -366,9 +425,15 @@ void restore_rollback_state(ggml_backend_t backend, ggml_tensor * t,
         if (async_copy) ggml_backend_tensor_set_async(backend, t, src, 0, bytes);
         else            ggml_backend_tensor_set(t, src, 0, bytes);
     }
-    // Direct truncation is used for q<=4 (no aliased current-window slots).
-    // Wider rejected verifies restore to pos and replay the accepted prefix.
+    // A rejected row whose ring slot is shared with a committed row of the
+    // same batch keeps the committed write: with five tokens the fifth
+    // token's slot is the seed's. In an undone flush the seed row is put
+    // back by deepseek4_spec_restore_seed_row before this runs; in a kept
+    // flush the slot belongs to a rejected post-boundary position and is
+    // rewritten before it is ever pooled.
+    const int period = rolling ? 4 : (int) t->ne[1];
     for (int i = first_rejected; i < count; ++i) {
+        if (i >= period && i - period < first_rejected) continue;
         const int row = (rolling ? 4 : 0) + rollback_ring_row(t, pos + i);
         const size_t offset = row * t->nb[1];
         const uint8_t * saved = src + (rolling ? offset : i * t->nb[1]);
@@ -553,6 +618,32 @@ double spec_ms_since(SpecClock::time_point t0) {
 
 }  // namespace
 
+bool deepseek4_spec_restore_seed_row(ggml_backend_t backend, ggml_tensor * state,
+                                     int seed_pos) {
+    if (!state || !state->buffer || state->ne[1] != 8) return false;
+    const int slot = seed_pos & (DS4_SPEC_ROLLING_RATIO - 1);
+    // Two views on the same device buffer: the rotated copy of the seed row
+    // in the previous half and the seed's current-window slot. A backend
+    // copy between them is one device-side row copy on the compute stream,
+    // ordered before the previous-half restore that follows it.
+    ggml_init_params params = {};
+    params.mem_size = 2 * ggml_tensor_overhead();
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) return false;
+    ggml_tensor * src = ggml_view_2d(ctx, state, state->ne[0], 1, state->nb[1],
+                                     (size_t) slot * state->nb[1]);
+    ggml_tensor * dst = ggml_view_2d(ctx, state, state->ne[0], 1, state->nb[1],
+                                     (size_t) (DS4_SPEC_ROLLING_RATIO + slot) * state->nb[1]);
+    bool ok = ggml_backend_view_init(src) == GGML_STATUS_SUCCESS &&
+              ggml_backend_view_init(dst) == GGML_STATUS_SUCCESS;
+    if (ok) {
+        ggml_backend_tensor_copy_async(backend, backend, src, dst);
+    }
+    ggml_free(ctx);
+    return ok;
+}
+
 DeepSeek4SpecRollback::~DeepSeek4SpecRollback() {
     if (async_backend) {
         ggml_backend_synchronize(async_backend);
@@ -602,7 +693,9 @@ bool deepseek4_dspark_verify_forward(ggml_backend_t backend,
                                      bool allow_graph_reuse,
                                      MoeHybridStorage * moe_hybrid,
                                      MoeExpertComputeRuntime * expert_runtime,
-                                     MoeHybridRoutingStats * routing_stats) {
+                                     MoeHybridRoutingStats * routing_stats,
+                                     DeepSeek4SpecBoundaryCheckpoint *
+                                         boundary_checkpoint_out) {
     const DeepSeek4RoctxPhaseScope roctx_phase(InferencePhase::Verify);
     std::vector<float> hc_state;
     std::vector<float> all_logits;
@@ -613,6 +706,8 @@ bool deepseek4_dspark_verify_forward(ggml_backend_t backend,
     hooks.capture_out = &capture_out;
     hooks.all_logits_out = &all_logits;
     hooks.argmax_out = &gpu_argmax;
+    if (boundary_checkpoint_out) boundary_checkpoint_out->clear();
+    hooks.boundary_checkpoint_out = boundary_checkpoint_out;
     hooks.prefer_argmax_only =
         spec_env_flag("DFLASH_DS4_GPU_ARGMAX_VERIFY") && logits_out == nullptr;
     if (!deepseek4_step_layer_range(backend, device, w, cache, hc_state, embed, n_tokens, kv_start,
@@ -691,6 +786,11 @@ bool run_deepseek4_dspark_spec_decode(
         {roctx_phase, n_gen, 0, target_w.n_layer, device});
     const bool async_rollback = spec_env_flag("DFLASH_DS4_ASYNC_ROLLBACK");
     const bool pinned_rollback = spec_env_flag("DFLASH_DS4_PINNED_ROLLBACK");
+    // Kill switch for the q5 two-boundary checkpoint restore (falls back to
+    // restore-and-replay) and the per-token diagnostic trace.
+    const bool boundary_checkpoint_enabled =
+        !spec_env_flag("DFLASH_DS4_DISABLE_BOUNDARY_CHECKPOINT");
+    const bool token_trace = spec_env_flag("DFLASH_DS4_TOKEN_TRACE");
     if (spec_env_flag("DFLASH_DS4_Q6_VERIFY")) {
         std::fprintf(stderr,
             "[ds4-spec] q=6 verification is unsupported; use q=5\n");
@@ -724,10 +824,16 @@ bool run_deepseek4_dspark_spec_decode(
     if (const char * raw = std::getenv("DFLASH_DS4_ADAPTIVE_WIDTH")) {
         adaptive_width = raw[0] && std::strcmp(raw, "0") != 0;
     }
-    // The confidence artifact was calibrated through q=4. Q5 still adapts,
-    // but uses target acceptance feedback rather than extrapolating that head.
+    // A drafter confidence head scores every candidate of this very step, so
+    // the width follows the text as it changes instead of lagging behind an
+    // acceptance estimate. The controller extends a head that covers fewer
+    // depths than the q5 verifier with the learned conditional acceptance of
+    // the remaining depth, and target feedback keeps refining that estimate
+    // (kDs4ConfidenceDepths bounds the depths taken from the head).
+    // DFLASH_DS4_CONFIDENCE_WIDTH=0 is the kill switch back to the learned
+    // acceptance policy for A/B runs and drafters with a miscalibrated head.
     const bool use_confidence_width = adaptive_width && !seq_verify_mode &&
-        !q5_verify &&
+        spec_env_default_on("DFLASH_DS4_CONFIDENCE_WIDTH") &&
         drafter.confidence_w != nullptr && drafter.confidence_b != nullptr &&
         (drafter.confidence_dim == n_embd ||
          drafter.confidence_dim == n_embd + drafter.markov_rank);
@@ -756,13 +862,21 @@ bool run_deepseek4_dspark_spec_decode(
                      DS4_CONSERVATIVE_VERIFY_MAX_TOKENS);
         q_cap = DS4_CONSERVATIVE_VERIFY_MAX_TOKENS;
     }
+    // See kDs4AdaptiveMinWidth / kDs4VerifyWidthCostMs for the policy.
     AdaptiveSpecWidth width_controller(
-        q_cap, 2, adaptive_width && !seq_verify_mode);
+        q_cap, kDs4AdaptiveMinWidth, adaptive_width && !seq_verify_mode);
+    std::vector<float> width_cost_ms((size_t) q_cap + 1, 0.0f);
+    for (int width = kDs4AdaptiveMinWidth;
+         width <= std::min(q_cap, DS4_Q5_VERIFY_TOKENS); ++width) {
+        width_cost_ms[(size_t) width] = kDs4VerifyWidthCostMs[width];
+    }
+    width_controller.set_relative_costs(width_cost_ms);
     if (timing && width_controller.enabled()) {
-        std::fprintf(stderr, "[ds4-spec] adaptive width policy=%s\n",
+        std::fprintf(stderr,
+                     "[ds4-spec] adaptive width policy=%s\n",
                      use_confidence_width
                          ? "confidence (acceptance fallback)"
-                         : "acceptance");
+                         : "acceptance-and-cost");
     }
 
     // Snapshot backend for the legacy full-snapshot rollback path.
@@ -790,24 +904,37 @@ bool run_deepseek4_dspark_spec_decode(
     }
     int feat_count = win_have;   // number of valid feature columns ending at committed-1
 
-    auto push_feature = [&](const float * col) {
-        // Shift-append one feature column (keep last n_swa).
-        if (feat_count >= n_swa) {
-            std::memmove(feat_win.data(), feat_win.data() + feat_row,
-                         sizeof(float) * (size_t) feat_row * (n_swa - 1));
-            std::memcpy(feat_win.data() + (size_t) feat_row * (n_swa - 1), col,
-                        sizeof(float) * feat_row);
-        } else {
-            std::memcpy(feat_win.data() + (size_t) feat_row * feat_count, col,
-                        sizeof(float) * feat_row);
-            feat_count++;
+    auto push_features = [&](const float * cols, int count) {
+        if (!cols || count <= 0) return;
+        if (count >= n_swa) {
+            std::memcpy(
+                feat_win.data(), cols + (size_t) (count - n_swa) * feat_row,
+                sizeof(float) * (size_t) feat_row * n_swa);
+            feat_count = n_swa;
+            return;
         }
+
+        // Shift at most once per accepted speculative block. The old
+        // per-column loop moved the full ~7.5 MiB window up to four times per
+        // q4 step even though only the final contiguous suffix was observable.
+        const int keep = std::min(feat_count, n_swa - count);
+        const int drop = feat_count - keep;
+        if (drop > 0 && keep > 0) {
+            std::memmove(
+                feat_win.data(), feat_win.data() + (size_t) drop * feat_row,
+                sizeof(float) * (size_t) feat_row * keep);
+        }
+        std::memcpy(
+            feat_win.data() + (size_t) keep * feat_row, cols,
+            sizeof(float) * (size_t) feat_row * count);
+        feat_count = keep + count;
     };
 
     int lt = last_tok;
     int pos = committed;      // absolute position of the seed (block slot 0)
     int n_generated = 0;
     long accept_sum = 0, offered_sum = 0, steps = 0;
+    std::vector<long> width_steps((size_t) q_cap + 1, 0);
     bool ok = true;
     bool stop_requested = false;
 
@@ -818,6 +945,7 @@ bool run_deepseek4_dspark_spec_decode(
     std::vector<float> padded_confidence_hidden((size_t) n_embd * (block + 1), 0.0f);
     std::vector<int32_t> draft_tok, tgt_am;
     std::vector<float> draft_confidence;
+    std::vector<float> step_confidence;
 
     // Cumulative phase timings (ms).
     double tm_draft = 0, tm_head = 0, tm_save = 0, tm_verify = 0, tm_apply = 0, tm_feat = 0;
@@ -825,6 +953,7 @@ bool run_deepseek4_dspark_spec_decode(
     const SpecClock::time_point run_t0 = SpecClock::now();
 
     while (n_generated < n_gen) {
+        const SpecClock::time_point step_t0 = SpecClock::now();
         const int ctx_len = feat_count < n_swa ? feat_count : n_swa;
 
         // Noise block = [seed] + [MASK]*(block-1).
@@ -902,7 +1031,8 @@ bool run_deepseek4_dspark_spec_decode(
         // acceptance feedback remains the fallback and drives q5/artifacts
         // without confidence metadata.
         if (!use_confidence_width) {
-            q_step_cap = width_controller.next_width(q_step_cap);
+            q_step_cap = width_controller.next_width_cost_aware(
+                {}, q_step_cap);
         }
         if (q_step_cap >= 2) {
             std::memcpy(padded_hidden.data() + n_embd, local_hidden.data(),
@@ -917,7 +1047,8 @@ bool run_deepseek4_dspark_spec_decode(
                             q_step_cap, lt, draft_tok,
                             use_confidence_width ? &draft_confidence : nullptr,
                             use_confidence_width
-                                ? padded_confidence_hidden.data() : nullptr);
+                                ? padded_confidence_hidden.data() : nullptr,
+                            nullptr);
             if (!ds_ok) {
                 ds_ok = dspark_markov_correct_greedy_chain(dw, backend, target,
                             padded_hidden.data(), q_step_cap, lt, 0.0f, draft_tok);
@@ -941,18 +1072,19 @@ bool run_deepseek4_dspark_spec_decode(
         } else {
             draft_tok.push_back(lt);   // q=1: seed only, no speculation
         }
-        // Confidence estimates are per candidate. Their cumulative product is
-        // the estimated probability that the target accepts the whole prefix
-        // unlocked by a wider verify. The defaults were calibrated on q=4
-        // traces and keep q=4 for high-confidence prefixes while avoiding its
-        // extra verify cost on low-acceptance prompts.
-        if (use_confidence_width && draft_confidence.size() >= 2 && draft_tok.size() >= 3) {
-            const float confidence_p2 = draft_confidence[0] * draft_confidence[1];
-            int selected_q = confidence_p2 >= kConfidenceQ3Threshold ? 3 : 2;
-            if (selected_q == 3 && draft_confidence.size() >= 3 && draft_tok.size() >= 4) {
-                const float confidence_p3 = confidence_p2 * draft_confidence[2];
-                if (confidence_p3 >= kConfidenceQ4Threshold) selected_q = 4;
+        // Confidence estimates are conditional per candidate. Select the
+        // width with the best predicted committed-tokens/step-cost ratio;
+        // this avoids treating a narrower verifier as proportionally cheaper
+        // when q3 and q4 are nearly the same cost on gfx1151.
+        if (use_confidence_width && !draft_confidence.empty()) {
+            if (draft_confidence.size() > (size_t) kDs4ConfidenceDepths) {
+                step_confidence.assign(draft_confidence.begin(),
+                                       draft_confidence.begin() + kDs4ConfidenceDepths);
+            } else {
+                step_confidence = draft_confidence;
             }
+            const int selected_q = width_controller.next_width_cost_aware(
+                step_confidence, (int) draft_tok.size());
             if ((int) draft_tok.size() > selected_q) draft_tok.resize((size_t) selected_q);
         } else if (use_confidence_width && !seq_verify_mode) {
             const int selected_q = width_controller.next_width((int)draft_tok.size());
@@ -962,6 +1094,7 @@ bool run_deepseek4_dspark_spec_decode(
         }
         if ((int) draft_tok.size() > q_step_cap) draft_tok.resize(q_step_cap);
         const int q = (int) draft_tok.size();   // seed + candidates
+        if (q >= 0 && q <= q_cap) width_steps[(size_t) q]++;
         tm_head += spec_ms_since(t0);
         if (debug && wide_verify && steps == 0) {
             std::fprintf(stderr, "[ds4-wide] head-ready q=%d\n", q);
@@ -1012,9 +1145,11 @@ bool run_deepseek4_dspark_spec_decode(
                          rollback.raw_count);
         }
 
-        // First ratio-4 boundary position touched by this verify (p % 4 == 3).
-        const int first_boundary = pos + (3 - (pos & 3));
+        // First ratio-4 boundary position at or after the seed (p % 4 == 3).
+        const int first_boundary = deepseek4_first_ratio4_boundary(pos);
         const bool boundary_crossed = first_boundary <= pos + q - 1;
+        const bool multiple_boundaries_crossed =
+            deepseek4_verify_crosses_multiple_ratio4_boundaries(pos, q);
 
         // ── ONE batched verify (writes cache + captures features for all q) ──
         t0 = SpecClock::now();
@@ -1087,23 +1222,64 @@ bool run_deepseek4_dspark_spec_decode(
                 ok = false;
                 break;
             }
-        } else if (!full_snap && accept < q && q > 4) {
-            // A rejected wide verify may have crossed two ratio-4 boundaries.
-            // Restore the compact pre-verify state and replay only the
-            // accepted prefix (at most q5), which is exact and rare at high
-            // acceptance.
-            spec_rollback_apply(
-                rollback, target_w, target_cache, pos, true);
-            std::vector<int32_t> kv_toks;
-            kv_toks.reserve((size_t) accept);
-            kv_toks.push_back(lt);
-            for (int i = 1; i < accept; ++i) kv_toks.push_back(draft_tok[i]);
-            int replay_last = -1;
-            std::vector<int32_t> replay_am;
-            if (!target.verify_batch(kv_toks, pos, replay_last, &replay_am)) {
-                std::fprintf(stderr, "[ds4-spec] wide rollback replay failed\n");
-                ok = false;
-                break;
+        } else if (!full_snap && accept < q &&
+                   q > DS4_CONSERVATIVE_VERIFY_MAX_TOKENS) {
+            // Rejected wide (q5) verify over positions [pos, pos + 4].
+            // Recoveries, cheapest first:
+            // (1) two ratio-4 boundaries touched (pos % 4 == 3, see
+            //     deepseek4_verify_crosses_multiple_ratio4_boundaries): the
+            //     fused graph checkpointed the ratio-4 state right after its
+            //     first flush, so copy those rows back on-device and truncate
+            //     the counters/ring instead of replaying every target layer;
+            // (2) one boundary touched: truncate directly like the q<=4
+            //     verifier (gfx1151 at 123K: 169.8 -> 160.1 ms/step). The
+            //     fifth token writes the seed's rolling slot (4 + pos % 4).
+            //     If the accepted prefix reaches past the boundary the flush
+            //     stays and that slot belongs to a rejected post-boundary
+            //     position, rewritten before it is ever pooled. If the flush
+            //     must be undone the seed's row is still on the device in
+            //     the rotated previous half, so it is copied back into its
+            //     slot before the previous half is restored.
+            // (3) two boundaries without a usable checkpoint: restore the
+            //     compact pre-verify state and replay the accepted prefix.
+            if (multiple_boundaries_crossed && boundary_checkpoint_enabled &&
+                target.restore_first_boundary_checkpoint()) {
+                spec_rollback_apply(
+                    rollback, target_w, target_cache, commit_pos, false);
+            } else if (!multiple_boundaries_crossed) {
+                const bool undo_flush = commit_pos <= first_boundary;
+                if (undo_flush) {
+                    for (DeepSeek4LayerCache & lc : target_cache.layers) {
+                        deepseek4_spec_restore_seed_row(
+                            backend, lc.attn_compressor.state_kv, pos);
+                        deepseek4_spec_restore_seed_row(
+                            backend, lc.attn_compressor.state_score, pos);
+                        deepseek4_spec_restore_seed_row(
+                            backend, lc.indexer_compressor.state_kv, pos);
+                        deepseek4_spec_restore_seed_row(
+                            backend, lc.indexer_compressor.state_score, pos);
+                    }
+                }
+                spec_rollback_apply(
+                    rollback, target_w, target_cache, commit_pos, undo_flush);
+            } else {
+                spec_rollback_apply(
+                    rollback, target_w, target_cache, pos, true);
+                std::vector<int32_t> kv_toks;
+                kv_toks.reserve((size_t) accept);
+                kv_toks.push_back(lt);
+                for (int i = 1; i < accept; ++i) {
+                    kv_toks.push_back(draft_tok[i]);
+                }
+                int replay_last = -1;
+                std::vector<int32_t> replay_am;
+                if (!target.verify_batch(
+                        kv_toks, pos, replay_last, &replay_am)) {
+                    std::fprintf(stderr,
+                                 "[ds4-spec] wide rollback replay failed\n");
+                    ok = false;
+                    break;
+                }
             }
         } else if (!full_snap && accept < q) {
             // The prev-half flush is bad only if the boundary sits at-or-past
@@ -1120,13 +1296,24 @@ bool run_deepseek4_dspark_spec_decode(
         t0 = SpecClock::now();
         const std::vector<float> & feats = target.last_features();
         const int fN = full_snap ? target.last_verify_n() : accept;
-        for (int i = 0; i < fN; i++) push_feature(feats.data() + (size_t) i * feat_row);
+        push_features(feats.data(), fN);
         tm_feat += spec_ms_since(t0);
+        width_controller.observe(
+            accept, q, (float) spec_ms_since(step_t0));
+        if (use_confidence_width) {
+            width_controller.observe_confidence(draft_confidence, accept, q);
+        }
 
         // Output tokens this step = accepted candidates + bonus.
         bool hit_eos = false;
         for (int i = 1; i <= accept; i++) {
             const int t = (i < accept) ? draft_tok[i] : bonus;
+            if (token_trace) {
+                std::fprintf(stderr,
+                             "[ds4-spec-token] out=%d step=%ld slot=%d token=%d%s\n",
+                             n_generated, steps, i, t,
+                             i == accept ? " bonus" : "");
+            }
             out_tokens.push_back(t);
             n_generated++;
             if (on_token && !on_token(t)) {
@@ -1140,7 +1327,6 @@ bool run_deepseek4_dspark_spec_decode(
         lt = bonus;                    // deferred bonus becomes next seed
         accept_sum += matched;
         offered_sum += q - 1;
-        width_controller.observe(accept, q);
         steps++;
         if (timing && (steps <= 4 || (steps & 31) == 0)) {
             std::fprintf(stderr,
@@ -1168,6 +1354,29 @@ bool run_deepseek4_dspark_spec_decode(
                  steps ? (double) accept_sum / steps : 0.0,
                  steps ? (double) offered_sum / steps : 0.0, q_cap,
                  (int) full_snap);
+    if (width_controller.enabled()) {
+        std::fprintf(
+            stderr,
+            "[ds4-spec] adaptive widths q2=%ld q3=%ld q4=%ld q5=%ld\n",
+            q_cap >= 2 ? width_steps[2] : 0,
+            q_cap >= 3 ? width_steps[3] : 0,
+            q_cap >= 4 ? width_steps[4] : 0,
+            q_cap >= 5 ? width_steps[5] : 0);
+        if (use_confidence_width) {
+            // Recent predicted against observed acceptance per depth and
+            // the scale the controller applies to the head's scores.
+            std::string line = "[ds4-spec] confidence calibration";
+            char buf[64];
+            for (int d = 1; d < q_cap; ++d) {
+                std::snprintf(buf, sizeof(buf), " d%d pred=%.2f actual=%.2f scale=%.2f",
+                              d, width_controller.confidence_predicted(d),
+                              width_controller.confidence_observed(d),
+                              width_controller.confidence_scale(d));
+                line += buf;
+            }
+            std::fprintf(stderr, "%s\n", line.c_str());
+        }
+    }
     if (steps > 0) {
         std::fprintf(stderr,
             "[ds4-spec-t] TOTAL %.1f ms, %ld steps (%.1f ms/step), %d tok (%.1f tok/s) | "

@@ -56,7 +56,7 @@ ggml_mixed_mmq_policy deepseek4_mix_mmq_prefill_policy(
 
 class DeepSeek4Backend : public ModelBackend {
 public:
-    explicit DeepSeek4Backend(const DeepSeek4BackendConfig & cfg);
+    explicit DeepSeek4Backend(DeepSeek4BackendConfig cfg);
     ~DeepSeek4Backend() override;
 
     DeepSeek4Backend(const DeepSeek4Backend &) = delete;

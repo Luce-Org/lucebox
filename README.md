@@ -53,7 +53,7 @@ Model links open the exact weights used by the measured setup. Drafter links ope
 | [Laguna XS 2.1 33B Q4_K_M](https://huggingface.co/poolside/Laguna-XS-2.1-GGUF/blob/main/Laguna-XS-2.1-Q4_K_M.gguf) + [DFlash Q4 drafter](https://huggingface.co/Lucebox/Laguna-XS-2.1-DFlash-GGUF/blob/main/laguna-xs21-dflash-q4.gguf) | Decode | **1.7×** at 256K |
 | [Gemma 4 26B-A4B Q4_K_M](https://huggingface.co/bartowski/google_gemma-4-26B-A4B-it-GGUF/blob/main/google_gemma-4-26B-A4B-it-Q4_K_M.gguf) + [DFlash Q8_0 drafter](https://huggingface.co/Lucebox/gemma-4-26B-A4B-it-DFlash-GGUF/blob/main/gemma-4-26B-A4B-it-DFlash-q8_0.gguf) | Decode | **1.31×** |
 | [Gemma 4 31B IT Q4_K_M](https://huggingface.co/bartowski/google_gemma-4-31B-it-GGUF/blob/main/google_gemma-4-31B-it-Q4_K_M.gguf) + [DFlash Q8_0 drafter](https://huggingface.co/Lucebox/gemma-4-31B-it-DFlash-GGUF/blob/main/gemma-4-31B-it-DFlash-q8_0.gguf) | Decode | **3.2×** |
-| [DeepSeek V4 Flash ROCmFPX MIX Strix](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-ROCmFP3/blob/main/DeepSeek-V4-Flash-0731-ROCMFPX-MIX-STRIX.gguf) + [DSpark Q4RMFP4 drafter](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-DSpark-GGUF/blob/main/DeepSeek-V4-Flash-0731-DSpark-draft-Q4RMFP4-denseF16.gguf) | Decode | Up to **1.81×** vs target-only, **32.7 vs 18.1 tok/s** |
+| [DeepSeek V4 Flash ROCmFPX MIX Strix](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-ROCmFP3/blob/main/DeepSeek-V4-Flash-0731-ROCMFPX-MIX-STRIX.gguf) + [DSpark Q4RMFP4 drafter](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-DSpark-GGUF/blob/main/DeepSeek-V4-Flash-0731-DSpark-draft-Q4RMFP4-denseF16.gguf) | Decode | **42 tok/s** at 8K and **39 tok/s** on code and math with the plain launch ([PR #729](https://github.com/Luce-Org/lucebox/pull/729)) |
 | [Ling 3.0 Flash 124B-A5.1B Q4_K_M](https://huggingface.co/bloomer010/Ling-3.0-flash-GGUF) | Decode | **34.6 tok/s** median AR on DGX Spark |
 
 ## Tested Machines (GPU/APU)
@@ -78,7 +78,7 @@ The engine is not tied to one reference card. NVIDIA architectures are selected 
 | Hardware | Model | Measured result |
 |---|---|---|
 | **R9700** | [Qwen 3.8 27B UD-IQ4_XS](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/blob/main/Qwen3.8-27B-UD-IQ4_XS.gguf) + [DFlash2 source](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2/blob/main/model.safetensors) | **208.1 tok/s** HumanEval average; **227.8 tok/s** best request |
-| **Strix Halo** | [DeepSeek V4 ROCmFPX MIX Strix](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-ROCmFP3/blob/main/DeepSeek-V4-Flash-0731-ROCMFPX-MIX-STRIX.gguf) + [DSpark Q4RMFP4](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-DSpark-GGUF/blob/main/DeepSeek-V4-Flash-0731-DSpark-draft-Q4RMFP4-denseF16.gguf) | **32.7 tok/s** high-acceptance median; **27.9 tok/s** across the fixed 30-prompt evaluation, using all six routed experts |
+| **Strix Halo** | [DeepSeek V4 ROCmFPX MIX Strix](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-ROCmFP3/blob/main/DeepSeek-V4-Flash-0731-ROCMFPX-MIX-STRIX.gguf) + [DSpark Q4RMFP4](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-DSpark-GGUF/blob/main/DeepSeek-V4-Flash-0731-DSpark-draft-Q4RMFP4-denseF16.gguf) | **42 tok/s** decode and **320 tok/s** prefill at 8K, **36 tok/s** at 123K, **39 tok/s** on code and math, **25 tok/s** on prose, all six routed experts, plain launch ([PR #729](https://github.com/Luce-Org/lucebox/pull/729)) |
 | **RTX 5090** | Qwen 3.8 27B | **110.6 tok/s** for a 26,758-token prompt and 1,024-token continuation ([PR #637](https://github.com/Luce-Org/lucebox/pull/637)) |
 
 ### Heterogeneous and parallel results
@@ -243,6 +243,7 @@ See [Continuous batching in Lucebox](https://www.lucebox.com/blog/continuous-bat
 | Environment variables | [Environment reference](server/docs/ENVIRONMENT.md) |
 | Server internals | [Architecture](server/docs/ARCHITECTURE.md) |
 | Client integration and qualification | [Harness guide](harness/README.md) |
+| Server engine components | [Engine components](server/docs/ENGINE_COMPONENTS.md) |
 
 Benchmarks stay with each implementation: [DFlash](server/RESULTS.md), [PFlash](optimizations/pflash/), [Spark](optimizations/spark/), [KVFlash](optimizations/kvflash/), and [Megakernel](optimizations/megakernel/).
 

@@ -156,6 +156,8 @@ void deepseek4_dspark_draft_wait(ggml_backend_t backend);
 //                 over the hc_mult HC copies after each capture layer
 //                 (concatenated in capture_layer_ids order) — the drafter's
 //                 main_hidden feed.
+//   boundary_checkpoint_out: optional device-resident first-flush state for a
+//                 q5 batch that crosses two ratio-4 boundaries.
 // Advances/updates the target cache exactly like a decode of these tokens.
 bool deepseek4_dspark_verify_forward(ggml_backend_t backend,
                                      int device,
@@ -173,7 +175,9 @@ bool deepseek4_dspark_verify_forward(ggml_backend_t backend,
                                      bool allow_graph_reuse = false,
                                      MoeHybridStorage * moe_hybrid = nullptr,
                                      MoeExpertComputeRuntime * expert_runtime = nullptr,
-                                     MoeHybridRoutingStats * routing_stats = nullptr);
+                                     MoeHybridRoutingStats * routing_stats = nullptr,
+                                     DeepSeek4SpecBoundaryCheckpoint *
+                                         boundary_checkpoint_out = nullptr);
 
 // Minimal speculative-decode rollback state. Rejected positions must restore
 // the physical SWA rows they overwrote after the ring wraps; otherwise a later
@@ -225,6 +229,41 @@ void deepseek4_spec_rollback_apply(const DeepSeek4SpecRollback & rollback,
                                    DeepSeek4Cache & cache,
                                    int commit_pos,
                                    bool restore_prev);
+
+// The rolling compressor that speculative rollback tracks pools every
+// DS4_SPEC_ROLLING_RATIO positions, flushing after positions 3, 7, 11, ...
+// (its [comp_width, 8] state in spec_rollback_save is two such windows).
+inline constexpr int DS4_SPEC_ROLLING_RATIO = 4;
+
+// First ratio-4 boundary position at or after base_pos (p % 4 == 3).
+// base_pos must be non-negative; the ratio is a power of two.
+inline int deepseek4_first_ratio4_boundary(int base_pos) {
+    return base_pos + (DS4_SPEC_ROLLING_RATIO - 1 -
+                       (base_pos & (DS4_SPEC_ROLLING_RATIO - 1)));
+}
+
+// A ratio-4 rolling state is [width, 8]: rows 0..3 hold the previous
+// completed window, rows 4..7 the current window indexed by position % 4.
+// When a verify crosses one ratio-4 boundary, the graph rotates the completed
+// window (seed row included) into rows 0..3 before the post-boundary tail
+// writes rows 4.. again; with five tokens the fifth token's slot is the seed's.
+// If that flush must be undone on a rejection, the seed's current-window row
+// is recovered from the rotated copy: copy row (pos % 4) to row 4 + (pos % 4).
+// Must run before the previous half is restored from the pre-verify snapshot.
+// Returns false when the tensor is not a ratio-4 rolling state.
+bool deepseek4_spec_restore_seed_row(ggml_backend_t backend, ggml_tensor * state,
+                                     int seed_pos);
+
+// A rejected speculative batch only needs target replay when it touched more
+// than one ratio-4 boundary: with one boundary the compact rollback can
+// either retain the committed flush or restore the pre-verify half directly.
+inline bool deepseek4_verify_crosses_multiple_ratio4_boundaries(
+        int base_pos, int n_tokens) {
+    if (base_pos < 0 || n_tokens <= 0) return false;
+    const int last_pos = base_pos + n_tokens - 1;
+    return deepseek4_first_ratio4_boundary(base_pos) +
+               DS4_SPEC_ROLLING_RATIO <= last_pos;
+}
 
 // Run DSpark speculative decode: draft block_size candidates with `drafter`,
 // verify against the DS4 target in one batched forward, accept the matching
