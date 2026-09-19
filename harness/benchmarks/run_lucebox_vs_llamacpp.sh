@@ -24,7 +24,7 @@ FA_WINDOW="${FA_WINDOW:-0}"
 # laguna); set explicitly to experiment.
 CACHE_TYPE_K="${CACHE_TYPE_K:-}"
 CACHE_TYPE_V="${CACHE_TYPE_V:-}"
-EXTRA_SERVER_ARGS="${EXTRA_SERVER_ARGS:---lazy-draft}"
+EXTRA_SERVER_ARGS="${EXTRA_SERVER_ARGS:-}"
 LLAMA_N_GPU_LAYERS="${LLAMA_N_GPU_LAYERS:-999}"
 MODEL_ID="${MODEL_ID:-luce-dflash}"
 LLAMA_MODEL_ID="${LLAMA_MODEL_ID:-llama-cpp}"

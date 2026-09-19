@@ -1,0 +1,7 @@
+{
+  "/opt/lucebox-concurrent/server/build-hip/dflash_server": "65fa8f1e0c5b21543c9e98b1725130bc0386f07a05b4fc481637dfce4ee35ffd",
+  "/opt/lucebox/work/swift-mtp/build/bin/llama-server": "dba852e7e0c5e3dd11928df23ff8230d4943fe748261825d2dc382605a3eb076",
+  "/opt/lucebox/work/swift-mtp/frozen-template.jinja": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041",
+  "model_sha256": "f717f0ef80a3c814bdd8650cc3e404dd0441056afb46770932a9c5051e444d6c",
+  "llama_commit": "fa6769818708afd9807b22183ccda112fd563427"
+}

@@ -189,11 +189,7 @@ std::string check_feature_compatibility(
         args.device.gpu == args.draft_device.gpu &&
         args.fa_window == 0;
 
-    if (concurrent_local_chain &&
-        admission.draft_residency == DraftResidencyPolicy::RequestScoped) {
-        return "concurrent DFlash2 does not support "
-               "--draft-residency=request-scoped";
-    }
+
 
     // ── --paged-attention × architecture, placement, and decode features
     // Paged decode swaps the contiguous K/V cache for a block table owned by

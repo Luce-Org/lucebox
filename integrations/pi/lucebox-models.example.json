@@ -1,0 +1,162 @@
+{
+  "providers": {
+    "lucebox": {
+      "api": "openai-completions",
+      "apiKey": "local-not-secret",
+      "baseUrl": "http://192.168.2.191:8216/v1",
+      "models": [
+        {
+          "compat": {
+            "maxTokensField": "max_tokens",
+            "supportsDeveloperRole": false,
+            "supportsReasoningEffort": true,
+            "supportsUsageInStreaming": false,
+            "thinkingFormat": "openai",
+            "sendSessionAffinityHeaders": true
+          },
+          "contextWindow": 80000,
+          "cost": {
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "input": 0,
+            "output": 0
+          },
+          "id": "qwen3.8-27b-swift",
+          "input": [
+            "text"
+          ],
+          "maxTokens": 32768,
+          "name": "Qwen3.8-27B Swift",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "high": "high",
+            "low": "low",
+            "medium": "medium",
+            "minimal": "low",
+            "xhigh": "xhigh"
+          }
+        },
+        {
+          "compat": {
+            "maxTokensField": "max_tokens",
+            "supportsDeveloperRole": false,
+            "supportsReasoningEffort": true,
+            "supportsUsageInStreaming": false,
+            "thinkingFormat": "openai",
+            "sendSessionAffinityHeaders": true
+          },
+          "contextWindow": 80000,
+          "cost": {
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "input": 0,
+            "output": 0
+          },
+          "id": "qwen3.8-27b",
+          "input": [
+            "text"
+          ],
+          "maxTokens": 32768,
+          "name": "Qwen3.8-27B Swift (compatibility alias)",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "high": "high",
+            "low": "low",
+            "medium": "medium",
+            "minimal": "low",
+            "xhigh": "xhigh"
+          }
+        },
+        {
+          "compat": {
+            "maxTokensField": "max_tokens",
+            "supportsDeveloperRole": false,
+            "supportsReasoningEffort": true,
+            "supportsUsageInStreaming": false,
+            "thinkingFormat": "openai",
+            "sendSessionAffinityHeaders": true
+          },
+          "contextWindow": 80000,
+          "cost": {
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "input": 0,
+            "output": 0
+          },
+          "id": "qwen3.8-27b-pflash",
+          "input": [
+            "text"
+          ],
+          "maxTokens": 32768,
+          "name": "Qwen3.8-27B Swift PFlash (compatibility alias)",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "high": "high",
+            "low": "low",
+            "medium": "medium",
+            "minimal": "low",
+            "xhigh": "xhigh"
+          }
+        },
+        {
+          "compat": {
+            "maxTokensField": "max_tokens",
+            "supportsDeveloperRole": false,
+            "supportsReasoningEffort": true,
+            "supportsUsageInStreaming": false,
+            "thinkingFormat": "openai",
+            "sendSessionAffinityHeaders": true
+          },
+          "contextWindow": 131072,
+          "cost": {
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "input": 0,
+            "output": 0
+          },
+          "id": "qwen3.8-27b-abliterated",
+          "input": [
+            "text"
+          ],
+          "maxTokens": 32768,
+          "name": "Qwen3.8-27B DFlash2 Abliterated",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "high": "high",
+            "low": "low",
+            "medium": "medium",
+            "minimal": "low",
+            "xhigh": "xhigh"
+          }
+        },
+        {
+          "compat": {
+            "maxTokensField": "max_tokens",
+            "supportsDeveloperRole": false,
+            "supportsReasoningEffort": true,
+            "supportsUsageInStreaming": false,
+            "thinkingFormat": "openai",
+            "sendSessionAffinityHeaders": true
+          },
+          "contextWindow": 131072,
+          "cost": {
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "input": 0,
+            "output": 0
+          },
+          "id": "gemma-4-26b-a4b",
+          "input": [
+            "text"
+          ],
+          "maxTokens": 32768,
+          "name": "Gemma4 26B-A4B DFlash2",
+          "reasoning": true
+        }
+      ],
+      "compat": {
+        "sendSessionAffinityHeaders": true
+      }
+    }
+  }
+}

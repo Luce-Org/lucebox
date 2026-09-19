@@ -1,5 +1,6 @@
 #include "CppUnitTestFramework.hpp"
 #include "internal.h"
+#include "common/snapshot_migrate.h"
 #include "qwen35/graph_builders.h"
 
 #include "ggml-backend.h"
@@ -7,6 +8,8 @@
 #include "ggml.h"
 
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <vector>
 
 using namespace CppUnitTestFramework;
@@ -265,7 +268,16 @@ TEST_CASE(RecurrentSnapshotFixture, snapshot_and_restore_recurrent_state) {
 }
 
 TEST_CASE(RecurrentSnapshotFixture, copied_paged_prefix_uses_fresh_pages) {
-    ggml_backend_t backend = ggml_backend_cpu_init();
+    ggml_backend_t backend = nullptr;
+    if (std::getenv("TEST_SNAPSHOT_GPU")) {
+        ggml_backend_load_all();
+        auto device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        CHECK(device != nullptr);
+        if (!device) return;
+        backend = ggml_backend_dev_init(device, nullptr);
+    } else {
+        backend = ggml_backend_cpu_init();
+    }
     CHECK(backend != nullptr);
     if (!backend) SKIP("CPU backend is unavailable");
 
@@ -334,11 +346,11 @@ TEST_CASE(RecurrentSnapshotFixture, copied_paged_prefix_uses_fresh_pages) {
     CHECK(snap.layout == PrefixSnapshot::Layout::paged &&
           snap.cur_pos == 20);
     CHECK(ggml_backend_buffer_get_size(snap.buf) == estimated_bytes);
-    // Paged copies use get/set with snapshot tensor data as host staging.
-    // Keep that storage on a true CPU buffer, including on unified-memory
-    // compute backends.
+    const char * requested = std::getenv("DFLASH_PREFIX_CACHE_DEVICE");
+    const bool device_snapshot = requested && std::strcmp(requested, "gpu") == 0;
     CHECK(ggml_backend_buffer_get_type(snap.buf) ==
-          ggml_backend_cpu_buffer_type());
+          (device_snapshot ? ggml_backend_get_default_buffer_type(backend)
+                           : ggml_backend_cpu_buffer_type()));
 
     // An incomplete per-layer pair is invalid topology and must not replace
     // the committed payload.
@@ -396,4 +408,77 @@ TEST_CASE(RecurrentSnapshotFixture, copied_paged_prefix_uses_fresh_pages) {
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
     ggml_backend_free(backend);
+}
+
+TEST_CASE(RecurrentSnapshotFixture, dense_snapshot_device_roundtrip) {
+    ggml_backend_t backend = nullptr;
+    if (std::getenv("TEST_SNAPSHOT_GPU")) {
+        ggml_backend_load_all();
+        auto device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        CHECK(device != nullptr);
+        if (!device) return;
+        backend = ggml_backend_dev_init(device, nullptr);
+    } else backend = ggml_backend_cpu_init();
+    CHECK(backend != nullptr);
+    if (!backend) return;
+    ggml_init_params params{};
+    params.mem_size = 16 * ggml_tensor_overhead(); params.no_alloc = true;
+    auto ctx = ggml_init(params);
+    auto k = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 16, 2);
+    auto v = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 16, 2);
+    auto ss = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 2, 2);
+    auto cv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 3, 2);
+    auto tf = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2, 16);
+    auto buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    CHECK(buffer != nullptr);
+    if (!buffer) { ggml_free(ctx); ggml_backend_free(backend); return; }
+    std::vector<ggml_tensor *> tensors{k,v,ss,cv,tf};
+    std::vector<std::vector<float>> originals;
+    int serial = 1;
+    for (auto t : tensors) {
+        std::vector<float> a(ggml_nelements(t));
+        for (auto & x : a) x = float(serial++);
+        set_tensor(t,a); originals.push_back(a);
+    }
+    dflash::common::TargetWeights weights;
+    weights.n_layer = 2; weights.full_attention_interval = 2;
+    TargetCache cache;
+    cache.backend = backend; cache.cur_pos = 7; cache.max_ctx = 16;
+    cache.target_feat_cap = 16; cache.kv_k_type = GGML_TYPE_F32;
+    cache.attn_k = {k}; cache.attn_v = {v};
+    cache.ssm_state = {ss}; cache.conv_state = {cv}; cache.target_feat = tf;
+    PrefixSnapshot snapshot;
+    CHECK(dflash::common::snapshot_target_cache(weights,cache,backend,snapshot));
+    CHECK(ggml_backend_buffer_is_host(snapshot.buf) ==
+          ggml_backend_buft_is_host(ggml_backend_get_default_buffer_type(backend)));
+    for (auto t : tensors) set_tensor(t,std::vector<float>(ggml_nelements(t),-1));
+    CHECK(dflash::common::restore_target_cache(snapshot,cache));
+    for (int n=0;n<2;++n) {
+        auto actual=get_tensor(tensors[n]);
+        for (int h=0;h<2;++h) for (int i=0;i<32;++i)
+            CHECK(actual[h*32+i] == (i<14 ? originals[n][h*32+i] : -1));
+    }
+    CHECK(get_tensor(ss)==originals[2]); CHECK(get_tensor(cv)==originals[3]);
+    auto actual=get_tensor(tf);
+    for (int i=0;i<32;++i) CHECK(actual[i] == (i<14 ? originals[4][i] : -1));
+    free_prefix_snapshot(snapshot);
+    ggml_backend_buffer_free(buffer); ggml_free(ctx); ggml_backend_free(backend);
+}
+
+TEST_CASE(RecurrentSnapshotFixture, verified_snapshot_copy_keeps_source_alive) {
+    auto backend=ggml_backend_cpu_init();CHECK(backend);
+    auto ctx=ggml_init({ggml_tensor_overhead()*4,nullptr,true});CHECK(ctx);
+    auto tensor=ggml_new_tensor_2d(ctx,GGML_TYPE_F32,17,31);ggml_set_name(tensor,"state");
+    auto buffer=ggml_backend_alloc_ctx_tensors(ctx,backend);CHECK(buffer);
+    std::vector<float> expected(17*31);for(int i=0;i<(int)expected.size();++i)expected[i]=i*.25f;
+    set_tensor(tensor,expected);
+    {
+        dflash::common::SnapshotCopy copy;CHECK(copy.copy(ctx,backend));
+        CHECK(get_tensor(ggml_get_tensor(copy.ctx,"state"))==expected);
+        CHECK(get_tensor(tensor)==expected);
+        std::vector<float> changed(expected.size(),-1);set_tensor(ggml_get_tensor(copy.ctx,"state"),changed);
+        CHECK(get_tensor(tensor)==expected);
+    }
+    CHECK(get_tensor(tensor)==expected);
+    ggml_backend_buffer_free(buffer);ggml_free(ctx);ggml_backend_free(backend);
 }

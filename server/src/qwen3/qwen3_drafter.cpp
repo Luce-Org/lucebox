@@ -275,7 +275,8 @@ static std::vector<int32_t> qwen35_score_and_compress(
     int chunk_size,
     int n_lookahead,
     int pool_kernel,
-    int score_query_end) {
+    int score_query_end,
+    const std::function<bool()> & cancelled) {
 
     const int S = (int)ids.size();
     const int hidden = w.n_embd;
@@ -286,6 +287,14 @@ static std::vector<int32_t> qwen35_score_and_compress(
         return {};
     }
     const int query_start = query_end - n_lookahead;
+    auto interrupted = [&]() {
+        if (cancelled && cancelled()) {
+            set_last_error("compression cancelled");
+            return true;
+        }
+        return false;
+    };
+    if (interrupted()) return {};
 
     auto t0 = std::chrono::steady_clock::now();
     std::vector<float> running_max((size_t)n_lookahead * S, -INFINITY);
@@ -342,6 +351,10 @@ static std::vector<int32_t> qwen35_score_and_compress(
         const int batch = 2048;
         std::vector<float> emb((size_t)hidden * batch);
         for (int i = 0; i < S; i += batch) {
+            if (interrupted()) {
+                ggml_backend_buffer_free(act_buf); ggml_free(act_ctx); free_target_cache(cache);
+                return {};
+            }
             const int n = std::min(batch, S - i);
             if (!w.embedder.embed(ids.data() + i, n, emb.data())) {
                 ggml_backend_buffer_free(act_buf); ggml_free(act_ctx); free_target_cache(cache);
@@ -361,6 +374,10 @@ static std::vector<int32_t> qwen35_score_and_compress(
             for (int k = 0; k < il; ++k) if (((k + 1) % w.full_attention_interval) == 0) ++fa_idx;
         }
         for (int start = 0; start < S; start += ubatch) {
+            if (interrupted()) {
+                ggml_gallocr_free(alloc); ggml_backend_buffer_free(act_buf); ggml_free(act_ctx); free_target_cache(cache);
+                return {};
+            }
             const int n = std::min(ubatch, S - start);
             const int kv_len = start + n;
 
@@ -702,6 +719,18 @@ static std::vector<int32_t> qwen35_score_and_compress(
     return out_ids;
 }
 
+std::vector<DrafterScoreWindow> plan_drafter_score_windows(
+        int total, int query_end, int window, int overlap) {
+    std::vector<DrafterScoreWindow> result;
+    if (total < 0 || query_end < 0 || query_end > total || window <= 0 ||
+        overlap < 0) return result;
+    for (int start = 0; start < query_end; start += window) {
+        result.push_back({start, std::min(query_end, start + window),
+                          std::max(0, start - overlap)});
+    }
+    return result;
+}
+
 std::vector<int32_t> drafter_score_and_compress(
     DrafterContext & ctx,
     const std::vector<int32_t> & ids,
@@ -709,7 +738,12 @@ std::vector<int32_t> drafter_score_and_compress(
     int chunk_size,
     int n_lookahead,
     int pool_kernel,
-    int score_query_end) {
+    int score_query_end, const std::function<bool()>& cancelled) {
+    auto interrupted=[&]() {
+        if(cancelled && cancelled()){set_last_error("compression cancelled");return true;}
+        return false;
+    };
+    if(interrupted())return {};
     if (!ctx.loaded) {
         set_last_error("drafter not loaded");
         return {};
@@ -725,7 +759,8 @@ std::vector<int32_t> drafter_score_and_compress(
         }
         auto * st = static_cast<Qwen35DrafterState *>(ctx.arch_state);
         return qwen35_score_and_compress(st->weights, ids, keep_ratio, chunk_size,
-                                         n_lookahead, pool_kernel, score_query_end);
+                                         n_lookahead, pool_kernel, score_query_end,
+                                         cancelled);
     }
     const int S = (int)ids.size();
     if (S < n_lookahead + 1) {
@@ -736,10 +771,49 @@ std::vector<int32_t> drafter_score_and_compress(
     // ── 1. Custom forward + GPU tail-attention scoring ────────────────
     auto t0 = std::chrono::steady_clock::now();
     std::vector<float> running_max;
-    if (!forward_qwen3_drafter_model(
+    const int window = env_int("DFLASH_COMPRESS_SCORE_WINDOW", 0);
+    if (window >= 512 && window <= 65536 && S > window && n_lookahead > 0) {
+        const int query_end = score_query_end < 0 ? S : score_query_end;
+        if (query_end > S || query_end < n_lookahead) {
+            set_last_error("windowed scorer query out of range");
+            return {};
+        }
+        const int query_start = query_end - n_lookahead;
+        running_max.assign((size_t)n_lookahead * S, 0.0f);
+        int windows = 0;
+        // Tokens after query_end are a rendered suffix. The full scorer masks
+        // them from the query rows, so never place them before the duplicated
+        // query in a later window. Their initialized zero scores are retained.
+        for (const auto & score_window :
+             plan_drafter_score_windows(S, query_end, window)) {
+            if(interrupted())return {};
+            const int start = score_window.start;
+            const int end = score_window.end;
+            const int context_start = score_window.context_start;
+            std::vector<int32_t> local(ids.begin() + context_start, ids.begin() + end);
+            local.insert(local.end(), ids.begin() + query_start, ids.begin() + query_end);
+            std::vector<float> scores;
+            if (!forward_qwen3_drafter_model(ctx.weights, local, n_lookahead,
+                                             scores, (int)local.size())) return {};
+            if (scores.size() != (size_t)n_lookahead * local.size()) {
+                set_last_error("windowed scorer output shape mismatch");
+                return {};
+            }
+            for (int t = 0; t < n_lookahead; ++t) {
+                for (int j = start; j < end; ++j) {
+                    running_max[(size_t)t * S + j] =
+                        scores[(size_t)t * local.size() + j - context_start];
+                }
+            }
+            ++windows;
+        }
+        std::fprintf(stderr,"[windowed-score] tokens=%d window=%d overlap=512 windows=%d\n",
+                     S,window,windows);
+    } else if (!forward_qwen3_drafter_model(
             ctx.weights, ids, n_lookahead, running_max, score_query_end)) {
         return {};
     }
+    if(interrupted())return {};
     auto t1 = std::chrono::steady_clock::now();
     std::fprintf(stderr, "[drafter] forward+score in %.2fs S=%d\n",
         std::chrono::duration<double>(t1 - t0).count(), S);

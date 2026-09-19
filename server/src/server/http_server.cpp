@@ -17,6 +17,7 @@
 #endif
 
 #include "http_server.h"
+#include "hybrid_regions.h"
 #include "engine/luce_engine.h"
 #include "admission.h"
 #include "common/concurrency/seq_engine.h"
@@ -265,6 +266,18 @@ static float pflash_keep_ratio(const ServerConfig & cfg, int n_tokens) {
 }
 
 namespace http_detail {
+
+bool request_allows_pflash_compression(const json & body) {
+    if (!body.is_object() || !body.contains("extra_body")) return true;
+    const auto & extra = body["extra_body"];
+    if (!extra.is_object() || !extra.contains("lucebox_cache")) return true;
+    const auto & cache = extra["lucebox_cache"];
+    if (!cache.is_object() || !cache.contains("mode") ||
+        !cache["mode"].is_string()) {
+        return true;
+    }
+    return cache["mode"].get<std::string>() != "exact";
+}
 
 int flowkv_activation_threshold(const ServerConfig & config) {
     return config.pflash_mode == ServerConfig::PflashMode::ALWAYS
@@ -793,7 +806,7 @@ json build_props_body(const ServerConfig & config,
             {"bsa_enabled",  nullptr},
             {"bsa_alpha",    nullptr},
             {"lm_head_fix",  nullptr},
-            {"draft_residency", draft_residency_policy_name(config.draft_residency)},
+            {"draft_residency", "release-after-use"},
         };
     } else {
         const char * bsa_env = std::getenv("DFLASH_FP_USE_BSA");
@@ -819,7 +832,7 @@ json build_props_body(const ServerConfig & config,
             {"bsa_enabled",  (bsa_env != nullptr && *bsa_env && std::strcmp(bsa_env, "0") != 0)},
             {"bsa_alpha",    bsa_alpha},
             {"lm_head_fix",  (lmfix_env != nullptr && *lmfix_env && std::strcmp(lmfix_env, "0") != 0)},
-            {"draft_residency", draft_residency_policy_name(config.draft_residency)},
+            {"draft_residency", "release-after-use"},
         };
     }
 
@@ -856,8 +869,7 @@ json build_props_body(const ServerConfig & config,
             {"fa_window",       config.fa_window},
             {"kv_cache_k",      config.kv_cache_k},
             {"kv_cache_v",      config.kv_cache_v},
-            {"lazy_draft",      config.lazy_draft},
-            {"draft_residency", draft_residency_policy_name(config.draft_residency)},
+            {"draft_residency", "persistent"},
             {"target_sharding", config.target_sharding},
             // Prefill chunk size (bargs.chunk). Surfaced so snapshot
             // tooling captures the full config — bench consumers
@@ -920,6 +932,14 @@ json build_props_body(const ServerConfig & config,
         }},
         {"pflash", pflash},
         {"prefix_cache", {
+            {"storage", config.concurrent_paged_prefix_cache
+                ? ((std::getenv("DFLASH_PREFIX_CACHE_DEVICE") &&
+                    std::strcmp(std::getenv("DFLASH_PREFIX_CACHE_DEVICE"), "gpu") == 0)
+                    ? "gpu" : "cpu") : "backend-default"},
+            {"mode", config.concurrent_paged_prefix_cache && config.session_prefix_cache_max_tokens > 0
+                ? "session-rolling" : "shared-prefix"},
+            {"session_max_tokens", config.concurrent_paged_prefix_cache
+                ? config.session_prefix_cache_max_tokens : 0},
             {"capacity",           pcs.capacity},
             {"in_use",             pcs.in_use},
             {"lifetime_hits",      pcs.lifetime_hits},
@@ -1069,6 +1089,7 @@ std::vector<ChatMessage> normalize_chat_messages(
             bool replayed = false;
             if (cm.role == "assistant" && m.contains("tool_calls") &&
                 m["tool_calls"].is_array() && !m["tool_calls"].empty()) {
+                cm.tool_calls_json = m["tool_calls"].dump();
                 std::vector<std::string> call_ids;
                 for (const auto & tc : m["tool_calls"]) {
                     std::string id = tc.value("id", "");
@@ -1238,7 +1259,8 @@ HttpServer::HttpServer(dflash::engine::LuceEngine & engine,
     , chat_format_(ChatFormat::QWEN3)  // default, overridden by arch
     , prefix_cache_(config.prefix_cache_cap, tokenizer,
           config.concurrent_paged_prefix_cache
-              ? config.concurrent_prefix_cache_max_bytes : 0)
+              ? config.concurrent_prefix_cache_max_bytes : 0,
+          config.concurrent_paged_prefix_cache ? config.session_prefix_cache_max_tokens : 0)
     , disk_cache_({config.disk_cache_dir,
                    config.disk_cache_budget_mb * (size_t)(1024 * 1024),
                    config.disk_cache_min_tokens,
@@ -1249,6 +1271,22 @@ HttpServer::HttpServer(dflash::engine::LuceEngine & engine,
     curl_global_init(CURL_GLOBAL_DEFAULT);
     #endif
     prefix_cache_.init_full_cache(config.prefill_cache_cap);
+    const char *hybrid_mode=std::getenv("DFLASH_HYBRID_CACHE");
+    hybrid_enabled_=hybrid_mode && std::string(hybrid_mode)!="off";
+    hybrid_shadow_=hybrid_mode && std::string(hybrid_mode)=="shadow";
+    if(hybrid_enabled_ && !config_.pflash_upstream_base.empty())
+        throw std::invalid_argument("Hybrid cache requires a local backend; upstream routing is unsupported");
+    if(hybrid_enabled_) {
+        if(const char* budget=std::getenv("DFLASH_HYBRID_GPU_CHECKPOINT_MIB")) {
+            const auto mib=std::stoull(budget);
+            if(!mib || mib>9216)throw std::invalid_argument("GPU checkpoint budget must be 1..9216 MiB");
+            hybrid_cache_.gpu_checkpoint_budget=mib*1024*1024;
+        }
+        const char *cal=std::getenv("DFLASH_HYBRID_CALIBRATION");
+        hybrid_cache_.load_calibration(cal?cal:"");
+        publish_hybrid(json::object());
+    }
+
     // Fold model+config identity into the layout fingerprint BEFORE init()
     // so compute_layout_id sees it on every learn/verify call. Prevents stale
     // KV hits when the server restarts over the same --kv-cache-dir with a
@@ -1759,6 +1797,12 @@ void HttpServer::handle_client(SocketHandle fd) {
     }
 
     // Introspection: server config + cache stats + arch + capabilities.
+    if (hr.method == "GET" && hr.path == "/cache/status") {
+        std::lock_guard<std::mutex> lock(hybrid_stats_mutex_);
+        send_response(fd,200,"application/json",hybrid_stats_.dump()+"\n");
+        socket_close(fd);
+        return;
+    }
     if (hr.method == "GET" && hr.path == "/props") {
         json body = build_props_body(config_, prefix_cache_, tool_memory_);
         send_response(fd, 200, "application/json", body.dump() + "\n");
@@ -1985,6 +2029,10 @@ bool HttpServer::parse_common_request_fields(
     // visible reply after thinking.
     req.max_output =
         resolve_max_output_tokens(body, config_.default_max_tokens);
+    if (hybrid_enabled_ && req.max_output > config_.default_max_tokens) {
+        send_error(fd, 400, "Requested output capacity exceeds the server output limit");
+        return false;
+    }
     // Spec §4.4: clamp request max_tokens to --default-max-tokens.
     if (req.max_output > config_.default_max_tokens) {
         std::fprintf(stderr,
@@ -2300,7 +2348,7 @@ bool HttpServer::render_messages_to_text(
             rendered = render_chat_template_jinja(
                 config_.chat_template_src, chat_messages, bos, eos,
                 add_generation_prompt,
-                req.thinking_enabled, tools_json);
+                req.thinking_enabled, tools_json, req.reasoning_effort);
         } catch (const std::exception & e) {
             error = std::string("chat template (jinja) render failed: ") + e.what();
             return false;
@@ -2335,9 +2383,11 @@ bool HttpServer::render_and_tokenize_request(
 bool HttpServer::validate_request_context(
         SocketHandle fd, const ParsedRequest & req, bool send_failure) {
     const int prompt_tokens = (int) req.prompt_tokens.size();
+    if(hybrid_enabled_)return true; // Per-candidate effective context/output validation on worker.
     const bool pflash_will_run =
         config_.pflash_mode != ServerConfig::PflashMode::OFF &&
         drafter_tokenizer_ != nullptr &&
+        http_detail::request_allows_pflash_compression(req.raw_body) &&
         (config_.pflash_mode == ServerConfig::PflashMode::ALWAYS ||
          prompt_tokens >= config_.pflash_threshold);
     if (!should_reject_oversized(
@@ -2412,6 +2462,12 @@ bool HttpServer::route_request(SocketHandle fd, const HttpRequest & hr) {
     bool count_tokens_only = false;
     try {
         req.raw_body = json::parse(hr.body);
+        if(hr.path=="/cache/release" && hybrid_enabled_) {
+            req.hybrid_release=true;req.stream=false;req.format=ApiFormat::OPENAI_CHAT;
+            req.session_id=req.raw_body.at("owner").get<std::string>();
+            if(req.session_id.empty()||req.session_id.size()>256){send_error(fd,400,"invalid owner");return true;}
+            enqueue_request_and_wait(fd,std::move(req));return true;
+        }
         if (!parse_endpoint_request(
                 hr.path, req.raw_body, req, count_tokens_only)) return false;
         return models_.empty()
@@ -2434,8 +2490,12 @@ bool HttpServer::handle_model_request(SocketHandle fd, ParsedRequest & req,
         // Reasoning must be applied BEFORE rendering: the template injects
         // the empty <think>\n\n</think>\n\n block when thinking is disabled.
         apply_request_reasoning(body, config_, req);
-        // Bandit: parse session_id from extra_body (opt-in adaptive keep_ratio).
-        req.session_id = parse_session_id_from_body(body);
+        // The upstream compression proxy is content-addressed and deliberately
+        // has no per-chat ownership or adaptive retention policy.  Keep the
+        // legacy session bandit available only for the self-hosted backend.
+        req.session_id = config_.pflash_upstream_base.empty()
+            ? parse_session_id_from_body(body)
+            : std::string{};
 
         // PPP rearrange (optional): peel ephemeral system banners into a
         // following system message so the first chat boundary is stable.
@@ -2980,13 +3040,7 @@ void HttpServer::apply_flowkv_compression(
     json modified_messages = req.messages;
     bool any_compressed = false;
     int cache_hits = 0;
-    const auto residency_action = resolve_draft_residency_action(
-        config_.draft_residency,
-        DraftResidencyContext{
-            DraftResidencyUse::PFlashCompress,
-            config_.lazy_draft,
-            !config_.draft_path.empty(),
-        });
+    const auto residency_action = DraftResidencyAction::ReleaseAfterUse;
 
     std::vector<ModelBackend::CompressRequest> compress_requests;
     std::vector<int> compress_message_indices;
@@ -3182,13 +3236,7 @@ std::string HttpServer::apply_pflash_compression(
     compress_request.drafter_path = config_.pflash_drafter_path;
     compress_request.drafter_gpu = config_.pflash_drafter_gpu;
     compress_request.skip_park = config_.pflash_skip_park;
-    const auto residency = resolve_draft_residency_action(
-        config_.draft_residency,
-        DraftResidencyContext{
-            DraftResidencyUse::PFlashCompress,
-            config_.lazy_draft,
-            !config_.draft_path.empty(),
-        });
+    const auto residency = DraftResidencyAction::ReleaseAfterUse;
     compress_request.residency_action = residency;
 
     ModelBackend::CompressResult result;
@@ -3264,10 +3312,12 @@ std::string HttpServer::apply_pflash_compression(
 
 HttpServer::PreparedPrompt HttpServer::prepare_prompt(
         const ParsedRequest & req) {
+    if(hybrid_enabled_)return prepare_hybrid_prompt(req);
     PreparedPrompt prepared;
     prepared.tokens = req.prompt_tokens;
 
     if (config_.pflash_mode != ServerConfig::PflashMode::OFF &&
+        http_detail::request_allows_pflash_compression(req.raw_body) &&
         drafter_tokenizer_ != nullptr) {
         const int prompt_tokens = (int) req.prompt_tokens.size();
         bool should_compress =
@@ -3397,6 +3447,25 @@ bool HttpServer::forward_upstream(
 HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
         const ParsedRequest & req, PreparedPrompt & prepared,
         GenerateRequest & generate_request) {
+    if(prepared.hybrid) {
+        GenerationCacheState cache;
+        cache.cache_slot=prepared.hybrid_source;cache.using_restore=cache.cache_slot>=0;
+        cache.prefix_len=cache.using_restore?backend_.snapshot_cur_pos(cache.cache_slot):0;
+        // The selected transaction already reserved replacement bytes and chose a
+        // free destination. Capture scheduling performs no extra eviction or migration.
+        const auto& capture=prepared.hybrid_capture;
+        if(capture.slot>=0 && !hybrid_cache_.find(capture.slot)) {
+            cache.snap_slot=capture.slot;cache.snap_cut=capture.requested;cache.snap_prepared=true;
+            cache.hybrid_capture_primary=capture.primary;
+            generate_request.snap_slot=capture.slot;generate_request.snap_pos=capture.requested;
+        }
+        prepared.hybrid_trace["capture_primary"]=cache.hybrid_capture_primary;
+        prepared.hybrid_trace["capture_slot"]=cache.snap_slot;
+        prepared.hybrid_trace["capture_requested"]=cache.snap_cut;
+        prepared.hybrid_trace["prefix_tokens"]=cache.prefix_len;
+        status_.set_flags(cache.using_restore,prepared.compressed,!config_.draft_path.empty());
+        return cache;
+    }
     auto & effective_prompt = prepared.tokens;
     // Tool-heavy requests prefer the reusable system/tool boundary under eviction.
     const bool prefer_inline_snap = !req.tools.empty();
@@ -3484,7 +3553,7 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
     }
     if (!cache.using_restore) {
         auto [inline_slot, inline_len] =
-            prefix_cache_.lookup(effective_prompt);
+            prefix_cache_.lookup(effective_prompt, req.session_id);
         cache.cache_slot = inline_slot;
         cache.prefix_len = inline_len;
         cache.using_restore = cache.cache_slot >= 0;
@@ -3725,7 +3794,8 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
             cache.using_restore ? logical_prefix_len : 0,
             prefer_tools_boundary,
             forced_cut,
-            restore_source_slot);
+            restore_source_slot,
+            {}, req.session_id);
         cache.snap_slot = cache.snap_reservation.slot();
         cache.snap_cut = cache.snap_reservation.target_cut();
     };
@@ -3803,6 +3873,24 @@ void HttpServer::finalize_generation_cache(
     const bool generation_produced_output = result.ok() &&
         completion_tokens > 0 && visible_output_seen && !client_disconnected;
 
+    if(prepared.hybrid) {
+        if(cache.using_restore && result.ok())if(auto*e=hybrid_cache_.find(cache.cache_slot)) {
+            ++e->hits;e->last_used=++hybrid_cache_.tick;
+        }
+        if(cache.snap_prepared) {
+            int position=backend_.snapshot_cur_pos(cache.snap_slot);
+            if(generation_produced_output&&backend_.snapshot_used(cache.snap_slot)&&position>0&&position<=cache.snap_cut) {
+                hybrid::Entry e;e.slot=cache.snap_slot;e.position=position;e.owner=prepared.hybrid_owner;
+                e.primary=cache.hybrid_capture_primary;
+                e.full=position==(int)prepared.tokens.size();e.gpu=backend_.snapshot_on_gpu(e.slot);
+                e.bytes=backend_.snapshot_bytes(e.slot);e.representation=prepared.representation;
+                e.saved_seconds=std::max(1.,(double)position/500.);
+                hybrid_cache_.commit(backend_,std::move(e));
+            }else backend_.snapshot_free(cache.snap_slot);
+        }
+        publish_hybrid(prepared.hybrid_trace);
+        return;
+    }
     if (cache.full_snap_prepared) {
         if (generation_produced_output &&
             backend_.snapshot_used(cache.full_snap_slot)) {
@@ -3990,7 +4078,8 @@ void HttpServer::remember_agent_turn(
 
     const int canonical_end = (int) canonical_tokens.size();
     auto reservation = prefix_cache_.reserve_inline_snap(
-        canonical_tokens, source_pos, false, canonical_end, source_slot);
+        canonical_tokens, source_pos, false, canonical_end, source_slot,
+        {}, req.session_id);
     // No safe victim (only the restore source and/or protected pins remain)
     // or no useful boundary: nothing to replay into.
     if (!reservation.active() ||
@@ -4125,6 +4214,16 @@ void HttpServer::configure_generation_io(
             return false;
         }
         ++output.completion_tokens;
+        // Tool syntax can remain buffered for minutes. Report committed-token
+        // progress as an SSE comment, without exposing incomplete tool arguments.
+        if (req.stream && output.completion_tokens % 64 == 0) {
+            const std::string progress = ":lucebox-progress " + json({
+                {"id", req.response_id}, {"tokens", output.completion_tokens}}).dump() + "\n\n";
+            if (!send_job_bytes(job, progress.data(), progress.size())) {
+                output.client_disconnected = true;
+                return false;
+            }
+        }
 
         if (output.completion_tokens == 1) {
             // Prefill is over: the first generated token marks the decode phase.
@@ -4168,6 +4267,11 @@ bool HttpServer::deliver_generation_token(
         int32_t token, int & completion_tokens,
         ClientSendBuffer & send_buffer) {
     ++completion_tokens;
+    if (req.stream && completion_tokens % 64 == 0) {
+        stop_job_stream(job, &send_buffer);
+        send_buffer.append(":lucebox-progress " + json({
+            {"id", req.response_id}, {"tokens", completion_tokens}}).dump() + "\n\n");
+    }
 
     std::string text;
     const TokenDelivery delivery =
@@ -4239,6 +4343,11 @@ void HttpServer::process_job(ServerJob * job) {
     const auto & req = job->req;
     auto started_at = std::chrono::steady_clock::now();
 
+    if(req.hybrid_release) {
+        hybrid_cache_.release(backend_,req.session_id);publish_hybrid({{"released",req.session_id}});
+        send_response(fd,200,"application/json","{\"released\":true}\n");
+        std::lock_guard<std::mutex> lock(job->mu);job->done=true;job->cv.notify_one();return;
+    }
     // Track live status for /status page. RAII guard ensures idle on all paths.
     std::string prompt_excerpt;
     if (!req.prompt_tokens.empty()) {
@@ -4288,11 +4397,13 @@ void HttpServer::process_job(ServerJob * job) {
 
     // The server owns the downstream SSE transport for local and proxied
     // generation so both paths share heartbeat and disconnect handling.
-    if (req.stream) {
+    bool stream_started=false;
+    if (req.stream && !hybrid_enabled_) {
         if (!send_sse_headers(job)) {
             finish_job();
             return;
         }
+        stream_started=true;
     }
 
     // Create SSE emitter for streaming state machine.
@@ -4304,7 +4415,7 @@ void HttpServer::process_job(ServerJob * job) {
 
     // Emit initial SSE events only for local generation. The upstream owns
     // the proxied event sequence.
-    if (req.stream && config_.pflash_upstream_base.empty()) {
+    if (req.stream && !hybrid_enabled_ && config_.pflash_upstream_base.empty()) {
         bool start_ok = true;
         for (const auto & chunk : emitter.emit_start()) {
             if (!send_job_bytes(job, chunk.data(), chunk.size())) {
@@ -4317,7 +4428,15 @@ void HttpServer::process_job(ServerJob * job) {
             return;
         }
     }
-    if (req.stream) start_job_stream(job);
+    if (req.stream && !hybrid_enabled_) start_job_stream(job);
+    auto ensure_stream_started=[&]() {
+        if(!req.stream || stream_started)return true;
+        if(!send_sse_headers(job))return false;
+        stream_started=true;
+        for(const auto& chunk:emitter.emit_start())
+            if(!send_job_bytes(job,chunk.data(),chunk.size()))return false;
+        start_job_stream(job);return true;
+    };
 
     auto fail_request = [&](int status, const std::string & message) {
         std::fprintf(stderr, "[server] request failed: %s\n", message.c_str());
@@ -4331,20 +4450,35 @@ void HttpServer::process_job(ServerJob * job) {
             error = ResponseError::internal("server_error", message);
         }
         stop_job_stream(job);
-        if (req.stream) {
+        if (req.stream && stream_started) {
             for (const std::string & chunk : emitter.emit_error(error)) {
                 send_job_bytes(job, chunk.data(), chunk.size());
             }
         } else {
             const json body = build_error_response(
                 req.format, error, req.response_id);
-            send_response(fd, response_error_http_status(error),
+            send_response(fd, status == 408 ? 408 : response_error_http_status(error),
                           "application/json", body.dump() + "\n");
         }
         finish_job();
     };
 
-    PreparedPrompt prepared = prepare_prompt(req);
+    auto cancelled=[job]() {return job->client_disconnected.load(std::memory_order_acquire);};
+    PreparedPrompt prepared = hybrid_enabled_ ? prepare_hybrid_prompt(req,cancelled) : prepare_prompt(req);
+    bool fallback_used=false;
+    auto may_fallback=[&]() {
+        if(fallback_used || stream_started || job->client_disconnected.load(std::memory_order_acquire))return false;
+        const auto now_ms=std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        return prepared.hybrid_deadline_ms==0 || now_ms<prepared.hybrid_deadline_ms;
+    };
+    if(prepared.hybrid && prepared.error_status && prepared.hybrid_recoverable && may_fallback() && backend_.cache_reset_after_failure()) {
+        fallback_used=true;
+        ParsedRequest fallback=req;
+        fallback.raw_body["extra_body"]["lucebox_cache"]["mode"]="exact";
+        prepared=prepare_hybrid_prompt(fallback,cancelled);
+        prepared.hybrid_trace["fallback"]="preparation_to_exact";
+    }
     if (prepared.error_status != 0) {
         fail_request(prepared.error_status, prepared.error);
         return;
@@ -4364,34 +4498,37 @@ void HttpServer::process_job(ServerJob * job) {
 
     GenerationCacheState cache =
         prepare_generation_cache(req, prepared, gen_req);
-    const bool using_restore = cache.using_restore;
-    const int cache_slot = cache.cache_slot;
-    const int prefix_len = cache.prefix_len;
+    bool using_restore = cache.using_restore;
+    int cache_slot = cache.cache_slot;
+    int prefix_len = cache.prefix_len;
 
     DaemonIO io;
     GenerationOutputState output;
     configure_generation_io(job, req, emitter, output, io);
+    if(prepared.hybrid) {
+        io.should_cancel=[&,cancelled]() {
+            const auto now=std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            return cancelled() || (prepared.hybrid_deadline_ms && now>=prepared.hybrid_deadline_ms);
+        };
+        auto deliver=io.on_token;
+        io.on_token=[&,deliver](int32_t token) {
+            if(token<0)return true;
+            if(!ensure_stream_started()){output.client_disconnected=true;return false;}
+            return deliver(token);
+        };
+    }
     int & completion_tokens = output.completion_tokens;
     bool & visible_output_seen = output.visible_output_seen;
     bool & client_disconnected = output.client_disconnected;
 
-    const auto dflash_residency =
-        resolve_draft_residency_action(
-            config_.draft_residency,
-            DraftResidencyContext{
-                DraftResidencyUse::DFlashDecode,
-                config_.lazy_draft,
-                !config_.draft_path.empty(),
-            });
 
-    // Run generation (with or without restore).
-    // Request-scoped draft residency ensures decode draft is loaded only
-    // around the generation window, leaving room for PFlash/target state.
-    if (dflash_residency == DraftResidencyAction::ReleaseAfterUse &&
-        !config_.draft_path.empty()) {
-        backend_.free_drafter();    // free pflash drafter (~1.4 GB) if loaded
-        backend_.unpark(ParkTarget::DraftModel);   // reload decode draft (~3.3 GB)
+    if(prepared.hybrid && io.should_cancel && io.should_cancel()) {
+        if(cache.snap_slot>=0)backend_.snapshot_free(cache.snap_slot);
+        fail_request(408,"Request cancelled or deadline expired");return;
     }
+    // Run generation (with or without restore).
+    // The decoding drafter stays resident across requests.
 
     // The status stays in PREFILL until the first generated token (set in the
     // token callback): generate() below prefills first, so flipping here makes
@@ -4404,10 +4541,27 @@ void HttpServer::process_job(ServerJob * job) {
         result = backend_.generate(gen_req, io);
     }
 
-    if (dflash_residency == DraftResidencyAction::ReleaseAfterUse &&
-        !config_.draft_path.empty()) {
-        backend_.park(ParkTarget::DraftModel);
+    // Only failures known to precede decoding may retry, and only once. Reuse the
+    // effective frozen representation rather than reconstructing omitted source content.
+    if(prepared.hybrid && using_restore && !result.ok() && output.completion_tokens==0 &&
+       (result.error->code==GenerateErrorCode::InvalidSnapshotSlot ||
+        result.error->code==GenerateErrorCode::DecodeSeedMissing) && may_fallback() &&
+       backend_.cache_reset_after_failure()) {
+        fallback_used=true;
+        hybrid_cache_.erase(backend_,cache_slot);
+        if(cache.snap_slot>=0)backend_.snapshot_free(cache.snap_slot);
+        cache.snap_slot=-1;gen_req.snap_slot=-1;gen_req.snap_pos=-1;
+        auto resource=hybrid::plan_memory(hybrid_cache_.memory(backend_,-1,4*hybrid::GiB));
+        if(resource.feasible && hybrid_cache_.execute(backend_,resource)) {
+            cache.using_restore=false;cache.cache_slot=-1;cache.prefix_len=0;
+            using_restore=false;cache_slot=-1;prefix_len=0;
+            prepared.hybrid_trace["fallback"]="restore_to_effective_rebuild";
+            prepared.hybrid_trace.erase("cost_key");
+            result=backend_.generate(gen_req,io);
+        }
     }
+    if(req.stream && !ensure_stream_started())output.client_disconnected=true;
+
 
     if (job->client_disconnected.load(std::memory_order_acquire)) {
         client_disconnected = true;
@@ -4419,7 +4573,7 @@ void HttpServer::process_job(ServerJob * job) {
 
     // Bandit: update when spec decode actually ran — including 0-accept case,
     // which signals the current keep_ratio is too low.
-    if (result.ok() && !req.session_id.empty() && result.spec_decode_ran) {
+    if (!hybrid_enabled_ && result.ok() && !req.session_id.empty() && result.spec_decode_ran) {
         float old_keep = sessions_.get_keep_ratio(req.session_id);
         int   old_turn = sessions_.turn_count(req.session_id);
         sessions_.update(req.session_id, result.accept_rate);
@@ -4431,6 +4585,16 @@ void HttpServer::process_job(ServerJob * job) {
             old_keep, new_keep, ema, result.accept_rate);
     }
 
+    if(prepared.hybrid) {
+        double elapsed=std::chrono::duration<double>(std::chrono::steady_clock::now()-started_at).count();
+        prepared.hybrid_trace["seconds"]=elapsed;
+        prepared.hybrid_trace["prefill_seconds"]=result.prefill_s;
+        prepared.hybrid_trace["decode_seconds"]=result.decode_s;
+        prepared.hybrid_trace["success"]=result.ok();
+        if(result.ok() && !fallback_used && prepared.hybrid_trace.contains("cost_key"))
+            hybrid_cache_.observe(prepared.hybrid_trace["cost_key"].get<std::string>(),elapsed,prepared.hybrid_trace);
+        std::fprintf(stderr,"[hybrid] %s\n",prepared.hybrid_trace.dump().c_str());
+    }
     finalize_generation_cache(
         req, prepared, cache, result, completion_tokens,
         visible_output_seen, client_disconnected);
@@ -4929,5 +5093,7 @@ bool HttpServer::send_sse_headers(ServerJob * job) {
               "Connection: keep-alive\r\n\r\n";
     return send_job_bytes(job, header.data(), header.size());
 }
+
+#include "hybrid_http.inc"
 
 }  // namespace dflash::common

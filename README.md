@@ -1,3 +1,5 @@
+> **Serving-resilience fork:** native cache reclamation and RAM admission, a bounded model gateway, cancellation/recovery, tests, and systemd examples. See [serving setup and behavior](docs/serving/README.md). Based on [Luce-Org/lucebox](https://github.com/Luce-Org/lucebox); upstream history and Apache-2.0 license are retained.
+
 <p align="center">
   <a href="https://www.lucebox.com/"><img src="https://www.lucebox.com/lucebox-logo.png" alt="Lucebox" width="160"></a>
 </p>

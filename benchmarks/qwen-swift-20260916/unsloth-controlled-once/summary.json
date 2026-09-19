@@ -1,0 +1,25 @@
+{
+  "rows": [
+    {
+      "suite": "quality",
+      "backend": "Unsloth + DFlash2 (one run)",
+      "prefill": 1.17,
+      "decode": 36.28,
+      "wall": 37.5,
+      "tokens": 3073,
+      "thinking": 2946,
+      "tps": 84.71
+    },
+    {
+      "suite": "speed",
+      "backend": "Unsloth + DFlash2 (one run)",
+      "prefill": 1.91,
+      "decode": 63.64,
+      "wall": 65.63,
+      "tokens": 6190,
+      "thinking": 4895,
+      "tps": 97.27
+    }
+  ],
+  "quality_passes": 6
+}

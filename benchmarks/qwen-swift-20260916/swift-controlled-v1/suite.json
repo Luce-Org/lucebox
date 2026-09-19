@@ -1,0 +1,281 @@
+{
+  "version": "swift-controlled-v1",
+  "settings": {
+    "reasoning_effort": "xhigh",
+    "temperature": 0,
+    "seed": 42,
+    "max_tokens": 64000,
+    "context": 65536,
+    "repetitions": 3
+  },
+  "order": [
+    "dflash",
+    "mtp",
+    "mtp",
+    "dflash",
+    "dflash",
+    "mtp"
+  ],
+  "cases": [
+    {
+      "id": "arithmetic",
+      "suite": "quality",
+      "messages": [
+        {
+          "role": "user",
+          "content": "A machine makes 17 parts every 6 minutes. It runs for 3 hours 24 minutes, but is stopped for 18 minutes during that interval. It starts a fresh cycle when restarted. Both active intervals are multiples of 6 minutes. How many parts? Return JSON only: {\"parts\": integer}."
+        }
+      ],
+      "expected": {
+        "parts": 527
+      },
+      "criterion": "Exact JSON object, values and types; no fences or extra text. Normal completion required."
+    },
+    {
+      "id": "constraints",
+      "suite": "quality",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Schedule tasks A,B,C,D, each one hour, on one machine starting at hour 0. A must precede C, B must precede D, and D must precede A. Return JSON only with the unique order: {\"order\":[...]}."
+        }
+      ],
+      "expected": {
+        "order": [
+          "B",
+          "D",
+          "A",
+          "C"
+        ]
+      },
+      "criterion": "Exact JSON object, values and types; no fences or extra text. Normal completion required."
+    },
+    {
+      "id": "code_aliasing",
+      "suite": "quality",
+      "messages": [
+        {
+          "role": "user",
+          "content": "What does Python print?\na = [[0]] * 3\na[0].append(1)\na[1] = [2]\na[2][0] = 9\nprint(a)\nReturn JSON only with result as an array of arrays of integers, not a string: {\"result\": [[...], ...]}."
+        }
+      ],
+      "expected": {
+        "result": [
+          [
+            9,
+            1
+          ],
+          [
+            2
+          ],
+          [
+            9,
+            1
+          ]
+        ]
+      },
+      "criterion": "Exact JSON object, values and types; no fences or extra text. Normal completion required."
+    },
+    {
+      "id": "code_intervals",
+      "suite": "quality",
+      "messages": [
+        {
+          "role": "user",
+          "content": "A function merges CLOSED integer intervals when they overlap, but NOT merely when adjacent. Given [[8,10],[1,3],[3,6],[7,7],[12,12],[10,11]], return the sorted merged list as JSON only: {\"intervals\":[...]}."
+        }
+      ],
+      "expected": {
+        "intervals": [
+          [
+            1,
+            6
+          ],
+          [
+            7,
+            7
+          ],
+          [
+            8,
+            11
+          ],
+          [
+            12,
+            12
+          ]
+        ]
+      },
+      "criterion": "Exact JSON object, values and types; no fences or extra text. Normal completion required."
+    },
+    {
+      "id": "extraction",
+      "suite": "quality",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Data: [{\"id\":\"a\",\"active\":true,\"score\":7},{\"id\":\"b\",\"active\":false,\"score\":99},{\"id\":\"c\",\"active\":true,\"score\":7},{\"id\":\"d\",\"active\":true,\"score\":4}]. Select active items, sort by score descending then id descending, take first two. Return JSON only: {\"ids\":[...]}."
+        }
+      ],
+      "expected": {
+        "ids": [
+          "c",
+          "a"
+        ]
+      },
+      "criterion": "Exact JSON object, values and types; no fences or extra text. Normal completion required."
+    },
+    {
+      "id": "tool_call",
+      "suite": "quality",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Use lookup_weather to check Toronto in Celsius."
+        }
+      ],
+      "expected": {
+        "city": "Toronto",
+        "unit": "celsius"
+      },
+      "criterion": "Exactly one lookup_weather call, exact argument object and types, finish_reason tool_calls.",
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "lookup_weather",
+            "description": "Look up weather for a city",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                },
+                "unit": {
+                  "type": "string",
+                  "enum": [
+                    "celsius",
+                    "fahrenheit"
+                  ]
+                }
+              },
+              "required": [
+                "city",
+                "unit"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "has_close_elements",
+      "suite": "speed",
+      "messages": [
+        {
+          "role": "user",
+          "content": "from typing import List\n\ndef has_close_elements(numbers: List[float], threshold: float) -> bool:\n    \"\"\"Check if in given list of numbers, are any two numbers closer to each other than\n    given threshold.\n    >>> has_close_elements([1.0, 2.0, 3.0], 0.5)\n    False\n    >>> has_close_elements([1.0, 2.8, 3.0, 4.0, 5.0, 2.0], 0.3)\n    True\n    \"\"\"\n    for"
+        }
+      ],
+      "criterion": "Normal completion and nonempty final content; coding correctness is not scored."
+    },
+    {
+      "id": "separate_paren_groups",
+      "suite": "speed",
+      "messages": [
+        {
+          "role": "user",
+          "content": "from typing import List\n\ndef separate_paren_groups(paren_string: str) -> List[str]:\n    \"\"\" Input to this function is a string containing multiple groups of nested parentheses. Your goal is to\n    separate those group into separate strings and return the list of those.\n    Separate groups are balanced (each open brace is properly closed) and not nested within each other\n    Ignore any spaces in the input string.\n    >>> separate_paren_groups('( ) (( )) (( )( ))')\n    ['()', '(())', '(()())']\n    \"\"\"\n    result = []\n    current_string = []\n    current_depth = 0\n    for"
+        }
+      ],
+      "criterion": "Normal completion and nonempty final content; coding correctness is not scored."
+    },
+    {
+      "id": "truncate_number",
+      "suite": "speed",
+      "messages": [
+        {
+          "role": "user",
+          "content": "def truncate_number(number: float) -> float:\n    \"\"\" Given a positive floating point number, it can be decomposed into\n    and integer part (largest integer smaller than given number) and decimals\n    (leftover part always smaller than 1).\n\n    Return the decimal part of the number.\n    >>> truncate_number(3.5)\n    0.5\n    \"\"\"\n    return"
+        }
+      ],
+      "criterion": "Normal completion and nonempty final content; coding correctness is not scored."
+    },
+    {
+      "id": "below_zero",
+      "suite": "speed",
+      "messages": [
+        {
+          "role": "user",
+          "content": "from typing import List\n\ndef below_zero(operations: List[int]) -> bool:\n    \"\"\" You're given a list of deposit and withdrawal operations on a bank account that starts with\n    zero balance. Your task is to detect if at any point the balance of account fallls below zero, and\n    at that point function should return True. Otherwise it should return False.\n    >>> below_zero([1, 2, 3])\n    False\n    >>> below_zero([1, 2, -4, 5])\n    True\n    \"\"\"\n    balance = 0\n    for op in"
+        }
+      ],
+      "criterion": "Normal completion and nonempty final content; coding correctness is not scored."
+    },
+    {
+      "id": "mean_absolute_deviation",
+      "suite": "speed",
+      "messages": [
+        {
+          "role": "user",
+          "content": "from typing import List\n\ndef mean_absolute_deviation(numbers: List[float]) -> float:\n    \"\"\" For a given list of input numbers, calculate Mean Absolute Deviation\n    around the mean of this dataset.\n    Mean Absolute Deviation is the average absolute difference between each\n    element and a centerpoint (mean in this case):\n    MAD = average | x - x_mean |\n    >>> mean_absolute_deviation([1.0, 2.0, 3.0, 4.0])\n    1.0\n    \"\"\"\n    mean ="
+        }
+      ],
+      "criterion": "Normal completion and nonempty final content; coding correctness is not scored."
+    },
+    {
+      "id": "intersperse",
+      "suite": "speed",
+      "messages": [
+        {
+          "role": "user",
+          "content": "from typing import List\n\ndef intersperse(numbers: List[int], delimeter: int) -> List[int]:\n    \"\"\" Insert a number 'delimeter' between every two consecutive elements of input list `numbers'\n    >>> intersperse([], 4)\n    []\n    >>> intersperse([1, 2, 3], 4)\n    [1, 4, 2, 4, 3]\n    \"\"\"\n    result = []\n    for i, n in"
+        }
+      ],
+      "criterion": "Normal completion and nonempty final content; coding correctness is not scored."
+    },
+    {
+      "id": "parse_nested_parens",
+      "suite": "speed",
+      "messages": [
+        {
+          "role": "user",
+          "content": "from typing import List\n\ndef parse_nested_parens(paren_string: str) -> List[int]:\n    \"\"\" Input to this function is a string represented multiple groups for nested parentheses separated by spaces.\n    For each of the group, output the deepest level of nesting of parentheses.\n    E.g. (()()) has maximum two levels of nesting while ((())) has three.\n    >>> parse_nested_parens('(()()) ((())) () ((())()())')\n    [2, 3, 1, 3]\n    \"\"\"\n    def parse_paren_group(s):\n        depth = 0\n        max_depth = 0\n        for c in"
+        }
+      ],
+      "criterion": "Normal completion and nonempty final content; coding correctness is not scored."
+    },
+    {
+      "id": "filter_by_substring",
+      "suite": "speed",
+      "messages": [
+        {
+          "role": "user",
+          "content": "from typing import List\n\ndef filter_by_substring(strings: List[str], substring: str) -> List[str]:\n    \"\"\" Filter an input list of strings only for ones that contain given substring\n    >>> filter_by_substring([], 'a')\n    []\n    >>> filter_by_substring(['abc', 'bacd', 'cde', 'array'], 'a')\n    ['abc', 'bacd', 'array']\n    \"\"\"\n    return"
+        }
+      ],
+      "criterion": "Normal completion and nonempty final content; coding correctness is not scored."
+    },
+    {
+      "id": "sum_product",
+      "suite": "speed",
+      "messages": [
+        {
+          "role": "user",
+          "content": "from typing import List, Tuple\n\ndef sum_product(numbers: List[int]) -> Tuple[int, int]:\n    \"\"\" For a given list of integers, return a tuple consisting of a sum and a product of all the integers in a list.\n    Empty sum should be equal to 0 and empty product should be equal to 1.\n    >>> sum_product([])\n    (0, 1)\n    >>> sum_product([1, 2, 3, 4])\n    (10, 24)\n    \"\"\"\n    s = 0\n    p = 1\n    for n in"
+        }
+      ],
+      "criterion": "Normal completion and nonempty final content; coding correctness is not scored."
+    },
+    {
+      "id": "rolling_max",
+      "suite": "speed",
+      "messages": [
+        {
+          "role": "user",
+          "content": "from typing import List\n\ndef rolling_max(numbers: List[int]) -> List[int]:\n    \"\"\" From a given list of integers, generate a list of rolling maximum element found until given moment\n    in the sequence.\n    >>> rolling_max([1, 2, 3, 2, 3, 4, 2])\n    [1, 2, 3, 3, 3, 4, 4]\n    \"\"\"\n    result = []\n    running_max = None\n    for n in numbers:\n        if running_max is"
+        }
+      ],
+      "criterion": "Normal completion and nonempty final content; coding correctness is not scored."
+    }
+  ]
+}

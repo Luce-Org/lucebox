@@ -1,0 +1,16 @@
+[Unit]
+Description=Lucebox two-model API with automatic GPU model switching
+Wants=network.target
+Requires=linuxmacan-gpu-render-link.service
+After=network.target linuxmacan-gpu-render-link.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/lucebox
+ExecStart=/opt/lucebox-python/bin/python /opt/lucebox/model_router.py
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=45
+
+[Install]
+WantedBy=multi-user.target

@@ -31,6 +31,8 @@
 #include "ggml-cuda.h"
 #include "ggml-backend-impl.h"
 #include "common/snapshot_backend.h"
+#include "common/snapshot_migrate.h"
+#include "ggml-cpu.h"
 #include "pflash_ggml_adapter.h"
 #include "flashprefill.h"
 
@@ -316,7 +318,7 @@ bool Qwen35Backend::init() {
 
     // Snapshot backend: on discrete GPU uses system RAM; on unified memory
     // (Metal, iGPU) stays on compute backend.
-    snap_backend_ = create_snapshot_backend(target_backend_);
+    snap_backend_ = create_snapshot_backend(target_backend_, true);
     if (!snap_backend_) {
         std::fprintf(stderr, "snapshot backend init failed\n");
         return false;
@@ -975,6 +977,73 @@ bool Qwen35Backend::unpark(ParkTarget target) {
 
 // ── Snapshots ───────────────────────────────────────────────────────────
 
+int Qwen35Backend::snapshot_capture_position(int requested,int prompt_length,int restored) const {
+    if(cfg_.paged_attention || kvflash_active() || requested<=restored || requested>prompt_length)return -1;
+    if(requested==prompt_length)return requested;
+    const int batch=qwen35_prefill_ubatch(512);
+    const int actual=restored+(requested-restored)/batch*batch;
+    return actual>restored?actual:-1;
+}
+bool Qwen35Backend::cache_reset_after_failure() {
+    if(!target_backend_ || !cache_.base_buf || cfg_.paged_attention)return false;
+    // ggml GPU synchronization checks the runtime status and aborts on device failure.
+    // A fault therefore reaches the supervisor, never a speculative dense retry.
+    ggml_backend_synchronize(target_backend_);
+    ggml_backend_buffer_clear(cache_.base_buf,0);
+    reset_recurrent_state(cache_);
+    cache_.cur_pos=0;
+    ggml_backend_synchronize(target_backend_);
+    return true;
+}
+uint64_t Qwen35Backend::cache_reclaimable_scratch_bytes() const {
+    uint64_t bytes=0;
+    if(sg_.alloc)bytes+=ggml_gallocr_get_buffer_size(sg_.alloc,0);
+    if(proj_sg_.alloc)bytes+=ggml_gallocr_get_buffer_size(proj_sg_.alloc,0);
+    return bytes;
+}
+uint64_t Qwen35Backend::cache_gpu_free_bytes() const {
+    size_t available=0,total=0;
+    auto dev=ggml_backend_get_device(target_backend_);
+    if(dev)ggml_backend_dev_memory(dev,&available,&total);
+    return available;
+}
+uint64_t Qwen35Backend::snapshot_estimate_bytes(int pos) const {
+    if(pos<=0 || cfg_.paged_attention)return 0;
+    uint64_t bytes=1024*1024;
+    for(auto*t:cache_.attn_k)if(t)bytes+=ggml_row_size(t->type,t->ne[0])*(uint64_t)pos*t->ne[2]+512;
+    for(auto*t:cache_.attn_v)if(t)bytes+=ggml_row_size(t->type,t->ne[0])*(uint64_t)pos*t->ne[2]+512;
+    for(auto*t:cache_.ssm_state)if(t)bytes+=ggml_nbytes(t)+512;
+    for(auto*t:cache_.conv_state)if(t)bytes+=ggml_nbytes(t)+512;
+    if(cache_.target_feat)bytes+=ggml_row_size(cache_.target_feat->type,cache_.target_feat->ne[0])*
+        (uint64_t)std::min(pos,cache_.target_feat_cap)+512;
+    return bytes;
+}
+uint64_t Qwen35Backend::snapshot_bytes(int slot) const {
+    if(!snapshot_used(slot))return 0;
+    return ggml_backend_buffer_get_size(prefix_snapshots_[slot].buf);
+}
+bool Qwen35Backend::snapshot_on_gpu(int slot) const {
+    return snapshot_used(slot) && !ggml_backend_buffer_is_host(prefix_snapshots_[slot].buf);
+}
+bool Qwen35Backend::snapshot_move(int slot,bool gpu) {
+    if(!snapshot_used(slot))return false;
+    if(snapshot_on_gpu(slot)==gpu)return true;
+    auto &old=prefix_snapshots_[slot];
+    if(old.layout!=PrefixSnapshot::Layout::dense)return false;
+    ggml_backend_t cpu=gpu?nullptr:ggml_backend_cpu_init();
+    auto destination=gpu?target_backend_:cpu;
+    SnapshotCopy copy;
+    if(!copy.copy(old.ctx,destination)){if(cpu)ggml_backend_free(cpu);return false;}
+    PrefixSnapshot next=old;
+    auto rebind=[&](auto &v){for(auto*&t:v)if(t)t=ggml_get_tensor(copy.ctx,t->name);};
+    rebind(next.attn_k_snap);rebind(next.attn_v_snap);rebind(next.ssm_state_snap);rebind(next.conv_state_snap);
+    if(next.target_feat_snap)next.target_feat_snap=ggml_get_tensor(copy.ctx,next.target_feat_snap->name);
+    next.ctx=copy.ctx;next.buf=copy.buf;copy.ctx=nullptr;copy.buf=nullptr;
+    std::swap(old,next);free_prefix_snapshot(next);
+    if(cpu)ggml_backend_free(cpu);
+    return true;
+}
+
 bool Qwen35Backend::snapshot_save(int slot) {
     if (cfg_.paged_attention) {
         static bool warned = false;
@@ -1197,7 +1266,7 @@ std::vector<ModelBackend::CompressResult> Qwen35Backend::compress_batch(
         result.compressed_ids = drafter_score_and_compress(
             drafter_ctx_, request.input_ids, request.keep_ratio,
             /*chunk_size=*/32, request.score_query_tokens, /*pool_kernel=*/13,
-            request.score_query_end);
+            request.score_query_end, request.should_cancel);
         result.ok = !result.compressed_ids.empty();
         if (result.ok) {
             std::fprintf(stderr, "[compress] %zu -> %zu tokens\n",
@@ -1241,6 +1310,7 @@ bool Qwen35Backend::handle_compress(const std::string & line, const DaemonIO & i
     req.drafter_path = (n >= 3 && drafter_path[0])
         ? drafter_path
         : "/opt/lucebox/models/drafter/Qwen3-0.6B-BF16.gguf";
+    req.should_cancel = [&io]() { return io.is_cancelled(); };
     {
         size_t total_vram = 0;
         int dev = 0;
@@ -1343,15 +1413,15 @@ void Qwen35Backend::shutdown() {
         ggml_backend_free(draft_backend_);
         draft_backend_ = nullptr;
     }
+    if (snap_backend_) {
+        free_snapshot_backend(snap_backend_, target_backend_);
+        snap_backend_ = nullptr;
+    }
     if (target_backend_) {
         ggml_backend_free(target_backend_);
         target_backend_ = nullptr;
     }
     tensor_parallel_.reset();
-    if (snap_backend_) {
-        free_snapshot_backend(snap_backend_, target_backend_);
-        snap_backend_ = nullptr;
-    }
 }
 
 // ── Release scratch buffers between requests ────────────────────────────

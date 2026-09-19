@@ -1,0 +1,1299 @@
+{
+  "surface": "report",
+  "title": "Swift: DFlash2 versus MTP",
+  "generatedAt": "2026-09-16T16:47:18.426957+00:00",
+  "status": "reviewed",
+  "filters": [],
+  "queries": {
+    "protocol": {
+      "rows": [
+        {
+          "suite": "quality",
+          "prompt": "arithmetic",
+          "criterion": "Exact JSON object, values and types; no fences or extra text. Normal completion required.",
+          "input": "A machine makes 17 parts every 6 minutes. It runs for 3 hours 24 minutes, but is stopped for 18 minutes during that interval. It starts a fresh cycle when restarted. Both active intervals are multiples of 6 minutes. How many parts? Return JSON only: {\"parts\": integer}.",
+          "expected": "{\n  \"parts\": 527\n}",
+          "tools": "[]"
+        },
+        {
+          "suite": "quality",
+          "prompt": "constraints",
+          "criterion": "Exact JSON object, values and types; no fences or extra text. Normal completion required.",
+          "input": "Schedule tasks A,B,C,D, each one hour, on one machine starting at hour 0. A must precede C, B must precede D, and D must precede A. Return JSON only with the unique order: {\"order\":[...]}.",
+          "expected": "{\n  \"order\": [\n    \"B\",\n    \"D\",\n    \"A\",\n    \"C\"\n  ]\n}",
+          "tools": "[]"
+        },
+        {
+          "suite": "quality",
+          "prompt": "code_aliasing",
+          "criterion": "Exact JSON object, values and types; no fences or extra text. Normal completion required.",
+          "input": "What does Python print?\na = [[0]] * 3\na[0].append(1)\na[1] = [2]\na[2][0] = 9\nprint(a)\nReturn JSON only with result as an array of arrays of integers, not a string: {\"result\": [[...], ...]}.",
+          "expected": "{\n  \"result\": [\n    [\n      9,\n      1\n    ],\n    [\n      2\n    ],\n    [\n      9,\n      1\n    ]\n  ]\n}",
+          "tools": "[]"
+        },
+        {
+          "suite": "quality",
+          "prompt": "code_intervals",
+          "criterion": "Exact JSON object, values and types; no fences or extra text. Normal completion required.",
+          "input": "A function merges CLOSED integer intervals when they overlap, but NOT merely when adjacent. Given [[8,10],[1,3],[3,6],[7,7],[12,12],[10,11]], return the sorted merged list as JSON only: {\"intervals\":[...]}.",
+          "expected": "{\n  \"intervals\": [\n    [\n      1,\n      6\n    ],\n    [\n      7,\n      7\n    ],\n    [\n      8,\n      11\n    ],\n    [\n      12,\n      12\n    ]\n  ]\n}",
+          "tools": "[]"
+        },
+        {
+          "suite": "quality",
+          "prompt": "extraction",
+          "criterion": "Exact JSON object, values and types; no fences or extra text. Normal completion required.",
+          "input": "Data: [{\"id\":\"a\",\"active\":true,\"score\":7},{\"id\":\"b\",\"active\":false,\"score\":99},{\"id\":\"c\",\"active\":true,\"score\":7},{\"id\":\"d\",\"active\":true,\"score\":4}]. Select active items, sort by score descending then id descending, take first two. Return JSON only: {\"ids\":[...]}.",
+          "expected": "{\n  \"ids\": [\n    \"c\",\n    \"a\"\n  ]\n}",
+          "tools": "[]"
+        },
+        {
+          "suite": "quality",
+          "prompt": "tool_call",
+          "criterion": "Exactly one lookup_weather call, exact argument object and types, finish_reason tool_calls.",
+          "input": "Use lookup_weather to check Toronto in Celsius.",
+          "expected": "{\n  \"city\": \"Toronto\",\n  \"unit\": \"celsius\"\n}",
+          "tools": "[\n  {\n    \"type\": \"function\",\n    \"function\": {\n      \"name\": \"lookup_weather\",\n      \"description\": \"Look up weather for a city\",\n      \"parameters\": {\n        \"type\": \"object\",\n        \"properties\": {\n          \"city\": {\n            \"type\": \"string\"\n          },\n          \"unit\": {\n            \"type\": \"string\",\n            \"enum\": [\n              \"celsius\",\n              \"fahrenheit\"\n            ]\n          }\n        },\n        \"required\": [\n          \"city\",\n          \"unit\"\n        ]\n      }\n    }\n  }\n]"
+        },
+        {
+          "suite": "speed",
+          "prompt": "has_close_elements",
+          "criterion": "Normal completion and nonempty final content; coding correctness is not scored.",
+          "input": "from typing import List\n\ndef has_close_elements(numbers: List[float], threshold: float) -> bool:\n    \"\"\"Check if in given list of numbers, are any two numbers closer to each other than\n    given threshold.\n    >>> has_close_elements([1.0, 2.0, 3.0], 0.5)\n    False\n    >>> has_close_elements([1.0, 2.8, 3.0, 4.0, 5.0, 2.0], 0.3)\n    True\n    \"\"\"\n    for",
+          "expected": "Not scored for coding correctness",
+          "tools": "[]"
+        },
+        {
+          "suite": "speed",
+          "prompt": "separate_paren_groups",
+          "criterion": "Normal completion and nonempty final content; coding correctness is not scored.",
+          "input": "from typing import List\n\ndef separate_paren_groups(paren_string: str) -> List[str]:\n    \"\"\" Input to this function is a string containing multiple groups of nested parentheses. Your goal is to\n    separate those group into separate strings and return the list of those.\n    Separate groups are balanced (each open brace is properly closed) and not nested within each other\n    Ignore any spaces in the input string.\n    >>> separate_paren_groups('( ) (( )) (( )( ))')\n    ['()', '(())', '(()())']\n    \"\"\"\n    result = []\n    current_string = []\n    current_depth = 0\n    for",
+          "expected": "Not scored for coding correctness",
+          "tools": "[]"
+        },
+        {
+          "suite": "speed",
+          "prompt": "truncate_number",
+          "criterion": "Normal completion and nonempty final content; coding correctness is not scored.",
+          "input": "def truncate_number(number: float) -> float:\n    \"\"\" Given a positive floating point number, it can be decomposed into\n    and integer part (largest integer smaller than given number) and decimals\n    (leftover part always smaller than 1).\n\n    Return the decimal part of the number.\n    >>> truncate_number(3.5)\n    0.5\n    \"\"\"\n    return",
+          "expected": "Not scored for coding correctness",
+          "tools": "[]"
+        },
+        {
+          "suite": "speed",
+          "prompt": "below_zero",
+          "criterion": "Normal completion and nonempty final content; coding correctness is not scored.",
+          "input": "from typing import List\n\ndef below_zero(operations: List[int]) -> bool:\n    \"\"\" You're given a list of deposit and withdrawal operations on a bank account that starts with\n    zero balance. Your task is to detect if at any point the balance of account fallls below zero, and\n    at that point function should return True. Otherwise it should return False.\n    >>> below_zero([1, 2, 3])\n    False\n    >>> below_zero([1, 2, -4, 5])\n    True\n    \"\"\"\n    balance = 0\n    for op in",
+          "expected": "Not scored for coding correctness",
+          "tools": "[]"
+        },
+        {
+          "suite": "speed",
+          "prompt": "mean_absolute_deviation",
+          "criterion": "Normal completion and nonempty final content; coding correctness is not scored.",
+          "input": "from typing import List\n\ndef mean_absolute_deviation(numbers: List[float]) -> float:\n    \"\"\" For a given list of input numbers, calculate Mean Absolute Deviation\n    around the mean of this dataset.\n    Mean Absolute Deviation is the average absolute difference between each\n    element and a centerpoint (mean in this case):\n    MAD = average | x - x_mean |\n    >>> mean_absolute_deviation([1.0, 2.0, 3.0, 4.0])\n    1.0\n    \"\"\"\n    mean =",
+          "expected": "Not scored for coding correctness",
+          "tools": "[]"
+        },
+        {
+          "suite": "speed",
+          "prompt": "intersperse",
+          "criterion": "Normal completion and nonempty final content; coding correctness is not scored.",
+          "input": "from typing import List\n\ndef intersperse(numbers: List[int], delimeter: int) -> List[int]:\n    \"\"\" Insert a number 'delimeter' between every two consecutive elements of input list `numbers'\n    >>> intersperse([], 4)\n    []\n    >>> intersperse([1, 2, 3], 4)\n    [1, 4, 2, 4, 3]\n    \"\"\"\n    result = []\n    for i, n in",
+          "expected": "Not scored for coding correctness",
+          "tools": "[]"
+        },
+        {
+          "suite": "speed",
+          "prompt": "parse_nested_parens",
+          "criterion": "Normal completion and nonempty final content; coding correctness is not scored.",
+          "input": "from typing import List\n\ndef parse_nested_parens(paren_string: str) -> List[int]:\n    \"\"\" Input to this function is a string represented multiple groups for nested parentheses separated by spaces.\n    For each of the group, output the deepest level of nesting of parentheses.\n    E.g. (()()) has maximum two levels of nesting while ((())) has three.\n    >>> parse_nested_parens('(()()) ((())) () ((())()())')\n    [2, 3, 1, 3]\n    \"\"\"\n    def parse_paren_group(s):\n        depth = 0\n        max_depth = 0\n        for c in",
+          "expected": "Not scored for coding correctness",
+          "tools": "[]"
+        },
+        {
+          "suite": "speed",
+          "prompt": "filter_by_substring",
+          "criterion": "Normal completion and nonempty final content; coding correctness is not scored.",
+          "input": "from typing import List\n\ndef filter_by_substring(strings: List[str], substring: str) -> List[str]:\n    \"\"\" Filter an input list of strings only for ones that contain given substring\n    >>> filter_by_substring([], 'a')\n    []\n    >>> filter_by_substring(['abc', 'bacd', 'cde', 'array'], 'a')\n    ['abc', 'bacd', 'array']\n    \"\"\"\n    return",
+          "expected": "Not scored for coding correctness",
+          "tools": "[]"
+        },
+        {
+          "suite": "speed",
+          "prompt": "sum_product",
+          "criterion": "Normal completion and nonempty final content; coding correctness is not scored.",
+          "input": "from typing import List, Tuple\n\ndef sum_product(numbers: List[int]) -> Tuple[int, int]:\n    \"\"\" For a given list of integers, return a tuple consisting of a sum and a product of all the integers in a list.\n    Empty sum should be equal to 0 and empty product should be equal to 1.\n    >>> sum_product([])\n    (0, 1)\n    >>> sum_product([1, 2, 3, 4])\n    (10, 24)\n    \"\"\"\n    s = 0\n    p = 1\n    for n in",
+          "expected": "Not scored for coding correctness",
+          "tools": "[]"
+        },
+        {
+          "suite": "speed",
+          "prompt": "rolling_max",
+          "criterion": "Normal completion and nonempty final content; coding correctness is not scored.",
+          "input": "from typing import List\n\ndef rolling_max(numbers: List[int]) -> List[int]:\n    \"\"\" From a given list of integers, generate a list of rolling maximum element found until given moment\n    in the sequence.\n    >>> rolling_max([1, 2, 3, 2, 3, 4, 2])\n    [1, 2, 3, 3, 3, 4, 4]\n    \"\"\"\n    result = []\n    running_max = None\n    for n in numbers:\n        if running_max is",
+          "expected": "Not scored for coding correctness",
+          "tools": "[]"
+        }
+      ],
+      "source": {
+        "name": "Frozen benchmark protocol",
+        "description": "swift-controlled-v1/suite.json; measurements pending",
+        "evidenceFlow": [
+          {
+            "title": "Frozen inputs",
+            "detail": "Same model, template and prompts; xhigh, 64000 output ceiling, 65536 context, three repeats per backend. SHA256 in suite.sha256."
+          }
+        ]
+      }
+    },
+    "summary": {
+      "rows": [
+        {
+          "backend": "Lucebox + DFlash2",
+          "suite": "quality",
+          "repetitions": 3,
+          "median_wall": 20.85,
+          "median_prefill": 1.17,
+          "median_decode": 19.63,
+          "median_tokens": 1717,
+          "median_thinking": 1590,
+          "median_tps": 87.45,
+          "median_prefill_tokens": 929,
+          "median_prefill_tps": 797.08,
+          "min_wall": 20.56,
+          "max_wall": 20.86,
+          "min_tps": 87.38,
+          "max_tps": 88.69
+        },
+        {
+          "backend": "Lucebox + DFlash2",
+          "suite": "speed",
+          "repetitions": 3,
+          "median_wall": 64.15,
+          "median_prefill": 1.98,
+          "median_decode": 62.08,
+          "median_tokens": 5605,
+          "median_thinking": 4092,
+          "median_tps": 90.29,
+          "median_prefill_tokens": 1703,
+          "median_prefill_tps": 859.19,
+          "min_wall": 63.57,
+          "max_wall": 64.21,
+          "min_tps": 90.21,
+          "max_tps": 91.09
+        },
+        {
+          "backend": "llama.cpp + MTP",
+          "suite": "quality",
+          "repetitions": 3,
+          "median_wall": 28.8,
+          "median_prefill": 2.8,
+          "median_decode": 25.98,
+          "median_tokens": 1574,
+          "median_thinking": 1447,
+          "median_tps": 60.6,
+          "median_prefill_tokens": 929,
+          "median_prefill_tps": 331.75,
+          "min_wall": 28.39,
+          "max_wall": 28.82,
+          "min_tps": 60.58,
+          "max_tps": 61.49
+        },
+        {
+          "backend": "llama.cpp + MTP",
+          "suite": "speed",
+          "repetitions": 3,
+          "median_wall": 88.13,
+          "median_prefill": 4.84,
+          "median_decode": 83.16,
+          "median_tokens": 5084,
+          "median_thinking": 3482,
+          "median_tps": 61.14,
+          "median_prefill_tokens": 1703,
+          "median_prefill_tps": 351.85,
+          "min_wall": 86.99,
+          "max_wall": 88.29,
+          "min_tps": 60.95,
+          "max_tps": 61.89
+        }
+      ],
+      "source": {
+        "name": "Frozen Swift controlled benchmark v1",
+        "description": "Measured on linuxmacan. Raw results.json, suite.json, launch.json, and analysis.py retained in work/swift-controlled-v1.",
+        "evidenceFlow": [
+          {
+            "title": "Measurement",
+            "detail": "96 requests planned: 16 frozen prompts \u00d7 2 backends \u00d7 3 repetitions. No prior exploratory runs included."
+          },
+          {
+            "title": "Aggregation",
+            "detail": "Sum times and tokens within each suite/repetition; report medians of three run totals. Quality passes require exact answers and JSON types, no repair."
+          }
+        ],
+        "metricDefinitions": [
+          {
+            "label": "Thinking text tokens",
+            "definition": "Returned reasoning text retokenized using the same Swift tokenizer with special-token addition disabled. Excludes wrapper markers; may differ from native generated reasoning-token counts."
+          },
+          {
+            "label": "Generation rate",
+            "definition": "Total completion tokens, including thinking, divided by measured generation seconds. Prefill and HTTP overhead excluded."
+          }
+        ]
+      }
+    },
+    "quality": {
+      "rows": [
+        {
+          "backend": "Lucebox + DFlash2",
+          "prompt": "arithmetic",
+          "answers": 3,
+          "format": 3,
+          "passed": 3,
+          "repetitions": 3
+        },
+        {
+          "backend": "llama.cpp + MTP",
+          "prompt": "arithmetic",
+          "answers": 3,
+          "format": 3,
+          "passed": 3,
+          "repetitions": 3
+        },
+        {
+          "backend": "Lucebox + DFlash2",
+          "prompt": "constraints",
+          "answers": 3,
+          "format": 3,
+          "passed": 3,
+          "repetitions": 3
+        },
+        {
+          "backend": "llama.cpp + MTP",
+          "prompt": "constraints",
+          "answers": 3,
+          "format": 3,
+          "passed": 3,
+          "repetitions": 3
+        },
+        {
+          "backend": "Lucebox + DFlash2",
+          "prompt": "code_aliasing",
+          "answers": 3,
+          "format": 3,
+          "passed": 3,
+          "repetitions": 3
+        },
+        {
+          "backend": "llama.cpp + MTP",
+          "prompt": "code_aliasing",
+          "answers": 3,
+          "format": 3,
+          "passed": 3,
+          "repetitions": 3
+        },
+        {
+          "backend": "Lucebox + DFlash2",
+          "prompt": "code_intervals",
+          "answers": 3,
+          "format": 3,
+          "passed": 3,
+          "repetitions": 3
+        },
+        {
+          "backend": "llama.cpp + MTP",
+          "prompt": "code_intervals",
+          "answers": 3,
+          "format": 3,
+          "passed": 3,
+          "repetitions": 3
+        },
+        {
+          "backend": "Lucebox + DFlash2",
+          "prompt": "extraction",
+          "answers": 3,
+          "format": 3,
+          "passed": 3,
+          "repetitions": 3
+        },
+        {
+          "backend": "llama.cpp + MTP",
+          "prompt": "extraction",
+          "answers": 3,
+          "format": 3,
+          "passed": 3,
+          "repetitions": 3
+        },
+        {
+          "backend": "Lucebox + DFlash2",
+          "prompt": "tool_call",
+          "answers": 3,
+          "format": 3,
+          "passed": 3,
+          "repetitions": 3
+        },
+        {
+          "backend": "llama.cpp + MTP",
+          "prompt": "tool_call",
+          "answers": 3,
+          "format": 3,
+          "passed": 3,
+          "repetitions": 3
+        }
+      ],
+      "source": {
+        "name": "Frozen Swift controlled benchmark v1",
+        "description": "Measured on linuxmacan. Raw results.json, suite.json, launch.json, and analysis.py retained in work/swift-controlled-v1.",
+        "evidenceFlow": [
+          {
+            "title": "Measurement",
+            "detail": "96 requests planned: 16 frozen prompts \u00d7 2 backends \u00d7 3 repetitions. No prior exploratory runs included."
+          },
+          {
+            "title": "Aggregation",
+            "detail": "Sum times and tokens within each suite/repetition; report medians of three run totals. Quality passes require exact answers and JSON types, no repair."
+          }
+        ],
+        "metricDefinitions": [
+          {
+            "label": "Thinking text tokens",
+            "definition": "Returned reasoning text retokenized using the same Swift tokenizer with special-token addition disabled. Excludes wrapper markers; may differ from native generated reasoning-token counts."
+          },
+          {
+            "label": "Generation rate",
+            "definition": "Total completion tokens, including thinking, divided by measured generation seconds. Prefill and HTTP overhead excluded."
+          }
+        ]
+      }
+    },
+    "detail": {
+      "rows": [
+        {
+          "backend": "Lucebox + DFlash2",
+          "suite": "quality",
+          "prompt": "arithmetic",
+          "repetitions": 3,
+          "wall": 6.53,
+          "prefill": 0.2,
+          "decode": 6.32,
+          "tokens": 534,
+          "thinking": 523
+        },
+        {
+          "backend": "llama.cpp + MTP",
+          "suite": "quality",
+          "prompt": "arithmetic",
+          "repetitions": 3,
+          "wall": 8.79,
+          "prefill": 0.49,
+          "decode": 8.3,
+          "tokens": 497,
+          "thinking": 486
+        },
+        {
+          "backend": "Lucebox + DFlash2",
+          "suite": "quality",
+          "prompt": "constraints",
+          "repetitions": 3,
+          "wall": 1.78,
+          "prefill": 0.14,
+          "decode": 1.64,
+          "tokens": 130,
+          "thinking": 116
+        },
+        {
+          "backend": "llama.cpp + MTP",
+          "suite": "quality",
+          "prompt": "constraints",
+          "repetitions": 3,
+          "wall": 2.46,
+          "prefill": 0.42,
+          "decode": 2.04,
+          "tokens": 125,
+          "thinking": 111
+        },
+        {
+          "backend": "Lucebox + DFlash2",
+          "suite": "quality",
+          "prompt": "code_aliasing",
+          "repetitions": 3,
+          "wall": 3.37,
+          "prefill": 0.14,
+          "decode": 3.22,
+          "tokens": 287,
+          "thinking": 265
+        },
+        {
+          "backend": "llama.cpp + MTP",
+          "suite": "quality",
+          "prompt": "code_aliasing",
+          "repetitions": 3,
+          "wall": 4.37,
+          "prefill": 0.43,
+          "decode": 3.94,
+          "tokens": 257,
+          "thinking": 235
+        },
+        {
+          "backend": "Lucebox + DFlash2",
+          "suite": "quality",
+          "prompt": "code_intervals",
+          "repetitions": 3,
+          "wall": 6.32,
+          "prefill": 0.14,
+          "decode": 6.17,
+          "tokens": 573,
+          "thinking": 545
+        },
+        {
+          "backend": "llama.cpp + MTP",
+          "suite": "quality",
+          "prompt": "code_intervals",
+          "repetitions": 3,
+          "wall": 8.55,
+          "prefill": 0.42,
+          "decode": 8.12,
+          "tokens": 503,
+          "thinking": 475
+        },
+        {
+          "backend": "Lucebox + DFlash2",
+          "suite": "quality",
+          "prompt": "extraction",
+          "repetitions": 3,
+          "wall": 1.56,
+          "prefill": 0.18,
+          "decode": 1.37,
+          "tokens": 118,
+          "thinking": 108
+        },
+        {
+          "backend": "llama.cpp + MTP",
+          "suite": "quality",
+          "prompt": "extraction",
+          "repetitions": 3,
+          "wall": 2.49,
+          "prefill": 0.44,
+          "decode": 2.05,
+          "tokens": 117,
+          "thinking": 107
+        },
+        {
+          "backend": "Lucebox + DFlash2",
+          "suite": "quality",
+          "prompt": "tool_call",
+          "repetitions": 3,
+          "wall": 1.27,
+          "prefill": 0.36,
+          "decode": 0.9,
+          "tokens": 75,
+          "thinking": 33
+        },
+        {
+          "backend": "llama.cpp + MTP",
+          "suite": "quality",
+          "prompt": "tool_call",
+          "repetitions": 3,
+          "wall": 2.03,
+          "prefill": 0.6,
+          "decode": 1.41,
+          "tokens": 75,
+          "thinking": 33
+        },
+        {
+          "backend": "Lucebox + DFlash2",
+          "suite": "speed",
+          "prompt": "has_close_elements",
+          "repetitions": 3,
+          "wall": 8.95,
+          "prefill": 0.21,
+          "decode": 8.73,
+          "tokens": 770,
+          "thinking": 595
+        },
+        {
+          "backend": "llama.cpp + MTP",
+          "suite": "speed",
+          "prompt": "has_close_elements",
+          "repetitions": 3,
+          "wall": 14.72,
+          "prefill": 0.57,
+          "decode": 14.14,
+          "tokens": 840,
+          "thinking": 665
+        },
+        {
+          "backend": "Lucebox + DFlash2",
+          "suite": "speed",
+          "prompt": "separate_paren_groups",
+          "repetitions": 3,
+          "wall": 16.44,
+          "prefill": 0.2,
+          "decode": 16.22,
+          "tokens": 1233,
+          "thinking": 1011
+        },
+        {
+          "backend": "llama.cpp + MTP",
+          "suite": "speed",
+          "prompt": "separate_paren_groups",
+          "repetitions": 3,
+          "wall": 16.3,
+          "prefill": 0.48,
+          "decode": 15.82,
+          "tokens": 923,
+          "thinking": 694
+        },
+        {
+          "backend": "Lucebox + DFlash2",
+          "suite": "speed",
+          "prompt": "truncate_number",
+          "repetitions": 3,
+          "wall": 6.93,
+          "prefill": 0.17,
+          "decode": 6.74,
+          "tokens": 506,
+          "thinking": 492
+        },
+        {
+          "backend": "llama.cpp + MTP",
+          "suite": "speed",
+          "prompt": "truncate_number",
+          "repetitions": 3,
+          "wall": 7.57,
+          "prefill": 0.44,
+          "decode": 7.13,
+          "tokens": 433,
+          "thinking": 334
+        },
+        {
+          "backend": "Lucebox + DFlash2",
+          "suite": "speed",
+          "prompt": "below_zero",
+          "repetitions": 3,
+          "wall": 3.36,
+          "prefill": 0.2,
+          "decode": 3.15,
+          "tokens": 308,
+          "thinking": 149
+        },
+        {
+          "backend": "llama.cpp + MTP",
+          "suite": "speed",
+          "prompt": "below_zero",
+          "repetitions": 3,
+          "wall": 5.07,
+          "prefill": 0.51,
+          "decode": 4.54,
+          "tokens": 281,
+          "thinking": 123
+        },
+        {
+          "backend": "Lucebox + DFlash2",
+          "suite": "speed",
+          "prompt": "mean_absolute_deviation",
+          "repetitions": 3,
+          "wall": 9.84,
+          "prefill": 0.2,
+          "decode": 9.63,
+          "tokens": 725,
+          "thinking": 559
+        },
+        {
+          "backend": "llama.cpp + MTP",
+          "suite": "speed",
+          "prompt": "mean_absolute_deviation",
+          "repetitions": 3,
+          "wall": 9.43,
+          "prefill": 0.47,
+          "decode": 8.96,
+          "tokens": 546,
+          "thinking": 380
+        },
+        {
+          "backend": "Lucebox + DFlash2",
+          "suite": "speed",
+          "prompt": "intersperse",
+          "repetitions": 3,
+          "wall": 2.74,
+          "prefill": 0.2,
+          "decode": 2.54,
+          "tokens": 347,
+          "thinking": 207
+        },
+        {
+          "backend": "llama.cpp + MTP",
+          "suite": "speed",
+          "prompt": "intersperse",
+          "repetitions": 3,
+          "wall": 5.9,
+          "prefill": 0.45,
+          "decode": 5.45,
+          "tokens": 342,
+          "thinking": 202
+        },
+        {
+          "backend": "Lucebox + DFlash2",
+          "suite": "speed",
+          "prompt": "parse_nested_parens",
+          "repetitions": 3,
+          "wall": 7.51,
+          "prefill": 0.2,
+          "decode": 7.29,
+          "tokens": 744,
+          "thinking": 531
+        },
+        {
+          "backend": "llama.cpp + MTP",
+          "suite": "speed",
+          "prompt": "parse_nested_parens",
+          "repetitions": 3,
+          "wall": 12.44,
+          "prefill": 0.48,
+          "decode": 11.95,
+          "tokens": 746,
+          "thinking": 535
+        },
+        {
+          "backend": "Lucebox + DFlash2",
+          "suite": "speed",
+          "prompt": "filter_by_substring",
+          "repetitions": 3,
+          "wall": 1.91,
+          "prefill": 0.19,
+          "decode": 1.71,
+          "tokens": 201,
+          "thinking": 87
+        },
+        {
+          "backend": "llama.cpp + MTP",
+          "suite": "speed",
+          "prompt": "filter_by_substring",
+          "repetitions": 3,
+          "wall": 3.78,
+          "prefill": 0.45,
+          "decode": 3.32,
+          "tokens": 201,
+          "thinking": 87
+        },
+        {
+          "backend": "Lucebox + DFlash2",
+          "suite": "speed",
+          "prompt": "sum_product",
+          "repetitions": 3,
+          "wall": 2.89,
+          "prefill": 0.2,
+          "decode": 2.68,
+          "tokens": 375,
+          "thinking": 218
+        },
+        {
+          "backend": "llama.cpp + MTP",
+          "suite": "speed",
+          "prompt": "sum_product",
+          "repetitions": 3,
+          "wall": 6.15,
+          "prefill": 0.48,
+          "decode": 5.68,
+          "tokens": 375,
+          "thinking": 218
+        },
+        {
+          "backend": "Lucebox + DFlash2",
+          "suite": "speed",
+          "prompt": "rolling_max",
+          "repetitions": 3,
+          "wall": 3.57,
+          "prefill": 0.2,
+          "decode": 3.36,
+          "tokens": 396,
+          "thinking": 243
+        },
+        {
+          "backend": "llama.cpp + MTP",
+          "suite": "speed",
+          "prompt": "rolling_max",
+          "repetitions": 3,
+          "wall": 6.56,
+          "prefill": 0.53,
+          "decode": 6.02,
+          "tokens": 397,
+          "thinking": 244
+        }
+      ],
+      "source": {
+        "name": "Frozen Swift controlled benchmark v1",
+        "description": "Measured on linuxmacan. Raw results.json, suite.json, launch.json, and analysis.py retained in work/swift-controlled-v1.",
+        "evidenceFlow": [
+          {
+            "title": "Measurement",
+            "detail": "96 requests planned: 16 frozen prompts \u00d7 2 backends \u00d7 3 repetitions. No prior exploratory runs included."
+          },
+          {
+            "title": "Aggregation",
+            "detail": "Sum times and tokens within each suite/repetition; report medians of three run totals. Quality passes require exact answers and JSON types, no repair."
+          }
+        ],
+        "metricDefinitions": [
+          {
+            "label": "Thinking text tokens",
+            "definition": "Returned reasoning text retokenized using the same Swift tokenizer with special-token addition disabled. Excludes wrapper markers; may differ from native generated reasoning-token counts."
+          },
+          {
+            "label": "Generation rate",
+            "definition": "Total completion tokens, including thinking, divided by measured generation seconds. Prefill and HTTP overhead excluded."
+          }
+        ]
+      }
+    },
+    "runs": {
+      "rows": [
+        {
+          "backend": "Lucebox + DFlash2",
+          "suite": "quality",
+          "rep": 1,
+          "wall": 20.556709003052674,
+          "prefill": 1.1495,
+          "decode": 19.3592,
+          "tokens": 1717,
+          "thinking": 1590,
+          "tps": 88.69168147444108,
+          "prefill_tokens": 929,
+          "prefill_tps": 808.1774684645499
+        },
+        {
+          "backend": "Lucebox + DFlash2",
+          "suite": "speed",
+          "rep": 1,
+          "wall": 63.5745523518417,
+          "prefill": 1.9589,
+          "decode": 61.5309,
+          "tokens": 5605,
+          "thinking": 4092,
+          "tps": 91.09244298393165,
+          "prefill_tokens": 1703,
+          "prefill_tps": 869.3654602072592
+        },
+        {
+          "backend": "Lucebox + DFlash2",
+          "suite": "quality",
+          "rep": 2,
+          "wall": 20.86335973383393,
+          "prefill": 1.1676,
+          "decode": 19.6493,
+          "tokens": 1717,
+          "thinking": 1590,
+          "tps": 87.38224771365901,
+          "prefill_tokens": 929,
+          "prefill_tps": 795.6491949297705
+        },
+        {
+          "backend": "Lucebox + DFlash2",
+          "suite": "speed",
+          "rep": 2,
+          "wall": 64.21126437408384,
+          "prefill": 1.9909000000000001,
+          "decode": 62.1345,
+          "tokens": 5605,
+          "thinking": 4092,
+          "tps": 90.2075336568251,
+          "prefill_tokens": 1703,
+          "prefill_tps": 855.3920337535787
+        },
+        {
+          "backend": "Lucebox + DFlash2",
+          "suite": "quality",
+          "rep": 3,
+          "wall": 20.8455297681503,
+          "prefill": 1.1655,
+          "decode": 19.6333,
+          "tokens": 1717,
+          "thinking": 1590,
+          "tps": 87.45345917395446,
+          "prefill_tokens": 929,
+          "prefill_tps": 797.0827970827971
+        },
+        {
+          "backend": "Lucebox + DFlash2",
+          "suite": "speed",
+          "rep": 3,
+          "wall": 64.14997540204786,
+          "prefill": 1.9821,
+          "decode": 62.0796,
+          "tokens": 5605,
+          "thinking": 4092,
+          "tps": 90.28730855224583,
+          "prefill_tokens": 1703,
+          "prefill_tps": 859.1897482468089
+        },
+        {
+          "backend": "llama.cpp + MTP",
+          "suite": "quality",
+          "rep": 1,
+          "wall": 28.389900952926837,
+          "prefill": 2.766497,
+          "decode": 25.598021,
+          "tokens": 1574,
+          "thinking": 1447,
+          "tps": 61.489128397855445,
+          "prefill_tokens": 929,
+          "prefill_tps": 335.8037257947505
+        },
+        {
+          "backend": "llama.cpp + MTP",
+          "suite": "speed",
+          "rep": 1,
+          "wall": 86.98857973399572,
+          "prefill": 4.800631,
+          "decode": 82.15076499999999,
+          "tokens": 5084,
+          "thinking": 3482,
+          "tps": 61.886216153921396,
+          "prefill_tokens": 1703,
+          "prefill_tps": 354.74503247593907
+        },
+        {
+          "backend": "llama.cpp + MTP",
+          "suite": "quality",
+          "rep": 2,
+          "wall": 28.797632195055485,
+          "prefill": 2.800341,
+          "decode": 25.975103999999998,
+          "tokens": 1574,
+          "thinking": 1447,
+          "tps": 60.59648500348642,
+          "prefill_tokens": 929,
+          "prefill_tps": 331.7453124458771
+        },
+        {
+          "backend": "llama.cpp + MTP",
+          "suite": "speed",
+          "rep": 2,
+          "wall": 88.13138094323222,
+          "prefill": 4.936259,
+          "decode": 83.15565,
+          "tokens": 5084,
+          "thinking": 3482,
+          "tps": 61.13835920950651,
+          "prefill_tokens": 1703,
+          "prefill_tps": 344.9981048401229
+        },
+        {
+          "backend": "llama.cpp + MTP",
+          "suite": "quality",
+          "rep": 3,
+          "wall": 28.816793619072996,
+          "prefill": 2.8092289999999998,
+          "decode": 25.982522,
+          "tokens": 1574,
+          "thinking": 1447,
+          "tps": 60.57918473041224,
+          "prefill_tokens": 929,
+          "prefill_tps": 330.69571757944976
+        },
+        {
+          "backend": "llama.cpp + MTP",
+          "suite": "speed",
+          "rep": 3,
+          "wall": 88.28550098312553,
+          "prefill": 4.8401369999999995,
+          "decode": 83.407083,
+          "tokens": 5084,
+          "thinking": 3482,
+          "tps": 60.95405590434088,
+          "prefill_tokens": 1703,
+          "prefill_tps": 351.84954475462166
+        }
+      ],
+      "source": {
+        "name": "Frozen Swift controlled benchmark v1",
+        "description": "Measured on linuxmacan. Raw results.json, suite.json, launch.json, and analysis.py retained in work/swift-controlled-v1.",
+        "evidenceFlow": [
+          {
+            "title": "Measurement",
+            "detail": "96 requests planned: 16 frozen prompts \u00d7 2 backends \u00d7 3 repetitions. No prior exploratory runs included."
+          },
+          {
+            "title": "Aggregation",
+            "detail": "Sum times and tokens within each suite/repetition; report medians of three run totals. Quality passes require exact answers and JSON types, no repair."
+          }
+        ],
+        "metricDefinitions": [
+          {
+            "label": "Thinking text tokens",
+            "definition": "Returned reasoning text retokenized using the same Swift tokenizer with special-token addition disabled. Excludes wrapper markers; may differ from native generated reasoning-token counts."
+          },
+          {
+            "label": "Generation rate",
+            "definition": "Total completion tokens, including thinking, divided by measured generation seconds. Prefill and HTTP overhead excluded."
+          }
+        ]
+      }
+    },
+    "token_summary": {
+      "rows": [
+        {
+          "backend": "Lucebox + DFlash2",
+          "suite": "quality",
+          "repetitions": 3,
+          "median_wall": 20.85,
+          "median_prefill": 1.17,
+          "median_decode": 19.63,
+          "median_tokens": 1717,
+          "median_thinking": 1590,
+          "median_tps": 87.45,
+          "median_prefill_tokens": 929,
+          "median_prefill_tps": 797.08,
+          "min_wall": 20.56,
+          "max_wall": 20.86,
+          "min_tps": 87.38,
+          "max_tps": 88.69
+        },
+        {
+          "backend": "Lucebox + DFlash2",
+          "suite": "speed",
+          "repetitions": 3,
+          "median_wall": 64.15,
+          "median_prefill": 1.98,
+          "median_decode": 62.08,
+          "median_tokens": 5605,
+          "median_thinking": 4092,
+          "median_tps": 90.29,
+          "median_prefill_tokens": 1703,
+          "median_prefill_tps": 859.19,
+          "min_wall": 63.57,
+          "max_wall": 64.21,
+          "min_tps": 90.21,
+          "max_tps": 91.09
+        },
+        {
+          "backend": "llama.cpp + MTP",
+          "suite": "quality",
+          "repetitions": 3,
+          "median_wall": 28.8,
+          "median_prefill": 2.8,
+          "median_decode": 25.98,
+          "median_tokens": 1574,
+          "median_thinking": 1447,
+          "median_tps": 60.6,
+          "median_prefill_tokens": 929,
+          "median_prefill_tps": 331.75,
+          "min_wall": 28.39,
+          "max_wall": 28.82,
+          "min_tps": 60.58,
+          "max_tps": 61.49
+        },
+        {
+          "backend": "llama.cpp + MTP",
+          "suite": "speed",
+          "repetitions": 3,
+          "median_wall": 88.13,
+          "median_prefill": 4.84,
+          "median_decode": 83.16,
+          "median_tokens": 5084,
+          "median_thinking": 3482,
+          "median_tps": 61.14,
+          "median_prefill_tokens": 1703,
+          "median_prefill_tps": 351.85,
+          "min_wall": 86.99,
+          "max_wall": 88.29,
+          "min_tps": 60.95,
+          "max_tps": 61.89
+        }
+      ],
+      "source": {
+        "name": "Frozen Swift controlled benchmark v1",
+        "description": "Measured on linuxmacan. Raw results.json, suite.json, launch.json, and analysis.py retained in work/swift-controlled-v1.",
+        "evidenceFlow": [
+          {
+            "title": "Measurement",
+            "detail": "96 requests planned: 16 frozen prompts \u00d7 2 backends \u00d7 3 repetitions. No prior exploratory runs included."
+          },
+          {
+            "title": "Aggregation",
+            "detail": "Sum times and tokens within each suite/repetition; report medians of three run totals. Quality passes require exact answers and JSON types, no repair."
+          }
+        ],
+        "metricDefinitions": [
+          {
+            "label": "Thinking text tokens",
+            "definition": "Returned reasoning text retokenized using the same Swift tokenizer with special-token addition disabled. Excludes wrapper markers; may differ from native generated reasoning-token counts."
+          },
+          {
+            "label": "Generation rate",
+            "definition": "Total completion tokens, including thinking, divided by measured generation seconds. Prefill and HTTP overhead excluded."
+          }
+        ]
+      }
+    },
+    "variation": {
+      "rows": [
+        {
+          "backend": "Lucebox + DFlash2",
+          "suite": "quality",
+          "repetitions": 3,
+          "median_wall": 20.85,
+          "median_prefill": 1.17,
+          "median_decode": 19.63,
+          "median_tokens": 1717,
+          "median_thinking": 1590,
+          "median_tps": 87.45,
+          "median_prefill_tokens": 929,
+          "median_prefill_tps": 797.08,
+          "min_wall": 20.56,
+          "max_wall": 20.86,
+          "min_tps": 87.38,
+          "max_tps": 88.69
+        },
+        {
+          "backend": "Lucebox + DFlash2",
+          "suite": "speed",
+          "repetitions": 3,
+          "median_wall": 64.15,
+          "median_prefill": 1.98,
+          "median_decode": 62.08,
+          "median_tokens": 5605,
+          "median_thinking": 4092,
+          "median_tps": 90.29,
+          "median_prefill_tokens": 1703,
+          "median_prefill_tps": 859.19,
+          "min_wall": 63.57,
+          "max_wall": 64.21,
+          "min_tps": 90.21,
+          "max_tps": 91.09
+        },
+        {
+          "backend": "llama.cpp + MTP",
+          "suite": "quality",
+          "repetitions": 3,
+          "median_wall": 28.8,
+          "median_prefill": 2.8,
+          "median_decode": 25.98,
+          "median_tokens": 1574,
+          "median_thinking": 1447,
+          "median_tps": 60.6,
+          "median_prefill_tokens": 929,
+          "median_prefill_tps": 331.75,
+          "min_wall": 28.39,
+          "max_wall": 28.82,
+          "min_tps": 60.58,
+          "max_tps": 61.49
+        },
+        {
+          "backend": "llama.cpp + MTP",
+          "suite": "speed",
+          "repetitions": 3,
+          "median_wall": 88.13,
+          "median_prefill": 4.84,
+          "median_decode": 83.16,
+          "median_tokens": 5084,
+          "median_thinking": 3482,
+          "median_tps": 61.14,
+          "median_prefill_tokens": 1703,
+          "median_prefill_tps": 351.85,
+          "min_wall": 86.99,
+          "max_wall": 88.29,
+          "min_tps": 60.95,
+          "max_tps": 61.89
+        }
+      ],
+      "source": {
+        "name": "Frozen Swift controlled benchmark v1",
+        "description": "Measured on linuxmacan. Raw results.json, suite.json, launch.json, and analysis.py retained in work/swift-controlled-v1.",
+        "evidenceFlow": [
+          {
+            "title": "Measurement",
+            "detail": "96 requests planned: 16 frozen prompts \u00d7 2 backends \u00d7 3 repetitions. No prior exploratory runs included."
+          },
+          {
+            "title": "Aggregation",
+            "detail": "Sum times and tokens within each suite/repetition; report medians of three run totals. Quality passes require exact answers and JSON types, no repair."
+          }
+        ],
+        "metricDefinitions": [
+          {
+            "label": "Thinking text tokens",
+            "definition": "Returned reasoning text retokenized using the same Swift tokenizer with special-token addition disabled. Excludes wrapper markers; may differ from native generated reasoning-token counts."
+          },
+          {
+            "label": "Generation rate",
+            "definition": "Total completion tokens, including thinking, divided by measured generation seconds. Prefill and HTTP overhead excluded."
+          }
+        ]
+      }
+    },
+    "unsloth": {
+      "rows": [
+        {
+          "suite": "quality",
+          "backend": "Unsloth + DFlash2 (one run)",
+          "prefill": 1.17,
+          "decode": 36.28,
+          "wall": 37.5,
+          "tokens": 3073,
+          "thinking": 2946,
+          "tps": 84.71
+        },
+        {
+          "suite": "speed",
+          "backend": "Unsloth + DFlash2 (one run)",
+          "prefill": 1.91,
+          "decode": 63.64,
+          "wall": 65.63,
+          "tokens": 6190,
+          "thinking": 4895,
+          "tps": 97.27
+        }
+      ],
+      "source": {
+        "name": "Unsloth controlled single run",
+        "description": "work/unsloth-controlled-once/results.json; exact suite and request bodies match swift-controlled-v1. One repetition, not a median."
+      }
+    },
+    "unsloth_detail": {
+      "rows": [
+        {
+          "prompt": "arithmetic",
+          "suite": "quality",
+          "wall": 26.36,
+          "tokens": 2063,
+          "thinking": 2052,
+          "quality": "True"
+        },
+        {
+          "prompt": "constraints",
+          "suite": "quality",
+          "wall": 1.37,
+          "tokens": 114,
+          "thinking": 100,
+          "quality": "True"
+        },
+        {
+          "prompt": "code_aliasing",
+          "suite": "quality",
+          "wall": 3.17,
+          "tokens": 303,
+          "thinking": 281,
+          "quality": "True"
+        },
+        {
+          "prompt": "code_intervals",
+          "suite": "quality",
+          "wall": 3.97,
+          "tokens": 395,
+          "thinking": 367,
+          "quality": "True"
+        },
+        {
+          "prompt": "extraction",
+          "suite": "quality",
+          "wall": 1.67,
+          "tokens": 126,
+          "thinking": 116,
+          "quality": "True"
+        },
+        {
+          "prompt": "tool_call",
+          "suite": "quality",
+          "wall": 0.96,
+          "tokens": 72,
+          "thinking": 30,
+          "quality": "True"
+        },
+        {
+          "prompt": "has_close_elements",
+          "suite": "speed",
+          "wall": 7.59,
+          "tokens": 747,
+          "thinking": 572,
+          "quality": "Not scored"
+        },
+        {
+          "prompt": "separate_paren_groups",
+          "suite": "speed",
+          "wall": 11.29,
+          "tokens": 1061,
+          "thinking": 832,
+          "quality": "Not scored"
+        },
+        {
+          "prompt": "truncate_number",
+          "suite": "speed",
+          "wall": 6.88,
+          "tokens": 497,
+          "thinking": 483,
+          "quality": "Not scored"
+        },
+        {
+          "prompt": "below_zero",
+          "suite": "speed",
+          "wall": 3.87,
+          "tokens": 391,
+          "thinking": 232,
+          "quality": "Not scored"
+        },
+        {
+          "prompt": "mean_absolute_deviation",
+          "suite": "speed",
+          "wall": 12.65,
+          "tokens": 1030,
+          "thinking": 994,
+          "quality": "Not scored"
+        },
+        {
+          "prompt": "intersperse",
+          "suite": "speed",
+          "wall": 4.49,
+          "tokens": 511,
+          "thinking": 367,
+          "quality": "Not scored"
+        },
+        {
+          "prompt": "parse_nested_parens",
+          "suite": "speed",
+          "wall": 8.66,
+          "tokens": 845,
+          "thinking": 637,
+          "quality": "Not scored"
+        },
+        {
+          "prompt": "filter_by_substring",
+          "suite": "speed",
+          "wall": 1.81,
+          "tokens": 181,
+          "thinking": 161,
+          "quality": "Not scored"
+        },
+        {
+          "prompt": "sum_product",
+          "suite": "speed",
+          "wall": 3.77,
+          "tokens": 431,
+          "thinking": 274,
+          "quality": "Not scored"
+        },
+        {
+          "prompt": "rolling_max",
+          "suite": "speed",
+          "wall": 4.63,
+          "tokens": 496,
+          "thinking": 343,
+          "quality": "Not scored"
+        }
+      ],
+      "source": {
+        "name": "Unsloth controlled single run",
+        "description": "work/unsloth-controlled-once/results.json; exact suite and request bodies match swift-controlled-v1. One repetition, not a median."
+      }
+    }
+  },
+  "id": "report:b712795c-89a9-4f9e-a301-c5f23a0458d7",
+  "buildStatus": "complete",
+  "report": {
+    "asOf": "2026-09-16"
+  },
+  "finding": "## DFlash2 finished the article suite 27.2% sooner\n\nWith the frozen inputs and xhigh thinking, median total request time was **64.15s for Lucebox + DFlash2** and **88.13s for llama.cpp + MTP**. Median generation throughput was **90.29 versus 61.14 tokens/s**, including thinking.\n\nBoth passed **18/18 quality checks**: six distinct tasks repeated three times, with exact answers and strict JSON/tool-call formatting. No output reached the ceiling. This is a small correctness screen, not proof of equal quality on broader coding work.\n\nThe backends generated different numbers of tokens despite identical inputs. Total latency therefore reflects both output length and generation speed. This compares complete serving configurations, not the speculation algorithms in isolation.",
+  "methodsText": "## Reading the measurements\n\n**Two suites, never pooled.** Quality has six fixed, known-answer tasks. Speed has the ten canonical Lucebox article prompts; generated code is not executed or scored for correctness. Each row sums one full suite, then takes the median across three repetitions. Per-prompt rows take medians separately, so their sums need not equal the suite median.\n\n**Tokens.** Input and total generated counts come from each server. Total generated includes thinking, final answers, and any generated protocol tokens. Thinking text is retokenized with the same Swift tokenizer for both backends, without added special tokens. This excludes wrapper markers and may differ slightly from native reasoning-token counts; Lucebox's native counts are retained in the raw data. Do not subtract thinking text tokens from total generated and label the remainder exactly as visible-answer tokens.\n\n**Time.** Prefill and generation are the backend's own reported phase times. Total time is externally measured HTTP wall time; it also includes parsing, transport and other request overhead. Model loading, a single unmeasured warmup, and post-run token counting are excluded. Decode tok/s divides all generated tokens by generation time. Three repeats quantify limited timing variation; fixed-seed repeats do not create new independent quality tasks.\n\n## Frozen settings and controls\n\nSame Swift IQ4_XS file and embedded Jinja template; xhigh thinking, temperature 0, seed 42, non-streaming requests, single stream, 65,536-token context, 64,000-token output ceiling, GPU weights and Q8 K/V. Forced thinking closure and prefix caching are disabled. The finite context prevents truly unlimited output; no response approached the ceiling. DFlash2 uses its existing Q8 drafter and block 16; MTP uses the embedded head and maximum three draft tokens. No prompt compression.\n\nRun order: DFlash2, MTP, MTP, DFlash2, DFlash2, MTP. Fresh process and the same short warmup per repetition; GPU memory is checked between loads. Request bodies and prompt-token counts match across all six runs. All 96 responses contain thinking text, complete normally, and report zero cached input tokens.\n\n## Scope and exclusions\n\nThe six quality prompts and rubric were frozen before measured runs. The JSON-array requirement is explicit in this version and identical for both backends. No answers were repaired or coerced. The exact text, expected objects and tool schema appear below.\n\nEarlier exploratory results are excluded. A discarded setup run exposed a silent 32,768-token server clamp; startup was corrected and all measured repetitions restarted. The partial data remain in a separately named rejected-preflight folder and are not included here. Earlier startup recovery briefly encountered delayed GPU-memory release; measured runs used a release check between loads.\n\nThese results describe this machine, model, quantization and the two complete backends. Different numerical kernels and generated traces remain part of that comparison. The speed suite does not establish code correctness, and the quality suite is too small to establish broad model equivalence.\n\n\n**Why earlier numbers differ.** This frozen protocol uses the exact embedded template (including its xhigh instructions), the full context/output settings above, and disabled prefix caching. Earlier exploratory runs used differing renderers, output caps, contexts and reasoning settings. Their throughput values are not pooled with or treated as replicates of this experiment.",
+  "unslothText": "## Regular Unsloth model: one additional run\n\nThe regular **Qwen3.8-27B-UD-IQ4_XS** model with DFlash2 finished the ten article prompts in **65.63s**, producing **6,190 tokens**, including **4,895 thinking-text tokens**, at **97.27 tokens/s**. It passed **6/6** fixed quality checks.\n\nThis is **one run**, compared with the three-run Swift medians above. The same 16 request bodies, scoring rules, xhigh settings, frozen Swift template, drafter and server binary were used. Input token counts match for every task. Prefix caching and compression remain disabled. The Unsloth model's native template differs; we intentionally retained the frozen template to hold the rendered instructions constant. The quantization files are both IQ4_XS-family but have different per-layer quantization layouts, so this is not a pure fine-tuning ablation.\n\nThinking text is counted with the same tokenizer as before; the models' vocabulary and merge hashes match. No response hit the 64,000-token ceiling. This single run does not establish timing variability. Article code remains unscored for correctness.\n"
+}

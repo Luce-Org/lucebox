@@ -1,0 +1,812 @@
+{
+  "summary": [
+    {
+      "backend": "Lucebox + DFlash2",
+      "suite": "quality",
+      "repetitions": 3,
+      "median_wall": 20.85,
+      "median_prefill": 1.17,
+      "median_decode": 19.63,
+      "median_tokens": 1717,
+      "median_thinking": 1590,
+      "median_tps": 87.45,
+      "median_prefill_tokens": 929,
+      "median_prefill_tps": 797.08,
+      "min_wall": 20.56,
+      "max_wall": 20.86,
+      "min_tps": 87.38,
+      "max_tps": 88.69
+    },
+    {
+      "backend": "Lucebox + DFlash2",
+      "suite": "speed",
+      "repetitions": 3,
+      "median_wall": 64.15,
+      "median_prefill": 1.98,
+      "median_decode": 62.08,
+      "median_tokens": 5605,
+      "median_thinking": 4092,
+      "median_tps": 90.29,
+      "median_prefill_tokens": 1703,
+      "median_prefill_tps": 859.19,
+      "min_wall": 63.57,
+      "max_wall": 64.21,
+      "min_tps": 90.21,
+      "max_tps": 91.09
+    },
+    {
+      "backend": "llama.cpp + MTP",
+      "suite": "quality",
+      "repetitions": 3,
+      "median_wall": 28.8,
+      "median_prefill": 2.8,
+      "median_decode": 25.98,
+      "median_tokens": 1574,
+      "median_thinking": 1447,
+      "median_tps": 60.6,
+      "median_prefill_tokens": 929,
+      "median_prefill_tps": 331.75,
+      "min_wall": 28.39,
+      "max_wall": 28.82,
+      "min_tps": 60.58,
+      "max_tps": 61.49
+    },
+    {
+      "backend": "llama.cpp + MTP",
+      "suite": "speed",
+      "repetitions": 3,
+      "median_wall": 88.13,
+      "median_prefill": 4.84,
+      "median_decode": 83.16,
+      "median_tokens": 5084,
+      "median_thinking": 3482,
+      "median_tps": 61.14,
+      "median_prefill_tokens": 1703,
+      "median_prefill_tps": 351.85,
+      "min_wall": 86.99,
+      "max_wall": 88.29,
+      "min_tps": 60.95,
+      "max_tps": 61.89
+    }
+  ],
+  "runs": [
+    {
+      "backend": "Lucebox + DFlash2",
+      "suite": "quality",
+      "rep": 1,
+      "wall": 20.556709003052674,
+      "prefill": 1.1495,
+      "decode": 19.3592,
+      "tokens": 1717,
+      "thinking": 1590,
+      "tps": 88.69168147444108,
+      "prefill_tokens": 929,
+      "prefill_tps": 808.1774684645499
+    },
+    {
+      "backend": "Lucebox + DFlash2",
+      "suite": "speed",
+      "rep": 1,
+      "wall": 63.5745523518417,
+      "prefill": 1.9589,
+      "decode": 61.5309,
+      "tokens": 5605,
+      "thinking": 4092,
+      "tps": 91.09244298393165,
+      "prefill_tokens": 1703,
+      "prefill_tps": 869.3654602072592
+    },
+    {
+      "backend": "Lucebox + DFlash2",
+      "suite": "quality",
+      "rep": 2,
+      "wall": 20.86335973383393,
+      "prefill": 1.1676,
+      "decode": 19.6493,
+      "tokens": 1717,
+      "thinking": 1590,
+      "tps": 87.38224771365901,
+      "prefill_tokens": 929,
+      "prefill_tps": 795.6491949297705
+    },
+    {
+      "backend": "Lucebox + DFlash2",
+      "suite": "speed",
+      "rep": 2,
+      "wall": 64.21126437408384,
+      "prefill": 1.9909000000000001,
+      "decode": 62.1345,
+      "tokens": 5605,
+      "thinking": 4092,
+      "tps": 90.2075336568251,
+      "prefill_tokens": 1703,
+      "prefill_tps": 855.3920337535787
+    },
+    {
+      "backend": "Lucebox + DFlash2",
+      "suite": "quality",
+      "rep": 3,
+      "wall": 20.8455297681503,
+      "prefill": 1.1655,
+      "decode": 19.6333,
+      "tokens": 1717,
+      "thinking": 1590,
+      "tps": 87.45345917395446,
+      "prefill_tokens": 929,
+      "prefill_tps": 797.0827970827971
+    },
+    {
+      "backend": "Lucebox + DFlash2",
+      "suite": "speed",
+      "rep": 3,
+      "wall": 64.14997540204786,
+      "prefill": 1.9821,
+      "decode": 62.0796,
+      "tokens": 5605,
+      "thinking": 4092,
+      "tps": 90.28730855224583,
+      "prefill_tokens": 1703,
+      "prefill_tps": 859.1897482468089
+    },
+    {
+      "backend": "llama.cpp + MTP",
+      "suite": "quality",
+      "rep": 1,
+      "wall": 28.389900952926837,
+      "prefill": 2.766497,
+      "decode": 25.598021,
+      "tokens": 1574,
+      "thinking": 1447,
+      "tps": 61.489128397855445,
+      "prefill_tokens": 929,
+      "prefill_tps": 335.8037257947505
+    },
+    {
+      "backend": "llama.cpp + MTP",
+      "suite": "speed",
+      "rep": 1,
+      "wall": 86.98857973399572,
+      "prefill": 4.800631,
+      "decode": 82.15076499999999,
+      "tokens": 5084,
+      "thinking": 3482,
+      "tps": 61.886216153921396,
+      "prefill_tokens": 1703,
+      "prefill_tps": 354.74503247593907
+    },
+    {
+      "backend": "llama.cpp + MTP",
+      "suite": "quality",
+      "rep": 2,
+      "wall": 28.797632195055485,
+      "prefill": 2.800341,
+      "decode": 25.975103999999998,
+      "tokens": 1574,
+      "thinking": 1447,
+      "tps": 60.59648500348642,
+      "prefill_tokens": 929,
+      "prefill_tps": 331.7453124458771
+    },
+    {
+      "backend": "llama.cpp + MTP",
+      "suite": "speed",
+      "rep": 2,
+      "wall": 88.13138094323222,
+      "prefill": 4.936259,
+      "decode": 83.15565,
+      "tokens": 5084,
+      "thinking": 3482,
+      "tps": 61.13835920950651,
+      "prefill_tokens": 1703,
+      "prefill_tps": 344.9981048401229
+    },
+    {
+      "backend": "llama.cpp + MTP",
+      "suite": "quality",
+      "rep": 3,
+      "wall": 28.816793619072996,
+      "prefill": 2.8092289999999998,
+      "decode": 25.982522,
+      "tokens": 1574,
+      "thinking": 1447,
+      "tps": 60.57918473041224,
+      "prefill_tokens": 929,
+      "prefill_tps": 330.69571757944976
+    },
+    {
+      "backend": "llama.cpp + MTP",
+      "suite": "speed",
+      "rep": 3,
+      "wall": 88.28550098312553,
+      "prefill": 4.8401369999999995,
+      "decode": 83.407083,
+      "tokens": 5084,
+      "thinking": 3482,
+      "tps": 60.95405590434088,
+      "prefill_tokens": 1703,
+      "prefill_tps": 351.84954475462166
+    }
+  ],
+  "quality": [
+    {
+      "backend": "Lucebox + DFlash2",
+      "prompt": "arithmetic",
+      "answers": 3,
+      "format": 3,
+      "passed": 3,
+      "repetitions": 3
+    },
+    {
+      "backend": "llama.cpp + MTP",
+      "prompt": "arithmetic",
+      "answers": 3,
+      "format": 3,
+      "passed": 3,
+      "repetitions": 3
+    },
+    {
+      "backend": "Lucebox + DFlash2",
+      "prompt": "constraints",
+      "answers": 3,
+      "format": 3,
+      "passed": 3,
+      "repetitions": 3
+    },
+    {
+      "backend": "llama.cpp + MTP",
+      "prompt": "constraints",
+      "answers": 3,
+      "format": 3,
+      "passed": 3,
+      "repetitions": 3
+    },
+    {
+      "backend": "Lucebox + DFlash2",
+      "prompt": "code_aliasing",
+      "answers": 3,
+      "format": 3,
+      "passed": 3,
+      "repetitions": 3
+    },
+    {
+      "backend": "llama.cpp + MTP",
+      "prompt": "code_aliasing",
+      "answers": 3,
+      "format": 3,
+      "passed": 3,
+      "repetitions": 3
+    },
+    {
+      "backend": "Lucebox + DFlash2",
+      "prompt": "code_intervals",
+      "answers": 3,
+      "format": 3,
+      "passed": 3,
+      "repetitions": 3
+    },
+    {
+      "backend": "llama.cpp + MTP",
+      "prompt": "code_intervals",
+      "answers": 3,
+      "format": 3,
+      "passed": 3,
+      "repetitions": 3
+    },
+    {
+      "backend": "Lucebox + DFlash2",
+      "prompt": "extraction",
+      "answers": 3,
+      "format": 3,
+      "passed": 3,
+      "repetitions": 3
+    },
+    {
+      "backend": "llama.cpp + MTP",
+      "prompt": "extraction",
+      "answers": 3,
+      "format": 3,
+      "passed": 3,
+      "repetitions": 3
+    },
+    {
+      "backend": "Lucebox + DFlash2",
+      "prompt": "tool_call",
+      "answers": 3,
+      "format": 3,
+      "passed": 3,
+      "repetitions": 3
+    },
+    {
+      "backend": "llama.cpp + MTP",
+      "prompt": "tool_call",
+      "answers": 3,
+      "format": 3,
+      "passed": 3,
+      "repetitions": 3
+    }
+  ],
+  "detail": [
+    {
+      "backend": "Lucebox + DFlash2",
+      "suite": "quality",
+      "prompt": "arithmetic",
+      "repetitions": 3,
+      "wall": 6.53,
+      "prefill": 0.2,
+      "decode": 6.32,
+      "tokens": 534,
+      "thinking": 523
+    },
+    {
+      "backend": "llama.cpp + MTP",
+      "suite": "quality",
+      "prompt": "arithmetic",
+      "repetitions": 3,
+      "wall": 8.79,
+      "prefill": 0.49,
+      "decode": 8.3,
+      "tokens": 497,
+      "thinking": 486
+    },
+    {
+      "backend": "Lucebox + DFlash2",
+      "suite": "quality",
+      "prompt": "constraints",
+      "repetitions": 3,
+      "wall": 1.78,
+      "prefill": 0.14,
+      "decode": 1.64,
+      "tokens": 130,
+      "thinking": 116
+    },
+    {
+      "backend": "llama.cpp + MTP",
+      "suite": "quality",
+      "prompt": "constraints",
+      "repetitions": 3,
+      "wall": 2.46,
+      "prefill": 0.42,
+      "decode": 2.04,
+      "tokens": 125,
+      "thinking": 111
+    },
+    {
+      "backend": "Lucebox + DFlash2",
+      "suite": "quality",
+      "prompt": "code_aliasing",
+      "repetitions": 3,
+      "wall": 3.37,
+      "prefill": 0.14,
+      "decode": 3.22,
+      "tokens": 287,
+      "thinking": 265
+    },
+    {
+      "backend": "llama.cpp + MTP",
+      "suite": "quality",
+      "prompt": "code_aliasing",
+      "repetitions": 3,
+      "wall": 4.37,
+      "prefill": 0.43,
+      "decode": 3.94,
+      "tokens": 257,
+      "thinking": 235
+    },
+    {
+      "backend": "Lucebox + DFlash2",
+      "suite": "quality",
+      "prompt": "code_intervals",
+      "repetitions": 3,
+      "wall": 6.32,
+      "prefill": 0.14,
+      "decode": 6.17,
+      "tokens": 573,
+      "thinking": 545
+    },
+    {
+      "backend": "llama.cpp + MTP",
+      "suite": "quality",
+      "prompt": "code_intervals",
+      "repetitions": 3,
+      "wall": 8.55,
+      "prefill": 0.42,
+      "decode": 8.12,
+      "tokens": 503,
+      "thinking": 475
+    },
+    {
+      "backend": "Lucebox + DFlash2",
+      "suite": "quality",
+      "prompt": "extraction",
+      "repetitions": 3,
+      "wall": 1.56,
+      "prefill": 0.18,
+      "decode": 1.37,
+      "tokens": 118,
+      "thinking": 108
+    },
+    {
+      "backend": "llama.cpp + MTP",
+      "suite": "quality",
+      "prompt": "extraction",
+      "repetitions": 3,
+      "wall": 2.49,
+      "prefill": 0.44,
+      "decode": 2.05,
+      "tokens": 117,
+      "thinking": 107
+    },
+    {
+      "backend": "Lucebox + DFlash2",
+      "suite": "quality",
+      "prompt": "tool_call",
+      "repetitions": 3,
+      "wall": 1.27,
+      "prefill": 0.36,
+      "decode": 0.9,
+      "tokens": 75,
+      "thinking": 33
+    },
+    {
+      "backend": "llama.cpp + MTP",
+      "suite": "quality",
+      "prompt": "tool_call",
+      "repetitions": 3,
+      "wall": 2.03,
+      "prefill": 0.6,
+      "decode": 1.41,
+      "tokens": 75,
+      "thinking": 33
+    },
+    {
+      "backend": "Lucebox + DFlash2",
+      "suite": "speed",
+      "prompt": "has_close_elements",
+      "repetitions": 3,
+      "wall": 8.95,
+      "prefill": 0.21,
+      "decode": 8.73,
+      "tokens": 770,
+      "thinking": 595
+    },
+    {
+      "backend": "llama.cpp + MTP",
+      "suite": "speed",
+      "prompt": "has_close_elements",
+      "repetitions": 3,
+      "wall": 14.72,
+      "prefill": 0.57,
+      "decode": 14.14,
+      "tokens": 840,
+      "thinking": 665
+    },
+    {
+      "backend": "Lucebox + DFlash2",
+      "suite": "speed",
+      "prompt": "separate_paren_groups",
+      "repetitions": 3,
+      "wall": 16.44,
+      "prefill": 0.2,
+      "decode": 16.22,
+      "tokens": 1233,
+      "thinking": 1011
+    },
+    {
+      "backend": "llama.cpp + MTP",
+      "suite": "speed",
+      "prompt": "separate_paren_groups",
+      "repetitions": 3,
+      "wall": 16.3,
+      "prefill": 0.48,
+      "decode": 15.82,
+      "tokens": 923,
+      "thinking": 694
+    },
+    {
+      "backend": "Lucebox + DFlash2",
+      "suite": "speed",
+      "prompt": "truncate_number",
+      "repetitions": 3,
+      "wall": 6.93,
+      "prefill": 0.17,
+      "decode": 6.74,
+      "tokens": 506,
+      "thinking": 492
+    },
+    {
+      "backend": "llama.cpp + MTP",
+      "suite": "speed",
+      "prompt": "truncate_number",
+      "repetitions": 3,
+      "wall": 7.57,
+      "prefill": 0.44,
+      "decode": 7.13,
+      "tokens": 433,
+      "thinking": 334
+    },
+    {
+      "backend": "Lucebox + DFlash2",
+      "suite": "speed",
+      "prompt": "below_zero",
+      "repetitions": 3,
+      "wall": 3.36,
+      "prefill": 0.2,
+      "decode": 3.15,
+      "tokens": 308,
+      "thinking": 149
+    },
+    {
+      "backend": "llama.cpp + MTP",
+      "suite": "speed",
+      "prompt": "below_zero",
+      "repetitions": 3,
+      "wall": 5.07,
+      "prefill": 0.51,
+      "decode": 4.54,
+      "tokens": 281,
+      "thinking": 123
+    },
+    {
+      "backend": "Lucebox + DFlash2",
+      "suite": "speed",
+      "prompt": "mean_absolute_deviation",
+      "repetitions": 3,
+      "wall": 9.84,
+      "prefill": 0.2,
+      "decode": 9.63,
+      "tokens": 725,
+      "thinking": 559
+    },
+    {
+      "backend": "llama.cpp + MTP",
+      "suite": "speed",
+      "prompt": "mean_absolute_deviation",
+      "repetitions": 3,
+      "wall": 9.43,
+      "prefill": 0.47,
+      "decode": 8.96,
+      "tokens": 546,
+      "thinking": 380
+    },
+    {
+      "backend": "Lucebox + DFlash2",
+      "suite": "speed",
+      "prompt": "intersperse",
+      "repetitions": 3,
+      "wall": 2.74,
+      "prefill": 0.2,
+      "decode": 2.54,
+      "tokens": 347,
+      "thinking": 207
+    },
+    {
+      "backend": "llama.cpp + MTP",
+      "suite": "speed",
+      "prompt": "intersperse",
+      "repetitions": 3,
+      "wall": 5.9,
+      "prefill": 0.45,
+      "decode": 5.45,
+      "tokens": 342,
+      "thinking": 202
+    },
+    {
+      "backend": "Lucebox + DFlash2",
+      "suite": "speed",
+      "prompt": "parse_nested_parens",
+      "repetitions": 3,
+      "wall": 7.51,
+      "prefill": 0.2,
+      "decode": 7.29,
+      "tokens": 744,
+      "thinking": 531
+    },
+    {
+      "backend": "llama.cpp + MTP",
+      "suite": "speed",
+      "prompt": "parse_nested_parens",
+      "repetitions": 3,
+      "wall": 12.44,
+      "prefill": 0.48,
+      "decode": 11.95,
+      "tokens": 746,
+      "thinking": 535
+    },
+    {
+      "backend": "Lucebox + DFlash2",
+      "suite": "speed",
+      "prompt": "filter_by_substring",
+      "repetitions": 3,
+      "wall": 1.91,
+      "prefill": 0.19,
+      "decode": 1.71,
+      "tokens": 201,
+      "thinking": 87
+    },
+    {
+      "backend": "llama.cpp + MTP",
+      "suite": "speed",
+      "prompt": "filter_by_substring",
+      "repetitions": 3,
+      "wall": 3.78,
+      "prefill": 0.45,
+      "decode": 3.32,
+      "tokens": 201,
+      "thinking": 87
+    },
+    {
+      "backend": "Lucebox + DFlash2",
+      "suite": "speed",
+      "prompt": "sum_product",
+      "repetitions": 3,
+      "wall": 2.89,
+      "prefill": 0.2,
+      "decode": 2.68,
+      "tokens": 375,
+      "thinking": 218
+    },
+    {
+      "backend": "llama.cpp + MTP",
+      "suite": "speed",
+      "prompt": "sum_product",
+      "repetitions": 3,
+      "wall": 6.15,
+      "prefill": 0.48,
+      "decode": 5.68,
+      "tokens": 375,
+      "thinking": 218
+    },
+    {
+      "backend": "Lucebox + DFlash2",
+      "suite": "speed",
+      "prompt": "rolling_max",
+      "repetitions": 3,
+      "wall": 3.57,
+      "prefill": 0.2,
+      "decode": 3.36,
+      "tokens": 396,
+      "thinking": 243
+    },
+    {
+      "backend": "llama.cpp + MTP",
+      "suite": "speed",
+      "prompt": "rolling_max",
+      "repetitions": 3,
+      "wall": 6.56,
+      "prefill": 0.53,
+      "decode": 6.02,
+      "tokens": 397,
+      "thinking": 244
+    }
+  ],
+  "prompt_counts": {
+    "arithmetic": {
+      "dflash": [
+        118
+      ],
+      "mtp": [
+        118
+      ]
+    },
+    "constraints": {
+      "dflash": [
+        104
+      ],
+      "mtp": [
+        104
+      ]
+    },
+    "code_aliasing": {
+      "dflash": [
+        125
+      ],
+      "mtp": [
+        125
+      ]
+    },
+    "code_intervals": {
+      "dflash": [
+        114
+      ],
+      "mtp": [
+        114
+      ]
+    },
+    "extraction": {
+      "dflash": [
+        130
+      ],
+      "mtp": [
+        130
+      ]
+    },
+    "tool_call": {
+      "dflash": [
+        338
+      ],
+      "mtp": [
+        338
+      ]
+    },
+    "has_close_elements": {
+      "dflash": [
+        177
+      ],
+      "mtp": [
+        177
+      ]
+    },
+    "separate_paren_groups": {
+      "dflash": [
+        187
+      ],
+      "mtp": [
+        187
+      ]
+    },
+    "truncate_number": {
+      "dflash": [
+        138
+      ],
+      "mtp": [
+        138
+      ]
+    },
+    "below_zero": {
+      "dflash": [
+        180
+      ],
+      "mtp": [
+        180
+      ]
+    },
+    "mean_absolute_deviation": {
+      "dflash": [
+        172
+      ],
+      "mtp": [
+        172
+      ]
+    },
+    "intersperse": {
+      "dflash": [
+        156
+      ],
+      "mtp": [
+        156
+      ]
+    },
+    "parse_nested_parens": {
+      "dflash": [
+        191
+      ],
+      "mtp": [
+        191
+      ]
+    },
+    "filter_by_substring": {
+      "dflash": [
+        147
+      ],
+      "mtp": [
+        147
+      ]
+    },
+    "sum_product": {
+      "dflash": [
+        183
+      ],
+      "mtp": [
+        183
+      ]
+    },
+    "rolling_max": {
+      "dflash": [
+        172
+      ],
+      "mtp": [
+        172
+      ]
+    }
+  }
+}

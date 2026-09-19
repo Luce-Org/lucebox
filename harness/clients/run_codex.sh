@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${MAX_CTX:=32768}"
 : "${BUDGET:=22}"
 : "${VERIFY_MODE:=ddtree}"
-: "${EXTRA_SERVER_ARGS:=--lazy-draft}"
+: "${EXTRA_SERVER_ARGS:=}"
 : "${CODEX_TIMEOUT:=3600}"
 if [[ "${MODEL_SERVER:-}" == "llamacpp" ]]; then
   : "${LLAMA_COMPAT_PROXY:=responses}"

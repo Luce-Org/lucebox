@@ -1,0 +1,552 @@
+[
+  {
+    "name": "has_close_elements",
+    "request": {
+      "model": "swift-qwen",
+      "messages": [
+        {
+          "role": "user",
+          "content": "from typing import List\n\ndef has_close_elements(numbers: List[float], threshold: float) -> bool:\n    \"\"\"Check if in given list of numbers, are any two numbers closer to each other than\n    given threshold.\n    >>> has_close_elements([1.0, 2.0, 3.0], 0.5)\n    False\n    >>> has_close_elements([1.0, 2.8, 3.0, 4.0, 5.0, 2.0], 0.3)\n    True\n    \"\"\"\n    for"
+        }
+      ],
+      "max_tokens": 256,
+      "temperature": 0,
+      "reasoning_effort": "none",
+      "seed": 42
+    },
+    "wall_seconds": 2.957810978987254,
+    "response": {
+      "choices": [
+        {
+          "finish_reason": "stop",
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "```python\nfrom typing import List\n\ndef has_close_elements(numbers: List[float], threshold: float) -> bool:\n    \"\"\"Check if in given list of numbers, are any two numbers closer to each other than\n    given threshold.\n    >>> has_close_elements([1.0, 2.0, 3.0], 0.5)\n    False\n    >>> has_close_elements([1.0, 2.8, 3.0, 4.0, 5.0, 2.0], 0.3)\n    True\n    \"\"\"\n    for i in range(len(numbers)):\n        for j in range(i + 1, len(numbers)):\n            if abs(numbers[i] - numbers[j]) < threshold:\n                return True\n    return False\n```"
+          }
+        }
+      ],
+      "created": 1789575820,
+      "model": "swift-qwen",
+      "system_fingerprint": "b1-fa67698",
+      "object": "chat.completion",
+      "usage": {
+        "completion_tokens": 173,
+        "prompt_tokens": 137,
+        "total_tokens": 310,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "id": "chatcmpl-Ia7cLs1HT7GDq9GcxtY31FpUQ2V2j16Q",
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 137,
+        "prompt_ms": 360.628,
+        "prompt_per_token_ms": 2.6323211678832115,
+        "prompt_per_second": 379.89285357764794,
+        "predicted_n": 173,
+        "predicted_ms": 2455.179,
+        "predicted_per_token_ms": 14.274296511627908,
+        "predicted_per_second": 70.05599184417919,
+        "draft_n": 132,
+        "draft_n_accepted": 131
+      }
+    }
+  },
+  {
+    "name": "separate_paren_groups",
+    "request": {
+      "model": "swift-qwen",
+      "messages": [
+        {
+          "role": "user",
+          "content": "from typing import List\n\ndef separate_paren_groups(paren_string: str) -> List[str]:\n    \"\"\" Input to this function is a string containing multiple groups of nested parentheses. Your goal is to\n    separate those group into separate strings and return the list of those.\n    Separate groups are balanced (each open brace is properly closed) and not nested within each other\n    Ignore any spaces in the input string.\n    >>> separate_paren_groups('( ) (( )) (( )( ))')\n    ['()', '(())', '(()())']\n    \"\"\"\n    result = []\n    current_string = []\n    current_depth = 0\n    for"
+        }
+      ],
+      "max_tokens": 256,
+      "temperature": 0,
+      "reasoning_effort": "none",
+      "seed": 42
+    },
+    "wall_seconds": 3.6861220869468525,
+    "response": {
+      "choices": [
+        {
+          "finish_reason": "stop",
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "```python\nfrom typing import List\n\ndef separate_paren_groups(paren_string: str) -> List[str]:\n    \"\"\" Input to this function is a string containing multiple groups of nested parentheses. Your goal is to\n    separate those group into separate strings and return the list of those.\n    Separate groups are balanced (each open brace is properly closed) and not nested within each other\n    Ignore any spaces in the input string.\n    >>> separate_paren_groups('( ) (( )) (( )( ))')\n    ['()', '(())', '(()())']\n    \"\"\"\n    result = []\n    current_string = []\n    current_depth = 0\n    for char in paren_string:\n        if char == ' ':\n            continue\n        if char == '(':\n            current_depth += 1\n            current_string.append(char)\n        elif char == ')':\n            current_depth -= 1\n            current_string.append(char)\n            if current_depth == 0:\n                result.append(''.join(current_string))\n                current_string = []\n    return result\n```"
+          }
+        }
+      ],
+      "created": 1789575824,
+      "model": "swift-qwen",
+      "system_fingerprint": "b1-fa67698",
+      "object": "chat.completion",
+      "usage": {
+        "completion_tokens": 227,
+        "prompt_tokens": 147,
+        "total_tokens": 374,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "id": "chatcmpl-OhJWWZbtziR6ge4qDj6oLXN7F7PMunY3",
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 147,
+        "prompt_ms": 366.06,
+        "prompt_per_token_ms": 2.490204081632653,
+        "prompt_per_second": 401.573512538928,
+        "predicted_n": 227,
+        "predicted_ms": 3170.694,
+        "predicted_per_token_ms": 14.029619469026548,
+        "predicted_per_second": 71.27777073410427,
+        "draft_n": 171,
+        "draft_n_accepted": 169
+      }
+    }
+  },
+  {
+    "name": "truncate_number",
+    "request": {
+      "model": "swift-qwen",
+      "messages": [
+        {
+          "role": "user",
+          "content": "def truncate_number(number: float) -> float:\n    \"\"\" Given a positive floating point number, it can be decomposed into\n    and integer part (largest integer smaller than given number) and decimals\n    (leftover part always smaller than 1).\n\n    Return the decimal part of the number.\n    >>> truncate_number(3.5)\n    0.5\n    \"\"\"\n    return"
+        }
+      ],
+      "max_tokens": 256,
+      "temperature": 0,
+      "reasoning_effort": "none",
+      "seed": 42
+    },
+    "wall_seconds": 1.8623288259841502,
+    "response": {
+      "choices": [
+        {
+          "finish_reason": "stop",
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "```python\ndef truncate_number(number: float) -> float:\n    \"\"\" Given a positive floating point number, it can be decomposed into\n    and integer part (largest integer smaller than given number) and decimals\n    (leftover part always smaller than 1).\n\n    Return the decimal part of the number.\n    >>> truncate_number(3.5)\n    0.5\n    \"\"\"\n    return number - int(number)\n```"
+          }
+        }
+      ],
+      "created": 1789575826,
+      "model": "swift-qwen",
+      "system_fingerprint": "b1-fa67698",
+      "object": "chat.completion",
+      "usage": {
+        "completion_tokens": 97,
+        "prompt_tokens": 98,
+        "total_tokens": 195,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "id": "chatcmpl-phfRr0CKBGrgHixwAIdal7w86lgx2EcQ",
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 98,
+        "prompt_ms": 306.421,
+        "prompt_per_token_ms": 3.1267448979591834,
+        "prompt_per_second": 319.8214221610138,
+        "predicted_n": 97,
+        "predicted_ms": 1404.922,
+        "predicted_per_token_ms": 14.634604166666668,
+        "predicted_per_second": 68.33119561085954,
+        "draft_n": 72,
+        "draft_n_accepted": 72
+      }
+    }
+  },
+  {
+    "name": "below_zero",
+    "request": {
+      "model": "swift-qwen",
+      "messages": [
+        {
+          "role": "user",
+          "content": "from typing import List\n\ndef below_zero(operations: List[int]) -> bool:\n    \"\"\" You're given a list of deposit and withdrawal operations on a bank account that starts with\n    zero balance. Your task is to detect if at any point the balance of account fallls below zero, and\n    at that point function should return True. Otherwise it should return False.\n    >>> below_zero([1, 2, 3])\n    False\n    >>> below_zero([1, 2, -4, 5])\n    True\n    \"\"\"\n    balance = 0\n    for op in"
+        }
+      ],
+      "max_tokens": 256,
+      "temperature": 0,
+      "reasoning_effort": "none",
+      "seed": 42
+    },
+    "wall_seconds": 2.8747495600255206,
+    "response": {
+      "choices": [
+        {
+          "finish_reason": "stop",
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "```python\nfrom typing import List\n\ndef below_zero(operations: List[int]) -> bool:\n    \"\"\" You're given a list of deposit and withdrawal operations on a bank account that starts with\n    zero balance. Your task is to detect if at any point the balance of account fallls below zero, and\n    at that point function should return True. Otherwise it should return False.\n    >>> below_zero([1, 2, 3])\n    False\n    >>> below_zero([1, 2, -4, 5])\n    True\n    \"\"\"\n    balance = 0\n    for op in operations:\n        balance += op\n        if balance < 0:\n            return True\n    return False\n```"
+          }
+        }
+      ],
+      "created": 1789575829,
+      "model": "swift-qwen",
+      "system_fingerprint": "b1-fa67698",
+      "object": "chat.completion",
+      "usage": {
+        "completion_tokens": 157,
+        "prompt_tokens": 140,
+        "total_tokens": 297,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "id": "chatcmpl-jwSo8ETTqRpr0o1YSxpOylh0jyoK7bTA",
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 140,
+        "prompt_ms": 362.946,
+        "prompt_per_token_ms": 2.5924714285714288,
+        "prompt_per_second": 385.73231279584286,
+        "predicted_n": 157,
+        "predicted_ms": 2370.073,
+        "predicted_per_token_ms": 15.19277564102564,
+        "predicted_per_second": 65.82075741970817,
+        "draft_n": 120,
+        "draft_n_accepted": 119
+      }
+    }
+  },
+  {
+    "name": "mean_absolute_deviation",
+    "request": {
+      "model": "swift-qwen",
+      "messages": [
+        {
+          "role": "user",
+          "content": "from typing import List\n\ndef mean_absolute_deviation(numbers: List[float]) -> float:\n    \"\"\" For a given list of input numbers, calculate Mean Absolute Deviation\n    around the mean of this dataset.\n    Mean Absolute Deviation is the average absolute difference between each\n    element and a centerpoint (mean in this case):\n    MAD = average | x - x_mean |\n    >>> mean_absolute_deviation([1.0, 2.0, 3.0, 4.0])\n    1.0\n    \"\"\"\n    mean ="
+        }
+      ],
+      "max_tokens": 256,
+      "temperature": 0,
+      "reasoning_effort": "none",
+      "seed": 42
+    },
+    "wall_seconds": 2.7413376659387723,
+    "response": {
+      "choices": [
+        {
+          "finish_reason": "stop",
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "```python\nfrom typing import List\n\ndef mean_absolute_deviation(numbers: List[float]) -> float:\n    \"\"\" For a given list of input numbers, calculate Mean Absolute Deviation\n    around the mean of this dataset.\n    Mean Absolute Deviation is the average absolute difference between each\n    element and a centerpoint (mean in this case):\n    MAD = average | x - x_mean |\n    >>> mean_absolute_deviation([1.0, 2.0, 3.0, 4.0])\n    1.0\n    \"\"\"\n    mean = sum(numbers) / len(numbers)\n    return sum(abs(x - mean) for x in numbers) / len(numbers)\n```"
+          }
+        }
+      ],
+      "created": 1789575832,
+      "model": "swift-qwen",
+      "system_fingerprint": "b1-fa67698",
+      "object": "chat.completion",
+      "usage": {
+        "completion_tokens": 151,
+        "prompt_tokens": 132,
+        "total_tokens": 283,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "id": "chatcmpl-cL2KAKN7HXYGnV4qwPbyMI4TLjrarzbB",
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 132,
+        "prompt_ms": 341.93,
+        "prompt_per_token_ms": 2.590378787878788,
+        "prompt_per_second": 386.0439271195859,
+        "predicted_n": 151,
+        "predicted_ms": 2256.088,
+        "predicted_per_token_ms": 15.040586666666668,
+        "predicted_per_second": 66.48676824662867,
+        "draft_n": 114,
+        "draft_n_accepted": 113
+      }
+    }
+  },
+  {
+    "name": "intersperse",
+    "request": {
+      "model": "swift-qwen",
+      "messages": [
+        {
+          "role": "user",
+          "content": "from typing import List\n\ndef intersperse(numbers: List[int], delimeter: int) -> List[int]:\n    \"\"\" Insert a number 'delimeter' between every two consecutive elements of input list `numbers'\n    >>> intersperse([], 4)\n    []\n    >>> intersperse([1, 2, 3], 4)\n    [1, 4, 2, 4, 3]\n    \"\"\"\n    result = []\n    for i, n in"
+        }
+      ],
+      "max_tokens": 256,
+      "temperature": 0,
+      "reasoning_effort": "none",
+      "seed": 42
+    },
+    "wall_seconds": 2.393279329990037,
+    "response": {
+      "choices": [
+        {
+          "finish_reason": "stop",
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "```python\nfrom typing import List\n\ndef intersperse(numbers: List[int], delimeter: int) -> List[int]:\n    \"\"\" Insert a number 'delimeter' between every two consecutive elements of input list `numbers'\n    >>> intersperse([], 4)\n    []\n    >>> intersperse([1, 2, 3], 4)\n    [1, 4, 2, 4, 3]\n    \"\"\"\n    result = []\n    for i, n in enumerate(numbers):\n        if i > 0:\n            result.append(delimeter)\n        result.append(n)\n    return result\n```"
+          }
+        }
+      ],
+      "created": 1789575834,
+      "model": "swift-qwen",
+      "system_fingerprint": "b1-fa67698",
+      "object": "chat.completion",
+      "usage": {
+        "completion_tokens": 138,
+        "prompt_tokens": 116,
+        "total_tokens": 254,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "id": "chatcmpl-2uirFFJ4jIamUoCitTAH9wftWNIQJ8vo",
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 116,
+        "prompt_ms": 328.453,
+        "prompt_per_token_ms": 2.8314913793103447,
+        "prompt_per_second": 353.17077329176476,
+        "predicted_n": 138,
+        "predicted_ms": 1920.302,
+        "predicted_per_token_ms": 14.016802919708029,
+        "predicted_per_second": 71.3429450159402,
+        "draft_n": 105,
+        "draft_n_accepted": 104
+      }
+    }
+  },
+  {
+    "name": "parse_nested_parens",
+    "request": {
+      "model": "swift-qwen",
+      "messages": [
+        {
+          "role": "user",
+          "content": "from typing import List\n\ndef parse_nested_parens(paren_string: str) -> List[int]:\n    \"\"\" Input to this function is a string represented multiple groups for nested parentheses separated by spaces.\n    For each of the group, output the deepest level of nesting of parentheses.\n    E.g. (()()) has maximum two levels of nesting while ((())) has three.\n    >>> parse_nested_parens('(()()) ((())) () ((())()())')\n    [2, 3, 1, 3]\n    \"\"\"\n    def parse_paren_group(s):\n        depth = 0\n        max_depth = 0\n        for c in"
+        }
+      ],
+      "max_tokens": 256,
+      "temperature": 0,
+      "reasoning_effort": "none",
+      "seed": 42
+    },
+    "wall_seconds": 3.5838481480022892,
+    "response": {
+      "choices": [
+        {
+          "finish_reason": "stop",
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "```python\nfrom typing import List\n\ndef parse_nested_parens(paren_string: str) -> List[int]:\n    \"\"\" Input to this function is a string represented multiple groups for nested parentheses separated by spaces.\n    For each of the group, output the deepest level of nesting of parentheses.\n    E.g. (()()) has maximum two levels of nesting while ((())) has three.\n    >>> parse_nested_parens('(()()) ((())) () ((())()())')\n    [2, 3, 1, 3]\n    \"\"\"\n    def parse_paren_group(s):\n        depth = 0\n        max_depth = 0\n        for c in s:\n            if c == '(':\n                depth += 1\n                if depth > max_depth:\n                    max_depth = depth\n            elif c == ')':\n                depth -= 1\n        return max_depth\n    \n    groups = paren_string.split()\n    return [parse_paren_group(group) for group in groups]\n```"
+          }
+        }
+      ],
+      "created": 1789575838,
+      "model": "swift-qwen",
+      "system_fingerprint": "b1-fa67698",
+      "object": "chat.completion",
+      "usage": {
+        "completion_tokens": 215,
+        "prompt_tokens": 151,
+        "total_tokens": 366,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "id": "chatcmpl-M8Mg2z8seknpajWq03i4aJt7UkfWTvRC",
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 151,
+        "prompt_ms": 364.015,
+        "prompt_per_token_ms": 2.4106953642384106,
+        "prompt_per_second": 414.8180706839004,
+        "predicted_n": 215,
+        "predicted_ms": 3075.454,
+        "predicted_per_token_ms": 14.371280373831777,
+        "predicted_per_second": 69.5832225095872,
+        "draft_n": 165,
+        "draft_n_accepted": 160
+      }
+    }
+  },
+  {
+    "name": "filter_by_substring",
+    "request": {
+      "model": "swift-qwen",
+      "messages": [
+        {
+          "role": "user",
+          "content": "from typing import List\n\ndef filter_by_substring(strings: List[str], substring: str) -> List[str]:\n    \"\"\" Filter an input list of strings only for ones that contain given substring\n    >>> filter_by_substring([], 'a')\n    []\n    >>> filter_by_substring(['abc', 'bacd', 'cde', 'array'], 'a')\n    ['abc', 'bacd', 'array']\n    \"\"\"\n    return"
+        }
+      ],
+      "max_tokens": 256,
+      "temperature": 0,
+      "reasoning_effort": "none",
+      "seed": 42
+    },
+    "wall_seconds": 2.0608872869051993,
+    "response": {
+      "choices": [
+        {
+          "finish_reason": "stop",
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "```python\nfrom typing import List\n\ndef filter_by_substring(strings: List[str], substring: str) -> List[str]:\n    \"\"\" Filter an input list of strings only for ones that contain given substring\n    >>> filter_by_substring([], 'a')\n    []\n    >>> filter_by_substring(['abc', 'bacd', 'cde', 'array'], 'a')\n    ['abc', 'bacd', 'array']\n    \"\"\"\n    return [s for s in strings if substring in s]\n```"
+          }
+        }
+      ],
+      "created": 1789575840,
+      "model": "swift-qwen",
+      "system_fingerprint": "b1-fa67698",
+      "object": "chat.completion",
+      "usage": {
+        "completion_tokens": 112,
+        "prompt_tokens": 107,
+        "total_tokens": 219,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "id": "chatcmpl-8A9ygEWBnxcjvGXvhVknRhyeCVjc2fCI",
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 107,
+        "prompt_ms": 323.065,
+        "prompt_per_token_ms": 3.0192990654205607,
+        "prompt_per_second": 331.2026991472304,
+        "predicted_n": 112,
+        "predicted_ms": 1596.493,
+        "predicted_per_token_ms": 14.382819819819819,
+        "predicted_per_second": 69.52739535970406,
+        "draft_n": 84,
+        "draft_n_accepted": 83
+      }
+    }
+  },
+  {
+    "name": "sum_product",
+    "request": {
+      "model": "swift-qwen",
+      "messages": [
+        {
+          "role": "user",
+          "content": "from typing import List, Tuple\n\ndef sum_product(numbers: List[int]) -> Tuple[int, int]:\n    \"\"\" For a given list of integers, return a tuple consisting of a sum and a product of all the integers in a list.\n    Empty sum should be equal to 0 and empty product should be equal to 1.\n    >>> sum_product([])\n    (0, 1)\n    >>> sum_product([1, 2, 3, 4])\n    (10, 24)\n    \"\"\"\n    s = 0\n    p = 1\n    for n in"
+        }
+      ],
+      "max_tokens": 256,
+      "temperature": 0,
+      "reasoning_effort": "none",
+      "seed": 42
+    },
+    "wall_seconds": 2.8835487120086327,
+    "response": {
+      "choices": [
+        {
+          "finish_reason": "stop",
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "```python\nfrom typing import List, Tuple\n\ndef sum_product(numbers: List[int]) -> Tuple[int, int]:\n    \"\"\" For a given list of integers, return a tuple consisting of a sum and a product of all the integers in a list.\n    Empty sum should be equal to 0 and empty product should be equal to 1.\n    >>> sum_product([])\n    (0, 1)\n    >>> sum_product([1, 2, 3, 4])\n    (10, 24)\n    \"\"\"\n    s = 0\n    p = 1\n    for n in numbers:\n        s += n\n        p *= n\n    return (s, p)\n```"
+          }
+        }
+      ],
+      "created": 1789575843,
+      "model": "swift-qwen",
+      "system_fingerprint": "b1-fa67698",
+      "object": "chat.completion",
+      "usage": {
+        "completion_tokens": 157,
+        "prompt_tokens": 143,
+        "total_tokens": 300,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "id": "chatcmpl-BMeV20KHmWT4fBafFcCMtemX32StJfWd",
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 143,
+        "prompt_ms": 356.727,
+        "prompt_per_token_ms": 2.4945944055944054,
+        "prompt_per_second": 400.8667692661335,
+        "predicted_n": 157,
+        "predicted_ms": 2389.145,
+        "predicted_per_token_ms": 15.315032051282051,
+        "predicted_per_second": 65.2953253151232,
+        "draft_n": 120,
+        "draft_n_accepted": 119
+      }
+    }
+  },
+  {
+    "name": "rolling_max",
+    "request": {
+      "model": "swift-qwen",
+      "messages": [
+        {
+          "role": "user",
+          "content": "from typing import List\n\ndef rolling_max(numbers: List[int]) -> List[int]:\n    \"\"\" From a given list of integers, generate a list of rolling maximum element found until given moment\n    in the sequence.\n    >>> rolling_max([1, 2, 3, 2, 3, 4, 2])\n    [1, 2, 3, 3, 3, 4, 4]\n    \"\"\"\n    result = []\n    running_max = None\n    for n in numbers:\n        if running_max is"
+        }
+      ],
+      "max_tokens": 256,
+      "temperature": 0,
+      "reasoning_effort": "none",
+      "seed": 42
+    },
+    "wall_seconds": 2.8925947659881786,
+    "response": {
+      "choices": [
+        {
+          "finish_reason": "stop",
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "```python\nfrom typing import List\n\ndef rolling_max(numbers: List[int]) -> List[int]:\n    \"\"\" From a given list of integers, generate a list of rolling maximum element found until given moment\n    in the sequence.\n    >>> rolling_max([1, 2, 3, 2, 3, 4, 2])\n    [1, 2, 3, 3, 3, 4, 4]\n    \"\"\"\n    result = []\n    running_max = None\n    for n in numbers:\n        if running_max is None:\n            running_max = n\n        else:\n            running_max = max(running_max, n)\n        result.append(running_max)\n    return result\n```"
+          }
+        }
+      ],
+      "created": 1789575845,
+      "model": "swift-qwen",
+      "system_fingerprint": "b1-fa67698",
+      "object": "chat.completion",
+      "usage": {
+        "completion_tokens": 162,
+        "prompt_tokens": 132,
+        "total_tokens": 294,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "id": "chatcmpl-VwfPOOZjwVhF1ErPX8601opiCNiQNkcY",
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 132,
+        "prompt_ms": 342.835,
+        "prompt_per_token_ms": 2.5972348484848484,
+        "prompt_per_second": 385.02486618927475,
+        "predicted_n": 162,
+        "predicted_ms": 2409.631,
+        "predicted_per_token_ms": 14.966652173913042,
+        "predicted_per_second": 66.81520946568168,
+        "draft_n": 123,
+        "draft_n_accepted": 120
+      }
+    }
+  }
+]

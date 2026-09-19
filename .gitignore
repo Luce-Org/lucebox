@@ -93,3 +93,18 @@ dflash/docs/tuning-snapshots/
 # Workdir editor backup suffixes
 *.git-head
 *.pre-pflash-rename
+
+# Serving deployment state: models, logs, local reports and rollback files
+/models.json
+/models.*.json
+!/models.example.json
+/model-backend.log*
+/model_router.before-*.py
+/model_router.next.py
+/model_router.py.before-*
+/MEMORY_GUARD*.md
+/MODEL_ROUTING.md
+/SERVING_RESILIENCE.md
+/scripts/start-single-original.sh
+/scripts/start.sh.before-*
+*.gguf

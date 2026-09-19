@@ -243,6 +243,7 @@ bool LayerSplitBackend::handle_compress(const std::string & line,
         req.drafter_path = adapter_->default_compress_drafter_path();
     }
     req.skip_park = skip_park;
+    req.should_cancel = [&io]() { return io.is_cancelled(); };
 
     CompressResult result = compress(req);
     for (int32_t t : result.compressed_ids) io.emit(t);

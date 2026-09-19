@@ -10,6 +10,7 @@
 
 #include "http_server.h"
 #include "common/concurrency/seq_engine.h"
+#include "common/concurrency/seq_round_policy.h"
 #include "parallel_prefix_txn.h"
 #include "response_error.h"
 
@@ -456,7 +457,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         if (prefix_supported) {
             const auto hit = prefix_cache_.lookup_candidate(
                 req.prompt_tokens,
-                (int)req.prompt_tokens.size() - 1);
+                (int)req.prompt_tokens.size() - 1, req.session_id);
             if (hit.first >= 0 && hit.second > 0 &&
                 hit.second < (int)req.prompt_tokens.size()) {
                 restore_policy_slot = hit.first;
@@ -464,10 +465,10 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                     (uint64_t)hit.first + 1, hit.second};
             }
 
-            // The restore source is never the capture destination: the new
-            // checkpoint lands in a different slot so the restore point can
-            // slide forward past the deepest slot (same rule as the classic
-            // worker's restore_source_slot).
+            // Shared-cache mode protects the restore source. Session mode
+            // instead replaces its owner's slot after synchronous restore has
+            // copied it into independent live sequence storage. Atomic engine
+            // replacement preserves the incumbent if the capture fails.
             capture_reservation = prefix_cache_.reserve_inline_snap(
                 req.prompt_tokens,
                 prefix_plan.restore.valid()
@@ -477,7 +478,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 restore_policy_slot,
                 [&engine](int target_cut) {
                     return engine.estimate_prefix_store_bytes(target_cut);
-                });
+                }, req.session_id);
             if (capture_reservation.active()) {
                 const uint64_t capture_id = next_prefix_capture_id++;
                 if (next_prefix_capture_id == 0)
@@ -694,7 +695,8 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
     step_plan.prefills.reserve((size_t)n_slots);
     std::vector<PrefillCandidate> prefill_candidates;
     prefill_candidates.reserve((size_t)n_slots);
-    size_t prefill_round_robin_start = 0;
+    SeqRoundPolicy round_policy;
+    const bool trace_rounds = std::getenv("DFLASH_TRACE_ROUNDS") != nullptr;
 
     while (true) {
         // Phase 1 — Admission: deferred job first (FIFO), then the queue.
@@ -762,6 +764,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
 
         // Phase 2 — Idle: no slot to step, so only the drains need service.
         if (live_slots == 0) {
+            round_policy.reset();
             service_drains();
             if (deferred) {
                 // A defensive busy response with no live sequence must not
@@ -791,7 +794,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 retire_slot(i);
             }
         }
-        if (live_slots == 0) continue;
+        if (live_slots == 0) { round_policy.reset(); continue; }
 
         if (offload_budget) {
             int resident = 0, oldest = -1;
@@ -852,25 +855,28 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 // cannot proceed, let residents advance and release capacity.
             }
         }
-
         // Phase 3 — Build the resident cohort. Parked requests retain their
         // socket/emitter and pending token, but never enter a device graph.
+        // The serving-resilience round policy selects a fair, bounded prefill
+        // subset; the upstream engine then reserves decode KV and may offload
+        // a resident sequence before the graph is submitted.
         auto build_plan = [&]() {
             step_plan.decode.clear();
             prefill_candidates.clear();
             for (int i = 0; i < n_slots; ++i) {
-                const auto & s = slots[(size_t)i];
-                if (!s.job || parked(i)) continue;
-                if (!s.prefilling) {
+                const auto & slot = slots[(size_t)i];
+                if (!slot.job || parked(i)) continue;
+                if (!slot.prefilling) {
                     step_plan.decode.push_back(
-                        {i, s.pending_tok, s.hook.close_token_ids.empty()});
+                        {i, slot.pending_tok, slot.hook.close_token_ids.empty()});
                 } else {
-                    prefill_candidates.push_back({i, s.admission_order});
+                    prefill_candidates.push_back({i, slot.admission_order});
                 }
             }
-            step_plan.prefills = plan_prefill_slices(prefill_candidates,
-                engine.step_plan_limits((int)step_plan.decode.size()),
-                prefill_round_robin_start);
+            const StepPlanLimits limits =
+                engine.step_plan_limits((int)step_plan.decode.size());
+            round_policy.plan(step_plan, prefill_candidates, limits,
+                              engine.has_speculative_decode(step_plan.decode));
         };
         build_plan();
         while (!engine.reserve_decode(step_plan)) {
@@ -913,13 +919,13 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                     if (!slots[(size_t)candidate].prefilling) { victim = candidate; break; }
                 }
                 if (victim < 0) break; // engines reserve prefills at admission
-                auto & s = slots[(size_t)victim];
-                if (offload_budget && engine.evict_kv(victim, s.pending_tok, error)) {
+                auto & slot = slots[(size_t)victim];
+                if (offload_budget && engine.evict_kv(victim, slot.pending_tok, error)) {
                     std::fprintf(stderr,
                         "[parallel] slot %d parked for KV recompute\n", victim);
                     publish_live_count();
                 } else {
-                    s.error = to_response_error({GenerateErrorCode::DecodeFailed,
+                    slot.error = to_response_error({GenerateErrorCode::DecodeFailed,
                         error.empty()
                             ? "paged KV pool cannot fit the request's next decode token"
                             : "paged KV growth could not be preserved: " + error});
@@ -928,10 +934,22 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             }
             build_plan();
         }
-        if (!prefill_candidates.empty()) ++prefill_round_robin_start;
         if (step_plan.decode.empty() && step_plan.prefills.empty()) continue;
 
+        const auto round_started = std::chrono::steady_clock::now();
         SeqEngine::StepResult step_result = engine.step(step_plan);
+        if (trace_rounds) {
+            const double elapsed_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - round_started).count();
+            int budget = 0;
+            for (const auto & slice : step_plan.prefills) budget += slice.max_tokens;
+            std::fprintf(stderr, "[round] decode=%zu pending_prefill=%zu selected_prefill=%zu budget=%d spec_lanes=%d accepted_draft=%d ms=%.3f ok=%d\n",
+                         step_plan.decode.size(), prefill_candidates.size(),
+                         step_plan.prefills.size(), budget,
+                         step_result.speculative_lanes,
+                         step_result.speculative_accepted_tokens, elapsed_ms,
+                         step_result.ok());
+        }
         const std::string protocol_error =
             validate_step_result(step_plan, step_result, n_slots);
         if (!protocol_error.empty()) {
@@ -942,6 +960,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         }
 
         if (!step_result.ok()) {
+            round_policy.reset();
             const std::string & error = step_result.error;
             std::fprintf(stderr,
                 "[parallel] engine step failed: %s — "

@@ -501,19 +501,7 @@ CMD=("$DFLASH_SERVER_BIN" "$DFLASH_TARGET"
 [ -n "$DRAFT_ARG" ]                && CMD+=(--ddtree --ddtree-budget "$DFLASH_BUDGET")
 [ -n "$DFLASH_DEFAULT_MAX_TOKENS" ] && CMD+=(--default-max-tokens "$DFLASH_DEFAULT_MAX_TOKENS")
 [ -n "$DFLASH_MODEL_NAME" ]         && CMD+=(--model-name "$DFLASH_MODEL_NAME")
-# `--lazy-draft` is silently dropped by the C++ server unless both
-# `--prefill-drafter` and `--draft` are present (look for the runtime
-# warning `--lazy-draft ignored: requires both --prefill-drafter and
-# --draft`). Warn loudly here when the operator's config asked for lazy
-# but we're about to drop it — sweeping past the silent no-op was the
-# fingerprint left in every sindri decode-tuning docker.stderr.
-if [ "$DFLASH_LAZY" = "1" ]; then
-    if [ -z "$DRAFT_ARG" ] || [ -z "$DFLASH_PREFILL_DRAFTER" ]; then
-        warn "DFLASH_LAZY=1 ignored: requires both DFLASH_DRAFT and DFLASH_PREFILL_DRAFTER (see entrypoint.sh comment). Continuing without --lazy-draft."
-    else
-        CMD+=(--lazy-draft)
-    fi
-fi
+[ "$DFLASH_LAZY" = "1" ] && warn "DFLASH_LAZY is deprecated and ignored; the decoding drafter is always resident."
 [ -n "$DFLASH_CACHE_TYPE_K" ]      && CMD+=(--cache-type-k "$DFLASH_CACHE_TYPE_K")
 [ -n "$DFLASH_CACHE_TYPE_V" ]      && CMD+=(--cache-type-v "$DFLASH_CACHE_TYPE_V")
 [ "$DFLASH_FA_WINDOW" -gt 0 ] 2>/dev/null && CMD+=(--fa-window "$DFLASH_FA_WINDOW")

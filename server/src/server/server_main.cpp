@@ -24,6 +24,7 @@
 #include "common/platform_env.h"
 #include "common/peer_access.h"
 #include "common/specla_mode.h"
+#include "qwen3/qwen3_drafter.h"
 #include "engine/luce_engine.h"
 #include "placement/pflash_placement.h"
 #include "placement/draft_residency.h"
@@ -49,6 +50,100 @@ using namespace dflash::common;
 
 // Global server pointer for signal handling.
 static HttpServer * g_server = nullptr;
+
+class UpstreamCompressionBackend final : public ModelBackend {
+public:
+    void print_ready_banner() const override {}
+    bool park(ParkTarget) override { return true; }
+    bool unpark(ParkTarget) override { return true; }
+    bool is_target_parked() const override { return false; }
+    GenerateResult generate_impl(const GenerateRequest &, const DaemonIO &) override {
+        GenerateResult result;
+        result.fail(GenerateErrorCode::BackendSpecific,
+                    "upstream compression backend cannot generate locally");
+        return result;
+    }
+    bool snapshot_save(int) override { return false; }
+    void snapshot_free(int) override {}
+    bool snapshot_used(int) const override { return false; }
+    int snapshot_cur_pos(int) const override { return 0; }
+    GenerateResult restore_and_generate_impl(
+            int, const GenerateRequest &, const DaemonIO &) override {
+        GenerateResult result;
+        result.fail(GenerateErrorCode::BackendSpecific,
+                    "upstream compression backend has no snapshots");
+        return result;
+    }
+    CompressResult compress(const CompressRequest & request) override {
+        const auto results = compress_batch({request});
+        return results.empty() ? CompressResult{} : results.front();
+    }
+    std::vector<CompressResult> compress_batch(
+            const std::vector<CompressRequest> & requests) override {
+        std::vector<CompressResult> results(requests.size());
+        if (requests.empty()) return results;
+
+        const CompressRequest * load_request = nullptr;
+        for (const auto & request : requests) {
+            if (request.input_ids.empty()) continue;
+            if (load_request == nullptr) {
+                load_request = &request;
+            } else if (request.drafter_path != load_request->drafter_path ||
+                       request.drafter_gpu != load_request->drafter_gpu ||
+                       request.residency_action !=
+                           load_request->residency_action) {
+                std::vector<CompressResult> independent(requests.size());
+                for (size_t index = 0; index < requests.size(); ++index) {
+                    const auto one = compress_batch({requests[index]});
+                    if (!one.empty()) independent[index] = one.front();
+                }
+                return independent;
+            }
+        }
+        if (load_request == nullptr) return results;
+
+        if (!drafter_loaded_) {
+            if (!load_drafter(load_request->drafter_path, 999,
+                              load_request->drafter_gpu,
+                              drafter_)) {
+                std::fprintf(stderr, "[compress-proxy] drafter load failed\n");
+                dflash::common::free_drafter(drafter_);
+                return results;
+            }
+            drafter_loaded_ = true;
+        }
+
+        for (size_t index = 0; index < requests.size(); ++index) {
+            const auto & request = requests[index];
+            if (request.input_ids.empty()) continue;
+            auto & result = results[index];
+            result.compressed_ids = drafter_score_and_compress(
+                drafter_, request.input_ids, request.keep_ratio,
+                /*chunk_size=*/32, request.score_query_tokens,
+                /*pool_kernel=*/13, request.score_query_end,
+                request.should_cancel);
+            result.ok = !result.compressed_ids.empty();
+        }
+        if (load_request->residency_action ==
+            DraftResidencyAction::ReleaseAfterUse) {
+            free_drafter();
+        }
+        return results;
+    }
+    bool handle_compress(const std::string &, const DaemonIO &) override {
+        return false;
+    }
+    void free_drafter() override {
+        if (!drafter_loaded_) return;
+        dflash::common::free_drafter(drafter_);
+        drafter_loaded_ = false;
+    }
+    void shutdown() override { free_drafter(); }
+
+private:
+    DrafterContext drafter_;
+    bool drafter_loaded_ = false;
+};
 
 static void signal_handler(int sig) {
     (void)sig;
@@ -143,6 +238,10 @@ static void print_usage(const char * prog) {
         "  --concurrent-prefix-cache-max-mib <MiB>\n"
         "                       Resident RAM limit for copied concurrent paged\n"
         "                       checkpoints (default: 4096; 0 unlimited)\n"
+        "  --session-prefix-cache-max-tokens <N>\n"
+        "                       Opt-in concurrent rolling checkpoint per session;\n"
+        "                       N bounds cached prefix tokens (0 disables).\n"
+        "                       RAM budget includes atomic replacement scratch.\n"
         "  --agent-turn-cache         Extend prefix caching through generated tool calls\n"
         "  --prefill-cache-slots <N> Full prompt/prefill cache slots (default: 0)\n"
         "  --fast-rollback     Enable speculative fast rollback (default: on)\n"
@@ -203,9 +302,6 @@ static void print_usage(const char * prog) {
         "                              10000:0.5 40000:0.2 100000:0.1\n"
         "  --prefill-drafter <path>    Drafter GGUF for compression (Qwen3-0.6B)\n"
         "  --prefill-skip-park         Skip park/unpark (for >=32GB GPUs)\n"
-        "  --draft-residency auto|persistent|request-scoped\n"
-        "                         Drafter lifetime policy (default: auto)\n"
-        "  --lazy-draft                Legacy alias for --draft-residency=request-scoped\n"
         "\n"
         "PFlash upstream proxy (forward compressed prompt to a backend):\n"
         "  --prefill-upstream-base <URL>   OpenAI-compatible upstream. Compressed\n"
@@ -560,6 +656,17 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
             }
             sconfig.concurrent_prefix_cache_max_bytes =
                 (size_t)(mib * bytes_per_mib);
+        } else if (std::strcmp(argv[i], "--session-prefix-cache-max-tokens") == 0) {
+            if (i + 1 >= argc) return 2;
+            const char * value = argv[++i];
+            const char * end = value + std::strlen(value);
+            int tokens = 0;
+            const auto parsed = std::from_chars(value, end, tokens);
+            if (parsed.ec != std::errc{} || parsed.ptr != end || tokens < 0) {
+                std::fprintf(stderr, "[server] session cache tokens must be a non-negative integer\n");
+                return 2;
+            }
+            sconfig.session_prefix_cache_max_tokens = tokens;
         } else if (std::strcmp(argv[i], "--agent-turn-cache") == 0) {
             sconfig.agent_turn_cache = true;
         } else if (std::strcmp(argv[i], "--prefill-cache-slots") == 0 && i + 1 < argc) {
@@ -724,19 +831,6 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
                 sconfig.pflash_curve.push_back({tok, ratio});
             }
             std::sort(sconfig.pflash_curve.begin(), sconfig.pflash_curve.end());
-        } else if (std::strcmp(argv[i], "--draft-residency") == 0 && i + 1 < argc) {
-            if (!parse_draft_residency_policy(argv[++i], sconfig.draft_residency)) {
-                std::fprintf(stderr,
-                    "[server] unknown --draft-residency policy: '%s' "
-                    "(expected: auto, persistent, request-scoped)\n", argv[i]);
-                print_usage(argv[0]);
-                return 1;
-            }
-            sconfig.lazy_draft =
-                (sconfig.draft_residency == DraftResidencyPolicy::RequestScoped);
-        } else if (std::strcmp(argv[i], "--lazy-draft") == 0) {
-            sconfig.lazy_draft = true;
-            sconfig.draft_residency = DraftResidencyPolicy::RequestScoped;
         } else if (std::strcmp(argv[i], "--chat-template-file") == 0 && i + 1 < argc) {
             const char * path = argv[++i];
             std::FILE * f = std::fopen(path, "rb");
@@ -835,9 +929,9 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
     if (load_balancing && (bargs.device.is_multi_device() ||
             bargs.remote_draft.enabled() || bargs.remote_target_shard.enabled() ||
             sconfig.pflash_mode != ServerConfig::PflashMode::OFF ||
-            !sconfig.pflash_upstream_base.empty() || sconfig.lazy_draft ||
+            !sconfig.pflash_upstream_base.empty() ||
             sconfig.freq_tracking || !sconfig.collect_routing_path.empty())) {
-        std::fprintf(stderr, "[server] model '%s' requires local serving; compression, sharding, request-scoped drafts and routing collection are unsupported with load balancing\n", sconfig.model_name.c_str());
+        std::fprintf(stderr, "[server] model '%s' requires local serving; compression, sharding and routing collection are unsupported with load balancing\n", sconfig.model_name.c_str());
         return 2;
     }
     return 0;
@@ -918,7 +1012,6 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         sconfig.pflash_mode != ServerConfig::PflashMode::OFF;
     backend_admission.pflash_drafter_configured =
         !sconfig.pflash_drafter_path.empty();
-    backend_admission.draft_residency = sconfig.draft_residency;
     // Fixed pools are known incompatibilities before model setup. Automatic
     // sizing needs the backend's real VRAM budget; if it produces a live pool,
     // the backend rejects the pairing after sizing.
@@ -1080,14 +1173,6 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         set_environment_variable("DFLASH27B_FA_WINDOW", "0", false);
     }
 
-    if (sconfig.draft_residency == DraftResidencyPolicy::RequestScoped &&
-        !(pflash_enabled || backend_speculation.draft_path)) {
-        std::fprintf(stderr,
-            "[server] --draft-residency=request-scoped ignored: requires "
-            "--prefill-compression or --draft\n");
-        sconfig.draft_residency = DraftResidencyPolicy::Auto;
-        sconfig.lazy_draft = false;
-    }
 
     // Load tokenizer.
     std::fprintf(
@@ -1179,7 +1264,14 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
                 arch.c_str());
         }
     }
-    auto backend_owner = create_backend(backend_plan);
+    std::unique_ptr<ModelBackend> backend_owner;
+    if (!sconfig.pflash_upstream_base.empty()) {
+        backend_owner = std::make_unique<UpstreamCompressionBackend>();
+        std::fprintf(stderr,
+            "[server] upstream compression proxy: target weights stay unloaded\n");
+    } else {
+        backend_owner = create_backend(backend_plan);
+    }
     if (!backend_owner) {
         std::fprintf(stderr, "[server] backend creation failed\n");
         return 1;
@@ -1496,11 +1588,7 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         std::fprintf(stderr, "[server] │  fp_use_bsa      = %s\n", getenv("DFLASH_FP_USE_BSA") ? "ON" : "off");
         std::fprintf(stderr, "[server] │  fp_alpha        = %s\n", getenv("DFLASH_FP_ALPHA") ? getenv("DFLASH_FP_ALPHA") : "0.12 (default)");
     }
-    std::fprintf(stderr, "[server] │  draft_residency = %s\n",
-                 draft_residency_policy_name(sconfig.draft_residency));
-    if (backend_speculation.draft_path) {
-        std::fprintf(stderr, "[server] │  lazy_draft      = %s\n", sconfig.lazy_draft ? "ON" : "off");
-    }
+    std::fprintf(stderr, "[server] │  decode draft    = persistent\n");
     std::fprintf(stderr, "[server] ╰─────────────────────────────────────────────────────╯\n\n");
 
     // Populate /props introspection fields. These are runtime config snaps
@@ -1595,10 +1683,6 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         server.set_drafter_tokenizer(&drafter_tokenizer);
     }
 
-    // Lazy-draft: park decode draft at startup to free VRAM (~3.3 GB).
-    if (sconfig.lazy_draft && backend_speculation.draft_path) {
-        backend->park(ParkTarget::DraftModel);
-    }
 
     // Set up routing data collector (--collect-routing)
     auto & routing_collector = loaded.routing_collector;

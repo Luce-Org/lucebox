@@ -1,0 +1,144 @@
+{
+  "api": {
+    "endpoints": [
+      "GET /health",
+      "GET /props",
+      "GET /status",
+      "GET /status/events",
+      "GET /status/json",
+      "GET /v1/models",
+      "POST /v1/chat/completions",
+      "POST /v1/messages",
+      "POST /v1/messages/count_tokens",
+      "POST /v1/responses"
+    ]
+  },
+  "budget_envelope": {
+    "default_max_tokens": 32768,
+    "effort_tiers": {
+      "high": 28672,
+      "low": 3584,
+      "max": 28672,
+      "medium": 14336,
+      "x-high": 28672
+    },
+    "hard_limit_reply_budget": 4096,
+    "model_card_source": "family:qwen35",
+    "think_max_tokens": 28672
+  },
+  "build_info": "luce-dflash v0.0.0+cpp props_schema=2",
+  "capabilities": {
+    "reasoning_supported": true,
+    "speculative_supported": true,
+    "tools_supported": true
+  },
+  "daemon": {
+    "alive": true
+  },
+  "default_generation_settings": {
+    "min_p": 0.0,
+    "n_ctx": 65536,
+    "repeat_penalty": 1.0,
+    "temperature": 0.0,
+    "top_k": 0,
+    "top_p": 1.0
+  },
+  "full_cache": {
+    "capacity": 0,
+    "disk_bytes": 0,
+    "disk_policy": "full",
+    "enabled": false,
+    "in_use": 0,
+    "lifetime_hits": 0
+  },
+  "model": {
+    "arch": "qwen35",
+    "draft_path": "/code/models/qwen38/qwen38-dflash2-q8_0.gguf",
+    "tokenizer_id": null
+  },
+  "model_alias": "swift-qwen",
+  "model_card": null,
+  "model_path": "/code/models/swift-qwen/ukisai_Swift-Qwen3.8-27b-IQ4_XS.gguf",
+  "pflash": {
+    "bsa_alpha": null,
+    "bsa_enabled": null,
+    "draft_residency": "release-after-use",
+    "drafter_gguf": null,
+    "enabled": false,
+    "keep_ratio": null,
+    "lm_head_fix": null,
+    "mode": "off",
+    "skip_park": null,
+    "threshold": null
+  },
+  "prefix_cache": {
+    "agent_turn_enabled": false,
+    "budget_skips": 0,
+    "capacity": 2,
+    "capture_attempts": 0,
+    "capture_failures": 0,
+    "capture_stall_ms_max": 0.0,
+    "capture_stall_ms_total": 0.0,
+    "in_use": 0,
+    "lifetime_hits": 0,
+    "max_resident_bytes": 0,
+    "mode": "shared-prefix",
+    "resident_bytes": 0,
+    "restore_attempts": 0,
+    "restore_invalidations": 0,
+    "restore_stall_ms_max": 0.0,
+    "restore_stall_ms_total": 0.0,
+    "session_max_tokens": 0,
+    "storage": "backend-default"
+  },
+  "reasoning": {
+    "default": null,
+    "supported": true,
+    "supported_efforts": [
+      "low",
+      "medium",
+      "high",
+      "x-high",
+      "max"
+    ]
+  },
+  "runtime": {
+    "backend": "hip",
+    "chunk": 512,
+    "continuous_batching": {
+      "admission_coalesce_ms": 20
+    },
+    "draft_device": "auto:0",
+    "draft_residency": "persistent",
+    "fa_window": 0,
+    "kv_cache_k": "q8_0",
+    "kv_cache_v": "q8_0",
+    "target_device": "auto:0",
+    "target_sharding": false
+  },
+  "sampling": {
+    "capabilities": {
+      "supports_frequency_penalty": true,
+      "supports_seed": true,
+      "supports_temperature": true,
+      "supports_top_k": true,
+      "supports_top_p": true
+    }
+  },
+  "server": {
+    "name": "luce-dflash",
+    "props_schema": 2,
+    "version": "0.0.0+cpp"
+  },
+  "speculative": {
+    "ddtree_budget": null,
+    "enabled": false
+  },
+  "speculative_mode": "off",
+  "tool_replay": {
+    "current_bytes": 0,
+    "current_entries": 0,
+    "max_bytes": 67108864,
+    "max_entries": 50000
+  }
+}

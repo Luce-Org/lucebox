@@ -19,6 +19,10 @@ struct ChatMessage {
     std::string content;    // message text
     // Optional tool_call_id for tool result messages.
     std::string tool_call_id;
+    // Original OpenAI assistant tool_calls array, serialized as JSON. Jinja
+    // templates need the structured fields rather than a reconstructed text
+    // approximation.
+    std::string tool_calls_json;
 };
 
 // Chat template format.
@@ -81,6 +85,7 @@ std::string render_chat_template_jinja(
     const std::string & eos_token,
     bool add_generation_prompt = true,
     bool enable_thinking = false,
-    const std::string & tools_json = "");
+    const std::string & tools_json = "",
+    const std::string & reasoning_effort = "");
 
 }  // namespace dflash::common

@@ -5,6 +5,7 @@
 #include "ggml-alloc.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <limits>
@@ -13,6 +14,19 @@
 #include <vector>
 
 namespace dflash::common {
+namespace {
+struct GraphBuildTrace {
+    const char * kind;
+    bool enabled = std::getenv("DFLASH_TRACE_ROUNDS") != nullptr;
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    ~GraphBuildTrace() {
+        if (enabled) std::fprintf(stderr, "[graph-build] kind=%s ms=%.3f\n", kind,
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - start).count());
+    }
+};
+}
+
 
 bool detail::target_graph_capacity_for_parallel_segments(
         int n_parallel_segments,
@@ -384,6 +398,7 @@ bool build_target_step(
     int n_prefill_segments,
     int n_logits_rows,
     bool compact_slots) {
+    GraphBuildTrace trace{"ordinary"};
     step_graph_free(sg);
 
     // Compact n_seqs is a decode graph bucket width, not the physical
@@ -851,6 +866,7 @@ bool build_target_step_paged_tree(
     if (sg.paged_tree_key && *sg.paged_tree_key == graph_key) {
         return true;
     }
+    GraphBuildTrace trace{"speculative"};
     step_graph_free(sg);
 
     size_t graph_capacity = 0;

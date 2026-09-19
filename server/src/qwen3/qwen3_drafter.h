@@ -12,6 +12,7 @@
 // token IDs (drafter vocab).
 
 #pragma once
+#include <functional>
 
 #include <cstddef>
 #include <cstdint>
@@ -63,6 +64,17 @@ void free_drafter(DrafterContext & ctx);
 // Avoids repeated ggml backend create/destroy during daemon reuse.
 void free_drafter_weights(DrafterContext & ctx);
 
+struct DrafterScoreWindow {
+    int start;
+    int end;
+    int context_start;
+};
+
+// Plan source windows only through query_end. Tokens in [query_end,total)
+// are a rendered suffix masked by the full scorer and must retain zero scores.
+std::vector<DrafterScoreWindow> plan_drafter_score_windows(
+    int total, int query_end, int window, int overlap = 512);
+
 // Score importance per token via Liu Q-hook tail attention, then chunk-top-K
 // span merge. Returns surviving token IDs (drafter vocab).
 //
@@ -82,6 +94,7 @@ std::vector<int32_t> drafter_score_and_compress(
     int    chunk_size  = 32,
     int    n_lookahead = 8,
     int    pool_kernel = 13,
-    int    score_query_end = -1);
+    int    score_query_end = -1,
+    const std::function<bool()>& cancelled = {});
 
 } // namespace dflash::common

@@ -1,0 +1,2 @@
+# Standalone gateway; Python >= 3.11 (asyncio.timeout).
+aiohttp>=3.14,<4
