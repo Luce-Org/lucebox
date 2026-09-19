@@ -73,26 +73,60 @@ public:
         return result;
     }
     CompressResult compress(const CompressRequest & request) override {
-        CompressResult result;
-        if (request.input_ids.empty()) return result;
+        const auto results = compress_batch({request});
+        return results.empty() ? CompressResult{} : results.front();
+    }
+    std::vector<CompressResult> compress_batch(
+            const std::vector<CompressRequest> & requests) override {
+        std::vector<CompressResult> results(requests.size());
+        if (requests.empty()) return results;
+
+        const CompressRequest * load_request = nullptr;
+        for (const auto & request : requests) {
+            if (request.input_ids.empty()) continue;
+            if (load_request == nullptr) {
+                load_request = &request;
+            } else if (request.drafter_path != load_request->drafter_path ||
+                       request.drafter_gpu != load_request->drafter_gpu ||
+                       request.residency_action !=
+                           load_request->residency_action) {
+                std::vector<CompressResult> independent(requests.size());
+                for (size_t index = 0; index < requests.size(); ++index) {
+                    const auto one = compress_batch({requests[index]});
+                    if (!one.empty()) independent[index] = one.front();
+                }
+                return independent;
+            }
+        }
+        if (load_request == nullptr) return results;
+
         if (!drafter_loaded_) {
-            if (!load_drafter(request.drafter_path, 999, request.drafter_gpu,
+            if (!load_drafter(load_request->drafter_path, 999,
+                              load_request->drafter_gpu,
                               drafter_)) {
                 std::fprintf(stderr, "[compress-proxy] drafter load failed\n");
                 dflash::common::free_drafter(drafter_);
-                return result;
+                return results;
             }
             drafter_loaded_ = true;
         }
-        result.compressed_ids = drafter_score_and_compress(
-            drafter_, request.input_ids, request.keep_ratio,
-            /*chunk_size=*/32, request.score_query_tokens, /*pool_kernel=*/13,
-            request.score_query_end, request.should_cancel);
-        result.ok = !result.compressed_ids.empty();
-        if (request.residency_action == DraftResidencyAction::ReleaseAfterUse) {
+
+        for (size_t index = 0; index < requests.size(); ++index) {
+            const auto & request = requests[index];
+            if (request.input_ids.empty()) continue;
+            auto & result = results[index];
+            result.compressed_ids = drafter_score_and_compress(
+                drafter_, request.input_ids, request.keep_ratio,
+                /*chunk_size=*/32, request.score_query_tokens,
+                /*pool_kernel=*/13, request.score_query_end,
+                request.should_cancel);
+            result.ok = !result.compressed_ids.empty();
+        }
+        if (load_request->residency_action ==
+            DraftResidencyAction::ReleaseAfterUse) {
             free_drafter();
         }
-        return result;
+        return results;
     }
     bool handle_compress(const std::string &, const DaemonIO &) override {
         return false;
