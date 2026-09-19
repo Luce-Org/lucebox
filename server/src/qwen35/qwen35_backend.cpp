@@ -1408,15 +1408,15 @@ void Qwen35Backend::shutdown() {
         ggml_backend_free(draft_backend_);
         draft_backend_ = nullptr;
     }
+    if (snap_backend_) {
+        free_snapshot_backend(snap_backend_, target_backend_);
+        snap_backend_ = nullptr;
+    }
     if (target_backend_) {
         ggml_backend_free(target_backend_);
         target_backend_ = nullptr;
     }
     tensor_parallel_.reset();
-    if (snap_backend_) {
-        free_snapshot_backend(snap_backend_, target_backend_);
-        snap_backend_ = nullptr;
-    }
 }
 
 // ── Release scratch buffers between requests ────────────────────────────
