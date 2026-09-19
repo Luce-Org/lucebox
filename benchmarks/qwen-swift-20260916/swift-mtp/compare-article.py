@@ -19,7 +19,7 @@ def wait_production(timeout=180):
   time.sleep(1)
  raise RuntimeError('Production Lucebox did not become healthy and idle')
 guard=f'lucebox-benchmark-restore-{os.getpid()}'
-def arm_guard():subprocess.run(['systemd-run','--unit',guard,'--on-active=45m','--timer-property=AccuracySec=1s','/bin/systemctl','start','lucebox.service'],check=True)
+def arm_guard():subprocess.run(['systemd-run','--unit',guard,'--on-active=2h','--timer-property=AccuracySec=1s','/bin/systemctl','start','lucebox.service'],check=True)
 def disarm_guard():subprocess.run(['systemctl','stop',guard+'.timer'],check=False)
 h=call('/health',port=8216,timeout=5)
 if h.get('busy') or h.get('pending_requests'):raise RuntimeError(f'Live requests present: {h}')
@@ -54,6 +54,8 @@ try:
    drain_gpu()
 finally:
  if p and p.poll() is None:p.kill();p.wait()
- drain_gpu()
+ try:drain_gpu()
+ except Exception as error:
+  raise RuntimeError('GPU allocations did not drain; production was not started concurrently and the restoration guard remains armed') from error
  subprocess.run(['systemctl','start','lucebox.service'],check=True)
  wait_production();disarm_guard()

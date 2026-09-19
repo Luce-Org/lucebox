@@ -40,10 +40,13 @@ def wait_production(timeout=180):
    h=call('/health',port=8216,timeout=2)
    if h.get('status')=='ok' and not h.get('busy') and not h.get('pending_requests'):return h
   except Exception:pass
-  time.sleep(1)
+ time.sleep(1)
  raise RuntimeError('Production Lucebox did not become healthy and idle')
+guard=f'lucebox-benchmark-restore-{os.getpid()}'
+def arm_guard():subprocess.run(['systemd-run','--unit',guard,'--on-active=2h','--timer-property=AccuracySec=1s','/bin/systemctl','start','lucebox.service'],check=True)
+def disarm_guard():subprocess.run(['systemctl','stop',guard+'.timer'],check=False)
 rows=[];reps={'dflash':0,'mtp':0};p=None
-subprocess.run(['systemctl','stop','lucebox.service'],check=True)
+arm_guard();subprocess.run(['systemctl','stop','lucebox.service'],check=True)
 try:
  drain_gpu()
  for backend in ['dflash','mtp']:
@@ -81,4 +84,4 @@ finally:
   drain_gpu()
  finally:
   subprocess.run(['systemctl','start','lucebox.service'],check=True)
-  wait_production()
+  wait_production();disarm_guard()

@@ -14,7 +14,7 @@ def wait_production(timeout=180):
   time.sleep(1)
  raise RuntimeError('Production Lucebox did not become healthy and idle')
 guard=f'lucebox-benchmark-restore-{os.getpid()}'
-def arm_guard():subprocess.run(['systemd-run','--unit',guard,'--on-active=45m','--timer-property=AccuracySec=1s','/bin/systemctl','start','lucebox.service'],check=True)
+def arm_guard():subprocess.run(['systemd-run','--unit',guard,'--on-active=2h','--timer-property=AccuracySec=1s','/bin/systemctl','start','lucebox.service'],check=True)
 def disarm_guard():subprocess.run(['systemctl','stop',guard+'.timer'],check=False)
 h=call('/health',port=8216)
 if h.get('busy') or h.get('pending_requests'):raise RuntimeError(f'Live requests present: {h}')

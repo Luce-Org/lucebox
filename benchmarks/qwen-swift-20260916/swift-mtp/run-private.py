@@ -2,7 +2,7 @@ import pathlib,subprocess,os,urllib.request,json,time
 r=pathlib.Path('/opt/lucebox/work/swift-mtp');env=dict(os.environ,LD_LIBRARY_PATH='/opt/rocm/core-10.0/lib')
 guard=f'lucebox-benchmark-restore-{os.getpid()}'
 def arm_guard():
- subprocess.run(['systemd-run','--unit',guard,'--on-active=45m','--timer-property=AccuracySec=1s','/bin/systemctl','start','lucebox.service'],check=True)
+ subprocess.run(['systemd-run','--unit',guard,'--on-active=2h','--timer-property=AccuracySec=1s','/bin/systemctl','start','lucebox.service'],check=True)
 def wait_production(timeout=180):
  deadline=time.monotonic()+timeout
  while time.monotonic()<deadline:
