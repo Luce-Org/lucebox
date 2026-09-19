@@ -9276,6 +9276,17 @@ TEST_CASE(ServerUnitFixture, hybrid_prevalidation_plan_rejects_cache_mutations) 
     ResourcePlan spill=scratch_only;spill.spill.push_back(7);
     TEST_ASSERT(!safe_before_validation(spill));
 }
+TEST_CASE(ServerUnitFixture, pflash_score_windows_exclude_rendered_suffix) {
+    const auto windows=plan_drafter_score_windows(
+        /*total=*/20000, /*query_end=*/12000, /*window=*/8192);
+    TEST_ASSERT(windows.size()==2);
+    TEST_ASSERT(windows[0].start==0 && windows[0].end==8192 &&
+                windows[0].context_start==0);
+    TEST_ASSERT(windows[1].start==8192 && windows[1].end==12000 &&
+                windows[1].context_start==7680);
+    for(const auto& window:windows)TEST_ASSERT(window.end<=12000);
+    TEST_ASSERT(plan_drafter_score_windows(10,11,8).empty());
+}
 TEST_CASE(ServerUnitFixture, hybrid_pi_text_blocks_preserve_other_parts_and_summary) {
     using namespace dflash::common::hybrid;
     Json messages={{{"role","user"},{"content",{{{"type","text"},{"text","document text"}},{{"type","text"},{"text","Question?"}}}}}};

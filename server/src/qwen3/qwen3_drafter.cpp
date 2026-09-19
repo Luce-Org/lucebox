@@ -717,6 +717,18 @@ static std::vector<int32_t> qwen35_score_and_compress(
     return out_ids;
 }
 
+std::vector<DrafterScoreWindow> plan_drafter_score_windows(
+        int total, int query_end, int window, int overlap) {
+    std::vector<DrafterScoreWindow> result;
+    if (total < 0 || query_end < 0 || query_end > total || window <= 0 ||
+        overlap < 0) return result;
+    for (int start = 0; start < query_end; start += window) {
+        result.push_back({start, std::min(query_end, start + window),
+                          std::max(0, start - overlap)});
+    }
+    return result;
+}
+
 std::vector<int32_t> drafter_score_and_compress(
     DrafterContext & ctx,
     const std::vector<int32_t> & ids,
@@ -770,10 +782,12 @@ std::vector<int32_t> drafter_score_and_compress(
         // Tokens after query_end are a rendered suffix. The full scorer masks
         // them from the query rows, so never place them before the duplicated
         // query in a later window. Their initialized zero scores are retained.
-        for (int start = 0; start < query_end; start += window) {
+        for (const auto & score_window :
+             plan_drafter_score_windows(S, query_end, window)) {
             if(interrupted())return {};
-            const int end = std::min(query_end, start + window);
-            const int context_start = std::max(0, start - 512);
+            const int start = score_window.start;
+            const int end = score_window.end;
+            const int context_start = score_window.context_start;
             std::vector<int32_t> local(ids.begin() + context_start, ids.begin() + end);
             local.insert(local.end(), ids.begin() + query_start, ids.begin() + query_end);
             std::vector<float> scores;
