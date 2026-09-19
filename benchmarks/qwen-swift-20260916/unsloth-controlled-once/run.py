@@ -1,9 +1,9 @@
 import json,pathlib,subprocess,urllib.request,time,os,hashlib,datetime
 r=pathlib.Path('/opt/lucebox/work/unsloth-controlled-once');s=json.loads((r/'suite.json').read_text());expected_hash=(r/'suite.sha256').read_text().split()[0];assert hashlib.sha256((r/'suite.json').read_bytes()).hexdigest()==expected_hash
 port=18217
-def call(path,body=None,port=port):
+def call(path,body=None,port=port,timeout=600):
  req=urllib.request.Request(f'http://127.0.0.1:{port}'+path,data=None if body is None else json.dumps(body).encode(),headers={'Content-Type':'application/json'})
- with urllib.request.urlopen(req,timeout=600) as f:return json.load(f)
+ with urllib.request.urlopen(req,timeout=timeout) as f:return json.load(f)
 def shape(a,b):
  if type(a)!=type(b):return False
  if isinstance(a,dict):return a.keys()==b.keys() and all(shape(a[k],b[k]) for k in b)
@@ -26,12 +26,22 @@ args={
 'dflash':['/opt/lucebox-concurrent/server/build-hip/dflash_server','/code/models/qwen38/Qwen3.8-27B-UD-IQ4_XS.gguf','--draft','/code/models/qwen38/qwen38-dflash2-q8_0.gguf','--draft-block-size','16','--prefix-cache-slots','0','--max-ctx','65536','--cache-type-k','q8_0','--cache-type-v','q8_0','--host','127.0.0.1','--port',str(port),'--model-name','swift-qwen','--chat-template-file',template,'--default-max-tokens','64000','--think-max-tokens','64000','--reasoning-effort-x-high','64000','--reasoning-effort-max','64000','--hard-limit-reply-budget','0'],
 'mtp':['/opt/lucebox/work/swift-mtp/build/bin/llama-server','-m',model,'--host','127.0.0.1','--port',str(port),'--alias','swift-qwen','-ngl','99','-c','65536','-np','1','-b','512','-ub','512','-fa','on','-ctk','q8_0','-ctv','q8_0','--jinja','--chat-template-file',template,'--metrics','--spec-type','draft-mtp','--spec-draft-n-max','3','--reasoning-budget','-1','--no-context-shift','--cache-ram','0']}
 env=dict(os.environ,LD_LIBRARY_PATH='/opt/rocm/core-10.0/lib',DFLASH_IDLE_PREFILL_TOKENS='512',DFLASH_MIXED_PREFILL_TOKENS='64',DFLASH_LONG_MIXED_PREFILL_TOKENS='64',DFLASH_HYBRID_CACHE='off')
-(r/'launch.json').write_text(json.dumps(args,indent=2));h=call('/health',port=8216);assert not h.get('busy') and not h.get('pending_requests'),h
+(r/'launch.json').write_text(json.dumps(args,indent=2));h=call('/health',port=8216,timeout=5)
+if h.get('busy') or h.get('pending_requests'):raise RuntimeError(f'Live requests present: {h}')
 def drain_gpu():
  for _ in range(150):
   if int(pathlib.Path('/sys/class/drm/card5/device/mem_info_vram_used').read_text()) < 1536*1024**2:return
   time.sleep(0.2)
  raise RuntimeError('Previous GPU allocations did not drain')
+def wait_production(timeout=180):
+ deadline=time.monotonic()+timeout
+ while time.monotonic()<deadline:
+  try:
+   h=call('/health',port=8216,timeout=2)
+   if h.get('status')=='ok' and not h.get('busy') and not h.get('pending_requests'):return h
+  except Exception:pass
+  time.sleep(1)
+ raise RuntimeError('Production Lucebox did not become healthy and idle')
 rows=[];reps={'dflash':0,'mtp':0};p=None
 subprocess.run(['systemctl','stop','lucebox.service'],check=True)
 try:
@@ -43,7 +53,7 @@ try:
    for _ in range(180):
     if p.poll() is not None:raise RuntimeError(name+' startup failed')
     try:
-     if call('/health').get('status')=='ok':break
+     if call('/health',timeout=2).get('status')=='ok':break
     except Exception:pass
     time.sleep(1)
    else:raise RuntimeError('startup timeout')
@@ -66,6 +76,9 @@ try:
    p=None
    drain_gpu()
 finally:
- if p and p.poll() is None:p.kill();p.wait()
- drain_gpu()
- subprocess.run(['systemctl','start','lucebox.service'],check=True)
+ try:
+  if p and p.poll() is None:p.kill();p.wait()
+  drain_gpu()
+ finally:
+  subprocess.run(['systemctl','start','lucebox.service'],check=True)
+  wait_production()
