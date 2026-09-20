@@ -953,7 +953,7 @@ bool ggml_cuda_hc_gate_mix(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     static const bool tile16 = [] {
         const char * e = getenv("QWEN4EXP_HC_TILE16");
         const char * ref = getenv("QWEN4EXP_UPSTREAM");
-        return e && atoi(e) == 1 && !(ref && atoi(ref));
+        return !(e && atoi(e) == 0) && !(ref && atoi(ref));
     }();
     const bool use16 = tile16 && K == 320 && E % 32 == 0 && w->type == GGML_TYPE_IQ4_NL;
     static const bool check = getenv("QWEN4EXP_HC_TILE_CHECK") != nullptr;

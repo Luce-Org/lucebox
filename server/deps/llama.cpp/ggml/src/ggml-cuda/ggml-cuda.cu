@@ -3036,11 +3036,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
 
     // Frozen gfx1151 / ROCm 7.2.2 table, trained on separate 16366-token captures.
-    // MMQ changes activation quantization: experimental, never the reference profile.
+    // MMQ changes activation quantization, so the reference profile never takes it;
+    // it is on by default and can be disabled with QWEN4EXP_DENSE_TABLE=0.
     static const bool table = [] {
         const char * e = getenv("QWEN4EXP_DENSE_TABLE");
         const char * ref = getenv("QWEN4EXP_UPSTREAM");
-        return e && atoi(e) == 1 && !(ref && atoi(ref));
+        return !(e && atoi(e) == 0) && !(ref && atoi(ref));
     }();
     if (table && !probe && tokens == 16366 &&
         !ggml_backend_buft_is_cuda_split(src0->buffer->buft) &&

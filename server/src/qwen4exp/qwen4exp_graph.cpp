@@ -938,7 +938,7 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
         int64_t layer_T = T;
         static const bool last_token_ffn = [] {
             const char * value = getenv("QWEN4EXP_LAST_TOKEN_FFN");
-            return value && std::atoi(value) != 0;
+            return !(value && std::atoi(value) == 0);
         }();
         if ((upstream || last_token_ffn) && il == w.n_layer - 1 && T > 1) {
             // Upstream selects output rows before the final HC/FFN, so its
