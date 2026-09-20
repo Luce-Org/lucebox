@@ -1,0 +1,56 @@
+[bench] url=http://127.0.0.1:18845  model=dflash  suites=he,gsm,math
+
+[bench] === HE (n=10) ===
+    #  id                  wall     TTFT  pf tok/s  out_tok  out tok/s  score
+  ---  ---               ------  -------  --------  -------  ---------  -----
+    1  he_01              6.77s   1.144s    124.20      173      30.73  OK
+    2  he_02              8.32s   0.815s    164.30      230      30.67  OK
+    3  he_03              3.87s   0.800s    128.80       97      31.64  OK
+    4  he_04              5.88s   0.840s    163.10      157      31.18  OK
+    5  he_05              6.25s   0.803s    169.30      169      31.02  OK
+    6  he_06              5.69s   0.823s    136.20      152      31.20  OK
+    7  he_07              7.72s   0.776s    170.10      214      30.82  OK
+    8  he_08              4.35s   0.816s    137.20      112      31.66  OK
+    9  he_09              6.03s   0.788s    170.10      163      31.10  OK
+   10  he_10              5.93s   0.856s    135.50      158      31.14  OK
+
+  [summary] ok=10/10  wall=6.08s  TTFT=0.846s  prefill=149.90 tok/s  output=31.12 tok/s  accuracy=10/10 (100.0%)
+
+[bench] === GSM (n=10) ===
+    #  id                  wall     TTFT  pf tok/s  out_tok  out tok/s  score
+  ---  ---               ------  -------  --------  -------  ---------  -----
+    1  gsm_01             8.77s   0.646s    127.00      247      30.42  OK
+    2  gsm_02             5.04s   0.374s    115.00      143      30.66  OK
+    3  gsm_03            17.79s   0.571s    126.10      519      30.15  OK
+    4  gsm_04             5.42s   0.449s    113.60      153      30.81  OK
+    5  gsm_05            10.17s   0.848s    147.40      283      30.36  OK
+    6  gsm_06            10.59s   0.543s    132.70      303      30.17  OK
+    7  gsm_07             7.55s   0.515s    112.60      216      30.69  OK
+    8  gsm_08            13.88s   0.632s    137.70      399      30.11  OK
+    9  gsm_09            16.09s   0.699s    137.30      465      30.22  OK
+   10  gsm_10            11.78s   0.617s    126.50      339      30.36  OK
+
+  [summary] ok=10/10  wall=10.71s  TTFT=0.589s  prefill=127.60 tok/s  output=30.39 tok/s  accuracy=10/10 (100.0%)
+
+[bench] === MATH (n=10) ===
+    #  id                  wall     TTFT  pf tok/s  out_tok  out tok/s  score
+  ---  ---               ------  -------  --------  -------  ---------  -----
+    1  math_01           11.41s   0.450s    104.50      332      30.30  OK
+    2  math_02            7.47s   0.522s    134.10      211      30.36  OK
+    3  math_03           11.81s   0.611s    112.90      340      30.36  OK
+    4  math_04           14.75s   0.792s    128.80      422      30.24  OK
+    5  math_05           28.69s   0.449s    135.90      846      29.95  OK
+    6  math_06           11.85s   0.432s    117.90      344      30.13  OK
+    7  math_07            9.92s   0.469s    119.30      287      30.37  OK
+    8  math_08           24.71s   0.512s    125.00      728      30.09  OK
+    9  math_09           17.15s   0.433s     99.30      504      30.15  OK
+   10  math_10           69.29s   0.787s    130.90     2048      29.90  WRONG
+
+  [summary] ok=10/10  wall=20.70s  TTFT=0.546s  prefill=120.90 tok/s  output=30.19 tok/s  accuracy=9/10 (90.0%)
+
+[bench] === SUMMARY ===
+   Suite     OK     Wall     TTFT   Pf tok/s   Out tok/s   Out tok       Score
+      he  10/10    6.08s   0.846s     149.90       31.12      1625       10/10
+     gsm  10/10   10.71s   0.589s     127.60       30.39      3067       10/10
+    math  10/10   20.70s   0.546s     120.90       30.19      6062        9/10
+wrote /tmp/qwen4exp-graph-triage/e42-full-quality-graphs-on.quality.json

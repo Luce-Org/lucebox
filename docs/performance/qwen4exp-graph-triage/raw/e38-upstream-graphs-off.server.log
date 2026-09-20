@@ -1,0 +1,135 @@
+[server] load balancing disabled; primary=dflash target=hip:0
+[server] loading tokenizer from /home/duster/models/qwen4exp-iq4nl/Qwen3.8-Flash-Next-IQ4_NL-00001-of-00003.gguf
+[tokenizer] added_tokens: 33 special tokens
+[tokenizer] loaded vocab=248320 merges=247587 bos=248044 eos=248046 eot=248046 pre=qwen35 sp=no
+[server] creating backend...
+[backend_factory] detected arch=qwen4exp
+ggml_cuda_init: found 1 ROCm devices (Total VRAM: 98304 MiB):
+  Device 0: Radeon 8060S Graphics, gfx1151 (0x1151), VMM: no, Wave Size: 32, VRAM: 98304 MiB
+[qwen4exp] qwen4exp trunk loaded: 48 layers (36 linear + 12 full), 1222 tensors 66.24 GiB from 3 shard(s), experts=10/512 hc=4/320 ple_layers=1 ngram=3 heads_per_ngram=8 table_rows=320001536 eos=248046
+[qwen4exp] cache: integrated GPU detected, graph inputs will be ring-buffered in pinned host memory (DFLASH_HIP_NO_UMA_RING=1 to disable)
+[qwen4exp] cache: 12 full + 36 linear layers, kv=f16 768.00 MiB @ ctx=32768, ssm_state 108.0 MiB, conv_state 4.2 MiB
+[server] gguf meta: general.name='Qwen3.8 Flash Next' general.architecture='qwen4exp'
+[model_card] using cards dir: /home/duster/lucebox-qwen4exp/server/build-hip/../../share/model_cards
+[model_card] probing sidecar: /home/duster/lucebox-qwen4exp/server/build-hip/../../share/model_cards/qwen3.8-flash-next.json (from general.name='Qwen3.8 Flash Next')
+[model_card] sidecar not found at /home/duster/lucebox-qwen4exp/server/build-hip/../../share/model_cards/qwen3.8-flash-next.json
+[model_card] using family fallback for arch='qwen4exp'
+[server] effort-tier ceiling = max_ctx(32768) - hard_limit_reply_budget(4096) = 28672
+
+[server] ╭─── Configuration ───────────────────────────────────╮
+[server] │  host            = 127.0.0.1
+[server] │  port            = 18840
+[server] │  model           = /home/duster/models/qwen4exp-iq4nl/Qwen3.8-Flash-Next-IQ4_NL-00001-of-00003.gguf
+[server] │  draft           = (none)
+[server] │  model_name      = dflash
+[server] │  max_ctx         = 32768
+[server] │  model_card      = family:qwen4exp
+[server] │  max_tokens      = 32768 (family:qwen4exp)
+[server] │  think_max_tokens= 28672 (family:qwen4exp)
+[server] │  hard_limit_reply= 4096 (family:qwen4exp)
+[server] │  effort tiers    = low=3584 (family:qwen4exp)
+[server] │                    medium=14336 (family:qwen4exp)
+[server] │                    high=28672 (family:qwen4exp)
+[server] │                    x-high=28672 (family:qwen4exp)
+[server] │                    max=28672 (family:qwen4exp)
+[server] │  target_device   = hip:0
+[server] │  target_split    = layer
+[server] │  draft_device    = auto:0
+[server] │  draft_exec      = local
+[server] │  peer_access     = off
+[server] │  chunk           = 16384
+[server] │  admission_wait  = 20 ms
+[server] │  fa_window       = 0
+[server] │  ddtree          = off
+[server] │  specla          = off
+[server] │  fast_rollback   = ON
+[server] │  ddtree_budget   = 22
+[server] │  prefix_cache    = 0 slots
+[server] │  agent_turn_cache= off
+[server] │  prefill_cache   = 0 slots
+[server] │  cors            = ON
+[server] │  cache_type_k    = family default
+[server] │  cache_type_v    = family default
+[server] │  pflash          = off
+[server] │  draft_residency = auto
+[server] ╰─────────────────────────────────────────────────────╯
+
+[server] level-2 force-close (marker-only, 8 chars → 1 tokens, hard_limit_reply_budget = 4096)
+[server] level-2 force-close token ids: 248069
+[ppp] enabled=1 rearrange=0 lcp_window=8 min_pin=512 max_ephemeral=256
+[server] model dflash automatic decode KV offload budget: 0 bytes
+[server] listening on http://127.0.0.1:18840
+[server] request path=/v1/chat/completions body_bytes=66738
+[server] chat chatcmpl_0000000000000000 format=chat stream=true msgs=1 tools=0 prompt_tokens=13664 max_tokens=64 max_ctx=32768 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=dflash
+[server] chat START chatcmpl_0000000000000000 format=chat stream=true prompt_tokens=13664 max_tokens=64 tools=0
+[server] chat CACHE chatcmpl_0000000000000000 restore=false slot=-1 prefix_len=0 effective_prompt=13664 pflash=false disk_policy=full disk_hit=false snap_slot=-1 snap_pos=0 full_snap_slot=-1 full_snap_pos=0
+[qwen4exp-logit] request=1 step=0 pos=13664 selected=760 best=760 best_logit=19.3006439 second=8584 second_logit=17.1392746 margin=2.16136932 hash=b37879cfd1a4691a
+[qwen4exp-logit] request=1 step=1 pos=13665 selected=36367 best=36367 best_logit=22.0138054 second=7289 second_logit=16.4289799 margin=5.58482552 hash=84d09b3c20a6c2c7
+[qwen4exp-logit] request=1 step=2 pos=13666 selected=1328 best=1328 best_logit=21.503231 second=369 second_logit=14.057353 margin=7.44587803 hash=4345622b8266b136
+[qwen4exp-logit] request=1 step=3 pos=13667 selected=369 best=369 best_logit=21.9705276 second=364 second_logit=20.5080528 margin=1.46247482 hash=ce363a924dda683a
+[qwen4exp-logit] request=1 step=4 pos=13668 selected=25168 best=25168 best_logit=20.486721 second=2972 second_logit=16.0716419 margin=4.41507912 hash=a2a60e3d4d20f4ff
+[qwen4exp-logit] request=1 step=5 pos=13669 selected=669 best=669 best_logit=23.1789818 second=37163 second_logit=14.8469973 margin=8.33198452 hash=9873f5b60e6e4cd0
+[qwen4exp-logit] request=1 step=6 pos=13670 selected=2036 best=2036 best_logit=22.4442177 second=2366 second_logit=13.7424212 margin=8.70179653 hash=85f7808d69dd24e7
+[qwen4exp-logit] request=1 step=7 pos=13671 selected=12 best=12 best_logit=20.9921474 second=1354 second_logit=14.4771042 margin=6.51504326 hash=0084a3806da332a1
+[qwen4exp-logit] request=1 step=8 pos=13672 selected=1354 best=1354 best_logit=22.8138847 second=22 second_logit=12.8269711 margin=9.98691368 hash=007658367958c6dd
+[qwen4exp-logit] request=1 step=9 pos=13673 selected=9269 best=9269 best_logit=20.7342224 second=3635 second_logit=12.9665146 margin=7.76770782 hash=0a782ed3fa3a5342
+[qwen4exp-logit] request=1 step=10 pos=13674 selected=12 best=12 best_logit=20.9164276 second=321 second_logit=13.4917727 margin=7.42465496 hash=402f67319a534739
+[qwen4exp-logit] request=1 step=11 pos=13675 selected=22 best=22 best_logit=21.8796883 second=321 second_logit=12.4794483 margin=9.40023994 hash=20e79c7438731d21
+[qwen4exp-logit] request=1 step=12 pos=13676 selected=22 best=22 best_logit=22.2544556 second=321 second_logit=13.1079359 margin=9.14651966 hash=2971085af4b01e08
+[qwen4exp-logit] request=1 step=13 pos=13677 selected=18 best=18 best_logit=23.4869347 second=321 second_logit=14.9525251 margin=8.53440952 hash=895735dbfed4650e
+[qwen4exp-logit] request=1 step=14 pos=13678 selected=16 best=16 best_logit=21.6185265 second=11 second_logit=14.2378616 margin=7.38066483 hash=bbb0d72011f9409e
+[qwen4exp-logit] request=1 step=15 pos=13679 selected=11 best=11 best_logit=22.5501938 second=321 second_logit=21.6058197 margin=0.944374084 hash=54026cc053b40d26
+[qwen4exp-logit] request=1 step=16 pos=13680 selected=321 best=321 best_logit=24.0191078 second=279 second_logit=15.4192572 margin=8.59985065 hash=3337002a54dd7178
+[qwen4exp-logit] request=1 step=17 pos=13681 selected=279 best=279 best_logit=21.9723015 second=12864 second_logit=14.9768209 margin=6.99548054 hash=6d6fc0b7fb0041dd
+[qwen4exp-logit] request=1 step=18 pos=13682 selected=12864 best=12864 best_logit=20.6785927 second=27462 second_logit=19.6103172 margin=1.06827545 hash=89aa658d27fd2049
+[qwen4exp-logit] request=1 step=19 pos=13683 selected=579 best=579 best_logit=23.5382423 second=725 second_logit=14.0613604 margin=9.47688198 hash=c1fa41aceceda203
+[qwen4exp-logit] request=1 step=20 pos=13684 selected=27462 best=27462 best_logit=25.1427307 second=63412 second_logit=13.1096077 margin=12.033123 hash=a272010c6710ad34
+[qwen4exp-logit] request=1 step=21 pos=13685 selected=21482 best=21482 best_logit=22.5269375 second=369 second_logit=13.4827309 margin=9.04420662 hash=c8fc16431badec2a
+[qwen4exp-logit] request=1 step=22 pos=13686 selected=369 best=369 best_logit=23.3850994 second=12076 second_logit=15.9948359 margin=7.39026356 hash=a942a72b2eacbc93
+[qwen4exp-logit] request=1 step=23 pos=13687 selected=12076 best=12076 best_logit=22.9856377 second=220 second_logit=19.2426853 margin=3.74295235 hash=67e66d34d29fb0fd
+[qwen4exp-logit] request=1 step=24 pos=13688 selected=430 best=430 best_logit=23.5862846 second=303 second_logit=14.5521441 margin=9.03414059 hash=c133a9a8fb25cea0
+[qwen4exp-logit] request=1 step=25 pos=13689 selected=220 best=220 best_logit=21.9394054 second=25168 second_logit=15.9087887 margin=6.03061676 hash=951f2c24646d341e
+[qwen4exp-logit] request=1 step=26 pos=13690 selected=20 best=20 best_logit=25.0590744 second=19 second_logit=13.7608843 margin=11.2981901 hash=5bd1e1aa1ff0eca0
+[qwen4exp-logit] request=1 step=27 pos=13691 selected=19 best=19 best_logit=24.9793434 second=11995 second_logit=13.7607765 margin=11.2185669 hash=bd2fe1f906de1a93
+[qwen4exp-logit] request=1 step=28 pos=13692 selected=11995 best=11995 best_logit=22.89674 second=13 second_logit=14.5006046 margin=8.39613533 hash=6f340f4ee7124782
+[qwen4exp-logit] request=1 step=29 pos=13693 selected=59275 best=59275 best_logit=23.3606434 second=13 second_logit=14.0371304 margin=9.32351303 hash=5f1a356605abe572
+[qwen4exp-logit] request=1 step=30 pos=13694 selected=13 best=13 best_logit=22.5005608 second=248046 second_logit=16.6559067 margin=5.84465408 hash=e4c1d84538197293
+[qwen4exp-logit] request=1 step=31 pos=13695 selected=248046 best=248046 best_logit=23.1032829 second=436 second_logit=17.949461 margin=5.15382195 hash=8767d258e8b6299c
+[server] chat DONE chatcmpl_0000000000000000 ok=true in=13664 effective_in=13664 out=32 34.7s 0.9 tok/s finish=stop restore=false slot=-1 prefix_len=0 prefill=33.4s decode=1.3s(25.0tok/s) error=- detail=-
+[server] request path=/v1/chat/completions body_bytes=66738
+[server] chat chatcmpl_0000000000000001 format=chat stream=true msgs=1 tools=0 prompt_tokens=13664 max_tokens=64 max_ctx=32768 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=dflash
+[server] chat START chatcmpl_0000000000000001 format=chat stream=true prompt_tokens=13664 max_tokens=64 tools=0
+[server] chat CACHE chatcmpl_0000000000000001 restore=false slot=-1 prefix_len=0 effective_prompt=13664 pflash=false disk_policy=full disk_hit=false snap_slot=-1 snap_pos=0 full_snap_slot=-1 full_snap_pos=0
+[qwen4exp-logit] request=2 step=0 pos=13664 selected=760 best=760 best_logit=18.2102928 second=8584 second_logit=15.8213577 margin=2.38893509 hash=0a8be5be4bad6582
+[qwen4exp-logit] request=2 step=1 pos=13665 selected=36367 best=36367 best_logit=22.1526089 second=7289 second_logit=16.1886845 margin=5.96392441 hash=45f4fec468eb12ac
+[qwen4exp-logit] request=2 step=2 pos=13666 selected=1328 best=1328 best_logit=21.8408127 second=369 second_logit=14.0671272 margin=7.77368546 hash=49b812776cff39f4
+[qwen4exp-logit] request=2 step=3 pos=13667 selected=369 best=369 best_logit=22.0769253 second=364 second_logit=20.644371 margin=1.43255424 hash=dd2512a87fde5c94
+[qwen4exp-logit] request=2 step=4 pos=13668 selected=25168 best=25168 best_logit=20.3261986 second=2972 second_logit=16.3757648 margin=3.95043373 hash=5427105f50d13199
+[qwen4exp-logit] request=2 step=5 pos=13669 selected=669 best=669 best_logit=22.8329582 second=37163 second_logit=14.672534 margin=8.16042423 hash=0ac7db5833727dc8
+[qwen4exp-logit] request=2 step=6 pos=13670 selected=2036 best=2036 best_logit=23.1745033 second=2366 second_logit=14.1499577 margin=9.02454567 hash=b353afa69799a28b
+[qwen4exp-logit] request=2 step=7 pos=13671 selected=12 best=12 best_logit=21.2391052 second=321 second_logit=14.2150249 margin=7.02408028 hash=594c81f0ae6cfbad
+[qwen4exp-logit] request=2 step=8 pos=13672 selected=1354 best=1354 best_logit=22.8977776 second=22 second_logit=13.0425596 margin=9.85521793 hash=c6f55dcb999372e2
+[qwen4exp-logit] request=2 step=9 pos=13673 selected=9269 best=9269 best_logit=22.0771828 second=59364 second_logit=12.9717884 margin=9.10539436 hash=d5b62591802ef677
+[qwen4exp-logit] request=2 step=10 pos=13674 selected=12 best=12 best_logit=21.2931213 second=321 second_logit=13.1420822 margin=8.15103912 hash=b92e504b1faa7415
+[qwen4exp-logit] request=2 step=11 pos=13675 selected=22 best=22 best_logit=22.3948078 second=321 second_logit=12.1607609 margin=10.2340469 hash=6c0ffe490c347972
+[qwen4exp-logit] request=2 step=12 pos=13676 selected=22 best=22 best_logit=22.6160355 second=18 second_logit=12.7058506 margin=9.91018486 hash=76fc35ab8e530d55
+[qwen4exp-logit] request=2 step=13 pos=13677 selected=18 best=18 best_logit=23.4156456 second=321 second_logit=14.781477 margin=8.63416862 hash=f7a7b27846488e38
+[qwen4exp-logit] request=2 step=14 pos=13678 selected=16 best=16 best_logit=21.7581787 second=11 second_logit=13.8001642 margin=7.95801449 hash=ceafa8087ee4a9ef
+[qwen4exp-logit] request=2 step=15 pos=13679 selected=11 best=11 best_logit=22.7968712 second=321 second_logit=21.8081703 margin=0.988700867 hash=24d22997f6e95a63
+[qwen4exp-logit] request=2 step=16 pos=13680 selected=321 best=321 best_logit=25.0731335 second=279 second_logit=16.0072517 margin=9.06588173 hash=ff6a1204aecac9ce
+[qwen4exp-logit] request=2 step=17 pos=13681 selected=279 best=279 best_logit=22.4313927 second=27462 second_logit=15.5863628 margin=6.84502983 hash=5ac7478fec3340d1
+[qwen4exp-logit] request=2 step=18 pos=13682 selected=12864 best=12864 best_logit=20.8487587 second=27462 second_logit=20.0647697 margin=0.783988953 hash=7034b38e7f79d96d
+[qwen4exp-logit] request=2 step=19 pos=13683 selected=579 best=579 best_logit=24.1209297 second=725 second_logit=14.5053024 margin=9.61562729 hash=3436125be99ca27e
+[qwen4exp-logit] request=2 step=20 pos=13684 selected=27462 best=27462 best_logit=25.9153385 second=63412 second_logit=13.5359602 margin=12.3793783 hash=07150297728946a2
+[qwen4exp-logit] request=2 step=21 pos=13685 selected=21482 best=21482 best_logit=23.8058796 second=369 second_logit=14.0018921 margin=9.8039875 hash=8bd9acfd534d4bf9
+[qwen4exp-logit] request=2 step=22 pos=13686 selected=369 best=369 best_logit=24.0405273 second=12076 second_logit=16.5386677 margin=7.50185966 hash=e7251190b2620bad
+[qwen4exp-logit] request=2 step=23 pos=13687 selected=12076 best=12076 best_logit=23.3704872 second=220 second_logit=19.8040981 margin=3.56638908 hash=20082f53a73a6c68
+[qwen4exp-logit] request=2 step=24 pos=13688 selected=430 best=430 best_logit=24.1859779 second=220 second_logit=15.3601856 margin=8.82579231 hash=b827ec812ee73bc4
+[qwen4exp-logit] request=2 step=25 pos=13689 selected=220 best=220 best_logit=22.0712433 second=25168 second_logit=14.4305553 margin=7.64068794 hash=392f7fceb0767293
+[qwen4exp-logit] request=2 step=26 pos=13690 selected=20 best=20 best_logit=24.3515854 second=19 second_logit=13.6953354 margin=10.65625 hash=58a0df78622d0d75
+[qwen4exp-logit] request=2 step=27 pos=13691 selected=19 best=19 best_logit=25.2395248 second=18 second_logit=14.3026009 margin=10.936924 hash=7b7d3766d8c85dc9
+[qwen4exp-logit] request=2 step=28 pos=13692 selected=11995 best=11995 best_logit=23.2349663 second=13 second_logit=14.8727531 margin=8.36221313 hash=ed5b817fb47785a4
+[qwen4exp-logit] request=2 step=29 pos=13693 selected=59275 best=59275 best_logit=23.2327728 second=13 second_logit=14.2033768 margin=9.02939606 hash=404ab3ab2e34252e
+[qwen4exp-logit] request=2 step=30 pos=13694 selected=13 best=13 best_logit=22.6259174 second=248046 second_logit=17.0667953 margin=5.55912209 hash=185b95a29a279903
+[qwen4exp-logit] request=2 step=31 pos=13695 selected=248046 best=248046 best_logit=22.3230705 second=436 second_logit=17.8680954 margin=4.45497513 hash=68d4061fab2a361e
+[server] chat DONE chatcmpl_0000000000000001 ok=true in=13664 effective_in=13664 out=32 32.5s 1.0 tok/s finish=stop restore=false slot=-1 prefix_len=0 prefill=31.3s decode=1.3s(25.2tok/s) error=- detail=-

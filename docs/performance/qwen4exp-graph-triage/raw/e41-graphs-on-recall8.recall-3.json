@@ -1,0 +1,49 @@
+{
+  "command": "bench",
+  "url": "http://127.0.0.1:18844",
+  "model": "dflash",
+  "suites": {
+    "recall": {
+      "suite": "recall",
+      "n": 2,
+      "n_ok": 2,
+      "results": [
+        {
+          "id": "recall_13k",
+          "ok": true,
+          "text": "The calibration key is QUINCE-AMBER-7731, and the thermal ceiling is recorded as 54 degrees Celsius.",
+          "wall_s": 17.524,
+          "ttft_s": 16.5626,
+          "prompt_tokens": 13664,
+          "completion_tokens": 30,
+          "prefill_tok_s": 825.0,
+          "output_tok_s": 31.2,
+          "correct": true,
+          "score_detail": "correct: all expected present"
+        },
+        {
+          "id": "recall_24k",
+          "ok": true,
+          "text": "The calibration key is QUINCE-AMBER-7731, and the thermal ceiling is recorded as 54 degrees Celsius.",
+          "wall_s": 30.174,
+          "ttft_s": 29.2125,
+          "prompt_tokens": 23984,
+          "completion_tokens": 30,
+          "prefill_tok_s": 821.0,
+          "output_tok_s": 31.21,
+          "correct": true,
+          "score_detail": "correct: all expected present"
+        }
+      ],
+      "mean_wall_s": 23.849,
+      "mean_ttft_s": 22.8875,
+      "mean_prefill_tok_s": 823.0,
+      "mean_output_tok_s": 31.2,
+      "total_output_tokens": 60,
+      "total_prompt_tokens": 37648,
+      "accuracy": "2/2",
+      "accuracy_pct": 100.0
+    }
+  },
+  "ok": true
+}

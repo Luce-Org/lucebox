@@ -1,0 +1,80 @@
+{
+  "tag": "e40-fresh-on-3",
+  "binary": "server/build-hip-graphs-t14/dflash_server",
+  "command": [
+    "server/build-hip-graphs-t14/dflash_server",
+    "--model",
+    "/home/duster/models/qwen4exp-iq4nl/Qwen3.8-Flash-Next-IQ4_NL-00001-of-00003.gguf",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "18843",
+    "--target-device",
+    "hip:0",
+    "--max-ctx",
+    "32768",
+    "--chunk",
+    "16384",
+    "--prefix-cache-slots",
+    "0"
+  ],
+  "stable": "1",
+  "warm_small": [],
+  "rows": [
+    {
+      "pieces": [
+        "T",
+        "he ",
+        "ca",
+        "li",
+        "b",
+        "ra",
+        "tio",
+        "n",
+        " ",
+        "k",
+        "e",
+        "y",
+        " ",
+        "is Q",
+        "UINC",
+        "E-AM",
+        "BE",
+        "R-7731, ",
+        "and the ",
+        "rig",
+        "'s therma",
+        "l c",
+        "e",
+        "i",
+        "l",
+        "ing is r",
+        "ecorded ",
+        "a",
+        "s 54 degrees Celsius."
+      ],
+      "text": "The calibration key is QUINCE-AMBER-7731, and the rig's thermal ceiling is recorded as 54 degrees Celsius.",
+      "usage": {
+        "completion_tokens": 32,
+        "prompt_tokens": 13664,
+        "timings": {
+          "agent_turn_cache_hit": false,
+          "cache_hit": false,
+          "cached_prefix_tokens": 0,
+          "decode_ms": 1117.7,
+          "decode_tokens_per_sec": 28.6,
+          "effective_prompt_tokens": 13664,
+          "prefill_ms": 16976.8,
+          "prefilled_tokens": 13664
+        },
+        "total_tokens": 13696
+      },
+      "wall_s": 18.143142014014302,
+      "repeat": 1,
+      "has_key": true,
+      "has_54": true
+    }
+  ],
+  "all_text_equal": true,
+  "all_pieces_equal": true
+}
