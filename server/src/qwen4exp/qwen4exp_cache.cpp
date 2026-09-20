@@ -141,6 +141,15 @@ bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
 }
 
 void free_qwen4exp_cache(Qwen4ExpCache & c) {
+    if (c.decode_workspace.alloc) {
+        ggml_gallocr_free(c.decode_workspace.alloc);
+        c.decode_workspace.alloc = nullptr;
+        c.decode_workspace.planned = false;
+    }
+    if (c.decode_workspace.ctx) {
+        ggml_free(c.decode_workspace.ctx);
+        c.decode_workspace.ctx = nullptr;
+    }
     if (c.input_ring.buf) {
         ggml_backend_buffer_free(c.input_ring.buf);
         c.input_ring.buf = nullptr;

@@ -8,6 +8,7 @@
 #include "qwen4exp_internal.h"
 
 #include "ggml.h"
+#include "ggml-alloc.h"
 #include "ggml-backend.h"
 
 #include <vector>
@@ -27,6 +28,15 @@ struct Qwen4ExpInputRing {
     // Per-slot section layout: [ embd | positions | ple | mask ].
     size_t                embd_off = 0, pos_off = 0, ple_off = 0, mask_off = 0;
     size_t                embd_cap = 0, pos_cap = 0, ple_cap = 0, mask_cap = 0;
+};
+
+// Optional T=1 decode workspace. Reuse the metadata arena and gallocr backing
+// buffers; allocation assignments are remeasured because KV views and RoPE
+// positions advance every step, so the graph still has to be rebuilt.
+struct Qwen4ExpDecodeWorkspace {
+    ggml_context * ctx   = nullptr;
+    ggml_gallocr_t alloc = nullptr;
+    bool planned = false;
 };
 
 struct Qwen4ExpCache {
@@ -66,6 +76,10 @@ struct Qwen4ExpCache {
 
     // Pinned graph-input ring (see Qwen4ExpInputRing).
     Qwen4ExpInputRing input_ring;
+
+    // T=1 decode workspace reuse, on by default (disable with
+    // QWEN4EXP_DECODE_REUSE=0; excluded under QWEN4EXP_UPSTREAM=1).
+    Qwen4ExpDecodeWorkspace decode_workspace;
 };
 
 bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
