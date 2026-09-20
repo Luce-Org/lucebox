@@ -1,0 +1,114 @@
+[
+  {
+    "label": "cache_off",
+    "round": 0,
+    "ttft": 16.67,
+    "tps": 981.7636472705458,
+    "wall_time": 1789864539.2624812
+  },
+  {
+    "label": "cache_off",
+    "round": 0,
+    "ttft": 16.57,
+    "tps": 987.6885938442969,
+    "wall_time": 1789864555.8971798
+  },
+  {
+    "label": "cache_off",
+    "round": 0,
+    "ttft": 16.42,
+    "tps": 996.7113276492082,
+    "wall_time": 1789864572.3832526
+  },
+  {
+    "label": "cache_off",
+    "round": 0,
+    "ttft": 16.55,
+    "tps": 988.882175226586,
+    "wall_time": 1789864589.024478
+  },
+  {
+    "label": "cache_on",
+    "round": 1,
+    "ttft": 16.92,
+    "tps": 967.2576832151299,
+    "wall_time": 1789864671.226947
+  },
+  {
+    "label": "cache_on",
+    "round": 1,
+    "ttft": 17.02,
+    "tps": 961.5746180963572,
+    "wall_time": 1789864688.3150148
+  },
+  {
+    "label": "cache_on",
+    "round": 1,
+    "ttft": 17.01,
+    "tps": 962.1399176954732,
+    "wall_time": 1789864705.390218
+  },
+  {
+    "label": "cache_on",
+    "round": 1,
+    "ttft": 16.96,
+    "tps": 964.9764150943396,
+    "wall_time": 1789864722.4136522
+  },
+  {
+    "label": "cache_on",
+    "round": 2,
+    "ttft": 16.85,
+    "tps": 971.2759643916913,
+    "wall_time": 1789864802.9108596
+  },
+  {
+    "label": "cache_on",
+    "round": 2,
+    "ttft": 16.82,
+    "tps": 973.0083234244946,
+    "wall_time": 1789864819.7952073
+  },
+  {
+    "label": "cache_on",
+    "round": 2,
+    "ttft": 16.68,
+    "tps": 981.1750599520384,
+    "wall_time": 1789864836.5456085
+  },
+  {
+    "label": "cache_on",
+    "round": 2,
+    "ttft": 16.63,
+    "tps": 984.1250751653639,
+    "wall_time": 1789864853.2424107
+  },
+  {
+    "label": "cache_off",
+    "round": 3,
+    "ttft": 16.57,
+    "tps": 987.6885938442969,
+    "wall_time": 1789864938.6060076
+  },
+  {
+    "label": "cache_off",
+    "round": 3,
+    "ttft": 16.48,
+    "tps": 993.0825242718446,
+    "wall_time": 1789864955.1527953
+  },
+  {
+    "label": "cache_off",
+    "round": 3,
+    "ttft": 16.49,
+    "tps": 992.4802910855065,
+    "wall_time": 1789864971.7056904
+  },
+  {
+    "label": "cache_off",
+    "round": 3,
+    "ttft": 16.5,
+    "tps": 991.8787878787879,
+    "wall_time": 1789864988.274824
+  }
+]

@@ -1,0 +1,482 @@
+[
+  {
+    "label": "best",
+    "round": 0,
+    "ttft": 16.98,
+    "tps": 963.8398115429917
+  },
+  {
+    "label": "best",
+    "round": 0,
+    "ttft": 16.69,
+    "tps": 980.5871779508687
+  },
+  {
+    "label": "best",
+    "round": 0,
+    "ttft": 16.32,
+    "tps": 1002.8186274509803
+  },
+  {
+    "label": "best",
+    "round": 0,
+    "ttft": 16.21,
+    "tps": 1009.6236890808143
+  },
+  {
+    "label": "chunk8192",
+    "round": 1,
+    "ttft": 16.67,
+    "tps": 981.7636472705458
+  },
+  {
+    "label": "chunk8192",
+    "round": 1,
+    "ttft": 16.64,
+    "tps": 983.5336538461538
+  },
+  {
+    "label": "chunk8192",
+    "round": 1,
+    "ttft": 16.64,
+    "tps": 983.5336538461538
+  },
+  {
+    "label": "chunk8192",
+    "round": 1,
+    "ttft": 16.66,
+    "tps": 982.3529411764706
+  },
+  {
+    "label": "cublas3",
+    "round": 2,
+    "ttft": 18.3,
+    "tps": 894.3169398907104
+  },
+  {
+    "label": "cublas3",
+    "round": 2,
+    "ttft": 17.7,
+    "tps": 924.632768361582
+  },
+  {
+    "label": "cublas3",
+    "round": 2,
+    "ttft": 17.6,
+    "tps": 929.8863636363635
+  },
+  {
+    "label": "cublas3",
+    "round": 2,
+    "ttft": 17.57,
+    "tps": 931.4741035856573
+  },
+  {
+    "label": "cublas1",
+    "round": 3,
+    "ttft": 18.73,
+    "tps": 873.7853710624667
+  },
+  {
+    "label": "cublas1",
+    "round": 3,
+    "ttft": 18.93,
+    "tps": 864.5536185948231
+  },
+  {
+    "label": "cublas1",
+    "round": 3,
+    "ttft": 18.37,
+    "tps": 890.9090909090909
+  },
+  {
+    "label": "cublas1",
+    "round": 3,
+    "ttft": 18.48,
+    "tps": 885.6060606060606
+  },
+  {
+    "label": "shadow2",
+    "round": 4,
+    "ttft": 23.99,
+    "tps": 682.2009170487704
+  },
+  {
+    "label": "shadow2",
+    "round": 4,
+    "ttft": 23.79,
+    "tps": 687.9361076082388
+  },
+  {
+    "label": "shadow2",
+    "round": 4,
+    "ttft": 23.63,
+    "tps": 692.5941599661447
+  },
+  {
+    "label": "shadow2",
+    "round": 4,
+    "ttft": 23.46,
+    "tps": 697.6129582267689
+  },
+  {
+    "label": "hc0",
+    "round": 5,
+    "ttft": 18.58,
+    "tps": 880.8396124865448
+  },
+  {
+    "label": "hc0",
+    "round": 5,
+    "ttft": 17.99,
+    "tps": 909.7276264591441
+  },
+  {
+    "label": "hc0",
+    "round": 5,
+    "ttft": 17.62,
+    "tps": 928.8308740068104
+  },
+  {
+    "label": "hc0",
+    "round": 5,
+    "ttft": 17.59,
+    "tps": 930.4150085275725
+  },
+  {
+    "label": "gdn_grouped",
+    "round": 6,
+    "ttft": 17.69,
+    "tps": 925.1554550593555
+  },
+  {
+    "label": "gdn_grouped",
+    "round": 6,
+    "ttft": 17.02,
+    "tps": 961.5746180963572
+  },
+  {
+    "label": "gdn_grouped",
+    "round": 6,
+    "ttft": 16.91,
+    "tps": 967.8296865759905
+  },
+  {
+    "label": "gdn_grouped",
+    "round": 6,
+    "ttft": 16.82,
+    "tps": 973.0083234244946
+  },
+  {
+    "label": "gdn_scalar",
+    "round": 7,
+    "ttft": 20.76,
+    "tps": 788.3429672447013
+  },
+  {
+    "label": "gdn_scalar",
+    "round": 7,
+    "ttft": 19.91,
+    "tps": 821.9989954796584
+  },
+  {
+    "label": "gdn_scalar",
+    "round": 7,
+    "ttft": 19.67,
+    "tps": 832.0284697508896
+  },
+  {
+    "label": "gdn_scalar",
+    "round": 7,
+    "ttft": 19.51,
+    "tps": 838.851870835469
+  },
+  {
+    "label": "dense",
+    "round": 8,
+    "ttft": 28.33,
+    "tps": 577.6914931168374
+  },
+  {
+    "label": "dense",
+    "round": 8,
+    "ttft": 26.24,
+    "tps": 623.704268292683
+  },
+  {
+    "label": "dense",
+    "round": 8,
+    "ttft": 26.36,
+    "tps": 620.8649468892261
+  },
+  {
+    "label": "dense",
+    "round": 8,
+    "ttft": 26.24,
+    "tps": 623.704268292683
+  },
+  {
+    "label": "index_cache",
+    "round": 9,
+    "ttft": 16.2,
+    "tps": 1010.246913580247
+  },
+  {
+    "label": "index_cache",
+    "round": 9,
+    "ttft": 16.11,
+    "tps": 1015.8907510862819
+  },
+  {
+    "label": "index_cache",
+    "round": 9,
+    "ttft": 16.11,
+    "tps": 1015.8907510862819
+  },
+  {
+    "label": "index_cache",
+    "round": 9,
+    "ttft": 16.21,
+    "tps": 1009.6236890808143
+  },
+  {
+    "label": "index_cache",
+    "round": 10,
+    "ttft": 16.22,
+    "tps": 1009.0012330456227
+  },
+  {
+    "label": "index_cache",
+    "round": 10,
+    "ttft": 16.2,
+    "tps": 1010.246913580247
+  },
+  {
+    "label": "index_cache",
+    "round": 10,
+    "ttft": 16.23,
+    "tps": 1008.3795440542206
+  },
+  {
+    "label": "index_cache",
+    "round": 10,
+    "ttft": 16.23,
+    "tps": 1008.3795440542206
+  },
+  {
+    "label": "dense",
+    "round": 11,
+    "ttft": 26.36,
+    "tps": 620.8649468892261
+  },
+  {
+    "label": "dense",
+    "round": 11,
+    "ttft": 25.96,
+    "tps": 630.4314329738058
+  },
+  {
+    "label": "dense",
+    "round": 11,
+    "ttft": 25.97,
+    "tps": 630.1886792452831
+  },
+  {
+    "label": "dense",
+    "round": 11,
+    "ttft": 26.03,
+    "tps": 628.736073761045
+  },
+  {
+    "label": "gdn_scalar",
+    "round": 12,
+    "ttft": 26.98,
+    "tps": 606.5974796145292
+  },
+  {
+    "label": "gdn_scalar",
+    "round": 12,
+    "ttft": 19.74,
+    "tps": 829.0780141843973
+  },
+  {
+    "label": "gdn_scalar",
+    "round": 12,
+    "ttft": 19.59,
+    "tps": 835.4262378764676
+  },
+  {
+    "label": "gdn_scalar",
+    "round": 12,
+    "ttft": 19.63,
+    "tps": 833.7238920020377
+  },
+  {
+    "label": "gdn_grouped",
+    "round": 13,
+    "ttft": 17.65,
+    "tps": 927.2521246458924
+  },
+  {
+    "label": "gdn_grouped",
+    "round": 13,
+    "ttft": 17.25,
+    "tps": 948.7536231884058
+  },
+  {
+    "label": "gdn_grouped",
+    "round": 13,
+    "ttft": 17.08,
+    "tps": 958.1967213114755
+  },
+  {
+    "label": "gdn_grouped",
+    "round": 13,
+    "ttft": 17.15,
+    "tps": 954.2857142857143
+  },
+  {
+    "label": "hc0",
+    "round": 14,
+    "ttft": 18.5,
+    "tps": 884.6486486486486
+  },
+  {
+    "label": "hc0",
+    "round": 14,
+    "ttft": 17.81,
+    "tps": 918.9219539584503
+  },
+  {
+    "label": "hc0",
+    "round": 14,
+    "ttft": 17.68,
+    "tps": 925.6787330316743
+  },
+  {
+    "label": "hc0",
+    "round": 14,
+    "ttft": 17.68,
+    "tps": 925.6787330316743
+  },
+  {
+    "label": "shadow2",
+    "round": 15,
+    "ttft": 24.32,
+    "tps": 672.9440789473684
+  },
+  {
+    "label": "shadow2",
+    "round": 15,
+    "ttft": 23.93,
+    "tps": 683.9114082741329
+  },
+  {
+    "label": "shadow2",
+    "round": 15,
+    "ttft": 23.44,
+    "tps": 698.2081911262799
+  },
+  {
+    "label": "shadow2",
+    "round": 15,
+    "ttft": 23.5,
+    "tps": 696.4255319148937
+  },
+  {
+    "label": "cublas1",
+    "round": 16,
+    "ttft": 19.36,
+    "tps": 845.3512396694215
+  },
+  {
+    "label": "cublas1",
+    "round": 16,
+    "ttft": 18.96,
+    "tps": 863.1856540084387
+  },
+  {
+    "label": "cublas1",
+    "round": 16,
+    "ttft": 18.96,
+    "tps": 863.1856540084387
+  },
+  {
+    "label": "cublas1",
+    "round": 16,
+    "ttft": 18.74,
+    "tps": 873.3191035218784
+  },
+  {
+    "label": "cublas3",
+    "round": 17,
+    "ttft": 18.44,
+    "tps": 887.527114967462
+  },
+  {
+    "label": "cublas3",
+    "round": 17,
+    "ttft": 18.17,
+    "tps": 900.7154650522839
+  },
+  {
+    "label": "cublas3",
+    "round": 17,
+    "ttft": 18.0,
+    "tps": 909.2222222222222
+  },
+  {
+    "label": "cublas3",
+    "round": 17,
+    "ttft": 18.02,
+    "tps": 908.2130965593785
+  },
+  {
+    "label": "chunk8192",
+    "round": 18,
+    "ttft": 16.93,
+    "tps": 966.6863555818074
+  },
+  {
+    "label": "chunk8192",
+    "round": 18,
+    "ttft": 16.91,
+    "tps": 967.8296865759905
+  },
+  {
+    "label": "chunk8192",
+    "round": 18,
+    "ttft": 16.76,
+    "tps": 976.4916467780429
+  },
+  {
+    "label": "chunk8192",
+    "round": 18,
+    "ttft": 16.75,
+    "tps": 977.0746268656717
+  },
+  {
+    "label": "best",
+    "round": 19,
+    "ttft": 17.19,
+    "tps": 952.065154159395
+  },
+  {
+    "label": "best",
+    "round": 19,
+    "ttft": 16.91,
+    "tps": 967.8296865759905
+  },
+  {
+    "label": "best",
+    "round": 19,
+    "ttft": 16.88,
+    "tps": 969.5497630331754
+  },
+  {
+    "label": "best",
+    "round": 19,
+    "ttft": 16.9,
+    "tps": 968.4023668639054
+  }
+]
