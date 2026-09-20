@@ -765,7 +765,7 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
     }();
     static const bool stable_graph = [] {
         const char * value = getenv("QWEN4EXP_DECODE_STABLEGRAPH");
-        return !(value && std::atoi(value) == 0);
+        return value && std::atoi(value) != 0;
     }();
     static const bool stable_telemetry = [] {
         const char * value = getenv("QWEN4EXP_STABLEGRAPH_TELEMETRY");
