@@ -92,6 +92,9 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
         }
     }
     switch (args.type_x) {
+        case GGML_TYPE_Q2_0:
+            mul_mat_q_case<GGML_TYPE_Q2_0>(ctx, args, stream);
+            break;
         case GGML_TYPE_Q4_0:
             mul_mat_q_case<GGML_TYPE_Q4_0>(ctx, args, stream);
             break;
@@ -410,7 +413,7 @@ static void ggml_cuda_mul_mat_q_impl(
         const int sis1 = nb12 / nb11;
 
         ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
-            ne02, ne12, n_expert_used, ne11, si1, sis1, stream);
+            ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse=*/false, stream);
         CUDA_CHECK(cudaGetLastError());
     }
 
@@ -636,6 +639,7 @@ bool ggml_cuda_should_use_mmq(const ggml_tensor * op, int cc, int64_t ne11, int6
     bool mmq_supported;
 
     switch (type) {
+        case GGML_TYPE_Q2_0:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:

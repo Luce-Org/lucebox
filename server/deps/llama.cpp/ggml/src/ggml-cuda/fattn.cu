@@ -8,6 +8,7 @@
 #include "fattn.cuh"
 #include "ds4-env.cuh"
 #include "ds4-causal.h"
+#include "qsa.cuh"
 
 #include <type_traits>
 
@@ -3998,7 +3999,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
         }
     }
 
-    if (ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING || amd_wmma_available(cc) || Q->ne[1] <= 32/ncols2) {
+    if (ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING || (amd_wmma_available(cc) && !(GGML_CUDA_CC_IS_RDNA3(cc) && DKQ == 256 && DV == 256)) || Q->ne[1] <= 32/ncols2) {
         ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 32/ncols2, ncols2>(ctx, dst);
         return;
     }
@@ -4058,6 +4059,22 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
             return;
         } else {
             GGML_ABORT("fatal error");
+        }
+    }
+
+    // Qwen4Exp GQA=12 uses four heads per tile upstream, not a padded group of eight.
+    if (GGML_CUDA_CC_IS_RDNA3(cc) && DKQ == 256 && DV == 256 && use_gqa_opt) {
+        if (gqa_ratio % 8 == 0) {
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst);
+            return;
+        }
+        if (gqa_ratio % 4 == 0) {
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 4>(ctx, dst);
+            return;
+        }
+        if (gqa_ratio % 2 == 0) {
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 2>(ctx, dst);
+            return;
         }
     }
 
@@ -4479,6 +4496,21 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     // Use the WMMA kernel if possible:
+    // Match upstream's RDNA3.5 head-256 selection without altering RDNA4 paths.
+    int rdna3_gqa_eff = 1;
+    while (rdna3_gqa_eff < 8 && gqa_ratio % (2*rdna3_gqa_eff) == 0) rdna3_gqa_eff *= 2;
+    static const auto env_int64 = [](const char * name, int64_t def) -> int64_t {
+        const char * e = getenv(name);
+        return e ? atoll(e) : def;
+    };
+    // Keep existing QSA/padded callers on their shipped path unless opted in.
+    static const bool rdna3_fa256 = env_int64("QWEN4EXP_UPSTREAM", 0) != 0 ||
+        env_int64("QWEN4EXP_FA_PAD256", 0) != 0 || env_int64("LUCE_FA256_MMA", 0) != 0;
+    if (rdna3_fa256 && GGML_CUDA_CC_IS_RDNA3_5(cc) && gqa_opt_applies && Q->ne[0] == 256 && V->ne[0] == 256 &&
+        Q->ne[1] * rdna3_gqa_eff > 32) {
+        return BEST_FATTN_KERNEL_MMA_F16;
+    }
+
     // On RDNA4 the rocWMMA kernel is not qualified (fragment layouts do not
     // match the hand-rolled softmax reductions), so it is reachable only
     // through the env-gated head-256 block below.
@@ -4523,10 +4555,6 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // f16 / 2e-3 q8_0 KV) and is the default; LUCE_FA256_MMA=0 opts
     // out. LUCE_FA256_WMMA=1 additionally enables the unqualified
     // rocWMMA kernel for A/B work.
-    static const auto env_int64 = [](const char * name, int64_t def) -> int64_t {
-        const char * e = getenv(name);
-        return e ? atoll(e) : def;
-    };
     static const bool fa256_tc          = env_int64("LUCE_FA256_MMA", 1) != 0;
     static const bool fa256_wmma        = env_int64("LUCE_FA256_WMMA", 0) != 0;
     // KV length above which the raw-MMA kernel takes over from rocWMMA in
@@ -4590,8 +4618,28 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     return BEST_FATTN_KERNEL_TILE;
 }
 
+static long long g_fattn_qsa_launches   = 0;
+static long long g_fattn_dense_launches = 0;
+long long ggml_backend_cuda_get_fattn_qsa_launch_count()   { return g_fattn_qsa_launches; }
+long long ggml_backend_cuda_get_fattn_dense_launch_count() { return g_fattn_dense_launches; }
+void ggml_backend_cuda_reset_fattn_launch_counts() { g_fattn_qsa_launches = 0; g_fattn_dense_launches = 0; }
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+    if (ggml_cuda_flash_attn_ext_qsa_decode_supported(ctx, dst)) {
+        ++g_fattn_qsa_launches;
+        ggml_cuda_flash_attn_ext_qsa_decode(ctx, dst);
+        return;
+    }
+    if (ggml_cuda_flash_attn_ext_qsa_supported(ctx, dst)) {
+        ++g_fattn_qsa_launches;
+        ggml_cuda_flash_attn_ext_qsa(ctx, dst);
+        return;
+    }
+    ++g_fattn_dense_launches;
+    // only the qsa kernel honours the selected-cell indices; the kernels below attend to every key, so
+    // a maskless sparse op reaching them would read cells the mask exists to hide
+    GGML_ASSERT((dst->src[3] || !dst->src[5]) && "sparse flash attention without a mask needs the qsa kernel");
     if (ggml_flash_attn_ext_is_ds4(dst)) {
 #if defined(GGML_USE_HIP)
         if (!ggml_cuda_ds4_flash_attn_d512_f32(ctx, dst)) {

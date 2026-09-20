@@ -2604,7 +2604,49 @@ ggml_backend_sched_t ggml_backend_sched_new(
         ? std::max(1, atoi(profile_min_raw)) : 1;
 
     sched->n_backends = n_backends;
-    sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
+
+    // dflash: UMA ring buffer for integrated GPUs (port of pwilkin strix-halo).
+    // When an async compute backend (the iGPU) can read the CPU backend's
+    // host-visible (pinned) buffer directly, graph inputs are allocated there
+    // and ring-buffered across n_copies_uma copies instead of being staged
+    // H2D into VRAM per token. Without the rotation, host writes for token N+1
+    // would overwrite inputs that the still-running graph for token N reads
+    // (#15034-class corruption), so the ring and the integrated flag must land
+    // together. Opt out: DFLASH_HIP_NO_UMA_RING=1. Tune: GGML_SCHED_UMA_RING=N.
+    bool is_uma = false;
+    if (!parallel && n_backends >= 2) {
+        ggml_backend_buffer_type_t cpu_buft = bufts ? bufts[n_backends - 1]
+            : ggml_backend_get_default_buffer_type(backends[n_backends - 1]);
+
+        if (cpu_buft && ggml_backend_buft_is_host(cpu_buft)) {
+            for (int b = 0; b < n_backends - 1; b++) {
+                ggml_backend_dev_props props;
+                ggml_backend_dev_get_props(ggml_backend_get_device(backends[b]), &props);
+                if (!props.caps.async) {
+                    continue;
+                }
+                if (ggml_backend_supports_buft(backends[b], cpu_buft)) {
+                    is_uma = true;
+                    GGML_LOG_DEBUG("%s: %s computes directly on %s, ring buffering graph inputs\n",
+                            __func__, ggml_backend_name(backends[b]), ggml_backend_buft_name(cpu_buft));
+                    break;
+                }
+            }
+        }
+    }
+
+    if (is_uma && getenv("DFLASH_HIP_NO_UMA_RING") != nullptr) {
+        is_uma = false;
+    }
+
+    int n_copies_uma = is_uma ? 2 : 1;
+
+    const char * GGML_SCHED_UMA_RING = getenv("GGML_SCHED_UMA_RING");
+    if (GGML_SCHED_UMA_RING && is_uma) {
+        n_copies_uma = std::min(std::max(atoi(GGML_SCHED_UMA_RING), 1), GGML_SCHED_MAX_COPIES);
+    }
+
+    sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : n_copies_uma;
 
     // initialize hash table
     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
