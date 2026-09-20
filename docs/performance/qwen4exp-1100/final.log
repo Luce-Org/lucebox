@@ -1,0 +1,115 @@
+START combined-ab 0 table {'QWEN4EXP_DENSE_TABLE': '1'} chunk 16384
+combined-ab table warmup pt=16366 ttft=19.09s tps=857.307
+combined-ab table warmup pt=16366 ttft=16.38s tps=999.145
+combined-ab table 1 pt=16366 ttft=16.20s tps=1010.247
+combined-ab table 2 pt=16366 ttft=16.41s tps=997.319
+combined-ab table 3 pt=16366 ttft=16.30s tps=1004.049
+combined-ab table 4 pt=16366 ttft=16.21s tps=1009.624
+START combined-ab 1 table_hc {'QWEN4EXP_DENSE_TABLE': '1', 'QWEN4EXP_HC_TILE16': '1'} chunk 16384
+combined-ab table_hc warmup pt=16366 ttft=18.65s tps=877.534
+combined-ab table_hc warmup pt=16366 ttft=15.97s tps=1024.796
+combined-ab table_hc 1 pt=16366 ttft=15.45s tps=1059.288
+combined-ab table_hc 2 pt=16366 ttft=15.32s tps=1068.277
+combined-ab table_hc 3 pt=16366 ttft=15.28s tps=1071.073
+combined-ab table_hc 4 pt=16366 ttft=15.30s tps=1069.673
+START combined-ab 2 table_hc {'QWEN4EXP_DENSE_TABLE': '1', 'QWEN4EXP_HC_TILE16': '1'} chunk 16384
+combined-ab table_hc warmup pt=16366 ttft=17.34s tps=943.829
+combined-ab table_hc warmup pt=16366 ttft=15.79s tps=1036.479
+combined-ab table_hc 1 pt=16366 ttft=15.51s tps=1055.190
+combined-ab table_hc 2 pt=16366 ttft=15.35s tps=1066.189
+combined-ab table_hc 3 pt=16366 ttft=15.31s tps=1068.975
+combined-ab table_hc 4 pt=16366 ttft=15.37s tps=1064.802
+START combined-ab 3 table {'QWEN4EXP_DENSE_TABLE': '1'} chunk 16384
+combined-ab table warmup pt=16366 ttft=18.72s tps=874.252
+combined-ab table warmup pt=16366 ttft=16.83s tps=972.430
+combined-ab table 1 pt=16366 ttft=15.84s tps=1033.207
+combined-ab table 2 pt=16366 ttft=16.06s tps=1019.054
+combined-ab table 3 pt=16366 ttft=15.86s tps=1031.904
+combined-ab table 4 pt=16366 ttft=15.79s tps=1036.479
+RESULT table n 8 min 997.3187081048142 median 1014.6502313853913 best 1036.478784040532
+RESULT table_hc n 8 min 1055.190199871051 median 1067.232843741761 best 1071.0732984293195
+FINAL CONFIG SELECTION {'QWEN4EXP_LAST_TOKEN_FFN': '1', 'QWEN4EXP_DENSE_TABLE': '1', 'QWEN4EXP_HC_TILE16': '1'} medians 1014.6502313853913 1067.232843741761
+QUALITY START final {'QWEN4EXP_LAST_TOKEN_FFN': '1', 'QWEN4EXP_DENSE_TABLE': '1', 'QWEN4EXP_HC_TILE16': '1'} chunk 16384
+[bench] url=http://127.0.0.1:8877  model=dflash  suites=he,gsm,math,recall
+
+[bench] === HE (n=10) ===
+    #  id                  wall     TTFT  pf tok/s  out_tok  out tok/s  score
+  ---  ---               ------  -------  --------  -------  ---------  -----
+    1  he_01              7.01s   1.093s    129.90      173      29.24  OK
+    2  he_02              8.87s   0.869s    154.20      230      28.73  OK
+    3  he_03              4.12s   0.838s    123.00       97      29.51  OK
+    4  he_04              6.28s   0.887s    154.40      157      29.11  OK
+    5  he_05              6.69s   0.846s    160.70      169      28.91  OK
+    6  he_06              6.12s   0.878s    127.50      152      28.97  OK
+    7  he_07              8.28s   0.826s    159.80      214      28.71  OK
+    8  he_08              4.67s   0.868s    129.00      112      29.48  OK
+    9  he_09              6.46s   0.838s    160.00      163      28.96  OK
+   10  he_10              6.35s   0.906s    128.00      158      29.01  OK
+
+  [summary] ok=10/10  wall=6.49s  TTFT=0.885s  prefill=142.70 tok/s  output=29.06 tok/s  accuracy=10/10 (100.0%)
+
+[bench] === GSM (n=10) ===
+    #  id                  wall     TTFT  pf tok/s  out_tok  out tok/s  score
+  ---  ---               ------  -------  --------  -------  ---------  -----
+    1  gsm_01             9.45s   0.689s    119.00      247      28.19  OK
+    2  gsm_02             5.42s   0.398s    108.10      143      28.47  OK
+    3  gsm_03            20.13s   0.607s    118.60      546      27.97  OK
+    4  gsm_04             5.82s   0.480s    106.30      153      28.67  OK
+    5  gsm_05            10.91s   0.897s    139.30      283      28.26  OK
+    6  gsm_06            11.39s   0.573s    125.70      303      28.02  OK
+    7  gsm_07             8.11s   0.546s    106.20      216      28.56  OK
+    8  gsm_08            14.91s   0.665s    130.80      399      28.02  OK
+    9  gsm_09            17.31s   0.742s    129.40      465      28.07  OK
+   10  gsm_10            12.65s   0.651s    119.70      339      28.26  OK
+
+  [summary] ok=10/10  wall=11.61s  TTFT=0.625s  prefill=120.30 tok/s  output=28.25 tok/s  accuracy=10/10 (100.0%)
+
+[bench] === MATH (n=10) ===
+    #  id                  wall     TTFT  pf tok/s  out_tok  out tok/s  score
+  ---  ---               ------  -------  --------  -------  ---------  -----
+    1  math_01           12.25s   0.483s     97.30      332      28.21  OK
+    2  math_02            8.01s   0.551s    126.90      211      28.28  OK
+    3  math_03           12.67s   0.644s    107.20      340      28.27  OK
+    4  math_04           15.84s   0.840s    121.40      422      28.13  OK
+    5  math_05           30.84s   0.470s    129.70      846      27.85  OK
+    6  math_06           12.94s   0.456s    111.80      350      28.04  OK
+    7  math_07           10.65s   0.495s    113.10      287      28.27  OK
+    8  math_08           28.21s   0.543s    117.90      774      27.97  OK
+    9  math_09           18.41s   0.461s     93.20      504      28.07  OK
+   10  math_10           74.76s   0.829s    124.20     2048      27.70  WRONG
+
+  [summary] ok=10/10  wall=22.46s  TTFT=0.577s  prefill=114.30 tok/s  output=28.08 tok/s  accuracy=9/10 (90.0%)
+
+[bench] === RECALL (n=2) ===
+    #  id                  wall     TTFT  pf tok/s  out_tok  out tok/s  score
+  ---  ---               ------  -------  --------  -------  ---------  -----
+    1  recall_13k        18.08s  16.979s    804.80       32      29.16  OK
+    2  recall_24k        25.80s  24.685s    971.60       30      26.97  OK
+
+  [summary] ok=2/2  wall=21.94s  TTFT=20.832s  prefill=888.20 tok/s  output=28.06 tok/s  accuracy=2/2 (100.0%)
+
+[bench] === SUMMARY ===
+   Suite     OK     Wall     TTFT   Pf tok/s   Out tok/s   Out tok       Score
+      he  10/10    6.49s   0.885s     142.70       29.06      1625       10/10
+     gsm  10/10   11.61s   0.625s     120.30       28.25      3094       10/10
+    math  10/10   22.46s   0.577s     114.30       28.08      6114        9/10
+  recall    2/2   21.94s  20.832s     888.20       28.06        62         2/2
+wrote /tmp/qwen1100/final-quality.json
+QUALITY RESULT he 10/10 regressed_cases []
+QUALITY RESULT gsm 10/10 regressed_cases []
+QUALITY RESULT math 9/10 regressed_cases []
+QUALITY RESULT recall 2/2 regressed_cases []
+LONG CHECK START 0 matched count 16366
+{"plant_position": 0, "prompt_tokens": 16366, "text": "QUINCE-AMBER-7731", "seconds": 15.982506888991338, "ok": true}
+LONG CHECK START 339 matched count 16366
+{"plant_position": 339, "prompt_tokens": 16366, "text": "calibration key for the Strix Halo test rig is QUINCE-AMBER-7731", "seconds": 16.21749956900021, "ok": true}
+FINAL PREFILL warmup pt=16366 ttft=15.32s tps=1068.277
+FINAL PREFILL 1 pt=16366 ttft=15.46s tps=1058.603
+FINAL PREFILL 2 pt=16366 ttft=15.40s tps=1062.727
+FINAL PREFILL 3 pt=16366 ttft=15.36s tps=1065.495
+FINAL PREFILL 4 pt=16366 ttft=15.37s tps=1064.802
+FINAL PREFILL 5 pt=16366 ttft=15.38s tps=1064.109
+FINAL PREFILL 6 pt=16366 ttft=15.39s tps=1063.418
+FINAL PREFILL 7 pt=16366 ttft=15.41s tps=1062.038
+FINAL PREFILL 8 pt=16366 ttft=15.41s tps=1062.038
+FINAL SUMMARY {'quality_ok': True, 'settings': {'QWEN4EXP_LAST_TOKEN_FFN': '1', 'QWEN4EXP_DENSE_TABLE': '1', 'QWEN4EXP_HC_TILE16': '1'}, 'chunk': '16384', 'ttft': [15.46, 15.4, 15.36, 15.37, 15.38, 15.39, 15.41, 15.41], 'min_tps': 1058.6028460543337, 'median_tps': 1063.0725382479768, 'best_tps': 1065.4947916666667}

@@ -1,0 +1,5 @@
+REFERENCE iq4 exit 0
+BINARY iq4 L00.gnorm final_output-0 EXACT bytes 393216
+BINARY iq4 L03.faout attn_pregate-3 EXACT bytes 393216
+BINARY iq4 L03.att attn_output-3 EXACT bytes 163840
+BINARY iq4 logits result_output EXACT bytes 993280

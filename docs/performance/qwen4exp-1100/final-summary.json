@@ -1,0 +1,22 @@
+{
+  "quality_ok": true,
+  "settings": {
+    "QWEN4EXP_LAST_TOKEN_FFN": "1",
+    "QWEN4EXP_DENSE_TABLE": "1",
+    "QWEN4EXP_HC_TILE16": "1"
+  },
+  "chunk": "16384",
+  "ttft": [
+    15.46,
+    15.4,
+    15.36,
+    15.37,
+    15.38,
+    15.39,
+    15.41,
+    15.41
+  ],
+  "min_tps": 1058.6028460543337,
+  "median_tps": 1063.0725382479768,
+  "best_tps": 1065.4947916666667
+}

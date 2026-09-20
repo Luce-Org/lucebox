@@ -1,0 +1,35 @@
+.group_segment_fixed_size: 36864
+.name:           _ZN12_GLOBAL__N_118hc_gate_mix_kernelILi4ELi0ELi32ELi2EEEvPKhPKtS4_PfPtbiiiff
+.private_segment_fixed_size: 436
+.vgpr_count:     256
+.vgpr_spill_count: 118
+
+.group_segment_fixed_size: 27648
+.name:           _ZN12_GLOBAL__N_118hc_gate_mix_kernelILi4ELi0ELi16ELi1EEEvPKhPKtS4_PfPtbiiiff
+.private_segment_fixed_size: 72
+.vgpr_count:     256
+.vgpr_spill_count: 17
+
+.group_segment_fixed_size: 36864
+.name:           _ZN12_GLOBAL__N_117mmb_routed_kernelILi128ELi128ELi32ELi64ELi0ELb0EEEvPKhmPKtPfPtbPKiS8_S8_PKjii
+.private_segment_fixed_size: 0
+.vgpr_count:     182
+.vgpr_spill_count: 0
+
+.group_segment_fixed_size: 36864
+.name:           _ZN12_GLOBAL__N_121mmb_routed_glu_kernelILi64ELi128ELi32ELi32ELi0ELb0EEEvPKhS2_mPKtPfPtbPKiS8_S8_PKjii
+.private_segment_fixed_size: 0
+.vgpr_count:     207
+.vgpr_spill_count: 0
+
+.group_segment_fixed_size: 36864
+.name:           _ZN12_GLOBAL__N_121mmb_routed_glu_kernelILi64ELi128ELi32ELi32ELi0ELb1EEEvPKhS2_mPKtPfPtbPKiS8_S8_PKjii
+.private_segment_fixed_size: 0
+.vgpr_count:     207
+.vgpr_spill_count: 0
+
+.group_segment_fixed_size: 36864
+.name:           _ZN12_GLOBAL__N_117mmb_routed_kernelILi128ELi128ELi32ELi64ELi0ELb1EEEvPKhmPKtPfPtbPKiS8_S8_PKjii
+.private_segment_fixed_size: 0
+.vgpr_count:     182
+.vgpr_spill_count: 0

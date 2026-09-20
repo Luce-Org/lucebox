@@ -1,0 +1,162 @@
+[server] load balancing disabled; primary=dflash target=hip:0
+[server] loading tokenizer from /home/duster/models/qwen4exp-iq4nl/Qwen3.8-Flash-Next-IQ4_NL-00001-of-00003.gguf
+[tokenizer] added_tokens: 33 special tokens
+[tokenizer] loaded vocab=248320 merges=247587 bos=248044 eos=248046 eot=248046 pre=qwen35 sp=no
+[server] creating backend...
+[backend_factory] detected arch=qwen4exp
+ggml_cuda_init: found 1 ROCm devices (Total VRAM: 98304 MiB):
+  Device 0: Radeon 8060S Graphics, gfx1151 (0x1151), VMM: no, Wave Size: 32, VRAM: 98304 MiB
+[qwen4exp] qwen4exp trunk loaded: 48 layers (36 linear + 12 full), 1222 tensors 66.24 GiB from 3 shard(s), experts=10/512 hc=4/320 ple_layers=1 ngram=3 heads_per_ngram=8 table_rows=320001536 eos=248046
+[qwen4exp] cache: integrated GPU detected, graph inputs will be ring-buffered in pinned host memory (DFLASH_HIP_NO_UMA_RING=1 to disable)
+[qwen4exp] cache: 12 full + 36 linear layers, kv=f16 937.50 MiB @ ctx=40000, ssm_state 108.0 MiB, conv_state 4.2 MiB
+[server] gguf meta: general.name='Qwen3.8 Flash Next' general.architecture='qwen4exp'
+[model_card] using cards dir: /home/duster/lucebox-qwen4exp/server/build-hip/../../share/model_cards
+[model_card] probing sidecar: /home/duster/lucebox-qwen4exp/server/build-hip/../../share/model_cards/qwen3.8-flash-next.json (from general.name='Qwen3.8 Flash Next')
+[model_card] sidecar not found at /home/duster/lucebox-qwen4exp/server/build-hip/../../share/model_cards/qwen3.8-flash-next.json
+[model_card] using family fallback for arch='qwen4exp'
+[server] effort-tier ceiling = max_ctx(40000) - hard_limit_reply_budget(4096) = 35904
+
+[server] ╭─── Configuration ───────────────────────────────────╮
+[server] │  host            = 127.0.0.1
+[server] │  port            = 8877
+[server] │  model           = /home/duster/models/qwen4exp-iq4nl/Qwen3.8-Flash-Next-IQ4_NL-00001-of-00003.gguf
+[server] │  draft           = (none)
+[server] │  model_name      = dflash
+[server] │  max_ctx         = 40000
+[server] │  model_card      = family:qwen4exp
+[server] │  max_tokens      = 32768 (family:qwen4exp)
+[server] │  think_max_tokens= 28672 (family:qwen4exp)
+[server] │  hard_limit_reply= 4096 (family:qwen4exp)
+[server] │  effort tiers    = low=3584 (family:qwen4exp)
+[server] │                    medium=14336 (family:qwen4exp)
+[server] │                    high=28672 (family:qwen4exp)
+[server] │                    x-high=28672 (family:qwen4exp)
+[server] │                    max=28672 (family:qwen4exp)
+[server] │  target_device   = hip:0
+[server] │  target_split    = layer
+[server] │  draft_device    = auto:0
+[server] │  draft_exec      = local
+[server] │  peer_access     = off
+[server] │  chunk           = 16384
+[server] │  admission_wait  = 20 ms
+[server] │  fa_window       = 0
+[server] │  ddtree          = off
+[server] │  specla          = off
+[server] │  fast_rollback   = ON
+[server] │  ddtree_budget   = 22
+[server] │  prefix_cache    = 32 slots
+[server] │  agent_turn_cache= off
+[server] │  prefill_cache   = 0 slots
+[server] │  cors            = ON
+[server] │  cache_type_k    = family default
+[server] │  cache_type_v    = family default
+[server] │  pflash          = off
+[server] │  draft_residency = auto
+[server] ╰─────────────────────────────────────────────────────╯
+
+[server] level-2 force-close (marker-only, 8 chars → 1 tokens, hard_limit_reply_budget = 4096)
+[server] level-2 force-close token ids: 248069
+[pc] enabled: cap=32 family=qwen
+[ppp] enabled=1 rearrange=0 lcp_window=8 min_pin=512 max_ephemeral=256
+[server] model dflash automatic decode KV offload budget: 0 bytes
+[server] listening on http://127.0.0.1:8877
+[server] request path=/v1/chat/completions body_bytes=79815
+[server] chat chatcmpl_0000000000000000 format=chat stream=true msgs=1 tools=0 prompt_tokens=16366 max_tokens=1 max_ctx=40000 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=dflash
+[server] chat START chatcmpl_0000000000000000 format=chat stream=true prompt_tokens=16366 max_tokens=1 tools=0
+[server] chat CACHE chatcmpl_0000000000000000 restore=false slot=-1 prefix_len=0 effective_prompt=16366 pflash=false disk_policy=full disk_hit=false snap_slot=0 snap_pos=16360 full_snap_slot=-1 full_snap_pos=0
+[hc-tile-check] node_21 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_94 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_215 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_279 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_322 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_386 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_429 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_609 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_652 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_717 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_760 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_825 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_868 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_932 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_975 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_1155 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_1198 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_1263 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_1306 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_1371 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_1414 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_1478 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_1521 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_1701 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_1744 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_1809 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_1852 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_1917 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_1960 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_2024 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_2067 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_2247 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_2290 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_2355 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_2398 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_2463 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_2506 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_2570 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_2613 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_2793 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_2836 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_2901 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_2944 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_3009 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_3052 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_3116 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_3159 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_3339 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_3382 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_3447 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_3490 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_3555 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_3598 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_3662 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_3705 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_3885 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_3928 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_3993 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_4036 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_4101 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_4144 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_4208 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_4251 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_4431 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_4474 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_4539 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_4582 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_4647 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_4690 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_4754 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_4797 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_4977 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_5020 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_5085 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_5128 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_5193 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_5236 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_5300 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_5343 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_5523 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_5566 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_5631 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_5674 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_5739 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_5782 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_5846 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_5889 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_6069 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_6112 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_6177 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_6220 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_6285 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_6328 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_6392 T=16366 bytes=83793920 differences=0
+[hc-tile-check] node_6435 T=16366 bytes=83793920 differences=0
+[server] chat DONE chatcmpl_0000000000000000 ok=true in=16366 effective_in=16366 out=1 21.6s 0.0 tok/s finish=length restore=false slot=-1 prefix_len=0 prefill=21.6s decode=0.0s(1087.6tok/s) error=- detail=-

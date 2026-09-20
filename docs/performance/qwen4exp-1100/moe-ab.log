@@ -1,0 +1,26 @@
+START moe-ab 0 control {} chunk 16384
+moe-ab control warmup pt=16366 ttft=19.56s tps=836.708
+moe-ab control 1 pt=16366 ttft=17.73s tps=923.068
+moe-ab control 2 pt=16366 ttft=16.61s tps=985.310
+moe-ab control 3 pt=16366 ttft=16.41s tps=997.319
+moe-ab control 4 pt=16366 ttft=16.40s tps=997.927
+START moe-ab 1 pipeline {'QWEN4EXP_MOE_PIPELINE': '1'} chunk 16384
+moe-ab pipeline warmup pt=16366 ttft=20.33s tps=805.017
+moe-ab pipeline 1 pt=16366 ttft=17.10s tps=957.076
+moe-ab pipeline 2 pt=16366 ttft=16.50s tps=991.879
+moe-ab pipeline 3 pt=16366 ttft=16.46s tps=994.289
+moe-ab pipeline 4 pt=16366 ttft=16.42s tps=996.711
+START moe-ab 2 pipeline {'QWEN4EXP_MOE_PIPELINE': '1'} chunk 16384
+moe-ab pipeline warmup pt=16366 ttft=19.83s tps=825.315
+moe-ab pipeline 1 pt=16366 ttft=17.24s tps=949.304
+moe-ab pipeline 2 pt=16366 ttft=16.85s tps=971.276
+moe-ab pipeline 3 pt=16366 ttft=16.86s tps=970.700
+moe-ab pipeline 4 pt=16366 ttft=16.68s tps=981.175
+START moe-ab 3 control {} chunk 16384
+moe-ab control warmup pt=16366 ttft=19.88s tps=823.239
+moe-ab control 1 pt=16366 ttft=17.17s tps=953.174
+moe-ab control 2 pt=16366 ttft=16.96s tps=964.976
+moe-ab control 3 pt=16366 ttft=16.84s tps=971.853
+moe-ab control 4 pt=16366 ttft=16.71s tps=979.414
+RESULT control n 8 min 923.0682459108855 median 975.6331282134383 best 997.9268292682927
+RESULT pipeline n 8 min 949.3039443155453 median 976.2255121718649 best 996.7113276492082
