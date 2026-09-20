@@ -1,0 +1,669 @@
+[server] load balancing disabled; primary=dflash target=hip:0
+[server] loading tokenizer from /home/duster/models/qwen4exp-iq4nl/Qwen3.8-Flash-Next-IQ4_NL-00001-of-00003.gguf
+[tokenizer] added_tokens: 33 special tokens
+[tokenizer] loaded vocab=248320 merges=247587 bos=248044 eos=248046 eot=248046 pre=qwen35 sp=no
+[server] creating backend...
+[backend_factory] detected arch=qwen4exp
+ggml_cuda_init: found 1 ROCm devices (Total VRAM: 98304 MiB):
+  Device 0: Radeon 8060S Graphics, gfx1151 (0x1151), VMM: no, Wave Size: 32, VRAM: 98304 MiB
+[qwen4exp] qwen4exp trunk loaded: 48 layers (36 linear + 12 full), 1222 tensors 66.24 GiB from 3 shard(s), experts=10/512 hc=4/320 ple_layers=1 ngram=3 heads_per_ngram=8 table_rows=320001536 eos=248046
+[qwen4exp] cache: integrated GPU detected, graph inputs will be ring-buffered in pinned host memory (DFLASH_HIP_NO_UMA_RING=1 to disable)
+[qwen4exp] cache: 12 full + 36 linear layers, kv=f16 937.50 MiB @ ctx=40000, ssm_state 108.0 MiB, conv_state 4.2 MiB
+[server] gguf meta: general.name='Qwen3.8 Flash Next' general.architecture='qwen4exp'
+[model_card] using cards dir: /home/duster/lucebox-qwen4exp/server/build-hip/../../share/model_cards
+[model_card] probing sidecar: /home/duster/lucebox-qwen4exp/server/build-hip/../../share/model_cards/qwen3.8-flash-next.json (from general.name='Qwen3.8 Flash Next')
+[model_card] sidecar not found at /home/duster/lucebox-qwen4exp/server/build-hip/../../share/model_cards/qwen3.8-flash-next.json
+[model_card] using family fallback for arch='qwen4exp'
+[server] effort-tier ceiling = max_ctx(40000) - hard_limit_reply_budget(4096) = 35904
+
+[server] ╭─── Configuration ───────────────────────────────────╮
+[server] │  host            = 127.0.0.1
+[server] │  port            = 18731
+[server] │  model           = /home/duster/models/qwen4exp-iq4nl/Qwen3.8-Flash-Next-IQ4_NL-00001-of-00003.gguf
+[server] │  draft           = (none)
+[server] │  model_name      = dflash
+[server] │  max_ctx         = 40000
+[server] │  model_card      = family:qwen4exp
+[server] │  max_tokens      = 32768 (family:qwen4exp)
+[server] │  think_max_tokens= 28672 (family:qwen4exp)
+[server] │  hard_limit_reply= 4096 (family:qwen4exp)
+[server] │  effort tiers    = low=3584 (family:qwen4exp)
+[server] │                    medium=14336 (family:qwen4exp)
+[server] │                    high=28672 (family:qwen4exp)
+[server] │                    x-high=28672 (family:qwen4exp)
+[server] │                    max=28672 (family:qwen4exp)
+[server] │  target_device   = hip:0
+[server] │  target_split    = layer
+[server] │  draft_device    = auto:0
+[server] │  draft_exec      = local
+[server] │  peer_access     = off
+[server] │  chunk           = 16384
+[server] │  admission_wait  = 20 ms
+[server] │  fa_window       = 0
+[server] │  ddtree          = off
+[server] │  specla          = off
+[server] │  fast_rollback   = ON
+[server] │  ddtree_budget   = 22
+[server] │  prefix_cache    = 32 slots
+[server] │  agent_turn_cache= off
+[server] │  prefill_cache   = 0 slots
+[server] │  cors            = ON
+[server] │  cache_type_k    = family default
+[server] │  cache_type_v    = family default
+[server] │  pflash          = off
+[server] │  draft_residency = auto
+[server] ╰─────────────────────────────────────────────────────╯
+
+[server] level-2 force-close (marker-only, 8 chars → 1 tokens, hard_limit_reply_budget = 4096)
+[server] level-2 force-close token ids: 248069
+[pc] enabled: cap=32 family=qwen
+[ppp] enabled=1 rearrange=0 lcp_window=8 min_pin=512 max_ephemeral=256
+[server] model dflash automatic decode KV offload budget: 0 bytes
+[server] listening on http://127.0.0.1:18731
+[server] request path=/v1/chat/completions body_bytes=9837
+[server] chat chatcmpl_0000000000000000 format=chat stream=true msgs=1 tools=0 prompt_tokens=1996 max_tokens=128 max_ctx=40000 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=dflash
+[server] chat START chatcmpl_0000000000000000 format=chat stream=true prompt_tokens=1996 max_tokens=128 tools=0
+[server] chat CACHE chatcmpl_0000000000000000 restore=false slot=-1 prefix_len=0 effective_prompt=1996 pflash=false disk_policy=full disk_hit=false snap_slot=0 snap_pos=1990 full_snap_slot=-1 full_snap_pos=0
+[cuda-graph-stats] key=0x71f8b55d2b20 n_nodes=5546 total=1 replay=0 capture=0 eager=1 enabled=1
+[fa] graph qsa=0 dense=12
+[qwen4exp-stable] event=build bucket=2304 nodes=5147
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=1 replay=0 capture=0 eager=1 enabled=1
+[fa] graph qsa=0 dense=12
+[qwen4exp-stable] event=first bucket=2304 calls=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=2 replay=0 capture=1 eager=1 enabled=1
+[fa] graph qsa=0 dense=12
+[qwen4exp-stable] event=reuse bucket=2304 calls=2
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=3 replay=1 capture=1 eager=1 enabled=1
+[qwen4exp-stable] event=reuse bucket=2304 calls=3
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=4 replay=2 capture=1 eager=1 enabled=1
+[qwen4exp-stable] event=reuse bucket=2304 calls=4
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=5 replay=3 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=6 replay=4 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=7 replay=5 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=8 replay=6 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=9 replay=7 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=10 replay=8 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=11 replay=9 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=12 replay=10 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=13 replay=11 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=14 replay=12 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=15 replay=13 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=16 replay=14 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=17 replay=15 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=18 replay=16 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=19 replay=17 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=20 replay=18 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=21 replay=19 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=22 replay=20 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=23 replay=21 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=24 replay=22 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=25 replay=23 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=26 replay=24 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=27 replay=25 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=28 replay=26 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=29 replay=27 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=30 replay=28 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=31 replay=29 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=32 replay=30 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=33 replay=31 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=34 replay=32 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=35 replay=33 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=36 replay=34 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=37 replay=35 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=38 replay=36 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=39 replay=37 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=40 replay=38 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=41 replay=39 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=42 replay=40 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=43 replay=41 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=44 replay=42 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=45 replay=43 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=46 replay=44 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=47 replay=45 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=48 replay=46 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=49 replay=47 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=50 replay=48 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=51 replay=49 capture=1 eager=1 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=52 replay=50 capture=1 eager=1 enabled=1
+[qwen4exp-stable] event=rebuild old_bucket=2304 new_bucket=2560
+[qwen4exp-stable] event=build bucket=2560 nodes=5147
+[cuda-graph-diff] key=0x71f8b55d2c90 node=2/5147 name=node_2 op=REPEAT extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x71f8bc606300 new_data=0x71f8bc606500
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=53 replay=50 capture=1 eager=2 enabled=1
+[fa] graph qsa=0 dense=12
+[qwen4exp-stable] event=first bucket=2560 calls=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=54 replay=50 capture=2 eager=2 enabled=1
+[fa] graph qsa=0 dense=12
+[qwen4exp-stable] event=reuse bucket=2560 calls=2
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=55 replay=51 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=2560 calls=3
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=56 replay=52 capture=2 eager=2 enabled=1
+[qwen4exp-stable] event=reuse bucket=2560 calls=4
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=57 replay=53 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=58 replay=54 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=59 replay=55 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=60 replay=56 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=61 replay=57 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=62 replay=58 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=63 replay=59 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=64 replay=60 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=65 replay=61 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=66 replay=62 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=67 replay=63 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=68 replay=64 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=69 replay=65 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=70 replay=66 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=71 replay=67 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=72 replay=68 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=73 replay=69 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=74 replay=70 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=75 replay=71 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=76 replay=72 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=77 replay=73 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=78 replay=74 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=79 replay=75 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=80 replay=76 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=81 replay=77 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=82 replay=78 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=83 replay=79 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=84 replay=80 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=85 replay=81 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=86 replay=82 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=87 replay=83 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=88 replay=84 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=89 replay=85 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=90 replay=86 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=91 replay=87 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=92 replay=88 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=93 replay=89 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=94 replay=90 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=95 replay=91 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=96 replay=92 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=97 replay=93 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=98 replay=94 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=99 replay=95 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=100 replay=96 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=101 replay=97 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=102 replay=98 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=103 replay=99 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=104 replay=100 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=105 replay=101 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=106 replay=102 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=107 replay=103 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=108 replay=104 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=109 replay=105 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=110 replay=106 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=111 replay=107 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=112 replay=108 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=113 replay=109 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=114 replay=110 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=115 replay=111 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=116 replay=112 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=117 replay=113 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=118 replay=114 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=119 replay=115 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=120 replay=116 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=121 replay=117 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=122 replay=118 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=123 replay=119 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=124 replay=120 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=125 replay=121 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=126 replay=122 capture=2 eager=2 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=127 replay=123 capture=2 eager=2 enabled=1
+[server] chat DONE chatcmpl_0000000000000000 ok=true in=1996 effective_in=1996 out=128 9.2s 14.0 tok/s finish=length restore=false slot=-1 prefix_len=0 prefill=4.6s decode=4.5s(28.4tok/s) error=- detail=-
+[server] request path=/v1/chat/completions body_bytes=9837
+[server] chat chatcmpl_0000000000000001 format=chat stream=true msgs=1 tools=0 prompt_tokens=1996 max_tokens=128 max_ctx=40000 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=dflash
+[server] chat START chatcmpl_0000000000000001 format=chat stream=true prompt_tokens=1996 max_tokens=128 tools=0
+[server] chat CACHE chatcmpl_0000000000000001 restore=false slot=-1 prefix_len=0 effective_prompt=1996 pflash=false disk_policy=full disk_hit=false snap_slot=1 snap_pos=1990 full_snap_slot=-1 full_snap_pos=0
+[cuda-graph-stats] key=0x71f8a38d1b20 n_nodes=5546 total=1 replay=0 capture=0 eager=1 enabled=1
+[fa] graph qsa=0 dense=12
+[qwen4exp-stable] event=rebuild old_bucket=2560 new_bucket=2304
+[qwen4exp-stable] event=build bucket=2304 nodes=5147
+[cuda-graph-diff] key=0x71f8b55d2c90 node=2/5147 name=node_2 op=REPEAT extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x71f8bc606500 new_data=0x71f8bc606300
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=128 replay=123 capture=2 eager=3 enabled=1
+[fa] graph qsa=0 dense=12
+[qwen4exp-stable] event=first bucket=2304 calls=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=129 replay=123 capture=3 eager=3 enabled=1
+[fa] graph qsa=0 dense=12
+[qwen4exp-stable] event=reuse bucket=2304 calls=2
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=130 replay=124 capture=3 eager=3 enabled=1
+[qwen4exp-stable] event=reuse bucket=2304 calls=3
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=131 replay=125 capture=3 eager=3 enabled=1
+[qwen4exp-stable] event=reuse bucket=2304 calls=4
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=132 replay=126 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=133 replay=127 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=134 replay=128 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=135 replay=129 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=136 replay=130 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=137 replay=131 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=138 replay=132 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=139 replay=133 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=140 replay=134 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=141 replay=135 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=142 replay=136 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=143 replay=137 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=144 replay=138 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=145 replay=139 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=146 replay=140 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=147 replay=141 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=148 replay=142 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=149 replay=143 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=150 replay=144 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=151 replay=145 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=152 replay=146 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=153 replay=147 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=154 replay=148 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=155 replay=149 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=156 replay=150 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=157 replay=151 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=158 replay=152 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=159 replay=153 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=160 replay=154 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=161 replay=155 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=162 replay=156 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=163 replay=157 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=164 replay=158 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=165 replay=159 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=166 replay=160 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=167 replay=161 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=168 replay=162 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=169 replay=163 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=170 replay=164 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=171 replay=165 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=172 replay=166 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=173 replay=167 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=174 replay=168 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=175 replay=169 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=176 replay=170 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=177 replay=171 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=178 replay=172 capture=3 eager=3 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=179 replay=173 capture=3 eager=3 enabled=1
+[qwen4exp-stable] event=rebuild old_bucket=2304 new_bucket=2560
+[qwen4exp-stable] event=build bucket=2560 nodes=5147
+[cuda-graph-diff] key=0x71f8b55d2c90 node=2/5147 name=node_2 op=REPEAT extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x71f8bc606300 new_data=0x71f8bc606500
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=180 replay=173 capture=3 eager=4 enabled=1
+[fa] graph qsa=0 dense=12
+[qwen4exp-stable] event=first bucket=2560 calls=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=181 replay=173 capture=4 eager=4 enabled=1
+[fa] graph qsa=0 dense=12
+[qwen4exp-stable] event=reuse bucket=2560 calls=2
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=182 replay=174 capture=4 eager=4 enabled=1
+[qwen4exp-stable] event=reuse bucket=2560 calls=3
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=183 replay=175 capture=4 eager=4 enabled=1
+[qwen4exp-stable] event=reuse bucket=2560 calls=4
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=184 replay=176 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=185 replay=177 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=186 replay=178 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=187 replay=179 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=188 replay=180 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=189 replay=181 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=190 replay=182 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=191 replay=183 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=192 replay=184 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=193 replay=185 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=194 replay=186 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=195 replay=187 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=196 replay=188 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=197 replay=189 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=198 replay=190 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=199 replay=191 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=200 replay=192 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=201 replay=193 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=202 replay=194 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=203 replay=195 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=204 replay=196 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=205 replay=197 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=206 replay=198 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=207 replay=199 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=208 replay=200 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=209 replay=201 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=210 replay=202 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=211 replay=203 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=212 replay=204 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=213 replay=205 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=214 replay=206 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=215 replay=207 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=216 replay=208 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=217 replay=209 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=218 replay=210 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=219 replay=211 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=220 replay=212 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=221 replay=213 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=222 replay=214 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=223 replay=215 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=224 replay=216 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=225 replay=217 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=226 replay=218 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=227 replay=219 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=228 replay=220 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=229 replay=221 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=230 replay=222 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=231 replay=223 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=232 replay=224 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=233 replay=225 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=234 replay=226 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=235 replay=227 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=236 replay=228 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=237 replay=229 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=238 replay=230 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=239 replay=231 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=240 replay=232 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=241 replay=233 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=242 replay=234 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=243 replay=235 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=244 replay=236 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=245 replay=237 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=246 replay=238 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=247 replay=239 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=248 replay=240 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=249 replay=241 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=250 replay=242 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=251 replay=243 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=252 replay=244 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=253 replay=245 capture=4 eager=4 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=254 replay=246 capture=4 eager=4 enabled=1
+[server] chat DONE chatcmpl_0000000000000001 ok=true in=1996 effective_in=1996 out=128 6.8s 18.7 tok/s finish=length restore=false slot=-1 prefix_len=0 prefill=2.5s decode=4.4s(29.2tok/s) error=- detail=-
+[server] request path=/v1/chat/completions body_bytes=79803
+[server] chat chatcmpl_0000000000000002 format=chat stream=true msgs=1 tools=0 prompt_tokens=16348 max_tokens=128 max_ctx=40000 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=dflash
+[server] chat START chatcmpl_0000000000000002 format=chat stream=true prompt_tokens=16348 max_tokens=128 tools=0
+[server] chat CACHE chatcmpl_0000000000000002 restore=false slot=-1 prefix_len=0 effective_prompt=16348 pflash=false disk_policy=full disk_hit=false snap_slot=2 snap_pos=16342 full_snap_slot=-1 full_snap_pos=0
+[cuda-graph-stats] key=0x71f88f9839b0 n_nodes=6614 total=1 replay=0 capture=0 eager=1 enabled=1
+[fa] graph qsa=12 dense=0
+[qwen4exp-stable] event=rebuild old_bucket=2560 new_bucket=16640
+[qwen4exp-stable] event=build bucket=16640 nodes=5147
+[cuda-graph-diff] key=0x71f8b55d2c90 node=2/5147 name=node_2 op=REPEAT extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x71f8bc606500 new_data=0x71f8bc60d300
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=255 replay=246 capture=4 eager=5 enabled=1
+[fa] graph qsa=0 dense=12
+[qwen4exp-stable] event=first bucket=16640 calls=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=256 replay=246 capture=5 eager=5 enabled=1
+[fa] graph qsa=0 dense=12
+[qwen4exp-stable] event=reuse bucket=16640 calls=2
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=257 replay=247 capture=5 eager=5 enabled=1
+[qwen4exp-stable] event=reuse bucket=16640 calls=3
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=258 replay=248 capture=5 eager=5 enabled=1
+[qwen4exp-stable] event=reuse bucket=16640 calls=4
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=259 replay=249 capture=5 eager=5 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=260 replay=250 capture=5 eager=5 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=261 replay=251 capture=5 eager=5 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=262 replay=252 capture=5 eager=5 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=263 replay=253 capture=5 eager=5 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=264 replay=254 capture=5 eager=5 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=265 replay=255 capture=5 eager=5 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=266 replay=256 capture=5 eager=5 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=267 replay=257 capture=5 eager=5 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=268 replay=258 capture=5 eager=5 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=269 replay=259 capture=5 eager=5 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=270 replay=260 capture=5 eager=5 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=271 replay=261 capture=5 eager=5 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=272 replay=262 capture=5 eager=5 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=273 replay=263 capture=5 eager=5 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=274 replay=264 capture=5 eager=5 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=275 replay=265 capture=5 eager=5 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=276 replay=266 capture=5 eager=5 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=277 replay=267 capture=5 eager=5 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=278 replay=268 capture=5 eager=5 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=279 replay=269 capture=5 eager=5 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=280 replay=270 capture=5 eager=5 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=281 replay=271 capture=5 eager=5 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=282 replay=272 capture=5 eager=5 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=283 replay=273 capture=5 eager=5 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=284 replay=274 capture=5 eager=5 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=285 replay=275 capture=5 eager=5 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=286 replay=276 capture=5 eager=5 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=287 replay=277 capture=5 eager=5 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=288 replay=278 capture=5 eager=5 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=289 replay=279 capture=5 eager=5 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=290 replay=280 capture=5 eager=5 enabled=1
+[qwen4exp-stable] event=rebuild old_bucket=16640 new_bucket=16896
+[qwen4exp-stable] event=build bucket=16896 nodes=5147
+[cuda-graph-diff] key=0x71f8b55d2c90 node=2/5147 name=node_2 op=REPEAT extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x71f8bc60d300 new_data=0x71f8bc60d500
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=291 replay=280 capture=5 eager=6 enabled=1
+[fa] graph qsa=0 dense=12
+[qwen4exp-stable] event=first bucket=16896 calls=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=292 replay=280 capture=6 eager=6 enabled=1
+[fa] graph qsa=0 dense=12
+[qwen4exp-stable] event=reuse bucket=16896 calls=2
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=293 replay=281 capture=6 eager=6 enabled=1
+[qwen4exp-stable] event=reuse bucket=16896 calls=3
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=294 replay=282 capture=6 eager=6 enabled=1
+[qwen4exp-stable] event=reuse bucket=16896 calls=4
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=295 replay=283 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=296 replay=284 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=297 replay=285 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=298 replay=286 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=299 replay=287 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=300 replay=288 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=301 replay=289 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=302 replay=290 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=303 replay=291 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=304 replay=292 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=305 replay=293 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=306 replay=294 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=307 replay=295 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=308 replay=296 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=309 replay=297 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=310 replay=298 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=311 replay=299 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=312 replay=300 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=313 replay=301 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=314 replay=302 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=315 replay=303 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=316 replay=304 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=317 replay=305 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=318 replay=306 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=319 replay=307 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=320 replay=308 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=321 replay=309 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=322 replay=310 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=323 replay=311 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=324 replay=312 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=325 replay=313 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=326 replay=314 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=327 replay=315 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=328 replay=316 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=329 replay=317 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=330 replay=318 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=331 replay=319 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=332 replay=320 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=333 replay=321 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=334 replay=322 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=335 replay=323 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=336 replay=324 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=337 replay=325 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=338 replay=326 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=339 replay=327 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=340 replay=328 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=341 replay=329 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=342 replay=330 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=343 replay=331 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=344 replay=332 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=345 replay=333 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=346 replay=334 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=347 replay=335 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=348 replay=336 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=349 replay=337 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=350 replay=338 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=351 replay=339 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=352 replay=340 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=353 replay=341 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=354 replay=342 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=355 replay=343 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=356 replay=344 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=357 replay=345 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=358 replay=346 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=359 replay=347 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=360 replay=348 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=361 replay=349 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=362 replay=350 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=363 replay=351 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=364 replay=352 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=365 replay=353 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=366 replay=354 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=367 replay=355 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=368 replay=356 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=369 replay=357 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=370 replay=358 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=371 replay=359 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=372 replay=360 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=373 replay=361 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=374 replay=362 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=375 replay=363 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=376 replay=364 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=377 replay=365 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=378 replay=366 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=379 replay=367 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=380 replay=368 capture=6 eager=6 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=381 replay=369 capture=6 eager=6 enabled=1
+[server] chat DONE chatcmpl_0000000000000002 ok=true in=16348 effective_in=16348 out=128 21.2s 6.0 tok/s finish=length restore=false slot=-1 prefix_len=0 prefill=16.6s decode=4.6s(27.7tok/s) error=- detail=-
+[server] request path=/v1/chat/completions body_bytes=79803
+[server] chat chatcmpl_0000000000000003 format=chat stream=true msgs=1 tools=0 prompt_tokens=16348 max_tokens=128 max_ctx=40000 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=dflash
+[server] chat START chatcmpl_0000000000000003 format=chat stream=true prompt_tokens=16348 max_tokens=128 tools=0
+[server] chat CACHE chatcmpl_0000000000000003 restore=false slot=-1 prefix_len=0 effective_prompt=16348 pflash=false disk_policy=full disk_hit=false snap_slot=3 snap_pos=16342 full_snap_slot=-1 full_snap_pos=0
+[cuda-graph-diff] key=0x71f88f9839b0 node=1/6614 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=1 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x71f693000000 new_data=0x71f6a7725400
+[cuda-graph-stats] key=0x71f88f9839b0 n_nodes=6614 total=2 replay=0 capture=0 eager=2 enabled=1
+[fa] graph qsa=12 dense=0
+[qwen4exp-stable] event=rebuild old_bucket=16896 new_bucket=16640
+[qwen4exp-stable] event=build bucket=16640 nodes=5147
+[cuda-graph-diff] key=0x71f8b55d2c90 node=2/5147 name=node_2 op=REPEAT extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x71f8bc60d500 new_data=0x71f8bc60d300
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=382 replay=369 capture=6 eager=7 enabled=1
+[fa] graph qsa=0 dense=12
+[qwen4exp-stable] event=first bucket=16640 calls=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=383 replay=369 capture=7 eager=7 enabled=1
+[fa] graph qsa=0 dense=12
+[qwen4exp-stable] event=reuse bucket=16640 calls=2
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=384 replay=370 capture=7 eager=7 enabled=1
+[qwen4exp-stable] event=reuse bucket=16640 calls=3
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=385 replay=371 capture=7 eager=7 enabled=1
+[qwen4exp-stable] event=reuse bucket=16640 calls=4
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=386 replay=372 capture=7 eager=7 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=387 replay=373 capture=7 eager=7 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=388 replay=374 capture=7 eager=7 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=389 replay=375 capture=7 eager=7 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=390 replay=376 capture=7 eager=7 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=391 replay=377 capture=7 eager=7 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=392 replay=378 capture=7 eager=7 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=393 replay=379 capture=7 eager=7 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=394 replay=380 capture=7 eager=7 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=395 replay=381 capture=7 eager=7 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=396 replay=382 capture=7 eager=7 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=397 replay=383 capture=7 eager=7 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=398 replay=384 capture=7 eager=7 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=399 replay=385 capture=7 eager=7 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=400 replay=386 capture=7 eager=7 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=401 replay=387 capture=7 eager=7 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=402 replay=388 capture=7 eager=7 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=403 replay=389 capture=7 eager=7 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=404 replay=390 capture=7 eager=7 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=405 replay=391 capture=7 eager=7 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=406 replay=392 capture=7 eager=7 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=407 replay=393 capture=7 eager=7 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=408 replay=394 capture=7 eager=7 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=409 replay=395 capture=7 eager=7 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=410 replay=396 capture=7 eager=7 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=411 replay=397 capture=7 eager=7 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=412 replay=398 capture=7 eager=7 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=413 replay=399 capture=7 eager=7 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=414 replay=400 capture=7 eager=7 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=415 replay=401 capture=7 eager=7 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=416 replay=402 capture=7 eager=7 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=417 replay=403 capture=7 eager=7 enabled=1
+[qwen4exp-stable] event=rebuild old_bucket=16640 new_bucket=16896
+[qwen4exp-stable] event=build bucket=16896 nodes=5147
+[cuda-graph-diff] key=0x71f8b55d2c90 node=2/5147 name=node_2 op=REPEAT extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x71f8bc60d300 new_data=0x71f8bc60d500
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=418 replay=403 capture=7 eager=8 enabled=1
+[fa] graph qsa=0 dense=12
+[qwen4exp-stable] event=first bucket=16896 calls=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=419 replay=403 capture=8 eager=8 enabled=1
+[fa] graph qsa=0 dense=12
+[qwen4exp-stable] event=reuse bucket=16896 calls=2
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=420 replay=404 capture=8 eager=8 enabled=1
+[qwen4exp-stable] event=reuse bucket=16896 calls=3
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=421 replay=405 capture=8 eager=8 enabled=1
+[qwen4exp-stable] event=reuse bucket=16896 calls=4
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=422 replay=406 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=423 replay=407 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=424 replay=408 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=425 replay=409 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=426 replay=410 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=427 replay=411 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=428 replay=412 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=429 replay=413 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=430 replay=414 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=431 replay=415 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=432 replay=416 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=433 replay=417 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=434 replay=418 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=435 replay=419 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=436 replay=420 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=437 replay=421 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=438 replay=422 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=439 replay=423 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=440 replay=424 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=441 replay=425 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=442 replay=426 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=443 replay=427 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=444 replay=428 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=445 replay=429 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=446 replay=430 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=447 replay=431 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=448 replay=432 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=449 replay=433 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=450 replay=434 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=451 replay=435 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=452 replay=436 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=453 replay=437 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=454 replay=438 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=455 replay=439 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=456 replay=440 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=457 replay=441 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=458 replay=442 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=459 replay=443 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=460 replay=444 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=461 replay=445 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=462 replay=446 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=463 replay=447 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=464 replay=448 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=465 replay=449 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=466 replay=450 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=467 replay=451 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=468 replay=452 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=469 replay=453 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=470 replay=454 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=471 replay=455 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=472 replay=456 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=473 replay=457 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=474 replay=458 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=475 replay=459 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=476 replay=460 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=477 replay=461 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=478 replay=462 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=479 replay=463 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=480 replay=464 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=481 replay=465 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=482 replay=466 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=483 replay=467 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=484 replay=468 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=485 replay=469 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=486 replay=470 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=487 replay=471 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=488 replay=472 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=489 replay=473 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=490 replay=474 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=491 replay=475 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=492 replay=476 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=493 replay=477 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=494 replay=478 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=495 replay=479 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=496 replay=480 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=497 replay=481 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=498 replay=482 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=499 replay=483 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=500 replay=484 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=501 replay=485 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=502 replay=486 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=503 replay=487 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=504 replay=488 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=505 replay=489 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=506 replay=490 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=507 replay=491 capture=8 eager=8 enabled=1
+[cuda-graph-stats] key=0x71f8b55d2c90 n_nodes=5147 total=508 replay=492 capture=8 eager=8 enabled=1
+[server] chat DONE chatcmpl_0000000000000003 ok=true in=16348 effective_in=16348 out=128 21.0s 6.1 tok/s finish=length restore=false slot=-1 prefix_len=0 prefill=16.4s decode=4.6s(27.8tok/s) error=- detail=-
