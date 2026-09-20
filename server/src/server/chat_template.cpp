@@ -68,7 +68,7 @@ ChatFormat chat_format_for_arch(const std::string & arch) {
     if (arch == "laguna") return ChatFormat::LAGUNA;
     if (arch == "gemma4") return ChatFormat::GEMMA4;
     if (arch == "bailingmoe3") return ChatFormat::BAILINGMOE3;
-    // qwen35, qwen3 use the Qwen3/ChatML format
+    // qwen35, qwen36, qwen3, qwen4exp use the Qwen3/ChatML format
     return ChatFormat::QWEN3;
 }
 

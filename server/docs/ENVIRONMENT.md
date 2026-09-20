@@ -379,3 +379,9 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `PFLASH_DRAFTER_SCORE_LAYERS` - qwen3_graph.cpp
 - `PFLASH_FREEZE_HOT_WINDOW` - http_server.cpp
 - `TMPDIR` - backend_ipc.cpp, moe_expert_compute_ipc.cpp
+- `LLAMA_MMB_HC16` - ggml-cuda.cu (>=2: mark the HC normalized stream bf16-only when every consumer reads the bf16 copy; default off)
+- `LLAMA_HC16_DEBUG` - ggml-cuda.cu (DIAGNOSTIC: print which consumer blocks each HC16 mark)
+- `QWEN4EXP_QSA` - qwen4exp_graph.cpp (enable the sparse selected-attention path)
+- `QWEN4EXP_MMB_CUBLAS` - ggml-cuda.cu (cuBLAS route: 0/unset off, 1 validated K=2560, 3 + ssm_out, 5 + HC down/up)
+- `DFLASH_MMB_SHADOW` - mmb.cu (1 enables the IQ4_NL bf16 weight shadow; default 2 = Q6_K only)
+- `DFLASH_MMB_SHADOW_CAP_MB` - mmb.cu (cap on total bf16 weight-shadow bytes)
