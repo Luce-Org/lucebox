@@ -1,0 +1,153 @@
+{
+  "gsq_prefill": {
+    "control": {
+      "n": 8,
+      "effective_prompt_tokens": 16366,
+      "prefill_ms": {
+        "median": 28235.1,
+        "min": 28025.6,
+        "max": 28249.7
+      },
+      "tokens_per_second": {
+        "median": 579.6331565595585,
+        "min": 579.3335858433895,
+        "max": 583.966088147979
+      }
+    },
+    "quant_candidate": {
+      "n": 8,
+      "effective_prompt_tokens": 16366,
+      "prefill_ms": {
+        "median": 21591.2,
+        "min": 21412.2,
+        "max": 21696.0
+      },
+      "tokens_per_second": {
+        "median": 757.9943162445766,
+        "min": 754.3325958702065,
+        "max": 764.3306152567228
+      }
+    },
+    "rejected_bf16_candidate": {
+      "n": 8,
+      "effective_prompt_tokens": 16366,
+      "prefill_ms": {
+        "median": 19076.1,
+        "min": 19065.5,
+        "max": 19107.8
+      },
+      "tokens_per_second": {
+        "median": 857.9321995691987,
+        "min": 856.5088602560211,
+        "max": 858.409168393171
+      }
+    },
+    "quant_gain_percent": 30.771386637660548
+  },
+  "iq4_prefill": {
+    "n": 8,
+    "effective_prompt_tokens": 16366,
+    "prefill_ms": {
+      "median": 15242.8,
+      "min": 15172.3,
+      "max": 16278.1
+    },
+    "tokens_per_second": {
+      "median": 1073.6885533314885,
+      "min": 1005.3998931079179,
+      "max": 1078.676271890221
+    }
+  },
+  "iq4_decode": {
+    "control_first": {
+      "2048": {
+        "n": 8,
+        "effective_prompt_tokens": 1996,
+        "tokens_per_second": {
+          "median": 30.0,
+          "min": 29.8,
+          "max": 30.1
+        },
+        "decode_ms": {
+          "median": 4269.45,
+          "min": 4257.6,
+          "max": 4297.8
+        }
+      },
+      "16384": {
+        "n": 8,
+        "effective_prompt_tokens": 16348,
+        "tokens_per_second": {
+          "median": 28.5,
+          "min": 28.4,
+          "max": 28.5
+        },
+        "decode_ms": {
+          "median": 4493.35,
+          "min": 4484.7,
+          "max": 4508.5
+        }
+      }
+    },
+    "candidate": {
+      "2048": {
+        "n": 8,
+        "effective_prompt_tokens": 1996,
+        "tokens_per_second": {
+          "median": 29.8,
+          "min": 29.7,
+          "max": 29.9
+        },
+        "decode_ms": {
+          "median": 4290.8,
+          "min": 4280.4,
+          "max": 4304.4
+        }
+      },
+      "16384": {
+        "n": 8,
+        "effective_prompt_tokens": 16348,
+        "tokens_per_second": {
+          "median": 28.1,
+          "min": 27.9,
+          "max": 28.1
+        },
+        "decode_ms": {
+          "median": 4556.75,
+          "min": 4551.8,
+          "max": 4595.5
+        }
+      }
+    },
+    "control_thermal_match": {
+      "2048": {
+        "n": 8,
+        "effective_prompt_tokens": 1996,
+        "tokens_per_second": {
+          "median": 29.85,
+          "min": 29.7,
+          "max": 29.9
+        },
+        "decode_ms": {
+          "median": 4291.2,
+          "min": 4275.7,
+          "max": 4308.1
+        }
+      },
+      "16384": {
+        "n": 8,
+        "effective_prompt_tokens": 16348,
+        "tokens_per_second": {
+          "median": 28.1,
+          "min": 27.9,
+          "max": 28.1
+        },
+        "decode_ms": {
+          "median": 4560.65,
+          "min": 4555.8,
+          "max": 4590.6
+        }
+      }
+    }
+  }
+}

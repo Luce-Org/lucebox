@@ -1,0 +1,65 @@
+[bench] url=http://127.0.0.1:18750  model=dflash  suites=he,gsm,math,recall
+
+[bench] === HE (n=10) ===
+    #  id                  wall     TTFT  pf tok/s  out_tok  out tok/s  score
+  ---  ---               ------  -------  --------  -------  ---------  -----
+    1  he_01              7.96s   1.023s    138.80      173      24.95  OK
+    2  he_02             10.79s   0.886s    151.20      245      24.74  OK
+    3  he_03              4.67s   0.862s    119.50       97      25.48  OK
+    4  he_04              7.18s   0.931s    147.20      157      25.14  OK
+    5  he_05              7.63s   0.886s    153.60      169      25.06  OK
+    6  he_06              7.03s   0.908s    123.40      154      25.14  OK
+    7  he_07              9.56s   0.870s    151.70      216      24.86  OK
+    8  he_08              5.29s   0.899s    124.50      112      25.53  OK
+    9  he_09              7.39s   0.891s    150.40      163      25.09  OK
+   10  he_10              7.29s   0.961s    120.70      159      25.10  OK
+
+  [summary] ok=10/10  wall=7.48s  TTFT=0.912s  prefill=138.10 tok/s  output=25.11 tok/s  accuracy=10/10 (100.0%)
+
+[bench] === GSM (n=10) ===
+    #  id                  wall     TTFT  pf tok/s  out_tok  out tok/s  score
+  ---  ---               ------  -------  --------  -------  ---------  -----
+    1  gsm_01             8.79s   0.722s    113.60      199      24.67  OK
+    2  gsm_02             7.13s   0.440s     97.80      165      24.66  OK
+    3  gsm_03            19.27s   0.648s    111.20      454      24.38  OK
+    4  gsm_04             6.67s   0.518s     98.40      153      24.88  OK
+    5  gsm_05            11.38s   0.930s    134.40      257      24.60  OK
+    6  gsm_06            15.02s   0.616s    116.90      351      24.37  OK
+    7  gsm_07             9.31s   0.596s     97.40      216      24.79  OK
+    8  gsm_08            19.81s   0.704s    123.60      465      24.34  WRONG
+    9  gsm_09            19.97s   0.789s    121.70      469      24.45  WRONG
+   10  gsm_10            13.54s   0.706s    110.50      315      24.55  OK
+
+  [summary] ok=10/10  wall=13.09s  TTFT=0.667s  prefill=112.50 tok/s  output=24.57 tok/s  accuracy=8/10 (80.0%)
+
+[bench] === MATH (n=10) ===
+    #  id                  wall     TTFT  pf tok/s  out_tok  out tok/s  score
+  ---  ---               ------  -------  --------  -------  ---------  -----
+    1  math_01           13.90s   0.532s     88.40      328      24.53  OK
+    2  math_02            8.12s   0.767s     91.30      185      25.17  OK
+    3  math_03           14.51s   0.705s     97.80      339      24.55  OK
+    4  math_04           37.99s   0.888s    114.90      901      24.29  OK
+    5  math_05           49.57s   0.564s    108.20     1186      24.20  OK
+    6  math_06           14.66s   0.521s     97.90      342      24.20  OK
+    7  math_07           10.24s   0.545s    102.80      239      24.64  OK
+    8  math_08           25.99s   0.599s    106.80      619      24.38  OK
+    9  math_09           16.65s   0.519s     82.90      395      24.49  OK
+   10  math_10           79.79s   0.872s    118.10     1913      24.24  OK
+
+  [summary] ok=10/10  wall=27.14s  TTFT=0.651s  prefill=100.90 tok/s  output=24.47 tok/s  accuracy=10/10 (100.0%)
+
+[bench] === RECALL (n=2) ===
+    #  id                  wall     TTFT  pf tok/s  out_tok  out tok/s  score
+  ---  ---               ------  -------  --------  -------  ---------  -----
+    1  recall_13k        25.14s  23.986s    569.70       32      27.65  OK
+    2  recall_24k        43.38s  42.196s    568.40       32      27.01  OK
+
+  [summary] ok=2/2  wall=34.26s  TTFT=33.091s  prefill=569.00 tok/s  output=27.33 tok/s  accuracy=2/2 (100.0%)
+
+[bench] === SUMMARY ===
+   Suite     OK     Wall     TTFT   Pf tok/s   Out tok/s   Out tok       Score
+      he  10/10    7.48s   0.912s     138.10       25.11      1645       10/10
+     gsm  10/10   13.09s   0.667s     112.50       24.57      3044        8/10
+    math  10/10   27.14s   0.651s     100.90       24.47      6447       10/10
+  recall    2/2   34.26s  33.091s     569.00       27.33        64         2/2
+wrote /tmp/q4exp-gsq-prefill/t13-gsq-quality.json

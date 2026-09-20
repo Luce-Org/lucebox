@@ -1,0 +1,43 @@
+{
+  "model": "gsq",
+  "kind": "prefill",
+  "depth": 0,
+  "warmup": {
+    "usage": {
+      "completion_tokens": 1,
+      "prompt_tokens": 16366,
+      "timings": {
+        "agent_turn_cache_hit": false,
+        "cache_hit": false,
+        "cached_prefix_tokens": 0,
+        "decode_ms": 0.3,
+        "decode_tokens_per_sec": 3563.9,
+        "effective_prompt_tokens": 16366,
+        "prefill_ms": 21873.7,
+        "prefilled_tokens": 16366
+      },
+      "total_tokens": 16367
+    },
+    "ttft_s": 21.88567583700933,
+    "wall_s": 21.887121363004553
+  },
+  "measured": {
+    "usage": {
+      "completion_tokens": 1,
+      "prompt_tokens": 16366,
+      "timings": {
+        "agent_turn_cache_hit": false,
+        "cache_hit": false,
+        "cached_prefix_tokens": 0,
+        "decode_ms": 0.3,
+        "decode_tokens_per_sec": 3676.3,
+        "effective_prompt_tokens": 16366,
+        "prefill_ms": 21616.3,
+        "prefilled_tokens": 16366
+      },
+      "total_tokens": 16367
+    },
+    "ttft_s": 21.625641486010863,
+    "wall_s": 21.627034782999544
+  }
+}

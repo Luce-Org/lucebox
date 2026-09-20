@@ -1,0 +1,696 @@
+[server] load balancing disabled; primary=dflash target=hip:0
+[server] loading tokenizer from /home/duster/models/qwen4exp/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf
+[tokenizer] added_tokens: 33 special tokens
+[tokenizer] loaded vocab=248320 merges=247587 bos=248044 eos=248046 eot=248046 pre=qwen35 sp=no
+[server] creating backend...
+[backend_factory] detected arch=qwen4exp
+ggml_cuda_init: found 1 ROCm devices (Total VRAM: 98304 MiB):
+  Device 0: Radeon 8060S Graphics, gfx1151 (0x1151), VMM: no, Wave Size: 32, VRAM: 98304 MiB
+[qwen4exp] qwen4exp trunk loaded: 48 layers (36 linear + 12 full), 1222 tensors 43.54 GiB from 2 shard(s), experts=10/512 hc=4/320 ple_layers=1 ngram=3 heads_per_ngram=8 table_rows=320001536 eos=248046
+[qwen4exp] cache: integrated GPU detected, graph inputs will be ring-buffered in pinned host memory (DFLASH_HIP_NO_UMA_RING=1 to disable)
+[qwen4exp] cache: 12 full + 36 linear layers, kv=f16 937.50 MiB @ ctx=40000, ssm_state 108.0 MiB, conv_state 4.2 MiB
+[server] gguf meta: general.name='Qwen3.8-Flash-Next GSQ-RCO' general.architecture='qwen4exp'
+[model_card] using cards dir: /home/duster/lucebox-qwen4exp/server/build-hip/../../share/model_cards
+[model_card] probing sidecar: /home/duster/lucebox-qwen4exp/server/build-hip/../../share/model_cards/qwen3.8-flash-next-gsq-rco.json (from general.name='Qwen3.8-Flash-Next GSQ-RCO')
+[model_card] sidecar not found at /home/duster/lucebox-qwen4exp/server/build-hip/../../share/model_cards/qwen3.8-flash-next-gsq-rco.json
+[model_card] using family fallback for arch='qwen4exp'
+[server] effort-tier ceiling = max_ctx(40000) - hard_limit_reply_budget(4096) = 35904
+
+[server] ╭─── Configuration ───────────────────────────────────╮
+[server] │  host            = 127.0.0.1
+[server] │  port            = 18740
+[server] │  model           = /home/duster/models/qwen4exp/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf
+[server] │  draft           = (none)
+[server] │  model_name      = dflash
+[server] │  max_ctx         = 40000
+[server] │  model_card      = family:qwen4exp
+[server] │  max_tokens      = 32768 (family:qwen4exp)
+[server] │  think_max_tokens= 28672 (family:qwen4exp)
+[server] │  hard_limit_reply= 4096 (family:qwen4exp)
+[server] │  effort tiers    = low=3584 (family:qwen4exp)
+[server] │                    medium=14336 (family:qwen4exp)
+[server] │                    high=28672 (family:qwen4exp)
+[server] │                    x-high=28672 (family:qwen4exp)
+[server] │                    max=28672 (family:qwen4exp)
+[server] │  target_device   = hip:0
+[server] │  target_split    = layer
+[server] │  draft_device    = auto:0
+[server] │  draft_exec      = local
+[server] │  peer_access     = off
+[server] │  chunk           = 16384
+[server] │  admission_wait  = 20 ms
+[server] │  fa_window       = 0
+[server] │  ddtree          = off
+[server] │  specla          = off
+[server] │  fast_rollback   = ON
+[server] │  ddtree_budget   = 22
+[server] │  prefix_cache    = 32 slots
+[server] │  agent_turn_cache= off
+[server] │  prefill_cache   = 0 slots
+[server] │  cors            = ON
+[server] │  cache_type_k    = family default
+[server] │  cache_type_v    = family default
+[server] │  pflash          = off
+[server] │  draft_residency = auto
+[server] ╰─────────────────────────────────────────────────────╯
+
+[server] level-2 force-close (marker-only, 8 chars → 1 tokens, hard_limit_reply_budget = 4096)
+[server] level-2 force-close token ids: 248069
+[pc] enabled: cap=32 family=qwen
+[ppp] enabled=1 rearrange=0 lcp_window=8 min_pin=512 max_ephemeral=256
+[server] model dflash automatic decode KV offload budget: 0 bytes
+[server] listening on http://127.0.0.1:18740
+[server] request path=/v1/chat/completions body_bytes=79900
+[server] chat chatcmpl_0000000000000000 format=chat stream=true msgs=1 tools=0 prompt_tokens=16366 max_tokens=1 max_ctx=40000 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=dflash
+[server] chat START chatcmpl_0000000000000000 format=chat stream=true prompt_tokens=16366 max_tokens=1 tools=0
+[server] chat CACHE chatcmpl_0000000000000000 restore=false slot=-1 prefix_len=0 effective_prompt=16366 pflash=false disk_policy=full disk_hit=false snap_slot=0 snap_pos=16360 full_snap_slot=-1 full_snap_pos=0
+[mm] K=10240 N=320 type=30
+[mm] K=320 N=10240 type=30
+[mm] K=2560 N=10240 type=23
+[dense-probe] type=23 M=10240 K=2560 T=16366 bf=0 shadow=0 route=4 rep=0 ms=187.875275 name=blk.0.attn_qkv.weight
+[dense-probe] type=23 M=10240 K=2560 T=16366 bf=0 shadow=0 route=4 rep=1 ms=183.541580 name=blk.0.attn_qkv.weight
+[dense-probe] type=23 M=10240 K=2560 T=16366 bf=0 shadow=0 route=4 rep=2 ms=182.424667 name=blk.0.attn_qkv.weight
+[dense-probe] type=23 M=10240 K=2560 T=16366 bf=0 shadow=0 route=4 rep=3 ms=184.345673 name=blk.0.attn_qkv.weight
+[dense-probe] type=23 M=10240 K=2560 T=16366 bf=0 shadow=0 route=4 rep=4 ms=184.746429 name=blk.0.attn_qkv.weight
+[dense-probe] type=23 M=10240 K=2560 T=16366 bf=0 shadow=0 route=4 rep=5 ms=180.686172 name=blk.0.attn_qkv.weight
+[dense-probe] type=23 M=10240 K=2560 T=16366 bf=0 shadow=0 route=5 rep=0 ms=137.138580 name=blk.0.attn_qkv.weight
+[dense-probe] type=23 M=10240 K=2560 T=16366 bf=0 shadow=0 route=5 rep=1 ms=132.285187 name=blk.0.attn_qkv.weight
+[dense-probe] type=23 M=10240 K=2560 T=16366 bf=0 shadow=0 route=5 rep=2 ms=135.749329 name=blk.0.attn_qkv.weight
+[dense-probe] type=23 M=10240 K=2560 T=16366 bf=0 shadow=0 route=5 rep=3 ms=139.278992 name=blk.0.attn_qkv.weight
+[dense-probe] type=23 M=10240 K=2560 T=16366 bf=0 shadow=0 route=5 rep=4 ms=133.740097 name=blk.0.attn_qkv.weight
+[dense-probe] type=23 M=10240 K=2560 T=16366 bf=0 shadow=0 route=5 rep=5 ms=133.452667 name=blk.0.attn_qkv.weight
+[dense-probe] type=23 M=10240 K=2560 T=16366 bf=0 shadow=0 route=3 rep=0 ms=34.074497 name=blk.0.attn_qkv.weight
+[dense-probe] type=23 M=10240 K=2560 T=16366 bf=0 shadow=0 route=3 rep=1 ms=32.602673 name=blk.0.attn_qkv.weight
+[dense-probe] type=23 M=10240 K=2560 T=16366 bf=0 shadow=0 route=3 rep=2 ms=32.465679 name=blk.0.attn_qkv.weight
+[dense-probe] type=23 M=10240 K=2560 T=16366 bf=0 shadow=0 route=3 rep=3 ms=32.174263 name=blk.0.attn_qkv.weight
+[dense-probe] type=23 M=10240 K=2560 T=16366 bf=0 shadow=0 route=3 rep=4 ms=32.310329 name=blk.0.attn_qkv.weight
+[dense-probe] type=23 M=10240 K=2560 T=16366 bf=0 shadow=0 route=3 rep=5 ms=32.608719 name=blk.0.attn_qkv.weight
+[mm] K=2560 N=48 type=30
+[mm] K=2560 N=2560 type=30
+[mm] K=2560 N=10240 type=30
+[mm] K=10240 N=4 type=30
+[mm] K=2560 N=6144 type=21
+[dense-probe] type=21 M=6144 K=2560 T=16366 bf=0 shadow=0 route=4 rep=0 ms=89.704834 name=blk.0.attn_gate.weight
+[dense-probe] type=21 M=6144 K=2560 T=16366 bf=0 shadow=0 route=4 rep=1 ms=86.974159 name=blk.0.attn_gate.weight
+[dense-probe] type=21 M=6144 K=2560 T=16366 bf=0 shadow=0 route=4 rep=2 ms=89.618172 name=blk.0.attn_gate.weight
+[dense-probe] type=21 M=6144 K=2560 T=16366 bf=0 shadow=0 route=4 rep=3 ms=89.654053 name=blk.0.attn_gate.weight
+[dense-probe] type=21 M=6144 K=2560 T=16366 bf=0 shadow=0 route=4 rep=4 ms=91.477554 name=blk.0.attn_gate.weight
+[dense-probe] type=21 M=6144 K=2560 T=16366 bf=0 shadow=0 route=4 rep=5 ms=93.939781 name=blk.0.attn_gate.weight
+[dense-probe] type=21 M=6144 K=2560 T=16366 bf=0 shadow=0 route=5 rep=0 ms=79.921547 name=blk.0.attn_gate.weight
+[dense-probe] type=21 M=6144 K=2560 T=16366 bf=0 shadow=0 route=5 rep=1 ms=80.589699 name=blk.0.attn_gate.weight
+[dense-probe] type=21 M=6144 K=2560 T=16366 bf=0 shadow=0 route=5 rep=2 ms=80.197296 name=blk.0.attn_gate.weight
+[dense-probe] type=21 M=6144 K=2560 T=16366 bf=0 shadow=0 route=5 rep=3 ms=80.229134 name=blk.0.attn_gate.weight
+[dense-probe] type=21 M=6144 K=2560 T=16366 bf=0 shadow=0 route=5 rep=4 ms=80.454498 name=blk.0.attn_gate.weight
+[dense-probe] type=21 M=6144 K=2560 T=16366 bf=0 shadow=0 route=5 rep=5 ms=80.202103 name=blk.0.attn_gate.weight
+[dense-probe] type=21 M=6144 K=2560 T=16366 bf=0 shadow=0 route=3 rep=0 ms=24.529224 name=blk.0.attn_gate.weight
+[dense-probe] type=21 M=6144 K=2560 T=16366 bf=0 shadow=0 route=3 rep=1 ms=21.839161 name=blk.0.attn_gate.weight
+[dense-probe] type=21 M=6144 K=2560 T=16366 bf=0 shadow=0 route=3 rep=2 ms=21.794697 name=blk.0.attn_gate.weight
+[dense-probe] type=21 M=6144 K=2560 T=16366 bf=0 shadow=0 route=3 rep=3 ms=21.945253 name=blk.0.attn_gate.weight
+[dense-probe] type=21 M=6144 K=2560 T=16366 bf=0 shadow=0 route=3 rep=4 ms=21.877069 name=blk.0.attn_gate.weight
+[dense-probe] type=21 M=6144 K=2560 T=16366 bf=0 shadow=0 route=3 rep=5 ms=21.918213 name=blk.0.attn_gate.weight
+[mm] K=6144 N=2560 type=23
+[dense-probe] type=23 M=2560 K=6144 T=16366 bf=0 shadow=0 route=4 rep=0 ms=116.841202 name=blk.0.ssm_out.weight
+[dense-probe] type=23 M=2560 K=6144 T=16366 bf=0 shadow=0 route=4 rep=1 ms=113.995941 name=blk.0.ssm_out.weight
+[dense-probe] type=23 M=2560 K=6144 T=16366 bf=0 shadow=0 route=4 rep=2 ms=114.182152 name=blk.0.ssm_out.weight
+[dense-probe] type=23 M=2560 K=6144 T=16366 bf=0 shadow=0 route=4 rep=3 ms=112.631355 name=blk.0.ssm_out.weight
+[dense-probe] type=23 M=2560 K=6144 T=16366 bf=0 shadow=0 route=4 rep=4 ms=113.739891 name=blk.0.ssm_out.weight
+[dense-probe] type=23 M=2560 K=6144 T=16366 bf=0 shadow=0 route=4 rep=5 ms=115.193558 name=blk.0.ssm_out.weight
+[dense-probe] type=23 M=2560 K=6144 T=16366 bf=0 shadow=0 route=5 rep=0 ms=88.880310 name=blk.0.ssm_out.weight
+[dense-probe] type=23 M=2560 K=6144 T=16366 bf=0 shadow=0 route=5 rep=1 ms=87.810226 name=blk.0.ssm_out.weight
+[dense-probe] type=23 M=2560 K=6144 T=16366 bf=0 shadow=0 route=5 rep=2 ms=84.647072 name=blk.0.ssm_out.weight
+[dense-probe] type=23 M=2560 K=6144 T=16366 bf=0 shadow=0 route=5 rep=3 ms=86.300331 name=blk.0.ssm_out.weight
+[dense-probe] type=23 M=2560 K=6144 T=16366 bf=0 shadow=0 route=5 rep=4 ms=87.246910 name=blk.0.ssm_out.weight
+[dense-probe] type=23 M=2560 K=6144 T=16366 bf=0 shadow=0 route=5 rep=5 ms=85.708694 name=blk.0.ssm_out.weight
+[dense-probe] type=23 M=2560 K=6144 T=16366 bf=0 shadow=0 route=3 rep=0 ms=22.355740 name=blk.0.ssm_out.weight
+[dense-probe] type=23 M=2560 K=6144 T=16366 bf=0 shadow=0 route=3 rep=1 ms=22.218019 name=blk.0.ssm_out.weight
+[dense-probe] type=23 M=2560 K=6144 T=16366 bf=0 shadow=0 route=3 rep=2 ms=22.258078 name=blk.0.ssm_out.weight
+[dense-probe] type=23 M=2560 K=6144 T=16366 bf=0 shadow=0 route=3 rep=3 ms=22.316628 name=blk.0.ssm_out.weight
+[dense-probe] type=23 M=2560 K=6144 T=16366 bf=0 shadow=0 route=3 rep=4 ms=22.315664 name=blk.0.ssm_out.weight
+[dense-probe] type=23 M=2560 K=6144 T=16366 bf=0 shadow=0 route=3 rep=5 ms=22.278254 name=blk.0.ssm_out.weight
+[mm] K=2560 N=512 type=30
+[mm] K=2560 N=640 type=23
+[dense-probe] type=23 M=640 K=2560 T=16366 bf=0 shadow=0 route=4 rep=0 ms=12.324357 name=blk.0.ffn_gate_shexp.weight
+[dense-probe] type=23 M=640 K=2560 T=16366 bf=0 shadow=0 route=4 rep=1 ms=11.996221 name=blk.0.ffn_gate_shexp.weight
+[dense-probe] type=23 M=640 K=2560 T=16366 bf=0 shadow=0 route=4 rep=2 ms=12.094289 name=blk.0.ffn_gate_shexp.weight
+[dense-probe] type=23 M=640 K=2560 T=16366 bf=0 shadow=0 route=4 rep=3 ms=12.312170 name=blk.0.ffn_gate_shexp.weight
+[dense-probe] type=23 M=640 K=2560 T=16366 bf=0 shadow=0 route=4 rep=4 ms=12.287615 name=blk.0.ffn_gate_shexp.weight
+[dense-probe] type=23 M=640 K=2560 T=16366 bf=0 shadow=0 route=4 rep=5 ms=11.829546 name=blk.0.ffn_gate_shexp.weight
+[dense-probe] type=23 M=640 K=2560 T=16366 bf=0 shadow=0 route=5 rep=0 ms=9.280493 name=blk.0.ffn_gate_shexp.weight
+[dense-probe] type=23 M=640 K=2560 T=16366 bf=0 shadow=0 route=5 rep=1 ms=9.257697 name=blk.0.ffn_gate_shexp.weight
+[dense-probe] type=23 M=640 K=2560 T=16366 bf=0 shadow=0 route=5 rep=2 ms=9.557773 name=blk.0.ffn_gate_shexp.weight
+[dense-probe] type=23 M=640 K=2560 T=16366 bf=0 shadow=0 route=5 rep=3 ms=9.498503 name=blk.0.ffn_gate_shexp.weight
+[dense-probe] type=23 M=640 K=2560 T=16366 bf=0 shadow=0 route=5 rep=4 ms=9.234229 name=blk.0.ffn_gate_shexp.weight
+[dense-probe] type=23 M=640 K=2560 T=16366 bf=0 shadow=0 route=5 rep=5 ms=9.357092 name=blk.0.ffn_gate_shexp.weight
+[dense-probe] type=23 M=640 K=2560 T=16366 bf=0 shadow=0 route=3 rep=0 ms=2.779267 name=blk.0.ffn_gate_shexp.weight
+[dense-probe] type=23 M=640 K=2560 T=16366 bf=0 shadow=0 route=3 rep=1 ms=2.839145 name=blk.0.ffn_gate_shexp.weight
+[dense-probe] type=23 M=640 K=2560 T=16366 bf=0 shadow=0 route=3 rep=2 ms=2.836268 name=blk.0.ffn_gate_shexp.weight
+[dense-probe] type=23 M=640 K=2560 T=16366 bf=0 shadow=0 route=3 rep=3 ms=2.843112 name=blk.0.ffn_gate_shexp.weight
+[dense-probe] type=23 M=640 K=2560 T=16366 bf=0 shadow=0 route=3 rep=4 ms=2.862897 name=blk.0.ffn_gate_shexp.weight
+[dense-probe] type=23 M=640 K=2560 T=16366 bf=0 shadow=0 route=3 rep=5 ms=2.863847 name=blk.0.ffn_gate_shexp.weight
+[mm] K=2560 N=640 type=21
+[dense-probe] type=21 M=640 K=2560 T=16366 bf=0 shadow=0 route=4 rep=0 ms=10.415657 name=blk.0.ffn_up_shexp.weight
+[dense-probe] type=21 M=640 K=2560 T=16366 bf=0 shadow=0 route=4 rep=1 ms=10.166568 name=blk.0.ffn_up_shexp.weight
+[dense-probe] type=21 M=640 K=2560 T=16366 bf=0 shadow=0 route=4 rep=2 ms=10.207040 name=blk.0.ffn_up_shexp.weight
+[dense-probe] type=21 M=640 K=2560 T=16366 bf=0 shadow=0 route=4 rep=3 ms=10.254666 name=blk.0.ffn_up_shexp.weight
+[dense-probe] type=21 M=640 K=2560 T=16366 bf=0 shadow=0 route=4 rep=4 ms=10.315503 name=blk.0.ffn_up_shexp.weight
+[dense-probe] type=21 M=640 K=2560 T=16366 bf=0 shadow=0 route=4 rep=5 ms=9.996660 name=blk.0.ffn_up_shexp.weight
+[dense-probe] type=21 M=640 K=2560 T=16366 bf=0 shadow=0 route=5 rep=0 ms=9.056329 name=blk.0.ffn_up_shexp.weight
+[dense-probe] type=21 M=640 K=2560 T=16366 bf=0 shadow=0 route=5 rep=1 ms=8.997179 name=blk.0.ffn_up_shexp.weight
+[dense-probe] type=21 M=640 K=2560 T=16366 bf=0 shadow=0 route=5 rep=2 ms=8.968479 name=blk.0.ffn_up_shexp.weight
+[dense-probe] type=21 M=640 K=2560 T=16366 bf=0 shadow=0 route=5 rep=3 ms=9.054795 name=blk.0.ffn_up_shexp.weight
+[dense-probe] type=21 M=640 K=2560 T=16366 bf=0 shadow=0 route=5 rep=4 ms=8.980352 name=blk.0.ffn_up_shexp.weight
+[dense-probe] type=21 M=640 K=2560 T=16366 bf=0 shadow=0 route=5 rep=5 ms=9.028511 name=blk.0.ffn_up_shexp.weight
+[dense-probe] type=21 M=640 K=2560 T=16366 bf=0 shadow=0 route=3 rep=0 ms=3.053154 name=blk.0.ffn_up_shexp.weight
+[dense-probe] type=21 M=640 K=2560 T=16366 bf=0 shadow=0 route=3 rep=1 ms=3.125859 name=blk.0.ffn_up_shexp.weight
+[dense-probe] type=21 M=640 K=2560 T=16366 bf=0 shadow=0 route=3 rep=2 ms=3.092429 name=blk.0.ffn_up_shexp.weight
+[dense-probe] type=21 M=640 K=2560 T=16366 bf=0 shadow=0 route=3 rep=3 ms=3.110767 name=blk.0.ffn_up_shexp.weight
+[dense-probe] type=21 M=640 K=2560 T=16366 bf=0 shadow=0 route=3 rep=4 ms=3.181509 name=blk.0.ffn_up_shexp.weight
+[dense-probe] type=21 M=640 K=2560 T=16366 bf=0 shadow=0 route=3 rep=5 ms=3.130097 name=blk.0.ffn_up_shexp.weight
+[mm] K=640 N=2560 type=20
+[dense-probe] type=20 M=2560 K=640 T=16366 bf=0 shadow=0 route=4 rep=0 ms=4.595309 name=blk.0.ffn_down_shexp.weight
+[dense-probe] type=20 M=2560 K=640 T=16366 bf=0 shadow=0 route=4 rep=1 ms=4.338503 name=blk.0.ffn_down_shexp.weight
+[dense-probe] type=20 M=2560 K=640 T=16366 bf=0 shadow=0 route=4 rep=2 ms=4.387317 name=blk.0.ffn_down_shexp.weight
+[dense-probe] type=20 M=2560 K=640 T=16366 bf=0 shadow=0 route=4 rep=3 ms=4.583118 name=blk.0.ffn_down_shexp.weight
+[dense-probe] type=20 M=2560 K=640 T=16366 bf=0 shadow=0 route=4 rep=4 ms=4.666620 name=blk.0.ffn_down_shexp.weight
+[dense-probe] type=20 M=2560 K=640 T=16366 bf=0 shadow=0 route=4 rep=5 ms=4.589159 name=blk.0.ffn_down_shexp.weight
+[dense-probe] type=20 M=2560 K=640 T=16366 bf=0 shadow=0 route=5 rep=0 ms=7.052384 name=blk.0.ffn_down_shexp.weight
+[dense-probe] type=20 M=2560 K=640 T=16366 bf=0 shadow=0 route=5 rep=1 ms=6.978519 name=blk.0.ffn_down_shexp.weight
+[dense-probe] type=20 M=2560 K=640 T=16366 bf=0 shadow=0 route=5 rep=2 ms=6.949108 name=blk.0.ffn_down_shexp.weight
+[dense-probe] type=20 M=2560 K=640 T=16366 bf=0 shadow=0 route=5 rep=3 ms=6.797528 name=blk.0.ffn_down_shexp.weight
+[dense-probe] type=20 M=2560 K=640 T=16366 bf=0 shadow=0 route=5 rep=4 ms=6.821315 name=blk.0.ffn_down_shexp.weight
+[dense-probe] type=20 M=2560 K=640 T=16366 bf=0 shadow=0 route=5 rep=5 ms=6.867803 name=blk.0.ffn_down_shexp.weight
+[dense-probe] type=20 M=2560 K=640 T=16366 bf=0 shadow=0 route=3 rep=0 ms=4.742211 name=blk.0.ffn_down_shexp.weight
+[dense-probe] type=20 M=2560 K=640 T=16366 bf=0 shadow=0 route=3 rep=1 ms=2.788316 name=blk.0.ffn_down_shexp.weight
+[dense-probe] type=20 M=2560 K=640 T=16366 bf=0 shadow=0 route=3 rep=2 ms=2.828790 name=blk.0.ffn_down_shexp.weight
+[dense-probe] type=20 M=2560 K=640 T=16366 bf=0 shadow=0 route=3 rep=3 ms=2.842202 name=blk.0.ffn_down_shexp.weight
+[dense-probe] type=20 M=2560 K=640 T=16366 bf=0 shadow=0 route=3 rep=4 ms=2.865677 name=blk.0.ffn_down_shexp.weight
+[dense-probe] type=20 M=2560 K=640 T=16366 bf=0 shadow=0 route=3 rep=5 ms=2.854140 name=blk.0.ffn_down_shexp.weight
+[mm] K=2560 N=1 type=30
+[mm] K=2560 N=6144 type=14
+[dense-probe] type=14 M=6144 K=2560 T=16366 bf=0 shadow=1 route=1 rep=0 ms=18.169302 name=blk.1.attn_gate.weight
+[dense-probe] type=14 M=6144 K=2560 T=16366 bf=0 shadow=1 route=1 rep=1 ms=18.083103 name=blk.1.attn_gate.weight
+[dense-probe] type=14 M=6144 K=2560 T=16366 bf=0 shadow=1 route=1 rep=2 ms=18.010071 name=blk.1.attn_gate.weight
+[dense-probe] type=14 M=6144 K=2560 T=16366 bf=0 shadow=1 route=1 rep=3 ms=18.008495 name=blk.1.attn_gate.weight
+[dense-probe] type=14 M=6144 K=2560 T=16366 bf=0 shadow=1 route=1 rep=4 ms=18.090952 name=blk.1.attn_gate.weight
+[dense-probe] type=14 M=6144 K=2560 T=16366 bf=0 shadow=1 route=1 rep=5 ms=18.142117 name=blk.1.attn_gate.weight
+[dense-probe] type=14 M=6144 K=2560 T=16366 bf=0 shadow=1 route=4 rep=0 ms=72.021034 name=blk.1.attn_gate.weight
+[dense-probe] type=14 M=6144 K=2560 T=16366 bf=0 shadow=1 route=4 rep=1 ms=71.785362 name=blk.1.attn_gate.weight
+[dense-probe] type=14 M=6144 K=2560 T=16366 bf=0 shadow=1 route=4 rep=2 ms=71.554237 name=blk.1.attn_gate.weight
+[dense-probe] type=14 M=6144 K=2560 T=16366 bf=0 shadow=1 route=4 rep=3 ms=71.312683 name=blk.1.attn_gate.weight
+[dense-probe] type=14 M=6144 K=2560 T=16366 bf=0 shadow=1 route=4 rep=4 ms=71.503113 name=blk.1.attn_gate.weight
+[dense-probe] type=14 M=6144 K=2560 T=16366 bf=0 shadow=1 route=4 rep=5 ms=71.557457 name=blk.1.attn_gate.weight
+[dense-probe] type=14 M=6144 K=2560 T=16366 bf=0 shadow=1 route=5 rep=0 ms=88.100060 name=blk.1.attn_gate.weight
+[dense-probe] type=14 M=6144 K=2560 T=16366 bf=0 shadow=1 route=5 rep=1 ms=89.131454 name=blk.1.attn_gate.weight
+[dense-probe] type=14 M=6144 K=2560 T=16366 bf=0 shadow=1 route=5 rep=2 ms=89.099983 name=blk.1.attn_gate.weight
+[dense-probe] type=14 M=6144 K=2560 T=16366 bf=0 shadow=1 route=5 rep=3 ms=89.099098 name=blk.1.attn_gate.weight
+[dense-probe] type=14 M=6144 K=2560 T=16366 bf=0 shadow=1 route=5 rep=4 ms=89.154663 name=blk.1.attn_gate.weight
+[dense-probe] type=14 M=6144 K=2560 T=16366 bf=0 shadow=1 route=5 rep=5 ms=89.114357 name=blk.1.attn_gate.weight
+[dense-probe] type=14 M=6144 K=2560 T=16366 bf=0 shadow=1 route=3 rep=0 ms=34.272778 name=blk.1.attn_gate.weight
+[dense-probe] type=14 M=6144 K=2560 T=16366 bf=0 shadow=1 route=3 rep=1 ms=32.347855 name=blk.1.attn_gate.weight
+[dense-probe] type=14 M=6144 K=2560 T=16366 bf=0 shadow=1 route=3 rep=2 ms=32.084408 name=blk.1.attn_gate.weight
+[dense-probe] type=14 M=6144 K=2560 T=16366 bf=0 shadow=1 route=3 rep=3 ms=31.981394 name=blk.1.attn_gate.weight
+[dense-probe] type=14 M=6144 K=2560 T=16366 bf=0 shadow=1 route=3 rep=4 ms=31.959101 name=blk.1.attn_gate.weight
+[dense-probe] type=14 M=6144 K=2560 T=16366 bf=0 shadow=1 route=3 rep=5 ms=32.012211 name=blk.1.attn_gate.weight
+[mm] K=6144 N=2560 type=21
+[dense-probe] type=21 M=2560 K=6144 T=16366 bf=0 shadow=0 route=4 rep=0 ms=101.782249 name=blk.1.ssm_out.weight
+[dense-probe] type=21 M=2560 K=6144 T=16366 bf=0 shadow=0 route=4 rep=1 ms=101.078300 name=blk.1.ssm_out.weight
+[dense-probe] type=21 M=2560 K=6144 T=16366 bf=0 shadow=0 route=4 rep=2 ms=97.280296 name=blk.1.ssm_out.weight
+[dense-probe] type=21 M=2560 K=6144 T=16366 bf=0 shadow=0 route=4 rep=3 ms=101.150894 name=blk.1.ssm_out.weight
+[dense-probe] type=21 M=2560 K=6144 T=16366 bf=0 shadow=0 route=4 rep=4 ms=99.465134 name=blk.1.ssm_out.weight
+[dense-probe] type=21 M=2560 K=6144 T=16366 bf=0 shadow=0 route=4 rep=5 ms=99.656937 name=blk.1.ssm_out.weight
+[dense-probe] type=21 M=2560 K=6144 T=16366 bf=0 shadow=0 route=5 rep=0 ms=86.579041 name=blk.1.ssm_out.weight
+[dense-probe] type=21 M=2560 K=6144 T=16366 bf=0 shadow=0 route=5 rep=1 ms=85.644806 name=blk.1.ssm_out.weight
+[dense-probe] type=21 M=2560 K=6144 T=16366 bf=0 shadow=0 route=5 rep=2 ms=87.091751 name=blk.1.ssm_out.weight
+[dense-probe] type=21 M=2560 K=6144 T=16366 bf=0 shadow=0 route=5 rep=3 ms=85.437485 name=blk.1.ssm_out.weight
+[dense-probe] type=21 M=2560 K=6144 T=16366 bf=0 shadow=0 route=5 rep=4 ms=87.102943 name=blk.1.ssm_out.weight
+[dense-probe] type=21 M=2560 K=6144 T=16366 bf=0 shadow=0 route=5 rep=5 ms=87.123543 name=blk.1.ssm_out.weight
+[dense-probe] type=21 M=2560 K=6144 T=16366 bf=0 shadow=0 route=3 rep=0 ms=24.675619 name=blk.1.ssm_out.weight
+[dense-probe] type=21 M=2560 K=6144 T=16366 bf=0 shadow=0 route=3 rep=1 ms=24.929499 name=blk.1.ssm_out.weight
+[dense-probe] type=21 M=2560 K=6144 T=16366 bf=0 shadow=0 route=3 rep=2 ms=24.929888 name=blk.1.ssm_out.weight
+[dense-probe] type=21 M=2560 K=6144 T=16366 bf=0 shadow=0 route=3 rep=3 ms=24.902819 name=blk.1.ssm_out.weight
+[dense-probe] type=21 M=2560 K=6144 T=16366 bf=0 shadow=0 route=3 rep=4 ms=24.992928 name=blk.1.ssm_out.weight
+[dense-probe] type=21 M=2560 K=6144 T=16366 bf=0 shadow=0 route=3 rep=5 ms=24.933420 name=blk.1.ssm_out.weight
+[mm] K=6144 N=2560 type=12
+[dense-probe] type=12 M=2560 K=6144 T=16366 bf=0 shadow=0 route=4 rep=0 ms=66.094055 name=blk.2.ssm_out.weight
+[dense-probe] type=12 M=2560 K=6144 T=16366 bf=0 shadow=0 route=4 rep=1 ms=64.106781 name=blk.2.ssm_out.weight
+[dense-probe] type=12 M=2560 K=6144 T=16366 bf=0 shadow=0 route=4 rep=2 ms=63.449657 name=blk.2.ssm_out.weight
+[dense-probe] type=12 M=2560 K=6144 T=16366 bf=0 shadow=0 route=4 rep=3 ms=64.128319 name=blk.2.ssm_out.weight
+[dense-probe] type=12 M=2560 K=6144 T=16366 bf=0 shadow=0 route=4 rep=4 ms=63.869125 name=blk.2.ssm_out.weight
+[dense-probe] type=12 M=2560 K=6144 T=16366 bf=0 shadow=0 route=4 rep=5 ms=63.854622 name=blk.2.ssm_out.weight
+[dense-probe] type=12 M=2560 K=6144 T=16366 bf=0 shadow=0 route=5 rep=0 ms=83.248375 name=blk.2.ssm_out.weight
+[dense-probe] type=12 M=2560 K=6144 T=16366 bf=0 shadow=0 route=5 rep=1 ms=84.051598 name=blk.2.ssm_out.weight
+[dense-probe] type=12 M=2560 K=6144 T=16366 bf=0 shadow=0 route=5 rep=2 ms=83.925964 name=blk.2.ssm_out.weight
+[dense-probe] type=12 M=2560 K=6144 T=16366 bf=0 shadow=0 route=5 rep=3 ms=83.281525 name=blk.2.ssm_out.weight
+[dense-probe] type=12 M=2560 K=6144 T=16366 bf=0 shadow=0 route=5 rep=4 ms=83.118317 name=blk.2.ssm_out.weight
+[dense-probe] type=12 M=2560 K=6144 T=16366 bf=0 shadow=0 route=5 rep=5 ms=84.333893 name=blk.2.ssm_out.weight
+[dense-probe] type=12 M=2560 K=6144 T=16366 bf=0 shadow=0 route=3 rep=0 ms=23.867212 name=blk.2.ssm_out.weight
+[dense-probe] type=12 M=2560 K=6144 T=16366 bf=0 shadow=0 route=3 rep=1 ms=23.918320 name=blk.2.ssm_out.weight
+[dense-probe] type=12 M=2560 K=6144 T=16366 bf=0 shadow=0 route=3 rep=2 ms=23.883352 name=blk.2.ssm_out.weight
+[dense-probe] type=12 M=2560 K=6144 T=16366 bf=0 shadow=0 route=3 rep=3 ms=23.937008 name=blk.2.ssm_out.weight
+[dense-probe] type=12 M=2560 K=6144 T=16366 bf=0 shadow=0 route=3 rep=4 ms=23.964083 name=blk.2.ssm_out.weight
+[dense-probe] type=12 M=2560 K=6144 T=16366 bf=0 shadow=0 route=3 rep=5 ms=23.912378 name=blk.2.ssm_out.weight
+[mm] K=2560 N=640 type=12
+[dense-probe] type=12 M=640 K=2560 T=16366 bf=0 shadow=0 route=4 rep=0 ms=7.073366 name=blk.2.ffn_gate_shexp.weight
+[dense-probe] type=12 M=640 K=2560 T=16366 bf=0 shadow=0 route=4 rep=1 ms=6.838576 name=blk.2.ffn_gate_shexp.weight
+[dense-probe] type=12 M=640 K=2560 T=16366 bf=0 shadow=0 route=4 rep=2 ms=6.868633 name=blk.2.ffn_gate_shexp.weight
+[dense-probe] type=12 M=640 K=2560 T=16366 bf=0 shadow=0 route=4 rep=3 ms=6.803597 name=blk.2.ffn_gate_shexp.weight
+[dense-probe] type=12 M=640 K=2560 T=16366 bf=0 shadow=0 route=4 rep=4 ms=6.858038 name=blk.2.ffn_gate_shexp.weight
+[dense-probe] type=12 M=640 K=2560 T=16366 bf=0 shadow=0 route=4 rep=5 ms=6.837864 name=blk.2.ffn_gate_shexp.weight
+[dense-probe] type=12 M=640 K=2560 T=16366 bf=0 shadow=0 route=5 rep=0 ms=8.125347 name=blk.2.ffn_gate_shexp.weight
+[dense-probe] type=12 M=640 K=2560 T=16366 bf=0 shadow=0 route=5 rep=1 ms=8.102918 name=blk.2.ffn_gate_shexp.weight
+[dense-probe] type=12 M=640 K=2560 T=16366 bf=0 shadow=0 route=5 rep=2 ms=8.076644 name=blk.2.ffn_gate_shexp.weight
+[dense-probe] type=12 M=640 K=2560 T=16366 bf=0 shadow=0 route=5 rep=3 ms=8.078245 name=blk.2.ffn_gate_shexp.weight
+[dense-probe] type=12 M=640 K=2560 T=16366 bf=0 shadow=0 route=5 rep=4 ms=8.071579 name=blk.2.ffn_gate_shexp.weight
+[dense-probe] type=12 M=640 K=2560 T=16366 bf=0 shadow=0 route=5 rep=5 ms=8.109828 name=blk.2.ffn_gate_shexp.weight
+[dense-probe] type=12 M=640 K=2560 T=16366 bf=0 shadow=0 route=3 rep=0 ms=3.004011 name=blk.2.ffn_gate_shexp.weight
+[dense-probe] type=12 M=640 K=2560 T=16366 bf=0 shadow=0 route=3 rep=1 ms=3.031568 name=blk.2.ffn_gate_shexp.weight
+[dense-probe] type=12 M=640 K=2560 T=16366 bf=0 shadow=0 route=3 rep=2 ms=3.057574 name=blk.2.ffn_gate_shexp.weight
+[dense-probe] type=12 M=640 K=2560 T=16366 bf=0 shadow=0 route=3 rep=3 ms=3.074220 name=blk.2.ffn_gate_shexp.weight
+[dense-probe] type=12 M=640 K=2560 T=16366 bf=0 shadow=0 route=3 rep=4 ms=3.046724 name=blk.2.ffn_gate_shexp.weight
+[dense-probe] type=12 M=640 K=2560 T=16366 bf=0 shadow=0 route=3 rep=5 ms=3.079851 name=blk.2.ffn_gate_shexp.weight
+[mm] K=2560 N=640 type=13
+[dense-probe] type=13 M=640 K=2560 T=16366 bf=0 shadow=0 route=4 rep=0 ms=7.789815 name=blk.2.ffn_up_shexp.weight
+[dense-probe] type=13 M=640 K=2560 T=16366 bf=0 shadow=0 route=4 rep=1 ms=7.776734 name=blk.2.ffn_up_shexp.weight
+[dense-probe] type=13 M=640 K=2560 T=16366 bf=0 shadow=0 route=4 rep=2 ms=7.670783 name=blk.2.ffn_up_shexp.weight
+[dense-probe] type=13 M=640 K=2560 T=16366 bf=0 shadow=0 route=4 rep=3 ms=7.550279 name=blk.2.ffn_up_shexp.weight
+[dense-probe] type=13 M=640 K=2560 T=16366 bf=0 shadow=0 route=4 rep=4 ms=7.672532 name=blk.2.ffn_up_shexp.weight
+[dense-probe] type=13 M=640 K=2560 T=16366 bf=0 shadow=0 route=4 rep=5 ms=7.662503 name=blk.2.ffn_up_shexp.weight
+[dense-probe] type=13 M=640 K=2560 T=16366 bf=0 shadow=0 route=5 rep=0 ms=7.481848 name=blk.2.ffn_up_shexp.weight
+[dense-probe] type=13 M=640 K=2560 T=16366 bf=0 shadow=0 route=5 rep=1 ms=7.607885 name=blk.2.ffn_up_shexp.weight
+[dense-probe] type=13 M=640 K=2560 T=16366 bf=0 shadow=0 route=5 rep=2 ms=7.476200 name=blk.2.ffn_up_shexp.weight
+[dense-probe] type=13 M=640 K=2560 T=16366 bf=0 shadow=0 route=5 rep=3 ms=7.561505 name=blk.2.ffn_up_shexp.weight
+[dense-probe] type=13 M=640 K=2560 T=16366 bf=0 shadow=0 route=5 rep=4 ms=7.570774 name=blk.2.ffn_up_shexp.weight
+[dense-probe] type=13 M=640 K=2560 T=16366 bf=0 shadow=0 route=5 rep=5 ms=7.526534 name=blk.2.ffn_up_shexp.weight
+[dense-probe] type=13 M=640 K=2560 T=16366 bf=0 shadow=0 route=3 rep=0 ms=6.052569 name=blk.2.ffn_up_shexp.weight
+[dense-probe] type=13 M=640 K=2560 T=16366 bf=0 shadow=0 route=3 rep=1 ms=3.149633 name=blk.2.ffn_up_shexp.weight
+[dense-probe] type=13 M=640 K=2560 T=16366 bf=0 shadow=0 route=3 rep=2 ms=3.183192 name=blk.2.ffn_up_shexp.weight
+[dense-probe] type=13 M=640 K=2560 T=16366 bf=0 shadow=0 route=3 rep=3 ms=3.205985 name=blk.2.ffn_up_shexp.weight
+[dense-probe] type=13 M=640 K=2560 T=16366 bf=0 shadow=0 route=3 rep=4 ms=3.270686 name=blk.2.ffn_up_shexp.weight
+[dense-probe] type=13 M=640 K=2560 T=16366 bf=0 shadow=0 route=3 rep=5 ms=3.248981 name=blk.2.ffn_up_shexp.weight
+[mm] K=2560 N=512 type=23
+[dense-probe] type=23 M=512 K=2560 T=16366 bf=0 shadow=0 route=4 rep=0 ms=10.868508 name=blk.3.attn_k.weight
+[dense-probe] type=23 M=512 K=2560 T=16366 bf=0 shadow=0 route=4 rep=1 ms=9.755114 name=blk.3.attn_k.weight
+[dense-probe] type=23 M=512 K=2560 T=16366 bf=0 shadow=0 route=4 rep=2 ms=9.799936 name=blk.3.attn_k.weight
+[dense-probe] type=23 M=512 K=2560 T=16366 bf=0 shadow=0 route=4 rep=3 ms=9.844269 name=blk.3.attn_k.weight
+[dense-probe] type=23 M=512 K=2560 T=16366 bf=0 shadow=0 route=4 rep=4 ms=10.151872 name=blk.3.attn_k.weight
+[dense-probe] type=23 M=512 K=2560 T=16366 bf=0 shadow=0 route=4 rep=5 ms=9.908350 name=blk.3.attn_k.weight
+[dense-probe] type=23 M=512 K=2560 T=16366 bf=0 shadow=0 route=5 rep=0 ms=7.755403 name=blk.3.attn_k.weight
+[dense-probe] type=23 M=512 K=2560 T=16366 bf=0 shadow=0 route=5 rep=1 ms=8.015941 name=blk.3.attn_k.weight
+[dense-probe] type=23 M=512 K=2560 T=16366 bf=0 shadow=0 route=5 rep=2 ms=7.808825 name=blk.3.attn_k.weight
+[dense-probe] type=23 M=512 K=2560 T=16366 bf=0 shadow=0 route=5 rep=3 ms=7.982846 name=blk.3.attn_k.weight
+[dense-probe] type=23 M=512 K=2560 T=16366 bf=0 shadow=0 route=5 rep=4 ms=7.996698 name=blk.3.attn_k.weight
+[dense-probe] type=23 M=512 K=2560 T=16366 bf=0 shadow=0 route=5 rep=5 ms=7.928027 name=blk.3.attn_k.weight
+[dense-probe] type=23 M=512 K=2560 T=16366 bf=0 shadow=0 route=3 rep=0 ms=2.437683 name=blk.3.attn_k.weight
+[dense-probe] type=23 M=512 K=2560 T=16366 bf=0 shadow=0 route=3 rep=1 ms=2.471474 name=blk.3.attn_k.weight
+[dense-probe] type=23 M=512 K=2560 T=16366 bf=0 shadow=0 route=3 rep=2 ms=2.485965 name=blk.3.attn_k.weight
+[dense-probe] type=23 M=512 K=2560 T=16366 bf=0 shadow=0 route=3 rep=3 ms=2.501684 name=blk.3.attn_k.weight
+[dense-probe] type=23 M=512 K=2560 T=16366 bf=0 shadow=0 route=3 rep=4 ms=2.503107 name=blk.3.attn_k.weight
+[dense-probe] type=23 M=512 K=2560 T=16366 bf=0 shadow=0 route=3 rep=5 ms=2.505734 name=blk.3.attn_k.weight
+[mm] K=2560 N=512 type=14
+[dense-probe] type=14 M=512 K=2560 T=16366 bf=0 shadow=1 route=4 rep=0 ms=5.558538 name=blk.3.attn_v.weight
+[dense-probe] type=14 M=512 K=2560 T=16366 bf=0 shadow=1 route=4 rep=1 ms=5.527595 name=blk.3.attn_v.weight
+[dense-probe] type=14 M=512 K=2560 T=16366 bf=0 shadow=1 route=4 rep=2 ms=5.523978 name=blk.3.attn_v.weight
+[dense-probe] type=14 M=512 K=2560 T=16366 bf=0 shadow=1 route=4 rep=3 ms=5.528309 name=blk.3.attn_v.weight
+[dense-probe] type=14 M=512 K=2560 T=16366 bf=0 shadow=1 route=4 rep=4 ms=5.449211 name=blk.3.attn_v.weight
+[dense-probe] type=14 M=512 K=2560 T=16366 bf=0 shadow=1 route=4 rep=5 ms=5.543436 name=blk.3.attn_v.weight
+[dense-probe] type=14 M=512 K=2560 T=16366 bf=0 shadow=1 route=5 rep=0 ms=7.802548 name=blk.3.attn_v.weight
+[dense-probe] type=14 M=512 K=2560 T=16366 bf=0 shadow=1 route=5 rep=1 ms=7.755016 name=blk.3.attn_v.weight
+[dense-probe] type=14 M=512 K=2560 T=16366 bf=0 shadow=1 route=5 rep=2 ms=7.550645 name=blk.3.attn_v.weight
+[dense-probe] type=14 M=512 K=2560 T=16366 bf=0 shadow=1 route=5 rep=3 ms=7.516824 name=blk.3.attn_v.weight
+[dense-probe] type=14 M=512 K=2560 T=16366 bf=0 shadow=1 route=5 rep=4 ms=7.633435 name=blk.3.attn_v.weight
+[dense-probe] type=14 M=512 K=2560 T=16366 bf=0 shadow=1 route=5 rep=5 ms=7.460783 name=blk.3.attn_v.weight
+[dense-probe] type=14 M=512 K=2560 T=16366 bf=0 shadow=1 route=3 rep=0 ms=3.483461 name=blk.3.attn_v.weight
+[dense-probe] type=14 M=512 K=2560 T=16366 bf=0 shadow=1 route=3 rep=1 ms=3.515114 name=blk.3.attn_v.weight
+[dense-probe] type=14 M=512 K=2560 T=16366 bf=0 shadow=1 route=3 rep=2 ms=3.550109 name=blk.3.attn_v.weight
+[dense-probe] type=14 M=512 K=2560 T=16366 bf=0 shadow=1 route=3 rep=3 ms=3.528350 name=blk.3.attn_v.weight
+[dense-probe] type=14 M=512 K=2560 T=16366 bf=0 shadow=1 route=3 rep=4 ms=3.517683 name=blk.3.attn_v.weight
+[dense-probe] type=14 M=512 K=2560 T=16366 bf=0 shadow=1 route=3 rep=5 ms=3.507474 name=blk.3.attn_v.weight
+[mm] K=2560 N=128 type=30
+[mm] K=2560 N=12288 type=23
+[dense-probe] type=23 M=12288 K=2560 T=16366 bf=0 shadow=0 route=4 rep=0 ms=214.085220 name=blk.3.attn_q.weight
+[dense-probe] type=23 M=12288 K=2560 T=16366 bf=0 shadow=0 route=4 rep=1 ms=214.056870 name=blk.3.attn_q.weight
+[dense-probe] type=23 M=12288 K=2560 T=16366 bf=0 shadow=0 route=4 rep=2 ms=216.279541 name=blk.3.attn_q.weight
+[dense-probe] type=23 M=12288 K=2560 T=16366 bf=0 shadow=0 route=4 rep=3 ms=213.780121 name=blk.3.attn_q.weight
+[dense-probe] type=23 M=12288 K=2560 T=16366 bf=0 shadow=0 route=4 rep=4 ms=215.861588 name=blk.3.attn_q.weight
+[dense-probe] type=23 M=12288 K=2560 T=16366 bf=0 shadow=0 route=4 rep=5 ms=214.716705 name=blk.3.attn_q.weight
+[dense-probe] type=23 M=12288 K=2560 T=16366 bf=0 shadow=0 route=5 rep=0 ms=172.378235 name=blk.3.attn_q.weight
+[dense-probe] type=23 M=12288 K=2560 T=16366 bf=0 shadow=0 route=5 rep=1 ms=173.310699 name=blk.3.attn_q.weight
+[dense-probe] type=23 M=12288 K=2560 T=16366 bf=0 shadow=0 route=5 rep=2 ms=174.737701 name=blk.3.attn_q.weight
+[dense-probe] type=23 M=12288 K=2560 T=16366 bf=0 shadow=0 route=5 rep=3 ms=173.692474 name=blk.3.attn_q.weight
+[dense-probe] type=23 M=12288 K=2560 T=16366 bf=0 shadow=0 route=5 rep=4 ms=166.601868 name=blk.3.attn_q.weight
+[dense-probe] type=23 M=12288 K=2560 T=16366 bf=0 shadow=0 route=5 rep=5 ms=173.447296 name=blk.3.attn_q.weight
+[dense-probe] type=23 M=12288 K=2560 T=16366 bf=0 shadow=0 route=3 rep=0 ms=37.388969 name=blk.3.attn_q.weight
+[dense-probe] type=23 M=12288 K=2560 T=16366 bf=0 shadow=0 route=3 rep=1 ms=37.639511 name=blk.3.attn_q.weight
+[dense-probe] type=23 M=12288 K=2560 T=16366 bf=0 shadow=0 route=3 rep=2 ms=37.717136 name=blk.3.attn_q.weight
+[dense-probe] type=23 M=12288 K=2560 T=16366 bf=0 shadow=0 route=3 rep=3 ms=37.774734 name=blk.3.attn_q.weight
+[dense-probe] type=23 M=12288 K=2560 T=16366 bf=0 shadow=0 route=3 rep=4 ms=37.597416 name=blk.3.attn_q.weight
+[dense-probe] type=23 M=12288 K=2560 T=16366 bf=0 shadow=0 route=3 rep=5 ms=37.710419 name=blk.3.attn_q.weight
+[mm] K=6144 N=2560 type=14
+[dense-probe] type=14 M=2560 K=6144 T=16366 bf=0 shadow=1 route=1 rep=0 ms=29.284479 name=blk.3.attn_output.weight
+[dense-probe] type=14 M=2560 K=6144 T=16366 bf=0 shadow=1 route=1 rep=1 ms=29.607187 name=blk.3.attn_output.weight
+[dense-probe] type=14 M=2560 K=6144 T=16366 bf=0 shadow=1 route=1 rep=2 ms=29.567425 name=blk.3.attn_output.weight
+[dense-probe] type=14 M=2560 K=6144 T=16366 bf=0 shadow=1 route=1 rep=3 ms=29.506504 name=blk.3.attn_output.weight
+[dense-probe] type=14 M=2560 K=6144 T=16366 bf=0 shadow=1 route=1 rep=4 ms=29.052824 name=blk.3.attn_output.weight
+[dense-probe] type=14 M=2560 K=6144 T=16366 bf=0 shadow=1 route=1 rep=5 ms=29.666037 name=blk.3.attn_output.weight
+[dense-probe] type=14 M=2560 K=6144 T=16366 bf=0 shadow=1 route=4 rep=0 ms=110.176826 name=blk.3.attn_output.weight
+[dense-probe] type=14 M=2560 K=6144 T=16366 bf=0 shadow=1 route=4 rep=1 ms=100.971222 name=blk.3.attn_output.weight
+[dense-probe] type=14 M=2560 K=6144 T=16366 bf=0 shadow=1 route=4 rep=2 ms=98.440964 name=blk.3.attn_output.weight
+[dense-probe] type=14 M=2560 K=6144 T=16366 bf=0 shadow=1 route=4 rep=3 ms=109.024849 name=blk.3.attn_output.weight
+[dense-probe] type=14 M=2560 K=6144 T=16366 bf=0 shadow=1 route=4 rep=4 ms=95.580048 name=blk.3.attn_output.weight
+[dense-probe] type=14 M=2560 K=6144 T=16366 bf=0 shadow=1 route=4 rep=5 ms=105.166321 name=blk.3.attn_output.weight
+[dense-probe] type=14 M=2560 K=6144 T=16366 bf=0 shadow=1 route=5 rep=0 ms=112.054077 name=blk.3.attn_output.weight
+[dense-probe] type=14 M=2560 K=6144 T=16366 bf=0 shadow=1 route=5 rep=1 ms=114.137321 name=blk.3.attn_output.weight
+[dense-probe] type=14 M=2560 K=6144 T=16366 bf=0 shadow=1 route=5 rep=2 ms=108.879471 name=blk.3.attn_output.weight
+[dense-probe] type=14 M=2560 K=6144 T=16366 bf=0 shadow=1 route=5 rep=3 ms=112.892433 name=blk.3.attn_output.weight
+[dense-probe] type=14 M=2560 K=6144 T=16366 bf=0 shadow=1 route=5 rep=4 ms=109.616013 name=blk.3.attn_output.weight
+[dense-probe] type=14 M=2560 K=6144 T=16366 bf=0 shadow=1 route=5 rep=5 ms=108.408730 name=blk.3.attn_output.weight
+[dense-probe] type=14 M=2560 K=6144 T=16366 bf=0 shadow=1 route=3 rep=0 ms=35.258530 name=blk.3.attn_output.weight
+[dense-probe] type=14 M=2560 K=6144 T=16366 bf=0 shadow=1 route=3 rep=1 ms=35.429161 name=blk.3.attn_output.weight
+[dense-probe] type=14 M=2560 K=6144 T=16366 bf=0 shadow=1 route=3 rep=2 ms=35.362614 name=blk.3.attn_output.weight
+[dense-probe] type=14 M=2560 K=6144 T=16366 bf=0 shadow=1 route=3 rep=3 ms=35.362289 name=blk.3.attn_output.weight
+[dense-probe] type=14 M=2560 K=6144 T=16366 bf=0 shadow=1 route=3 rep=4 ms=35.400585 name=blk.3.attn_output.weight
+[dense-probe] type=14 M=2560 K=6144 T=16366 bf=0 shadow=1 route=3 rep=5 ms=35.324795 name=blk.3.attn_output.weight
+[mm] K=640 N=2560 type=42
+[dense-probe] type=42 M=2560 K=640 T=16366 bf=0 shadow=0 route=4 rep=0 ms=6.996661 name=blk.3.ffn_down_shexp.weight
+[dense-probe] type=42 M=2560 K=640 T=16366 bf=0 shadow=0 route=4 rep=1 ms=6.936546 name=blk.3.ffn_down_shexp.weight
+[dense-probe] type=42 M=2560 K=640 T=16366 bf=0 shadow=0 route=4 rep=2 ms=7.052547 name=blk.3.ffn_down_shexp.weight
+[dense-probe] type=42 M=2560 K=640 T=16366 bf=0 shadow=0 route=4 rep=3 ms=7.005468 name=blk.3.ffn_down_shexp.weight
+[dense-probe] type=42 M=2560 K=640 T=16366 bf=0 shadow=0 route=4 rep=4 ms=6.998177 name=blk.3.ffn_down_shexp.weight
+[dense-probe] type=42 M=2560 K=640 T=16366 bf=0 shadow=0 route=4 rep=5 ms=6.950226 name=blk.3.ffn_down_shexp.weight
+[dense-probe] type=42 M=2560 K=640 T=16366 bf=0 shadow=0 route=5 rep=0 ms=7.463241 name=blk.3.ffn_down_shexp.weight
+[dense-probe] type=42 M=2560 K=640 T=16366 bf=0 shadow=0 route=5 rep=1 ms=7.386075 name=blk.3.ffn_down_shexp.weight
+[dense-probe] type=42 M=2560 K=640 T=16366 bf=0 shadow=0 route=5 rep=2 ms=7.454137 name=blk.3.ffn_down_shexp.weight
+[dense-probe] type=42 M=2560 K=640 T=16366 bf=0 shadow=0 route=5 rep=3 ms=7.456347 name=blk.3.ffn_down_shexp.weight
+[dense-probe] type=42 M=2560 K=640 T=16366 bf=0 shadow=0 route=5 rep=4 ms=7.386648 name=blk.3.ffn_down_shexp.weight
+[dense-probe] type=42 M=2560 K=640 T=16366 bf=0 shadow=0 route=5 rep=5 ms=7.484314 name=blk.3.ffn_down_shexp.weight
+[dense-probe] type=42 M=2560 K=640 T=16366 bf=0 shadow=0 route=3 rep=0 ms=9.200401 name=blk.3.ffn_down_shexp.weight
+[dense-probe] type=42 M=2560 K=640 T=16366 bf=0 shadow=0 route=3 rep=1 ms=2.751664 name=blk.3.ffn_down_shexp.weight
+[dense-probe] type=42 M=2560 K=640 T=16366 bf=0 shadow=0 route=3 rep=2 ms=2.787836 name=blk.3.ffn_down_shexp.weight
+[dense-probe] type=42 M=2560 K=640 T=16366 bf=0 shadow=0 route=3 rep=3 ms=2.844971 name=blk.3.ffn_down_shexp.weight
+[dense-probe] type=42 M=2560 K=640 T=16366 bf=0 shadow=0 route=3 rep=4 ms=2.837267 name=blk.3.ffn_down_shexp.weight
+[dense-probe] type=42 M=2560 K=640 T=16366 bf=0 shadow=0 route=3 rep=5 ms=2.856029 name=blk.3.ffn_down_shexp.weight
+[mm] K=2560 N=10240 type=14
+[dense-probe] type=14 M=10240 K=2560 T=16366 bf=0 shadow=1 route=1 rep=0 ms=29.631577 name=blk.4.attn_qkv.weight
+[dense-probe] type=14 M=10240 K=2560 T=16366 bf=0 shadow=1 route=1 rep=1 ms=29.510330 name=blk.4.attn_qkv.weight
+[dense-probe] type=14 M=10240 K=2560 T=16366 bf=0 shadow=1 route=1 rep=2 ms=29.538076 name=blk.4.attn_qkv.weight
+[dense-probe] type=14 M=10240 K=2560 T=16366 bf=0 shadow=1 route=1 rep=3 ms=29.228796 name=blk.4.attn_qkv.weight
+[dense-probe] type=14 M=10240 K=2560 T=16366 bf=0 shadow=1 route=1 rep=4 ms=29.097044 name=blk.4.attn_qkv.weight
+[dense-probe] type=14 M=10240 K=2560 T=16366 bf=0 shadow=1 route=1 rep=5 ms=29.055931 name=blk.4.attn_qkv.weight
+[dense-probe] type=14 M=10240 K=2560 T=16366 bf=0 shadow=1 route=4 rep=0 ms=125.404854 name=blk.4.attn_qkv.weight
+[dense-probe] type=14 M=10240 K=2560 T=16366 bf=0 shadow=1 route=4 rep=1 ms=122.536636 name=blk.4.attn_qkv.weight
+[dense-probe] type=14 M=10240 K=2560 T=16366 bf=0 shadow=1 route=4 rep=2 ms=123.310951 name=blk.4.attn_qkv.weight
+[dense-probe] type=14 M=10240 K=2560 T=16366 bf=0 shadow=1 route=4 rep=3 ms=124.244736 name=blk.4.attn_qkv.weight
+[dense-probe] type=14 M=10240 K=2560 T=16366 bf=0 shadow=1 route=4 rep=4 ms=123.679443 name=blk.4.attn_qkv.weight
+[dense-probe] type=14 M=10240 K=2560 T=16366 bf=0 shadow=1 route=4 rep=5 ms=123.977478 name=blk.4.attn_qkv.weight
+[dense-probe] type=14 M=10240 K=2560 T=16366 bf=0 shadow=1 route=5 rep=0 ms=146.334732 name=blk.4.attn_qkv.weight
+[dense-probe] type=14 M=10240 K=2560 T=16366 bf=0 shadow=1 route=5 rep=1 ms=146.825378 name=blk.4.attn_qkv.weight
+[dense-probe] type=14 M=10240 K=2560 T=16366 bf=0 shadow=1 route=5 rep=2 ms=146.624405 name=blk.4.attn_qkv.weight
+[dense-probe] type=14 M=10240 K=2560 T=16366 bf=0 shadow=1 route=5 rep=3 ms=146.489059 name=blk.4.attn_qkv.weight
+[dense-probe] type=14 M=10240 K=2560 T=16366 bf=0 shadow=1 route=5 rep=4 ms=146.649475 name=blk.4.attn_qkv.weight
+[dense-probe] type=14 M=10240 K=2560 T=16366 bf=0 shadow=1 route=5 rep=5 ms=146.796494 name=blk.4.attn_qkv.weight
+[dense-probe] type=14 M=10240 K=2560 T=16366 bf=0 shadow=1 route=3 rep=0 ms=52.337330 name=blk.4.attn_qkv.weight
+[dense-probe] type=14 M=10240 K=2560 T=16366 bf=0 shadow=1 route=3 rep=1 ms=53.026897 name=blk.4.attn_qkv.weight
+[dense-probe] type=14 M=10240 K=2560 T=16366 bf=0 shadow=1 route=3 rep=2 ms=52.960239 name=blk.4.attn_qkv.weight
+[dense-probe] type=14 M=10240 K=2560 T=16366 bf=0 shadow=1 route=3 rep=3 ms=53.305260 name=blk.4.attn_qkv.weight
+[dense-probe] type=14 M=10240 K=2560 T=16366 bf=0 shadow=1 route=3 rep=4 ms=53.388985 name=blk.4.attn_qkv.weight
+[dense-probe] type=14 M=10240 K=2560 T=16366 bf=0 shadow=1 route=3 rep=5 ms=55.325726 name=blk.4.attn_qkv.weight
+[mm] K=2560 N=6144 type=23
+[dense-probe] type=23 M=6144 K=2560 T=16366 bf=0 shadow=0 route=4 rep=0 ms=106.635643 name=blk.6.attn_gate.weight
+[dense-probe] type=23 M=6144 K=2560 T=16366 bf=0 shadow=0 route=4 rep=1 ms=107.723610 name=blk.6.attn_gate.weight
+[dense-probe] type=23 M=6144 K=2560 T=16366 bf=0 shadow=0 route=4 rep=2 ms=107.528755 name=blk.6.attn_gate.weight
+[dense-probe] type=23 M=6144 K=2560 T=16366 bf=0 shadow=0 route=4 rep=3 ms=108.991989 name=blk.6.attn_gate.weight
+[dense-probe] type=23 M=6144 K=2560 T=16366 bf=0 shadow=0 route=4 rep=4 ms=107.576797 name=blk.6.attn_gate.weight
+[dense-probe] type=23 M=6144 K=2560 T=16366 bf=0 shadow=0 route=4 rep=5 ms=106.963066 name=blk.6.attn_gate.weight
+[dense-probe] type=23 M=6144 K=2560 T=16366 bf=0 shadow=0 route=5 rep=0 ms=81.190865 name=blk.6.attn_gate.weight
+[dense-probe] type=23 M=6144 K=2560 T=16366 bf=0 shadow=0 route=5 rep=1 ms=79.188515 name=blk.6.attn_gate.weight
+[dense-probe] type=23 M=6144 K=2560 T=16366 bf=0 shadow=0 route=5 rep=2 ms=79.333969 name=blk.6.attn_gate.weight
+[dense-probe] type=23 M=6144 K=2560 T=16366 bf=0 shadow=0 route=5 rep=3 ms=80.535347 name=blk.6.attn_gate.weight
+[dense-probe] type=23 M=6144 K=2560 T=16366 bf=0 shadow=0 route=5 rep=4 ms=79.445641 name=blk.6.attn_gate.weight
+[dense-probe] type=23 M=6144 K=2560 T=16366 bf=0 shadow=0 route=5 rep=5 ms=80.159523 name=blk.6.attn_gate.weight
+[dense-probe] type=23 M=6144 K=2560 T=16366 bf=0 shadow=0 route=3 rep=0 ms=18.881676 name=blk.6.attn_gate.weight
+[dense-probe] type=23 M=6144 K=2560 T=16366 bf=0 shadow=0 route=3 rep=1 ms=19.428778 name=blk.6.attn_gate.weight
+[dense-probe] type=23 M=6144 K=2560 T=16366 bf=0 shadow=0 route=3 rep=2 ms=19.260447 name=blk.6.attn_gate.weight
+[dense-probe] type=23 M=6144 K=2560 T=16366 bf=0 shadow=0 route=3 rep=3 ms=19.433910 name=blk.6.attn_gate.weight
+[dense-probe] type=23 M=6144 K=2560 T=16366 bf=0 shadow=0 route=3 rep=4 ms=19.291136 name=blk.6.attn_gate.weight
+[dense-probe] type=23 M=6144 K=2560 T=16366 bf=0 shadow=0 route=3 rep=5 ms=19.364988 name=blk.6.attn_gate.weight
+[mm] K=6144 N=2560 type=13
+[dense-probe] type=13 M=2560 K=6144 T=16366 bf=0 shadow=1 route=1 rep=0 ms=28.842789 name=blk.6.ssm_out.weight
+[dense-probe] type=13 M=2560 K=6144 T=16366 bf=0 shadow=1 route=1 rep=1 ms=29.675215 name=blk.6.ssm_out.weight
+[dense-probe] type=13 M=2560 K=6144 T=16366 bf=0 shadow=1 route=1 rep=2 ms=29.112991 name=blk.6.ssm_out.weight
+[dense-probe] type=13 M=2560 K=6144 T=16366 bf=0 shadow=1 route=1 rep=3 ms=29.483356 name=blk.6.ssm_out.weight
+[dense-probe] type=13 M=2560 K=6144 T=16366 bf=0 shadow=1 route=1 rep=4 ms=28.939049 name=blk.6.ssm_out.weight
+[dense-probe] type=13 M=2560 K=6144 T=16366 bf=0 shadow=1 route=1 rep=5 ms=29.359262 name=blk.6.ssm_out.weight
+[dense-probe] type=13 M=2560 K=6144 T=16366 bf=0 shadow=1 route=4 rep=0 ms=108.851715 name=blk.6.ssm_out.weight
+[dense-probe] type=13 M=2560 K=6144 T=16366 bf=0 shadow=1 route=4 rep=1 ms=101.246284 name=blk.6.ssm_out.weight
+[dense-probe] type=13 M=2560 K=6144 T=16366 bf=0 shadow=1 route=4 rep=2 ms=97.494080 name=blk.6.ssm_out.weight
+[dense-probe] type=13 M=2560 K=6144 T=16366 bf=0 shadow=1 route=4 rep=3 ms=101.907593 name=blk.6.ssm_out.weight
+[dense-probe] type=13 M=2560 K=6144 T=16366 bf=0 shadow=1 route=4 rep=4 ms=96.074257 name=blk.6.ssm_out.weight
+[dense-probe] type=13 M=2560 K=6144 T=16366 bf=0 shadow=1 route=4 rep=5 ms=102.507866 name=blk.6.ssm_out.weight
+[dense-probe] type=13 M=2560 K=6144 T=16366 bf=0 shadow=1 route=5 rep=0 ms=112.163757 name=blk.6.ssm_out.weight
+[dense-probe] type=13 M=2560 K=6144 T=16366 bf=0 shadow=1 route=5 rep=1 ms=111.649055 name=blk.6.ssm_out.weight
+[dense-probe] type=13 M=2560 K=6144 T=16366 bf=0 shadow=1 route=5 rep=2 ms=111.593430 name=blk.6.ssm_out.weight
+[dense-probe] type=13 M=2560 K=6144 T=16366 bf=0 shadow=1 route=5 rep=3 ms=110.504845 name=blk.6.ssm_out.weight
+[dense-probe] type=13 M=2560 K=6144 T=16366 bf=0 shadow=1 route=5 rep=4 ms=113.589577 name=blk.6.ssm_out.weight
+[dense-probe] type=13 M=2560 K=6144 T=16366 bf=0 shadow=1 route=5 rep=5 ms=112.109726 name=blk.6.ssm_out.weight
+[dense-probe] type=13 M=2560 K=6144 T=16366 bf=0 shadow=1 route=3 rep=0 ms=25.040232 name=blk.6.ssm_out.weight
+[dense-probe] type=13 M=2560 K=6144 T=16366 bf=0 shadow=1 route=3 rep=1 ms=25.317339 name=blk.6.ssm_out.weight
+[dense-probe] type=13 M=2560 K=6144 T=16366 bf=0 shadow=1 route=3 rep=2 ms=25.261364 name=blk.6.ssm_out.weight
+[dense-probe] type=13 M=2560 K=6144 T=16366 bf=0 shadow=1 route=3 rep=3 ms=25.426945 name=blk.6.ssm_out.weight
+[dense-probe] type=13 M=2560 K=6144 T=16366 bf=0 shadow=1 route=3 rep=4 ms=25.387571 name=blk.6.ssm_out.weight
+[dense-probe] type=13 M=2560 K=6144 T=16366 bf=0 shadow=1 route=3 rep=5 ms=25.431763 name=blk.6.ssm_out.weight
+[mm] K=2560 N=640 type=14
+[dense-probe] type=14 M=640 K=2560 T=16366 bf=0 shadow=1 route=4 rep=0 ms=6.308717 name=blk.6.ffn_up_shexp.weight
+[dense-probe] type=14 M=640 K=2560 T=16366 bf=0 shadow=1 route=4 rep=1 ms=6.342427 name=blk.6.ffn_up_shexp.weight
+[dense-probe] type=14 M=640 K=2560 T=16366 bf=0 shadow=1 route=4 rep=2 ms=6.387857 name=blk.6.ffn_up_shexp.weight
+[dense-probe] type=14 M=640 K=2560 T=16366 bf=0 shadow=1 route=4 rep=3 ms=6.431364 name=blk.6.ffn_up_shexp.weight
+[dense-probe] type=14 M=640 K=2560 T=16366 bf=0 shadow=1 route=4 rep=4 ms=6.379881 name=blk.6.ffn_up_shexp.weight
+[dense-probe] type=14 M=640 K=2560 T=16366 bf=0 shadow=1 route=4 rep=5 ms=6.359202 name=blk.6.ffn_up_shexp.weight
+[dense-probe] type=14 M=640 K=2560 T=16366 bf=0 shadow=1 route=5 rep=0 ms=8.848740 name=blk.6.ffn_up_shexp.weight
+[dense-probe] type=14 M=640 K=2560 T=16366 bf=0 shadow=1 route=5 rep=1 ms=8.792252 name=blk.6.ffn_up_shexp.weight
+[dense-probe] type=14 M=640 K=2560 T=16366 bf=0 shadow=1 route=5 rep=2 ms=8.844915 name=blk.6.ffn_up_shexp.weight
+[dense-probe] type=14 M=640 K=2560 T=16366 bf=0 shadow=1 route=5 rep=3 ms=8.647998 name=blk.6.ffn_up_shexp.weight
+[dense-probe] type=14 M=640 K=2560 T=16366 bf=0 shadow=1 route=5 rep=4 ms=8.733711 name=blk.6.ffn_up_shexp.weight
+[dense-probe] type=14 M=640 K=2560 T=16366 bf=0 shadow=1 route=5 rep=5 ms=8.862413 name=blk.6.ffn_up_shexp.weight
+[dense-probe] type=14 M=640 K=2560 T=16366 bf=0 shadow=1 route=3 rep=0 ms=4.020570 name=blk.6.ffn_up_shexp.weight
+[dense-probe] type=14 M=640 K=2560 T=16366 bf=0 shadow=1 route=3 rep=1 ms=4.094068 name=blk.6.ffn_up_shexp.weight
+[dense-probe] type=14 M=640 K=2560 T=16366 bf=0 shadow=1 route=3 rep=2 ms=4.129378 name=blk.6.ffn_up_shexp.weight
+[dense-probe] type=14 M=640 K=2560 T=16366 bf=0 shadow=1 route=3 rep=3 ms=4.091217 name=blk.6.ffn_up_shexp.weight
+[dense-probe] type=14 M=640 K=2560 T=16366 bf=0 shadow=1 route=3 rep=4 ms=4.126170 name=blk.6.ffn_up_shexp.weight
+[dense-probe] type=14 M=640 K=2560 T=16366 bf=0 shadow=1 route=3 rep=5 ms=4.133254 name=blk.6.ffn_up_shexp.weight
+[mm] K=2560 N=512 type=12
+[dense-probe] type=12 M=512 K=2560 T=16366 bf=0 shadow=0 route=4 rep=0 ms=6.774723 name=blk.7.attn_k.weight
+[dense-probe] type=12 M=512 K=2560 T=16366 bf=0 shadow=0 route=4 rep=1 ms=5.514005 name=blk.7.attn_k.weight
+[dense-probe] type=12 M=512 K=2560 T=16366 bf=0 shadow=0 route=4 rep=2 ms=5.586769 name=blk.7.attn_k.weight
+[dense-probe] type=12 M=512 K=2560 T=16366 bf=0 shadow=0 route=4 rep=3 ms=5.487671 name=blk.7.attn_k.weight
+[dense-probe] type=12 M=512 K=2560 T=16366 bf=0 shadow=0 route=4 rep=4 ms=5.465940 name=blk.7.attn_k.weight
+[dense-probe] type=12 M=512 K=2560 T=16366 bf=0 shadow=0 route=4 rep=5 ms=5.392771 name=blk.7.attn_k.weight
+[dense-probe] type=12 M=512 K=2560 T=16366 bf=0 shadow=0 route=5 rep=0 ms=7.007747 name=blk.7.attn_k.weight
+[dense-probe] type=12 M=512 K=2560 T=16366 bf=0 shadow=0 route=5 rep=1 ms=6.765123 name=blk.7.attn_k.weight
+[dense-probe] type=12 M=512 K=2560 T=16366 bf=0 shadow=0 route=5 rep=2 ms=6.867632 name=blk.7.attn_k.weight
+[dense-probe] type=12 M=512 K=2560 T=16366 bf=0 shadow=0 route=5 rep=3 ms=6.888148 name=blk.7.attn_k.weight
+[dense-probe] type=12 M=512 K=2560 T=16366 bf=0 shadow=0 route=5 rep=4 ms=6.817236 name=blk.7.attn_k.weight
+[dense-probe] type=12 M=512 K=2560 T=16366 bf=0 shadow=0 route=5 rep=5 ms=6.830355 name=blk.7.attn_k.weight
+[dense-probe] type=12 M=512 K=2560 T=16366 bf=0 shadow=0 route=3 rep=0 ms=2.602685 name=blk.7.attn_k.weight
+[dense-probe] type=12 M=512 K=2560 T=16366 bf=0 shadow=0 route=3 rep=1 ms=2.576292 name=blk.7.attn_k.weight
+[dense-probe] type=12 M=512 K=2560 T=16366 bf=0 shadow=0 route=3 rep=2 ms=2.614426 name=blk.7.attn_k.weight
+[dense-probe] type=12 M=512 K=2560 T=16366 bf=0 shadow=0 route=3 rep=3 ms=2.591652 name=blk.7.attn_k.weight
+[dense-probe] type=12 M=512 K=2560 T=16366 bf=0 shadow=0 route=3 rep=4 ms=2.604637 name=blk.7.attn_k.weight
+[dense-probe] type=12 M=512 K=2560 T=16366 bf=0 shadow=0 route=3 rep=5 ms=2.625338 name=blk.7.attn_k.weight
+[mm] K=2560 N=12288 type=12
+[dense-probe] type=12 M=12288 K=2560 T=16366 bf=0 shadow=0 route=4 rep=0 ms=117.980537 name=blk.11.attn_q.weight
+[dense-probe] type=12 M=12288 K=2560 T=16366 bf=0 shadow=0 route=4 rep=1 ms=114.488632 name=blk.11.attn_q.weight
+[dense-probe] type=12 M=12288 K=2560 T=16366 bf=0 shadow=0 route=4 rep=2 ms=117.332382 name=blk.11.attn_q.weight
+[dense-probe] type=12 M=12288 K=2560 T=16366 bf=0 shadow=0 route=4 rep=3 ms=115.323097 name=blk.11.attn_q.weight
+[dense-probe] type=12 M=12288 K=2560 T=16366 bf=0 shadow=0 route=4 rep=4 ms=115.998817 name=blk.11.attn_q.weight
+[dense-probe] type=12 M=12288 K=2560 T=16366 bf=0 shadow=0 route=4 rep=5 ms=115.209328 name=blk.11.attn_q.weight
+[dense-probe] type=12 M=12288 K=2560 T=16366 bf=0 shadow=0 route=5 rep=0 ms=155.381714 name=blk.11.attn_q.weight
+[dense-probe] type=12 M=12288 K=2560 T=16366 bf=0 shadow=0 route=5 rep=1 ms=155.565155 name=blk.11.attn_q.weight
+[dense-probe] type=12 M=12288 K=2560 T=16366 bf=0 shadow=0 route=5 rep=2 ms=155.525238 name=blk.11.attn_q.weight
+[dense-probe] type=12 M=12288 K=2560 T=16366 bf=0 shadow=0 route=5 rep=3 ms=155.305695 name=blk.11.attn_q.weight
+[dense-probe] type=12 M=12288 K=2560 T=16366 bf=0 shadow=0 route=5 rep=4 ms=155.487366 name=blk.11.attn_q.weight
+[dense-probe] type=12 M=12288 K=2560 T=16366 bf=0 shadow=0 route=5 rep=5 ms=155.396393 name=blk.11.attn_q.weight
+[dense-probe] type=12 M=12288 K=2560 T=16366 bf=0 shadow=0 route=3 rep=0 ms=41.038147 name=blk.11.attn_q.weight
+[dense-probe] type=12 M=12288 K=2560 T=16366 bf=0 shadow=0 route=3 rep=1 ms=43.323257 name=blk.11.attn_q.weight
+[dense-probe] type=12 M=12288 K=2560 T=16366 bf=0 shadow=0 route=3 rep=2 ms=43.463554 name=blk.11.attn_q.weight
+[dense-probe] type=12 M=12288 K=2560 T=16366 bf=0 shadow=0 route=3 rep=3 ms=43.146091 name=blk.11.attn_q.weight
+[dense-probe] type=12 M=12288 K=2560 T=16366 bf=0 shadow=0 route=3 rep=4 ms=43.225971 name=blk.11.attn_q.weight
+[dense-probe] type=12 M=12288 K=2560 T=16366 bf=0 shadow=0 route=3 rep=5 ms=42.944363 name=blk.11.attn_q.weight
+[mm] K=2560 N=10240 type=12
+[dense-probe] type=12 M=10240 K=2560 T=16366 bf=0 shadow=0 route=4 rep=0 ms=96.959450 name=blk.12.attn_qkv.weight
+[dense-probe] type=12 M=10240 K=2560 T=16366 bf=0 shadow=0 route=4 rep=1 ms=100.215942 name=blk.12.attn_qkv.weight
+[dense-probe] type=12 M=10240 K=2560 T=16366 bf=0 shadow=0 route=4 rep=2 ms=99.821411 name=blk.12.attn_qkv.weight
+[dense-probe] type=12 M=10240 K=2560 T=16366 bf=0 shadow=0 route=4 rep=3 ms=101.544647 name=blk.12.attn_qkv.weight
+[dense-probe] type=12 M=10240 K=2560 T=16366 bf=0 shadow=0 route=4 rep=4 ms=99.354156 name=blk.12.attn_qkv.weight
+[dense-probe] type=12 M=10240 K=2560 T=16366 bf=0 shadow=0 route=4 rep=5 ms=98.180145 name=blk.12.attn_qkv.weight
+[dense-probe] type=12 M=10240 K=2560 T=16366 bf=0 shadow=0 route=5 rep=0 ms=126.634827 name=blk.12.attn_qkv.weight
+[dense-probe] type=12 M=10240 K=2560 T=16366 bf=0 shadow=0 route=5 rep=1 ms=126.490242 name=blk.12.attn_qkv.weight
+[dense-probe] type=12 M=10240 K=2560 T=16366 bf=0 shadow=0 route=5 rep=2 ms=126.657173 name=blk.12.attn_qkv.weight
+[dense-probe] type=12 M=10240 K=2560 T=16366 bf=0 shadow=0 route=5 rep=3 ms=126.399185 name=blk.12.attn_qkv.weight
+[dense-probe] type=12 M=10240 K=2560 T=16366 bf=0 shadow=0 route=5 rep=4 ms=126.803474 name=blk.12.attn_qkv.weight
+[dense-probe] type=12 M=10240 K=2560 T=16366 bf=0 shadow=0 route=5 rep=5 ms=126.478539 name=blk.12.attn_qkv.weight
+[dense-probe] type=12 M=10240 K=2560 T=16366 bf=0 shadow=0 route=3 rep=0 ms=34.619972 name=blk.12.attn_qkv.weight
+[dense-probe] type=12 M=10240 K=2560 T=16366 bf=0 shadow=0 route=3 rep=1 ms=36.327068 name=blk.12.attn_qkv.weight
+[dense-probe] type=12 M=10240 K=2560 T=16366 bf=0 shadow=0 route=3 rep=2 ms=36.642166 name=blk.12.attn_qkv.weight
+[dense-probe] type=12 M=10240 K=2560 T=16366 bf=0 shadow=0 route=3 rep=3 ms=36.588039 name=blk.12.attn_qkv.weight
+[dense-probe] type=12 M=10240 K=2560 T=16366 bf=0 shadow=0 route=3 rep=4 ms=36.357361 name=blk.12.attn_qkv.weight
+[dense-probe] type=12 M=10240 K=2560 T=16366 bf=0 shadow=0 route=3 rep=5 ms=36.278271 name=blk.12.attn_qkv.weight
+[mm] K=2560 N=6144 type=12
+[dense-probe] type=12 M=6144 K=2560 T=16366 bf=0 shadow=0 route=4 rep=0 ms=61.664631 name=blk.14.attn_gate.weight
+[dense-probe] type=12 M=6144 K=2560 T=16366 bf=0 shadow=0 route=4 rep=1 ms=60.379051 name=blk.14.attn_gate.weight
+[dense-probe] type=12 M=6144 K=2560 T=16366 bf=0 shadow=0 route=4 rep=2 ms=61.857166 name=blk.14.attn_gate.weight
+[dense-probe] type=12 M=6144 K=2560 T=16366 bf=0 shadow=0 route=4 rep=3 ms=59.306019 name=blk.14.attn_gate.weight
+[dense-probe] type=12 M=6144 K=2560 T=16366 bf=0 shadow=0 route=4 rep=4 ms=60.078335 name=blk.14.attn_gate.weight
+[dense-probe] type=12 M=6144 K=2560 T=16366 bf=0 shadow=0 route=4 rep=5 ms=59.186012 name=blk.14.attn_gate.weight
+[dense-probe] type=12 M=6144 K=2560 T=16366 bf=0 shadow=0 route=5 rep=0 ms=75.281227 name=blk.14.attn_gate.weight
+[dense-probe] type=12 M=6144 K=2560 T=16366 bf=0 shadow=0 route=5 rep=1 ms=75.446190 name=blk.14.attn_gate.weight
+[dense-probe] type=12 M=6144 K=2560 T=16366 bf=0 shadow=0 route=5 rep=2 ms=75.496902 name=blk.14.attn_gate.weight
+[dense-probe] type=12 M=6144 K=2560 T=16366 bf=0 shadow=0 route=5 rep=3 ms=75.387978 name=blk.14.attn_gate.weight
+[dense-probe] type=12 M=6144 K=2560 T=16366 bf=0 shadow=0 route=5 rep=4 ms=75.078438 name=blk.14.attn_gate.weight
+[dense-probe] type=12 M=6144 K=2560 T=16366 bf=0 shadow=0 route=5 rep=5 ms=75.502831 name=blk.14.attn_gate.weight
+[dense-probe] type=12 M=6144 K=2560 T=16366 bf=0 shadow=0 route=3 rep=0 ms=20.807941 name=blk.14.attn_gate.weight
+[dense-probe] type=12 M=6144 K=2560 T=16366 bf=0 shadow=0 route=3 rep=1 ms=21.647549 name=blk.14.attn_gate.weight
+[dense-probe] type=12 M=6144 K=2560 T=16366 bf=0 shadow=0 route=3 rep=2 ms=22.104584 name=blk.14.attn_gate.weight
+[dense-probe] type=12 M=6144 K=2560 T=16366 bf=0 shadow=0 route=3 rep=3 ms=22.265129 name=blk.14.attn_gate.weight
+[dense-probe] type=12 M=6144 K=2560 T=16366 bf=0 shadow=0 route=3 rep=4 ms=22.292292 name=blk.14.attn_gate.weight
+[dense-probe] type=12 M=6144 K=2560 T=16366 bf=0 shadow=0 route=3 rep=5 ms=22.271433 name=blk.14.attn_gate.weight
+[mm] K=2560 N=10240 type=13
+[dense-probe] type=13 M=10240 K=2560 T=16366 bf=0 shadow=1 route=1 rep=0 ms=29.050968 name=blk.16.attn_qkv.weight
+[dense-probe] type=13 M=10240 K=2560 T=16366 bf=0 shadow=1 route=1 rep=1 ms=29.353455 name=blk.16.attn_qkv.weight
+[dense-probe] type=13 M=10240 K=2560 T=16366 bf=0 shadow=1 route=1 rep=2 ms=29.293695 name=blk.16.attn_qkv.weight
+[dense-probe] type=13 M=10240 K=2560 T=16366 bf=0 shadow=1 route=1 rep=3 ms=29.280016 name=blk.16.attn_qkv.weight
+[dense-probe] type=13 M=10240 K=2560 T=16366 bf=0 shadow=1 route=1 rep=4 ms=29.194202 name=blk.16.attn_qkv.weight
+[dense-probe] type=13 M=10240 K=2560 T=16366 bf=0 shadow=1 route=1 rep=5 ms=29.735424 name=blk.16.attn_qkv.weight
+[dense-probe] type=13 M=10240 K=2560 T=16366 bf=0 shadow=1 route=4 rep=0 ms=126.841301 name=blk.16.attn_qkv.weight
+[dense-probe] type=13 M=10240 K=2560 T=16366 bf=0 shadow=1 route=4 rep=1 ms=123.934395 name=blk.16.attn_qkv.weight
+[dense-probe] type=13 M=10240 K=2560 T=16366 bf=0 shadow=1 route=4 rep=2 ms=124.174561 name=blk.16.attn_qkv.weight
+[dense-probe] type=13 M=10240 K=2560 T=16366 bf=0 shadow=1 route=4 rep=3 ms=124.767624 name=blk.16.attn_qkv.weight
+[dense-probe] type=13 M=10240 K=2560 T=16366 bf=0 shadow=1 route=4 rep=4 ms=123.853989 name=blk.16.attn_qkv.weight
+[dense-probe] type=13 M=10240 K=2560 T=16366 bf=0 shadow=1 route=4 rep=5 ms=123.860245 name=blk.16.attn_qkv.weight
+[dense-probe] type=13 M=10240 K=2560 T=16366 bf=0 shadow=1 route=5 rep=0 ms=145.720596 name=blk.16.attn_qkv.weight
+[dense-probe] type=13 M=10240 K=2560 T=16366 bf=0 shadow=1 route=5 rep=1 ms=146.421219 name=blk.16.attn_qkv.weight
+[dense-probe] type=13 M=10240 K=2560 T=16366 bf=0 shadow=1 route=5 rep=2 ms=146.319778 name=blk.16.attn_qkv.weight
+[dense-probe] type=13 M=10240 K=2560 T=16366 bf=0 shadow=1 route=5 rep=3 ms=145.848145 name=blk.16.attn_qkv.weight
+[dense-probe] type=13 M=10240 K=2560 T=16366 bf=0 shadow=1 route=5 rep=4 ms=146.165573 name=blk.16.attn_qkv.weight
+[dense-probe] type=13 M=10240 K=2560 T=16366 bf=0 shadow=1 route=5 rep=5 ms=146.434479 name=blk.16.attn_qkv.weight
+[dense-probe] type=13 M=10240 K=2560 T=16366 bf=0 shadow=1 route=3 rep=0 ms=36.632999 name=blk.16.attn_qkv.weight
+[dense-probe] type=13 M=10240 K=2560 T=16366 bf=0 shadow=1 route=3 rep=1 ms=37.195503 name=blk.16.attn_qkv.weight
+[dense-probe] type=13 M=10240 K=2560 T=16366 bf=0 shadow=1 route=3 rep=2 ms=37.057453 name=blk.16.attn_qkv.weight
+[dense-probe] type=13 M=10240 K=2560 T=16366 bf=0 shadow=1 route=3 rep=3 ms=37.378193 name=blk.16.attn_qkv.weight
+[dense-probe] type=13 M=10240 K=2560 T=16366 bf=0 shadow=1 route=3 rep=4 ms=39.134686 name=blk.16.attn_qkv.weight
+[dense-probe] type=13 M=10240 K=2560 T=16366 bf=0 shadow=1 route=3 rep=5 ms=39.924488 name=blk.16.attn_qkv.weight
+[mm] K=2560 N=12288 type=14
+[dense-probe] type=14 M=12288 K=2560 T=16366 bf=0 shadow=1 route=1 rep=0 ms=34.482979 name=blk.27.attn_q.weight
+[dense-probe] type=14 M=12288 K=2560 T=16366 bf=0 shadow=1 route=1 rep=1 ms=34.625381 name=blk.27.attn_q.weight
+[dense-probe] type=14 M=12288 K=2560 T=16366 bf=0 shadow=1 route=1 rep=2 ms=34.555153 name=blk.27.attn_q.weight
+[dense-probe] type=14 M=12288 K=2560 T=16366 bf=0 shadow=1 route=1 rep=3 ms=34.596107 name=blk.27.attn_q.weight
+[dense-probe] type=14 M=12288 K=2560 T=16366 bf=0 shadow=1 route=1 rep=4 ms=35.084404 name=blk.27.attn_q.weight
+[dense-probe] type=14 M=12288 K=2560 T=16366 bf=0 shadow=1 route=1 rep=5 ms=35.294468 name=blk.27.attn_q.weight
+[dense-probe] type=14 M=12288 K=2560 T=16366 bf=0 shadow=1 route=4 rep=0 ms=155.398300 name=blk.27.attn_q.weight
+[dense-probe] type=14 M=12288 K=2560 T=16366 bf=0 shadow=1 route=4 rep=1 ms=154.756012 name=blk.27.attn_q.weight
+[dense-probe] type=14 M=12288 K=2560 T=16366 bf=0 shadow=1 route=4 rep=2 ms=154.924637 name=blk.27.attn_q.weight
+[dense-probe] type=14 M=12288 K=2560 T=16366 bf=0 shadow=1 route=4 rep=3 ms=153.409302 name=blk.27.attn_q.weight
+[dense-probe] type=14 M=12288 K=2560 T=16366 bf=0 shadow=1 route=4 rep=4 ms=153.325546 name=blk.27.attn_q.weight
+[dense-probe] type=14 M=12288 K=2560 T=16366 bf=0 shadow=1 route=4 rep=5 ms=152.853241 name=blk.27.attn_q.weight
+[dense-probe] type=14 M=12288 K=2560 T=16366 bf=0 shadow=1 route=5 rep=0 ms=184.001266 name=blk.27.attn_q.weight
+[dense-probe] type=14 M=12288 K=2560 T=16366 bf=0 shadow=1 route=5 rep=1 ms=184.144012 name=blk.27.attn_q.weight
+[dense-probe] type=14 M=12288 K=2560 T=16366 bf=0 shadow=1 route=5 rep=2 ms=184.274429 name=blk.27.attn_q.weight
+[dense-probe] type=14 M=12288 K=2560 T=16366 bf=0 shadow=1 route=5 rep=3 ms=184.135956 name=blk.27.attn_q.weight
+[dense-probe] type=14 M=12288 K=2560 T=16366 bf=0 shadow=1 route=5 rep=4 ms=184.416107 name=blk.27.attn_q.weight
+[dense-probe] type=14 M=12288 K=2560 T=16366 bf=0 shadow=1 route=5 rep=5 ms=184.011017 name=blk.27.attn_q.weight
+[dense-probe] type=14 M=12288 K=2560 T=16366 bf=0 shadow=1 route=3 rep=0 ms=62.000038 name=blk.27.attn_q.weight
+[dense-probe] type=14 M=12288 K=2560 T=16366 bf=0 shadow=1 route=3 rep=1 ms=62.202900 name=blk.27.attn_q.weight
+[dense-probe] type=14 M=12288 K=2560 T=16366 bf=0 shadow=1 route=3 rep=2 ms=62.501293 name=blk.27.attn_q.weight
+[dense-probe] type=14 M=12288 K=2560 T=16366 bf=0 shadow=1 route=3 rep=3 ms=62.247208 name=blk.27.attn_q.weight
+[dense-probe] type=14 M=12288 K=2560 T=16366 bf=0 shadow=1 route=3 rep=4 ms=64.794708 name=blk.27.attn_q.weight
+[dense-probe] type=14 M=12288 K=2560 T=16366 bf=0 shadow=1 route=3 rep=5 ms=67.443459 name=blk.27.attn_q.weight
+[mm] K=2560 N=6144 type=13
+[dense-probe] type=13 M=6144 K=2560 T=16366 bf=0 shadow=1 route=1 rep=0 ms=17.967117 name=blk.34.attn_gate.weight
+[dense-probe] type=13 M=6144 K=2560 T=16366 bf=0 shadow=1 route=1 rep=1 ms=17.842598 name=blk.34.attn_gate.weight
+[dense-probe] type=13 M=6144 K=2560 T=16366 bf=0 shadow=1 route=1 rep=2 ms=17.839012 name=blk.34.attn_gate.weight
+[dense-probe] type=13 M=6144 K=2560 T=16366 bf=0 shadow=1 route=1 rep=3 ms=17.903837 name=blk.34.attn_gate.weight
+[dense-probe] type=13 M=6144 K=2560 T=16366 bf=0 shadow=1 route=1 rep=4 ms=17.908966 name=blk.34.attn_gate.weight
+[dense-probe] type=13 M=6144 K=2560 T=16366 bf=0 shadow=1 route=1 rep=5 ms=18.075020 name=blk.34.attn_gate.weight
+[dense-probe] type=13 M=6144 K=2560 T=16366 bf=0 shadow=1 route=4 rep=0 ms=71.867409 name=blk.34.attn_gate.weight
+[dense-probe] type=13 M=6144 K=2560 T=16366 bf=0 shadow=1 route=4 rep=1 ms=69.603882 name=blk.34.attn_gate.weight
+[dense-probe] type=13 M=6144 K=2560 T=16366 bf=0 shadow=1 route=4 rep=2 ms=69.719315 name=blk.34.attn_gate.weight
+[dense-probe] type=13 M=6144 K=2560 T=16366 bf=0 shadow=1 route=4 rep=3 ms=69.966461 name=blk.34.attn_gate.weight
+[dense-probe] type=13 M=6144 K=2560 T=16366 bf=0 shadow=1 route=4 rep=4 ms=70.258987 name=blk.34.attn_gate.weight
+[dense-probe] type=13 M=6144 K=2560 T=16366 bf=0 shadow=1 route=4 rep=5 ms=70.035049 name=blk.34.attn_gate.weight
+[dense-probe] type=13 M=6144 K=2560 T=16366 bf=0 shadow=1 route=5 rep=0 ms=87.039124 name=blk.34.attn_gate.weight
+[dense-probe] type=13 M=6144 K=2560 T=16366 bf=0 shadow=1 route=5 rep=1 ms=86.933731 name=blk.34.attn_gate.weight
+[dense-probe] type=13 M=6144 K=2560 T=16366 bf=0 shadow=1 route=5 rep=2 ms=87.625778 name=blk.34.attn_gate.weight
+[dense-probe] type=13 M=6144 K=2560 T=16366 bf=0 shadow=1 route=5 rep=3 ms=87.524384 name=blk.34.attn_gate.weight
+[dense-probe] type=13 M=6144 K=2560 T=16366 bf=0 shadow=1 route=5 rep=4 ms=87.569931 name=blk.34.attn_gate.weight
+[dense-probe] type=13 M=6144 K=2560 T=16366 bf=0 shadow=1 route=5 rep=5 ms=87.552032 name=blk.34.attn_gate.weight
+[dense-probe] type=13 M=6144 K=2560 T=16366 bf=0 shadow=1 route=3 rep=0 ms=21.347569 name=blk.34.attn_gate.weight
+[dense-probe] type=13 M=6144 K=2560 T=16366 bf=0 shadow=1 route=3 rep=1 ms=21.640043 name=blk.34.attn_gate.weight
+[dense-probe] type=13 M=6144 K=2560 T=16366 bf=0 shadow=1 route=3 rep=2 ms=22.401964 name=blk.34.attn_gate.weight
+[dense-probe] type=13 M=6144 K=2560 T=16366 bf=0 shadow=1 route=3 rep=3 ms=23.038448 name=blk.34.attn_gate.weight
+[dense-probe] type=13 M=6144 K=2560 T=16366 bf=0 shadow=1 route=3 rep=4 ms=23.247356 name=blk.34.attn_gate.weight
+[dense-probe] type=13 M=6144 K=2560 T=16366 bf=0 shadow=1 route=3 rep=5 ms=23.177414 name=blk.34.attn_gate.weight
+[mm] K=2560 N=512 type=13
+[dense-probe] type=13 M=512 K=2560 T=16366 bf=0 shadow=0 route=4 rep=0 ms=7.421111 name=blk.43.attn_k.weight
+[dense-probe] type=13 M=512 K=2560 T=16366 bf=0 shadow=0 route=4 rep=1 ms=6.118219 name=blk.43.attn_k.weight
+[dense-probe] type=13 M=512 K=2560 T=16366 bf=0 shadow=0 route=4 rep=2 ms=6.225955 name=blk.43.attn_k.weight
+[dense-probe] type=13 M=512 K=2560 T=16366 bf=0 shadow=0 route=4 rep=3 ms=6.284308 name=blk.43.attn_k.weight
+[dense-probe] type=13 M=512 K=2560 T=16366 bf=0 shadow=0 route=4 rep=4 ms=6.092295 name=blk.43.attn_k.weight
+[dense-probe] type=13 M=512 K=2560 T=16366 bf=0 shadow=0 route=4 rep=5 ms=6.381308 name=blk.43.attn_k.weight
+[dense-probe] type=13 M=512 K=2560 T=16366 bf=0 shadow=0 route=5 rep=0 ms=6.174864 name=blk.43.attn_k.weight
+[dense-probe] type=13 M=512 K=2560 T=16366 bf=0 shadow=0 route=5 rep=1 ms=6.247470 name=blk.43.attn_k.weight
+[dense-probe] type=13 M=512 K=2560 T=16366 bf=0 shadow=0 route=5 rep=2 ms=6.174466 name=blk.43.attn_k.weight
+[dense-probe] type=13 M=512 K=2560 T=16366 bf=0 shadow=0 route=5 rep=3 ms=6.282157 name=blk.43.attn_k.weight
+[dense-probe] type=13 M=512 K=2560 T=16366 bf=0 shadow=0 route=5 rep=4 ms=6.288371 name=blk.43.attn_k.weight
+[dense-probe] type=13 M=512 K=2560 T=16366 bf=0 shadow=0 route=5 rep=5 ms=6.113341 name=blk.43.attn_k.weight
+[dense-probe] type=13 M=512 K=2560 T=16366 bf=0 shadow=0 route=3 rep=0 ms=2.740896 name=blk.43.attn_k.weight
+[dense-probe] type=13 M=512 K=2560 T=16366 bf=0 shadow=0 route=3 rep=1 ms=2.713288 name=blk.43.attn_k.weight
+[dense-probe] type=13 M=512 K=2560 T=16366 bf=0 shadow=0 route=3 rep=2 ms=2.705895 name=blk.43.attn_k.weight
+[dense-probe] type=13 M=512 K=2560 T=16366 bf=0 shadow=0 route=3 rep=3 ms=2.719929 name=blk.43.attn_k.weight
+[dense-probe] type=13 M=512 K=2560 T=16366 bf=0 shadow=0 route=3 rep=4 ms=2.718748 name=blk.43.attn_k.weight
+[dense-probe] type=13 M=512 K=2560 T=16366 bf=0 shadow=0 route=3 rep=5 ms=2.715221 name=blk.43.attn_k.weight
+[mm] K=2560 N=512 type=21
+[dense-probe] type=21 M=512 K=2560 T=16366 bf=0 shadow=0 route=4 rep=0 ms=9.520212 name=blk.47.attn_k.weight
+[dense-probe] type=21 M=512 K=2560 T=16366 bf=0 shadow=0 route=4 rep=1 ms=8.503433 name=blk.47.attn_k.weight
+[dense-probe] type=21 M=512 K=2560 T=16366 bf=0 shadow=0 route=4 rep=2 ms=8.436904 name=blk.47.attn_k.weight
+[dense-probe] type=21 M=512 K=2560 T=16366 bf=0 shadow=0 route=4 rep=3 ms=8.384193 name=blk.47.attn_k.weight
+[dense-probe] type=21 M=512 K=2560 T=16366 bf=0 shadow=0 route=4 rep=4 ms=8.511655 name=blk.47.attn_k.weight
+[dense-probe] type=21 M=512 K=2560 T=16366 bf=0 shadow=0 route=4 rep=5 ms=8.477605 name=blk.47.attn_k.weight
+[dense-probe] type=21 M=512 K=2560 T=16366 bf=0 shadow=0 route=5 rep=0 ms=7.594226 name=blk.47.attn_k.weight
+[dense-probe] type=21 M=512 K=2560 T=16366 bf=0 shadow=0 route=5 rep=1 ms=7.544763 name=blk.47.attn_k.weight
+[dense-probe] type=21 M=512 K=2560 T=16366 bf=0 shadow=0 route=5 rep=2 ms=7.583552 name=blk.47.attn_k.weight
+[dense-probe] type=21 M=512 K=2560 T=16366 bf=0 shadow=0 route=5 rep=3 ms=7.684715 name=blk.47.attn_k.weight
+[dense-probe] type=21 M=512 K=2560 T=16366 bf=0 shadow=0 route=5 rep=4 ms=7.668593 name=blk.47.attn_k.weight
+[dense-probe] type=21 M=512 K=2560 T=16366 bf=0 shadow=0 route=5 rep=5 ms=7.656364 name=blk.47.attn_k.weight
+[dense-probe] type=21 M=512 K=2560 T=16366 bf=0 shadow=0 route=3 rep=0 ms=2.677498 name=blk.47.attn_k.weight
+[dense-probe] type=21 M=512 K=2560 T=16366 bf=0 shadow=0 route=3 rep=1 ms=2.660165 name=blk.47.attn_k.weight
+[dense-probe] type=21 M=512 K=2560 T=16366 bf=0 shadow=0 route=3 rep=2 ms=2.658998 name=blk.47.attn_k.weight
+[dense-probe] type=21 M=512 K=2560 T=16366 bf=0 shadow=0 route=3 rep=3 ms=2.673860 name=blk.47.attn_k.weight
+[dense-probe] type=21 M=512 K=2560 T=16366 bf=0 shadow=0 route=3 rep=4 ms=2.683332 name=blk.47.attn_k.weight
+[dense-probe] type=21 M=512 K=2560 T=16366 bf=0 shadow=0 route=3 rep=5 ms=2.686511 name=blk.47.attn_k.weight
+[mm] K=2560 N=12288 type=21
+[dense-probe] type=21 M=12288 K=2560 T=16366 bf=0 shadow=0 route=4 rep=0 ms=187.094833 name=blk.47.attn_q.weight
+[dense-probe] type=21 M=12288 K=2560 T=16366 bf=0 shadow=0 route=4 rep=1 ms=193.550797 name=blk.47.attn_q.weight
+[dense-probe] type=21 M=12288 K=2560 T=16366 bf=0 shadow=0 route=4 rep=2 ms=194.389648 name=blk.47.attn_q.weight
+[dense-probe] type=21 M=12288 K=2560 T=16366 bf=0 shadow=0 route=4 rep=3 ms=184.962479 name=blk.47.attn_q.weight
+[dense-probe] type=21 M=12288 K=2560 T=16366 bf=0 shadow=0 route=4 rep=4 ms=178.613907 name=blk.47.attn_q.weight
+[dense-probe] type=21 M=12288 K=2560 T=16366 bf=0 shadow=0 route=4 rep=5 ms=190.096909 name=blk.47.attn_q.weight
+[dense-probe] type=21 M=12288 K=2560 T=16366 bf=0 shadow=0 route=5 rep=0 ms=164.068451 name=blk.47.attn_q.weight
+[dense-probe] type=21 M=12288 K=2560 T=16366 bf=0 shadow=0 route=5 rep=1 ms=167.905914 name=blk.47.attn_q.weight
+[dense-probe] type=21 M=12288 K=2560 T=16366 bf=0 shadow=0 route=5 rep=2 ms=168.144028 name=blk.47.attn_q.weight
+[dense-probe] type=21 M=12288 K=2560 T=16366 bf=0 shadow=0 route=5 rep=3 ms=168.086548 name=blk.47.attn_q.weight
+[dense-probe] type=21 M=12288 K=2560 T=16366 bf=0 shadow=0 route=5 rep=4 ms=168.299988 name=blk.47.attn_q.weight
+[dense-probe] type=21 M=12288 K=2560 T=16366 bf=0 shadow=0 route=5 rep=5 ms=168.441895 name=blk.47.attn_q.weight
+[dense-probe] type=21 M=12288 K=2560 T=16366 bf=0 shadow=0 route=3 rep=0 ms=42.643509 name=blk.47.attn_q.weight
+[dense-probe] type=21 M=12288 K=2560 T=16366 bf=0 shadow=0 route=3 rep=1 ms=45.927776 name=blk.47.attn_q.weight
+[dense-probe] type=21 M=12288 K=2560 T=16366 bf=0 shadow=0 route=3 rep=2 ms=46.010437 name=blk.47.attn_q.weight
+[dense-probe] type=21 M=12288 K=2560 T=16366 bf=0 shadow=0 route=3 rep=3 ms=45.619106 name=blk.47.attn_q.weight
+[dense-probe] type=21 M=12288 K=2560 T=16366 bf=0 shadow=0 route=3 rep=4 ms=44.972885 name=blk.47.attn_q.weight
+[dense-probe] type=21 M=12288 K=2560 T=16366 bf=0 shadow=0 route=3 rep=5 ms=45.481770 name=blk.47.attn_q.weight
+[mm] K=2560 N=248320 type=13
+[fa] graph qsa=12 dense=0
+[server] chat DONE chatcmpl_0000000000000000 ok=true in=16366 effective_in=16366 out=1 59.6s 0.0 tok/s finish=length restore=false slot=-1 prefix_len=0 prefill=59.6s decode=0.0s(752.0tok/s) error=- detail=-
+[server] request path=/v1/chat/completions body_bytes=79900
+[server] chat chatcmpl_0000000000000001 format=chat stream=true msgs=1 tools=0 prompt_tokens=16366 max_tokens=1 max_ctx=40000 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=dflash
+[server] chat START chatcmpl_0000000000000001 format=chat stream=true prompt_tokens=16366 max_tokens=1 tools=0
+[server] chat CACHE chatcmpl_0000000000000001 restore=false slot=-1 prefix_len=0 effective_prompt=16366 pflash=false disk_policy=full disk_hit=false snap_slot=1 snap_pos=16360 full_snap_slot=-1 full_snap_pos=0
+[fa] graph qsa=12 dense=0
+[server] chat DONE chatcmpl_0000000000000001 ok=true in=16366 effective_in=16366 out=1 27.9s 0.0 tok/s finish=length restore=false slot=-1 prefix_len=0 prefill=27.9s decode=0.0s(3670.9tok/s) error=- detail=-

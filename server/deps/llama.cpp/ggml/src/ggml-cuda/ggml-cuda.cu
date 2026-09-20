@@ -2992,23 +2992,47 @@ static bool ggml_cuda_mmb_cublas_shape_ok(const ggml_tensor * src0) {
 bool ggml_cuda_mmb_glu_down(ggml_backend_cuda_context &, ggml_tensor *, ggml_tensor *, ggml_tensor *, ggml_tensor *);
 extern int ggml_cuda_mmb_probe_tile;
 static int qwen_dense_probe_route = 0;
+
+static void ggml_cuda_mul_mat_bf16_cublas(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        ggml_tensor * dst) {
+    const uint16_t * xb = ggml_cuda_mmb_bf16_src(src1);
+    ggml_tensor tmp1 = *src1;
+    const ggml_tensor * cublas_src1 = src1;
+    if (xb) {
+        tmp1.type = GGML_TYPE_BF16;
+        tmp1.data = const_cast<uint16_t *>(xb);
+        tmp1.nb[0] = sizeof(uint16_t);
+        tmp1.nb[1] = sizeof(uint16_t) * src1->ne[0];
+        tmp1.nb[2] = tmp1.nb[1] * src1->ne[1];
+        tmp1.nb[3] = tmp1.nb[2] * src1->ne[2];
+        cublas_src1 = &tmp1;
+    }
+    ggml_cuda_op_mul_mat(ctx, src0, cublas_src1, dst, ggml_cuda_op_mul_mat_cublas, nullptr);
+}
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     // Offline capture only: repeated complete operations on actual model inputs.
     // Always replay the normal path last so probe results never feed the graph.
     static const bool probe = getenv("QWEN4EXP_DENSE_PROBE") != nullptr;
     const int64_t tokens = ggml_nrows(src1);
     if (probe && !qwen_dense_probe_route && tokens >= 512 &&
-        ggml_cuda_mmb_supported_mm(src0, src1, dst) && ggml_is_quantized(src0->type)) {
+        ggml_cuda_mmb_supported_mm(src0, src1, dst) &&
+        (ggml_is_quantized(src0->type) || src0->type == GGML_TYPE_BF16)) {
         static std::set<std::tuple<int, int64_t, int64_t, int64_t, bool, bool>> seen;
         const bool bf = ggml_cuda_mmb_bf16_src(src1) != nullptr;
         const bool shadow = ggml_cuda_mmb_shadow_ptr(src0) != nullptr;
         if (seen.emplace((int)src0->type, src0->ne[1], src0->ne[0], tokens, bf, shadow).second) {
             cudaEvent_t start, end;
             CUDA_CHECK(cudaEventCreateWithFlags(&start, 0)); CUDA_CHECK(cudaEventCreateWithFlags(&end, 0));
-            for (int route : {1, 4, 5, 3}) {
+            for (int route : {1, 2, 4, 5, 3}) {
                 if (route == 1 && (!shadow || !ggml_cuda_mmb_cublas_shape_ok(src0))) continue;
+                // Native BF16 can go directly to rocBLAS without a shadow.
+                if (route == 2 && src0->type != GGML_TYPE_BF16) continue;
                 // MMQ requires materialized F32; don't reinterpret bf16-only storage.
-                if (route == 3 && (bf || ggml_cuda_mmb_is_bf16_only(dst))) continue;
+                if (route == 3 && (!ggml_is_quantized(src0->type) || bf || ggml_cuda_mmb_is_bf16_only(dst))) continue;
                 qwen_dense_probe_route = route;
                 ggml_cuda_mmb_probe_tile = route == 4 ? 128 : route == 5 ? 256 : 0;
                 for (int rep = 0; rep < 6; ++rep) {
@@ -3034,6 +3058,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
         return;
     }
+    if (qwen_dense_probe_route == 2) {
+        ggml_cuda_mul_mat_bf16_cublas(ctx, src0, src1, dst);
+        return;
+    }
 
     // Frozen gfx1151 / ROCm 7.2.2 table, trained on separate 16366-token captures.
     // MMQ changes activation quantization, so the reference profile never takes it;
@@ -3043,10 +3071,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         const char * ref = getenv("QWEN4EXP_UPSTREAM");
         return !(e && atoi(e) == 0) && !(ref && atoi(ref));
     }();
-    if (table && !probe && tokens == 16366 &&
+    const bool measured_dense = table && !probe && tokens == 16366 &&
         !ggml_backend_buft_is_cuda_split(src0->buffer->buft) &&
         ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151 &&
-        ggml_cuda_mmb_supported_mm(src0, src1, dst) &&
+        ggml_cuda_mmb_supported_mm(src0, src1, dst);
+    if (measured_dense &&
         !ggml_cuda_mmb_bf16_src(src1) && !ggml_cuda_mmb_is_bf16_only(dst)) {
         struct entry { ggml_type type; int64_t m, k; bool shadow; };
         static const entry measured[] = {
@@ -3056,6 +3085,32 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             {GGML_TYPE_IQ4_NL, 2560,  640, false},
             {GGML_TYPE_Q5_K,   2560, 6144, true},
             {GGML_TYPE_IQ4_NL, 2560, 6144, true},
+
+            // GSQ-RCO IQ3_XXS: every tuple below beat MMB in a separate
+            // 16366-token capture. Shadow-backed Q5_K/Q6_K tuples that favor
+            // rocBLAS remain on the QWEN4EXP_MMB_CUBLAS route below.
+            {GGML_TYPE_Q4_K,     512, 2560, false},
+            {GGML_TYPE_Q4_K,     640, 2560, false},
+            {GGML_TYPE_Q4_K,    2560, 6144, false},
+            {GGML_TYPE_Q4_K,    6144, 2560, false},
+            {GGML_TYPE_Q4_K,   10240, 2560, false},
+            {GGML_TYPE_Q4_K,   12288, 2560, false},
+            {GGML_TYPE_Q5_K,     512, 2560, false},
+            {GGML_TYPE_Q5_K,     640, 2560, false},
+            {GGML_TYPE_Q6_K,     512, 2560, true},
+            {GGML_TYPE_Q6_K,     640, 2560, true},
+            {GGML_TYPE_IQ3_S,    512, 2560, false},
+            {GGML_TYPE_IQ3_S,    640, 2560, false},
+            {GGML_TYPE_IQ3_S,   2560, 6144, false},
+            {GGML_TYPE_IQ3_S,   6144, 2560, false},
+            {GGML_TYPE_IQ3_S,  12288, 2560, false},
+            {GGML_TYPE_IQ4_XS,   512, 2560, false},
+            {GGML_TYPE_IQ4_XS,   640, 2560, false},
+            {GGML_TYPE_IQ4_XS,  2560, 6144, false},
+            {GGML_TYPE_IQ4_XS,  6144, 2560, false},
+            {GGML_TYPE_IQ4_XS, 10240, 2560, false},
+            {GGML_TYPE_IQ4_XS, 12288, 2560, false},
+            {GGML_TYPE_Q2_0,    2560,  640, false},
         };
         for (const auto & row : measured) {
             if (src0->type == row.type && src0->ne[1] == row.m && src0->ne[0] == row.k &&

@@ -1,0 +1,26 @@
+{
+  "short_pass": true,
+  "long_pass": true,
+  "short_text": "The capital of France is **Paris**.",
+  "long_text": "QUINCE-AMBER-7731",
+  "long_usage": {
+    "accept_rate": 0.0,
+    "completion_tokens": 12,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens": 16366,
+    "spec_decode_ran": false,
+    "timings": {
+      "agent_turn_cache_hit": false,
+      "cache_hit": false,
+      "cached_prefix_tokens": 0,
+      "decode_ms": 467.0,
+      "decode_tokens_per_sec": 25.7,
+      "effective_prompt_tokens": 16366,
+      "prefill_ms": 21578.7,
+      "prefilled_tokens": 16366
+    },
+    "total_tokens": 16378
+  }
+}

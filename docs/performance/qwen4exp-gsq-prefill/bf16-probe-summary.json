@@ -1,0 +1,354 @@
+[
+  {
+    "type_id": 30,
+    "type": "BF16",
+    "M": 1,
+    "K": 2560,
+    "bf_activation": false,
+    "shadow": false,
+    "names": [
+      "blk.0.ffn_gate_inp_shexp.weight"
+    ],
+    "routes": {
+      "2": {
+        "median_ms": 1.626706,
+        "min_ms": 1.599031,
+        "max_ms": 1.816916,
+        "n": 6
+      },
+      "4": {
+        "median_ms": 1.024712,
+        "min_ms": 1.008072,
+        "max_ms": 1.040805,
+        "n": 6
+      },
+      "5": {
+        "median_ms": 1.054071,
+        "min_ms": 1.033676,
+        "max_ms": 1.108016,
+        "n": 6
+      }
+    },
+    "winner_route": 4
+  },
+  {
+    "type_id": 30,
+    "type": "BF16",
+    "M": 4,
+    "K": 10240,
+    "bf_activation": false,
+    "shadow": false,
+    "names": [
+      "blk.0.hc_attn_inject.weight"
+    ],
+    "routes": {
+      "2": {
+        "median_ms": 7.9144135,
+        "min_ms": 7.689312,
+        "max_ms": 8.235303,
+        "n": 6
+      },
+      "4": {
+        "median_ms": 4.700255,
+        "min_ms": 4.613823,
+        "max_ms": 4.850724,
+        "n": 6
+      },
+      "5": {
+        "median_ms": 4.660992,
+        "min_ms": 4.439535,
+        "max_ms": 4.982232,
+        "n": 6
+      }
+    },
+    "winner_route": 5
+  },
+  {
+    "type_id": 30,
+    "type": "BF16",
+    "M": 4,
+    "K": 10240,
+    "bf_activation": true,
+    "shadow": false,
+    "names": [
+      "blk.0.hc_ffn_inject.weight"
+    ],
+    "routes": {
+      "2": {
+        "median_ms": 3.4477745,
+        "min_ms": 3.30175,
+        "max_ms": 4.030581,
+        "n": 6
+      },
+      "4": {
+        "median_ms": 4.6684795,
+        "min_ms": 4.619925,
+        "max_ms": 4.778088,
+        "n": 6
+      },
+      "5": {
+        "median_ms": 4.6061185,
+        "min_ms": 4.449682,
+        "max_ms": 5.113132,
+        "n": 6
+      }
+    },
+    "winner_route": 2
+  },
+  {
+    "type_id": 30,
+    "type": "BF16",
+    "M": 48,
+    "K": 2560,
+    "bf_activation": false,
+    "shadow": false,
+    "names": [
+      "blk.0.ssm_alpha.weight"
+    ],
+    "routes": {
+      "2": {
+        "median_ms": 1.618357,
+        "min_ms": 1.60645,
+        "max_ms": 1.758886,
+        "n": 6
+      },
+      "4": {
+        "median_ms": 1.804875,
+        "min_ms": 1.725398,
+        "max_ms": 2.050928,
+        "n": 6
+      },
+      "5": {
+        "median_ms": 2.563039,
+        "min_ms": 2.389952,
+        "max_ms": 2.743768,
+        "n": 6
+      }
+    },
+    "winner_route": 2
+  },
+  {
+    "type_id": 30,
+    "type": "BF16",
+    "M": 128,
+    "K": 2560,
+    "bf_activation": false,
+    "shadow": false,
+    "names": [
+      "blk.3.indexer.k_proj.weight"
+    ],
+    "routes": {
+      "2": {
+        "median_ms": 1.6739074999999999,
+        "min_ms": 1.658241,
+        "max_ms": 1.702546,
+        "n": 6
+      },
+      "4": {
+        "median_ms": 1.8371784999999998,
+        "min_ms": 1.82016,
+        "max_ms": 1.911653,
+        "n": 6
+      },
+      "5": {
+        "median_ms": 2.670277,
+        "min_ms": 2.512013,
+        "max_ms": 2.792262,
+        "n": 6
+      }
+    },
+    "winner_route": 2
+  },
+  {
+    "type_id": 30,
+    "type": "BF16",
+    "M": 320,
+    "K": 10240,
+    "bf_activation": false,
+    "shadow": false,
+    "names": [
+      "blk.0.hc_attn_down.weight"
+    ],
+    "routes": {
+      "2": {
+        "median_ms": 11.151014499999999,
+        "min_ms": 10.802452,
+        "max_ms": 13.160545,
+        "n": 6
+      },
+      "4": {
+        "median_ms": 29.410731499999997,
+        "min_ms": 19.608038,
+        "max_ms": 31.851233,
+        "n": 6
+      },
+      "5": {
+        "median_ms": 24.134036000000002,
+        "min_ms": 23.807728,
+        "max_ms": 24.861828,
+        "n": 6
+      }
+    },
+    "winner_route": 2
+  },
+  {
+    "type_id": 30,
+    "type": "BF16",
+    "M": 320,
+    "K": 10240,
+    "bf_activation": true,
+    "shadow": false,
+    "names": [
+      "blk.0.hc_ffn_down.weight"
+    ],
+    "routes": {
+      "2": {
+        "median_ms": 6.864938499999999,
+        "min_ms": 6.670867,
+        "max_ms": 7.198248,
+        "n": 6
+      },
+      "4": {
+        "median_ms": 29.6598995,
+        "min_ms": 27.215796,
+        "max_ms": 31.063999,
+        "n": 6
+      },
+      "5": {
+        "median_ms": 23.560556499999997,
+        "min_ms": 23.509703,
+        "max_ms": 24.380451,
+        "n": 6
+      }
+    },
+    "winner_route": 2
+  },
+  {
+    "type_id": 30,
+    "type": "BF16",
+    "M": 512,
+    "K": 2560,
+    "bf_activation": false,
+    "shadow": false,
+    "names": [
+      "blk.0.ffn_gate_inp.weight"
+    ],
+    "routes": {
+      "2": {
+        "median_ms": 2.4309019999999997,
+        "min_ms": 2.40674,
+        "max_ms": 2.46618,
+        "n": 6
+      },
+      "4": {
+        "median_ms": 5.160482,
+        "min_ms": 5.049349,
+        "max_ms": 6.34132,
+        "n": 6
+      },
+      "5": {
+        "median_ms": 7.239107499999999,
+        "min_ms": 7.148121,
+        "max_ms": 7.269351,
+        "n": 6
+      }
+    },
+    "winner_route": 2
+  },
+  {
+    "type_id": 30,
+    "type": "BF16",
+    "M": 2560,
+    "K": 2560,
+    "bf_activation": false,
+    "shadow": false,
+    "names": [
+      "blk.1.ple_value.weight"
+    ],
+    "routes": {
+      "2": {
+        "median_ms": 7.436361,
+        "min_ms": 7.27457,
+        "max_ms": 7.442096,
+        "n": 6
+      },
+      "4": {
+        "median_ms": 26.9141465,
+        "min_ms": 26.415758,
+        "max_ms": 28.489059,
+        "n": 6
+      },
+      "5": {
+        "median_ms": 36.017748,
+        "min_ms": 35.42942,
+        "max_ms": 36.814018,
+        "n": 6
+      }
+    },
+    "winner_route": 2
+  },
+  {
+    "type_id": 30,
+    "type": "BF16",
+    "M": 10240,
+    "K": 320,
+    "bf_activation": false,
+    "shadow": false,
+    "names": [
+      "blk.0.hc_attn_up.weight"
+    ],
+    "routes": {
+      "2": {
+        "median_ms": 9.0295375,
+        "min_ms": 8.98492,
+        "max_ms": 9.080215,
+        "n": 6
+      },
+      "4": {
+        "median_ms": 16.747877000000003,
+        "min_ms": 16.731451,
+        "max_ms": 17.024775,
+        "n": 6
+      },
+      "5": {
+        "median_ms": 21.8257945,
+        "min_ms": 21.430559,
+        "max_ms": 22.232727,
+        "n": 6
+      }
+    },
+    "winner_route": 2
+  },
+  {
+    "type_id": 30,
+    "type": "BF16",
+    "M": 10240,
+    "K": 2560,
+    "bf_activation": false,
+    "shadow": false,
+    "names": [
+      "blk.1.ple_key.weight"
+    ],
+    "routes": {
+      "2": {
+        "median_ms": 28.9172855,
+        "min_ms": 28.810867,
+        "max_ms": 30.062937,
+        "n": 6
+      },
+      "4": {
+        "median_ms": 123.464203,
+        "min_ms": 122.325989,
+        "max_ms": 124.0467,
+        "n": 6
+      },
+      "5": {
+        "median_ms": 145.826271,
+        "min_ms": 144.381165,
+        "max_ms": 147.384003,
+        "n": 6
+      }
+    },
+    "winner_route": 2
+  }
+]
