@@ -27,10 +27,11 @@ endpoint and reports tok/s, TTFT, and correctness scores.
 
 | Suite   | Description                                        | Scoring          |
 |---------|----------------------------------------------------|------------------|
-| `he`    | HumanEval code-completion prompts (10)             | tok/s only       |
-| `gsm`   | GSM8K arithmetic reasoning prompts (10)            | tok/s only       |
+| `he`    | HumanEval code-completion prompts (10)             | tok/s + gold-test pass |
+| `gsm`   | GSM8K arithmetic reasoning prompts (10)            | tok/s + accuracy |
 | `math`  | Math500 with `\boxed{}` correctness check (10)     | tok/s + accuracy |
 | `agent` | Agentic workloads at 2K/8K/24K context (6)         | TTFT + tok/s     |
+| `recall`| Planted-fact long-context recall (13.6K, 24K)      | tok/s + `expect_contains` |
 
 ### Usage
 
@@ -68,6 +69,9 @@ Static JSONL files in `harness/benchmarks/prompts/`:
 - `bench_gsm.jsonl` — GSM8K arithmetic reasoning
 - `bench_math.jsonl` — Math500 with `gold_answer` field
 - `bench_agent.jsonl` — Agentic prompts with `bucket` field (2k/8k/24k)
+- `bench_recall.jsonl` — planted-fact long-context recall; scored by
+  `expect_contains` (also usable on any prompt: `expect_contains` list and/or
+  `expect_regex`)
 
 ### Correctness
 
