@@ -117,6 +117,18 @@ if (CUDAToolkit_FOUND)
     file(GLOB   SRCS "template-instances/mmf*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
 
+    # mmb.cu (bf16 WMMA dequant GEMM) and moe-weighted-reduction.cu use
+    # AMD-specific intrinsics (__builtin_amdgcn_perm, v16s/v8f, _Float16) and
+    # are only built through the HIP backend (ggml-hip globs ggml-cuda/*.cu).
+    # This CUDA-language file must not hand them to nvcc.
+    list(REMOVE_ITEM GGML_SOURCES_CUDA
+        "${CMAKE_CURRENT_SOURCE_DIR}/mmb.cu"
+        "${CMAKE_CURRENT_SOURCE_DIR}/moe-weighted-reduction.cu"
+        "${CMAKE_CURRENT_SOURCE_DIR}/hc-mix.cu"
+        "${CMAKE_CURRENT_SOURCE_DIR}/hc-cn.cu"
+        "${CMAKE_CURRENT_SOURCE_DIR}/qsa.cu"
+    )
+
     if(GGML_CUDA_BLACKWELL_CONSUMER)
         # FP4 MMA kernels (mxfp4/nvfp4) require sm_120a instructions not present
         # on consumer Blackwell (RTX 5090, SM 12.0).

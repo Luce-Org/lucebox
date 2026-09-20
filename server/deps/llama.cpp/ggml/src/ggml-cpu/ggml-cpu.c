@@ -438,6 +438,12 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_Q8_0,
         .nrows                    = 1,
     },
+    [GGML_TYPE_Q2_0] = {
+        .from_float               = quantize_row_q2_0,
+        .vec_dot                  = ggml_vec_dot_q2_0_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
     [GGML_TYPE_Q4_0] = {
         .from_float               = quantize_row_q4_0,
         .vec_dot                  = ggml_vec_dot_q4_0_q8_0,
@@ -2084,6 +2090,8 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_ds4_moe_combine(params, tensor);
             } break;
+        case GGML_OP_HC_COMBINE_NORM:
+            GGML_ABORT("GGML_OP_HC_COMBINE_NORM is only supported on the CUDA/HIP backend");
         case GGML_OP_OUT_PROD:
             {
                 ggml_compute_forward_out_prod(params, tensor);

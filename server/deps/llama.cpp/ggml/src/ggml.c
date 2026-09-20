@@ -696,6 +696,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_q1_0,
         .from_float_ref           = (ggml_from_float_t) quantize_row_q1_0_ref,
     },
+    [GGML_TYPE_Q2_0] = {
+        .type_name                = "q2_0",
+        .blck_size                = QK2_0,
+        .type_size                = sizeof(block_q2_0),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_q2_0,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_q2_0_ref,
+    },
     [GGML_TYPE_TQ3_0] = {
         .type_name                = "tq3_0",
         .blck_size                = QK_TQ3_0,
@@ -1205,9 +1213,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SOFT_MAX_VISION_F32",
     "MUL_MAT_VISION_AV_F32",
     "DS4_MOE_COMBINE",
+
+    "HC_COMBINE_NORM",
 };
 
-static_assert(GGML_OP_COUNT == 110, "GGML_OP_COUNT != 110");
+static_assert(GGML_OP_COUNT == 111, "GGML_OP_COUNT != 111");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1337,9 +1347,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "soft_max_vision_f32(x)",
     "vision_av_f32(v,p)",
     "ds4_moe_combine(down,w,shared)",
+
+    "hc_combine_norm(inj,res,blk,gamma)",
 };
 
-static_assert(GGML_OP_COUNT == 110, "GGML_OP_COUNT != 110");
+static_assert(GGML_OP_COUNT == 111, "GGML_OP_COUNT != 111");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -1559,6 +1571,7 @@ enum ggml_type ggml_ftype_to_ggml_type(enum ggml_ftype ftype) {
         case GGML_FTYPE_MOSTLY_Q4_0:          wtype = GGML_TYPE_Q4_0;  break;
         case GGML_FTYPE_MOSTLY_Q4_1:          wtype = GGML_TYPE_Q4_1;  break;
         case GGML_FTYPE_MOSTLY_Q1_0:          wtype = GGML_TYPE_Q1_0;  break;
+        case GGML_FTYPE_MOSTLY_Q2_0:          wtype = GGML_TYPE_Q2_0;  break;
         case GGML_FTYPE_MOSTLY_Q5_0:          wtype = GGML_TYPE_Q5_0;  break;
         case GGML_FTYPE_MOSTLY_Q5_1:          wtype = GGML_TYPE_Q5_1;  break;
         case GGML_FTYPE_MOSTLY_Q8_0:          wtype = GGML_TYPE_Q8_0;  break;
@@ -4084,8 +4097,8 @@ struct ggml_tensor * ggml_permute(
     struct ggml_tensor * result = ggml_view_tensor(ctx, a);
     ggml_format_name(result, "%s (permuted)", a->name);
 
-    int ne[GGML_MAX_DIMS];
-    int nb[GGML_MAX_DIMS];
+    int64_t ne[GGML_MAX_DIMS];
+    int64_t nb[GGML_MAX_DIMS];
 
     ne[axis0] = a->ne[0];
     ne[axis1] = a->ne[1];
@@ -5709,6 +5722,15 @@ void ggml_flash_attn_ext_set_prec(
     const int32_t prec_i32 = (int32_t) prec;
 
     ggml_set_op_params_i32(a, 3, prec_i32); // scale is on first pos, max_bias on second
+}
+
+void ggml_flash_attn_ext_set_n_kv_max(
+        struct ggml_tensor * a,
+        int32_t              n_kv_max) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(n_kv_max >= 0);
+
+    ggml_set_op_params_i32(a, 4, n_kv_max);
 }
 
 void ggml_flash_attn_ext_set_ds4_sparse(
@@ -8604,6 +8626,10 @@ static int ggml_node_list_find_tensor(const struct ggml_cgraph * cgraph,
     return -1;
 }
 
+static bool ggml_is_constant(const struct ggml_tensor * tensor) {
+    return tensor->buffer != NULL && ggml_backend_buffer_get_usage(tensor->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS && (tensor->flags & GGML_TENSOR_FLAG_PARAM) == 0;
+}
+
 bool ggml_can_fuse_subgraph_ext(const struct ggml_cgraph * cgraph,
                                 const int *                node_idxs,
                                 int                        count,
@@ -8649,10 +8675,11 @@ bool ggml_can_fuse_subgraph_ext(const struct ggml_cgraph * cgraph,
             return false;
         }
 
-        // if node is a view, check if the view_src and all it's parent view_srcs are within the subgraph
+        // if node is a view, check if the view_src and all its parent view_srcs are within the subgraph.
+        // external view sources are allowed only for weight tensors, which are constant for this graph execution.
         struct ggml_tensor * view_src = node->view_src;
         while (view_src) {
-            if (ggml_node_list_find_tensor(cgraph, node_idxs, count, view_src) == -1) {
+            if (ggml_node_list_find_tensor(cgraph, node_idxs, count, view_src) == -1 && !ggml_is_constant(view_src)) {
                 return false;
             }
             view_src = view_src->view_src;
@@ -8924,6 +8951,7 @@ size_t ggml_quantize_chunk(
 
     switch (type) {
         case GGML_TYPE_Q1_0:    result = quantize_q1_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_Q2_0:    result = quantize_q2_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q4_0:    result = quantize_q4_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q4_1:    result = quantize_q4_1(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q5_0:    result = quantize_q5_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
@@ -9556,5 +9584,37 @@ struct ggml_tensor * ggml_ds4_moe_fused_combine_shared(
     result->src[0] = down_e;
     result->src[1] = weights;
     result->src[2] = shared_out;
+    return result;
+}
+
+struct ggml_tensor * ggml_hc_combine_norm(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * inject,
+        struct ggml_tensor  * residual,
+        struct ggml_tensor  * block_out,
+        struct ggml_tensor  * gamma,
+        float                 s1, float b1, float s2, float b2, float eps) {
+    GGML_ASSERT(inject && residual && block_out && gamma);
+    GGML_ASSERT(inject->type == GGML_TYPE_F32 && residual->type == GGML_TYPE_F32 &&
+                block_out->type == GGML_TYPE_F32 && gamma->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(inject) && ggml_is_contiguous(residual) &&
+                ggml_is_contiguous(block_out) && ggml_is_contiguous(gamma));
+    GGML_ASSERT(residual->ne[3] == 1 && inject->ne[0] == residual->ne[1] &&
+                inject->ne[1] == residual->ne[2] && block_out->ne[3] == 1 &&
+                block_out->ne[0] == residual->ne[0] && block_out->ne[2] == residual->ne[2]);
+    GGML_ASSERT(ggml_nelements(gamma) == residual->ne[0] * residual->ne[1]);
+
+    const int64_t ne[4] = { residual->ne[0], residual->ne[1], residual->ne[2], 2 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+    result->op     = GGML_OP_HC_COMBINE_NORM;
+    result->src[0] = inject;
+    result->src[1] = residual;
+    result->src[2] = block_out;
+    result->src[3] = gamma;
+    ggml_set_op_params_f32(result, 0, s1);
+    ggml_set_op_params_f32(result, 1, b1);
+    ggml_set_op_params_f32(result, 2, s2);
+    ggml_set_op_params_f32(result, 3, b2);
+    ggml_set_op_params_f32(result, 4, eps);
     return result;
 }

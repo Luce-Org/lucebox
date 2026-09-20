@@ -227,7 +227,7 @@ static __global__ void rope_neox(const T *            x,
     dst[idst + n_dims / 2] = ggml_cuda_cast<D>(x0 * sin_theta + x1 * cos_theta);
 }
 
-template <bool forward, bool has_ff, typename T>
+template <bool forward, bool has_ff, bool upstream_f32, typename T>
 static __global__ void rope_multi(const T *            x,
                                   T *                  dst,
                                   const int            ne00,
@@ -275,26 +275,26 @@ static __global__ void rope_multi(const T *            x,
     const int sec_w = sections.v[1] + sections.v[0];
     const int sector = (i0 / 2) % sect_dims;
 
-    double theta_base = 0.0;
+    std::conditional_t<upstream_f32, float, double> theta_base = 0.0;
     if (is_imrope) {
         if (sector % 3 == 1 && sector < 3 * sections.v[1]) {         // h
-            theta_base = rope_theta_fp64(pos[i2 + ne02 * 1], theta_scale, i0/2);
+            theta_base = (upstream_f32 ? double(pos[i2 + ne02 * 1] * powf(theta_scale, i0 / 2.0f)) : rope_theta_fp64(pos[i2 + ne02 * 1], theta_scale, i0/2));
         } else if (sector % 3 == 2 && sector < 3 * sections.v[2]) {  // w
-            theta_base = rope_theta_fp64(pos[i2 + ne02 * 2], theta_scale, i0/2);
+            theta_base = (upstream_f32 ? double(pos[i2 + ne02 * 2] * powf(theta_scale, i0 / 2.0f)) : rope_theta_fp64(pos[i2 + ne02 * 2], theta_scale, i0/2));
         } else if (sector % 3 == 0 && sector < 3 * sections.v[0]) {  // t
-            theta_base = rope_theta_fp64(pos[i2], theta_scale, i0/2);
+            theta_base = (upstream_f32 ? double(pos[i2] * powf(theta_scale, i0 / 2.0f)) : rope_theta_fp64(pos[i2], theta_scale, i0/2));
         } else {
-            theta_base = rope_theta_fp64(pos[i2 + ne02 * 3], theta_scale, i0/2);
+            theta_base = (upstream_f32 ? double(pos[i2 + ne02 * 3] * powf(theta_scale, i0 / 2.0f)) : rope_theta_fp64(pos[i2 + ne02 * 3], theta_scale, i0/2));
         }
     } else {
         if (sector < sections.v[0]) {
-            theta_base = rope_theta_fp64(pos[i2], theta_scale, i0/2);
+            theta_base = (upstream_f32 ? double(pos[i2] * powf(theta_scale, i0 / 2.0f)) : rope_theta_fp64(pos[i2], theta_scale, i0/2));
         } else if (sector >= sections.v[0] && sector < sec_w) {
-            theta_base = rope_theta_fp64(pos[i2 + ne02 * 1], theta_scale, i0/2);
+            theta_base = (upstream_f32 ? double(pos[i2 + ne02 * 1] * powf(theta_scale, i0 / 2.0f)) : rope_theta_fp64(pos[i2 + ne02 * 1], theta_scale, i0/2));
         } else if (sector >= sec_w && sector < sec_w + sections.v[2]) {
-            theta_base = rope_theta_fp64(pos[i2 + ne02 * 2], theta_scale, i0/2);
+            theta_base = (upstream_f32 ? double(pos[i2 + ne02 * 2] * powf(theta_scale, i0 / 2.0f)) : rope_theta_fp64(pos[i2 + ne02 * 2], theta_scale, i0/2));
         } else if (sector >= sec_w + sections.v[2]) {
-            theta_base = rope_theta_fp64(pos[i2 + ne02 * 3], theta_scale, i0/2);
+            theta_base = (upstream_f32 ? double(pos[i2 + ne02 * 3] * powf(theta_scale, i0 / 2.0f)) : rope_theta_fp64(pos[i2 + ne02 * 3], theta_scale, i0/2));
         }
     }
 
@@ -303,7 +303,23 @@ static __global__ void rope_multi(const T *            x,
     float cos_theta;
     float sin_theta;
 
-    rope_yarn<forward>(theta_base/freq_factor, freq_scale, corr_dims, i0, ext_factor, attn_factor, cos_theta, sin_theta);
+    if constexpr (upstream_f32) {
+        // Upstream rounds the angle in F32 and lets sinf/cosf do range reduction.
+        const float theta_extrap = (float) theta_base / freq_factor;
+        const float theta_interp = freq_scale * theta_extrap;
+        float theta = theta_interp;
+        float mscale = attn_factor;
+        if (ext_factor != 0.0f) {
+            const float ramp_mix = rope_yarn_ramp(corr_dims.v[0], corr_dims.v[1], i0) * ext_factor;
+            theta = theta_interp * (1 - ramp_mix) + theta_extrap * ramp_mix;
+            mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+        }
+        cos_theta = cosf(theta) * mscale;
+        sin_theta = sinf(theta) * mscale;
+        if (!forward) sin_theta *= -1.0f;
+    } else {
+        rope_yarn<forward>(theta_base/freq_factor, freq_scale, corr_dims, i0, ext_factor, attn_factor, cos_theta, sin_theta);
+    }
 
     const float x0 = x[ix + 0];
     const float x1 = x[ix + n_dims/2];
@@ -491,14 +507,32 @@ static void rope_multi_cuda(const T *            x,
 
     const float theta_scale = powf(freq_base, -2.0f / n_dims);
 
-    if (freq_factors == nullptr) {
-        rope_multi<forward, false, T><<<block_nums, block_dims, 0, stream>>>(
-            x, dst, ne00, ne01, ne02, s01, s02, s03, s1, s2, s3, n_dims, pos, freq_scale, ext_factor,
-            attn_factor, corr_dims, theta_scale, freq_factors, sections, is_imrope);
+    // Explicit parity mode; preserve the fork's FP64 long-context default.
+    static const bool upstream_f32 = [] {
+        const char * v = getenv("QWEN4EXP_ROPE_F32");
+        const char * ref = getenv("QWEN4EXP_UPSTREAM");
+        return (v && atoi(v) != 0) || (ref && atoi(ref) != 0);
+    }();
+    if (upstream_f32) {
+        if (freq_factors == nullptr) {
+            rope_multi<forward, false, true, T><<<block_nums, block_dims, 0, stream>>>(
+                x, dst, ne00, ne01, ne02, s01, s02, s03, s1, s2, s3, n_dims, pos, freq_scale, ext_factor,
+                attn_factor, corr_dims, theta_scale, freq_factors, sections, is_imrope);
+        } else {
+            rope_multi<forward, true, true, T><<<block_nums, block_dims, 0, stream>>>(
+                x, dst, ne00, ne01, ne02, s01, s02, s03, s1, s2, s3, n_dims, pos, freq_scale, ext_factor,
+                attn_factor, corr_dims, theta_scale, freq_factors, sections, is_imrope);
+        }
     } else {
-        rope_multi<forward, true, T><<<block_nums, block_dims, 0, stream>>>(
-            x, dst, ne00, ne01, ne02, s01, s02, s03, s1, s2, s3, n_dims, pos, freq_scale, ext_factor,
-            attn_factor, corr_dims, theta_scale, freq_factors, sections, is_imrope);
+        if (freq_factors == nullptr) {
+            rope_multi<forward, false, false, T><<<block_nums, block_dims, 0, stream>>>(
+                x, dst, ne00, ne01, ne02, s01, s02, s03, s1, s2, s3, n_dims, pos, freq_scale, ext_factor,
+                attn_factor, corr_dims, theta_scale, freq_factors, sections, is_imrope);
+        } else {
+            rope_multi<forward, true, false, T><<<block_nums, block_dims, 0, stream>>>(
+                x, dst, ne00, ne01, ne02, s01, s02, s03, s1, s2, s3, n_dims, pos, freq_scale, ext_factor,
+                attn_factor, corr_dims, theta_scale, freq_factors, sections, is_imrope);
+        }
     }
 }
 
