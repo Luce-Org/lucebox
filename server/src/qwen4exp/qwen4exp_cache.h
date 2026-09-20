@@ -37,6 +37,18 @@ struct Qwen4ExpDecodeWorkspace {
     ggml_context * ctx   = nullptr;
     ggml_gallocr_t alloc = nullptr;
     bool planned = false;
+
+    // Stable T=1 graph state (QWEN4EXP_DECODE_STABLEGRAPH=1). The graph is
+    // rebuilt only when the fixed attention-span bucket changes.
+    ggml_cgraph * gf = nullptr;
+    ggml_tensor * inp_emb = nullptr;
+    ggml_tensor * positions = nullptr;
+    ggml_tensor * mask = nullptr;
+    ggml_tensor * ple_in = nullptr;
+    ggml_tensor * kv_row = nullptr;
+    ggml_tensor * logits = nullptr;
+    int64_t kv_bucket = 0;
+    uint64_t stable_calls = 0;
 };
 
 struct Qwen4ExpCache {
@@ -86,6 +98,8 @@ bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
                            int max_ctx, ggml_type kv_type, Qwen4ExpCache & out);
 
 void free_qwen4exp_cache(Qwen4ExpCache & c);
+
+void clear_qwen4exp_decode_workspace(Qwen4ExpDecodeWorkspace & workspace);
 
 // Zero the recurrent state and conv history and reset cur_pos. KV is left
 // intact; callers that need a clean sequence also reset cur_pos themselves.
