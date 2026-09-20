@@ -1678,6 +1678,14 @@ def _run_bench_case(
     messages = case["messages"]
     max_tokens = max_tokens_override or case.get("max_tokens", 256)
 
+    # Optional experiment knobs (unset by default, so behaviour is unchanged):
+    #   BENCH_MAX_TOKENS  force the completion cap for every case
+    #   BENCH_THINKING    on/off -> chat_template_kwargs.enable_thinking
+    #   BENCH_EFFORT      low|medium|high|x-high|max|none -> reasoning.effort
+    _mt = os.environ.get("BENCH_MAX_TOKENS")
+    if _mt:
+        max_tokens = int(_mt)
+
     payload = {
         "model": model,
         "messages": messages,
@@ -1686,6 +1694,14 @@ def _run_bench_case(
         "stream": True,
         "stream_options": {"include_usage": True},
     }
+    _think = os.environ.get("BENCH_THINKING")
+    if _think is not None:
+        payload["chat_template_kwargs"] = {
+            "enable_thinking": _think.strip().lower() not in ("0", "off", "false", "no")
+        }
+    _effort = os.environ.get("BENCH_EFFORT")
+    if _effort:
+        payload["reasoning"] = {"effort": _effort}
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         base_url + "/v1/chat/completions",
