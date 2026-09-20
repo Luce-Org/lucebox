@@ -1,0 +1,1613 @@
+[server] load balancing disabled; primary=dflash target=hip:0
+[server] loading tokenizer from /home/duster/models/qwen4exp-iq4nl/Qwen3.8-Flash-Next-IQ4_NL-00001-of-00003.gguf
+[tokenizer] added_tokens: 33 special tokens
+[tokenizer] loaded vocab=248320 merges=247587 bos=248044 eos=248046 eot=248046 pre=qwen35 sp=no
+[server] creating backend...
+[backend_factory] detected arch=qwen4exp
+ggml_cuda_init: found 1 ROCm devices (Total VRAM: 98304 MiB):
+  Device 0: Radeon 8060S Graphics, gfx1151 (0x1151), VMM: no, Wave Size: 32, VRAM: 98304 MiB
+[qwen4exp] qwen4exp trunk loaded: 48 layers (36 linear + 12 full), 1222 tensors 66.24 GiB from 3 shard(s), experts=10/512 hc=4/320 ple_layers=1 ngram=3 heads_per_ngram=8 table_rows=320001536 eos=248046
+[qwen4exp] cache: 12 full + 36 linear layers, kv=f16 937.50 MiB @ ctx=40000, ssm_state 108.0 MiB, conv_state 4.2 MiB
+[server] gguf meta: general.name='Qwen3.8 Flash Next' general.architecture='qwen4exp'
+[model_card] using cards dir: /home/duster/lucebox-qwen4exp/server/build-hip/../../share/model_cards
+[model_card] probing sidecar: /home/duster/lucebox-qwen4exp/server/build-hip/../../share/model_cards/qwen3.8-flash-next.json (from general.name='Qwen3.8 Flash Next')
+[model_card] sidecar not found at /home/duster/lucebox-qwen4exp/server/build-hip/../../share/model_cards/qwen3.8-flash-next.json
+[model_card] using family fallback for arch='qwen4exp'
+[server] effort-tier ceiling = max_ctx(40000) - hard_limit_reply_budget(4096) = 35904
+
+[server] ╭─── Configuration ───────────────────────────────────╮
+[server] │  host            = 127.0.0.1
+[server] │  port            = 8895
+[server] │  model           = /home/duster/models/qwen4exp-iq4nl/Qwen3.8-Flash-Next-IQ4_NL-00001-of-00003.gguf
+[server] │  draft           = (none)
+[server] │  model_name      = dflash
+[server] │  max_ctx         = 40000
+[server] │  model_card      = family:qwen4exp
+[server] │  max_tokens      = 32768 (family:qwen4exp)
+[server] │  think_max_tokens= 28672 (family:qwen4exp)
+[server] │  hard_limit_reply= 4096 (family:qwen4exp)
+[server] │  effort tiers    = low=3584 (family:qwen4exp)
+[server] │                    medium=14336 (family:qwen4exp)
+[server] │                    high=28672 (family:qwen4exp)
+[server] │                    x-high=28672 (family:qwen4exp)
+[server] │                    max=28672 (family:qwen4exp)
+[server] │  target_device   = hip:0
+[server] │  target_split    = layer
+[server] │  draft_device    = auto:0
+[server] │  draft_exec      = local
+[server] │  peer_access     = off
+[server] │  chunk           = 16384
+[server] │  admission_wait  = 20 ms
+[server] │  fa_window       = 0
+[server] │  ddtree          = off
+[server] │  specla          = off
+[server] │  fast_rollback   = ON
+[server] │  ddtree_budget   = 22
+[server] │  prefix_cache    = 32 slots
+[server] │  agent_turn_cache= off
+[server] │  prefill_cache   = 0 slots
+[server] │  cors            = ON
+[server] │  cache_type_k    = family default
+[server] │  cache_type_v    = family default
+[server] │  pflash          = off
+[server] │  draft_residency = auto
+[server] ╰─────────────────────────────────────────────────────╯
+
+[server] level-2 force-close (marker-only, 8 chars → 1 tokens, hard_limit_reply_budget = 4096)
+[server] level-2 force-close token ids: 248069
+[pc] enabled: cap=32 family=qwen
+[ppp] enabled=1 rearrange=0 lcp_window=8 min_pin=512 max_ephemeral=256
+[server] model dflash automatic decode KV offload budget: 0 bytes
+[server] listening on http://127.0.0.1:8895
+[server] request path=/v1/chat/completions body_bytes=9837
+[server] chat chatcmpl_0000000000000000 format=chat stream=true msgs=1 tools=0 prompt_tokens=1996 max_tokens=128 max_ctx=40000 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=dflash
+[server] chat START chatcmpl_0000000000000000 format=chat stream=true prompt_tokens=1996 max_tokens=128 tools=0
+[server] chat CACHE chatcmpl_0000000000000000 restore=false slot=-1 prefix_len=0 effective_prompt=1996 pflash=false disk_policy=full disk_hit=false snap_slot=0 snap_pos=1990 full_snap_slot=-1 full_snap_pos=0
+[cuda-graph-stats] key=0x7a56215d2b20 n_nodes=5546 total=1 replay=0 capture=0 eager=1 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=1 replay=0 capture=0 eager=1 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad53800 new_data=0x7a562ad53a00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=2 replay=0 capture=0 eager=2 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=3 replay=0 capture=0 eager=3 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=4 replay=0 capture=0 eager=4 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=5 replay=0 capture=0 eager=5 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad54000 new_data=0x7a562ad54200
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=6 replay=0 capture=0 eager=6 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=7 replay=0 capture=0 eager=7 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=8 replay=0 capture=0 eager=8 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=9 replay=0 capture=0 eager=9 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=10 replay=0 capture=0 eager=10 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad54a00 new_data=0x7a562ad54c00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=11 replay=0 capture=0 eager=11 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=12 replay=0 capture=0 eager=12 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=13 replay=0 capture=0 eager=13 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=14 replay=0 capture=0 eager=14 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=15 replay=0 capture=0 eager=15 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad55400 new_data=0x7a562ad55600
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=16 replay=0 capture=0 eager=16 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad55600 new_data=0x7a562ad55800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=17 replay=0 capture=0 eager=17 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad55800 new_data=0x7a562ad55a00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=18 replay=0 capture=0 eager=18 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad55a00 new_data=0x7a562ad55c00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=19 replay=0 capture=0 eager=19 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=20 replay=0 capture=0 eager=20 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad55e00 new_data=0x7a562ad56000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=21 replay=0 capture=0 eager=21 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad56000 new_data=0x7a562ad56200
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=22 replay=0 capture=0 eager=22 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad56200 new_data=0x7a562ad56400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=23 replay=0 capture=0 eager=23 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=24 replay=0 capture=0 eager=24 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad56600 new_data=0x7a562ad56800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=25 replay=0 capture=0 eager=25 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad56800 new_data=0x7a562ad56a00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=26 replay=0 capture=0 eager=26 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad56a00 new_data=0x7a562ad56c00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=27 replay=0 capture=0 eager=27 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad56c00 new_data=0x7a562ad56e00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=28 replay=0 capture=0 eager=28 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad56e00 new_data=0x7a562ad57000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=29 replay=0 capture=0 eager=29 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=30 replay=0 capture=0 eager=30 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad57200 new_data=0x7a562ad57400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=31 replay=0 capture=0 eager=31 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad57400 new_data=0x7a562ad57600
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=32 replay=0 capture=0 eager=32 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad57600 new_data=0x7a562ad57800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=33 replay=0 capture=0 eager=33 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad57800 new_data=0x7a562ad57a00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=34 replay=0 capture=0 eager=34 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad57a00 new_data=0x7a562ad57c00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=35 replay=0 capture=0 eager=35 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad57c00 new_data=0x7a562ad57e00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=36 replay=0 capture=0 eager=36 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad57e00 new_data=0x7a562ad58000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=37 replay=0 capture=0 eager=37 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad58000 new_data=0x7a562ad58200
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=38 replay=0 capture=0 eager=38 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad58200 new_data=0x7a562ad58400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=39 replay=0 capture=0 eager=39 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=40 replay=0 capture=0 eager=40 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad58600 new_data=0x7a562ad58800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=41 replay=0 capture=0 eager=41 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad58800 new_data=0x7a562ad58a00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=42 replay=0 capture=0 eager=42 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad58a00 new_data=0x7a562ad58c00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=43 replay=0 capture=0 eager=43 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad58c00 new_data=0x7a562ad58e00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=44 replay=0 capture=0 eager=44 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad58e00 new_data=0x7a562ad59000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=45 replay=0 capture=0 eager=45 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad59000 new_data=0x7a562ad59200
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=46 replay=0 capture=0 eager=46 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad59200 new_data=0x7a562ad59400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=47 replay=0 capture=0 eager=47 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad59400 new_data=0x7a562ad59600
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=48 replay=0 capture=0 eager=48 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad59600 new_data=0x7a562ad59800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=49 replay=0 capture=0 eager=49 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=50 replay=0 capture=0 eager=50 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad59a00 new_data=0x7a562ad59c00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=51 replay=0 capture=0 eager=51 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad59c00 new_data=0x7a562ad59e00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=52 replay=0 capture=0 eager=52 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad59e00 new_data=0x7a562ad5a000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=53 replay=0 capture=0 eager=53 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5a000 new_data=0x7a562ad5a200
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=54 replay=0 capture=0 eager=54 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=55 replay=0 capture=0 eager=55 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=56 replay=0 capture=0 eager=56 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5a600 new_data=0x7a562ad5a800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=57 replay=0 capture=0 eager=57 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5a800 new_data=0x7a562ad5aa00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=58 replay=0 capture=0 eager=58 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5aa00 new_data=0x7a562ad5ac00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=59 replay=0 capture=0 eager=59 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=60 replay=0 capture=0 eager=60 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5ae00 new_data=0x7a562ad5b000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=61 replay=0 capture=0 eager=61 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5b000 new_data=0x7a562ad5b200
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=62 replay=0 capture=0 eager=62 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5b200 new_data=0x7a562ad5b400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=63 replay=0 capture=0 eager=63 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5b400 new_data=0x7a562ad5b600
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=64 replay=0 capture=0 eager=64 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5b600 new_data=0x7a562ad5b800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=65 replay=0 capture=0 eager=65 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5b800 new_data=0x7a562ad5ba00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=66 replay=0 capture=0 eager=66 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5ba00 new_data=0x7a562ad5bc00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=67 replay=0 capture=0 eager=67 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5bc00 new_data=0x7a562ad5be00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=68 replay=0 capture=0 eager=68 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5be00 new_data=0x7a562ad5c000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=69 replay=0 capture=0 eager=69 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=70 replay=0 capture=0 eager=70 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5c200 new_data=0x7a562ad5c400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=71 replay=0 capture=0 eager=71 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5c400 new_data=0x7a562ad5c600
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=72 replay=0 capture=0 eager=72 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5c600 new_data=0x7a562ad5c800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=73 replay=0 capture=0 eager=73 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5c800 new_data=0x7a562ad5ca00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=74 replay=0 capture=0 eager=74 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5ca00 new_data=0x7a562ad5cc00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=75 replay=0 capture=0 eager=75 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5cc00 new_data=0x7a562ad5ce00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=76 replay=0 capture=0 eager=76 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5ce00 new_data=0x7a562ad5d000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=77 replay=0 capture=0 eager=77 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5d000 new_data=0x7a562ad5d200
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=78 replay=0 capture=0 eager=78 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5d200 new_data=0x7a562ad5d400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=79 replay=0 capture=0 eager=79 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=80 replay=0 capture=0 eager=80 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5d600 new_data=0x7a562ad5d800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=81 replay=0 capture=0 eager=81 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5d800 new_data=0x7a562ad5da00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=82 replay=0 capture=0 eager=82 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5da00 new_data=0x7a562ad5dc00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=83 replay=0 capture=0 eager=83 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5dc00 new_data=0x7a562ad5de00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=84 replay=0 capture=0 eager=84 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5de00 new_data=0x7a562ad5e000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=85 replay=0 capture=0 eager=85 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5e000 new_data=0x7a562ad5e200
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=86 replay=0 capture=0 eager=86 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5e200 new_data=0x7a562ad5e400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=87 replay=0 capture=0 eager=87 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5e400 new_data=0x7a562ad5e600
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=88 replay=0 capture=0 eager=88 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5e600 new_data=0x7a562ad5e800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=89 replay=0 capture=0 eager=89 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=90 replay=0 capture=0 eager=90 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5ea00 new_data=0x7a562ad5ec00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=91 replay=0 capture=0 eager=91 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5ec00 new_data=0x7a562ad5ee00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=92 replay=0 capture=0 eager=92 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5ee00 new_data=0x7a562ad5f000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=93 replay=0 capture=0 eager=93 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5f000 new_data=0x7a562ad5f200
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=94 replay=0 capture=0 eager=94 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5f200 new_data=0x7a562ad5f400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=95 replay=0 capture=0 eager=95 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5f400 new_data=0x7a562ad5f600
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=96 replay=0 capture=0 eager=96 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5f600 new_data=0x7a562ad5f800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=97 replay=0 capture=0 eager=97 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5f800 new_data=0x7a562ad5fa00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=98 replay=0 capture=0 eager=98 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5fa00 new_data=0x7a562ad5fc00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=99 replay=0 capture=0 eager=99 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=100 replay=0 capture=0 eager=100 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5fe00 new_data=0x7a562ad60000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=101 replay=0 capture=0 eager=101 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad60000 new_data=0x7a562ad60200
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=102 replay=0 capture=0 eager=102 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad60200 new_data=0x7a562ad60400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=103 replay=0 capture=0 eager=103 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad60400 new_data=0x7a562ad60600
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=104 replay=0 capture=0 eager=104 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad60600 new_data=0x7a562ad60800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=105 replay=0 capture=0 eager=105 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad60800 new_data=0x7a562ad60a00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=106 replay=0 capture=0 eager=106 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad60a00 new_data=0x7a562ad60c00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=107 replay=0 capture=0 eager=107 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad60c00 new_data=0x7a562ad60e00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=108 replay=0 capture=0 eager=108 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad60e00 new_data=0x7a562ad61000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=109 replay=0 capture=0 eager=109 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=110 replay=0 capture=0 eager=110 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad61200 new_data=0x7a562ad61400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=111 replay=0 capture=0 eager=111 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad61400 new_data=0x7a562ad61600
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=112 replay=0 capture=0 eager=112 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad61600 new_data=0x7a562ad61800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=113 replay=0 capture=0 eager=113 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad61800 new_data=0x7a562ad61a00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=114 replay=0 capture=0 eager=114 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad61a00 new_data=0x7a562ad61c00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=115 replay=0 capture=0 eager=115 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad61c00 new_data=0x7a562ad61e00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=116 replay=0 capture=0 eager=116 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad61e00 new_data=0x7a562ad62000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=117 replay=0 capture=0 eager=117 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad62000 new_data=0x7a562ad62200
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=118 replay=0 capture=0 eager=118 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad62200 new_data=0x7a562ad62400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=119 replay=0 capture=0 eager=119 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=120 replay=0 capture=0 eager=120 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad62600 new_data=0x7a562ad62800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=121 replay=0 capture=0 eager=121 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad62800 new_data=0x7a562ad62a00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=122 replay=0 capture=0 eager=122 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad62a00 new_data=0x7a562ad62c00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=123 replay=0 capture=0 eager=123 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad62c00 new_data=0x7a562ad62e00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=124 replay=0 capture=0 eager=124 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad62e00 new_data=0x7a562ad63000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=125 replay=0 capture=0 eager=125 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad63000 new_data=0x7a562ad63200
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=126 replay=0 capture=0 eager=126 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad63200 new_data=0x7a562ad63400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=127 replay=0 capture=0 eager=127 enabled=1
+[fa] graph qsa=0 dense=12
+[server] chat DONE chatcmpl_0000000000000000 ok=true in=1996 effective_in=1996 out=128 7.9s 16.2 tok/s finish=length restore=false slot=-1 prefix_len=0 prefill=3.2s decode=4.6s(27.7tok/s) error=- detail=-
+[server] request path=/v1/chat/completions body_bytes=9837
+[server] chat chatcmpl_0000000000000001 format=chat stream=true msgs=1 tools=0 prompt_tokens=1996 max_tokens=128 max_ctx=40000 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=dflash
+[server] chat START chatcmpl_0000000000000001 format=chat stream=true prompt_tokens=1996 max_tokens=128 tools=0
+[server] chat CACHE chatcmpl_0000000000000001 restore=false slot=-1 prefix_len=0 effective_prompt=1996 pflash=false disk_policy=full disk_hit=false snap_slot=1 snap_pos=1990 full_snap_slot=-1 full_snap_pos=0
+[cuda-graph-stats] key=0x7a56216d1b20 n_nodes=5546 total=1 replay=0 capture=0 eager=1 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=128 replay=0 capture=0 eager=128 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad53800 new_data=0x7a562ad53a00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=129 replay=0 capture=0 eager=129 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad53a00 new_data=0x7a562ad53c00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=130 replay=0 capture=0 eager=130 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad53c00 new_data=0x7a562ad53e00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=131 replay=0 capture=0 eager=131 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad53e00 new_data=0x7a562ad54000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=132 replay=0 capture=0 eager=132 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad54000 new_data=0x7a562ad54200
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=133 replay=0 capture=0 eager=133 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad54200 new_data=0x7a562ad54400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=134 replay=0 capture=0 eager=134 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad54400 new_data=0x7a562ad54600
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=135 replay=0 capture=0 eager=135 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad54600 new_data=0x7a562ad54800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=136 replay=0 capture=0 eager=136 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=137 replay=0 capture=0 eager=137 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad54a00 new_data=0x7a562ad54c00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=138 replay=0 capture=0 eager=138 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad54c00 new_data=0x7a562ad54e00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=139 replay=0 capture=0 eager=139 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad54e00 new_data=0x7a562ad55000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=140 replay=0 capture=0 eager=140 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad55000 new_data=0x7a562ad55200
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=141 replay=0 capture=0 eager=141 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad55200 new_data=0x7a562ad55400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=142 replay=0 capture=0 eager=142 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad55400 new_data=0x7a562ad55600
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=143 replay=0 capture=0 eager=143 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad55600 new_data=0x7a562ad55800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=144 replay=0 capture=0 eager=144 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad55800 new_data=0x7a562ad55a00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=145 replay=0 capture=0 eager=145 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad55a00 new_data=0x7a562ad55c00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=146 replay=0 capture=0 eager=146 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=147 replay=0 capture=0 eager=147 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad55e00 new_data=0x7a562ad56000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=148 replay=0 capture=0 eager=148 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad56000 new_data=0x7a562ad56200
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=149 replay=0 capture=0 eager=149 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad56200 new_data=0x7a562ad56400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=150 replay=0 capture=0 eager=150 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad56400 new_data=0x7a562ad56600
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=151 replay=0 capture=0 eager=151 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad56600 new_data=0x7a562ad56800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=152 replay=0 capture=0 eager=152 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad56800 new_data=0x7a562ad56a00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=153 replay=0 capture=0 eager=153 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad56a00 new_data=0x7a562ad56c00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=154 replay=0 capture=0 eager=154 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad56c00 new_data=0x7a562ad56e00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=155 replay=0 capture=0 eager=155 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad56e00 new_data=0x7a562ad57000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=156 replay=0 capture=0 eager=156 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=157 replay=0 capture=0 eager=157 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad57200 new_data=0x7a562ad57400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=158 replay=0 capture=0 eager=158 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad57400 new_data=0x7a562ad57600
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=159 replay=0 capture=0 eager=159 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad57600 new_data=0x7a562ad57800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=160 replay=0 capture=0 eager=160 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad57800 new_data=0x7a562ad57a00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=161 replay=0 capture=0 eager=161 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad57a00 new_data=0x7a562ad57c00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=162 replay=0 capture=0 eager=162 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad57c00 new_data=0x7a562ad57e00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=163 replay=0 capture=0 eager=163 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad57e00 new_data=0x7a562ad58000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=164 replay=0 capture=0 eager=164 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad58000 new_data=0x7a562ad58200
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=165 replay=0 capture=0 eager=165 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad58200 new_data=0x7a562ad58400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=166 replay=0 capture=0 eager=166 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=167 replay=0 capture=0 eager=167 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad58600 new_data=0x7a562ad58800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=168 replay=0 capture=0 eager=168 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad58800 new_data=0x7a562ad58a00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=169 replay=0 capture=0 eager=169 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad58a00 new_data=0x7a562ad58c00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=170 replay=0 capture=0 eager=170 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad58c00 new_data=0x7a562ad58e00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=171 replay=0 capture=0 eager=171 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad58e00 new_data=0x7a562ad59000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=172 replay=0 capture=0 eager=172 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad59000 new_data=0x7a562ad59200
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=173 replay=0 capture=0 eager=173 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad59200 new_data=0x7a562ad59400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=174 replay=0 capture=0 eager=174 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad59400 new_data=0x7a562ad59600
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=175 replay=0 capture=0 eager=175 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad59600 new_data=0x7a562ad59800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=176 replay=0 capture=0 eager=176 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=177 replay=0 capture=0 eager=177 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad59a00 new_data=0x7a562ad59c00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=178 replay=0 capture=0 eager=178 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad59c00 new_data=0x7a562ad59e00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=179 replay=0 capture=0 eager=179 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad59e00 new_data=0x7a562ad5a000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=180 replay=0 capture=0 eager=180 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5a000 new_data=0x7a562ad5a200
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=181 replay=0 capture=0 eager=181 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5a200 new_data=0x7a562ad5a400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=182 replay=0 capture=0 eager=182 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5a400 new_data=0x7a562ad5a600
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=183 replay=0 capture=0 eager=183 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5a600 new_data=0x7a562ad5a800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=184 replay=0 capture=0 eager=184 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5a800 new_data=0x7a562ad5aa00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=185 replay=0 capture=0 eager=185 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5aa00 new_data=0x7a562ad5ac00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=186 replay=0 capture=0 eager=186 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=187 replay=0 capture=0 eager=187 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5ae00 new_data=0x7a562ad5b000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=188 replay=0 capture=0 eager=188 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5b000 new_data=0x7a562ad5b200
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=189 replay=0 capture=0 eager=189 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5b200 new_data=0x7a562ad5b400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=190 replay=0 capture=0 eager=190 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5b400 new_data=0x7a562ad5b600
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=191 replay=0 capture=0 eager=191 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5b600 new_data=0x7a562ad5b800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=192 replay=0 capture=0 eager=192 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5b800 new_data=0x7a562ad5ba00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=193 replay=0 capture=0 eager=193 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5ba00 new_data=0x7a562ad5bc00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=194 replay=0 capture=0 eager=194 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5bc00 new_data=0x7a562ad5be00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=195 replay=0 capture=0 eager=195 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5be00 new_data=0x7a562ad5c000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=196 replay=0 capture=0 eager=196 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=197 replay=0 capture=0 eager=197 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5c200 new_data=0x7a562ad5c400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=198 replay=0 capture=0 eager=198 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5c400 new_data=0x7a562ad5c600
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=199 replay=0 capture=0 eager=199 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5c600 new_data=0x7a562ad5c800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=200 replay=0 capture=0 eager=200 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5c800 new_data=0x7a562ad5ca00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=201 replay=0 capture=0 eager=201 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5ca00 new_data=0x7a562ad5cc00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=202 replay=0 capture=0 eager=202 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5cc00 new_data=0x7a562ad5ce00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=203 replay=0 capture=0 eager=203 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5ce00 new_data=0x7a562ad5d000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=204 replay=0 capture=0 eager=204 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5d000 new_data=0x7a562ad5d200
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=205 replay=0 capture=0 eager=205 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5d200 new_data=0x7a562ad5d400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=206 replay=0 capture=0 eager=206 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=207 replay=0 capture=0 eager=207 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5d600 new_data=0x7a562ad5d800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=208 replay=0 capture=0 eager=208 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5d800 new_data=0x7a562ad5da00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=209 replay=0 capture=0 eager=209 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5da00 new_data=0x7a562ad5dc00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=210 replay=0 capture=0 eager=210 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5dc00 new_data=0x7a562ad5de00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=211 replay=0 capture=0 eager=211 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5de00 new_data=0x7a562ad5e000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=212 replay=0 capture=0 eager=212 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5e000 new_data=0x7a562ad5e200
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=213 replay=0 capture=0 eager=213 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5e200 new_data=0x7a562ad5e400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=214 replay=0 capture=0 eager=214 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5e400 new_data=0x7a562ad5e600
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=215 replay=0 capture=0 eager=215 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5e600 new_data=0x7a562ad5e800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=216 replay=0 capture=0 eager=216 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=217 replay=0 capture=0 eager=217 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5ea00 new_data=0x7a562ad5ec00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=218 replay=0 capture=0 eager=218 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5ec00 new_data=0x7a562ad5ee00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=219 replay=0 capture=0 eager=219 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5ee00 new_data=0x7a562ad5f000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=220 replay=0 capture=0 eager=220 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5f000 new_data=0x7a562ad5f200
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=221 replay=0 capture=0 eager=221 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5f200 new_data=0x7a562ad5f400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=222 replay=0 capture=0 eager=222 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5f400 new_data=0x7a562ad5f600
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=223 replay=0 capture=0 eager=223 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5f600 new_data=0x7a562ad5f800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=224 replay=0 capture=0 eager=224 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5f800 new_data=0x7a562ad5fa00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=225 replay=0 capture=0 eager=225 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5fa00 new_data=0x7a562ad5fc00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=226 replay=0 capture=0 eager=226 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=227 replay=0 capture=0 eager=227 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad5fe00 new_data=0x7a562ad60000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=228 replay=0 capture=0 eager=228 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad60000 new_data=0x7a562ad60200
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=229 replay=0 capture=0 eager=229 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad60200 new_data=0x7a562ad60400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=230 replay=0 capture=0 eager=230 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad60400 new_data=0x7a562ad60600
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=231 replay=0 capture=0 eager=231 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad60600 new_data=0x7a562ad60800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=232 replay=0 capture=0 eager=232 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad60800 new_data=0x7a562ad60a00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=233 replay=0 capture=0 eager=233 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad60a00 new_data=0x7a562ad60c00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=234 replay=0 capture=0 eager=234 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad60c00 new_data=0x7a562ad60e00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=235 replay=0 capture=0 eager=235 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad60e00 new_data=0x7a562ad61000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=236 replay=0 capture=0 eager=236 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=237 replay=0 capture=0 eager=237 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad61200 new_data=0x7a562ad61400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=238 replay=0 capture=0 eager=238 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad61400 new_data=0x7a562ad61600
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=239 replay=0 capture=0 eager=239 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad61600 new_data=0x7a562ad61800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=240 replay=0 capture=0 eager=240 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad61800 new_data=0x7a562ad61a00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=241 replay=0 capture=0 eager=241 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad61a00 new_data=0x7a562ad61c00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=242 replay=0 capture=0 eager=242 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad61c00 new_data=0x7a562ad61e00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=243 replay=0 capture=0 eager=243 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad61e00 new_data=0x7a562ad62000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=244 replay=0 capture=0 eager=244 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad62000 new_data=0x7a562ad62200
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=245 replay=0 capture=0 eager=245 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad62200 new_data=0x7a562ad62400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=246 replay=0 capture=0 eager=246 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=247 replay=0 capture=0 eager=247 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad62600 new_data=0x7a562ad62800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=248 replay=0 capture=0 eager=248 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad62800 new_data=0x7a562ad62a00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=249 replay=0 capture=0 eager=249 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad62a00 new_data=0x7a562ad62c00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=250 replay=0 capture=0 eager=250 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad62c00 new_data=0x7a562ad62e00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=251 replay=0 capture=0 eager=251 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad62e00 new_data=0x7a562ad63000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=252 replay=0 capture=0 eager=252 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad63000 new_data=0x7a562ad63200
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=253 replay=0 capture=0 eager=253 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562ad63200 new_data=0x7a562ad63400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=254 replay=0 capture=0 eager=254 enabled=1
+[fa] graph qsa=0 dense=12
+[server] chat DONE chatcmpl_0000000000000001 ok=true in=1996 effective_in=1996 out=128 7.1s 18.0 tok/s finish=length restore=false slot=-1 prefix_len=0 prefill=2.5s decode=4.6s(27.7tok/s) error=- detail=-
+[server] request path=/v1/chat/completions body_bytes=79803
+[server] chat chatcmpl_0000000000000002 format=chat stream=true msgs=1 tools=0 prompt_tokens=16348 max_tokens=128 max_ctx=40000 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=dflash
+[server] chat START chatcmpl_0000000000000002 format=chat stream=true prompt_tokens=16348 max_tokens=128 tools=0
+[server] chat CACHE chatcmpl_0000000000000002 restore=false slot=-1 prefix_len=0 effective_prompt=16348 pflash=false disk_policy=full disk_hit=false snap_slot=2 snap_pos=16342 full_snap_slot=-1 full_snap_pos=0
+[cuda-graph-stats] key=0x7a560d7839b0 n_nodes=6614 total=1 replay=0 capture=0 eager=1 enabled=1
+[fa] graph qsa=12 dense=0
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=255 replay=0 capture=0 eager=255 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b455800 new_data=0x7a562b455a00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=256 replay=0 capture=0 eager=256 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b455a00 new_data=0x7a562b455c00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=257 replay=0 capture=0 eager=257 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b455c00 new_data=0x7a562b455e00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=258 replay=0 capture=0 eager=258 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b455e00 new_data=0x7a562b456000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=259 replay=0 capture=0 eager=259 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b456000 new_data=0x7a562b456200
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=260 replay=0 capture=0 eager=260 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b456200 new_data=0x7a562b456400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=261 replay=0 capture=0 eager=261 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b456400 new_data=0x7a562b456600
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=262 replay=0 capture=0 eager=262 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b456600 new_data=0x7a562b456800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=263 replay=0 capture=0 eager=263 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=264 replay=0 capture=0 eager=264 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b456a00 new_data=0x7a562b456c00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=265 replay=0 capture=0 eager=265 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b456c00 new_data=0x7a562b456e00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=266 replay=0 capture=0 eager=266 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b456e00 new_data=0x7a562b457000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=267 replay=0 capture=0 eager=267 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b457000 new_data=0x7a562b457200
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=268 replay=0 capture=0 eager=268 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b457200 new_data=0x7a562b457400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=269 replay=0 capture=0 eager=269 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b457400 new_data=0x7a562b457600
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=270 replay=0 capture=0 eager=270 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b457600 new_data=0x7a562b457800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=271 replay=0 capture=0 eager=271 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b457800 new_data=0x7a562b457a00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=272 replay=0 capture=0 eager=272 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b457a00 new_data=0x7a562b457c00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=273 replay=0 capture=0 eager=273 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=274 replay=0 capture=0 eager=274 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b457e00 new_data=0x7a562b458000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=275 replay=0 capture=0 eager=275 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b458000 new_data=0x7a562b458200
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=276 replay=0 capture=0 eager=276 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b458200 new_data=0x7a562b458400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=277 replay=0 capture=0 eager=277 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b458400 new_data=0x7a562b458600
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=278 replay=0 capture=0 eager=278 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b458600 new_data=0x7a562b458800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=279 replay=0 capture=0 eager=279 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b458800 new_data=0x7a562b458a00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=280 replay=0 capture=0 eager=280 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b458a00 new_data=0x7a562b458c00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=281 replay=0 capture=0 eager=281 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b458c00 new_data=0x7a562b458e00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=282 replay=0 capture=0 eager=282 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b458e00 new_data=0x7a562b459000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=283 replay=0 capture=0 eager=283 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=284 replay=0 capture=0 eager=284 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b459200 new_data=0x7a562b459400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=285 replay=0 capture=0 eager=285 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b459400 new_data=0x7a562b459600
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=286 replay=0 capture=0 eager=286 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b459600 new_data=0x7a562b459800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=287 replay=0 capture=0 eager=287 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b459800 new_data=0x7a562b459a00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=288 replay=0 capture=0 eager=288 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b459a00 new_data=0x7a562b459c00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=289 replay=0 capture=0 eager=289 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b459c00 new_data=0x7a562b459e00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=290 replay=0 capture=0 eager=290 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b459e00 new_data=0x7a562b45a000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=291 replay=0 capture=0 eager=291 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45a000 new_data=0x7a562b45a200
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=292 replay=0 capture=0 eager=292 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45a200 new_data=0x7a562b45a400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=293 replay=0 capture=0 eager=293 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=294 replay=0 capture=0 eager=294 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45a600 new_data=0x7a562b45a800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=295 replay=0 capture=0 eager=295 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45a800 new_data=0x7a562b45aa00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=296 replay=0 capture=0 eager=296 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45aa00 new_data=0x7a562b45ac00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=297 replay=0 capture=0 eager=297 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45ac00 new_data=0x7a562b45ae00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=298 replay=0 capture=0 eager=298 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45ae00 new_data=0x7a562b45b000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=299 replay=0 capture=0 eager=299 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45b000 new_data=0x7a562b45b200
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=300 replay=0 capture=0 eager=300 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45b200 new_data=0x7a562b45b400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=301 replay=0 capture=0 eager=301 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45b400 new_data=0x7a562b45b600
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=302 replay=0 capture=0 eager=302 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45b600 new_data=0x7a562b45b800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=303 replay=0 capture=0 eager=303 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=304 replay=0 capture=0 eager=304 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45ba00 new_data=0x7a562b45bc00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=305 replay=0 capture=0 eager=305 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45bc00 new_data=0x7a562b45be00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=306 replay=0 capture=0 eager=306 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45be00 new_data=0x7a562b45c000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=307 replay=0 capture=0 eager=307 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45c000 new_data=0x7a562b45c200
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=308 replay=0 capture=0 eager=308 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45c200 new_data=0x7a562b45c400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=309 replay=0 capture=0 eager=309 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45c400 new_data=0x7a562b45c600
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=310 replay=0 capture=0 eager=310 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45c600 new_data=0x7a562b45c800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=311 replay=0 capture=0 eager=311 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45c800 new_data=0x7a562b45ca00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=312 replay=0 capture=0 eager=312 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45ca00 new_data=0x7a562b45cc00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=313 replay=0 capture=0 eager=313 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=314 replay=0 capture=0 eager=314 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45ce00 new_data=0x7a562b45d000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=315 replay=0 capture=0 eager=315 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45d000 new_data=0x7a562b45d200
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=316 replay=0 capture=0 eager=316 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45d200 new_data=0x7a562b45d400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=317 replay=0 capture=0 eager=317 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45d400 new_data=0x7a562b45d600
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=318 replay=0 capture=0 eager=318 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45d600 new_data=0x7a562b45d800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=319 replay=0 capture=0 eager=319 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45d800 new_data=0x7a562b45da00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=320 replay=0 capture=0 eager=320 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45da00 new_data=0x7a562b45dc00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=321 replay=0 capture=0 eager=321 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45dc00 new_data=0x7a562b45de00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=322 replay=0 capture=0 eager=322 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45de00 new_data=0x7a562b45e000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=323 replay=0 capture=0 eager=323 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=324 replay=0 capture=0 eager=324 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45e200 new_data=0x7a562b45e400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=325 replay=0 capture=0 eager=325 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45e400 new_data=0x7a562b45e600
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=326 replay=0 capture=0 eager=326 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45e600 new_data=0x7a562b45e800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=327 replay=0 capture=0 eager=327 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45e800 new_data=0x7a562b45ea00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=328 replay=0 capture=0 eager=328 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45ea00 new_data=0x7a562b45ec00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=329 replay=0 capture=0 eager=329 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45ec00 new_data=0x7a562b45ee00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=330 replay=0 capture=0 eager=330 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45ee00 new_data=0x7a562b45f000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=331 replay=0 capture=0 eager=331 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45f000 new_data=0x7a562b45f200
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=332 replay=0 capture=0 eager=332 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45f200 new_data=0x7a562b45f400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=333 replay=0 capture=0 eager=333 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=334 replay=0 capture=0 eager=334 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45f600 new_data=0x7a562b45f800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=335 replay=0 capture=0 eager=335 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45f800 new_data=0x7a562b45fa00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=336 replay=0 capture=0 eager=336 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45fa00 new_data=0x7a562b45fc00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=337 replay=0 capture=0 eager=337 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45fc00 new_data=0x7a562b45fe00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=338 replay=0 capture=0 eager=338 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45fe00 new_data=0x7a562b460000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=339 replay=0 capture=0 eager=339 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b460000 new_data=0x7a562b460200
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=340 replay=0 capture=0 eager=340 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b460200 new_data=0x7a562b460400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=341 replay=0 capture=0 eager=341 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b460400 new_data=0x7a562b460600
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=342 replay=0 capture=0 eager=342 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b460600 new_data=0x7a562b460800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=343 replay=0 capture=0 eager=343 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=344 replay=0 capture=0 eager=344 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b460a00 new_data=0x7a562b460c00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=345 replay=0 capture=0 eager=345 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b460c00 new_data=0x7a562b460e00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=346 replay=0 capture=0 eager=346 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b460e00 new_data=0x7a562b461000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=347 replay=0 capture=0 eager=347 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b461000 new_data=0x7a562b461200
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=348 replay=0 capture=0 eager=348 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b461200 new_data=0x7a562b461400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=349 replay=0 capture=0 eager=349 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b461400 new_data=0x7a562b461600
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=350 replay=0 capture=0 eager=350 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b461600 new_data=0x7a562b461800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=351 replay=0 capture=0 eager=351 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b461800 new_data=0x7a562b461a00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=352 replay=0 capture=0 eager=352 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b461a00 new_data=0x7a562b461c00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=353 replay=0 capture=0 eager=353 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=354 replay=0 capture=0 eager=354 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b461e00 new_data=0x7a562b462000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=355 replay=0 capture=0 eager=355 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b462000 new_data=0x7a562b462200
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=356 replay=0 capture=0 eager=356 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b462200 new_data=0x7a562b462400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=357 replay=0 capture=0 eager=357 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b462400 new_data=0x7a562b462600
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=358 replay=0 capture=0 eager=358 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b462600 new_data=0x7a562b462800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=359 replay=0 capture=0 eager=359 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b462800 new_data=0x7a562b462a00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=360 replay=0 capture=0 eager=360 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b462a00 new_data=0x7a562b462c00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=361 replay=0 capture=0 eager=361 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b462c00 new_data=0x7a562b462e00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=362 replay=0 capture=0 eager=362 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b462e00 new_data=0x7a562b463000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=363 replay=0 capture=0 eager=363 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=364 replay=0 capture=0 eager=364 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b463200 new_data=0x7a562b463400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=365 replay=0 capture=0 eager=365 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b463400 new_data=0x7a562b463600
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=366 replay=0 capture=0 eager=366 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b463600 new_data=0x7a562b463800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=367 replay=0 capture=0 eager=367 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b463800 new_data=0x7a562b463a00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=368 replay=0 capture=0 eager=368 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b463a00 new_data=0x7a562b463c00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=369 replay=0 capture=0 eager=369 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b463c00 new_data=0x7a562b463e00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=370 replay=0 capture=0 eager=370 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b463e00 new_data=0x7a562b464000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=371 replay=0 capture=0 eager=371 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b464000 new_data=0x7a562b464200
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=372 replay=0 capture=0 eager=372 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b464200 new_data=0x7a562b464400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=373 replay=0 capture=0 eager=373 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=374 replay=0 capture=0 eager=374 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b464600 new_data=0x7a562b464800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=375 replay=0 capture=0 eager=375 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b464800 new_data=0x7a562b464a00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=376 replay=0 capture=0 eager=376 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b464a00 new_data=0x7a562b464c00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=377 replay=0 capture=0 eager=377 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b464c00 new_data=0x7a562b464e00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=378 replay=0 capture=0 eager=378 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b464e00 new_data=0x7a562b465000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=379 replay=0 capture=0 eager=379 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b465000 new_data=0x7a562b465200
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=380 replay=0 capture=0 eager=380 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b465200 new_data=0x7a562b465400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=381 replay=0 capture=0 eager=381 enabled=1
+[fa] graph qsa=0 dense=12
+[server] chat DONE chatcmpl_0000000000000002 ok=true in=16348 effective_in=16348 out=128 21.4s 6.0 tok/s finish=length restore=false slot=-1 prefix_len=0 prefill=16.3s decode=5.1s(25.1tok/s) error=- detail=-
+[server] request path=/v1/chat/completions body_bytes=79803
+[server] chat chatcmpl_0000000000000003 format=chat stream=true msgs=1 tools=0 prompt_tokens=16348 max_tokens=128 max_ctx=40000 thinking=false reasoning_effort=none started_in_thinking=false stops=0 model=dflash
+[server] chat START chatcmpl_0000000000000003 format=chat stream=true prompt_tokens=16348 max_tokens=128 tools=0
+[server] chat CACHE chatcmpl_0000000000000003 restore=false slot=-1 prefix_len=0 effective_prompt=16348 pflash=false disk_policy=full disk_hit=false snap_slot=3 snap_pos=16342 full_snap_slot=-1 full_snap_pos=0
+[cuda-graph-diff] key=0x7a560d7839b0 node=1/6614 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=1 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5297a00000 new_data=0x7a529aa00000
+[cuda-graph-stats] key=0x7a560d7839b0 n_nodes=6614 total=2 replay=0 capture=0 eager=2 enabled=1
+[fa] graph qsa=12 dense=0
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=382 replay=0 capture=0 eager=382 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b455800 new_data=0x7a562b455a00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=383 replay=0 capture=0 eager=383 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b455a00 new_data=0x7a562b455c00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=384 replay=0 capture=0 eager=384 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b455c00 new_data=0x7a562b455e00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=385 replay=0 capture=0 eager=385 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b455e00 new_data=0x7a562b456000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=386 replay=0 capture=0 eager=386 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b456000 new_data=0x7a562b456200
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=387 replay=0 capture=0 eager=387 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b456200 new_data=0x7a562b456400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=388 replay=0 capture=0 eager=388 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b456400 new_data=0x7a562b456600
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=389 replay=0 capture=0 eager=389 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b456600 new_data=0x7a562b456800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=390 replay=0 capture=0 eager=390 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=391 replay=0 capture=0 eager=391 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b456a00 new_data=0x7a562b456c00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=392 replay=0 capture=0 eager=392 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b456c00 new_data=0x7a562b456e00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=393 replay=0 capture=0 eager=393 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b456e00 new_data=0x7a562b457000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=394 replay=0 capture=0 eager=394 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b457000 new_data=0x7a562b457200
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=395 replay=0 capture=0 eager=395 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b457200 new_data=0x7a562b457400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=396 replay=0 capture=0 eager=396 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b457400 new_data=0x7a562b457600
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=397 replay=0 capture=0 eager=397 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b457600 new_data=0x7a562b457800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=398 replay=0 capture=0 eager=398 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b457800 new_data=0x7a562b457a00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=399 replay=0 capture=0 eager=399 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b457a00 new_data=0x7a562b457c00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=400 replay=0 capture=0 eager=400 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=401 replay=0 capture=0 eager=401 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b457e00 new_data=0x7a562b458000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=402 replay=0 capture=0 eager=402 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b458000 new_data=0x7a562b458200
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=403 replay=0 capture=0 eager=403 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b458200 new_data=0x7a562b458400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=404 replay=0 capture=0 eager=404 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b458400 new_data=0x7a562b458600
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=405 replay=0 capture=0 eager=405 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b458600 new_data=0x7a562b458800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=406 replay=0 capture=0 eager=406 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b458800 new_data=0x7a562b458a00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=407 replay=0 capture=0 eager=407 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b458a00 new_data=0x7a562b458c00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=408 replay=0 capture=0 eager=408 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b458c00 new_data=0x7a562b458e00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=409 replay=0 capture=0 eager=409 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b458e00 new_data=0x7a562b459000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=410 replay=0 capture=0 eager=410 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=411 replay=0 capture=0 eager=411 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b459200 new_data=0x7a562b459400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=412 replay=0 capture=0 eager=412 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b459400 new_data=0x7a562b459600
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=413 replay=0 capture=0 eager=413 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b459600 new_data=0x7a562b459800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=414 replay=0 capture=0 eager=414 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b459800 new_data=0x7a562b459a00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=415 replay=0 capture=0 eager=415 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b459a00 new_data=0x7a562b459c00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=416 replay=0 capture=0 eager=416 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b459c00 new_data=0x7a562b459e00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=417 replay=0 capture=0 eager=417 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b459e00 new_data=0x7a562b45a000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=418 replay=0 capture=0 eager=418 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45a000 new_data=0x7a562b45a200
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=419 replay=0 capture=0 eager=419 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45a200 new_data=0x7a562b45a400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=420 replay=0 capture=0 eager=420 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=421 replay=0 capture=0 eager=421 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45a600 new_data=0x7a562b45a800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=422 replay=0 capture=0 eager=422 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45a800 new_data=0x7a562b45aa00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=423 replay=0 capture=0 eager=423 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45aa00 new_data=0x7a562b45ac00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=424 replay=0 capture=0 eager=424 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45ac00 new_data=0x7a562b45ae00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=425 replay=0 capture=0 eager=425 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45ae00 new_data=0x7a562b45b000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=426 replay=0 capture=0 eager=426 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45b000 new_data=0x7a562b45b200
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=427 replay=0 capture=0 eager=427 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45b200 new_data=0x7a562b45b400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=428 replay=0 capture=0 eager=428 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45b400 new_data=0x7a562b45b600
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=429 replay=0 capture=0 eager=429 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45b600 new_data=0x7a562b45b800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=430 replay=0 capture=0 eager=430 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=431 replay=0 capture=0 eager=431 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45ba00 new_data=0x7a562b45bc00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=432 replay=0 capture=0 eager=432 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45bc00 new_data=0x7a562b45be00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=433 replay=0 capture=0 eager=433 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45be00 new_data=0x7a562b45c000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=434 replay=0 capture=0 eager=434 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45c000 new_data=0x7a562b45c200
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=435 replay=0 capture=0 eager=435 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45c200 new_data=0x7a562b45c400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=436 replay=0 capture=0 eager=436 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45c400 new_data=0x7a562b45c600
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=437 replay=0 capture=0 eager=437 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45c600 new_data=0x7a562b45c800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=438 replay=0 capture=0 eager=438 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45c800 new_data=0x7a562b45ca00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=439 replay=0 capture=0 eager=439 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45ca00 new_data=0x7a562b45cc00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=440 replay=0 capture=0 eager=440 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=441 replay=0 capture=0 eager=441 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45ce00 new_data=0x7a562b45d000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=442 replay=0 capture=0 eager=442 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45d000 new_data=0x7a562b45d200
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=443 replay=0 capture=0 eager=443 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45d200 new_data=0x7a562b45d400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=444 replay=0 capture=0 eager=444 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45d400 new_data=0x7a562b45d600
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=445 replay=0 capture=0 eager=445 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45d600 new_data=0x7a562b45d800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=446 replay=0 capture=0 eager=446 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45d800 new_data=0x7a562b45da00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=447 replay=0 capture=0 eager=447 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45da00 new_data=0x7a562b45dc00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=448 replay=0 capture=0 eager=448 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45dc00 new_data=0x7a562b45de00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=449 replay=0 capture=0 eager=449 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45de00 new_data=0x7a562b45e000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=450 replay=0 capture=0 eager=450 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=451 replay=0 capture=0 eager=451 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45e200 new_data=0x7a562b45e400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=452 replay=0 capture=0 eager=452 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45e400 new_data=0x7a562b45e600
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=453 replay=0 capture=0 eager=453 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45e600 new_data=0x7a562b45e800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=454 replay=0 capture=0 eager=454 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45e800 new_data=0x7a562b45ea00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=455 replay=0 capture=0 eager=455 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45ea00 new_data=0x7a562b45ec00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=456 replay=0 capture=0 eager=456 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45ec00 new_data=0x7a562b45ee00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=457 replay=0 capture=0 eager=457 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45ee00 new_data=0x7a562b45f000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=458 replay=0 capture=0 eager=458 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45f000 new_data=0x7a562b45f200
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=459 replay=0 capture=0 eager=459 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45f200 new_data=0x7a562b45f400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=460 replay=0 capture=0 eager=460 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=461 replay=0 capture=0 eager=461 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45f600 new_data=0x7a562b45f800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=462 replay=0 capture=0 eager=462 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45f800 new_data=0x7a562b45fa00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=463 replay=0 capture=0 eager=463 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45fa00 new_data=0x7a562b45fc00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=464 replay=0 capture=0 eager=464 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45fc00 new_data=0x7a562b45fe00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=465 replay=0 capture=0 eager=465 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b45fe00 new_data=0x7a562b460000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=466 replay=0 capture=0 eager=466 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b460000 new_data=0x7a562b460200
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=467 replay=0 capture=0 eager=467 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b460200 new_data=0x7a562b460400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=468 replay=0 capture=0 eager=468 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b460400 new_data=0x7a562b460600
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=469 replay=0 capture=0 eager=469 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b460600 new_data=0x7a562b460800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=470 replay=0 capture=0 eager=470 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=471 replay=0 capture=0 eager=471 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b460a00 new_data=0x7a562b460c00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=472 replay=0 capture=0 eager=472 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b460c00 new_data=0x7a562b460e00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=473 replay=0 capture=0 eager=473 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b460e00 new_data=0x7a562b461000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=474 replay=0 capture=0 eager=474 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b461000 new_data=0x7a562b461200
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=475 replay=0 capture=0 eager=475 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b461200 new_data=0x7a562b461400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=476 replay=0 capture=0 eager=476 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b461400 new_data=0x7a562b461600
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=477 replay=0 capture=0 eager=477 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b461600 new_data=0x7a562b461800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=478 replay=0 capture=0 eager=478 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b461800 new_data=0x7a562b461a00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=479 replay=0 capture=0 eager=479 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b461a00 new_data=0x7a562b461c00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=480 replay=0 capture=0 eager=480 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=481 replay=0 capture=0 eager=481 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b461e00 new_data=0x7a562b462000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=482 replay=0 capture=0 eager=482 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b462000 new_data=0x7a562b462200
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=483 replay=0 capture=0 eager=483 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b462200 new_data=0x7a562b462400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=484 replay=0 capture=0 eager=484 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b462400 new_data=0x7a562b462600
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=485 replay=0 capture=0 eager=485 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b462600 new_data=0x7a562b462800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=486 replay=0 capture=0 eager=486 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b462800 new_data=0x7a562b462a00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=487 replay=0 capture=0 eager=487 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b462a00 new_data=0x7a562b462c00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=488 replay=0 capture=0 eager=488 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b462c00 new_data=0x7a562b462e00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=489 replay=0 capture=0 eager=489 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b462e00 new_data=0x7a562b463000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=490 replay=0 capture=0 eager=490 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=491 replay=0 capture=0 eager=491 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b463200 new_data=0x7a562b463400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=492 replay=0 capture=0 eager=492 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b463400 new_data=0x7a562b463600
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=493 replay=0 capture=0 eager=493 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b463600 new_data=0x7a562b463800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=494 replay=0 capture=0 eager=494 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b463800 new_data=0x7a562b463a00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=495 replay=0 capture=0 eager=495 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b463a00 new_data=0x7a562b463c00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=496 replay=0 capture=0 eager=496 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b463c00 new_data=0x7a562b463e00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=497 replay=0 capture=0 eager=497 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b463e00 new_data=0x7a562b464000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=498 replay=0 capture=0 eager=498 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b464000 new_data=0x7a562b464200
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=499 replay=0 capture=0 eager=499 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b464200 new_data=0x7a562b464400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=500 replay=0 capture=0 eager=500 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=1/5171 name= (reshaped) op=RESHAPE extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a5628600000 new_data=0x7a5628600000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=501 replay=0 capture=0 eager=501 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b464600 new_data=0x7a562b464800
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=502 replay=0 capture=0 eager=502 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b464800 new_data=0x7a562b464a00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=503 replay=0 capture=0 eager=503 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b464a00 new_data=0x7a562b464c00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=504 replay=0 capture=0 eager=504 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b464c00 new_data=0x7a562b464e00
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=505 replay=0 capture=0 eager=505 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b464e00 new_data=0x7a562b465000
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=506 replay=0 capture=0 eager=506 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b465000 new_data=0x7a562b465200
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=507 replay=0 capture=0 eager=507 enabled=1
+[fa] graph qsa=0 dense=12
+[cuda-graph-diff] key=0x7a56216d19b0 node=437/5171 name=leaf_96 (view) op=VIEW extra=0 node_no_extra=1 src_data=0 src_ne=0 src_nb=0 old_extra=(nil) new_extra=(nil) old_data=0x7a562b465200 new_data=0x7a562b465400
+[cuda-graph-stats] key=0x7a56216d19b0 n_nodes=5171 total=508 replay=0 capture=0 eager=508 enabled=1
+[fa] graph qsa=0 dense=12
+[server] chat DONE chatcmpl_0000000000000003 ok=true in=16348 effective_in=16348 out=128 21.3s 6.0 tok/s finish=length restore=false slot=-1 prefix_len=0 prefill=16.2s decode=5.1s(25.0tok/s) error=- detail=-

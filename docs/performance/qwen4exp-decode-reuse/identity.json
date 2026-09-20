@@ -1,0 +1,90 @@
+{
+  "control": {
+    "2048": {
+      "pieces": [
+        "QUINCE-AMBER-7731"
+      ],
+      "usage": {
+        "completion_tokens": 12,
+        "prompt_tokens": 1817,
+        "timings": {
+          "agent_turn_cache_hit": false,
+          "cache_hit": false,
+          "cached_prefix_tokens": 0,
+          "decode_ms": 396.6,
+          "decode_tokens_per_sec": 30.3,
+          "effective_prompt_tokens": 1817,
+          "prefill_ms": 2816.8,
+          "prefilled_tokens": 1817
+        },
+        "total_tokens": 1829
+      }
+    },
+    "16384": {
+      "pieces": [
+        "QUINCE-AMBER-7731"
+      ],
+      "usage": {
+        "completion_tokens": 12,
+        "prompt_tokens": 14847,
+        "timings": {
+          "agent_turn_cache_hit": false,
+          "cache_hit": false,
+          "cached_prefix_tokens": 0,
+          "decode_ms": 435.8,
+          "decode_tokens_per_sec": 27.5,
+          "effective_prompt_tokens": 14847,
+          "prefill_ms": 15669.5,
+          "prefilled_tokens": 14847
+        },
+        "total_tokens": 14859
+      }
+    }
+  },
+  "candidate": {
+    "2048": {
+      "pieces": [
+        "QUINCE-AMBER-7731"
+      ],
+      "usage": {
+        "completion_tokens": 12,
+        "prompt_tokens": 1817,
+        "timings": {
+          "agent_turn_cache_hit": false,
+          "cache_hit": false,
+          "cached_prefix_tokens": 0,
+          "decode_ms": 387.8,
+          "decode_tokens_per_sec": 30.9,
+          "effective_prompt_tokens": 1817,
+          "prefill_ms": 3330.5,
+          "prefilled_tokens": 1817
+        },
+        "total_tokens": 1829
+      }
+    },
+    "16384": {
+      "pieces": [
+        "QUINCE-AMBER-7731"
+      ],
+      "usage": {
+        "completion_tokens": 12,
+        "prompt_tokens": 14847,
+        "timings": {
+          "agent_turn_cache_hit": false,
+          "cache_hit": false,
+          "cached_prefix_tokens": 0,
+          "decode_ms": 431.6,
+          "decode_tokens_per_sec": 27.8,
+          "effective_prompt_tokens": 14847,
+          "prefill_ms": 15040.5,
+          "prefilled_tokens": 14847
+        },
+        "total_tokens": 14859
+      }
+    }
+  },
+  "equal": {
+    "2048": true,
+    "16384": true
+  }
+}

@@ -750,6 +750,11 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
     // sequence, which is ~25% slower on this model.
     static const bool upstream = [] { const char * v = getenv("QWEN4EXP_UPSTREAM"); return v && std::atoi(v) != 0; }();
     static const bool hc_fused = !upstream && getenv("QWEN4EXP_HC_UNFUSED") == nullptr;
+    static const bool decode_reuse = [] {
+        const char * value = getenv("QWEN4EXP_DECODE_REUSE");
+        return !(value && std::atoi(value) == 0);
+    }();
+    const bool reuse_decode_workspace = decode_reuse && !upstream && n_tokens == 1 && !dump;
     std::vector<std::pair<ggml_tensor *, std::string>> dump_t;
     auto dump_mark = [&](ggml_tensor * t, const char * label) {
         if (dump && t) {
@@ -835,7 +840,17 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
     ip.mem_size = ggml_tensor_overhead() * 200000 +
                   ggml_graph_overhead_custom(200000, false) + (1u << 20);
     ip.no_alloc = true;
-    ggml_context * ctx = ggml_init(ip);
+    ggml_context * ctx = nullptr;
+    if (reuse_decode_workspace) {
+        if (cache.decode_workspace.ctx == nullptr) {
+            cache.decode_workspace.ctx = ggml_init(ip);
+        } else {
+            ggml_reset(cache.decode_workspace.ctx);
+        }
+        ctx = cache.decode_workspace.ctx;
+    } else {
+        ctx = ggml_init(ip);
+    }
     if (!ctx) return res;
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, 200000, false);
 
@@ -1053,14 +1068,37 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
         }
     }
 
-    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-    if (!ggml_gallocr_alloc_graph(galloc, gf)) {
-        std::fprintf(stderr, "[qwen4exp] graph alloc failed (T=%lld kv_len=%lld)\n",
-                     (long long) T, (long long) kv_len);
-        ggml_gallocr_free(galloc);
-        ggml_free(ctx);
+    ggml_gallocr_t galloc = nullptr;
+    if (reuse_decode_workspace) {
+        if (cache.decode_workspace.alloc == nullptr) {
+            cache.decode_workspace.alloc =
+                ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        }
+        galloc = cache.decode_workspace.alloc;
+    } else {
+        galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    }
+    if (!galloc) {
+        std::fprintf(stderr, "[qwen4exp] graph allocator creation failed\n");
+        if (!reuse_decode_workspace) ggml_free(ctx);
         return res;
     }
+    // T=1 graphs keep the same broad shape but advancing KV views can change
+    // lifetimes. Recompute assignments while retaining the allocator buffers;
+    // reusing the old index-wise plan produced incorrect tokens.
+    const bool reserve_ok = !reuse_decode_workspace ||
+        !cache.decode_workspace.planned || ggml_gallocr_reserve(galloc, gf);
+    if (!reserve_ok || !ggml_gallocr_alloc_graph(galloc, gf)) {
+        std::fprintf(stderr, "[qwen4exp] graph alloc failed (T=%lld kv_len=%lld)\n",
+                     (long long) T, (long long) kv_len);
+        if (reuse_decode_workspace) cache.decode_workspace.planned = false;
+        if (!reuse_decode_workspace) {
+            ggml_gallocr_free(galloc);
+            ggml_free(ctx);
+        }
+        return res;
+    }
+    if (reuse_decode_workspace) cache.decode_workspace.planned = true;
 
     if (prof) t_alloc = prof_now_ms();
     // M-RoPE sections are section-major [s*T + i]: 0..2 carry the position, 3 is zero.
@@ -1107,8 +1145,10 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
     if (prof) t_upload = prof_now_ms();
     if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "[qwen4exp] graph compute failed\n");
-        ggml_gallocr_free(galloc);
-        ggml_free(ctx);
+        if (!reuse_decode_workspace) {
+            ggml_gallocr_free(galloc);
+            ggml_free(ctx);
+        }
         return res;
     }
     cache.indexer_blocks = next_indexer_blocks;
@@ -1185,8 +1225,10 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
         }
     }
 
-    ggml_gallocr_free(galloc);
-    ggml_free(ctx);
+    if (!reuse_decode_workspace) {
+        ggml_gallocr_free(galloc);
+        ggml_free(ctx);
+    }
 
     res.ok = true;
     res.n_tokens = n_tokens;
@@ -1195,4 +1237,3 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
 }
 
 }  // namespace dflash::common
-

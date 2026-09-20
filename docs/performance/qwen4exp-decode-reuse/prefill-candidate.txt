@@ -1,0 +1,8 @@
+rep=1 pt=16366 ttft=17.64s
+rep=2 pt=16366 ttft=16.25s
+rep=3 pt=16366 ttft=15.80s
+rep=4 pt=16366 ttft=15.82s
+rep=5 pt=16366 ttft=15.78s
+rep=6 pt=16366 ttft=15.30s
+rep=7 pt=16366 ttft=15.29s
+rep=8 pt=16366 ttft=15.28s
