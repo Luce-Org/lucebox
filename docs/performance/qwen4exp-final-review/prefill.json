@@ -1,0 +1,49 @@
+{
+  "n": 8,
+  "samples": [
+    {
+      "prompt_tokens": 16366,
+      "seconds": 15.39,
+      "tokens_per_second": 1063.4178037686809
+    },
+    {
+      "prompt_tokens": 16366,
+      "seconds": 15.35,
+      "tokens_per_second": 1066.1889250814334
+    },
+    {
+      "prompt_tokens": 16366,
+      "seconds": 15.35,
+      "tokens_per_second": 1066.1889250814334
+    },
+    {
+      "prompt_tokens": 16366,
+      "seconds": 15.36,
+      "tokens_per_second": 1065.4947916666667
+    },
+    {
+      "prompt_tokens": 16366,
+      "seconds": 15.36,
+      "tokens_per_second": 1065.4947916666667
+    },
+    {
+      "prompt_tokens": 16366,
+      "seconds": 15.36,
+      "tokens_per_second": 1065.4947916666667
+    },
+    {
+      "prompt_tokens": 16366,
+      "seconds": 15.34,
+      "tokens_per_second": 1066.883963494133
+    },
+    {
+      "prompt_tokens": 16366,
+      "seconds": 15.35,
+      "tokens_per_second": 1066.1889250814334
+    }
+  ],
+  "median_tps": 1065.84185837405,
+  "min_tps": 1063.4178037686809,
+  "max_tps": 1066.883963494133,
+  "best_tps": 1066.883963494133
+}

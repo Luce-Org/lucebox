@@ -7,10 +7,9 @@
 // 512-expert top-10 MoE, per-layer n-gram embedding) into Luzebox's ggml graph
 // style.
 //
-// Single sequence (n_seqs = 1). The learned sparse indexer is built but the
-// full-attention path runs dense, which is the numerically exact computation
-// (see the strix-halo journey: sparse selection measured break-even at equal
-// quality). The PLE table is read through Qwen4ExpPleReader, never uploaded.
+// Single sequence (n_seqs = 1). Prefill can use the learned sparse indexer;
+// single-token decode uses dense attention. The PLE table is read through
+// Qwen4ExpPleReader and is never uploaded in full.
 
 #pragma once
 

@@ -1,9 +1,7 @@
 // Qwen4ExpBackend — ModelBackend for Qwen3.8-Flash-Next (arch `qwen4exp`).
 //
-// Phase-1 scaffold: the loader and weight layout are real, and the backend
-// registers so the architecture is dispatchable. The forward graph (HC, PLE,
-// 512-expert MoE, hybrid DeltaNet/full attention) lands next; generate()
-// currently fails with a clear BackendSpecific error rather than pretending.
+// Implements the single-sequence hybrid DeltaNet/full-attention graph,
+// hyper-connections, PLE, and routed MoE used by the model.
 
 #pragma once
 

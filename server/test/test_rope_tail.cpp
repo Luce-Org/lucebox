@@ -15,6 +15,7 @@
 #include "ggml.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -78,14 +79,25 @@ bool run(ggml_backend_t backend, bool tail_mode, int head_dim, int n_heads, int 
     std::vector<float> factor_values(use_factors ? rp.n_rot / 2 : 0);
     for (size_t i = 0; i < factor_values.size(); ++i) factor_values[i] = 1.0f + 0.125f * i;
     ggml_backend_buffer_t factor_buf = nullptr;
+    void * factor_data = nullptr;
     if (factors && ggml_backend_is_cpu(backend)) {
         // A separate allocation lets ASan catch reads beyond the n_rot/2 factors.
-        factor_buf = ggml_backend_cpu_buffer_from_ptr(factor_values.data(), factor_values.size() * sizeof(float));
-        ggml_backend_tensor_alloc(factor_buf, factors, factor_values.data());
+        const size_t bytes = factor_values.size() * sizeof(float);
+        const size_t alignment = ggml_backend_buft_get_alignment(ggml_backend_cpu_buffer_type());
+        const size_t aligned_bytes = (bytes + alignment - 1) / alignment * alignment;
+        factor_data = std::aligned_alloc(alignment, aligned_bytes);
+        if (!factor_data) {
+            ggml_free(ctx);
+            return false;
+        }
+        std::memcpy(factor_data, factor_values.data(), bytes);
+        factor_buf = ggml_backend_cpu_buffer_from_ptr(factor_data, bytes);
+        ggml_backend_tensor_alloc(factor_buf, factors, factor_data);
     }
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
     if (!buf) {
         ggml_backend_buffer_free(factor_buf);
+        std::free(factor_data);
         ggml_free(ctx);
         return false;
     }
@@ -102,6 +114,7 @@ bool run(ggml_backend_t backend, bool tail_mode, int head_dim, int n_heads, int 
     }
     ggml_backend_buffer_free(buf);
     ggml_backend_buffer_free(factor_buf);
+    std::free(factor_data);
     ggml_free(ctx);
     return ok;
 }

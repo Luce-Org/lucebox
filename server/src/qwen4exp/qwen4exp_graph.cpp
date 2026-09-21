@@ -213,9 +213,7 @@ static ggml_tensor * hc_norm_xn(ggml_context * c, ggml_tensor * fused,
     dmark(shared, "msh");
 
     ggml_tensor * moe_out;
-    // The fork's fused combine is the validated default (HE 10/10, ~985 t/s prefill);
-    // QWEN4EXP_MOE_UNFUSED=1 falls back to upstream's separate rounded multiply over
-    // route views, which is ~25% slower on this model.
+    // Keep the unfused form for upstream differential checks.
     static const bool moe_fused = [] {
         const char * v = getenv("QWEN4EXP_UPSTREAM");
         return !(v && std::atoi(v) != 0) && getenv("QWEN4EXP_MOE_UNFUSED") == nullptr;
@@ -468,7 +466,10 @@ static ggml_tensor * build_qsa_attn(ggml_context * c, ggml_tensor * cur,
 }
 
 static bool indexer_store_ok(ggml_tensor * indexer_k, int64_t T, int64_t pos0, int64_t ratio) {
-    static const bool use_qsa = getenv("QWEN4EXP_QSA") != nullptr;
+    static const bool use_qsa = [] {
+        const char * value = getenv("QWEN4EXP_QSA");
+        return value && std::atoi(value) != 0;
+    }();
     if (!use_qsa || T < 128 || ratio <= 1 || ratio % 4 != 0 || pos0 % ratio != 0) return false;
     const int64_t off    = pos0 / ratio;
     const int64_t nb_cur = (T + ratio - 1) / ratio;
@@ -480,7 +481,10 @@ static bool qsa_layer_ok(const Qwen4ExpWeights & w, ggml_tensor * k_cache,
                          ggml_tensor * indexer_k, int64_t T, int64_t kv_len,
                          int64_t pos0, int64_t ratio, int64_t Hq, int64_t Hk,
                          int64_t indexer_written) {
-    static const bool use_qsa = getenv("QWEN4EXP_QSA") != nullptr;
+    static const bool use_qsa = [] {
+        const char * value = getenv("QWEN4EXP_QSA");
+        return value && std::atoi(value) != 0;
+    }();
     if (!use_qsa || T < 128 || ratio <= 1) return false;
     if (w.indexer_head_size != 128 || w.indexer_n_head <= 0 ||
         w.indexer_top_k % ratio != 0) return false;
@@ -753,10 +757,8 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
     static const bool prof = getenv("QWEN4EXP_PROF") != nullptr;
     // QWEN4EXP_DUMP=1 materialises per-layer activations and prints finite/absmax/mean.
     static const bool dump = getenv("QWEN4EXP_DUMP") != nullptr;
-    // The fork's fused hc-combine-norm is the validated default (HE 10/10, ~985 t/s
-    // prefill); its 256-thread sum-of-squares reduction differs sub-ulp from
-    // upstream's ggml_rms_norm. QWEN4EXP_HC_UNFUSED=1 selects the upstream two-op
-    // sequence, which is ~25% slower on this model.
+    // The fused reduction can differ from upstream's ggml_rms_norm below one
+    // ulp; keep the unfused form for upstream differential checks.
     static const bool upstream = [] { const char * v = getenv("QWEN4EXP_UPSTREAM"); return v && std::atoi(v) != 0; }();
     static const bool hc_fused = !upstream && getenv("QWEN4EXP_HC_UNFUSED") == nullptr;
     static const bool decode_reuse = [] {
@@ -857,7 +859,6 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
     const int64_t T = n_tokens;
     const int64_t kv_len = pos0 + n_tokens;
     static const bool fa_pad256 = upstream || [] { const char * v = getenv("QWEN4EXP_FA_PAD256"); return v && std::atoi(v) != 0; }();
-    static const bool dev_mask = getenv("QWEN4EXP_KQ_MASK_DEV") != nullptr;
     // Give a new stable graph at least one full 256-token generation window.
     // The fixed mask excludes its padded tail, while the stable K/V views and
     // set_rows index keep every graph pointer and property unchanged.
@@ -954,12 +955,13 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
         ggml_set_input(kv_row);
     }
     ggml_tensor * mask = nullptr;
-    // QSA derives its own complete-block visibility; when every full layer takes it the dense [kv_len, T] mask is never read.
+    // QSA derives its own complete-block visibility. Elide the dense mask only
+    // when every full-attention layer can take that path.
     int full0 = -1;
     for (int il = 0; il < w.n_layer && full0 < 0; ++il) {
         if (w.layers[il].is_full_attention) full0 = il;
     }
-    bool qsa_all = false;
+    bool qsa_all = T > 1 && full0 >= 0;
     // Capture before advancing so the per-layer guard bounds the prefix this chunk reads.
     const int indexer_written = cache.indexer_blocks;
     // Commit only after the graph computes: a failed alloc/compute must not mark columns the kernel never wrote.
@@ -967,8 +969,15 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
     if (T > 1 && full0 >= 0) {
         const int fi = full_idx[full0];
         const int64_t ratio = full0 < (int) w.compress_ratios.size() ? w.compress_ratios[full0] : 0;
-        qsa_all = qsa_layer_ok(w, cache.attn_k[fi], cache.indexer_k[fi],
-                               T, kv_len, pos0, ratio, w.n_head, w.n_head_kv, indexer_written);
+        for (int il = 0; il < w.n_layer && qsa_all; ++il) {
+            if (!w.layers[il].is_full_attention) continue;
+            const int layer_fi = full_idx[il];
+            const int64_t layer_ratio = il < (int) w.compress_ratios.size()
+                ? w.compress_ratios[il] : 0;
+            qsa_all = qsa_layer_ok(w, cache.attn_k[layer_fi], cache.indexer_k[layer_fi],
+                                   T, kv_len, pos0, layer_ratio,
+                                   w.n_head, w.n_head_kv, indexer_written);
+        }
         if (indexer_store_ok(cache.indexer_k[fi], T, pos0, ratio)) {
             // Only extend on a contiguous chunk; a gap leaves the cache unusable so later chunks fall back to dense.
             const int off = (int) (pos0 / ratio);
@@ -977,15 +986,8 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
         }
     }
     if ((T > 1 || fa_pad256 || use_stable_graph) && !qsa_all) {
-        if (!dev_mask || use_stable_graph) {
-            mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, mask_len, T);
-            ggml_set_input(mask);
-        } else {
-            ggml_tensor * m = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, mask_len, T);
-            m = ggml_fill_inplace(ctx, m, 0.0f);
-            m = ggml_diag_mask_inf_inplace(ctx, m, (int) pos0);
-            mask = ggml_cast(ctx, m, GGML_TYPE_F16);
-        }
+        mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, mask_len, T);
+        ggml_set_input(mask);
     }
     ggml_tensor * ple_in = nullptr;
     if (has_ple) {
@@ -1046,8 +1048,8 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
         if ((upstream || last_token_ffn) && il == w.n_layer - 1 && T > 1) {
             // Upstream selects output rows before the final HC/FFN, so its
             // quantized matmuls dispatch with one token (MMV rather than MMQ).
-            // The performance opt-in reuses that selection after all attention
-            // cache writes. Earlier rows have no remaining stateful consumers.
+            // The default path reuses that selection after all attention cache
+            // writes. Earlier rows have no remaining stateful consumers.
             cur = ggml_view_2d(ctx, cur, w.n_embd, 1, cur->nb[1], (T - 1)*cur->nb[1]);
             inject = ggml_view_2d(ctx, inject, inject->ne[0], 1, inject->nb[1], (T - 1)*inject->nb[1]);
             res_hc = ggml_view_3d(ctx, res_hc, w.n_embd, w.n_hc, 1,
@@ -1126,7 +1128,7 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
         const size_t pos_need  = static_cast<size_t>(4) * T * sizeof(int32_t);
         const size_t ple_need  = has_ple
             ? static_cast<size_t>(w.ple_head_dim) * ple_heads * T * sizeof(float) : 0;
-        const size_t mask_need = (!dev_mask && mask)
+        const size_t mask_need = mask
             ? static_cast<size_t>(mask_len) * T * sizeof(ggml_fp16_t) : 0;
         ggml_backend_buffer_type_t host_buft =
             ggml_backend_dev_host_buffer_type(ggml_backend_get_device(backend));
@@ -1147,7 +1149,7 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
             ring_mask = slot_base + cache.input_ring.mask_off;
             ggml_backend_tensor_alloc(cache.input_ring.buf, inp_emb, ring_embd);
             ggml_backend_tensor_alloc(cache.input_ring.buf, positions, ring_pos);
-            if (mask && !dev_mask) {
+            if (mask) {
                 ggml_backend_tensor_alloc(cache.input_ring.buf, mask, ring_mask);
             }
             if (ple_in) {
@@ -1215,7 +1217,7 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
         pos[(size_t) (3 * T + i)] = 0;
     }
     std::vector<ggml_fp16_t> m;
-    if ((!dev_mask || use_stable_graph) && mask) {
+    if (mask) {
         const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
         const ggml_fp16_t ninf = ggml_fp32_to_fp16(-INFINITY);
         m.resize((size_t) mask_len * T);
@@ -1239,7 +1241,7 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
     } else if (ring_embd != nullptr) {
         std::memcpy(inp_emb->data, emb.data(), sizeof(float) * emb.size());
         std::memcpy(positions->data, pos.data(), sizeof(int32_t) * pos.size());
-        if (mask && !dev_mask) {
+        if (mask) {
             std::memcpy(mask->data, m.data(), sizeof(ggml_fp16_t) * m.size());
         }
         if (ple_in) {
@@ -1248,7 +1250,7 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
     } else {
         ggml_backend_tensor_set(inp_emb, emb.data(), 0, sizeof(float) * emb.size());
         ggml_backend_tensor_set(positions, pos.data(), 0, sizeof(int32_t) * pos.size());
-        if (!dev_mask && mask) {
+        if (mask) {
             ggml_backend_tensor_set(mask, m.data(), 0, sizeof(ggml_fp16_t) * m.size());
         }
         if (ple_in) {

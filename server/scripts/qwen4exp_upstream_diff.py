@@ -259,9 +259,13 @@ def calibrate(up_bin, args, env, up_data):
 
 
 def main():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    default_repo = os.path.dirname(os.path.dirname(script_dir))
+    default_llama = os.environ.get(
+        "QWEN4EXP_LLAMA_TREE", os.path.expanduser("~/llama-qwen4"))
     ap = argparse.ArgumentParser()
-    ap.add_argument("--llama-tree", default="/home/duster/llama-qwen4")
-    ap.add_argument("--repo", default="/home/duster/lucebox-qwen4exp")
+    ap.add_argument("--llama-tree", default=default_llama)
+    ap.add_argument("--repo", default=default_repo)
     ap.add_argument("--model", required=True)
     ap.add_argument("--seq", type=int, default=16)
     ap.add_argument("--reference", action="store_true",
@@ -271,7 +275,6 @@ def main():
                     help="rerun the upstream engine once (A-A) and print its run-to-run noise floor")
     args = ap.parse_args()
 
-    script_dir = os.path.dirname(os.path.abspath(__file__))
     up_bin = "/tmp/qwen4exp_nodes_up"
     build_upstream_dumper(script_dir, args.llama_tree, up_bin)
     our_bin = build_ours(args.repo)

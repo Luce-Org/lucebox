@@ -1,0 +1,1480 @@
+Test project /tmp/qwen4exp-final-review/server/build-hip
+        Start   1: test_server_unit.ServerUnitFixture.test_placement_device_rejects_gpu_index_overflow
+  1/730 Test   #1: test_server_unit.ServerUnitFixture.test_placement_device_rejects_gpu_index_overflow ....................................................   Passed    0.03 sec
+        Start   2: test_server_unit.ServerUnitFixture.test_api_format_names_are_total
+  2/730 Test   #2: test_server_unit.ServerUnitFixture.test_api_format_names_are_total .....................................................................   Passed    0.03 sec
+        Start   3: test_server_unit.ServerUnitFixture.test_pflash_scorer_uses_user_query_before_chat_suffix
+  3/730 Test   #3: test_server_unit.ServerUnitFixture.test_pflash_scorer_uses_user_query_before_chat_suffix ...............................................   Passed    0.03 sec
+        Start   4: test_server_unit.ServerUnitFixture.test_pflash_scorer_accepts_responses_string_input
+  4/730 Test   #4: test_server_unit.ServerUnitFixture.test_pflash_scorer_accepts_responses_string_input ...................................................   Passed    0.03 sec
+        Start   5: test_server_unit.ServerUnitFixture.test_pflash_query_mapping_tolerates_one_bpe_boundary_token
+  5/730 Test   #5: test_server_unit.ServerUnitFixture.test_pflash_query_mapping_tolerates_one_bpe_boundary_token ..........................................   Passed    0.03 sec
+        Start   6: test_server_unit.ServerUnitFixture.test_pflash_query_mapping_rejects_weak_punctuation_match
+  6/730 Test   #6: test_server_unit.ServerUnitFixture.test_pflash_query_mapping_rejects_weak_punctuation_match ............................................   Passed    0.03 sec
+        Start   7: test_server_unit.ServerUnitFixture.test_pflash_score_validation_counts_nan_and_inf
+  7/730 Test   #7: test_server_unit.ServerUnitFixture.test_pflash_score_validation_counts_nan_and_inf .....................................................   Passed    0.03 sec
+        Start   8: test_server_unit.ServerUnitFixture.test_qwen35_pflash_rejects_missing_query_window
+  8/730 Test   #8: test_server_unit.ServerUnitFixture.test_qwen35_pflash_rejects_missing_query_window .....................................................   Passed    0.03 sec
+        Start   9: test_server_unit.ServerUnitFixture.test_pflash_ipc_rejects_unsupported_query_widths
+  9/730 Test   #9: test_server_unit.ServerUnitFixture.test_pflash_ipc_rejects_unsupported_query_widths ....................................................   Passed    0.03 sec
+        Start  10: test_server_unit.ServerUnitFixture.test_pflash_query_capture_splits_across_chunks
+ 10/730 Test  #10: test_server_unit.ServerUnitFixture.test_pflash_query_capture_splits_across_chunks ......................................................   Passed    0.03 sec
+        Start  11: test_server_unit.ServerUnitFixture.test_daemon_io_external_cancellation_latches
+ 11/730 Test  #11: test_server_unit.ServerUnitFixture.test_daemon_io_external_cancellation_latches ........................................................   Passed    0.03 sec
+        Start  12: test_server_unit.ServerUnitFixture.test_http_peer_socket_probe_preserves_half_close
+ 12/730 Test  #12: test_server_unit.ServerUnitFixture.test_http_peer_socket_probe_preserves_half_close ....................................................   Passed    0.03 sec
+        Start  13: test_server_unit.ServerUnitFixture.test_http_heartbeat_never_waits_for_stalled_peer
+ 13/730 Test  #13: test_server_unit.ServerUnitFixture.test_http_heartbeat_never_waits_for_stalled_peer ....................................................   Passed    0.03 sec
+        Start  14: test_server_unit.ServerUnitFixture.test_http_sse_done_scanner_requires_terminal_line
+ 14/730 Test  #14: test_server_unit.ServerUnitFixture.test_http_sse_done_scanner_requires_terminal_line ...................................................   Passed    0.03 sec
+        Start  15: test_server_unit.ServerUnitFixture.test_qwen35_mrope_positions_axis_major
+ 15/730 Test  #15: test_server_unit.ServerUnitFixture.test_qwen35_mrope_positions_axis_major ..............................................................   Passed    0.03 sec
+        Start  16: test_server_unit.ServerUnitFixture.test_utf8_safe_len_ascii
+ 16/730 Test  #16: test_server_unit.ServerUnitFixture.test_utf8_safe_len_ascii ............................................................................   Passed    0.03 sec
+        Start  17: test_server_unit.ServerUnitFixture.test_utf8_safe_len_partial_2byte
+ 17/730 Test  #17: test_server_unit.ServerUnitFixture.test_utf8_safe_len_partial_2byte ....................................................................   Passed    0.04 sec
+        Start  18: test_server_unit.ServerUnitFixture.test_utf8_safe_len_partial_3byte
+ 18/730 Test  #18: test_server_unit.ServerUnitFixture.test_utf8_safe_len_partial_3byte ....................................................................   Passed    0.04 sec
+        Start  19: test_server_unit.ServerUnitFixture.test_utf8_safe_len_partial_4byte
+ 19/730 Test  #19: test_server_unit.ServerUnitFixture.test_utf8_safe_len_partial_4byte ....................................................................   Passed    0.03 sec
+        Start  20: test_server_unit.ServerUnitFixture.test_utf8_sanitize_valid
+ 20/730 Test  #20: test_server_unit.ServerUnitFixture.test_utf8_sanitize_valid ............................................................................   Passed    0.03 sec
+        Start  21: test_server_unit.ServerUnitFixture.test_utf8_sanitize_replaces_invalid
+ 21/730 Test  #21: test_server_unit.ServerUnitFixture.test_utf8_sanitize_replaces_invalid .................................................................   Passed    0.03 sec
+        Start  22: test_server_unit.ServerUnitFixture.test_utf8_sanitize_empty
+ 22/730 Test  #22: test_server_unit.ServerUnitFixture.test_utf8_sanitize_empty ............................................................................   Passed    0.03 sec
+        Start  23: test_server_unit.ServerUnitFixture.test_reasoning_basic
+ 23/730 Test  #23: test_server_unit.ServerUnitFixture.test_reasoning_basic ................................................................................   Passed    0.03 sec
+        Start  24: test_server_unit.ServerUnitFixture.test_reasoning_no_tags
+ 24/730 Test  #24: test_server_unit.ServerUnitFixture.test_reasoning_no_tags ..............................................................................   Passed    0.03 sec
+        Start  25: test_server_unit.ServerUnitFixture.test_reasoning_started_in_thinking
+ 25/730 Test  #25: test_server_unit.ServerUnitFixture.test_reasoning_started_in_thinking ..................................................................   Passed    0.04 sec
+        Start  26: test_server_unit.ServerUnitFixture.test_emitter_started_in_thinking_without_open_tag
+ 26/730 Test  #26: test_server_unit.ServerUnitFixture.test_emitter_started_in_thinking_without_open_tag ...................................................   Passed    0.03 sec
+        Start  27: test_server_unit.ServerUnitFixture.test_reasoning_unclosed_think
+ 27/730 Test  #27: test_server_unit.ServerUnitFixture.test_reasoning_unclosed_think .......................................................................   Passed    0.03 sec
+        Start  28: test_server_unit.ServerUnitFixture.test_reasoning_empty_thinking
+ 28/730 Test  #28: test_server_unit.ServerUnitFixture.test_reasoning_empty_thinking .......................................................................   Passed    0.03 sec
+        Start  29: test_server_unit.ServerUnitFixture.test_reasoning_whitespace_in_think
+ 29/730 Test  #29: test_server_unit.ServerUnitFixture.test_reasoning_whitespace_in_think ..................................................................   Passed    0.03 sec
+        Start  30: test_server_unit.ServerUnitFixture.test_reasoning_disabled
+ 30/730 Test  #30: test_server_unit.ServerUnitFixture.test_reasoning_disabled .............................................................................   Passed    0.03 sec
+        Start  31: test_server_unit.ServerUnitFixture.test_parse_qwen_multiline_xml_parameters_lf
+ 31/730 Test  #31: test_server_unit.ServerUnitFixture.test_parse_qwen_multiline_xml_parameters_lf .........................................................   Passed    0.03 sec
+        Start  32: test_server_unit.ServerUnitFixture.test_parse_qwen_multiline_xml_parameters_crlf
+ 32/730 Test  #32: test_server_unit.ServerUnitFixture.test_parse_qwen_multiline_xml_parameters_crlf .......................................................   Passed    0.04 sec
+        Start  33: test_server_unit.ServerUnitFixture.test_parse_qwen_multiline_xml_string_value
+ 33/730 Test  #33: test_server_unit.ServerUnitFixture.test_parse_qwen_multiline_xml_string_value ..........................................................   Passed    0.03 sec
+        Start  34: test_server_unit.ServerUnitFixture.test_parse_qwen_multiline_xml_parameter_at_true_eof
+ 34/730 Test  #34: test_server_unit.ServerUnitFixture.test_parse_qwen_multiline_xml_parameter_at_true_eof .................................................   Passed    0.04 sec
+        Start  35: test_server_unit.ServerUnitFixture.test_parse_tool_call_xml
+ 35/730 Test  #35: test_server_unit.ServerUnitFixture.test_parse_tool_call_xml ............................................................................   Passed    0.03 sec
+        Start  36: test_server_unit.ServerUnitFixture.test_parse_bare_function_xml
+ 36/730 Test  #36: test_server_unit.ServerUnitFixture.test_parse_bare_function_xml ........................................................................   Passed    0.04 sec
+        Start  37: test_server_unit.ServerUnitFixture.test_parse_bare_tool_name_xml_with_function_close
+ 37/730 Test  #37: test_server_unit.ServerUnitFixture.test_parse_bare_tool_name_xml_with_function_close ...................................................   Passed    0.03 sec
+        Start  38: test_server_unit.ServerUnitFixture.test_parse_repeated_bare_edit_calls_with_trailing_close
+ 38/730 Test  #38: test_server_unit.ServerUnitFixture.test_parse_repeated_bare_edit_calls_with_trailing_close .............................................   Passed    0.04 sec
+        Start  39: test_server_unit.ServerUnitFixture.test_tool_syntax_scanner_declared_name_guards
+ 39/730 Test  #39: test_server_unit.ServerUnitFixture.test_tool_syntax_scanner_declared_name_guards .......................................................   Passed    0.03 sec
+        Start  40: test_server_unit.ServerUnitFixture.test_parse_undeclared_file_tag_stays_content
+ 40/730 Test  #40: test_server_unit.ServerUnitFixture.test_parse_undeclared_file_tag_stays_content ........................................................   Passed    0.03 sec
+        Start  41: test_server_unit.ServerUnitFixture.test_parse_attribute_style_tool_xml
+ 41/730 Test  #41: test_server_unit.ServerUnitFixture.test_parse_attribute_style_tool_xml .................................................................   Passed    0.04 sec
+        Start  42: test_server_unit.ServerUnitFixture.test_parse_mixed_tool_variants_preserve_source_order
+ 42/730 Test  #42: test_server_unit.ServerUnitFixture.test_parse_mixed_tool_variants_preserve_source_order ................................................   Passed    0.03 sec
+        Start  43: test_server_unit.ServerUnitFixture.test_parse_attribute_style_tool_xml_rejects_malformed_body
+ 43/730 Test  #43: test_server_unit.ServerUnitFixture.test_parse_attribute_style_tool_xml_rejects_malformed_body ..........................................   Passed    0.03 sec
+        Start  44: test_server_unit.ServerUnitFixture.test_parse_funcname_tool_xml
+ 44/730 Test  #44: test_server_unit.ServerUnitFixture.test_parse_funcname_tool_xml ........................................................................   Passed    0.03 sec
+        Start  45: test_server_unit.ServerUnitFixture.test_parse_funcname_tool_xml_rejects_malformed_or_unknown
+ 45/730 Test  #45: test_server_unit.ServerUnitFixture.test_parse_funcname_tool_xml_rejects_malformed_or_unknown ...........................................   Passed    0.03 sec
+        Start  46: test_server_unit.ServerUnitFixture.test_parse_space_function_tool_xml
+ 46/730 Test  #46: test_server_unit.ServerUnitFixture.test_parse_space_function_tool_xml ..................................................................   Passed    0.03 sec
+        Start  47: test_server_unit.ServerUnitFixture.test_parse_space_function_tool_xml_rejects_malformed_or_unknown
+ 47/730 Test  #47: test_server_unit.ServerUnitFixture.test_parse_space_function_tool_xml_rejects_malformed_or_unknown .....................................   Passed    0.04 sec
+        Start  48: test_server_unit.ServerUnitFixture.test_parse_json_tool_call
+ 48/730 Test  #48: test_server_unit.ServerUnitFixture.test_parse_json_tool_call ...........................................................................   Passed    0.03 sec
+        Start  49: test_server_unit.ServerUnitFixture.test_parse_single_tool_bare_json_args
+ 49/730 Test  #49: test_server_unit.ServerUnitFixture.test_parse_single_tool_bare_json_args ...............................................................   Passed    0.03 sec
+        Start  50: test_server_unit.ServerUnitFixture.test_parse_single_tool_bare_json_args_allows_empty_optional_object
+ 50/730 Test  #50: test_server_unit.ServerUnitFixture.test_parse_single_tool_bare_json_args_allows_empty_optional_object ..................................   Passed    0.03 sec
+        Start  51: test_server_unit.ServerUnitFixture.test_parse_single_tool_bare_json_args_rejects_prose
+ 51/730 Test  #51: test_server_unit.ServerUnitFixture.test_parse_single_tool_bare_json_args_rejects_prose .................................................   Passed    0.03 sec
+        Start  52: test_server_unit.ServerUnitFixture.test_parse_single_tool_bare_json_args_rejects_ambiguous_tools
+ 52/730 Test  #52: test_server_unit.ServerUnitFixture.test_parse_single_tool_bare_json_args_rejects_ambiguous_tools .......................................   Passed    0.03 sec
+        Start  53: test_server_unit.ServerUnitFixture.test_parse_no_tools
+ 53/730 Test  #53: test_server_unit.ServerUnitFixture.test_parse_no_tools .................................................................................   Passed    0.03 sec
+        Start  54: test_server_unit.ServerUnitFixture.test_parse_tool_code_wrapper
+ 54/730 Test  #54: test_server_unit.ServerUnitFixture.test_parse_tool_code_wrapper ........................................................................   Passed    0.03 sec
+        Start  55: test_server_unit.ServerUnitFixture.test_parse_function_call_wrapper
+ 55/730 Test  #55: test_server_unit.ServerUnitFixture.test_parse_function_call_wrapper ....................................................................   Passed    0.03 sec
+        Start  56: test_server_unit.ServerUnitFixture.test_parse_legacy_openai_function_call_json
+ 56/730 Test  #56: test_server_unit.ServerUnitFixture.test_parse_legacy_openai_function_call_json .........................................................   Passed    0.03 sec
+        Start  57: test_server_unit.ServerUnitFixture.test_parse_deepseek_function_parameters_json
+ 57/730 Test  #57: test_server_unit.ServerUnitFixture.test_parse_deepseek_function_parameters_json ........................................................   Passed    0.03 sec
+        Start  58: test_server_unit.ServerUnitFixture.test_parse_deepseek_function_stringified_parameters_json
+ 58/730 Test  #58: test_server_unit.ServerUnitFixture.test_parse_deepseek_function_stringified_parameters_json ............................................   Passed    0.03 sec
+        Start  59: test_server_unit.ServerUnitFixture.test_parse_bare_function_json_with_parameters
+ 59/730 Test  #59: test_server_unit.ServerUnitFixture.test_parse_bare_function_json_with_parameters .......................................................   Passed    0.03 sec
+        Start  60: test_server_unit.ServerUnitFixture.test_parse_function_call_xml_invoke_name_parameters
+ 60/730 Test  #60: test_server_unit.ServerUnitFixture.test_parse_function_call_xml_invoke_name_parameters .................................................   Passed    0.03 sec
+        Start  61: test_server_unit.ServerUnitFixture.test_parse_function_call_xml_multiple_parameters
+ 61/730 Test  #61: test_server_unit.ServerUnitFixture.test_parse_function_call_xml_multiple_parameters ....................................................   Passed    0.03 sec
+        Start  62: test_server_unit.ServerUnitFixture.test_parse_tool_call_xml_invoke_name_parameters
+ 62/730 Test  #62: test_server_unit.ServerUnitFixture.test_parse_tool_call_xml_invoke_name_parameters .....................................................   Passed    0.03 sec
+        Start  63: test_server_unit.ServerUnitFixture.test_parse_legacy_tool_call_with_nested_name_tag
+ 63/730 Test  #63: test_server_unit.ServerUnitFixture.test_parse_legacy_tool_call_with_nested_name_tag ....................................................   Passed    0.03 sec
+        Start  64: test_server_unit.ServerUnitFixture.test_parse_xml_tool_call_malformed_parameters_rejected
+ 64/730 Test  #64: test_server_unit.ServerUnitFixture.test_parse_xml_tool_call_malformed_parameters_rejected ..............................................   Passed    0.03 sec
+        Start  65: test_server_unit.ServerUnitFixture.test_parse_xml_tool_call_zero_arguments_accepted
+ 65/730 Test  #65: test_server_unit.ServerUnitFixture.test_parse_xml_tool_call_zero_arguments_accepted ....................................................   Passed    0.04 sec
+        Start  66: test_server_unit.ServerUnitFixture.test_parse_xml_tool_call_invoke_envelope_attribute_style
+ 66/730 Test  #66: test_server_unit.ServerUnitFixture.test_parse_xml_tool_call_invoke_envelope_attribute_style ............................................   Passed    0.03 sec
+        Start  67: test_server_unit.ServerUnitFixture.test_parse_tool_call_xml_function_name_tag
+ 67/730 Test  #67: test_server_unit.ServerUnitFixture.test_parse_tool_call_xml_function_name_tag ..........................................................   Passed    0.04 sec
+        Start  68: test_server_unit.ServerUnitFixture.test_parse_dsml_tool_calls_with_token
+ 68/730 Test  #68: test_server_unit.ServerUnitFixture.test_parse_dsml_tool_calls_with_token ...............................................................   Passed    0.03 sec
+        Start  69: test_server_unit.ServerUnitFixture.test_parse_dsml_tool_calls_multiple_parameters
+ 69/730 Test  #69: test_server_unit.ServerUnitFixture.test_parse_dsml_tool_calls_multiple_parameters ......................................................   Passed    0.03 sec
+        Start  70: test_server_unit.ServerUnitFixture.test_parse_dsml_tool_calls_edit_tool
+ 70/730 Test  #70: test_server_unit.ServerUnitFixture.test_parse_dsml_tool_calls_edit_tool ................................................................   Passed    0.03 sec
+        Start  71: test_server_unit.ServerUnitFixture.test_render_deepseek4_chat_template_dsml_tools
+ 71/730 Test  #71: test_server_unit.ServerUnitFixture.test_render_deepseek4_chat_template_dsml_tools ......................................................   Passed    0.03 sec
+        Start  72: test_server_unit.ServerUnitFixture.test_find_tool_syntax_start_arg_key_backtracking
+ 72/730 Test  #72: test_server_unit.ServerUnitFixture.test_find_tool_syntax_start_arg_key_backtracking ....................................................   Passed    0.03 sec
+        Start  73: test_server_unit.ServerUnitFixture.test_parse_dsml_tool_calls_string_attribute_semantics
+ 73/730 Test  #73: test_server_unit.ServerUnitFixture.test_parse_dsml_tool_calls_string_attribute_semantics ...............................................   Passed    0.04 sec
+        Start  74: test_server_unit.ServerUnitFixture.test_parse_dsml_tool_calls_unclosed_invoke
+ 74/730 Test  #74: test_server_unit.ServerUnitFixture.test_parse_dsml_tool_calls_unclosed_invoke ..........................................................   Passed    0.03 sec
+        Start  75: test_server_unit.ServerUnitFixture.test_parse_dsml_tool_calls_deepseek_harness_exact_payload
+ 75/730 Test  #75: test_server_unit.ServerUnitFixture.test_parse_dsml_tool_calls_deepseek_harness_exact_payload ...........................................   Passed    0.04 sec
+        Start  76: test_server_unit.ServerUnitFixture.test_parse_dsml_tool_calls_unclosed_final_invoke_before_block_end
+ 76/730 Test  #76: test_server_unit.ServerUnitFixture.test_parse_dsml_tool_calls_unclosed_final_invoke_before_block_end ...................................   Passed    0.03 sec
+        Start  77: test_server_unit.ServerUnitFixture.test_parse_dsml_tool_calls_unclosed_invoke_with_nested_json
+ 77/730 Test  #77: test_server_unit.ServerUnitFixture.test_parse_dsml_tool_calls_unclosed_invoke_with_nested_json .........................................   Passed    0.03 sec
+        Start  78: test_server_unit.ServerUnitFixture.test_parse_dsml_tool_calls_tag_like_parameter_content
+ 78/730 Test  #78: test_server_unit.ServerUnitFixture.test_parse_dsml_tool_calls_tag_like_parameter_content ...............................................   Passed    0.03 sec
+        Start  79: test_server_unit.ServerUnitFixture.test_parse_tool_calls_prose_invoke_tag_does_not_mask_json_call
+ 79/730 Test  #79: test_server_unit.ServerUnitFixture.test_parse_tool_calls_prose_invoke_tag_does_not_mask_json_call ......................................   Passed    0.03 sec
+        Start  80: test_server_unit.ServerUnitFixture.test_parse_dsml_tool_calls_literal_invoke_in_string_parameter
+ 80/730 Test  #80: test_server_unit.ServerUnitFixture.test_parse_dsml_tool_calls_literal_invoke_in_string_parameter .......................................   Passed    0.03 sec
+        Start  81: test_server_unit.ServerUnitFixture.test_parse_dsml_tool_calls_unclosed_string_parameter_before_sibling_parameter
+ 81/730 Test  #81: test_server_unit.ServerUnitFixture.test_parse_dsml_tool_calls_unclosed_string_parameter_before_sibling_parameter .......................   Passed    0.04 sec
+        Start  82: test_server_unit.ServerUnitFixture.test_parse_dsml_tool_calls_literal_param_tag_in_string_value
+ 82/730 Test  #82: test_server_unit.ServerUnitFixture.test_parse_dsml_tool_calls_literal_param_tag_in_string_value ........................................   Passed    0.03 sec
+        Start  83: test_server_unit.ServerUnitFixture.test_parse_tool_allowed_filter
+ 83/730 Test  #83: test_server_unit.ServerUnitFixture.test_parse_tool_allowed_filter ......................................................................   Passed    0.04 sec
+        Start  84: test_server_unit.ServerUnitFixture.test_parse_call_verb_empty_args
+ 84/730 Test  #84: test_server_unit.ServerUnitFixture.test_parse_call_verb_empty_args .....................................................................   Passed    0.03 sec
+        Start  85: test_server_unit.ServerUnitFixture.test_parse_call_verb_strict_json_args
+ 85/730 Test  #85: test_server_unit.ServerUnitFixture.test_parse_call_verb_strict_json_args ...............................................................   Passed    0.04 sec
+        Start  86: test_server_unit.ServerUnitFixture.test_parse_call_verb_namespaced_verb
+ 86/730 Test  #86: test_server_unit.ServerUnitFixture.test_parse_call_verb_namespaced_verb ................................................................   Passed    0.03 sec
+        Start  87: test_server_unit.ServerUnitFixture.test_parse_call_verb_whitespace_before_key
+ 87/730 Test  #87: test_server_unit.ServerUnitFixture.test_parse_call_verb_whitespace_before_key ..........................................................   Passed    0.04 sec
+        Start  88: test_server_unit.ServerUnitFixture.test_parse_call_verb_missing_close_brace_rejected
+ 88/730 Test  #88: test_server_unit.ServerUnitFixture.test_parse_call_verb_missing_close_brace_rejected ...................................................   Passed    0.03 sec
+        Start  89: test_server_unit.ServerUnitFixture.test_parse_call_verb_narrative_without_body_rejected
+ 89/730 Test  #89: test_server_unit.ServerUnitFixture.test_parse_call_verb_narrative_without_body_rejected ................................................   Passed    0.04 sec
+        Start  90: test_server_unit.ServerUnitFixture.test_parse_call_verb_underscore_prefix
+ 90/730 Test  #90: test_server_unit.ServerUnitFixture.test_parse_call_verb_underscore_prefix ..............................................................   Passed    0.03 sec
+        Start  91: test_server_unit.ServerUnitFixture.test_parse_call_verb_nested_object_args
+ 91/730 Test  #91: test_server_unit.ServerUnitFixture.test_parse_call_verb_nested_object_args .............................................................   Passed    0.03 sec
+        Start  92: test_server_unit.ServerUnitFixture.test_parse_call_verb_back_to_back
+ 92/730 Test  #92: test_server_unit.ServerUnitFixture.test_parse_call_verb_back_to_back ...................................................................   Passed    0.03 sec
+        Start  93: test_server_unit.ServerUnitFixture.test_parse_call_verb_relaxed_single_quotes
+ 93/730 Test  #93: test_server_unit.ServerUnitFixture.test_parse_call_verb_relaxed_single_quotes ..........................................................   Passed    0.03 sec
+        Start  94: test_server_unit.ServerUnitFixture.test_parse_call_verb_glued_to_word_rejected
+ 94/730 Test  #94: test_server_unit.ServerUnitFixture.test_parse_call_verb_glued_to_word_rejected .........................................................   Passed    0.04 sec
+        Start  95: test_server_unit.ServerUnitFixture.test_parse_call_verb_does_not_hijack_inner_name
+ 95/730 Test  #95: test_server_unit.ServerUnitFixture.test_parse_call_verb_does_not_hijack_inner_name .....................................................   Passed    0.04 sec
+        Start  96: test_server_unit.ServerUnitFixture.test_parse_call_verb_single
+ 96/730 Test  #96: test_server_unit.ServerUnitFixture.test_parse_call_verb_single .........................................................................   Passed    0.03 sec
+        Start  97: test_server_unit.ServerUnitFixture.test_parse_call_verb_namespaced
+ 97/730 Test  #97: test_server_unit.ServerUnitFixture.test_parse_call_verb_namespaced .....................................................................   Passed    0.03 sec
+        Start  98: test_server_unit.ServerUnitFixture.test_parse_call_verb_snake_and_hyphen
+ 98/730 Test  #98: test_server_unit.ServerUnitFixture.test_parse_call_verb_snake_and_hyphen ...............................................................   Passed    0.03 sec
+        Start  99: test_server_unit.ServerUnitFixture.test_parse_call_verb_tool_allowed_filter
+ 99/730 Test  #99: test_server_unit.ServerUnitFixture.test_parse_call_verb_tool_allowed_filter ............................................................   Passed    0.04 sec
+        Start 100: test_server_unit.ServerUnitFixture.test_parse_call_verb_inline_prose_rejected
+100/730 Test #100: test_server_unit.ServerUnitFixture.test_parse_call_verb_inline_prose_rejected ..........................................................   Passed    0.03 sec
+        Start 101: test_server_unit.ServerUnitFixture.test_parse_call_verb_inline_prose_after_space
+101/730 Test #101: test_server_unit.ServerUnitFixture.test_parse_call_verb_inline_prose_after_space .......................................................   Passed    0.03 sec
+        Start 102: test_server_unit.ServerUnitFixture.test_parse_call_verb_malformed_args
+102/730 Test #102: test_server_unit.ServerUnitFixture.test_parse_call_verb_malformed_args .................................................................   Passed    0.03 sec
+        Start 103: test_server_unit.ServerUnitFixture.test_parse_call_verb_inner_brace_in_string
+103/730 Test #103: test_server_unit.ServerUnitFixture.test_parse_call_verb_inner_brace_in_string ..........................................................   Passed    0.04 sec
+        Start 104: test_server_unit.ServerUnitFixture.test_parse_call_verb_unquoted_keys
+104/730 Test #104: test_server_unit.ServerUnitFixture.test_parse_call_verb_unquoted_keys ..................................................................   Passed    0.03 sec
+        Start 105: test_server_unit.ServerUnitFixture.test_parse_call_verb_cleaned_text
+105/730 Test #105: test_server_unit.ServerUnitFixture.test_parse_call_verb_cleaned_text ...................................................................   Passed    0.04 sec
+        Start 106: test_server_unit.ServerUnitFixture.test_parse_call_verb_intercept_inner_json
+106/730 Test #106: test_server_unit.ServerUnitFixture.test_parse_call_verb_intercept_inner_json ...........................................................   Passed    0.03 sec
+        Start 107: test_server_unit.ServerUnitFixture.test_parse_call_verb_multiline_args
+107/730 Test #107: test_server_unit.ServerUnitFixture.test_parse_call_verb_multiline_args .................................................................   Passed    0.04 sec
+        Start 108: test_server_unit.ServerUnitFixture.test_parse_call_verb_singlequote_with_inner_doublequote
+108/730 Test #108: test_server_unit.ServerUnitFixture.test_parse_call_verb_singlequote_with_inner_doublequote .............................................   Passed    0.03 sec
+        Start 109: test_server_unit.ServerUnitFixture.test_parse_call_verb_backtick_with_inner_doublequote
+109/730 Test #109: test_server_unit.ServerUnitFixture.test_parse_call_verb_backtick_with_inner_doublequote ................................................   Passed    0.03 sec
+        Start 110: test_server_unit.ServerUnitFixture.test_emitter_reasoning_split_openai
+110/730 Test #110: test_server_unit.ServerUnitFixture.test_emitter_reasoning_split_openai .................................................................   Passed    0.03 sec
+        Start 111: test_server_unit.ServerUnitFixture.test_emitter_first_content_index_natural_close
+111/730 Test #111: test_server_unit.ServerUnitFixture.test_emitter_first_content_index_natural_close ......................................................   Passed    0.03 sec
+        Start 112: test_server_unit.ServerUnitFixture.test_emitter_first_content_index_never_closed
+112/730 Test #112: test_server_unit.ServerUnitFixture.test_emitter_first_content_index_never_closed .......................................................   Passed    0.03 sec
+        Start 113: test_server_unit.ServerUnitFixture.test_emitter_first_content_index_content_only
+113/730 Test #113: test_server_unit.ServerUnitFixture.test_emitter_first_content_index_content_only .......................................................   Passed    0.03 sec
+        Start 114: test_server_unit.ServerUnitFixture.test_emitter_first_content_index_qwen36_streaming_thinking
+114/730 Test #114: test_server_unit.ServerUnitFixture.test_emitter_first_content_index_qwen36_streaming_thinking ..........................................   Passed    0.03 sec
+        Start 115: test_server_unit.ServerUnitFixture.test_emitter_reasoning_strips_leading_think_tag
+115/730 Test #115: test_server_unit.ServerUnitFixture.test_emitter_reasoning_strips_leading_think_tag .....................................................   Passed    0.03 sec
+        Start 116: test_server_unit.ServerUnitFixture.test_emitter_content_only_no_thinking
+116/730 Test #116: test_server_unit.ServerUnitFixture.test_emitter_content_only_no_thinking ...............................................................   Passed    0.03 sec
+        Start 117: test_server_unit.ServerUnitFixture.test_emitter_tool_buffer_detection
+117/730 Test #117: test_server_unit.ServerUnitFixture.test_emitter_tool_buffer_detection ..................................................................   Passed    0.04 sec
+        Start 118: test_server_unit.ServerUnitFixture.test_emitter_function_call_tool_buffer_detection
+118/730 Test #118: test_server_unit.ServerUnitFixture.test_emitter_function_call_tool_buffer_detection ....................................................   Passed    0.03 sec
+        Start 119: test_server_unit.ServerUnitFixture.test_emitter_bare_function_json_tool_buffer_detection
+119/730 Test #119: test_server_unit.ServerUnitFixture.test_emitter_bare_function_json_tool_buffer_detection ...............................................   Passed    0.04 sec
+        Start 120: test_server_unit.ServerUnitFixture.test_emitter_named_json_with_multiple_tools
+120/730 Test #120: test_server_unit.ServerUnitFixture.test_emitter_named_json_with_multiple_tools .........................................................   Passed    0.03 sec
+        Start 121: test_server_unit.ServerUnitFixture.test_emitter_multi_tool_json_content_is_preserved
+121/730 Test #121: test_server_unit.ServerUnitFixture.test_emitter_multi_tool_json_content_is_preserved ...................................................   Passed    0.04 sec
+        Start 122: test_server_unit.ServerUnitFixture.test_emitter_anthropic_tool_use_blocks
+122/730 Test #122: test_server_unit.ServerUnitFixture.test_emitter_anthropic_tool_use_blocks ..............................................................   Passed    0.03 sec
+        Start 123: test_server_unit.ServerUnitFixture.test_emitter_single_tool_bare_json_args
+123/730 Test #123: test_server_unit.ServerUnitFixture.test_emitter_single_tool_bare_json_args .............................................................   Passed    0.03 sec
+        Start 124: test_server_unit.ServerUnitFixture.test_emitter_bare_json_args_do_not_trigger_after_content
+124/730 Test #124: test_server_unit.ServerUnitFixture.test_emitter_bare_json_args_do_not_trigger_after_content ............................................   Passed    0.03 sec
+        Start 125: test_server_unit.ServerUnitFixture.test_emitter_bare_function_tool_buffer_detection
+125/730 Test #125: test_server_unit.ServerUnitFixture.test_emitter_bare_function_tool_buffer_detection ....................................................   Passed    0.03 sec
+        Start 126: test_server_unit.ServerUnitFixture.test_emitter_attribute_style_tool_buffer_detection
+126/730 Test #126: test_server_unit.ServerUnitFixture.test_emitter_attribute_style_tool_buffer_detection ..................................................   Passed    0.03 sec
+        Start 127: test_server_unit.ServerUnitFixture.test_emitter_funcname_tool_buffer_detection
+127/730 Test #127: test_server_unit.ServerUnitFixture.test_emitter_funcname_tool_buffer_detection .........................................................   Passed    0.03 sec
+        Start 128: test_server_unit.ServerUnitFixture.test_emitter_space_function_tool_buffer_detection
+128/730 Test #128: test_server_unit.ServerUnitFixture.test_emitter_space_function_tool_buffer_detection ...................................................   Passed    0.03 sec
+        Start 129: test_server_unit.ServerUnitFixture.test_emitter_repeated_bare_edit_calls
+129/730 Test #129: test_server_unit.ServerUnitFixture.test_emitter_repeated_bare_edit_calls ...............................................................   Passed    0.03 sec
+        Start 130: test_server_unit.ServerUnitFixture.test_emitter_does_not_leak_malformed_tool_xml
+130/730 Test #130: test_server_unit.ServerUnitFixture.test_emitter_does_not_leak_malformed_tool_xml .......................................................   Passed    0.03 sec
+        Start 131: test_server_unit.ServerUnitFixture.test_emitter_parses_tool_call_missing_outer_close
+131/730 Test #131: test_server_unit.ServerUnitFixture.test_emitter_parses_tool_call_missing_outer_close ...................................................   Passed    0.03 sec
+        Start 132: test_server_unit.ServerUnitFixture.test_emitter_no_tools_keeps_tool_like_text
+132/730 Test #132: test_server_unit.ServerUnitFixture.test_emitter_no_tools_keeps_tool_like_text ..........................................................   Passed    0.03 sec
+        Start 133: test_server_unit.ServerUnitFixture.test_emitter_undeclared_file_tag_stays_content
+133/730 Test #133: test_server_unit.ServerUnitFixture.test_emitter_undeclared_file_tag_stays_content ......................................................   Passed    0.03 sec
+        Start 134: test_server_unit.ServerUnitFixture.test_emitter_anthropic_structure
+134/730 Test #134: test_server_unit.ServerUnitFixture.test_emitter_anthropic_structure ....................................................................   Passed    0.03 sec
+        Start 135: test_server_unit.ServerUnitFixture.test_emitter_responses_structure
+135/730 Test #135: test_server_unit.ServerUnitFixture.test_emitter_responses_structure ....................................................................   Passed    0.03 sec
+        Start 136: test_server_unit.ServerUnitFixture.test_emitter_responses_bare_function_tool_call
+136/730 Test #136: test_server_unit.ServerUnitFixture.test_emitter_responses_bare_function_tool_call ......................................................   Passed    0.03 sec
+        Start 137: test_server_unit.ServerUnitFixture.test_emitter_streaming_openai_has_done
+137/730 Test #137: test_server_unit.ServerUnitFixture.test_emitter_streaming_openai_has_done ..............................................................   Passed    0.03 sec
+        Start 138: test_server_unit.ServerUnitFixture.test_emitter_nonstreaming_accumulates
+138/730 Test #138: test_server_unit.ServerUnitFixture.test_emitter_nonstreaming_accumulates ...............................................................   Passed    0.03 sec
+        Start 139: test_server_unit.ServerUnitFixture.test_emitter_anthropic_thinking_blocks
+139/730 Test #139: test_server_unit.ServerUnitFixture.test_emitter_anthropic_thinking_blocks ..............................................................   Passed    0.03 sec
+        Start 140: test_server_unit.ServerUnitFixture.test_stop_sequence_basic
+140/730 Test #140: test_server_unit.ServerUnitFixture.test_stop_sequence_basic ............................................................................   Passed    0.03 sec
+        Start 141: test_server_unit.ServerUnitFixture.test_stop_sequence_mid_token
+141/730 Test #141: test_server_unit.ServerUnitFixture.test_stop_sequence_mid_token ........................................................................   Passed    0.03 sec
+        Start 142: test_server_unit.ServerUnitFixture.test_stop_sequence_multiple
+142/730 Test #142: test_server_unit.ServerUnitFixture.test_stop_sequence_multiple .........................................................................   Passed    0.03 sec
+        Start 143: test_server_unit.ServerUnitFixture.test_stop_sequence_no_match
+143/730 Test #143: test_server_unit.ServerUnitFixture.test_stop_sequence_no_match .........................................................................   Passed    0.03 sec
+        Start 144: test_server_unit.ServerUnitFixture.test_stop_sequence_empty_list
+144/730 Test #144: test_server_unit.ServerUnitFixture.test_stop_sequence_empty_list .......................................................................   Passed    0.03 sec
+        Start 145: test_server_unit.ServerUnitFixture.test_stop_sequence_finish_reason
+145/730 Test #145: test_server_unit.ServerUnitFixture.test_stop_sequence_finish_reason ....................................................................   Passed    0.04 sec
+        Start 146: test_server_unit.ServerUnitFixture.test_stop_sequence_streaming_output
+146/730 Test #146: test_server_unit.ServerUnitFixture.test_stop_sequence_streaming_output .................................................................   Passed    0.03 sec
+        Start 147: test_server_unit.ServerUnitFixture.test_stop_sequence_anthropic_format
+147/730 Test #147: test_server_unit.ServerUnitFixture.test_stop_sequence_anthropic_format .................................................................   Passed    0.03 sec
+        Start 148: test_server_unit.ServerUnitFixture.test_stop_sequence_in_reasoning_mode
+148/730 Test #148: test_server_unit.ServerUnitFixture.test_stop_sequence_in_reasoning_mode ................................................................   Passed    0.03 sec
+        Start 149: test_server_unit.ServerUnitFixture.test_stop_sequence_holdback_extends
+149/730 Test #149: test_server_unit.ServerUnitFixture.test_stop_sequence_holdback_extends .................................................................   Passed    0.03 sec
+        Start 150: test_server_unit.ServerUnitFixture.test_resolve_deepseek_chat_markers
+150/730 Test #150: test_server_unit.ServerUnitFixture.test_resolve_deepseek_chat_markers ..................................................................   Passed    0.03 sec
+        Start 151: test_server_unit.ServerUnitFixture.test_prefix_cache_reserves_disk_staging_slot
+151/730 Test #151: test_server_unit.ServerUnitFixture.test_prefix_cache_reserves_disk_staging_slot ........................................................   Passed    0.03 sec
+        Start 152: test_server_unit.ServerUnitFixture.test_prefix_cache_records_only_validated_restore
+152/730 Test #152: test_server_unit.ServerUnitFixture.test_prefix_cache_records_only_validated_restore ....................................................   Passed    0.03 sec
+        Start 153: test_server_unit.ServerUnitFixture.test_restore_invalidation_preserves_pending_pin
+153/730 Test #153: test_server_unit.ServerUnitFixture.test_restore_invalidation_preserves_pending_pin .....................................................   Passed    0.03 sec
+        Start 154: test_server_unit.ServerUnitFixture.test_prefix_cache_resident_budget_and_stall_stats
+154/730 Test #154: test_server_unit.ServerUnitFixture.test_prefix_cache_resident_budget_and_stall_stats ...................................................   Passed    0.03 sec
+        Start 155: test_server_unit.ServerUnitFixture.test_canonical_turn_matches_replay_checkpoint
+155/730 Test #155: test_server_unit.ServerUnitFixture.test_canonical_turn_matches_replay_checkpoint .......................................................   Passed    0.03 sec
+        Start 156: test_server_unit.ServerUnitFixture.test_qwen_completed_tool_turn_preserves_generation_prefix
+156/730 Test #156: test_server_unit.ServerUnitFixture.test_qwen_completed_tool_turn_preserves_generation_prefix ...........................................   Passed    0.03 sec
+        Start 157: test_server_unit.ServerUnitFixture.test_hash_prefix_deterministic
+157/730 Test #157: test_server_unit.ServerUnitFixture.test_hash_prefix_deterministic ......................................................................   Passed    0.03 sec
+        Start 158: test_server_unit.ServerUnitFixture.test_hash_prefix_different_inputs
+158/730 Test #158: test_server_unit.ServerUnitFixture.test_hash_prefix_different_inputs ...................................................................   Passed    0.03 sec
+        Start 159: test_server_unit.ServerUnitFixture.test_hash_prefix_different_lengths
+159/730 Test #159: test_server_unit.ServerUnitFixture.test_hash_prefix_different_lengths ..................................................................   Passed    0.03 sec
+        Start 160: test_server_unit.ServerUnitFixture.test_hash_prefix_empty
+160/730 Test #160: test_server_unit.ServerUnitFixture.test_hash_prefix_empty ..............................................................................   Passed    0.03 sec
+        Start 161: test_server_unit.ServerUnitFixture.test_find_boundaries_empty
+161/730 Test #161: test_server_unit.ServerUnitFixture.test_find_boundaries_empty ..........................................................................   Passed    0.03 sec
+        Start 162: test_server_unit.ServerUnitFixture.test_find_boundaries_qwen_system_first
+162/730 Test #162: test_server_unit.ServerUnitFixture.test_find_boundaries_qwen_system_first ..............................................................   Passed    0.03 sec
+        Start 163: test_server_unit.ServerUnitFixture.test_find_boundaries_qwen_user_first_quoted_system
+163/730 Test #163: test_server_unit.ServerUnitFixture.test_find_boundaries_qwen_user_first_quoted_system ..................................................   Passed    0.03 sec
+        Start 164: test_server_unit.ServerUnitFixture.test_find_boundaries_qwen_user_first
+164/730 Test #164: test_server_unit.ServerUnitFixture.test_find_boundaries_qwen_user_first ................................................................   Passed    0.03 sec
+        Start 165: test_server_unit.ServerUnitFixture.test_tool_schema_is_part_of_stable_system_boundary
+165/730 Test #165: test_server_unit.ServerUnitFixture.test_tool_schema_is_part_of_stable_system_boundary ..................................................   Passed    0.03 sec
+        Start 166: test_server_unit.ServerUnitFixture.test_find_boundaries_stray_end_msg_does_not_truncate
+166/730 Test #166: test_server_unit.ServerUnitFixture.test_find_boundaries_stray_end_msg_does_not_truncate ................................................   Passed    0.03 sec
+        Start 167: test_server_unit.ServerUnitFixture.test_find_boundaries_clean_prompt_unchanged
+167/730 Test #167: test_server_unit.ServerUnitFixture.test_find_boundaries_clean_prompt_unchanged .........................................................   Passed    0.03 sec
+        Start 168: test_server_unit.ServerUnitFixture.test_inline_snapshot_boundary_advances_past_restore
+168/730 Test #168: test_server_unit.ServerUnitFixture.test_inline_snapshot_boundary_advances_past_restore .................................................   Passed    0.03 sec
+        Start 169: test_server_unit.ServerUnitFixture.test_inline_snapshot_prefers_tools_boundary_until_restored
+169/730 Test #169: test_server_unit.ServerUnitFixture.test_inline_snapshot_prefers_tools_boundary_until_restored ..........................................   Passed    0.03 sec
+        Start 170: test_server_unit.ServerUnitFixture.test_forced_tools_pin_yields_to_deepen_after_restore
+170/730 Test #170: test_server_unit.ServerUnitFixture.test_forced_tools_pin_yields_to_deepen_after_restore ................................................   Passed    0.03 sec
+        Start 171: test_server_unit.ServerUnitFixture.test_ppp_master_toggle_gates_tools_boundary_pinning
+171/730 Test #171: test_server_unit.ServerUnitFixture.test_ppp_master_toggle_gates_tools_boundary_pinning .................................................   Passed    0.03 sec
+        Start 172: test_server_unit.ServerUnitFixture.test_ppp_lcp_and_safe_boundary
+172/730 Test #172: test_server_unit.ServerUnitFixture.test_ppp_lcp_and_safe_boundary ......................................................................   Passed    0.03 sec
+        Start 173: test_server_unit.ServerUnitFixture.test_ppp_choose_pin_end_prefers_boundary_then_mid
+173/730 Test #173: test_server_unit.ServerUnitFixture.test_ppp_choose_pin_end_prefers_boundary_then_mid ...................................................   Passed    0.03 sec
+        Start 174: test_server_unit.ServerUnitFixture.test_ppp_annotate_against_recent_ring
+174/730 Test #174: test_server_unit.ServerUnitFixture.test_ppp_annotate_against_recent_ring ...............................................................   Passed    0.03 sec
+        Start 175: test_server_unit.ServerUnitFixture.test_ppp_diff_split_finds_middle_hunk
+175/730 Test #175: test_server_unit.ServerUnitFixture.test_ppp_diff_split_finds_middle_hunk ...............................................................   Passed    0.03 sec
+        Start 176: test_server_unit.ServerUnitFixture.test_ppp_diff_rewrite_moves_volatile_after_stable
+176/730 Test #176: test_server_unit.ServerUnitFixture.test_ppp_diff_rewrite_moves_volatile_after_stable ...................................................   Passed    0.03 sec
+        Start 177: test_server_unit.ServerUnitFixture.test_ppp_diff_rewrite_noop_without_boundaries
+177/730 Test #177: test_server_unit.ServerUnitFixture.test_ppp_diff_rewrite_noop_without_boundaries .......................................................   Passed    0.03 sec
+        Start 178: test_server_unit.ServerUnitFixture.test_ppp_diff_rewrite_stops_before_next_role
+178/730 Test #178: test_server_unit.ServerUnitFixture.test_ppp_diff_rewrite_stops_before_next_role ........................................................   Passed    0.03 sec
+        Start 179: test_server_unit.ServerUnitFixture.test_ppp_tools_system_head_end
+179/730 Test #179: test_server_unit.ServerUnitFixture.test_ppp_tools_system_head_end ......................................................................   Passed    0.03 sec
+        Start 180: test_server_unit.ServerUnitFixture.test_ppp_split_and_rearrange_ephemeral_tail
+180/730 Test #180: test_server_unit.ServerUnitFixture.test_ppp_split_and_rearrange_ephemeral_tail .........................................................   Passed    0.03 sec
+        Start 181: test_server_unit.ServerUnitFixture.test_evict_empty_is_zero
+181/730 Test #181: test_server_unit.ServerUnitFixture.test_evict_empty_is_zero ............................................................................   Passed    0.03 sec
+        Start 182: test_server_unit.ServerUnitFixture.test_evict_single_is_zero
+182/730 Test #182: test_server_unit.ServerUnitFixture.test_evict_single_is_zero ...........................................................................   Passed    0.03 sec
+        Start 183: test_server_unit.ServerUnitFixture.test_evict_chain_keeps_ancestors
+183/730 Test #183: test_server_unit.ServerUnitFixture.test_evict_chain_keeps_ancestors ....................................................................   Passed    0.03 sec
+        Start 184: test_server_unit.ServerUnitFixture.test_evict_unrelated_falls_back_to_lru
+184/730 Test #184: test_server_unit.ServerUnitFixture.test_evict_unrelated_falls_back_to_lru ..............................................................   Passed    0.03 sec
+        Start 185: test_server_unit.ServerUnitFixture.test_evict_branch_spares_shared_root
+185/730 Test #185: test_server_unit.ServerUnitFixture.test_evict_branch_spares_shared_root ................................................................   Passed    0.03 sec
+        Start 186: test_server_unit.ServerUnitFixture.test_evict_skips_protected_leaf
+186/730 Test #186: test_server_unit.ServerUnitFixture.test_evict_skips_protected_leaf .....................................................................   Passed    0.03 sec
+        Start 187: test_server_unit.ServerUnitFixture.test_evict_all_protected_falls_back
+187/730 Test #187: test_server_unit.ServerUnitFixture.test_evict_all_protected_falls_back .................................................................   Passed    0.03 sec
+        Start 188: test_server_unit.ServerUnitFixture.test_slide_evicts_ancestor_not_restore_source
+188/730 Test #188: test_server_unit.ServerUnitFixture.test_slide_evicts_ancestor_not_restore_source .......................................................   Passed    0.03 sec
+        Start 189: test_server_unit.ServerUnitFixture.test_slide_restore_source_never_evicted
+189/730 Test #189: test_server_unit.ServerUnitFixture.test_slide_restore_source_never_evicted .............................................................   Passed    0.03 sec
+        Start 190: test_server_unit.ServerUnitFixture.test_slide_protected_pin_never_evicted
+190/730 Test #190: test_server_unit.ServerUnitFixture.test_slide_protected_pin_never_evicted ..............................................................   Passed    0.03 sec
+        Start 191: test_server_unit.ServerUnitFixture.test_slide_branching_oldest_leaf_unchanged
+191/730 Test #191: test_server_unit.ServerUnitFixture.test_slide_branching_oldest_leaf_unchanged ..........................................................   Passed    0.03 sec
+        Start 192: test_server_unit.ServerUnitFixture.test_slide_free_slot_skips_restore_source
+192/730 Test #192: test_server_unit.ServerUnitFixture.test_slide_free_slot_skips_restore_source ...........................................................   Passed    0.03 sec
+        Start 193: test_server_unit.ServerUnitFixture.test_pflash_config_defaults
+193/730 Test #193: test_server_unit.ServerUnitFixture.test_pflash_config_defaults .........................................................................   Passed    0.03 sec
+        Start 194: test_server_unit.ServerUnitFixture.test_concurrent_status_is_aggregate_only
+194/730 Test #194: test_server_unit.ServerUnitFixture.test_concurrent_status_is_aggregate_only ............................................................   Passed    0.04 sec
+        Start 195: test_server_unit.ServerUnitFixture.test_pflash_config_modes
+195/730 Test #195: test_server_unit.ServerUnitFixture.test_pflash_config_modes ............................................................................   Passed    0.03 sec
+        Start 196: test_server_unit.ServerUnitFixture.test_pflash_compress_request_struct
+196/730 Test #196: test_server_unit.ServerUnitFixture.test_pflash_compress_request_struct .................................................................   Passed    0.03 sec
+        Start 197: test_server_unit.ServerUnitFixture.test_pflash_compress_result_defaults
+197/730 Test #197: test_server_unit.ServerUnitFixture.test_pflash_compress_result_defaults ................................................................   Passed    0.03 sec
+        Start 198: test_server_unit.ServerUnitFixture.test_pflash_threshold_auto_mode
+198/730 Test #198: test_server_unit.ServerUnitFixture.test_pflash_threshold_auto_mode .....................................................................   Passed    0.03 sec
+        Start 199: test_server_unit.ServerUnitFixture.test_pflash_threshold_always_mode
+199/730 Test #199: test_server_unit.ServerUnitFixture.test_pflash_threshold_always_mode ...................................................................   Passed    0.03 sec
+        Start 200: test_server_unit.ServerUnitFixture.test_pflash_config_upstream_defaults
+200/730 Test #200: test_server_unit.ServerUnitFixture.test_pflash_config_upstream_defaults ................................................................   Passed    0.03 sec
+        Start 201: test_server_unit.ServerUnitFixture.test_pflash_curve_interpolation
+201/730 Test #201: test_server_unit.ServerUnitFixture.test_pflash_curve_interpolation .....................................................................   Passed    0.03 sec
+        Start 202: test_server_unit.ServerUnitFixture.test_pflash_curve_empty_uses_flat
+202/730 Test #202: test_server_unit.ServerUnitFixture.test_pflash_curve_empty_uses_flat ...................................................................   Passed    0.03 sec
+        Start 203: test_server_unit.ServerUnitFixture.test_pflash_upstream_proxy_config
+203/730 Test #203: test_server_unit.ServerUnitFixture.test_pflash_upstream_proxy_config ...................................................................   Passed    0.03 sec
+        Start 204: test_server_unit.ServerUnitFixture.test_pflash_raw_body_preserved
+204/730 Test #204: test_server_unit.ServerUnitFixture.test_pflash_raw_body_preserved ......................................................................   Passed    0.03 sec
+        Start 205: test_server_unit.ServerUnitFixture.test_parse_request_sampler_applies_defaults_and_overrides
+205/730 Test #205: test_server_unit.ServerUnitFixture.test_parse_request_sampler_applies_defaults_and_overrides ...........................................   Passed    0.03 sec
+        Start 206: test_server_unit.ServerUnitFixture.test_require_messages_array_rejects_invalid
+206/730 Test #206: test_server_unit.ServerUnitFixture.test_require_messages_array_rejects_invalid .........................................................   Passed    0.03 sec
+        Start 207: test_server_unit.ServerUnitFixture.test_max_output_alias_precedence_ignores_shadowed_invalid_value
+207/730 Test #207: test_server_unit.ServerUnitFixture.test_max_output_alias_precedence_ignores_shadowed_invalid_value .....................................   Passed    0.03 sec
+        Start 208: test_server_unit.ServerUnitFixture.test_deepseek_reasoning_effort_aliases_and_budgets
+208/730 Test #208: test_server_unit.ServerUnitFixture.test_deepseek_reasoning_effort_aliases_and_budgets ..................................................   Passed    0.03 sec
+        Start 209: test_server_unit.ServerUnitFixture.test_deepseek_reasoning_request_precedence_and_toggles
+209/730 Test #209: test_server_unit.ServerUnitFixture.test_deepseek_reasoning_request_precedence_and_toggles ..............................................   Passed    0.03 sec
+        Start 210: test_server_unit.ServerUnitFixture.test_qwen_template_toggles_remain_renderer_only
+210/730 Test #210: test_server_unit.ServerUnitFixture.test_qwen_template_toggles_remain_renderer_only .....................................................   Passed    0.03 sec
+        Start 211: test_server_unit.ServerUnitFixture.test_pflash_placement_same_backend_local
+211/730 Test #211: test_server_unit.ServerUnitFixture.test_pflash_placement_same_backend_local ............................................................   Passed    0.03 sec
+        Start 212: test_server_unit.ServerUnitFixture.test_pflash_placement_mixed_backend_remote
+212/730 Test #212: test_server_unit.ServerUnitFixture.test_pflash_placement_mixed_backend_remote ..........................................................   Passed    0.03 sec
+        Start 213: test_server_unit.ServerUnitFixture.test_pflash_placement_auto_draft_follows_target
+213/730 Test #213: test_server_unit.ServerUnitFixture.test_pflash_placement_auto_draft_follows_target .....................................................   Passed    0.03 sec
+        Start 214: test_server_unit.ServerUnitFixture.test_pflash_placement_disabled_never_remote
+214/730 Test #214: test_server_unit.ServerUnitFixture.test_pflash_placement_disabled_never_remote .........................................................   Passed    0.03 sec
+        Start 215: test_server_unit.ServerUnitFixture.test_pflash_placement_usage_gate
+215/730 Test #215: test_server_unit.ServerUnitFixture.test_pflash_placement_usage_gate ....................................................................   Passed    0.03 sec
+        Start 216: test_server_unit.ServerUnitFixture.test_draft_residency_parse
+216/730 Test #216: test_server_unit.ServerUnitFixture.test_draft_residency_parse ..........................................................................   Passed    0.03 sec
+        Start 217: test_server_unit.ServerUnitFixture.test_draft_residency_pflash_auto
+217/730 Test #217: test_server_unit.ServerUnitFixture.test_draft_residency_pflash_auto ....................................................................   Passed    0.03 sec
+        Start 218: test_server_unit.ServerUnitFixture.test_draft_residency_dflash_auto_and_request_scoped
+218/730 Test #218: test_server_unit.ServerUnitFixture.test_draft_residency_dflash_auto_and_request_scoped .................................................   Passed    0.03 sec
+        Start 219: test_server_unit.ServerUnitFixture.test_deepseek4_render_system_only_gen_prompt
+219/730 Test #219: test_server_unit.ServerUnitFixture.test_deepseek4_render_system_only_gen_prompt ........................................................   Passed    0.03 sec
+        Start 220: test_server_unit.ServerUnitFixture.test_deepseek4_render_empty_chat_gen_prompt
+220/730 Test #220: test_server_unit.ServerUnitFixture.test_deepseek4_render_empty_chat_gen_prompt .........................................................   Passed    0.03 sec
+        Start 221: test_server_unit.ServerUnitFixture.test_deepseek4_render_reasoning_effort_prefixes
+221/730 Test #221: test_server_unit.ServerUnitFixture.test_deepseek4_render_reasoning_effort_prefixes .....................................................   Passed    0.03 sec
+        Start 222: test_server_unit.ServerUnitFixture.test_bailingmoe3_render_official_role_format
+222/730 Test #222: test_server_unit.ServerUnitFixture.test_bailingmoe3_render_official_role_format ........................................................   Passed    0.03 sec
+        Start 223: test_server_unit.ServerUnitFixture.test_bailingmoe3_render_thinking_and_tools
+223/730 Test #223: test_server_unit.ServerUnitFixture.test_bailingmoe3_render_thinking_and_tools ..........................................................   Passed    0.03 sec
+        Start 224: test_server_unit.ServerUnitFixture.test_bailingmoe3_request_overrides_system_thinking
+224/730 Test #224: test_server_unit.ServerUnitFixture.test_bailingmoe3_request_overrides_system_thinking ..................................................   Passed    0.03 sec
+        Start 225: test_server_unit.ServerUnitFixture.test_emitter_suppresses_undeclared_bailing_tool_block
+225/730 Test #225: test_server_unit.ServerUnitFixture.test_emitter_suppresses_undeclared_bailing_tool_block ...............................................   Passed    0.03 sec
+        Start 226: test_server_unit.ServerUnitFixture.test_bailingmoe3_router_builds_group_mask
+226/730 Test #226: test_server_unit.ServerUnitFixture.test_bailingmoe3_router_builds_group_mask ...........................................................   Passed    0.03 sec
+        Start 227: test_server_unit.ServerUnitFixture.test_jinja_render_basic
+227/730 Test #227: test_server_unit.ServerUnitFixture.test_jinja_render_basic .............................................................................   Passed    0.03 sec
+        Start 228: test_server_unit.ServerUnitFixture.test_jinja_render_no_gen_prompt
+228/730 Test #228: test_server_unit.ServerUnitFixture.test_jinja_render_no_gen_prompt .....................................................................   Passed    0.03 sec
+        Start 229: test_server_unit.ServerUnitFixture.test_jinja_render_tools_injected
+229/730 Test #229: test_server_unit.ServerUnitFixture.test_jinja_render_tools_injected ....................................................................   Passed    0.03 sec
+        Start 230: test_server_unit.ServerUnitFixture.test_jinja_render_empty_tools_skipped
+230/730 Test #230: test_server_unit.ServerUnitFixture.test_jinja_render_empty_tools_skipped ...............................................................   Passed    0.03 sec
+        Start 231: test_server_unit.ServerUnitFixture.test_jinja_render_bos_eos_threaded
+231/730 Test #231: test_server_unit.ServerUnitFixture.test_jinja_render_bos_eos_threaded ..................................................................   Passed    0.03 sec
+        Start 232: test_server_unit.ServerUnitFixture.test_jinja_render_empty_template_throws
+232/730 Test #232: test_server_unit.ServerUnitFixture.test_jinja_render_empty_template_throws .............................................................   Passed    0.03 sec
+        Start 233: test_server_unit.ServerUnitFixture.test_jinja_render_bad_tools_json_throws
+233/730 Test #233: test_server_unit.ServerUnitFixture.test_jinja_render_bad_tools_json_throws .............................................................   Passed    0.03 sec
+        Start 234: test_server_unit.ServerUnitFixture.test_normalize_responses_tool_followup_messages
+234/730 Test #234: test_server_unit.ServerUnitFixture.test_normalize_responses_tool_followup_messages .....................................................   Passed    0.03 sec
+        Start 235: test_server_unit.ServerUnitFixture.test_parse_target_device_list_same_backend
+235/730 Test #235: test_server_unit.ServerUnitFixture.test_parse_target_device_list_same_backend ..........................................................   Passed    0.03 sec
+        Start 236: test_server_unit.ServerUnitFixture.test_parse_target_device_list_mixed_backend
+236/730 Test #236: test_server_unit.ServerUnitFixture.test_parse_target_device_list_mixed_backend .........................................................   Passed    0.03 sec
+        Start 237: test_server_unit.ServerUnitFixture.test_parse_target_device_list_mixed_backend_multi_remote
+237/730 Test #237: test_server_unit.ServerUnitFixture.test_parse_target_device_list_mixed_backend_multi_remote ............................................   Passed    0.03 sec
+        Start 238: test_server_unit.ServerUnitFixture.test_parse_target_device_list_single_gpu_is_not_layer_split
+238/730 Test #238: test_server_unit.ServerUnitFixture.test_parse_target_device_list_single_gpu_is_not_layer_split .........................................   Passed    0.03 sec
+        Start 239: test_server_unit.ServerUnitFixture.test_validate_layer_split_weights_shape
+239/730 Test #239: test_server_unit.ServerUnitFixture.test_validate_layer_split_weights_shape .............................................................   Passed    0.03 sec
+        Start 240: test_server_unit.ServerUnitFixture.test_target_shard_plan_same_backend_split
+240/730 Test #240: test_server_unit.ServerUnitFixture.test_target_shard_plan_same_backend_split ...........................................................   Passed    0.03 sec
+        Start 241: test_server_unit.ServerUnitFixture.test_target_shard_plan_mixed_backend_split
+241/730 Test #241: test_server_unit.ServerUnitFixture.test_target_shard_plan_mixed_backend_split ..........................................................   Passed    0.03 sec
+        Start 242: test_server_unit.ServerUnitFixture.test_target_shard_plan_rejects_bad_local_backend
+242/730 Test #242: test_server_unit.ServerUnitFixture.test_target_shard_plan_rejects_bad_local_backend ....................................................   Passed    0.03 sec
+        Start 243: test_server_unit.ServerUnitFixture.test_kvflash_pager_identity_sync_contract
+243/730 Test #243: test_server_unit.ServerUnitFixture.test_kvflash_pager_identity_sync_contract ...........................................................   Passed    0.24 sec
+        Start 244: test_server_unit.ServerUnitFixture.test_layer_split_kvflash_history_contract
+244/730 Test #244: test_server_unit.ServerUnitFixture.test_layer_split_kvflash_history_contract ...........................................................   Passed    0.03 sec
+        Start 245: test_server_unit.ServerUnitFixture.test_backend_precision_cuda_sm_policy
+245/730 Test #245: test_server_unit.ServerUnitFixture.test_backend_precision_cuda_sm_policy ...............................................................   Passed    0.03 sec
+        Start 246: test_server_unit.ServerUnitFixture.test_backend_precision_hip_arch_policy
+246/730 Test #246: test_server_unit.ServerUnitFixture.test_backend_precision_hip_arch_policy ..............................................................   Passed    0.03 sec
+        Start 247: test_server_unit.ServerUnitFixture.test_backend_precision_activation_type_combine
+247/730 Test #247: test_server_unit.ServerUnitFixture.test_backend_precision_activation_type_combine ......................................................   Passed    0.04 sec
+        Start 248: test_server_unit.ServerUnitFixture.test_layer_split_backend_inline_snapshot_and_restore_delta
+248/730 Test #248: test_server_unit.ServerUnitFixture.test_layer_split_backend_inline_snapshot_and_restore_delta ..........................................   Passed    0.03 sec
+        Start 249: test_server_unit.ServerUnitFixture.test_layer_split_backend_sampling_capability_gate
+249/730 Test #249: test_server_unit.ServerUnitFixture.test_layer_split_backend_sampling_capability_gate ...................................................   Passed    0.03 sec
+        Start 250: test_server_unit.ServerUnitFixture.test_layer_split_backend_chunks_prefill_by_adapter_limit
+250/730 Test #250: test_server_unit.ServerUnitFixture.test_layer_split_backend_chunks_prefill_by_adapter_limit ............................................   Passed    0.03 sec
+        Start 251: test_server_unit.ServerUnitFixture.test_layer_split_backend_cancels_between_prefill_chunks
+251/730 Test #251: test_server_unit.ServerUnitFixture.test_layer_split_backend_cancels_between_prefill_chunks .............................................   Passed    0.03 sec
+        Start 252: test_server_unit.ServerUnitFixture.test_layer_split_compress_nopark_uses_default_drafter_path
+252/730 Test #252: test_server_unit.ServerUnitFixture.test_layer_split_compress_nopark_uses_default_drafter_path ..........................................   Passed    0.03 sec
+        Start 253: test_server_unit.ServerUnitFixture.test_layer_split_compress_rejects_bad_keep_ratio
+253/730 Test #253: test_server_unit.ServerUnitFixture.test_layer_split_compress_rejects_bad_keep_ratio ....................................................   Passed    0.03 sec
+        Start 254: test_server_unit.ServerUnitFixture.test_layer_split_backend_shutdown_is_idempotent
+254/730 Test #254: test_server_unit.ServerUnitFixture.test_layer_split_backend_shutdown_is_idempotent .....................................................   Passed    0.03 sec
+        Start 255: test_server_unit.ServerUnitFixture.test_layer_split_backend_capability_proxy
+255/730 Test #255: test_server_unit.ServerUnitFixture.test_layer_split_backend_capability_proxy ...........................................................   Passed    0.03 sec
+        Start 256: test_server_unit.ServerUnitFixture.test_inline_snapshot_finalization_uses_actual_saved_position
+256/730 Test #256: test_server_unit.ServerUnitFixture.test_inline_snapshot_finalization_uses_actual_saved_position ........................................   Passed    0.03 sec
+        Start 257: test_server_unit.ServerUnitFixture.test_scheduler_counts_restore_only_after_engine_attempts_it
+257/730 Test #257: test_server_unit.ServerUnitFixture.test_scheduler_counts_restore_only_after_engine_attempts_it .........................................   Passed    1.04 sec
+        Start 258: test_server_unit.ServerUnitFixture.test_scheduler_rejects_malformed_restore_and_drops_stale_entry
+258/730 Test #258: test_server_unit.ServerUnitFixture.test_scheduler_rejects_malformed_restore_and_drops_stale_entry ......................................   Passed    0.03 sec
+        Start 259: test_server_unit.ServerUnitFixture.test_scheduler_discards_unrequested_restored_checkpoint
+259/730 Test #259: test_server_unit.ServerUnitFixture.test_scheduler_discards_unrequested_restored_checkpoint .............................................   Passed    0.03 sec
+        Start 260: test_server_unit.ServerUnitFixture.test_scheduler_stale_restore_preserves_other_protected_capture
+260/730 Test #260: test_server_unit.ServerUnitFixture.test_scheduler_stale_restore_preserves_other_protected_capture ......................................   Passed    0.03 sec
+        Start 261: test_server_unit.ServerUnitFixture.test_compress_batch_default_preserves_order
+261/730 Test #261: test_server_unit.ServerUnitFixture.test_compress_batch_default_preserves_order .........................................................   Passed    0.03 sec
+        Start 262: test_server_unit.ServerUnitFixture.test_disk_cache_config_defaults
+262/730 Test #262: test_server_unit.ServerUnitFixture.test_disk_cache_config_defaults .....................................................................   Passed    0.03 sec
+        Start 263: test_server_unit.ServerUnitFixture.test_disk_cache_policy_parse
+263/730 Test #263: test_server_unit.ServerUnitFixture.test_disk_cache_policy_parse ........................................................................   Passed    0.03 sec
+        Start 264: test_server_unit.ServerUnitFixture.test_scope_override_preserves_compress
+264/730 Test #264: test_server_unit.ServerUnitFixture.test_scope_override_preserves_compress ..............................................................   Passed    0.03 sec
+        Start 265: test_server_unit.ServerUnitFixture.test_disk_cache_fixed_boundary
+265/730 Test #265: test_server_unit.ServerUnitFixture.test_disk_cache_fixed_boundary ......................................................................   Passed    0.04 sec
+        Start 266: test_server_unit.ServerUnitFixture.test_disk_cache_auto_boundary_lcp
+266/730 Test #266: test_server_unit.ServerUnitFixture.test_disk_cache_auto_boundary_lcp ...................................................................   Passed    0.03 sec
+        Start 267: test_server_unit.ServerUnitFixture.test_disk_cache_auto_window_limits_history
+267/730 Test #267: test_server_unit.ServerUnitFixture.test_disk_cache_auto_window_limits_history ..........................................................   Passed    0.03 sec
+        Start 268: test_server_unit.ServerUnitFixture.test_disk_cache_disabled_when_no_dir
+268/730 Test #268: test_server_unit.ServerUnitFixture.test_disk_cache_disabled_when_no_dir ................................................................   Passed    0.03 sec
+        Start 269: test_server_unit.ServerUnitFixture.test_disk_cache_disables_memory_only_backend
+269/730 Test #269: test_server_unit.ServerUnitFixture.test_disk_cache_disables_memory_only_backend ........................................................   Passed    0.03 sec
+        Start 270: test_server_unit.ServerUnitFixture.test_disk_cache_init_creates_directory
+270/730 Test #270: test_server_unit.ServerUnitFixture.test_disk_cache_init_creates_directory ..............................................................   Passed    0.03 sec
+        Start 271: test_server_unit.ServerUnitFixture.test_disk_cache_header_size
+271/730 Test #271: test_server_unit.ServerUnitFixture.test_disk_cache_header_size .........................................................................   Passed    0.03 sec
+        Start 272: test_server_unit.ServerUnitFixture.test_disk_cache_header_round_trip
+272/730 Test #272: test_server_unit.ServerUnitFixture.test_disk_cache_header_round_trip ...................................................................   Passed    0.03 sec
+        Start 273: test_server_unit.ServerUnitFixture.test_disk_cache_continued_boundary
+273/730 Test #273: test_server_unit.ServerUnitFixture.test_disk_cache_continued_boundary ..................................................................   Passed    0.03 sec
+        Start 274: test_server_unit.ServerUnitFixture.test_disk_cache_continued_interval_logic
+274/730 Test #274: test_server_unit.ServerUnitFixture.test_disk_cache_continued_interval_logic ............................................................   Passed    0.03 sec
+        Start 275: test_server_unit.ServerUnitFixture.test_disk_cache_full_lookup_lengths
+275/730 Test #275: test_server_unit.ServerUnitFixture.test_disk_cache_full_lookup_lengths .................................................................   Passed    0.03 sec
+        Start 276: test_server_unit.ServerUnitFixture.test_disk_cache_cold_prefix_short_prompt
+276/730 Test #276: test_server_unit.ServerUnitFixture.test_disk_cache_cold_prefix_short_prompt ............................................................   Passed    0.03 sec
+        Start 277: test_server_unit.ServerUnitFixture.test_disk_cache_cold_prefix_no_boundaries
+277/730 Test #277: test_server_unit.ServerUnitFixture.test_disk_cache_cold_prefix_no_boundaries ...........................................................   Passed    0.03 sec
+        Start 278: test_server_unit.ServerUnitFixture.test_disk_cache_cold_prefix_finds_boundary
+278/730 Test #278: test_server_unit.ServerUnitFixture.test_disk_cache_cold_prefix_finds_boundary ..........................................................   Passed    0.03 sec
+        Start 279: test_server_unit.ServerUnitFixture.test_disk_cache_budget_enforcement_scoring
+279/730 Test #279: test_server_unit.ServerUnitFixture.test_disk_cache_budget_enforcement_scoring ..........................................................   Passed    0.03 sec
+        Start 280: test_server_unit.ServerUnitFixture.test_disk_cache_lookup_miss_no_layout
+280/730 Test #280: test_server_unit.ServerUnitFixture.test_disk_cache_lookup_miss_no_layout ...............................................................   Passed    0.03 sec
+        Start 281: test_server_unit.ServerUnitFixture.test_disk_cache_save_below_min_tokens
+281/730 Test #281: test_server_unit.ServerUnitFixture.test_disk_cache_save_below_min_tokens ...............................................................   Passed    0.03 sec
+        Start 282: test_server_unit.ServerUnitFixture.test_disk_cache_rejects_snapshot_past_key
+282/730 Test #282: test_server_unit.ServerUnitFixture.test_disk_cache_rejects_snapshot_past_key ...........................................................   Passed    0.04 sec
+        Start 283: test_server_unit.ServerUnitFixture.test_disk_cache_continued_keys_full_prefix
+283/730 Test #283: test_server_unit.ServerUnitFixture.test_disk_cache_continued_keys_full_prefix ..........................................................   Passed    0.03 sec
+        Start 284: test_server_unit.ServerUnitFixture.test_disk_identity_salt_changes_layout_id
+284/730 Test #284: test_server_unit.ServerUnitFixture.test_disk_identity_salt_changes_layout_id ...........................................................   Passed    0.03 sec
+        Start 285: test_server_unit.ServerUnitFixture.test_disk_identity_salt_zero_is_backcompat
+285/730 Test #285: test_server_unit.ServerUnitFixture.test_disk_identity_salt_zero_is_backcompat ..........................................................   Passed    0.03 sec
+        Start 286: test_server_unit.ServerUnitFixture.test_backend_ipc_rejects_file_work_dir
+286/730 Test #286: test_server_unit.ServerUnitFixture.test_backend_ipc_rejects_file_work_dir ..............................................................   Passed    0.03 sec
+        Start 287: test_server_unit.ServerUnitFixture.test_backend_ipc_payload_pipe_round_trip
+287/730 Test #287: test_server_unit.ServerUnitFixture.test_backend_ipc_payload_pipe_round_trip ............................................................   Passed    0.03 sec
+        Start 288: test_server_unit.ServerUnitFixture.test_backend_ipc_payload_transport_parse
+288/730 Test #288: test_server_unit.ServerUnitFixture.test_backend_ipc_payload_transport_parse ............................................................   Passed    0.03 sec
+        Start 289: test_server_unit.ServerUnitFixture.test_backend_ipc_payload_bounds
+289/730 Test #289: test_server_unit.ServerUnitFixture.test_backend_ipc_payload_bounds .....................................................................   Passed    0.03 sec
+        Start 290: test_server_unit.ServerUnitFixture.test_backend_ipc_shared_payload_map_sizing
+290/730 Test #290: test_server_unit.ServerUnitFixture.test_backend_ipc_shared_payload_map_sizing ..........................................................   Passed    0.03 sec
+        Start 291: test_server_unit.ServerUnitFixture.test_backend_ipc_shared_payload_segment_contract
+291/730 Test #291: test_server_unit.ServerUnitFixture.test_backend_ipc_shared_payload_segment_contract ....................................................   Passed    0.03 sec
+        Start 292: test_server_unit.ServerUnitFixture.test_moe_hybrid_expert_compute_batch_default
+292/730 Test #292: test_server_unit.ServerUnitFixture.test_moe_hybrid_expert_compute_batch_default ........................................................   Passed    0.03 sec
+        Start 293: test_server_unit.ServerUnitFixture.test_moe_hybrid_expert_compute_ipc_mode_batch_limit
+293/730 Test #293: test_server_unit.ServerUnitFixture.test_moe_hybrid_expert_compute_ipc_mode_batch_limit .................................................   Passed    0.03 sec
+        Start 294: test_server_unit.ServerUnitFixture.test_moe_hybrid_prefill_hot_sub_batch_limit
+294/730 Test #294: test_server_unit.ServerUnitFixture.test_moe_hybrid_prefill_hot_sub_batch_limit .........................................................   Passed    0.03 sec
+        Start 295: test_server_unit.ServerUnitFixture.test_moe_hybrid_uma_core_memory_is_saturating
+295/730 Test #295: test_server_unit.ServerUnitFixture.test_moe_hybrid_uma_core_memory_is_saturating .......................................................   Passed    0.03 sec
+        Start 296: test_server_unit.ServerUnitFixture.test_moe_hybrid_canonical_rocmfp2_q2_is_tokenwise
+296/730 Test #296: test_server_unit.ServerUnitFixture.test_moe_hybrid_canonical_rocmfp2_q2_is_tokenwise ...................................................   Passed    0.03 sec
+        Start 297: test_server_unit.ServerUnitFixture.test_sampler_cfg_defaults
+297/730 Test #297: test_server_unit.ServerUnitFixture.test_sampler_cfg_defaults ...........................................................................   Passed    0.03 sec
+        Start 298: test_server_unit.ServerUnitFixture.test_sampler_greedy_argmax
+298/730 Test #298: test_server_unit.ServerUnitFixture.test_sampler_greedy_argmax ..........................................................................   Passed    0.03 sec
+        Start 299: test_server_unit.ServerUnitFixture.test_sampler_temperature_affects_distribution
+299/730 Test #299: test_server_unit.ServerUnitFixture.test_sampler_temperature_affects_distribution .......................................................   Passed    0.03 sec
+        Start 300: test_server_unit.ServerUnitFixture.test_sampler_top_p_truncation
+300/730 Test #300: test_server_unit.ServerUnitFixture.test_sampler_top_p_truncation .......................................................................   Passed    0.03 sec
+        Start 301: test_server_unit.ServerUnitFixture.test_sampler_top_k_truncation
+301/730 Test #301: test_server_unit.ServerUnitFixture.test_sampler_top_k_truncation .......................................................................   Passed    0.03 sec
+        Start 302: test_server_unit.ServerUnitFixture.test_sampler_repetition_penalty
+302/730 Test #302: test_server_unit.ServerUnitFixture.test_sampler_repetition_penalty .....................................................................   Passed    0.03 sec
+        Start 303: test_server_unit.ServerUnitFixture.test_sampler_frequency_penalty
+303/730 Test #303: test_server_unit.ServerUnitFixture.test_sampler_frequency_penalty ......................................................................   Passed    0.03 sec
+        Start 304: test_server_unit.ServerUnitFixture.test_sampler_presence_penalty
+304/730 Test #304: test_server_unit.ServerUnitFixture.test_sampler_presence_penalty .......................................................................   Passed    0.03 sec
+        Start 305: test_server_unit.ServerUnitFixture.test_sampler_freq_and_pres_combined
+305/730 Test #305: test_server_unit.ServerUnitFixture.test_sampler_freq_and_pres_combined .................................................................   Passed    0.03 sec
+        Start 306: test_server_unit.ServerUnitFixture.test_sampler_negative_frequency_penalty
+306/730 Test #306: test_server_unit.ServerUnitFixture.test_sampler_negative_frequency_penalty .............................................................   Passed    0.03 sec
+        Start 307: test_server_unit.ServerUnitFixture.test_sampler_seed_reproducibility
+307/730 Test #307: test_server_unit.ServerUnitFixture.test_sampler_seed_reproducibility ...................................................................   Passed    0.03 sec
+        Start 308: test_server_unit.ServerUnitFixture.test_sampler_rep_window_limits_scope
+308/730 Test #308: test_server_unit.ServerUnitFixture.test_sampler_rep_window_limits_scope ................................................................   Passed    0.03 sec
+        Start 309: test_server_unit.ServerUnitFixture.test_parse_sampler_token_basic
+309/730 Test #309: test_server_unit.ServerUnitFixture.test_parse_sampler_token_basic ......................................................................   Passed    0.03 sec
+        Start 310: test_server_unit.ServerUnitFixture.test_parse_sampler_token_with_penalties
+310/730 Test #310: test_server_unit.ServerUnitFixture.test_parse_sampler_token_with_penalties .............................................................   Passed    0.03 sec
+        Start 311: test_server_unit.ServerUnitFixture.test_parse_sampler_token_minimal
+311/730 Test #311: test_server_unit.ServerUnitFixture.test_parse_sampler_token_minimal ....................................................................   Passed    0.03 sec
+        Start 312: test_server_unit.ServerUnitFixture.test_parse_sampler_token_no_samp
+312/730 Test #312: test_server_unit.ServerUnitFixture.test_parse_sampler_token_no_samp ....................................................................   Passed    0.03 sec
+        Start 313: test_server_unit.ServerUnitFixture.test_sampler_temp_zero_with_penalties_uses_argmax
+313/730 Test #313: test_server_unit.ServerUnitFixture.test_sampler_temp_zero_with_penalties_uses_argmax ...................................................   Passed    0.03 sec
+        Start 314: test_server_unit.ServerUnitFixture.test_sampler_needs_logit_processing
+314/730 Test #314: test_server_unit.ServerUnitFixture.test_sampler_needs_logit_processing .................................................................   Passed    0.03 sec
+        Start 315: test_server_unit.ServerUnitFixture.test_server_config_cache_defaults
+315/730 Test #315: test_server_unit.ServerUnitFixture.test_server_config_cache_defaults ...................................................................   Passed    0.03 sec
+        Start 316: test_server_unit.ServerUnitFixture.test_model_card_env_override_beats_cwd
+316/730 Test #316: test_server_unit.ServerUnitFixture.test_model_card_env_override_beats_cwd ..............................................................   Passed    0.03 sec
+        Start 317: test_server_unit.ServerUnitFixture.test_model_card_family_fallback_deepseek4
+317/730 Test #317: test_server_unit.ServerUnitFixture.test_model_card_family_fallback_deepseek4 ...........................................................   Passed    0.03 sec
+        Start 318: test_server_unit.ServerUnitFixture.test_model_card_family_fallback_bailingmoe3
+318/730 Test #318: test_server_unit.ServerUnitFixture.test_model_card_family_fallback_bailingmoe3 .........................................................   Passed    0.03 sec
+        Start 319: test_server_unit.ServerUnitFixture.test_props_model_card_wholesale_sidecar
+319/730 Test #319: test_server_unit.ServerUnitFixture.test_props_model_card_wholesale_sidecar .............................................................   Passed    0.03 sec
+        Start 320: test_server_unit.ServerUnitFixture.test_props_model_card_null_on_family_fallback
+320/730 Test #320: test_server_unit.ServerUnitFixture.test_props_model_card_null_on_family_fallback .......................................................   Passed    0.03 sec
+        Start 321: test_server_unit.ServerUnitFixture.test_props_deepseek4_tool_capability
+321/730 Test #321: test_server_unit.ServerUnitFixture.test_props_deepseek4_tool_capability ................................................................   Passed    0.03 sec
+        Start 322: test_server_unit.ServerUnitFixture.test_props_deepseek4_reasoning_capability
+322/730 Test #322: test_server_unit.ServerUnitFixture.test_props_deepseek4_reasoning_capability ...........................................................   Passed    0.03 sec
+        Start 323: test_server_unit.ServerUnitFixture.test_props_budget_envelope_shape
+323/730 Test #323: test_server_unit.ServerUnitFixture.test_props_budget_envelope_shape ....................................................................   Passed    0.03 sec
+        Start 324: test_server_unit.ServerUnitFixture.test_props_runtime_shape
+324/730 Test #324: test_server_unit.ServerUnitFixture.test_props_runtime_shape ............................................................................   Passed    0.03 sec
+        Start 325: test_server_unit.ServerUnitFixture.test_usage_timings_openai_chat_streaming
+325/730 Test #325: test_server_unit.ServerUnitFixture.test_usage_timings_openai_chat_streaming ............................................................   Passed    0.03 sec
+        Start 326: test_server_unit.ServerUnitFixture.test_usage_timings_anthropic_streaming
+326/730 Test #326: test_server_unit.ServerUnitFixture.test_usage_timings_anthropic_streaming ..............................................................   Passed    0.03 sec
+        Start 327: test_server_unit.ServerUnitFixture.test_usage_timings_responses_streaming
+327/730 Test #327: test_server_unit.ServerUnitFixture.test_usage_timings_responses_streaming ..............................................................   Passed    0.03 sec
+        Start 328: test_server_unit.ServerUnitFixture.test_usage_timings_zero_decode_no_div_by_zero
+328/730 Test #328: test_server_unit.ServerUnitFixture.test_usage_timings_zero_decode_no_div_by_zero .......................................................   Passed    0.03 sec
+        Start 329: test_server_unit.ServerUnitFixture.test_usage_timings_reports_prefix_cache_work
+329/730 Test #329: test_server_unit.ServerUnitFixture.test_usage_timings_reports_prefix_cache_work ........................................................   Passed    0.03 sec
+        Start 330: test_server_unit.ServerUnitFixture.test_usage_timings_omitted_when_null
+330/730 Test #330: test_server_unit.ServerUnitFixture.test_usage_timings_omitted_when_null ................................................................   Passed    0.03 sec
+        Start 331: test_server_unit.ServerUnitFixture.test_model_backend_retries_empty_spec_generate_once_with_ar
+331/730 Test #331: test_server_unit.ServerUnitFixture.test_model_backend_retries_empty_spec_generate_once_with_ar .........................................   Passed    0.03 sec
+        Start 332: test_server_unit.ServerUnitFixture.test_model_backend_retries_empty_spec_restore_once_with_ar
+332/730 Test #332: test_server_unit.ServerUnitFixture.test_model_backend_retries_empty_spec_restore_once_with_ar ..........................................   Passed    0.03 sec
+        Start 333: test_server_unit.ServerUnitFixture.test_model_backend_retries_empty_visible_spec_generate_once_with_ar
+333/730 Test #333: test_server_unit.ServerUnitFixture.test_model_backend_retries_empty_visible_spec_generate_once_with_ar .................................   Passed    0.03 sec
+        Start 334: test_server_unit.ServerUnitFixture.test_model_backend_retries_empty_visible_spec_restore_once_with_ar
+334/730 Test #334: test_server_unit.ServerUnitFixture.test_model_backend_retries_empty_visible_spec_restore_once_with_ar ..................................   Passed    0.03 sec
+        Start 335: test_server_unit.ServerUnitFixture.test_generate_result_accept_rate_defaults_to_zero
+335/730 Test #335: test_server_unit.ServerUnitFixture.test_generate_result_accept_rate_defaults_to_zero ...................................................   Passed    0.03 sec
+        Start 336: test_server_unit.ServerUnitFixture.test_generate_result_accept_rate_can_be_set
+336/730 Test #336: test_server_unit.ServerUnitFixture.test_generate_result_accept_rate_can_be_set .........................................................   Passed    0.03 sec
+        Start 337: test_server_unit.ServerUnitFixture.test_generate_result_accept_rate_bounds
+337/730 Test #337: test_server_unit.ServerUnitFixture.test_generate_result_accept_rate_bounds .............................................................   Passed    0.03 sec
+        Start 338: test_server_unit.ServerUnitFixture.test_generate_result_accept_rate_in_usage_openai
+338/730 Test #338: test_server_unit.ServerUnitFixture.test_generate_result_accept_rate_in_usage_openai ....................................................   Passed    0.03 sec
+        Start 339: test_server_unit.ServerUnitFixture.test_generate_result_accept_rate_in_usage_anthropic
+339/730 Test #339: test_server_unit.ServerUnitFixture.test_generate_result_accept_rate_in_usage_anthropic .................................................   Passed    0.03 sec
+        Start 340: test_server_unit.ServerUnitFixture.test_generate_result_accept_rate_zero_when_no_spec_decode
+340/730 Test #340: test_server_unit.ServerUnitFixture.test_generate_result_accept_rate_zero_when_no_spec_decode ...........................................   Passed    0.03 sec
+        Start 341: test_server_unit.ServerUnitFixture.test_generate_result_error_state_is_consistent
+341/730 Test #341: test_server_unit.ServerUnitFixture.test_generate_result_error_state_is_consistent ......................................................   Passed    0.03 sec
+        Start 342: test_server_unit.ServerUnitFixture.test_response_error_maps_every_generation_code
+342/730 Test #342: test_server_unit.ServerUnitFixture.test_response_error_maps_every_generation_code ......................................................   Passed    0.03 sec
+        Start 343: test_server_unit.ServerUnitFixture.test_response_error_nonstream_formats
+343/730 Test #343: test_server_unit.ServerUnitFixture.test_response_error_nonstream_formats ...............................................................   Passed    0.03 sec
+        Start 344: test_server_unit.ServerUnitFixture.test_response_error_factories_fill_empty_messages
+344/730 Test #344: test_server_unit.ServerUnitFixture.test_response_error_factories_fill_empty_messages ...................................................   Passed    0.03 sec
+        Start 345: test_server_unit.ServerUnitFixture.test_sse_emitter_openai_error_is_terminal
+345/730 Test #345: test_server_unit.ServerUnitFixture.test_sse_emitter_openai_error_is_terminal ...........................................................   Passed    0.03 sec
+        Start 346: test_server_unit.ServerUnitFixture.test_sse_emitter_anthropic_error_is_terminal
+346/730 Test #346: test_server_unit.ServerUnitFixture.test_sse_emitter_anthropic_error_is_terminal ........................................................   Passed    0.03 sec
+        Start 347: test_server_unit.ServerUnitFixture.test_sse_emitter_responses_error_is_terminal
+347/730 Test #347: test_server_unit.ServerUnitFixture.test_sse_emitter_responses_error_is_terminal ........................................................   Passed    0.03 sec
+        Start 348: test_server_unit.ServerUnitFixture.test_normalize_strips_billing_header_anthropic_array
+348/730 Test #348: test_server_unit.ServerUnitFixture.test_normalize_strips_billing_header_anthropic_array ................................................   Passed    0.03 sec
+        Start 349: test_server_unit.ServerUnitFixture.test_normalize_strips_billing_header_openai_messages0
+349/730 Test #349: test_server_unit.ServerUnitFixture.test_normalize_strips_billing_header_openai_messages0 ...............................................   Passed    0.03 sec
+        Start 350: test_server_unit.ServerUnitFixture.test_normalize_idempotent_across_changing_header
+350/730 Test #350: test_server_unit.ServerUnitFixture.test_normalize_idempotent_across_changing_header ....................................................   Passed    0.03 sec
+        Start 351: test_server_unit.ServerUnitFixture.test_normalize_preserves_legit_system_content
+351/730 Test #351: test_server_unit.ServerUnitFixture.test_normalize_preserves_legit_system_content .......................................................   Passed    0.03 sec
+        Start 352: test_server_unit.ServerUnitFixture.test_normalize_handles_leading_whitespace_header
+352/730 Test #352: test_server_unit.ServerUnitFixture.test_normalize_handles_leading_whitespace_header ....................................................   Passed    0.03 sec
+        Start 353: test_server_unit.ServerUnitFixture.test_prefix_key_stable_across_header_change
+353/730 Test #353: test_server_unit.ServerUnitFixture.test_prefix_key_stable_across_header_change .........................................................   Passed    0.03 sec
+        Start 354: test_server_unit.ServerUnitFixture.test_flowkv_T4_compress_false_policy_name_no_suffix
+354/730 Test #354: test_server_unit.ServerUnitFixture.test_flowkv_T4_compress_false_policy_name_no_suffix .................................................   Passed    0.03 sec
+        Start 355: test_server_unit.ServerUnitFixture.test_flowkv_T4_compress_true_policy_name_has_suffix
+355/730 Test #355: test_server_unit.ServerUnitFixture.test_flowkv_T4_compress_true_policy_name_has_suffix .................................................   Passed    0.03 sec
+        Start 356: test_server_unit.ServerUnitFixture.test_flowkv_T4_default_no_compress
+356/730 Test #356: test_server_unit.ServerUnitFixture.test_flowkv_T4_default_no_compress ..................................................................   Passed    0.03 sec
+        Start 357: test_server_unit.ServerUnitFixture.test_flowkv_T6_frozen_block_key_deterministic
+357/730 Test #357: test_server_unit.ServerUnitFixture.test_flowkv_T6_frozen_block_key_deterministic .......................................................   Passed    0.03 sec
+        Start 358: test_server_unit.ServerUnitFixture.test_flowkv_T6_frozen_block_key_zero_on_empty
+358/730 Test #358: test_server_unit.ServerUnitFixture.test_flowkv_T6_frozen_block_key_zero_on_empty .......................................................   Passed    0.03 sec
+        Start 359: test_server_unit.ServerUnitFixture.test_flowkv_T6_frozen_block_key_distinct_content
+359/730 Test #359: test_server_unit.ServerUnitFixture.test_flowkv_T6_frozen_block_key_distinct_content ....................................................   Passed    0.03 sec
+        Start 360: test_server_unit.ServerUnitFixture.test_flowkv_T7_disk_clamp_system_end_boundary
+360/730 Test #360: test_server_unit.ServerUnitFixture.test_flowkv_T7_disk_clamp_system_end_boundary .......................................................   Passed    0.03 sec
+        Start 361: test_server_unit.ServerUnitFixture.test_flowkv_T3_ws1_continuation_json_shape
+361/730 Test #361: test_server_unit.ServerUnitFixture.test_flowkv_T3_ws1_continuation_json_shape ..........................................................   Passed    0.03 sec
+        Start 362: test_server_unit.ServerUnitFixture.test_flowkv_T1_system_end_boundary_first
+362/730 Test #362: test_server_unit.ServerUnitFixture.test_flowkv_T1_system_end_boundary_first ............................................................   Passed    0.03 sec
+        Start 363: test_server_unit.ServerUnitFixture.test_flowkv_T5_aggregate_activation_threshold
+363/730 Test #363: test_server_unit.ServerUnitFixture.test_flowkv_T5_aggregate_activation_threshold .......................................................   Passed    0.03 sec
+        Start 364: test_server_unit.ServerUnitFixture.test_flowkv_session_keep_ratio_override
+364/730 Test #364: test_server_unit.ServerUnitFixture.test_flowkv_session_keep_ratio_override .............................................................   Passed    0.03 sec
+        Start 365: test_server_unit.ServerUnitFixture.test_qwen3_drafter_rejects_truncated_gguf
+365/730 Test #365: test_server_unit.ServerUnitFixture.test_qwen3_drafter_rejects_truncated_gguf ...........................................................   Passed    0.08 sec
+        Start 366: test_server_unit.ServerUnitFixture.test_gguf_tensor_in_file_bounds
+366/730 Test #366: test_server_unit.ServerUnitFixture.test_gguf_tensor_in_file_bounds .....................................................................   Passed    0.03 sec
+        Start 367: test_server_unit.ServerUnitFixture.test_gguf_bounds_error_reports_operands
+367/730 Test #367: test_server_unit.ServerUnitFixture.test_gguf_bounds_error_reports_operands .............................................................   Passed    0.03 sec
+        Start 368: test_server_unit.ServerUnitFixture.test_qwen35_embedded_mtp_target_layer_count
+368/730 Test #368: test_server_unit.ServerUnitFixture.test_qwen35_embedded_mtp_target_layer_count .........................................................   Passed    0.03 sec
+        Start 369: test_server_unit.ServerUnitFixture.test_parse_function_calls_invoke_xml
+369/730 Test #369: test_server_unit.ServerUnitFixture.test_parse_function_calls_invoke_xml ................................................................   Passed    0.04 sec
+        Start 370: test_server_unit.ServerUnitFixture.test_parse_function_calls_invoke_json
+370/730 Test #370: test_server_unit.ServerUnitFixture.test_parse_function_calls_invoke_json ...............................................................   Passed    0.03 sec
+        Start 371: test_server_unit.ServerUnitFixture.test_emitter_function_calls_inside_reasoning
+371/730 Test #371: test_server_unit.ServerUnitFixture.test_emitter_function_calls_inside_reasoning ........................................................   Passed    0.03 sec
+        Start 372: test_server_unit.ServerUnitFixture.test_parse_function_calls_anthropic_input_schema
+372/730 Test #372: test_server_unit.ServerUnitFixture.test_parse_function_calls_anthropic_input_schema ....................................................   Passed    0.03 sec
+        Start 373: test_server_unit.ServerUnitFixture.test_emitter_function_calls_unclosed_think_flushes_reasoning
+373/730 Test #373: test_server_unit.ServerUnitFixture.test_emitter_function_calls_unclosed_think_flushes_reasoning ........................................   Passed    0.03 sec
+        Start 374: test_server_unit.ServerUnitFixture.test_emitter_function_calls_content_tokens_accounting
+374/730 Test #374: test_server_unit.ServerUnitFixture.test_emitter_function_calls_content_tokens_accounting ...............................................   Passed    0.04 sec
+        Start 375: test_server_unit.ServerUnitFixture.test_emitter_function_calls_param_with_literal_think_close
+375/730 Test #375: test_server_unit.ServerUnitFixture.test_emitter_function_calls_param_with_literal_think_close ..........................................   Passed    0.04 sec
+        Start 376: test_server_unit.ServerUnitFixture.test_emitter_streaming_length_finish_reason_at_cap
+376/730 Test #376: test_server_unit.ServerUnitFixture.test_emitter_streaming_length_finish_reason_at_cap ..................................................   Passed    0.03 sec
+        Start 377: test_server_unit.ServerUnitFixture.test_emitter_streaming_length_finish_reason_at_zero_cap
+377/730 Test #377: test_server_unit.ServerUnitFixture.test_emitter_streaming_length_finish_reason_at_zero_cap .............................................   Passed    0.03 sec
+        Start 378: test_server_unit.ServerUnitFixture.test_emitter_streaming_stop_sequence_beats_length_at_cap
+378/730 Test #378: test_server_unit.ServerUnitFixture.test_emitter_streaming_stop_sequence_beats_length_at_cap ............................................   Passed    0.03 sec
+        Start 379: test_server_unit.ServerUnitFixture.test_emitter_streaming_anthropic_length_finish_reason_at_cap
+379/730 Test #379: test_server_unit.ServerUnitFixture.test_emitter_streaming_anthropic_length_finish_reason_at_cap ........................................   Passed    0.03 sec
+        Start 380: test_server_unit.ServerUnitFixture.test_emitter_streaming_anthropic_stop_sequence_beats_length_at_cap
+380/730 Test #380: test_server_unit.ServerUnitFixture.test_emitter_streaming_anthropic_stop_sequence_beats_length_at_cap ..................................   Passed    0.03 sec
+        Start 381: test_server_unit.ServerUnitFixture.test_parse_function_calls_json_lines
+381/730 Test #381: test_server_unit.ServerUnitFixture.test_parse_function_calls_json_lines ................................................................   Passed    0.03 sec
+        Start 382: test_server_unit.ServerUnitFixture.test_parse_function_calls_sibling_invokes_partial_failure
+382/730 Test #382: test_server_unit.ServerUnitFixture.test_parse_function_calls_sibling_invokes_partial_failure ...........................................   Passed    0.03 sec
+        Start 383: test_server_unit.ServerUnitFixture.test_parse_function_calls_rejected_invokes_do_not_expose_nested_json
+383/730 Test #383: test_server_unit.ServerUnitFixture.test_parse_function_calls_rejected_invokes_do_not_expose_nested_json ................................   Passed    0.03 sec
+        Start 384: test_server_unit.ServerUnitFixture.test_parse_function_calls_invoke_rejects_braced_prose
+384/730 Test #384: test_server_unit.ServerUnitFixture.test_parse_function_calls_invoke_rejects_braced_prose ...............................................   Passed    0.03 sec
+        Start 385: test_server_unit.ServerUnitFixture.test_parse_function_calls_invoke_keeps_structured_json_syntax_errors
+385/730 Test #385: test_server_unit.ServerUnitFixture.test_parse_function_calls_invoke_keeps_structured_json_syntax_errors ................................   Passed    0.03 sec
+        Start 386: test_server_unit.ServerUnitFixture.test_parse_json_syntax_error_forwarding
+386/730 Test #386: test_server_unit.ServerUnitFixture.test_parse_json_syntax_error_forwarding .............................................................   Passed    0.03 sec
+        Start 387: test_server_unit.ServerUnitFixture.test_emitter_streaming_json_syntax_error_openai_delta
+387/730 Test #387: test_server_unit.ServerUnitFixture.test_emitter_streaming_json_syntax_error_openai_delta ...............................................   Passed    0.03 sec
+        Start 388: test_server_unit.ServerUnitFixture.test_emitter_streaming_json_syntax_error_anthropic
+388/730 Test #388: test_server_unit.ServerUnitFixture.test_emitter_streaming_json_syntax_error_anthropic ..................................................   Passed    0.03 sec
+        Start 389: test_server_unit.ServerUnitFixture.test_emitter_streaming_malformed_tool_in_think_recovers_answer
+389/730 Test #389: test_server_unit.ServerUnitFixture.test_emitter_streaming_malformed_tool_in_think_recovers_answer ......................................   Passed    0.03 sec
+        Start 390: test_server_unit.ServerUnitFixture.test_emitter_streaming_malformed_tool_apostrophe_recovers_answer
+390/730 Test #390: test_server_unit.ServerUnitFixture.test_emitter_streaming_malformed_tool_apostrophe_recovers_answer ....................................   Passed    0.03 sec
+        Start 391: test_server_unit.ServerUnitFixture.test_emitter_streaming_malformed_tool_in_think_without_think_close_suppressed
+391/730 Test #391: test_server_unit.ServerUnitFixture.test_emitter_streaming_malformed_tool_in_think_without_think_close_suppressed .......................   Passed    0.03 sec
+        Start 392: test_server_unit.ServerUnitFixture.test_emitter_streaming_malformed_tool_in_think_literal_think_close_in_args_does_not_leak
+392/730 Test #392: test_server_unit.ServerUnitFixture.test_emitter_streaming_malformed_tool_in_think_literal_think_close_in_args_does_not_leak ............   Passed    0.03 sec
+        Start 393: test_server_unit.ServerUnitFixture.test_emitter_streaming_malformed_tool_in_think_envelope_with_internal_think_close_recovers_answer
+393/730 Test #393: test_server_unit.ServerUnitFixture.test_emitter_streaming_malformed_tool_in_think_envelope_with_internal_think_close_recovers_answer ...   Passed    0.04 sec
+        Start 394: test_server_unit.ServerUnitFixture.test_emitter_streaming_long_tool_name_split_in_reasoning_holds_back
+394/730 Test #394: test_server_unit.ServerUnitFixture.test_emitter_streaming_long_tool_name_split_in_reasoning_holds_back .................................   Passed    0.03 sec
+        Start 395: test_server_unit.ServerUnitFixture.test_parse_tool_call_rejects_empty_name_and_scalar_arguments
+395/730 Test #395: test_server_unit.ServerUnitFixture.test_parse_tool_call_rejects_empty_name_and_scalar_arguments ........................................   Passed    0.03 sec
+        Start 396: test_server_unit.ServerUnitFixture.test_extract_raw_json_tool_fallback_with_nested_name_argument
+396/730 Test #396: test_server_unit.ServerUnitFixture.test_extract_raw_json_tool_fallback_with_nested_name_argument .......................................   Passed    0.04 sec
+        Start 397: test_server_unit.ServerUnitFixture.test_extract_raw_json_tool_fallback_ignores_nested_metadata_name
+397/730 Test #397: test_server_unit.ServerUnitFixture.test_extract_raw_json_tool_fallback_ignores_nested_metadata_name ....................................   Passed    0.03 sec
+        Start 398: test_server_unit.ServerUnitFixture.test_raw_json_fallback_does_not_cross_tool_envelopes
+398/730 Test #398: test_server_unit.ServerUnitFixture.test_raw_json_fallback_does_not_cross_tool_envelopes ................................................   Passed    0.03 sec
+        Start 399: test_server_unit.ServerUnitFixture.test_parse_json_tool_call_checks_later_envelope_siblings
+399/730 Test #399: test_server_unit.ServerUnitFixture.test_parse_json_tool_call_checks_later_envelope_siblings ............................................   Passed    0.04 sec
+        Start 400: test_server_unit.ServerUnitFixture.test_emitter_prose_ending_in_tool_name_stays_content
+400/730 Test #400: test_server_unit.ServerUnitFixture.test_emitter_prose_ending_in_tool_name_stays_content ................................................   Passed    0.03 sec
+        Start 401: test_server_unit.ServerUnitFixture.test_emitter_tool_only_bare_name_remains_zero_arg_call
+401/730 Test #401: test_server_unit.ServerUnitFixture.test_emitter_tool_only_bare_name_remains_zero_arg_call ..............................................   Passed    0.03 sec
+        Start 402: test_server_unit.ServerUnitFixture.test_parse_function_calls_mixed_invoke_and_json_line_siblings
+402/730 Test #402: test_server_unit.ServerUnitFixture.test_parse_function_calls_mixed_invoke_and_json_line_siblings .......................................   Passed    0.03 sec
+        Start 403: test_server_unit.ServerUnitFixture.test_build_response_suppresses_length_finish_reason_on_eos
+403/730 Test #403: test_server_unit.ServerUnitFixture.test_build_response_suppresses_length_finish_reason_on_eos ..........................................   Passed    0.04 sec
+        Start 404: test_server_unit.ServerUnitFixture.test_parse_function_calls_empty_invoke_zero_args
+404/730 Test #404: test_server_unit.ServerUnitFixture.test_parse_function_calls_empty_invoke_zero_args ....................................................   Passed    0.04 sec
+        Start 405: test_server_unit.ServerUnitFixture.test_emitter_streaming_malformed_tool_in_think_answer_containing_close_tag_recovers_answer
+405/730 Test #405: test_server_unit.ServerUnitFixture.test_emitter_streaming_malformed_tool_in_think_answer_containing_close_tag_recovers_answer ..........   Passed    0.04 sec
+        Start 406: test_server_unit.ServerUnitFixture.test_escape_for_logging
+406/730 Test #406: test_server_unit.ServerUnitFixture.test_escape_for_logging .............................................................................   Passed    0.03 sec
+        Start 407: test_server_unit.ServerUnitFixture.test_emitter_suppresses_malformed_multiline_tool_buffer
+407/730 Test #407: test_server_unit.ServerUnitFixture.test_emitter_suppresses_malformed_multiline_tool_buffer .............................................   Passed    0.03 sec
+        Start 408: test_server_unit.ServerUnitFixture.test_concurrent_scheduler_burst_stops_at_eos
+408/730 Test #408: test_server_unit.ServerUnitFixture.test_concurrent_scheduler_burst_stops_at_eos ........................................................   Passed    0.03 sec
+        Start 409: test_server_unit.ModelRoutingFixture.test_two_plus_two_preserves_batching_and_independent_progress
+409/730 Test #409: test_server_unit.ModelRoutingFixture.test_two_plus_two_preserves_batching_and_independent_progress .....................................   Passed    0.24 sec
+        Start 410: test_server_unit.ModelRoutingFixture.test_rejected_requests_and_engine_failure_release_capacity
+410/730 Test #410: test_server_unit.ModelRoutingFixture.test_rejected_requests_and_engine_failure_release_capacity ........................................   Passed    0.24 sec
+        Start 411: test_server_unit.ModelRoutingFixture.test_disconnect_holds_capacity_until_engine_retirement
+411/730 Test #411: test_server_unit.ModelRoutingFixture.test_disconnect_holds_capacity_until_engine_retirement ............................................   Passed    0.49 sec
+        Start 412: test_server_unit.ModelRoutingFixture.test_response_protocols_use_selected_model_and_terminal_event
+412/730 Test #412: test_server_unit.ModelRoutingFixture.test_response_protocols_use_selected_model_and_terminal_event .....................................   Passed    0.24 sec
+        Start 413: test_server_unit.ModelRoutingFixture.test_shutdown_drains_both_models_and_incomplete_upload
+413/730 Test #413: test_server_unit.ModelRoutingFixture.test_shutdown_drains_both_models_and_incomplete_upload ............................................   Passed    0.24 sec
+        Start 414: test_server_unit.ModelRoutingFixture.test_hybrid_admission_uses_single_capacity_and_independent_workers
+414/730 Test #414: test_server_unit.ModelRoutingFixture.test_hybrid_admission_uses_single_capacity_and_independent_workers ................................   Passed    0.24 sec
+        Start 415: test_server_unit.ModelRoutingFixture.test_hybrid_disconnect_cancels_single_worker_and_reuses_capacity
+415/730 Test #415: test_server_unit.ModelRoutingFixture.test_hybrid_disconnect_cancels_single_worker_and_reuses_capacity ..................................   Passed    0.50 sec
+        Start 416: test_server_unit.ModelRoutingFixture.test_hybrid_shutdown_drains_single_worker_before_destroying_contexts
+416/730 Test #416: test_server_unit.ModelRoutingFixture.test_hybrid_shutdown_drains_single_worker_before_destroying_contexts ..............................   Passed    0.24 sec
+        Start 417: test_server_unit.ModelRoutingFixture.test_two_native_workers_preserve_priority_and_capacity
+417/730 Test #417: test_server_unit.ModelRoutingFixture.test_two_native_workers_preserve_priority_and_capacity ............................................   Passed    0.25 sec
+        Start 418: test_server_unit.ModelRoutingFixture.test_two_native_workers_finish_before_shutdown_returns
+418/730 Test #418: test_server_unit.ModelRoutingFixture.test_two_native_workers_finish_before_shutdown_returns ............................................   Passed    0.24 sec
+        Start 419: test_server_unit.ModelRoutingFixture.test_default_native_worker_finishes_active_response_on_shutdown
+419/730 Test #419: test_server_unit.ModelRoutingFixture.test_default_native_worker_finishes_active_response_on_shutdown ...................................   Passed    0.44 sec
+        Start 420: test_server_unit.ModelRoutingFixture.test_model_names_and_auto_fill_primary_then_secondary_and_drain_waiter
+420/730 Test #420: test_server_unit.ModelRoutingFixture.test_model_names_and_auto_fill_primary_then_secondary_and_drain_waiter ............................   Passed    0.24 sec
+        Start 421: test_server_unit.ModelRoutingFixture.test_kv_busy_falls_back_before_stream_headers_and_retokenizes
+421/730 Test #421: test_server_unit.ModelRoutingFixture.test_kv_busy_falls_back_before_stream_headers_and_retokenizes .....................................   Passed    0.24 sec
+        Start 422: test_server_unit.ModelRoutingFixture.test_permanent_capacity_falls_back_or_rejects_without_waiting
+422/730 Test #422: test_server_unit.ModelRoutingFixture.test_permanent_capacity_falls_back_or_rejects_without_waiting .....................................   Passed    0.24 sec
+        Start 423: test_server_unit.ModelRoutingFixture.test_busy_engines_retry_without_retirement_notification
+423/730 Test #423: test_server_unit.ModelRoutingFixture.test_busy_engines_retry_without_retirement_notification ...........................................   Passed    0.49 sec
+        Start 424: test_server_unit.ModelRoutingFixture.test_waiting_disconnect_and_shutdown_release_requests
+424/730 Test #424: test_server_unit.ModelRoutingFixture.test_waiting_disconnect_and_shutdown_release_requests .............................................   Passed    0.49 sec
+        Start 425: test_server_unit.ModelRoutingFixture.test_busy_waiters_do_not_trigger_each_others_retries
+425/730 Test #425: test_server_unit.ModelRoutingFixture.test_busy_waiters_do_not_trigger_each_others_retries ..............................................   Passed    0.44 sec
+        Start 426: test_server_unit.ModelRoutingFixture.test_single_model_permanent_capacity_is_client_error
+426/730 Test #426: test_server_unit.ModelRoutingFixture.test_single_model_permanent_capacity_is_client_error ..............................................   Passed    0.24 sec
+        Start 427: test_server_unit.ModelRoutingFixture.test_single_model_run_does_not_enable_balancing
+427/730 Test #427: test_server_unit.ModelRoutingFixture.test_single_model_run_does_not_enable_balancing ...................................................   Passed    0.24 sec
+        Start 428: test_server_unit.ModelRoutingFixture.test_reversed_priority_ignores_generation_model_names
+428/730 Test #428: test_server_unit.ModelRoutingFixture.test_reversed_priority_ignores_generation_model_names .............................................   Passed    0.24 sec
+        Start 429: test_server_unit.ModelRoutingFixture.test_decode_pressure_preserves_stream_and_routes_new_work
+429/730 Test #429: test_server_unit.ModelRoutingFixture.test_decode_pressure_preserves_stream_and_routes_new_work .........................................   Passed    0.24 sec
+        Start 430: test_server_unit.ModelRoutingFixture.test_suspended_disconnect_and_shutdown_release_all_state
+430/730 Test #430: test_server_unit.ModelRoutingFixture.test_suspended_disconnect_and_shutdown_release_all_state ..........................................   Passed    0.85 sec
+        Start 431: test_server_unit.ModelRoutingFixture.test_evict_for_recompute_preserves_request
+431/730 Test #431: test_server_unit.ModelRoutingFixture.test_evict_for_recompute_preserves_request ........................................................   Passed    0.85 sec
+        Start 432: test_server_unit.ModelRoutingFixture.test_suspension_resumes_before_drain_when_feasible
+432/730 Test #432: test_server_unit.ModelRoutingFixture.test_suspension_resumes_before_drain_when_feasible ................................................   Passed    0.24 sec
+        Start 433: test_server_unit.ModelRoutingFixture.test_disabled_offload_still_preflights_decode
+433/730 Test #433: test_server_unit.ModelRoutingFixture.test_disabled_offload_still_preflights_decode .....................................................   Passed    0.45 sec
+        Start 434: test_server_unit.ModelRoutingFixture.test_deferred_restore_keeps_resident_progressing
+434/730 Test #434: test_server_unit.ModelRoutingFixture.test_deferred_restore_keeps_resident_progressing ..................................................   Passed    0.44 sec
+        Start 435: test_server_unit.ModelRoutingFixture.test_offload_budget_and_restore_errors_fail_one_request_cleanly
+435/730 Test #435: test_server_unit.ModelRoutingFixture.test_offload_budget_and_restore_errors_fail_one_request_cleanly ...................................   Passed    0.85 sec
+        Start 436: test_server_unit.LuceEngineFixture.luce_engine_lifecycle_suite
+436/730 Test #436: test_server_unit.LuceEngineFixture.luce_engine_lifecycle_suite .........................................................................   Passed    0.03 sec
+        Start 437: test_server_unit.PagedKvOffloadFixture.test_quantized_payload_and_rng_survive_page_remapping
+437/730 Test #437: test_server_unit.PagedKvOffloadFixture.test_quantized_payload_and_rng_survive_page_remapping ...........................................   Passed    0.03 sec
+        Start 438: test_server_unit.PagedKvOffloadFixture.test_budget_and_restore_failure_preserve_the_request
+438/730 Test #438: test_server_unit.PagedKvOffloadFixture.test_budget_and_restore_failure_preserve_the_request ............................................   Passed    0.03 sec
+        Start 439: test_server_unit.PagedKvOffloadFixture.test_partial_prefill_and_cancellation_keep_slot_ownership
+439/730 Test #439: test_server_unit.PagedKvOffloadFixture.test_partial_prefill_and_cancellation_keep_slot_ownership .......................................   Passed    0.03 sec
+        Start 440: test_server_unit.PagedKvOffloadFixture.test_invalid_layout_and_staged_decode_do_not_release_blocks
+440/730 Test #440: test_server_unit.PagedKvOffloadFixture.test_invalid_layout_and_staged_decode_do_not_release_blocks .....................................   Passed    0.03 sec
+        Start 441: test_server_unit.PagedKvOffloadFixture.test_auto_budget_bounds_shared_headroom_and_payload
+441/730 Test #441: test_server_unit.PagedKvOffloadFixture.test_auto_budget_bounds_shared_headroom_and_payload .............................................   Passed    0.03 sec
+        Start 442: test_server_unit.PagedKvOffloadFixture.test_memory_probe_respects_container_and_parent_limits
+442/730 Test #442: test_server_unit.PagedKvOffloadFixture.test_memory_probe_respects_container_and_parent_limits ..........................................   Passed    0.04 sec
+        Start 443: test_server_unit.AnchorParamsFixture.test_tier_boundaries
+443/730 Test #443: test_server_unit.AnchorParamsFixture.test_tier_boundaries ..............................................................................   Passed    0.03 sec
+        Start 444: test_server_unit.AnchorParamsFixture.test_legacy_env_overrides_tier
+444/730 Test #444: test_server_unit.AnchorParamsFixture.test_legacy_env_overrides_tier ....................................................................   Passed    0.04 sec
+        Start 445: test_server_unit.AnchorParamsFixture.test_pflash_env_wins_over_legacy
+445/730 Test #445: test_server_unit.AnchorParamsFixture.test_pflash_env_wins_over_legacy ..................................................................   Passed    0.03 sec
+        Start 446: test_server_unit.AnchorParamsFixture.test_sentinel_minus1_falls_through_to_tier
+446/730 Test #446: test_server_unit.AnchorParamsFixture.test_sentinel_minus1_falls_through_to_tier ........................................................   Passed    0.03 sec
+        Start 447: test_server_unit.AnchorParamsFixture.test_zero_is_valid_override
+447/730 Test #447: test_server_unit.AnchorParamsFixture.test_zero_is_valid_override .......................................................................   Passed    0.03 sec
+        Start 448: test_server_unit.DerivedScalarsFixture.match_returns_true
+448/730 Test #448: test_server_unit.DerivedScalarsFixture.match_returns_true ..............................................................................   Passed    0.03 sec
+        Start 449: test_server_unit.DerivedScalarsFixture.mismatch_q_dim_returns_false
+449/730 Test #449: test_server_unit.DerivedScalarsFixture.mismatch_q_dim_returns_false ....................................................................   Passed    0.03 sec
+        Start 450: test_server_unit.DerivedScalarsFixture.mismatch_kv_dim_returns_false
+450/730 Test #450: test_server_unit.DerivedScalarsFixture.mismatch_kv_dim_returns_false ...................................................................   Passed    0.03 sec
+        Start 451: test_server_unit.DerivedScalarsFixture.mismatch_n_embd_returns_false
+451/730 Test #451: test_server_unit.DerivedScalarsFixture.mismatch_n_embd_returns_false ...................................................................   Passed    0.03 sec
+        Start 452: test_server_unit.DerivedScalarsFixture.draft_dims_match
+452/730 Test #452: test_server_unit.DerivedScalarsFixture.draft_dims_match ................................................................................   Passed    0.03 sec
+        Start 453: test_server_unit.DerivedScalarsFixture.qwen35_target_dims_match
+453/730 Test #453: test_server_unit.DerivedScalarsFixture.qwen35_target_dims_match ........................................................................   Passed    0.03 sec
+        Start 454: test_server_unit.DerivedScalarsFixture.err_contains_layer_tag
+454/730 Test #454: test_server_unit.DerivedScalarsFixture.err_contains_layer_tag ..........................................................................   Passed    0.03 sec
+        Start 455: test_server_unit.AdaptiveSpecWidthFixture.starts_with_two_candidates
+455/730 Test #455: test_server_unit.AdaptiveSpecWidthFixture.starts_with_two_candidates ...................................................................   Passed    0.03 sec
+        Start 456: test_server_unit.AdaptiveSpecWidthFixture.clean_drafts_probe_upward
+456/730 Test #456: test_server_unit.AdaptiveSpecWidthFixture.clean_drafts_probe_upward ....................................................................   Passed    0.03 sec
+        Start 457: test_server_unit.AdaptiveSpecWidthFixture.censored_sample_is_not_averaged_down
+457/730 Test #457: test_server_unit.AdaptiveSpecWidthFixture.censored_sample_is_not_averaged_down .........................................................   Passed    0.03 sec
+        Start 458: test_server_unit.AdaptiveSpecWidthFixture.rejection_backs_off_gently
+458/730 Test #458: test_server_unit.AdaptiveSpecWidthFixture.rejection_backs_off_gently ...................................................................   Passed    0.03 sec
+        Start 459: test_server_unit.AdaptiveSpecWidthFixture.respects_model_and_feedback_caps
+459/730 Test #459: test_server_unit.AdaptiveSpecWidthFixture.respects_model_and_feedback_caps .............................................................   Passed    0.03 sec
+        Start 460: test_server_unit.AdaptiveSpecWidthFixture.respects_minimum_width
+460/730 Test #460: test_server_unit.AdaptiveSpecWidthFixture.respects_minimum_width .......................................................................   Passed    0.03 sec
+        Start 461: test_server_unit.AdaptiveSpecWidthFixture.shared_policy_can_back_off_to_two_rows
+461/730 Test #461: test_server_unit.AdaptiveSpecWidthFixture.shared_policy_can_back_off_to_two_rows .......................................................   Passed    0.03 sec
+        Start 462: test_server_unit.AdaptiveSpecWidthFixture.one_row_model_is_valid_with_two_row_floor
+462/730 Test #462: test_server_unit.AdaptiveSpecWidthFixture.one_row_model_is_valid_with_two_row_floor ....................................................   Passed    0.03 sec
+        Start 463: test_server_unit.AdaptiveSpecWidthFixture.disabled_controller_preserves_proposal
+463/730 Test #463: test_server_unit.AdaptiveSpecWidthFixture.disabled_controller_preserves_proposal .......................................................   Passed    0.03 sec
+        Start 464: test_server_unit.AdaptiveSpecWidthFixture.reset_restores_initial_estimate
+464/730 Test #464: test_server_unit.AdaptiveSpecWidthFixture.reset_restores_initial_estimate ..............................................................   Passed    0.03 sec
+        Start 465: test_server_unit.AdaptiveSpecWidthFixture.cost_aware_width_prefers_profitable_depth
+465/730 Test #465: test_server_unit.AdaptiveSpecWidthFixture.cost_aware_width_prefers_profitable_depth ....................................................   Passed    0.03 sec
+        Start 466: test_server_unit.AdaptiveSpecWidthFixture.cost_aware_width_learns_prefix_survival
+466/730 Test #466: test_server_unit.AdaptiveSpecWidthFixture.cost_aware_width_learns_prefix_survival ......................................................   Passed    0.03 sec
+        Start 467: test_server_unit.AdaptiveSpecWidthFixture.observed_cost_updates_only_offered_width
+467/730 Test #467: test_server_unit.AdaptiveSpecWidthFixture.observed_cost_updates_only_offered_width .....................................................   Passed    0.03 sec
+        Start 468: test_server_unit.AdaptiveSpecWidthFixture.nearly_free_fifth_slot_stays_profitable
+468/730 Test #468: test_server_unit.AdaptiveSpecWidthFixture.nearly_free_fifth_slot_stays_profitable ......................................................   Passed    0.03 sec
+        Start 469: test_server_unit.AdaptiveSpecWidthFixture.costly_fifth_slot_backs_off
+469/730 Test #469: test_server_unit.AdaptiveSpecWidthFixture.costly_fifth_slot_backs_off ..................................................................   Passed    0.03 sec
+        Start 470: test_server_unit.AdaptiveSpecWidthFixture.guarded_max_width_requires_clean_streak
+470/730 Test #470: test_server_unit.AdaptiveSpecWidthFixture.guarded_max_width_requires_clean_streak ......................................................   Passed    0.03 sec
+        Start 471: test_server_unit.AdaptiveSpecWidthFixture.guarded_max_width_can_probe_optimistically
+471/730 Test #471: test_server_unit.AdaptiveSpecWidthFixture.guarded_max_width_can_probe_optimistically ...................................................   Passed    0.03 sec
+        Start 472: test_server_unit.AdaptiveSpecWidthFixture.clean_drafts_saturate_at_the_cap
+472/730 Test #472: test_server_unit.AdaptiveSpecWidthFixture.clean_drafts_saturate_at_the_cap .............................................................   Passed    0.03 sec
+        Start 473: test_server_unit.AdaptiveSpecWidthFixture.floor_above_cap_clamps_to_cap
+473/730 Test #473: test_server_unit.AdaptiveSpecWidthFixture.floor_above_cap_clamps_to_cap ................................................................   Passed    0.03 sec
+        Start 474: test_server_unit.AdaptiveSpecWidthFixture.full_rejection_is_the_strongest_narrowing_signal
+474/730 Test #474: test_server_unit.AdaptiveSpecWidthFixture.full_rejection_is_the_strongest_narrowing_signal .............................................   Passed    0.03 sec
+        Start 475: test_server_unit.AdaptiveSpecWidthFixture.cost_aware_collapses_from_q5_to_q2_under_full_rejections
+475/730 Test #475: test_server_unit.AdaptiveSpecWidthFixture.cost_aware_collapses_from_q5_to_q2_under_full_rejections .....................................   Passed    0.03 sec
+        Start 476: test_server_unit.AdaptiveSpecWidthFixture.cost_aware_skips_widths_without_a_usable_cost
+476/730 Test #476: test_server_unit.AdaptiveSpecWidthFixture.cost_aware_skips_widths_without_a_usable_cost ................................................   Passed    0.03 sec
+        Start 477: test_server_unit.AdaptiveSpecWidthFixture.unseeded_width_adopts_first_cost_then_tracks
+477/730 Test #477: test_server_unit.AdaptiveSpecWidthFixture.unseeded_width_adopts_first_cost_then_tracks .................................................   Passed    0.03 sec
+        Start 478: test_server_unit.AdaptiveSpecWidthFixture.seeded_width_holds_its_seed_through_warmup
+478/730 Test #478: test_server_unit.AdaptiveSpecWidthFixture.seeded_width_holds_its_seed_through_warmup ...................................................   Passed    0.03 sec
+        Start 479: test_server_unit.AdaptiveSpecWidthFixture.cost_aware_never_exceeds_the_proposal
+479/730 Test #479: test_server_unit.AdaptiveSpecWidthFixture.cost_aware_never_exceeds_the_proposal ........................................................   Passed    0.03 sec
+        Start 480: test_server_unit.AdaptiveSpecWidthFixture.cost_aware_re_widens_from_q2_when_acceptance_recovers
+480/730 Test #480: test_server_unit.AdaptiveSpecWidthFixture.cost_aware_re_widens_from_q2_when_acceptance_recovers ........................................   Passed    0.03 sec
+        Start 481: test_server_unit.AdaptiveSpecWidthFixture.rejection_below_offered_width_zeroes_deeper_prefixes
+481/730 Test #481: test_server_unit.AdaptiveSpecWidthFixture.rejection_below_offered_width_zeroes_deeper_prefixes .........................................   Passed    0.03 sec
+        Start 482: test_server_unit.AdaptiveSpecWidthFixture.cost_aware_stays_narrow_under_prose_like_acceptance
+482/730 Test #482: test_server_unit.AdaptiveSpecWidthFixture.cost_aware_stays_narrow_under_prose_like_acceptance ..........................................   Passed    0.03 sec
+        Start 483: test_server_unit.AdaptiveSpecWidthFixture.cost_aware_extends_a_short_confidence_vector_with_learned_depths
+483/730 Test #483: test_server_unit.AdaptiveSpecWidthFixture.cost_aware_extends_a_short_confidence_vector_with_learned_depths .............................   Passed    0.03 sec
+        Start 484: test_server_unit.AdaptiveSpecWidthFixture.confidence_scores_are_calibrated_against_the_target
+484/730 Test #484: test_server_unit.AdaptiveSpecWidthFixture.confidence_scores_are_calibrated_against_the_target ..........................................   Passed    0.03 sec
+        Start 485: test_server_unit.AdaptiveSpecWidthFixture.clean_draft_explores_one_width_up_on_a_near_tie
+485/730 Test #485: test_server_unit.AdaptiveSpecWidthFixture.clean_draft_explores_one_width_up_on_a_near_tie ..............................................   Passed    0.03 sec
+        Start 486: test_server_unit.ImmutableGraphInputPoolFixture.identical_layer_inputs_share_storage
+486/730 Test #486: test_server_unit.ImmutableGraphInputPoolFixture.identical_layer_inputs_share_storage ...................................................   Passed    0.03 sec
+        Start 487: test_server_unit.ImmutableGraphInputPoolFixture.different_inputs_are_not_aliased
+487/730 Test #487: test_server_unit.ImmutableGraphInputPoolFixture.different_inputs_are_not_aliased .......................................................   Passed    0.03 sec
+        Start 488: test_server_unit.ImmutableGraphInputPoolFixture.float_bit_patterns_are_preserved
+488/730 Test #488: test_server_unit.ImmutableGraphInputPoolFixture.float_bit_patterns_are_preserved .......................................................   Passed    0.03 sec
+        Start 489: test_server_unit.ImmutableGraphInputPoolFixture.empty_inputs_and_owner_lifetime
+489/730 Test #489: test_server_unit.ImmutableGraphInputPoolFixture.empty_inputs_and_owner_lifetime ........................................................   Passed    0.04 sec
+        Start 490: test_server_unit.ImmutableGraphInputPoolFixture.integer_inputs_can_reuse_the_same_pool
+490/730 Test #490: test_server_unit.ImmutableGraphInputPoolFixture.integer_inputs_can_reuse_the_same_pool .................................................   Passed    0.03 sec
+        Start 491: test_server_unit.MmqTileSelection.default_search_checks_wider_candidates
+491/730 Test #491: test_server_unit.MmqTileSelection.default_search_checks_wider_candidates ...............................................................   Passed    0.03 sec
+        Start 492: test_server_unit.MmqTileSelection.admitted_override_preserves_tuned_width
+492/730 Test #492: test_server_unit.MmqTileSelection.admitted_override_preserves_tuned_width ..............................................................   Passed    0.03 sec
+        Start 493: test_server_unit.MmqTileSelection.rejected_override_runs_complete_default_search
+493/730 Test #493: test_server_unit.MmqTileSelection.rejected_override_runs_complete_default_search .......................................................   Passed    0.03 sec
+        Start 494: test_server_unit.MmqTileSelection.automatic_exclusion_does_not_override_explicit_policy
+494/730 Test #494: test_server_unit.MmqTileSelection.automatic_exclusion_does_not_override_explicit_policy ................................................   Passed    0.03 sec
+        Start 495: test_server_unit.MmqTileSelection.short_batches_and_ties_keep_smallest_sufficient_tile
+495/730 Test #495: test_server_unit.MmqTileSelection.short_batches_and_ties_keep_smallest_sufficient_tile .................................................   Passed    0.03 sec
+        Start 496: test_server_unit.MmqTileSelection.eligibility_and_large_column_counts_are_preserved
+496/730 Test #496: test_server_unit.MmqTileSelection.eligibility_and_large_column_counts_are_preserved ....................................................   Passed    0.03 sec
+        Start 497: test_server_unit.MixedMmqPolicy.operation_metadata_is_independent
+497/730 Test #497: test_server_unit.MixedMmqPolicy.operation_metadata_is_independent ......................................................................   Passed    0.03 sec
+        Start 498: test_server_unit.MixedMmqPolicy.interleaved_backends_and_replay_preserve_policy
+498/730 Test #498: test_server_unit.MixedMmqPolicy.interleaved_backends_and_replay_preserve_policy ........................................................   Passed    0.30 sec
+        Start 499: test_server_unit.MixedMmqPolicy.dense_glu_fusion_preserves_matvec_dispatch
+499/730 Test #499: test_server_unit.MixedMmqPolicy.dense_glu_fusion_preserves_matvec_dispatch .............................................................   Passed    0.20 sec
+        Start 500: test_server_unit.SpecAcceptanceFixture.empty_history_has_zero_rate
+500/730 Test #500: test_server_unit.SpecAcceptanceFixture.empty_history_has_zero_rate .....................................................................   Passed    0.03 sec
+        Start 501: test_server_unit.SpecAcceptanceFixture.final_budget_does_not_penalize_full_acceptance
+501/730 Test #501: test_server_unit.SpecAcceptanceFixture.final_budget_does_not_penalize_full_acceptance ..................................................   Passed    0.03 sec
+        Start 502: test_server_unit.SpecAcceptanceFixture.rejection_bonus_is_not_an_accepted_draft
+502/730 Test #502: test_server_unit.SpecAcceptanceFixture.rejection_bonus_is_not_an_accepted_draft ........................................................   Passed    0.03 sec
+        Start 503: test_server_unit.SpecAcceptanceFixture.early_stop_counts_only_emitted_accepts
+503/730 Test #503: test_server_unit.SpecAcceptanceFixture.early_stop_counts_only_emitted_accepts ..........................................................   Passed    0.03 sec
+        Start 504: test_server_unit.SpecAcceptanceFixture.tree_only_counts_actual_topology_with_root
+504/730 Test #504: test_server_unit.SpecAcceptanceFixture.tree_only_counts_actual_topology_with_root ......................................................   Passed    0.03 sec
+        Start 505: test_server_unit.SpecAcceptanceFixture.mixed_tree_chain_and_ar_tail_keep_one_denominator
+505/730 Test #505: test_server_unit.SpecAcceptanceFixture.mixed_tree_chain_and_ar_tail_keep_one_denominator ...............................................   Passed    0.03 sec
+        Start 506: test_server_unit.SpecAcceptanceFixture.seed_only_tree_and_variable_chain_widths_stay_bounded
+506/730 Test #506: test_server_unit.SpecAcceptanceFixture.seed_only_tree_and_variable_chain_widths_stay_bounded ...........................................   Passed    0.03 sec
+        Start 507: test_server_unit.SpecAcceptanceFixture.final_tree_budget_matches_chain_accounting
+507/730 Test #507: test_server_unit.SpecAcceptanceFixture.final_tree_budget_matches_chain_accounting ......................................................   Passed    0.03 sec
+        Start 508: test_server_unit.Ds4EnvFixture.split_kv_aliases_values_and_kill_switch_precedence
+508/730 Test #508: test_server_unit.Ds4EnvFixture.split_kv_aliases_values_and_kill_switch_precedence ......................................................   Passed    0.03 sec
+        Start 509: test_server_unit.KvflashUbatchFixture.rounded_to_chunk_multiple_never_below_one_chunk
+509/730 Test #509: test_server_unit.KvflashUbatchFixture.rounded_to_chunk_multiple_never_below_one_chunk ..................................................   Passed    0.03 sec
+        Start 510: test_server_unit.KvflashUbatchFixture.clamped_to_pool
+510/730 Test #510: test_server_unit.KvflashUbatchFixture.clamped_to_pool ..................................................................................   Passed    0.03 sec
+        Start 511: test_server_unit.AdaptiveKeepRatioFixture.default_construction
+511/730 Test #511: test_server_unit.AdaptiveKeepRatioFixture.default_construction .........................................................................   Passed    0.03 sec
+        Start 512: test_server_unit.AdaptiveKeepRatioFixture.first_turn_sets_ema_to_observed
+512/730 Test #512: test_server_unit.AdaptiveKeepRatioFixture.first_turn_sets_ema_to_observed ..............................................................   Passed    0.03 sec
+        Start 513: test_server_unit.AdaptiveKeepRatioFixture.high_accept_decreases_keep
+513/730 Test #513: test_server_unit.AdaptiveKeepRatioFixture.high_accept_decreases_keep ...................................................................   Passed    0.03 sec
+        Start 514: test_server_unit.AdaptiveKeepRatioFixture.low_accept_increases_keep
+514/730 Test #514: test_server_unit.AdaptiveKeepRatioFixture.low_accept_increases_keep ....................................................................   Passed    0.03 sec
+        Start 515: test_server_unit.AdaptiveKeepRatioFixture.in_band_no_change
+515/730 Test #515: test_server_unit.AdaptiveKeepRatioFixture.in_band_no_change ............................................................................   Passed    0.03 sec
+        Start 516: test_server_unit.AdaptiveKeepRatioFixture.respects_lower_bound
+516/730 Test #516: test_server_unit.AdaptiveKeepRatioFixture.respects_lower_bound .........................................................................   Passed    0.03 sec
+        Start 517: test_server_unit.AdaptiveKeepRatioFixture.respects_upper_bound
+517/730 Test #517: test_server_unit.AdaptiveKeepRatioFixture.respects_upper_bound .........................................................................   Passed    0.03 sec
+        Start 518: test_server_unit.AdaptiveKeepRatioFixture.ten_turn_convergence_high_accept
+518/730 Test #518: test_server_unit.AdaptiveKeepRatioFixture.ten_turn_convergence_high_accept .............................................................   Passed    0.03 sec
+        Start 519: test_server_unit.AdaptiveKeepRatioFixture.escalation_far_outside_band
+519/730 Test #519: test_server_unit.AdaptiveKeepRatioFixture.escalation_far_outside_band ..................................................................   Passed    0.03 sec
+        Start 520: test_server_unit.AdaptiveKeepRatioFixture.sessions_isolated
+520/730 Test #520: test_server_unit.AdaptiveKeepRatioFixture.sessions_isolated ............................................................................   Passed    0.03 sec
+        Start 521: test_server_unit.AdaptiveKeepRatioFixture.unknown_session_returns_default
+521/730 Test #521: test_server_unit.AdaptiveKeepRatioFixture.unknown_session_returns_default ..............................................................   Passed    0.03 sec
+        Start 522: test_server_unit.AdaptiveKeepRatioFixture.get_ema_reflects_post_update_value
+522/730 Test #522: test_server_unit.AdaptiveKeepRatioFixture.get_ema_reflects_post_update_value ...........................................................   Passed    0.03 sec
+        Start 523: test_server_unit.AdaptiveKeepRatioFixture.lru_eviction_bounds_map_size
+523/730 Test #523: test_server_unit.AdaptiveKeepRatioFixture.lru_eviction_bounds_map_size .................................................................   Passed    0.03 sec
+        Start 524: test_server_unit.SkipParkGuardFixture.T1_not_requested_stays_off
+524/730 Test #524: test_server_unit.SkipParkGuardFixture.T1_not_requested_stays_off .......................................................................   Passed    0.03 sec
+        Start 525: test_server_unit.SkipParkGuardFixture.T2_big_card_any_ctx
+525/730 Test #525: test_server_unit.SkipParkGuardFixture.T2_big_card_any_ctx ..............................................................................   Passed    0.03 sec
+        Start 526: test_server_unit.SkipParkGuardFixture.T3_small_card_small_ctx_allowed
+526/730 Test #526: test_server_unit.SkipParkGuardFixture.T3_small_card_small_ctx_allowed ..................................................................   Passed    0.03 sec
+        Start 527: test_server_unit.SkipParkGuardFixture.T4_small_card_big_ctx_downgraded
+527/730 Test #527: test_server_unit.SkipParkGuardFixture.T4_small_card_big_ctx_downgraded .................................................................   Passed    0.03 sec
+        Start 528: test_server_unit.SkipParkGuardFixture.T5_boundary_ctx_one_over
+528/730 Test #528: test_server_unit.SkipParkGuardFixture.T5_boundary_ctx_one_over .........................................................................   Passed    0.03 sec
+        Start 529: test_server_unit.SkipParkGuardFixture.T6_boundary_vram_just_under_32g
+529/730 Test #529: test_server_unit.SkipParkGuardFixture.T6_boundary_vram_just_under_32g ..................................................................   Passed    0.03 sec
+        Start 530: test_server_unit.BanditIntegrationFixture.three_turn_session_evolves_keep_ratio
+530/730 Test #530: test_server_unit.BanditIntegrationFixture.three_turn_session_evolves_keep_ratio ........................................................   Passed    0.03 sec
+        Start 531: test_server_unit.BanditIntegrationFixture.no_session_id_uses_static_default
+531/730 Test #531: test_server_unit.BanditIntegrationFixture.no_session_id_uses_static_default ............................................................   Passed    0.03 sec
+        Start 532: test_server_unit.BanditIntegrationFixture.isolated_sessions
+532/730 Test #532: test_server_unit.BanditIntegrationFixture.isolated_sessions ............................................................................   Passed    0.03 sec
+        Start 533: test_server_unit.BanditIntegrationFixture.multi_turn_reaches_lower_bound
+533/730 Test #533: test_server_unit.BanditIntegrationFixture.multi_turn_reaches_lower_bound ...............................................................   Passed    0.03 sec
+        Start 534: test_server_unit.BanditIntegrationFixture.multi_turn_reaches_upper_bound
+534/730 Test #534: test_server_unit.BanditIntegrationFixture.multi_turn_reaches_upper_bound ...............................................................   Passed    0.03 sec
+        Start 535: test_server_unit.BanditIntegrationFixture.zero_accept_drives_keep_up
+535/730 Test #535: test_server_unit.BanditIntegrationFixture.zero_accept_drives_keep_up ...................................................................   Passed    0.03 sec
+        Start 536: test_server_unit.BanditIntegrationFixture.non_string_session_id_integer_extra_body
+536/730 Test #536: test_server_unit.BanditIntegrationFixture.non_string_session_id_integer_extra_body .....................................................   Passed    0.03 sec
+        Start 537: test_server_unit.BanditIntegrationFixture.non_string_session_id_null_top_level
+537/730 Test #537: test_server_unit.BanditIntegrationFixture.non_string_session_id_null_top_level .........................................................   Passed    0.03 sec
+        Start 538: test_server_unit.BanditIntegrationFixture.non_string_session_id_array_extra_body
+538/730 Test #538: test_server_unit.BanditIntegrationFixture.non_string_session_id_array_extra_body .......................................................   Passed    0.03 sec
+        Start 539: test_server_unit.AdmissionFixture.test_small_prompt_no_compression_accepts
+539/730 Test #539: test_server_unit.AdmissionFixture.test_small_prompt_no_compression_accepts .............................................................   Passed    0.03 sec
+        Start 540: test_server_unit.AdmissionFixture.test_oversized_no_compression_rejects
+540/730 Test #540: test_server_unit.AdmissionFixture.test_oversized_no_compression_rejects ................................................................   Passed    0.03 sec
+        Start 541: test_server_unit.AdmissionFixture.test_oversized_with_compression_accepts
+541/730 Test #541: test_server_unit.AdmissionFixture.test_oversized_with_compression_accepts ..............................................................   Passed    0.03 sec
+        Start 542: test_server_unit.AdmissionFixture.test_exactly_at_limit_accepts
+542/730 Test #542: test_server_unit.AdmissionFixture.test_exactly_at_limit_accepts ........................................................................   Passed    0.03 sec
+        Start 543: test_server_unit.AdmissionFixture.test_one_over_limit_no_compression_rejects
+543/730 Test #543: test_server_unit.AdmissionFixture.test_one_over_limit_no_compression_rejects ...........................................................   Passed    0.03 sec
+        Start 544: test_server_unit.AdmissionFixture.test_one_over_limit_with_compression_accepts
+544/730 Test #544: test_server_unit.AdmissionFixture.test_one_over_limit_with_compression_accepts .........................................................   Passed    0.03 sec
+        Start 545: test_server_unit.AdmissionFixture.test_effective_overflows_compressed_within_budget
+545/730 Test #545: test_server_unit.AdmissionFixture.test_effective_overflows_compressed_within_budget ....................................................   Passed    0.03 sec
+        Start 546: test_server_unit.AdmissionFixture.test_effective_overflows_full_cache_hit_uses_served_size
+546/730 Test #546: test_server_unit.AdmissionFixture.test_effective_overflows_full_cache_hit_uses_served_size .............................................   Passed    0.03 sec
+        Start 547: test_server_unit.AdmissionFixture.test_effective_overflows_post_compress_genuinely_oversized
+547/730 Test #547: test_server_unit.AdmissionFixture.test_effective_overflows_post_compress_genuinely_oversized ...........................................   Passed    0.03 sec
+        Start 548: test_server_unit.AdmissionFixture.test_effective_overflows_verbatim_within_budget
+548/730 Test #548: test_server_unit.AdmissionFixture.test_effective_overflows_verbatim_within_budget ......................................................   Passed    0.03 sec
+        Start 549: test_server_unit.AdmissionFixture.test_effective_overflows_zero_length_hit_is_a_hit
+549/730 Test #549: test_server_unit.AdmissionFixture.test_effective_overflows_zero_length_hit_is_a_hit ....................................................   Passed    0.03 sec
+        Start 550: test_server_unit.AdmissionFixture.test_effective_overflows_full_cache_hit_still_too_large
+550/730 Test #550: test_server_unit.AdmissionFixture.test_effective_overflows_full_cache_hit_still_too_large ..............................................   Passed    0.03 sec
+        Start 551: test_server_unit.RestoreDeltaFixture.restore_delta_excludes_cached_prefix
+551/730 Test #551: test_server_unit.RestoreDeltaFixture.restore_delta_excludes_cached_prefix ..............................................................   Passed    0.03 sec
+        Start 552: test_server_unit.RestoreDeltaFixture.restore_delta_empty_on_full_hit
+552/730 Test #552: test_server_unit.RestoreDeltaFixture.restore_delta_empty_on_full_hit ...................................................................   Passed    0.03 sec
+        Start 553: test_server_unit.RestoreDeltaFixture.restore_delta_rejects_long_prefix
+553/730 Test #553: test_server_unit.RestoreDeltaFixture.restore_delta_rejects_long_prefix .................................................................   Passed    0.03 sec
+        Start 554: test_server_unit.ChainRollbackPolicyFixture.policy_defaults_and_env_parsing
+554/730 Test #554: test_server_unit.ChainRollbackPolicyFixture.policy_defaults_and_env_parsing ............................................................   Passed    0.04 sec
+        Start 555: test_server_unit.ChainRollbackPolicyFixture.split_fast_rollback_is_explicitly_opt_in
+555/730 Test #555: test_server_unit.ChainRollbackPolicyFixture.split_fast_rollback_is_explicitly_opt_in ...................................................   Passed    0.03 sec
+        Start 556: test_server_unit.ChainRollbackPolicyFixture.split_checkpoint_dtype_is_gated_at_allocation
+556/730 Test #556: test_server_unit.ChainRollbackPolicyFixture.split_checkpoint_dtype_is_gated_at_allocation ..............................................   Passed    0.03 sec
+        Start 557: test_server_unit.ChainRollbackPolicyFixture.asymmetric_v_cache_is_ling_only
+557/730 Test #557: test_server_unit.ChainRollbackPolicyFixture.asymmetric_v_cache_is_ling_only ............................................................   Passed    0.04 sec
+        Start 558: test_server_unit.ChainRollbackPolicyFixture.diagnostics_accumulator_and_print_contract
+558/730 Test #558: test_server_unit.ChainRollbackPolicyFixture.diagnostics_accumulator_and_print_contract .................................................   Passed    0.03 sec
+        Start 559: test_server_unit.DdtreeTauFixture.infinite_tau_matches_unpruned_tree
+559/730 Test #559: test_server_unit.DdtreeTauFixture.infinite_tau_matches_unpruned_tree ...................................................................   Passed    0.03 sec
+        Start 560: test_server_unit.DdtreeTauFixture.margin_prunes_low_confidence_branches
+560/730 Test #560: test_server_unit.DdtreeTauFixture.margin_prunes_low_confidence_branches ................................................................   Passed    0.03 sec
+        Start 561: test_server_unit.DdtreeTauFixture.budget_still_caps_within_window
+561/730 Test #561: test_server_unit.DdtreeTauFixture.budget_still_caps_within_window ......................................................................   Passed    0.04 sec
+        Start 562: test_server_unit.DdtreeTauFixture.precomputed_fast_path_preserves_legacy_order
+562/730 Test #562: test_server_unit.DdtreeTauFixture.precomputed_fast_path_preserves_legacy_order .........................................................   Passed    0.04 sec
+        Start 563: test_server_unit.DdtreeTauFixture.chain_seed_respects_margin
+563/730 Test #563: test_server_unit.DdtreeTauFixture.chain_seed_respects_margin ...........................................................................   Passed    0.03 sec
+        Start 564: test_server_unit.DdtreeTauFixture.branch_descendants_use_their_exact_prefix
+564/730 Test #564: test_server_unit.DdtreeTauFixture.branch_descendants_use_their_exact_prefix ............................................................   Passed    0.03 sec
+        Start 565: test_server_unit.DdtreeTauFixture.conditioned_tau_prunes_and_stays_ancestor_closed
+565/730 Test #565: test_server_unit.DdtreeTauFixture.conditioned_tau_prunes_and_stays_ancestor_closed .....................................................   Passed    0.03 sec
+        Start 566: test_server_unit.AnchorTransitiveFixture.transitive_anchor_suite
+566/730 Test #566: test_server_unit.AnchorTransitiveFixture.transitive_anchor_suite .......................................................................   Passed    0.03 sec
+        Start 567: test_server_unit.DrafterEarlyExitScoreRangeFixture.score_range_suite
+567/730 Test #567: test_server_unit.DrafterEarlyExitScoreRangeFixture.score_range_suite ...................................................................   Passed    0.03 sec
+        Start 568: test_server_unit.DrafterTailCaptureGuardFixture.tail_capture_guard_suite
+568/730 Test #568: test_server_unit.DrafterTailCaptureGuardFixture.tail_capture_guard_suite ...............................................................   Passed    0.03 sec
+        Start 569: test_server_unit.DrafterWarmPathRegressionFixture.warm_path_regression_suite
+569/730 Test #569: test_server_unit.DrafterWarmPathRegressionFixture.warm_path_regression_suite ...........................................................   Passed    0.03 sec
+        Start 570: test_server_unit.Qwen3BufferPlanFixture.allocation_policy
+570/730 Test #570: test_server_unit.Qwen3BufferPlanFixture.allocation_policy ..............................................................................   Passed    0.03 sec
+        Start 571: test_server_unit.ModelTestPaths.RejectsMissingRequiredAsset
+571/730 Test #571: test_server_unit.ModelTestPaths.RejectsMissingRequiredAsset ............................................................................   Passed    0.03 sec
+        Start 572: test_server_unit.ModelTestPaths.ResolvesConfiguredDirectory
+572/730 Test #572: test_server_unit.ModelTestPaths.ResolvesConfiguredDirectory ............................................................................   Passed    0.03 sec
+        Start 573: test_server_unit.GgufMmapFixture.gguf_mmap_suite
+573/730 Test #573: test_server_unit.GgufMmapFixture.gguf_mmap_suite .......................................................................................   Passed    0.03 sec
+        Start 574: test_server_unit.KvQuantFixture.kv_quant_suite
+574/730 Test #574: test_server_unit.KvQuantFixture.kv_quant_suite .........................................................................................   Passed    0.03 sec
+        Start 575: test_server_unit.KvflashPlacementFixture.kvflash_placement_decision_suite
+575/730 Test #575: test_server_unit.KvflashPlacementFixture.kvflash_placement_decision_suite ..............................................................   Passed    0.03 sec
+        Start 576: test_server_unit.KvflashPoolSizingFixture.kvflash_pool_sizing_suite
+576/730 Test #576: test_server_unit.KvflashPoolSizingFixture.kvflash_pool_sizing_suite ....................................................................   Passed    0.03 sec
+        Start 577: test_server_unit.KvflashQkFixture.kvflash_qk_suite
+577/730 Test #577: test_server_unit.KvflashQkFixture.kvflash_qk_suite .....................................................................................   Passed    0.03 sec
+        Start 578: test_server_unit.Qwen35MoeRoutingStatsFixture.moe_routing_stats_suite
+578/730 Test #578: test_server_unit.Qwen35MoeRoutingStatsFixture.moe_routing_stats_suite ..................................................................   Passed    0.03 sec
+        Start 579: test_server_unit.Qwen35MoeExpertPlacementFixture.moe_expert_placement_suite
+579/730 Test #579: test_server_unit.Qwen35MoeExpertPlacementFixture.moe_expert_placement_suite ............................................................   Passed    0.03 sec
+        Start 580: test_server_unit.Qwen35MoeSwapManagerFixture.moe_swap_manager_suite
+580/730 Test #580: test_server_unit.Qwen35MoeSwapManagerFixture.moe_swap_manager_suite ....................................................................   Passed    0.03 sec
+        Start 581: test_server_unit.MmqStreamkScheduleFixture.useful_chunk_cap
+581/730 Test #581: test_server_unit.MmqStreamkScheduleFixture.useful_chunk_cap ............................................................................   Passed    0.03 sec
+        Start 582: test_server_unit.MmqStreamkScheduleFixture.unchanged_paths_and_input_guards
+582/730 Test #582: test_server_unit.MmqStreamkScheduleFixture.unchanged_paths_and_input_guards ............................................................   Passed    0.03 sec
+        Start 583: test_server_unit.MoeHybridStorageFixture.single_token_cached_graphs_keep_mixed_mmq_policy
+583/730 Test #583: test_server_unit.MoeHybridStorageFixture.single_token_cached_graphs_keep_mixed_mmq_policy ..............................................   Passed    0.03 sec
+        Start 584: test_server_unit.MoeHybridStorageFixture.storage_identity_includes_mixed_mmq_policy
+584/730 Test #584: test_server_unit.MoeHybridStorageFixture.storage_identity_includes_mixed_mmq_policy ....................................................   Passed    0.03 sec
+        Start 585: test_server_unit.MoeHybridStorageFixture.expert_residency_tracks_model_sized_expert_sets
+585/730 Test #585: test_server_unit.MoeHybridStorageFixture.expert_residency_tracks_model_sized_expert_sets ...............................................   Passed    0.03 sec
+        Start 586: test_server_unit.MoeHybridStorageFixture.heterogeneous_route_balance_scales_with_model_top_k
+586/730 Test #586: test_server_unit.MoeHybridStorageFixture.heterogeneous_route_balance_scales_with_model_top_k ...........................................   Passed    0.03 sec
+        Start 587: test_server_unit.MoeHybridStorageFixture.dynamic_route_balance_uses_physical_owner_maps
+587/730 Test #587: test_server_unit.MoeHybridStorageFixture.dynamic_route_balance_uses_physical_owner_maps ................................................   Passed    0.03 sec
+        Start 588: test_server_unit.MoeHybridStorageFixture.fractional_route_quota_rounds_over_the_batch
+588/730 Test #588: test_server_unit.MoeHybridStorageFixture.fractional_route_quota_rounds_over_the_batch ..................................................   Passed    0.03 sec
+        Start 589: test_model_smoke.SmokeLoadDraft.LoadsConfiguredModel
+589/730 Test #589: test_model_smoke.SmokeLoadDraft.LoadsConfiguredModel ...................................................................................***Skipped   0.03 sec
+        Start 590: test_model_smoke.SmokeLoadTarget.LoadsConfiguredModel
+590/730 Test #590: test_model_smoke.SmokeLoadTarget.LoadsConfiguredModel ..................................................................................***Skipped   0.03 sec
+        Start 591: test_model_smoke.SmokeLoadLagunaTarget.LoadsConfiguredModel
+591/730 Test #591: test_model_smoke.SmokeLoadLagunaTarget.LoadsConfiguredModel ............................................................................***Skipped   0.03 sec
+        Start 592: test_model_smoke.PagedAttention.PartitionedPathMatchesReference
+592/730 Test #592: test_model_smoke.PagedAttention.PartitionedPathMatchesReference ........................................................................   Passed    0.58 sec
+        Start 593: test_model_smoke.PagedAttention.DirectPathMatchesReference
+593/730 Test #593: test_model_smoke.PagedAttention.DirectPathMatchesReference .............................................................................   Passed    0.28 sec
+        Start 594: test_model_smoke.PagedAttention.ActiveSlotsMatchReference
+594/730 Test #594: test_model_smoke.PagedAttention.ActiveSlotsMatchReference ..............................................................................   Passed    0.18 sec
+        Start 595: test_model_smoke.PagedAttention.CompactThreeSlotBucketMatchesReference
+595/730 Test #595: test_model_smoke.PagedAttention.CompactThreeSlotBucketMatchesReference .................................................................   Passed    0.13 sec
+        Start 596: test_model_smoke.PagedAttention.PackedTreesMatchReference
+596/730 Test #596: test_model_smoke.PagedAttention.PackedTreesMatchReference ..............................................................................   Passed    0.33 sec
+        Start 597: test_model_smoke.PagedAttention.CompactArAndFixedChainMatchReference
+597/730 Test #597: test_model_smoke.PagedAttention.CompactArAndFixedChainMatchReference ...................................................................   Passed    0.15 sec
+        Start 598: test_model_smoke.PagedAttention.CyclicParentMetadataIsMasked
+598/730 Test #598: test_model_smoke.PagedAttention.CyclicParentMetadataIsMasked ...........................................................................   Passed    0.13 sec
+        Start 599: test_model_smoke.PagedAttention.RaggedCausalPositionsMatchReference
+599/730 Test #599: test_model_smoke.PagedAttention.RaggedCausalPositionsMatchReference ....................................................................   Passed    0.15 sec
+        Start 600: test_model_smoke.DecodeKvOffloadGpuFixture.QwenSeededContinuationMatchesControl
+600/730 Test #600: test_model_smoke.DecodeKvOffloadGpuFixture.QwenSeededContinuationMatchesControl ........................................................***Skipped   0.03 sec
+        Start 601: test_model_smoke.DecodeKvOffloadGpuFixture.QwenDraftContinuationMatchesControl
+601/730 Test #601: test_model_smoke.DecodeKvOffloadGpuFixture.QwenDraftContinuationMatchesControl .........................................................***Skipped   0.03 sec
+        Start 602: test_model_smoke.DecodeKvOffloadGpuFixture.DeepSeekSeededContinuationMatchesControl
+602/730 Test #602: test_model_smoke.DecodeKvOffloadGpuFixture.DeepSeekSeededContinuationMatchesControl ....................................................***Skipped   0.03 sec
+        Start 603: test_model_smoke.DecodeKvOffloadGpuFixture.QwenRecomputeMatchesFreshReplay
+603/730 Test #603: test_model_smoke.DecodeKvOffloadGpuFixture.QwenRecomputeMatchesFreshReplay .............................................................***Skipped   0.04 sec
+        Start 604: test_model_smoke.DecodeKvOffloadGpuFixture.QwenDraftRecomputeMatchesFreshReplay
+604/730 Test #604: test_model_smoke.DecodeKvOffloadGpuFixture.QwenDraftRecomputeMatchesFreshReplay ........................................................***Skipped   0.03 sec
+        Start 605: test_model_smoke.DecodeKvOffloadGpuFixture.DeepSeekRecomputeMatchesFreshReplay
+605/730 Test #605: test_model_smoke.DecodeKvOffloadGpuFixture.DeepSeekRecomputeMatchesFreshReplay .........................................................***Skipped   0.03 sec
+        Start 606: test_blocking_row_pool.BlockingRowPoolFixture.mixed_widths_complete_exactly_once
+606/730 Test #606: test_blocking_row_pool.BlockingRowPoolFixture.mixed_widths_complete_exactly_once .......................................................   Passed    0.01 sec
+        Start 607: test_blocking_row_pool.BlockingRowPoolFixture.concurrent_clients_do_not_mix_jobs
+607/730 Test #607: test_blocking_row_pool.BlockingRowPoolFixture.concurrent_clients_do_not_mix_jobs .......................................................   Passed    0.00 sec
+        Start 608: test_blocking_row_pool.BlockingRowPoolFixture.boundaries_and_idle_wakeup
+608/730 Test #608: test_blocking_row_pool.BlockingRowPoolFixture.boundaries_and_idle_wakeup ...............................................................   Passed    0.02 sec
+        Start 609: test_blocking_row_pool.BlockingRowPoolFixture.worker_count_preserves_unknown_hardware_fallback
+609/730 Test #609: test_blocking_row_pool.BlockingRowPoolFixture.worker_count_preserves_unknown_hardware_fallback .........................................   Passed    0.00 sec
+        Start 610: test_blocking_row_pool.BlockingRowPoolFixture.delayed_inactive_worker_holds_generation_open
+610/730 Test #610: test_blocking_row_pool.BlockingRowPoolFixture.delayed_inactive_worker_holds_generation_open ............................................   Passed    0.00 sec
+        Start 611: test_kernel_qualification_core.KernelQualificationFixture.comparisons
+611/730 Test #611: test_kernel_qualification_core.KernelQualificationFixture.comparisons ..................................................................   Passed    0.00 sec
+        Start 612: test_kernel_qualification_core.KernelQualificationFixture.statuses
+612/730 Test #612: test_kernel_qualification_core.KernelQualificationFixture.statuses .....................................................................   Passed    0.00 sec
+        Start 613: test_kernel_qualification_core.KernelQualificationFixture.report_preserves_double_precision
+613/730 Test #613: test_kernel_qualification_core.KernelQualificationFixture.report_preserves_double_precision ............................................   Passed    0.00 sec
+        Start 614: test_kernel_qualification_core.KernelQualificationFixture.report_rejects_nonfinite_numbers
+614/730 Test #614: test_kernel_qualification_core.KernelQualificationFixture.report_rejects_nonfinite_numbers .............................................   Passed    0.00 sec
+        Start 615: test_platform_compat.PlatformCompatFixture.platform_environment_and_socket_compatibility
+615/730 Test #615: test_platform_compat.PlatformCompatFixture.platform_environment_and_socket_compatibility ...............................................   Passed    0.00 sec
+        Start 616: test_draft_swa.DraftSwaFixture.override_preserves_loaded_mixed_pattern
+616/730 Test #616: test_draft_swa.DraftSwaFixture.override_preserves_loaded_mixed_pattern .................................................................   Passed    0.03 sec
+        Start 617: test_draft_swa.DraftSwaFixture.override_preserves_loaded_all_full_pattern
+617/730 Test #617: test_draft_swa.DraftSwaFixture.override_preserves_loaded_all_full_pattern ..............................................................   Passed    0.03 sec
+        Start 618: test_draft_swa.DraftSwaFixture.override_infers_legacy_pattern_when_metadata_is_missing
+618/730 Test #618: test_draft_swa.DraftSwaFixture.override_infers_legacy_pattern_when_metadata_is_missing .................................................   Passed    0.04 sec
+        Start 619: test_draft_swa.DraftSwaFixture.nonpositive_override_is_a_noop
+619/730 Test #619: test_draft_swa.DraftSwaFixture.nonpositive_override_is_a_noop ..........................................................................   Passed    0.03 sec
+        Start 620: test_draft_swa.DraftSwaFixture.override_is_idempotent
+620/730 Test #620: test_draft_swa.DraftSwaFixture.override_is_idempotent ..................................................................................   Passed    0.03 sec
+        Start 621: test_feature_gate.FeatureGateFixture.feature_gate_suite
+621/730 Test #621: test_feature_gate.FeatureGateFixture.feature_gate_suite ................................................................................   Passed    0.00 sec
+        Start 622: test_feature_gate.BackendPlanFixture.backend_plan_suite
+622/730 Test #622: test_feature_gate.BackendPlanFixture.backend_plan_suite ................................................................................   Passed    0.00 sec
+        Start 623: test_qwen35_split_tree_guard.Qwen35SplitTreeGuardFixture.root_inclusive_pure_chain_guard
+623/730 Test #623: test_qwen35_split_tree_guard.Qwen35SplitTreeGuardFixture.root_inclusive_pure_chain_guard ...............................................   Passed    0.00 sec
+        Start 624: test_recurrent_snapshot.RecurrentSnapshotFixture.validates_paged_tree_capacity_and_uploads
+624/730 Test #624: test_recurrent_snapshot.RecurrentSnapshotFixture.validates_paged_tree_capacity_and_uploads .............................................   Passed    0.03 sec
+        Start 625: test_recurrent_snapshot.RecurrentSnapshotFixture.validates_paged_tree_layout
+625/730 Test #625: test_recurrent_snapshot.RecurrentSnapshotFixture.validates_paged_tree_layout ...........................................................   Passed    0.03 sec
+        Start 626: test_recurrent_snapshot.RecurrentSnapshotFixture.invalidates_paged_tree_graph_cache_key
+626/730 Test #626: test_recurrent_snapshot.RecurrentSnapshotFixture.invalidates_paged_tree_graph_cache_key ................................................   Passed    0.03 sec
+        Start 627: test_recurrent_snapshot.RecurrentSnapshotFixture.snapshot_and_restore_recurrent_state
+627/730 Test #627: test_recurrent_snapshot.RecurrentSnapshotFixture.snapshot_and_restore_recurrent_state ..................................................   Passed    0.04 sec
+        Start 628: test_recurrent_snapshot.RecurrentSnapshotFixture.copied_paged_prefix_uses_fresh_pages
+628/730 Test #628: test_recurrent_snapshot.RecurrentSnapshotFixture.copied_paged_prefix_uses_fresh_pages ..................................................   Passed    0.03 sec
+        Start 629: test_ds4_mix_registry_teardown.Ds4MixRegistryTeardownFixture.unregisters_all_mix_tensor_classes
+629/730 Test #629: test_ds4_mix_registry_teardown.Ds4MixRegistryTeardownFixture.unregisters_all_mix_tensor_classes ........................................   Passed    0.11 sec
+        Start 630: test_ds4_dmix_entry_validation.Ds4DmixEntryValidationFixture.rejects_malformed_dmix_entries
+630/730 Test #630: test_ds4_dmix_entry_validation.Ds4DmixEntryValidationFixture.rejects_malformed_dmix_entries ............................................   Passed    0.03 sec
+        Start 631: test_ggml_rmsnorm_batch.GgmlRmsnormBatchFixture.rmsnorm_batch
+631/730 Test #631: test_ggml_rmsnorm_batch.GgmlRmsnormBatchFixture.rmsnorm_batch ..........................................................................   Passed    0.13 sec
+        Start 632: test_qwen35_tensor_parallel.Qwen35TensorParallelFixture.tensor_parallel_split_state
+632/730 Test #632: test_qwen35_tensor_parallel.Qwen35TensorParallelFixture.tensor_parallel_split_state ....................................................   Passed    0.03 sec
+        Start 633: test_deepseek4_hc_cuda.Deepseek4HcCudaFixture.hc_pre_cpu_parity
+633/730 Test #633: test_deepseek4_hc_cuda.Deepseek4HcCudaFixture.hc_pre_cpu_parity ........................................................................   Passed    0.11 sec
+        Start 634: test_rms_norm_hip.RmsNormHipFixture.rms_norm_matches_cpu
+634/730 Test #634: test_rms_norm_hip.RmsNormHipFixture.rms_norm_matches_cpu ...............................................................................   Passed    0.11 sec
+        Start 635: test_rope_tail.RopeTailFixture.cpu_matches_split_rotate_concat
+635/730 Test #635: test_rope_tail.RopeTailFixture.cpu_matches_split_rotate_concat .........................................................................   Passed    0.03 sec
+        Start 636: test_rope_tail.RopeTailFixture.gpu_matches_split_rotate_concat
+636/730 Test #636: test_rope_tail.RopeTailFixture.gpu_matches_split_rotate_concat .........................................................................   Passed    0.13 sec
+        Start 637: test_paged_kv_pool.PagedKvPoolFixture.block_boundaries
+637/730 Test #637: test_paged_kv_pool.PagedKvPoolFixture.block_boundaries .................................................................................   Passed    0.00 sec
+        Start 638: test_paged_kv_pool.PagedKvPoolFixture.nondefault_block_size
+638/730 Test #638: test_paged_kv_pool.PagedKvPoolFixture.nondefault_block_size ............................................................................   Passed    0.00 sec
+        Start 639: test_paged_kv_pool.PagedKvPoolFixture.reserved_acquire_feeds_chunked_append
+639/730 Test #639: test_paged_kv_pool.PagedKvPoolFixture.reserved_acquire_feeds_chunked_append ............................................................   Passed    0.00 sec
+        Start 640: test_paged_kv_pool.PagedKvPoolFixture.reserved_acquire_is_atomic_and_isolated
+640/730 Test #640: test_paged_kv_pool.PagedKvPoolFixture.reserved_acquire_is_atomic_and_isolated ..........................................................   Passed    0.00 sec
+        Start 641: test_paged_kv_pool.PagedKvPoolFixture.capacity_top_up_is_atomic_and_private
+641/730 Test #641: test_paged_kv_pool.PagedKvPoolFixture.capacity_top_up_is_atomic_and_private ............................................................   Passed    0.00 sec
+        Start 642: test_paged_kv_pool.PagedKvPoolFixture.zero_token_append_is_a_no_op
+642/730 Test #642: test_paged_kv_pool.PagedKvPoolFixture.zero_token_append_is_a_no_op .....................................................................   Passed    0.00 sec
+        Start 643: test_paged_kv_pool.PagedKvPoolFixture.first_last_slots_append
+643/730 Test #643: test_paged_kv_pool.PagedKvPoolFixture.first_last_slots_append ..........................................................................   Passed    0.00 sec
+        Start 644: test_paged_kv_pool.PagedKvPoolFixture.rollback_append_restores_visible_sequence
+644/730 Test #644: test_paged_kv_pool.PagedKvPoolFixture.rollback_append_restores_visible_sequence ........................................................   Passed    0.00 sec
+        Start 645: test_paged_kv_pool.PagedKvPoolFixture.rollback_retry_preserves_mixed_allocation_order
+645/730 Test #645: test_paged_kv_pool.PagedKvPoolFixture.rollback_retry_preserves_mixed_allocation_order ..................................................   Passed    0.00 sec
+        Start 646: test_paged_kv_pool.PagedKvPoolFixture.noncontiguous_reuse_and_isolation
+646/730 Test #646: test_paged_kv_pool.PagedKvPoolFixture.noncontiguous_reuse_and_isolation ................................................................   Passed    0.00 sec
+        Start 647: test_paged_kv_pool.PagedKvPoolFixture.exhaustion_rolls_back
+647/730 Test #647: test_paged_kv_pool.PagedKvPoolFixture.exhaustion_rolls_back ............................................................................   Passed    0.00 sec
+        Start 648: test_paged_kv_pool.PagedKvPoolFixture.request_identity_and_stale_handles
+648/730 Test #648: test_paged_kv_pool.PagedKvPoolFixture.request_identity_and_stale_handles ...............................................................   Passed    0.00 sec
+        Start 649: test_paged_kv_pool.PagedKvPoolFixture.duplicate_request_is_transactional
+649/730 Test #649: test_paged_kv_pool.PagedKvPoolFixture.duplicate_request_is_transactional ...............................................................   Passed    0.00 sec
+        Start 650: test_paged_kv_pool.PagedKvPoolFixture.invalid_arguments
+650/730 Test #650: test_paged_kv_pool.PagedKvPoolFixture.invalid_arguments ................................................................................   Passed    0.00 sec
+        Start 651: test_paged_kv_pool.PagedKvPoolFixture.auto_pool_sizing
+651/730 Test #651: test_paged_kv_pool.PagedKvPoolFixture.auto_pool_sizing .................................................................................   Passed    0.00 sec
+        Start 652: test_paged_kv_pool.DeepSeek4PageLayoutFixture.raw_ring_wraps
+652/730 Test #652: test_paged_kv_pool.DeepSeek4PageLayoutFixture.raw_ring_wraps ...........................................................................   Passed    0.00 sec
+        Start 653: test_paged_kv_pool.DeepSeek4PageLayoutFixture.compressed_page_rows
+653/730 Test #653: test_paged_kv_pool.DeepSeek4PageLayoutFixture.compressed_page_rows .....................................................................   Passed    0.00 sec
+        Start 654: test_paged_kv_pool.DeepSeek4PageLayoutFixture.invalid_geometry
+654/730 Test #654: test_paged_kv_pool.DeepSeek4PageLayoutFixture.invalid_geometry .........................................................................   Passed    0.00 sec
+        Start 655: test_paged_kv_pool.DeepSeek4PagedCacheFixture.pool_capacity
+655/730 Test #655: test_paged_kv_pool.DeepSeek4PagedCacheFixture.pool_capacity ............................................................................   Passed    0.00 sec
+        Start 656: test_paged_kv_pool.DeepSeek4PagedCacheFixture.allocation_plan
+656/730 Test #656: test_paged_kv_pool.DeepSeek4PagedCacheFixture.allocation_plan ..........................................................................   Passed    0.00 sec
+        Start 657: test_paged_kv_pool.DeepSeek4PagedCacheFixture.gathered_lane_history
+657/730 Test #657: test_paged_kv_pool.DeepSeek4PagedCacheFixture.gathered_lane_history ....................................................................   Passed    0.00 sec
+        Start 658: test_paged_kv_pool.DeepSeek4PagedCacheFixture.six_active_lanes
+658/730 Test #658: test_paged_kv_pool.DeepSeek4PagedCacheFixture.six_active_lanes .........................................................................   Passed    0.00 sec
+        Start 659: test_paged_kv_pool.DeepSeek4PagedCacheFixture.raw_ring_boundary
+659/730 Test #659: test_paged_kv_pool.DeepSeek4PagedCacheFixture.raw_ring_boundary ........................................................................   Passed    0.00 sec
+        Start 660: test_paged_kv_pool.DeepSeek4PagedCacheFixture.ratio128_history
+660/730 Test #660: test_paged_kv_pool.DeepSeek4PagedCacheFixture.ratio128_history .........................................................................   Passed    0.00 sec
+        Start 661: test_paged_kv_pool.DeepSeek4PagedCacheFixture.invalid_active_pages
+661/730 Test #661: test_paged_kv_pool.DeepSeek4PagedCacheFixture.invalid_active_pages .....................................................................   Passed    0.00 sec
+        Start 662: test_rocmfp3_mix_registry.Rocmfp3MixRegistryFixture.registry_lifecycle
+662/730 Test #662: test_rocmfp3_mix_registry.Rocmfp3MixRegistryFixture.registry_lifecycle .................................................................   Passed    0.26 sec
+        Start 663: test_rocmfp_mix_slice_matvec.RocmfpMixSliceMatvecFixture.slice_matvec_matches_reference
+663/730 Test #663: test_rocmfp_mix_slice_matvec.RocmfpMixSliceMatvecFixture.slice_matvec_matches_reference ................................................   Passed    0.11 sec
+        Start 664: test_rocmfp_mix_gateup_glu.RocmfpMixGateupGluFixture.fp2_fused_gateup_glu_and_paged_dispatch
+664/730 Test #664: test_rocmfp_mix_gateup_glu.RocmfpMixGateupGluFixture.fp2_fused_gateup_glu_and_paged_dispatch ...........................................   Passed    0.14 sec
+        Start 665: test_rocmfp_mix_gateup_glu.RocmfpMixGateupGluFixture.fp3_fused_gateup_glu_and_paged_dispatch
+665/730 Test #665: test_rocmfp_mix_gateup_glu.RocmfpMixGateupGluFixture.fp3_fused_gateup_glu_and_paged_dispatch ...........................................   Passed    0.14 sec
+        Start 666: test_rocmfp_mix_gateup_glu.RocmfpMixGateupGluFixture.paged_dispatch_on_nonzero_device
+666/730 Test #666: test_rocmfp_mix_gateup_glu.RocmfpMixGateupGluFixture.paged_dispatch_on_nonzero_device ..................................................***Skipped   0.08 sec
+        Start 667: test_rocmfp_mix_glu_fusable.RocmfpMixGluFusableFixture.admission_predicate
+667/730 Test #667: test_rocmfp_mix_glu_fusable.RocmfpMixGluFusableFixture.admission_predicate .............................................................   Passed    0.03 sec
+        Start 668: deepseek4_mmid_grouped_cuda_reject_parent_width
+668/730 Test #668: deepseek4_mmid_grouped_cuda_reject_parent_width ........................................................................................   Passed    0.04 sec
+        Start 669: deepseek4_mmid_grouped_cuda_benchmark_accounting
+669/730 Test #669: deepseek4_mmid_grouped_cuda_benchmark_accounting .......................................................................................   Passed    0.04 sec
+        Start 670: deepseek4_mmid_grouped_cuda_benchmark_config
+670/730 Test #670: deepseek4_mmid_grouped_cuda_benchmark_config ...........................................................................................   Passed    1.35 sec
+        Start 671: deepseek4_mmid_grouped_cuda_parent_benchmark
+671/730 Test #671: deepseek4_mmid_grouped_cuda_parent_benchmark ...........................................................................................   Passed    0.08 sec
+        Start 672: deepseek4_mmid_grouped_cuda_no_gpu
+672/730 Test #672: deepseek4_mmid_grouped_cuda_no_gpu .....................................................................................................   Passed    0.32 sec
+        Start 673: deepseek4_mmid_grouped_cuda_combine_override
+673/730 Test #673: deepseek4_mmid_grouped_cuda_combine_override ...........................................................................................   Passed    0.13 sec
+        Start 674: ds4_maskless_prefill_defaults
+674/730 Test #674: ds4_maskless_prefill_defaults ..........................................................................................................   Passed    0.21 sec
+        Start 675: ds4_maskless_prefill_disabled
+675/730 Test #675: ds4_maskless_prefill_disabled ..........................................................................................................   Passed    0.21 sec
+        Start 676: ds4_maskless_prefill_f32
+676/730 Test #676: ds4_maskless_prefill_f32 ...............................................................................................................   Passed    1.99 sec
+        Start 677: ds4_maskless_prefill_short
+677/730 Test #677: ds4_maskless_prefill_short .............................................................................................................   Passed    0.14 sec
+        Start 678: ds4_maskless_prefill_defaults_f32
+678/730 Test #678: ds4_maskless_prefill_defaults_f32 ......................................................................................................   Passed    0.20 sec
+        Start 679: ds4_maskless_prefill_disabled_f32
+679/730 Test #679: ds4_maskless_prefill_disabled_f32 ......................................................................................................   Passed    0.21 sec
+        Start 680: ds4_maskless_prefill_short_f32
+680/730 Test #680: ds4_maskless_prefill_short_f32 .........................................................................................................   Passed    0.14 sec
+        Start 681: ds4_load_transactional
+681/730 Test #681: ds4_load_transactional .................................................................................................................   Passed    0.03 sec
+        Start 682: ds4_budget_hook
+682/730 Test #682: ds4_budget_hook ........................................................................................................................   Passed    0.00 sec
+        Start 683: server_unit_entrypoint_cache_defaults
+683/730 Test #683: server_unit_entrypoint_cache_defaults ..................................................................................................   Passed    0.07 sec
+        Start 684: server_unit_pi_harness_timeout
+684/730 Test #684: server_unit_pi_harness_timeout .........................................................................................................   Passed    0.06 sec
+        Start 685: server_unit_client_harness_timeouts
+685/730 Test #685: server_unit_client_harness_timeouts ....................................................................................................   Passed    0.17 sec
+        Start 686: cuda_pool_shutdown
+686/730 Test #686: cuda_pool_shutdown .....................................................................................................................   Passed    0.16 sec
+        Start 687: rocmfp4_reference
+687/730 Test #687: rocmfp4_reference ......................................................................................................................   Passed    0.00 sec
+        Start 688: rocmfpx_reference
+688/730 Test #688: rocmfpx_reference ......................................................................................................................   Passed    0.00 sec
+        Start 689: test_rocmfp4_hip_tail
+689/730 Test #689: test_rocmfp4_hip_tail ..................................................................................................................   Passed    0.10 sec
+        Start 690: test_rocmfpx_mmq
+690/730 Test #690: test_rocmfpx_mmq .......................................................................................................................   Passed   14.66 sec
+        Start 691: test_gfx1151_width4_dispatch
+691/730 Test #691: test_gfx1151_width4_dispatch ...........................................................................................................   Passed    0.95 sec
+        Start 692: test_ds4_mmid_regression
+692/730 Test #692: test_ds4_mmid_regression ...............................................................................................................   Passed    0.11 sec
+        Start 693: test_qwen35_gdn_verify_fusion
+693/730 Test #693: test_qwen35_gdn_verify_fusion ..........................................................................................................   Passed    0.23 sec
+        Start 694: test_softmax_sink_col
+694/730 Test #694: test_softmax_sink_col ..................................................................................................................   Passed    0.20 sec
+        Start 695: test_mul_mat_host_input
+695/730 Test #695: test_mul_mat_host_input ................................................................................................................   Passed    0.16 sec
+        Start 696: test_rms_norm_scale
+696/730 Test #696: test_rms_norm_scale ....................................................................................................................   Passed    1.35 sec
+        Start 697: test_fattn_mma256
+697/730 Test #697: test_fattn_mma256 ......................................................................................................................   Passed    0.72 sec
+        Start 698: test_mmb_cublas_diff
+698/730 Test #698: test_mmb_cublas_diff ...................................................................................................................   Passed    0.81 sec
+        Start 699: test_convert_vec
+699/730 Test #699: test_convert_vec .......................................................................................................................   Passed    0.11 sec
+        Start 700: test_getrows_scalar
+700/730 Test #700: test_getrows_scalar ....................................................................................................................   Passed    0.13 sec
+        Start 701: test_paged_attn_wmma
+701/730 Test #701: test_paged_attn_wmma ...................................................................................................................***Skipped   0.08 sec
+        Start 702: deepseek4_mmid_grouped_cuda
+702/730 Test #702: deepseek4_mmid_grouped_cuda ............................................................................................................   Passed   13.46 sec
+        Start 703: test_ds4_moe_combine_cuda
+703/730 Test #703: test_ds4_moe_combine_cuda ..............................................................................................................   Passed    0.16 sec
+        Start 704: test_ds4_maskless_prefill
+704/730 Test #704: test_ds4_maskless_prefill ..............................................................................................................   Passed    1.57 sec
+        Start 705: draft_topk_cuda
+705/730 Test #705: draft_topk_cuda ........................................................................................................................   Passed    0.51 sec
+        Start 706: deepseek4_unit
+706/730 Test #706: deepseek4_unit .........................................................................................................................   Passed   11.03 sec
+        Start 707: test_deepseek4_roctx
+707/730 Test #707: test_deepseek4_roctx ...................................................................................................................   Passed    0.01 sec
+        Start 708: test_qwen35_roctx
+708/730 Test #708: test_qwen35_roctx ......................................................................................................................   Passed    0.00 sec
+        Start 709: test_seq_slot_manager
+709/730 Test #709: test_seq_slot_manager ..................................................................................................................   Passed    0.00 sec
+        Start 710: test_seq_engine_contract
+710/730 Test #710: test_seq_engine_contract ...............................................................................................................   Passed    0.00 sec
+        Start 711: test_parallel_prefix_txn
+711/730 Test #711: test_parallel_prefix_txn ...............................................................................................................   Passed    0.00 sec
+        Start 712: test_ddtree_path
+712/730 Test #712: test_ddtree_path .......................................................................................................................   Passed    0.00 sec
+        Start 713: test_chain_spec_shapes
+713/730 Test #713: test_chain_spec_shapes .................................................................................................................   Passed    0.00 sec
+        Start 714: test_dflash2_selector_validation
+714/730 Test #714: test_dflash2_selector_validation .......................................................................................................   Passed    0.00 sec
+        Start 715: test_draft_swa_multilane
+715/730 Test #715: test_draft_swa_multilane ...............................................................................................................***Skipped   0.03 sec
+        Start 716: test_seq_batch_plan
+716/730 Test #716: test_seq_batch_plan ....................................................................................................................   Passed    0.00 sec
+        Start 717: test_client_send_buffer
+717/730 Test #717: test_client_send_buffer ................................................................................................................   Passed    0.00 sec
+        Start 718: test_moe_input_ready
+718/730 Test #718: test_moe_input_ready ...................................................................................................................   Passed    0.00 sec
+        Start 719: test_ggml_meta_split_layout
+719/730 Test #719: test_ggml_meta_split_layout ............................................................................................................   Passed    0.00 sec
+        Start 720: test_delta_net_specla
+720/730 Test #720: test_delta_net_specla ..................................................................................................................   Passed    0.47 sec
+        Start 721: paged_attn_wmma_route
+721/730 Test #721: paged_attn_wmma_route ..................................................................................................................***Skipped   0.07 sec
+        Start 722: kernel_qualification_gdn
+722/730 Test #722: kernel_qualification_gdn ...............................................................................................................   Passed    0.13 sec
+        Start 723: kernel_qualification_moe_ds4
+723/730 Test #723: kernel_qualification_moe_ds4 ...........................................................................................................   Passed    0.76 sec
+        Start 724: batched_gdn
+724/730 Test #724: batched_gdn ............................................................................................................................   Passed    0.13 sec
+        Start 725: batched_gdn_cpu
+725/730 Test #725: batched_gdn_cpu ........................................................................................................................   Passed    0.04 sec
+        Start 726: gdn_replay_log
+726/730 Test #726: gdn_replay_log .........................................................................................................................   Passed    7.32 sec
+        Start 727: gdn_replay_log_gallocr
+727/730 Test #727: gdn_replay_log_gallocr .................................................................................................................   Passed    0.20 sec
+        Start 728: gdn_replay_log_preflight
+728/730 Test #728: gdn_replay_log_preflight ...............................................................................................................   Passed    0.12 sec
+        Start 729: concat_transpose
+729/730 Test #729: concat_transpose .......................................................................................................................   Passed    0.20 sec
+        Start 730: server_cli_model_names
+730/730 Test #730: server_cli_model_names .................................................................................................................   Passed    0.29 sec
+
+100% tests passed, 0 tests failed out of 730
+
+Total Test time (real) =  95.92 sec
+
+The following tests did not run:
+	589 - test_model_smoke.SmokeLoadDraft.LoadsConfiguredModel (Skipped)
+	590 - test_model_smoke.SmokeLoadTarget.LoadsConfiguredModel (Skipped)
+	591 - test_model_smoke.SmokeLoadLagunaTarget.LoadsConfiguredModel (Skipped)
+	600 - test_model_smoke.DecodeKvOffloadGpuFixture.QwenSeededContinuationMatchesControl (Skipped)
+	601 - test_model_smoke.DecodeKvOffloadGpuFixture.QwenDraftContinuationMatchesControl (Skipped)
+	602 - test_model_smoke.DecodeKvOffloadGpuFixture.DeepSeekSeededContinuationMatchesControl (Skipped)
+	603 - test_model_smoke.DecodeKvOffloadGpuFixture.QwenRecomputeMatchesFreshReplay (Skipped)
+	604 - test_model_smoke.DecodeKvOffloadGpuFixture.QwenDraftRecomputeMatchesFreshReplay (Skipped)
+	605 - test_model_smoke.DecodeKvOffloadGpuFixture.DeepSeekRecomputeMatchesFreshReplay (Skipped)
+	666 - test_rocmfp_mix_gateup_glu.RocmfpMixGateupGluFixture.paged_dispatch_on_nonzero_device (Skipped)
+	701 - test_paged_attn_wmma (Skipped)
+	715 - test_draft_swa_multilane (Skipped)
+	721 - paged_attn_wmma_route (Skipped)

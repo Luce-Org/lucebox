@@ -165,6 +165,7 @@ void free_qwen4exp_cache(Qwen4ExpCache & c) {
     c.ple_layer_ids.clear();
     c.full_layer_ids.clear();
     c.linear_layer_ids.clear();
+    c.ple_prev.clear();
     c.cur_pos = 0;
     c.max_ctx = 0;
 }
@@ -182,6 +183,7 @@ void reset_qwen4exp_state(ggml_backend_t backend, Qwen4ExpCache & c) {
     }
     c.cur_pos = 0;
     c.indexer_blocks = 0;
+    c.ple_prev.clear();
 }
 
 }  // namespace dflash::common

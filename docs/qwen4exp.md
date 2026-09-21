@@ -36,41 +36,59 @@ end-to-end timings include decode + warmup and hide 1-2% changes).
 
 Decode ~29 tok/s (autoregressive; MTP is not wired yet).
 
-## Enablement / env
+## Serving and environment
 
-Best-known IQ4_NL prefill config on gfx1151:
-`QWEN4EXP_QSA=1 QWEN4EXP_MMB_CUBLAS=5 DFLASH_MMB_SHADOW=1 LLAMA_MMB_HC16=2 QWEN4EXP_LAST_TOKEN_FFN=1`.
-Use `GGML_CUDA_MMB=1`, `GGML_DS4_INDEXER_M32_CACHE_B=0`, and `--chunk 16384`.
-The September 20 measurements use minimum TTFT of eight (best throughput),
-not minimum throughput; see the linked experiment for all samples and gates.
+The backend is single-sequence. It does not implement paged attention, a shared
+KV pool, concurrent decode slots, speculative decoding, layer split, or remote
+drafting. Use `--chunk 16384` for long prefill; there is no `QWEN4EXP_CHUNK`
+environment variable.
 
-- `QWEN4EXP_QSA` — QSA selected attention (chunked prefill via the indexer-K cache).
-  This switch is presence-based: unset it to disable; `=0` still enables QSA.
-- `QWEN4EXP_RMS_SCALE_FUSED` — defaults on for eligible RDNA3.5 F32 width-128
-  RMS_NORM + SCALE pairs; preserves the original intermediate rounding. Set `0`
-  for the two-kernel fallback.
-- `QWEN4EXP_LAST_TOKEN_FFN=1` — evaluate only the final output row in the last
-  layer's HC/FFN after attention/cache updates. Opt-in because GEMM dispatch and
-  rounding change. IQ4_NL quality was validated; other fast model profiles were
-  not. The upstream reference profile already performs this row selection.
-- `QWEN4EXP_MMB_CUBLAS` — route quantized GEMM shapes to cuBLAS/hipBLASLt via a
-  bf16 weight shadow (1/3/5 add ssm_out and HC down/up).
-- `DFLASH_MMB_SHADOW` — bf16 weight shadow mode (1 = IQ4_NL/Q5_K, 2 = Q6_K).
-- `LLAMA_MMB_HC16` — keep the hyper-connection normalized stream bf16-only.
-- `QWEN4EXP_CHUNK` — prefill chunk size (16384 recommended; smaller sizes still
-  populate the indexer cache).
+The measured gfx1151 IQ4_NL configuration is:
 
-Upstream comparison profile (opt-in): `QWEN4EXP_UPSTREAM=1`. It uses padded
-256-row dense K/V and masks, upstream F32 MRoPE angles, unfused HC/MoE, and
-last-token-only final FFN evaluation, and upstream vector-dot dispatch. It
-preserves the shipped defaults. Use `GGML_CUDA_MMB=0` for bitwise comparisons
-and start with the QSA/shadow performance flags unset.
-For individual A/Bs, `QWEN4EXP_FA_PAD256=1` enables padding and
-`QWEN4EXP_ROPE_F32=1` selects F32 MRoPE. Other RoPE modes retain FP64 angles.
-The RDNA3.5 head-256 MMA selector uses upstream's GQA divisor (4 for 24/2
-heads) and 64-column prefill configuration. It is enabled by either profile/
-padding flag above, or an explicit `DFLASH27B_FA256_MMA=1`; otherwise existing
-RDNA3.5 QSA/padded callers retain their shipped selector.
+```
+DFLASH_HIP_NO_AUTO_UMA=1 GGML_CUDA_MMB=1 QWEN4EXP_QSA=1 \
+QWEN4EXP_MMB_CUBLAS=5 DFLASH_MMB_SHADOW=1 LLAMA_MMB_HC16=2
+```
+
+The following variables are supported serving controls or temporary burn-in
+kill switches:
+
+| Variable | Default | Purpose |
+|---|---:|---|
+| `DFLASH_HIP_NO_AUTO_UMA` | unset | Disable automatic managed-memory selection. Set to `1` on unified-memory systems when explicit placement is required. |
+| `DFLASH_HIP_UMA_MIN_FRAC` | `0.35` | Minimum fraction of device memory that automatic UMA placement must leave free. |
+| `QWEN4EXP_QSA` | `0` | `1` enables sparse selected attention for eligible prefill chunks. Decode remains dense. |
+| `QWEN4EXP_MMB_CUBLAS` | `0` | Select validated bf16-shadow rocBLAS routes: `1`, `3`, and `5` progressively add dense shapes. Mode `2` is a diagnostic broad route and is not safe for serving. |
+| `DFLASH_MMB_SHADOW` | `2` | Weight-shadow policy: `0` off, `1` IQ4_NL/Q5_K, `2` Q6_K. |
+| `DFLASH_MMB_SHADOW_CAP_MB` | `40960` | Process-wide cap for bf16 weight shadows. |
+| `LLAMA_MMB_HC16` | `0` | `2` keeps eligible hyper-connection streams in bf16 between consumers. |
+| `QWEN4EXP_DENSE_TABLE` | `1` | Kill switch for the gfx1151, exactly-16366-token measured MMQ dispatch table. Disabled by `QWEN4EXP_UPSTREAM`. |
+| `QWEN4EXP_HC_TILE16` | `1` | Kill switch for the measured IQ4_NL 16-row hyper-connection tile. Disabled by `QWEN4EXP_UPSTREAM`. |
+| `QWEN4EXP_RMS_SCALE_FUSED` | `1` | Kill switch for eligible RDNA3.5 F32 width-128 RMS-Norm-plus-scale fusion. |
+| `QWEN4EXP_LAST_TOKEN_FFN` | `1` | Kill switch for final-row-only evaluation after the last layer has completed its state writes. |
+| `QWEN4EXP_DECODE_REUSE` | `1` | Kill switch for reuse of the T=1 ggml context and graph allocator. |
+| `QWEN4EXP_DECODE_STABLEGRAPH` | `1` | Kill switch for bucketed, pointer-stable T=1 graphs. HIP graph capture itself still depends on a `GGML_HIP_GRAPHS` build. |
+
+These variables are diagnostics and differential-test controls; they are not
+production tuning requirements:
+
+| Variable(s) | Purpose |
+|---|---|
+| `QWEN4EXP_UPSTREAM` | Select reference-compatible graph, attention, RoPE, and dispatch paths. Optimizations that can change numerics exclude themselves under this profile. |
+| `QWEN4EXP_HC_UNFUSED`, `QWEN4EXP_MOE_UNFUSED`, `QWEN4EXP_GDNL2_LEGACY` | Restore individual unfused or legacy numerical paths for differential bisection. |
+| `QWEN4EXP_FA_PAD256`, `QWEN4EXP_ROPE_F32` | Isolate the reference padded-attention and F32-angle RoPE behavior. |
+| `QWEN4EXP_DENSE_PROBE` | Benchmark candidate dense GEMM routes on real tensors. It changes execution timing and must not be used for serving. |
+| `QWEN4EXP_HC_TILE_CHECK` | Byte-compare the 16-row HC tile against the original tile and abort on mismatch. |
+| `QWEN4EXP_PROF`, `QWEN4EXP_FA_TELEMETRY`, `QWEN4EXP_STABLEGRAPH_TELEMETRY` | Print graph phase, attention route, or stable-graph telemetry. |
+| `QWEN4EXP_MM_LOG`, `QWEN4EXP_CUBLAS_LOG`, `DFLASH_MMB_TELEMETRY` | Print matrix shape and dispatch telemetry. |
+| `QWEN4EXP_DUMP`, `QWEN4EXP_DUMP_BIN` | Materialize and dump internal graph activations for the differential harness. |
+| `DFLASH_HIP_NO_PINNED_STAGE`, `DFLASH_HIP_NO_UMA_RING` | Disable pinned staging or the qwen4exp pinned input ring for diagnosis. |
+| `DFLASH_GDN_NO_TILED`, `DFLASH_GDN_FORCE_GROUPED_COLS`, `DFLASH_GDN_NO_GROUPED_COLS` | Override GDN kernel dispatch for profiling and bisection. |
+
+The differential tools additionally use `QWEN4EXP_LLAMA_TREE`,
+`QWEN4EXP_TOKEN_FILE`, and `QWEN4EXP_UP_DUMP_BIN`. The benchmark harness accepts
+`QWEN4EXP_SERVER`, `QWEN4EXP_MODEL`, and `QWEN4EXP_DIFF_PORT`; these do not
+change backend execution.
 
 ## Benchmarking and correctness
 

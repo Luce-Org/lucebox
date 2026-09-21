@@ -2989,7 +2989,6 @@ static bool ggml_cuda_mmb_cublas_shape_ok(const ggml_tensor * src0) {
     return false;
 }
 
-bool ggml_cuda_mmb_glu_down(ggml_backend_cuda_context &, ggml_tensor *, ggml_tensor *, ggml_tensor *, ggml_tensor *);
 extern int ggml_cuda_mmb_probe_tile;
 static int qwen_dense_probe_route = 0;
 
@@ -5524,16 +5523,6 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                             if (!ok) continue;
 
-                            if (op == GGML_OP_MUL_MAT_ID && i + 3 < cgraph->n_nodes &&
-                                ggml_can_fuse_subgraph(cgraph, i, {op, op, GGML_OP_GLU, GGML_OP_MUL_MAT_ID}, {i + 3})) {
-                                int outputs[] = {i + 3};
-                                if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 4, outputs, 1) &&
-                                    ggml_cuda_mmb_glu_down(*cuda_ctx, gate, up, glu, cgraph->nodes[i + 3])) {
-                                    fused_mul_mat_vec = true;
-                                    fused_node_count = 4;
-                                    break;
-                                }
-                            }
                             if (ggml_cuda_try_fuse_mul_mat_glu(*cuda_ctx, gate, up, glu)) {
                                 fused_mul_mat_vec = true;
                                 fused_node_count = 3;
@@ -5677,15 +5666,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
 #if defined(GGML_USE_HIP)
                 cudaEvent_t pev0 = nullptr, pev1 = nullptr;
-                if (g_op_prof) { hipEventCreate(&pev0); hipEventCreate(&pev1); cudaEventRecord(pev0, cuda_ctx->stream()); }
+                if (g_op_prof) {
+                    CUDA_CHECK(hipEventCreate(&pev0));
+                    CUDA_CHECK(hipEventCreate(&pev1));
+                    CUDA_CHECK(cudaEventRecord(pev0, cuda_ctx->stream()));
+                }
 #endif
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
 #if defined(GGML_USE_HIP)
                 if (g_op_prof) {
-                    cudaEventRecord(pev1, cuda_ctx->stream());
-                    cudaEventSynchronize(pev1);
+                    CUDA_CHECK(cudaEventRecord(pev1, cuda_ctx->stream()));
+                    CUDA_CHECK(cudaEventSynchronize(pev1));
                     float ms = 0.0f;
-                    hipEventElapsedTime(&ms, pev0, pev1);
+                    CUDA_CHECK(hipEventElapsedTime(&ms, pev0, pev1));
                     g_op_ms[(int) node->op] += ms;
                     g_op_n[(int) node->op]++;
                     if (node->op == GGML_OP_MUL_MAT && node->src[0]) {
@@ -5693,7 +5686,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         g_mm_ms[key] += ms;
                         g_mm_n[key]++;
                     }
-                    cudaEventDestroy(pev0); cudaEventDestroy(pev1);
+                    CUDA_CHECK(cudaEventDestroy(pev0));
+                    CUDA_CHECK(cudaEventDestroy(pev1));
                 }
 #endif
                 if (!ok) {
