@@ -29,6 +29,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `GGML_CUDA_GRAPH_STATS` | unset | DEBUG: per-graph CUDA-graph replay/capture/eager counters. |
 | `GGML_CUDA_GRAPH_STATS_EVERY` | 200 | DEBUG: print period for the stats above (clamped to >=1). |
 | `LUCE_HIP_NO_AUTO_UMA` | unset | Set to `1` to disable automatic unified-memory placement; required by the qwen4exp gfx1151 measured configuration. |
+| `LUCE_HIP_NO_UMA_RING` | unset | DEBUG: disable the qwen4exp pinned input ring for diagnosis. |
 | `QWEN4EXP_QSA` | 0 | `1` enables qwen4exp prefill selected attention. Decode remains dense. |
 | `QWEN4EXP_MMB_CUBLAS` | 0 | Qwen4exp validated bf16-shadow dense route (`1`, `3`, or `5`). Mode `2` is diagnostic only. |
 | `LUCE_MMB_SHADOW` | 2 | Shared MMB bf16 weight-shadow policy (`0` off, `1` IQ4_NL/Q5_K, `2` Q6_K). |

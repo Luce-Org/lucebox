@@ -16,7 +16,7 @@
 
 #include <string>
 
-namespace dflash::common {
+namespace luce::common {
 
 struct Qwen4ExpBackendConfig {
     std::string     model_path;
@@ -68,4 +68,4 @@ private:
     bool                  parked_  = false;
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

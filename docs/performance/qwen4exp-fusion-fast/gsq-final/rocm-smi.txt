@@ -1,0 +1,53 @@
+
+
+============================ ROCm System Management Interface ============================
+============================== Version of System Component ===============================
+Driver version: 7.0.0-31-generic
+==========================================================================================
+====================================== Temperature =======================================
+GPU[0]		: Temperature (Sensor edge) (C): 32.0
+GPU[0]		: Temperature (Sensor junction) (C): 33.0
+GPU[0]		: Temperature (Sensor memory) (C): 30.0
+GPU[1]		: Temperature (Sensor edge) (C): 37.0
+==========================================================================================
+=============================== Current clock frequencies ================================
+GPU[0]		: dcefclk clock level: 1: (219Mhz)
+GPU[0]		: fclk clock level: 1: (582Mhz)
+GPU[0]		: mclk clock level: 0: (96Mhz)
+GPU[0]		: sclk clock level: S: (41Mhz)
+GPU[0]		: socclk clock level: 0: (417Mhz)
+GPU[0]		: pcie clock level: 13 (8.0GT/s x2)
+GPU[1]		: fclk clock level: 7: (2000Mhz)
+GPU[1]		: mclk clock level: 2: (1000Mhz)
+GPU[1]		: sclk clock level: 2: (2900Mhz)
+GPU[1]		: socclk clock level: 6: (1472Mhz)
+==========================================================================================
+================================= Show Performance Level =================================
+GPU[0]		: Performance Level: manual
+GPU[1]		: Performance Level: high
+==========================================================================================
+=================================== Power Consumption ====================================
+GPU[0]		: Average Graphics Package Power (W): 17.0
+GPU[1]		: Current Socket Graphics Package Power (W): 18.095
+==========================================================================================
+====================================== Product Info ======================================
+GPU[0]		: Card Series: 		AMD Radeon Graphics
+GPU[0]		: Card Model: 		0x7551
+GPU[0]		: Card Vendor: 		Advanced Micro Devices, Inc. [AMD/ATI]
+GPU[0]		: Card SKU: 		G287BP00
+GPU[0]		: Subsystem ID: 	0x000a
+GPU[0]		: Device Rev: 		0xc0
+GPU[0]		: Node ID: 		1
+GPU[0]		: GUID: 		59838
+GPU[0]		: GFX Version: 		gfx1201
+GPU[1]		: Card Series: 		Radeon 8060S Graphics
+GPU[1]		: Card Model: 		0x1586
+GPU[1]		: Card Vendor: 		Advanced Micro Devices, Inc. [AMD/ATI]
+GPU[1]		: Card SKU: 		STRXLGEN
+GPU[1]		: Subsystem ID: 	0x000a
+GPU[1]		: Device Rev: 		0xc1
+GPU[1]		: Node ID: 		2
+GPU[1]		: GUID: 		15588
+GPU[1]		: GFX Version: 		gfx1151
+==========================================================================================
+================================== End of ROCm SMI Log ===================================

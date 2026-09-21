@@ -17,7 +17,7 @@
 #include <utility>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 namespace {
 
 static double prof_now_ms() {
@@ -271,7 +271,11 @@ ggml_tensor * build_linear_attn(ggml_context * c, ggml_cgraph * gf, ggml_tensor 
     ggml_build_forward_expand(gf, ggml_cpy(c, new_hist,
         ggml_reshape_3d(c, conv_state, kernel - 1, conv_channels, 1)));
 
-    ggml_tensor * conv = ggml_silu(c, ggml_ssm_conv(c, conv_input, L.ssm_conv1d));
+    ggml_tensor * conv_op = ggml_ssm_conv(c, conv_input, L.ssm_conv1d);
+    // The gfx1151 fusion reads CONCAT's input at this later node. src[3] is
+    // unused by ordinary SSM_CONV and gives the allocator the real lifetime.
+    conv_op->src[3] = qkv_t;
+    ggml_tensor * conv = ggml_silu(c, conv_op);
     if (dump_mark) {
         char dlab[32];
         std::snprintf(dlab, sizeof dlab, "L%02d.conv", il);
@@ -725,6 +729,9 @@ ggml_tensor * build_ple(ggml_context * c, ggml_cgraph * gf, ggml_tensor * hidden
         ggml_tensor * shifted = ggml_cont(c, ggml_transpose(c,
             ggml_view_3d(c, padded, T, hc_dim, 1, padded->nb[1], padded->nb[2],
                          ggml_row_size(padded->type, start))));
+        // The fused kernel runs at the first CONT and reads norm_t directly.
+        // CONT ignores src[1], so use it as the allocator dependency edge.
+        if (k == 0) shifted->src[1] = norm_t;
         ggml_tensor * wk = ggml_cont(c,
             ggml_view_2d(c, L.ple_conv1d, 1, hc_dim, L.ple_conv1d->nb[1],
                          k * L.ple_conv1d->nb[0]));
@@ -1362,4 +1369,4 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
     return res;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

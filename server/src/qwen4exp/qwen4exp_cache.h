@@ -13,11 +13,11 @@
 
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 // UMA graph-input ring: forward inputs in pinned host memory the iGPU reads
 // over GTT (no H2D staging). Two slots rotate so the host never overwrites
-// inputs a still-submitted graph may read. Opt out: DFLASH_HIP_NO_UMA_RING=1.
+// inputs a still-submitted graph may read. Opt out: LUCE_HIP_NO_UMA_RING=1.
 struct Qwen4ExpInputRing {
     bool                  enabled    = false;
     int                   next_slot  = 0;
@@ -105,4 +105,4 @@ void clear_qwen4exp_decode_workspace(Qwen4ExpDecodeWorkspace & workspace);
 // intact; callers that need a clean sequence also reset cur_pos themselves.
 void reset_qwen4exp_state(ggml_backend_t backend, Qwen4ExpCache & c);
 
-}  // namespace dflash::common
+}  // namespace luce::common

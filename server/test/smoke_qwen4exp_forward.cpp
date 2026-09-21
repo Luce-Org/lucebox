@@ -22,7 +22,7 @@
 #include <vector>
 #include <fstream>
 
-using namespace dflash::common;
+using namespace luce::common;
 
 namespace {
 

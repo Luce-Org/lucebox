@@ -3119,7 +3119,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             }
         }
     }
-    static const bool dense_telemetry = getenv("DFLASH_MMB_TELEMETRY") != nullptr;
+    static const bool dense_telemetry = getenv("LUCE_MMB_TELEMETRY") != nullptr;
     static const bool mm_shape_log = getenv("QWEN4EXP_MM_LOG") != nullptr;
     if (mm_shape_log) {
         static std::set<std::tuple<long long, long long, int>> seen;

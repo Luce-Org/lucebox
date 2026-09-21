@@ -1,7 +1,7 @@
 # Qwen3.8-Flash-Next (`qwen4exp`) backend
 
 Hand-written ggml graph and CUDA/HIP kernels for `Qwen/Qwen3.8-Flash-Next`, the
-experimental hybrid-attention MoE. Runs on the existing `dflash_server`
+experimental hybrid-attention MoE. Runs on the existing `luce_server`
 (`--target-device hip:0`), alongside the DFlash/PFlash backends.
 
 ## Model
@@ -46,8 +46,8 @@ environment variable.
 The measured gfx1151 IQ4_NL configuration is:
 
 ```
-DFLASH_HIP_NO_AUTO_UMA=1 GGML_CUDA_MMB=1 QWEN4EXP_QSA=1 \
-QWEN4EXP_MMB_CUBLAS=5 DFLASH_MMB_SHADOW=1 LLAMA_MMB_HC16=2
+LUCE_HIP_NO_AUTO_UMA=1 GGML_CUDA_MMB=1 QWEN4EXP_QSA=1 \
+QWEN4EXP_MMB_CUBLAS=5 LUCE_MMB_SHADOW=1 LLAMA_MMB_HC16=2
 ```
 
 The following variables are supported serving controls or temporary burn-in
@@ -55,12 +55,12 @@ kill switches:
 
 | Variable | Default | Purpose |
 |---|---:|---|
-| `DFLASH_HIP_NO_AUTO_UMA` | unset | Disable automatic managed-memory selection. Set to `1` on unified-memory systems when explicit placement is required. |
-| `DFLASH_HIP_UMA_MIN_FRAC` | `0.35` | Minimum fraction of device memory that automatic UMA placement must leave free. |
+| `LUCE_HIP_NO_AUTO_UMA` | unset | Disable automatic managed-memory selection. Set to `1` on unified-memory systems when explicit placement is required. |
+| `LUCE_HIP_UMA_MIN_FRAC` | `0.45` | Model-allocation fraction of system RAM above which integrated GPUs select managed memory. |
 | `QWEN4EXP_QSA` | `0` | `1` enables sparse selected attention for eligible prefill chunks. Decode remains dense. |
 | `QWEN4EXP_MMB_CUBLAS` | `0` | Select validated bf16-shadow rocBLAS routes: `1`, `3`, and `5` progressively add dense shapes. Mode `2` is a diagnostic broad route and is not safe for serving. |
-| `DFLASH_MMB_SHADOW` | `2` | Weight-shadow policy: `0` off, `1` IQ4_NL/Q5_K, `2` Q6_K. |
-| `DFLASH_MMB_SHADOW_CAP_MB` | `40960` | Process-wide cap for bf16 weight shadows. |
+| `LUCE_MMB_SHADOW` | `2` | Weight-shadow policy: `0` off, `1` IQ4_NL/Q5_K, `2` Q6_K. |
+| `LUCE_MMB_SHADOW_CAP_MB` | `40960` | Process-wide cap for bf16 weight shadows. |
 | `LLAMA_MMB_HC16` | `0` | `2` keeps eligible hyper-connection streams in bf16 between consumers. |
 | `QWEN4EXP_DENSE_TABLE` | `1` | Kill switch for the gfx1151, exactly-16366-token measured MMQ dispatch table. Disabled by `QWEN4EXP_UPSTREAM`. |
 | `QWEN4EXP_HC_TILE16` | `1` | Kill switch for the measured IQ4_NL 16-row hyper-connection tile. Disabled by `QWEN4EXP_UPSTREAM`. |
@@ -80,10 +80,10 @@ production tuning requirements:
 | `QWEN4EXP_DENSE_PROBE` | Benchmark candidate dense GEMM routes on real tensors. It changes execution timing and must not be used for serving. |
 | `QWEN4EXP_HC_TILE_CHECK` | Byte-compare the 16-row HC tile against the original tile and abort on mismatch. |
 | `QWEN4EXP_PROF`, `QWEN4EXP_FA_TELEMETRY`, `QWEN4EXP_STABLEGRAPH_TELEMETRY` | Print graph phase, attention route, or stable-graph telemetry. |
-| `QWEN4EXP_MM_LOG`, `QWEN4EXP_CUBLAS_LOG`, `DFLASH_MMB_TELEMETRY` | Print matrix shape and dispatch telemetry. |
+| `QWEN4EXP_MM_LOG`, `QWEN4EXP_CUBLAS_LOG`, `LUCE_MMB_TELEMETRY` | Print matrix shape and dispatch telemetry. |
 | `QWEN4EXP_DUMP`, `QWEN4EXP_DUMP_BIN` | Materialize and dump internal graph activations for the differential harness. |
-| `DFLASH_HIP_NO_PINNED_STAGE`, `DFLASH_HIP_NO_UMA_RING` | Disable pinned staging or the qwen4exp pinned input ring for diagnosis. |
-| `DFLASH_GDN_NO_TILED`, `DFLASH_GDN_FORCE_GROUPED_COLS`, `DFLASH_GDN_NO_GROUPED_COLS` | Override GDN kernel dispatch for profiling and bisection. |
+| `LUCE_HIP_NO_PINNED_STAGE`, `LUCE_HIP_NO_UMA_RING` | Disable pinned staging or the qwen4exp pinned input ring for diagnosis. |
+| `LUCE_GDN_NO_TILED`, `LUCE_GDN_FORCE_GROUPED_COLS`, `LUCE_GDN_NO_GROUPED_COLS` | Override GDN kernel dispatch for profiling and bisection. |
 
 The differential tools additionally use `QWEN4EXP_LLAMA_TREE`,
 `QWEN4EXP_TOKEN_FILE`, and `QWEN4EXP_UP_DUMP_BIN`. The benchmark harness accepts

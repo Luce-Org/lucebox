@@ -704,14 +704,14 @@ static std::unordered_map<const void *, uint16_t *> g_mmb_shadow;
 static std::map<std::pair<const void *, const void *>, uint16_t *> g_mmb_shadow_pair;   // concat(w0, w1) along rows -> BF16 copy
 static size_t g_mmb_shadow_bytes = 0;
 int    mmb_shadow_mode(){
-    static const int m = []() { const char * e = getenv("DFLASH_MMB_SHADOW"); return e ? atoi(e) : 2; }();
+    static const int m = []() { const char * e = getenv("LUCE_MMB_SHADOW"); return e ? atoi(e) : 2; }();
     return m;
 }
 bool   mmb_shadow()    { return mmb_shadow_mode() != 0; }
 bool   mmb_shadow_q6k(){ return mmb_shadow_mode() >= 1; }
 size_t mmb_shadow_cap(){
     static const size_t c = []() {
-        const char * e = getenv("DFLASH_MMB_SHADOW_CAP_MB");
+        const char * e = getenv("LUCE_MMB_SHADOW_CAP_MB");
         return (size_t) (e ? atoll(e) : 6144) << 20;
     }();
     return c;

@@ -17,14 +17,19 @@ static __global__ void ple_concat_tail(const float * __restrict__ state, const f
                                        const int C, const int T, const int H, const int tail_from, const int row_stride) {
     const int ncols = T + H - tail_from;
     const int64_t idx = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= (int64_t) C * ncols) return;
-    const int c = (int) (idx / ncols), j = tail_from + (int) (idx % ncols);
-    out[(size_t) c * row_stride + j] = (j < H) ? state[c * H + j] : x[(size_t) (j - H) * C + c];
+    if (idx >= (int64_t) C * (H + ncols)) return;
+    const int c = (int) (idx / (H + ncols)), col = (int) (idx % (H + ncols));
+    if (col < H) {
+        out[(size_t) c * row_stride + col] = state[c * H + col];
+    } else {
+        const int j = tail_from + col - H;
+        out[(size_t) c * row_stride + j] = (j < H) ? state[c * H + j] : x[(size_t) (j - H) * C + c];
+    }
 }
 
 template <int K, int DIL, int TT, typename W>
-static __global__ void __launch_bounds__(256) ple_conv_kernel(const float * __restrict__ state, const float * __restrict__ x,
-        const W * __restrict__ w, float * __restrict__ y, const int C, const int T) {
+static __global__ void __launch_bounds__(256) ple_conv_kernel(const float * __restrict__ saved_state, const float * __restrict__ x,
+        const W * __restrict__ w, float * __restrict__ y, const int C, const int T, const int state_stride) {
     constexpr int H = (K - 1) * DIL, WIN = H + 1;
     const int c = blockIdx.x * 256 + threadIdx.x, t0 = blockIdx.y * TT;
     if (c >= C) return;
@@ -32,7 +37,7 @@ static __global__ void __launch_bounds__(256) ple_conv_kernel(const float * __re
 #pragma unroll
     for (int k = 0; k < K; ++k) wr[k] = ggml_cuda_cast<float>(w[c * K + k]);
     float win[WIN];
-    auto ld = [&](int jp) -> float { return (jp < H) ? state[c * H + jp] : ((jp - H) < T ? x[(size_t) (jp - H) * C + c] : 0.0f); };
+    auto ld = [&](int jp) -> float { return (jp < H) ? saved_state[(size_t) c * state_stride + jp] : ((jp - H) < T ? x[(size_t) (jp - H) * C + c] : 0.0f); };
 #pragma unroll
     for (int k = 0; k < WIN; ++k) win[k] = ld(t0 + k);
     const int tend = min(T, t0 + TT);
@@ -148,7 +153,7 @@ static bool ple_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_ple_conv
             std::find(casts.begin(), casts.end(), cgraph->nodes[n]) != casts.end()) outputs.push_back(n);
     }
     if (!ggml_can_fuse_subgraph_ext(cgraph, indices.data(), (int) indices.size(), ops.data(), outputs.data(), (int) outputs.size())) return false;
-    m.concat_idx = i; m.first_tap_idx = first_tap; m.silu_idx = silu; m.x = x; m.state = st; m.concat = cc; m.w = wroot; m.out = cgraph->nodes[silu];
+    m.concat_idx = i; m.first_tap_idx = first_tap; m.silu_idx = silu; m.input = tr; m.state = st; m.concat = cc; m.w = wroot; m.out = cgraph->nodes[silu];
     m.C = C; m.T = T; m.H = H; m.K = 4; m.dil = 3; m.tail_from = tail_from;
     return true;
 }
@@ -162,9 +167,9 @@ bool ggml_cuda_ple_conv_match_at_tap(const ggml_cgraph * cgraph, int i, ggml_cud
     return false;
 }
 void ggml_cuda_ple_conv_write_tail(ggml_backend_cuda_context & ctx, const ggml_cuda_ple_conv_match & m) {
-    const int ncols = (int) (m.T + m.H - m.tail_from); if (ncols <= 0) return;
-    const int64_t n = m.C * ncols;
-    ple_concat_tail<<<(unsigned) ((n + 255) / 256), 256, 0, ctx.stream()>>>((const float *) m.state->data, (const float *) m.x->data,
+    const int ncols = (int) (m.T + m.H - m.tail_from);
+    const int64_t n = m.C * (m.H + ncols);
+    ple_concat_tail<<<(unsigned) ((n + 255) / 256), 256, 0, ctx.stream()>>>((const float *) m.state->data, (const float *) m.input->data,
         (float *) m.concat->data, (int) m.C, (int) m.T, (int) m.H, (int) m.tail_from, (int) (m.concat->nb[1] / sizeof(float)));
     CUDA_CHECK(cudaGetLastError());
 }
@@ -172,11 +177,11 @@ void ggml_cuda_ple_conv_direct(ggml_backend_cuda_context & ctx, const ggml_cuda_
     constexpr int TT = 128;
     dim3 grid((unsigned) (m.C / 256), (unsigned) ((m.T + TT - 1) / TT));
     if (m.w->type == GGML_TYPE_F32) {
-        ple_conv_kernel<4, 3, TT, float><<<grid, 256, 0, ctx.stream()>>>((const float *) m.state->data, (const float *) m.x->data,
-            (const float *) m.w->data, (float *) m.out->data, (int) m.C, (int) m.T);
+        ple_conv_kernel<4, 3, TT, float><<<grid, 256, 0, ctx.stream()>>>((const float *) m.concat->data, (const float *) m.input->data,
+            (const float *) m.w->data, (float *) m.out->data, (int) m.C, (int) m.T, (int) (m.concat->nb[1] / sizeof(float)));
     } else {
-        ple_conv_kernel<4, 3, TT, half><<<grid, 256, 0, ctx.stream()>>>((const float *) m.state->data, (const float *) m.x->data,
-            (const half *) m.w->data, (float *) m.out->data, (int) m.C, (int) m.T);
+        ple_conv_kernel<4, 3, TT, half><<<grid, 256, 0, ctx.stream()>>>((const float *) m.concat->data, (const float *) m.input->data,
+            (const half *) m.w->data, (float *) m.out->data, (int) m.C, (int) m.T, (int) (m.concat->nb[1] / sizeof(float)));
     }
     CUDA_CHECK(cudaGetLastError());
 }

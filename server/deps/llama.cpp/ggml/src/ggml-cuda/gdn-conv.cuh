@@ -2,7 +2,7 @@
 #include "common.cuh"
 struct ggml_cuda_gdn_conv_match {
     int concat_idx = -1, conv_idx = -1;   // node indices
-    const ggml_tensor * x = nullptr;      // [C, T] F32 contiguous (root of the transpose view)
+    const ggml_tensor * input = nullptr;  // CONCAT src[1], transpose view of [C, T]
     const ggml_tensor * state = nullptr;  // [3, C] F32 contiguous
     const ggml_tensor * concat = nullptr; // [T+3, C] F32
     const ggml_tensor * w = nullptr;

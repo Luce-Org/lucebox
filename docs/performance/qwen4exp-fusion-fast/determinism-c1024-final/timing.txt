@@ -1,0 +1,3 @@
+/tmp/qwen4exp-fusion-fast-evidence/determinism-c1024-final/run1.log:DUMP cut=1024 prompt_len=1025 indexer_blocks=256 prefill_ms=3011.568 bytes=144784108 path=/tmp/qwen4exp-fusion-fast-evidence/determinism-c1024-final/run1.bin
+/tmp/qwen4exp-fusion-fast-evidence/determinism-c1024-final/run2.log:DUMP cut=1024 prompt_len=1025 indexer_blocks=256 prefill_ms=2827.769 bytes=144784108 path=/tmp/qwen4exp-fusion-fast-evidence/determinism-c1024-final/run2.bin
+/tmp/qwen4exp-fusion-fast-evidence/determinism-c1024-final/run3.log:DUMP cut=1024 prompt_len=1025 indexer_blocks=256 prefill_ms=2712.529 bytes=144784108 path=/tmp/qwen4exp-fusion-fast-evidence/determinism-c1024-final/run3.bin
