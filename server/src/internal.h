@@ -623,6 +623,11 @@ struct PrefixSnapshot {
     //     [HEAD_DIM, kv_end-kv_start, N_HEAD_KV] (smaller than cache).
     //   - ssm_state_snap, conv_state_snap, target_feat_snap are NOT
     //     allocated (THIN snapshots are KV-only).
+    // For Layout::paged:
+    //   - target_feat_snap is optional. Speculating engines capture the
+    //     sequence slot's live drafter feature-ring slab so a restored prefix
+    //     keeps the draft window warm; engines without speculation leave it
+    //     null and pay nothing.
 };
 
 // Snapshot the slim state of `cache` into `snap`. KV tensors are RIGHT-SIZED
@@ -647,21 +652,28 @@ void free_prefix_snapshot(PrefixSnapshot & snap);
 // Exact CPU-buffer allocation size for the dense checkpoint layout used by
 // snapshot_paged_target_cache(). Returns zero when the cache topology or token
 // count is invalid. This lets the scheduler enforce a resident-memory budget
-// before allocating or copying a checkpoint.
+// before allocating or copying a checkpoint. `with_target_feat` must match the
+// capture call so the estimate covers the optional drafter feature payload.
 size_t estimate_paged_target_cache_snapshot_bytes(
-    const TargetCache & cache, int token_count);
+    const TargetCache & cache, int token_count, bool with_target_feat = false);
 
 // Capture one live sequence from a multi-slot paged cache. Attention rows are
 // gathered through `block_table` into dense logical order in the copied
 // snapshot; recurrent state is copied only from `seq_slot`'s slab. The page
 // table itself is intentionally not retained: every restore owns fresh pages.
+// When `with_target_feat` is set and the cache owns a drafter feature ring,
+// the slot's live ring slab is captured verbatim (ring slots are absolute
+// positions mod cap, so the first min(token_count, cap) slab rows are
+// self-describing on restore). Engines without speculation pass false and
+// keep the checkpoint at KV + recurrent state only.
 bool snapshot_paged_target_cache(
     const TargetCache & cache,
     int seq_slot,
     const std::vector<uint32_t> & block_table,
     int block_size,
     int token_count,
-    PrefixSnapshot & snap);
+    PrefixSnapshot & snap,
+    bool with_target_feat = false);
 
 // Atomically replace a paged snapshot. The incumbent remains valid when
 // allocation, layout validation, or any staged copy fails.
@@ -671,11 +683,14 @@ bool replace_paged_target_cache(
     const std::vector<uint32_t> & block_table,
     int block_size,
     int token_count,
-    PrefixSnapshot & destination);
+    PrefixSnapshot & destination,
+    bool with_target_feat = false);
 
 // Restore a copied paged snapshot into fresh destination pages and one
 // recurrent-state slab. `block_table` describes the destination sequence and
-// must cover snap.cur_pos logical tokens.
+// must cover snap.cur_pos logical tokens. A checkpoint that carries a
+// drafter feature payload also restores the slot's feature-ring slab; a
+// checkpoint without one restores KV + recurrent state only.
 bool restore_paged_target_cache(
     const PrefixSnapshot & snap,
     TargetCache & cache,
