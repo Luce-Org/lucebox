@@ -45,6 +45,15 @@ inline int dflash_drafter_window(int max_ctx) {
     return cap;
 }
 
+// Local drafting consumes the full trained feature window. draft_ctx_max is a
+// transport/compute cap for remote drafting only; non-positive means no cap.
+inline int dflash_draft_context_cap(int ring_cap, bool remote, int draft_ctx_max) {
+    return remote && draft_ctx_max > 0 && draft_ctx_max < ring_cap
+        ? draft_ctx_max : ring_cap;
+}
+
+ggml_type dflash_feature_dtype();
+
 struct DraftFeatureMirror {
     ggml_context * ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;
