@@ -57,7 +57,7 @@ static ggml_type parse_feature_dtype() {
     const char * s = std::getenv("DFLASH_FEATURE_DTYPE");
     if (!s || !s[0]) {
         // Lossless F32 default. q4_0 is an explicit opt-in that makes the deep
-        // (~40K) ring cheaper (~1.7 GiB -> ~0.2 GiB) but quantises the drafter's
+        // (~40K) ring cheaper (~3.9 GiB -> ~0.55 GiB) but quantises the drafter's
         // feature inputs; the IPC draft daemon also writes/snapshots the ring as
         // F32, so the default must stay F32 until those paths are type-aware.
         return GGML_TYPE_F32;
