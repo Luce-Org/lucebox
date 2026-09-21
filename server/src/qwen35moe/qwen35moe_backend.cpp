@@ -2052,11 +2052,12 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
             return false;
         }
 
-        // 2. Draft compute
-        constexpr int DRAFT_CTX_MAX_DEFAULT = 2048;
+        // 2. Draft compute. Keep the deep feature history coherent, but bound
+        // active self-attention with draft_ctx_max (8K was the measured sweet
+        // spot; consuming the full 40K ring is slower than AR).
         const int ring_cap = feature_mirror().cap;
-        const int draft_ctx = std::min(committed,
-            std::min(ring_cap, std::max(DRAFT_CTX_MAX_DEFAULT, cfg_.draft_ctx_max)));
+        const int draft_cap = dflash_draft_context_cap(ring_cap, cfg_.draft_ctx_max);
+        const int draft_ctx = std::min(committed, draft_cap);
         const int draft_start = committed - draft_ctx;
         int mirror_slot0 = 0;
         const bool use_mirror_view =
@@ -2065,7 +2066,7 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
         if (!build_draft_step(draft_sg, draft_weights(), /*lm_head=*/nullptr, draft_backend(),
                               draft_ctx, use_mirror_view ? &feature_mirror() : nullptr,
                               committed,
-                              std::min(ring_cap, std::max(DRAFT_CTX_MAX_DEFAULT, cfg_.draft_ctx_max)))) {
+                              /*ctx_len_max=*/draft_cap)) {
             std::fprintf(stderr, "[hybrid-spec] draft build failed\n");
             step_graph_destroy(draft_sg);
             return false;

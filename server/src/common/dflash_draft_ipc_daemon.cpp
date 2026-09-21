@@ -64,6 +64,16 @@ int run_dflash_draft_ipc_daemon(const char * draft_path,
         return 2;
     }
 
+    const ggml_type feature_dtype = dflash_feature_dtype();
+    if (feature_dtype != GGML_TYPE_F32) {
+        std::fprintf(stderr,
+                     "[draft-ipc-daemon] DFLASH_FEATURE_DTYPE=%s is unsupported; "
+                     "IPC feature rings require f32\n",
+                     ggml_type_name(feature_dtype));
+        stream_status(stream_fd, -1);
+        return 1;
+    }
+
     void * shared_payload = nullptr;
     void * shared_payload_data = nullptr;
     size_t shared_payload_capacity = 0;

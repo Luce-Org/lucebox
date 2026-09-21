@@ -431,7 +431,7 @@ bool Qwen35LayerSplitAdapter::load_draft() {
     if (cfg_.remote_draft.enabled()) {
         const int cap = cfg_.remote_draft.ring_cap > 0
             ? std::min(cfg_.remote_draft.ring_cap, cfg_.device.max_ctx)
-            : std::min(cfg_.device.max_ctx, cfg_.draft_ctx_max);
+            : dflash_draft_context_cap(cfg_.device.max_ctx, cfg_.draft_ctx_max);
         if (!remote_draft_.start(
                 cfg_.remote_draft.ipc_bin, *cfg_.draft_path,
                                  cfg_.draft_gpu, cap,
@@ -490,6 +490,7 @@ bool Qwen35LayerSplitAdapter::load_draft() {
                      swa.swa_layers, swa.total_layers, swa.effective_window);
     }
 
+    // qwen35moe has no layer-split path. Keep dense Qwen's established cap.
     const int cap = std::min(cfg_.device.max_ctx, cfg_.draft_ctx_max);
     if (!draft_feature_mirror_init(feature_ring_, draft_backend_,
                                    cfg_.draft_gpu, cfg_.draft_gpu, cap,

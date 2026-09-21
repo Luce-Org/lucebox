@@ -110,8 +110,8 @@ Qwen35SeqEngine::Qwen35SeqEngine(
         }
         if (draft_states_ready && n_slots >= 5) {
             auto dummy = std::make_unique<DraftKvState>();
-            const int draft_cap = std::min(
-                cap, std::max(1, b_.cfg_.draft_ctx_max));
+            const int draft_cap = dflash_draft_context_cap(
+                cap, b_.cfg_.draft_ctx_max);
             if (draft_kv_init_batched(
                     *dummy, b_.dw_, b_.draft_backend_, draft_cap)) {
                 dummy_draft_kv_.push_back(std::move(dummy));
@@ -181,8 +181,8 @@ DraftKvState * Qwen35SeqEngine::ensure_slot_draft_kv(int slot) {
     }
     if (state) draft_kv_free(*state);
     state = std::make_unique<DraftKvState>();
-    const int cap = std::min(
-        mirror->cap, std::max(1, b_.cfg_.draft_ctx_max));
+    const int cap = dflash_draft_context_cap(
+        mirror->cap, b_.cfg_.draft_ctx_max);
     if (!draft_kv_init_batched(
             *state, b_.dw_, b_.draft_backend_, cap)) {
         draft_kv_free(*state);
@@ -296,9 +296,8 @@ Qwen35SeqEngine::prepare_chain_drafts(
     }
 
     const int dummy_count = bucket - static_cast<int>(lanes.size());
-    const int cap = std::min(
-        lanes.front().mirror->cap,
-        std::max(1, b_.cfg_.draft_ctx_max));
+    const int cap = dflash_draft_context_cap(
+        lanes.front().mirror->cap, b_.cfg_.draft_ctx_max);
     while (static_cast<int>(dummy_draft_kv_.size()) < dummy_count) {
         auto dummy = std::make_unique<DraftKvState>();
         if (!draft_kv_init_batched(

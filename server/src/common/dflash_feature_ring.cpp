@@ -53,9 +53,16 @@ static bool ensure_staging(DraftFeatureMirror & mirror, size_t bytes) {
     return true;
 }
 
-static ggml_type parse_feature_dtype() {
+ggml_type dflash_feature_dtype() {
     const char * s = std::getenv("DFLASH_FEATURE_DTYPE");
-    if (!s || !s[0] || std::strcmp(s, "f32") == 0 || std::strcmp(s, "F32") == 0) {
+    if (!s || !s[0]) {
+        // Lossless F32 default. q4_0 is an explicit opt-in that makes the deep
+        // (~40K) ring cheaper (~3.9 GiB -> ~0.55 GiB) but quantises the drafter's
+        // feature inputs; the IPC draft daemon also writes/snapshots the ring as
+        // F32, so the default must stay F32 until those paths are type-aware.
+        return GGML_TYPE_F32;
+    }
+    if (std::strcmp(s, "f32") == 0 || std::strcmp(s, "F32") == 0) {
         return GGML_TYPE_F32;
     }
     if (std::strcmp(s, "f16") == 0 || std::strcmp(s, "F16") == 0) {
@@ -67,6 +74,10 @@ static ggml_type parse_feature_dtype() {
     if (std::strcmp(s, "q8_0") == 0 || std::strcmp(s, "Q8_0") == 0 ||
         std::strcmp(s, "q8") == 0 || std::strcmp(s, "Q8") == 0) {
         return GGML_TYPE_Q8_0;
+    }
+    if (std::strcmp(s, "q4_0") == 0 || std::strcmp(s, "Q4_0") == 0 ||
+        std::strcmp(s, "q4") == 0 || std::strcmp(s, "Q4") == 0) {
+        return GGML_TYPE_Q4_0;
     }
     std::fprintf(stderr, "[dflash-feature] ignoring unsupported DFLASH_FEATURE_DTYPE=%s\n", s);
     return GGML_TYPE_F32;
@@ -281,7 +292,7 @@ bool draft_feature_mirror_init(DraftFeatureMirror & mirror,
     mirror.target_device = target_device;
     mirror.n_target_layers = n_target_layers;
     mirror.hidden_size = hidden_size;
-    mirror.storage_type = parse_feature_dtype();
+    mirror.storage_type = dflash_feature_dtype();
     if (!check_feature_width_compatible(mirror.storage_type, hidden_size) ||
         !check_feature_width_compatible(mirror.storage_type, n_target_layers * hidden_size)) {
         std::fprintf(stderr,
@@ -519,15 +530,30 @@ bool copy_host_capture_slice_to_draft_ring(
     const int hidden = feature_ring.hidden_size;
     const size_t expected = (size_t)n_tokens * (size_t)hidden;
     if (host_elems != expected) return false;
+    // The ring may store a quantised row (q4_0/q8_0/...), whose byte width is
+    // not 4*hidden. Convert each F32 host row to the ring's storage type and
+    // offset by the real row size, or we write past the row into neighbouring
+    // slots (and past the tensor for the last slot).
+    const size_t row_bytes = ggml_row_size(feature_ring.storage_type, hidden);
+    if (row_bytes == 0) return false;
     const size_t dst_stride = feature_ring.target_feat->nb[1];
-    const size_t row_bytes = (size_t)hidden * sizeof(float);
+    const size_t layer_off = (size_t)capture_idx * row_bytes;
+    std::vector<uint8_t> row(row_bytes);
     for (int i = 0; i < n_tokens; ++i) {
         const int slot = (start_pos + i) % feature_ring.cap;
         const float * src = host + (size_t)i * (size_t)hidden;
-        const size_t dst_offset =
-            (size_t)slot * dst_stride +
-            (size_t)capture_idx * (size_t)hidden * sizeof(float);
-        ggml_backend_tensor_set(feature_ring.target_feat, src, dst_offset, row_bytes);
+        const void * out = src;
+        size_t out_bytes = (size_t)hidden * sizeof(float);
+        if (feature_ring.storage_type != GGML_TYPE_F32) {
+            if (!host_f32_to_feature_row(feature_ring.storage_type, src,
+                                         row.data(), (size_t)hidden)) {
+                return false;
+            }
+            out = row.data();
+            out_bytes = row_bytes;
+        }
+        ggml_backend_tensor_set(feature_ring.target_feat, out,
+                                (size_t)slot * dst_stride + layer_off, out_bytes);
     }
     return true;
 }
@@ -558,6 +584,18 @@ bool copy_feature_ring_range_to_tensor(
                                  row_bytes * (size_t)run)) {
                 return false;
             }
+        } else if (dst_stride == row_bytes) {
+            // Quantised mirror, contiguous destination: dequantise the whole
+            // run in one call instead of one launch per row (the draft window
+            // can span 40960 rows).
+            auto to_f32 = ggml_get_to_fp32_cuda(feature_ring.storage_type);
+            if (!to_f32) return false;
+            cudaError_t err = cudaSetDevice(feature_ring.device);
+            if (feature_cuda_failed("cudaSetDevice", err)) return false;
+            to_f32(src_base, (float *)dst_base,
+                   (int64_t)run * (int64_t)fc_in, nullptr);
+            err = cudaGetLastError();
+            if (feature_cuda_failed("to_fp32_cuda", err)) return false;
         } else {
             for (int i = 0; i < run; i++) {
                 if (!copy_feature_to_f32(

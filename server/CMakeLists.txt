@@ -1931,6 +1931,7 @@ if(DFLASH27B_TESTS)
             test/test_spec_acceptance.cpp
             test/test_ds4_env.cpp
             test/test_kvflash_ubatch.cpp
+            test/test_dflash_window.cpp
             test/test_adaptive_keep_ratio.cpp
             test/test_skip_park_guard.cpp
             test/test_bandit_integration.cpp

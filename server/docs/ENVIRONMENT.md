@@ -23,6 +23,8 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `DFLASH27B_PAGED_WMMA` | unset (0) | BURN-IN: =1 routes paged full-attention layers (RDNA4, head 256, F16/Q8_0/Q4_0 KV, non-tree) to the WMMA kernel. Differential-tested against the decode kernel; single-prompt TTFT -21% at 12K and -42% at 44K, batched 8K-pool prefill slightly ahead. |
 | `GGML_CUDA_PAGED_ATTN_FORCE_PARTITIONS` | unset | DEBUG: force the paged-attention context partition count (both routes) to bisect partition-overlap and overhead behaviour. |
 | `DFLASH27B_PREFILL_UBATCH` | backend-dependent (512 in `qwen35_backend.cpp`; 16/384 in `layer_split_daemon.cpp`; `cfg_.chunk` in `qwen35_layer_split_adapter.cpp`) | Prefill ubatch. Under pooled kvflash prefill it is rounded down to a multiple of the pager chunk (never below one chunk) and clamped to the pool, instead of being forced to one chunk per ubatch. |
+| `DFLASH_FEAT_RING_CAP` | unset (= 40960 for qwen35moe only) | Memory valve for the Qwen 3.6 35B-A3B drafter feature history. Lowers its target ring and mirror together; the value is additionally clamped by `--max-ctx`. Dense Qwen 27B, Gemma, Laguna and DSpark retain their existing windows. Active draft compute remains bounded by `--draft-ctx-max` (8192 is the measured 35B-A3B sweet spot). |
+| `DFLASH_FEATURE_DTYPE` | f32 | Feature-mirror storage type. `q4_0` makes the deep (~40K) ring ~8x smaller but quantises the drafter's feature inputs; remote IPC drafting rejects non-F32 storage. |
 | `DFLASH_DRAFT_KV` | 1 | KILL SWITCH (remove after burn-in): =0 restores the legacy per-step drafter window recompute instead of the ring cache. |
 | `DFLASH_LAGUNA_SWA_RING` | 1 | KILL SWITCH (remove after burn-in): =0 keeps SWA layers on pool-sized caches under KVFlash. |
 | `DFLASH_PROF` | unset | DEBUG: comma list of profilers (step,verify,prefill). Replaces DFLASH_LAGUNA_{STEP,VERIFY,PREFILL}_PROF. |
@@ -197,6 +199,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_EXPERT_BUDGET_MB` - deepseek4_backend.cpp, laguna_backend.cpp, qwen35moe_backend.cpp
 - `DFLASH_EXPERT_BUDGET_PCT` - laguna_backend.cpp
 - `DFLASH_FAST_ROLLBACK_THRESHOLD` - chain_rollback_policy.h
+- `DFLASH_FEAT_RING_CAP` - dflash_feature_ring.h
 - `DFLASH_FEATURE_DTYPE` - dflash_feature_ring.cpp
 - `DFLASH_KV_ROTATE` - qwen35_target_graph.cpp (set to 1 to force FWHT K rotation on; off by default for f16/q8_0 caches, on for narrower types)
 - `DFLASH_FP_ALPHA` - http_server.cpp, qwen3_graph.cpp, server_main.cpp
