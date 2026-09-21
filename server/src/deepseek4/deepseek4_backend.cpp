@@ -2734,7 +2734,15 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
         }
         out_tokens.push_back(next_token);
         const auto emit_t0 = Clock::now();
-        io.emit(next_token);
+        if (io.logprobs_top_k >= 0 && io.on_token_logprob) {
+            // logits was moved into last_logits_ for generated>0 above; the
+            // record still describes the raw row this step committed from.
+            const float * row =
+                generated > 0 ? last_logits_.data() : logits.data();
+            io.emit_with_logits(next_token, row, w_.n_vocab);
+        } else {
+            io.emit(next_token);
+        }
         if (timing) tel_acc.emit_us += elapsed_us(emit_t0, Clock::now());
 
         if (deepseek4_is_eos_tok(next_token, w_)) {

@@ -2270,6 +2270,14 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
     std::vector<float> embed_buf_vec(hidden);
     float * embed_buf = embed_buf_vec.data();
 
+    // Opt-in per-token logprobs: every commit site below must run a variant
+    // that leaves the full raw logits row in logits_buf, so the GPU-argmax
+    // and GPU-sampler shortcuts are bypassed (they read back only the
+    // winning token). Raw-logit semantics: the record describes the row
+    // before penalties/temperature; a min-tokens or budget-hook substitute
+    // is still scored under the same row.
+    const bool want_logprobs = io.logprobs_top_k >= 0 && io.on_token_logprob;
+
     // First token: consume the final prefill position.  Do not derive this
     // offset from committed/KV position: restore paths can prefill a delta at
     // nonzero KV offsets, and committed then no longer describes chunk size.
@@ -2293,10 +2301,28 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
                                       out_tokens, sampler_rng_);
         } else {
             first_tok = cache_.last_tok;
+            if (want_logprobs) {
+                // Greedy normally consumes only the prefill argmax; logprobs
+                // need the full last-position row. A restore-hit request can
+                // reach here without any prefill logits — the server forces
+                // a cache miss for logprobs, so this stays defensive.
+                if (!prefill_last_logits_valid_) {
+                    std::fprintf(stderr,
+                        "[logprobs] no prefill logits row for first token\n");
+                    return false;
+                }
+                ggml_backend_tensor_get(sg_.logits, logits_buf.data(),
+                                        prefill_last_logits_offset_,
+                                        sizeof(float) * vocab);
+            }
         }
         maybe_force_close(first_tok);
         out_tokens.push_back(first_tok);
-        io.emit(first_tok);
+        if (want_logprobs) {
+            io.emit_with_logits(first_tok, logits_buf.data(), vocab);
+        } else {
+            io.emit(first_tok);
+        }
         if (kvflash_active()) kvflash_history_.push_back(first_tok);
         if (IS_EOS_TOK(first_tok, w_)) return true;
         // The first token is pending: the prefill logits produced it, but its
@@ -2380,7 +2406,8 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
             // full ~vocab-wide D2H copy (the same payoff DFLASH_GPU_ARGMAX gets
             // for greedy). Falls back to the CPU chain on -1.
             int g_tok = -1;
-            if (gpu_sampler_enabled() && gpu_sampler_supports(sampler_) &&
+            if (!want_logprobs &&
+                gpu_sampler_enabled() && gpu_sampler_supports(sampler_) &&
                 sg_.logits && sg_.logits->data &&
                 !ggml_backend_buft_is_meta(
                     ggml_backend_get_default_buffer_type(target_backend_))) {
@@ -2415,7 +2442,7 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
                 next_tok = sample_logits(logits_buf.data(), vocab, sampler_,
                                           out_tokens, sampler_rng_);
             }
-        } else if (kGpuArgmaxAR && sg_.argmax_tokens) {
+        } else if (!want_logprobs && kGpuArgmaxAR && sg_.argmax_tokens) {
             int32_t tok_i = 0;
             ggml_backend_tensor_get(sg_.argmax_tokens, &tok_i, 0, sizeof(int32_t));
             next_tok = tok_i;
@@ -2435,7 +2462,13 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
         maybe_force_close(next_tok);
 
         out_tokens.push_back(next_tok);
-        io.emit(next_tok);
+        if (want_logprobs) {
+            // logits_buf holds this step's raw row: want_logprobs forces the
+            // CPU readback in every selection branch above.
+            io.emit_with_logits(next_tok, logits_buf.data(), vocab);
+        } else {
+            io.emit(next_tok);
+        }
         committed++;
         cache_.cur_pos = committed;
         if (pool) {

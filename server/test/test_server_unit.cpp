@@ -4175,6 +4175,90 @@ TEST_CASE(ServerUnitFixture, test_parse_request_sampler_applies_defaults_and_ove
     TEST_ASSERT(std::fabs(sampler.rep_pen - 1.1f) < 0.001f);
 }
 
+TEST_CASE(ServerUnitFixture, test_parse_request_logprobs_defaults_off) {
+    int top_k = 0;
+    std::string error;
+    TEST_ASSERT(parse_request_logprobs(
+        {{"messages", json::array()}}, /*stream=*/false, top_k, error));
+    TEST_ASSERT(top_k == -1);
+    TEST_ASSERT(error.empty());
+    // logprobs: false is the same as absent, even with stream.
+    TEST_ASSERT(parse_request_logprobs(
+        {{"logprobs", false}}, /*stream=*/true, top_k, error));
+    TEST_ASSERT(top_k == -1);
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_request_logprobs_accepts_valid) {
+    int top_k = -1;
+    std::string error;
+    TEST_ASSERT(parse_request_logprobs(
+        {{"logprobs", true}}, /*stream=*/false, top_k, error));
+    TEST_ASSERT(top_k == 0);
+    TEST_ASSERT(parse_request_logprobs(
+        {{"logprobs", true}, {"top_logprobs", 4}},
+        /*stream=*/false, top_k, error));
+    TEST_ASSERT(top_k == 4);
+    TEST_ASSERT(parse_request_logprobs(
+        {{"logprobs", true}, {"top_logprobs", 0}},
+        /*stream=*/false, top_k, error));
+    TEST_ASSERT(top_k == 0);
+    TEST_ASSERT(parse_request_logprobs(
+        {{"logprobs", true}, {"top_logprobs", 20}},
+        /*stream=*/false, top_k, error));
+    TEST_ASSERT(top_k == 20);
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_request_logprobs_rejects_bad_types) {
+    int top_k = -1;
+    std::string error;
+    TEST_ASSERT(!parse_request_logprobs(
+        {{"logprobs", "yes"}}, /*stream=*/false, top_k, error));
+    TEST_ASSERT(!error.empty());
+    TEST_ASSERT(!parse_request_logprobs(
+        {{"logprobs", true}, {"top_logprobs", "4"}},
+        /*stream=*/false, top_k, error));
+    TEST_ASSERT(!error.empty());
+    TEST_ASSERT(!parse_request_logprobs(
+        {{"logprobs", true}, {"top_logprobs", 2.5}},
+        /*stream=*/false, top_k, error));
+    TEST_ASSERT(!error.empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_request_logprobs_rejects_bad_range) {
+    int top_k = -1;
+    std::string error;
+    TEST_ASSERT(!parse_request_logprobs(
+        {{"logprobs", true}, {"top_logprobs", 21}},
+        /*stream=*/false, top_k, error));
+    TEST_ASSERT(!error.empty());
+    TEST_ASSERT(!parse_request_logprobs(
+        {{"logprobs", true}, {"top_logprobs", -1}},
+        /*stream=*/false, top_k, error));
+    TEST_ASSERT(!error.empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_request_logprobs_requires_logprobs) {
+    int top_k = -1;
+    std::string error;
+    TEST_ASSERT(!parse_request_logprobs(
+        {{"top_logprobs", 4}}, /*stream=*/false, top_k, error));
+    TEST_ASSERT(!error.empty());
+    // Explicit false counts as absent.
+    TEST_ASSERT(!parse_request_logprobs(
+        {{"logprobs", false}, {"top_logprobs", 4}},
+        /*stream=*/false, top_k, error));
+    TEST_ASSERT(!error.empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_request_logprobs_rejects_stream) {
+    int top_k = -1;
+    std::string error;
+    TEST_ASSERT(!parse_request_logprobs(
+        {{"logprobs", true}, {"stream", true}}, /*stream=*/true,
+        top_k, error));
+    TEST_ASSERT(!error.empty());
+}
+
 TEST_CASE(ServerUnitFixture, test_require_messages_array_rejects_invalid) {
     const json valid = {{"messages", json::array({
         {{"role", "user"}, {"content", "hi"}},

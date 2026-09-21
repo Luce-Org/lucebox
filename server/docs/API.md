@@ -75,8 +75,8 @@ under `usage.timings`:
 | `chat_template_kwargs` | object | — | Direct template control (`{"enable_thinking":true}`) | ✅ |
 | `stop` | string/array | — | Stop sequences | ✅ |
 | `n` | int | — | Number of completions | ❌ TODO |
-| `logprobs` | bool | — | Return log probabilities | ❌ TODO |
-| `top_logprobs` | int | — | Number of top logprobs per token | ❌ TODO |
+| `logprobs` | bool | `false` | Return per-token log probabilities | ✅ (non-streaming, AR path, qwen35 + deepseek4, `--max-concurrency 1`; raw-logit semantics — see [Logprobs](#logprobs)) |
+| `top_logprobs` | int | `0` | Number of top logprobs per token (0–20, requires `logprobs: true`) | ✅ (same qualifier) |
 | `response_format` | object | — | JSON mode / structured output | ❌ TODO |
 | `tool_choice` | string/object | — | Tool choice / force tool usage | ✅ |
 | `logit_bias` | object | — | Per-token logit adjustments | ❌ TODO |
@@ -98,7 +98,60 @@ under `usage.timings`:
 | `usage.prompt_tokens` | ✅ |
 | `usage.completion_tokens` | ✅ |
 | `usage.total_tokens` | ✅ |
-| `choices[].logprobs` | ❌ TODO |
+| `choices[].logprobs` | ✅ (only when `logprobs: true`; non-streaming, AR path, qwen35 + deepseek4, `--max-concurrency 1` — see [Logprobs](#logprobs)) |
+
+### Logprobs
+
+Opt-in per-token log probabilities for fidelity measurement (QA tooling).
+Request `"logprobs": true` plus optional `"top_logprobs": K` (0–20, default
+0). Only `/v1/chat/completions` supports these fields; other endpoints
+ignore them.
+
+Response (only present when requested):
+
+```json
+"choices": [{
+  "logprobs": {
+    "content": [
+      {"token": "The", "token_id": 791, "logprob": -0.02,
+       "bytes": [84, 104, 101],
+       "top_logprobs": [
+         {"token": "The", "token_id": 791, "logprob": -0.02, "bytes": [..]},
+         {"token": " A", "token_id": 362,  "logprob": -3.11, "bytes": [..]}]}
+    ],
+    "reasoning_content": [ /* same shape; empty when no thinking ran */ ]
+  }
+}]
+```
+
+**Semantics — raw logits, not sampled distribution.** Every `logprob` is a
+log-softmax over the **raw target logits at the committed position**: before
+repetition/frequency/presence penalties and before temperature. For greedy
+decode the chosen token is the argmax and `top_logprobs[0]` matches it; for
+sampled decode the entry still describes the pre-sampling row (this differs
+from OpenAI, whose logprobs reflect the post-sampling distribution). A token
+substituted by the thinking-budget close hook is scored under the same raw
+row. `top_logprobs` lists the K highest-logit tokens; ties resolve to the
+lower token id (same rule as argmax).
+
+**Limits.** Non-streaming requests only (`stream: true` + `logprobs` →
+400), autoregressive decode only (the request forces the AR path; DFlash /
+DSpark speculative decode logprobs are not implemented), qwen35 and
+deepseek4 backends only (other arches → 400), single-slot serving only
+(scheduled serving → 400: `--max-concurrency` > 1 on qwen35, any
+`--paged-attention` deployment on deepseek4 — a lone `--paged-attention`
+slot on qwen35 still runs the AR path and works), and
+`top_logprobs` requires `logprobs: true`. Logprobs requests skip
+prefix-cache restore and always run a cold prefill — a snapshot restore
+would produce the first token with no logits row — so they do not benefit
+from warm prompts. `top_logprobs` entries expose the raw vocab piece; the
+chosen `token` is the text exactly as appended to the message field, so
+`join(content[].token) == message.content` and likewise for
+`reasoning_content` (a stop sequence mid-token truncates the last entry's
+`token` accordingly).
+
+Follow-ups not implemented: streaming logprobs, spec-decode-path logprobs,
+scheduler/concurrency support, and the KLD dump.
 
 ---
 
@@ -244,7 +297,6 @@ support causes errors or silent feature degradation.
 
 | Feature | Notes |
 |---------|-------|
-| **`logprobs` / `top_logprobs`** | Token probabilities in response. Debugging/analysis only. |
 | **`n` (multiple completions)** | Generate N choices per request. No known agent uses this. |
 | **`logit_bias`** | Per-token logit adjustments. |
 | **`user`** | End-user identifier (tracking only). |

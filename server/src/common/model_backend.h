@@ -23,6 +23,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "generation_types.h"
+#include "logprobs.h"
 #include "sampler.h"
 #include "concurrency/seq_engine.h"
 #include "placement/draft_residency.h"
@@ -111,10 +112,23 @@ struct DaemonIO {
     // this at each spec-decode step with draft tokens and phase info.
     InferenceObserver observer;
 
+    // Opt-in per-token logprob reporting (non-streaming AR path only).
+    // When logprobs_top_k >= 0 and on_token_logprob is set, backends call
+    // emit_with_logits at each commit site so every emitted token carries a
+    // logprob record computed from the raw logits row.
+    int logprobs_top_k = -1;
+    std::function<void(const TokenLogprob &)> on_token_logprob;
+
     // Write a single int32 to the stream fd (token or -1 sentinel).
     // Also invokes on_token if set. Sets cancelled=true if on_token
     // returns false (client disconnected).
     void emit(int32_t v) const;
+
+    // Emit a committed token together with its logprob record computed from
+    // the raw logits row that produced it. The record is reported before
+    // emit() so a cancelled emit still leaves one record per pushed token.
+    // No-op beyond emit() when logprob reporting is not armed.
+    void emit_with_logits(int32_t tok, const float * logits, int vocab) const;
 
     // Poll external cancellation and latch the result locally. `cancelled`
     // remains worker-thread-owned; the probe itself may read atomic state.
@@ -309,6 +323,12 @@ struct ModelBackend {
         (void)line; (void)io;
         return false;
     }
+
+    // ── Per-token logprobs ───────────────────────────────────────────
+    // True when the backend's AR decode can report a raw-logits logprob for
+    // every committed token (see DaemonIO::emit_with_logits). The server
+    // rejects logprobs requests on backends that keep the default false.
+    virtual bool supports_logprobs() const { return false; }
 
     // ── DFlash speculative decode support ────────────────────────────
     // Returns true if this backend can participate in DFlash spec decode

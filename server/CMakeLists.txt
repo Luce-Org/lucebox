@@ -563,6 +563,7 @@ add_library(dflash_common STATIC
     src/qwen35/layer_split_daemon_loop.cpp
     src/qwen35/qwen35_daemon.cpp
     src/common/sampler.cpp
+    src/common/logprobs.cpp
     src/common/backend_precision.cpp
     src/common/daemon_loop.cpp
     src/common/gguf_inspect.cpp
@@ -1953,7 +1954,8 @@ if(DFLASH27B_TESTS)
             test/test_qwen35moe_expert_placement.cpp
             test/test_qwen35moe_swap_manager.cpp
             test/test_mmq_streamk_schedule.cpp
-            test/test_moe_hybrid_storage.cpp)
+            test/test_moe_hybrid_storage.cpp
+            test/test_logprobs.cpp)
         if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
             list(APPEND _server_unit_sources
                 test/test_gpu_sampler_cuda.cpp

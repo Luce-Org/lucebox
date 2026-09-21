@@ -44,6 +44,11 @@ struct GenerateRequest {
     BudgetHook budget_hook;
     // Set only for the single autoregressive retry after empty spec output.
     bool force_ar_decode = false;
+    // Per-token logprob capture: -1 off, 0 = committed token only, K adds
+    // the top-K alternatives. Requests using this must run the AR path so a
+    // full logits row exists for every committed token.
+    int logprobs_top_k = -1;
+    bool want_logprobs() const { return logprobs_top_k >= 0; }
 };
 
 // Backend-independent failure categories. generate_error_code() is their
