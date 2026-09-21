@@ -30,11 +30,19 @@ TEST_CASE(DflashWindowFixture, env_valve_lowers_the_window) {
     }
 }
 
-TEST_CASE(DflashWindowFixture, context_cap_is_remote_only) {
+TEST_CASE(DflashWindowFixture, deep_history_is_opt_in) {
+    using dflash::common::dflash_feature_ring_cap;
+    luce_test::ScopedEnvVar ring("DFLASH_FEAT_RING_CAP", nullptr);
+    CHECK(dflash_feature_ring_cap(131072, false) == 4096);
+    CHECK(dflash_feature_ring_cap(131072, true) == 40960);
+    CHECK(dflash_feature_ring_cap(2048, false) == 2048);
+    CHECK(dflash_feature_ring_cap(2048, true) == 2048);
+}
+
+TEST_CASE(DflashWindowFixture, context_cap_bounds_local_and_remote_compute) {
     using dflash::common::dflash_draft_context_cap;
-    CHECK(dflash_draft_context_cap(40960, false, 4096) == 40960);
-    CHECK(dflash_draft_context_cap(40960, true, 4096) == 4096);
-    CHECK(dflash_draft_context_cap(4096, true, 8192) == 4096);
-    CHECK(dflash_draft_context_cap(40960, true, 0) == 40960);
-    CHECK(dflash_draft_context_cap(40960, true, -1) == 40960);
+    CHECK(dflash_draft_context_cap(40960, 4096) == 4096);
+    CHECK(dflash_draft_context_cap(4096, 8192) == 4096);
+    CHECK(dflash_draft_context_cap(40960, 0) == 40960);
+    CHECK(dflash_draft_context_cap(40960, -1) == 40960);
 }

@@ -30,12 +30,13 @@ namespace dflash::common {
 // prefix exceeds it. Pending the converter injecting the real context_length
 // into the drafter GGUF (currently a 262144 placeholder).
 inline constexpr int DFLASH_DRAFTER_TRAINED_CTX = 40960;
+inline constexpr int DFLASH_FEATURE_RING_DEFAULT = 4096;
 
-// Effective drafter feature window. Every producer of drafter features (the
-// target feature ring, the feature mirror, the layer-split mirror) must use
-// this same value: the mirror is synced from the target ring, so mismatched
-// windows feed the drafter aliased features. `DFLASH_FEAT_RING_CAP` is the
-// memory valve (lower clamps both rings); unset/0 means the trained window.
+// Deep drafter feature window. On an opted-in model, the target feature ring
+// and feature mirror must use this same value: the mirror is synced from the
+// target ring, so mismatched windows feed the drafter aliased features.
+// `DFLASH_FEAT_RING_CAP` is the memory valve (lower clamps both rings);
+// unset/0 means the trained window.
 inline int dflash_drafter_window(int max_ctx) {
     int cap = max_ctx < DFLASH_DRAFTER_TRAINED_CTX ? max_ctx : DFLASH_DRAFTER_TRAINED_CTX;
     if (const char * s = std::getenv("DFLASH_FEAT_RING_CAP")) {
@@ -45,10 +46,21 @@ inline int dflash_drafter_window(int max_ctx) {
     return cap;
 }
 
-// Local drafting consumes the full trained feature window. draft_ctx_max is a
-// transport/compute cap for remote drafting only; non-positive means no cap.
-inline int dflash_draft_context_cap(int ring_cap, bool remote, int draft_ctx_max) {
-    return remote && draft_ctx_max > 0 && draft_ctx_max < ring_cap
+// Opt the affected target/drafter pair into deep history without changing the
+// established ring on other model families.
+inline int dflash_feature_ring_cap(int max_ctx, bool needs_deep_history) {
+    return needs_deep_history
+        ? dflash_drafter_window(max_ctx)
+        : (max_ctx < DFLASH_FEATURE_RING_DEFAULT
+               ? max_ctx : DFLASH_FEATURE_RING_DEFAULT);
+}
+
+// Bound the feature history consumed by one draft step. The feature ring may
+// be deeper than the active window: qwen35moe needs a 40K history ring to keep
+// old captures coherent, but its measured throughput sweet spot is an 8K
+// active window. Keep the configured compute cap on local and remote paths.
+inline int dflash_draft_context_cap(int ring_cap, int draft_ctx_max) {
+    return draft_ctx_max > 0 && draft_ctx_max < ring_cap
         ? draft_ctx_max : ring_cap;
 }
 

@@ -38,7 +38,6 @@
 #include "qwen35_ops.h"
 #include "qwen35moe_ffn.h"
 #include "common/chain_rollback_policy.h"
-#include "common/dflash_feature_ring.h"
 #include "common/kv_rotation.h"
 #include "common/specla_commit_cuda.h"
 
@@ -109,13 +108,15 @@ bool create_target_cache(const TargetWeights & w,
                          bool paged_attention,
                          int n_seq_slots,
                          bool concurrent_tree,
-                         ggml_type cache_type_k, ggml_type cache_type_v) {
+                         ggml_type cache_type_k, ggml_type cache_type_v,
+                         int target_feat_cap) {
     return create_target_cache_partial(w, max_ctx, max_verify_tokens, backend,
                                        out, prefill_only,
                                        0, w.n_layer, true, ctx_alloc,
                                        /*f32_ssm_intermediates=*/false,
                                        paged_attention, n_seq_slots,
-                                       concurrent_tree, cache_type_k, cache_type_v);
+                                       concurrent_tree, cache_type_k, cache_type_v,
+                                       target_feat_cap);
 }
 
 // concurrent_fixed_cache_bytes() in qwen35_backend.cpp mirrors this
@@ -135,7 +136,8 @@ bool create_target_cache_partial(const TargetWeights & w,
                                  bool paged_attention,
                                  int n_seq_slots,
                                  bool concurrent_tree,
-                         ggml_type cache_type_k, ggml_type cache_type_v) {
+                         ggml_type cache_type_k, ggml_type cache_type_v,
+                         int target_feat_cap) {
     if (layer_begin < 0) layer_begin = 0;
     if (layer_end < 0 || layer_end > w.n_layer) layer_end = w.n_layer;
     if (layer_begin > layer_end) {
@@ -269,11 +271,7 @@ bool create_target_cache_partial(const TargetWeights & w,
             }
         }
 
-        // Match the drafter's feature mirror window (common/dflash_feature_ring.h):
-        // the target ring is the source the mirror is synced from, so it must
-        // span the same window. A 4096-slot target ring with a deeper mirror
-        // feeds the drafter aliased features from older positions on restore.
-        out.target_feat_cap = dflash::common::dflash_drafter_window(max_ctx);
+        out.target_feat_cap = std::min(max_ctx, target_feat_cap);
         if (allocate_target_feat) {
             const int fc_in = w.n_capture_layers * w.n_embd;
             // Concurrent slots own disjoint feature rings. The final row is
