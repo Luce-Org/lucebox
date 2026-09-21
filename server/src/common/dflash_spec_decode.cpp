@@ -111,8 +111,8 @@ bool run_dflash_spec_decode(
         // default must not starve the local deep window), and a non-positive
         // remote cap means "no cap" rather than a zero-length draft.
         const int ring_cap = use_remote_draft ? remote_draft->ring_cap() : feature_ring.cap;
-        const int draft_cap = (use_remote_draft && draft_ctx_max > 0)
-            ? std::min(ring_cap, draft_ctx_max) : ring_cap;
+        const int draft_cap = dflash_draft_context_cap(
+            ring_cap, use_remote_draft, draft_ctx_max);
         const int draft_ctx = std::min(committed, draft_cap);
         const int draft_start = committed - draft_ctx;
         int mirror_slot0 = 0;

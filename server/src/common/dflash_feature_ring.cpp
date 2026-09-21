@@ -53,7 +53,7 @@ static bool ensure_staging(DraftFeatureMirror & mirror, size_t bytes) {
     return true;
 }
 
-static ggml_type parse_feature_dtype() {
+ggml_type dflash_feature_dtype() {
     const char * s = std::getenv("DFLASH_FEATURE_DTYPE");
     if (!s || !s[0]) {
         // Lossless F32 default. q4_0 is an explicit opt-in that makes the deep
@@ -292,7 +292,7 @@ bool draft_feature_mirror_init(DraftFeatureMirror & mirror,
     mirror.target_device = target_device;
     mirror.n_target_layers = n_target_layers;
     mirror.hidden_size = hidden_size;
-    mirror.storage_type = parse_feature_dtype();
+    mirror.storage_type = dflash_feature_dtype();
     if (!check_feature_width_compatible(mirror.storage_type, hidden_size) ||
         !check_feature_width_compatible(mirror.storage_type, n_target_layers * hidden_size)) {
         std::fprintf(stderr,

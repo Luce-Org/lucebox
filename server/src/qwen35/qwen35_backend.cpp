@@ -342,7 +342,8 @@ bool Qwen35Backend::init() {
     if (cfg_.draft_path && use_remote_draft) {
         const int cap = cfg_.remote_draft.ring_cap > 0
             ? std::min(cfg_.remote_draft.ring_cap, cfg_.device.max_ctx)
-            : std::min(cfg_.device.max_ctx, cfg_.draft_ctx_max);
+            : dflash_draft_context_cap(
+                cfg_.device.max_ctx, /*remote=*/true, cfg_.draft_ctx_max);
         if (!remote_draft_.start(cfg_.remote_draft.ipc_bin, *cfg_.draft_path,
                                  cfg_.draft_gpu, cap,
                                  cfg_.remote_draft.work_dir)) {
@@ -920,7 +921,8 @@ bool Qwen35Backend::unpark(ParkTarget target) {
         if (use_remote_draft) {
             const int cap = cfg_.remote_draft.ring_cap > 0
                 ? std::min(cfg_.remote_draft.ring_cap, cfg_.device.max_ctx)
-                : std::min(cfg_.device.max_ctx, cfg_.draft_ctx_max);
+                : dflash_draft_context_cap(
+                    cfg_.device.max_ctx, /*remote=*/true, cfg_.draft_ctx_max);
             if (!remote_draft_.start(
                     cfg_.remote_draft.ipc_bin, *cfg_.draft_path,
                                      cfg_.draft_gpu, cap,
@@ -3019,11 +3021,12 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         // 2. Draft compute (skipped on plain-decode burst steps)
         bool used_draft_kv = false;
         if (!ar_step) {
-            // The ring cap IS the drafter's trained window; let the drafter read
-            // the whole visible prefix (no draft_ctx_max/2048 sub-floor, which
-            // starved it of deep context and collapsed accept at 8K+).
+            // A local draft reads the full trained window. Remote drafting keeps
+            // its explicit positive transport/compute cap.
             const int ring_cap = use_remote_draft ? remote_draft_.ring_cap() : feature_mirror_.cap;
-            const int draft_ctx = std::min(committed, ring_cap);
+            const int draft_cap = dflash_draft_context_cap(
+                ring_cap, use_remote_draft, cfg_.draft_ctx_max);
+            const int draft_ctx = std::min(committed, draft_cap);
             const int draft_start = committed - draft_ctx;
             int mirror_slot0 = 0;
             const bool use_mirror_view =

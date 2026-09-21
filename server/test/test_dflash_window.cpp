@@ -29,3 +29,12 @@ TEST_CASE(DflashWindowFixture, env_valve_lowers_the_window) {
         CHECK(dflash_drafter_window(131072) == DFLASH_DRAFTER_TRAINED_CTX);
     }
 }
+
+TEST_CASE(DflashWindowFixture, context_cap_is_remote_only) {
+    using dflash::common::dflash_draft_context_cap;
+    CHECK(dflash_draft_context_cap(40960, false, 4096) == 40960);
+    CHECK(dflash_draft_context_cap(40960, true, 4096) == 4096);
+    CHECK(dflash_draft_context_cap(4096, true, 8192) == 4096);
+    CHECK(dflash_draft_context_cap(40960, true, 0) == 40960);
+    CHECK(dflash_draft_context_cap(40960, true, -1) == 40960);
+}
