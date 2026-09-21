@@ -5694,6 +5694,14 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ2_S:
         case GGML_TYPE_Q8_K:
+        case GGML_TYPE_Q4_0_ROCMFP4:
+        case GGML_TYPE_Q4_0_ROCMFP4_FAST:
+        case GGML_TYPE_Q6_0_ROCMFPX:
+        case GGML_TYPE_Q8_0_ROCMFPX:
+        case GGML_TYPE_Q3_0_ROCMFPX:
+        case GGML_TYPE_Q3_1_ROCMFP3_MIX:
+        case GGML_TYPE_Q2_1_ROCMFP2_MIX:
+        case GGML_TYPE_Q2_0_ROCMFP2:
         case GGML_TYPE_I8:
         case GGML_TYPE_I16:
         case GGML_TYPE_I32:

@@ -23,12 +23,6 @@ Qwen4ExpBackend::~Qwen4ExpBackend() {
 }
 
 bool Qwen4ExpBackend::init() {
-    // bf16 WMMA dequant GEMM (journey step 05). RDNA3.5/4 only; mmb_enabled()
-    // still gates on the device cc. Process-global by design: this daemon
-    // builds a single backend, so it is effectively qwen4exp-scoped. Set before
-    // the first graph compute so the cached env lookup in mmb.cu sees it,
-    // without clobbering an explicit GGML_CUDA_MMB=0 from the operator.
-    setenv("GGML_CUDA_MMB", "1", 0);
     if (cfg_.device.is_layer_split()) {
         std::fprintf(stderr, "[qwen4exp] layer split is not supported yet\n");
         return false;
@@ -66,15 +60,37 @@ void Qwen4ExpBackend::print_ready_banner() const {
 }
 
 bool Qwen4ExpBackend::park(ParkTarget target) {
-    (void) target;
-    // Weight residency control lands with the graph; nothing to release yet.
+    if (target != ParkTarget::TargetModel && target != ParkTarget::All) {
+        return false;
+    }
+    if (parked_) return true;
+    free_qwen4exp_cache(cache_);
+    free_qwen4exp_weights(weights_);
     parked_ = true;
+    std::printf("[qwen4exp] target parked\n");
+    std::fflush(stdout);
     return true;
 }
 
 bool Qwen4ExpBackend::unpark(ParkTarget target) {
-    (void) target;
+    if (target != ParkTarget::TargetModel && target != ParkTarget::All) {
+        return false;
+    }
+    if (!parked_) return true;
+    if (!load_qwen4exp_gguf(cfg_.model_path, backend_, weights_)) {
+        std::fprintf(stderr, "[qwen4exp] unpark reload failed: %s\n",
+                     dflash27b_last_error());
+        return false;
+    }
+    if (!create_qwen4exp_cache(backend_, weights_, cfg_.device.max_ctx,
+                               GGML_TYPE_F16, cache_)) {
+        std::fprintf(stderr, "[qwen4exp] unpark cache creation failed\n");
+        free_qwen4exp_weights(weights_);
+        return false;
+    }
     parked_ = false;
+    std::printf("[qwen4exp] target unparked\n");
+    std::fflush(stdout);
     return true;
 }
 
@@ -94,11 +110,8 @@ GenerateResult Qwen4ExpBackend::generate_impl(const GenerateRequest & req,
     const int chunk = std::max(1, cfg_.chunk);
     int pos = 0;
 
-    // A generate() call is one fresh sequence: clear the recurrent state and
-    // the PLE n-gram window before the prefill writes position 0.
+    // A generate() call starts a fresh sequence.
     reset_qwen4exp_state(backend_, cache_);
-    cache_.ple_prev.clear();
-    cache_.cur_pos = 0;
 
     const auto t_pre0 = std::chrono::steady_clock::now();
     for (size_t i = 0; i < req.prompt.size(); i += (size_t) chunk) {

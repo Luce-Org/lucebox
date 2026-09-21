@@ -377,6 +377,13 @@ bool load_qwen4exp_gguf(const std::string & path, ggml_backend_t backend,
 
     auto fail = [&](const std::string & message) {
         set_last_error("qwen4exp: " + message);
+        out.ple_reader.close();
+        if (out.buf) {
+            ggml_backend_buffer_free(out.buf);
+            out.buf = nullptr;
+        }
+        out.embedder.tok_embd_owned.clear();
+        out.embedder.tok_embd_bytes = nullptr;
         for (ShardSource & shard : shards) {
             gguf_free(shard.gctx);
             if (shard.meta) {
@@ -385,6 +392,7 @@ bool load_qwen4exp_gguf(const std::string & path, ggml_backend_t backend,
             }
         }
         out.extra_meta_ctxs.clear();
+        out.backend = nullptr;
         return false;
     };
 
@@ -425,6 +433,7 @@ bool load_qwen4exp_gguf(const std::string & path, ggml_backend_t backend,
         head_k != 256 || head_v != 256 || fai == 0 || n_ff_exp == 0 ||
         n_expert == 0 || n_used == 0 || n_used > n_expert || n_hc <= 1 ||
         hc_lr == 0 || ssm_conv < 2 || ssm_inner == 0 || ssm_state == 0 ||
+        ssm_inner % ssm_state != 0 ||
         ssm_dt == 0 || ssm_grp == 0 || idx_head == 0 || idx_dim == 0 ||
         idx_topk == 0 || ple_hdim == 0 || ple_ng < 2 || ple_hpn == 0 ||
         ple_conv < 2 || n_layer % fai != 0) {
@@ -819,6 +828,14 @@ void free_qwen4exp_weights(Qwen4ExpWeights & w) {
         ggml_free(w.ctx);
         w.ctx = nullptr;
     }
+    w.embedder.tok_embd_owned.clear();
+    w.embedder.tok_embd_bytes = nullptr;
+    w.layers.clear();
+    w.tok_embd = nullptr;
+    w.output = nullptr;
+    w.output_hc_norm = nullptr;
+    w.output_hc_down = nullptr;
+    w.output_hc_up = nullptr;
     w.backend = nullptr;
 }
 

@@ -28,6 +28,7 @@ using cudaDeviceProp        = hipDeviceProp_t;
 
 // Error codes
 #define cudaSuccess                 hipSuccess
+#define cudaErrorNoDevice           hipErrorNoDevice
 #define cudaErrorInvalidValue       hipErrorInvalidValue
 #define cudaErrorIllegalAddress     hipErrorIllegalAddress
 #define cudaErrorAssert             hipErrorAssert
@@ -79,9 +80,6 @@ using cudaDeviceProp        = hipDeviceProp_t;
 #define cudaGetErrorString          hipGetErrorString
 #define cudaGetErrorName            hipGetErrorName
 #define cudaPeekAtLastError         hipPeekAtLastError
-
-// Launch bounds
-#define __launch_bounds__           __launch_bounds__
 
 // Stream capture status (added CUDA 10.0 — ROCm compat headers may omit this)
 #define cudaStreamCaptureStatus             hipStreamCaptureStatus

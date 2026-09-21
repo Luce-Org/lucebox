@@ -801,8 +801,8 @@ void ggml_cuda_mmb_release_all() {
     ggml_cuda_mmb_begin_graph();
     for (int i = 0; i < 4; ++i) { if (g_mmb_slots[i].buf) delete g_mmb_slots[i].buf; g_mmb_slots[i].buf = nullptr; g_mmb_slot_cap[i] = 0; }
     // Shadow weights are raw cudaMalloc keyed by data pointer and held for the process lifetime.
-    for (auto & e : g_mmb_shadow)      { if (e.second) cudaFree(e.second); }
-    for (auto & e : g_mmb_shadow_pair) { if (e.second) cudaFree(e.second); }
+    for (auto & e : g_mmb_shadow)      { if (e.second) CUDA_CHECK(cudaFree(e.second)); }
+    for (auto & e : g_mmb_shadow_pair) { if (e.second) CUDA_CHECK(cudaFree(e.second)); }
     g_mmb_shadow.clear();
     g_mmb_shadow_pair.clear();
     g_mmb_shadow_bytes = 0;
@@ -1074,92 +1074,6 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
     CUDA_CHECK(cudaGetLastError());
 }
 
-// One routing plan, expert-major BF16 GLU output, contiguous down input, final
-// scatter back to the original top-k slot order. Arithmetic tiles are unchanged.
-bool ggml_cuda_mmb_glu_down(ggml_backend_cuda_context & ctx, ggml_tensor * gate,
-        ggml_tensor * up, ggml_tensor * glu, ggml_tensor * down) {
-    static const bool enabled = [] {
-        const char * e = getenv("QWEN4EXP_MOE_PIPELINE");
-        const char * ref = getenv("QWEN4EXP_UPSTREAM");
-        return e && atoi(e) == 1 && !(ref && atoi(ref));
-    }();
-    if (!enabled || down->op != GGML_OP_MUL_MAT_ID || down->src[1] != glu ||
-        down->src[2] != gate->src[2]) return false;
-    const ggml_tensor * gw = gate->src[0], * uw = up->src[0];
-    const ggml_tensor * src1 = gate->src[1], * ids = gate->src[2];
-    if (!ggml_cuda_mmb_supported_glu(gw, uw, src1, ids, glu) ||
-        !ggml_cuda_mmb_supported_mmid(down->src[0], glu, ids, down) ||
-        down->src[0]->ne[2] != gw->ne[2]) return false;
-    static const bool check = getenv("QWEN4EXP_MOE_PIPELINE_CHECK") != nullptr;
-    ggml_cuda_pool_alloc<uint8_t> reference(ctx.pool());
-    const size_t output_bytes = ggml_nelements(down) *
-        (ggml_cuda_mmb_is_bf16_only(down) ? sizeof(uint16_t) : sizeof(float));
-    if (check) {
-        ggml_cuda_mul_mat_id_mmb_glu(ctx, gw, uw, src1, ids, glu);
-        ggml_cuda_mul_mat_id_mmb(ctx, down->src[0], glu, ids, down);
-        reference.alloc(output_bytes);
-        CUDA_CHECK(cudaMemcpyAsync(reference.get(), down->data, output_bytes, cudaMemcpyDeviceToDevice, ctx.stream()));
-    }
-
-    cudaStream_t stream = ctx.stream();
-    const int K = (int) gw->ne[0], M = (int) gw->ne[1], E = (int) gw->ne[2];
-    const int ne11 = (int) src1->ne[1], T = (int) src1->ne[2], n_used = (int) ids->ne[0];
-    const int n_rows_x = ne11 * T, n_rows = n_used * T;
-    constexpr int BN = 128;
-    const uint16_t * xhp = mmb_bf16_activation(ctx, src1, (size_t) n_rows_x * K, stream);
-    ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), n_rows);
-    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), n_rows);
-    ggml_cuda_pool_alloc<int32_t> bounds(ctx.pool(), E + 1);
-    const int si1  = (int) (ids->nb[1] / sizeof(int32_t));
-    const int sis1 = (int) (src1->nb[2] / src1->nb[1]);
-    if (!ggml_cuda_launch_mm_ids_bounded(ctx, (const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), bounds.get(),
-            E, T, n_used, ne11, si1, sis1, /*inverse=*/false, stream)) {
-        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), bounds.get(),
-            E, T, n_used, ne11, si1, sis1, /*write_inverse=*/false, stream);
-    }
-    constexpr int BN_SMALL = 32, THRESH = 128;
-    const int nbig_max   = n_rows / BN + E + 1;
-    const int nsmall_max = E * ((THRESH + BN_SMALL - 1) / BN_SMALL) + 1;
-    ggml_cuda_pool_alloc<uint32_t> desc_big(ctx.pool(), nbig_max);
-    ggml_cuda_pool_alloc<uint32_t> desc_small(ctx.pool(), nsmall_max);
-    mmb_build_desc2<<<1, 1024, 0, stream>>>(bounds.get(), desc_big.get(), desc_small.get(), E, nbig_max, nsmall_max, BN, BN_SMALL, THRESH);
-    ggml_cuda_pool_alloc<uint16_t> intermediate(ctx.pool(), (size_t) n_rows * M);
-    uint16_t * Dh = intermediate.get();
-    const bool store_f32 = false;
-    const uint8_t * Wg = (const uint8_t *) gw->data, * Wu = (const uint8_t *) uw->data; float * D = (float *) glu->data; const size_t eb = (size_t) gw->nb[2];
-    dim3 gbig((M + 63) / 64, nbig_max), gsmall((M + 63) / 64, nsmall_max);
-    mmb_dispatch_quant(gw->type, [&](auto tag) {
-        constexpr int WT = decltype(tag)::value;
-    mmb_routed_glu_kernel<64, BN, 32, 32, WT, true><<<gbig, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), nullptr, bounds.get(), desc_big.get(), M, K);
-    mmb_routed_glu_kernel<64, BN_SMALL, 16, 16, WT, true><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), nullptr, bounds.get(), desc_small.get(), M, K);
-    });
-    const ggml_tensor * dw = down->src[0];
-    const int DM = (int) down->ne[0];
-    uint16_t * downh = ggml_cuda_mmb_is_bf16_only(down) ? (uint16_t *) down->data : nullptr;
-    const dim3 dbig((DM + 127) / 128, nbig_max), dsmall((DM + 127) / 128, nsmall_max);
-    mmb_dispatch_quant(dw->type, [&](auto tag) {
-        constexpr int WT = decltype(tag)::value;
-        mmb_routed_kernel<128, BN, 32, 64, WT, true><<<dbig, MMB_NT, 0, stream>>>(
-            (const uint8_t *) dw->data, dw->nb[2], Dh, (float *) down->data, downh, !downh,
-            nullptr, ids_dst.get(), bounds.get(), desc_big.get(), DM, M);
-        mmb_routed_kernel<128, BN_SMALL, 32, 16, WT, true><<<dsmall, MMB_NT, 0, stream>>>(
-            (const uint8_t *) dw->data, dw->nb[2], Dh, (float *) down->data, downh, !downh,
-            nullptr, ids_dst.get(), bounds.get(), desc_small.get(), DM, M);
-    });
-    CUDA_CHECK(cudaGetLastError());
-    if (check) {
-        ggml_cuda_pool_alloc<unsigned int> errors(ctx.pool(), 1);
-        CUDA_CHECK(cudaMemsetAsync(errors.get(), 0, sizeof(unsigned int), stream));
-        mmb_check_bytes<<<256, 256, 0, stream>>>(reference.get(), (const uint8_t *) down->data, output_bytes, errors.get());
-        unsigned int count;
-        CUDA_CHECK(cudaMemcpyAsync(&count, errors.get(), sizeof(count), cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-        std::fprintf(stderr, "[moe-pipeline-check] %s T=%d bytes=%zu differences=%u\n", down->name, T, output_bytes, count);
-        GGML_ASSERT(count == 0);
-    }
-    return true;
-}
-
 // Called from graph_optimize (outside stream capture): create the shadow for an eligible IQ4_NL dense weight.
 void ggml_cuda_mmb_shadow_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * w) {
     if (!w) return;
@@ -1186,10 +1100,13 @@ void ggml_cuda_mmb_shadow_prepare(ggml_backend_cuda_context & ctx, const ggml_te
         uint16_t * buf = nullptr;
         half * tmp = nullptr;
         if (cudaMalloc((void **) &buf, bytes) != cudaSuccess) { GGML_LOG_WARN("MMB_SHADOW alloc failed (%zu bytes)\n", bytes); return; }
-        if (cudaMalloc((void **) &tmp, bytes) != cudaSuccess) { cudaFree(buf); return; }
+        if (cudaMalloc((void **) &tmp, bytes) != cudaSuccess) {
+            CUDA_CHECK(cudaFree(buf));
+            return;
+        }
         to_f16((const void *) w->data, (half *) tmp, (int64_t) n, ctx.stream());
         to_bf16((const void *) tmp, (nv_bfloat16 *) buf, (int64_t) n, ctx.stream());
-        cudaFree(tmp);
+        CUDA_CHECK(cudaFree(tmp));
         CUDA_CHECK(cudaGetLastError());
         g_mmb_shadow[w->data] = buf; g_mmb_shadow_bytes += bytes;
         return;
