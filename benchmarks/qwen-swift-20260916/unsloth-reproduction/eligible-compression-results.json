@@ -1,0 +1,181 @@
+[
+  {
+    "name": "cold",
+    "wall_seconds": 22.206796293030493,
+    "answer": "507831, 926104, 318762",
+    "usage": {
+      "accept_rate": 0.4791666567325592,
+      "completion_tokens": 23,
+      "completion_tokens_details": {
+        "reasoning_tokens": 0
+      },
+      "prompt_tokens": 32084,
+      "spec_decode_ran": true,
+      "timings": {
+        "agent_turn_cache_hit": false,
+        "cache_hit": false,
+        "cached_prefix_tokens": 0,
+        "decode_ms": 248.4,
+        "decode_tokens_per_sec": 92.6,
+        "effective_prompt_tokens": 6388,
+        "prefill_ms": 7300.9,
+        "prefilled_tokens": 6388
+      },
+      "total_tokens": 32107
+    },
+    "trace": {
+      "candidates": [
+        {
+          "estimate_kind": "measured",
+          "estimate_source": "v2:8efbddf010838f6b89f98420ae5e8fe8:w8192:r20:dense:0:32768:32768:gpu:exact:0:capture6",
+          "feasible": true,
+          "path": "dense",
+          "prefix": 0,
+          "projection_ratio": 1.0,
+          "seconds": 48.968657353,
+          "slot": -1,
+          "valid": true
+        },
+        {
+          "estimate_kind": "measured",
+          "estimate_source": "v2:8efbddf010838f6b89f98420ae5e8fe8:w8192:r20:compress:0:32768:32768:gpu:lossy:32768:capture6",
+          "feasible": true,
+          "path": "compress",
+          "prefix": 0,
+          "projection_ratio": 1.0,
+          "seconds": 20.836697271,
+          "slot": -1,
+          "valid": true
+        }
+      ],
+      "capture_primary": true,
+      "capture_requested": 6382,
+      "capture_slot": 0,
+      "cost_key": "v2:8efbddf010838f6b89f98420ae5e8fe8:w8192:r20:compress:0:32768:32768:gpu:lossy:32768:capture6",
+      "decode_seconds": 0.248446413,
+      "effective_tokens": 6388,
+      "eligible_tokens": 32048,
+      "evictions": [],
+      "final_evictions": [],
+      "final_spills": [],
+      "generation": null,
+      "input_tokens": 32084,
+      "mode": "auto",
+      "owner": "reproduction-compression",
+      "prefill_seconds": 7.300872987,
+      "prefix_tokens": 0,
+      "projection_anchor": true,
+      "purpose": "chat",
+      "reason": "cold_compression_saves",
+      "rejected_checkpoints": [],
+      "restore_slot": -1,
+      "scored_regions": 1,
+      "scoring_seconds": 14.477632092,
+      "seconds": 22.188652751,
+      "selected_path": "compress",
+      "spills": [],
+      "success": true,
+      "uncached_scoring_tokens": 32048
+    }
+  },
+  {
+    "name": "repeat",
+    "wall_seconds": 0.9907552640652284,
+    "answer": "507831, 926104, 318762",
+    "usage": {
+      "accept_rate": 0.4791666567325592,
+      "completion_tokens": 23,
+      "completion_tokens_details": {
+        "reasoning_tokens": 0
+      },
+      "prompt_tokens": 32084,
+      "spec_decode_ran": true,
+      "timings": {
+        "agent_turn_cache_hit": false,
+        "cache_hit": true,
+        "cached_prefix_tokens": 6144,
+        "decode_ms": 304.6,
+        "decode_tokens_per_sec": 75.5,
+        "effective_prompt_tokens": 6388,
+        "prefill_ms": 435.2,
+        "prefilled_tokens": 244
+      },
+      "total_tokens": 32107
+    },
+    "trace": {
+      "candidates": [
+        {
+          "estimate_kind": "measured",
+          "estimate_source": "v2:8efbddf010838f6b89f98420ae5e8fe8:w8192:r20:frozen:8192:256:32768:gpu:lossy:0:capture3",
+          "feasible": true,
+          "path": "frozen",
+          "prefix": 6144,
+          "projection_ratio": 1.0,
+          "seconds": 0.970195844,
+          "slot": 0,
+          "valid": true
+        },
+        {
+          "estimate_kind": "measured",
+          "estimate_source": "v2:8efbddf010838f6b89f98420ae5e8fe8:w8192:r20:dense:0:32768:32768:gpu:exact:0:capture6",
+          "feasible": true,
+          "path": "dense",
+          "prefix": 0,
+          "projection_ratio": 1.0,
+          "seconds": 48.968657353,
+          "slot": -1,
+          "valid": true
+        },
+        {
+          "estimate_kind": "unknown",
+          "estimate_source": "",
+          "feasible": true,
+          "path": "compress",
+          "prefix": 0,
+          "projection_ratio": 0.0,
+          "seconds": null,
+          "slot": -1,
+          "valid": true
+        },
+        {
+          "estimate_kind": "unknown",
+          "estimate_source": "",
+          "feasible": true,
+          "path": "compress",
+          "prefix": 6144,
+          "projection_ratio": 0.0,
+          "seconds": null,
+          "slot": 0,
+          "valid": true
+        }
+      ],
+      "capture_primary": false,
+      "capture_requested": 6388,
+      "capture_slot": 1,
+      "cost_key": "v2:8efbddf010838f6b89f98420ae5e8fe8:w8192:r20:frozen:8192:256:32768:gpu:lossy:0:capture3",
+      "decode_seconds": 0.304602203,
+      "effective_tokens": 6388,
+      "eligible_tokens": 32048,
+      "evictions": [],
+      "final_evictions": [],
+      "final_spills": [],
+      "generation": null,
+      "input_tokens": 32084,
+      "mode": "auto",
+      "owner": "reproduction-compression",
+      "prefill_seconds": 0.43520364,
+      "prefix_tokens": 6144,
+      "projection_anchor": false,
+      "purpose": "chat",
+      "reason": "reuse_hysteresis",
+      "rejected_checkpoints": [],
+      "restore_slot": 0,
+      "scored_regions": 0,
+      "seconds": 0.977689051,
+      "selected_path": "frozen",
+      "spills": [],
+      "success": true,
+      "uncached_scoring_tokens": 0
+    }
+  }
+]

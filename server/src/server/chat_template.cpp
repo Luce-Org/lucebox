@@ -592,7 +592,8 @@ std::string render_chat_template_jinja(
     const std::string & eos_token,
     bool add_generation_prompt,
     bool enable_thinking,
-    const std::string & tools_json)
+    const std::string & tools_json,
+    const std::string & reasoning_effort)
 {
     if (template_src.empty()) {
         throw std::runtime_error("render_chat_template_jinja: template_src is empty");
@@ -612,6 +613,15 @@ std::string render_chat_template_jinja(
         if (!m.tool_call_id.empty()) {
             mj["tool_call_id"] = m.tool_call_id;
         }
+        if (!m.tool_calls_json.empty()) {
+            try {
+                mj["tool_calls"] = nlohmann::ordered_json::parse(
+                    m.tool_calls_json);
+            } catch (const std::exception & e) {
+                throw std::runtime_error(
+                    std::string("render_chat_template_jinja: failed to parse message tool_calls JSON: ") + e.what());
+            }
+        }
         messages_j.push_back(std::move(mj));
     }
 
@@ -621,6 +631,7 @@ std::string render_chat_template_jinja(
     inputs["eos_token"]             = eos_token;
     inputs["add_generation_prompt"] = add_generation_prompt;
     inputs["enable_thinking"]       = enable_thinking;
+    inputs["reasoning_effort"]      = reasoning_effort;
 
     bool has_tools = !tools_json.empty() && tools_json != "[]" && tools_json != "null";
     if (has_tools) {

@@ -1,0 +1,22 @@
+[
+  "/opt/lucebox-concurrent/server/build-hip/dflash_server",
+  "/code/models/swift-qwen/ukisai_Swift-Qwen3.8-27b-IQ4_XS.gguf",
+  "--draft",
+  "/code/models/qwen38/qwen38-dflash2-q8_0.gguf",
+  "--draft-block-size",
+  "16",
+  "--prefix-cache-slots",
+  "2",
+  "--max-ctx",
+  "8192",
+  "--cache-type-k",
+  "q8_0",
+  "--cache-type-v",
+  "q8_0",
+  "--host",
+  "127.0.0.1",
+  "--port",
+  "18217",
+  "--model-name",
+  "swift-qwen"
+]

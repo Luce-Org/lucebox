@@ -257,6 +257,9 @@ public:
         // every live sequence before invoking step() again.
         std::string error;
 
+        // Successful speculative work, excluding the pending output token.
+        int speculative_lanes = 0;
+        int speculative_accepted_tokens = 0;
         bool ok() const { return error.empty(); }
     };
 
@@ -265,6 +268,12 @@ public:
     // advertise different sequence, per-sequence, and total-token limits for
     // idle, mixed, or larger decode buckets.
     virtual StepPlanLimits step_plan_limits(int decode_rows) const = 0;
+
+    // Read-only eligibility for a decode-only speculative round. Pending
+    // prefill does not make an otherwise eligible decoder incapable.
+    virtual bool has_speculative_decode(const std::vector<StepInput> &) const {
+        return false;
+    }
 
     // A successful result returns one decode output for every decode input and
     // one explicit advanced/completed/failed result for every selected

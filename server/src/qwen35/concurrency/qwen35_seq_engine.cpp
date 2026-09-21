@@ -1154,6 +1154,8 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
         if (selected[i]) {
             Proposal & proposal =
                 proposals[static_cast<size_t>(proposal_for_input[i])];
+            ++result.speculative_lanes;
+            result.speculative_accepted_tokens += static_cast<int>(proposal.accepted) - 1;
             output.token = proposal.pending;
             output.committed_tokens.assign(
                 proposal.tokens.begin() + 1,

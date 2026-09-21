@@ -1,0 +1,8 @@
+{
+  "requests": 10,
+  "tokens": 1507,
+  "wall_seconds": 16.337120504234917,
+  "end_to_end_tps": 92.2439177460529,
+  "decode_seconds": 10.1941,
+  "decode_tps": 147.8306079006484
+}

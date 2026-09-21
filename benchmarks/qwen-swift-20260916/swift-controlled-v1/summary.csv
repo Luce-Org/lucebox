@@ -1,0 +1,5 @@
+backend,suite,repetitions,median_wall,median_prefill,median_decode,median_tokens,median_thinking,median_tps,median_prefill_tokens,median_prefill_tps,min_wall,max_wall,min_tps,max_tps
+Lucebox + DFlash2,quality,3,20.85,1.17,19.63,1717,1590,87.45,929,797.08,20.56,20.86,87.38,88.69
+Lucebox + DFlash2,speed,3,64.15,1.98,62.08,5605,4092,90.29,1703,859.19,63.57,64.21,90.21,91.09
+llama.cpp + MTP,quality,3,28.8,2.8,25.98,1574,1447,60.6,929,331.75,28.39,28.82,60.58,61.49
+llama.cpp + MTP,speed,3,88.13,4.84,83.16,5084,3482,61.14,1703,351.85,86.99,88.29,60.95,61.89

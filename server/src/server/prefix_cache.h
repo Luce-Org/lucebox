@@ -114,7 +114,7 @@ public:
 
     // cap = number of prefix-cache slots (0 disables).
     PrefixCache(int cap, const Tokenizer & tokenizer,
-                size_t max_resident_bytes = 0);
+                size_t max_resident_bytes = 0, int session_max_tokens = 0);
 
     bool disabled() const { return disabled_; }
 
@@ -124,11 +124,13 @@ public:
     // ── Inline prefix cache ─────────────────────────────────────────
 
     // Look up the longest cached prefix. Returns (slot, prefix_len) or (-1, 0).
-    std::pair<int, int> lookup(const std::vector<int32_t> & prompt_ids);
+    std::pair<int, int> lookup(
+        const std::vector<int32_t> & prompt_ids,
+        const std::string & session_id = {});
     // Side-effect-free candidate for engines that must validate payloads.
     std::pair<int, int> lookup_candidate(
         const std::vector<int32_t> & prompt_ids,
-        int max_prefix_tokens);
+        int max_prefix_tokens, const std::string & session_id = {});
 
     // Promote and count only after an engine restored this checkpoint.
     void record_inline_hit(
@@ -174,6 +176,7 @@ public:
         PrefixHash victim_{};
         bool has_victim_ = false;
         bool protect_ = false;
+        std::string session_id_;
     };
 
     using InlineSnapshotSize = std::function<size_t(int target_cut)>;
@@ -196,7 +199,8 @@ public:
         bool prefer_tools_boundary = false,
         int forced_cut = 0,
         int restore_source_slot = -1,
-        InlineSnapshotSize estimate_bytes = {});
+        InlineSnapshotSize estimate_bytes = {},
+        const std::string & session_id = {});
 
     // Commit an already-materialized snapshot without a reservation. Used by
     // cache import/bootstrap paths and tests.
@@ -282,12 +286,24 @@ private:
         std::vector<int32_t> ids;  // prefix tokens [0, target_cut) for prefix-aware eviction
         bool                 protect = false;  // sticky tools-boundary pin
         size_t               resident_bytes = 0;
+        std::string          session_id;
     };
     std::vector<LruEntry> entries_;
     int next_slot_ = 0;
     uint64_t active_inline_reservation_ = 0;
     uint64_t next_inline_reservation_ = 1;
     size_t max_resident_bytes_ = 0;
+    int session_max_tokens_ = 0;
+    struct SessionPending {
+        std::string owner;
+        int slot;
+        size_t new_bytes;
+        size_t old_bytes;
+    };
+    std::map<uint64_t, SessionPending> session_pending_;
+    InlineReservation reserve_session_snap(
+        const std::vector<int32_t> & prompt_ids, int restored_prefix_len,
+        InlineSnapshotSize estimate_bytes, const std::string & session_id);
     size_t resident_bytes_ = 0;
 
     // Full-cache state
@@ -337,7 +353,7 @@ private:
     std::pair<int, int> lookup_impl(
         const std::vector<int32_t> & prompt_ids,
         int max_prefix_tokens,
-        bool record_hit);
+        bool record_hit, const std::string & session_id = {});
     bool inline_reservation_active(uint64_t id) const;
     void release_inline_reservation(uint64_t id);
     bool commit_inline_reservation(InlineReservation & reservation,
@@ -347,7 +363,7 @@ private:
     void abort_inline_reservation(InlineReservation & reservation);
     void replace_inline_entry(int slot, int target_cut,
                               const std::vector<int32_t> & prompt_ids,
-                              bool protect, size_t resident_bytes);
+                              bool protect, size_t resident_bytes, const std::string & session_id = {});
 
     int find_full_entry(const PrefixHash & h) const;
     void move_full_to_end(int idx);

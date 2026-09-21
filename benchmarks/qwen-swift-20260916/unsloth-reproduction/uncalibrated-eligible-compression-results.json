@@ -1,0 +1,80 @@
+[
+  {
+    "name": "cold",
+    "wall_seconds": 48.436295934952796,
+    "answer": "507831, 926104, 318762",
+    "usage": {
+      "accept_rate": 0.71875,
+      "completion_tokens": 23,
+      "completion_tokens_details": {
+        "reasoning_tokens": 0
+      },
+      "prompt_tokens": 32084,
+      "spec_decode_ran": true,
+      "timings": {
+        "agent_turn_cache_hit": false,
+        "cache_hit": false,
+        "cached_prefix_tokens": 0,
+        "decode_ms": 388.3,
+        "decode_tokens_per_sec": 59.2,
+        "effective_prompt_tokens": 32084,
+        "prefill_ms": 47881.9,
+        "prefilled_tokens": 32084
+      },
+      "total_tokens": 32107
+    },
+    "trace": {
+      "candidates": [
+        {
+          "estimate_kind": "unknown",
+          "estimate_source": "",
+          "feasible": true,
+          "path": "dense",
+          "prefix": 0,
+          "projection_ratio": 0.0,
+          "seconds": null,
+          "slot": -1,
+          "valid": true
+        },
+        {
+          "estimate_kind": "unknown",
+          "estimate_source": "",
+          "feasible": true,
+          "path": "compress",
+          "prefix": 0,
+          "projection_ratio": 0.0,
+          "seconds": null,
+          "slot": -1,
+          "valid": true
+        }
+      ],
+      "capture_primary": true,
+      "capture_requested": 32078,
+      "capture_slot": 0,
+      "cost_key": "v2:8efbddf010838f6b89f98420ae5e8fe8:w8192:r20:dense:0:32768:32768:gpu:exact:0:capture6",
+      "decode_seconds": 0.388261145,
+      "effective_tokens": 32084,
+      "eligible_tokens": 32048,
+      "evictions": [],
+      "final_evictions": [],
+      "final_spills": [],
+      "generation": null,
+      "input_tokens": 32084,
+      "mode": "auto",
+      "owner": "reproduction-compression",
+      "prefill_seconds": 47.881937435,
+      "prefix_tokens": 0,
+      "projection_anchor": true,
+      "purpose": "chat",
+      "reason": "cold_dense",
+      "rejected_checkpoints": [],
+      "restore_slot": -1,
+      "scored_regions": 0,
+      "seconds": 48.414530155,
+      "selected_path": "dense",
+      "spills": [],
+      "success": true,
+      "uncached_scoring_tokens": 0
+    }
+  }
+]

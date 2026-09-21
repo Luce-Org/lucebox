@@ -1,0 +1,22 @@
+{
+  "quality-swift-dflash-xhigh": {
+    "requests": 6,
+    "tokens": 1678,
+    "reasoning_tokens": 1557,
+    "wall_seconds": 15.528934197267517,
+    "decode_tps": 115.17131561607731,
+    "end_to_end_tps": 108.05635330049,
+    "all_finished": true,
+    "passes": 6
+  },
+  "article-swift-dflash-xhigh": {
+    "requests": 10,
+    "tokens": 5773,
+    "reasoning_tokens": 2710,
+    "wall_seconds": 50.47411718906369,
+    "decode_tps": 118.38238762080726,
+    "end_to_end_tps": 114.37545263794817,
+    "all_finished": true,
+    "passes": null
+  }
+}

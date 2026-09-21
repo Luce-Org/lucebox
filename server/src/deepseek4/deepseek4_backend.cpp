@@ -3175,7 +3175,10 @@ std::vector<ModelBackend::CompressResult> DeepSeek4Backend::compress_batch(
         if (!valid_request(request)) continue;
         CompressResult & result = results[index];
         result.compressed_ids = drafter_score_and_compress(
-            pflash_drafter_ctx_, request.input_ids, request.keep_ratio);
+            pflash_drafter_ctx_, request.input_ids, request.keep_ratio,
+            /*chunk_size=*/32, request.score_query_tokens,
+            /*pool_kernel=*/13, request.score_query_end,
+            request.should_cancel);
         result.ok = !result.compressed_ids.empty();
     }
 
@@ -3219,6 +3222,7 @@ bool DeepSeek4Backend::handle_compress(const std::string & line,
     req.keep_ratio = (float) keep_x1000 / 1000.0f;
     req.drafter_path = std::move(drafter_path);
     req.skip_park = skip_park;
+    req.should_cancel = [&io]() { return io.is_cancelled(); };
     CompressResult result = compress(req);
     if (!result.ok) {
         std::fprintf(stderr, "[deepseek4-pflash] compression failed\n");

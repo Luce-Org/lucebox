@@ -21,6 +21,7 @@
 #include "chat_template.h"
 #include "tool_memory.h"
 #include "prefix_cache.h"
+#include "hybrid_cache.h"
 #include "disk_prefix_cache.h"
 #include "freeze_history.h"
 #include "api_types.h"
@@ -106,6 +107,7 @@ struct ServerConfig {
     // active. Zero means unlimited.
     size_t      concurrent_prefix_cache_max_bytes = (size_t)4 * 1024 * 1024 * 1024;
     bool        concurrent_paged_prefix_cache = false;
+    int         session_prefix_cache_max_tokens = 0; // opt-in rolling session checkpoints
     int         prefill_cache_cap = 0;  // full-prompt/prefill cache slots (0 disables)
     // Extend the existing prefix cache through generated tool-call turns.
     bool        agent_turn_cache = false;
@@ -228,8 +230,6 @@ struct ServerConfig {
     // Piecewise keep-ratio curve: (token_threshold, keep_ratio) sorted ascending.
     // If empty, uses pflash_keep_ratio as flat value.
     std::vector<std::pair<int, float>> pflash_curve;
-    bool        lazy_draft      = false;   // legacy alias for request-scoped draft residency
-    DraftResidencyPolicy draft_residency = DraftResidencyPolicy::Auto;
 
     // Disk prefix cache
     std::string disk_cache_dir;             // empty = disabled
@@ -298,11 +298,16 @@ PflashQueryWindow find_pflash_query_window(
     int search_end,
     int max_tokens = 8);
 
+// Per-request exact mode bypasses every lossy PFlash representation. Missing
+// metadata and auto mode retain the server's configured compression policy.
+bool request_allows_pflash_compression(const json & body);
+
 }  // namespace http_detail
 
 // ─── Parsed request ─────────────────────────────────────────────────────
 
 struct ParsedRequest {
+    bool hybrid_release = false;
     ApiFormat                  format;
     std::vector<int32_t>      prompt_tokens;  // tokenized prompt
     std::string               rendered_prompt;
@@ -433,6 +438,16 @@ private:
     void process_job(ServerJob * job);
 
     struct PreparedPrompt {
+        bool hybrid = false;
+        bool hybrid_recoverable = false;
+        int64_t hybrid_deadline_ms = 0;
+        int hybrid_source = -1;
+        std::string hybrid_owner;
+        bool hybrid_temporary = false;
+        hybrid::Path hybrid_path = hybrid::Path::Dense;
+        hybrid::Capture hybrid_capture;
+        std::shared_ptr<hybrid::Representation> representation;
+        json hybrid_trace;
         std::vector<int32_t> tokens;
         bool compressed = false;
         bool flowkv = false;
@@ -446,6 +461,8 @@ private:
     // Prompt preparation keeps the FlowKV and whole-prompt PFlash policies
     // out of the decode path while preserving their shared precedence rules.
     PreparedPrompt prepare_prompt(const ParsedRequest & req);
+    PreparedPrompt prepare_hybrid_prompt(const ParsedRequest & req, const std::function<bool()>& cancelled = {});
+    void publish_hybrid(const json & trace);
     void apply_flowkv_compression(const ParsedRequest & req,
                                   PreparedPrompt & prepared);
     std::string apply_pflash_compression(const ParsedRequest & req,
@@ -469,6 +486,7 @@ private:
         int snap_slot = -1;
         int snap_cut = 0;
         bool snap_prepared = false;
+        bool hybrid_capture_primary = false;
     };
 
     GenerationCacheState prepare_generation_cache(
@@ -597,6 +615,12 @@ private:
 
     // Per-session adaptive keep_ratio bandit state.
     HttpServerSessions sessions_;
+    bool hybrid_enabled_ = false;
+    bool hybrid_shadow_ = false;
+    hybrid::Cache hybrid_cache_;
+    std::mutex hybrid_stats_mutex_;
+    json hybrid_stats_;
+
 
     // Live status tracker (read by /status/json, written by worker thread).
     ServerStatus status_;

@@ -63,6 +63,7 @@ public:
         }
         if (event.status == PrefixStoreEvent::Status::saved) {
             const bool committed = reservation_.commit(prompt, event.bytes);
+            if (!committed) engine_->discard_prefix_store(ticket_.checkpoint);
             clear();
             return committed ? Resolution::saved : Resolution::failed;
         }

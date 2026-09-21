@@ -1,0 +1,34 @@
+{
+  "default": "model-a",
+  "listen_host": "127.0.0.1",
+  "listen_port": 8216,
+  "backend_url": "http://127.0.0.1:18216",
+  "backend": {
+    "executable": "server/build-hip/dflash_server",
+    "library_path": "/opt/rocm/lib",
+    "extra_args": []
+  },
+  "draft": "/srv/models/draft.gguf",
+  "models": {
+    "model-a": {"path": "/srv/models/model-a.gguf", "context": 131072},
+    "model-b": {"path": "/srv/models/model-b.gguf", "context": 131072}
+  },
+  "memory": {
+    "bytes_per_token": 98304,
+    "work_bytes_per_token": 8192,
+    "fixed_bytes": 1073741824,
+    "reserve_bytes": 2147483648,
+    "snapshot_max_bytes": 4294967296
+  },
+  "serving": {
+    "max_queue": 4,
+    "queue_timeout": 120,
+    "prefill_timeout": 600,
+    "token_timeout": 120,
+    "request_timeout": 3600,
+    "cancel_grace": 5,
+    "stop_grace": 5,
+    "load_timeout": 180,
+    "body_timeout": 15
+  }
+}

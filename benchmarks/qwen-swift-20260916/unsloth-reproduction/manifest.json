@@ -1,0 +1,35 @@
+{
+  "target_repo": "unsloth/Qwen3.8-27B-GGUF",
+  "target_revision": "4ca720788d1e01f1bff70c033e0d0028fd02e502",
+  "draft_repo": "incoai/Qwen3.8-27B-DFlash2",
+  "draft_revision": "dedf8df68adfb1afeaf7b7480c0a0243108177b4",
+  "removed": [
+    {
+      "path": "/code/models/qwen38/Qwen3.8-27B-UD-IQ4_XS.gguf",
+      "bytes": 14252845984,
+      "sha256": "40fac4050e940397dbf13087afd50f4734a11805bf9d65ef8ddd7483470e6199"
+    },
+    {
+      "path": "/code/models/qwen38/qwen38-dflash2-q8_0.gguf",
+      "bytes": 2045471776,
+      "sha256": "bb727abc583498aa4deea8b3cd0c34c2d96553954cbff25b5f7bdd469f0f1306"
+    },
+    {
+      "path": "/code/models/qwen38/dflash-Qwen3.8-27B-Q8_0.gguf",
+      "bytes": 2056414816,
+      "sha256": "c18e800daedc59ca68fd13b6a856d795746af6d399a9279ac6a277d1d422f87e"
+    }
+  ],
+  "installed": [
+    {
+      "path": "/code/models/qwen38/Qwen3.8-27B-UD-IQ4_XS.gguf",
+      "bytes": 14252845984,
+      "sha256": "40fac4050e940397dbf13087afd50f4734a11805bf9d65ef8ddd7483470e6199"
+    },
+    {
+      "path": "/code/models/qwen38/qwen38-dflash2-q8_0.gguf",
+      "bytes": 2045471776,
+      "sha256": "bb727abc583498aa4deea8b3cd0c34c2d96553954cbff25b5f7bdd469f0f1306"
+    }
+  ]
+}

@@ -1,0 +1,13 @@
+backend,prompt,answers,format,passed,repetitions
+Lucebox + DFlash2,arithmetic,3,3,3,3
+llama.cpp + MTP,arithmetic,3,3,3,3
+Lucebox + DFlash2,constraints,3,3,3,3
+llama.cpp + MTP,constraints,3,3,3,3
+Lucebox + DFlash2,code_aliasing,3,3,3,3
+llama.cpp + MTP,code_aliasing,3,3,3,3
+Lucebox + DFlash2,code_intervals,3,3,3,3
+llama.cpp + MTP,code_intervals,3,3,3,3
+Lucebox + DFlash2,extraction,3,3,3,3
+llama.cpp + MTP,extraction,3,3,3,3
+Lucebox + DFlash2,tool_call,3,3,3,3
+llama.cpp + MTP,tool_call,3,3,3,3

@@ -1,0 +1,103 @@
+{
+  "surface": "report",
+  "title": "Swift: DFlash2 versus MTP",
+  "generatedAt": "2026-09-16T16:34:34.077717+00:00",
+  "status": "live",
+  "filters": [],
+  "queries": {
+    "protocol": {
+      "rows": [
+        {
+          "suite": "quality",
+          "prompt": "arithmetic",
+          "criterion": "Exact JSON object, values and types; no fences or extra text. Normal completion required."
+        },
+        {
+          "suite": "quality",
+          "prompt": "constraints",
+          "criterion": "Exact JSON object, values and types; no fences or extra text. Normal completion required."
+        },
+        {
+          "suite": "quality",
+          "prompt": "code_aliasing",
+          "criterion": "Exact JSON object, values and types; no fences or extra text. Normal completion required."
+        },
+        {
+          "suite": "quality",
+          "prompt": "code_intervals",
+          "criterion": "Exact JSON object, values and types; no fences or extra text. Normal completion required."
+        },
+        {
+          "suite": "quality",
+          "prompt": "extraction",
+          "criterion": "Exact JSON object, values and types; no fences or extra text. Normal completion required."
+        },
+        {
+          "suite": "quality",
+          "prompt": "tool_call",
+          "criterion": "Exactly one lookup_weather call, exact argument object and types, finish_reason tool_calls."
+        },
+        {
+          "suite": "speed",
+          "prompt": "has_close_elements",
+          "criterion": "Normal completion and nonempty final content; coding correctness is not scored."
+        },
+        {
+          "suite": "speed",
+          "prompt": "separate_paren_groups",
+          "criterion": "Normal completion and nonempty final content; coding correctness is not scored."
+        },
+        {
+          "suite": "speed",
+          "prompt": "truncate_number",
+          "criterion": "Normal completion and nonempty final content; coding correctness is not scored."
+        },
+        {
+          "suite": "speed",
+          "prompt": "below_zero",
+          "criterion": "Normal completion and nonempty final content; coding correctness is not scored."
+        },
+        {
+          "suite": "speed",
+          "prompt": "mean_absolute_deviation",
+          "criterion": "Normal completion and nonempty final content; coding correctness is not scored."
+        },
+        {
+          "suite": "speed",
+          "prompt": "intersperse",
+          "criterion": "Normal completion and nonempty final content; coding correctness is not scored."
+        },
+        {
+          "suite": "speed",
+          "prompt": "parse_nested_parens",
+          "criterion": "Normal completion and nonempty final content; coding correctness is not scored."
+        },
+        {
+          "suite": "speed",
+          "prompt": "filter_by_substring",
+          "criterion": "Normal completion and nonempty final content; coding correctness is not scored."
+        },
+        {
+          "suite": "speed",
+          "prompt": "sum_product",
+          "criterion": "Normal completion and nonempty final content; coding correctness is not scored."
+        },
+        {
+          "suite": "speed",
+          "prompt": "rolling_max",
+          "criterion": "Normal completion and nonempty final content; coding correctness is not scored."
+        }
+      ],
+      "source": {
+        "name": "Frozen benchmark protocol",
+        "description": "swift-controlled-v1/suite.json; measurements pending",
+        "evidenceFlow": [
+          {
+            "title": "Frozen inputs",
+            "detail": "Same model, template and prompts; xhigh, 64000 output ceiling, 65536 context, three repeats per backend. SHA256 in suite.sha256."
+          }
+        ]
+      }
+    }
+  }
+}

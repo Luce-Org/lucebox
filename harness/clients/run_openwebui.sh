@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${MAX_CTX:=262144}"
 : "${BUDGET:=22}"
 : "${VERIFY_MODE:=ddtree}"
-: "${EXTRA_SERVER_ARGS:=--lazy-draft}"
+: "${EXTRA_SERVER_ARGS:=}"
 source "$SCRIPT_DIR/common.sh"
 
 WEBUI_PORT="${WEBUI_PORT:-18081}"

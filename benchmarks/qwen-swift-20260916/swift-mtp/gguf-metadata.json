@@ -1,0 +1,25 @@
+{
+  "metadata": {
+    "general.architecture": "qwen35",
+    "qwen35.block_count": 65,
+    "qwen35.nextn_predict_layers": 1
+  },
+  "mtp_tensors": [
+    {
+      "name": "blk.64.nextn.eh_proj.weight",
+      "type": "2"
+    },
+    {
+      "name": "blk.64.nextn.enorm.weight",
+      "type": "0"
+    },
+    {
+      "name": "blk.64.nextn.hnorm.weight",
+      "type": "0"
+    },
+    {
+      "name": "blk.64.nextn.shared_head_norm.weight",
+      "type": "0"
+    }
+  ]
+}

@@ -31,7 +31,6 @@ enum class KvFlashRequest {
 struct BackendAdmissionContext {
     bool pflash_enabled = false;
     bool pflash_drafter_configured = false;
-    DraftResidencyPolicy draft_residency = DraftResidencyPolicy::Auto;
 
     // Automatic sizing remains backend-owned because only the initialized
     // backend has the VRAM budget. Fixed pools can participate in admission.

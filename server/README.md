@@ -246,8 +246,6 @@ The command shape is `dflash_server <model.gguf> [options]`. The first positiona
 |---|---|---|
 | `--draft-block-size <N>` | checkpoint metadata | Dense Qwen proposal width, from 2 through 32 and no more than twice the trained block size. |
 | `--draft-swa <N>` | `0` | Draft sliding-attention window. |
-| `--draft-residency auto\|persistent\|request-scoped` | `auto` | Control when draft weights remain resident. |
-| `--lazy-draft` | off | Alias for request-scoped draft residency. |
 | `--fast-rollback` | on | Enable speculative fast rollback. |
 | `--no-fast-rollback` | off | Disable fast rollback. |
 | `--specla` | off | Enable SpecLA when the target supports it. |
@@ -876,3 +874,5 @@ codex --provider dflash "Explain this codebase"
 | Codex models endpoint | ✅ |
 | Reasoning / thinking | ✅ (effort: low / medium) |
 | WebSockets | ❌ (not needed) |
+
+The decoding drafter stays resident for the loaded model lifetime. The separate PFlash scorer is released after scoring. Removed `--draft-residency` and `--lazy-draft` options are rejected; remove them from existing launch configurations.

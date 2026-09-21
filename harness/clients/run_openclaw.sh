@@ -6,7 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${BUDGET:=22}"
 : "${VERIFY_MODE:=ddtree}"
 # FA_WINDOW stays 0 (common.sh): finite windows break tool calls.
-: "${EXTRA_SERVER_ARGS:=--lazy-draft}"
+: "${EXTRA_SERVER_ARGS:=}"
 : "${OPENCLAW_TIMEOUT:=3600}"
 source "$SCRIPT_DIR/common.sh"
 
