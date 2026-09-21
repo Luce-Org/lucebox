@@ -14,7 +14,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 struct Qwen4ExpLayer {
     // Pre-attention / pre-FFN norms (the block RMSNorm inputs).
@@ -213,4 +213,4 @@ bool load_qwen4exp_gguf(const std::string & path,
 
 void free_qwen4exp_weights(Qwen4ExpWeights & w);
 
-}  // namespace dflash::common
+}  // namespace luce::common

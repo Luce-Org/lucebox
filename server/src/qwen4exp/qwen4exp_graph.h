@@ -22,7 +22,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 struct Qwen4ExpForwardResult {
     bool ok = false;
@@ -42,4 +42,4 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
                                        int pos0,
                                        std::vector<float> & out_logits);
 
-}  // namespace dflash::common
+}  // namespace luce::common

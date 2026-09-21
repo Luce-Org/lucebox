@@ -2612,7 +2612,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
     // H2D into VRAM per token. Without the rotation, host writes for token N+1
     // would overwrite inputs that the still-running graph for token N reads
     // (#15034-class corruption), so the ring and the integrated flag must land
-    // together. Opt out: DFLASH_HIP_NO_UMA_RING=1. Tune: GGML_SCHED_UMA_RING=N.
+    // together. Opt out: LUCE_HIP_NO_UMA_RING=1. Tune: GGML_SCHED_UMA_RING=N.
     bool is_uma = false;
     if (!parallel && n_backends >= 2) {
         ggml_backend_buffer_type_t cpu_buft = bufts ? bufts[n_backends - 1]
@@ -2635,7 +2635,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
         }
     }
 
-    if (is_uma && getenv("DFLASH_HIP_NO_UMA_RING") != nullptr) {
+    if (is_uma && getenv("LUCE_HIP_NO_UMA_RING") != nullptr) {
         is_uma = false;
     }
 

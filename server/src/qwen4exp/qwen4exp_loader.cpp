@@ -33,7 +33,7 @@
 #include <unistd.h>
 #endif
 
-namespace dflash::common {
+namespace luce::common {
 namespace {
 
 constexpr const char * kArch = "qwen4exp";
@@ -839,4 +839,4 @@ void free_qwen4exp_weights(Qwen4ExpWeights & w) {
     w.backend = nullptr;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

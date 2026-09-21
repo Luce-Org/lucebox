@@ -13,7 +13,7 @@
 #include <utility>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 Qwen4ExpBackend::Qwen4ExpBackend(Qwen4ExpBackendConfig cfg)
     : cfg_(std::move(cfg)) {}
@@ -35,7 +35,7 @@ bool Qwen4ExpBackend::init() {
     }
     if (!load_qwen4exp_gguf(cfg_.model_path, backend_, weights_)) {
         std::fprintf(stderr, "[qwen4exp] model load failed: %s\n",
-                     dflash27b_last_error());
+                     luce_last_error());
         return false;
     }
     if (!create_qwen4exp_cache(backend_, weights_, cfg_.device.max_ctx,
@@ -79,7 +79,7 @@ bool Qwen4ExpBackend::unpark(ParkTarget target) {
     if (!parked_) return true;
     if (!load_qwen4exp_gguf(cfg_.model_path, backend_, weights_)) {
         std::fprintf(stderr, "[qwen4exp] unpark reload failed: %s\n",
-                     dflash27b_last_error());
+                     luce_last_error());
         return false;
     }
     if (!create_qwen4exp_cache(backend_, weights_, cfg_.device.max_ctx,
@@ -217,4 +217,4 @@ void Qwen4ExpBackend::shutdown() {
     }
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

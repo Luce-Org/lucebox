@@ -2,7 +2,7 @@
 #include "common.cuh"
 struct ggml_cuda_ple_conv_match {
     int concat_idx = -1, first_tap_idx = -1, silu_idx = -1;
-    const ggml_tensor * x = nullptr;       // [C, T] F32 contiguous
+    const ggml_tensor * input = nullptr;   // CONCAT src[1], transpose view of [C, T]
     const ggml_tensor * state = nullptr;   // [H, C] F32 contiguous (H = (K-1)*dil)
     const ggml_tensor * concat = nullptr;  // [T+H, C]
     const ggml_tensor * w = nullptr;

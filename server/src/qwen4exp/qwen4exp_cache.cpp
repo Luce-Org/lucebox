@@ -3,7 +3,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 
@@ -11,7 +11,7 @@ namespace {
 // the (pinned) host buffer type directly — the same condition the scheduler
 // UMA detection uses in ggml-backend.cpp.
 bool qwen4exp_uma_ring_supported(ggml_backend_t backend) {
-    if (getenv("DFLASH_HIP_NO_UMA_RING") != nullptr) return false;
+    if (getenv("LUCE_HIP_NO_UMA_RING") != nullptr) return false;
     if (getenv("GGML_CUDA_NO_PINNED") != nullptr) return false;
     ggml_backend_dev_t dev = ggml_backend_get_device(backend);
     if (!dev || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_IGPU) {
@@ -119,7 +119,7 @@ bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
     if (out.input_ring.enabled) {
         std::fprintf(stderr,
             "[qwen4exp] cache: integrated GPU detected, graph inputs will be "
-            "ring-buffered in pinned host memory (DFLASH_HIP_NO_UMA_RING=1 to disable)\n");
+            "ring-buffered in pinned host memory (LUCE_HIP_NO_UMA_RING=1 to disable)\n");
     }
 
     // A fresh cache must start from zero recurrent state, not whatever the
@@ -186,4 +186,4 @@ void reset_qwen4exp_state(ggml_backend_t backend, Qwen4ExpCache & c) {
     c.ple_prev.clear();
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common
