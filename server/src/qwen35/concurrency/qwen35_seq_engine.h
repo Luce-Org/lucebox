@@ -147,6 +147,7 @@ private:
     void fail_prefill(int slot, std::vector<PrefillOutput> & outputs,
                               const char * log_message,
                               const char * client_message);
+    int prefill_chunk_size(int slot, int max_tokens) const;
     PrefillStage stage_prefill_chunk(int slot, int max_tokens,
                                      std::vector<PrefillOutput> & outputs);
     int32_t sample_graph_row(int slot, int logits_row,

@@ -2591,7 +2591,8 @@ extern "C" {
     // at or beyond tree_sizes[s] are excluded. query_positions may describe
     // compact autoregressive rows in a mixed AR/tree batch; tree rows ignore
     // it and read the full committed prefix. Pure tree batches pass NULL.
-    // tree_width is derived from parent_ids.
+    // tree_width is derived from parent_ids. Each node partitions only
+    // its causal extent; masked future nodes do not affect the reduction.
     GGML_API struct ggml_tensor * ggml_paged_attn_ext_tree(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,

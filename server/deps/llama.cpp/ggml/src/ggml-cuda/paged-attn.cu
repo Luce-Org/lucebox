@@ -19,9 +19,8 @@ static __host__ __device__ __forceinline__ int32_t paged_attn_ceil_div(
 }
 
 // Partition count for n_blocks of context: enough partitions to cover the
-// blocks and to reach min_partitions for occupancy, but never more than the
-// blocks themselves or the cap. Host and device must agree on this so the
-// launched grid matches the per-sequence active partition count.
+// blocks and reach min_partitions, but never more than the blocks or cap.
+// Host and device share this rule; each row clamps to its own context.
 static __host__ __device__ __forceinline__ int32_t paged_attn_partitions(
         int32_t n_blocks, int32_t min_partitions, int32_t cap) {
     const int32_t context_partitions =
@@ -92,8 +91,8 @@ static constexpr float PAGED_ATTN_LOG2E = 1.44269504088896340736f;
 //
 // Quantized Q is produced once per decode step by paged_attn_quantize_q and
 // read back from global memory here, so context partitions do not repeat the
-// quantization work. Long contexts are split between blocks and merged below;
-// the direct specialization avoids scratch for a single partition.
+// quantization work. Context partitions are merged below with the same
+// partial precision and combine arithmetic even for a single partition.
 
 // Batched K·Q dots: one K row is loaded once per lane and dotted against all
 // n_batch_heads quantized Q vectors. These mirror the fattn-common vec_dot
@@ -212,7 +211,7 @@ static __global__ void paged_attn_quantize_q(
     }
 }
 
-template<int D, ggml_type type_K, ggml_type type_V, int n_batch_heads, bool write_partials>
+template<int D, ggml_type type_K, ggml_type type_V, int n_batch_heads>
 static __global__ void paged_attn_decode(
         const char    * __restrict__ q,
         const char    * __restrict__ k,
@@ -225,7 +224,6 @@ static __global__ void paged_attn_decode(
         const char    * __restrict__ query_positions,
         const char    * __restrict__ parent_ids,
         const char    * __restrict__ tree_sizes,
-        char          * __restrict__ dst,
         half          * __restrict__ partial_acc,
         float2        * __restrict__ partial_meta,
         int64_t q_nb1,   int64_t q_nb2,
@@ -235,7 +233,6 @@ static __global__ void paged_attn_decode(
         int64_t ksl_nb0,
         int64_t asi_nb0, int64_t qpos_nb0,
         int64_t parent_nb0, int64_t parent_nb1, int64_t tree_size_nb0,
-        int64_t dst_nb1, int64_t dst_nb2,
         int32_t n_table_seq,
         int32_t n_head,
         int32_t n_head_kv,
@@ -315,12 +312,11 @@ static __global__ void paged_attn_decode(
         : (kv_seq_len_raw < table_capacity
             ? kv_seq_len_raw
             : (int32_t) table_capacity);
-    // Treat the candidate slab as a virtual tail of tree_width tokens. The
-    // normal partition split then covers prefix and tree candidates in one
-    // stable softmax; invisible siblings/padding resolve to no physical row.
+    // Use each node's causal extent so invisible future nodes cannot
+    // change the reduction of the committed prefix.
+    const int32_t candidate_tokens = tree_query ? query_node + 1 : 0;
     const int64_t virtual_tokens = valid_query
-        ? (int64_t) kv_seq_len + (tree_query ? tree_width : 0)
-        : 0;
+        ? (int64_t) kv_seq_len + candidate_tokens : 0;
     const int32_t n_logical_blocks =
         paged_attn_ceil_div(virtual_tokens, block_size);
     const int32_t active_partitions =
@@ -330,19 +326,9 @@ static __global__ void paged_attn_decode(
 #pragma unroll
         for (int h = 0; h < n_batch_heads; ++h) {
             const int64_t output_row = (int64_t) (head0 + h) * n_seq + seq;
-            if constexpr (write_partials) {
-                if (lane == 0) {
-                    partial_meta[output_row * n_partitions + partition] =
-                        make_float2(-FLT_MAX, 0.0f);
-                }
-            } else {
-                float * o_row =
-                    (float *) (dst + (int64_t) seq * dst_nb1 +
-                                     (int64_t) (head0 + h) * dst_nb2);
-#pragma unroll
-                for (int i = lane; i < D; i += nthreads) {
-                    o_row[i] = 0.0f;
-                }
+            if (lane == 0) {
+                partial_meta[output_row * n_partitions + partition] =
+                    make_float2(-FLT_MAX, 0.0f);
             }
         }
         return;
@@ -574,9 +560,6 @@ static __global__ void paged_attn_decode(
         // lets the combine kernel reuse its weight*qk_sum coefficient.
         const int64_t partial_row =
             output_row * n_partitions + partition;
-        float * o_row =
-            (float *) (dst + (int64_t) seq * dst_nb1 +
-                             (int64_t) (head0 + h) * dst_nb2);
 #pragma unroll
         for (int segment = 0;
              segment < D / (nthreads * values_per_load);
@@ -588,18 +571,12 @@ static __global__ void paged_attn_decode(
             for (int i = 0; i < values_per_load; ++i) {
                 const float value =
                     acc[h][segment * values_per_load + i] * inv_sum;
-                if constexpr (write_partials) {
-                    partial_acc[partial_row * D + value0 + i] =
-                        __float2half(value);
-                } else {
-                    o_row[value0 + i] = value;
-                }
+                partial_acc[partial_row * D + value0 + i] =
+                    __float2half(value);
             }
         }
-        if constexpr (write_partials) {
-            if (lane == 0) {
-                partial_meta[partial_row] = make_float2(qk_max[h], qk_sum[h]);
-            }
+        if (lane == 0) {
+            partial_meta[partial_row] = make_float2(qk_max[h], qk_sum[h]);
         }
     }
 }
@@ -843,11 +820,8 @@ bool ggml_cuda_paged_attn_supported(const ggml_tensor * dst) {
 }
 
 // Cached max resident blocks/SM for this instantiation at the given block
-// width; 0 when the device cannot launch it. Deliberately queries the
-// write_partials variant: occupancy only steers min_partitions, which is a
-// partition count for that variant. The direct variant launches solely when
-// the count collapses to one, where occupancy no longer influences the
-// topology.
+// width; 0 when the device cannot launch it. Used only to select a launchable
+// head batch and block width, never to choose numerical partitions.
 template<ggml_type type_K, ggml_type type_V, int n_batch_heads>
 static int paged_attn_cached_occupancy(int device, int warps_per_block) {
     // 0 means "not queried yet"; UNLAUNCHABLE records a block size this
@@ -866,7 +840,7 @@ static int paged_attn_cached_occupancy(int device, int warps_per_block) {
             cudaOccupancyMaxActiveBlocksPerMultiprocessor(
                 &probe,
                 paged_attn_decode<PAGED_ATTN_HEAD_DIM, type_K, type_V,
-                                  n_batch_heads, true>,
+                                  n_batch_heads>,
                 WARP_SIZE * warps_per_block, 0);
         if (err != cudaSuccess) {
             probe = UNLAUNCHABLE;
@@ -957,47 +931,29 @@ static bool try_launch_paged_attn(
         1);
 
     const int64_t output_rows = q->ne[1] * q->ne[2];
-    const int64_t work_groups = q->ne[1] * head_groups;
-    const int64_t target_blocks =
-        (int64_t) ggml_cuda_info().devices[ctx.device].nsm *
-        max_blocks_per_sm;
-    int32_t min_partitions = (int32_t)
-        ((target_blocks + work_groups - 1) / work_groups);
-    if (min_partitions < 1) {
-        min_partitions = 1;
-    }
-    // Small batches need more context partitions each to expose enough work;
-    // large batches already fill the device, where extra partitions mostly
-    // repeat the per-partition fixed costs. Scale the cap so the total
-    // partition count stays roughly constant across batch sizes.
-    int32_t partition_limit =
-        PAGED_ATTN_MAX_PARTITIONS / (int32_t) q->ne[1];
-    if (partition_limit < 32) {
-        partition_limit = 32;
-    }
-    if (min_partitions > partition_limit) {
-        min_partitions = partition_limit;
-    }
+    // A row's reduction must not change when another request joins or
+    // leaves the batch. Occupancy still selects a launchable specialization;
+    // the numerical partition count depends only on the row's context.
+    int32_t min_partitions = 1;
     const int32_t tree_blocks = paged_attn_ceil_div(tree_width, block_size);
-    const int64_t partitionable_blocks =
-        block_table->ne[0] + (parent_ids ? tree_blocks : 0);
+    const int64_t partitionable_blocks = block_table->ne[0] + tree_blocks;
     if (min_partitions > partitionable_blocks) {
         min_partitions = (int32_t) partitionable_blocks;
     }
 
-    // Size the launch from the live maximum committed prefix plus the virtual
-    // tree tail. Ragged/tree rows still clamp their own active partition count
-    // from device metadata.
+    // The host grid covers every possible tree node. Each row derives
+    // its numerical partitions from its own causal extent, so this upper
+    // bound does not change the reduction of shorter rows.
     const int64_t live_tokens =
-        (int64_t) max_kv_seq_len + (parent_ids ? tree_width : 0);
+        (int64_t) max_kv_seq_len + tree_width;
     const int32_t live_blocks =
         paged_attn_ceil_div(live_tokens, block_size);
     int32_t n_partitions = paged_attn_partitions(
         live_blocks, min_partitions, PAGED_ATTN_MAX_PARTITIONS);
 
-    // Test/debug override used to exercise both the direct and partials paths
-    // independently of device-specific occupancy. Values outside the valid
-    // grid range are ignored. Read once: every full-attention layer launches
+    // Test/debug override used to exercise fixed partition counts. Values
+    // outside the valid grid range are ignored. Read once: every
+    // full-attention layer launches
     // this on every decode token, so an environment scan per launch would sit
     // in the decode hot path.
     static const int forced_partitions = []() {
@@ -1041,15 +997,16 @@ static bool try_launch_paged_attn(
     ggml_cuda_pool_alloc<float2> meta_scratch(ctx.pool());
     half   * partial_acc  = nullptr;
     float2 * partial_meta = nullptr;
-    if (n_partitions > 1) {
+    {
         const size_t partial_rows = (size_t) output_rows * n_partitions;
         partial_acc  = acc_scratch.alloc(partial_rows * D);
         partial_meta = meta_scratch.alloc(partial_rows);
     }
 
-    auto * decode_kernel = n_partitions == 1
-        ? paged_attn_decode<D, type_K, type_V, n_batch_heads, false>
-        : paged_attn_decode<D, type_K, type_V, n_batch_heads, true>;
+    // Keep the same partial precision and combine arithmetic even when
+    // every row fits in one partition. A longer peer must not change it.
+    auto * decode_kernel =
+        paged_attn_decode<D, type_K, type_V, n_batch_heads>;
     decode_kernel<<<grid, block, 0, ctx.stream()>>>(
         (const char *) q->data,
         (const char *) k->data,
@@ -1062,7 +1019,6 @@ static bool try_launch_paged_attn(
         query_positions ? (const char *) query_positions->data : nullptr,
         parent_ids ? (const char *) parent_ids->data : nullptr,
         tree_sizes ? (const char *) tree_sizes->data : nullptr,
-        (char *) dst->data,
         partial_acc,
         partial_meta,
         q->nb[1], q->nb[2],
@@ -1075,7 +1031,6 @@ static bool try_launch_paged_attn(
         parent_ids ? parent_ids->nb[0] : 0,
         parent_ids ? parent_ids->nb[1] : 0,
         tree_sizes ? tree_sizes->nb[0] : 0,
-        dst->nb[1], dst->nb[2],
         (int32_t) block_table->ne[1],
         n_head,
         n_head_kv,
@@ -1091,7 +1046,7 @@ static bool try_launch_paged_attn(
         tree_scratch_stride,
         scale);
 
-    if (n_partitions > 1) {
+    {
         const dim3 combine_grid(
             (unsigned int) q->ne[2],
             (unsigned int) q->ne[1],
@@ -2167,8 +2122,8 @@ static bool try_launch_paged_attn_wmma(ggml_backend_cuda_context & ctx, ggml_ten
     }
     int32_t n_partitions =
         paged_attn_partitions(n_logical_blocks, min_partitions, PAGED_ATTN_MAX_PARTITIONS);
-    // Test/debug override, applied after the occupancy floor like the decode
-    // launcher: the floor above would otherwise silently raise any forced
+    // Test/debug override, applied after this route's occupancy floor:
+    // the floor above would otherwise silently raise any forced
     // value <= 32 back to 32 and defeat partition bisection experiments.
     if (force_partitions >= 1 &&
         force_partitions <= PAGED_ATTN_MAX_PARTITIONS &&
