@@ -5141,12 +5141,15 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
                 parsed <= 128 && parsed % 8 == 0
             ? (int)parsed : 0;
     }();
-    static const bool adaptive_moe_x_enabled = []() {
+    // Unset: only the qualified MIX formats adapt. =1: every measured
+    // format adapts. =0: none do.
+    static const int adaptive_moe_x_mode = []() {
         const char * raw = std::getenv("GGML_CUDA_MMQ_MOE_ADAPTIVE_X");
-        return raw && *raw && !(raw[0] == '0' && raw[1] == '\0');
+        if (!raw || !*raw) return -1;
+        return (raw[0] == '0' && raw[1] == '\0') ? 0 : 1;
     }();
     int requested_mmq_x = forced_mmq_x;
-    if (requested_mmq_x == 0 && adaptive_moe_x_enabled &&
+    if (requested_mmq_x == 0 && adaptive_moe_x_mode != 0 &&
         cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151 &&
         args.expert_bounds != nullptr && args.nchannels_x > 0) {
         // Grouped MoE routes are sparse across experts. Sizing the X tile from
@@ -5158,9 +5161,14 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
             (args.ncols_y + args.nchannels_x - 1) / args.nchannels_x;
         if (routes_per_expert <= 16) {
             switch (type) {
-                case GGML_TYPE_Q2_0_ROCMFP2:      requested_mmq_x = 32; break;
-                case GGML_TYPE_Q3_0_ROCMFPX:      requested_mmq_x = 48; break;
-                case GGML_TYPE_Q4_0_ROCMFP4_FAST: requested_mmq_x = 16; break;
+                case GGML_TYPE_Q2_0_ROCMFP2:      if (adaptive_moe_x_mode == 1) requested_mmq_x = 32; break;
+                case GGML_TYPE_Q3_0_ROCMFPX:      if (adaptive_moe_x_mode == 1) requested_mmq_x = 48; break;
+                case GGML_TYPE_Q4_0_ROCMFP4_FAST: if (adaptive_moe_x_mode == 1) requested_mmq_x = 16; break;
+                // Shipped MIX experts, on by default: 32 measured best on gfx1151
+                // for 50-140 token DS4 prefills (-10% at 53 and 121 tokens; 48/64
+                // pad, 16/24 slower), outputs identical; denser routes unchanged.
+                case GGML_TYPE_Q2_1_ROCMFP2_MIX:  requested_mmq_x = 32; break;
+                case GGML_TYPE_Q3_1_ROCMFP3_MIX:  requested_mmq_x = 32; break;
                 default: break;
             }
         }
