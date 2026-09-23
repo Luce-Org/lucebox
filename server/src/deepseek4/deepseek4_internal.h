@@ -574,6 +574,28 @@ bool deepseek4_step_layer_range(
     MoeHybridRoutingStats *     routing_stats = nullptr,
     vision::ImageSpanView       image_spans = {});
 
+// One sequence of a shared prefill pass: `n_tokens` rows of `embed` starting
+// at `kv_start` of `cache`, with the sequence's image spans in its own prompt
+// positions.
+struct DeepSeek4PrefillSeq {
+    DeepSeek4Cache *      cache = nullptr;
+    const float *         embed = nullptr;       // [n_tokens, n_embd]
+    const int32_t *       token_ids = nullptr;   // n_tokens ids (image rows use their marker ids)
+    int                   n_tokens = 0;
+    int                   kv_start = 0;
+    vision::ImageSpanView image_spans;
+};
+
+// Prefills several independent sequences in one layer-major pass on a full
+// (non-hybrid) GPU model with sparse attention. Attention runs per sequence
+// against its own cache; the HC mixing and the MoE FFN run once over all the
+// sequences' rows, so every layer's expert weights are read once for all of
+// them. Produces no logits and no feature capture.
+bool deepseek4_prefill_multi(ggml_backend_t backend, int device,
+                             const DeepSeek4Weights & w,
+                             const std::vector<DeepSeek4PrefillSeq> & seqs,
+                             std::string & error);
+
 bool deepseek4_validate_image_batch(
     const DeepSeek4Weights & w, const DeepSeek4Cache & cache,
     const MoeHybridStorage * hybrid, const int32_t * tokens,

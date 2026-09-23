@@ -80,6 +80,12 @@ SeqEngine::AdmitResult DeepSeek4SeqEngine::admit(
     return result;
 }
 
+DeepSeek4SeqEngine::~DeepSeek4SeqEngine() {
+    for (auto & cache : staging_caches_) {
+        if (cache) free_deepseek4_cache(*cache);
+    }
+}
+
 bool DeepSeek4SeqEngine::supports_images() const {
     return b_.image_capable_ && b_.vision_ && b_.cache_.buf;
 }
@@ -89,21 +95,22 @@ SeqEngine::AdmitResult DeepSeek4SeqEngine::admit_images(
         const SamplerCfg & sampler, const ImagePromptHandle & images) {
     AdmitResult refused;
     refused.status = AdmitResult::Status::failed;
-    if (!supports_images() || prompt.size() < 2) {
+    // DS4V image blocks need whole-block bidirectional prefill, which the
+    // 16-row gathered graph cannot run. Admission encodes the images and seeds
+    // the slot with every prompt token but the last; the next step() prefills
+    // all pending image requests together on the layer-major sparse path and
+    // copies their state into the slots, and the last (text) token then
+    // prefills in the batch, yielding the first sampled token as usual.
+    if (!supports_images() || prompt.size() < 6 || prompt.size() > size_t(b_.cache_.max_ctx)) {
         refused.error = "image support or prompt length is invalid";
         return refused;
     }
-    // DS4V image blocks need whole-block bidirectional prefill, which the
-    // 16-row gathered graph cannot run. Prefill every token but the last on
-    // the single-request sparse path into the staging cache, copy that state
-    // into the slot, and let the paged engine prefill the final (text) token,
-    // which yields the first sampled token through the normal step.
-    const int prefix = int(prompt.size()) - 1;
     std::string error;
-    if (!b_.prefill_image_prefix(prompt, images, prefix, error)) {
-        refused.error = error.empty() ? "image prefill failed" : error;
+    if (!b_.encode_image_request(prompt, images, error)) {
+        refused.error = error.empty() ? "image encoding failed" : error;
         return refused;
     }
+    const int prefix = int(prompt.size()) - 1;
     AdmitResult result = admit(request_id, prompt, sampler);
     if (result.status != AdmitResult::Status::admitted) return result;
     SeqSlotManager::PrefillChunk seeded = slots_.seed_restored_prefix(result.slot, prefix);
@@ -111,17 +118,54 @@ SeqEngine::AdmitResult DeepSeek4SeqEngine::admit_images(
     for (size_t i = 0; ok && i < seeded.new_blocks.size(); ++i) {
         ok = set_block(result.slot, seeded.first_new_block + int(i), seeded.new_blocks[i]);
     }
-    if (ok) {
-        ok = import_deepseek4_paged_slot(
-            b_.cache_, prefix, b_.paged_cache_, uint32_t(result.slot),
-            host_tables_.data() + size_t(result.slot) * stride_, stride_, error);
-    }
     if (!ok) {
         retire(result.slot);
-        refused.error = error.empty() ? "image prefix could not be seeded into the paged slot" : error;
+        refused.error = "image prefix could not be seeded into the paged slot";
         return refused;
     }
+    pending_images_.push_back({result.slot, images, prompt, prefix});
     return result;
+}
+
+void DeepSeek4SeqEngine::run_pending_images(std::vector<PrefillOutput> & failures,
+                                            std::vector<uint8_t> & failed_slots) {
+    if (pending_images_.empty()) return;
+    std::vector<DeepSeek4Backend::StagedPrefill> batch(pending_images_.size());
+    for (size_t k = 0; k < pending_images_.size(); ++k) {
+        // Staging cache k: the backend's own for the first request, then
+        // one more per concurrent request (allocated once, reused).
+        DeepSeek4Cache * staging = &b_.cache_;
+        if (k > 0) {
+            while (staging_caches_.size() < k) staging_caches_.emplace_back();
+            auto & owned = staging_caches_[k - 1];
+            if (!owned) {
+                owned = std::make_unique<DeepSeek4Cache>();
+                if (!create_deepseek4_cache(b_.backend_, b_.w_, b_.cache_.max_ctx, *owned)) owned.reset();
+            }
+            staging = owned.get();
+        }
+        batch[k].images = pending_images_[k].images;
+        batch[k].prompt = &pending_images_[k].prompt;
+        batch[k].prefix = pending_images_[k].prefix;
+        batch[k].staging = staging;
+        if (!staging) batch[k].error = "staging cache allocation failed";
+    }
+    b_.prefill_staged(batch);
+    for (size_t k = 0; k < batch.size(); ++k) {
+        const PendingImage & p = pending_images_[k];
+        std::string error = batch[k].error;
+        bool ok = batch[k].ok;
+        if (ok) {
+            ok = import_deepseek4_paged_slot(
+                *batch[k].staging, p.prefix, b_.paged_cache_, uint32_t(p.slot),
+                host_tables_.data() + size_t(p.slot) * stride_, stride_, error);
+        }
+        if (!ok) {
+            fail_prefill(p.slot, failures, error.empty() ? "staged image prefill failed" : error);
+            if (p.slot >= 0 && p.slot < int(failed_slots.size())) failed_slots[size_t(p.slot)] = 1;
+        }
+    }
+    pending_images_.clear();
 }
 
 bool DeepSeek4SeqEngine::set_block(int slot, int logical, int32_t physical) {
@@ -194,6 +238,9 @@ SeqEngine::StepResult DeepSeek4SeqEngine::step(const StepPlan & plan) {
     }
     if (inputs.empty() && plan.prefills.empty()) return result;
 
+    std::vector<uint8_t> image_failed((size_t)n_slots, 0);
+    run_pending_images(result.prefills, image_failed);
+
     std::vector<int32_t> lane_tokens;
     std::vector<int64_t> lane_positions;
     std::vector<int32_t> lane_slots;
@@ -244,6 +291,7 @@ SeqEngine::StepResult DeepSeek4SeqEngine::step(const StepPlan & plan) {
     std::vector<PrefillLane> prefill_lanes;
     prefill_lanes.reserve(plan.prefills.size());
     for (const PrefillSlice & slice : plan.prefills) {
+        if (image_failed[(size_t)slice.slot]) continue;
         const SeqSlot & before = slots_.slot(slice.slot);
         const int remaining = before.prompt_len - before.cur_pos;
         const int n_rows = std::min(slice.max_tokens, remaining);
@@ -413,6 +461,9 @@ bool DeepSeek4SeqEngine::evict_kv(int slot, int32_t pending_token,
 }
 
 void DeepSeek4SeqEngine::retire(int slot) {
+    pending_images_.erase(std::remove_if(pending_images_.begin(), pending_images_.end(),
+                                         [slot](const PendingImage & p) { return p.slot == slot; }),
+                          pending_images_.end());
     offload_.discard(slot);
     if (!slots_.is_active(slot)) return;
     slots_.retire(slot);

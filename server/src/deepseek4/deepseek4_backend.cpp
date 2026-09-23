@@ -1149,27 +1149,91 @@ bool DeepSeek4Backend::prepare_images(
     }
 }
 
-bool DeepSeek4Backend::prefill_image_prefix(const std::vector<int32_t> & prompt,
-                                            const ImagePromptHandle & handle,
-                                            int prefix_tokens, std::string & error) {
+bool DeepSeek4Backend::encode_image_request(const std::vector<int32_t> & prompt,
+                                            const ImagePromptHandle & handle, std::string & error) {
     const auto * images = dynamic_cast<const DeepSeek4ImagePrompt *>(handle.get());
-    if (!images || images->owner_ != this || !images->matches(prompt) || !cache_.buf ||
-        prefix_tokens <= 0 || prefix_tokens >= int(prompt.size()) ||
-        prompt.size() > size_t(cache_.max_ctx)) {
-        error = "image binding, staging cache, or prompt length is invalid";
+    if (!images || images->owner_ != this || !images->matches(prompt)) {
+        error = "image binding does not match this prompt";
         return false;
     }
     DaemonIO io;
-    struct ImageStreamJoin {
-        DeepSeek4Backend * backend;
-        ~ImageStreamJoin() { backend->join_image_stream(); }
-    } join{this};
-    if (!materialize_images(*images, io, error)) return false;
-    if (do_prefill(prompt, io, 0, -1, -1, images, prefix_tokens) != prefix_tokens) {
-        if (error.empty()) error = "image prefix prefill failed";
+    const auto t0 = Clock::now();
+    const bool ok = materialize_images(*images, io, error);
+    join_image_stream();
+    if (ok && !images->complete()) {
+        error = "image encoding did not complete";
         return false;
     }
-    return true;
+    std::fprintf(stderr, "[deepseek4] batched image request encoded in %.0f ms\n", elapsed_s(t0) * 1000.0);
+    return ok;
+}
+
+void DeepSeek4Backend::prefill_staged(std::vector<StagedPrefill> & batch) {
+    // Embeddings for every request's prefix (image rows + text rows).
+    struct Seq { StagedPrefill * item; const DeepSeek4ImagePrompt * images; std::vector<float> embed; int done = 0; };
+    std::vector<Seq> seqs;
+    for (auto & item : batch) {
+        const auto * images = dynamic_cast<const DeepSeek4ImagePrompt *>(item.images.get());
+        if (!images || !item.prompt || !item.staging || item.prefix < 5 ||
+            item.prefix > int(item.prompt->size()) || item.prefix > item.staging->max_ctx) {
+            item.error = "invalid staged prefill request";
+            continue;
+        }
+        std::vector<float> embed(size_t(item.prefix) * size_t(w_.n_embd));
+        if (!images->embed_chunk(w_.embedder, 0, item.prefix, embed.data())) {
+            item.error = "staged prefill embedding failed";
+            continue;
+        }
+        reset_deepseek4_cache(*item.staging);
+        item.staging->prefill_mode = PrefillAttentionMode::Sparse;
+        seqs.push_back({&item, images, std::move(embed), 0});
+    }
+    ggml_backend_synchronize(backend_);
+    deepseek4_release_image_scratch(cache_, moe_hybrid_.get());
+    const int budget_total = std::min(1024, DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS);
+    const auto t0 = Clock::now();
+    int passes = 0, rows = 0;
+    for (;;) {
+        // One pass takes the next chunk of every unfinished request that fits:
+        // whole image blocks only, and never leave a tail shorter than 5 rows.
+        std::vector<DeepSeek4PrefillSeq> pass;
+        std::vector<Seq *> members;
+        int budget = budget_total;
+        for (auto & s : seqs) {
+            const int remaining = s.item->prefix - s.done;
+            if (remaining <= 0 || !s.item->error.empty() || budget < 5) continue;
+            int n = std::min(remaining, budget);
+            if (remaining - n > 0 && remaining - n < 5) n = std::max(0, remaining - 5);
+            n = n >= 5 ? vision::atomic_image_chunk(s.images->spans(), uint64_t(s.done), n,
+                                                    uint64_t(remaining), budget) : 0;
+            if (n < 5) continue;
+            DeepSeek4PrefillSeq seq;
+            seq.cache = s.item->staging;
+            seq.embed = s.embed.data() + size_t(s.done) * size_t(w_.n_embd);
+            seq.token_ids = s.item->prompt->data() + s.done;
+            seq.n_tokens = n;
+            seq.kv_start = s.done;
+            seq.image_spans = s.images->spans();
+            pass.push_back(seq);
+            members.push_back(&s);
+            budget -= n;
+        }
+        if (pass.empty()) break;
+        std::string error;
+        if (!deepseek4_prefill_multi(backend_, cfg_.device.gpu, w_, pass, error)) {
+            for (Seq * m : members) m->item->error = error.empty() ? "staged prefill failed" : error;
+            continue;
+        }
+        for (size_t k = 0; k < members.size(); ++k) members[k]->done += pass[k].n_tokens;
+        ++passes;
+        for (const auto & p : pass) rows += p.n_tokens;
+    }
+    for (auto & s : seqs) {
+        if (s.item->error.empty() && s.done != s.item->prefix) s.item->error = "staged prefill could not be chunked";
+        s.item->ok = s.item->error.empty();
+    }
+    std::fprintf(stderr, "[deepseek4] staged prefill: %zu requests, %d rows in %d shared passes, %.0f ms\n",
+                 seqs.size(), rows, passes, elapsed_s(t0) * 1000.0);
 }
 
 void DeepSeek4Backend::join_image_stream() {

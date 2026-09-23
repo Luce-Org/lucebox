@@ -207,10 +207,21 @@ private:
     bool init_single_gpu_vision();
     // Waits for a streaming image encode started by materialize_images.
     void join_image_stream();
-    // Batched serving: encode an image request and prefill its first
-    // prefix_tokens into the single-request staging cache (cache_).
-    bool prefill_image_prefix(const std::vector<int32_t> & prompt, const ImagePromptHandle & images,
-                              int prefix_tokens, std::string & error);
+    // Batched serving. encode_image_request materializes an image request's
+    // rows; prefill_staged fills each request's first `prefix` tokens into
+    // its own staging cache in shared layer-major passes (expert weights read
+    // once per pass for every request in it).
+    struct StagedPrefill {
+        ImagePromptHandle images;
+        const std::vector<int32_t> * prompt = nullptr;
+        int prefix = 0;
+        DeepSeek4Cache * staging = nullptr;
+        bool ok = false;
+        std::string error;
+    };
+    bool encode_image_request(const std::vector<int32_t> & prompt, const ImagePromptHandle & images,
+                              std::string & error);
+    void prefill_staged(std::vector<StagedPrefill> & batch);
     bool materialize_images(const DeepSeek4ImagePrompt & images,
                             const DaemonIO & io, std::string & error);
 

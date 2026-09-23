@@ -7739,6 +7739,241 @@ static int ds4_try_layer_major_prefill(
     return (out_logits && out_logits->empty()) ? -1 : 1;
 }
 
+
+static bool initialize_layer_range_cache(
+        DeepSeek4LayerRangeCache & runtime, ggml_backend_t backend, int device,
+        const DeepSeek4Weights & w, int layer_begin, int layer_end, bool owns_output);
+
+bool deepseek4_prefill_multi(ggml_backend_t backend, int device,
+                             const DeepSeek4Weights & w,
+                             const std::vector<DeepSeek4PrefillSeq> & seqs,
+                             std::string & error) {
+    const auto fail_early = [&](const char * why) { error = why; return false; };
+    if (!backend || seqs.empty() || w.moe_hybrid || !ds4_backend_is_gpu(backend))
+        return fail_early("shared prefill needs a full model on one GPU");
+    int total = 0;
+    for (const auto & s : seqs) {
+        if (!s.cache || !s.embed || !s.token_ids || s.n_tokens < 5 || s.kv_start < 0 ||
+            s.cache->prefill_mode == PrefillAttentionMode::Exact ||
+            s.kv_start + s.n_tokens > s.cache->max_ctx)
+            return fail_early("invalid shared prefill sequence");
+        total += s.n_tokens;
+    }
+    if (total > DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS) return fail_early("shared prefill exceeds the pass size");
+
+    // Runtime (HC weights, hash tables, HC mirrors) from the first cache.
+    DeepSeek4Cache & owner = *seqs.front().cache;
+    if (!owner.layer_range_cache) owner.layer_range_cache = new DeepSeek4LayerRangeCache();
+    DeepSeek4LayerRangeCache & runtime = *owner.layer_range_cache;
+    if (!runtime.matches(w, backend, device, 0, w.n_layer, true) &&
+        !initialize_layer_range_cache(runtime, backend, device, w, 0, w.n_layer, true))
+        return fail_early("layer runtime initialization failed");
+    auto & fc = runtime.fused_decode_graph_cache;
+    const auto & hc_weights = runtime.hc_layer_weights;
+    const auto & hc_out_weights = runtime.hc_output_weights;
+    const auto & hash_tables = runtime.hash_routing_tables;
+    if (fc.owner_ctx != w.ctx || fc.backend != backend) {
+        fc.destroy(); fc.owner_ctx = w.ctx; fc.backend = backend;
+    }
+    if (!ds4_fused_ensure_fn_mirrors(fc, backend, w, hc_weights, hc_out_weights))
+        return fail_early("HC weight mirrors failed");
+
+    const int n_embd = w.n_embd, n_hc = w.n_hc;
+    const int64_t hc_dim = (int64_t) n_embd * n_hc;
+    const int64_t mix_dim = 2 * (int64_t) n_hc + (int64_t) n_hc * n_hc;
+
+    // Row offsets, concatenated ids and "is image row" flags for the pass.
+    std::vector<int> offset(seqs.size());
+    std::vector<int32_t> ids((size_t) total);
+    std::vector<uint8_t> image_row((size_t) total, 0);
+    bool any_image = false;
+    for (size_t k = 0, off = 0; k < seqs.size(); off += (size_t) seqs[k].n_tokens, ++k) {
+        offset[k] = (int) off;
+        std::copy_n(seqs[k].token_ids, seqs[k].n_tokens, ids.begin() + (ptrdiff_t) off);
+        for (int t = 0; t < seqs[k].n_tokens; ++t) {
+            if (vision::image_block_at(seqs[k].image_spans, uint64_t(seqs[k].kv_start + t))) {
+                image_row[off + (size_t) t] = 1;
+                any_image = true;
+            }
+        }
+    }
+
+    ggml_init_params state_params{};
+    state_params.mem_size = 4 * ggml_tensor_overhead() + 4096;
+    state_params.no_alloc = true;
+    ggml_context * state_ctx = ggml_init(state_params);
+    if (!state_ctx) return fail_early("state context failed");
+    ggml_tensor * state_a = ggml_new_tensor_2d(state_ctx, GGML_TYPE_F32, hc_dim, total);
+    ggml_tensor * state_b = ggml_new_tensor_2d(state_ctx, GGML_TYPE_F32, hc_dim, total);
+    ggml_backend_buffer_t state_buf = ggml_backend_alloc_ctx_tensors(state_ctx, backend);
+    if (!state_buf) { ggml_free(state_ctx); return fail_early("state allocation failed"); }
+    {
+        std::vector<float> initial((size_t) hc_dim * total);
+        for (size_t k = 0; k < seqs.size(); ++k) {
+            for (int t = 0; t < seqs[k].n_tokens; ++t) {
+                float * dst = initial.data() + (size_t) (offset[k] + t) * hc_dim;
+                for (int h = 0; h < n_hc; ++h) {
+                    std::memcpy(dst + (size_t) h * n_embd, seqs[k].embed + (size_t) t * n_embd,
+                                sizeof(float) * (size_t) n_embd);
+                }
+            }
+        }
+        ggml_backend_tensor_set(state_a, initial.data(), 0, sizeof(float) * initial.size());
+    }
+    ggml_gallocr_t alloc = ds4_layer_major_get_shared_alloc(w, backend);
+    const size_t meta_bytes = 160u * 1024 * 1024;
+    if (ds4_layer_major_meta_owner != w.ctx) {
+        ds4_layer_major_meta_arena.clear();
+        ds4_layer_major_meta_arena.shrink_to_fit();
+        ds4_layer_major_meta_owner = w.ctx;
+    }
+    if (ds4_layer_major_meta_arena.size() < meta_bytes) ds4_layer_major_meta_arena.resize(meta_bytes);
+    auto fail = [&](const char * what, int il) {
+        std::fprintf(stderr, "[deepseek4-prefill-multi] %s at layer %d\n", what, il);
+        ggml_backend_buffer_free(state_buf);
+        ggml_free(state_ctx);
+        error = what;
+        return false;
+    };
+    if (!alloc) return fail("shared allocator unavailable", -1);
+
+    std::vector<int32_t> hash_scratch;
+    ggml_tensor * state_in = state_a;
+    ggml_tensor * state_out = state_b;
+    for (int il = 0; il < w.n_layer; ++il) {
+        ggml_init_params params{};
+        params.mem_size = ds4_layer_major_meta_arena.size();
+        params.mem_buffer = ds4_layer_major_meta_arena.data();
+        params.no_alloc = true;
+        ggml_context * ctx = ggml_init(params);
+        if (!ctx) return fail("metadata allocation failed", il);
+        ggml_cgraph * gf = ggml_new_graph_custom(ctx, 65536, false);
+        const DeepSeek4Layer & L = w.layers[(size_t) il];
+        const HcLayerWeightsCpu & hlw = hc_weights[(size_t) il];
+
+        // HC pre over every row of every sequence.
+        ggml_tensor * norm_hc = ggml_rms_norm(ctx, state_in, w.hc_eps);
+        ggml_tensor * mix_attn = ggml_reshape_2d(ctx, ggml_mul_mat(ctx, fc.fn_attn_f16[(size_t) il], norm_hc),
+                                                 mix_dim, total);
+        ggml_tensor * pre_attn = ggml_ds4_hc_pre(
+            ctx, mix_attn, ds4_fused_hc_base_f32(ctx, L.hc_attn_base), state_in, n_hc,
+            w.n_hc_sinkhorn_iter, hlw.attn.scale_data[0], hlw.attn.scale_data[1], hlw.attn.scale_data[2]);
+        ggml_tensor * attn_in = ggml_view_2d(ctx, pre_attn, n_embd, total, pre_attn->nb[1], 0);
+        ggml_tensor * split_attn = ggml_view_2d(ctx, pre_attn, mix_dim, total, pre_attn->nb[1],
+                                                (size_t) n_embd * sizeof(float));
+        ggml_tensor * attn_normed = ggml_cont(ctx, build_rms_norm(ctx, attn_in, L.attn_norm, w.rms_eps));
+
+        // Attention per sequence, each against its own cache.
+        std::vector<DeepSeek4I32InputBinding> i32_inputs;
+        std::vector<DeepSeek4I32ArrayBinding> i32_array_inputs;
+        std::vector<DeepSeek4I64ArrayBinding> i64_array_inputs;
+        std::vector<DeepSeek4F32ArrayBinding> f32_array_inputs;
+        ggml_tensor * attn_out = nullptr;
+        for (size_t k = 0; k < seqs.size(); ++k) {
+            const DeepSeek4PrefillSeq & s = seqs[k];
+            ggml_tensor * rows = ggml_view_2d(ctx, attn_normed, n_embd, s.n_tokens, attn_normed->nb[1],
+                                              (size_t) offset[k] * attn_normed->nb[1]);
+            ggml_tensor * out = build_mla_attention(
+                ctx, gf, rows, w, L, s.cache->layers[(size_t) il], il, s.kv_start, s.n_tokens,
+                nullptr, i32_inputs, i32_array_inputs, i64_array_inputs, &f32_array_inputs,
+                DeepSeek4AttentionImpl::SparseFlash, /*boundary_checkpoint=*/nullptr, s.image_spans);
+            if (!out) { ggml_free(ctx); return fail("attention graph build failed", il); }
+            attn_out = attn_out ? ggml_concat(ctx, attn_out, out, 1) : out;
+        }
+        ggml_tensor * hc_after_attn = ggml_ds4_hc_post(ctx, state_in, attn_out, split_attn, n_hc);
+
+        // HC pre -> one MoE FFN over all rows.
+        norm_hc = ggml_rms_norm(ctx, hc_after_attn, w.hc_eps);
+        ggml_tensor * mix_ffn = ggml_reshape_2d(ctx, ggml_mul_mat(ctx, fc.fn_ffn_f16[(size_t) il], norm_hc),
+                                                mix_dim, total);
+        ggml_tensor * pre_ffn = ggml_ds4_hc_pre(
+            ctx, mix_ffn, ds4_fused_hc_base_f32(ctx, L.hc_ffn_base), hc_after_attn, n_hc,
+            w.n_hc_sinkhorn_iter, hlw.ffn.scale_data[0], hlw.ffn.scale_data[1], hlw.ffn.scale_data[2]);
+        ggml_tensor * ffn_in = ggml_view_2d(ctx, pre_ffn, n_embd, total, pre_ffn->nb[1], 0);
+        ggml_tensor * split_ffn = ggml_view_2d(ctx, pre_ffn, mix_dim, total, pre_ffn->nb[1],
+                                               (size_t) n_embd * sizeof(float));
+        ggml_tensor * ffn_normed = build_rms_norm(ctx, ffn_in, L.ffn_norm, w.rms_eps);
+        const bool hash_routed = il < w.n_hash_layer && L.ffn_gate_tid2eid && hash_tables[(size_t) il].loaded;
+        ggml_tensor * selection_bias = nullptr;
+        ggml_tensor * hash_ids = nullptr;
+        ggml_tensor * ffn_out = nullptr;
+        if (any_image) {
+            if (!L.ffn_gate_bias_vl) { ggml_free(ctx); return fail("image rows without an image router bias", il); }
+            selection_bias = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, w.n_expert, total);
+            ggml_set_input(selection_bias);
+            ffn_out = build_moe_ffn(ctx, ffn_normed, w, L, il, total, selection_bias);
+        } else if (hash_routed) {
+            hash_ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, w.n_expert_used, total);
+            ggml_set_input(hash_ids);
+            ffn_out = ds4_build_hash_routed_ffn(ctx, w, L, ffn_normed, hash_ids, total);
+        } else {
+            ffn_out = build_moe_ffn(ctx, ffn_normed, w, L, il, total);
+        }
+        if (!ffn_out) { ggml_free(ctx); return fail("FFN graph build failed", il); }
+        ggml_tensor * hc_next = ggml_ds4_hc_post(ctx, hc_after_attn, ffn_out, split_ffn, n_hc);
+        ggml_tensor * state_copy = ggml_cpy(ctx, hc_next, state_out);
+        ggml_set_output(state_copy);
+        ggml_build_forward_expand(gf, state_copy);
+
+        if (!ggml_gallocr_alloc_graph(alloc, gf)) { ggml_free(ctx); return fail("scratch allocation failed", il); }
+        for (const auto & b : i32_inputs) ggml_backend_tensor_set(b.tensor, &b.value, 0, sizeof(b.value));
+        for (const auto & b : i32_array_inputs)
+            ggml_backend_tensor_set(b.tensor, b.values.data(), 0, sizeof(int32_t) * b.values.size());
+        for (const auto & b : i64_array_inputs)
+            ggml_backend_tensor_set(b.tensor, b.values.data(), 0, sizeof(int64_t) * b.values.size());
+        for (const auto & b : f32_array_inputs)
+            ggml_backend_tensor_set(b.tensor, b.values.data(), 0, sizeof(float) * b.values.size());
+        if (hash_ids) {
+            const int n_used = w.n_expert_used;
+            hash_scratch.resize((size_t) n_used * total);
+            const auto & table = hash_tables[(size_t) il].ids;
+            for (int t = 0; t < total; ++t) {
+                std::memcpy(hash_scratch.data() + (size_t) t * n_used, table.data() + (size_t) ids[(size_t) t] * n_used,
+                            sizeof(int32_t) * (size_t) n_used);
+            }
+            ggml_backend_tensor_set(hash_ids, hash_scratch.data(), 0, sizeof(int32_t) * hash_scratch.size());
+        }
+        if (selection_bias) {
+            // Same rule as the single-sequence image path: image rows take the
+            // image router bias; text rows the layer bias, and on hash-routed
+            // layers a large bias on exactly the experts the table names.
+            constexpr float HASH_PICK = 1.0e4f;
+            const size_t n_expert = (size_t) w.n_expert;
+            std::vector<float> image_bias(n_expert), text_bias(n_expert, 0.0f);
+            ggml_backend_tensor_get(L.ffn_gate_bias_vl, image_bias.data(), 0, sizeof(float) * n_expert);
+            if (!hash_routed && L.ffn_exp_probs_b)
+                ggml_backend_tensor_get(L.ffn_exp_probs_b, text_bias.data(), 0, sizeof(float) * n_expert);
+            std::vector<float> bias(n_expert * (size_t) total);
+            for (int t = 0; t < total; ++t) {
+                float * row = bias.data() + (size_t) t * n_expert;
+                if (image_row[(size_t) t]) { std::copy(image_bias.begin(), image_bias.end(), row); continue; }
+                std::copy(text_bias.begin(), text_bias.end(), row);
+                if (hash_routed) {
+                    const int32_t * picks = hash_tables[(size_t) il].ids.data() +
+                        (size_t) ids[(size_t) t] * (size_t) w.n_expert_used;
+                    for (int j = 0; j < w.n_expert_used; ++j) row[picks[j]] = HASH_PICK;
+                }
+            }
+            ggml_backend_tensor_set(selection_bias, bias.data(), 0, sizeof(float) * bias.size());
+        }
+        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) { ggml_free(ctx); return fail("compute failed", il); }
+        ggml_free(ctx);
+        const int ratio = (int) w.compress_ratios[(size_t) il];
+        for (const auto & s : seqs) {
+            if (ratio <= 0) continue;
+            DeepSeek4LayerCache & lc = s.cache->layers[(size_t) il];
+            const int next_pos = s.kv_start + s.n_tokens;
+            lc.n_comp = std::max(lc.n_comp, next_pos / ratio);
+            if (ratio == 4) lc.n_index_comp = std::max(lc.n_index_comp, next_pos / ratio);
+        }
+        std::swap(state_in, state_out);
+    }
+    for (const auto & s : seqs) s.cache->cur_pos = s.kv_start + s.n_tokens;
+    ggml_backend_buffer_free(state_buf);
+    ggml_free(state_ctx);
+    return true;
+}
+
 static bool ds4_hc_layer_weights_ready(const HcWeightsCpu & weights,
                                        int n_embd,
                                        int n_hc) {

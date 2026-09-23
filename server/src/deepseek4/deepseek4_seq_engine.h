@@ -5,11 +5,14 @@
 #include "common/concurrency/seq_slot_manager.h"
 
 #include <cstdint>
+#include <memory>
+#include <string>
 #include <vector>
 
 namespace luce::common {
 
 class DeepSeek4Backend;
+struct DeepSeek4Cache;
 
 // Exact concurrent serving path for DeepSeek4. Model state remains in
 // DeepSeek4PagedCache; this class owns only scheduler-facing slot state and
@@ -18,6 +21,7 @@ class DeepSeek4SeqEngine final : public SeqEngine {
 public:
     DeepSeek4SeqEngine(DeepSeek4Backend & backend, PagedKvPool & pool,
                        int max_ctx, uint32_t table_stride);
+    ~DeepSeek4SeqEngine() override;
 
     int slot_count() const override { return slots_.slot_count(); }
     int max_context() const override { return slots_.max_context(); }
@@ -48,6 +52,19 @@ private:
     bool set_block(int slot, int logical, int32_t physical);
     void fail_prefill(int slot, std::vector<PrefillOutput> & outputs,
                       const std::string & error);
+
+    // Image requests admitted since the last step: their slots hold the
+    // prompt minus its last token as seeded blocks, and step() fills those
+    // blocks from shared staged prefill passes before running the batch.
+    struct PendingImage {
+        int slot = -1;
+        ImagePromptHandle images;
+        std::vector<int32_t> prompt;
+        int prefix = 0;
+    };
+    std::vector<PendingImage> pending_images_;
+    std::vector<std::unique_ptr<DeepSeek4Cache>> staging_caches_;
+    void run_pending_images(std::vector<PrefillOutput> & failures, std::vector<uint8_t> & failed_slots);
 
     DeepSeek4Backend & b_;
     SeqSlotManager slots_;
