@@ -108,9 +108,8 @@ as ordinary text.
 The server expands image markers after final rendering and tokenization, and
 the expanded image tokens count toward context and usage. Image requests
 bypass the token-keyed prefix, disk and agent-turn caches and prompt
-compression: tokens alone do not identify an image. Qwen3.5 / Qwen3.8 image
-requests decode with the drafter like text; DS4V image requests decode
-without it.
+compression: tokens alone do not identify an image. Image requests decode
+with the model's drafter like text requests.
 
 Layer or tensor splitting across GPUs, remote target shards, concurrent
 sequence scheduling (`--max-concurrency`) and upstream forwarding do not
@@ -265,7 +264,14 @@ importance matrix, the shipped recipe above), on a Strix Halo alone at top-k 6:
   and one-to-four-image sets are all correct.
 - With the published DSpark drafter and fused decode and verify, text decodes
   at 25 to 37 tok/s on 256-token answers (30 mean), as fast as the shipped
-  text model; image requests decode without the drafter at about 22 tok/s.
+  text model.
+- Image requests decode with the DSpark drafter too: on 12 images with
+  256-token answers, 13.3 s per answer (30 tok/s after the first token)
+  against 15.7 s (22 tok/s) without it. Capturing the drafter's features
+  during prefill adds about 0.7 s before the first token, so one-word answers
+  come back slightly later. The 220 questions score AI2D 86, ChartQA 55 and
+  40 with the drafter (209 answers identical to plain decode); one to four
+  images all correct.
 
 Not yet established:
 
