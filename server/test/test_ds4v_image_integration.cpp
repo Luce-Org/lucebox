@@ -69,8 +69,8 @@ void validation_and_lookup() {
     require(valid_image_spans({}, 0), "empty prompt/view is valid");
     require(!image_block_at({}, 0), "empty lookup is null");
     require(!valid_image_spans({nullptr, 1}, 100), "nonempty null view rejected");
-    std::array<TokenSpan, 5> too_many{};
-    require(!valid_image_spans({too_many.data(), too_many.size()}, 100), "more than four images rejected");
+    std::array<TokenSpan, luce::vision::DS4V_MAX_IMAGES + 1> too_many{};
+    require(!valid_image_spans({too_many.data(), too_many.size()}, 100), "too many images rejected");
     const std::vector<TokenSpan> spans{{10, 13, 18, 20}, {20, 20, 25, 25}, {30, 31, 33, 35}};
     require(valid_image_spans(view(spans), 35), "adjacent and separated blocks valid");
     require(!image_block_at(view(spans), 9), "text before block excluded");

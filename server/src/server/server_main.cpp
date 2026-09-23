@@ -86,6 +86,7 @@ static void print_usage(const char * prog) {
         "                      do not change generation routing.\n"
         "  --draft <path>       Draft model for speculative decode\n"
         "  --mmproj <path>      Vision projector GGUF: enables image input (Qwen3.5/3.8, DS4V)\n"
+        "  --mmproj-device hip:N  Run the DS4V image encoder on another GPU (one-GPU layout)\n"
         "  --port <N>           Listen port (default: 8080)\n"
         "  --host <addr>        Bind address (default: 0.0.0.0)\n"
         "  --max-ctx <N>        Max context length (default: 131072)\n"
@@ -365,6 +366,13 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
                 return 2;
             }
             bargs.mmproj_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--mmproj-device") == 0 && i + 1 < argc) {
+            DevicePlacement vision_device;
+            if (!parse_placement_device(argv[++i], vision_device)) {
+                std::fprintf(stderr, "[server] bad --mmproj-device value (expected hip:gpu)\n");
+                return 2;
+            }
+            bargs.mmproj_device = vision_device;
         } else if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
             sconfig.port = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--host") == 0 && i + 1 < argc) {

@@ -131,6 +131,7 @@ BackendPreparation BackendPlanBuilder::resolve(
     BackendPlan plan;
     plan.model_.path = std::move(args.model_path);
     plan.model_.mmproj_path = std::move(args.mmproj_path);
+    plan.model_.mmproj_device = std::move(args.mmproj_device);
     plan.model_.metadata = std::move(model);
 
     plan.placement_.target = std::move(args.device);

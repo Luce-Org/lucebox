@@ -56,6 +56,9 @@ struct BackendArgs {
 
     // Optional: vision projector .gguf (deepseek4 only)
     std::optional<std::string> mmproj_path;
+    // Optional: GPU for the vision encoder when it should not share the
+    // target's (deepseek4, one-GPU layout only).
+    std::optional<DevicePlacement> mmproj_device;
 
     // Device placement
     DevicePlacement device;

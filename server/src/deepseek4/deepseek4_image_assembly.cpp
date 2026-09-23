@@ -104,7 +104,7 @@ bool materialize_image_rows(const std::vector<PromptImage> & images,
                             ImageRows & output, std::string & error) {
     error.clear();
     try {
-        require(!images.empty() && images.size() <= 4 && bool(encode), "invalid image encode request");
+        require(!images.empty() && images.size() <= DS4V_MAX_IMAGES && bool(encode), "invalid image encode request");
         cancelled(is_cancelled);
         sentinels_valid(sentinels, dimension);
         uint64_t previous_end = 0;
@@ -145,7 +145,7 @@ bool embed_image_prompt_chunk(const PreparedImagePrompt & prompt, const ImageRow
     try {
         require(bool(prompt) && vocabulary > 0 && count && position <= prompt.tokens.size() &&
                 count <= prompt.tokens.size() - position && rows.size() == prompt.images.size() &&
-                prompt.images.size() <= 4, "invalid mixed embedding request");
+                prompt.images.size() <= DS4V_MAX_IMAGES, "invalid mixed embedding request");
         const size_t end = position + count;
         uint64_t previous_end = 0;
         for (size_t i = 0; i < prompt.images.size(); ++i) {

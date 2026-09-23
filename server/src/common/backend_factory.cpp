@@ -370,6 +370,7 @@ std::unique_ptr<ModelBackend> construct_backend(
             DeepSeek4BackendConfig cfg;
             cfg.model_path = model.path;
             cfg.mmproj_path = model.mmproj_path.value_or("");
+            cfg.mmproj_gpu  = model.mmproj_device ? model.mmproj_device->gpu : -1;
             cfg.device     = placement.target;
             cfg.stream_fd  = execution.stream_fd;
             cfg.max_ctx    = placement.target.max_ctx;

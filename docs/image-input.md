@@ -66,6 +66,25 @@ launch plus `--mmproj`: the Vision file replaces
 `DeepSeek-V4-Flash-0731-ROCMFPX-MIX-STRIX.gguf` for text as well and decodes
 at least as fast (numbers below). For R9700 + Strix Halo see [DS4V](#ds4v) below.
 
+With an R9700 in the same box, run the image encoder there while the model
+stays on the Strix Halo: expose both GPUs, point `--target-device` at the Strix
+Halo and add `--mmproj-device` with the R9700 (on lucebox6, without
+`HIP_VISIBLE_DEVICES`, that is `--target-device hip:1 --mmproj-device hip:0`).
+The encoder then runs about twice as fast and streams each image into prefill
+as soon as it is encoded, so the Strix Halo never waits for the next one:
+
+| Images | Prompt tokens | Encoder on the Strix Halo | Encoder on the R9700 |
+| --- | --- | --- | --- |
+| 1 | 126 | 2.97 s | 2.94 s |
+| 4 | 942 | 11.2 s | 9.1 s |
+| 8 | 2,262 | 27.7 s | 19.2 s |
+| 16 | 4,358 | 51.8 s | 34.6 s |
+
+Time to the first token, with the published launch above and ChartQA charts.
+Answers are identical in both layouts. `--mmproj-device` applies to this one-GPU
+layout; with the experts split across both GPUs the encoder already runs on the
+R9700.
+
 ### Send an image
 
 ```bash
@@ -101,7 +120,7 @@ Use `POST /v1/chat/completions` with user-message content parts in display order
 
 Only base64 JPEG/PNG data URLs are supported. Remote URLs, images outside user
 content arrays, and image parts through other API formats are rejected. A
-request carries at most four images, 16 MiB encoded each and 32 MiB combined.
+request carries at most 16 images, 16 MiB encoded each and 32 MiB combined.
 Decoder pixel and aspect limits also apply. A model's image marker cannot be supplied
 as ordinary text.
 

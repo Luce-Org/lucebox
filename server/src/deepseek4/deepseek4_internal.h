@@ -369,6 +369,7 @@ struct DeepSeek4Head4Tail2Routes {
 struct DeepSeek4BackendConfig {
     std::string  model_path;
     std::string  mmproj_path;
+    int          mmproj_gpu   = -1;    // vision encoder GPU; -1 = the target's
     DevicePlacement device;
     int          stream_fd    = -1;
     int          chunk        = 512;   // prefill chunk size

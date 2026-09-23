@@ -17,7 +17,7 @@ inline constexpr size_t MAX_IMAGE_BYTES = 16 * 1024 * 1024;
 struct ImageInputLimits {
     size_t image_bytes = MAX_IMAGE_BYTES;
     size_t request_bytes = 32 * 1024 * 1024;
-    size_t image_count = 4;
+    size_t image_count = MAX_REQUEST_IMAGES;
 };
 
 struct ImageRequestPolicy {

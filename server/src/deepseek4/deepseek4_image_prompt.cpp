@@ -1,4 +1,5 @@
 #include "deepseek4_image_prompt.h"
+#include "../common/image_prompt.h"
 #include <limits>
 #include <new>
 #include <utility>
@@ -21,7 +22,8 @@ PreparedImagePrompt prepare_image_prompt(const std::vector<std::int32_t> & token
         limits.output_reserve>limits.context_capacity || limits.max_expanded_tokens==0 ||
         limits.max_expanded_tokens>MAX_PREPARED_PROMPT_TOKENS)
         return fail(ImagePromptError::InvalidLimits,"invalid context, output reserve, or prompt bound");
-    if (images.size()>4) return fail(ImagePromptError::ImageCount,"at most four images are supported");
+    if (images.size()>common::MAX_REQUEST_IMAGES)
+        return fail(ImagePromptError::ImageCount,"too many images in request");
     if (tokens.size()>limits.max_expanded_tokens)
         return fail(ImagePromptError::TokenLimit,"rendered tokens exceed prompt bound");
     size_t markers=0;

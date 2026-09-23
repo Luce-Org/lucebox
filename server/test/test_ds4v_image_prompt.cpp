@@ -1,4 +1,5 @@
 #include "deepseek4_image_prompt.h"
+#include "common/image_prompt.h"
 #include <iostream>
 #include <limits>
 #include <stdexcept>
@@ -63,7 +64,7 @@ int main() {
         for (int kind=0;kind<5;++kind) rejected(prepare_image_prompt({vocab+kind},{}),ImagePromptError::InvalidToken);
         rejected(prepare_image_prompt({marker},{image},{},{129279,marker}),ImagePromptError::InvalidContract);
         rejected(prepare_image_prompt({marker},{image},{},{vocab,marker-1}),ImagePromptError::InvalidContract);
-        rejected(prepare_image_prompt(std::vector<int32_t>(5,marker),std::vector<ImagePatchInput>(5,image)),ImagePromptError::ImageCount);
+        rejected(prepare_image_prompt(std::vector<int32_t>(luce::common::MAX_REQUEST_IMAGES+1,marker),std::vector<ImagePatchInput>(luce::common::MAX_REQUEST_IMAGES+1,image)),ImagePromptError::ImageCount);
         auto bad=image; bad.plan.resized_width++;
         rejected(prepare_image_prompt({marker,marker},{image,bad}),ImagePromptError::InvalidPlan);
         bad=image; bad.plan.aligner_rows=2;

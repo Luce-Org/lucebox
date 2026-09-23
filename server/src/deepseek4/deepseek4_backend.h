@@ -16,6 +16,8 @@
 #include "deepseek4_internal.h"
 #include "deepseek4_dspark.h"
 #include "deepseek4_vision.h"
+
+#include <thread>
 #include "deepseek4_image_prompt.h"
 #include "deepseek4_image_assembly.h"
 #include "deepseek4_image_admission.h"
@@ -131,6 +133,11 @@ private:
     bool                   image_capable_ = false;
     bool                   cache_has_images_ = false;
     std::unique_ptr<vision::VisionRuntime> vision_;
+    // Owned backend for the vision encoder when --mmproj-device names a GPU
+    // other than the target's; null when the encoder shares backend_.
+    ggml_backend_t         vision_backend_ = nullptr;
+    // Encodes images on vision_backend_ while prefill consumes them.
+    std::thread            image_stream_;
     vision::ImageRequestGate image_request_gate_;
     vision::ImageAdmissionReserves image_reserves_;
 
@@ -195,6 +202,8 @@ private:
                    const DeepSeek4ImagePrompt * images = nullptr);
     bool load_vision();
     bool init_single_gpu_vision();
+    // Waits for a streaming image encode started by materialize_images.
+    void join_image_stream();
     bool materialize_images(const DeepSeek4ImagePrompt & images,
                             const DaemonIO & io, std::string & error);
 

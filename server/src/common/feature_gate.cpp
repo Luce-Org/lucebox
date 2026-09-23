@@ -59,6 +59,14 @@ std::string check_feature_compatibility(
             return "--mmproj with DeepSeek4 requires a HIP backend";
         }
     }
+    if (args.mmproj_device.has_value()) {
+        if (!args.mmproj_path.has_value() || arch != "deepseek4" ||
+            args.mmproj_device->backend != PlacementBackend::Hip ||
+            args.mmproj_device->gpu == args.device.gpu) {
+            return "--mmproj-device needs --mmproj, a DeepSeek4 target, and a HIP GPU "
+                   "other than the target's";
+        }
+    }
 
     // ── PFlash enablement × drafter model
     if (admission.pflash_enabled &&

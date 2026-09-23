@@ -37,6 +37,7 @@ public:
     struct Model {
         std::string path;
         std::optional<std::string> mmproj_path;
+        std::optional<DevicePlacement> mmproj_device;
         GgufModelInfo metadata;
     };
 

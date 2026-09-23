@@ -3,6 +3,7 @@
 // in qwen35_backend.cpp.
 #include "qwen35_backend.h"
 
+#include "common/image_prompt.h"
 #include "common/vision/image_decode.h"
 #include "qwen35_image_request.h"
 
@@ -14,7 +15,7 @@
 namespace luce::common {
 
 namespace {
-constexpr size_t MAX_IMAGES_PER_REQUEST = 4;  // the server's transport limit
+constexpr size_t MAX_IMAGES_PER_REQUEST = common::MAX_REQUEST_IMAGES;
 }
 
 bool Qwen35Backend::load_vision() {
