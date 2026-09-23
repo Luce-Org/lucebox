@@ -379,6 +379,7 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit(
         const SamplerCfg & sampler) {
     AdmitResult result = slots_.admit(request_id, prompt, sampler);
     if (result.status == AdmitResult::Status::admitted) {
+        clear_slot_images(result.slot);
         reset_recurrent_slot(b_.cache_, result.slot);
         if (result.slot >= 0 &&
             result.slot < static_cast<int>(slot_draft_kv_.size()) &&
@@ -386,6 +387,43 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit(
             draft_kv_reset(*slot_draft_kv_[static_cast<size_t>(result.slot)]);
         }
     }
+    return result;
+}
+
+bool Qwen35SeqEngine::supports_images() const {
+    return b_.supports_images();
+}
+
+SeqEngine::AdmitResult Qwen35SeqEngine::admit_images(
+        uint64_t request_id,
+        const std::vector<int32_t> & prompt,
+        const SamplerCfg & sampler,
+        const ImagePromptHandle & images) {
+    AdmitResult refused;
+    refused.status = AdmitResult::Status::failed;
+    const auto * payload = dynamic_cast<const Qwen35ImagePrompt *>(images.get());
+    if (!payload || payload->owner != &b_ || !payload->matches(prompt)) {
+        refused.error = "image binding does not match this prompt";
+        return refused;
+    }
+    // Encode before claiming a slot: a failed encode then leaves no slot to
+    // unwind. The tower runs on this (the scheduler) thread, between steps.
+    Qwen35ImageRows rows;
+    std::string error = "image encoding failed";
+    if (!b_.encode_images(*payload, rows, error)) {
+        refused.error = error;
+        return refused;
+    }
+    AdmitResult result = admit(request_id, prompt, sampler);
+    if (result.status != AdmitResult::Status::admitted) return result;
+    if (slot_images_.size() < static_cast<size_t>(slots_.slot_count())) {
+        slot_images_.resize(static_cast<size_t>(slots_.slot_count()));
+    }
+    SlotImages & state = slot_images_[static_cast<size_t>(result.slot)];
+    state.payload = images;
+    state.rows = std::move(rows);
+    state.rows.prompt = payload;
+    state.rope_delta = payload->positions.next - static_cast<int>(prompt.size());
     return result;
 }
 
@@ -425,6 +463,7 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit_with_prefix(
         const PrefixStorePlan & plan) {
     AdmitResult result = slots_.admit(request_id, prompt, sampler);
     if (result.status != AdmitResult::Status::admitted) return result;
+    clear_slot_images(result.slot);
 
     const int slot = result.slot;
     slots_.slot(slot).pending_capture = {};
@@ -652,6 +691,13 @@ Qwen35SeqEngine::PrefillStage Qwen35SeqEngine::stage_prefill_chunk(
                      "prefill embedding failed");
         return PrefillStage{};
     }
+    if (slot < static_cast<int>(slot_images_.size()) &&
+        slot_images_[static_cast<size_t>(slot)].payload) {
+        const SlotImages & images = slot_images_[static_cast<size_t>(slot)];
+        images.rows.overwrite(stage.embeddings.data(), stage.kv_pos, stage.chunk, b_.w_.n_embd);
+        stage.positions.assign(static_cast<size_t>(4) * stage.chunk, 0);
+        images.rows.prompt->positions.fill(stage.positions.data(), stage.kv_pos, stage.chunk);
+    }
     stage.ready = true;
     return stage;
 }
@@ -856,7 +902,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
         seq_lens_[static_cast<size_t>(lane.slot)] = lane.position + 1;
         for (int axis = 0; axis < 3; ++axis) {
             positions[static_cast<size_t>(axis) * total_rows + lane_index] =
-                lane.position;
+                lane.position + rope_delta(lane.slot);
         }
         for (int head = 0; head < n_head_kv; ++head) {
             write_rows[static_cast<size_t>(head) * total_rows + lane_index] =
@@ -884,7 +930,8 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
                 ? -1
                 : node - 1;
             query_slots[static_cast<size_t>(row)] = proposal.slot;
-            const int position = slots_.slot(proposal.slot).cur_pos + node;
+            const int position = slots_.slot(proposal.slot).cur_pos + node +
+                rope_delta(proposal.slot);
             for (int axis = 0; axis < 3; ++axis) {
                 positions[static_cast<size_t>(axis) * total_rows + row] =
                     position;
@@ -1427,14 +1474,23 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
     pos_buf_.assign((size_t)4 * n_total, 0);
     token_offset = 0;
     for (const PrefillStage & prefill : prefills) {
-        fill_qwen35_mrope_positions(
-            pos_buf_.data(), n_total, token_offset,
-            prefill.kv_pos, prefill.chunk);
+        if (prefill.positions.empty()) {
+            fill_qwen35_mrope_positions(
+                pos_buf_.data(), n_total, token_offset,
+                prefill.kv_pos, prefill.chunk);
+        } else {
+            for (int axis = 0; axis < 4; ++axis) {
+                std::copy_n(prefill.positions.data() + (size_t)axis * prefill.chunk, prefill.chunk,
+                            pos_buf_.data() + (size_t)axis * n_total + token_offset);
+            }
+        }
         token_offset += prefill.chunk;
     }
     if (with_decode) {
         for (int row = 0; row < live_count; ++row) {
-            const int pos = live_positions_[(size_t)row];
+            // Rotary positions run ahead of KV positions after an image.
+            const int pos = live_positions_[(size_t)row] +
+                rope_delta(live_slot_ids_[(size_t)row]);
             const int packed_row = n_prefill + row;
             pos_buf_[(size_t)0 * n_total + packed_row] = pos;
             pos_buf_[(size_t)1 * n_total + packed_row] = pos;
@@ -1650,6 +1706,7 @@ bool Qwen35SeqEngine::evict_kv(int slot, int32_t pending_token,
 
 void Qwen35SeqEngine::retire(int slot) {
     offload_.discard(slot);
+    clear_slot_images(slot);
     if (!slots_.is_active(slot)) return;
     if (slot >= 0 && slot < static_cast<int>(slot_draft_kv_.size()) &&
         slot_draft_kv_[static_cast<size_t>(slot)]) {

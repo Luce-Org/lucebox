@@ -130,9 +130,14 @@ bypass the token-keyed prefix, disk and agent-turn caches and prompt
 compression: tokens alone do not identify an image. Image requests decode
 with the model's drafter like text requests.
 
-Layer or tensor splitting across GPUs, remote target shards, concurrent
-sequence scheduling (`--max-concurrency`) and upstream forwarding do not
-support images. `/props` reports the effective capability in
+Layer or tensor splitting across GPUs, remote target shards and upstream
+forwarding do not support images. Qwen3.5 / Qwen3.8 serve images with
+concurrent sequence scheduling (`--paged-attention --max-concurrency N`): each
+image request is encoded when it is admitted and then prefills and decodes in
+the shared batch like text, with the drafter. On one R9700, four concurrent
+256-token image answers finish in 6.9 s (149 tok/s in total) against 13.3 s
+(77 tok/s) one at a time. DeepSeek V4 image requests still need one request
+at a time. `/props` reports the effective capability in
 `capabilities.image_input_supported` after backend initialization.
 
 ## Qwen3.5 / Qwen3.8
