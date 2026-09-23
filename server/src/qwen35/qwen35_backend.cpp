@@ -1324,6 +1324,7 @@ DFlashTarget * Qwen35Backend::dflash_target() {
             qt->set_kvflash_pager(&kvflash_pager_);
         }
         qt->set_fast_rollback(cfg_.fast_rollback);
+        qt->set_rope_offset(&rope_delta_);
     }
     return dflash_target_.get();
 }
@@ -1508,9 +1509,9 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
                     req.n_gen, ar_n_gen, committed, cfg_.device.max_ctx);
             }
         }
-        // Speculative decoding takes rotary positions from KV positions, which
-        // an image prompt pulls apart, so image requests decode one by one.
-        if (cfg_.paged_attention || req.force_ar_decode || has_images) {
+        // Image requests speculate too: the verify target shifts its rotary
+        // positions by rope_delta_, and the drafter only proposes tokens.
+        if (cfg_.paged_attention || req.force_ar_decode) {
             decode_ok = do_ar_decode(committed, ar_n_gen, result.tokens, out_io,
                                      req.budget_hook,
                                      &result.budget_forced_close,

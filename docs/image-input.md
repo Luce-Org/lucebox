@@ -36,8 +36,8 @@ hf download Lucebox/Qwen3.8-27B-DFlash2-GGUF \
   --port 8216
 ```
 
-About 21 GiB of VRAM at the peak of an image request. Text requests keep the
-DFlash2 drafter; image requests decode without it.
+About 21 GiB of VRAM at the peak of an image request. Text and image requests
+both decode with the DFlash2 drafter.
 
 ### DeepSeek V4 Flash Vision on a Strix Halo
 
@@ -125,10 +125,10 @@ Decoder pixel and aspect limits also apply. A model's image marker cannot be sup
 as ordinary text.
 
 The server expands image markers after final rendering and tokenization, and
-the expanded image tokens count toward context and usage. Image requests use
-plain autoregressive decoding and bypass the token-keyed prefix, disk and
-agent-turn caches and prompt compression: tokens alone do not identify an
-image. Text requests on the same server keep speculative decoding and caching.
+the expanded image tokens count toward context and usage. Image requests
+bypass the token-keyed prefix, disk and agent-turn caches and prompt
+compression: tokens alone do not identify an image. Image requests decode
+with the model's drafter like text requests.
 
 Layer or tensor splitting across GPUs, remote target shards, concurrent
 sequence scheduling (`--max-concurrency`) and upstream forwarding do not
@@ -163,8 +163,12 @@ Lucebox `Qwen3.8-27B-IQ4_XS-pure` file and a Q8_0 projector:
   lmms-eval prompts: AI2D 90/100, ChartQA relaxed accuracy 56/60 (augmented)
   and 42/60 (human). Image prompts prefill in 0.56 s on average; one to four
   images per request all answer correctly (four images, 2,495 tokens: 3.2 s).
-- Text decodes at 56 to 117 tok/s on 256-token answers (84 on average); image
-  requests decode without the drafter at about 36 tok/s.
+- Text decodes at 56 to 117 tok/s on 256-token answers (84 on average).
+- Image requests decode with the drafter. On 12 images with 256-token
+  answers: 4.0 s per answer (76 tok/s after the first token), against 5.5 s
+  for llama.cpp with the same drafter (`--spec-type draft-dflash`) and 8.4 s
+  without one; faster on every image, 1.21x to 1.58x. The 220-question score
+  is unchanged (188, 218 answers identical to plain decode).
 
 With unsloth's UD-IQ4_XS file and the published BF16 projector:
 
@@ -279,7 +283,14 @@ importance matrix, the shipped recipe above), on a Strix Halo alone at top-k 6:
   and one-to-four-image sets are all correct.
 - With the published DSpark drafter and fused decode and verify, text decodes
   at 25 to 37 tok/s on 256-token answers (30 mean), as fast as the shipped
-  text model; image requests decode without the drafter at about 22 tok/s.
+  text model.
+- Image requests decode with the DSpark drafter too: on 12 images with
+  256-token answers, 13.3 s per answer (30 tok/s after the first token)
+  against 15.7 s (22 tok/s) without it. Capturing the drafter's features
+  during prefill adds about 0.7 s before the first token, so one-word answers
+  come back slightly later. The 220 questions score AI2D 86, ChartQA 55 and
+  40 with the drafter (209 answers identical to plain decode); one to four
+  images all correct.
 
 Not yet established:
 
