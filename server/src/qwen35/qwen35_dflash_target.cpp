@@ -307,7 +307,7 @@ bool Qwen35DFlashTarget::verify_batch(
 
     // GGML M-RoPE positions are axis-major.
     std::vector<int32_t> pos(4 * n_tokens);
-    fill_qwen35_mrope_positions(pos.data(), base_pos, n_tokens);
+    fill_qwen35_mrope_positions(pos.data(), base_pos + rope_offset(), n_tokens);
     ggml_backend_tensor_set(sg_.positions, pos.data(), 0,
                             sizeof(int32_t) * pos.size());
 
@@ -452,7 +452,7 @@ bool Qwen35DFlashTarget::verify_tree(
     // M-RoPE axis-major positions: each node sits at committed + its depth.
     std::vector<int32_t> pos4(4 * N, 0);
     for (int i = 0; i < N_actual; i++) {
-        const int p = committed + (i == 0 ? 0 : tree.depths[i - 1]);
+        const int p = committed + rope_offset() + (i == 0 ? 0 : tree.depths[i - 1]);
         pos4[0 * N + i] = p;
         pos4[1 * N + i] = p;
         pos4[2 * N + i] = p;

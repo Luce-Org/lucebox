@@ -93,6 +93,11 @@ public:
     // so rollback_to() can restore recurrent state without replay.
     void set_fast_rollback(bool enabled) { fast_rollback_ = enabled; }
 
+    // Rotary positions run ahead of KV positions by this many after an image
+    // (image tokens take 2D positions). Points at the owner's per-request
+    // offset, which every prefill sets; null means zero.
+    void set_rope_offset(const int * offset) { rope_offset_ = offset; }
+
 private:
     TargetWeights & w_;
     TargetCache & cache_;
@@ -102,6 +107,8 @@ private:
     int fa_window_;
     KvFlashPager * pager_ = nullptr;
     bool fast_rollback_ = false;
+    const int * rope_offset_ = nullptr;
+    int rope_offset() const { return rope_offset_ ? *rope_offset_ : 0; }
 
     // SpecLA (docs/SPECLA.md): true when the cache was
     // migrated with factor buffers. Capture-verify then runs the
