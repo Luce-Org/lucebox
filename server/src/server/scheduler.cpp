@@ -451,7 +451,9 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         PrefixCaptureTxn prepared_capture;
         PrefixCache::InlineReservation capture_reservation;
         int restore_policy_slot = -1;
-        const bool prefix_supported =
+        // Tokens alone do not identify an image: image requests never touch
+        // the prefix cache.
+        const bool prefix_supported = !req.images &&
             engine.supports_prefix_store() && !prefix_cache_.disabled();
         if (prefix_supported) {
             const auto hit = prefix_cache_.lookup_candidate(
@@ -502,7 +504,10 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         // Admission only claims the slot and queues the prompt. Prefill
         // advances one chunk per engine step alongside live decode.
         const PrefixStorePlan requested_plan = prefix_plan;
-        auto ar = prefix_supported
+        auto ar = req.images
+            ? engine.admit_images(
+                  next_request_id, req.prompt_tokens, req.sampler, req.images)
+            : prefix_supported
             ? engine.admit_with_prefix(
                   next_request_id, req.prompt_tokens, req.sampler,
                   requested_plan)

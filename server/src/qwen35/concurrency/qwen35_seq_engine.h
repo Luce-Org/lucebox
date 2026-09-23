@@ -26,6 +26,7 @@
 #include "common/dflash_draft_kv.h"
 #include "common/dflash_feature_ring.h"
 #include "qwen35_slot_manager.h"
+#include "../qwen35_image_request.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -114,6 +115,11 @@ public:
         return slots_.kv_restore_feasible(slot);
     }
     void retire(int slot) override;
+    bool supports_images() const override;
+    AdmitResult admit_images(uint64_t request_id,
+                             const std::vector<int32_t> & prompt,
+                             const SamplerCfg & sampler,
+                             const ImagePromptHandle & images) override;
 
     bool token_is_eos(int32_t token) const override;
 
@@ -126,7 +132,29 @@ private:
         bool commit = false;
         std::vector<int64_t> rows;
         std::vector<float> embeddings;
+        // Axis-major [4 x chunk] rotary positions when the slot holds images;
+        // empty means the plain kv_pos + i positions.
+        std::vector<int32_t> positions;
     };
+
+    // Per-slot image state: the payload (kept alive for re-prefill after
+    // eviction), its encoded rows, and how far rotary positions run ahead of
+    // KV positions after the images.
+    struct SlotImages {
+        ImagePromptHandle payload;
+        Qwen35ImageRows rows;
+        int rope_delta = 0;
+    };
+    std::vector<SlotImages> slot_images_;
+    int rope_delta(int slot) const {
+        return slot >= 0 && slot < static_cast<int>(slot_images_.size())
+            ? slot_images_[static_cast<size_t>(slot)].rope_delta : 0;
+    }
+    void clear_slot_images(int slot) {
+        if (slot >= 0 && slot < static_cast<int>(slot_images_.size())) {
+            slot_images_[static_cast<size_t>(slot)] = SlotImages{};
+        }
+    }
 
     struct PreparedChainDraft {
         std::vector<int32_t> tokens;
