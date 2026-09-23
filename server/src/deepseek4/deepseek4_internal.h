@@ -451,6 +451,15 @@ bool create_deepseek4_paged_cache(ggml_backend_t backend,
                                   uint32_t slots, uint32_t max_ctx,
                                   uint32_t physical_blocks,
                                   DeepSeek4PagedCache & out);
+// Copies the first n_tokens of a single-request cache (prefilled from position
+// 0) into one paged slot: the raw SWA ring, the completed compressed and
+// indexer rows through the slot's block table, and the compressor states.
+// Both caches must come from the same weights. The slot's first n_tokens
+// blocks must already be in block_table.
+bool import_deepseek4_paged_slot(const DeepSeek4Cache & src, int n_tokens,
+                                 DeepSeek4PagedCache & dst, uint32_t slot,
+                                 const int32_t * block_table, uint32_t block_table_len,
+                                 std::string & error);
 void reset_deepseek4_paged_slot(DeepSeek4PagedCache & c, uint32_t slot);
 void free_deepseek4_paged_cache(DeepSeek4PagedCache & c);
 // Exact gathered-reference decode for up to six independent lanes. Inputs are

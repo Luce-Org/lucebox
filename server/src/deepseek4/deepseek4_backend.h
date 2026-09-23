@@ -197,13 +197,20 @@ private:
                                            int snapshot_capture_to);
 
     // Prefill prompt tokens in chunks, return absolute committed position.
+    // prefix_tokens > 0 prefills only that many leading tokens (the batched
+    // image admission leaves the last prompt token to the paged engine).
     int do_prefill(const std::vector<int32_t> & tokens, const DaemonIO & io,
                    int kv_offset = 0, int snap_slot = -1, int snap_pos = -1,
-                   const DeepSeek4ImagePrompt * images = nullptr);
+                   const DeepSeek4ImagePrompt * images = nullptr,
+                   int prefix_tokens = 0);
     bool load_vision();
     bool init_single_gpu_vision();
     // Waits for a streaming image encode started by materialize_images.
     void join_image_stream();
+    // Batched serving: encode an image request and prefill its first
+    // prefix_tokens into the single-request staging cache (cache_).
+    bool prefill_image_prefix(const std::vector<int32_t> & prompt, const ImagePromptHandle & images,
+                              int prefix_tokens, std::string & error);
     bool materialize_images(const DeepSeek4ImagePrompt & images,
                             const DaemonIO & io, std::string & error);
 

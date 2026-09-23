@@ -1149,6 +1149,29 @@ bool DeepSeek4Backend::prepare_images(
     }
 }
 
+bool DeepSeek4Backend::prefill_image_prefix(const std::vector<int32_t> & prompt,
+                                            const ImagePromptHandle & handle,
+                                            int prefix_tokens, std::string & error) {
+    const auto * images = dynamic_cast<const DeepSeek4ImagePrompt *>(handle.get());
+    if (!images || images->owner_ != this || !images->matches(prompt) || !cache_.buf ||
+        prefix_tokens <= 0 || prefix_tokens >= int(prompt.size()) ||
+        prompt.size() > size_t(cache_.max_ctx)) {
+        error = "image binding, staging cache, or prompt length is invalid";
+        return false;
+    }
+    DaemonIO io;
+    struct ImageStreamJoin {
+        DeepSeek4Backend * backend;
+        ~ImageStreamJoin() { backend->join_image_stream(); }
+    } join{this};
+    if (!materialize_images(*images, io, error)) return false;
+    if (do_prefill(prompt, io, 0, -1, -1, images, prefix_tokens) != prefix_tokens) {
+        if (error.empty()) error = "image prefix prefill failed";
+        return false;
+    }
+    return true;
+}
+
 void DeepSeek4Backend::join_image_stream() {
     if (image_stream_.joinable()) image_stream_.join();
 }
@@ -1424,8 +1447,10 @@ bool DeepSeek4Backend::load_model() {
         const bool two_gpu_ok = tp.in_process && tp.backend_valid &&
             tp.secondary_backend == PlacementBackend::Hip &&
             tp.secondary_gpu != cfg_.device.gpu && !tp.all_on_secondary && !force_full;
+        // Batched serving keeps exact prefill for text; its image admissions
+        // prefill into a sparse staging cache instead.
         if (target_backend != PlacementBackend::Hip || cfg_.device.is_layer_split() ||
-            cfg_.prefill_mode != PrefillAttentionMode::Sparse ||
+            (cfg_.prefill_mode != PrefillAttentionMode::Sparse && !cfg_.paged_attention) ||
             (tp.requested && !two_gpu_ok) ||
             env_flag_enabled("LUCE_DS4_DENSE_TP_MASK")) {
             std::fprintf(stderr, "[deepseek4] --mmproj requires a HIP target with --ds4-prefill sparse, "
@@ -1807,6 +1832,18 @@ bool DeepSeek4Backend::init() {
                 "or set --kv-pool-tokens\n", max_ctx, cfg_.max_concurrency,
                 (unsigned long long)requested);
             return false;
+        }
+        if (vision_) {
+            // Image admissions prefill on the single-request sparse path into
+            // this staging cache, then copy it into their paged slot.
+            if (!create_deepseek4_cache(backend_, w_, max_ctx, cache_)) {
+                std::fprintf(stderr, "[deepseek4] image staging cache allocation failed (ctx=%d)\n", max_ctx);
+                return false;
+            }
+            cache_.prefill_mode = PrefillAttentionMode::Sparse;
+            image_request_gate_.set_capacity(cfg_.max_concurrency);
+            std::fprintf(stderr, "[deepseek4] batched image serving: %d slots, staging cache ctx=%d\n",
+                         cfg_.max_concurrency, max_ctx);
         }
     } else {
         if (!create_deepseek4_cache(backend_, w_, max_ctx, cache_)) {
@@ -2740,12 +2777,13 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                                   int kv_offset,
                                   int snap_slot,
                                   int snap_pos,
-                                  const DeepSeek4ImagePrompt * images) {
+                                  const DeepSeek4ImagePrompt * images,
+                                  int prefix_tokens) {
     // Image prompts capture DSpark features from their text chunks only: the
     // image graph takes no capture hooks (see the chunking below).
     const bool capture_spec = spec_enabled_ && spec_drafter_;
     const InferencePhase phase = deepseek4_roctx_prefill_phase(
-        prefill_attention_mode_name(cfg_.prefill_mode));
+        prefill_attention_mode_name(cache_.prefill_mode));
     const DeepSeek4RoctxPhaseScope roctx_phase(phase);
     const DeepSeek4RoctxRange roctx_range(
         "ds4.prefill",
@@ -2766,7 +2804,8 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
     // Mixed hot/cold hybrid execution still has single-token HC semantics, so
     // retain the reference path there.  --chunk 1 is the explicit fallback.
     const int requested_chunk = cfg_.chunk > 0 ? cfg_.chunk : w_.n_swa;
-    const int n_total = (int)tokens.size();
+    const int n_total = prefix_tokens > 0
+        ? std::min(prefix_tokens, (int)tokens.size()) : (int)tokens.size();
     // Bound the layer-major graph to the topology validated by the prefill
     // kernels. Smaller tail chunks use the same scheduler or its reference
     // fallback.
@@ -2777,17 +2816,17 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
     // hybrid execution remains tokenwise; batching it would skip per-token HC
     // post-mixing and corrupt the hidden state.
     const bool hybrid_batch_supported =
-        !moe_hybrid_ || cfg_.prefill_mode == PrefillAttentionMode::Sparse;
+        !moe_hybrid_ || cache_.prefill_mode == PrefillAttentionMode::Sparse;
     const int base_chunk =
         !hybrid_batch_supported ||
-        (cfg_.prefill_mode == PrefillAttentionMode::Exact &&
+        (cache_.prefill_mode == PrefillAttentionMode::Exact &&
          spec_drafter_ != nullptr)
         ? 1
         : std::max(1, std::min(requested_chunk,
                                layer_major_cap));
     const bool bound_hybrid_scratch =
         moe_hybrid_ &&
-        cfg_.prefill_mode == PrefillAttentionMode::Sparse;
+        cache_.prefill_mode == PrefillAttentionMode::Sparse;
     const int chunk = bound_hybrid_scratch
         ? deepseek4_hybrid_prefill_chunk_tokens(
               base_chunk, kv_offset + n_total,
@@ -3048,7 +3087,7 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                                             need_logits ? &logits : nullptr,
                                             tokens.data() + i,
                                             timing ? &step_tel : nullptr,
-                                            cfg_.prefill_mode != PrefillAttentionMode::Sparse, hp,
+                                            cache_.prefill_mode != PrefillAttentionMode::Sparse, hp,
                                             /*moe_hybrid=*/nullptr, /*expert_runtime=*/nullptr,
                                             /*routing_stats=*/nullptr,
                                             images ? images->spans() : vision::ImageSpanView{});

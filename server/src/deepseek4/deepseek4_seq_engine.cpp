@@ -80,6 +80,50 @@ SeqEngine::AdmitResult DeepSeek4SeqEngine::admit(
     return result;
 }
 
+bool DeepSeek4SeqEngine::supports_images() const {
+    return b_.image_capable_ && b_.vision_ && b_.cache_.buf;
+}
+
+SeqEngine::AdmitResult DeepSeek4SeqEngine::admit_images(
+        uint64_t request_id, const std::vector<int32_t> & prompt,
+        const SamplerCfg & sampler, const ImagePromptHandle & images) {
+    AdmitResult refused;
+    refused.status = AdmitResult::Status::failed;
+    if (!supports_images() || prompt.size() < 2) {
+        refused.error = "image support or prompt length is invalid";
+        return refused;
+    }
+    // DS4V image blocks need whole-block bidirectional prefill, which the
+    // 16-row gathered graph cannot run. Prefill every token but the last on
+    // the single-request sparse path into the staging cache, copy that state
+    // into the slot, and let the paged engine prefill the final (text) token,
+    // which yields the first sampled token through the normal step.
+    const int prefix = int(prompt.size()) - 1;
+    std::string error;
+    if (!b_.prefill_image_prefix(prompt, images, prefix, error)) {
+        refused.error = error.empty() ? "image prefill failed" : error;
+        return refused;
+    }
+    AdmitResult result = admit(request_id, prompt, sampler);
+    if (result.status != AdmitResult::Status::admitted) return result;
+    SeqSlotManager::PrefillChunk seeded = slots_.seed_restored_prefix(result.slot, prefix);
+    bool ok = seeded.ok && seeded.rows.size() == size_t(prefix);
+    for (size_t i = 0; ok && i < seeded.new_blocks.size(); ++i) {
+        ok = set_block(result.slot, seeded.first_new_block + int(i), seeded.new_blocks[i]);
+    }
+    if (ok) {
+        ok = import_deepseek4_paged_slot(
+            b_.cache_, prefix, b_.paged_cache_, uint32_t(result.slot),
+            host_tables_.data() + size_t(result.slot) * stride_, stride_, error);
+    }
+    if (!ok) {
+        retire(result.slot);
+        refused.error = error.empty() ? "image prefix could not be seeded into the paged slot" : error;
+        return refused;
+    }
+    return result;
+}
+
 bool DeepSeek4SeqEngine::set_block(int slot, int logical, int32_t physical) {
     if (slot < 0 || slot >= slots_.slot_count() || logical < 0 ||
         (uint32_t) logical >= stride_) return false;

@@ -51,9 +51,9 @@ std::string check_feature_compatibility(
     if (args.mmproj_path.has_value()) {
         if ((arch != "deepseek4" && arch != "qwen35") || args.device.is_layer_split() ||
             args.device.is_tensor_parallel() || args.remote_target_shard.enabled() ||
-            (arch == "deepseek4" && args.max_concurrency != 1)) {
-            return "--mmproj requires a local DeepSeek4 (one request at a time) or Qwen3.5 "
-                   "backend that is not split across GPUs by layer or tensor";
+            (arch == "deepseek4" && args.max_concurrency != 1 && !args.paged_attention)) {
+            return "--mmproj requires a local DeepSeek4 or Qwen3.5 backend that is not split "
+                   "across GPUs by layer or tensor (DeepSeek4 batching needs --paged-attention)";
         }
         if (arch == "deepseek4" && target_backend != PlacementBackend::Hip) {
             return "--mmproj with DeepSeek4 requires a HIP backend";

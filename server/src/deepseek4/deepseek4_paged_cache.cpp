@@ -6,7 +6,10 @@
 #include "deepseek4_internal.h"
 #endif
 
+#include <algorithm>
 #include <cstdio>
+#include <string>
+#include <vector>
 #include <limits>
 #include <memory>
 
@@ -220,6 +223,78 @@ void reset_deepseek4_paged_slot(DeepSeek4PagedCache & c, uint32_t slot) {
         clear_slot(layer.indexer_compressor.state_kv);
         clear_slot(layer.indexer_compressor.state_score);
     }
+}
+
+bool import_deepseek4_paged_slot(const DeepSeek4Cache & src, int n_tokens,
+                                 DeepSeek4PagedCache & dst, uint32_t slot,
+                                 const int32_t * block_table, uint32_t block_table_len,
+                                 std::string & error) {
+    const auto fail = [&](const char * why) { error = why; return false; };
+    if (!dst.buf || slot >= dst.plan.slots || n_tokens <= 0 || !block_table ||
+        src.layers.size() != dst.layers.size()) return fail("invalid paged import request");
+    const uint64_t blocks_needed = (uint64_t(n_tokens) + DS4_PAGE_TOKENS - 1) / DS4_PAGE_TOKENS;
+    if (blocks_needed > block_table_len) return fail("paged import exceeds the block table");
+    for (uint64_t b = 0; b < blocks_needed; ++b) {
+        if (block_table[b] < 0 || uint32_t(block_table[b]) >= dst.plan.physical_blocks)
+            return fail("paged import block is not allocated");
+    }
+    const auto same_rows = [](const ggml_tensor * a, const ggml_tensor * b) {
+        return a && b && a->type == b->type && a->ne[0] == b->ne[0] && a->nb[1] == b->nb[1];
+    };
+    // One whole slot plane of a [width, rows, slots] tensor from a [width, rows] one.
+    const auto copy_plane = [&](const ggml_tensor * from, ggml_tensor * to) {
+        if (!from && !to) return true;
+        if (!same_rows(from, to) || from->ne[1] != to->ne[1] || ggml_nbytes(from) != to->nb[2]) return false;
+        std::vector<uint8_t> host(ggml_nbytes(from));
+        ggml_backend_tensor_get(from, host.data(), 0, host.size());
+        ggml_backend_tensor_set(to, host.data(), size_t(slot) * to->nb[2], host.size());
+        return true;
+    };
+    // Completed compression groups, chronological in src, paged in dst.
+    // Groups inside one logical block land on consecutive rows of its page.
+    const auto copy_groups = [&](const ggml_tensor * from, ggml_tensor * to, uint32_t ratio, int groups) {
+        if (!groups) return true;
+        if (!same_rows(from, to) || groups > from->ne[1]) return false;
+        std::vector<uint8_t> host(size_t(groups) * from->nb[1]);
+        ggml_backend_tensor_get(from, host.data(), 0, host.size());
+        const int per_block = int(DS4_PAGE_TOKENS / ratio);
+        for (int g = 0; g < groups;) {
+            const uint64_t end_token = uint64_t(g) * ratio + ratio - 1;
+            const uint64_t logical = end_token / DS4_PAGE_TOKENS;
+            uint64_t row = 0; bool emitted = false;
+            if (!ds4_compressed_page_row(end_token, uint32_t(block_table[logical]), ratio, row, emitted) ||
+                !emitted || row >= uint64_t(to->ne[1])) return false;
+            const int run = std::min(groups - g, per_block - int((end_token % DS4_PAGE_TOKENS) / ratio));
+            ggml_backend_tensor_set(to, host.data() + size_t(g) * from->nb[1],
+                                    size_t(row) * to->nb[1], size_t(run) * from->nb[1]);
+            g += run;
+        }
+        return true;
+    };
+    for (size_t il = 0; il < dst.layers.size(); ++il) {
+        const DeepSeek4LayerCache & s = src.layers[il];
+        DeepSeek4PagedLayerCache & d = dst.layers[il];
+        // The single-request ring has the paged ring's 128 rows and the same
+        // position % 128 indexing, so the whole ring moves as one plane.
+        if (!same_rows(s.raw_kv, d.raw_kv) || s.raw_kv->ne[1] != int64_t(DS4_PAGE_TOKENS) ||
+            ggml_nbytes(s.raw_kv) != d.raw_kv->nb[2]) return fail("raw ring layouts differ");
+        if (!copy_plane(s.raw_kv, d.raw_kv)) return fail("raw ring copy failed");
+        if (!d.ratio) continue;
+        const int groups = n_tokens / int(d.ratio);
+        if (s.n_comp != groups) return fail("compressed row count does not match the prefix");
+        if (!copy_groups(s.comp_kv, d.comp_kv, d.ratio, groups)) return fail("compressed row copy failed");
+        if (!copy_plane(s.attn_compressor.state_kv, d.attn_compressor.state_kv) ||
+            !copy_plane(s.attn_compressor.state_score, d.attn_compressor.state_score))
+            return fail("compressor state copy failed");
+        if (d.index_comp_kv) {
+            if (s.n_index_comp != groups) return fail("indexer row count does not match the prefix");
+            if (!copy_groups(s.index_comp_kv, d.index_comp_kv, d.ratio, groups) ||
+                !copy_plane(s.indexer_compressor.state_kv, d.indexer_compressor.state_kv) ||
+                !copy_plane(s.indexer_compressor.state_score, d.indexer_compressor.state_score))
+                return fail("indexer copy failed");
+        }
+    }
+    return true;
 }
 
 void free_deepseek4_paged_cache(DeepSeek4PagedCache & c) {

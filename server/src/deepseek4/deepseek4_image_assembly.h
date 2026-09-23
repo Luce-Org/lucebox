@@ -12,8 +12,11 @@ namespace luce::vision {
 class ImageRequestGate {
 public:
     std::shared_ptr<void> try_acquire() const;
+    // Concurrent serving admits up to one image request per batch slot.
+    void set_capacity(int capacity) { capacity_ = capacity > 0 ? capacity : 1; }
 private:
-    std::shared_ptr<std::atomic<bool>> active_ = std::make_shared<std::atomic<bool>>(false);
+    std::shared_ptr<std::atomic<int>> active_ = std::make_shared<std::atomic<int>>(0);
+    int capacity_ = 1;
 };
 
 struct ImageRaster {

@@ -136,8 +136,27 @@ concurrent sequence scheduling (`--paged-attention --max-concurrency N`): each
 image request is encoded when it is admitted and then prefills and decodes in
 the shared batch like text, with the drafter. On one R9700, four concurrent
 256-token image answers finish in 6.9 s (149 tok/s in total) against 13.3 s
-(77 tok/s) one at a time. DeepSeek V4 image requests still need one request
-at a time. `/props` reports the effective capability in
+(77 tok/s) one at a time.
+
+DeepSeek V4 Flash Vision batches too, with the batched launch from the DeepSeek
+guide plus `--mmproj` (and `--mmproj-device` for an R9700 encoder):
+
+```
+luce_server models/DeepSeek-V4-Flash-Vision-Exp-ROCMFPX-MIX-STRIX.gguf \
+  --target-device hip:1 --mmproj-device hip:0 \
+  --paged-attention --max-concurrency 4 --kv-pool-tokens 24576 --max-ctx 8192 \
+  --ds4-prefill exact --prefix-cache-slots 0 --ds4-expert-top-k 6 \
+  --mmproj models/DeepSeek-V4-Flash-Vision-Exp-mmproj-BF16.gguf
+```
+
+Its image blocks need whole-block bidirectional prefill, which the batched
+engine's 16-row step cannot run. An image request is therefore prefilled up to
+its last token on the single-request sparse path, into a staging cache, while
+the batch waits; that state is copied into the request's paged slot and the
+last token prefills in the batch, so the answer decodes alongside everyone
+else. On the Strix Halo with the encoder on the R9700, four concurrent image
+answers of 256 tokens finish in 39 s (26 tok/s in total), two images plus two
+text requests in 33 s (31 tok/s); four text requests reach 38 tok/s. `/props` reports the effective capability in
 `capabilities.image_input_supported` after backend initialization.
 
 ## Qwen3.5 / Qwen3.8

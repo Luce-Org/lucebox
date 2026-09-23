@@ -38,6 +38,11 @@ public:
     }
     void retire(int slot) override;
     bool token_is_eos(int32_t token) const override;
+    bool supports_images() const override;
+    AdmitResult admit_images(uint64_t request_id,
+                             const std::vector<int32_t> & prompt,
+                             const SamplerCfg & sampler,
+                             const ImagePromptHandle & images) override;
 
 private:
     bool set_block(int slot, int logical, int32_t physical);
