@@ -39,6 +39,11 @@ inline constexpr int DS4_NUMERICAL_PREFILL_BAND = 2048;
 inline constexpr int DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS = 10240;
 // Chunks of four rows or fewer take the decode-shaped path, not layer-major.
 inline constexpr int DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS = 5;
+// Staged image prefill rows per batched step, shared by the pending requests.
+// With live decoders the budget bounds how long they wait between tokens;
+// with none, a larger pass shares each layer's expert reads across requests.
+inline constexpr int DS4_STAGED_PREFILL_ROWS_PER_STEP = 256;
+inline constexpr int DS4_STAGED_PREFILL_ROWS_WITHOUT_DECODE = 1024;
 // Normal verification stays within one ratio-4 compressor window. Q5 is an
 // explicit opt-in whose fused graph models a second boundary.
 inline constexpr int DS4_CONSERVATIVE_VERIFY_MAX_TOKENS = 4;

@@ -333,6 +333,10 @@ public:
         error = "engine does not support KV eviction";
         return false;
     }
+    // False when the slot's KV cannot be rebuilt from its token history (for
+    // example image rows that prefill from pixels): the scheduler then picks
+    // another eviction victim.
+    virtual bool kv_recomputable(int) const { return true; }
 
     // True when a parked slot's resume reservation fits current free pool
     // capacity with headroom for the resident cohort's next step — the

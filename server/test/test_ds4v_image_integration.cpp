@@ -77,6 +77,34 @@ void validation_and_lookup() {
     require(last_image_end_in(view(spans), 12, 26) == 25, "last overlapping image wins");
     require(last_image_end_in(view(spans), 25, 30) == 0, "text between images");
     require(last_image_end_in(view(spans), 34, 40) == 35, "chunk starting inside an image");
+    {
+        // Staged prefill chunks: 2 text rows, a 362-row image, 2 text rows
+        // (the shape of a one-image chat prompt), with a 256-row budget.
+        const std::vector<TokenSpan> chat{{2, 3, 363, 364}};
+        require(staged_prefill_chunk(view(chat), 0, 366, 256, 5) == 366,
+                "short text before an image grows to take the image and the stub tail");
+        const std::vector<TokenSpan> two{{2, 3, 99, 100}, {300, 301, 399, 400}};
+        require(staged_prefill_chunk(view(two), 0, 500, 256, 5) == 256, "text runs to the budget");
+        require(staged_prefill_chunk(view(two), 256, 244, 256, 5) == 244, "an image and the tail");
+        // Every layout of up to two images walks to the end in valid chunks.
+        for (uint64_t a = 0; a < 12; ++a)
+            for (uint64_t len = 5; len < 40; len += 7)
+                for (int prefix = int(a + len); prefix < int(a + len) + 12; ++prefix)
+                    for (int budget : {5, 8, 16, 256}) {
+                        const std::vector<TokenSpan> layout{{a, a, a + len, a + len}};
+                        int done = 0;
+                        while (done < prefix) {
+                            const int n = staged_prefill_chunk(view(layout), uint64_t(done),
+                                                               prefix - done, budget, 5);
+                            require(n >= 5 || prefix < 5, "staged chunk makes progress");
+                            require(prefix - done - n == 0 || prefix - done - n >= 5, "no stub tail");
+                            require(!(uint64_t(done) < a + len && uint64_t(done + n) > a &&
+                                      (uint64_t(done) > a || uint64_t(done + n) < a + len)),
+                                    "image block stays whole");
+                            done += n;
+                        }
+                    }
+    }
     require(valid_image_spans(view(spans), 35), "adjacent and separated blocks valid");
     require(!image_block_at(view(spans), 9), "text before block excluded");
     require(image_block_at(view(spans), 10) == &spans[0], "leading padding belongs to image block");

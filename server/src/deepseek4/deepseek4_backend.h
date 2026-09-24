@@ -25,7 +25,10 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include <condition_variable>
+#include <deque>
 #include <memory>
+#include <mutex>
 #include <random>
 #include <string>
 #include <thread>
@@ -135,8 +138,18 @@ private:
     // Owned backend for the vision encoder when --mmproj-device names a GPU
     // other than the target's; null when the encoder shares backend_.
     ggml_backend_t         vision_backend_ = nullptr;
-    // Encodes images on vision_backend_ while prefill consumes them.
-    std::thread            image_stream_;
+    // Encoder worker on vision_backend_: encodes queued image requests in
+    // order and publishes each image as it lands, so neither the scheduler
+    // nor prefill waits for a whole request. Started on first use.
+    std::thread            encode_worker_;
+    std::mutex             encode_mutex_;
+    std::condition_variable encode_ready_;
+    std::deque<std::shared_ptr<const DeepSeek4ImagePrompt>> encode_queue_;
+    bool                   encode_stop_ = false;
+    vision::ImageSentinels image_sentinels_;
+    // Batched image serving: one single-request staging cache per slot
+    // (slot 0 uses cache_), allocated at startup.
+    std::vector<std::unique_ptr<DeepSeek4Cache>> image_staging_caches_;
     vision::ImageAdmissionReserves image_reserves_;
 
     // Sampler
@@ -203,24 +216,33 @@ private:
                    int prefix_tokens = 0);
     bool load_vision();
     bool init_single_gpu_vision();
-    // Waits for a streaming image encode started by materialize_images.
-    void join_image_stream();
-    // Batched serving. encode_image_request materializes an image request's
-    // rows; prefill_staged fills each request's first `prefix` tokens into
-    // its own staging cache in shared layer-major passes (expert weights read
-    // once per pass for every request in it).
-    struct StagedPrefill {
-        ImagePromptHandle images;
-        const std::vector<int32_t> * prompt = nullptr;
-        int prefix = 0;
-        DeepSeek4Cache * staging = nullptr;
-        bool ok = false;
-        std::string error;
-    };
+    // Encodes one image with the vision runtime (caller serialises use).
+    bool encode_one_image(const vision::PromptImage & image, vision::ImageRaster & raster,
+                          std::string & error);
+    // Queues an image request on the encoder worker (--mmproj-device only).
+    void enqueue_image_encode(std::shared_ptr<const DeepSeek4ImagePrompt> images);
+    void encode_worker_loop();
+    void cancel_image_encode(const ImagePromptPayload & images) const;
+    // Stops the encoder worker (failing queued requests), then frees vision_.
+    void release_vision();
+    // Batched serving. A staged prefill fills one request's first `prefix`
+    // tokens into its slot's staging cache over several steps;
+    // run_staged_pass advances every ready request by one shared layer-major
+    // pass (expert weights read once per pass for all of them).
+    using StagedPrefill = DeepSeek4StagedPrefill;
+    DeepSeek4Cache * image_staging_cache(int slot);
+    // Starts encoding an admitted image request: queued on the encoder
+    // worker with --mmproj-device, otherwise encoded here.
     bool encode_image_request(const std::vector<int32_t> & prompt, const ImagePromptHandle & images,
                               std::string & error);
-    void prefill_staged(std::vector<StagedPrefill> & batch);
-    bool materialize_images(const DeepSeek4ImagePrompt & images,
+    bool begin_staged_prefill(StagedPrefill & item);
+    // One shared pass over the ready, unfinished items, about `row_budget`
+    // rows in total (a whole image block may exceed it). Returns rows run.
+    int run_staged_pass(const std::vector<StagedPrefill *> & items, int row_budget);
+    // Waits up to `timeout_ms` for the next rows of an item to have their
+    // images encoded, so an otherwise idle scheduler does not spin.
+    void wait_staged_ready(const StagedPrefill & item, int timeout_ms) const;
+    bool materialize_images(const std::shared_ptr<const DeepSeek4ImagePrompt> & images,
                             const DaemonIO & io, std::string & error);
 
     // Generate after either a fresh prefill or a restored prefix. kv_offset is
