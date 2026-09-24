@@ -16,8 +16,6 @@
 #include "deepseek4_internal.h"
 #include "deepseek4_dspark.h"
 #include "deepseek4_vision.h"
-
-#include <thread>
 #include "deepseek4_image_prompt.h"
 #include "deepseek4_image_assembly.h"
 #include "deepseek4_image_admission.h"
@@ -30,6 +28,7 @@
 #include <memory>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace luce::common {

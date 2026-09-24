@@ -406,16 +406,19 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit_images(
         refused.error = "image binding does not match this prompt";
         return refused;
     }
-    // Encode before claiming a slot: a failed encode then leaves no slot to
-    // unwind. The tower runs on this (the scheduler) thread, between steps.
+    // Claim the slot first: a busy pool defers the request and retries it,
+    // and encoding before that would rerun the tower on every retry. The
+    // tower runs on this (the scheduler) thread, so no step sees the slot
+    // before its images are in place.
+    AdmitResult result = admit(request_id, prompt, sampler);
+    if (result.status != AdmitResult::Status::admitted) return result;
     Qwen35ImageRows rows;
     std::string error = "image encoding failed";
     if (!b_.encode_images(*payload, rows, error)) {
+        retire(result.slot);
         refused.error = error;
         return refused;
     }
-    AdmitResult result = admit(request_id, prompt, sampler);
-    if (result.status != AdmitResult::Status::admitted) return result;
     if (slot_images_.size() < static_cast<size_t>(slots_.slot_count())) {
         slot_images_.resize(static_cast<size_t>(slots_.slot_count()));
     }

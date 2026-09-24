@@ -35,6 +35,7 @@
 #include <cstring>
 #include <cinttypes>
 #include <condition_variable>
+#include <exception>
 #include <mutex>
 #include <limits>
 #include <new>
@@ -1349,18 +1350,25 @@ bool DeepSeek4Backend::materialize_images(const DeepSeek4ImagePrompt & images,
             const auto t0 = Clock::now();
             bool ok = true;
             std::string stream_error;
-            for (size_t i = 0; ok && i < images.prepared_.images.size(); ++i) {
-                vision::ImageRows one;
-                ok = vision::materialize_image_rows({images.prepared_.images[i]}, sentinels,
-                        size_t(w_.n_embd), encode_one, [&] { return io.is_cancelled(); },
-                        one, stream_error) && one.size() == 1;
-                if (ok) images.publish_image(i, std::move(one.front()));
+            try {
+                for (size_t i = 0; ok && i < images.prepared_.images.size(); ++i) {
+                    vision::ImageRows one;
+                    ok = vision::materialize_image_rows({images.prepared_.images[i]}, sentinels,
+                            size_t(w_.n_embd), encode_one, [&] { return io.is_cancelled(); },
+                            one, stream_error) && one.size() == 1;
+                    if (ok) images.publish_image(i, std::move(one.front()));
+                }
+            } catch (const std::exception & e) {
+                // Nothing may escape the thread: fail the stream so prefill stops waiting.
+                ok = false;
+                stream_error = e.what();
             }
             vision_->release_scratch();
             if (!ok) {
                 std::fprintf(stderr, "[deepseek4] streaming image encode stopped: %s\n",
                              stream_error.empty() ? "cancelled" : stream_error.c_str());
                 images.fail_stream();
+                return;
             }
             std::fprintf(stderr, "[deepseek4] images encoded in %.0f ms on the --mmproj-device GPU (streamed)\n",
                          elapsed_s(t0) * 1000.0);
@@ -3037,15 +3045,9 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
             // An image batch cannot capture DSpark features, so end it at its
             // last image: the text after the image then prefills (and
             // captures) as ordinary chunks.
-            const vision::ImageSpanView spans = images->spans();
-            uint64_t last_image_end = 0;
-            for (size_t k = 0; k < spans.size; ++k) {
-                const auto & span = spans.data[k];
-                if (span.block_begin < uint64_t(pos + n_tok) && span.block_end > uint64_t(pos)) {
-                    chunk_has_image = true;
-                    last_image_end = std::max(last_image_end, span.block_end);
-                }
-            }
+            const uint64_t last_image_end =
+                vision::last_image_end_in(images->spans(), uint64_t(pos), uint64_t(pos + n_tok));
+            chunk_has_image = last_image_end != 0;
             if (chunk_has_image && capture_spec && last_image_end < uint64_t(pos + n_tok)) {
                 n_tok = int(last_image_end - uint64_t(pos));
             }
@@ -3440,7 +3442,7 @@ GenerateResult DeepSeek4Backend::generate_from_state(
         std::string error;
         const auto encode_t0 = Clock::now();
         const bool encoded = materialize_images(*images, out_io, error);
-        if (!vision_backend_) {
+        if (encoded && !vision_backend_) {
             std::fprintf(stderr, "[deepseek4] images encoded in %.0f ms on the target GPU\n",
                          elapsed_s(encode_t0) * 1000.0);
         }
@@ -3514,7 +3516,10 @@ GenerateResult DeepSeek4Backend::generate_from_state(
                 sampler_.rep_pen, sampler_.freq_pen, sampler_.pres_pen);
         }
     }
-    if (spec_enabled_ && spec_drafter_ && req.n_gen > 0 &&
+    // An image prompt whose last image leaves no captured text rows gives the
+    // drafter no context to start from; decode that request plainly.
+    const bool image_without_draft_context = req.images && spec_feat_window_.empty();
+    if (spec_enabled_ && spec_drafter_ && req.n_gen > 0 && !image_without_draft_context &&
         !req.force_ar_decode && !budget_requires_ar && !sampling_requires_ar) {
         if (last_logits_.empty()) {
             result.fail(GenerateErrorCode::DecodeFailed, "spec: no prefill logits");

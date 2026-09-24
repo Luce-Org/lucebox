@@ -72,6 +72,11 @@ void validation_and_lookup() {
     std::array<TokenSpan, luce::vision::DS4V_MAX_IMAGES + 1> too_many{};
     require(!valid_image_spans({too_many.data(), too_many.size()}, 100), "too many images rejected");
     const std::vector<TokenSpan> spans{{10, 13, 18, 20}, {20, 20, 25, 25}, {30, 31, 33, 35}};
+    require(last_image_end_in(view(spans), 0, 10) == 0, "no image before the first block");
+    require(last_image_end_in(view(spans), 0, 11) == 20, "chunk reaching into the first image");
+    require(last_image_end_in(view(spans), 12, 26) == 25, "last overlapping image wins");
+    require(last_image_end_in(view(spans), 25, 30) == 0, "text between images");
+    require(last_image_end_in(view(spans), 34, 40) == 35, "chunk starting inside an image");
     require(valid_image_spans(view(spans), 35), "adjacent and separated blocks valid");
     require(!image_block_at(view(spans), 9), "text before block excluded");
     require(image_block_at(view(spans), 10) == &spans[0], "leading padding belongs to image block");
