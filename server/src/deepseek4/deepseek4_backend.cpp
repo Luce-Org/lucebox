@@ -1772,6 +1772,7 @@ bool DeepSeek4Backend::load_spec_drafter() {
         return false;
     }
 
+    drafter->flash_attention = placement_backend_of(draft_backend) == PlacementBackend::Hip;
     spec_drafter_ = std::move(drafter);
     spec_enabled_ = true;
     spec_drafter_parked_ = false;

@@ -72,6 +72,11 @@ struct DSparkDrafter {
     int mask_token_id   = 128799;
     bool dspark_enabled  = false;
     bool head_hc_enabled = false;
+    // Attend with the DS4 D=512 flash kernel instead of BLAS products (HIP).
+    // It is faster, and a drafter on a second GPU needs it: rocBLAS looks
+    // its Tensile kernels up by name across devices, so a GEMM on a second
+    // architecture makes the target GPU's next GEMM of that name fail.
+    bool flash_attention = false;
     std::vector<int> capture_layer_ids;  // [40,41,42]
 };
 

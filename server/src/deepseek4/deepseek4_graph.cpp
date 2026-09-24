@@ -10847,7 +10847,8 @@ static ggml_tensor * build_dspark_attention(
         ggml_tensor * pos_block,   // I32[block]    absolute positions committed..committed+block-1
         ggml_tensor * neg_block,   // I32[block]    -(block positions)
         ggml_tensor * pos_ctx,     // I32[ctx_len]  absolute positions committed-ctx_len..committed-1
-        ggml_tensor * attn_mask) { // F32[ctx_len+block], 0 or -inf
+        ggml_tensor * attn_mask,   // F32[ctx_len+block], 0 or -inf
+        bool flash) {              // D=512 flash kernel instead of BLAS products
     const int head_dim  = w.head_dim;
     const int n_head    = w.n_head;
     const int n_rot     = w.n_rot;
@@ -10892,31 +10893,54 @@ static ggml_tensor * build_dspark_attention(
         n_attn = ctx_len + block;
     }
 
-    // ── Scores + sink softmax (full visibility, no causal mask) ─────
-    ggml_tensor * q_flat = ggml_reshape_2d(ctx, q, head_dim, n_head * block);
-    ggml_tensor * scores = ggml_mul_mat(ctx, kv_attn, q_flat);    // [n_attn, n_head*block]
-    scores = ggml_scale(ctx, scores, 1.0f / sqrtf((float) head_dim));
-    if (attn_mask) {
-        // Runtime mask keeps a fixed n_swa-wide graph mathematically
-        // equivalent to the shorter valid prompt window. Padded context
-        // columns receive -inf; block columns remain visible.
-        scores = ggml_add(ctx, scores, ggml_repeat(ctx, attn_mask, scores));
-    }
-    ggml_tensor * probs = nullptr;
-    if (L.attn_sinks) {
-        ggml_tensor * sink = ggml_reshape_2d(ctx, L.attn_sinks, 1, n_head);
-        ggml_tensor * sink_shape = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n_head * block);
-        sink = ggml_repeat(ctx, sink, sink_shape);
-        ggml_tensor * sws = ggml_concat(ctx, scores, sink, 0);    // [n_attn+1, n_head*block]
-        ggml_tensor * pws = ggml_soft_max(ctx, sws);
-        probs = ggml_view_2d(ctx, pws, n_attn, n_head * block, pws->nb[1], 0);
-    } else {
-        probs = ggml_soft_max(ctx, scores);
+    ggml_tensor * context = nullptr;
+    if (flash) {
+        // The same scores, sink softmax and value product in the DS4 D=512
+        // kernel (one shared latent head is both key and value).
+        ggml_tensor * q_fa = ggml_permute(ctx, q, 0, 2, 1, 3);          // [head_dim, block, n_head]
+        ggml_tensor * kv_fa = ggml_reshape_3d(ctx, kv_attn, head_dim, n_attn, 1);
+        ggml_tensor * mask_fa = nullptr;
+        if (attn_mask) {
+            mask_fa = ggml_cast(ctx, ggml_repeat(ctx, ggml_reshape_2d(ctx, attn_mask, n_attn, 1),
+                                                 ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_attn, block)),
+                                GGML_TYPE_F16);
+        }
+        context = ggml_flash_attn_ext(ctx, q_fa, kv_fa, kv_fa, mask_fa,
+                                      1.0f / sqrtf((float) head_dim), 0.0f, 0.0f);
+        if (L.attn_sinks) {
+            ggml_flash_attn_ext_add_sinks(context, L.attn_sinks);
+        }
+        ggml_flash_attn_ext_set_prec(context, GGML_PREC_F32);
+        ggml_flash_attn_ext_set_ds4_sparse(context, n_attn, n_attn, 0, 32);
     }
 
-    // ── Context, inverse RoPE, grouped low-rank output ──────────────
-    ggml_tensor * kv_T = ggml_cont(ctx, ggml_transpose(ctx, kv_attn));  // [n_attn, head_dim]
-    ggml_tensor * context = ggml_mul_mat(ctx, kv_T, probs);             // [head_dim, n_head*block]
+    // ── Scores + sink softmax (full visibility, no causal mask) ─────
+    if (!context) {
+        ggml_tensor * q_flat = ggml_reshape_2d(ctx, q, head_dim, n_head * block);
+        ggml_tensor * scores = ggml_mul_mat(ctx, kv_attn, q_flat);    // [n_attn, n_head*block]
+        scores = ggml_scale(ctx, scores, 1.0f / sqrtf((float) head_dim));
+        if (attn_mask) {
+            // Runtime mask keeps a fixed n_swa-wide graph mathematically
+            // equivalent to the shorter valid prompt window. Padded context
+            // columns receive -inf; block columns remain visible.
+            scores = ggml_add(ctx, scores, ggml_repeat(ctx, attn_mask, scores));
+        }
+        ggml_tensor * probs = nullptr;
+        if (L.attn_sinks) {
+            ggml_tensor * sink = ggml_reshape_2d(ctx, L.attn_sinks, 1, n_head);
+            ggml_tensor * sink_shape = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n_head * block);
+            sink = ggml_repeat(ctx, sink, sink_shape);
+            ggml_tensor * sws = ggml_concat(ctx, scores, sink, 0);    // [n_attn+1, n_head*block]
+            ggml_tensor * pws = ggml_soft_max(ctx, sws);
+            probs = ggml_view_2d(ctx, pws, n_attn, n_head * block, pws->nb[1], 0);
+        } else {
+            probs = ggml_soft_max(ctx, scores);
+        }
+
+        // ── Context, inverse RoPE, grouped low-rank output ──────────────
+        ggml_tensor * kv_T = ggml_cont(ctx, ggml_transpose(ctx, kv_attn));  // [n_attn, head_dim]
+        context = ggml_mul_mat(ctx, kv_T, probs);                           // [head_dim, n_head*block]
+    }
     context = ggml_reshape_3d(ctx, context, head_dim, n_head, block);
     context = build_tail_rope_3d(ctx, context, neg_block, n_rot, head_dim, n_head, block,
                                  rope_freq, rope_scale, rope_ext, rope_attn,
@@ -11397,7 +11421,7 @@ static bool deepseek4_dspark_draft_forward_impl(
                                                             layer_ctx_kv, w, L,
                                                             graph_ctx_len, C.pos_block,
                                                             C.neg_block, C.pos_ctx,
-                                                            C.attn_mask);
+                                                            C.attn_mask, d.flash_attention);
             dbg_tap(std::string("attn_L") + std::to_string(il), attn_out);
             // ── HC post (attention), per block position ─────────────────
             ggml_tensor * hc_next = nullptr;
