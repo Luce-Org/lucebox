@@ -10,6 +10,7 @@
 #include "ggml-backend.h"
 
 #include <cstdint>
+#include <vector>
 
 namespace luce::common {
 
@@ -47,6 +48,11 @@ struct MoeHybridConfig {
     MoeHybridColdBackend cold_expert_backend = MoeHybridColdBackend::Cpu;
     bool materialize_hot_experts = true;
     bool materialize_cold_experts = true;
+    // Explicit secondary (cold stack) owners per layer. Empty keeps the
+    // default, the complement of the hot set. Otherwise every layer lists its
+    // cold-stack experts, and the experts in neither stack are streamed from
+    // the model file on demand.
+    std::vector<std::vector<int32_t>> cold_expert_ids;
 
     // Cold owner None has no cold experts, so nothing to materialize whatever
     // materialize_cold_experts says.

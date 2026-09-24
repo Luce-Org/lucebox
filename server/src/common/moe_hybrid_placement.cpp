@@ -649,4 +649,134 @@ bool MoeHybridPlacement::build_critical_path_balanced_from_stats(
     out = std::move(tmp);
     return true;
 }
+// ─── MoeExpertOwnership ─────────────────────────────────────────────────
+
+bool MoeExpertOwnership::init(int layers, int experts, Owner fill) {
+    if (layers <= 0 || experts <= 0) return false;
+    n_layer = layers;
+    n_expert = experts;
+    owner.assign((size_t) layers * (size_t) experts, (uint8_t) fill);
+    pinned.assign(owner.size(), 0);
+    return true;
+}
+
+bool MoeExpertOwnership::load_json(const std::string & path, int layers, int experts,
+                                   MoeExpertOwnership & out, std::string * err) {
+    std::ifstream f(path);
+    if (!f) {
+        if (err) *err = "cannot open expert placement " + path;
+        return false;
+    }
+    nlohmann::json j;
+    try {
+        f >> j;
+    } catch (const std::exception & ex) {
+        if (err) *err = std::string("expert placement: ") + ex.what();
+        return false;
+    }
+    if (!j.is_object() || !j.contains("owners") || !j["owners"].is_array()) {
+        if (err) *err = "expert placement needs an \"owners\" array";
+        return false;
+    }
+    const nlohmann::json & owners = j["owners"];
+    MoeExpertOwnership tmp;
+    if (!tmp.init(layers, experts, Stream) || owners.size() != tmp.owner.size()) {
+        if (err) {
+            *err = "expert placement has " + std::to_string(owners.size()) +
+                   " owners, the model needs " + std::to_string((size_t) layers * (size_t) experts);
+        }
+        return false;
+    }
+    for (size_t i = 0; i < owners.size(); ++i) {
+        const std::string name = owners[i].is_string() ? owners[i].get<std::string>() : std::string();
+        if (name == "primary") {
+            tmp.owner[i] = Primary;
+        } else if (name == "secondary") {
+            tmp.owner[i] = Secondary;
+        } else if (name == "stream") {
+            tmp.owner[i] = Stream;
+        } else {
+            if (err) {
+                *err = "expert placement entry " + std::to_string(i) +
+                       " must be \"primary\", \"secondary\" or \"stream\"";
+            }
+            return false;
+        }
+    }
+    out = std::move(tmp);
+    return true;
+}
+
+void MoeExpertOwnership::pin_primary(int layer, int expert) {
+    const size_t i = (size_t) layer * (size_t) n_expert + (size_t) expert;
+    owner[i] = Primary;
+    pinned[i] = 1;
+}
+
+bool MoeExpertOwnership::fit_budgets(const std::vector<uint64_t> & layer_expert_bytes,
+                                     uint64_t primary_budget, uint64_t secondary_budget,
+                                     const MoeHybridRoutingStats * usage,
+                                     std::string * err) {
+    if (layer_expert_bytes.size() != (size_t) n_layer) {
+        if (err) *err = "expert byte sizes do not match the ownership";
+        return false;
+    }
+    if (usage && (usage->n_layer != n_layer || usage->n_expert != n_expert)) usage = nullptr;
+
+    auto demote = [&](Owner from, uint64_t budget) -> bool {
+        uint64_t used = bytes(from, layer_expert_bytes);
+        if (used <= budget) return true;
+        struct Candidate { uint64_t use; int spread; int layer; int expert; };
+        std::vector<Candidate> candidates;
+        for (int il = 0; il < n_layer; ++il) {
+            int rank = 0;  // 0 = this layer's highest expert id in the tier
+            for (int e = n_expert - 1; e >= 0; --e) {
+                const size_t i = (size_t) il * (size_t) n_expert + (size_t) e;
+                if (owner[i] != from || pinned[i]) continue;
+                candidates.push_back({usage ? usage->count(il, e) : 0, rank++, il, e});
+            }
+        }
+        std::sort(candidates.begin(), candidates.end(), [](const Candidate & a, const Candidate & b) {
+            if (a.use != b.use) return a.use < b.use;
+            if (a.spread != b.spread) return a.spread < b.spread;
+            return a.layer < b.layer;
+        });
+        for (const Candidate & c : candidates) {
+            if (used <= budget) break;
+            set(c.layer, c.expert, (Owner) (from + 1));
+            used -= layer_expert_bytes[(size_t) c.layer];
+        }
+        if (used > budget) {
+            if (err) *err = "pinned experts exceed the primary expert budget";
+            return false;
+        }
+        return true;
+    };
+    return demote(Primary, primary_budget) && demote(Secondary, secondary_budget);
+}
+
+std::vector<std::vector<int32_t>> MoeExpertOwnership::expert_ids(Owner o) const {
+    std::vector<std::vector<int32_t>> out((size_t) n_layer);
+    for (int il = 0; il < n_layer; ++il) {
+        for (int e = 0; e < n_expert; ++e) {
+            if (at(il, e) == o) out[(size_t) il].push_back(e);
+        }
+    }
+    return out;
+}
+
+int MoeExpertOwnership::count(Owner o) const {
+    return (int) std::count(owner.begin(), owner.end(), (uint8_t) o);
+}
+
+uint64_t MoeExpertOwnership::bytes(Owner o, const std::vector<uint64_t> & layer_expert_bytes) const {
+    uint64_t total = 0;
+    for (int il = 0; il < n_layer; ++il) {
+        for (int e = 0; e < n_expert; ++e) {
+            if (at(il, e) == o) total += layer_expert_bytes[(size_t) il];
+        }
+    }
+    return total;
+}
+
 }  // namespace luce::common

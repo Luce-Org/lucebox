@@ -276,6 +276,67 @@ bool MoeHybridStorage::empty() const {
     return layers.empty();
 }
 
+void MoeHybridStorage::count_routes(int layer, const int32_t * expert_ids, size_t n) {
+    if (layer < 0 || (size_t)layer >= layers.size()) return;
+    const MoeHybridLayerStorage & st = layers[(size_t)layer];
+    for (size_t i = 0; i < n; ++i) {
+        const int32_t gid = expert_ids[i];
+        if (gid < 0 || (size_t)gid >= st.hot_local_by_global.size()) continue;
+        if (st.hot_local_by_global[(size_t)gid] >= 0) {
+            ++route_counts.primary;
+        } else if (st.is_streamed(gid)) {
+            ++route_counts.streamed;
+        } else {
+            ++route_counts.secondary;
+        }
+    }
+}
+
+// Fills the cold stack of layer `il`: the complement of the hot set by
+// default, or the layer's explicit cfg.cold_expert_ids. When the cold stack
+// is materialized, the experts it leaves out are streamed (n_streamed);
+// otherwise every cold expert is.
+static bool assign_cold_experts(const MoeHybridConfig & cfg, int il,
+                                const std::vector<uint8_t> & is_hot,
+                                bool duplicate_hot_on_cold,
+                                bool materialized,
+                                MoeHybridLayerStorage & dst,
+                                std::string * err) {
+    if (cfg.cold_expert_ids.empty()) {
+        for (int expert = 0; expert < cfg.n_expert; ++expert) {
+            if (duplicate_hot_on_cold || !is_hot[(size_t)expert]) {
+                dst.cold_local_by_global[(size_t)expert] = (int32_t)dst.cold_expert_ids.size();
+                dst.cold_expert_ids.push_back((int32_t)expert);
+            }
+        }
+        dst.n_streamed = materialized ? 0 : (int)dst.cold_expert_ids.size();
+        return true;
+    }
+    if (cfg.cold_expert_ids.size() != (size_t)cfg.n_layer || duplicate_hot_on_cold || !materialized) {
+        if (err) {
+            *err = "explicit cold-stack owners need one list per layer, a materialized "
+                   "cold stack and no duplicated hot experts";
+        }
+        return false;
+    }
+    for (int32_t expert : cfg.cold_expert_ids[(size_t)il]) {
+        if (expert < 0 || expert >= cfg.n_expert || is_hot[(size_t)expert] ||
+            dst.cold_local_by_global[(size_t)expert] >= 0) {
+            if (err) {
+                *err = "explicit cold-stack expert " + std::to_string(expert) + " in layer " +
+                       std::to_string(il) + " is out of range, hot, or listed twice";
+            }
+            return false;
+        }
+        dst.cold_local_by_global[(size_t)expert] = (int32_t)dst.cold_expert_ids.size();
+        dst.cold_expert_ids.push_back(expert);
+    }
+    int owned = 0;
+    for (uint8_t hot : is_hot) owned += hot ? 1 : 0;
+    dst.n_streamed = cfg.n_expert - owned - (int)dst.cold_expert_ids.size();
+    return true;
+}
+
 bool build_moe_hybrid_storage(const MoeHybridConfig & cfg,
                               ggml_backend_t gpu_backend,
                               const MoeHybridPlacement & placement,
@@ -352,13 +413,9 @@ bool build_moe_hybrid_storage(const MoeHybridConfig & cfg,
             is_hot[(size_t)expert] = 1;
         }
         dst.decode_hot_local_by_global = dst.hot_local_by_global;
-        if (!no_cold_owner) {
-            for (int expert = 0; expert < cfg.n_expert; ++expert) {
-                if (duplicate_hot_on_cold || !is_hot[(size_t)expert]) {
-                    dst.cold_local_by_global[(size_t)expert] = (int32_t)dst.cold_expert_ids.size();
-                    dst.cold_expert_ids.push_back((int32_t)expert);
-                }
-            }
+        if (!no_cold_owner &&
+            !assign_cold_experts(cfg, il, is_hot, duplicate_hot_on_cold, true, dst, err)) {
+            return false;
         }
         dst.decode_cold_local_by_global = dst.cold_local_by_global;
 
@@ -579,13 +636,10 @@ bool build_moe_hybrid_storage_from_file(
             is_hot[(size_t)expert] = 1;
         }
         dst.decode_hot_local_by_global = dst.hot_local_by_global;
-        if (allocate_cold && !no_cold_owner) {
-            for (int expert = 0; expert < cfg.n_expert; ++expert) {
-                if (duplicate_hot_on_cold || !is_hot[(size_t)expert]) {
-                    dst.cold_local_by_global[(size_t)expert] = (int32_t)dst.cold_expert_ids.size();
-                    dst.cold_expert_ids.push_back((int32_t)expert);
-                }
-            }
+        if (allocate_cold && !no_cold_owner &&
+            !assign_cold_experts(cfg, il, is_hot, duplicate_hot_on_cold,
+                                 cfg.materializes_cold_experts(), dst, err)) {
+            return false;
         }
         dst.decode_cold_local_by_global = dst.cold_local_by_global;
 

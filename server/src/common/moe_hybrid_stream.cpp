@@ -6,6 +6,7 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 
@@ -183,6 +184,7 @@ bool MoeHybridStreamEngine::stream_expert_sync(const void * mmap_data, size_t mm
 
     const auto * file_base = static_cast<const uint8_t *>(mmap_data);
     size_t staging_offset = 0;
+    const auto read_t0 = std::chrono::steady_clock::now();
 
     // Validate expert_id against region size
     if (expert_id < 0) {
@@ -252,12 +254,21 @@ bool MoeHybridStreamEngine::stream_expert_sync(const void * mmap_data, size_t mm
     }
 
     // DMA pinned → GPU scratch (synchronous for now; async pipeline in eval function)
+    const auto upload_t0 = std::chrono::steady_clock::now();
     cudaError_t cuda_err = cudaMemcpy(gpu_scratch_, pinned_buf_, staging_offset,
                                       cudaMemcpyHostToDevice);
     if (cuda_err != cudaSuccess) {
         if (err) *err = std::string("cudaMemcpy H2D failed: ") + cudaGetErrorString(cuda_err);
         return false;
     }
+    const auto upload_t1 = std::chrono::steady_clock::now();
+    auto us = [](auto a, auto b) {
+        return (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
+    };
+    stats_.experts += 1;
+    stats_.bytes += staging_offset;
+    stats_.read_us += us(read_t0, upload_t0);
+    stats_.upload_us += us(upload_t0, upload_t1);
 
     // Set pointers into scratch
     auto * scratch_bytes = static_cast<uint8_t *>(gpu_scratch_);
@@ -315,7 +326,7 @@ bool eval_moe_cold_experts_streaming(
     for (int i = 0; i < total_slots; ++i) {
         const int32_t gid = selected_ids[i];
         if (gid < 0 || gid >= cfg.n_expert) continue;
-        if (storage.hot_local_by_global[(size_t)gid] < 0) {
+        if (storage.is_streamed(gid)) {
             cold_needed[(size_t)gid] = true;
         }
     }
@@ -337,6 +348,14 @@ bool eval_moe_cold_experts_streaming(
         if (!engine.stream_expert_sync(mmap_data, mmap_size, regions, cold_eid, gpu_backend, err)) {
             return false;
         }
+        struct ComputeTimer {
+            MoeHybridStreamEngine & engine;
+            std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+            ~ComputeTimer() {
+                engine.add_compute_us((uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - t0).count());
+            }
+        } compute_timer{engine};
 
         // Gather all tokens that selected this expert
         struct TokenHit { int ti; float weight; };

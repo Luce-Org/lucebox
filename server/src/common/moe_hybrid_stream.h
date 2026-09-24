@@ -68,12 +68,27 @@ public:
     size_t scratch_up_bytes()   const { return last_up_bytes_; }
     size_t scratch_down_bytes() const { return last_down_bytes_; }
 
+    // Work since the last reset_stats(): reading experts out of the mmap
+    // (page faults read the SSD, page-cache hits read RAM), uploading them to
+    // the GPU, and building + computing their graphs.
+    struct Stats {
+        uint64_t experts    = 0;
+        uint64_t bytes      = 0;
+        uint64_t read_us    = 0;
+        uint64_t upload_us  = 0;
+        uint64_t compute_us = 0;
+    };
+    const Stats & stats() const { return stats_; }
+    void add_compute_us(uint64_t us) { stats_.compute_us += us; }
+    void reset_stats() { stats_ = {}; }
+
     // Total pinned buffer size.
     size_t pinned_bytes() const { return pinned_size_; }
     // Total GPU scratch size.
     size_t scratch_bytes() const { return scratch_size_; }
 
 private:
+    Stats stats_;
     void * pinned_buf_  = nullptr;  // cudaMallocHost'd staging buffer
     size_t pinned_size_ = 0;
 
@@ -90,9 +105,10 @@ private:
     size_t last_down_bytes_ = 0;
 };
 
-// Evaluate cold experts by streaming from mmap to GPU, pipelined.
-// Hot experts are already computed (result in hot_partial).
-// Returns combined cold expert contribution in out (sized n_embd * n_tokens).
+// Evaluate the selected experts that neither stack owns
+// (MoeHybridLayerStorage::is_streamed) by streaming them from mmap to GPU.
+// The owned experts are computed elsewhere. Returns the streamed experts'
+// weighted contribution in out (sized n_embd * n_tokens).
 bool eval_moe_cold_experts_streaming(
     MoeHybridStreamEngine &         engine,
     ggml_backend_t                  gpu_backend,
