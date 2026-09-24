@@ -139,9 +139,11 @@ GGML_BACKEND_API int ggml_backend_cuda_get_device_id(ggml_backend_t backend);
 GGML_BACKEND_API int ggml_backend_cuda_set_mmvq_max_ncols_override(int max_ncols);
 
 // Calling-thread switch for batch-invariant quantized MUL_MAT: while set,
-// multi-column products take the matrix-vector path column by column, so
-// each output column is bit-identical to the same product of that column
-// alone (a speculative verifier then reproduces single-token decode exactly).
+// products of up to eight columns stay on the matrix-vector path with the
+// single-column block shape (Q8_0 reads each weight row once for all
+// columns, other types run the single-column kernel per column), so each
+// output column is bit-identical to the same product of that column alone
+// and a speculative verifier reproduces single-token decode exactly.
 // Returns the previous setting.
 GGML_BACKEND_API bool ggml_backend_cuda_set_mmvq_batch_invariant(bool enabled);
 
