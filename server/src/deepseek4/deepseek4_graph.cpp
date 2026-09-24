@@ -4035,6 +4035,96 @@ bool init_deepseek4_streamed_expert_cache(
     return cache.init(make_ds4_moe_hybrid_config(w), descs, hybrid, opts, err);
 }
 
+// Layer-ahead prefetch of streamed experts. While layer L routes, the same
+// FFN input is also routed with layer L+1's norm and router (selection bias
+// and protected experts included); the streamed experts that prediction picks
+// start loading while L computes. It only moves bytes early: L+1 still routes
+// on its own hidden state.
+// A layer's selection bias (exp_probs_b, router bias included) for host
+// routing: the host copy taken at load, or a device read into scratch.
+// nullptr when the layer has none.
+static const float * ds4_selection_bias(const DeepSeek4Weights & w, int layer,
+                                        std::vector<float> & scratch) {
+    if (!w.selection_bias_host.empty()) {
+        return w.selection_bias_host.data() + (size_t) layer * (size_t) w.n_expert;
+    }
+    const ggml_tensor * b = w.layers[(size_t) layer].ffn_exp_probs_b;
+    if (!b) return nullptr;
+    scratch.resize((size_t) w.n_expert);
+    ggml_backend_tensor_get(b, scratch.data(), 0, sizeof(float) * scratch.size());
+    return scratch.data();
+}
+
+struct Ds4NextLayerRoutes {
+    int layer = -1;
+    std::vector<int32_t> experts;
+};
+
+static bool ds4_stream_prefetch_enabled() {
+    static const bool enabled = [] {
+        const char * v = std::getenv("LUCE_EXPERT_STREAM_PREFETCH");
+        return !v || !*v || std::strcmp(v, "0") != 0;
+    }();
+    return enabled;
+}
+
+// Appends the next layer's router probabilities to a routing graph and
+// returns them concatenated after the current layer's `probs`
+// ([2 * n_expert, 1]) so one readback serves both, or nullptr when there is
+// nothing to prefetch for the next layer.
+static ggml_tensor * build_ds4_next_layer_router(
+        ggml_context * ctx,
+        ggml_cgraph * gf,
+        ggml_tensor * ffn_inp,
+        ggml_tensor * probs,
+        const DeepSeek4Weights & w,
+        const MoeHybridStorage & hybrid,
+        int layer,
+        int n_tokens) {
+    const int next = layer + 1;
+    if (n_tokens != 1 || next >= w.n_layer || next < w.n_hash_layer ||
+        !hybrid.expert_cache || !hybrid.expert_cache->ready() ||
+        (size_t) next >= hybrid.layers.size() || hybrid.layers[(size_t) next].n_streamed == 0 ||
+        !ds4_stream_prefetch_enabled()) {
+        return nullptr;
+    }
+    // The caller reads its own results back after these nodes run: keep the
+    // allocator from reusing their buffers for the prediction.
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) ggml_set_output(ggml_graph_node(gf, i));
+    const DeepSeek4Layer & N = w.layers[(size_t) next];
+    ggml_tensor * normed = build_rms_norm(ctx, ffn_inp, N.ffn_norm, w.rms_eps);
+    ggml_tensor * next_probs = ggml_sqrt(ctx, ggml_softplus(ctx, ggml_mul_mat(ctx, N.ffn_gate_inp, normed)));
+    ggml_tensor * pair = ggml_concat(ctx, probs, next_probs, 0);
+    ggml_set_output(pair);
+    ggml_build_forward_expand(gf, pair);
+    return pair;
+}
+
+static void ds4_select_routed_experts(const DeepSeek4Weights & w, int layer, const float * probs,
+                                      const float * bias, int k, int32_t * out);
+
+// Reads the pair built above: the current layer's probabilities into
+// probs_host, the next layer's selection into out. False without a pair.
+static bool read_ds4_probs_and_next_routes(
+        ggml_tensor * pair,
+        const DeepSeek4Weights & w,
+        int layer,
+        float * probs_host,
+        Ds4NextLayerRoutes & out) {
+    out = {};
+    if (!pair) return false;
+    const size_t n = (size_t) w.n_expert;
+    std::vector<float> both(2 * n);
+    ggml_backend_tensor_get(pair, both.data(), 0, sizeof(float) * both.size());
+    std::memcpy(probs_host, both.data(), sizeof(float) * n);
+    std::vector<float> scratch;
+    out.layer = layer + 1;
+    out.experts.assign((size_t) ds4_effective_expert_count(w), -1);
+    ds4_select_routed_experts(w, out.layer, both.data() + n, ds4_selection_bias(w, out.layer, scratch),
+                              (int) out.experts.size(), out.experts.data());
+    return true;
+}
+
 // Adds the routed experts that neither stack owns (an explicit ownership
 // leaves them to the model file) to the owners' output. They are streamed
 // through the same engine as a non-materialized cold stack.
@@ -4112,15 +4202,20 @@ static bool eval_ds4_hybrid(
         const MoeExpertLayer * expert_layer,
         DeepSeek4StepTelemetry * step_tel,
         ggml_tensor * ffn_normed_backend = nullptr,
-        const MoeHybridDeviceOutputs * device_outputs = nullptr) {
+        const MoeHybridDeviceOutputs * device_outputs = nullptr,
+        const Ds4NextLayerRoutes * next_routes = nullptr) {
     const auto ffn_t0 = Ds4TimingClock::now();
     if (hybrid_owner) {
         hybrid_owner->count_routes(layer, selected_host, (size_t) n_tokens * (size_t) n_expert_used);
     }
     if (hybrid_owner && hybrid_owner->expert_cache && storage.n_streamed > 0) {
-        // Start this layer's misses before the owners run so the loads
-        // overlap their compute.
+        // Start this layer's misses, then the next layer's predicted experts,
+        // before the owners run so both loads overlap their compute.
         hybrid_owner->expert_cache->stage(layer, selected_host, n_tokens * n_expert_used);
+    }
+    if (hybrid_owner && hybrid_owner->expert_cache && next_routes && !next_routes->experts.empty()) {
+        hybrid_owner->expert_cache->prefetch(next_routes->layer, next_routes->experts.data(),
+                                             (int) next_routes->experts.size());
     }
     if (!stream_engine && hybrid_owner) stream_engine = hybrid_owner->stream_engine;
     const bool streaming_ready =
@@ -5443,6 +5538,8 @@ static bool deepseek4_step_hybrid(
             ggml_cgraph * ffn_gf = ggml_new_graph(ffn_ctx);
             ggml_build_forward_expand(ffn_gf, ffn_normed);
             ggml_build_forward_expand(ffn_gf, router_probs);
+            ggml_tensor * probs_pair = build_ds4_next_layer_router(
+                ffn_ctx, ffn_gf, ffn_inp, router_probs, w, moe_hybrid, il, n_tokens);
             ggml_gallocr_t ffn_alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
             if (!ggml_gallocr_alloc_graph(ffn_alloc, ffn_gf)) {
                 ggml_gallocr_free(ffn_alloc); ggml_free(ffn_ctx);
@@ -5469,23 +5566,21 @@ static bool deepseek4_step_hybrid(
             std::vector<float> weights_host((size_t)route_width * (size_t)n_tokens);
             const auto route_read_t0 = Ds4TimingClock::now();
             ggml_backend_tensor_get(ffn_normed, ffn_normed_host.data(), 0, sizeof(float) * ffn_normed_host.size());
-            ggml_backend_tensor_get(router_probs, probs_host.data(), 0, sizeof(float) * probs_host.size());
+            Ds4NextLayerRoutes next_routes;
+            if (!read_ds4_probs_and_next_routes(probs_pair, w, il, probs_host.data(), next_routes)) {
+                ggml_backend_tensor_get(router_probs, probs_host.data(), 0, sizeof(float) * probs_host.size());
+            }
             if (telemetry) telemetry->route_read_us += ds4_elapsed_us(route_read_t0, Ds4TimingClock::now());
             ggml_gallocr_free(ffn_alloc);
             ggml_free(ffn_ctx);
 
-            std::vector<float> bias_host;
+            std::vector<float> bias_scratch;
             const auto route_select_t0 = Ds4TimingClock::now();
-            if (L.ffn_exp_probs_b) {
-                bias_host.resize((size_t)w.n_expert);
-                ggml_backend_tensor_get(L.ffn_exp_probs_b, bias_host.data(), 0,
-                                        sizeof(float) * bias_host.size());
-            }
+            const float * bias_host = ds4_selection_bias(w, il, bias_scratch);
             for (int ti = 0; ti < n_tokens; ++ti) {
                 const float * probs = probs_host.data() + (size_t)ti * (size_t)w.n_expert;
                 std::vector<int32_t> top((size_t)route_width, -1);
-                ds4_select_routed_experts(w, il, probs, bias_host.empty() ? nullptr : bias_host.data(),
-                                          route_width, top.data());
+                ds4_select_routed_experts(w, il, probs, bias_host, route_width, top.data());
                 float sum = 0.0f;
                 for (int slot = 0; slot < route_width; ++slot) {
                     const int32_t expert = top[(size_t)slot];
@@ -5523,7 +5618,8 @@ static bool deepseek4_step_hybrid(
                     il, n_embd, route_width,
                     ffn_normed_host.data(), selected_host.data(), weights_host.data(),
                     n_tokens, ffn_out_host, &hot_alloc, &cold_alloc,
-                    expert_compute, expert_layer, telemetry)) {
+                    expert_compute, expert_layer, telemetry,
+                    nullptr, nullptr, &next_routes)) {
                 if (hot_alloc) ggml_gallocr_free(hot_alloc);
                 if (cold_alloc) ggml_gallocr_free(cold_alloc);
                 return false;
@@ -6926,6 +7022,7 @@ static bool eval_ds4_layer_range_hybrid_ffn(
     ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, normed);
     ggml_build_forward_expand(gf, probs);
+    ggml_tensor * probs_pair = build_ds4_next_layer_router(ctx, gf, inp, probs, w, hybrid, layer, n_tokens);
     ggml_gallocr_t alloc = nullptr;
     if (persistent_owner_alloc) {
         if (!hybrid.prefill_route_alloc) {
@@ -6995,14 +7092,17 @@ static bool eval_ds4_layer_range_hybrid_ffn(
         normed_host.resize((size_t)n_embd * (size_t)n_tokens);
     }
     std::vector<float> probs_host((size_t)w.n_expert * (size_t)n_tokens);
+    Ds4NextLayerRoutes next_routes;
     if (route_ok) {
         const auto route_read_t0 = Ds4TimingClock::now();
         if (!device_ffn_input) {
             ggml_backend_tensor_get(normed, normed_host.data(), 0,
                                     sizeof(float) * normed_host.size());
         }
-        ggml_backend_tensor_get(probs, probs_host.data(), 0,
-                                sizeof(float) * probs_host.size());
+        if (!read_ds4_probs_and_next_routes(probs_pair, w, layer, probs_host.data(), next_routes)) {
+            ggml_backend_tensor_get(probs, probs_host.data(), 0,
+                                    sizeof(float) * probs_host.size());
+        }
         if (telemetry) {
             telemetry->route_read_us +=
                 ds4_elapsed_us(route_read_t0, Ds4TimingClock::now());
@@ -7023,12 +7123,8 @@ static bool eval_ds4_layer_range_hybrid_ffn(
 
     std::vector<int32_t> selected((size_t)route_width * (size_t)n_tokens);
     std::vector<float> weights((size_t)route_width * (size_t)n_tokens);
-    std::vector<float> bias;
-    if (!hash_routed && L.ffn_exp_probs_b) {
-        bias.resize((size_t)w.n_expert);
-        ggml_backend_tensor_get(L.ffn_exp_probs_b, bias.data(), 0,
-                                sizeof(float) * bias.size());
-    }
+    std::vector<float> bias_scratch;
+    const float * bias = hash_routed ? nullptr : ds4_selection_bias(w, layer, bias_scratch);
     std::vector<float> image_bias;
     if (image_spans.size) {
         if (!L.ffn_gate_bias_vl) return false;
@@ -7070,8 +7166,7 @@ static bool eval_ds4_layer_range_hybrid_ffn(
             std::memcpy(token_ids_out, row,
                         sizeof(int32_t) * (size_t)route_width);
         } else {
-            ds4_select_routed_experts(w, layer, token_probs, bias.empty() ? nullptr : bias.data(),
-                                      route_width, token_ids_out);
+            ds4_select_routed_experts(w, layer, token_probs, bias, route_width, token_ids_out);
         }
 
         float sum = 0.0f;
@@ -7116,7 +7211,8 @@ static bool eval_ds4_layer_range_hybrid_ffn(
         n_tokens, out, hot_alloc, cold_alloc,
         expert_compute, expert_layer, telemetry,
         device_ffn_input ? normed : nullptr,
-        device_ffn_input ? device_outputs : nullptr);
+        device_ffn_input ? device_outputs : nullptr,
+        &next_routes);
     if (trace_prefill) {
         std::fprintf(stderr,
                      "[deepseek4-prefill-trace] layer=%d expert owners=%s "

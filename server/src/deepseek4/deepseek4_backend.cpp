@@ -1392,6 +1392,20 @@ bool DeepSeek4Backend::apply_routing_adjustments() {
             ggml_backend_tensor_set(t, bias.data(), 0, sizeof(float) * bias.size());
         }
     }
+    // Host routing reads a selection bias per layer and token; keep a copy.
+    w_.selection_bias_host.clear();
+    const bool f32_biases = std::all_of(w_.layers.begin(), w_.layers.end(), [&](const DeepSeek4Layer & L) {
+        return L.ffn_exp_probs_b && L.ffn_exp_probs_b->type == GGML_TYPE_F32 &&
+               ggml_nelements(L.ffn_exp_probs_b) == w_.n_expert;
+    });
+    if (f32_biases && !w_.layers.empty()) {
+        w_.selection_bias_host.resize((size_t) w_.n_layer * (size_t) w_.n_expert);
+        for (int il = 0; il < w_.n_layer; ++il) {
+            ggml_backend_tensor_get(w_.layers[(size_t) il].ffn_exp_probs_b,
+                                    w_.selection_bias_host.data() + (size_t) il * (size_t) w_.n_expert,
+                                    0, sizeof(float) * (size_t) w_.n_expert);
+        }
+    }
     if (!w_.router_bias_delta.empty() || !w_.protected_experts.empty()) {
         std::fprintf(stderr, "[deepseek4] routing: router bias %s, %d protected experts\n",
                      w_.router_bias_delta.empty() ? "off" : cfg_.router_bias_path.c_str(),

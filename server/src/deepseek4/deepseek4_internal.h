@@ -331,6 +331,10 @@ struct DeepSeek4Weights {
     // subtracts it again to find a token's native top-k.
     std::vector<float>   router_bias_delta;
     std::vector<uint8_t> protected_experts;
+    // Host copy of every layer's selection bias (exp_probs_b with the router
+    // bias applied), [n_layer * n_expert], taken once after the adjustments.
+    // Empty when a layer has no F32 bias; host routing then reads the device.
+    std::vector<float>   selection_bias_host;
     bool fused_decode        = false;
     bool fused_verify_f16_kv = false;
 };

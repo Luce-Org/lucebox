@@ -2855,6 +2855,7 @@ void free_deepseek4_weights(DeepSeek4Weights & w) {
     }
     if (w.buf) { ggml_backend_buffer_free(w.buf); w.buf = nullptr; }
     w.layers.clear();
+    w.selection_bias_host.clear();
     w.embedder.tok_embd_owned.clear();
     w.embedder.tok_embd_bytes = nullptr;
     w.moe_hybrid = false;
