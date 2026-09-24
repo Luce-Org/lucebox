@@ -4313,6 +4313,7 @@ struct HcPreResult {
     std::vector<float> working;   // [n_embd] — input to sublayer
     float post[4];                // post gates
     float comb[16];               // combine matrix [4×4]
+    float pre[4];                 // pre gates (V4.1 hands them to the next sub-block)
 };
 
 // Per-layer CPU-side HC weight cache (read from GPU once for CPU fallback and
@@ -4581,10 +4582,12 @@ static void finish_hc_pre_from_mix_into(float * working,
                                         const float * base_data,
                                         int n_embd,
                                         int n_hc,
-                                        int sinkhorn_iters) {
+                                        int sinkhorn_iters,
+                                        float * pre_out = nullptr) {
     // Sinkhorn split
     float split[24];  // 2*4 + 4*4 = 24
     cpu_hc_sinkhorn(split, mix, scale_data, base_data, n_hc, sinkhorn_iters, 1.0e-6f);
+    if (pre_out) memcpy(pre_out, split, (size_t) n_hc * sizeof(float));
 
     // Weighted sum: out[d] = Σ_h split[h] * hc_state[h*n_embd + d]
     for (int d = 0; d < n_embd; d++) {
@@ -4610,7 +4613,7 @@ static HcPreResult finish_hc_pre_from_mix(const float * hc_state,
     result.working.resize(n_embd);
     finish_hc_pre_from_mix_into(result.working.data(), result.post, result.comb,
                                 hc_state, mix, scale_data, base_data,
-                                n_embd, n_hc, sinkhorn_iters);
+                                n_embd, n_hc, sinkhorn_iters, result.pre);
     return result;
 }
 
@@ -4627,7 +4630,8 @@ static void cpu_hc_pre_into(float * working,
                             float hc_eps,
                             float * flat,
                             float * mix,
-                            bool serial_fn) {
+                            bool serial_fn,
+                            float * pre_out = nullptr) {
     const int hc_dim = n_hc * n_embd;
     const int mix_dim = 2 * n_hc + n_hc * n_hc;
 
@@ -4643,7 +4647,7 @@ static void cpu_hc_pre_into(float * working,
     }
     finish_hc_pre_from_mix_into(working, post, comb, hc_state, mix,
                                 scale_data, base_data,
-                                n_embd, n_hc, sinkhorn_iters);
+                                n_embd, n_hc, sinkhorn_iters, pre_out);
 }
 
 static HcPreResult cpu_hc_pre(const float * hc_state, const uint16_t * fn_data,
@@ -4655,7 +4659,8 @@ static HcPreResult cpu_hc_pre(const float * hc_state, const uint16_t * fn_data,
     float mix[24];
     cpu_hc_pre_into(result.working.data(), result.post, result.comb,
                     hc_state, fn_data, scale_data, base_data,
-                    n_embd, n_hc, sinkhorn_iters, hc_eps, flat.data(), mix, false);
+                    n_embd, n_hc, sinkhorn_iters, hc_eps, flat.data(), mix, false,
+                    result.pre);
     return result;
 }
 
@@ -4705,7 +4710,8 @@ static void hc_pre_auto_into(float * working,
                              float hc_eps,
                              float * flat,
                              float * mix_scratch,
-                             bool serial_fn) {
+                             bool serial_fn,
+                             float * pre_out = nullptr) {
 #if defined(LUCE_BACKEND_CUDA)
     if (ds4_hc_cuda_enabled() && fn_tensor && fn_tensor->data) {
         float mix[24];
@@ -4714,7 +4720,7 @@ static void hc_pre_auto_into(float * working,
             finish_hc_pre_from_mix_into(working, post, comb, hc_state, mix,
                                         weights.scale_data.data(),
                                         weights.base_data.data(),
-                                        n_embd, n_hc, sinkhorn_iters);
+                                        n_embd, n_hc, sinkhorn_iters, pre_out);
             return;
         }
     }
@@ -4724,7 +4730,8 @@ static void hc_pre_auto_into(float * working,
     cpu_hc_pre_into(working, post, comb,
                     hc_state, weights.fn_data.data(),
                     weights.scale_data.data(), weights.base_data.data(),
-                    n_embd, n_hc, sinkhorn_iters, hc_eps, flat, mix_scratch, serial_fn);
+                    n_embd, n_hc, sinkhorn_iters, hc_eps, flat, mix_scratch, serial_fn,
+                    pre_out);
 }
 
 static void hc_pre_batch(std::vector<float> & working,
@@ -4737,11 +4744,13 @@ static void hc_pre_batch(std::vector<float> & working,
                          int n_embd,
                          int n_hc,
                          int sinkhorn_iters,
-                         float hc_eps) {
+                         float hc_eps,
+                         std::vector<float> * pre = nullptr) {
     const size_t hc_dim = (size_t)n_embd * (size_t)n_hc;
     working.resize((size_t)n_tokens * (size_t)n_embd);
     post.resize((size_t)n_tokens * (size_t)n_hc);
     comb.resize((size_t)n_tokens * (size_t)n_hc * (size_t)n_hc);
+    if (pre) pre->resize((size_t)n_tokens * (size_t)n_hc);
 
     ds4_pool_for_tokens(n_tokens, [&](int t0, int t1) {
         std::vector<float> flat(hc_dim);
@@ -4759,7 +4768,8 @@ static void hc_pre_batch(std::vector<float> & working,
                              hc_eps,
                              flat.data(),
                              mix,
-                             /*serial_fn=*/n_tokens > 1);
+                             /*serial_fn=*/n_tokens > 1,
+                             pre ? pre->data() + (size_t)t * n_hc : nullptr);
         }
     });
 }
@@ -4775,6 +4785,20 @@ static void cpu_hc_post(float * out_hc, const float * block_out,
             }
             out_hc[(size_t)dst * n_embd + d] = acc;
         }
+    }
+}
+
+// V4.1 staggers the hyper-connection pre-mix (model.py Block.forward): a
+// sub-block's input is collapsed with the previous sub-block's `pre`
+// coefficients (one-hot copy 0 before the first layer), its own `pre` feeds
+// the next sub-block, and the head collapses with the last FFN's `pre`. V4
+// collapses every sub-block with its own coefficients (and has output_hc_*).
+static void ds4_hc_collapse(float * out, const float * hc_state, const float * pre,
+                             int n_embd, int n_hc) {
+    for (int d = 0; d < n_embd; ++d) {
+        float acc = 0.0f;
+        for (int h = 0; h < n_hc; ++h) acc += pre[h] * hc_state[(size_t) h * n_embd + d];
+        out[d] = acc;
     }
 }
 
@@ -5019,6 +5043,15 @@ static bool deepseek4_step_hybrid(
         }
         load_hc_weights_cpu(hc_output_weights, w.output_hc_fn, w.output_hc_scale, w.output_hc_base);
     }
+    // Staggered pre-mix (see ds4_hc_collapse): the previous sub-block's
+    // coefficients, one-hot copy 0 before the first layer.
+    const bool staggered_pre = w.hc_staggered_pre;
+    float prev_pre[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+    if (staggered_pre && (n_hc > 4 || n_tokens != 1)) {
+        std::fprintf(stderr, "[deepseek4] staggered hyper-connection step needs n_hc <= 4 and one token (got %d, %d)\n",
+                     n_hc, n_tokens);
+        return false;
+    }
 
     for (int il = 0; il < w.n_layer; ++il) {
         const DeepSeek4Layer & L = w.layers[(size_t) il];
@@ -5034,7 +5067,12 @@ static bool deepseek4_step_hybrid(
         if (hc_lw.attn.loaded && n_tokens == 1) {
             hc_attn_result = hc_pre_auto(hc_state.data(), hc_lw.attn, L.hc_attn_fn,
                                          n_embd, n_hc, w.n_hc_sinkhorn_iter, w.hc_eps);
-            memcpy(cur.data(), hc_attn_result.working.data(), (size_t)n_embd * sizeof(float));
+            if (staggered_pre) {
+                ds4_hc_collapse(cur.data(), hc_state.data(), prev_pre, n_embd, n_hc);
+                memcpy(prev_pre, hc_attn_result.pre, (size_t) n_hc * sizeof(float));
+            } else {
+                memcpy(cur.data(), hc_attn_result.working.data(), (size_t)n_embd * sizeof(float));
+            }
         } else {
             // Fallback: use first HC stream
             memcpy(cur.data(), hc_state.data(), (size_t)n_embd * (size_t)n_tokens * sizeof(float));
@@ -5128,7 +5166,12 @@ static bool deepseek4_step_hybrid(
         if (hc_lw.ffn.loaded && n_tokens == 1) {
             hc_ffn_result = hc_pre_auto(hc_state.data(), hc_lw.ffn, L.hc_ffn_fn,
                                         n_embd, n_hc, w.n_hc_sinkhorn_iter, w.hc_eps);
-            memcpy(ffn_working.data(), hc_ffn_result.working.data(), (size_t)n_embd * sizeof(float));
+            if (staggered_pre) {
+                ds4_hc_collapse(ffn_working.data(), hc_state.data(), prev_pre, n_embd, n_hc);
+                memcpy(prev_pre, hc_ffn_result.pre, (size_t) n_hc * sizeof(float));
+            } else {
+                memcpy(ffn_working.data(), hc_ffn_result.working.data(), (size_t)n_embd * sizeof(float));
+            }
         } else {
             memcpy(ffn_working.data(), hc_state.data(), (size_t)n_embd * (size_t)n_tokens * sizeof(float));
         }
@@ -5423,6 +5466,10 @@ static bool deepseek4_step_hybrid(
             }
             final_embd[d] = acc;
         }
+    } else if (staggered_pre) {
+        // No output_hc_* in V4.1: collapse with the last FFN's pre coefficients
+        // (model.py Transformer.forward: layer.hc_pre(h, pre_mix)).
+        ds4_hc_collapse(final_embd.data(), hc_state.data(), prev_pre, n_embd, n_hc);
     } else {
         memcpy(final_embd.data(), hc_state.data(), (size_t)n_embd * (size_t)n_tokens * sizeof(float));
     }
@@ -7943,7 +7990,9 @@ static bool initialize_layer_range_cache(
         }
     }
 
-    if (owns_output) {
+    // With the staggered pre-mix there is no output_hc_*: the head collapses
+    // with the last FFN's pre coefficients (see ds4_hc_collapse).
+    if (owns_output && !w.hc_staggered_pre) {
         if (!load_hc_weights_cpu(runtime.hc_output_weights,
                                  w.output_hc_fn,
                                  w.output_hc_scale,
@@ -8913,15 +8962,28 @@ bool deepseek4_step_layer_range(
             break;
         }
     }
+    // The staggered pre-mix (see ds4_hc_collapse) runs on the host HC path
+    // only, and carries the previous sub-block's coefficients from layer 0.
+    const bool staggered_pre = w.hc_staggered_pre;
+    if (staggered_pre && (layer_begin != 0 || layer_end != w.n_layer || n_hc > 4)) {
+        std::fprintf(stderr, "[deepseek4] staggered hyper-connections need the full layer range "
+                     "(got %d..%d)\n", layer_begin, layer_end);
+        return false;
+    }
+    std::vector<float> hc_prev_pre, hc_own_pre;
+    if (staggered_pre) {
+        hc_prev_pre.assign((size_t) n_tokens * (size_t) n_hc, 0.0f);
+        for (int t = 0; t < n_tokens; ++t) hc_prev_pre[(size_t) t * n_hc] = 1.0f;
+    }
     const bool use_backend_decode_hc =
         reuse_decode_graphs &&
         ds4_backend_is_gpu(backend) &&
-        backend_decode_hc_supported;
+        backend_decode_hc_supported && !staggered_pre;
     const bool use_backend_decode_hc_direct = use_backend_decode_hc && ds4_backend_is_hip(backend);
     const bool use_backend_decode_hc_graph =
         use_backend_decode_hc && !use_backend_decode_hc_direct;
     const bool use_backend_prefill_hc =
-        heterogeneous_sparse_prefill &&
+        heterogeneous_sparse_prefill && !staggered_pre &&
         ds4_env_flag("LUCE_DS4_HYBRID_PREFILL_GPU_HC");
     ggml_tensor * hc_state_backend = nullptr;
     if (use_backend_prefill_hc) {
@@ -9105,7 +9167,16 @@ bool deepseek4_step_layer_range(
         } else {
             hc_pre_batch(cur, hc_post, hc_comb,
                          hc_state.data(), hc_lw.attn, L.hc_attn_fn,
-                         n_tokens, n_embd, n_hc, w.n_hc_sinkhorn_iter, w.hc_eps);
+                         n_tokens, n_embd, n_hc, w.n_hc_sinkhorn_iter, w.hc_eps,
+                         staggered_pre ? &hc_own_pre : nullptr);
+            if (staggered_pre) {
+                for (int t = 0; t < n_tokens; ++t) {
+                    ds4_hc_collapse(cur.data() + (size_t) t * n_embd,
+                                     hc_state.data() + (size_t) t * hc_dim,
+                                     hc_prev_pre.data() + (size_t) t * n_hc, n_embd, n_hc);
+                }
+                hc_prev_pre.swap(hc_own_pre);
+            }
         }
         if (telemetry) telemetry->hc_pre_attn_us += ds4_elapsed_us(hc_pre_attn_t0, Ds4TimingClock::now());
 
@@ -9707,7 +9778,16 @@ bool deepseek4_step_layer_range(
         } else {
             hc_pre_batch(ffn_working, hc_post, hc_comb,
                          hc_state.data(), hc_lw.ffn, L.hc_ffn_fn,
-                         n_tokens, n_embd, n_hc, w.n_hc_sinkhorn_iter, w.hc_eps);
+                         n_tokens, n_embd, n_hc, w.n_hc_sinkhorn_iter, w.hc_eps,
+                         staggered_pre ? &hc_own_pre : nullptr);
+            if (staggered_pre) {
+                for (int t = 0; t < n_tokens; ++t) {
+                    ds4_hc_collapse(ffn_working.data() + (size_t) t * n_embd,
+                                     hc_state.data() + (size_t) t * hc_dim,
+                                     hc_prev_pre.data() + (size_t) t * n_hc, n_embd, n_hc);
+                }
+                hc_prev_pre.swap(hc_own_pre);
+            }
         }
         if (telemetry) telemetry->hc_pre_ffn_us += ds4_elapsed_us(hc_pre_ffn_t0, Ds4TimingClock::now());
 
@@ -9952,13 +10032,22 @@ bool deepseek4_step_layer_range(
         // Final HC pre for output
         const auto output_t0 = Ds4TimingClock::now();
         std::vector<float> & final_embd = scratch.final_embd;
-        hc_output_batch(final_embd,
-                        hc_state.data(),
-                        hc_output_weights_range,
-                        n_tokens,
-                        n_embd,
-                        n_hc,
-                        w.hc_eps);
+        if (staggered_pre) {
+            final_embd.resize((size_t) n_tokens * (size_t) n_embd);
+            for (int t = 0; t < n_tokens; ++t) {
+                ds4_hc_collapse(final_embd.data() + (size_t) t * n_embd,
+                                 hc_state.data() + (size_t) t * hc_dim,
+                                 hc_prev_pre.data() + (size_t) t * n_hc, n_embd, n_hc);
+            }
+        } else {
+            hc_output_batch(final_embd,
+                            hc_state.data(),
+                            hc_output_weights_range,
+                            n_tokens,
+                            n_embd,
+                            n_hc,
+                            w.hc_eps);
+        }
 
         if (reuse_decode_graphs) {
             if (!cached_decode_output_graph.valid() ||
