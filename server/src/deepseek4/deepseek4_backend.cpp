@@ -1076,7 +1076,7 @@ DeepSeek4Backend::~DeepSeek4Backend() {
     shutdown();
 }
 
-bool DeepSeek4Backend::prepare_images(
+ImagePrepareStatus DeepSeek4Backend::prepare_images(
         std::vector<int32_t> & tokens, std::vector<EncodedImage> images,
         uint64_t context_capacity, uint64_t output_reserve,
         ImagePromptHandle & payload, std::string & error) const {
@@ -1088,29 +1088,29 @@ bool DeepSeek4Backend::prepare_images(
             for (int32_t token : tokens) {
                 if (token == marker || token < 0 || token >= w_.n_vocab) {
                     error = "unbound image marker or invalid token in rendered prompt";
-                    return false;
+                    return ImagePrepareStatus::invalid;
                 }
             }
         }
         payload.reset();
-        return true;
+        return ImagePrepareStatus::ok;
     }
     if (!image_capable_) {
         error = "image input requires a validated --mmproj projector and heterogeneous HIP sparse prefill";
-        return false;
+        return ImagePrepareStatus::invalid;
     }
     try {
         if (images.size() > MAX_REQUEST_IMAGES) {
             error = "too many images in request";
-            return false;
+            return ImagePrepareStatus::invalid;
         }
         auto lease = image_request_gate_.try_acquire();
         if (!lease) {
-            error = "an image request is already in progress; retry after it completes";
-            return false;
+            error = "the server is serving as many image requests as it holds; retry shortly";
+            return ImagePrepareStatus::busy;
         }
         if (!vision::check_deepseek4_image_host_preparation(4ULL * 1024 * 1024 * 1024, error)) {
-            return false;
+            return ImagePrepareStatus::invalid;
         }
         std::vector<vision::ImagePatchInput> patches;
         patches.reserve(images.size());
@@ -1119,13 +1119,13 @@ bool DeepSeek4Backend::prepare_images(
             if (image.bytes.size() > 16ULL * 1024 * 1024 ||
                 encoded_bytes > 32ULL * 1024 * 1024 - image.bytes.size()) {
                 error = "images exceed request byte limit";
-                return false;
+                return ImagePrepareStatus::invalid;
             }
             encoded_bytes += image.bytes.size();
             auto decoded = vision::decode_image({image.bytes.data(), image.bytes.size()});
-            if (!decoded) { error = decoded.status.message; return false; }
+            if (!decoded) { error = decoded.status.message; return ImagePrepareStatus::invalid; }
             auto processed = vision::preprocess_rgb(decoded.image.view(), 0);
-            if (!processed) { error = processed.status.message; return false; }
+            if (!processed) { error = processed.status.message; return ImagePrepareStatus::invalid; }
             patches.push_back({processed.image.plan, std::move(processed.image.patches_bf16)});
         }
         vision::ImagePromptLimits limits;
@@ -1133,20 +1133,20 @@ bool DeepSeek4Backend::prepare_images(
         limits.output_reserve = output_reserve;
         limits.max_expanded_tokens = std::min(context_capacity, vision::MAX_PREPARED_PROMPT_TOKENS);
         auto prepared = vision::prepare_image_prompt(tokens, patches, limits);
-        if (!prepared) { error = prepared.message; return false; }
+        if (!prepared) { error = prepared.message; return ImagePrepareStatus::invalid; }
         auto binding = std::shared_ptr<DeepSeek4ImagePrompt>(
             new DeepSeek4ImagePrompt(this, std::move(prepared), std::move(images), std::move(lease)));
         if (!vision::valid_image_spans(binding->spans(), binding->prepared_.tokens.size())) {
             error = "invalid prepared image spans";
-            return false;
+            return ImagePrepareStatus::invalid;
         }
         std::vector<int32_t> expanded = binding->prepared_.tokens;
         tokens.swap(expanded);
         payload = std::move(binding);
-        return true;
+        return ImagePrepareStatus::ok;
     } catch (const std::bad_alloc &) {
         error = "image preparation allocation failed";
-        return false;
+        return ImagePrepareStatus::invalid;
     }
 }
 

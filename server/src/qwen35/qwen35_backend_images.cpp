@@ -50,7 +50,7 @@ std::string Qwen35Backend::image_placeholder() const {
     return image_input_ ? QWEN35_IMAGE_PLACEHOLDER : "";
 }
 
-bool Qwen35Backend::prepare_images(std::vector<int32_t> & tokens, std::vector<EncodedImage> images,
+ImagePrepareStatus Qwen35Backend::prepare_images(std::vector<int32_t> & tokens, std::vector<EncodedImage> images,
                                    uint64_t context_capacity, uint64_t output_reserve,
                                    ImagePromptHandle & payload, std::string & error) const {
     payload.reset();
@@ -59,20 +59,20 @@ bool Qwen35Backend::prepare_images(std::vector<int32_t> & tokens, std::vector<En
         // token, with no image behind it.
         if (image_input_ && std::find(tokens.begin(), tokens.end(), w_.image_pad_id) != tokens.end()) {
             error = "image marker in a prompt without images";
-            return false;
+            return ImagePrepareStatus::invalid;
         }
-        return true;
+        return ImagePrepareStatus::ok;
     }
-    if (!image_input_) { error = "this model was started without --mmproj"; return false; }
-    if (images.size() > MAX_IMAGES_PER_REQUEST) { error = "too many images in request"; return false; }
+    if (!image_input_) { error = "this model was started without --mmproj"; return ImagePrepareStatus::invalid; }
+    if (images.size() > MAX_IMAGES_PER_REQUEST) { error = "too many images in request"; return ImagePrepareStatus::invalid; }
     try {
         auto prompt = std::make_shared<Qwen35ImagePrompt>();
         prompt->owner = this;
         for (const EncodedImage & image : images) {
             auto decoded = vision::decode_image({image.bytes.data(), image.bytes.size()});
-            if (!decoded) { error = decoded.status.message; return false; }
+            if (!decoded) { error = decoded.status.message; return ImagePrepareStatus::invalid; }
             vision::Qwen35Pixels pixels;
-            if (!vision::qwen35_vision_preprocess(vision_config_, decoded.image, pixels, error)) return false;
+            if (!vision::qwen35_vision_preprocess(vision_config_, decoded.image, pixels, error)) return ImagePrepareStatus::invalid;
             Qwen35ImageSlot slot;
             slot.columns = pixels.grid_columns;
             slot.rows = pixels.grid_rows;
@@ -80,14 +80,14 @@ bool Qwen35Backend::prepare_images(std::vector<int32_t> & tokens, std::vector<En
             prompt->pixels.push_back(std::move(pixels));
         }
         const uint64_t limit = context_capacity > output_reserve ? context_capacity - output_reserve : 0;
-        if (!qwen35_expand_image_tokens(tokens, w_.image_pad_id, prompt->slots, limit, error)) return false;
+        if (!qwen35_expand_image_tokens(tokens, w_.image_pad_id, prompt->slots, limit, error)) return ImagePrepareStatus::invalid;
         prompt->expanded_tokens = tokens;
         prompt->positions = qwen35_image_rope_positions((int) tokens.size(), prompt->slots);
         payload = std::move(prompt);
-        return true;
+        return ImagePrepareStatus::ok;
     } catch (const std::bad_alloc &) {
         error = "image preparation allocation failed";
-        return false;
+        return ImagePrepareStatus::invalid;
     }
 }
 

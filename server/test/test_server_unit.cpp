@@ -9445,11 +9445,12 @@ TEST_CASE(ServerUnitFixture, test_default_backend_rejects_encoded_images_without
     ImagePromptHandle payload;
     std::string error;
     TEST_ASSERT(!backend.supports_images());
-    TEST_ASSERT(!backend.prepare_images(tokens, {{"image/png", {137, 80, 78, 71}}},
-                                        8192, 32, payload, error));
+    TEST_ASSERT(backend.prepare_images(tokens, {{"image/png", {137, 80, 78, 71}}},
+                                       8192, 32, payload, error) == ImagePrepareStatus::invalid);
     TEST_ASSERT(tokens == std::vector<int32_t>({1, 2, 3}));
     TEST_ASSERT(!payload && !error.empty());
-    TEST_ASSERT(backend.prepare_images(tokens, {}, 8192, 32, payload, error));
+    TEST_ASSERT(backend.prepare_images(tokens, {}, 8192, 32, payload, error) ==
+                ImagePrepareStatus::ok);
     TEST_ASSERT(tokens == std::vector<int32_t>({1, 2, 3}));
 }
 

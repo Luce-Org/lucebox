@@ -36,6 +36,14 @@ int main() {
             retained_lease = transient.try_acquire();
         }
         retained_lease.reset();
+        {
+            ImageRequestGate batched;
+            batched.set_capacity(2);
+            auto first = batched.try_acquire(), second = batched.try_acquire();
+            check(first && second && !batched.try_acquire(), "gate capacity was not enforced");
+            first.reset();
+            check(bool(batched.try_acquire()), "released lease did not free gate capacity");
+        }
         const ImageSentinels sentinels{{10,11}, {20,21}, {30,31}, {40,41}};
         const ImageRaster raster{4, 2, {100,101,200,201,300,301,400,401}};
         const std::vector<float> expected{20,21,10,11,300,301,100,101,30,31,

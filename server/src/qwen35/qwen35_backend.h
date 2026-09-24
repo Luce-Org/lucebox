@@ -163,12 +163,12 @@ public:
     // decode one token at a time.
     bool supports_images() const override { return image_input_; }
     std::string image_placeholder() const override;
-    bool prepare_images(std::vector<int32_t> & tokens,
-                        std::vector<EncodedImage> images,
-                        uint64_t context_capacity,
-                        uint64_t output_reserve,
-                        ImagePromptHandle & payload,
-                        std::string & error) const override;
+    ImagePrepareStatus prepare_images(std::vector<int32_t> & tokens,
+                                      std::vector<EncodedImage> images,
+                                      uint64_t context_capacity,
+                                      uint64_t output_reserve,
+                                      ImagePromptHandle & payload,
+                                      std::string & error) const override;
     bool supports_remote_draft() const override { return true; }
 
     // ── Concurrent slot serving (paged AR decode over N sequences) ────

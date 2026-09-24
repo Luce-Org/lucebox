@@ -138,21 +138,21 @@ struct ModelBackend {
     // turns into the image marker, and binds decoded images to a rendered prompt.
     virtual bool supports_images() const { return false; }
     virtual std::string image_placeholder() const { return {}; }
-    virtual bool prepare_images(std::vector<int32_t> & tokens,
-                                std::vector<EncodedImage> images,
-                                uint64_t context_capacity,
-                                uint64_t output_reserve,
-                                ImagePromptHandle & payload,
-                                std::string & error) const {
+    virtual ImagePrepareStatus prepare_images(std::vector<int32_t> & tokens,
+                                              std::vector<EncodedImage> images,
+                                              uint64_t context_capacity,
+                                              uint64_t output_reserve,
+                                              ImagePromptHandle & payload,
+                                              std::string & error) const {
         (void) tokens;
         (void) context_capacity;
         (void) output_reserve;
         if (!images.empty()) {
             error = "this backend does not support image input";
-            return false;
+            return ImagePrepareStatus::invalid;
         }
         payload.reset();
-        return true;
+        return ImagePrepareStatus::ok;
     }
 
     // Print the "[<arch>-daemon] ready ..." banner on stdout.

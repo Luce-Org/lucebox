@@ -150,14 +150,18 @@ luce_server models/DeepSeek-V4-Flash-Vision-Exp-ROCMFPX-MIX-STRIX.gguf \
 ```
 
 Its image blocks need whole-block bidirectional prefill, which the batched
-engine's 16-row step cannot run. An image request is therefore prefilled up to
-its last token on the single-request sparse path, into a staging cache, while
-the batch waits; that state is copied into the request's paged slot and the
-last token prefills in the batch, so the answer decodes alongside everyone
-else. On the Strix Halo with the encoder on the R9700, four concurrent image
-answers of 256 tokens finish in 39 s (26 tok/s in total), two images plus two
-text requests in 33 s (31 tok/s); four text requests reach 38 tok/s. `/props` reports the effective capability in
-`capabilities.image_input_supported` after backend initialization.
+engine's 16-row step cannot run. Image requests admitted since the last step
+are therefore prefilled up to their last token together, in shared
+layer-major sparse passes into per-request staging caches (each layer's
+experts are read once for all of them); that state is copied into each
+request's paged slot and the last token prefills in the batch, so the answers
+decode alongside everyone else. On the Strix Halo with the encoder on the
+R9700, four concurrent image answers of 256 tokens finish in 35 s (29 tok/s in
+total), two images plus two text requests at 31 tok/s; four text requests
+reach 38 tok/s. The server holds at most one image request per slot; further
+image requests get HTTP 503 and should be retried. `/props` reports the
+effective capability in `capabilities.image_input_supported` after backend
+initialization.
 
 ## Qwen3.5 / Qwen3.8
 

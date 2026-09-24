@@ -2494,10 +2494,13 @@ bool HttpServer::handle_model_request(SocketHandle fd, ParsedRequest & req,
         if (!render_and_tokenize_request(fd, render_messages, req)) return true;
 
         std::string image_error;
-        if (!backend_.prepare_images(req.prompt_tokens, std::move(encoded_images),
+        const ImagePrepareStatus image_status = backend_.prepare_images(
+                req.prompt_tokens, std::move(encoded_images),
                 uint64_t(std::max(0, config_.max_ctx)), uint64_t(std::max(0, req.max_output)),
-                req.images, image_error)) {
-            send_error(fd, 400, image_error);
+                req.images, image_error);
+        if (image_status != ImagePrepareStatus::ok) {
+            // A full image gate is capacity, not a bad request: clients retry 503.
+            send_error(fd, image_status == ImagePrepareStatus::busy ? 503 : 400, image_error);
             return true;
         }
 
