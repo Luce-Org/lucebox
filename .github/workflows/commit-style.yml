@@ -1,0 +1,29 @@
+name: Commit style
+
+# Every non-merge commit in a pull request must follow the conventional commit
+# style: `type(scope): summary`. See .github/ci/check_commit_messages.py for the
+# rules. The `compact-commits` label (compact-commits.yml) rewrites messages to match.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  commit-style:
+    name: Commit messages
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check commit messages
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: python3 .github/ci/check_commit_messages.py --base "$BASE" --head "$HEAD"

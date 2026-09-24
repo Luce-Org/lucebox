@@ -75,7 +75,19 @@ fix(dflash): clamp int8 DeltaNet state update before dequant
 docs(hub): add DVFS methodology link
 ```
 
-Allowed types: `feat`, `fix`, `refactor`, `perf`, `docs`, `test`, `bench`, `chore`, `ci`.
+Allowed types: `feat`, `fix`, `refactor`, `perf`, `docs`, `test`, `bench`, `build`, `chore`, `ci`, `revert`.
+The scope is required and lowercase, and the subject stays under 100 characters with no
+trailing period. CI checks every commit in a pull request
+([`commit-style.yml`](.github/workflows/commit-style.yml)).
+
+## Compacting commits before merge
+
+When a pull request is ready, a maintainer can add the `compact-commits` label. A bot then
+folds a pull request with 2 or more commits into a few conventional commits (usually
+one per type), checks the code is unchanged, and force-pushes them to the branch. It
+never merges: press Merge as usual once CI passes on the new head. On a fork, keep
+"Allow edits by maintainers" ticked. See
+[`compact-commits.yml`](.github/workflows/compact-commits.yml).
 
 ## Hardware access
 

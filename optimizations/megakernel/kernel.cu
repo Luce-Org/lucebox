@@ -72,6 +72,8 @@ constexpr int MAX_ACT_DIM = (HIDDEN_SIZE > INTERMEDIATE_SIZE) ? HIDDEN_SIZE : IN
 #endif
 
 constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
+constexpr int SHMEM_FLOATS = (MAX_ACT_DIM > NUM_WARPS * FA_HEAD_DIM)
+    ? MAX_ACT_DIM : NUM_WARPS * FA_HEAD_DIM;
 
 #ifndef LM_NUM_BLOCKS
 #define LM_NUM_BLOCKS 512
@@ -536,6 +538,7 @@ __device__ void full_attention_layer(
         int hs = block_id * hpb, he = min(hs + hpb, FA_NUM_Q_HEADS);
         __shared__ float s_max_score[NUM_WARPS];
         __shared__ float s_sum_exp[NUM_WARPS];
+        float *s_attn_scratch = reinterpret_cast<float *>(shmem);
         constexpr int EPL = FA_HEAD_DIM / WARP_SIZE;
 
         for (int qh = hs; qh < he; qh++) {
@@ -561,7 +564,7 @@ __device__ void full_attention_layer(
                     out_acc[e] = out_acc[e]*exp_diff + wt*H2F(__ldg(v_pos + lane_id*EPL+e));
             }
             if (lane_id == 0) { s_max_score[warp_id] = max_score; s_sum_exp[warp_id] = sum_exp; }
-            for (int e = 0; e < EPL; e++) g_activations[warp_id*FA_HEAD_DIM + lane_id*EPL+e] = out_acc[e];
+            for (int e = 0; e < EPL; e++) s_attn_scratch[warp_id*FA_HEAD_DIM + lane_id*EPL+e] = out_acc[e];
             __syncthreads();
 
             if (warp_id == 0) {
@@ -570,7 +573,7 @@ __device__ void full_attention_layer(
                 for (int ww = 0; ww < NUM_WARPS; ww++) {
                     if (s_max_score[ww] > -INFINITY) {
                         float s = fast_exp(s_max_score[ww]-gm); ts += s_sum_exp[ww]*s;
-                        for (int e = 0; e < EPL; e++) fo[e] += g_activations[ww*FA_HEAD_DIM+lane_id*EPL+e]*s;
+                        for (int e = 0; e < EPL; e++) fo[e] += s_attn_scratch[ww*FA_HEAD_DIM+lane_id*EPL+e]*s;
                     }
                 }
                 float *gate_ptr = q_head + FA_HEAD_DIM;
@@ -892,8 +895,8 @@ decode_kernel(
 
     AtomicGridSync grid{barrier_counter, barrier_generation, (unsigned int)num_blocks, 0};
 
-    // Shared memory: large enough for max(HIDDEN_SIZE bf16, INTERMEDIATE_SIZE f32)
-    __shared__ __align__(16) char shmem_raw[MAX_ACT_DIM * sizeof(float)];
+    // Block-local workspace for normalization, MLP and attention merge.
+    __shared__ __align__(16) char shmem_raw[SHMEM_FLOATS * sizeof(float)];
     half_t *shmem_bf16 = reinterpret_cast<half_t *>(shmem_raw);
 
     const half_t *embed_row = embed_weight + input_token_id * HIDDEN_SIZE;

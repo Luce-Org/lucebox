@@ -116,6 +116,7 @@ for exact-retrieval and matched true-context benchmarks.
 | Codex | [`run_codex.sh`](harness/clients/run_codex.sh) |
 | OpenCode | [`run_opencode.sh`](harness/clients/run_opencode.sh) |
 | Hermes | [`run_hermes.sh`](harness/clients/run_hermes.sh) |
+| [OMP](https://omp.sh/) | [`run_omp.sh`](harness/clients/run_omp.sh) |
 | Pi | [`run_pi.sh`](harness/clients/run_pi.sh) |
 | OpenClaw | [`run_openclaw.sh`](harness/clients/run_openclaw.sh) |
 | Open WebUI | [`run_openwebui.sh`](harness/clients/run_openwebui.sh) |

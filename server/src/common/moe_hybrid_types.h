@@ -21,6 +21,15 @@ int query_gpu_compute_sm();
 enum class MoeHybridColdBackend {
     Cpu,
     Gpu,
+    // No cold owner: non-resident routes contribute zero and are never
+    // materialized; the caller reduces the owners' partials outside this
+    // process (e.g. with ggml_cluster_allreduce). Storage allocates no cold
+    // buffers, evaluators build no cold graph, never fall back to CPU or
+    // streamed evaluation for non-resident routes and never swap experts.
+    // The routed partial never carries the shared expert, which is replicated
+    // on every owner: pass a MoeLayerDesc without shexp tensors and add
+    // eval_moe_shared_expert_batched() once, after the reduction.
+    None,
 };
 
 // ─── MoE architecture config (model-agnostic) ──────────────────────────
@@ -38,6 +47,13 @@ struct MoeHybridConfig {
     MoeHybridColdBackend cold_expert_backend = MoeHybridColdBackend::Cpu;
     bool materialize_hot_experts = true;
     bool materialize_cold_experts = true;
+
+    // Cold owner None has no cold experts, so nothing to materialize whatever
+    // materialize_cold_experts says.
+    bool materializes_cold_experts() const {
+        return materialize_cold_experts &&
+               cold_expert_backend != MoeHybridColdBackend::None;
+    }
 
     // When true, MMQ mul_mat_id works correctly with reduced hot stacks
     // (n_hot < n_expert). Safe on sm_80+ (Ampere/Ada/Hopper/Blackwell).

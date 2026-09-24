@@ -28,6 +28,7 @@ PRIMARY_OUTPUT_NAMES = {
     "openclaw.out",
     "openwebui.out",
     "openwebui-tools.out",
+    "omp.out",
     "pi.out",
 }
 MARKERS = ("OK_DONE", "lucebox-client-ok", "OPENWEBUI_TOOL_OK")
@@ -129,6 +130,40 @@ def first_json_value(text: str):
     return value
 
 
+def extract_omp_json_text(text: str) -> str | None:
+    """Pull assistant text out of OMP's `--mode json` event stream.
+
+    OMP echoes the user prompt and tool results as message events too, so only
+    `role == "assistant"` message content counts as generated output.
+    """
+    parts: list[str] = []
+    handled_assistant_event = False
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict) or event.get("type") != "message_end":
+            continue
+        message = event.get("message")
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        handled_assistant_event = True
+        content = message.get("content")
+        if isinstance(content, str):
+            parts.append(content)
+        elif isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict) and isinstance(item.get("text"), str):
+                    parts.append(item["text"])
+    if handled_assistant_event:
+        return "\n".join(part for part in parts if part)
+    return None
+
+
 def extract_generated_text(text: str) -> str:
     parts: list[str] = []
     value = first_json_value(text)
@@ -164,6 +199,9 @@ def extract_generated_text(text: str) -> str:
         return ""
 
     if not parts:
+        omp_text = extract_omp_json_text(text)
+        if omp_text is not None:
+            return omp_text
         for line in text.splitlines():
             line = line.strip()
             if not line:
@@ -205,6 +243,31 @@ def tool_call_ok(text: str) -> bool:
     return "tool_call:" in text or '"tool_calls"' in text
 
 
+def omp_tool_call_ok(text: str) -> bool:
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") == "tool_execution_start":
+            return True
+        message = event.get("message")
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if isinstance(content, list) and any(
+            isinstance(item, dict) and item.get("type") == "toolCall"
+            for item in content
+        ):
+            return True
+    return False
+
+
 def preview(text: str, limit: int = 180) -> str:
     compact = re.sub(r"\s+", " ", text).strip()
     return compact[:limit]
@@ -230,7 +293,11 @@ def summarize_backend(pair_dir: Path, backend: str) -> dict:
     m = re.search(r"^rc=(\d+)$", backend_out, flags=re.M)
     if m:
         rc = m.group(1)
-    observed_tool_call = tool_call_ok(generated_text) or any(call.get("finish") == "tool_calls" for call in calls)
+    observed_tool_call = (
+        tool_call_ok(generated_text)
+        or omp_tool_call_ok(client_text)
+        or any(call.get("finish") == "tool_calls" for call in calls)
+    )
     return {
         "backend": backend,
         "run_dir": str(run_dir),

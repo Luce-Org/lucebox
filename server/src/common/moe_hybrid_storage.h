@@ -202,6 +202,14 @@ struct MoeHybridStorage {
     bool materialized_cold_experts = true;
     ggml_mixed_mmq_policy mixed_mmq_policy = GGML_MIXED_MMQ_DEFAULT;
     MoeHybridPlacement placement;
+
+    // Cold experts are streamed from the source file on demand. Cold owner
+    // None is not materialized either, but it has no cold experts at all, so
+    // it must not set up a streaming path.
+    bool streams_cold_experts() const {
+        return !materialized_cold_experts &&
+               cold_backend_kind != MoeHybridColdBackend::None;
+    }
     std::vector<MoeHybridLayerStorage> layers;
 
     // Long heterogeneous prefill uses one routing graph and one owner graph

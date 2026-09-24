@@ -10,7 +10,7 @@ HumanEval/GSM8K/Math500/agent suite runner, see
 
 Use this when you want to know whether a server change affects output quality or
 decode speed. Use `harness/clients/` when you want to know whether Codex,
-OpenCode, Open WebUI, Pi, and the other clients still work.
+OpenCode, OMP, Open WebUI, Pi, and the other clients still work.
 
 ## Bench suites (HumanEval, GSM8K, Math500, Agent)
 

@@ -1,0 +1,40 @@
+name: Compact commits
+
+# Adding the `compact-commits` label to a pull request asks the commit compaction
+# bot to fold its commits into a few conventional commits before merge. The bot
+# never merges and never changes the code: it only rewrites the branch's history,
+# then comments the old-to-new commit mapping and removes the label.
+#
+# This workflow only forwards the request; it checks out and runs nothing.
+
+on:
+  pull_request_target:
+    types: [labeled]
+
+permissions: {}
+
+jobs:
+  dispatch:
+    if: github.event.label.name == 'compact-commits'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Hand the pull request to the compaction bot
+        env:
+          GH_TOKEN: ${{ secrets.LUCEBOX_BOTS_DISPATCH_TOKEN }}
+          BOT_REPO: ${{ secrets.LUCEBOX_BOTS_DISPATCH_REPO }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          SENDER: ${{ github.event.sender.login }}
+        run: |
+          set -euo pipefail
+          if [ -z "$GH_TOKEN" ] || [ -z "$BOT_REPO" ]; then
+            echo "::error::LUCEBOX_BOTS_DISPATCH_TOKEN or LUCEBOX_BOTS_DISPATCH_REPO is not set"
+            exit 1
+          fi
+          gh api "repos/$BOT_REPO/dispatches" \
+            -f event_type=compact-commits \
+            -f "client_payload[repository]=$REPO" \
+            -F "client_payload[pr]=$PR" \
+            -f "client_payload[sender]=$SENDER" >/dev/null
+          echo "Sent PR #$PR to the compaction bot." >> "$GITHUB_STEP_SUMMARY"
