@@ -203,13 +203,7 @@ static size_t ggml_cuda_total_ram_bytes() {
     return cached;
 }
 
-static bool ggml_cuda_device_use_uma(int device, size_t size) {
-    if (getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY") != nullptr) {
-        return true;
-    }
-    if (getenv("LUCE_HIP_NO_AUTO_UMA") != nullptr) {
-        return false;
-    }
+static bool ggml_cuda_device_is_integrated(int device) {
     static const std::array<bool, GGML_CUDA_MAX_DEVICES> integrated = []() {
         std::array<bool, GGML_CUDA_MAX_DEVICES> flags{};
         int n = 0;
@@ -220,7 +214,17 @@ static bool ggml_cuda_device_use_uma(int device, size_t size) {
         }
         return flags;
     }();
-    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES || !integrated[device]) {
+    return device >= 0 && device < GGML_CUDA_MAX_DEVICES && integrated[device];
+}
+
+static bool ggml_cuda_device_use_uma(int device, size_t size) {
+    if (getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY") != nullptr) {
+        return true;
+    }
+    if (getenv("LUCE_HIP_NO_AUTO_UMA") != nullptr) {
+        return false;
+    }
+    if (!ggml_cuda_device_is_integrated(device)) {
         return false;
     }
     size_t total_ram = ggml_cuda_total_ram_bytes();
@@ -275,6 +279,28 @@ static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device,
 #endif // defined(GGML_USE_HIP)
     } else {
         err = cudaMalloc(ptr, size);
+#if defined(GGML_USE_HIP)
+        // An integrated GPU with a large carve (e.g. 64 GiB) can fill its
+        // device heap mid-load while host RAM still has room. Retry as managed
+        // memory so the carve and GTT are usable together; same opt-out as
+        // the auto-UMA path above.
+        if (err != cudaSuccess && getenv("LUCE_HIP_NO_AUTO_UMA") == nullptr &&
+            ggml_cuda_device_is_integrated(device)) {
+            (void)hipGetLastError();
+            err = cudaMallocManaged(ptr, size);
+            if (err == cudaSuccess) {
+                managed = true;
+                (void)cudaMemAdvise(*ptr, size, hipMemAdviseSetCoarseGrain, device);
+                (void)hipGetLastError();
+                static bool logged = false;
+                if (!logged) {
+                    GGML_LOG_INFO("ggml_cuda: device %d heap full; overflowing to unified (managed) memory\n",
+                                  device);
+                    logged = true;
+                }
+            }
+        }
+#endif // defined(GGML_USE_HIP)
     }
     if (out_managed != nullptr) {
         *out_managed = managed && (err == cudaSuccess);
