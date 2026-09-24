@@ -10604,7 +10604,9 @@ static ggml_tensor * build_dspark_attention(
     ggml_tensor * qr = build_rms_norm(ctx, ggml_mul_mat(ctx, L.attn_q_a, cur), L.attn_q_a_norm, eps);
     ggml_tensor * q = ggml_mul_mat(ctx, L.attn_q_b, qr);          // [n_head*head_dim, block]
     q = ggml_reshape_3d(ctx, q, head_dim, n_head, block);
-    q = ggml_rms_norm(ctx, q, eps);                               // per-head unweighted
+    if (w.attn_q_head_norm) {
+        q = ggml_rms_norm(ctx, q, eps);                           // per-head unweighted (V4)
+    }
     q = build_tail_rope_3d(ctx, q, pos_block, n_rot, head_dim, n_head, block,
                            rope_freq, rope_scale, rope_ext, rope_attn,
                            w.rope_yarn_beta_fast, w.rope_yarn_beta_slow, rope_orig);
@@ -11079,6 +11081,24 @@ static bool deepseek4_dspark_draft_forward_impl(
             return ggml_view_1d(ctx, hc, (int64_t) n_embd * n_hc,
                                 (size_t) p * hc->nb[2]);
         };
+        // Staggered pre-mix (V4.1, see ds4_hc_collapse): each sub-block's
+        // input collapses the HC copies with the previous sub-block's pre
+        // coefficients; the first attention takes copy 0 (identity mix) and
+        // the head the last FFN's. prev_pre[p] is null before layer 0.
+        const bool staggered = w.hc_staggered_pre;
+        std::vector<ggml_tensor *> prev_pre((size_t) block, nullptr);
+        auto hc_collapse = [&](ggml_tensor * hcf, ggml_tensor * pre) -> ggml_tensor * {
+            ggml_tensor * hc2 = ggml_reshape_2d(ctx, hcf, n_embd, n_hc);
+            if (!pre) {
+                return ggml_reshape_2d(ctx, ggml_view_1d(ctx, hcf, n_embd, 0), n_embd, 1);
+            }
+            ggml_tensor * weighted = ggml_mul(ctx, hc2, ggml_reshape_2d(ctx, pre, 1, n_hc));
+            ggml_tensor * summed = ggml_sum_rows(ctx, ggml_cont(ctx, ggml_transpose(ctx, weighted)));
+            return ggml_reshape_2d(ctx, summed, n_embd, 1);
+        };
+        auto split_pre = [&](ggml_tensor * split) -> ggml_tensor * {
+            return ggml_view_1d(ctx, split, n_hc, 0);
+        };
 
         for (int il = 0; il < w.n_layer; il++) {
             const DeepSeek4Layer & L = w.layers[il];
@@ -11094,8 +11114,13 @@ static bool deepseek4_dspark_draft_forward_impl(
                 ggml_tensor * pre = ggml_ds4_hc_pre(ctx, mix, base, hcf, n_hc,
                                                     w.n_hc_sinkhorn_iter,
                                                     C.s_attn[il][0], C.s_attn[il][1], C.s_attn[il][2]);
-                work_cols[p]  = ggml_reshape_2d(ctx, ggml_view_1d(ctx, pre, n_embd, 0), n_embd, 1);
                 split_attn[p] = ggml_view_1d(ctx, pre, mix_dim, (size_t) n_embd * sizeof(float));
+                if (staggered) {
+                    work_cols[p] = hc_collapse(hcf, prev_pre[(size_t) p]);
+                    prev_pre[(size_t) p] = split_pre(split_attn[p]);
+                } else {
+                    work_cols[p] = ggml_reshape_2d(ctx, ggml_view_1d(ctx, pre, n_embd, 0), n_embd, 1);
+                }
             }
             ggml_tensor * attn_in = work_cols[0];
             for (int p = 1; p < block; p++) attn_in = ggml_concat(ctx, attn_in, work_cols[p], 1);
@@ -11135,8 +11160,13 @@ static bool deepseek4_dspark_draft_forward_impl(
                 ggml_tensor * pre = ggml_ds4_hc_pre(ctx, mix, base, hcf, n_hc,
                                                     w.n_hc_sinkhorn_iter,
                                                     C.s_ffn[il][0], C.s_ffn[il][1], C.s_ffn[il][2]);
-                fwork[p]     = ggml_reshape_2d(ctx, ggml_view_1d(ctx, pre, n_embd, 0), n_embd, 1);
                 split_ffn[p] = ggml_view_1d(ctx, pre, mix_dim, (size_t) n_embd * sizeof(float));
+                if (staggered) {
+                    fwork[p] = hc_collapse(hcf, prev_pre[(size_t) p]);
+                    prev_pre[(size_t) p] = split_pre(split_ffn[p]);
+                } else {
+                    fwork[p] = ggml_reshape_2d(ctx, ggml_view_1d(ctx, pre, n_embd, 0), n_embd, 1);
+                }
             }
             ggml_tensor * ffn_in = fwork[0];
             for (int p = 1; p < block; p++) ffn_in = ggml_concat(ctx, ffn_in, fwork[p], 1);
@@ -11164,12 +11194,17 @@ static bool deepseek4_dspark_draft_forward_impl(
         ggml_tensor * confidence_out = nullptr;
         for (int p = 0; p < block; p++) {
             ggml_tensor * hcf = hc_col(hc_cur, p);
-            ggml_tensor * onorm = ggml_rms_norm(ctx, hcf, hc_eps);
-            ggml_tensor * omix = ggml_mul_mat(ctx, w.output_hc_fn, onorm);
-            omix = ggml_reshape_1d(ctx, omix, n_hc);
-            ggml_tensor * obase = ggml_reshape_1d(ctx, w.output_hc_base, n_hc);
-            ggml_tensor * final_embd = ggml_ds4_hc_out(ctx, omix, obase, hcf, n_hc, C.s_out);
-            ggml_tensor * final_2d = ggml_reshape_2d(ctx, final_embd, n_embd, 1);
+            ggml_tensor * final_2d = nullptr;
+            if (staggered) {
+                final_2d = hc_collapse(hcf, prev_pre[(size_t) p]);
+            } else {
+                ggml_tensor * onorm = ggml_rms_norm(ctx, hcf, hc_eps);
+                ggml_tensor * omix = ggml_mul_mat(ctx, w.output_hc_fn, onorm);
+                omix = ggml_reshape_1d(ctx, omix, n_hc);
+                ggml_tensor * obase = ggml_reshape_1d(ctx, w.output_hc_base, n_hc);
+                ggml_tensor * final_embd = ggml_ds4_hc_out(ctx, omix, obase, hcf, n_hc, C.s_out);
+                final_2d = ggml_reshape_2d(ctx, final_embd, n_embd, 1);
+            }
             ggml_tensor * hidden_p = build_rms_norm(ctx, final_2d, w.out_norm, w.rms_eps);
             out = out ? ggml_concat(ctx, out, hidden_p, 1) : hidden_p;
             confidence_out = confidence_out

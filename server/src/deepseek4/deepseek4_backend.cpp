@@ -1745,7 +1745,10 @@ bool DeepSeek4Backend::load_spec_drafter() {
     }
 
     const DSparkDrafter & d = *drafter;
-    bool compatible = d.core.n_embd == w_.n_embd &&
+    // A drafter is trained against one target: its hyper-connection rules
+    // (the staggered pre-mix of V4.1) must match the target's.
+    bool compatible = d.core.hc_staggered_pre == w_.hc_staggered_pre &&
+                      d.core.n_embd == w_.n_embd &&
                       d.core.n_vocab == w_.n_vocab &&
                       d.vocab_size == w_.n_vocab &&
                       d.mask_token_id >= 0 && d.mask_token_id < w_.n_vocab &&
@@ -1756,9 +1759,9 @@ bool DeepSeek4Backend::load_spec_drafter() {
     if (!compatible) {
         std::fprintf(stderr,
                      "[deepseek4] DSpark drafter is incompatible with target "
-                     "(target embd/vocab/layers=%d/%d/%d, draft=%d/%d)\n",
-                     w_.n_embd, w_.n_vocab, w_.n_layer,
-                     d.core.n_embd, d.vocab_size);
+                     "(target %s embd/vocab/layers=%d/%d/%d, draft %s %d/%d)\n",
+                     w_.arch.c_str(), w_.n_embd, w_.n_vocab, w_.n_layer,
+                     d.core.arch.c_str(), d.core.n_embd, d.vocab_size);
         free_deepseek4_dspark_drafter(*drafter);
         if (spec_backend_) {
             ggml_backend_free(spec_backend_);

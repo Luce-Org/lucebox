@@ -2,7 +2,11 @@
 //
 // The DSpark drafter is a small (n_layer≈3) DeepSeek-V4 block stack stored under
 // the checkpoint's mtp.* namespace and converted to a GGUF with arch
-// "deepseek4-dflash-draft" (see scripts/convert_ds4_dspark_draft_to_gguf.py).
+// "deepseek4-dflash-draft" (V4 Flash) or "deepseek41-dflash-draft" (V4.1
+// Flash, see scripts/convert_ds4_dspark_draft_to_gguf.py). The V4.1 block
+// follows the target's V4.1 rules (staggered hyper-connection pre-mix, no
+// per-head query norm, no output_hc_* head collapse) and captures the
+// residual entering target layers 37-39.
 //
 // Reference forward: deepseek-ai/DeepSeek-V4-Flash-DSpark inference/model.py
 // (DSparkBlock / DSparkAttention / DSparkMarkovHead / DSparkConfidenceHead,

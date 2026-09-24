@@ -1,7 +1,8 @@
 // DeepSeek-V4-Flash "DSpark" drafter loader.  See deepseek4_dspark.h.
 //
 // Self-contained (shares nothing with the target loader) so it cannot regress
-// the target path.  Loads a "deepseek4-dflash-draft" GGUF into a DSparkDrafter:
+// the target path.  Loads a "deepseek4-dflash-draft" (V4 Flash) or
+// "deepseek41-dflash-draft" (V4.1 Flash) GGUF into a DSparkDrafter:
 // the n_layer decoder blocks reuse DeepSeek4Weights leaf-name bindings, and the
 // DSpark-specific tensors (dflash.fc / hidden_norm / dspark.*) bind separately.
 
@@ -29,7 +30,10 @@ namespace {
 std::string g_dspark_err;
 void set_err(const std::string & m) { g_dspark_err = m; std::fprintf(stderr, "[ds4-dspark] %s\n", m.c_str()); }
 
+// V4 Flash drafter, and the V4.1 Flash one (staggered hyper-connection
+// pre-mix, no per-head query norm, no output_hc_* head collapse).
 const char * ARCH = "deepseek4-dflash-draft";
+const char * ARCH_V41 = "deepseek41-dflash-draft";
 
 uint32_t kv_u32(gguf_context * g, const std::string & key, uint32_t def) {
     const int64_t id = gguf_find_key(g, key.c_str());
@@ -142,17 +146,19 @@ bool load_deepseek4_dspark_drafter(const std::string & path,
     if (!g) { set_err("gguf_init failed: " + path); return false; }
 
     // ── Arch check ──────────────────────────────────────────────────────
+    std::string arch;
     {
         const int64_t aid = gguf_find_key(g, "general.architecture");
         if (aid < 0) { set_err("missing general.architecture"); gguf_free(g); if (meta) ggml_free(meta); return false; }
-        const char * arch = gguf_get_val_str(g, aid);
-        if (std::string(arch) != ARCH) {
-            set_err(std::string("unexpected arch: ") + arch + " (expected " + ARCH + ")");
+        arch = gguf_get_val_str(g, aid);
+        if (arch != ARCH && arch != ARCH_V41) {
+            set_err("unexpected arch: " + arch + " (expected " + ARCH + " or " + ARCH_V41 + ")");
             gguf_free(g); if (meta) ggml_free(meta); return false;
         }
     }
+    const bool is_v41 = arch == ARCH_V41;
 
-    const std::string P = std::string(ARCH) + ".";
+    const std::string P = arch + ".";
     DeepSeek4Weights & w = out.core;
 
     // ── Core hparams (mirror the target loader's defaults) ──────────────
@@ -189,6 +195,14 @@ bool load_deepseek4_dspark_drafter(const std::string & path,
     w.swiglu_clamp_exp = kv_f32(g, P + "swiglu_clamp_exp", 10.0f);
     w.eos_id = -1;        // drafter carries no tokenizer; EOS comes from the target
     w.eos_chat_id = -1;
+    // Same forward-pass rules as the target loader applies to deepseek41:
+    // no per-head query norm, staggered pre-mix (the head collapses with the
+    // last FFN's coefficients, so there are no output_hc_* tensors) and HC
+    // mixes normalized with norm_eps.
+    w.arch = arch;
+    w.attn_q_head_norm = !is_v41;
+    w.hc_staggered_pre = is_v41;
+    if (is_v41) w.hc_eps = w.rms_eps;
 
     // DSpark drafter layers have NO KV compression (DSparkAttention asserts
     // compress_ratio==0). Force all-zero so no compressor/indexer tensors are
@@ -381,9 +395,11 @@ bool load_deepseek4_dspark_drafter(const std::string & path,
     need(out.markov_w1, "dflash.dspark.markov.w1");
     need(out.markov_w2, "dflash.dspark.markov.w2");
     need(w.out_norm, "output_norm.weight");
-    need(w.output_hc_fn, "output_hc_fn.weight");
-    need(w.output_hc_scale, "output_hc_scale.weight");
-    need(w.output_hc_base, "output_hc_base.weight");
+    if (!w.hc_staggered_pre) {
+        need(w.output_hc_fn, "output_hc_fn.weight");
+        need(w.output_hc_scale, "output_hc_scale.weight");
+        need(w.output_hc_base, "output_hc_base.weight");
+    }
     for (int il = 0; il < w.n_layer; ++il) {
         const DeepSeek4Layer & L = w.layers[(size_t) il];
         const std::string p = "blk." + std::to_string(il) + ".";
@@ -433,9 +449,11 @@ bool load_deepseek4_dspark_drafter(const std::string & path,
     expect_shape(out.markov_w2, "dflash.dspark.markov.w2",
                  {out.markov_rank, out.vocab_size});
     expect_shape(w.out_norm, "output_norm.weight", {n_embd});
-    expect_shape(w.output_hc_fn, "output_hc_fn.weight", {hc_dim, w.n_hc});
-    expect_shape(w.output_hc_scale, "output_hc_scale.weight", {1});
-    expect_shape(w.output_hc_base, "output_hc_base.weight", {w.n_hc});
+    if (!w.hc_staggered_pre) {
+        expect_shape(w.output_hc_fn, "output_hc_fn.weight", {hc_dim, w.n_hc});
+        expect_shape(w.output_hc_scale, "output_hc_scale.weight", {1});
+        expect_shape(w.output_hc_base, "output_hc_base.weight", {w.n_hc});
+    }
     if (out.confidence_w && out.confidence_dim > 0) {
         expect_shape(out.confidence_w, "dflash.dspark.confidence.weight",
                      {out.confidence_dim, 1});
@@ -512,9 +530,11 @@ bool load_deepseek4_dspark_drafter(const std::string & path,
     gguf_free(g);  // meta_ctx now owned by w.ctx; do not free here
 
     std::fprintf(stderr,
-        "[ds4-dspark] loaded %s: n_layer=%d n_embd=%d vocab=%d block_size=%d "
-        "n_target_layers=%d markov_rank=%d confidence_dim=%d mask_tok=%d dspark=%d head_hc=%d\n",
-        path.c_str(), w.n_layer, w.n_embd, w.n_vocab, out.block_size,
+        "[ds4-dspark] loaded %s: arch=%s n_layer=%d n_embd=%d vocab=%d block_size=%d "
+        "experts=%d/%d n_target_layers=%d markov_rank=%d confidence_dim=%d mask_tok=%d "
+        "dspark=%d head_hc=%d\n",
+        path.c_str(), arch.c_str(), w.n_layer, w.n_embd, w.n_vocab, out.block_size,
+        w.n_expert_used, w.n_expert,
         out.n_target_layers, out.markov_rank, out.confidence_dim, out.mask_token_id,
         (int)out.dspark_enabled, (int)out.head_hc_enabled);
     return true;
