@@ -17,6 +17,7 @@
 #include "common/peer_access.h"
 #include "common/platform_env.h"
 #include "common/sampler.h"
+#include "common/moe_hybrid_routing_stats.h"
 
 #if defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP)
 #include "common/gpu_runtime_compat.h"
@@ -1299,6 +1300,7 @@ bool DeepSeek4Backend::validate_model_features() const {
     } else if (!cfg_.mmproj_path.empty()) {
         unsupported = "--mmproj";
     }
+
     if (unsupported) {
         std::fprintf(stderr, "[deepseek4] %s is not implemented for %s (see server/docs/DS41.md)\n",
                      unsupported, w_.arch.c_str());
@@ -1309,6 +1311,91 @@ bool DeepSeek4Backend::validate_model_features() const {
                      "and compressed attention is dense (see server/docs/DS41.md)\n", w_.arch.c_str());
     }
     return true;
+}
+
+// ─── Routing adjustments and explicit expert ownership ─────────────────
+
+// Replaces the uniform hot set with the explicit three-tier ownership of
+// --ds4-expert-placement, fitted to the primary budget (what the uniform
+// placement spends) and the secondary device.
+bool DeepSeek4Backend::apply_expert_ownership(bool secondary_owner, MoeHybridConfig & hybrid_cfg) {
+    if (cfg_.expert_placement_path.empty()) return true;
+
+    std::vector<uint64_t> expert_bytes((size_t) w_.n_layer);
+    for (int il = 0; il < w_.n_layer; ++il) {
+        const DeepSeek4Layer & L = w_.layers[(size_t) il];
+        expert_bytes[(size_t) il] = (ggml_nbytes(L.ffn_gate_exps) + ggml_nbytes(L.ffn_up_exps) +
+                                     ggml_nbytes(L.ffn_down_exps)) / (uint64_t) w_.n_expert;
+    }
+    uint64_t primary_budget = 0;
+    for (int il = 0; il < w_.n_layer; ++il) {
+        primary_budget += expert_bytes[(size_t) il] * (uint64_t) moe_placement_.hot_counts[(size_t) il];
+    }
+    uint64_t secondary_budget = 0;
+    if (secondary_owner) {
+        if (const char * mb = std::getenv("LUCE_EXPERT_SECONDARY_BUDGET_MB")) {
+            secondary_budget = (uint64_t) std::strtoull(mb, nullptr, 10) * 1024ULL * 1024ULL;
+        } else {
+            size_t free_bytes = 0, total_bytes = 0;
+            ggml_backend_dev_memory(ggml_backend_get_device(expert_backend_), &free_bytes, &total_bytes);
+            constexpr uint64_t reserve = 4ULL << 30;   // compute buffers on the secondary
+            secondary_budget = free_bytes > reserve ? free_bytes - reserve : 0;
+        }
+    }
+
+    MoeExpertOwnership own;
+    std::string err;
+    if (!MoeExpertOwnership::load_json(cfg_.expert_placement_path, w_.n_layer, w_.n_expert, own, &err)) {
+        std::fprintf(stderr, "[deepseek4] %s\n", err.c_str());
+        return false;
+    }
+    MoeHybridRoutingStats usage;
+    const char * usage_path = std::getenv("LUCE_DS4_HOTNESS_CSV");
+    const bool have_usage = usage_path && *usage_path && MoeHybridRoutingStats::load_csv(usage_path, usage, &err);
+    if (!own.fit_budgets(expert_bytes, primary_budget, secondary_budget, have_usage ? &usage : nullptr, &err)) {
+        std::fprintf(stderr, "[deepseek4] expert ownership: %s\n", err.c_str());
+        return false;
+    }
+
+    moe_placement_.hot_expert_ids = own.expert_ids(MoeExpertOwnership::Primary);
+    moe_placement_.total_hot = 0;
+    for (int il = 0; il < w_.n_layer; ++il) {
+        moe_placement_.hot_counts[(size_t) il] = (int) moe_placement_.hot_expert_ids[(size_t) il].size();
+        moe_placement_.total_hot += moe_placement_.hot_counts[(size_t) il];
+    }
+    moe_decode_placement_ = {};
+    if (secondary_owner) hybrid_cfg.cold_expert_ids = own.expert_ids(MoeExpertOwnership::Secondary);
+
+    using O = MoeExpertOwnership;
+    std::fprintf(stderr,
+                 "[deepseek4] expert ownership: primary %d experts %.2f GiB (budget %.2f GiB), "
+                 "secondary %d experts %.2f GiB (budget %.2f GiB), streamed %d experts %.2f GiB\n",
+                 own.count(O::Primary), gib(own.bytes(O::Primary, expert_bytes)), gib(primary_budget),
+                 own.count(O::Secondary), gib(own.bytes(O::Secondary, expert_bytes)), gib(secondary_budget),
+                 own.count(O::Stream), gib(own.bytes(O::Stream, expert_bytes)));
+    std::fprintf(stderr, "[deepseek4] expert ownership from %s; demotions ranked by %s\n",
+                 cfg_.expert_placement_path.c_str(), have_usage ? usage_path : "layer balance");
+    return true;
+}
+
+// One line per phase of a request: where its routed expert calls went and
+// what the streamed ones cost (mmap read incl. SSD faults, upload, compute).
+void DeepSeek4Backend::log_route_counts(const char * phase) {
+    if (!moe_hybrid_) return;
+    MoeHybridStorage::RouteCounts & c = moe_hybrid_->route_counts;
+    const double total = (double) std::max<uint64_t>(1, c.total());
+    const MoeHybridStreamEngine::Stats & st = stream_engine_.stats();
+    if (c.total() > 0) {
+        std::fprintf(stderr, "[deepseek4] %s routed calls: %" PRIu64 " primary %.1f%%, secondary %.1f%%, "
+                     "streamed %.1f%%; streamed %" PRIu64 " experts %.2f GiB: read %.0f ms, upload %.0f ms, "
+                     "compute %.0f ms\n",
+                     phase, c.total(), 100.0 * (double) c.primary / total,
+                     100.0 * (double) c.secondary / total, 100.0 * (double) c.streamed / total,
+                     st.experts, gib(st.bytes), st.read_us / 1000.0, st.upload_us / 1000.0,
+                     st.compute_us / 1000.0);
+    }
+    c = {};
+    stream_engine_.reset_stats();
 }
 
 bool DeepSeek4Backend::validate_prefill_mode() const {
@@ -1843,6 +1930,10 @@ bool DeepSeek4Backend::init_moe_tensor_parallel() {
         const PlacementBackend local_kind =
             cfg_.device.backend == PlacementBackend::Auto
                 ? compiled_placement_backend() : cfg_.device.backend;
+        int secondary_experts = 0;
+        for (const MoeHybridLayerStorage & layer : moe_hybrid_->layers) {
+            secondary_experts += (int) layer.cold_expert_ids.size();
+        }
         std::fprintf(stderr,
                      "[deepseek4-moe-tp] enabled mode=in-process local=%s:%d "
                      "secondary=%s:%d primary_experts=%d "
@@ -1851,7 +1942,7 @@ bool DeepSeek4Backend::init_moe_tensor_parallel() {
                      placement_backend_name(tp.secondary_backend),
                      tp.secondary_gpu,
                      moe_placement_.total_hot,
-                     w_.n_layer * w_.n_expert - moe_placement_.total_hot);
+                     secondary_experts);
         return true;
     }
 
@@ -2278,6 +2369,7 @@ bool DeepSeek4Backend::init_hybrid_model() {
         hybrid_cfg.materialize_cold_experts = true;
         hybrid_cfg.cold_expert_backend = MoeHybridColdBackend::Gpu;
     }
+    if (!apply_expert_ownership(inprocess_tp, hybrid_cfg)) return fail_hybrid_init();
     if (vision_) {
 #if defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP)
         hipDeviceProp_t primary_properties{}, cold_properties{};
@@ -2438,17 +2530,22 @@ bool DeepSeek4Backend::init_hybrid_model() {
                      "[deepseek4] cold-expert stream engine ready: pinned=%.1f MiB scratch=%.1f MiB\n",
                      stream_engine_.pinned_bytes() / 1024.0 / 1024.0,
                      stream_engine_.scratch_bytes() / 1024.0 / 1024.0);
+        hybrid->stream_engine = &stream_engine_;
     }
 
     moe_hybrid_ = std::move(hybrid);
     w_.moe_hybrid = true;
-    const int total_cold = w_.n_layer * w_.n_expert - moe_placement_.total_hot;
+    int total_cold = 0, total_streamed = 0;
+    for (const MoeHybridLayerStorage & layer : moe_hybrid_->layers) {
+        total_streamed += layer.n_streamed;
+        if (layer.down_cold || layer.gate_up_cold) total_cold += (int) layer.cold_expert_ids.size();
+    }
     const char * cold_backend =
         moe_hybrid_->cold_backend_kind == MoeHybridColdBackend::Gpu  ? "gpu"
         : moe_hybrid_->cold_backend_kind == MoeHybridColdBackend::None ? "none"
                                                                        : "cpu";
-    std::fprintf(stderr, "[deepseek4] hybrid experts ready: hot=%d cold=%d cold_backend=%s%s\n",
-                 moe_placement_.total_hot, total_cold, cold_backend, "");
+    std::fprintf(stderr, "[deepseek4] hybrid experts ready: hot=%d cold=%d streamed=%d cold_backend=%s\n",
+                 moe_placement_.total_hot, total_cold, total_streamed, cold_backend);
     return true;
 }
 
@@ -3058,6 +3155,7 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
     if (n_total > DS4_CONSERVATIVE_VERIFY_MAX_TOKENS) {
         deepseek4_release_prefill_scratch(cache_, moe_hybrid_.get());
     }
+    log_route_counts("prefill");
     return pos;
 }
 
@@ -3200,6 +3298,7 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
     if (timing) {
         log_deepseek4_step_telemetry("decode", (int)out_tokens.size(), steps, elapsed_s(phase_t0), tel_acc);
     }
+    log_route_counts("decode");
     return true;
 }
 

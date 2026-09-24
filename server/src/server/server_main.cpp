@@ -119,6 +119,10 @@ static void print_usage(const char * prog) {
         "  --ds4-expert-top-k <N>\n"
         "                       Keep and renormalize the highest-ranked N routed experts\n"
         "                       (0=model default; single-device DeepSeek4 only)\n"
+        "  --ds4-expert-placement <FILE>\n"
+        "                       Per-expert owner: primary GPU, secondary GPU or streamed\n"
+        "                       from the model file (JSON, see docs/DS41.md)\n"
+
         "  --ds4-prefill <mode> DeepSeek4 prefill: exact, dense, or sparse\n"
         "                       (default: exact; dense/sparse are experimental\n"
         "                       and may change generated tokens)\n"
@@ -461,6 +465,8 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
                 std::fprintf(stderr, "[server] --ds4-expert-top-k must be non-negative\n");
                 return 2;
             }
+        } else if (std::strcmp(argv[i], "--ds4-expert-placement") == 0 && i + 1 < argc) {
+            bargs.ds4_expert_placement = argv[++i];
         } else if (std::strcmp(argv[i], "--ds4-prefill") == 0 && i + 1 < argc) {
             const char * mode = argv[++i];
             bargs.ds4_prefill_mode_set = true;

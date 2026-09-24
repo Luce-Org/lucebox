@@ -170,6 +170,7 @@ BackendPreparation BackendPlanBuilder::resolve(
     plan.execution_.fused_decode = args.ds4_fused_decode;
     plan.execution_.fused_verify_f16_kv =
         args.ds4_fused_verify_f16_kv;
+    plan.execution_.expert_placement = args.ds4_expert_placement;
 
     plan.warnings_ = std::move(warnings);
     return plan;

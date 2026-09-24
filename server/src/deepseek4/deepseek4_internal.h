@@ -323,6 +323,7 @@ struct DeepSeek4Weights {
     // Runtime serving policy. These values are set by the backend after the
     // GGUF is loaded; they are not model metadata.
     int  routed_expert_top_k = 0;  // 0 = model default (n_expert_used)
+
     bool fused_decode        = false;
     bool fused_verify_f16_kv = false;
 };
@@ -480,6 +481,7 @@ struct DeepSeek4BackendConfig {
     bool         paged_attention = false;
     int          max_concurrency = 1;
     long long    kv_pool_tokens = 0;
+    std::string  expert_placement_path;   // three-tier expert ownership (JSON)
 };
 
 // ─── Function declarations ──────────────────────────────────────────────

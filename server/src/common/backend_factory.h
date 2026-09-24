@@ -86,6 +86,7 @@ public:
         int expert_top_k = 0;
         bool fused_decode = false;
         bool fused_verify_f16_kv = false;
+        std::string expert_placement;
     };
 
     BackendPlan(BackendPlan &&) noexcept = default;

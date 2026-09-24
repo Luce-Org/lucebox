@@ -197,6 +197,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `LUCE_DYN_CONV_FUSED` - draft_graph.cpp (=0 expands the DFlash2 dynamic convs instead of the fused kernel)
 - `LUCE_EXPERT_BUDGET_MB` - deepseek4_backend.cpp, laguna_backend.cpp, qwen35moe_backend.cpp
 - `LUCE_EXPERT_BUDGET_PCT` - laguna_backend.cpp
+- `LUCE_EXPERT_SECONDARY_BUDGET_MB` - deepseek4_backend.cpp (secondary-device byte budget for `--ds4-expert-placement`; default: free memory minus 4 GiB)
 - `LUCE_FAST_ROLLBACK_THRESHOLD` - chain_rollback_policy.h
 - `LUCE_FEATURE_DTYPE` - dflash_feature_ring.cpp
 - `LUCE_KV_ROTATE` - qwen35_target_graph.cpp (set to 1 to force FWHT K rotation on; off by default for f16/q8_0 caches, on for narrower types)

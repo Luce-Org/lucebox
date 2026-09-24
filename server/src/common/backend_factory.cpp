@@ -381,6 +381,7 @@ std::unique_ptr<ModelBackend> construct_backend(
             cfg.expert_top_k = execution.expert_top_k;
             cfg.fused_decode = execution.fused_decode;
             cfg.fused_verify_f16_kv = execution.fused_verify_f16_kv;
+            cfg.expert_placement_path = execution.expert_placement;
             cfg.prefill_mode = execution.prefill_mode;
             cfg.paged_attention = cache.paged_attention;
             cfg.max_concurrency = execution.max_concurrency;

@@ -4022,12 +4022,57 @@ static ggml_tensor * build_shared_ffn(
     return ggml_mul_mat(ctx, L.ffn_down_shexp, mid_sh);
 }
 
+// Adds the routed experts that neither stack owns (an explicit ownership
+// leaves them to the model file) to the owners' output. They are streamed
+// through the same engine as a non-materialized cold stack.
+static bool eval_ds4_streamed_experts(
+        ggml_backend_t backend,
+        const MoeHybridConfig & hybrid_cfg,
+        const MoeLayerDesc & desc,
+        const MoeHybridStorage * hybrid_owner,
+        const MoeHybridLayerStorage & storage,
+        MoeHybridStreamEngine * stream_engine,
+        bool streaming_ready,
+        int layer,
+        int n_embd,
+        int n_expert_used,
+        const float * ffn_normed_host,
+        const int32_t * selected_host,
+        const float * weights_host,
+        int n_tokens,
+        const MoeHybridDeviceOutputs * device_outputs,
+        std::vector<float> & ffn_out_host) {
+    const size_t n_routes = (size_t) n_tokens * (size_t) n_expert_used;
+    bool any = false;
+    for (size_t i = 0; i < n_routes && !any; ++i) any = storage.is_streamed(selected_host[i]);
+    if (!any) return true;
+    if (!streaming_ready || !ffn_normed_host || device_outputs ||
+        ffn_out_host.size() != (size_t) n_embd * (size_t) n_tokens) {
+        std::fprintf(stderr,
+                     "[deepseek4] layer %d routes to streamed experts, which need the host "
+                     "activations and the stream engine\n", layer);
+        return false;
+    }
+    std::vector<float> streamed_out;
+    std::string err;
+    if (!eval_moe_cold_experts_streaming(
+            *stream_engine, backend, hybrid_owner->mmap_data, hybrid_owner->mmap_size,
+            hybrid_cfg, desc, hybrid_owner->layer_regions[(size_t) layer], storage,
+            ffn_normed_host, selected_host, weights_host, n_tokens, streamed_out, &err)) {
+        std::fprintf(stderr, "[deepseek4] layer %d streamed expert eval failed: %s\n",
+                     layer, err.c_str());
+        return false;
+    }
+    for (size_t i = 0; i < ffn_out_host.size(); ++i) ffn_out_host[i] += streamed_out[i];
+    return true;
+}
+
 static bool eval_ds4_hybrid(
         ggml_backend_t backend,
         ggml_backend_t cpu_backend,
         const MoeHybridConfig & hybrid_cfg,
         const MoeLayerDesc & desc,
-        const MoeHybridStorage * hybrid_owner,
+        MoeHybridStorage * hybrid_owner,
         MoeHybridLayerStorage & storage,
         MoeHybridStreamEngine * stream_engine,
         int layer,
@@ -4046,12 +4091,17 @@ static bool eval_ds4_hybrid(
         ggml_tensor * ffn_normed_backend = nullptr,
         const MoeHybridDeviceOutputs * device_outputs = nullptr) {
     const auto ffn_t0 = Ds4TimingClock::now();
+    if (hybrid_owner) {
+        hybrid_owner->count_routes(layer, selected_host, (size_t) n_tokens * (size_t) n_expert_used);
+    }
+    if (!stream_engine && hybrid_owner) stream_engine = hybrid_owner->stream_engine;
+    const bool streaming_ready =
+        hybrid_owner && stream_engine && stream_engine->is_ready() && hybrid_owner->has_mmap() &&
+        layer >= 0 && layer < (int) hybrid_owner->layer_regions.size();
     if (!storage.cold_expert_ids.empty() &&
         !storage.down_cold && !storage.gate_up_cold &&
         !(expert_compute && expert_layer)) {
-        if (!hybrid_owner || !stream_engine || !stream_engine->is_ready() ||
-            !hybrid_owner->has_mmap() ||
-            layer < 0 || layer >= (int) hybrid_owner->layer_regions.size()) {
+        if (!streaming_ready) {
             std::fprintf(stderr,
                          "[deepseek4] layer %d requires cold-expert streaming but it is unavailable\n",
                          layer);
@@ -4138,6 +4188,13 @@ static bool eval_ds4_hybrid(
         expert_compute, expert_layer,
         step_tel ? &ffn_tel : nullptr,
         ffn_normed_backend, device_outputs);
+    if (ffn_ok && storage.n_streamed > 0 &&
+        !eval_ds4_streamed_experts(backend, hybrid_cfg, desc, hybrid_owner, storage, stream_engine,
+                                   streaming_ready, layer, n_embd, n_expert_used, ffn_normed_host,
+                                   selected_host, weights_host, n_tokens, device_outputs,
+                                   ffn_out_host)) {
+        return false;
+    }
     if (ffn_ok) {
         if (step_tel) {
             step_tel->ffn_eval_us += ds4_elapsed_us(ffn_t0, Ds4TimingClock::now());
@@ -6776,7 +6833,7 @@ static bool eval_ds4_layer_range_hybrid_ffn(
         !device_input_env || !*device_input_env ||
         std::strcmp(device_input_env, "0") != 0;
     const bool device_ffn_input =
-        device_input_enabled &&
+        device_input_enabled && layer_storage.n_streamed == 0 &&
         !expert_compute && moe_expert_major_prefill_enabled(n_tokens) &&
         layer_storage.cold_backend_kind == MoeHybridColdBackend::Gpu &&
         layer_storage.cold_backend && layer_storage.cold_backend != backend &&
@@ -6978,6 +7035,7 @@ static bool eval_ds4_layer_range_hybrid_ffn(
                 }
             }
         }
+
 
         float sum = 0.0f;
         for (int slot = 0; slot < route_width; ++slot) {
