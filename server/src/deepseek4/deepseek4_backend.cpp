@@ -1228,17 +1228,20 @@ bool DeepSeek4Backend::begin_staged_prefill(StagedPrefill & item) {
     return true;
 }
 
-int DeepSeek4Backend::run_staged_pass(const std::vector<StagedPrefill *> & items, int row_budget) {
+bool DeepSeek4Backend::begin_staged_pass(const std::vector<StagedPrefill *> & items, int row_budget,
+                                         DeepSeek4PrefillPass & pass, std::vector<int> & rows) {
     // One pass takes the next chunk of every ready, unfinished request while
     // the budget lasts: whole image blocks only (a block may exceed the
     // budget), never a chunk or a tail below the layer-major minimum, and only
     // rows whose images the encoder has already published.
     constexpr int min_rows = DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS;
-    std::vector<DeepSeek4PrefillSeq> pass;
-    std::vector<StagedPrefill *> members;
+    rows.assign(items.size(), 0);
+    std::vector<DeepSeek4PrefillSeq> seqs;
+    std::vector<size_t> members;
     std::vector<std::vector<float>> embeds;
     int budget = row_budget;
-    for (StagedPrefill * item : items) {
+    for (size_t k = 0; k < items.size(); ++k) {
+        StagedPrefill * item = items[k];
         if (item->finished() || budget < min_rows) continue;
         const auto * images = static_cast<const DeepSeek4ImagePrompt *>(item->images.get());
         if (images->stream_failed()) {
@@ -1265,25 +1268,18 @@ int DeepSeek4Backend::run_staged_pass(const std::vector<StagedPrefill *> & items
         seq.n_tokens = n;
         seq.kv_start = item->done;
         seq.image_spans = images->spans();
-        pass.push_back(seq);
-        members.push_back(item);
+        seqs.push_back(seq);
+        members.push_back(k);
         budget -= n;
     }
-    if (pass.empty()) return 0;
-    const auto t0 = Clock::now();
+    if (seqs.empty()) return false;
     std::string error;
-    if (!deepseek4_prefill_multi(backend_, cfg_.device.gpu, w_, pass, error)) {
-        for (StagedPrefill * m : members) m->error = error.empty() ? "staged prefill failed" : error;
-        return 0;
+    if (!pass.begin(backend_, cfg_.device.gpu, w_, seqs, error)) {
+        for (size_t k : members) items[k]->error = error.empty() ? "staged prefill failed" : error;
+        return false;
     }
-    int rows = 0;
-    for (size_t k = 0; k < members.size(); ++k) {
-        members[k]->done += pass[k].n_tokens;
-        rows += pass[k].n_tokens;
-    }
-    std::fprintf(stderr, "[deepseek4] staged prefill pass: %zu requests, %d rows, %.0f ms\n",
-                 members.size(), rows, elapsed_s(t0) * 1000.0);
-    return rows;
+    for (size_t m = 0; m < members.size(); ++m) rows[members[m]] = seqs[m].n_tokens;
+    return true;
 }
 
 void DeepSeek4Backend::wait_staged_ready(const StagedPrefill & item, int row_budget,

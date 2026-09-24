@@ -107,6 +107,15 @@ SeqEngine::AdmitResult DeepSeek4SeqEngine::admit_images(
     // retries it, and encoding first would rerun the encoder on every retry.
     AdmitResult result = admit(request_id, prompt, sampler);
     if (result.status != AdmitResult::Status::admitted) return result;
+    if (staging_in_flight(result.slot)) {
+        // The slot's staging cache still belongs to a pass in flight (its
+        // previous request retired mid-pass): retry after the pass.
+        retire(result.slot);
+        result.status = AdmitResult::Status::busy;
+        result.slot = -1;
+        result.error = "image staging cache is still in use";
+        return result;
+    }
     PendingImage pending;
     pending.slot = result.slot;
     pending.staged.images = images;
@@ -142,20 +151,66 @@ DeepSeek4SeqEngine::PendingImage * DeepSeek4SeqEngine::pending_image(int slot) {
     return nullptr;
 }
 
-void DeepSeek4SeqEngine::advance_pending_images(bool decoding, bool idle) {
-    std::vector<DeepSeek4StagedPrefill *> items;
-    for (auto & pending : pending_images_) {
-        if (!pending.staged.finished()) items.push_back(&pending.staged);
+bool DeepSeek4SeqEngine::staging_in_flight(int slot) const {
+    if (!staged_pass_) return false;
+    for (const auto & member : staged_pass_->members) {
+        if (member.slot == slot) return true;
     }
-    if (items.empty()) return;
-    // Bounded work per step keeps every live stream decoding while images
-    // prefill; a whole image block may exceed the budget.
-    const int budget = decoding ? DS4_STAGED_PREFILL_ROWS_PER_STEP
-                                : DS4_STAGED_PREFILL_ROWS_WITHOUT_DECODE;
-    const int rows = b_.run_staged_pass(items, budget);
-    // Nothing ready and nothing else to run: wait briefly for the encoder
-    // instead of spinning the scheduler.
-    if (rows == 0 && idle) b_.wait_staged_ready(*items.front(), budget, 20);
+    return false;
+}
+
+void DeepSeek4SeqEngine::advance_pending_images(bool decoding, bool idle) {
+    if (!staged_pass_) {
+        std::vector<DeepSeek4StagedPrefill *> items;
+        std::vector<int> slots;
+        for (auto & pending : pending_images_) {
+            if (pending.staged.finished()) continue;
+            items.push_back(&pending.staged);
+            slots.push_back(pending.slot);
+        }
+        if (items.empty()) return;
+        auto staged = std::make_unique<StagedPass>();
+        std::vector<int> rows;
+        if (b_.begin_staged_pass(items, decoding ? DS4_STAGED_PREFILL_ROWS_PER_STEP
+                                                 : DS4_STAGED_PREFILL_ROWS_WITHOUT_DECODE,
+                                 staged->pass, rows)) {
+            for (size_t k = 0; k < items.size(); ++k) {
+                if (rows[k] > 0) staged->members.push_back({slots[k], items[k]->images, rows[k]});
+            }
+            staged->started = std::chrono::steady_clock::now();
+            staged_pass_ = std::move(staged);
+        } else if (idle) {
+            // Nothing ready and nothing else to run: wait briefly for the
+            // encoder instead of spinning the scheduler.
+            b_.wait_staged_ready(*items.front(), DS4_STAGED_PREFILL_ROWS_PER_STEP, 20);
+        }
+    }
+    if (staged_pass_) {
+        // With live decoders, only a slice of the pass's layers: they then
+        // decode after each slice instead of waiting for the whole pass.
+        StagedPass & staged = *staged_pass_;
+        std::string error;
+        const bool ok = staged.pass.run_layers(
+            decoding ? DS4_STAGED_PREFILL_LAYERS_PER_STEP : b_.w_.n_layer, error);
+        ++staged.slices;
+        if (!ok || staged.pass.done()) {
+            int rows = 0;
+            for (const auto & member : staged.members) {
+                rows += member.rows;
+                PendingImage * pending = pending_image(member.slot);
+                // A member that retired (or whose slot now holds another
+                // request) is skipped.
+                if (!pending || pending->staged.images != member.images) continue;
+                if (ok) pending->staged.done += member.rows;
+                else pending->staged.error = error.empty() ? "staged prefill failed" : error;
+            }
+            std::fprintf(stderr, "[deepseek4] staged prefill pass: %zu requests, %d rows, %d slices, %.0f ms\n",
+                         staged.members.size(), rows, staged.slices,
+                         std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now() - staged.started).count());
+            staged_pass_.reset();
+        }
+    }
     for (auto & pending : pending_images_) {
         DeepSeek4StagedPrefill & staged = pending.staged;
         if (!staged.error.empty() || staged.done < staged.prefix || !staged.staging) continue;

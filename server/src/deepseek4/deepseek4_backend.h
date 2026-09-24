@@ -227,9 +227,9 @@ private:
     // Stops the encoder worker (failing queued requests), then frees vision_.
     void release_vision();
     // Batched serving. A staged prefill fills one request's first `prefix`
-    // tokens into its slot's staging cache over several steps;
-    // run_staged_pass advances every ready request by one shared layer-major
-    // pass (expert weights read once per pass for all of them).
+    // tokens into its slot's staging cache over several steps, in shared
+    // layer-major passes (expert weights read once per pass for all of them)
+    // that the engine advances a few layers per step.
     using StagedPrefill = DeepSeek4StagedPrefill;
     DeepSeek4Cache * image_staging_cache(int slot);
     // Starts encoding an admitted image request: queued on the encoder
@@ -237,9 +237,11 @@ private:
     bool encode_image_request(const std::vector<int32_t> & prompt, const ImagePromptHandle & images,
                               std::string & error);
     bool begin_staged_prefill(StagedPrefill & item);
-    // One shared pass over the ready, unfinished items, about `row_budget`
-    // rows in total (a whole image block may exceed it). Returns rows run.
-    int run_staged_pass(const std::vector<StagedPrefill *> & items, int row_budget);
+    // Starts one shared pass over the ready, unfinished items, about
+    // `row_budget` rows in total (a whole image block may exceed it); `rows`
+    // gets each item's share. False when no item is ready (or all failed).
+    bool begin_staged_pass(const std::vector<StagedPrefill *> & items, int row_budget,
+                           DeepSeek4PrefillPass & pass, std::vector<int> & rows);
     // Waits up to `timeout_ms` for the next rows of an item to have their
     // images encoded, so an otherwise idle scheduler does not spin.
     void wait_staged_ready(const StagedPrefill & item, int row_budget, int timeout_ms) const;

@@ -3,7 +3,9 @@
 #include "common/concurrency/seq_engine.h"
 #include "common/concurrency/paged_kv_offload.h"
 #include "common/concurrency/seq_slot_manager.h"
+#include "deepseek4_internal.h"
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -12,7 +14,6 @@
 namespace luce::common {
 
 class DeepSeek4Backend;
-struct DeepSeek4Cache;
 
 // A batched image request's prompt prefix, prefilled into its slot's staging
 // cache over several steps before it is copied into the paged slot.
@@ -72,6 +73,22 @@ private:
         DeepSeek4StagedPrefill staged;
     };
     std::vector<PendingImage> pending_images_;
+    // The shared pass in flight: it runs a few layers per step and cannot be
+    // abandoned half-way, so members that retire meanwhile are just skipped
+    // when it completes, and their slots' staging caches stay busy until then.
+    struct StagedPass {
+        struct Member {
+            int slot = -1;
+            ImagePromptHandle images;  // also identifies the request
+            int rows = 0;
+        };
+        DeepSeek4PrefillPass pass;
+        std::vector<Member> members;
+        int slices = 0;
+        std::chrono::steady_clock::time_point started;
+    };
+    std::unique_ptr<StagedPass> staged_pass_;
+    bool staging_in_flight(int slot) const;
     PendingImage * pending_image(int slot);
     void advance_pending_images(bool decoding, bool idle);
 
