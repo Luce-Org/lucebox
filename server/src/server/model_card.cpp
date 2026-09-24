@@ -1,6 +1,7 @@
 // Model card resolution. See model_card.h and docs/specs/thinking-budget.md §3.
 
 #include "model_card.h"
+#include "common/model_capabilities.h"
 
 #include <nlohmann/json.hpp>
 
@@ -308,7 +309,7 @@ static bool family_fallback(const std::string & arch, ModelCard & out) {
         out.source_label = "family:laguna";
         return true;
     }
-    if (arch == "deepseek4") {
+    if (arch_is_deepseek4_family(arch)) {
         // There was no entry here, so every DeepSeek4 artifact — including the
         // published ROCmFPX GGUFs — fell through to the §3.4 hard fallback. That
         // clamped replies hard enough to truncate ~35% of HumanEval completions

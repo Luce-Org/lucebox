@@ -967,7 +967,7 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     const BackendPlan::Execution & backend_execution =
         backend_plan.execution();
     const std::string & arch = backend_plan.arch();
-    if (multi_model && !backend_cache.paged_attention && arch != "deepseek4" && arch != "qwen35") {
+    if (multi_model && !backend_cache.paged_attention && !arch_is_deepseek4_family(arch) && arch != "qwen35") {
         std::fprintf(stderr,
             "[server] model '%s': single-request routing currently supports Qwen and DeepSeek4; "
             "use --max-concurrency for a supported batched model\n", sconfig.model_name.c_str());
@@ -1062,7 +1062,7 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     if (arch == "qwen35" && !backend_placement.target.is_multi_device()) {
         cache_type_k = luce::kv_type_name(backend_cache.cache_type_k);
         cache_type_v = luce::kv_type_name(backend_cache.cache_type_v);
-    } else if (arch == "deepseek4") {
+    } else if (arch_is_deepseek4_family(arch)) {
         if (!cache_type_k.empty() || !cache_type_v.empty()) {
             std::fprintf(stderr, "[server] model '%s': --cache-type-k/v are ignored by DeepSeek4's fixed cache layout\n", sconfig.model_name.c_str());
         }
@@ -1430,7 +1430,7 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     std::fprintf(stderr, "[server] │  chunk           = %d\n", backend_execution.chunk);
     std::fprintf(stderr, "[server] │  admission_wait  = %d ms\n",
                  sconfig.admission_coalesce_ms);
-    if (arch == "deepseek4") {
+    if (arch_is_deepseek4_family(arch)) {
         std::fprintf(stderr, "[server] │  ds4_fused      = %s\n",
                      backend_execution.fused_decode ? "ON" : "off");
         std::fprintf(stderr, "[server] │  ds4_verify_f16kv= %s\n",

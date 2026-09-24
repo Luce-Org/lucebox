@@ -218,6 +218,7 @@ private:
     bool init_hybrid_model();
     bool requires_monolithic_model() const;
     bool validate_prefill_mode() const;
+    bool validate_model_features() const;
     bool init_moe_tensor_parallel();
     bool compute_uniform_hybrid_placement(const DeepSeek4Weights & w,
                                           int max_ctx,

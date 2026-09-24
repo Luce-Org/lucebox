@@ -21,6 +21,7 @@
 #include "engine/luce_engine.h"
 #include "admission.h"
 #include "common/concurrency/seq_engine.h"
+#include "common/model_capabilities.h"
 #include "response_error.h"
 #include "sse_emitter.h"
 #include "prompt_normalize.h"
@@ -739,10 +740,10 @@ json build_props_body(const ServerConfig & config,
                       const ToolMemory & tool_memory) {
     // arch-gated capabilities (mirrors Python _capabilities()).
     const bool is_qwen = (config.arch.rfind("qwen", 0) == 0);
-    const bool is_deepseek4 = (config.arch == "deepseek4");
+    const bool is_deepseek4 = (arch_is_deepseek4_family(config.arch));
     const bool reasoning_supported = is_qwen || is_deepseek4;
     const bool speculative_supported = is_qwen;
-    const bool tools_supported = is_qwen || config.arch == "deepseek4";
+    const bool tools_supported = is_qwen || arch_is_deepseek4_family(config.arch);
 
     auto pcs  = prefix_cache.stats();
     auto pcfs = prefix_cache.full_stats();
@@ -2148,11 +2149,11 @@ void apply_request_reasoning(
             normalized_effort = "low";
         } else if (effort == "medium") {
             tier_value = config.effort_tiers.medium;
-            normalized_effort = config.arch == "deepseek4" ? "high" : "medium";
+            normalized_effort = arch_is_deepseek4_family(config.arch) ? "high" : "medium";
         } else if (effort == "xhigh") {
             // DeepSeek V4 Flash's OpenAI-compatible APIs map xhigh to high.
             // Other architectures retain Lucebox's x-high tier alias.
-            if (config.arch == "deepseek4") {
+            if (arch_is_deepseek4_family(config.arch)) {
                 tier_value = config.effort_tiers.high;
                 normalized_effort = "high";
             } else {
@@ -2162,7 +2163,7 @@ void apply_request_reasoning(
         } else if (effort == "x-high") {
             // Hyphenated x-high is Lucebox's explicit five-tier extension.
             tier_value = config.effort_tiers.x_high;
-            normalized_effort = config.arch == "deepseek4" ? "max" : "x-high";
+            normalized_effort = arch_is_deepseek4_family(config.arch) ? "max" : "x-high";
         } else if (effort == "max") {
             tier_value = config.effort_tiers.max;
             normalized_effort = "max";
@@ -2223,7 +2224,7 @@ void apply_request_reasoning(
     // DeepSeek uses high whenever thinking is enabled without an explicit
     // model-facing effort. Only API-style thinking.type="enabled" also selects
     // the high budget tier; bare template toggles affect rendering alone.
-    if (enable_thinking && config.arch == "deepseek4" &&
+    if (enable_thinking && arch_is_deepseek4_family(config.arch) &&
         normalized_effort.empty()) {
         normalized_effort = "high";
         if (req.thinking_opt_in) {

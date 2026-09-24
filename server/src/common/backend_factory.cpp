@@ -101,6 +101,7 @@ LUCE_CHECK_ARCH("laguna",    LagunaBackendArgs,     LagunaLayerSplitAdapterConfi
 LUCE_CHECK_ARCH("qwen3",     Qwen3BackendConfig,    NoLayerSplitConfig);
 LUCE_CHECK_ARCH("gemma4",    Gemma4BackendConfig,   Gemma4LayerSplitAdapterConfig);
 LUCE_CHECK_ARCH("deepseek4", DeepSeek4BackendConfig, DeepSeek4LayerSplitAdapterConfig);
+LUCE_CHECK_ARCH("deepseek41", DeepSeek4BackendConfig, DeepSeek4LayerSplitAdapterConfig);
 
 // These sit outside the bundle because the field-presence trait cannot
 // separate qwen35 from qwen35moe: they share Qwen35Config, while the factory
@@ -109,6 +110,9 @@ LUCE_CHECK_ARCH("deepseek4", DeepSeek4BackendConfig, DeepSeek4LayerSplitAdapterC
 LUCE_CHECK_ARCH_OPTION("qwen35", Qwen35Config, Qwen35LayerSplitAdapterConfig,
                          has_paged_attention, paged_attn);
 LUCE_CHECK_ARCH_OPTION("deepseek4", DeepSeek4BackendConfig,
+                         DeepSeek4LayerSplitAdapterConfig,
+                         has_paged_attention, paged_attn);
+LUCE_CHECK_ARCH_OPTION("deepseek41", DeepSeek4BackendConfig,
                          DeepSeek4LayerSplitAdapterConfig,
                          has_paged_attention, paged_attn);
 LUCE_CHECK_ARCH_OPTION("qwen35", Qwen35Config, Qwen35LayerSplitAdapterConfig,
@@ -358,7 +362,7 @@ std::unique_ptr<ModelBackend> construct_backend(
         }
         return backend;
 
-    } else if (arch == "deepseek4") {
+    } else if (arch_is_deepseek4_family(arch)) {
         // Approximate prefill and the fused decode options are gated against
         // non-monolithic-HIP placement in check_feature_compatibility().
 

@@ -65,7 +65,7 @@ std::string check_feature_compatibility(
         !admission.pflash_drafter_configured) {
         return "--prefill-compression requires --prefill-drafter";
     }
-    if (admission.pflash_enabled && arch == "deepseek4" &&
+    if (admission.pflash_enabled && arch_is_deepseek4_family(arch) &&
         args.device.is_layer_split()) {
         return "--prefill-compression is not supported with DeepSeek4 layer splitting";
     }
@@ -244,7 +244,7 @@ std::string check_feature_compatibility(
         if (admission.fixed_kvflash_requested()) {
             return "--paged-attention cannot be combined with KVFlash";
         }
-        if (arch == "deepseek4") {
+        if (arch_is_deepseek4_family(arch)) {
             if (target_backend != PlacementBackend::Hip) {
                 return "DeepSeek4 paged attention requires a local HIP target";
             }
@@ -281,7 +281,7 @@ std::string check_feature_compatibility(
         }
         // Qwen's graph is qualified through 64 lanes. DeepSeek's gathered
         // whole-model graph has a smaller, separately qualified ceiling.
-        const int max_slots = arch == "deepseek4"
+        const int max_slots = arch_is_deepseek4_family(arch)
             ? DEEPSEEK4_MAX_PAGED_SEQUENCES : 64;
         if (args.max_concurrency > max_slots) {
             return "--max-concurrency must be at most " +
@@ -310,7 +310,7 @@ std::string check_feature_compatibility(
     }
 
     // ── --ds4-prefill × architecture
-    if (args.ds4_prefill_mode_set && arch != "deepseek4") {
+    if (args.ds4_prefill_mode_set && !arch_is_deepseek4_family(arch)) {
         return "--ds4-prefill is only valid for deepseek4 models (detected '" +
                arch + "')";
     }
@@ -320,17 +320,17 @@ std::string check_feature_compatibility(
     // by either monolithic backend, but the layer-split adapter does not yet
     // propagate it.
     const bool monolithic_ds4 =
-        arch == "deepseek4" &&
+        arch_is_deepseek4_family(arch) &&
         target_backend == PlacementBackend::Hip &&
         !args.device.is_layer_split() &&
         !args.remote_target_shard.enabled();
     const bool local_ds4 =
-        arch == "deepseek4" &&
+        arch_is_deepseek4_family(arch) &&
         !args.device.is_layer_split() &&
         !args.remote_target_shard.enabled();
 
     // ── approximate --ds4-prefill × placement
-    if (arch == "deepseek4" &&
+    if (arch_is_deepseek4_family(arch) &&
         prefill_attention_mode_is_approximate(args.ds4_prefill_mode) &&
         !monolithic_ds4) {
         return std::string("DS4 ") +

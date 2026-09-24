@@ -16,6 +16,7 @@
 #include "laguna_internal.h"
 #include "../deepseek4/deepseek4_internal.h"
 #include "moe_hybrid_types_impl.h"
+#include "model_capabilities.h"
 
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
@@ -723,7 +724,7 @@ bool load_remote_moe_runtime(const char * target_path,
             backend, placement, gctx, file_bytes, file_size,
             data_start, arch, weights, free_laguna_target_weights, out, err);
     }
-    if (arch == "deepseek4") {
+    if (arch_is_deepseek4_family(arch)) {
         DeepSeek4Weights weights;
         if (!load_deepseek4_gguf_partial(target_path, backend, plan, weights)) {
             if (err) *err = "failed to load DeepSeek4 expert metadata";

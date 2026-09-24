@@ -1281,6 +1281,36 @@ bool DeepSeek4Backend::requires_monolithic_model() const {
            prefill_attention_mode_is_approximate(cfg_.prefill_mode);
 }
 
+// DeepSeek V4.1 runs on the host hyper-connection paths (hybrid token step
+// and layer-range step) with dense attention over its shared compressed
+// caches. The paths below do not implement its cache sharing or staggered
+// pre-mix yet, so refuse them instead of silently producing wrong tokens.
+bool DeepSeek4Backend::validate_model_features() const {
+    if (!w_.hc_staggered_pre) return true;
+    const char * unsupported = nullptr;
+    if (cfg_.paged_attention) {
+        unsupported = "--paged-attention";
+    } else if (cfg_.fused_decode || env_flag_enabled("LUCE_DS4_FUSED_DECODE")) {
+        unsupported = "fused decode";
+    } else if (cfg_.fused_verify_f16_kv || env_flag_enabled("LUCE_DS4_SPEC")) {
+        unsupported = "DSpark speculative decoding";
+    } else if (cfg_.device.is_layer_split()) {
+        unsupported = "layer split";
+    } else if (!cfg_.mmproj_path.empty()) {
+        unsupported = "--mmproj";
+    }
+    if (unsupported) {
+        std::fprintf(stderr, "[deepseek4] %s is not implemented for %s (see server/docs/DS41.md)\n",
+                     unsupported, w_.arch.c_str());
+        return false;
+    }
+    if (w_.engram.present()) {
+        std::fprintf(stderr, "[deepseek4] %s: the Engram layers run without their n-gram memory "
+                     "and compressed attention is dense (see server/docs/DS41.md)\n", w_.arch.c_str());
+    }
+    return true;
+}
+
 bool DeepSeek4Backend::validate_prefill_mode() const {
     if (cfg_.prefill_mode == PrefillAttentionMode::Exact) {
         return true;
@@ -1674,7 +1704,7 @@ bool DeepSeek4Backend::init() {
     if (!load_model()) {
         return false;
     }
-    if (!validate_prefill_mode()) {
+    if (!validate_prefill_mode() || !validate_model_features()) {
         return false;
     }
     if (prefill_attention_mode_is_approximate(cfg_.prefill_mode)) {
