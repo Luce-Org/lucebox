@@ -7753,7 +7753,7 @@ bool deepseek4_prefill_multi(ggml_backend_t backend, int device,
         return fail_early("shared prefill needs a full model on one GPU");
     int total = 0;
     for (const auto & s : seqs) {
-        if (!s.cache || !s.embed || !s.token_ids || s.n_tokens < 5 || s.kv_start < 0 ||
+        if (!s.cache || !s.embed || !s.token_ids || s.n_tokens < DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS || s.kv_start < 0 ||
             s.cache->prefill_mode == PrefillAttentionMode::Exact ||
             s.kv_start + s.n_tokens > s.cache->max_ctx)
             return fail_early("invalid shared prefill sequence");

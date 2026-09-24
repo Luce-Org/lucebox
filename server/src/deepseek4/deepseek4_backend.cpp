@@ -1174,7 +1174,7 @@ void DeepSeek4Backend::prefill_staged(std::vector<StagedPrefill> & batch) {
     std::vector<Seq> seqs;
     for (auto & item : batch) {
         const auto * images = dynamic_cast<const DeepSeek4ImagePrompt *>(item.images.get());
-        if (!images || !item.prompt || !item.staging || item.prefix < 5 ||
+        if (!images || !item.prompt || !item.staging || item.prefix < DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS ||
             item.prefix > int(item.prompt->size()) || item.prefix > item.staging->max_ctx) {
             item.error = "invalid staged prefill request";
             continue;
@@ -1191,22 +1191,24 @@ void DeepSeek4Backend::prefill_staged(std::vector<StagedPrefill> & batch) {
     ggml_backend_synchronize(backend_);
     deepseek4_release_image_scratch(cache_, moe_hybrid_.get());
     const int budget_total = std::min(1024, DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS);
+    constexpr int min_rows = DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS;
     const auto t0 = Clock::now();
     int passes = 0, rows = 0;
     for (;;) {
         // One pass takes the next chunk of every unfinished request that fits:
-        // whole image blocks only, and never leave a tail shorter than 5 rows.
+        // whole image blocks only, and never a chunk or tail below the
+        // layer-major minimum.
         std::vector<DeepSeek4PrefillSeq> pass;
         std::vector<Seq *> members;
         int budget = budget_total;
         for (auto & s : seqs) {
             const int remaining = s.item->prefix - s.done;
-            if (remaining <= 0 || !s.item->error.empty() || budget < 5) continue;
+            if (remaining <= 0 || !s.item->error.empty() || budget < min_rows) continue;
             int n = std::min(remaining, budget);
-            if (remaining - n > 0 && remaining - n < 5) n = std::max(0, remaining - 5);
-            n = n >= 5 ? vision::atomic_image_chunk(s.images->spans(), uint64_t(s.done), n,
+            if (remaining - n > 0 && remaining - n < min_rows) n = std::max(0, remaining - min_rows);
+            n = n >= min_rows ? vision::atomic_image_chunk(s.images->spans(), uint64_t(s.done), n,
                                                     uint64_t(remaining), budget) : 0;
-            if (n < 5) continue;
+            if (n < min_rows) continue;
             DeepSeek4PrefillSeq seq;
             seq.cache = s.item->staging;
             seq.embed = s.embed.data() + size_t(s.done) * size_t(w_.n_embd);

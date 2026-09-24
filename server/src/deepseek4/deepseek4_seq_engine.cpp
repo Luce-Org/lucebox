@@ -96,23 +96,28 @@ SeqEngine::AdmitResult DeepSeek4SeqEngine::admit_images(
     AdmitResult refused;
     refused.status = AdmitResult::Status::failed;
     // DS4V image blocks need whole-block bidirectional prefill, which the
-    // 16-row gathered graph cannot run. Admission encodes the images and seeds
-    // the slot with every prompt token but the last; the next step() prefills
-    // all pending image requests together on the layer-major sparse path and
-    // copies their state into the slots, and the last (text) token then
-    // prefills in the batch, yielding the first sampled token as usual.
-    if (!supports_images() || prompt.size() < 6 || prompt.size() > size_t(b_.cache_.max_ctx)) {
+    // 16-row gathered graph cannot run. Admission claims a slot, encodes the
+    // images and seeds the slot with every prompt token but the last; the
+    // next step() prefills all pending image requests together on the
+    // layer-major sparse path and copies their state into the slots, and the
+    // last (text) token then prefills in the batch, yielding the first
+    // sampled token as usual.
+    const int prefix = int(prompt.size()) - 1;
+    if (!supports_images() || prefix < DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS ||
+        prompt.size() > size_t(b_.cache_.max_ctx)) {
         refused.error = "image support or prompt length is invalid";
         return refused;
     }
+    // Claim the slot before encoding: a busy pool defers the request and
+    // retries it, and encoding first would rerun the encoder on every retry.
+    AdmitResult result = admit(request_id, prompt, sampler);
+    if (result.status != AdmitResult::Status::admitted) return result;
     std::string error;
     if (!b_.encode_image_request(prompt, images, error)) {
+        retire(result.slot);
         refused.error = error.empty() ? "image encoding failed" : error;
         return refused;
     }
-    const int prefix = int(prompt.size()) - 1;
-    AdmitResult result = admit(request_id, prompt, sampler);
-    if (result.status != AdmitResult::Status::admitted) return result;
     SeqSlotManager::PrefillChunk seeded = slots_.seed_restored_prefix(result.slot, prefix);
     bool ok = seeded.ok && seeded.rows.size() == size_t(prefix);
     for (size_t i = 0; ok && i < seeded.new_blocks.size(); ++i) {
