@@ -4978,10 +4978,49 @@ static void hc_pre_batch(std::vector<float> & working,
     comb.resize((size_t)n_tokens * (size_t)n_hc * (size_t)n_hc);
     if (pre) pre->resize((size_t)n_tokens * (size_t)n_hc);
 
-    // A few tokens (a speculative verify batch) run one after another, each
-    // with the row-parallel matvec of single-token decode; larger batches
-    // spread tokens over the pool instead. Both give the same bits.
+    // A few tokens (a speculative verify batch) compute their mixes in one
+    // pass, on the device when single-token decode uses it (one round trip
+    // for the batch) or as one row-parallel host job; larger batches spread
+    // tokens over the pool instead. Every token's mix is computed exactly as
+    // single-token decode computes it.
     const bool token_parallel = n_tokens > kHcPreSequentialTokens;
+    if (!token_parallel && n_tokens > 1) {
+        const int mix_dim = 2 * n_hc + n_hc * n_hc;
+        std::vector<float> mix((size_t) mix_dim * (size_t) n_tokens);
+        bool device_mix = false;
+#if defined(LUCE_BACKEND_CUDA)
+        device_mix = ds4_hc_cuda_enabled() && fn_tensor && fn_tensor->data &&
+            deepseek4_cuda_hc_pre_mix_batch(hc_state, n_tokens, fn_tensor->data,
+                                            n_embd, n_hc, hc_eps, mix.data());
+#endif
+        if (!device_mix) {
+            std::vector<float> flat(hc_dim * (size_t) n_tokens);
+            for (int t = 0; t < n_tokens; ++t) {
+                cpu_rms_norm(flat.data() + (size_t) t * hc_dim, hc_state + (size_t) t * hc_dim,
+                             (int) hc_dim, hc_eps);
+            }
+            const uint16_t * fn = weights.fn_data.data();
+            ds4_hc_matvec_pool().run_chunks(n_tokens * mix_dim, [&](int begin, int end) {
+                for (int r = begin; r < end; ++r) {
+                    const int t = r / mix_dim;
+                    const int row = r % mix_dim;
+                    mix[(size_t) r] = cpu_dot_f16_row(fn + (size_t) row * hc_dim,
+                                                      flat.data() + (size_t) t * hc_dim, (int) hc_dim);
+                }
+            });
+        }
+        for (int t = 0; t < n_tokens; ++t) {
+            finish_hc_pre_from_mix_into(working.data() + (size_t) t * n_embd,
+                                        post.data() + (size_t) t * n_hc,
+                                        comb.data() + (size_t) t * n_hc * (size_t) n_hc,
+                                        hc_state + (size_t) t * hc_dim,
+                                        mix.data() + (size_t) t * mix_dim,
+                                        weights.scale_data.data(), weights.base_data.data(),
+                                        n_embd, n_hc, sinkhorn_iters,
+                                        pre ? pre->data() + (size_t) t * n_hc : nullptr);
+        }
+        return;
+    }
     auto run_tokens = [&](int t0, int t1) {
         std::vector<float> flat(hc_dim);
         float mix[24];
@@ -8994,10 +9033,10 @@ bool deepseek4_step_layer_range(
     // V4.1 verification (staggered pre-mix): each layer's attention is one
     // graph that runs the single-token decode lane of every token in position
     // order (ds4_run_verify_attention), so the batch may span any number of
-    // compressor boundaries; hyper-connections and the output head run per
-    // token as in decode, and the FFN runs once for the whole batch (each
-    // routed expert is read once per layer). All products are
-    // batch-invariant, so every token matches single-token decode bit for bit.
+    // compressor boundaries; hyper-connections run per token as in decode,
+    // and the FFN and output head run once for the whole batch (each routed
+    // expert is read once per layer). All products are batch-invariant, so
+    // every token matches single-token decode bit for bit.
     const bool decode_tokenwise_verify =
         w.hc_staggered_pre && n_tokens > 1 && verify_hooks &&
         verify_hooks->all_logits_out && allow_decode_graph_reuse &&
@@ -10477,30 +10516,7 @@ bool deepseek4_step_layer_range(
                             w.hc_eps);
         }
 
-        if (decode_tokenwise_verify) {
-            if (!cached_decode_output_graph.valid() ||
-                cached_decode_output_graph.owner_ctx != w.ctx ||
-                cached_decode_output_graph.backend != backend ||
-                cached_decode_output_graph.n_tokens != 1) {
-                if (!build_cached_decode_output_graph(cached_decode_output_graph, backend, w, 1)) {
-                    return false;
-                }
-            }
-            std::vector<float> & all = *verify_hooks->all_logits_out;
-            all.resize((size_t) w.n_vocab * (size_t) n_tokens);
-            for (int t = 0; t < n_tokens; ++t) {
-                ggml_backend_tensor_set(cached_decode_output_graph.sg.hidden_input,
-                                        final_embd.data() + (size_t) t * n_embd, 0,
-                                        sizeof(float) * (size_t) n_embd);
-                if (ggml_backend_graph_compute(backend, cached_decode_output_graph.sg.gf) != GGML_STATUS_SUCCESS) {
-                    return false;
-                }
-                ggml_backend_tensor_get(cached_decode_output_graph.sg.logits,
-                                        all.data() + (size_t) t * w.n_vocab, 0,
-                                        sizeof(float) * (size_t) w.n_vocab);
-            }
-            out_logits->assign(all.end() - w.n_vocab, all.end());
-        } else if (reuse_decode_graphs) {
+        if (reuse_decode_graphs) {
             if (!cached_decode_output_graph.valid() ||
                 cached_decode_output_graph.owner_ctx != w.ctx ||
                 cached_decode_output_graph.backend != backend ||

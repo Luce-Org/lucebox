@@ -32,6 +32,7 @@ struct HcCudaScratch {
     float * d_comb = nullptr;
     size_t state_cap = 0;
     size_t working_cap = 0;
+    int batch_cap = 0;          // tokens d_sums and d_mix hold
 
     explicit HcCudaScratch(int device = -1) : owner_device(device) {}
 
@@ -49,12 +50,20 @@ struct HcCudaScratch {
         if (d_comb) cudaFree(d_comb);
     }
 
-    bool ensure(size_t hc_dim, size_t n_embd) {
-        // Mix/scale/base/post/comb are bounded by kMaxHc (every entry point
+    bool ensure(size_t hc_dim, size_t n_embd, int n_tokens = 1) {
+        // Scale/base/post/comb are bounded by kMaxHc (every entry point
         // validates n_hc <= kMaxHc), so allocate them at their maxima once.
-        // Working and state scale with n_embd, so they track a capacity.
-        if (!d_sums && cudaMalloc(&d_sums, sizeof(float) * kSums) != cudaSuccess) return false;
-        if (!d_mix && cudaMalloc(&d_mix, sizeof(float) * kMaxMixDim) != cudaSuccess) return false;
+        // Working and state scale with n_embd, and state, sums and mix with
+        // the tokens of a batched mix, so they track a capacity.
+        if (batch_cap < n_tokens) {
+            if (d_sums) cudaFree(d_sums);
+            if (d_mix) cudaFree(d_mix);
+            d_sums = d_mix = nullptr;
+            batch_cap = 0;
+            if (cudaMalloc(&d_sums, sizeof(float) * kSums * (size_t) n_tokens) != cudaSuccess) return false;
+            if (cudaMalloc(&d_mix, sizeof(float) * kMaxMixDim * (size_t) n_tokens) != cudaSuccess) return false;
+            batch_cap = n_tokens;
+        }
         if (!d_scale && cudaMalloc(&d_scale, sizeof(float) * kMaxMixDim) != cudaSuccess) return false;
         if (!d_base && cudaMalloc(&d_base, sizeof(float) * kMaxMixDim) != cudaSuccess) return false;
         if (!d_post && cudaMalloc(&d_post, sizeof(float) * kMaxHc) != cudaSuccess) return false;
@@ -68,14 +77,15 @@ struct HcCudaScratch {
             if (cudaMalloc(&d_working, sizeof(float) * n_embd) != cudaSuccess) return false;
             working_cap = n_embd;
         }
-        if (state_cap < hc_dim) {
+        const size_t state_elems = hc_dim * (size_t) n_tokens;
+        if (state_cap < state_elems) {
             if (d_state) {
                 cudaFree(d_state);
                 d_state = nullptr;
                 state_cap = 0;
             }
-            if (cudaMalloc(&d_state, sizeof(float) * hc_dim) != cudaSuccess) return false;
-            state_cap = hc_dim;
+            if (cudaMalloc(&d_state, sizeof(float) * state_elems) != cudaSuccess) return false;
+            state_cap = state_elems;
         }
         return true;
     }
@@ -412,7 +422,17 @@ bool deepseek4_cuda_hc_pre_mix(const float * hc_state_host,
                                int           n_hc,
                                float         eps,
                                float *       mix_host) {
-    if (!hc_state_host || !fn_device || !mix_host || n_embd <= 0 || n_hc <= 0) {
+    return deepseek4_cuda_hc_pre_mix_batch(hc_state_host, 1, fn_device, n_embd, n_hc, eps, mix_host);
+}
+
+bool deepseek4_cuda_hc_pre_mix_batch(const float * hc_states_host,
+                                     int           n_tokens,
+                                     const void *  fn_device,
+                                     int           n_embd,
+                                     int           n_hc,
+                                     float         eps,
+                                     float *       mix_host) {
+    if (!hc_states_host || !fn_device || !mix_host || n_tokens <= 0 || n_embd <= 0 || n_hc <= 0) {
         return false;
     }
     const int hc_dim = n_embd * n_hc;
@@ -420,30 +440,37 @@ bool deepseek4_cuda_hc_pre_mix(const float * hc_state_host,
     if (!slot) return false;
     std::lock_guard<std::mutex> lock(slot->mutex);
     HcCudaScratch & scratch = slot->scratch;
-    if (!scratch.ensure((size_t)hc_dim, (size_t)n_embd)) {
+    if (!scratch.ensure((size_t)hc_dim, (size_t)n_embd, n_tokens)) {
         return false;
     }
-    if (cudaMemcpy(scratch.d_state, hc_state_host, sizeof(float) * (size_t)hc_dim,
+    if (cudaMemcpy(scratch.d_state, hc_states_host, sizeof(float) * (size_t)hc_dim * n_tokens,
                    cudaMemcpyHostToDevice) != cudaSuccess) {
         return false;
     }
-    hc_sumsq_kernel<<<kSums, kThreads>>>(scratch.d_state, hc_dim, scratch.d_sums);
+    // Each token runs the single-token kernels on its own slice: one round
+    // trip for the batch, the same bits per token.
+    for (int t = 0; t < n_tokens; ++t) {
+        hc_sumsq_kernel<<<kSums, kThreads>>>(scratch.d_state + (size_t) t * hc_dim, hc_dim,
+                                             scratch.d_sums + (size_t) t * kSums);
+    }
     if (cudaGetLastError() != cudaSuccess) return false;
-    std::vector<float> sums(kSums);
+    std::vector<float> sums((size_t) kSums * n_tokens);
     if (cudaMemcpy(sums.data(), scratch.d_sums, sizeof(float) * sums.size(),
                    cudaMemcpyDeviceToHost) != cudaSuccess) {
         return false;
     }
-    float ss = 0.0f;
-    for (float v : sums) ss += v;
-    const float inv_rms = 1.0f / std::sqrt(ss / (float)hc_dim + eps);
-    hc_mix_kernel<<<kMixDim, kThreads>>>(scratch.d_state,
-                                         static_cast<const __half *>(fn_device),
-                                         hc_dim,
-                                         inv_rms,
-                                         scratch.d_mix);
+    for (int t = 0; t < n_tokens; ++t) {
+        float ss = 0.0f;
+        for (int i = 0; i < kSums; ++i) ss += sums[(size_t) t * kSums + i];
+        const float inv_rms = 1.0f / std::sqrt(ss / (float)hc_dim + eps);
+        hc_mix_kernel<<<kMixDim, kThreads>>>(scratch.d_state + (size_t) t * hc_dim,
+                                             static_cast<const __half *>(fn_device),
+                                             hc_dim,
+                                             inv_rms,
+                                             scratch.d_mix + (size_t) t * kMixDim);
+    }
     if (cudaGetLastError() != cudaSuccess) return false;
-    if (cudaMemcpy(mix_host, scratch.d_mix, sizeof(float) * kMixDim,
+    if (cudaMemcpy(mix_host, scratch.d_mix, sizeof(float) * kMixDim * n_tokens,
                    cudaMemcpyDeviceToHost) != cudaSuccess) {
         return false;
     }
