@@ -790,7 +790,9 @@ int deepseek4_safe_compressor_batch_tokens(const DeepSeek4Weights & w,
     int safe = n_tokens;
     for (uint32_t raw_ratio : w.compress_ratios) {
         const int ratio = (int) raw_ratio;
-        if (ratio <= 0) continue;
+        // Ratio 1 emits one latent per token and keeps no pooling state, so
+        // it has no boundary; treating it as one would force one-token batches.
+        if (ratio <= 1) continue;
         int pos_mod = kv_start % ratio;
         if (pos_mod < 0) pos_mod += ratio;
         safe = std::min(safe, ratio - pos_mod);
@@ -1182,9 +1184,75 @@ static void build_compressor_step(
         ggml_tensor ** first_prev_kv_src_out = nullptr,
         ggml_tensor ** first_prev_kv_dst_out = nullptr,
         ggml_tensor ** first_prev_score_src_out = nullptr,
-        ggml_tensor ** first_prev_score_dst_out = nullptr) {
-    if (!gf || !cur_last || !ape || !kv_proj || !gate_proj || !norm_weight ||
-        !state.state_kv || !state.state_score || !comp_cache || ratio <= 0) {
+        ggml_tensor ** first_prev_score_dst_out = nullptr,
+        const DeepSeek4Layer * latent_index = nullptr,   // index keys from the pre-RoPE latent (V4.1)
+        ggml_tensor * index_cache = nullptr,             // ... written here, one row per compressed row
+        ggml_tensor ** index_cache_source_out = nullptr) {
+    if (!gf || !cur_last || !kv_proj || !norm_weight || !comp_cache || ratio <= 0) {
+        return;
+    }
+    // V4 (ratio 4/128) pools with a gate and an APE; V4.1 ratio 2 pools with a
+    // gate and no APE; V4.1 ratio 1 is a plain per-token projection.
+    if (ratio > 1 && (!gate_proj || !state.state_kv || !state.state_score)) return;
+    if (ratio == 4 && !ape) return;
+
+    if (ratio == 1) {
+        // V4.1 ratio-1 kv source (model.py Compressor.forward, ratio == 1):
+        // latent = rms_norm(wkv · x) per token, no gate, no state. A token is
+        // its own group, so RoPE at its own position and row = position. The
+        // index key is taken from the latent before RoPE (Indexer.forward).
+        const bool multi = cur_all != nullptr && n_tokens_all > 1 && kv_start_all >= 0;
+        const int n_emit = multi ? n_tokens_all : 1;
+        ggml_tensor * latent = ggml_mul_mat(ctx, kv_proj, multi ? cur_all : cur_last);   // [head_dim, n_emit]
+        latent = build_rms_norm(ctx, latent, norm_weight, rms_eps);
+        ggml_tensor * pos = comp_pos_inp;
+        if (pos && ggml_nelements(pos) > n_emit) pos = ggml_view_1d(ctx, pos, n_emit, 0);
+        if (!pos || ggml_nelements(pos) != n_emit) {
+            pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_emit);
+            ggml_set_input(pos);
+            std::vector<int32_t> vals((size_t) n_emit);
+            for (int i = 0; i < n_emit; ++i) vals[(size_t) i] = multi ? kv_start_all + i : token_pos;
+            i32_array_inputs.push_back({pos, std::move(vals)});
+        }
+        const float r1_rope_scale = rope_scale_factor > 0.0f ? (1.0f / rope_scale_factor) : 1.0f;
+        float r1_rope_attn = 1.0f;
+        if (r1_rope_scale > 0.0f) r1_rope_attn /= (1.0f + 0.1f * logf(1.0f / r1_rope_scale));
+        ggml_tensor * index_key = nullptr;
+        if (latent_index && latent_index->indexer_k && latent_index->indexer_k_norm && index_cache) {
+            const int index_dim = (int) index_cache->ne[0];
+            index_key = ggml_mul_mat(ctx, latent_index->indexer_k, latent);
+            index_key = build_rms_norm(ctx, index_key, latent_index->indexer_k_norm, rms_eps);
+            index_key = build_tail_rope_2d(ctx, index_key, pos, n_rot, index_dim, n_emit,
+                                           compress_rope_freq_base, r1_rope_scale, 1.0f, r1_rope_attn,
+                                           rope_yarn_beta_fast, rope_yarn_beta_slow, rope_orig_ctx);
+        }
+        latent = build_tail_rope_2d(ctx, latent, pos, n_rot, head_dim, n_emit,
+                                    compress_rope_freq_base, r1_rope_scale, 1.0f, r1_rope_attn,
+                                    rope_yarn_beta_fast, rope_yarn_beta_slow, rope_orig_ctx);
+        if (current_comp_out) {
+            *current_comp_out = multi
+                ? ggml_view_2d(ctx, latent, head_dim, 1, latent->nb[1], (size_t) (n_emit - 1) * latent->nb[1])
+                : latent;
+        }
+        const int first_row = multi ? kv_start_all : token_pos;
+        if (!(comp_rows_inp && paged_physical_row) && first_row + n_emit > (int) comp_cache->ne[1]) return;
+        auto write_rows = [&](ggml_tensor * cache, ggml_tensor * values, ggml_tensor ** source_out) {
+            if (!cache || !values) return;
+            ggml_tensor * source = cache;
+            if (comp_rows_inp) {
+                ggml_tensor * rows = comp_rows_inp;
+                if (ggml_nelements(rows) > n_emit) rows = ggml_view_1d(ctx, rows, n_emit, 0);
+                source = ggml_set_rows(ctx, cache, values, rows);
+                ggml_build_forward_expand(gf, source);
+            } else {
+                ggml_tensor * slot = ggml_view_2d(ctx, cache, cache->ne[0], n_emit, cache->nb[1],
+                                                  (size_t) first_row * cache->nb[1]);
+                ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_cast(ctx, values, cache->type), slot));
+            }
+            if (source_out) *source_out = source;
+        };
+        write_rows(comp_cache, latent, comp_cache_source_out);
+        write_rows(index_cache, index_key, index_cache_source_out);
         return;
     }
 
@@ -1233,9 +1301,11 @@ static void build_compressor_step(
                                                (size_t) ti * kv_all->nb[1]);
             ggml_tensor * sc_ti = ggml_view_2d(ctx, sc_all, comp_width, 1, sc_all->nb[1],
                                                (size_t) ti * sc_all->nb[1]);
-            ggml_tensor * ape_ti = ggml_view_2d(ctx, ape, comp_width, 1, ape->nb[1],
-                                                (size_t) pm_ti * ape->nb[1]);
-            sc_ti = ggml_add(ctx, sc_ti, ggml_cast(ctx, ape_ti, GGML_TYPE_F32));
+            if (ape) {
+                ggml_tensor * ape_ti = ggml_view_2d(ctx, ape, comp_width, 1, ape->nb[1],
+                                                    (size_t) pm_ti * ape->nb[1]);
+                sc_ti = ggml_add(ctx, sc_ti, ggml_cast(ctx, ape_ti, GGML_TYPE_F32));
+            }
             ggml_tensor * kv_slot_ti = ggml_view_2d(ctx, state.state_kv, comp_width, 1,
                                                     state.state_kv->nb[1],
                                                     (size_t) row_ti * state.state_kv->nb[1]);
@@ -1254,7 +1324,7 @@ static void build_compressor_step(
     ggml_tensor * batched_kv_all = nullptr;
     ggml_tensor * batched_sc_all = nullptr;
     ggml_tensor * ape_col = nullptr;
-    if (!batched_rows) {
+    if (!batched_rows && ape) {
         if (ape_row_inp) {
             ape_col = ggml_get_rows(ctx, ape, ape_row_inp);
             ape_col = ggml_reshape_2d(ctx, ape_col, comp_width, 1);
@@ -1276,8 +1346,10 @@ static void build_compressor_step(
         // below read state_*_source, which span A set.
         ggml_tensor * kv_all = ggml_mul_mat(ctx, kv_proj, cur_all);
         ggml_tensor * sc_all = ggml_mul_mat(ctx, gate_proj, cur_all);
-        ggml_tensor * ape_cols = ggml_get_rows(ctx, ape, ape_row_inp);   // [comp_width, q]
-        sc_all = ggml_add(ctx, sc_all, ape_cols);
+        if (ape) {
+            ggml_tensor * ape_cols = ggml_get_rows(ctx, ape, ape_row_inp);   // [comp_width, q]
+            sc_all = ggml_add(ctx, sc_all, ape_cols);
+        }
         for (int ti = 0; ti < n_tokens_all; ++ti) {
             if (((kv_start_all + ti + 1) % ratio) == 0) { batched_b = ti; break; }
         }
@@ -1389,6 +1461,18 @@ static void build_compressor_step(
     if (rope_scale > 0.0f) {
         rope_attn /= (1.0f + 0.1f * logf(1.0f / rope_scale));
     }
+    // V4.1 index keys: from this pre-RoPE latent at kv sources that are index
+    // sources, RoPE'd at the same group position (model.py Indexer.forward).
+    ggml_tensor * index_key = nullptr;
+    ggml_tensor * index_cache_source = index_cache;
+    if (latent_index && latent_index->indexer_k && latent_index->indexer_k_norm && index_cache) {
+        const int index_dim = (int) index_cache->ne[0];
+        index_key = ggml_mul_mat(ctx, latent_index->indexer_k, pooled);
+        index_key = build_rms_norm(ctx, index_key, latent_index->indexer_k_norm, rms_eps);
+        index_key = build_tail_rope_2d(ctx, index_key, comp_pos, n_rot, index_dim, 1,
+                                       compress_rope_freq_base, rope_scale, 1.0f, rope_attn,
+                                       rope_yarn_beta_fast, rope_yarn_beta_slow, rope_orig_ctx);
+    }
     pooled = build_tail_rope_2d(ctx, pooled, comp_pos, n_rot, head_dim, 1,
                                 compress_rope_freq_base, rope_scale, 1.0f, rope_attn,
                                 rope_yarn_beta_fast, rope_yarn_beta_slow, rope_orig_ctx);
@@ -1422,6 +1506,22 @@ static void build_compressor_step(
 
     if (comp_cache_source_out) {
         *comp_cache_source_out = comp_cache_source;
+    }
+    if (index_key) {
+        if (comp_rows_inp) {
+            ggml_tensor * first_comp_row = comp_rows_inp;
+            if (ggml_nelements(first_comp_row) > 1) {
+                first_comp_row = ggml_view_1d(ctx, first_comp_row, 1, 0);
+            }
+            index_cache_source = ggml_set_rows(ctx, index_cache, index_key, first_comp_row);
+            ggml_build_forward_expand(gf, index_cache_source);
+        } else {
+            ggml_tensor * index_slot = ggml_view_2d(
+                ctx, index_cache, index_cache->ne[0], 1, index_cache->nb[1],
+                (size_t) comp_row * index_cache->nb[1]);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_cast(ctx, index_key, index_cache->type), index_slot));
+        }
+        if (index_cache_source_out) *index_cache_source_out = index_cache_source;
     }
 
     if (batched_rows) {
@@ -2049,7 +2149,11 @@ static DeepSeek4PreparedProjectedLane build_mla_qkv_projection(
     qr = build_rms_norm(ctx, qr, L.attn_q_a_norm, w.rms_eps);
     ggml_tensor * q = ds4_mul_mat_columns(ctx, L.attn_q_b, qr, projection_columns);
     q = ggml_reshape_3d(ctx, q, w.head_dim, w.n_head, n_tokens);
-    q = ggml_rms_norm(ctx, q, w.rms_eps);
+    // V4 normalizes every query head to unit RMS after wq_b (model.py:
+    // q *= rsqrt(mean(q^2) + eps)); V4.1 dropped that step.
+    if (w.attn_q_head_norm) {
+        q = ggml_rms_norm(ctx, q, w.rms_eps);
+    }
 
     ggml_tensor * kv = ds4_mul_mat_columns(ctx, L.attn_kv, cur, projection_columns);
     kv = build_rms_norm(ctx, kv, L.attn_kv_a_norm, w.rms_eps);
@@ -2364,6 +2468,12 @@ static ggml_tensor * build_mla_attention_lane_core(
     ggml_tensor * cur_last = ggml_view_2d(
         ctx, cur, n_embd, 1, cur->nb[1], (size_t)(n_tokens - 1) * cur->nb[1]);
     ggml_tensor * comp_kv_source = lane.comp_kv;
+    ggml_tensor * index_comp_kv_source = lane.index_comp_kv;
+    // V4.1: ratio 2 pools without APE, ratio 1 emits rms_norm(wkv · x) per
+    // token with no state; kv sources that are index sources also write the
+    // index key of each compressed row (from the pre-RoPE latent).
+    const DeepSeek4Layer * latent_index =
+        (L.indexer_k && lane.index_comp_kv) ? &L : nullptr;
     if (lane.write_comp && ratio > 0 && L.attn_compressor_kv) {
         build_compressor_step(ctx, gf, cur_last,
                               L.attn_compressor_ape,
@@ -2406,10 +2516,10 @@ static ggml_tensor * build_mla_attention_lane_core(
                               boundary_checkpoint
                                   ? &boundary_checkpoint->attn_score_src : nullptr,
                               boundary_checkpoint
-                                  ? &boundary_checkpoint->attn_score_dst : nullptr);
+                                  ? &boundary_checkpoint->attn_score_dst : nullptr,
+                              latent_index, lane.index_comp_kv, &index_comp_kv_source);
     }
 
-    ggml_tensor * index_comp_kv_source = lane.index_comp_kv;
     // Gathered paged concurrency always uses Explicit attention, whose
     // build_indexer_topk path is disabled. In that mode the indexer compressor
     // only writes state that no graph node reads, so omit the dead subgraph.
