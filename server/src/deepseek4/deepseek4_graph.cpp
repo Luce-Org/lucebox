@@ -784,26 +784,6 @@ static ggml_tensor * build_tail_rope_2d(ggml_context * ctx,
 
 // ─── KV Compressor Step ────────────────────────────────────────────────
 
-// Keep the pooled-window row a verify token just wrote (see
-// Ds4VerifyWindowRows); `t` is the token's index in the batch.
-static void ds4_record_verify_window_row(Ds4VerifyWindowRows * rows,
-                                         const DeepSeek4LayerCache & lc,
-                                         int ratio, int il, int t, int pos) {
-    if (!rows || !deepseek4_is_window_state(lc.attn_compressor, ratio)) return;
-    if (rows->kv.size() <= (size_t) il) {
-        rows->kv.resize((size_t) il + 1);
-        rows->score.resize((size_t) il + 1);
-    }
-    auto keep = [&](ggml_tensor * state, std::vector<uint8_t> & dst) {
-        const size_t row_bytes = state->nb[1];
-        dst.resize(((size_t) t + 1) * row_bytes);
-        ggml_backend_tensor_get(state, dst.data() + (size_t) t * row_bytes,
-                                (size_t) (pos % ratio) * row_bytes, row_bytes);
-    };
-    keep(lc.attn_compressor.state_kv, rows->kv[(size_t) il]);
-    keep(lc.attn_compressor.state_score, rows->score[(size_t) il]);
-}
-
 int deepseek4_safe_compressor_batch_tokens(const DeepSeek4Weights & w,
                                            int kv_start,
                                            int n_tokens) {
@@ -7369,6 +7349,207 @@ static bool ds4_run_exact_tokenwise_prefill_attention(
     return true;
 }
 
+// One layer's attention for a V4.1 verify batch, as one graph. The q/kv
+// projections with their RoPE, and the inverse RoPE with the output
+// projection, run once over the batch (batch-invariant products, see
+// ggml_backend_cuda_set_mmvq_batch_invariant); in between each token runs the
+// lane core of the single-token decode graph at its own position, in position
+// order, so its ring write, compressor step and attention over the rows
+// visible at that position are computed exactly as the decode step for that
+// token computes them.
+static bool ds4_run_verify_attention(
+        ggml_backend_t backend,
+        const DeepSeek4Weights & w,
+        const DeepSeek4Layer & L,
+        DeepSeek4LayerCache & lc,
+        DeepSeek4LayerCache & comp_lc,
+        int il,
+        const float * cur,
+        int n_tokens,
+        int kv_start,
+        std::vector<float> & attn_out_host,
+        DeepSeek4CachedLayerAlloc & attn_alloc,
+        Ds4VerifyWindowRows * window_rows,
+        DeepSeek4StepTelemetry * telemetry) {
+    const auto build_t0 = Ds4TimingClock::now();
+    const int n_embd = w.n_embd;
+    const int ratio = (int) w.compress_ratios[(size_t) il];
+    ggml_init_params params{};
+    params.mem_size = ds4_attn_step_meta_size(1) * (size_t) n_tokens;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) return false;
+    ggml_cgraph * gf = ggml_new_graph_custom(
+        ctx, ds4_attn_step_graph_size(1) * (size_t) n_tokens, false);
+
+    std::vector<DeepSeek4I32InputBinding> i32_inputs;
+    std::vector<DeepSeek4I32ArrayBinding> i32_array_inputs;
+    std::vector<DeepSeek4I64ArrayBinding> i64_array_inputs;
+    auto i32_input = [&](int32_t value) {
+        ggml_tensor * t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        ggml_set_input(t);
+        i32_array_inputs.push_back({t, {value}});
+        return t;
+    };
+    auto i64_input = [&](int64_t value) {
+        ggml_tensor * t = ggml_new_tensor_2d(ctx, GGML_TYPE_I64, 1, 1);
+        ggml_set_input(t);
+        i64_array_inputs.push_back({t, {value}});
+        return t;
+    };
+
+    ggml_tensor * inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+    ggml_set_input(inp);
+    ggml_tensor * normed = build_rms_norm(ctx, inp, L.attn_norm, w.rms_eps);
+    ggml_tensor * rope_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+    ggml_set_input(rope_pos);
+    {
+        std::vector<int32_t> positions((size_t) n_tokens);
+        for (int t = 0; t < n_tokens; ++t) positions[(size_t) t] = kv_start + t;
+        i32_array_inputs.push_back({rope_pos, std::move(positions)});
+    }
+    DeepSeek4PreparedProjectedLane batched =
+        build_mla_qkv_projection(ctx, normed, w, L, n_tokens);
+    build_mla_qkv_rope(ctx, batched, w, ds4_rope_params(w, ratio), n_tokens, rope_pos,
+                       /*fuse_q_rope=*/false);
+
+    const bool keep_window_rows =
+        window_rows && deepseek4_is_window_state(lc.attn_compressor, ratio);
+    ggml_tensor * context = nullptr;
+    std::vector<ggml_tensor *> window_kv((size_t) n_tokens, nullptr);
+    std::vector<ggml_tensor *> window_score((size_t) n_tokens, nullptr);
+    for (int t = 0; t < n_tokens; ++t) {
+        const int pos = kv_start + t;
+        // Host counters as the decode step at `pos` sees them.
+        ds4_advance_comp_counters(w, il, lc, pos);
+        DeepSeek4AttentionGraphInputs inputs;
+        inputs.rope_pos = ggml_view_1d(ctx, rope_pos, 1, (size_t) t * rope_pos->nb[0]);
+        inputs.neg_pos = i32_input(-pos);
+        inputs.raw_kv_rows = i64_input(pos % w.n_swa);
+        if (ratio > 0) {
+            inputs.attn_ape_row = i32_input(pos % ratio);
+            inputs.attn_state_rows = i64_input(ratio == 4 ? ratio + pos % ratio : pos % ratio);
+            inputs.attn_comp_rows = i64_input(pos / ratio);
+            inputs.attn_comp_pos = i32_input(pos + 1 - ratio);
+        }
+        if (ratio == 4) {
+            inputs.index_ape_row = i32_input(pos % ratio);
+            inputs.index_state_rows = i64_input(ratio + pos % ratio);
+            inputs.index_comp_rows = i64_input(pos / ratio);
+            inputs.index_comp_pos = i32_input(pos + 1 - ratio);
+        }
+        const DeepSeek4PreparedProjectedLane lane_proj =
+            ds4_slice_projected_lane(ctx, batched, w, t, inputs.rope_pos);
+        ggml_tensor * lane_cur = ggml_view_2d(ctx, normed, n_embd, 1, normed->nb[1],
+                                              (size_t) t * normed->nb[1]);
+        const DeepSeek4MlaLaneBindings lane =
+            deepseek4_contiguous_lane_bindings(w, il, lc, comp_lc, pos);
+        ggml_tensor * lane_context = nullptr;
+        if (!build_mla_attention_lane_core(
+                ctx, gf, lane_cur, w, L, lane, il, pos, 1, &inputs,
+                i32_inputs, i32_array_inputs, i64_array_inputs,
+                /*f32_array_inputs=*/nullptr, DeepSeek4AttentionImpl::Explicit, &lane_proj,
+                &lane_context)) {
+            ggml_free(ctx);
+            return false;
+        }
+        ggml_build_forward_expand(gf, lane_context);
+        context = context ? ggml_concat(ctx, context, lane_context, 1) : lane_context;
+        if (keep_window_rows) {
+            // Nodes run in build order, so this copy sees the row this token
+            // just wrote and no later token's write.
+            auto row = [&](ggml_tensor * state) {
+                ggml_tensor * r = ggml_cont(ctx, ggml_view_2d(
+                    ctx, state, state->ne[0], 1, state->nb[1],
+                    (size_t) (pos % ratio) * state->nb[1]));
+                ggml_set_output(r);
+                ggml_build_forward_expand(gf, r);
+                return r;
+            };
+            window_kv[(size_t) t] = row(lc.attn_compressor.state_kv);
+            window_score[(size_t) t] = row(lc.attn_compressor.state_score);
+        }
+    }
+
+    ggml_tensor * neg_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+    ggml_set_input(neg_pos);
+    {
+        std::vector<int32_t> negated((size_t) n_tokens);
+        for (int t = 0; t < n_tokens; ++t) negated[(size_t) t] = -(kv_start + t);
+        i32_array_inputs.push_back({neg_pos, std::move(negated)});
+    }
+    const Ds4RopeParams rope = ds4_rope_params(w, ratio);
+    context = build_tail_rope_3d(
+        ctx, ggml_reshape_3d(ctx, context, w.head_dim, w.n_head, n_tokens), neg_pos,
+        w.n_rot, w.head_dim, w.n_head, n_tokens, rope.freq, rope.scale, rope.ext, rope.attn,
+        w.rope_yarn_beta_fast, w.rope_yarn_beta_slow, rope.n_ctx_orig);
+    // The single-token decode graph never takes the grouped output kernel.
+    ggml_tensor * out = build_mla_output_projection(
+        ctx, ggml_reshape_2d(ctx, context, (int64_t) w.head_dim * w.n_head, n_tokens),
+        w, L, n_tokens, /*allow_grouped=*/false);
+    ggml_set_output(out);
+    ggml_build_forward_expand(gf, out);
+
+    if (!attn_alloc.valid() || attn_alloc.owner_ctx != w.ctx || attn_alloc.backend != backend) {
+        attn_alloc.free();
+        attn_alloc.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        attn_alloc.owner_ctx = w.ctx;
+        attn_alloc.backend = backend;
+    }
+    if (!attn_alloc.alloc || !ggml_gallocr_alloc_graph(attn_alloc.alloc, gf)) {
+        std::fprintf(stderr, "[deepseek4] verify attn graph alloc failed layer %d\n", il);
+        ggml_free(ctx);
+        return false;
+    }
+    if (telemetry) telemetry->attn_build_us += ds4_elapsed_us(build_t0, Ds4TimingClock::now());
+
+    // Inputs a lane does not consume (the APE row of a pool without APE, the
+    // flush rows of a non-flushing token) are not in the graph.
+    ggml_backend_tensor_set(inp, cur, 0, sizeof(float) * (size_t) n_embd * n_tokens);
+    for (const auto & b : i32_inputs) {
+        if (b.tensor->buffer) ggml_backend_tensor_set(b.tensor, &b.value, 0, sizeof(b.value));
+    }
+    for (const auto & b : i32_array_inputs) {
+        if (b.tensor->buffer) {
+            ggml_backend_tensor_set(b.tensor, b.values.data(), 0, sizeof(int32_t) * b.values.size());
+        }
+    }
+    for (const auto & b : i64_array_inputs) {
+        if (b.tensor->buffer) {
+            ggml_backend_tensor_set(b.tensor, b.values.data(), 0, sizeof(int64_t) * b.values.size());
+        }
+    }
+    const auto compute_t0 = Ds4TimingClock::now();
+    const bool ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
+    if (telemetry) telemetry->attn_compute_us += ds4_elapsed_us(compute_t0, Ds4TimingClock::now());
+    if (ok) {
+        const auto read_t0 = Ds4TimingClock::now();
+        ggml_backend_tensor_get(out, attn_out_host.data(), 0,
+                                sizeof(float) * (size_t) n_embd * n_tokens);
+        if (keep_window_rows) {
+            if (window_rows->kv.size() <= (size_t) il) {
+                window_rows->kv.resize((size_t) il + 1);
+                window_rows->score.resize((size_t) il + 1);
+            }
+            const size_t row_bytes = ggml_nbytes(window_kv[0]);
+            window_rows->kv[(size_t) il].resize(row_bytes * (size_t) n_tokens);
+            window_rows->score[(size_t) il].resize(row_bytes * (size_t) n_tokens);
+            for (int t = 0; t < n_tokens; ++t) {
+                ggml_backend_tensor_get(window_kv[(size_t) t],
+                                        window_rows->kv[(size_t) il].data() + (size_t) t * row_bytes,
+                                        0, row_bytes);
+                ggml_backend_tensor_get(window_score[(size_t) t],
+                                        window_rows->score[(size_t) il].data() + (size_t) t * row_bytes,
+                                        0, row_bytes);
+            }
+        }
+        if (telemetry) telemetry->attn_read_us += ds4_elapsed_us(read_t0, Ds4TimingClock::now());
+    }
+    ggml_free(ctx);
+    ds4_advance_comp_counters(w, il, lc, kv_start + n_tokens);
+    return ok;
+}
+
 // Layer-major DS4 prefill. Each layer is one GPU graph containing batched HC,
 // attention, MoE and HC post-processing. The HC state is kept in two external
 // device tensors and ping-ponged between layers, eliminating the two host
@@ -8810,13 +8991,13 @@ bool deepseek4_step_layer_range(
         heterogeneous_sparse_prefill &&
         (image_batch || ds4_env_flag("LUCE_DS4_HYBRID_PREFILL_EAGER")));
 
-    // V4.1 verification (staggered pre-mix): the layer loop below runs each
-    // token's attention through the cached single-token decode graph, in
-    // position order, so the batch may span any number of compressor
-    // boundaries and each token's attention, hyper-connections and output
-    // are computed exactly as native decode computes them; the FFN runs once
-    // for the whole batch (each routed expert is read once per layer) with
-    // batch-invariant products, so it too matches single-token decode.
+    // V4.1 verification (staggered pre-mix): each layer's attention is one
+    // graph that runs the single-token decode lane of every token in position
+    // order (ds4_run_verify_attention), so the batch may span any number of
+    // compressor boundaries; hyper-connections and the output head run per
+    // token as in decode, and the FFN runs once for the whole batch (each
+    // routed expert is read once per layer). All products are
+    // batch-invariant, so every token matches single-token decode bit for bit.
     const bool decode_tokenwise_verify =
         w.hc_staggered_pre && n_tokens > 1 && verify_hooks &&
         verify_hooks->all_logits_out && allow_decode_graph_reuse &&
@@ -9186,7 +9367,7 @@ bool deepseek4_step_layer_range(
     // honor the caller's request to take the dynamic path for verification.
     const bool reuse_decode_graphs = n_tokens == 1 && allow_decode_graph_reuse;
     Ds4DecodeSharedInputs * shared_inputs = nullptr;
-    if ((reuse_decode_graphs || decode_tokenwise_verify) && ds4_backend_is_gpu(backend) &&
+    if (reuse_decode_graphs && ds4_backend_is_gpu(backend) &&
         decode_shared_inputs.ensure(w, backend)) {
         decode_shared_inputs.set_step(w, kv_start);
         shared_inputs = &decode_shared_inputs;
@@ -9422,21 +9603,40 @@ bool deepseek4_step_layer_range(
 
         // ── Build & run attention graph ─────────────────────────────
         {
+            const int token_pos = kv_start + n_tokens - 1;
             const bool reuse_decode_attn = reuse_decode_graphs;
             ggml_tensor * attn_out = nullptr;
             ggml_cgraph * gf = nullptr;
             ggml_context * ctx = nullptr;
             DeepSeek4CachedDecodeAttnGraph * cached_attn = nullptr;
 
-            // Look up (or build) the cached single-token decode attention
-            // graph for a token at `pos` and set its per-step inputs; the
-            // caller supplies the attention input and runs the graph.
-            auto acquire_decode_attn = [&](int pos) -> DeepSeek4CachedDecodeAttnGraph * {
-                const int n_raw = std::min(pos + 1, w.n_swa);
-                const int n_comp_attn = (ratio > 0) ? ds4_comp_rows_used(comp_lc.comp_kv, ds4_committed_comp_rows(w, comp_lc.n_comp), ratio, pos) : 0;
-                const int n_index_comp = comp_lc.index_comp_kv ? ds4_comp_rows_used(comp_lc.index_comp_kv, ds4_committed_comp_rows(w, comp_lc.n_index_comp), ratio, pos) : 0;
-                const bool attn_flush = ratio > 0 && (((pos + 1) % ratio) == 0);
-                const bool index_flush = ratio == 4 && (((pos + 1) % ratio) == 0);
+            const bool exact_tokenwise_prefill =
+                !reuse_decode_attn && !decode_tokenwise_verify && n_tokens > 1 &&
+                cache.prefill_mode == PrefillAttentionMode::Exact;
+            if (decode_tokenwise_verify) {
+                if (!ds4_run_verify_attention(
+                        backend, w, L, lc, comp_lc, il, cur.data(), n_tokens, kv_start,
+                        attn_out_host, cached_attn_allocs[(size_t) il],
+                        verify_hooks->window_rows, telemetry)) {
+                    return false;
+                }
+            } else if (exact_tokenwise_prefill) {
+                const DeepSeek4AttentionImpl attention_impl =
+                    cache.prefill_mode == PrefillAttentionMode::Sparse
+                        ? DeepSeek4AttentionImpl::SparseFlash
+                        : DeepSeek4AttentionImpl::Explicit;
+                if (!ds4_run_exact_tokenwise_prefill_attention(
+                        backend, w, L, lc, comp_lc, il, cur.data(), n_tokens, kv_start,
+                        attention_impl, attn_out_host,
+                        cached_attn_allocs[(size_t) il], telemetry)) {
+                    return false;
+                }
+            } else if (reuse_decode_attn) {
+                const int n_raw = std::min(kv_start + 1, w.n_swa);
+                const int n_comp_attn = (ratio > 0) ? ds4_comp_rows_used(comp_lc.comp_kv, ds4_committed_comp_rows(w, comp_lc.n_comp), ratio, token_pos) : 0;
+                const int n_index_comp = comp_lc.index_comp_kv ? ds4_comp_rows_used(comp_lc.index_comp_kv, ds4_committed_comp_rows(w, comp_lc.n_index_comp), ratio, token_pos) : 0;
+                const bool attn_flush = ratio > 0 && (((token_pos + 1) % ratio) == 0);
+                const bool index_flush = ratio == 4 && (((token_pos + 1) % ratio) == 0);
                 auto & per_layer = cached_decode_attn_graphs[(size_t)il];
                 auto it = std::find_if(per_layer.begin(), per_layer.end(),
                     [&](const DeepSeek4CachedDecodeAttnGraph & candidate) {
@@ -9469,7 +9669,7 @@ bool deepseek4_step_layer_range(
                     per_layer.emplace_back();
                     auto & candidate = per_layer.back();
                     const auto attn_build_t0 = Ds4TimingClock::now();
-                    if (!build_cached_decode_attn_graph(candidate, backend, w, L, lc, comp_lc, il, pos,
+                    if (!build_cached_decode_attn_graph(candidate, backend, w, L, lc, comp_lc, il, kv_start,
                                                         n_raw, n_comp_attn, n_index_comp,
                                                         shared_inputs)) {
                         // Out of memory (tight primary GPU in split mode):
@@ -9496,13 +9696,13 @@ bool deepseek4_step_layer_range(
                         per_layer.emplace_back();
                         auto & candidate2 = per_layer.back();
                         if (!build_cached_decode_attn_graph(
-                                candidate2, backend, w, L, lc, comp_lc, il, pos,
+                                candidate2, backend, w, L, lc, comp_lc, il, kv_start,
                                 n_raw, n_comp_attn, n_index_comp,
                                 shared_inputs)) {
                             std::fprintf(stderr,
                                          "[deepseek4] cached attn graph alloc failed layer %d "
                                          "after eviction\n", il);
-                            return nullptr;
+                            return false;
                         }
                         it = std::prev(per_layer.end());
                     } else {
@@ -9521,22 +9721,29 @@ bool deepseek4_step_layer_range(
                     if (telemetry) telemetry->attn_build_us += ds4_elapsed_us(attn_build_t0, Ds4TimingClock::now());
                 }
                 it->last_use = ++layer_range_cache.decode_attn_cache_tick;
-                DeepSeek4CachedDecodeAttnGraph * cached_attn = &*it;
+                cached_attn = &*it;
+                gf = cached_attn->sg.gf;
+                attn_out = cached_attn->sg.hidden_states;
 
-                const int64_t raw_row = pos % w.n_swa;
-                const int32_t rope_pos = pos;
-                const int32_t neg_pos = -pos;
+                const int64_t raw_row = kv_start % w.n_swa;
+                const int32_t rope_pos = kv_start;
+                const int32_t neg_pos = -kv_start;
+                if (attn_in_backend) {
+                    ggml_backend_tensor_copy(attn_in_backend, cached_attn->sg.inp_embed);
+                } else {
+                    ggml_backend_tensor_set(cached_attn->sg.inp_embed, cur.data(), 0, sizeof(float) * cur.size());
+                }
                 if (!cached_attn->uses_shared_inputs) {
                 ggml_backend_tensor_set(cached_attn->inputs.rope_pos, &rope_pos, 0, sizeof(rope_pos));
                 ggml_backend_tensor_set(cached_attn->inputs.neg_pos, &neg_pos, 0, sizeof(neg_pos));
                 ggml_backend_tensor_set(cached_attn->inputs.raw_kv_rows, &raw_row, 0, sizeof(raw_row));
                 if (ratio > 0) {
-                    const int pos_mod = pos % ratio;
+                    const int pos_mod = token_pos % ratio;
                     const int32_t ape_row = pos_mod;
                     const int64_t state_row = (ratio == 4) ? (ratio + pos_mod) : pos_mod;
-                    const int64_t comp_row = pos / ratio;
-                    const int32_t comp_pos = pos + 1 - ratio;
-                    const bool flush_boundary = ((pos + 1) % ratio) == 0;
+                    const int64_t comp_row = token_pos / ratio;
+                    const int32_t comp_pos = token_pos + 1 - ratio;
+                    const bool flush_boundary = ((token_pos + 1) % ratio) == 0;
                     ggml_backend_tensor_set(cached_attn->inputs.attn_ape_row, &ape_row, 0, sizeof(ape_row));
                     ggml_backend_tensor_set(cached_attn->inputs.attn_state_rows, &state_row, 0, sizeof(state_row));
                     if (flush_boundary) {
@@ -9545,12 +9752,12 @@ bool deepseek4_step_layer_range(
                     }
                 }
                 if (ratio == 4) {
-                    const int pos_mod = pos % ratio;
+                    const int pos_mod = token_pos % ratio;
                     const int32_t ape_row = pos_mod;
                     const int64_t state_row = ratio + pos_mod;
-                    const int64_t comp_row = pos / ratio;
-                    const int32_t comp_pos = pos + 1 - ratio;
-                    const bool flush_boundary = ((pos + 1) % ratio) == 0;
+                    const int64_t comp_row = token_pos / ratio;
+                    const int32_t comp_pos = token_pos + 1 - ratio;
+                    const bool flush_boundary = ((token_pos + 1) % ratio) == 0;
                     ggml_backend_tensor_set(cached_attn->inputs.index_ape_row, &ape_row, 0, sizeof(ape_row));
                     ggml_backend_tensor_set(cached_attn->inputs.index_state_rows, &state_row, 0, sizeof(state_row));
                     if (flush_boundary) {
@@ -9558,56 +9765,6 @@ bool deepseek4_step_layer_range(
                         ggml_backend_tensor_set(cached_attn->inputs.index_comp_pos, &comp_pos, 0, sizeof(comp_pos));
                     }
                 }
-                }
-                return cached_attn;
-            };
-            const bool exact_tokenwise_prefill =
-                !reuse_decode_attn && !decode_tokenwise_verify && n_tokens > 1 &&
-                cache.prefill_mode == PrefillAttentionMode::Exact;
-            if (decode_tokenwise_verify) {
-                for (int t = 0; t < n_tokens; ++t) {
-                    const int pos = kv_start + t;
-                    if (shared_inputs) shared_inputs->set_step(w, pos);
-                    DeepSeek4CachedDecodeAttnGraph * g = acquire_decode_attn(pos);
-                    if (!g) return false;
-                    ggml_backend_tensor_set(g->sg.inp_embed, cur.data() + (size_t) t * n_embd, 0,
-                                            sizeof(float) * (size_t) n_embd);
-                    const auto attn_compute_t0 = Ds4TimingClock::now();
-                    if (ggml_backend_graph_compute(backend, g->sg.gf) != GGML_STATUS_SUCCESS) {
-                        std::fprintf(stderr, "[deepseek4] verify attn compute failed layer %d pos %d\n",
-                                     il, pos);
-                        return false;
-                    }
-                    if (telemetry) telemetry->attn_compute_us += ds4_elapsed_us(attn_compute_t0, Ds4TimingClock::now());
-                    const auto attn_read_t0 = Ds4TimingClock::now();
-                    ggml_backend_tensor_get(g->sg.hidden_states, attn_out_host.data() + (size_t) t * n_embd,
-                                            0, sizeof(float) * (size_t) n_embd);
-                    if (telemetry) telemetry->attn_read_us += ds4_elapsed_us(attn_read_t0, Ds4TimingClock::now());
-                    // The next token of this layer must see what this one
-                    // flushed, as the next decode step would.
-                    ds4_advance_comp_counters(w, il, lc, pos + 1);
-                    ds4_record_verify_window_row(verify_hooks->window_rows, lc, ratio, il, t, pos);
-                }
-            } else if (exact_tokenwise_prefill) {
-                const DeepSeek4AttentionImpl attention_impl =
-                    cache.prefill_mode == PrefillAttentionMode::Sparse
-                        ? DeepSeek4AttentionImpl::SparseFlash
-                        : DeepSeek4AttentionImpl::Explicit;
-                if (!ds4_run_exact_tokenwise_prefill_attention(
-                        backend, w, L, lc, comp_lc, il, cur.data(), n_tokens, kv_start,
-                        attention_impl, attn_out_host,
-                        cached_attn_allocs[(size_t) il], telemetry)) {
-                    return false;
-                }
-            } else if (reuse_decode_attn) {
-                cached_attn = acquire_decode_attn(kv_start);
-                if (!cached_attn) return false;
-                gf = cached_attn->sg.gf;
-                attn_out = cached_attn->sg.hidden_states;
-                if (attn_in_backend) {
-                    ggml_backend_tensor_copy(attn_in_backend, cached_attn->sg.inp_embed);
-                } else {
-                    ggml_backend_tensor_set(cached_attn->sg.inp_embed, cur.data(), 0, sizeof(float) * cur.size());
                 }
             } else {
                 const auto attn_build_t0 = Ds4TimingClock::now();
