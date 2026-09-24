@@ -5,6 +5,9 @@ DFlash. DeepSeek4 supports a monolithic HIP backend, a layer-split backend,
 and an in-process heterogeneous expert-parallel backend for a discrete GPU
 paired with Strix Halo.
 
+DeepSeek V4.1 Flash (`deepseek41`) runs on the same backend; its status, run
+recipe and open work are in [DS41.md](DS41.md).
+
 ## Model Architecture
 
 DeepSeek V4 Flash is a 43-layer MoE model with:
