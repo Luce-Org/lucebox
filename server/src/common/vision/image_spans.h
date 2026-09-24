@@ -33,6 +33,17 @@ inline const TokenSpan * image_block_at(ImageSpanView spans, uint64_t position) 
     return nullptr;
 }
 
+// End of the last image block that overlaps [begin, end), or 0 when none does.
+inline uint64_t last_image_end_in(ImageSpanView spans, uint64_t begin, uint64_t end) {
+    uint64_t last = 0;
+    for (size_t i = 0; i < spans.size; ++i) {
+        const auto & span = spans.data[i];
+        if (span.block_begin >= end) break;
+        if (span.block_end > begin) last = span.block_end;
+    }
+    return last;
+}
+
 inline bool valid_image_spans(ImageSpanView spans, uint64_t prompt_size,
                               size_t max_images, uint64_t max_block_tokens) {
     if (spans.size > max_images || (spans.size && !spans.data)) return false;

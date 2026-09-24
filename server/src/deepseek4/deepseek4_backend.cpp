@@ -2832,15 +2832,9 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
             // An image batch cannot capture DSpark features, so end it at its
             // last image: the text after the image then prefills (and
             // captures) as ordinary chunks.
-            const vision::ImageSpanView spans = images->spans();
-            uint64_t last_image_end = 0;
-            for (size_t k = 0; k < spans.size; ++k) {
-                const auto & span = spans.data[k];
-                if (span.block_begin < uint64_t(pos + n_tok) && span.block_end > uint64_t(pos)) {
-                    chunk_has_image = true;
-                    last_image_end = std::max(last_image_end, span.block_end);
-                }
-            }
+            const uint64_t last_image_end =
+                vision::last_image_end_in(images->spans(), uint64_t(pos), uint64_t(pos + n_tok));
+            chunk_has_image = last_image_end != 0;
             if (chunk_has_image && capture_spec && last_image_end < uint64_t(pos + n_tok)) {
                 n_tok = int(last_image_end - uint64_t(pos));
             }
@@ -3298,7 +3292,10 @@ GenerateResult DeepSeek4Backend::generate_from_state(
                 sampler_.rep_pen, sampler_.freq_pen, sampler_.pres_pen);
         }
     }
-    if (spec_enabled_ && spec_drafter_ && req.n_gen > 0 &&
+    // An image prompt whose last image leaves no captured text rows gives the
+    // drafter no context to start from; decode that request plainly.
+    const bool image_without_draft_context = req.images && spec_feat_window_.empty();
+    if (spec_enabled_ && spec_drafter_ && req.n_gen > 0 && !image_without_draft_context &&
         !req.force_ar_decode && !budget_requires_ar && !sampling_requires_ar) {
         if (last_logits_.empty()) {
             result.fail(GenerateErrorCode::DecodeFailed, "spec: no prefill logits");

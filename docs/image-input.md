@@ -148,7 +148,8 @@ Lucebox `Qwen3.8-27B-IQ4_XS-pure` file and a Q8_0 projector:
 - Image requests decode with the drafter. On 12 images with 256-token
   answers: 4.0 s per answer (76 tok/s after the first token), against 5.5 s
   for llama.cpp with the same drafter (`--spec-type draft-dflash`) and 8.4 s
-  without one; faster on every image, 1.21x to 1.58x. The 220-question score
+  without one; faster than llama.cpp with the drafter on every image, 1.21x
+  to 1.58x. The 220-question score
   is unchanged (188, 218 answers identical to plain decode).
 
 With unsloth's UD-IQ4_XS file and the published BF16 projector:
@@ -156,7 +157,8 @@ With unsloth's UD-IQ4_XS file and the published BF16 projector:
 - 220 seeded questions from `lmms-lab/ai2d` and `lmms-lab/ChartQA` with
   lmms-eval prompts: AI2D 85/100, ChartQA relaxed accuracy 55/60 (augmented)
   and 43/60 (human), no errors. Image prompts average 448 tokens and prefill in
-  0.71 s (largest 1,068 tokens, 1.8 s); decode runs at 31 to 35 tok/s.
+  0.71 s (largest 1,068 tokens, 1.8 s); decode runs at 31 to 35 tok/s (plain
+  decode, measured before image requests used the drafter).
 - A projector with its weight matrices in Q8_0 (rows that are not a multiple
   of 32 stay F16) encodes a 975-token image in 443 ms instead of 677 ms with
   the BF16 file, with the same scores on the 220 questions and 216 identical
@@ -171,7 +173,8 @@ With unsloth's UD-IQ4_XS file and the published BF16 projector:
   tokens). The projector adds 0.9 GiB of VRAM; the peak during image requests
   was 21.6 GiB against 20.8 GiB for text.
 - The same requests answer correctly on a Strix Halo alone, where a
-  1,012-token image prompt prefills in 4.6 s and decodes at 14 tok/s.
+  1,012-token image prompt prefills in 4.6 s and decodes at 14 tok/s (plain
+  decode).
 
 Not yet established: a comparison against the reference implementation on the
 same questions, and CUDA. The tower uses only standard ggml
@@ -250,7 +253,8 @@ the exported projector, on a Strix Halo alone and on R9700 + Strix Halo, 220
 seeded questions from `lmms-lab/ai2d` and `lmms-lab/ChartQA` with lmms-eval
 prompts: AI2D 85/100, ChartQA relaxed accuracy 55/60 (augmented) and 43/60
 (human). Both layouts score the same and give word-identical answers on 213 of
-220 questions. An image request prefills in about 4 s and decodes at about
+220 questions. An image request prefills in about 4 s and, without the
+drafter, decodes at about
 23 tok/s.
 
 With our own ROCMFP MIX conversion of the same checkpoint (per-expert
