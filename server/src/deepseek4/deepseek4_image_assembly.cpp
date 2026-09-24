@@ -57,17 +57,6 @@ void cancelled(const ImageCancelled & callback) {
 }
 } // namespace
 
-std::shared_ptr<void> ImageRequestGate::try_acquire() const {
-    int current = active_->load(std::memory_order_acquire);
-    do {
-        if (current >= capacity_) return {};
-    } while (!active_->compare_exchange_weak(current, current + 1, std::memory_order_acq_rel));
-    // shared_ptr invokes the deleter if control-block allocation throws too.
-    return std::shared_ptr<void>(active_.get(), [active = active_](void *) {
-        active->fetch_sub(1, std::memory_order_release);
-    });
-}
-
 bool assemble_image_rows(const ImageLayout & layout, const ImageRaster & raster,
                          const ImageSentinels & sentinels, size_t dimension,
                          std::vector<float> & output, std::string & error) {

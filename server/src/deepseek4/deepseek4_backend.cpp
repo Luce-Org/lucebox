@@ -55,9 +55,8 @@ private:
     friend class DeepSeek4Backend;
     DeepSeek4ImagePrompt(const DeepSeek4Backend * owner,
                         vision::PreparedImagePrompt prepared,
-                        std::vector<EncodedImage> encoded, std::shared_ptr<void> lease)
-        : owner_(owner), prepared_(std::move(prepared)), encoded_(std::move(encoded)),
-          lease_(std::move(lease)) {
+                        std::vector<EncodedImage> encoded)
+        : owner_(owner), prepared_(std::move(prepared)), encoded_(std::move(encoded)) {
         for (const auto & image : prepared_.images) spans_.push_back(image.layout.span);
     }
 
@@ -108,7 +107,6 @@ private:
     const DeepSeek4Backend * const owner_;
     const vision::PreparedImagePrompt prepared_;
     const std::vector<EncodedImage> encoded_;
-    const std::shared_ptr<void> lease_;
     std::vector<vision::TokenSpan> spans_;
     mutable std::vector<std::vector<float>> materialized_;
     mutable std::mutex stream_mutex_;
@@ -1104,13 +1102,11 @@ ImagePrepareStatus DeepSeek4Backend::prepare_images(
             error = "too many images in request";
             return ImagePrepareStatus::invalid;
         }
-        auto lease = image_request_gate_.try_acquire();
-        if (!lease) {
-            error = "the server is serving as many image requests as it holds; retry shortly";
-            return ImagePrepareStatus::busy;
-        }
+        // Image requests queue like text ones: a waiting request holds only
+        // its patches (a few MB per image); the encoded rows exist only once
+        // it runs, so the slots bound them. Short host memory is capacity.
         if (!vision::check_deepseek4_image_host_preparation(4ULL * 1024 * 1024 * 1024, error)) {
-            return ImagePrepareStatus::invalid;
+            return ImagePrepareStatus::busy;
         }
         std::vector<vision::ImagePatchInput> patches;
         patches.reserve(images.size());
@@ -1135,7 +1131,7 @@ ImagePrepareStatus DeepSeek4Backend::prepare_images(
         auto prepared = vision::prepare_image_prompt(tokens, patches, limits);
         if (!prepared) { error = prepared.message; return ImagePrepareStatus::invalid; }
         auto binding = std::shared_ptr<DeepSeek4ImagePrompt>(
-            new DeepSeek4ImagePrompt(this, std::move(prepared), std::move(images), std::move(lease)));
+            new DeepSeek4ImagePrompt(this, std::move(prepared), std::move(images)));
         if (!vision::valid_image_spans(binding->spans(), binding->prepared_.tokens.size())) {
             error = "invalid prepared image spans";
             return ImagePrepareStatus::invalid;
@@ -1915,7 +1911,6 @@ bool DeepSeek4Backend::init() {
                 return false;
             }
             cache_.prefill_mode = PrefillAttentionMode::Sparse;
-            image_request_gate_.set_capacity(cfg_.max_concurrency);
             std::fprintf(stderr, "[deepseek4] batched image serving: %d slots, staging cache ctx=%d\n",
                          cfg_.max_concurrency, max_ctx);
         }

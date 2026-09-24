@@ -1,23 +1,10 @@
 #pragma once
 
 #include "deepseek4_image_prompt.h"
-#include <atomic>
 #include <functional>
 #include <memory>
 
 namespace luce::vision {
-
-// Bound decoded/prepared image memory to one outstanding request. The lease
-// travels with the immutable payload and may be released by another thread.
-class ImageRequestGate {
-public:
-    std::shared_ptr<void> try_acquire() const;
-    // Concurrent serving admits up to one image request per batch slot.
-    void set_capacity(int capacity) { capacity_ = capacity > 0 ? capacity : 1; }
-private:
-    std::shared_ptr<std::atomic<int>> active_ = std::make_shared<std::atomic<int>>(0);
-    int capacity_ = 1;
-};
 
 struct ImageRaster {
     size_t rows = 0, columns = 0;

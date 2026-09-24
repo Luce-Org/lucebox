@@ -137,7 +137,6 @@ private:
     ggml_backend_t         vision_backend_ = nullptr;
     // Encodes images on vision_backend_ while prefill consumes them.
     std::thread            image_stream_;
-    vision::ImageRequestGate image_request_gate_;
     vision::ImageAdmissionReserves image_reserves_;
 
     // Sampler

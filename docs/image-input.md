@@ -158,8 +158,7 @@ request's paged slot and the last token prefills in the batch, so the answers
 decode alongside everyone else. On the Strix Halo with the encoder on the
 R9700, four concurrent image answers of 256 tokens finish in 35 s (29 tok/s in
 total), two images plus two text requests at 31 tok/s; four text requests
-reach 38 tok/s. The server holds at most one image request per slot; further
-image requests get HTTP 503 and should be retried. `/props` reports the
+reach 38 tok/s. Image requests beyond the free slots wait in the queue. `/props` reports the
 effective capability in `capabilities.image_input_supported` after backend
 initialization.
 
@@ -261,10 +260,11 @@ per-expert layout is used expert by expert; the community publishes one for
 this model) or `--absmax-only`. The converter uses every core: about 40 minutes
 for this checkpoint on 32 cores.
 
-One image request may be outstanding per backend. Its admission lease remains
-with the immutable payload through queueing and generation; another image
-request is rejected until that payload is released. This bounds simultaneous
-preprocessing and prepared-image memory. Text requests retain the normal queue.
+Image requests wait in the same queue as text requests. A waiting request
+holds only its preprocessed patches, a few MB per image; its encoded rows
+exist only while it runs, so the number of slots bounds them. When host
+memory is too short to prepare another image request, the server answers
+HTTP 503 and the client should retry.
 
 The server expands image markers after final rendering and tokenization.
 Expanded image tokens count toward context and usage. Image blocks remain
