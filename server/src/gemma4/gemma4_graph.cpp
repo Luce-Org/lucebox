@@ -111,18 +111,8 @@ static ggml_tensor * build_gemma4_moe_block(ggml_context * ctx, ggml_tensor * at
     // Routed expert forward via mul_mat_id with fused gate+up
     ggml_tensor * cur_3d = ggml_reshape_3d(ctx, cur_moe, n_embd, 1, n_tokens);
     ggml_tensor * gate_up_e = ggml_mul_mat_id(ctx, L.ffn_gate_up_exps, cur_3d, selected);
-    // gate_up_e is [n_ff_exp*2, n_used, n_tokens] — split and GELU-gate
-    const int n_ff_exp = w.n_ff_exp;
-    ggml_tensor * gate_e = ggml_view_3d(ctx, gate_up_e,
-        n_ff_exp, gate_up_e->ne[1], gate_up_e->ne[2],
-        gate_up_e->nb[1], gate_up_e->nb[2], 0);
-    ggml_tensor * up_e = ggml_view_3d(ctx, gate_up_e,
-        n_ff_exp, gate_up_e->ne[1], gate_up_e->ne[2],
-        gate_up_e->nb[1], gate_up_e->nb[2],
-        (size_t)n_ff_exp * ggml_element_size(gate_up_e));
-    gate_e = ggml_cont(ctx, gate_e);
-    up_e = ggml_cont(ctx, up_e);
-    ggml_tensor * gu = ggml_mul(ctx, ggml_gelu(ctx, gate_e), up_e);
+    // GEGLU reads gate and up directly from the packed [2*n_ff_exp, n_used, n_tokens] tensor.
+    ggml_tensor * gu = ggml_geglu(ctx, gate_up_e);
     ggml_tensor * experts = ggml_mul_mat_id(ctx, L.ffn_down_exps, gu, selected);
 
     // Weighted sum of expert outputs
