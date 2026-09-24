@@ -43,6 +43,31 @@ static float weighted_mse(const float * a, const float * b, const float * w, int
     return sum_w > 0.0f ? err / sum_w : 0.0f;
 }
 
+#ifndef ROCMFP2_AFFINE
+// Bit 7 of a ROCmFP2 scale byte negates that half-block's codebook.
+static void check_fp2_sign_flip(void) {
+    block_rocmfp2 plain;
+    float src[2*QK_ROCMFP2];
+    float ref[QK_ROCMFP2];
+    float flipped[QK_ROCMFP2];
+
+    fill_row(src, 2*QK_ROCMFP2);
+    rocmfpx_quantize_row_fp2_ref(src, &plain, QK_ROCMFP2);
+    rocmfpx_dequantize_row_fp2(&plain, ref, QK_ROCMFP2);
+
+    block_rocmfp2 signed_block = plain;
+    signed_block.e[1] |= 0x80;
+    assert(rocmfpx_validate_row_data_fp2(&signed_block, sizeof(signed_block)));
+    rocmfpx_dequantize_row_fp2(&signed_block, flipped, QK_ROCMFP2);
+    for (int i = 0; i < QK_ROCMFP2; ++i) {
+        assert(flipped[i] == (i < QK_ROCMFP2/2 ? ref[i] : -ref[i]));
+    }
+
+    signed_block.e[0] = 0xff;  // sign bit over an invalid scale
+    assert(!rocmfpx_validate_row_data_fp2(&signed_block, sizeof(signed_block)));
+}
+#endif
+
 static void check_weighted_imatrix_fp3(void) {
     enum { N = QK_ROCMFP3 };
 
@@ -232,6 +257,8 @@ int main(void) {
     check_weighted_imatrix_fp2();
 #ifdef ROCMFP2_AFFINE
     check_fp2_affine_encoding();
+#else
+    check_fp2_sign_flip();
 #endif
     check_weighted_imatrix_fp3();
     check_large_finite_values();

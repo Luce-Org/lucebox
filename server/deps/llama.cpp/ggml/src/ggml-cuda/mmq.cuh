@@ -1007,7 +1007,7 @@ struct rocmfpx_dual_mmq_traits<GGML_TYPE_Q2_0_ROCMFP2> {
     }
 
     static __device__ __forceinline__ float scale(const block_t * block, const int half) {
-        return rocmfpx_ue4m3_to_fp32_finite(block->e[half]);
+        return rocmfpx_fp2_half_scale_to_fp32_finite(block->e[half]);
     }
 };
 

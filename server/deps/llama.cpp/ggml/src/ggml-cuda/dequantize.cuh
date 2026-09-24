@@ -179,8 +179,8 @@ static __device__ __forceinline__ void dequantize_rocmfpx_fp2(const void * vx, c
     v.x = (float) (rocmfpx_get_fp2_code_cuda(x[ib].qs, i0) & 3u) * scale - offset;
     v.y = (float) (rocmfpx_get_fp2_code_cuda(x[ib].qs, i1) & 3u) * scale - offset;
 #else
-    const float d0 = rocmfpx_ue4m3_to_fp32_finite(x[ib].e[i0 >= QK_ROCMFP2/2]);
-    const float d1 = rocmfpx_ue4m3_to_fp32_finite(x[ib].e[i1 >= QK_ROCMFP2/2]);
+    const float d0 = rocmfpx_fp2_half_scale_to_fp32_finite(x[ib].e[i0 >= QK_ROCMFP2/2]);
+    const float d1 = rocmfpx_fp2_half_scale_to_fp32_finite(x[ib].e[i1 >= QK_ROCMFP2/2]);
 
     v.x = d0 * rocmfpx_decode_fp2_code_cuda(rocmfpx_get_fp2_code_cuda(x[ib].qs, i0));
     v.y = d1 * rocmfpx_decode_fp2_code_cuda(rocmfpx_get_fp2_code_cuda(x[ib].qs, i1));

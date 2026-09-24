@@ -561,7 +561,7 @@ static __device__ __forceinline__ float vec_dot_rocmfpx_fp2_q8_1(
 #ifdef ROCMFP2_AFFINE
     return rocmfpx_fp2_affine_dot(bq2, bq8_1, sumi, iqs, db);
 #else
-    return db * rocmfpx_ue4m3_to_fp32_finite(bq2->e[iqs]) * sumi;
+    return db * rocmfpx_fp2_half_scale_to_fp32_finite(bq2->e[iqs]) * sumi;
 #endif
 }
 
