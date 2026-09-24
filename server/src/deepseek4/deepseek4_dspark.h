@@ -181,7 +181,8 @@ bool deepseek4_dspark_verify_forward(ggml_backend_t backend,
                                      MoeExpertComputeRuntime * expert_runtime = nullptr,
                                      MoeHybridRoutingStats * routing_stats = nullptr,
                                      DeepSeek4SpecBoundaryCheckpoint *
-                                         boundary_checkpoint_out = nullptr);
+                                         boundary_checkpoint_out = nullptr,
+                                     Ds4VerifyWindowRows * window_rows = nullptr);
 
 // Minimal speculative-decode rollback state. Rejected positions must restore
 // the physical SWA rows they overwrote after the ring wraps; otherwise a later

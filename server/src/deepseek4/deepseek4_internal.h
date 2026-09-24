@@ -646,6 +646,16 @@ bool deepseek4_step(
 // When set on a multi-token deepseek4_step_layer_range call they add: per-layer
 // mean-over-HC feature capture and full per-position logits. Null on the normal
 // (23 tok/s) decode path so it is completely unaffected.
+// Rows a verify batch wrote into small pooled compressor windows (V4.1 ratio
+// 2: a window's state rows are its tokens' projections, pooled when it
+// completes). A later token of the batch overwrites the row of an earlier one
+// at the same window slot, so a rejection that ends mid-window puts the
+// accepted tokens' rows back from here (see the DSpark rollback).
+struct Ds4VerifyWindowRows {
+    std::vector<std::vector<uint8_t>> kv;     // [layer] -> [batch token][row bytes]
+    std::vector<std::vector<uint8_t>> score;
+};
+
 struct Ds4VerifyHooks {
     const std::vector<int> * capture_layer_ids = nullptr;  // e.g. {40,41,42}
     std::vector<float> *     capture_out = nullptr;         // [n_cap*n_embd * n_tokens]
@@ -657,7 +667,16 @@ struct Ds4VerifyHooks {
     std::vector<int32_t> *   argmax_out = nullptr;          // [n_tokens], optional GPU result
     bool                     prefer_argmax_only = false;     // skip logits D2H when available
     DeepSeek4SpecBoundaryCheckpoint * boundary_checkpoint_out = nullptr;
+    Ds4VerifyWindowRows *    window_rows = nullptr;         // V4.1 tokenwise verify
 };
+
+// True for a compressor state that is one pooled window of `ratio` rows
+// (V4.1 ratio 2), as opposed to V4's overlapping ratio-4 state or its
+// ratio-128 ring.
+inline bool deepseek4_is_window_state(const DeepSeek4CompressorState & st, int ratio) {
+    return ratio > 1 && ratio < 4 && st.state_kv && st.state_score &&
+           st.state_kv->ne[1] == ratio && st.state_score->ne[1] == ratio;
+}
 
 bool deepseek4_step_layer_range(
     ggml_backend_t              backend,

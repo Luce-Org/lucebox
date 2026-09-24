@@ -1300,6 +1300,8 @@ bool DeepSeek4Backend::requires_monolithic_model() const {
 // and layer-range step) with dense attention over its shared compressed
 // caches. The paths below do not implement its cache sharing or staggered
 // pre-mix yet, so refuse them instead of silently producing wrong tokens.
+// DSpark speculative decoding verifies through the layer-range step (see
+// deepseek4_step_layer_range), so it is allowed.
 bool DeepSeek4Backend::validate_model_features() const {
     if (!w_.hc_staggered_pre) return true;
     const char * unsupported = nullptr;
@@ -1307,8 +1309,8 @@ bool DeepSeek4Backend::validate_model_features() const {
         unsupported = "--paged-attention";
     } else if (cfg_.fused_decode || env_flag_enabled("LUCE_DS4_FUSED_DECODE")) {
         unsupported = "fused decode";
-    } else if (cfg_.fused_verify_f16_kv || env_flag_enabled("LUCE_DS4_SPEC")) {
-        unsupported = "DSpark speculative decoding";
+    } else if (cfg_.fused_verify_f16_kv || env_flag_enabled("LUCE_DS4_FUSED_VERIFY")) {
+        unsupported = "fused verify";
     } else if (cfg_.device.is_layer_split()) {
         unsupported = "layer split";
     } else if (!cfg_.mmproj_path.empty()) {
