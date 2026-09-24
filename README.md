@@ -176,6 +176,21 @@ docker run --rm --device /dev/kfd --device /dev/dri \
   ghcr.io/luce-org/lucebox-hub:rocm
 ```
 
+The container picks the GPU the model fits on (a discrete card before an integrated one, else the largest) and sizes the context from that GPU's memory. `serve` is the default command, so `luce_server` flags can follow the image name directly (or `serve`); they replace the values the container would pass. `--target-device`, `--max-ctx` and `--profile` all work:
+
+```bash
+# Show the GPUs, the model, and the device auto placement would use
+docker run --rm <gpu flags> -v ... ghcr.io/luce-org/lucebox-hub:rocm devices
+
+# DeepSeek V4 on Strix Halo with its qualified profile (DSpark drafter in models/draft/)
+docker run --rm <gpu flags> -p 8000:8080 -v ... ghcr.io/luce-org/lucebox-hub:rocm --profile ds4-strix
+
+# Pin a device
+docker run --rm <gpu flags> -p 8000:8080 -v ... ghcr.io/luce-org/lucebox-hub:rocm --target-device hip:1
+```
+
+Environment variables such as `LUCE_TARGET`, `LUCE_TARGET_DEVICE`, `LUCE_MAX_CTX` and `LUCE_ARGS` cover the same settings for compose files; see the header of [`server/scripts/entrypoint.sh`](server/scripts/entrypoint.sh).
+
 ## Run the Server
 
 This quick start runs the R9700 profile above. The complete flag reference is in the [server guide](server/README.md#server-parameter-reference).

@@ -649,18 +649,27 @@ void test_feature_warnings_report_inert_draft() {
     args.model_path = "/nonexistent/model.gguf";
     args.draft_path = "/nonexistent/draft.gguf";
 
-    // qwen3 and deepseek4 never forward a draft model.
+    // qwen3 never forwards a draft model.
     CHECK(warns_about(warn_result(args, "qwen3"), "--draft"));
-    CHECK(warns_about(warn_result(args, "deepseek4"), "--draft"));
-    // laguna and gemma4 forward it only when monolithic.
+    // laguna, gemma4 and deepseek4 (DSpark) forward it only when monolithic.
     CHECK(!warns_about(warn_result(args, "laguna"), "--draft"));
     CHECK(!warns_about(warn_result(args, "gemma4"), "--draft"));
+    CHECK(!warns_about(warn_result(args, "deepseek4"), "--draft"));
 
     BackendArgs split = args;
     CHECK(parse_placement_device_list("cuda:0,cuda:1", split.device));
     const std::vector<std::string> w = collect_feature_warnings(split, "laguna");
     CHECK(warns_about(w, "--draft"));
     CHECK(w[0].find("single-device placement") != std::string::npos);
+    const std::vector<std::string> ds4 = collect_feature_warnings(split, "deepseek4");
+    CHECK(warns_about(ds4, "--draft"));
+    CHECK(ds4[0].find("single-device placement") != std::string::npos);
+
+    // A deepseek4 remote target shard runs the layer-split adapter too.
+    BackendArgs shard = args;
+    shard.remote_target_shard.ipc_bin = "/usr/bin/target-shard-ipc";
+    CHECK(warns_about(collect_feature_warnings(shard, "deepseek4"), "--draft"));
+    CHECK(!warns_about(collect_feature_warnings(shard, "laguna"), "--draft"));
 }
 
 void test_feature_warnings_report_inert_decode_tunables() {

@@ -400,7 +400,11 @@ std::vector<std::string> collect_feature_warnings(
     const std::string & arch)
 {
     std::vector<std::string> out;
-    const bool split = args.device.is_layer_split();
+    // create_backend() also hands deepseek4 to its layer-split adapter for a
+    // remote target shard on one local device; that adapter drops the same
+    // options as an explicit split.
+    const bool split = args.device.is_layer_split() ||
+        (arch == "deepseek4" && args.remote_target_shard.enabled());
 
     // Each entry pairs a requested option with the capability predicate for
     // the field create_backend() would have to forward for it to take effect.

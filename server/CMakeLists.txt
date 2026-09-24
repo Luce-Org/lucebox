@@ -603,6 +603,7 @@ add_library(luce_common STATIC
     src/common/backend_factory.cpp
     src/common/feature_gate.cpp
     src/placement/placement_config.cpp
+    src/placement/device_select.cpp
     src/common/layer_split_utils.cpp
     src/common/ddtree.cpp
     src/common/peer_access.cpp
@@ -1966,15 +1967,15 @@ if(LUCE_TESTS)
         list(APPEND _raw_unit_test_targets test_moe_input_ready)
     endif()
 
-    # The production CUDA and ROCm images share this entrypoint. Keep native
-    # server defaults intact unless an operator explicitly supplies an env
-    # override; otherwise container launches can silently disable features
-    # that are enabled by the C++ server itself.
-    if(UNIX AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_entrypoint_cache_defaults.sh")
+    # The production CUDA and ROCm images share this entrypoint. The test
+    # drives it against a fake luce_server: native defaults stay with the
+    # server, operator flags pass through and win, and device, context and
+    # draft choices follow the probed hardware and model architecture.
+    if(UNIX AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_entrypoint.sh")
         add_test(
-            NAME server_unit_entrypoint_cache_defaults
+            NAME server_unit_entrypoint
             COMMAND bash
-                "${CMAKE_CURRENT_SOURCE_DIR}/test/test_entrypoint_cache_defaults.sh"
+                "${CMAKE_CURRENT_SOURCE_DIR}/test/test_entrypoint.sh"
                 "${CMAKE_CURRENT_SOURCE_DIR}/scripts/entrypoint.sh")
     endif()
 
@@ -2245,6 +2246,7 @@ if(LUCE_TESTS)
         add_executable(test_feature_gate test/test_feature_gate.cpp)
         target_sources(test_feature_gate PRIVATE
             test/test_backend_plan.cpp
+            test/test_launch_policy.cpp
             src/common/backend_plan.cpp
             src/common/feature_gate.cpp
             src/kv_quant.cpp

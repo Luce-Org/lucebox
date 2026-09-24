@@ -372,7 +372,9 @@ struct DeepSeek4BackendConfig {
     std::string  model_path;
     std::string  mmproj_path;
     int          mmproj_gpu   = -1;    // vision encoder GPU; -1 = the target's
+    std::string  draft_path;   // DSpark drafter; empty falls back to LUCE_DS4_DRAFT
     DevicePlacement device;
+    DevicePlacement draft_device;  // auto backend: LUCE_DS4_DRAFT_GPU/_BACKEND, else the target
     int          stream_fd    = -1;
     int          chunk        = 512;   // prefill chunk size
     PrefillAttentionMode prefill_mode = PrefillAttentionMode::Exact;

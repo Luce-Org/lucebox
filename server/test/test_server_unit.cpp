@@ -38,6 +38,7 @@
 #include "common/layer_split_kvflash.h"
 #include "common/layer_split_utils.h"
 #include "common/kvflash_pager.h"
+#include "placement/device_select.h"
 #include "placement/draft_residency.h"
 #include "common/gguf_bounds.h"
 #include "common/gguf_inspect.h"
@@ -186,6 +187,41 @@ TEST_CASE(ServerUnitFixture, test_placement_device_rejects_gpu_index_overflow) {
         TEST_ASSERT(!parse_placement_device(value, device));
     }
     TEST_ASSERT(!parse_placement_device_list("hip:0,hip:4294967296", device));
+}
+
+// --target-device auto sizes the KV cache from the GGUF header for the
+// Qwen3.5/3.6 hybrids: only full-attention layers, excluding NextN blocks.
+TEST_CASE(ServerUnitFixture, test_gguf_kv_cache_bytes_counts_full_attention_layers) {
+    auto write = [](const char * arch, const char * name) {
+        gguf_context * g = gguf_init_empty();
+        const std::string pre = std::string(arch) + ".";
+        gguf_set_val_str(g, "general.architecture", arch);
+        gguf_set_val_u32(g, (pre + "block_count").c_str(), 9);
+        gguf_set_val_u32(g, (pre + "nextn_predict_layers").c_str(), 1);
+        gguf_set_val_u32(g, (pre + "full_attention_interval").c_str(), 4);
+        gguf_set_val_u32(g, (pre + "attention.head_count_kv").c_str(), 2);
+        gguf_set_val_u32(g, (pre + "attention.key_length").c_str(), 128);
+        gguf_set_val_u32(g, (pre + "attention.value_length").c_str(), 128);
+        const std::string path = test_tmp_path(name).string();
+        gguf_write_to_file(g, path.c_str(), /*only_meta=*/true);
+        gguf_free(g);
+        return path;
+    };
+    const std::string qwen = write("qwen35", "luce_test_kv_qwen35.gguf");
+    // 8 target layers / interval 4 = 2 full-attention layers, 2 KV heads.
+    const uint64_t q4_row = ggml_row_size(GGML_TYPE_Q4_0, 128);
+    TEST_ASSERT(gguf_kv_cache_bytes(qwen, 1000, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0) ==
+                2ull * 2 * (q4_row + q4_row) * 1000);
+    const uint64_t f16_row = ggml_row_size(GGML_TYPE_F16, 128);
+    TEST_ASSERT(gguf_kv_cache_bytes(qwen, 1000, GGML_TYPE_F16, GGML_TYPE_F16) ==
+                2ull * 2 * (f16_row + f16_row) * 1000);
+    TEST_ASSERT(gguf_kv_cache_bytes(qwen, 0, GGML_TYPE_F16, GGML_TYPE_F16) == 0);
+
+    // Families that size their own caches are not estimated.
+    TEST_ASSERT(gguf_kv_cache_bytes(write("deepseek4", "luce_test_kv_ds4.gguf"), 1000,
+                                    GGML_TYPE_F16, GGML_TYPE_F16) == 0);
+    TEST_ASSERT(gguf_kv_cache_bytes(test_tmp_path("luce_test_kv_missing.gguf").string(),
+                                    1000) == 0);
 }
 
 TEST_CASE(ServerUnitFixture, test_api_format_names_are_total) {

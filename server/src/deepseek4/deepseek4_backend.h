@@ -157,7 +157,9 @@ private:
     // safe only when this matches cache_.cur_pos.
     int                    last_logits_pos_ = -1;
 
-    // DSpark speculative decode (opt-in: LUCE_DS4_SPEC=1 + LUCE_DS4_DRAFT=<gguf>).
+    // DSpark speculative decode (opt-in: --draft <gguf>, or
+    // LUCE_DS4_SPEC=1 + LUCE_DS4_DRAFT=<gguf>).
+    bool                           spec_requested_ = false;
     bool                           spec_enabled_ = false;
     bool                           spec_drafter_parked_ = false;
     std::string                    spec_draft_path_;

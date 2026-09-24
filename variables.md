@@ -1,6 +1,6 @@
 # Environment Variables Reference
 
-Summary of `LUCE_*` / `LUCE_*` environment variables recognized across the
+Summary of `LUCE_*` environment variables recognized across the
 codebase, grouped by subsystem. Most are runtime toggles read via `getenv` /
 `os.environ`; a few are build/compile-time or harness knobs (noted where relevant).
 
@@ -29,21 +29,24 @@ Untagged variables are operational tuning knobs.
 |---|---|
 | `LUCE_HOST` | Server bind host. |
 | `LUCE_PORT` | Server bind port. |
-| `LUCE_BIN` / `LUCE_SERVER_BIN` | Path to the server binary (harness/scripts). |
+| `LUCE_BIN` | 🧪 **test/bench** Path to `test_dflash` for the bench scripts. |
+| `LUCE_SERVER_BIN` | Path to `luce_server` (container entrypoint, harness). |
 | `LUCE_BIN_AR` | Alternate/AR binary path for benchmarks. |
 | `LUCE_DIR` | Base working directory. |
 | `LUCE_SHARE_DIR` | Static/share asset directory served by the HTTP server. |
 | `LUCE_MODEL_CARDS_DIR` | Directory of model-card definitions. |
 | `LUCE_MODEL_NAME` | Model name/identifier. |
 | `LUCE_TOKENIZER` | Tokenizer path/identifier. |
-| `LUCE_TARGET` | Target model path/spec. |
-| `LUCE_DRAFT` | Draft model path/spec. |
+| `LUCE_TARGET` | Target model path (container entrypoint, `run.py`). |
+| `LUCE_DRAFT` | Draft file or directory (container entrypoint, `run.py`); `none` disables the container draft. |
+| `LUCE_TARGET_DEVICE` | Default `--target-device` (`backend:gpu` or `auto`) when no flag or profile names one; the container sets `auto`. |
+| `LUCE_PROFILE` / `LUCE_ARGS` | Container entrypoint: `--profile` name and extra `luce_server` flags. |
 | `LUCE_IMAGE_INFO_PATH` | Path to image/build info metadata. |
-| `LUCE_MAX_CONTEXT` / `LUCE_MAX_CTX` | Maximum context length. |
+| `LUCE_MAX_CTX` | Container entrypoint `--max-ctx` (default: sized from the GPU's memory). |
+| `LUCE_MAX_CONTEXT` | KV sizing override for laguna and qwen35moe expert placement. |
 | `LUCE_DEFAULT_MAX_TOKENS` | Default generation token cap. |
 | `LUCE_IGNORE_EOS` | Ignore EOS token during generation. |
-| `LUCE_LAZY` | Lazy model/weight loading. |
-| `LUCE_VERBOSE` | 🐛 **debug** Verbose logging. |
+| `LUCE_LAZY` | Container entrypoint: `1` adds `--lazy-draft` (needs a draft and `LUCE_PREFILL_DRAFTER`). |
 
 ## GPU / backend placement
 
@@ -291,12 +294,10 @@ Untagged variables are operational tuning knobs.
 | Variable | Purpose |
 |---|---|
 | `LUCE_THINK_MAX` | Max thinking tokens. |
-| `LUCE_THINK_SOFT_CLOSE_MIN_RATIO` | Soft-close ratio for thinking blocks. |
-| `LUCE_DEBUG_THINKING_LOGITS` | 🐛 **debug** Debug thinking logits. |
 | `LUCE_DEGENERATE_RUN_TOKENS` | Degenerate-run token threshold. |
 | `LUCE_STALL_TOOL_PREFIX` | Tool-call stall prefix handling. |
 | `LUCE_MIN_TOKENS` | Minimum generated tokens. |
-| `LUCE_BUDGET` | Token/compute budget. |
+| `LUCE_BUDGET` | Container entrypoint `--ddtree-budget` (default 22). |
 | `LUCE_ANTHROPIC_RAW_SYSTEM` / `LUCE_ANTHROPIC_RAW_USER` | Pass raw system/user content on the Anthropic-compatible path. |
 
 ## Profiling / debug instrumentation
@@ -326,7 +327,7 @@ Untagged variables are operational tuning knobs.
 Runtime C/C++ variables can be re-listed with:
 
 ```sh
-grep -rE 'getenv\("DFLASH[A-Z0-9_]*"\)' server/src
+grep -rE 'getenv\("LUCE_[A-Z0-9_]*"\)' server/src
 ```
 
 See `server/docs/ENVIRONMENT.md` for the canonical generated inventory and the

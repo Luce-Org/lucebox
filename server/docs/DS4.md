@@ -120,8 +120,8 @@ options are available:
   HC, attention, MoE, and the output projection on the GPU and avoids
   per-layer host round trips. On HIP this option requests a monolithic model
   load because the fused graph must reference every expert tensor directly.
-  If that allocation fails, the backend logs the fallback and continues with
-  hybrid expert placement and layered decode.
+  If that allocation fails, startup fails; use `luce_server --list-devices
+  <model>` to find a GPU that holds the model, or `--target-device auto`.
 - Adaptive qtype-105/106 experts work in monolithic mode and across two GPUs
   using the same runtime. The loader gives each GPU's compact tensor the
   decode-table rows for the experts it owns. CPU expert offload and mixed
@@ -150,13 +150,27 @@ options are available:
   formats' different error profile crosses the threshold. Serve adaptive artifacts
   at the model default.
 
-For the validated single-device Strix Halo profile:
+For the validated single-device Strix Halo profile (`--profile ds4-strix`
+expands to the flags listed in
+[RECOMMENDED_SETUPS.md](RECOMMENDED_SETUPS.md#deepseek-v4-on-strix-halo)):
 
 ```bash
 ./server/build-hip/luce_server /opt/models/DeepSeek-V4-Flash.gguf \
-  --target-device hip:0 \
-  --ds4-fused-decode
+  --draft /opt/models/DeepSeek-V4-Flash-DSpark-draft.gguf \
+  --target-device auto \
+  --profile ds4-strix
 ```
+
+`--draft` on a DeepSeek V4 target loads the DSpark drafter and
+`--draft-device` places it (default: the target GPU). The environment
+spelling `LUCE_DS4_SPEC=1 LUCE_DS4_DRAFT=<gguf>` with `LUCE_DS4_DRAFT_GPU` and
+`LUCE_DS4_DRAFT_BACKEND` still works and is used when `--draft` is absent. An
+explicit `--draft` that cannot be loaded stops startup; the environment
+spelling keeps its autoregressive fallback. DSpark and both profiles serve one
+request at a time: paged concurrent serving (`--max-concurrency` above 1)
+decodes autoregressively with exact prefill and rejects `--draft`, sparse
+prefill and fused decode (see
+[Strix Halo concurrent serving](#strix-halo-concurrent-serving)).
 
 ### In-process heterogeneous expert parallel
 
@@ -185,35 +199,27 @@ tokens per step with the fused verifier, and prefills in batched sparse mode.
 It needs no calibration files.
 
 ```bash
-export LUCE_DS4_MOE_TP=1 LUCE_DS4_MOE_TP_INPROC=1 LUCE_DS4_MOE_TP_GPU=1
-export LUCE_EXPERT_BUDGET_MB=14350
-export LUCE_DS4_SPEC=1 LUCE_DS4_DRAFT=/path/to/deepseek4-dspark-draft.gguf
-export LUCE_DS4_DRAFT_GPU=0 LUCE_DS4_SPEC_Q=5 LUCE_DS4_Q5_VERIFY=1
-export LUCE_DS4_FUSED_VERIFY=1 LUCE_DS4_FUSED_HYBRID_DECODE=1
-export LUCE_DS4_PINNED_ROLLBACK=1 LUCE_DS4_GPU_ARGMAX_VERIFY=1
-export LUCE_DS4_DRAFT_CONTEXT_KV_CACHE=1
-export LUCE_DS4_TP_ROUTE_PREFORK=1 LUCE_DS4_TP_DEVICE_JOIN=1 LUCE_DS4_TP_DEVICE_JOIN_SPLIT=1
-export LUCE_DS4_TP_FUSED_HC_JOIN=1 LUCE_DS4_TP_MAIN_ROUTE_WEIGHTS=1
-export LUCE_DS4_TP_COARSE_OWNER=1 LUCE_DS4_TP_NATIVE_ROUTE_WIDTH=1
-export LUCE_DS4_TP_MASKED_ROUTES=1 LUCE_DS4_TP_GROUPED_MMVQ=1
-export LUCE_DS4_TP_CAPTURE_CACHE_SLOTS=4
-export LUCE_MOE_TP_DYNAMIC_ROUTE_BALANCE=1 LUCE_MOE_TP_DYNAMIC_MAIN_SLOTS_X4=13
-export LUCE_MOE_DUPLICATE_HOT_ON_COLD=1 LUCE_MOE_FULL_COLD_PARALLEL=1
-export LUCE_MOE_PREFILL_PERSISTENT_OWNER_ALLOC=1
-export LUCE_DS4_HYBRID_PREFILL_GPU_HC=1 LUCE_DS4_HYBRID_PREFILL_EAGER=1
-export GGML_CUDA_BATCH_PEER_COPIES=1
-export LUCE_MMID_GROUPED=1 LUCE_MMID_GROUPED_TYPES=8 LUCE_MMID_GROUPED_DEVICE=1
-export LUCE_CUDA_MMVQ_MOE_ROWS_PER_BLOCK=2 LUCE_CUDA_MMVQ_MOE_FP3_PACKED24=1 LUCE_CUDA_MMVQ_FP4_X4=1
-export LUCE_DS4_DIRECT_INDEXER_TOPK=1 GGML_DS4_TOPK_BLOCK_RADIX=1
-export LUCE_DS4_MIX_MMQ_PREFILL=1 LUCE_CUDA_I32_REPEAT=1
-export ROCBLAS_USE_HIPBLASLT=0
-
 ./server/build-hip-dual/luce_server /path/to/deepseek4-target.gguf \
-  --target-device hip:0 --peer-access \
-  --max-ctx 18432 --chunk 2048 \
-  --ds4-fused-decode --ds4-expert-top-k 6 \
-  --ds4-prefill sparse
+  --draft /path/to/deepseek4-dspark-draft.gguf \
+  --profile ds4-r9700-strix
 ```
+
+`--profile ds4-r9700-strix` expands to `--target-device hip:0
+--expert-device hip:1 --peer-access --max-ctx 18432 --chunk 2048
+--ds4-fused-decode --ds4-expert-top-k 6 --ds4-prefill sparse` and installs
+the 37 tuning variables of the qualified recipe (`LUCE_EXPERT_BUDGET_MB=14350`,
+`LUCE_DS4_SPEC_Q=5`, `LUCE_DS4_Q5_VERIFY=1`, the `LUCE_DS4_TP_*` join and
+routing switches, and the grouped MMVQ kernels; the full list is in
+`src/server/launch_profiles.h`). Flags on the command line replace the
+profile's value, and variables already set in the environment keep theirs;
+the startup log names each one it kept. The profile's `--expert-device` is a
+flag like any other, so it sets the `LUCE_DS4_MOE_TP*` variables below; pass
+`--expert-device` to move the experts. If the R9700 and Strix Halo enumerate
+the other way round, pass `--target-device hip:1 --expert-device hip:0`
+(`luce_server --list-devices` shows the order).
+
+`--expert-device <backend:gpu>` is the flag form of `LUCE_DS4_MOE_TP=1
+LUCE_DS4_MOE_TP_INPROC=1 LUCE_DS4_MOE_TP_GPU=<n> LUCE_DS4_MOE_TP_BACKEND=<backend>`.
 
 Measured with this command on an R9700 + Strix Halo machine (fixed-codebook
 ROCmFPx target, 18432-token context, greedy, every output deterministic
@@ -235,9 +241,8 @@ path exists only for sparse prefill. Top-4 routing (`--ds4-expert-top-k 4`)
 is a further approximation that raises decode speed; omit it when the
 model-default top-6 route is required.
 
-The minimal activation (`LUCE_DS4_MOE_TP=1`, `LUCE_DS4_MOE_TP_INPROC=1`,
-`LUCE_DS4_MOE_TP_GPU=1`, `LUCE_EXPERT_BUDGET_MB=11700`,
-`LUCE_MMVQ_MAX_NCOLS=4`) runs the same model with the fused decode and verify
+The minimal activation (`--target-device hip:0 --expert-device hip:1` with
+`LUCE_EXPERT_BUDGET_MB=11700` and `LUCE_MMVQ_MAX_NCOLS=4`) runs the same model with the fused decode and verify
 paths off and decodes at 12-15 tok/s; it is only useful to check placement.
 
 #### Radeon RX 7900 XT + Strix Halo, true top-k-6
@@ -347,10 +352,6 @@ ctest --test-dir server/build-cuda-hip -R mixed_cuda_hip --output-on-failure
 ```
 
 ```bash
-export LUCE_DS4_MOE_TP=1
-export LUCE_DS4_MOE_TP_INPROC=1
-export LUCE_DS4_MOE_TP_BACKEND=cuda
-export LUCE_DS4_MOE_TP_GPU=0       # cuda:0 (RTX 3090)
 export LUCE_DS4_MOE_TP_CONCENTRATE_COLD=1
 export LUCE_DS4_TP_SCHEDULE_BRANCHES=1
 export LUCE_DS4_TP_TARGETED_JOIN_SPLIT=1
@@ -358,12 +359,15 @@ export GGML_BATCH_PEER_COPIES=1
 # Start conservatively and tune from the startup placement and memory logs;
 # the usable budget depends on the model, placement policy, and free VRAM.
 export LUCE_EXPERT_BUDGET_MB=85000
-export LUCE_DS4_DRAFT=/path/to/dspark-draft.gguf
+# The drafter runs on the peer runtime, which --draft-device cannot name
+# without the IPC path, so its placement stays in the environment.
 export LUCE_DS4_DRAFT_BACKEND=cuda
 export LUCE_DS4_DRAFT_GPU=0
 
 ./server/build-cuda-hip/luce_server /path/to/deepseek4-target.gguf \
   --target-device hip:0 \
+  --expert-device cuda:0 \
+  --draft /path/to/dspark-draft.gguf \
   --ds4-prefill sparse
 ```
 
@@ -387,6 +391,11 @@ DeepSeek4 paged concurrency supports two resident HIP deployments:
   below. The target keeps dense work and its selected experts while the
   secondary owns the remaining materialized experts. The runtime accepts up
   to 6 lanes, but concurrency 5–6 is not qualified for this configuration.
+
+Paged serving decodes autoregressively: it rejects `--draft` (and
+`LUCE_DS4_SPEC`), sparse prefill and fused decode, so it does not combine
+with `--profile ds4-strix` or `ds4-r9700-strix`. The container entrypoint
+leaves out its DSpark drafter when `--max-concurrency` is above 1.
 
 The heterogeneous mode is route-level expert parallelism. It is not an
 explicit `--target-device hip:0,hip:1` layer split and does not use a remote
@@ -440,15 +449,12 @@ cmake --build server/build-hip -j
 For the R9700 + Strix Halo path, build `server/build-hip-dual` for
 `gfx1151;gfx1201` as shown in
 [In-process heterogeneous expert parallel](#in-process-heterogeneous-expert-parallel).
-Then expose the R9700 first and select the static in-process expert split.
-The grouped expert setting below is qualified at concurrency 1–4 with
-ROCmFP2 gate/up and ROCmFP3 down weights:
+Then target the R9700 and give the static in-process expert split to Strix
+Halo (`luce_server --list-devices` shows which index each has). The grouped
+expert setting below is qualified at concurrency 1–4 with ROCmFP2 gate/up and
+ROCmFP3 down weights:
 
 ```bash
-export HIP_VISIBLE_DEVICES=<r9700-index>,<strix-index>
-export LUCE_DS4_MOE_TP=1
-export LUCE_DS4_MOE_TP_INPROC=1
-export LUCE_DS4_MOE_TP_GPU=1
 export LUCE_EXPERT_BUDGET_MB=11700
 export LUCE_DS4_TP_BATCH_SPLIT_COPIES=1
 export LUCE_DS4_TP_GROUPED_MMVQ=1
@@ -456,6 +462,7 @@ export LUCE_DS4_TP_GROUPED_MMVQ=1
 ./server/build-hip-dual/luce_server \
   /path/to/models/DeepSeek-V4-Flash.gguf \
   --target-device hip:0 \
+  --expert-device hip:1 \
   --peer-access \
   --paged-attention \
   --max-concurrency 4 \
@@ -534,7 +541,7 @@ The runtime logs the chosen split with a `[deepseek4-split] auto-split:` banner.
 | `LUCE_DS4_CUDA_LAYERS` | Override the auto-split heuristic and pin the first `N` DeepSeek4 layers to CUDA. The remaining `43 - N` layers run on the Halo shard. |
 | `LUCE_DS4_TIMING` | Enable DS4 timing logs for local, paged, and layer-split execution. Paged rounds report full-graph build, input upload, compute, and readback time; leave unset for normal runs. |
 | `LUCE_DS4_ROCTX` | HIP-only, default-off semantic ROCTX ranges for an external rocprof trace. The library is loaded dynamically only when set to `1`, `true`, `yes`, or `on`. |
-| `LUCE_DS4_SPEC` / `LUCE_DS4_DRAFT` | Enable DSpark and select its GGUF. |
+| `LUCE_DS4_SPEC` / `LUCE_DS4_DRAFT` | Enable DSpark and select its GGUF when `--draft` is absent. |
 | `LUCE_DS4_DRAFT_BACKEND` / `LUCE_DS4_DRAFT_GPU` | Backend and device for the in-process drafter. |
 | `LUCE_DS4_MOE_TP` | Enable routed-expert partitioning. |
 | `LUCE_DS4_MOE_TP_INPROC` | Use two local GPU backends instead of an expert IPC worker. |
@@ -553,12 +560,12 @@ The runtime logs the chosen split with a `[deepseek4-split] auto-split:` banner.
 | `LUCE_DS4_HOTNESS_CSV` | Optional per-layer routing profile for hot placement. |
 | `LUCE_DS4_TP_GROUPED_MMVQ` | Opt in to grouped expert MMVQ for `n_tokens > 1`, replacing tokenwise ROCmFP2 gate/up dispatch. The paged R9700 + Strix profile is qualified at concurrency 1–4; the flag itself does not enforce topology or lane limits. `LUCE_MOE_TP_GROUPED_MMVQ` is the model-neutral name and takes precedence. |
 | `LUCE_DS4_TP_BATCH_SPLIT_COPIES` | Establish destination readiness once per scheduler split without combining backend copy dependencies. The qualified dual-ROCm launcher enables this exact path. |
-| `GGML_BATCH_PEER_COPIES` | Additionally combine HIP peer-copy dependency publication. The old `GGML_CUDA_BATCH_PEER_COPIES` spelling remains an alias. Keep these event-batching variables unset for the exact qualified profile. |
+| `GGML_BATCH_PEER_COPIES` | Additionally combine HIP peer-copy dependency publication. The old `GGML_CUDA_BATCH_PEER_COPIES` spelling remains an alias. Keep these event-batching variables unset for the qualified RX 7900 XT launcher (`serve_ds4_dual_rocm_128k.sh`); the R9700 + Strix profile (`--profile ds4-r9700-strix`) sets `GGML_CUDA_BATCH_PEER_COPIES=1`. |
 | `LUCE_DS4_TP_CRITICAL_PATH_PLACEMENT` | Use the routing profile and measured owner-rate ratio to minimize the predicted two-owner MoE critical path instead of maximizing aggregate hot-hit rate. Requires `LUCE_DS4_HOTNESS_CSV`. |
 | `LUCE_DS4_TP_MAIN_TO_PEER_RATE` | Relative main/peer routed-expert rate used by critical-path placement. It must be finite and greater than zero; the default is `3.4`. |
 | `LUCE_DS4_TP_BALANCE_MIN_HOT` | Minimum hot experts retained on every routed layer by critical-path placement. Defaults to `0`. |
-| `LUCE_DS4_Q5_VERIFY` | AMD q=5 fused verifier. Defaults to `1` on `gfx1151` when `LUCE_DS4_SPEC` is set, together with `LUCE_DS4_FUSED_VERIFY=1` and `LUCE_DS4_ADAPTIVE_WIDTH=1`; set `0` to restore the q<=4 verifier. It also selects the qualified MMVQ width and verifier-cache defaults when they are not explicitly overridden. |
-| `LUCE_DS4_ADAPTIVE_WIDTH` | Acceptance-and-cost verify-width controller. Defaults to `1` on `gfx1151` with `LUCE_DS4_SPEC`; chooses q2 to q5 per step (q5 is the cap) from measured acceptance and per-width cost. Set `0` for a fixed width. |
+| `LUCE_DS4_Q5_VERIFY` | AMD q=5 fused verifier. Defaults to `1` on `gfx1151` when DSpark is enabled (`--draft` or `LUCE_DS4_SPEC`), together with `LUCE_DS4_FUSED_VERIFY=1` and `LUCE_DS4_ADAPTIVE_WIDTH=1`; set `0` to restore the q<=4 verifier. It also selects the qualified MMVQ width and verifier-cache defaults when they are not explicitly overridden. |
+| `LUCE_DS4_ADAPTIVE_WIDTH` | Acceptance-and-cost verify-width controller. Defaults to `1` on `gfx1151` with DSpark enabled; chooses q2 to q5 per step (q5 is the cap) from measured acceptance and per-width cost. Set `0` for a fixed width. |
 | `LUCE_DS4_CONFIDENCE_WIDTH` | With the adaptive width and a drafter that carries a confidence head, the width of every step is chosen from the head's per-candidate scores (three depths on the q5 verifier; the fourth is learned from target feedback), calibrated online per depth against the target's actual acceptance. Defaults on; set `0` to fall back to the learned-acceptance policy. `LUCE_DS4_TIMING=1` prints the per-depth calibration (predicted, actual, applied scale) after every request. |
 | `LUCE_DS4_DIRECT_CONTIGUOUS_CAUSAL` | Analytic causal window for layer-major sliding-window layers instead of the quadratic mask upload. Part of the `gfx1151` sparse-prefill defaults (measured +10% prefill, identical output); set `0` to restore the explicit mask. |
 | `LUCE_DS4_INDEXER_F16_Q` / `LUCE_DS4_PREFILL_F16_KV_ALL` | F16 indexer queries and F16 selected-KV transport for sparse prefill. Part of the `gfx1151` sparse-prefill defaults; set `0` to restore F32. |
@@ -637,14 +644,13 @@ python server/scripts/convert_dflash_to_gguf.py \
 Run the converted drafter against a DeepSeek4 target with:
 
 ```bash
-export LUCE_DS4_SPEC=1
 export LUCE_DS4_FUSED_VERIFY=1
 # Experimental, single HIP target only; may change generated tokens:
 # export LUCE_DS4_SPARSE_DECODE_FLASH=1
-export LUCE_DS4_DRAFT=/path/to/dflash-draft.gguf
 export LUCE_DS4_SPEC_Q=4
 
 ./server/build-hip/luce_server /path/to/deepseek4-target.gguf \
+  --draft /path/to/dflash-draft.gguf \
   --target-device hip:0 \
   --ds4-fused-verify-f16-kv \
   --ds4-fused-decode
@@ -735,7 +741,7 @@ ROCmFP2 matvecs with three or more query rows reuse each activation across
 four output rows on gfx1151. Set `LUCE_ROCMFP2_ROW4=0` to restore the two-row
 schedule. Narrow F16 projections retain the shared MMVF dispatch policy.
 
-`LUCE_DS4_FUSED_VERIFY=1` is the throughput profile; it is the default on `gfx1151` when `LUCE_DS4_SPEC` is set and opt-in elsewhere. Its persistent
+`LUCE_DS4_FUSED_VERIFY=1` is the throughput profile; it is the default on `gfx1151` when DSpark is enabled and opt-in elsewhere. Its persistent
 whole-model GPU graph uses stable padded reduction shapes, so near-tied greedy
 logits can select a different token than the normal causal verifier even at
 temperature 0. Leave it unset when comparing against the normal verifier, or
@@ -746,8 +752,9 @@ fused verification nor the separate
 `--ds4-expert-top-k 4` approximation should be presented as byte-identical AR.
 
 DSpark can verify against in-process heterogeneous expert placement. The
-drafter remains local to its selected GPU backend; a failed draft load is
-reported and falls back to normal autoregressive decode. The target cache and
+drafter remains local to its selected GPU backend. A drafter given with
+`--draft` that fails to load stops startup; with the `LUCE_DS4_SPEC` spelling
+the failure is reported and decode falls back to autoregressive. The target cache and
 sampler stay on the main backend while routed target experts execute on their
 configured owners. `--ds4-expert-top-k 4` remains a separate approximate
 policy; omit it to retain the model's default six routed experts.
@@ -958,9 +965,9 @@ that fallback and `LUCE_DS4_ADAPTIVE_WIDTH=0` restores a fixed width.
 Re-run workload-level speed and quality checks before enabling it on another
 target or drafter.
 
-The qualified `gfx1151` launch is the plain one: `LUCE_DS4_SPEC=1`,
-`LUCE_DS4_DRAFT=<DSpark draft GGUF>`, the release CLI with `--chunk 8192`
-and a 128K context. Every kernel and policy default above is installed by the
+The qualified `gfx1151` launch is the plain one: `--draft <DSpark draft
+GGUF> --profile ds4-strix`, which is the release CLI with `--chunk 8192` and
+a 128K context. Every kernel and policy default above is installed by the
 device profile at start, and the published Strix Halo numbers (8K 320 / 42
 prefill / decode tok/s, 123K 284 / 36, code and math suites 39 tok/s at q5,
 prose 25 at q2) are measured exactly that way. Use `--chunk 8192` on the

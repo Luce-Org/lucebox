@@ -1,543 +1,369 @@
 #!/usr/bin/env bash
-# In-container ENTRYPOINT for lucebox-hub.
+# In-container ENTRYPOINT for lucebox-hub (CUDA and ROCm images).
 #
-# Normal path: the host-side `lucebox` CLI has already populated every
-# LUCE_* env var from its detection / autotune sweep, so this script
-# just resolves paths and execs the native luce_server binary.
+#   docker run IMAGE [serve] [luce_server flags...]   start the server (default)
+#   docker run IMAGE devices                          list GPUs and the auto choice
+#   docker run IMAGE shell                            bash inside the container
+#   docker run IMAGE <command> [args...]              run any other command
 #
-# Fallback path: a user runs the image directly (`docker run --gpus all
-# ghcr.io/luce-org/lucebox-hub:cuda12`) with no env-var prep. We then do a
-# minimal VRAM-tiered autotune — same tiers as `lucebox autotune`, kept in
-# sync by hand. Anything more elaborate (driver-version probes, AMD paths,
-# lspci fallbacks) belongs in the host CLI, not here.
+# `serve` finds the model files under models/, then execs luce_server with the
+# flags below. Any luce_server flag can follow `serve`, or come first, and it
+# replaces the value the entrypoint would pass, e.g.
+#
+#   docker run ... IMAGE --profile ds4-strix
+#   docker run ... IMAGE serve --target-device hip:1 --max-ctx 65536
+#
+# Environment (all optional):
+#   LUCE_TARGET               target GGUF (default: the one >5 GB file in models/)
+#   LUCE_DRAFT                draft file or directory (default: models/draft;
+#                             "none" runs without a draft)
+#   LUCE_TARGET_DEVICE        backend:gpu or auto (default: auto, which picks
+#                             a GPU the model fits on; see `devices`)
+#   LUCE_PROFILE              luce_server --profile name
+#   LUCE_ARGS                 extra luce_server flags, split on whitespace
+#   LUCE_MAX_CTX              context length (default: from the GPU's memory)
+#   LUCE_HOST, LUCE_PORT      listen address (default: 0.0.0.0:8080)
+#   LUCE_BUDGET               DDTree budget (default: 22)
+#   LUCE_LAZY                 1 = request-scoped draft (needs LUCE_PREFILL_DRAFTER)
+#   LUCE_CACHE_TYPE_K/V       KV cache types
+#   LUCE_PREFILL_MODE         off|auto|always PFlash compression (default: off)
+#   LUCE_PREFILL_KEEP, LUCE_PREFILL_THRESHOLD, LUCE_PREFILL_DRAFTER
+#   LUCE_PREFIX_CACHE_SLOTS, LUCE_PREFILL_CACHE_SLOTS
+#   LUCE_DEFAULT_MAX_TOKENS, LUCE_MODEL_NAME, LUCE_THINK_MAX, LUCE_FA_WINDOW,
+#   LUCE_MMPROJ
+# Other LUCE_* variables reach luce_server unchanged.
 
 set -euo pipefail
 
-# Honor a pre-set LUCE_DIR (used by the host-side smoke tests to drive
-# the entrypoint with a synthetic models/draft layout). In the shipped
-# image this var is unset, so the fallback is the normal install prefix.
+# Honor a pre-set LUCE_DIR (used by the entrypoint tests to drive a synthetic
+# models/draft layout). In the shipped image this var is unset.
 LUCE_DIR="${LUCE_DIR:-/opt/lucebox-hub/server}"
+: "${LUCE_SERVER_BIN:=$LUCE_DIR/build/luce_server}"
 
-info()  { printf '\033[1;34m[INFO]\033[0m  %s\n' "$*"; }
-warn()  { printf '\033[1;33m[WARN]\033[0m  %s\n' "$*"; }
+info()  { printf '\033[1;34m[INFO]\033[0m  %s\n' "$*" >&2; }
+warn()  { printf '\033[1;33m[WARN]\033[0m  %s\n' "$*" >&2; }
 die()   { printf '\033[1;31m[ERROR]\033[0m %s\n' "$*" >&2; exit 1; }
 
-# ── arg dispatch ───────────────────────────────────────────────────────────
-# `serve` (default) — start the OpenAI-compatible server.
-# `shell`            — drop into bash inside the container (debug).
-# `lucebox`          — dispatch to the Python CLI. Any subcommand
-#                      `lucebox.sh` doesn't handle on the host arrives here
-#                      (check, config, pull, print-run, smoke, …).
-# `python` or anything else
-#                    — pass through to exec, so `docker run … python -m foo`
-#                      still works for dev.
+# ── target ─────────────────────────────────────────────────────────────────
+# Targets are 10-100 GB; drafts and projectors are 1-4 GB and live under
+# models/draft/. When several targets are present we refuse to guess: picking
+# the wrong one silently has produced wrong benchmark numbers before.
+target_candidates() {
+    [ -d "$LUCE_DIR/models" ] || return 0
+    find -L "$LUCE_DIR/models" -maxdepth 4 -type f -name '*.gguf' -size +5G \
+        -not -path '*/draft/*' -not -iname '*mmproj*' -printf '%p\n' 2>/dev/null | sort
+}
+resolve_target() {
+    : "${LUCE_TARGET:=}"
+    if [ -z "$LUCE_TARGET" ]; then
+        local candidates=()
+        mapfile -t candidates < <(target_candidates)
+        case "${#candidates[@]}" in
+            0) ;;
+            1) LUCE_TARGET="${candidates[0]}"
+               info "Auto-detected target: $(basename "$LUCE_TARGET")" ;;
+            *) warn "Multiple candidate target GGUFs in $LUCE_DIR/models:"
+               local c
+               for c in "${candidates[@]}"; do warn "    $c"; done
+               die "Ambiguous target: set LUCE_TARGET=<path> to one of the candidates above." ;;
+        esac
+    fi
+    if [ -z "$LUCE_TARGET" ] || [ ! -f "$LUCE_TARGET" ]; then
+        die "No target GGUF found. Mount a model dir: -v /host/models:/opt/lucebox-hub/server/models, or set LUCE_TARGET=<path-inside-container>."
+    fi
+}
+
+# ── device probe ───────────────────────────────────────────────────────────
+# luce_server reports the GPUs of this image's runtime (CUDA or ROCm), the
+# model architecture, and the device `--target-device auto` would pick. Its
+# lines look like:
+#   device hip:0 arch=gfx1201 type=discrete total_mib=32624 free_mib=... name=...
+#   model arch=deepseek4 size_mib=89740 kv_mib=0 path=...
+#   auto hip:1 fits=no total_mib=98304 reason=...
+PROBE=""
+probe_field() {  # probe_field <line-kind> <key>  (first matching line)
+    awk -v kind="$1" -v key="$2" '
+        $1 == kind { for (i = 2; i <= NF; i++) if (index($i, key "=") == 1) {
+            print substr($i, length(key) + 2); exit } }' <<<"$PROBE"
+}
+device_total_mib() {  # device_total_mib <backend:gpu>
+    awk -v dev="$1" '$1 == "device" && $2 == dev {
+        for (i = 3; i <= NF; i++) if (index($i, "total_mib=") == 1) {
+            print substr($i, 11); exit } }' <<<"$PROBE"
+}
+
+# Last value of a flag in an argv list, e.g. the --target-device a user passed.
+arg_value() {  # arg_value <flag> <args...>
+    local flag="$1" value="" prev="" a
+    shift
+    for a in "$@"; do
+        [ "$prev" = "$flag" ] && value="$a"
+        prev="$a"
+    done
+    printf '%s' "$value"
+}
+has_arg() {  # has_arg <flag> <args...>
+    local flag="$1" a
+    shift
+    for a in "$@"; do [ "$a" = "$flag" ] && return 0; done
+    return 1
+}
+
+# ── draft ──────────────────────────────────────────────────────────────────
+# Drafts are architecture-specific (a Qwen3.6 DFlash draft crashes a Gemma
+# target and vice versa), so a draft directory is searched with the target's
+# family patterns first. DeepSeek V4 only takes its DSpark drafter.
+resolve_draft() {  # sets DRAFT_ARG
+    local arch="$1"
+    DRAFT_ARG=""
+    : "${LUCE_DRAFT:=$LUCE_DIR/models/draft}"
+    case "$LUCE_DRAFT" in none|off|"") return ;; esac
+
+    # Common host layouts link ~/models/qwen3.6-27b-dflash instead of draft/.
+    if [ "$LUCE_DRAFT" = "$LUCE_DIR/models/draft" ] && [ ! -e "$LUCE_DRAFT" ]; then
+        local cand
+        for cand in "$LUCE_DIR/models/qwen3.6-27b-dflash" \
+                    "$LUCE_DIR/models/Qwen3.6-27B-DFlash" \
+                    "$LUCE_DIR/models/dflash"; do
+            if [ -e "$cand" ]; then LUCE_DRAFT="$cand"; break; fi
+        done
+    fi
+    if [ -f "$LUCE_DRAFT" ]; then
+        DRAFT_ARG="$LUCE_DRAFT"
+        return
+    fi
+    if [ ! -d "$LUCE_DRAFT" ]; then
+        [ "$LUCE_DRAFT" = "$LUCE_DIR/models/draft" ] ||
+            warn "Draft path $LUCE_DRAFT not found — running without draft"
+        return
+    fi
+
+    local target_name family=() generic=()
+    target_name="$(basename "$LUCE_TARGET" .gguf | tr 'A-Z' 'a-z')"
+    if [ "$arch" = deepseek4 ]; then
+        family=('*dspark*.gguf')
+    else
+        case "$target_name" in
+            *gemma-4-26b*|*gemma4-26b*) family=('*gemma*4*26b*dflash*.gguf' '*dflash*gemma*4*26b*.gguf') ;;
+            *gemma-4-31b*|*gemma4-31b*) family=('*gemma*4*31b*dflash*.gguf' '*dflash*gemma*4*31b*.gguf') ;;
+            *gemma-4*|*gemma4*)         family=('*gemma*4*dflash*.gguf' '*dflash*gemma*4*.gguf') ;;
+            *qwen3.6*|*qwen36*)         family=('dflash-draft-3.6-*.gguf' '*qwen*3.6*dflash*.gguf') ;;
+        esac
+        generic=('dflash-draft-*.gguf' '*dflash*.gguf' '*.gguf' 'model.safetensors' '*.safetensors')
+    fi
+
+    # Projectors are never drafts, and DSpark drafters only serve DeepSeek V4.
+    local exclude=(-not -iname '*mmproj*')
+    [ "$arch" = deepseek4 ] || exclude+=(-not -iname '*dspark*')
+    local pattern file
+    for pattern in "${family[@]}" "${generic[@]}"; do
+        # Sorted so the pick does not depend on filesystem order.
+        file="$(find -L "$LUCE_DRAFT" -maxdepth 4 -type f -iname "$pattern" \
+                    "${exclude[@]}" -print 2>/dev/null | sort | head -n 1)"
+        if [ -n "$file" ]; then
+            DRAFT_ARG="$file"
+            info "Resolved draft dir $LUCE_DRAFT → $DRAFT_ARG (pattern: $pattern)"
+            return
+        fi
+    done
+    warn "No draft for $(basename "$LUCE_TARGET") in $LUCE_DRAFT — running without draft"
+}
+
+# ── dispatch ───────────────────────────────────────────────────────────────
 SUBCMD="${1:-serve}"
-[ $# -gt 0 ] && shift || true
-
-LUCEBOX_PKG="/opt/lucebox-hub"
-
 case "$SUBCMD" in
-    lucebox)
-        # --no-sync: the venv was fully populated at image build time
-        # (`uv sync --no-editable` in the Dockerfile). Skipping the env
-        # consistency check here prevents hatch-vcs from firing its
-        # `_version.py` write hook against the read-only workspace source
-        # dirs and crashing the entire subcommand.
-        exec uv run --no-sync --directory "$LUCEBOX_PKG" python -m lucebox "$@"
+    serve) [ $# -eq 0 ] || shift ;;
+    -*)    ;;  # bare luce_server flags: serve with them
+    devices)
+        shift
+        target=("${LUCE_TARGET:-}")
+        if [ -z "${target[0]}" ]; then
+            mapfile -t target < <(target_candidates)
+            if [ "${#target[@]}" -gt 1 ]; then
+                warn "Several target GGUFs in $LUCE_DIR/models; set LUCE_TARGET to include one in the listing."
+                target=()
+            fi
+        fi
+        exec "$LUCE_SERVER_BIN" --list-devices "${target[@]}" "$@"
         ;;
     shell)
+        shift
         exec /bin/bash "$@"
         ;;
-    serve|"")
-        : # fall through to server startup below
-        ;;
     *)
-        exec "$SUBCMD" "$@"
+        exec "$@"
         ;;
 esac
-
-# ── HOST_INFO (host-identity capture) ──────────────────────────────────────
-# Write /opt/lucebox-hub/HOST_INFO as JSON before exec'ing luce_server.
-# The C++ server reads this file at startup and surfaces the parsed JSON
-# under /props.host. Mirrors the IMAGE_INFO pattern (server_main.cpp
-# read_image_info) but in JSON instead of KEY=VALUE — host facts have
-# nested structure (gpu array, multi-field per GPU) that doesn't fit a
-# flat KEY=VALUE layout.
-#
-# Inputs: the LUCEBOX_HOST_* env vars set by the host wrapper's
-# probe_host(). When none are set (e.g. someone ran `docker run` directly,
-# bypassing lucebox.sh), we still write a stub `{"source":"unknown", ...}`
-# so the C++ side doesn't have to special-case missing-vs-blank.
-#
-# Failure is never fatal — the host_info file is informational. A
-# write-failure (read-only FS, etc.) gets a warning and we continue.
-write_host_info() {
-    local target="/opt/lucebox-hub/HOST_INFO"
-    local tmp="${target}.tmp.$$"
-    local collected_at
-    collected_at=$(date -u +%FT%TZ 2>/dev/null || echo "")
-    # If any LUCEBOX_HOST_* var was supplied, the source is "lucebox.sh"
-    # (the host wrapper probed and forwarded these via -e). Otherwise the
-    # container was launched outside the wrapper — we still emit a stub
-    # so the C++ side can read /props.host without special-casing missing.
-    local source_tag="unknown"
-    local collector_tag="entrypoint.sh"
-    if [ -n "${LUCEBOX_HOST_OS_PRETTY:-}" ] \
-       || [ -n "${LUCEBOX_HOST_KERNEL:-}" ] \
-       || [ -n "${LUCEBOX_HOST_GPU_LIST_CSV:-}" ] \
-       || [ -n "${LUCEBOX_HOST_CPU_MODEL:-}" ]; then
-        source_tag="lucebox.sh"
-        collector_tag="lucebox.sh"
-    fi
-
-    if ! _build_host_info_json "$source_tag" "$collector_tag" "$collected_at" > "$tmp" 2>/dev/null; then
-        warn "Failed to build HOST_INFO JSON — skipping"
-        rm -f "$tmp" 2>/dev/null || true
-        return 0
-    fi
-    if ! mv -f "$tmp" "$target" 2>/dev/null; then
-        warn "Failed to write $target (continuing without it)"
-        rm -f "$tmp" 2>/dev/null || true
-        return 0
-    fi
-    info "Wrote $target (source=$source_tag)"
-}
-
-# Build the HOST_INFO JSON on stdout. Real JSON escape via python3 (always
-# present in the runtime image — uv pulls it in for the venv stage) with
-# a bash fallback for parsing emergencies (broken venv, debug invocations
-# from a minimal base). The bash fallback covers the realistic char set
-# that leaks from lscpu / /etc/os-release / nvidia-smi (backslash, quote,
-# newline, tab, CR); the python path covers every JSON-illegal char
-# including the full U+0000-U+001F control range, so a misbehaved upstream
-# can't silently invalidate the entire HOST_INFO and turn /props.host
-# into null on the C++ side (which silently drops a parse-failed block).
-_json_escape() {
-    # Read from $1, emit on stdout. No quotes around the result — the
-    # caller wraps with `"..."`.
-    if command -v python3 >/dev/null 2>&1; then
-        # json.dumps emits `"…escaped…"`; strip the surrounding quotes
-        # so callers can keep their existing `"..."` wrap convention.
-        python3 -c '
-import json, sys
-out = json.dumps(sys.argv[1])
-sys.stdout.write(out[1:-1])
-' "$1"
-        return
-    fi
-    local s="$1"
-    s="${s//\\/\\\\}"
-    s="${s//\"/\\\"}"
-    s="${s//$'\n'/\\n}"
-    s="${s//$'\r'/\\r}"
-    s="${s//$'\t'/\\t}"
-    printf '%s' "$s"
-}
-
-# Emit a JSON value for a string field. Empty input → JSON null. Caller
-# embeds the result directly (no leading/trailing whitespace).
-_json_str_or_null() {
-    if [ -z "${1:-}" ]; then
-        printf 'null'
-    else
-        printf '"%s"' "$(_json_escape "$1")"
-    fi
-}
-
-# Emit a JSON value for an integer field. Empty / non-numeric → null.
-_json_int_or_null() {
-    local v="${1:-}"
-    if [ -z "$v" ] || ! [[ "$v" =~ ^-?[0-9]+$ ]]; then
-        printf 'null'
-    else
-        printf '%s' "$v"
-    fi
-}
-
-# Parse the LUCEBOX_HOST_GPU_LIST_CSV (whatever
-# `nvidia-smi --query-gpu=index,uuid,pci.bus_id,name,compute_cap,memory.total,power.limit
-#               --format=csv,noheader` produced on the host) into a JSON
-# array. Empty CSV → "[]". Each row becomes one object.
-_emit_gpu_array() {
-    local csv="${LUCEBOX_HOST_GPU_LIST_CSV:-}"
-    if [ -z "$csv" ]; then
-        printf '[]'
-        return
-    fi
-    local out="[" first=1
-    while IFS= read -r line; do
-        [ -z "$line" ] && continue
-        # Trim surrounding whitespace from each field. nvidia-smi prints
-        # `0, GPU-abc..., 00000000:01:00.0, NVIDIA RTX 5090, 12.0, 24576 MiB, 175.00 W`.
-        # Some driver builds emit bare `,` delimiters with no trailing space —
-        # split on `,` alone and trim whitespace per field so both forms parse.
-        local idx uuid pci name cc mem plimit
-        IFS=',' read -r idx uuid pci name cc mem plimit <<<"$line"
-        idx=$(printf '%s' "$idx" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
-        uuid=$(printf '%s' "$uuid" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
-        pci=$(printf '%s' "$pci" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
-        name=$(printf '%s' "$name" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
-        cc=$(printf '%s' "$cc" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
-        mem=$(printf '%s' "$mem" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
-        plimit=$(printf '%s' "$plimit" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
-        # Strip units. "24576 MiB" → 24576; "175.00 W" → 175 (truncate).
-        local mem_mib vram_gb power_w
-        mem_mib=$(printf '%s' "$mem" | awk '{print $1+0}')
-        vram_gb=""
-        if [ -n "$mem_mib" ] && [ "$mem_mib" -gt 0 ] 2>/dev/null; then
-            vram_gb=$((mem_mib / 1024))
-        fi
-        power_w=$(printf '%s' "$plimit" | awk '{printf "%d", $1+0.5}')
-        if [ "$first" = "1" ]; then
-            first=0
-        else
-            out+=","
-        fi
-        out+="{\"index\":$(_json_int_or_null "$idx"),\"uuid\":$(_json_str_or_null "$uuid"),"
-        out+="\"pci_bus_id\":$(_json_str_or_null "$pci"),\"name\":$(_json_str_or_null "$name"),"
-        out+="\"sm\":$(_json_str_or_null "$cc"),\"vram_gb\":$(_json_int_or_null "$vram_gb"),"
-        out+="\"power_limit_w\":$(_json_int_or_null "$power_w")}"
-    done <<<"$csv"
-    out+="]"
-    printf '%s' "$out"
-}
-
-_build_host_info_json() {
-    local source_tag="$1" collector_tag="$2" collected_at="$3"
-    printf '{'
-    printf '"os_pretty":%s,'        "$(_json_str_or_null "${LUCEBOX_HOST_OS_PRETTY:-}")"
-    printf '"kernel":%s,'           "$(_json_str_or_null "${LUCEBOX_HOST_KERNEL:-}")"
-    printf '"wsl_version":%s,'      "$(_json_str_or_null "${LUCEBOX_HOST_WSL_VERSION:-}")"
-    printf '"docker_version":%s,'   "$(_json_str_or_null "${LUCEBOX_HOST_DOCKER_VERSION:-}")"
-    printf '"nvidia_driver":%s,'    "$(_json_str_or_null "${LUCEBOX_HOST_DRIVER_VERSION:-}")"
-    printf '"nvidia_ctk_version":%s,' "$(_json_str_or_null "${LUCEBOX_HOST_NVIDIA_CTK_VERSION:-}")"
-    printf '"cpu_model":%s,'        "$(_json_str_or_null "${LUCEBOX_HOST_CPU_MODEL:-}")"
-    printf '"nproc":%s,'            "$(_json_int_or_null "${LUCEBOX_HOST_NPROC:-}")"
-    printf '"ram_gb":%s,'           "$(_json_int_or_null "${LUCEBOX_HOST_RAM_GB:-}")"
-    printf '"gpus":%s,'             "$(_emit_gpu_array)"
-    printf '"cuda_visible_devices":%s,' "$(_json_str_or_null "${LUCEBOX_HOST_CUDA_VISIBLE_DEVICES:-}")"
-    printf '"source":%s,'           "$(_json_str_or_null "$source_tag")"
-    printf '"collector":%s,'        "$(_json_str_or_null "$collector_tag")"
-    printf '"collected_at":%s'      "$(_json_str_or_null "$collected_at")"
-    printf '}\n'
-}
-
-write_host_info
-
-# ── detect ─────────────────────────────────────────────────────────────────
-# nvidia-smi is always present here (--gpus all wires the driver in).
-GPU_VRAM_GB=0
-if command -v nvidia-smi &>/dev/null; then
-    if mem_mib=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null \
-                  | head -1) && [ -n "$mem_mib" ]; then
-        GPU_VRAM_GB=$((mem_mib / 1024))
-    fi
+USER_ARGS=("$@")
+EXTRA_ARGS=()
+if [ -n "${LUCE_ARGS:-}" ]; then
+    read -r -a EXTRA_ARGS <<<"$LUCE_ARGS"
 fi
-GPU_COUNT=0
-if command -v nvidia-smi &>/dev/null; then
-    GPU_COUNT=$(nvidia-smi -L 2>/dev/null | awk '/^GPU /{n++} END{print n+0}') || GPU_COUNT=0
+ALL_ARGS=("${EXTRA_ARGS[@]}" "${USER_ARGS[@]}")
+
+# These mapped to flags luce_server no longer accepts; forwarding them made
+# the server exit with "unknown option".
+for retired in LUCE_THINK_SOFT_CLOSE_MIN_RATIO LUCE_DEBUG_THINKING_LOGITS; do
+    [ -n "${!retired:-}" ] && warn "$retired is no longer supported by luce_server and is ignored"
+done
+
+[ -x "$LUCE_SERVER_BIN" ] || die "luce_server binary missing at $LUCE_SERVER_BIN (image build failed?)"
+resolve_target
+
+# The server reads LUCE_TARGET_DEVICE whenever no device flag or profile names
+# one, so the default never overrides an explicit placement.
+export LUCE_TARGET_DEVICE="${LUCE_TARGET_DEVICE:-auto}"
+
+PROBE="$("$LUCE_SERVER_BIN" --list-devices "$LUCE_TARGET" 2>/dev/null || true)"
+MODEL_ARCH="$(probe_field model arch)"
+GPU_COUNT="$(grep -c '^device ' <<<"$PROBE" || true)"
+if [ -z "$PROBE" ] || [ "$GPU_COUNT" = 0 ]; then
+    warn "No GPU visible to luce_server. CUDA: --gpus all. ROCm: --device /dev/kfd --device /dev/dri --group-add video --group-add render."
 fi
 
-# ── fallback autotune (only fills unset env) ───────────────────────────────
-# Keep these tiers in lockstep with lucebox::autotune_env on the host. The
-# divergence we accept is the lower-VRAM error tier — the host CLI refuses
-# to start there with a clear message; here we just warn and let the server
-# decide whether it can load.
+# A --profile in the arguments replaces LUCE_PROFILE; luce_server takes one.
+PROFILE_ARG="$(arg_value --profile "${ALL_ARGS[@]}")"
+PROFILE="${PROFILE_ARG:-${LUCE_PROFILE:-}}"
 
-if [ "$GPU_VRAM_GB" -gt 0 ]; then
+# The device the model will run on, for sizing: an explicit single device, else
+# the auto choice. A profile may name its own device, so with a profile only an
+# explicit one is known here. Multi-device placements (--target-devices) keep
+# the server's own defaults and are reported as given.
+TARGET_DEVICES="$(arg_value --target-devices "${ALL_ARGS[@]}")"
+USED_DEVICE=""
+if [ -z "$TARGET_DEVICES" ]; then
+    USED_DEVICE="$(arg_value --target-device "${ALL_ARGS[@]}")"
+    if [ -z "$USED_DEVICE" ] && [ "$LUCE_TARGET_DEVICE" != auto ]; then
+        USED_DEVICE="$LUCE_TARGET_DEVICE"
+    fi
+    if [ -z "$PROFILE" ] && { [ -z "$USED_DEVICE" ] || [ "$USED_DEVICE" = auto ]; }; then
+        USED_DEVICE="$(awk '$1 == "auto" { print $2; exit }' <<<"$PROBE")"
+    fi
+    [ "$USED_DEVICE" = auto ] && USED_DEVICE=""
+fi
+TARGET_DESC="${TARGET_DEVICES:-${USED_DEVICE:-chosen by luce_server}}"
+GPU_MIB=0
+if [ -n "$USED_DEVICE" ]; then
+    GPU_MIB="$(device_total_mib "$USED_DEVICE")"
+    GPU_MIB="${GPU_MIB:-0}"
+fi
+[ "$GPU_COUNT" -gt 1 ] 2>/dev/null &&
+    info "$GPU_COUNT GPUs visible; target $TARGET_DESC (LUCE_TARGET_DEVICE=$LUCE_TARGET_DEVICE; list with: docker run ... devices)"
+
+# DeepSeek V4 serves concurrent requests (paged attention) autoregressively,
+# so it takes no drafter there.
+PAGED=0
+CONCURRENCY="$(arg_value --max-concurrency "${ALL_ARGS[@]}")"
+if has_arg --paged-attention "${ALL_ARGS[@]}" || [ "${CONCURRENCY:-1}" -gt 1 ] 2>/dev/null; then
+    PAGED=1
+fi
+
+# ── context size from GPU memory ───────────────────────────────────────────
+# Only when the operator set neither LUCE_MAX_CTX nor a profile: a profile's
+# --max-ctx is part of its qualified configuration. An explicit --max-ctx flag
+# still gets the memory-based draft settings, but its context is the one used.
+MAX_CTX_ARG="$(arg_value --max-ctx "${ALL_ARGS[@]}")"
+LAZY_EXPLICIT="${LUCE_LAZY:-}"
+GPU_GB=$((GPU_MIB / 1024))
+if [ -z "${LUCE_MAX_CTX:-}" ] && [ -z "$PROFILE" ] && [ "$GPU_GB" -gt 0 ]; then
     IS_WSL=0
     if grep -qi microsoft /proc/version 2>/dev/null || [ -e /proc/sys/fs/binfmt_misc/WSLInterop ]; then
         IS_WSL=1
     fi
-    if [ "$GPU_VRAM_GB" -lt 12 ]; then
+    if [ "$GPU_GB" -lt 12 ]; then
+        LUCE_MAX_CTX=4096; : "${LUCE_LAZY:=1}"
+        warn "GPU memory ${GPU_GB} GB < 12 GB — a 27B target is unlikely to fit"
+    elif [ "$GPU_GB" -lt 22 ]; then
+        LUCE_MAX_CTX=32768; : "${LUCE_LAZY:=1}"
+    elif [ "$GPU_GB" -lt 32 ]; then
         : "${LUCE_LAZY:=1}"
-        : "${LUCE_MAX_CTX:=4096}"
-        warn "VRAM ${GPU_VRAM_GB} GB < 12 GB — 27B target unlikely to fit"
-    elif [ "$GPU_VRAM_GB" -lt 22 ]; then
-        : "${LUCE_LAZY:=1}"
-        : "${LUCE_MAX_CTX:=32768}"
-    elif [ "$GPU_VRAM_GB" -lt 32 ]; then
-        : "${LUCE_LAZY:=1}"
-        if [ "$IS_WSL" = "1" ]; then
-            : "${LUCE_BUDGET:=16}"
-            : "${LUCE_MAX_CTX:=65536}"
+        if [ "$IS_WSL" = 1 ]; then
+            LUCE_MAX_CTX=65536; : "${LUCE_BUDGET:=16}"
         else
-            : "${LUCE_MAX_CTX:=98304}"
+            LUCE_MAX_CTX=98304
         fi
     else
-        : "${LUCE_MAX_CTX:=131072}"
+        LUCE_MAX_CTX=131072
     fi
 fi
+[ -n "$PROFILE" ] || : "${LUCE_MAX_CTX:=16384}"
 
-: "${LUCE_BIN:=$LUCE_DIR/build/test_dflash}"
-: "${LUCE_SERVER_BIN:=$LUCE_DIR/build/luce_server}"
-: "${LUCE_HOST:=0.0.0.0}"
-: "${LUCE_PORT:=8080}"
-: "${LUCE_BUDGET:=22}"
-: "${LUCE_MAX_CTX:=16384}"
-: "${LUCE_LAZY:=0}"
-: "${LUCE_CACHE_TYPE_K:=}"
-: "${LUCE_CACHE_TYPE_V:=}"
-: "${LUCE_VERBOSE:=0}"
-: "${LUCE_TARGET:=}"
-: "${LUCE_DRAFT:=$LUCE_DIR/models/draft}"
-: "${LUCE_PREFILL_MODE:=off}"
-: "${LUCE_PREFILL_KEEP:=0.05}"
-: "${LUCE_PREFILL_THRESHOLD:=32000}"
-: "${LUCE_PREFILL_DRAFTER:=}"
-# Optional server default for requests that omit max_tokens. When unset,
-# the C++ server uses the model-card default.
-: "${LUCE_DEFAULT_MAX_TOKENS:=}"
-# Optional advertised model name for /v1/models (also selects the matching
-# share/model_cards/<name>.json). When unset, the C++ server uses its default
-# ("luce"). Lets an operator surface the real model id without a wrapper.
-: "${LUCE_MODEL_NAME:=}"
-# Phase-1 (thinking) cap when a request opts into thinking. Default mirrors
-# antirez/ds4 ds4_eval.c: think_max_tokens = max_tokens(16000) - hard_limit
-# reply budget(512) = 15488. The server's own hardcoded default is 10000;
-# overriding here aligns ds4-eval and similar reasoning benches with upstream.
-: "${LUCE_THINK_MAX:=15488}"
-# Soft-close thinking termination dial (PR #326). Lets the AR loop force
-# </think> early when the close-token logit comes within this probability
-# ratio of the chosen-token logit. Range [0.0, 1.0]; 0.0 = disabled (server
-# default, byte-identical to pre-change behavior). 0.5 = close when close
-# is within 2× of chosen; 0.9 = aggressive (close when close is within
-# ~10% of chosen). Only emitted to the server CLI when nonzero so unset
-# reproduces the server's own default. Qwen3.5/3.6 AR path only in v1.
-: "${LUCE_THINK_SOFT_CLOSE_MIN_RATIO:=0.0}"
-# Diagnostic: when "1", forward --debug-thinking-logits to the server so
-# the AR loop emits per-step [soft-trace] lines for fitting a sliding-
-# ratio curve. Heavy stderr; operator-only. Default off.
-: "${LUCE_DEBUG_THINKING_LOGITS:=0}"
-# Flash-attention sliding-window on full-attention layers. 0 = server's
-# stock full attention. Sparse decode windows (e.g. 2048-8192) bound
-# the compute on long prompts for gemma4's hybrid iSWA without changing
-# the KV footprint. Only emitted to the server CLI when nonzero so
-# unset reproduces the server's own default unchanged.
-: "${LUCE_FA_WINDOW:=0}"
-
-# ── auto-detect target ─────────────────────────────────────────────────────
-# Target .gguf is typically 10-30 GB (Q4_K_M). Drafts are 1-2 GB (Q8_0 / Q4)
-# and live under models/draft/ or have a dflash- prefix. The 5 GB threshold
-# excludes drafts cleanly without needing to parse GGUF arch metadata.
-#
-# CRITICAL UX RULE: when multiple candidate targets exist, we DO NOT silently
-# pick one based on filename pattern. That hid a real bug for the matrix
-# bench — a hardcoded Qwen3.6 preference made the container run the wrong
-# model when both gemma4 and qwen3.6 GGUFs were present, and the operator
-# only noticed when the bench numbers came out wrong. Either set
-# LUCE_TARGET=... explicitly, or have exactly one .gguf in models/.
-if [ -z "$LUCE_TARGET" ] && [ -d "$LUCE_DIR/models" ]; then
-    # Collect candidates: .gguf files ≥5 GB (target-sized), excluding
-    # anything under models/draft/. Sort alphabetically for determinism.
-    mapfile -t TARGET_CANDIDATES < <(
-        find -L "$LUCE_DIR/models" -maxdepth 4 -type f -name '*.gguf' \
-            -size +5G \
-            -not -path '*/draft/*' \
-            -printf '%p\n' 2>/dev/null \
-          | sort
-    )
-    case "${#TARGET_CANDIDATES[@]}" in
-        0)
-            : # fall through to the missing-target die below
-            ;;
-        1)
-            LUCE_TARGET="${TARGET_CANDIDATES[0]}"
-            info "Auto-detected target: $(basename "$LUCE_TARGET")"
-            ;;
-        *)
-            # Refuse to guess: silently picking the wrong target has burned
-            # us before (bench numbers come out wrong, only noticed after the
-            # fact). Force the operator to disambiguate via LUCE_TARGET.
-            warn "Multiple candidate target GGUFs in $LUCE_DIR/models. Refusing to auto-select."
-            warn "Set LUCE_TARGET=<path> to choose one. Candidates:"
-            for c in "${TARGET_CANDIDATES[@]}"; do
-                warn "    $c"
-            done
-            die "Ambiguous target: set LUCE_TARGET=<path> from the candidates above."
-            ;;
-    esac
-fi
-
-if [ -z "$LUCE_TARGET" ] || [ ! -f "$LUCE_TARGET" ]; then
-    die "No target GGUF found. Mount a model dir: -v /host/models:/opt/lucebox-hub/server/models, or set LUCE_TARGET=<path-inside-container>."
-fi
-[ -x "$LUCE_SERVER_BIN" ] || die "luce_server binary missing at $LUCE_SERVER_BIN (image build failed?)"
-
-# Qwen3.6 DFlash drafters use sliding-window attention in the draft. Some GGUFs
-# carry this metadata directly; keep the documented env override as the startup
-# default so older drafts behave like the autotune-sweep path.
+# Qwen3.6 DFlash drafters use sliding-window attention; older GGUFs lack the
+# metadata, so keep the documented default for them.
 case "$(basename "$LUCE_TARGET")" in
     *Qwen3.6*|*qwen3.6*)
         if [ -z "${LUCE_DRAFT_SWA:-}" ]; then
             export LUCE_DRAFT_SWA=2048
-            info "Autotune: LUCE_DRAFT_SWA=2048 (Qwen3.6 draft SWA)"
-        fi
-        ;;
+            info "LUCE_DRAFT_SWA=2048 (Qwen3.6 draft SWA)"
+        fi ;;
 esac
 
-# Common host layouts use ~/models/qwen3.6-27b-dflash as an absolute symlink
-# rather than a literal models/draft directory. If the default is absent, find
-# that draft before deciding to run without DFlash.
-if [ "$LUCE_DRAFT" = "$LUCE_DIR/models/draft" ] && [ ! -e "$LUCE_DRAFT" ]; then
-    for cand in "$LUCE_DIR/models/qwen3.6-27b-dflash" \
-                "$LUCE_DIR/models/Qwen3.6-27B-DFlash" \
-                "$LUCE_DIR/models/dflash"; do
-        if [ -e "$cand" ]; then
-            LUCE_DRAFT="$cand"
-            break
-        fi
-    done
-fi
-
-# Draft: directory holding GGUF/safetensors, or a direct draft file.
-# The native luce_server expects --draft to be a FILE path (not a dir).
-# If LUCE_DRAFT points at a directory, resolve it to a draft GGUF inside.
-#
-# Draft files are arch-specific: a draft trained for qwen3.6 has a fc
-# weight shape that only divides evenly into the qwen3.6 target's hidden
-# size, and crashes hard at spec-decode time when fed gemma4 (or vice
-# versa) — see Gemma4Backend draft-incompatibility check. So when the
-# draft dir contains multiple drafts (e.g. a host with both qwen3.6 and
-# gemma4 drafts pre-downloaded), pick the one whose filename matches the
-# target's family. Falls back to the generic dflash-draft-*.gguf pattern
-# (legacy qwen3.6-only behavior) when the target family is unknown.
-DRAFT_ARG="$LUCE_DRAFT"
-if [ -d "$LUCE_DRAFT" ]; then
-    # Derive a target-family hint from the target filename. Matching the
-    # GGUF arch metadata would be cleaner but requires parsing the header
-    # in shell; the filename convention is enforced upstream by the
-    # publish-side dflash quantize scripts.
-    TARGET_BASENAME="$(basename "$LUCE_TARGET" .gguf 2>/dev/null)"
-    # Use -iname (case-insensitive) throughout so both naming conventions
-    # work: legacy "dflash-gemma-4-31b-*.gguf" and the Lucebox HF repo's
-    # "gemma-4-31B-it-DFlash-q8_0.gguf". Glob list is family-specific first,
-    # then generic dflash-draft-*.gguf legacy, then last-resort *.gguf.
-    # The 31B match in the Lucebox repo uses capital B in the filename —
-    # -iname handles that without needing to enumerate every case form.
-    case "$(echo "$TARGET_BASENAME" | tr 'A-Z' 'a-z')" in
-        *gemma-4-26b*|*gemma4-26b*)
-            FAMILY_GLOBS=('*gemma*4*26b*dflash*.gguf' '*dflash*gemma*4*26b*.gguf') ;;
-        *gemma-4-31b*|*gemma4-31b*)
-            FAMILY_GLOBS=('*gemma*4*31b*dflash*.gguf' '*dflash*gemma*4*31b*.gguf') ;;
-        *gemma-4*|*gemma4*)
-            FAMILY_GLOBS=('*gemma*4*dflash*.gguf' '*dflash*gemma*4*.gguf') ;;
-        *qwen3.6*|*qwen36*)
-            FAMILY_GLOBS=('dflash-draft-3.6-*.gguf' '*qwen*3.6*dflash*.gguf') ;;
-        *)
-            FAMILY_GLOBS=() ;;
-    esac
-
-    DRAFT_FILE=""
-    # Track which glob actually matched so the info() log can show whether
-    # we picked via the family-specific pattern or fell back to a generic
-    # one. Initialize empty up front — `set -u` will fire if we read the
-    # var without an assignment having run, and the for-loop below may
-    # exit on the very first iteration without entering the body.
-    DRAFT_FAMILY_GLOB=""
-    # Family-specific globs first (most specific). Then the legacy
-    # `dflash-draft-*.gguf` for single-draft setups. Then the generic
-    # `*.gguf` / safetensors fallbacks.
-    GENERIC_GLOBS=('dflash-draft-*.gguf' '*dflash*.gguf' '*.gguf' 'model.safetensors' '*.safetensors')
-    family_count="${#FAMILY_GLOBS[@]}"
-    i=0
-    for pattern in "${FAMILY_GLOBS[@]}" "${GENERIC_GLOBS[@]}"; do
-        # Sort matches lexicographically so the pick is deterministic across
-        # filesystems (find's traversal order is filesystem-dependent without
-        # an explicit sort). First lexicographic match wins.
-        DRAFT_FILE="$(find -L "$LUCE_DRAFT" -maxdepth 4 -type f -iname "$pattern" -print 2>/dev/null | sort | head -n 1)"
-        if [ -n "$DRAFT_FILE" ]; then
-            # Mark the family-specific match so the log line below can
-            # distinguish "matched on family hint" from "generic fallback".
-            if [ "$i" -lt "$family_count" ]; then
-                DRAFT_FAMILY_GLOB="$pattern"
-            fi
-            break
-        fi
-        i=$((i + 1))
-    done
-    # Defensive: every read of DRAFT_FAMILY_GLOB below must survive `set -u`
-    # even if the init on line ~257 was somehow skipped (e.g. a future refactor
-    # that moves the init out of this block, or a partial-rewrite during a
-    # rebase that drops it). Coalesce-to-empty inline so a regression can't
-    # re-trip the unbound-variable crash that fired on the sindri sweep with
-    # multiple target GGUFs in models/ (commit a87bb93 was a partial fix —
-    # the recurrence proved that "initialize once at the top of the block"
-    # is too easy to undo). Cost: zero bytes at runtime.
-    DRAFT_FAMILY_GLOB="${DRAFT_FAMILY_GLOB:-}"
-    if [ -n "$DRAFT_FILE" ] && [ -f "$DRAFT_FILE" ]; then
-        DRAFT_ARG="$DRAFT_FILE"
-        if [ -n "$DRAFT_FAMILY_GLOB" ]; then
-            info "Resolved draft dir $LUCE_DRAFT → $DRAFT_ARG (target family: $DRAFT_FAMILY_GLOB)"
-        else
-            info "Resolved draft dir $LUCE_DRAFT → $DRAFT_ARG"
-        fi
-    else
-        warn "No DFlash draft GGUF/safetensors in draft dir $LUCE_DRAFT — running without draft"
-        DRAFT_ARG=""
-    fi
-elif [ -n "$LUCE_DRAFT" ] && [ ! -f "$LUCE_DRAFT" ]; then
-    warn "Draft path $LUCE_DRAFT not found — running without draft"
+if [ "$MODEL_ARCH" = deepseek4 ] && [ "$PAGED" = 1 ]; then
     DRAFT_ARG=""
+    info "DeepSeek V4 concurrent serving decodes autoregressively; not loading a DSpark drafter"
+else
+    resolve_draft "$MODEL_ARCH"
 fi
 
-[ "$GPU_COUNT" -gt 1 ] && warn "${GPU_COUNT} GPUs detected — native server layer sharding is not auto-enabled"
+if [ "$MODEL_ARCH" = deepseek4 ] && [ -z "$PROFILE" ] && [ "$PAGED" = 0 ]; then
+    case "$(awk -v dev="$USED_DEVICE" '$1 == "device" && $2 == dev { print $3 }' <<<"$PROBE")" in
+        arch=gfx1151) info "DeepSeek V4 on Strix Halo: add --profile ds4-strix for the qualified serving profile" ;;
+    esac
+fi
 
-# ── build + exec native server ────────────────────────────────────────────
+# ── build + exec ───────────────────────────────────────────────────────────
+: "${LUCE_HOST:=0.0.0.0}"
+: "${LUCE_PORT:=8080}"
+: "${LUCE_BUDGET:=22}"
+: "${LUCE_THINK_MAX:=15488}"   # ds4_eval.c: max_tokens(16000) - reply budget(512)
+: "${LUCE_PREFILL_MODE:=off}"
+
 CMD=("$LUCE_SERVER_BIN" "$LUCE_TARGET"
      --host "$LUCE_HOST"
      --port "$LUCE_PORT"
-     --max-ctx "$LUCE_MAX_CTX"
      --think-max-tokens "$LUCE_THINK_MAX")
+[ -n "$PROFILE" ] && [ -z "$PROFILE_ARG" ] && CMD+=(--profile "$PROFILE")
+[ -n "${LUCE_MAX_CTX:-}" ] && [ -z "$MAX_CTX_ARG" ] && CMD+=(--max-ctx "$LUCE_MAX_CTX")
 
-# Keep cache defaults owned by luce_server. In particular, omitting
-# LUCE_PREFIX_CACHE_SLOTS preserves the native nonzero default instead of
-# silently disabling multi-turn prefix reuse in the container. Explicit
-# values, including 0 as an operator opt-out, are forwarded unchanged.
+# Cache defaults belong to luce_server: omitting the variable keeps the native
+# default, and explicit values (including 0) are forwarded.
 [ -n "${LUCE_PREFIX_CACHE_SLOTS:-}" ] && CMD+=(--prefix-cache-slots "$LUCE_PREFIX_CACHE_SLOTS")
 [ -n "${LUCE_PREFILL_CACHE_SLOTS:-}" ] && CMD+=(--prefill-cache-slots "$LUCE_PREFILL_CACHE_SLOTS")
 
-[ -n "$DRAFT_ARG" ]                && CMD+=(--draft "$DRAFT_ARG")
-[ -n "$DRAFT_ARG" ]                && CMD+=(--ddtree --ddtree-budget "$LUCE_BUDGET")
-[ -n "$LUCE_DEFAULT_MAX_TOKENS" ] && CMD+=(--default-max-tokens "$LUCE_DEFAULT_MAX_TOKENS")
-[ -n "$LUCE_MODEL_NAME" ]         && CMD+=(--model-name "$LUCE_MODEL_NAME")
-[ -n "${LUCE_MMPROJ:-}" ]        && CMD+=(--mmproj "$LUCE_MMPROJ")
-# `--lazy-draft` is silently dropped by the C++ server unless both
-# `--prefill-drafter` and `--draft` are present (look for the runtime
-# warning `--lazy-draft ignored: requires both --prefill-drafter and
-# --draft`). Warn loudly here when the operator's config asked for lazy
-# but we're about to drop it — sweeping past the silent no-op was the
-# fingerprint left in every sindri decode-tuning docker.stderr.
-if [ "$LUCE_LAZY" = "1" ]; then
-    if [ -z "$DRAFT_ARG" ] || [ -z "$LUCE_PREFILL_DRAFTER" ]; then
-        warn "LUCE_LAZY=1 ignored: requires both LUCE_DRAFT and LUCE_PREFILL_DRAFTER (see entrypoint.sh comment). Continuing without --lazy-draft."
-    else
+if [ -n "$DRAFT_ARG" ]; then
+    CMD+=(--draft "$DRAFT_ARG")
+    # DeepSeek V4 verifies DSpark proposals itself; DDTree is a DFlash mode.
+    [ "$MODEL_ARCH" = deepseek4 ] || CMD+=(--ddtree --ddtree-budget "$LUCE_BUDGET")
+fi
+[ -n "${LUCE_DEFAULT_MAX_TOKENS:-}" ] && CMD+=(--default-max-tokens "$LUCE_DEFAULT_MAX_TOKENS")
+[ -n "${LUCE_MODEL_NAME:-}" ]         && CMD+=(--model-name "$LUCE_MODEL_NAME")
+[ -n "${LUCE_MMPROJ:-}" ]             && CMD+=(--mmproj "$LUCE_MMPROJ")
+[ -n "${LUCE_CACHE_TYPE_K:-}" ]       && CMD+=(--cache-type-k "$LUCE_CACHE_TYPE_K")
+[ -n "${LUCE_CACHE_TYPE_V:-}" ]       && CMD+=(--cache-type-v "$LUCE_CACHE_TYPE_V")
+[ "${LUCE_FA_WINDOW:-0}" -gt 0 ] 2>/dev/null && CMD+=(--fa-window "$LUCE_FA_WINDOW")
+
+# --lazy-draft parks a decode draft only while PFlash compresses a prompt.
+if [ "${LUCE_LAZY:-0}" = 1 ]; then
+    if [ -n "$DRAFT_ARG" ] && [ -n "${LUCE_PREFILL_DRAFTER:-}" ]; then
         CMD+=(--lazy-draft)
+    elif [ "$LAZY_EXPLICIT" = 1 ]; then
+        warn "LUCE_LAZY=1 ignored: requires a draft and LUCE_PREFILL_DRAFTER"
     fi
 fi
-[ -n "$LUCE_CACHE_TYPE_K" ]      && CMD+=(--cache-type-k "$LUCE_CACHE_TYPE_K")
-[ -n "$LUCE_CACHE_TYPE_V" ]      && CMD+=(--cache-type-v "$LUCE_CACHE_TYPE_V")
-[ "$LUCE_FA_WINDOW" -gt 0 ] 2>/dev/null && CMD+=(--fa-window "$LUCE_FA_WINDOW")
-# Soft-close ratio: emit only when nonzero. The default-string compare
-# guards against the floating-point quirks of `[` numeric tests for
-# values like 0.0/0/0.00 — anything non-"0.0" passes through to the
-# server, which clamps to [0,1] itself.
-case "$LUCE_THINK_SOFT_CLOSE_MIN_RATIO" in
-    0|0.0|0.00|0.000) ;;  # disabled — don't emit
-    *) CMD+=(--think-soft-close-min-ratio "$LUCE_THINK_SOFT_CLOSE_MIN_RATIO") ;;
-esac
-[ "$LUCE_DEBUG_THINKING_LOGITS" = "1" ] && CMD+=(--debug-thinking-logits)
 
-if [ "$LUCE_PREFILL_MODE" != "off" ]; then
-    [ -n "$LUCE_PREFILL_DRAFTER" ] || die "LUCE_PREFILL_MODE=$LUCE_PREFILL_MODE requires LUCE_PREFILL_DRAFTER"
+if [ "$LUCE_PREFILL_MODE" != off ]; then
+    [ -n "${LUCE_PREFILL_DRAFTER:-}" ] || die "LUCE_PREFILL_MODE=$LUCE_PREFILL_MODE requires LUCE_PREFILL_DRAFTER"
     [ -f "$LUCE_PREFILL_DRAFTER" ] || die "Prefill drafter not found at $LUCE_PREFILL_DRAFTER"
     CMD+=(--prefill-compression "$LUCE_PREFILL_MODE"
-          --prefill-keep-ratio "$LUCE_PREFILL_KEEP"
-          --prefill-threshold "$LUCE_PREFILL_THRESHOLD"
+          --prefill-keep-ratio "${LUCE_PREFILL_KEEP:-0.05}"
+          --prefill-threshold "${LUCE_PREFILL_THRESHOLD:-32000}"
           --prefill-drafter "$LUCE_PREFILL_DRAFTER")
 fi
 
-info "lucebox-hub container starting (target=$(basename "$LUCE_TARGET"), max_ctx=$LUCE_MAX_CTX, budget=$LUCE_BUDGET, lazy=$LUCE_LAZY)"
+# Operator flags go last: luce_server keeps the last value of a repeated flag.
+CMD+=("${ALL_ARGS[@]}")
+
+info "lucebox-hub starting: target=$(basename "$LUCE_TARGET") arch=${MODEL_ARCH:-unknown} device=$TARGET_DESC max_ctx=${MAX_CTX_ARG:-${LUCE_MAX_CTX:-profile}}${PROFILE:+ profile=$PROFILE}"
 
 cd "$LUCE_DIR"
 exec "${CMD[@]}"

@@ -226,17 +226,21 @@ RTX mixed-hardware notes before running long prompts.
 
 The command shape is `luce_server <model.gguf> [options]`. The first positional argument selects the target weights. `--model-name` only changes the name reported by the API; it does not select a model file.
 
+`luce_server --list-devices [model.gguf]` prints every GPU with its `backend:N` index, architecture and memory, and, given a model, the device `--target-device auto` would choose.
+
+`--profile <name>` applies a qualified hardware and model configuration: `ds4-strix` (DeepSeek V4 on Strix Halo) or `ds4-r9700-strix` (DeepSeek V4 with experts split between an R9700 and Strix Halo). Flags on the command line replace the profile's value, and environment variables that are already set keep theirs. The startup log lists what the profile applied.
+
 ### Core server
 
 | Option | Default | Purpose |
 |---|---|---|
-| `--draft <path>` | none | Draft model for speculative decode. |
+| `--draft <path>` | none | Draft model for speculative decode: DFlash for Qwen, Gemma and Laguna, DSpark for DeepSeek V4. |
 | `--host <addr>` | `0.0.0.0` | Bind address. |
 | `--port <N>` | `8080` | Listen port. |
-| `--max-ctx <N>` | `131072` | Maximum context length. |
+| `--max-ctx <N>` | `8192` | Maximum context length. |
 | `--max-tokens <N>` | model card | Legacy alias for `--default-max-tokens`. |
 | `--default-max-tokens <N>` | model card or `16000` | Output cap when a request omits a token limit. |
-| `--model-name <name>` | `dflash` | API alias returned by `/v1/models` and responses. It does not change the loaded weights. |
+| `--model-name <name>` | `luce` | API alias returned by `/v1/models` and responses. It does not change the loaded weights. |
 | `--chat-template-file <path>` | model default | Jinja chat-template override. |
 | `--no-cors` | CORS enabled | Disable CORS headers. |
 
@@ -263,8 +267,9 @@ The command shape is `luce_server <model.gguf> [options]`. The first positional 
 
 | Option | Default | Purpose |
 |---|---|---|
-| `--target-device <backend:gpu>` | `auto:0` | Place the target on a CUDA or HIP device. |
-| `--draft-device <backend:gpu>` | `auto:0` | Place the draft on a CUDA or HIP device. |
+| `--target-device <backend:gpu\|auto>` | `auto:0` or `LUCE_TARGET_DEVICE` | Place the target on a CUDA or HIP device. `auto` picks a GPU the model fits on (discrete before integrated, then the lowest index), else the largest GPU. |
+| `--draft-device <backend:gpu>` | `auto:0` | Place the draft on a CUDA or HIP device. DeepSeek V4 and `--target-device auto` default to the target GPU. |
+| `--expert-device <backend:gpu>` | none | DeepSeek V4: keep dense work and hot experts on the target and run the remaining routed experts on this GPU in the same process. |
 | `--target-devices <list>` | one device | Select multiple target devices, such as `cuda:0,cuda:1`. |
 | `--target-split-mode layer\|tensor` | `layer` | Select the multi-GPU target strategy. |
 | `--target-layer-split <weights>` | none | Optional layer-split weights. |

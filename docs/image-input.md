@@ -48,28 +48,27 @@ hf download Lucebox/DeepSeek-V4-Flash-0731-ROCmFP3 \
 hf download Lucebox/DeepSeek-V4-Flash-0731-DSpark-GGUF \
   DeepSeek-V4-Flash-0731-DSpark-draft-Q4RMFP4-denseF16.gguf --local-dir models
 
-LUCE_DS4_SPEC=1 \
-LUCE_DS4_DRAFT=models/DeepSeek-V4-Flash-0731-DSpark-draft-Q4RMFP4-denseF16.gguf \
 LUCE_DS4_SPARSE_DECODE_FLASH=1 \
 ./server/build-hip/luce_server models/DeepSeek-V4-Flash-Vision-Exp-ROCMFPX-MIX-STRIX.gguf \
-  --target-device hip:0 --max-ctx 131072 --chunk 8192 \
-  --cache-type-k q4_0 --cache-type-v q4_0 \
-  --ds4-fused-decode --ds4-fused-verify-f16-kv \
-  --ds4-expert-top-k 6 --ds4-prefill sparse \
+  --draft models/DeepSeek-V4-Flash-0731-DSpark-draft-Q4RMFP4-denseF16.gguf \
+  --target-device auto --profile ds4-strix \
   --mmproj models/DeepSeek-V4-Flash-Vision-Exp-mmproj-BF16.gguf \
   --port 8216
 ```
 
-`hip:0` must be the Strix Halo; on a host with a discrete GPU too, expose the
-Strix Halo alone with `HIP_VISIBLE_DEVICES`. This is the text model's published
-launch plus `--mmproj`: the Vision file replaces
+The model must run on the Strix Halo. `--target-device auto` picks it when the
+discrete GPU cannot hold the model, as with an R9700 (32 GB); with a larger
+discrete GPU, name the Strix Halo with `--target-device hip:N` instead
+(`luce_server --list-devices` shows the choice).
+This is the text model's published launch (`--profile ds4-strix`) plus `--mmproj`: the Vision file replaces
 `DeepSeek-V4-Flash-0731-ROCMFPX-MIX-STRIX.gguf` for text as well and decodes
 at least as fast (numbers below). For R9700 + Strix Halo see [DS4V](#ds4v) below.
 
 With an R9700 in the same box, run the image encoder there while the model
-stays on the Strix Halo: expose both GPUs, point `--target-device` at the Strix
-Halo and add `--mmproj-device` with the R9700 (on lucebox6, without
-`HIP_VISIBLE_DEVICES`, that is `--target-device hip:1 --mmproj-device hip:0`).
+stays on the Strix Halo: expose both GPUs and add `--mmproj-device` with the
+R9700. `--target-device auto` already puts the model on the Strix Halo (on
+lucebox6, without `HIP_VISIBLE_DEVICES`, that is `hip:1`, so add
+`--mmproj-device hip:0`).
 The encoder then runs about twice as fast and streams each image into prefill
 as soon as it is encoded, so the Strix Halo never waits for the next one:
 

@@ -33,7 +33,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `LUCE_MMID_GROUPED` | unset | Grouped MUL_MAT_ID kernel for small verify batches; candidate for CLI promotion. |
 | `LUCE_MMID_GROUPED_TYPES` | 7 | Grouped-kernel type mask; bit 3 (`8`) opts ROCmFP2/ROCmFP3 into the path. |
 | `LUCE_MMID_GROUPED_DEVICE` | -1 | Optional zero-based device restriction; unset/-1 applies to every eligible device. |
-| `LUCE_DS4_MOE_TP` / `LUCE_DS4_MOE_TP_INPROC` | unset | BURN-IN: enable DeepSeek4 route-owner expert parallelism in one process. |
+| `LUCE_DS4_MOE_TP` / `LUCE_DS4_MOE_TP_INPROC` | unset | BURN-IN: enable DeepSeek4 route-owner expert parallelism in one process. Prefer the CLI: `--expert-device <backend:gpu>` sets both with the device and backend. |
 | `LUCE_DS4_MOE_TP_BACKEND` / `LUCE_MOE_TP_BACKEND` | peer runtime in a mixed build; compiled runtime otherwise | Select the in-process cold expert owner backend. |
 | `LUCE_DS4_MOE_TP_GPU` | peer backend device 0 in a mixed build; other local device otherwise | Device index within the cold DeepSeek4 expert backend. |
 | `LUCE_DS4_MOE_TP_CONCENTRATE_COLD` | unset | BURN-IN: use complete peer-owned expert layers to reduce cross-runtime joins; falls back when the placement would exceed the target budget. |
@@ -80,6 +80,8 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `LUCE_PREFIX_CACHE_SLOTS` | 32 | Container-entrypoint equivalent of `--prefix-cache-slots`; not read directly by the native binary. |
 | `LUCE_PREFILL_CACHE_SLOTS` | 0 | Container-entrypoint equivalent of `--prefill-cache-slots`; not read directly by the native binary. |
 | `LUCE_MMPROJ` | unset | Container-entrypoint equivalent of `--mmproj` (vision projector path, enables image input); not read directly by the native binary. |
+| `LUCE_TARGET_DEVICE` | unset (`auto` in the container) | Target device (`backend:gpu` or `auto`) used when neither `--target-device`, `--target-devices` nor a `--profile` names one. |
+| `LUCE_PROFILE` / `LUCE_ARGS` | unset | Container entrypoint only: `--profile` name, and extra `luce_server` flags split on whitespace. |
 | `LUCE_PREFILL_POOL_TRIM_TOKENS` | unset | OPT-IN: trim cached allocations from legacy CUDA/HIP device pools at completed Qwen3.5 prefill chunk boundaries after each configured token interval. Intended for long, shape-changing prefills on non-VMM devices; each trim synchronizes the target backend and retires captured graphs. |
 | `LUCE_SPLIT_FAST_ROLLBACK` | unset | OPT-IN: exact F32 checkpoints and replay-free rollback for local qwen35 target layer splits. Prefer `--target-split-fast-rollback`; adds checkpoint VRAM (~1.65 GiB for the measured Qwen3.6-27B q=16 split). |
 | `LUCE_STALL_TOOL_PREFIX` | unset | OPT-IN: recover a stalled tool call by injecting the prepared tool prefix when generation stops after an action suffix. |
@@ -107,6 +109,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `LUCE_ADAPTIVE_SPEC_WIDTH` - adaptive_spec_width.h
 - `LUCE_ADAPTIVE_WIDTH_MIN` - adaptive_verify_width.h
 - `LUCE_ADAPTIVE_WIDTH_THETA` - adaptive_verify_width.h
+- `LUCE_ARGS` - scripts/entrypoint.sh (extra `luce_server` flags, split on whitespace)
 - `LUCE_COLD_THREADS` - moe_expert_compute_cpu.cpp
 - `LUCE_CUDA_BACKEND_PATH` - dynamic_backend.cpp
 - `LUCE_CUDA_MMVF_NARROW_F16` - ggml-cuda/mmvf.cu
@@ -299,6 +302,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `LUCE_PREFILL_POOL_TRIM_TOKENS` - qwen35_backend.cpp (OPT-IN: trim legacy device pools during long prefills)
 - `LUCE_PREFILL_TIMING` - qwen35_backend.cpp (DEBUG: per-ubatch prefill build/alloc/compute timing)
 - `LUCE_PREFIX_CACHE_SLOTS` - scripts/entrypoint.sh (maps to `--prefix-cache-slots`)
+- `LUCE_PROFILE` - scripts/entrypoint.sh (maps to `--profile`)
 - `LUCE_QWEN35MOE_CACHE_SLOTS` - qwen35moe_backend.cpp
 - `LUCE_QWEN35MOE_HOTNESS` - qwen35moe_backend.cpp
 - `LUCE_QWEN35MOE_NEXT_PLACEMENT_OUT` - qwen35moe_backend.cpp
@@ -332,6 +336,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `LUCE_SPLIT_FAST_ROLLBACK` - chain_rollback_policy.h
 - `LUCE_STALL_TOOL_PREFIX` - http_server.cpp
 - `LUCE_SV_DEBUG` - qwen35_backend.cpp
+- `LUCE_TARGET_DEVICE` - server_main.cpp (default for `--target-device`)
 - `LUCE_TARGET_SHARD_IPC_SHARED_BYTES` - target_shard_ipc.cpp
 - `LUCE_TARGET_SHARD_IPC_TRANSPORT` - target_shard_ipc.cpp
 - `LUCE_TOPK_PROFILE` - geometric_draft_topk_cuda.cu

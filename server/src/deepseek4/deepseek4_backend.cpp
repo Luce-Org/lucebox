@@ -246,14 +246,14 @@ static bool is_gfx_device(int gpu, const char * arch) {
 #endif
 }
 
-static bool configure_dspark_mmvq_defaults(int gpu) {
+static bool configure_dspark_mmvq_defaults(int gpu, bool spec) {
     if (env_flag_enabled("LUCE_DS4_Q6_VERIFY")) {
         std::fprintf(stderr,
                      "[deepseek4] q=6 verification is unsupported; use q=5\n");
         return false;
     }
 #if defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP)
-    if (!env_flag_enabled("LUCE_DS4_SPEC")) {
+    if (!spec) {
         return true;
     }
 
@@ -350,9 +350,10 @@ static bool configure_dspark_mmvq_defaults(int gpu) {
 // The gfx1151 dense ROCmFP4 weight-reuse kernel preserves single-column
 // arithmetic through that width. Keep those projections on MMVQ while
 // honoring an explicit LUCE_MMVQ_MAX_NCOLS setting.
-static void configure_gfx1151_paged_mmvq_default(int gpu, bool paged_attention) {
+static void configure_gfx1151_paged_mmvq_default(int gpu, bool paged_attention,
+                                                bool spec) {
 #if defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP)
-    if (!paged_attention || env_flag_enabled("LUCE_DS4_SPEC") ||
+    if (!paged_attention || spec ||
         !is_gfx_device(gpu, "gfx1151")) {
         return;
     }
@@ -418,9 +419,9 @@ static bool apply_gfx1151_profile_defaults(
 // test_failed_init_preserves_sparse_opt_in asserts init() leaves it alone).
 // Returns false when a default could not be installed, so init() never
 // continues with a partially applied verifier profile.
-static bool configure_gfx1151_dspark_verifier_defaults(int gpu) {
+static bool configure_gfx1151_dspark_verifier_defaults(int gpu, bool spec) {
 #if defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP)
-    if (!env_flag_enabled("LUCE_DS4_SPEC") ||
+    if (!spec ||
         !is_gfx_device(gpu, "gfx1151")) {
         return true;
     }
@@ -1625,17 +1626,24 @@ bool DeepSeek4Backend::load_spec_drafter() {
 
     ggml_backend_t draft_backend = backend_;
     int draft_gpu = cfg_.device.gpu;
-    if (const char * gpu = std::getenv("LUCE_DS4_DRAFT_GPU")) {
-        draft_gpu = std::max(0, std::atoi(gpu));
-    }
     const bool separate_draft_stream =
         env_flag_enabled("LUCE_DS4_DRAFT_SEPARATE_STREAM");
     PlacementBackend draft_kind = PlacementBackend::Auto;
-    if (!ds4_draft_backend(draft_kind)) {
-        std::fprintf(stderr,
-                     "[deepseek4] invalid LUCE_DS4_DRAFT_BACKEND; "
-                     "expected cuda or hip\n");
-        return false;
+    // server_main makes an explicit --draft-device concrete (auto:N included),
+    // so an auto backend here means "not placed": environment, then target.
+    if (cfg_.draft_device.backend != PlacementBackend::Auto) {
+        draft_kind = cfg_.draft_device.backend;
+        draft_gpu = cfg_.draft_device.gpu;
+    } else {
+        if (const char * gpu = std::getenv("LUCE_DS4_DRAFT_GPU")) {
+            draft_gpu = std::max(0, std::atoi(gpu));
+        }
+        if (!ds4_draft_backend(draft_kind)) {
+            std::fprintf(stderr,
+                         "[deepseek4] invalid LUCE_DS4_DRAFT_BACKEND; "
+                         "expected cuda or hip\n");
+            return false;
+        }
     }
     const PlacementBackend target_kind = placement_backend_of(backend_);
     if (draft_kind != target_kind || draft_gpu != cfg_.device.gpu ||
@@ -1795,6 +1803,9 @@ bool DeepSeek4Backend::supports_batched_spec_feature_capture(
 }
 
 bool DeepSeek4Backend::init() {
+    // --draft selects DSpark directly; LUCE_DS4_SPEC + LUCE_DS4_DRAFT remain
+    // the environment spelling of the same request.
+    spec_requested_ = !cfg_.draft_path.empty() || env_flag_enabled("LUCE_DS4_SPEC");
     if (cfg_.paged_attention) {
         const PlacementBackend target_backend =
             cfg_.device.backend == PlacementBackend::Auto
@@ -1830,16 +1841,17 @@ bool DeepSeek4Backend::init() {
 
     // Install the gfx1151 DSpark verifier profile first: the MMVQ crossover
     // below reads LUCE_DS4_Q5_VERIFY.
-    if (!configure_gfx1151_dspark_verifier_defaults(cfg_.device.gpu)) {
+    if (!configure_gfx1151_dspark_verifier_defaults(cfg_.device.gpu, spec_requested_)) {
         return false;
     }
     // The shared MMVQ/MMQ crossover defaults to q=3 for NVIDIA. On gfx1151,
     // DSpark q=4 is faster through MMVQ. Keep AR and other devices unchanged,
     // and preserve LUCE_MMVQ_MAX_NCOLS as an explicit override.
-    if (!configure_dspark_mmvq_defaults(cfg_.device.gpu)) {
+    if (!configure_dspark_mmvq_defaults(cfg_.device.gpu, spec_requested_)) {
         return false;
     }
-    configure_gfx1151_paged_mmvq_default(cfg_.device.gpu, cfg_.paged_attention);
+    configure_gfx1151_paged_mmvq_default(cfg_.device.gpu, cfg_.paged_attention,
+                                         spec_requested_);
     if (!configure_gfx1151_sparse_prefill_kernel_defaults(
             cfg_.device.gpu, cfg_.prefill_mode)) {
         return false;
@@ -1853,7 +1865,7 @@ bool DeepSeek4Backend::init() {
          cfg_.prefill_mode != PrefillAttentionMode::Exact ||
          cfg_.fused_decode || cfg_.fused_verify_f16_kv ||
          env_flag_enabled("LUCE_DS4_FUSED_DECODE") ||
-         env_flag_enabled("LUCE_DS4_SPEC"))) {
+         spec_requested_)) {
         std::fprintf(stderr,
             "[deepseek4] paged serving requires 1..%d local slots, exact "
             "prefill, and autoregressive non-fused decode\n",
@@ -1987,7 +1999,16 @@ bool DeepSeek4Backend::init() {
                  prefill_attention_mode_name(cfg_.prefill_mode),
                  moe_hybrid_ ? " [hybrid]" : "");
 
-    if (!cfg_.paged_attention && env_flag_enabled("LUCE_DS4_SPEC")) {
+    if (!cfg_.paged_attention && !cfg_.draft_path.empty()) {
+        // An explicit --draft is part of the launch contract: fail rather
+        // than silently serving without the requested drafter.
+        spec_draft_path_ = cfg_.draft_path;
+        if (!load_spec_drafter()) {
+            std::fprintf(stderr, "[deepseek4] --draft %s could not be loaded as a "
+                                 "DSpark drafter\n", cfg_.draft_path.c_str());
+            return false;
+        }
+    } else if (!cfg_.paged_attention && spec_requested_) {
         const char * dp = std::getenv("LUCE_DS4_DRAFT");
         if (dp && *dp) {
             spec_draft_path_ = dp;

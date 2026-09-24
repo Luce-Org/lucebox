@@ -371,7 +371,9 @@ std::unique_ptr<ModelBackend> construct_backend(
             cfg.model_path = model.path;
             cfg.mmproj_path = model.mmproj_path.value_or("");
             cfg.mmproj_gpu  = model.mmproj_device ? model.mmproj_device->gpu : -1;
+            cfg.draft_path = speculation.draft_path.value_or("");
             cfg.device     = placement.target;
+            cfg.draft_device = placement.draft;
             cfg.stream_fd  = execution.stream_fd;
             cfg.max_ctx    = placement.target.max_ctx;
             cfg.chunk      = execution.chunk;
