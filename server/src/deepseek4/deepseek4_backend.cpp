@@ -35,6 +35,7 @@
 #include <cstring>
 #include <cinttypes>
 #include <condition_variable>
+#include <exception>
 #include <mutex>
 #include <limits>
 #include <new>
@@ -1260,18 +1261,25 @@ bool DeepSeek4Backend::materialize_images(const DeepSeek4ImagePrompt & images,
             const auto t0 = Clock::now();
             bool ok = true;
             std::string stream_error;
-            for (size_t i = 0; ok && i < images.prepared_.images.size(); ++i) {
-                vision::ImageRows one;
-                ok = vision::materialize_image_rows({images.prepared_.images[i]}, sentinels,
-                        size_t(w_.n_embd), encode_one, [&] { return io.is_cancelled(); },
-                        one, stream_error) && one.size() == 1;
-                if (ok) images.publish_image(i, std::move(one.front()));
+            try {
+                for (size_t i = 0; ok && i < images.prepared_.images.size(); ++i) {
+                    vision::ImageRows one;
+                    ok = vision::materialize_image_rows({images.prepared_.images[i]}, sentinels,
+                            size_t(w_.n_embd), encode_one, [&] { return io.is_cancelled(); },
+                            one, stream_error) && one.size() == 1;
+                    if (ok) images.publish_image(i, std::move(one.front()));
+                }
+            } catch (const std::exception & e) {
+                // Nothing may escape the thread: fail the stream so prefill stops waiting.
+                ok = false;
+                stream_error = e.what();
             }
             vision_->release_scratch();
             if (!ok) {
                 std::fprintf(stderr, "[deepseek4] streaming image encode stopped: %s\n",
                              stream_error.empty() ? "cancelled" : stream_error.c_str());
                 images.fail_stream();
+                return;
             }
             std::fprintf(stderr, "[deepseek4] images encoded in %.0f ms on the --mmproj-device GPU (streamed)\n",
                          elapsed_s(t0) * 1000.0);
@@ -3315,7 +3323,7 @@ GenerateResult DeepSeek4Backend::generate_from_state(
         std::string error;
         const auto encode_t0 = Clock::now();
         const bool encoded = materialize_images(*images, out_io, error);
-        if (!vision_backend_) {
+        if (encoded && !vision_backend_) {
             std::fprintf(stderr, "[deepseek4] images encoded in %.0f ms on the target GPU\n",
                          elapsed_s(encode_t0) * 1000.0);
         }
