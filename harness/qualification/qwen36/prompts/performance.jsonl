@@ -1,0 +1,1 @@
+{"id":"ar-throughput","description":"Stable bounded decode workload for AR concurrency profiles","messages":[{"role":"user","content":"Write one compact paragraph explaining why deterministic benchmarks need fixed prompts and decoding parameters. Do not use a list."}]}
