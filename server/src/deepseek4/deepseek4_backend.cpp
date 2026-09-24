@@ -37,6 +37,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <exception>
+#include <functional>
 #include <mutex>
 #include <limits>
 #include <new>
@@ -61,10 +62,10 @@ private:
         for (const auto & image : prepared_.images) spans_.push_back(image.layout.span);
     }
 
-    bool embed_chunk(const CpuEmbedder & embedder, size_t position,
-                     int count, float * output) const {
+    bool embed_chunk(const CpuEmbedder & embedder, size_t position, int count, float * output,
+                     const std::function<bool()> & cancelled = {}) const {
         if (!output || count <= 0 || embedder.n_embd <= 0) return false;
-        if (!wait_for_images(position, size_t(count))) return false;
+        if (!wait_for_images(position, size_t(count), cancelled)) return false;
         std::vector<float> result;
         std::string error;
         const bool ok = vision::embed_image_prompt_chunk(
@@ -87,10 +88,16 @@ private:
         }
         return needed;
     }
-    bool wait_for_images(size_t position, size_t count) const {
+    // `cancelled` (polled while waiting) lets a request that ends early stop
+    // waiting for images it no longer needs.
+    bool wait_for_images(size_t position, size_t count,
+                         const std::function<bool()> & cancelled = {}) const {
         const size_t needed = images_needed(position, count);
         std::unique_lock<std::mutex> lock(stream_mutex_);
-        stream_ready_.wait(lock, [&] { return stream_failed_ || ready_ >= needed; });
+        while (!stream_failed_ && ready_ < needed) {
+            if (cancelled && cancelled()) return false;
+            stream_ready_.wait_for(lock, std::chrono::milliseconds(50));
+        }
         return ready_ >= needed;
     }
     // Non-blocking: every image overlapping [position, position + count) is in.
@@ -1279,11 +1286,15 @@ int DeepSeek4Backend::run_staged_pass(const std::vector<StagedPrefill *> & items
     return rows;
 }
 
-void DeepSeek4Backend::wait_staged_ready(const StagedPrefill & item, int timeout_ms) const {
+void DeepSeek4Backend::wait_staged_ready(const StagedPrefill & item, int row_budget,
+                                         int timeout_ms) const {
     const auto * images = static_cast<const DeepSeek4ImagePrompt *>(item.images.get());
-    if (images && !item.finished()) {
-        images->wait_images_for(size_t(item.done), size_t(item.prefix - item.done), timeout_ms);
-    }
+    if (!images || item.finished()) return;
+    // Wake as soon as the next chunk's images are in, not all of them.
+    const int n = vision::staged_prefill_chunk(images->spans(), uint64_t(item.done),
+                                               item.prefix - item.done, row_budget,
+                                               DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS);
+    if (n > 0) images->wait_images_for(size_t(item.done), size_t(n), timeout_ms);
 }
 
 bool DeepSeek4Backend::encode_one_image(const vision::PromptImage & image,
@@ -3188,7 +3199,8 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         std::vector<float> embed(w_.n_embd * n_tok);
         const auto embed_t0 = Clock::now();
         const bool embedded = images
-            ? images->embed_chunk(w_.embedder, size_t(i), n_tok, embed.data())
+            ? images->embed_chunk(w_.embedder, size_t(i), n_tok, embed.data(),
+                                  [&] { return io.is_cancelled(); })
             : w_.embedder.embed(tokens.data() + i, n_tok, embed.data());
         if (!embedded) return -1;
         DeepSeek4StepTelemetry step_tel;

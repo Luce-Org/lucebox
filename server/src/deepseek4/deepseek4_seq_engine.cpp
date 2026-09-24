@@ -150,11 +150,12 @@ void DeepSeek4SeqEngine::advance_pending_images(bool decoding, bool idle) {
     if (items.empty()) return;
     // Bounded work per step keeps every live stream decoding while images
     // prefill; a whole image block may exceed the budget.
-    const int rows = b_.run_staged_pass(items, decoding ? DS4_STAGED_PREFILL_ROWS_PER_STEP
-                                                        : DS4_STAGED_PREFILL_ROWS_WITHOUT_DECODE);
+    const int budget = decoding ? DS4_STAGED_PREFILL_ROWS_PER_STEP
+                                : DS4_STAGED_PREFILL_ROWS_WITHOUT_DECODE;
+    const int rows = b_.run_staged_pass(items, budget);
     // Nothing ready and nothing else to run: wait briefly for the encoder
     // instead of spinning the scheduler.
-    if (rows == 0 && idle) b_.wait_staged_ready(*items.front(), 20);
+    if (rows == 0 && idle) b_.wait_staged_ready(*items.front(), budget, 20);
     for (auto & pending : pending_images_) {
         DeepSeek4StagedPrefill & staged = pending.staged;
         if (!staged.error.empty() || staged.done < staged.prefix || !staged.staging) continue;
@@ -301,7 +302,11 @@ SeqEngine::StepResult DeepSeek4SeqEngine::step(const StepPlan & plan) {
             const DeepSeek4StagedPrefill & staged = pending->staged;
             const bool failed = !staged.error.empty();
             const bool copied = !failed && staged.done >= staged.prefix && !staged.staging;
-            if (failed) fail_prefill(slice.slot, result.prefills, staged.error);
+            if (failed) {
+                fail_prefill(slice.slot, result.prefills, staged.error);
+                // Its queued encode must not keep the encoder from others.
+                if (staged.images) b_.cancel_image_encode(*staged.images);
+            }
             if (failed || copied) {
                 pending_images_.erase(pending_images_.begin() + (pending - pending_images_.data()));
             }

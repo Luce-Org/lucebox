@@ -86,24 +86,34 @@ void validation_and_lookup() {
         const std::vector<TokenSpan> two{{2, 3, 99, 100}, {300, 301, 399, 400}};
         require(staged_prefill_chunk(view(two), 0, 500, 256, 5) == 256, "text runs to the budget");
         require(staged_prefill_chunk(view(two), 256, 244, 256, 5) == 244, "an image and the tail");
-        // Every layout of up to two images walks to the end in valid chunks.
+        // Every layout of one or two images walks to the end in valid chunks.
+        const auto walk = [&](const std::vector<TokenSpan> & layout, int prefix, int budget) {
+            int done = 0;
+            while (done < prefix) {
+                const int n = staged_prefill_chunk(view(layout), uint64_t(done), prefix - done, budget, 5);
+                require(n >= 5, "staged chunk makes progress");
+                require(prefix - done - n == 0 || prefix - done - n >= 5, "no stub tail");
+                for (const TokenSpan & span : layout) {
+                    require(!(uint64_t(done) < span.block_end && uint64_t(done + n) > span.block_begin &&
+                              (uint64_t(done) > span.block_begin || uint64_t(done + n) < span.block_end)),
+                            "image block stays whole");
+                }
+                done += n;
+            }
+        };
         for (uint64_t a = 0; a < 12; ++a)
             for (uint64_t len = 5; len < 40; len += 7)
-                for (int prefix = int(a + len); prefix < int(a + len) + 12; ++prefix)
-                    for (int budget : {5, 8, 16, 256}) {
-                        const std::vector<TokenSpan> layout{{a, a, a + len, a + len}};
-                        int done = 0;
-                        while (done < prefix) {
-                            const int n = staged_prefill_chunk(view(layout), uint64_t(done),
-                                                               prefix - done, budget, 5);
-                            require(n >= 5 || prefix < 5, "staged chunk makes progress");
-                            require(prefix - done - n == 0 || prefix - done - n >= 5, "no stub tail");
-                            require(!(uint64_t(done) < a + len && uint64_t(done + n) > a &&
-                                      (uint64_t(done) > a || uint64_t(done + n) < a + len)),
-                                    "image block stays whole");
-                            done += n;
+                for (int budget : {5, 8, 16, 256}) {
+                    for (int prefix = int(a + len); prefix < int(a + len) + 12; ++prefix)
+                        walk({{a, a, a + len, a + len}}, prefix, budget);
+                    for (uint64_t gap = 0; gap < 9; gap += 2)
+                        for (uint64_t len2 = 5; len2 < 30; len2 += 8) {
+                            const uint64_t b = a + len + gap;
+                            for (int tail = 0; tail < 7; ++tail)
+                                walk({{a, a, a + len, a + len}, {b, b, b + len2, b + len2}},
+                                     int(b + len2) + tail, budget);
                         }
-                    }
+                }
     }
     require(valid_image_spans(view(spans), 35), "adjacent and separated blocks valid");
     require(!image_block_at(view(spans), 9), "text before block excluded");

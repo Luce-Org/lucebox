@@ -25,6 +25,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <memory>
@@ -145,7 +146,7 @@ private:
     std::mutex             encode_mutex_;
     std::condition_variable encode_ready_;
     std::deque<std::shared_ptr<const DeepSeek4ImagePrompt>> encode_queue_;
-    bool                   encode_stop_ = false;
+    std::atomic<bool>      encode_stop_{false};  // also read by the worker's cancel check
     vision::ImageSentinels image_sentinels_;
     // Batched image serving: one single-request staging cache per slot
     // (slot 0 uses cache_), allocated at startup.
@@ -241,7 +242,7 @@ private:
     int run_staged_pass(const std::vector<StagedPrefill *> & items, int row_budget);
     // Waits up to `timeout_ms` for the next rows of an item to have their
     // images encoded, so an otherwise idle scheduler does not spin.
-    void wait_staged_ready(const StagedPrefill & item, int timeout_ms) const;
+    void wait_staged_ready(const StagedPrefill & item, int row_budget, int timeout_ms) const;
     bool materialize_images(const std::shared_ptr<const DeepSeek4ImagePrompt> & images,
                             const DaemonIO & io, std::string & error);
 
