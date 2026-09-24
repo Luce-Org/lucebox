@@ -17,6 +17,7 @@
 #include "common/peer_access.h"
 #include "common/platform_env.h"
 #include "common/sampler.h"
+#include "common/moe_hybrid_expert_cache.h"
 #include "common/moe_hybrid_routing_stats.h"
 
 #include <nlohmann/json.hpp>
@@ -1485,7 +1486,22 @@ void DeepSeek4Backend::log_route_counts(const char * phase) {
     MoeHybridStorage::RouteCounts & c = moe_hybrid_->route_counts;
     const double total = (double) std::max<uint64_t>(1, c.total());
     const MoeHybridStreamEngine::Stats & st = stream_engine_.stats();
-    if (c.total() > 0) {
+    if (c.total() > 0 && expert_cache_.ready()) {
+        const MoeStreamedExpertCache::Stats cs = expert_cache_.stats();
+        const double used = (double) std::max<uint64_t>(1, cs.experts);
+        std::fprintf(stderr, "[deepseek4] %s routed calls: %" PRIu64 " primary %.1f%%, secondary %.1f%%, "
+                     "streamed %.1f%%; streamed %" PRIu64 " experts, cache hit %.1f%% (prefetched %.1f%%), "
+                     "loaded %" PRIu64 " (%" PRIu64 " by prefetch) %.2f GiB: read %.0f ms, upload %.0f ms, "
+                     "wait %.0f ms, compute %.0f ms; prefetch accuracy %.1f%% of %" PRIu64 "\n",
+                     phase, c.total(), 100.0 * (double) c.primary / total,
+                     100.0 * (double) c.secondary / total, 100.0 * (double) c.streamed / total,
+                     cs.experts, 100.0 * (double) cs.hits / used, 100.0 * (double) cs.prefetch_hits / used,
+                     cs.loads, cs.prefetched, gib(cs.bytes), cs.read_us / 1000.0, cs.upload_us / 1000.0,
+                     cs.wait_us / 1000.0, cs.compute_us / 1000.0,
+                     100.0 * (double) cs.predicted_used / (double) std::max<uint64_t>(1, cs.predicted_of),
+                     cs.predicted_of);
+        expert_cache_.reset_stats();
+    } else if (c.total() > 0) {
         std::fprintf(stderr, "[deepseek4] %s routed calls: %" PRIu64 " primary %.1f%%, secondary %.1f%%, "
                      "streamed %.1f%%; streamed %" PRIu64 " experts %.2f GiB: read %.0f ms, upload %.0f ms, "
                      "compute %.0f ms\n",
@@ -2421,6 +2437,7 @@ bool DeepSeek4Backend::init_hybrid_model() {
 
     auto hybrid = std::make_shared<MoeHybridStorage>();
     const auto fail_hybrid_init = [&]() {
+        expert_cache_.destroy();
         stream_engine_.destroy();
         hybrid.reset();
         if (expert_backend_) {
@@ -2631,6 +2648,27 @@ bool DeepSeek4Backend::init_hybrid_model() {
                      stream_engine_.pinned_bytes() / 1024.0 / 1024.0,
                      stream_engine_.scratch_bytes() / 1024.0 / 1024.0);
         hybrid->stream_engine = &stream_engine_;
+
+        // Streamed experts go through a device cache on the secondary GPU
+        // when there is one: it reads host memory at local speed while the
+        // primary sits behind a narrower link. LUCE_EXPERT_STREAM_DEVICE
+        // overrides; LUCE_EXPERT_STREAM_CACHE_MB sizes the cache (default:
+        // the device's free memory minus 2 GiB), 0 keeps the uncached path.
+        MoeExpertCacheOptions cache_opts;
+        cache_opts.device = inprocess_tp && tp.secondary_backend == local_kind
+            ? tp.secondary_gpu : cfg_.device.gpu;
+        if (const char * v = std::getenv("LUCE_EXPERT_STREAM_DEVICE"); v && *v) {
+            cache_opts.device = std::atoi(v);
+        }
+        const char * cache_mb = std::getenv("LUCE_EXPERT_STREAM_CACHE_MB");
+        if (cache_mb && *cache_mb) cache_opts.pool_bytes = (size_t) std::atoll(cache_mb) << 20;
+        if (!(cache_mb && *cache_mb && cache_opts.pool_bytes == 0)) {
+            if (init_deepseek4_streamed_expert_cache(w_, *hybrid, cache_opts, expert_cache_, &err)) {
+                hybrid->expert_cache = &expert_cache_;
+            } else {
+                std::fprintf(stderr, "[deepseek4] streamed expert cache disabled: %s\n", err.c_str());
+            }
+        }
     }
 
     moe_hybrid_ = std::move(hybrid);
@@ -2689,6 +2727,7 @@ bool DeepSeek4Backend::park(ParkTarget target) {
     last_logits_pos_ = -1;
     free_deepseek4_cache(cache_);
     expert_runtime_.reset();
+    expert_cache_.destroy();
     stream_engine_.destroy();
     moe_hybrid_.reset();
     if (expert_backend_) {
@@ -2719,6 +2758,7 @@ bool DeepSeek4Backend::unpark(ParkTarget target) {
             std::fprintf(stderr, "[deepseek4] unpark: failed to restore target model\n");
             vision_.reset();
             free_deepseek4_weights(w_);
+            expert_cache_.destroy();
             stream_engine_.destroy();
             moe_hybrid_.reset();
             if (expert_backend_) {
@@ -2738,6 +2778,7 @@ bool DeepSeek4Backend::unpark(ParkTarget target) {
             free_deepseek4_cache(cache_);
             vision_.reset();
             free_deepseek4_weights(w_);
+            expert_cache_.destroy();
             stream_engine_.destroy();
             moe_hybrid_.reset();
             if (expert_backend_) {
@@ -2755,6 +2796,7 @@ bool DeepSeek4Backend::unpark(ParkTarget target) {
             vision_.reset();
             free_deepseek4_weights(w_);
             expert_runtime_.reset();
+            expert_cache_.destroy();
             stream_engine_.destroy();
             moe_hybrid_.reset();
             if (expert_backend_) {
@@ -2773,6 +2815,7 @@ bool DeepSeek4Backend::unpark(ParkTarget target) {
     if (!validate_prefill_mode()) {
         vision_.reset();
         free_deepseek4_weights(w_);
+        expert_cache_.destroy();
         stream_engine_.destroy();
         moe_hybrid_.reset();
         moe_placement_ = {};
@@ -3954,6 +3997,7 @@ void DeepSeek4Backend::shutdown() {
     free_deepseek4_paged_cache(paged_cache_);
     free_deepseek4_cache(cache_);
     expert_runtime_.reset();
+    expert_cache_.destroy();
     stream_engine_.destroy();
     moe_hybrid_.reset();
     if (expert_backend_) {

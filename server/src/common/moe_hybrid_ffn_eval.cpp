@@ -1065,6 +1065,37 @@ static bool build_moe_owner_branch(
         /*force_fused_combine=*/false, canonical_route_join);
 }
 
+ggml_tensor * build_moe_routed_experts(
+        ggml_context * ctx,
+        const MoeHybridConfig & cfg,
+        const MoeLayerDesc & desc,
+        ggml_tensor * gate,
+        ggml_tensor * up,
+        ggml_tensor * down,
+        ggml_tensor * gate_up,
+        ggml_tensor * inp,
+        ggml_tensor * sel,
+        ggml_tensor * wts,
+        int n_routes,
+        int n_tokens) {
+    MoeOwnerGraphSpec stack;
+    stack.gate = gate;
+    stack.up = up;
+    stack.down = down;
+    stack.gate_up = gate_up;
+    stack.local_ids = sel;
+    stack.masked_weights = wts;
+    MoeHybridConfig routes_cfg = cfg;
+    routes_cfg.n_expert_used = n_routes;
+    if (!stack.available() ||
+        !build_moe_owner_branch(ctx, routes_cfg, desc, inp, n_tokens,
+                                /*canonical_route_join=*/false,
+                                /*allow_fused_combine=*/false, stack)) {
+        return nullptr;
+    }
+    return stack.output;
+}
+
 static ggml_tensor * build_moe_owner_join(
         ggml_context * ctx,
         ggml_cgraph * schedule_graph,

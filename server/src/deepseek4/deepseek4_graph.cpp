@@ -22,6 +22,7 @@
 #include "../common/cuda_graph_overrides.h"
 #include "../common/dynamic_backend.h"
 #include "../common/moe_expert_compute.h"
+#include "../common/moe_hybrid_expert_cache.h"
 #include "../common/moe_hybrid_ffn_eval.h"
 #include "../common/moe_hybrid_routing_stats.h"
 #include "../common/moe_hybrid_stream.h"
@@ -4022,6 +4023,18 @@ static ggml_tensor * build_shared_ffn(
     return ggml_mul_mat(ctx, L.ffn_down_shexp, mid_sh);
 }
 
+bool init_deepseek4_streamed_expert_cache(
+        const DeepSeek4Weights & w,
+        const MoeHybridStorage & hybrid,
+        const MoeExpertCacheOptions & opts,
+        MoeStreamedExpertCache & cache,
+        std::string * err) {
+    std::vector<MoeLayerDesc> descs;
+    descs.reserve((size_t) w.n_layer);
+    for (int il = 0; il < w.n_layer; ++il) descs.push_back(make_ds4_moe_layer_desc(w.layers[(size_t) il]));
+    return cache.init(make_ds4_moe_hybrid_config(w), descs, hybrid, opts, err);
+}
+
 // Adds the routed experts that neither stack owns (an explicit ownership
 // leaves them to the model file) to the owners' output. They are streamed
 // through the same engine as a non-materialized cold stack.
@@ -4053,8 +4066,18 @@ static bool eval_ds4_streamed_experts(
                      "activations and the stream engine\n", layer);
         return false;
     }
-    std::vector<float> streamed_out;
     std::string err;
+    MoeStreamedExpertCache * cache = hybrid_owner->expert_cache;
+    if (cache && cache->ready()) {
+        if (!cache->eval(layer, desc, ffn_normed_host, selected_host, weights_host,
+                         n_expert_used, n_tokens, ffn_out_host.data(), &err)) {
+            std::fprintf(stderr, "[deepseek4] layer %d streamed expert eval failed: %s\n",
+                         layer, err.c_str());
+            return false;
+        }
+        return true;
+    }
+    std::vector<float> streamed_out;
     if (!eval_moe_cold_experts_streaming(
             *stream_engine, backend, hybrid_owner->mmap_data, hybrid_owner->mmap_size,
             hybrid_cfg, desc, hybrid_owner->layer_regions[(size_t) layer], storage,
@@ -4093,6 +4116,11 @@ static bool eval_ds4_hybrid(
     const auto ffn_t0 = Ds4TimingClock::now();
     if (hybrid_owner) {
         hybrid_owner->count_routes(layer, selected_host, (size_t) n_tokens * (size_t) n_expert_used);
+    }
+    if (hybrid_owner && hybrid_owner->expert_cache && storage.n_streamed > 0) {
+        // Start this layer's misses before the owners run so the loads
+        // overlap their compute.
+        hybrid_owner->expert_cache->stage(layer, selected_host, n_tokens * n_expert_used);
     }
     if (!stream_engine && hybrid_owner) stream_engine = hybrid_owner->stream_engine;
     const bool streaming_ready =
@@ -4156,7 +4184,16 @@ static bool eval_ds4_hybrid(
             add_ffn_telemetry(step_tel, single_tel);
 
             cold_out.assign((size_t)n_embd, 0.0f);
-            if (has_cold) {
+            if (has_cold && hybrid_owner->expert_cache && hybrid_owner->expert_cache->ready()) {
+                if (!hybrid_owner->expert_cache->eval(layer, desc, token_inp, token_selected,
+                                                      token_weights, n_expert_used, 1,
+                                                      cold_out.data(), &err)) {
+                    std::fprintf(stderr,
+                                 "[deepseek4] layer %d cold streaming eval failed: %s\n",
+                                 layer, err.c_str());
+                    return false;
+                }
+            } else if (has_cold) {
                 if (!eval_moe_cold_experts_streaming(
                         *stream_engine, backend,
                         hybrid_owner->mmap_data, hybrid_owner->mmap_size,

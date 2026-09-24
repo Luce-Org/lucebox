@@ -9,6 +9,7 @@
 #include "common/model_backend.h"
 #include "common/moe_expert_compute.h"
 #include "common/sampler.h"
+#include "../common/moe_hybrid_expert_cache.h"
 #include "../common/moe_hybrid_placement.h"
 #include "../common/moe_hybrid_routing_stats.h"
 #include "../common/moe_hybrid_storage.h"
@@ -235,6 +236,7 @@ private:
     MoeHybridPlacement                moe_placement_;
     MoeHybridPlacement                moe_decode_placement_;
     MoeHybridStreamEngine             stream_engine_;
+    MoeStreamedExpertCache            expert_cache_;
     MoeExpertComputeRuntime            expert_runtime_;
     std::shared_ptr<MoeHybridRoutingStats> routing_stats_;
     std::string                       routing_stats_out_path_;

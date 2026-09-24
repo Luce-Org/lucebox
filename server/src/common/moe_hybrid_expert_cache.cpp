@@ -1,0 +1,628 @@
+// Device cache for streamed MoE experts — implementation.
+
+#include "moe_hybrid_expert_cache.h"
+#include "moe_hybrid_ffn_eval.h"
+#include "gpu_runtime_compat.h"
+
+#include "ggml-cuda.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstring>
+
+#if !defined(_WIN32)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
+namespace luce::common {
+
+namespace {
+
+using Clock = std::chrono::steady_clock;
+
+uint64_t elapsed_us(Clock::time_point t0, Clock::time_point t1) {
+    return (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+}
+
+// Room after each role's stack for the quantized row padding a GPU buffer
+// reserves past the last row of a tensor.
+constexpr size_t kStackTail = 64 * 1024;
+constexpr size_t kAlign = 256;
+
+size_t align_up(size_t v, size_t a) { return (v + a - 1) / a * a; }
+
+// Expert byte ranges of one layer in file order: gate (or fused gate_up),
+// up, down. Unused roles have size 0.
+struct ExpertRanges {
+    size_t off[3] = {0, 0, 0};
+    size_t size[3] = {0, 0, 0};
+};
+
+ExpertRanges expert_ranges(const LayerExpertRegions & r, int expert) {
+    ExpertRanges out;
+    const size_t e = (size_t) expert;
+    if (r.fused_gate_up) {
+        out.off[0] = r.gate_up_exps.offset + e * r.expert_bytes_gate_up;
+        out.size[0] = r.expert_bytes_gate_up;
+    } else {
+        out.off[0] = r.gate_exps.offset + e * r.expert_bytes_gate;
+        out.size[0] = r.expert_bytes_gate;
+        out.off[1] = r.up_exps.offset + e * r.expert_bytes_up;
+        out.size[1] = r.expert_bytes_up;
+    }
+    out.off[2] = r.down_exps.offset + e * r.expert_bytes_down;
+    out.size[2] = r.expert_bytes_down;
+    return out;
+}
+
+void advise_willneed(const void * map, size_t map_size, const ExpertRanges & ranges) {
+#if !defined(_WIN32)
+    static const size_t page = (size_t) sysconf(_SC_PAGESIZE);
+    for (int i = 0; i < 3; ++i) {
+        if (ranges.size[i] == 0 || ranges.off[i] + ranges.size[i] > map_size) continue;
+        const size_t start = ranges.off[i] / page * page;
+        ::madvise(const_cast<uint8_t *>(static_cast<const uint8_t *>(map)) + start,
+                  ranges.size[i] + (ranges.off[i] - start), MADV_WILLNEED);
+    }
+#else
+    (void) map; (void) map_size; (void) ranges;
+#endif
+}
+
+}  // namespace
+
+struct MoeStreamedExpertCache::Loader {
+    void * staging = nullptr;  // pinned, one slot
+    cudaStream_t stream = nullptr;
+};
+
+void MoeStreamedExpertCache::Graph::free() {
+    if (alloc) ggml_gallocr_free(alloc);
+    if (ctx) ggml_free(ctx);
+    *this = {};
+}
+
+MoeStreamedExpertCache::~MoeStreamedExpertCache() {
+    destroy();
+}
+
+bool MoeStreamedExpertCache::init(const MoeHybridConfig & cfg,
+                                  const std::vector<MoeLayerDesc> & descs,
+                                  const MoeHybridStorage & storage,
+                                  const MoeExpertCacheOptions & opts,
+                                  std::string * err) {
+    destroy();
+    const auto fail = [&](const std::string & msg) {
+        if (err) *err = msg;
+        destroy();
+        return false;
+    };
+    if (!storage.has_mmap() || storage.layer_regions.size() != storage.layers.size() ||
+        descs.size() != storage.layers.size()) {
+        return fail("streamed expert cache needs the model file mapping and per-layer regions");
+    }
+    cfg_ = cfg;
+    storage_ = &storage;
+    device_ = opts.device;
+
+    // Slot geometry: the largest expert of each role over the streamed layers.
+    // Layers with other weight types get their own view of the same slots.
+    bool fused = false, any = false;
+    for (size_t il = 0; il < storage.layers.size(); ++il) {
+        if (storage.layers[il].n_streamed == 0) continue;
+        const LayerExpertRegions & r = storage.layer_regions[il];
+        const MoeLayerDesc & d = descs[il];
+        if (any && r.fused_gate_up != fused) return fail("mixed fused and split gate/up layers");
+        fused = r.fused_gate_up;
+        any = true;
+        for (const ggml_tensor * t : {d.ffn_gate_exps, d.ffn_up_exps, d.ffn_down_exps, d.ffn_gate_up_exps}) {
+            if (t && (t->type == GGML_TYPE_Q3_1_ROCMFP3_MIX || t->type == GGML_TYPE_Q2_1_ROCMFP2_MIX)) {
+                return fail("mixed-codebook expert types need per-expert decode tables");
+            }
+        }
+        stride_gate_ = std::max(stride_gate_, fused ? r.expert_bytes_gate_up : r.expert_bytes_gate);
+        stride_up_ = std::max(stride_up_, fused ? (size_t) 0 : r.expert_bytes_up);
+        stride_down_ = std::max(stride_down_, r.expert_bytes_down);
+    }
+    if (!any) return fail("no streamed experts");
+    slot_bytes_ = stride_gate_ + stride_up_ + stride_down_;
+
+    size_t pool = opts.pool_bytes;
+    if (pool == 0) {
+        size_t free_b = 0, total_b = 0;
+        ggml_backend_cuda_get_device_memory(device_, &free_b, &total_b);
+        pool = free_b > opts.reserve_bytes ? free_b - opts.reserve_bytes : 0;
+    }
+    const size_t fixed = 3 * (kStackTail + kAlign);
+    n_slots_ = pool > fixed ? (int) ((pool - fixed) / slot_bytes_) : 0;
+    const int min_slots = std::max(16, 2 * cfg.n_expert_used);
+    if (n_slots_ < min_slots) {
+        return fail("device " + std::to_string(device_) + " has room for " +
+                    std::to_string(n_slots_) + " expert slots, need at least " +
+                    std::to_string(min_slots));
+    }
+
+    backend_ = ggml_backend_cuda_init(device_);
+    if (!backend_) return fail("failed to create a backend on device " + std::to_string(device_));
+
+    const size_t off_up = align_up((size_t) n_slots_ * stride_gate_ + kStackTail, kAlign);
+    const size_t off_down = off_up + (stride_up_ ? align_up((size_t) n_slots_ * stride_up_ + kStackTail, kAlign) : 0);
+    const size_t total = off_down + (size_t) n_slots_ * stride_down_ + kStackTail;
+    pool_buf_ = ggml_backend_buft_alloc_buffer(ggml_backend_cuda_buffer_type(device_), total);
+    if (!pool_buf_) return fail("failed to allocate " + std::to_string(total >> 20) + " MiB of expert slots");
+    ggml_backend_buffer_set_usage(pool_buf_, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    auto * base = static_cast<uint8_t *>(ggml_backend_buffer_get_base(pool_buf_));
+    base_gate_ = base;
+    base_up_ = stride_up_ ? base + off_up : nullptr;
+    base_down_ = base + off_down;
+
+    // One stacked tensor per role and weight-type signature, strided by slot.
+    ggml_init_params ip{};
+    ip.mem_size = ggml_tensor_overhead() * 4 * storage.layers.size() + 1024;
+    ip.no_alloc = true;
+    pool_ctx_ = ggml_init(ip);
+    if (!pool_ctx_) return fail("ggml_init failed for the expert slot views");
+    const auto stack = [&](const ggml_tensor * like, size_t stride, uint8_t * at) -> ggml_tensor * {
+        ggml_tensor * t = ggml_new_tensor_3d(pool_ctx_, like->type, like->ne[0], like->ne[1], n_slots_);
+        t->nb[2] = stride;
+        t->nb[3] = stride * (size_t) n_slots_;
+        if (ggml_backend_tensor_alloc(pool_buf_, t, at) != GGML_STATUS_SUCCESS) return nullptr;
+        return t;
+    };
+    using Sig = std::tuple<int, int, int, int, float, float, float, float>;
+    std::map<Sig, int> view_by_sig;
+    view_of_layer_.assign(storage.layers.size(), -1);
+    for (size_t il = 0; il < storage.layers.size(); ++il) {
+        if (storage.layers[il].n_streamed == 0) continue;
+        const MoeLayerDesc & d = descs[il];
+        const auto type_of = [](const ggml_tensor * t) { return t ? (int) t->type : -1; };
+        const Sig sig{type_of(d.ffn_gate_exps), type_of(d.ffn_up_exps), type_of(d.ffn_down_exps),
+                      type_of(d.ffn_gate_up_exps), d.ffn_gate_exps_s, d.ffn_up_exps_s,
+                      d.ffn_down_exps_s, d.ffn_gate_up_exps_s};
+        auto it = view_by_sig.find(sig);
+        if (it == view_by_sig.end()) {
+            PoolView v;
+            if (fused) {
+                v.gate_up = stack(d.ffn_gate_up_exps, stride_gate_, base_gate_);
+            } else {
+                v.gate = stack(d.ffn_gate_exps, stride_gate_, base_gate_);
+                v.up = stack(d.ffn_up_exps, stride_up_, base_up_);
+            }
+            v.down = stack(d.ffn_down_exps, stride_down_, base_down_);
+            if (!(v.gate_up || (v.gate && v.up)) || !v.down) return fail("failed to place the expert slot views");
+            it = view_by_sig.emplace(sig, (int) views_.size()).first;
+            views_.push_back(v);
+        }
+        view_of_layer_[il] = it->second;
+    }
+
+    slots_.assign((size_t) n_slots_, Slot{});
+    predicted_.assign(storage.layers.size(), {});
+    const int n_loaders = std::max(1, opts.n_loaders);
+    for (int i = 0; i < n_loaders; ++i) {
+        auto * l = new Loader();
+        loaders_.push_back(l);
+        if (cudaMallocHost(&l->staging, slot_bytes_) != cudaSuccess) {
+            l->staging = nullptr;
+            return fail("failed to allocate pinned expert staging");
+        }
+    }
+    for (Loader * l : loaders_) threads_.emplace_back(&MoeStreamedExpertCache::loader_main, this, l);
+
+    std::fprintf(stderr,
+                 "[moe-stream] expert cache on device %d: %d slots x %.2f MiB = %.2f GiB, "
+                 "%d loaders, %zu weight view(s)\n",
+                 device_, n_slots_, slot_bytes_ / 1048576.0, total / 1073741824.0,
+                 n_loaders, views_.size());
+    return true;
+}
+
+void MoeStreamedExpertCache::destroy() {
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        stopping_ = true;
+    }
+    cv_.notify_all();
+    for (std::thread & t : threads_) t.join();
+    threads_.clear();
+    for (Loader * l : loaders_) {
+        if (l->staging) cudaFreeHost(l->staging);
+        delete l;
+    }
+    loaders_.clear();
+    for (auto & kv : graphs_) kv.second.free();
+    graphs_.clear();
+    views_.clear();
+    view_of_layer_.clear();
+    if (pool_ctx_) ggml_free(pool_ctx_);
+    pool_ctx_ = nullptr;
+    if (pool_buf_) ggml_backend_buffer_free(pool_buf_);
+    pool_buf_ = nullptr;
+    if (backend_) ggml_backend_free(backend_);
+    backend_ = nullptr;
+    slots_.clear();
+    slot_of_.clear();
+    jobs_.clear();
+    predicted_.clear();
+    staged_.clear();
+    staged_layer_ = -1;
+    failed_.clear();
+    n_slots_ = 0;
+    slot_bytes_ = stride_gate_ = stride_up_ = stride_down_ = 0;
+    base_gate_ = base_up_ = base_down_ = nullptr;
+    storage_ = nullptr;
+    device_ = -1;
+    tick_ = 0;
+    stats_ = {};
+    stopping_ = false;
+}
+
+MoeStreamedExpertCache::Stats MoeStreamedExpertCache::stats() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return stats_;
+}
+
+void MoeStreamedExpertCache::reset_stats() {
+    std::lock_guard<std::mutex> lk(mu_);
+    stats_ = {};
+}
+
+// ── Loaders ─────────────────────────────────────────────────────────────
+
+void MoeStreamedExpertCache::loader_main(Loader * self) {
+    cudaSetDevice(device_);
+    cudaStreamCreateWithFlags(&self->stream, cudaStreamNonBlocking);
+    std::unique_lock<std::mutex> lk(mu_);
+    while (true) {
+        cv_.wait(lk, [&] { return stopping_ || !jobs_.empty(); });
+        if (stopping_) break;
+        const int slot = jobs_.front();
+        jobs_.pop_front();
+        lk.unlock();
+        uint64_t read_us = 0, upload_us = 0;
+        const bool ok = load_slot(*self, slot, &read_us, &upload_us);
+        lk.lock();
+        slots_[(size_t) slot].state = SlotState::Ready;
+        stats_.read_us += read_us;
+        stats_.upload_us += upload_us;
+        if (!ok && failed_.empty()) {
+            failed_ = "failed to load expert " + std::to_string(slots_[(size_t) slot].expert) +
+                      " of layer " + std::to_string(slots_[(size_t) slot].layer);
+        }
+        cv_.notify_all();
+    }
+    lk.unlock();
+    if (self->stream) cudaStreamDestroy(self->stream);
+    self->stream = nullptr;
+}
+
+// A loading slot is never evicted, so its layer/expert are stable here.
+bool MoeStreamedExpertCache::load_slot(Loader & loader, int slot,
+                                       uint64_t * read_us, uint64_t * upload_us) {
+    const Slot & s = slots_[(size_t) slot];
+    const ExpertRanges r = expert_ranges(storage_->layer_regions[(size_t) s.layer], s.expert);
+    const auto * file = static_cast<const uint8_t *>(storage_->mmap_data);
+    auto * staging = static_cast<uint8_t *>(loader.staging);
+    uint8_t * dst[3] = {
+        base_gate_ + (size_t) slot * stride_gate_,
+        base_up_ ? base_up_ + (size_t) slot * stride_up_ : nullptr,
+        base_down_ + (size_t) slot * stride_down_,
+    };
+    const auto t0 = Clock::now();
+    size_t at = 0;
+    size_t staged_at[3] = {0, 0, 0};
+    for (int i = 0; i < 3; ++i) {
+        if (r.size[i] == 0) continue;
+        if (r.off[i] + r.size[i] > storage_->mmap_size) return false;
+        std::memcpy(staging + at, file + r.off[i], r.size[i]);
+        staged_at[i] = at;
+        at += r.size[i];
+    }
+    const auto t1 = Clock::now();
+    for (int i = 0; i < 3; ++i) {
+        if (r.size[i] == 0) continue;
+        if (cudaMemcpyAsync(dst[i], staging + staged_at[i], r.size[i], cudaMemcpyHostToDevice,
+                            loader.stream) != cudaSuccess) {
+            return false;
+        }
+    }
+    const bool ok = cudaStreamSynchronize(loader.stream) == cudaSuccess;
+    *read_us = elapsed_us(t0, t1);
+    *upload_us = elapsed_us(t1, Clock::now());
+    return ok;
+}
+
+// ── Slots ───────────────────────────────────────────────────────────────
+
+int MoeStreamedExpertCache::evict_locked() {
+    int best = -1;
+    for (int i = 0; i < n_slots_; ++i) {
+        const Slot & s = slots_[(size_t) i];
+        if (s.state == SlotState::Empty) return i;
+        if (s.state != SlotState::Ready || s.pins > 0) continue;
+        if (best < 0 || s.last_use < slots_[(size_t) best].last_use) best = i;
+    }
+    return best;
+}
+
+int MoeStreamedExpertCache::lookup_or_load_locked(int layer, int expert, bool front, bool * hit) {
+    const uint64_t k = key(layer, expert);
+    auto it = slot_of_.find(k);
+    if (it != slot_of_.end()) {
+        const int slot = it->second;
+        if (front && slots_[(size_t) slot].state == SlotState::Loading) {
+            // Needed now: move a queued prefetch ahead of the others.
+            auto q = std::find(jobs_.begin(), jobs_.end(), slot);
+            if (q != jobs_.end()) {
+                jobs_.erase(q);
+                jobs_.push_front(slot);
+            }
+        }
+        *hit = true;
+        return slot;
+    }
+    *hit = false;
+    const int slot = evict_locked();
+    if (slot < 0) return -1;
+    Slot & s = slots_[(size_t) slot];
+    if (s.layer >= 0) slot_of_.erase(key(s.layer, s.expert));
+    s = Slot{};
+    s.layer = layer;
+    s.expert = expert;
+    s.state = SlotState::Loading;
+    s.demand = front;
+    s.prefetched = !front;
+    s.last_use = ++tick_;
+    slot_of_[k] = slot;
+    const ExpertRanges r = expert_ranges(storage_->layer_regions[(size_t) layer], expert);
+    advise_willneed(storage_->mmap_data, storage_->mmap_size, r);
+    if (front) jobs_.push_front(slot); else jobs_.push_back(slot);
+    stats_.loads += 1;
+    stats_.bytes += r.size[0] + r.size[1] + r.size[2];
+    if (!front) stats_.prefetched += 1;
+    cv_.notify_all();
+    return slot;
+}
+
+void MoeStreamedExpertCache::stage(int layer, const int32_t * selected, int n_routes) {
+    if (!ready() || layer < 0 || (size_t) layer >= storage_->layers.size()) return;
+    const MoeHybridLayerStorage & st = storage_->layers[(size_t) layer];
+    std::lock_guard<std::mutex> lk(mu_);
+    for (int slot : staged_) --slots_[(size_t) slot].pins;
+    staged_.clear();
+    staged_layer_ = layer;
+    // At most half the slots, so an eval chunk always finds room next to them.
+    const size_t max_staged = (size_t) std::max(1, n_slots_ / 2);
+    for (int i = 0; i < n_routes && staged_.size() < max_staged; ++i) {
+        if (!st.is_streamed(selected[i])) continue;
+        bool hit = false;
+        const int slot = lookup_or_load_locked(layer, selected[i], /*front=*/true, &hit);
+        if (slot < 0) break;  // eval waits for room instead
+        if (std::find(staged_.begin(), staged_.end(), slot) != staged_.end()) continue;
+        ++slots_[(size_t) slot].pins;
+        slots_[(size_t) slot].last_use = ++tick_;
+        staged_.push_back(slot);
+    }
+}
+
+void MoeStreamedExpertCache::prefetch(int layer, const int32_t * experts, int n) {
+    if (!ready() || layer < 0 || (size_t) layer >= storage_->layers.size()) return;
+    const MoeHybridLayerStorage & st = storage_->layers[(size_t) layer];
+    std::lock_guard<std::mutex> lk(mu_);
+    std::vector<int32_t> & pred = predicted_[(size_t) layer];
+    pred.clear();
+    for (int i = 0; i < n; ++i) {
+        if (!st.is_streamed(experts[i])) continue;
+        pred.push_back(experts[i]);
+        bool hit = false;
+        const int slot = lookup_or_load_locked(layer, experts[i], /*front=*/false, &hit);
+        if (slot < 0) break;
+        if (hit) slots_[(size_t) slot].last_use = ++tick_;
+    }
+}
+
+// ── Evaluation ──────────────────────────────────────────────────────────
+
+bool MoeStreamedExpertCache::build_graph(Graph & g, int view, const MoeLayerDesc & desc,
+                                         int n_routes, int n_tokens, std::string * err) {
+    ggml_init_params ip{};
+    ip.mem_size = ggml_tensor_overhead() * (64 + 32 * (size_t) n_tokens) +
+                  ggml_graph_overhead_custom(2048, false);
+    ip.no_alloc = true;
+    g.ctx = ggml_init(ip);
+    if (!g.ctx) {
+        if (err) *err = "ggml_init failed for the streamed expert graph";
+        return false;
+    }
+    g.inp = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, cfg_.n_embd, n_tokens);
+    g.sel = ggml_new_tensor_2d(g.ctx, GGML_TYPE_I32, n_routes, n_tokens);
+    g.wts = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, n_routes, n_tokens);
+    ggml_set_input(g.inp);
+    ggml_set_input(g.sel);
+    ggml_set_input(g.wts);
+    const PoolView & v = views_[(size_t) view];
+    g.out = build_moe_routed_experts(g.ctx, cfg_, desc, v.gate, v.up, v.down, v.gate_up,
+                                     g.inp, g.sel, g.wts, n_routes, n_tokens);
+    if (!g.out) {
+        if (err) *err = "failed to build the streamed expert graph";
+        g.free();
+        return false;
+    }
+    ggml_set_output(g.out);
+    g.gf = ggml_new_graph_custom(g.ctx, 2048, false);
+    ggml_build_forward_expand(g.gf, g.out);
+    g.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_));
+    if (!g.alloc || !ggml_gallocr_alloc_graph(g.alloc, g.gf)) {
+        if (err) *err = "failed to allocate the streamed expert graph";
+        g.free();
+        return false;
+    }
+    return true;
+}
+
+// Decode-sized graphs are built once per (view, routes, tokens) and reused.
+MoeStreamedExpertCache::Graph * MoeStreamedExpertCache::graph_for(
+        int view, const MoeLayerDesc & desc, int n_routes, int n_tokens, std::string * err) {
+    const auto k = std::make_tuple(view, n_routes, n_tokens);
+    auto it = graphs_.find(k);
+    if (it != graphs_.end()) return &it->second;
+    Graph g;
+    if (!build_graph(g, view, desc, n_routes, n_tokens, err)) return nullptr;
+    return &graphs_.emplace(k, g).first->second;
+}
+
+bool MoeStreamedExpertCache::eval(int layer, const MoeLayerDesc & desc,
+                                  const float * inp, const int32_t * selected,
+                                  const float * weights, int n_used, int n_tokens,
+                                  float * out, std::string * err) {
+    if (!ready() || layer < 0 || (size_t) layer >= storage_->layers.size() ||
+        view_of_layer_[(size_t) layer] < 0) {
+        if (err) *err = "streamed expert cache not ready for this layer";
+        return false;
+    }
+    const MoeHybridLayerStorage & st = storage_->layers[(size_t) layer];
+    const int n_routes_all = n_used * n_tokens;
+
+    // Streamed experts of this call, in first-route order.
+    std::vector<int32_t> uniq;
+    std::vector<uint8_t> seen((size_t) cfg_.n_expert, 0);
+    for (int i = 0; i < n_routes_all; ++i) {
+        const int32_t e = selected[i];
+        if (!st.is_streamed(e) || seen[(size_t) e]) continue;
+        seen[(size_t) e] = 1;
+        uniq.push_back(e);
+    }
+    const auto release_staged = [&] {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (staged_layer_ != layer) return;
+        for (int slot : staged_) --slots_[(size_t) slot].pins;
+        staged_.clear();
+        staged_layer_ = -1;
+    };
+    if (uniq.empty()) {
+        release_staged();
+        return true;
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        std::vector<int32_t> & pred = predicted_[(size_t) layer];
+        if (!pred.empty()) {
+            stats_.predicted_of += uniq.size();
+            for (int32_t e : uniq) {
+                if (std::find(pred.begin(), pred.end(), e) != pred.end()) ++stats_.predicted_used;
+            }
+            pred.clear();
+        }
+    }
+
+    const int chunk_cap = std::max(1, n_slots_ / 2);
+    std::vector<int> slot_of_expert((size_t) cfg_.n_expert, -1);
+    std::vector<float> part((size_t) cfg_.n_embd * (size_t) n_tokens);
+    for (size_t c0 = 0; c0 < uniq.size(); c0 += (size_t) chunk_cap) {
+        const size_t c1 = std::min(uniq.size(), c0 + (size_t) chunk_cap);
+        std::vector<int> slots;
+        slots.reserve(c1 - c0);
+        {
+            std::unique_lock<std::mutex> lk(mu_);
+            for (size_t i = c0; i < c1; ++i) {
+                bool hit = false;
+                int slot;
+                while ((slot = lookup_or_load_locked(layer, uniq[i], /*front=*/true, &hit)) < 0) {
+                    cv_.wait(lk);  // every slot pinned or loading
+                }
+                Slot & s = slots_[(size_t) slot];
+                ++s.pins;
+                if (!s.demand) ++stats_.hits;
+                if (s.prefetched) ++stats_.prefetch_hits;
+                s.demand = s.prefetched = false;
+                slots.push_back(slot);
+                slot_of_expert[(size_t) uniq[i]] = slot;
+            }
+            const auto t0 = Clock::now();
+            cv_.wait(lk, [&] {
+                if (!failed_.empty()) return true;
+                for (int slot : slots) {
+                    if (slots_[(size_t) slot].state != SlotState::Ready) return false;
+                }
+                return true;
+            });
+            stats_.wait_us += elapsed_us(t0, Clock::now());
+            stats_.experts += slots.size();
+        }
+        // The staged loads have started and the first chunk holds its own
+        // pins; later chunks must be able to use the staged slots' room.
+        if (c0 == 0) release_staged();
+        const auto unpin = [&] {
+            std::lock_guard<std::mutex> lk(mu_);
+            for (int slot : slots) {
+                --slots_[(size_t) slot].pins;
+                slots_[(size_t) slot].last_use = ++tick_;
+            }
+        };
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            if (!failed_.empty()) {
+                if (err) *err = failed_;
+                for (int slot : slots) --slots_[(size_t) slot].pins;
+                return false;
+            }
+        }
+
+        // Per token, this chunk's routes in route order, padded with a
+        // zero-weight route to a slot the chunk pinned (always finite data).
+        int n_routes = 0;
+        for (int t = 0; t < n_tokens; ++t) {
+            int n = 0;
+            for (int k = 0; k < n_used; ++k) {
+                const int32_t e = selected[t * n_used + k];
+                if (e >= 0 && e < cfg_.n_expert && slot_of_expert[(size_t) e] >= 0) ++n;
+            }
+            n_routes = std::max(n_routes, n);
+        }
+        std::vector<int32_t> sel((size_t) n_routes * (size_t) n_tokens, slots[0]);
+        std::vector<float> wts((size_t) n_routes * (size_t) n_tokens, 0.0f);
+        for (int t = 0; t < n_tokens; ++t) {
+            int n = 0;
+            for (int k = 0; k < n_used; ++k) {
+                const int32_t e = selected[t * n_used + k];
+                if (e < 0 || e >= cfg_.n_expert || slot_of_expert[(size_t) e] < 0) continue;
+                sel[(size_t) t * n_routes + n] = slot_of_expert[(size_t) e];
+                wts[(size_t) t * n_routes + n] = weights[t * n_used + k];
+                ++n;
+            }
+        }
+        for (size_t i = c0; i < c1; ++i) slot_of_expert[(size_t) uniq[i]] = -1;
+
+        const auto t0 = Clock::now();
+        const int view = view_of_layer_[(size_t) layer];
+        Graph scratch;
+        Graph * g = n_tokens <= 8 ? graph_for(view, desc, n_routes, n_tokens, err)
+                                  : (build_graph(scratch, view, desc, n_routes, n_tokens, err) ? &scratch : nullptr);
+        bool ok = g != nullptr;
+        if (ok) {
+            ggml_backend_tensor_set(g->inp, inp, 0, sizeof(float) * (size_t) cfg_.n_embd * (size_t) n_tokens);
+            ggml_backend_tensor_set(g->sel, sel.data(), 0, sizeof(int32_t) * sel.size());
+            ggml_backend_tensor_set(g->wts, wts.data(), 0, sizeof(float) * wts.size());
+            ok = ggml_backend_graph_compute(backend_, g->gf) == GGML_STATUS_SUCCESS;
+            if (ok) {
+                ggml_backend_tensor_get(g->out, part.data(), 0, sizeof(float) * part.size());
+                for (size_t i = 0; i < part.size(); ++i) out[i] += part[i];
+            } else if (err) {
+                *err = "streamed expert graph compute failed";
+            }
+        }
+        scratch.free();
+        unpin();
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            stats_.compute_us += elapsed_us(t0, Clock::now());
+        }
+        if (!ok) return false;
+    }
+    return true;
+}
+
+}  // namespace luce::common

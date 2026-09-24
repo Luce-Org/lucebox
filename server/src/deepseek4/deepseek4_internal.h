@@ -55,6 +55,8 @@ struct MoeHybridConfig;
 struct MoeHybridRoutingStats;
 struct MoeExpertComputeRuntime;
 class MoeHybridStreamEngine;
+class MoeStreamedExpertCache;
+struct MoeExpertCacheOptions;
 
 struct DeepSeek4StepTelemetry {
     uint64_t total_us = 0;
@@ -602,6 +604,15 @@ bool build_deepseek4_head4_tail2_routes(
 int deepseek4_safe_compressor_batch_tokens(const DeepSeek4Weights & w,
                                            int kv_start,
                                            int n_tokens);
+
+// Sets up the device cache for the experts the hybrid storage streams from
+// the model file (see common/moe_hybrid_expert_cache.h).
+bool init_deepseek4_streamed_expert_cache(
+    const DeepSeek4Weights &      w,
+    const MoeHybridStorage &      hybrid,
+    const MoeExpertCacheOptions & opts,
+    MoeStreamedExpertCache &      cache,
+    std::string *                 err);
 
 // Forward: single step (prefill chunk or decode token).
 // embed: [n_embd, n_tokens] input embeddings (post-embedding lookup).

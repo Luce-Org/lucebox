@@ -16,6 +16,7 @@ namespace luce::common {
 
 struct MoeHybridRoutingStats;
 class MoeHybridStreamEngine;
+class MoeStreamedExpertCache;
 
 // File region for one expert tensor (offset into mmap).
 struct ExpertFileRegion {
@@ -229,8 +230,10 @@ struct MoeHybridStorage {
         }
         return false;
     }
-    // Serves the streamed experts; owned by the model backend, set after init.
+    // Serve the streamed experts; owned by the model backend, set after init.
+    // The cache, when set, replaces the engine's one-expert-at-a-time path.
     MoeHybridStreamEngine * stream_engine = nullptr;
+    MoeStreamedExpertCache * expert_cache = nullptr;
 
     // Routed expert calls by owner since the last reset, for request logs.
     struct RouteCounts {

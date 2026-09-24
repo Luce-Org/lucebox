@@ -233,6 +233,24 @@ bool build_moe_hybrid_ffn_graph(
     MoeHybridRouteBalance          route_balance =
                                        MoeHybridRouteBalance::Allowed);
 
+// Weighted routed experts of one stacked weight set, built like an owner
+// stack: out[:, t] = sum_k wts[k, t] * expert_{sel[k, t]}(inp[:, t]).
+// gate/up/down (or gate_up/down) are [.., .., n_stack]; sel and wts are
+// [n_routes, n_tokens]. Returns nullptr when the stack is incomplete.
+ggml_tensor * build_moe_routed_experts(
+    ggml_context *          ctx,
+    const MoeHybridConfig & cfg,
+    const MoeLayerDesc &    desc,
+    ggml_tensor *           gate,
+    ggml_tensor *           up,
+    ggml_tensor *           down,
+    ggml_tensor *           gate_up,
+    ggml_tensor *           inp,
+    ggml_tensor *           sel,
+    ggml_tensor *           wts,
+    int                     n_routes,
+    int                     n_tokens);
+
 int moe_hybrid_expert_compute_batch_limit();
 int moe_hybrid_expert_compute_ipc_batch_limit(int n_tokens);
 int moe_hybrid_prefill_hot_sub_batch_limit();
