@@ -148,14 +148,16 @@ bool layer_snapshot_shape_ok(const DeepSeek4LayerGeometry & g,
     auto fail = [&](const char * what) { if (why) *why = what; return false; };
     if (L.n_comp < 0 || L.n_index_comp < 0) return fail("negative row count");
     if (!is_2d(L.raw_kv, GGML_TYPE_F16, g.head_dim, g.raw_rows)) return fail("raw window shape");
+    // Readers of a shared compressed cache (V4.1) and stateless ratio-1
+    // sources carry fewer tensors; the geometry says which.
     if ((!!L.comp_kv) != g.has_comp) return fail("compressed rows presence");
-    if ((!!L.attn_compressor.state_kv) != g.has_comp ||
-        (!!L.attn_compressor.state_score) != g.has_comp) {
+    if ((!!L.attn_compressor.state_kv) != g.has_comp_state() ||
+        (!!L.attn_compressor.state_score) != g.has_comp_state()) {
         return fail("attention compressor state presence");
     }
     if ((!!L.index_comp_kv) != g.has_index) return fail("indexer rows presence");
-    if ((!!L.indexer_compressor.state_kv) != g.has_index ||
-        (!!L.indexer_compressor.state_score) != g.has_index) {
+    if ((!!L.indexer_compressor.state_kv) != g.has_index_state() ||
+        (!!L.indexer_compressor.state_score) != g.has_index_state()) {
         return fail("indexer compressor state presence");
     }
     if (!g.has_comp && L.n_comp != 0) return fail("compressed rows without capacity");
@@ -164,8 +166,9 @@ bool layer_snapshot_shape_ok(const DeepSeek4LayerGeometry & g,
         if (!is_2d(L.comp_kv, GGML_TYPE_F16, g.head_dim, std::max(1, L.n_comp))) {
             return fail("compressed rows shape");
         }
-        if (!is_2d(L.attn_compressor.state_kv, GGML_TYPE_F32, g.comp_width, g.comp_state_rows) ||
-            !is_2d(L.attn_compressor.state_score, GGML_TYPE_F32, g.comp_width, g.comp_state_rows)) {
+        if (g.has_comp_state() &&
+            (!is_2d(L.attn_compressor.state_kv, GGML_TYPE_F32, g.comp_width, g.comp_state_rows) ||
+             !is_2d(L.attn_compressor.state_score, GGML_TYPE_F32, g.comp_width, g.comp_state_rows))) {
             return fail("attention compressor state shape");
         }
         if (comp_capacity > 0 && L.n_comp > comp_capacity) return fail("compressed rows exceed capacity");
@@ -174,8 +177,9 @@ bool layer_snapshot_shape_ok(const DeepSeek4LayerGeometry & g,
         if (!is_2d(L.index_comp_kv, GGML_TYPE_F16, g.index_dim, std::max(1, L.n_index_comp))) {
             return fail("indexer rows shape");
         }
-        if (!is_2d(L.indexer_compressor.state_kv, GGML_TYPE_F32, g.index_state_width, g.index_state_rows) ||
-            !is_2d(L.indexer_compressor.state_score, GGML_TYPE_F32, g.index_state_width, g.index_state_rows)) {
+        if (g.has_index_state() &&
+            (!is_2d(L.indexer_compressor.state_kv, GGML_TYPE_F32, g.index_state_width, g.index_state_rows) ||
+             !is_2d(L.indexer_compressor.state_score, GGML_TYPE_F32, g.index_state_width, g.index_state_rows))) {
             return fail("indexer compressor state shape");
         }
         if (comp_capacity > 0 && L.n_index_comp > comp_capacity) return fail("indexer rows exceed capacity");

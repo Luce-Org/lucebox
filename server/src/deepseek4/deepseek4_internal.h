@@ -520,26 +520,18 @@ bool create_deepseek4_cache(ggml_backend_t backend,
                              int max_ctx,
                              DeepSeek4Cache & out);
 
-// Per-layer cache geometry implied by the weights. Single source of truth for
-// create_deepseek4_cache() and for snapshot declaration/validation
-// (deepseek4_snapshot.h), so the two can never disagree on shapes.
-struct DeepSeek4LayerGeometry {
-    uint32_t ratio = 0;            // compress ratio: 0 (raw window only), 4 or 128
-    int64_t  head_dim = 0;         // raw / compressed row width (F16)
-    int64_t  raw_rows = 0;         // n_swa
-    bool     has_comp = false;     // ratio > 0: comp_kv + attn compressor state
-    int64_t  comp_width = 0;       // attn compressor state width (F32)
-    int64_t  comp_state_rows = 0;
-    bool     has_index = false;    // ratio == 4: index_comp_kv + indexer state
-    int64_t  index_dim = 0;        // indexer row width (F16)
-    int64_t  index_state_width = 0;  // indexer compressor state width (F32)
-    int64_t  index_state_rows = 0;
-    // Compressed-row capacity for a cache of `max_ctx` tokens (0 if !has_comp).
-    int64_t comp_capacity(int max_ctx) const {
-        return has_comp ? (int64_t) max_ctx / (int64_t) ratio + 16 : 0;
-    }
-};
+// Per-layer cache geometry implied by the weights (struct and rules in
+// deepseek4_paged_cache.h). Single source of truth for create_deepseek4_cache(),
+// the paged planner, the cache byte estimate and snapshot declaration and
+// validation (deepseek4_snapshot.h), so none of them can disagree on shapes.
 DeepSeek4LayerGeometry deepseek4_layer_geometry(const DeepSeek4Weights & w, int layer);
+std::vector<DeepSeek4LayerGeometry> deepseek4_layer_geometries(const DeepSeek4Weights & w);
+// The compressed rows `il` attends over: its own cache at a kv source (every
+// V4 layer), the source's cache at a V4.1 reader. Readers never write there.
+template <typename Cache>
+inline auto & ds4_comp_cache(Cache & cache, const DeepSeek4Weights & w, int il) {
+    return cache.layers[(size_t) deepseek4_kv_source_layer(w, il)];
+}
 inline int64_t deepseek4_hc_state_elements(const DeepSeek4Weights & w) {
     return (int64_t) w.n_hc * (int64_t) w.n_embd;
 }

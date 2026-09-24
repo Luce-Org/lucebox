@@ -21,6 +21,40 @@ bool add_mul(uint64_t & dst, uint64_t a, uint64_t b) {
 }
 }
 
+DeepSeek4LayerGeometry deepseek4_layer_geometry_from_ratio(
+        uint32_t ratio, int64_t head_dim, int64_t raw_rows, int64_t indexer_head_dim,
+        bool is_kv_source, bool is_index_source) {
+    DeepSeek4LayerGeometry g;
+    g.ratio = ratio;
+    g.head_dim = head_dim;
+    g.raw_rows = raw_rows;
+    g.is_kv_source = ratio > 0 && is_kv_source;
+    g.is_index_source = ratio > 0 && is_index_source;
+    g.has_comp = g.is_kv_source;
+    if (g.has_comp) {
+        // V4's ratio-4 CSA keeps the previous and current windows at double
+        // width; every other pooling compressor keeps one window of `ratio`
+        // rows; the ratio-1 latent is emitted per token and needs no state.
+        if (ratio == 4) {
+            g.comp_width = 2 * head_dim;
+            g.comp_state_rows = 2 * (int64_t) ratio;
+        } else if (ratio >= 2) {
+            g.comp_width = head_dim;
+            g.comp_state_rows = (int64_t) ratio;
+        }
+    }
+    g.has_index = g.has_comp && g.is_index_source;
+    if (g.has_index) {
+        g.index_dim = indexer_head_dim;
+        if (ratio == 4) {
+            // V4 indexer compressor: width 2 * indexer head dim, same double buffer.
+            g.index_state_width = 2 * indexer_head_dim;
+            g.index_state_rows = 2 * (int64_t) ratio;
+        }
+    }
+    return g;
+}
+
 bool plan_deepseek4_paged_pool_blocks(uint32_t max_ctx, uint32_t slots,
                                       uint64_t requested_tokens,
                                       uint32_t & physical_blocks) {
@@ -41,7 +75,7 @@ bool prepare_deepseek4_gathered_lane_rows(
         uint32_t physical_blocks, uint32_t ratio,
         std::vector<DeepSeek4GatheredLaneRows> & out) {
     if (!slots || !positions || !block_tables || !block_table_stride ||
-        !physical_blocks || (ratio != 0 && ratio != 4 && ratio != 128)) {
+        !physical_blocks || (ratio != 0 && !ds4_compress_ratio_pages(ratio))) {
         return false;
     }
     std::vector<DeepSeek4GatheredLaneRows> prepared(lanes);
@@ -111,31 +145,40 @@ bool prepare_deepseek4_gathered_lane_rows(
 bool plan_deepseek4_paged_cache(uint32_t head_dim, uint32_t indexer_head_dim,
                                 uint32_t slots, uint32_t max_ctx,
                                 uint32_t physical_blocks,
-                                const std::vector<uint32_t> & ratios,
+                                const std::vector<DeepSeek4LayerGeometry> & layers,
                                 DeepSeek4PagedCachePlan & out) {
     DeepSeek4PagedCachePlan p;
     if (!head_dim || !indexer_head_dim || !slots || !max_ctx ||
-        !physical_blocks || ratios.empty() ||
+        !physical_blocks || layers.empty() ||
         physical_blocks > UINT32_MAX / DS4_PAGE_TOKENS) return false;
     p.slots = slots; p.max_ctx = max_ctx; p.physical_blocks = physical_blocks;
     p.max_blocks_per_sequence = 1 + (max_ctx - 1) / DS4_PAGE_TOKENS;
-    p.ratios = ratios;
-    p.physical_rows.resize(ratios.size());
-    for (size_t i = 0; i < ratios.size(); ++i) {
-        const uint32_t r = ratios[i];
-        if (r != 0 && r != 4 && r != 128) return false;
+    p.ratios.resize(layers.size());
+    p.physical_rows.resize(layers.size());
+    for (size_t i = 0; i < layers.size(); ++i) {
+        const DeepSeek4LayerGeometry & g = layers[i];
+        const uint32_t r = g.ratio;
+        p.ratios[i] = r;
+        if (r != 0 && !ds4_compress_ratio_pages(r)) return false;
+        if (uint64_t(g.head_dim) != head_dim || uint64_t(g.raw_rows) != DS4_PAGE_TOKENS) return false;
         if (!add_mul(p.raw_bytes, uint64_t(head_dim) * DS4_PAGE_TOKENS * 2, slots)) return false;
-        if (!r) continue;
+        if (!g.has_comp) continue;
         uint64_t rows = 0;
         if (!ds4_compressed_page_capacity(physical_blocks, r, rows)) return false;
         p.physical_rows[i] = rows;
         if (!add_mul(p.compressed_bytes, uint64_t(head_dim) * 2, rows)) return false;
-        const uint64_t width = uint64_t(head_dim) * (r == 4 ? 2 : 1);
-        const uint64_t state_rows = r == 4 ? 8 : 128;
-        if (!add_mul(p.state_bytes, width * state_rows * 8, slots)) return false; // KV + score F32
-        if (r == 4) {
+        if (g.has_comp_state() &&
+            !add_mul(p.state_bytes, uint64_t(g.comp_width) * uint64_t(g.comp_state_rows) * 8, slots)) {
+            return false; // KV + score F32
+        }
+        if (g.has_index) {
+            if (uint64_t(g.index_dim) != indexer_head_dim) return false;
             if (!add_mul(p.compressed_bytes, uint64_t(indexer_head_dim) * 2, rows)) return false;
-            if (!add_mul(p.state_bytes, uint64_t(indexer_head_dim) * 2 * 8 * 8, slots)) return false;
+            if (g.has_index_state() &&
+                !add_mul(p.state_bytes,
+                         uint64_t(g.index_state_width) * uint64_t(g.index_state_rows) * 8, slots)) {
+                return false;
+            }
         }
     }
     p.total_persistent_bytes = p.raw_bytes;
@@ -147,6 +190,22 @@ bool plan_deepseek4_paged_cache(uint32_t head_dim, uint32_t indexer_head_dim,
     return true;
 }
 
+bool plan_deepseek4_paged_cache(uint32_t head_dim, uint32_t indexer_head_dim,
+                                uint32_t slots, uint32_t max_ctx,
+                                uint32_t physical_blocks,
+                                const std::vector<uint32_t> & ratios,
+                                DeepSeek4PagedCachePlan & out) {
+    std::vector<DeepSeek4LayerGeometry> layers;
+    layers.reserve(ratios.size());
+    for (uint32_t r : ratios) {
+        layers.push_back(deepseek4_layer_geometry_from_ratio(
+            r, head_dim, DS4_PAGE_TOKENS, indexer_head_dim,
+            /*is_kv_source=*/r > 0, /*is_index_source=*/r == 4));
+    }
+    return plan_deepseek4_paged_cache(head_dim, indexer_head_dim, slots, max_ctx,
+                                      physical_blocks, layers, out);
+}
+
 #ifndef LUCE_DS4_PLAN_ONLY
 bool create_deepseek4_paged_cache(ggml_backend_t backend,
                                   const DeepSeek4Weights & w, uint32_t slots,
@@ -154,9 +213,10 @@ bool create_deepseek4_paged_cache(ggml_backend_t backend,
                                   DeepSeek4PagedCache & out) {
     free_deepseek4_paged_cache(out);
     DeepSeek4PagedCachePlan plan;
-    if (!backend || w.n_layer <= 0 || w.compress_ratios.size() != size_t(w.n_layer) ||
+    const std::vector<DeepSeek4LayerGeometry> geometry = deepseek4_layer_geometries(w);
+    if (!backend || w.n_layer <= 0 || geometry.size() != size_t(w.n_layer) ||
         !plan_deepseek4_paged_cache(w.head_dim, w.n_indexer_head_dim, slots,
-                                    max_ctx, physical_blocks, w.compress_ratios, plan)) return false;
+                                    max_ctx, physical_blocks, geometry, plan)) return false;
     try { out.pool = std::make_unique<PagedKvPool>(physical_blocks, slots, DS4_PAGE_TOKENS); }
     catch (...) { free_deepseek4_paged_cache(out); return false; }
     out.plan = plan;
@@ -164,20 +224,24 @@ bool create_deepseek4_paged_cache(ggml_backend_t backend,
     ggml_init_params ip{ggml_tensor_overhead() * size_t(w.n_layer * 9 + 5) + 4096, nullptr, true};
     out.ctx = ggml_init(ip);
     if (!out.ctx) { free_deepseek4_paged_cache(out); return false; }
+    // Readers of a shared compressed cache (V4.1) keep their ratio but own no
+    // rows; bind through ds4_comp_cache() to reach the source's tensors.
     for (int il = 0; il < w.n_layer; ++il) {
-        auto & l = out.layers[il]; const uint32_t r = plan.ratios[il];
-        l.ratio = r; l.physical_rows = plan.physical_rows[il];
+        auto & l = out.layers[il]; const DeepSeek4LayerGeometry & g = geometry[il];
+        l.ratio = g.ratio; l.physical_rows = plan.physical_rows[il];
         l.raw_kv = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F16, w.head_dim, DS4_PAGE_TOKENS, slots);
-        if (!r) continue;
+        if (!g.has_comp) continue;
         l.comp_kv = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F16, w.head_dim, l.physical_rows);
-        const int64_t width = int64_t(w.head_dim) * (r == 4 ? 2 : 1), sr = r == 4 ? 8 : 128;
-        l.attn_compressor.state_kv = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F32, width, sr, slots);
-        l.attn_compressor.state_score = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F32, width, sr, slots);
-        if (r == 4) {
-            l.index_comp_kv = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F16, w.n_indexer_head_dim, l.physical_rows);
-            const int64_t iw = int64_t(w.n_indexer_head_dim) * 2;
-            l.indexer_compressor.state_kv = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F32, iw, 8, slots);
-            l.indexer_compressor.state_score = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F32, iw, 8, slots);
+        if (g.has_comp_state()) {
+            l.attn_compressor.state_kv = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F32, g.comp_width, g.comp_state_rows, slots);
+            l.attn_compressor.state_score = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F32, g.comp_width, g.comp_state_rows, slots);
+        }
+        if (g.has_index) {
+            l.index_comp_kv = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F16, g.index_dim, l.physical_rows);
+            if (g.has_index_state()) {
+                l.indexer_compressor.state_kv = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F32, g.index_state_width, g.index_state_rows, slots);
+                l.indexer_compressor.state_score = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F32, g.index_state_width, g.index_state_rows, slots);
+            }
         }
     }
     uint64_t raw_bytes = 0, compressed_bytes = 0, state_bytes = 0;

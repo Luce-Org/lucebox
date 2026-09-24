@@ -542,8 +542,9 @@ void spec_rollback_apply(const DeepSeek4SpecRollback & rb, const DeepSeek4Weight
     for (size_t il = 0; il < cache.layers.size(); ++il) {
         DeepSeek4LayerCache & lc = cache.layers[il];
         const uint32_t ratio = il < w.compress_ratios.size() ? w.compress_ratios[il] : 0;
-        if (ratio > 0) lc.n_comp = commit_pos / (int) ratio;
-        if (ratio == 4) lc.n_index_comp = commit_pos / 4;
+        // Only the owner of the compressed rows counts them (V4.1 readers own none).
+        if (ratio > 0 && deepseek4_is_kv_source(w, (int) il)) lc.n_comp = commit_pos / (int) ratio;
+        if (lc.index_comp_kv) lc.n_index_comp = commit_pos / (int) ratio;
         const int first_rejected = std::clamp(commit_pos - rb.raw_pos, 0, rb.raw_count);
         if (il < rb.layers.size()) {
             const DeepSeek4SpecRollback::Layer & s = rb.layers[il];

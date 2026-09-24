@@ -13,12 +13,17 @@ inline constexpr uint32_t ds4_raw_ring_row(uint64_t logical_token) {
     return static_cast<uint32_t>(logical_token % DS4_PAGE_TOKENS);
 }
 
+// Compress ratios whose groups tile a page: V4's 4 and 128, V4.1's 2 and 1.
+inline constexpr bool ds4_compress_ratio_pages(uint32_t ratio) {
+    return ratio == 1 || ratio == 2 || ratio == 4 || ratio == 128;
+}
+
 // Number of physically paged compressed rows. Rejects unsupported ratios and
 // arithmetic that cannot be represented by the row-index type.
 inline bool ds4_compressed_page_capacity(uint64_t physical_blocks,
                                          uint32_t ratio,
                                          uint64_t & rows) {
-    if (ratio != 4 && ratio != 128) return false;
+    if (!ds4_compress_ratio_pages(ratio)) return false;
     const uint64_t rows_per_block = DS4_PAGE_TOKENS / ratio;
     if (physical_blocks >
         std::numeric_limits<uint64_t>::max() / rows_per_block) {
@@ -36,7 +41,7 @@ inline bool ds4_compressed_page_row(uint64_t logical_token,
                                     uint32_t ratio,
                                     uint64_t & row,
                                     bool & emitted) {
-    if (ratio != 4 && ratio != 128) return false;
+    if (!ds4_compress_ratio_pages(ratio)) return false;
     emitted = logical_token % ratio == ratio - 1;
     if (!emitted) return true;
 

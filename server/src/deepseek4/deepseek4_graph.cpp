@@ -798,6 +798,37 @@ int deepseek4_safe_compressor_batch_tokens(const DeepSeek4Weights & w,
     return std::max(1, safe);
 }
 
+// Advance the compressed-row counters of layer `il` to cover `next_pos`
+// tokens. Only the owner of the rows counts them (readers of a shared cache
+// own none and reach the source through ds4_comp_cache()); index rows
+// advance with the compressed rows wherever the layer has them.
+static void ds4_advance_comp_counters(const DeepSeek4Weights & w,
+                                      int il,
+                                      DeepSeek4LayerCache & lc,
+                                      int next_pos) {
+    const int ratio = (int) w.compress_ratios[(size_t) il];
+    if (ratio <= 0 || !deepseek4_is_kv_source(w, il)) return;
+    lc.n_comp = std::max(lc.n_comp, next_pos / ratio);
+    if (lc.index_comp_kv) {
+        lc.n_index_comp = std::max(lc.n_index_comp, next_pos / ratio);
+    }
+}
+
+static void ds4_advance_comp_counters(const DeepSeek4Weights & w,
+                                      DeepSeek4Cache & cache,
+                                      int il,
+                                      int next_pos) {
+    ds4_advance_comp_counters(w, il, cache.layers[(size_t) il], next_pos);
+}
+
+// Compressed rows a lane may treat as already published. With shared caches a
+// kv source publishes rows for later tokens of the same step before its
+// readers run, so every layer derives visibility from its own query position
+// (model.py: compress_len = (pos + 1) // ratio) instead.
+static int ds4_committed_comp_rows(const DeepSeek4Weights & w, int n_committed) {
+    return w.shared_comp_cache ? 0 : n_committed;
+}
+
 // Build an exact multi-token compressor update for prefill. Complete windows
 // are pooled as one batched tensor, so a 2K ubatch does not create hundreds of
 // serial softmax subgraphs. The state is assembled functionally from an
@@ -1925,7 +1956,10 @@ struct DeepSeek4MlaLaneBindings {
     ggml_tensor ** current_index_comp_out = nullptr;
     // False is the padding/inactive-lane contract: build attention against the
     // supplied padded history, but emit no persistent current-row mutations.
-    bool write_enabled = true;
+    // write_comp is additionally false on a layer that reads another layer's
+    // compressed rows (V4.1 readers): it never runs a compressor.
+    bool write_raw = true;
+    bool write_comp = true;
     DeepSeek4CompressorState * attn_compressor = nullptr;
     DeepSeek4CompressorState * indexer_compressor = nullptr;
     int n_comp_live = 0;
@@ -2113,22 +2147,30 @@ static DeepSeek4PreparedProjectedLane ds4_slice_projected_lane(
     return out;
 }
 
+// `lc` owns the layer's raw ring; `comp_lc` holds the compressed rows it
+// attends over (ds4_comp_cache: itself on V4 and at every kv source).
 static DeepSeek4MlaLaneBindings deepseek4_contiguous_lane_bindings(
+        const DeepSeek4Weights & w,
+        int layer_idx,
         DeepSeek4LayerCache & lc,
-        int ratio,
+        DeepSeek4LayerCache & comp_lc,
         int token_pos) {
+    const int ratio = (int) w.compress_ratios[(size_t) layer_idx];
     DeepSeek4MlaLaneBindings lane;
     lane.history_mode = DeepSeek4MlaLaneBindings::HistoryMode::ContiguousRing;
     lane.raw_kv = lc.raw_kv;
-    lane.comp_kv = lc.comp_kv;
-    lane.index_comp_kv = lc.index_comp_kv;
-    lane.attn_compressor = &lc.attn_compressor;
-    lane.indexer_compressor = &lc.indexer_compressor;
+    lane.comp_kv = comp_lc.comp_kv;
+    lane.index_comp_kv = comp_lc.index_comp_kv;
+    lane.attn_compressor = &comp_lc.attn_compressor;
+    lane.indexer_compressor = &comp_lc.indexer_compressor;
+    lane.write_comp = deepseek4_is_kv_source(w, layer_idx);
+    const int committed = ds4_committed_comp_rows(w, comp_lc.n_comp);
+    const int committed_index = ds4_committed_comp_rows(w, comp_lc.n_index_comp);
     lane.n_comp_live = ratio > 0
-        ? ds4_comp_rows_used(lc.comp_kv, lc.n_comp, ratio, token_pos) : 0;
-    lane.n_index_comp_live = ratio == 4
-        ? ds4_comp_rows_used(lc.index_comp_kv, lc.n_index_comp, 4, token_pos) : 0;
-    lane.n_comp_committed = lc.n_comp;
+        ? ds4_comp_rows_used(comp_lc.comp_kv, committed, ratio, token_pos) : 0;
+    lane.n_index_comp_live = comp_lc.index_comp_kv
+        ? ds4_comp_rows_used(comp_lc.index_comp_kv, committed_index, ratio, token_pos) : 0;
+    lane.n_comp_committed = committed;
     return lane;
 }
 
@@ -2295,7 +2337,7 @@ static ggml_tensor * build_mla_attention_lane_core(
     if (lane.current_raw_out) {
         *lane.current_raw_out = kv;
     }
-    if (!lane.write_enabled) {
+    if (!lane.write_raw) {
         // Inactive/padding lanes intentionally have no cache mutation.
     } else if (raw_kv_rows) {
         ggml_tensor * kv_f32 = ggml_is_contiguous(kv) ? kv : ggml_cont(ctx, kv);
@@ -2322,7 +2364,7 @@ static ggml_tensor * build_mla_attention_lane_core(
     ggml_tensor * cur_last = ggml_view_2d(
         ctx, cur, n_embd, 1, cur->nb[1], (size_t)(n_tokens - 1) * cur->nb[1]);
     ggml_tensor * comp_kv_source = lane.comp_kv;
-    if (lane.write_enabled && ratio > 0 && L.attn_compressor_kv) {
+    if (lane.write_comp && ratio > 0 && L.attn_compressor_kv) {
         build_compressor_step(ctx, gf, cur_last,
                               L.attn_compressor_ape,
                               L.attn_compressor_kv,
@@ -2373,7 +2415,7 @@ static ggml_tensor * build_mla_attention_lane_core(
     // only writes state that no graph node reads, so omit the dead subgraph.
     const bool indexer_compressor_is_dead =
         gathered_history && attention_impl != DeepSeek4AttentionImpl::SparseFlash;
-    if (lane.write_enabled && ratio == 4 && L.indexer_compressor_kv &&
+    if (lane.write_comp && ratio == 4 && L.indexer_compressor_kv &&
         !indexer_compressor_is_dead) {
         build_indexer_compressor_step(ctx, gf, cur_last, w, L,
                                       *lane.indexer_compressor, lane.index_comp_kv, token_pos,
@@ -2402,7 +2444,7 @@ static ggml_tensor * build_mla_attention_lane_core(
     // comp_kv: [head_dim, comp_cap] F16 compressed rows.
     // n_raw = min(kv_start + n_tokens, n_swa)
     const bool masked_kv = cached_inputs && cached_inputs->attn_row_mask;
-    const bool gathered_emits_comp = gathered_history && lane.write_enabled &&
+    const bool gathered_emits_comp = gathered_history && lane.write_comp &&
         ratio > 0 && ((token_pos + 1) % ratio) == 0;
     const int n_comp_live = gathered_history
         ? lane.n_comp_history + (gathered_emits_comp ? 1 : 0) : lane.n_comp_live;
@@ -3150,6 +3192,7 @@ static ggml_tensor * build_mla_attention(
         const DeepSeek4Weights & w,
         const DeepSeek4Layer & L,
         DeepSeek4LayerCache & lc,
+        DeepSeek4LayerCache & comp_lc,
         int layer_idx,
         int kv_start,
         int n_tokens,
@@ -3161,9 +3204,8 @@ static ggml_tensor * build_mla_attention(
         DeepSeek4AttentionImpl attention_impl = DeepSeek4AttentionImpl::Explicit,
         DeepSeek4SpecBoundaryCheckpointLayer * boundary_checkpoint = nullptr,
         vision::ImageSpanView image_spans = {}) {
-    const int ratio = w.compress_ratios[layer_idx];
     DeepSeek4MlaLaneBindings lane = deepseek4_contiguous_lane_bindings(
-        lc, ratio, kv_start + n_tokens - 1);
+        w, layer_idx, lc, comp_lc, kv_start + n_tokens - 1);
     return build_mla_attention_lane_core(
         ctx, gf, cur, w, L, lane, layer_idx, kv_start, n_tokens,
         cached_inputs, i32_inputs, i32_array_inputs, i64_array_inputs,
@@ -3413,6 +3455,7 @@ static bool build_cached_decode_attn_graph(
         const DeepSeek4Weights & w,
         const DeepSeek4Layer & L,
         DeepSeek4LayerCache & lc,
+        DeepSeek4LayerCache & comp_lc,
         int layer_idx,
         int kv_start,
         int raw_attn_count,
@@ -3506,7 +3549,7 @@ static bool build_cached_decode_attn_graph(
     std::vector<DeepSeek4I32ArrayBinding> i32_array_inputs;
     std::vector<DeepSeek4I64ArrayBinding> i64_array_inputs;
     ggml_tensor * normed = build_rms_norm(out.sg.ctx, out.sg.inp_embed, L.attn_norm, w.rms_eps);
-    out.sg.hidden_states = build_mla_attention(out.sg.ctx, out.sg.gf, normed, w, L, lc, layer_idx,
+    out.sg.hidden_states = build_mla_attention(out.sg.ctx, out.sg.gf, normed, w, L, lc, comp_lc, layer_idx,
                                                kv_start, 1, &out.inputs,
                                                i32_inputs, i32_array_inputs, i64_array_inputs);
     if (!out.sg.hidden_states) {
@@ -4870,6 +4913,7 @@ static bool deepseek4_step_hybrid(
     for (int il = 0; il < w.n_layer; ++il) {
         const DeepSeek4Layer & L = w.layers[(size_t) il];
         DeepSeek4LayerCache & lc = cache.layers[(size_t) il];
+        DeepSeek4LayerCache & comp_lc = ds4_comp_cache(cache, w, il);
         const HcLayerWeightsCpu & hc_lw = hc_layer_weights[(size_t)il];
 
         // ── HC pre (attention) ──────────────────────────────────────
@@ -4909,7 +4953,7 @@ static bool deepseek4_step_hybrid(
         ggml_cgraph * gf = ggml_new_graph(ctx);
 
         ggml_tensor * normed = build_rms_norm(ctx, inp, L.attn_norm, w.rms_eps);
-        ggml_tensor * attn_out = build_mla_attention(ctx, gf, normed, w, L, lc, il,
+        ggml_tensor * attn_out = build_mla_attention(ctx, gf, normed, w, L, lc, comp_lc, il,
                                                      kv_start, n_tokens, nullptr,
                                                      i32_inputs, i32_array_inputs,
                                                      i64_array_inputs);
@@ -6177,10 +6221,10 @@ static bool ds4_build_fused_decode_graph(
     for (int il = 0; il < w.n_layer; ++il) {
         const int ratio = (int) w.compress_ratios[il];
         int padded = 0;
-        if (ratio > 0 && cache.layers[(size_t) il].comp_kv) {
-            const int n_comp = ds4_comp_rows_used(cache.layers[(size_t) il].comp_kv,
-                                                  cache.layers[(size_t) il].n_comp, ratio, token_pos);
-            padded = ds4_padded_comp_rows(n_comp, (int) cache.layers[(size_t) il].comp_kv->ne[1]);
+        const DeepSeek4LayerCache & clc = ds4_comp_cache(cache, w, il);
+        if (ratio > 0 && clc.comp_kv) {
+            const int n_comp = ds4_comp_rows_used(clc.comp_kv, clc.n_comp, ratio, token_pos);
+            padded = ds4_padded_comp_rows(n_comp, (int) clc.comp_kv->ne[1]);
         }
         mask_total += w.n_swa + padded;
     }
@@ -6194,6 +6238,7 @@ static bool ds4_build_fused_decode_graph(
     for (int il = 0; il < w.n_layer; ++il) {
         const DeepSeek4Layer & L = w.layers[(size_t) il];
         DeepSeek4LayerCache & lc = cache.layers[(size_t) il];
+        DeepSeek4LayerCache & comp_lc = ds4_comp_cache(cache, w, il);
         const HcLayerWeightsCpu & hlw = hc_weights[(size_t) il];
         const int ratio = (int) w.compress_ratios[il];
 
@@ -6252,7 +6297,7 @@ static bool ds4_build_fused_decode_graph(
             ? DeepSeek4AttentionImpl::SparseFlash
             : DeepSeek4AttentionImpl::Explicit;
         ggml_tensor * normed = build_rms_norm(ctx, attn_in, L.attn_norm, w.rms_eps);
-        ggml_tensor * attn_out = build_mla_attention(ctx, gf, normed, w, L, lc, il,
+        ggml_tensor * attn_out = build_mla_attention(ctx, gf, normed, w, L, lc, comp_lc, il,
                                                      kv_start, 1, &ain,
                                                      i32b, i32ab, i64ab,
                                                      &f32ab, attention_impl);
@@ -6383,7 +6428,7 @@ static int ds4_try_fused_decode_step(
     key.push_back(token_ids ? 1 : 0);
     for (int il = 0; il < w.n_layer; ++il) {
         const int ratio = (int) w.compress_ratios[il];
-        DeepSeek4LayerCache & lc = cache.layers[(size_t) il];
+        DeepSeek4LayerCache & lc = ds4_comp_cache(cache, w, il);
         int padded = 0;
         if (ratio > 0 && lc.comp_kv) {
             const int n_comp = ds4_comp_rows_used(lc.comp_kv, lc.n_comp, ratio, token_pos);
@@ -6468,7 +6513,7 @@ static int ds4_try_fused_decode_step(
         const int n_valid_raw = std::min(kv_start + 1, w.n_swa);
         for (int il = 0; il < w.n_layer; ++il) {
             const int ratio = (int) w.compress_ratios[il];
-            DeepSeek4LayerCache & lc = cache.layers[(size_t) il];
+            DeepSeek4LayerCache & lc = ds4_comp_cache(cache, w, il);
             int n_comp = 0, padded = 0;
             if (ratio > 0 && lc.comp_kv) {
                 n_comp = ds4_comp_rows_used(lc.comp_kv, lc.n_comp, ratio, token_pos);
@@ -6839,6 +6884,7 @@ static bool ds4_run_exact_tokenwise_prefill_attention(
         const DeepSeek4Weights & w,
         const DeepSeek4Layer & L,
         DeepSeek4LayerCache & lc,
+        DeepSeek4LayerCache & comp_lc,
         int il,
         const float * cur,
         int n_tokens,
@@ -6869,7 +6915,7 @@ static bool ds4_run_exact_tokenwise_prefill_attention(
             ctx, ds4_attn_step_graph_size(1), false);
         ggml_tensor * normed = build_rms_norm(ctx, inp, L.attn_norm, w.rms_eps);
         ggml_tensor * attn_out = build_mla_attention(
-            ctx, gf, normed, w, L, lc, il, kv_start + ti, 1, nullptr,
+            ctx, gf, normed, w, L, lc, comp_lc, il, kv_start + ti, 1, nullptr,
             i32_inputs, i32_array_inputs, i64_array_inputs, &f32_array_inputs,
             attention_impl);
         ggml_set_output(attn_out);
@@ -6937,15 +6983,7 @@ static bool ds4_run_exact_tokenwise_prefill_attention(
         // Publish compressor rows immediately. The next token in this layer
         // must observe a row flushed by the current token, matching the q=1
         // reference when a prefill band crosses a compressor boundary.
-        const int ratio = (int) w.compress_ratios[il];
-        if (ratio > 0) {
-            const int next_pos = kv_start + ti + 1;
-            lc.n_comp = std::max(lc.n_comp, next_pos / ratio);
-            if (ratio == 4) {
-                lc.n_index_comp = std::max(lc.n_index_comp,
-                                           next_pos / ratio);
-            }
-        }
+        ds4_advance_comp_counters(w, il, lc, kv_start + ti + 1);
         ggml_free(ctx);
     }
     return true;
@@ -7436,15 +7474,7 @@ static int ds4_try_layer_major_prefill(
                     sizeof(float) * (size_t) w.n_vocab);
             }
 
-            DeepSeek4LayerCache & lc = cache.layers[(size_t) il];
-            const int ratio = (int) w.compress_ratios[(size_t) il];
-            if (ratio > 0) {
-                lc.n_comp = std::max(lc.n_comp, next_pos / ratio);
-                if (ratio == 4) {
-                    lc.n_index_comp = std::max(
-                        lc.n_index_comp, next_pos / ratio);
-                }
-            }
+            ds4_advance_comp_counters(w, cache, il, next_pos);
         }
         cache.cur_pos = next_pos;
         return (out_logits && out_logits->empty()) ? -1 : 1;
@@ -7482,6 +7512,7 @@ static int ds4_try_layer_major_prefill(
 
         const DeepSeek4Layer & L = w.layers[(size_t) il];
         DeepSeek4LayerCache & lc = cache.layers[(size_t) il];
+        DeepSeek4LayerCache & comp_lc = ds4_comp_cache(cache, w, il);
         const HcLayerWeightsCpu & hlw = hc_weights[(size_t) il];
 
         // HC pre -> batched attention.
@@ -7512,7 +7543,7 @@ static int ds4_try_layer_major_prefill(
                 ? DeepSeek4AttentionImpl::SparseFlash
                 : DeepSeek4AttentionImpl::DenseFlash;
         ggml_tensor * attn_out = build_mla_attention(
-            ctx, gf, attn_normed, w, L, lc, il, kv_start, n_tokens,
+            ctx, gf, attn_normed, w, L, lc, comp_lc, il, kv_start, n_tokens,
             nullptr, i32_inputs, i32_array_inputs, i64_array_inputs,
             &f32_array_inputs, attention_impl,
             /*boundary_checkpoint=*/nullptr, image_spans);
@@ -7701,14 +7732,7 @@ static int ds4_try_layer_major_prefill(
                                     sizeof(float) * (size_t) w.n_vocab);
         }
 
-        const int ratio = (int) w.compress_ratios[(size_t) il];
-        if (ratio > 0) {
-            lc.n_comp = std::max(lc.n_comp, next_pos / ratio);
-            if (ratio == 4) {
-                lc.n_index_comp = std::max(lc.n_index_comp,
-                                            next_pos / ratio);
-            }
-        }
+        ds4_advance_comp_counters(w, il, lc, next_pos);
         if (cached_layer) {
             cached_layer->i32_inputs = std::move(i32_inputs);
             cached_layer->i32_array_inputs = std::move(i32_array_inputs);
@@ -8708,10 +8732,7 @@ bool deepseek4_step_layer_range(
         if (vrc > 0) {
             const int np = kv_start + n_tokens;
             for (int il = layer_begin; il < layer_end; ++il) {
-                const uint32_t vratio = w.compress_ratios[il];
-                if (vratio <= 0) continue;
-                cache.layers[il].n_comp = std::max(cache.layers[il].n_comp, np / (int) vratio);
-                if (vratio == 4) cache.layers[il].n_index_comp = std::max(cache.layers[il].n_index_comp, np / (int) vratio);
+                ds4_advance_comp_counters(w, cache, il, np);
             }
             cache.cur_pos = np;
             if (telemetry) telemetry->total_us += ds4_elapsed_us(step_t0, Ds4TimingClock::now());
@@ -8746,8 +8767,7 @@ bool deepseek4_step_layer_range(
             for (int il = layer_begin; il < layer_end; ++il) {
                 const uint32_t ratio = w.compress_ratios[il];
                 if (ratio <= 0 || (np % (int) ratio) != 0) continue;
-                cache.layers[il].n_comp = std::max(cache.layers[il].n_comp, np / (int) ratio);
-                if (ratio == 4) cache.layers[il].n_index_comp = std::max(cache.layers[il].n_index_comp, np / (int) ratio);
+                ds4_advance_comp_counters(w, cache, il, np);
             }
             cache.cur_pos = np;
             if (telemetry) telemetry->total_us += ds4_elapsed_us(step_t0, Ds4TimingClock::now());
@@ -8858,6 +8878,7 @@ bool deepseek4_step_layer_range(
     for (int il = layer_begin; il < layer_end; ++il) {
         const DeepSeek4Layer & L = w.layers[(size_t)il];
         DeepSeek4LayerCache & lc = cache.layers[(size_t)il];
+        DeepSeek4LayerCache & comp_lc = ds4_comp_cache(cache, w, il);
         const HcLayerWeightsCpu & hc_lw = hc_layer_weights_range[(size_t)il];
         const int ratio = (int)w.compress_ratios[il];
         bool hash_routed = false;
@@ -8996,15 +9017,15 @@ bool deepseek4_step_layer_range(
                         ? DeepSeek4AttentionImpl::SparseFlash
                         : DeepSeek4AttentionImpl::Explicit;
                 if (!ds4_run_exact_tokenwise_prefill_attention(
-                        backend, w, L, lc, il, cur.data(), n_tokens, kv_start,
+                        backend, w, L, lc, comp_lc, il, cur.data(), n_tokens, kv_start,
                         attention_impl, attn_out_host,
                         cached_attn_allocs[(size_t) il], telemetry)) {
                     return false;
                 }
             } else if (reuse_decode_attn) {
                 const int n_raw = std::min(kv_start + 1, w.n_swa);
-                const int n_comp_attn = (ratio > 0) ? ds4_comp_rows_used(lc.comp_kv, lc.n_comp, ratio, token_pos) : 0;
-                const int n_index_comp = (ratio == 4) ? ds4_comp_rows_used(lc.index_comp_kv, lc.n_index_comp, 4, token_pos) : 0;
+                const int n_comp_attn = (ratio > 0) ? ds4_comp_rows_used(comp_lc.comp_kv, ds4_committed_comp_rows(w, comp_lc.n_comp), ratio, token_pos) : 0;
+                const int n_index_comp = comp_lc.index_comp_kv ? ds4_comp_rows_used(comp_lc.index_comp_kv, ds4_committed_comp_rows(w, comp_lc.n_index_comp), ratio, token_pos) : 0;
                 const bool attn_flush = ratio > 0 && (((token_pos + 1) % ratio) == 0);
                 const bool index_flush = ratio == 4 && (((token_pos + 1) % ratio) == 0);
                 auto & per_layer = cached_decode_attn_graphs[(size_t)il];
@@ -9039,7 +9060,7 @@ bool deepseek4_step_layer_range(
                     per_layer.emplace_back();
                     auto & candidate = per_layer.back();
                     const auto attn_build_t0 = Ds4TimingClock::now();
-                    if (!build_cached_decode_attn_graph(candidate, backend, w, L, lc, il, kv_start,
+                    if (!build_cached_decode_attn_graph(candidate, backend, w, L, lc, comp_lc, il, kv_start,
                                                         n_raw, n_comp_attn, n_index_comp,
                                                         shared_inputs)) {
                         // Out of memory (tight primary GPU in split mode):
@@ -9066,7 +9087,7 @@ bool deepseek4_step_layer_range(
                         per_layer.emplace_back();
                         auto & candidate2 = per_layer.back();
                         if (!build_cached_decode_attn_graph(
-                                candidate2, backend, w, L, lc, il, kv_start,
+                                candidate2, backend, w, L, lc, comp_lc, il, kv_start,
                                 n_raw, n_comp_attn, n_index_comp,
                                 shared_inputs)) {
                             std::fprintf(stderr,
@@ -9160,7 +9181,7 @@ bool deepseek4_step_layer_range(
                     cache.prefill_mode == PrefillAttentionMode::Sparse
                         ? DeepSeek4AttentionImpl::SparseFlash
                         : DeepSeek4AttentionImpl::Explicit;
-                attn_out = build_mla_attention(ctx, gf, normed, w, L, lc, il,
+                attn_out = build_mla_attention(ctx, gf, normed, w, L, lc, comp_lc, il,
                                                kv_start, n_tokens, nullptr,
                                                i32_inputs, i32_array_inputs,
                                                i64_array_inputs,
@@ -9925,13 +9946,7 @@ bool deepseek4_step_layer_range(
     // boundaries even when the chunk itself does not end on a boundary.
     const int next_pos = kv_start + n_tokens;
     for (int il = layer_begin; il < layer_end; ++il) {
-        const uint32_t ratio = w.compress_ratios[il];
-        if (ratio <= 0) continue;
-        cache.layers[il].n_comp = std::max(cache.layers[il].n_comp, next_pos / (int)ratio);
-        if (ratio == 4) {
-            cache.layers[il].n_index_comp = std::max(cache.layers[il].n_index_comp,
-                                                     next_pos / (int)ratio);
-        }
+        ds4_advance_comp_counters(w, cache, il, next_pos);
     }
 
     cache.cur_pos = next_pos;
@@ -9942,28 +9957,18 @@ bool deepseek4_step_layer_range(
 // ─── Cache management ───────────────────────────────────────────────────
 
 DeepSeek4LayerGeometry deepseek4_layer_geometry(const DeepSeek4Weights & w, int layer) {
-    DeepSeek4LayerGeometry g;
-    g.ratio = (layer >= 0 && (size_t) layer < w.compress_ratios.size())
+    const uint32_t ratio = (layer >= 0 && (size_t) layer < w.compress_ratios.size())
         ? w.compress_ratios[(size_t) layer] : 0;
-    g.head_dim = w.head_dim;
-    g.raw_rows = w.n_swa;
-    g.has_comp = g.ratio > 0;
-    g.has_index = g.ratio == 4;
-    if (g.has_comp) {
-        // Compressor state: width = coff * head_dim (2x for ratio-4, 1x for
-        // ratio-128); rows = 2*ratio for ratio-4 (prev + current window),
-        // ratio otherwise.
-        const int64_t coff = g.has_index ? 2 : 1;
-        g.comp_width = coff * (int64_t) w.head_dim;
-        g.comp_state_rows = g.has_index ? 2 * (int64_t) g.ratio : (int64_t) g.ratio;
-    }
-    if (g.has_index) {
-        // Indexer compressor: width = 2 * indexer head dim, same double buffer.
-        g.index_dim = w.n_indexer_head_dim;
-        g.index_state_width = 2 * (int64_t) w.n_indexer_head_dim;
-        g.index_state_rows = 2 * (int64_t) g.ratio;
-    }
-    return g;
+    return deepseek4_layer_geometry_from_ratio(
+        ratio, w.head_dim, w.n_swa, w.n_indexer_head_dim,
+        deepseek4_is_kv_source(w, layer), deepseek4_is_index_source(w, layer));
+}
+
+std::vector<DeepSeek4LayerGeometry> deepseek4_layer_geometries(const DeepSeek4Weights & w) {
+    std::vector<DeepSeek4LayerGeometry> out;
+    out.reserve((size_t) std::max(0, w.n_layer));
+    for (int il = 0; il < w.n_layer; ++il) out.push_back(deepseek4_layer_geometry(w, il));
+    return out;
 }
 
 bool create_deepseek4_cache(ggml_backend_t backend,
@@ -9995,6 +10000,8 @@ bool create_deepseek4_cache(ggml_backend_t backend,
         lc.n_comp = 0;
         lc.n_index_comp = 0;
 
+        // Readers of a shared compressed cache (V4.1) allocate nothing beyond
+        // the raw ring; they reach the source's rows through ds4_comp_cache().
         if (!g.has_comp) {
             continue;
         }
@@ -10004,25 +10011,29 @@ bool create_deepseek4_cache(ggml_backend_t backend,
         std::snprintf(name, sizeof(name), "ds4_comp_kv_%d", il);
         ggml_set_name(lc.comp_kv, name);
 
-        lc.attn_compressor.state_kv = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, g.comp_width, g.comp_state_rows);
-        lc.attn_compressor.state_score = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, g.comp_width, g.comp_state_rows);
-        std::snprintf(name, sizeof(name), "ds4_comp_state_kv_%d", il);
-        ggml_set_name(lc.attn_compressor.state_kv, name);
-        std::snprintf(name, sizeof(name), "ds4_comp_state_score_%d", il);
-        ggml_set_name(lc.attn_compressor.state_score, name);
+        if (g.has_comp_state()) {
+            lc.attn_compressor.state_kv = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, g.comp_width, g.comp_state_rows);
+            lc.attn_compressor.state_score = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, g.comp_width, g.comp_state_rows);
+            std::snprintf(name, sizeof(name), "ds4_comp_state_kv_%d", il);
+            ggml_set_name(lc.attn_compressor.state_kv, name);
+            std::snprintf(name, sizeof(name), "ds4_comp_state_score_%d", il);
+            ggml_set_name(lc.attn_compressor.state_score, name);
+        }
 
         if (g.has_index) {
             lc.index_comp_kv = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F16, g.index_dim, comp_cap);
-            lc.indexer_compressor.state_kv = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32,
-                                                                g.index_state_width, g.index_state_rows);
-            lc.indexer_compressor.state_score = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32,
-                                                                   g.index_state_width, g.index_state_rows);
             std::snprintf(name, sizeof(name), "ds4_index_comp_kv_%d", il);
             ggml_set_name(lc.index_comp_kv, name);
-            std::snprintf(name, sizeof(name), "ds4_index_state_kv_%d", il);
-            ggml_set_name(lc.indexer_compressor.state_kv, name);
-            std::snprintf(name, sizeof(name), "ds4_index_state_score_%d", il);
-            ggml_set_name(lc.indexer_compressor.state_score, name);
+            if (g.has_index_state()) {
+                lc.indexer_compressor.state_kv = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32,
+                                                                    g.index_state_width, g.index_state_rows);
+                lc.indexer_compressor.state_score = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32,
+                                                                       g.index_state_width, g.index_state_rows);
+                std::snprintf(name, sizeof(name), "ds4_index_state_kv_%d", il);
+                ggml_set_name(lc.indexer_compressor.state_kv, name);
+                std::snprintf(name, sizeof(name), "ds4_index_state_score_%d", il);
+                ggml_set_name(lc.indexer_compressor.state_score, name);
+            }
         }
     }
 

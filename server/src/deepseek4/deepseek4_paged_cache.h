@@ -6,6 +6,42 @@
 
 namespace luce::common {
 
+// Per-layer cache geometry. Pure host data so the plan-only build can use it.
+//   ratio 0            raw window only.
+//   V4 ratio 4         CSA compressor: double-width state over the previous
+//                      and current window (2*ratio rows), APE, plus its own
+//                      indexer compressor feeding the index-key rows.
+//   V4 ratio 128       HCA compressor: one window of `ratio` rows, single width.
+//   V4.1 ratio 2       same pooling as HCA without APE; index keys derive from
+//                      the latent, so index rows exist without indexer state.
+//   V4.1 ratio 1       one latent per token: rows without any compressor state.
+// Only kv source layers own compressed rows; V4.1 readers keep their ratio but
+// allocate nothing beyond the raw ring.
+struct DeepSeek4LayerGeometry {
+    uint32_t ratio = 0;
+    int64_t  head_dim = 0;             // raw / compressed row width (F16)
+    int64_t  raw_rows = 0;             // n_swa
+    bool     is_kv_source = false;     // runs the compressor; the only writer of comp_kv
+    bool     is_index_source = false;  // scores index keys (owns a top-k)
+    bool     has_comp = false;         // comp_kv rows (ratio > 0 at a kv source)
+    int64_t  comp_width = 0;           // attn compressor state width (F32); 0 = stateless
+    int64_t  comp_state_rows = 0;
+    bool     has_index = false;        // index_comp_kv rows
+    int64_t  index_dim = 0;            // index-key row width (F16)
+    int64_t  index_state_width = 0;    // V4 indexer compressor state width (F32); 0 = none
+    int64_t  index_state_rows = 0;
+    bool has_comp_state() const { return has_comp && comp_state_rows > 0; }
+    bool has_index_state() const { return has_index && index_state_rows > 0; }
+    // Compressed-row capacity for a cache of `max_ctx` tokens (0 if !has_comp).
+    int64_t comp_capacity(int max_ctx) const {
+        return has_comp ? (int64_t) max_ctx / (int64_t) ratio + 16 : 0;
+    }
+};
+
+DeepSeek4LayerGeometry deepseek4_layer_geometry_from_ratio(
+    uint32_t ratio, int64_t head_dim, int64_t raw_rows, int64_t indexer_head_dim,
+    bool is_kv_source, bool is_index_source);
+
 // Pure host-side allocation plan. Byte counts describe tensor payloads (ggml
 // alignment/padding is deliberately excluded).
 struct DeepSeek4PagedCachePlan {
@@ -59,8 +95,19 @@ bool prepare_deepseek4_gathered_lane_rows(
     uint32_t ratio,
     std::vector<DeepSeek4GatheredLaneRows> & out);
 
-// Ratios must contain only 0, 4, or 128. A ratio-zero layer has a raw ring
-// but no compressed storage or compressor state.
+// One geometry per layer; ratios must page (0, 1, 2, 4 or 128). A layer
+// without compressed storage (ratio zero, or a V4.1 reader) has a raw ring
+// but no compressed rows or compressor state.
+bool plan_deepseek4_paged_cache(uint32_t head_dim,
+                                uint32_t indexer_head_dim,
+                                uint32_t slots,
+                                uint32_t max_ctx,
+                                uint32_t physical_blocks,
+                                const std::vector<DeepSeek4LayerGeometry> & layers,
+                                DeepSeek4PagedCachePlan & out);
+
+// V4 form of the above: every compressing layer owns its rows and the ratio-4
+// layers carry the indexer.
 bool plan_deepseek4_paged_cache(uint32_t head_dim,
                                 uint32_t indexer_head_dim,
                                 uint32_t slots,

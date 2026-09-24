@@ -726,27 +726,22 @@ static void log_ds4_expert_memory_info(const char * tag,
 
 static uint64_t estimate_ds4_cache_bytes(const DeepSeek4Weights & w, int max_ctx) {
     size_t total_bytes = 0;
-    const size_t head_dim = (size_t) w.head_dim;
-    const size_t swa_size = (size_t) w.n_swa;
-
     for (int il = 0; il < w.n_layer; ++il) {
-        total_bytes += swa_size * head_dim * sizeof(uint16_t);
-        const uint32_t ratio = w.compress_ratios[(size_t) il];
-        if (ratio == 0) continue;
-
-        const size_t comp_cap = (size_t) (max_ctx / (int) ratio) + 16;
-        total_bytes += comp_cap * head_dim * sizeof(uint16_t);
-
-        const size_t state_rows = (ratio == 4) ? 8 : ratio;
-        const size_t comp_width = head_dim * (ratio == 4 ? 2 : 1);
-        total_bytes += state_rows * comp_width * sizeof(float) * 2;
-
-        if (ratio == 4) {
+        const DeepSeek4LayerGeometry g = deepseek4_layer_geometry(w, il);
+        total_bytes += (size_t) g.raw_rows * (size_t) g.head_dim * sizeof(uint16_t);
+        if (!g.has_comp) continue;
+        const size_t comp_cap = (size_t) g.comp_capacity(max_ctx);
+        total_bytes += comp_cap * (size_t) g.head_dim * sizeof(uint16_t);
+        if (g.has_comp_state()) {
+            total_bytes += (size_t) g.comp_state_rows * (size_t) g.comp_width * sizeof(float) * 2;
+        }
+        if (g.has_index) {
             // index_comp_kv is per-head. The full multi-head width lives
             // only in fixed-size state scratch and does not scale with context.
-            const size_t index_dim = (size_t) w.n_indexer_head_dim;
-            total_bytes += comp_cap * index_dim * sizeof(uint16_t);
-            total_bytes += state_rows * (2 * index_dim) * sizeof(float) * 2;
+            total_bytes += comp_cap * (size_t) g.index_dim * sizeof(uint16_t);
+            if (g.has_index_state()) {
+                total_bytes += (size_t) g.index_state_rows * (size_t) g.index_state_width * sizeof(float) * 2;
+            }
         }
     }
 
@@ -1879,7 +1874,7 @@ bool DeepSeek4Backend::compute_uniform_hybrid_placement(const DeepSeek4Weights &
             !plan_deepseek4_paged_cache(
                 (uint32_t)w.head_dim, (uint32_t)w.n_indexer_head_dim,
                 (uint32_t)cfg_.max_concurrency, (uint32_t)max_ctx,
-                physical_blocks, w.compress_ratios, paged_plan) ||
+                physical_blocks, deepseek4_layer_geometries(w), paged_plan) ||
             kv_bytes > UINT64_MAX - paged_plan.total_persistent_bytes) {
             if (err) *err = "failed to plan paged KV memory for hybrid placement";
             return false;

@@ -524,14 +524,12 @@ static bool ds4_build_fused_verify_graph(
     } else if (!paged_mode) {
         for (int il = 0; il < w.n_layer; ++il) {
             const int ratio = (int) w.compress_ratios[il];
+            const DeepSeek4LayerCache & clc = ds4_comp_cache(*cache, w, il);
             int padded = 0;
-            if (ratio > 0 && cache->layers[(size_t) il].comp_kv) {
+            if (ratio > 0 && clc.comp_kv) {
                 const int n_comp = ds4_comp_rows_used(
-                    cache->layers[(size_t) il].comp_kv,
-                    cache->layers[(size_t) il].n_comp, ratio,
-                    kv_start + q - 1);
-                padded = ds4_padded_comp_rows(
-                    n_comp, (int) cache->layers[(size_t) il].comp_kv->ne[1]);
+                    clc.comp_kv, clc.n_comp, ratio, kv_start + q - 1);
+                padded = ds4_padded_comp_rows(n_comp, (int) clc.comp_kv->ne[1]);
             }
             const int preserved_rows = q > 1 ? q : 0;
             mask_total += (int64_t) (w.n_swa + padded + preserved_rows) * q;
@@ -589,6 +587,8 @@ static bool ds4_build_fused_verify_graph(
         const DeepSeek4Layer & L = w.layers[(size_t) il];
         DeepSeek4LayerCache * lc =
             paged_mode ? nullptr : &cache->layers[(size_t) il];
+        DeepSeek4LayerCache * comp_lc =
+            paged_mode ? nullptr : &ds4_comp_cache(*cache, w, il);
         const HcLayerWeightsCpu & hlw = hc_weights[(size_t) il];
         const int ratio = (int) w.compress_ratios[il];
 
@@ -617,6 +617,8 @@ static bool ds4_build_fused_verify_graph(
             // established MLA lane core at q=1; all surrounding HC/MoE/output
             // machinery remains q-wide and unchanged.
             DeepSeek4PagedLayerCache & plc = paged_cache->layers[(size_t) il];
+            // Compressed rows and compressor state live at the kv source.
+            DeepSeek4PagedLayerCache & cplc = ds4_comp_cache(*paged_cache, w, il);
             ggml_tensor * raw_flat = ggml_reshape_2d(
                 ctx, plc.raw_kv, w.head_dim,
                 (int64_t) DS4_PAGE_TOKENS * paged_cache->plan.slots);
@@ -742,25 +744,26 @@ static bool ds4_build_fused_verify_graph(
                     : comp_stage ? ggml_view_2d(ctx, comp_stage, w.head_dim,
                         rows.compressed_history.size(), comp_stage->nb[1],
                         (size_t) (px.comp_off - comp_begin) * comp_stage->nb[1])
-                    : ggml_get_rows(ctx, plc.comp_kv, px.comp_gather);
+                    : ggml_get_rows(ctx, cplc.comp_kv, px.comp_gather);
                 ggml_tensor * index_history = nullptr;
+                // Stateless (ratio-1) sources carry no pooling state to view.
                 DeepSeek4CompressorState attn_state{}, index_state{};
-                if (ratio > 0 && rows.slot >= 0) {
-                    const size_t off = (size_t) rows.slot * plc.attn_compressor.state_kv->nb[2];
-                    attn_state.state_kv = ggml_view_2d(ctx, plc.attn_compressor.state_kv,
-                        plc.attn_compressor.state_kv->ne[0], plc.attn_compressor.state_kv->ne[1],
-                        plc.attn_compressor.state_kv->nb[1], off);
-                    attn_state.state_score = ggml_view_2d(ctx, plc.attn_compressor.state_score,
-                        plc.attn_compressor.state_score->ne[0], plc.attn_compressor.state_score->ne[1],
-                        plc.attn_compressor.state_score->nb[1], off);
+                if (ratio > 0 && rows.slot >= 0 && cplc.attn_compressor.state_kv) {
+                    const size_t off = (size_t) rows.slot * cplc.attn_compressor.state_kv->nb[2];
+                    attn_state.state_kv = ggml_view_2d(ctx, cplc.attn_compressor.state_kv,
+                        cplc.attn_compressor.state_kv->ne[0], cplc.attn_compressor.state_kv->ne[1],
+                        cplc.attn_compressor.state_kv->nb[1], off);
+                    attn_state.state_score = ggml_view_2d(ctx, cplc.attn_compressor.state_score,
+                        cplc.attn_compressor.state_score->ne[0], cplc.attn_compressor.state_score->ne[1],
+                        cplc.attn_compressor.state_score->nb[1], off);
                     if (ratio == 4) {
-                        const size_t io = (size_t) rows.slot * plc.indexer_compressor.state_kv->nb[2];
-                        index_state.state_kv = ggml_view_2d(ctx, plc.indexer_compressor.state_kv,
-                            plc.indexer_compressor.state_kv->ne[0], plc.indexer_compressor.state_kv->ne[1],
-                            plc.indexer_compressor.state_kv->nb[1], io);
-                        index_state.state_score = ggml_view_2d(ctx, plc.indexer_compressor.state_score,
-                            plc.indexer_compressor.state_score->ne[0], plc.indexer_compressor.state_score->ne[1],
-                            plc.indexer_compressor.state_score->nb[1], io);
+                        const size_t io = (size_t) rows.slot * cplc.indexer_compressor.state_kv->nb[2];
+                        index_state.state_kv = ggml_view_2d(ctx, cplc.indexer_compressor.state_kv,
+                            cplc.indexer_compressor.state_kv->ne[0], cplc.indexer_compressor.state_kv->ne[1],
+                            cplc.indexer_compressor.state_kv->nb[1], io);
+                        index_state.state_score = ggml_view_2d(ctx, cplc.indexer_compressor.state_score,
+                            cplc.indexer_compressor.state_score->ne[0], cplc.indexer_compressor.state_score->ne[1],
+                            cplc.indexer_compressor.state_score->nb[1], io);
                     }
                 }
                 DeepSeek4MlaLaneBindings lane{};
@@ -774,13 +777,14 @@ static bool ds4_build_fused_verify_graph(
                 lane.n_index_comp_history = (int) rows.compressed_history.size();
                 // Writes use the same flattened physical-row geometry as the
                 // gather indices (not the slot-local 128-row second axis).
-                lane.raw_kv = raw_flat; lane.comp_kv = plc.comp_kv;
-                lane.index_comp_kv = plc.index_comp_kv;
+                lane.raw_kv = raw_flat; lane.comp_kv = cplc.comp_kv;
+                lane.index_comp_kv = cplc.index_comp_kv;
                 lane.raw_write_rows = px.raw_write; lane.comp_write_rows = px.comp_write;
                 lane.index_comp_write_rows = px.comp_write;
                 lane.comp_read_rows = px.comp_read;
                 lane.index_comp_read_rows = px.comp_read;
-                lane.write_enabled = rows.slot >= 0;
+                lane.write_raw = rows.slot >= 0;
+                lane.write_comp = lane.write_raw && deepseek4_is_kv_source(w, il);
                 lane.attn_compressor = &attn_state; lane.indexer_compressor = &index_state;
                 DeepSeek4AttentionGraphInputs ci{};
                 ci.rope_pos = px.pos; ci.neg_pos = px.neg_pos;
@@ -886,10 +890,10 @@ static bool ds4_build_fused_verify_graph(
                 (size_t) il * 2 * sizeof(int64_t));
         }
         int padded = 0;
-        if (ratio > 0 && lc->comp_kv) {
+        if (ratio > 0 && comp_lc->comp_kv) {
             const int n_comp = ds4_comp_rows_used(
-                lc->comp_kv, lc->n_comp, ratio, lane_token_pos);
-            padded = ds4_padded_comp_rows(n_comp, (int) lc->comp_kv->ne[1]);
+                comp_lc->comp_kv, comp_lc->n_comp, ratio, lane_token_pos);
+            padded = ds4_padded_comp_rows(n_comp, (int) comp_lc->comp_kv->ne[1]);
         }
         const int64_t n_attn = (int64_t) w.n_swa + padded +
                                (lane_q > 1 ? lane_q : 0);
@@ -918,7 +922,7 @@ static bool ds4_build_fused_verify_graph(
             ? DeepSeek4AttentionImpl::SparseFlash
             : DeepSeek4AttentionImpl::Explicit;
         ggml_tensor * normed = build_rms_norm(ctx, attn_in, L.attn_norm, w.rms_eps);
-        attn_out = build_mla_attention(ctx, gf, normed, w, L, *lc, il,
+        attn_out = build_mla_attention(ctx, gf, normed, w, L, *lc, *comp_lc, il,
                                                      lane_kv_start, lane_q, &ain,
                                                      i32b, i32ab, i64ab,
                                                      &f32ab, attention_impl,
@@ -1520,7 +1524,7 @@ static int ds4_try_fused_verify_step(
     for (int layer : *hooks->capture_layer_ids) key.push_back(layer);
     for (int il = 0; il < w.n_layer; ++il) {
         const int ratio = (int) w.compress_ratios[il];
-        DeepSeek4LayerCache & lc = cache.layers[(size_t) il];
+        DeepSeek4LayerCache & lc = ds4_comp_cache(cache, w, il);
         int padded = 0;
         if (ratio > 0 && lc.comp_kv) {
             const int n_comp = ds4_comp_rows_used(lc.comp_kv, lc.n_comp, ratio, token_pos);
@@ -1655,7 +1659,7 @@ static int ds4_try_fused_verify_step(
         size_t off = 0;
         for (int il = 0; il < w.n_layer; ++il) {
             const int ratio = (int) w.compress_ratios[il];
-            DeepSeek4LayerCache & lc = cache.layers[(size_t) il];
+            DeepSeek4LayerCache & lc = ds4_comp_cache(cache, w, il);
             const int lane_q = q;
             const int lane_start = 0;
             const int lane_kv_start = kv_start + lane_start;
