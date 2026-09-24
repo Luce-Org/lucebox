@@ -122,7 +122,11 @@ static void print_usage(const char * prog) {
         "  --ds4-expert-placement <FILE>\n"
         "                       Per-expert owner: primary GPU, secondary GPU or streamed\n"
         "                       from the model file (JSON, see docs/DS41.md)\n"
-
+        "  --ds4-router-bias <FILE>\n"
+        "                       Add f32 [n_layer][n_expert] to the routing selection bias\n"
+        "  --ds4-protected-experts <FILE>\n"
+        "                       Experts that keep a token's native routing and stay on\n"
+        "                       the primary GPU (JSON {\"layer\": [ids]})\n"
         "  --ds4-prefill <mode> DeepSeek4 prefill: exact, dense, or sparse\n"
         "                       (default: exact; dense/sparse are experimental\n"
         "                       and may change generated tokens)\n"
@@ -467,6 +471,10 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
             }
         } else if (std::strcmp(argv[i], "--ds4-expert-placement") == 0 && i + 1 < argc) {
             bargs.ds4_expert_placement = argv[++i];
+        } else if (std::strcmp(argv[i], "--ds4-router-bias") == 0 && i + 1 < argc) {
+            bargs.ds4_router_bias = argv[++i];
+        } else if (std::strcmp(argv[i], "--ds4-protected-experts") == 0 && i + 1 < argc) {
+            bargs.ds4_protected_experts = argv[++i];
         } else if (std::strcmp(argv[i], "--ds4-prefill") == 0 && i + 1 < argc) {
             const char * mode = argv[++i];
             bargs.ds4_prefill_mode_set = true;

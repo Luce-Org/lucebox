@@ -76,8 +76,10 @@ struct BackendArgs {
     int             ds4_expert_top_k = 0;  // 0 = model default
     bool            ds4_fused_decode = false;
     bool            ds4_fused_verify_f16_kv = false;
-    // Expert ownership file (see docs/DS41.md); empty = unused.
+    // Expert ownership and routing files (see docs/DS41.md); empty = unused.
     std::string     ds4_expert_placement;
+    std::string     ds4_router_bias;
+    std::string     ds4_protected_experts;
 
     // Attention and speculative-decode options. Individual backends consume
     // only the fields they support.

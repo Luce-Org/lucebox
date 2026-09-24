@@ -323,7 +323,12 @@ struct DeepSeek4Weights {
     // Runtime serving policy. These values are set by the backend after the
     // GGUF is loaded; they are not model metadata.
     int  routed_expert_top_k = 0;  // 0 = model default (n_expert_used)
-
+    // Routing adjustments loaded with the model (--ds4-router-bias,
+    // --ds4-protected-experts), [n_layer * n_expert] each, empty when unused.
+    // The delta is already added to every ffn_exp_probs_b; host routing
+    // subtracts it again to find a token's native top-k.
+    std::vector<float>   router_bias_delta;
+    std::vector<uint8_t> protected_experts;
     bool fused_decode        = false;
     bool fused_verify_f16_kv = false;
 };
@@ -482,6 +487,8 @@ struct DeepSeek4BackendConfig {
     int          max_concurrency = 1;
     long long    kv_pool_tokens = 0;
     std::string  expert_placement_path;   // three-tier expert ownership (JSON)
+    std::string  router_bias_path;        // f32 [n_layer][n_expert] selection bias delta
+    std::string  protected_experts_path;  // {"layer": [expert ids]} (JSON)
 };
 
 // ─── Function declarations ──────────────────────────────────────────────

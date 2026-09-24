@@ -171,6 +171,8 @@ BackendPreparation BackendPlanBuilder::resolve(
     plan.execution_.fused_verify_f16_kv =
         args.ds4_fused_verify_f16_kv;
     plan.execution_.expert_placement = args.ds4_expert_placement;
+    plan.execution_.router_bias = args.ds4_router_bias;
+    plan.execution_.protected_experts = args.ds4_protected_experts;
 
     plan.warnings_ = std::move(warnings);
     return plan;

@@ -19,6 +19,8 @@
 #include "common/sampler.h"
 #include "common/moe_hybrid_routing_stats.h"
 
+#include <nlohmann/json.hpp>
+
 #if defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP)
 #include "common/gpu_runtime_compat.h"
 #endif
@@ -35,6 +37,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cinttypes>
+#include <fstream>
 #include <limits>
 #include <new>
 #include <sstream>
@@ -1300,7 +1303,11 @@ bool DeepSeek4Backend::validate_model_features() const {
     } else if (!cfg_.mmproj_path.empty()) {
         unsupported = "--mmproj";
     }
-
+    if (!w_.protected_experts.empty() && !w_.moe_hybrid) {
+        std::fprintf(stderr, "[deepseek4] --ds4-protected-experts applies on the host routing of the "
+                     "hybrid expert tier; this model is fully resident\n");
+        return false;
+    }
     if (unsupported) {
         std::fprintf(stderr, "[deepseek4] %s is not implemented for %s (see server/docs/DS41.md)\n",
                      unsupported, w_.arch.c_str());
@@ -1315,11 +1322,90 @@ bool DeepSeek4Backend::validate_model_features() const {
 
 // ─── Routing adjustments and explicit expert ownership ─────────────────
 
-// Replaces the uniform hot set with the explicit three-tier ownership of
-// --ds4-expert-placement, fitted to the primary budget (what the uniform
-// placement spends) and the secondary device.
+// Reads --ds4-router-bias (raw little-endian f32 [n_layer][n_expert]) and
+// --ds4-protected-experts ({"<layer>": [expert ids], ...}) into the weights.
+bool DeepSeek4Backend::load_routing_adjustments() {
+    const size_t n = (size_t) w_.n_layer * (size_t) w_.n_expert;
+    w_.router_bias_delta.clear();
+    w_.protected_experts.clear();
+    if (!cfg_.router_bias_path.empty()) {
+        std::ifstream f(cfg_.router_bias_path, std::ios::binary | std::ios::ate);
+        if (!f || (size_t) f.tellg() != n * sizeof(float)) {
+            std::fprintf(stderr, "[deepseek4] router bias %s must hold %zu f32 values ([%d][%d])\n",
+                         cfg_.router_bias_path.c_str(), n, w_.n_layer, w_.n_expert);
+            return false;
+        }
+        w_.router_bias_delta.resize(n);
+        f.seekg(0);
+        f.read(reinterpret_cast<char *>(w_.router_bias_delta.data()), (std::streamsize) (n * sizeof(float)));
+        if (!f) return false;
+    }
+    if (!cfg_.protected_experts_path.empty()) {
+        std::ifstream f(cfg_.protected_experts_path);
+        nlohmann::json j;
+        try {
+            f >> j;
+        } catch (const std::exception & ex) {
+            std::fprintf(stderr, "[deepseek4] protected experts %s: %s\n",
+                         cfg_.protected_experts_path.c_str(), ex.what());
+            return false;
+        }
+        w_.protected_experts.assign(n, 0);
+        for (auto it = j.begin(); j.is_object() && it != j.end(); ++it) {
+            int layer = -1;
+            const std::string & key = it.key();
+            std::from_chars(key.data(), key.data() + key.size(), layer);
+            if (layer < 0 || layer >= w_.n_layer || !it.value().is_array()) {
+                std::fprintf(stderr, "[deepseek4] protected experts: bad layer entry \"%s\"\n", key.c_str());
+                return false;
+            }
+            for (const auto & e : it.value()) {
+                const int expert = e.is_number_integer() ? e.get<int>() : -1;
+                if (expert < 0 || expert >= w_.n_expert) {
+                    std::fprintf(stderr, "[deepseek4] protected experts: bad expert in layer %d\n", layer);
+                    return false;
+                }
+                w_.protected_experts[(size_t) layer * (size_t) w_.n_expert + (size_t) expert] = 1;
+            }
+        }
+    }
+    return true;
+}
+
+// Adds the router bias delta to every layer's selection bias once, so routing
+// pays nothing per token. Mixing weights are unaffected (they never read it).
+bool DeepSeek4Backend::apply_routing_adjustments() {
+    if (!load_routing_adjustments()) return false;
+    if (!w_.router_bias_delta.empty()) {
+        std::vector<float> bias((size_t) w_.n_expert);
+        for (int il = 0; il < w_.n_layer; ++il) {
+            ggml_tensor * t = w_.layers[(size_t) il].ffn_exp_probs_b;
+            if (!t || t->type != GGML_TYPE_F32 || ggml_nelements(t) != w_.n_expert) {
+                std::fprintf(stderr, "[deepseek4] layer %d has no F32 selection bias for --ds4-router-bias\n", il);
+                return false;
+            }
+            ggml_backend_tensor_get(t, bias.data(), 0, sizeof(float) * bias.size());
+            for (int e = 0; e < w_.n_expert; ++e) {
+                bias[(size_t) e] += w_.router_bias_delta[(size_t) il * (size_t) w_.n_expert + (size_t) e];
+            }
+            ggml_backend_tensor_set(t, bias.data(), 0, sizeof(float) * bias.size());
+        }
+    }
+    if (!w_.router_bias_delta.empty() || !w_.protected_experts.empty()) {
+        std::fprintf(stderr, "[deepseek4] routing: router bias %s, %d protected experts\n",
+                     w_.router_bias_delta.empty() ? "off" : cfg_.router_bias_path.c_str(),
+                     (int) std::count(w_.protected_experts.begin(), w_.protected_experts.end(), 1));
+    }
+    return true;
+}
+
+// Replaces the uniform hot set with an explicit three-tier ownership: the
+// placement file (or the uniform placement when only protected experts are
+// given), protected experts pinned to the primary, fitted to the primary
+// budget (what the uniform placement spends) and the secondary device.
 bool DeepSeek4Backend::apply_expert_ownership(bool secondary_owner, MoeHybridConfig & hybrid_cfg) {
-    if (cfg_.expert_placement_path.empty()) return true;
+    if (!load_routing_adjustments()) return false;
+    if (cfg_.expert_placement_path.empty() && w_.protected_experts.empty()) return true;
 
     std::vector<uint64_t> expert_bytes((size_t) w_.n_layer);
     for (int il = 0; il < w_.n_layer; ++il) {
@@ -1345,9 +1431,22 @@ bool DeepSeek4Backend::apply_expert_ownership(bool secondary_owner, MoeHybridCon
 
     MoeExpertOwnership own;
     std::string err;
-    if (!MoeExpertOwnership::load_json(cfg_.expert_placement_path, w_.n_layer, w_.n_expert, own, &err)) {
-        std::fprintf(stderr, "[deepseek4] %s\n", err.c_str());
-        return false;
+    if (!cfg_.expert_placement_path.empty()) {
+        if (!MoeExpertOwnership::load_json(cfg_.expert_placement_path, w_.n_layer, w_.n_expert, own, &err)) {
+            std::fprintf(stderr, "[deepseek4] %s\n", err.c_str());
+            return false;
+        }
+    } else {
+        own.init(w_.n_layer, w_.n_expert,
+                 secondary_owner ? MoeExpertOwnership::Secondary : MoeExpertOwnership::Stream);
+        for (int il = 0; il < w_.n_layer; ++il) {
+            for (int32_t e : moe_placement_.hot_expert_ids[(size_t) il]) {
+                own.set(il, e, MoeExpertOwnership::Primary);
+            }
+        }
+    }
+    for (size_t i = 0; i < w_.protected_experts.size(); ++i) {
+        if (w_.protected_experts[i]) own.pin_primary((int) (i / (size_t) w_.n_expert), (int) (i % (size_t) w_.n_expert));
     }
     MoeHybridRoutingStats usage;
     const char * usage_path = std::getenv("LUCE_DS4_HOTNESS_CSV");
@@ -1374,7 +1473,8 @@ bool DeepSeek4Backend::apply_expert_ownership(bool secondary_owner, MoeHybridCon
                  own.count(O::Secondary), gib(own.bytes(O::Secondary, expert_bytes)), gib(secondary_budget),
                  own.count(O::Stream), gib(own.bytes(O::Stream, expert_bytes)));
     std::fprintf(stderr, "[deepseek4] expert ownership from %s; demotions ranked by %s\n",
-                 cfg_.expert_placement_path.c_str(), have_usage ? usage_path : "layer balance");
+                 cfg_.expert_placement_path.empty() ? "the uniform placement" : cfg_.expert_placement_path.c_str(),
+                 have_usage ? usage_path : "layer balance");
     return true;
 }
 
@@ -1788,7 +1888,7 @@ bool DeepSeek4Backend::init() {
 
     snap_backend_ = ggml_backend_init_by_name("cpu", nullptr);
 
-    if (!load_model()) {
+    if (!load_model() || !apply_routing_adjustments()) {
         return false;
     }
     if (!validate_prefill_mode() || !validate_model_features()) {
@@ -2615,7 +2715,7 @@ bool DeepSeek4Backend::unpark(ParkTarget target) {
     const bool want_target_model = park_target_includes_target_model(target);
 
     if (want_target_model && parked_) {
-        if (!load_model()) {
+        if (!load_model() || !apply_routing_adjustments()) {
             std::fprintf(stderr, "[deepseek4] unpark: failed to restore target model\n");
             vision_.reset();
             free_deepseek4_weights(w_);

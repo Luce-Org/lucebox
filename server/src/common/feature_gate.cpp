@@ -357,9 +357,11 @@ std::string check_feature_compatibility(
                "DeepSeek4 backend";
     }
 
-    // ── --ds4-expert-placement × architecture/adapter
-    if (!args.ds4_expert_placement.empty() && !local_ds4) {
-        return "--ds4-expert-placement requires a single local DeepSeek4 backend";
+    // ── expert ownership and routing files × architecture/adapter
+    if ((!args.ds4_expert_placement.empty() || !args.ds4_router_bias.empty() ||
+         !args.ds4_protected_experts.empty()) && !local_ds4) {
+        return "--ds4-expert-placement, --ds4-router-bias and "
+               "--ds4-protected-experts require a single local DeepSeek4 backend";
     }
 
     return {};

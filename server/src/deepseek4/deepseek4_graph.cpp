@@ -4238,6 +4238,40 @@ static bool eval_ds4_hybrid(
     return true;
 }
 
+// Host top-k routing of one token over `probs + bias` (the layer's selection
+// bias, which includes any router delta loaded with the model). A token whose
+// native top-k, the same selection without the delta, holds a protected
+// expert keeps its native selection.
+static void ds4_top_k_experts(const float * probs, const float * bias, const float * minus,
+                              int n_expert, int k, int32_t * out) {
+    auto score = [&](int e) {
+        return probs[e] + (bias ? bias[e] : 0.0f) - (minus ? minus[e] : 0.0f);
+    };
+    std::fill(out, out + k, -1);
+    for (int expert = 0; expert < n_expert; ++expert) {
+        const float s = score(expert);
+        for (int slot = 0; slot < k; ++slot) {
+            if (out[slot] < 0 || s > score(out[slot])) {
+                for (int move = k - 1; move > slot; --move) out[move] = out[move - 1];
+                out[slot] = expert;
+                break;
+            }
+        }
+    }
+}
+
+static void ds4_select_routed_experts(const DeepSeek4Weights & w, int layer, const float * probs,
+                                      const float * bias, int k, int32_t * out) {
+    const size_t row = (size_t) layer * (size_t) w.n_expert;
+    if (!w.protected_experts.empty() && !w.router_bias_delta.empty() && bias) {
+        ds4_top_k_experts(probs, bias, w.router_bias_delta.data() + row, w.n_expert, k, out);
+        for (int slot = 0; slot < k; ++slot) {
+            if (out[slot] >= 0 && w.protected_experts[row + (size_t) out[slot]]) return;
+        }
+    }
+    ds4_top_k_experts(probs, bias, nullptr, w.n_expert, k, out);
+}
+
 // `selection_bias`, when given, is a per-token [n_expert, n_tokens] input that
 // replaces the layer's single selection bias. Image batches use it: image rows
 // select with the image router bias, text rows keep their usual selection.
@@ -5413,24 +5447,8 @@ static bool deepseek4_step_hybrid(
             for (int ti = 0; ti < n_tokens; ++ti) {
                 const float * probs = probs_host.data() + (size_t)ti * (size_t)w.n_expert;
                 std::vector<int32_t> top((size_t)route_width, -1);
-                for (int expert = 0; expert < w.n_expert; ++expert) {
-                    const float score = probs[expert] +
-                        (!bias_host.empty() ? bias_host[(size_t)expert] : 0.0f);
-                    for (int slot = 0; slot < route_width; ++slot) {
-                        const int32_t cur_expert = top[(size_t)slot];
-                        const float cur_score = cur_expert >= 0
-                            ? probs[cur_expert] +
-                                (!bias_host.empty() ? bias_host[(size_t)cur_expert] : 0.0f)
-                            : -INFINITY;
-                        if (cur_expert < 0 || score > cur_score) {
-                            for (int m = route_width - 1; m > slot; --m) {
-                                top[(size_t)m] = top[(size_t)m - 1];
-                            }
-                            top[(size_t)slot] = expert;
-                            break;
-                        }
-                    }
-                }
+                ds4_select_routed_experts(w, il, probs, bias_host.empty() ? nullptr : bias_host.data(),
+                                          route_width, top.data());
                 float sum = 0.0f;
                 for (int slot = 0; slot < route_width; ++slot) {
                     const int32_t expert = top[(size_t)slot];
@@ -7015,27 +7033,9 @@ static bool eval_ds4_layer_range_hybrid_ffn(
             std::memcpy(token_ids_out, row,
                         sizeof(int32_t) * (size_t)route_width);
         } else {
-            std::fill(token_ids_out, token_ids_out + route_width, -1);
-            for (int expert = 0; expert < w.n_expert; ++expert) {
-                const float score = token_probs[expert] +
-                    (!bias.empty() ? bias[(size_t)expert] : 0.0f);
-                for (int slot = 0; slot < route_width; ++slot) {
-                    const int32_t current = token_ids_out[slot];
-                    const float current_score = current >= 0
-                        ? token_probs[current] +
-                            (!bias.empty() ? bias[(size_t)current] : 0.0f)
-                        : -INFINITY;
-                    if (current < 0 || score > current_score) {
-                        for (int move = route_width - 1; move > slot; --move) {
-                            token_ids_out[move] = token_ids_out[move - 1];
-                        }
-                        token_ids_out[slot] = expert;
-                        break;
-                    }
-                }
-            }
+            ds4_select_routed_experts(w, layer, token_probs, bias.empty() ? nullptr : bias.data(),
+                                      route_width, token_ids_out);
         }
-
 
         float sum = 0.0f;
         for (int slot = 0; slot < route_width; ++slot) {
