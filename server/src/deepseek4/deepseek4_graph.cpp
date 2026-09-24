@@ -4977,6 +4977,9 @@ static void hc_pre_auto_into(float * working,
                     pre_out);
 }
 
+// Batches up to this size compute the HC pre-mix token by token.
+constexpr int kHcPreSequentialTokens = 8;
+
 static void hc_pre_batch(std::vector<float> & working,
                          std::vector<float> & post,
                          std::vector<float> & comb,
@@ -4995,7 +4998,11 @@ static void hc_pre_batch(std::vector<float> & working,
     comb.resize((size_t)n_tokens * (size_t)n_hc * (size_t)n_hc);
     if (pre) pre->resize((size_t)n_tokens * (size_t)n_hc);
 
-    ds4_pool_for_tokens(n_tokens, [&](int t0, int t1) {
+    // A few tokens (a speculative verify batch) run one after another, each
+    // with the row-parallel matvec of single-token decode; larger batches
+    // spread tokens over the pool instead. Both give the same bits.
+    const bool token_parallel = n_tokens > kHcPreSequentialTokens;
+    auto run_tokens = [&](int t0, int t1) {
         std::vector<float> flat(hc_dim);
         float mix[24];
         for (int t = t0; t < t1; ++t) {
@@ -5011,10 +5018,15 @@ static void hc_pre_batch(std::vector<float> & working,
                              hc_eps,
                              flat.data(),
                              mix,
-                             /*serial_fn=*/n_tokens > 1,
+                             /*serial_fn=*/token_parallel,
                              pre ? pre->data() + (size_t)t * n_hc : nullptr);
         }
-    });
+    };
+    if (token_parallel) {
+        ds4_pool_for_tokens(n_tokens, run_tokens);
+    } else {
+        run_tokens(0, n_tokens);
+    }
 }
 
 static void cpu_hc_post(float * out_hc, const float * block_out,
