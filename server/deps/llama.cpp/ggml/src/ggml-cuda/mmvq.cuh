@@ -14,6 +14,9 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc);
 bool ggml_cuda_mmvq_mmid_grouped_enabled(
     ggml_type type, int cc, int64_t ncols_dst, int64_t routed_pairs);
 
+// Set by ggml_backend_cuda_set_mmvq_batch_invariant (calling thread).
+bool ggml_cuda_mmvq_batch_invariant();
+
 void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
 

@@ -138,6 +138,13 @@ GGML_BACKEND_API int ggml_backend_cuda_get_device_id(ggml_backend_t backend);
 // changing concurrent requests or other CUDA/HIP backends.
 GGML_BACKEND_API int ggml_backend_cuda_set_mmvq_max_ncols_override(int max_ncols);
 
+// Calling-thread switch for batch-invariant quantized MUL_MAT: while set,
+// multi-column products take the matrix-vector path column by column, so
+// each output column is bit-identical to the same product of that column
+// alone (a speculative verifier then reproduces single-token decode exactly).
+// Returns the previous setting.
+GGML_BACKEND_API bool ggml_backend_cuda_set_mmvq_batch_invariant(bool enabled);
+
 // Calling-thread DS4 mixed-expert dispatch ceiling, scoped to a graph compute.
 // Accepts 0 (the default of five) or 1..16; returns the previous ceiling.
 GGML_BACKEND_API int ggml_backend_cuda_set_ds4_mix_mmv_max_tokens_override(int max_tokens);

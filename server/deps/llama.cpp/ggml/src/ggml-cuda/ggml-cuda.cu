@@ -104,6 +104,17 @@ static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 static thread_local int ggml_cuda_mmvq_max_ncols_override = 0;
 static thread_local int ggml_cuda_ds4_mix_mmv_max_tokens = GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS;
 static thread_local bool ggml_cuda_graphs_disabled_override = false;
+static thread_local bool ggml_cuda_mmvq_batch_invariant_enabled = false;
+
+extern "C" bool ggml_backend_cuda_set_mmvq_batch_invariant(bool enabled) {
+    const bool previous = ggml_cuda_mmvq_batch_invariant_enabled;
+    ggml_cuda_mmvq_batch_invariant_enabled = enabled;
+    return previous;
+}
+
+bool ggml_cuda_mmvq_batch_invariant() {
+    return ggml_cuda_mmvq_batch_invariant_enabled;
+}
 
 extern "C" int ggml_backend_cuda_set_ds4_mix_mmv_max_tokens_override(int max_tokens) {
     GGML_ASSERT(max_tokens >= 0 && max_tokens <= GGML_CUDA_DS4_MIX_MMV_PAGED_MAX_TOKENS);
@@ -2572,6 +2583,9 @@ static int ggml_cuda_mmvq_max_ncols() {
         const int v = e ? atoi(e) : 3;
         return v > 0 ? v : MMVQ_MAX_BATCH_SIZE;
     }();
+    if (ggml_cuda_mmvq_batch_invariant_enabled) {
+        return MMVQ_MAX_BATCH_SIZE;
+    }
     return ggml_cuda_mmvq_max_ncols_override > 0
         ? ggml_cuda_mmvq_max_ncols_override : configured;
 }

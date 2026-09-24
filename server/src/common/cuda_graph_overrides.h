@@ -13,11 +13,17 @@ public:
             bool disable_graphs = false,
             int mmvq_max_ncols = 0,
             bool skip_property_check = false,
-            int ds4_mix_mmv_max_tokens = 0)
+            int ds4_mix_mmv_max_tokens = 0,
+            bool mmvq_batch_invariant = false)
         : disable_graphs_(disable_graphs),
           override_mmvq_(mmvq_max_ncols > 0),
           skip_property_check_(skip_property_check),
-          override_ds4_mix_(ds4_mix_mmv_max_tokens > 0) {
+          override_ds4_mix_(ds4_mix_mmv_max_tokens > 0),
+          batch_invariant_(mmvq_batch_invariant) {
+        if (batch_invariant_) {
+            previous_batch_invariant_ =
+                ggml_backend_cuda_set_mmvq_batch_invariant(true);
+        }
         if (disable_graphs_) {
             previous_graphs_disabled_ =
                 ggml_backend_cuda_set_graphs_disabled_override(true);
@@ -38,6 +44,9 @@ public:
     }
 
     ~ScopedCudaGraphOverrides() {
+        if (batch_invariant_) {
+            ggml_backend_cuda_set_mmvq_batch_invariant(previous_batch_invariant_);
+        }
         if (override_ds4_mix_) {
             ggml_backend_cuda_set_ds4_mix_mmv_max_tokens_override(previous_ds4_mix_max_tokens_);
         }
@@ -63,7 +72,9 @@ private:
     bool override_mmvq_ = false;
     bool skip_property_check_ = false;
     bool override_ds4_mix_ = false;
+    bool batch_invariant_ = false;
     bool previous_graphs_disabled_ = false;
+    bool previous_batch_invariant_ = false;
     bool previous_skip_property_check_ = false;
     int previous_mmvq_max_ncols_ = 0;
     int previous_ds4_mix_max_tokens_ = 0;

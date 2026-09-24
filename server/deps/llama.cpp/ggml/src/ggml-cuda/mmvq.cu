@@ -2965,6 +2965,21 @@ void ggml_cuda_mul_mat_vec_q(
         }
     }
 
+    if (!ids && ncols_dst > 1 && ggml_cuda_mmvq_batch_invariant()) {
+        // The kernel's warp count (and so its reduction order) depends on the
+        // column count; one single-column launch per column keeps every
+        // column bit-identical to a single-token product.
+        for (int64_t col = 0; col < ncols_dst; ++col) {
+            mul_mat_vec_q_switch_type(
+                src0->data, src0->type,
+                src1_q8_d + col*stride_col_y*(int64_t) sizeof(block_q8_1), ids_d, fusion_local,
+                dst_d + col*stride_col_dst, ne00,
+                ne01,              1,             s01, stride_col_y,     stride_col_dst,
+                ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
+                ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
+        }
+        return;
+    }
     mul_mat_vec_q_switch_type(
         src0->data, src0->type, src1_q8_d, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
