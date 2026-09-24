@@ -103,6 +103,16 @@ static bool env_flag_enabled(const char * name) {
     return value && value[0] && std::strcmp(value, "0") != 0;
 }
 
+// The expert usage profile that ranks placement: LUCE_DS4_HOTNESS_CSV, or
+// else the route counts earlier runs learned into LUCE_DS4_ROUTING_STATS_OUT.
+static const char * ds4_usage_profile_path() {
+    const char * given = std::getenv("LUCE_DS4_HOTNESS_CSV");
+    if (given && *given) return given;
+    const char * learned = std::getenv("LUCE_DS4_ROUTING_STATS_OUT");
+    if (learned && *learned && std::ifstream(learned).good()) return learned;
+    return nullptr;
+}
+
 struct AffineMmqPrefillScope {
     bool active = false;
 
@@ -1464,7 +1474,7 @@ bool DeepSeek4Backend::apply_expert_ownership(bool secondary_owner, MoeHybridCon
         if (w_.protected_experts[i]) own.pin_primary((int) (i / (size_t) w_.n_expert), (int) (i % (size_t) w_.n_expert));
     }
     MoeHybridRoutingStats usage;
-    const char * usage_path = std::getenv("LUCE_DS4_HOTNESS_CSV");
+    const char * usage_path = ds4_usage_profile_path();
     const bool have_usage = usage_path && *usage_path && MoeHybridRoutingStats::load_csv(usage_path, usage, &err);
     if (!own.fit_budgets(expert_bytes, primary_budget, secondary_budget, have_usage ? &usage : nullptr, &err)) {
         std::fprintf(stderr, "[deepseek4] expert ownership: %s\n", err.c_str());
@@ -1984,8 +1994,15 @@ bool DeepSeek4Backend::init() {
                 return false;
             }
             routing_stats_out_path_ = stats_path;
-            std::fprintf(stderr, "[deepseek4] routing stats enabled output=%s\n",
-                         routing_stats_out_path_.c_str());
+            // Keep learning across restarts: resume the counts saved there.
+            MoeHybridRoutingStats saved;
+            std::string load_err;
+            const bool resumed = std::ifstream(stats_path).good() &&
+                MoeHybridRoutingStats::load_csv(stats_path, saved, &load_err) &&
+                saved.matches(w_.n_layer, w_.n_expert, w_.n_expert_used);
+            if (resumed) *routing_stats_ = std::move(saved);
+            std::fprintf(stderr, "[deepseek4] routing stats enabled output=%s%s\n",
+                         routing_stats_out_path_.c_str(), resumed ? " (resumed)" : "");
         }
     }
     if (env_flag_enabled("LUCE_DS4_TP_ROUTE_STATS") && !routing_stats_) {
@@ -2149,7 +2166,7 @@ bool DeepSeek4Backend::compute_uniform_hybrid_placement(const DeepSeek4Weights &
     const bool concentrate_requested = tp.concentrate_secondary;
     bool concentrated = false;
     int retained_local = 0;
-    const char * profile_path = std::getenv("LUCE_DS4_HOTNESS_CSV");
+    const char * profile_path = ds4_usage_profile_path();
     const char * decode_profile_path =
         std::getenv("LUCE_DS4_DECODE_HOTNESS_CSV");
     const bool phase_aware_placement = decode_profile_path &&
