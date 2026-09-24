@@ -326,6 +326,9 @@ constexpr float kDs4VerifyWidthCostMs[DS4_Q5_VERIFY_TOKENS + 1] = {
 // prev-half = first 4 rows of a [comp_width, 8] ratio-4 rolling state.
 // Ratio-128 states need only the touched ring rows, not the full 128 rows.
 constexpr int kRollbackMaxTokens = 6; // Preserve the existing raw-ring staging capacity.
+// Default V4.1 verify width (seed + two drafts): q=3 beat q=4..6 on the
+// hybrid tier (count 13.0, code 15.0 tok/s against 13.4/13.7 at q=4).
+constexpr int kDs4TokenwiseVerifyDefaultWidth = 3;
 
 size_t prev_half_bytes(const ggml_tensor * t) {
     return t && t->ne[1] == 8 ? (size_t) t->nb[1] * 4 : 0;
@@ -878,15 +881,19 @@ bool run_deepseek4_dspark_spec_decode(
     // The explicit wide path handles a second ratio-4 boundary in-graph and
     // restores/replays only a rejected prefix, avoiding full snapshots on the
     // overwhelmingly common all-accepted path.
-    // V4.1 verifies token by token through the decode attention graphs, so
-    // no compressor boundary limits its width; the rollback staging does.
+    // V4.1 verifies each token through its decode lane, so no compressor
+    // boundary limits its width, only the rollback staging does
+    // (LUCE_DS4_SPEC_Q up to six); the default width measured best on the
+    // R9700 + Strix Halo hybrid tier.
     const bool tokenwise_verify = target_w.hc_staggered_pre;
     const int fast_cap = tokenwise_verify
         ? std::min(block + 1, kRollbackMaxTokens)
         : std::min(block + 1,
                    q5_verify ? DS4_Q5_VERIFY_TOKENS
                              : DS4_CONSERVATIVE_VERIFY_MAX_TOKENS);
-    int q_cap = full_snap ? block + 1 : fast_cap;
+    int q_cap = full_snap ? block + 1
+              : tokenwise_verify ? std::min(fast_cap, kDs4TokenwiseVerifyDefaultWidth)
+              : fast_cap;
     if (const char * qs = std::getenv("LUCE_DS4_SPEC_Q")) {
         const int v = std::atoi(qs);
         if (v >= 2 && v <= block + 1) {
