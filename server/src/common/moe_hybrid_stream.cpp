@@ -54,6 +54,16 @@ MoeHybridStreamEngine & MoeHybridStreamEngine::operator=(MoeHybridStreamEngine &
     return *this;
 }
 
+// Slack after every staged matrix. The streaming eval hands this scratch to
+// tensors owned by a graph allocator, and ggml-cuda's quantized matvec zeroes
+// the row padding it expects after a quantized matrix whose width is not a
+// multiple of MATRIX_ROW_PADDING (512 elements), for example the 2304-wide
+// down experts of DeepSeek V4.1. Without slack that write lands in the next
+// staged matrix or past the buffer. 4 KiB covers the padding of every
+// quantized type.
+static constexpr size_t kRegionPad = 4096;
+static constexpr size_t kRegions   = 3;   // gate, up, down (or gate_up, down)
+
 bool MoeHybridStreamEngine::init(ggml_backend_t gpu_backend, size_t max_expert_bytes,
                                  std::string * err) {
     destroy();
@@ -61,17 +71,20 @@ bool MoeHybridStreamEngine::init(ggml_backend_t gpu_backend, size_t max_expert_b
         if (err) *err = "invalid arguments to stream engine init";
         return false;
     }
+    const size_t alloc_bytes = max_expert_bytes + kRegions * kRegionPad;
 
-    // Allocate pinned host staging buffer
-    cudaError_t cuda_err = cudaMallocHost(&pinned_buf_, max_expert_bytes);
+    // Allocate pinned host staging buffer (zeroed once: the pad bytes travel
+    // to the GPU with every expert and must decode to nothing)
+    cudaError_t cuda_err = cudaMallocHost(&pinned_buf_, alloc_bytes);
     if (cuda_err != cudaSuccess) {
         if (err) *err = std::string("cudaMallocHost failed: ") + cudaGetErrorString(cuda_err);
         return false;
     }
-    pinned_size_ = max_expert_bytes;
+    std::memset(pinned_buf_, 0, alloc_bytes);
+    pinned_size_ = alloc_bytes;
 
     // Allocate GPU scratch buffer
-    cuda_err = cudaMalloc(&gpu_scratch_, max_expert_bytes);
+    cuda_err = cudaMalloc(&gpu_scratch_, alloc_bytes);
     if (cuda_err != cudaSuccess) {
         if (err) *err = std::string("cudaMalloc scratch failed: ") + cudaGetErrorString(cuda_err);
         cudaFreeHost(pinned_buf_);
@@ -79,7 +92,7 @@ bool MoeHybridStreamEngine::init(ggml_backend_t gpu_backend, size_t max_expert_b
         pinned_size_ = 0;
         return false;
     }
-    scratch_size_ = max_expert_bytes;
+    scratch_size_ = alloc_bytes;
     backend_ = gpu_backend;
     return true;
 }
@@ -189,7 +202,7 @@ bool MoeHybridStreamEngine::stream_expert_sync(const void * mmap_data, size_t mm
                     file_base + file_off, bytes);
         last_gate_bytes_ = bytes;
         last_up_bytes_ = 0;
-        staging_offset += bytes;
+        staging_offset += bytes + kRegionPad;
     } else {
         // gate
         {
@@ -202,7 +215,7 @@ bool MoeHybridStreamEngine::stream_expert_sync(const void * mmap_data, size_t mm
             std::memcpy(static_cast<uint8_t *>(pinned_buf_) + staging_offset,
                         file_base + file_off, bytes);
             last_gate_bytes_ = bytes;
-            staging_offset += bytes;
+            staging_offset += bytes + kRegionPad;
         }
         // up
         {
@@ -215,7 +228,7 @@ bool MoeHybridStreamEngine::stream_expert_sync(const void * mmap_data, size_t mm
             std::memcpy(static_cast<uint8_t *>(pinned_buf_) + staging_offset,
                         file_base + file_off, bytes);
             last_up_bytes_ = bytes;
-            staging_offset += bytes;
+            staging_offset += bytes + kRegionPad;
         }
     }
 
@@ -230,7 +243,7 @@ bool MoeHybridStreamEngine::stream_expert_sync(const void * mmap_data, size_t mm
         std::memcpy(static_cast<uint8_t *>(pinned_buf_) + staging_offset,
                     file_base + file_off, bytes);
         last_down_bytes_ = bytes;
-        staging_offset += bytes;
+        staging_offset += bytes + kRegionPad;
     }
 
     if (staging_offset > scratch_size_) {
@@ -251,13 +264,13 @@ bool MoeHybridStreamEngine::stream_expert_sync(const void * mmap_data, size_t mm
     size_t off = 0;
     if (regions.fused_gate_up) {
         scratch_gate_ = scratch_bytes + off;
-        off += last_gate_bytes_;
+        off += last_gate_bytes_ + kRegionPad;
         scratch_up_ = nullptr;
     } else {
         scratch_gate_ = scratch_bytes + off;
-        off += last_gate_bytes_;
+        off += last_gate_bytes_ + kRegionPad;
         scratch_up_ = scratch_bytes + off;
-        off += last_up_bytes_;
+        off += last_up_bytes_ + kRegionPad;
     }
     scratch_down_ = scratch_bytes + off;
 
