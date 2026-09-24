@@ -1,17 +1,26 @@
-// Loads DeepSeek V4 Flash from a GGUF file.
+// Loads DeepSeek V4 Flash ("deepseek4") and V4.1 Flash ("deepseek41") from a
+// GGUF file. Metadata keys are `<arch>.<key>`; the sidecar keys our encoder
+// writes (deepseek4.{p4mix,dmix,gumix}.sidecar) stay literal.
 //
 // Tensor naming follows the ds4 GGUF conversion:
 //   token_embd.weight, output_norm.weight, output.weight,
-//   output_hc_base.weight, output_hc_fn.weight, output_hc_scale.weight
+//   output_hc_base.weight, output_hc_fn.weight, output_hc_scale.weight (V4)
 //   blk.<i>.attn_norm.weight, blk.<i>.attn_q_a.weight, attn_q_a_norm,
 //   attn_q_b, attn_kv, attn_kv_a_norm, attn_sinks, attn_output_a, attn_output_b,
 //   attn_compressor_{ape,kv,gate,norm}, indexer.{attn_q_b, proj},
-//   indexer_compressor_{ape,kv,gate,norm},
+//   indexer_compressor_{ape,kv,gate,norm} (V4),
+//   indexer.{attn_k, k_norm}, engram_{q,k,wkv} (V4.1; engram_embd is skipped),
 //   hc_attn_fn, hc_attn_scale, hc_attn_base,
 //   ffn_norm, ffn_gate_inp, exp_probs_b (bias), ffn_gate_tid2eid,
 //   ffn_gate_exps, ffn_up_exps, ffn_down_exps,
 //   ffn_gate_shexp, ffn_up_shexp, ffn_down_shexp,
 //   hc_ffn_fn, hc_ffn_scale, hc_ffn_base
+//
+// Two converters write deepseek41 files with different key vocabularies (see
+// kKeyAliases below). The kv / index source layer lists are optional: when
+// absent they are inferred from tensor presence (a kv source carries
+// attn_compressor_kv, an index source carries indexer.attn_q_b), which is exact
+// for the released checkpoint and for every V4 file.
 
 #include "deepseek4_internal.h"
 #include "internal.h"
@@ -141,34 +150,56 @@ struct DS4Mmap {
     }
 };
 
-uint32_t get_u32_or(gguf_context * g, const char * key, uint32_t def) {
-    int64_t id = gguf_find_key(g, key);
-    if (id < 0) return def;
-    if (gguf_get_kv_type(g, id) == GGUF_TYPE_ARRAY) {
-        if (gguf_get_arr_n(g, id) == 0) return def;
-        return ((const uint32_t *)gguf_get_arr_data(g, id))[0];
+// Any numeric scalar as a double. Converters disagree on the storage type of
+// the same key (llama.cpp writes rope_theta as f32, DwarfStar as u32), and the
+// typed gguf getters assert on a mismatch, so every scalar read goes through
+// here. A one-element numeric array counts as the scalar. Returns false for
+// absent keys, strings, and non-numeric arrays.
+static bool get_number(gguf_context * g, int64_t id, double & out) {
+    if (id < 0) return false;
+    enum gguf_type t = gguf_get_kv_type(g, id);
+    const void * raw = nullptr;
+    if (t == GGUF_TYPE_ARRAY) {
+        if (gguf_get_arr_n(g, id) == 0) return false;
+        t = gguf_get_arr_type(g, id);
+        raw = gguf_get_arr_data(g, id);
     }
-    return gguf_get_val_u32(g, id);
+    switch (t) {
+        case GGUF_TYPE_UINT8:   out = raw ? *(const uint8_t *) raw  : gguf_get_val_u8(g, id);  return true;
+        case GGUF_TYPE_INT8:    out = raw ? *(const int8_t *) raw   : gguf_get_val_i8(g, id);  return true;
+        case GGUF_TYPE_UINT16:  out = raw ? *(const uint16_t *) raw : gguf_get_val_u16(g, id); return true;
+        case GGUF_TYPE_INT16:   out = raw ? *(const int16_t *) raw  : gguf_get_val_i16(g, id); return true;
+        case GGUF_TYPE_UINT32:  out = raw ? *(const uint32_t *) raw : gguf_get_val_u32(g, id); return true;
+        case GGUF_TYPE_INT32:   out = raw ? *(const int32_t *) raw  : gguf_get_val_i32(g, id); return true;
+        case GGUF_TYPE_FLOAT32: out = raw ? *(const float *) raw    : gguf_get_val_f32(g, id); return true;
+        case GGUF_TYPE_BOOL:    out = raw ? *(const bool *) raw     : gguf_get_val_bool(g, id); return true;
+        case GGUF_TYPE_UINT64:  out = (double) (raw ? *(const uint64_t *) raw : gguf_get_val_u64(g, id)); return true;
+        case GGUF_TYPE_INT64:   out = (double) (raw ? *(const int64_t *) raw  : gguf_get_val_i64(g, id)); return true;
+        case GGUF_TYPE_FLOAT64: out = raw ? *(const double *) raw   : gguf_get_val_f64(g, id); return true;
+        default: return false;
+    }
+}
+
+uint32_t get_u32_or(gguf_context * g, const char * key, uint32_t def) {
+    double v;
+    if (!get_number(g, gguf_find_key(g, key), v) || v < 0 || v > (double) UINT32_MAX) return def;
+    return (uint32_t) v;
 }
 
 uint64_t get_u64_or(gguf_context * g, const char * key, uint64_t def) {
-    int64_t id = gguf_find_key(g, key);
+    const int64_t id = gguf_find_key(g, key);
     if (id < 0) return def;
-    // Handle both u32 and u64 storage in GGUF
-    if (gguf_get_kv_type(g, id) == GGUF_TYPE_UINT32) {
-        return (uint64_t)gguf_get_val_u32(g, id);
-    }
-    return (uint64_t)gguf_get_val_u64(g, id);
+    const enum gguf_type t = gguf_get_kv_type(g, id);
+    if (t == GGUF_TYPE_UINT64) return gguf_get_val_u64(g, id);   // exact
+    double v;
+    if (!get_number(g, id, v) || v < 0) return def;
+    return (uint64_t) v;
 }
 
 float get_f32_or(gguf_context * g, const char * key, float def) {
-    int64_t id = gguf_find_key(g, key);
-    if (id < 0) return def;
-    if (gguf_get_kv_type(g, id) == GGUF_TYPE_ARRAY) {
-        if (gguf_get_arr_n(g, id) == 0) return def;
-        return ((const float *)gguf_get_arr_data(g, id))[0];
-    }
-    return gguf_get_val_f32(g, id);
+    double v;
+    if (!get_number(g, gguf_find_key(g, key), v)) return def;
+    return (float) v;
 }
 
 bool get_u32_arr(gguf_context * g, const char * key, std::vector<uint32_t> & out,
@@ -208,8 +239,117 @@ bool get_u32_arr(gguf_context * g, const char * key, std::vector<uint32_t> & out
     return true;
 }
 
+// Scalar i32 (or u32) with a default; used for values that may be -1.
+int32_t get_i32_or(gguf_context * g, const char * key, int32_t def) {
+    double v;
+    if (!get_number(g, gguf_find_key(g, key), v) || v < (double) INT32_MIN || v > (double) INT32_MAX) return def;
+    return (int32_t) v;
+}
+
+// i32/u32 array into ints (layer ids, token maps). Absent key = empty + true.
+bool get_i32_arr(gguf_context * g, const char * key, std::vector<int32_t> & out,
+                 std::string * err = nullptr) {
+    out.clear();
+    int64_t id = gguf_find_key(g, key);
+    if (id < 0) return true;
+    if (gguf_get_kv_type(g, id) != GGUF_TYPE_ARRAY) {
+        if (err) *err = std::string(key) + " must be an array";
+        return false;
+    }
+    const enum gguf_type arr_type = gguf_get_arr_type(g, id);
+    const size_t n = gguf_get_arr_n(g, id);
+    const void * raw = gguf_get_arr_data(g, id);
+    out.resize(n);
+    if (arr_type == GGUF_TYPE_INT32) {
+        const int32_t * vals = static_cast<const int32_t *>(raw);
+        out.assign(vals, vals + n);
+    } else if (arr_type == GGUF_TYPE_UINT32) {
+        const uint32_t * vals = static_cast<const uint32_t *>(raw);
+        for (size_t i = 0; i < n; ++i) {
+            if (vals[i] > (uint32_t) INT32_MAX) {
+                if (err) *err = std::string(key) + " array value exceeds i32";
+                out.clear();
+                return false;
+            }
+            out[i] = (int32_t) vals[i];
+        }
+    } else {
+        if (err) *err = std::string(key) + " array element type must be i32 or u32";
+        out.clear();
+        return false;
+    }
+    return true;
+}
+
+// u64/i64 (or u32/i32) array into uint64 (engram hash constants). Negative
+// values are rejected. Absent key = empty + true.
+bool get_u64_arr(gguf_context * g, const char * key, std::vector<uint64_t> & out,
+                 std::string * err = nullptr) {
+    out.clear();
+    int64_t id = gguf_find_key(g, key);
+    if (id < 0) return true;
+    if (gguf_get_kv_type(g, id) != GGUF_TYPE_ARRAY) {
+        if (err) *err = std::string(key) + " must be an array";
+        return false;
+    }
+    const enum gguf_type arr_type = gguf_get_arr_type(g, id);
+    const size_t n = gguf_get_arr_n(g, id);
+    const void * raw = gguf_get_arr_data(g, id);
+    out.resize(n);
+    auto reject_negative = [&](bool negative) {
+        if (!negative) return true;
+        if (err) *err = std::string(key) + " array values must be non-negative";
+        out.clear();
+        return false;
+    };
+    switch (arr_type) {
+        case GGUF_TYPE_UINT64: {
+            const uint64_t * vals = static_cast<const uint64_t *>(raw);
+            out.assign(vals, vals + n);
+            return true;
+        }
+        case GGUF_TYPE_INT64: {
+            const int64_t * vals = static_cast<const int64_t *>(raw);
+            for (size_t i = 0; i < n; ++i) {
+                if (!reject_negative(vals[i] < 0)) return false;
+                out[i] = (uint64_t) vals[i];
+            }
+            return true;
+        }
+        case GGUF_TYPE_UINT32: {
+            const uint32_t * vals = static_cast<const uint32_t *>(raw);
+            for (size_t i = 0; i < n; ++i) out[i] = vals[i];
+            return true;
+        }
+        case GGUF_TYPE_INT32: {
+            const int32_t * vals = static_cast<const int32_t *>(raw);
+            for (size_t i = 0; i < n; ++i) {
+                if (!reject_negative(vals[i] < 0)) return false;
+                out[i] = (uint64_t) vals[i];
+            }
+            return true;
+        }
+        default:
+            if (err) *err = std::string(key) + " array element type must be u64, i64, u32 or i32";
+            out.clear();
+            return false;
+    }
+}
+
 ggml_tensor * find_tensor(ggml_context * ctx, const char * name) {
     return ggml_get_tensor(ctx, name);
+}
+
+// Compact "[a, b, c]" rendering for the load log.
+template <typename T>
+std::string join_ints(const std::vector<T> & v, size_t limit = 64) {
+    std::string s = "[";
+    for (size_t i = 0; i < v.size() && i < limit; ++i) {
+        if (i) s += ", ";
+        s += std::to_string(v[i]);
+    }
+    if (v.size() > limit) s += ", ... (" + std::to_string(v.size()) + " values)";
+    return s + "]";
 }
 
 static size_t align_up_size(size_t x, size_t a) {
@@ -258,9 +398,16 @@ static int image_bias_layer(const char * name) {
     return -1;
 }
 
+// The Engram hash tables (about 95 GiB per layer) are never kept or mapped;
+// their rows are read on demand (deepseek4_engram.h).
+static bool is_engram_table_tensor(const char * name) {
+    return std::strstr(name, ".engram_embd.") != nullptr;
+}
+
 static bool should_keep_ds4_tensor(const char * name,
                                    const TargetLoadPlan & plan) {
     int layer_id = -1;
+    if (is_engram_table_tensor(name)) return false;
     if (plan.expert_metadata_only) {
         return parse_block_tensor_name(name, layer_id) &&
                layer_id >= plan.layer_begin &&
@@ -334,6 +481,213 @@ struct DS4TensorAlloc {
     bool dense_split = false;
 };
 }  // namespace
+
+// ─── Source-layer resolution ────────────────────────────────────────────
+// Fills kv_src / idx_src and the per-layer source flags from the declared
+// (or inferred) source lists. A compressing layer resolves to the latest
+// source at or below it with the same ratio; V4 lists every compressing layer
+// (and every ratio-4 layer for the indexer), so every layer resolves to itself.
+static bool deepseek4_resolve_layer_sources(DeepSeek4Weights & w, std::string & err) {
+    const int n_layer = w.n_layer;
+    auto check_list = [&](const std::vector<int> & ids, const char * what) {
+        int prev = -1;
+        for (int id : ids) {
+            if (id < 0 || id >= n_layer) {
+                err = std::string(what) + " layer id " + std::to_string(id) + " is out of range";
+                return false;
+            }
+            if (id <= prev) {
+                err = std::string(what) + " layer ids must be strictly ascending";
+                return false;
+            }
+            if (w.compress_ratios[(size_t) id] == 0) {
+                err = std::string(what) + " layer " + std::to_string(id) + " has compress ratio 0";
+                return false;
+            }
+            prev = id;
+        }
+        return true;
+    };
+    if (!check_list(w.kv_source_layer_ids, "kv source") ||
+        !check_list(w.index_source_layer_ids, "index source")) {
+        return false;
+    }
+    // Every compressing layer must find its compressed rows (strict). A
+    // compressing layer with no index source of its own ratio attends densely
+    // over them, which is what V4's ratio-128 layers do (no indexer at all).
+    auto resolve = [&](const std::vector<int> & ids, std::vector<int> & src,
+                       std::vector<uint8_t> & flags, const char * what, bool strict) {
+        src.assign((size_t) n_layer, 0);
+        flags.assign((size_t) n_layer, 0);
+        for (int id : ids) flags[(size_t) id] = 1;
+        int latest = -1;
+        for (int il = 0; il < n_layer; ++il) {
+            if (flags[(size_t) il]) latest = il;
+            src[(size_t) il] = il;
+            const uint32_t ratio = w.compress_ratios[(size_t) il];
+            if (ratio == 0 || flags[(size_t) il]) continue;
+            const bool matched = latest >= 0 && w.compress_ratios[(size_t) latest] == ratio;
+            if (matched) {
+                src[(size_t) il] = latest;
+            } else if (strict) {
+                err = "layer " + std::to_string(il) + " (ratio " + std::to_string(ratio) +
+                      ") has no " + what + " of the same ratio at or below it" +
+                      (latest >= 0 ? " (nearest is layer " + std::to_string(latest) + ", ratio " +
+                                     std::to_string(w.compress_ratios[(size_t) latest]) + ")"
+                                   : std::string());
+                return false;
+            }
+        }
+        return true;
+    };
+    if (!resolve(w.kv_source_layer_ids, w.kv_src, w.kv_source_flags, "kv source", true) ||
+        !resolve(w.index_source_layer_ids, w.idx_src, w.index_source_flags, "index source", false)) {
+        return false;
+    }
+    // Index keys are produced where the compressed rows are (the reference
+    // creates indexer.wk only at a kv source that is also an index source), so
+    // every index source must score keys that exist: its kv source must be an
+    // index source too. V4's ratio-4 layers are both; ratio-128 layers are neither.
+    for (int il : w.index_source_layer_ids) {
+        const int src = w.kv_src[(size_t) il];
+        if (!w.index_source_flags[(size_t) src]) {
+            err = "index source layer " + std::to_string(il) + " reads index keys from kv source layer " +
+                  std::to_string(src) + ", which is not an index source and produces none";
+            return false;
+        }
+    }
+    w.shared_comp_cache = false;
+    for (int il = 0; il < n_layer; ++il) {
+        w.shared_comp_cache = w.shared_comp_cache || w.kv_src[(size_t) il] != il;
+    }
+    return true;
+}
+
+// ─── Engram metadata (V4.1) ─────────────────────────────────────────────
+// llama.cpp PR #28696 writes the geometry (head_count, key_length,
+// max_ngram_size) and the bucket offsets; the DwarfStar converter writes only
+// the hash arrays and per-layer row counts, and embeds the tables. Whatever is
+// missing is derived here, then everything is checked against the geometry.
+// The tables themselves are never mapped: only their location is recorded.
+static bool read_deepseek4_engram(gguf_context * gctx, ggml_context * meta_ctx,
+                                  const std::string & prefix, uint32_t n_layer,
+                                  uint32_t n_vocab, DeepSeek4Weights::Engram & e,
+                                  std::string & err) {
+    auto key = [&](const char * name) { return prefix + name; };
+    std::vector<int32_t> layer_ids;
+    if (!get_i32_arr(gctx, key("layer_ids").c_str(), layer_ids, &err)) return false;
+    if (layer_ids.empty()) return true;
+    e.layer_ids.assign(layer_ids.begin(), layer_ids.end());
+    e.n_heads   = (int) get_u32_or(gctx, key("head_count").c_str(), 0);
+    e.key_len   = (int) get_u32_or(gctx, key("key_length").c_str(), 0);
+    e.max_ngram = (int) get_u32_or(gctx, key("max_ngram_size").c_str(), 0);
+    e.pad_id    = get_i32_or(gctx, key("pad_id").c_str(), -1);
+    if (!get_u64_arr(gctx, key("multipliers").c_str(), e.multipliers, &err) ||
+        !get_u64_arr(gctx, key("primes").c_str(), e.primes, &err) ||
+        !get_u64_arr(gctx, key("offsets").c_str(), e.offsets, &err) ||
+        !get_u64_arr(gctx, key("rows").c_str(), e.rows, &err) ||
+        !get_i32_arr(gctx, key("token_map").c_str(), e.token_map, &err)) {
+        return false;
+    }
+    int prev = -1;
+    for (int id : e.layer_ids) {
+        if (id < 0 || (uint32_t) id >= n_layer || id <= prev) {
+            err = "engram layer ids must be ascending and in range";
+            return false;
+        }
+        prev = id;
+    }
+    const size_t n_eng = e.layer_ids.size();
+    if (e.max_ngram == 0 && e.multipliers.size() % n_eng == 0) {
+        e.max_ngram = (int) (e.multipliers.size() / n_eng);
+    }
+    if (e.n_heads == 0 && e.max_ngram >= 2 &&
+        e.primes.size() % (n_eng * (size_t) (e.max_ngram - 1)) == 0) {
+        e.n_heads = (int) (e.primes.size() / (n_eng * (size_t) (e.max_ngram - 1)));
+    }
+    if (e.key_len == 0 && e.n_heads > 0 && e.max_ngram >= 2 && meta_ctx) {
+        // wkv takes the concatenated keys: ne[0] = cols * key_len.
+        const int64_t cols = (int64_t) (e.max_ngram - 1) * e.n_heads;
+        for (const char * suffix : {"engram_kv.weight", "engram_wkv.weight"}) {
+            const std::string name = "blk." + std::to_string(e.layer_ids[0]) + "." + suffix;
+            const ggml_tensor * wkv = ggml_get_tensor(meta_ctx, name.c_str());
+            if (wkv && wkv->ne[0] % cols == 0) {
+                e.key_len = (int) (wkv->ne[0] / cols);
+                break;
+            }
+        }
+    }
+    if (e.n_heads <= 0 || e.key_len <= 0 || e.max_ngram < 2) {
+        err = "engram geometry missing: head_count/key_length/max_ngram_size (and not derivable)";
+        return false;
+    }
+    const size_t cols = (size_t) (e.max_ngram - 1) * (size_t) e.n_heads;
+    if (e.offsets.empty() && e.primes.size() == n_eng * cols) {
+        // Bucket offsets are the running sum of the primes within each layer.
+        e.offsets.resize(n_eng * cols);
+        for (size_t l = 0; l < n_eng; ++l) {
+            uint64_t off = 0;
+            for (size_t c = 0; c < cols; ++c) {
+                e.offsets[l * cols + c] = off;
+                off += e.primes[l * cols + c];
+            }
+        }
+    }
+    if (e.multipliers.size() != n_eng * (size_t) e.max_ngram ||
+        e.primes.size() != n_eng * cols || e.offsets.size() != n_eng * cols) {
+        err = "engram hash arrays do not match the geometry (" + std::to_string(n_eng) +
+              " layers, max_ngram " + std::to_string(e.max_ngram) + ", " +
+              std::to_string(e.n_heads) + " heads)";
+        return false;
+    }
+    // A layer's table has exactly as many rows as the hash can address: the
+    // sum of that layer's primes.
+    std::vector<uint64_t> addressable(n_eng, 0);
+    for (size_t l = 0; l < n_eng; ++l) {
+        for (size_t c = 0; c < cols; ++c) addressable[l] += e.primes[l * cols + c];
+    }
+    if (e.rows.empty()) e.rows = addressable;
+    if (e.rows != addressable) {
+        err = "engram rows disagree with the sum of each layer's primes";
+        return false;
+    }
+    if (e.token_map.size() != n_vocab) {
+        err = "engram token_map has " + std::to_string(e.token_map.size()) +
+              " entries, expected n_vocab " + std::to_string(n_vocab);
+        return false;
+    }
+    for (int32_t t : e.token_map) {
+        if (t < 0) {
+            err = "engram token_map has a negative entry";
+            return false;
+        }
+    }
+    if (e.pad_id < 0) {
+        err = "engram pad_id missing";
+        return false;
+    }
+    for (size_t l = 0; l < n_eng; ++l) {
+        const std::string name = "blk." + std::to_string(e.layer_ids[l]) + ".engram_embd.weight";
+        const int64_t tid = gguf_find_tensor(gctx, name.c_str());
+        if (tid < 0) continue;
+        const ggml_tensor * t = meta_ctx ? ggml_get_tensor(meta_ctx, name.c_str()) : nullptr;
+        DeepSeek4Weights::Engram::Table tab;
+        tab.layer_id    = e.layer_ids[l];
+        tab.file_offset = (uint64_t) gguf_get_data_offset(gctx) + (uint64_t) gguf_get_tensor_offset(gctx, tid);
+        tab.ggml_type   = (int) gguf_get_tensor_type(gctx, tid);
+        if (t) {
+            tab.row_bytes = (uint32_t) ggml_row_size(t->type, t->ne[0]);
+            tab.rows      = (uint64_t) t->ne[1];
+        }
+        if (tab.rows != e.rows[l]) {
+            err = name + " has " + std::to_string(tab.rows) + " rows, the hash addresses " +
+                  std::to_string(e.rows[l]);
+            return false;
+        }
+        e.tables.push_back(tab);
+    }
+    return true;
+}
 
 // ─── Compute per-layer compression ratios (matches ds4.c logic) ─────────
 static std::vector<uint32_t> compute_compress_ratios(int n_layer) {
@@ -1455,50 +1809,111 @@ bool load_deepseek4_gguf_partial(const std::string & path,
             return false;
         }
         const char * arch = gguf_get_val_str(gctx, aid);
-        if (std::string(arch) != "deepseek4") {
-            set_last_error(std::string("unexpected arch: ") + arch + " (expected deepseek4)");
+        if (std::string(arch) != "deepseek4" && std::string(arch) != "deepseek41") {
+            set_last_error(std::string("unexpected arch: ") + arch + " (expected deepseek4 or deepseek41)");
             gguf_free(gctx);
             if (meta_ctx) ggml_free(meta_ctx);
             return false;
         }
+        out.arch = arch;
     }
-
-    static const char * kRequiredU32Keys[] = {
-        "deepseek4.block_count",
-        "deepseek4.embedding_length",
-        "deepseek4.attention.head_count",
-        "deepseek4.attention.head_count_kv",
-        "deepseek4.attention.key_length",
-        "deepseek4.rope.dimension_count",
-        "deepseek4.attention.q_lora_rank",
-        "deepseek4.attention.output_lora_rank",
-        "deepseek4.attention.output_group_count",
-        "deepseek4.expert_count",
-        "deepseek4.expert_used_count",
-        "deepseek4.expert_shared_count",
-        "deepseek4.expert_feed_forward_length",
-        "deepseek4.hash_layer_count",
-        "deepseek4.attention.sliding_window",
-        "deepseek4.attention.indexer.head_count",
-        "deepseek4.attention.indexer.key_length",
-        "deepseek4.attention.indexer.top_k",
-        "deepseek4.hyper_connection.count",
-        "deepseek4.hyper_connection.sinkhorn_iterations",
+    const bool is_v41 = out.arch == "deepseek41";
+    // Every model key is `<arch>.<name>`. Two converters write deepseek41 files:
+    // llama.cpp PR #28696 uses llama.cpp names (block_count, attention.head_count,
+    // ...) and antirez's DwarfStar converter uses the HF config names
+    // (num_hidden_layers, num_attention_heads, ...). key() returns whichever
+    // spelling the file carries, the llama.cpp one when neither does, so every
+    // read and every error message below stays in one vocabulary.
+    static const std::pair<const char *, const char *> kKeyAliases[] = {
+        {"block_count",                          "num_hidden_layers"},
+        {"embedding_length",                     "hidden_size"},
+        {"context_length",                       "max_position_embeddings"},
+        {"attention.head_count",                 "num_attention_heads"},
+        {"attention.head_count_kv",              "num_key_value_heads"},
+        {"attention.key_length",                 "head_dim"},
+        {"rope.dimension_count",                 "qk_rope_head_dim"},
+        {"attention.q_lora_rank",                "q_lora_rank"},
+        {"attention.output_lora_rank",           "o_lora_rank"},
+        {"attention.output_group_count",         "o_groups"},
+        {"expert_count",                         "n_routed_experts"},
+        {"expert_used_count",                    "num_experts_per_tok"},
+        {"expert_shared_count",                  "n_shared_experts"},
+        {"expert_feed_forward_length",           "moe_intermediate_size"},
+        {"attention.sliding_window",             "sliding_window"},
+        {"attention.indexer.head_count",         "index_n_heads"},
+        {"attention.indexer.key_length",         "index_head_dim"},
+        {"attention.indexer.top_k",              "index_topk"},
+        {"hyper_connection.count",               "hc_mult"},
+        {"hyper_connection.sinkhorn_iterations", "hc_sinkhorn_iters"},
+        {"hyper_connection.epsilon",             "hc_eps"},
+        {"rope.freq_base",                       "rope_theta"},
+        {"rope.scaling.factor",                  "rope_scaling.factor"},
+        {"rope.scaling.yarn_beta_fast",          "rope_scaling.beta_fast"},
+        {"rope.scaling.yarn_beta_slow",          "rope_scaling.beta_slow"},
+        {"rope.scaling.original_context_length", "rope_scaling.original_max_position_embeddings"},
+        {"attention.compress_rope_freq_base",    "compress_rope_theta"},
+        {"attention.layer_norm_rms_epsilon",     "rms_norm_eps"},
+        {"expert_weights_scale",                 "routed_scaling_factor"},
+        {"swiglu_clamp_exp",                     "swiglu_limit"},
+        {"attention.compress_ratios",            "compress_ratios"},
+        {"attention.kv_source_layers",           "kv_source_layer_ids"},
+        {"attention.index_source_layers",        "index_source_layer_ids"},
+        {"attention.candidate_source_layer",     "candidate_source_layer_id"},
+        {"attention.candidate_topk_blocks",      "candidate_topk_blocks"},
+        {"attention.candidate_block_size",       "candidate_block_size"},
     };
-    for (const char * key : kRequiredU32Keys) {
-        if (gguf_find_key(gctx, key) < 0) {
-            set_last_error(std::string("missing required key: ") + key);
-            gguf_free(gctx);
-            if (meta_ctx) ggml_free(meta_ctx);
-            return false;
+    const std::string P = out.arch + ".";
+    auto key = [&](const char * name) -> std::string {
+        std::string k = P + name;
+        if (gguf_find_key(gctx, k.c_str()) >= 0) return k;
+        for (const auto & a : kKeyAliases) {
+            if (std::strcmp(a.first, name) != 0) continue;
+            const std::string alt = P + a.second;
+            if (gguf_find_key(gctx, alt.c_str()) >= 0) return alt;
+        }
+        return k;
+    };
+    auto fail = [&](const std::string & msg) {
+        set_last_error(msg);
+        gguf_free(gctx);
+        if (meta_ctx) ggml_free(meta_ctx);
+        return false;
+    };
+
+    // hash_layer_count is optional (V4.1 has no hash-routed layers) and so is
+    // vocab_size (llama.cpp converters omit it; the token list says it).
+    static const char * kRequiredU32Keys[] = {
+        "block_count",
+        "embedding_length",
+        "attention.head_count",
+        "attention.head_count_kv",
+        "attention.key_length",
+        "rope.dimension_count",
+        "attention.q_lora_rank",
+        "attention.output_lora_rank",
+        "attention.output_group_count",
+        "expert_count",
+        "expert_used_count",
+        "expert_shared_count",
+        "expert_feed_forward_length",
+        "attention.sliding_window",
+        "attention.indexer.head_count",
+        "attention.indexer.key_length",
+        "attention.indexer.top_k",
+        "hyper_connection.count",
+        "hyper_connection.sinkhorn_iterations",
+    };
+    for (const char * name : kRequiredU32Keys) {
+        if (gguf_find_key(gctx, key(name).c_str()) < 0) {
+            return fail("missing required key: " + key(name));
         }
     }
 
     // ── Read hyperparameters ────────────────────────────────────────────
-    const uint32_t n_layer        = get_u32_or(gctx, "deepseek4.block_count", 43);
-    const uint32_t n_embd         = get_u32_or(gctx, "deepseek4.embedding_length", 4096);
+    const uint32_t n_layer        = get_u32_or(gctx, key("block_count").c_str(), 43);
+    const uint32_t n_embd         = get_u32_or(gctx, key("embedding_length").c_str(), 4096);
     // llama.cpp conversions carry no vocab_size key; the token list has the size.
-    uint32_t n_vocab = get_u32_or(gctx, "deepseek4.vocab_size", 0);
+    uint32_t n_vocab = get_u32_or(gctx, key("vocab_size").c_str(), 0);
     if (n_vocab == 0) {
         const int64_t tokens_key = gguf_find_key(gctx, "tokenizer.ggml.tokens");
         if (tokens_key >= 0 && gguf_get_kv_type(gctx, tokens_key) == GGUF_TYPE_ARRAY) {
@@ -1506,70 +1921,113 @@ bool load_deepseek4_gguf_partial(const std::string & path,
             if (n_tokens > 0 && n_tokens <= std::numeric_limits<int32_t>::max()) n_vocab = (uint32_t) n_tokens;
         }
     }
-    const uint32_t n_head         = get_u32_or(gctx, "deepseek4.attention.head_count", 64);
-    const uint32_t n_head_kv      = get_u32_or(gctx, "deepseek4.attention.head_count_kv", 1);
-    const uint32_t head_dim       = get_u32_or(gctx, "deepseek4.attention.key_length", 512);
-    const uint32_t n_rot          = get_u32_or(gctx, "deepseek4.rope.dimension_count", 64);
-    const uint32_t n_lora_q       = get_u32_or(gctx, "deepseek4.attention.q_lora_rank", 1024);
-    const uint32_t n_lora_o       = get_u32_or(gctx, "deepseek4.attention.output_lora_rank", 1024);
-    const uint32_t n_out_group    = get_u32_or(gctx, "deepseek4.attention.output_group_count", 8);
-    const uint32_t n_expert       = get_u32_or(gctx, "deepseek4.expert_count", 256);
-    const uint32_t n_expert_used  = get_u32_or(gctx, "deepseek4.expert_used_count", 6);
-    const uint32_t n_expert_shared = get_u32_or(gctx, "deepseek4.expert_shared_count", 1);
-    const uint32_t n_ff_exp       = get_u32_or(gctx, "deepseek4.expert_feed_forward_length", 2048);
-    const uint32_t n_hash_layer   = get_u32_or(gctx, "deepseek4.hash_layer_count", 3);
-    const uint32_t n_swa          = get_u32_or(gctx, "deepseek4.attention.sliding_window", 128);
-    const uint32_t n_indexer_head = get_u32_or(gctx, "deepseek4.attention.indexer.head_count", 64);
-    const uint32_t n_indexer_head_dim = get_u32_or(gctx, "deepseek4.attention.indexer.key_length", 128);
-    const uint32_t n_indexer_top_k = get_u32_or(gctx, "deepseek4.attention.indexer.top_k", 512);
-    const uint32_t n_hc           = get_u32_or(gctx, "deepseek4.hyper_connection.count", 4);
-    const uint32_t n_hc_sinkhorn  = get_u32_or(gctx, "deepseek4.hyper_connection.sinkhorn_iterations", 20);
+    const uint32_t n_head         = get_u32_or(gctx, key("attention.head_count").c_str(), 64);
+    const uint32_t n_head_kv      = get_u32_or(gctx, key("attention.head_count_kv").c_str(), 1);
+    const uint32_t head_dim       = get_u32_or(gctx, key("attention.key_length").c_str(), 512);
+    const uint32_t n_rot          = get_u32_or(gctx, key("rope.dimension_count").c_str(), 64);
+    const uint32_t n_lora_q       = get_u32_or(gctx, key("attention.q_lora_rank").c_str(), 1024);
+    const uint32_t n_lora_o       = get_u32_or(gctx, key("attention.output_lora_rank").c_str(), 1024);
+    const uint32_t n_out_group    = get_u32_or(gctx, key("attention.output_group_count").c_str(), 8);
+    const uint32_t n_expert       = get_u32_or(gctx, key("expert_count").c_str(), 256);
+    const uint32_t n_expert_used  = get_u32_or(gctx, key("expert_used_count").c_str(), 6);
+    const uint32_t n_expert_shared = get_u32_or(gctx, key("expert_shared_count").c_str(), 1);
+    const uint32_t n_ff_exp       = get_u32_or(gctx, key("expert_feed_forward_length").c_str(), 2048);
+    const uint32_t n_hash_layer   = get_u32_or(gctx, key("hash_layer_count").c_str(), 0);
+    const uint32_t n_swa          = get_u32_or(gctx, key("attention.sliding_window").c_str(), 128);
+    const uint32_t n_indexer_head = get_u32_or(gctx, key("attention.indexer.head_count").c_str(), 64);
+    const uint32_t n_indexer_head_dim = get_u32_or(gctx, key("attention.indexer.key_length").c_str(), 128);
+    const uint32_t n_indexer_top_k = get_u32_or(gctx, key("attention.indexer.top_k").c_str(), 512);
+    const uint32_t n_hc           = get_u32_or(gctx, key("hyper_connection.count").c_str(), 4);
+    const uint32_t n_hc_sinkhorn  = get_u32_or(gctx, key("hyper_connection.sinkhorn_iterations").c_str(), 20);
 
     // RoPE parameters
-    const float rope_freq_base    = get_f32_or(gctx, "deepseek4.rope.freq_base", 10000.0f);
-    const float rope_scale_factor = get_f32_or(gctx, "deepseek4.rope.scaling.factor", 16.0f);
-    const float rope_yarn_beta_fast = get_f32_or(gctx, "deepseek4.rope.scaling.yarn_beta_fast", 32.0f);
-    const float rope_yarn_beta_slow = get_f32_or(gctx, "deepseek4.rope.scaling.yarn_beta_slow", 1.0f);
-    const float compress_rope_freq_base = get_f32_or(gctx, "deepseek4.attention.compress_rope_freq_base", 160000.0f);
-    const uint64_t rope_orig_ctx  = get_u64_or(gctx, "deepseek4.rope.scaling.original_context_length", 65536);
+    const float rope_freq_base    = get_f32_or(gctx, key("rope.freq_base").c_str(), 10000.0f);
+    const float rope_scale_factor = get_f32_or(gctx, key("rope.scaling.factor").c_str(), 16.0f);
+    const float rope_yarn_beta_fast = get_f32_or(gctx, key("rope.scaling.yarn_beta_fast").c_str(), 32.0f);
+    const float rope_yarn_beta_slow = get_f32_or(gctx, key("rope.scaling.yarn_beta_slow").c_str(), 1.0f);
+    const float compress_rope_freq_base = get_f32_or(gctx, key("attention.compress_rope_freq_base").c_str(), 160000.0f);
+    const uint64_t rope_orig_ctx  = get_u64_or(gctx, key("rope.scaling.original_context_length").c_str(), 65536);
 
     // Other parameters
-    const float rms_eps           = get_f32_or(gctx, "deepseek4.attention.layer_norm_rms_epsilon", 1e-6f);
-    const float hc_eps            = get_f32_or(gctx, "deepseek4.hyper_connection.epsilon", 1e-6f);
-    const float expert_weight_scale = get_f32_or(gctx, "deepseek4.expert_weights_scale", 1.5f);
-    const float swiglu_clamp      = get_f32_or(gctx, "deepseek4.swiglu_clamp_exp", 10.0f);
+    const float rms_eps           = get_f32_or(gctx, key("attention.layer_norm_rms_epsilon").c_str(), 1e-6f);
+    const float hc_eps            = get_f32_or(gctx, key("hyper_connection.epsilon").c_str(), 1e-6f);
+    const float expert_weight_scale = get_f32_or(gctx, key("expert_weights_scale").c_str(), 1.5f);
+    const float swiglu_clamp      = get_f32_or(gctx, key("swiglu_clamp_exp").c_str(), 10.0f);
 
     if (n_vocab == 0) {
-        set_last_error("no vocabulary size: need deepseek4.vocab_size or tokenizer.ggml.tokens");
-        gguf_free(gctx);
-        if (meta_ctx) ggml_free(meta_ctx);
-        return false;
+        return fail("no vocabulary size: need " + key("vocab_size") + " or tokenizer.ggml.tokens");
     }
 
-    // Compression ratios from metadata (or compute default)
+    // Compression ratios from metadata (V4 may fall back to the fixed pattern;
+    // V4.1's 2-vs-1 split cannot be inferred, so the array is required).
     std::vector<uint32_t> compress_ratios_meta;
     std::string compress_ratios_err;
-    if (!get_u32_arr(gctx, "deepseek4.attention.compress_ratios",
+    if (!get_u32_arr(gctx, key("attention.compress_ratios").c_str(),
                      compress_ratios_meta, &compress_ratios_err)) {
-        set_last_error(compress_ratios_err);
-        gguf_free(gctx);
-        if (meta_ctx) ggml_free(meta_ctx);
-        return false;
+        return fail(compress_ratios_err);
     }
     std::vector<uint32_t> compress_ratios;
     if (compress_ratios_meta.size() == n_layer) {
         compress_ratios = compress_ratios_meta;
-    } else {
+    } else if (!is_v41) {
         compress_ratios = compute_compress_ratios((int)n_layer);
+    } else {
+        return fail(key("attention.compress_ratios") + " must list every layer (" +
+                    std::to_string(compress_ratios_meta.size()) + " of " +
+                    std::to_string(n_layer) + ")");
+    }
+    for (size_t il = 0; il < compress_ratios.size(); ++il) {
+        const uint32_t r = compress_ratios[il];
+        const bool ok = is_v41 ? (r == 0 || r == 1 || r == 2) : (r == 0 || r == 4 || r == 128);
+        if (!ok) {
+            return fail("layer " + std::to_string(il) + " compress ratio " + std::to_string(r) +
+                        " is not supported for " + out.arch);
+        }
+    }
+
+    // ── V4.1 source layers, candidates, Engram constants ───────────────
+    std::vector<int32_t> kv_source_ids, index_source_ids;
+    std::string arr_err;
+    if (!get_i32_arr(gctx, key("attention.kv_source_layers").c_str(), kv_source_ids, &arr_err) ||
+        !get_i32_arr(gctx, key("attention.index_source_layers").c_str(), index_source_ids, &arr_err)) {
+        return fail(arr_err);
+    }
+    const bool sources_declared = gguf_find_key(gctx, key("attention.kv_source_layers").c_str()) >= 0;
+    if (!sources_declared) {
+        // Infer from tensor presence (llama.cpp PR #28696 writes no lists).
+        for (uint32_t il = 0; il < n_layer; ++il) {
+            if (compress_ratios[il] == 0) continue;
+            char name[96];
+            std::snprintf(name, sizeof(name), "blk.%u.attn_compressor_kv.weight", il);
+            if (gguf_find_tensor(gctx, name) >= 0) kv_source_ids.push_back((int32_t) il);
+            std::snprintf(name, sizeof(name), "blk.%u.indexer.attn_q_b.weight", il);
+            if (gguf_find_tensor(gctx, name) >= 0) index_source_ids.push_back((int32_t) il);
+        }
+    }
+    const int32_t candidate_source_layer = get_i32_or(gctx, key("attention.candidate_source_layer").c_str(), -1);
+    const uint32_t candidate_topk_blocks = get_u32_or(gctx, key("attention.candidate_topk_blocks").c_str(), 0);
+    const uint32_t candidate_block_size = get_u32_or(gctx, key("attention.candidate_block_size").c_str(), 0);
+    if (candidate_source_layer >= 0 &&
+        ((uint32_t) candidate_source_layer >= n_layer || candidate_topk_blocks == 0 || candidate_block_size == 0)) {
+        return fail("candidate source layer " + std::to_string(candidate_source_layer) +
+                    " needs candidate_topk_blocks and candidate_block_size > 0 and a valid layer");
+    }
+
+    DeepSeek4Weights::Engram engram;
+    {
+        std::string engram_err;
+        if (!read_deepseek4_engram(gctx, meta_ctx, P + "engram.", n_layer, n_vocab, engram, engram_err)) {
+            return fail(engram_err);
+        }
     }
 
     const uint32_t kMissingSpecial = 0xFFFFFFFFu;
     const uint32_t raw_eos = get_u32_or(gctx, "tokenizer.ggml.eos_token_id", kMissingSpecial);
     const uint32_t raw_eot = get_u32_or(gctx, "tokenizer.ggml.eot_token_id", kMissingSpecial);
 
-    std::fprintf(stderr, "[deepseek4] model: layers=%u embd=%u heads=%u head_dim=%u "
+    std::fprintf(stderr, "[deepseek4] arch=%s model: layers=%u embd=%u heads=%u head_dim=%u "
                  "lora_q=%u lora_o=%u out_groups=%u\n",
-                 n_layer, n_embd, n_head, head_dim, n_lora_q, n_lora_o, n_out_group);
+                 out.arch.c_str(), n_layer, n_embd, n_head, head_dim, n_lora_q, n_lora_o, n_out_group);
     std::fprintf(stderr, "[deepseek4] moe: experts=%u used=%u shared=%u ff=%u hash_layers=%u\n",
                  n_expert, n_expert_used, n_expert_shared, n_ff_exp, n_hash_layer);
     std::fprintf(stderr, "[deepseek4] attention: swa=%u rot=%u indexer_heads=%u top_k=%u hc=%u\n",
@@ -1610,6 +2068,41 @@ bool load_deepseek4_gguf_partial(const std::string & path,
     out.swiglu_clamp_exp = swiglu_clamp;
     out.eos_id          = (raw_eos == kMissingSpecial) ? -1 : (int32_t)raw_eos;
     out.eos_chat_id     = (raw_eot == kMissingSpecial) ? -1 : (int32_t)raw_eot;
+    out.kv_source_layer_ids.assign(kv_source_ids.begin(), kv_source_ids.end());
+    out.index_source_layer_ids.assign(index_source_ids.begin(), index_source_ids.end());
+    out.candidate_source_layer = candidate_source_layer;
+    out.candidate_topk_blocks  = (int) candidate_topk_blocks;
+    out.candidate_block_size   = (int) candidate_block_size;
+    out.engram = std::move(engram);
+
+    // V4.1 dropped the per-head query norm, staggers the hyper-connection
+    // pre-mix and normalizes the HC mixes with norm_eps (model.py hc_mixes).
+    out.attn_q_head_norm = !is_v41;
+    out.hc_staggered_pre = is_v41;
+    if (is_v41) out.hc_eps = rms_eps;
+
+    {
+        std::string src_err;
+        if (!deepseek4_resolve_layer_sources(out, src_err)) {
+            return fail("compressed cache ownership: " + src_err);
+        }
+    }
+    if (out.shared_comp_cache) {
+        std::fprintf(stderr, "[deepseek4] compress_ratios=%s kv_sources=%s (%s) index_sources=%s\n",
+                     join_ints(compress_ratios).c_str(), join_ints(out.kv_source_layer_ids).c_str(),
+                     sources_declared ? "declared" : "inferred from tensors",
+                     join_ints(out.index_source_layer_ids).c_str());
+    }
+    if (out.candidate_source_layer >= 0) {
+        std::fprintf(stderr, "[deepseek4] candidates: source_layer=%d topk_blocks=%d block_size=%d\n",
+                     out.candidate_source_layer, out.candidate_topk_blocks, out.candidate_block_size);
+    }
+    if (out.engram.present()) {
+        std::fprintf(stderr, "[deepseek4] engram: layers=%s heads=%d key_len=%d max_ngram=%d rows=%s, "
+                     "%zu table(s) embedded in the GGUF (not mapped)\n",
+                     join_ints(out.engram.layer_ids).c_str(), out.engram.n_heads, out.engram.key_len,
+                     out.engram.max_ngram, join_ints(out.engram.rows).c_str(), out.engram.tables.size());
+    }
 
     out.layers.resize(n_layer);
     out.backend = backend;
@@ -1620,6 +2113,16 @@ bool load_deepseek4_gguf_partial(const std::string & path,
     if (plan.expert_metadata_only) {
         plan.load_output = false;
         plan.skip_expert_tensors = true;
+    }
+    // A shard must hold the compressed rows its layers read: a layer split may
+    // only cut where every reader's source is inside the same range.
+    for (int il = std::max(0, plan.layer_begin); il < plan.layer_end && il < (int) n_layer; ++il) {
+        const int src = deepseek4_kv_source_layer(out, il);
+        if (compress_ratios[(size_t) il] > 0 && (src < plan.layer_begin || src >= plan.layer_end)) {
+            return fail("layer range [" + std::to_string(plan.layer_begin) + ", " +
+                        std::to_string(plan.layer_end) + ") cuts a shared compressed cache: layer " +
+                        std::to_string(il) + " reads kv source layer " + std::to_string(src));
+        }
     }
 
     // ── Collect tensors for allocation ──────────────────────────────────
@@ -2002,6 +2505,15 @@ bool load_deepseek4_gguf_partial(const std::string & path,
         if (suffix == "indexer_compressor_kv.weight")   { L.indexer_compressor_kv = a.tensor; continue; }
         if (suffix == "indexer_compressor_gate.weight") { L.indexer_compressor_gate = a.tensor; continue; }
         if (suffix == "indexer_compressor_norm.weight") { L.indexer_compressor_norm = a.tensor; continue; }
+        // V4.1 index keys from the latent (kv source layers that are index sources)
+        if (suffix == "indexer.attn_k.weight")        { L.indexer_k = a.tensor; continue; }
+        if (suffix == "indexer.k_norm.weight")        { L.indexer_k_norm = a.tensor; continue; }
+
+        // Engram (V4.1 engram layers; engram_embd is filtered out above).
+        // llama.cpp PR #28696 names first, DwarfStar names second.
+        if (suffix == "engram_q.weight"   || suffix == "engram_q_norm.weight") { L.engram_q = a.tensor; continue; }
+        if (suffix == "engram_k.weight"   || suffix == "engram_k_norm.weight") { L.engram_k = a.tensor; continue; }
+        if (suffix == "engram_wkv.weight" || suffix == "engram_kv.weight")     { L.engram_wkv = a.tensor; continue; }
 
         // HC attention
         if (suffix == "hc_attn_fn.weight")         { L.hc_attn_fn = a.tensor; continue; }

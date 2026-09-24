@@ -8,9 +8,17 @@
 //   - Indexer: on ratio-4 layers, learned scorer selects top-k compressed rows.
 //   - HC: Hierarchical Controller with 4 parallel residual streams, mixed via
 //     Sinkhorn-normalized combine matrices at each sublayer.
-//   - MoE: 256 routed experts (top-6) + 1 shared expert per layer.
-//     First 3 layers use hash-based routing (token_id → expert_ids).
+//   - MoE: routed experts (top-6, 256 in V4 / 384 in V4.1) + 1 shared expert
+//     per layer. V4's first 3 layers use hash-based routing (token_id → expert_ids).
 //   - RoPE: partial rotation (64 of 512 dims), YaRN scaling.
+//
+// DeepSeek V4.1 Flash ("deepseek41") shares every struct here. Its deltas:
+// compress ratios 2 (layers 2-19) and 1 (20-39) with the compressed rows
+// owned by a few kv source layers and read by the layers after them, index
+// keys derived from the attention latent at those sources, no per-head query
+// norm, a staggered hyper-connection pre-mix, candidate block pre-selection,
+// and the Engram n-gram memory on two layers. See docs/DS41.md for what the
+// runtime implements today.
 
 #pragma once
 
@@ -117,16 +125,29 @@ struct DeepSeek4Layer {
     ggml_tensor * attn_compressor_gate = nullptr;  // [n_embd, comp_width] score/gating
     ggml_tensor * attn_compressor_norm = nullptr;  // [head_dim] post-pool RMS norm
 
-    // ── Indexer (ratio-4 layers only) ────────────────────────────────
+    // ── Indexer (V4: ratio-4 layers; V4.1: index source layers) ──────
     // Selects which compressed rows to attend via top-k scoring.
     ggml_tensor * indexer_attn_q_b     = nullptr;  // [n_lora_q, n_indexer_head * indexer_head_dim]
     ggml_tensor * indexer_proj         = nullptr;  // [n_embd, n_indexer_head] head weight projection
 
-    // Indexer has its own compressor for the indexer key cache
+    // V4: the indexer has its own compressor for the indexer key cache.
     ggml_tensor * indexer_compressor_ape  = nullptr;
     ggml_tensor * indexer_compressor_kv   = nullptr;
     ggml_tensor * indexer_compressor_gate = nullptr;
     ggml_tensor * indexer_compressor_norm = nullptr;
+
+    // V4.1: index keys are rope_tail(rms_norm(indexer_k · latent)) of the
+    // compressed latent, written at kv source layers that are index sources.
+    ggml_tensor * indexer_k            = nullptr;  // [head_dim, indexer_head_dim]
+    ggml_tensor * indexer_k_norm       = nullptr;  // [indexer_head_dim]
+
+    // ── Engram (V4.1 engram layers only) ─────────────────────────────
+    // The hash table itself (blk.N.engram_embd) is never loaded; its rows are
+    // read on demand (deepseek4_engram.h). TODO(deepseek41): apply on the
+    // layer input of every HC copy.
+    ggml_tensor * engram_q             = nullptr;  // [n_embd, n_hc]
+    ggml_tensor * engram_k             = nullptr;  // [n_embd, n_hc]
+    ggml_tensor * engram_wkv           = nullptr;  // [n_hash_cols * key_len, n_embd * (n_hc + 1)]
 
     // ── HC Attention ─────────────────────────────────────────────────
     ggml_tensor * hc_attn_fn         = nullptr;  // [n_hc * n_embd, hc_mix_dim] F16
@@ -186,6 +207,9 @@ struct DeepSeek4Weights {
     CpuEmbedder embedder;
 
     // ── Architecture metadata ────────────────────────────────────────
+    // Model family, general.architecture: "deepseek4" (V4 Flash) or
+    // "deepseek41" (V4.1 Flash). Metadata keys are read as `arch + "."`.
+    std::string arch      = "deepseek4";
     int n_layer           = 43;
     int n_embd            = 4096;
     int n_vocab           = 129280;
@@ -217,8 +241,62 @@ struct DeepSeek4Weights {
     int n_hc              = 4;
     int n_hc_sinkhorn_iter = 20;
 
-    // Per-layer compression ratios (0 = no compression, 4 or 128)
+    // Per-layer compression ratios (0 = no compression; V4: 4 or 128;
+    // V4.1: 2 or 1).
     std::vector<uint32_t> compress_ratios;
+
+    // Compressed-cache ownership. Every compressing layer keeps its ratio, but
+    // only kv source layers run a compressor and write compressed rows; the
+    // layers after a source read that source's rows. Index source layers score
+    // the shared index keys and hand their top-k to the layers after them.
+    // V4 declares no sources: every compressing layer is its own kv source and
+    // every ratio-4 layer its own index source, so every kv_src[il] == il.
+    std::vector<int>     kv_source_layer_ids;     // declared or inferred, ascending
+    std::vector<int>     index_source_layer_ids;
+    std::vector<int>     kv_src;                  // per layer: owner of its compressed rows
+    std::vector<int>     idx_src;                 // per layer: owner of its top-k
+    std::vector<uint8_t> kv_source_flags;         // per layer: is a kv source
+    std::vector<uint8_t> index_source_flags;      // per layer: is an index source
+    bool shared_comp_cache = false;               // some layer reads another layer's rows
+
+    // Forward-pass rules that differ between the families (set by the loader).
+    bool attn_q_head_norm = true;    // unit-RMS per query head after wq_b (V4 only)
+    bool hc_staggered_pre = false;   // V4.1 pre-mix: see ds4_hc_collapse in the graph
+
+    // Candidate block pre-selection (V4.1): the index sources after
+    // candidate_source_layer restrict their top-k to the candidate blocks
+    // that layer selected. -1 = off. TODO(deepseek41): an exact no-op until
+    // more than candidate_topk_blocks * candidate_block_size compressed rows.
+    int candidate_source_layer = -1;
+    int candidate_topk_blocks  = 0;
+    int candidate_block_size   = 0;
+
+    // Engram n-gram hash memory (V4.1): hash constants as written by the
+    // converter (deepseek41.engram.*) and where each layer's table lives.
+    struct Engram {
+        std::vector<int>      layer_ids;
+        int                   n_heads   = 0;
+        int                   key_len   = 0;
+        int                   max_ngram = 0;
+        std::vector<uint64_t> multipliers;  // [n_engram_layers * max_ngram]
+        std::vector<uint64_t> primes;       // [n_engram_layers * (max_ngram - 1) * n_heads]
+        std::vector<uint64_t> offsets;      // same shape as primes
+        std::vector<int32_t>  token_map;    // [n_vocab] compressed token ids
+        int32_t               pad_id = -1;  // already compressed
+        std::vector<uint64_t> rows;         // [n_engram_layers] table rows = sum of that layer's primes
+        // Where each layer's table lives when the GGUF embeds it
+        // (blk.N.engram_embd, I8 [row_bytes, rows]: 256 E4M3 + 8 E8M0 block
+        // scales per row). Never mapped; rows are pread on demand.
+        struct Table {
+            int      layer_id    = -1;
+            uint64_t file_offset = 0;   // absolute byte offset in the GGUF
+            uint64_t rows        = 0;
+            uint32_t row_bytes   = 0;
+            int      ggml_type   = -1;  // ggml_type of the tensor as stored
+        };
+        std::vector<Table>    tables;
+        bool present() const { return !layer_ids.empty(); }
+    } engram;
 
     // RoPE
     float rope_freq_base        = 10000.0f;
@@ -230,7 +308,7 @@ struct DeepSeek4Weights {
 
     // Norms
     float rms_eps         = 1.0e-6f;
-    float hc_eps          = 1.0e-6f;
+    float hc_eps          = 1.0e-6f;   // RMS eps of the HC mixes (V4.1: rms_eps)
 
     // SwiGLU
     float swiglu_clamp_exp = 10.0f;
@@ -258,6 +336,28 @@ inline bool ds4_image_capable(const DeepSeek4Weights & w) {
 inline bool deepseek4_is_eos_tok(int tok, const DeepSeek4Weights & w) {
     return (w.eos_chat_id >= 0 && tok == w.eos_chat_id)
         || (w.eos_id >= 0 && tok == w.eos_id);
+}
+
+// Source-layer indirection. The loader always fills the arrays; weights built
+// by hand (tests) fall back to the V4 rule: every compressing layer owns its
+// rows and the ratio-4 layers carry the indexer.
+inline bool deepseek4_is_kv_source(const DeepSeek4Weights & w, int il) {
+    if (il < 0 || (size_t) il >= w.compress_ratios.size()) return false;
+    if (w.kv_source_flags.empty()) return w.compress_ratios[(size_t) il] > 0;
+    return w.kv_source_flags[(size_t) il] != 0;
+}
+inline bool deepseek4_is_index_source(const DeepSeek4Weights & w, int il) {
+    if (il < 0 || (size_t) il >= w.compress_ratios.size()) return false;
+    if (w.index_source_flags.empty()) return w.compress_ratios[(size_t) il] == 4;
+    return w.index_source_flags[(size_t) il] != 0;
+}
+// Layer whose compressed rows (and index keys) `il` attends over.
+inline int deepseek4_kv_source_layer(const DeepSeek4Weights & w, int il) {
+    return (il >= 0 && (size_t) il < w.kv_src.size()) ? w.kv_src[(size_t) il] : il;
+}
+// Layer whose top-k `il` reuses. TODO(deepseek41): carry the top-k.
+inline int deepseek4_index_source_layer(const DeepSeek4Weights & w, int il) {
+    return (il >= 0 && (size_t) il < w.idx_src.size()) ? w.idx_src[(size_t) il] : il;
 }
 
 // ─── KV Cache ───────────────────────────────────────────────────────────
