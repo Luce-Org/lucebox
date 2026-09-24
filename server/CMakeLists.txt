@@ -505,9 +505,11 @@ add_library(luce_common STATIC
     src/gemma4/gemma4_daemon.cpp
     src/gemma4/gemma4_dflash_target.cpp
     src/gemma4/gemma4_layer_split_adapter.cpp
-    # DeepSeek V4 Flash target arch
+    # DeepSeek V4 Flash target arch (and V4.1 Flash)
     src/deepseek4/deepseek4_loader.cpp
     src/deepseek4/deepseek4_graph.cpp
+    src/deepseek4/deepseek4_engram.cpp
+    src/deepseek4/deepseek4_engram_apply.cpp
     src/deepseek4/deepseek4_snapshot.cpp
     src/deepseek4/deepseek4_roctx.cpp
     src/deepseek4/deepseek4_paged_cache.cpp
@@ -1782,6 +1784,16 @@ if(LUCE_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/src)
         list(APPEND _raw_unit_test_targets test_paged_kv_pool)
     endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ds4_engram.cpp")
+        # DeepSeek V4.1 Engram addressing and row decode: host only, no ggml or GPU.
+        add_executable(test_ds4_engram
+            test/test_ds4_engram.cpp
+            src/deepseek4/deepseek4_engram.cpp)
+        target_include_directories(test_ds4_engram PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        find_package(Threads REQUIRED)
+        target_link_libraries(test_ds4_engram PRIVATE Threads::Threads)
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_seq_slot_manager.cpp")
         # Host-side slot bookkeeping test (concurrent serving): no GPU.
         add_executable(test_seq_slot_manager
@@ -2313,6 +2325,7 @@ if(LUCE_TESTS)
         test_rms_norm_hip
         test_rope_tail
         test_paged_kv_pool
+        test_ds4_engram
         test_rocmfp3_mix_registry
         test_rocmfp_mix_slice_matvec
         test_rocmfp_mix_gateup_glu
