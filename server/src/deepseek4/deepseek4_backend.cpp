@@ -1323,6 +1323,28 @@ bool DeepSeek4Backend::validate_model_features() const {
                      unsupported, w_.arch.c_str());
         return false;
     }
+    // Paged V4.1 serving is qualified with the default expert-owner kernels
+    // only: with these switches it has faulted the GPU (see DS41.md, known
+    // limits), so refuse them until that is understood.
+    if (cfg_.paged_attention) {
+        static const char * const unqualified[] = {
+            "LUCE_DS4_TP_GROUPED_MMVQ", "LUCE_MOE_TP_GROUPED_MMVQ", "LUCE_MMID_GROUPED",
+            "LUCE_DS4_TP_NATIVE_ROUTE_WIDTH", "LUCE_DS4_TP_MASKED_ROUTES",
+            "LUCE_DS4_TP_BATCH_SPLIT_COPIES", "GGML_CUDA_BATCH_PEER_COPIES", "GGML_BATCH_PEER_COPIES",
+            "LUCE_DS4_TP_DEVICE_JOIN", "LUCE_MOE_TP_DEVICE_JOIN", "LUCE_DS4_TP_DEVICE_JOIN_SPLIT",
+            "LUCE_DS4_TP_FUSED_HC_JOIN", "LUCE_DS4_TP_ROUTE_PREFORK", "LUCE_MOE_TP_ROUTE_PREFORK",
+            "LUCE_DS4_TP_COARSE_OWNER", "LUCE_MOE_TP_COARSE_OWNER", "LUCE_DS4_TP_MAIN_ROUTE_WEIGHTS",
+            "LUCE_CUDA_MMVQ_MOE_ROWS_PER_BLOCK",
+        };
+        for (const char * name : unqualified) {
+            if (env_flag_enabled(name)) {
+                std::fprintf(stderr, "[deepseek4] %s is not qualified with paged serving of %s "
+                             "(see server/docs/DS41.md); unset it or drop --paged-attention\n",
+                             name, w_.arch.c_str());
+                return false;
+            }
+        }
+    }
     if (w_.engram.present()) {
         std::fprintf(stderr, "[deepseek4] %s: the Engram layers run without their n-gram memory "
                      "and compressed attention is dense (see server/docs/DS41.md)\n", w_.arch.c_str());
@@ -2016,16 +2038,6 @@ bool DeepSeek4Backend::init() {
             "compute callback; select in-process LUCE_DS4_MOE_TP or disable paged attention\n");
         return false;
     }
-    // Streamed experts are served inside the gathered graph by the device
-    // cache (a third owner answered through its mailbox).
-    if (cfg_.paged_attention && moe_hybrid_ &&
-        moe_hybrid_->streams_cold_experts() && !moe_hybrid_->expert_cache) {
-        std::fprintf(stderr,
-            "[deepseek4] paged serving requires statically materialized "
-            "expert ownership or the streamed expert cache; enable in-process "
-            "LUCE_DS4_MOE_TP\n");
-        return false;
-    }
 
     if (const char * stats_path = std::getenv("LUCE_DS4_ROUTING_STATS_OUT")) {
         if (*stats_path) {
@@ -2095,8 +2107,101 @@ bool DeepSeek4Backend::init() {
             std::fprintf(stderr, "[deepseek4] LUCE_DS4_SPEC set but LUCE_DS4_DRAFT gguf missing\n");
         }
     }
+    if (!init_streamed_expert_tier() || !check_device_headroom()) return false;
     image_capable_ = vision_ != nullptr;
     return true;
+}
+
+// Free memory a device must keep after every persistent allocation: room for
+// the graph compute buffers allocated at the first request, and on an APU for
+// the driver, so no allocation spills past the carve into shared (SVM) memory.
+static size_t ds4_device_headroom_bytes(int device) {
+    cudaDeviceProp prop{};
+    const bool integrated = cudaGetDeviceProperties(&prop, device) == cudaSuccess && prop.integrated;
+    return integrated ? ((size_t) 4 << 30) : ((size_t) 3 << 29);
+}
+
+// Streamed expert cache and expert promotion, sized from what is left after
+// the model, the owner stacks, the caches and the drafter are in place.
+bool DeepSeek4Backend::init_streamed_expert_tier() {
+    MoeHybridStorage * hybrid = moe_hybrid_.get();
+    if (!hybrid || !hybrid->stream_engine || stream_cache_device_ < 0) return true;
+    std::string err;
+    // LUCE_EXPERT_STREAM_DEVICE overrides the device; LUCE_EXPERT_STREAM_CACHE_MB
+    // caps the cache (0 keeps the uncached path). The cache never takes the
+    // device's headroom: a larger request is shrunk to fit.
+    MoeExpertCacheOptions cache_opts;
+    cache_opts.device = stream_cache_device_;
+    if (const char * v = std::getenv("LUCE_EXPERT_STREAM_DEVICE"); v && *v) {
+        cache_opts.device = std::atoi(v);
+    }
+    cache_opts.reserve_bytes = ds4_device_headroom_bytes(cache_opts.device);
+    const char * cache_mb = std::getenv("LUCE_EXPERT_STREAM_CACHE_MB");
+    const bool disabled = cache_mb && *cache_mb && std::atoll(cache_mb) == 0;
+    if (!disabled) {
+        size_t free_b = 0, total_b = 0;
+        ggml_backend_cuda_get_device_memory(cache_opts.device, &free_b, &total_b);
+        const size_t fits = free_b > cache_opts.reserve_bytes ? free_b - cache_opts.reserve_bytes : 0;
+        cache_opts.pool_bytes = fits;
+        if (cache_mb && *cache_mb) {
+            const size_t want = (size_t) std::atoll(cache_mb) << 20;
+            if (want > fits) {
+                std::fprintf(stderr, "[deepseek4] LUCE_EXPERT_STREAM_CACHE_MB=%s does not fit device %d "
+                             "with %.1f GiB headroom; using %.2f GiB\n", cache_mb, cache_opts.device,
+                             cache_opts.reserve_bytes / 1073741824.0, fits / 1073741824.0);
+            }
+            cache_opts.pool_bytes = std::min(want, fits);
+        }
+        if (cache_opts.pool_bytes > 0 &&
+            init_deepseek4_streamed_expert_cache(w_, *hybrid, cache_opts, expert_cache_, &err)) {
+            hybrid->expert_cache = &expert_cache_;
+            // Start with the most used streamed experts resident; the
+            // loaders fill the pool while the server comes up.
+            MoeHybridRoutingStats usage;
+            const char * usage_path = ds4_usage_profile_path();
+            std::string usage_err;
+            if (usage_path && MoeHybridRoutingStats::load_csv(usage_path, usage, &usage_err)) {
+                expert_cache_.warm(usage);
+            }
+        } else {
+            std::fprintf(stderr, "[deepseek4] streamed expert cache disabled: %s\n",
+                         cache_opts.pool_bytes ? err.c_str() : "no room left on the device");
+        }
+    }
+    if (cfg_.paged_attention && hybrid->streams_cold_experts() && !hybrid->expert_cache) {
+        std::fprintf(stderr,
+            "[deepseek4] paged serving requires statically materialized "
+            "expert ownership or the streamed expert cache\n");
+        return false;
+    }
+    return true;
+}
+
+// Logs every device's memory once everything persistent is allocated and
+// refuses a configuration that leaves less than the device's headroom, rather
+// than let the driver overcommit it at the first request.
+bool DeepSeek4Backend::check_device_headroom() const {
+    std::vector<int> devices = {cfg_.device.gpu};
+    if (stream_cache_device_ >= 0 && stream_cache_device_ != cfg_.device.gpu) {
+        devices.push_back(stream_cache_device_);
+    }
+    bool ok = true;
+    for (int device : devices) {
+        size_t free_b = 0, total_b = 0;
+        ggml_backend_cuda_get_device_memory(device, &free_b, &total_b);
+        const size_t need = ds4_device_headroom_bytes(device);
+        std::fprintf(stderr, "[deepseek4] device %d memory: %.2f of %.2f GiB used, %.2f GiB free "
+                     "(headroom %.2f GiB)%s\n", device, (total_b - free_b) / 1073741824.0,
+                     total_b / 1073741824.0, free_b / 1073741824.0, need / 1073741824.0,
+                     free_b < need ? ": does not fit" : "");
+        ok = ok && free_b >= need;
+    }
+    if (!ok) {
+        std::fprintf(stderr, "[deepseek4] the configuration does not fit the devices with their "
+                     "headroom; lower LUCE_EXPERT_BUDGET_MB / LUCE_EXPERT_SECONDARY_BUDGET_MB, "
+                     "--kv-pool-tokens or --max-ctx\n");
+    }
+    return ok;
 }
 
 bool DeepSeek4Backend::init_moe_tensor_parallel() {
@@ -2721,34 +2826,10 @@ bool DeepSeek4Backend::init_hybrid_model() {
                      stream_engine_.scratch_bytes() / 1024.0 / 1024.0);
         hybrid->stream_engine = &stream_engine_;
 
-        // Streamed experts go through a device cache on the secondary GPU
-        // when there is one: it reads host memory at local speed while the
-        // primary sits behind a narrower link. LUCE_EXPERT_STREAM_DEVICE
-        // overrides; LUCE_EXPERT_STREAM_CACHE_MB sizes the cache (default:
-        // the device's free memory minus 2 GiB), 0 keeps the uncached path.
-        MoeExpertCacheOptions cache_opts;
-        cache_opts.device = inprocess_tp && tp.secondary_backend == local_kind
+        // The device cache for streamed experts is sized last, after every
+        // other allocation (init_streamed_expert_tier).
+        stream_cache_device_ = inprocess_tp && tp.secondary_backend == local_kind
             ? tp.secondary_gpu : cfg_.device.gpu;
-        if (const char * v = std::getenv("LUCE_EXPERT_STREAM_DEVICE"); v && *v) {
-            cache_opts.device = std::atoi(v);
-        }
-        const char * cache_mb = std::getenv("LUCE_EXPERT_STREAM_CACHE_MB");
-        if (cache_mb && *cache_mb) cache_opts.pool_bytes = (size_t) std::atoll(cache_mb) << 20;
-        if (!(cache_mb && *cache_mb && cache_opts.pool_bytes == 0)) {
-            if (init_deepseek4_streamed_expert_cache(w_, *hybrid, cache_opts, expert_cache_, &err)) {
-                hybrid->expert_cache = &expert_cache_;
-                // Start with the most used streamed experts resident; the
-                // loaders fill the pool while the server comes up.
-                MoeHybridRoutingStats usage;
-                const char * usage_path = ds4_usage_profile_path();
-                std::string usage_err;
-                if (usage_path && MoeHybridRoutingStats::load_csv(usage_path, usage, &usage_err)) {
-                    expert_cache_.warm(usage);
-                }
-            } else {
-                std::fprintf(stderr, "[deepseek4] streamed expert cache disabled: %s\n", err.c_str());
-            }
-        }
     }
 
     moe_hybrid_ = std::move(hybrid);
@@ -2914,6 +2995,8 @@ bool DeepSeek4Backend::unpark(ParkTarget target) {
             return false;
         }
     }
+    // A restored target sizes its streamed expert tier last again.
+    if (moe_hybrid_ && !expert_cache_.ready() && !init_streamed_expert_tier()) return false;
     cache_.prefill_mode = cfg_.prefill_mode;
     return true;
 }

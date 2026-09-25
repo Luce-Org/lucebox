@@ -217,6 +217,8 @@ private:
 
     bool load_model();
     bool init_hybrid_model();
+    bool init_streamed_expert_tier();
+    bool check_device_headroom() const;
     bool requires_monolithic_model() const;
     bool validate_prefill_mode() const;
     bool validate_model_features() const;
@@ -238,6 +240,7 @@ private:
     MoeHybridPlacement                moe_decode_placement_;
     MoeHybridStreamEngine             stream_engine_;
     MoeStreamedExpertCache            expert_cache_;
+    int                               stream_cache_device_ = -1;
     MoeExpertComputeRuntime            expert_runtime_;
     std::shared_ptr<MoeHybridRoutingStats> routing_stats_;
     std::string                       routing_stats_out_path_;

@@ -867,6 +867,51 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
+// Large host<->device copies go through a pinned staging buffer of this thread
+// instead of letting the runtime pin the caller's pages (on ROCm a pageable
+// transfer registers them as userptr memory, which the kernel must keep
+// restoring while the page cache churns, e.g. when the source is a mapped
+// model file). Small copies keep the direct path.
+static constexpr size_t GGML_CUDA_STAGED_COPY_MIN = (size_t) 1 << 20;
+static constexpr size_t GGML_CUDA_STAGED_COPY_CHUNK = (size_t) 16 << 20;
+
+static char * ggml_cuda_copy_staging(int slot) {
+    thread_local char * staging[2] = {nullptr, nullptr};
+    if (!staging[slot]) {
+        void * ptr = nullptr;
+        CUDA_CHECK(cudaMallocHost(&ptr, GGML_CUDA_STAGED_COPY_CHUNK));
+        staging[slot] = (char *) ptr;
+    }
+    return staging[slot];
+}
+
+static void ggml_cuda_staged_h2d(char * dst, const char * src, size_t size) {
+    // Two buffers: fill one while the other uploads.
+    cudaEvent_t done[2] = {nullptr, nullptr};
+    for (int i = 0; i < 2; ++i) CUDA_CHECK(cudaEventCreateWithFlags(&done[i], cudaEventDisableTiming));
+    for (size_t at = 0, k = 0; at < size; at += GGML_CUDA_STAGED_COPY_CHUNK, ++k) {
+        const int slot = (int) (k & 1);
+        const size_t n = std::min(GGML_CUDA_STAGED_COPY_CHUNK, size - at);
+        char * staging = ggml_cuda_copy_staging(slot);
+        if (k >= 2) CUDA_CHECK(cudaEventSynchronize(done[slot]));
+        memcpy(staging, src + at, n);
+        CUDA_CHECK(cudaMemcpyAsync(dst + at, staging, n, cudaMemcpyHostToDevice, cudaStreamPerThread));
+        CUDA_CHECK(cudaEventRecord(done[slot], cudaStreamPerThread));
+    }
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    for (int i = 0; i < 2; ++i) CUDA_CHECK(cudaEventDestroy(done[i]));
+}
+
+static void ggml_cuda_staged_d2h(char * dst, const char * src, size_t size) {
+    char * staging = ggml_cuda_copy_staging(0);
+    for (size_t at = 0; at < size; at += GGML_CUDA_STAGED_COPY_CHUNK) {
+        const size_t n = std::min(GGML_CUDA_STAGED_COPY_CHUNK, size - at);
+        CUDA_CHECK(cudaMemcpyAsync(staging, src + at, n, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+        memcpy(dst + at, staging, n);
+    }
+}
+
 static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
@@ -905,6 +950,10 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
         }
         return;
     }
+    if (size >= GGML_CUDA_STAGED_COPY_MIN) {
+        ggml_cuda_staged_h2d((char *) tensor->data + offset, (const char *) data, size);
+        return;
+    }
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -913,6 +962,10 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    if (size >= GGML_CUDA_STAGED_COPY_MIN && !ctx->is_managed) {
+        ggml_cuda_staged_d2h((char *) data, (const char *) tensor->data + offset, size);
+        return;
+    }
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
