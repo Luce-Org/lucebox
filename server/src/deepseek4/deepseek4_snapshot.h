@@ -39,7 +39,10 @@ struct DeepSeek4SnapshotAux {
 // Layout of DeepSeek4Snapshot::meta_snap (I32):
 //   [0] version, [1] n_layer, [2] n_vocab, [3] n_spec_feat, [4] cur_pos,
 //   then per layer: n_comp, n_index_comp.
-constexpr int kDeepSeek4SnapMetaVersion = 1;
+// Version 2 carries the per-layer geometry of shared compressed caches
+// (V4.1): compressed rows only at kv sources, no compressor state at ratio-1
+// sources, index rows at the kv sources that are index sources.
+constexpr int kDeepSeek4SnapMetaVersion = 2;
 constexpr int kDeepSeek4SnapMetaBase = 5;
 
 // Metadata recovered by deepseek4_snapshot_bind().

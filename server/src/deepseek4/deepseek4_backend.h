@@ -190,10 +190,27 @@ private:
                                            int snapshot_capture_from,
                                            int snapshot_capture_to);
 
+    // Batched mixed-owner prefill: per-token scratch on the target and on the
+    // second owner's GPU, the chunk that fits a device, and the chunk length at
+    // `pos` that stops at the next restore point.
+    struct HybridPrefillScratch {
+        size_t target = 0;
+        size_t second = 0;
+    };
+    static HybridPrefillScratch hybrid_prefill_scratch_per_token(
+        const DeepSeek4Weights & w, int max_ctx, int chunk);
+    static int hybrid_prefill_fit_tokens(size_t free_bytes, size_t keep_bytes,
+                                         size_t per_token_bytes);
+    static int restore_safe_prefill_tokens(int pos, int requested_tokens,
+                                           const std::vector<int> & restore_points);
+
     // Prefill prompt tokens in chunks, return absolute committed position.
+    // A batched prefill starts a chunk at every absolute `restore_points`
+    // position (see GenerateRequest::restore_points).
     int do_prefill(const std::vector<int32_t> & tokens, const DaemonIO & io,
                    int kv_offset = 0, int snap_slot = -1, int snap_pos = -1,
-                   const DeepSeek4ImagePrompt * images = nullptr);
+                   const DeepSeek4ImagePrompt * images = nullptr,
+                   const std::vector<int> & restore_points = {});
     bool load_vision();
     bool init_single_gpu_vision();
     bool materialize_images(const DeepSeek4ImagePrompt & images,
@@ -219,6 +236,7 @@ private:
     bool init_hybrid_model();
     bool init_streamed_expert_tier();
     bool check_device_headroom() const;
+    void size_hybrid_prefill_chunk();
     bool requires_monolithic_model() const;
     bool validate_prefill_mode() const;
     bool validate_model_features() const;

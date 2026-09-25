@@ -3647,6 +3647,24 @@ static void test_monolithic_snapshot_disk_roundtrip() {
         TEST_ASSERT(backend.snapshot_used(6));
         TEST_ASSERT(backend.snapshots_[6].owns_storage);
     }
+    // Snapshots carry the current format version; an older one is refused.
+    {
+        const ModelBackend::SnapshotRef good = backend.snapshot_ref(5);
+        ggml_context * old_ctx = nullptr;
+        ggml_backend_buffer_t old_buf = nullptr;
+        TEST_ASSERT(clone_snapshot_context_like_disk_reader(good.ctx, &old_ctx, &old_buf));
+        ggml_tensor * meta = ggml_get_tensor(old_ctx, kDeepSeek4SnapMetaName);
+        TEST_ASSERT(meta != nullptr);
+        int32_t version = 0;
+        ggml_backend_tensor_get(meta, &version, 0, sizeof(version));
+        TEST_ASSERT(version == kDeepSeek4SnapMetaVersion && version >= 2);
+        version = 1;
+        ggml_backend_tensor_set(meta, &version, 0, sizeof(version));
+        TEST_ASSERT(!backend.snapshot_adopt(7, old_ctx, old_buf, good.cur_pos, -1));
+        TEST_ASSERT(!backend.snapshot_used(7));
+        ggml_backend_buffer_free(old_buf);
+        ggml_free(old_ctx);
+    }
 
     for (int i = 0; i < 8; ++i) backend.snapshot_free(i);
     remove_test_disk_cache_dir(dir);
@@ -3803,17 +3821,87 @@ static void test_spec_feature_tail_is_bounded() {
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
+static void test_prefill_restore_points() {
+    std::fprintf(stderr, "  test_prefill_restore_points ...");
+
+    using Backend = DeepSeek4Backend;
+    // A chunk stops at the next restore point after its start.
+    const std::vector<int> points = {100, 300, 350};
+    TEST_ASSERT(Backend::restore_safe_prefill_tokens(0, 1024, points) == 100);
+    TEST_ASSERT(Backend::restore_safe_prefill_tokens(100, 1024, points) == 200);
+    TEST_ASSERT(Backend::restore_safe_prefill_tokens(300, 1024, points) == 50);
+    TEST_ASSERT(Backend::restore_safe_prefill_tokens(350, 1024, points) == 1024);
+    TEST_ASSERT(Backend::restore_safe_prefill_tokens(0, 64, points) == 64);
+    TEST_ASSERT(Backend::restore_safe_prefill_tokens(36, 64, points) == 64);
+    TEST_ASSERT(Backend::restore_safe_prefill_tokens(0, 1024, {}) == 1024);
+
+    // The chunks after any restore point are the ones a cold prefill runs.
+    const auto chunk_starts = [&](int from, int end, int chunk) {
+        std::vector<int> starts;
+        for (int pos = from; pos < end;) {
+            starts.push_back(pos);
+            pos += Backend::restore_safe_prefill_tokens(pos, std::min(chunk, end - pos), points);
+        }
+        return starts;
+    };
+    const std::vector<int> cold = chunk_starts(0, 1400, 256);
+    for (int point : points) {
+        const std::vector<int> restored = chunk_starts(point, 1400, 256);
+        TEST_ASSERT(std::find(cold.begin(), cold.end(), point) != cold.end());
+        TEST_ASSERT(std::equal(restored.begin(), restored.end(),
+                               std::find(cold.begin(), cold.end(), point)));
+    }
+
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+static void test_hybrid_prefill_chunk_fit() {
+    std::fprintf(stderr, "  test_hybrid_prefill_chunk_fit ...");
+
+    using Backend = DeepSeek4Backend;
+    // The fitted chunk is a function of its inputs only: a multiple of 64,
+    // at least 64, within the layer-major limit.
+    const size_t gib = (size_t) 1 << 30, mib = (size_t) 1 << 20;
+    TEST_ASSERT(Backend::hybrid_prefill_fit_tokens(4 * gib, gib, mib) == 3072);
+    TEST_ASSERT(Backend::hybrid_prefill_fit_tokens(4 * gib, gib, mib) ==
+                Backend::hybrid_prefill_fit_tokens(4 * gib, gib, mib));
+    TEST_ASSERT(Backend::hybrid_prefill_fit_tokens(gib + 100 * mib, gib, mib) == 64);
+    TEST_ASSERT(Backend::hybrid_prefill_fit_tokens(gib + 130 * mib, gib, mib) == 128);
+    TEST_ASSERT(Backend::hybrid_prefill_fit_tokens(gib / 2, gib, mib) == 64);
+    TEST_ASSERT(Backend::hybrid_prefill_fit_tokens(64 * gib, gib, 1) ==
+                DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS);
+
+    // Per-token scratch grows with the compressed rows a context can reach;
+    // ratio-1 layers reach one row per token.
+    DeepSeek4Weights w;
+    w.n_embd = 5120;
+    w.n_head = 64;
+    w.head_dim = 512;
+    w.n_expert = 384;
+    w.n_expert_used = 6;
+    w.n_ff_exp = 2304;
+    w.n_swa = 128;
+    w.compress_ratios = {0, 0, 2, 1};
+    const auto short_ctx = Backend::hybrid_prefill_scratch_per_token(w, 4096, 1024);
+    const auto long_ctx = Backend::hybrid_prefill_scratch_per_token(w, 16384, 1024);
+    TEST_ASSERT(long_ctx.target - short_ctx.target == (size_t) (16384 - 4096) * 6);
+    TEST_ASSERT(long_ctx.second == short_ctx.second);
+    TEST_ASSERT(short_ctx.target > short_ctx.second && short_ctx.second > 0);
+
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
 static void test_dspark_prefill_capture_boundaries() {
     std::fprintf(stderr, "  test_dspark_prefill_capture_boundaries ...");
 
     using Backend = DeepSeek4Backend;
-    // Both monolithic layer-major and sparse heterogeneous prefill return the
-    // per-token capture rows needed to retain a tail from one wide graph.
+    // Both monolithic layer-major and batched heterogeneous prefill return
+    // the per-token capture rows needed to retain a tail from one wide graph.
     TEST_ASSERT(Backend::supports_batched_spec_feature_capture(
                     false, PrefillAttentionMode::Sparse, 2048));
     TEST_ASSERT(Backend::supports_batched_spec_feature_capture(
                     true, PrefillAttentionMode::Sparse, 2048));
-    TEST_ASSERT(!Backend::supports_batched_spec_feature_capture(
+    TEST_ASSERT(Backend::supports_batched_spec_feature_capture(
                     true, PrefillAttentionMode::Dense, 2048));
     TEST_ASSERT(!Backend::supports_batched_spec_feature_capture(
                     true, PrefillAttentionMode::Exact, 2048));
@@ -3831,12 +3919,15 @@ static void test_dspark_prefill_capture_boundaries() {
     TEST_ASSERT(Backend::capture_safe_prefill_tokens(
                     1920, 128, 1920, false, false, 0, 0) == 128);
 
-    // A pending checkpoint contributes both edges of its capture window. The
-    // resulting batches are either wholly hooked or wholly unhooked.
+    // A token-by-token capture also stops at both edges of a pending
+    // checkpoint's window; a batched capture returns its rows from any chunk,
+    // so a checkpoint does not change where batched chunks start.
     TEST_ASSERT(Backend::capture_safe_prefill_tokens(
-                    0, 2048, 1920, true, true, 384, 512) == 384);
+                    0, 2048, 1920, true, true, 384, 512) == 2048);
     TEST_ASSERT(Backend::capture_safe_prefill_tokens(
-                    384, 1664, 1920, true, true, 384, 512) == 128);
+                    0, 2048, 1920, false, true, 384, 512) == 384);
+    TEST_ASSERT(Backend::capture_safe_prefill_tokens(
+                    384, 1664, 1920, false, true, 384, 512) == 128);
     TEST_ASSERT(Backend::capture_safe_prefill_tokens(
                     512, 1536, 1920, false, false, 384, 512) == 1408);
 
@@ -7867,6 +7958,8 @@ int main(int argc, char ** argv) {
     test_layer_split_snapshot_disk_roundtrip();
     test_spec_feature_tail_is_bounded();
     test_dspark_prefill_capture_boundaries();
+    test_hybrid_prefill_chunk_fit();
+    test_prefill_restore_points();
     test_reset_request_state();
     test_reset_deepseek4_cache(backend);
     test_adapter_guard_paths();

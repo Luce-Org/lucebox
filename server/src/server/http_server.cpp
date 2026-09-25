@@ -2538,6 +2538,21 @@ namespace {
 // Disk-cache staging lives above both PrefixCache pools.
 constexpr int kDiskStagingSlot = ModelBackend::kMaxSlots - 1;
 
+// Every position a later request may restore `prompt`'s prefix from: its chat
+// boundaries plus the extra cuts a cache may take (a PPP pin, a fixed disk
+// scope). See GenerateRequest::restore_points.
+std::vector<int> prefix_restore_points(const std::vector<int32_t> & prompt,
+                                       const ChatMarkers & markers,
+                                       std::initializer_list<int> cuts) {
+    std::vector<int> points = find_all_boundaries(prompt, markers);
+    for (int cut : cuts) {
+        if (cut > 0 && cut < (int) prompt.size()) points.push_back(cut);
+    }
+    std::sort(points.begin(), points.end());
+    points.erase(std::unique(points.begin(), points.end()), points.end());
+    return points;
+}
+
 struct CompletionTokenCounts {
     int total = 0;
     int reasoning = 0;
@@ -3655,6 +3670,8 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
         scoped_request.n_gen = 0;
         scoped_request.snap_slot = kDiskStagingSlot;
         scoped_request.snap_pos = selected_boundary;
+        scoped_request.restore_points = prefix_restore_points(
+            scoped_request.prompt, prefix_cache_.chat_markers(), {forced_cut});
         DaemonIO scoped_io;
         scoped_io.stream_fd = -1;
         const auto scoped_result =
@@ -3738,6 +3755,8 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
             cold_request.n_gen = 0;
             cold_request.snap_slot = kDiskStagingSlot;
             cold_request.snap_pos = cold_boundary;
+            cold_request.restore_points = prefix_restore_points(
+                cold_request.prompt, prefix_cache_.chat_markers(), {forced_cut});
             DaemonIO cold_io;
             cold_io.stream_fd = -1;
             const auto cold_result = backend_.generate(cold_request, cold_io);
@@ -3838,6 +3857,12 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
         cache.disk_hit ? "true" : "false",
         cache.snap_slot, cache.snap_cut,
         cache.full_snap_slot, cache.full_snap_pos);
+
+    if (!prefix_cache_.disabled() || !disk_cache_.disabled()) {
+        generate_request.restore_points = prefix_restore_points(
+            effective_prompt, prefix_cache_.chat_markers(),
+            {forced_cut, selected_boundary});
+    }
 
     status_.set_flags(
         cache.using_restore, prepared.compressed,

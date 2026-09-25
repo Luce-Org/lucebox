@@ -1887,12 +1887,14 @@ int DeepSeek4Backend::capture_safe_prefill_tokens(
         }
     };
 
+    // A batched capture returns every requested row of its chunk, so only a
+    // token-by-token capture splits at the capture windows.
     if (!batch_final_capture) {
         split_at(final_capture_from);
-    }
-    if (snapshot_pending) {
-        split_at(snapshot_capture_from);
-        split_at(snapshot_capture_to);
+        if (snapshot_pending) {
+            split_at(snapshot_capture_from);
+            split_at(snapshot_capture_to);
+        }
     }
     return safe_tokens;
 }
@@ -1906,10 +1908,11 @@ bool DeepSeek4Backend::supports_batched_spec_feature_capture(
         return false;
     }
     // The monolithic layer-major path reads only the requested token range.
-    // Sparse heterogeneous prefill returns every requested capture row; the
-    // caller then retains the final/snapshot window. Other hybrid modes are
-    // tokenwise and must still split at capture boundaries.
-    return !hybrid || mode == PrefillAttentionMode::Sparse;
+    // Batched heterogeneous prefill returns every requested capture row; the
+    // caller then retains the final/snapshot window. Hybrid prefill that runs
+    // token by token never reaches here with more than one token.
+    (void) hybrid;
+    return true;
 }
 
 bool DeepSeek4Backend::init() {
@@ -2108,6 +2111,7 @@ bool DeepSeek4Backend::init() {
         }
     }
     if (!init_streamed_expert_tier() || !check_device_headroom()) return false;
+    size_hybrid_prefill_chunk();
     image_capable_ = vision_ != nullptr;
     return true;
 }
@@ -2217,6 +2221,76 @@ bool DeepSeek4Backend::check_device_headroom() const {
                      "LUCE_EXPERT_PROMOTE_MB, --kv-pool-tokens or --max-ctx\n");
     }
     return ok;
+}
+
+// Scratch one token of a batched mixed-owner prefill chunk needs. The target
+// holds the attention graph (queries, context and the causal mask over the raw
+// window, the chunk and every compressed row `max_ctx` can reach) and the
+// routing and hot-owner arenas; the GPU of the second owner and the streamed
+// experts holds their arenas.
+DeepSeek4Backend::HybridPrefillScratch DeepSeek4Backend::hybrid_prefill_scratch_per_token(
+        const DeepSeek4Weights & w, int max_ctx, int chunk) {
+    size_t comp_rows = 0;
+    for (uint32_t ratio : w.compress_ratios) {
+        if (ratio > 0) comp_rows = std::max(comp_rows, (size_t) std::max(0, max_ctx) / ratio);
+    }
+    const size_t f32 = sizeof(float);
+    const size_t heads = (size_t) w.n_head * (size_t) w.head_dim * f32;
+    const size_t mask = ((size_t) w.n_swa + (size_t) std::max(1, chunk) + comp_rows) *
+                        (f32 + sizeof(uint16_t));
+    const size_t routes = (size_t) w.n_expert_used * 3 * (size_t) w.n_ff_exp * f32;
+    const size_t token = (size_t) w.n_embd * f32;
+    HybridPrefillScratch out;
+    out.target = 4 * heads + mask + routes + 4 * token + 2 * (size_t) w.n_expert * f32;
+    out.second = 2 * routes + 4 * token;
+    return out;
+}
+
+// Chunk tokens whose scratch fits `free_bytes` while `keep_bytes` stay free:
+// a multiple of 64, and at least 64.
+int DeepSeek4Backend::hybrid_prefill_fit_tokens(size_t free_bytes, size_t keep_bytes,
+                                                size_t per_token_bytes) {
+    constexpr size_t granule = 64;
+    const size_t room = free_bytes > keep_bytes ? free_bytes - keep_bytes : 0;
+    const size_t tokens = per_token_bytes > 0 ? room / per_token_bytes : 0;
+    return (int) std::min<size_t>(DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS,
+                                  std::max(granule, tokens / granule * granule));
+}
+
+// Bounds a batched mixed-owner prefill chunk by the memory left after load;
+// each device keeps half its headroom for the decode and verify graphs. The
+// cap is fixed for the life of the target, so a prompt is always cut into the
+// same chunks and a restored prefix reproduces a cold prefill
+// (GenerateRequest::restore_points).
+void DeepSeek4Backend::size_hybrid_prefill_chunk() {
+    if (!moe_hybrid_ || cfg_.prefill_mode == PrefillAttentionMode::Exact) return;
+    const int chunk = std::max(1, cfg_.chunk > 0 ? cfg_.chunk : w_.n_swa);
+    const HybridPrefillScratch per_token = hybrid_prefill_scratch_per_token(
+        w_, cfg_.max_ctx > 0 ? cfg_.max_ctx : 8192, chunk);
+    const auto fit = [](int device, size_t bytes) {
+        size_t free_b = 0, total_b = 0;
+        ggml_backend_cuda_get_device_memory(device, &free_b, &total_b);
+        return hybrid_prefill_fit_tokens(free_b, ds4_device_headroom_bytes(device) / 2, bytes);
+    };
+    int tokens = fit(cfg_.device.gpu, per_token.target);
+    if (stream_cache_device_ >= 0 && stream_cache_device_ != cfg_.device.gpu) {
+        tokens = std::min(tokens, fit(stream_cache_device_, per_token.second));
+    }
+    if (tokens < chunk) {
+        hybrid_prefill_chunk_cap_ = hybrid_prefill_chunk_cap_ > 0
+            ? std::min(hybrid_prefill_chunk_cap_, tokens) : tokens;
+        std::fprintf(stderr, "[deepseek4] batched prefill chunk %d -> %d tokens to fit the "
+                     "devices' free memory\n", chunk, tokens);
+    }
+}
+
+// Tokens of a batched prefill chunk at absolute `pos` that stop at the next
+// restore point, so every restore point starts a chunk.
+int DeepSeek4Backend::restore_safe_prefill_tokens(int pos, int requested_tokens,
+                                                  const std::vector<int> & restore_points) {
+    const auto next = std::upper_bound(restore_points.begin(), restore_points.end(), pos);
+    return next != restore_points.end() && *next < pos + requested_tokens
+        ? *next - pos : requested_tokens;
 }
 
 bool DeepSeek4Backend::init_moe_tensor_parallel() {
@@ -3032,6 +3106,7 @@ bool DeepSeek4Backend::unpark(ParkTarget target) {
     }
     // A restored target sizes its streamed expert tier last again.
     if (moe_hybrid_ && !expert_cache_.ready() && !init_streamed_expert_tier()) return false;
+    size_hybrid_prefill_chunk();
     cache_.prefill_mode = cfg_.prefill_mode;
     return true;
 }
@@ -3105,7 +3180,8 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                                   int kv_offset,
                                   int snap_slot,
                                   int snap_pos,
-                                  const DeepSeek4ImagePrompt * images) {
+                                  const DeepSeek4ImagePrompt * images,
+                                  const std::vector<int> & restore_points) {
     const bool capture_spec = !images && spec_enabled_ && spec_drafter_;
     if (images) spec_feat_window_.clear();
     const InferencePhase phase = deepseek4_roctx_prefill_phase(
@@ -3137,11 +3213,15 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
     const int layer_major_cap = vision_
         ? std::min(1024, DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS)
         : DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS;
-    // Only sparse prefill has a qualified batched mixed-owner HC path. Dense
-    // hybrid execution remains tokenwise; batching it would skip per-token HC
-    // post-mixing and corrupt the hidden state.
+    // Mixed-owner prefill batches on the layer-range path, which mixes the
+    // hyper-connections per token: sparse, or dense attention there. Dense
+    // prefill through the host hybrid step stays token by token; batching it
+    // would skip per-token HC post-mixing and corrupt the hidden state.
+    const bool layer_range_hybrid =
+        moe_hybrid_ && (expert_runtime_.compute || expert_backend_);
     const bool hybrid_batch_supported =
-        !moe_hybrid_ || cfg_.prefill_mode == PrefillAttentionMode::Sparse;
+        !moe_hybrid_ || cfg_.prefill_mode == PrefillAttentionMode::Sparse ||
+        (cfg_.prefill_mode == PrefillAttentionMode::Dense && layer_range_hybrid);
     const int base_chunk =
         !hybrid_batch_supported ||
         (cfg_.prefill_mode == PrefillAttentionMode::Exact &&
@@ -3150,8 +3230,8 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         : std::max(1, std::min(requested_chunk,
                                layer_major_cap));
     const bool bound_hybrid_scratch =
-        moe_hybrid_ &&
-        cfg_.prefill_mode == PrefillAttentionMode::Sparse;
+        moe_hybrid_ && hybrid_batch_supported &&
+        cfg_.prefill_mode != PrefillAttentionMode::Exact;
     const int chunk = bound_hybrid_scratch
         ? deepseek4_hybrid_prefill_chunk_tokens(
               base_chunk, kv_offset + n_total,
@@ -3278,6 +3358,10 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
             snap_pos > pos && snap_pos < pos + n_tok) {
             n_tok = snap_pos - pos;
         }
+        // A batched chunk's numerics depend on where it starts. Start one at
+        // every position a later request may restore from, so the chunks after
+        // a restore are exactly the ones a cold prefill of the prompt runs.
+        n_tok = restore_safe_prefill_tokens(pos, n_tok, restore_points);
         if (capture_spec) {
             const bool batch_final_capture =
                 supports_batched_spec_feature_capture(
@@ -3366,7 +3450,7 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         static const bool affine_capture_enabled =
             env_flag_enabled("LUCE_CUDA_MMQ_FP2_AFFINE_CAPTURE");
         affine_mmq_scope.set_enabled(hp == nullptr || affine_capture_enabled);
-        if (moe_hybrid_ && (expert_runtime_.compute || expert_backend_)) {
+        if (layer_range_hybrid) {
             ok = deepseek4_step_layer_range(
                 backend_, cfg_.device.gpu, w_, cache_, hc_state,
                 embed.data(), n_tok, pos,
@@ -3695,12 +3779,14 @@ GenerateResult DeepSeek4Backend::generate_from_state(
     int committed = kv_offset;
     if (kv_offset == 0) {
         committed = do_prefill(req.prompt, out_io, 0,
-                               req.snap_slot, req.snap_pos, images);
+                               req.snap_slot, req.snap_pos, images,
+                               req.restore_points);
     } else if (kv_offset < (int) req.prompt.size()) {
         std::vector<int32_t> suffix(req.prompt.begin() + kv_offset,
                                     req.prompt.end());
         committed = do_prefill(suffix, out_io, kv_offset,
-                               req.snap_slot, req.snap_pos);
+                               req.snap_slot, req.snap_pos, nullptr,
+                               req.restore_points);
     }
     if (committed < 0) {
         result.fail(GenerateErrorCode::PrefillFailed);

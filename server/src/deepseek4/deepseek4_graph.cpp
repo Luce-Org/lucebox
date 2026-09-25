@@ -843,6 +843,9 @@ static int ds4_committed_comp_rows(const DeepSeek4Weights & w, int n_committed) 
 // are pooled as one batched tensor, so a 2K ubatch does not create hundreds of
 // serial softmax subgraphs. The state is assembled functionally from an
 // initial snapshot and written back once, avoiding persistent-buffer races.
+// Ratio 4 pools overlapping windows; other ratios (128, and V4.1's ratio 2,
+// which has no APE) pool disjoint ones. `latent_index` also writes the index
+// key of every pooled row from its pre-RoPE latent (V4.1 index sources).
 static bool build_compressor_prefill(
         ggml_context * ctx,
         ggml_cgraph * gf,
@@ -867,10 +870,13 @@ static bool build_compressor_prefill(
         std::vector<DeepSeek4I64ArrayBinding> & i64_array_inputs,
         std::vector<DeepSeek4I32ArrayBinding> & i32_array_inputs,
         ggml_tensor ** comp_cache_source_out,
-        bool indexer_qat) {
+        bool indexer_qat,
+        const DeepSeek4Layer * latent_index = nullptr,
+        ggml_tensor * index_cache = nullptr,
+        ggml_tensor ** index_cache_source_out = nullptr) {
     if (!cur_all || n_tokens <= 1 ||
         n_tokens > DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS ||
-        (ratio != 4 && ratio != 128)) {
+        ratio < 2 || (ratio == 4 && !ape)) {
         return false;
     }
 
@@ -929,16 +935,18 @@ static bool build_compressor_prefill(
     Pair projected;
     projected.kv = ggml_mul_mat(ctx, kv_proj, cur_all);
     projected.score = ggml_mul_mat(ctx, gate_proj, cur_all);
-    ggml_tensor * ape_rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
-    ggml_set_input(ape_rows);
-    std::vector<int32_t> ape_values((size_t) n_tokens);
-    for (int i = 0; i < n_tokens; ++i) {
-        ape_values[(size_t) i] = (kv_start + i) % ratio;
+    if (ape) {
+        ggml_tensor * ape_rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+        ggml_set_input(ape_rows);
+        std::vector<int32_t> ape_values((size_t) n_tokens);
+        for (int i = 0; i < n_tokens; ++i) {
+            ape_values[(size_t) i] = (kv_start + i) % ratio;
+        }
+        i32_array_inputs.push_back({ape_rows, std::move(ape_values)});
+        ggml_tensor * ape_cols = ggml_get_rows(ctx, ape, ape_rows);
+        projected.score = ggml_add(ctx, projected.score,
+                                   ds4_cast_if_needed(ctx, ape_cols, GGML_TYPE_F32));
     }
-    i32_array_inputs.push_back({ape_rows, std::move(ape_values)});
-    ggml_tensor * ape_cols = ggml_get_rows(ctx, ape, ape_rows);
-    projected.score = ggml_add(ctx, projected.score,
-                               ds4_cast_if_needed(ctx, ape_cols, GGML_TYPE_F32));
 
     // Snapshot before the single writeback.  Both compressor output and final
     // state depend on these copies, forcing reads to complete before mutation.
@@ -1131,6 +1139,20 @@ static bool build_compressor_prefill(
         if (rope_scale > 0.0f) {
             rope_attn /= (1.0f + 0.1f * logf(1.0f / rope_scale));
         }
+        ggml_tensor * index_key = nullptr;
+        if (latent_index && latent_index->indexer_k &&
+            latent_index->indexer_k_norm && index_cache) {
+            const int index_dim = (int) index_cache->ne[0];
+            index_key = ggml_mul_mat(ctx, latent_index->indexer_k, pooled);
+            index_key = build_rms_norm(ctx, index_key,
+                                       latent_index->indexer_k_norm, rms_eps);
+            index_key = build_tail_rope_2d(ctx, index_key, comp_pos, n_rot,
+                                           index_dim, n_pooled,
+                                           compress_rope_freq_base, rope_scale,
+                                           1.0f, rope_attn,
+                                           rope_yarn_beta_fast,
+                                           rope_yarn_beta_slow, rope_orig_ctx);
+        }
         pooled = build_tail_rope_2d(ctx, pooled, comp_pos, n_rot, head_dim,
                                     n_pooled,
                                     compress_rope_freq_base, rope_scale,
@@ -1148,6 +1170,12 @@ static bool build_compressor_prefill(
         i64_array_inputs.push_back({comp_row_tensor, std::move(comp_rows)});
         comp_cache_source = ggml_set_rows(ctx, comp_cache, pooled, comp_row_tensor);
         ggml_build_forward_expand(gf, comp_cache_source);
+        if (index_key) {
+            ggml_tensor * index_source = ggml_set_rows(
+                ctx, index_cache, ggml_cont(ctx, index_key), comp_row_tensor);
+            ggml_build_forward_expand(gf, index_source);
+            if (index_cache_source_out) *index_cache_source_out = index_source;
+        }
     }
     if (comp_cache_source_out) *comp_cache_source_out = comp_cache_source;
     return true;
@@ -1274,7 +1302,8 @@ static void build_compressor_step(
                                  rope_yarn_beta_fast, rope_yarn_beta_slow,
                                  rope_orig_ctx, i64_array_inputs,
                                  i32_array_inputs, comp_cache_source_out,
-                                 indexer_qat)) {
+                                 indexer_qat, latent_index, index_cache,
+                                 index_cache_source_out)) {
         return;
     }
 
@@ -4048,8 +4077,9 @@ bool init_deepseek4_streamed_expert_cache(
 // Layer-ahead prefetch of streamed experts. While layer L routes, the same
 // FFN input is also routed with layer L+1's norm and router (selection bias
 // and protected experts included); the streamed experts that prediction picks
-// start loading while L computes. It only moves bytes early: L+1 still routes
-// on its own hidden state.
+// start loading while L computes (for a prefill batch, the union over its
+// tokens). It only moves bytes early: L+1 still routes on its own hidden
+// state.
 // A layer's selection bias (exp_probs_b, router bias included) for host
 // routing: the host copy taken at load, or a device read into scratch.
 // nullptr when the layer has none.
@@ -4080,8 +4110,8 @@ static bool ds4_stream_prefetch_enabled() {
 
 // Appends the next layer's router probabilities to a routing graph and
 // returns them concatenated after the current layer's `probs`
-// ([2 * n_expert, 1]) so one readback serves both, or nullptr when there is
-// nothing to prefetch for the next layer.
+// ([2 * n_expert, n_tokens]) so one readback serves both, or nullptr when
+// there is nothing to prefetch for the next layer.
 static ggml_tensor * build_ds4_next_layer_router(
         ggml_context * ctx,
         ggml_cgraph * gf,
@@ -4089,10 +4119,9 @@ static ggml_tensor * build_ds4_next_layer_router(
         ggml_tensor * probs,
         const DeepSeek4Weights & w,
         const MoeHybridStorage & hybrid,
-        int layer,
-        int n_tokens) {
+        int layer) {
     const int next = layer + 1;
-    if (n_tokens != 1 || next >= w.n_layer || next < w.n_hash_layer ||
+    if (next >= w.n_layer || next < w.n_hash_layer ||
         !hybrid.expert_cache || !hybrid.expert_cache->ready() ||
         (size_t) next >= hybrid.layers.size() || hybrid.layers[(size_t) next].n_streamed == 0 ||
         !ds4_stream_prefetch_enabled()) {
@@ -4114,24 +4143,36 @@ static void ds4_select_routed_experts(const DeepSeek4Weights & w, int layer, con
                                       const float * bias, int k, int32_t * out);
 
 // Reads the pair built above: the current layer's probabilities into
-// probs_host, the next layer's selection into out. False without a pair.
+// probs_host ([n_expert, n_tokens]), the next layer's selection into out (the
+// union over the tokens, in first-route order). False without a pair.
 static bool read_ds4_probs_and_next_routes(
         ggml_tensor * pair,
         const DeepSeek4Weights & w,
         int layer,
+        int n_tokens,
         float * probs_host,
         Ds4NextLayerRoutes & out) {
     out = {};
     if (!pair) return false;
     const size_t n = (size_t) w.n_expert;
-    std::vector<float> both(2 * n);
+    std::vector<float> both(2 * n * (size_t) n_tokens);
     ggml_backend_tensor_get(pair, both.data(), 0, sizeof(float) * both.size());
-    std::memcpy(probs_host, both.data(), sizeof(float) * n);
     std::vector<float> scratch;
     out.layer = layer + 1;
-    out.experts.assign((size_t) ds4_effective_expert_count(w), -1);
-    ds4_select_routed_experts(w, out.layer, both.data() + n, ds4_selection_bias(w, out.layer, scratch),
-                              (int) out.experts.size(), out.experts.data());
+    const float * bias = ds4_selection_bias(w, out.layer, scratch);
+    const int k = ds4_effective_expert_count(w);
+    std::vector<int32_t> token_routes((size_t) k);
+    std::vector<uint8_t> seen(n, 0);
+    for (int t = 0; t < n_tokens; ++t) {
+        const float * column = both.data() + 2 * n * (size_t) t;
+        std::memcpy(probs_host + n * (size_t) t, column, sizeof(float) * n);
+        ds4_select_routed_experts(w, out.layer, column + n, bias, k, token_routes.data());
+        for (int32_t e : token_routes) {
+            if (e < 0 || (size_t) e >= n || seen[(size_t) e]) continue;
+            seen[(size_t) e] = 1;
+            out.experts.push_back(e);
+        }
+    }
     return true;
 }
 
@@ -5607,7 +5648,7 @@ static bool deepseek4_step_hybrid(
             ggml_build_forward_expand(ffn_gf, ffn_normed);
             ggml_build_forward_expand(ffn_gf, router_probs);
             ggml_tensor * probs_pair = build_ds4_next_layer_router(
-                ffn_ctx, ffn_gf, ffn_inp, router_probs, w, moe_hybrid, il, n_tokens);
+                ffn_ctx, ffn_gf, ffn_inp, router_probs, w, moe_hybrid, il);
             ggml_gallocr_t ffn_alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
             if (!ggml_gallocr_alloc_graph(ffn_alloc, ffn_gf)) {
                 ggml_gallocr_free(ffn_alloc); ggml_free(ffn_ctx);
@@ -5635,7 +5676,7 @@ static bool deepseek4_step_hybrid(
             const auto route_read_t0 = Ds4TimingClock::now();
             ggml_backend_tensor_get(ffn_normed, ffn_normed_host.data(), 0, sizeof(float) * ffn_normed_host.size());
             Ds4NextLayerRoutes next_routes;
-            if (!read_ds4_probs_and_next_routes(probs_pair, w, il, probs_host.data(), next_routes)) {
+            if (!read_ds4_probs_and_next_routes(probs_pair, w, il, n_tokens, probs_host.data(), next_routes)) {
                 ggml_backend_tensor_get(router_probs, probs_host.data(), 0, sizeof(float) * probs_host.size());
             }
             if (telemetry) telemetry->route_read_us += ds4_elapsed_us(route_read_t0, Ds4TimingClock::now());
@@ -7141,7 +7182,7 @@ static bool eval_ds4_layer_range_hybrid_ffn(
     ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, normed);
     ggml_build_forward_expand(gf, probs);
-    ggml_tensor * probs_pair = build_ds4_next_layer_router(ctx, gf, inp, probs, w, hybrid, layer, n_tokens);
+    ggml_tensor * probs_pair = build_ds4_next_layer_router(ctx, gf, inp, probs, w, hybrid, layer);
     ggml_gallocr_t alloc = nullptr;
     if (persistent_owner_alloc) {
         if (!hybrid.prefill_route_alloc) {
@@ -7218,7 +7259,7 @@ static bool eval_ds4_layer_range_hybrid_ffn(
             ggml_backend_tensor_get(normed, normed_host.data(), 0,
                                     sizeof(float) * normed_host.size());
         }
-        if (!read_ds4_probs_and_next_routes(probs_pair, w, layer, probs_host.data(), next_routes)) {
+        if (!read_ds4_probs_and_next_routes(probs_pair, w, layer, n_tokens, probs_host.data(), next_routes)) {
             ggml_backend_tensor_get(probs, probs_host.data(), 0,
                                     sizeof(float) * probs_host.size());
         }
@@ -9021,10 +9062,15 @@ bool deepseek4_step_layer_range(
         n_tokens == DS4_Q5_VERIFY_TOKENS &&
         ds4_env_flag("LUCE_DS4_Q5_VERIFY");
     // With the staggered pre-mix the fused graph verifies token by token
-    // (ds4_fused_attention_lanes), so no compressor boundary limits its width.
+    // (ds4_fused_attention_lanes), so no compressor boundary limits the width
+    // of a verify batch (one that asks for every token's logits or argmax). A
+    // prefill chunk that only captures DSpark features is not one: it takes
+    // the batched prefill below.
+    const bool verify_batch = verify_hooks &&
+        (verify_hooks->all_logits_out || verify_hooks->argmax_out);
     const bool fused_verify_width_ok =
         n_tokens <= DS4_CONSERVATIVE_VERIFY_MAX_TOKENS || wide_verify_candidate ||
-        w.hc_staggered_pre;
+        (w.hc_staggered_pre && verify_batch);
     const bool fused_verify_candidate =
         (!moe_hybrid || fused_hybrid_ready) &&
         n_tokens >= 2 && fused_verify_width_ok && verify_hooks &&
@@ -9059,9 +9105,13 @@ bool deepseek4_step_layer_range(
                     moe_hybrid->cold_backend != backend ? 1 : 0);
         }
     }
-    const bool heterogeneous_sparse_prefill =
+    // Mixed-owner (hybrid) batched prefill: host hyper-connections per token,
+    // one attention graph and one routed-expert pass per layer for the batch.
+    // Sparse prefill uses the indexer's top-k on ratio-4 layers; dense prefill
+    // attends to every visible compressed row.
+    const bool heterogeneous_batched_prefill =
         !fused_verify_candidate && moe_hybrid &&
-        cache.prefill_mode == PrefillAttentionMode::Sparse &&
+        cache.prefill_mode != PrefillAttentionMode::Exact &&
         n_tokens > 4 && n_tokens <= DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS &&
         layer_begin == 0 && is_last_shard &&
         ds4_backend_is_gpu(backend);
@@ -9084,7 +9134,7 @@ bool deepseek4_step_layer_range(
     // especially important for long-context unified-memory systems, where
     // otherwise identical per-layer arenas can evict model pages.
     const bool shared_layer_major_prefill =
-        heterogeneous_sparse_prefill || standard_layer_major_prefill;
+        heterogeneous_batched_prefill || standard_layer_major_prefill;
     // These graphs are rebuilt around an owner join on every layer, so tensor
     // metadata addresses can be recycled for different topologies.  Until
     // the full heterogeneous layer is captured as one stable scheduler graph,
@@ -9092,7 +9142,7 @@ bool deepseek4_step_layer_range(
     // the following decode/request.  The override is thread-local and scoped
     // to this forward call; decode graph replay is restored on every return.
     ScopedCudaGraphOverrides heterogeneous_prefill_eager_scope(
-        heterogeneous_sparse_prefill &&
+        heterogeneous_batched_prefill &&
         (image_batch || ds4_env_flag("LUCE_DS4_HYBRID_PREFILL_EAGER")));
 
     // V4.1 verification (staggered pre-mix): each layer's attention is one
@@ -9129,7 +9179,7 @@ bool deepseek4_step_layer_range(
         /*disable_graphs=*/false,
         /*mmvq_max_ncols=*/exact_multi_token_band ? 4 : 0);
     if (first_chunk > 0 && first_chunk < n_tokens &&
-        !fused_verify_candidate && !heterogeneous_sparse_prefill &&
+        !fused_verify_candidate && !heterogeneous_batched_prefill &&
         !standard_layer_major_prefill && !decode_tokenwise_verify) {
         const int input_width = layer_begin == 0 ? n_embd : hc_dim;
         std::vector<float> hc_all;
@@ -9339,7 +9389,7 @@ bool deepseek4_step_layer_range(
     const int n_expert_used = ds4_effective_expert_count(w);
     scratch.ensure(w.ctx, n_tokens, n_embd, n_hc, n_expert_used);
     const bool trace_prefill =
-        heterogeneous_sparse_prefill &&
+        heterogeneous_batched_prefill &&
         ds4_env_flag("LUCE_DS4_PREFILL_TRACE");
     if (trace_prefill) {
         std::fprintf(stderr,
@@ -9366,7 +9416,7 @@ bool deepseek4_step_layer_range(
         }
     }
     // Only the two batched prefill paths know about image rows.
-    if (image_batch && !heterogeneous_sparse_prefill) {
+    if (image_batch && !heterogeneous_batched_prefill) {
         std::fprintf(stderr, "[deepseek4] image prefill has no batched path for this configuration\n");
         return false;
     }
@@ -9506,7 +9556,7 @@ bool deepseek4_step_layer_range(
     const bool use_backend_decode_hc_graph =
         use_backend_decode_hc && !use_backend_decode_hc_direct;
     const bool use_backend_prefill_hc =
-        heterogeneous_sparse_prefill && !staggered_pre &&
+        heterogeneous_batched_prefill && !staggered_pre &&
         ds4_env_flag("LUCE_DS4_HYBRID_PREFILL_GPU_HC");
     ggml_tensor * hc_state_backend = nullptr;
     if (use_backend_prefill_hc) {
@@ -9891,7 +9941,9 @@ bool deepseek4_step_layer_range(
                 const DeepSeek4AttentionImpl attention_impl =
                     cache.prefill_mode == PrefillAttentionMode::Sparse
                         ? DeepSeek4AttentionImpl::SparseFlash
-                        : DeepSeek4AttentionImpl::Explicit;
+                        : heterogeneous_batched_prefill
+                            ? DeepSeek4AttentionImpl::DenseFlash
+                            : DeepSeek4AttentionImpl::Explicit;
                 attn_out = build_mla_attention(ctx, gf, normed, w, L, lc, comp_lc, il,
                                                kv_start, n_tokens, nullptr,
                                                i32_inputs, i32_array_inputs,
@@ -10185,7 +10237,7 @@ bool deepseek4_step_layer_range(
             384u * 1024u * 1024u;
         if (!ds4_env_flag(
                 "LUCE_DS4_DISABLE_LONG_CONTEXT_ARENA_HANDOFF") &&
-            heterogeneous_sparse_prefill &&
+            heterogeneous_batched_prefill &&
             kv_start >= k_long_context_attn_release_pos &&
             shared_prefill_attn_alloc.alloc &&
             ggml_gallocr_get_buffer_size(
